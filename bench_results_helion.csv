@@ -1,0 +1,7 @@
+design,cells,luts,ffs,dsps,brams,runtime_s
+blinky,3,1,0,0,0,0
+counter,9,4,0,0,0,0
+hier,3,1,0,0,0,0
+complex,158,71,0,0,0,0
+picorv32,3030,1697,0,0,0,16
+serv,25,15,0,0,0,0

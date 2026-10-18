@@ -11,7 +11,7 @@
 //! VCD measures architectural switching, not post-route glitch power.
 
 use crate::Sim;
-use helion_ir::Design;
+use helion_ir::{resolve, Design};
 
 /// Upper bound on dumped signals. Ibex-scale designs would otherwise produce
 /// gigabyte VCDs from this behavioral kernel; extra nets are silently
@@ -29,6 +29,11 @@ fn vcd_id(mut n: usize) -> String {
         }
     }
     chars.iter().rev().map(|&b| b as char).collect()
+}
+
+/// Public base-94 VCD identifier generator (`!`..`~`).
+pub fn vcd_id_code(n: usize) -> String {
+    vcd_id(n)
 }
 
 /// Run the event kernel and dump a VCD of every driven net.
@@ -70,7 +75,7 @@ pub fn dump_vcd(design: &Design, cycles: u32, timescale_ps: u64) -> String {
     // half-period are already in ps), so no tick-unit conversion exists to
     // get wrong.
     out.push_str("$timescale 1ps $end\n");
-    out.push_str(&format!("$scope module {} $end\n", design.name));
+    out.push_str(&format!("$scope module {} $end\n", resolve(design.name)));
     for (name, id) in names.iter().zip(ids.iter()) {
         out.push_str(&format!("$var wire 1 {id} {name} $end\n"));
     }
@@ -133,6 +138,22 @@ pub fn dump_vcd(design: &Design, cycles: u32, timescale_ps: u64) -> String {
         }
     }
     out
+}
+
+/// Run the compiled fast kernel for `cycles` clock posedges and return a delta-compressed
+/// [`CompactWaveStream`](crate::wave::CompactWaveStream).
+pub fn dump_wave_stream(
+    design: &Design,
+    cycles: u32,
+    timescale_ps: u64,
+) -> crate::wave::CompactWaveStream {
+    crate::wave::CompactWaveStream::capture_compiled(design, cycles, timescale_ps)
+}
+
+/// Run the compiled fast kernel for `cycles` clock posedges and return a compact FST-style
+/// binary waveform archive (`HFST\x01`).
+pub fn dump_fst_bytes(design: &Design, cycles: u32, timescale_ps: u64) -> Vec<u8> {
+    dump_wave_stream(design, cycles, timescale_ps).to_fst_bytes()
 }
 
 #[cfg(test)]

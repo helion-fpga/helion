@@ -1,0 +1,18 @@
+RUN seeds=[11400714819323198485, 1, 2, 3] frames=5000 warmup=true design=Some("/home/hatch/workspace/helion-ide-merge/crates/helion-gui/../../examples/blinky.sv")
+DIALOG seed=11400714819323198485 create_project: opens=6 closes=6
+DIALOG seed=11400714819323198485 palette: opens=7 closes=7
+DIALOG seed=11400714819323198485 cheatsheet: opens=6 closes=6
+DIALOG seed=11400714819323198485 tcl: opens=7 closes=6
+DIALOG seed=1 cheatsheet: opens=8 closes=8
+DIALOG seed=1 create_project: opens=9 closes=9
+DIALOG seed=1 palette: opens=10 closes=9
+DIALOG seed=1 tcl: opens=5 closes=5
+ANOMALY TIMING-MUTATED-EXPLAINABLE frame=191 TimingSnap { wns_ps: 9700, tns_ps: 0, endpoints: 1, clocks: 1, r2r_ps: 300, iob_ps: 220, setup_ps: 300, hold_ps: 120, hold_slack_ps: 100, route_ps: 40, clk_net_ps: 40, clock_period_ps: 10000, steps: [Failed, Done, Done, Done, Done] } -> TimingSnap { wns_ps: 9700, tns_ps: 0, endpoints: 1, clocks: 1, r2r_ps: 300, iob_ps: 220, setup_ps: 300, hold_ps: 120, hold_slack_ps: 100, route_ps: 40, clk_net_ps: 40, clock_period_ps: 10000, steps: [Failed, Done, Done, Done, Pending] } (tcl=true runs=false) events=[EV move 604.27 201.87 | EV down 604.27 201.87 0 0 | EV up 604.27 201.87 0 0]
+ANOMALY TIMING-MUTATED-EXPLAINABLE frame=981 TimingSnap { wns_ps: 8500, tns_ps: 0, endpoints: 1, clocks: 1, r2r_ps: 300, iob_ps: 1500, setup_ps: 1500, hold_ps: 1400, hold_slack_ps: 1380, route_ps: 1320, clk_net_ps: 680, clock_period_ps: 10000, steps: [Done, Done, Done, Done, Pending] } -> TimingSnap { wns_ps: 9700, tns_ps: 0, endpoints: 1, clocks: 1, r2r_ps: 300, iob_ps: 220, setup_ps: 300, hold_ps: 120, hold_slack_ps: 100, route_ps: 40, clk_net_ps: 40, clock_period_ps: 10000, steps: [Done, Done, Done, Done, Pending] } (tcl=true runs=false) events=[EV move 688.50 196.32 | EV down 688.50 196.32 0 0 | EV up 688.50 196.32 0 0 | EV down 688.50 196.32 0 0 | EV up 688.50 196.32 0 0]
+DIALOG seed=2 create_project: opens=10 closes=10
+DIALOG seed=2 cheatsheet: opens=5 closes=5
+DIALOG seed=2 examples: opens=2 closes=2
+DIALOG seed=2 palette: opens=10 closes=10
+DIALOG seed=2 tcl: opens=6 closes=5
+ANOMALY TIMING-MUTATED-EXPLAINABLE frame=981 TimingSnap { wns_ps: 8500, tns_ps: 0, endpoints: 1, clocks: 1, r2r_ps: 300, iob_ps: 1500, setup_ps: 1500, hold_ps: 1400, hold_slack_ps: 1380, route_ps: 1320, clk_net_ps: 680, clock_period_ps: 10000, steps: [Done, Done, Done, Done, Pending] } -> TimingSnap { wns_ps: 9700, tns_ps: 0, endpoints: 1, clocks: 1, r2r_ps: 300, iob_ps: 220, setup_ps: 300, hold_ps: 120, hold_slack_ps: 100, route_ps: 40, clk_net_ps: 40, clock_period_ps: 10000, steps: [Done, Done, Done, Done, Pending] } (tcl=true runs=false) events=[EV move 688.50 196.32 | EV down 688.50 196.32 0 0 | EV up 688.50 196.32 0 0 | EV down 688.50 196.32 0 0 | EV up 688.50 196.32 0 0]
+ANOMALY FREEZE frame=1532 dt=21.0s events=[EV move 1437.13 678.51 | EV down 1437.13 678.51 0 0 | EV up 1437.13 678.51 0 0]

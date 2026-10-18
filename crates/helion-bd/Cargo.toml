@@ -6,3 +6,5 @@ license.workspace = true
 
 [dependencies]
 helion-ipxact = { workspace = true }
+helion-bits = { workspace = true }
+helion-device = { workspace = true }

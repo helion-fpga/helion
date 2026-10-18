@@ -1,4 +1,4 @@
-// Helion 0.2 SV blinky — registered inverter, LED = Q
+// Helion 0.2 SV blinky - registered inverter, LED = Q
 module blinky (
     input  logic clk,
     output logic led

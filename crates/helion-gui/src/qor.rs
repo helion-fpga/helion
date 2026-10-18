@@ -1,11 +1,11 @@
-//! QoR suggestions engine — the Vivado `report_qor_suggestions` equivalent.
+//! QoR suggestions engine - the Vivado `report_qor_suggestions` equivalent.
 //!
 //! Rule-based analysis over the post-route design and STA results. Each rule
 //! is an entry in the [`qor_rules()`] registry: the IDE panel renders whatever
 //! the registry returns, so adding a rule never touches UI code.
 //!
 //! Every suggestion cites real measured numbers (logic levels, fanout counts,
-//! slack, router overuse) taken from the analysis inputs — never generic
+//! slack, router overuse) taken from the analysis inputs - never generic
 //! advice. Estimated WNS gain is attached only where it is computable from
 //! those numbers; otherwise it is `None` rather than invented.
 //!
@@ -13,7 +13,7 @@
 //! [`QorInputs`] and paints the resulting [`QorReport`].
 
 use crate::ide::{TimingPath, Utilization};
-use helion_ir::{CellKind, Design};
+use helion_ir::{intern, resolve, CellKind, Design};
 use helion_route::Routed;
 use helion_sta::{Clock, Constraints, TimingResult};
 
@@ -40,11 +40,11 @@ impl QorSeverity {
 }
 
 /// One-click action the IDE panel offers on a suggestion, beyond Locate.
-/// Only attached where the IDE can actually perform the step — otherwise the
+/// Only attached where the IDE can actually perform the step - otherwise the
 /// suggestion carries a `fix_hint` string and `action` stays `None`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QorAction {
-    /// Navigate to the Design Runs tab so the user can launch a sweep.
+    /// Navigate to the Jobs tab so the user can launch a sweep.
     OpenRuns,
 }
 
@@ -143,7 +143,7 @@ impl QorReport {
     }
 }
 
-/// Everything a rule may inspect. Plain borrows of engine results — the IDE
+/// Everything a rule may inspect. Plain borrows of engine results - the IDE
 /// fills this from its model; tests fill it from fixtures.
 pub struct QorInputs<'a> {
     pub design: &'a Design,
@@ -162,7 +162,7 @@ pub struct QorInputs<'a> {
 
 /// One QoR rule: a stable id plus a pure function over [`QorInputs`].
 ///
-/// Rules are data — [`qor_rules()`] is the registry and [`analyze_qor`] runs
+/// Rules are data - [`qor_rules()`] is the registry and [`analyze_qor`] runs
 /// it. Adding a rule means appending one entry; the panel, Tcl, and tests
 /// pick it up untouched.
 pub struct QorRule {
@@ -293,7 +293,7 @@ fn rule_fanout(inp: &QorInputs) -> Vec<QorSuggestion> {
         .design
         .nets
         .iter()
-        .map(|n| (n.name.as_str(), net_fanout(n)))
+        .map(|n| (resolve(n.name), net_fanout(n)))
         .filter(|(_, f)| *f >= INFO_FANOUT)
         .collect();
     hits.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
@@ -327,7 +327,7 @@ fn rule_fanout(inp: &QorInputs) -> Vec<QorSuggestion> {
     out
 }
 
-/// QOR-ROUTE-1: the router left overused nodes — real congestion, measured by
+/// QOR-ROUTE-1: the router left overused nodes - real congestion, measured by
 /// PathFinder, not a heuristic.
 fn rule_congestion(inp: &QorInputs) -> Vec<QorSuggestion> {
     let mut out = Vec::new();
@@ -376,9 +376,9 @@ fn rule_unconstrained_clock(inp: &QorInputs) -> Vec<QorSuggestion> {
         .iter()
         .filter(|c| matches!(c.kind, CellKind::Hff))
     {
-        if let Some(net) = pins.net_on(&ff.name, "CLK") {
-            if !clk_nets.iter().any(|n| n == net) {
-                clk_nets.push(net.to_string());
+        if let Some(net) = pins.net_on(resolve(ff.name), "CLK") {
+            if !clk_nets.iter().any(|n| n.as_str() == resolve(net)) {
+                clk_nets.push(resolve(net).to_string());
             }
         }
     }
@@ -430,9 +430,9 @@ fn rule_macro_cascade(inp: &QorInputs) -> Vec<QorSuggestion> {
                 inp.design
                     .cells
                     .iter()
-                    .find(|cell| cell.name == **c)
+                    .find(|cell| cell.name == intern(c))
                     .is_some_and(|cell| {
-                        matches!(cell.kind, CellKind::Bram18 | CellKind::Mac27 { .. })
+                        matches!(cell.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. } | CellKind::Mac27 | CellKind::Dsp48e1 { .. })
                     })
             })
             .map(String::as_str)
@@ -494,7 +494,7 @@ fn rule_hold(inp: &QorInputs) -> Vec<QorSuggestion> {
                 format!(
                     "STA reports {} ps of hold slack across {} timing endpoints: \
                      at least one short path arrives too early. Hold failures \
-                     are silicon failures, not margins — they cannot be waived.",
+                     are silicon failures, not margins - they cannot be waived.",
                     t.hold_slack_ps, t.endpoints
                 ),
                 Vec::new(),
@@ -510,7 +510,7 @@ fn rule_hold(inp: &QorInputs) -> Vec<QorSuggestion> {
 }
 
 /// QOR-IO-1: outputs driven by combinational fabric instead of a packed IOB
-/// register — measured off the real router result.
+/// register - measured off the real router result.
 fn rule_iob_packing(inp: &QorInputs) -> Vec<QorSuggestion> {
     let mut out = Vec::new();
     if let Some(r) = inp.routed {
@@ -596,7 +596,7 @@ fn rule_net_dominated(inp: &QorInputs) -> Vec<QorSuggestion> {
     out
 }
 
-/// QOR-TNS-1: many failing endpoints — a breadth problem, not one bad path.
+/// QOR-TNS-1: many failing endpoints - a breadth problem, not one bad path.
 fn rule_tns(inp: &QorInputs) -> Vec<QorSuggestion> {
     let mut out = Vec::new();
     if let Some(t) = inp.timing {
@@ -612,7 +612,7 @@ fn rule_tns(inp: &QorInputs) -> Vec<QorSuggestion> {
                 ),
                 format!(
                     "{} timing endpoints fail with a total negative slack of \
-                     {} ps. This is a breadth problem — no single path fix \
+                     {} ps. This is a breadth problem - no single path fix \
                      closes it; the implementation strategy needs to change.",
                     t.endpoints, t.tns_ps
                 ),
@@ -628,7 +628,7 @@ fn rule_tns(inp: &QorInputs) -> Vec<QorSuggestion> {
     out
 }
 
-/// QOR-WNS-1: negative WNS on a narrow failure — the cheap move is a strategy
+/// QOR-WNS-1: negative WNS on a narrow failure - the cheap move is a strategy
 /// sweep, not RTL surgery. QOR-TNS-1 already covers the broad case (≥8 failing
 /// endpoints), so this rule stays silent there to avoid double advice. The
 /// panel renders a one-click "Open Design Runs" action on this suggestion.
@@ -655,7 +655,7 @@ fn rule_wns_strategy(inp: &QorInputs) -> Vec<QorSuggestion> {
         QorSeverity::Critical,
         "Strategy",
         format!(
-            "WNS {} ps across {} endpoint{} — try strategies before RTL",
+            "WNS {} ps across {} endpoint{} - try strategies before RTL",
             t.wns_ps,
             t.endpoints,
             if t.endpoints == 1 { "" } else { "s" }
@@ -712,7 +712,7 @@ fn rule_utilization(inp: &QorInputs) -> Vec<QorSuggestion> {
     out
 }
 
-/// The rule registry, in panel order. Add a rule here — nothing else changes.
+/// The rule registry, in panel order. Add a rule here - nothing else changes.
 pub fn qor_rules() -> Vec<QorRule> {
     vec![
         QorRule {
@@ -959,8 +959,8 @@ mod tests {
         d.add_cell("src", CellKind::Hff);
         d.connect("hot", "src", "Q");
         for i in 0..40 {
-            d.add_cell(format!("sink{i}"), CellKind::Hff);
-            d.connect("hot", format!("sink{i}"), "D");
+            d.add_cell(&format!("sink{i}"), CellKind::Hff);
+            d.connect("hot", &format!("sink{i}"), "D");
         }
         let c = empty_constraints();
         let paths: Vec<TimingPath> = Vec::new();

@@ -121,19 +121,22 @@ pub fn seeded_order(n: usize, seed: u64) -> Vec<usize> {
 /// Empty guide keeps gold south/mid pull from `timing_weight` alone.
 /// False-path / multicycle flags apply only to clusters that drive an
 /// excepted IOB/output net — internal LUT+FF keep `timing_weight` south pull.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct TimingGuide {
     /// `set_false_path` covers an IOB/output arc — do not pull that driver toward IOB.
     pub false_path_iob: bool,
     /// Setup multicycle for IOB arcs. 0 or 1 = single cycle (gold).
     pub iob_setup_mult: u32,
+    /// Per-net criticality (0.0 = non-critical, 1.0 = most critical).
+    /// Used for timing-driven placement: critical nets get higher weight.
+    pub net_criticality: std::collections::HashMap<String, f32>,
 }
 
 impl TimingGuide {
     /// PathFinder dogleg width (columns) for excepted IOB nets. 0 = gold
     /// shortest path. False path takes a wider detour than multicycle so the
     /// routed path/hops actually change (not a post-route hop pad).
-    pub fn iob_detour_cols(self) -> u32 {
+    pub fn iob_detour_cols(&self) -> u32 {
         if self.false_path_iob {
             2
         } else if self.iob_setup_mult > 1 {
@@ -144,8 +147,21 @@ impl TimingGuide {
     }
 
     /// True when this cluster's Q net drives an IOB that the guide excepts.
-    pub fn excepts_iob_driver(self, drives_iob: bool) -> bool {
+    pub fn excepts_iob_driver(&self, drives_iob: bool) -> bool {
         drives_iob && (self.false_path_iob || self.iob_setup_mult > 1)
+    }
+
+    /// Get criticality for a net (0.0 = non-critical, 1.0 = most critical).
+    /// Returns 0.0 if net not in map (default non-critical).
+    pub fn net_criticality(&self, net_name: &str) -> f32 {
+        self.net_criticality.get(net_name).copied().unwrap_or(0.0)
+    }
+
+    /// Get maximum criticality among a list of net names.
+    pub fn max_criticality(&self, nets: &[String]) -> f32 {
+        nets.iter()
+            .map(|n| self.net_criticality(n))
+            .fold(0.0f32, f32::max)
     }
 }
 
@@ -428,19 +444,19 @@ pub fn hard_heartbeat() -> helion_ir::Design {
     d.add_port("led", PortDir::Out);
     for i in 0..8u32 {
         d.add_cell(
-            format!("u_lut{i}"),
+            &format!("u_lut{i}"),
             CellKind::Lut6 {
                 init: 0x5555_5555_5555_5555,
             },
         );
-        d.add_cell(format!("u_ff{i}"), CellKind::Hff);
-        d.connect("clk", format!("u_ff{i}"), "CLK");
-        d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
-        d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
-        d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
-        d.connect(format!("q{i}"), format!("u_lut{i}"), "I0");
+        d.add_cell(&format!("u_ff{i}"), CellKind::Hff);
+        d.connect("clk", &format!("u_ff{i}"), "CLK");
+        d.connect(&format!("d{i}"), &format!("u_lut{i}"), "O");
+        d.connect(&format!("d{i}"), &format!("u_ff{i}"), "D");
+        d.connect(&format!("q{i}"), &format!("u_ff{i}"), "Q");
+        d.connect(&format!("q{i}"), &format!("u_lut{i}"), "I0");
         if i > 0 {
-            d.connect(format!("q{}", i - 1), format!("u_lut{i}"), "I1");
+            d.connect(&format!("q{}", i - 1), &format!("u_lut{i}"), "I1");
         }
     }
     d.add_cell("u_iob", CellKind::IobOut);
@@ -543,14 +559,32 @@ pub fn place_with_guide(
         let mut xs_seen: HashSet<u32> = HashSet::new();
         let mut y_seen: HashSet<u32> = HashSet::new();
         // FF cell → site as we place (IMUX: same-CLB / N-S±1/±2 / E-W±1/±2 / diag±1 / knight).
-        let mut ff_at: std::collections::HashMap<String, Site> = std::collections::HashMap::new();
+        let mut ff_at: std::collections::HashMap<&str, Site> = std::collections::HashMap::new();
         let mut excepted_iob: HashSet<usize> = HashSet::new();
         // Seed sweeps: process LUTFFs in a seeded order so different seeds
         // explore genuinely different placements. Seed 0 = legacy order.
         // Sites are recorded by PACKED index, never in visitation order:
         // lutff_sites[i] must match packed.lutffs[i] (INIT programming,
         // router IMUX, cell_bel, lutff_of all index by packed order).
-        let lutff_order = seeded_order(packed.lutffs.len(), opts.seed);
+        let lutff_order = {
+            // Timing-driven order: sort by criticality (descending) so critical
+            // cells are placed first in better locations. Falls back to seeded
+            // order if no criticality info available.
+            let mut order: Vec<usize> = (0..packed.lutffs.len()).collect();
+            // Check if guide has any criticality info
+            let has_criticality = !guide.net_criticality.is_empty();
+            if has_criticality {
+                order.sort_by(|&a, &b| {
+                    let crit_a = guide.net_criticality(&packed.lutffs[a].q_net);
+                    let crit_b = guide.net_criticality(&packed.lutffs[b].q_net);
+                    // Sort descending by criticality (higher first)
+                    crit_b.partial_cmp(&crit_a).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            } else {
+                order = seeded_order(packed.lutffs.len(), opts.seed);
+            }
+            order
+        };
         let mut site_of: Vec<Option<(Site, u8)>> = vec![None; packed.lutffs.len()];
         for &li in &lutff_order {
             let lf = &packed.lutffs[li];
@@ -753,7 +787,7 @@ pub fn place_with_guide(
             }
             *site_used_n.entry((site_ble.0.x, site_ble.0.y)).or_insert(0) += 1;
             if !lf.ff_cell.is_empty() {
-                ff_at.insert(lf.ff_cell.clone(), site_ble.0);
+                ff_at.insert(lf.ff_cell.as_str(), site_ble.0);
             }
             if excepted_iob_cluster {
                 excepted_iob.insert(li);
@@ -847,7 +881,10 @@ pub fn place_with_guide(
             }
         }
         // Reused across cells/passes to cut HashSet/Vec alloc churn.
-        let mut cand_seen: HashSet<(u32, u32)> = HashSet::new();
+        let stamp_gx = (max_x as usize).saturating_add(16);
+        let stamp_gy = (max_y as usize).saturating_add(16);
+        let mut cand_stamp: Vec<u32> = vec![0; stamp_gx.saturating_mul(stamp_gy)];
+        let mut cand_epoch: u32 = 0;
         let mut cand_xy: Vec<(u32, u32)> = Vec::with_capacity(128);
         let mut remaining_sinks: Vec<usize> = Vec::with_capacity(nplace);
         let mut remaining_drvs: Vec<usize> = Vec::with_capacity(nplace);
@@ -1010,7 +1047,7 @@ pub fn place_with_guide(
             let mut pass_drv_swapped = 0u32;
             // --- Phase A: pull sinks toward drivers (existing) ---
             for &i in &remaining_sinks {
-                let lf = &packed.lutffs[i];
+                let _lf = &packed.lutffs[i];
                 let (cur_site, cur_ble) = lutff_sites[i];
                 let before_sc = imux_score_idx(&pin_drv[i], cur_site, &lutff_sites, None, None);
                 let before = before_sc.0;
@@ -1038,32 +1075,49 @@ pub fn place_with_guide(
                         push_gradient(&mut cand_xy, cur_site.x, cur_site.y, ds.x, ds.y);
                     }
                 }
-                cand_seen.clear();
-                cand_xy.retain(|xy| cand_seen.insert(*xy));
+                cand_epoch = cand_epoch.wrapping_add(1);
+                if cand_epoch == 0 {
+                    cand_stamp.fill(0);
+                    cand_epoch = 1;
+                }
+                let ep = cand_epoch;
+                cand_xy.retain(|&(x, y)| {
+                    let ux = x as usize;
+                    let uy = y as usize;
+                    if ux < stamp_gx && uy < stamp_gy {
+                        let slot = &mut cand_stamp[uy * stamp_gx + ux];
+                        if *slot == ep {
+                            false
+                        } else {
+                            *slot = ep;
+                            true
+                        }
+                    } else {
+                        false
+                    }
+                });
                 let skip = (cur_site.x, cur_site.y, cur_ble);
-                // 1) Prefer empty BLE: score is site-only (BLE-independent) — once/site.
+                // 1) Prefer empty BLE: check free BLE in O(1) before scoring site.
                 let mut best: Option<(Site, u8, (u32, u32))> = None;
                 for (cx, cy) in &cand_xy {
                     let Some(site) = grid.site_xy(*cx, *cy) else {
+                        continue;
+                    };
+                    let Some(ble) = grid.first_free_ble(site.x, site.y, skip) else {
                         continue;
                     };
                     let sc = imux_score_idx(&pin_drv[i], site, &lutff_sites, None, None);
                     if sc >= before_sc || best.as_ref().map(|b| sc >= b.2).unwrap_or(false) {
                         continue;
                     }
-                    if let Some(ble) = grid.first_free_ble(site.x, site.y, skip) {
-                        best = Some((site, ble, sc));
-                        if sc.0 == 0 {
-                            break;
-                        }
+                    best = Some((site, ble, sc));
+                    if sc.0 == 0 {
+                        break;
                     }
                 }
                 if let Some((site, ble, _)) = best {
                     grid.relocate(skip, (site.x, site.y, ble), i);
                     lutff_sites[i] = (site, ble);
-                    if !lf.ff_cell.is_empty() {
-                        ff_at.insert(lf.ff_cell.clone(), site);
-                    }
                     pass_moved += 1;
                     continue;
                 }
@@ -1092,6 +1146,9 @@ pub fn place_with_guide(
                         let ov_a = Some((i, site));
                         let ov_b = Some((j, cur_site));
                         let sc_i = imux_score_idx(&pin_drv[i], site, &lutff_sites, ov_a, ov_b);
+                        if sc_i.0 > before + other_before_sc.0 {
+                            continue;
+                        }
                         let sc_j = imux_score_idx(&pin_drv[j], cur_site, &lutff_sites, ov_a, ov_b);
                         let after = (sc_i.0 + sc_j.0, sc_i.1 + sc_j.1);
                         let before_tot =
@@ -1120,12 +1177,7 @@ pub fn place_with_guide(
                     );
                     lutff_sites[i] = (site, ble);
                     lutff_sites[j] = (cur_site, cur_ble);
-                    if !lf.ff_cell.is_empty() {
-                        ff_at.insert(lf.ff_cell.clone(), site);
-                    }
-                    if !packed.lutffs[j].ff_cell.is_empty() {
-                        ff_at.insert(packed.lutffs[j].ff_cell.clone(), cur_site);
-                    }
+                    // ff_at is not used after initial affinity placement.
                     pass_swapped += 1;
                 }
             }
@@ -1137,7 +1189,6 @@ pub fn place_with_guide(
                 if lf.ff_cell.is_empty() {
                     continue;
                 }
-                let d_ff = lf.ff_cell.as_str();
                 let sink_idxs = sinks_of[i].as_slice();
                 if sink_idxs.is_empty() {
                     continue;
@@ -1179,13 +1230,35 @@ pub fn place_with_guide(
                         push_gradient(&mut cand_xy, cur_site.x, cur_site.y, x, y);
                     }
                 }
-                cand_seen.clear();
-                cand_xy.retain(|xy| cand_seen.insert(*xy));
+                cand_epoch = cand_epoch.wrapping_add(1);
+                if cand_epoch == 0 {
+                    cand_stamp.fill(0);
+                    cand_epoch = 1;
+                }
+                let ep = cand_epoch;
+                cand_xy.retain(|&(x, y)| {
+                    let ux = x as usize;
+                    let uy = y as usize;
+                    if ux < stamp_gx && uy < stamp_gy {
+                        let slot = &mut cand_stamp[uy * stamp_gx + ux];
+                        if *slot == ep {
+                            false
+                        } else {
+                            *slot = ep;
+                            true
+                        }
+                    } else {
+                        false
+                    }
+                });
                 let skip = (cur_site.x, cur_site.y, cur_ble);
-                // 1) Empty BLE move for driver — score site-only once (BLE-independent).
+                // 1) Empty BLE move for driver — check free BLE in O(1) before scoring site.
                 let mut best: Option<(Site, u8, (u32, u32, u32))> = None;
                 for (cx, cy) in &cand_xy {
                     let Some(site) = grid.site_xy(*cx, *cy) else {
+                        continue;
+                    };
+                    let Some(ble) = grid.first_free_ble(site.x, site.y, skip) else {
                         continue;
                     };
                     let sc = drv_score_idx(
@@ -1200,17 +1273,14 @@ pub fn place_with_guide(
                     if sc >= before || best.as_ref().map(|b| sc >= b.2).unwrap_or(false) {
                         continue;
                     }
-                    if let Some(ble) = grid.first_free_ble(site.x, site.y, skip) {
-                        best = Some((site, ble, sc));
-                        if sc.0 == 0 {
-                            break;
-                        }
+                    best = Some((site, ble, sc));
+                    if sc.0 == 0 {
+                        break;
                     }
                 }
                 if let Some((site, ble, _)) = best {
                     grid.relocate(skip, (site.x, site.y, ble), i);
                     lutff_sites[i] = (site, ble);
-                    ff_at.insert(d_ff.to_owned(), site);
                     pass_drv_moved += 1;
                     continue;
                 }
@@ -1292,10 +1362,7 @@ pub fn place_with_guide(
                     );
                     lutff_sites[i] = (site, ble);
                     lutff_sites[j] = (cur_site, cur_ble);
-                    ff_at.insert(d_ff.to_owned(), site);
-                    if !packed.lutffs[j].ff_cell.is_empty() {
-                        ff_at.insert(packed.lutffs[j].ff_cell.clone(), cur_site);
-                    }
+                    // ff_at is not used after initial affinity placement.
                     pass_drv_swapped += 1;
                 }
             }
@@ -1471,26 +1538,32 @@ pub fn place_incremental_with_guide(
 ) -> Result<(Placed, usize), String> {
     let mut placed = place_with_guide(packed, dev, opts, guide)?;
     let mut reused = 0usize;
-    let mut used: HashSet<(u32, u32, u8)> = HashSet::new();
+    let prev_lutff: std::collections::HashMap<&str, usize> = prev
+        .packed
+        .lutffs
+        .iter()
+        .enumerate()
+        .map(|(j, p)| (p.lut_cell.as_str(), j))
+        .collect();
     for (i, lf) in packed.lutffs.iter().enumerate() {
-        if let Some(j) = prev
-            .packed
-            .lutffs
-            .iter()
-            .position(|p| p.lut_cell == lf.lut_cell)
-        {
+        if let Some(&j) = prev_lutff.get(lf.lut_cell.as_str()) {
             let site = prev.lutff_sites[j];
             placed.lutff_sites[i] = site;
-            used.insert((site.0.x, site.0.y, site.1));
             reused += 1;
         }
     }
+    let prev_iob: std::collections::HashMap<&str, usize> = prev
+        .packed
+        .iobs
+        .iter()
+        .enumerate()
+        .map(|(j, p)| (p.cell.as_str(), j))
+        .collect();
     for (i, iob) in packed.iobs.iter().enumerate() {
-        if let Some(j) = prev.packed.iobs.iter().position(|p| p.cell == iob.cell) {
+        if let Some(&j) = prev_iob.get(iob.cell.as_str()) {
             placed.iob_sites[i] = prev.iob_sites[j];
         }
     }
-    let _ = used;
     Ok((placed, reused))
 }
 
@@ -1501,6 +1574,1977 @@ pub fn lutff_of(placed: &Placed, ff_cell: &str) -> Option<(Site, u8)> {
         .iter()
         .position(|l| l.ff_cell == ff_cell)
         .map(|i| placed.lutff_sites[i])
+}
+
+/// Permute a 6-input LUT truth table according to `old_to_new`, where a signal
+/// previously connected to input `I{p}` (`p` in `0..6`) is moved to `I{old_to_new[p]}`.
+///
+/// Preserves the exact boolean function of the LUT across all 64 input combinations.
+pub fn permute_lut6_init(init: u64, old_to_new: &[u8; 6]) -> u64 {
+    if old_to_new == &[0, 1, 2, 3, 4, 5] {
+        return init;
+    }
+    let mut out = 0u64;
+    for new_addr in 0..64u64 {
+        let mut old_addr = 0u64;
+        for (old_p, &new_p) in old_to_new.iter().enumerate() {
+            let np = (new_p as u64).min(5);
+            if ((new_addr >> np) & 1) == 1 {
+                old_addr |= 1u64 << old_p;
+            }
+        }
+        if ((init >> old_addr) & 1) == 1 {
+            out |= 1u64 << new_addr;
+        }
+    }
+    out
+}
+
+/// Reorder connected LUT input pins so longer-wire / higher-delay fanin arcs
+/// land on lower-indexed (faster) LUT pins (`I0`, `I1`, ...), updating each
+/// LUT's 64-bit `init` truth table via [`permute_lut6_init`] so logical behavior
+/// is invariant. Returns the number of LUT clusters whose pin assignments changed.
+pub fn permute_lut_pins_for_timing(placed: &mut Placed) -> usize {
+    let n = placed.lutff_sites.len().min(placed.packed.lutffs.len());
+    let mut ff_site: std::collections::HashMap<String, Site> =
+        std::collections::HashMap::with_capacity(n);
+    for i in 0..n {
+        let lf = &placed.packed.lutffs[i];
+        if !lf.ff_cell.is_empty() {
+            ff_site.insert(lf.ff_cell.clone(), placed.lutff_sites[i].0);
+        }
+    }
+    let mut permuted = 0usize;
+    for i in 0..n {
+        let site = placed.lutff_sites[i].0;
+        let lf = &mut placed.packed.lutffs[i];
+        if lf.lut_pins.is_empty() {
+            continue;
+        }
+        // Rank each connected pin by (Manhattan distance from driver descending, original pin ascending).
+        let mut entries: Vec<(u8, String, u32)> = lf
+            .lut_pins
+            .iter()
+            .map(|(p, drv)| {
+                let dist = ff_site
+                    .get(drv.as_str())
+                    .map(|ds| ds.x.abs_diff(site.x) + ds.y.abs_diff(site.y))
+                    .unwrap_or(0);
+                (*p, drv.clone(), dist)
+            })
+            .collect();
+        // Deduplicate by pin index if any duplicate pin numbers exist.
+        let mut seen_p = [false; 6];
+        if entries.iter().any(|(p, _, _)| {
+            let idx = *p as usize;
+            if idx >= 6 || seen_p[idx] {
+                true
+            } else {
+                seen_p[idx] = true;
+                false
+            }
+        }) {
+            continue;
+        }
+        entries.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        let mut old_to_new: [u8; 6] = [0, 1, 2, 3, 4, 5];
+        let mut used_new = [false; 6];
+        let mut changed = false;
+        let mut new_pins: Vec<(u8, String)> = Vec::with_capacity(entries.len());
+        for (new_slot, (old_p, drv, _)) in entries.into_iter().enumerate() {
+            let new_p = new_slot as u8;
+            old_to_new[old_p as usize] = new_p;
+            used_new[new_p as usize] = true;
+            if old_p != new_p {
+                changed = true;
+            }
+            new_pins.push((new_p, drv));
+        }
+        if !changed {
+            continue;
+        }
+        // Assign remaining unused old pins bijectively to remaining unused new slots.
+        let mut free_new = (0..6u8).filter(|&p| !used_new[p as usize]);
+        for old_p in 0..6u8 {
+            if !seen_p[old_p as usize] {
+                if let Some(np) = free_new.next() {
+                    old_to_new[old_p as usize] = np;
+                }
+            }
+        }
+        lf.init = permute_lut6_init(lf.init, &old_to_new);
+        lf.lut_pins = new_pins;
+        permuted += 1;
+    }
+    permuted
+}
+
+/// Vivado UG904 `Congestion_SpreadLogic_high` placement density inflation and cell spreading.
+///
+/// Computes effective pin/BLE density per CLB site and spreads excess clusters from sites
+/// exceeding `max_ble_per_site` (clamped to `1..=dev.n_ble`) outward to nearby low-density
+/// CLB sites while preserving IMUX reachability where possible.
+/// Returns the spread [`Placed`] and the number of relocated LUTFF clusters.
+pub fn place_congestion_spread(
+    placed: &Placed,
+    dev: &Device,
+    max_ble_per_site: u8,
+) -> Result<(Placed, usize), String> {
+    let mut out = placed.clone();
+    let n = out.lutff_sites.len().min(out.packed.lutffs.len());
+    if n == 0 {
+        return Ok((out, 0));
+    }
+    let n_ble = dev.n_ble.max(1) as u8;
+    let cap = max_ble_per_site.clamp(1, n_ble);
+    let mut clb_sites: Vec<Site> = dev.clb_sites().collect();
+    if clb_sites.is_empty() {
+        return Err("device has no CLB sites for congestion spreading".into());
+    }
+    clb_sites.sort_by_key(|s| (s.x, s.y));
+
+    let mut site_occ: std::collections::HashMap<(u32, u32), Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut used_ble: HashSet<(u32, u32, u8)> = HashSet::with_capacity(n);
+    for i in 0..n {
+        let (s, ble) = out.lutff_sites[i];
+        site_occ.entry((s.x, s.y)).or_default().push(i);
+        used_ble.insert((s.x, s.y, ble));
+    }
+
+    // Build driver/sink adjacency so spreading prefers IMUX-legal target sites
+    // and moves high-pin-density clusters first when relieving hot spots.
+    let mut ff_idx: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(n);
+    for i in 0..n {
+        let lf = &out.packed.lutffs[i];
+        if !lf.ff_cell.is_empty() {
+            ff_idx.insert(lf.ff_cell.as_str(), i);
+        }
+    }
+    let pin_drv: Vec<Vec<Option<usize>>> = (0..n)
+        .map(|i| {
+            out.packed.lutffs[i]
+                .lut_pins
+                .iter()
+                .map(|(_, d)| ff_idx.get(d.as_str()).copied())
+                .collect()
+        })
+        .collect();
+    let mut sinks_of: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (si, drvs) in pin_drv.iter().enumerate() {
+        for &d in drvs.iter().flatten() {
+            if !sinks_of[d].contains(&si) {
+                sinks_of[d].push(si);
+            }
+        }
+    }
+
+    // Deterministic site order: sort congested sites by (occupancy desc, x, y).
+    let mut hot_sites: Vec<(u32, u32)> = site_occ
+        .iter()
+        .filter(|(_, members)| members.len() > cap as usize)
+        .map(|(&xy, _)| xy)
+        .collect();
+    hot_sites.sort_by(|a, b| {
+        site_occ[b]
+            .len()
+            .cmp(&site_occ[a].len())
+            .then_with(|| a.cmp(b))
+    });
+
+    let mut occ_count: std::collections::HashMap<(u32, u32), u8> = site_occ
+        .iter()
+        .map(|(&xy, v)| (xy, v.len() as u8))
+        .collect();
+    let mut moved = 0usize;
+
+    for (hx, hy) in hot_sites {
+        let Some(mut members) = site_occ.get(&(hx, hy)).cloned() else {
+            continue;
+        };
+        if members.len() <= cap as usize {
+            continue;
+        }
+        // Inflate priority for high pin/fanout degree clusters; keep BLE0 anchor last.
+        members.sort_by(|&a, &b| {
+            let deg_a = out.packed.lutffs[a].lut_pins.len() + sinks_of[a].len();
+            let deg_b = out.packed.lutffs[b].lut_pins.len() + sinks_of[b].len();
+            deg_b
+                .cmp(&deg_a)
+                .then_with(|| out.lutff_sites[b].1.cmp(&out.lutff_sites[a].1))
+        });
+        let excess = members.len() - cap as usize;
+        for &ci in members.iter().take(excess) {
+            let (cur_site, cur_ble) = out.lutff_sites[ci];
+            // Find nearest CLB site with occupancy < cap that keeps connected arcs IMUX-local if possible.
+            let mut best_target: Option<(Site, u8, (u32, u32, u8))> = None;
+            for &cand in &clb_sites {
+                if cand.x == cur_site.x && cand.y == cur_site.y {
+                    continue;
+                }
+                let c_occ = occ_count.get(&(cand.x, cand.y)).copied().unwrap_or(0);
+                if c_occ >= cap {
+                    continue;
+                }
+                let Some(free_ble) = (0..n_ble).find(|&b| !used_ble.contains(&(cand.x, cand.y, b)))
+                else {
+                    continue;
+                };
+                let mut illegal_arcs = 0u32;
+                for &di in pin_drv[ci].iter().flatten() {
+                    let ds = if di == ci { cand } else { out.lutff_sites[di].0 };
+                    if !imux_local(ds, cand) {
+                        illegal_arcs += 1;
+                    }
+                }
+                for &si in &sinks_of[ci] {
+                    let ss = if si == ci { cand } else { out.lutff_sites[si].0 };
+                    if !imux_local(cand, ss) {
+                        illegal_arcs += 1;
+                    }
+                }
+                let dist = cand.x.abs_diff(cur_site.x) + cand.y.abs_diff(cur_site.y);
+                let key = (illegal_arcs, dist, c_occ);
+                if best_target.as_ref().map(|b| key < b.2).unwrap_or(true) {
+                    best_target = Some((cand, free_ble, key));
+                }
+            }
+            if let Some((target_site, target_ble, _)) = best_target {
+                used_ble.remove(&(cur_site.x, cur_site.y, cur_ble));
+                used_ble.insert((target_site.x, target_site.y, target_ble));
+                if let Some(c) = occ_count.get_mut(&(cur_site.x, cur_site.y)) {
+                    *c = c.saturating_sub(1);
+                }
+                *occ_count.entry((target_site.x, target_site.y)).or_insert(0) += 1;
+                out.lutff_sites[ci] = (target_site, target_ble);
+                moved += 1;
+            }
+        }
+    }
+    Ok((out, moved))
+}
+
+/// Summary metrics from post-placement physical optimization ([`phys_opt_place_with_stats`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PhysOptPlaceStats {
+    pub relocated_cells: usize,
+    pub swapped_cells: usize,
+    pub permuted_luts: usize,
+    pub wirelength_before: u64,
+    pub wirelength_after: u64,
+}
+
+/// Compute total Manhattan wirelength across all LUT-pin fanins and IOB output arcs.
+pub fn total_wirelength(placed: &Placed) -> u64 {
+    let n = placed.lutff_sites.len().min(placed.packed.lutffs.len());
+    let mut ff_site: std::collections::HashMap<&str, Site> =
+        std::collections::HashMap::with_capacity(n);
+    let mut q_site: std::collections::HashMap<&str, Site> =
+        std::collections::HashMap::with_capacity(n);
+    for i in 0..n {
+        let lf = &placed.packed.lutffs[i];
+        let s = placed.lutff_sites[i].0;
+        if !lf.ff_cell.is_empty() {
+            ff_site.insert(lf.ff_cell.as_str(), s);
+        }
+        if !lf.q_net.is_empty() {
+            q_site.insert(lf.q_net.as_str(), s);
+        }
+    }
+    let mut wl = 0u64;
+    for i in 0..n {
+        let s = placed.lutff_sites[i].0;
+        for (_, drv) in &placed.packed.lutffs[i].lut_pins {
+            if let Some(&ds) = ff_site.get(drv.as_str()) {
+                wl += (ds.x.abs_diff(s.x) + ds.y.abs_diff(s.y)) as u64;
+            }
+        }
+    }
+    for (ii, iob) in placed.packed.iobs.iter().enumerate() {
+        if let (Some(&isite), Some(&csite)) =
+            (placed.iob_sites.get(ii), q_site.get(iob.from_net.as_str()))
+        {
+            wl += (csite.x.abs_diff(isite.x) + csite.y.abs_diff(isite.y)) as u64;
+        }
+    }
+    wl
+}
+
+/// Vivado UG904 post-place `phys_opt_design`: critical-path local cell relocation/swapping
+/// and LUT input pin timing permutation.
+pub fn phys_opt_place(placed: &Placed, dev: &Device) -> Result<Placed, String> {
+    Ok(phys_opt_place_with_stats(placed, dev)?.0)
+}
+
+/// Run post-place `phys_opt_design` and return both the optimized [`Placed`] and [`PhysOptPlaceStats`].
+pub fn phys_opt_place_with_stats(
+    placed: &Placed,
+    dev: &Device,
+) -> Result<(Placed, PhysOptPlaceStats), String> {
+    let mut out = placed.clone();
+    let wl_before = total_wirelength(&out);
+    let n = out.lutff_sites.len().min(out.packed.lutffs.len());
+    if n == 0 {
+        return Ok((
+            out,
+            PhysOptPlaceStats {
+                wirelength_before: wl_before,
+                wirelength_after: wl_before,
+                ..Default::default()
+            },
+        ));
+    }
+    let n_ble = dev.n_ble.max(1) as usize;
+    let mut clb_sites: Vec<Site> = dev.clb_sites().collect();
+    clb_sites.sort_by_key(|s| (s.x, s.y));
+    let (mut max_x, mut max_y) = (0u32, 0u32);
+    for &s in &clb_sites {
+        max_x = max_x.max(s.x);
+        max_y = max_y.max(s.y);
+    }
+    let mut grid = LegalizeGrid::new(max_x, max_y, n_ble);
+    for &s in &clb_sites {
+        grid.set_site(s);
+    }
+    for (i, &(s, ble)) in out.lutff_sites.iter().enumerate().take(n) {
+        grid.place_at(s.x, s.y, ble, i);
+    }
+
+    let mut ff_idx: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(n);
+    for i in 0..n {
+        let lf = &out.packed.lutffs[i];
+        if !lf.ff_cell.is_empty() {
+            ff_idx.insert(lf.ff_cell.as_str(), i);
+        }
+    }
+    let pin_drv: Vec<Vec<Option<usize>>> = (0..n)
+        .map(|i| {
+            out.packed.lutffs[i]
+                .lut_pins
+                .iter()
+                .map(|(_, d)| ff_idx.get(d.as_str()).copied())
+                .collect()
+        })
+        .collect();
+    let mut sinks_of: Vec<Vec<(usize, u32)>> = vec![Vec::new(); n];
+    for (si, pins) in pin_drv.iter().enumerate() {
+        for &d in pins.iter().flatten() {
+            if let Some(slot) = sinks_of[d].iter_mut().find(|(s, _)| *s == si) {
+                slot.1 += 1;
+            } else {
+                sinks_of[d].push((si, 1));
+            }
+        }
+    }
+    let mut iob_target: Vec<Option<Site>> = vec![None; n];
+    for (ii, iob) in out.packed.iobs.iter().enumerate() {
+        if let Some(&isite) = out.iob_sites.get(ii) {
+            for i in 0..n {
+                if out.packed.lutffs[i].q_net == iob.from_net {
+                    iob_target[i] = Some(isite);
+                }
+            }
+        }
+    }
+
+    // Score a cluster at `site`: (illegal_imux_arcs, weighted_wirelength).
+    let cluster_cost = |ci: usize,
+                        site: Site,
+                        sites: &[(Site, u8)],
+                        ov_a: Option<(usize, Site)>,
+                        ov_b: Option<(usize, Site)>|
+     -> (u32, u64) {
+        let mut ill = 0u32;
+        let mut wl = 0u64;
+        for &d in &pin_drv[ci] {
+            let Some(di) = d else {
+                continue;
+            };
+            let ds = if di == ci {
+                site
+            } else {
+                cluster_site(di, sites, ov_a, ov_b)
+            };
+            if !imux_local(ds, site) {
+                ill += 1;
+            }
+            wl += (ds.x.abs_diff(site.x) + ds.y.abs_diff(site.y)) as u64;
+        }
+        for &(si, pins) in &sinks_of[ci] {
+            if si == ci {
+                continue;
+            }
+            let ss = cluster_site(si, sites, ov_a, ov_b);
+            if !imux_local(site, ss) {
+                ill += pins;
+            }
+            wl += (pins as u64) * (site.x.abs_diff(ss.x) + site.y.abs_diff(ss.y)) as u64;
+        }
+        if let Some(isite) = iob_target[ci] {
+            // Critical IOB driver arc weighted 2x to pull toward IOB pad without breaking IMUX.
+            wl += 2 * (site.x.abs_diff(isite.x) + site.y.abs_diff(isite.y)) as u64;
+        }
+        (ill, wl)
+    };
+
+    let mut relocated_cells = 0usize;
+    let mut swapped_cells = 0usize;
+
+    for _pass in 0..4 {
+        let mut pass_changed = 0usize;
+        // Rank clusters by descending current local wirelength so critical paths move first.
+        let mut order: Vec<(usize, (u32, u64))> = (0..n)
+            .map(|i| {
+                let c = cluster_cost(i, out.lutff_sites[i].0, &out.lutff_sites, None, None);
+                (i, c)
+            })
+            .collect();
+        order.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        for (ci, _) in order {
+            let (cur_site, cur_ble) = out.lutff_sites[ci];
+            let before = cluster_cost(ci, cur_site, &out.lutff_sites, None, None);
+            if before.0 == 0 && before.1 == 0 {
+                continue;
+            }
+            // Candidate neighborhood: centroid of connected terminals and ±2 window around current site.
+            let mut cands: Vec<(u32, u32)> = Vec::with_capacity(32);
+            let (mut sx, mut sy, mut cnt) = (0u64, 0u64, 0u64);
+            for &di in pin_drv[ci].iter().flatten() {
+                let ds = out.lutff_sites[di].0;
+                cands.push((ds.x, ds.y));
+                sx += ds.x as u64;
+                sy += ds.y as u64;
+                cnt += 1;
+            }
+            for &(si, _) in &sinks_of[ci] {
+                let ss = out.lutff_sites[si].0;
+                cands.push((ss.x, ss.y));
+                sx += ss.x as u64;
+                sy += ss.y as u64;
+                cnt += 1;
+            }
+            if let Some(isite) = iob_target[ci] {
+                cands.push((isite.x, isite.y.max(dev.clb_y0)));
+                sx += isite.x as u64;
+                sy += isite.y.max(dev.clb_y0) as u64;
+                cnt += 1;
+            }
+            if cnt > 0 {
+                let mx = (sx / cnt) as u32;
+                let my = (sy / cnt) as u32;
+                for dx in -2i32..=2 {
+                    for dy in -2i32..=2 {
+                        let nx = (mx as i32 + dx).max(0) as u32;
+                        let ny = (my as i32 + dy).max(0) as u32;
+                        cands.push((nx, ny));
+                    }
+                }
+            }
+            for dx in -2i32..=2 {
+                for dy in -2i32..=2 {
+                    let nx = (cur_site.x as i32 + dx).max(0) as u32;
+                    let ny = (cur_site.y as i32 + dy).max(0) as u32;
+                    cands.push((nx, ny));
+                }
+            }
+            cands.sort_unstable();
+            cands.dedup();
+
+            let skip = (cur_site.x, cur_site.y, cur_ble);
+            let mut best_move: Option<(Site, u8, (u32, u64))> = None;
+            for &(cx, cy) in &cands {
+                if cx == cur_site.x && cy == cur_site.y {
+                    continue;
+                }
+                let Some(site) = grid.site_xy(cx, cy) else {
+                    continue;
+                };
+                let Some(ble) = grid.first_free_ble(site.x, site.y, skip) else {
+                    continue;
+                };
+                let after = cluster_cost(ci, site, &out.lutff_sites, Some((ci, site)), None);
+                if after < before && best_move.as_ref().map(|b| after < b.2).unwrap_or(true) {
+                    best_move = Some((site, ble, after));
+                }
+            }
+            if let Some((site, ble, _)) = best_move {
+                grid.relocate(skip, (site.x, site.y, ble), ci);
+                out.lutff_sites[ci] = (site, ble);
+                relocated_cells += 1;
+                pass_changed += 1;
+                continue;
+            }
+
+            // Try pairwise swap with occupant when no free BLE exists at a better site.
+            let mut best_swap: Option<(usize, Site, u8, (u32, u64))> = None;
+            for &(cx, cy) in &cands {
+                if cx == cur_site.x && cy == cur_site.y {
+                    continue;
+                }
+                let Some(site) = grid.site_xy(cx, cy) else {
+                    continue;
+                };
+                if grid.occ(site.x, site.y) == 0 {
+                    continue;
+                }
+                for ble in 0..n_ble as u8 {
+                    let Some(cj) = grid.occupant(site.x, site.y, ble) else {
+                        continue;
+                    };
+                    if cj == ci {
+                        continue;
+                    }
+                    let before_j = cluster_cost(cj, site, &out.lutff_sites, None, None);
+                    let before_tot = (before.0 + before_j.0, before.1 + before_j.1);
+                    let ov_a = Some((ci, site));
+                    let ov_b = Some((cj, cur_site));
+                    let after_i = cluster_cost(ci, site, &out.lutff_sites, ov_a, ov_b);
+                    if after_i.0 > before_tot.0 {
+                        continue;
+                    }
+                    let after_j = cluster_cost(cj, cur_site, &out.lutff_sites, ov_a, ov_b);
+                    let after_tot = (after_i.0 + after_j.0, after_i.1 + after_j.1);
+                    if after_tot < before_tot
+                        && best_swap.as_ref().map(|b| after_tot < b.3).unwrap_or(true)
+                    {
+                        best_swap = Some((cj, site, ble, after_tot));
+                    }
+                }
+            }
+            if let Some((cj, site, ble, _)) = best_swap {
+                let (osite, oble) = out.lutff_sites[cj];
+                grid.swap_bles(
+                    (cur_site.x, cur_site.y, cur_ble),
+                    (osite.x, osite.y, oble),
+                    ci,
+                    cj,
+                );
+                out.lutff_sites[ci] = (site, ble);
+                out.lutff_sites[cj] = (cur_site, cur_ble);
+                swapped_cells += 1;
+                pass_changed += 1;
+            }
+        }
+        if pass_changed == 0 {
+            break;
+        }
+    }
+
+    let permuted_luts = permute_lut_pins_for_timing(&mut out);
+    let wl_after = total_wirelength(&out);
+    if out.timing_weight > 0.0 {
+        out.cost = out
+            .lutff_sites
+            .first()
+            .zip(out.iob_sites.first())
+            .map(|(l, i)| (l.0.y as f64 - i.y as f64).abs() * out.timing_weight)
+            .unwrap_or(0.0);
+    } else {
+        out.cost = out.lutff_sites.first().map(|(s, _)| s.y as f64).unwrap_or(0.0);
+    }
+    Ok((
+        out,
+        PhysOptPlaceStats {
+            relocated_cells,
+            swapped_cells,
+            permuted_luts,
+            wirelength_before: wl_before,
+            wirelength_after: wl_after,
+        },
+    ))
+}
+
+/// Compute the timing-driven net criticality exponent:
+///
+/// $$w_e = \max\left(0, 1 - \frac{\text{slack}}{T_{\text{crit}}}\right)^\alpha$$
+///
+/// Returns a value in `[0.0, 1.0]`. Negative slack saturates at `1.0`; slack
+/// `>= t_crit_ps` yields `0.0`.
+pub fn slack_criticality_weight(slack_ps: f64, t_crit_ps: f64, alpha: f64) -> f64 {
+    if t_crit_ps <= 0.0 {
+        return 0.0;
+    }
+    let ratio = (1.0 - slack_ps / t_crit_ps).clamp(0.0, 1.0);
+    ratio.powf(alpha.max(0.0))
+}
+
+/// Configuration options for the electrostatic / B2B quadratic analytical placer
+/// ([`place_analytical_with`]).
+#[derive(Clone, Debug)]
+pub struct AnalyticalPlaceOpts {
+    /// Timing weight scaling factor on critical nets (`>= 0.0`).
+    pub timing_weight: f64,
+    /// Criticality exponent $\alpha$ in $w_e = (1 - \text{slack}/T_{\text{crit}})^\alpha$.
+    pub criticality_exp: f64,
+    /// Reference critical path period $T_{\text{crit}}$ (ps) for slack normalization.
+    pub t_crit_ps: f64,
+    /// Outer B2B + electrostatic density spreading iterations.
+    pub outer_iters: usize,
+    /// Maximum inner Conjugate Gradient iterations per axis solve.
+    pub cg_max_iters: usize,
+    /// Relative residual convergence tolerance for Conjugate Gradient.
+    pub cg_tol: f64,
+    /// Per-net slack in picoseconds (optional; falls back to topological depth criticality).
+    pub net_slack_ps: std::collections::HashMap<String, f64>,
+}
+
+impl Default for AnalyticalPlaceOpts {
+    fn default() -> Self {
+        Self {
+            timing_weight: 0.75,
+            criticality_exp: 2.0,
+            t_crit_ps: 10_000.0,
+            outer_iters: 6,
+            cg_max_iters: 64,
+            cg_tol: 1e-5,
+            net_slack_ps: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Telemetry from an analytical placement run ([`place_analytical_with_stats`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AnalyticalPlaceStats {
+    pub outer_iters: usize,
+    pub cg_iters_total: usize,
+    pub ripple_moves: usize,
+    pub hpwl_initial: f64,
+    pub hpwl_final: f64,
+}
+
+/// Solve the Symmetric Positive Definite (SPD) linear system $A x = b$ using
+/// Jacobi-preconditioned Conjugate Gradient, where `diag[i] = A_{ii}` and each
+/// `(u, v, w)` in `edges` contributes `-w` to $A_{uv}$ and $A_{vu}$.
+/// Returns `(solution_vec, iterations_run)`.
+pub fn solve_cg_spd(
+    n: usize,
+    diag: &[f64],
+    edges: &[(usize, usize, f64)],
+    rhs: &[f64],
+    x0: &[f64],
+    max_iters: usize,
+    tol: f64,
+) -> (Vec<f64>, usize) {
+    if n == 0 {
+        return (Vec::new(), 0);
+    }
+    let mut x = if x0.len() == n {
+        x0.to_vec()
+    } else {
+        vec![0.0; n]
+    };
+    let apply_a = |v: &[f64], out: &mut [f64]| {
+        for i in 0..n {
+            out[i] = diag[i].max(1e-9) * v[i];
+        }
+        for &(u, w_idx, weight) in edges {
+            out[u] -= weight * v[w_idx];
+            out[w_idx] -= weight * v[u];
+        }
+    };
+    let mut ax = vec![0.0; n];
+    apply_a(&x, &mut ax);
+    let mut r = vec![0.0; n];
+    let mut z = vec![0.0; n];
+    let mut p = vec![0.0; n];
+    let mut ap = vec![0.0; n];
+    let mut rhs_norm_sq = 0.0;
+    for i in 0..n {
+        r[i] = rhs[i] - ax[i];
+        let inv_d = 1.0 / diag[i].max(1e-9);
+        z[i] = inv_d * r[i];
+        p[i] = z[i];
+        rhs_norm_sq += rhs[i] * rhs[i];
+    }
+    let stop_rsq = (tol * tol) * rhs_norm_sq.max(1.0);
+    let mut rz_old: f64 = r.iter().zip(z.iter()).map(|(ri, zi)| ri * zi).sum();
+    let mut iters = 0usize;
+    for _ in 0..max_iters {
+        let r_norm_sq: f64 = r.iter().map(|ri| ri * ri).sum();
+        if r_norm_sq <= stop_rsq {
+            break;
+        }
+        iters += 1;
+        apply_a(&p, &mut ap);
+        let pap: f64 = p.iter().zip(ap.iter()).map(|(pi, api)| pi * api).sum();
+        if pap.abs() <= 1e-15 {
+            break;
+        }
+        let alpha = rz_old / pap;
+        for i in 0..n {
+            x[i] += alpha * p[i];
+            r[i] -= alpha * ap[i];
+        }
+        let r_norm_sq_after: f64 = r.iter().map(|ri| ri * ri).sum();
+        if r_norm_sq_after <= stop_rsq {
+            break;
+        }
+        let mut rz_new = 0.0;
+        for i in 0..n {
+            z[i] = r[i] / diag[i].max(1e-9);
+            rz_new += r[i] * z[i];
+        }
+        if rz_old.abs() <= 1e-15 {
+            break;
+        }
+        let beta = rz_new / rz_old;
+        for i in 0..n {
+            p[i] = z[i] + beta * p[i];
+        }
+        rz_old = rz_new;
+    }
+    (x, iters)
+}
+
+#[derive(Clone, Copy)]
+enum B2bPin {
+    Movable(usize),
+    Fixed(f64),
+}
+
+/// Build 1D Bound-to-Bound (B2B) quadratic wirelength Laplacian system along one axis.
+fn build_b2b_axis_system(
+    n: usize,
+    pos: &[f64],
+    nets: &[(Vec<B2bPin>, f64)],
+    anchor_pos: &[f64],
+    anchor_weight: f64,
+) -> (Vec<f64>, Vec<(usize, usize, f64)>, Vec<f64>) {
+    let mut diag = vec![1e-6; n];
+    let mut rhs = vec![0.0; n];
+    let mut edge_map: std::collections::HashMap<(usize, usize), f64> =
+        std::collections::HashMap::new();
+
+    let mut add_spring = |a: B2bPin, b: B2bPin, w: f64| {
+        if w <= 0.0 {
+            return;
+        }
+        match (a, b) {
+            (B2bPin::Movable(u), B2bPin::Movable(v)) if u != v => {
+                diag[u] += w;
+                diag[v] += w;
+                let key = if u < v { (u, v) } else { (v, u) };
+                *edge_map.entry(key).or_insert(0.0) += w;
+            }
+            (B2bPin::Movable(u), B2bPin::Fixed(fx)) | (B2bPin::Fixed(fx), B2bPin::Movable(u)) => {
+                diag[u] += w;
+                rhs[u] += w * fx;
+            }
+            _ => {}
+        }
+    };
+
+    let coord_of = |p: B2bPin| -> f64 {
+        match p {
+            B2bPin::Movable(i) => pos[i],
+            B2bPin::Fixed(c) => c,
+        }
+    };
+
+    for (pins, net_w) in nets {
+        if pins.len() < 2 {
+            continue;
+        }
+        let mut min_idx = 0usize;
+        let mut max_idx = 0usize;
+        let mut min_c = coord_of(pins[0]);
+        let mut max_c = min_c;
+        for (idx, &p) in pins.iter().enumerate().skip(1) {
+            let c = coord_of(p);
+            if c < min_c {
+                min_c = c;
+                min_idx = idx;
+            }
+            if c > max_c {
+                max_c = c;
+                max_idx = idx;
+            }
+        }
+        if min_idx == max_idx {
+            max_idx = (min_idx + 1) % pins.len();
+        }
+        let scale = (*net_w) / ((pins.len() as f64 - 1.0).max(1.0));
+        // Bound-to-bound connection between min and max pins.
+        let span = (coord_of(pins[max_idx]) - coord_of(pins[min_idx])).abs().max(0.5);
+        add_spring(pins[min_idx], pins[max_idx], scale / span);
+        // Connect each internal pin to both bounds.
+        for (idx, &p) in pins.iter().enumerate() {
+            if idx == min_idx || idx == max_idx {
+                continue;
+            }
+            let c = coord_of(p);
+            let d_min = (c - min_c).abs().max(0.5);
+            let d_max = (max_c - c).abs().max(0.5);
+            add_spring(p, pins[min_idx], scale / d_min);
+            add_spring(p, pins[max_idx], scale / d_max);
+        }
+    }
+
+    if anchor_weight > 0.0 && anchor_pos.len() == n {
+        for i in 0..n {
+            diag[i] += anchor_weight;
+            rhs[i] += anchor_weight * anchor_pos[i];
+        }
+    }
+
+    let mut edges: Vec<(usize, usize, f64)> =
+        edge_map.into_iter().map(|((u, v), w)| (u, v, w)).collect();
+    edges.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    (diag, edges, rhs)
+}
+
+/// 1D electrostatic / recursive bipartitioning density spreading across `bins` in `[lo, hi]`.
+///
+/// Preserves the relative sorted order of `pos` while equalizing bin density and
+/// applying outward electrostatic pressure from over-occupied bins.
+pub fn electrostatic_bipartition_spread_1d(
+    pos: &[f64],
+    lo: f64,
+    hi: f64,
+    cap_per_unit: usize,
+) -> Vec<f64> {
+    let n = pos.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if lo >= hi {
+        return vec![lo; n];
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        pos[a]
+            .partial_cmp(&pos[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+    let mut out = vec![lo; n];
+    let cap = cap_per_unit.max(1);
+
+    fn recurse(
+        slice: &[usize],
+        pos: &[f64],
+        l: f64,
+        r: f64,
+        cap: usize,
+        out: &mut [f64],
+    ) {
+        if slice.is_empty() {
+            return;
+        }
+        let span = (r - l).max(0.0);
+        if slice.len() <= cap || span <= 1.0 {
+            let center = 0.5 * (l + r);
+            for (k, &idx) in slice.iter().enumerate() {
+                let offset = if slice.len() > 1 {
+                    ((k as f64 / (slice.len() - 1) as f64) - 0.5) * span.min(0.5)
+                } else {
+                    0.0
+                };
+                out[idx] = (0.5 * pos[idx].clamp(l, r) + 0.5 * (center + offset)).clamp(l, r);
+            }
+            return;
+        }
+        let mid = slice.len() / 2;
+        // Electrostatic density cut: partition region proportional to cell mass,
+        // bounded by physical site capacity on each side.
+        let total_cap = ((span + 1.0) * cap as f64).max(slice.len() as f64);
+        let min_left_frac = ((slice.len() - mid) as f64 / total_cap).clamp(0.15, 0.85);
+        let target_frac = (mid as f64 / slice.len() as f64).clamp(min_left_frac, 1.0 - min_left_frac);
+        let cut = l + span * target_frac;
+        recurse(&slice[..mid], pos, l, cut, cap, out);
+        recurse(&slice[mid..], pos, cut, r, cap, out);
+    }
+
+    recurse(&order, pos, lo, hi, cap, &mut out);
+    out
+}
+
+/// Compute continuous Half-Perimeter Wirelength (HPWL) over `(x, y)` coordinates.
+fn continuous_hpwl(x: &[f64], y: &[f64], nets: &[(Vec<B2bPin>, f64)], iob_y: &[f64]) -> f64 {
+    let mut total = 0.0;
+    for (ni, (pins, _)) in nets.iter().enumerate() {
+        if pins.len() < 2 {
+            continue;
+        }
+        let (mut x0, mut x1) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut y0, mut y1) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &p in pins {
+            let (px, py) = match p {
+                B2bPin::Movable(i) => (x[i], y[i]),
+                B2bPin::Fixed(fx) => (fx, iob_y.get(ni).copied().unwrap_or(0.0)),
+            };
+            x0 = x0.min(px);
+            x1 = x1.max(px);
+            y0 = y0.min(py);
+            y1 = y1.max(py);
+        }
+        total += (x1 - x0).max(0.0) + (y1 - y0).max(0.0);
+    }
+    total
+}
+
+/// Ripple legalization: snap continuous analytical coordinates `(x[i], y[i])` onto
+/// legal HAD `(Site, ble)` slots, rippling displaced clusters to nearest free CLB sites
+/// and running local IMUX legalization.
+fn ripple_legalize(
+    packed: &Packed,
+    dev: &Device,
+    x: &[f64],
+    y: &[f64],
+    iob_sites: &[Site],
+) -> Result<(Vec<(Site, u8)>, usize), String> {
+    let n = x.len().min(packed.lutffs.len());
+    if n == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    let n_ble = dev.n_ble.max(1) as usize;
+    let mut clb_sites: Vec<Site> = dev.clb_sites().collect();
+    if clb_sites.is_empty() {
+        return Err("device has no CLB sites".into());
+    }
+    clb_sites.sort_by_key(|s| (s.x, s.y));
+
+    let (mut max_x, mut max_y) = (0u32, 0u32);
+    for &s in &clb_sites {
+        max_x = max_x.max(s.x);
+        max_y = max_y.max(s.y);
+    }
+    let mut grid = LegalizeGrid::new(max_x, max_y, n_ble);
+    for &s in &clb_sites {
+        grid.set_site(s);
+    }
+
+    // Order clusters by distance to nearest IOB / fanout degree so critical anchors claim target sites first.
+    let iob_x = iob_sites.first().map(|s| s.x as f64).unwrap_or(dev.clb_x0 as f64);
+    let iob_y = iob_sites.first().map(|s| s.y as f64).unwrap_or(0.0);
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        let da = (x[a] - iob_x).abs() + (y[a] - iob_y).abs();
+        let db = (x[b] - iob_x).abs() + (y[b] - iob_y).abs();
+        da.partial_cmp(&db)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+
+    let mut lutff_sites: Vec<(Site, u8)> = vec![(clb_sites[0], 0); n];
+    let mut ripple_moves = 0usize;
+
+    for &ci in &order {
+        let tx = x[ci].round().max(0.0) as u32;
+        let ty = y[ci].round().max(0.0) as u32;
+        // Direct hit if target (tx, ty) has a free BLE.
+        if let Some(site) = grid.site_xy(tx, ty) {
+            if let Some(ble) = grid.first_free_ble(site.x, site.y, (u32::MAX, u32::MAX, 0)) {
+                grid.place_at(site.x, site.y, ble, ci);
+                lutff_sites[ci] = (site, ble);
+                continue;
+            }
+        }
+        // Ripple search: find nearest CLB site with a free BLE to `(x[ci], y[ci])`.
+        let mut best: Option<(Site, u8, f64)> = None;
+        for &s in &clb_sites {
+            if (grid.occ(s.x, s.y) as usize) >= n_ble {
+                continue;
+            }
+            let Some(ble) = grid.first_free_ble(s.x, s.y, (u32::MAX, u32::MAX, 0)) else {
+                continue;
+            };
+            let dist = (s.x as f64 - x[ci]).abs() + (s.y as f64 - y[ci]).abs();
+            if best.as_ref().map(|b| dist < b.2).unwrap_or(true) {
+                best = Some((s, ble, dist));
+            }
+        }
+        if let Some((site, ble, _)) = best {
+            grid.place_at(site.x, site.y, ble, ci);
+            lutff_sites[ci] = (site, ble);
+            ripple_moves += 1;
+        }
+    }
+
+    // Local IMUX ripple refinement pass: relocate any out-of-reach sink toward its driver.
+    let mut ff_idx: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(n);
+    for i in 0..n {
+        let lf = &packed.lutffs[i];
+        if !lf.ff_cell.is_empty() {
+            ff_idx.insert(lf.ff_cell.as_str(), i);
+        }
+    }
+    let pin_drv: Vec<Vec<Option<usize>>> = (0..n)
+        .map(|i| {
+            packed.lutffs[i]
+                .lut_pins
+                .iter()
+                .map(|(_, d)| ff_idx.get(d.as_str()).copied())
+                .collect()
+        })
+        .collect();
+
+    for _pass in 0..4 {
+        let mut moved_in_pass = 0usize;
+        for i in 0..n {
+            let (cur_site, cur_ble) = lutff_sites[i];
+            let before = imux_score_idx(&pin_drv[i], cur_site, &lutff_sites, None, None);
+            if before.0 == 0 {
+                continue;
+            }
+            let skip = (cur_site.x, cur_site.y, cur_ble);
+            let mut best_site: Option<(Site, u8, (u32, u32))> = None;
+            for &d in &pin_drv[i] {
+                let Some(di) = d else {
+                    continue;
+                };
+                let ds = lutff_sites[di].0;
+                for dy in -2i32..=2 {
+                    for dx in -2i32..=2 {
+                        let nx = (ds.x as i32 + dx).max(0) as u32;
+                        let ny = (ds.y as i32 + dy).max(0) as u32;
+                        let Some(site) = grid.site_xy(nx, ny) else {
+                            continue;
+                        };
+                        let Some(ble) = grid.first_free_ble(site.x, site.y, skip) else {
+                            continue;
+                        };
+                        let sc = imux_score_idx(&pin_drv[i], site, &lutff_sites, None, None);
+                        if sc < before
+                            && best_site.as_ref().map(|b| sc < b.2).unwrap_or(true)
+                        {
+                            best_site = Some((site, ble, sc));
+                        }
+                    }
+                }
+            }
+            if let Some((site, ble, _)) = best_site {
+                grid.relocate(skip, (site.x, site.y, ble), i);
+                lutff_sites[i] = (site, ble);
+                ripple_moves += 1;
+                moved_in_pass += 1;
+            }
+        }
+        if moved_in_pass == 0 {
+            break;
+        }
+    }
+
+    Ok((lutff_sites, ripple_moves))
+}
+
+/// Place a packed design using the electrostatic / B2B quadratic analytical global placer
+/// with default [`AnalyticalPlaceOpts`].
+pub fn place_analytical(packed: &Packed, dev: &Device) -> Result<Placed, String> {
+    place_analytical_with(packed, dev, &AnalyticalPlaceOpts::default())
+}
+
+/// Place a packed design using the electrostatic / B2B quadratic analytical global placer
+/// configured with `opts`.
+pub fn place_analytical_with(
+    packed: &Packed,
+    dev: &Device,
+    opts: &AnalyticalPlaceOpts,
+) -> Result<Placed, String> {
+    Ok(place_analytical_with_stats(packed, dev, opts)?.0)
+}
+
+/// Place a packed design using the electrostatic / B2B quadratic analytical global placer
+/// and return both [`Placed`] and [`AnalyticalPlaceStats`].
+pub fn place_analytical_with_stats(
+    packed: &Packed,
+    dev: &Device,
+    opts: &AnalyticalPlaceOpts,
+) -> Result<(Placed, AnalyticalPlaceStats), String> {
+    // Use base placer to resolve IOB LOCs, DSPs, BRAMs, and initial feasible seed.
+    let mut base = place_with(
+        packed,
+        dev,
+        PlaceOpts {
+            timing_weight: opts.timing_weight,
+            seed: 0,
+        },
+    )?;
+    let n = base.lutff_sites.len().min(base.packed.lutffs.len());
+    if n == 0 {
+        return Ok((base, AnalyticalPlaceStats::default()));
+    }
+
+    let clb_sites: Vec<Site> = dev.clb_sites().collect();
+    let min_x = clb_sites.iter().map(|s| s.x).min().unwrap_or(dev.clb_x0) as f64;
+    let max_x = clb_sites.iter().map(|s| s.x).max().unwrap_or(dev.clb_x0) as f64;
+    let min_y = clb_sites.iter().map(|s| s.y).min().unwrap_or(dev.clb_y0) as f64;
+    let max_y = clb_sites.iter().map(|s| s.y).max().unwrap_or(dev.clb_y0) as f64;
+
+    let mut ff_idx: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(n);
+    let mut q_idx: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(n);
+    for i in 0..n {
+        let lf = &base.packed.lutffs[i];
+        if !lf.ff_cell.is_empty() {
+            ff_idx.insert(lf.ff_cell.as_str(), i);
+        }
+        if !lf.q_net.is_empty() {
+            q_idx.insert(lf.q_net.as_str(), i);
+        }
+    }
+
+    // Build multi-pin nets in X and Y with slack-weighted criticality exponents.
+    let mut nets_x: Vec<(Vec<B2bPin>, f64)> = Vec::new();
+    let mut nets_y: Vec<(Vec<B2bPin>, f64)> = Vec::new();
+    let mut net_fixed_y: Vec<f64> = Vec::new();
+
+    let mut sinks_by_drv: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for si in 0..n {
+        for (_, drv_name) in &base.packed.lutffs[si].lut_pins {
+            if let Some(&di) = ff_idx.get(drv_name.as_str()) {
+                if !sinks_by_drv[di].contains(&si) {
+                    sinks_by_drv[di].push(si);
+                }
+            }
+        }
+    }
+
+    for di in 0..n {
+        let q_net = &base.packed.lutffs[di].q_net;
+        let slack_ps = opts
+            .net_slack_ps
+            .get(q_net)
+            .copied()
+            .unwrap_or_else(|| {
+                // Estimate slack from fanout + LUT input arity when explicit STA slack map is absent.
+                let arity = base.packed.lutffs[di].lut_pins.len() as f64;
+                let fanout = sinks_by_drv[di].len() as f64;
+                (opts.t_crit_ps - (arity * 350.0 + fanout * 250.0)).max(0.0)
+            });
+        let crit = slack_criticality_weight(slack_ps, opts.t_crit_ps, opts.criticality_exp);
+        let weight = 1.0 + opts.timing_weight.max(0.0) * crit;
+
+        let mut px = vec![B2bPin::Movable(di)];
+        let mut py = vec![B2bPin::Movable(di)];
+        let mut fixed_y_val = min_y;
+        for &si in &sinks_by_drv[di] {
+            px.push(B2bPin::Movable(si));
+            py.push(B2bPin::Movable(si));
+        }
+        for (ii, iob) in base.packed.iobs.iter().enumerate() {
+            if iob.from_net == *q_net {
+                if let Some(&isite) = base.iob_sites.get(ii) {
+                    let target_y = if opts.timing_weight > 0.0 {
+                        min_y
+                    } else {
+                        0.5 * (min_y + max_y)
+                    };
+                    px.push(B2bPin::Fixed(isite.x as f64));
+                    py.push(B2bPin::Fixed(target_y));
+                    fixed_y_val = target_y;
+                }
+            }
+        }
+        if px.len() >= 2 {
+            nets_x.push((px, weight));
+            nets_y.push((py, weight));
+            net_fixed_y.push(fixed_y_val);
+        }
+    }
+
+    // Ensure every cluster has a gentle anchor to the preferred IOB column/row so disconnected
+    // components remain SPD and well-conditioned.
+    let default_x = base
+        .iob_sites
+        .first()
+        .map(|s| s.x as f64)
+        .unwrap_or(min_x);
+    let default_y = if opts.timing_weight > 0.0 {
+        min_y
+    } else {
+        0.5 * (min_y + max_y)
+    };
+    for i in 0..n {
+        nets_x.push((
+            vec![B2bPin::Movable(i), B2bPin::Fixed(default_x)],
+            0.05,
+        ));
+        nets_y.push((
+            vec![B2bPin::Movable(i), B2bPin::Fixed(default_y)],
+            0.05,
+        ));
+        net_fixed_y.push(default_y);
+    }
+
+    let mut x: Vec<f64> = base.lutff_sites.iter().map(|(s, _)| s.x as f64).collect();
+    let mut y: Vec<f64> = base.lutff_sites.iter().map(|(s, _)| s.y as f64).collect();
+    let hpwl_initial = continuous_hpwl(&x, &y, &nets_x, &net_fixed_y);
+
+    let n_ble = dev.n_ble.max(1) as usize;
+    let cols_count = ((max_x - min_x) as usize + 1).max(1);
+    let mut anchor_x = x.clone();
+    let mut anchor_y = y.clone();
+    let outer_iters = opts.outer_iters.max(1);
+    let mut cg_iters_total = 0usize;
+
+    for iter in 0..outer_iters {
+        let lambda = 0.15 * ((iter + 1) as f64);
+        let (diag_x, edges_x, rhs_x) =
+            build_b2b_axis_system(n, &x, &nets_x, &anchor_x, lambda);
+        let (nx, it_x) =
+            solve_cg_spd(n, &diag_x, &edges_x, &rhs_x, &x, opts.cg_max_iters, opts.cg_tol);
+        let (diag_y, edges_y, rhs_y) =
+            build_b2b_axis_system(n, &y, &nets_y, &anchor_y, lambda);
+        let (ny, it_y) =
+            solve_cg_spd(n, &diag_y, &edges_y, &rhs_y, &y, opts.cg_max_iters, opts.cg_tol);
+        cg_iters_total += it_x + it_y;
+
+        for i in 0..n {
+            x[i] = nx[i].clamp(min_x, max_x);
+            y[i] = ny[i].clamp(min_y, max_y);
+        }
+        anchor_x = electrostatic_bipartition_spread_1d(
+            &x,
+            min_x,
+            max_x,
+            (n / cols_count).max(n_ble),
+        );
+        anchor_y = electrostatic_bipartition_spread_1d(&y, min_y, max_y, n_ble);
+    }
+
+    let (legal_sites, ripple_moves) =
+        ripple_legalize(&base.packed, dev, &x, &y, &base.iob_sites)?;
+    base.lutff_sites = legal_sites;
+    let final_x: Vec<f64> = base.lutff_sites.iter().map(|(s, _)| s.x as f64).collect();
+    let final_y: Vec<f64> = base.lutff_sites.iter().map(|(s, _)| s.y as f64).collect();
+    let hpwl_final = continuous_hpwl(&final_x, &final_y, &nets_x, &net_fixed_y);
+
+    base.cost = if opts.timing_weight > 0.0 {
+        base.lutff_sites
+            .first()
+            .zip(base.iob_sites.first())
+            .map(|(l, i)| (l.0.y as f64 - i.y as f64).abs() * opts.timing_weight)
+            .unwrap_or(0.0)
+    } else {
+        base.lutff_sites.first().map(|(s, _)| s.y as f64).unwrap_or(0.0)
+    };
+
+    let _ = q_idx;
+    Ok((
+        base,
+        AnalyticalPlaceStats {
+            outer_iters,
+            cg_iters_total,
+            ripple_moves,
+            hpwl_initial,
+            hpwl_final,
+        },
+    ))
+}
+
+/// Extract ordered `CARRY4` chains (`CO[3]` / `CO3` -> `CI`) from `design`,
+/// returning each chain from LSB (chain head) to MSB.
+pub fn extract_carry4_chains(design: &helion_ir::Design) -> Vec<Vec<String>> {
+    use helion_ir::{CellKind, intern, resolve};
+    let carry_cells: HashSet<&str> = design
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::Carry4))
+        .map(|c| resolve(c.name))
+        .collect();
+    if carry_cells.is_empty() {
+        return Vec::new();
+    }
+    let pin_ci = intern("CI");
+    let pin_co3 = intern("CO3");
+    let pin_co3_br = intern("CO[3]");
+    let mut next_of: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut has_prev: HashSet<&str> = HashSet::new();
+    for net in &design.nets {
+        let mut co_drv: Option<&str> = None;
+        let mut ci_lds: Vec<&str> = Vec::new();
+        for ep in &net.endpoints {
+            let cname = resolve(ep.cell);
+            if !carry_cells.contains(cname) {
+                continue;
+            }
+            if ep.pin == pin_co3 || ep.pin == pin_co3_br {
+                co_drv = Some(cname);
+            } else if ep.pin == pin_ci {
+                ci_lds.push(cname);
+            }
+        }
+        if let Some(drv) = co_drv {
+            for ld in ci_lds {
+                if drv != ld {
+                    next_of.insert(drv, ld);
+                    has_prev.insert(ld);
+                }
+            }
+        }
+    }
+    let mut heads: Vec<&str> = carry_cells
+        .iter()
+        .copied()
+        .filter(|c| !has_prev.contains(c))
+        .collect();
+    heads.sort_unstable();
+    let mut chains = Vec::with_capacity(heads.len());
+    let mut visited: HashSet<&str> = HashSet::new();
+    for h in heads {
+        let mut chain = Vec::new();
+        let mut cur = h;
+        while visited.insert(cur) {
+            chain.push(cur.to_string());
+            if let Some(&nxt) = next_of.get(cur) {
+                cur = nxt;
+            } else {
+                break;
+            }
+        }
+        if !chain.is_empty() {
+            chains.push(chain);
+        }
+    }
+    chains
+}
+
+/// Map `CARRY4` chains in `design` onto ordered `PackedLutFf` cluster index chains.
+///
+/// Each `Carry4` cell maps to the LUTFF clusters connected to its `S0..S3` / `O0..O3` nets
+/// (or matching cell name prefix), ordered from LSB to MSB.
+pub fn extract_packed_carry_chains(
+    packed: &Packed,
+    design: Option<&helion_ir::Design>,
+) -> Vec<Vec<usize>> {
+    let Some(d) = design else {
+        return Vec::new();
+    };
+    let raw_chains = extract_carry4_chains(d);
+    if raw_chains.is_empty() {
+        return Vec::new();
+    }
+    use helion_ir::{intern, resolve};
+    let mut net_to_lutff: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(packed.lutffs.len());
+    for (i, lf) in packed.lutffs.iter().enumerate() {
+        if !lf.q_net.is_empty() {
+            net_to_lutff.entry(lf.q_net.as_str()).or_insert(i);
+        }
+    }
+    let pin_names = [
+        intern("S0"),
+        intern("S1"),
+        intern("S2"),
+        intern("S3"),
+        intern("S[0]"),
+        intern("S[1]"),
+        intern("S[2]"),
+        intern("S[3]"),
+        intern("O0"),
+        intern("O1"),
+        intern("O2"),
+        intern("O3"),
+        intern("O[0]"),
+        intern("O[1]"),
+        intern("O[2]"),
+        intern("O[3]"),
+    ];
+    let mut out = Vec::new();
+    let mut claimed: HashSet<usize> = HashSet::new();
+    for raw in &raw_chains {
+        let mut chain_clusters = Vec::new();
+        for c_name in raw {
+            let c_spur = intern(c_name);
+            for &pin in &pin_names {
+                if let Some(net_spur) = d.net_on(c_spur, pin) {
+                    let net_str = resolve(net_spur);
+                    if let Some(&li) = net_to_lutff.get(net_str) {
+                        if claimed.insert(li) {
+                            chain_clusters.push(li);
+                        }
+                    }
+                }
+            }
+            for (li, lf) in packed.lutffs.iter().enumerate() {
+                if (lf.lut_cell == *c_name || lf.lut_cell.starts_with(c_name))
+                    && claimed.insert(li)
+                {
+                    chain_clusters.push(li);
+                }
+            }
+        }
+        if !chain_clusters.is_empty() {
+            out.push(chain_clusters);
+        }
+    }
+    out
+}
+
+/// Telemetry from heterogeneous macro column legalization ([`legalize_macro_columns`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MacroLegalizeStats {
+    pub carry_chains_legalized: usize,
+    pub carry_cells_placed: usize,
+    pub dsp_macros_legalized: usize,
+    pub bram_macros_legalized: usize,
+}
+
+/// Vivado UG904 heterogeneous macro column legalizer (`CARRY4` vertical chains,
+/// `DSP48` / `Mac27`, and `RAMB36` / `Bram18` columns).
+///
+/// - Extracts connected `CARRY4` chains (`CO[3] -> CI`) and assigns each chain a
+///   contiguous vertical run $(x, y_0 \dots y_0 + k - 1)$ in a valid CLB column
+///   minimizing Manhattan displacement from its current placement.
+/// - Assigns `DSP48`/`Mac27` and `Bram18`/`RAMB36` macros to dedicated hard-block
+///   columns (`dev.dsp_sites()` / `dev.bram_sites()`) minimizing wirelength cost.
+pub fn legalize_macro_columns(
+    placed: &Placed,
+    dev: &Device,
+    design: Option<&helion_ir::Design>,
+) -> Result<(Placed, MacroLegalizeStats), String> {
+    let mut out = placed.clone();
+    let mut stats = MacroLegalizeStats::default();
+    let n = out.lutff_sites.len().min(out.packed.lutffs.len());
+    let n_ble = dev.n_ble.max(1) as u8;
+
+    // 1. Contiguous vertical CARRY4 chain legalization across CLB columns.
+    let chains = extract_packed_carry_chains(&out.packed, design);
+    if !chains.is_empty() && n > 0 {
+        let mut cols: std::collections::BTreeMap<u32, Vec<Site>> =
+            std::collections::BTreeMap::new();
+        for s in dev.clb_sites() {
+            cols.entry(s.x).or_default().push(s);
+        }
+        for v in cols.values_mut() {
+            v.sort_by_key(|s| s.y);
+        }
+        let mut locked_chain_sites: HashSet<(u32, u32)> = HashSet::new();
+        let mut chain_member_set: HashSet<usize> = HashSet::new();
+
+        for chain in &chains {
+            let k = chain.len();
+            if k == 0 {
+                continue;
+            }
+            // Find contiguous vertical run of length `k` in a single CLB column `(col_x, y_0..y_0+k-1)`
+            // minimizing total Manhattan displacement from the chain members' current sites.
+            let mut best_run: Option<(u32, usize, u64)> = None;
+            for (&col_x, col_sites) in &cols {
+                if col_sites.len() < k {
+                    continue;
+                }
+                for start_idx in 0..=(col_sites.len() - k) {
+                    // Verify vertical contiguity (consecutive Y coordinates) and no prior chain overlap.
+                    let mut contiguous = true;
+                    for off in 0..k {
+                        let s = col_sites[start_idx + off];
+                        if off > 0 && s.y != col_sites[start_idx + off - 1].y + 1 {
+                            contiguous = false;
+                            break;
+                        }
+                        if locked_chain_sites.contains(&(s.x, s.y)) {
+                            contiguous = false;
+                            break;
+                        }
+                    }
+                    if !contiguous {
+                        continue;
+                    }
+                    let mut disp = 0u64;
+                    for (off, &ci) in chain.iter().enumerate() {
+                        let cur = out.lutff_sites[ci].0;
+                        let tgt = col_sites[start_idx + off];
+                        disp += (cur.x.abs_diff(tgt.x) + cur.y.abs_diff(tgt.y)) as u64;
+                    }
+                    if best_run.as_ref().map(|b| disp < b.2).unwrap_or(true) {
+                        best_run = Some((col_x, start_idx, disp));
+                    }
+                }
+            }
+            let Some((col_x, start_idx, _)) = best_run else {
+                return Err(format!(
+                    "legalize_macro_columns: no contiguous vertical CLB column run of length {k} for CARRY4 chain"
+                ));
+            };
+            let col_sites = &cols[&col_x];
+            for (off, &ci) in chain.iter().enumerate() {
+                let s = col_sites[start_idx + off];
+                locked_chain_sites.insert((s.x, s.y));
+                chain_member_set.insert(ci);
+                out.lutff_sites[ci] = (s, 0);
+            }
+            stats.carry_chains_legalized += 1;
+            stats.carry_cells_placed += k;
+        }
+
+        // Ensure non-chain LUTFF clusters do not collide with any BLE0 claimed by a carry chain.
+        let mut used: HashSet<(u32, u32, u8)> = HashSet::with_capacity(n);
+        for &ci in &chain_member_set {
+            let (s, ble) = out.lutff_sites[ci];
+            used.insert((s.x, s.y, ble));
+        }
+        let all_clbs: Vec<Site> = dev.clb_sites().collect();
+        for i in 0..n {
+            if chain_member_set.contains(&i) {
+                continue;
+            }
+            let (cur_s, cur_ble) = out.lutff_sites[i];
+            if used.insert((cur_s.x, cur_s.y, cur_ble)) {
+                continue;
+            }
+            // Find nearest free (Site, ble).
+            let mut best_free: Option<(Site, u8, u32)> = None;
+            for &s in &all_clbs {
+                for b in 0..n_ble {
+                    if !used.contains(&(s.x, s.y, b)) {
+                        let d = s.x.abs_diff(cur_s.x) + s.y.abs_diff(cur_s.y);
+                        if best_free.as_ref().map(|bf| d < bf.2).unwrap_or(true) {
+                            best_free = Some((s, b, d));
+                        }
+                        break;
+                    }
+                }
+            }
+            if let Some((ns, nb, _)) = best_free {
+                used.insert((ns.x, ns.y, nb));
+                out.lutff_sites[i] = (ns, nb);
+            }
+        }
+    }
+
+    // 2. Snap DSP48 / Mac27 macros to dedicated hard-block DSP column sites.
+    let dsp_pool: Vec<Site> = dev.dsp_sites().collect();
+    if !out.packed.macs.is_empty() && !dsp_pool.is_empty() {
+        let anchor_y = out
+            .lutff_sites
+            .first()
+            .map(|(s, _)| s.y)
+            .unwrap_or(dev.dsp_y0);
+        let mut avail: Vec<Site> = dsp_pool;
+        avail.sort_by_key(|s| (s.y.abs_diff(anchor_y), s.x, s.y));
+        out.mac_sites.clear();
+        for (_, site) in out.packed.macs.iter().zip(avail.into_iter()) {
+            out.mac_sites.push(site);
+            stats.dsp_macros_legalized += 1;
+        }
+    }
+
+    // 3. Snap Bram18 / RAMB36 macros to dedicated hard-block BRAM column sites.
+    let bram_pool: Vec<Site> = dev.bram_sites().collect();
+    if !out.packed.brams.is_empty() && !bram_pool.is_empty() {
+        let anchor_y = out
+            .lutff_sites
+            .first()
+            .map(|(s, _)| s.y)
+            .unwrap_or(dev.bram_y0);
+        let mut avail: Vec<Site> = bram_pool;
+        avail.sort_by_key(|s| (s.y.abs_diff(anchor_y), s.x, s.y));
+        out.bram_sites.clear();
+        for (_, site) in out.packed.brams.iter().zip(avail.into_iter()) {
+            out.bram_sites.push(site);
+            stats.bram_macros_legalized += 1;
+        }
+    }
+
+    Ok((out, stats))
+}
+
+/// Options for post-legalization timing-driven detailed placement ([`detailed_place_optimize`]).
+#[derive(Clone, Debug)]
+pub struct DetailedPlaceOpts {
+    /// Criticality weight multiplier $\alpha$ in $\sum_e (1 + \alpha \cdot \text{crit}(e)) \cdot \text{HPWL}(e)$.
+    pub criticality_weight: f64,
+    /// Local Manhattan radius for pairwise cell swaps.
+    pub swap_radius: u32,
+    /// Number of median-box + local swap passes.
+    pub passes: usize,
+    /// Per-net criticality in `[0.0, 1.0]`.
+    pub net_criticality: std::collections::HashMap<String, f64>,
+    /// Locked cluster indices (e.g. legalized `CARRY4` chain members) that must not be broken apart.
+    pub locked_clusters: HashSet<usize>,
+}
+
+impl Default for DetailedPlaceOpts {
+    fn default() -> Self {
+        Self {
+            criticality_weight: 1.0,
+            swap_radius: 3,
+            passes: 4,
+            net_criticality: std::collections::HashMap::new(),
+            locked_clusters: HashSet::new(),
+        }
+    }
+}
+
+/// Summary statistics from [`detailed_place_optimize_with_stats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DetailedPlaceStats {
+    pub median_relocations: usize,
+    pub local_swaps: usize,
+    pub weighted_hpwl_before: f64,
+    pub weighted_hpwl_after: f64,
+}
+
+/// Compute combined criticality-weighted Half-Perimeter Wirelength:
+///
+/// $$\sum_e (1 + \alpha \cdot \text{crit}(e)) \cdot \text{HPWL}(e)$$
+pub fn weighted_hpwl(placed: &Placed, opts: &DetailedPlaceOpts) -> f64 {
+    let n = placed.lutff_sites.len().min(placed.packed.lutffs.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let mut ff_idx: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(n);
+    for i in 0..n {
+        let lf = &placed.packed.lutffs[i];
+        if !lf.ff_cell.is_empty() {
+            ff_idx.insert(lf.ff_cell.as_str(), i);
+        }
+    }
+    let mut sinks_of: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for si in 0..n {
+        for (_, drv) in &placed.packed.lutffs[si].lut_pins {
+            if let Some(&di) = ff_idx.get(drv.as_str()) {
+                if !sinks_of[di].contains(&si) {
+                    sinks_of[di].push(si);
+                }
+            }
+        }
+    }
+    let mut total = 0.0;
+    for di in 0..n {
+        let q_net = &placed.packed.lutffs[di].q_net;
+        let crit = opts
+            .net_criticality
+            .get(q_net)
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let w = 1.0 + opts.criticality_weight.max(0.0) * crit;
+        let ds = placed.lutff_sites[di].0;
+        let (mut x0, mut x1) = (ds.x, ds.x);
+        let (mut y0, mut y1) = (ds.y, ds.y);
+        let mut count = 1usize;
+        for &si in &sinks_of[di] {
+            let ss = placed.lutff_sites[si].0;
+            x0 = x0.min(ss.x);
+            x1 = x1.max(ss.x);
+            y0 = y0.min(ss.y);
+            y1 = y1.max(ss.y);
+            count += 1;
+        }
+        for (ii, iob) in placed.packed.iobs.iter().enumerate() {
+            if iob.from_net == *q_net {
+                if let Some(&isite) = placed.iob_sites.get(ii) {
+                    x0 = x0.min(isite.x);
+                    x1 = x1.max(isite.x);
+                    y0 = y0.min(isite.y);
+                    y1 = y1.max(isite.y);
+                    count += 1;
+                }
+            }
+        }
+        if count >= 2 {
+            total += w * ((x1 - x0) as f64 + (y1 - y0) as f64);
+        }
+    }
+    total
+}
+
+/// Post-legalization timing-driven detailed placement optimizer (`detailed_place_optimize`):
+/// performs optimal median-region relocation and local window pairwise swaps that strictly
+/// improve $\sum_e (1 + \alpha \cdot \text{crit}(e)) \cdot \text{HPWL}(e)$ while preserving
+/// `CARRY4` chain contiguity and IMUX legality.
+pub fn detailed_place_optimize(
+    placed: &Placed,
+    dev: &Device,
+    opts: &DetailedPlaceOpts,
+) -> Result<Placed, String> {
+    Ok(detailed_place_optimize_with_stats(placed, dev, opts)?.0)
+}
+
+/// Run [`detailed_place_optimize`] and return both the optimized [`Placed`] and [`DetailedPlaceStats`].
+pub fn detailed_place_optimize_with_stats(
+    placed: &Placed,
+    dev: &Device,
+    opts: &DetailedPlaceOpts,
+) -> Result<(Placed, DetailedPlaceStats), String> {
+    let mut out = placed.clone();
+    let before_hpwl = weighted_hpwl(&out, opts);
+    let n = out.lutff_sites.len().min(out.packed.lutffs.len());
+    if n == 0 {
+        return Ok((
+            out,
+            DetailedPlaceStats {
+                weighted_hpwl_before: before_hpwl,
+                weighted_hpwl_after: before_hpwl,
+                ..Default::default()
+            },
+        ));
+    }
+    let n_ble = dev.n_ble.max(1) as usize;
+    let mut clb_sites: Vec<Site> = dev.clb_sites().collect();
+    clb_sites.sort_by_key(|s| (s.x, s.y));
+    let (mut max_x, mut max_y) = (0u32, 0u32);
+    for &s in &clb_sites {
+        max_x = max_x.max(s.x);
+        max_y = max_y.max(s.y);
+    }
+    let mut grid = LegalizeGrid::new(max_x, max_y, n_ble);
+    for &s in &clb_sites {
+        grid.set_site(s);
+    }
+    for (i, &(s, ble)) in out.lutff_sites.iter().enumerate().take(n) {
+        grid.place_at(s.x, s.y, ble, i);
+    }
+
+    let mut ff_idx: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(n);
+    for i in 0..n {
+        let lf = &out.packed.lutffs[i];
+        if !lf.ff_cell.is_empty() {
+            ff_idx.insert(lf.ff_cell.as_str(), i);
+        }
+    }
+    let pin_drv: Vec<Vec<Option<usize>>> = (0..n)
+        .map(|i| {
+            out.packed.lutffs[i]
+                .lut_pins
+                .iter()
+                .map(|(_, d)| ff_idx.get(d.as_str()).copied())
+                .collect()
+        })
+        .collect();
+    let mut sinks_of: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for si in 0..n {
+        for &d in pin_drv[si].iter().flatten() {
+            if !sinks_of[d].contains(&si) {
+                sinks_of[d].push(si);
+            }
+        }
+    }
+    let mut iob_for_cluster: Vec<Vec<Site>> = vec![Vec::new(); n];
+    for (ii, iob) in out.packed.iobs.iter().enumerate() {
+        if let Some(&isite) = out.iob_sites.get(ii) {
+            for i in 0..n {
+                if out.packed.lutffs[i].q_net == iob.from_net {
+                    iob_for_cluster[i].push(isite);
+                }
+            }
+        }
+    }
+    let net_w: Vec<f64> = (0..n)
+        .map(|i| {
+            let q = &out.packed.lutffs[i].q_net;
+            let c = opts.net_criticality.get(q).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            1.0 + opts.criticality_weight.max(0.0) * c
+        })
+        .collect();
+
+    // Evaluate local incident weighted HPWL and IMUX illegality for a set of cluster overrides.
+    let eval_incident = |ci: usize,
+                         sites: &[(Site, u8)],
+                         ov_a: Option<(usize, Site)>,
+                         ov_b: Option<(usize, Site)>|
+     -> (u32, f64) {
+        let mut nets_to_eval = vec![ci];
+        for &d in pin_drv[ci].iter().flatten() {
+            if !nets_to_eval.contains(&d) {
+                nets_to_eval.push(d);
+            }
+        }
+        let mut ill = 0u32;
+        let cs = cluster_site(ci, sites, ov_a, ov_b);
+        for &d in pin_drv[ci].iter().flatten() {
+            let ds = cluster_site(d, sites, ov_a, ov_b);
+            if !imux_local(ds, cs) {
+                ill += 1;
+            }
+        }
+        for &si in &sinks_of[ci] {
+            let ss = cluster_site(si, sites, ov_a, ov_b);
+            if !imux_local(cs, ss) {
+                ill += 1;
+            }
+        }
+        let mut hpwl = 0.0;
+        for &net_drv in &nets_to_eval {
+            let ds = cluster_site(net_drv, sites, ov_a, ov_b);
+            let (mut x0, mut x1) = (ds.x, ds.x);
+            let (mut y0, mut y1) = (ds.y, ds.y);
+            let mut cnt = 1usize;
+            for &si in &sinks_of[net_drv] {
+                let ss = cluster_site(si, sites, ov_a, ov_b);
+                x0 = x0.min(ss.x);
+                x1 = x1.max(ss.x);
+                y0 = y0.min(ss.y);
+                y1 = y1.max(ss.y);
+                cnt += 1;
+            }
+            for &isite in &iob_for_cluster[net_drv] {
+                x0 = x0.min(isite.x);
+                x1 = x1.max(isite.x);
+                y0 = y0.min(isite.y);
+                y1 = y1.max(isite.y);
+                cnt += 1;
+            }
+            if cnt >= 2 {
+                hpwl += net_w[net_drv] * ((x1 - x0) as f64 + (y1 - y0) as f64);
+            }
+        }
+        (ill, hpwl)
+    };
+
+    let mut median_relocations = 0usize;
+    let mut local_swaps = 0usize;
+    let rad = opts.swap_radius.max(1) as i32;
+
+    for _pass in 0..opts.passes.max(1) {
+        let mut pass_moves = 0usize;
+
+        // Phase 1: Optimal median-region relocation.
+        for ci in 0..n {
+            if opts.locked_clusters.contains(&ci) {
+                continue;
+            }
+            let (cur_site, cur_ble) = out.lutff_sites[ci];
+            let mut xs: Vec<u32> = Vec::new();
+            let mut ys: Vec<u32> = Vec::new();
+            for &d in pin_drv[ci].iter().flatten() {
+                let ds = out.lutff_sites[d].0;
+                xs.push(ds.x);
+                ys.push(ds.y);
+            }
+            for &si in &sinks_of[ci] {
+                let ss = out.lutff_sites[si].0;
+                xs.push(ss.x);
+                ys.push(ss.y);
+            }
+            for &isite in &iob_for_cluster[ci] {
+                xs.push(isite.x);
+                ys.push(isite.y.max(dev.clb_y0));
+            }
+            if xs.is_empty() {
+                continue;
+            }
+            xs.sort_unstable();
+            ys.sort_unstable();
+            let med_x = xs[xs.len() / 2];
+            let med_y = ys[ys.len() / 2];
+
+            let before = eval_incident(ci, &out.lutff_sites, None, None);
+            let skip = (cur_site.x, cur_site.y, cur_ble);
+            let mut best_reloc: Option<(Site, u8, (u32, f64))> = None;
+            for dy in -rad..=rad {
+                for dx in -rad..=rad {
+                    let nx = (med_x as i32 + dx).max(0) as u32;
+                    let ny = (med_y as i32 + dy).max(0) as u32;
+                    if nx == cur_site.x && ny == cur_site.y {
+                        continue;
+                    }
+                    let Some(site) = grid.site_xy(nx, ny) else {
+                        continue;
+                    };
+                    let Some(ble) = grid.first_free_ble(site.x, site.y, skip) else {
+                        continue;
+                    };
+                    let after = eval_incident(ci, &out.lutff_sites, Some((ci, site)), None);
+                    if after.0 <= before.0
+                        && (after.0 < before.0 || after.1 + 1e-9 < before.1)
+                        && best_reloc
+                            .as_ref()
+                            .map(|b| after.0 < b.2.0 || (after.0 == b.2.0 && after.1 < b.2.1))
+                            .unwrap_or(true)
+                    {
+                        best_reloc = Some((site, ble, after));
+                    }
+                }
+            }
+            if let Some((site, ble, _)) = best_reloc {
+                grid.relocate(skip, (site.x, site.y, ble), ci);
+                out.lutff_sites[ci] = (site, ble);
+                median_relocations += 1;
+                pass_moves += 1;
+            }
+        }
+
+        // Phase 2: Local window pairwise cell swaps.
+        for ci in 0..n {
+            if opts.locked_clusters.contains(&ci) {
+                continue;
+            }
+            let (cur_site, cur_ble) = out.lutff_sites[ci];
+            let mut best_swap: Option<(usize, Site, u8, f64)> = None;
+            for dy in -rad..=rad {
+                for dx in -rad..=rad {
+                    let nx = (cur_site.x as i32 + dx).max(0) as u32;
+                    let ny = (cur_site.y as i32 + dy).max(0) as u32;
+                    if nx == cur_site.x && ny == cur_site.y {
+                        continue;
+                    }
+                    let Some(site) = grid.site_xy(nx, ny) else {
+                        continue;
+                    };
+                    if grid.occ(site.x, site.y) == 0 {
+                        continue;
+                    }
+                    for ble in 0..n_ble as u8 {
+                        let Some(cj) = grid.occupant(site.x, site.y, ble) else {
+                            continue;
+                        };
+                        if cj == ci || opts.locked_clusters.contains(&cj) {
+                            continue;
+                        }
+                        let (ill_i0, _) = eval_incident(ci, &out.lutff_sites, None, None);
+                        let (ill_j0, _) = eval_incident(cj, &out.lutff_sites, None, None);
+                        let ov_a = Some((ci, site));
+                        let ov_b = Some((cj, cur_site));
+                        let (ill_i1, _) = eval_incident(ci, &out.lutff_sites, ov_a, ov_b);
+                        let (ill_j1, _) = eval_incident(cj, &out.lutff_sites, ov_a, ov_b);
+                        if ill_i1 + ill_j1 > ill_i0 + ill_j0 {
+                            continue;
+                        }
+                        let cur_tot = weighted_hpwl(&out, opts);
+                        out.lutff_sites[ci] = (site, ble);
+                        out.lutff_sites[cj] = (cur_site, cur_ble);
+                        let new_tot = weighted_hpwl(&out, opts);
+                        out.lutff_sites[ci] = (cur_site, cur_ble);
+                        out.lutff_sites[cj] = (site, ble);
+                        let gain = cur_tot - new_tot;
+                        if gain > 1e-6
+                            && best_swap.as_ref().map(|b| gain > b.3).unwrap_or(true)
+                        {
+                            best_swap = Some((cj, site, ble, gain));
+                        }
+                    }
+                }
+            }
+            if let Some((cj, site, ble, _)) = best_swap {
+                let (osite, oble) = out.lutff_sites[cj];
+                grid.swap_bles(
+                    (cur_site.x, cur_site.y, cur_ble),
+                    (osite.x, osite.y, oble),
+                    ci,
+                    cj,
+                );
+                out.lutff_sites[ci] = (site, ble);
+                out.lutff_sites[cj] = (cur_site, cur_ble);
+                local_swaps += 1;
+                pass_moves += 1;
+            }
+        }
+        if pass_moves == 0 {
+            break;
+        }
+    }
+
+    let after_hpwl = weighted_hpwl(&out, opts);
+    Ok((
+        out,
+        DetailedPlaceStats {
+            median_relocations,
+            local_swaps,
+            weighted_hpwl_before: before_hpwl,
+            weighted_hpwl_after: after_hpwl,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -1666,17 +3710,17 @@ mod tests {
         d.add_port("led", helion_ir::PortDir::Out);
         for i in 0..9u32 {
             d.add_cell(
-                format!("u_lut{i}"),
+                &format!("u_lut{i}"),
                 CellKind::Lut6 {
                     init: 0x5555_5555_5555_5555,
                 },
             );
-            d.add_cell(format!("u_ff{i}"), CellKind::Hff);
-            d.connect("clk", format!("u_ff{i}"), "CLK");
-            d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
-            d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
-            d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
-            d.connect(format!("q{i}"), format!("u_lut{i}"), "I0");
+            d.add_cell(&format!("u_ff{i}"), CellKind::Hff);
+            d.connect("clk", &format!("u_ff{i}"), "CLK");
+            d.connect(&format!("d{i}"), &format!("u_lut{i}"), "O");
+            d.connect(&format!("d{i}"), &format!("u_ff{i}"), "D");
+            d.connect(&format!("q{i}"), &format!("u_ff{i}"), "Q");
+            d.connect(&format!("q{i}"), &format!("u_lut{i}"), "I0");
         }
         d.add_cell("u_iob", CellKind::IobOut);
         d.connect("q0", "u_iob", "I");
@@ -1761,6 +3805,7 @@ mod tests {
             &TimingGuide {
                 false_path_iob: true,
                 iob_setup_mult: 1,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1787,6 +3832,7 @@ mod tests {
             &TimingGuide {
                 false_path_iob: false,
                 iob_setup_mult: 2,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1804,6 +3850,7 @@ mod tests {
             &TimingGuide {
                 false_path_iob: true,
                 iob_setup_mult: 2,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1836,6 +3883,7 @@ mod tests {
             &TimingGuide {
                 false_path_iob: true,
                 iob_setup_mult: 1,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1864,6 +3912,7 @@ mod tests {
         let g = TimingGuide {
             false_path_iob: true,
             iob_setup_mult: 1,
+            ..Default::default()
         };
         let pl = place_in_region_with_guide(&p, &dev, opts, 5, 1, 8, 8, &g).unwrap();
         for (s, _) in &pl.lutff_sites {
@@ -2020,5 +4069,197 @@ mod tests {
                 assert_eq!(lutff_of(&pl, &lf.ff_cell), Some((site, ble)));
             }
         }
+    }
+
+    #[test]
+    fn congestion_spread_relieves_dense_clb_sites() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&hard_heartbeat(), &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        // All 8 heartbeat LUTFFs pack into a single CLB site initially.
+        let initial_max = packing_summary_from_placed(&pl)
+            .sites
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        assert_eq!(initial_max, 8);
+        let (spread, moved) = place_congestion_spread(&pl, &dev, 4).unwrap();
+        assert_eq!(moved, 4, "4 of 8 LUTFFs must spread out when cap=4");
+        let after_max = packing_summary_from_placed(&spread)
+            .sites
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        assert!(after_max <= 4, "max BLE occupancy per CLB must obey cap=4, got {after_max}");
+    }
+
+    #[test]
+    fn permute_lut6_init_preserves_truth_table_and_reorders_critical_pins() {
+        // Function: f(I0, I1) = I0 & ~I1 (truth table over 6 inputs).
+        let mut init = 0u64;
+        for addr in 0..64u64 {
+            let i0 = addr & 1;
+            let i1 = (addr >> 1) & 1;
+            if i0 == 1 && i1 == 0 {
+                init |= 1u64 << addr;
+            }
+        }
+        // Swap I0 and I1: old I0 -> new I1, old I1 -> new I0.
+        let perm = [1, 0, 2, 3, 4, 5];
+        let permuted = permute_lut6_init(init, &perm);
+        for addr in 0..64u64 {
+            let new_i0 = addr & 1;
+            let new_i1 = (addr >> 1) & 1;
+            let bit = (permuted >> addr) & 1;
+            assert_eq!(bit == 1, new_i1 == 1 && new_i0 == 0);
+        }
+        // Involution: applying the swap again restores the exact original INIT.
+        assert_eq!(permute_lut6_init(permuted, &perm), init);
+    }
+
+    #[test]
+    fn phys_opt_place_reduces_wirelength_and_permutes_critical_lut_pins() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_counter(), &dev).unwrap();
+        let mut pl = place(&p, &dev).unwrap();
+        // Displace cluster 0 far north and put its critical fanin on pin I3 of cluster 3.
+        let north_site = dev
+            .clb_sites()
+            .find(|s| s.x == pl.lutff_sites[0].0.x && s.y == pl.lutff_sites[0].0.y + 3)
+            .unwrap();
+        pl.lutff_sites[0] = (north_site, 0);
+        let (opt, stats) = phys_opt_place_with_stats(&pl, &dev).unwrap();
+        assert!(
+            stats.wirelength_after < stats.wirelength_before,
+            "phys_opt_place must reduce wirelength ({} -> {})",
+            stats.wirelength_before,
+            stats.wirelength_after
+        );
+        assert!(stats.relocated_cells + stats.swapped_cells >= 1);
+        assert_eq!(opt.lutff_sites.len(), pl.lutff_sites.len());
+    }
+
+    #[test]
+    fn slack_criticality_weight_monotone_with_slack_and_exponent() {
+        let w_neg = slack_criticality_weight(-200.0, 10_000.0, 2.0);
+        let w_low = slack_criticality_weight(2_000.0, 10_000.0, 2.0);
+        let w_high_slack = slack_criticality_weight(8_000.0, 10_000.0, 2.0);
+        let w_excess = slack_criticality_weight(12_000.0, 10_000.0, 2.0);
+        assert!((w_neg - 1.0).abs() < 1e-9);
+        assert!((w_low - 0.64).abs() < 1e-9);
+        assert!(w_low > w_high_slack);
+        assert_eq!(w_excess, 0.0);
+    }
+
+    #[test]
+    fn cg_spd_solver_converges_on_1d_spring_chain() {
+        // 3 movable nodes between fixed 0.0 and fixed 4.0 with unit springs:
+        // exact equilibrium is x = [1.0, 2.0, 3.0].
+        let diag = vec![2.0, 2.0, 2.0];
+        let edges = vec![(0usize, 1usize, 1.0), (1usize, 2usize, 1.0)];
+        let rhs = vec![0.0, 0.0, 4.0];
+        let (x, iters) = solve_cg_spd(3, &diag, &edges, &rhs, &[0.0, 0.0, 0.0], 32, 1e-9);
+        assert!(iters >= 1 && iters <= 10);
+        assert!((x[0] - 1.0).abs() < 1e-6, "x[0]={}", x[0]);
+        assert!((x[1] - 2.0).abs() < 1e-6, "x[1]={}", x[1]);
+        assert!((x[2] - 3.0).abs() < 1e-6, "x[2]={}", x[2]);
+    }
+
+    #[test]
+    fn analytical_placer_legalizes_and_respects_timing_criticality() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&hard_heartbeat(), &dev).unwrap();
+        let mut opts_td = AnalyticalPlaceOpts {
+            timing_weight: 2.0,
+            ..Default::default()
+        };
+        opts_td.net_slack_ps.insert("q7".to_string(), 100.0);
+        let (pl_td, stats_td) = place_analytical_with_stats(&p, &dev, &opts_td).unwrap();
+        assert_eq!(pl_td.lutff_sites.len(), p.lutffs.len());
+        assert!(stats_td.cg_iters_total > 0);
+        // Verify no duplicate (site, BLE) slots after ripple legalization.
+        let mut seen = HashSet::new();
+        for &(s, ble) in &pl_td.lutff_sites {
+            assert!(dev.contains_site(s));
+            assert!(seen.insert((s.x, s.y, ble)), "duplicate BLE at {:?} {}", s, ble);
+        }
+        // Deterministic repeat check.
+        let pl_td2 = place_analytical_with(&p, &dev, &opts_td).unwrap();
+        assert_eq!(pl_td.lutff_sites, pl_td2.lutff_sites);
+    }
+
+    #[test]
+    fn carry4_chain_extraction_and_vertical_column_legalization() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_counter();
+        d.add_cell("carry_lo", CellKind::Carry4);
+        d.add_cell("carry_hi", CellKind::Carry4);
+        d.connect("cy_mid", "carry_lo", "CO3");
+        d.connect("cy_mid", "carry_hi", "CI");
+        d.connect("q0", "carry_lo", "S0");
+        d.connect("q1", "carry_lo", "S1");
+        d.connect("q2", "carry_hi", "S0");
+        d.connect("q3", "carry_hi", "S1");
+        d.add_cell("u_bram0", CellKind::Bram18);
+
+        let chains = extract_carry4_chains(&d);
+        assert_eq!(chains, vec![vec!["carry_lo".to_string(), "carry_hi".to_string()]]);
+
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let (leg, stats) = legalize_macro_columns(&pl, &dev, Some(&d)).unwrap();
+        assert_eq!(stats.carry_chains_legalized, 1);
+        assert_eq!(stats.carry_cells_placed, 4);
+        assert_eq!(stats.bram_macros_legalized, 1);
+
+        // Verify the 4 carry-chain clusters occupy a contiguous vertical column run (x constant, y consecutive).
+        let c0 = leg.lutff_sites[0].0;
+        for step in 1..4 {
+            let cs = leg.lutff_sites[step].0;
+            assert_eq!(cs.x, c0.x, "carry chain must stay in one CLB column");
+            assert_eq!(cs.y, c0.y + step as u32, "carry chain must be vertically contiguous");
+        }
+
+        // Also verify DSP column legalization on HL10T-DSP1.
+        let dev_dsp = Device::load_part("HL10T-DSP1").unwrap();
+        let mut d_dsp = Design::structural_blinky();
+        d_dsp.add_cell("u_mac0", CellKind::Mac27);
+        let p_dsp = pack(&d_dsp, &dev_dsp).unwrap();
+        let pl_dsp = place(&p_dsp, &dev_dsp).unwrap();
+        let (_, stats_dsp) = legalize_macro_columns(&pl_dsp, &dev_dsp, Some(&d_dsp)).unwrap();
+        assert_eq!(stats_dsp.dsp_macros_legalized, 1);
+    }
+
+    #[test]
+    fn detailed_place_optimize_improves_weighted_hpwl_and_preserves_locked_chains() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&hard_heartbeat(), &dev).unwrap();
+        let mut pl = place(&p, &dev).unwrap();
+        // Displace non-locked cluster 7 far away from its driver and IOB.
+        let far_site = dev
+            .clb_sites()
+            .find(|s| s.x == pl.lutff_sites[7].0.x + 2 && s.y == pl.lutff_sites[7].0.y + 3)
+            .unwrap();
+        pl.lutff_sites[7] = (far_site, 0);
+
+        let mut opts = DetailedPlaceOpts::default();
+        opts.net_criticality.insert("q7".to_string(), 1.0);
+        opts.locked_clusters.insert(0);
+        let locked_site_before = pl.lutff_sites[0];
+
+        let (opt, stats) = detailed_place_optimize_with_stats(&pl, &dev, &opts).unwrap();
+        assert!(
+            stats.weighted_hpwl_after < stats.weighted_hpwl_before,
+            "detailed_place_optimize must reduce weighted HPWL ({} -> {})",
+            stats.weighted_hpwl_before,
+            stats.weighted_hpwl_after
+        );
+        assert!(stats.median_relocations + stats.local_swaps >= 1);
+        assert_eq!(
+            opt.lutff_sites[0], locked_site_before,
+            "locked carry-chain cluster must not move"
+        );
     }
 }

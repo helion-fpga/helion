@@ -293,6 +293,51 @@ pub struct ClockAssignment {
     /// Spine name from `globals.json` (e.g. `"UL58"`).
     pub spine: String,
 }
+/// A placed 5G SERDES Dual Channel Unit (`DCUA`).
+#[derive(Clone, Debug)]
+pub struct PlacedDcu {
+    pub name: String,
+    pub dcu_idx: u8,
+    pub site: SiteAddr,
+}
+
+/// A placed SERDES External Reference Clock Buffer (`EXTREFB`).
+#[derive(Clone, Debug)]
+pub struct PlacedExtref {
+    pub name: String,
+    pub dcu_idx: u8,
+    pub site: SiteAddr,
+}
+
+/// A placed `DDRDLL`.
+#[derive(Clone, Debug)]
+pub struct PlacedDdrdll {
+    pub name: String,
+    pub site: SiteAddr,
+}
+
+/// A placed `DQSBUFM`.
+#[derive(Clone, Debug)]
+pub struct PlacedDqs {
+    pub name: String,
+    pub site: SiteAddr,
+}
+
+/// A placed `IDDRX1F` / `ODDRX1F` / `IDDRX2F` / `ODDRX2F` / `DELAYG` / `DELAYF`.
+#[derive(Clone, Debug)]
+pub struct PlacedIologic {
+    pub name: String,
+    pub kind: crate::pack::IologicKind,
+    pub site: SiteAddr,
+}
+
+/// A placed system configuration block (`USRMCLK`, `OSCG`, `DTR`).
+#[derive(Clone, Debug)]
+pub struct PlacedSysConfig {
+    pub name: String,
+    pub kind: crate::pack::SysConfigKind,
+    pub site: SiteAddr,
+}
 
 /// Placed packed netlist for the LFE5U-85F: a concrete device site for
 /// every packed primitive, plus the clock-net -> global-clock mapping for
@@ -313,10 +358,22 @@ pub struct PlacedEcp5 {
     pub ios: Vec<PlacedIo>,
     /// Placed block RAMs.
     pub ebrs: Vec<PlacedEbr>,
-    /// Placed DSP instances.
+    /// Placed DSP instances (`MULT18X18D` and `ALU54B`).
     pub dsps: Vec<PlacedDsp>,
     /// Placed PLLs.
     pub plls: Vec<PlacedPll>,
+    /// Placed 5G SERDES DCU blocks.
+    pub dcus: Vec<PlacedDcu>,
+    /// Placed SERDES EXTREFB blocks.
+    pub extrefs: Vec<PlacedExtref>,
+    /// Placed DDRDLL blocks.
+    pub ddrdlls: Vec<PlacedDdrdll>,
+    /// Placed DQSBUFM blocks.
+    pub dqs_blocks: Vec<PlacedDqs>,
+    /// Placed IOLOGIC blocks.
+    pub iologics: Vec<PlacedIologic>,
+    /// Placed system config blocks (`USRMCLK`, `OSCG`, `DTR`).
+    pub sys_configs: Vec<PlacedSysConfig>,
     /// Placed carry chains.
     pub carry_chains: Vec<PlacedCarryChain>,
     /// Clock-net -> global clock (DCC) assignments for the route worker.
@@ -528,9 +585,13 @@ fn group_dsp_slices(bels: Vec<BelSite>) -> Vec<DspSlice> {
 fn alloc_dsp(slices: &mut [DspSlice], kind: DspKind, name: &str) -> Result<SiteAddr, String> {
     let prefix = kind.bel_prefix();
     for slice in slices.iter_mut() {
-        // Skip slices already claimed by an incompatible kind.
+        // Allow MULT18_* and ALU54_* to coexist in the same sysDSP slice so
+        // hardware multiplier-accumulator cascades share one DSP slice.
         if let Some(taken) = &slice.taken {
-            if taken != prefix {
+            let compatible = taken == prefix
+                || (taken == "MULT18_" && prefix == "ALU54_")
+                || (taken == "ALU54_" && prefix == "MULT18_");
+            if !compatible {
                 continue;
             }
         }
@@ -877,9 +938,13 @@ pub fn place(device: &Device, packed: &PackedEcp5) -> Result<PlacedEcp5, String>
         device,
         &[
             SiteClass::Pio,
+            SiteClass::IoLogic,
             SiteClass::Ebr,
             SiteClass::Dsp,
             SiteClass::Pll,
+            SiteClass::DdrDll,
+            SiteClass::Dqs,
+            SiteClass::Control,
         ],
     );
     let mut pio_bels = pools.remove(&SiteClass::Pio).unwrap_or_default();
@@ -943,11 +1008,9 @@ pub fn place(device: &Device, packed: &PackedEcp5) -> Result<PlacedEcp5, String>
         let site = alloc_bel(&mut ebr_pool, "EBR", &ram.name)?;
         out.ebrs.push(PlacedEbr {
             name: ram.name.clone(),
-            // v1: the pack worker carries 9-bit INIT words and no width
-            // attributes; the bitstream worker only supports DATA_WIDTH 9.
             params: EbrParams {
-                width_a: 9,
-                width_b: 9,
+                width_a: u32::from(ram.data_width_a),
+                width_b: u32::from(ram.data_width_b),
             },
             nets: Vec::new(),
             site,
@@ -955,7 +1018,6 @@ pub fn place(device: &Device, packed: &PackedEcp5) -> Result<PlacedEcp5, String>
     }
     let mut dsp_slices = group_dsp_slices(pools.remove(&SiteClass::Dsp).unwrap_or_default());
     for dsp in &packed.dsps {
-        // v1: the pack worker only infers MULT18X18D.
         let site = alloc_dsp(&mut dsp_slices, DspKind::Mult18x18, &dsp.name)?;
         let mut nets = vec![dsp.a_net.clone(), dsp.b_net.clone()];
         if let Some(c) = &dsp.c_net {
@@ -969,14 +1031,155 @@ pub fn place(device: &Device, packed: &PackedEcp5) -> Result<PlacedEcp5, String>
             site,
         });
     }
+    for alu in &packed.alu54s {
+        let site = alloc_dsp(&mut dsp_slices, DspKind::Alu54, &alu.name)?;
+        let mut nets = Vec::new();
+        for n in [
+            &alu.ma_net,
+            &alu.mb_net,
+            &alu.c_net,
+            &alu.cin_net,
+            &alu.co_net,
+            &alu.r_net,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            nets.push(n.clone());
+        }
+        out.dsps.push(PlacedDsp {
+            name: alu.name.clone(),
+            kind: DspKind::Alu54,
+            nets,
+            site,
+        });
+    }
     let mut pll_pool = pools.remove(&SiteClass::Pll).unwrap_or_default();
     for pll in &packed.plls {
         let site = alloc_bel(&mut pll_pool, "PLL", &pll.name)?;
+        let mut out_nets = vec![pll.out_net.clone()];
+        for s in [&pll.clkos_net, &pll.clkos2_net, &pll.clkos3_net]
+            .into_iter()
+            .flatten()
+        {
+            out_nets.push(s.clone());
+        }
         out.plls.push(PlacedPll {
             name: pll.name.clone(),
             ref_net: pll.ref_net.clone(),
-            out_nets: vec![pll.out_net.clone()],
+            out_nets,
             site,
+        });
+    }
+
+    // ---- 2b. DCU / EXTREFB / DDRDLL / DQS / IOLOGIC / SysConfig ----------------
+    let dcu_tiles = device.tiles_of_type("VCIB_DCUA");
+    for (di, dcu) in packed.dcus.iter().enumerate() {
+        let tidx = dcu_tiles
+            .get(dcu.dcu_idx as usize)
+            .or_else(|| dcu_tiles.get(di))
+            .or_else(|| dcu_tiles.first())
+            .copied()
+            .ok_or_else(|| format!("place: no VCIB_DCUA tile for {}", dcu.name))?;
+        let t = &device.tiles()[tidx];
+        out.dcus.push(PlacedDcu {
+            name: dcu.name.clone(),
+            dcu_idx: dcu.dcu_idx,
+            site: SiteAddr {
+                tile_row: t.row,
+                tile_col: t.col,
+                tile_type: t.tile_type.clone(),
+                site: format!("DCU{}", dcu.dcu_idx),
+                bel_col: t.col as i32,
+                bel_row: t.row as i32,
+            },
+        });
+    }
+    for (ei, ext) in packed.extrefs.iter().enumerate() {
+        let tidx = dcu_tiles
+            .get(ext.dcu_idx as usize)
+            .or_else(|| dcu_tiles.get(ei))
+            .or_else(|| dcu_tiles.first())
+            .copied()
+            .ok_or_else(|| format!("place: no VCIB_DCUA tile for EXTREFB {}", ext.name))?;
+        let t = &device.tiles()[tidx];
+        out.extrefs.push(PlacedExtref {
+            name: ext.name.clone(),
+            dcu_idx: ext.dcu_idx,
+            site: SiteAddr {
+                tile_row: t.row,
+                tile_col: t.col,
+                tile_type: t.tile_type.clone(),
+                site: format!("EXTREF{}", ext.dcu_idx),
+                bel_col: t.col as i32,
+                bel_row: t.row as i32,
+            },
+        });
+    }
+    let mut ddrdll_pool = pools.remove(&SiteClass::DdrDll).unwrap_or_default();
+    for dll in &packed.ddrdlls {
+        let site = alloc_bel(&mut ddrdll_pool, "DDRDLL", &dll.name)?;
+        out.ddrdlls.push(PlacedDdrdll {
+            name: dll.name.clone(),
+            site,
+        });
+    }
+    let mut dqs_pool = pools
+        .remove(&SiteClass::Dqs)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|b| b.tile_type.contains("DQS"))
+        .collect::<Vec<_>>();
+    for dqs in &packed.dqs_blocks {
+        let site = alloc_bel(&mut dqs_pool, "DQSBUFM", &dqs.name)?;
+        out.dqs_blocks.push(PlacedDqs {
+            name: dqs.name.clone(),
+            site,
+        });
+    }
+    let mut iol_pool = pools
+        .remove(&SiteClass::IoLogic)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|b| {
+            (b.name == "IOLOGICA" || b.name == "IOLOGICB")
+                && (b.tile_type.starts_with("PICL0")
+                    || b.tile_type.starts_with("PICR0")
+                    || b.tile_type.starts_with("PICB0")
+                    || b.tile_type.starts_with("PICT0"))
+        })
+        .collect::<Vec<_>>();
+    for iol in &packed.iologics {
+        let site = alloc_bel(&mut iol_pool, "IOLOGIC", &iol.name)?;
+        out.iologics.push(PlacedIologic {
+            name: iol.name.clone(),
+            kind: iol.kind,
+            site,
+        });
+    }
+    for sc in &packed.sys_configs {
+        let (tt, sname) = match sc.kind {
+            crate::pack::SysConfigKind::Usrmclk => ("EFB1_PICB1", "CCLK"),
+            crate::pack::SysConfigKind::Oscg => ("EFB1_PICB1", "OSC"),
+            crate::pack::SysConfigKind::Dtr => ("DTR", "DTR"),
+        };
+        let tidx = device
+            .tiles_of_type(tt)
+            .first()
+            .copied()
+            .ok_or_else(|| format!("place: no {tt} tile for {:?}", sc.kind))?;
+        let t = &device.tiles()[tidx];
+        out.sys_configs.push(PlacedSysConfig {
+            name: sc.name.clone(),
+            kind: sc.kind,
+            site: SiteAddr {
+                tile_row: t.row,
+                tile_col: t.col,
+                tile_type: t.tile_type.clone(),
+                site: sname.to_string(),
+                bel_col: t.col as i32,
+                bel_row: t.row as i32,
+            },
         });
     }
 
@@ -1645,6 +1848,7 @@ mod tests {
             ref_net: "clk".into(),
             out_net: "pll_clk".into(),
             params: vec![],
+            ..Default::default()
         });
         let placed = place(dev, &packed).unwrap();
         // clk + pll_clk.
@@ -1664,6 +1868,7 @@ mod tests {
             rams: vec![PackedEcp5Ram {
                 name: "ram0".into(),
                 init: vec![],
+                ..Default::default()
             }],
             dsps: vec![
                 PackedEcp5Dsp {
@@ -1672,6 +1877,7 @@ mod tests {
                     b_net: "b".into(),
                     c_net: None,
                     p_net: "p0".into(),
+                    ..Default::default()
                 },
                 PackedEcp5Dsp {
                     name: "mult1".into(),
@@ -1679,6 +1885,7 @@ mod tests {
                     b_net: "b".into(),
                     c_net: None,
                     p_net: "p1".into(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -1734,6 +1941,7 @@ mod tests {
             packed.rams.push(PackedEcp5Ram {
                 name: format!("ram{i}"),
                 init: vec![],
+                ..Default::default()
             });
         }
         let err = place(dev, &packed).unwrap_err();
@@ -1751,6 +1959,7 @@ mod tests {
                 ref_net: "clk".into(),
                 out_net: format!("c{i}"),
                 params: vec![],
+                ..Default::default()
             });
         }
         let err = place(dev, &packed).unwrap_err();

@@ -1,7 +1,7 @@
 //! Self-correction loop: chrome state, event isolation, geometry probes, engine offload.
 //!
 //! The IDE binary and the tests drive the **same** `ChromeState` transitions.
-//! Paint in `helion-ide` must follow [`central_pane`] — if a click updates state
+//! Paint in `helion-ide` must follow [`central_pane`] - if a click updates state
 //! but the pane is still Timing, tests fail.
 
 use crate::chrome::{self, Activity, Canvas, WorkspacePane};
@@ -188,7 +188,7 @@ pub fn apply_activity(s: &mut ChromeState, a: Activity) {
             s.workspace = WorkspaceTab::Reports;
         }
         Activity::Simulate => {
-            // Do not leave Timing/Device canvas selected — Waveform is the pane.
+            // Do not leave Timing/Device canvas selected - Waveform is the pane.
             s.canvas = Canvas::Editor;
             if !s.workspace.sim_only() {
                 s.workspace = WorkspaceTab::Wave;
@@ -218,6 +218,23 @@ pub fn apply_more(s: &mut ChromeState, tab: WorkspaceTab) {
         return;
     }
     match chrome::pane_for_workspace(tab) {
+        WorkspacePane::Device => {
+            // Canvas tabs must sync the canvas, not just the workspace.
+            // The fuzzer caught "More Device" leaving canvas=Editor (stale).
+            s.activity = Activity::Device;
+            s.canvas = Canvas::Device;
+            s.sidebar_hidden = false;
+        }
+        WorkspacePane::Editor => {
+            s.activity = Activity::Files;
+            s.canvas = Canvas::Editor;
+            s.sidebar_hidden = false;
+        }
+        WorkspacePane::Timing => {
+            s.activity = Activity::Timing;
+            s.canvas = Canvas::Timing;
+            s.sidebar_hidden = false;
+        }
         WorkspacePane::Package => {
             s.activity = Activity::Device;
             s.canvas = Canvas::Device;
@@ -307,7 +324,7 @@ pub fn geometry_at(window_w: f32, window_h: f32, sidebar: f32, console: f32) -> 
     }
 }
 
-/// Heavy CAD work — never run inside an egui frame.
+/// Heavy CAD work - never run inside an egui frame.
 #[derive(Clone, Debug)]
 pub enum JobKind {
     Open(PathBuf),
@@ -350,7 +367,7 @@ impl JobKind {
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| p.display().to_string())
             ),
-            JobKind::Implement => "Implementing — synthesis, opt, place, route…".into(),
+            JobKind::Implement => "Implementing - synthesis, opt, place, route…".into(),
             JobKind::Step(s) => format!("Running {}…", s.label()),
             JobKind::SimRun(n) => format!("Running simulation ({n} cycles)…"),
             JobKind::DesignRun { name } => format!("Running design run {name}…"),
@@ -941,22 +958,14 @@ mod tests {
             "Zoom Fit touches a pane edge ({drawn_w}x{drawn_h})"
         );
 
-        d.click_more(WorkspaceTab::Hierarchy);
-        assert_eq!(d.pane(), WorkspacePane::Hierarchy);
+        // Grammar R15: Hierarchy is a Z3 sidebar section, not a More
+        // destination. No click_more target routes to a hierarchy central
+        // pane; the tree data is still built for the sidebar sections.
         let hier = d.model.hierarchy.drawing();
         assert!(
             !hier.boxes.is_empty(),
             "hierarchy after Implement must have boxes"
         );
-        let native = chrome::native_drawing_fill(hier.width, hier.height, 1000.0, 400.0);
-        assert!(
-            native < chrome::PANE_FILL_MIN,
-            "native hierarchy {native} cols must be a postage stamp so scale is required ({}×{})",
-            hier.width,
-            hier.height
-        );
-        let hfit = chrome::hierarchy_fit(hier.width.max(1.0), hier.height.max(1.0), 1000.0, 400.0);
-        assert!(hfit.fills(), "hierarchy scaled {hfit:?}");
         d.click_more(WorkspaceTab::Ip);
         assert_eq!(d.pane(), WorkspacePane::Ip);
         let (cat_h, ip_canvas) = chrome::ip_layout(1000.0, 400.0);
@@ -1167,5 +1176,32 @@ mod tests {
             }
         };
         assert!(out.result.is_ok(), "{:?}", out.result);
+    }
+
+    /// Grammar R15: the hierarchy tree is a Z3 sidebar section, not a
+    /// central pane. It must not appear in the More menu, and every More
+    /// destination must still honor the click_more -> pane contract.
+    #[test]
+    fn hierarchy_is_not_a_central_destination() {
+        let plan = chrome::chrome_at(1600.0);
+        assert!(
+            !plan.more_items.iter().any(|l| *l == "Hierarchy"),
+            "More menu must not list Hierarchy: {:?}",
+            plan.more_items
+        );
+        assert!(WorkspaceTab::parse_label("Hierarchy").is_none());
+        let mut d = ChromeDriver::new();
+        d.click_open(&example("counter.sv")).unwrap();
+        d.click_implement().unwrap();
+        for tab in WorkspaceTab::ALL {
+            if chrome::is_more_destination(tab) {
+                d.click_more(tab);
+                assert_eq!(
+                    d.pane(),
+                    chrome::pane_for_workspace(tab),
+                    "{tab:?} broke the More -> pane contract"
+                );
+            }
+        }
     }
 }

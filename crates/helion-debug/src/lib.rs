@@ -9,10 +9,38 @@ use helion_bits::bitgen;
 use helion_device::Device;
 use helion_fabric::{Fabric, IlaMatchKind};
 use helion_hw::Tap;
-use helion_ir::{CellKind, Design};
+use helion_ir::{intern, resolve, CellKind, Design};
 use helion_pack::pack;
 use helion_place::place;
 use helion_route::route;
+
+pub mod bscan;
+pub mod insert;
+pub mod ltx;
+pub mod trigger;
+pub mod vio_axi;
+
+pub use bscan::{
+    BSCAN_HUB_BROADCAST_SLOT, BSCAN_HUB_MAGIC, BscanCoreSlot, BscanDebugHub, BscanFrame,
+    BscanUserChain, DebugCoreKind, MAX_BSCAN_SLOTS, deterministic_core_uuid, hub_opcode,
+};
+pub use insert::{
+    DebugCoreInsertionReport, DebugInsertConfig, collect_marked_debug_nets, insert_debug_cores,
+    strip_debug_cores,
+};
+pub use ltx::{
+    DebugProbesLtx, LtxCoreDescriptor, LtxProbeChannel, LtxProbeDirection,
+    group_nets_into_probe_channels,
+};
+pub use trigger::{
+    ComparatorOp, IlaCapturedSegment, IlaSequencerCaptureResult, IlaSequencerConfig,
+    IlaTriggerSequencer, MAX_TRIGGER_STATES, ProbeComparator, StateTransition, TriggerBoolOp,
+    TriggerCondition, TriggerStateSpec, TriggerWindowPosition, run_sequencer_capture,
+};
+pub use vio_axi::{
+    AxiRegion, AxiResp, AxiTxnKind, HwAxiTxn, JtagAxiMaster, VioActivityKind, VioCore, VioProbeIn,
+    VioProbeOut, create_hw_axi_txn,
+};
 
 #[derive(Clone, Debug)]
 pub struct IlaCapture {
@@ -111,39 +139,40 @@ fn ila_aux_nets(net: &str) -> [String; 2] {
 pub fn strip_ila(design: &mut Design, net: &str) {
     let cells = ila_cell_names(net);
     let aux = ila_aux_nets(net);
-    design.cells.retain(|c| !cells.iter().any(|n| n == &c.name));
-    design.nets.retain(|n| !aux.iter().any(|a| a == &n.name));
+    design.cells.retain(|c| !cells.iter().any(|n| resolve(c.name) == n.as_str()));
+    design.nets.retain(|n| !aux.iter().any(|a| resolve(n.name) == a.as_str()));
     for n in &mut design.nets {
-        n.endpoints.retain(|e| !cells.iter().any(|c| c == &e.cell));
+        n.endpoints.retain(|e| !cells.iter().any(|c| resolve(e.cell) == c.as_str()));
     }
+    design.rebuild_indexes();
 }
 
 /// Insert an ILA probe on `net`: identity LUT+FF so the bitstream gains BLE1 INIT.
 pub fn insert_ila(design: &mut Design, net: &str) -> Result<(), String> {
-    if !design.nets.iter().any(|n| n.name == net) {
+    if !design.nets.iter().any(|n| n.name == intern(net)) {
         return Err(format!("mark_debug: no net {net}"));
     }
     if design
         .cells
         .iter()
-        .any(|c| matches!(&c.kind, CellKind::Ila { net: n } if n == net))
+        .any(|c| matches!(&c.kind, CellKind::Ila { net: n } if *n == intern(net)))
     {
         return Ok(());
     }
-    design.add_cell(format!("ila_{net}"), CellKind::Ila { net: net.into() });
+    design.add_cell(&format!("ila_{net}"), CellKind::Ila { net: intern(net) });
     // Buffer LUT: O = I0 → INIT 0xAAAA… so capture tracks the marked net.
     design.add_cell(
-        format!("ila_{net}_lut"),
+        &format!("ila_{net}_lut"),
         CellKind::Lut6 {
             init: 0xAAAA_AAAA_AAAA_AAAA,
         },
     );
-    design.add_cell(format!("ila_{net}_ff"), CellKind::Hff);
-    design.connect(net, format!("ila_{net}_lut"), "I0");
+    design.add_cell(&format!("ila_{net}_ff"), CellKind::Hff);
+    design.connect(net, &format!("ila_{net}_lut"), "I0");
     let dnet = format!("ila_{net}_d");
-    design.connect(&dnet, format!("ila_{net}_lut"), "O");
-    design.connect(&dnet, format!("ila_{net}_ff"), "D");
-    design.connect(format!("ila_{net}_q"), format!("ila_{net}_ff"), "Q");
+    design.connect(&dnet, &format!("ila_{net}_lut"), "O");
+    design.connect(&dnet, &format!("ila_{net}_ff"), "D");
+    design.connect(&format!("ila_{net}_q"), &format!("ila_{net}_ff"), "Q");
     Ok(())
 }
 
@@ -151,7 +180,7 @@ pub fn insert_ila(design: &mut Design, net: &str) -> Result<(), String> {
 pub fn insert_marked(design: &mut Design) -> Result<usize, String> {
     let nets = design.marked_debug_nets();
     for n in &nets {
-        insert_ila(design, n)?;
+        insert_ila(design, resolve(*n))?;
     }
     Ok(nets.len())
 }
@@ -214,7 +243,8 @@ pub fn insert_arm_capture(
 }
 
 pub fn strip_capture_bram(design: &mut Design) {
-    design.cells.retain(|c| c.name != CAPTURE_BRAM);
+    design.cells.retain(|c| c.name != intern(CAPTURE_BRAM));
+    design.rebuild_indexes();
 }
 
 /// Insert a Bram18 used as on-fabric ILA capture RAM (INIT sized to `words`).
@@ -229,7 +259,7 @@ pub fn insert_capture_bram(design: &mut Design, words: usize) -> Result<(), Stri
     let cell = design
         .cells
         .iter_mut()
-        .find(|c| c.name == CAPTURE_BRAM)
+        .find(|c| c.name == intern(CAPTURE_BRAM))
         .ok_or_else(|| "ila_capture_ram missing after insert".to_string())?;
     cell.attrs.set("INIT", init);
     Ok(())
@@ -256,13 +286,16 @@ fn match_unit_cell_names() -> [&'static str; 4] {
 
 pub fn strip_match_unit(design: &mut Design) {
     let names = match_unit_cell_names();
-    design.cells.retain(|c| !names.iter().any(|n| *n == c.name));
+    design.cells.retain(|c| !names.iter().any(|n| intern(n) == c.name));
     design.nets.retain(|n| {
-        n.name != MATCH_HIT_NET && n.name != MATCH_PREV_NET && n.name != "ila_match_delay_d"
+        n.name != intern(MATCH_HIT_NET)
+            && n.name != intern(MATCH_PREV_NET)
+            && n.name != intern("ila_match_delay_d")
     });
     for n in &mut design.nets {
-        n.endpoints.retain(|e| !names.iter().any(|c| *c == e.cell));
+        n.endpoints.retain(|e| !names.iter().any(|c| intern(c) == e.cell));
     }
+    design.rebuild_indexes();
 }
 
 /// Insert UG908-class match unit + trigger FSM IP marker on `trigger_net`.
@@ -275,7 +308,7 @@ pub fn insert_match_unit(
     trigger_net: &str,
     kind: IlaTriggerKind,
 ) -> Result<(), String> {
-    if !design.nets.iter().any(|n| n.name == trigger_net) {
+    if !design.nets.iter().any(|n| n.name == intern(trigger_net)) {
         return Err(format!("match unit: no net {trigger_net}"));
     }
     strip_match_unit(design);
@@ -283,10 +316,10 @@ pub fn insert_match_unit(
     design.add_cell(
         TRIG_FSM_CELL,
         CellKind::BlackBox {
-            module: "h_ila_trig".into(),
+            module: intern("h_ila_trig"),
         },
     );
-    if let Some(c) = design.cells.iter_mut().find(|c| c.name == TRIG_FSM_CELL) {
+    if let Some(c) = design.cells.iter_mut().find(|c| c.name == intern(TRIG_FSM_CELL)) {
         c.attrs.set("MATCH", kind.as_str());
         c.attrs.set("NET", trigger_net);
         c.attrs.set("VLNV", "community:helion:h_ila_trig:1.0");
@@ -377,7 +410,7 @@ pub fn insert_arm_capture_deep(
         ));
     }
     for n in &cfg.nets {
-        if !design.nets.iter().any(|nn| nn.name == *n) {
+        if !design.nets.iter().any(|nn| nn.name == intern(n)) {
             return Err(format!("mark_debug: no net {n}"));
         }
     }
@@ -413,7 +446,7 @@ pub fn insert_arm_capture_deep(
     {
         return Err("ILA deep did not pack match-unit LUT".into());
     }
-    if !d.cells.iter().any(|c| c.name == TRIG_FSM_CELL) {
+    if !d.cells.iter().any(|c| c.name == intern(TRIG_FSM_CELL)) {
         return Err("ILA deep missing ila_trig_fsm IP marker".into());
     }
     let bram_major = routed
@@ -586,7 +619,7 @@ fn probe_site(
     if let Some(iob) = packed
         .iobs
         .iter()
-        .find(|iob| design.net_on(&iob.cell, "PAD") == Some(net))
+        .find(|iob| design.net_on(intern(&iob.cell), intern("PAD")) == Some(intern(net)))
     {
         if let Some(i) = packed.lutffs.iter().position(|l| l.q_net == iob.from_net) {
             return placed
@@ -687,7 +720,7 @@ mod tests {
         assert!(
             d.cells
                 .iter()
-                .any(|c| matches!(&c.kind, CellKind::Ila { net } if net == "q3"))
+                .any(|c| matches!(&c.kind, CellKind::Ila { net } if *net == intern("q3")))
         );
         let cap = insert_arm_capture(&dev, &d, "q3", 16)
             .expect("mark_debug → arm must capture; must not Err(bitstream unchanged)");
@@ -706,13 +739,13 @@ mod tests {
     fn strip_ila_removes_probe_cells() {
         let mut d = Design::structural_blinky();
         insert_ila(&mut d, "q").unwrap();
-        assert!(d.cells.iter().any(|c| c.name.starts_with("ila_q")));
+        assert!(d.cells.iter().any(|c| resolve(c.name).starts_with("ila_q")));
         strip_ila(&mut d, "q");
-        assert!(!d.cells.iter().any(|c| c.name.starts_with("ila_q")));
-        assert!(!d.nets.iter().any(|n| n.name.starts_with("ila_q")));
+        assert!(!d.cells.iter().any(|c| resolve(c.name).starts_with("ila_q")));
+        assert!(!d.nets.iter().any(|n| resolve(n.name).starts_with("ila_q")));
         // Marked net keeps user endpoints (FF Q), not ILA sink.
         let q = d.net("q").unwrap();
-        assert!(!q.endpoints.iter().any(|e| e.cell.starts_with("ila_")));
+        assert!(!q.endpoints.iter().any(|e| resolve(e.cell).starts_with("ila_")));
     }
 
     #[test]
@@ -846,24 +879,397 @@ mod tests {
     fn match_unit_insert_packs_lut_and_fsm_marker() {
         let mut d = Design::structural_counter();
         insert_match_unit(&mut d, "q3", IlaTriggerKind::Rising).unwrap();
-        assert!(d.cells.iter().any(|c| c.name == "ila_match_lut"));
+        assert!(d.cells.iter().any(|c| c.name == intern("ila_match_lut")));
         assert!(d.cells.iter().any(|c| {
-            matches!(&c.kind, CellKind::BlackBox { module } if module == "h_ila_trig")
+            matches!(&c.kind, CellKind::BlackBox { module } if *module == intern("h_ila_trig"))
         }));
         assert_eq!(
             match_unit_init(IlaTriggerKind::Rising),
             0x2222_2222_2222_2222
         );
         strip_match_unit(&mut d);
-        assert!(!d.cells.iter().any(|c| c.name == "ila_match_lut"));
+        assert!(!d.cells.iter().any(|c| c.name == intern("ila_match_lut")));
     }
 
     #[test]
     fn deep_capture_bram_strip_roundtrip() {
         let mut d = Design::structural_counter();
         insert_capture_bram(&mut d, 16).unwrap();
-        assert!(d.cells.iter().any(|c| c.name == "ila_capture_ram"));
+        assert!(d.cells.iter().any(|c| c.name == intern("ila_capture_ram")));
         strip_capture_bram(&mut d);
-        assert!(!d.cells.iter().any(|c| c.name == "ila_capture_ram"));
+        assert!(!d.cells.iter().any(|c| c.name == intern("ila_capture_ram")));
+    }
+
+    #[test]
+    fn insert_debug_cores_stiches_ila_bscan_and_compiles_bitstream() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_counter();
+        let (_, baseline_bits) = compile(&dev, &d).unwrap();
+
+        d.mark_debug("q0").unwrap();
+        d.mark_debug("q3").unwrap();
+
+        let mut cfg = DebugInsertConfig::default();
+        cfg.sample_depth = 32;
+        cfg.trigger_stages = 4;
+        cfg.vio_probes_in = vec!["q1".into()];
+        cfg.vio_probes_out = vec!["q2".into()];
+        cfg.insert_jtag_axi = true;
+
+        let rep = insert_debug_cores(&mut d, &cfg).unwrap();
+        assert_eq!(rep.probed_nets, vec!["q0".to_string(), "q3".to_string()]);
+        assert_eq!(rep.probe_channels.len(), 2);
+        assert_eq!(rep.hub.slots.len(), 3, "ILA + VIO + JTAG-AXI on BSCAN hub");
+        assert!(d.cell("bscan_usr1").is_some());
+        assert!(d.cell("u_dbg_hub").is_some());
+        assert!(d.cell("ila_trig_cmp_lut").is_some());
+        assert!(d.cell("ila_capture_ram").is_some());
+        assert!(d.cell("u_vio_0").is_some());
+        assert!(d.cell("u_jtag_axi_0").is_some());
+
+        // Netlist with inserted debug cores must pack, place, route, and bitgen cleanly.
+        let (routed, debug_bits) = compile(&dev, &d).unwrap();
+        assert_ne!(baseline_bits.frames, debug_bits.frames);
+        assert!(!routed.placed.packed.brams.is_empty());
+
+        // HNF round-trip preserves inserted debug cores.
+        let hnf = d.to_hnf();
+        let d_rt = Design::from_hnf(&hnf).unwrap();
+        assert!(d_rt.cell("u_dbg_hub").is_some());
+
+        // Strip removes all debug cores cleanly.
+        strip_debug_cores(&mut d);
+        assert!(d.cell("u_dbg_hub").is_none());
+        assert!(d.cell("bscan_usr1").is_none());
+        assert!(d.cell("ila_capture_ram").is_none());
+    }
+
+    #[test]
+    fn ltx_probe_file_bus_grouping_and_disk_roundtrip() {
+        let mut d = Design::structural_counter();
+        // Add bus nets cnt[0]..cnt[3] marked for debug alongside scalar q3.
+        for bit in 0..4 {
+            let bus_net = format!("cnt[{bit}]");
+            d.connect(&bus_net, &format!("u_ff{bit}"), "Q");
+            d.mark_debug(&bus_net).unwrap();
+        }
+        d.mark_debug("q3").unwrap();
+
+        let rep = insert_debug_cores(&mut d, &DebugInsertConfig::default()).unwrap();
+        assert_eq!(rep.probe_channels.len(), 2, "cnt[3:0] coalesced + scalar q3");
+
+        let (_, q3_ch) = rep.ltx.find_probe("q3").unwrap();
+        assert_eq!(q3_ch.port_id, "PROBE0");
+        assert_eq!(q3_ch.width, 1);
+
+        let (_, cnt_ch) = rep.ltx.find_probe("cnt").unwrap();
+        assert_eq!(cnt_ch.port_id, "PROBE1");
+        assert_eq!(cnt_ch.width, 4);
+        assert_eq!(cnt_ch.msb, 3);
+        assert_eq!(cnt_ch.lsb, 0);
+        assert_eq!(cnt_ch.display_signal(), "cnt[3:0]");
+        assert_eq!(
+            cnt_ch.nets,
+            vec!["cnt[0]", "cnt[1]", "cnt[2]", "cnt[3]"]
+        );
+
+        // String + disk file round-trip.
+        let tmp_dir = std::env::temp_dir().join("helion-debug-ltx-test");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let ltx_path = tmp_dir.join("debug_probes.ltx");
+        rep.ltx.write_ltx(&ltx_path).unwrap();
+        let parsed = DebugProbesLtx::read_ltx(&ltx_path).unwrap();
+        assert_eq!(parsed, rep.ltx);
+    }
+
+    #[test]
+    fn bscan_hub_multiplexes_slots_and_tap_frames() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut tap = Tap::new(&dev);
+        let mut hub = BscanDebugHub::new("u_dbg_hub", BscanUserChain::User1);
+        let s_ila = hub.register_core("u_ila_0", DebugCoreKind::Ila, 4).unwrap();
+        let s_vio = hub.register_core("u_vio_0", DebugCoreKind::Vio, 2).unwrap();
+        let s_axi = hub
+            .register_core("u_jtag_axi_0", DebugCoreKind::JtagAxi, 1)
+            .unwrap();
+        assert_eq!((s_ila, s_vio, s_axi), (0, 1, 2));
+
+        let f_sel = hub.select_slot(s_vio).unwrap();
+        assert_eq!(f_sel.slot_id, s_vio);
+        assert_eq!(hub.active_slot, Some(s_vio));
+
+        let encoded = f_sel.encode();
+        let decoded = BscanFrame::decode(encoded).unwrap();
+        assert_eq!(decoded, f_sel);
+
+        let f_tap = hub
+            .transact_via_tap(&mut tap, s_axi, hub_opcode::WRITE_CTRL, 0x1234_5678)
+            .unwrap();
+        assert_eq!(f_tap.payload, 0x1234_5678);
+        assert_eq!(hub.discover_cores().len(), 3);
+    }
+
+    #[test]
+    fn multi_stage_trigger_sequencer_boolean_edges_ranges_and_counters() {
+        // 4-bit counter stream: 0..16 repeated 3 times (48 cycles).
+        let mut stream = Vec::new();
+        for cycle in 0..48u64 {
+            let v = cycle % 16;
+            stream.push(vec![
+                (v & 1) != 0,
+                (v & 2) != 0,
+                (v & 4) != 0,
+                (v & 8) != 0,
+            ]);
+        }
+        // State 0: wait for rising edge on bit 3 (value transitions 7 -> 8) AND bus in range 8..=12.
+        let s0 = TriggerStateSpec::new(
+            0,
+            "wait_msb_rise",
+            TriggerCondition::and(vec![
+                ProbeComparator::bit(3, ComparatorOp::parse("R").unwrap()),
+                ProbeComparator::bus(vec![0, 1, 2, 3], ComparatorOp::parse("8..=12").unwrap()),
+            ]),
+            1,
+            StateTransition::Goto(1),
+        );
+        // State 1: count 3 toggles ('B' both edges) on bit 0 while bus >= 9, then goto State 2.
+        let s1 = TriggerStateSpec::new(
+            1,
+            "count_lsb_toggles",
+            TriggerCondition::and(vec![
+                ProbeComparator::bit(0, ComparatorOp::parse("B").unwrap()),
+                ProbeComparator::bus(vec![0, 1, 2, 3], ComparatorOp::parse(">=9").unwrap()),
+            ]),
+            3,
+            StateTransition::Goto(2),
+        );
+        // State 2: wait for falling edge ('F') on bit 3 (15 -> 0 wrap) OR bus <= 2, then Trigger.
+        let s2 = TriggerStateSpec::new(
+            2,
+            "wait_wrap_fall",
+            TriggerCondition::or(vec![
+                ProbeComparator::bit(3, ComparatorOp::parse("F").unwrap()),
+                ProbeComparator::bus(vec![0, 1, 2, 3], ComparatorOp::parse("<=0").unwrap()),
+            ]),
+            1,
+            StateTransition::Trigger,
+        );
+
+        let cfg = IlaSequencerConfig {
+            states: vec![s0, s1, s2],
+            window_position: TriggerWindowPosition::CenterTrigger,
+            segment_depth: 8,
+            num_segments: 2,
+            capture_qualifier: None,
+        };
+        let mut seq = IlaTriggerSequencer::new(cfg).unwrap();
+        let res = seq
+            .run_stream(
+                vec!["q0".into(), "q1".into(), "q2".into(), "q3".into()],
+                &stream,
+            )
+            .unwrap();
+        assert_eq!(res.segments.len(), 2, "must capture both segments");
+        for seg in &res.segments {
+            assert_eq!(seg.samples.len(), 8);
+            assert_eq!(seg.trigger_offset, 4, "CenterTrigger at depth/2 = 4");
+            // At trigger_offset, counter wrapped from 15 to 0.
+            assert_eq!(seg.words[seg.trigger_offset], 0);
+            assert!(seg.state_trace.len() >= 5, "1 + 3 + 1 state matches");
+        }
+    }
+
+    #[test]
+    fn trigger_sequencer_supports_16_states_and_capture_qualification() {
+        // Build a full 16-state cascade (states 0..15) where each state matches bus == state_id.
+        let mut states = Vec::new();
+        for s in 0..16u8 {
+            let next = if s < 15 {
+                StateTransition::Goto(s + 1)
+            } else {
+                StateTransition::Trigger
+            };
+            states.push(TriggerStateSpec::new(
+                s,
+                format!("st_{s}"),
+                TriggerCondition::single(ProbeComparator::bus(
+                    vec![0, 1, 2, 3],
+                    ComparatorOp::Equal(u64::from(s)),
+                )),
+                1,
+                next,
+            ));
+        }
+        // Capture qualifier: only record even values (bit 0 == 0) except allow all in this 16-step test
+        // or test qualification on a 32-cycle stream where qualifier selects bit 0 == 1.
+        let cfg = IlaSequencerConfig {
+            states,
+            window_position: TriggerWindowPosition::PreTrigger,
+            segment_depth: 8,
+            num_segments: 1,
+            capture_qualifier: None,
+        };
+        let mut stream = Vec::new();
+        for v in 0..20u64 {
+            let c = v % 16;
+            stream.push(vec![
+                (c & 1) != 0,
+                (c & 2) != 0,
+                (c & 4) != 0,
+                (c & 8) != 0,
+            ]);
+        }
+        let mut seq = IlaTriggerSequencer::new(cfg).unwrap();
+        let res = seq
+            .run_stream(
+                vec!["b0".into(), "b1".into(), "b2".into(), "b3".into()],
+                &stream,
+            )
+            .unwrap();
+        assert_eq!(res.segments.len(), 1);
+        assert_eq!(res.segments[0].trigger_offset, 7, "PreTrigger at end of 8-sample window");
+        assert_eq!(res.segments[0].words, vec![8, 9, 10, 11, 12, 13, 14, 15]);
+    }
+
+    #[test]
+    fn fabric_segmented_sequencer_capture_with_qualification() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let d = Design::structural_counter();
+        let probes = vec!["q0".into(), "q1".into(), "q2".into(), "q3".into()];
+
+        // Capture qualifier: only sample cycles where q0 == 1 (odd counter values: 1, 3, 5, 7, 9, 11, 13, 15).
+        // Trigger when bus >= 7 (after 2 qualified matches: 7 and 9).
+        let seq_cfg = IlaSequencerConfig {
+            states: vec![TriggerStateSpec::new(
+                0,
+                "odd_ge_7",
+                TriggerCondition::single(ProbeComparator::bus(
+                    vec![0, 1, 2, 3],
+                    ComparatorOp::GreaterOrEqual(7),
+                )),
+                2,
+                StateTransition::Trigger,
+            )],
+            window_position: TriggerWindowPosition::PostTrigger,
+            segment_depth: 4,
+            num_segments: 2,
+            capture_qualifier: Some(TriggerCondition::single(ProbeComparator::bit(
+                0,
+                ComparatorOp::Equal(1),
+            ))),
+        };
+        let res = run_sequencer_capture(&dev, &d, &probes, seq_cfg, 128).unwrap();
+        assert_eq!(res.segments.len(), 2);
+        assert!(res.qualified_cycles < res.total_cycles, "qualifier filtered even cycles");
+        // Every captured word must have bit 0 == 1 (odd counter value).
+        for seg in &res.segments {
+            assert_eq!(seg.words.len(), 4);
+            for &w in &seg.words {
+                assert_eq!(w & 1, 1, "qualified sample must be odd, got {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn vio_stimulus_injection_and_activity_detectors_on_fabric() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let d = Design::structural_counter();
+        let (routed, bits) = compile(&dev, &d).unwrap();
+        let mut fab = Fabric::new(&dev);
+        fab.program(&bits).unwrap();
+        fab.finish_startup();
+
+        let mut hub = BscanDebugHub::new("u_dbg_hub", BscanUserChain::User1);
+        let slot = hub.register_core("u_vio_0", DebugCoreKind::Vio, 2).unwrap();
+        let mut vio = VioCore::new("u_vio_0", slot);
+        vio.add_probe_in("cnt_in", vec!["q0".into(), "q1".into(), "q2".into(), "q3".into()]);
+        vio.add_probe_out("cnt_force", vec!["q0".into(), "q1".into(), "q2".into(), "q3".into()], 0);
+
+        // Inject virtual stimulus 0b1010 (10) onto counter FFs and verify probe_in reads it back.
+        vio.set_probe_out("cnt_force", 0b1010).unwrap();
+        assert_eq!(vio.commit_outputs(&mut hub).unwrap(), 1);
+        assert_eq!(
+            vio.apply_stimulus_to_fabric(&routed.placed, &d, &mut fab)
+                .unwrap(),
+            4
+        );
+        vio.sample_from_fabric(&routed.placed, &d, &fab, &mut hub)
+            .unwrap();
+        assert_eq!(vio.probe_in("cnt_in").unwrap().value, 0b1010);
+
+        // Toggle stimulus to 0b0101 (5): both rising and falling edges must be detected.
+        let toggled = vio.toggle_probe_out("cnt_force").unwrap();
+        assert_eq!(toggled, 0b0101);
+        vio.commit_outputs(&mut hub).unwrap();
+        vio.apply_stimulus_to_fabric(&routed.placed, &d, &mut fab)
+            .unwrap();
+        vio.sample_from_fabric(&routed.placed, &d, &fab, &mut hub)
+            .unwrap();
+
+        let pin = vio.probe_in("cnt_in").unwrap();
+        assert_eq!(pin.value, 0b0101);
+        assert_eq!(pin.activity(), VioActivityKind::BothEdges);
+        assert_eq!(pin.rising_mask, 0b0101);
+        assert_eq!(pin.falling_mask, 0b1010);
+        assert_eq!(pin.transition_count, 1);
+        assert_eq!(pin.min_value, Some(0b0101));
+        assert_eq!(pin.max_value, Some(0b1010));
+
+        vio.clear_all_activity();
+        assert_eq!(vio.probe_in("cnt_in").unwrap().activity(), VioActivityKind::None);
+    }
+
+    #[test]
+    fn jtag_to_axi_master_transactions_and_error_responses() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut tap = Tap::new(&dev);
+        let mut hub = BscanDebugHub::new("u_dbg_hub", BscanUserChain::User1);
+        let slot = hub
+            .register_core("u_jtag_axi_0", DebugCoreKind::JtagAxi, 1)
+            .unwrap();
+        let mut axi = JtagAxiMaster::new("u_jtag_axi_0", slot);
+
+        // Unaligned address must be rejected by create_hw_axi_txn.
+        assert!(create_hw_axi_txn("bad_align", 0x4000_0002, AxiTxnKind::Read, 1, vec![]).is_err());
+
+        // 4-beat burst write + readback to AXI BRAM aperture (0xC000_0000), backed by Tap BRAM 0.
+        let payload = vec![0xCAFE_BABE, 0x1234_5678, 0x0BAD_F00D, 0xFEED_FACE];
+        let mut wr_txn =
+            create_hw_axi_txn("wr_bram", 0xC000_0000, AxiTxnKind::Write, 4, payload.clone())
+                .unwrap();
+        let resp = axi.run_hw_axi_on_tap(&mut wr_txn, &mut hub, &mut tap).unwrap();
+        assert_eq!(resp, AxiResp::Okay);
+        assert!(wr_txn.completed);
+        assert_eq!(wr_txn.dr_scans, 8);
+        assert_eq!(tap.fabric().bram_read_word(0, 0) as u32, 0xCAFE_BABE);
+        assert_eq!(tap.fabric().bram_read_word(0, 3) as u32, 0xFEED_FACE);
+
+        let mut rd_txn =
+            create_hw_axi_txn("rd_bram", 0xC000_0000, AxiTxnKind::Read, 4, vec![]).unwrap();
+        let resp_rd = axi.run_hw_axi_on_tap(&mut rd_txn, &mut hub, &mut tap).unwrap();
+        assert_eq!(resp_rd, AxiResp::Okay);
+        assert_eq!(rd_txn.read_data, payload);
+
+        // Read from Read-Only ROM ID aperture succeeds; write returns SLVERR.
+        let mut rom_rd =
+            create_hw_axi_txn("rom_rd", 0x8000_0000, AxiTxnKind::Read, 1, vec![]).unwrap();
+        assert_eq!(axi.run_hw_axi(&mut rom_rd, &mut hub).unwrap(), AxiResp::Okay);
+        assert_eq!(rom_rd.read_data, vec![0x4845_4C31]);
+
+        let mut rom_wr =
+            create_hw_axi_txn("rom_wr", 0x8000_0000, AxiTxnKind::Write, 1, vec![0]).unwrap();
+        assert_eq!(
+            axi.run_hw_axi(&mut rom_wr, &mut hub).unwrap(),
+            AxiResp::SlvErr
+        );
+
+        // Access to unmapped address returns DECERR.
+        let mut dec_rd =
+            create_hw_axi_txn("unmapped", 0xDEAD_0000, AxiTxnKind::Read, 1, vec![]).unwrap();
+        assert_eq!(
+            axi.run_hw_axi(&mut dec_rd, &mut hub).unwrap(),
+            AxiResp::DecErr
+        );
     }
 }

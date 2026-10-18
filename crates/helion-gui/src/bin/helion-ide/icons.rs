@@ -1,6 +1,6 @@
 //! Vector activity-rail icons (P0-1).
 //!
-//! Drawn with the egui painter — no emoji, no letter glyphs, no icon font
+//! Drawn with the egui painter - no emoji, no letter glyphs, no icon font
 //! dependency. Each icon fits a 24×24 box centered in the given rect and
 //! uses a single `color` so active/inactive states stay token-driven.
 
@@ -192,7 +192,7 @@ pub fn paint_stage(painter: &egui::Painter, rect: Rect, stage: FlowStep, color: 
     let sw = 1.6;
     let stroke = Stroke::new(sw, color);
     match stage {
-        // Synthesis: gear-ish — hexagon with inner dot.
+        // Synthesis: gear-ish - hexagon with inner dot.
         FlowStep::Synthesis => {
             let r = 7.0;
             let pts: Vec<Pos2> = (0..6)
@@ -204,7 +204,7 @@ pub fn paint_stage(painter: &egui::Painter, rect: Rect, stage: FlowStep, color: 
             painter.add(egui::Shape::closed_line(pts, stroke));
             painter.circle_filled(c, 2.0, color);
         }
-        // Opt: magic-wand spark — diagonal line with sparkles.
+        // Opt: magic-wand spark - diagonal line with sparkles.
         FlowStep::Opt => {
             painter.line_segment(
                 [

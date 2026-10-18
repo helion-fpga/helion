@@ -1,10 +1,14 @@
 //! Hierarchy tree view: Vivado Netlist-tree pattern.
 //!
-//! Replaces the treemap (unreadable noise past a few hundred blocks) with a
-//! real expandable tree: chevron rows, indent guides, per-node cell counts,
-//! 28px rows, full-width selection highlight, and a filter field. Virtualized
-//! via `ScrollArea::show_rows` so 15k-block designs stay interactive - rows
-//! are only materialized for expanded paths, never all at once.
+//! Z3 sidebar section (grammar R15), not a central pane: an expandable tree
+//! with chevron rows, indent guides, per-node cell counts, 28px rows,
+//! full-width selection highlight, and a filter field. Virtualized via
+//! `ScrollArea::show_rows` so 15k-block designs stay interactive - rows are
+//! only materialized for expanded paths, never all at once.
+//!
+//! Selection cross-probes through the shared `model.selected` identity:
+//! single-click selects (sidebar highlight, Z4 inspector, Device canvas),
+//! double-click opens the hierarchy sheet in Schematic.
 
 use std::collections::{HashMap, HashSet};
 
@@ -39,6 +43,10 @@ struct TreeState {
     parent: Vec<Option<usize>>,
     expanded: HashSet<String>,
     filter: String,
+    /// Selection the tree has already revealed. When the model selection
+    /// changes, ancestors expand so the node lands on a visible row; the
+    /// user's own expand/collapse choices are never fought on other frames.
+    revealed: Option<String>,
 }
 
 impl TreeState {
@@ -230,29 +238,36 @@ fn paint_chevron(p: &egui::Painter, center: egui::Pos2, expanded: bool, color: e
     p.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
 }
 
-/// Vivado Netlist-tree hierarchy pane. `model.selected` is the cross-view
-/// selection identity shared with Schematic/Device/Properties.
+/// Vivado Netlist-tree hierarchy section (Z3 sidebar). `model.selected` is the
+/// cross-view selection identity shared with Schematic/Device/Properties.
 pub fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
-    ui.horizontal(|ui| {
-        ui.heading("Hierarchy");
-        ui.add_space(12.0);
-        if ui.button("Show in Schematic").clicked() {
-            let _ = model.exec("open_hierarchy_sheet");
-        }
-    });
+    let hw = ui.available_width().max(120.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(hw, 24.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.label(egui::RichText::new("Hierarchy").strong().size(13.0));
+            let rem = (ui.available_width() - 88.0).max(4.0);
+            ui.add_space(rem);
+            if ui
+                .small_button("Schematic ↗")
+                .on_hover_text("Open hierarchy in schematic viewer")
+                .clicked()
+            {
+                let _ = model.exec("open_hierarchy_sheet");
+            }
+        },
+    );
 
     let top = model.hierarchy.top.clone();
     let Some(top_name) = top.clone() else {
-        ui.add_space(12.0);
-        ui.vertical_centered(|ui| {
-            ui.add_space(40.0);
-            ui.label(egui::RichText::new("No hierarchy yet.").color(theme.dim));
-            ui.label(
-                egui::RichText::new("Run Synthesis to build the design tree.")
-                    .small()
-                    .color(theme.faint),
-            );
-        });
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("No hierarchy yet.").small().color(theme.dim));
+        ui.label(
+            egui::RichText::new("Run Synthesis to build the design tree.")
+                .small()
+                .color(theme.faint),
+        );
         return;
     };
 
@@ -272,7 +287,25 @@ pub fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::T
             parent,
             expanded: HashSet::from([root_name]),
             filter: String::new(),
+            revealed: None,
         };
+    }
+
+    // Reveal a cross-probed selection ("Show in Hierarchy", message links,
+    // utilization rows): on selection change, expand the node's ancestors so
+    // it lands on a visible row instead of hiding inside a collapsed subtree.
+    if state.revealed.as_deref() != model.selected.as_deref() {
+        state.revealed = model.selected.clone();
+        if let Some(mut i) = state
+            .nodes
+            .iter()
+            .position(|n| Some(n.name.as_str()) == model.selected.as_deref())
+        {
+            while let Some(p) = state.parent[i] {
+                state.expanded.insert(state.nodes[p].name.clone());
+                i = p;
+            }
+        }
     }
 
     let n_instances = state
@@ -296,7 +329,7 @@ pub fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::T
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Filter").small().color(theme.dim));
         ui.text_edit_singleline(&mut state.filter);
-        if !state.filter.is_empty() && ui.small_button("✕").clicked() {
+        if !state.filter.is_empty() && ui.small_button("×").clicked() {
             state.filter.clear();
         }
     });
@@ -401,25 +434,37 @@ pub fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::T
                 }
                 let label_x = rect.min.x + 8.0 + n.depth as f32 * INDENT + 18.0;
                 let is_internal = TreeState::is_instance_kind(&n.kind);
-                painter.text(
-                    egui::pos2(label_x, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    &n.short,
-                    egui::FontId::proportional(13.0),
-                    if is_internal { theme.text } else { theme.dim },
-                );
-                // Right-aligned count (instances) or kind (leaves).
+                // Right-aligned count (instances) or kind (leaves) measured first so label never collides.
                 let right = if is_internal {
                     format!("({})", n.leaf_count)
                 } else {
                     n.kind.clone()
                 };
-                painter.text(
-                    egui::pos2(rect.max.x - 10.0, rect.center().y),
-                    egui::Align2::RIGHT_CENTER,
+                let rgalley = painter.layout_no_wrap(
                     right,
                     egui::FontId::proportional(11.0),
                     theme.faint,
+                );
+                let rw = rgalley.size().x;
+                let rx = (rect.max.x - 10.0 - rw).max(label_x + 36.0);
+                painter.galley(
+                    egui::pos2(rx, rect.center().y - rgalley.size().y * 0.5),
+                    rgalley,
+                    theme.faint,
+                );
+                let label_clip = egui::Rect::from_min_max(
+                    egui::pos2(label_x, rect.min.y),
+                    egui::pos2((rx - 6.0).max(label_x + 24.0), rect.max.y),
+                );
+                let lgalley = painter.layout_no_wrap(
+                    n.short.clone(),
+                    egui::FontId::proportional(13.0),
+                    if is_internal { theme.text } else { theme.dim },
+                );
+                painter.with_clip_rect(label_clip).galley(
+                    egui::pos2(label_x, rect.center().y - lgalley.size().y * 0.5),
+                    lgalley,
+                    if is_internal { theme.text } else { theme.dim },
                 );
                 // 1px divider.
                 painter.line_segment(

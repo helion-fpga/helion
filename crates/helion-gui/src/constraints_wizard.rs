@@ -9,7 +9,7 @@
 //! (`bin/helion-ide/constraints_wizard.rs`); this module is what the golden
 //! tests exercise.
 
-use helion_ir::{Design, PortDir};
+use helion_ir::{intern, resolve, Design, PortDir};
 
 /// Wizard pages, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,7 +159,7 @@ impl WizardError {
 }
 
 fn port_named<'d>(design: &'d Design, name: &str) -> Option<&'d helion_ir::Port> {
-    design.ports.iter().find(|p| p.name == name)
+    design.ports.iter().find(|p| p.name == intern(name))
 }
 
 /// Validate the whole input against the loaded design and the clocks the
@@ -193,7 +193,7 @@ pub fn validate(
         if !c.generated && port_named(design, &c.port).is_none() {
             errs.push(WizardError::at(
                 WizardStep::Clocks,
-                format!("{tag}port '{}' is not a top-level port of {}", c.port, design.name),
+                format!("{tag}port '{}' is not a top-level port of {}", c.port, resolve(design.name)),
             ));
         }
         if !(c.period_ns > 0.0) || !c.period_ns.is_finite() {
@@ -239,7 +239,7 @@ pub fn validate(
             match port_named(design, &d.port) {
                 None => errs.push(WizardError::at(
                     step,
-                    format!("{tag}port '{}' is not a top-level port of {}", d.port, design.name),
+                    format!("{tag}port '{}' is not a top-level port of {}", d.port, resolve(design.name)),
                 )),
                 Some(p) => {
                     let ok = match (want_input, p.dir) {
@@ -365,7 +365,7 @@ fn get_obj(name: &str, is_clock: bool) -> String {
 /// `helion_sta::load_xdc`) before it is ever written to disk.
 pub fn generate_sdc(input: &WizardInput, design_name: &str) -> String {
     let mut out = String::new();
-    out.push_str("# Helion Constraints Wizard — generated SDC\n");
+    out.push_str("# Helion Constraints Wizard - generated SDC\n");
     out.push_str(&format!("# Design: {design_name}\n"));
     out.push_str("# Edit freely; the Constraints tab re-parses this file on save.\n");
 
@@ -480,7 +480,7 @@ mod tests {
             ("led", PortDir::Out),
         ] {
             d.ports.push(helion_ir::Port {
-                name: name.into(),
+                name: intern(name),
                 dir,
                 attrs: Default::default(),
             });
@@ -523,7 +523,7 @@ mod tests {
     #[test]
     fn golden_sdc_generation() {
         let text = generate_sdc(&sample_input(), "sample");
-        let expected = "# Helion Constraints Wizard — generated SDC\n\
+        let expected = "# Helion Constraints Wizard - generated SDC\n\
 # Design: sample\n\
 # Edit freely; the Constraints tab re-parses this file on save.\n\
 \n\

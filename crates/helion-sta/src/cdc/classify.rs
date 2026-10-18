@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use helion_ir::{CellKind, Design};
+use helion_ir::{resolve, CellKind, Design, Spur};
 
 use super::crossings::{bus_stem, driver_infos, CdcClass, CdcCrossing, CrossingSource, RawCrossing};
 use super::domains::{DomainKind, DomainMap};
@@ -413,15 +413,15 @@ pub fn classify_crossings(
     // their domains. Bram18/Mac27/BlackBox expose no clock pins, so Helion
     // cannot classify crossings into them: visible but unclassifiable, an
     // honest limitation. Aggregated per cell to avoid one record per bus bit.
-    let mut bb_feeds: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
+    let mut bb_feeds: HashMap<Spur, (Vec<Spur>, Vec<String>)> = HashMap::new();
     for net in &design.nets {
-        let mut bb_cells: Vec<String> = Vec::new();
+        let mut bb_cells: Vec<Spur> = Vec::new();
         for e in &net.endpoints {
-            if let Some(c) = design.cell(&e.cell) {
+            if let Some(c) = design.cell(resolve(e.cell)) {
                 match &c.kind {
                     CellKind::Bram18 | CellKind::Mac27 | CellKind::BlackBox { .. } => {
                         if !bb_cells.contains(&e.cell) {
-                            bb_cells.push(e.cell.clone());
+                            bb_cells.push(e.cell);
                         }
                     }
                     _ => {}
@@ -432,7 +432,7 @@ pub fn classify_crossings(
             continue;
         }
         let mut from_names: Vec<String> = Vec::new();
-        for di in driver_infos(design, domains, &net.name) {
+        for di in driver_infos(design, domains, resolve(net.name)) {
             if let CrossingSource::Domain(d) = di.source {
                 if domains.domains[d].kind != DomainKind::Unknown {
                     from_names.push(domain_name(domains, d).to_string());
@@ -445,12 +445,12 @@ pub fn classify_crossings(
             continue;
         }
         for bb in &bb_cells {
-            let entry = bb_feeds.entry(bb.clone()).or_default();
-            entry.0.push(net.name.clone());
+            let entry = bb_feeds.entry(*bb).or_default();
+            entry.0.push(net.name);
             entry.1.extend(from_names.clone());
         }
     }
-    let mut bb_cells: Vec<String> = bb_feeds.keys().cloned().collect();
+    let mut bb_cells: Vec<Spur> = bb_feeds.keys().cloned().collect();
     bb_cells.sort();
     for bb in &bb_cells {
         let (mut nets, mut doms) = bb_feeds.remove(bb).unwrap_or_default();
@@ -458,19 +458,20 @@ pub fn classify_crossings(
         nets.dedup();
         doms.sort();
         doms.dedup();
+        let nets_s: Vec<&str> = nets.iter().map(|n| resolve(*n)).collect();
         out.push(mk(
-            bb,
+            resolve(*bb),
             None,
             &doms.join(","),
-            bb,
+            resolve(*bb),
             CdcClass::BlackBoxBoundary,
             Vec::new(),
-            vec![bb.clone()],
+            vec![resolve(*bb).to_string()],
             0,
             &format!(
                 "{} exposes no clock pins; nets {} driven from {} cannot be timing-classified",
-                bb,
-                nets.join(","),
+                resolve(*bb),
+                nets_s.join(","),
                 doms.join(",")
             ),
         ));
@@ -491,9 +492,8 @@ pub fn classify_crossings(
 #[cfg(test)]
 mod tests {
     use super::super::crossings::CdcClass;
-    use super::classify_crossings;
     use crate::{create_clock, report_cdc, CdcSeverity, Constraints};
-    use helion_ir::{CellKind, Design, PortDir};
+    use helion_ir::{intern, CellKind, Design, PortDir};
 
     /// `out = I0` buffer LUT (passthrough).
     const BUF_INIT: u64 = 0xAAAAAAAAAAAAAAAA;
@@ -636,7 +636,11 @@ mod tests {
         let mut d = Design::new("t");
         d.add_port("clk_a", PortDir::In);
         ff(&mut d, "src", "clk_a", "src_d");
-        d.add_cell("u_bb", CellKind::BlackBox { module: "ip".into() });
+        d.add_cell("u_bb", CellKind::BlackBox { module: intern("ip") });
+        d.add_cell("u_bb", CellKind::BlackBox { module: helion_ir::intern("ip") });
+        d.add_cell("u_bb", CellKind::BlackBox { module: helion_ir::intern("ip") });
+        d.add_cell("u_bb", CellKind::BlackBox { module: helion_ir::intern("ip") });
+        d.add_cell("u_bb", CellKind::BlackBox { module: helion_ir::intern("ip") });
         d.connect("sig", "src", "Q");
         d.connect("sig", "u_bb", "INP");
         let clks = two_clocks();

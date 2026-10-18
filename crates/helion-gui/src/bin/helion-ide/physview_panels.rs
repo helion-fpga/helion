@@ -8,6 +8,7 @@
 use eframe::egui::{self, Color32, RichText, Stroke};
 
 use super::theme;
+use helion_gui::chrome;
 use super::IdeModel;
 use super::WorkspaceTab;
 use helion_gui::physview::{
@@ -93,7 +94,7 @@ pub fn paint_display_control(ui: &mut egui::Ui, pv: &mut PhysViewState, model: &
         let solo = pv.layers.solo() == Some(layer);
         ui.horizontal(|ui| {
             // Color swatch.
-            let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+            let (r, _) = ui.allocate_exact_size(egui::vec2(chrome::STATUS_DOT_SIZE, chrome::STATUS_DOT_SIZE), egui::Sense::hover());
             ui.painter().rect_filled(r, 2.0, swatch);
             if ui.checkbox(&mut on, layer.label()).changed() {
                 pv.layers.set_visible(layer, on);
@@ -139,12 +140,13 @@ pub fn paint_display_control(ui: &mut egui::Ui, pv: &mut PhysViewState, model: &
         }
     });
     // Heat-map legend strip.
-    match pv.layers.heat_mode {
-        HeatMode::Congestion => {
-            let max_u = model.device.congestion.iter().copied().max().unwrap_or(0);
-            paint_ramp_legend(ui, theme, &format!("0 ... {max_u} nets/tile"));
-        }
-        HeatMode::Criticality => {
+    if pv.layers.heat_mode == HeatMode::Congestion
+        || pv.layers.is_visible(LayerId::CongestionHeat)
+    {
+        let max_u = model.device.congestion.iter().copied().max().unwrap_or(0);
+        paint_ramp_legend(ui, theme, &format!("0 … {max_u} nets/tile"));
+    } else if pv.layers.heat_mode == HeatMode::Criticality {
+        {
             ui.horizontal(|ui| {
                 for (label, rgb) in [
                     ("ok >1ns", physview::slack_color(physview::SlackBucket::Safe)),
@@ -152,7 +154,7 @@ pub fn paint_display_control(ui: &mut egui::Ui, pv: &mut PhysViewState, model: &
                     ("<0 viol", physview::slack_color(physview::SlackBucket::Violating)),
                 ] {
                     let c = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(chrome::STATUS_DOT_SIZE, chrome::STATUS_DOT_SIZE), egui::Sense::hover());
                     ui.painter().rect_filled(r, 2.0, c);
                     ui.label(RichText::new(label).small().color(theme.faint));
                 }
@@ -161,7 +163,6 @@ pub fn paint_display_control(ui: &mut egui::Ui, pv: &mut PhysViewState, model: &
                 ui.label(RichText::new("No timing data: run STA first.").small().color(theme.faint));
             }
         }
-        HeatMode::Off => {}
     }
     ui.add_space(6.0);
     ui.separator();
@@ -188,7 +189,7 @@ fn paint_ramp_legend(ui: &mut egui::Ui, theme: &theme::Theme, labels: &str) {
     ui.horizontal(|ui| {
         let steps = 24;
         let w = 120.0 / steps as f32;
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 10.0), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(chrome::DISPLAY_OCCUPANCY_BAR_W, chrome::DISPLAY_OCCUPANCY_BAR_H), egui::Sense::hover());
         for i in 0..steps {
             let t = i as f32 / (steps - 1) as f32;
             let rgb = physview::congestion_ramp(t);
@@ -271,6 +272,8 @@ pub fn paint_inspector(
         InspectorKind::Empty => String::new(),
     };
     if matches!(kind, InspectorKind::Empty) {
+        // Wrap so the hint is never truncated mid-word in a narrow dock.
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
         ui.label(RichText::new("Click a site, net, pblock, or clock region.").color(theme.faint));
         return;
     }
@@ -309,7 +312,7 @@ pub fn paint_inspector(
                     .then(|| s.occupant.clone())
                 })
                 .flatten();
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.small_button("Zoom to").clicked() {
                     if let Some((x, y)) = site_xy {
                         model.device_zoom = 2.5;
@@ -323,15 +326,18 @@ pub fn paint_inspector(
                     }
                 }
                 if ui.small_button("Show in Hierarchy").clicked() {
+                    // Grammar R15: the hierarchy tree is a Z3 sidebar section
+                    // (Device activity). Selecting reveals the node there -
+                    // the tree auto-expands to the selection - and the Z4
+                    // inspector shows its properties.
                     if let Some(cell) = occupant {
                         model.selected = Some(cell);
-                        model.workspace = WorkspaceTab::Hierarchy;
                     }
                 }
             });
         }
         InspectorKind::Net(net) => {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.small_button("Highlight net").clicked() {
                     // Solo the route: selection drives the accent highlight
                     // through the existing highlight mechanism.
@@ -385,18 +391,30 @@ pub fn paint_find_dialog(
     }
     let mut close = false;
     let mut activate: Option<FindHit> = None;
+    egui::Area::new(egui::Id::new("find_in_device_backdrop"))
+        .order(egui::Order::Foreground)
+        .fade_in(false)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            ui.painter().rect_filled(
+                ctx.screen_rect(),
+                0.0,
+                Color32::from_black_alpha(96),
+            );
+        });
     egui::Window::new("Find in Device")
+        .order(egui::Order::Foreground)
+        .fade_in(false)
         .collapsible(false)
         .resizable(false)
-        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 60.0))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 72.0))
         .show(ctx, |ui| {
-            ui.set_min_width(420.0);
+            ui.set_min_width(chrome::PROPS_GRID_MIN_W);
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut pv.find_query)
-                    .hint_text("site, cell, or net name")
-                    .desired_width(400.0),
+                    .hint_text("Search site (X2Y0), cell (u_ff0), or net (cnt_0)…")
+                    .desired_width(chrome::FIND_DIALOG_QUERY_W),
             );
-            // Focus the query box when the dialog opens.
             if pv.find_needs_focus {
                 resp.request_focus();
                 pv.find_needs_focus = false;
@@ -405,7 +423,6 @@ pub fn paint_find_dialog(
             if !hits.is_empty() {
                 pv.find_selected = pv.find_selected.min(hits.len() - 1);
             }
-            // Keyboard navigation.
             if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) && !hits.is_empty() {
                 pv.find_selected = (pv.find_selected + 1) % hits.len();
             }
@@ -421,19 +438,54 @@ pub fn paint_find_dialog(
             ui.separator();
             for (i, hit) in hits.iter().enumerate() {
                 let on = i == pv.find_selected;
-                let kind_label = match hit.kind {
-                    FindKind::Site => "site",
-                    FindKind::Cell => "cell",
-                    FindKind::Net => "net",
+                let (kind_label, kind_col) = match hit.kind {
+                    FindKind::Site => ("SITE", theme.cat_blue),
+                    FindKind::Cell => ("CELL", theme.ok),
+                    FindKind::Net => ("NET ", theme.info),
                 };
-                let row = format!("[{}] {}  {}", kind_label, hit.label, hit.detail);
-                if ui.selectable_label(on, RichText::new(row).small().monospace()).clicked() {
+                let (rrect, rresp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 24.0),
+                    egui::Sense::click(),
+                );
+                if on {
+                    ui.painter().rect_filled(rrect, 4.0, theme.sel);
+                } else if rresp.hovered() {
+                    ui.painter().rect_filled(rrect, 4.0, theme.surface_hover);
+                }
+                ui.painter().text(
+                    egui::pos2(rrect.left() + 8.0, rrect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    kind_label,
+                    theme::font_code(10.0),
+                    kind_col,
+                );
+                ui.painter().text(
+                    egui::pos2(rrect.left() + 52.0, rrect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    &hit.label,
+                    theme::font_code(12.0),
+                    theme.text,
+                );
+                ui.painter().text(
+                    egui::pos2(rrect.right() - 8.0, rrect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    &hit.detail,
+                    theme::font_code(11.0),
+                    theme.dim,
+                );
+                if rresp.clicked() {
                     activate = Some(hit.clone());
                 }
             }
             if hits.is_empty() {
-                ui.label(RichText::new("No matches.").small().color(theme.faint));
+                ui.label(RichText::new("No matches found.").small().color(theme.faint));
             }
+            ui.separator();
+            ui.label(
+                RichText::new("↑↓ navigate · Enter select & zoom · Esc close")
+                    .small()
+                    .color(theme.faint),
+            );
         });
     if let Some(hit) = activate {
         apply_find_hit(model, pv, &hit, zoom_target);

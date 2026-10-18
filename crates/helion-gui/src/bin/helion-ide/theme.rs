@@ -1,7 +1,7 @@
 //! Design tokens for `helion-ide` (P0-4).
 //!
 //! Single source of truth for color, typography, and spacing. All paint code
-//! consumes [`Theme`] fields — never hardcode `Color32::from_rgb` literals in
+//! consumes [`Theme`] fields - never hardcode `Color32::from_rgb` literals in
 //! the shell. Dark is the default; [`Theme::light`] overrides the same names.
 //!
 //! Token values follow `~/workspace/helion-research/ide-ux-plan.md` §5:
@@ -29,7 +29,7 @@ pub struct Theme {
     pub dim: Color32,
     pub faint: Color32,
     pub accent: Color32,
-    /// Accent at ~25% over surface — selection fill.
+    /// Accent at ~25% over surface - selection fill.
     pub sel: Color32,
     /// Accent dimmed for active-but-muted glyphs.
     pub accent_dim: Color32,
@@ -113,6 +113,7 @@ impl Theme {
     /// Push this theme into egui: visuals + text styles + spacing.
     /// Call once at startup and whenever the theme/density changes.
     pub fn apply(&self, ctx: &egui::Context) {
+        ensure_fonts(ctx);
         let mut visuals = if self.is_dark() {
             egui::Visuals::dark()
         } else {
@@ -121,6 +122,14 @@ impl Theme {
         visuals.override_text_color = Some(self.text);
         visuals.panel_fill = self.panel;
         visuals.window_fill = self.surface;
+        visuals.window_stroke = egui::Stroke::new(1.0, self.line);
+        visuals.popup_shadow = egui::Shadow {
+            offset: [0, 4],
+            blur: 12,
+            spread: 0,
+            color: Color32::from_black_alpha(96),
+        };
+        visuals.window_shadow = visuals.popup_shadow;
         visuals.extreme_bg_color = self.bg;
         visuals.faint_bg_color = self.surface;
         visuals.code_bg_color = self.bg;
@@ -162,6 +171,9 @@ impl Theme {
             s.spacing.button_padding = egui::vec2(pad + 4.0, pad * 0.75);
             s.spacing.item_spacing = egui::vec2(8.0, pad * 0.5);
             s.spacing.indent = 16.0;
+            // Zero fade-in lag so dialogs, command palettes, and pop-ups render
+            // at full contrast immediately on open without ghost bleed-through.
+            s.animation_time = 0.0;
         });
     }
 
@@ -235,6 +247,17 @@ pub fn install_fonts(ctx: &egui::Context) {
         vec!["jbmono-bold".into()],
     );
     ctx.set_fonts(fonts);
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("helion_fonts_installed"), true));
+}
+
+/// Ensure bundled fonts are installed on `ctx` (idempotent; fast no-op after
+/// the first call on a given [`egui::Context`], including headless unit tests).
+pub fn ensure_fonts(ctx: &egui::Context) {
+    let id = egui::Id::new("helion_fonts_installed");
+    let installed = ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    if !installed {
+        install_fonts(ctx);
+    }
 }
 
 /// UI typeface (Inter) at `size` px.
@@ -242,12 +265,12 @@ pub fn font_ui(size: f32) -> FontId {
     FontId::new(size, FontFamily::Proportional)
 }
 
-/// UI typeface, medium weight — headings, rail labels, wordmark.
+/// UI typeface, medium weight - headings, rail labels, wordmark.
 pub fn font_ui_medium(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("ui-medium".into()))
 }
 
-/// UI typeface, semibold — primary buttons, section titles.
+/// UI typeface, semibold - primary buttons, section titles.
 #[allow(dead_code)]
 pub fn font_ui_semibold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("ui-semibold".into()))

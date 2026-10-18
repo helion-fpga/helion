@@ -116,7 +116,7 @@ mod tests {
     use super::*;
     use crate::aig_opt::rewrite_aig_multi;
     use crate::{set_aig_rewrite, synth_sv, Lit as SvLit};
-    use helion_ir::{CellKind, Design, PortDir};
+    use helion_ir::{intern, CellKind, Design, PortDir};
 
     /// 16-bit enable-gated counter: real RTL, 18 PIs (clk, en + 16 FF Qs),
     /// 32 outputs (16 count bits + 16 FF D pseudo-outputs).
@@ -292,7 +292,7 @@ endmodule
         let mut rd = and2_design();
         rd.cells
             .iter_mut()
-            .find(|c| c.name == "u_lut")
+            .find(|c| c.name == intern("u_lut"))
             .expect("u_lut")
             .kind = CellKind::Lut6 { init: 0xE };
         let r = EquivModel::from_design(&rd).expect("revised");
@@ -325,8 +325,8 @@ endmodule
         for (kind, label) in [
             (CellKind::Bram18, "Bram18"),
             (CellKind::Mac27, "Mac27"),
-            (CellKind::BlackBox { module: "ip".into() }, "BlackBox"),
-            (CellKind::Ila { net: "w".into() }, "Ila"),
+            (CellKind::BlackBox { module: intern("ip") }, "BlackBox"),
+            (CellKind::Ila { net: intern("w") }, "Ila"),
         ] {
             let mut d = and2_design();
             d.add_cell("u_bb", kind);

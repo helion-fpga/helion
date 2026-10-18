@@ -11,9 +11,11 @@
 //! report catalog regroup + endpoint-slack histogram.
 
 use eframe::egui;
+use helion_gui::chrome;
 
 use super::open_more_workspace;
 use super::theme;
+use super::BottomTab;
 use super::HelionIde;
 use super::IdeModel;
 use super::WorkspaceTab;
@@ -22,14 +24,18 @@ use super::WorkspaceTab;
 /// Collapses to one column on narrow windows. Zero dead void by construction.
 pub fn paint_dashboard(ui: &mut egui::Ui, app: &mut HelionIde) {
     let theme = app.theme;
-    egui::ScrollArea::vertical()
-        .id_salt("dashboard_scroll")
-        .auto_shrink([false, false])
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
-            let avail = ui.available_width();
-            let cols = if avail >= 760.0 { 2 } else { 1 };
-            let gap = 16.0;
-            let sw = (avail - gap * (cols as f32 - 1.0)) / cols as f32;
+            egui::ScrollArea::vertical()
+                .id_salt("dashboard_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let avail = ui.available_width();
+                    let cols = if avail >= 720.0 { 2 } else { 1 };
+                    let gap = chrome::SPACE_MD;
+                    let row_spacing = ui.spacing().item_spacing.x;
+                    let sw = dashboard_column_width(avail, cols, gap, row_spacing);
             // Vertical fill: when the viewport is taller than the content,
             // distribute the slack across rows so no dead void remains.
             let viewport_h = ui.available_height();
@@ -46,19 +52,19 @@ pub fn paint_dashboard(ui: &mut egui::Ui, app: &mut HelionIde) {
             };
             // (title, view tabs, min height, section index)
             const SECTIONS: [(&str, Option<(&str, &[&str])>, f32, usize); 8] = [
-                ("Design", None, 152.0, 0),
-                ("Synthesis", None, 174.0, 1),
-                ("Implementation", None, 196.0, 2),
+                ("Design", None, 136.0, 0),
+                ("Synthesis", None, 148.0, 1),
+                ("Implementation", None, 172.0, 2),
                 (
                     "Timing",
                     Some(("dash_timing_view", &["Summary", "Paths"])),
-                    248.0,
+                    208.0,
                     3,
                 ),
-                ("Utilization", None, 232.0, 4),
-                ("DRC", None, 162.0, 5),
-                ("Power", None, 192.0, 6),
-                ("Run History", None, 232.0, 7),
+                ("Utilization", None, 212.0, 4),
+                ("DRC", None, 160.0, 5),
+                ("Power", None, 188.0, 6),
+                ("Run History", None, 196.0, 7),
             ];
             let mut go: Option<WorkspaceTab> = None;
             for (ri, chunk) in SECTIONS.chunks(cols).enumerate() {
@@ -84,7 +90,12 @@ pub fn paint_dashboard(ui: &mut egui::Ui, app: &mut HelionIde) {
             if let Some(tab) = go {
                 open_more_workspace(app, tab);
             }
+                });
         });
+}
+
+fn dashboard_column_width(avail: f32, cols: usize, gap: f32, row_spacing: f32) -> f32 {
+    (avail - (gap + row_spacing) * cols.saturating_sub(1) as f32) / cols.max(1) as f32
 }
 
 /// Section container: 12px radius, --surface fill, 1px --line border.
@@ -243,7 +254,7 @@ fn paint_section_body(
 }
 
 /// Label:value row: fixed ~190px label column (12px dim), 13px text value.
-/// Painted with `painter.text` — `add_sized`+`Label` centers text (egui
+/// Painted with `painter.text` - `add_sized`+`Label` centers text (egui
 /// uses a centered-and-justified layout there), which breaks the column.
 fn kv_row(ui: &mut egui::Ui, theme: &theme::Theme, label: &str, value: &str) {
     let w = ui.available_width();
@@ -273,8 +284,8 @@ fn status_row(ui: &mut egui::Ui, theme: &theme::Theme, label: &str, status: &str
     let (icon, color) = match status {
         "Complete" | "Clean" => ("✓", theme.ok),
         "Running" => ("▶", theme.accent),
-        "Failed" => ("✗", theme.danger),
-        "Warnings" => ("⚠", theme.warn),
+        "Failed" => ("×", theme.danger),
+        "Warnings" => ("▲", theme.warn),
         _ => ("○", theme.faint),
     };
     let w = ui.available_width();
@@ -480,14 +491,29 @@ fn paint_design_body(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Them
         ui,
         theme,
         "Top module",
-        m.tree.top.as_deref().unwrap_or("—"),
+        m.tree.top.as_deref().unwrap_or("-"),
     );
-    let src = app
-        .recent
-        .first()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "—".into());
-    kv_row(ui, theme, "Source file", &truncate_str(&src, 42));
+    let src = m
+        .selected_source
+        .as_deref()
+        .or_else(|| m.tree.sources.first().map(String::as_str))
+        .map(|s| {
+            let fname = s.rsplit('/').next().unwrap_or(s);
+            if s.len() > 38 {
+                format!("{fname}  (…{})", &s[s.len().saturating_sub(24)..])
+            } else {
+                s.to_string()
+            }
+        })
+        .or_else(|| {
+            app.recent.first().map(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.display().to_string())
+            })
+        })
+        .unwrap_or_else(|| "-".into());
+    kv_row(ui, theme, "Source file", &src);
 }
 
 /// Synthesis section: status / strategy / part / cells / runtime.
@@ -501,16 +527,16 @@ fn paint_synth_body(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
                 ui,
                 theme,
                 "Cells",
-                &run.cells.map(|c| c.to_string()).unwrap_or_else(|| "—".into()),
+                &run.cells.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
             );
             kv_row(ui, theme, "Runtime", &fmt_duration(run.runtime_ms));
         }
         None => {
             status_row(ui, theme, "Status", "Not started");
-            kv_row(ui, theme, "Strategy", "—");
+            kv_row(ui, theme, "Strategy", "-");
             kv_row(ui, theme, "Part", app.model.part());
-            kv_row(ui, theme, "Cells", "—");
-            kv_row(ui, theme, "Runtime", "—");
+            kv_row(ui, theme, "Cells", "-");
+            kv_row(ui, theme, "Runtime", "-");
         }
     }
 }
@@ -527,7 +553,7 @@ fn paint_impl_body(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme)
                 "Worst Negative Slack (WNS)",
                 &run.wns_ps
                     .map(|w| format!("{w} ps"))
-                    .unwrap_or_else(|| "—".into()),
+                    .unwrap_or_else(|| "-".into()),
             );
             kv_row(
                 ui,
@@ -536,7 +562,7 @@ fn paint_impl_body(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme)
                 &run
                     .lutff
                     .map(|c| c.to_string())
-                    .unwrap_or_else(|| "—".into()),
+                    .unwrap_or_else(|| "-".into()),
             );
             kv_row(ui, theme, "Runtime", &fmt_duration(run.runtime_ms));
             kv_row(
@@ -546,17 +572,17 @@ fn paint_impl_body(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme)
                 &run
                     .bitstream_hash
                     .map(|h| format!("{h:08x}"))
-                    .unwrap_or_else(|| "—".into()),
+                    .unwrap_or_else(|| "-".into()),
             );
         }
         None => {
             status_row(ui, theme, "Status", "Not started");
             for (l, v) in [
-                ("Strategy", "—"),
-                ("Worst Negative Slack (WNS)", "—"),
-                ("LUT+FF", "—"),
-                ("Runtime", "—"),
-                ("Bitstream", "—"),
+                ("Strategy", "-"),
+                ("Worst Negative Slack (WNS)", "-"),
+                ("LUT+FF", "-"),
+                ("Runtime", "-"),
+                ("Bitstream", "-"),
             ] {
                 kv_row(ui, theme, l, v);
             }
@@ -780,7 +806,7 @@ fn paint_power_body(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
         let pct = uw as f64 / total as f64 * 100.0;
         ui.horizontal(|ui| {
             let (srect, _) =
-                ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.allocate_exact_size(egui::vec2(chrome::STATUS_DOT_SIZE, chrome::STATUS_DOT_SIZE), egui::Sense::hover());
             ui.painter().rect_filled(srect, 2.0, swatch);
             ui.label(egui::RichText::new(label).size(13.0).color(theme.text));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -803,12 +829,11 @@ fn paint_runs_body(
     app: &mut HelionIde,
     theme: &theme::Theme,
 ) -> Option<WorkspaceTab> {
-    let mut go = None;
     if app.model.runs.is_empty() {
         ui.vertical_centered(|ui| {
             ui.add_space(10.0);
             ui.label(
-                egui::RichText::new("No runs yet — create one from the Design Runs tab.")
+                egui::RichText::new("No runs yet - create one from the Jobs tab.")
                     .size(13.0)
                     .color(theme.dim),
             );
@@ -826,8 +851,8 @@ fn paint_runs_body(
             let (icon, scolor) = match run.status.as_str() {
                 "Complete" => ("✓", theme.ok),
                 "Running" => ("▶", theme.accent),
-                "Failed" => ("✗", theme.danger),
-                "Warnings" => ("⚠", theme.warn),
+                "Failed" => ("×", theme.danger),
+                "Warnings" => ("▲", theme.warn),
                 _ => ("○", theme.faint),
             };
             vec![
@@ -843,13 +868,13 @@ fn paint_runs_body(
                 Cell::num(
                     run.wns_ps
                         .map(|w| format!("{w} ps"))
-                        .unwrap_or_else(|| "—".into()),
+                        .unwrap_or_else(|| "-".into()),
                     theme.text,
                 ),
                 Cell::num(
                     run.lutff
                         .map(|c| c.to_string())
-                        .unwrap_or_else(|| "—".into()),
+                        .unwrap_or_else(|| "-".into()),
                     theme.text,
                 ),
                 Cell::num(fmt_duration(run.runtime_ms), theme.text),
@@ -878,10 +903,11 @@ fn paint_runs_body(
             theme,
             &format!("View all {} runs", app.model.runs.len()),
         ) {
-            go = Some(WorkspaceTab::Runs);
+            // Runs live in the Z6 Jobs tab (grammar R12), not a Z5 pane.
+            app.model.bottom_tab = BottomTab::Jobs;
         }
     }
-    go
+    None
 }
 
 /// Design/top name: explicit top override, else the loaded design, else "-".
@@ -890,17 +916,24 @@ fn design_name(model: &IdeModel) -> String {
         .tree
         .top
         .clone()
-        .or_else(|| model.shell.session.design.as_ref().map(|d| d.name.clone()))
+        .or_else(|| {
+            model
+                .shell
+                .session
+                .design
+                .as_ref()
+                .map(|d| helion_ir::resolve(d.name).to_string())
+        })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "-".into())
 }
 
-/// `None` runtime -> "—"; <1s -> "N ms"; else "N.N s".
+/// `None` runtime -> "-"; <1s -> "N ms"; else "N.N s".
 fn fmt_duration(ms: Option<u64>) -> String {
     match ms {
         Some(m) if m >= 1000 => format!("{:.1} s", m as f64 / 1000.0),
         Some(m) => format!("{m} ms"),
-        None => "—".into(),
+        None => "-".into(),
     }
 }
 
@@ -914,19 +947,58 @@ fn truncate_str(s: &str, n: usize) -> String {
     }
 }
 
-/// "Timing Analysis" report catalog: regroups the timing-related report tabs
-/// (summary, paths, clocks, CDC, power, methodology, DRC, utilization) into one
-/// section tree for the Reports sidebar. Replaces the flat report catalog.
+/// Report catalog for the Reports sidebar: timing reports under TIMING ANALYSIS,
+/// quality reports (power, methodology, DRC, utilization) under DESIGN QUALITY.
+/// Two sections, not one: power and DRC are not timing analysis.
 pub fn paint_timing_catalog(ui: &mut egui::Ui, app: &mut HelionIde) {
     let theme = app.theme;
+    let cache_id = egui::Id::new("timing_catalog_rows_cache");
+    let cache_key: (usize, usize, usize, Option<i64>, usize, bool) = (
+        app.model.tree.cells.len(),
+        app.model.tree.nets.len(),
+        app.model.timing_paths.len(),
+        app.model.wns_ps(),
+        app.model.drc.as_ref().map(|d| d.violations.len()).unwrap_or(0),
+        app.model.vcd_activity.is_some(),
+    );
+    type CatRow = (String, Option<String>, egui::Color32, WorkspaceTab);
+    let (clk_rows, qual_rows): (Vec<CatRow>, Vec<CatRow>) = ui
+        .ctx()
+        .data_mut(|d| {
+            d.get_temp::<(
+                (usize, usize, usize, Option<i64>, usize, bool),
+                Vec<CatRow>,
+                Vec<CatRow>,
+            )>(cache_id)
+        })
+        .filter(|(k, _, _)| *k == cache_key)
+        .map(|(_, c, q)| (c, q))
+        .unwrap_or_else(|| {
+            let c = timing_clock_rows(&app.model, &theme);
+            let q = timing_quality_rows(&app.model, &theme);
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(cache_id, (cache_key, c.clone(), q.clone())));
+            (c, q)
+        });
     ui.label(
         egui::RichText::new("TIMING ANALYSIS")
             .small()
             .color(theme.faint),
     );
     ui.add_space(4.0);
-    let rows = timing_rows(&app.model, &theme);
-    for (label, badge, dot, tab) in rows {
+    for (label, badge, dot, tab) in clk_rows {
+        if catalog_row(ui, &theme, &label, badge.as_deref(), dot) {
+            open_more_workspace(app, tab);
+        }
+    }
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new("DESIGN QUALITY")
+            .small()
+            .color(theme.faint),
+    );
+    ui.add_space(4.0);
+    for (label, badge, dot, tab) in qual_rows {
         if catalog_row(ui, &theme, &label, badge.as_deref(), dot) {
             open_more_workspace(app, tab);
         }
@@ -938,16 +1010,30 @@ pub fn paint_timing_catalog(ui: &mut egui::Ui, app: &mut HelionIde) {
 /// negative-slack endpoint, otherwise `theme.accent`; axis labels use
 /// `theme.faint`. Honest empty state when there is no path data.
 pub fn paint_slack_histogram(ui: &mut egui::Ui, model: &IdeModel, theme: &theme::Theme) {
-    ui.label(
-        egui::RichText::new("Endpoint Slack Histogram")
-            .font(theme::font_ui_semibold(13.0))
-            .color(theme.text),
-    );
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Endpoint Slack Histogram")
+                .font(theme::font_ui_semibold(13.0))
+                .color(theme.text),
+        );
+        if !model.timing_paths.is_empty() {
+            let viol = model.timing_paths.iter().filter(|p| p.slack_ps < 0).count();
+            ui.label(
+                egui::RichText::new(format!(
+                    "· {} endpoints ({} violating)",
+                    model.timing_paths.len(),
+                    viol
+                ))
+                .size(11.5)
+                .color(if viol > 0 { theme.danger } else { theme.dim }),
+            );
+        }
+    });
     if model.timing_paths.is_empty() {
-        ui.label(egui::RichText::new("No timing paths — run Implement").color(theme.faint));
+        ui.label(egui::RichText::new("No timing paths - run Implement").color(theme.faint));
         return;
     }
-    const BINS: usize = 20;
+    const BINS: usize = 16;
     let min = model
         .timing_paths
         .iter()
@@ -960,54 +1046,79 @@ pub fn paint_slack_histogram(ui: &mut egui::Ui, model: &IdeModel, theme: &theme:
         .map(|p| p.slack_ps)
         .max()
         .unwrap_or(0);
-    let span = (max - min).max(1) as f64;
+    let (lo, hi) = if min == max {
+        (min - 500, max + 500)
+    } else {
+        (min, max)
+    };
+    let span = (hi - lo).max(1) as f64;
     let mut counts = [0usize; BINS];
     let mut bin_min = [i64::MAX; BINS];
     for p in &model.timing_paths {
-        let b = (((p.slack_ps - min) as f64 / span) * BINS as f64).floor() as usize;
+        let b = (((p.slack_ps - lo) as f64 / span) * BINS as f64).floor() as usize;
         let b = b.min(BINS - 1);
         counts[b] += 1;
         bin_min[b] = bin_min[b].min(p.slack_ps);
     }
     let peak = counts.iter().copied().max().unwrap_or(1).max(1);
-    let plot_h = 96.0;
+    let plot_h = 84.0;
     let width = ui.available_width().max(120.0);
-    let bar_w = width / BINS as f32;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, plot_h), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, 6.0, theme.panel);
+    p.rect_stroke(
+        rect,
+        6.0,
+        egui::Stroke::new(1.0, theme.line),
+        egui::StrokeKind::Inside,
+    );
+    let inner = rect.shrink2(egui::vec2(10.0, 10.0));
+    let bar_w = inner.width() / BINS as f32;
     for (i, count) in counts.iter().enumerate() {
-        let h = *count as f32 / peak as f32 * plot_h;
-        let x0 = rect.left() + i as f32 * bar_w;
-        let bar = egui::Rect::from_min_max(
-            egui::pos2(x0 + 1.0, rect.top() + plot_h - h),
-            egui::pos2(x0 + bar_w - 1.0, rect.top() + plot_h),
+        let x0 = inner.left() + i as f32 * bar_w;
+        let slot = egui::Rect::from_min_max(
+            egui::pos2(x0 + 2.0, inner.top() + 12.0),
+            egui::pos2(x0 + bar_w - 2.0, inner.bottom()),
         );
-        let color = if bin_min[i] < 0 {
-            theme.danger
-        } else {
-            // Muted accent per §3.3: the histogram is context, not brand.
-            theme.accent_dim
-        };
-        ui.painter().rect_filled(bar, 2.0, color);
+        p.rect_filled(slot, 2.0, theme.bg.gamma_multiply(0.55));
+        if *count > 0 {
+            let avail_bar_h = (inner.height() - 14.0).max(8.0);
+            let h = (*count as f32 / peak as f32 * avail_bar_h).max(6.0);
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(x0 + 2.0, inner.bottom() - h),
+                egui::pos2(x0 + bar_w - 2.0, inner.bottom()),
+            );
+            let color = if bin_min[i] < 0 {
+                theme.danger
+            } else {
+                theme.accent_dim
+            };
+            p.rect_filled(bar, 2.0, color);
+            p.text(
+                egui::pos2(bar.center().x, bar.top() - 2.0),
+                egui::Align2::CENTER_BOTTOM,
+                count.to_string(),
+                egui::FontId::monospace(10.0),
+                theme.text,
+            );
+        }
     }
     ui.horizontal(|ui| {
         ui.label(
-            egui::RichText::new(format!("{min} ps"))
+            egui::RichText::new(format!("Min: {lo} ps"))
+                .monospace()
                 .small()
                 .color(theme.faint),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
-                egui::RichText::new(format!("{max} ps"))
+                egui::RichText::new(format!("Max: {hi} ps"))
+                    .monospace()
                     .small()
                     .color(theme.faint),
             );
         });
     });
-    ui.label(
-        egui::RichText::new(format!("{} paths", model.timing_paths.len()))
-            .small()
-            .color(theme.faint),
-    );
 }
 
 /// One catalog row: severity dot + label + right-aligned badge. True on click.
@@ -1018,26 +1129,38 @@ fn catalog_row(
     badge: Option<&str>,
     dot: egui::Color32,
 ) -> bool {
-    let mut clicked = false;
-    ui.horizontal(|ui| {
-        ui.colored_label(dot, "●");
-        if ui
-            .add(
-                egui::Label::new(egui::RichText::new(label).color(theme.text))
-                    .sense(egui::Sense::click()),
-            )
-            .clicked()
-        {
-            clicked = true;
+    let w = ui.available_width().max(80.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        if resp.hovered() {
+            p.rect_filled(rect, 4.0, theme.surface_hover);
         }
+        p.circle_filled(egui::pos2(rect.left() + 8.0, rect.center().y), 4.0, dot);
+        let mut label_right = rect.right() - 6.0;
         if let Some(b) = badge {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(b).small().color(theme.faint));
-            });
+            let bgalley = p.layout_no_wrap(b.to_string(), theme::font_ui(11.0), theme.faint);
+            let bw = bgalley.size().x;
+            let bx = (rect.right() - 6.0 - bw).max(rect.left() + 68.0);
+            label_right = (bx - 8.0).max(rect.left() + 48.0);
+            p.galley(
+                egui::pos2(bx, rect.center().y - bgalley.size().y * 0.5),
+                bgalley,
+                theme.faint,
+            );
         }
-    });
-    ui.add_space(2.0);
-    clicked
+        let label_clip = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 18.0, rect.top()),
+            egui::pos2(label_right, rect.bottom()),
+        );
+        let lgalley = p.layout_no_wrap(label.to_string(), theme::font_ui(13.0), theme.text);
+        p.with_clip_rect(label_clip).galley(
+            egui::pos2(rect.left() + 20.0, rect.center().y - lgalley.size().y * 0.5),
+            lgalley,
+            theme.text,
+        );
+    }
+    resp.clicked()
 }
 
 /// (label, badge, dot, tab) tuple builder for the catalog rows.
@@ -1048,16 +1171,6 @@ fn cat_row(
     tab: WorkspaceTab,
 ) -> (String, Option<String>, egui::Color32, WorkspaceTab) {
     (label.into(), badge, dot, tab)
-}
-
-/// Full catalog row list. Badges come from cheap model fields only.
-fn timing_rows(
-    model: &IdeModel,
-    theme: &theme::Theme,
-) -> Vec<(String, Option<String>, egui::Color32, WorkspaceTab)> {
-    let mut rows = timing_clock_rows(model, theme);
-    rows.extend(timing_quality_rows(model, theme));
-    rows
 }
 
 /// Timing + clock rows: summary, paths, clock interaction, CDC, clock networks.
@@ -1126,6 +1239,46 @@ fn timing_clock_rows(
         WorkspaceTab::ClockNetworks,
     ));
     rows
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::{chrome, dashboard_column_width};
+
+    #[test]
+    fn project_summary_columns_stay_inside_every_viewport() {
+        for avail in [320.0, 719.0, 760.0, 1024.0, 1440.0, 2400.0] {
+            let cols = if avail >= 760.0 { 2 } else { 1 };
+            let gap = chrome::SPACE_LG;
+            let row_spacing = chrome::SPACE_SM;
+            let col_w = dashboard_column_width(avail, cols, gap, row_spacing);
+            let row_w = col_w * cols as f32
+                + (gap + row_spacing) * cols.saturating_sub(1) as f32;
+            assert!(col_w > 0.0);
+            assert!(row_w <= avail + f32::EPSILON, "{row_w} exceeds {avail}");
+            assert!(
+                (row_w - avail).abs() < 0.01,
+                "{row_w} leaves slack in {avail}"
+            );
+        }
+    }
+
+    #[test]
+    fn report_bars_scale_with_width_and_keep_a_compact_height() {
+        assert_eq!(
+            chrome::power_report_bar_w(320.0),
+            320.0 * chrome::POWER_BAR_PANE_SHARE
+        );
+        assert!(chrome::power_report_bar_w(1440.0) > chrome::POWER_BAR_W);
+        assert_eq!(
+            chrome::power_report_bar_w(4000.0),
+            chrome::POWER_BAR_MAX_W
+        );
+        assert_eq!(
+            chrome::occupancy_bar_draw_h(120.0),
+            chrome::OCCUPANCY_BAR_H
+        );
+    }
 }
 
 /// Quality + power rows: power, methodology, DRC, utilization.
