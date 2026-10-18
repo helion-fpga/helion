@@ -13,6 +13,11 @@ pub use priority_cut::{
     npn4_are_equivalent, npn4_canonical, npn4_reconstruct, prune_and_compact_cut, Npn4Transform,
     PriorityCut, PriorityCutStats, LUT6_VAR_INIT,
 };
+pub mod power_opt;
+pub use power_opt::{
+    PowerOptReport, extract_fdre_clock_enables, gate_bram_idle_enables, hoist_bufgce_clock_gates,
+    optimize_dynamic_power,
+};
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
