@@ -470,6 +470,25 @@ pub fn decode_packets(bytes: &[u8]) -> Result<(u32, BTreeMap<(u8, u16, u8), u128
                     far += 1;
                 }
             }
+            0x12 => {
+                // MFWR (Multi-Frame Write compressed packet):
+                // 16-byte template word + N * (u32 start_far, u16 run_len) entries
+                if !synced {
+                    return Err("MFWR before SYNC".into());
+                }
+                if len < 22 || (len - 16) % 6 != 0 {
+                    return Err(format!("bad MFWR payload length {len}"));
+                }
+                let word = u128::from_le_bytes(payload[0..16].try_into().unwrap());
+                for entry in payload[16..].chunks_exact(6) {
+                    let start_far = u32::from_le_bytes(entry[0..4].try_into().unwrap());
+                    let count = u16::from_le_bytes(entry[4..6].try_into().unwrap()) as u32;
+                    for off in 0..count {
+                        let f = Far::decode(start_far + off);
+                        frames.insert((f.block_type, f.major, f.minor), word);
+                    }
+                }
+            }
             0x21 => {}
             0x02 => synced = false,
             other => return Err(format!("unknown packet {other:#04x}")),
@@ -593,6 +612,570 @@ pub fn bitgen_pblock(
     };
     bs.packets = encode_packets(dev.idcode, &bs.frames);
     Ok(bs)
+}
+
+/// Header flag bit 0 in `.hbits` when `BITSTREAM.GENERAL.COMPRESS TRUE` (`MFWR`) is active.
+pub const HBITS_FLAG_COMPRESSED: u32 = 1 << 0;
+
+/// Vivado UG908 Readback Data (`.rbd`) golden frame image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadbackData {
+    pub idcode: u32,
+    pub frames: BTreeMap<(u8, u16, u8), u128>,
+}
+
+impl ReadbackData {
+    /// Serialize `.rbd` into deterministic UG908-style ASCII hex lines.
+    pub fn to_rbd_text(&self) -> String {
+        let mut out = format!("# Helion UG908 Readback Data (.rbd)\nIDCODE {:#010x}\n", self.idcode);
+        for (&(b, maj, min), &w) in &self.frames {
+            let far = Far {
+                block_type: b,
+                die: 0,
+                major: maj,
+                minor: min,
+            }
+            .encode();
+            out.push_str(&format!("FAR {far:#010x} WORD {w:032x}\n"));
+        }
+        out
+    }
+
+    /// Parse `.rbd` ASCII text back into [`ReadbackData`].
+    pub fn from_rbd_text(text: &str) -> Result<Self, String> {
+        let mut idcode = 0u32;
+        let mut saw_idcode = false;
+        let mut frames = BTreeMap::new();
+        for raw in text.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut toks = line.split_whitespace();
+            match toks.next() {
+                Some("IDCODE") => {
+                    let s = toks.next().ok_or("rbd: missing IDCODE value")?;
+                    idcode = u32::from_str_radix(s.trim_start_matches("0x"), 16)
+                        .map_err(|e| format!("rbd IDCODE: {e}"))?;
+                    saw_idcode = true;
+                }
+                Some("FAR") => {
+                    let far_s = toks.next().ok_or("rbd: missing FAR")?;
+                    let _word_kw = toks.next().ok_or("rbd: missing WORD keyword")?;
+                    let word_s = toks.next().ok_or("rbd: missing WORD hex")?;
+                    let far_u32 = u32::from_str_radix(far_s.trim_start_matches("0x"), 16)
+                        .map_err(|e| format!("rbd FAR: {e}"))?;
+                    let w = u128::from_str_radix(word_s.trim_start_matches("0x"), 16)
+                        .map_err(|e| format!("rbd WORD: {e}"))?;
+                    let f = Far::decode(far_u32);
+                    frames.insert((f.block_type, f.major, f.minor), w);
+                }
+                other => return Err(format!("rbd: unknown directive {other:?}")),
+            }
+        }
+        if !saw_idcode {
+            return Err("rbd: missing IDCODE header".into());
+        }
+        Ok(Self { idcode, frames })
+    }
+}
+
+/// Vivado UG908 Mask Data (`.msd`) dynamic-state bitmask per frame.
+///
+/// A `1` bit in `masks[&(block, major, minor)]` marks a dynamic state bit (FF state,
+/// LUTRAM/SRL contents, or runtime BRAM data) that must be ignored during readback verification.
+/// A `0` bit marks a static configuration bit (LUT INIT, FF.USED, IMUX PIP, IOB, DSP) that must match `.rbd`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaskData {
+    pub idcode: u32,
+    pub masks: BTreeMap<(u8, u16, u8), u128>,
+}
+
+impl MaskData {
+    /// Serialize `.msd` into deterministic UG908-style ASCII hex lines.
+    pub fn to_msd_text(&self) -> String {
+        let mut out = format!("# Helion UG908 Mask Data (.msd)\nIDCODE {:#010x}\n", self.idcode);
+        for (&(b, maj, min), &m) in &self.masks {
+            let far = Far {
+                block_type: b,
+                die: 0,
+                major: maj,
+                minor: min,
+            }
+            .encode();
+            out.push_str(&format!("FAR {far:#010x} MASK {m:032x}\n"));
+        }
+        out
+    }
+
+    /// Parse `.msd` ASCII text back into [`MaskData`].
+    pub fn from_msd_text(text: &str) -> Result<Self, String> {
+        let mut idcode = 0u32;
+        let mut saw_idcode = false;
+        let mut masks = BTreeMap::new();
+        for raw in text.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut toks = line.split_whitespace();
+            match toks.next() {
+                Some("IDCODE") => {
+                    let s = toks.next().ok_or("msd: missing IDCODE value")?;
+                    idcode = u32::from_str_radix(s.trim_start_matches("0x"), 16)
+                        .map_err(|e| format!("msd IDCODE: {e}"))?;
+                    saw_idcode = true;
+                }
+                Some("FAR") => {
+                    let far_s = toks.next().ok_or("msd: missing FAR")?;
+                    let _mask_kw = toks.next().ok_or("msd: missing MASK keyword")?;
+                    let mask_s = toks.next().ok_or("msd: missing MASK hex")?;
+                    let far_u32 = u32::from_str_radix(far_s.trim_start_matches("0x"), 16)
+                        .map_err(|e| format!("msd FAR: {e}"))?;
+                    let m = u128::from_str_radix(mask_s.trim_start_matches("0x"), 16)
+                        .map_err(|e| format!("msd MASK: {e}"))?;
+                    let f = Far::decode(far_u32);
+                    masks.insert((f.block_type, f.major, f.minor), m);
+                }
+                other => return Err(format!("msd: unknown directive {other:?}")),
+            }
+        }
+        if !saw_idcode {
+            return Err("msd: missing IDCODE header".into());
+        }
+        Ok(Self { idcode, masks })
+    }
+}
+
+/// One frame mismatch reported by [`verify_readback_masked`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadbackMismatch {
+    pub block_type: u8,
+    pub major: u16,
+    pub minor: u8,
+    pub expected: u128,
+    pub actual: u128,
+    pub mask: u128,
+    pub failing_bits: u128,
+}
+
+/// Result of [`verify_readback_masked`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadbackVerifyReport {
+    pub ok: bool,
+    pub checked_frames: usize,
+    pub masked_dynamic_bits: usize,
+    pub mismatches: Vec<ReadbackMismatch>,
+}
+
+/// Generate a Vivado UG908 `.rbd` Readback Data image from a programmed [`Bitstream`].
+pub fn generate_rbd(bits: &Bitstream) -> ReadbackData {
+    ReadbackData {
+        idcode: bits.idcode,
+        frames: bits.frames.clone(),
+    }
+}
+
+/// Generate a Vivado UG908 `.msd` Mask Data image from `bits` and optional `lutram_bles` (`(x, y, ble)`).
+///
+/// Masks out:
+/// - `BLE0..7.FF.INIT` and `BLE0..7.FF.SRVAL` dynamic flip-flop capture bits in every configured CLB major.
+/// - `BLE{ble}.LUT.INIT[0..63]` for any `(x, y, ble)` in `lutram_bles` (distributed RAM / SRL).
+/// - `Far::BRAM` data frames (`minor >= 1`), while leaving `Far::BRAM` minor `0` (`USED` + site coords) unmasked.
+pub fn generate_msd(
+    dev: &Device,
+    bits: &Bitstream,
+    lutram_bles: &[(u32, u32, u8)],
+) -> Result<MaskData, String> {
+    let fm = dev.featuremap();
+    let fb = fm.frame_bits;
+    let mut clb_ff_mask_by_minor: BTreeMap<u8, u128> = BTreeMap::new();
+    for ble in 0..dev.n_ble {
+        for suffix in ["FF.INIT", "FF.SRVAL"] {
+            let key = format!("BLE{ble}.{suffix}");
+            if let Some(abs) = fm.abs_bit(&key) {
+                let minor = (abs / fb) as u8;
+                let bit = abs % fb;
+                *clb_ff_mask_by_minor.entry(minor).or_insert(0) |= 1u128 << bit;
+            }
+        }
+    }
+
+    let mut clb_majors: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+    for &(b, maj, _) in bits.frames.keys() {
+        if b == Far::CLB_IO_CLK {
+            clb_majors.insert(maj);
+        }
+    }
+    let mut masks: BTreeMap<(u8, u16, u8), u128> = BTreeMap::new();
+    for maj in clb_majors {
+        for (&minor, &m) in &clb_ff_mask_by_minor {
+            if m != 0 {
+                *masks.entry((Far::CLB_IO_CLK, maj, minor)).or_insert(0) |= m;
+            }
+        }
+    }
+    for &(x, y, ble) in lutram_bles {
+        let major = dev
+            .clb_major(x, y)
+            .ok_or_else(|| format!("generate_msd: CLB_X{x}Y{y} is not a CLB site"))?;
+        let abs0 = fm
+            .abs_bit(&format!("BLE{ble}.LUT.INIT[0]"))
+            .ok_or_else(|| format!("generate_msd: unknown BLE{ble}.LUT.INIT[0]"))?;
+        let minor = (abs0 / fb) as u8;
+        let bit0 = abs0 % fb;
+        *masks.entry((Far::CLB_IO_CLK, major, minor)).or_insert(0) |= (u64::MAX as u128) << bit0;
+    }
+    for &(b, maj, min) in bits.frames.keys() {
+        if b == Far::BRAM && min >= 1 {
+            masks.insert((Far::BRAM, maj, min), u128::MAX);
+        }
+    }
+    Ok(MaskData {
+        idcode: bits.idcode,
+        masks,
+    })
+}
+
+/// Compare hardware readback frames against golden `.rbd` while masking out dynamic `.msd` bits.
+pub fn verify_readback_masked(
+    rbd: &ReadbackData,
+    msd: &MaskData,
+    hw_readback_frames: &BTreeMap<(u8, u16, u8), u128>,
+) -> ReadbackVerifyReport {
+    let mut all_keys: std::collections::BTreeSet<(u8, u16, u8)> = std::collections::BTreeSet::new();
+    for &k in rbd.frames.keys().chain(hw_readback_frames.keys()) {
+        all_keys.insert(k);
+    }
+    let mut mismatches = Vec::new();
+    let mut masked_dynamic_bits = 0usize;
+    for key in &all_keys {
+        let exp = rbd.frames.get(key).copied().unwrap_or(0);
+        let act = hw_readback_frames.get(key).copied().unwrap_or(0);
+        let mask = msd.masks.get(key).copied().unwrap_or(0);
+        masked_dynamic_bits += mask.count_ones() as usize;
+        let diff = (exp ^ act) & !mask;
+        if diff != 0 {
+            mismatches.push(ReadbackMismatch {
+                block_type: key.0,
+                major: key.1,
+                minor: key.2,
+                expected: exp,
+                actual: act,
+                mask,
+                failing_bits: diff,
+            });
+        }
+    }
+    ReadbackVerifyReport {
+        ok: mismatches.is_empty(),
+        checked_frames: all_keys.len(),
+        masked_dynamic_bits,
+        mismatches,
+    }
+}
+
+/// 9-bit Extended Hamming SEC-DED (Single Error Correction, Double Error Detection)
+/// syndrome over a 128-bit configuration frame (`u128`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameEcc {
+    /// 8-bit Hamming parity over 1-based bit positions `1..=128`.
+    pub syndrome: u8,
+    /// Overall parity across all 128 data bits and 8 syndrome bits.
+    pub overall_parity: bool,
+}
+
+impl FrameEcc {
+    pub fn compute(word: u128) -> Self {
+        let mut syndrome = 0u8;
+        let mut data_parity = false;
+        let mut rem = word;
+        while rem != 0 {
+            let bit = rem.trailing_zeros() as u8;
+            let pos = bit + 1; // 1..=128 (fits in 8 bits: 0x01..=0x80)
+            syndrome ^= pos;
+            data_parity = !data_parity;
+            rem &= rem - 1;
+        }
+        Self {
+            syndrome,
+            overall_parity: data_parity,
+        }
+    }
+}
+
+/// Outcome of SEM SEU check & scrub on a single 128-bit configuration frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeuOutcome {
+    /// Zero bit flips detected.
+    Clean,
+    /// Single-bit SEU detected at `bit` (`0..128`) and automatically corrected in-place.
+    CorrectedSingleBit { bit: u8 },
+    /// Single-bit upset in the ECC parity storage itself (data word intact).
+    CorrectedParityBit,
+    /// Double-bit (or even multi-bit) uncorrectable SEU detected (`syndrome != 0`, even parity).
+    UncorrectableDoubleBit { syndrome: u8 },
+}
+
+/// Summary report returned by [`SemScrubber::scrub_bitstream`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScrubReport {
+    pub frames_scanned: usize,
+    pub corrected_single_bits: Vec<((u8, u16, u8), u8)>,
+    pub uncorrectable_double_bits: Vec<((u8, u16, u8), u8)>,
+}
+
+impl ScrubReport {
+    pub fn is_clean_or_corrected(&self) -> bool {
+        self.uncorrectable_double_bits.is_empty()
+    }
+}
+
+/// Soft Error Mitigation (SEM) SEU Frame Scrubber using Extended Hamming SEC-DED ECC.
+#[derive(Clone, Debug)]
+pub struct SemScrubber {
+    pub golden_ecc: BTreeMap<(u8, u16, u8), FrameEcc>,
+    pub corrected_single_bit_count: u64,
+    pub uncorrectable_double_bit_count: u64,
+}
+
+impl SemScrubber {
+    /// Build golden SEC-DED frame syndromes for every configured frame in `bits`.
+    pub fn from_bitstream(bits: &Bitstream) -> Self {
+        let golden_ecc = bits
+            .frames
+            .iter()
+            .map(|(&k, &w)| (k, FrameEcc::compute(w)))
+            .collect();
+        Self {
+            golden_ecc,
+            corrected_single_bit_count: 0,
+            uncorrectable_double_bit_count: 0,
+        }
+    }
+
+    /// Check one 128-bit frame against its golden SEC-DED ECC and auto-correct a single-bit flip in-place.
+    pub fn check_and_scrub_frame(&mut self, key: (u8, u16, u8), word: &mut u128) -> SeuOutcome {
+        let expected = self
+            .golden_ecc
+            .get(&key)
+            .copied()
+            .unwrap_or_else(|| FrameEcc::compute(0));
+        let actual = FrameEcc::compute(*word);
+        let syn = expected.syndrome ^ actual.syndrome;
+        let p_err = expected.overall_parity ^ actual.overall_parity;
+
+        if syn == 0 && !p_err {
+            return SeuOutcome::Clean;
+        }
+        if p_err && (1..=128).contains(&syn) {
+            let bit = syn - 1;
+            *word ^= 1u128 << bit;
+            self.corrected_single_bit_count += 1;
+            return SeuOutcome::CorrectedSingleBit { bit };
+        }
+        if p_err && syn == 0 {
+            return SeuOutcome::CorrectedParityBit;
+        }
+        self.uncorrectable_double_bit_count += 1;
+        SeuOutcome::UncorrectableDoubleBit { syndrome: syn }
+    }
+
+    /// Scan and scrub all frames in `bits`, correcting any single-bit SEUs and reporting double-bit alarms.
+    pub fn scrub_bitstream(&mut self, bits: &mut Bitstream) -> ScrubReport {
+        let mut all_keys: std::collections::BTreeSet<(u8, u16, u8)> =
+            std::collections::BTreeSet::new();
+        for &k in self.golden_ecc.keys().chain(bits.frames.keys()) {
+            all_keys.insert(k);
+        }
+        let mut corrected_single_bits = Vec::new();
+        let mut uncorrectable_double_bits = Vec::new();
+        let mut modified = false;
+
+        for key in &all_keys {
+            let mut w = bits.frames.get(key).copied().unwrap_or(0);
+            match self.check_and_scrub_frame(*key, &mut w) {
+                SeuOutcome::Clean | SeuOutcome::CorrectedParityBit => {}
+                SeuOutcome::CorrectedSingleBit { bit } => {
+                    if w == 0 {
+                        bits.frames.remove(key);
+                    } else {
+                        bits.frames.insert(*key, w);
+                    }
+                    corrected_single_bits.push((*key, bit));
+                    modified = true;
+                }
+                SeuOutcome::UncorrectableDoubleBit { syndrome } => {
+                    uncorrectable_double_bits.push((*key, syndrome));
+                }
+            }
+        }
+        if modified {
+            bits.packets = encode_packets(bits.idcode, &bits.frames);
+        }
+        ScrubReport {
+            frames_scanned: all_keys.len(),
+            corrected_single_bits,
+            uncorrectable_double_bits,
+        }
+    }
+}
+
+/// Compression telemetry for `BITSTREAM.GENERAL.COMPRESS TRUE` (`MFWR` deduplication).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompressionStats {
+    pub uncompressed_bytes: usize,
+    pub compressed_bytes: usize,
+    pub total_frames: usize,
+    pub unique_frames: usize,
+    pub mfwr_groups: usize,
+}
+
+/// Compress a [`Bitstream`] using Vivado-class `BITSTREAM.GENERAL.COMPRESS TRUE` (`MFWR` op `0x12`).
+///
+/// Deduplicates identical 128-bit frame words across the die into compact `MFWR` multi-frame
+/// write packets when profitable, and sets `HBITS_FLAG_COMPRESSED` in the `.hbits` header.
+pub fn compress_bitstream_with_stats(bits: &Bitstream) -> (Bitstream, CompressionStats) {
+    let uncompressed_packets = encode_packets(bits.idcode, &bits.frames);
+    let uncompressed_bytes = uncompressed_packets.len();
+
+    // Group non-zero frames by their 128-bit payload value into contiguous (start_far, count) runs.
+    let mut by_word: BTreeMap<u128, Vec<(u32, u16)>> = BTreeMap::new();
+    let mut total_frames = 0usize;
+    for (&(block, major, minor), &payload) in &bits.frames {
+        if payload == 0 {
+            continue;
+        }
+        total_frames += 1;
+        let far = Far {
+            block_type: block,
+            die: 0,
+            major,
+            minor,
+        }
+        .encode();
+        let runs = by_word.entry(payload).or_default();
+        if let Some((start, count)) = runs.last_mut() {
+            if *start + u32::from(*count) == far && *count < u16::MAX {
+                *count += 1;
+                continue;
+            }
+        }
+        runs.push((far, 1));
+    }
+
+    let unique_frames = by_word.len();
+    let mut out = Vec::with_capacity(HBITS_HEADER_BYTES + uncompressed_bytes);
+    out.resize(HBITS_HEADER_BYTES, 0);
+    // SYNC
+    out.push(0x01);
+    out.extend_from_slice(&4u16.to_le_bytes());
+    out.extend_from_slice(b"HELI");
+
+    let mut mfwr_groups = 0usize;
+    let mut single_frames: BTreeMap<(u8, u16, u8), u128> = BTreeMap::new();
+
+    for (word, runs) in &by_word {
+        let total_for_word: usize = runs.iter().map(|(_, c)| *c as usize).sum();
+        if total_for_word >= 2 {
+            // Emit MFWR (0x12): 16-byte template word + 6 bytes per (start_far, count) run
+            mfwr_groups += 1;
+            let payload_len = 16 + runs.len() * 6;
+            out.push(0x12);
+            out.extend_from_slice(&(payload_len as u16).to_le_bytes());
+            out.extend_from_slice(&word.to_le_bytes());
+            for &(start_far, count) in runs {
+                out.extend_from_slice(&start_far.to_le_bytes());
+                out.extend_from_slice(&count.to_le_bytes());
+            }
+        } else if let Some(&(far, _)) = runs.first() {
+            let f = Far::decode(far);
+            single_frames.insert((f.block_type, f.major, f.minor), *word);
+        }
+    }
+
+    // Flush remaining unique singletons as standard contiguous WRITE_FAR + WRITE_FDRI runs
+    let mut run_start: Option<u32> = None;
+    let mut last_far: Option<u32> = None;
+    let mut run: Vec<u128> = Vec::new();
+    for ((block, major, minor), payload) in &single_frames {
+        let far = Far {
+            block_type: *block,
+            die: 0,
+            major: *major,
+            minor: *minor,
+        }
+        .encode();
+        let contiguous = last_far.map(|prev| far == prev + 1).unwrap_or(false);
+        if !contiguous || run.len() >= MAX_RUN_FRAMES {
+            if let Some(start) = run_start {
+                if !run.is_empty() {
+                    flush_run(&mut out, start, &run);
+                }
+            }
+            run.clear();
+            run_start = Some(far);
+        }
+        run.push(*payload);
+        last_far = Some(far);
+    }
+    if let Some(start) = run_start {
+        if !run.is_empty() {
+            flush_run(&mut out, start, &run);
+        }
+    }
+
+    // CRC_CHECK
+    out.push(0x21);
+    out.extend_from_slice(&4u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    // DESYNC
+    out.push(0x02);
+    out.extend_from_slice(&0u16.to_le_bytes());
+
+    let body_len = (out.len() - HBITS_HEADER_BYTES) as u64;
+    out[0..4].copy_from_slice(b"HBIT");
+    out[4..6].copy_from_slice(&1u16.to_le_bytes());
+    out[6..10].copy_from_slice(&bits.idcode.to_le_bytes());
+    out[10..14].copy_from_slice(&HBITS_FLAG_COMPRESSED.to_le_bytes());
+    out[14..22].copy_from_slice(&body_len.to_le_bytes());
+    let hash = sha256_lite(&out[HBITS_HEADER_BYTES..]);
+    out[22..54].copy_from_slice(&hash);
+    let hdr_crc = crc32c(&out[..54]);
+    out[54..58].copy_from_slice(&hdr_crc.to_le_bytes());
+
+    let compressed_bytes = out.len();
+    let stats = CompressionStats {
+        uncompressed_bytes,
+        compressed_bytes,
+        total_frames,
+        unique_frames,
+        mfwr_groups,
+    };
+    (
+        Bitstream {
+            idcode: bits.idcode,
+            frames: bits.frames.clone(),
+            packets: out,
+        },
+        stats,
+    )
+}
+
+/// Compress a [`Bitstream`] with `BITSTREAM.GENERAL.COMPRESS TRUE` (`MFWR` multi-frame write).
+pub fn compress_bitstream(bits: &Bitstream) -> Bitstream {
+    compress_bitstream_with_stats(bits).0
+}
+
+/// Decompress a compressed (or standard) `.hbits` [`Bitstream`] back into canonical uncompressed `.hbits` packets.
+pub fn decompress_bitstream(bits: &Bitstream) -> Result<Bitstream, String> {
+    let (idcode, frames) = decode_packets(&bits.packets)?;
+    let packets = encode_packets(idcode, &frames);
+    Ok(Bitstream {
+        idcode,
+        frames,
+        packets,
+    })
 }
 
 fn sha256_lite(data: &[u8]) -> [u8; 32] {
@@ -982,5 +1565,150 @@ mod tests {
             "{err}"
         );
         assert!(!err.contains("DONE=1"), "must not invent DONE: {err}");
+    }
+
+    #[test]
+    fn ug908_rbd_msd_generation_and_masked_readback_verification() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_counter();
+        d.add_cell("u_bram", CellKind::Bram18);
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        let mut bs = bitgen(&dev, &r).unwrap();
+        bs.frames.insert((Far::BRAM, 0, 1), 0x1111_2222_3333_4444u128);
+
+        let (site0, _) = r.placed.lutff_sites[0];
+        // Treat BLE7 at site0 as LUTRAM so its 64-bit LUT INIT is also masked in .msd.
+        let rbd = generate_rbd(&bs);
+        let msd = generate_msd(&dev, &bs, &[(site0.x, site0.y, 7)]).unwrap();
+
+        // Round-trip .rbd and .msd text representations
+        let rbd_rt = ReadbackData::from_rbd_text(&rbd.to_rbd_text()).unwrap();
+        let msd_rt = MaskData::from_msd_text(&msd.to_msd_text()).unwrap();
+        assert_eq!(rbd_rt, rbd);
+        assert_eq!(msd_rt, msd);
+
+        // Flipping dynamic FF.INIT, LUTRAM BLE7.LUT.INIT, and BRAM runtime word (minor 1)
+        // must be masked by .msd and pass verify_readback_masked!
+        let mut hw_frames = bs.frames.clone();
+        let ff_loc = dev
+            .locate(&format!("CLB_X{}Y{}.BLE0.FF.INIT", site0.x, site0.y))
+            .unwrap();
+        *hw_frames
+            .entry((ff_loc.far.block_type, ff_loc.far.major, ff_loc.far.minor))
+            .or_insert(0) ^= 1u128 << ff_loc.bit;
+        let lutram_loc = dev
+            .locate(&format!("CLB_X{}Y{}.BLE7.LUT.INIT[13]", site0.x, site0.y))
+            .unwrap();
+        *hw_frames
+            .entry((
+                lutram_loc.far.block_type,
+                lutram_loc.far.major,
+                lutram_loc.far.minor,
+            ))
+            .or_insert(0) ^= 1u128 << lutram_loc.bit;
+        hw_frames.insert((Far::BRAM, 0, 1), 0xDEAD_BEEF_CAFE_F00Du128);
+
+        let rep_ok = verify_readback_masked(&rbd_rt, &msd_rt, &hw_frames);
+        assert!(
+            rep_ok.ok,
+            "dynamic FF/LUTRAM/BRAM state changes must be masked out: {:?}",
+            rep_ok.mismatches
+        );
+        assert!(rep_ok.masked_dynamic_bits > 0);
+
+        // Flipping a static LUT0 INIT bit or IMUX routing PIP bit must fail readback verify!
+        let lut0_loc = dev
+            .locate(&format!("CLB_X{}Y{}.BLE0.LUT.INIT[0]", site0.x, site0.y))
+            .unwrap();
+        *hw_frames
+            .entry((lut0_loc.far.block_type, lut0_loc.far.major, lut0_loc.far.minor))
+            .or_insert(0) ^= 1u128 << lut0_loc.bit;
+        let rep_fail = verify_readback_masked(&rbd_rt, &msd_rt, &hw_frames);
+        assert!(!rep_fail.ok, "corrupted static LUT bit must fail verification");
+        assert_eq!(rep_fail.mismatches.len(), 1);
+        assert_eq!(rep_fail.mismatches[0].failing_bits, 1u128 << lut0_loc.bit);
+    }
+
+    #[test]
+    fn sem_scrubber_sec_ded_corrects_all_128_single_bit_seus_and_flags_double_bit() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_counter(), &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        let gold = bitgen(&dev, &r).unwrap();
+        let mut scrubber = SemScrubber::from_bitstream(&gold);
+
+        let (&sample_key, &sample_word) = gold.frames.iter().next().unwrap();
+        // Exhaustively verify single-bit SEU correction across all 128 bit positions (0..128)
+        for bit in 0..128u8 {
+            let mut corrupted = sample_word ^ (1u128 << bit);
+            let outcome = scrubber.check_and_scrub_frame(sample_key, &mut corrupted);
+            assert_eq!(outcome, SeuOutcome::CorrectedSingleBit { bit });
+            assert_eq!(
+                corrupted, sample_word,
+                "bit {bit} must be auto-corrected to exact golden frame word"
+            );
+        }
+        assert_eq!(scrubber.corrected_single_bit_count, 128);
+
+        // Verify double-bit upsets across distinct bit pairs are detected as UncorrectableDoubleBit
+        for (b0, b1) in [(0u8, 1u8), (3, 67), (15, 127), (63, 64)] {
+            let mut corrupted2 = sample_word ^ (1u128 << b0) ^ (1u128 << b1);
+            let outcome = scrubber.check_and_scrub_frame(sample_key, &mut corrupted2);
+            assert!(
+                matches!(outcome, SeuOutcome::UncorrectableDoubleBit { .. }),
+                "double-bit flip ({b0}, {b1}) must trigger UncorrectableDoubleBit, got {outcome:?}"
+            );
+        }
+
+        // Full-bitstream scrub test: inject 1-bit SEU in one frame, verify scrub_bitstream restores it
+        let mut live_bs = gold.clone();
+        *live_bs.frames.get_mut(&sample_key).unwrap() ^= 1u128 << 42;
+        let report = scrubber.scrub_bitstream(&mut live_bs);
+        assert!(report.is_clean_or_corrected());
+        assert_eq!(report.corrected_single_bits, vec![(sample_key, 42)]);
+        assert_eq!(live_bs.frames, gold.frames);
+        assert_eq!(live_bs.packets, gold.packets);
+    }
+
+    #[test]
+    fn mfwr_bitstream_compression_reduces_size_and_roundtrips_losslessly() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut frames = BTreeMap::new();
+        // Populate 64 CLB majors with repeated template words (typical replicated logic / LUTs)
+        for major in 0..64u16 {
+            frames.insert((Far::CLB_IO_CLK, major, 0), 0x5555_5555_5555_5555_AAAA_AAAA_AAAA_AAAAu128);
+            frames.insert((Far::CLB_IO_CLK, major, 4), 0x0000_0000_0000_0001_0000_0000_0000_0101u128);
+        }
+        let uncomp_packets = encode_packets(dev.idcode, &frames);
+        let uncomp = Bitstream {
+            idcode: dev.idcode,
+            frames: frames.clone(),
+            packets: uncomp_packets,
+        };
+
+        let (comp, stats) = compress_bitstream_with_stats(&uncomp);
+        assert_eq!(stats.total_frames, 128);
+        assert_eq!(stats.unique_frames, 2);
+        assert_eq!(stats.mfwr_groups, 2);
+        assert!(
+            comp.packets.len() < uncomp.packets.len() / 2,
+            "MFWR compressed stream ({} B) must be >2x smaller than uncompressed ({} B)",
+            comp.packets.len(),
+            uncomp.packets.len()
+        );
+        let flags = u32::from_le_bytes(comp.packets[10..14].try_into().unwrap());
+        assert_eq!(flags & HBITS_FLAG_COMPRESSED, HBITS_FLAG_COMPRESSED);
+
+        // decode_packets and Bitstream::from_packets must transparently decode MFWR packets!
+        let from_comp = Bitstream::from_packets(&comp.packets).unwrap();
+        assert_eq!(from_comp.idcode, dev.idcode);
+        assert_eq!(from_comp.frames, uncomp.frames);
+
+        let decomp = decompress_bitstream(&comp).unwrap();
+        assert_eq!(decomp.frames, uncomp.frames);
+        assert_eq!(decomp.packets, uncomp.packets);
     }
 }
