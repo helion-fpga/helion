@@ -31,6 +31,11 @@ fn vcd_id(mut n: usize) -> String {
     chars.iter().rev().map(|&b| b as char).collect()
 }
 
+/// Public base-94 VCD identifier generator (`!`..`~`).
+pub fn vcd_id_code(n: usize) -> String {
+    vcd_id(n)
+}
+
 /// Run the event kernel and dump a VCD of every driven net.
 ///
 /// * `cycles` — number of clock posedges to simulate.
@@ -133,6 +138,22 @@ pub fn dump_vcd(design: &Design, cycles: u32, timescale_ps: u64) -> String {
         }
     }
     out
+}
+
+/// Run the compiled fast kernel for `cycles` clock posedges and return a delta-compressed
+/// [`CompactWaveStream`](crate::wave::CompactWaveStream).
+pub fn dump_wave_stream(
+    design: &Design,
+    cycles: u32,
+    timescale_ps: u64,
+) -> crate::wave::CompactWaveStream {
+    crate::wave::CompactWaveStream::capture_compiled(design, cycles, timescale_ps)
+}
+
+/// Run the compiled fast kernel for `cycles` clock posedges and return a compact FST-style
+/// binary waveform archive (`HFST\x01`).
+pub fn dump_fst_bytes(design: &Design, cycles: u32, timescale_ps: u64) -> Vec<u8> {
+    dump_wave_stream(design, cycles, timescale_ps).to_fst_bytes()
 }
 
 #[cfg(test)]
