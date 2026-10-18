@@ -1559,6 +1559,17 @@ thread_local! {
     /// Signal/port → packed-struct or enum type name for the current module.
     static SIG_TYPES: std::cell::RefCell<HashMap<String, String>> =
         std::cell::RefCell::new(HashMap::new());
+    /// Named SVA `sequence` definitions: name -> (formal_params, body_tokens).
+    static SVA_SEQS: std::cell::RefCell<HashMap<String, SvaMacroDef>> =
+        std::cell::RefCell::new(HashMap::new());
+    /// Named SVA `property` definitions: name -> (formal_params, body_tokens).
+    static SVA_PROPS: std::cell::RefCell<HashMap<String, SvaMacroDef>> =
+        std::cell::RefCell::new(HashMap::new());
+    /// Parsed `bind` directives to attach checker instances to target modules.
+    static BIND_DIRECTIVES: std::cell::RefCell<Vec<BindDirective>> =
+        std::cell::RefCell::new(Vec::new());
+    /// Monotonic counter for synthesized SVA shift-register / monitor nets.
+    static SVA_MON_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Modules whose priority-encoder always @(*) fold was skipped by
     /// `compact_priority_onehot_unroll` after its own validation (>=48 bit
     /// writes, >=75% set-to-1 RHSs, scalar carry). `try_emit_priority_onehot_grant`
@@ -1584,6 +1595,37 @@ struct PackedStruct {
     order: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OwnedTok {
+    Ident(String),
+    Number(u128, usize),
+    Pat { val: u128, care: u128, width: usize },
+    Kw(String),
+    Str(String),
+    Sym(char),
+    Le,
+    Ge,
+    Eq,
+    Ne,
+    Lor,
+    Land,
+}
+
+#[derive(Clone, Debug)]
+struct SvaMacroDef {
+    params: Vec<String>,
+    body: Vec<OwnedTok>,
+}
+
+#[derive(Clone, Debug)]
+struct BindDirective {
+    target_module: String,
+    checker_module: String,
+    inst_name: String,
+    params: Vec<(String, u128)>,
+    conns: Vec<(String, String)>,
+    wildcard: bool,
+}
 fn skipped_funcs_clear() {
     SKIPPED_FUNCS.with(|s| s.borrow_mut().clear());
 }
@@ -1601,6 +1643,18 @@ fn pkg_enums_clear() {
     PKG_ENUM_TYPES.with(|m| m.borrow_mut().clear());
     PKG_PACKED.with(|m| m.borrow_mut().clear());
     SIG_TYPES.with(|m| m.borrow_mut().clear());
+    SVA_SEQS.with(|m| m.borrow_mut().clear());
+    SVA_PROPS.with(|m| m.borrow_mut().clear());
+    BIND_DIRECTIVES.with(|m| m.borrow_mut().clear());
+    SVA_MON_ID.with(|c| c.set(0));
+}
+
+fn next_sva_mon_id() -> usize {
+    SVA_MON_ID.with(|c| {
+        let id = c.get();
+        c.set(id + 1);
+        id
+    })
 }
 
 fn pkg_enum_type_width(name: &str) -> Option<usize> {
@@ -4665,6 +4719,9 @@ fn tokenize(s: &str) -> Result<Vec<Tok<'_>>, String> {
         "sequence",
         "endsequence",
         "inside",
+        "bind",
+        "disable",
+        "iff",
     ];
     while i < b.len() {
         let c = b[i] as char;
@@ -7650,6 +7707,228 @@ fn parse_assign_nbas<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
     Ok(vec![(name, bit, rhs)])
 }
 
+fn tok_to_owned(t: &Tok<'_>) -> OwnedTok {
+    match t {
+        Tok::Ident(s) => OwnedTok::Ident((*s).to_string()),
+        Tok::Number(v, w) => OwnedTok::Number(*v, *w),
+        Tok::Pat { val, care, width } => OwnedTok::Pat {
+            val: *val,
+            care: *care,
+            width: *width,
+        },
+        Tok::Kw(s) => OwnedTok::Kw((*s).to_string()),
+        Tok::Str(s) => OwnedTok::Str((*s).to_string()),
+        Tok::Sym(c) => OwnedTok::Sym(*c),
+        Tok::Le => OwnedTok::Le,
+        Tok::Ge => OwnedTok::Ge,
+        Tok::Eq => OwnedTok::Eq,
+        Tok::Ne => OwnedTok::Ne,
+        Tok::Lor => OwnedTok::Lor,
+        Tok::Land => OwnedTok::Land,
+    }
+}
+
+fn owned_tok_to_arena<'a>(t: &OwnedTok, arena: &'a Bump) -> Tok<'a> {
+    match t {
+        OwnedTok::Ident(s) => Tok::Ident(arena.alloc_str(s)),
+        OwnedTok::Number(v, w) => Tok::Number(*v, *w),
+        OwnedTok::Pat { val, care, width } => Tok::Pat {
+            val: *val,
+            care: *care,
+            width: *width,
+        },
+        OwnedTok::Kw(s) => Tok::Kw(arena.alloc_str(s)),
+        OwnedTok::Str(s) => Tok::Str(arena.alloc_str(s)),
+        OwnedTok::Sym(c) => Tok::Sym(*c),
+        OwnedTok::Le => Tok::Le,
+        OwnedTok::Ge => Tok::Ge,
+        OwnedTok::Eq => Tok::Eq,
+        OwnedTok::Ne => Tok::Ne,
+        OwnedTok::Lor => Tok::Lor,
+        OwnedTok::Land => Tok::Land,
+    }
+}
+
+fn harvest_sva_macro<'a>(p: &mut P<'a>, end_kw: &str, is_prop: bool) {
+    let Ok(name) = p.ident() else {
+        skip_until_kw(p, end_kw);
+        return;
+    };
+    let name = name.to_string();
+    let mut params: Vec<String> = Vec::new();
+    if p.eat_sym('(') {
+        while !p.eat_sym(')') && p.peek().is_some() {
+            let _ = parse_port_dir(p);
+            skip_sv_type(p);
+            if let Ok(pn) = p.ident() {
+                params.push(pn.to_string());
+            } else {
+                p.bump();
+            }
+            let _ = p.eat_sym(',');
+        }
+    }
+    let _ = p.eat_sym(';');
+    let mut body: Vec<OwnedTok> = Vec::new();
+    while !p.eat_kw(end_kw) {
+        let Some(tok) = p.bump() else {
+            break;
+        };
+        body.push(tok_to_owned(tok));
+    }
+    if p.eat_sym(':') {
+        let _ = p.ident();
+    }
+    while matches!(body.last(), Some(OwnedTok::Sym(';'))) {
+        body.pop();
+    }
+    let def = SvaMacroDef { params, body };
+    if is_prop {
+        SVA_PROPS.with(|m| {
+            m.borrow_mut().insert(name, def);
+        });
+    } else {
+        SVA_SEQS.with(|m| {
+            m.borrow_mut().insert(name, def);
+        });
+    }
+}
+
+fn expand_sva_tokens<'a>(toks: &[Tok<'a>], arena: &'a Bump) -> Vec<Tok<'a>> {
+    let mut cur: Vec<Tok<'a>> = toks.to_vec();
+    for _ in 0..4 {
+        let mut next: Vec<Tok<'a>> = Vec::with_capacity(cur.len());
+        let mut changed = false;
+        let mut i = 0usize;
+        while i < cur.len() {
+            if let Tok::Ident(id) = cur[i] {
+                let def_opt = SVA_PROPS
+                    .with(|m| m.borrow().get(id).cloned())
+                    .or_else(|| SVA_SEQS.with(|m| m.borrow().get(id).cloned()));
+                if let Some(def) = def_opt {
+                    changed = true;
+                    i += 1;
+                    let mut arg_map: HashMap<String, Vec<Tok<'a>>> = HashMap::new();
+                    if i < cur.len() && matches!(cur[i], Tok::Sym('(')) {
+                        i += 1;
+                        let mut d = 1i32;
+                        let mut cur_arg: Vec<Tok<'a>> = Vec::new();
+                        let mut args: Vec<Vec<Tok<'a>>> = Vec::new();
+                        while i < cur.len() && d > 0 {
+                            match &cur[i] {
+                                Tok::Sym('(') => {
+                                    d += 1;
+                                    cur_arg.push(cur[i].clone());
+                                }
+                                Tok::Sym(')') => {
+                                    d -= 1;
+                                    if d == 0 {
+                                        if !cur_arg.is_empty() || !args.is_empty() {
+                                            args.push(std::mem::take(&mut cur_arg));
+                                        }
+                                        i += 1;
+                                        break;
+                                    }
+                                    cur_arg.push(cur[i].clone());
+                                }
+                                Tok::Sym(',') if d == 1 => {
+                                    args.push(std::mem::take(&mut cur_arg));
+                                }
+                                other => cur_arg.push(other.clone()),
+                            }
+                            i += 1;
+                        }
+                        for (pn, av) in def.params.iter().zip(args.into_iter()) {
+                            arg_map.insert(pn.clone(), av);
+                        }
+                    }
+                    for bt in &def.body {
+                        if let OwnedTok::Ident(bid) = bt {
+                            if let Some(rep) = arg_map.get(bid.as_str()) {
+                                next.extend(rep.iter().cloned());
+                                continue;
+                            }
+                        }
+                        next.push(owned_tok_to_arena(bt, arena));
+                    }
+                    continue;
+                }
+            }
+            next.push(cur[i].clone());
+            i += 1;
+        }
+        cur = next;
+        if !changed {
+            break;
+        }
+    }
+    cur
+}
+
+fn parse_bind_directive<'a>(p: &mut P<'a>) {
+    let Ok(target_module) = p.ident() else {
+        skip_to_semi(p);
+        return;
+    };
+    if p.eat_sym(':') {
+        let _ = p.ident();
+    }
+    let Ok(checker_module) = p.ident() else {
+        skip_to_semi(p);
+        return;
+    };
+    let params = parse_param_assigns(p).unwrap_or_default();
+    let Ok(inst_name) = p.ident() else {
+        skip_to_semi(p);
+        return;
+    };
+    let mut conns: Vec<(String, String)> = Vec::new();
+    let mut wildcard = false;
+    if p.eat_sym('(') {
+        let mut pos = 0usize;
+        loop {
+            let i0 = p.i;
+            if p.eat_sym(')') || p.peek().is_none() {
+                break;
+            }
+            if p.eat_sym('.') {
+                if p.eat_sym('*') {
+                    wildcard = true;
+                } else if let Ok(port) = p.ident() {
+                    if p.eat_sym('(') {
+                        if let Some(net) = parse_inst_net(p) {
+                            conns.push((port.to_string(), net.to_string()));
+                        }
+                        let _ = p.eat_sym(')');
+                    } else {
+                        conns.push((port.to_string(), port.to_string()));
+                    }
+                } else {
+                    skip_until_arg_end(p);
+                }
+            } else if let Some(net) = parse_inst_net(p) {
+                conns.push((format!("#{pos}"), net.to_string()));
+                pos += 1;
+            }
+            let _ = p.eat_sym(',');
+            if p.i == i0 {
+                p.bump();
+            }
+        }
+    }
+    let _ = p.eat_sym(';');
+    BIND_DIRECTIVES.with(|b| {
+        b.borrow_mut().push(BindDirective {
+            target_module: target_module.to_string(),
+            checker_module: checker_module.to_string(),
+            inst_name: inst_name.to_string(),
+            params,
+            conns,
+            wildcard,
+        });
+    });
+}
+
 /// Pure lookahead: is the upcoming statement `[label:] assert ...`?
 /// Consumes nothing.
 fn peek_assert_stmt(p: &P) -> bool {
@@ -7660,6 +7939,18 @@ fn peek_assert_stmt(p: &P) -> bool {
         i += 2;
     }
     matches!(p.t.get(i), Some(Tok::Kw(k)) if *k == "assert")
+}
+
+/// Pure lookahead: is the upcoming statement `[label:] cover property ...`?
+fn peek_cover_property_stmt(p: &P) -> bool {
+    let mut i = p.i;
+    if matches!(p.t.get(i), Some(Tok::Ident(_)))
+        && matches!(p.t.get(i + 1), Some(Tok::Sym(':')))
+    {
+        i += 2;
+    }
+    matches!(p.t.get(i), Some(Tok::Kw(k)) if *k == "cover")
+        && matches!(p.t.get(i + 1), Some(Tok::Kw(k)) if *k == "property")
 }
 
 /// Parse the optional `else $error/$warning/$info[(msg)]` action of an
@@ -7708,33 +7999,39 @@ fn parse_sva_else_action(p: &mut P<'_>) -> Result<(SvaSeverity, Option<String>),
 /// triple is only recognized at paren-depth 0, so `a | b` and `a || b` never
 /// match, and `a | -b` is excluded by requiring the `>` third token.
 /// Sequence-level out-of-subset constructs get named errors here.
-fn scan_implication(t: &[Tok<'_>], start: usize) -> Result<(usize, SvaImplKind, usize), String> {
+fn scan_implication(
+    t: &[Tok<'_>],
+    start: usize,
+    is_cover: bool,
+) -> Result<(usize, SvaImplKind, usize), String> {
     let mut depth = 0i32;
     let mut found: Option<(usize, SvaImplKind)> = None;
+    let mut first_hash_delay: Option<usize> = None;
     let mut i = start;
     while i < t.len() {
         match &t[i] {
             Tok::Sym('(') => depth += 1,
             Tok::Sym(')') => {
                 if depth == 0 {
-                    return match found {
-                        Some((k, kind)) => Ok((k, kind, i)),
-                        None => Err(sva_err(
-                            "no `|->`/`|=>` implication found in `assert property`",
-                        )),
-                    };
+                    if let Some((k, kind)) = found {
+                        return Ok((k, kind, i));
+                    }
+                    if let Some(hk) = first_hash_delay {
+                        return Ok((hk, SvaImplKind::Overlapped, i));
+                    }
+                    if is_cover {
+                        return Ok((start, SvaImplKind::Overlapped, i));
+                    }
+                    return Err(sva_err(
+                        "no `|->`/`|=>` implication found in `assert property`",
+                    ));
                 }
                 depth -= 1;
             }
             _ => {}
         }
         if depth == 0 {
-            if let Tok::Ident(s) = &t[i] {
-                if *s == "disable"
-                    && matches!(t.get(i + 1), Some(Tok::Ident(n)) if *n == "iff")
-                {
-                    return Err(sva_err("`disable iff` is not in the v3.0 SVA subset"));
-                }
+            if let Tok::Ident(s) | Tok::Kw(s) = &t[i] {
                 if *s == "throughout" {
                     return Err(sva_err("`throughout` is not in the v3.0 SVA subset"));
                 }
@@ -7752,6 +8049,12 @@ fn scan_implication(t: &[Tok<'_>], start: usize) -> Result<(usize, SvaImplKind, 
                     }
                     _ => {}
                 }
+            }
+            if first_hash_delay.is_none()
+                && matches!(t[i], Tok::Sym('#'))
+                && matches!(t.get(i + 1), Some(Tok::Sym('#')))
+            {
+                first_hash_delay = Some(i);
             }
             let is_over = matches!(t[i], Tok::Sym('|'))
                 && matches!(t.get(i + 1), Some(Tok::Sym('-')))
@@ -7776,11 +8079,22 @@ fn scan_implication(t: &[Tok<'_>], start: usize) -> Result<(usize, SvaImplKind, 
 
 /// Parse one boolean side of a property from a token sub-range, via a
 /// sub-parser sharing the arena (and params/widths/signedness) with the
-/// parent. `$rose`/`$fell`/`$stable` calls become sampled nodes; any other
+/// parent. `$rose`/`$fell`/`$stable`/`$past` calls become sampled nodes; any other
 /// call is a named out-of-subset error.
 fn parse_sva_bool<'a>(p: &P<'a>, start: usize, end: usize) -> Result<SvaBool<'a>, String> {
+    parse_sva_bool_slice(p, &p.t[start..end])
+}
+
+fn parse_sva_bool_slice<'a>(p: &P<'a>, slice: &'a [Tok<'a>]) -> Result<SvaBool<'a>, String> {
+    if slice.is_empty() {
+        return Ok(SvaBool::Expr(RExpr::Const {
+            val: 1,
+            width: 1,
+            care: 1,
+        }));
+    }
     let mut sub = P {
-        t: &p.t[start..end],
+        t: slice,
         i: 0,
         arena: p.arena,
         params: p.params.clone(),
@@ -7794,10 +8108,9 @@ fn parse_sva_bool<'a>(p: &P<'a>, start: usize, end: usize) -> Result<SvaBool<'a>
     rewrite_sva_bool(&e)
 }
 
-/// Concurrent assertion:
-/// `[label:] assert [#0] property (@(posedge|negedge clk) <ante> |-> [##N] <conseq>)`
+/// Concurrent assertion or cover property:
+/// `[label:] (assert|cover) [#0] property ([@(posedge|negedge clk)] [disable iff (rst)] <ante> |-> [##N | ##[m:n]] <conseq>)`
 /// `[else $error/$warning/$info[(msg)]] ;`
-/// Everything outside the v3.0 subset is a named error, never a silent skip.
 pub(crate) fn parse_concurrent_assert<'a>(
     p: &mut P<'a>,
 ) -> Result<ConcPropAst<'a>, String> {
@@ -7813,9 +8126,13 @@ pub(crate) fn parse_concurrent_assert<'a>(
     } else {
         None
     };
-    if !p.eat_kw("assert") {
-        return Err(sva_err("expected `assert`"));
-    }
+    let is_cover = if p.eat_kw("assert") {
+        false
+    } else if p.eat_kw("cover") {
+        true
+    } else {
+        return Err(sva_err("expected `assert` or `cover`"));
+    };
     if matches!(p.peek(), Some(Tok::Sym('#'))) {
         return Err(sva_err(
             "`assert #0` (deferred assertion) is not in the v3.0 SVA subset",
@@ -7827,35 +8144,134 @@ pub(crate) fn parse_concurrent_assert<'a>(
     if !p.eat_sym('(') {
         return Err(sva_err("expected `(` after `assert property`"));
     }
-    if !p.eat_sym('@') {
+    // Find matching closing paren of `property (...)`
+    let inner_start = p.i;
+    let mut d = 1i32;
+    let mut k = inner_start;
+    while k < p.t.len() && d > 0 {
+        match &p.t[k] {
+            Tok::Sym('(') => d += 1,
+            Tok::Sym(')') => d -= 1,
+            _ => {}
+        }
+        if d == 0 {
+            break;
+        }
+        k += 1;
+    }
+    if d != 0 || k >= p.t.len() {
+        return Err(sva_err("unterminated `assert property`"));
+    }
+    let raw_slice = &p.t[inner_start..k];
+    p.i = k + 1; // consume closing ')' of property(...)
+    let (severity, else_msg) = parse_sva_else_action(p)?;
+    if !p.eat_sym(';') {
+        return Err(sva_err("expected `;` after `assert property (...)`"));
+    }
+
+    // Expand any referenced named `property` or `sequence` macros, then append a sentinel `)`
+    // so `scan_implication` sees the same closing delimiter.
+    let mut expanded = expand_sva_tokens(raw_slice, p.arena);
+    expanded.push(Tok::Sym(')'));
+    let exp_toks: &'a [Tok<'a>] = p.arena.alloc_slice_clone(&expanded);
+    let mut ep = P {
+        t: exp_toks,
+        i: 0,
+        arena: p.arena,
+        params: p.params.clone(),
+        widths: p.widths.clone(),
+        signed: p.signed.clone(),
+    };
+
+    let mut negedge = false;
+    let mut clk = "clk".to_string();
+    if ep.eat_sym('@') {
+        if !ep.eat_sym('(') {
+            return Err(sva_err("expected `(` after `@`"));
+        }
+        negedge = if ep.eat_kw("posedge") {
+            false
+        } else if ep.eat_kw("negedge") {
+            true
+        } else {
+            return Err(sva_err("expected `posedge`/`negedge` in `@(...)`"));
+        };
+        clk = ep
+            .ident()
+            .map_err(|_| sva_err("expected clock name in `@(...)`"))?
+            .to_string();
+        if !ep.eat_sym(')') {
+            return Err(sva_err("expected `)` after the clock name"));
+        }
+    } else if raw_slice.len() == exp_toks.len() - 1 {
+        // Inline property without macro expansion requires `@(posedge clk)`
         return Err(sva_err(
             "expected `@(posedge clk)` after `assert property (`",
         ));
     }
-    if !p.eat_sym('(') {
-        return Err(sva_err("expected `(` after `@`"));
+
+    // Optional `disable iff (rst_expr)`
+    let mut disable_iff: Option<SvaBool<'a>> = None;
+    if ep.eat_kw("disable") || matches!(ep.peek(), Some(Tok::Ident(s)) if *s == "disable") {
+        if !matches!(ep.t.get(ep.i - 1), Some(Tok::Kw("disable"))) {
+            ep.bump();
+        }
+        if !(ep.eat_kw("iff") || matches!(ep.peek(), Some(Tok::Ident(s)) if *s == "iff" && { ep.bump(); true })) {
+            return Err(sva_err("expected `iff` after `disable`"));
+        }
+        if !ep.eat_sym('(') {
+            return Err(sva_err("expected `(` after `disable iff`"));
+        }
+        let dis_start = ep.i;
+        let mut dd = 1i32;
+        let mut di = dis_start;
+        while di < ep.t.len() && dd > 0 {
+            match &ep.t[di] {
+                Tok::Sym('(') => dd += 1,
+                Tok::Sym(')') => dd -= 1,
+                _ => {}
+            }
+            if dd == 0 {
+                break;
+            }
+            di += 1;
+        }
+        if dd != 0 {
+            return Err(sva_err("unterminated `disable iff (...)`"));
+        }
+        disable_iff = Some(parse_sva_bool_slice(&ep, &ep.t[dis_start..di])?);
+        ep.i = di + 1;
+        // Allow `@(posedge clk)` after `disable iff (...)` as well
+        if ep.eat_sym('@') {
+            if !ep.eat_sym('(') {
+                return Err(sva_err("expected `(` after `@`"));
+            }
+            negedge = if ep.eat_kw("posedge") {
+                false
+            } else if ep.eat_kw("negedge") {
+                true
+            } else {
+                return Err(sva_err("expected `posedge`/`negedge` in `@(...)`"));
+            };
+            clk = ep
+                .ident()
+                .map_err(|_| sva_err("expected clock name in `@(...)`"))?
+                .to_string();
+            if !ep.eat_sym(')') {
+                return Err(sva_err("expected `)` after the clock name"));
+            }
+        }
     }
-    let negedge = if p.eat_kw("posedge") {
-        false
-    } else if p.eat_kw("negedge") {
-        true
-    } else {
-        return Err(sva_err("expected `posedge`/`negedge` in `@(...)`"));
-    };
-    let clk = p
-        .ident()
-        .map_err(|_| sva_err("expected clock name in `@(...)`"))?
-        .to_string();
-    if !p.eat_sym(')') {
-        return Err(sva_err("expected `)` after the clock name"));
-    }
-    let prop_start = p.i;
-    let (impl_idx, kind, end_idx) = scan_implication(p.t, p.i)?;
-    // `##` delays live only right after the implication: reject them in the
-    // antecedent (e.g. `a ##1 b |-> c`).
-    {
+
+    let prop_start = ep.i;
+    let (impl_idx, kind, end_idx) = scan_implication(ep.t, ep.i, is_cover)?;
+    let is_hash_seq = matches!(ep.t.get(impl_idx), Some(Tok::Sym('#')));
+    let is_cover_expr_only = is_cover && impl_idx == prop_start && !is_hash_seq;
+    if !is_hash_seq && !is_cover_expr_only {
+        // `##` delays live only right after the implication: reject them in the
+        // antecedent (e.g. `a ##1 b |-> c`).
         let mut d = 0i32;
-        for t in &p.t[prop_start..impl_idx] {
+        for t in &ep.t[prop_start..impl_idx] {
             match t {
                 Tok::Sym('(') => d += 1,
                 Tok::Sym(')') => d -= 1,
@@ -7868,20 +8284,45 @@ pub(crate) fn parse_concurrent_assert<'a>(
             }
         }
     }
-    let mut j = impl_idx + 3;
-    let mut delay: u32 = match kind {
+    let mut j = if is_hash_seq || is_cover_expr_only {
+        impl_idx
+    } else {
+        impl_idx + 3
+    };
+    let base_delay: u32 = match kind {
         SvaImplKind::Overlapped => 0,
         SvaImplKind::NonOverlapped => 1,
     };
+    let mut delay: u32 = base_delay;
+    let mut delay_max: u32 = base_delay;
     let mut delay_lit: Option<u32> = None;
-    if matches!(p.t.get(j), Some(Tok::Sym('#'))) {
-        if !matches!(p.t.get(j + 1), Some(Tok::Sym('#'))) {
+    if matches!(ep.t.get(j), Some(Tok::Sym('#'))) {
+        if !matches!(ep.t.get(j + 1), Some(Tok::Sym('#'))) {
             return Err(sva_err("expected `##N` after the implication"));
         }
         j += 2;
-        match p.t.get(j) {
+        match ep.t.get(j) {
             Some(Tok::Sym('[')) => {
-                return Err(sva_err("`##[N:M]` delays are not in the v3.0 SVA subset"));
+                // `##[m:n]` bounded delay range
+                let Some(Tok::Number(m_val, _)) = ep.t.get(j + 1) else {
+                    return Err(sva_err("expected constant lower bound in `##[m:n]`"));
+                };
+                if !matches!(ep.t.get(j + 2), Some(Tok::Sym(':'))) {
+                    return Err(sva_err("expected `:` in `##[m:n]`"));
+                }
+                let Some(Tok::Number(n_val, _)) = ep.t.get(j + 3) else {
+                    return Err(sva_err("expected constant upper bound in `##[m:n]`"));
+                };
+                if !matches!(ep.t.get(j + 4), Some(Tok::Sym(']'))) {
+                    return Err(sva_err("expected `]` after `##[m:n]`"));
+                }
+                if *m_val > 256 || *n_val > 256 || *m_val > *n_val {
+                    return Err(sva_err("`##[m:n]` bounds must satisfy 0 <= m <= n <= 256"));
+                }
+                delay = base_delay + (*m_val as u32);
+                delay_max = base_delay + (*n_val as u32);
+                delay_lit = Some(*m_val as u32);
+                j += 5;
             }
             Some(Tok::Sym('*')) => {
                 return Err(sva_err("`##*` (unbounded delay) is not in the v3.0 SVA subset"));
@@ -7893,7 +8334,8 @@ pub(crate) fn parse_concurrent_assert<'a>(
                 if *n > 256 {
                     return Err(sva_err("`##N` with N > 256 is not in the v3.0 SVA subset"));
                 }
-                delay += *n as u32;
+                delay = base_delay + (*n as u32);
+                delay_max = delay;
                 delay_lit = Some(*n as u32);
                 j += 1;
             }
@@ -7907,7 +8349,7 @@ pub(crate) fn parse_concurrent_assert<'a>(
     // No chained or stray `##` in the consequent: it is a pure boolean expr.
     {
         let mut d = 0i32;
-        for t in &p.t[j..end_idx] {
+        for t in &ep.t[j..end_idx] {
             match t {
                 Tok::Sym('(') => d += 1,
                 Tok::Sym(')') => d -= 1,
@@ -7920,13 +8362,16 @@ pub(crate) fn parse_concurrent_assert<'a>(
             }
         }
     }
-    let antecedent = parse_sva_bool(p, prop_start, impl_idx)?;
-    let consequent = parse_sva_bool(p, j, end_idx)?;
-    p.i = end_idx + 1; // consume the property's closing paren
-    let (severity, else_msg) = parse_sva_else_action(p)?;
-    if !p.eat_sym(';') {
-        return Err(sva_err("expected `;` after `assert property (...)`"));
-    }
+    let antecedent = if is_cover_expr_only {
+        SvaBool::Expr(RExpr::Const {
+            val: 1,
+            width: 1,
+            care: 1,
+        })
+    } else {
+        parse_sva_bool_slice(&ep, &ep.t[prop_start..impl_idx])?
+    };
+    let consequent = parse_sva_bool_slice(&ep, &ep.t[j..end_idx])?;
     let text = conc_text(
         &clk,
         negedge,
@@ -7941,8 +8386,11 @@ pub(crate) fn parse_concurrent_assert<'a>(
         label,
         clk,
         negedge,
+        is_cover,
+        disable_iff,
         antecedent,
         delay,
+        delay_max,
         consequent,
         severity,
         else_msg,
@@ -8323,6 +8771,18 @@ fn parse_preprocessed(pre: String) -> Result<Vec<Rtl<'static>>, String> {
             skip_until_kw(&mut p, "endtask");
             continue;
         }
+        if p.eat_kw("sequence") {
+            harvest_sva_macro(&mut p, "endsequence", false);
+            continue;
+        }
+        if p.eat_kw("property") {
+            harvest_sva_macro(&mut p, "endproperty", true);
+            continue;
+        }
+        if p.eat_kw("bind") {
+            parse_bind_directive(&mut p);
+            continue;
+        }
         match p.peek() {
             Some(Tok::Kw(k)) if *k == "module" => match parse_one_module(&mut p) {
                 Ok(m) => mods.push(m),
@@ -8337,6 +8797,7 @@ fn parse_preprocessed(pre: String) -> Result<Vec<Rtl<'static>>, String> {
     if mods.is_empty() {
         return Err("no module".into());
     }
+    apply_bind_directives(&mut mods, arena);
     Ok(mods)
 }
 
@@ -9657,6 +10118,14 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
     // inline into nbas/assigns (`q <= inv(d)`). Complex bodies stay skipped
     // without re-entry (Ibex mhpmcounter_get / PMP).
     let skipped = skipped_funcs_take();
+    materialize_sampled_calls_in_module(
+        module,
+        &mut p,
+        &ports,
+        &mut signals,
+        &mut nbas,
+        &mut assigns,
+    );
     let mut called = HashSet::new();
     for (_, _, rhs) in nbas.iter().chain(assigns.iter()) {
         collect_calls(rhs, &mut called);
@@ -9718,6 +10187,7 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
         assigns.clear();
         mem_inits.clear();
     }
+    synthesize_sva_monitors(module, &mut p, &ports, &mut signals, &mut nbas, &sva_conc);
     let toks = p.t[tok_start..p.i].to_vec();
     Ok(Rtl {
         module,
@@ -9734,6 +10204,345 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
         sva_conc,
         sva_imm,
     })
+}
+
+fn default_module_clk<'a>(module: &str, ports: &[(&'a str, PortDir, usize)]) -> String {
+    edge_clk_of(module)
+        .or_else(|| {
+            ports
+                .iter()
+                .find(|(n, dir, _)| *dir == PortDir::In && (*n == "clk" || n.contains("clk")))
+                .or_else(|| ports.iter().find(|(_, dir, _)| *dir == PortDir::In))
+                .map(|(n, _, _)| n.to_string())
+        })
+        .unwrap_or_else(|| "clk".to_string())
+}
+
+fn materialize_sampled_rexpr<'a>(
+    module: &str,
+    clk: &str,
+    p: &P<'a>,
+    signals: &mut Vec<Signal<'a>>,
+    nbas: &mut Vec<Nba<'a>>,
+    e: &RExpr<'a>,
+) -> RExpr<'a> {
+    match e {
+        RExpr::Call { name, args }
+            if matches!(*name, "$past" | "$rose" | "$fell" | "$stable") && !args.is_empty() =>
+        {
+            let inner = materialize_sampled_rexpr(module, clk, p, signals, nbas, &args[0]);
+            let w = match &inner {
+                RExpr::Ident(s) => signals
+                    .iter()
+                    .find(|sg| sg.name == *s)
+                    .map(|sg| sg.width)
+                    .or_else(|| p.widths.get(*s).copied())
+                    .unwrap_or(1)
+                    .max(1),
+                RExpr::Range(_, lo, hi) => (*hi).abs_diff(*lo).saturating_add(1).max(1),
+                _ => 1,
+            };
+            let stages = if *name == "$past" && args.len() >= 2 {
+                match &args[1] {
+                    RExpr::Const { val, .. } => (*val as usize).clamp(1, 32),
+                    _ => 1,
+                }
+            } else {
+                1
+            };
+            let id = next_sva_mon_id();
+            let mut prev_expr = inner.clone();
+            let mut last_stage_name: &'a str = "";
+            for st in 1..=stages {
+                let sname: &'a str = p.arena.alloc_str(&format!("__sva_past_{id}_s{st}"));
+                signals.push(Signal {
+                    name: sname,
+                    width: w,
+                    depth: 0,
+                    keep: true,
+                    mark_debug: false,
+                    force_bram: false,
+                });
+                if w > 1 {
+                    for b in 0..w {
+                        nbas.push((sname, Some(b), bit_extract(prev_expr.clone(), b, p.arena)));
+                    }
+                } else {
+                    nbas.push((sname, None, prev_expr));
+                }
+                note_seq_write(module, clk, sname);
+                prev_expr = RExpr::Ident(sname);
+                last_stage_name = sname;
+            }
+            let past_ident = RExpr::Ident(last_stage_name);
+            match *name {
+                "$past" => past_ident,
+                "$rose" => RExpr::And(p.alloc(RExpr::Not(p.alloc(past_ident))), p.alloc(inner)),
+                "$fell" => RExpr::And(p.alloc(past_ident), p.alloc(RExpr::Not(p.alloc(inner)))),
+                "$stable" => RExpr::Eq(p.alloc(past_ident), p.alloc(inner)),
+                _ => unreachable!(),
+            }
+        }
+        other => map_rexpr_children(
+            other,
+            &mut |c| materialize_sampled_rexpr(module, clk, p, signals, nbas, c),
+            p.arena,
+        ),
+    }
+}
+
+fn rexpr_has_sampled_call<'x, 'e>(e: &'e RExpr<'x>) -> bool
+where
+    'x: 'e,
+{
+    let mut calls = HashSet::new();
+    collect_calls(e, &mut calls);
+    calls
+        .iter()
+        .any(|c| matches!(*c, "$past" | "$rose" | "$fell" | "$stable"))
+}
+
+fn materialize_sampled_calls_in_module<'a>(
+    module: &str,
+    p: &mut P<'a>,
+    ports: &[(&'a str, PortDir, usize)],
+    signals: &mut Vec<Signal<'a>>,
+    nbas: &mut Vec<Nba<'a>>,
+    assigns: &mut Vec<Nba<'a>>,
+) {
+    if !nbas.iter().any(|(_, _, r)| rexpr_has_sampled_call(r))
+        && !assigns.iter().any(|(_, _, r)| rexpr_has_sampled_call(r))
+    {
+        return;
+    }
+    let clk = default_module_clk(module, ports);
+    let mut new_sampled_nbas: Vec<Nba<'a>> = Vec::new();
+    for (_, _, rhs) in nbas.iter_mut() {
+        if rexpr_has_sampled_call(rhs) {
+            *rhs = materialize_sampled_rexpr(module, &clk, p, signals, &mut new_sampled_nbas, rhs);
+        }
+    }
+    for (_, _, rhs) in assigns.iter_mut() {
+        if rexpr_has_sampled_call(rhs) {
+            *rhs = materialize_sampled_rexpr(module, &clk, p, signals, &mut new_sampled_nbas, rhs);
+        }
+    }
+    for sig in signals.iter() {
+        note_width(p, sig.name, sig.width);
+    }
+    nbas.extend(new_sampled_nbas);
+}
+
+fn svabool_all_names_known<'a>(
+    b: &SvaBool<'a>,
+    signals: &[Signal<'a>],
+    ports: &[(&'a str, PortDir, usize)],
+) -> bool {
+    match b {
+        SvaBool::Expr(e) => {
+            let mut names = HashSet::new();
+            rexpr_names(e, &mut names);
+            names.into_iter().all(|n| {
+                !n.contains('.')
+                    && (signals.iter().any(|s| s.name == n)
+                        || ports.iter().any(|(pn, _, _)| *pn == n))
+            })
+        }
+        SvaBool::Not(x) | SvaBool::Sampled { arg: x, .. } => {
+            svabool_all_names_known(x, signals, ports)
+        }
+        SvaBool::And(x, y) | SvaBool::Or(x, y) => {
+            svabool_all_names_known(x, signals, ports)
+                && svabool_all_names_known(y, signals, ports)
+        }
+    }
+}
+
+fn svabool_to_rexpr<'a>(
+    module: &str,
+    clk: &str,
+    p: &P<'a>,
+    signals: &mut Vec<Signal<'a>>,
+    nbas: &mut Vec<Nba<'a>>,
+    b: &SvaBool<'a>,
+) -> RExpr<'a> {
+    match b {
+        SvaBool::Expr(e) => materialize_sampled_rexpr(module, clk, p, signals, nbas, e),
+        SvaBool::Not(x) => {
+            let rx = svabool_to_rexpr(module, clk, p, signals, nbas, x);
+            RExpr::Not(p.alloc(rx))
+        }
+        SvaBool::And(x, y) => {
+            let rx = svabool_to_rexpr(module, clk, p, signals, nbas, x);
+            let ry = svabool_to_rexpr(module, clk, p, signals, nbas, y);
+            RExpr::And(p.alloc(rx), p.alloc(ry))
+        }
+        SvaBool::Or(x, y) => {
+            let rx = svabool_to_rexpr(module, clk, p, signals, nbas, x);
+            let ry = svabool_to_rexpr(module, clk, p, signals, nbas, y);
+            RExpr::Or(p.alloc(rx), p.alloc(ry))
+        }
+        SvaBool::Sampled { func, arg } => {
+            let inner = svabool_to_rexpr(module, clk, p, signals, nbas, arg);
+            let call = match func {
+                sva::SvaSampleFn::Rose => RExpr::Call {
+                    name: "$rose",
+                    args: vec![inner],
+                },
+                sva::SvaSampleFn::Fell => RExpr::Call {
+                    name: "$fell",
+                    args: vec![inner],
+                },
+                sva::SvaSampleFn::Stable => RExpr::Call {
+                    name: "$stable",
+                    args: vec![inner],
+                },
+                sva::SvaSampleFn::Past(n) => RExpr::Call {
+                    name: "$past",
+                    args: vec![
+                        inner,
+                        RExpr::Const {
+                            val: *n as u128,
+                            width: 32,
+                            care: u128::MAX,
+                        },
+                    ],
+                },
+            };
+            materialize_sampled_rexpr(module, clk, p, signals, nbas, &call)
+        }
+    }
+}
+
+fn synthesize_sva_monitors<'a>(
+    module: &str,
+    p: &mut P<'a>,
+    ports: &[(&'a str, PortDir, usize)],
+    signals: &mut Vec<Signal<'a>>,
+    nbas: &mut Vec<Nba<'a>>,
+    sva_conc: &[ConcPropAst<'a>],
+) {
+    for ast in sva_conc {
+        if ast.negedge {
+            continue;
+        }
+        if !svabool_all_names_known(&ast.antecedent, signals, ports)
+            || !svabool_all_names_known(&ast.consequent, signals, ports)
+            || ast
+                .disable_iff
+                .as_ref()
+                .is_some_and(|d| !svabool_all_names_known(d, signals, ports))
+        {
+            continue;
+        }
+        let clk = ast.clk.as_str();
+        let id = next_sva_mon_id();
+        let ant_r = svabool_to_rexpr(module, clk, p, signals, nbas, &ast.antecedent);
+        let conseq_r = svabool_to_rexpr(module, clk, p, signals, nbas, &ast.consequent);
+        let not_rst = ast.disable_iff.as_ref().map(|d| {
+            let dr = svabool_to_rexpr(module, clk, p, signals, nbas, d);
+            RExpr::Not(p.alloc(dr))
+        });
+        let gate_rst = |expr: RExpr<'a>| -> RExpr<'a> {
+            if let Some(nr) = &not_rst {
+                RExpr::And(p.alloc(nr.clone()), p.alloc(expr))
+            } else {
+                expr
+            }
+        };
+        let ant_gated = gate_rst(ant_r);
+        let mut stage_exprs: Vec<RExpr<'a>> = vec![ant_gated.clone()];
+        for st in 1..=(ast.delay_max as usize) {
+            let sname: &'a str = p.arena.alloc_str(&format!("__sva_mon_{id}_p{st}"));
+            signals.push(Signal {
+                name: sname,
+                width: 1,
+                depth: 0,
+                keep: true,
+                mark_debug: false,
+                force_bram: false,
+            });
+            let prev = stage_exprs[st - 1].clone();
+            nbas.push((sname, None, gate_rst(prev)));
+            note_seq_write(module, clk, sname);
+            stage_exprs.push(RExpr::Ident(sname));
+        }
+        let d_min = (ast.delay as usize).min(stage_exprs.len() - 1);
+        let d_max = (ast.delay_max as usize).min(stage_exprs.len() - 1);
+        let mut window_trig = stage_exprs[d_min].clone();
+        for d in (d_min + 1)..=d_max {
+            window_trig = RExpr::Or(p.alloc(window_trig), p.alloc(stage_exprs[d].clone()));
+        }
+        let status_d = if ast.is_cover {
+            gate_rst(RExpr::And(p.alloc(window_trig), p.alloc(conseq_r)))
+        } else {
+            gate_rst(RExpr::Or(
+                p.alloc(RExpr::Not(p.alloc(window_trig))),
+                p.alloc(conseq_r),
+            ))
+        };
+        let status_name: &'a str = p.arena.alloc_str(&format!("__sva_mon_{id}_status_q"));
+        signals.push(Signal {
+            name: status_name,
+            width: 1,
+            depth: 0,
+            keep: true,
+            mark_debug: false,
+            force_bram: false,
+        });
+        nbas.push((status_name, None, status_d));
+        note_seq_write(module, clk, status_name);
+    }
+    for sig in signals.iter() {
+        note_width(p, sig.name, sig.width);
+    }
+}
+
+fn apply_bind_directives<'a>(mods: &mut [Rtl<'a>], arena: &'a Bump) {
+    let directives = BIND_DIRECTIVES.with(|b| b.borrow().clone());
+    if directives.is_empty() {
+        return;
+    }
+    let mod_ports: HashMap<String, Vec<String>> = mods
+        .iter()
+        .map(|m| {
+            (
+                m.module.to_string(),
+                m.ports.iter().map(|(pn, _, _)| pn.to_string()).collect(),
+            )
+        })
+        .collect();
+    for bd in directives {
+        let Some(cports) = mod_ports.get(&bd.checker_module) else {
+            continue;
+        };
+        for m in mods.iter_mut() {
+            if m.module != bd.target_module.as_str() {
+                continue;
+            }
+            if m.insts.iter().any(|i| i.name == bd.inst_name.as_str()) {
+                continue;
+            }
+            let mut conns: Vec<(&'a str, &'a str)> = Vec::new();
+            for (p, n) in &bd.conns {
+                conns.push((arena.alloc_str(p), arena.alloc_str(n)));
+            }
+            if bd.wildcard {
+                for cp in cports {
+                    if !bd.conns.iter().any(|(p, _)| p == cp) {
+                        let s = arena.alloc_str(cp);
+                        conns.push((s, s));
+                    }
+                }
+            }
+            m.insts.push(Inst {
+                module: arena.alloc_str(&bd.checker_module),
+                name: arena.alloc_str(&bd.inst_name),
+                conns,
+                params: bd.params.clone(),
+            });
+        }
+    }
 }
 
 /// `wire`/`logic name = expr` (assignment may start on the next line).
@@ -10542,10 +11351,20 @@ fn parse_module_items<'a>(
             let _ = skip_item_or_block(p);
             continue;
         }
-        // SVA concurrent assertions (v3.0 subset): `[label:] assert property`.
-        // `assume` / `cover` keep their historical silent skip; `expect` and
-        // every other out-of-subset construct get a named rejection.
-        if peek_assert_stmt(p) {
+        if p.eat_kw("sequence") {
+            harvest_sva_macro(p, "endsequence", false);
+            continue;
+        }
+        if p.eat_kw("property") {
+            harvest_sva_macro(p, "endproperty", true);
+            continue;
+        }
+        if p.eat_kw("bind") {
+            parse_bind_directive(p);
+            continue;
+        }
+        // SVA concurrent assertions: `[label:] (assert|cover) property`.
+        if peek_assert_stmt(p) || peek_cover_property_stmt(p) {
             match parse_concurrent_assert(p) {
                 Ok(ast) => sva_conc.push(ast),
                 Err(e) => return Err(e),
