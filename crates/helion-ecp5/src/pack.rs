@@ -1048,9 +1048,9 @@ mod tests {
     fn lut6_cell(d: &mut Design, name: &str, init: u64, inputs: &[&str]) {
         d.add_cell(name, CellKind::Lut6 { init });
         for (i, net) in inputs.iter().enumerate() {
-            d.connect(*net, name, format!("I{i}"));
+            d.connect(*net, name, &format!("I{i}"));
         }
-        d.connect(format!("{name}$o"), name, "O");
+        d.connect(&format!("{name}$o"), name, "O");
     }
 
     #[test]
@@ -1162,7 +1162,7 @@ mod tests {
         for (i, f) in ["f1", "f2"].iter().enumerate() {
             d.add_cell(*f, CellKind::Hff);
             d.connect("g$o", *f, "D");
-            d.connect(format!("q{i}"), *f, "Q");
+            d.connect(&format!("q{i}"), *f, "Q");
             d.connect("clk", *f, "CLK");
         }
         let p = pack(&d).unwrap();
@@ -1181,9 +1181,9 @@ mod tests {
         }
         d.add_cell("c0", CellKind::Carry4);
         for i in 0..4 {
-            d.connect(format!("s{i}$o"), "c0", format!("S{i}"));
-            d.connect(format!("a{i}"), "c0", format!("DI{i}"));
-            d.connect(format!("sum{i}"), "c0", format!("O{i}"));
+            d.connect(&format!("s{i}$o"), "c0", &format!("S{i}"));
+            d.connect(&format!("a{i}"), "c0", &format!("DI{i}"));
+            d.connect(&format!("sum{i}"), "c0", &format!("O{i}"));
         }
         if cin_one {
             d.connect("1", "c0", "CYINIT");
@@ -1302,9 +1302,9 @@ mod tests {
             d.add_cell(*nm, CellKind::Carry4);
             for b in 0..4 {
                 let i = idx * 4 + b;
-                d.connect(format!("s{i}$o"), *nm, format!("S{b}"));
-                d.connect(format!("a{i}"), *nm, format!("DI{b}"));
-                d.connect(format!("sum{i}"), *nm, format!("O{b}"));
+                d.connect(&format!("s{i}$o"), *nm, &format!("S{b}"));
+                d.connect(&format!("a{i}"), *nm, &format!("DI{b}"));
+                d.connect(&format!("sum{i}"), *nm, &format!("O{b}"));
             }
         }
         // c1.CI <- c0.CO3.
@@ -1405,7 +1405,7 @@ mod tests {
     #[test]
     fn pll_passes_dividers_through() {
         let mut d = Design::new("p");
-        d.add_cell("pll0", CellKind::BlackBox { module: "EHXPLLL".to_string() });
+        d.add_cell("pll0", CellKind::BlackBox { module: intern("EHXPLLL") });
         d.connect("clki", "pll0", "CLKI");
         d.connect("clkop", "pll0", "CLKOP");
         d.set_cell_attr("pll0", "CLKI_DIV", "1").unwrap();
@@ -1430,7 +1430,7 @@ mod tests {
     #[test]
     fn pll_missing_dividers_is_loud_error() {
         let mut d = Design::new("p");
-        d.add_cell("pll0", CellKind::BlackBox { module: "PLLB".to_string() });
+        d.add_cell("pll0", CellKind::BlackBox { module: intern("PLLB") });
         d.connect("clki", "pll0", "CLKI");
         d.connect("clkop", "pll0", "CLKOP");
         let e = pack(&d).unwrap_err();
@@ -1440,7 +1440,7 @@ mod tests {
     #[test]
     fn unknown_blackbox_is_loud_error() {
         let mut d = Design::new("b");
-        d.add_cell("x", CellKind::BlackBox { module: "MYSTERY".to_string() });
+        d.add_cell("x", CellKind::BlackBox { module: intern("MYSTERY") });
         let e = pack(&d).unwrap_err();
         assert!(e.contains("MYSTERY"), "unexpected error: {e}");
     }
@@ -1448,7 +1448,7 @@ mod tests {
     #[test]
     fn ila_is_loud_error() {
         let mut d = Design::new("i");
-        d.add_cell("ila0", CellKind::Ila { net: "probe".to_string() });
+        d.add_cell("ila0", CellKind::Ila { net: intern("probe") });
         assert!(pack(&d).is_err());
     }
 
@@ -1574,7 +1574,7 @@ mod tests {
     fn over_capacity_ebr_is_loud_error() {
         let mut d = Design::new("t");
         for i in 0..213 {
-            d.add_cell(format!("r{i}"), CellKind::Bram18);
+            d.add_cell(&format!("r{i}"), CellKind::Bram18);
         }
         let e = pack(&d).unwrap_err();
         assert!(e.contains("over capacity"), "unexpected error: {e}");
@@ -1591,7 +1591,7 @@ mod tests {
             d.set_port_attr(&port, "LOC", "A10").unwrap();
             let cell = format!("ob{i}");
             d.add_cell(&cell, CellKind::IobOut);
-            d.connect(format!("n{i}"), &cell, "I");
+            d.connect(&format!("n{i}"), &cell, "I");
             d.connect(&port, &cell, "PAD");
         }
         let e = pack(&d).unwrap_err();
@@ -1604,9 +1604,9 @@ mod tests {
         let mut d = Design::new("t");
         for i in 0..7 {
             let cell = format!("pll{i}");
-            d.add_cell(&cell, CellKind::BlackBox { module: "EHXPLLL".to_string() });
-            d.connect(format!("r{i}"), &cell, "CLKI");
-            d.connect(format!("o{i}"), &cell, "CLKOP");
+            d.add_cell(&cell, CellKind::BlackBox { module: intern("EHXPLLL") });
+            d.connect(&format!("r{i}"), &cell, "CLKI");
+            d.connect(&format!("o{i}"), &cell, "CLKOP");
             d.set_cell_attr(&cell, "CLKI_DIV", "1").unwrap();
             d.set_cell_attr(&cell, "CLKOP_DIV", "8").unwrap();
         }
@@ -1622,7 +1622,7 @@ mod tests {
         for i in 0..83_641 {
             let cell = format!("c{i}");
             d.add_cell(&cell, CellKind::Lut6 { init: 0 });
-            d.connect(format!("o{i}"), &cell, "O");
+            d.connect(&format!("o{i}"), &cell, "O");
         }
         let e = pack(&d).unwrap_err();
         assert!(e.contains("over capacity"), "unexpected error: {e}");

@@ -559,7 +559,7 @@ pub fn place_with_guide(
         let mut xs_seen: HashSet<u32> = HashSet::new();
         let mut y_seen: HashSet<u32> = HashSet::new();
         // FF cell → site as we place (IMUX: same-CLB / N-S±1/±2 / E-W±1/±2 / diag±1 / knight).
-        let mut ff_at: std::collections::HashMap<String, Site> = std::collections::HashMap::new();
+        let mut ff_at: std::collections::HashMap<&str, Site> = std::collections::HashMap::new();
         let mut excepted_iob: HashSet<usize> = HashSet::new();
         // Seed sweeps: process LUTFFs in a seeded order so different seeds
         // explore genuinely different placements. Seed 0 = legacy order.
@@ -787,7 +787,7 @@ pub fn place_with_guide(
             }
             *site_used_n.entry((site_ble.0.x, site_ble.0.y)).or_insert(0) += 1;
             if !lf.ff_cell.is_empty() {
-                ff_at.insert(lf.ff_cell.clone(), site_ble.0);
+                ff_at.insert(lf.ff_cell.as_str(), site_ble.0);
             }
             if excepted_iob_cluster {
                 excepted_iob.insert(li);
@@ -881,7 +881,10 @@ pub fn place_with_guide(
             }
         }
         // Reused across cells/passes to cut HashSet/Vec alloc churn.
-        let mut cand_seen: HashSet<(u32, u32)> = HashSet::new();
+        let stamp_gx = (max_x as usize).saturating_add(16);
+        let stamp_gy = (max_y as usize).saturating_add(16);
+        let mut cand_stamp: Vec<u32> = vec![0; stamp_gx.saturating_mul(stamp_gy)];
+        let mut cand_epoch: u32 = 0;
         let mut cand_xy: Vec<(u32, u32)> = Vec::with_capacity(128);
         let mut remaining_sinks: Vec<usize> = Vec::with_capacity(nplace);
         let mut remaining_drvs: Vec<usize> = Vec::with_capacity(nplace);
@@ -1044,7 +1047,7 @@ pub fn place_with_guide(
             let mut pass_drv_swapped = 0u32;
             // --- Phase A: pull sinks toward drivers (existing) ---
             for &i in &remaining_sinks {
-                let lf = &packed.lutffs[i];
+                let _lf = &packed.lutffs[i];
                 let (cur_site, cur_ble) = lutff_sites[i];
                 let before_sc = imux_score_idx(&pin_drv[i], cur_site, &lutff_sites, None, None);
                 let before = before_sc.0;
@@ -1072,32 +1075,49 @@ pub fn place_with_guide(
                         push_gradient(&mut cand_xy, cur_site.x, cur_site.y, ds.x, ds.y);
                     }
                 }
-                cand_seen.clear();
-                cand_xy.retain(|xy| cand_seen.insert(*xy));
+                cand_epoch = cand_epoch.wrapping_add(1);
+                if cand_epoch == 0 {
+                    cand_stamp.fill(0);
+                    cand_epoch = 1;
+                }
+                let ep = cand_epoch;
+                cand_xy.retain(|&(x, y)| {
+                    let ux = x as usize;
+                    let uy = y as usize;
+                    if ux < stamp_gx && uy < stamp_gy {
+                        let slot = &mut cand_stamp[uy * stamp_gx + ux];
+                        if *slot == ep {
+                            false
+                        } else {
+                            *slot = ep;
+                            true
+                        }
+                    } else {
+                        false
+                    }
+                });
                 let skip = (cur_site.x, cur_site.y, cur_ble);
-                // 1) Prefer empty BLE: score is site-only (BLE-independent) — once/site.
+                // 1) Prefer empty BLE: check free BLE in O(1) before scoring site.
                 let mut best: Option<(Site, u8, (u32, u32))> = None;
                 for (cx, cy) in &cand_xy {
                     let Some(site) = grid.site_xy(*cx, *cy) else {
+                        continue;
+                    };
+                    let Some(ble) = grid.first_free_ble(site.x, site.y, skip) else {
                         continue;
                     };
                     let sc = imux_score_idx(&pin_drv[i], site, &lutff_sites, None, None);
                     if sc >= before_sc || best.as_ref().map(|b| sc >= b.2).unwrap_or(false) {
                         continue;
                     }
-                    if let Some(ble) = grid.first_free_ble(site.x, site.y, skip) {
-                        best = Some((site, ble, sc));
-                        if sc.0 == 0 {
-                            break;
-                        }
+                    best = Some((site, ble, sc));
+                    if sc.0 == 0 {
+                        break;
                     }
                 }
                 if let Some((site, ble, _)) = best {
                     grid.relocate(skip, (site.x, site.y, ble), i);
                     lutff_sites[i] = (site, ble);
-                    if !lf.ff_cell.is_empty() {
-                        ff_at.insert(lf.ff_cell.clone(), site);
-                    }
                     pass_moved += 1;
                     continue;
                 }
@@ -1126,6 +1146,9 @@ pub fn place_with_guide(
                         let ov_a = Some((i, site));
                         let ov_b = Some((j, cur_site));
                         let sc_i = imux_score_idx(&pin_drv[i], site, &lutff_sites, ov_a, ov_b);
+                        if sc_i.0 > before + other_before_sc.0 {
+                            continue;
+                        }
                         let sc_j = imux_score_idx(&pin_drv[j], cur_site, &lutff_sites, ov_a, ov_b);
                         let after = (sc_i.0 + sc_j.0, sc_i.1 + sc_j.1);
                         let before_tot =
@@ -1154,12 +1177,7 @@ pub fn place_with_guide(
                     );
                     lutff_sites[i] = (site, ble);
                     lutff_sites[j] = (cur_site, cur_ble);
-                    if !lf.ff_cell.is_empty() {
-                        ff_at.insert(lf.ff_cell.clone(), site);
-                    }
-                    if !packed.lutffs[j].ff_cell.is_empty() {
-                        ff_at.insert(packed.lutffs[j].ff_cell.clone(), cur_site);
-                    }
+                    // ff_at is not used after initial affinity placement.
                     pass_swapped += 1;
                 }
             }
@@ -1171,7 +1189,6 @@ pub fn place_with_guide(
                 if lf.ff_cell.is_empty() {
                     continue;
                 }
-                let d_ff = lf.ff_cell.as_str();
                 let sink_idxs = sinks_of[i].as_slice();
                 if sink_idxs.is_empty() {
                     continue;
@@ -1213,13 +1230,35 @@ pub fn place_with_guide(
                         push_gradient(&mut cand_xy, cur_site.x, cur_site.y, x, y);
                     }
                 }
-                cand_seen.clear();
-                cand_xy.retain(|xy| cand_seen.insert(*xy));
+                cand_epoch = cand_epoch.wrapping_add(1);
+                if cand_epoch == 0 {
+                    cand_stamp.fill(0);
+                    cand_epoch = 1;
+                }
+                let ep = cand_epoch;
+                cand_xy.retain(|&(x, y)| {
+                    let ux = x as usize;
+                    let uy = y as usize;
+                    if ux < stamp_gx && uy < stamp_gy {
+                        let slot = &mut cand_stamp[uy * stamp_gx + ux];
+                        if *slot == ep {
+                            false
+                        } else {
+                            *slot = ep;
+                            true
+                        }
+                    } else {
+                        false
+                    }
+                });
                 let skip = (cur_site.x, cur_site.y, cur_ble);
-                // 1) Empty BLE move for driver — score site-only once (BLE-independent).
+                // 1) Empty BLE move for driver — check free BLE in O(1) before scoring site.
                 let mut best: Option<(Site, u8, (u32, u32, u32))> = None;
                 for (cx, cy) in &cand_xy {
                     let Some(site) = grid.site_xy(*cx, *cy) else {
+                        continue;
+                    };
+                    let Some(ble) = grid.first_free_ble(site.x, site.y, skip) else {
                         continue;
                     };
                     let sc = drv_score_idx(
@@ -1234,17 +1273,14 @@ pub fn place_with_guide(
                     if sc >= before || best.as_ref().map(|b| sc >= b.2).unwrap_or(false) {
                         continue;
                     }
-                    if let Some(ble) = grid.first_free_ble(site.x, site.y, skip) {
-                        best = Some((site, ble, sc));
-                        if sc.0 == 0 {
-                            break;
-                        }
+                    best = Some((site, ble, sc));
+                    if sc.0 == 0 {
+                        break;
                     }
                 }
                 if let Some((site, ble, _)) = best {
                     grid.relocate(skip, (site.x, site.y, ble), i);
                     lutff_sites[i] = (site, ble);
-                    ff_at.insert(d_ff.to_owned(), site);
                     pass_drv_moved += 1;
                     continue;
                 }
@@ -1326,10 +1362,7 @@ pub fn place_with_guide(
                     );
                     lutff_sites[i] = (site, ble);
                     lutff_sites[j] = (cur_site, cur_ble);
-                    ff_at.insert(d_ff.to_owned(), site);
-                    if !packed.lutffs[j].ff_cell.is_empty() {
-                        ff_at.insert(packed.lutffs[j].ff_cell.clone(), cur_site);
-                    }
+                    // ff_at is not used after initial affinity placement.
                     pass_drv_swapped += 1;
                 }
             }
@@ -1505,26 +1538,32 @@ pub fn place_incremental_with_guide(
 ) -> Result<(Placed, usize), String> {
     let mut placed = place_with_guide(packed, dev, opts, guide)?;
     let mut reused = 0usize;
-    let mut used: HashSet<(u32, u32, u8)> = HashSet::new();
+    let prev_lutff: std::collections::HashMap<&str, usize> = prev
+        .packed
+        .lutffs
+        .iter()
+        .enumerate()
+        .map(|(j, p)| (p.lut_cell.as_str(), j))
+        .collect();
     for (i, lf) in packed.lutffs.iter().enumerate() {
-        if let Some(j) = prev
-            .packed
-            .lutffs
-            .iter()
-            .position(|p| p.lut_cell == lf.lut_cell)
-        {
+        if let Some(&j) = prev_lutff.get(lf.lut_cell.as_str()) {
             let site = prev.lutff_sites[j];
             placed.lutff_sites[i] = site;
-            used.insert((site.0.x, site.0.y, site.1));
             reused += 1;
         }
     }
+    let prev_iob: std::collections::HashMap<&str, usize> = prev
+        .packed
+        .iobs
+        .iter()
+        .enumerate()
+        .map(|(j, p)| (p.cell.as_str(), j))
+        .collect();
     for (i, iob) in packed.iobs.iter().enumerate() {
-        if let Some(j) = prev.packed.iobs.iter().position(|p| p.cell == iob.cell) {
+        if let Some(&j) = prev_iob.get(iob.cell.as_str()) {
             placed.iob_sites[i] = prev.iob_sites[j];
         }
     }
-    let _ = used;
     Ok((placed, reused))
 }
 
@@ -1700,17 +1739,17 @@ mod tests {
         d.add_port("led", helion_ir::PortDir::Out);
         for i in 0..9u32 {
             d.add_cell(
-                format!("u_lut{i}"),
+                &format!("u_lut{i}"),
                 CellKind::Lut6 {
                     init: 0x5555_5555_5555_5555,
                 },
             );
-            d.add_cell(format!("u_ff{i}"), CellKind::Hff);
-            d.connect("clk", format!("u_ff{i}"), "CLK");
-            d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
-            d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
-            d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
-            d.connect(format!("q{i}"), format!("u_lut{i}"), "I0");
+            d.add_cell(&format!("u_ff{i}"), CellKind::Hff);
+            d.connect("clk", &format!("u_ff{i}"), "CLK");
+            d.connect(&format!("d{i}"), &format!("u_lut{i}"), "O");
+            d.connect(&format!("d{i}"), &format!("u_ff{i}"), "D");
+            d.connect(&format!("q{i}"), &format!("u_ff{i}"), "Q");
+            d.connect(&format!("q{i}"), &format!("u_lut{i}"), "I0");
         }
         d.add_cell("u_iob", CellKind::IobOut);
         d.connect("q0", "u_iob", "I");
@@ -1795,6 +1834,7 @@ mod tests {
             &TimingGuide {
                 false_path_iob: true,
                 iob_setup_mult: 1,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1821,6 +1861,7 @@ mod tests {
             &TimingGuide {
                 false_path_iob: false,
                 iob_setup_mult: 2,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1838,6 +1879,7 @@ mod tests {
             &TimingGuide {
                 false_path_iob: true,
                 iob_setup_mult: 2,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1870,6 +1912,7 @@ mod tests {
             &TimingGuide {
                 false_path_iob: true,
                 iob_setup_mult: 1,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1898,6 +1941,7 @@ mod tests {
         let g = TimingGuide {
             false_path_iob: true,
             iob_setup_mult: 1,
+            ..Default::default()
         };
         let pl = place_in_region_with_guide(&p, &dev, opts, 5, 1, 8, 8, &g).unwrap();
         for (s, _) in &pl.lutff_sites {

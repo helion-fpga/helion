@@ -255,24 +255,32 @@ fn synchronous_pair(domains: &DomainMap, a: usize, b: usize) -> bool {
 /// reported as `UNCONSTRAINED_CLOCK_NET` instead of guessed crossings.
 pub fn find_crossings(design: &Design, domains: &DomainMap) -> Vec<RawCrossing> {
     let mut out = Vec::new();
+    let mut info_cache: std::collections::HashMap<helion_ir::Spur, Vec<DriverInfo>> =
+        std::collections::HashMap::new();
+    let pin_d = intern("D");
     for cell in &design.cells {
         if !matches!(cell.kind, helion_ir::CellKind::Hff) {
             continue;
         }
-        let Some(to) = domains.domain_of_ff(resolve(cell.name)) else {
+        let cell_name = resolve(cell.name);
+        let Some(to) = domains.domain_of_ff(cell_name) else {
             continue;
         };
-        let Some(d_net) = design.net_on(cell.name, intern("D")) else {
+        let Some(d_net) = design.net_on(cell.name, pin_d) else {
             continue;
         };
-        for di in driver_infos(design, domains, resolve(d_net)) {
+        let d_net_str = resolve(d_net);
+        let infos = info_cache
+            .entry(d_net)
+            .or_insert_with(|| driver_infos(design, domains, d_net_str));
+        for di in infos {
             match di.source {
                 CrossingSource::PortInput => out.push(RawCrossing {
-                    net: resolve(d_net).to_string(),
+                    net: d_net_str.to_string(),
                     from: CrossingSource::PortInput,
                     to,
-                    driver_cells: di.cells,
-                    load_ff: resolve(cell.name).to_string(),
+                    driver_cells: di.cells.clone(),
+                    load_ff: cell_name.to_string(),
                 }),
                 CrossingSource::Domain(from) => {
                     if from == to || synchronous_pair(domains, from, to) {
@@ -284,11 +292,11 @@ pub fn find_crossings(design: &Design, domains: &DomainMap) -> Vec<RawCrossing> 
                         continue;
                     }
                     out.push(RawCrossing {
-                        net: resolve(d_net).to_string(),
+                        net: d_net_str.to_string(),
                         from: CrossingSource::Domain(from),
                         to,
-                        driver_cells: di.cells,
-                        load_ff: resolve(cell.name).to_string(),
+                        driver_cells: di.cells.clone(),
+                        load_ff: cell_name.to_string(),
                     });
                 }
             }

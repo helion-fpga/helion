@@ -7,6 +7,7 @@
 
 use helion_device::{BelId, Device, NetId, Site, SiteKind};
 use helion_place::Placed;
+use rayon::prelude::*;
 
 pub use helion_place::TimingGuide;
 use std::cmp::Ordering;
@@ -546,33 +547,32 @@ pub fn route_with_guide(
             ff_site.insert(lutff.ff_cell.as_str(), placed.lutff_sites[i]);
         }
     }
-    let mut imux = Vec::new();
-    let mut imux_skip = 0u32;
-    for (i, lutff) in placed.packed.lutffs.iter().enumerate() {
+    let route_cluster = |(i, lutff): (usize, &helion_pack::PackedLutFf)| -> (Vec<ImuxRoute>, u32) {
         let (site, ble) = placed.lutff_sites[i];
+        let mut local_imux = Vec::new();
+        let mut local_skip = 0u32;
         if lutff.lut_pins.is_empty() {
             // Registered empty-pin cluster: keep local FF Q loop (gold blinky/counter).
             // Comb LUT: primary/port inputs — no IMUX programming needed.
             if !lutff.ff_cell.is_empty() {
-                imux.push(ImuxRoute {
+                local_imux.push(ImuxRoute {
                     x: site.x,
                     y: site.y,
                     mux: ble as u32 * 8,
                     sel: 16 + ble,
                 });
             }
-            continue;
+            return (local_imux, local_skip);
         }
+        local_imux.reserve(lutff.lut_pins.len());
         for (pin, driver) in &lutff.lut_pins {
             let Some((dsite, dble)) = ff_site.get(driver.as_str()).copied() else {
-                // Truncated-to-device clusters may still name a driver that
-                // was not placed; skip the IMUX like an out-of-reach arc.
-                imux_skip += 1;
+                local_skip += 1;
                 continue;
             };
             match imux_sel(dsite, site, dble) {
                 Ok(sel) => {
-                    imux.push(ImuxRoute {
+                    local_imux.push(ImuxRoute {
                         x: site.x,
                         y: site.y,
                         mux: ble as u32 * 8 + *pin as u32,
@@ -580,11 +580,33 @@ pub fn route_with_guide(
                     });
                 }
                 Err(_) => {
-                    // Bring-up IMUX reach includes ±3/±4 axis + diag±2 (sel 112-127, 192-255).
-                    // Longer residual arcs: skip + count (honest, not silent).
-                    imux_skip += 1;
+                    local_skip += 1;
                 }
             }
+        }
+        (local_imux, local_skip)
+    };
+    let mut imux = Vec::new();
+    let mut imux_skip = 0u32;
+    if placed.packed.lutffs.len() >= 256 {
+        let parts: Vec<(Vec<ImuxRoute>, u32)> = placed
+            .packed
+            .lutffs
+            .par_iter()
+            .enumerate()
+            .map(route_cluster)
+            .collect();
+        let total_imux: usize = parts.iter().map(|(v, _)| v.len()).sum();
+        imux.reserve(total_imux);
+        for (mut v, sk) in parts {
+            imux.append(&mut v);
+            imux_skip += sk;
+        }
+    } else {
+        for (i, lutff) in placed.packed.lutffs.iter().enumerate() {
+            let (mut v, sk) = route_cluster((i, lutff));
+            imux.append(&mut v);
+            imux_skip += sk;
         }
     }
 
@@ -695,11 +717,9 @@ pub fn route_with_guide(
             .get(*packed_ii)
             .map(|io| io.from_net.clone())
             .unwrap_or_default();
-        let from_ff = placed
-            .packed
-            .lutffs
-            .iter()
-            .find(|l| l.q_net == net)
+        let from_ff = q_net_lutff
+            .get(net.as_str())
+            .and_then(|&idx| placed.packed.lutffs.get(idx))
             .map(|l| !l.ff_cell.is_empty())
             .unwrap_or(true);
         iob_src.push(IobRoute {
@@ -967,6 +987,7 @@ mod tests {
         let gfp = TimingGuide {
             false_path_iob: true,
             iob_setup_mult: 1,
+            ..Default::default()
         };
         let pl0 = place_with_guide(&p, &dev, opts, &g0).unwrap();
         let plfp = place_with_guide(&p, &dev, opts, &gfp).unwrap();
@@ -1008,6 +1029,7 @@ mod tests {
         let gm = TimingGuide {
             false_path_iob: false,
             iob_setup_mult: 2,
+            ..Default::default()
         };
         let pl0 = place_with_guide(&p, &dev, opts, &g0).unwrap();
         let plm = place_with_guide(&p, &dev, opts, &gm).unwrap();
@@ -1031,6 +1053,7 @@ mod tests {
         let gfp = TimingGuide {
             false_path_iob: true,
             iob_setup_mult: 2,
+            ..Default::default()
         };
         let rfp = route_with_guide(
             &place_with_guide(&p, &dev, opts, &gfp).unwrap(),

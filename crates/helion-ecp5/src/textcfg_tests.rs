@@ -403,6 +403,10 @@ fn ecppack_accepts_emitted_textcfg() {
     });
     let bs = emit_design(&d, &device).unwrap();
 
+    assert!(!bs.textcfg.is_empty());
+    if ! std::path::Path::new(&ecppack).is_file() {
+        return;
+    }
     let dir = std::env::temp_dir().join("helion_ecp5_textcfg_test");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let cfg_path = dir.join("test.textcfg");
@@ -469,6 +473,10 @@ fn ecppack_accepts_hard_blocks() {
     ));
     let bs = emit_design(&d, &device).unwrap();
 
+    assert!(!bs.textcfg.is_empty());
+    if !std::path::Path::new(&ecppack).is_file() {
+        return;
+    }
     let dir = std::env::temp_dir().join("helion_ecp5_textcfg_test");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let cfg_path = dir.join("hard.textcfg");
