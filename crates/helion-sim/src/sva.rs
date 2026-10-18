@@ -161,7 +161,7 @@ struct PendingAttempt {
     countdown: u32,
 }
 
-/// Checker for one concurrent `assert property`.
+/// Checker for one concurrent `assert property` or `cover property`.
 #[derive(Clone, Debug)]
 pub struct PropChecker {
     prop: SvaProperty,
@@ -170,14 +170,29 @@ pub struct PropChecker {
     hist: Vec<u64>,
     hist_valid: bool,
     pending: VecDeque<PendingAttempt>,
+    pub is_cover: bool,
     pub attempts: u64,
+    pub passes: u64,
     pub vacuous: u64,
     pub failures: u64,
     pub first_failure: Option<(u64, u64)>,
+    pub first_pass: Option<(u64, u64)>,
 }
 
 impl PropChecker {
     fn attach(design: &Design, prop: SvaProperty) -> Result<Self, String> {
+        Self::attach_with_mode(
+            design,
+            prop. text.trim_start().starts_with("cover"),
+            prop,
+        )
+    }
+
+    fn attach_with_mode(
+        design: &Design,
+        is_cover: bool,
+        prop: SvaProperty,
+    ) -> Result<Self, String> {
         let bind = bind_probes(design, &prop.text, &prop.probes)?;
         let mut sampled = Vec::new();
         collect_sampled(&prop.antecedent, &mut sampled);
@@ -192,10 +207,13 @@ impl PropChecker {
             hist,
             hist_valid: false,
             pending: VecDeque::new(),
+            is_cover,
             attempts: 0,
+            passes: 0,
             vacuous: 0,
             failures: 0,
             first_failure: None,
+            first_pass: None,
         })
     }
 
@@ -246,7 +264,12 @@ impl PropChecker {
         while i < self.pending.len() {
             if self.pending[i].countdown == 0 {
                 let (cv, _) = eval(&self.prop.consequent, &probes, &self.hist);
-                if cv == 0 {
+                if cv != 0 {
+                    self.passes += 1;
+                    if self.first_pass.is_none() {
+                        self.first_pass = Some((time, cycle));
+                    }
+                } else if !self.is_cover {
                     self.failures += 1;
                     if self.first_failure.is_none() {
                         self.first_failure = Some((time, cycle));
@@ -360,33 +383,58 @@ impl ImmChecker {
 }
 
 /// Per-property status for [`SvaReport`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PropStatus {
     pub label: Option<String>,
     pub text: String,
+    pub is_cover: bool,
     pub attempts: u64,
+    pub passes: u64,
     pub vacuous: u64,
     pub failures: u64,
     pub first_failure: Option<(u64, u64)>,
+    pub first_pass: Option<(u64, u64)>,
+}
+
+/// Per-cover-property status for [`SvaReport`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoverStatus {
+    pub label: Option<String>,
+    pub text: String,
+    pub attempts: u64,
+    pub hits: u64,
+    pub vacuous: u64,
+    pub first_hit: Option<(u64, u64)>,
+}
+
+impl CoverStatus {
+    pub fn is_covered(&self) -> bool {
+        self.hits > 0
+    }
 }
 
 /// Per-immediate status for [`SvaReport`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImmStatus {
     pub label: Option<String>,
     pub text: String,
     pub is_final: bool,
     pub checks: u64,
+    pub passes: u64,
     pub failures: u64,
     pub first_failure: Option<(u64, u64)>,
 }
 
 /// Aggregate SVA status: per-assertion counters plus the unbounded total.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SvaReport {
     pub properties: Vec<PropStatus>,
+    pub covers: Vec<CoverStatus>,
     pub immediates: Vec<ImmStatus>,
     pub total_failures: u64,
+    pub total_passes: u64,
+    pub total_vacuous: u64,
+    pub total_cover_hits: u64,
 }
 
 impl SvaReport {
@@ -406,6 +454,18 @@ impl SvaReport {
                 p.attempts, p.vacuous, p.failures, p.text
             ));
         }
+        for c in &self.covers {
+            let name = c.label.as_deref().unwrap_or(&c.text);
+            let verdict = if c.hits > 0 { "COVERED" } else { "UNCOVERED" };
+            let first = c
+                .first_hit
+                .map(|(t, _)| format!(", first t={t}ps"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "cover {name}: {verdict} attempts={} hits={} vacuous={}{first} :: {}",
+                c.attempts, c.hits, c.vacuous, c.text
+            ));
+        }
         for im in &self.immediates {
             let name = im.label.as_deref().unwrap_or(&im.text);
             let verdict = if im.failures == 0 { "PASS" } else { "FAIL" };
@@ -420,12 +480,28 @@ impl SvaReport {
         }
         lines
     }
+
+    /// Concise summary line of SVA assertion and cover property results.
+    pub fn summary_line(&self) -> String {
+        let covered = self.covers.iter().filter(|c| c.hits > 0).count();
+        format!(
+            "sva assertions={} immediates={} covers={}/{} passes={} vacuous={} failures={}",
+            self.properties.len(),
+            self.immediates.len(),
+            covered,
+            self.covers.len(),
+            self.total_passes,
+            self.total_vacuous,
+            self.total_failures,
+        )
+    }
 }
 
 /// Owns the checker sidecars for one [`Sim`](crate::Sim).
 #[derive(Clone, Debug)]
 pub struct SvaEngine {
     checkers: Vec<PropChecker>,
+    covers: Vec<PropChecker>,
     imms: Vec<ImmChecker>,
     failures: Vec<SvaFailure>,
     pub total_failures: u64,
@@ -435,6 +511,7 @@ impl SvaEngine {
     pub fn new() -> Self {
         SvaEngine {
             checkers: Vec::new(),
+            covers: Vec::new(),
             imms: Vec::new(),
             failures: Vec::new(),
             total_failures: 0,
@@ -442,7 +519,7 @@ impl SvaEngine {
     }
 
     pub fn is_attached(&self) -> bool {
-        !self.checkers.is_empty() || !self.imms.is_empty()
+        !self.checkers.is_empty() || !self.covers.is_empty() || !self.imms.is_empty()
     }
 
     /// Attach elaborated checkers, resolving probes against `design`.
@@ -454,18 +531,38 @@ impl SvaEngine {
         props: Vec<SvaProperty>,
         imms: Vec<SvaImmProp>,
     ) -> Result<(), String> {
-        let mut checkers = Vec::with_capacity(props.len());
+        let mut checkers = Vec::new();
+        let mut covers = Vec::new();
         for p in props {
-            checkers.push(PropChecker::attach(design, p)?);
+            let chk = PropChecker::attach(design, p)?;
+            if chk.is_cover {
+                covers.push(chk);
+            } else {
+                checkers.push(chk);
+            }
         }
         let mut imm_checkers = Vec::with_capacity(imms.len());
         for im in imms {
             imm_checkers.push(ImmChecker::attach(design, im)?);
         }
         self.checkers = checkers;
+        self.covers = covers;
         self.imms = imm_checkers;
         self.failures.clear();
         self.total_failures = 0;
+        Ok(())
+    }
+
+    /// Attach concurrent `cover property` items explicitly.
+    pub fn attach_covers(
+        &mut self,
+        design: &Design,
+        covers: Vec<SvaProperty>,
+    ) -> Result<(), String> {
+        for p in covers {
+            self.covers
+                .push(PropChecker::attach_with_mode(design, true, p)?);
+        }
         Ok(())
     }
 
@@ -480,6 +577,9 @@ impl SvaEngine {
     ) {
         let mut fresh = Vec::new();
         for c in &mut self.checkers {
+            c.sample_pre(time, cycle, ff_q, stim, &mut fresh);
+        }
+        for c in &mut self.covers {
             c.sample_pre(time, cycle, ff_q, stim, &mut fresh);
         }
         for ic in &mut self.imms {
@@ -529,32 +629,59 @@ impl SvaEngine {
     }
 
     pub fn report(&self) -> SvaReport {
+        let properties: Vec<PropStatus> = self
+            .checkers
+            .iter()
+            .map(|c| PropStatus {
+                label: c.prop.label.clone(),
+                text: c.prop.text.clone(),
+                is_cover: false,
+                attempts: c.attempts,
+                passes: c.passes,
+                vacuous: c.vacuous,
+                failures: c.failures,
+                first_failure: c.first_failure,
+                first_pass: c.first_pass,
+            })
+            .collect();
+        let covers: Vec<CoverStatus> = self
+            .covers
+            .iter()
+            .map(|c| CoverStatus {
+                label: c.prop.label.clone(),
+                text: c.prop.text.clone(),
+                attempts: c.attempts,
+                hits: c.passes,
+                vacuous: c.vacuous,
+                first_hit: c.first_pass,
+            })
+            .collect();
+        let immediates: Vec<ImmStatus> = self
+            .imms
+            .iter()
+            .map(|ic| ImmStatus {
+                label: ic.prop.label.clone(),
+                text: ic.prop.text.clone(),
+                is_final: ic.prop.is_final,
+                checks: ic.checks,
+                passes: ic.checks.saturating_sub(ic.failures),
+                failures: ic.failures,
+                first_failure: ic.first_failure,
+            })
+            .collect();
+        let total_passes: u64 = properties.iter().map(|p| p.passes).sum::<u64>()
+            + immediates.iter().map(|i| i.passes).sum::<u64>();
+        let total_vacuous: u64 = properties.iter().map(|p| p.vacuous).sum::<u64>()
+            + covers.iter().map(|c| c.vacuous).sum::<u64>();
+        let total_cover_hits: u64 = covers.iter().map(|c| c.hits).sum();
         SvaReport {
-            properties: self
-                .checkers
-                .iter()
-                .map(|c| PropStatus {
-                    label: c.prop.label.clone(),
-                    text: c.prop.text.clone(),
-                    attempts: c.attempts,
-                    vacuous: c.vacuous,
-                    failures: c.failures,
-                    first_failure: c.first_failure,
-                })
-                .collect(),
-            immediates: self
-                .imms
-                .iter()
-                .map(|ic| ImmStatus {
-                    label: ic.prop.label.clone(),
-                    text: ic.prop.text.clone(),
-                    is_final: ic.prop.is_final,
-                    checks: ic.checks,
-                    failures: ic.failures,
-                    first_failure: ic.first_failure,
-                })
-                .collect(),
+            properties,
+            covers,
+            immediates,
             total_failures: self.total_failures,
+            total_passes,
+            total_vacuous,
+            total_cover_hits,
         }
     }
 }
@@ -596,18 +723,18 @@ mod tests {
                 let dval = if en == 1 { inc } else { qi };
                 init |= dval << addr;
             }
-            d.add_cell(format!("u_lut{i}"), CellKind::Lut6 { init });
-            d.add_cell(format!("u_ff{i}"), CellKind::Hff);
-            d.connect("clk", format!("u_ff{i}"), "CLK");
-            d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
-            d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
+            d.add_cell(&format!("u_lut{i}"), CellKind::Lut6 { init });
+            d.add_cell(&format!("u_ff{i}"), CellKind::Hff);
+            d.connect("clk", &format!("u_ff{i}"), "CLK");
+            d.connect(&format!("d{i}"), &format!("u_lut{i}"), "O");
+            d.connect(&format!("d{i}"), &format!("u_ff{i}"), "D");
             // Q net uses the elaborator's bit_name convention ("cnt_{i}").
             let qnet = format!("cnt_{i}");
-            d.connect(qnet.clone(), format!("u_ff{i}"), "Q");
-            d.connect("en", format!("u_lut{i}"), "I0");
-            d.connect(qnet.clone(), format!("u_lut{i}"), "I1");
+            d.connect(&qnet, &format!("u_ff{i}"), "Q");
+            d.connect("en", &format!("u_lut{i}"), "I0");
+            d.connect(&qnet, &format!("u_lut{i}"), "I1");
             for j in 0..i {
-                d.connect(format!("cnt_{j}"), format!("u_lut{i}"), format!("I{}", j + 2));
+                d.connect(&format!("cnt_{j}"), &format!("u_lut{i}"), &format!("I{}", j + 2));
             }
         }
         d

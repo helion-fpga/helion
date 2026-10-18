@@ -7,10 +7,36 @@ use helion_ir::{intern, resolve, CellKind, Design, PortDir};
 use helion_sv::sva::{SvaImmProp, SvaProperty};
 use std::collections::HashMap;
 
+pub mod coverage;
+pub mod fast;
+pub mod sdf;
 pub mod sva;
 pub mod vcd;
-use sva::{SvaEngine, SvaFailure, SvaReport};
+pub mod wave;
 
+pub use coverage::{
+    BranchCoverageStats, CoverageCollector, FsmCoverageStats, FunctionalCoverageReport,
+    NetToggleStats,
+};
+pub use fast::{
+    CompiledFf, CompiledNode, CompiledSim, ConeNodeKind, LevelizedSchedule, Logic4, NET_ONE,
+    NET_UNCONNECTED, NET_ZERO,
+};
+pub use sdf::{
+    parse_sdf, SdfCorner, SdfDelayPs, SdfFile, SdfInterconnect, SdfIoPath, SdfTimingCheck,
+    SdfTimingCheckKind, SimTimingModel, TimingViolation, TimingViolationKind,
+};
+pub use sva::{
+    CoverStatus, ImmChecker, ImmStatus, PropChecker, PropStatus, SvaEngine, SvaFailure,
+    SvaFailureKind, SvaReport, SVA_FAILURE_CAP,
+};
+pub use wave::{
+    decode_axi_lite, decode_axi_stream, decode_i2c, decode_spi, decode_uart, decode_wishbone,
+    AxiLiteSignals, AxiLiteTransaction, AxiLiteTxKind, AxiStreamPacket, AxiStreamSignals,
+    CompactWaveStream, I2cByteTransfer, I2cSignals, I2cTransaction, ProtocolTransaction,
+    SpiConfig, SpiTransaction, UartConfig, UartFrame, UartParity, WaveSample, WaveSignalDef,
+    WaveSignalId, WaveSlice, WishboneSignals, WishboneTransaction,
+};
 /// UG900 force vs deposit: hold until `release`, or one-shot poke.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SimForceKind {
@@ -72,6 +98,12 @@ pub struct Sim {
     /// ILA probe support: driver per net + LUT input net per pin (all 6 pins).
     net_drivers: HashMap<String, NetDriver>,
     lut_input_nets: HashMap<String, [Option<String>; 6]>,
+    /// Levelized flat 2-state / 4-state compiled simulator sidecar.
+    compiled: CompiledSim,
+    /// Optional SDF back-annotated gate-level timing model.
+    timing: Option<SimTimingModel>,
+    /// Runtime functional coverage collector (toggle, branch, FSM).
+    coverage: CoverageCollector,
 }
 
 impl Sim {
@@ -90,7 +122,11 @@ impl Sim {
             if let Some(q) = n.endpoints.iter().find(|e| e.pin == intern("Q")) {
                 net_ff.insert(resolve(n.name).to_string(), resolve(q.cell).to_string());
             }
-            if let Some(o) = n.endpoints.iter().find(|e| e.pin == intern("O")) {
+            if let Some(o) = n
+                .endpoints
+                .iter()
+                .find(|e| e.pin == intern("O") && lut_init.contains_key(resolve(e.cell)))
+            {
                 net_lut_o.insert(resolve(n.name).to_string(), resolve(o.cell).to_string());
             }
             for e in &n.endpoints {
@@ -105,7 +141,10 @@ impl Sim {
                     }
                 }
             }
-            let lut_o = n.endpoints.iter().find(|e| e.pin == intern("O"));
+            let lut_o = n
+                .endpoints
+                .iter()
+                .find(|e| e.pin == intern("O") && lut_init.contains_key(resolve(e.cell)));
             let ff_d = n.endpoints.iter().find(|e| e.pin == intern("D"));
             if let (Some(l), Some(f)) = (lut_o, ff_d) {
                 ff_d_lut.insert(resolve(f.cell).to_string(), resolve(l.cell).to_string());
@@ -173,6 +212,8 @@ impl Sim {
                 lut_input_nets.insert(resolve(c.name).to_string(), pins);
             }
         }
+        let compiled = CompiledSim::new(d);
+        let coverage = CoverageCollector::from_design(d, &compiled);
         Self {
             time: 0,
             cycle: 0,
@@ -192,6 +233,9 @@ impl Sim {
             iob_pad_to_i,
             net_drivers,
             lut_input_nets,
+            compiled,
+            timing: None,
+            coverage,
         }
     }
 
@@ -255,6 +299,8 @@ impl Sim {
         match self.ports.get(port) {
             Some(PortDir::In) | Some(PortDir::Inout) => {
                 self.input_values.insert(port.to_string(), value);
+                let _ = self.compiled.drive_input(port, value);
+                self.compiled.eval_comb_2state();
                 Ok(())
             }
             Some(_) => Err(format!("drive_input: port {port} is not an input")),
@@ -355,6 +401,18 @@ impl Sim {
             || self.net_lut_o.contains_key(net)
             || self.input_values.contains_key(net);
         if !driven {
+            if self.compiled.schedule.input_ports.contains_key(net) {
+                return None;
+            }
+            if self
+                .compiled
+                .schedule
+                .ops
+                .iter()
+                .any(|op| op.output_nets().iter().any(|&id| self.compiled.schedule.net_names.get(id as usize).map(String::as_str) == Some(net)))
+            {
+                return self.compiled.sample(net);
+            }
             return None;
         }
         let mut memo = HashMap::new();
@@ -441,6 +499,20 @@ impl Sim {
         // SVA preponed region: concurrent properties + non-final immediate
         // asserts sample the pre-edge state.
         self.sva.sample_pre(self.time, self.cycle, &self.ff_q, &self.stim);
+
+        // Sync any deposit/force/input updates into the compiled fast engine.
+        for (port, &val) in &self.input_values {
+            let _ = self.compiled.drive_input(port, val);
+        }
+        for (ff, &val) in &self.ff_q {
+            let _ = self.compiled.set_ff_4state(ff, Logic4::from_bool(val));
+        }
+        if let Some(tm) = &mut self.timing {
+            tm.step_timed(&mut self.compiled, delay);
+        } else {
+            self.compiled.step_2state(delay);
+        }
+
         let mut next_q = HashMap::new();
         // One memo per step: net values are stable across this edge.
         let mut memo: HashMap<String, bool> = HashMap::new();
@@ -454,6 +526,14 @@ impl Sim {
             let o = self.lut_output_live(lut, &mut memo, &mut stack);
             next_q.insert(ff.clone(), o);
         }
+        // Also propagate FFs driven by Carry4 / Muxf7 / Muxf8 from the compiled schedule.
+        for ff_desc in &self.compiled.schedule.ffs {
+            if !self.ff_d_lut.contains_key(&ff_desc.name) {
+                if let Some(v) = self.compiled.get_ff_4state(&ff_desc.name) {
+                    next_q.insert(ff_desc.name.clone(), v == Logic4::One);
+                }
+            }
+        }
         for (k, v) in next_q {
             self.ff_q.insert(k, v);
         }
@@ -462,11 +542,145 @@ impl Sim {
             .as_ref()
             .and_then(|f| self.ff_q.get(f))
             .copied()
-            .unwrap_or(false);
+            .unwrap_or(self.compiled.led);
         self.apply_forces();
+        for (ff, &val) in &self.ff_q {
+            let _ = self.compiled.set_ff_4state(ff, Logic4::from_bool(val));
+        }
+        self.coverage.sample_compiled(&self.compiled);
         // SVA postponed region: `assert final` sees the committed state.
         self.sva
             .sample_post(self.time, self.cycle, &self.ff_q, &self.stim);
+    }
+
+    /// Access the levelized flat compiled 2-state/4-state engine.
+    pub fn compiled(&self) -> &CompiledSim {
+        &self.compiled
+    }
+
+    /// Mutably access the levelized flat compiled 2-state/4-state engine.
+    pub fn compiled_mut(&mut self) -> &mut CompiledSim {
+        &mut self.compiled
+    }
+
+    /// Run `cycles` clock posedges using the levelized flat 2-state compiled fast path
+    /// (`Vec<u64>` state words, zero per-cycle allocation) and synchronize `Sim` state.
+    pub fn run_fast_2state(&mut self, cycles: u64, period_ps: u64) -> Vec<bool> {
+        for (port, &val) in &self.input_values {
+            let _ = self.compiled.drive_input(port, val);
+        }
+        let wave = self.compiled.run_2state_cycles(cycles, period_ps);
+        self.time = self.compiled.time;
+        self.cycle = self.compiled.cycle;
+        self.led = self.compiled.led;
+        for ff in &self.compiled.schedule.ffs {
+            if let Some(v) = self.compiled.get_ff_4state(&ff.name) {
+                self.ff_q.insert(ff.name.clone(), v == Logic4::One);
+            }
+        }
+        self.apply_forces();
+        wave
+    }
+
+    /// Execute one clock posedge in 4-state (`0, 1, X, Z`) mode.
+    pub fn step_4state(&mut self, delay: u64) {
+        self.time += delay;
+        self.cycle += 1;
+        if let Some(tm) = &mut self.timing {
+            tm.step_timed(&mut self.compiled, delay);
+        } else {
+            self.compiled.step_4state(delay);
+        }
+        for ff in &self.compiled.schedule.ffs {
+            if let Some(v) = self.compiled.get_ff_4state(&ff.name) {
+                self.ff_q.insert(ff.name.clone(), v == Logic4::One);
+            }
+        }
+        self.led = self.compiled.led;
+        self.coverage.sample_compiled(&self.compiled);
+    }
+
+    /// Drive a primary input port with a 4-state [`Logic4`] value (`0, 1, X, Z`).
+    pub fn drive_input_4state(&mut self, port: &str, value: Logic4) -> Result<(), String> {
+        match self.ports.get(port) {
+            Some(PortDir::In) | Some(PortDir::Inout) => {
+                if let Some(b) = value.as_bool() {
+                    self.input_values.insert(port.to_string(), b);
+                } else {
+                    self.input_values.remove(port);
+                }
+                self.compiled.drive_input_4state(port, value)?;
+                self.compiled.eval_comb_4state();
+                Ok(())
+            }
+            Some(_) => Err(format!("drive_input_4state: port {port} is not an input")),
+            None => Err(format!("drive_input_4state: no port {port}")),
+        }
+    }
+
+    /// Sample a net, port, or FF in 4-state (`0, 1, X, Z`) mode.
+    pub fn sample_4state(&self, name: &str) -> Option<Logic4> {
+        self.compiled.sample_4state(name)
+    }
+
+    /// Attach an SDF back-annotated gate-level timing model to this simulator.
+    pub fn attach_sdf(&mut self, sdf: &SdfFile, corner: SdfCorner) {
+        self.timing = Some(SimTimingModel::from_sdf(sdf, corner));
+    }
+
+    /// Parse an SDF text and attach the resulting [`SimTimingModel`] at `corner`.
+    pub fn attach_sdf_str(&mut self, sdf_src: &str, corner: SdfCorner) -> Result<(), String> {
+        let model = SimTimingModel::parse(sdf_src, corner)?;
+        self.timing = Some(model);
+        Ok(())
+    }
+
+    /// Return all SDF timing violations recorded so far.
+    pub fn timing_violations(&self) -> &[TimingViolation] {
+        self.timing
+            .as_ref()
+            .map(|t| t.violations.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Clear recorded SDF timing violations.
+    pub fn clear_timing_violations(&mut self) {
+        if let Some(t) = &mut self.timing {
+            t.violations.clear();
+        }
+    }
+
+    /// Attach SVA concurrent `cover property` items to this simulator.
+    pub fn attach_sva_covers(
+        &mut self,
+        design: &Design,
+        covers: Vec<SvaProperty>,
+    ) -> Result<(), String> {
+        self.sva.attach_covers(design, covers)
+    }
+
+    /// Register an explicit branch condition net for branch coverage tracking.
+    pub fn register_branch_coverage(
+        &mut self,
+        name: impl Into<String>,
+        cond_net: impl Into<String>,
+    ) {
+        self.coverage.register_branch(name, cond_net);
+    }
+
+    /// Register an explicit multi-bit FSM state bus for FSM state/transition coverage.
+    pub fn register_fsm_coverage(
+        &mut self,
+        name: impl Into<String>,
+        bit_nets: Vec<String>,
+        expected_states: Option<usize>,
+    ) {
+        self.coverage.register_fsm(name, bit_nets, expected_states);
+    }
+
+    /// Build a unified [`FunctionalCoverageReport`] (toggle + branch + FSM + SVA assertions/covers).
+    pub fn coverage_report(&self) -> FunctionalCoverageReport {
+        self.coverage.report(self.sva.report())
     }
 
     /// UG900 Objects pane: live helion-sim probes (LED + each FF Q), not a static name list.
@@ -727,7 +941,7 @@ pub fn run_tb(design: &Design, cycles: u32) -> Vec<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helion_ir::{intern, resolve, CellKind, Design, PortDir};
+    use helion_ir::{intern, CellKind, Design, PortDir};
 
     #[test]
     fn overlay_sim_counter_led_gold_labeled_sim_done() {
@@ -853,7 +1067,7 @@ endmodule
     fn memory_cells_capped_on_wide_netlist() {
         let mut d = Design::new("wide");
         for i in 0..400u32 {
-            d.add_cell(format!("lut{i}"), CellKind::Lut6 { init: 1 });
+            d.add_cell(&format!("lut{i}"), CellKind::Lut6 { init: 1 });
         }
         let s = Sim::new(&d);
         assert_eq!(s.lut_init.len(), 400, "kernel still holds every INIT");
@@ -987,14 +1201,14 @@ endmodule
             w
         }
         for i in 0..6u32 {
-            d.add_cell(format!("u_lut{i}"), CellKind::Lut6 { init: inc_init(i) });
-            d.add_cell(format!("u_ff{i}"), CellKind::Hff);
-            d.connect("clk", format!("u_ff{i}"), "CLK");
-            d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
-            d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
-            d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
+            d.add_cell(&format!("u_lut{i}"), CellKind::Lut6 { init: inc_init(i) });
+            d.add_cell(&format!("u_ff{i}"), CellKind::Hff);
+            d.connect("clk", &format!("u_ff{i}"), "CLK");
+            d.connect(&format!("d{i}"), &format!("u_lut{i}"), "O");
+            d.connect(&format!("d{i}"), &format!("u_ff{i}"), "D");
+            d.connect(&format!("q{i}"), &format!("u_ff{i}"), "Q");
             for pin in 0..=i {
-                d.connect(format!("q{pin}"), format!("u_lut{i}"), format!("I{pin}"));
+                d.connect(&format!("q{pin}"), &format!("u_lut{i}"), &format!("I{pin}"));
             }
         }
         d.add_cell("u_iob", CellKind::IobOut);
@@ -1008,7 +1222,7 @@ endmodule
         let d = six_bit_counter();
         let lut5 = d.cell("u_lut5").unwrap();
         let pins: Vec<_> = (0..6u8)
-            .filter(|p| d.net_on("u_lut5", &format!("I{p}")).is_some())
+            .filter(|p| d.net_on(intern("u_lut5"), intern(&format!("I{p}"))).is_some())
             .collect();
         assert_eq!(
             pins,
@@ -1152,5 +1366,635 @@ endmodule
         s.drive_input("b", true).unwrap();
         s.step_posedge(10);
         assert_eq!(s.sample("u_ff"), Some(1));
+    }
+
+    // ========================================================================
+    // Levelized Flat Compiled 2-State & 4-State Fast Path Tests
+    // ========================================================================
+
+    #[test]
+    fn levelized_fast_2state_matches_event_sim_and_runs_multi_thousand_cycles() {
+        let d = six_bit_counter();
+        let mut ev_sim = Sim::new(&d);
+        let mut fast_sim = CompiledSim::new(&d);
+        assert_eq!(fast_sim.schedule.num_levels(), 1);
+        assert_eq!(fast_sim.schedule.ffs.len(), 6);
+        assert!(!fast_sim.schedule.has_combinational_loop);
+
+        for _ in 0..128 {
+            ev_sim.step_posedge(10);
+            fast_sim.step_2state(10);
+            assert_eq!(fast_sim.led, ev_sim.led);
+            for i in 0..6 {
+                let qname = format!("q{i}");
+                assert_eq!(fast_sim.sample(&qname), ev_sim.sample(&qname));
+            }
+        }
+
+        // High-speed compiled batch run (10,000 cycles, zero per-cycle allocation).
+        let mut batch_sim = Sim::new(&d);
+        let wave = batch_sim.run_fast_2state(10_000, 10);
+        assert_eq!(wave.len(), 10_000);
+        assert_eq!(batch_sim.cycle, 10_000);
+        assert_eq!(batch_sim.time, 100_000);
+        // 10_000 % 64 = 16 -> bit 5 (MSB of 6-bit counter) is 0 at count 16.
+        assert!(!batch_sim.led);
+    }
+
+    #[test]
+    fn levelized_fast_evaluates_carry4_chains_and_muxf7_muxf8_trees() {
+        // Build an 8-bit Carry4 counter + MUXF7/MUXF8 selector tree.
+        let mut d = Design::new("carry_mux_dut");
+        d.add_port("clk", PortDir::In);
+        d.add_port("sel0", PortDir::In);
+        d.add_port("sel1", PortDir::In);
+        d.add_port("y", PortDir::Out);
+
+        for c in 0..2u32 {
+            let cname = format!("u_carry{c}");
+            d.add_cell(&cname, CellKind::Carry4);
+            if c == 0 {
+                d.connect("1", &cname, "CYINIT");
+            } else {
+                d.connect("co_chain", &cname, "CI");
+            }
+            for i in 0..4u32 {
+                let bit = c * 4 + i;
+                let ff_name = format!("u_ff{bit}");
+                let q_net = format!("q_{bit}");
+                let o_net = format!("sum_{bit}");
+                d.add_cell(&ff_name, CellKind::Hff);
+                d.connect("clk", &ff_name, "CLK");
+                d.connect(&o_net, &cname, &format!("O{i}"));
+                d.connect(&o_net, &ff_name, "D");
+                d.connect(&q_net, &ff_name, "Q");
+                d.connect(&q_net, &cname, &format!("S{i}"));
+                d.connect("0", &cname, &format!("DI{i}"));
+            }
+            if c == 0 {
+                d.connect("co_chain", &cname, "CO3");
+            }
+        }
+
+        // Two MUXF7 cells feeding one MUXF8 cell to mux {q_0, q_1, q_2, q_3}.
+        d.add_cell(
+            "u_mux7_lo",
+            CellKind::BlackBox {
+                module: intern("MUXF7"),
+            },
+        );
+        d.connect("q_0", "u_mux7_lo", "I0");
+        d.connect("q_1", "u_mux7_lo", "I1");
+        d.connect("sel0", "u_mux7_lo", "S");
+        d.connect("m7_lo", "u_mux7_lo", "O");
+
+        d.add_cell(
+            "u_mux7_hi",
+            CellKind::BlackBox {
+                module: intern("MUXF7"),
+            },
+        );
+        d.connect("q_2", "u_mux7_hi", "I0");
+        d.connect("q_3", "u_mux7_hi", "I1");
+        d.connect("sel0", "u_mux7_hi", "S");
+        d.connect("m7_hi", "u_mux7_hi", "O");
+
+        d.add_cell(
+            "u_mux8",
+            CellKind::BlackBox {
+                module: intern("MUXF8"),
+            },
+        );
+        d.connect("m7_lo", "u_mux8", "I0");
+        d.connect("m7_hi", "u_mux8", "I1");
+        d.connect("sel1", "u_mux8", "S");
+        d.connect("y", "u_mux8", "O");
+
+        let mut sim = Sim::new(&d);
+        assert!(
+            sim.compiled().schedule.num_levels() >= 2,
+            "Carry0->Carry1 and MUXF7->MUXF8 must form at least 2 topological levels"
+        );
+
+        for count in 0..20u64 {
+            // Check all 8 counter bits match `count`.
+            let mut val = 0u64;
+            for b in 0..8 {
+                if sim.sample(&format!("q_{b}")) == Some(1) {
+                    val |= 1 << b;
+                }
+            }
+            assert_eq!(val, count, "8-bit Carry4 counter must equal {count}");
+
+            // Verify MUXF7 + MUXF8 4:1 mux selects q_{0..3}.
+            for sel in 0..4u64 {
+                sim.drive_input("sel0", (sel & 1) != 0).unwrap();
+                sim.drive_input("sel1", ((sel >> 1) & 1) != 0).unwrap();
+                sim.compiled_mut().eval_comb_2state();
+                let expected_bit = (count >> sel) & 1;
+                assert_eq!(sim.sample("y"), Some(expected_bit));
+            }
+
+            sim.step_posedge(10);
+        }
+    }
+
+    #[test]
+    fn four_state_logic_propagates_x_z_and_optimistically_resolves_dominated_cones() {
+        let d = and_dut();
+        let mut csim = CompiledSim::new_4state(&d, true);
+        // FFs start in X when init_ffs_x = true.
+        assert_eq!(csim.sample_4state("u_ff"), Some(Logic4::X));
+
+        // Drive a = X, b = 0 into an AND LUT (`init = 0x8`): `0 & X` must resolve to known `0`!
+        csim.drive_input_4state("a", Logic4::X).unwrap();
+        csim.drive_input_4state("b", Logic4::Zero).unwrap();
+        csim.step_4state(10);
+        assert_eq!(
+            csim.sample_4state("y"),
+            Some(Logic4::Zero),
+            "0 & X must resolve to deterministic 0"
+        );
+
+        // Drive a = X, b = 1 into the AND LUT: `1 & X` is unknown `X`!
+        csim.drive_input_4state("a", Logic4::X).unwrap();
+        csim.drive_input_4state("b", Logic4::One).unwrap();
+        csim.step_4state(10);
+        assert_eq!(
+            csim.sample_4state("y"),
+            Some(Logic4::X),
+            "1 & X must propagate X"
+        );
+
+        // Drive a = 1, b = 1: resolves to known `1`.
+        csim.drive_input_4state("a", Logic4::One).unwrap();
+        csim.drive_input_4state("b", Logic4::One).unwrap();
+        csim.step_4state(10);
+        assert_eq!(csim.sample_4state("y"), Some(Logic4::One));
+    }
+
+    // ========================================================================
+    // SDF Back-Annotated Gate-Level Timing Simulation Tests
+    // ========================================================================
+
+    #[test]
+    fn sdf_parser_and_gate_level_timing_detects_setup_hold_and_width_violations() {
+        let d = Design::structural_blinky();
+        let sdf_src = r#"
+(DELAYFILE
+  (SDFVERSION "3.0")
+  (DESIGN "blinky")
+  (TIMESCALE 1ps)
+  (INTERCONNECT u_ff/Q u_lut/I0 (120:150:180) (110:140:170))
+  (INTERCONNECT u_lut/O u_ff/D (200:250:320) (190:240:300))
+  (CELL
+    (CELLTYPE "LUT6")
+    (INSTANCE u_lut)
+    (DELAY
+      (ABSOLUTE
+        (IOPATH I0 O (90:110:140) (85:105:135))
+      )
+    )
+  )
+  (CELL
+    (CELLTYPE "FDRE")
+    (INSTANCE u_ff)
+    (DELAY
+      (ABSOLUTE
+        (IOPATH (posedge CLK) Q (100:120:160) (100:120:160))
+      )
+    )
+    (TIMINGCHECK
+      (SETUPHOLD D (posedge CLK) (80:100:120) (50:60:70))
+      (WIDTH (posedge CLK) (200:250:300))
+    )
+  )
+)
+"#;
+        let sdf = parse_sdf(sdf_src).expect("parse valid SDF");
+        assert_eq!(sdf.design_name.as_deref(), Some("blinky"));
+        assert_eq!(sdf.iopaths.len(), 2);
+        assert_eq!(sdf.interconnects.len(), 2);
+        assert_eq!(sdf.timing_checks.len(), 2);
+
+        // Total Max corner path delay:
+        // CLK->Q (160ps) + IC(u_ff/Q->u_lut/I0 = 180ps) + LUT(I0->O = 140ps) + IC(u_lut/O->u_ff/D = 320ps) = 800ps.
+        // Setup @ Max = 120ps -> minimum safe clock period = 920ps.
+        let mut sim = Sim::new(&d);
+        sim.attach_sdf(&sdf, SdfCorner::Max);
+
+        // Static arrival analysis must report 800ps at `u_ff`.
+        let arrivals = sim
+            .timing
+            .as_ref()
+            .unwrap()
+            .analyze_static_arrivals(&sim.compiled().schedule);
+        assert_eq!(arrivals.get("u_ff"), Some(&800));
+
+        // 1. Run at 1000ps period (slack = +80ps, pulse width = 500ps >= 300ps): NO violations!
+        sim.step_posedge(1000);
+        assert!(
+            sim.timing_violations().is_empty(),
+            "1000ps period has +80ps setup slack: {:?}",
+            sim.timing_violations()
+        );
+
+        // 2. Run at 850ps period (arrival 800ps + setup 120ps = 920ps > 850ps -> slack = -70ps): SETUP violation!
+        sim.step_posedge(850);
+        let viols = sim.timing_violations();
+        assert_eq!(viols.len(), 1, "{viols:?}");
+        assert_eq!(viols[0].kind, TimingViolationKind::Setup);
+        assert_eq!(viols[0].instance, "u_ff");
+        assert_eq!(viols[0].arrival_ps, 780);
+        assert_eq!(viols[0].limit_ps, 120);
+        assert_eq!(viols[0].slack_ps, -50);
+        // 3. Run at 500ps period (pulse width = 250ps < 300ps min width): both WIDTH and SETUP violations!
+        sim.clear_timing_violations();
+        sim.step_posedge(500);
+        let viols = sim.timing_violations();
+        assert!(
+            viols.iter().any(|v| v.kind == TimingViolationKind::PulseWidth),
+            "must flag pulse width violation at 500ps period: {viols:?}"
+        );
+        assert!(
+            viols.iter().any(|v| v.kind == TimingViolationKind::Setup),
+            "must flag setup violation at 500ps period: {viols:?}"
+        );
+
+        // 4. Hold violation test: fast zero-delay path with 150ps HOLD requirement.
+        let hold_sdf = r#"
+(DELAYFILE
+  (SDFVERSION "3.0")
+  (TIMESCALE 1ps)
+  (CELL
+    (CELLTYPE "FDRE")
+    (INSTANCE u_ff)
+    (DELAY (ABSOLUTE (IOPATH (posedge CLK) Q (20:20:20) (20:20:20))))
+    (TIMINGCHECK (HOLD D (posedge CLK) (150:150:150)))
+  )
+)
+"#;
+        let mut csim = CompiledSim::new(&d);
+        let mut hold_tm = SimTimingModel::parse(hold_sdf, SdfCorner::Max).unwrap();
+        let h_viols = hold_tm.step_timed(&mut csim, 1000);
+        assert_eq!(h_viols.len(), 1);
+        assert_eq!(h_viols[0].kind, TimingViolationKind::Hold);
+        assert_eq!(h_viols[0].slack_ps, -130);
+        // With inject_x_on_violation = true, the FF state becomes X!
+        assert_eq!(csim.sample_4state("u_ff"), Some(Logic4::X));
+    }
+
+    // ========================================================================
+    // Functional Coverage & SVA Property Summary Report Tests
+    // ========================================================================
+
+    #[test]
+    fn functional_coverage_tracks_toggles_branches_fsm_states_and_sva_covers() {
+        let src = r#"
+module top (
+    input  logic clk,
+    input  logic en,
+    output logic [3:0] cnt_o
+);
+    logic [3:0] cnt;
+    always_ff @(posedge clk) begin
+        if (en)
+            cnt <= cnt + 1;
+    end
+    assign cnt_o = cnt;
+    assert property (@(posedge clk) !en |-> ##1 $stable(cnt));
+    assert property (@(posedge clk) en |-> ##1 !$stable(cnt));
+endmodule
+"#;
+        let out = helion_sv::sva::synth_sv_with_sva(src, "top.sv").expect("synth sva");
+        let d = Design::structural_counter();
+        let mut sim = Sim::new(&d);
+        sim.register_branch_coverage("counter_lsb_branch", "q0");
+
+        // Also attach a cover property on q0 -> q1 transition.
+        let mut cover_prop = out.properties[1].clone();
+        cover_prop.label = Some("cov_inc".to_string());
+        cover_prop.text = "cover property (@(posedge clk) q0 |-> ##1 q1)".to_string();
+        cover_prop.probes = vec![
+            helion_sv::sva::SvaProbe::FfBit {
+                net: "q0".to_string(),
+            },
+            helion_sv::sva::SvaProbe::FfBit {
+                net: "q1".to_string(),
+            },
+        ];
+        cover_prop.antecedent = helion_sv::sva::SvaExpr::Bit(0);
+        cover_prop.consequent = helion_sv::sva::SvaExpr::Bit(1);
+        cover_prop.delay = 1;
+        sim.attach_sva_covers(&d, vec![cover_prop]).unwrap();
+
+        // Run 16 cycles so the 4-bit counter visits all 16 states (0..15) and wraps.
+        for _ in 0..16 {
+            sim.step_posedge(10);
+        }
+
+        let rep = sim.coverage_report();
+        assert_eq!(rep.cycles_sampled, 16);
+        assert_eq!(
+            rep.fully_toggled_nets(),
+            rep.total_nets(),
+            "every net in 4-bit counter toggles both 0->1 and 1->0 over 16 cycles: {:?}",
+            rep.net_toggles
+        );
+        assert!((rep.toggle_bin_coverage_pct() - 100.0).abs() < 1e-6);
+        assert!((rep.branch_coverage_pct() - 100.0).abs() < 1e-6);
+
+        // Auto-discovered 4-bit FSM/counter `q` (`q0..q3`) visited all 16 states.
+        let fsm = rep.fsms.iter().find(|f| f.name == "q").expect("auto fsm q");
+        assert_eq!(fsm.visited_states.len(), 16);
+        assert_eq!(fsm.transitions.len(), 16);
+        assert!((fsm.state_coverage_pct() - 100.0).abs() < 1e-6);
+
+        // Cover property hit multiple times when q0=1 is followed by q1=1.
+        assert_eq!(rep.sva.covers.len(), 1);
+        assert!(rep.sva.covers[0].is_covered());
+        assert!(rep.sva.covers[0].hits >= 4);
+        assert!(rep.summary_line().contains("covers=1/1"));
+        assert!(
+            rep.tcl_lines()
+                .iter()
+                .any(|l| l.starts_with("cover cov_inc: COVERED")),
+            "{:?}",
+            rep.tcl_lines()
+        );
+    }
+
+    // ========================================================================
+    // Compact Waveform Delta Streaming & Protocol Decoders Tests
+    // ========================================================================
+
+    #[test]
+    fn compact_wave_stream_fst_roundtrip_search_and_slice() {
+        let d = Design::structural_counter();
+        let stream = vcd::dump_wave_stream(&d, 32, 100);
+        let vcd_str = vcd::dump_vcd(&d, 32, 100);
+        let fst_bytes = stream.to_fst_bytes();
+        assert!(
+            fst_bytes.len() < vcd_str.len(),
+            "binary FST stream ({} B) must be more compact than ASCII VCD ({} B)",
+            fst_bytes.len(),
+            vcd_str.len()
+        );
+
+        let decoded = CompactWaveStream::from_fst_bytes(&fst_bytes).expect("decode HFST");
+        assert_eq!(decoded.signals().len(), stream.signals().len());
+        assert_eq!(decoded.duration_ps, stream.duration_ps);
+
+        // Glob and substring signal search.
+        let q_sigs = decoded.search_signals("q*");
+        assert_eq!(q_sigs.len(), 4);
+
+        let q0 = decoded.find_signal("q0").expect("q0");
+        let slice = decoded.slice(q0, 200, 750).expect("slice");
+        assert_eq!(slice.start_ps, 200);
+        assert_eq!(slice.end_ps, 750);
+        assert!(!slice.transitions.is_empty());
+
+        // Next rising edge query.
+        let first_rise = decoded.next_edge(q0, 0, Some(true)).expect("rising edge");
+        assert!(first_rise <= 200);
+    }
+
+    #[test]
+    fn protocol_decoders_reconstruct_axilite_axistream_uart_spi_i2c_wishbone() {
+        // 1. AXI4-Lite Write + Read transaction decoding
+        let mut axi_wave = CompactWaveStream::new(1);
+        let aclk = axi_wave.add_signal("aclk", 1);
+        let awvalid = axi_wave.add_signal("awvalid", 1);
+        let awready = axi_wave.add_signal("awready", 1);
+        let awaddr = axi_wave.add_signal("awaddr", 32);
+        let wvalid = axi_wave.add_signal("wvalid", 1);
+        let wready = axi_wave.add_signal("wready", 1);
+        let wdata = axi_wave.add_signal("wdata", 32);
+        let wstrb = axi_wave.add_signal("wstrb", 4);
+        let bvalid = axi_wave.add_signal("bvalid", 1);
+        let bready = axi_wave.add_signal("bready", 1);
+        let bresp = axi_wave.add_signal("bresp", 2);
+        let arvalid = axi_wave.add_signal("arvalid", 1);
+        let arready = axi_wave.add_signal("arready", 1);
+        let araddr = axi_wave.add_signal("araddr", 32);
+        let rvalid = axi_wave.add_signal("rvalid", 1);
+        let rready = axi_wave.add_signal("rready", 1);
+        let rdata = axi_wave.add_signal("rdata", 32);
+        let rresp = axi_wave.add_signal("rresp", 2);
+
+        axi_wave.record_change(aclk, 0, 0);
+        // Cycle 1 (t=10): AW + W handshake to 0x1000_0004 with 0xCAFE_BABE
+        axi_wave.record_change(awvalid, 5, 1);
+        axi_wave.record_change(awready, 5, 1);
+        axi_wave.record_change(awaddr, 5, 0x1000_0004);
+        axi_wave.record_change(wvalid, 5, 1);
+        axi_wave.record_change(wready, 5, 1);
+        axi_wave.record_change(wdata, 5, 0xCAFE_BABE);
+        axi_wave.record_change(wstrb, 5, 0xF);
+        axi_wave.record_change(aclk, 10, 1);
+        axi_wave.record_change(aclk, 15, 0);
+        // Cycle 2 (t=20): B response + AR handshake to 0x1000_0004
+        axi_wave.record_change(awvalid, 16, 0);
+        axi_wave.record_change(wvalid, 16, 0);
+        axi_wave.record_change(bvalid, 16, 1);
+        axi_wave.record_change(bready, 16, 1);
+        axi_wave.record_change(bresp, 16, 0);
+        axi_wave.record_change(arvalid, 16, 1);
+        axi_wave.record_change(arready, 16, 1);
+        axi_wave.record_change(araddr, 16, 0x1000_0004);
+        axi_wave.record_change(aclk, 20, 1);
+        axi_wave.record_change(aclk, 25, 0);
+        // Cycle 3 (t=30): R response with 0xCAFE_BABE
+        axi_wave.record_change(bvalid, 26, 0);
+        axi_wave.record_change(arvalid, 26, 0);
+        axi_wave.record_change(rvalid, 26, 1);
+        axi_wave.record_change(rready, 26, 1);
+        axi_wave.record_change(rdata, 26, 0xCAFE_BABE);
+        axi_wave.record_change(rresp, 26, 0);
+        axi_wave.record_change(aclk, 30, 1);
+
+        let axi_txs = decode_axi_lite(
+            &axi_wave,
+            &AxiLiteSignals {
+                aclk,
+                aresetn: None,
+                awvalid,
+                awready,
+                awaddr,
+                wvalid,
+                wready,
+                wdata,
+                wstrb: Some(wstrb),
+                bvalid,
+                bready,
+                bresp: Some(bresp),
+                arvalid,
+                arready,
+                araddr,
+                rvalid,
+                rready,
+                rdata,
+                rresp: Some(rresp),
+            },
+        );
+        assert_eq!(axi_txs.len(), 2);
+        assert_eq!(axi_txs[0].kind, AxiLiteTxKind::Write);
+        assert_eq!(axi_txs[0].addr, 0x1000_0004);
+        assert_eq!(axi_txs[0].data, 0xCAFE_BABE);
+        assert_eq!(axi_txs[1].kind, AxiLiteTxKind::Read);
+        assert_eq!(axi_txs[1].addr, 0x1000_0004);
+        assert_eq!(axi_txs[1].data, 0xCAFE_BABE);
+
+        // 2. AXI4-Stream multi-beat packet decoding
+        let mut axis_wave = CompactWaveStream::new(1);
+        let s_clk = axis_wave.add_signal("aclk", 1);
+        let tvalid = axis_wave.add_signal("tvalid", 1);
+        let tready = axis_wave.add_signal("tready", 1);
+        let tdata = axis_wave.add_signal("tdata", 8);
+        let tlast = axis_wave.add_signal("tlast", 1);
+        axis_wave.record_change(s_clk, 0, 0);
+        for (i, &(byte, last)) in [(0x11u64, 0u64), (0x22, 0), (0x33, 1)].iter().enumerate() {
+            let t_setup = (i as u64) * 10 + 5;
+            let t_edge = (i as u64 + 1) * 10;
+            axis_wave.record_change(tvalid, t_setup, 1);
+            axis_wave.record_change(tready, t_setup, 1);
+            axis_wave.record_change(tdata, t_setup, byte);
+            axis_wave.record_change(tlast, t_setup, last);
+            axis_wave.record_change(s_clk, t_edge, 1);
+            axis_wave.record_change(s_clk, t_edge + 5, 0);
+        }
+        let pkts = decode_axi_stream(
+            &axis_wave,
+            &AxiStreamSignals {
+                aclk: s_clk,
+                tvalid,
+                tready,
+                tdata,
+                tlast: Some(tlast),
+                tkeep: None,
+                tuser: None,
+            },
+        );
+        assert_eq!(pkts.len(), 1);
+        assert_eq!(pkts[0].beats, vec![0x11, 0x22, 0x33]);
+        assert!(pkts[0].terminated_by_tlast);
+
+        // 3. UART 8N1 frame decoding ('A' = 0x41)
+        let mut uart_wave = CompactWaveStream::new(1);
+        let tx = uart_wave.add_signal("tx", 1);
+        let bit_ps = 100u64;
+        uart_wave.record_change(tx, 0, 1); // idle high
+        uart_wave.record_change(tx, 100, 0); // start bit
+        let byte = 0x41u8;
+        for b in 0..8u64 {
+            uart_wave.record_change(tx, 200 + b * bit_ps, u64::from((byte >> b) & 1));
+        }
+        uart_wave.record_change(tx, 1000, 1); // stop bit
+        let uart_frames = decode_uart(&uart_wave, &UartConfig::new_8n1(tx, bit_ps));
+        assert_eq!(uart_frames.len(), 1);
+        assert_eq!(uart_frames[0].data, 0x41);
+        assert!(!uart_frames[0].parity_error);
+        assert!(!uart_frames[0].framing_error);
+
+        // 4. SPI Mode 0 8-bit full-duplex decoding (MOSI = 0xA5, MISO = 0x5A)
+        let mut spi_wave = CompactWaveStream::new(1);
+        let sclk = spi_wave.add_signal("sclk", 1);
+        let cs_n = spi_wave.add_signal("cs_n", 1);
+        let mosi = spi_wave.add_signal("mosi", 1);
+        let miso = spi_wave.add_signal("miso", 1);
+        spi_wave.record_change(sclk, 0, 0);
+        spi_wave.record_change(cs_n, 0, 1);
+        spi_wave.record_change(cs_n, 5, 0);
+        for b in 0..8u64 {
+            let bit_idx = 7 - b;
+            let t_setup = 10 + b * 20;
+            let t_rise = 20 + b * 20;
+            let t_fall = 30 + b * 20;
+            spi_wave.record_change(mosi, t_setup, (0xA5 >> bit_idx) & 1);
+            spi_wave.record_change(miso, t_setup, (0x5A >> bit_idx) & 1);
+            spi_wave.record_change(sclk, t_rise, 1);
+            spi_wave.record_change(sclk, t_fall, 0);
+        }
+        spi_wave.record_change(cs_n, 200, 1);
+        let spi_txs = decode_spi(
+            &spi_wave,
+            &SpiConfig::mode0_8bit(sclk, cs_n, mosi, Some(miso)),
+        );
+        assert_eq!(spi_txs.len(), 1);
+        assert_eq!(spi_txs[0].mosi_words, vec![0xA5]);
+        assert_eq!(spi_txs[0].miso_words, vec![0x5A]);
+
+        // 5. I2C START + 7-bit address (0x50 Write, ACK) + Data (0x3C, ACK) + STOP
+        let mut i2c_wave = CompactWaveStream::new(1);
+        let scl = i2c_wave.add_signal("scl", 1);
+        let sda = i2c_wave.add_signal("sda", 1);
+        i2c_wave.record_change(scl, 0, 1);
+        i2c_wave.record_change(sda, 0, 1);
+        // START: SDA falls at t=10 while SCL=1
+        i2c_wave.record_change(sda, 10, 0);
+        i2c_wave.record_change(scl, 15, 0);
+        // 9 bits for addr (0x50 << 1 | 0 = 0xA0, ACK = 0) + 9 bits for data (0x3C, ACK = 0)
+        let i2c_bits: [u64; 18] = [
+            1, 0, 1, 0, 0, 0, 0, 0, 0, // 0x50 write + ACK(0)
+            0, 0, 1, 1, 1, 1, 0, 0, 0, // 0x3C + ACK(0)
+        ];
+        for (idx, &bit) in i2c_bits.iter().enumerate() {
+            let base = 20 + (idx as u64) * 20;
+            i2c_wave.record_change(sda, base, bit);
+            i2c_wave.record_change(scl, base + 5, 1);
+            i2c_wave.record_change(scl, base + 15, 0);
+        }
+        // STOP: SDA rises while SCL=1
+        i2c_wave.record_change(sda, 400, 0);
+        i2c_wave.record_change(scl, 405, 1);
+        i2c_wave.record_change(sda, 410, 1);
+        let i2c_txs = decode_i2c(&i2c_wave, &I2cSignals { scl, sda });
+        assert_eq!(i2c_txs.len(), 1);
+        assert_eq!(i2c_txs[0].address, 0x50);
+        assert!(!i2c_txs[0].is_read);
+        assert!(i2c_txs[0].address_ack);
+        assert_eq!(i2c_txs[0].data_bytes.len(), 1);
+        assert_eq!(i2c_txs[0].data_bytes[0].byte, 0x3C);
+        assert!(i2c_txs[0].data_bytes[0].ack);
+
+        // 6. Wishbone Classic Write + Read cycle decoding
+        let mut wb_wave = CompactWaveStream::new(1);
+        let wb_clk = wb_wave.add_signal("clk", 1);
+        let cyc = wb_wave.add_signal("cyc", 1);
+        let stb = wb_wave.add_signal("stb", 1);
+        let we = wb_wave.add_signal("we", 1);
+        let adr = wb_wave.add_signal("adr", 32);
+        let dat_w = wb_wave.add_signal("dat_w", 32);
+        let dat_r = wb_wave.add_signal("dat_r", 32);
+        let ack = wb_wave.add_signal("ack", 1);
+        wb_wave.record_change(wb_clk, 0, 0);
+        wb_wave.record_change(cyc, 5, 1);
+        wb_wave.record_change(stb, 5, 1);
+        wb_wave.record_change(we, 5, 1);
+        wb_wave.record_change(adr, 5, 0x2000);
+        wb_wave.record_change(dat_w, 5, 0x1234_5678);
+        wb_wave.record_change(ack, 5, 1);
+        wb_wave.record_change(wb_clk, 10, 1);
+        wb_wave.record_change(wb_clk, 15, 0);
+        let wb_txs = decode_wishbone(
+            &wb_wave,
+            &WishboneSignals {
+                clk: wb_clk,
+                cyc,
+                stb,
+                we,
+                adr,
+                dat_w,
+                dat_r,
+                ack,
+                err: None,
+                sel: None,
+            },
+        );
+        assert_eq!(wb_txs.len(), 1);
+        assert!(wb_txs[0].is_write);
+        assert_eq!(wb_txs[0].addr, 0x2000);
+        assert_eq!(wb_txs[0].data, 0x1234_5678);
     }
 }
