@@ -18,7 +18,7 @@
   <a href="https://github.com/helion-fpga/helion/actions/workflows/ci.yml"><img src="https://github.com/helion-fpga/helion/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/helion-fpga/helion/releases/latest"><img src="https://img.shields.io/github/v/release/helion-fpga/helion" alt="Latest release"></a>
   <a href="https://github.com/helion-fpga/helion/releases"><img src="https://img.shields.io/github/downloads/helion-fpga/helion/total.svg" alt="Downloads"></a>
-  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License"></a>
 </p>
 
 <p align="center">
@@ -198,7 +198,11 @@ Rust, SystemVerilog, STA, IDE, or docs: [get involved](https://helion-fpga.githu
 
 ## License
 
-Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
+Licensed under [AGPL-3.0-or-later](LICENSE).
+
+The "Helion" name and logo are trademarks of Saksham Srivastava; see
+[TRADEMARKS.md](TRADEMARKS.md). The AGPL covers the code, not the brand:
+if you fork or redistribute a modified version, rename it.
 
 ## Repository Traffic
 
