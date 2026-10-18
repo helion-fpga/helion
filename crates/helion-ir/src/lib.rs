@@ -6,6 +6,13 @@ pub use opt::{
     canonicalize_lut6, lut6_input_is_dont_care, LutOptStats, MuxfKind, OptDesignStats,
     PhysOptStats, WideConeDecomp, WideTruthTable, BUF_INIT, INV_INIT, MUXF_INIT,
 };
+pub use opt::LutOptStats;
+pub mod priority_cut;
+pub use priority_cut::{
+    compose_lut6_shannon, lift_cut_truth_table, map_priority_cuts_lut6, npn4_apply,
+    npn4_are_equivalent, npn4_canonical, npn4_reconstruct, prune_and_compact_cut, Npn4Transform,
+    PriorityCut, PriorityCutStats, LUT6_VAR_INIT,
+};
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
