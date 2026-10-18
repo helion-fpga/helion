@@ -16,6 +16,7 @@ pub mod emit;
 pub mod parser;
 pub mod pragma;
 pub mod schedule;
+pub mod systolic_csr_dataflow;
 
 pub use ap_math_stream::{
     ApFixed, ApInt, ApOverflowMode, ApQuantMode, HlsStream, hls_abs_i64, hls_clz_u64,
@@ -45,6 +46,12 @@ pub use schedule::{
     resolve_top_and_inline, schedule_cdfg, ArrayBankConfig, BasicBlock, BindingResult,
     BoundBramBank, BoundDsp, Cdfg, CdfgEdge, CdfgNode, CdfgOp, CmpKind, ControlEdge,
     ControlEdgeKind, DataflowChannel, DataflowProcess, DepKind, LoopScheduleInfo, ScheduleResult,
+};
+pub use systolic_csr_dataflow::{
+    AxiLiteCsrMap, AxiLiteCsrReg, DataflowChannelSpec, DataflowChannelStorage, DataflowGraph,
+    DataflowTaskNode, SystolicArrayConfig, SystolicDataflowMode, SystolicGridResult,
+    SystolicPeNode, analyze_dataflow_network, build_axilite_csr_map,
+    compute_deadlock_free_fifo_depth, emit_axilite_c_driver, generate_systolic_pe_grid,
 };
 
 use helion_ir::{CellKind, Design};
@@ -918,5 +925,132 @@ void fir_mac_cosim(int a[4], int b[4], int bias, int *out) {
         assert_eq!(fail_report.status, CosimStatus::Fail);
         assert_eq!(fail_report.vectors_passed, 0);
         assert!(fail_report.report_text.contains("FAIL"));
+    }
+
+    #[test]
+    fn hls_dataflow_task_network_pipo_vs_fifo_and_deadlock_free_sizing() {
+        let src = r#"
+void producer_seq(int in_a[16], int seq_ch[16], int rand_buf[16]) {
+  for (int i = 0; i < 16; i++) {
+    #pragma HLS PIPELINE II=1
+    seq_ch[i] = in_a[i] + 1;
+    rand_buf[i] = in_a[i] * 2;
+  }
+}
+
+void consumer_unbalanced(int seq_ch[16], int rand_buf[16], int out_b[16]) {
+  for (int i = 0; i < 16; i++) {
+    #pragma HLS PIPELINE II=4
+    out_b[i] = seq_ch[i] + rand_buf[15 - i];
+  }
+}
+
+void dataflow_top(int in_a[16], int out_b[16]) {
+  #pragma HLS DATAFLOW
+  int seq_ch[16];
+  int rand_buf[16];
+  producer_seq(in_a, seq_ch, rand_buf);
+  consumer_unbalanced(seq_ch, rand_buf, out_b);
+}
+"#;
+        let df = analyze_dataflow_network(src).expect("analyze_dataflow_network");
+        assert_eq!(df.tasks.len(), 2);
+        assert_eq!(df.channels.len(), 2);
+        // `seq_ch` is accessed sequentially (`seq_ch[i]`) -> StreamFifo
+        // With producer II=1 and slower consumer II=4 over 16 items, deadlock-free FIFO depth > 12
+        let seq_spec = df.channels.iter().find(|c| c.name == "seq_ch").unwrap();
+        assert!(seq_spec.sequential_access);
+        assert!(matches!(
+            seq_spec.storage,
+            DataflowChannelStorage::StreamFifo { min_depth } if min_depth >= 12
+        ));
+        // `rand_buf` is accessed out-of-order (`rand_buf[15 - i]`) -> 2-bank PingPongRam (PIPO)
+        let rand_spec = df.channels.iter().find(|c| c.name == "rand_buf").unwrap();
+        assert!(!rand_spec.sequential_access);
+        assert_eq!(
+            rand_spec.storage,
+            DataflowChannelStorage::PingPongRam {
+                banks: 2,
+                bank_depth: 16
+            }
+        );
+        assert!(df.synchronizer_sv.contains("ap_channel_done_rand_buf"));
+        assert!(df.synchronizer_sv.contains("start_for_consumer_unbalanced_din"));
+    }
+
+    #[test]
+    fn hls_2d_dsp48_systolic_array_pe_grid_synthesis() {
+        let cfg = SystolicArrayConfig {
+            name: "systolic_3x3".into(),
+            rows: 3,
+            cols: 3,
+            inner_k: 4,
+            data_width: 16,
+            mode: SystolicDataflowMode::WeightStationary,
+        };
+        let grid = generate_systolic_pe_grid(&cfg).expect("generate 3x3 systolic grid");
+        assert_eq!(grid.pe_grid.len(), 9);
+        assert_eq!(grid.total_dsp48, 9);
+        assert_eq!(grid.ii_cycles, 1);
+        let dsp_cells = grid
+            .design
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. }))
+            .count();
+        assert_eq!(dsp_cells, 9, "3x3 systolic PE grid must synthesize 9 DSP48E1 cells");
+        // Verify vertical PCIN/BCOUT cascade wiring on row > 0
+        let pe_2_1 = grid.pe_grid.iter().find(|p| p.row == 2 && p.col == 1).unwrap();
+        assert_eq!(pe_2_1.b_in_net, "pe_bcout_1_1");
+        assert_eq!(pe_2_1.pcin_net.as_deref(), Some("pe_pcout_1_1"));
+
+        let a = vec![
+            vec![1, 2, 3, 4],
+            vec![2, 1, 0, 1],
+            vec![0, 3, 2, 1],
+        ];
+        let b = vec![
+            vec![1, 0, 2],
+            vec![0, 1, 1],
+            vec![2, 1, 0],
+            vec![1, 2, 1],
+        ];
+        let c = grid.execute_matmul(&a, &b);
+        assert_eq!(c[0], vec![11, 13, 8]);
+        assert_eq!(c[1], vec![3, 3, 6]);
+        assert_eq!(c[2], vec![5, 7, 4]);
+    }
+
+    #[test]
+    fn hls_axilite_csr_map_and_bare_metal_c_driver_emission() {
+        let src = r#"
+int conv1d_csr(int *in_ptr, int *out_ptr, int coeff, int bias) {
+  #pragma HLS INTERFACE s_axilite port=return bundle=control
+  #pragma HLS INTERFACE m_axi port=in_ptr bundle=gmem0
+  #pragma HLS INTERFACE m_axi port=out_ptr bundle=gmem0
+  #pragma HLS INTERFACE s_axilite port=coeff bundle=control
+  #pragma HLS INTERFACE s_axilite port=bias bundle=control
+  *out_ptr = (*in_ptr) * coeff + bias;
+  return *out_ptr;
+}
+"#;
+        let hls = hls_compile(src).expect("compile conv1d_csr");
+        let (csr_map, c_header) = emit_axilite_c_driver(&hls);
+        assert_eq!(csr_map.registers[0].offset, 0x00);
+        assert_eq!(csr_map.registers[0].name, "AP_CTRL");
+        assert_eq!(csr_map.registers[1].offset, 0x04);
+        assert_eq!(csr_map.registers[1].name, "GIE");
+        assert_eq!(csr_map.registers[2].offset, 0x08);
+        assert_eq!(csr_map.registers[2].name, "IER");
+        assert_eq!(csr_map.registers[3].offset, 0x0C);
+        assert_eq!(csr_map.registers[3].name, "ISR");
+        assert!(c_header.contains("#define XCONV1D_CSR_CONTROL_ADDR_AP_CTRL 0x00"));
+        assert!(c_header.contains("#define XCONV1D_CSR_CONTROL_ADDR_GIE 0x04"));
+        assert!(c_header.contains("#define XCONV1D_CSR_CONTROL_ADDR_IER 0x08"));
+        assert!(c_header.contains("#define XCONV1D_CSR_CONTROL_ADDR_ISR 0x0c"));
+        assert!(c_header.contains("#define XCONV1D_CSR_CONTROL_ADDR_COEFF_DATA"));
+        assert!(c_header.contains("#define XCONV1D_CSR_CONTROL_ADDR_BIAS_DATA"));
+        assert!(c_header.contains("Xconv1d_csr_Start"));
+        assert!(c_header.contains("Xconv1d_csr_IsDone"));
     }
 }
