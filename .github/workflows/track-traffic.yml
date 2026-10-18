@@ -1,0 +1,104 @@
+name: Track repository traffic
+
+# GitHub only keeps 14 days of traffic data (clones, views). This workflow
+# snapshots it daily into traffic/ history files so the record is permanent.
+# Data: total clones, unique cloners, views, unique visitors per day.
+
+on:
+  schedule:
+    - cron: "0 1 * * *" # daily at 01:00 UTC
+  workflow_dispatch: # allow manual runs
+
+permissions:
+  contents: write
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch traffic and append to history
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p traffic
+
+          # Clones: 14-day window, per-day count + uniques
+          gh api "repos/$REPO/traffic/clones" > /tmp/clones.json
+          # Views: 14-day window, per-day count + uniques
+          gh api "repos/$REPO/traffic/views" > /tmp/views.json
+
+          # Append new days to ndjson history, deduped by timestamp
+          for kind in clones views; do
+            hist="traffic/${kind}-history.ndjson"
+            touch "$hist"
+            python3 - "$kind" "$hist" <<'EOF'
+          import json, sys
+          kind, hist = sys.argv[1], sys.argv[2]
+          with open(f"/tmp/{kind}.json") as f:
+              data = json.load(f)
+          seen = set()
+          try:
+              with open(hist) as f:
+                  for line in f:
+                      line = line.strip()
+                      if line:
+                          seen.add(json.loads(line)["timestamp"])
+          except FileNotFoundError:
+              pass
+          added = 0
+          with open(hist, "a") as f:
+              for e in data.get(kind, []):
+                  ts = e["timestamp"][:10]  # day granularity
+                  if ts not in seen:
+                      f.write(json.dumps({
+                          "timestamp": ts,
+                          "count": e["count"],
+                          "uniques": e["uniques"],
+                      }) + "\n")
+                      seen.add(ts)
+                      added += 1
+          print(f"{kind}: +{added} new days")
+          EOF
+          done
+
+          # Summary table (all time, from history files)
+          python3 - <<'EOF'
+          import json
+          rows = {}
+          for kind in ("clones", "views"):
+              total = uniques = days = 0
+              try:
+                  with open(f"traffic/{kind}-history.ndjson") as f:
+                      for line in f:
+                          line = line.strip()
+                          if line:
+                              e = json.loads(line)
+                              total += e["count"]
+                              uniques += e["uniques"]
+                              days += 1
+              except FileNotFoundError:
+                  pass
+              rows[kind] = (total, uniques, days)
+          with open("traffic/README.md", "w") as f:
+              f.write("# Repository traffic history\n\n")
+              f.write("GitHub keeps only 14 days of traffic data. This directory holds the\n")
+              f.write("permanent record, appended daily by `.github/workflows/track-traffic.yml`.\n\n")
+              f.write("| Metric | Total | Uniques | Days tracked |\n")
+              f.write("|---|---|---|---|\n")
+              for kind in ("clones", "views"):
+                  t, u, d = rows[kind]
+                  f.write(f"| {kind} | {t} | {u} | {d} |\n")
+          EOF
+          cat traffic/README.md
+
+      - name: Commit history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add traffic/
+          git diff --cached --quiet || git commit -m "traffic: daily snapshot"
+          git push
