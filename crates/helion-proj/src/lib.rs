@@ -17,6 +17,13 @@ pub use checkpoint2::{
     delete_checkpoint, diff_metas, list_checkpoints, load_checkpoint, read_meta, save_checkpoint,
     stage_of,
 };
+pub mod translator;
+pub use translator::{
+    ClockConstraint, ClockGroupRelation, ClockGroupsConstraint, ConstraintFormat,
+    FalsePathConstraint, IoDelayConstraint, MaxDelayConstraint, MulticycleConstraint,
+    PortConstraint, PullMode, SlewRate, UniversalConstraints, canonicalize_iostandard,
+    iostandard_to_lattice, iostandard_to_quartus, iostandard_to_vivado, translate_constraints,
+};
 
 /// UG986 Lab 1 Helion equivalents of implementation strategies.
 /// Not Vivado strategy trademarks: same *kind* of lever (timing vs runtime vs phys).
@@ -1960,8 +1967,14 @@ pub fn constraints_from_project(
         let path = resolve_prj_path(prj_path, cf);
         let body = std::fs::read_to_string(&path)
             .map_err(|e| format!("read_xdc {}: {e}", path.display()))?;
-        blob.push_str(&body);
-        if !body.ends_with('\n') {
+        let normalized = match ConstraintFormat::from_extension(&path) {
+            Some(fmt @ (ConstraintFormat::Lpf | ConstraintFormat::Pcf | ConstraintFormat::Qsf)) => {
+                UniversalConstraints::parse_format(&body, fmt)?.to_xdc()
+            }
+            _ => body,
+        };
+        blob.push_str(&normalized);
+        if !normalized.ends_with('\n') {
             blob.push('\n');
         }
     }
@@ -2066,7 +2079,7 @@ mod tests {
         assert_eq!(cells, vec!["u_lut"]);
         let ckpt = Session::restore_with_ir(&ck).unwrap();
         let ir = ckpt.design.expect("checkpoint must embed HNF");
-        assert_eq!(ir.name, "blinky");
+        assert_eq!(resolve(ir.name), "blinky");
         assert_eq!(ir.lut_inits(), Design::structural_blinky().lut_inits());
         assert_eq!(ckpt.strategy, ImplStrategy::Default);
         assert!(get_nets(proj.design.as_ref().unwrap(), Some("q")).contains(&"q".into()));
@@ -2877,10 +2890,10 @@ create_pblock pblock_0
             d.add_cell(&lut, CellKind::Lut6 { init: 2 });
             d.add_cell(&ff, CellKind::Hff);
             d.connect("clk", &ff, "CLK");
-            d.connect(format!("d{i}"), &lut, "O");
-            d.connect(format!("d{i}"), &ff, "D");
-            d.connect(format!("q{i}"), &ff, "Q");
-            d.connect(format!("q{i}"), &lut, "I0");
+            d.connect(&format!("d{i}"), &lut, "O");
+            d.connect(&format!("d{i}"), &ff, "D");
+            d.connect(&format!("q{i}"), &ff, "Q");
+            d.connect(&format!("q{i}"), &lut, "I0");
         }
         d.add_cell("u_iob", CellKind::IobOut);
         d.connect("q0", "u_iob", "I");
