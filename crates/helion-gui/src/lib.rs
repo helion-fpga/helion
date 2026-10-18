@@ -56,14 +56,15 @@ pub use ide::{
     Ila, IlaStatus,
     MemoryWordRow, BreakpointRow, ForceRow, EditorMarker, MsgSeverity, NavAction, NavSection, SourceLine,
     ConstraintRow, ConstraintSection, MidRunUi,
-    Pblock, ProjectSummaryGadget, PropertyRow, ProbeSelection, ReportCatalogRow,
+    Pblock, ProjectSummaryGadget, PropertyRow, ProbeSelection, CrossProbeSelection,
+    RtlSymbolInfo, RtlSymbolLocation, ReportCatalogRow,
     NetlistRow, NetlistTree, PackageDrawing, PackagePin, SchematicCamera, SchematicDrawing, SchematicPin,
     SchematicSymbol, SchematicView, SchematicWire, ScopeNode, SimLogRow, SimObject, EcoRow, IncrementalRow, StepState, TimingPath,
     schematic_kind_label, schematic_short_name,
     TimingPathPin, TimingPathSortCol,
     RunCol, best_run_index, sort_run_indices, sweep_wns_stats,
     UltraFastStage, Utilization, UtilizationReport, UtilOccupancy, HierOccupancy, VirtualBus,
-    Waveform, WaveMarker, WaveCursorRow, WaveRadix, WaveStyle, WaveTrace, WorkspaceTab, WaveDensity,
+    Waveform, WaveMarker, WaveCursorRow, WaveProtocol, WaveRadix, WaveStyle, WaveTrace, WaveTransaction, WorkspaceTab, WaveDensity,
 };
 pub use helion_drc::{Drc, DrcSeverity, DrcViolation};
 pub use helion_sta::{

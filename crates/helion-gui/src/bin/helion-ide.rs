@@ -1455,6 +1455,9 @@ fn handle_shortcuts(ctx: &egui::Context, app: &mut HelionIde) {
     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::Z)) {
         app.editor_wrap = !app.editor_wrap;
     }
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F4)) {
+        let _ = app.model.cross_probe("");
+    }
 }
 
 fn native_close_project(app: &mut HelionIde) {
@@ -11229,6 +11232,71 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
             );
         });
     ui.separator();
+    ui.horizontal(|ui| {
+        ui.heading("Waveform");
+        let a_txt = match model.wave.cursor_a {
+            Some(s) => format!("A t={s} ({} ps)", model.wave.time_ps(s)),
+            None => "A=-".into(),
+        };
+        let b_txt = match model.wave.cursor_b {
+            Some(s) => format!("B t={s} ({} ps)", model.wave.time_ps(s)),
+            None => "B=-".into(),
+        };
+        let d_txt = match model.wave.time_delta_ps() {
+            Some(d) => format!("Δt={d} ps"),
+            None => "Δt=n/a".into(),
+        };
+        let ns = model.wave.timescale_ps as f64 / 1000.0;
+        let period = if ns >= 1.0 && (ns - ns.round()).abs() < 1e-9 {
+            format!("{} ns per cycle", ns.round() as i64)
+        } else {
+            format!("{} ps per cycle", model.wave.timescale_ps)
+        };
+        ui.label(
+            RichText::new(format!(
+                "Waveform {period}  cursor t={}  {a_txt}  {b_txt}  {d_txt}",
+                model.wave.cursor,
+            ))
+            .weak(),
+        );
+        if sidebar_button(ui, "Cursor A")
+            .on_hover_text("Place cursor A (Shift-click on wave)")
+            .clicked()
+        {
+            let _ = model.set_wave_ab_cursor("A");
+        }
+        if sidebar_button(ui, "Cursor B")
+            .on_hover_text("Place cursor B (Alt-click on wave)")
+            .clicked()
+        {
+            let _ = model.set_wave_ab_cursor("B");
+        }
+        if sidebar_button(ui, "Add marker").clicked() {
+            let n = model.wave.markers.len() + 1;
+            let _ = model.add_wave_marker(&format!("M{n}"));
+        }
+        if sidebar_button(ui, "Virtual bus").clicked() {
+            let _ = model.add_wave_virtual_bus("vb led cnt");
+        }
+        ui.checkbox(&mut model.wave.show_protocol_lanes, "Protocol lanes")
+            .on_hover_text("Decode multi-bit bus protocols into symbolic transaction lanes");
+        // GTKWave-style lane density.
+        ui.label(RichText::new("Density").small().weak());
+        let mut dens = model.wave.density;
+        ui.radio_value(&mut dens, helion_gui::WaveDensity::Comfortable, "Comfortable")
+            .on_hover_text("Roomy lanes for probing");
+        ui.radio_value(&mut dens, helion_gui::WaveDensity::Compact, "Compact")
+            .on_hover_text("Fit ~3x more signals in the pane");
+        model.wave.density = dens;
+    });
+    ui.label(
+        RichText::new("click cursor · Shift A · Alt B")
+            .small()
+            .weak(),
+    );
+    paint_wave_markers(ui, model);
+    paint_wave_cursors(ui, model);
+    paint_virtual_buses(ui, model);
     if model.wave.traces.is_empty() {
         if paint_remaining_cta(
             ui,
@@ -11402,11 +11470,21 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
 
     let mut style_cmd: Option<(String, WaveStyle)> = None;
     let mut radix_cmd: Option<(String, WaveRadix)> = None;
+    let mut proto_cmd: Option<(String, helion_gui::WaveProtocol)> = None;
+    let mut probe_cmd: Option<String> = None;
     let mut new_cursor: Option<usize> = None;
     let mut place_a: Option<usize> = None;
     let mut place_b: Option<usize> = None;
+    let cursor = model.wave.cursor;
+    let cursor_a = model.wave.cursor_a;
+    let cursor_b = model.wave.cursor_b;
+    let ts = model.wave.timescale_ps;
+    let row_h = chrome::wave_trace_row_h(model.wave.density);
+    let active_wave_probe = model.cross_probe.wave_trace.clone();
 
     for (row_idx, t) in model.wave.traces.iter().enumerate() {
+    for t in &model.wave.traces {
+        let is_probed = active_wave_probe.as_deref() == Some(t.name.as_str());
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
             ui.set_min_height(row_h);
@@ -11430,6 +11508,26 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                 t.value_at(cursor),
                 theme::font_code(12.0),
                 theme.ok,
+            if ui
+                .add_sized(
+                    [110.0, 28.0],
+                    egui::Button::selectable(
+                        is_probed,
+                        RichText::new(&t.name).monospace().strong(),
+                    ),
+                )
+                .on_hover_text("Click to cross-probe signal across RTL, Schematic, Device, Timing, and DRC (F4)")
+                .clicked()
+            {
+                probe_cmd = Some(t.name.clone());
+            }
+            ui.add_sized(
+                [72.0, 28.0],
+                egui::Label::new(
+                    RichText::new(t.value_at(cursor))
+                        .monospace()
+                        .color(theme.ok),
+                ),
             );
             if let Some(a) = cursor_a {
                 let (arect, _) = ui.allocate_exact_size(egui::vec2(ab_w, row_h), Sense::hover());
@@ -11567,8 +11665,122 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                     ));
                     ui.close();
                 }
+                ui.separator();
+                for proto in [
+                    helion_gui::WaveProtocol::Auto,
+                    helion_gui::WaveProtocol::Raw,
+                    helion_gui::WaveProtocol::AxiLite,
+                    helion_gui::WaveProtocol::Spi,
+                    helion_gui::WaveProtocol::Uart,
+                    helion_gui::WaveProtocol::StateCounter,
+                ] {
+                    if ui
+                        .button(format!("Protocol: {}", proto.label()))
+                        .clicked()
+                    {
+                        proto_cmd = Some((t_name.clone(), proto));
+                        ui.close();
+                    }
+                }
             });
         });
+    }
+    if model.wave.show_protocol_lanes {
+        let proto_lanes = model.wave.protocol_lanes();
+        for (lane_name, proto_name, txs) in &proto_lanes {
+            let cur_label = txs
+                .iter()
+                .find(|tx| cursor >= tx.start_sample && cursor <= tx.end_sample)
+                .map(|tx| tx.label.as_str())
+                .unwrap_or("-");
+            ui.horizontal(|ui| {
+                ui.set_min_height(row_h);
+                ui.set_max_height(row_h);
+                ui.add_sized(
+                    [110.0, 28.0],
+                    egui::Label::new(
+                        RichText::new(format!("{lane_name} [{proto_name}]"))
+                            .monospace()
+                            .size(11.0)
+                            .color(theme.accent),
+                    ),
+                );
+                ui.add_sized(
+                    [72.0, 28.0],
+                    egui::Label::new(
+                        RichText::new(cur_label)
+                            .monospace()
+                            .size(11.0)
+                            .color(theme.gold),
+                    ),
+                );
+                if let Some(a) = cursor_a {
+                    let a_lbl = txs
+                        .iter()
+                        .find(|tx| a >= tx.start_sample && a <= tx.end_sample)
+                        .map(|tx| tx.label.as_str())
+                        .unwrap_or("-");
+                    ui.add_sized(
+                        [56.0, 28.0],
+                        egui::Label::new(
+                            RichText::new(a_lbl).monospace().size(10.5).color(theme.danger),
+                        ),
+                    );
+                }
+                if let Some(b) = cursor_b {
+                    let b_lbl = txs
+                        .iter()
+                        .find(|tx| b >= tx.start_sample && b <= tx.end_sample)
+                        .map(|tx| tx.label.as_str())
+                        .unwrap_or("-");
+                    ui.add_sized(
+                        [56.0, 28.0],
+                        egui::Label::new(
+                            RichText::new(b_lbl).monospace().size(10.5).color(theme.trace_b),
+                        ),
+                    );
+                }
+                ui.add_sized(
+                    [116.0, chrome::HIT_SIDEBAR],
+                    egui::Label::new(
+                        RichText::new("PROTO").monospace().size(10.5).color(theme.dim),
+                    ),
+                );
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), (row_h - 4.0).max(28.0)),
+                    Sense::click(),
+                );
+                if ui.is_rect_visible(rect) {
+                    paint_protocol_lane_shape(ui, rect, txs, cursor, n, theme);
+                }
+                if let Some(pos) = resp.hover_pos() {
+                    let x = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+                    let sample = ((x * n as f32) as usize).min(n.saturating_sub(1));
+                    if let Some(tx) = txs
+                        .iter()
+                        .find(|tx| sample >= tx.start_sample && sample <= tx.end_sample)
+                    {
+                        resp.clone().on_hover_text(format!(
+                            "{} · {} [sample {}..{} · {}..{} ps]: {} (0x{:X})",
+                            tx.trace,
+                            tx.protocol,
+                            tx.start_sample,
+                            tx.end_sample,
+                            tx.start_sample as u64 * ts.max(1),
+                            (tx.end_sample + 1) as u64 * ts.max(1),
+                            tx.label,
+                            tx.value
+                        ));
+                    }
+                }
+            });
+        }
+    }
+    if let Some((name, proto)) = proto_cmd {
+        let _ = model.set_wave_protocol(&format!("{name} {}", proto.label()));
+    }
+    if let Some(name) = probe_cmd {
+        let _ = model.cross_probe(&name);
     }
     if let Some((name, st)) = style_cmd {
         let _ = model.set_wave_style(&format!(
@@ -12701,6 +12913,61 @@ fn paint_trace_shape(
         );
     }
     let _ = ns;
+}
+
+fn wave_tx_badge_color(theme: &theme::Theme, kind: &str) -> Color32 {
+    match kind {
+        "init" => theme.info,
+        "read" => theme.accent,
+        "write" => theme.violet,
+        "wrap" => theme.warn,
+        "err" => theme.danger,
+        "idle" => theme.dim,
+        _ => theme.ok,
+    }
+}
+
+fn paint_protocol_lane_shape(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    txs: &[helion_gui::WaveTransaction],
+    cursor: usize,
+    n: usize,
+    theme: &theme::Theme,
+) {
+    let p = ui.painter();
+    p.rect_filled(rect, 0.0, theme.die_bg);
+    let dx = rect.width() / n.max(1) as f32;
+    for tx in txs {
+        let x0 = rect.left() + dx * tx.start_sample as f32 + 1.0;
+        let x1 = (rect.left() + dx * (tx.end_sample + 1) as f32 - 1.0).max(x0 + 2.0);
+        let box_rect = egui::Rect::from_min_max(
+            egui::pos2(x0, rect.top() + 3.0),
+            egui::pos2(x1, rect.bottom() - 3.0),
+        );
+        let col = wave_tx_badge_color(theme, &tx.kind);
+        p.rect_filled(box_rect, 3.0, col.gamma_multiply(0.22));
+        p.rect_stroke(
+            box_rect,
+            3.0,
+            Stroke::new(1.0_f32, col),
+            egui::StrokeKind::Inside,
+        );
+        if box_rect.width() >= 28.0 {
+            p.with_clip_rect(box_rect.shrink(2.0)).text(
+                box_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                &tx.label,
+                egui::FontId::monospace(10.0),
+                theme.text,
+            );
+        }
+    }
+    let cx = rect.left() + dx * (cursor as f32 + 0.5);
+    p.line_segment(
+        [egui::pos2(cx, rect.top()), egui::pos2(cx, rect.bottom())],
+        Stroke::new(1.0_f32, theme.gold),
+    );
 }
 
 fn hw_stat_bit_color(theme: &theme::Theme, name: &str, value: bool) -> Color32 {
