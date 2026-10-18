@@ -23,6 +23,18 @@ use helion_hw::{
 };
 use std::path::Path;
 
+pub mod ibert;
+pub mod sysmon;
+
+pub use ibert::{
+    BathtubCurve, BathtubPoint, EyeMetrics, IbertEyeScan, IbertLinkConfig, PrbsEngine,
+    PrbsPattern, erfc_approx, q_tail, run_ibert_eye_scan, sweep_bathtub,
+};
+pub use sysmon::{
+    SysmonAlarms, SysmonMonitor, SysmonRailReading, SysmonTelemetry, adc_to_temp_c,
+    adc_to_voltage, drp_addr, temp_c_to_adc, voltage_to_adc,
+};
+
 /// Locked Bits/hw refuse codes — re-exported (identical `HELION_E_*` tokens; do not rename).
 pub use helion_hw::{ERR_CODE_EMPTY_BITSTREAM, ERR_CODE_USB_0};
 
@@ -359,5 +371,136 @@ mod tests {
         }
         assert!(!err.contains("programmer_ok=1"), "{err}");
         assert_no_board_done_claim(&err);
+    }
+
+    #[test]
+    fn sysmon_xadc_transfer_functions_and_drp_alarms() {
+        // UG480 transfer function round-trip checks.
+        for &t_c in &[-40.0, 0.0, 25.0, 62.5, 85.0, 125.0] {
+            let code = temp_c_to_adc(t_c);
+            let back = adc_to_temp_c(code);
+            assert!(
+                (back - t_c).abs() < 0.25,
+                "temp {t_c}C -> adc {code:#x} -> {back}C"
+            );
+        }
+        for &v in &[0.95, 1.00, 1.03, 1.80, 2.50] {
+            let code = voltage_to_adc(v);
+            let back = adc_to_voltage(code);
+            assert!(
+                (back - v).abs() < 0.002,
+                "volt {v}V -> adc {code:#x} -> {back}V"
+            );
+        }
+
+        let mut mon = SysmonMonitor::new(25.0);
+        assert!(!mon.telemetry.alarms.any());
+        assert_eq!(mon.read_drp(drp_addr::ALARM_FLAGS), 0);
+
+        // Normal operating sample: 52.0C, nominal rails.
+        mon.ingest_sample(52.0, 0.998, 1.795, 1.001);
+        assert!(!mon.telemetry.alarms.any());
+        assert!(mon.telemetry.max_temp_c > 51.5);
+        assert!(mon.telemetry.min_temp_c < 25.5);
+
+        // High temperature (92.0C >= 85.0C user limit) + VCCINT droop (0.94V < 0.97V).
+        mon.ingest_sample(92.0, 0.94, 1.80, 1.00);
+        assert!(mon.telemetry.alarms.user_temp_alarm);
+        assert!(!mon.telemetry.alarms.over_temp_shutdown);
+        assert!(mon.telemetry.alarms.vccint_alarm);
+        assert!(!mon.telemetry.alarms.vccaux_alarm);
+        assert!(mon.telemetry.alarms.any());
+        let flags = mon.read_drp(drp_addr::ALARM_FLAGS);
+        assert_eq!(flags & 0b0011, 0b0011, "user_temp + vccint alarm bits set");
+
+        // Over-temperature shutdown (128.0C >= 125.0C OT limit).
+        mon.ingest_sample(128.0, 1.00, 1.80, 1.00);
+        assert!(mon.telemetry.alarms.over_temp_shutdown);
+        assert!(mon.telemetry.summary_line().contains("SYSMON TEMP="));
+    }
+
+    #[test]
+    fn sysmon_bitstream_telemetry_scales_with_activity_and_refuses_empty() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut mon = SysmonMonitor::new(25.0);
+
+        let empty_err = mon
+            .sample_bitstream(&dev, &Bitstream::empty(&dev), 25.0, 0.5)
+            .unwrap_err();
+        assert!(empty_err.contains(ERR_CODE_EMPTY_BITSTREAM));
+
+        let bits = bitgen_structural_counter();
+        let idle = mon.sample_bitstream(&dev, &bits, 25.0, 0.0).unwrap();
+        let busy = mon.sample_bitstream(&dev, &bits, 25.0, 1.5).unwrap();
+        assert!(
+            busy.die_temp_c > idle.die_temp_c,
+            "higher toggle rate must increase die temp: busy={} idle={}",
+            busy.die_temp_c,
+            idle.die_temp_c
+        );
+        assert!(
+            busy.vccint.current_v <= idle.vccint.current_v,
+            "higher toggle rate must increase IR droop on VCCINT"
+        );
+    }
+
+    #[test]
+    fn ibert_prbs_lfsr_period_and_bathtub_eye_scan_metrics() {
+        // PRBS-7 LFSR must have exact maximal period 2^7 - 1 = 127.
+        let mut prbs = PrbsEngine::new(PrbsPattern::Prbs7, 0x01);
+        let init_state = prbs.lfsr;
+        for step in 1..=127 {
+            let _ = prbs.next_bit();
+            if step < 127 {
+                assert_ne!(prbs.lfsr, init_state, "premature repeat at step {step}");
+            } else {
+                assert_eq!(prbs.lfsr, init_state, "must repeat at period 127");
+            }
+        }
+        let ber_with_err = prbs.run_burst(10_000, 5);
+        assert!(ber_with_err > 0.0 && ber_with_err < 1e-2);
+
+        // Healthy 10.3125 Gbps link with CTLE + DFE enabled.
+        let good_cfg = IbertLinkConfig::default();
+        let bathtub = sweep_bathtub(&good_cfg, 41, 10_000_000_000).unwrap();
+        assert!(
+            bathtub.horizontal_opening_ui >= 0.45,
+            "healthy link horizontal opening UI={}",
+            bathtub.horizontal_opening_ui
+        );
+        assert!(
+            bathtub.center_ber < 1e-12,
+            "center BER={:e}",
+            bathtub.center_ber
+        );
+        assert!(
+            bathtub.points.first().unwrap().ber > 0.1,
+            "edge at -0.5 UI must have high BER"
+        );
+
+        let scan_open = run_ibert_eye_scan(&good_cfg, 33, 21).unwrap();
+        assert!(scan_open.metrics.margin_pass);
+        assert!(scan_open.metrics.horizontal_opening_ui >= 0.45);
+        assert!(scan_open.metrics.vertical_opening_mv >= 150.0);
+        assert!(scan_open.metrics.eye_area_ui_mv > 50.0);
+        let ascii = scan_open.render_ascii();
+        assert!(ascii.contains("IBERT Eye Scan MGT_X0Y0"));
+        assert!(ascii.contains("pass=true"));
+
+        // Severely degraded 25 dB loss channel with equalization turned off -> smaller/closed eye.
+        let mut degraded_cfg = IbertLinkConfig::default();
+        degraded_cfg.channel_loss_db = 28.0;
+        degraded_cfg.tx_pre_cursor_db = 0.0;
+        degraded_cfg.tx_post_cursor_db = 0.0;
+        degraded_cfg.rx_ctle_gain_db = 0.0;
+        degraded_cfg.rx_dfe_enabled = false;
+        let scan_degraded = run_ibert_eye_scan(&degraded_cfg, 33, 21).unwrap();
+        assert!(
+            scan_degraded.metrics.eye_area_ui_mv < scan_open.metrics.eye_area_ui_mv,
+            "unequalized high-loss channel must have smaller eye area"
+        );
+        assert!(
+            scan_degraded.metrics.vertical_opening_mv < scan_open.metrics.vertical_opening_mv
+        );
     }
 }
