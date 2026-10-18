@@ -714,6 +714,167 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         }
     }
 
+    // 13b. GTPE2_COMMON, GTPE2_CHANNEL, IBUFDS_GTE2, PCIE_2_1, XADC, and CFG_CENTER_MID primitives.
+    for ibuf in &placed.ibufds_gte2s {
+        if let Some(pib) = packed.ibufds_gte2s.iter().find(|x| x.name == ibuf.name) {
+            lines.push(format!("{}.{}.IN_USE", ibuf.tile, ibuf.site));
+            if pib.clkcm_cfg {
+                lines.push(format!("{}.{}.CLKCM_CFG", ibuf.tile, ibuf.site));
+            }
+            if pib.clkrcv_trst {
+                lines.push(format!("{}.{}.CLKRCV_TRST", ibuf.tile, ibuf.site));
+            }
+            lines.push(format!(
+                "{}.{}.CLKSWING_CFG[1:0] = 2'b{:02b}",
+                ibuf.tile, ibuf.site, pib.clkswing_cfg
+            ));
+        }
+    }
+    for gtc in &placed.gtp_commons {
+        if let Some(pg) = packed.gtp_commons.iter().find(|x| x.name == gtc.name) {
+            lines.push(format!("{}.GTPE2_COMMON.IN_USE", gtc.tile));
+            lines.push(format!(
+                "{}.GTPE2_COMMON.PLL0_FBDIV[5:0] = 6'd{}",
+                gtc.tile, pg.pll0_fbdiv
+            ));
+            lines.push(format!(
+                "{}.GTPE2_COMMON.PLL0_FBDIV_45.D{}",
+                gtc.tile, pg.pll0_fbdiv_45
+            ));
+            lines.push(format!(
+                "{}.GTPE2_COMMON.PLL0_REFCLK_DIV.D{}",
+                gtc.tile, pg.pll0_refclk_div
+            ));
+            lines.push(format!(
+                "{}.GTPE2_COMMON.PLL1_FBDIV[5:0] = 6'd{}",
+                gtc.tile, pg.pll1_fbdiv
+            ));
+            lines.push(format!(
+                "{}.GTPE2_COMMON.PLL1_FBDIV_45.D{}",
+                gtc.tile, pg.pll1_fbdiv_45
+            ));
+            lines.push(format!(
+                "{}.GTPE2_COMMON.PLL1_REFCLK_DIV.D{}",
+                gtc.tile, pg.pll1_refclk_div
+            ));
+        }
+    }
+    for gch in &placed.gtp_channels {
+        if let Some(pg) = packed.gtp_channels.iter().find(|x| x.name == gch.name) {
+            lines.push(format!("{}.GTPE2_CHANNEL.IN_USE", gch.tile));
+            lines.push(format!(
+                "{}.GTPE2_CHANNEL.RXOUT_DIV.D{}",
+                gch.tile, pg.rxout_div
+            ));
+            lines.push(format!(
+                "{}.GTPE2_CHANNEL.TXOUT_DIV.D{}",
+                gch.tile, pg.txout_div
+            ));
+            lines.push(format!(
+                "{}.GTPE2_CHANNEL.RX_DATA_WIDTH.W{}",
+                gch.tile, pg.rx_data_width
+            ));
+            lines.push(format!(
+                "{}.GTPE2_CHANNEL.TX_DATA_WIDTH.W{}",
+                gch.tile, pg.tx_data_width
+            ));
+            if pg.rx_int_datawidth == 1 {
+                lines.push(format!("{}.GTPE2_CHANNEL.RX_INT_DATAWIDTH", gch.tile));
+            }
+            if pg.tx_int_datawidth == 1 {
+                lines.push(format!("{}.GTPE2_CHANNEL.TX_INT_DATAWIDTH", gch.tile));
+            }
+        }
+    }
+    for pcie in &placed.pcies {
+        if let Some(pp) = packed.pcies.iter().find(|x| x.name == pcie.name) {
+            lines.push(format!("{}.PCIE_2_1.IN_USE", pcie.tile));
+            lines.push(format!(
+                "{}.PCIE_2_1.LINK_CAP_MAX_LINK_SPEED.GEN{}",
+                pcie.tile, pp.max_link_speed
+            ));
+            lines.push(format!(
+                "{}.PCIE_2_1.LINK_CAP_MAX_LINK_WIDTH.X{}",
+                pcie.tile, pp.max_link_width
+            ));
+            lines.push(format!(
+                "{}.PCIE_2_1.DEV_CAP_MAX_PAYLOAD_SUPPORTED[2:0] = 3'd{}",
+                pcie.tile,
+                pp.max_payload_supported & 0x7
+            ));
+            for (i, &bval) in pp.bar.iter().enumerate() {
+                if bval != 0 {
+                    lines.push(format!(
+                        "{}.PCIE_2_1.BAR{i}[31:0] = 32'h{bval:08X}",
+                        pcie.tile
+                    ));
+                }
+            }
+        }
+    }
+    for xadc in &placed.xadcs {
+        if let Some(px) = packed.xadcs.iter().find(|x| x.name == xadc.name) {
+            lines.push(format!("{}.XADC.IN_USE", xadc.tile));
+            for (&reg, &val) in &px.init_regs {
+                lines.push(format!(
+                    "{}.XADC.INIT_{reg:02X}[15:0] = 16'h{val:04X}",
+                    xadc.tile
+                ));
+            }
+        }
+    }
+    for cfg in &placed.cfg_prims {
+        if let Some(pc) = packed.cfg_prims.iter().find(|x| x.name == cfg.name) {
+            match cfg.kind {
+                crate::pack::CfgPrimKind::Bscane2 => {
+                    lines.push(format!(
+                        "{}.BSCAN.JTAG_CHAIN_{}.IN_USE",
+                        cfg.tile, pc.jtag_chain
+                    ));
+                    if pc.disable_jtag {
+                        lines.push(format!("{}.BSCAN.DISABLE_JTAG", cfg.tile));
+                    }
+                }
+                crate::pack::CfgPrimKind::Icape2 => {
+                    lines.push(format!("{}.ICAP.IN_USE", cfg.tile));
+                    lines.push(format!("{}.ICAP.ICAP_WIDTH.{}", cfg.tile, pc.icap_width));
+                    lines.push(format!(
+                        "{}.ICAP.DEVICE_ID[31:0] = 32'h{:08X}",
+                        cfg.tile, pc.device_id
+                    ));
+                }
+                crate::pack::CfgPrimKind::DnaPort => {
+                    lines.push(format!("{}.DNA_PORT.IN_USE", cfg.tile));
+                    if pc.sim_dna_value != 0 {
+                        lines.push(format!(
+                            "{}.DNA_PORT.SIM_DNA_VALUE[56:0] = 57'h{:015X}",
+                            cfg.tile, pc.sim_dna_value
+                        ));
+                    }
+                }
+                crate::pack::CfgPrimKind::FrameEcce2 => {
+                    lines.push(format!("{}.FRAME_ECC.IN_USE", cfg.tile));
+                    lines.push(format!("{}.FRAME_ECC.FARSRC.{}", cfg.tile, pc.farsrc));
+                }
+                crate::pack::CfgPrimKind::Startupe2 => {
+                    lines.push(format!("{}.STARTUP.IN_USE", cfg.tile));
+                    if pc.prog_usr {
+                        lines.push(format!("{}.STARTUP.PROG_USR", cfg.tile));
+                    }
+                }
+                crate::pack::CfgPrimKind::UsrAccesse2 => {
+                    lines.push(format!("{}.USR_ACCESS.IN_USE", cfg.tile));
+                }
+                crate::pack::CfgPrimKind::Capturee2 => {
+                    lines.push(format!("{}.CAPTURE.IN_USE", cfg.tile));
+                    if pc.oneshot {
+                        lines.push(format!("{}.CAPTURE.ONESHOT", cfg.tile));
+                    }
+                }
+            }
+        }
+    }
+
     // 14. Routing pips: TILE.DST.SRC.
     for net in &routed.nets {
         if let RouteKind::Pips(pips) = &net.kind {

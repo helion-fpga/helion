@@ -336,6 +336,35 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         add_ep(muxf.i1_net.clone(), site.to_string(), "I1", false);
         add_ep(muxf.o_net.clone(), site.to_string(), "O", true);
     }
+    for ibuf in &packed.ibufds_gte2s {
+        clock_spine_nets.insert(ibuf.o_net.clone());
+        if let Some(odiv) = &ibuf.odiv2_net {
+            clock_spine_nets.insert(odiv.clone());
+        }
+    }
+    for gtc in &packed.gtp_commons {
+        for n in [
+            &gtc.gtrefclk0_net,
+            &gtc.gtrefclk1_net,
+            &gtc.pll0outclk_net,
+            &gtc.pll0outrefclk_net,
+            &gtc.pll1outclk_net,
+            &gtc.pll1outrefclk_net,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            clock_spine_nets.insert(n.clone());
+        }
+    }
+    for gch in &packed.gtp_channels {
+        for n in [&gch.txoutclk_net, &gch.rxoutclk_net]
+            .into_iter()
+            .flatten()
+        {
+            clock_spine_nets.insert(n.clone());
+        }
+    }
 
     let mut nets = Vec::new();
     let mut net_names: Vec<String> = net_eps.keys().cloned().collect();

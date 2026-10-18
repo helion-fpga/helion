@@ -274,6 +274,55 @@ pub struct PlacedMuxf {
     pub bel: String,
 }
 
+/// A placed `GTPE2_CHANNEL`.
+#[derive(Clone, Debug)]
+pub struct PlacedGtpChannel {
+    pub name: String,
+    pub tile: String,
+    pub site: String,
+}
+
+/// A placed `GTPE2_COMMON`.
+#[derive(Clone, Debug)]
+pub struct PlacedGtpCommon {
+    pub name: String,
+    pub tile: String,
+    pub site: String,
+}
+
+/// A placed `IBUFDS_GTE2`.
+#[derive(Clone, Debug)]
+pub struct PlacedIbufdsGte2 {
+    pub name: String,
+    pub tile: String,
+    pub site: String,
+}
+
+/// A placed `PCIE_2_1`.
+#[derive(Clone, Debug)]
+pub struct PlacedPcie {
+    pub name: String,
+    pub tile: String,
+    pub site: String,
+}
+
+/// A placed `XADC`.
+#[derive(Clone, Debug)]
+pub struct PlacedXadc {
+    pub name: String,
+    pub tile: String,
+    pub site: String,
+}
+
+/// A placed 7-Series configuration primitive (`BSCANE2`, `ICAPE2`, `DNA_PORT`, `FRAME_ECCE2`, `STARTUPE2`, `USR_ACCESSE2`, `CAPTUREE2`).
+#[derive(Clone, Debug)]
+pub struct PlacedCfgPrim {
+    pub name: String,
+    pub kind: crate::pack::CfgPrimKind,
+    pub tile: String,
+    pub site: String,
+}
+
 /// Backend-owned placed netlist for xc7a35t.
 #[derive(Clone, Debug, Default)]
 pub struct Placed7 {
@@ -291,8 +340,13 @@ pub struct Placed7 {
     pub iodelays: Vec<PlacedIodelay>,
     pub srls: Vec<PlacedSrl>,
     pub muxfs: Vec<PlacedMuxf>,
+    pub gtp_channels: Vec<PlacedGtpChannel>,
+    pub gtp_commons: Vec<PlacedGtpCommon>,
+    pub ibufds_gte2s: Vec<PlacedIbufdsGte2>,
+    pub pcies: Vec<PlacedPcie>,
+    pub xadcs: Vec<PlacedXadc>,
+    pub cfg_prims: Vec<PlacedCfgPrim>,
 }
-
 /// BEL letters within a slice: A, B, C, D.
 const BEL_LETTERS: [char; 4] = ['A', 'B', 'C', 'D'];
 
@@ -438,6 +492,89 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         &mut site_tile,
         &mut out.srls,
     )?;
+
+    // 2g. GTPE2_COMMON, GTPE2_CHANNEL, IBUFDS_GTE2, PCIE_2_1, XADC, and CFG_CENTER_MID primitives.
+    for (i, gtc) in packed.gtp_commons.iter().enumerate() {
+        if i >= 2 {
+            return Err(format!("place: out of GTPE2_COMMON sites for {}", gtc.name));
+        }
+        out.gtp_commons.push(PlacedGtpCommon {
+            name: gtc.name.clone(),
+            tile: format!("GTP_COMMON_X113Y{}", 26 + i * 52),
+            site: format!("GTPE2_COMMON_X0Y{i}"),
+        });
+    }
+    for (i, gch) in packed.gtp_channels.iter().enumerate() {
+        if i >= 4 {
+            return Err(format!(
+                "place: out of GTPE2_CHANNEL sites for {}",
+                gch.name
+            ));
+        }
+        out.gtp_channels.push(PlacedGtpChannel {
+            name: gch.name.clone(),
+            tile: format!("GTP_CHANNEL_{}_X113Y{}", i % 4, 10 + i * 12),
+            site: format!("GTPE2_CHANNEL_X0Y{i}"),
+        });
+    }
+    for (i, ibuf) in packed.ibufds_gte2s.iter().enumerate() {
+        if i >= 2 {
+            return Err(format!(
+                "place: out of IBUFDS_GTE2 sites for {}",
+                ibuf.name
+            ));
+        }
+        out.ibufds_gte2s.push(PlacedIbufdsGte2 {
+            name: ibuf.name.clone(),
+            tile: "GTP_COMMON_X113Y26".to_string(),
+            site: format!("IBUFDS_GTE2_X0Y{i}"),
+        });
+    }
+    for (i, pcie) in packed.pcies.iter().enumerate() {
+        if i >= 1 {
+            return Err(format!("place: out of PCIE_2_1 sites for {}", pcie.name));
+        }
+        out.pcies.push(PlacedPcie {
+            name: pcie.name.clone(),
+            tile: "PCIE_BOT_X113Y25".to_string(),
+            site: "PCIE_2_1_X0Y0".to_string(),
+        });
+    }
+    for (i, xadc) in packed.xadcs.iter().enumerate() {
+        if i >= 1 {
+            return Err(format!("place: out of XADC sites for {}", xadc.name));
+        }
+        out.xadcs.push(PlacedXadc {
+            name: xadc.name.clone(),
+            tile: "CFG_CENTER_MID_X51Y76".to_string(),
+            site: "XADC_X0Y0".to_string(),
+        });
+    }
+    for cfg in &packed.cfg_prims {
+        let site = match cfg.kind {
+            crate::pack::CfgPrimKind::Bscane2 => {
+                format!("BSCAN_X0Y{}", cfg.jtag_chain.saturating_sub(1))
+            }
+            crate::pack::CfgPrimKind::Icape2 => "ICAP_X0Y0".to_string(),
+            crate::pack::CfgPrimKind::DnaPort => "DNA_PORT_X0Y0".to_string(),
+            crate::pack::CfgPrimKind::FrameEcce2 => "FRAME_ECC_X0Y0".to_string(),
+            crate::pack::CfgPrimKind::Startupe2 => "STARTUP_X0Y0".to_string(),
+            crate::pack::CfgPrimKind::UsrAccesse2 => "USR_ACCESS_X0Y0".to_string(),
+            crate::pack::CfgPrimKind::Capturee2 => "CAPTURE_X0Y0".to_string(),
+        };
+        if !used_sites.insert(site.clone()) {
+            return Err(format!(
+                "place: configuration site {site} already occupied (cell {})",
+                cfg.name
+            ));
+        }
+        out.cfg_prims.push(PlacedCfgPrim {
+            name: cfg.name.clone(),
+            kind: cfg.kind,
+            tile: "CFG_CENTER_MID_X51Y76".to_string(),
+            site,
+        });
+    }
 
     // 3. Pair FFs with their driving LUTs (FF.D == LUT.O) into one slice.
     let lut_by_output: HashMap<&str, usize> = packed
