@@ -12,11 +12,13 @@ use helion_route::{HOP_DELAY_PS, RouteOpts, Routed, route_with};
 use helion_sta::{Constraints, apply_xdc, create_clock, load_xdc, report_timing_routed_xdc};
 
 mod checkpoint2;
+pub mod ip_packager;
 pub use checkpoint2::{
     CheckpointDiff, CheckpointMeta, CheckpointStage, CheckpointSummary, RestoredCheckpoint,
     delete_checkpoint, diff_metas, list_checkpoints, load_checkpoint, read_meta, save_checkpoint,
     stage_of,
 };
+pub use ip_packager::*;
 
 /// UG986 Lab 1 Helion equivalents of implementation strategies.
 /// Not Vivado strategy trademarks: same *kind* of lever (timing vs runtime vs phys).
@@ -2066,7 +2068,7 @@ mod tests {
         assert_eq!(cells, vec!["u_lut"]);
         let ckpt = Session::restore_with_ir(&ck).unwrap();
         let ir = ckpt.design.expect("checkpoint must embed HNF");
-        assert_eq!(ir.name, "blinky");
+        assert_eq!(resolve(ir.name), "blinky");
         assert_eq!(ir.lut_inits(), Design::structural_blinky().lut_inits());
         assert_eq!(ckpt.strategy, ImplStrategy::Default);
         assert!(get_nets(proj.design.as_ref().unwrap(), Some("q")).contains(&"q".into()));
@@ -2877,10 +2879,10 @@ create_pblock pblock_0
             d.add_cell(&lut, CellKind::Lut6 { init: 2 });
             d.add_cell(&ff, CellKind::Hff);
             d.connect("clk", &ff, "CLK");
-            d.connect(format!("d{i}"), &lut, "O");
-            d.connect(format!("d{i}"), &ff, "D");
-            d.connect(format!("q{i}"), &ff, "Q");
-            d.connect(format!("q{i}"), &lut, "I0");
+            d.connect(&format!("d{i}"), &lut, "O");
+            d.connect(&format!("d{i}"), &ff, "D");
+            d.connect(&format!("q{i}"), &ff, "Q");
+            d.connect(&format!("q{i}"), &lut, "I0");
         }
         d.add_cell("u_iob", CellKind::IobOut);
         d.connect("q0", "u_iob", "I");
