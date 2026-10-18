@@ -639,6 +639,7 @@ mod tests {
         d.add_cell("u_bb", CellKind::BlackBox { module: intern("ip") });
         d.add_cell("u_bb", CellKind::BlackBox { module: helion_ir::intern("ip") });
         d.add_cell("u_bb", CellKind::BlackBox { module: helion_ir::intern("ip") });
+        d.add_cell("u_bb", CellKind::BlackBox { module: helion_ir::intern("ip") });
         d.connect("sig", "src", "Q");
         d.connect("sig", "u_bb", "INP");
         let clks = two_clocks();

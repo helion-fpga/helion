@@ -9,11 +9,17 @@ pub mod classify;
 pub mod crossings;
 pub mod domains;
 pub mod synchronizers;
+pub mod ug906_mtbf;
 
 pub use classify::classify_crossings;
 pub use crossings::{find_crossings, CdcClass, CdcCrossing, CrossingSource, RawCrossing};
 pub use domains::{extract_domains, ClockDomain, DomainKind, DomainMap};
 pub use synchronizers::{is_mux_select, sync_chain, SyncChain};
+pub use ug906_mtbf::{
+    classify_ug906_clock_pair, compute_cdc_mtbf_years, report_cdc_mtbf, CdcMtbfReport,
+    CdcSyncMtbfEntry, ClockInteractionEntry, ClockInteractionMatrix, TechCorner,
+    Ug906ClockPairClass, SECONDS_PER_YEAR,
+};
 // Legacy pair-level helpers, moved into `cdc::` (still crate-internal).
 pub(crate) use domains::{clock_ff_loads, clock_net_name};
 pub(crate) use synchronizers::cdc_synchronizer;
