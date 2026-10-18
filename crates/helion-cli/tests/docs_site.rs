@@ -103,8 +103,7 @@ fn public_html_documents_the_app() {
     );
     let legal = joined.to_ascii_lowercase();
     assert!(
-        legal.contains("apache-2.0")
-            && legal.contains("mit")
+        legal.contains("agpl")
             && (legal.contains("unisim")
                 || legal.contains("project x-ray")
                 || legal.contains("vendor bitstream")

@@ -120,7 +120,7 @@ jobs:
             echo "Helion ${TAG#v}"
             echo
             echo "Original FPGA family + CAD. Native Apple Silicon app; Linux CLI tarball."
-            echo "Unsigned macOS build — Gatekeeper will warn. Apache-2.0 OR MIT."
+            echo "Unsigned macOS build — Gatekeeper will warn. AGPL-3.0."
             echo
             sh scripts/changelog-excerpt.sh "$TAG"
             echo
