@@ -4,6 +4,16 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub mod power;
+pub use power::{
+    ActivityDatabase, ActivitySource, AirflowProfile, BramWriteMode, DynamicPowerBreakdown,
+    HeatsinkProfile, NetActivity, PowerCell, PowerCellKind, PowerClock, PowerConfidence,
+    PowerNetlist, PowerOptAction, PowerOptKind, PowerOptSummary, PowerReport, RailPower,
+    ThermalConditions, VectorlessConfig, VoltageRail, analyze_power, lut6_boolean_diff_prob,
+    lut6_propagate_activity, lut6_static_prob, parse_saif, parse_vcd_activity, power_opt_design,
+    propagate_vectorless_activity,
+};
+
 #[derive(Clone, Debug)]
 pub struct Device {
     pub part: String,
@@ -1039,6 +1049,28 @@ impl Device {
         } else {
             Err(format!("unsupported site {site}"))
         }
+    }
+
+    /// Run Vivado UG907 multi-rail power and junction-temperature analysis on this part.
+    pub fn analyze_power(
+        &self,
+        netlist: &PowerNetlist,
+        seed_activity: Option<&ActivityDatabase>,
+        thermal: &ThermalConditions,
+        vec_cfg: &VectorlessConfig,
+    ) -> PowerReport {
+        power::analyze_power(self, netlist, seed_activity, thermal, vec_cfg)
+    }
+
+    /// Run Vivado UG907 `power_opt_design` clock-enable & BRAM power optimization on this part.
+    pub fn power_opt_design(
+        &self,
+        netlist: &mut PowerNetlist,
+        seed_activity: Option<&ActivityDatabase>,
+        thermal: &ThermalConditions,
+        vec_cfg: &VectorlessConfig,
+    ) -> PowerOptSummary {
+        power::power_opt_design(self, netlist, seed_activity, thermal, vec_cfg)
     }
 }
 
