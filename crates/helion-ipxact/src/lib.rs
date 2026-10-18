@@ -1,6 +1,13 @@
 //! IEEE 1685-style pack/reimport (minimal XML). Helion-MM/ST, not AXI.
 
 use std::path::Path;
+pub mod generators;
+pub mod model;
+pub mod rtl;
+
+pub use generators::*;
+pub use model::*;
+pub use rtl::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IpCore {
@@ -1666,5 +1673,81 @@ file a.v
             let pkg = parse_helion(&body).unwrap();
             assert_eq!(pkg.to_ip_core().unwrap(), ip);
         }
+    }
+
+    #[test]
+    fn parametric_catalog_covers_all_vivado_ips_and_bus_types() {
+        let pcat = parametric_catalog();
+        for expected in [
+            "axi_interconnect",
+            "axi_protocol_converter",
+            "axi_gpio",
+            "axi_uartlite",
+            "axi_timer",
+            "axi_bram_ctrl",
+            "cdc_fifo",
+            "proc_sys_reset",
+            "axi_cpu",
+            "axi4_master_cpu",
+            "axi_quad_spi",
+            "axi_iic",
+            "axi_intc",
+            "blk_mem_gen",
+            "apb_gpio",
+            "wb_gpio",
+        ] {
+            let comp = find_ip_component(expected)
+                .unwrap_or_else(|| panic!("missing parametric IP {expected}"));
+            let xml = comp.to_ipxact_xml();
+            assert!(xml.contains("<ipxact:component"), "{expected}");
+            assert!(xml.contains("<ipxact:busInterfaces>"), "{expected}");
+            let sv = comp.generate_sv(& std::collections::BTreeMap::new()).unwrap();
+            assert!(sv.contains(&format!("module {}", comp.core.name)), "{expected}: {sv}");
+            assert!(sv.contains("endmodule"), "{expected}");
+        }
+        assert!(pcat.len() >= 16);
+
+        // Verify all 13 required UG994 bus interface types parse and roundtrip
+        for b in [
+            "AXI4",
+            "AXI4-Lite",
+            "AXI4-Stream",
+            "APB",
+            "Wishbone",
+            "Clock",
+            "Reset",
+            "Interrupt",
+            "GPIO",
+            "UART",
+            "SPI",
+            "I2C",
+            "BRAM_PORT",
+        ] {
+            let parsed = BusInterfaceType::parse(b).unwrap_or_else(|| panic!("failed to parse {b}"));
+            assert_eq!(parsed.as_str(), b);
+        }
+    }
+
+    #[test]
+    fn parametric_rtl_generators_respect_overrides() {
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("C_GPIO_WIDTH".into(), "16".into());
+        overrides.insert("C_IS_DUAL".into(), "1".into());
+        let gpio = component_axi_gpio().generate_sv(&overrides).unwrap();
+        assert!(gpio.contains("parameter int C_GPIO_WIDTH         = 16"));
+        assert!(gpio.contains("parameter int C_IS_DUAL            = 1"));
+
+        overrides.clear();
+        overrides.insert("C_BAUDRATE".into(), "921600".into());
+        let uart = component_axi_uartlite().generate_sv(&overrides).unwrap();
+        assert!(uart.contains("parameter int C_BAUDRATE         = 921600"));
+
+        overrides.clear();
+        overrides.insert("C_IS_ASYNC".into(), "1".into());
+        overrides.insert("C_FIFO_DEPTH".into(), "32".into());
+        let fifo = component_cdc_fifo().generate_sv(&overrides).unwrap();
+        assert!(fifo.contains("parameter int C_FIFO_DEPTH  = 32"));
+        assert!(fifo.contains("wr_gray_next"));
+        assert!(fifo.contains("rd_gray_next"));
     }
 }
