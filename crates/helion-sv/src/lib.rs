@@ -19,6 +19,7 @@ pub mod cdc;
 pub mod parallel_elab;
 /// SystemVerilog Assertions, v3.0 subset (verification track, Part B).
 pub mod sva;
+mod ug901;
 
 // Thread-local storage for pre-optimization Design (for --verify flag).
 // When HELION_PRESERVE_PRE_OPT is set, synth_from_parsed_top clones the
@@ -4125,6 +4126,11 @@ fn hash_own(rtl: &Rtl) -> u64 {
         }
         h.feed_rexpr(rhs);
     }
+    for t in &rtl.toks {
+        if let Tok::Ident(s) | Tok::Kw(s) | Tok::Str(s) = t {
+            h.feed(s);
+        }
+    }
     h.h
 }
 
@@ -7093,14 +7099,17 @@ fn parse_lhs_after_name<'a>(p: &mut P<'a>, name: &'a str) -> Result<LhsKind<'a>,
                 }
                 Ok(LhsKind::Bit(name, idx))
             }
-            Some(Tok::Ident(id)) => {
-                let addr = RExpr::Ident(p.arena.alloc_str(id));
+            _ => {
+                p.i = save;
+                let addr = parse_rexpr(p)?;
                 if !p.eat_sym(']') {
                     return Err("]".into());
                 }
+                if matches!(p.peek(), Some(Tok::Sym('['))) {
+                    skip_brackets(p);
+                }
                 Ok(LhsKind::MemWrite { name, addr })
             }
-            _ => Err("lhs index".into()),
         }
     } else {
         Ok(LhsKind::Whole(name))
@@ -7768,6 +7777,25 @@ fn parse_attrs<'a>(p: &mut P<'a>) -> Vec<(String, String)> {
             attrs.push((key, val));
             let _ = p.eat_sym(',');
         }
+thread_local! {
+    static PENDING_ATTR_KVS: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn parse_attr<'a>(p: &mut P<'a>) -> Option<(String, String)> {
+    if let Some(kv) = PENDING_ATTR_KVS.with(|q| {
+        let mut b = q.borrow_mut();
+        if b.is_empty() {
+            None
+        } else {
+            Some(b.remove(0))
+        }
+    }) {
+        return Some(kv);
+    }
+    let save = p.i;
+    if !p.eat_sym('(') {
+        return None;
     }
     attrs
 }
@@ -7783,6 +7811,14 @@ fn parse_attr<'a>(p: &mut P<'a>) -> Option<(String, String)> {
         if p.peek() == Some(&Tok::Sym('*')) && p.t.get(p.i + 1) == Some(&Tok::Sym(')')) {
             p.bump(); // '*'
             p.bump(); // ')'
+            break;
+    let mut parsed = Vec::new();
+    while p.peek().is_some() {
+        if matches!(p.peek(), Some(Tok::Sym('*')))
+            && matches!(p.t.get(p.i + 1), Some(Tok::Sym(')')))
+        {
+            p.bump();
+            p.bump();
             break;
         }
         let key = match p.bump() {
@@ -7808,6 +7844,35 @@ fn parse_attr<'a>(p: &mut P<'a>) -> Option<(String, String)> {
         let _ = p.eat_sym(',');
     }
     first
+        let k = match p.bump() {
+            Some(Tok::Ident(s) | Tok::Kw(s)) => s.to_string(),
+            Some(Tok::Sym('*')) if p.eat_sym(')') => break,
+            _ => {
+                p.i = save;
+                return None;
+            }
+        };
+        let v = if p.eat_sym('=') {
+            match p.bump() {
+                Some(Tok::Str(s) | Tok::Ident(s) | Tok::Kw(s)) => s.to_string(),
+                Some(Tok::Number(n, _)) => n.to_string(),
+                _ => "1".into(),
+            }
+        } else {
+            "1".into()
+        };
+        parsed.push((k, v));
+        let _ = p.eat_sym(',');
+    }
+    if parsed.is_empty() {
+        p.i = save;
+        return None;
+    }
+    let first = parsed.remove(0);
+    if !parsed.is_empty() {
+        PENDING_ATTR_KVS.with(|q| q.borrow_mut().extend(parsed));
+    }
+    Some(first)
 }
 
 /// FNV-1a tag so a string parameter does not compare equal to a small integer.
@@ -8353,6 +8418,39 @@ fn parse_assign_nbas<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
                 return Err("]".into());
             }
         }
+        // Optional byte-write lane select `mem[addr][hi:lo]` or `mem[addr][lo +: w]`.
+        if word_addr.is_some() && p.eat_sym('[') {
+            if let Ok(a) = const_u(p) {
+                if matches!(p.peek(), Some(Tok::Sym('+')))
+                    && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+                {
+                    p.bump();
+                    p.bump();
+                    let _ = const_u(p);
+                    let _ = p.eat_sym(']');
+                    bit = Some(a as usize);
+                } else if matches!(p.peek(), Some(Tok::Sym('-')))
+                    && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+                {
+                    p.bump();
+                    p.bump();
+                    let w = const_u(p).unwrap_or(1) as usize;
+                    let _ = p.eat_sym(']');
+                    bit = Some((a as usize).saturating_sub(w.saturating_sub(1)));
+                } else if p.eat_sym(':') {
+                    let b = const_u(p).unwrap_or(0) as usize;
+                    let _ = p.eat_sym(']');
+                    bit = Some((a as usize).min(b));
+                } else {
+                    let _ = p.eat_sym(']');
+                    bit = Some(a as usize);
+                }
+            } else {
+                while p.peek().is_some() && !p.eat_sym(']') {
+                    p.bump();
+                }
+            }
+        }
     }
     if matches!(p.peek(), Some(Tok::Le)) {
         p.bump();
@@ -8364,7 +8462,7 @@ fn parse_assign_nbas<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
     if let Some(addr) = word_addr {
         return Ok(vec![(
             name,
-            None,
+            bit,
             RExpr::WordAt {
                 addr: p.arena.alloc(addr),
                 data: p.arena.alloc(rhs),
@@ -10210,7 +10308,28 @@ fn lift_functions_if_no_body<'a>(
 }
 
 fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
-    let tok_start = p.i;
+    let mut tok_start = p.i;
+    // Include any preceding `(* ... *)` attributes attached to `module`.
+    while tok_start >= 2
+        && matches!(p.t.get(tok_start - 1), Some(Tok::Sym(')')))
+        && matches!(p.t.get(tok_start - 2), Some(Tok::Sym('*')))
+    {
+        let mut k = tok_start - 2;
+        let mut found = false;
+        while k > 0 {
+            k -= 1;
+            if matches!(p.t.get(k), Some(Tok::Sym('(')))
+                && matches!(p.t.get(k + 1), Some(Tok::Sym('*')))
+            {
+                tok_start = k;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            break;
+        }
+    }
     if !p.eat_kw("module") {
         return Err("expected module".into());
     }
@@ -19720,18 +19839,19 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
     // builder sees `Expr::Const` (XNOR-with-const -> wire, AND-with-c0 -> c0).
     // Const-prop rebuilds RExpr subtrees; the scratch arena is leaked so new
     // nodes live for the parse lifetime (same pattern as the leaked source).
-    let prop_arena: &Bump = Box::leak(Box::new(Bump::new()));
+    let prop_arena_owned = Bump::new();
+    let prop_arena: &Bump = &prop_arena_owned;
     let mut rtl_owned = rtl.clone();
+    let mut d = Design::new(rtl_owned.module);
+    let ug_attrs = ug901::extract_ug901_attrs(&rtl_owned);
+    let modified_fsms =
+        ug901::apply_ug901_fsm_pass(&mut rtl_owned, &mut d, &ug_attrs, prop_arena);
     propagate_const_wires(&mut rtl_owned, prop_arena);
-    let rtl: &Rtl = &rtl_owned;
-    let mut d = Design::new(rtl.module);
     // Bump arena for transient boolean Expr trees built per bit below.
     // reg_bits/comb_bits borrow from it; all trees are consumed into the
     // AIG/Design before this function returns, so the arena dies here.
     let arena = Bump::new();
-    for (n, dir, _) in &rtl.ports {
-        // A read-only inout is a load-enable input, not an output pad and
-        // not a made-up bus. Timing still sees a plain input.
+    for (n, dir, _) in &rtl_owned.ports {
         let dir = if matches!(dir, PortDir::Inout) {
             PortDir::In
         } else {
@@ -19739,59 +19859,75 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
         };
         d.add_port(*n, dir);
     }
-    // User clock is the posedge/negedge name when that port exists.
-    // Otherwise the historical first-`clk`/first-input pick (gold counter).
-    let clk_owned = edge_clk_of(rtl.module)
+    let clk_owned = edge_clk_of(rtl_owned.module)
         .filter(|c| {
-            rtl.ports
+            rtl_owned
+                .ports
                 .iter()
                 .any(|(n, dir, _)| *n == c.as_str() && *dir == PortDir::In)
         })
         .or_else(|| {
-            rtl.ports
+            rtl_owned
+                .ports
                 .iter()
                 .find(|(n, dir, _)| *dir == PortDir::In && *n == "clk")
-                .or_else(|| rtl.ports.iter().find(|(_, dir, _)| *dir == PortDir::In))
+                .or_else(|| rtl_owned.ports.iter().find(|(_, dir, _)| *dir == PortDir::In))
                 .map(|(n, _, _)| n.to_string())
         })
         .unwrap_or_else(|| "clk".into());
     let clk = clk_owned.as_str();
 
-    // `$display` / X/Z compare is a simulator model. Do not invent LUTs or MACs.
-    if sim_only_for(&rtl.module) {
+    if sim_only_for(&rtl_owned.module) {
         d.attrs.set("SIM_ONLY", "1");
         d.attrs.set("NO_BODY", "1");
         return Ok(d);
     }
 
-    // FM-HEL-10m-0835: after `hang_diag flatten`, 15011 (assigns, no nbas)
-    // and 14777 (wide unpacked nbas) stall in the bit-blast. Name that path
-    // and stop. One diagnostic. No invented LUT, no closed WNS.
-    if let Some(sig) = flatten_leftover_signal(rtl) {
-        note_flatten_cap(&rtl.module, &sig);
+    if let Some(sig) = flatten_leftover_signal(&rtl_owned) {
+        note_flatten_cap(&rtl_owned.module, &sig);
         d.attrs.set("FLATTEN_CAP", "1");
         return Ok(d);
     }
 
-    // Flatten NBAs into per-bit (name_bit, expr)
-    // FM-HEL-HANG: hard cap bit-blast work (Ibex synth_sv_path hung after CORPUS).
-    // Linear visit budget. Add/cmp hang guards stay elsewhere (Ibex).
     rexpr_bit_budget_reset(400_000);
     let mut reg_bits: Vec<(String, Expr)> = Vec::new();
     let mut n_mac = 0usize;
     let mut n_bram = 0usize;
-    // Bounded unpacked shift (const word index, small depth×width) → Hffs.
-    // A variable-index read is not expanded here.
-    let (unpacked_bits, mut lowered_unpacked) = lower_unpacked_clocked_words(rtl, &arena);
-    reg_bits.extend(unpacked_bits);
-    // Const-index word add (`res[0] <= a+b`) → ripple adder into Hffs.
-    // Not a MAC, and not the generic cone (that left 2 bits and a wide_cone).
+    let mut lowered_unpacked: HashSet<String> = HashSet::new();
+
+    ug901::apply_ug901_dsp_pass(&mut rtl_owned, &mut d, clk, &ug_attrs, prop_arena, &mut n_mac);
+    ug901::apply_ug901_srl_pass(
+        &mut rtl_owned,
+        &mut d,
+        clk,
+        &ug_attrs,
+        &arena,
+        &mut lowered_unpacked,
+        &mut n_bram,
+    );
+    ug901::apply_ug901_ram_rom_pass(
+        &mut rtl_owned,
+        &mut d,
+        clk,
+        &ug_attrs,
+        &arena,
+        &mut lowered_unpacked,
+        &mut n_bram,
+    );
+
+    let rtl: &Rtl = &rtl_owned;
+    let (unpacked_bits, lu_clocked) = lower_unpacked_clocked_words(rtl, &arena);
+    for (bitn, expr) in unpacked_bits {
+        if !lowered_unpacked
+            .iter()
+            .any(|m| bitn == format!("{m}_w0") || bitn.starts_with(&format!("{m}_w")))
+        {
+            reg_bits.push((bitn, expr));
+        }
+    }
+    lowered_unpacked.extend(lu_clocked);
     lowered_unpacked.extend(lower_const_word_adds(&mut d, rtl, clk, &lowered_unpacked));
-    // cycles=2..4: later words are Hff shifts of res[i-1], not a new add.
-    // Larger or non-constant: word_pipeline_cap, no extra stages, no closed WNS.
     lowered_unpacked.extend(lower_word_pipeline(&mut d, rtl, clk, &lowered_unpacked));
-    // Variable-index write (depth≤32, width≤16) → Hffs on the user's clock.
-    // The read stays a single variable_index_read; do not walk a wide cone.
     lowered_unpacked.extend(lower_var_index_words(&mut d, rtl, clk, &arena));
     for (lhs, bit, rhs) in &rtl.nbas {
         if sig_depth(rtl, lhs) > 0 {
@@ -20944,6 +21080,8 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
         d.attrs.set("INOUT_ENABLE_NOT_LOWERED", "1");
     }
 
+    ug901::finalize_ug901_dsp_cascades(&mut d, rtl, clk);
+    ug901::tag_fsm_state_cells(&mut d, &modified_fsms);
     // Negedge-only always: one Hff on that clock, or one named diagnostic.
     // Do not walk a cone. Falling versus rising is not a fake WNS.
     lower_negedge_hffs(&mut d, rtl);
