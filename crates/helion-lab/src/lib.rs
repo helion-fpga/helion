@@ -47,6 +47,15 @@ pub use svf_stapl::{
     write_hw_svf,
 };
 
+pub mod axi_pcie_analyzer;
+
+pub use axi_pcie_analyzer::{
+    AxiBurstKind, AxiBurstTxn, AxiPerfMonitor, AxiPerfReport, AxiProtocolChecker,
+    AxiProtocolViolation, AxiTrafficGenConfig, AxiTrafficGenerator, AxiTrafficPattern,
+    AxiViolationKind, AxiWriteChannelSample, LatencyStats, PcieGenSpeed, PcieLinkIssue,
+    PcieLtssmAnalyzer, PcieLtssmReport, PcieLtssmState, PcieTraceSample,
+};
+
 /// Locked Bits/hw refuse codes — re-exported (identical `HELION_E_*` tokens; do not rename).
 pub use helion_hw::{ERR_CODE_EMPTY_BITSTREAM, ERR_CODE_USB_0};
 
@@ -633,5 +642,209 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn axi_traffic_generator_and_performance_monitor_metrics() {
+        for pat in [
+            AxiTrafficPattern::Sequential,
+            AxiTrafficPattern::Strided { stride_bytes: 512 },
+            AxiTrafficPattern::Random { seed: 42 },
+            AxiTrafficPattern::AddressSweep {
+                low_addr: 0x4000_0000,
+                high_addr: 0x4001_0000,
+                step_bytes: 256,
+            },
+        ] {
+            let mut cfg = AxiTrafficGenConfig::default();
+            cfg.pattern = pat;
+            cfg.burst_len = 16;
+            cfg.data_width_bits = 64;
+            let mut tg = AxiTrafficGenerator::new(cfg.clone());
+            let txns = tg.generate_bursts(40);
+            assert_eq!(txns.len(), 40);
+
+            // Verify no generated burst crosses a 4KB boundary.
+            let mut checker = AxiProtocolChecker::default();
+            for t in &txns {
+                checker.check_address_phase(t);
+            }
+            assert!(
+                checker.violations.is_empty(),
+                "generated traffic must be 4KB boundary safe: {:?}",
+                checker.violations
+            );
+
+            let mut mon = AxiPerfMonitor::new();
+            mon.record_batch(txns);
+            let rep = mon.analyze(cfg.clock_freq_mhz, cfg.data_width_bits);
+            assert!(rep.total_throughput_mbps > 100.0);
+            assert!(rep.bus_utilization_pct > 10.0 && rep.bus_utilization_pct <= 100.0);
+            assert!(rep.read_latency.min_cycles <= rep.read_latency.p50_cycles);
+            assert!(rep.read_latency.p50_cycles <= rep.read_latency.p99_cycles);
+            assert!(rep.read_latency.p99_cycles <= rep.read_latency.max_cycles);
+            assert_eq!(rep.peak_outstanding, 8);
+        }
+    }
+
+    #[test]
+    fn axi_protocol_checker_detects_pg101_violations() {
+        let mut checker = AxiProtocolChecker::new(4);
+
+        // 1. 4KB boundary crossing: start at 0x4000_0FF0 with 4 beats x 8B = 32B -> crosses 0x4000_1000.
+        let bad_4k = AxiBurstTxn {
+            id: 1,
+            is_write: true,
+            addr: 0x4000_0FF0,
+            beats: 4,
+            beat_bytes: 8,
+            burst_kind: AxiBurstKind::Incr,
+            exclusive: false,
+            issue_cycle: 10,
+            complete_cycle: 20,
+            outstanding_at_issue: 1,
+        };
+        checker.check_address_phase(&bad_4k);
+        assert!(
+            checker
+                .violations
+                .iter()
+                .any(|v| v.kind == AxiViolationKind::AwaddrBoundary4K)
+        );
+
+        // 2. Invalid exclusive burst (> 16 beats).
+        let mut bad_excl = bad_4k.clone();
+        bad_excl.addr = 0x4000_0000;
+        bad_excl.beats = 32;
+        bad_excl.exclusive = true;
+        checker.check_address_phase(&bad_excl);
+        assert!(
+            checker
+                .violations
+                .iter()
+                .any(|v| v.kind == AxiViolationKind::ExclAccessInvalid)
+        );
+
+        // 3. Unstable WDATA while stalled (WVALID=1, WREADY=0), MAXWAITS deadlock, and WLAST beat mismatch.
+        let stream = vec![
+            AxiWriteChannelSample {
+                cycle: 1,
+                wvalid: true,
+                wready: false,
+                wdata: 0x1111,
+                wstrb: 0xFF,
+                wlast: false,
+            },
+            AxiWriteChannelSample {
+                cycle: 2,
+                wvalid: true,
+                wready: false,
+                wdata: 0x2222, // Mutated while WREADY=0 -> AXI_ERRM_WDATA_STABLE!
+                wstrb: 0xFF,
+                wlast: false,
+            },
+            AxiWriteChannelSample {
+                cycle: 3,
+                wvalid: true,
+                wready: false,
+                wdata: 0x2222,
+                wstrb: 0xFF,
+                wlast: false,
+            },
+            AxiWriteChannelSample {
+                cycle: 4,
+                wvalid: true,
+                wready: false,
+                wdata: 0x2222,
+                wstrb: 0xFF,
+                wlast: false,
+            },
+            AxiWriteChannelSample {
+                cycle: 5,
+                wvalid: true,
+                wready: true,
+                wdata: 0x2222,
+                wstrb: 0xFF,
+                wlast: true, // WLAST on beat 1 when expected_beats = 2 -> AXI_ERRM_WDATA_NUM!
+            },
+        ];
+        checker.check_write_stream(2, &stream);
+        assert!(
+            checker
+                .violations
+                .iter()
+                .any(|v| v.kind == AxiViolationKind::WdataUnstable)
+        );
+        assert!(
+            checker
+                .violations
+                .iter()
+                .any(|v| v.kind == AxiViolationKind::MaxWaitsDeadlock)
+        );
+        assert!(
+            checker
+                .violations
+                .iter()
+                .any(|v| v.kind == AxiViolationKind::WdataNumMismatch)
+        );
+    }
+
+    #[test]
+    fn pcie_gen1_to_gen4_ltssm_trace_analyzer_and_equalization_diagnostics() {
+        let mut analyzer = PcieLtssmAnalyzer::new();
+        let trace = [
+            (0, PcieLtssmState::DetectQuiet, PcieGenSpeed::Gen1, 8, 4, 80),
+            (100, PcieLtssmState::DetectActive, PcieGenSpeed::Gen1, 8, 4, 80),
+            (250, PcieLtssmState::PollingActive, PcieGenSpeed::Gen1, 8, 4, 80),
+            (400, PcieLtssmState::ConfigurationLinkwidthStart, PcieGenSpeed::Gen1, 8, 4, 80),
+            (600, PcieLtssmState::ConfigurationComplete, PcieGenSpeed::Gen1, 8, 4, 80),
+            (700, PcieLtssmState::L0, PcieGenSpeed::Gen1, 8, 4, 80),
+            // Speed upgrade to Gen3 (8.0 GT/s) with Phase 0..3 Equalization
+            (900, PcieLtssmState::RecoveryRcvrLock, PcieGenSpeed::Gen1, 8, 4, 75),
+            (1000, PcieLtssmState::RecoverySpeed, PcieGenSpeed::Gen3, 8, 4, 75),
+            (1100, PcieLtssmState::RecoveryEqualizationPhase0, PcieGenSpeed::Gen3, 8, 4, 75),
+            (1200, PcieLtssmState::RecoveryEqualizationPhase1, PcieGenSpeed::Gen3, 8, 4, 75),
+            (1300, PcieLtssmState::RecoveryEqualizationPhase2, PcieGenSpeed::Gen3, 8, 7, 68),
+            (1400, PcieLtssmState::RecoveryEqualizationPhase3, PcieGenSpeed::Gen3, 8, 7, 72),
+            (1500, PcieLtssmState::L0, PcieGenSpeed::Gen3, 8, 7, 72),
+            // Speed upgrade to Gen4 (16.0 GT/s), with poor FOM on Phase 2 triggering diagnostic
+            (1700, PcieLtssmState::RecoveryRcvrLock, PcieGenSpeed::Gen3, 8, 7, 70),
+            (1800, PcieLtssmState::RecoverySpeed, PcieGenSpeed::Gen4, 8, 7, 60),
+            (1900, PcieLtssmState::RecoveryEqualizationPhase2, PcieGenSpeed::Gen4, 8, 12, 10),
+            // Fallback downgrade to Gen3 L0
+            (2000, PcieLtssmState::L0, PcieGenSpeed::Gen3, 8, 7, 65),
+        ];
+        for &(ts, state, speed, width, preset, fom) in &trace {
+            analyzer.push_sample(PcieTraceSample {
+                timestamp_ns: ts,
+                state,
+                speed,
+                link_width: width,
+                tx_eq_preset: preset,
+                rx_eq_fom: fom,
+            });
+        }
+
+        let rep = analyzer.analyze();
+        assert!(rep.reached_l0);
+        assert_eq!(rep.max_speed, PcieGenSpeed::Gen4);
+        assert_eq!(rep.final_speed, PcieGenSpeed::Gen3);
+        assert_eq!(rep.final_link_width, 8);
+        assert_eq!(rep.speed_upgrades, 2);
+        assert_eq!(rep.speed_downgrades, 1);
+        assert_eq!(rep.eq_phases_visited, vec![0, 1, 2, 3]);
+        assert_eq!(rep.recovery_retrain_count, 2);
+        assert!(rep.issues.iter().any(|i| matches!(
+            i,
+            PcieLinkIssue::EqualizationPresetFailure { preset: 12, fom: 10, .. }
+        )));
+        assert!(rep.issues.iter().any(|i| matches!(
+            i,
+            PcieLinkIssue::EqualizationFallbackDowngrade {
+                from_speed: PcieGenSpeed::Gen4,
+                to_speed: PcieGenSpeed::Gen3,
+                ..
+            }
+        )));
     }
 }
