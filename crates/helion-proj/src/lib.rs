@@ -17,6 +17,11 @@ pub use checkpoint2::{
     delete_checkpoint, diff_metas, list_checkpoints, load_checkpoint, read_meta, save_checkpoint,
     stage_of,
 };
+pub mod netlist_interchange;
+pub use netlist_interchange::{
+    NetlistFormat, read_eblif, read_edif, read_verilog_netlist, read_yosys_json, write_eblif,
+    write_edif, write_verilog_netlist, write_yosys_json,
+};
 
 /// UG986 Lab 1 Helion equivalents of implementation strategies.
 /// Not Vivado strategy trademarks: same *kind* of lever (timing vs runtime vs phys).
@@ -2066,7 +2071,7 @@ mod tests {
         assert_eq!(cells, vec!["u_lut"]);
         let ckpt = Session::restore_with_ir(&ck).unwrap();
         let ir = ckpt.design.expect("checkpoint must embed HNF");
-        assert_eq!(ir.name, "blinky");
+        assert_eq!(resolve(ir.name), "blinky");
         assert_eq!(ir.lut_inits(), Design::structural_blinky().lut_inits());
         assert_eq!(ckpt.strategy, ImplStrategy::Default);
         assert!(get_nets(proj.design.as_ref().unwrap(), Some("q")).contains(&"q".into()));
@@ -2877,10 +2882,10 @@ create_pblock pblock_0
             d.add_cell(&lut, CellKind::Lut6 { init: 2 });
             d.add_cell(&ff, CellKind::Hff);
             d.connect("clk", &ff, "CLK");
-            d.connect(format!("d{i}"), &lut, "O");
-            d.connect(format!("d{i}"), &ff, "D");
-            d.connect(format!("q{i}"), &ff, "Q");
-            d.connect(format!("q{i}"), &lut, "I0");
+            d.connect(&format!("d{i}"), &lut, "O");
+            d.connect(&format!("d{i}"), &ff, "D");
+            d.connect(&format!("q{i}"), &ff, "Q");
+            d.connect(&format!("q{i}"), &lut, "I0");
         }
         d.add_cell("u_iob", CellKind::IobOut);
         d.connect("q0", "u_iob", "I");
