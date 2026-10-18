@@ -16,6 +16,7 @@ pub mod qor;
 pub mod reports;
 pub mod tcl;
 
+pub mod ip_packager;
 pub use checkpoint2::{
     CheckpointDiff, CheckpointMeta, CheckpointStage, CheckpointSummary, RestoredCheckpoint,
     cell_fingerprints, delete_checkpoint, diff_metas, list_checkpoints, load_checkpoint,
@@ -52,6 +53,7 @@ pub use netlist_interchange::{
     NetlistFormat, read_eblif, read_edif, read_verilog_netlist, read_yosys_json, write_eblif,
     write_edif, write_verilog_netlist, write_yosys_json,
 };
+pub use ip_packager::*;
 
 /// UG986 / UG904 implementation strategies, including Vivado multi-strategy explorer presets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
