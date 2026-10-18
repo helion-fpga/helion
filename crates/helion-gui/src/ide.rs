@@ -8998,6 +8998,19 @@ impl IdeModel {
 
     /// HNF/HAD names linked from a UG893 Messages / DRC string (not a caption dump).
     pub fn extract_design_objects(&self, hay: &str) -> Vec<String> {
+        if hay.is_empty() {
+            return Vec::new();
+        }
+        // O(|hay|) token set lookup: instead of cloning and sorting all 54k+
+        // design cells/nets on every message, tokenize `hay` first (typically
+        // 5-25 tokens) and only match candidates whose identifier appears in `hay`.
+        let hay_tokens: HashSet<&str> = hay
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .filter(|t| t.len() >= 2)
+            .collect();
+        if hay_tokens.is_empty() {
+            return Vec::new();
+        }
         let mut out: Vec<String> = Vec::new();
         let mut push = |s: String| {
             if s.is_empty() || s == "-" {
@@ -9007,29 +9020,31 @@ impl IdeModel {
                 out.push(s);
             }
         };
-        let mut names: Vec<String> = Vec::new();
-        names.extend(self.io_ports.iter().map(|p| p.name.clone()));
-        names.extend(self.tree.nets.iter().cloned());
-        names.extend(self.tree.cells.iter().map(|(c, _)| c.clone()));
-        names.extend(self.package_pins.iter().map(|p| p.pin.clone()));
-        names.sort_by_key(|s| std::cmp::Reverse(s.len()));
-        names.dedup();
-        for n in &names {
-            if n.len() < 2 {
-                continue;
+        let mut candidates: Vec<&str> = Vec::new();
+        for p in &self.io_ports {
+            if hay_tokens.contains(p.name.as_str()) {
+                candidates.push(p.name.as_str());
             }
-            let mut from = 0;
-            while from < hay.len() {
-                let Some(pos) = hay[from..].find(n.as_str()) else {
-                    break;
-                };
-                let abs = from + pos;
-                if Self::ascii_whole_token(hay, abs, n.len()) {
-                    push(n.clone());
-                    break;
-                }
-                from = abs + n.len().max(1);
+        }
+        for n in &self.tree.nets {
+            if hay_tokens.contains(n.as_str()) {
+                candidates.push(n.as_str());
             }
+        }
+        for (c, _) in &self.tree.cells {
+            if hay_tokens.contains(c.as_str()) {
+                candidates.push(c.as_str());
+            }
+        }
+        for p in &self.package_pins {
+            if hay_tokens.contains(p.pin.as_str()) {
+                candidates.push(p.pin.as_str());
+            }
+        }
+        candidates.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        candidates.dedup();
+        for n in candidates {
+            push(n.to_string());
         }
         for tok in hay.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
             if tok.is_empty() {

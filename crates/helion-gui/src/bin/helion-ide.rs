@@ -471,14 +471,15 @@ impl HelionIde {
                     v.clamp(chrome::CONSOLE_MIN_HEIGHT, chrome::CONSOLE_MAX_HEIGHT);
             }
         }
-        // Optional launch hooks for Mac shots / demos (does not remove Open…).
+        // Load persisted chrome state BEFORE HELION_OPEN / HELION_FLOW / HELION_WORKSPACE
+        // so explicit launch hooks are never overwritten by `~/.helion/chrome.ini`.
+        layouts::load_chrome_state(&mut app);
         if let Ok(path) = std::env::var("HELION_OPEN") {
             let pb = PathBuf::from(path.trim());
             if pb.is_file() {
                 app.open_path(&pb);
             }
         }
-        // Demo/shot hook: auto-save one checkpoint per flow stage.
         if std::env::var("HELION_AUTO_CHECKPOINT").as_deref() == Ok("1") {
             app.model.auto_checkpoint = true;
         }
@@ -572,7 +573,6 @@ impl HelionIde {
             w.set_step_idx(step);
             app.constraints_wizard = Some(w);
         }
-        layouts::load_chrome_state(&mut app);
         app
     }
 
@@ -682,13 +682,27 @@ impl HelionIde {
             actual: "queued".into(),
             class: EventClass::Ok,
         });
-        let model = self.model.clone();
-        // Snapshot UI state first: the job runs on the clone above, and on
-        // completion the finished model is adopted. Without the snapshot,
-        // everything the user does mid-run would be discarded with the clone.
         self.ui_snapshot = Some(self.model.capture_mid_run_ui());
-        // No "Started" toast: job progress already lives in the status bar
-        // (busy spinner + progress segment). Toasts are for completions only.
+        let mut model = if matches!(kind, JobKind::Open(_)) {
+            let mut m = IdeModel::new();
+            m.constraints = self.model.constraints.clone();
+            m.runs = self.model.runs.clone();
+            m.run_queue = self.model.run_queue.clone();
+            m.messages = self.model.messages.clone();
+            m.log = self.model.log.clone();
+            m
+        } else {
+            // Temporarily swap out heavy derived view caches (schematic/hierarchy)
+            // that `sync_from_session` rebuilds on the worker thread anyway,
+            // avoiding a 300k-String clone on the UI thread for Ibex-scale designs.
+            let saved_schem = std::mem::take(&mut self.model.schematic);
+            let saved_hier = std::mem::take(&mut self.model.hierarchy);
+            let m = self.model.clone();
+            self.model.schematic = saved_schem;
+            self.model.hierarchy = saved_hier;
+            m
+        };
+        let _ = &mut model;
         self.job = Some(spawn_job(model, kind));
     }
 
@@ -3940,24 +3954,47 @@ fn paint_messages(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme)
     ui.ctx().data_mut(|d| d.insert_temp(q_id, search_q.clone()));
     let q_low = search_q.trim().to_ascii_lowercase();
     let selected = model.selected_message;
-    let rows: Vec<(usize, helion_gui::IdeMessage, String)> = model
-        .message_rows()
-        .into_iter()
-        .filter(|(_, m)| {
-            q_low.is_empty()
-                || m.id.to_ascii_lowercase().contains(&q_low)
-                || m.text.to_ascii_lowercase().contains(&q_low)
+    let msg_cache_id = egui::Id::new("messages_rows_cache");
+    let msg_key = (
+        model.messages.len(),
+        model.message_filter,
+        q_low.clone(),
+        model.tree.cells.len(),
+    );
+    let rows: std::sync::Arc<Vec<(usize, helion_gui::IdeMessage, String)>> = ui
+        .ctx()
+        .data_mut(|d| {
+            d.get_temp::<(
+                (usize, Option<MsgSeverity>, String, usize),
+                std::sync::Arc<Vec<(usize, helion_gui::IdeMessage, String)>>,
+            )>(msg_cache_id)
         })
-        .map(|(i, m)| {
-            let objs = model.extract_design_objects(&m.text);
-            let cell = if objs.is_empty() {
-                "-".into()
-            } else {
-                single_line_summary(&objs.join(", "), 36)
-            };
-            (i, m.clone(), cell)
-        })
-        .collect();
+        .filter(|(k, _)| *k == msg_key)
+        .map(|(_, r)| r)
+        .unwrap_or_else(|| {
+            let computed: Vec<(usize, helion_gui::IdeMessage, String)> = model
+                .message_rows()
+                .into_iter()
+                .filter(|(_, m)| {
+                    q_low.is_empty()
+                        || m.id.to_ascii_lowercase().contains(&q_low)
+                        || m.text.to_ascii_lowercase().contains(&q_low)
+                })
+                .map(|(i, m)| {
+                    let objs = model.extract_design_objects(&m.text);
+                    let cell = if objs.is_empty() {
+                        "-".into()
+                    } else {
+                        single_line_summary(&objs.join(", "), 36)
+                    };
+                    (i, m.clone(), cell)
+                })
+                .collect();
+            let arc = std::sync::Arc::new(computed);
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(msg_cache_id, (msg_key, arc.clone())));
+            arc
+        });
     let mut pick: Option<usize> = None;
     let mut pick_obj: Option<usize> = None;
     if rows.is_empty() {
@@ -3981,7 +4018,7 @@ fn paint_messages(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme)
                     ui.label(RichText::new("Objects").small().strong());
                     ui.label(RichText::new("Message").small().strong());
                     ui.end_row();
-                    for (i, m, obj) in &rows {
+                    for (i, m, obj) in rows.iter() {
                         let on = selected == Some(*i);
                         let fill = msg_severity_color(theme, m.severity);
                         num_cell(ui, &i.to_string());
