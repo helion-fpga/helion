@@ -10423,7 +10423,7 @@ fn parse_module_items<'a>(
         if p.eat_kw("always_comb") {
             ensure_elaborated_module_params(p);
             if sim_only_for(&cur_mod()) {
-                if !non_initial_is_sim_only(p.t) {
+                if !non_initial_is_sim_only(p.t, p.i) {
                     SIM_ONLY_SEEN.with(|s| {
                         s.borrow_mut().remove(&cur_mod());
                     });
@@ -10455,7 +10455,7 @@ fn parse_module_items<'a>(
             let (combo, edge_clk, negedge_only) = skip_event_control(p);
             ensure_elaborated_module_params(p);
             if sim_only_for(&cur_mod()) {
-                if !non_initial_is_sim_only(p.t) {
+                if !non_initial_is_sim_only(p.t, p.i) {
                     SIM_ONLY_SEEN.with(|s| {
                         s.borrow_mut().remove(&cur_mod());
                     });
@@ -10742,11 +10742,26 @@ fn gen_for_suffix(fallback: usize) -> String {
     })
 }
 
+fn current_module_start(toks: &[Tok], cur_i: usize) -> usize {
+    let mut k = cur_i.min(toks.len());
+    while k > 0 {
+        k -= 1;
+        if matches!(&toks[k], Tok::Kw(kw) if *kw == "module") {
+            return k;
+        }
+        if matches!(&toks[k], Tok::Kw(kw) if *kw == "endmodule") {
+            return k + 1;
+        }
+    }
+    0
+}
+
 /// Check whether `$display`/`$write` or `===`/`!==` against X/Z occurs outside
-/// `initial` blocks. Elaboration-time `$display` sanity checks inside `initial`
-/// blocks (e.g. `axi_interconnect`) must not mark synthesizable RTL as `sim_only`.
-fn non_initial_is_sim_only(toks: &[Tok]) -> bool {
-    let mut i = 0usize;
+/// `initial` blocks in the current module. Elaboration-time `$display` sanity
+/// checks inside `initial` blocks (e.g. `axi_interconnect`) must not mark
+/// synthesizable RTL as `sim_only`.
+fn non_initial_is_sim_only(toks: &[Tok], cur_i: usize) -> bool {
+    let mut i = current_module_start(toks, cur_i);
     while i < toks.len() {
         if matches!(&toks[i], Tok::Kw(k) if *k == "endmodule") {
             break;
@@ -11290,7 +11305,8 @@ fn eval_gen_atom<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
 /// `{M_COUNT{{M_REGIONS{32'd24}}}}` or `calcBaseAddrs(0)` in `axi_interconnect`).
 fn ensure_elaborated_module_params<'a>(p: &mut P<'a>) {
     let limit = p.i.min(p.t.len());
-    let mut idx = 0usize;
+    let start = current_module_start(p.t, limit);
+    let mut idx = start;
     while idx < limit {
         match &p.t[idx] {
             Tok::Kw(k) if *k == "parameter" || *k == "localparam" => {
@@ -12079,6 +12095,8 @@ fn parse_for_unroll_module<'a>(
     if niter > 4096 || empty {
         return Ok(());
     }
+    let mod_start = current_module_start(p.t, start_i);
+    let mod_decl_toks = &p.t[mod_start..start_i.min(p.t.len())];
     let mut cur_val = if step_down { hi - 1 } else { lo };
     for _ in 0..niter {
         let i = cur_val;
@@ -12087,7 +12105,7 @@ fn parse_for_unroll_module<'a>(
         let mut iter_widths = p.widths.clone();
         let mut toks = prepare_gen_iter_tokens(
             &body,
-            p.t,
+            mod_decl_toks,
             var,
             i as u128,
             &mut iter_params,
@@ -12856,8 +12874,8 @@ fn rexpr_to_bit<'a>(e: &RExpr<'_>, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Re
                                     stack.push(ToBitTask::Visit(*a, bit + shift));
                                 }
                             }
-                        } else {
-                            let max_sh = wa.saturating_sub(bit).min(32);
+                        } else if matches!(*a, RExpr::Const { .. } | RExpr::Ident(_)) && wa <= 16 {
+                            let max_sh = wa.saturating_sub(bit).min(16);
                             let mut acc: Option<Expr> = None;
                             for s_val in 0..max_sh {
                                 let abit = rexpr_to_bit(a, rtl, bit + s_val, arena)?;
@@ -12874,6 +12892,8 @@ fn rexpr_to_bit<'a>(e: &RExpr<'_>, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Re
                                 });
                             }
                             memo.insert(key, acc.unwrap_or(Expr::Const(false)));
+                        } else {
+                            return Err("shift amount not const".into());
                         }
                     }
                     RExpr::Ashr(a, sh) => {
