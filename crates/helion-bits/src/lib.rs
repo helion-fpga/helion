@@ -252,25 +252,24 @@ pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
             .saturating_add(packed.brams.len().saturating_mul(2)),
     );
     program_clb_frames(dev, routed, &mut acc)?;
+    let mut iob_elec_by_net: HashMap<&str, u128> = HashMap::with_capacity(packed.iobs.len());
+    for iob in &packed.iobs {
+        iob_elec_by_net.entry(iob.from_net.as_str()).or_insert_with(|| {
+            Device::iob_electrical_bits(
+                iob.drive.as_deref(),
+                iob.slew.as_deref(),
+                iob.pulltype.as_deref(),
+                iob.diff_term.as_deref(),
+                iob.in_term.as_deref(),
+            )
+        });
+    }
     for r in &routed.iob_src {
         let major = dev
             .iob_major(r.iob.0, r.iob.1)
             .ok_or_else(|| format!("IOB_X{}Y{} has no major", r.iob.0, r.iob.1))?;
         // bit0 USED, [3:1] BLE, [15:4] CLB y; [24:16] DRIVE/SLEW/PULLTYPE/DIFF_TERM/IN_TERM (0 = default)
-        let elec = packed
-            .iobs
-            .iter()
-            .find(|i| i.from_net == r.net)
-            .map(|i| {
-                Device::iob_electrical_bits(
-                    i.drive.as_deref(),
-                    i.slew.as_deref(),
-                    i.pulltype.as_deref(),
-                    i.diff_term.as_deref(),
-                    i.in_term.as_deref(),
-                )
-            })
-            .unwrap_or(0);
+        let elec = iob_elec_by_net.get(r.net.as_str()).copied().unwrap_or(0);
         let word = 1u128 | ((r.ble as u128) << 1) | ((r.clb.1 as u128) << 4) | elec;
         acc.insert((Far::IOB, major, 0), word);
     }
