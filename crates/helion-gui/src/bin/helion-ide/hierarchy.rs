@@ -241,32 +241,28 @@ fn paint_chevron(p: &egui::Painter, center: egui::Pos2, expanded: bool, color: e
 /// Vivado Netlist-tree hierarchy section (Z3 sidebar). `model.selected` is the
 /// cross-view selection identity shared with Schematic/Device/Properties.
 pub fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
-    ui.vertical(|ui| {
-        ui.heading("Hierarchy");
-        if ui
-            .add_sized(
-                [ui.available_width(), super::chrome::HIT_SIDEBAR],
-                egui::Button::new("Show in Schematic"),
-            )
-            .on_hover_text("Open hierarchy in schematic viewer")
-            .clicked()
-        {
-            let _ = model.exec("open_hierarchy_sheet");
-        }
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Hierarchy").strong().size(13.0));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button("Schematic ↗")
+                .on_hover_text("Open hierarchy in schematic viewer")
+                .clicked()
+            {
+                let _ = model.exec("open_hierarchy_sheet");
+            }
+        });
     });
 
     let top = model.hierarchy.top.clone();
     let Some(top_name) = top.clone() else {
-        ui.add_space(12.0);
-        ui.vertical_centered(|ui| {
-            ui.add_space(40.0);
-            ui.label(egui::RichText::new("No hierarchy yet.").color(theme.dim));
-            ui.label(
-                egui::RichText::new("Run Synthesis to build the design tree.")
-                    .small()
-                    .color(theme.faint),
-            );
-        });
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("No hierarchy yet.").small().color(theme.dim));
+        ui.label(
+            egui::RichText::new("Run Synthesis to build the design tree.")
+                .small()
+                .color(theme.faint),
+        );
         return;
     };
 
@@ -328,7 +324,7 @@ pub fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::T
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Filter").small().color(theme.dim));
         ui.text_edit_singleline(&mut state.filter);
-        if !state.filter.is_empty() && ui.small_button("✕").clicked() {
+        if !state.filter.is_empty() && ui.small_button("×").clicked() {
             state.filter.clear();
         }
     });

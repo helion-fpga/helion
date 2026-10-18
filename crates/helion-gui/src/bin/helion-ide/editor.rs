@@ -212,16 +212,154 @@ fn gutter_tick_color(theme: &theme::Theme, kind: &str) -> Option<egui::Color32> 
     }
 }
 
+#[derive(Clone, Debug)]
+struct EditorAuxState {
+    find_open: bool,
+    find_query: String,
+    replace_text: String,
+    case_sensitive: bool,
+    current_match: usize,
+    outline_open: bool,
+}
+
+impl Default for EditorAuxState {
+    fn default() -> Self {
+        let find_env = std::env::var("HELION_EDITOR_FIND").as_deref() == Ok("1");
+        Self {
+            find_open: find_env,
+            find_query: if find_env { "cnt".into() } else { String::new() },
+            replace_text: String::new(),
+            case_sensitive: false,
+            current_match: 0,
+            outline_open: true,
+        }
+    }
+}
+
+pub fn toggle_find_bar(ctx: &egui::Context) {
+    let id = egui::Id::new("editor_aux_state");
+    let mut st: EditorAuxState = ctx.data_mut(|d| d.get_temp(id)).unwrap_or_default();
+    st.find_open = !st.find_open;
+    ctx.data_mut(|d| d.insert_temp(id, st));
+}
+
+pub fn set_find_demo(ctx: &egui::Context, open: bool, query: &str) {
+    let id = egui::Id::new("editor_aux_state");
+    let mut st: EditorAuxState = ctx.data_mut(|d| d.get_temp(id)).unwrap_or_default();
+    st.find_open = open;
+    if !query.is_empty() {
+        st.find_query = query.to_string();
+    }
+    ctx.data_mut(|d| d.insert_temp(id, st));
+}
+
+struct RtlSymbol {
+    kind: &'static str,
+    name: String,
+    line: usize,
+}
+
+fn extract_rtl_symbols(text: &str) -> Vec<RtlSymbol> {
+    let mut out = Vec::new();
+    for (idx, raw) in text.split('\n').enumerate() {
+        let line = idx + 1;
+        let code = raw.split("//").next().unwrap_or(raw).trim();
+        if code.is_empty() {
+            continue;
+        }
+        let tokens: Vec<&str> = code
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '$')
+            .filter(|s| !s.is_empty())
+            .collect();
+        let Some(&first) = tokens.first() else {
+            continue;
+        };
+        match first {
+            "module" | "entity" | "package" | "interface" => {
+                if let Some(&name) = tokens.get(1) {
+                    out.push(RtlSymbol { kind: "MOD", name: name.to_string(), line });
+                }
+            }
+            "input" | "output" | "inout" => {
+                if let Some(&name) = tokens.last() {
+                    if name != first && name != "logic" && name != "wire" && name != "reg" {
+                        out.push(RtlSymbol { kind: "PORT", name: name.to_string(), line });
+                    }
+                }
+            }
+            "logic" | "reg" | "wire" | "bit" | "integer" => {
+                if let Some(&name) = tokens.last() {
+                    if name != first {
+                        out.push(RtlSymbol { kind: "SIG", name: name.to_string(), line });
+                    }
+                }
+            }
+            "parameter" | "localparam" => {
+                if let Some(eq_pos) = code.find('=') {
+                    let lhs = code[..eq_pos].trim();
+                    if let Some(name) = lhs
+                        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .filter(|s| !s.is_empty())
+                        .last()
+                    {
+                        out.push(RtlSymbol { kind: "PARM", name: name.to_string(), line });
+                    }
+                }
+            }
+            "always_ff" | "always_comb" | "always_latch" | "always" | "initial" => {
+                out.push(RtlSymbol { kind: "BLK", name: first.to_string(), line });
+            }
+            "assign" => {
+                if let Some(&lhs) = tokens.get(1) {
+                    out.push(RtlSymbol { kind: "ASN", name: lhs.to_string(), line });
+                }
+            }
+            "function" | "task" => {
+                if let Some(&name) = tokens.get(1) {
+                    out.push(RtlSymbol { kind: "FN", name: name.to_string(), line });
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn find_match_lines(text: &str, query: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let q = if case_sensitive {
+        query.to_string()
+    } else {
+        query.to_ascii_lowercase()
+    };
+    let mut hits = Vec::new();
+    for (idx, line) in text.split('\n').enumerate() {
+        let hay = if case_sensitive {
+            line.to_string()
+        } else {
+            line.to_ascii_lowercase()
+        };
+        let mut start = 0;
+        while let Some(pos) = hay[start..].find(&q) {
+            hits.push((idx + 1, start + pos));
+            start += pos + q.len().max(1);
+        }
+    }
+    hits
+}
+
 pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme) {
     sync_editor_buffer(app);
-    // Force the editor to fill the available width. Without this, the
-    // editor can leave a black gap on the right when the central panel
-    // is wider than the content's natural size.
     ui.set_width(ui.available_width());
 
-    // ---- header (filename, dirty dot, breadcrumbs, toggles) ----
-    // Short borrows only: the header buttons act on `app`, so `model` must
-    // not be borrowed across them.
+    if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+        toggle_find_bar(ui.ctx());
+    }
+    let aux_id = egui::Id::new("editor_aux_state");
+    let mut aux: EditorAuxState = ui.ctx().data_mut(|d| d.get_temp(aux_id)).unwrap_or_default();
+
     let lang = {
         let m = &app.model;
         m.selected_source
@@ -252,27 +390,30 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
         editor_crumbs(m.source_line_rows(), cursor, lang)
     };
     let n_lines = app.editor_text.split('\n').count().max(1);
+    let symbols = extract_rtl_symbols(&app.editor_text);
 
     let mut do_open = false;
     let mut do_goto = false;
     let mut do_save = false;
     let mut do_wrap = false;
+    ui.add_space(2.0);
     ui.horizontal(|ui| {
+        ui.add_space(8.0);
         let mut name = RichText::new(&file_name)
-            .color(theme.faint)
-            .font(theme::font_ui(12.0));
+            .color(theme.text)
+            .font(theme::font_ui_medium(12.5));
         if app.editor_dirty {
             name = RichText::new(format!("{file_name} ●"))
                 .color(theme.warn)
-                .font(theme::font_ui(12.0));
+                .font(theme::font_ui_medium(12.5));
         }
         ui.label(name)
-            .on_hover_text(if app.editor_dirty { "Unsaved changes (⌘S)" } else { "" });
+            .on_hover_text(if app.editor_dirty { "Unsaved changes (⌘S)" } else { "Active source file" });
         if let Some((name, line)) = &crumbs.module {
             ui.label(RichText::new("›").color(theme.faint).font(theme::font_ui(12.0)));
             if ui
-                .link(RichText::new(name).color(theme.text).font(theme::font_ui(12.0)))
-                .on_hover_text(format!("Go to line {line}"))
+                .link(RichText::new(name).color(theme.info).font(theme::font_code(12.0)))
+                .on_hover_text(format!("Module declaration · Go to line {line}"))
                 .clicked()
             {
                 ui.ctx()
@@ -282,15 +423,21 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
         if let Some((name, line)) = &crumbs.block {
             ui.label(RichText::new("›").color(theme.faint).font(theme::font_ui(12.0)));
             if ui
-                .link(RichText::new(name).color(theme.text).font(theme::font_ui(12.0)))
-                .on_hover_text(format!("Go to line {line}"))
+                .link(RichText::new(name).color(theme.text).font(theme::font_code(12.0)))
+                .on_hover_text(format!("Procedural block · Go to line {line}"))
                 .clicked()
             {
                 ui.ctx()
                     .memory_mut(|m| m.data.insert_temp(egui::Id::new("text_editor_scroll_to"), *line));
             }
         }
+        ui.label(
+            RichText::new(format!("Ln {cursor}/{n_lines}"))
+                .color(theme.faint)
+                .font(theme::font_code(11.0)),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(6.0);
             if ui.small_button("Goto Source").clicked() {
                 do_goto = true;
             }
@@ -316,9 +463,129 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
             {
                 do_wrap = true;
             }
+            let outline_label = if aux.outline_open {
+                format!("Outline ({})", symbols.len())
+            } else {
+                "Outline: off".to_string()
+            };
+            if ui
+                .add(egui::Button::new(RichText::new(outline_label).size(11.5)).selected(aux.outline_open))
+                .on_hover_text("Toggle RTL Symbol Outline dock")
+                .clicked()
+            {
+                aux.outline_open = !aux.outline_open;
+            }
+            if ui
+                .add(egui::Button::new(RichText::new("Find / Replace").size(11.5)).selected(aux.find_open))
+                .on_hover_text("Find and replace in current file (⌘F)")
+                .clicked()
+            {
+                aux.find_open = !aux.find_open;
+            }
         });
     });
     ui.separator();
+
+    // ---- Inline Find / Replace Pop-up Bar ----
+    let matches = find_match_lines(&app.editor_text, &aux.find_query, aux.case_sensitive);
+    if !matches.is_empty() && aux.current_match >= matches.len() {
+        aux.current_match = 0;
+    }
+    if aux.find_open {
+        let mut jump_line: Option<usize> = None;
+        egui::Frame::new()
+            .fill(theme.panel)
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Find").font(theme::font_ui_medium(12.0)).color(theme.dim));
+                    let find_resp = ui.add(
+                        egui::TextEdit::singleline(&mut aux.find_query)
+                            .desired_width(180.0)
+                            .hint_text("Search in file…")
+                            .font(theme::font_code(12.0)),
+                    );
+                    if find_resp.changed() {
+                        aux.current_match = 0;
+                        if let Some(&(ln, _)) = find_match_lines(&app.editor_text, &aux.find_query, aux.case_sensitive).first() {
+                            jump_line = Some(ln);
+                        }
+                    }
+                    let badge_txt = if aux.find_query.is_empty() {
+                        "Type to search".to_string()
+                    } else if matches.is_empty() {
+                        "0 results".to_string()
+                    } else {
+                        format!("{} of {}", aux.current_match + 1, matches.len())
+                    };
+                    let badge_col = if !aux.find_query.is_empty() && matches.is_empty() {
+                        theme.danger
+                    } else {
+                        theme.dim
+                    };
+                    ui.label(RichText::new(badge_txt).font(theme::font_code(11.0)).color(badge_col));
+                    if ui
+                        .add_enabled(!matches.is_empty(), egui::Button::new("▲").small())
+                        .on_hover_text("Previous match")
+                        .clicked()
+                    {
+                        aux.current_match = (aux.current_match + matches.len() - 1) % matches.len();
+                        jump_line = Some(matches[aux.current_match].0);
+                    }
+                    if ui
+                        .add_enabled(!matches.is_empty(), egui::Button::new("▼").small())
+                        .on_hover_text("Next match")
+                        .clicked()
+                    {
+                        aux.current_match = (aux.current_match + 1) % matches.len();
+                        jump_line = Some(matches[aux.current_match].0);
+                    }
+                    if ui
+                        .add(egui::Button::new(RichText::new("Aa").monospace().size(11.0)).selected(aux.case_sensitive))
+                        .on_hover_text("Match case")
+                        .clicked()
+                    {
+                        aux.case_sensitive = !aux.case_sensitive;
+                    }
+                    ui.separator();
+                    ui.label(RichText::new("Replace").font(theme::font_ui_medium(12.0)).color(theme.dim));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut aux.replace_text)
+                            .desired_width(150.0)
+                            .hint_text("Replace with…")
+                            .font(theme::font_code(12.0)),
+                    );
+                    if ui
+                        .add_enabled(!matches.is_empty() && !aux.find_query.is_empty(), egui::Button::new("Replace").small())
+                        .clicked()
+                    {
+                        if let Some(pos) = app.editor_text.find(&aux.find_query) {
+                            app.editor_text.replace_range(pos..pos + aux.find_query.len(), &aux.replace_text);
+                            app.editor_dirty = true;
+                        }
+                    }
+                    if ui
+                        .add_enabled(!matches.is_empty() && !aux.find_query.is_empty(), egui::Button::new("Replace All").small())
+                        .clicked()
+                    {
+                        app.editor_text = app.editor_text.replace(&aux.find_query, &aux.replace_text);
+                        app.editor_dirty = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").on_hover_text("Close Find bar (Esc)").clicked() {
+                            aux.find_open = false;
+                        }
+                    });
+                });
+            });
+        ui.separator();
+        if let Some(ln) = jump_line {
+            let _ = app.model.select_editor_line(&ln.to_string());
+            ui.ctx()
+                .memory_mut(|m| m.data.insert_temp(egui::Id::new("text_editor_scroll_to"), ln));
+        }
+    }
+
     if do_save {
         save_editor(app);
     }
@@ -331,6 +598,8 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
     if do_goto {
         let _ = app.model.goto_editor("");
     }
+    ui.ctx().data_mut(|d| d.insert_temp(aux_id, aux.clone()));
+
     if !has_sources {
         ui.centered_and_justified(|ui| {
             ui.label(
@@ -342,21 +611,30 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
         return;
     }
 
-    // ---- main row: gutter | text scroll | minimap ----
+    // ---- main row: gutter | text scroll | minimap | symbol outline ----
     let avail = ui.available_size();
     let wrap = app.editor_wrap;
-    // Narrow pane: the minimap hides (VS Code never lets it overflow the
-    // editor viewport) and the text takes the whole leftover.
-    let show_minimap = editor_minimap_visible(avail.x);
+    let outline_w = 172.0_f32;
+    let show_outline = aux.outline_open && avail.x >= 560.0;
+    let rem_for_editor = if show_outline {
+        (avail.x - outline_w - 8.0).max(240.0)
+    } else {
+        avail.x
+    };
+    let show_minimap = editor_minimap_visible(rem_for_editor);
+    let mut jump_to_symbol: Option<usize> = None;
+    let match_lines: std::collections::HashSet<usize> = matches.iter().map(|&(l, _)| l).collect();
+
     ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
         let gutter_resp = ui.allocate_exact_size(
             egui::vec2(GUTTER_W, avail.y),
             egui::Sense::click(),
         );
         let text_w = if show_minimap {
-            (ui.available_width() - MINIMAP_W - ui.spacing().item_spacing.x).max(MIN_TEXT_W)
+            (rem_for_editor - GUTTER_W - MINIMAP_W).max(MIN_TEXT_W)
         } else {
-            ui.available_width().max(120.0)
+            (rem_for_editor - GUTTER_W).max(120.0)
         };
         let scroll_resp = ui.allocate_ui(egui::vec2(text_w, avail.y), |ui| {
             paint_editor_text(ui, app, theme, lang, n_lines, wrap)
@@ -370,13 +648,107 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
             None
         };
 
+        if show_outline {
+            let (sep_r, _) = ui.allocate_exact_size(egui::vec2(1.0, avail.y), egui::Sense::hover());
+            ui.painter().line_segment(
+                [sep_r.left_top(), sep_r.left_bottom()],
+                egui::Stroke::new(1.0, theme.line),
+            );
+            ui.allocate_ui_with_layout(
+                egui::vec2(outline_w, avail.y),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::Frame::new()
+                        .fill(theme.panel)
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            ui.set_min_size(egui::vec2(outline_w - 16.0, (avail.y - 12.0).max(1.0)));
+                            ui.label(
+                                RichText::new("SYMBOL OUTLINE")
+                                    .font(theme::font_ui_semibold(10.5))
+                                    .color(theme.faint),
+                            );
+                            ui.add_space(4.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("editor_symbol_outline")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.vertical(|ui| {
+                                        if symbols.is_empty() {
+                                            ui.label(RichText::new("No symbols parsed.").small().color(theme.faint));
+                                        }
+                                        for sym in &symbols {
+                                            let on = cursor == sym.line;
+                                            let badge_col = match sym.kind {
+                                                "MOD" => theme.accent,
+                                                "PORT" => theme.info,
+                                                "SIG" => theme.ok,
+                                                "BLK" => theme.warn,
+                                                _ => theme.violet,
+                                            };
+                                            let (rrect, rresp) = ui.allocate_exact_size(
+                                                egui::vec2(ui.available_width(), 22.0),
+                                                egui::Sense::click(),
+                                            );
+                                            if on {
+                                                ui.painter().rect_filled(rrect, 3.0, theme.sel);
+                                            } else if rresp.hovered() {
+                                                ui.painter().rect_filled(rrect, 3.0, theme.surface_hover);
+                                            }
+                                            ui.painter().text(
+                                                egui::pos2(rrect.left() + 4.0, rrect.center().y),
+                                                egui::Align2::LEFT_CENTER,
+                                                sym.kind,
+                                                theme::font_code(9.5),
+                                                badge_col,
+                                            );
+                                            ui.painter().text(
+                                                egui::pos2(rrect.left() + 36.0, rrect.center().y),
+                                                egui::Align2::LEFT_CENTER,
+                                                &sym.name,
+                                                theme::font_code(11.5),
+                                                if on { theme.text } else { theme.dim },
+                                            );
+                                            ui.painter().text(
+                                                egui::pos2(rrect.right() - 4.0, rrect.center().y),
+                                                egui::Align2::RIGHT_CENTER,
+                                                format!(":{}", sym.line),
+                                                theme::font_code(10.0),
+                                                theme.faint,
+                                            );
+                                            if rresp.clicked() {
+                                                jump_to_symbol = Some(sym.line);
+                                            }
+                                        }
+                                    });
+                                });
+                        });
+                },
+            );
+        }
+
         let scroll_out = &scroll_resp.inner;
-        paint_gutter_overlay(ui, app, theme, &gutter_resp.1, scroll_out, n_lines, wrap);
+        paint_gutter_overlay(
+            ui,
+            app,
+            theme,
+            &gutter_resp.1,
+            scroll_out,
+            n_lines,
+            wrap,
+            &match_lines,
+        );
         if let Some(mini_resp) = mini_resp {
             paint_minimap(ui, app, theme, &mini_resp.1, scroll_out, n_lines, lang);
         }
         handle_gutter_click(app, &gutter_resp.1, scroll_out, n_lines, wrap);
     });
+
+    if let Some(line) = jump_to_symbol {
+        let _ = app.model.select_editor_line(&line.to_string());
+        ui.ctx()
+            .memory_mut(|m| m.data.insert_temp(egui::Id::new("text_editor_scroll_to"), line));
+    }
 }
 
 /// The scroll area + content-sized TextEdit. Returns the scroll output
@@ -455,6 +827,7 @@ fn paint_gutter_overlay(
     scroll: &egui::scroll_area::ScrollAreaOutput<egui::text_edit::TextEditOutput>,
     n_lines: usize,
     wrap: bool,
+    match_lines: &std::collections::HashSet<usize>,
 ) {
     let gutter_rect = gutter_resp.rect;
     let offset_y = scroll.state.offset.y;
@@ -465,6 +838,14 @@ fn paint_gutter_overlay(
     let selected = app.model.selected_source_line;
 
     let painter = ui.painter().with_clip_rect(gutter_rect);
+    painter.rect_filled(gutter_rect, 0.0, theme.panel.gamma_multiply(0.55));
+    painter.line_segment(
+        [
+            egui::pos2(gutter_rect.max.x - 1.0, gutter_rect.min.y),
+            egui::pos2(gutter_rect.max.x - 1.0, gutter_rect.max.y),
+        ],
+        egui::Stroke::new(1.0, theme.line),
+    );
     // Track cumulative content-y while walking visible lines.
     let mut cy = 0.0;
     let mut i = 0;
@@ -478,22 +859,38 @@ fn paint_gutter_overlay(
             let sy = gutter_rect.min.y + (cy - offset_y);
             let num = (i + 1).to_string();
             let on = selected == Some(i + 1);
+            let is_match = match_lines.contains(&(i + 1));
             if on {
                 painter.rect_filled(
                     egui::Rect::from_min_size(
                         egui::pos2(gutter_rect.min.x, sy),
-                        egui::vec2(gutter_rect.width(), h),
+                        egui::vec2(gutter_rect.width() - 1.0, h),
                     ),
                     2.0,
                     theme.sel,
                 );
+            } else if is_match {
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(gutter_rect.min.x, sy),
+                        egui::vec2(gutter_rect.width() - 1.0, h),
+                    ),
+                    2.0,
+                    theme.gold.gamma_multiply(0.22),
+                );
             }
             painter.text(
-                egui::pos2(gutter_rect.max.x - 6.0, sy + 2.0),
-                egui::Align2::RIGHT_TOP,
+                egui::pos2(gutter_rect.max.x - 8.0, sy + ROW_H * 0.5),
+                egui::Align2::RIGHT_CENTER,
                 num,
-                theme::font_code(12.0),
-                if on { theme.text } else { theme.faint },
+                theme::font_code(11.5),
+                if on {
+                    theme.text
+                } else if is_match {
+                    theme.gold
+                } else {
+                    theme.faint
+                },
             );
             // Diagnostic tick (worst severity wins, as before).
             let tick = markers
@@ -505,14 +902,15 @@ fn paint_gutter_overlay(
                     bookmarks
                         .contains(&(i + 1))
                         .then_some(theme.accent)
-                });
+                })
+                .or_else(|| is_match.then_some(theme.gold));
             if let Some(c) = tick {
                 painter.rect_filled(
                     egui::Rect::from_min_size(
-                        egui::pos2(gutter_rect.min.x + 4.0, sy + (h - 12.0) / 2.0),
-                        egui::vec2(8.0, 12.0),
+                        egui::pos2(gutter_rect.min.x + 4.0, sy + (ROW_H - 12.0) / 2.0),
+                        egui::vec2(6.0, 12.0),
                     ),
-                    1.0,
+                    2.0,
                     c,
                 );
             }
@@ -566,8 +964,11 @@ fn paint_minimap(
         return;
     }
     let painter = ui.painter().with_clip_rect(mini_rect);
-    painter.rect_filled(mini_rect, 4.0, theme.bg);
-
+    painter.rect_filled(mini_rect, 0.0, theme.panel.gamma_multiply(0.45));
+    painter.line_segment(
+        [mini_rect.left_top(), mini_rect.left_bottom()],
+        egui::Stroke::new(1.0, theme.line),
+    );
     let offset_y = scroll.state.offset.y;
     let viewport_h = scroll.inner_rect.height().max(1.0);
     // Use the scroll area's measured content extent. Reconstructing this from
