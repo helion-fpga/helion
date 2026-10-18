@@ -40,6 +40,13 @@ pub use tcl::{
     get_clocks, get_ports, net_properties, pin_properties, port_properties, run_vivado_tcl,
     split_tcl_list, tcl_glob_match, translate_vhdl_to_sv,
 };
+pub mod translator;
+pub use translator::{
+    ClockConstraint, ClockGroupRelation, ClockGroupsConstraint, ConstraintFormat,
+    FalsePathConstraint, IoDelayConstraint, MaxDelayConstraint, MulticycleConstraint,
+    PortConstraint, PullMode, SlewRate, UniversalConstraints, canonicalize_iostandard,
+    iostandard_to_lattice, iostandard_to_quartus, iostandard_to_vivado, translate_constraints,
+};
 
 /// UG986 / UG904 implementation strategies, including Vivado multi-strategy explorer presets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2376,8 +2383,14 @@ pub fn constraints_from_project(
         let path = resolve_prj_path(prj_path, cf);
         let body = std::fs::read_to_string(&path)
             .map_err(|e| format!("read_xdc {}: {e}", path.display()))?;
-        blob.push_str(&body);
-        if !body.ends_with('\n') {
+        let normalized = match ConstraintFormat::from_extension(&path) {
+            Some(fmt @ (ConstraintFormat::Lpf | ConstraintFormat::Pcf | ConstraintFormat::Qsf)) => {
+                UniversalConstraints::parse_format(&body, fmt)?.to_xdc()
+            }
+            _ => body,
+        };
+        blob.push_str(&normalized);
+        if !normalized.ends_with('\n') {
             blob.push('\n');
         }
     }
