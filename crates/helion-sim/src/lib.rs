@@ -53,6 +53,12 @@ pub use dpi::{
 };
 pub use sva::{SvaEngine, SvaFailure, SvaReport};
 pub use svtb::{ScoreboardMismatch, SimMailbox, SimScoreboard, SimSemaphore};
+pub mod verilate;
+use sva::{SvaEngine, SvaFailure, SvaReport};
+pub use verilate::{
+    emit_cpp_cycle_model, emit_rust_cycle_model, sanitize_ident, VpiFormat, VpiHandle,
+    VpiObjectInfo, VpiObjectKind, VpiPutFlags, VpiRegistry, VpiValue, VpiVecVal,
+};
 /// UG900 force vs deposit: hold until `release`, or one-shot poke.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SimForceKind {
@@ -122,6 +128,8 @@ pub struct Sim {
     coverage: CoverageCollector,
     /// DPI-C foreign function registry attached to this simulator.
     dpi: DpiRegistry,
+    /// IEEE 1364 / 1800 VPI signal introspection registry.
+    vpi: VpiRegistry,
 }
 
 impl Sim {
@@ -232,6 +240,7 @@ impl Sim {
         }
         let compiled = CompiledSim::new(d);
         let coverage = CoverageCollector::from_design(d, &compiled);
+        let vpi = VpiRegistry::new(d);
         Self {
             time: 0,
             cycle: 0,
@@ -255,6 +264,7 @@ impl Sim {
             timing: None,
             coverage,
             dpi: DpiRegistry::new(),
+            vpi,
         }
     }
 
@@ -513,6 +523,9 @@ impl Sim {
     }
 
     pub fn step_posedge(&mut self, delay: u64) {
+        let mut vpi = std::mem::take(&mut self.vpi);
+        let _ = vpi.flush_inertial_puts(self);
+        self.vpi = vpi;
         self.time += delay;
         self.cycle += 1;
         // SVA preponed region: concurrent properties + non-final immediate
@@ -724,6 +737,49 @@ impl Sim {
     pub fn call_dpi(&mut self, name: &str, args: &[DpiValue]) -> Result<DpiValue, String> {
         self.dpi.call(name, args)
     }
+    /// Look up the HFF cell name driving `net`, if `net` is driven by a flip-flop `Q` pin.
+    pub fn net_ff_cell(&self, net: &str) -> Option<String> {
+        self.net_ff.get(net).cloned()
+    }
+
+    /// Access the IEEE 1800 VPI signal introspection registry.
+    pub fn vpi(&self) -> &VpiRegistry {
+        &self.vpi
+    }
+
+    /// Look up a [`VpiHandle`] by hierarchical or local signal name.
+    pub fn vpi_handle_by_name(&self, name: &str) -> Option<VpiHandle> {
+        self.vpi.vpi_handle_by_name(name)
+    }
+
+    /// Read the current value of a VPI handle in the requested [`VpiFormat`].
+    pub fn vpi_get_value(&self, handle: VpiHandle, format: VpiFormat) -> Result<VpiValue, String> {
+        self.vpi.vpi_get_value(self, handle, format)
+    }
+
+    /// Write, schedule, force, or release a VPI signal handle with [`VpiPutFlags`].
+    pub fn vpi_put_value(
+        &mut self,
+        handle: VpiHandle,
+        value: &VpiValue,
+        flags: VpiPutFlags,
+    ) -> Result<(), String> {
+        let mut vpi = std::mem::take(&mut self.vpi);
+        let res = vpi.vpi_put_value(self, handle, value, flags);
+        self.vpi = vpi;
+        res
+    }
+
+    /// Return VPI handles for all top-level ports (`vpi_iterate(vpiPort, top)`).
+    pub fn vpi_iterate_ports(&self) -> Vec<VpiHandle> {
+        self.vpi.vpi_iterate_ports()
+    }
+
+    /// Return VPI handles for all nets, registers, and vector buses (`vpi_iterate(vpiNet, top)`).
+    pub fn vpi_iterate_nets(&self) -> Vec<VpiHandle> {
+        self.vpi.vpi_iterate_nets()
+    }
+
     /// UG900 Objects pane: live helion-sim probes (LED + each FF Q), not a static name list.
     pub fn object_values(&self) -> Vec<(String, String)> {
         self.locals()
@@ -2247,5 +2303,194 @@ endmodule
         assert_eq!(first.golden_value, Some(1));
         assert_eq!(first.candidate_value, Some(0));
         assert!(fail_rep.summary_line().contains("cosim FAIL"));
+    }
+
+    #[test]
+    fn verilate_cpp20_and_rust_codegen_levelizes_cones_and_matches_sim() {
+        let mut d = Design::structural_counter();
+        // Add a Carry4, MUXF7, MUXF8, and Bram18 to exercise all levelized codegen primitives.
+        d.add_cell("u_carry", CellKind::Carry4);
+        d.connect("1", "u_carry", "CYINIT");
+        d.connect("q0", "u_carry", "S0");
+        d.connect("0", "u_carry", "DI0");
+        d.connect("carry_o0", "u_carry", "O0");
+        d.connect("carry_co3", "u_carry", "CO3");
+
+        d.add_cell(
+            "u_mux7",
+            CellKind::BlackBox {
+                module: intern("MUXF7"),
+            },
+        );
+        d.connect("q0", "u_mux7", "I0");
+        d.connect("q1", "u_mux7", "I1");
+        d.connect("q2", "u_mux7", "S");
+        d.connect("m7_o", "u_mux7", "O");
+
+        d.add_cell(
+            "u_mux8",
+            CellKind::BlackBox {
+                module: intern("MUXF8"),
+            },
+        );
+        d.connect("m7_o", "u_mux8", "I0");
+        d.connect("carry_o0", "u_mux8", "I1");
+        d.connect("q3", "u_mux8", "S");
+        d.connect("m8_o", "u_mux8", "O");
+
+        d.add_cell("u_ram", CellKind::Bram18);
+        d.connect("q0", "u_ram", "RADDR0");
+        d.connect("q0", "u_ram", "WADDR0");
+        d.connect("q1", "u_ram", "DI0");
+        d.connect("q2", "u_ram", "WE");
+        d.connect("ram_do0", "u_ram", "DO0");
+
+        let cpp = emit_cpp_cycle_model(&d);
+        assert!(cpp.contains("struct VHelionModel {"));
+        assert!(cpp.contains("constexpr void eval_comb() noexcept"));
+        assert!(cpp.contains("constexpr void tick() noexcept"));
+        assert!(
+            cpp.contains("ULL >> idx_u_lut0) & 1ULL"),
+            "must emit branchless 64-bit LUT shift: {cpp}"
+        );
+        assert!(cpp.contains("std::array<uint16_t, 1024> ram_u_ram{};"));
+
+        let rs = emit_rust_cycle_model(&d);
+        assert!(rs.contains("pub struct VHelionModel {"));
+        assert!(rs.contains("pub fn eval_comb(&mut self)"));
+        assert!(rs.contains("pub fn tick(&mut self)"));
+        assert!(
+            rs.contains("u64 >> idx_u_lut0) & 1u64"),
+            "must emit branchless 64-bit Rust LUT shift: {rs}"
+        );
+
+        // Compile & execute the emitted C++20 counter model if `clang++` is available,
+        // verifying bit-exact agreement with `COUNTER_OVERLAY_SIM_LED`.
+        let counter_cpp = emit_cpp_cycle_model(&Design::structural_counter());
+        if std::process::Command::new("clang++")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            let tmp_dir = std::env::temp_dir();
+            let cpp_path = tmp_dir.join("helion_verilate_test.cpp");
+            let bin_path = tmp_dir.join("helion_verilate_test_bin");
+            let main_src = format!(
+                "{counter_cpp}\n#include <iostream>\nint main() {{\n    VHelionModel m{{}};\n    for (int i = 0; i < 16; ++i) {{\n        m.tick();\n        std::cout << m.led;\n    }}\n    return 0;\n}}\n"
+            );
+            std::fs::write(&cpp_path, main_src).expect("write cpp");
+            let status = std::process::Command::new("clang++")
+                .args([
+                    "-std=c++20",
+                    "-O2",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    cpp_path.to_str().unwrap(),
+                    "-o",
+                    bin_path.to_str().unwrap(),
+                ])
+                .status()
+                .expect("invoke clang++");
+            assert!(status.success(), "clang++ -std=c++20 compilation failed");
+            let out = std::process::Command::new(&bin_path)
+                .output()
+                .expect("run compiled VHelionModel");
+            assert!(out.status.success());
+            let led_str = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(led_str.trim(), COUNTER_OVERLAY_SIM_LED);
+        }
+    }
+
+    #[test]
+    fn vpi_registry_introspects_signals_formats_and_puts_values() {
+        let d = Design::structural_counter();
+        let mut sim = Sim::new(&d);
+
+        let ports = sim.vpi_iterate_ports();
+        assert!(!ports.is_empty());
+        let nets = sim.vpi_iterate_nets();
+        assert!(!nets.is_empty());
+
+        // Look up both single-bit (`counter.q0`) and reconstructed 4-bit bus (`q` = `q0..q3`).
+        let h_q0 = sim.vpi_handle_by_name("counter.q0").expect("counter.q0");
+        let h_q_bus = sim.vpi_handle_by_name("q").expect("4-bit bus q");
+        let h_led = sim.vpi_handle_by_name("led").expect("led");
+
+        assert_eq!(sim.vpi().vpi_object_info(h_q_bus).unwrap().width, 4);
+
+        // Advance 10 cycles (`q` counts to 10 = `4'b1010` = `0xa`).
+        for _ in 0..10 {
+            sim.step_posedge(10);
+        }
+        assert_eq!(
+            sim.vpi_get_value(h_q_bus, VpiFormat::IntVal).unwrap(),
+            VpiValue::IntVal(10)
+        );
+        assert_eq!(
+            sim.vpi_get_value(h_q_bus, VpiFormat::BinStr).unwrap(),
+            VpiValue::BinStr("1010".to_string())
+        );
+        assert_eq!(
+            sim.vpi_get_value(h_q_bus, VpiFormat::HexStr).unwrap(),
+            VpiValue::HexStr("a".to_string())
+        );
+        assert_eq!(
+            sim.vpi_get_value(h_q_bus, VpiFormat::DecStr).unwrap(),
+            VpiValue::DecStr("10".to_string())
+        );
+        assert_eq!(
+            sim.vpi_get_value(h_q_bus, VpiFormat::VectorVal).unwrap(),
+            VpiValue::VectorVal(vec![VpiVecVal { aval: 10, bval: 0 }])
+        );
+
+        // VpiPutFlags::NoDelay deposits a new 4-bit value (`4'b0101` = 5) onto `q`.
+        sim.vpi_put_value(
+            h_q_bus,
+            &VpiValue::BinStr("0101".to_string()),
+            VpiPutFlags::NoDelay,
+        )
+        .unwrap();
+        assert_eq!(
+            sim.vpi_get_value(h_q_bus, VpiFormat::IntVal).unwrap(),
+            VpiValue::IntVal(5)
+        );
+        assert_eq!(
+            sim.vpi_get_value(h_q0, VpiFormat::IntVal).unwrap(),
+            VpiValue::IntVal(1)
+        );
+
+        // VpiPutFlags::ForceFlag holds `led` at 1 across clock edges until ReleaseFlag.
+        sim.vpi_put_value(h_led, &VpiValue::IntVal(1), VpiPutFlags::ForceFlag)
+            .unwrap();
+        sim.step_posedge(10); // q = 6 (cnt[3] = 0), but led is forced to 1!
+        assert_eq!(
+            sim.vpi_get_value(h_led, VpiFormat::IntVal).unwrap(),
+            VpiValue::IntVal(1)
+        );
+        sim.vpi_put_value(h_led, &VpiValue::IntVal(0), VpiPutFlags::ReleaseFlag)
+            .unwrap();
+        sim.step_posedge(10); // q = 7 (cnt[3] = 0), force released -> led = 0!
+        assert_eq!(
+            sim.vpi_get_value(h_led, VpiFormat::IntVal).unwrap(),
+            VpiValue::IntVal(0)
+        );
+
+        // VpiPutFlags::InertialDelay schedules an update applied on the next step_posedge.
+        let mut dut_sim = Sim::new(&and_dut());
+        let h_a = dut_sim.vpi_handle_by_name("a").unwrap();
+        let h_b = dut_sim.vpi_handle_by_name("b").unwrap();
+        let h_y = dut_sim.vpi_handle_by_name("y").unwrap();
+        dut_sim
+            .vpi_put_value(h_a, &VpiValue::IntVal(1), VpiPutFlags::InertialDelay)
+            .unwrap();
+        dut_sim
+            .vpi_put_value(h_b, &VpiValue::IntVal(1), VpiPutFlags::InertialDelay)
+            .unwrap();
+        dut_sim.step_posedge(10);
+        assert_eq!(
+            dut_sim.vpi_get_value(h_y, VpiFormat::IntVal).unwrap(),
+            VpiValue::IntVal(1)
+        );
     }
 }
