@@ -1604,6 +1604,554 @@ pub fn route_timing_driven(
     })
 }
 
+/// Count the number of 90-degree turns (vias / switchbox direction changes) along a tile path.
+pub fn count_route_vias(path: &[(u32, u32)]) -> u32 {
+    if path.len() < 3 {
+        return 0;
+    }
+    let mut vias = 0u32;
+    for w in path.windows(3) {
+        let dx1 = w[1].0 as i32 - w[0].0 as i32;
+        let dy1 = w[1].1 as i32 - w[0].1 as i32;
+        let dx2 = w[2].0 as i32 - w[1].0 as i32;
+        let dy2 = w[2].1 as i32 - w[1].1 as i32;
+        if (dx1, dy1) != (dx2, dy2) {
+            vias += 1;
+        }
+    }
+    vias
+}
+
+fn rebuild_congestion_map(routed: &mut Routed) {
+    let cols = routed.congestion_cols;
+    let rows = routed.congestion_rows;
+    let len = (cols as usize).saturating_mul(rows as usize);
+    routed.congestion = vec![0u32; len];
+    if cols == 0 || rows == 0 {
+        routed.overused = 0;
+        return;
+    }
+    let grid = TileGrid {
+        x0: routed.congestion_x0,
+        y0: routed.congestion_y0,
+        cols,
+        rows,
+    };
+    for r in &routed.iob_src {
+        for &(tx, ty) in &r.path {
+            if (tx, ty) == r.clb || (tx, ty) == r.iob {
+                continue;
+            }
+            if let Some(ti) = grid.index(tx, ty) {
+                routed.congestion[ti] = routed.congestion[ti].saturating_add(1);
+            }
+        }
+    }
+    routed.overused = routed.congestion.iter().filter(|&&c| c > 1).count() as u32;
+}
+
+/// Vivado UG904 `set_bus_skew` constraint for multi-bit Gray/CDC buses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BusSkewConstraint {
+    /// Logical bus name or prefix (e.g. `"gray_ptr"`).
+    pub bus_name: String,
+    /// Explicit net names belonging to this bus (if empty, matches nets starting with `bus_name`).
+    pub bit_nets: Vec<String>,
+    /// Maximum allowed bit-to-bit routing delay skew $\Delta_{\text{skew\_ps}}$ (ps).
+    pub max_skew_ps: i64,
+}
+
+/// Per-bus skew summary produced by [`route_bus_skew_aware`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BusSkewReport {
+    pub bus_name: String,
+    pub max_delay_ps: i64,
+    pub min_delay_ps: i64,
+    pub skew_before_ps: i64,
+    pub skew_after_ps: i64,
+    pub detoured_bits: usize,
+    pub met: bool,
+}
+
+/// Route a placed design and enforce `set_bus_skew` constraints across multi-bit buses:
+///
+/// $$|\max_i d(b_i) - \min_j d(b_j)| \le \Delta_{\text{skew\_ps}}$$
+///
+/// Routes the slowest bit first to establish $T_{\text{target}} = \max_i d(b_i)$, then
+/// inserts uncongested orthogonal tile dogleg detours (and directed delay padding if needed)
+/// on fast bits whose delay falls below $T_{\text{target}} - \Delta_{\text{skew\_ps}}$.
+pub fn route_bus_skew_aware(
+    placed: &Placed,
+    dev: &Device,
+    constraints: &[BusSkewConstraint],
+) -> Result<(Routed, Vec<BusSkewReport>), String> {
+    let mut out = route(placed, dev)?;
+    let grid = TileGrid::from_device(dev);
+    let mut reports = Vec::with_capacity(constraints.len());
+
+    for c in constraints {
+        let max_skew = c.max_skew_ps.max(0);
+        let member_indices: Vec<usize> = out
+            .iob_src
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                if c.bit_nets.is_empty() {
+                    r.net.starts_with(&c.bus_name)
+                } else {
+                    c.bit_nets.iter().any(|n| n == &r.net)
+                }
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if member_indices.len() < 2 {
+            let d = member_indices
+                .first()
+                .map(|&i| out.iob_src[i].delay_ps)
+                .unwrap_or(0);
+            reports.push(BusSkewReport {
+                bus_name: c.bus_name.clone(),
+                max_delay_ps: d,
+                min_delay_ps: d,
+                skew_before_ps: 0,
+                skew_after_ps: 0,
+                detoured_bits: 0,
+                met: true,
+            });
+            continue;
+        }
+
+        let target_delay = member_indices
+            .iter()
+            .map(|&i| out.iob_src[i].delay_ps)
+            .max()
+            .unwrap_or(0);
+        let min_before = member_indices
+            .iter()
+            .map(|&i| out.iob_src[i].delay_ps)
+            .min()
+            .unwrap_or(0);
+        let skew_before_ps = target_delay - min_before;
+        let min_required_delay = (target_delay - max_skew).max(0);
+        let mut detoured_bits = 0usize;
+
+        for &ri in &member_indices {
+            if out.iob_src[ri].delay_ps >= min_required_delay {
+                continue;
+            }
+            detoured_bits += 1;
+            while out.iob_src[ri].delay_ps < min_required_delay {
+                // Only insert a 2-hop dogleg (+80ps) if it won't overshoot target_delay + max_skew.
+                if out.iob_src[ri].delay_ps + 2 * HOP_DELAY_PS > target_delay + max_skew {
+                    break;
+                }
+                let path = &out.iob_src[ri].path;
+                let mut inserted = None;
+                for idx in 0..path.len().saturating_sub(1) {
+                    let a = path[idx];
+                    let b = path[idx + 1];
+                    let dx = b.0 as i32 - a.0 as i32;
+                    let dy = b.1 as i32 - a.1 as i32;
+                    let perp: [(i32, i32); 2] = if dx == 0 && dy.abs() == 1 {
+                        [(1, 0), (-1, 0)]
+                    } else if dy == 0 && dx.abs() == 1 {
+                        [(0, 1), (0, -1)]
+                    } else {
+                        continue;
+                    };
+                    for (ox, oy) in perp {
+                        let ax = a.0 as i32 + ox;
+                        let ay = a.1 as i32 + oy;
+                        let bx = b.0 as i32 + ox;
+                        let by = b.1 as i32 + oy;
+                        if ax < 0 || ay < 0 || bx < 0 || by < 0 {
+                            continue;
+                        }
+                        let pa = (ax as u32, ay as u32);
+                        let pb = (bx as u32, by as u32);
+                        if !on_grid(dev, pa.0, pa.1) || !on_grid(dev, pb.0, pb.1) {
+                            continue;
+                        }
+                        if path.contains(&pa) || path.contains(&pb) {
+                            continue;
+                        }
+                        let (Some(tia), Some(tib)) = (grid.index(pa.0, pa.1), grid.index(pb.0, pb.1))
+                        else {
+                            continue;
+                        };
+                        if out.congestion.get(tia).copied().unwrap_or(0) == 0
+                            && out.congestion.get(tib).copied().unwrap_or(0) == 0
+                        {
+                            inserted = Some((idx + 1, pa, pb, tia, tib));
+                            break;
+                        }
+                    }
+                    if inserted.is_some() {
+                        break;
+                    }
+                }
+                if let Some((ins_at, pa, pb, tia, tib)) = inserted {
+                    out.iob_src[ri].path.insert(ins_at, pb);
+                    out.iob_src[ri].path.insert(ins_at, pa);
+                    if let Some(cg) = out.congestion.get_mut(tia) {
+                        *cg = cg.saturating_add(1);
+                    }
+                    if let Some(cg) = out.congestion.get_mut(tib) {
+                        *cg = cg.saturating_add(1);
+                    }
+                    let hops = out.iob_src[ri].path.len().saturating_sub(1) as u32;
+                    out.iob_src[ri].hops = hops;
+                    out.iob_src[ri].delay_ps = hops as i64 * HOP_DELAY_PS;
+                } else {
+                    // Fallback: directed 1-hop delay pad when physical dogleg would overshoot or saturate.
+                    let needed_hops =
+                        ((min_required_delay + HOP_DELAY_PS - 1) / HOP_DELAY_PS) as u32;
+                    out.iob_src[ri].hops = out.iob_src[ri].hops.max(needed_hops);
+                    out.iob_src[ri].delay_ps = out.iob_src[ri].hops as i64 * HOP_DELAY_PS;
+                    break;
+                }
+            }
+            if out.iob_src[ri].delay_ps < min_required_delay {
+                let needed_hops = ((min_required_delay + HOP_DELAY_PS - 1) / HOP_DELAY_PS) as u32;
+                out.iob_src[ri].hops = out.iob_src[ri].hops.max(needed_hops);
+                out.iob_src[ri].delay_ps = out.iob_src[ri].hops as i64 * HOP_DELAY_PS;
+            }
+        }
+
+        let max_after = member_indices
+            .iter()
+            .map(|&i| out.iob_src[i].delay_ps)
+            .max()
+            .unwrap_or(0);
+        let min_after = member_indices
+            .iter()
+            .map(|&i| out.iob_src[i].delay_ps)
+            .min()
+            .unwrap_or(0);
+        let skew_after_ps = max_after - min_after;
+        reports.push(BusSkewReport {
+            bus_name: c.bus_name.clone(),
+            max_delay_ps: max_after,
+            min_delay_ps: min_after,
+            skew_before_ps,
+            skew_after_ps,
+            detoured_bits,
+            met: skew_after_ps <= max_skew,
+        });
+    }
+    rebuild_congestion_map(&mut out);
+    Ok((out, reports))
+}
+
+/// Crosstalk spacing & grounded `GND` shield policy for timing-critical nets
+/// ([`apply_crosstalk_spacing`]).
+#[derive(Clone, Debug)]
+pub struct CrosstalkSpacingPolicy {
+    /// Net names classified as timing-critical victims/aggressors.
+    pub critical_nets: HashSet<String>,
+    /// Extra step penalty (in [`HOP_DELAY_PS`] multiples) on tiles immediately adjacent
+    /// ($(x \pm 1, y)$ or $(x, y \pm 1)$) to a critical net's intermediate segments.
+    pub adjacent_penalty_hops: u32,
+    /// Reserve uncongested adjacent $(x \pm 1, y)$ tiles as grounded `GND` shield tracks.
+    pub reserve_gnd_shields: bool,
+}
+
+impl Default for CrosstalkSpacingPolicy {
+    fn default() -> Self {
+        Self {
+            critical_nets: HashSet::new(),
+            adjacent_penalty_hops: 6,
+            reserve_gnd_shields: true,
+        }
+    }
+}
+
+/// Telemetry from [`apply_crosstalk_spacing`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CrosstalkShieldReport {
+    pub critical_nets_routed: usize,
+    pub shield_tiles_reserved: Vec<(u32, u32)>,
+    pub rerouted_aggressors: usize,
+    pub adjacent_couplings_before: usize,
+    pub adjacent_couplings_after: usize,
+}
+
+fn count_adjacent_couplings(routes: &[IobRoute], critical_nets: &HashSet<String>) -> usize {
+    let mut crit_tiles: HashSet<(u32, u32)> = HashSet::new();
+    for r in routes {
+        if critical_nets.contains(&r.net) {
+            for &pt in &r.path {
+                if pt != r.clb && pt != r.iob {
+                    crit_tiles.insert(pt);
+                }
+            }
+        }
+    }
+    if crit_tiles.is_empty() {
+        return 0;
+    }
+    let mut couplings = 0usize;
+    for r in routes {
+        if critical_nets.contains(&r.net) {
+            continue;
+        }
+        for &(x, y) in &r.path {
+            if (x, y) == r.clb || (x, y) == r.iob {
+                continue;
+            }
+            for (dx, dy) in [(1i32, 0), (-1, 0), (0, 1), (0, -1)] {
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                if nx >= 0 && ny >= 0 && crit_tiles.contains(&(nx as u32, ny as u32)) {
+                    couplings += 1;
+                }
+            }
+        }
+    }
+    couplings
+}
+
+/// Apply critical-net crosstalk spacing and optional `GND` track shielding
+/// ([`CrosstalkSpacingPolicy`]).
+///
+/// Penalizes tiles immediately adjacent to critical nets' intermediate segments and
+/// reroutes non-critical aggressor nets away from the critical halo when an uncongested
+/// lower-coupling path exists.
+pub fn apply_crosstalk_spacing(
+    routed: &Routed,
+    dev: &Device,
+    policy: &CrosstalkSpacingPolicy,
+) -> Result<(Routed, CrosstalkShieldReport), String> {
+    let mut out = routed.clone();
+    let couplings_before = count_adjacent_couplings(&out.iob_src, &policy.critical_nets);
+    let grid = TileGrid::from_device(dev);
+    let mut halo_penalty = vec![0u32; grid.len()];
+    let mut crit_count = 0usize;
+    let mut shield_set: HashSet<(u32, u32)> = HashSet::new();
+
+    for r in &out.iob_src {
+        if !policy.critical_nets.contains(&r.net) {
+            continue;
+        }
+        crit_count += 1;
+        for &(x, y) in &r.path {
+            if (x, y) == r.clb || (x, y) == r.iob {
+                continue;
+            }
+            for (dx, dy) in [(1i32, 0), (-1, 0), (0, 1), (0, -1)] {
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                if nx < 0 || ny < 0 {
+                    continue;
+                }
+                let (ux, uy) = (nx as u32, ny as u32);
+                if !on_grid(dev, ux, uy) {
+                    continue;
+                }
+                if let Some(ti) = grid.index(ux, uy) {
+                    halo_penalty[ti] = halo_penalty[ti]
+                        .saturating_add(policy.adjacent_penalty_hops.max(1) * HOP_DELAY_PS as u32);
+                    if policy.reserve_gnd_shields && dy == 0 {
+                        shield_set.insert((ux, uy));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut scratch = AstarScratch::new(grid.len());
+    let mut rerouted_aggressors = 0usize;
+    for ri in 0..out.iob_src.len() {
+        if policy.critical_nets.contains(&out.iob_src[ri].net) {
+            continue;
+        }
+        let src = out.iob_src[ri].clb;
+        let dst = out.iob_src[ri].iob;
+        let old_path = &out.iob_src[ri].path;
+        let touches_halo = old_path.iter().any(|&(x, y)| {
+            (x, y) != src
+                && (x, y) != dst
+                && grid
+                    .index(x, y)
+                    .map(|ti| halo_penalty[ti] > 0)
+                    .unwrap_or(false)
+        });
+        if !touches_halo {
+            continue;
+        }
+        let mut pres = out.congestion.clone();
+        for &(tx, ty) in old_path {
+            if (tx, ty) == src || (tx, ty) == dst {
+                continue;
+            }
+            if let Some(ti) = grid.index(tx, ty) {
+                pres[ti] = pres[ti].saturating_sub(1);
+            }
+        }
+        if let Ok(new_path) = astar(dev, &grid, &mut scratch, src, dst, &halo_penalty, &pres, 8, 0)
+        {
+            if new_path != *old_path {
+                let extra_pad = out.iob_src[ri]
+                    .hops
+                    .saturating_sub(old_path.len().saturating_sub(1) as u32);
+                let new_hops = new_path.len().saturating_sub(1) as u32 + extra_pad;
+                out.iob_src[ri].path = new_path;
+                out.iob_src[ri].hops = new_hops;
+                out.iob_src[ri].delay_ps = new_hops as i64 * HOP_DELAY_PS;
+                rebuild_congestion_map(&mut out);
+                rerouted_aggressors += 1;
+            }
+        }
+    }
+
+    let mut shield_tiles_reserved: Vec<(u32, u32)> = shield_set
+        .into_iter()
+        .filter(|&(x, y)| {
+            grid.index(x, y)
+                .and_then(|ti| out.congestion.get(ti))
+                .copied()
+                .unwrap_or(1)
+                == 0
+        })
+        .collect();
+    shield_tiles_reserved.sort_unstable();
+    let couplings_after = count_adjacent_couplings(&out.iob_src, &policy.critical_nets);
+
+    Ok((
+        out,
+        CrosstalkShieldReport {
+            critical_nets_routed: crit_count,
+            shield_tiles_reserved,
+            rerouted_aggressors,
+            adjacent_couplings_before: couplings_before,
+            adjacent_couplings_after: couplings_after,
+        },
+    ))
+}
+
+/// Summary metrics from post-route via minimization ([`minimize_route_vias`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViaMinimizationStats {
+    pub nets_simplified: usize,
+    pub vias_before: u32,
+    pub vias_after: u32,
+    pub hops_before: u32,
+    pub hops_after: u32,
+}
+
+/// Post-route via minimization (`minimize_route_vias`):
+/// scans routed net paths for redundant `H -> V -> H` / `V -> H -> V` staircase jogs
+/// and replaces them with direct 0-via straight lines or 1-via L-shaped corners when
+/// the replacement is congestion-free and does not increase path delay (hops).
+pub fn minimize_route_vias(
+    routed: &Routed,
+    dev: &Device,
+) -> Result<(Routed, ViaMinimizationStats), String> {
+    let mut out = routed.clone();
+    let vias_before: u32 = out.iob_src.iter().map(|r| count_route_vias(&r.path)).sum();
+    let hops_before: u32 = out.iob_src.iter().map(|r| r.hops).sum();
+    let grid = TileGrid::from_device(dev);
+    let mut nets_simplified = 0usize;
+
+    for ri in 0..out.iob_src.len() {
+        let src = out.iob_src[ri].clb;
+        let dst = out.iob_src[ri].iob;
+        let old_path = &out.iob_src[ri].path;
+        let old_vias = count_route_vias(old_path);
+        if old_vias <= 1 && old_path.len().saturating_sub(1) as u32 == manhattan(src, dst) {
+            continue;
+        }
+        let old_tile_hops = old_path.len().saturating_sub(1) as u32;
+        let extra_pad = out.iob_src[ri].hops.saturating_sub(old_tile_hops);
+
+        // Rip up current net's intermediate tiles from congestion map.
+        let mut pres = out.congestion.clone();
+        for &(tx, ty) in old_path {
+            if (tx, ty) == src || (tx, ty) == dst {
+                continue;
+            }
+            if let Some(ti) = grid.index(tx, ty) {
+                pres[ti] = pres[ti].saturating_sub(1);
+            }
+        }
+
+        let try_l_corner = |hv: bool| -> Option<Vec<(u32, u32)>> {
+            let mut p = Vec::with_capacity((manhattan(src, dst) + 1) as usize);
+            let (mut x, mut y) = src;
+            p.push((x, y));
+            if hv {
+                while x != dst.0 {
+                    x = if x < dst.0 { x + 1 } else { x - 1 };
+                    if !on_grid(dev, x, y) {
+                        return None;
+                    }
+                    p.push((x, y));
+                }
+                while y != dst.1 {
+                    y = if y < dst.1 { y + 1 } else { y - 1 };
+                    if !on_grid(dev, x, y) {
+                        return None;
+                    }
+                    p.push((x, y));
+                }
+            } else {
+                while y != dst.1 {
+                    y = if y < dst.1 { y + 1 } else { y - 1 };
+                    if !on_grid(dev, x, y) {
+                        return None;
+                    }
+                    p.push((x, y));
+                }
+                while x != dst.0 {
+                    x = if x < dst.0 { x + 1 } else { x - 1 };
+                    if !on_grid(dev, x, y) {
+                        return None;
+                    }
+                    p.push((x, y));
+                }
+            }
+            for &(tx, ty) in &p {
+                if (tx, ty) == src || (tx, ty) == dst {
+                    continue;
+                }
+                let ti = grid.index(tx, ty)?;
+                if pres.get(ti).copied().unwrap_or(0) > 0 {
+                    return None;
+                }
+            }
+            Some(p)
+        };
+
+        if let Some(new_path) = try_l_corner(false).or_else(|| try_l_corner(true)) {
+            let new_tile_hops = new_path.len().saturating_sub(1) as u32;
+            let new_vias = count_route_vias(&new_path);
+            if new_tile_hops <= old_tile_hops
+                && (new_vias < old_vias || new_tile_hops < old_tile_hops)
+            {
+                let new_hops = new_tile_hops + extra_pad;
+                out.iob_src[ri].path = new_path;
+                out.iob_src[ri].hops = new_hops;
+                out.iob_src[ri].delay_ps = new_hops as i64 * HOP_DELAY_PS;
+                rebuild_congestion_map(&mut out);
+                nets_simplified += 1;
+            }
+        }
+    }
+
+    let vias_after: u32 = out.iob_src.iter().map(|r| count_route_vias(&r.path)).sum();
+    let hops_after: u32 = out.iob_src.iter().map(|r| r.hops).sum();
+    Ok((
+        out,
+        ViaMinimizationStats {
+            nets_simplified,
+            vias_before,
+            vias_after,
+            hops_before,
+            hops_after,
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2071,5 +2619,92 @@ mod tests {
         cfg.min_hold_delay_ps = base_delay + 3 * HOP_DELAY_PS;
         let r_hold = route_timing_driven(&pl, &dev, &cfg).unwrap();
         assert!(r_hold.iob_src[0].delay_ps >= cfg.min_hold_delay_ps);
+    }
+
+    #[test]
+    fn bus_skew_aware_router_bounds_multi_bit_skew_within_tolerance() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::new("bus2");
+        d.add_port("clk", helion_ir::PortDir::In);
+        d.add_port("o0", helion_ir::PortDir::Out);
+        d.add_port("o1", helion_ir::PortDir::Out);
+        for i in 0..2 {
+            let lut = format!("lut{i}");
+            let ff = format!("ff{i}");
+            let io = format!("iob{i}");
+            d.add_cell(&lut, helion_ir::CellKind::Lut6 { init: 0x5555_5555_5555_5555 });
+            d.add_cell(&ff, helion_ir::CellKind::Hff);
+            d.add_cell(&io, helion_ir::CellKind::IobOut);
+            d.connect("clk", &ff, "CLK");
+            d.connect(&format!("d{i}"), &lut, "O");
+            d.connect(&format!("d{i}"), &ff, "D");
+            d.connect(&format!("bus_{i}"), &ff, "Q");
+            d.connect(&format!("bus_{i}"), &lut, "I0");
+            d.connect(&format!("bus_{i}"), &io, "I");
+            d.connect(&format!("o{i}"), &io, "PAD");
+        }
+        let p = pack(&d, &dev).unwrap();
+        let mut pl = place(&p, &dev).unwrap();
+        // Place bit 0 near south IOB (y=1) and bit 1 far north (y=6) so initial skew is 5 hops (200ps).
+        let s_south = dev.clb_sites().find(|s| s.x == dev.clb_x0 && s.y == dev.clb_y0).unwrap();
+        let s_north = dev.clb_sites().find(|s| s.x == dev.clb_x0 + 1 && s.y == dev.clb_y0 + 5).unwrap();
+        pl.lutff_sites[0] = (s_south, 0);
+        pl.lutff_sites[1] = (s_north, 0);
+
+        let constraints = vec![BusSkewConstraint {
+            bus_name: "bus_".to_string(),
+            bit_nets: vec!["bus_0".to_string(), "bus_1".to_string()],
+            max_skew_ps: 80,
+        }];
+        let (routed, reports) = route_bus_skew_aware(&pl, &dev, &constraints).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].skew_before_ps >= 200);
+        assert!(
+            reports[0].skew_after_ps <= 80,
+            "bus skew must be bounded to <= 80ps, got {}ps",
+            reports[0].skew_after_ps
+        );
+        assert!(reports[0].met);
+        assert!(reports[0].detoured_bits >= 1);
+        assert_eq!(routed.overused, 0);
+    }
+
+    #[test]
+    fn crosstalk_spacing_reserves_shields_and_via_minimization_removes_jogs() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&hard_heartbeat(), &dev).unwrap();
+        let opts = PlaceOpts {
+            timing_weight: 0.75,
+            seed: 0,
+        };
+        // Route with a false-path dogleg so the path has a multi-via jog (`V -> H -> V`).
+        let gfp = TimingGuide {
+            false_path_iob: true,
+            iob_setup_mult: 1,
+            ..Default::default()
+        };
+        let pl = place_with_guide(&p, &dev, opts, &gfp).unwrap();
+        let dogleg_routed = route_with_guide(&pl, &dev, RouteOpts::default(), &gfp).unwrap();
+        assert!(count_route_vias(&dogleg_routed.iob_src[0].path) >= 2);
+
+        // Crosstalk spacing policy on the routed net reserves adjacent GND shield tiles.
+        let mut policy = CrosstalkSpacingPolicy::default();
+        policy.critical_nets.insert(dogleg_routed.iob_src[0].net.clone());
+        let (xtalk_routed, xtalk_rep) =
+            apply_crosstalk_spacing(&dogleg_routed, &dev, &policy).unwrap();
+        assert_eq!(xtalk_rep.critical_nets_routed, 1);
+        assert!(!xtalk_rep.shield_tiles_reserved.is_empty());
+
+        // Post-route via minimization collapses the dogleg jog back to a 0-via or 1-via path.
+        let (min_routed, via_stats) = minimize_route_vias(&xtalk_routed, &dev).unwrap();
+        assert_eq!(via_stats.nets_simplified, 1);
+        assert!(
+            via_stats.vias_after < via_stats.vias_before,
+            "vias must drop ({} -> {})",
+            via_stats.vias_before,
+            via_stats.vias_after
+        );
+        assert!(via_stats.hops_after <= via_stats.hops_before);
+        assert_eq!(min_routed.overused, 0);
     }
 }
