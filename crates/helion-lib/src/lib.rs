@@ -15,14 +15,6 @@ pub use sby::{
     parse_sby_config, run_sby_task, set_ff_init, AigerAscii, Btor2Line, FormalTrace, ProofMethod,
     SbyConfig, SbyEngine, SbyMode, SbyOptions, SbyStatus, SbyTask, SbyTaskResult, TraceStep,
 };
-
-pub mod sby;
-pub use sby::{
-    add_formal_assert, add_formal_assume, add_formal_bad, add_formal_cover, add_formal_fair,
-    emit_aiger_ascii, emit_btor2, emit_smtlib2_qfbv, parse_aiger_ascii, parse_btor2,
-    parse_sby_config, run_sby_task, set_ff_init, AigerAscii, Btor2Line, FormalTrace, ProofMethod,
-    SbyConfig, SbyEngine, SbyMode, SbyOptions, SbyStatus, SbyTask, SbyTaskResult, TraceStep,
-};
 pub mod equiv_sec;
 pub use equiv_sec::{
     cec_cutpoint_sweep, sec_prove_sequential_equiv, CecResult, CutpointEquiv, FailingOutputCone,

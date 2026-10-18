@@ -52,7 +52,6 @@ pub use cosim::{
 pub use dpi::{
     DpiCallRecord, DpiParamDecl, DpiParamDir, DpiRegistry, DpiSignature, DpiType, DpiValue,
 };
-pub use sva::{SvaEngine, SvaFailure, SvaReport};
 pub use svtb::{ScoreboardMismatch, SimMailbox, SimScoreboard, SimSemaphore};
 pub mod verilate;
 pub use crv_coverage::{
@@ -61,7 +60,6 @@ pub use crv_coverage::{
     IllegalBinViolation, NamedConstraintBlock, RandClass, RandConstraint, RandConstraintSolver,
     RandExpr, RandMode, RandVarSpec,
 };
-use sva::{SvaEngine, SvaFailure, SvaReport};
 pub use verilate::{
     emit_cpp_cycle_model, emit_rust_cycle_model, sanitize_ident, VpiFormat, VpiHandle,
     VpiObjectInfo, VpiObjectKind, VpiPutFlags, VpiRegistry, VpiValue, VpiVecVal,

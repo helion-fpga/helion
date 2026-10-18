@@ -1698,6 +1698,12 @@ fn pkg_enums_clear() {
     SIG_TYPES.with(|m| m.borrow_mut().clear());
     UNMODPORTED_INTF_PORTS.with(|m| m.borrow_mut().clear());
     ANON_PACKED_ID.with(|c| c.set(0));
+    PKG_FUNCS.with(|m| m.borrow_mut().clear());
+    STR_PARAM_VALS.with(|m| m.borrow_mut().clear());
+    SVA_SEQS.with(|m| m.borrow_mut().clear());
+    SVA_PROPS.with(|m| m.borrow_mut().clear());
+    BIND_DIRECTIVES.with(|m| m.borrow_mut().clear());
+    SVA_MON_ID.with(|c| c.set(0));
 }
 
 fn sv_interface_get(name: &str) -> Option<SvInterface> {
@@ -1722,8 +1728,6 @@ fn resolve_interface_member<'a>(p: &P<'a>, sig: &str, member: &str) -> Option<&'
     } else {
         None
     }
-    PKG_FUNCS.with(|m| m.borrow_mut().clear());
-    STR_PARAM_VALS.with(|m| m.borrow_mut().clear());
 }
 
 fn pkg_func_insert(name: String, f: FuncDef<'static>) {
@@ -1744,10 +1748,6 @@ fn note_str_param_val(name: &str, val: &str) {
 
 fn str_param_val_of(name: &str) -> Option<String> {
     STR_PARAM_VALS.with(|m| m.borrow().get(name).cloned())
-    SVA_SEQS.with(|m| m.borrow_mut().clear());
-    SVA_PROPS.with(|m| m.borrow_mut().clear());
-    BIND_DIRECTIVES.with(|m| m.borrow_mut().clear());
-    SVA_MON_ID.with(|c| c.set(0));
 }
 
 fn next_sva_mon_id() -> usize {
@@ -5905,7 +5905,7 @@ fn const_atom_with_width<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
             if !p.eat_sym(')') {
                 return Err("$signed/$unsigned )".into());
             }
-            Ok(v)
+            Ok((v, 0))
         }
         Some(Tok::Ident(s)) if *s == "$onehot" || *s == "$onehot0" => {
             let is_zero_ok = *s == "$onehot0";
@@ -5919,7 +5919,7 @@ fn const_atom_with_width<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
             }
             let masked = v & c & care_mask(w.min(128).max(1));
             let ones = masked.count_ones();
-            Ok(u128::from(if is_zero_ok { ones <= 1 } else { ones == 1 }))
+            Ok((u128::from(if is_zero_ok { ones <= 1 } else { ones == 1 }), 1))
         }
         Some(Tok::Ident(s)) if *s == "$countones" => {
             p.bump();
@@ -5931,7 +5931,7 @@ fn const_atom_with_width<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
                 return Err("$countones )".into());
             }
             let masked = v & c & care_mask(w.min(128).max(1));
-            Ok(masked.count_ones() as u128)
+            Ok((masked.count_ones() as u128, 32))
         }
         Some(Tok::Ident(s)) if *s == "$countbits" => {
             p.bump();
@@ -5967,7 +5967,7 @@ fn const_atom_with_width<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
                     total += 1;
                 }
             }
-            Ok(total)
+            Ok((total, 32))
         }
         Some(Tok::Ident(s)) if *s == "$isunknown" => {
             p.bump();
@@ -5979,7 +5979,7 @@ fn const_atom_with_width<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
                 return Err("$isunknown )".into());
             }
             let mask = care_mask(w.min(128).max(1));
-            Ok(u128::from((c & mask) != mask))
+            Ok((u128::from((c & mask) != mask), 1))
         }
         Some(Tok::Kw(k)) if *k == "unsigned" || *k == "signed" => {
             // `unsigned'(expr)` — keyword form of a size cast. Value is inner.
@@ -6065,7 +6065,7 @@ fn const_atom_with_width<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
                     );
                 }
                 let inlined = subst_idents(&body, &map, p.arena);
-                return eval_const_rexpr(p, &inlined);
+                return eval_const_rexpr(p, &inlined).map(|v| (v, f.ret_w));
             }
             pkg_enum_get(&name)
                 .or_else(|| enum_const_default(&name))
@@ -8704,6 +8704,10 @@ fn parse_attrs<'a>(p: &mut P<'a>) -> Vec<(String, String)> {
             attrs.push((key, val));
             let _ = p.eat_sym(',');
         }
+    }
+    attrs
+}
+
 thread_local! {
     static PENDING_ATTR_KVS: std::cell::RefCell<Vec<(String, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -8721,24 +8725,11 @@ fn parse_attr<'a>(p: &mut P<'a>) -> Option<(String, String)> {
         return Some(kv);
     }
     let save = p.i;
-    if !p.eat_sym('(') {
-        return None;
-    }
-    attrs
-}
-
-fn parse_attr<'a>(p: &mut P<'a>) -> Option<(String, String)> {
     if !peek_attr(p) {
         return None;
     }
     p.bump(); // '('
     p.bump(); // '*'
-    let mut first = None;
-    while p.peek().is_some() {
-        if p.peek() == Some(&Tok::Sym('*')) && p.t.get(p.i + 1) == Some(&Tok::Sym(')')) {
-            p.bump(); // '*'
-            p.bump(); // ')'
-            break;
     let mut parsed = Vec::new();
     while p.peek().is_some() {
         if matches!(p.peek(), Some(Tok::Sym('*')))
@@ -8748,29 +8739,6 @@ fn parse_attr<'a>(p: &mut P<'a>) -> Option<(String, String)> {
             p.bump();
             break;
         }
-        let key = match p.bump() {
-            Some(Tok::Ident(s) | Tok::Kw(s)) => s.to_string(),
-            Some(Tok::Sym('*')) if p.peek() == Some(&Tok::Sym(')')) => {
-                p.bump();
-                break;
-            }
-            _ => continue,
-        };
-        let val = if p.eat_sym('=') {
-            match p.bump() {
-                Some(Tok::Str(s) | Tok::Ident(s) | Tok::Kw(s)) => s.to_string(),
-                Some(Tok::Number(n, _)) => n.to_string(),
-                _ => "1".to_string(),
-            }
-        } else {
-            "1".to_string()
-        };
-        if first.is_none() {
-            first = Some((key, val));
-        }
-        let _ = p.eat_sym(',');
-    }
-    first
         let k = match p.bump() {
             Some(Tok::Ident(s) | Tok::Kw(s)) => s.to_string(),
             Some(Tok::Sym('*')) if p.eat_sym(')') => break,
@@ -11403,7 +11371,7 @@ fn parse_function<'a>(p: &mut P<'a>) -> Result<FuncDef<'a>, String> {
     // fold the local variable assignments into the return expression.
     let ret_writes = stmts.iter().filter(|(lhs, _, _)| *lhs == name).count();
     if ret_writes == 1 && stmts.len() > 1 && stmts.last().is_some_and(|(l, b, _)| *l == name && b.is_none()) {
-        let folded = fold_blocking_assigns(stmts.clone(), p.arena, "");
+        let folded = fold_blocking_assigns(stmts.clone(), &p.widths, p.arena, "");
         if let Some((_, None, rhs)) = folded.into_iter().find(|(l, _, _)| *l == name) {
             stmts = vec![(name, None, rhs)];
         }
@@ -12878,7 +12846,6 @@ fn parse_module_items<'a>(
                         }
                         if p.eat_sym('=') {
                             let parsed_val = if let Some(Tok::Str(sval)) = p.peek() {
-                            if let Some(Tok::Str(sval)) = p.peek() {
                                 note_str_param_val(name, sval);
                                 let h = str_param_hash(sval);
                                 p.bump();
@@ -15680,22 +15647,22 @@ fn index_part_bit<'a>(
             if src >= eff_w {
                 return Ok(Expr::Const(false));
             }
-            return Ok(Expr::Var(arena.alloc_str(&(unpacked_word_q(name, word, eff_w, src)))));
-        }
-    }
-    if depth == 1 {
-        if bit >= wsrc {
-            return Ok(Expr::Const(false));
             if let Some(words) = rtl.mem_inits.get(name) {
                 if !words.is_empty() && !rtl.nbas.iter().any(|(lhs, _, _)| *lhs == name) {
                     let wval = words.get(&word).copied().unwrap_or(0);
                     return Ok(Expr::Const((wval >> src) & 1 == 1));
                 }
             }
-            return Ok(Expr::Var(arena.alloc_str(&(unpacked_word_q(name, word, wsrc, src)))));
+            return Ok(Expr::Var(arena.alloc_str(&(unpacked_word_q(name, word, eff_w, src)))));
+        }
+    }
+    if depth == 1 {
+        if bit >= wsrc {
+            return Ok(Expr::Const(false));
         }
         return Ok(Expr::Var(arena.alloc_str(&(bit_name(name, wsrc, bit)))));
-        if depth <= 64 {
+    }
+    if depth <= 64 {
             if let Some(words) = rtl.mem_inits.get(name) {
                 if !words.is_empty() && !rtl.nbas.iter().any(|(lhs, _, _)| *lhs == name) {
                     if bit >= wsrc {
@@ -15727,7 +15694,6 @@ fn index_part_bit<'a>(
                 }
             }
         }
-    }
     if bit >= part_w {
         return Ok(Expr::Const(false));
     }
@@ -22935,7 +22901,6 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
     }
     let net_copies = collect_net_copies(&rtl.assigns);
     let priority_grant = try_emit_priority_onehot_grant(&mut d, rtl);
-    for (lhs, bit, rhs0) in &rtl.assigns {
     let mut n_arith_tree = 0usize;
     for (lhs, bit, rhs0) in &rtl.assigns {
         let rhs_sub = subst_net_copies(rhs0, &net_copies, &arena);
@@ -23490,10 +23455,6 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
             emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
             continue;
         }
-        if wide_capped && cone_pi_exceeds(expr, 6) {
-            if !rel_sig.contains_key(bitn)
-                && !cone_pi_exceeds(expr_rom, 16)
-                && expr_node_count(expr_rom) <= 128
         // Generic wide-cone decomposition BEFORE wide_capped check.
         // Does not use AIG batch, so not subject to the cap.
         // Skip relational operators (they stay assign_not_lowered by design).
@@ -23511,25 +23472,11 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
             )
             .is_some()
             {
-                if decompose_wide_cone(
-                    &mut d,
-                    &mut share,
-                    &format!("u_wd{i}_"),
-                    Some(bitn),
-                    expr_rom,
-                )
-                .is_some()
-                {
-                    if md_bits.contains(bitn) {
-                        let _ = d.mark_debug(bitn);
-                    }
-                    continue;
+                if md_bits.contains(bitn) {
+                    let _ = d.mark_debug(bitn);
                 }
+                continue;
             }
-            if let Some(sig) = rel_sig.get(bitn) {
-                note_assign_not_lowered(&rtl.module, sig);
-            }
-            continue;
         }
         // Strip unreachable case-hold self PI (sha256_k). ≤6-PI cones — const
         // ROM or Ident mux — collapse to one LUT6. Wider Ident/ITE expand
