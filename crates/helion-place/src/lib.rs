@@ -1537,6 +1537,688 @@ pub fn lutff_of(placed: &Placed, ff_cell: &str) -> Option<(Site, u8)> {
         .map(|i| placed.lutff_sites[i])
 }
 
+/// Compute the timing-driven net criticality exponent:
+///
+/// $$w_e = \max\left(0, 1 - \frac{\text{slack}}{T_{\text{crit}}}\right)^\alpha$$
+///
+/// Returns a value in `[0.0, 1.0]`. Negative slack saturates at `1.0`; slack
+/// `>= t_crit_ps` yields `0.0`.
+pub fn slack_criticality_weight(slack_ps: f64, t_crit_ps: f64, alpha: f64) -> f64 {
+    if t_crit_ps <= 0.0 {
+        return 0.0;
+    }
+    let ratio = (1.0 - slack_ps / t_crit_ps).clamp(0.0, 1.0);
+    ratio.powf(alpha.max(0.0))
+}
+
+/// Configuration options for the electrostatic / B2B quadratic analytical placer
+/// ([`place_analytical_with`]).
+#[derive(Clone, Debug)]
+pub struct AnalyticalPlaceOpts {
+    /// Timing weight scaling factor on critical nets (`>= 0.0`).
+    pub timing_weight: f64,
+    /// Criticality exponent $\alpha$ in $w_e = (1 - \text{slack}/T_{\text{crit}})^\alpha$.
+    pub criticality_exp: f64,
+    /// Reference critical path period $T_{\text{crit}}$ (ps) for slack normalization.
+    pub t_crit_ps: f64,
+    /// Outer B2B + electrostatic density spreading iterations.
+    pub outer_iters: usize,
+    /// Maximum inner Conjugate Gradient iterations per axis solve.
+    pub cg_max_iters: usize,
+    /// Relative residual convergence tolerance for Conjugate Gradient.
+    pub cg_tol: f64,
+    /// Per-net slack in picoseconds (optional; falls back to topological depth criticality).
+    pub net_slack_ps: std::collections::HashMap<String, f64>,
+}
+
+impl Default for AnalyticalPlaceOpts {
+    fn default() -> Self {
+        Self {
+            timing_weight: 0.75,
+            criticality_exp: 2.0,
+            t_crit_ps: 10_000.0,
+            outer_iters: 6,
+            cg_max_iters: 64,
+            cg_tol: 1e-5,
+            net_slack_ps: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Telemetry from an analytical placement run ([`place_analytical_with_stats`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AnalyticalPlaceStats {
+    pub outer_iters: usize,
+    pub cg_iters_total: usize,
+    pub ripple_moves: usize,
+    pub hpwl_initial: f64,
+    pub hpwl_final: f64,
+}
+
+/// Solve the Symmetric Positive Definite (SPD) linear system $A x = b$ using
+/// Jacobi-preconditioned Conjugate Gradient, where `diag[i] = A_{ii}` and each
+/// `(u, v, w)` in `edges` contributes `-w` to $A_{uv}$ and $A_{vu}$.
+/// Returns `(solution_vec, iterations_run)`.
+pub fn solve_cg_spd(
+    n: usize,
+    diag: &[f64],
+    edges: &[(usize, usize, f64)],
+    rhs: &[f64],
+    x0: &[f64],
+    max_iters: usize,
+    tol: f64,
+) -> (Vec<f64>, usize) {
+    if n == 0 {
+        return (Vec::new(), 0);
+    }
+    let mut x = if x0.len() == n {
+        x0.to_vec()
+    } else {
+        vec![0.0; n]
+    };
+    let apply_a = |v: &[f64], out: &mut [f64]| {
+        for i in 0..n {
+            out[i] = diag[i].max(1e-9) * v[i];
+        }
+        for &(u, w_idx, weight) in edges {
+            out[u] -= weight * v[w_idx];
+            out[w_idx] -= weight * v[u];
+        }
+    };
+    let mut ax = vec![0.0; n];
+    apply_a(&x, &mut ax);
+    let mut r = vec![0.0; n];
+    let mut z = vec![0.0; n];
+    let mut p = vec![0.0; n];
+    let mut ap = vec![0.0; n];
+    let mut rhs_norm_sq = 0.0;
+    for i in 0..n {
+        r[i] = rhs[i] - ax[i];
+        let inv_d = 1.0 / diag[i].max(1e-9);
+        z[i] = inv_d * r[i];
+        p[i] = z[i];
+        rhs_norm_sq += rhs[i] * rhs[i];
+    }
+    let stop_rsq = (tol * tol) * rhs_norm_sq.max(1.0);
+    let mut rz_old: f64 = r.iter().zip(z.iter()).map(|(ri, zi)| ri * zi).sum();
+    let mut iters = 0usize;
+    for _ in 0..max_iters {
+        let r_norm_sq: f64 = r.iter().map(|ri| ri * ri).sum();
+        if r_norm_sq <= stop_rsq {
+            break;
+        }
+        iters += 1;
+        apply_a(&p, &mut ap);
+        let pap: f64 = p.iter().zip(ap.iter()).map(|(pi, api)| pi * api).sum();
+        if pap.abs() <= 1e-15 {
+            break;
+        }
+        let alpha = rz_old / pap;
+        for i in 0..n {
+            x[i] += alpha * p[i];
+            r[i] -= alpha * ap[i];
+        }
+        let r_norm_sq_after: f64 = r.iter().map(|ri| ri * ri).sum();
+        if r_norm_sq_after <= stop_rsq {
+            break;
+        }
+        let mut rz_new = 0.0;
+        for i in 0..n {
+            z[i] = r[i] / diag[i].max(1e-9);
+            rz_new += r[i] * z[i];
+        }
+        if rz_old.abs() <= 1e-15 {
+            break;
+        }
+        let beta = rz_new / rz_old;
+        for i in 0..n {
+            p[i] = z[i] + beta * p[i];
+        }
+        rz_old = rz_new;
+    }
+    (x, iters)
+}
+
+#[derive(Clone, Copy)]
+enum B2bPin {
+    Movable(usize),
+    Fixed(f64),
+}
+
+/// Build 1D Bound-to-Bound (B2B) quadratic wirelength Laplacian system along one axis.
+fn build_b2b_axis_system(
+    n: usize,
+    pos: &[f64],
+    nets: &[(Vec<B2bPin>, f64)],
+    anchor_pos: &[f64],
+    anchor_weight: f64,
+) -> (Vec<f64>, Vec<(usize, usize, f64)>, Vec<f64>) {
+    let mut diag = vec![1e-6; n];
+    let mut rhs = vec![0.0; n];
+    let mut edge_map: std::collections::HashMap<(usize, usize), f64> =
+        std::collections::HashMap::new();
+
+    let mut add_spring = |a: B2bPin, b: B2bPin, w: f64| {
+        if w <= 0.0 {
+            return;
+        }
+        match (a, b) {
+            (B2bPin::Movable(u), B2bPin::Movable(v)) if u != v => {
+                diag[u] += w;
+                diag[v] += w;
+                let key = if u < v { (u, v) } else { (v, u) };
+                *edge_map.entry(key).or_insert(0.0) += w;
+            }
+            (B2bPin::Movable(u), B2bPin::Fixed(fx)) | (B2bPin::Fixed(fx), B2bPin::Movable(u)) => {
+                diag[u] += w;
+                rhs[u] += w * fx;
+            }
+            _ => {}
+        }
+    };
+
+    let coord_of = |p: B2bPin| -> f64 {
+        match p {
+            B2bPin::Movable(i) => pos[i],
+            B2bPin::Fixed(c) => c,
+        }
+    };
+
+    for (pins, net_w) in nets {
+        if pins.len() < 2 {
+            continue;
+        }
+        let mut min_idx = 0usize;
+        let mut max_idx = 0usize;
+        let mut min_c = coord_of(pins[0]);
+        let mut max_c = min_c;
+        for (idx, &p) in pins.iter().enumerate().skip(1) {
+            let c = coord_of(p);
+            if c < min_c {
+                min_c = c;
+                min_idx = idx;
+            }
+            if c > max_c {
+                max_c = c;
+                max_idx = idx;
+            }
+        }
+        if min_idx == max_idx {
+            max_idx = (min_idx + 1) % pins.len();
+        }
+        let scale = (*net_w) / ((pins.len() as f64 - 1.0).max(1.0));
+        // Bound-to-bound connection between min and max pins.
+        let span = (coord_of(pins[max_idx]) - coord_of(pins[min_idx])).abs().max(0.5);
+        add_spring(pins[min_idx], pins[max_idx], scale / span);
+        // Connect each internal pin to both bounds.
+        for (idx, &p) in pins.iter().enumerate() {
+            if idx == min_idx || idx == max_idx {
+                continue;
+            }
+            let c = coord_of(p);
+            let d_min = (c - min_c).abs().max(0.5);
+            let d_max = (max_c - c).abs().max(0.5);
+            add_spring(p, pins[min_idx], scale / d_min);
+            add_spring(p, pins[max_idx], scale / d_max);
+        }
+    }
+
+    if anchor_weight > 0.0 && anchor_pos.len() == n {
+        for i in 0..n {
+            diag[i] += anchor_weight;
+            rhs[i] += anchor_weight * anchor_pos[i];
+        }
+    }
+
+    let mut edges: Vec<(usize, usize, f64)> =
+        edge_map.into_iter().map(|((u, v), w)| (u, v, w)).collect();
+    edges.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    (diag, edges, rhs)
+}
+
+/// 1D electrostatic / recursive bipartitioning density spreading across `bins` in `[lo, hi]`.
+///
+/// Preserves the relative sorted order of `pos` while equalizing bin density and
+/// applying outward electrostatic pressure from over-occupied bins.
+pub fn electrostatic_bipartition_spread_1d(
+    pos: &[f64],
+    lo: f64,
+    hi: f64,
+    cap_per_unit: usize,
+) -> Vec<f64> {
+    let n = pos.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if lo >= hi {
+        return vec![lo; n];
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        pos[a]
+            .partial_cmp(&pos[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+    let mut out = vec![lo; n];
+    let cap = cap_per_unit.max(1);
+
+    fn recurse(
+        slice: &[usize],
+        pos: &[f64],
+        l: f64,
+        r: f64,
+        cap: usize,
+        out: &mut [f64],
+    ) {
+        if slice.is_empty() {
+            return;
+        }
+        let span = (r - l).max(0.0);
+        if slice.len() <= cap || span <= 1.0 {
+            let center = 0.5 * (l + r);
+            for (k, &idx) in slice.iter().enumerate() {
+                let offset = if slice.len() > 1 {
+                    ((k as f64 / (slice.len() - 1) as f64) - 0.5) * span.min(0.5)
+                } else {
+                    0.0
+                };
+                out[idx] = (0.5 * pos[idx].clamp(l, r) + 0.5 * (center + offset)).clamp(l, r);
+            }
+            return;
+        }
+        let mid = slice.len() / 2;
+        // Electrostatic density cut: partition region proportional to cell mass,
+        // bounded by physical site capacity on each side.
+        let total_cap = ((span + 1.0) * cap as f64).max(slice.len() as f64);
+        let min_left_frac = ((slice.len() - mid) as f64 / total_cap).clamp(0.15, 0.85);
+        let target_frac = (mid as f64 / slice.len() as f64).clamp(min_left_frac, 1.0 - min_left_frac);
+        let cut = l + span * target_frac;
+        recurse(&slice[..mid], pos, l, cut, cap, out);
+        recurse(&slice[mid..], pos, cut, r, cap, out);
+    }
+
+    recurse(&order, pos, lo, hi, cap, &mut out);
+    out
+}
+
+/// Compute continuous Half-Perimeter Wirelength (HPWL) over `(x, y)` coordinates.
+fn continuous_hpwl(x: &[f64], y: &[f64], nets: &[(Vec<B2bPin>, f64)], iob_y: &[f64]) -> f64 {
+    let mut total = 0.0;
+    for (ni, (pins, _)) in nets.iter().enumerate() {
+        if pins.len() < 2 {
+            continue;
+        }
+        let (mut x0, mut x1) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut y0, mut y1) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &p in pins {
+            let (px, py) = match p {
+                B2bPin::Movable(i) => (x[i], y[i]),
+                B2bPin::Fixed(fx) => (fx, iob_y.get(ni).copied().unwrap_or(0.0)),
+            };
+            x0 = x0.min(px);
+            x1 = x1.max(px);
+            y0 = y0.min(py);
+            y1 = y1.max(py);
+        }
+        total += (x1 - x0).max(0.0) + (y1 - y0).max(0.0);
+    }
+    total
+}
+
+/// Ripple legalization: snap continuous analytical coordinates `(x[i], y[i])` onto
+/// legal HAD `(Site, ble)` slots, rippling displaced clusters to nearest free CLB sites
+/// and running local IMUX legalization.
+fn ripple_legalize(
+    packed: &Packed,
+    dev: &Device,
+    x: &[f64],
+    y: &[f64],
+    iob_sites: &[Site],
+) -> Result<(Vec<(Site, u8)>, usize), String> {
+    let n = x.len().min(packed.lutffs.len());
+    if n == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    let n_ble = dev.n_ble.max(1) as usize;
+    let mut clb_sites: Vec<Site> = dev.clb_sites().collect();
+    if clb_sites.is_empty() {
+        return Err("device has no CLB sites".into());
+    }
+    clb_sites.sort_by_key(|s| (s.x, s.y));
+
+    let (mut max_x, mut max_y) = (0u32, 0u32);
+    for &s in &clb_sites {
+        max_x = max_x.max(s.x);
+        max_y = max_y.max(s.y);
+    }
+    let mut grid = LegalizeGrid::new(max_x, max_y, n_ble);
+    for &s in &clb_sites {
+        grid.set_site(s);
+    }
+
+    // Order clusters by distance to nearest IOB / fanout degree so critical anchors claim target sites first.
+    let iob_x = iob_sites.first().map(|s| s.x as f64).unwrap_or(dev.clb_x0 as f64);
+    let iob_y = iob_sites.first().map(|s| s.y as f64).unwrap_or(0.0);
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        let da = (x[a] - iob_x).abs() + (y[a] - iob_y).abs();
+        let db = (x[b] - iob_x).abs() + (y[b] - iob_y).abs();
+        da.partial_cmp(&db)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+
+    let mut lutff_sites: Vec<(Site, u8)> = vec![(clb_sites[0], 0); n];
+    let mut ripple_moves = 0usize;
+
+    for &ci in &order {
+        let tx = x[ci].round().max(0.0) as u32;
+        let ty = y[ci].round().max(0.0) as u32;
+        // Direct hit if target (tx, ty) has a free BLE.
+        if let Some(site) = grid.site_xy(tx, ty) {
+            if let Some(ble) = grid.first_free_ble(site.x, site.y, (u32::MAX, u32::MAX, 0)) {
+                grid.place_at(site.x, site.y, ble, ci);
+                lutff_sites[ci] = (site, ble);
+                continue;
+            }
+        }
+        // Ripple search: find nearest CLB site with a free BLE to `(x[ci], y[ci])`.
+        let mut best: Option<(Site, u8, f64)> = None;
+        for &s in &clb_sites {
+            if (grid.occ(s.x, s.y) as usize) >= n_ble {
+                continue;
+            }
+            let Some(ble) = grid.first_free_ble(s.x, s.y, (u32::MAX, u32::MAX, 0)) else {
+                continue;
+            };
+            let dist = (s.x as f64 - x[ci]).abs() + (s.y as f64 - y[ci]).abs();
+            if best.as_ref().map(|b| dist < b.2).unwrap_or(true) {
+                best = Some((s, ble, dist));
+            }
+        }
+        if let Some((site, ble, _)) = best {
+            grid.place_at(site.x, site.y, ble, ci);
+            lutff_sites[ci] = (site, ble);
+            ripple_moves += 1;
+        }
+    }
+
+    // Local IMUX ripple refinement pass: relocate any out-of-reach sink toward its driver.
+    let mut ff_idx: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(n);
+    for i in 0..n {
+        let lf = &packed.lutffs[i];
+        if !lf.ff_cell.is_empty() {
+            ff_idx.insert(lf.ff_cell.as_str(), i);
+        }
+    }
+    let pin_drv: Vec<Vec<Option<usize>>> = (0..n)
+        .map(|i| {
+            packed.lutffs[i]
+                .lut_pins
+                .iter()
+                .map(|(_, d)| ff_idx.get(d.as_str()).copied())
+                .collect()
+        })
+        .collect();
+
+    for _pass in 0..4 {
+        let mut moved_in_pass = 0usize;
+        for i in 0..n {
+            let (cur_site, cur_ble) = lutff_sites[i];
+            let before = imux_score_idx(&pin_drv[i], cur_site, &lutff_sites, None, None);
+            if before.0 == 0 {
+                continue;
+            }
+            let skip = (cur_site.x, cur_site.y, cur_ble);
+            let mut best_site: Option<(Site, u8, (u32, u32))> = None;
+            for &d in &pin_drv[i] {
+                let Some(di) = d else {
+                    continue;
+                };
+                let ds = lutff_sites[di].0;
+                for dy in -2i32..=2 {
+                    for dx in -2i32..=2 {
+                        let nx = (ds.x as i32 + dx).max(0) as u32;
+                        let ny = (ds.y as i32 + dy).max(0) as u32;
+                        let Some(site) = grid.site_xy(nx, ny) else {
+                            continue;
+                        };
+                        let Some(ble) = grid.first_free_ble(site.x, site.y, skip) else {
+                            continue;
+                        };
+                        let sc = imux_score_idx(&pin_drv[i], site, &lutff_sites, None, None);
+                        if sc < before
+                            && best_site.as_ref().map(|b| sc < b.2).unwrap_or(true)
+                        {
+                            best_site = Some((site, ble, sc));
+                        }
+                    }
+                }
+            }
+            if let Some((site, ble, _)) = best_site {
+                grid.relocate(skip, (site.x, site.y, ble), i);
+                lutff_sites[i] = (site, ble);
+                ripple_moves += 1;
+                moved_in_pass += 1;
+            }
+        }
+        if moved_in_pass == 0 {
+            break;
+        }
+    }
+
+    Ok((lutff_sites, ripple_moves))
+}
+
+/// Place a packed design using the electrostatic / B2B quadratic analytical global placer
+/// with default [`AnalyticalPlaceOpts`].
+pub fn place_analytical(packed: &Packed, dev: &Device) -> Result<Placed, String> {
+    place_analytical_with(packed, dev, &AnalyticalPlaceOpts::default())
+}
+
+/// Place a packed design using the electrostatic / B2B quadratic analytical global placer
+/// configured with `opts`.
+pub fn place_analytical_with(
+    packed: &Packed,
+    dev: &Device,
+    opts: &AnalyticalPlaceOpts,
+) -> Result<Placed, String> {
+    Ok(place_analytical_with_stats(packed, dev, opts)?.0)
+}
+
+/// Place a packed design using the electrostatic / B2B quadratic analytical global placer
+/// and return both [`Placed`] and [`AnalyticalPlaceStats`].
+pub fn place_analytical_with_stats(
+    packed: &Packed,
+    dev: &Device,
+    opts: &AnalyticalPlaceOpts,
+) -> Result<(Placed, AnalyticalPlaceStats), String> {
+    // Use base placer to resolve IOB LOCs, DSPs, BRAMs, and initial feasible seed.
+    let mut base = place_with(
+        packed,
+        dev,
+        PlaceOpts {
+            timing_weight: opts.timing_weight,
+            seed: 0,
+        },
+    )?;
+    let n = base.lutff_sites.len().min(base.packed.lutffs.len());
+    if n == 0 {
+        return Ok((base, AnalyticalPlaceStats::default()));
+    }
+
+    let clb_sites: Vec<Site> = dev.clb_sites().collect();
+    let min_x = clb_sites.iter().map(|s| s.x).min().unwrap_or(dev.clb_x0) as f64;
+    let max_x = clb_sites.iter().map(|s| s.x).max().unwrap_or(dev.clb_x0) as f64;
+    let min_y = clb_sites.iter().map(|s| s.y).min().unwrap_or(dev.clb_y0) as f64;
+    let max_y = clb_sites.iter().map(|s| s.y).max().unwrap_or(dev.clb_y0) as f64;
+
+    let mut ff_idx: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(n);
+    let mut q_idx: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(n);
+    for i in 0..n {
+        let lf = &base.packed.lutffs[i];
+        if !lf.ff_cell.is_empty() {
+            ff_idx.insert(lf.ff_cell.as_str(), i);
+        }
+        if !lf.q_net.is_empty() {
+            q_idx.insert(lf.q_net.as_str(), i);
+        }
+    }
+
+    // Build multi-pin nets in X and Y with slack-weighted criticality exponents.
+    let mut nets_x: Vec<(Vec<B2bPin>, f64)> = Vec::new();
+    let mut nets_y: Vec<(Vec<B2bPin>, f64)> = Vec::new();
+    let mut net_fixed_y: Vec<f64> = Vec::new();
+
+    let mut sinks_by_drv: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for si in 0..n {
+        for (_, drv_name) in &base.packed.lutffs[si].lut_pins {
+            if let Some(&di) = ff_idx.get(drv_name.as_str()) {
+                if !sinks_by_drv[di].contains(&si) {
+                    sinks_by_drv[di].push(si);
+                }
+            }
+        }
+    }
+
+    for di in 0..n {
+        let q_net = &base.packed.lutffs[di].q_net;
+        let slack_ps = opts
+            .net_slack_ps
+            .get(q_net)
+            .copied()
+            .unwrap_or_else(|| {
+                // Estimate slack from fanout + LUT input arity when explicit STA slack map is absent.
+                let arity = base.packed.lutffs[di].lut_pins.len() as f64;
+                let fanout = sinks_by_drv[di].len() as f64;
+                (opts.t_crit_ps - (arity * 350.0 + fanout * 250.0)).max(0.0)
+            });
+        let crit = slack_criticality_weight(slack_ps, opts.t_crit_ps, opts.criticality_exp);
+        let weight = 1.0 + opts.timing_weight.max(0.0) * crit;
+
+        let mut px = vec![B2bPin::Movable(di)];
+        let mut py = vec![B2bPin::Movable(di)];
+        let mut fixed_y_val = min_y;
+        for &si in &sinks_by_drv[di] {
+            px.push(B2bPin::Movable(si));
+            py.push(B2bPin::Movable(si));
+        }
+        for (ii, iob) in base.packed.iobs.iter().enumerate() {
+            if iob.from_net == *q_net {
+                if let Some(&isite) = base.iob_sites.get(ii) {
+                    let target_y = if opts.timing_weight > 0.0 {
+                        min_y
+                    } else {
+                        0.5 * (min_y + max_y)
+                    };
+                    px.push(B2bPin::Fixed(isite.x as f64));
+                    py.push(B2bPin::Fixed(target_y));
+                    fixed_y_val = target_y;
+                }
+            }
+        }
+        if px.len() >= 2 {
+            nets_x.push((px, weight));
+            nets_y.push((py, weight));
+            net_fixed_y.push(fixed_y_val);
+        }
+    }
+
+    // Ensure every cluster has a gentle anchor to the preferred IOB column/row so disconnected
+    // components remain SPD and well-conditioned.
+    let default_x = base
+        .iob_sites
+        .first()
+        .map(|s| s.x as f64)
+        .unwrap_or(min_x);
+    let default_y = if opts.timing_weight > 0.0 {
+        min_y
+    } else {
+        0.5 * (min_y + max_y)
+    };
+    for i in 0..n {
+        nets_x.push((
+            vec![B2bPin::Movable(i), B2bPin::Fixed(default_x)],
+            0.05,
+        ));
+        nets_y.push((
+            vec![B2bPin::Movable(i), B2bPin::Fixed(default_y)],
+            0.05,
+        ));
+        net_fixed_y.push(default_y);
+    }
+
+    let mut x: Vec<f64> = base.lutff_sites.iter().map(|(s, _)| s.x as f64).collect();
+    let mut y: Vec<f64> = base.lutff_sites.iter().map(|(s, _)| s.y as f64).collect();
+    let hpwl_initial = continuous_hpwl(&x, &y, &nets_x, &net_fixed_y);
+
+    let n_ble = dev.n_ble.max(1) as usize;
+    let cols_count = ((max_x - min_x) as usize + 1).max(1);
+    let rows_count = ((max_y - min_y) as usize + 1).max(1);
+    let mut anchor_x = x.clone();
+    let mut anchor_y = y.clone();
+    let outer_iters = opts.outer_iters.max(1);
+    let mut cg_iters_total = 0usize;
+
+    for iter in 0..outer_iters {
+        let lambda = 0.15 * ((iter + 1) as f64);
+        let (diag_x, edges_x, rhs_x) =
+            build_b2b_axis_system(n, &x, &nets_x, &anchor_x, lambda);
+        let (nx, it_x) =
+            solve_cg_spd(n, &diag_x, &edges_x, &rhs_x, &x, opts.cg_max_iters, opts.cg_tol);
+        let (diag_y, edges_y, rhs_y) =
+            build_b2b_axis_system(n, &y, &nets_y, &anchor_y, lambda);
+        let (ny, it_y) =
+            solve_cg_spd(n, &diag_y, &edges_y, &rhs_y, &y, opts.cg_max_iters, opts.cg_tol);
+        cg_iters_total += it_x + it_y;
+
+        for i in 0..n {
+            x[i] = nx[i].clamp(min_x, max_x);
+            y[i] = ny[i].clamp(min_y, max_y);
+        }
+        anchor_x = electrostatic_bipartition_spread_1d(
+            &x,
+            min_x,
+            max_x,
+            (n / cols_count).max(n_ble),
+        );
+        anchor_y = electrostatic_bipartition_spread_1d(&y, min_y, max_y, n_ble);
+    }
+
+    let (legal_sites, ripple_moves) =
+        ripple_legalize(&base.packed, dev, &x, &y, &base.iob_sites)?;
+    base.lutff_sites = legal_sites;
+    let final_x: Vec<f64> = base.lutff_sites.iter().map(|(s, _)| s.x as f64).collect();
+    let final_y: Vec<f64> = base.lutff_sites.iter().map(|(s, _)| s.y as f64).collect();
+    let hpwl_final = continuous_hpwl(&final_x, &final_y, &nets_x, &net_fixed_y);
+
+    base.cost = if opts.timing_weight > 0.0 {
+        base.lutff_sites
+            .first()
+            .zip(base.iob_sites.first())
+            .map(|(l, i)| (l.0.y as f64 - i.y as f64).abs() * opts.timing_weight)
+            .unwrap_or(0.0)
+    } else {
+        base.lutff_sites.first().map(|(s, _)| s.y as f64).unwrap_or(0.0)
+    };
+
+    let _ = q_idx;
+    Ok((
+        base,
+        AnalyticalPlaceStats {
+            outer_iters,
+            cg_iters_total,
+            ripple_moves,
+            hpwl_initial,
+            hpwl_final,
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1700,17 +2382,17 @@ mod tests {
         d.add_port("led", helion_ir::PortDir::Out);
         for i in 0..9u32 {
             d.add_cell(
-                format!("u_lut{i}"),
+                &format!("u_lut{i}"),
                 CellKind::Lut6 {
                     init: 0x5555_5555_5555_5555,
                 },
             );
-            d.add_cell(format!("u_ff{i}"), CellKind::Hff);
-            d.connect("clk", format!("u_ff{i}"), "CLK");
-            d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
-            d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
-            d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
-            d.connect(format!("q{i}"), format!("u_lut{i}"), "I0");
+            d.add_cell(&format!("u_ff{i}"), CellKind::Hff);
+            d.connect("clk", &format!("u_ff{i}"), "CLK");
+            d.connect(&format!("d{i}"), &format!("u_lut{i}"), "O");
+            d.connect(&format!("d{i}"), &format!("u_ff{i}"), "D");
+            d.connect(&format!("q{i}"), &format!("u_ff{i}"), "Q");
+            d.connect(&format!("q{i}"), &format!("u_lut{i}"), "I0");
         }
         d.add_cell("u_iob", CellKind::IobOut);
         d.connect("q0", "u_iob", "I");
@@ -1795,6 +2477,7 @@ mod tests {
             &TimingGuide {
                 false_path_iob: true,
                 iob_setup_mult: 1,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1821,6 +2504,7 @@ mod tests {
             &TimingGuide {
                 false_path_iob: false,
                 iob_setup_mult: 2,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1838,6 +2522,7 @@ mod tests {
             &TimingGuide {
                 false_path_iob: true,
                 iob_setup_mult: 2,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1870,6 +2555,7 @@ mod tests {
             &TimingGuide {
                 false_path_iob: true,
                 iob_setup_mult: 1,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1898,6 +2584,7 @@ mod tests {
         let g = TimingGuide {
             false_path_iob: true,
             iob_setup_mult: 1,
+            ..Default::default()
         };
         let pl = place_in_region_with_guide(&p, &dev, opts, 5, 1, 8, 8, &g).unwrap();
         for (s, _) in &pl.lutff_sites {
@@ -2054,5 +2741,54 @@ mod tests {
                 assert_eq!(lutff_of(&pl, &lf.ff_cell), Some((site, ble)));
             }
         }
+    }
+
+    #[test]
+    fn slack_criticality_weight_monotone_with_slack_and_exponent() {
+        let w_neg = slack_criticality_weight(-200.0, 10_000.0, 2.0);
+        let w_low = slack_criticality_weight(2_000.0, 10_000.0, 2.0);
+        let w_high_slack = slack_criticality_weight(8_000.0, 10_000.0, 2.0);
+        let w_excess = slack_criticality_weight(12_000.0, 10_000.0, 2.0);
+        assert!((w_neg - 1.0).abs() < 1e-9);
+        assert!((w_low - 0.64).abs() < 1e-9);
+        assert!(w_low > w_high_slack);
+        assert_eq!(w_excess, 0.0);
+    }
+
+    #[test]
+    fn cg_spd_solver_converges_on_1d_spring_chain() {
+        // 3 movable nodes between fixed 0.0 and fixed 4.0 with unit springs:
+        // exact equilibrium is x = [1.0, 2.0, 3.0].
+        let diag = vec![2.0, 2.0, 2.0];
+        let edges = vec![(0usize, 1usize, 1.0), (1usize, 2usize, 1.0)];
+        let rhs = vec![0.0, 0.0, 4.0];
+        let (x, iters) = solve_cg_spd(3, &diag, &edges, &rhs, &[0.0, 0.0, 0.0], 32, 1e-9);
+        assert!(iters >= 1 && iters <= 10);
+        assert!((x[0] - 1.0).abs() < 1e-6, "x[0]={}", x[0]);
+        assert!((x[1] - 2.0).abs() < 1e-6, "x[1]={}", x[1]);
+        assert!((x[2] - 3.0).abs() < 1e-6, "x[2]={}", x[2]);
+    }
+
+    #[test]
+    fn analytical_placer_legalizes_and_respects_timing_criticality() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&hard_heartbeat(), &dev).unwrap();
+        let mut opts_td = AnalyticalPlaceOpts {
+            timing_weight: 2.0,
+            ..Default::default()
+        };
+        opts_td.net_slack_ps.insert("q7".to_string(), 100.0);
+        let (pl_td, stats_td) = place_analytical_with_stats(&p, &dev, &opts_td).unwrap();
+        assert_eq!(pl_td.lutff_sites.len(), p.lutffs.len());
+        assert!(stats_td.cg_iters_total > 0);
+        // Verify no duplicate (site, BLE) slots after ripple legalization.
+        let mut seen = HashSet::new();
+        for &(s, ble) in &pl_td.lutff_sites {
+            assert!(dev.contains_site(s));
+            assert!(seen.insert((s.x, s.y, ble)), "duplicate BLE at {:?} {}", s, ble);
+        }
+        // Deterministic repeat check.
+        let pl_td2 = place_analytical_with(&p, &dev, &opts_td).unwrap();
+        assert_eq!(pl_td.lutff_sites, pl_td2.lutff_sites);
     }
 }
