@@ -312,7 +312,7 @@ pub fn paint_inspector(
                     .then(|| s.occupant.clone())
                 })
                 .flatten();
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.small_button("Zoom to").clicked() {
                     if let Some((x, y)) = site_xy {
                         model.device_zoom = 2.5;
@@ -337,7 +337,7 @@ pub fn paint_inspector(
             });
         }
         InspectorKind::Net(net) => {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.small_button("Highlight net").clicked() {
                     // Solo the route: selection drives the accent highlight
                     // through the existing highlight mechanism.

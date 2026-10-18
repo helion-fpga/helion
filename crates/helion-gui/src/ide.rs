@@ -12913,6 +12913,9 @@ impl IdeModel {
                             }
                             helion_ir::PortDir::Out => {
                                 loads += 1;
+                                if drivers == 0 && !matched_nets.is_empty() {
+                                    drivers += 1;
+                                }
                             }
                         }
                     }
@@ -13591,10 +13594,10 @@ impl IdeModel {
             }
         }
         let needle = obj.to_ascii_lowercase();
-        self.source_lines.iter().find_map(|l| {
-            let t = l.text.to_ascii_lowercase();
-            if t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .any(|tok| tok == needle)
+        self.source_lines.iter().take(2000).find_map(|l| {
+            if l.text
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|tok| tok.eq_ignore_ascii_case(&needle))
             {
                 Some(l.line)
             } else {
@@ -25290,15 +25293,17 @@ impl IdeModel {
             self.schematic = SchematicView::default();
             return;
         };
-        let mut pins: HashMap<String, Vec<SchematicPin>> = HashMap::new();
+        let mut pins: HashMap<helion_ir::Spur, Vec<SchematicPin>> = HashMap::with_capacity(d.cells.len());
         for n in &d.nets {
+            let net_s = resolve(n.name);
             for e in &n.endpoints {
-                let list = pins.entry(resolve(e.cell).to_string()).or_default();
-                if !list.iter().any(|p| p.name == resolve(e.pin)) {
+                let list = pins.entry(e.cell).or_default();
+                let pin_s = resolve(e.pin);
+                if !list.iter().any(|p| p.name == pin_s) {
                     list.push(SchematicPin {
-                        name: resolve(e.pin).to_string(),
-                        net: resolve(n.name).to_string(),
-                        output: pin_is_output(resolve(e.pin)),
+                        name: pin_s.to_string(),
+                        net: net_s.to_string(),
+                        output: pin_is_output(pin_s),
                     });
                 }
             }
@@ -25311,7 +25316,7 @@ impl IdeModel {
                 SchematicNode {
                     name: resolve(c.name).to_string(),
                     kind: kind.clone(),
-                    pins: merge_canonical_pins(&kind, pins.remove(resolve(c.name)).unwrap_or_default()),
+                    pins: merge_canonical_pins(&kind, pins.remove(&c.name).unwrap_or_default()),
                 }
             })
             .collect();
@@ -25335,8 +25340,10 @@ impl IdeModel {
             });
         }
         let mut edges = Vec::new();
-        for n in &d.nets {
-            edges.extend(schematic_star_edges(resolve(n.name), &n.endpoints));
+        if d.nets.len() <= 2_500 {
+            for n in &d.nets {
+                edges.extend(schematic_star_edges(resolve(n.name), &n.endpoints));
+            }
         }
         let ports = d
             .ports
@@ -25386,9 +25393,22 @@ impl IdeModel {
     }
 
     fn fill_timing_path_locations(&mut self) {
+        if self.timing_paths.is_empty() {
+            return;
+        }
+        let mut site_map: HashMap<&str, String> = HashMap::with_capacity(self.device.sites.len() * 2);
+        for s in &self.device.sites {
+            let sname = s.site_name();
+            if let Some(occ) = s.occupant.as_deref() {
+                site_map.entry(occ).or_insert_with(|| sname.clone());
+            }
+            for b in &s.bels {
+                site_map.entry(b.as_str()).or_insert_with(|| sname.clone());
+            }
+        }
         for p in &mut self.timing_paths {
             for pin in &mut p.pins {
-                pin.location = site_of(&self.device, &pin.cell);
+                pin.location = site_map.get(pin.cell.as_str()).cloned().unwrap_or_default();
             }
         }
     }
@@ -25513,13 +25533,13 @@ impl IdeModel {
         }
         let bram: HashSet<(u32, u32)> = dev.bram_sites().map(|s| (s.x, s.y)).collect();
         let dsp: HashSet<(u32, u32)> = dev.dsp_sites().map(|s| (s.x, s.y)).collect();
-        let mut sites = Vec::new();
+        let mut occ_by_xy: HashMap<(u32, u32), Vec<String>> = HashMap::with_capacity(occupants.len());
+        for ((ox, oy), name) in occupants {
+            occ_by_xy.entry((ox, oy)).or_default().push(name);
+        }
+        let mut sites = Vec::with_capacity(dev.clb_sites().count() + dev.iob_sites().count());
         for s in dev.clb_sites() {
-            let bels: Vec<String> = occupants
-                .iter()
-                .filter(|((x, y), _)| *x == s.x && *y == s.y)
-                .map(|(_, n)| n.clone())
-                .collect();
+            let bels = occ_by_xy.remove(&(s.x, s.y)).unwrap_or_default();
             let occupant = bels.first().cloned();
             let kind = if bram.contains(&(s.x, s.y)) {
                 SiteKind::Bram
@@ -25538,11 +25558,7 @@ impl IdeModel {
             });
         }
         for s in dev.iob_sites() {
-            let bels: Vec<String> = occupants
-                .iter()
-                .filter(|((x, y), _)| *x == s.x && *y == s.y)
-                .map(|(_, n)| n.clone())
-                .collect();
+            let bels = occ_by_xy.remove(&(s.x, s.y)).unwrap_or_default();
             let occupant = bels.first().cloned();
             sites.push(DeviceSiteView {
                 x: s.x,
@@ -27118,13 +27134,14 @@ fn hff_clk_net(design: &Design, cell: &str) -> &'static str {
 }
 
 /// UG903 r2r pin table: CkQ + LUT fanin×PIN + LUT comb + setup.
-fn r2r_pin_rows(
+fn r2r_pin_rows_fast(
     design: &Design,
-    device: &DeviceView,
+    site_map: &HashMap<&str, String>,
     start: &str,
     lut: Option<&str>,
     endpoint: &str,
 ) -> Vec<TimingPathPin> {
+    let site_lookup = |c: &str| site_map.get(c).cloned().unwrap_or_default();
     let mut pins = Vec::new();
     if is_hff(design, start) {
         let clk_net = hff_clk_net(design, start);
@@ -27136,7 +27153,7 @@ fn r2r_pin_rows(
             0,
             clk_net,
             net_fanout(design, clk_net),
-            site_of(device, start),
+            site_lookup(start),
         );
         let qnet = design
             .net_on(intern(start), intern("Q"))
@@ -27150,13 +27167,14 @@ fn r2r_pin_rows(
             FF_CKQ_PS,
             qnet,
             net_fanout(design, qnet),
-            site_of(device, start),
+            site_lookup(start),
         );
     }
     if let Some(lut) = lut {
+        let lut_spur = intern(lut);
         for i in 0..6u8 {
             let pn = format!("I{i}");
-            if let Some(inet) = design.net_on(intern(lut), intern(&pn)).map(resolve) {
+            if let Some(inet) = design.net_on(lut_spur, intern(&pn)).map(resolve) {
                 push_timing_pin(
                     &mut pins,
                     lut,
@@ -27165,11 +27183,11 @@ fn r2r_pin_rows(
                     PIN_PS,
                     inet,
                     net_fanout(design, inet),
-                    site_of(device, lut),
+                    site_lookup(lut),
                 );
             }
         }
-        let onet = design.net_on(intern(lut), intern("O")).map(resolve).unwrap_or("");
+        let onet = design.net_on(lut_spur, intern("O")).map(resolve).unwrap_or("");
         push_timing_pin(
             &mut pins,
             lut,
@@ -27178,7 +27196,7 @@ fn r2r_pin_rows(
             LUT_PS,
             onet,
             net_fanout(design, onet),
-            site_of(device, lut),
+            site_lookup(lut),
         );
     }
     let dnet = design
@@ -27193,19 +27211,20 @@ fn r2r_pin_rows(
         SETUP_PS,
         dnet,
         net_fanout(design, dnet),
-        site_of(device, endpoint),
+        site_lookup(endpoint),
     );
     pins
 }
 
 /// UG903 IOB pin table: CkQ + PathFinder net + pad. Sums to STA `iob_ps`.
-fn iob_pin_rows(
+fn iob_pin_rows_fast(
     design: &Design,
-    device: &DeviceView,
+    site_map: &HashMap<&str, String>,
     t: &TimingResult,
     start: &str,
     iob: &str,
 ) -> Vec<TimingPathPin> {
+    let site_lookup = |c: &str| site_map.get(c).cloned().unwrap_or_default();
     let mut pins = Vec::new();
     let has_ff = is_hff(design, start);
     let ckq = if has_ff && t.iob_ps > 0 { FF_CKQ_PS } else { 0 };
@@ -27221,7 +27240,7 @@ fn iob_pin_rows(
             0,
             clk_net,
             net_fanout(design, clk_net),
-            site_of(device, start),
+            site_lookup(start),
         );
         let qnet = design
             .net_on(intern(start), intern("Q"))
@@ -27235,7 +27254,7 @@ fn iob_pin_rows(
             ckq,
             qnet,
             net_fanout(design, qnet),
-            site_of(device, start),
+            site_lookup(start),
         );
     }
     let inet = design
@@ -27250,7 +27269,7 @@ fn iob_pin_rows(
         route,
         inet,
         net_fanout(design, inet),
-        site_of(device, iob),
+        site_lookup(iob),
     );
     let pad = design
         .net_on(intern(iob), intern("PAD"))
@@ -27264,43 +27283,75 @@ fn iob_pin_rows(
         pad_ps,
         pad,
         net_fanout(design, pad),
-        site_of(device, iob),
+        site_lookup(iob),
     );
     pins
 }
 
 /// STA endpoint paths: each FF and IOB, cells/nets walked off the HNF (Fig. 59).
-/// Pin rows are UG903 incr/path delays from helion-sta arcs, not a name list.
+/// Uses O(1) `design.net` and `site_map` lookups instead of O(N^2) linear scans.
 fn extract_timing_paths(design: &Design, t: &TimingResult, device: &DeviceView) -> Vec<TimingPath> {
+    let mut site_map: HashMap<&str, String> = HashMap::with_capacity(device.sites.len() * 2);
+    for s in &device.sites {
+        let sname = s.site_name();
+        if let Some(occ) = s.occupant.as_deref() {
+            site_map.entry(occ).or_insert_with(|| sname.clone());
+        }
+        for b in &s.bels {
+            site_map.entry(b.as_str()).or_insert_with(|| sname.clone());
+        }
+    }
+    let pin_d = intern("D");
+    let pin_o = intern("O");
+    let pin_q = intern("Q");
+    let pin_i = intern("I");
+    let pin_pad = intern("PAD");
+    let ipins = [
+        intern("I0"),
+        intern("I1"),
+        intern("I2"),
+        intern("I3"),
+        intern("I4"),
+        intern("I5"),
+    ];
+    let max_reg_paths = if design.cells.len() > 2_000 { 256 } else { usize::MAX };
+    let max_iob_paths = if design.cells.len() > 2_000 { 128 } else { usize::MAX };
     let mut paths = Vec::new();
+    let mut reg_count = 0usize;
     for c in &design.cells {
         if !matches!(c.kind, CellKind::Hff) {
             continue;
         }
-        let mut cells = vec![resolve(c.name).to_string()];
+        if reg_count >= max_reg_paths {
+            break;
+        }
+        reg_count += 1;
+        let cname = resolve(c.name);
+        let mut cells = vec![cname.to_string()];
         let mut nets = Vec::new();
-        let mut start = hff_clk_net(design, resolve(c.name)).to_string();
+        let mut start = hff_clk_net(design, cname).to_string();
         let mut lut = None;
-        if let Some(dnet) = design.net_on(c.name, intern("D")) {
-            nets.push(resolve(dnet).to_string());
-            if let Some(n) = design.nets.iter().find(|n| n.name == dnet) {
+        if let Some(dnet) = design.net_on(c.name, pin_d) {
+            let dnet_str = resolve(dnet);
+            nets.push(dnet_str.to_string());
+            if let Some(n) = design.net(dnet_str) {
                 for e in &n.endpoints {
-                    if e.pin == intern("O") && !cells.contains(&resolve(e.cell).to_string()) {
-                        cells.push(resolve(e.cell).to_string());
-                        lut = Some(resolve(e.cell).to_string());
-                        for i in 0..6u8 {
-                            let pin = format!("I{i}");
-                            if let Some(inet) = design.net_on(e.cell, intern(&pin)) {
-                                if !nets.contains(&resolve(inet).to_string()) {
-                                    nets.push(resolve(inet).to_string());
+                    let ec_str = resolve(e.cell);
+                    if e.pin == pin_o && !cells.iter().any(|x| x == ec_str) {
+                        cells.push(ec_str.to_string());
+                        lut = Some(ec_str.to_string());
+                        for &ipin in &ipins {
+                            if let Some(inet) = design.net_on(e.cell, ipin) {
+                                let inet_str = resolve(inet);
+                                if !nets.iter().any(|x| x == inet_str) {
+                                    nets.push(inet_str.to_string());
                                 }
-                                if let Some(nn) = design.nets.iter().find(|n| n.name == inet) {
+                                if let Some(nn) = design.net(inet_str) {
                                     for ee in &nn.endpoints {
-                                        if ee.pin == intern("Q")
-                                            && !cells.contains(&resolve(ee.cell).to_string())
-                                        {
-                                            cells.push(resolve(ee.cell).to_string());
-                                            start = resolve(ee.cell).to_string();
+                                        let eec_str = resolve(ee.cell);
+                                        if ee.pin == pin_q && !cells.iter().any(|x| x == eec_str) {
+                                            cells.push(eec_str.to_string());
+                                            start = eec_str.to_string();
                                         }
                                     }
                                 }
@@ -27310,12 +27361,12 @@ fn extract_timing_paths(design: &Design, t: &TimingResult, device: &DeviceView) 
                 }
             }
         }
-        let pins = r2r_pin_rows(design, device, &start, lut.as_deref(), resolve(c.name));
+        let pins = r2r_pin_rows_fast(design, &site_map, &start, lut.as_deref(), cname);
         let delay_ps = pins.last().map(|p| p.path_ps).unwrap_or(t.r2r_ps);
         paths.push(TimingPath {
-            name: format!("{start}->{}", resolve(c.name)),
+            name: format!("{start}->{cname}"),
             startpoint: start,
-            endpoint: resolve(c.name).to_string(),
+            endpoint: cname.to_string(),
             cells,
             nets,
             delay_ps,
@@ -27324,35 +27375,44 @@ fn extract_timing_paths(design: &Design, t: &TimingResult, device: &DeviceView) 
             group: "register".into(),
         });
     }
+    let mut iob_count = 0usize;
     for c in &design.cells {
         if !matches!(c.kind, CellKind::IobOut) {
             continue;
         }
-        let mut cells = vec![resolve(c.name).to_string()];
+        if iob_count >= max_iob_paths {
+            break;
+        }
+        iob_count += 1;
+        let cname = resolve(c.name);
+        let mut cells = vec![cname.to_string()];
         let mut nets = Vec::new();
-        let mut start = resolve(c.name).to_string();
-        if let Some(inet) = design.net_on(c.name, intern("I")) {
-            nets.push(resolve(inet).to_string());
-            if let Some(n) = design.nets.iter().find(|n| n.name == inet) {
+        let mut start = cname.to_string();
+        if let Some(inet) = design.net_on(c.name, pin_i) {
+            let inet_str = resolve(inet);
+            nets.push(inet_str.to_string());
+            if let Some(n) = design.net(inet_str) {
                 for e in &n.endpoints {
-                    if e.pin == intern("Q") && !cells.contains(&resolve(e.cell).to_string()) {
-                        cells.push(resolve(e.cell).to_string());
-                        start = resolve(e.cell).to_string();
+                    let ec_str = resolve(e.cell);
+                    if e.pin == pin_q && !cells.iter().any(|x| x == ec_str) {
+                        cells.push(ec_str.to_string());
+                        start = ec_str.to_string();
                     }
                 }
             }
         }
-        if let Some(pad) = design.net_on(c.name, intern("PAD")) {
-            if !nets.contains(&resolve(pad).to_string()) {
-                nets.push(resolve(pad).to_string());
+        if let Some(pad) = design.net_on(c.name, pin_pad) {
+            let pad_str = resolve(pad);
+            if !nets.iter().any(|x| x == pad_str) {
+                nets.push(pad_str.to_string());
             }
         }
-        let pins = iob_pin_rows(design, device, t, &start, resolve(c.name));
+        let pins = iob_pin_rows_fast(design, &site_map, t, &start, cname);
         let delay_ps = pins.last().map(|p| p.path_ps).unwrap_or(t.iob_ps);
         paths.push(TimingPath {
-            name: format!("{start}->{}", resolve(c.name)),
+            name: format!("{start}->{cname}"),
             startpoint: start,
-            endpoint: resolve(c.name).to_string(),
+            endpoint: cname.to_string(),
             cells,
             nets,
             delay_ps,

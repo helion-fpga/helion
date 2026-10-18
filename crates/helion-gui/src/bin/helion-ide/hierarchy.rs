@@ -241,9 +241,14 @@ fn paint_chevron(p: &egui::Painter, center: egui::Pos2, expanded: bool, color: e
 /// Vivado Netlist-tree hierarchy section (Z3 sidebar). `model.selected` is the
 /// cross-view selection identity shared with Schematic/Device/Properties.
 pub fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Hierarchy").strong().size(13.0));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    let hw = ui.available_width().max(120.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(hw, 24.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.label(egui::RichText::new("Hierarchy").strong().size(13.0));
+            let rem = (ui.available_width() - 88.0).max(4.0);
+            ui.add_space(rem);
             if ui
                 .small_button("Schematic ↗")
                 .on_hover_text("Open hierarchy in schematic viewer")
@@ -251,8 +256,8 @@ pub fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::T
             {
                 let _ = model.exec("open_hierarchy_sheet");
             }
-        });
-    });
+        },
+    );
 
     let top = model.hierarchy.top.clone();
     let Some(top_name) = top.clone() else {
@@ -429,25 +434,37 @@ pub fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::T
                 }
                 let label_x = rect.min.x + 8.0 + n.depth as f32 * INDENT + 18.0;
                 let is_internal = TreeState::is_instance_kind(&n.kind);
-                painter.text(
-                    egui::pos2(label_x, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    &n.short,
-                    egui::FontId::proportional(13.0),
-                    if is_internal { theme.text } else { theme.dim },
-                );
-                // Right-aligned count (instances) or kind (leaves).
+                // Right-aligned count (instances) or kind (leaves) measured first so label never collides.
                 let right = if is_internal {
                     format!("({})", n.leaf_count)
                 } else {
                     n.kind.clone()
                 };
-                painter.text(
-                    egui::pos2(rect.max.x - 10.0, rect.center().y),
-                    egui::Align2::RIGHT_CENTER,
+                let rgalley = painter.layout_no_wrap(
                     right,
                     egui::FontId::proportional(11.0),
                     theme.faint,
+                );
+                let rw = rgalley.size().x;
+                let rx = (rect.max.x - 10.0 - rw).max(label_x + 36.0);
+                painter.galley(
+                    egui::pos2(rx, rect.center().y - rgalley.size().y * 0.5),
+                    rgalley,
+                    theme.faint,
+                );
+                let label_clip = egui::Rect::from_min_max(
+                    egui::pos2(label_x, rect.min.y),
+                    egui::pos2((rx - 6.0).max(label_x + 24.0), rect.max.y),
+                );
+                let lgalley = painter.layout_no_wrap(
+                    n.short.clone(),
+                    egui::FontId::proportional(13.0),
+                    if is_internal { theme.text } else { theme.dim },
+                );
+                painter.with_clip_rect(label_clip).galley(
+                    egui::pos2(label_x, rect.center().y - lgalley.size().y * 0.5),
+                    lgalley,
+                    if is_internal { theme.text } else { theme.dim },
                 );
                 // 1px divider.
                 painter.line_segment(

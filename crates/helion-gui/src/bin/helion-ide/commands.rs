@@ -655,7 +655,7 @@ pub fn paint_palette(ctx: &egui::Context, app: &mut HelionIde) {
     if let Some(p) = run {
         app.palette.open = false;
         match p {
-            PalettePick::File(path) => app.open_path(&path),
+            PalettePick::File(path) => app.open_path_async(&path),
             PalettePick::Cmd(cmd) => run_command(app, cmd),
         }
     }
