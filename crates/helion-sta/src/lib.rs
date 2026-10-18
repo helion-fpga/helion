@@ -17,7 +17,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 mod cdc;
 mod constraints_codec;
-
+pub mod signoff;
+pub use signoff::*;
 // Structural CDC analysis (v3.0 verification track): clock-domain
 // extraction, net-level crossing detection, synchronizer recognition, and
 // the 11 CdcClass violation classes layered on `report_cdc`.
