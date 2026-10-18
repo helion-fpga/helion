@@ -200,12 +200,6 @@ Rust, SystemVerilog, STA, IDE, or docs: [get involved](https://helion-fpga.githu
 
 Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
 
-## GitHub Stats
-
-![Saksham's GitHub stats](https://github-readme-stats.vercel.app/api?username=saksham-45&show_icons=true)
-![Top languages](https://github-readme-stats.vercel.app/api/top-langs/?username=saksham-45&layout=compact)
-![GitHub streak](https://streak-stats.demolab.com/?user=saksham-45)
-
 ## Repository Traffic
 
 <!-- TRAFFIC-START -->
