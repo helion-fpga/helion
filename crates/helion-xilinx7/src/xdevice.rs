@@ -119,12 +119,20 @@ impl<'a> DeviceQuery for XDevice<'a> {
         self.device.bufg_sites().into_iter().next()
     }
 
+    fn bufg_sites(&self) -> Vec<(String, String)> {
+        self.device.bufg_sites()
+    }
+
     fn ramb_site(&self) -> Option<(String, String)> {
         self.device.ramb_sites().into_iter().next()
     }
 
     fn dsp_site(&self) -> Option<(String, String)> {
         self.device.dsp_sites().into_iter().next()
+    }
+
+    fn pin_bank(&self, pin: &str) -> Option<String> {
+        self.device.package_pin(pin).map(|p| p.bank.clone())
     }
 
     fn tile_xy(&self, tile: &str) -> Option<(i32, i32)> {

@@ -48,7 +48,7 @@ fn picorv32_with_bram_end_to_end() {
         match &c.kind {
             helion_ir::CellKind::Lut6 { .. } => luts += 1,
             helion_ir::CellKind::Hff => ffs += 1,
-            helion_ir::CellKind::Bram18 => brams += 1,
+            helion_ir::CellKind::Bram18 | helion_ir::CellKind::Bram18e1 { .. } => brams += 1,
             _ => {}
         }
     }
@@ -63,7 +63,7 @@ fn picorv32_with_bram_end_to_end() {
     // Run pack to verify BRAM is packed.
     let backend = Xilinx7Backend::open("xc7a35t").expect("backend open failed");
     // Note: full run() requires IOB LOCs; we test pack/place separately.
-    let packed = backend.pack(&design).expect("pack failed");
+    let _packed = backend.pack(&design).expect("pack failed");
     // Packed7 is backend-specific; verify via debug output.
     println!("Pack: OK");
 }
