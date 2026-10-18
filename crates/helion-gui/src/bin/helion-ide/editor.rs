@@ -255,8 +255,16 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
 
     let mut do_open = false;
     let mut do_goto = false;
+    let mut do_goto_def = false;
+    let mut do_cross_probe = false;
     let mut do_save = false;
     let mut do_wrap = false;
+    if ui
+        .ctx()
+        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F12))
+    {
+        do_goto_def = true;
+    }
     ui.horizontal(|ui| {
         let mut name = RichText::new(&file_name)
             .color(theme.faint)
@@ -291,6 +299,20 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
             }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button("Cross-Probe (F4)")
+                .on_hover_text("Synchronize selection across RTL, Schematic, Device, Timing, DRC, and Waveform (F4)")
+                .clicked()
+            {
+                do_cross_probe = true;
+            }
+            if ui
+                .small_button("Go to Def (F12)")
+                .on_hover_text("Jump to SV/VHDL/XDC symbol declaration (F12 or Ctrl/⌘+Click)")
+                .clicked()
+            {
+                do_goto_def = true;
+            }
             if ui.small_button("Goto Source").clicked() {
                 do_goto = true;
             }
@@ -330,6 +352,15 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
     }
     if do_goto {
         let _ = app.model.goto_editor("");
+    }
+    if do_goto_def {
+        if let Ok(loc) = app.model.goto_definition("") {
+            ui.ctx()
+                .memory_mut(|m| m.data.insert_temp(egui::Id::new("text_editor_scroll_to"), loc.line));
+        }
+    }
+    if do_cross_probe {
+        let _ = app.model.cross_probe("");
     }
     if !has_sources {
         ui.centered_and_justified(|ui| {
@@ -440,6 +471,87 @@ fn paint_editor_text(
             app.editor_content_w = out.galley.size().x.max(200.0);
         }
         app.editor_line_rows = rows_rc.borrow().clone();
+
+        // Inline SV/VHDL/XDC symbol hover tooltip & Ctrl/Cmd+Click go-to-definition.
+        if let Some(pos) = out.response.hover_pos() {
+            let rel_y = (pos.y - out.galley_pos.y).max(0.0);
+            let rel_x = (pos.x - out.galley_pos.x).max(0.0);
+            let glyph_w = ui
+                .fonts(|f| f.glyph_width(&theme::font_code(13.0), 'M'))
+                .max(7.2);
+            let hovered_line = y_to_line(rel_y, n_lines, wrap, &app.editor_line_rows) + 1;
+            let hovered_col = (rel_x / glyph_w).floor() as usize + 1;
+            if let Some(sym) = app.model.symbol_at_line_col(hovered_line, hovered_col) {
+                if let Some(info) = app.model.symbol_hover(&sym) {
+                    let theme_h = *theme;
+                    let info_c = info.clone();
+                    out.response.clone().on_hover_ui_at_pointer(|ui| {
+                        ui.set_max_width(360.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(&info_c.symbol)
+                                    .font(theme::font_code(13.0))
+                                    .color(theme_h.accent)
+                                    .strong(),
+                            );
+                            ui.label(
+                                RichText::new(format!("({} · {}-bit)", info_c.kind, info_c.width))
+                                    .font(theme::font_ui(11.5))
+                                    .color(theme_h.dim),
+                            );
+                        });
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!(
+                                "Width: {} bit(s)   ·   Drivers: {}   ·   Loads: {}",
+                                info_c.width, info_c.drivers, info_c.loads
+                            ))
+                            .font(theme::font_code(11.5))
+                            .color(theme_h.text),
+                        );
+                        let (slack_txt, slack_col) = match info_c.slack_ps {
+                            Some(s) if s >= 0 => (format!("Worst Slack: +{s} ps (MET)"), theme_h.ok),
+                            Some(s) => (format!("Worst Slack: {s} ps (VIOLATED)"), theme_h.danger),
+                            None => ("Worst Slack: n/a (unrouted)".to_string(), theme_h.faint),
+                        };
+                        ui.label(
+                            RichText::new(slack_txt)
+                                .font(theme::font_code(11.5))
+                                .color(slack_col),
+                        );
+                        if let Some(def) = &info_c.definition {
+                            let bname = def.file.rsplit('/').next().unwrap_or(&def.file);
+                            ui.label(
+                                RichText::new(format!(
+                                    "Defined at {}:{} — {}",
+                                    bname, def.line, def.decl_text
+                                ))
+                                .font(theme::font_code(11.0))
+                                .color(theme_h.dim),
+                            );
+                        }
+                        ui.label(
+                            RichText::new("F12 / ⌘+Click: Go to Definition  ·  F4: Cross-Probe")
+                                .font(theme::font_ui(10.5))
+                                .color(theme_h.faint),
+                        );
+                    });
+                }
+                let cmd_click = out.response.clicked()
+                    && ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+                let alt_click = out.response.clicked() && ui.input(|i| i.modifiers.alt);
+                if cmd_click {
+                    if let Ok(loc) = app.model.goto_definition(&sym) {
+                        ui.ctx().memory_mut(|m| {
+                            m.data
+                                .insert_temp(egui::Id::new("text_editor_scroll_to"), loc.line)
+                        });
+                    }
+                } else if alt_click {
+                    let _ = app.model.cross_probe(&sym);
+                }
+            }
+        }
         out
     })
 }
