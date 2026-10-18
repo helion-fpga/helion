@@ -630,6 +630,9 @@ impl<'a> Parser<'a> {
             }
             let w = self.num().ok_or("ap_int width")? as usize;
             while !self.eat(">") {
+                if self.peek() == Some(&Tok::Sym(">>".into())) {
+                    break;
+                }
                 if self.peek().is_none() {
                     return Err("unterminated ap_int<...>".into());
                 }
@@ -653,6 +656,9 @@ impl<'a> Parser<'a> {
                     w = (n as usize).max(1);
                 }
                 while !self.eat(">") {
+                    if self.peek() == Some(&Tok::Sym(">>".into())) {
+                        break;
+                    }
                     if self.peek().is_none() {
                         return Err("unterminated ap_axis<...>".into());
                     }
@@ -675,7 +681,7 @@ impl<'a> Parser<'a> {
                 return Err("expected '<' after stream".into());
             }
             let (inner, _) = self.parse_type()?;
-            if !self.eat(">") {
+            if !self.eat(">") && !self.eat(">>") {
                 return Err("expected '>' after stream<T>".into());
             }
             return Ok((
@@ -985,11 +991,14 @@ impl<'a> Parser<'a> {
             self.i += 1;
             return Ok(CExpr::Num(v));
         }
-        let n = self.ident()?;
+        let mut n = self.ident()?;
+        while self.eat("::") {
+            n = self.ident()?;
+        }
         if let Some(&val) = self.const_vals.get(&n) {
             return Ok(CExpr::Num(val));
         }
-        // Member access: `s.read()`, `s.empty()`, `s.full()`, `pkt.data`, `x.range(hi, lo)`
+        // Member access: `s.read()`, `s.empty()`, `s.full()`, `pkt.data`, `x.range(hi, lo)`, `x.bit(i)`
         if self.eat(".") || self.eat("->") {
             let member = self.ident()?;
             if self.eat("(") {
@@ -999,9 +1008,10 @@ impl<'a> Parser<'a> {
                     let _ = self.eat(",");
                 }
                 return match member.as_str() {
-                    "read" => Ok(CExpr::StreamRead(n)),
+                    "read" | "read_nb" => Ok(CExpr::StreamRead(n)),
                     "empty" => Ok(CExpr::StreamEmpty(n)),
                     "full" => Ok(CExpr::StreamFull(n)),
+                    "bit" if args.len() == 1 => Ok(CExpr::Bit(n, Box::new(args[0].clone()))),
                     "range" if args.len() == 2 => {
                         let hi = self.eval_cexpr_const(&args[0]).unwrap_or(0) as usize;
                         let lo = self.eval_cexpr_const(&args[1]).unwrap_or(0) as usize;
@@ -1414,12 +1424,12 @@ impl<'a> Parser<'a> {
                     let _ = self.eat(",");
                 }
                 let _ = self.eat(";");
-                if method == "write" {
+                if method == "write" || method == "write_nb" {
                     if let Some(v) = args.into_iter().next() {
                         out.push(CStmt::StreamWrite { stream: name, val: v });
                         return Ok(());
                     }
-                } else if method == "read" {
+                } else if method == "read" || method == "read_nb" {
                     if let Some(CExpr::Var(dst)) = args.into_iter().next() {
                         out.push(CStmt::Assign {
                             lhs: LValue::Var(dst),
@@ -1427,6 +1437,16 @@ impl<'a> Parser<'a> {
                         });
                         return Ok(());
                     }
+                } else if method == "range" && args.len() == 2 && self.eat("=") {
+                    let hi = self.eval_cexpr_const(&args[0]).unwrap_or(0) as usize;
+                    let lo = self.eval_cexpr_const(&args[1]).unwrap_or(0) as usize;
+                    let rhs = self.parse_expr()?;
+                    let _ = self.eat(";");
+                    out.push(CStmt::Assign {
+                        lhs: LValue::Slice(name, hi, lo),
+                        rhs,
+                    });
+                    return Ok(());
                 }
                 return Ok(());
             }
