@@ -41,6 +41,8 @@ pub use fir_dds::{
     DdsCompilerEngine, DdsConfig, DdsSample, FirCompilerEngine, FirConfig, FirRateMode,
     design_lowpass_hamming_taps, emit_dds_sv, emit_fir_sv,
 };
+pub mod crypto;
+pub use crypto::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IpCore {
@@ -3248,5 +3250,132 @@ file a.v
         assert!(sv64.contains("parameter int unsigned XLEN         = 64"));
         assert!(sv64.contains("m_axil_awaddr"));
         assert!(sv64.contains("module helion_rv64_subsys"));
+    }
+
+    #[test]
+    fn nist_fips_197_180_202_rfc8439_and_sp800_90b_reference_vectors() {
+        // 1. NIST FIPS 197 Appendix B AES-128 test vector
+        let aes128_key: [u8; 16] = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
+        ];
+        let aes_pt: [u8; 16] = [
+            0x32, 0x43, 0xf6, 0xa8, 0x88, 0x5a, 0x30, 0x8d, 0x31, 0x31, 0x98, 0xa2, 0xe0, 0x37,
+            0x07, 0x34,
+        ];
+        let aes128_ct = aes128_encrypt_block(&aes128_key, &aes_pt);
+        assert_eq!(
+            aes128_ct,
+            [
+                0x39, 0x25, 0x84, 0x1d, 0x02, 0xdc, 0x09, 0xfb, 0xdc, 0x11, 0x85, 0x97, 0x19, 0x6a,
+                0x0b, 0x32
+            ]
+        );
+
+        // 2. NIST FIPS 197 Appendix C.3 AES-256 test vector
+        let aes256_key: [u8; 32] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        let aes256_pt: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let aes256_ct = aes256_encrypt_block(&aes256_key, &aes256_pt);
+        assert_eq!(
+            aes256_ct,
+            [
+                0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67, 0x45, 0xbf, 0xea, 0xfc, 0x49, 0x90, 0x4b, 0x49,
+                0x60, 0x89
+            ]
+        );
+
+        // 3. NIST SP 800-38D Test Case 1 (AES-128-GCM empty plaintext & empty AAD -> tag = 0x58e2fccefa7e3061367f1d57a4e7455a)
+        let (gcm_ct, gcm_tag) = aes128_gcm_encrypt(&[0u8; 16], &[0u8; 12], &[], &[]);
+        assert!(gcm_ct.is_empty());
+        assert_eq!(
+            gcm_tag,
+            [
+                0x58, 0xe2, 0xfc, 0xce, 0xfa, 0x7e, 0x30, 0x61, 0x36, 0x7f, 0x1d, 0x57, 0xa4, 0xe7,
+                0x45, 0x5a
+            ]
+        );
+
+        // 4. NIST FIPS 180-4 SHA-256("abc")
+        let sha256_abc = sha256_digest(b"abc");
+        assert_eq!(
+            sha256_abc,
+            [
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad
+            ]
+        );
+
+        // 5. NIST FIPS 202 SHA3-256("abc")
+        let sha3_abc = sha3_256_digest(b"abc");
+        assert_eq!(
+            sha3_abc,
+            [
+                0x3a, 0x98, 0x5d, 0xa7, 0x4f, 0xe2, 0x25, 0xb2, 0x04, 0x5c, 0x17, 0x2d, 0x6b, 0xd3,
+                0x90, 0xbd, 0x85, 0x5f, 0x08, 0x6e, 0x3e, 0x9d, 0x52, 0x5b, 0x46, 0xbf, 0xe2, 0x45,
+                0x11, 0x43, 0x15, 0x32
+            ]
+        );
+
+        // 6. RFC 8439 Section 2.3.2 ChaCha20 Block Function Test Vector
+        let mut chacha_key = [0u8; 32];
+        for (i, b) in chacha_key.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let chacha_nonce: [u8; 12] = [
+            0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let ks = chacha20_block(&chacha_key, 1, &chacha_nonce);
+        assert_eq!(&ks[0..4], &[0x10, 0xf1, 0xe7, 0xe4]);
+        assert_eq!(&ks[60..64], &[0xa2, 0x50, 0x3c, 0x4e]);
+
+        // 7. Von-Neumann Debiaser & NIST SP 800-90B TRNG Health Monitor
+        assert_eq!(von_neumann_debias(&[0, 0, 0, 1, 1, 0, 1, 1]), vec![0, 1]);
+        let mut mon = TrngHealthMonitor::new(4, 6, 8);
+        for &s in &[0, 1, 0, 1] {
+            mon.feed_sample(s);
+        }
+        assert!(mon.is_healthy());
+        for _ in 0..4 {
+            mon.feed_sample(1);
+        }
+        assert!(mon.rct_failed);
+    }
+
+    #[test]
+    fn crypto_catalog_and_synthesizable_sv_generators() {
+        let cat = crypto_catalog();
+        assert_eq!(cat.len(), 5);
+
+        let aes_sv = generate_aes_gcm_sv(256);
+        assert!(aes_sv.contains("module aes_gcm_core"));
+        assert!(aes_sv.contains("parameter int C_KEY_BITS = 256"));
+        assert!(aes_sv.contains("parameter int C_ROUNDS   = 14"));
+        assert!(aes_sv.contains("gf128_mul_step"));
+
+        let sha256_sv = generate_sha256_sv();
+        assert!(sha256_sv.contains("module sha256_core"));
+        assert!(sha256_sv.contains("32'h6a09e667"));
+
+        let sha3_sv = generate_sha3_keccak_sv();
+        assert!(sha3_sv.contains("module sha3_keccak_f1600"));
+        assert!(sha3_sv.contains("sha3_256_digest"));
+
+        let chacha_sv = generate_chacha20_poly1305_sv();
+        assert!(chacha_sv.contains("module chacha20_poly1305_aead"));
+        assert!(chacha_sv.contains("32'h61707865"));
+
+        let trng_sv = generate_trng_nist_sv(8, 16, 325);
+        assert!(trng_sv.contains("module trng_ro_nist_90b"));
+        assert!(trng_sv.contains("health_rct_error"));
+        assert!(trng_sv.contains("health_apt_error"));
+        assert!(trng_sv.contains("vn_first_bit"));
     }
 }
