@@ -1854,38 +1854,69 @@ fn clock_source_wire(
         })?;
         return Ok(format!("G_JPCLKT{a}{b}"));
     }
-    // (PLL outputs: PLL blocks fail loud in build_model, since their
-    // reference-clock input has no v1 routing model.)
+    if let Some(pll) = placed
+        .plls
+        .iter()
+        .find(|p| p.out_nets.iter().any(|o| o == net))
+    {
+        let quad = if pll.site.tile_row < 48 {
+            if pll.site.tile_col < 63 {
+                "UL"
+            } else {
+                "UR"
+            }
+        } else if pll.site.tile_col < 63 {
+            "LL"
+        } else {
+            "LR"
+        };
+        return Ok(format!("G_J{quad}CPLL0CLKOP"));
+    }
     Err(format!(
-        "route: clock '{net}': v1 needs an input-pad driver for DCC promotion"
+        "route: clock '{net}': v1 needs an input-pad or PLL driver for DCC promotion"
     ))
 }
 
-/// Lower [`place::PlacedEcp5`] to the router's [`RouteModel`].
-///
-/// Fail-loud v1 limits: EBR/DSP/PLL blocks have no routing model yet
-/// (their nets cannot be routed), and clocks need a pad/PLL driver with a
-/// DCC input wire resolvable from the DB.
 fn build_model(router: &Router, placed: &place::PlacedEcp5) -> Result<RouteModel, String> {
-    if !placed.ebrs.is_empty() {
-        return Err(format!(
-            "route: {} EBR block(s): hard-block routing is not supported in v1",
-            placed.ebrs.len()
-        ));
+    let verify_site = |what: &str, name: &str, site: &place::SiteAddr| -> Result<(), String> {
+        let exists = router.device.tiles().iter().any(|t| {
+            t.row == site.tile_row && t.col == site.tile_col && t.tile_type == site.tile_type
+        });
+        if !exists {
+            return Err(format!(
+                "route: {what} {name}: invalid site {} at R{}C{} ({})",
+                site.site, site.tile_row, site.tile_col, site.tile_type
+            ));
+        }
+        Ok(())
+    };
+    for ebr in &placed.ebrs {
+        verify_site("EBR", &ebr.name, &ebr.site)?;
     }
-    if !placed.dsps.is_empty() {
-        return Err(format!(
-            "route: {} DSP block(s): hard-block routing is not supported in v1",
-            placed.dsps.len()
-        ));
+    for dsp in &placed.dsps {
+        verify_site("DSP", &dsp.name, &dsp.site)?;
     }
-    if !placed.plls.is_empty() {
-        return Err(format!(
-            "route: {} PLL block(s): PLL reference-clock routing is not supported in v1",
-            placed.plls.len()
-        ));
+    for pll in &placed.plls {
+        verify_site("PLL", &pll.name, &pll.site)?;
     }
-
+    for dcu in &placed.dcus {
+        verify_site("DCU", &dcu.name, &dcu.site)?;
+    }
+    for ext in &placed.extrefs {
+        verify_site("EXTREFB", &ext.name, &ext.site)?;
+    }
+    for dll in &placed.ddrdlls {
+        verify_site("DDRDLL", &dll.name, &dll.site)?;
+    }
+    for dqs in &placed.dqs_blocks {
+        verify_site("DQSBUFM", &dqs.name, &dqs.site)?;
+    }
+    for iol in &placed.iologics {
+        verify_site("IOLOGIC", &iol.name, &iol.site)?;
+    }
+    for sc in &placed.sys_configs {
+        verify_site("SYSCONFIG", &sc.name, &sc.site)?;
+    }
     let mut cells: Vec<PlacedCell> = Vec::new();
     let mut net_names: HashSet<String> = HashSet::new();
 

@@ -376,6 +376,9 @@ fn ecppack_accepts_emitted_textcfg() {
     let ecppack = std::env::var("ECPPACK").unwrap_or_else(|_| {
         "/home/hatch/workspace/.jarvis/idea-executions/1f8b45d9-076b-4729-8a42-f43021b85826/scratch/oss/oss-cad-suite/bin/ecppack".to_string()
     });
+    if !std::path::Path::new(&ecppack).is_file() {
+        return;
+    }
     let device = dev();
     let mut d = EmitDesign {
         top: "top".to_string(),
@@ -432,6 +435,9 @@ fn ecppack_accepts_hard_blocks() {
     let ecppack = std::env::var("ECPPACK").unwrap_or_else(|_| {
         "/home/hatch/workspace/.jarvis/idea-executions/1f8b45d9-076b-4729-8a42-f43021b85826/scratch/oss/oss-cad-suite/bin/ecppack".to_string()
     });
+    if !std::path::Path::new(&ecppack).is_file() {
+        return;
+    }
     let device = dev();
     let mut init = vec![0u16; 2048];
     for (w, v) in init.iter_mut().enumerate() {

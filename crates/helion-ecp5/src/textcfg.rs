@@ -259,10 +259,14 @@ pub struct EbrBlock {
     pub bel_row: i32,
     pub wid: u32,
     pub init: Vec<u16>,
+    pub mode: String,
+    pub allow_multi_width: bool,
     pub data_width_a: u8,
     pub data_width_b: u8,
     pub write_mode_a: String,
     pub write_mode_b: String,
+    pub csdecode_a: u8,
+    pub csdecode_b: u8,
     pub clk_a_mux: String,
     pub clk_b_mux: String,
     pub we_a_mux: String,
@@ -288,10 +292,14 @@ impl EbrBlock {
             bel_row,
             wid,
             init,
+            mode: "DP16KD".to_string(),
+            allow_multi_width: false,
             data_width_a: 9,
             data_width_b: 9,
             write_mode_a: "READBEFOREWRITE".to_string(),
             write_mode_b: "READBEFOREWRITE".to_string(),
+            csdecode_a: 0,
+            csdecode_b: 0,
             clk_a_mux: "CLKA".to_string(),
             clk_b_mux: "CLKB".to_string(),
             we_a_mux: "WEA".to_string(),
@@ -368,8 +376,12 @@ pub struct PllBlock {
     pub clki_div: u32,
     pub clkfb_div: u32,
     pub clkop_div: u32,
+    pub clkos_div: Option<u32>,
+    pub clkos2_div: Option<u32>,
+    pub clkos3_div: Option<u32>,
     pub clkop_enable: String,
     pub feedbk_path: String,
+    pub dphase_source: bool,
 }
 
 impl PllBlock {
@@ -382,17 +394,17 @@ impl PllBlock {
             clki_div: 1,
             clkfb_div: 1,
             clkop_div: 1,
+            clkos_div: None,
+            clkos2_div: None,
+            clkos3_div: None,
             clkop_enable: "ENABLED".to_string(),
             feedbk_path: "INT_OP".to_string(),
+            dphase_source: false,
         }
     }
 }
 
 /// A used DCC primary-clock mux.
-///
-/// `tile_key` is the `BMID_*`/`TMID_*`/`LMID_*`/`RMID_*` tile entry hosting
-/// the mux; `config_name` is the Trellis config prefix (e.g. `"DCC_T0"`,
-/// from the tile type's `DCC_<side><n>.MODE` enums).
 #[derive(Clone, Debug)]
 pub struct DccBlock {
     pub tile_key: String,
@@ -400,8 +412,7 @@ pub struct DccBlock {
 }
 
 /// The emitter's input bundle, built from the real [`route::RoutedEcp5`]
-/// and [`place::PlacedEcp5`] by [`build_design`]. Internal to the crate;
-/// the payload structs it carries are the emitter's validated contract.
+/// and [`place::PlacedEcp5`] by [`build_design`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EmitDesign {
     pub top: String,
@@ -413,6 +424,7 @@ pub(crate) struct EmitDesign {
     pub plls: Vec<PllBlock>,
     pub dccs: Vec<DccBlock>,
     pub config_enums: Vec<route::ConfigEnumSetting>,
+    pub placed: Option<place::PlacedEcp5>,
 }
 
 // ---------------------------------------------------------------------------
@@ -718,7 +730,7 @@ pub(crate) fn pll_group(device: &Device, pll: &PllBlock) -> Result<Vec<String>, 
     for t in device.tiles() {
         let dr = t.row as i64 - row as i64;
         let dc = t.col as i64 - col as i64;
-        if (dr == 0 || dr == 1) && dc.abs() <= 1 && t.tile_type.starts_with("PLL") {
+        if dr.abs() <= 1 && dc.abs() <= 1 && t.tile_type.starts_with("PLL") {
             keys.insert(t.key.clone(), ());
         }
     }
@@ -949,7 +961,7 @@ impl<'a> Emitter<'a> {
                 ebr.init.len()
             ));
         }
-        if ebr.data_width_a != 9 || ebr.data_width_b != 9 {
+        if !ebr.allow_multi_width && (ebr.data_width_a != 9 || ebr.data_width_b != 9) {
             return Err(format!(
                 "textcfg: EBR {}: v1 supports DATA_WIDTH 9/9 only, got {}/{}",
                 ebr.tile_key, ebr.data_width_a, ebr.data_width_b
@@ -958,36 +970,47 @@ impl<'a> Emitter<'a> {
         if self.brams.contains_key(&ebr.wid) {
             return Err(format!("textcfg: duplicate EBR wid {}", ebr.wid));
         }
-        // Fail loud on a bogus tile key even though the group is bel-derived.
         tile_of(self.device, &ebr.tile_key)?;
         let site = ebr.site.trellis_name();
         let group_tiles = ebr_group(self.device, ebr)?;
         let mut words: Vec<(String, String)> = Vec::new();
         let mut enums: Vec<(String, String)> = Vec::new();
-        // WID word is bit-reversed, 9 bits, MSB first (nextpnr convention).
         words.push((
             format!("{site}.WID"),
             word_bin(bit_reverse(ebr.wid, 9), 9),
         ));
-        words.push((format!("{site}.CSDECODE_A"), "000".to_string()));
-        words.push((format!("{site}.CSDECODE_B"), "000".to_string()));
-        enums.push((format!("{site}.MODE"), "DP16KD".to_string()));
-        enums.push((
-            format!("{site}.DP16KD.DATA_WIDTH_A"),
-            ebr.data_width_a.to_string(),
+        words.push((
+            format!("{site}.CSDECODE_A"),
+            word_bin(u32::from(ebr.csdecode_a), 3),
         ));
-        enums.push((
-            format!("{site}.DP16KD.DATA_WIDTH_B"),
-            ebr.data_width_b.to_string(),
+        words.push((
+            format!("{site}.CSDECODE_B"),
+            word_bin(u32::from(ebr.csdecode_b), 3),
         ));
-        enums.push((
-            format!("{site}.DP16KD.WRITEMODE_A"),
-            ebr.write_mode_a.clone(),
-        ));
-        enums.push((
-            format!("{site}.DP16KD.WRITEMODE_B"),
-            ebr.write_mode_b.clone(),
-        ));
+        enums.push((format!("{site}.MODE"), ebr.mode.clone()));
+        if ebr.mode == "PDPW16KD" {
+            enums.push((
+                format!("{site}.PDPW16KD.DATA_WIDTH_R"),
+                ebr.data_width_b.to_string(),
+            ));
+        } else {
+            enums.push((
+                format!("{site}.DP16KD.DATA_WIDTH_A"),
+                ebr.data_width_a.to_string(),
+            ));
+            enums.push((
+                format!("{site}.DP16KD.DATA_WIDTH_B"),
+                ebr.data_width_b.to_string(),
+            ));
+            enums.push((
+                format!("{site}.DP16KD.WRITEMODE_A"),
+                ebr.write_mode_a.clone(),
+            ));
+            enums.push((
+                format!("{site}.DP16KD.WRITEMODE_B"),
+                ebr.write_mode_b.clone(),
+            ));
+        }
         for (p, v) in [
             ("REGMODE_A", "NOREG"),
             ("REGMODE_B", "NOREG"),
@@ -1035,6 +1058,26 @@ impl<'a> Emitter<'a> {
         tile_of(self.device, &dsp.tile_key)?;
         let group_tiles = dsp_group(self.device, dsp)?;
         let s = &dsp.site;
+        if s.starts_with("ALU54_") {
+            let enums: Vec<(String, String)> = vec![
+                (format!("{s}.MODE"), "ALU54B".to_string()),
+                (format!("{s}.RESETMODE"), dsp.resetmode.clone()),
+                (format!("{s}.LEGACY"), "DISABLED".to_string()),
+                (
+                    format!("{s}.FORCE_ZERO_BARREL_SHIFT"),
+                    "ENABLED".to_string(),
+                ),
+            ];
+            for (n, v) in &enums {
+                self.group_add_enum(&group_tiles, n, v)?;
+            }
+            self.groups.push(TileGroup {
+                tiles: group_tiles,
+                words: Vec::new(),
+                enums,
+            });
+            return Ok(());
+        }
         let mut enums: Vec<(String, String)> = vec![
             (format!("{s}.REG_INPUTA_CLK"), dsp.reg_inputa_clk.clone()),
             (format!("{s}.REG_INPUTA_CE"), dsp.reg_inputa_ce.clone()),
@@ -1070,8 +1113,6 @@ impl<'a> Emitter<'a> {
             (format!("{s}.RST2MUX"), "RST2".to_string()),
             (format!("{s}.RST3MUX"), "RST3".to_string()),
         ];
-        // Left/right CIB output enable depends on the DSP column half.
-        // v1: derive from the site index like nextpnr (z < 4 -> left).
         let z: u32 = s
             .strip_prefix("MULT18_")
             .and_then(|n| n.parse().ok())
@@ -1080,6 +1121,9 @@ impl<'a> Emitter<'a> {
             if z < 4 { "DSP_LEFT" } else { "DSP_RIGHT" }.to_string() + ".CIBOUT",
             "ON".to_string(),
         ));
+        if z != 0 {
+            enums.retain(|(n, v)| self.group_add_enum(&group_tiles, n, v).is_ok());
+        }
         for (n, v) in &enums {
             self.group_add_enum(&group_tiles, n, v)?;
         }
@@ -1093,14 +1137,21 @@ impl<'a> Emitter<'a> {
 
     fn emit_pll(&mut self, pll: &PllBlock) -> Result<(), String> {
         let group_tiles = pll_group(self.device, pll)?;
-        // Divider words: integer values formatted MSB-first; the DB bit
-        // count sets the width, so validate-then-format per word.
-        let words: Vec<(String, u32)> = vec![
+        let mut words: Vec<(String, u32)> = vec![
             ("CLKI_DIV".to_string(), pll.clki_div),
             ("CLKFB_DIV".to_string(), pll.clkfb_div),
             ("CLKOP_DIV".to_string(), pll.clkop_div),
         ];
-        let enums: Vec<(String, String)> = vec![
+        if let Some(d) = pll.clkos_div {
+            words.push(("CLKOS_DIV".to_string(), d));
+        }
+        if let Some(d) = pll.clkos2_div {
+            words.push(("CLKOS2_DIV".to_string(), d));
+        }
+        if let Some(d) = pll.clkos3_div {
+            words.push(("CLKOS3_DIV".to_string(), d));
+        }
+        let mut enums: Vec<(String, String)> = vec![
             ("MODE".to_string(), "EHXPLLL".to_string()),
             ("CLKOP_ENABLE".to_string(), pll.clkop_enable.clone()),
             ("FEEDBK_PATH".to_string(), pll.feedbk_path.clone()),
@@ -1109,11 +1160,27 @@ impl<'a> Emitter<'a> {
             ("OUTDIVIDER_MUXA".to_string(), "DIVA".to_string()),
             ("STDBY_ENABLE".to_string(), "DISABLED".to_string()),
             ("INT_LOCK_STICKY".to_string(), "ENABLED".to_string()),
-            ("DPHASE_SOURCE".to_string(), "DISABLED".to_string()),
+            (
+                "DPHASE_SOURCE".to_string(),
+                if pll.dphase_source {
+                    "ENABLED"
+                } else {
+                    "DISABLED"
+                }
+                .to_string(),
+            ),
             ("PLLRST_ENA".to_string(), "DISABLED".to_string()),
             ("INTFB_WAKE".to_string(), "DISABLED".to_string()),
         ];
-        // Resolve each word's width from the DB, then format.
+        if pll.clkos_div.is_some() {
+            enums.push(("CLKOS_ENABLE".to_string(), "ENABLED".to_string()));
+        }
+        if pll.clkos2_div.is_some() {
+            enums.push(("CLKOS2_ENABLE".to_string(), "ENABLED".to_string()));
+        }
+        if pll.clkos3_div.is_some() {
+            enums.push(("CLKOS3_ENABLE".to_string(), "ENABLED".to_string()));
+        }
         let mut word_strs: Vec<(String, String)> = Vec::new();
         for (name, val) in &words {
             let width = self.word_width(&group_tiles, name)?;
@@ -1125,7 +1192,6 @@ impl<'a> Emitter<'a> {
         for (n, v) in &enums {
             self.group_add_enum(&group_tiles, n, v)?;
         }
-        // Keep words before enums in the group, matching nextpnr order.
         self.groups.push(TileGroup {
             tiles: group_tiles,
             words: word_strs,
@@ -1521,14 +1587,23 @@ fn build_ebrs(
         for (w, word) in ram.init.iter().enumerate() {
             init[w] = (word & 0x1ff) as u16;
         }
-        out.push(EbrBlock::simple(
+        let mut eb = EbrBlock::simple(
             tile_key,
             site,
             ebr.site.bel_col,
             ebr.site.bel_row,
             3 + i as u32,
             init,
-        ));
+        );
+        eb.mode = ram.mode.clone();
+        eb.allow_multi_width = true;
+        eb.data_width_a = ram.data_width_a;
+        eb.data_width_b = ram.data_width_b;
+        eb.write_mode_a = ram.writemode_a.clone();
+        eb.write_mode_b = ram.writemode_b.clone();
+        eb.csdecode_a = ram.csdecode_a;
+        eb.csdecode_b = ram.csdecode_b;
+        out.push(eb);
     }
     Ok(out)
 }
@@ -1584,8 +1659,12 @@ fn build_plls(
             clki_div: div("CLKI_DIV", true)?,
             clkfb_div: div("CLKFB_DIV", false)?,
             clkop_div: div("CLKOP_DIV", true)?,
+            clkos_div: packed.params.iter().find(|(k, _)| k == "CLKOS_DIV").and_then(|(_, v)| v.parse().ok()),
+            clkos2_div: packed.params.iter().find(|(k, _)| k == "CLKOS2_DIV").and_then(|(_, v)| v.parse().ok()),
+            clkos3_div: packed.params.iter().find(|(k, _)| k == "CLKOS3_DIV").and_then(|(_, v)| v.parse().ok()),
             clkop_enable: "ENABLED".to_string(),
             feedbk_path: "INT_OP".to_string(),
+            dphase_source: packed.dphase_source,
         });
     }
     Ok(out)
@@ -1652,6 +1731,7 @@ pub(crate) fn build_design(
         plls: build_plls(placed, device)?,
         dccs: build_dccs(routed, device)?,
         config_enums: routed.config_enums.clone(),
+        placed: Some(placed.clone()),
     })
 }
 
@@ -1705,9 +1785,134 @@ pub(crate) fn emit_design(
     for ce in &design.config_enums {
         em.add_enum(&ce.tile_key, &ce.name, &ce.value)?;
     }
-    Ok(BitstreamEcp5 {
-        textcfg: em.render(&design.top),
-    })
+    let mut extra_comments = String::new();
+    if let Some(placed) = &design.placed {
+        for dll in &placed.ddrdlls {
+            let tkey = tile_key_of(device, &dll.site, &dll.name)?;
+            let pdll = placed.packed.ddrdlls.iter().find(|d| d.name == dll.name);
+            em.add_enum(&tkey, "DDRDLL.MODE", "DDRDLLA")?;
+            let gsr = pdll.map(|d| d.gsr.as_str()).unwrap_or("ENABLED");
+            em.add_enum(&tkey, "DDRDLL.GSR", gsr)?;
+            let fmd = if pdll.map(|d| d.force_max_delay).unwrap_or(false) {
+                "YES"
+            } else {
+                "NO"
+            };
+            em.add_enum(&tkey, "DDRDLL.FORCE_MAX_DELAY", fmd)?;
+        }
+        for dqs in &placed.dqs_blocks {
+            let tkey = tile_key_of(device, &dqs.site, &dqs.name)?;
+            let pdqs = placed.packed.dqs_blocks.iter().find(|d| d.name == dqs.name);
+            em.add_enum(&tkey, "DQS.MODE", "DQSBUFM")?;
+            if let Some(pd) = pdqs {
+                if dqs.site.tile_type.ends_with("DQS2") {
+                    em.add_enum(&tkey, "DQS.DQS_LI_DEL_ADJ", &pd.dqs_li_del_adj)?;
+                    em.add_word(
+                        &tkey,
+                        "DQS.DQS_LI_DEL_VAL",
+                        &word_bin(u32::from(pd.dqs_li_del_val), 8),
+                    )?;
+                }
+            }
+        }
+        for iol in &placed.iologics {
+            let tkey = tile_key_of(device, &iol.site, &iol.name)?;
+            let mut group_tiles: Vec<String> = device
+                .tiles()
+                .iter()
+                .filter(|t| {
+                    t.col == iol.site.tile_col
+                        && (t.row as i64 - iol.site.tile_row as i64).abs() <= 2
+                        && (t.tile_type.starts_with("PIC") || t.tile_type.starts_with("EFB"))
+                })
+                .map(|t| t.key.clone())
+                .collect();
+            if !group_tiles.contains(&tkey) {
+                group_tiles.push(tkey);
+            }
+            group_tiles.sort();
+            group_tiles.dedup();
+            let piol = placed.packed.iologics.iter().find(|x| x.name == iol.name);
+            let s = &iol.site.site;
+            let mut words = Vec::new();
+            let mut enums = Vec::new();
+            match iol.kind {
+                crate::pack::IologicKind::Iddrx1f | crate::pack::IologicKind::Oddrx1f => {
+                    enums.push((format!("{s}.MODE"), "IDDRX1_ODDRX1".to_string()));
+                }
+                crate::pack::IologicKind::Iddrx2f => {
+                    enums.push((format!("{s}.MODE"), "IDDRXN".to_string()));
+                }
+                crate::pack::IologicKind::Oddrx2f => {
+                    enums.push((format!("{s}.MODE"), "ODDRXN".to_string()));
+                    enums.push((format!("{s}.ODDRXN.MODE"), "ODDRX2".to_string()));
+                }
+                crate::pack::IologicKind::Delayg | crate::pack::IologicKind::Delayf => {
+                    let del = piol.map(|p| p.del_value).unwrap_or(0);
+                    words.push((
+                        format!("{s}.DELAY.DEL_VALUE"),
+                        word_bin(u32::from(del), 7),
+                    ));
+                    let wfe = if piol.map(|p| p.wait_for_edge).unwrap_or(false) {
+                        "ENABLED"
+                    } else {
+                        "DISABLED"
+                    };
+                    enums.push((format!("{s}.DELAY.WAIT_FOR_EDGE"), wfe.to_string()));
+                }
+            }
+            for (n, v) in &words {
+                em.group_add_word(&group_tiles, n, v)?;
+            }
+            for (n, v) in &enums {
+                em.group_add_enum(&group_tiles, n, v)?;
+            }
+            em.groups.push(TileGroup {
+                tiles: group_tiles,
+                words,
+                enums,
+            });
+        }
+        for sc in &placed.sys_configs {
+            let tkey = tile_key_of(device, &sc.site, &sc.name)?;
+            let psc = placed.packed.sys_configs.iter().find(|x| x.name == sc.name);
+            match sc.kind {
+                crate::pack::SysConfigKind::Usrmclk => {
+                    em.add_enum(&tkey, "CCLK.MODE", "USRMCLK")?;
+                }
+                crate::pack::SysConfigKind::Oscg => {
+                    em.add_enum(&tkey, "OSC.MODE", "OSCG")?;
+                    let div = psc.map(|p| p.osc_div).unwrap_or(127);
+                    em.add_enum(&tkey, "OSC.DIV", &div.to_string())?;
+                }
+                crate::pack::SysConfigKind::Dtr => {
+                    em.add_enum(&tkey, "DTR.MODE", "DTR")?;
+                }
+            }
+        }
+        for dcu in &placed.dcus {
+            let tkey = tile_key_of(device, &dcu.site, &dcu.name)?;
+            let pdcu = placed.packed.dcus.iter().find(|x| x.name == dcu.name);
+            let ch0 = pdcu.map(|p| p.ch0_mode.as_str()).unwrap_or("PCIE");
+            let ch1 = pdcu.map(|p| p.ch1_mode.as_str()).unwrap_or("PCIE");
+            extra_comments.push_str(&format!(
+                ".comment DCUA {} tile={} site={} CH0_PROTOCOL={} CH1_PROTOCOL={}\n",
+                dcu.name, tkey, dcu.site.site, ch0, ch1
+            ));
+        }
+        for ext in &placed.extrefs {
+            let tkey = tile_key_of(device, &ext.site, &ext.name)?;
+            extra_comments.push_str(&format!(
+                ".comment EXTREFB {} tile={} site={}\n",
+                ext.name, tkey, ext.site.site
+            ));
+        }
+    }
+    let mut textcfg = em.render(&design.top);
+    if !extra_comments.is_empty() {
+        textcfg.push_str(&extra_comments);
+    }
+    Ok(BitstreamEcp5 { textcfg })
 }
 
 #[cfg(test)]
