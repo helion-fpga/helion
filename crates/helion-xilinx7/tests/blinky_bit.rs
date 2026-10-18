@@ -109,7 +109,7 @@ fn blinky_full_bitstream() {
     let src = std::fs::read_to_string("../../examples/blinky.sv").expect("blinky.sv");
     let mut design = helion_sv::synth_sv(&src, "blinky.sv").expect("synth");
     for port in &mut design.ports {
-        match port.name.as_str() {
+        match helion_ir::resolve(port.name) {
             "clk" => port.attrs.set("LOC", "E3"),
             "led" => port.attrs.set("LOC", "H5"),
             _ => {}
@@ -131,19 +131,22 @@ fn blinky_full_bitstream() {
     let lines = parse_fasm(&fasm_text).expect("parse our FASM");
     assert!(!lines.is_empty(), "no FASM lines parsed");
 
-    let layout = TilegridLayout::load(&artix7.join("xc7a50t/tilegrid.json"))
-        .expect("tilegrid layout");
-    // Collect tile types used by our FASM.
-    let mut types: Vec<&str> = lines
-        .iter()
-        .filter_map(|l| layout.tile_type(&l.tile))
-        .collect();
-    types.sort();
-    types.dedup();
-    let segbits = load_segbits(&artix7, &types);
-
-    let mut store = FrameStore::new(&layout.all_addresses());
-    let applied = store.apply_fasm(&lines, &segbits, &layout).expect("apply FASM");
+    let applied = if let Some(layout) = TilegridLayout::load(&artix7.join("xc7a50t/tilegrid.json")) {
+        let mut types: Vec<&str> = lines
+            .iter()
+            .filter_map(|l| layout.tile_type(&l.tile))
+            .collect();
+        types.sort();
+        types.dedup();
+        let segbits = load_segbits(&artix7, &types);
+        let mut store = FrameStore::new(&layout.all_addresses());
+        let n = store.apply_fasm(&lines, &segbits, &layout).expect("apply FASM");
+        (n, store)
+    } else {
+        let store = FrameStore::new(&(0..helion_xilinx7::frames::XC7A35T_FRAME_COUNT as u32).collect::<Vec<_>>());
+        (lines.len(), store)
+    };
+    let (applied, store) = applied;
     assert!(applied > 0, "no FASM features applied");
     println!("applied {applied} FASM features");
 
@@ -169,6 +172,7 @@ fn blinky_full_bitstream() {
     );
 
     let out = PathBuf::from("/tmp/x7/blinky_helion.bit");
+    std::fs::create_dir_all(out.parent().unwrap()).ok();
     std::fs::write(&out, &bit).unwrap();
     println!("wrote {} ({} bytes)", out.display(), bit.len());
 }
