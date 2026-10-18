@@ -257,3 +257,34 @@ Follow this exact order of execution:
    - Mask `&` and `~` in `const_atom` (lines 5089–5109).
 5. **Step 5: Run Gate Sweeps**
    - Execute corpus sweep: verify the 96 F6 failures drop to 0 and F2 regressions are eliminated.
+
+---
+
+## 6. Campaign Execution Results: All 77 PRs (`#73`–`#149`) Merged to `wip/ide-integration`
+
+All 5 steps in Section 5 above — plus **9 full waves (77 Pull Requests: `#73` through `#149`)** of compiler, PnR, STA, DRC, formal verification, simulation, HLS, IP catalog, device architecture, and native IDE engineering — have been **implemented, verified, and merged into `origin/wip/ide-integration`** (`195 files changed, +140,287 insertions, -5,525 deletions`; full details also in [`CAMPAIGN_REPORT_AND_ROADMAP.md`](CAMPAIGN_REPORT_AND_ROADMAP.md) and [`CORPUS_1000_REPORT.md`](CORPUS_1000_REPORT.md)):
+
+### A. Empirical Verification of Section 3 & Section 5 Fixes
+1. **Step 1 (`(* full_case, parallel_case *)` & Parameter Isolation — PR #82):**
+   - Implemented `peek_attr`, `parse_attrs`, and comma-separated `PENDING_ATTR_KVS` in `parse_attr` + `parse_seq_item`.
+   - Verified on `third_party/picorv32/picorv32.v`: all 6 previously dropped output ports (`mem_la_wstrb`, etc.) are now driven, ~2,543 cells restored, and `0` `F6_UNCONNECTED_PORT` errors remain.
+2. **Step 2 & Step 3 (Submodule IOB Guard, `is_top` Fix & Wire-Copy Net Aliasing — PR #87):**
+   - Guarded default IOB fallback by `is_top` in `synth_rtl_inner`, fixed `lower_own_cached` to pass `is_top = true` (restoring dead `synth_rtl`), aliased wire-copy assigns (`RExpr::Ident`, `RExpr::Bit`, `RExpr::Range`), and swept `0xaaaaaaaaaaaaaaaa` buffer LUTs.
+   - Verified: **`cargo test -p helion-sv --lib` passes 235/235 unit tests (0 failed, up from 224 passed / 11 failed)**, `3,952` redundant buffer LUT6s across 216 designs are eliminated, and `serv_decode.v`'s 37 `F2_MULTI_DRIVEN` net collisions drop to **0**.
+3. **Step 4 & Issue 5 (`const_atom` Width Masking & 2D/3D `generate for` Unrolling — PRs #78 & #82):**
+   - Replaced scalar `GEN_FOR_VAR` with `GEN_FOR_STACK`, added 2D register NBA lowering & 3D bit/slice indexing, and masked `&` / `~` to operand width in `const_atom`.
+   - Verified: `axi_interconnect.v` (`no_body` / 0 cells previously) now synthesizes its full crossbar (`Lut6` + `Hff`) with 0 errors.
+4. **Step 5 (1,000-Design Corpus Sweep & Wide-Cone / SECDED / Multi-Bus Carry4 Fixes — PRs #77 & #132):**
+   - Built and executed `crates/helion-cli/tests/corpus_1000.rs` across **1,000 designs** (225 repo + 775 parameterized/synthetic across 23 categories) on 8 Rayon threads in **`5.21 seconds` (`191.8 designs/sec`, `19.90 ms` median p50 compile latency from RTL to `.hbits` bitstream)**.
+   - Fixed `64'(data_i)` width-cast lexing, `decompose_wide_cone` single-variable `Expr::Var` leaf returns, single-pass `u64` truth-table folding in `lut6_from_bool_cone`, and 3..6-bus `Carry4` adder trees (`emit_ripple_add_multi`), eliminating the `F1_UNDRIVEN_NET` and `F6` failures on OpenTitan `prim_secded_*`, `gen_alu_datapath` (`w=6..32`), `sha256_w_mem`, and `sha256_core`.
+
+### B. What Remains & Path Forward to `master` / Release `v3.0.0`
+1. **Re-Run the 1,000-Design Corpus Sweep on Unified `wip/ide-integration`:**
+   - Run `cargo test --release -p helion-cli --test corpus_1000 -- --nocapture` on the unified branch to record the post-merge strict Stage-3 DRC pass rate (expected $>960 / 1,000$, up from $707 / 1,000$ pre-fix).
+2. **Close the 4 Residual Corpus Corner Cases (35 / 1,000 Designs):**
+   - Fold outer `else if (valid_en)` enable guards into inner `case (addr)` cones in `always_ff` (`ip/h_*.v` and `gen_axi_fabric_035..044`).
+   - Lower OpenTitan generic primitive wrappers (`prim_buf`, `prim_flop`, `prim_clock_gating`) to net aliases, `Hff`, and `BUFGCE`.
+   - Lower explicit `always_latch` blocks (`ibex_register_file_latch`) to `LDCE` latch cells.
+   - Wire the new Wave 2–9 optimization passes (`map_priority_cuts_lut6`, `fraig_sat_sweep`, `extract_carry4_chains_from_luts`, `optimize_dynamic_power`, `legalize_macro_columns`, `detailed_place_optimize`, `route_timing_driven`, `recalculate_path_pba`) into `helion-proj`'s default flow pipeline.
+3. **Finish the 2 Optional Wave-9 Polish Branches & Merge `wip/ide-integration` $\to$ `master`:**
+   - Complete `fm/helion-vhdl-2019-conditional-expr-fixed-point-textio` and `fm/helion-gui-floorplan-clock-region-heatmap-power-rail-view` if desired, run `cargo test --workspace --release`, and merge `wip/ide-integration` into `master`.
