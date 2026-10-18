@@ -2417,6 +2417,15 @@ fn collect_loop_schedules(
                 &mut rec_lat,
                 target_clock_ns,
             );
+            // Check for loop-carried array recurrence & #pragma HLS DEPENDENCE overrides
+            let dep_rec_ii = compute_loop_array_recurrence_ii(
+                body,
+                &cdfg.array_configs,
+                pragmas,
+                all_directives,
+                muls_per_iter,
+            );
+            rec_lat = rec_lat.max(dep_rec_ii);
 
             let mut res_ii = 1u32;
             for &cnt in bank_accesses.values() {
@@ -2465,6 +2474,72 @@ fn collect_loop_schedules(
             });
         }
     }
+}
+
+fn compute_loop_array_recurrence_ii(
+    body: &[CStmt],
+    array_configs: &BTreeMap<String, ArrayBankConfig>,
+    loop_pragmas: &[HlsDirective],
+    all_directives: &[HlsDirective],
+    muls_per_iter: usize,
+) -> u32 {
+    let mut reads = Vec::new();
+    let mut writes = Vec::new();
+    collect_stmt_rw(body, &mut reads, &mut writes);
+
+    let mut max_rec_ii = 1u32;
+    for w_arr in &writes {
+        if !reads.contains(w_arr) {
+            continue;
+        }
+        if array_configs.get(w_arr).is_some_and(|c| c.is_registers) {
+            continue;
+        }
+        // Check if this variable is an array (written via ArrayElem)
+        let is_array_write = body.iter().any(|s| {
+            matches!(
+                s,
+                CStmt::Assign {
+                    lhs: LValue::ArrayElem { array, .. },
+                    ..
+                } if array == w_arr
+            )
+        });
+        if !is_array_write {
+            continue;
+        }
+
+        // Base memory-to-memory recurrence latency: 2 cycles (BRAM load + store), or 4 cycles with DSP multiply
+        let rec_cycles: u32 = if muls_per_iter > 0 { 4 } else { 2 };
+
+        // Check for `#pragma HLS DEPENDENCE` matching `w_arr`
+        let dep_dir = loop_pragmas
+            .iter()
+            .chain(all_directives.iter())
+            .filter_map(|d| match d {
+                HlsDirective::Dependence(dd)
+                    if dd.variable == *w_arr || dd.variable == "*" =>
+                {
+                    Some(dd)
+                }
+                _ => None,
+            })
+            .last();
+
+        if let Some(dd) = dep_dir {
+            if !dd.dependent {
+                // `#pragma HLS DEPENDENCE variable=... inter false` removes loop-carried recurrence
+                continue;
+            }
+            let dist = dd.distance.unwrap_or(1).max(1);
+            let ii = (rec_cycles + dist - 1) / dist;
+            max_rec_ii = max_rec_ii.max(ii);
+        } else {
+            // Default conservative inter-iteration array recurrence (distance = 1)
+            max_rec_ii = max_rec_ii.max(rec_cycles);
+        }
+    }
+    max_rec_ii
 }
 
 #[allow(clippy::too_many_arguments)]
