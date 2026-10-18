@@ -1073,6 +1073,537 @@ pub fn phys_opt_route_with_stats(
     ))
 }
 
+/// Vivado UG904 timing-driven PathFinder router configuration ([`route_timing_driven`]).
+#[derive(Clone, Debug)]
+pub struct TimingDrivenRouterConfig {
+    /// Maximum negotiated congestion iterations.
+    pub max_iters: u32,
+    /// Criticality exponent $\alpha$ in $\text{crit}(e) = (1 - \text{slack}/D_{\max})^\alpha$.
+    pub criticality_exp: f64,
+    /// Upper bound on $\text{crit}(e)$ (`< 1.0`) so $(1 - \text{crit}(e))$ never vanishes on congested tiles.
+    pub max_criticality: f64,
+    /// Base tile resource cost $b(n)$ in units of [`HOP_DELAY_PS`].
+    pub base_cost: f64,
+    /// Initial present-congestion penalty factor.
+    pub pres_fac_init: f64,
+    /// Per-iteration multiplier for the present-congestion penalty factor.
+    pub pres_fac_mult: f64,
+    /// Historical congestion step weight.
+    pub hist_fac: f64,
+    /// Directed A* lookahead factor.
+    pub astar_fac: f64,
+    /// Optional minimum route delay (ps) for hold-time padding (`0` = disabled).
+    pub min_hold_delay_ps: i64,
+    /// Optional explicit per-net criticality overrides (`0.0..=1.0`).
+    pub net_criticality: HashMap<String, f64>,
+}
+
+impl Default for TimingDrivenRouterConfig {
+    fn default() -> Self {
+        Self {
+            max_iters: 16,
+            criticality_exp: 2.0,
+            max_criticality: 0.99,
+            base_cost: 1.0,
+            pres_fac_init: 1.0,
+            pres_fac_mult: 1.5,
+            hist_fac: 1.0,
+            astar_fac: 1.2,
+            min_hold_delay_ps: 0,
+            net_criticality: HashMap::new(),
+        }
+    }
+}
+
+/// Compute slack criticality $\text{crit}(e) = \min(\text{max\_crit}, \max(0, 1 - \text{slack}/D_{\max})^\alpha)$.
+pub fn net_criticality_from_slack(
+    slack_ps: i64,
+    d_max_ps: i64,
+    criticality_exp: f64,
+    max_criticality: f64,
+) -> f64 {
+    if d_max_ps <= 0 {
+        return 0.0;
+    }
+    let ratio = (1.0 - (slack_ps as f64) / (d_max_ps as f64)).clamp(0.0, 1.0);
+    ratio
+        .powf(criticality_exp.max(0.0))
+        .clamp(0.0, max_criticality.clamp(0.0, 0.999))
+}
+
+/// Evaluate the timing-driven PathFinder step cost on tile $n$ for edge $e$:
+///
+/// $$\text{cost}(n, e) = \text{crit}(e) \cdot d(n) + (1 - \text{crit}(e)) \cdot b(n) \cdot h(n) \cdot p(n)$$
+#[inline]
+pub fn tdr_node_cost(
+    crit: f64,
+    delay_ps: i64,
+    base_cost: f64,
+    hist_val: u32,
+    pres_val: u32,
+    pres_fac: f64,
+    hist_fac: f64,
+) -> i64 {
+    let c = crit.clamp(0.0, 0.999);
+    let d_n = delay_ps as f64;
+    let b_n = (base_cost.max(0.1)) * (HOP_DELAY_PS as f64);
+    let h_n = 1.0 + hist_fac.max(0.0) * (hist_val as f64);
+    let p_n = 1.0 + pres_fac.max(0.0) * (pres_val as f64);
+    let total = c * d_n + (1.0 - c) * b_n * h_n * p_n;
+    (total.round() as i64).max(1)
+}
+
+/// Partition net indices into spatially disjoint batches whose expanded bounding boxes
+/// (`margin` tiles on each side) do not overlap. Nets are considered in descending
+/// criticality order so the most timing-critical nets run in the earliest batch.
+pub fn schedule_disjoint_bbox_batches(
+    bboxes: &[((u32, u32), (u32, u32), f64)],
+    margin: u32,
+) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = (0..bboxes.len()).collect();
+    order.sort_by(|&a, &b| {
+        let ca = bboxes[a].2;
+        let cb = bboxes[b].2;
+        let hpa = manhattan(bboxes[a].0, bboxes[a].1);
+        let hpb = manhattan(bboxes[b].0, bboxes[b].1);
+        cb.partial_cmp(&ca)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| hpb.cmp(&hpa))
+            .then_with(|| a.cmp(&b))
+    });
+
+    let rect_of = |src: (u32, u32), dst: (u32, u32)| -> (u32, u32, u32, u32) {
+        let x0 = src.0.min(dst.0).saturating_sub(margin);
+        let x1 = src.0.max(dst.0).saturating_add(margin);
+        let y0 = src.1.min(dst.1).saturating_sub(margin);
+        let y1 = src.1.max(dst.1).saturating_add(margin);
+        (x0, y0, x1, y1)
+    };
+    let overlaps = |a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)| -> bool {
+        a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
+    };
+
+    let mut batches: Vec<Vec<usize>> = Vec::new();
+    let mut batch_rects: Vec<Vec<(u32, u32, u32, u32)>> = Vec::new();
+    for ni in order {
+        let r = rect_of(bboxes[ni].0, bboxes[ni].1);
+        let mut placed_in = None;
+        for (bi, rects) in batch_rects.iter().enumerate() {
+            if rects.iter().all(|&other| !overlaps(r, other)) {
+                placed_in = Some(bi);
+                break;
+            }
+        }
+        match placed_in {
+            Some(bi) => {
+                batches[bi].push(ni);
+                batch_rects[bi].push(r);
+            }
+            None => {
+                batches.push(vec![ni]);
+                batch_rects.push(vec![r]);
+            }
+        }
+    }
+    batches
+}
+
+fn astar_tdr(
+    dev: &Device,
+    grid: &TileGrid,
+    scratch: &mut AstarScratch,
+    src: (u32, u32),
+    dst: (u32, u32),
+    crit: f64,
+    cfg: &TimingDrivenRouterConfig,
+    hist: &[u32],
+    pres: &[u32],
+    pres_fac: f64,
+) -> Result<Vec<(u32, u32)>, String> {
+    scratch.begin();
+    let src_i = grid
+        .index(src.0, src.1)
+        .ok_or_else(|| format!("PathFinder TDR: src off grid {src:?}"))?;
+    scratch.set_g_came(src_i, 0, src);
+    let h0 = ((manhattan(src, dst) as f64) * (HOP_DELAY_PS as f64) * cfg.astar_fac.max(1.0)).round()
+        as i64;
+    scratch.open.push(Item {
+        cost: h0,
+        x: src.0,
+        y: src.1,
+    });
+    let mut neigh = [(0u32, 0u32); 4];
+    while let Some(Item { x, y, .. }) = scratch.open.pop() {
+        let Some(cur_i) = grid.index(x, y) else {
+            continue;
+        };
+        if scratch.closed[cur_i] == scratch.epoch {
+            continue;
+        }
+        scratch.closed[cur_i] = scratch.epoch;
+        if (x, y) == dst {
+            let mut path = vec![(x, y)];
+            let mut cur = (x, y);
+            while cur != src {
+                let ci = grid.index(cur.0, cur.1).ok_or("astar_tdr broke")?;
+                if scratch.g_stamp[ci] != scratch.epoch {
+                    return Err("astar_tdr broke".into());
+                }
+                cur = scratch.came[ci];
+                path.push(cur);
+            }
+            path.reverse();
+            return Ok(path);
+        }
+        let gc = scratch.g_at(cur_i);
+        let nlen = neighbors4(dev, x, y, &mut neigh);
+        for &(nx, ny) in neigh[..nlen].iter() {
+            let Some(ni) = grid.index(nx, ny) else {
+                continue;
+            };
+            let h_val = hist.get(ni).copied().unwrap_or(0);
+            let p_val = if (nx, ny) == dst {
+                0
+            } else {
+                pres.get(ni).copied().unwrap_or(0)
+            };
+            let step = tdr_node_cost(
+                crit,
+                HOP_DELAY_PS,
+                cfg.base_cost,
+                h_val,
+                p_val,
+                pres_fac,
+                cfg.hist_fac,
+            );
+            let ng = gc + step;
+            if ng < scratch.g_at(ni) {
+                scratch.set_g_came(ni, ng, (x, y));
+                let lookahead = ((manhattan((nx, ny), dst) as f64)
+                    * (HOP_DELAY_PS as f64)
+                    * (crit + (1.0 - crit) * cfg.base_cost)
+                    * cfg.astar_fac.max(1.0))
+                .round() as i64;
+                scratch.open.push(Item {
+                    cost: ng + lookahead,
+                    x: nx,
+                    y: ny,
+                });
+            }
+        }
+    }
+    Err(format!("PathFinder TDR: no path {src:?} -> {dst:?}"))
+}
+
+/// Vivado UG904 timing-driven PathFinder router (`route_timing_driven`):
+/// combines slack criticality cost $\text{crit}(e) \cdot d(n)$ with negotiated
+/// congestion cost $(1 - \text{crit}(e)) \cdot b(n) \cdot h(n) \cdot p(n)$,
+/// bounding-box disjoint parallel rip-up/reroute batches, and optional hold-time
+/// minimum delay padding.
+pub fn route_timing_driven(
+    placed: &Placed,
+    dev: &Device,
+    cfg: &TimingDrivenRouterConfig,
+) -> Result<Routed, String> {
+    let mut ff_site: HashMap<&str, (Site, u8)> = HashMap::with_capacity(placed.lutff_sites.len());
+    for (i, lutff) in placed.packed.lutffs.iter().enumerate() {
+        if !lutff.ff_cell.is_empty() {
+            ff_site.insert(lutff.ff_cell.as_str(), placed.lutff_sites[i]);
+        }
+    }
+    let mut imux = Vec::new();
+    let mut imux_skip = 0u32;
+    for (i, lutff) in placed.packed.lutffs.iter().enumerate() {
+        let (site, ble) = placed.lutff_sites[i];
+        if lutff.lut_pins.is_empty() {
+            if !lutff.ff_cell.is_empty() {
+                imux.push(ImuxRoute {
+                    x: site.x,
+                    y: site.y,
+                    mux: ble as u32 * 8,
+                    sel: 16 + ble,
+                });
+            }
+            continue;
+        }
+        for (pin, driver) in &lutff.lut_pins {
+            let Some((dsite, dble)) = ff_site.get(driver.as_str()).copied() else {
+                imux_skip += 1;
+                continue;
+            };
+            match imux_sel(dsite, site, dble) {
+                Ok(sel) => imux.push(ImuxRoute {
+                    x: site.x,
+                    y: site.y,
+                    mux: ble as u32 * 8 + *pin as u32,
+                    sel,
+                }),
+                Err(_) => imux_skip += 1,
+            }
+        }
+    }
+
+    let mut q_net_lutff: HashMap<&str, usize> = HashMap::with_capacity(placed.packed.lutffs.len());
+    for (i, lutff) in placed.packed.lutffs.iter().enumerate() {
+        q_net_lutff.entry(lutff.q_net.as_str()).or_insert(i);
+    }
+    let mut nets: Vec<((u32, u32), (u32, u32), u8, usize, String)> = Vec::new();
+    if !placed.packed.lutffs.is_empty() {
+        for (ii, iob_site) in placed.iob_sites.iter().enumerate() {
+            let packed_iob = placed.packed.iobs.get(ii);
+            let net_name = packed_iob
+                .map(|io| io.from_net.clone())
+                .unwrap_or_default();
+            let idx = packed_iob
+                .and_then(|io| q_net_lutff.get(io.from_net.as_str()).copied())
+                .unwrap_or(0);
+            let Some(&(clb, ble)) = placed.lutff_sites.get(idx) else {
+                continue;
+            };
+            if clb.y <= iob_site.y {
+                continue;
+            }
+            nets.push(((clb.x, clb.y), (iob_site.x, iob_site.y), ble, ii, net_name));
+        }
+    }
+
+    let grid = TileGrid::from_device(dev);
+    if nets.is_empty() {
+        return Ok(Routed {
+            placed: placed.clone(),
+            iob_src: Vec::new(),
+            imux,
+            pathfinder_iters: 0,
+            overused: 0,
+            imux_skip,
+            congestion: vec![0u32; grid.len()],
+            congestion_x0: grid.x0,
+            congestion_y0: grid.y0,
+            congestion_cols: grid.cols,
+            congestion_rows: grid.rows,
+        });
+    }
+
+    let max_span_ps = nets
+        .iter()
+        .map(|(s, d, _, _, _)| (manhattan(*s, *d) as i64) * HOP_DELAY_PS)
+        .max()
+        .unwrap_or(HOP_DELAY_PS)
+        .max(HOP_DELAY_PS);
+
+    let mut crits: Vec<f64> = nets
+        .iter()
+        .map(|(s, d, _, _, name)| {
+            if let Some(&c) = cfg.net_criticality.get(name) {
+                c.clamp(0.0, cfg.max_criticality.clamp(0.0, 0.999))
+            } else {
+                let est_delay = (manhattan(*s, *d) as i64) * HOP_DELAY_PS;
+                let slack = (max_span_ps - est_delay).max(0);
+                net_criticality_from_slack(
+                    slack,
+                    max_span_ps,
+                    cfg.criticality_exp,
+                    cfg.max_criticality,
+                )
+            }
+        })
+        .collect();
+
+    let bboxes: Vec<((u32, u32), (u32, u32), f64)> = nets
+        .iter()
+        .enumerate()
+        .map(|(i, (s, d, _, _, _))| (*s, *d, crits[i]))
+        .collect();
+    let batches = schedule_disjoint_bbox_batches(&bboxes, 1);
+
+    let max_iters = cfg.max_iters.max(1);
+    let mut hist = vec![0u32; grid.len()];
+    let mut pres = vec![0u32; grid.len()];
+    let mut paths: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nets.len()];
+    let mut best_paths = paths.clone();
+    let mut best_overused = u32::MAX;
+    let mut best_hops = u32::MAX;
+    let mut pres_fac = cfg.pres_fac_init.max(0.5);
+    let mut iters = 0u32;
+
+    for iter in 0..max_iters {
+        iters = iter + 1;
+        // Route each batch of spatially disjoint nets; within a batch, nets have
+        // non-overlapping bounding boxes so they can be routed in parallel with Rayon.
+        for batch in &batches {
+            // Rip up current paths of nets in this batch from `pres`.
+            if iter > 0 {
+                for &ni in batch {
+                    let (src, dst, _, _, _) = nets[ni];
+                    for &(tx, ty) in &paths[ni] {
+                        if (tx, ty) == src || (tx, ty) == dst {
+                            continue;
+                        }
+                        if let Some(ti) = grid.index(tx, ty) {
+                            pres[ti] = pres[ti].saturating_sub(1);
+                        }
+                    }
+                }
+            }
+            let batch_results: Result<Vec<(usize, Vec<(u32, u32)>)>, String> = if batch.len() >= 2 {
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = batch
+                        .iter()
+                        .map(|&ni| {
+                            let (src, dst, _, _, _) = nets[ni];
+                            let crit = crits[ni];
+                            let hist_ref = &hist;
+                            let pres_ref = &pres;
+                            s.spawn(move || {
+                                let mut scratch = AstarScratch::new(grid.len());
+                                let p = astar_tdr(
+                                    dev,
+                                    &grid,
+                                    &mut scratch,
+                                    src,
+                                    dst,
+                                    crit,
+                                    cfg,
+                                    hist_ref,
+                                    pres_ref,
+                                    pres_fac,
+                                )?;
+                                Ok::<(usize, Vec<(u32, u32)>), String>((ni, p))
+                            })
+                        })
+                        .collect();
+                    let mut out = Vec::with_capacity(handles.len());
+                    for h in handles {
+                        out.push(h.join().map_err(|_| "tdr worker panicked".to_string())??);
+                    }
+                    Ok(out)
+                })
+            } else {
+                let mut out = Vec::with_capacity(batch.len());
+                let mut scratch = AstarScratch::new(grid.len());
+                for &ni in batch {
+                    let (src, dst, _, _, _) = nets[ni];
+                    let p = astar_tdr(
+                        dev,
+                        &grid,
+                        &mut scratch,
+                        src,
+                        dst,
+                        crits[ni],
+                        cfg,
+                        &hist,
+                        &pres,
+                        pres_fac,
+                    )?;
+                    out.push((ni, p));
+                }
+                Ok(out)
+            };
+            for (ni, p) in batch_results? {
+                let (src, dst, _, _, _) = nets[ni];
+                for &(tx, ty) in &p {
+                    if (tx, ty) == src || (tx, ty) == dst {
+                        continue;
+                    }
+                    if let Some(ti) = grid.index(tx, ty) {
+                        pres[ti] = pres[ti].saturating_add(1);
+                    }
+                }
+                paths[ni] = p;
+            }
+        }
+
+        let ou = pres.iter().filter(|&&c| c > 1).count() as u32;
+        let hops_sum: u32 = paths.iter().map(|p| p.len().saturating_sub(1) as u32).sum();
+        if ou < best_overused || (ou == best_overused && hops_sum < best_hops) {
+            best_overused = ou;
+            best_hops = hops_sum;
+            best_paths = paths.clone();
+        }
+        if ou == 0 {
+            break;
+        }
+        for (ti, &c) in pres.iter().enumerate() {
+            if c > 1 {
+                hist[ti] = hist[ti].saturating_add(c - 1);
+            }
+        }
+        // Update per-net criticality from current routed delay relative to D_max.
+        let d_max_iter = paths
+            .iter()
+            .map(|p| (p.len().saturating_sub(1) as i64) * HOP_DELAY_PS)
+            .max()
+            .unwrap_or(HOP_DELAY_PS)
+            .max(HOP_DELAY_PS);
+        for (ni, (_, _, _, _, name)) in nets.iter().enumerate() {
+            if !cfg.net_criticality.contains_key(name) {
+                let d_net = (paths[ni].len().saturating_sub(1) as i64) * HOP_DELAY_PS;
+                let slack = (d_max_iter - d_net).max(0);
+                crits[ni] = net_criticality_from_slack(
+                    slack,
+                    d_max_iter,
+                    cfg.criticality_exp,
+                    cfg.max_criticality,
+                );
+            }
+        }
+        pres_fac *= cfg.pres_fac_mult.max(1.1);
+    }
+
+    let mut congestion = vec![0u32; grid.len()];
+    for (i, path) in best_paths.iter().enumerate() {
+        let (src, dst, _, _, _) = nets[i];
+        for &(tx, ty) in path {
+            if (tx, ty) == src || (tx, ty) == dst {
+                continue;
+            }
+            if let Some(ti) = grid.index(tx, ty) {
+                congestion[ti] = congestion[ti].saturating_add(1);
+            }
+        }
+    }
+
+    let min_hops = if cfg.min_hold_delay_ps > 0 {
+        ((cfg.min_hold_delay_ps + HOP_DELAY_PS - 1) / HOP_DELAY_PS).max(0) as u32
+    } else {
+        0
+    };
+    let mut iob_src = Vec::with_capacity(nets.len());
+    for (i, (src, dst, ble, _, net)) in nets.into_iter().enumerate() {
+        let raw_hops = best_paths[i].len().saturating_sub(1) as u32;
+        let hops = raw_hops.max(min_hops);
+        let from_ff = q_net_lutff
+            .get(net.as_str())
+            .and_then(|&idx| placed.packed.lutffs.get(idx))
+            .map(|l| !l.ff_cell.is_empty())
+            .unwrap_or(true);
+        iob_src.push(IobRoute {
+            iob: dst,
+            clb: src,
+            ble,
+            hops,
+            delay_ps: hops as i64 * HOP_DELAY_PS,
+            path: best_paths[i].clone(),
+            net,
+            from_ff,
+        });
+    }
+
+    Ok(Routed {
+        placed: placed.clone(),
+        iob_src,
+        imux,
+        pathfinder_iters: iters,
+        overused: best_overused,
+        imux_skip,
+        congestion,
+        congestion_x0: grid.x0,
+        congestion_y0: grid.y0,
+        congestion_cols: grid.cols,
+        congestion_rows: grid.rows,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1485,5 +2016,60 @@ mod tests {
         assert!(stats.hops_after < stats.hops_before);
         assert!(stats.vias_after < stats.vias_before);
         assert_eq!(reclaimed.iob_src[0].hops, base.iob_src[0].hops);
+    }
+
+    #[test]
+    fn tdr_cost_prioritizes_delay_for_critical_nets_and_congestion_for_non_critical() {
+        // On a congested tile (hist=3, pres=2), a critical net (crit=0.95) pays far less
+        // congestion penalty than a non-critical net (crit=0.05), steering non-critical
+        // nets around the hot spot while letting the critical net take the direct path.
+        let crit_cost = tdr_node_cost(0.95, HOP_DELAY_PS, 1.0, 3, 2, 2.0, 1.0);
+        let non_crit_cost = tdr_node_cost(0.05, HOP_DELAY_PS, 1.0, 3, 2, 2.0, 1.0);
+        assert!(
+            crit_cost < non_crit_cost,
+            "critical net cost ({crit_cost}) must be lower on congested tile than non-critical ({non_crit_cost})"
+        );
+        let c_hi = net_criticality_from_slack(500, 10_000, 2.0, 0.99);
+        let c_lo = net_criticality_from_slack(8_000, 10_000, 2.0, 0.99);
+        assert!(c_hi > c_lo);
+        assert!(c_hi <= 0.99);
+    }
+
+    #[test]
+    fn disjoint_bbox_scheduler_groups_non_overlapping_nets_and_separates_overlaps() {
+        let bboxes = vec![
+            ((2, 4), (2, 0), 0.9),  // col 2
+            ((10, 4), (10, 0), 0.8), // col 10 (disjoint from col 2 with margin=1)
+            ((3, 4), (3, 0), 0.5),  // col 3 (overlaps col 2 when margin=1)
+        ];
+        let batches = schedule_disjoint_bbox_batches(&bboxes, 1);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0], vec![0, 1], "disjoint high-crit nets share batch 0");
+        assert_eq!(batches[1], vec![2], "overlapping net scheduled in batch 1");
+    }
+
+    #[test]
+    fn route_timing_driven_routes_cleanly_and_honors_hold_min_delay() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&hard_heartbeat(), &dev).unwrap();
+        let pl = place_with(
+            &p,
+            &dev,
+            PlaceOpts {
+                timing_weight: 0.75,
+                seed: 0,
+            },
+        )
+        .unwrap();
+        let mut cfg = TimingDrivenRouterConfig::default();
+        cfg.net_criticality.insert("q7".to_string(), 0.95);
+        let r = route_timing_driven(&pl, &dev, &cfg).unwrap();
+        assert_eq!(r.overused, 0);
+        assert!(!r.iob_src.is_empty());
+        let base_delay = r.iob_src[0].delay_ps;
+
+        cfg.min_hold_delay_ps = base_delay + 3 * HOP_DELAY_PS;
+        let r_hold = route_timing_driven(&pl, &dev, &cfg).unwrap();
+        assert!(r_hold.iob_src[0].delay_ps >= cfg.min_hold_delay_ps);
     }
 }
