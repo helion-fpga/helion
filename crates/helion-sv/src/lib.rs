@@ -1569,6 +1569,12 @@ thread_local! {
         std::cell::RefCell::new(HashSet::new());
     /// Counter for anonymous inline nested packed structs/unions.
     static ANON_PACKED_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Functions defined inside `package ... endpackage` (both bare and `pkg::name`).
+    static PKG_FUNCS: std::cell::RefCell<HashMap<String, FuncDef<'static>>> =
+        std::cell::RefCell::new(HashMap::new());
+    /// String parameter raw values for `$readmemh(MEM_FILE, mem)` parameter paths.
+    static STR_PARAM_VALS: std::cell::RefCell<HashMap<String, String>> =
+        std::cell::RefCell::new(HashMap::new());
     /// Modules whose priority-encoder always @(*) fold was skipped by
     /// `compact_priority_onehot_unroll` after its own validation (>=48 bit
     /// writes, >=75% set-to-1 RHSs, scalar carry). `try_emit_priority_onehot_grant`
@@ -1651,6 +1657,28 @@ fn resolve_interface_member<'a>(p: &P<'a>, sig: &str, member: &str) -> Option<&'
     } else {
         None
     }
+    PKG_FUNCS.with(|m| m.borrow_mut().clear());
+    STR_PARAM_VALS.with(|m| m.borrow_mut().clear());
+}
+
+fn pkg_func_insert(name: String, f: FuncDef<'static>) {
+    PKG_FUNCS.with(|m| {
+        m.borrow_mut().insert(name, f);
+    });
+}
+
+fn pkg_func_get(name: &str) -> Option<FuncDef<'static>> {
+    PKG_FUNCS.with(|m| m.borrow().get(name).cloned())
+}
+
+fn note_str_param_val(name: &str, val: &str) {
+    STR_PARAM_VALS.with(|m| {
+        m.borrow_mut().insert(name.to_string(), val.to_string());
+    });
+}
+
+fn str_param_val_of(name: &str) -> Option<String> {
+    STR_PARAM_VALS.with(|m| m.borrow().get(name).cloned())
 }
 
 fn pkg_enum_type_width(name: &str) -> Option<usize> {
@@ -2381,16 +2409,16 @@ fn harvest_pkg_packed_param<'a>(p: &mut P<'a>) {
                 }
                 _ => {}
             }
-        } else if pkg_param_is_csr_or_mubi(&name) {
+        } else {
             let save = p.i;
-            match parse_rexpr(p) {
-                Ok(e) => {
+            if let Ok(val) = const_u(p) {
+                pkg_enum_insert(name.to_string(), val);
+            } else {
+                p.i = save;
+                if let Ok(e) = parse_rexpr(p) {
                     if let Some(val) = rexpr_const_val(&e) {
                         pkg_enum_insert(name.to_string(), val);
                     }
-                }
-                Err(_) => {
-                    p.i = save;
                 }
             }
         }
@@ -3724,6 +3752,14 @@ fn rhs_unpacked_index(rhs: &RExpr<'_>, rtl: &Rtl) -> bool {
                         continue;
                     }
                     if const_rexpr_usize(base).is_some() {
+                        continue;
+                    }
+                    // Small ROM initialized via $readmemh/$readmemb with no writes lowers to LUTs.
+                    if d <= 64
+                        && rtl.mem_inits.get(*name).is_some_and(|m| !m.is_empty())
+                        && !rtl.nbas.iter().any(|(lhs, _, _)| lhs == name)
+                    {
+                        stack.push(*base);
                         continue;
                     }
                     return true;
@@ -5449,28 +5485,224 @@ fn clog2_u(n: u128) -> u128 {
     }
 }
 
-/// `$bits(type)` / `$bits(pkg::type)` / `$bits(sig)` — harvested enum,
-/// packed-struct, or tracked signal width. Not a generate miss.
+fn rexpr_est_width<'a>(p: &P<'a>, e: &RExpr<'a>) -> usize {
+    match e {
+        RExpr::Ident(s) => p
+            .widths
+            .get(*s)
+            .copied()
+            .or_else(|| typed_width(s))
+            .unwrap_or(1)
+            .max(1),
+        RExpr::Bit(_, _) => 1,
+        RExpr::Range(_, lo, hi) => (*hi).abs_diff(*lo).saturating_add(1).max(1),
+        RExpr::IndexPart { width, .. } => (*width).max(1),
+        RExpr::Const { width, .. } => {
+            if *width == 0 {
+                32
+            } else {
+                (*width).max(1)
+            }
+        }
+        RExpr::Concat(parts) => parts.iter().map(|pt| rexpr_est_width(p, pt)).sum::<usize>().max(1),
+        RExpr::RedAnd(_)
+        | RExpr::RedOr(_)
+        | RExpr::RedXor(_)
+        | RExpr::Eq(_, _)
+        | RExpr::Ne(_, _)
+        | RExpr::Lt(_, _) => 1,
+        RExpr::Not(x) | RExpr::Shl(x, _) | RExpr::Shr(x, _) | RExpr::Ashr(x, _) => {
+            rexpr_est_width(p, x)
+        }
+        RExpr::And(a, b)
+        | RExpr::Or(a, b)
+        | RExpr::Xor(a, b)
+        | RExpr::Add(a, b)
+        | RExpr::Sub(a, b)
+        | RExpr::Mul(a, b) => rexpr_est_width(p, a).max(rexpr_est_width(p, b)),
+        RExpr::Mux(_, t, f) => rexpr_est_width(p, t).max(rexpr_est_width(p, f)),
+        RExpr::Call { name, .. } => pkg_func_get(name).map(|f| f.ret_w.max(1)).unwrap_or(32),
+        RExpr::WordAt { data, .. } => rexpr_est_width(p, data),
+    }
+}
+
+/// `$bits(type)` / `$bits(pkg::type)` / `$bits(sig)` / `$bits(expr)` — harvested enum,
+/// packed-struct, keyword type, tracked signal width, or expression width.
 fn parse_bits_width<'a>(p: &mut P<'a>) -> Result<u128, String> {
     if !p.eat_sym('(') {
         return Err("$bits (".into());
     }
-    let mut name = p.ident()?;
-    if matches!(p.peek(), Some(Tok::Sym(':')))
-        && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
-        && matches!(p.t.get(p.i + 2), Some(Tok::Ident(_)))
-    {
-        p.bump();
-        p.bump();
-        name = p.ident()?;
+    if p.eat_kw("byte") {
+        let _ = p.eat_kw("signed") || p.eat_kw("unsigned");
+        let mult = if matches!(p.peek(), Some(Tok::Sym('['))) {
+            p.width_opt().unwrap_or(1).max(1)
+        } else {
+            1
+        };
+        if !p.eat_sym(')') {
+            return Err("$bits )".into());
+        }
+        return Ok((8 * mult) as u128);
     }
+    if p.eat_kw("shortint") {
+        let _ = p.eat_kw("signed") || p.eat_kw("unsigned");
+        if !p.eat_sym(')') {
+            return Err("$bits )".into());
+        }
+        return Ok(16);
+    }
+    if p.eat_kw("int") || p.eat_kw("integer") {
+        let _ = p.eat_kw("signed") || p.eat_kw("unsigned");
+        if !p.eat_sym(')') {
+            return Err("$bits )".into());
+        }
+        return Ok(32);
+    }
+    if p.eat_kw("longint") {
+        let _ = p.eat_kw("signed") || p.eat_kw("unsigned");
+        if !p.eat_sym(')') {
+            return Err("$bits )".into());
+        }
+        return Ok(64);
+    }
+    if p.eat_kw("logic") || p.eat_kw("bit") || p.eat_kw("reg") || p.eat_kw("wire") {
+        let _ = p.eat_kw("signed") || p.eat_kw("unsigned");
+        let mut w = 1usize;
+        while matches!(p.peek(), Some(Tok::Sym('['))) {
+            w = w.saturating_mul(p.width_opt()?.max(1));
+        }
+        if !p.eat_sym(')') {
+            return Err("$bits )".into());
+        }
+        return Ok(w as u128);
+    }
+    let save = p.i;
+    if let Ok(mut name) = p.ident() {
+        if matches!(p.peek(), Some(Tok::Sym(':')))
+            && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+            && matches!(p.t.get(p.i + 2), Some(Tok::Ident(_)))
+        {
+            p.bump();
+            p.bump();
+            name = p.ident()?;
+        }
+        if p.eat_sym(')') {
+            if let Some(w) = typed_width(&name).or_else(|| p.widths.get(&name).copied()) {
+                return Ok(w as u128);
+            }
+            return Err(format!("$bits unknown {name}"));
+        }
+    }
+    p.i = save;
+    let expr = parse_rexpr(p)?;
     if !p.eat_sym(')') {
         return Err("$bits )".into());
     }
-    typed_width(&name)
-        .or_else(|| p.widths.get(&name).copied())
-        .map(|w| w as u128)
-        .ok_or_else(|| format!("$bits unknown {name}"))
+    Ok(rexpr_est_width(p, &expr) as u128)
+}
+
+fn eval_const_rexpr<'a>(p: &P<'a>, e: &RExpr<'a>) -> Result<u128, String> {
+    match e {
+        RExpr::Const { val, .. } => Ok(*val),
+        RExpr::Ident(s) => p
+            .params
+            .get(*s)
+            .copied()
+            .or_else(|| pkg_enum_get(s))
+            .or_else(|| enum_const_default(s))
+            .ok_or_else(|| format!("non-const ident {s}")),
+        RExpr::Not(x) => Ok(!eval_const_rexpr(p, x)?),
+        RExpr::RedOr(x) => Ok(u128::from(eval_const_rexpr(p, x)? != 0)),
+        RExpr::RedAnd(x) => {
+            let v = eval_const_rexpr(p, x)?;
+            let w = rexpr_est_width(p, x).min(128).max(1);
+            let m = care_mask(w);
+            Ok(u128::from((v & m) == m))
+        }
+        RExpr::RedXor(x) => Ok((eval_const_rexpr(p, x)?.count_ones() % 2) as u128),
+        RExpr::And(a, b) => Ok(eval_const_rexpr(p, a)? & eval_const_rexpr(p, b)?),
+        RExpr::Or(a, b) => Ok(eval_const_rexpr(p, a)? | eval_const_rexpr(p, b)?),
+        RExpr::Xor(a, b) => Ok(eval_const_rexpr(p, a)? ^ eval_const_rexpr(p, b)?),
+        RExpr::Add(a, b) => Ok(eval_const_rexpr(p, a)?.wrapping_add(eval_const_rexpr(p, b)?)),
+        RExpr::Sub(a, b) => Ok(eval_const_rexpr(p, a)?.wrapping_sub(eval_const_rexpr(p, b)?)),
+        RExpr::Mul(a, b) => Ok(eval_const_rexpr(p, a)?.wrapping_mul(eval_const_rexpr(p, b)?)),
+        RExpr::Shl(a, b) => {
+            let sh = (eval_const_rexpr(p, b)? as u32).min(127);
+            Ok(eval_const_rexpr(p, a)?.checked_shl(sh).unwrap_or(0))
+        }
+        RExpr::Shr(a, b) | RExpr::Ashr(a, b) => {
+            let sh = (eval_const_rexpr(p, b)? as u32).min(127);
+            Ok(eval_const_rexpr(p, a)?.checked_shr(sh).unwrap_or(0))
+        }
+        RExpr::Eq(a, b) => Ok(u128::from(eval_const_rexpr(p, a)? == eval_const_rexpr(p, b)?)),
+        RExpr::Ne(a, b) => Ok(u128::from(eval_const_rexpr(p, a)? != eval_const_rexpr(p, b)?)),
+        RExpr::Lt(a, b) => Ok(u128::from(eval_const_rexpr(p, a)? < eval_const_rexpr(p, b)?)),
+        RExpr::Mux(c, t, f) => {
+            if eval_const_rexpr(p, c)? != 0 {
+                eval_const_rexpr(p, t)
+            } else {
+                eval_const_rexpr(p, f)
+            }
+        }
+        RExpr::Concat(parts) => {
+            let mut acc = 0u128;
+            for pt in parts {
+                let w = rexpr_est_width(p, pt).min(128).max(1);
+                let v = eval_const_rexpr(p, pt)? & care_mask(w);
+                acc = (acc.checked_shl(w as u32).unwrap_or(0)) | v;
+            }
+            Ok(acc)
+        }
+        _ => Err("non-const rexpr".into()),
+    }
+}
+
+fn parse_const_arg_val_width<'a>(p: &mut P<'a>) -> Result<(u128, usize, u128), String> {
+    if let Some(Tok::Pat { val, care, width }) = p.peek() {
+        let v = *val;
+        let c = *care;
+        let w = (*width).max(1);
+        p.bump();
+        return Ok((v, w, c));
+    }
+    if let Some(Tok::Number(val, width)) = p.peek() {
+        let v = *val;
+        let w = *width;
+        p.bump();
+        let eff_w = if w == 0 {
+            (u128::BITS - v.leading_zeros()).max(1) as usize
+        } else {
+            w
+        };
+        return Ok((v, eff_w, care_mask(eff_w.min(128))));
+    }
+    let v = const_u(p)?;
+    let eff_w = (u128::BITS - v.leading_zeros()).max(1) as usize;
+    Ok((v, eff_w, care_mask(eff_w.min(128))))
+}
+
+fn parse_ctrl_bit_choice<'a>(p: &mut P<'a>) -> u8 {
+    // Parses '1, '0, 1'b1, 1'b0, 'x, 'z in $countbits(expr, ctrl)
+    if p.eat_sym('\'') {
+        match p.bump() {
+            Some(Tok::Number(1, _)) => return 1,
+            Some(Tok::Number(0, _)) => return 0,
+            Some(Tok::Ident(s)) if s.starts_with('1') || s.eq_ignore_ascii_case("b1") => return 1,
+            Some(Tok::Ident(s)) if s.starts_with('0') || s.eq_ignore_ascii_case("b0") => return 0,
+            _ => return 2, // x/z
+        }
+    }
+    match p.bump() {
+        Some(Tok::Number(v, _)) => {
+            if *v != 0 {
+                1
+            } else {
+                0
+            }
+        }
+        Some(Tok::Pat { .. }) => 2,
+        _ => 1,
+    }
 }
 
 fn const_atom_with_width<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
@@ -5569,6 +5801,91 @@ fn const_atom_with_width<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
             }
             Ok((clog2_u(arg), 32))
         }
+        Some(Tok::Ident(s)) if *s == "$signed" || *s == "$unsigned" => {
+            p.bump();
+            if !p.eat_sym('(') {
+                return Err("$signed/$unsigned (".into());
+            }
+            let v = const_u(p)?;
+            if !p.eat_sym(')') {
+                return Err("$signed/$unsigned )".into());
+            }
+            Ok(v)
+        }
+        Some(Tok::Ident(s)) if *s == "$onehot" || *s == "$onehot0" => {
+            let is_zero_ok = *s == "$onehot0";
+            p.bump();
+            if !p.eat_sym('(') {
+                return Err("$onehot (".into());
+            }
+            let (v, w, c) = parse_const_arg_val_width(p)?;
+            if !p.eat_sym(')') {
+                return Err("$onehot )".into());
+            }
+            let masked = v & c & care_mask(w.min(128).max(1));
+            let ones = masked.count_ones();
+            Ok(u128::from(if is_zero_ok { ones <= 1 } else { ones == 1 }))
+        }
+        Some(Tok::Ident(s)) if *s == "$countones" => {
+            p.bump();
+            if !p.eat_sym('(') {
+                return Err("$countones (".into());
+            }
+            let (v, w, c) = parse_const_arg_val_width(p)?;
+            if !p.eat_sym(')') {
+                return Err("$countones )".into());
+            }
+            let masked = v & c & care_mask(w.min(128).max(1));
+            Ok(masked.count_ones() as u128)
+        }
+        Some(Tok::Ident(s)) if *s == "$countbits" => {
+            p.bump();
+            if !p.eat_sym('(') {
+                return Err("$countbits (".into());
+            }
+            let (v, w, c) = parse_const_arg_val_width(p)?;
+            let mut count_1 = false;
+            let mut count_0 = false;
+            let mut count_x = false;
+            while p.eat_sym(',') {
+                match parse_ctrl_bit_choice(p) {
+                    1 => count_1 = true,
+                    0 => count_0 = true,
+                    _ => count_x = true,
+                }
+            }
+            if !p.eat_sym(')') {
+                return Err("$countbits )".into());
+            }
+            let w = w.min(128).max(1);
+            let mut total = 0u128;
+            for b in 0..w {
+                let is_care = (c >> b) & 1 == 1;
+                let bit_val = (v >> b) & 1 == 1;
+                if !is_care {
+                    if count_x {
+                        total += 1;
+                    }
+                } else if bit_val && count_1 {
+                    total += 1;
+                } else if !bit_val && count_0 {
+                    total += 1;
+                }
+            }
+            Ok(total)
+        }
+        Some(Tok::Ident(s)) if *s == "$isunknown" => {
+            p.bump();
+            if !p.eat_sym('(') {
+                return Err("$isunknown (".into());
+            }
+            let (_, w, c) = parse_const_arg_val_width(p)?;
+            if !p.eat_sym(')') {
+                return Err("$isunknown )".into());
+            }
+            let mask = care_mask(w.min(128).max(1));
+            Ok(u128::from((c & mask) != mask))
+        }
         Some(Tok::Kw(k)) if *k == "unsigned" || *k == "signed" => {
             // `unsigned'(expr)` — keyword form of a size cast. Value is inner.
             p.bump();
@@ -5580,7 +5897,9 @@ fn const_atom_with_width<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
             Ok((v, 0))
         }
         Some(Tok::Ident(s)) => {
-            let mut name = s.to_string();
+            let first = s.to_string();
+            let mut name = first.clone();
+            let mut qualified: Option<String> = None;
             p.bump();
             // `unsigned'(expr)` size cast. The value is the inner const.
             if p.eat_sym('\'') && p.eat_sym('(') {
@@ -5588,14 +5907,16 @@ fn const_atom_with_width<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
                 let _ = p.eat_sym(')');
                 return Ok((v, 0));
             }
-            // `pkg::EnumLit` after skipped packages — resolve the member name.
+            // `pkg::EnumLit` or `pkg::func(...)`.
             if matches!(p.peek(), Some(Tok::Sym(':')))
                 && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
                 && matches!(p.t.get(p.i + 2), Some(Tok::Ident(_)))
             {
                 p.bump();
                 p.bump();
-                name = p.ident()?.to_string();
+                let member = p.ident()?.to_string();
+                qualified = Some(format!("{first}::{member}"));
+                name = member;
             }
             if let Some(v) = p.params.get(&name).copied() {
                 let w = p.widths.get(name.as_str()).copied().unwrap_or(0);
@@ -5606,6 +5927,50 @@ fn const_atom_with_width<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
                 let n = const_u(p)?;
                 let _ = p.eat_sym(')');
                 return Ok((if n > 1 { clog2_u(n) } else { 1 }, 32));
+            }
+            if p.eat_sym('(') {
+                let mut args = Vec::new();
+                if !p.eat_sym(')') {
+                    loop {
+                        args.push(const_u(p)?);
+                        if p.eat_sym(')') {
+                            break;
+                        }
+                        if !p.eat_sym(',') {
+                            return Err("const call ,".into());
+                        }
+                    }
+                }
+                let f = qualified
+                    .as_deref()
+                    .and_then(pkg_func_get)
+                    .or_else(|| pkg_func_get(&name))
+                    .ok_or_else(|| format!("unknown const func {name}"))?;
+                let body = simple_return_assign(&f).ok_or_else(|| format!("complex func {name}"))?;
+                let ins: Vec<_> = f
+                    .ports
+                    .iter()
+                    .filter(|(_, d, _)| *d == PortDir::In)
+                    .cloned()
+                    .collect();
+                let plist = if ins.is_empty() { f.ports.clone() } else { ins };
+                if args.len() != plist.len() {
+                    return Err("const func arity".into());
+                }
+                let mut map = HashMap::new();
+                for (i, (pn, _, pw)) in plist.iter().enumerate() {
+                    let w = (*pw).min(128).max(1);
+                    map.insert(
+                        pn.clone(),
+                        RExpr::Const {
+                            val: args[i] & care_mask(w),
+                            width: w,
+                            care: care_mask(w),
+                        },
+                    );
+                }
+                let inlined = subst_idents(&body, &map, p.arena);
+                return eval_const_rexpr(p, &inlined);
             }
             pkg_enum_get(&name)
                 .or_else(|| enum_const_default(&name))
@@ -6617,7 +6982,15 @@ fn parse_atom_r<'a>(p: &mut P<'a>) -> Result<RExpr<'a>, String> {
             Ok(inner)
         }
         Some(Tok::Ident(s)) => {
-            let name: &'a str = s;
+            let mut name: &'a str = s;
+            if matches!(p.peek(), Some(Tok::Sym(':')))
+                && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+                && matches!(p.t.get(p.i + 2), Some(Tok::Ident(_)))
+            {
+                p.bump();
+                p.bump();
+                name = p.ident()?;
+            }
             // Ibex ALU: `$unsigned(a) + $unsigned(b)`. Value is the inner expr
             // (unsigned/signed cast does not invent bits). Not a generate miss.
             if (name == "$unsigned" || name == "$signed") && p.eat_sym('(') {
@@ -6628,13 +7001,22 @@ fn parse_atom_r<'a>(p: &mut P<'a>) -> Result<RExpr<'a>, String> {
                 return Ok(inner);
             }
             if name == "$clog2" && p.eat_sym('(') {
+                let save_c = p.i;
+                if let Ok(v) = const_u(p) {
+                    if p.eat_sym(')') {
+                        return Ok(RExpr::Const {
+                            val: clog2_u(v),
+                            width: 32,
+                            care: u128::MAX,
+                        });
+                    }
+                }
+                p.i = save_c;
                 let arg = parse_rexpr(p)?;
                 if !p.eat_sym(')') {
                     return Err("$clog2 )".into());
                 }
-                let RExpr::Const { val, .. } = arg else {
-                    return Err("$clog2 needs const".into());
-                };
+                let val = eval_const_rexpr(p, &arg)?;
                 return Ok(RExpr::Const {
                     val: clog2_u(val),
                     width: 32,
@@ -6647,6 +7029,57 @@ fn parse_atom_r<'a>(p: &mut P<'a>) -> Result<RExpr<'a>, String> {
                     val: w,
                     width: 32,
                     care: u128::MAX,
+                });
+            }
+            if (name == "$onehot" || name == "$onehot0") && p.eat_sym('(') {
+                let is_zero_ok = name == "$onehot0";
+                let arg = parse_rexpr(p)?;
+                if !p.eat_sym(')') {
+                    return Err("$onehot )".into());
+                }
+                return lower_onehot_rexpr(p, arg, is_zero_ok);
+            }
+            if name == "$countones" && p.eat_sym('(') {
+                let arg = parse_rexpr(p)?;
+                if !p.eat_sym(')') {
+                    return Err("$countones )".into());
+                }
+                return lower_countbits_rexpr(p, arg, true, false, false);
+            }
+            if name == "$countbits" && p.eat_sym('(') {
+                let arg = parse_rexpr(p)?;
+                let mut count_1 = false;
+                let mut count_0 = false;
+                let mut count_x = false;
+                while p.eat_sym(',') {
+                    match parse_ctrl_bit_choice(p) {
+                        1 => count_1 = true,
+                        0 => count_0 = true,
+                        _ => count_x = true,
+                    }
+                }
+                if !p.eat_sym(')') {
+                    return Err("$countbits )".into());
+                }
+                return lower_countbits_rexpr(p, arg, count_1, count_0, count_x);
+            }
+            if name == "$isunknown" && p.eat_sym('(') {
+                let arg = parse_rexpr(p)?;
+                if !p.eat_sym(')') {
+                    return Err("$isunknown )".into());
+                }
+                if let RExpr::Const { width, care, .. } = arg {
+                    let mask = care_mask(width.min(128).max(1));
+                    return Ok(RExpr::Const {
+                        val: u128::from((care & mask) != mask),
+                        width: 1,
+                        care: 1,
+                    });
+                }
+                return Ok(RExpr::Const {
+                    val: 0,
+                    width: 1,
+                    care: 1,
                 });
             }
             // `fname(a, b)` — inlined after module parse when a FuncDef exists.
@@ -6666,7 +7099,6 @@ fn parse_atom_r<'a>(p: &mut P<'a>) -> Result<RExpr<'a>, String> {
                 }
                 return Ok(RExpr::Call { name, args });
             }
-            // Ident form of a size cast, if the type was not a keyword.
             if matches!(p.peek(), Some(Tok::Sym('\'')))
                 && matches!(p.t.get(p.i + 1), Some(Tok::Sym('(')))
             {
@@ -6831,6 +7263,172 @@ fn parse_atom_r<'a>(p: &mut P<'a>) -> Result<RExpr<'a>, String> {
             }
         }
         other => Err(format!("atom {other:?}")),
+    }
+}
+
+fn extract_expr_bits_lsb<'a>(p: &P<'a>, expr: &RExpr<'a>) -> Vec<RExpr<'a>> {
+    let mut out = Vec::new();
+    match expr {
+        RExpr::Ident(name) => {
+            let w = p.widths.get(*name).copied().unwrap_or(1).max(1).min(64);
+            for b in 0..w {
+                out.push(RExpr::Range(name, b, b));
+            }
+        }
+        RExpr::Range(name, lo, hi) => {
+            let l = (*lo).min(*hi);
+            let h = (*lo).max(*hi);
+            for b in l..=h.min(l + 63) {
+                out.push(RExpr::Range(name, b, b));
+            }
+        }
+        RExpr::Bit(name, b) => {
+            out.push(RExpr::Range(name, *b, *b));
+        }
+        RExpr::Concat(parts) => {
+            for pt in parts.iter().rev() {
+                out.extend(extract_expr_bits_lsb(p, pt));
+            }
+        }
+        other => {
+            let w = rexpr_est_width(p, other).min(64).max(1);
+            for b in 0..w {
+                out.push(bit_extract(other.clone(), b, p.arena));
+            }
+        }
+    }
+    out
+}
+
+fn lower_onehot_rexpr<'a>(
+    p: &P<'a>,
+    arg: RExpr<'a>,
+    is_zero_ok: bool,
+) -> Result<RExpr<'a>, String> {
+    if let RExpr::Const { val, width, care } = arg {
+        let w = if width == 0 { 32 } else { width.min(128).max(1) };
+        let masked = val & care & care_mask(w);
+        let ones = masked.count_ones();
+        return Ok(RExpr::Const {
+            val: u128::from(if is_zero_ok { ones <= 1 } else { ones == 1 }),
+            width: 1,
+            care: 1,
+        });
+    }
+    let bits = extract_expr_bits_lsb(p, &arg);
+    if bits.is_empty() {
+        return Ok(RExpr::Const {
+            val: u128::from(is_zero_ok),
+            width: 1,
+            care: 1,
+        });
+    }
+    let mut seen_one = bits[0].clone();
+    let mut seen_two = RExpr::Const {
+        val: 0,
+        width: 1,
+        care: 1,
+    };
+    for b in bits.into_iter().skip(1) {
+        let both = RExpr::And(p.alloc(seen_one.clone()), p.alloc(b.clone()));
+        seen_two = if matches!(seen_two, RExpr::Const { val: 0, .. }) {
+            both
+        } else {
+            RExpr::Or(p.alloc(seen_two), p.alloc(both))
+        };
+        seen_one = RExpr::Or(p.alloc(seen_one), p.alloc(b));
+    }
+    let not_two = RExpr::Not(p.alloc(seen_two));
+    if is_zero_ok {
+        Ok(not_two)
+    } else {
+        Ok(RExpr::And(p.alloc(seen_one), p.alloc(not_two)))
+    }
+}
+
+fn lower_countbits_rexpr<'a>(
+    p: &P<'a>,
+    arg: RExpr<'a>,
+    count_1: bool,
+    count_0: bool,
+    count_x: bool,
+) -> Result<RExpr<'a>, String> {
+    if let RExpr::Const { val, width, care } = arg {
+        let w = if width == 0 { 32 } else { width.min(128).max(1) };
+        let mut total = 0u128;
+        for b in 0..w {
+            let is_care = (care >> b) & 1 == 1;
+            let bit_val = (val >> b) & 1 == 1;
+            if !is_care {
+                if count_x {
+                    total += 1;
+                }
+            } else if bit_val && count_1 {
+                total += 1;
+            } else if !bit_val && count_0 {
+                total += 1;
+            }
+        }
+        let out_w = (clog2_u((w as u128) + 1) as usize).max(1);
+        return Ok(RExpr::Const {
+            val: total,
+            width: out_w,
+            care: care_mask(out_w),
+        });
+    }
+    let raw_bits = extract_expr_bits_lsb(p, &arg);
+    let n = raw_bits.len().max(1);
+    let out_w = (clog2_u((n as u128) + 1) as usize).max(1);
+    if !count_1 && !count_0 {
+        return Ok(RExpr::Const {
+            val: 0,
+            width: out_w,
+            care: care_mask(out_w),
+        });
+    }
+    if count_1 && count_0 {
+        return Ok(RExpr::Const {
+            val: n as u128,
+            width: out_w,
+            care: care_mask(out_w),
+        });
+    }
+    // Build bitwise ripple counter over the 1-bit terms using pure Xor/And/Or (zero RExpr::Add nodes).
+    let mut acc_bits: Vec<RExpr<'a>> = vec![
+        RExpr::Const {
+            val: 0,
+            width: 1,
+            care: 1,
+        };
+        out_w
+    ];
+    for rb in raw_bits {
+        let term = if count_1 {
+            rb
+        } else {
+            RExpr::Not(p.alloc(rb))
+        };
+        let mut carry = term;
+        for slot in acc_bits.iter_mut() {
+            if matches!(*slot, RExpr::Const { val: 0, .. }) {
+                *slot = carry;
+                carry = RExpr::Const {
+                    val: 0,
+                    width: 1,
+                    care: 1,
+                };
+                break;
+            }
+            let prev = slot.clone();
+            *slot = RExpr::Xor(p.alloc(prev.clone()), p.alloc(carry.clone()));
+            carry = RExpr::And(p.alloc(prev), p.alloc(carry));
+        }
+    }
+    if acc_bits.len() == 1 {
+        Ok(acc_bits.pop().unwrap())
+    } else {
+        let msb_to_lsb: Vec<RExpr<'a>> = acc_bits.into_iter().rev().collect();
+        Ok(RExpr::Concat(msb_to_lsb))
     }
 }
 
@@ -7152,6 +7750,14 @@ fn try_parse_readmem<'a>(p: &mut P<'a>, mem_inits: &mut HashMap<&'a str, BTreeMa
     }
     let path = match p.bump() {
         Some(Tok::Str(s)) => s.to_string(),
+        Some(Tok::Ident(id)) => {
+            if let Some(sv) = str_param_val_of(id) {
+                sv
+            } else {
+                p.i = save;
+                return false;
+            }
+        }
         _ => {
             p.i = save;
             return false;
@@ -7169,12 +7775,15 @@ fn try_parse_readmem<'a>(p: &mut P<'a>, mem_inits: &mut HashMap<&'a str, BTreeMa
         }
     };
     let mut start = 0usize;
+    let mut end_limit: Option<usize> = None;
     if p.eat_sym(',') {
         if let Ok(v) = const_u(p) {
             start = v as usize;
         }
         if p.eat_sym(',') {
-            let _ = const_u(p);
+            if let Ok(e) = const_u(p) {
+                end_limit = Some(e as usize);
+            }
         }
     }
     let _ = p.eat_sym(')');
@@ -7200,7 +7809,10 @@ fn try_parse_readmem<'a>(p: &mut P<'a>, mem_inits: &mut HashMap<&'a str, BTreeMa
     }
     let entry = mem_inits.entry(mem).or_default();
     for (a, v) in words {
-        entry.insert(start.saturating_add(a), v);
+        let dst_addr = start.saturating_add(a);
+        if end_limit.is_none_or(|lim| dst_addr <= lim) {
+            entry.insert(dst_addr, v);
+        }
     }
     true
 }
@@ -8887,6 +9499,13 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
         return Err(sva_err("`expect` is not in the v3.0 SVA subset"));
     }
     while p.eat_kw("unique") || p.eat_kw("unique0") || p.eat_kw("priority") {}
+    let _ = p.eat_kw("unique");
+    let _ = p.eat_kw("priority");
+    if p.eat_kw("return") {
+        let rhs = parse_rexpr(p)?;
+        let _ = p.eat_sym(';');
+        return Ok((SeqItemOut::Nbas(vec![("return", None, rhs)]), Vec::new()));
+    }
     if p.eat_kw("for") {
         let (nbas, imms) = parse_for_unroll(p)?;
         return Ok((SeqItemOut::Nbas(nbas), imms));
@@ -9145,8 +9764,9 @@ fn parse_preprocessed(pre: String) -> Result<Vec<Rtl<'static>>, String> {
             continue;
         }
         if p.eat_kw("package") {
-            // Walk the package so `typedef enum` members seed PKG_ENUMS.
-            // Blind skip left OPCODE_*/ALU_* as unknown Idents → soft miss.
+            let pkg_name = p.ident().unwrap_or("");
+            // Walk the package so `typedef enum` members seed PKG_ENUMS and
+            // package functions seed PKG_FUNCS.
             while !p.eat_kw("endpackage") {
                 if p.peek().is_none() {
                     break;
@@ -9159,7 +9779,21 @@ fn parse_preprocessed(pre: String) -> Result<Vec<Rtl<'static>>, String> {
                     harvest_pkg_packed_param(&mut p);
                     continue;
                 }
+                if p.eat_kw("function") {
+                    let mut pkg_funcs = Vec::new();
+                    parse_or_skip_function(&mut p, &mut pkg_funcs);
+                    for f in pkg_funcs {
+                        if !pkg_name.is_empty() {
+                            pkg_func_insert(format!("{pkg_name}::{}", f.name), f.clone());
+                        }
+                        pkg_func_insert(f.name.clone(), f);
+                    }
+                    continue;
+                }
                 p.bump();
+            }
+            if p.eat_sym(':') {
+                let _ = p.ident();
             }
             continue;
         }
@@ -9265,6 +9899,9 @@ fn parse_param_assigns<'a>(p: &mut P<'a>) -> Result<Vec<(String, u128)>, String>
             }
             skip_sv_type(p);
             if p.eat_sym('=') {
+                if let Some(Tok::Str(sval)) = p.peek() {
+                    note_str_param_val(name, sval);
+                }
                 match const_u(p) {
                     Ok(val) => {
                         // Register immediately so later defaults can ref earlier ones
@@ -9634,12 +10271,49 @@ struct FuncDef<'a> {
 
 /// Standing rule: a function is behavioral Verilog. Parse it so a call can
 /// inline, or an otherwise empty module can lift it into ports + assigns.
+fn parse_fn_type_width<'a>(p: &mut P<'a>) -> usize {
+    let _ = p.eat_kw("automatic") || p.eat_kw("static") || p.eat_kw("var") || p.eat_kw("const");
+    let mut w = 1usize;
+    if p.eat_kw("int") || p.eat_kw("integer") {
+        w = 32;
+    } else if p.eat_kw("shortint") {
+        w = 16;
+    } else if p.eat_kw("longint") {
+        w = 64;
+    } else if p.eat_kw("byte") {
+        w = 8;
+    } else {
+        let _ = p.eat_kw("logic") || p.eat_kw("bit") || p.eat_kw("reg") || p.eat_kw("wire");
+    }
+    let _ = p.eat_kw("signed") || p.eat_kw("unsigned");
+    while matches!(p.peek(), Some(Tok::Ident(_)))
+        && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+    {
+        let _ = p.ident();
+        let _ = p.eat_sym(':');
+        let _ = p.eat_sym(':');
+    }
+    if matches!(p.peek(), Some(Tok::Sym('['))) {
+        w = p.width_opt().unwrap_or(1).max(1);
+    } else if matches!(p.peek(), Some(Tok::Ident(_))) {
+        let save = p.i;
+        let tname = p.ident().unwrap_or("");
+        if matches!(p.peek(), Some(Tok::Ident(_)) | Some(Tok::Sym('['))) {
+            if let Some(tw) = typed_width(tname) {
+                w = tw.max(1);
+            }
+            if matches!(p.peek(), Some(Tok::Sym('['))) {
+                w = p.width_opt().unwrap_or(w).max(1);
+            }
+        } else {
+            p.i = save;
+        }
+    }
+    w
+}
+
 fn parse_function<'a>(p: &mut P<'a>) -> Result<FuncDef<'a>, String> {
-    skip_sv_type(p);
-    let ret_w = match p.width_opt() {
-        Ok(w) => w,
-        Err(_) => 1,
-    };
+    let ret_w = parse_fn_type_width(p);
     let name = match p.ident() {
         Ok(n) => n,
         Err(_) => {
@@ -9657,8 +10331,7 @@ fn parse_function<'a>(p: &mut P<'a>) -> Result<FuncDef<'a>, String> {
                 return Err("unterminated function ports".into());
             }
             let dir = parse_port_dir(p).unwrap_or(PortDir::In);
-            skip_sv_type(p);
-            let w = p.width_opt().unwrap_or(1);
+            let w = parse_fn_type_width(p);
             if let Ok(n) = p.ident() {
                 ports.push((n.to_string(), dir, w));
                 signals.push((n.to_string(), w));
@@ -9677,8 +10350,7 @@ fn parse_function<'a>(p: &mut P<'a>) -> Result<FuncDef<'a>, String> {
         }
         if matches!(p.peek(), Some(Tok::Kw(k)) if *k == "input" || *k == "output" || *k == "inout") {
             let dir = parse_port_dir(p).unwrap_or(PortDir::In);
-            skip_sv_type(p);
-            let w = p.width_opt().unwrap_or(1);
+            let w = parse_fn_type_width(p);
             if let Ok(n) = p.ident() {
                 ports.push((n.to_string(), dir, w));
                 signals.push((n.to_string(), w));
@@ -9687,7 +10359,7 @@ fn parse_function<'a>(p: &mut P<'a>) -> Result<FuncDef<'a>, String> {
             let _ = p.eat_sym(';');
             continue;
         }
-        if p.eat_kw("integer") {
+        if p.eat_kw("integer") || p.eat_kw("int") {
             if let Ok(n) = p.ident() {
                 signals.push((n.to_string(), 32));
                 note_width(p, n, 32);
@@ -9695,13 +10367,23 @@ fn parse_function<'a>(p: &mut P<'a>) -> Result<FuncDef<'a>, String> {
             let _ = p.eat_sym(';');
             continue;
         }
-        if p.eat_kw("reg") || p.eat_kw("wire") || p.eat_kw("logic") {
+        if p.eat_kw("reg") || p.eat_kw("wire") || p.eat_kw("logic") || p.eat_kw("bit") || p.eat_kw("byte") {
+            let _ = p.eat_kw("signed") || p.eat_kw("unsigned");
             let w = p.width_opt().unwrap_or(1);
             if let Ok(n) = p.ident() {
                 signals.push((n.to_string(), w));
                 note_width(p, n, w);
             }
             skip_to_semi(p);
+            continue;
+        }
+        if p.eat_kw("return") {
+            if let Ok(rhs) = parse_rexpr(p) {
+                let _ = p.eat_sym(';');
+                stmts.push((name, None, rhs));
+            } else {
+                skip_to_semi(p);
+            }
             continue;
         }
         if p.eat_kw("begin") {
@@ -9717,7 +10399,14 @@ fn parse_function<'a>(p: &mut P<'a>) -> Result<FuncDef<'a>, String> {
                             "`assert` in function bodies is not in the v3.0 SVA subset",
                         ));
                     }
-                    stmts.extend(normalize_nbas(p, s))
+                    for (lhs, bit, rhs) in s {
+                        let target = if lhs == "return" { name } else { lhs };
+                        if target == name && bit.is_none() {
+                            stmts.push((name, None, rhs));
+                        } else {
+                            stmts.extend(normalize_nbas(p, vec![(target, bit, rhs)]));
+                        }
+                    }
                 }
                 Err(_) => {
                     let _ = skip_begin_end(p);
@@ -9727,7 +10416,16 @@ fn parse_function<'a>(p: &mut P<'a>) -> Result<FuncDef<'a>, String> {
         }
         let save = p.i;
         match parse_assign_nbas(p) {
-            Ok(v) => stmts.extend(normalize_nbas(p, v)),
+            Ok(v) => {
+                for (lhs, bit, rhs) in v {
+                    let target = if lhs == "return" { name } else { lhs };
+                    if target == name && bit.is_none() {
+                        stmts.push((name, None, rhs));
+                    } else {
+                        stmts.extend(normalize_nbas(p, vec![(target, bit, rhs)]));
+                    }
+                }
+            }
             Err(_) => {
                 p.i = save;
                 let _ = skip_item_or_block(p);
@@ -9735,6 +10433,18 @@ fn parse_function<'a>(p: &mut P<'a>) -> Result<FuncDef<'a>, String> {
         }
         if p.i == save {
             let _ = p.bump();
+        }
+    }
+    if p.eat_sym(':') {
+        let _ = p.ident();
+    }
+    // If the function assigns to local variables before a single final return assignment,
+    // fold the local variable assignments into the return expression.
+    let ret_writes = stmts.iter().filter(|(lhs, _, _)| *lhs == name).count();
+    if ret_writes == 1 && stmts.len() > 1 && stmts.last().is_some_and(|(l, b, _)| *l == name && b.is_none()) {
+        let folded = fold_blocking_assigns(stmts.clone(), p.arena, "");
+        if let Some((_, None, rhs)) = folded.into_iter().find(|(l, _, _)| *l == name) {
+            stmts = vec![(name, None, rhs)];
         }
     }
     Ok(FuncDef {
@@ -10039,9 +10749,19 @@ where
         // Try to inline if Call.
         let result: RExpr<'a> = match rebuilt {
             RExpr::Call { ref name, ref args } => {
-                if let Some(f) = funcs.iter().find(|f| f.name == *name) {
-                    if let Some(body) = simple_return_assign(f) {
-                        let ins: Vec<_> = f.ports.iter().filter(|(_, d, _)| *d == PortDir::In).cloned().collect();
+                let found_fn = funcs
+                    .iter()
+                    .find(|f| f.name == *name)
+                    .cloned()
+                    .or_else(|| pkg_func_get(name));
+                if let Some(f) = found_fn {
+                    if let Some(body) = simple_return_assign(&f) {
+                        let ins: Vec<_> = f
+                            .ports
+                            .iter()
+                            .filter(|(_, d, _)| *d == PortDir::In)
+                            .cloned()
+                            .collect();
                         let plist = if ins.is_empty() { f.ports.clone() } else { ins };
                         if args.len() == plist.len() {
                             let mut map = HashMap::new();
@@ -10049,9 +10769,6 @@ where
                                 map.insert(pn.clone(), args[i].clone());
                             }
                             if !subst_select_needs_ident(&body, &map) {
-                                // Inline by substituting. Use iterative subst_idents.
-                                // subst_idents is currently the original recursive version;
-                                // for function bodies (small), recursion is fine.
                                 subst_idents(&body, &map, arena)
                             } else {
                                 rebuilt
@@ -10083,8 +10800,12 @@ fn try_inline_call<'a>(
     depth: usize,
     arena: &'a Bump,
 ) -> Option<RExpr<'a>> {
-    let f = funcs.iter().find(|f| f.name == name)?;
-    let body = simple_return_assign(f)?;
+    let f = funcs
+        .iter()
+        .find(|f| f.name == name)
+        .cloned()
+        .or_else(|| pkg_func_get(name))?;
+    let body = simple_return_assign(&f)?;
     let ins: Vec<_> = f
         .ports
         .iter()
@@ -10836,6 +11557,8 @@ fn parse_module_items<'a>(
                         }
                         if p.eat_sym('=') {
                             let parsed_val = if let Some(Tok::Str(sval)) = p.peek() {
+                            if let Some(Tok::Str(sval)) = p.peek() {
+                                note_str_param_val(name, sval);
                                 let h = str_param_hash(sval);
                                 p.bump();
                                 Some(h)
@@ -13632,8 +14355,47 @@ fn index_part_bit<'a>(
     if depth == 1 {
         if bit >= wsrc {
             return Ok(Expr::Const(false));
+            if let Some(words) = rtl.mem_inits.get(name) {
+                if !words.is_empty() && !rtl.nbas.iter().any(|(lhs, _, _)| *lhs == name) {
+                    let wval = words.get(&word).copied().unwrap_or(0);
+                    return Ok(Expr::Const((wval >> src) & 1 == 1));
+                }
+            }
+            return Ok(Expr::Var(arena.alloc_str(&(unpacked_word_q(name, word, wsrc, src)))));
         }
         return Ok(Expr::Var(arena.alloc_str(&(bit_name(name, wsrc, bit)))));
+        if depth <= 64 {
+            if let Some(words) = rtl.mem_inits.get(name) {
+                if !words.is_empty() && !rtl.nbas.iter().any(|(lhs, _, _)| *lhs == name) {
+                    if bit >= wsrc {
+                        return Ok(Expr::Const(false));
+                    }
+                    let mut acc: Option<Expr<'a>> = None;
+                    for k in 0..depth {
+                        let wval = words.get(&k).copied().unwrap_or(0);
+                        if (wval >> bit) & 1 == 0 {
+                            continue;
+                        }
+                        let eq = cmp_eq_bits(
+                            base,
+                            &RExpr::Const {
+                                val: k as u128,
+                                width: 32,
+                                care: u128::MAX,
+                            },
+                            rtl,
+                            true,
+                            arena,
+                        )?;
+                        acc = Some(match acc {
+                            None => eq,
+                            Some(prev) => Expr::Or(arena.alloc(prev), arena.alloc(eq)),
+                        });
+                    }
+                    return Ok(acc.unwrap_or(Expr::Const(false)));
+                }
+            }
+        }
     }
     if bit >= part_w {
         return Ok(Expr::Const(false));
@@ -13839,7 +14601,16 @@ fn rexpr_to_bit<'a>(e: &RExpr<'_>, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Re
                         let v = if depth > 1 && bit >= w {
                             Expr::Const(false)
                         } else if depth > 1 {
-                            Expr::Var(arena.alloc_str(&(unpacked_word_q(s, *i, w, bit))))
+                            if let Some(words) = rtl.mem_inits.get(s) {
+                                if !words.is_empty() && !rtl.nbas.iter().any(|(lhs, _, _)| *lhs == *s) {
+                                    let wval = words.get(i).copied().unwrap_or(0);
+                                    Expr::Const((wval >> bit) & 1 == 1)
+                                } else {
+                                    Expr::Var(arena.alloc_str(&(unpacked_word_q(s, *i, w, bit))))
+                                }
+                            } else {
+                                Expr::Var(arena.alloc_str(&(unpacked_word_q(s, *i, w, bit))))
+                            }
                         } else if depth == 1 && bit >= w {
                             Expr::Const(false)
                         } else if depth == 1 {
