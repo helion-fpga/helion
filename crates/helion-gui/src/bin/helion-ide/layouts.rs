@@ -233,7 +233,13 @@ pub fn load_chrome_state(app: &mut HelionIde) {
         && std::env::var("HELION_FLOW").is_err()
     {
         if let Some(p) = ini.preset {
-            apply_preset(app, p);
+            let has_project =
+                !app.model.tree.sources.is_empty() || app.model.last_project_path.is_some();
+            if has_project {
+                apply_preset(app, p);
+            } else {
+                app.layout_state.preset = p;
+            }
         }
     }
     if std::env::var("HELION_SIDEBAR_WIDTH").is_err() {
