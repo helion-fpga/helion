@@ -2529,18 +2529,21 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
     let model = &app.model;
     let honest = model.timing_honesty_label();
     let provenance = model.constraint_provenance().to_string();
-    let wns = if model.timing_closed_wns() {
+    let raw_wns = if model.timing_closed_wns() {
         honest.clone()
     } else if honest.starts_with("no_body") {
-        // Internal token; the status bar shows a human label instead.
         "No design".into()
     } else if honest.starts_with("no_clock_path") {
         "no_clock_path".into()
-    } else if honest.contains("default period") {
-        honest.clone()
     } else {
         honest.clone()
     };
+    // Strip redundant " default period, not user SDC" suffix because the very
+    // next segment already displays "default constraints" / "user constraints".
+    let wns = raw_wns
+        .strip_suffix(" default period, not user SDC")
+        .unwrap_or(&raw_wns)
+        .to_string();
     // Red when negative (§3.7); green only for genuinely closed timing (status
     // semantics), warn when there is no closed WNS to show.
     let wns_num = model.timing.as_ref().map(|t| t.wns_ps);
@@ -2613,14 +2616,33 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
         .show_separator_line(true)
         .show(ctx, |ui| {
             let w = ui.available_width();
-            // Reserve for the right-side job indicator; segments never paint into it.
-            let right_w = chrome::STATUS_RIGHT_WIDTH;
+            let font = egui::FontId::new(12.0, egui::FontFamily::Monospace);
+            // Measure the true right-side width (flow step chips ~276px + separator
+            // + busy spinner/progress text or "✓ idle") so left segments never
+            // collide with the right-side flow strip or simulation spinner!
+            let right_status_txt = if busy {
+                if progress.is_empty() {
+                    "working".to_string()
+                } else {
+                    progress.clone()
+                }
+            } else {
+                "✓ idle".to_string()
+            };
+            let right_txt_w = ui
+                .painter()
+                .layout_no_wrap(right_status_txt.clone(), font.clone(), theme.dim)
+                .size()
+                .x;
+            let flow_strip_w = 278.0_f32;
+            let right_w = (flow_strip_w + right_txt_w + if busy { 48.0 } else { 28.0 })
+                .max(chrome::STATUS_RIGHT_WIDTH)
+                .min(w * 0.62);
             let (bar, _) = ui.allocate_exact_size(
                 egui::vec2(w, chrome::STATUS_HEIGHT),
                 egui::Sense::hover(),
             );
-            let x_limit = bar.right() - right_w - 8.0;
-            // Segments are spec'd first, then measured, then the visible
+            let x_limit = (bar.right() - right_w - 16.0).max(bar.left() + 80.0);
             // leading run is painted (chrome::status_visible_count): narrow
             // windows hide low-priority segments instead of overlapping them
             // (VS Code's status bar priority pattern).
@@ -2702,12 +2724,11 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
             if !board_crumb.is_empty() {
                 spec(board_crumb.to_string(), theme.faint, "", None);
             }
-            if !progress.is_empty() {
+            if !busy && !progress.is_empty() {
                 spec(progress.clone(), theme.accent_dim, "", None);
-            } else if status != "idle" && !status.is_empty() && !status.ends_with(": ok") {
+            } else if !busy && status != "idle" && !status.is_empty() && !status.ends_with(": ok") {
                 spec(status.clone(), theme.dim, "", None);
             }
-            let font = egui::FontId::new(12.0, egui::FontFamily::Monospace);
             let widths: Vec<f32> = specs
                 .iter()
                 .map(|sp| {
@@ -2744,22 +2765,24 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
             }
             // Right side: flow progress chips (R16: Z1 -> Z7) + background-job
             // spinner/progress, or idle indicator.
-            let right_w = chrome::STATUS_RIGHT_WIDTH;
-
             let right_rect = egui::Rect::from_min_size(
-                egui::pos2(bar.right() - right_w - 8.0, bar.top()),
+                egui::pos2((bar.right() - right_w - 8.0).max(bar.left()), bar.top()),
                 egui::vec2(right_w, bar.height()),
             );
+            // Subtle vertical divider separating left telemetry from right flow strip.
+            ui.painter().line_segment(
+                [
+                    egui::pos2(right_rect.left() - 6.0, bar.top() + 5.0),
+                    egui::pos2(right_rect.left() - 6.0, bar.bottom() - 5.0),
+                ],
+                egui::Stroke::new(1.0, theme.line),
+            );
             ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
+                ui.set_clip_rect(right_rect);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if busy {
-                        let ptxt = if progress.is_empty() {
-                            "working".to_string()
-                        } else {
-                            progress.clone()
-                        };
                         ui.label(
-                            RichText::new(ptxt)
+                            RichText::new(&right_status_txt)
                                 .monospace()
                                 .size(12.0)
                                 .color(theme.accent_dim),
@@ -2774,9 +2797,6 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
                         );
                     }
                     ui.separator();
-                    // R16: flow step chips live in the status bar, not the toolbar.
-                    // paint_progress_strip returns the clicked step; the job
-                    // is submitted after the panel closure (borrow rules).
                     if let Some(step) = paint_progress_strip(ui, &theme, model) {
                         go_step = Some(step);
                     }
@@ -3714,145 +3734,199 @@ fn paint_clipped_select(
     resp.clicked()
 }
 
+fn paint_sim_row(
+    ui: &mut egui::Ui,
+    on: bool,
+    left_name: &str,
+    right_badge: &str,
+    tip: &str,
+    theme: &theme::Theme,
+) -> bool {
+    let w = ui.available_width().max(48.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 22.0), Sense::click());
+    let resp = resp.on_hover_text(tip);
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter().with_clip_rect(rect);
+        if on {
+            p.rect_filled(rect, 3.0, theme.sel);
+        } else if resp.hovered() {
+            p.rect_filled(rect, 3.0, theme.surface_hover);
+        }
+        let rgalley = p.layout_no_wrap(
+            right_badge.to_string(),
+            egui::FontId::monospace(10.5),
+            theme.faint,
+        );
+        let rw = rgalley.size().x;
+        let rx = (rect.right() - 6.0 - rw).max(rect.left() + 48.0);
+        p.galley(
+            egui::pos2(rx, rect.center().y - rgalley.size().y * 0.5),
+            rgalley,
+            theme.faint,
+        );
+        let left_clip = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 4.0, rect.top()),
+            egui::pos2((rx - 6.0).max(rect.left() + 28.0), rect.bottom()),
+        );
+        let lgalley = p.layout_no_wrap(
+            left_name.to_string(),
+            egui::FontId::monospace(11.5),
+            if on { theme.text } else { theme.dim },
+        );
+        p.with_clip_rect(left_clip).galley(
+            egui::pos2(rect.left() + 5.0, rect.center().y - lgalley.size().y * 0.5),
+            lgalley,
+            if on { theme.text } else { theme.dim },
+        );
+    }
+    resp.clicked()
+}
+
 fn paint_sim_nav_body(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
-    ui.add_space(chrome::SPACE_XS);
-    egui::Frame::new()
-        .inner_margin(egui::Margin::symmetric(8, 4))
+    egui::ScrollArea::vertical()
+        .id_salt("sim_nav_outer_scroll")
+        .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            let on_tb = model.workspace == WorkspaceTab::Testbench;
-            let tb_btn = egui::Button::new(
-                RichText::new(format!("Testbench Runner ({})", model.tb_files.len())).strong(),
-            )
-            .selected(on_tb);
-            if ui
-                .add_sized([ui.available_width(), chrome::HIT_SIDEBAR], tb_btn)
-                .on_hover_text("Integrated SystemVerilog testbench runner")
-                .clicked()
-            {
-                model.workspace = WorkspaceTab::Testbench;
-            }
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Simulation Control").font(theme::font_ui_semibold(12.0)));
-            });
-            ui.horizontal_wrapped(|ui| {
-                let n = model.sim_runtime_cycles.max(1);
-                if ui.button(format!("▶ Run {n}")).clicked() {
-                    surface::request_job(JobKind::SimRun(n));
-                }
-                if ui.button("Step").clicked() {
-                    let _ = model.sim_step();
-                }
-                if ui.button("Restart").clicked() {
-                    let _ = model.sim_restart();
-                }
-            });
-            ui.separator();
-            let scopes = model.scope_rows().to_vec();
-            ui.label(
-                RichText::new(format!("Scopes ({})", scopes.len()))
-                    .font(theme::font_ui_semibold(12.0)),
-            );
-            let selected_scope = model.selected_scope.clone();
-            let mut pick_scope = None;
-            let row_h = 22.0;
-            egui::ScrollArea::vertical()
-                .id_salt("ug900_scopes")
-                .max_height(140.0)
-                .show_rows(ui, row_h, scopes.len().max(1), |ui, range| {
-                    if scopes.is_empty() {
-                        ui.label(RichText::new("No scopes yet — press Run.").small().color(theme.dim));
-                        return;
+            ui.add_space(chrome::SPACE_XS);
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let on_tb = model.workspace == WorkspaceTab::Testbench;
+                    let tb_btn = egui::Button::new(
+                        RichText::new(format!("Testbench Runner ({})", model.tb_files.len())).strong(),
+                    )
+                    .selected(on_tb);
+                    if ui
+                        .add_sized([ui.available_width(), chrome::HIT_SIDEBAR], tb_btn)
+                        .on_hover_text("Integrated SystemVerilog testbench runner")
+                        .clicked()
+                    {
+                        model.workspace = WorkspaceTab::Testbench;
                     }
-                    let end = range.end.min(scopes.len());
-                    for (i, s) in scopes[range.start..end].iter().enumerate() {
-                        let i = range.start + i;
-                        let on = selected_scope.as_deref() == Some(s.name.as_str());
-                        let shown = format!(
-                            "{:<14} {}",
-                            helion_gui::schematic_short_name(&s.name),
-                            s.type_cell()
-                        );
-                        if paint_clipped_select(ui, on, &shown, &s.name, theme) {
-                            pick_scope = Some(i.to_string());
+                    ui.separator();
+                    ui.label(RichText::new("Simulation Control").font(theme::font_ui_semibold(12.0)));
+                    ui.horizontal_wrapped(|ui| {
+                        let n = model.sim_runtime_cycles.max(1);
+                        if ui.button(format!("▶ Run {n}")).clicked() {
+                            surface::request_job(JobKind::SimRun(n));
                         }
+                        if ui.button("Step").clicked() {
+                            let _ = model.sim_step();
+                        }
+                        if ui.button("Restart").clicked() {
+                            let _ = model.sim_restart();
+                        }
+                    });
+                    ui.separator();
+                    ui.label(RichText::new("Debug Panes").font(theme::font_ui_semibold(12.0)));
+                    ui.add_space(2.0);
+                    let ws = model.workspace;
+                    let panes: [(&str, WorkspaceTab, u8); 8] = [
+                        ("Wave", WorkspaceTab::Wave, 0),
+                        ("ILA", WorkspaceTab::Ila, 0),
+                        ("Source", WorkspaceTab::Source, 1),
+                        ("Memory", WorkspaceTab::Memory, 2),
+                        ("Breakpoints", WorkspaceTab::Breakpoints, 3),
+                        ("Locals", WorkspaceTab::Locals, 0),
+                        ("Force", WorkspaceTab::Forces, 4),
+                        ("Settings", WorkspaceTab::SimSettings, 0),
+                    ];
+                    for pair in panes.chunks(2) {
+                        ui.columns(2, |cols| {
+                            for (cidx, &(label, tab, act)) in pair.iter().enumerate() {
+                                let bw = cols[cidx].available_width().max(48.0);
+                                if cols[cidx]
+                                    .add_sized([bw, 24.0], egui::Button::new(label).selected(ws == tab))
+                                    .clicked()
+                                {
+                                    match act {
+                                        1 => {
+                                            let _ = model.open_source_window();
+                                        }
+                                        2 => {
+                                            let _ = model.open_memory();
+                                        }
+                                        3 => {
+                                            let _ = model.open_breakpoints();
+                                        }
+                                        4 => {
+                                            let _ = model.open_forces();
+                                        }
+                                        _ => {
+                                            model.workspace = tab;
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    ui.separator();
+                    let scopes = model.scope_rows().to_vec();
+                    ui.label(
+                        RichText::new(format!("Scopes ({})", scopes.len()))
+                            .font(theme::font_ui_semibold(12.0)),
+                    );
+                    let selected_scope = model.selected_scope.clone();
+                    let mut pick_scope = None;
+                    let row_h = 22.0;
+                    egui::ScrollArea::vertical()
+                        .id_salt("ug900_scopes")
+                        .max_height(132.0)
+                        .auto_shrink([false, true])
+                        .show_rows(ui, row_h, scopes.len().max(1), |ui, range| {
+                            if scopes.is_empty() {
+                                ui.label(RichText::new("No scopes yet — press Run.").small().color(theme.dim));
+                                return;
+                            }
+                            let end = range.end.min(scopes.len());
+                            for (i, s) in scopes[range.start..end].iter().enumerate() {
+                                let i = range.start + i;
+                                let on = selected_scope.as_deref() == Some(s.name.as_str());
+                                let short = helion_gui::schematic_short_name(&s.name);
+                                let tip = format!("{} ({})", s.name, s.type_cell());
+                                if paint_sim_row(ui, on, &short, s.type_cell(), &tip, theme) {
+                                    pick_scope = Some(i.to_string());
+                                }
+                            }
+                        });
+                    if let Some(spec) = pick_scope {
+                        let _ = model.select_scope(&spec);
+                    }
+                    ui.separator();
+                    let objects = model.object_rows().to_vec();
+                    ui.label(
+                        RichText::new(format!("Objects ({})", objects.len()))
+                            .font(theme::font_ui_semibold(12.0)),
+                    );
+                    let selected_object = model.selected_object.clone();
+                    let mut pick_obj = None;
+                    let obj_h = ui.available_height().max(154.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("ug900_objects")
+                        .max_height(obj_h)
+                        .auto_shrink([false, true])
+                        .show_rows(ui, row_h, objects.len().max(1), |ui, range| {
+                            if objects.is_empty() {
+                                ui.label(RichText::new("No objects. Select a scope.").small().color(theme.dim));
+                                return;
+                            }
+                            let end = range.end.min(objects.len());
+                            for (i, o) in objects[range.start..end].iter().enumerate() {
+                                let i = range.start + i;
+                                let on = selected_object.as_deref() == Some(o.name.as_str());
+                                let short = helion_gui::schematic_short_name(&o.name);
+                                let right = format!("{} {}", o.type_cell(), o.value_cell());
+                                let tip = format!("{} · {} = {}", o.name, o.type_cell(), o.value_cell());
+                                if paint_sim_row(ui, on, &short, &right, &tip, theme) {
+                                    pick_obj = Some(i.to_string());
+                                }
+                            }
+                        });
+                    if let Some(spec) = pick_obj {
+                        let _ = model.select_object(&spec);
                     }
                 });
-            if let Some(spec) = pick_scope {
-                let _ = model.select_scope(&spec);
-            }
-            ui.separator();
-            let objects = model.object_rows().to_vec();
-            ui.label(
-                RichText::new(format!("Objects ({})", objects.len()))
-                    .font(theme::font_ui_semibold(12.0)),
-            );
-            let selected_object = model.selected_object.clone();
-            let mut pick_obj = None;
-            let obj_h = (ui.available_height() - 104.0).max(80.0);
-            egui::ScrollArea::vertical()
-                .id_salt("ug900_objects")
-                .max_height(obj_h)
-                .show_rows(ui, row_h, objects.len().max(1), |ui, range| {
-                    if objects.is_empty() {
-                        ui.label(RichText::new("No objects. Select a scope.").small().color(theme.dim));
-                        return;
-                    }
-                    let end = range.end.min(objects.len());
-                    for (i, o) in objects[range.start..end].iter().enumerate() {
-                        let i = range.start + i;
-                        let on = selected_object.as_deref() == Some(o.name.as_str());
-                        let shown = format!(
-                            "{:<10} {:<5} {}",
-                            helion_gui::schematic_short_name(&o.name),
-                            o.type_cell(),
-                            o.value_cell()
-                        );
-                        if paint_clipped_select(ui, on, &shown, &o.name, theme) {
-                            pick_obj = Some(i.to_string());
-                        }
-                    }
-                });
-            if let Some(spec) = pick_obj {
-                let _ = model.select_object(&spec);
-            }
-            ui.separator();
-            ui.label(RichText::new("Debug Panes").font(theme::font_ui_semibold(12.0)));
-            let ws = model.workspace;
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-                if ui.add(egui::Button::new("Wave").selected(ws == WorkspaceTab::Wave)).clicked() {
-                    model.workspace = WorkspaceTab::Wave;
-                }
-                if ui.add(egui::Button::new("ILA").selected(ws == WorkspaceTab::Ila)).clicked() {
-                    model.workspace = WorkspaceTab::Ila;
-                }
-                if ui.add(egui::Button::new("Source").selected(ws == WorkspaceTab::Source)).clicked() {
-                    let _ = model.open_source_window();
-                }
-                if ui.add(egui::Button::new("Memory").selected(ws == WorkspaceTab::Memory)).clicked() {
-                    let _ = model.open_memory();
-                }
-                if ui
-                    .add(egui::Button::new("Breakpoints").selected(ws == WorkspaceTab::Breakpoints))
-                    .clicked()
-                {
-                    let _ = model.open_breakpoints();
-                }
-                if ui.add(egui::Button::new("Locals").selected(ws == WorkspaceTab::Locals)).clicked() {
-                    model.workspace = WorkspaceTab::Locals;
-                }
-                if ui.add(egui::Button::new("Force").selected(ws == WorkspaceTab::Forces)).clicked() {
-                    let _ = model.open_forces();
-                }
-                if ui
-                    .add(egui::Button::new("Settings").selected(ws == WorkspaceTab::SimSettings))
-                    .clicked()
-                {
-                    model.workspace = WorkspaceTab::SimSettings;
-                }
-            });
         });
 }
 
@@ -11653,7 +11727,7 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     let row_h = chrome::wave_trace_row_h(model.wave.density);
 
     // Unified column geometry so Header, Timescale Ruler, and Trace Rows align to the exact pixel!
-    let name_w = 132.0_f32;
+    let name_w = 188.0_f32;
     let val_w = 68.0_f32;
     let ab_w = 54.0_f32;
     let style_w = 58.0_f32;
@@ -11829,21 +11903,39 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
             } else if row_idx % 2 == 1 {
                 ui.painter().rect_filled(nrect, 0.0, theme.panel.gamma_multiply(0.25));
             }
-            ui.painter().text(
+            let disp_name = if t.name.chars().count() > 24 {
+                let tail: String = t
+                    .name
+                    .chars()
+                    .rev()
+                    .take(22)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                format!("…{tail}")
+            } else {
+                t.name.clone()
+            };
+            let name_clip = nrect.shrink2(egui::vec2(2.0, 0.0));
+            ui.painter().with_clip_rect(name_clip).text(
                 egui::pos2(nrect.left() + 4.0, nrect.center().y),
                 egui::Align2::LEFT_CENTER,
-                &t.name,
-                theme::font_code(12.0),
+                disp_name,
+                theme::font_code(11.5),
                 if is_probed { theme.gold } else { theme.text },
             );
             if nresp
-                .on_hover_text("Click to cross-probe signal across RTL, Schematic, Device, Timing, and DRC (F4)")
+                .on_hover_text(format!(
+                    "{} — Click to cross-probe signal across RTL, Schematic, Device, Timing, and DRC (F4)",
+                    t.name
+                ))
                 .clicked()
             {
                 probe_cmd = Some(t.name.clone());
             }
             let (vrect, _) = ui.allocate_exact_size(egui::vec2(val_w, row_h), Sense::hover());
-            ui.painter().text(
+            ui.painter().with_clip_rect(vrect).text(
                 egui::pos2(vrect.right() - 4.0, vrect.center().y),
                 egui::Align2::RIGHT_CENTER,
                 t.value_at(cursor),
@@ -11852,7 +11944,7 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
             );
             if let Some(a) = cursor_a {
                 let (arect, _) = ui.allocate_exact_size(egui::vec2(ab_w, row_h), Sense::hover());
-                ui.painter().text(
+                ui.painter().with_clip_rect(arect).text(
                     egui::pos2(arect.right() - 4.0, arect.center().y),
                     egui::Align2::RIGHT_CENTER,
                     t.value_at(a),
@@ -11862,7 +11954,7 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
             }
             if let Some(b) = cursor_b {
                 let (brect, _) = ui.allocate_exact_size(egui::vec2(ab_w, row_h), Sense::hover());
-                ui.painter().text(
+                ui.painter().with_clip_rect(brect).text(
                     egui::pos2(brect.right() - 4.0, brect.center().y),
                     egui::Align2::RIGHT_CENTER,
                     t.value_at(b),
@@ -12036,25 +12128,42 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                 .map(|tx| tx.label.as_str())
                 .unwrap_or("-");
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
                 ui.set_min_height(row_h);
                 ui.set_max_height(row_h);
-                ui.add_sized(
-                    [110.0, 28.0],
-                    egui::Label::new(
-                        RichText::new(format!("{lane_name} [{proto_name}]"))
-                            .monospace()
-                            .size(11.0)
-                            .color(theme.accent),
-                    ),
-                );
-                ui.add_sized(
-                    [72.0, 28.0],
-                    egui::Label::new(
-                        RichText::new(cur_label)
-                            .monospace()
-                            .size(11.0)
-                            .color(theme.gold),
-                    ),
+                ui.add_space(8.0 - gap);
+                let (nrect, nresp) = ui.allocate_exact_size(egui::vec2(name_w, row_h), Sense::hover());
+                let full_lane = format!("{lane_name} [{proto_name}]");
+                let disp_lane = if full_lane.chars().count() > 24 {
+                    let tail: String = full_lane
+                        .chars()
+                        .rev()
+                        .take(22)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    format!("…{tail}")
+                } else {
+                    full_lane.clone()
+                };
+                ui.painter()
+                    .with_clip_rect(nrect.shrink2(egui::vec2(2.0, 0.0)))
+                    .text(
+                        egui::pos2(nrect.left() + 4.0, nrect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        disp_lane,
+                        theme::font_code(11.0),
+                        theme.accent,
+                    );
+                let _ = nresp.on_hover_text(full_lane);
+                let (vrect, _) = ui.allocate_exact_size(egui::vec2(val_w, row_h), Sense::hover());
+                ui.painter().with_clip_rect(vrect).text(
+                    egui::pos2(vrect.right() - 4.0, vrect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    cur_label,
+                    theme::font_code(11.0),
+                    theme.gold,
                 );
                 if let Some(a) = cursor_a {
                     let a_lbl = txs
@@ -12062,11 +12171,13 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                         .find(|tx| a >= tx.start_sample && a <= tx.end_sample)
                         .map(|tx| tx.label.as_str())
                         .unwrap_or("-");
-                    ui.add_sized(
-                        [56.0, 28.0],
-                        egui::Label::new(
-                            RichText::new(a_lbl).monospace().size(10.5).color(theme.danger),
-                        ),
+                    let (arect, _) = ui.allocate_exact_size(egui::vec2(ab_w, row_h), Sense::hover());
+                    ui.painter().with_clip_rect(arect).text(
+                        egui::pos2(arect.right() - 4.0, arect.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        a_lbl,
+                        theme::font_code(10.5),
+                        theme.danger,
                     );
                 }
                 if let Some(b) = cursor_b {
@@ -12075,18 +12186,25 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                         .find(|tx| b >= tx.start_sample && b <= tx.end_sample)
                         .map(|tx| tx.label.as_str())
                         .unwrap_or("-");
-                    ui.add_sized(
-                        [56.0, 28.0],
-                        egui::Label::new(
-                            RichText::new(b_lbl).monospace().size(10.5).color(theme.trace_b),
-                        ),
+                    let (brect, _) = ui.allocate_exact_size(egui::vec2(ab_w, row_h), Sense::hover());
+                    ui.painter().with_clip_rect(brect).text(
+                        egui::pos2(brect.right() - 4.0, brect.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        b_lbl,
+                        theme::font_code(10.5),
+                        theme.trace_b,
                     );
                 }
-                ui.add_sized(
-                    [116.0, chrome::HIT_SIDEBAR],
-                    egui::Label::new(
-                        RichText::new("PROTO").monospace().size(10.5).color(theme.dim),
-                    ),
+                let (mrect, _) = ui.allocate_exact_size(
+                    egui::vec2(style_w + gap + radix_w, row_h),
+                    Sense::hover(),
+                );
+                ui.painter().text(
+                    mrect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "PROTO",
+                    theme::font_code(10.5),
+                    theme.dim,
                 );
                 let (rect, resp) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), (row_h - 4.0).max(28.0)),
