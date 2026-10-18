@@ -596,18 +596,18 @@ mod tests {
                 let dval = if en == 1 { inc } else { qi };
                 init |= dval << addr;
             }
-            d.add_cell(format!("u_lut{i}"), CellKind::Lut6 { init });
-            d.add_cell(format!("u_ff{i}"), CellKind::Hff);
-            d.connect("clk", format!("u_ff{i}"), "CLK");
-            d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
-            d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
+            d.add_cell(&format!("u_lut{i}"), CellKind::Lut6 { init });
+            d.add_cell(&format!("u_ff{i}"), CellKind::Hff);
+            d.connect("clk", &format!("u_ff{i}"), "CLK");
+            d.connect(&format!("d{i}"), &format!("u_lut{i}"), "O");
+            d.connect(&format!("d{i}"), &format!("u_ff{i}"), "D");
             // Q net uses the elaborator's bit_name convention ("cnt_{i}").
             let qnet = format!("cnt_{i}");
-            d.connect(qnet.clone(), format!("u_ff{i}"), "Q");
-            d.connect("en", format!("u_lut{i}"), "I0");
-            d.connect(qnet.clone(), format!("u_lut{i}"), "I1");
+            d.connect(&qnet, &format!("u_ff{i}"), "Q");
+            d.connect("en", &format!("u_lut{i}"), "I0");
+            d.connect(&qnet, &format!("u_lut{i}"), "I1");
             for j in 0..i {
-                d.connect(format!("cnt_{j}"), format!("u_lut{i}"), format!("I{}", j + 2));
+                d.connect(&format!("cnt_{j}"), &format!("u_lut{i}"), &format!("I{}", j + 2));
             }
         }
         d
