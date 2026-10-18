@@ -15,6 +15,4 @@ helion-hw = { workspace = true }
 helion-sta = { workspace = true }
 helion-debug = { workspace = true }
 helion-ipxact = { workspace = true }
-
-[dev-dependencies]
 helion-sv = { workspace = true }
