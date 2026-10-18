@@ -47,6 +47,11 @@ pub use translator::{
     PortConstraint, PullMode, SlewRate, UniversalConstraints, canonicalize_iostandard,
     iostandard_to_lattice, iostandard_to_quartus, iostandard_to_vivado, translate_constraints,
 };
+pub mod netlist_interchange;
+pub use netlist_interchange::{
+    NetlistFormat, read_eblif, read_edif, read_verilog_netlist, read_yosys_json, write_eblif,
+    write_edif, write_verilog_netlist, write_yosys_json,
+};
 
 /// UG986 / UG904 implementation strategies, including Vivado multi-strategy explorer presets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
