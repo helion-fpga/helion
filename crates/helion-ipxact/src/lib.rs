@@ -2,6 +2,17 @@
 
 use std::path::Path;
 
+pub mod video;
+pub use video::{
+    BayerPattern, ColorStandard, CscDirection, CscScalerConfig, HdmiInfoFrame, HdmiStandard,
+    HdmiTmdsConfig, MIPI_CSI2_ECC_MASKS, MipiCsi2Config, TMDS_CTRL_SYMBOLS, VdmaConfig,
+    VdmaFrameRing, VdmaGenlockMode, VideoResolutionPreset, VideoTimingMode, VtcConfig,
+    bilinear_scale_plane, demosaic_bayer_3x3, generate_axi_vdma_sv, generate_csc_scaler_sv,
+    generate_hdmi_tmds_rx_sv, generate_hdmi_tmds_tx_sv, generate_mipi_csi2_rx_demosaic_sv,
+    generate_vtc_sv, mipi_csi2_correct_header, mipi_csi2_header_ecc, rgb_to_ycbcr,
+    tmds_decode_symbol, tmds_encode_byte, ycbcr_to_rgb,
+};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IpCore {
     pub vendor: String,
@@ -779,6 +790,72 @@ pub fn pack_scoreboard() -> IpCore {
     }
 }
 
+/// HDMI 1.4/2.0 8b/10b TMDS transmitter + InfoFrame packetizer (ip/h_hdmi_tmds_tx).
+pub fn pack_hdmi_tmds_tx() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_hdmi_tmds_tx".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// HDMI 1.4/2.0 10b/8b TMDS receiver / decoder (ip/h_hdmi_tmds_rx).
+pub fn pack_hdmi_tmds_rx() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_hdmi_tmds_rx".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// PG020-class triple-buffered frame-sync video DMA mm2s/s2mm engine (ip/h_video_vdma).
+pub fn pack_video_vdma() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_video_vdma".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
+/// PG016-class programmable 480p/720p/1080p/4K video timing controller (ip/h_video_vtc).
+pub fn pack_video_vtc() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_video_vtc".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
+/// MIPI CSI-2 D-PHY RX packet parser + 3x3 Bayer-to-RGB demosaic (ip/h_mipi_csi2_rx).
+pub fn pack_mipi_csi2_rx() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_mipi_csi2_rx".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// RGB/YCbCr Color Space Converter & 2D Bilinear Video Scaler (ip/h_video_csc_scaler).
+pub fn pack_video_csc_scaler() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_video_csc_scaler".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -852,6 +929,12 @@ pub fn catalog() -> Vec<IpCore> {
         pack_piso(),
         pack_traffic_light(),
         pack_scoreboard(),
+        pack_hdmi_tmds_tx(),
+        pack_hdmi_tmds_rx(),
+        pack_video_vdma(),
+        pack_video_vtc(),
+        pack_mipi_csi2_rx(),
+        pack_video_csc_scaler(),
     ]
 }
 
