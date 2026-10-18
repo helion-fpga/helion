@@ -29,6 +29,172 @@ pub fn map_vhdl_path(path: &Path) -> Result<MapResult, String> {
     map_vhdl_origin(&src, &path.display().to_string())
 }
 
+/// Elaborate and map multiple VHDL (and optional companion SystemVerilog/Verilog)
+/// `(origin, source)` units together. Cross-file `package` / `package body`
+/// declarations (`use work.<pkg>.all`), separate `entity` and `architecture`
+/// files, and multi-entity hierarchies (`entity work.<child>` and `component`)
+/// are resolved across all files before lowering to `helion_sv::synth_sv_sources`.
+pub fn map_vhdl_sources(files: &[(&str, &str)]) -> Result<MapResult, String> {
+    if files.is_empty() {
+        return Err("no sources".into());
+    }
+    if files.len() == 1 && !looks_like_sv_file(files[0].0, files[0].1) {
+        return map_vhdl_origin(files[0].1, files[0].0);
+    }
+    for &(origin, source) in files {
+        if looks_like_sv_file(origin, source) {
+            continue;
+        }
+        if let Some(name) = osvvm_harness_module(source) {
+            eprintln!(
+                "diagnostic sim_only module={name} (OSVVM test harness; external entity not ingested; not a LUT; not a closed WNS)"
+            );
+            let soft = SoftDiag::new("sim_only", &name)
+                .with_detail("OSVVM test harness; external entity not ingested")
+                .with_span(span_best_effort(source, origin, &[&name]));
+            emit_diag(&soft.table_line());
+            return Ok(MapResult {
+                design: empty_named(name),
+                softs: vec![soft],
+            });
+        }
+        if let Some((kind, name)) = banner_hang_module(source) {
+            let why = match kind {
+                "vendor_wrapper" => "vendor IP wrapper; not ingested; not a LUT; not a closed WNS",
+                _ => "record or package type; not bit-blasted; not a LUT; not a closed WNS",
+            };
+            eprintln!("diagnostic {kind} module={name} ({why})");
+            let soft = SoftDiag::new(kind, &name)
+                .with_detail(why)
+                .with_span(span_best_effort(source, origin, &[&name]));
+            emit_diag(&soft.table_line());
+            return Ok(MapResult {
+                design: empty_named(name),
+                softs: vec![soft],
+            });
+        }
+    }
+    let mut vhdl_files: Vec<(&str, &str)> = Vec::new();
+    let mut sv_before: Vec<(&str, &str)> = Vec::new();
+    let mut sv_after: Vec<(&str, &str)> = Vec::new();
+    let last_is_sv = files
+        .last()
+        .map(|(o, s)| looks_like_sv_file(o, s))
+        .unwrap_or(false);
+    for &(origin, src) in files {
+        if looks_like_sv_file(origin, src) {
+            if last_is_sv {
+                sv_after.push((origin, src));
+            } else {
+                sv_before.push((origin, src));
+            }
+        } else {
+            vhdl_files.push((origin, src));
+        }
+    }
+    if vhdl_files.is_empty() {
+        let design = helion_sv::synth_sv_sources(files)?;
+        return Ok(MapResult {
+            design,
+            softs: Vec::new(),
+        });
+    }
+    let mut extra_known_bodies: HashSet<String> = HashSet::new();
+    let mut extra_module_ports: HashMap<String, Vec<(String, &'static str, usize)>> =
+        HashMap::new();
+    for &(_origin, sv_src) in sv_before.iter().chain(sv_after.iter()) {
+        if let Ok(mods) = helion_sv::list_sv_modules(sv_src) {
+            for m in mods {
+                extra_known_bodies.insert(m.to_ascii_lowercase());
+            }
+        }
+        for (mname, mports) in scan_sv_module_ports(sv_src) {
+            extra_known_bodies.insert(mname.to_ascii_lowercase());
+            extra_module_ports.insert(mname.to_ascii_lowercase(), mports);
+        }
+    }
+    let (sv, softs) =
+        vhdl_sources_to_sv_with_softs(&vhdl_files, &extra_known_bodies, &extra_module_ports)?;
+    let mut synth_inputs: Vec<(&str, &str)> = Vec::new();
+    for &(o, s) in &sv_before {
+        synth_inputs.push((o, s));
+    }
+    synth_inputs.push(("vhdl_multi.sv", sv.as_str()));
+    for &(o, s) in &sv_after {
+        synth_inputs.push((o, s));
+    }
+    let mut design = helion_sv::synth_sv_sources(&synth_inputs)?;
+    strip_redundant_buffer_luts(&mut design);
+    Ok(MapResult { design, softs })
+}
+
+/// Design-only multi-file VHDL synthesis wrapper.
+pub fn synth_vhdl_sources(files: &[(&str, &str)]) -> Result<Design, String> {
+    Ok(map_vhdl_sources(files)?.design)
+}
+
+/// Multi-file VHDL mapping from disk paths.
+pub fn map_vhdl_files(paths: &[&Path]) -> Result<MapResult, String> {
+    if paths.is_empty() {
+        return Err("no sources".into());
+    }
+    let mut owned: Vec<(String, String)> = Vec::with_capacity(paths.len());
+    for p in paths {
+        let text = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
+        owned.push((p.display().to_string(), text));
+    }
+    let refs: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    map_vhdl_sources(&refs)
+}
+
+/// Multi-file VHDL synthesis from disk paths.
+pub fn synth_vhdl_files(paths: &[&Path]) -> Result<Design, String> {
+    Ok(map_vhdl_files(paths)?.design)
+}
+
+/// Map a VHDL file together with any sibling `.vhd`/`.vhdl` (and `.sv`/`.v`)
+/// files in the same directory so cross-file packages, entities, architectures,
+/// and child components resolve automatically without project manifest ceremony,
+/// while keeping `path`'s top entity last.
+pub fn map_vhdl_path_with_siblings(path: &Path) -> Result<MapResult, String> {
+    let Some(parent) = path.parent() else {
+        return map_vhdl_path(path);
+    };
+    let Ok(rd) = std::fs::read_dir(parent) else {
+        return map_vhdl_path(path);
+    };
+    let canon_target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut sibs: Vec<std::path::PathBuf> = rd
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            let c = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+            if c == canon_target {
+                return false;
+            }
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "vhd" | "vhdl" | "sv" | "v"))
+                .unwrap_or(false)
+        })
+        .collect();
+    if sibs.is_empty() {
+        return map_vhdl_path(path);
+    }
+    sibs.sort();
+    sibs.push(path.to_path_buf());
+    let refs: Vec<&Path> = sibs.iter().map(|p| p.as_path()).collect();
+    map_vhdl_files(&refs)
+}
+
+/// Same-directory sibling synthesis for VHDL: packages, entities, architectures,
+/// and child components in sibling files are elaborated with `path` as the top file.
+pub fn synth_vhdl_path_with_siblings(path: &Path) -> Result<Design, String> {
+    Ok(map_vhdl_path_with_siblings(path)?.design)
+}
+
 fn map_vhdl_origin(source: &str, origin: &str) -> Result<MapResult, String> {
     if let Some(name) = osvvm_harness_module(source) {
         // OSVVM / PoC test harness (CreateClock, library.entity). The
@@ -47,8 +213,7 @@ fn map_vhdl_origin(source: &str, origin: &str) -> Result<MapResult, String> {
         });
     }
     if let Some((kind, name)) = banner_hang_module(source) {
-        // Banner-only 90s kills: vendor IP wrapper, or a record/package
-        // type the parser would walk forever. One line. Not a LUT.
+        // Banner-only 90s kills: vendor IP wrapper. One line. Not a LUT.
         // Not a vendor product. Not a closed WNS.
         let why = match kind {
             "vendor_wrapper" => "vendor IP wrapper; not ingested; not a LUT; not a closed WNS",
@@ -65,8 +230,72 @@ fn map_vhdl_origin(source: &str, origin: &str) -> Result<MapResult, String> {
         });
     }
     let (sv, softs) = vhdl_to_sv_with_softs(source, origin)?;
-    let design = helion_sv::synth_sv(&sv, "vhdl.sv")?;
+    let mut design = helion_sv::synth_sv(&sv, "vhdl.sv")?;
+    strip_redundant_buffer_luts(&mut design);
     Ok(MapResult { design, softs })
+}
+
+/// Remove redundant 1-input identity buffer LUTs (`0xaaaa_aaaa_aaaa_aaaa`)
+/// emitted alongside direct `IobOut` port connections or wire aliases.
+fn strip_redundant_buffer_luts(d: &mut Design) {
+    use helion_ir::{CellKind, Spur};
+    const BUF_INIT: u64 = 0xaaaa_aaaa_aaaa_aaaa;
+    let pin_o = intern("O");
+    let pin_i0 = intern("I0");
+    let pin_pad = intern("PAD");
+    let iob_cells: HashSet<Spur> = d
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::IobOut))
+        .map(|c| c.name)
+        .collect();
+    let mut iob_pad_nets: HashSet<Spur> = HashSet::new();
+    for net in &d.nets {
+        if net
+            .endpoints
+            .iter()
+            .any(|e| e.pin == pin_pad && iob_cells.contains(&e.cell))
+        {
+            iob_pad_nets.insert(net.name);
+        }
+    }
+    let mut remove_cells: HashSet<Spur> = HashSet::new();
+    for c in &d.cells {
+        let CellKind::Lut6 { init } = c.kind else {
+            continue;
+        };
+        if init != BUF_INIT {
+            continue;
+        }
+        let mut out_net: Option<Spur> = None;
+        let mut has_other_in = false;
+        for net in &d.nets {
+            for e in &net.endpoints {
+                if e.cell == c.name {
+                    if e.pin == pin_o {
+                        out_net = Some(net.name);
+                    } else if e.pin != pin_i0 {
+                        has_other_in = true;
+                    }
+                }
+            }
+        }
+        if !has_other_in {
+            if let Some(on) = out_net {
+                if iob_pad_nets.contains(&on) {
+                    remove_cells.insert(c.name);
+                }
+            }
+        }
+    }
+    if remove_cells.is_empty() {
+        return;
+    }
+    d.cells.retain(|c| !remove_cells.contains(&c.name));
+    for net in &mut d.nets {
+        net.endpoints.retain(|e| !remove_cells.contains(&e.cell));
+    }
+    d.rebuild_indexes();
 }
 
 /// OSVVM clock/reset harness or library-qualified AXI testbench. Not synth RTL.
@@ -78,16 +307,14 @@ fn empty_named(name: String) -> Design {
 }
 
 /// Files that previously printed a banner and then died at 90s.
-/// Vendor wrapper: IP-packaging / AXI bridge shell. Record: `is record`
-/// or a package bus record (`bus_req_t`). Do not elaborate either.
+/// Vendor wrapper: IP-packaging / AXI bridge shell. Do not elaborate it.
+/// Note: VHDL-2008 `record` types (`is record`, `bus_req_t`, `bus_rsp_t`) are
+/// now bit-blasted in bounded time and synthesized into real hardware.
 fn banner_hang_module(source: &str) -> Option<(&'static str, String)> {
     let low = source.to_ascii_lowercase();
     let name = first_entity_is(source).or_else(|| last_entity_is(source))?;
     if low.contains("ip packaging") || low.contains("xbus2axi4") {
         return Some(("vendor_wrapper", name));
-    }
-    if low.contains("is record") || low.contains("bus_req_t") || low.contains("bus_rsp_t") {
-        return Some(("record_type", name));
     }
     None
 }
@@ -150,47 +377,338 @@ fn vhdl_to_sv(source: &str) -> Result<String, String> {
     Ok(vhdl_to_sv_with_softs(source, "vhdl.vhd")?.0)
 }
 
-fn vhdl_to_sv_with_softs(source: &str, origin: &str) -> Result<(String, Vec<SoftDiag>), String> {
-    let t = tokenize(source);
-    let mut p = P { t: &t, i: 0 };
-    let mut entities: Vec<Entity> = Vec::new();
-    let mut archs: Vec<Arch> = Vec::new();
-    let mut pkg_consts: HashMap<String, i64> = HashMap::new();
-    while p.peek().is_some() {
-        if p.eat("library") || p.eat("use") || p.eat("context") {
-            eat_to_semi(&mut p);
-            continue;
-        }
-        if p.eat("package") {
-            let _ = p.eat("body");
-            let pkg = parse_package(&mut p)?;
-            pkg_consts.extend(pkg.consts);
-            continue;
-        }
-        if p.eat("entity") {
-            entities.push(parse_entity(&mut p)?);
-            continue;
-        }
-        if p.eat("architecture") {
-            archs.push(parse_arch(&mut p, &entities, &pkg_consts)?);
-            continue;
-        }
-        if p.eat("configuration") {
-            skip_balanced_end(&mut p, "configuration");
-            continue;
-        }
-        p.bump();
+fn looks_like_sv_file(origin: &str, src: &str) -> bool {
+    let ext = Path::new(origin)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "sv" || ext == "v" {
+        return true;
     }
-    let Some(top) = entities.last() else {
+    if ext == "vhd" || ext == "vhdl" {
+        return false;
+    }
+    let low = src.to_ascii_lowercase();
+    low.contains("endmodule") && !low.contains("architecture ") && !low.contains("end entity")
+}
+
+fn scan_sv_module_ports(src: &str) -> Vec<(String, Vec<(String, &'static str, usize)>)> {
+    let mut out = Vec::new();
+    let t = tokenize(src);
+    let mut p = P { t: &t, i: 0 };
+    while p.peek().is_some() {
+        if p.eat("module") {
+            let Ok(mname) = p.ident() else {
+                continue;
+            };
+            if p.eat("#") {
+                skip_paren_block(&mut p);
+            }
+            let mut ports = Vec::new();
+            if p.eat("(") {
+                let mut cur_dir: &'static str = "input";
+                let mut cur_w: usize = 1;
+                while !p.eat(")") && p.peek().is_some() {
+                    if p.eat("input") {
+                        cur_dir = "input";
+                        cur_w = 1;
+                    } else if p.eat("output") || p.eat("inout") {
+                        cur_dir = "output";
+                        cur_w = 1;
+                    }
+                    let _ = p.eat("wire");
+                    let _ = p.eat("logic");
+                    let _ = p.eat("reg");
+                    let _ = p.eat("signed");
+                    if p.eat("[") {
+                        let hi = parse_int_expr(&mut p).unwrap_or(0);
+                        let _ = p.eat(":");
+                        let lo = parse_int_expr(&mut p).unwrap_or(0);
+                        let _ = p.eat("]");
+                        cur_w = (hi.abs_diff(lo) as usize) + 1;
+                    }
+                    if let Ok(pname) = p.ident() {
+                        ports.push((pname, cur_dir, cur_w.max(1)));
+                    }
+                    if !p.eat(",") && !p.peek_sym(")") {
+                        p.bump();
+                    }
+                }
+            }
+            out.push((mname, ports));
+        } else {
+            p.bump();
+        }
+    }
+    out
+}
+
+fn vhdl_to_sv_with_softs(source: &str, origin: &str) -> Result<(String, Vec<SoftDiag>), String> {
+    let files = [(origin, source)];
+    let empty_bodies = HashSet::new();
+    let empty_ports = HashMap::new();
+    vhdl_sources_to_sv_with_softs(&files, &empty_bodies, &empty_ports)
+}
+
+#[derive(Clone, Debug)]
+enum VType {
+    Scalar(usize),
+    Record(String),
+}
+
+#[derive(Clone, Debug)]
+struct RecordField {
+    name: String,
+    ty: VType,
+}
+
+#[derive(Clone, Debug)]
+struct RecordDef {
+    fields: Vec<RecordField>,
+}
+
+#[derive(Clone, Debug)]
+struct FuncDef {
+    params: Vec<String>,
+    body_expr: String,
+    leaf_exprs: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TypeEnv {
+    consts: HashMap<String, i64>,
+    pkg_consts: HashMap<String, i64>,
+    pkg_names: HashSet<String>,
+    subtypes: HashMap<String, VType>,
+    records: HashMap<String, RecordDef>,
+    funcs: HashMap<String, FuncDef>,
+    rec_vars: HashMap<String, String>,
+    rec_consts: HashMap<String, HashMap<String, String>>,
+}
+
+impl TypeEnv {
+    fn get_record(&self, name: &str) -> Option<&RecordDef> {
+        let k = name.to_ascii_lowercase();
+        if let Some(r) = self.records.get(&k) {
+            return Some(r);
+        }
+        if let Some(VType::Record(target)) = self.subtypes.get(&k) {
+            return self.records.get(&target.to_ascii_lowercase());
+        }
+        None
+    }
+
+    fn flatten_record_leaves(
+        &self,
+        rec_type: &str,
+        prefix: &str,
+        suffix_prefix: &str,
+        depth: usize,
+    ) -> Vec<(String, String, usize)> {
+        if depth > 16 {
+            return Vec::new();
+        }
+        let Some(def) = self.get_record(rec_type) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for f in &def.fields {
+            let full = if prefix.is_empty() {
+                f.name.clone()
+            } else {
+                format!("{prefix}_{}", f.name)
+            };
+            let suf = if suffix_prefix.is_empty() {
+                f.name.to_ascii_lowercase()
+            } else {
+                format!("{suffix_prefix}_{}", f.name.to_ascii_lowercase())
+            };
+            match &f.ty {
+                VType::Scalar(w) => out.push((full, suf, (*w).max(1))),
+                VType::Record(sub) => {
+                    out.extend(self.flatten_record_leaves(sub, &full, &suf, depth + 1));
+                }
+            }
+        }
+        out
+    }
+
+    fn register_rec_var(&mut self, name: &str, rec_type: &str, depth: usize) {
+        if depth > 16 {
+            return;
+        }
+        let rlow = rec_type.to_ascii_lowercase();
+        self.rec_vars.insert(name.to_ascii_lowercase(), rlow.clone());
+        if let Some(def) = self.get_record(&rlow).cloned() {
+            for f in &def.fields {
+                if let VType::Record(sub) = &f.ty {
+                    let sub_name = format!("{name}_{}", f.name);
+                    self.register_rec_var(&sub_name, sub, depth + 1);
+                }
+            }
+        }
+    }
+
+    fn resolve_rec_var(&self, name: &str) -> Option<String> {
+        self.rec_vars.get(&name.to_ascii_lowercase()).cloned()
+    }
+}
+
+fn vhdl_sources_to_sv_with_softs(
+    files: &[(&str, &str)],
+    extra_known_bodies: &HashSet<String>,
+    extra_module_ports: &HashMap<String, Vec<(String, &'static str, usize)>>,
+) -> Result<(String, Vec<SoftDiag>), String> {
+    let tokenized: Vec<(&str, &str, Vec<Tok>)> = files
+        .iter()
+        .map(|&(origin, src)| (origin, src, tokenize(src)))
+        .collect();
+    let mut env = TypeEnv::default();
+    env.pkg_names.insert("work".into());
+    env.pkg_names.insert("ieee".into());
+    env.pkg_names.insert("std".into());
+
+    // Pass 1 (twice for cross-package dependencies): harvest all packages & package bodies.
+    for _pass in 0..2 {
+        for (_origin, _src, toks) in &tokenized {
+            let mut p = P { t: toks, i: 0 };
+            while p.peek().is_some() {
+                if p.eat("library") || p.eat("use") || p.eat("context") {
+                    eat_to_semi(&mut p);
+                    continue;
+                }
+                if p.eat("package") {
+                    let _ = p.eat("body");
+                    parse_package(&mut p, &mut env)?;
+                    continue;
+                }
+                if p.eat("entity") {
+                    skip_to_end_unit(&mut p, "entity");
+                    continue;
+                }
+                if p.eat("architecture") {
+                    skip_to_end_unit(&mut p, "architecture");
+                    continue;
+                }
+                if p.eat("configuration") {
+                    skip_balanced_end(&mut p, "configuration");
+                    continue;
+                }
+                p.bump();
+            }
+        }
+    }
+
+    // Pass 2: harvest all entities across all files.
+    let mut entities: Vec<Entity> = Vec::new();
+    let mut entity_origins: HashMap<String, (String, String)> = HashMap::new();
+    for (origin, src, toks) in &tokenized {
+        let mut p = P { t: toks, i: 0 };
+        while p.peek().is_some() {
+            if p.eat("library") || p.eat("use") || p.eat("context") {
+                eat_to_semi(&mut p);
+                continue;
+            }
+            if p.eat("package") {
+                let _ = p.eat("body");
+                skip_to_end_unit(&mut p, "package");
+                continue;
+            }
+            if p.eat("entity") {
+                let ent = parse_entity(&mut p, &mut env)?;
+                entity_origins.insert(
+                    ent.name.to_ascii_lowercase(),
+                    (origin.to_string(), src.to_string()),
+                );
+                if let Some(existing) = entities
+                    .iter_mut()
+                    .find(|e| e.name.eq_ignore_ascii_case(&ent.name))
+                {
+                    *existing = ent;
+                } else {
+                    entities.push(ent);
+                }
+                continue;
+            }
+            if p.eat("architecture") {
+                skip_to_end_unit(&mut p, "architecture");
+                continue;
+            }
+            if p.eat("configuration") {
+                skip_balanced_end(&mut p, "configuration");
+                continue;
+            }
+            p.bump();
+        }
+    }
+
+    // Pass 3: harvest all architectures across all files.
+    let mut archs: Vec<Arch> = Vec::new();
+    let mut arch_origins: HashMap<String, (String, String)> = HashMap::new();
+    for (origin, src, toks) in &tokenized {
+        let mut p = P { t: toks, i: 0 };
+        while p.peek().is_some() {
+            if p.eat("library") || p.eat("use") || p.eat("context") {
+                eat_to_semi(&mut p);
+                continue;
+            }
+            if p.eat("package") {
+                let _ = p.eat("body");
+                skip_to_end_unit(&mut p, "package");
+                continue;
+            }
+            if p.eat("entity") {
+                skip_to_end_unit(&mut p, "entity");
+                continue;
+            }
+            if p.eat("architecture") {
+                let a = parse_arch(&mut p, &entities, &env)?;
+                arch_origins.insert(
+                    a.of.to_ascii_lowercase(),
+                    (origin.to_string(), src.to_string()),
+                );
+                archs.push(a);
+                continue;
+            }
+            if p.eat("configuration") {
+                skip_balanced_end(&mut p, "configuration");
+                continue;
+            }
+            p.bump();
+        }
+    }
+
+    if entities.is_empty() {
         return Err("vhdl: need entity".into());
-    };
+    }
     let arch_for = |name: &str| -> Option<&Arch> {
         archs.iter().rev().find(|a| a.of.eq_ignore_ascii_case(name))
     };
-    // Entities that have an architecture body (even empty) are real modules.
-    // Component declarations without a matching entity/arch are missing — do
-    // not emit_stub empty shells (that silences unknown_instance / cells=0).
-    let mut known_bodies: HashSet<String> = HashSet::new();
+    let mut instantiated: HashSet<String> = HashSet::new();
+    for e in &entities {
+        if let Some(a) = arch_for(&e.name) {
+            for st in &a.stmts {
+                if let CStmt::Inst { module, .. } = st {
+                    instantiated.insert(module.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    let top_name = entities
+        .iter()
+        .rev()
+        .find(|e| !instantiated.contains(&e.name.to_ascii_lowercase()))
+        .or_else(|| entities.last())
+        .map(|e| e.name.clone())
+        .ok_or_else(|| String::from("vhdl: need entity"))?;
+    let top = entities
+        .iter()
+        .rev()
+        .find(|e| e.name.eq_ignore_ascii_case(&top_name))
+        .unwrap();
+
+    let mut known_bodies: HashSet<String> = extra_known_bodies.clone();
     for e in &entities {
         if arch_for(&e.name).is_some() {
             known_bodies.insert(e.name.to_ascii_lowercase());
@@ -203,11 +721,8 @@ fn vhdl_to_sv_with_softs(source: &str, origin: &str) -> Result<(String, Vec<Soft
         components: Vec::new(),
         stmts: Vec::new(),
         parse_softs: Vec::new(),
+        env: env.clone(),
     };
-    // STA clocks come from the architecture emit will actually use
-    // (`arch_for` = last matching arch). Unioning every arch of an entity
-    // would let a non-selected sequential body force clock→clk on a selected
-    // arch that treats `clock` as data. child_clocks uses this same map.
     let mut entity_clocks: HashMap<String, HashSet<String>> = HashMap::new();
     let mut entity_occupied: HashMap<String, HashSet<String>> = HashMap::new();
     for e in &entities {
@@ -216,12 +731,21 @@ fn vhdl_to_sv_with_softs(source: &str, origin: &str) -> Result<(String, Vec<Soft
             entity_occupied.insert(e.name.to_ascii_lowercase(), occupied_sv_names(e, a));
         }
     }
+    let default_origin = files.last().map(|(o, _)| *o).unwrap_or("vhdl.vhd");
+    let default_source = files.last().map(|(_, s)| *s).unwrap_or("");
+    let unit_origin_src = |ename: &str| -> (String, String) {
+        let k = ename.to_ascii_lowercase();
+        if let Some((o, s)) = arch_origins.get(&k) {
+            return (o.clone(), s.clone());
+        }
+        if let Some((o, s)) = entity_origins.get(&k) {
+            return (o.clone(), s.clone());
+        }
+        (default_origin.to_string(), default_source.to_string())
+    };
     let mut out = String::new();
     let mut entity_softs: HashMap<String, Vec<SoftDiag>> = HashMap::new();
-    // Pass 1: emit every unit with an EMPTY child_softs map so declaration
-    // order cannot omit child_soft_incomplete (parent-before-child gap).
     let empty_child_softs: HashMap<String, Vec<SoftDiag>> = HashMap::new();
-    // Emit non-top entities with bodies first so hierarchy stitch finds them.
     for e in &entities {
         if e.name.eq_ignore_ascii_case(&top.name) {
             continue;
@@ -229,11 +753,9 @@ fn vhdl_to_sv_with_softs(source: &str, origin: &str) -> Result<(String, Vec<Soft
         let Some(a) = arch_for(&e.name) else {
             continue;
         };
-        // Fold env (parse_arch) already saw pkg_consts. Do not dump package
-        // entries as localparam into hierarchical children — they collide
-        // with child ports/signals.
-        let consts = bind_consts(&pkg_consts, e, a, false);
+        let consts = bind_consts(&env.pkg_consts, e, a, false);
         let mut unit_softs = Vec::new();
+        let (u_origin, u_source) = unit_origin_src(&e.name);
         out.push_str(&emit_sv(
             e,
             a,
@@ -242,8 +764,9 @@ fn vhdl_to_sv_with_softs(source: &str, origin: &str) -> Result<(String, Vec<Soft
             &entity_clocks,
             &entity_occupied,
             &entities,
-            origin,
-            source,
+            extra_module_ports,
+            &u_origin,
+            &u_source,
             &mut unit_softs,
             &empty_child_softs,
         )?);
@@ -254,8 +777,9 @@ fn vhdl_to_sv_with_softs(source: &str, origin: &str) -> Result<(String, Vec<Soft
         .unwrap_or(&dummy);
     entity_clocks.insert(top.name.to_ascii_lowercase(), sta_clocks_of(arch));
     entity_occupied.insert(top.name.to_ascii_lowercase(), occupied_sv_names(top, arch));
-    let consts = bind_consts(&pkg_consts, top, arch, true);
+    let consts = bind_consts(&env.pkg_consts, top, arch, true);
     let mut unit_softs = Vec::new();
+    let (top_origin, top_source) = unit_origin_src(&top.name);
     out.push_str(&emit_sv(
         top,
         arch,
@@ -264,22 +788,21 @@ fn vhdl_to_sv_with_softs(source: &str, origin: &str) -> Result<(String, Vec<Soft
         &entity_clocks,
         &entity_occupied,
         &entities,
-        origin,
-        source,
+        extra_module_ports,
+        &top_origin,
+        &top_source,
         &mut unit_softs,
         &empty_child_softs,
     )?);
     entity_softs.insert(top.name.to_ascii_lowercase(), unit_softs);
 
-    // Pass 2: after all base entity_softs are filled, nest child_soft_incomplete
-    // bottom-up. MapResult.softs is a roots-only forest (no flat+nested dupes).
     let full_softs = build_softs_forest(
         &entities,
         &entity_softs,
         &archs,
         &known_bodies,
-        origin,
-        source,
+        &top_origin,
+        &top_source,
     );
     let mut nested_as_child: HashSet<String> = HashSet::new();
     for softs in full_softs.values() {
@@ -442,8 +965,6 @@ fn occupied_sv_names(ent: &Entity, arch: &Arch) -> HashSet<String> {
     for (n, _) in &arch.signals {
         s.insert(n.to_ascii_lowercase());
     }
-    // Top package dump (and clock→clk skip) must not collide with
-    // already-emitted localparams from generics / entity / arch consts.
     for n in ent.generics.keys() {
         s.insert(n.to_ascii_lowercase());
     }
@@ -456,15 +977,14 @@ fn occupied_sv_names(ent: &Entity, arch: &Arch) -> HashSet<String> {
     s
 }
 
-struct Unit {
-    consts: HashMap<String, i64>,
-}
-
+#[derive(Clone, Debug)]
 struct Entity {
     name: String,
     generics: HashMap<String, i64>,
     consts: HashMap<String, i64>,
     ports: Vec<(String, &'static str, usize)>,
+    raw_ports: Vec<(String, &'static str, VType)>,
+    rec_vars: HashMap<String, String>,
 }
 
 struct Arch {
@@ -475,8 +995,8 @@ struct Arch {
     stmts: Vec<CStmt>,
     /// Parse-time softs (generate_not_lowered, …) attached to this architecture.
     parse_softs: Vec<(String, Option<String>, String)>,
+    env: TypeEnv,
 }
-
 #[derive(Clone)]
 enum CStmt {
     Assign {
@@ -527,40 +1047,371 @@ enum SStmt {
         body: Vec<SStmt>,
     },
 }
-
-fn parse_package(p: &mut P) -> Result<Unit, String> {
-    let _ = p.ident();
+fn parse_package(p: &mut P, env: &mut TypeEnv) -> Result<(), String> {
+    if let Ok(pname) = p.ident() {
+        env.pkg_names.insert(pname.to_ascii_lowercase());
+    }
     let _ = p.eat("is");
-    let mut consts = HashMap::new();
-    while !p.eat("end") {
-        if p.peek().is_none() {
+    while p.peek().is_some() {
+        if p.eat("end") {
+            let _ = p.eat("package");
+            let _ = p.eat("body");
+            let _ = p.eat_ident();
+            let _ = p.eat(";");
             break;
         }
         if p.eat("constant") {
-            if let Ok((n, v)) = parse_constant(p, &consts) {
-                consts.insert(n, v);
-            }
+            parse_constant_into_env(p, env, true);
+        } else if p.eat("type") {
+            parse_type_decl(p, env);
+        } else if p.eat("subtype") {
+            parse_subtype_decl(p, env);
+        } else if p.eat("component") {
+            let _ = parse_component(p, env);
+        } else if p.eat("function") || p.eat("procedure") || p.eat("impure") || p.eat("pure") {
+            let _ = p.eat("function");
+            let _ = p.eat("procedure");
+            parse_subprogram_or_proto(p, env);
         } else {
             eat_decl_item(p);
         }
     }
-    let _ = p.eat("package");
-    let _ = p.eat("body");
-    let _ = p.eat_ident();
-    let _ = p.eat(";");
-    Ok(Unit { consts })
+    Ok(())
 }
 
-fn parse_entity(p: &mut P) -> Result<Entity, String> {
+fn parse_type_decl(p: &mut P, env: &mut TypeEnv) {
+    let Ok(tname) = p.ident() else {
+        eat_to_semi(p);
+        return;
+    };
+    let tkey = tname.to_ascii_lowercase();
+    if !p.eat("is") {
+        eat_to_semi(p);
+        return;
+    }
+    if p.eat("record") {
+        let mut fields = Vec::new();
+        let mut guard = 0usize;
+        while p.peek().is_some() && guard < 4096 {
+            guard += 1;
+            if p.eat("end") {
+                let _ = p.eat("record");
+                let _ = p.eat_ident();
+                let _ = p.eat(";");
+                break;
+            }
+            let Some(f0) = p.eat_name() else {
+                if !p.eat(";") {
+                    p.bump();
+                }
+                continue;
+            };
+            let mut fnames = vec![f0];
+            while p.eat(",") {
+                if let Some(fnm) = p.eat_name() {
+                    fnames.push(fnm);
+                }
+            }
+            let _ = p.eat(":");
+            let fty = parse_vtype(p, env);
+            skip_init(p);
+            let _ = p.eat(";");
+            for fnm in fnames {
+                fields.push(RecordField {
+                    name: fnm,
+                    ty: fty.clone(),
+                });
+            }
+        }
+        env.records.insert(tkey, RecordDef { fields });
+        return;
+    }
+    if p.eat("(") {
+        // Enum type: `type state_t is (S0, S1, S2);`
+        let mut elems = Vec::new();
+        while !p.eat(")") && p.peek().is_some() {
+            if let Ok(el) = p.ident() {
+                elems.push(el);
+            } else {
+                p.bump();
+            }
+            let _ = p.eat(",");
+        }
+        let _ = p.eat(";");
+        let n = elems.len();
+        let w = if n <= 1 {
+            1
+        } else {
+            (usize::BITS - (n - 1).leading_zeros()) as usize
+        };
+        for (idx, el) in elems.into_iter().enumerate() {
+            env.consts.entry(el).or_insert(idx as i64);
+        }
+        env.subtypes.insert(tkey, VType::Scalar(w.max(1)));
+        return;
+    }
+    if p.eat("array") {
+        let mut count = 1usize;
+        if p.eat("(") {
+            if let Some(a) = parse_int_expr_with(p, &env.consts) {
+                if p.eat("downto") || p.eat("to") {
+                    let b = parse_int_expr_with(p, &env.consts).unwrap_or(a);
+                    count = (a.abs_diff(b) as usize) + 1;
+                }
+            }
+            skip_paren_rest(p);
+        }
+        let _ = p.eat("of");
+        let elem_ty = parse_vtype(p, env);
+        let _ = p.eat(";");
+        let elem_w = match elem_ty {
+            VType::Scalar(w) => w,
+            VType::Record(r) => env
+                .flatten_record_leaves(&r, "", "", 0)
+                .iter()
+                .map(|(_, _, w)| *w)
+                .sum::<usize>()
+                .max(1),
+        };
+        env.subtypes
+            .insert(tkey, VType::Scalar((count * elem_w).max(1)));
+        return;
+    }
+    if p.eat("range") {
+        let a = parse_int_expr_with(p, &env.consts).unwrap_or(31);
+        let _ = p.eat("to");
+        let _ = p.eat("downto");
+        let b = parse_int_expr_with(p, &env.consts).unwrap_or(0);
+        if p.eat("units") {
+            skip_to_end_unit(p, "units");
+        } else {
+            eat_to_semi(p);
+        }
+        let span = (a.abs_diff(b) as usize) + 1;
+        let w = if span <= 1 {
+            1
+        } else {
+            (usize::BITS - (span - 1).leading_zeros()) as usize
+        };
+        env.subtypes.insert(tkey, VType::Scalar(w.max(1)));
+        return;
+    }
+    let ty = parse_vtype(p, env);
+    eat_to_semi(p);
+    env.subtypes.insert(tkey, ty);
+}
+
+fn parse_subtype_decl(p: &mut P, env: &mut TypeEnv) {
+    let Ok(sname) = p.ident() else {
+        eat_to_semi(p);
+        return;
+    };
+    let _ = p.eat("is");
+    let ty = parse_vtype(p, env);
+    eat_to_semi(p);
+    env.subtypes.insert(sname.to_ascii_lowercase(), ty);
+}
+
+fn parse_subprogram_or_proto(p: &mut P, env: &mut TypeEnv) {
+    let fname = p.ident().unwrap_or_default();
+    let mut params = Vec::new();
+    let mut local_env = env.clone();
+    if p.eat("(") {
+        while !p.eat(")") && p.peek().is_some() {
+            let _ = p.eat("constant");
+            let _ = p.eat("signal");
+            let _ = p.eat("variable");
+            let Some(p0) = p.eat_name() else {
+                if !p.eat(";") {
+                    p.bump();
+                }
+                continue;
+            };
+            let mut pnames = vec![p0];
+            while p.eat(",") {
+                if let Some(pn) = p.eat_name() {
+                    pnames.push(pn);
+                }
+            }
+            let _ = p.eat(":");
+            let _ = p.eat("in");
+            let _ = p.eat("out");
+            let _ = p.eat("inout");
+            let pty = parse_vtype(p, &local_env);
+            skip_init(p);
+            for pn in pnames {
+                if let VType::Record(r) = &pty {
+                    local_env.register_rec_var(&pn, r, 0);
+                }
+                params.push(pn);
+            }
+            let _ = p.eat(";");
+        }
+    }
+    let mut ret_ty = VType::Scalar(1);
+    if p.eat("return") {
+        ret_ty = parse_vtype(p, &local_env);
+    }
+    if p.eat(";") {
+        // Prototype in package header — done!
+        return;
+    }
+    let _ = p.eat("is");
+    let mut local_signals = Vec::new();
+    while !p.eat("begin") && p.peek().is_some() {
+        if p.eat("variable") || p.eat("signal") {
+            let _ = parse_signal_list(p, &mut local_signals, &mut local_env);
+        } else if p.eat("constant") {
+            parse_constant_into_env(p, &mut local_env, false);
+        } else if p.eat("type") {
+            parse_type_decl(p, &mut local_env);
+        } else if p.eat("subtype") {
+            parse_subtype_decl(p, &mut local_env);
+        } else if p.eat("function") || p.eat("procedure") || p.eat("impure") || p.eat("pure") {
+            let _ = p.eat("function");
+            let _ = p.eat("procedure");
+            parse_subprogram_or_proto(p, &mut local_env);
+        } else {
+            p.bump();
+        }
+    }
+    let mut var_assigns: HashMap<String, String> = HashMap::new();
+    let mut ret_expr: Option<String> = None;
+    let mut leaf_exprs: HashMap<String, String> = HashMap::new();
+    let mut depth = 1i32;
+    while depth > 0 && p.peek().is_some() {
+        if p.eat("end") {
+            if p.eat("if") || p.eat("case") || p.eat("loop") {
+                let _ = p.eat(";");
+                continue;
+            }
+            let _ = p.eat("function");
+            let _ = p.eat("procedure");
+            let _ = p.eat_ident();
+            let _ = p.eat(";");
+            depth -= 1;
+            break;
+        }
+        if p.eat("return") {
+            if let VType::Record(rname) = &ret_ty {
+                if let Ok(pairs) = parse_record_rhs(p, rname, &local_env) {
+                    for (suf, val) in pairs {
+                        let sub_val = subst_func_vars(&val, &var_assigns);
+                        leaf_exprs.insert(suf, sub_val);
+                    }
+                }
+            } else if let Ok(e) = parse_expr_sv(p, &local_env) {
+                let sub_e = subst_func_vars(&e, &var_assigns);
+                ret_expr = Some(sub_e);
+            }
+            eat_to_semi(p);
+            continue;
+        }
+        if p.eat("if") {
+            if let Ok(cond) = parse_expr_sv(p, &local_env) {
+                let _ = p.eat("then");
+                if p.eat("return") {
+                    let t_val = parse_expr_sv(p, &local_env).unwrap_or_else(|_| "1'b0".into());
+                    eat_to_semi(p);
+                    if p.eat("else") && p.eat("return") {
+                        let f_val = parse_expr_sv(p, &local_env).unwrap_or_else(|_| "1'b0".into());
+                        eat_to_semi(p);
+                        ret_expr = Some(format!(
+                            "(({}) ? ({}) : ({}))",
+                            subst_func_vars(&cond, &var_assigns),
+                            subst_func_vars(&t_val, &var_assigns),
+                            subst_func_vars(&f_val, &var_assigns)
+                        ));
+                    }
+                }
+            }
+            continue;
+        }
+        let save = p.i;
+        if let Ok(lhs) = parse_target_sv(p, &local_env, &local_signals) {
+            if p.eat(":=") || p.eat("<=") {
+                if let Some(rec_type) = local_env.resolve_rec_var(&lhs) {
+                    if let Ok(pairs) = parse_record_rhs(p, &rec_type, &local_env) {
+                        for (suf, val) in pairs {
+                            let full_lhs = format!("{lhs}_{suf}");
+                            let sub_val = subst_func_vars(&val, &var_assigns);
+                            var_assigns.insert(full_lhs, sub_val);
+                        }
+                        eat_to_semi(p);
+                        continue;
+                    }
+                } else if let Ok(rhs) = parse_expr_sv(p, &local_env) {
+                    let sub_rhs = subst_func_vars(&rhs, &var_assigns);
+                    var_assigns.insert(lhs, sub_rhs);
+                    eat_to_semi(p);
+                    continue;
+                }
+            }
+        }
+        p.i = save;
+        p.bump();
+    }
+    if !fname.is_empty() && (ret_expr.is_some() || !leaf_exprs.is_empty()) {
+        env.funcs.insert(
+            fname.to_ascii_lowercase(),
+            FuncDef {
+                params,
+                body_expr: ret_expr.unwrap_or_else(|| "1'b0".into()),
+                leaf_exprs,
+            },
+        );
+    }
+}
+
+fn subst_func_vars(expr: &str, vars: &HashMap<String, String>) -> String {
+    if vars.is_empty() {
+        return expr.to_string();
+    }
+    replace_word_map(expr, vars)
+}
+
+fn replace_word_map(s: &str, map: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let word = &s[start..i];
+            if let Some((_, rep)) = map.iter().find(|(k, _)| k.eq_ignore_ascii_case(word)) {
+                out.push_str(&format!("({rep})"));
+            } else {
+                out.push_str(word);
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn parse_entity(p: &mut P, env: &mut TypeEnv) -> Result<Entity, String> {
     let name = p.ident()?;
     let _ = p.eat("is");
+    let mut ent_env = env.clone();
     let mut generics = HashMap::new();
     if p.eat("generic") {
-        parse_generic_clause(p, &mut generics)?;
+        parse_generic_clause(p, &mut generics, &ent_env)?;
+        for (k, v) in &generics {
+            ent_env.consts.insert(k.clone(), *v);
+        }
     }
     let mut ports = Vec::new();
+    let mut raw_ports = Vec::new();
     if p.eat("port") {
-        ports = parse_port_clause(p, &generics)?;
+        let (flat, raw) = parse_port_clause(p, &mut ent_env)?;
+        ports = flat;
+        raw_ports = raw;
     }
     let mut consts: HashMap<String, i64> = HashMap::new();
     loop {
@@ -571,21 +1422,32 @@ fn parse_entity(p: &mut P) -> Result<Entity, String> {
             break;
         }
         if p.eat("constant") {
-            let mut env = generics.clone();
-            env.extend(consts.iter().map(|(k, v)| (k.clone(), *v)));
-            if let Ok((n, v)) = parse_constant(p, &env) {
-                consts.insert(n, v);
+            if let Ok((n, v)) = parse_constant(p, &mut ent_env) {
+                consts.insert(n.clone(), v);
+                ent_env.consts.insert(n, v);
             }
+        } else if p.eat("type") {
+            parse_type_decl(p, &mut ent_env);
+        } else if p.eat("subtype") {
+            parse_subtype_decl(p, &mut ent_env);
         } else {
             eat_decl_item(p);
         }
     }
     skip_to_end_unit(p, "entity");
+    for (rk, rv) in &ent_env.records {
+        env.records.entry(rk.clone()).or_insert_with(|| rv.clone());
+    }
+    for (sk, sv) in &ent_env.subtypes {
+        env.subtypes.entry(sk.clone()).or_insert_with(|| sv.clone());
+    }
     Ok(Entity {
         name,
         generics,
         consts,
         ports,
+        raw_ports,
+        rec_vars: ent_env.rec_vars,
     })
 }
 
@@ -598,28 +1460,25 @@ fn note_parse_soft(name: impl Into<String>, detail: Option<String>, hint: impl I
     PARSE_SOFTS.with(|s| s.borrow_mut().push((name.into(), detail, hint.into())));
 }
 
-fn parse_arch(
-    p: &mut P,
-    entities: &[Entity],
-    pkg_consts: &HashMap<String, i64>,
-) -> Result<Arch, String> {
+fn parse_arch(p: &mut P, entities: &[Entity], base_env: &TypeEnv) -> Result<Arch, String> {
     let _aname = p.ident()?;
     let _ = p.eat("of");
     let of = p.ident().unwrap_or_default();
     let _ = p.eat("is");
-    // Fold entity generics + entity declarative constants (and packages already
-    // seen) during architecture parse — widths/indexes in the arch see them.
-    let mut consts = pkg_consts.clone();
+    let mut env = base_env.clone();
     if let Some(e) = entities
         .iter()
         .rev()
         .find(|e| e.name.eq_ignore_ascii_case(&of))
     {
         for (k, v) in &e.generics {
-            consts.entry(k.clone()).or_insert(*v);
+            env.consts.entry(k.clone()).or_insert(*v);
         }
         for (k, v) in &e.consts {
-            consts.insert(k.clone(), *v);
+            env.consts.insert(k.clone(), *v);
+        }
+        for (rk, rv) in &e.rec_vars {
+            env.rec_vars.insert(rk.clone(), rv.clone());
         }
     }
     let mut arch_consts = HashMap::new();
@@ -629,29 +1488,34 @@ fn parse_arch(
         if p.peek().is_none() {
             break;
         }
-        if p.eat("signal") {
-            parse_signal_list(p, &mut signals, &consts)?;
+        if p.eat("signal") || p.eat("variable") || p.eat("shared") {
+            let _ = p.eat("variable");
+            parse_signal_list(p, &mut signals, &mut env)?;
         } else if p.eat("constant") {
-            if let Ok((n, v)) = parse_constant(p, &consts) {
-                consts.insert(n.clone(), v);
+            if let Some((n, v)) = parse_constant_into_env(p, &mut env, false) {
                 arch_consts.insert(n, v);
             }
         } else if p.eat("component") {
-            if let Ok(c) = parse_component(p, &consts) {
+            if let Ok(c) = parse_component(p, &mut env) {
                 components.push(c);
             }
-        } else if p.eat("type") || p.eat("subtype") || p.eat("attribute") || p.eat("alias") {
+        } else if p.eat("type") {
+            parse_type_decl(p, &mut env);
+        } else if p.eat("subtype") {
+            parse_subtype_decl(p, &mut env);
+        } else if p.eat("attribute") || p.eat("alias") {
             eat_decl_item(p);
         } else if p.eat("function") || p.eat("procedure") || p.eat("impure") || p.eat("pure") {
-            skip_subprogram(p);
+            let _ = p.eat("function");
+            let _ = p.eat("procedure");
+            parse_subprogram_or_proto(p, &mut env);
         } else {
             p.bump();
         }
     }
     PARSE_SOFTS.with(|s| s.borrow_mut().clear());
-    let stmts = parse_concurrent_list(p, &consts, &signals)?;
+    let stmts = parse_concurrent_list(p, &mut env, &mut signals)?;
     let parse_softs = PARSE_SOFTS.with(|s| s.borrow_mut().drain(..).collect());
-    // parse_concurrent_list already consumed `end`.
     let _ = p.eat("architecture");
     let _ = p.eat_ident();
     let _ = p.eat(";");
@@ -662,11 +1526,17 @@ fn parse_arch(
         components,
         stmts,
         parse_softs,
+        env,
     })
 }
 
-fn parse_generic_clause(p: &mut P, generics: &mut HashMap<String, i64>) -> Result<(), String> {
+fn parse_generic_clause(
+    p: &mut P,
+    generics: &mut HashMap<String, i64>,
+    env: &TypeEnv,
+) -> Result<(), String> {
     let _ = p.eat("(");
+    let mut fold = env.consts.clone();
     loop {
         if p.eat(")") {
             break;
@@ -684,11 +1554,12 @@ fn parse_generic_clause(p: &mut P, generics: &mut HashMap<String, i64>) -> Resul
         if p.peek_sym(":=") {
             let save = p.i;
             p.eat(":=");
-            val = parse_int_expr_with(p, generics).unwrap_or(0);
+            val = parse_int_expr_with(p, &fold).unwrap_or(0);
             p.i = save;
             skip_init(p);
         }
         for n in names {
+            fold.insert(n.clone(), val);
             generics.insert(n, val);
         }
         let _ = p.eat(";");
@@ -699,12 +1570,19 @@ fn parse_generic_clause(p: &mut P, generics: &mut HashMap<String, i64>) -> Resul
 
 fn parse_port_clause(
     p: &mut P,
-    consts: &HashMap<String, i64>,
-) -> Result<Vec<(String, &'static str, usize)>, String> {
+    env: &mut TypeEnv,
+) -> Result<
+    (
+        Vec<(String, &'static str, usize)>,
+        Vec<(String, &'static str, VType)>,
+    ),
+    String,
+> {
     if !p.eat("(") {
         return Err("port (".into());
     }
     let mut ports = Vec::new();
+    let mut raw_ports = Vec::new();
     loop {
         if p.eat(")") {
             break;
@@ -734,27 +1612,43 @@ fn parse_port_clause(
         } else {
             "input"
         };
-        let w = parse_type(p, consts);
+        let vty = parse_vtype(p, env);
         skip_init(p);
         for n in names {
-            ports.push((n, dir, w.max(1)));
+            raw_ports.push((n.clone(), dir, vty.clone()));
+            match &vty {
+                VType::Scalar(w) => ports.push((n, dir, (*w).max(1))),
+                VType::Record(rname) => {
+                    env.register_rec_var(&n, rname, 0);
+                    for (leaf_full, _suf, lw) in env.flatten_record_leaves(rname, &n, "", 0) {
+                        ports.push((leaf_full, dir, lw.max(1)));
+                    }
+                }
+            }
         }
         let _ = p.eat(";");
     }
     let _ = p.eat(";");
-    Ok(ports)
+    Ok((ports, raw_ports))
 }
 
-fn parse_component(p: &mut P, consts: &HashMap<String, i64>) -> Result<Entity, String> {
+fn parse_component(p: &mut P, env: &mut TypeEnv) -> Result<Entity, String> {
     let name = p.ident()?;
     let _ = p.eat("is");
+    let mut comp_env = env.clone();
     let mut generics = HashMap::new();
     if p.eat("generic") {
-        parse_generic_clause(p, &mut generics)?;
+        parse_generic_clause(p, &mut generics, &comp_env)?;
+        for (k, v) in &generics {
+            comp_env.consts.insert(k.clone(), *v);
+        }
     }
     let mut ports = Vec::new();
+    let mut raw_ports = Vec::new();
     if p.eat("port") {
-        ports = parse_port_clause(p, consts)?;
+        let (flat, raw) = parse_port_clause(p, &mut comp_env)?;
+        ports = flat;
+        raw_ports = raw;
     }
     skip_to_end_unit(p, "component");
     Ok(Entity {
@@ -762,44 +1656,94 @@ fn parse_component(p: &mut P, consts: &HashMap<String, i64>) -> Result<Entity, S
         generics,
         consts: HashMap::new(),
         ports,
+        raw_ports,
+        rec_vars: comp_env.rec_vars,
     })
+}
+
+fn push_unique_signal(signals: &mut Vec<(String, usize)>, name: String, width: usize) {
+    if !signals.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+        signals.push((name, width.max(1)));
+    }
 }
 
 fn parse_signal_list(
     p: &mut P,
     signals: &mut Vec<(String, usize)>,
-    consts: &HashMap<String, i64>,
+    env: &mut TypeEnv,
 ) -> Result<(), String> {
     let mut names = vec![p.ident()?];
     while p.eat(",") {
         names.push(p.ident()?);
     }
     let _ = p.eat(":");
-    let w = parse_type(p, consts);
+    let vty = parse_vtype(p, env);
     skip_init(p);
     let _ = p.eat(";");
     for n in names {
-        signals.push((n, w.max(1)));
+        match &vty {
+            VType::Scalar(w) => push_unique_signal(signals, n, *w),
+            VType::Record(rname) => {
+                env.register_rec_var(&n, rname, 0);
+                for (leaf_full, _suf, lw) in env.flatten_record_leaves(rname, &n, "", 0) {
+                    push_unique_signal(signals, leaf_full, lw);
+                }
+            }
+        }
     }
     Ok(())
 }
 
-fn parse_constant(p: &mut P, consts: &HashMap<String, i64>) -> Result<(String, i64), String> {
-    let n = p.ident()?;
+fn parse_constant_into_env(
+    p: &mut P,
+    env: &mut TypeEnv,
+    is_pkg: bool,
+) -> Option<(String, i64)> {
+    let Ok(n) = p.ident() else {
+        eat_to_semi(p);
+        return None;
+    };
     let _ = p.eat(":");
-    skip_type_tokens(p);
+    let vty = parse_vtype(p, env);
+    if let VType::Record(rname) = &vty {
+        if p.eat(":=") {
+            if let Ok(pairs) = parse_record_rhs(p, rname, env) {
+                let map: HashMap<String, String> = pairs.into_iter().collect();
+                env.rec_consts.insert(n.to_ascii_lowercase(), map);
+            }
+        }
+        eat_to_semi(p);
+        return None;
+    }
     let mut v = 0i64;
     if p.eat(":=") {
-        v = parse_int_expr_with(p, consts).unwrap_or(0);
+        let save = p.i;
+        if let Some(iv) = parse_int_expr_with(p, &env.consts) {
+            v = iv;
+        } else {
+            p.i = save;
+            if let Some(Tok::BitStr(bits)) = p.peek() {
+                v = i64::from_str_radix(bits, 2).unwrap_or(0);
+                p.i += 1;
+            }
+        }
     }
     eat_to_semi(p);
-    Ok((n, v))
+    env.consts.insert(n.clone(), v);
+    if is_pkg {
+        env.pkg_consts.insert(n.clone(), v);
+    }
+    Some((n, v))
+}
+
+fn parse_constant(p: &mut P, env: &mut TypeEnv) -> Result<(String, i64), String> {
+    parse_constant_into_env(p, env, false).ok_or_else(|| "constant".into())
 }
 
 fn parse_concurrent_list(
     p: &mut P,
-    consts: &HashMap<String, i64>,
-    signals: &[(String, usize)],
+    env: &mut TypeEnv,
+    signals: &mut Vec<(String, usize)>,
 ) -> Result<Vec<CStmt>, String> {
     let mut out = Vec::new();
     loop {
@@ -809,12 +1753,10 @@ fn parse_concurrent_list(
         if p.eat("end") {
             break;
         }
-        match parse_concurrent(p, consts, signals) {
-            Ok(Some(s)) => out.push(s),
-            Ok(None) => {}
+        match parse_concurrent_many(p, env, signals) {
+            Ok(stmts) => out.extend(stmts),
             Err(_) => {
-                // Recover: still capture a `<=` assignment in this statement.
-                if let Some(s) = recover_assign(p, consts) {
+                if let Some(s) = recover_assign(p, env) {
                     out.push(s);
                 } else {
                     skip_stmt(p);
@@ -825,54 +1767,97 @@ fn parse_concurrent_list(
     Ok(out)
 }
 
-fn parse_concurrent(
+fn parse_concurrent_many(
     p: &mut P,
-    consts: &HashMap<String, i64>,
-    signals: &[(String, usize)],
-) -> Result<Option<CStmt>, String> {
+    env: &mut TypeEnv,
+    signals: &mut Vec<(String, usize)>,
+) -> Result<Vec<CStmt>, String> {
     if p.eat("assert") || p.eat("report") || p.eat("severity") {
         eat_to_semi(p);
-        return Ok(None);
+        return Ok(Vec::new());
     }
     if p.eat("with") {
-        let sel = parse_expr_sv(p, consts)?;
+        let sel = parse_expr_sv(p, env)?;
         let _ = p.eat("select");
-        let lhs = parse_target_sv(p, consts, signals)?;
+        let lhs = parse_target_sv(p, env, signals)?;
         if !p.eat("<=") {
             return Err("select <=".into());
+        }
+        if let Some(rec_type) = env.resolve_rec_var(&lhs) {
+            let leaves = env.flatten_record_leaves(&rec_type, &lhs, "", 0);
+            let mut arms: Vec<(String, HashMap<String, String>)> = Vec::new();
+            let mut other: Option<HashMap<String, String>> = None;
+            loop {
+                let val_map: HashMap<String, String> =
+                    parse_record_rhs(p, &rec_type, env)?.into_iter().collect();
+                let _ = p.eat("when");
+                if p.eat("others") {
+                    other = Some(val_map);
+                    let _ = p.eat(";");
+                    break;
+                }
+                let pat = parse_expr_sv(p, env)?;
+                arms.push((pat, val_map));
+                if p.eat(";") {
+                    break;
+                }
+                let _ = p.eat(",");
+            }
+            let mut out = Vec::new();
+            for (leaf_lhs, suf, _w) in leaves {
+                let leaf_arms: Vec<(String, String)> = arms
+                    .iter()
+                    .map(|(pat, m)| {
+                        (
+                            pat.clone(),
+                            m.get(&suf).cloned().unwrap_or_else(|| "1'b0".into()),
+                        )
+                    })
+                    .collect();
+                let leaf_other = other
+                    .as_ref()
+                    .and_then(|m| m.get(&suf).cloned());
+                out.push(CStmt::Selected {
+                    sel: sel.clone(),
+                    lhs: leaf_lhs,
+                    arms: leaf_arms,
+                    other: leaf_other,
+                });
+            }
+            return Ok(out);
         }
         let mut arms = Vec::new();
         let mut other = None;
         loop {
-            let val = parse_expr_sv(p, consts)?;
+            let val = parse_expr_sv(p, env)?;
             let _ = p.eat("when");
             if p.eat("others") {
                 other = Some(val);
                 let _ = p.eat(";");
                 break;
             }
-            let pat = parse_expr_sv(p, consts)?;
+            let pat = parse_expr_sv(p, env)?;
             arms.push((pat, val));
             if p.eat(";") {
                 break;
             }
             let _ = p.eat(",");
         }
-        return Ok(Some(CStmt::Selected {
+        return Ok(vec![CStmt::Selected {
             sel,
             lhs,
             arms,
             other,
-        }));
+        }]);
     }
     if p.eat("process") {
-        return Ok(Some(parse_process(p, consts, signals)?));
+        return Ok(vec![parse_process(p, env, signals)?]);
     }
     if p.eat("for") {
-        return parse_for_generate(p, consts, signals);
+        return Ok(parse_for_generate(p, env, signals)?.into_iter().collect());
     }
     if p.eat("if") {
-        return parse_if_generate(p, consts, signals);
+        return Ok(parse_if_generate(p, env, signals)?.into_iter().collect());
     }
     // Optional label: ident :
     let save = p.i;
@@ -880,68 +1865,117 @@ fn parse_concurrent(
         let lab = p.ident()?;
         if p.eat(":") {
             if p.eat("process") {
-                return Ok(Some(parse_process(p, consts, signals)?));
+                return Ok(vec![parse_process(p, env, signals)?]);
             }
             if p.eat("for") {
-                return parse_for_generate(p, consts, signals);
+                return Ok(parse_for_generate(p, env, signals)?.into_iter().collect());
             }
             if p.eat("if") {
-                return parse_if_generate(p, consts, signals);
+                return Ok(parse_if_generate(p, env, signals)?.into_iter().collect());
             }
             if p.eat("entity") {
                 let _ = p.eat_ident(); // work
                 let _ = p.eat(".");
                 let module = p.ident().unwrap_or_else(|_| lab.clone());
+                if p.eat("(") {
+                    skip_paren_rest(p); // optional architecture name `entity work.foo(rtl)`
+                }
                 skip_generic_map(p);
-                let conns = parse_port_map(p, consts)?;
-                return Ok(Some(CStmt::Inst {
+                let conns = parse_port_map(p, env)?;
+                return Ok(vec![CStmt::Inst {
                     module,
                     name: lab,
                     conns,
-                }));
+                }]);
             }
             if p.eat("component") {
                 let module = p.ident().unwrap_or_else(|_| lab.clone());
                 skip_generic_map(p);
-                let conns = parse_port_map(p, consts)?;
-                return Ok(Some(CStmt::Inst {
+                let conns = parse_port_map(p, env)?;
+                return Ok(vec![CStmt::Inst {
                     module,
                     name: lab,
                     conns,
-                }));
+                }]);
             }
-            // inst: Name port map
             if matches!(p.peek(), Some(Tok::Ident(_)) | Some(Tok::Kw(_))) {
                 let module = p.ident()?;
                 skip_generic_map(p);
                 if p.eat("port") || p.peek_sym("(") {
-                    let conns = parse_port_map(p, consts)?;
-                    return Ok(Some(CStmt::Inst {
+                    let conns = parse_port_map(p, env)?;
+                    return Ok(vec![CStmt::Inst {
                         module,
                         name: lab,
                         conns,
-                    }));
+                    }]);
                 }
             }
         }
         p.i = save;
     }
-    // Concurrent assignment, possibly conditional.
-    let lhs = parse_target_sv(p, consts, signals)?;
+    // Concurrent assignment, possibly conditional, possibly whole-record or aggregate.
+    let lhs = parse_target_sv(p, env, signals)?;
     if !p.eat("<=") {
         p.i = save;
         skip_stmt(p);
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    let first = parse_expr_sv(p, consts)?;
+    if let Some(rec_type) = env.resolve_rec_var(&lhs) {
+        let leaves = env.flatten_record_leaves(&rec_type, &lhs, "", 0);
+        let first_map: HashMap<String, String> =
+            parse_record_rhs(p, &rec_type, env)?.into_iter().collect();
+        if p.eat("when") {
+            let mut arms: Vec<(Option<String>, HashMap<String, String>)> = Vec::new();
+            let cond = parse_expr_sv(p, env)?;
+            arms.push((Some(cond), first_map));
+            while p.eat("else") {
+                let vmap: HashMap<String, String> =
+                    parse_record_rhs(p, &rec_type, env)?.into_iter().collect();
+                if p.eat("when") {
+                    let c = parse_expr_sv(p, env)?;
+                    arms.push((Some(c), vmap));
+                } else {
+                    arms.push((None, vmap));
+                    break;
+                }
+            }
+            let _ = p.eat(";");
+            let mut out = Vec::new();
+            for (leaf_lhs, suf, _w) in leaves {
+                let leaf_arms: Vec<(Option<String>, String)> = arms
+                    .iter()
+                    .map(|(c, m)| {
+                        (
+                            c.clone(),
+                            m.get(&suf).cloned().unwrap_or_else(|| "1'b0".into()),
+                        )
+                    })
+                    .collect();
+                out.push(CStmt::CondAssign {
+                    lhs: leaf_lhs,
+                    arms: leaf_arms,
+                });
+            }
+            return Ok(out);
+        }
+        skip_after_delay(p);
+        let _ = p.eat(";");
+        let mut out = Vec::new();
+        for (leaf_lhs, suf, _w) in leaves {
+            let rhs = first_map.get(&suf).cloned().unwrap_or_else(|| "1'b0".into());
+            out.push(CStmt::Assign { lhs: leaf_lhs, rhs });
+        }
+        return Ok(out);
+    }
+    let first = parse_expr_sv(p, env)?;
     if p.eat("when") {
         let mut arms = Vec::new();
-        let cond = parse_expr_sv(p, consts)?;
+        let cond = parse_expr_sv(p, env)?;
         arms.push((Some(cond), first));
         while p.eat("else") {
-            let v = parse_expr_sv(p, consts)?;
+            let v = parse_expr_sv(p, env)?;
             if p.eat("when") {
-                let c = parse_expr_sv(p, consts)?;
+                let c = parse_expr_sv(p, env)?;
                 arms.push((Some(c), v));
             } else {
                 arms.push((None, v));
@@ -949,26 +1983,309 @@ fn parse_concurrent(
             }
         }
         let _ = p.eat(";");
-        return Ok(Some(CStmt::CondAssign { lhs, arms }));
+        return Ok(vec![CStmt::CondAssign { lhs, arms }]);
     }
     skip_after_delay(p);
     let _ = p.eat(";");
-    Ok(Some(CStmt::Assign { lhs, rhs: first }))
+    Ok(vec![CStmt::Assign { lhs, rhs: first }])
+}
+
+fn parse_record_rhs(
+    p: &mut P,
+    rec_type: &str,
+    env: &TypeEnv,
+) -> Result<Vec<(String, String)>, String> {
+    if p.peek_sym("(") {
+        return parse_record_aggregate(p, rec_type, env, 0);
+    }
+    let rhs_name = parse_qualified_ident_or_expr(p, env)?;
+    if let Some(cmap) = env.rec_consts.get(&rhs_name.to_ascii_lowercase()) {
+        let leaves = env.flatten_record_leaves(rec_type, "", "", 0);
+        return Ok(leaves
+            .into_iter()
+            .map(|(_full, suf, _w)| {
+                let v = cmap.get(&suf).cloned().unwrap_or_else(|| "1'b0".into());
+                (suf, v)
+            })
+            .collect());
+    }
+    if let Some((fname, args)) = rhs_name.strip_prefix("__func_call:").and_then(|s| s.split_once(':')) {
+        if let Some(fdef) = env.funcs.get(&fname.to_ascii_lowercase()) {
+            if !fdef.leaf_exprs.is_empty() {
+                let arg_list: Vec<&str> = if args.is_empty() {
+                    Vec::new()
+                } else {
+                    args.split("\x1f").collect()
+                };
+                let mut param_map = HashMap::new();
+                for (param, arg) in fdef.params.iter().zip(arg_list.iter()) {
+                    param_map.insert(param.clone(), (*arg).to_string());
+                }
+                let leaves = env.flatten_record_leaves(rec_type, "", "", 0);
+                return Ok(leaves
+                    .into_iter()
+                    .map(|(_full, suf, _w)| {
+                        let raw = fdef.leaf_exprs.get(&suf).cloned().unwrap_or_else(|| "1'b0".into());
+                        (suf, replace_word_map(&raw, &param_map))
+                    })
+                    .collect());
+            }
+        }
+    }
+    let leaves = env.flatten_record_leaves(rec_type, "", "", 0);
+    Ok(leaves
+        .into_iter()
+        .map(|(_full, suf, _w)| (suf.clone(), format!("{rhs_name}_{suf}")))
+        .collect())
+}
+
+fn parse_qualified_ident_or_expr(p: &mut P, env: &TypeEnv) -> Result<String, String> {
+    if matches!(p.peek(), Some(Tok::Ident(_)) | Some(Tok::Kw(_))) {
+        let mut n = p.ident()?;
+        while p.eat(".") {
+            let f = p.ident()?;
+            if env.pkg_names.contains(&n.to_ascii_lowercase()) {
+                n = f;
+            } else {
+                n = format!("{n}_{f}");
+            }
+        }
+        if p.eat("(") {
+            let mut args = Vec::new();
+            if !p.eat(")") {
+                loop {
+                    args.push(parse_expr_sv(p, env).unwrap_or_else(|_| "1'b0".into()));
+                    if !p.eat(",") {
+                        break;
+                    }
+                }
+                let _ = p.eat(")");
+            }
+            if env.funcs.contains_key(&n.to_ascii_lowercase()) {
+                return Ok(format!("__func_call:{}:{}", n, args.join("\x1f")));
+            }
+        }
+        return Ok(n);
+    }
+    parse_expr_sv(p, env)
+}
+
+fn parse_record_aggregate(
+    p: &mut P,
+    rec_type: &str,
+    env: &TypeEnv,
+    depth: usize,
+) -> Result<Vec<(String, String)>, String> {
+    if depth > 16 || !p.eat("(") {
+        return Err("record aggregate (".into());
+    }
+    let Some(def) = env.get_record(rec_type).cloned() else {
+        skip_paren_rest(p);
+        return Ok(Vec::new());
+    };
+    let mut result: HashMap<String, String> = HashMap::new();
+    let mut others_bit: Option<char> = None;
+    let mut others_expr: Option<String> = None;
+    let mut pos_idx = 0usize;
+    while !p.eat(")") && p.peek().is_some() {
+        if p.eat("others") {
+            let _ = p.eat("=>");
+            if let Some(ch) = peek_aggregate_fill_bit(p) {
+                others_bit = Some(ch);
+            } else {
+                others_expr = Some(parse_expr_sv(p, env).unwrap_or_else(|_| "1'b0".into()));
+            }
+            let _ = p.eat(",");
+            continue;
+        }
+        // Check if named association: `field1 [| field2 ...] => val`
+        let save = p.i;
+        let mut choices = Vec::new();
+        let mut is_named = false;
+        if matches!(p.peek(), Some(Tok::Ident(_)) | Some(Tok::Kw(_))) {
+            if let Ok(c0) = p.ident() {
+                choices.push(c0);
+                while p.eat("|") {
+                    if let Ok(cn) = p.ident() {
+                        choices.push(cn);
+                    } else {
+                        break;
+                    }
+                }
+                if p.eat("=>") {
+                    is_named = true;
+                }
+            }
+        }
+        if !is_named {
+            p.i = save;
+            choices.clear();
+            if let Some(f) = def.fields.get(pos_idx) {
+                choices.push(f.name.clone());
+                pos_idx += 1;
+            }
+        }
+        if choices.len() == 1 {
+            let fname = &choices[0];
+            if let Some(fdef) = def
+                .fields
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case(fname))
+            {
+                let fkey = fdef.name.to_ascii_lowercase();
+                match &fdef.ty {
+                    VType::Scalar(w) => {
+                        let val = parse_scalar_field_rhs(p, *w, env)?;
+                        result.insert(fkey, val);
+                    }
+                    VType::Record(sub_rec) => {
+                        if let Some(ch) = peek_aggregate_fill_bit(p) {
+                            for (_full, suf, lw) in env.flatten_record_leaves(sub_rec, "", &fkey, depth + 1) {
+                                result.insert(suf, fill_bits_literal(lw, ch));
+                            }
+                        } else {
+                            let sub_pairs = parse_record_rhs(p, sub_rec, env)?;
+                            for (sub_suf, sub_val) in sub_pairs {
+                                result.insert(format!("{fkey}_{sub_suf}"), sub_val);
+                            }
+                        }
+                    }
+                }
+            } else {
+                let _ = parse_expr_sv(p, env);
+            }
+        } else if !choices.is_empty() {
+            if let Some(ch) = peek_aggregate_fill_bit(p) {
+                for cname in &choices {
+                    if let Some(fdef) = def
+                        .fields
+                        .iter()
+                        .find(|f| f.name.eq_ignore_ascii_case(cname))
+                    {
+                        let fkey = fdef.name.to_ascii_lowercase();
+                        match &fdef.ty {
+                            VType::Scalar(w) => {
+                                result.insert(fkey, fill_bits_literal(*w, ch));
+                            }
+                            VType::Record(sub_rec) => {
+                                for (_full, suf, lw) in
+                                    env.flatten_record_leaves(sub_rec, "", &fkey, depth + 1)
+                                {
+                                    result.insert(suf, fill_bits_literal(lw, ch));
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                let v = parse_expr_sv(p, env).unwrap_or_else(|_| "1'b0".into());
+                for cname in &choices {
+                    if let Some(fdef) = def
+                        .fields
+                        .iter()
+                        .find(|f| f.name.eq_ignore_ascii_case(cname))
+                    {
+                        result.insert(fdef.name.to_ascii_lowercase(), v.clone());
+                    }
+                }
+            }
+        } else {
+            let _ = parse_expr_sv(p, env);
+        }
+        if !p.eat(",") {
+            if p.eat(")") {
+                break;
+            }
+        }
+    }
+    let all_leaves = env.flatten_record_leaves(rec_type, "", "", 0);
+    let mut out = Vec::with_capacity(all_leaves.len());
+    for (_full, suf, lw) in all_leaves {
+        if let Some(v) = result.remove(&suf) {
+            out.push((suf, v));
+        } else if let Some(ch) = others_bit {
+            out.push((suf, fill_bits_literal(lw, ch)));
+        } else if let Some(e) = &others_expr {
+            out.push((suf, e.clone()));
+        } else {
+            out.push((suf, fill_bits_literal(lw, '0')));
+        }
+    }
+    Ok(out)
+}
+
+fn parse_scalar_field_rhs(p: &mut P, width: usize, env: &TypeEnv) -> Result<String, String> {
+    if let Some(ch) = peek_aggregate_fill_bit(p) {
+        return Ok(fill_bits_literal(width, ch));
+    }
+    parse_expr_sv(p, env)
+}
+
+/// Recognizes `'0'`, `'1'`, `(others => '0')`, `(others => '1')`, or nested
+/// `(others => (others => '0'))` and returns the fill bit `'0'` or `'1'`.
+fn peek_aggregate_fill_bit(p: &mut P) -> Option<char> {
+    let save = p.i;
+    let mut parens = 0usize;
+    while p.eat("(") {
+        parens += 1;
+        if !p.eat("others") || !p.eat("=>") {
+            p.i = save;
+            return None;
+        }
+    }
+    if parens == 0 {
+        return None;
+    }
+    let bit = match p.peek() {
+        Some(Tok::BitStr(s)) if s == "1" => {
+            p.i += 1;
+            '1'
+        }
+        Some(Tok::BitStr(s)) if s == "0" => {
+            p.i += 1;
+            '0'
+        }
+        Some(Tok::Num(0)) => {
+            p.i += 1;
+            '0'
+        }
+        Some(Tok::Num(1)) => {
+            p.i += 1;
+            '1'
+        }
+        _ => {
+            p.i = save;
+            return None;
+        }
+    };
+    for _ in 0..parens {
+        if !p.eat(")") {
+            p.i = save;
+            return None;
+        }
+    }
+    Some(bit)
+}
+
+fn fill_bits_literal(width: usize, bit: char) -> String {
+    let w = width.max(1);
+    let b = if bit == '1' { '1' } else { '0' };
+    let bits: String = std::iter::repeat(b).take(w).collect();
+    format!("{w}'b{bits}")
 }
 
 fn parse_for_generate(
     p: &mut P,
-    consts: &HashMap<String, i64>,
-    signals: &[(String, usize)],
+    env: &mut TypeEnv,
+    signals: &mut Vec<(String, usize)>,
 ) -> Result<Option<CStmt>, String> {
     let var = p.ident()?;
     let _ = p.eat("in");
-    let lo = parse_int_expr(p).unwrap_or(0);
+    let lo = parse_int_expr_with(p, &env.consts).unwrap_or(0);
     let downto = p.eat("downto");
     let _ = p.eat("to");
-    let hi = parse_int_expr(p).unwrap_or(lo);
+    let hi = parse_int_expr_with(p, &env.consts).unwrap_or(lo);
     let _ = p.eat("generate");
-    // Optional declarative region.
     let save = p.i;
     let mut saw_begin = false;
     let mut k = 0;
@@ -993,8 +2310,6 @@ fn parse_for_generate(
     }
     let (a, b) = if downto { (hi, lo) } else { (lo, hi) };
     let mut all = Vec::new();
-    let body_toks_start = p.i;
-    // Capture body tokens until end generate.
     let mut depth = 1i32;
     let start = p.i;
     while depth > 0 && p.peek().is_some() {
@@ -1013,7 +2328,6 @@ fn parse_for_generate(
     }
     let body = p.t[start..p.i.min(p.t.len())].to_vec();
     let _ = p.eat(";");
-    let _ = body_toks_start;
     let step = if a <= b { 1i64 } else { -1 };
     let mut i = a;
     let mut n = 0;
@@ -1021,11 +2335,10 @@ fn parse_for_generate(
         if n > 4096 {
             break;
         }
-        let mut c = consts.clone();
-        c.insert(var.clone(), i);
+        let mut c_env = env.clone();
+        c_env.consts.insert(var.clone(), i);
         let mut bp = P { t: &body, i: 0 };
-        // body includes trailing `end generate` tokens already consumed; strip last end.
-        let stmts = parse_concurrent_list(&mut bp, &c, signals).unwrap_or_default();
+        let stmts = parse_concurrent_list(&mut bp, &mut c_env, signals).unwrap_or_default();
         all.extend(stmts);
         if i == b {
             break;
@@ -1043,9 +2356,6 @@ fn parse_for_generate(
             var.clone(),
         );
     }
-    // Flatten generate into sequential concurrent stmts by returning the first and
-    // splicing the rest via a dummy process-free list — caller only takes one.
-    // Push extras by wrapping: we return a process-less chain using Inst-less assigns.
     Ok(Some(CStmt::Process {
         clock: None,
         body: all
@@ -1064,10 +2374,10 @@ fn parse_for_generate(
 
 fn parse_if_generate(
     p: &mut P,
-    consts: &HashMap<String, i64>,
-    signals: &[(String, usize)],
+    env: &mut TypeEnv,
+    signals: &mut Vec<(String, usize)>,
 ) -> Result<Option<CStmt>, String> {
-    let cond = parse_int_expr(p).unwrap_or(1);
+    let cond = parse_int_expr_with(p, &env.consts).unwrap_or(1);
     let _ = p.eat("generate");
     let mut then_toks = Vec::new();
     let mut else_toks = Vec::new();
@@ -1102,9 +2412,8 @@ fn parse_if_generate(
     let use_else = cond == 0;
     let toks = if use_else { else_toks } else { then_toks };
     let mut bp = P { t: &toks, i: 0 };
-    let stmts = parse_concurrent_list(&mut bp, consts, signals).unwrap_or_default();
-    // Contract: return at most one concurrent stmt. Never silent-drop Insts —
-    // mirror for-generate when Insts are stripped/truncated from the body.
+    let mut c_env = env.clone();
+    let stmts = parse_concurrent_list(&mut bp, &mut c_env, signals).unwrap_or_default();
     let n = stmts.len();
     let dropped_inst = stmts
         .iter()
@@ -1123,8 +2432,8 @@ fn parse_if_generate(
 
 fn parse_process(
     p: &mut P,
-    consts: &HashMap<String, i64>,
-    signals: &[(String, usize)],
+    env: &mut TypeEnv,
+    signals: &mut Vec<(String, usize)>,
 ) -> Result<CStmt, String> {
     if p.eat("(") {
         let mut d = 1i32;
@@ -1138,17 +2447,27 @@ fn parse_process(
             }
         }
     }
+    let mut proc_env = env.clone();
     while !p.eat("begin") {
         if p.peek().is_none() {
             break;
         }
         if p.eat("variable") {
-            let _ = parse_signal_list(p, &mut Vec::new(), consts);
+            let _ = parse_signal_list(p, signals, &mut proc_env);
+        } else if p.eat("constant") {
+            parse_constant_into_env(p, &mut proc_env, false);
+        } else if p.eat("type") {
+            parse_type_decl(p, &mut proc_env);
+        } else if p.eat("subtype") {
+            parse_subtype_decl(p, &mut proc_env);
         } else {
             p.bump();
         }
     }
-    let body = parse_seq_list(p, consts, signals)?;
+    for (rk, rv) in &proc_env.rec_vars {
+        env.rec_vars.entry(rk.clone()).or_insert_with(|| rv.clone());
+    }
+    let body = parse_seq_list(p, &proc_env, signals)?;
     let _ = p.eat("end");
     let _ = p.eat("process");
     let _ = p.eat_ident();
@@ -1160,14 +2479,14 @@ fn parse_process(
 
 fn parse_if_else_chain(
     p: &mut P,
-    consts: &HashMap<String, i64>,
+    env: &TypeEnv,
     signals: &[(String, usize)],
 ) -> Result<Vec<SStmt>, String> {
     if p.eat("elsif") {
-        let cond = parse_clock_or_expr(p, consts)?;
+        let cond = parse_clock_or_expr(p, env)?;
         let _ = p.eat("then");
-        let then_b = parse_seq_list(p, consts, signals)?;
-        let else_b = parse_if_else_chain(p, consts, signals)?;
+        let then_b = parse_seq_list(p, env, signals)?;
+        let else_b = parse_if_else_chain(p, env, signals)?;
         return Ok(vec![SStmt::If {
             cond,
             then_b,
@@ -1175,14 +2494,14 @@ fn parse_if_else_chain(
         }]);
     }
     if p.eat("else") {
-        return parse_seq_list(p, consts, signals);
+        return parse_seq_list(p, env, signals);
     }
     Ok(Vec::new())
 }
 
 fn parse_seq_list(
     p: &mut P,
-    consts: &HashMap<String, i64>,
+    env: &TypeEnv,
     signals: &[(String, usize)],
 ) -> Result<Vec<SStmt>, String> {
     let mut v = Vec::new();
@@ -1190,7 +2509,6 @@ fn parse_seq_list(
         if p.peek().is_none() {
             break;
         }
-        // Leave terminators for the caller (`end if`, `elsif`, next `when`, …).
         if matches!(
             p.peek(),
             Some(Tok::Kw(k))
@@ -1198,44 +2516,43 @@ fn parse_seq_list(
         ) {
             break;
         }
-        match parse_seq(p, consts, signals) {
-            Ok(Some(s)) => v.push(s),
-            Ok(None) => {}
+        match parse_seq_many(p, env, signals) {
+            Ok(stmts) => v.extend(stmts),
             Err(_) => skip_stmt(p),
         }
     }
     Ok(v)
 }
 
-fn parse_seq(
+fn parse_seq_many(
     p: &mut P,
-    consts: &HashMap<String, i64>,
+    env: &TypeEnv,
     signals: &[(String, usize)],
-) -> Result<Option<SStmt>, String> {
+) -> Result<Vec<SStmt>, String> {
     if p.eat("null") {
         eat_to_semi(p);
-        return Ok(None);
+        return Ok(Vec::new());
     }
     if p.eat("wait") || p.eat("assert") || p.eat("report") || p.eat("next") || p.eat("exit") {
         eat_to_semi(p);
-        return Ok(None);
+        return Ok(Vec::new());
     }
     if p.eat("if") {
-        let cond = parse_clock_or_expr(p, consts)?;
+        let cond = parse_clock_or_expr(p, env)?;
         let _ = p.eat("then");
-        let then_b = parse_seq_list(p, consts, signals)?;
-        let else_b = parse_if_else_chain(p, consts, signals)?;
+        let then_b = parse_seq_list(p, env, signals)?;
+        let else_b = parse_if_else_chain(p, env, signals)?;
         let _ = p.eat("end");
         let _ = p.eat("if");
         let _ = p.eat(";");
-        return Ok(Some(SStmt::If {
+        return Ok(vec![SStmt::If {
             cond,
             then_b,
             else_b,
-        }));
+        }]);
     }
     if p.eat("case") {
-        let sel = parse_expr_sv(p, consts)?;
+        let sel = parse_expr_sv(p, env)?;
         let _ = p.eat("is");
         let mut arms = Vec::new();
         let mut other = Vec::new();
@@ -1254,74 +2571,85 @@ fn parse_seq(
             }
             if p.eat("others") {
                 let _ = p.eat("=>");
-                other = parse_seq_list(p, consts, signals)?;
+                other = parse_seq_list(p, env, signals)?;
                 continue;
             }
-            let mut pats = vec![parse_expr_sv(p, consts)?];
+            let mut pats = vec![parse_expr_sv(p, env)?];
             while p.eat("|") {
-                pats.push(parse_expr_sv(p, consts)?);
+                pats.push(parse_expr_sv(p, env)?);
             }
             let _ = p.eat("=>");
-            let body = parse_seq_list(p, consts, signals)?;
+            let body = parse_seq_list(p, env, signals)?;
             arms.push((pats, body));
         }
-        return Ok(Some(SStmt::Case { sel, arms, other }));
+        return Ok(vec![SStmt::Case { sel, arms, other }]);
     }
     if p.eat("for") {
         let var = p.ident()?;
         let _ = p.eat("in");
-        let lo = parse_int_expr(p).unwrap_or(0);
+        let lo = parse_int_expr_with(p, &env.consts).unwrap_or(0);
         let downto = p.eat("downto");
         let _ = p.eat("to");
-        let hi = parse_int_expr(p).unwrap_or(lo);
+        let hi = parse_int_expr_with(p, &env.consts).unwrap_or(lo);
         let _ = p.eat("loop");
-        let body = parse_seq_list(p, consts, signals)?;
+        let body = parse_seq_list(p, env, signals)?;
         let _ = p.eat("end");
         let _ = p.eat("loop");
         let _ = p.eat(";");
         let (lo, hi) = if downto { (hi, lo) } else { (lo, hi) };
-        return Ok(Some(SStmt::For { var, lo, hi, body }));
+        return Ok(vec![SStmt::For { var, lo, hi, body }]);
     }
     if p.eat("while") {
         eat_until_kw(p, "loop");
         let _ = p.eat("loop");
-        let body = parse_seq_list(p, consts, signals)?;
+        let body = parse_seq_list(p, env, signals)?;
         let _ = p.eat("end");
         let _ = p.eat("loop");
         let _ = p.eat(";");
-        // Finite unroll of 8 for unknown while — still maps the body.
-        return Ok(Some(SStmt::For {
+        return Ok(vec![SStmt::For {
             var: "_w".into(),
             lo: 0,
             hi: 7,
             body,
-        }));
+        }]);
     }
     if p.eat("loop") {
-        let body = parse_seq_list(p, consts, signals)?;
+        let body = parse_seq_list(p, env, signals)?;
         let _ = p.eat("end");
         let _ = p.eat("loop");
         let _ = p.eat(";");
-        return Ok(Some(SStmt::For {
+        return Ok(vec![SStmt::For {
             var: "_l".into(),
             lo: 0,
             hi: 0,
             body,
-        }));
+        }]);
     }
-    // Assignment: target <= expr;  or  target := expr;
-    let lhs = parse_target_sv(p, consts, signals)?;
+    let lhs = parse_target_sv(p, env, signals)?;
     if p.eat("<=") || p.eat(":=") {
-        let rhs = parse_expr_sv(p, consts)?;
+        if let Some(rec_type) = env.resolve_rec_var(&lhs) {
+            let leaves = env.flatten_record_leaves(&rec_type, &lhs, "", 0);
+            let rhs_map: HashMap<String, String> =
+                parse_record_rhs(p, &rec_type, env)?.into_iter().collect();
+            skip_after_delay(p);
+            let _ = p.eat(";");
+            let mut out = Vec::with_capacity(leaves.len());
+            for (leaf_lhs, suf, _w) in leaves {
+                let rhs = rhs_map.get(&suf).cloned().unwrap_or_else(|| "1'b0".into());
+                out.push(SStmt::Assign { lhs: leaf_lhs, rhs });
+            }
+            return Ok(out);
+        }
+        let rhs = parse_expr_sv(p, env)?;
         skip_after_delay(p);
         let _ = p.eat(";");
-        return Ok(Some(SStmt::Assign { lhs, rhs }));
+        return Ok(vec![SStmt::Assign { lhs, rhs }]);
     }
     skip_stmt(p);
-    Ok(None)
+    Ok(Vec::new())
 }
 
-fn parse_clock_or_expr(p: &mut P, consts: &HashMap<String, i64>) -> Result<String, String> {
+fn parse_clock_or_expr(p: &mut P, env: &TypeEnv) -> Result<String, String> {
     if let Some((clk, rise)) = take_clock(p) {
         return Ok(if rise {
             format!("__posedge_{clk}")
@@ -1329,20 +2657,30 @@ fn parse_clock_or_expr(p: &mut P, consts: &HashMap<String, i64>) -> Result<Strin
             format!("__negedge_{clk}")
         });
     }
-    parse_expr_sv(p, consts)
+    parse_expr_sv(p, env)
 }
 
 fn take_clock(p: &mut P) -> Option<(String, bool)> {
     let save = p.i;
     if p.eat("rising_edge") {
         let _ = p.eat("(");
-        let n = p.ident().ok()?;
+        let mut n = p.ident().ok()?;
+        while p.eat(".") {
+            if let Ok(f) = p.ident() {
+                n = format!("{n}_{f}");
+            }
+        }
         let _ = p.eat(")");
         return Some((n, true));
     }
     if p.eat("falling_edge") {
         let _ = p.eat("(");
-        let n = p.ident().ok()?;
+        let mut n = p.ident().ok()?;
+        while p.eat(".") {
+            if let Ok(f) = p.ident() {
+                n = format!("{n}_{f}");
+            }
+        }
         let _ = p.eat(")");
         return Some((n, false));
     }
@@ -1478,10 +2816,7 @@ fn strip_clock_if(body: Vec<SStmt>) -> Vec<SStmt> {
     body
 }
 
-fn parse_port_map(
-    p: &mut P,
-    consts: &HashMap<String, i64>,
-) -> Result<Vec<(String, String)>, String> {
+fn parse_port_map(p: &mut P, env: &TypeEnv) -> Result<Vec<(String, String)>, String> {
     let _ = p.eat("port");
     let _ = p.eat("map");
     let _ = p.eat("(");
@@ -1500,17 +2835,17 @@ fn parse_port_map(
             continue;
         }
         let save = p.i;
-        let first = parse_expr_sv(p, consts).unwrap_or_else(|_| "1'b0".into());
+        let first = parse_expr_sv(p, env).unwrap_or_else(|_| "1'b0".into());
         if p.eat("=>") {
             let net = if p.eat("open") {
                 format!("_open{idx}")
             } else {
-                parse_expr_sv(p, consts).unwrap_or(first.clone())
+                parse_expr_sv(p, env).unwrap_or(first.clone())
             };
             conns.push((first, net));
         } else {
             p.i = save;
-            let net = parse_expr_sv(p, consts).unwrap_or_else(|_| "1'b0".into());
+            let net = parse_expr_sv(p, env).unwrap_or_else(|_| "1'b0".into());
             conns.push((format!("#{idx}"), net));
         }
         idx += 1;
@@ -1529,52 +2864,59 @@ fn skip_generic_map(p: &mut P) {
 
 fn parse_target_sv(
     p: &mut P,
-    consts: &HashMap<String, i64>,
+    env: &TypeEnv,
     signals: &[(String, usize)],
 ) -> Result<String, String> {
-    let n = p.ident()?;
+    let mut n = p.ident()?;
+    while p.eat(".") {
+        let f = p.ident()?;
+        if env.pkg_names.contains(&n.to_ascii_lowercase()) {
+            n = f;
+        } else {
+            n = format!("{n}_{f}");
+        }
+    }
     if p.eat("(") {
-        if let Some(a) = parse_int_expr_with(p, consts) {
+        if let Some(a) = parse_int_expr_with(p, &env.consts) {
             if p.eat("downto") || p.eat("to") {
-                let b = parse_int_expr_with(p, consts).unwrap_or(a);
+                let b = parse_int_expr_with(p, &env.consts).unwrap_or(a);
                 let _ = p.eat(")");
                 let hi = a.max(b);
                 let lo = a.min(b);
                 if hi == lo {
                     return Ok(format!("{n}[{hi}]"));
                 }
-                // Bit-blast later at emit for NBA slices; keep range for now.
                 let _ = signals;
                 return Ok(format!("{n}[{hi}:{lo}]"));
             }
             let _ = p.eat(")");
             return Ok(format!("{n}[{a}]"));
         }
-        let e = parse_expr_sv(p, consts)?;
+        let e = parse_expr_sv(p, env)?;
         let _ = p.eat(")");
         return Ok(format!("{n}[{e}]"));
     }
     Ok(n)
 }
 
-fn parse_expr_sv(p: &mut P, consts: &HashMap<String, i64>) -> Result<String, String> {
-    parse_or_sv(p, consts)
+fn parse_expr_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
+    parse_or_sv(p, env)
 }
 
-fn parse_or_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, String> {
-    let mut e = parse_and_sv(p, c)?;
+fn parse_or_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
+    let mut e = parse_and_sv(p, env)?;
     loop {
         if p.eat("or") {
-            let r = parse_and_sv(p, c)?;
+            let r = parse_and_sv(p, env)?;
             e = format!("({e} | {r})");
         } else if p.eat("nor") {
-            let r = parse_and_sv(p, c)?;
+            let r = parse_and_sv(p, env)?;
             e = format!("~({e} | {r})");
         } else if p.eat("xor") {
-            let r = parse_and_sv(p, c)?;
+            let r = parse_and_sv(p, env)?;
             e = format!("({e} ^ {r})");
         } else if p.eat("xnor") {
-            let r = parse_and_sv(p, c)?;
+            let r = parse_and_sv(p, env)?;
             e = format!("~({e} ^ {r})");
         } else {
             break;
@@ -1583,14 +2925,14 @@ fn parse_or_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, String> {
     Ok(e)
 }
 
-fn parse_and_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, String> {
-    let mut e = parse_rel_sv(p, c)?;
+fn parse_and_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
+    let mut e = parse_rel_sv(p, env)?;
     loop {
         if p.eat("and") {
-            let r = parse_rel_sv(p, c)?;
+            let r = parse_rel_sv(p, env)?;
             e = format!("({e} & {r})");
         } else if p.eat("nand") {
-            let r = parse_rel_sv(p, c)?;
+            let r = parse_rel_sv(p, env)?;
             e = format!("~({e} & {r})");
         } else {
             break;
@@ -1599,44 +2941,86 @@ fn parse_and_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, String> {
     Ok(e)
 }
 
-fn parse_rel_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, String> {
-    let mut e = parse_shift_sv(p, c)?;
+fn expand_record_cmp(lhs: &str, rhs: &str, eq: bool, env: &TypeEnv) -> Option<String> {
+    let l_trim = lhs.trim().trim_matches(|c| c == '(' || c == ')').trim();
+    let r_trim = rhs.trim().trim_matches(|c| c == '(' || c == ')').trim();
+    let rec_type = env
+        .resolve_rec_var(l_trim)
+        .or_else(|| env.resolve_rec_var(r_trim))?;
+    let leaves = env.flatten_record_leaves(&rec_type, "", "", 0);
+    if leaves.is_empty() {
+        return None;
+    }
+    let l_cmap = env.rec_consts.get(&l_trim.to_ascii_lowercase());
+    let r_cmap = env.rec_consts.get(&r_trim.to_ascii_lowercase());
+    let mut terms = Vec::with_capacity(leaves.len());
+    for (_full, suf, _w) in leaves {
+        let le = if let Some(m) = l_cmap {
+            m.get(&suf).cloned().unwrap_or_else(|| "1'b0".into())
+        } else {
+            format!("{l_trim}_{suf}")
+        };
+        let re = if let Some(m) = r_cmap {
+            m.get(&suf).cloned().unwrap_or_else(|| "1'b0".into())
+        } else {
+            format!("{r_trim}_{suf}")
+        };
+        if eq {
+            terms.push(format!("({le} == {re})"));
+        } else {
+            terms.push(format!("({le} != {re})"));
+        }
+    }
+    let sep = if eq { " & " } else { " | " };
+    Some(format!("({})", terms.join(sep)))
+}
+
+fn parse_rel_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
+    let mut e = parse_shift_sv(p, env)?;
     if p.eat("=") {
-        let r = parse_shift_sv(p, c)?;
-        e = format!("({e} == {r})");
+        let r = parse_shift_sv(p, env)?;
+        if let Some(cmp) = expand_record_cmp(&e, &r, true, env) {
+            e = cmp;
+        } else {
+            e = format!("({e} == {r})");
+        }
     } else if p.eat("/=") {
-        let r = parse_shift_sv(p, c)?;
-        e = format!("({e} != {r})");
+        let r = parse_shift_sv(p, env)?;
+        if let Some(cmp) = expand_record_cmp(&e, &r, false, env) {
+            e = cmp;
+        } else {
+            e = format!("({e} != {r})");
+        }
     } else if p.eat("<=") {
-        let r = parse_shift_sv(p, c)?;
+        let r = parse_shift_sv(p, env)?;
         e = format!("({e} <= {r})");
     } else if p.eat(">=") {
-        let r = parse_shift_sv(p, c)?;
+        let r = parse_shift_sv(p, env)?;
         e = format!("({e} >= {r})");
     } else if p.eat("<") {
-        let r = parse_shift_sv(p, c)?;
+        let r = parse_shift_sv(p, env)?;
         e = format!("({e} < {r})");
     } else if p.eat(">") {
-        let r = parse_shift_sv(p, c)?;
+        let r = parse_shift_sv(p, env)?;
         e = format!("({e} > {r})");
     }
     Ok(e)
 }
 
-fn parse_shift_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, String> {
-    let mut e = parse_add_sv(p, c)?;
+fn parse_shift_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
+    let mut e = parse_add_sv(p, env)?;
     loop {
         if p.eat("sll") || p.eat("sla") {
-            let r = parse_add_sv(p, c)?;
+            let r = parse_add_sv(p, env)?;
             e = format!("({e} << {r})");
         } else if p.eat("srl") {
-            let r = parse_add_sv(p, c)?;
+            let r = parse_add_sv(p, env)?;
             e = format!("({e} >> {r})");
         } else if p.eat("sra") {
-            let r = parse_add_sv(p, c)?;
+            let r = parse_add_sv(p, env)?;
             e = format!("($signed({e}) >>> {r})");
         } else if p.eat("rol") || p.eat("ror") {
-            let r = parse_add_sv(p, c)?;
+            let r = parse_add_sv(p, env)?;
             e = format!("({e} << {r})");
         } else {
             break;
@@ -1645,17 +3029,17 @@ fn parse_shift_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, String>
     Ok(e)
 }
 
-fn parse_add_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, String> {
-    let mut e = parse_mul_sv(p, c)?;
+fn parse_add_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
+    let mut e = parse_mul_sv(p, env)?;
     loop {
         if p.eat("+") {
-            let r = parse_mul_sv(p, c)?;
+            let r = parse_mul_sv(p, env)?;
             e = format!("({e} + {r})");
         } else if p.eat("-") {
-            let r = parse_mul_sv(p, c)?;
+            let r = parse_mul_sv(p, env)?;
             e = format!("({e} - {r})");
         } else if p.eat("&") {
-            let r = parse_mul_sv(p, c)?;
+            let r = parse_mul_sv(p, env)?;
             e = format!("{{{e}, {r}}}");
         } else {
             break;
@@ -1664,17 +3048,17 @@ fn parse_add_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, String> {
     Ok(e)
 }
 
-fn parse_mul_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, String> {
-    let mut e = parse_unary_sv(p, c)?;
+fn parse_mul_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
+    let mut e = parse_unary_sv(p, env)?;
     loop {
         if p.eat("*") {
-            let r = parse_unary_sv(p, c)?;
+            let r = parse_unary_sv(p, env)?;
             e = format!("({e} * {r})");
         } else if p.eat("/") {
-            let r = parse_unary_sv(p, c)?;
+            let r = parse_unary_sv(p, env)?;
             e = format!("({e} / {r})");
         } else if p.eat("mod") || p.eat("rem") {
-            let r = parse_unary_sv(p, c)?;
+            let r = parse_unary_sv(p, env)?;
             e = format!("({e} % {r})");
         } else {
             break;
@@ -1683,39 +3067,38 @@ fn parse_mul_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, String> {
     Ok(e)
 }
 
-fn parse_unary_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, String> {
+fn parse_unary_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
     if p.eat("not") {
-        let x = parse_unary_sv(p, c)?;
+        let x = parse_unary_sv(p, env)?;
         return Ok(format!("~({x})"));
     }
     if p.eat("abs") {
-        let x = parse_unary_sv(p, c)?;
+        let x = parse_unary_sv(p, env)?;
         return Ok(format!("({x})"));
     }
     if p.eat("-") {
-        let x = parse_unary_sv(p, c)?;
+        let x = parse_unary_sv(p, env)?;
         return Ok(format!("-({x})"));
     }
     if p.eat("+") {
-        return parse_unary_sv(p, c);
+        return parse_unary_sv(p, env);
     }
-    parse_primary_sv(p, c)
+    parse_primary_sv(p, env)
 }
 
-fn parse_primary_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, String> {
+fn parse_primary_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
     if p.eat("(") {
-        // Aggregate (others => '0') or parenthesized expr.
         if p.eat("others") {
             let _ = p.eat("=>");
-            let v = parse_unary_sv(p, c).unwrap_or_else(|_| "1'b0".into());
+            let v = parse_unary_sv(p, env).unwrap_or_else(|_| "1'b0".into());
             let _ = p.eat(")");
             return Ok(v);
         }
-        let inner = parse_expr_sv(p, c)?;
+        let inner = parse_expr_sv(p, env)?;
         if p.eat(",") {
             let mut parts = vec![inner];
             loop {
-                parts.push(parse_expr_sv(p, c).unwrap_or_else(|_| "1'b0".into()));
+                parts.push(parse_expr_sv(p, env).unwrap_or_else(|_| "1'b0".into()));
                 if !p.eat(",") {
                     break;
                 }
@@ -1730,48 +3113,71 @@ fn parse_primary_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, Strin
         let bits = bits.clone();
         p.i += 1;
         let w = bits.len().max(1);
-        if bits
-            .chars()
-            .all(|ch| matches!(ch, '0' | '1' | 'z' | 'Z' | 'x' | 'X'))
-        {
-            return Ok(format!("{w}'b{bits}"));
-        }
-        // hex already converted in tokenizer
         return Ok(format!("{w}'b{bits}"));
     }
     if let Some(n) = p.number() {
         return Ok(n.to_string());
     }
     if matches!(p.peek(), Some(Tok::Ident(_)) | Some(Tok::Kw(_))) {
-        let n = p.ident()?;
+        let mut n = p.ident()?;
+        let mut rec_const_root: Option<String> = None;
+        let mut rec_const_suf = String::new();
+        if env.rec_consts.contains_key(&n.to_ascii_lowercase()) {
+            rec_const_root = Some(n.to_ascii_lowercase());
+        }
+        while p.eat(".") {
+            let f = p.ident()?;
+            if let Some(root) = &rec_const_root {
+                if rec_const_suf.is_empty() {
+                    rec_const_suf = f.to_ascii_lowercase();
+                } else {
+                    rec_const_suf = format!("{rec_const_suf}_{}", f.to_ascii_lowercase());
+                }
+                if let Some(val) = env.rec_consts.get(root).and_then(|m| m.get(&rec_const_suf)) {
+                    n = val.clone();
+                    rec_const_root = None;
+                } else {
+                    n = format!("{n}_{f}");
+                }
+            } else if env.pkg_names.contains(&n.to_ascii_lowercase()) {
+                n = f;
+                if env.rec_consts.contains_key(&n.to_ascii_lowercase()) {
+                    rec_const_root = Some(n.to_ascii_lowercase());
+                }
+            } else {
+                n = format!("{n}_{f}");
+            }
+        }
         if p.eat("'") {
-            // attribute or character already tokenized; eat ident
             let _ = p.ident();
+            if p.eat("(") {
+                let inner = parse_expr_sv(p, env)?;
+                let _ = p.eat(")");
+                return Ok(inner);
+            }
         }
         if p.eat("(") {
-            // slice, index, or function call / type cast
             if is_cast(&n) {
-                let inner = parse_expr_sv(p, c)?;
-                // optional , width
+                let inner = parse_expr_sv(p, env)?;
                 if p.eat(",") {
-                    let _ = parse_expr_sv(p, c);
+                    let _ = parse_expr_sv(p, env);
                 }
                 let _ = p.eat(")");
                 return Ok(inner);
             }
             if n.eq_ignore_ascii_case("rising_edge") {
-                let clk = parse_expr_sv(p, c)?;
+                let clk = parse_expr_sv(p, env)?;
                 let _ = p.eat(")");
                 return Ok(format!("__posedge_{clk}"));
             }
             if n.eq_ignore_ascii_case("falling_edge") {
-                let clk = parse_expr_sv(p, c)?;
+                let clk = parse_expr_sv(p, env)?;
                 let _ = p.eat(")");
                 return Ok(format!("__negedge_{clk}"));
             }
-            if let Some(a) = parse_int_expr_peek(p, c) {
+            if let Some(a) = parse_int_expr_peek(p, &env.consts) {
                 if p.eat("downto") || p.eat("to") {
-                    let b = parse_int_expr(p).unwrap_or(a);
+                    let b = parse_int_expr_with(p, &env.consts).unwrap_or(a);
                     let _ = p.eat(")");
                     let hi = a.max(b);
                     let lo = a.min(b);
@@ -1779,22 +3185,40 @@ fn parse_primary_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, Strin
                 }
                 if p.peek_sym(")") {
                     p.eat(")");
+                    if let Some(fdef) = env.funcs.get(&n.to_ascii_lowercase()) {
+                        let mut param_map = HashMap::new();
+                        if let Some(p0) = fdef.params.first() {
+                            param_map.insert(p0.clone(), a.to_string());
+                        }
+                        return Ok(replace_word_map(&fdef.body_expr, &param_map));
+                    }
                     return Ok(format!("{n}[{a}]"));
                 }
             }
-            // function call: fold args (Helion maps known IEEE; others XOR-fold so
-            // every operand still reaches hardware).
-            let mut args = vec![parse_expr_sv(p, c).unwrap_or_else(|_| "1'b0".into())];
+            let mut args = vec![parse_expr_sv(p, env).unwrap_or_else(|_| "1'b0".into())];
             while p.eat(",") {
-                args.push(parse_expr_sv(p, c).unwrap_or_else(|_| "1'b0".into()));
+                args.push(parse_expr_sv(p, env).unwrap_or_else(|_| "1'b0".into()));
             }
             let _ = p.eat(")");
+            if let Some(fdef) = env.funcs.get(&n.to_ascii_lowercase()) {
+                let mut param_map = HashMap::new();
+                for (param, arg) in fdef.params.iter().zip(args.iter()) {
+                    param_map.insert(param.clone(), arg.clone());
+                }
+                return Ok(replace_word_map(&fdef.body_expr, &param_map));
+            }
             if args.len() == 1 {
                 return Ok(args.remove(0));
             }
             return Ok(format!("({})", args.join(" ^ ")));
         }
-        if let Some(v) = const_get(c, &n) {
+        if n.eq_ignore_ascii_case("true") {
+            return Ok("1'b1".into());
+        }
+        if n.eq_ignore_ascii_case("false") {
+            return Ok("1'b0".into());
+        }
+        if let Some(v) = const_get(&env.consts, &n) {
             return Ok(v.to_string());
         }
         return Ok(n);
@@ -1853,6 +3277,9 @@ fn parse_int_expr_with(p: &mut P, c: &HashMap<String, i64>) -> Option<i64> {
         } else if p.eat("/") {
             let d = parse_int_atom(p, c).unwrap_or(1).max(1);
             v /= d;
+        } else if p.eat("**") {
+            let exp = parse_int_atom(p, c).unwrap_or(0).clamp(0, 62) as u32;
+            v = v.saturating_pow(exp);
         } else {
             break;
         }
@@ -1861,6 +3288,9 @@ fn parse_int_expr_with(p: &mut P, c: &HashMap<String, i64>) -> Option<i64> {
 }
 
 fn parse_int_atom(p: &mut P, c: &HashMap<String, i64>) -> Option<i64> {
+    if p.eat("-") {
+        return parse_int_atom(p, c).map(|x| -x);
+    }
     if p.eat("(") {
         let v = parse_int_expr_with(p, c);
         let _ = p.eat(")");
@@ -1870,36 +3300,81 @@ fn parse_int_atom(p: &mut P, c: &HashMap<String, i64>) -> Option<i64> {
         return Some(n as i64);
     }
     if matches!(p.peek(), Some(Tok::Ident(_)) | Some(Tok::Kw(_))) {
-        let n = p.ident().ok()?;
+        let save = p.i;
+        let mut n = p.ident().ok()?;
+        while p.eat(".") {
+            if let Ok(f) = p.ident() {
+                n = f;
+            }
+        }
+        if matches!(
+            n.to_ascii_lowercase().as_str(),
+            "clog2" | "log2" | "ceil_log2" | "bit_width"
+        ) && p.eat("(")
+        {
+            let arg = parse_int_expr_with(p, c).unwrap_or(1);
+            let _ = p.eat(")");
+            let w = if arg <= 1 {
+                1
+            } else {
+                (u64::BITS - ((arg as u64) - 1).leading_zeros()) as i64
+            };
+            return Some(w);
+        }
         if let Some(v) = const_get(c, &n) {
             return Some(v);
         }
-        // unknown ident is not an int
-        p.i -= 1;
+        p.i = save;
         return None;
     }
     None
 }
 
+fn parse_vtype(p: &mut P, env: &TypeEnv) -> VType {
+    let save = p.i;
+    if matches!(p.peek(), Some(Tok::Ident(_)) | Some(Tok::Kw(_))) {
+        if let Ok(mut tn) = p.ident() {
+            while p.eat(".") {
+                if let Ok(sub) = p.ident() {
+                    tn = sub;
+                }
+            }
+            let low = tn.to_ascii_lowercase();
+            if env.get_record(&low).is_some() {
+                skip_type_tail(p);
+                return VType::Record(low);
+            }
+            if let Some(sub_ty) = env.subtypes.get(&low).cloned() {
+                if !p.peek_sym("(") && !p.eat("range") {
+                    skip_type_tail(p);
+                    return sub_ty;
+                }
+            }
+        }
+    }
+    p.i = save;
+    VType::Scalar(parse_type(p, &env.consts))
+}
+
 fn parse_type(p: &mut P, consts: &HashMap<String, i64>) -> usize {
-    // optional array / subtype name
-    let _ = p.eat("std_logic");
-    let _ = p.eat("std_ulogic");
-    let _ = p.eat("std_logic_vector");
-    let _ = p.eat("std_ulogic_vector");
-    let _ = p.eat("unsigned");
-    let _ = p.eat("signed");
-    let _ = p.eat("bit");
-    let _ = p.eat("bit_vector");
-    let _ = p.eat("boolean");
-    let _ = p.eat("integer");
-    let _ = p.eat("natural");
-    let _ = p.eat("positive");
-    let _ = p.eat("real");
-    let _ = p.eat("character");
-    let _ = p.eat("string");
-    let _ = p.eat("time");
-    let _ = p.eat("range");
+    let mut is_int_default = false;
+    if p.eat("integer") || p.eat("natural") || p.eat("positive") {
+        is_int_default = true;
+    } else {
+        let _ = p.eat("std_logic");
+        let _ = p.eat("std_ulogic");
+        let _ = p.eat("std_logic_vector");
+        let _ = p.eat("std_ulogic_vector");
+        let _ = p.eat("unsigned");
+        let _ = p.eat("signed");
+        let _ = p.eat("bit");
+        let _ = p.eat("bit_vector");
+        let _ = p.eat("boolean");
+        let _ = p.eat("real");
+        let _ = p.eat("character");
+        let _ = p.eat("string");
+        let _ = p.eat("time");
+    }
     if p.eat("(") {
         if let Some(a) = parse_int_expr_with(p, consts) {
             if p.eat("downto") || p.eat("to") {
@@ -1912,7 +3387,6 @@ fn parse_type(p: &mut P, consts: &HashMap<String, i64>) -> usize {
             skip_type_tail(p);
             return 1;
         }
-        // (range <>) unconstrained → 1
         skip_paren_rest(p);
         skip_type_tail(p);
         return 1;
@@ -1922,6 +3396,15 @@ fn parse_type(p: &mut P, consts: &HashMap<String, i64>) -> usize {
         let _ = p.eat("to");
         let _ = p.eat("downto");
         let b = parse_int_expr_with(p, consts).unwrap_or(0);
+        let hi = a.max(b).max(0) as u64;
+        if is_int_default {
+            let w = if hi <= 1 {
+                1
+            } else {
+                (u64::BITS - hi.leading_zeros()) as usize
+            };
+            return w.max(1);
+        }
         return (a.abs_diff(b) as usize) + 1;
     }
     skip_type_tail(p);
@@ -1940,7 +3423,7 @@ fn skip_type_tail(p: &mut P) {
             skip_paren_rest(p);
             continue;
         }
-        break;
+        p.bump();
     }
 }
 
@@ -1987,9 +3470,9 @@ fn skip_init(p: &mut P) {
 }
 
 fn skip_after_delay(p: &mut P) {
-    if p.eat("after") || p.eat("when") && false {
+    if p.eat("after") {
         eat_to_semi(p);
-        p.i -= 1; // keep semicolon for caller
+        p.i = p.i.saturating_sub(1);
     }
 }
 
@@ -2051,11 +3534,11 @@ fn skip_stmt(p: &mut P) {
     }
 }
 
-fn recover_assign(p: &mut P, consts: &HashMap<String, i64>) -> Option<CStmt> {
+fn recover_assign(p: &mut P, env: &TypeEnv) -> Option<CStmt> {
     let start = p.i;
     while p.peek().is_some() && !p.peek_sym(";") {
         if p.eat("<=") {
-            let rhs = parse_expr_sv(p, consts).ok()?;
+            let rhs = parse_expr_sv(p, env).ok()?;
             eat_to_semi(p);
             return Some(CStmt::Assign {
                 lhs: "helion_recovered".into(),
@@ -2072,31 +3555,30 @@ fn eat_decl_item(p: &mut P) {
     eat_to_semi(p);
 }
 
-fn skip_subprogram(p: &mut P) {
-    let mut d = 1i32;
-    while d > 0 && p.peek().is_some() {
-        if p.eat("function") || p.eat("procedure") {
-            d += 1;
-        } else if p.eat("end") {
-            let _ = p.eat("function");
-            let _ = p.eat("procedure");
-            let _ = p.eat_ident();
-            let _ = p.eat(";");
-            d -= 1;
-        } else {
-            p.bump();
-        }
-    }
-}
-
 fn skip_to_end_unit(p: &mut P, kind: &str) {
     while p.peek().is_some() {
         if p.eat("end") {
+            if p.eat("record")
+                || p.eat("units")
+                || p.eat("function")
+                || p.eat("procedure")
+                || p.eat("if")
+                || p.eat("case")
+                || p.eat("loop")
+                || p.eat("generate")
+                || p.eat("process")
+                || (kind != "component" && p.eat("component"))
+            {
+                let _ = p.eat_ident();
+                let _ = p.eat(";");
+                continue;
+            }
             let _ = p.eat(kind);
             let _ = p.eat("entity");
             let _ = p.eat("architecture");
             let _ = p.eat("component");
             let _ = p.eat("package");
+            let _ = p.eat("body");
             let _ = p.eat_ident();
             let _ = p.eat(";");
             return;
@@ -2134,6 +3616,7 @@ fn emit_sv(
     entity_clocks: &HashMap<String, HashSet<String>>,
     entity_occupied: &HashMap<String, HashSet<String>>,
     entities: &[Entity],
+    extra_module_ports: &HashMap<String, Vec<(String, &'static str, usize)>>,
     origin: &str,
     source: &str,
     softs: &mut Vec<SoftDiag>,
@@ -2147,9 +3630,6 @@ fn emit_sv(
         .get(&ent.name.to_ascii_lowercase())
         .cloned()
         .unwrap_or_else(|| occupied_sv_names(ent, arch));
-    // Clash: process/STA clock is `clock` and `clk` is already a
-    // port/signal/generic/const. Keep-name already keeps `clock` distinct;
-    // emit a named diagnostic, do not silent-merge, do not abort synth.
     if clock_clk_clash(sta_clocks, &occupied) {
         emit_diag(&clock_clk_clash_line(&ent.name));
         push_soft(
@@ -2171,8 +3651,6 @@ fn emit_sv(
         push_soft(softs, d);
     }
     let mut sv = String::new();
-    // Honest hierarchy: never emit_stub empty modules for component decls.
-    // Missing bodies surface as named missing_component / unknown_instance.
     sv.push_str(&format!("module {}(", sv_ident(&ent.name)));
     let plist: Vec<String> = ent
         .ports
@@ -2265,8 +3743,6 @@ fn emit_sv(
                 conns,
             } => {
                 if !known_bodies.contains(&module.to_ascii_lowercase()) {
-                    // Named miss — not silent cells=0 via empty emit_stub.
-                    // module= is the entity being lowered, not design top_name.
                     emit_diag(&missing_component_line(&ent.name, name, module));
                     push_soft(
                         softs,
@@ -2293,8 +3769,8 @@ fn emit_sv(
                         push_soft(softs, d);
                     }
                 }
-                sv.push_str(&format!("  {} {name}(", sv_ident(module)));
-                let ports = child_ports(module, arch, entities);
+                let ports = child_ports(module, arch, entities, extra_module_ports);
+                let raw_ports = child_raw_ports(module, arch, entities);
                 let child_clocks = entity_clocks
                     .get(&module.to_ascii_lowercase())
                     .unwrap_or(&empty_clocks);
@@ -2307,25 +3783,25 @@ fn emit_sv(
                     .get(&module.to_ascii_lowercase())
                     .or(child_ports_occ.as_ref())
                     .unwrap_or(&empty_clocks);
-                let cs: Vec<String> = conns
-                    .iter()
-                    .map(|(a, b)| {
-                        let net = sv_inst_net(b, sta_clocks, &occupied);
-                        let port = if a.starts_with('#') {
-                            a[1..]
-                                .parse::<usize>()
-                                .ok()
-                                .and_then(|i| ports.and_then(|ps| ps.get(i)))
-                                .map(|(n, _, _)| sta_clock_name(n, child_clocks, child_occupied))
-                        } else {
-                            Some(sta_clock_name(a, child_clocks, child_occupied))
-                        };
-                        match port {
-                            Some(p) if !p.starts_with('#') => format!(".{p}({net})"),
-                            _ => net,
-                        }
-                    })
-                    .collect();
+                let expanded_conns = expand_inst_conns(conns, raw_ports, ports, &arch.env);
+                let mut cs: Vec<String> = Vec::new();
+                for (a, b) in &expanded_conns {
+                    let net = sv_inst_net(b, sta_clocks, &occupied);
+                    let port = if a.starts_with('#') {
+                        a[1..]
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|i| ports.and_then(|ps| ps.get(i)))
+                            .map(|(n, _, _)| sta_clock_name(n, child_clocks, child_occupied))
+                    } else {
+                        Some(sta_clock_name(a, child_clocks, child_occupied))
+                    };
+                    match port {
+                        Some(p) if !p.starts_with('#') => cs.push(format!(".{p}({net})")),
+                        _ => cs.push(net),
+                    }
+                }
+                sv.push_str(&format!("  {} {name}(", sv_ident(module)));
                 sv.push_str(&cs.join(", "));
                 sv.push_str(");\n");
             }
@@ -2333,6 +3809,77 @@ fn emit_sv(
     }
     sv.push_str("endmodule\n");
     Ok(sv)
+}
+
+fn expand_inst_conns(
+    conns: &[(String, String)],
+    raw_ports: Option<&[(String, &'static str, VType)]>,
+    flat_ports: Option<&[(String, &'static str, usize)]>,
+    env: &TypeEnv,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (a, b) in conns {
+        if a.starts_with('#') {
+            if let Ok(idx) = a[1..].parse::<usize>() {
+                if let Some(rps) = raw_ports {
+                    if let Some((pname, _dir, vty)) = rps.get(idx) {
+                        match vty {
+                            VType::Scalar(_) => {
+                                out.push((pname.clone(), b.clone()));
+                                continue;
+                            }
+                            VType::Record(rname) => {
+                                for (leaf_port, suf, _w) in
+                                    env.flatten_record_leaves(rname, pname, "", 0)
+                                {
+                                    let actual = if let Some(cmap) =
+                                        env.rec_consts.get(&b.to_ascii_lowercase())
+                                    {
+                                        cmap.get(&suf).cloned().unwrap_or_else(|| "1'b0".into())
+                                    } else {
+                                        format!("{b}_{suf}")
+                                    };
+                                    out.push((leaf_port, actual));
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let _ = flat_ports;
+            }
+            out.push((a.clone(), b.clone()));
+            continue;
+        }
+        if let Some(rps) = raw_ports {
+            if let Some((pname, _dir, VType::Record(rname))) =
+                rps.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(a))
+            {
+                for (leaf_port, suf, _w) in env.flatten_record_leaves(rname, pname, "", 0) {
+                    let actual = if let Some(cmap) = env.rec_consts.get(&b.to_ascii_lowercase()) {
+                        cmap.get(&suf).cloned().unwrap_or_else(|| "1'b0".into())
+                    } else {
+                        format!("{b}_{suf}")
+                    };
+                    out.push((leaf_port, actual));
+                }
+                continue;
+            }
+        }
+        if let Some(rname) = env.resolve_rec_var(b) {
+            let a_is_flat = flat_ports
+                .map(|ps| ps.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(a)))
+                .unwrap_or(false);
+            if !a_is_flat {
+                for (leaf_port, suf, _w) in env.flatten_record_leaves(&rname, a, "", 0) {
+                    out.push((leaf_port, format!("{b}_{suf}")));
+                }
+                continue;
+            }
+        }
+        out.push((a.clone(), b.clone()));
+    }
+    out
 }
 
 fn const_get(c: &HashMap<String, i64>, n: &str) -> Option<i64> {
@@ -2348,6 +3895,7 @@ fn child_ports<'a>(
     module: &str,
     arch: &'a Arch,
     entities: &'a [Entity],
+    extra_module_ports: &'a HashMap<String, Vec<(String, &'static str, usize)>>,
 ) -> Option<&'a [(String, &'static str, usize)]> {
     if let Some(c) = arch
         .components
@@ -2356,10 +3904,33 @@ fn child_ports<'a>(
     {
         return Some(c.ports.as_slice());
     }
+    if let Some(e) = entities
+        .iter()
+        .find(|e| e.name.eq_ignore_ascii_case(module))
+    {
+        return Some(e.ports.as_slice());
+    }
+    extra_module_ports
+        .get(&module.to_ascii_lowercase())
+        .map(|v| v.as_slice())
+}
+
+fn child_raw_ports<'a>(
+    module: &str,
+    arch: &'a Arch,
+    entities: &'a [Entity],
+) -> Option<&'a [(String, &'static str, VType)]> {
+    if let Some(c) = arch
+        .components
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(module))
+    {
+        return Some(c.raw_ports.as_slice());
+    }
     entities
         .iter()
         .find(|e| e.name.eq_ignore_ascii_case(module))
-        .map(|e| e.ports.as_slice())
+        .map(|e| e.raw_ports.as_slice())
 }
 
 /// helion-sv `parse_inst_net` drops `[idx]` on instance ports. Emit the
@@ -3070,7 +4641,7 @@ fn normalize_bitstr(s: &str, base: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helion_ir::{CellKind, INC4_INIT};
+    use helion_ir::{resolve, CellKind, INC4_INIT};
 
     #[test]
     fn vhdl_skips_strings_and_concat_without_aborting_synth() {
@@ -3533,26 +5104,26 @@ end;
         assert!(
             mr.softs
                 .iter()
-                .any(|s| s.name == "child_soft_incomplete" && s.module == "wrap"),
+                .any(|s| resolve(s.name) == "child_soft_incomplete" && resolve(s.module) == "wrap"),
             "softs={:?}",
             mr.soft_table_lines()
         );
         assert!(
-            !mr.softs.iter().any(|s| s.name == "missing_component"),
+            !mr.softs.iter().any(|s| resolve(s.name) == "missing_component"),
             "roots-only: leaf must not also be a flat root: {:?}",
             mr.soft_table_lines()
         );
         let miss: Vec<_> = mr
             .softs
             .iter()
-            .filter(|s| s.name == "child_soft_incomplete")
+            .filter(|s| resolve(s.name) == "child_soft_incomplete")
             .flat_map(|s| s.children.iter())
-            .filter(|s| s.name == "missing_component")
+            .filter(|s| resolve(s.name) == "missing_component")
             .collect();
         assert_eq!(miss.len(), 1, "softs={:?}", mr.soft_table_lines());
-        assert_eq!(miss[0].module, "inner");
+        assert_eq!(resolve(miss[0].module), "inner");
         assert!(
-            !miss.iter().any(|s| s.module == "wrap"),
+            !miss.iter().any(|s| resolve(s.module) == "wrap"),
             "must not use design top_name: {:?}",
             mr.soft_table_lines()
         );
@@ -3584,15 +5155,15 @@ end;
         let miss = mr
             .softs
             .iter()
-            .find(|s| s.name == "missing_component")
+            .find(|s| resolve(s.name) == "missing_component")
             .unwrap_or_else(|| {
                 panic!(
                     "missing_component SoftDiag required, got {:?}",
                     mr.soft_table_lines()
                 )
             });
-        assert_eq!(miss.name, "missing_component");
-        assert_eq!(miss.module, "wrap");
+        assert_eq!(resolve(miss.name), "missing_component");
+        assert_eq!(resolve(miss.module), "wrap");
         let detail = miss.detail.as_deref().unwrap_or("");
         assert!(detail.contains("inst=u_miss"), "inst in detail: {detail}");
         assert!(
@@ -3635,7 +5206,7 @@ end;
             !mr.design
                 .cells
                 .iter()
-                .any(|c| c.name.contains("unused_") || c.name.contains("fcov_")),
+                .any(|c| resolve(c.name).contains("unused_") || resolve(c.name).contains("fcov_")),
             "never invent LUTs for unused_*/fcov_: {:?}",
             mr.design.cells
         );
@@ -3665,12 +5236,12 @@ end;
         assert!(
             mr.softs
                 .iter()
-                .any(|s| s.name == "missing_component" && s.module == "top")
+                .any(|s| resolve(s.name) == "missing_component" && resolve(s.module) == "top")
         );
         let detail = mr
             .softs
             .iter()
-            .find(|s| s.name == "missing_component")
+            .find(|s| resolve(s.name) == "missing_component")
             .and_then(|s| s.detail.as_deref())
             .unwrap_or("");
         assert!(detail.contains("inst=ghost_u"), "{detail}");
@@ -3732,9 +5303,9 @@ end;
         let clash = mr
             .softs
             .iter()
-            .find(|s| s.name == "clock_clk_clash")
+            .find(|s| resolve(s.name) == "clock_clk_clash")
             .unwrap_or_else(|| panic!("clock_clk_clash SoftDiag, got {:?}", mr.soft_table_lines()));
-        assert_eq!(clash.module, "clash");
+        assert_eq!(resolve(clash.module), "clash");
         assert!(
             clash
                 .detail
@@ -3769,8 +5340,8 @@ end;
         assert!(
             mr.softs
                 .iter()
-                .any(|s| s.name == "generate_not_lowered" && s.module == "wrap")
-                || mr.softs.iter().any(|s| s.name == "missing_component"),
+                .any(|s| resolve(s.name) == "generate_not_lowered" && resolve(s.module) == "wrap")
+                || mr.softs.iter().any(|s| resolve(s.name) == "missing_component"),
             "generate instance must be a named soft, got {:?}",
             mr.soft_table_lines()
         );
@@ -3804,8 +5375,8 @@ end;
         assert!(
             mr.softs
                 .iter()
-                .any(|s| s.name == "generate_not_lowered" && s.module == "wrap")
-                || mr.softs.iter().any(|s| s.name == "missing_component"),
+                .any(|s| resolve(s.name) == "generate_not_lowered" && resolve(s.module) == "wrap")
+                || mr.softs.iter().any(|s| resolve(s.name) == "missing_component"),
             "if-generate instance must be a named soft, not silent cells=0: {:?}",
             mr.soft_table_lines()
         );
@@ -3854,7 +5425,7 @@ end;
         assert!(
             mr.softs
                 .iter()
-                .any(|s| s.name == "child_soft_incomplete" && s.module == "wrap"),
+                .any(|s| resolve(s.name) == "child_soft_incomplete" && resolve(s.module) == "wrap"),
             "wrap must root the forest: {:?}",
             mr.soft_table_lines()
         );
@@ -3863,12 +5434,12 @@ end;
         let wrap_csi = mr
             .softs
             .iter()
-            .find(|s| s.name == "child_soft_incomplete" && s.module == "wrap")
+            .find(|s| resolve(s.name) == "child_soft_incomplete" && resolve(s.module) == "wrap")
             .expect("wrap child_soft_incomplete");
         let mid_csi = wrap_csi
             .children
             .iter()
-            .find(|s| s.name == "child_soft_incomplete" && s.module == "mid")
+            .find(|s| resolve(s.name) == "child_soft_incomplete" && resolve(s.module) == "mid")
             .unwrap_or_else(|| {
                 panic!(
                     "mid child_soft_incomplete required under wrap despite parent-before-child decl order: {:?}",
@@ -3879,12 +5450,12 @@ end;
             mid_csi
                 .children
                 .iter()
-                .any(|s| s.name == "missing_component" && s.module == "inner"),
+                .any(|s| resolve(s.name) == "missing_component" && resolve(s.module) == "inner"),
             "inner missing_component nested under mid: {:?}",
             mr.soft_table_lines()
         );
         assert!(
-            !mr.softs.iter().any(|s| s.name == "missing_component"),
+            !mr.softs.iter().any(|s| resolve(s.name) == "missing_component"),
             "roots-only forest: {:?}",
             mr.soft_table_lines()
         );
@@ -3977,7 +5548,7 @@ end;
             "entity generic W must fold as arch signal width: {sv}"
         );
         let d = synth_vhdl(src).expect("buf");
-        assert!(d.ports.iter().any(|p| p.name == "q"));
+        assert!(d.ports.iter().any(|p| resolve(p.name) == "q"));
     }
 
     #[test]
@@ -4026,12 +5597,12 @@ end;
             d.cells
         );
         assert!(
-            d.ports.iter().any(|p| p.name == "clock"),
+            d.ports.iter().any(|p| resolve(p.name) == "clock"),
             "STA/Design port must keep real VHDL name clock: {:?}",
             d.ports
         );
         assert!(
-            !d.ports.iter().any(|p| p.name == "clk"),
+            !d.ports.iter().any(|p| resolve(p.name) == "clk"),
             "process/STA clock must not be renamed to clk: {:?}",
             d.ports
         );
@@ -4074,9 +5645,9 @@ end;
             "must not rewrite data clock→clk: {sv}"
         );
         let d = synth_vhdl(src).expect("mix");
-        assert!(d.ports.iter().any(|p| p.name == "clk"), "{:?}", d.ports);
+        assert!(d.ports.iter().any(|p| resolve(p.name) == "clk"), "{:?}", d.ports);
         assert!(
-            d.ports.iter().any(|p| p.name == "clock"),
+            d.ports.iter().any(|p| resolve(p.name) == "clock"),
             "NARROW keeps data port clock: {:?}",
             d.ports
         );
@@ -4248,10 +5819,10 @@ end;
             "policy: {line}"
         );
         let d = synth_vhdl(src).expect("clash must not abort synth");
-        let clk_ports: Vec<_> = d.ports.iter().filter(|p| p.name == "clk").collect();
+        let clk_ports: Vec<_> = d.ports.iter().filter(|p| resolve(p.name) == "clk").collect();
         assert_eq!(clk_ports.len(), 1, "no duplicate clk ports: {:?}", d.ports);
         assert!(
-            d.ports.iter().any(|p| p.name == "clock"),
+            d.ports.iter().any(|p| resolve(p.name) == "clock"),
             "process clock net kept distinct: {:?}",
             d.ports
         );
@@ -4345,7 +5916,7 @@ end;
             "top-only package params still emit: {sv}"
         );
         let d = synth_vhdl(src).expect("hier");
-        assert!(d.ports.iter().any(|p| p.name == "y"), "{:?}", d.ports);
+        assert!(d.ports.iter().any(|p| resolve(p.name) == "y"), "{:?}", d.ports);
     }
 
     #[test]
