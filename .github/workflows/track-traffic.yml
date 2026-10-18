@@ -92,13 +92,32 @@ jobs:
               for kind in ("clones", "views"):
                   t, u, d = rows[kind]
                   f.write(f"| {kind} | {t} | {u} | {d} |\n")
-          EOF
           cat traffic/README.md
+
+          # Mirror the totals table into the main README (between markers)
+          python3 - <<'EOF'
+          import re
+          with open("traffic/README.md") as f:
+              table = f.read().split("| Metric |", 1)[1]
+          table = "| Metric |" + table.split("\n\n")[0]
+          with open("README.md") as f:
+              readme = f.read()
+          new_table = table.rstrip()
+          readme, n = re.subn(
+              r"<!-- TRAFFIC-START -->.*?<!-- TRAFFIC-END -->",
+              f"<!-- TRAFFIC-START -->\n{new_table}\n<!-- TRAFFIC-END -->",
+              readme, flags=re.DOTALL,
+          )
+          assert n == 1, "traffic markers not found in README.md"
+          with open("README.md", "w") as f:
+              f.write(readme)
+          print("README traffic table updated")
+          EOF
 
       - name: Commit history
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add traffic/
+          git add traffic/ README.md
           git diff --cached --quiet || git commit -m "traffic: daily snapshot"
           git push

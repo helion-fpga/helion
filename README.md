@@ -205,3 +205,14 @@ Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at 
 ![Saksham's GitHub stats](https://github-readme-stats.vercel.app/api?username=saksham-45&show_icons=true)
 ![Top languages](https://github-readme-stats.vercel.app/api/top-langs/?username=saksham-45&layout=compact)
 ![GitHub streak](https://streak-stats.demolab.com/?user=saksham-45)
+
+## Repository Traffic
+
+<!-- TRAFFIC-START -->
+| Metric | Total | Uniques | Days tracked |
+|---|---|---|---|
+| clones | 1560 | 594 | 14 |
+| views | 17 | 12 | 14 |
+<!-- TRAFFIC-END -->
+
+Full history: [`traffic/`](traffic/) (updated daily; GitHub drops traffic data after 14 days).
