@@ -23,6 +23,13 @@ pub use waivers::{
     WaiverSet, generate_remediation_script, remediate_violation,
 };
 
+pub mod signoff;
+
+pub use signoff::{
+    AntennaNetMetric, BitgenSignoffReport, DEFAULT_MAX_ANTENNA_RATIO, SignoffConfig,
+    SignoffRuleInfo, check_bitstream_signoff, find_combinational_lut_loops, signoff_rule_info,
+};
+
 /// UG893 DRC violation severity (Error / Warning / Advisory).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrcSeverity {
@@ -95,6 +102,16 @@ impl Drc {
     /// Generate an actionable Tcl / RTL remediation script for all violations in this [`Drc`].
     pub fn remediation_script(&self) -> String {
         generate_remediation_script(self).to_tcl_script()
+    }
+
+    pub fn add_with_severity(
+        &mut self,
+        id: &str,
+        severity: DrcSeverity,
+        objects: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.push(id, severity, objects, message);
     }
 
     fn push(
@@ -890,6 +907,151 @@ mod tests {
             waivers
                 .to_tcl_script()
                 .contains("create_waiver -id DRIVE-2 -objects {led}")
+        );
+    }
+
+    #[test]
+    fn signoff_rule_table_covers_rtstat_1_to_12_and_bitgen_gates() {
+        for n in 1..=12 {
+            let id = format!("RTSTAT-{n}");
+            let info = signoff_rule_info(&id).unwrap_or_else(|| panic!("missing {id}"));
+            assert_eq!(info.id, id);
+            assert!(!info.title.is_empty());
+            assert!(info.downgrade_tcl_hint.contains("set_property SEVERITY"));
+        }
+        for id in [
+            "NSTD-1", "UCIO-1", "MDRV-1", "LUTLP-1", "ANT-1", "PLCK-1", "CIPS-1", "BIVC-1",
+        ] {
+            assert!(signoff_rule_info(id).is_some(), "missing {id}");
+        }
+    }
+
+    #[test]
+    fn bitstream_signoff_enforces_nstd_ucio_and_allows_severity_warning_downgrade() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let d = Design::structural_blinky();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+
+        // By default, blinky has no explicit IOSTANDARD or LOC on clk/led -> NSTD-1 and UCIO-1 block bitgen!
+        let cfg_strict = SignoffConfig::default();
+        let rep_strict = check_bitstream_signoff(&d, &r, &dev, &cfg_strict);
+        assert!(!rep_strict.bitgen_allowed);
+        assert!(rep_strict.gate_write_bitstream().is_err());
+        assert_eq!(rep_strict.nstd_ports, vec!["clk", "led"]);
+        assert_eq!(rep_strict.ucio_ports, vec!["clk", "led"]);
+        assert_eq!(
+            rep_strict.drc.item("NSTD-1").unwrap().severity,
+            DrcSeverity::Error
+        );
+        assert_eq!(
+            rep_strict.drc.item("UCIO-1").unwrap().severity,
+            DrcSeverity::Error
+        );
+
+        // Downgrade NSTD-1 and UCIO-1 to Warning via Vivado Tcl set_property SEVERITY {Warning}:
+        let mut cfg_waived = SignoffConfig::default();
+        let parsed = cfg_waived
+            .parse_tcl_severity_overrides(
+                "set_property SEVERITY {Warning} [get_drc_checks NSTD-1]\n\
+                 set_property SEVERITY {Warning} [get_drc_checks UCIO-1]",
+            )
+            .unwrap();
+        assert_eq!(parsed, 2);
+
+        let rep_waived = check_bitstream_signoff(&d, &r, &dev, &cfg_waived);
+        assert!(
+            rep_waived.bitgen_allowed,
+            "downgrading NSTD-1 & UCIO-1 to Warning must allow bitgen: {}",
+            rep_waived.summary_line()
+        );
+        rep_waived.gate_write_bitstream().unwrap();
+        assert_eq!(
+            rep_waived.drc.item("NSTD-1").unwrap().severity,
+            DrcSeverity::Warning
+        );
+        assert_eq!(
+            rep_waived.drc.item("UCIO-1").unwrap().severity,
+            DrcSeverity::Warning
+        );
+        assert_eq!(
+            rep_waived.downgraded_rules,
+            vec!["NSTD-1".to_string(), "UCIO-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn bitstream_signoff_catches_rtstat_mdrv_lutlp_antenna_plck_bivc() {
+        use helion_ir::CellKind;
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_blinky();
+        // Assign incompatible bank VCCO standards on same bank -> BIVC-1.
+        d.set_loc("led", "IOB_X2Y0").unwrap();
+        d.set_loc("clk", "IOB_X3Y0").unwrap();
+        d.set_iostandard("led", "LVCMOS33").unwrap();
+        d.set_iostandard("clk", "LVCMOS18").unwrap();
+
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let mut r = route(&pl, &dev).unwrap();
+
+        // Inject routing errors: overused tiles (RTSTAT-3 & RTSTAT-12), skipped IMUX (RTSTAT-2),
+        // and excessive metal wirelength on net "q" (ANT-1).
+        r.overused = 2;
+        r.pathfinder_iters = 30;
+        r.imux_skip = 1;
+        r.iob_src[0].hops = 120;
+
+        // Inject multi-driver net (MDRV-1) and combinational 2-LUT loop (LUTLP-1) and LUT-driven FF CLK (PLCK-1).
+        d.add_cell("u_loop_a", CellKind::Lut6 { init: 0xAAAA_AAAA_AAAA_AAAA });
+        d.add_cell("u_loop_b", CellKind::Lut6 { init: 0x5555_5555_5555_5555 });
+        d.connect("loop_ab", "u_loop_a", "O");
+        d.connect("loop_ab", "u_loop_b", "I0");
+        d.connect("loop_ba", "u_loop_b", "O");
+        d.connect("loop_ba", "u_loop_a", "I0");
+        // Second driver on loop_ab -> MDRV-1
+        d.connect("loop_ab", "u_loop_b", "O");
+        // LUT driving sequential FF CLK -> PLCK-1
+        d.add_cell("u_bad_clk_ff", CellKind::Hff);
+        d.connect("loop_ba", "u_bad_clk_ff", "CLK");
+        d.connect("q", "u_bad_clk_ff", "D");
+
+        let cfg = SignoffConfig::default();
+        let rep = check_bitstream_signoff(&d, &r, &dev, &cfg);
+        assert!(!rep.bitgen_allowed);
+        for id in [
+            "BIVC-1",
+            "RTSTAT-2",
+            "RTSTAT-3",
+            "RTSTAT-10",
+            "RTSTAT-12",
+            "MDRV-1",
+            "LUTLP-1",
+            "ANT-1",
+            "PLCK-1",
+        ] {
+            assert!(
+                rep.drc.item(id).is_some(),
+                "expected {id} in signoff report:\n{}",
+                rep.drc.text()
+            );
+        }
+        assert!(!rep.combinational_loops.is_empty());
+        assert!(rep.antenna_metrics.iter().any(|a| a.violated));
+
+        // Adding ANTENNA_DIODE="true" on net "q" must clear ANT-1!
+        d.set_net_attr("q", "ANTENNA_DIODE", "true").unwrap();
+        let rep_diode = check_bitstream_signoff(&d, &r, &dev, &cfg);
+        assert!(
+            rep_diode.drc.item("ANT-1").is_none(),
+            "ANTENNA_DIODE must clear ANT-1 violation"
+        );
+        assert!(
+            rep_diode
+                .antenna_metrics
+                .iter()
+                .all(|a| a.has_diode_protection && !a.violated)
         );
     }
 }
