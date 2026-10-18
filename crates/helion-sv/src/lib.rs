@@ -20,6 +20,12 @@ pub mod parallel_elab;
 /// SystemVerilog Assertions, v3.0 subset (verification track, Part B).
 pub mod sva;
 mod ug901;
+/// Radix-4 Modified Booth + Wallace tree multiplier, non-restoring divider, and integer square root.
+pub mod arith_trees;
+pub use arith_trees::{
+    booth_radix4_pp_lut6_init, synthesize_booth_wallace_mul, synthesize_isqrt,
+    synthesize_nonrestoring_div_rem, BoothWallaceStats, DivRemStats, IsqrtStats,
+};
 
 // Thread-local storage for pre-optimization Design (for --verify flag).
 // When HELION_PRESERVE_PRE_OPT is set, synth_from_parsed_top clones the
@@ -6614,7 +6620,36 @@ fn parse_mul<'a>(p: &mut P<'a>) -> Result<RExpr<'a>, String> {
                     width: (*wa).max(*wb),
                     care: *ca & *cb,
                 },
-                _ => return Err("div needs const operands".into()),
+                _ => RExpr::Call {
+                    name: "$div",
+                    args: vec![e, r],
+                },
+            };
+            continue;
+        }
+        if p.eat_sym('%') {
+            let r = parse_un_r(p)?;
+            e = match (&e, &r) {
+                (
+                    RExpr::Const {
+                        val: a,
+                        width: wa,
+                        care: ca,
+                    },
+                    RExpr::Const {
+                        val: b,
+                        width: wb,
+                        care: cb,
+                    },
+                ) if *b != 0 => RExpr::Const {
+                    val: a % *b,
+                    width: (*wa).max(*wb),
+                    care: *ca & *cb,
+                },
+                _ => RExpr::Call {
+                    name: "$rem",
+                    args: vec![e, r],
+                },
             };
             continue;
         }
@@ -7208,6 +7243,37 @@ fn parse_atom_r<'a>(p: &mut P<'a>) -> Result<RExpr<'a>, String> {
                     val: 0,
                     width: 1,
                     care: 1,
+                });
+            }
+            if name == "$sqrt" && p.eat_sym('(') {
+                let arg = parse_rexpr(p)?;
+                if !p.eat_sym(')') {
+                    return Err("$sqrt )".into());
+                }
+                if let RExpr::Const { val, width, care } = arg {
+                    return Ok(RExpr::Const {
+                        val: val.isqrt(),
+                        width: width.max(1),
+                        care,
+                    });
+                }
+                return Ok(RExpr::Call {
+                    name: "$sqrt",
+                    args: vec![arg],
+                });
+            }
+            if name == "$booth_mul" && p.eat_sym('(') {
+                let a = parse_rexpr(p)?;
+                if !p.eat_sym(',') {
+                    return Err("$booth_mul ,".into());
+                }
+                let b = parse_rexpr(p)?;
+                if !p.eat_sym(')') {
+                    return Err("$booth_mul )".into());
+                }
+                return Ok(RExpr::Call {
+                    name: "$booth_mul",
+                    args: vec![a, b],
                 });
             }
             // `fname(a, b)` — inlined after module parse when a FuncDef exists.
@@ -17299,6 +17365,127 @@ fn emit_mac27(d: &mut Design, cell: String, rhs: &RExpr<'_>, lhs: &str) {
     }
     d.connect(lhs, &cell, "P");
 }
+fn extract_arith_operand_nets(
+    d: &mut Design,
+    rtl: &Rtl,
+    prefix: &str,
+    expr: &RExpr<'_>,
+    target_w: usize,
+) -> Option<Vec<String>> {
+    match expr {
+        RExpr::Ident(s) if sig_depth(rtl, s) == 0 && name_known(rtl, s) => {
+            let sw = sig_width(rtl, s).max(1);
+            if sw > 32 {
+                return None;
+            }
+            Some((0..sw).map(|i| bit_name(s, sw, i)).collect())
+        }
+        RExpr::Range(s, lo, hi)
+            if sig_depth(rtl, s) == 0 && name_known(rtl, s) && *hi >= *lo =>
+        {
+            let sw = sig_width(rtl, s).max(1);
+            let rw = (*hi).saturating_sub(*lo).saturating_add(1).max(1);
+            if rw > 32 {
+                return None;
+            }
+            Some((*lo..=*hi).map(|i| bit_name(s, sw, i)).collect())
+        }
+        RExpr::Bit(s, b) if sig_depth(rtl, s) == 0 && name_known(rtl, s) => {
+            let sw = sig_width(rtl, s).max(1);
+            Some(vec![bit_name(s, sw, *b)])
+        }
+        RExpr::Const { val, width, .. } => {
+            let cw = (*width).max(target_w).max(1).min(32);
+            let mut nets = Vec::with_capacity(cw);
+            for i in 0..cw {
+                let bit_on = ((*val >> i) & 1) != 0;
+                let cell = format!("u_{prefix}_c{i}");
+                let net = format!("n_{prefix}_c{i}");
+                d.add_cell(
+                    &cell,
+                    CellKind::Lut6 {
+                        init: if bit_on { u64::MAX } else { 0 },
+                    },
+                );
+                d.connect(&net, &cell, "O");
+                let _ = d.dont_touch(&cell);
+                nets.push(net);
+            }
+            Some(nets)
+        }
+        _ => None,
+    }
+}
+
+fn try_emit_arith_tree_assign(
+    d: &mut Design,
+    rtl: &Rtl,
+    lhs: &str,
+    rhs: &RExpr<'_>,
+    idx: usize,
+) -> Option<bool> {
+    let RExpr::Call { name, args } = rhs else {
+        return None;
+    };
+    if !matches!(*name, "$div" | "$rem" | "$sqrt" | "$booth_mul") {
+        return None;
+    }
+    let w = sig_width(rtl, lhs).max(1);
+    if w > 32 {
+        return Some(false);
+    }
+    let out_nets: Vec<String> = (0..w).map(|i| bit_name(lhs, w, i)).collect();
+    let prefix = format!("atree_{lhs}_{idx}");
+    match (*name, args.as_slice()) {
+        ("$div", [a, b]) => {
+            let a_nets = extract_arith_operand_nets(d, rtl, &format!("{prefix}_a"), a, w)?;
+            let b_nets = extract_arith_operand_nets(d, rtl, &format!("{prefix}_b"), b, w)?;
+            arith_trees::synthesize_nonrestoring_div_rem(
+                d,
+                &prefix,
+                &a_nets,
+                &b_nets,
+                Some(&out_nets),
+                None,
+                false,
+            );
+            Some(true)
+        }
+        ("$rem", [a, b]) => {
+            let a_nets = extract_arith_operand_nets(d, rtl, &format!("{prefix}_a"), a, w)?;
+            let b_nets = extract_arith_operand_nets(d, rtl, &format!("{prefix}_b"), b, w)?;
+            arith_trees::synthesize_nonrestoring_div_rem(
+                d,
+                &prefix,
+                &a_nets,
+                &b_nets,
+                None,
+                Some(&out_nets),
+                false,
+            );
+            Some(true)
+        }
+        ("$sqrt", [x]) => {
+            let x_nets = extract_arith_operand_nets(d, rtl, &format!("{prefix}_x"), x, w)?;
+            arith_trees::synthesize_isqrt(d, &prefix, &x_nets, &out_nets, None);
+            Some(true)
+        }
+        ("$booth_mul", [a, b]) => {
+            let a_nets = extract_arith_operand_nets(d, rtl, &format!("{prefix}_a"), a, w)?;
+            let b_nets = extract_arith_operand_nets(d, rtl, &format!("{prefix}_b"), b, w)?;
+            arith_trees::synthesize_booth_wallace_mul(
+                d,
+                &prefix,
+                &a_nets,
+                &b_nets,
+                &out_nets,
+                false,
+            );
+            Some(true)
+        }
+        _ => Some(false),
+    }
+}
 
 fn is_mac_rhs(e: &RExpr<'_>) -> bool {
     // Transient rewrite; the arena dies with this call.
@@ -22749,6 +22936,8 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
     let net_copies = collect_net_copies(&rtl.assigns);
     let priority_grant = try_emit_priority_onehot_grant(&mut d, rtl);
     for (lhs, bit, rhs0) in &rtl.assigns {
+    let mut n_arith_tree = 0usize;
+    for (lhs, bit, rhs0) in &rtl.assigns {
         let rhs_sub = subst_net_copies(rhs0, &net_copies, &arena);
         let rhs = &rhs_sub;
         if clock_mux_sigs.contains(*lhs) || clock_gate_sigs.contains(*lhs) {
@@ -22900,6 +23089,16 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
             emit_mac27(&mut d, format!("u_mac{n_mac}"), rhs, lhs);
             n_mac += 1;
             continue;
+        }
+        if bit.is_none() {
+            if let Some(emitted) =
+                try_emit_arith_tree_assign(&mut d, rtl, lhs, rhs, n_arith_tree)
+            {
+                if emitted {
+                    n_arith_tree += 1;
+                }
+                continue;
+            }
         }
         // Unknown name is not const 0.
         if rexpr_unknown_name(rhs, rtl).is_some() {
@@ -23295,6 +23494,22 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
             if !rel_sig.contains_key(bitn)
                 && !cone_pi_exceeds(expr_rom, 16)
                 && expr_node_count(expr_rom) <= 128
+        // Generic wide-cone decomposition BEFORE wide_capped check.
+        // Does not use AIG batch, so not subject to the cap.
+        // Skip relational operators (they stay assign_not_lowered by design).
+        if !wide_capped
+            && cone_pi_exceeds(&expr_rom, 6)
+            && !rel_sig.contains_key(bitn)
+            && expr_node_count(&expr_rom) <= 256
+        {
+            if decompose_wide_cone(
+                &mut d,
+                &mut share,
+                &format!("u_wd{i}_"),
+                Some(bitn),
+                &expr_rom,
+            )
+            .is_some()
             {
                 if decompose_wide_cone(
                     &mut d,
