@@ -1,5 +1,13 @@
 //! HELIONLIB — original primitives (not UNISIM).
 
+pub mod formal;
+
+pub use formal::{
+    check_equivalence, check_sequential_equivalence, emit_cex_vcd, encode_lut6_clauses, run_bmc,
+    run_ic3_pdr, run_k_induction, BmcResult, CnfSolver, CounterexampleTrace, DesignModel,
+    InductionResult, LecResult, Lit, PdrResult, SafetyProperty, SatResult, TimeframeLits,
+};
+
 pub const LUT6: &str = r#"
 module LUT6 #(parameter [63:0] INIT = 64'h0) (
   input I0, I1, I2, I3, I4, I5, output O
