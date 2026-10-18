@@ -8,7 +8,7 @@ use super::HelionIde;
 use eframe::egui::{self};
 use helion_gui::constraints_wizard as wiz;
 use helion_gui::{chrome, IdeModel, JobKind};
-use helion_ir::{intern, resolve, PortDir};
+use helion_ir::{resolve, PortDir};
 use std::path::PathBuf;
 
 /// Screenshot affordance: `HELION_CONSTRAINTS_WIZARD=1` auto-opens the wizard,
@@ -825,7 +825,7 @@ pub fn paint(ui: &mut egui::Ui, app: &mut HelionIde) {
     ui.horizontal(|ui| {
         ui.heading("Constraints Wizard");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("✕ Close").clicked() {
+            if ui.button("× Close").clicked() {
                 app.constraints_wizard = None;
             }
         });

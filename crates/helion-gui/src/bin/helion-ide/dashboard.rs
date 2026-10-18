@@ -49,19 +49,19 @@ pub fn paint_dashboard(ui: &mut egui::Ui, app: &mut HelionIde) {
             };
             // (title, view tabs, min height, section index)
             const SECTIONS: [(&str, Option<(&str, &[&str])>, f32, usize); 8] = [
-                ("Design", None, 152.0, 0),
-                ("Synthesis", None, 174.0, 1),
-                ("Implementation", None, 196.0, 2),
+                ("Design", None, 132.0, 0),
+                ("Synthesis", None, 146.0, 1),
+                ("Implementation", None, 168.0, 2),
                 (
                     "Timing",
                     Some(("dash_timing_view", &["Summary", "Paths"])),
-                    248.0,
+                    204.0,
                     3,
                 ),
-                ("Utilization", None, 232.0, 4),
-                ("DRC", None, 162.0, 5),
-                ("Power", None, 192.0, 6),
-                ("Run History", None, 232.0, 7),
+                ("Utilization", None, 178.0, 4),
+                ("DRC", None, 140.0, 5),
+                ("Power", None, 168.0, 6),
+                ("Run History", None, 188.0, 7),
             ];
             let mut go: Option<WorkspaceTab> = None;
             for (ri, chunk) in SECTIONS.chunks(cols).enumerate() {
@@ -280,8 +280,8 @@ fn status_row(ui: &mut egui::Ui, theme: &theme::Theme, label: &str, status: &str
     let (icon, color) = match status {
         "Complete" | "Clean" => ("✓", theme.ok),
         "Running" => ("▶", theme.accent),
-        "Failed" => ("✗", theme.danger),
-        "Warnings" => ("⚠", theme.warn),
+        "Failed" => ("×", theme.danger),
+        "Warnings" => ("▲", theme.warn),
         _ => ("○", theme.faint),
     };
     let w = ui.available_width();
@@ -489,12 +489,27 @@ fn paint_design_body(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Them
         "Top module",
         m.tree.top.as_deref().unwrap_or("-"),
     );
-    let src = app
-        .recent
-        .first()
-        .map(|p| p.display().to_string())
+    let src = m
+        .selected_source
+        .as_deref()
+        .or_else(|| m.tree.sources.first().map(String::as_str))
+        .map(|s| {
+            let fname = s.rsplit('/').next().unwrap_or(s);
+            if s.len() > 38 {
+                format!("{fname}  (…{})", &s[s.len().saturating_sub(24)..])
+            } else {
+                s.to_string()
+            }
+        })
+        .or_else(|| {
+            app.recent.first().map(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.display().to_string())
+            })
+        })
         .unwrap_or_else(|| "-".into());
-    kv_row(ui, theme, "Source file", &truncate_str(&src, 42));
+    kv_row(ui, theme, "Source file", &src);
 }
 
 /// Synthesis section: status / strategy / part / cells / runtime.
@@ -832,8 +847,8 @@ fn paint_runs_body(
             let (icon, scolor) = match run.status.as_str() {
                 "Complete" => ("✓", theme.ok),
                 "Running" => ("▶", theme.accent),
-                "Failed" => ("✗", theme.danger),
-                "Warnings" => ("⚠", theme.warn),
+                "Failed" => ("×", theme.danger),
+                "Warnings" => ("▲", theme.warn),
                 _ => ("○", theme.faint),
             };
             vec![
@@ -965,16 +980,30 @@ pub fn paint_timing_catalog(ui: &mut egui::Ui, app: &mut HelionIde) {
 /// negative-slack endpoint, otherwise `theme.accent`; axis labels use
 /// `theme.faint`. Honest empty state when there is no path data.
 pub fn paint_slack_histogram(ui: &mut egui::Ui, model: &IdeModel, theme: &theme::Theme) {
-    ui.label(
-        egui::RichText::new("Endpoint Slack Histogram")
-            .font(theme::font_ui_semibold(13.0))
-            .color(theme.text),
-    );
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Endpoint Slack Histogram")
+                .font(theme::font_ui_semibold(13.0))
+                .color(theme.text),
+        );
+        if !model.timing_paths.is_empty() {
+            let viol = model.timing_paths.iter().filter(|p| p.slack_ps < 0).count();
+            ui.label(
+                egui::RichText::new(format!(
+                    "· {} endpoints ({} violating)",
+                    model.timing_paths.len(),
+                    viol
+                ))
+                .size(11.5)
+                .color(if viol > 0 { theme.danger } else { theme.dim }),
+            );
+        }
+    });
     if model.timing_paths.is_empty() {
         ui.label(egui::RichText::new("No timing paths - run Implement").color(theme.faint));
         return;
     }
-    const BINS: usize = 20;
+    const BINS: usize = 16;
     let min = model
         .timing_paths
         .iter()
@@ -987,54 +1016,79 @@ pub fn paint_slack_histogram(ui: &mut egui::Ui, model: &IdeModel, theme: &theme:
         .map(|p| p.slack_ps)
         .max()
         .unwrap_or(0);
-    let span = (max - min).max(1) as f64;
+    let (lo, hi) = if min == max {
+        (min - 500, max + 500)
+    } else {
+        (min, max)
+    };
+    let span = (hi - lo).max(1) as f64;
     let mut counts = [0usize; BINS];
     let mut bin_min = [i64::MAX; BINS];
     for p in &model.timing_paths {
-        let b = (((p.slack_ps - min) as f64 / span) * BINS as f64).floor() as usize;
+        let b = (((p.slack_ps - lo) as f64 / span) * BINS as f64).floor() as usize;
         let b = b.min(BINS - 1);
         counts[b] += 1;
         bin_min[b] = bin_min[b].min(p.slack_ps);
     }
     let peak = counts.iter().copied().max().unwrap_or(1).max(1);
-    let plot_h = 96.0;
+    let plot_h = 84.0;
     let width = ui.available_width().max(120.0);
-    let bar_w = width / BINS as f32;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, plot_h), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, 6.0, theme.panel);
+    p.rect_stroke(
+        rect,
+        6.0,
+        egui::Stroke::new(1.0, theme.line),
+        egui::StrokeKind::Inside,
+    );
+    let inner = rect.shrink2(egui::vec2(10.0, 10.0));
+    let bar_w = inner.width() / BINS as f32;
     for (i, count) in counts.iter().enumerate() {
-        let h = *count as f32 / peak as f32 * plot_h;
-        let x0 = rect.left() + i as f32 * bar_w;
-        let bar = egui::Rect::from_min_max(
-            egui::pos2(x0 + 1.0, rect.top() + plot_h - h),
-            egui::pos2(x0 + bar_w - 1.0, rect.top() + plot_h),
+        let x0 = inner.left() + i as f32 * bar_w;
+        let slot = egui::Rect::from_min_max(
+            egui::pos2(x0 + 2.0, inner.top() + 12.0),
+            egui::pos2(x0 + bar_w - 2.0, inner.bottom()),
         );
-        let color = if bin_min[i] < 0 {
-            theme.danger
-        } else {
-            // Muted accent per §3.3: the histogram is context, not brand.
-            theme.accent_dim
-        };
-        ui.painter().rect_filled(bar, 2.0, color);
+        p.rect_filled(slot, 2.0, theme.bg.gamma_multiply(0.55));
+        if *count > 0 {
+            let avail_bar_h = (inner.height() - 14.0).max(8.0);
+            let h = (*count as f32 / peak as f32 * avail_bar_h).max(6.0);
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(x0 + 2.0, inner.bottom() - h),
+                egui::pos2(x0 + bar_w - 2.0, inner.bottom()),
+            );
+            let color = if bin_min[i] < 0 {
+                theme.danger
+            } else {
+                theme.accent_dim
+            };
+            p.rect_filled(bar, 2.0, color);
+            p.text(
+                egui::pos2(bar.center().x, bar.top() - 2.0),
+                egui::Align2::CENTER_BOTTOM,
+                count.to_string(),
+                egui::FontId::monospace(10.0),
+                theme.text,
+            );
+        }
     }
     ui.horizontal(|ui| {
         ui.label(
-            egui::RichText::new(format!("{min} ps"))
+            egui::RichText::new(format!("Min: {lo} ps"))
+                .monospace()
                 .small()
                 .color(theme.faint),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
-                egui::RichText::new(format!("{max} ps"))
+                egui::RichText::new(format!("Max: {hi} ps"))
+                    .monospace()
                     .small()
                     .color(theme.faint),
             );
         });
     });
-    ui.label(
-        egui::RichText::new(format!("{} paths", model.timing_paths.len()))
-            .small()
-            .color(theme.faint),
-    );
 }
 
 /// One catalog row: severity dot + label + right-aligned badge. True on click.
