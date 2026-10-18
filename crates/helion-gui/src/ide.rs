@@ -12912,6 +12912,9 @@ impl IdeModel {
                                 }
                             }
                             helion_ir::PortDir::Out => {
+                                if drivers == 0 {
+                                    drivers += 1;
+                                }
                                 loads += 1;
                             }
                         }
