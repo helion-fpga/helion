@@ -998,7 +998,8 @@ pub fn share_available(window_w: f32, window_h: f32) -> SharedChrome {
     let body_h = (h - chrome_y).max(1.0);
     let side_budget = (w - RAIL_WIDTH).max(1.0);
 
-    let sidebar_floor = 128.0_f32.min(side_budget * 0.46).max(88.0);
+    let base_floor = if w >= 960.0 { 208.0_f32 } else { 128.0_f32 };
+    let sidebar_floor = base_floor.min(side_budget * 0.46).max(88.0);
     let sidebar_cap = (side_budget * 0.30)
         .clamp(sidebar_floor, SIDEBAR_MAX_WIDTH)
         .max(sidebar_floor);

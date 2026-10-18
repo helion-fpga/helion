@@ -1099,26 +1099,51 @@ fn catalog_row(
     badge: Option<&str>,
     dot: egui::Color32,
 ) -> bool {
-    let mut clicked = false;
-    ui.horizontal(|ui| {
-        ui.colored_label(dot, "●");
-        if ui
-            .add(
-                egui::Label::new(egui::RichText::new(label).color(theme.text))
-                    .sense(egui::Sense::click()),
-            )
-            .clicked()
-        {
-            clicked = true;
+    let w = ui.available_width().max(60.0);
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(w, chrome::HIT_SIDEBAR), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        if resp.hovered() {
+            p.rect_filled(rect, 4.0, theme.surface_hover);
         }
+        p.circle_filled(egui::pos2(rect.left() + 8.0, rect.center().y), 3.5, dot);
+        let label_x = rect.left() + 20.0;
+        let mut right_limit = rect.right() - 6.0;
         if let Some(b) = badge {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(b).small().color(theme.faint));
-            });
+            let badge_galley = p.layout_no_wrap(
+                b.to_string(),
+                theme::font_ui(11.0),
+                theme.faint,
+            );
+            let bw = badge_galley.size().x;
+            right_limit = (rect.right() - 6.0 - bw - 8.0).max(label_x + 16.0);
+            p.galley(
+                egui::pos2(
+                    rect.right() - 6.0 - bw,
+                    rect.center().y - badge_galley.size().y * 0.5,
+                ),
+                badge_galley,
+                theme.faint,
+            );
         }
-    });
-    ui.add_space(2.0);
-    clicked
+        let clip = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.top()),
+            egui::pos2(right_limit, rect.bottom()),
+        );
+        p.with_clip_rect(clip).text(
+            egui::pos2(label_x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            theme::font_ui(12.5),
+            theme.text,
+        );
+    }
+    let hover = match badge {
+        Some(b) => format!("{label} — {b}"),
+        None => label.to_string(),
+    };
+    resp.on_hover_text(hover).clicked()
 }
 
 /// (label, badge, dot, tab) tuple builder for the catalog rows.
