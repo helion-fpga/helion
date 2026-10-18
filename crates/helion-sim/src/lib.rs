@@ -7,10 +7,16 @@ use helion_ir::{intern, resolve, CellKind, Design, PortDir};
 use helion_sv::sva::{SvaImmProp, SvaProperty};
 use std::collections::HashMap;
 
+pub mod crv_coverage;
 pub mod sva;
 pub mod vcd;
+pub use crv_coverage::{
+    BinKind, BinSpec, BinStatus, CovergroupEngine, CovergroupReport, CoverpointReport,
+    CoverpointSpec, CrossReport, CrossSpec, DistItem, DistWeightKind, DomainIntervals,
+    IllegalBinViolation, NamedConstraintBlock, RandClass, RandConstraint, RandConstraintSolver,
+    RandExpr, RandMode, RandVarSpec,
+};
 use sva::{SvaEngine, SvaFailure, SvaReport};
-
 /// UG900 force vs deposit: hold until `release`, or one-shot poke.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SimForceKind {
@@ -727,7 +733,7 @@ pub fn run_tb(design: &Design, cycles: u32) -> Vec<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helion_ir::{intern, resolve, CellKind, Design, PortDir};
+    use helion_ir::{intern, CellKind, Design, PortDir};
 
     #[test]
     fn overlay_sim_counter_led_gold_labeled_sim_done() {
@@ -853,7 +859,7 @@ endmodule
     fn memory_cells_capped_on_wide_netlist() {
         let mut d = Design::new("wide");
         for i in 0..400u32 {
-            d.add_cell(format!("lut{i}"), CellKind::Lut6 { init: 1 });
+            d.add_cell(&format!("lut{i}"), CellKind::Lut6 { init: 1 });
         }
         let s = Sim::new(&d);
         assert_eq!(s.lut_init.len(), 400, "kernel still holds every INIT");
@@ -987,14 +993,14 @@ endmodule
             w
         }
         for i in 0..6u32 {
-            d.add_cell(format!("u_lut{i}"), CellKind::Lut6 { init: inc_init(i) });
-            d.add_cell(format!("u_ff{i}"), CellKind::Hff);
-            d.connect("clk", format!("u_ff{i}"), "CLK");
-            d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
-            d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
-            d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
+            d.add_cell(&format!("u_lut{i}"), CellKind::Lut6 { init: inc_init(i) });
+            d.add_cell(&format!("u_ff{i}"), CellKind::Hff);
+            d.connect("clk", &format!("u_ff{i}"), "CLK");
+            d.connect(&format!("d{i}"), &format!("u_lut{i}"), "O");
+            d.connect(&format!("d{i}"), &format!("u_ff{i}"), "D");
+            d.connect(&format!("q{i}"), &format!("u_ff{i}"), "Q");
             for pin in 0..=i {
-                d.connect(format!("q{pin}"), format!("u_lut{i}"), format!("I{pin}"));
+                d.connect(&format!("q{pin}"), &format!("u_lut{i}"), &format!("I{pin}"));
             }
         }
         d.add_cell("u_iob", CellKind::IobOut);
@@ -1008,7 +1014,7 @@ endmodule
         let d = six_bit_counter();
         let lut5 = d.cell("u_lut5").unwrap();
         let pins: Vec<_> = (0..6u8)
-            .filter(|p| d.net_on("u_lut5", &format!("I{p}")).is_some())
+            .filter(|p| d.net_on(intern("u_lut5"), intern(&format!("I{p}"))).is_some())
             .collect();
         assert_eq!(
             pins,
@@ -1152,5 +1158,187 @@ endmodule
         s.drive_input("b", true).unwrap();
         s.step_posedge(10);
         assert_eq!(s.sample("u_ff"), Some(1));
+    }
+
+    #[test]
+    fn crv_solver_randc_period_inside_dist_implication_and_backtracking() {
+        // 1. `randc` cyclic permutation: 3-bit variable (`0..=7`, period 8) must visit all
+        //    8 values without repetition in each 8-call epoch!
+        let mut rc_cls = RandClass::new("RandcSeq");
+        rc_cls.add_randc("id", 3);
+        let mut rc_solver = RandConstraintSolver::new(rc_cls, 0x1234_5678);
+        for _epoch in 0..3 {
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..8 {
+                let vals = rc_solver.randomize().expect("randc randomize");
+                assert!(
+                    seen.insert(vals["id"]),
+                    "randc repeated value before exhausting period 8"
+                );
+            }
+            assert_eq!(seen.len(), 8);
+        }
+
+        // 2. Complex constrained-random class with `inside`, negated `inside`, `dist`,
+        //    implication `->`, `solve a before b`, `unique`, and arithmetic `a + b == 20`.
+        let mut pkt = RandClass::new("BusPacket");
+        pkt.add_rand("mode", 2)
+            .add_rand("addr", 8)
+            .add_rand("len", 8)
+            .add_rand("tag_a", 4)
+            .add_rand("tag_b", 4);
+        pkt.add_constraint(
+            "c_valid",
+            vec![
+                RandConstraint::SolveBefore {
+                    before: "mode".to_string(),
+                    after: "addr".to_string(),
+                },
+                RandConstraint::Dist {
+                    var: "mode".to_string(),
+                    items: vec![
+                        DistItem::val_per_value(1, 90),
+                        DistItem::range_per_range(2, 3, 10),
+                    ],
+                },
+                RandConstraint::Inside {
+                    var: "addr".to_string(),
+                    ranges: vec![(0x10, 0x2F), (0x80, 0x8F)],
+                    negated: false,
+                },
+                RandConstraint::Inside {
+                    var: "addr".to_string(),
+                    ranges: vec![(0x18, 0x1F)],
+                    negated: true,
+                },
+                RandConstraint::Implies {
+                    cond: RandExpr::Eq(
+                        Box::new(RandExpr::var("mode")),
+                        Box::new(RandExpr::val(1)),
+                    ),
+                    body: vec![RandConstraint::Inside {
+                        var: "addr".to_string(),
+                        ranges: vec![(0x80, 0x8F)],
+                        negated: false,
+                    }],
+                },
+                RandConstraint::Unique(vec!["tag_a".to_string(), "tag_b".to_string()]),
+                RandConstraint::Expr(RandExpr::Eq(
+                    Box::new(RandExpr::Add(
+                        Box::new(RandExpr::var("tag_a")),
+                        Box::new(RandExpr::var("tag_b")),
+                    )),
+                    Box::new(RandExpr::val(20)),
+                )),
+                RandConstraint::Expr(RandExpr::Lt(
+                    Box::new(RandExpr::var("tag_a")),
+                    Box::new(RandExpr::var("tag_b")),
+                )),
+            ],
+        );
+
+        let mut solver = RandConstraintSolver::new(pkt, 0xCAFE_BABE);
+        let mut mode1_hits = 0usize;
+        for _ in 0..100 {
+            let sample = solver.randomize().expect("solve BusPacket");
+            let mode = sample["mode"];
+            let addr = sample["addr"];
+            let ta = sample["tag_a"];
+            let tb = sample["tag_b"];
+
+            assert!((1..=3).contains(&mode));
+            assert!(!((0x18..=0x1F).contains(&addr)), "excluded range hit: {addr:#x}");
+            assert!(
+                (0x10..=0x2F).contains(&addr) || (0x80..=0x8F).contains(&addr),
+                "outside allowed inside range: {addr:#x}"
+            );
+            if mode == 1 {
+                mode1_hits += 1;
+                assert!(
+                    (0x80..=0x8F).contains(&addr),
+                    "implication mode==1 -> addr in [0x80:0x8F] violated: {addr:#x}"
+                );
+            }
+            assert_ne!(ta, tb, "unique constraint violated");
+            assert_eq!(ta + tb, 20, "sum constraint violated");
+            assert!(ta < tb, "ordering constraint violated");
+        }
+        assert!(
+            mode1_hits >= 65,
+            "weighted dist (90:10) should heavily favor mode=1, got {mode1_hits}/100"
+        );
+
+        // Deterministic seed reproducibility:
+        let s1 = solver.randomize_with_seed(42).unwrap();
+        let s2 = solver.randomize_with_seed(42).unwrap();
+        assert_eq!(s1, s2, "randomize_with_seed must be deterministic");
+
+        // Unsatisfiable inline constraint fails loud:
+        let unsat = solver.randomize_with(&[RandConstraint::Inside {
+            var: "mode".to_string(),
+            ranges: vec![(0, 0)],
+            negated: false,
+        }]);
+        assert!(unsat.is_err());
+    }
+
+    #[test]
+    fn covergroup_engine_tracks_value_transition_ignore_illegal_and_cross_bins() {
+        let mut cp_op = CoverpointSpec::new("cp_op", "op");
+        cp_op
+            .add_value_bin("read", vec![(0, 0)], 2)
+            .add_value_bin("write", vec![(1, 1)], 2)
+            .add_transition_bin("rd_to_wr_to_rd", vec![0, 1, 0], 1)
+            .add_ignore_bin("nop", vec![(2, 2)])
+            .add_illegal_bin("bad_op", vec![(3, 3)])
+            .add_illegal_transition_bin("wr_to_bad", vec![1, 3]);
+
+        let mut cp_size = CoverpointSpec::new("cp_size", "size");
+        cp_size
+            .add_value_bin("byte", vec![(0, 0)], 1)
+            .add_value_bin("word", vec![(1, 3)], 1);
+
+        let mut cg = CovergroupEngine::new("bus_cg");
+        cg.add_coverpoint(cp_op);
+        cg.add_coverpoint(cp_size);
+        cg.add_cross(
+            CrossSpec::new(
+                "op_x_size",
+                vec!["cp_op".to_string(), "cp_size".to_string()],
+                1,
+            )
+            .with_ignore_tuple(vec!["rd_to_wr_to_rd".to_string(), "byte".to_string()])
+            .with_ignore_tuple(vec!["rd_to_wr_to_rd".to_string(), "word".to_string()]),
+        )
+        .expect("add cross");
+
+        let sample_pair = |cg: &mut CovergroupEngine, op: u64, size: u64| -> Vec<IllegalBinViolation> {
+            let mut m = HashMap::new();
+            m.insert("op".to_string(), op);
+            m.insert("size".to_string(), size);
+            cg.sample(&m)
+        };
+
+        // Hit (read, byte), (write, byte), (read, word), (write, word) -> also triggers `0 => 1 => 0`!
+        assert!(sample_pair(&mut cg, 0, 0).is_empty());
+        assert!(sample_pair(&mut cg, 1, 0).is_empty());
+        assert!(sample_pair(&mut cg, 0, 1).is_empty());
+        assert!(sample_pair(&mut cg, 1, 2).is_empty());
+        // Ignored value `op = 2` is skipped without affecting transition history or bins.
+        assert!(sample_pair(&mut cg, 2, 0).is_empty());
+
+        let rep = cg.report();
+        assert_eq!(rep.coverpoints[0].covered_bins, 3);
+        assert_eq!(rep.coverpoints[0].total_active_bins, 3);
+        assert!((rep.coverpoints[0].coverage_pct - 100.0).abs() < 1e-6);
+        assert_eq!(rep.crosses[0].covered_tuples, 4);
+        assert_eq!(rep.crosses[0].total_tuples, 4);
+        assert!((rep.overall_coverage_pct - 100.0).abs() < 1e-6);
+        assert!(rep.illegal_violations.is_empty());
+
+        // Sampling `op = 3` after `op = 1` triggers BOTH `illegal_bins bad_op` AND `illegal_bins wr_to_bad`!
+        let viols = sample_pair(&mut cg, 3, 0);
+        assert_eq!(viols.len(), 2, "{viols:?}");
+        assert_eq!(cg.violations().len(), 2);
     }
 }
