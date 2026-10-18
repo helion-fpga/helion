@@ -9,7 +9,7 @@
 
 use crate::device::{tile_db, tile_kind, TileKind, PINTYPE_INPUT, PINTYPE_OUTPUT};
 use crate::gclk::colbuf_src_y;
-use crate::pack::{lut4_init_to_lc_bits, IoDir, PackedPll, PllKind};
+use crate::pack::{lut4_init_to_lc_bits, HardIpKind, IoDir, OscKind, PackedPll};
 use crate::place::CarryMuxMode;
 use crate::route::{RoutedIce, Router};
 use std::collections::{HashMap, HashSet};
@@ -186,18 +186,15 @@ fn pll_config_bits(pll: &PackedPll) -> Vec<(u8, u8, bool)> {
     let mut bits: Vec<(u8, u8, bool)> = Vec::new();
     let mut push = |x: u8, cfg: u8, val: bool| bits.push((x, cfg, val));
     // PLLTYPE_0..2.
-    let plltype: u8 = match pll.kind {
-        PllKind::Pad => 0b010,
-        PllKind::Core => 0b011,
-    };
+    let plltype: u8 = pll.kind.plltype_code();
     push(16, 5, plltype & 1 != 0);
     push(18, 1, plltype & 2 != 0);
     push(18, 3, plltype & 4 != 0);
-    // FEEDBACK_PATH_0..2 = 3'b001 (SIMPLE).
-    push(18, 5, true);
-    push(15, 9, false);
-    push(16, 1, false);
-    // DIVR_0..3.
+    // FEEDBACK_PATH_0..2.
+    let fb: u8 = pll.feedback_path.code();
+    push(18, 5, fb & 1 != 0);
+    push(15, 9, fb & 2 != 0);
+    push(16, 1, fb & 4 != 0);
     for i in 0..4 {
         push(14, 1 + i, (pll.divr >> i) & 1 != 0);
     }
@@ -383,6 +380,16 @@ pub fn emit_asc(router: &Router, routed: &RoutedIce) -> Result<String, String> {
         let (bank, bit) = ram_config_bit(TileKind::Ramb, "PowerUp")?;
         if let Some(t) = tiles.get_mut(&(pr.x, pr.y)) {
             t.set(bank, bit);
+            if ram.neg_clk_r {
+                // B0[0] NegClk in RAMB tile
+                t.set(0, 0);
+            }
+        }
+        if ram.neg_clk_w {
+            if let Some(t) = tiles.get_mut(&(pr.x, pr.y + 1)) {
+                // B0[0] NegClk in RAMT tile
+                t.set(0, 0);
+            }
         }
         let modes = [
             (ram.write_mode, 0u8, 0u8),
@@ -406,13 +413,10 @@ pub fn emit_asc(router: &Router, routed: &RoutedIce) -> Result<String, String> {
     // The site row comes from the placed position (bottom y=0 / top y=33);
     // the bit layout is IceStorm icebox.py pllinfo_db "8k_0"/"8k_1".
     for pll in &placed.packed.plls {
-        let yb = match pll.kind {
-            PllKind::Pad => 0u8,
-            PllKind::Core => 33u8,
-        };
-        let io_kind = match pll.kind {
-            PllKind::Pad => TileKind::IoBottom,
-            PllKind::Core => TileKind::IoTop,
+        let (yb, io_kind) = if pll.kind.is_pad() {
+            (0u8, TileKind::IoBottom)
+        } else {
+            (33u8, TileKind::IoTop)
         };
         for (x, cfg, val) in pll_config_bits(pll) {
             if !val {
@@ -520,6 +524,86 @@ pub fn emit_asc(router: &Router, routed: &RoutedIce) -> Result<String, String> {
     extra_bits.dedup();
     for (bank, row, bit) in extra_bits {
         out.push_str(&format!(".extra_bit {bank} {row} {bit}\n"));
+    }
+
+    // 7. Hard IP / DSP / SPRAM / Oscillator configuration blocks (.comment metadata
+    // preserved alongside tile bitstream for SB_MAC16, SB_SPRAM256KA, SB_HFOSC/SB_LFOSC,
+    // SB_I2C, SB_SPI, SB_RGBA_DRV, SB_LEDDA_IP).
+    for (mi, mac) in placed.packed.mac16s.iter().enumerate() {
+        let pmac = &placed.mac16s[mi];
+        out.push_str(&format!(
+            ".comment SB_MAC16 {} site=({},{}) IpConfig=0x{:07x} NegTrigger={} C_REG={} A_REG={} B_REG={} D_REG={} MODE_8x8={} A_SIGNED={} B_SIGNED={}\n",
+            mac.name,
+            pmac.x,
+            pmac.y,
+            mac.config_bits_25,
+            u8::from(mac.neg_trigger),
+            u8::from(mac.c_reg),
+            u8::from(mac.a_reg),
+            u8::from(mac.b_reg),
+            u8::from(mac.d_reg),
+            u8::from(mac.mode_8x8),
+            u8::from(mac.a_signed),
+            u8::from(mac.b_signed),
+        ));
+    }
+    for (si, spram) in placed.packed.sprams.iter().enumerate() {
+        let pspram = &placed.sprams[si];
+        out.push_str(&format!(
+            ".comment SB_SPRAM256KA {} site=({},{})\n",
+            spram.name, pspram.x, pspram.y
+        ));
+    }
+    for (oi, osc) in placed.packed.oscs.iter().enumerate() {
+        let posc = &placed.oscs[oi];
+        let kind_str = match osc.kind {
+            OscKind::HfOsc => "SB_HFOSC",
+            OscKind::LfOsc => "SB_LFOSC",
+        };
+        out.push_str(&format!(
+            ".comment {} {} site=({},{}) CLKHF_DIV={}\n",
+            kind_str, osc.name, posc.x, posc.y, osc.clk_hf_div
+        ));
+    }
+    for (hi, ip) in placed.packed.hard_ips.iter().enumerate() {
+        let pip = &placed.hard_ips[hi];
+        match &ip.kind {
+            HardIpKind::I2c { bus_addr74 } => {
+                out.push_str(&format!(
+                    ".comment SB_I2C {} site=({},{}) BUS_ADDR74=0b{:04b}\n",
+                    ip.name, pip.x, pip.y, bus_addr74
+                ));
+            }
+            HardIpKind::Spi { bus_addr74 } => {
+                out.push_str(&format!(
+                    ".comment SB_SPI {} site=({},{}) BUS_ADDR74=0b{:04b}\n",
+                    ip.name, pip.x, pip.y, bus_addr74
+                ));
+            }
+            HardIpKind::RgbaDrv {
+                current_mode,
+                rgb0_current,
+                rgb1_current,
+                rgb2_current,
+            } => {
+                out.push_str(&format!(
+                    ".comment SB_RGBA_DRV {} site=({},{}) CURRENT_MODE={} RGB0_CURRENT=0b{:06b} RGB1_CURRENT=0b{:06b} RGB2_CURRENT=0b{:06b}\n",
+                    ip.name,
+                    pip.x,
+                    pip.y,
+                    current_mode,
+                    rgb0_current,
+                    rgb1_current,
+                    rgb2_current
+                ));
+            }
+            HardIpKind::LeddaIp => {
+                out.push_str(&format!(
+                    ".comment SB_LEDDA_IP {} site=({},{})\n",
+                    ip.name, pip.x, pip.y
+                ));
+            }
+        }
     }
     Ok(out)
 }

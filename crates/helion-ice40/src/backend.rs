@@ -104,16 +104,8 @@ mod tests {
     fn run_driver_produces_asc() {
         use helion_ir::{CellKind, PortDir};
         let mut d = NetlistIr::new("buf");
-        d.ports.push(helion_ir::Port {
-            name: "clk".to_string(),
-            dir: PortDir::In,
-            attrs: Default::default(),
-        });
-        d.ports.push(helion_ir::Port {
-            name: "led0".to_string(),
-            dir: PortDir::Out,
-            attrs: Default::default(),
-        });
+        d.add_port("clk", PortDir::In);
+        d.add_port("led0", PortDir::Out);
         d.add_cell("ib", CellKind::IobIn);
         d.connect("a_net", "ib", "O");
         d.connect("clk", "ib", "PAD");
