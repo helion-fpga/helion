@@ -11,6 +11,7 @@
 //!   emission and structured Vivado HLS Synthesis & Latency/Utilization Report generation.
 
 pub mod ap_math_stream;
+pub mod cosim;
 pub mod emit;
 pub mod parser;
 pub mod pragma;
@@ -21,6 +22,12 @@ pub use ap_math_stream::{
     hls_cordic_sincos_q14, hls_cos_q14, hls_max_i64, hls_min_i64, hls_popcount_u64, hls_sin_q14,
     hls_sqrt_u64,
 };
+pub use cosim::{
+    AXI4_4KB_BOUNDARY_BYTES, AXI4_MAX_BURST_BEATS, AxiBurstKind, CosimReport, CosimStatus,
+    CosimTestVector, CosimVectorResult, MAxiBurstDescriptor, coalesce_m_axi_bursts,
+    evaluate_c_kernel_reference, extract_kernel_m_axi_bursts, generate_cosim_testbench,
+    run_cosim_verification,
+};
 pub use emit::{generate_hls_report, resolve_interfaces, HlsSynthesisReport, InterfacePort};
 pub use parser::{
     tokenize, BinOp, CArg, CExpr, CFunction, CStmt, CType, CVar, LValue, Parser, Tok,
@@ -29,8 +36,9 @@ pub use parser::{
 pub use pragma::{
     extract_inline_pragmas, parse_pragma_line, parse_tcl_config, parse_tcl_directives,
     AllocationDirective, AllocationKind, ArrayPartitionDirective, DataflowChannelKind,
-    DataflowDirective, HlsConfig, HlsDirective, InlineDirective, InlineMode, InterfaceDirective,
-    InterfaceMode, PartitionType, PipelineDirective, PipelineStyle, UnrollDirective,
+    DataflowDirective, DependenceDirection, DependenceDirective, DependenceType, HlsConfig,
+    HlsDirective, InlineDirective, InlineMode, InterfaceDirective, InterfaceMode, PartitionType,
+    PipelineDirective, PipelineStyle, UnrollDirective,
 };
 pub use schedule::{
     bind_resources, build_cdfg, compute_alap, compute_asap, compute_sdc_schedule,
@@ -780,5 +788,135 @@ void dsp_math_stream_kernel(
                 .iter()
                 .any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. }))
         );
+    }
+
+    #[test]
+    fn hls_dependence_directive_adjusts_rec_ii_and_distance() {
+        // 1. Without #pragma HLS DEPENDENCE: loop reading and writing `hist[i]` with multiply has RecII = 4
+        let conservative_src = r#"
+void hist_update(int hist[16], int scale) {
+  HIST_LOOP: for (int i = 1; i < 16; i++) {
+    #pragma HLS PIPELINE II=1
+    hist[i] = hist[i - 1] * scale + 1;
+  }
+}
+"#;
+        let r_cons = hls_compile(conservative_src).expect("conservative hist_update");
+        assert_eq!(r_cons.schedule.rec_ii, 4, "Default distance=1 array recurrence with mul has RecII=4");
+        assert_eq!(r_cons.schedule.achieved_ii, 4);
+
+        // 2. With `#pragma HLS DEPENDENCE variable=hist inter true distance=2`: RecII = ceil(4 / 2) = 2
+        let dist2_src = r#"
+void hist_update(int hist[16], int scale) {
+  HIST_LOOP: for (int i = 2; i < 16; i++) {
+    #pragma HLS PIPELINE II=1
+    #pragma HLS DEPENDENCE variable=hist inter true RAW distance=2
+    hist[i] = hist[i - 2] * scale + 1;
+  }
+}
+"#;
+        let r_dist2 = hls_compile(dist2_src).expect("distance=2 hist_update");
+        assert_eq!(r_dist2.schedule.rec_ii, 2, "distance=2 halves RecII from 4 to 2");
+        assert_eq!(r_dist2.schedule.achieved_ii, 2);
+
+        // 3. With `#pragma HLS DEPENDENCE variable=hist inter false`: false dependence removes recurrence -> RecII = 1, II = 1
+        let false_dep_src = r#"
+void hist_update(int hist[16], int scale) {
+  HIST_LOOP: for (int i = 0; i < 16; i++) {
+    #pragma HLS PIPELINE II=1
+    #pragma HLS DEPENDENCE variable=hist inter false
+    hist[i] = hist[i] * scale + 1;
+  }
+}
+"#;
+        let r_false = hls_compile(false_dep_src).expect("inter false hist_update");
+        assert_eq!(r_false.schedule.rec_ii, 1, "inter false must eliminate array RecII");
+        assert_eq!(r_false.schedule.achieved_ii, 1);
+    }
+
+    #[test]
+    fn hls_m_axi_burst_coalescing_and_4kb_boundary_splitting() {
+        // 1. 600 words (4 bytes each = 2400 bytes) starting at 0x0800 (2048):
+        //    - Only 2048 bytes (512 words) remain before the 0x1000 (4096) 4KB boundary!
+        //    - Burst 0: 256 beats at 0x0800..0x0C00 (AWLEN = 255)
+        //    - Burst 1: 256 beats at 0x0C00..0x1000 (AWLEN = 255, hits 4KB boundary at 0x1000)
+        //    - Burst 2: remaining 88 beats at 0x1000..0x1160 (AWLEN = 87)
+        let bursts = coalesce_m_axi_bursts("gmem_in", "gmem0", AxiBurstKind::Read, 0x0800, 600, 4, 256);
+        assert_eq!(bursts.len(), 3);
+        assert_eq!(bursts[0].beats, 256);
+        assert_eq!(bursts[0].axlen, 255);
+        assert_eq!(bursts[0].start_byte_addr, 0x0800);
+        assert!(bursts[0].prefetch_enabled);
+        assert_eq!(bursts[1].beats, 256);
+        assert_eq!(bursts[1].start_byte_addr, 0x0C00);
+        assert_eq!(bursts[2].beats, 88);
+        assert_eq!(bursts[2].axlen, 87);
+        assert_eq!(bursts[2].start_byte_addr, 0x1000);
+
+        // 2. Verify m_axi burst ports in synthesized RTL
+        let src = r#"
+void axi_burst_copy(int *in_dram, int *out_dram) {
+  #pragma HLS INTERFACE m_axi port=in_dram bundle=gmem0
+  #pragma HLS INTERFACE m_axi port=out_dram bundle=gmem1
+  BURST_LOOP: for (int i = 0; i < 32; i++) {
+    #pragma HLS PIPELINE II=1
+    *out_dram = *in_dram + 5;
+  }
+}
+"#;
+        let hls = hls_compile(src).expect("compile axi_burst_copy");
+        assert!(hls.sv.contains("m_axi_gmem0_ARLEN"));
+        assert!(hls.sv.contains("m_axi_gmem0_RLAST"));
+        assert!(hls.sv.contains("m_axi_gmem1_AWLEN"));
+        assert!(hls.sv.contains("m_axi_gmem1_WLAST"));
+        let kernel_bursts = extract_kernel_m_axi_bursts(&hls, 0);
+        assert_eq!(kernel_bursts.len(), 2);
+        assert_eq!(kernel_bursts[0].beats, 32);
+        assert_eq!(kernel_bursts[0].axlen, 31);
+    }
+
+    #[test]
+    fn hls_c_rtl_cosim_testbench_and_verification() {
+        let src = r#"
+void fir_mac_cosim(int a[4], int b[4], int bias, int *out) {
+  #pragma HLS PIPELINE II=1
+  #pragma HLS ARRAY_PARTITION variable=a complete
+  #pragma HLS ARRAY_PARTITION variable=b complete
+  int acc = bias;
+  for (int i = 0; i < 4; i++) {
+    acc += a[i] * b[i];
+  }
+  *out = acc;
+}
+"#;
+        let v0 = CosimTestVector::new()
+            .with_array("a", vec![1, 2, 3, 4])
+            .with_array("b", vec![10, 20, 30, 40])
+            .with_scalar("bias", 5);
+        let v1 = CosimTestVector::new()
+            .with_array("a", vec![2, 0, -1, 3])
+            .with_array("b", vec![4, 5, 6, 7])
+            .with_scalar("bias", 10);
+
+        let report = run_cosim_verification(src, &[v0.clone(), v1]).expect("cosim pass");
+        assert_eq!(report.status, CosimStatus::Pass);
+        assert_eq!(report.vectors_tested, 2);
+        assert_eq!(report.vectors_passed, 2);
+        // 1*10 + 2*20 + 3*30 + 4*40 + 5 = 305
+        assert_eq!(report.vector_results[0].c_outputs["out"], vec![305]);
+        assert_eq!(report.vector_results[0].rtl_outputs["out"], vec![305]);
+        // 2*4 + 0*5 + (-1)*6 + 3*7 + 10 = 8 - 6 + 21 + 10 = 33
+        assert_eq!(report.vector_results[1].c_outputs["out"], vec![33]);
+        assert!(report.testbench_sv.contains("module fir_mac_cosim_cosim_tb;"));
+        assert!(report.testbench_sv.contains("Verify out == 305"));
+        assert!(report.report_text.contains("PASS"));
+
+        // Fault injection must cause CosimStatus::Fail
+        let mut v_fault = v0;
+        v_fault.inject_rtl_fault_delta = 1;
+        let fail_report = run_cosim_verification(src, &[v_fault]).expect("cosim fault run");
+        assert_eq!(fail_report.status, CosimStatus::Fail);
+        assert_eq!(fail_report.vectors_passed, 0);
+        assert!(fail_report.report_text.contains("FAIL"));
     }
 }
