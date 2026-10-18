@@ -16,7 +16,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 mod cdc;
 mod constraints_codec;
-
+pub mod ug903;
+pub use ug903::*;
 // Structural CDC analysis (v3.0 verification track): clock-domain
 // extraction, net-level crossing detection, synchronizer recognition, and
 // the 11 CdcClass violation classes layered on `report_cdc`.
@@ -2868,12 +2869,27 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
                         i = ni;
                         continue;
                     }
+                    if toks[i] == "-master_clock" {
+                        if let Some(m) = toks.get(i + 1) {
+                            master = m
+                                .trim_matches(|ch: char| "{}[]\"".contains(ch))
+                                .to_string();
+                            i += 2;
+                            continue;
+                        }
+                    }
                     if toks[i] == "-source" {
                         let joined = toks[i..].join(" ");
                         if let Some(n) =
                             tcl_name(&joined, "get_ports").or_else(|| tcl_name(&joined, "get_pins"))
                         {
                             master = n;
+                        } else if let Some(&raw_m) = toks.get(i + 1) {
+                            if !raw_m.starts_with('[') && !raw_m.starts_with('-') {
+                                master = raw_m.to_string();
+                                i += 2;
+                                continue;
+                            }
                         }
                         i += 1;
                         continue;
@@ -2890,8 +2906,9 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
                     source = name.clone();
                 }
                 if c.clocks.iter().all(|k| k.name != master) {
-                    // fall back to first clock name for -source [get_ports clk]
-                    if let Some(k) = c.clocks.first() {
+                    if let Some(by_src) = c.clocks.iter().find(|k| k.source == master) {
+                        master = by_src.name.clone();
+                    } else if let Some(k) = c.clocks.first() {
                         master = k.name.clone();
                     }
                 }
@@ -2917,10 +2934,22 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
                 let is_out = toks[0] == "set_output_delay";
                 let mut delay_ns: Option<f64> = None;
                 let mut port = String::new();
+                let mut add_delay = false;
+                let mut clock_fall = false;
                 let mut i = 1;
                 while i < toks.len() {
                     if toks[i] == "-clock" {
                         i += 2;
+                        continue;
+                    }
+                    if toks[i] == "-add_delay" {
+                        add_delay = true;
+                        i += 1;
+                        continue;
+                    }
+                    if toks[i] == "-clock_fall" {
+                        clock_fall = true;
+                        i += 1;
                         continue;
                     }
                     // Vivado: -max / -min qualify the following delay value.
@@ -2947,14 +2976,21 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
                     i += 1;
                 }
                 let ns = delay_ns.ok_or_else(|| format!("{line}: missing delay"))?;
+                let _ = clock_fall;
                 let ps = (ns * 1000.0).round() as i64;
                 if port.is_empty() {
                     return Err(format!("{line}: missing port"));
                 }
-                if is_out {
-                    c.output_delay_ps.insert(port, ps);
+                let map = if is_out {
+                    &mut c.output_delay_ps
                 } else {
-                    c.input_delay_ps.insert(port, ps);
+                    &mut c.input_delay_ps
+                };
+                if add_delay {
+                    let prev = map.get(&port).copied().unwrap_or(i64::MIN);
+                    map.insert(port, prev.max(ps));
+                } else {
+                    map.insert(port, ps);
                 }
             }
             "set_false_path" => {
@@ -4447,7 +4483,7 @@ set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]
         assert_eq!(
             d.ports
                 .iter()
-                .find(|p| p.name == "led")
+                .find(|p| p.name == intern("led"))
                 .unwrap()
                 .attrs
                 .get("LOC"),
@@ -4501,7 +4537,7 @@ set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]
         assert_eq!(
             d.ports
                 .iter()
-                .find(|p| p.name == "led")
+                .find(|p| p.name == intern("led"))
                 .unwrap()
                 .attrs
                 .get("IOSTANDARD"),
