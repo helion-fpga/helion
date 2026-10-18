@@ -160,6 +160,29 @@ pub struct InterfaceDirective {
     pub target: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependenceType {
+    Inter,
+    Intra,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependenceDirection {
+    Raw,
+    War,
+    Waw,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependenceDirective {
+    pub variable: String,
+    pub dep_type: DependenceType,
+    pub dependent: bool,
+    pub direction: DependenceDirection,
+    pub distance: Option<u32>,
+    pub target: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HlsDirective {
     Pipeline(PipelineDirective),
@@ -169,6 +192,7 @@ pub enum HlsDirective {
     Dataflow(DataflowDirective),
     Allocation(AllocationDirective),
     Interface(InterfaceDirective),
+    Dependence(DependenceDirective),
 }
 
 impl HlsDirective {
@@ -181,6 +205,7 @@ impl HlsDirective {
             Self::Dataflow(d) => d.target.as_deref(),
             Self::Allocation(d) => d.target.as_deref(),
             Self::Interface(d) => d.target.as_deref(),
+            Self::Dependence(d) => d.target.as_deref(),
         }
     }
 
@@ -194,6 +219,7 @@ impl HlsDirective {
             Self::Dataflow(d) => d.target = t,
             Self::Allocation(d) => d.target = t,
             Self::Interface(d) => d.target = t,
+            Self::Dependence(d) => d.target = t,
         }
         self
     }
@@ -542,8 +568,63 @@ pub fn parse_pragma_line(line: &str) -> Result<Option<HlsDirective>, String> {
                 target: kv.get("target").cloned(),
             })))
         }
-        "loop_tripcount" | "dependence" | "bind_storage" | "bind_op" | "stream" => {
-            // Recognized supplemental Vivado/Vitis HLS pragmas: map bind_op / bind_storage if relevant.
+        "dependence" => {
+            let variable = kv
+                .get("variable")
+                .or_else(|| kv.get("var"))
+                .cloned()
+                .unwrap_or_else(|| "*".into());
+            let dep_type = if flags_lower.iter().any(|f| f == "intra")
+                || kv
+                    .get("type")
+                    .is_some_and(|v| v.eq_ignore_ascii_case("intra"))
+            {
+                DependenceType::Intra
+            } else {
+                DependenceType::Inter
+            };
+            let dependent = if flags_lower.iter().any(|f| f == "false")
+                || kv
+                    .get("dependent")
+                    .is_some_and(|v| v.eq_ignore_ascii_case("false") || v == "0")
+            {
+                false
+            } else {
+                true
+            };
+            let direction = if flags_lower.iter().any(|f| f == "war")
+                || kv
+                    .get("direction")
+                    .is_some_and(|v| v.eq_ignore_ascii_case("war"))
+            {
+                DependenceDirection::War
+            } else if flags_lower.iter().any(|f| f == "waw")
+                || kv
+                    .get("direction")
+                    .is_some_and(|v| v.eq_ignore_ascii_case("waw"))
+            {
+                DependenceDirection::Waw
+            } else {
+                DependenceDirection::Raw
+            };
+            let distance = match kv.get("distance") {
+                Some(v) => Some(
+                    v.parse::<u32>()
+                        .map_err(|_| format!("invalid DEPENDENCE distance={v}"))?
+                        .max(1),
+                ),
+                None => None,
+            };
+            Ok(Some(HlsDirective::Dependence(DependenceDirective {
+                variable,
+                dep_type,
+                dependent,
+                direction,
+                distance,
+                target: kv.get("target").cloned(),
+            })))
+        }
+        "loop_tripcount" | "bind_storage" | "bind_op" | "stream" => {
             if cmd == "bind_op" {
                 if let Some(op) = kv.get("op") {
                     return Ok(Some(HlsDirective::Allocation(AllocationDirective {
@@ -969,6 +1050,60 @@ pub fn parse_tcl_config(tcl: &str) -> Result<HlsConfig, String> {
                         offset,
                         register,
                         target,
+                    }));
+            }
+            "set_directive_dependence" => {
+                let mut variable = "*".to_string();
+                let mut dep_type = DependenceType::Inter;
+                let mut dependent = true;
+                let mut direction = DependenceDirection::Raw;
+                let mut distance = None;
+                let mut positional = Vec::new();
+                let mut i = 0;
+                while i < args.len() {
+                    match args[i].to_ascii_lowercase().as_str() {
+                        "-variable" if i + 1 < args.len() => {
+                            variable = args[i + 1].clone();
+                            i += 2;
+                        }
+                        "-type" if i + 1 < args.len() => {
+                            if args[i + 1].eq_ignore_ascii_case("intra") {
+                                dep_type = DependenceType::Intra;
+                            }
+                            i += 2;
+                        }
+                        "-dependent" if i + 1 < args.len() => {
+                            dependent = !args[i + 1].eq_ignore_ascii_case("false")
+                                && args[i + 1] != "0";
+                            i += 2;
+                        }
+                        "-direction" if i + 1 < args.len() => {
+                            direction = match args[i + 1].to_ascii_lowercase().as_str() {
+                                "war" => DependenceDirection::War,
+                                "waw" => DependenceDirection::Waw,
+                                _ => DependenceDirection::Raw,
+                            };
+                            i += 2;
+                        }
+                        "-distance" if i + 1 < args.len() => {
+                            distance = args[i + 1].parse::<u32>().ok().map(|d| d.max(1));
+                            i += 2;
+                        }
+                        s if !s.starts_with('-') => {
+                            positional.push(args[i].clone());
+                            i += 1;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                cfg.directives
+                    .push(HlsDirective::Dependence(DependenceDirective {
+                        variable,
+                        dep_type,
+                        dependent,
+                        direction,
+                        distance,
+                        target: positional.first().cloned(),
                     }));
             }
             _ => {}
