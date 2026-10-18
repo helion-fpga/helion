@@ -242,7 +242,6 @@ fn paint_chevron(p: &egui::Painter, center: egui::Pos2, expanded: bool, color: e
 /// cross-view selection identity shared with Schematic/Device/Properties.
 pub fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Hierarchy").strong().size(13.0));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .small_button("Schematic ↗")
@@ -251,6 +250,10 @@ pub fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::T
             {
                 let _ = model.exec("open_hierarchy_sheet");
             }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.set_clip_rect(ui.max_rect());
+                ui.label(egui::RichText::new("Hierarchy").strong().size(13.0));
+            });
         });
     });
 
@@ -429,25 +432,38 @@ pub fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::T
                 }
                 let label_x = rect.min.x + 8.0 + n.depth as f32 * INDENT + 18.0;
                 let is_internal = TreeState::is_instance_kind(&n.kind);
-                painter.text(
-                    egui::pos2(label_x, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    &n.short,
-                    egui::FontId::proportional(13.0),
-                    if is_internal { theme.text } else { theme.dim },
-                );
-                // Right-aligned count (instances) or kind (leaves).
+                // Right-aligned count (instances) or kind (leaves) measured first so
+                // the left label clips cleanly before it at any sidebar width.
                 let right = if is_internal {
                     format!("({})", n.leaf_count)
                 } else {
                     n.kind.clone()
                 };
-                painter.text(
-                    egui::pos2(rect.max.x - 10.0, rect.center().y),
-                    egui::Align2::RIGHT_CENTER,
+                let right_galley = painter.layout_no_wrap(
                     right,
                     egui::FontId::proportional(11.0),
                     theme.faint,
+                );
+                let right_w = right_galley.size().x;
+                painter.galley(
+                    egui::pos2(
+                        rect.max.x - 10.0 - right_w,
+                        rect.center().y - right_galley.size().y * 0.5,
+                    ),
+                    right_galley,
+                    theme.faint,
+                );
+                let right_limit = (rect.max.x - 10.0 - right_w - 6.0).max(label_x + 12.0);
+                let label_clip = egui::Rect::from_min_max(
+                    egui::pos2(rect.min.x, rect.min.y),
+                    egui::pos2(right_limit, rect.max.y),
+                );
+                painter.with_clip_rect(label_clip).text(
+                    egui::pos2(label_x, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    &n.short,
+                    egui::FontId::proportional(13.0),
+                    if is_internal { theme.text } else { theme.dim },
                 );
                 // 1px divider.
                 painter.line_segment(
