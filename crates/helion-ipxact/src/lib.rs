@@ -21,6 +21,8 @@ pub use video::{
 };
 pub mod mig;
 pub use mig::*;
+pub mod connectivity;
+pub use connectivity::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IpCore {
@@ -1909,5 +1911,61 @@ file a.v
         assert!(sdr_sv.contains("SDR_CMD_PRE"));
         assert!(sdr_sv.contains("SDR_CMD_REF"));
         assert!(sdr_sv.contains("sdram_ras_n"));
+    }
+
+    #[test]
+    fn eth_mac_1g_10g_crc32_rgmii_sgmii_xgmii_and_mdio_sv() {
+        let cat = connectivity_catalog();
+        assert_eq!(cat.len(), 4);
+
+        // Standard IEEE 802.3 CRC-32 check on ASCII "123456789" -> 0xCBF43926
+        assert_eq!(compute_ethernet_crc32(b"123456789"), 0xCBF4_3926);
+
+        let rgmii_sv = EthMacConfig::default_1g_rgmii().generate_sv();
+        assert!(rgmii_sv.contains("module eth_mac_1g_rgmii"));
+        assert!(rgmii_sv.contains("ETH_PREAMBLE = 8'h55"));
+        assert!(rgmii_sv.contains("ETH_SFD      = 8'hD5"));
+        assert!(rgmii_sv.contains("32'hEDB8_8320"));
+        assert!(rgmii_sv.contains("rgmii_txd"));
+        assert!(rgmii_sv.contains("rgmii_rxd"));
+        assert!(rgmii_sv.contains("mdc"));
+        assert!(rgmii_sv.contains("mdio_i"));
+        assert!(rgmii_sv.contains("s_axis_tx_tdata"));
+        assert!(rgmii_sv.contains("m_axis_rx_tdata"));
+
+        let sgmii_sv = EthMacConfig::default_1g_sgmii().generate_sv();
+        assert!(sgmii_sv.contains("module eth_mac_1g_sgmii"));
+        assert!(sgmii_sv.contains("sgmii_txd"));
+        assert!(sgmii_sv.contains("sgmii_rxd"));
+
+        let xgmii_sv = EthMacConfig::default_10g_xgmii().generate_sv();
+        assert!(xgmii_sv.contains("module eth_mac_10g_xgmii"));
+        assert!(xgmii_sv.contains("parameter int C_AXIS_DATA_WIDTH = 64"));
+        assert!(xgmii_sv.contains("xgmii_txd"));
+        assert!(xgmii_sv.contains("xgmii_rxd"));
+    }
+
+    #[test]
+    fn pcie_tlp_axi_dma_and_usb2_ulpi_device_controllers_emit_synthesizable_sv() {
+        let pcie_sv = PcieDmaConfig::default().generate_sv();
+        assert!(pcie_sv.contains("module pcie_tlp_axi_dma_bridge"));
+        assert!(pcie_sv.contains("TLP_MRD_3DW"));
+        assert!(pcie_sv.contains("TLP_MWR_3DW"));
+        assert!(pcie_sv.contains("TLP_CPLD_3DW"));
+        assert!(pcie_sv.contains("bar0_sg_desc_addr"));
+        assert!(pcie_sv.contains("SG_FETCH_DESC"));
+        assert!(pcie_sv.contains("m_axi_awaddr"));
+        assert!(pcie_sv.contains("m_axi_araddr"));
+
+        let usb_sv = UsbDeviceConfig::default().generate_sv();
+        assert!(usb_sv.contains("module usb2_ulpi_device_ctrl"));
+        assert!(usb_sv.contains("ulpi_clk60"));
+        assert!(usb_sv.contains("ulpi_dir"));
+        assert!(usb_sv.contains("ulpi_nxt"));
+        assert!(usb_sv.contains("ulpi_stp"));
+        assert!(usb_sv.contains("PID_SETUP"));
+        assert!(usb_sv.contains("ep0_setup_packet"));
+        assert!(usb_sv.contains("s_axis_ep1_in_tdata"));
+        assert!(usb_sv.contains("m_axis_ep2_out_tdata"));
     }
 }
