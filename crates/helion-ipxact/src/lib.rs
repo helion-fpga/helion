@@ -45,6 +45,8 @@ pub mod crypto;
 pub use crypto::*;
 pub mod serial_noc;
 pub use serial_noc::*;
+pub mod smartnic_ip;
+pub use smartnic_ip::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IpCore {
@@ -1100,6 +1102,9 @@ pub fn catalog() -> Vec<IpCore> {
         pack_riscv_dm(),
         pack_icache(),
         pack_dcache(),
+        pack_qdma_engine(),
+        pack_cmac_100g(),
+        pack_rocev2_offload(),
     ]
 }
 
@@ -3456,5 +3461,128 @@ file a.v
         assert!(noc_sv.contains("compute_xy_route"));
         assert!(noc_sv.contains("wormhole_active"));
         assert!(noc_sv.contains("in_vc_credit_out"));
+    }
+
+    #[test]
+    fn qdma_sim_multi_queue_h2c_c2h_and_wb_status() {
+        let mut sim = QdMaSim::new(QdMaConfig::default());
+        sim.write_host_mem(0x1000, b"Helion-QDMA-H2C-Payload");
+        sim.write_card_mem(0x8000, b"Helion-QDMA-C2H-Result!");
+
+        sim.submit_descriptor(
+            3,
+            QdmaDescriptor {
+                desc_id: 1,
+                src_addr: 0x1000,
+                dst_addr: 0x4000,
+                length: 23,
+                is_c2h: false,
+                sop: true,
+                eop: true,
+            },
+        );
+        sim.submit_descriptor(
+            7,
+            QdmaDescriptor {
+                desc_id: 2,
+                src_addr: 0x8000,
+                dst_addr: 0x2000,
+                length: 23,
+                is_c2h: true,
+                sop: true,
+                eop: true,
+            },
+        );
+
+        let statuses = sim.step_all_queues();
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(&sim.read_card_mem(0x4000, 23), b"Helion-QDMA-H2C-Payload");
+        assert_eq!(&sim.read_host_mem(0x2000, 23), b"Helion-QDMA-C2H-Result!");
+        let wb3 = sim.wb_status(3).unwrap();
+        assert_eq!(wb3.pidx, 1);
+        assert_eq!(wb3.cidx, 1);
+        assert!(wb3.irq_pending);
+    }
+
+    #[test]
+    fn rs_fec_528_514_encodes_and_corrects_up_to_7_symbol_bursts() {
+        let fec = RsFec528_514::new();
+        let data: Vec<u16> = (0..RsFec528_514::K)
+            .map(|i| ((i * 37 + 13) & 0x3FF) as u16)
+            .collect();
+        let cw = fec.encode(&data);
+        assert_eq!(cw.len(), RsFec528_514::N);
+        assert!(fec.syndromes(&cw).iter().all(|&s| s == 0));
+
+        // Inject 7 arbitrary 10-bit symbol errors across data and parity positions
+        let mut corrupted = cw.clone();
+        for &(pos, mask) in &[
+            (0usize, 0x3FFu16),
+            (17, 0x155),
+            (103, 0x2AA),
+            (255, 0x0F0),
+            (411, 0x303),
+            (513, 0x1FF),
+            (525, 0x201),
+        ] {
+            corrupted[pos] ^= mask;
+        }
+        assert!(fec.syndromes(&corrupted).iter().any(|&s| s != 0));
+        let (recovered, n_fixed) = fec.decode_and_correct(&corrupted).unwrap();
+        assert_eq!(n_fixed, 7);
+        assert_eq!(recovered, cw);
+    }
+
+    #[test]
+    fn rocev2_sim_rdma_write_read_psn_tracking_and_smartnic_sv() {
+        // RFC 791 example IPv4 header checksum verification
+        let mut ip_hdr: [u8; 20] = [
+            0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8,
+            0x00, 0x01, 0xc0, 0xa8, 0x00, 0xc7,
+        ];
+        let csum = ipv4_header_checksum(&ip_hdr);
+        assert_eq!(csum, 0xB861);
+        ip_hdr[10..12].copy_from_slice(&csum.to_be_bytes());
+        assert_eq!(ipv4_header_checksum(&ip_hdr), 0);
+
+        let mut roce = RoceV2Sim::new(RoceV2Config::default());
+        roce.register_qp(42, 100, 0xDEAD_BEEF);
+
+        // 1. Build and process RDMA WRITE packet
+        let wr_pkt = roce.build_rdma_write_packet(42, 0x5000_0000, 0xDEAD_BEEF, b"RDMA-ZeroCopy!");
+        let ack_pkt = roce.process_rx_rocev2(&wr_pkt).unwrap().unwrap();
+        let ack_bth = RoceBth::from_bytes(&ack_pkt).unwrap();
+        assert_eq!(ack_bth.opcode, RoceBth::OP_ACKNOWLEDGE);
+        assert_eq!(ack_bth.psn, 100);
+        assert_eq!(&roce.read_axi_mem(0x5000_0000, 14), b"RDMA-ZeroCopy!");
+
+        // 2. Build and process RDMA READ request
+        let rd_req = roce.build_rdma_read_request(42, 0x5000_0000, 0xDEAD_BEEF, 14);
+        let rd_resp = roce.process_rx_rocev2(&rd_req).unwrap().unwrap();
+        let resp_bth = RoceBth::from_bytes(&rd_resp).unwrap();
+        assert_eq!(resp_bth.opcode, RoceBth::OP_RDMA_READ_RESPONSE_ONLY);
+        assert_eq!(&rd_resp[12..26], b"RDMA-ZeroCopy!");
+
+        // 3. Out-of-sequence PSN triggers NAK increment
+        assert!(roce.process_rx_rocev2(&wr_pkt).is_err());
+        assert_eq!(roce.qps.get(&42).unwrap().nak_count, 1);
+
+        // 4. Verify synthesizable SystemVerilog generation & catalog registration
+        let cat = catalog();
+        assert!(cat.iter().any(|c| c.name == "helion_qdma_engine"));
+        assert!(cat.iter().any(|c| c.name == "helion_cmac_100g"));
+        assert!(cat.iter().any(|c| c.name == "helion_rocev2_offload"));
+
+        let qdma_sv = generate_qdma_sv(&QdMaConfig::default());
+        assert!(qdma_sv.contains("module helion_qdma_engine"));
+        assert!(qdma_sv.contains("QDMA_WB_STATUS"));
+
+        let cmac_sv = generate_cmac_100g_sv(&Cmac100gConfig::default());
+        assert!(cmac_sv.contains("module helion_cmac_100g"));
+        assert!(cmac_sv.contains("PCS_AM0_MARKER"));
+
+        let roce_sv = generate_rocev2_sv(&RoceV2Config::default());
+        assert!(roce_sv.contains("module helion_rocev2_offload"));
+        assert!(roce_sv.contains("BTH_OP_RDMA_WRITE_ONLY"));
     }
 }
