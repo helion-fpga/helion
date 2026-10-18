@@ -3,6 +3,11 @@
 mod opt;
 
 pub use opt::LutOptStats;
+pub mod power_opt;
+pub use power_opt::{
+    PowerOptReport, extract_fdre_clock_enables, gate_bram_idle_enables, hoist_bufgce_clock_gates,
+    optimize_dynamic_power,
+};
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
