@@ -492,9 +492,8 @@ pub fn classify_crossings(
 #[cfg(test)]
 mod tests {
     use super::super::crossings::CdcClass;
-    use super::classify_crossings;
     use crate::{create_clock, report_cdc, CdcSeverity, Constraints};
-    use helion_ir::{CellKind, Design, PortDir};
+    use helion_ir::{intern, CellKind, Design, PortDir};
 
     /// `out = I0` buffer LUT (passthrough).
     const BUF_INIT: u64 = 0xAAAAAAAAAAAAAAAA;
@@ -637,7 +636,7 @@ mod tests {
         let mut d = Design::new("t");
         d.add_port("clk_a", PortDir::In);
         ff(&mut d, "src", "clk_a", "src_d");
-        d.add_cell("u_bb", CellKind::BlackBox { module: "ip".into() });
+        d.add_cell("u_bb", CellKind::BlackBox { module: intern("ip") });
         d.connect("sig", "src", "Q");
         d.connect("sig", "u_bb", "INP");
         let clks = two_clocks();

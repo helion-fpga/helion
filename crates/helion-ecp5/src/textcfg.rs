@@ -59,6 +59,9 @@ use crate::pack::CARRY_NET_PREFIX;
 use crate::place;
 use crate::route;
 use std::collections::{BTreeMap, HashMap};
+use rayon::prelude::*;
+use std::collections::HashSet;
+use std::sync::LazyLock;
 
 // ---------------------------------------------------------------------------
 // Emitter payload types
@@ -439,42 +442,60 @@ struct TileGroup {
 // bits.db validation helpers
 // ---------------------------------------------------------------------------
 
-/// Look up a tile entry by key. Fail loud on unknown keys.
+struct TypeCfgCache {
+    muxes: HashMap<String, HashSet<String>>,
+    enums: HashMap<String, HashSet<String>>,
+    words: HashMap<String, usize>,
+}
+
+static TYPE_CFG_CACHE: LazyLock<HashMap<&'static str, TypeCfgCache>> = LazyLock::new(|| {
+    crate::tiledata::TILE_TYPES
+        .par_iter()
+        .filter_map(|&tt| {
+            let text = crate::tiledata::bits_db(tt)?;
+            let mut muxes: HashMap<String, HashSet<String>> = HashMap::new();
+            for m in crate::route::parse_muxes(text) {
+                let set = muxes.entry(m.dst).or_default();
+                for inp in m.inputs {
+                    set.insert(inp.src);
+                }
+            }
+            let mut enums: HashMap<String, HashSet<String>> = HashMap::new();
+            for e in parse_config_enums(text) {
+                enums.insert(e.name, e.options.into_iter().collect());
+            }
+            let mut words: HashMap<String, usize> = HashMap::new();
+            for w in parse_config_words(text) {
+                words.insert(w.name, w.bits);
+            }
+            Some((tt, TypeCfgCache { muxes, enums, words }))
+        })
+        .collect()
+});
+
+/// Look up a tile entry by key in O(1). Fail loud on unknown keys.
 pub(crate) fn tile_of<'a>(device: &'a Device, key: &str) -> Result<&'a crate::device::Tile, String> {
     device
-        .tiles()
-        .iter()
-        .find(|t| t.key == key)
+        .tile_by_key(key)
         .ok_or_else(|| format!("textcfg: unknown tile key {key:?}"))
 }
 
 /// Validate an `arc:` against the tile type's muxes and return ().
-///
-/// Checks the sink mux exists in `bits.db` and lists `source` as an input.
-/// This is the "sets exactly the bits the DB says" check at the symbolic
-/// level: ecppack later expands the arc to the DB's `F<B>F<B>` tokens.
 pub(crate) fn check_arc(device: &Device, tile_key: &str, sink: &str, source: &str) -> Result<(), String> {
     let tile = tile_of(device, tile_key)?;
-    // The router's parser keeps `-` (default, no-bit) inputs; db.rs drops
-    // them, which would false-positive on router-emitted default arcs
-    // like `F6 <- F6_SLICE`.
-    let text = crate::tiledata::bits_db(&tile.tile_type).ok_or_else(|| {
+    let tc = TYPE_CFG_CACHE.get(tile.tile_type.as_str()).ok_or_else(|| {
         format!(
             "textcfg: no vendored bits.db for tile type {}",
             tile.tile_type
         )
     })?;
-    let muxes = crate::route::parse_muxes(text);
-    let mux = muxes
-        .iter()
-        .find(|m| m.dst == sink)
-        .ok_or_else(|| {
-            format!(
-                "textcfg: tile {tile_key} ({}): no mux with sink {sink:?} in bits.db",
-                tile.tile_type
-            )
-        })?;
-    if !mux.inputs.iter().any(|i| i.src == source) {
+    let inputs = tc.muxes.get(sink).ok_or_else(|| {
+        format!(
+            "textcfg: tile {tile_key} ({}): no mux with sink {sink:?} in bits.db",
+            tile.tile_type
+        )
+    })?;
+    if !inputs.contains(source) {
         return Err(format!(
             "textcfg: tile {tile_key} ({}): mux {sink:?} has no input {source:?} in bits.db",
             tile.tile_type
@@ -537,14 +558,14 @@ fn parse_config_enums(text: &str) -> Vec<EnumInfo> {
 
 /// Validate an `enum:` name/value against a tile type's `config_enum`s.
 pub(crate) fn check_enum_on_type(tile_type: &str, name: &str, value: &str) -> Result<(), String> {
-    let text = crate::tiledata::bits_db(tile_type)
+    let tc = TYPE_CFG_CACHE
+        .get(tile_type)
         .ok_or_else(|| format!("textcfg: no vendored bits.db for tile type {tile_type}"))?;
-    let enums = parse_config_enums(text);
-    let e = enums
-        .iter()
-        .find(|e| e.name == name)
+    let opts = tc
+        .enums
+        .get(name)
         .ok_or_else(|| format!("textcfg: tile type {tile_type}: no config enum {name:?} in bits.db"))?;
-    if value != "_NONE_" && !e.options.iter().any(|o| o == value) {
+    if value != "_NONE_" && !opts.contains(value) {
         return Err(format!(
             "textcfg: tile type {tile_type}: enum {name:?} has no option {value:?} in bits.db"
         ));
@@ -603,17 +624,17 @@ pub(crate) fn parse_config_words(text: &str) -> Vec<WordInfo> {
 
 /// Validate a `word:` name/value against a tile type's `.config` words.
 pub(crate) fn check_word_on_type(tile_type: &str, name: &str, value: &str) -> Result<(), String> {
-    let text = crate::tiledata::bits_db(tile_type)
+    let tc = TYPE_CFG_CACHE
+        .get(tile_type)
         .ok_or_else(|| format!("textcfg: no vendored bits.db for tile type {tile_type}"))?;
-    let words = parse_config_words(text);
-    let w = words
-        .iter()
-        .find(|w| w.name == name)
+    let &bits = tc
+        .words
+        .get(name)
         .ok_or_else(|| format!("textcfg: tile type {tile_type}: no config word {name:?} in bits.db"))?;
-    if value.len() != w.bits {
+    if value.len() != bits {
         return Err(format!(
             "textcfg: tile type {tile_type}: word {name:?} needs {} bits, got {} ({value:?})",
-            w.bits,
+            bits,
             value.len()
         ));
     }
@@ -1138,9 +1159,9 @@ impl<'a> Emitter<'a> {
     fn word_width(&self, group: &[String], name: &str) -> Result<usize, String> {
         for key in group {
             let tile = tile_of(self.device, key)?;
-            if let Some(text) = crate::tiledata::bits_db(&tile.tile_type) {
-                if let Some(w) = parse_config_words(text).iter().find(|w| w.name == name) {
-                    return Ok(w.bits);
+            if let Some(tc) = TYPE_CFG_CACHE.get(tile.tile_type.as_str()) {
+                if let Some(&bits) = tc.words.get(name) {
+                    return Ok(bits);
                 }
             }
         }
@@ -1234,12 +1255,12 @@ fn tile_key_of(
     site: &place::SiteAddr,
     what: &str,
 ) -> Result<String, String> {
+    let tiles = device.tiles();
     device
-        .tiles()
+        .tiles_at(site.tile_row, site.tile_col)
         .iter()
-        .find(|t| {
-            t.row == site.tile_row && t.col == site.tile_col && t.tile_type == site.tile_type
-        })
+        .map(|&i| &tiles[i])
+        .find(|t| t.tile_type == site.tile_type)
         .map(|t| t.key.clone())
         .ok_or_else(|| {
             format!(
@@ -1441,10 +1462,12 @@ fn pic_tile_key(
             "textcfg: {what}: PIO tile at R{row}C{col} is on no chip edge"
         ));
     };
+    let tiles = device.tiles();
     device
-        .tiles()
+        .tiles_at(pr, pc)
         .iter()
-        .find(|t| t.row == pr && t.col == pc && t.tile_type == pic_type)
+        .map(|&i| &tiles[i])
+        .find(|t| t.tile_type == pic_type)
         .map(|t| t.key.clone())
         .ok_or_else(|| {
             format!("textcfg: {what}: no PIC tile {pic_type} at R{pr}C{pc}")

@@ -10,11 +10,14 @@ helion-device = { workspace = true }
 helion-place = { workspace = true }
 helion-route = { workspace = true }
 helion-backend = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
 helion-sv = { workspace = true }
 helion-pack = { workspace = true }
+helion-bits = { workspace = true }
+helion-drc = { workspace = true }
 [[bench]]
 name = "sta"
 harness = false
