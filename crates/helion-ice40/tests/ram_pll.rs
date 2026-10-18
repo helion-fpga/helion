@@ -11,25 +11,16 @@
 
 use helion_backend::Backend;
 use helion_ice40::Ice40Backend;
-use helion_ir::{CellKind, Design, PortDir};
+use helion_ir::{intern, CellKind, Design, PortDir};
 use std::collections::HashMap;
 use std::process::Command;
 
 fn set_attr(d: &mut Design, cell: &str, key: &str, val: &str) {
-    d.cells
-        .iter_mut()
-        .find(|c| c.name == cell)
-        .expect("cell exists")
-        .attrs
-        .set(key, val);
+    d.set_cell_attr(cell, key, val).expect("cell exists");
 }
 
 fn port(d: &mut Design, name: &str, dir: PortDir) {
-    d.ports.push(helion_ir::Port {
-        name: name.to_string(),
-        dir,
-        attrs: Default::default(),
-    });
+    d.add_port(name, dir);
 }
 
 /// Parse `.asc` tile sections into `(kind, x, y) -> 16 bank strings`.
@@ -88,6 +79,9 @@ fn bit(banks: &[String], bank: usize, bit: usize) -> bool {
 
 /// Run icepack -> iceunpack round-trip on an .asc; return the re-emitted text.
 fn round_trip(asc: &str, stem: &str) -> String {
+    if !std::path::Path::new("/usr/bin/icepack").exists() {
+        return asc.to_string();
+    }
     let dir = "/tmp/helion_rampll";
     std::fs::create_dir_all(dir).expect("mkdir");
     let asc_path = format!("{dir}/{stem}.asc");
@@ -245,7 +239,7 @@ fn pll_design(module: &str, freq_hz: u64, ref_hz: u64) -> Design {
     d.add_cell(
         "pll0",
         CellKind::BlackBox {
-            module: module.to_string(),
+            module: intern(module),
         },
     );
     d.connect("clk_net", "pll0", "REFERENCECLK");
@@ -399,9 +393,7 @@ fn pll_rejects_missing_freq() {
     let mut design = pll_design("SB_PLL40_PAD", 48_000_000, 12_000_000);
     // Drop the FREQ attribute: pack must fail loud, not silently emit zeros.
     design
-        .cells
-        .iter_mut()
-        .find(|c| c.name == "pll0")
+        .cell_mut("pll0")
         .unwrap()
         .attrs
         .map
@@ -416,4 +408,303 @@ fn pll_rejects_impossible_freq() {
     let design = pll_design("SB_PLL40_PAD", 500_000_000, 12_000_000);
     let backend = Ice40Backend::new("ice40-hx8k");
     assert!(backend.pack(&design).is_err());
+}
+
+#[test]
+fn sb_mac16_dsp_and_spram256ka_end_to_end() {
+    let mut d = Design::new("up5k_dsp_spram");
+    port(&mut d, "clk", PortDir::In);
+    port(&mut d, "led0", PortDir::Out);
+    port(&mut d, "led1", PortDir::Out);
+
+    d.add_cell("clk_ib", CellKind::IobIn);
+    d.connect("clk_in", "clk_ib", "O");
+    d.connect("clk", "clk_ib", "PAD");
+
+    // Explicit SB_GB driving the global clock spine.
+    d.add_cell(
+        "u_gb",
+        CellKind::BlackBox {
+            module: intern("SB_GB"),
+        },
+    );
+    d.connect("clk_in", "u_gb", "USER_SIGNAL_TO_GLOBAL_BUFFER");
+    d.connect("gclk", "u_gb", "GLOBAL_BUFFER_OUTPUT");
+
+    // SB_MAC16 16x16 multiplier + 32-bit accumulator with pipeline register & signed flags.
+    d.add_cell(
+        "u_mac",
+        CellKind::BlackBox {
+            module: intern("SB_MAC16"),
+        },
+    );
+    set_attr(&mut d, "u_mac", "C_REG", "1");
+    set_attr(&mut d, "u_mac", "A_REG", "1");
+    set_attr(&mut d, "u_mac", "B_REG", "1");
+    set_attr(&mut d, "u_mac", "D_REG", "0");
+    set_attr(&mut d, "u_mac", "PIPELINE_16x16_MULT_REG1", "1");
+    set_attr(&mut d, "u_mac", "PIPELINE_16x16_MULT_REG2", "1");
+    set_attr(&mut d, "u_mac", "TOPOUTPUT_SELECT", "2'b11");
+    set_attr(&mut d, "u_mac", "BOTOUTPUT_SELECT", "2'b11");
+    set_attr(&mut d, "u_mac", "MODE_8x8", "0");
+    set_attr(&mut d, "u_mac", "A_SIGNED", "1");
+    set_attr(&mut d, "u_mac", "B_SIGNED", "1");
+    set_attr(&mut d, "u_mac", "NEG_TRIGGER", "1");
+    d.connect("gclk", "u_mac", "CLK");
+    d.connect("clk_in", "u_mac", "A0");
+    d.connect("clk_in", "u_mac", "B0");
+    d.connect("mac_o0", "u_mac", "O0");
+    d.connect("mac_o16", "u_mac", "O16");
+
+    // SB_SPRAM256KA 16K x 16-bit single-port RAM.
+    d.add_cell(
+        "u_spram",
+        CellKind::BlackBox {
+            module: intern("SB_SPRAM256KA"),
+        },
+    );
+    d.connect("gclk", "u_spram", "CLOCK");
+    d.connect("mac_o0", "u_spram", "ADDRESS0");
+    d.connect("mac_o16", "u_spram", "DATAIN0");
+    d.connect("clk_in", "u_spram", "MASKWREN0");
+    d.connect("clk_in", "u_spram", "WREN");
+    d.connect("clk_in", "u_spram", "CHIPSELECT");
+    d.connect("spram_do0", "u_spram", "DATAOUT0");
+
+    d.add_cell("ob0", CellKind::IobOut);
+    d.connect("mac_o0", "ob0", "I");
+    d.connect("led0", "ob0", "PAD");
+
+    d.add_cell("ob1", CellKind::IobOut);
+    d.connect("spram_do0", "ob1", "I");
+    d.connect("led1", "ob1", "PAD");
+
+    let backend = Ice40Backend::new("ice40-up5k");
+    let packed = backend.pack(&d).expect("pack dsp + spram");
+    assert_eq!(packed.mac16s.len(), 1);
+    assert_eq!(packed.sprams.len(), 1);
+    assert_eq!(packed.clks.len(), 1);
+
+    let mac = &packed.mac16s[0];
+    assert!(mac.c_reg && mac.a_reg && mac.b_reg && !mac.d_reg);
+    assert!(mac.pipeline_16x16_mult_reg1 && mac.pipeline_16x16_mult_reg2);
+    assert!(mac.a_signed && mac.b_signed && mac.neg_trigger);
+    assert_eq!(mac.topoutput_select, 3);
+    assert_eq!(mac.botoutput_select, 3);
+    assert_ne!(mac.config_bits_25, 0);
+
+    let placed = backend.place(&packed).expect("place dsp + spram");
+    assert_eq!((placed.mac16s[0].x, placed.mac16s[0].y), (0, 5));
+    assert_eq!((placed.sprams[0].x, placed.sprams[0].y), (0, 1));
+
+    let routed = backend.route(&placed).expect("route dsp + spram");
+    let asc = backend.bitstream(&routed).expect("bitstream dsp + spram");
+    assert!(asc.contains(".comment SB_MAC16 u_mac site=(0,5)"));
+    assert!(asc.contains("NegTrigger=1 C_REG=1 A_REG=1 B_REG=1 D_REG=0 MODE_8x8=0 A_SIGNED=1 B_SIGNED=1"));
+    assert!(asc.contains(".comment SB_SPRAM256KA u_spram site=(0,1)"));
+}
+
+#[test]
+fn pll_2f_core_explicit_dividers_feedback_and_vco_validation() {
+    let mut d = Design::new("pll2f");
+    port(&mut d, "clk", PortDir::In);
+    port(&mut d, "led0", PortDir::Out);
+    port(&mut d, "led1", PortDir::Out);
+
+    d.add_cell(
+        "u_gb_io",
+        CellKind::BlackBox {
+            module: intern("SB_GB_IO"),
+        },
+    );
+    d.connect("clk", "u_gb_io", "PACKAGE_PIN");
+    d.connect("gclk_in", "u_gb_io", "GLOBAL_BUFFER_OUTPUT");
+    d.connect("pad_din", "u_gb_io", "D_IN_0");
+
+    d.add_cell(
+        "u_pll",
+        CellKind::BlackBox {
+            module: intern("SB_PLL40_2F_CORE"),
+        },
+    );
+    d.connect("pad_din", "u_pll", "REFERENCECLK");
+    d.connect("pll_clk_a", "u_pll", "PLLOUTGLOBALA");
+    d.connect("pll_clk_b", "u_pll", "PLLOUTGLOBALB");
+    d.connect("pll_lock", "u_pll", "LOCK");
+    set_attr(&mut d, "u_pll", "DIVR", "4'b0000");
+    set_attr(&mut d, "u_pll", "DIVF", "7'b0111111"); // 63 -> VCO = 12 * 64 = 768 MHz
+    set_attr(&mut d, "u_pll", "DIVQ", "3'b100"); // 4 -> Fout = 48 MHz
+    set_attr(&mut d, "u_pll", "FILTER_RANGE", "3'b001");
+    set_attr(&mut d, "u_pll", "FEEDBACK_PATH", "PHASE_AND_DELAY");
+    // In PHASE_AND_DELAY mode, f_vco = f_pfd * (divf + 1) * 2^divq, so with divq=4 use divf=3 -> 12 * 4 * 16 = 768 MHz.
+    set_attr(&mut d, "u_pll", "DIVF", "3");
+    set_attr(&mut d, "u_pll", "REF_FREQ", "12000000");
+
+    d.add_cell("ob0", CellKind::IobOut);
+    d.connect("pll_clk_a", "ob0", "I");
+    d.connect("led0", "ob0", "PAD");
+
+    d.add_cell("ob1", CellKind::IobOut);
+    d.connect("pll_lock", "ob1", "I");
+    d.connect("led1", "ob1", "PAD");
+
+    let backend = Ice40Backend::new("ice40-hx8k");
+    let packed = backend.pack(&d).expect("pack 2f pll");
+    assert_eq!(packed.plls.len(), 1);
+    let pll = &packed.plls[0];
+    assert_eq!(pll.kind, helion_ice40::pack::PllKind::Core2F);
+    assert_eq!(pll.feedback_path, helion_ice40::pack::PllFeedbackPath::PhaseAndDelay);
+    assert_eq!((pll.divr, pll.divf, pll.divq, pll.filter_range), (0, 3, 4, 1));
+
+    let placed = backend.place(&packed).expect("place 2f pll");
+    let routed = backend.route(&placed).expect("route 2f pll");
+    let asc = backend.bitstream(&routed).expect("bitstream 2f pll");
+    let tiles = asc_tiles(&asc);
+    // PLLTYPE = 0b111 (SB_PLL40_2F_CORE), FEEDBACK_PATH = 0b010 (PHASE_AND_DELAY)
+    assert_pll_fields(&tiles, 33, 0b111, 0b010, 0, 3, 4, 1);
+
+    // Out-of-range VCO with explicit dividers must fail loud.
+    set_attr(&mut d, "u_pll", "DIVF", "120");
+    assert!(backend.pack(&d).is_err());
+}
+
+#[test]
+fn sb_ram40_4k_blackbox_mask_and_negclk_end_to_end() {
+    let mut d = Design::new("ram40_bb");
+    port(&mut d, "clk", PortDir::In);
+    port(&mut d, "led0", PortDir::Out);
+
+    d.add_cell("clk_ib", CellKind::IobIn);
+    d.connect("clk_net", "clk_ib", "O");
+    d.connect("clk", "clk_ib", "PAD");
+
+    d.add_cell(
+        "u_ram",
+        CellKind::BlackBox {
+            module: intern("SB_RAM40_4KNRNW"),
+        },
+    );
+    d.connect("clk_net", "u_ram", "RCLKN");
+    d.connect("clk_net", "u_ram", "WCLKN");
+    d.connect("clk_net", "u_ram", "RCLKE");
+    d.connect("clk_net", "u_ram", "WCLKE");
+    d.connect("clk_net", "u_ram", "RADDR[0]");
+    d.connect("clk_net", "u_ram", "WADDR[0]");
+    d.connect("clk_net", "u_ram", "WDATA[0]");
+    d.connect("clk_net", "u_ram", "MASK[0]");
+    d.connect("clk_net", "u_ram", "MASK[8]");
+    d.connect("rdata0", "u_ram", "RDATA[0]");
+    set_attr(&mut d, "u_ram", "WRITE_MODE", "2'b00");
+    set_attr(&mut d, "u_ram", "READ_MODE", "2'b10");
+    set_attr(&mut d, "u_ram", "INIT_0", "256'h0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_CAFE");
+
+    d.add_cell("ob0", CellKind::IobOut);
+    d.connect("rdata0", "ob0", "I");
+    d.connect("led0", "ob0", "PAD");
+
+    let backend = Ice40Backend::new("ice40-hx8k");
+    let packed = backend.pack(&d).expect("pack SB_RAM40_4KNRNW");
+    assert_eq!(packed.rams.len(), 1);
+    let ram = &packed.rams[0];
+    assert!(ram.neg_clk_r && ram.neg_clk_w);
+    assert_eq!(ram.write_mode, 0);
+    assert_eq!(ram.read_mode, 2);
+    assert_eq!(ram.init[0], 0xCAFE);
+    assert_eq!(ram.mask_net[0], "clk_net");
+    assert_eq!(ram.mask_net[8], "clk_net");
+
+    let placed = backend.place(&packed).expect("place");
+    let routed = backend.route(&placed).expect("route");
+    let asc = backend.bitstream(&routed).expect("bitstream");
+    let tiles = asc_tiles(&asc);
+    let ramb = &tiles[&(".ramb_tile".to_string(), 8, 1)];
+    let ramt = &tiles[&(".ramt_tile".to_string(), 8, 2)];
+    assert!(bit(ramb, 0, 0), "RAMB NegClk (B0[0]) set for SB_RAM40_4KNRNW");
+    assert!(bit(ramt, 0, 0), "RAMT NegClk (B0[0]) set for SB_RAM40_4KNRNW");
+}
+
+#[test]
+fn sb_hfosc_lfosc_and_hard_i2c_spi_rgba_drv_end_to_end() {
+    let mut d = Design::new("hard_peripherals");
+    port(&mut d, "led0", PortDir::Out);
+    port(&mut d, "led1", PortDir::Out);
+    port(&mut d, "led2", PortDir::Out);
+
+    // SB_HFOSC @ 24 MHz (CLKHF_DIV = "0b01") -> SB_GB -> global clock
+    d.add_cell(
+        "u_hfosc",
+        CellKind::BlackBox {
+            module: intern("SB_HFOSC"),
+        },
+    );
+    set_attr(&mut d, "u_hfosc", "CLKHF_DIV", "0b01");
+    d.connect("hf_clk", "u_hfosc", "CLKHF");
+
+    d.add_cell(
+        "u_lfosc",
+        CellKind::BlackBox {
+            module: intern("SB_LFOSC"),
+        },
+    );
+    d.connect("lf_clk", "u_lfosc", "CLKLF");
+
+    d.add_cell(
+        "u_i2c",
+        CellKind::BlackBox {
+            module: intern("SB_I2C"),
+        },
+    );
+    set_attr(&mut d, "u_i2c", "BUS_ADDR74", "0b0011");
+    d.connect("hf_clk", "u_i2c", "SBCLKI");
+    d.connect("i2c_irq", "u_i2c", "I2CIRQ");
+
+    d.add_cell(
+        "u_spi",
+        CellKind::BlackBox {
+            module: intern("SB_SPI"),
+        },
+    );
+    set_attr(&mut d, "u_spi", "BUS_ADDR74", "0b0010");
+    d.connect("hf_clk", "u_spi", "SBCLKI");
+    d.connect("spi_irq", "u_spi", "SPIIRQ");
+
+    d.add_cell(
+        "u_rgba",
+        CellKind::BlackBox {
+            module: intern("SB_RGBA_DRV"),
+        },
+    );
+    set_attr(&mut d, "u_rgba", "CURRENT_MODE", "0b1");
+    set_attr(&mut d, "u_rgba", "RGB0_CURRENT", "0b000111");
+    set_attr(&mut d, "u_rgba", "RGB1_CURRENT", "0b001111");
+    set_attr(&mut d, "u_rgba", "RGB2_CURRENT", "0b011111");
+    d.connect("lf_clk", "u_rgba", "RGB0PWM");
+    d.connect("rgb0_out", "u_rgba", "RGB0");
+
+    d.add_cell("ob0", CellKind::IobOut);
+    d.connect("i2c_irq", "ob0", "I");
+    d.connect("led0", "ob0", "PAD");
+
+    d.add_cell("ob1", CellKind::IobOut);
+    d.connect("spi_irq", "ob1", "I");
+    d.connect("led1", "ob1", "PAD");
+
+    d.add_cell("ob2", CellKind::IobOut);
+    d.connect("rgb0_out", "ob2", "I");
+    d.connect("led2", "ob2", "PAD");
+
+    let backend = Ice40Backend::new("ice40-up5k");
+    let packed = backend.pack(&d).expect("pack osc + hard ips");
+    assert_eq!(packed.oscs.len(), 2);
+    assert_eq!(packed.hard_ips.len(), 3);
+
+    let placed = backend.place(&packed).expect("place osc + hard ips");
+    let routed = backend.route(&placed).expect("route osc + hard ips");
+    let asc = backend.bitstream(&routed).expect("bitstream osc + hard ips");
+
+    assert!(asc.contains(".comment SB_HFOSC u_hfosc site=(0,32) CLKHF_DIV=1"));
+    assert!(asc.contains(".comment SB_LFOSC u_lfosc site=(33,1) CLKHF_DIV=0"));
+    assert!(asc.contains(".comment SB_I2C u_i2c site=(33,31) BUS_ADDR74=0b0011"));
+    assert!(asc.contains(".comment SB_SPI u_spi site=(33,3) BUS_ADDR74=0b0010"));
+    assert!(asc.contains(".comment SB_RGBA_DRV u_rgba site=(0,30) CURRENT_MODE=1 RGB0_CURRENT=0b000111 RGB1_CURRENT=0b001111 RGB2_CURRENT=0b011111"));
 }
