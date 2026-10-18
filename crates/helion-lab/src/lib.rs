@@ -35,6 +35,18 @@ pub use sysmon::{
     adc_to_voltage, drp_addr, temp_c_to_adc, voltage_to_adc,
 };
 
+pub mod bscan_1149;
+pub mod svf_stapl;
+
+pub use bscan_1149::{
+    BoardFault, BoardNet, BoardPinRef, BoundaryScanBoard, BsdlCell, BsdlCellKind, BsdlDevice,
+    DiagnosedFault, InterconnectTestReport, parse_bsdl,
+};
+pub use svf_stapl::{
+    SvfCommand, SvfExecutionReport, execute_hw_stapl, execute_hw_svf, parse_svf, write_hw_stapl,
+    write_hw_svf,
+};
+
 /// Locked Bits/hw refuse codes — re-exported (identical `HELION_E_*` tokens; do not rename).
 pub use helion_hw::{ERR_CODE_EMPTY_BITSTREAM, ERR_CODE_USB_0};
 
@@ -501,6 +513,125 @@ mod tests {
         );
         assert!(
             scan_degraded.metrics.vertical_opening_mv < scan_open.metrics.vertical_opening_mv
+        );
+    }
+
+    #[test]
+    fn write_and_execute_hw_svf_and_stapl_with_tdo_mask_verification() {
+        use helion_hw::Tap;
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+
+        // Empty bitstream must be refused by write_hw_svf and write_hw_stapl.
+        let empty_err = write_hw_svf(&dev, &Bitstream::empty(&dev)).unwrap_err();
+        assert!(empty_err.contains(ERR_CODE_EMPTY_BITSTREAM));
+
+        let bits = bitgen_structural_counter();
+        let svf = write_hw_svf(&dev, &bits).unwrap();
+        assert!(svf.contains("FREQUENCY 10000000 HZ;"));
+        assert!(svf.contains("SIR 6 TDI (03);"));
+        assert!(svf.contains("RUNTEST IDLE 33 TCK;"));
+
+        let mut tap = Tap::new(&dev);
+        let rep = execute_hw_svf(&mut tap, &svf).unwrap();
+        assert_eq!(rep.frequency_hz, Some(10_000_000));
+        assert_eq!(rep.sir_scans, 3);
+        assert_eq!(rep.sdr_scans, 3);
+        assert_eq!(rep.tdo_checks_passed, 2);
+        assert_eq!(rep.final_idcode, dev.idcode);
+        assert!(tap.fabric().stat.done && tap.fabric().stat.eos);
+
+        // Tampered IDCODE TDO expectation must fail execute_hw_svf with TDO mismatch.
+        let bad_svf = svf.replace(
+            &format!("TDO ({:08x})", dev.idcode),
+            "TDO (deadbeef)",
+        );
+        let mut tap_bad = Tap::new(&dev);
+        let tdo_err = execute_hw_svf(&mut tap_bad, &bad_svf).unwrap_err();
+        assert!(tdo_err.contains("SDR TDO mismatch"), "{tdo_err}");
+
+        // STAPL export & playback round-trip.
+        let stapl = write_hw_stapl(&dev, &bits).unwrap();
+        assert!(stapl.contains("ACTION PROGRAM = DO_PROGRAM;"));
+        assert!(stapl.contains("PROCEDURE DO_PROGRAM;"));
+        let mut tap_stapl = Tap::new(&dev);
+        let stapl_rep = execute_hw_stapl(&mut tap_stapl, &stapl).unwrap();
+        assert_eq!(stapl_rep.tdo_checks_passed, 2);
+        assert!(tap_stapl.fabric().stat.done);
+    }
+
+    #[test]
+    fn bsdl_roundtrip_and_ieee_1149_1_extest_interconnect_fault_diagnosis() {
+        let chip0 = BsdlDevice::helion_default("HL10T_U0", 0x0362_D093, 8);
+        let chip1 = BsdlDevice::helion_default("HL10T_U1", 0x0362_D093, 8);
+
+        // Verify BSDL text round-trip.
+        let bsdl_text = chip0.to_bsdl_string();
+        let parsed_chip0 = parse_bsdl(&bsdl_text).unwrap();
+        assert_eq!(parsed_chip0, chip0);
+
+        let mut board = BoundaryScanBoard::new(vec![chip0, chip1]);
+        // Net 0: multi-drop from U0.IO_0 -> U1.IO_0 and U1.IO_7
+        board.add_net(
+            "DATA_0",
+            BoardPinRef::new(0, "IO_0"),
+            vec![BoardPinRef::new(1, "IO_0"), BoardPinRef::new(1, "IO_7")],
+        );
+        for i in 1..6 {
+            board.add_net(
+                format!("DATA_{i}"),
+                BoardPinRef::new(0, format!("IO_{i}")),
+                vec![BoardPinRef::new(1, format!("IO_{i}"))],
+            );
+        }
+
+        // 1. Healthy board passes all Walking-1 / Walking-0 / Counting EXTEST vectors.
+        let clean_rep = board.run_interconnect_test();
+        assert!(clean_rep.pass);
+        assert!(clean_rep.diagnosed_faults.is_empty());
+        assert_eq!(clean_rep.total_bsr_bits_per_scan, 16);
+
+        // 2. Inject StuckAt0 on DATA_1, StuckAt1 on DATA_2, OpenPin on U1.IO_7 (on multi-drop DATA_0),
+        //    and BridgedNets (wired-AND) between DATA_3 and DATA_4.
+        board.inject_fault(BoardFault::StuckAt0 {
+            net_name: "DATA_1".into(),
+        });
+        board.inject_fault(BoardFault::StuckAt1 {
+            net_name: "DATA_2".into(),
+        });
+        board.inject_fault(BoardFault::OpenPin {
+            pin: BoardPinRef::new(1, "IO_7"),
+            open_pull_value: false,
+        });
+        board.inject_fault(BoardFault::BridgedNets {
+            net_a: "DATA_3".into(),
+            net_b: "DATA_4".into(),
+            wired_and: true,
+        });
+
+        let fault_rep = board.run_interconnect_test();
+        assert!(!fault_rep.pass);
+        assert_eq!(
+            fault_rep.diagnosed_faults,
+            vec![
+                DiagnosedFault::BridgedShort {
+                    net_a: "DATA_3".into(),
+                    net_b: "DATA_4".into(),
+                    wired_and: true,
+                },
+                DiagnosedFault::OpenReceiverPin {
+                    net_name: "DATA_0".into(),
+                    receiver: BoardPinRef::new(1, "IO_7"),
+                    stuck_level: false,
+                },
+                DiagnosedFault::StuckAt0 {
+                    net_name: "DATA_1".into(),
+                    receiver: BoardPinRef::new(1, "IO_1"),
+                },
+                DiagnosedFault::StuckAt1 {
+                    net_name: "DATA_2".into(),
+                    receiver: BoardPinRef::new(1, "IO_2"),
+                },
+            ]
         );
     }
 }
