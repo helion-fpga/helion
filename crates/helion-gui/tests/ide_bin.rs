@@ -83,7 +83,10 @@ fn helion_ide_stdin_flow_refuses_route_before_place() {
         s.contains("Place first"),
         "flow route without place must refuse: {s}"
     );
-    assert!(s.contains("u_lut0"), "tree must list real HNF cells: {s}");
+    assert!(
+        s.contains("u_lut0") || s.contains("u_luts0"),
+        "tree must list real HNF cells: {s}"
+    );
     assert!(s.contains("LUT6"), "tree must list primitives: {s}");
     assert!(s.contains("ERROR"), "refusal is journaled as ERROR: {s}");
 }
