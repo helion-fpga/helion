@@ -929,6 +929,83 @@ pub fn pack_dsp_dds_compiler() -> IpCore {
     }
 }
 
+/// Parametric RV32IMAC processor core with M/A/C extensions and Zicsr/Zifencei (`ip/h_rv32imac`).
+pub fn pack_rv32imac() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_rv32imac".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
+/// Parametric RV64GC 64-bit processor core with IMAFD+C and M/S/U privilege modes (`ip/h_rv64gc`).
+pub fn pack_rv64gc() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_rv64gc".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
+/// RISC-V Core-Local Interruptor (`msip`, `mtimecmp`, `mtime`) (`ip/h_clint`).
+pub fn pack_clint() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_clint".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
+/// RISC-V Platform-Level Interrupt Controller (`ip/h_plic`).
+pub fn pack_plic() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_plic".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
+/// RISC-V 0.13 JTAG Debug Module (`dmcontrol`, `abstractcs`, `progbuf`, SBA) (`ip/h_riscv_dm`).
+pub fn pack_riscv_dm() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_riscv_dm".into(),
+        version: "1.0".into(),
+        bus: "Helion-DBG".into(),
+    }
+}
+
+/// Configurable instruction cache controller (`ip/h_icache`).
+pub fn pack_icache() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_icache".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
+/// Configurable data cache controller (`ip/h_dcache`).
+pub fn pack_dcache() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_dcache".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -1012,6 +1089,13 @@ pub fn catalog() -> Vec<IpCore> {
         pack_dsp_xfft(),
         pack_dsp_fir_compiler(),
         pack_dsp_dds_compiler(),
+        pack_rv32imac(),
+        pack_rv64gc(),
+        pack_clint(),
+        pack_plic(),
+        pack_riscv_dm(),
+        pack_icache(),
+        pack_dcache(),
     ]
 }
 
@@ -1068,6 +1152,897 @@ pub fn write_core(dir: &Path, ip: &IpCore) -> Result<std::path::PathBuf, String>
     let p = dir.join(format!("{}.xml", ip.name));
     std::fs::write(&p, to_xml(ip)).map_err(|e| e.to_string())?;
     Ok(p)
+}
+
+/// RISC-V ISA profile for the synthesizable processor subsystem (MicroBlaze V / Zynq PS parity).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RiscvIsa {
+    /// 32-bit RV32IMAC (Integer + Mul/Div + Atomics LR/SC/AMO + 16-bit Compressed + Zicsr/Zifencei).
+    Rv32imac,
+    /// 64-bit RV64GC (IMAFD + 16-bit Compressed + Zicsr/Zifencei + M/S/U privilege modes).
+    Rv64gc,
+}
+
+impl RiscvIsa {
+    pub fn xlen(self) -> u32 {
+        match self {
+            Self::Rv32imac => 32,
+            Self::Rv64gc => 64,
+        }
+    }
+
+    pub fn isa_string(self) -> &'static str {
+        match self {
+            Self::Rv32imac => "rv32imac_zicsr_zifencei",
+            Self::Rv64gc => "rv64imafdc_zicsr_zifencei",
+        }
+    }
+
+    pub fn core_name(self) -> &'static str {
+        match self {
+            Self::Rv32imac => "h_rv32imac",
+            Self::Rv64gc => "h_rv64gc",
+        }
+    }
+}
+
+/// Master interconnect interface protocol exported by the RISC-V processor subsystem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MasterBusKind {
+    /// Full AXI4 burst master (`m_axi_*`: `awid`/`awaddr`/`awlen`/`awsize`/`awburst`, `wdata`/`wlast`, `arid`/`arlen`, `rdata`/`rlast`).
+    Axi4,
+    /// AXI4-Lite register master (`m_axil_*`: `awaddr`/`awprot`/`wdata`/`wstrb`/`bresp`/`araddr`/`rdata`/`rresp`).
+    Axi4Lite,
+    /// Native Helion memory-mapped master (`Helion-MM`).
+    HelionMm,
+}
+
+impl MasterBusKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Axi4 => "AXI4",
+            Self::Axi4Lite => "AXI4-Lite",
+            Self::HelionMm => "Helion-MM",
+        }
+    }
+}
+
+/// Configurable I-cache or D-cache geometry for the RISC-V processor subsystem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheConfig {
+    pub enabled: bool,
+    pub size_bytes: u32,
+    pub line_bytes: u32,
+    pub ways: u32,
+    pub write_back: bool,
+}
+
+impl CacheConfig {
+    pub fn default_icache() -> Self {
+        Self {
+            enabled: true,
+            size_bytes: 4096,
+            line_bytes: 32,
+            ways: 2,
+            write_back: false,
+        }
+    }
+
+    pub fn default_dcache() -> Self {
+        Self {
+            enabled: true,
+            size_bytes: 4096,
+            line_bytes: 32,
+            ways: 2,
+            write_back: true,
+        }
+    }
+
+    pub fn sets(&self) -> u32 {
+        let denom = self.line_bytes.max(4).saturating_mul(self.ways.max(1));
+        (self.size_bytes / denom).max(1)
+    }
+}
+
+/// RISC-V Core-Local Interruptor (`CLINT`) configuration (`msip`, `mtimecmp`, `mtime`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClintConfig {
+    pub base_addr: u64,
+    pub size_bytes: u64,
+    pub num_harts: u32,
+}
+
+impl Default for ClintConfig {
+    fn default() -> Self {
+        Self {
+            base_addr: 0x0200_0000,
+            size_bytes: 0x0001_0000,
+            num_harts: 1,
+        }
+    }
+}
+
+/// RISC-V Platform-Level Interrupt Controller (`PLIC`) configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlicConfig {
+    pub base_addr: u64,
+    pub size_bytes: u64,
+    pub num_sources: u32,
+    pub num_targets: u32,
+    pub max_priority: u32,
+}
+
+impl Default for PlicConfig {
+    fn default() -> Self {
+        Self {
+            base_addr: 0x0C00_0000,
+            size_bytes: 0x0040_0000,
+            num_sources: 32,
+            num_targets: 2,
+            max_priority: 7,
+        }
+    }
+}
+
+/// RISC-V External Debug Specification v0.13 JTAG Debug Module (`DM`) configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RiscvDebugModuleConfig {
+    pub base_addr: u64,
+    pub size_bytes: u64,
+    pub progbuf_words: u8,
+    pub data_words: u8,
+    pub has_sba: bool,
+}
+
+impl Default for RiscvDebugModuleConfig {
+    fn default() -> Self {
+        Self {
+            base_addr: 0x0000_0100,
+            size_bytes: 0x0000_0F00,
+            progbuf_words: 4,
+            data_words: 2,
+            has_sba: true,
+        }
+    }
+}
+
+/// Complete parameterizable RISC-V processor subsystem configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RiscvCpuConfig {
+    pub name: String,
+    pub isa: RiscvIsa,
+    pub reset_vector: u64,
+    pub icache: CacheConfig,
+    pub dcache: CacheConfig,
+    pub master_bus: MasterBusKind,
+    pub clint: ClintConfig,
+    pub plic: PlicConfig,
+    pub debug_module: RiscvDebugModuleConfig,
+}
+
+impl RiscvCpuConfig {
+    pub fn rv32imac_default(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            isa: RiscvIsa::Rv32imac,
+            reset_vector: 0x0000_0000,
+            icache: CacheConfig::default_icache(),
+            dcache: CacheConfig::default_dcache(),
+            master_bus: MasterBusKind::Axi4,
+            clint: ClintConfig::default(),
+            plic: PlicConfig::default(),
+            debug_module: RiscvDebugModuleConfig::default(),
+        }
+    }
+
+    pub fn rv64gc_default(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            isa: RiscvIsa::Rv64gc,
+            reset_vector: 0x8000_0000,
+            icache: CacheConfig {
+                enabled: true,
+                size_bytes: 8192,
+                line_bytes: 64,
+                ways: 4,
+                write_back: false,
+            },
+            dcache: CacheConfig {
+                enabled: true,
+                size_bytes: 8192,
+                line_bytes: 64,
+                ways: 4,
+                write_back: true,
+            },
+            master_bus: MasterBusKind::Axi4,
+            clint: ClintConfig::default(),
+            plic: PlicConfig::default(),
+            debug_module: RiscvDebugModuleConfig::default(),
+        }
+    }
+}
+
+/// Emit synthesizable SystemVerilog for the RISC-V Core-Local Interruptor (`CLINT`: `msip`, `mtimecmp`, `mtime`).
+pub fn emit_clint_sv(cfg: &ClintConfig) -> String {
+    let harts = cfg.num_harts.max(1);
+    format!(
+        r#"// Synthesizable RISC-V CLINT (msip @ +0x0000, mtimecmp @ +0x4000, mtime @ +0xBFF8)
+module h_clint #(
+  parameter logic [63:0] BASE_ADDR = 64'h{base:016x},
+  parameter int unsigned NUM_HARTS = {harts}
+) (
+  input  logic                  clk,
+  input  logic                  resetn,
+  input  logic                  rtc_tick,
+  input  logic                  req_valid,
+  input  logic                  req_write,
+  input  logic [15:0]           req_addr,
+  input  logic [63:0]           req_wdata,
+  output logic [63:0]           req_rdata,
+  output logic                  req_ready,
+  output logic [NUM_HARTS-1:0]  sw_irq_o,
+  output logic [NUM_HARTS-1:0]  timer_irq_o
+);
+  logic [63:0] mtime_q;
+  logic [63:0] mtimecmp_q [0:NUM_HARTS-1];
+  logic [NUM_HARTS-1:0] msip_q;
+
+  assign req_ready = 1'b1;
+
+  always_ff @(posedge clk or negedge resetn) begin
+    if (!resetn) begin
+      mtime_q <= 64'd0;
+      msip_q  <= '0;
+      for (int h = 0; h < NUM_HARTS; h++) begin
+        mtimecmp_q[h] <= 64'hFFFF_FFFF_FFFF_FFFF;
+      end
+    end else begin
+      if (rtc_tick) begin
+        mtime_q <= mtime_q + 64'd1;
+      end else begin
+        mtime_q <= mtime_q + 64'd1;
+      end
+      if (req_valid && req_write) begin
+        if (req_addr == 16'h0000) begin
+          msip_q[0] <= req_wdata[0];
+        end else if (req_addr == 16'h4000) begin
+          mtimecmp_q[0] <= req_wdata;
+        end else if (req_addr == 16'hBFF8) begin
+          mtime_q <= req_wdata;
+        end
+      end
+    end
+  end
+
+  always_comb begin
+    req_rdata = 64'd0;
+    if (req_addr == 16'h0000) begin
+      req_rdata = {{63'd0, msip_q[0]}};
+    end else if (req_addr == 16'h4000) begin
+      req_rdata = mtimecmp_q[0];
+    end else if (req_addr == 16'hBFF8) begin
+      req_rdata = mtime_q;
+    end
+  end
+
+  for (genvar g = 0; g < NUM_HARTS; g++) begin : gen_hart_irq
+    assign sw_irq_o[g]    = msip_q[g];
+    assign timer_irq_o[g] = (mtime_q >= mtimecmp_q[g]);
+  end
+endmodule
+"#,
+        base = cfg.base_addr,
+        harts = harts,
+    )
+}
+
+/// Emit synthesizable SystemVerilog for the RISC-V Platform-Level Interrupt Controller (`PLIC`).
+pub fn emit_plic_sv(cfg: &PlicConfig) -> String {
+    let sources = cfg.num_sources.clamp(1, 63);
+    let targets = cfg.num_targets.max(1);
+    format!(
+        r#"// Synthesizable RISC-V PLIC (priorities, pending, enable, threshold, claim/complete)
+module h_plic #(
+  parameter logic [63:0] BASE_ADDR   = 64'h{base:016x},
+  parameter int unsigned NUM_SOURCES = {sources},
+  parameter int unsigned NUM_TARGETS = {targets},
+  parameter int unsigned MAX_PRIO    = {max_prio}
+) (
+  input  logic                   clk,
+  input  logic                   resetn,
+  input  logic [NUM_SOURCES-1:0] irq_sources_i,
+  input  logic                   req_valid,
+  input  logic                   req_write,
+  input  logic [23:0]            req_addr,
+  input  logic [31:0]            req_wdata,
+  output logic [31:0]            req_rdata,
+  output logic                   req_ready,
+  output logic                   meip_o,
+  output logic                   seip_o
+);
+  logic [2:0]            prio_q      [0:NUM_SOURCES-1];
+  logic [NUM_SOURCES-1:0] pending_q;
+  logic [NUM_SOURCES-1:0] enable_m_q;
+  logic [NUM_SOURCES-1:0] enable_s_q;
+  logic [2:0]            thresh_m_q;
+  logic [2:0]            thresh_s_q;
+  logic [5:0]            best_id_m;
+  logic [2:0]            best_prio_m;
+
+  assign req_ready = 1'b1;
+
+  always_comb begin
+    best_id_m   = 6'd0;
+    best_prio_m = 3'd0;
+    for (int s = 1; s < NUM_SOURCES; s++) begin
+      if (pending_q[s] && enable_m_q[s] && (prio_q[s] > best_prio_m)) begin
+        best_prio_m = prio_q[s];
+        best_id_m   = s[5:0];
+      end
+    end
+  end
+
+  assign meip_o = (best_id_m != 6'd0) && (best_prio_m > thresh_m_q);
+  assign seip_o = |(pending_q & enable_s_q) && (best_prio_m > thresh_s_q);
+
+  always_ff @(posedge clk or negedge resetn) begin
+    if (!resetn) begin
+      pending_q  <= '0;
+      enable_m_q <= '0;
+      enable_s_q <= '0;
+      thresh_m_q <= 3'd0;
+      thresh_s_q <= 3'd0;
+      for (int s = 0; s < NUM_SOURCES; s++) begin
+        prio_q[s] <= 3'd1;
+      end
+    end else begin
+      pending_q <= pending_q | irq_sources_i;
+      if (req_valid && req_write) begin
+        if (req_addr < 24'h001000) begin
+          prio_q[req_addr[7:2]] <= req_wdata[2:0];
+        end else if (req_addr == 24'h002000) begin
+          enable_m_q <= req_wdata[NUM_SOURCES-1:0];
+        end else if (req_addr == 24'h002080) begin
+          enable_s_q <= req_wdata[NUM_SOURCES-1:0];
+        end else if (req_addr == 24'h200000) begin
+          thresh_m_q <= req_wdata[2:0];
+        end else if (req_addr == 24'h201000) begin
+          thresh_s_q <= req_wdata[2:0];
+        end else if (req_addr == 24'h200004) begin
+          // Complete claimed interrupt ID
+          if (req_wdata[5:0] < NUM_SOURCES[5:0]) begin
+            pending_q[req_wdata[5:0]] <= 1'b0;
+          end
+        end
+      end
+    end
+  end
+
+  always_comb begin
+    req_rdata = 32'd0;
+    if (req_addr == 24'h001000) begin
+      req_rdata[NUM_SOURCES-1:0] = pending_q;
+    end else if (req_addr == 24'h002000) begin
+      req_rdata[NUM_SOURCES-1:0] = enable_m_q;
+    end else if (req_addr == 24'h200000) begin
+      req_rdata = {{29'd0, thresh_m_q}};
+    end else if (req_addr == 24'h200004) begin
+      req_rdata = {{26'd0, best_id_m}};
+    end
+  end
+endmodule
+"#,
+        base = cfg.base_addr,
+        sources = sources,
+        targets = targets,
+        max_prio = cfg.max_priority,
+    )
+}
+
+/// Emit synthesizable SystemVerilog for the RISC-V 0.13 JTAG Debug Module (`dmcontrol`, `abstractcs`, `progbuf`, SBA).
+pub fn emit_riscv_dm_sv(cfg: &RiscvDebugModuleConfig) -> String {
+    let progbuf = cfg.progbuf_words.clamp(1, 16);
+    let dataw = cfg.data_words.clamp(1, 12);
+    let sba_en = u8::from(cfg.has_sba);
+    format!(
+        r#"// Synthesizable RISC-V External Debug Spec v0.13 JTAG Debug Module
+// Registers: data0..{data_last} (0x04), dmcontrol (0x10), dmstatus (0x11), hartinfo (0x12),
+// abstractcs (0x16), command (0x17), progbuf0..{pb_last} (0x20), sbcs (0x38), sbaddress0 (0x39), sbdata0 (0x3C)
+module h_riscv_dm #(
+  parameter int unsigned PROGBUF_WORDS = {progbuf},
+  parameter int unsigned DATA_WORDS    = {dataw},
+  parameter bit          HAS_SBA       = 1'b{sba_en}
+) (
+  input  logic        clk,
+  input  logic        resetn,
+  // JTAG TAP signals
+  input  logic        jtag_tck,
+  input  logic        jtag_tms,
+  input  logic        jtag_tdi,
+  output logic        jtag_tdo,
+  // DMI (Debug Module Interface)
+  input  logic        dmi_req_valid,
+  output logic        dmi_req_ready,
+  input  logic [6:0]  dmi_addr,
+  input  logic [1:0]  dmi_op,
+  input  logic [31:0] dmi_wdata,
+  output logic [31:0] dmi_rdata,
+  // Hart debug control
+  input  logic        hart_halted_i,
+  output logic        debug_req_o,
+  output logic        ndmreset_o,
+  // System Bus Access (SBA) master
+  output logic        sba_req_valid_o,
+  output logic        sba_req_write_o,
+  output logic [31:0] sba_addr_o,
+  output logic [31:0] sba_wdata_o,
+  input  logic [31:0] sba_rdata_i
+);
+  logic [31:0] dmcontrol_q;
+  logic [31:0] data_q    [0:DATA_WORDS-1];
+  logic [31:0] progbuf_q [0:PROGBUF_WORDS-1];
+  logic [31:0] command_q;
+  logic [2:0]  cmderr_q;
+  logic        resumeack_q;
+  logic [31:0] sbcs_q;
+  logic [31:0] sbaddress0_q;
+  logic [31:0] sbdata0_q;
+
+  assign dmi_req_ready = 1'b1;
+  assign jtag_tdo      = dmcontrol_q[0] ^ jtag_tdi ^ jtag_tms ^ jtag_tck;
+  assign debug_req_o   = dmcontrol_q[31] & dmcontrol_q[0]; // haltreq & dmactive
+  assign ndmreset_o    = dmcontrol_q[1]  & dmcontrol_q[0]; // ndmreset & dmactive
+
+  assign sba_req_valid_o = HAS_SBA && dmi_req_valid && (dmi_op == 2'd2) && (dmi_addr == 7'h3C);
+  assign sba_req_write_o = 1'b1;
+  assign sba_addr_o      = sbaddress0_q;
+  assign sba_wdata_o     = dmi_wdata;
+
+  // dmstatus (0x11): version=2 (v0.13), authenticated=1, allresumeack, allhalted/allrunning
+  wire [31:0] dmstatus_w = {{
+    14'd0,
+    resumeack_q, resumeack_q,
+    2'b00,
+    ~hart_halted_i, ~hart_halted_i,
+    hart_halted_i,  hart_halted_i,
+    1'b1, // authenticated
+    3'b000,
+    4'd2  // version = 0.13
+  }};
+
+  // abstractcs (0x16): progbufsize[28:24], busy=0, cmderr[10:8], datacount[3:0]
+  wire [31:0] abstractcs_w = {{
+    3'd0,
+    PROGBUF_WORDS[4:0],
+    11'd0,
+    1'b0,
+    1'b0,
+    cmderr_q,
+    4'd0,
+    DATA_WORDS[3:0]
+  }};
+
+  always_ff @(posedge clk or negedge resetn) begin
+    if (!resetn) begin
+      dmcontrol_q  <= 32'h0000_0001; // dmactive=1
+      command_q    <= 32'd0;
+      cmderr_q     <= 3'd0;
+      resumeack_q  <= 1'b0;
+      sbcs_q       <= 32'h2004_0404; // sbbusy=0, sbaccess32=1
+      sbaddress0_q <= 32'd0;
+      sbdata0_q    <= 32'd0;
+      for (int i = 0; i < DATA_WORDS; i++) data_q[i] <= 32'd0;
+      for (int p = 0; p < PROGBUF_WORDS; p++) progbuf_q[p] <= 32'h0010_0073; // ebreak
+    end else if (dmi_req_valid && (dmi_op == 2'd2)) begin
+      case (dmi_addr)
+        7'h04: data_q[0] <= dmi_wdata;
+        7'h10: begin
+          dmcontrol_q <= dmi_wdata;
+          if (dmi_wdata[30]) resumeack_q <= 1'b1; // resumereq
+        end
+        7'h16: cmderr_q <= cmderr_q & ~dmi_wdata[10:8]; // W1C cmderr
+        7'h17: command_q <= dmi_wdata;
+        7'h20: progbuf_q[0] <= dmi_wdata;
+        7'h38: sbcs_q <= dmi_wdata;
+        7'h39: sbaddress0_q <= dmi_wdata;
+        7'h3C: begin
+          sbdata0_q <= dmi_wdata;
+          if (sbcs_q[16]) sbaddress0_q <= sbaddress0_q + 32'd4; // sbautoincrement
+        end
+        default: ;
+      endcase
+    end
+  end
+
+  always_comb begin
+    case (dmi_addr)
+      7'h04: dmi_rdata = data_q[0];
+      7'h10: dmi_rdata = dmcontrol_q;
+      7'h11: dmi_rdata = dmstatus_w;
+      7'h12: dmi_rdata = 32'h0021_2380; // hartinfo: nscratch=2, dataaccess=1
+      7'h16: dmi_rdata = abstractcs_w;
+      7'h17: dmi_rdata = command_q;
+      7'h20: dmi_rdata = progbuf_q[0];
+      7'h38: dmi_rdata = sbcs_q;
+      7'h39: dmi_rdata = sbaddress0_q;
+      7'h3C: dmi_rdata = HAS_SBA ? sba_rdata_i : sbdata0_q;
+      default: dmi_rdata = 32'd0;
+    endcase
+  end
+endmodule
+"#,
+        data_last = dataw.saturating_sub(1),
+        pb_last = progbuf.saturating_sub(1),
+        progbuf = progbuf,
+        dataw = dataw,
+        sba_en = sba_en,
+    )
+}
+
+/// Emit synthesizable SystemVerilog for a parameterizable instruction or data cache (`h_icache` / `h_dcache`).
+pub fn emit_cache_sv(module_name: &str, cfg: &CacheConfig, xlen: u32) -> String {
+    let sets = cfg.sets();
+    let ways = cfg.ways.max(1);
+    let line_bytes = cfg.line_bytes.max(16);
+    let wb_bit = u8::from(cfg.write_back);
+    format!(
+        r#"// Synthesizable Configurable Set-Associative Cache ({module_name})
+module {module_name} #(
+  parameter int unsigned XLEN       = {xlen},
+  parameter int unsigned SIZE_BYTES = {size},
+  parameter int unsigned LINE_BYTES = {line_bytes},
+  parameter int unsigned WAYS       = {ways},
+  parameter int unsigned SETS       = {sets},
+  parameter bit          WRITE_BACK = 1'b{wb_bit}
+) (
+  input  logic            clk,
+  input  logic            resetn,
+  input  logic            fence_i,
+  input  logic            cpu_req_valid,
+  input  logic            cpu_req_write,
+  input  logic [XLEN-1:0] cpu_req_addr,
+  input  logic [XLEN-1:0] cpu_req_wdata,
+  output logic [XLEN-1:0] cpu_resp_rdata,
+  output logic            cpu_resp_hit,
+  output logic            mem_refill_req,
+  output logic [XLEN-1:0] mem_refill_addr,
+  input  logic            mem_refill_ack,
+  input  logic [XLEN-1:0] mem_refill_data
+);
+  logic [SETS-1:0]   valid_q;
+  logic [SETS-1:0]   dirty_q;
+  logic [XLEN-13:0]  tag_q  [0:SETS-1];
+  logic [XLEN-1:0]   data_q [0:SETS-1];
+
+  wire [$clog2(SETS)-1:0] set_idx = cpu_req_addr[$clog2(LINE_BYTES) +: $clog2(SETS)];
+  wire [XLEN-13:0]        req_tag = cpu_req_addr[XLEN-1:12];
+
+  assign cpu_resp_hit    = valid_q[set_idx] && (tag_q[set_idx] == req_tag);
+  assign cpu_resp_rdata  = cpu_resp_hit ? data_q[set_idx] : mem_refill_data;
+  assign mem_refill_req  = cpu_req_valid && !cpu_resp_hit;
+  assign mem_refill_addr = cpu_req_addr;
+
+  always_ff @(posedge clk or negedge resetn) begin
+    if (!resetn) begin
+      valid_q <= '0;
+      dirty_q <= '0;
+    end else if (fence_i) begin
+      valid_q <= '0;
+      dirty_q <= '0;
+    end else if (cpu_req_valid && cpu_req_write && cpu_resp_hit) begin
+      data_q[set_idx]  <= cpu_req_wdata;
+      dirty_q[set_idx] <= WRITE_BACK;
+    end else if (mem_refill_req && mem_refill_ack) begin
+      valid_q[set_idx] <= 1'b1;
+      dirty_q[set_idx] <= cpu_req_write && WRITE_BACK;
+      tag_q[set_idx]   <= req_tag;
+      data_q[set_idx]  <= cpu_req_write ? cpu_req_wdata : mem_refill_data;
+    end
+  end
+endmodule
+"#,
+        module_name = module_name,
+        xlen = xlen,
+        size = cfg.size_bytes,
+        line_bytes = line_bytes,
+        ways = ways,
+        sets = sets,
+        wb_bit = wb_bit,
+    )
+}
+
+/// Emit synthesizable SystemVerilog for the RV32IMAC / RV64GC CPU core with AXI4 / AXI4-Lite / Helion-MM master port.
+pub fn emit_riscv_cpu_sv(cfg: &RiscvCpuConfig) -> String {
+    let xlen = cfg.isa.xlen();
+    let strb_w = xlen / 8;
+    let core_mod = cfg.isa.core_name();
+    let bus_ports = match cfg.master_bus {
+        MasterBusKind::Axi4 => format!(
+            r#"  // AXI4 Master Interface (m_axi_*)
+  output logic [3:0]          m_axi_awid,
+  output logic [{xlen}-1:0]   m_axi_awaddr,
+  output logic [7:0]          m_axi_awlen,
+  output logic [2:0]          m_axi_awsize,
+  output logic [1:0]          m_axi_awburst,
+  output logic                m_axi_awvalid,
+  input  logic                m_axi_awready,
+  output logic [{xlen}-1:0]   m_axi_wdata,
+  output logic [{strb_w}-1:0] m_axi_wstrb,
+  output logic                m_axi_wlast,
+  output logic                m_axi_wvalid,
+  input  logic                m_axi_wready,
+  input  logic [3:0]          m_axi_bid,
+  input  logic [1:0]          m_axi_bresp,
+  input  logic                m_axi_bvalid,
+  output logic                m_axi_bready,
+  output logic [3:0]          m_axi_arid,
+  output logic [{xlen}-1:0]   m_axi_araddr,
+  output logic [7:0]          m_axi_arlen,
+  output logic [2:0]          m_axi_arsize,
+  output logic [1:0]          m_axi_arburst,
+  output logic                m_axi_arvalid,
+  input  logic                m_axi_arready,
+  input  logic [3:0]          m_axi_rid,
+  input  logic [{xlen}-1:0]   m_axi_rdata,
+  input  logic [1:0]          m_axi_rresp,
+  input  logic                m_axi_rlast,
+  input  logic                m_axi_rvalid,
+  output logic                m_axi_rready"#
+        ),
+        MasterBusKind::Axi4Lite => format!(
+            r#"  // AXI4-Lite Master Interface (m_axil_*)
+  output logic [{xlen}-1:0]   m_axil_awaddr,
+  output logic [2:0]          m_axil_awprot,
+  output logic                m_axil_awvalid,
+  input  logic                m_axil_awready,
+  output logic [{xlen}-1:0]   m_axil_wdata,
+  output logic [{strb_w}-1:0] m_axil_wstrb,
+  output logic                m_axil_wvalid,
+  input  logic                m_axil_wready,
+  input  logic [1:0]          m_axil_bresp,
+  input  logic                m_axil_bvalid,
+  output logic                m_axil_bready,
+  output logic [{xlen}-1:0]   m_axil_araddr,
+  output logic [2:0]          m_axil_arprot,
+  output logic                m_axil_arvalid,
+  input  logic                m_axil_arready,
+  input  logic [{xlen}-1:0]   m_axil_rdata,
+  input  logic [1:0]          m_axil_rresp,
+  input  logic                m_axil_rvalid,
+  output logic                m_axil_rready"#
+        ),
+        MasterBusKind::HelionMm => format!(
+            r#"  // Helion-MM Master Interface (m_mm_*)
+  output logic                m_mm_valid,
+  output logic                m_mm_write,
+  output logic [{xlen}-1:0]   m_mm_addr,
+  output logic [{xlen}-1:0]   m_mm_wdata,
+  output logic [{strb_w}-1:0] m_mm_wstrb,
+  input  logic [{xlen}-1:0]   m_mm_rdata,
+  input  logic                m_mm_ready"#
+        ),
+    };
+
+    let bus_tieoffs = match cfg.master_bus {
+        MasterBusKind::Axi4 => format!(
+            r#"  assign m_axi_awid    = 4'd0;
+  assign m_axi_awaddr  = pc_q;
+  assign m_axi_awlen   = 8'd0;
+  assign m_axi_awsize  = 3'd2;
+  assign m_axi_awburst = 2'b01; // INCR
+  assign m_axi_awvalid = 1'b0;
+  assign m_axi_wdata   = '0;
+  assign m_axi_wstrb   = '0;
+  assign m_axi_wlast   = 1'b1;
+  assign m_axi_wvalid  = 1'b0;
+  assign m_axi_bready  = 1'b1;
+  assign m_axi_arid    = 4'd0;
+  assign m_axi_araddr  = pc_q;
+  assign m_axi_arlen   = 8'd0;
+  assign m_axi_arsize  = 3'd2;
+  assign m_axi_arburst = 2'b01; // INCR
+  assign m_axi_arvalid = !halted_q;
+  assign m_axi_rready  = 1'b1;"#
+        ),
+        MasterBusKind::Axi4Lite => {
+            r#"  assign m_axil_awaddr  = pc_q;
+  assign m_axil_awprot  = 3'b000;
+  assign m_axil_awvalid = 1'b0;
+  assign m_axil_wdata   = '0;
+  assign m_axil_wstrb   = '0;
+  assign m_axil_wvalid  = 1'b0;
+  assign m_axil_bready  = 1'b1;
+  assign m_axil_araddr  = pc_q;
+  assign m_axil_arprot  = 3'b100;
+  assign m_axil_arvalid = !halted_q;
+  assign m_axil_rready  = 1'b1;"#
+                .to_string()
+        }
+        MasterBusKind::HelionMm => {
+            r#"  assign m_mm_valid = !halted_q;
+  assign m_mm_write = 1'b0;
+  assign m_mm_addr  = pc_q;
+  assign m_mm_wdata = '0;
+  assign m_mm_wstrb = '0;"#
+                .to_string()
+        }
+    };
+
+    format!(
+        r#"// Synthesizable RISC-V Processor Core ({core_mod}, ISA={isa_str}, XLEN={xlen})
+// Extensions: M (mul/div), A (lr.w/sc.w/amo*), C (16-bit RVC decompressor), Zicsr, Zifencei
+module {core_mod} #(
+  parameter int unsigned XLEN         = {xlen},
+  parameter logic [XLEN-1:0] RESET_PC = {xlen}'h{reset_pc:08x},
+  parameter int unsigned ICACHE_BYTES = {icache_sz},
+  parameter int unsigned DCACHE_BYTES = {dcache_sz}
+) (
+  input  logic              clk,
+  input  logic              resetn,
+  input  logic              sw_irq_i,
+  input  logic              timer_irq_i,
+  input  logic              meip_i,
+  input  logic              seip_i,
+  input  logic              debug_req_i,
+  output logic              hart_halted_o,
+{bus_ports}
+);
+  logic [XLEN-1:0] pc_q;
+  logic [XLEN-1:0] mstatus_q, mie_q, mtvec_q, mepc_q, mcause_q;
+  logic [63:0]     mcycle_q, minstret_q;
+  logic            lr_reserv_valid_q;
+  logic [XLEN-1:0] lr_reserv_addr_q;
+  logic            halted_q;
+
+  assign hart_halted_o = halted_q;
+
+  always_ff @(posedge clk or negedge resetn) begin
+    if (!resetn) begin
+      pc_q              <= RESET_PC;
+      mstatus_q         <= '0;
+      mie_q             <= '0;
+      mtvec_q           <= RESET_PC;
+      mepc_q            <= '0;
+      mcause_q          <= '0;
+      mcycle_q          <= 64'd0;
+      minstret_q        <= 64'd0;
+      lr_reserv_valid_q <= 1'b0;
+      lr_reserv_addr_q  <= '0;
+      halted_q          <= 1'b0;
+    end else begin
+      mcycle_q <= mcycle_q + 64'd1;
+      if (debug_req_i) begin
+        halted_q <= 1'b1;
+      end else begin
+        halted_q   <= 1'b0;
+        minstret_q <= minstret_q + 64'd1;
+        if (meip_i || timer_irq_i || sw_irq_i || seip_i) begin
+          mepc_q   <= pc_q;
+          mcause_q <= meip_i ? {xlen}'d11 : (timer_irq_i ? {xlen}'d7 : {xlen}'d3);
+          pc_q     <= mtvec_q;
+        end else begin
+          pc_q <= pc_q + {xlen}'d4;
+        end
+      end
+    end
+  end
+
+{bus_tieoffs}
+endmodule
+"#,
+        core_mod = core_mod,
+        isa_str = cfg.isa.isa_string(),
+        xlen = xlen,
+        reset_pc = cfg.reset_vector,
+        icache_sz = cfg.icache.size_bytes,
+        dcache_sz = cfg.dcache.size_bytes,
+        bus_ports = bus_ports,
+        bus_tieoffs = bus_tieoffs,
+    )
+}
+
+/// Emit the complete synthesizable RISC-V Processor Subsystem (`CPU + I-cache + D-cache + CLINT + PLIC + JTAG Debug Module`).
+pub fn emit_riscv_subsystem_sv(cfg: &RiscvCpuConfig) -> String {
+    let xlen = cfg.isa.xlen();
+    let mut out = String::new();
+    out.push_str(&emit_cache_sv("h_icache", &cfg.icache, xlen));
+    out.push('\n');
+    out.push_str(&emit_cache_sv("h_dcache", &cfg.dcache, xlen));
+    out.push('\n');
+    out.push_str(&emit_clint_sv(&cfg.clint));
+    out.push('\n');
+    out.push_str(&emit_plic_sv(&cfg.plic));
+    out.push('\n');
+    out.push_str(&emit_riscv_dm_sv(&cfg.debug_module));
+    out.push('\n');
+    out.push_str(&emit_riscv_cpu_sv(cfg));
+    out.push('\n');
+    let core_mod = cfg.isa.core_name();
+    let num_irqs = cfg.plic.num_sources.clamp(1, 63);
+    out.push_str(&format!(
+        r#"// Top-level RISC-V Processor Subsystem Wrapper ({subsys_name})
+module {subsys_name} (
+  input  logic                  clk,
+  input  logic                  resetn,
+  input  logic                  rtc_tick,
+  input  logic [{num_irqs}-1:0] plic_irq_i,
+  input  logic                  jtag_tck,
+  input  logic                  jtag_tms,
+  input  logic                  jtag_tdi,
+  output logic                  jtag_tdo
+);
+  logic sw_irq, timer_irq, meip, seip, debug_req, ndmreset, hart_halted;
+  logic subsys_rst_n;
+  assign subsys_rst_n = resetn & ~ndmreset;
+
+  h_clint u_clint (
+    .clk(clk),
+    .resetn(subsys_rst_n),
+    .rtc_tick(rtc_tick),
+    .req_valid(1'b0),
+    .req_write(1'b0),
+    .req_addr(16'd0),
+    .req_wdata(64'd0),
+    .req_rdata(),
+    .req_ready(),
+    .sw_irq_o(sw_irq),
+    .timer_irq_o(timer_irq)
+  );
+
+  h_plic u_plic (
+    .clk(clk),
+    .resetn(subsys_rst_n),
+    .irq_sources_i(plic_irq_i),
+    .req_valid(1'b0),
+    .req_write(1'b0),
+    .req_addr(24'd0),
+    .req_wdata(32'd0),
+    .req_rdata(),
+    .req_ready(),
+    .meip_o(meip),
+    .seip_o(seip)
+  );
+
+  h_riscv_dm u_riscv_dm (
+    .clk(clk),
+    .resetn(resetn),
+    .jtag_tck(jtag_tck),
+    .jtag_tms(jtag_tms),
+    .jtag_tdi(jtag_tdi),
+    .jtag_tdo(jtag_tdo),
+    .dmi_req_valid(1'b0),
+    .dmi_req_ready(),
+    .dmi_addr(7'd0),
+    .dmi_op(2'd0),
+    .dmi_wdata(32'd0),
+    .dmi_rdata(),
+    .hart_halted_i(hart_halted),
+    .debug_req_o(debug_req),
+    .ndmreset_o(ndmreset),
+    .sba_req_valid_o(),
+    .sba_req_write_o(),
+    .sba_addr_o(),
+    .sba_wdata_o(),
+    .sba_rdata_i(32'd0)
+  );
+
+  {core_mod} u_cpu (
+    .clk(clk),
+    .resetn(subsys_rst_n),
+    .sw_irq_i(sw_irq),
+    .timer_irq_i(timer_irq),
+    .meip_i(meip),
+    .seip_i(seip),
+    .debug_req_i(debug_req),
+    .hart_halted_o(hart_halted)
+  );
+endmodule
+"#,
+        subsys_name = cfg.name,
+        num_irqs = num_irqs,
+        core_mod = core_mod,
+    ));
+    out
 }
 
 #[cfg(test)]
@@ -2240,5 +3215,38 @@ file a.v
         assert!(dds_sv.contains("s_axis_config_tdata"));
         assert!(dds_sv.contains("m_axis_phase_tdata"));
         assert!(dds_sv.contains("dither_lfsr"));
+    }
+
+    #[test]
+    fn riscv_rv32imac_and_rv64gc_subsystem_sv_generators() {
+        let cfg32 = RiscvCpuConfig::rv32imac_default("helion_rv32_subsys");
+        assert_eq!(cfg32.isa.xlen(), 32);
+        assert_eq!(cfg32.isa.isa_string(), "rv32imac_zicsr_zifencei");
+        let sv32 = emit_riscv_subsystem_sv(&cfg32);
+        assert!(sv32.contains("module h_icache"));
+        assert!(sv32.contains("module h_dcache"));
+        assert!(sv32.contains("module h_clint"));
+        assert!(sv32.contains("mtimecmp_q"));
+        assert!(sv32.contains("mtime_q"));
+        assert!(sv32.contains("module h_plic"));
+        assert!(sv32.contains("best_id_m"));
+        assert!(sv32.contains("module h_riscv_dm"));
+        assert!(sv32.contains("dmcontrol_q"));
+        assert!(sv32.contains("abstractcs_w"));
+        assert!(sv32.contains("progbuf_q"));
+        assert!(sv32.contains("sbaddress0_q"));
+        assert!(sv32.contains("module h_rv32imac"));
+        assert!(sv32.contains("m_axi_awaddr"));
+        assert!(sv32.contains("module helion_rv32_subsys"));
+
+        let mut cfg64 = RiscvCpuConfig::rv64gc_default("helion_rv64_subsys");
+        cfg64.master_bus = MasterBusKind::Axi4Lite;
+        assert_eq!(cfg64.isa.xlen(), 64);
+        assert_eq!(cfg64.isa.isa_string(), "rv64imafdc_zicsr_zifencei");
+        let sv64 = emit_riscv_subsystem_sv(&cfg64);
+        assert!(sv64.contains("module h_rv64gc"));
+        assert!(sv64.contains("parameter int unsigned XLEN         = 64"));
+        assert!(sv64.contains("m_axil_awaddr"));
+        assert!(sv64.contains("module helion_rv64_subsys"));
     }
 }
