@@ -24,6 +24,24 @@ pub use mig::*;
 pub mod connectivity;
 pub use connectivity::*;
 
+pub mod cordic;
+pub mod fft;
+pub mod fir_dds;
+
+pub use cordic::{
+    CordicConfig, CordicCoordSystem, CordicEngine, CordicFixedOutput, CordicMode,
+    circular_atan_table, circular_gain, emit_cordic_sv, hyperbolic_atanh_table, hyperbolic_gain,
+    is_hyperbolic_repeat_step,
+};
+pub use fft::{
+    FftArchitecture, FftConfig, FftEngine, FftFixedResult, FftOutputOrder, bit_reverse,
+    emit_fft_sv, generate_twiddle_rom,
+};
+pub use fir_dds::{
+    DdsCompilerEngine, DdsConfig, DdsSample, FirCompilerEngine, FirConfig, FirRateMode,
+    design_lowpass_hamming_taps, emit_dds_sv, emit_fir_sv,
+};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IpCore {
     pub vendor: String,
@@ -867,6 +885,50 @@ pub fn pack_video_csc_scaler() -> IpCore {
     }
 }
 
+/// Vivado DSP IP: Pipelined CORDIC (UG958 / PG105 — circular/hyperbolic/linear rotation & vectoring).
+pub fn pack_dsp_cordic() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_dsp_cordic".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Vivado DSP IP: Radix-2/4 Burst & Pipelined Streaming FFT/IFFT (PG109, N=16..4096).
+pub fn pack_dsp_xfft() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_dsp_xfft".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Vivado DSP IP: Polyphase Decimation/Interpolation FIR Compiler (PG149).
+pub fn pack_dsp_fir_compiler() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_dsp_fir_compiler".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Vivado DSP IP: Phase-Dithered DDS Compiler (PG141).
+pub fn pack_dsp_dds_compiler() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_dsp_dds_compiler".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -946,6 +1008,10 @@ pub fn catalog() -> Vec<IpCore> {
         pack_video_vtc(),
         pack_mipi_csi2_rx(),
         pack_video_csc_scaler(),
+        pack_dsp_cordic(),
+        pack_dsp_xfft(),
+        pack_dsp_fir_compiler(),
+        pack_dsp_dds_compiler(),
     ]
 }
 
@@ -1967,5 +2033,212 @@ file a.v
         assert!(usb_sv.contains("ep0_setup_packet"));
         assert!(usb_sv.contains("s_axis_ep1_in_tdata"));
         assert!(usb_sv.contains("m_axis_ep2_out_tdata"));
+    }
+
+    #[test]
+    fn cordic_circular_hyperbolic_linear_and_sv_generation() {
+        use std::f64::consts::PI;
+        let eng = CordicEngine::new(CordicConfig::default());
+
+        // 1. Circular Rotation: sin/cos across all 4 quadrants [-pi, +pi].
+        for &deg in &[-150.0_f64, -90.0, -45.0, 0.0, 30.0, 60.0, 120.0, 175.0] {
+            let rad = deg.to_radians();
+            let (sin_c, cos_c) = eng.sin_cos(rad);
+            assert!(
+                (sin_c - rad.sin()).abs() < 1e-3,
+                "sin({deg} deg): got {sin_c}, expected {}",
+                rad.sin()
+            );
+            assert!(
+                (cos_c - rad.cos()).abs() < 1e-3,
+                "cos({deg} deg): got {cos_c}, expected {}",
+                rad.cos()
+            );
+        }
+
+        // 2. Circular Vectoring: atan2(y, x) and magnitude sqrt(x^2 + y^2).
+        for &(y, x) in &[(3.0_f64, 4.0_f64), (-1.5, 2.0), (2.0, -2.0), (-1.0, -1.732)] {
+            let (angle, mag) = eng.atan2_magnitude(y, x);
+            let exp_angle = y.atan2(x);
+            let exp_mag = (x * x + y * y).sqrt();
+            assert!(
+                (angle - exp_angle).abs() < 2e-3,
+                "atan2({y}, {x}): got {angle}, expected {exp_angle}"
+            );
+            assert!(
+                (mag - exp_mag).abs() < 5e-3,
+                "mag({y}, {x}): got {mag}, expected {exp_mag}"
+            );
+        }
+
+        // 3. Hyperbolic Rotation: sinh/cosh.
+        for &z in &[-0.8_f64, -0.3, 0.0, 0.5, 0.9] {
+            let (sh, ch) = eng.sinh_cosh(z);
+            assert!(
+                (sh - z.sinh()).abs() < 3e-3,
+                "sinh({z}): got {sh}, expected {}",
+                z.sinh()
+            );
+            assert!(
+                (ch - z.cosh()).abs() < 3e-3,
+                "cosh({z}): got {ch}, expected {}",
+                z.cosh()
+            );
+        }
+
+        // 4. Hyperbolic Vectoring: sqrt(v) across wide dynamic range.
+        for &v in &[0.0625_f64, 0.25, 0.5, 2.0, 9.0, 49.0] {
+            let root = eng.sqrt(v).unwrap();
+            assert!(
+                (root - v.sqrt()).abs() < 5e-3,
+                "sqrt({v}): got {root}, expected {}",
+                v.sqrt()
+            );
+        }
+        let _ = PI;
+
+        // 5. Synthesizable SystemVerilog emission with AXI4-Stream ports.
+        let sv = emit_cordic_sv(&CordicConfig::default());
+        assert!(sv.contains("module h_dsp_cordic"));
+        assert!(sv.contains("s_axis_tvalid"));
+        assert!(sv.contains("m_axis_x_tdata"));
+        assert!(sv.contains("ATAN_LUT"));
+    }
+
+    #[test]
+    fn fft_ifft_radix2_radix4_bit_reverse_and_sv_generation() {
+        use std::f64::consts::PI;
+        // Test transform sizes across N = 16 .. 4096.
+        for &n in &[16usize, 64, 256, 1024, 4096] {
+            let rom = generate_twiddle_rom(n, 14, false).unwrap();
+            assert_eq!(rom.len(), n / 2);
+            assert_eq!(rom[0], (1 << 14, 0));
+        }
+
+        // Forward + Inverse FFT round-trip on N=64 with PipelinedStreaming (Radix-4) and Radix2Burst.
+        for arch in [
+            FftArchitecture::PipelinedStreaming,
+            FftArchitecture::Radix4Burst,
+            FftArchitecture::Radix2Burst,
+        ] {
+            let cfg = FftConfig {
+                transform_size: 64,
+                arch,
+                output_order: FftOutputOrder::NaturalOrder,
+                ..FftConfig::default()
+            };
+            let eng = FftEngine::new(cfg.clone()).unwrap();
+            // Complex tone at bin 7 + bin 19.
+            let input: Vec<(f64, f64)> = (0..64)
+                .map(|k| {
+                    let t7 = 2.0 * PI * 7.0 * (k as f64) / 64.0;
+                    let t19 = 2.0 * PI * 19.0 * (k as f64) / 64.0;
+                    (t7.cos() + 0.5 * t19.cos(), t7.sin() + 0.5 * t19.sin())
+                })
+                .collect();
+            let spec = eng.transform_complex(&input, false).unwrap();
+            let mag7 = (spec[7].0.powi(2) + spec[7].1.powi(2)).sqrt();
+            let mag19 = (spec[19].0.powi(2) + spec[19].1.powi(2)).sqrt();
+            let mag0 = (spec[0].0.powi(2) + spec[0].1.powi(2)).sqrt();
+            assert!((mag7 - 64.0).abs() < 1e-6, "bin 7 peak={mag7}");
+            assert!((mag19 - 32.0).abs() < 1e-6, "bin 19 peak={mag19}");
+            assert!(mag0 < 1e-6);
+
+            let rec = eng.transform_complex(&spec, true).unwrap();
+            for (orig, r) in input.iter().zip(rec.iter()) {
+                assert!((orig.0 - r.0).abs() < 1e-9);
+                assert!((orig.1 - r.1).abs() < 1e-9);
+            }
+        }
+
+        // Bit-reversed output order verification.
+        let mut br_cfg = FftConfig::default();
+        br_cfg.transform_size = 16;
+        br_cfg.output_order = FftOutputOrder::BitReversed;
+        let br_eng = FftEngine::new(br_cfg.clone()).unwrap();
+        let tone1: Vec<(f64, f64)> = (0..16)
+            .map(|k| {
+                let th = 2.0 * PI * (k as f64) / 16.0;
+                (th.cos(), th.sin())
+            })
+            .collect();
+        let br_out = br_eng.transform_complex(&tone1, false).unwrap();
+        // Bin 1 in 4-bit bit-reversed order lands at index 0b1000 = 8!
+        let mag_at_8 = (br_out[8].0.powi(2) + br_out[8].1.powi(2)).sqrt();
+        assert!((mag_at_8 - 16.0).abs() < 1e-6);
+
+        // Fixed-point transform & SV emission.
+        let fixed_in: Vec<(i32, i32)> = vec![(1000, 0); 16];
+        let fixed_res = br_eng.transform_fixed(&fixed_in, false).unwrap();
+        assert_eq!(fixed_res.bins[0].0, 16000);
+        assert_eq!(fixed_res.radix4_stages, 2);
+
+        let sv = emit_fft_sv(&FftConfig::default()).unwrap();
+        assert!(sv.contains("module h_dsp_xfft"));
+        assert!(sv.contains("s_axis_config_tvalid"));
+        assert!(sv.contains("m_axis_data_tlast"));
+        assert!(sv.contains("TWIDDLE_RE"));
+    }
+
+    #[test]
+    fn polyphase_fir_and_phase_dithered_dds_compilers() {
+        // 1. Polyphase FIR Compiler: SingleRate, Decimation by 4, Interpolation by 4.
+        let taps = design_lowpass_hamming_taps(16, 0.25, 1024);
+        assert_eq!(taps.len(), 16);
+        // Symmetric linear-phase taps: h[k] == h[N-1-k].
+        for i in 0..8 {
+            assert_eq!(taps[i], taps[15 - i]);
+        }
+
+        // Decimation by 4 on 40 samples produces 10 output samples.
+        let mut decim_cfg = FirConfig::default();
+        decim_cfg.rate_mode = FirRateMode::Decimation { factor: 4 };
+        decim_cfg.coefficients = vec![256; 8];
+        let mut decim_eng = FirCompilerEngine::new(decim_cfg.clone());
+        assert_eq!(decim_eng.polyphase_branches().len(), 4);
+        let dc_in = vec![100i32; 40];
+        let decim_out = decim_eng.process_stream(&dc_in);
+        assert_eq!(decim_out.len(), 10);
+        assert_eq!(*decim_out.last().unwrap(), 100 * 256 * 8);
+
+        // Interpolation by 4 on 10 samples produces 40 output samples.
+        let mut interp_cfg = FirConfig::default();
+        interp_cfg.rate_mode = FirRateMode::Interpolation { factor: 4 };
+        interp_cfg.coefficients = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        let mut interp_eng = FirCompilerEngine::new(interp_cfg);
+        let interp_out = interp_eng.process_stream(&[1, 0, 0]);
+        assert_eq!(interp_out.len(), 12);
+        assert_eq!(&interp_out[0..8], &[10, 20, 30, 40, 50, 60, 70, 80]);
+
+        let fir_sv = emit_fir_sv(&decim_cfg);
+        assert!(fir_sv.contains("module h_dsp_fir_compiler"));
+        assert!(fir_sv.contains("s_axis_reload_tvalid"));
+        assert!(fir_sv.contains("m_axis_data_tdata"));
+
+        // 2. Phase-Dithered DDS Compiler: quadrature envelope and runtime PINC/POFF tuning.
+        let dds_cfg = DdsConfig::default();
+        let mut dds = DdsCompilerEngine::new(dds_cfg.clone());
+        let samples = dds.generate_samples(64);
+        assert_eq!(samples.len(), 64);
+        // Verify quadrature amplitude (sin^2 + cos^2) is approximately constant max_amp^2.
+        let max_amp = ((1i64 << 15) - 1) as f64;
+        for s in &samples {
+            let mag = ((s.sin as f64).powi(2) + (s.cos as f64).powi(2)).sqrt();
+            assert!(
+                (mag - max_amp).abs() < 150.0,
+                "DDS quadrature magnitude={mag} expected ~{max_amp}"
+            );
+        }
+        // Verify Sin and Cos both swing positive and negative over a full period.
+        assert!(samples.iter().any(|s| s.sin > 20_000));
+        assert!(samples.iter().any(|s| s.sin < -20_000));
+        assert!(samples.iter().any(|s| s.cos > 20_000));
+        assert!(samples.iter().any(|s| s.cos < -20_000));
+
+        let dds_sv = emit_dds_sv(&dds_cfg);
+        assert!(dds_sv.contains("module h_dsp_dds_compiler"));
+        assert!(dds_sv.contains("s_axis_config_tdata"));
+        assert!(dds_sv.contains("m_axis_phase_tdata"));
+        assert!(dds_sv.contains("dither_lfsr"));
     }
 }
