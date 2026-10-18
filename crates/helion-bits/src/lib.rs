@@ -1468,6 +1468,825 @@ pub fn reroute_probe_eco(
     Ok(sel)
 }
 
+/// One BRAM bit-lane mapping inside a Vivado UG898 `.mmi` (Memory Map Information) address space.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MmiBitLane {
+    pub cell_name: String,
+    pub placed_site: String,
+    pub bram_major: u16,
+    pub msb: u8,
+    pub lsb: u8,
+    pub addr_begin: u64,
+    pub addr_end: u64,
+    pub parity_bits: u8,
+}
+
+impl MmiBitLane {
+    pub fn bit_width(&self) -> u8 {
+        self.msb.saturating_sub(self.lsb) + 1
+    }
+}
+
+/// Processor-visible BRAM address space in a `.mmi` file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MmiAddressSpace {
+    pub name: String,
+    pub proc_name: String,
+    pub addr_begin: u64,
+    pub addr_end: u64,
+    pub bus_width: u8,
+    pub lanes: Vec<MmiBitLane>,
+}
+
+/// Vivado UG898 Memory Map Information (`.mmi`) descriptor mapping processor address
+/// spaces to physical `Far::BRAM` tiles and bit-lanes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryMapInfo {
+    pub part: String,
+    pub spaces: Vec<MmiAddressSpace>,
+}
+
+impl MemoryMapInfo {
+    /// Derive a `.mmi` descriptor directly from a placed & routed design's BRAM18 sites.
+    ///
+    /// Each BRAM18 tile exposes 64 INIT words × 8 bytes = 512 bytes (or `words_per_bram * 8`)
+    /// cascaded sequentially starting at `base_addr`.
+    pub fn from_routed(
+        dev: &Device,
+        routed: &Routed,
+        proc_name: &str,
+        space_name: &str,
+        base_addr: u64,
+    ) -> Self {
+        let bytes_per_bram = 64u64 * 8; // 64 64-bit INIT words per BRAM major = 512 B
+        let mut lanes = Vec::new();
+        let mut cur_addr = base_addr;
+        for (i, bram) in routed.placed.packed.brams.iter().enumerate() {
+            let site = routed
+                .placed
+                .bram_sites
+                .get(i)
+                .copied()
+                .unwrap_or(helion_device::Site {
+                    x: dev.bram_x,
+                    y: dev.bram_y0 + (i as u32) * 2,
+                    kind: helion_device::SiteKind::Bram,
+                });
+            let end = cur_addr + bytes_per_bram - 1;
+            lanes.push(MmiBitLane {
+                cell_name: bram.cell.clone(),
+                placed_site: site.id(),
+                bram_major: i as u16,
+                msb: 63,
+                lsb: 0,
+                addr_begin: cur_addr,
+                addr_end: end,
+                parity_bits: 0,
+            });
+            cur_addr = end + 1;
+        }
+        let addr_end = if cur_addr > base_addr {
+            cur_addr - 1
+        } else {
+            base_addr + bytes_per_bram - 1
+        };
+        Self {
+            part: dev.part.clone(),
+            spaces: vec![MmiAddressSpace {
+                name: space_name.into(),
+                proc_name: proc_name.into(),
+                addr_begin: base_addr,
+                addr_end,
+                bus_width: 64,
+                lanes,
+            }],
+        }
+    }
+
+    /// Emit a Vivado UG898-compatible `.mmi` XML document.
+    pub fn to_xml(&self) -> String {
+        let mut out = String::new();
+        out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        out.push_str(&format!(
+            "<MemInfo Version=\"1\" Minor=\"0\" Part=\"{}\">\n",
+            self.part
+        ));
+        for sp in &self.spaces {
+            out.push_str(&format!(
+                "  <Processor Endianness=\"Little\" InstPath=\"{}\">\n",
+                sp.proc_name
+            ));
+            out.push_str(&format!(
+                "    <AddressSpace Name=\"{}\" Begin=\"{:#010x}\" End=\"{:#010x}\" BusWidth=\"{}\">\n",
+                sp.name, sp.addr_begin, sp.addr_end, sp.bus_width
+            ));
+            out.push_str("      <BusBlock>\n");
+            for lane in &sp.lanes {
+                out.push_str(&format!(
+                    "        <BitLane MemType=\"RAMB18\" Cell=\"{}\" Placement=\"{}\" BramMajor=\"{}\">\n",
+                    lane.cell_name, lane.placed_site, lane.bram_major
+                ));
+                out.push_str(&format!(
+                    "          <DataWidth MSB=\"{}\" LSB=\"{}\"/>\n",
+                    lane.msb, lane.lsb
+                ));
+                out.push_str(&format!(
+                    "          <AddressRange Begin=\"{:#010x}\" End=\"{:#010x}\"/>\n",
+                    lane.addr_begin, lane.addr_end
+                ));
+                out.push_str(&format!(
+                    "          <Parity ON=\"{}\" NumBits=\"{}\"/>\n",
+                    if lane.parity_bits > 0 { "true" } else { "false" },
+                    lane.parity_bits
+                ));
+                out.push_str("        </BitLane>\n");
+            }
+            out.push_str("      </BusBlock>\n");
+            out.push_str("    </AddressSpace>\n");
+            out.push_str("  </Processor>\n");
+        }
+        out.push_str("</MemInfo>\n");
+        out
+    }
+
+    /// Parse a Vivado UG898 `.mmi` XML document.
+    pub fn from_xml(xml: &str) -> Result<Self, String> {
+        if !xml.contains("<MemInfo") {
+            return Err("mmi: missing <MemInfo root element".into());
+        }
+        let mut part = String::from("HL10T-C32-1");
+        let mut spaces = Vec::new();
+        let mut cur_proc = String::new();
+        let mut cur_space: Option<MmiAddressSpace> = None;
+        let mut cur_lane: Option<MmiBitLane> = None;
+
+        for raw in xml.lines() {
+            let line = raw.trim();
+            if line.starts_with("<MemInfo") {
+                if let Some(p) = xml_attr(line, "Part") {
+                    part = p.to_string();
+                }
+            } else if line.starts_with("<Processor") {
+                cur_proc = xml_attr(line, "InstPath").unwrap_or("cpu").to_string();
+            } else if line.starts_with("<AddressSpace") {
+                let name = xml_attr(line, "Name").unwrap_or("mem").to_string();
+                let addr_begin = parse_u64_num(xml_attr(line, "Begin").unwrap_or("0"))?;
+                let addr_end = parse_u64_num(xml_attr(line, "End").unwrap_or("0"))?;
+                let bus_width = xml_attr(line, "BusWidth")
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .unwrap_or(64);
+                cur_space = Some(MmiAddressSpace {
+                    name,
+                    proc_name: cur_proc.clone(),
+                    addr_begin,
+                    addr_end,
+                    bus_width,
+                    lanes: Vec::new(),
+                });
+            } else if line.starts_with("</AddressSpace>") {
+                if let Some(sp) = cur_space.take() {
+                    spaces.push(sp);
+                }
+            } else if line.starts_with("<BitLane") {
+                let cell_name = xml_attr(line, "Cell").unwrap_or("u_bram").to_string();
+                let placed_site = xml_attr(line, "Placement").unwrap_or("BRAM_X10Y1").to_string();
+                let bram_major = xml_attr(line, "BramMajor")
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .unwrap_or(0);
+                cur_lane = Some(MmiBitLane {
+                    cell_name,
+                    placed_site,
+                    bram_major,
+                    msb: 63,
+                    lsb: 0,
+                    addr_begin: 0,
+                    addr_end: 0,
+                    parity_bits: 0,
+                });
+            } else if line.starts_with("<DataWidth") {
+                if let Some(l) = cur_lane.as_mut() {
+                    if let Some(msb) = xml_attr(line, "MSB") {
+                        l.msb = msb.parse::<u8>().map_err(|e| format!("mmi MSB: {e}"))?;
+                    }
+                    if let Some(lsb) = xml_attr(line, "LSB") {
+                        l.lsb = lsb.parse::<u8>().map_err(|e| format!("mmi LSB: {e}"))?;
+                    }
+                }
+            } else if line.starts_with("<AddressRange") {
+                if let Some(l) = cur_lane.as_mut() {
+                    if let Some(b) = xml_attr(line, "Begin") {
+                        l.addr_begin = parse_u64_num(b)?;
+                    }
+                    if let Some(e) = xml_attr(line, "End") {
+                        l.addr_end = parse_u64_num(e)?;
+                    }
+                }
+            } else if line.starts_with("<Parity") {
+                if let Some(l) = cur_lane.as_mut() {
+                    if let Some(nb) = xml_attr(line, "NumBits") {
+                        l.parity_bits = nb.parse::<u8>().unwrap_or(0);
+                    }
+                }
+            } else if line.starts_with("</BitLane>") {
+                if let (Some(sp), Some(lane)) = (cur_space.as_mut(), cur_lane.take()) {
+                    sp.lanes.push(lane);
+                }
+            }
+        }
+        if spaces.is_empty() {
+            return Err("mmi: no <AddressSpace> found".into());
+        }
+        Ok(Self { part, spaces })
+    }
+
+    /// Emit a compact JSON `.mmi` document.
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        out.push_str("{\n");
+        out.push_str(&format!("  \"part\": \"{}\",\n", self.part));
+        out.push_str("  \"spaces\": [\n");
+        for (si, sp) in self.spaces.iter().enumerate() {
+            out.push_str("    {\n");
+            out.push_str(&format!("      \"name\": \"{}\",\n", sp.name));
+            out.push_str(&format!("      \"proc_name\": \"{}\",\n", sp.proc_name));
+            out.push_str(&format!("      \"addr_begin\": {},\n", sp.addr_begin));
+            out.push_str(&format!("      \"addr_end\": {},\n", sp.addr_end));
+            out.push_str(&format!("      \"bus_width\": {},\n", sp.bus_width));
+            out.push_str("      \"lanes\": [\n");
+            for (li, l) in sp.lanes.iter().enumerate() {
+                let comma = if li + 1 == sp.lanes.len() { "" } else { "," };
+                out.push_str(&format!(
+                    "        {{\"cell_name\":\"{}\",\"placed_site\":\"{}\",\"bram_major\":{},\"msb\":{},\"lsb\":{},\"addr_begin\":{},\"addr_end\":{},\"parity_bits\":{}}}{comma}\n",
+                    l.cell_name, l.placed_site, l.bram_major, l.msb, l.lsb, l.addr_begin, l.addr_end, l.parity_bits
+                ));
+            }
+            out.push_str("      ]\n");
+            let sp_comma = if si + 1 == self.spaces.len() { "" } else { "," };
+            out.push_str(&format!("    }}{sp_comma}\n"));
+        }
+        out.push_str("  ]\n}\n");
+        out
+    }
+
+    /// Parse a JSON `.mmi` document emitted by [`Self::to_json`].
+    pub fn from_json(json: &str) -> Result<Self, String> {
+        let mut part = String::from("HL10T-C32-1");
+        let mut spaces = Vec::new();
+        let mut cur_name = String::new();
+        let mut cur_proc = String::new();
+        let mut cur_begin = 0u64;
+        let mut cur_end = 0u64;
+        let mut cur_width = 64u8;
+        let mut cur_lanes: Vec<MmiBitLane> = Vec::new();
+        let mut in_space = false;
+
+        for raw in json.lines() {
+            let line = raw.trim().trim_end_matches(',');
+            if let Some(v) = json_str_field(line, "part") {
+                part = v.to_string();
+            } else if let Some(v) = json_str_field(line, "name") {
+                cur_name = v.to_string();
+                in_space = true;
+            } else if let Some(v) = json_str_field(line, "proc_name") {
+                cur_proc = v.to_string();
+            } else if let Some(v) = json_num_field(line, "addr_begin") {
+                if !line.contains("\"cell_name\"") {
+                    cur_begin = parse_u64_num(v)?;
+                }
+            } else if let Some(v) = json_num_field(line, "addr_end") {
+                if !line.contains("\"cell_name\"") {
+                    cur_end = parse_u64_num(v)?;
+                }
+            } else if let Some(v) = json_num_field(line, "bus_width") {
+                cur_width = v.parse::<u8>().unwrap_or(64);
+            }
+            if line.contains("\"cell_name\"") {
+                let cell_name = json_str_field(line, "cell_name")
+                    .ok_or("mmi json: missing cell_name")?
+                    .to_string();
+                let placed_site = json_str_field(line, "placed_site")
+                    .ok_or("mmi json: missing placed_site")?
+                    .to_string();
+                let bram_major = json_num_field(line, "bram_major")
+                    .ok_or("mmi json: missing bram_major")?
+                    .parse::<u16>()
+                    .map_err(|e| format!("mmi json bram_major: {e}"))?;
+                let msb = json_num_field(line, "msb")
+                    .ok_or("mmi json: missing msb")?
+                    .parse::<u8>()
+                    .map_err(|e| format!("mmi json msb: {e}"))?;
+                let lsb = json_num_field(line, "lsb")
+                    .ok_or("mmi json: missing lsb")?
+                    .parse::<u8>()
+                    .map_err(|e| format!("mmi json lsb: {e}"))?;
+                let addr_begin = parse_u64_num(
+                    json_num_field(line, "addr_begin").ok_or("mmi json: missing lane addr_begin")?,
+                )?;
+                let addr_end = parse_u64_num(
+                    json_num_field(line, "addr_end").ok_or("mmi json: missing lane addr_end")?,
+                )?;
+                let parity_bits = json_num_field(line, "parity_bits")
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .unwrap_or(0);
+                cur_lanes.push(MmiBitLane {
+                    cell_name,
+                    placed_site,
+                    bram_major,
+                    msb,
+                    lsb,
+                    addr_begin,
+                    addr_end,
+                    parity_bits,
+                });
+            } else if line == "]" && in_space {
+                spaces.push(MmiAddressSpace {
+                    name: std::mem::take(&mut cur_name),
+                    proc_name: std::mem::take(&mut cur_proc),
+                    addr_begin: cur_begin,
+                    addr_end: cur_end,
+                    bus_width: cur_width,
+                    lanes: std::mem::take(&mut cur_lanes),
+                });
+                in_space = false;
+            }
+        }
+        if spaces.is_empty() {
+            return Err("mmi json: no address spaces found".into());
+        }
+        Ok(Self { part, spaces })
+    }
+
+    /// Auto-detect and parse either `.mmi` XML or `.mmi` JSON.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let t = text.trim_start();
+        if t.starts_with('{') {
+            Self::from_json(t)
+        } else {
+            Self::from_xml(t)
+        }
+    }
+}
+
+fn xml_attr<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let pat = format!("{key}=\"");
+    let start = line.find(&pat)? + pat.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+fn json_str_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let pat = format!("\"{key}\":");
+    let start = line.find(&pat)? + pat.len();
+    let rest = line[start..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+fn json_num_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let pat = format!("\"{key}\":");
+    let start = line.find(&pat)? + pat.len();
+    let rest = line[start..].trim_start();
+    let end = rest
+        .find(|c: char| !c.is_ascii_hexdigit() && c != 'x' && c != 'X')
+        .unwrap_or(rest.len());
+    if end == 0 {
+        None
+    } else {
+        Some(&rest[..end])
+    }
+}
+
+fn parse_u64_num(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).map_err(|e| format!("bad hex {s}: {e}"))
+    } else {
+        t.parse::<u64>().map_err(|e| format!("bad int {s}: {e}"))
+    }
+}
+
+/// Contiguous loadable firmware segment extracted from an ELF (`PT_LOAD`) or `.mem` file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FirmwareSegment {
+    pub paddr: u64,
+    pub vaddr: u64,
+    pub data: Vec<u8>,
+}
+
+/// Parsed firmware image ready for `updatemem` BRAM frame splicing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FirmwareImage {
+    pub entry: u64,
+    pub is_64bit: bool,
+    pub machine: u16,
+    pub segments: Vec<FirmwareSegment>,
+}
+
+impl FirmwareImage {
+    pub fn total_bytes(&self) -> usize {
+        self.segments.iter().map(|s| s.data.len()).sum()
+    }
+}
+
+/// Parse a little-endian ELF32 or ELF64 binary image and extract all `PT_LOAD` (`p_type == 1`) segments.
+pub fn load_elf_firmware(bytes: &[u8]) -> Result<FirmwareImage, String> {
+    if bytes.len() < 52 || &bytes[0..4] != b"\x7fELF" {
+        return Err("updatemem: not an ELF binary (missing \\x7fELF magic)".into());
+    }
+    let ei_class = bytes[4];
+    let ei_data = bytes[5];
+    if ei_data != 1 {
+        return Err(format!(
+            "updatemem: unsupported ELF endianness {ei_data} (expected little-endian 1)"
+        ));
+    }
+    let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+    match ei_class {
+        1 => {
+            // ELF32
+            let entry = u32::from_le_bytes(bytes[24..28].try_into().unwrap()) as u64;
+            let phoff = u32::from_le_bytes(bytes[28..32].try_into().unwrap()) as usize;
+            let phentsize = u16::from_le_bytes([bytes[42], bytes[43]]) as usize;
+            let phnum = u16::from_le_bytes([bytes[44], bytes[45]]) as usize;
+            if phentsize < 32 {
+                return Err(format!("updatemem: invalid ELF32 phentsize {phentsize}"));
+            }
+            let mut segments = Vec::new();
+            for i in 0..phnum {
+                let off = phoff
+                    .checked_add(i.checked_mul(phentsize).ok_or("ELF32 phdr overflow")?)
+                    .ok_or("ELF32 phdr offset overflow")?;
+                let ph = bytes
+                    .get(off..off + 32)
+                    .ok_or_else(|| "updatemem: truncated ELF32 program header".to_string())?;
+                let p_type = u32::from_le_bytes(ph[0..4].try_into().unwrap());
+                if p_type != 1 {
+                    continue; // Only PT_LOAD (1)
+                }
+                let p_offset = u32::from_le_bytes(ph[4..8].try_into().unwrap()) as usize;
+                let p_vaddr = u32::from_le_bytes(ph[8..12].try_into().unwrap()) as u64;
+                let p_paddr = u32::from_le_bytes(ph[12..16].try_into().unwrap()) as u64;
+                let p_filesz = u32::from_le_bytes(ph[16..20].try_into().unwrap()) as usize;
+                let p_memsz = u32::from_le_bytes(ph[20..24].try_into().unwrap()) as usize;
+                if p_memsz == 0 && p_filesz == 0 {
+                    continue;
+                }
+                let file_slice = bytes
+                    .get(p_offset..p_offset.saturating_add(p_filesz))
+                    .ok_or_else(|| "updatemem: truncated ELF32 PT_LOAD segment data".to_string())?;
+                let mut data = Vec::with_capacity(p_memsz.max(p_filesz));
+                data.extend_from_slice(file_slice);
+                if p_memsz > data.len() {
+                    data.resize(p_memsz, 0);
+                }
+                segments.push(FirmwareSegment {
+                    paddr: p_paddr,
+                    vaddr: p_vaddr,
+                    data,
+                });
+            }
+            Ok(FirmwareImage {
+                entry,
+                is_64bit: false,
+                machine,
+                segments,
+            })
+        }
+        2 => {
+            // ELF64
+            if bytes.len() < 64 {
+                return Err("updatemem: truncated ELF64 header".into());
+            }
+            let entry = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+            let phoff = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
+            let phentsize = u16::from_le_bytes([bytes[54], bytes[55]]) as usize;
+            let phnum = u16::from_le_bytes([bytes[56], bytes[57]]) as usize;
+            if phentsize < 56 {
+                return Err(format!("updatemem: invalid ELF64 phentsize {phentsize}"));
+            }
+            let mut segments = Vec::new();
+            for i in 0..phnum {
+                let off = phoff
+                    .checked_add(i.checked_mul(phentsize).ok_or("ELF64 phdr overflow")?)
+                    .ok_or("ELF64 phdr offset overflow")?;
+                let ph = bytes
+                    .get(off..off + 56)
+                    .ok_or_else(|| "updatemem: truncated ELF64 program header".to_string())?;
+                let p_type = u32::from_le_bytes(ph[0..4].try_into().unwrap());
+                if p_type != 1 {
+                    continue; // Only PT_LOAD (1)
+                }
+                let p_offset = u64::from_le_bytes(ph[8..16].try_into().unwrap()) as usize;
+                let p_vaddr = u64::from_le_bytes(ph[16..24].try_into().unwrap());
+                let p_paddr = u64::from_le_bytes(ph[24..32].try_into().unwrap());
+                let p_filesz = u64::from_le_bytes(ph[32..40].try_into().unwrap()) as usize;
+                let p_memsz = u64::from_le_bytes(ph[40..48].try_into().unwrap()) as usize;
+                if p_memsz == 0 && p_filesz == 0 {
+                    continue;
+                }
+                let file_slice = bytes
+                    .get(p_offset..p_offset.saturating_add(p_filesz))
+                    .ok_or_else(|| "updatemem: truncated ELF64 PT_LOAD segment data".to_string())?;
+                let mut data = Vec::with_capacity(p_memsz.max(p_filesz));
+                data.extend_from_slice(file_slice);
+                if p_memsz > data.len() {
+                    data.resize(p_memsz, 0);
+                }
+                segments.push(FirmwareSegment {
+                    paddr: p_paddr,
+                    vaddr: p_vaddr,
+                    data,
+                });
+            }
+            Ok(FirmwareImage {
+                entry,
+                is_64bit: true,
+                machine,
+                segments,
+            })
+        }
+        other => Err(format!("updatemem: unsupported ELF class {other}")),
+    }
+}
+
+/// Build a valid RISC-V (`EM_RISCV = 243`) little-endian ELF32 executable with one `PT_LOAD` segment.
+pub fn build_minimal_elf32(entry: u32, load_addr: u32, payload: &[u8]) -> Vec<u8> {
+    let hdr_size = 52u32;
+    let phdr_size = 32u32;
+    let data_off = hdr_size + phdr_size;
+    let filesz = payload.len() as u32;
+    let mut out = Vec::with_capacity((data_off + filesz) as usize);
+    out.extend_from_slice(b"\x7fELF");
+    out.push(1); // EI_CLASS = ELFCLASS32
+    out.push(1); // EI_DATA = ELFDATA2LSB
+    out.push(1); // EI_VERSION
+    out.resize(16, 0);
+    out.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+    out.extend_from_slice(&243u16.to_le_bytes()); // e_machine = EM_RISCV
+    out.extend_from_slice(&1u32.to_le_bytes()); // e_version
+    out.extend_from_slice(&entry.to_le_bytes()); // e_entry
+    out.extend_from_slice(&hdr_size.to_le_bytes()); // e_phoff = 52
+    out.extend_from_slice(&0u32.to_le_bytes()); // e_shoff = 0
+    out.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    out.extend_from_slice(&(hdr_size as u16).to_le_bytes()); // e_ehsize = 52
+    out.extend_from_slice(&(phdr_size as u16).to_le_bytes()); // e_phentsize = 32
+    out.extend_from_slice(&1u16.to_le_bytes()); // e_phnum = 1
+    out.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
+    out.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+    out.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+
+    // Program header (PT_LOAD = 1)
+    out.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+    out.extend_from_slice(&data_off.to_le_bytes()); // p_offset
+    out.extend_from_slice(&load_addr.to_le_bytes()); // p_vaddr
+    out.extend_from_slice(&load_addr.to_le_bytes()); // p_paddr
+    out.extend_from_slice(&filesz.to_le_bytes()); // p_filesz
+    out.extend_from_slice(&filesz.to_le_bytes()); // p_memsz
+    out.extend_from_slice(&5u32.to_le_bytes()); // p_flags = PF_R | PF_X
+    out.extend_from_slice(&4u32.to_le_bytes()); // p_align = 4
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Build a valid RISC-V (`EM_RISCV = 243`) little-endian ELF64 executable with one `PT_LOAD` segment.
+pub fn build_minimal_elf64(entry: u64, load_addr: u64, payload: &[u8]) -> Vec<u8> {
+    let hdr_size = 64u64;
+    let phdr_size = 56u64;
+    let data_off = hdr_size + phdr_size;
+    let filesz = payload.len() as u64;
+    let mut out = Vec::with_capacity((data_off + filesz) as usize);
+    out.extend_from_slice(b"\x7fELF");
+    out.push(2); // EI_CLASS = ELFCLASS64
+    out.push(1); // EI_DATA = ELFDATA2LSB
+    out.push(1); // EI_VERSION
+    out.resize(16, 0);
+    out.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+    out.extend_from_slice(&243u16.to_le_bytes()); // e_machine = EM_RISCV
+    out.extend_from_slice(&1u32.to_le_bytes()); // e_version
+    out.extend_from_slice(&entry.to_le_bytes()); // e_entry
+    out.extend_from_slice(&hdr_size.to_le_bytes()); // e_phoff = 64
+    out.extend_from_slice(&0u64.to_le_bytes()); // e_shoff = 0
+    out.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    out.extend_from_slice(&(hdr_size as u16).to_le_bytes()); // e_ehsize = 64
+    out.extend_from_slice(&(phdr_size as u16).to_le_bytes()); // e_phentsize = 56
+    out.extend_from_slice(&1u16.to_le_bytes()); // e_phnum = 1
+    out.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
+    out.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+    out.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+
+    // ELF64 Program Header (PT_LOAD = 1)
+    out.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+    out.extend_from_slice(&5u32.to_le_bytes()); // p_flags = PF_R | PF_X
+    out.extend_from_slice(&data_off.to_le_bytes()); // p_offset
+    out.extend_from_slice(&load_addr.to_le_bytes()); // p_vaddr
+    out.extend_from_slice(&load_addr.to_le_bytes()); // p_paddr
+    out.extend_from_slice(&filesz.to_le_bytes()); // p_filesz
+    out.extend_from_slice(&filesz.to_le_bytes()); // p_memsz
+    out.extend_from_slice(&8u64.to_le_bytes()); // p_align = 8
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Parse a Vivado / Verilog `$readmemh` `.mem` hex firmware file into a [`FirmwareImage`].
+///
+/// Supports `@HEXADDR` origin directives, `//` line comments, and 8/16/32/64-bit hex tokens.
+/// When `bytes_per_token == 0`, token byte width is inferred from token hex length (`<=2`->1B, `<=4`->2B, `<=8`->4B, else 8B).
+pub fn load_mem_firmware(
+    text: &str,
+    default_base_addr: u64,
+    bytes_per_token: usize,
+) -> Result<FirmwareImage, String> {
+    let mut segments: Vec<FirmwareSegment> = Vec::new();
+    let mut cur_addr = default_base_addr;
+    let mut cur_data: Vec<u8> = Vec::new();
+    let mut seg_start = default_base_addr;
+
+    for raw in text.lines() {
+        let line = raw.split("//").next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        for tok in line.split_whitespace() {
+            if let Some(addr_hex) = tok.strip_prefix('@') {
+                if !cur_data.is_empty() {
+                    segments.push(FirmwareSegment {
+                        paddr: seg_start,
+                        vaddr: seg_start,
+                        data: std::mem::take(&mut cur_data),
+                    });
+                }
+                let addr = u64::from_str_radix(addr_hex.trim_start_matches("0x"), 16)
+                    .map_err(|e| format!("updatemem .mem bad @address '{tok}': {e}"))?;
+                cur_addr = addr;
+                seg_start = addr;
+                continue;
+            }
+            let clean = tok
+                .strip_prefix("0x")
+                .or_else(|| tok.strip_prefix("0X"))
+                .unwrap_or(tok)
+                .replace('_', "");
+            let val = u64::from_str_radix(&clean, 16)
+                .map_err(|e| format!("updatemem .mem bad hex token '{tok}': {e}"))?;
+            let width = if bytes_per_token > 0 {
+                bytes_per_token
+            } else if clean.len() <= 2 {
+                1
+            } else if clean.len() <= 4 {
+                2
+            } else if clean.len() <= 8 {
+                4
+            } else {
+                8
+            };
+            let le = val.to_le_bytes();
+            cur_data.extend_from_slice(&le[..width.min(8)]);
+            cur_addr += width as u64;
+        }
+    }
+    if !cur_data.is_empty() {
+        segments.push(FirmwareSegment {
+            paddr: seg_start,
+            vaddr: seg_start,
+            data: cur_data,
+        });
+    }
+    if segments.is_empty() {
+        return Err("updatemem: .mem file contained no hex payload".into());
+    }
+    let entry = segments[0].paddr;
+    Ok(FirmwareImage {
+        entry,
+        is_64bit: false,
+        machine: 243,
+        segments,
+    })
+}
+
+/// Read back a 64-bit BRAM INIT word (`word_idx` in `0..255`) from `Far::BRAM` major `bram_major`.
+pub fn readback_bram_word(bits: &Bitstream, bram_major: u16, word_idx: u8) -> u64 {
+    let minor = 1u8.saturating_add(word_idx);
+    bits.frames
+        .get(&(Far::BRAM, bram_major, minor))
+        .copied()
+        .unwrap_or(0) as u64
+}
+
+/// Vivado UG898 `updatemem`: sub-10ms ELF/MEM-to-BRAM bitstream firmware splicer.
+///
+/// Maps `image` (`PT_LOAD` ELF segments or `.mem` segments) across the bit-lanes and
+/// address ranges of `mmi` (matching `space_name`, `proc_name`, or the default space when
+/// `space_name` is empty), patches `Far::BRAM` INIT frames in `bits` in-place, and
+/// re-encodes `bits.packets` without re-running synthesis, placement, or routing.
+/// Returns the number of modified/populated BRAM INIT frames.
+pub fn updatemem(
+    dev: &Device,
+    bits: &mut Bitstream,
+    mmi: &MemoryMapInfo,
+    space_name: &str,
+    image: &FirmwareImage,
+) -> Result<usize, String> {
+    if bits.idcode != dev.idcode {
+        return Err(format!(
+            "updatemem: idcode mismatch bitstream {:#010x} device {:#010x}",
+            bits.idcode, dev.idcode
+        ));
+    }
+    let space = if space_name.is_empty() {
+        mmi.spaces.first()
+    } else {
+        mmi.spaces
+            .iter()
+            .find(|s| s.name == space_name || s.proc_name == space_name)
+    }
+    .ok_or_else(|| format!("updatemem: address space '{space_name}' not found in .mmi"))?;
+
+    if space.lanes.is_empty() {
+        return Err(format!(
+            "updatemem: address space '{}' has no BRAM BitLanes",
+            space.name
+        ));
+    }
+
+    let bus_bytes = (space.bus_width.max(8) as u64) / 8;
+    let mut touched_frames: std::collections::BTreeSet<(u8, u16, u8)> =
+        std::collections::BTreeSet::new();
+
+    for seg in &image.segments {
+        if seg.data.is_empty() {
+            continue;
+        }
+        let seg_end = seg
+            .paddr
+            .checked_add(seg.data.len() as u64 - 1)
+            .ok_or("updatemem: segment address overflow")?;
+        if seg.paddr < space.addr_begin || seg_end > space.addr_end {
+            return Err(format!(
+                "updatemem: segment [{:#010x}..={:#010x}] out of bounds for address space '{}' [{:#010x}..={:#010x}]",
+                seg.paddr, seg_end, space.name, space.addr_begin, space.addr_end
+            ));
+        }
+
+        for (byte_idx, &byte_val) in seg.data.iter().enumerate() {
+            let byte_addr = seg.paddr + byte_idx as u64;
+            let bus_bit_lo = ((byte_addr - space.addr_begin) % bus_bytes) as u8 * 8;
+            let bus_bit_hi = bus_bit_lo + 7;
+
+            for lane in &space.lanes {
+                if byte_addr < lane.addr_begin || byte_addr > lane.addr_end {
+                    continue;
+                }
+                if lane.msb < bus_bit_lo || lane.lsb > bus_bit_hi {
+                    continue;
+                }
+                // Ensure BRAM USED frame (minor 0) is present for this BRAM major.
+                let used_key = (Far::BRAM, lane.bram_major, 0);
+                bits.frames.entry(used_key).or_insert_with(|| {
+                    let (sx, sy) = helion_device::Site::parse_id(&lane.placed_site)
+                        .map(|s| (s.x, s.y))
+                        .unwrap_or((dev.bram_x, dev.bram_y0 + u32::from(lane.bram_major) * 2));
+                    1u128 | ((sx as u128) << 8) | ((sy as u128) << 16)
+                });
+
+                // Compute bit overlap between this byte [bus_bit_lo..=bus_bit_hi] and lane [lane.lsb..=lane.msb].
+                let ov_lo = bus_bit_lo.max(lane.lsb);
+                let ov_hi = bus_bit_hi.min(lane.msb);
+                let n_bits = ov_hi - ov_lo + 1;
+                let mask = if n_bits >= 8 {
+                    0xFFu64
+                } else {
+                    (1u64 << n_bits) - 1
+                };
+                let extracted = ((byte_val as u64) >> (ov_lo - bus_bit_lo)) & mask;
+
+                let lane_width_bits = u64::from(lane.bit_width());
+                let bus_word_idx = (byte_addr - lane.addr_begin) / bus_bytes;
+                let lane_bit_offset = bus_word_idx * lane_width_bits + u64::from(ov_lo - lane.lsb);
+                let bram_word_idx = (lane_bit_offset / 64) as u8;
+                let bit_in_word = (lane_bit_offset % 64) as u32;
+
+                let minor = 1u8
+                    .checked_add(bram_word_idx)
+                    .ok_or("updatemem: BRAM word index overflow (>254)")?;
+                let frame_key = (Far::BRAM, lane.bram_major, minor);
+                let cur = bits.frames.get(&frame_key).copied().unwrap_or(0) as u64;
+                let updated = (cur & !(mask << bit_in_word)) | (extracted << bit_in_word);
+                if updated == 0 {
+                    bits.frames.remove(&frame_key);
+                } else {
+                    bits.frames.insert(frame_key, updated as u128);
+                }
+                touched_frames.insert(frame_key);
+            }
+        }
+    }
+
+    bits.packets = encode_packets(bits.idcode, &bits.frames);
+    Ok(touched_frames.len())
+}
+
 fn sha256_lite(data: &[u8]) -> [u8; 32] {
     // 0.1 header hash: CRC32C repeated; not cryptographic. Field is 32 bytes.
     let c = crc32c(data);
@@ -1950,5 +2769,144 @@ mod tests {
         let iob = r.iob_src[0].iob;
         let iob_ble = reroute_probe_eco(&dev, &mut bs, (site.x, site.y, 3), (iob.0, iob.1, 0)).unwrap();
         assert_eq!(iob_ble, 3);
+    }
+
+    #[test]
+    fn mmi_xml_and_json_roundtrip_and_from_routed() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_blinky();
+        d.add_cell("u_bram0", CellKind::Bram18);
+        d.add_cell("u_bram1", CellKind::Bram18);
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+
+        let mmi = MemoryMapInfo::from_routed(&dev, &r, "u_rv32_hb1", "imem", 0x0000_0000);
+        assert_eq!(mmi.spaces.len(), 1);
+        assert_eq!(mmi.spaces[0].lanes.len(), 2);
+        assert_eq!(mmi.spaces[0].addr_begin, 0);
+        assert_eq!(mmi.spaces[0].addr_end, 1023);
+
+        let xml = mmi.to_xml();
+        assert!(xml.contains("<MemInfo"));
+        assert!(xml.contains("<BitLane"));
+        let from_xml = MemoryMapInfo::parse(&xml).unwrap();
+        assert_eq!(from_xml, mmi);
+
+        let json = mmi.to_json();
+        let from_json = MemoryMapInfo::parse(&json).unwrap();
+        assert_eq!(from_json, mmi);
+    }
+
+    #[test]
+    fn updatemem_splices_elf32_elf64_and_mem_in_sub_10ms() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_blinky();
+        d.add_cell("u_bram0", CellKind::Bram18);
+        d.add_cell("u_bram1", CellKind::Bram18);
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        let mut bs = bitgen(&dev, &r).unwrap();
+        let clb_frames_before: BTreeMap<_, _> = bs
+            .frames
+            .iter()
+            .filter(|((b, _, _), _)| *b != Far::BRAM)
+            .map(|(k, v)| (*k, *v))
+            .collect();
+
+        let mmi = MemoryMapInfo::from_routed(&dev, &r, "u_rv32_hb1", "imem", 0x0000_0000);
+
+        // 1. ELF32 PT_LOAD firmware splice (< 10 ms)
+        let mut code = Vec::new();
+        code.extend_from_slice(&0x0000_0513u32.to_le_bytes()); // li a0, 0
+        code.extend_from_slice(&0x0015_0513u32.to_le_bytes()); // addi a0, a0, 1
+        code.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        code.extend_from_slice(&0xCAFE_BABEu32.to_le_bytes());
+        let elf32_bytes = build_minimal_elf32(0x0000_0000, 0x0000_0000, &code);
+        let fw32 = load_elf_firmware(&elf32_bytes).unwrap();
+        assert!(!fw32.is_64bit);
+        assert_eq!(fw32.total_bytes(), 16);
+
+        let t0 = std::time::Instant::now();
+        let patched_frames = updatemem(&dev, &mut bs, &mmi, "imem", &fw32).unwrap();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed.as_millis() < 10,
+            "updatemem must complete in < 10 ms, took {elapsed:?}"
+        );
+        assert_eq!(patched_frames, 2);
+        assert_eq!(
+            readback_bram_word(&bs, 0, 0),
+            0x0015_0513_0000_0513u64,
+            "word 0 must carry first two RV32 instructions"
+        );
+        assert_eq!(
+            readback_bram_word(&bs, 0, 1),
+            0xCAFE_BABE_DEAD_BEEFu64,
+            "word 1 must carry next 64 bits"
+        );
+
+        // Non-BRAM CLB/IOB frames must be 100% untouched by updatemem!
+        let clb_frames_after: BTreeMap<_, _> = bs
+            .frames
+            .iter()
+            .filter(|((b, _, _), _)| *b != Far::BRAM)
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        assert_eq!(clb_frames_before, clb_frames_after);
+
+        // 2. ELF64 PT_LOAD firmware splice into second BRAM (addr 0x200 = 512)
+        let elf64_bytes =
+            build_minimal_elf64(0x0000_0200, 0x0000_0200, &0x1122_3344_5566_7788u64.to_le_bytes());
+        let fw64 = load_elf_firmware(&elf64_bytes).unwrap();
+        assert!(fw64.is_64bit);
+        updatemem(&dev, &mut bs, &mmi, "imem", &fw64).unwrap();
+        assert_eq!(readback_bram_word(&bs, 1, 0), 0x1122_3344_5566_7788u64);
+
+        // 3. Verilog .mem hex firmware loader + multi-lane bit slicing (32-bit low/high split lanes)
+        let mem_text = "// Firmware image\n@0000\nA5A55A5A 12345678\n@0008\nF00DCAFE 89ABCDEF\n";
+        let fw_mem = load_mem_firmware(mem_text, 0, 4).unwrap();
+        let split_mmi = MemoryMapInfo {
+            part: dev.part.clone(),
+            spaces: vec![MmiAddressSpace {
+                name: "split_bus".into(),
+                proc_name: "u_rv32_hb1".into(),
+                addr_begin: 0,
+                addr_end: 511,
+                bus_width: 64,
+                lanes: vec![
+                    MmiBitLane {
+                        cell_name: "u_bram_lo".into(),
+                        placed_site: "BRAM_X10Y1".into(),
+                        bram_major: 0,
+                        msb: 31,
+                        lsb: 0,
+                        addr_begin: 0,
+                        addr_end: 511,
+                        parity_bits: 0,
+                    },
+                    MmiBitLane {
+                        cell_name: "u_bram_hi".into(),
+                        placed_site: "BRAM_X10Y3".into(),
+                        bram_major: 1,
+                        msb: 63,
+                        lsb: 32,
+                        addr_begin: 0,
+                        addr_end: 511,
+                        parity_bits: 0,
+                    },
+                ],
+            }],
+        };
+        updatemem(&dev, &mut bs, &split_mmi, "split_bus", &fw_mem).unwrap();
+        // Low 32-bit lane (major 0) packs the two low 32-bit words (0xA5A55A5A and 0xF00DCAFE) into word 0!
+        assert_eq!(readback_bram_word(&bs, 0, 0), 0xF00D_CAFE_A5A5_5A5Au64);
+        // High 32-bit lane (major 1) packs the two high 32-bit words (0x12345678 and 0x89ABCDEF) into word 0!
+        assert_eq!(readback_bram_word(&bs, 1, 0), 0x89AB_CDEF_1234_5678u64);
+
+        // Decoded .hbits packet stream must preserve the spliced BRAM frames.
+        let (_, decoded) = decode_packets(&bs.packets).unwrap();
+        assert_eq!(decoded, bs.frames);
     }
 }
