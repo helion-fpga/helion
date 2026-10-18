@@ -952,14 +952,41 @@ fn truncate_str(s: &str, n: usize) -> String {
 /// Two sections, not one: power and DRC are not timing analysis.
 pub fn paint_timing_catalog(ui: &mut egui::Ui, app: &mut HelionIde) {
     let theme = app.theme;
+    let cache_id = egui::Id::new("timing_catalog_rows_cache");
+    let cache_key: (usize, usize, usize, Option<i64>, usize, bool) = (
+        app.model.tree.cells.len(),
+        app.model.tree.nets.len(),
+        app.model.timing_paths.len(),
+        app.model.wns_ps(),
+        app.model.drc.as_ref().map(|d| d.violations.len()).unwrap_or(0),
+        app.model.vcd_activity.is_some(),
+    );
+    type CatRow = (String, Option<String>, egui::Color32, WorkspaceTab);
+    let (clk_rows, qual_rows): (Vec<CatRow>, Vec<CatRow>) = ui
+        .ctx()
+        .data_mut(|d| {
+            d.get_temp::<(
+                (usize, usize, usize, Option<i64>, usize, bool),
+                Vec<CatRow>,
+                Vec<CatRow>,
+            )>(cache_id)
+        })
+        .filter(|(k, _, _)| *k == cache_key)
+        .map(|(_, c, q)| (c, q))
+        .unwrap_or_else(|| {
+            let c = timing_clock_rows(&app.model, &theme);
+            let q = timing_quality_rows(&app.model, &theme);
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(cache_id, (cache_key, c.clone(), q.clone())));
+            (c, q)
+        });
     ui.label(
         egui::RichText::new("TIMING ANALYSIS")
             .small()
             .color(theme.faint),
     );
     ui.add_space(4.0);
-    let rows = timing_clock_rows(&app.model, &theme);
-    for (label, badge, dot, tab) in rows {
+    for (label, badge, dot, tab) in clk_rows {
         if catalog_row(ui, &theme, &label, badge.as_deref(), dot) {
             open_more_workspace(app, tab);
         }
@@ -971,8 +998,7 @@ pub fn paint_timing_catalog(ui: &mut egui::Ui, app: &mut HelionIde) {
             .color(theme.faint),
     );
     ui.add_space(4.0);
-    let rows = timing_quality_rows(&app.model, &theme);
-    for (label, badge, dot, tab) in rows {
+    for (label, badge, dot, tab) in qual_rows {
         if catalog_row(ui, &theme, &label, badge.as_deref(), dot) {
             open_more_workspace(app, tab);
         }

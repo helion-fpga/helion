@@ -648,7 +648,11 @@ impl Scan<'_> {
         let from = self.i;
         while self.i < self.b.len() {
             let c = self.b[self.i];
-            if is_word_byte(c) || c.is_ascii_digit() || matches!(c, b'"' | b'\'' | b'`' | b'{') {
+            if is_word_byte(c)
+                || c.is_ascii_digit()
+                || matches!(c, b'"' | b'\'' | b'`')
+                || (c == b'{' && self.lang == Lang::Tcl)
+            {
                 break;
             }
             let (d0, d1) = (c, self.peek(1));
@@ -660,6 +664,9 @@ impl Scan<'_> {
             if c == b'}' && self.lang == Lang::Tcl {
                 break;
             }
+            self.i += 1;
+        }
+        if self.i == from {
             self.i += 1;
         }
         self.push(from, self.i, self.plain, false);

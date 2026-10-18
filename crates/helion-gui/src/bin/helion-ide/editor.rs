@@ -679,9 +679,11 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
         } else {
             (rem_for_editor - GUTTER_W).max(120.0)
         };
-        let scroll_resp = ui.allocate_ui(egui::vec2(text_w, avail.y), |ui| {
-            paint_editor_text(ui, app, theme, lang, n_lines, wrap)
-        });
+        let scroll_resp = ui.allocate_ui_with_layout(
+            egui::vec2(text_w, avail.y),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| paint_editor_text(ui, app, theme, lang, n_lines, wrap),
+        );
         let mini_resp = if show_minimap {
             Some(ui.allocate_exact_size(
                 egui::vec2(MINIMAP_W, avail.y),
@@ -712,15 +714,17 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
                                     .color(theme.faint),
                             );
                             ui.add_space(4.0);
-                            egui::ScrollArea::vertical()
-                                .id_salt("editor_symbol_outline")
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    ui.vertical(|ui| {
-                                        if symbols.is_empty() {
-                                            ui.label(RichText::new("No symbols parsed.").small().color(theme.faint));
-                                        }
-                                        for sym in symbols.iter() {
+                            if symbols.is_empty() {
+                                ui.label(RichText::new("No symbols parsed.").small().color(theme.faint));
+                            } else {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                egui::ScrollArea::vertical()
+                                    .id_salt("editor_symbol_outline")
+                                    .auto_shrink([false, false])
+                                    .show_rows(ui, 22.0, symbols.len(), |ui, sym_range| {
+                                        let row_w = ui.available_width().max(80.0);
+                                        for idx in sym_range {
+                                            let Some(sym) = symbols.get(idx) else { continue };
                                             let on = cursor == sym.line;
                                             let badge_col = match sym.kind {
                                                 "MOD" => theme.accent,
@@ -730,41 +734,57 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
                                                 _ => theme.violet,
                                             };
                                             let (rrect, rresp) = ui.allocate_exact_size(
-                                                egui::vec2(ui.available_width(), 22.0),
+                                                egui::vec2(row_w, 22.0),
                                                 egui::Sense::click(),
                                             );
-                                            if on {
-                                                ui.painter().rect_filled(rrect, 3.0, theme.sel);
-                                            } else if rresp.hovered() {
-                                                ui.painter().rect_filled(rrect, 3.0, theme.surface_hover);
+                                            if ui.is_rect_visible(rrect) {
+                                                let p = ui.painter();
+                                                if on {
+                                                    p.rect_filled(rrect, 3.0, theme.sel);
+                                                } else if rresp.hovered() {
+                                                    p.rect_filled(rrect, 3.0, theme.surface_hover);
+                                                }
+                                                p.text(
+                                                    egui::pos2(rrect.left() + 4.0, rrect.center().y),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    sym.kind,
+                                                    theme::font_code(9.5),
+                                                    badge_col,
+                                                );
+                                                let ltxt = format!(":{}", sym.line);
+                                                let lgalley = p.layout_no_wrap(
+                                                    ltxt,
+                                                    theme::font_code(9.5),
+                                                    theme.faint,
+                                                );
+                                                let lw = lgalley.size().x;
+                                                let lx = (rrect.right() - 4.0 - lw).max(rrect.left() + 64.0);
+                                                p.galley(
+                                                    egui::pos2(lx, rrect.center().y - lgalley.size().y * 0.5),
+                                                    lgalley,
+                                                    theme.faint,
+                                                );
+                                                let name_clip = egui::Rect::from_min_max(
+                                                    egui::pos2(rrect.left() + 34.0, rrect.top()),
+                                                    egui::pos2((lx - 4.0).max(rrect.left() + 48.0), rrect.bottom()),
+                                                );
+                                                let ngalley = p.layout_no_wrap(
+                                                    sym.name.clone(),
+                                                    theme::font_code(11.0),
+                                                    if on { theme.text } else { theme.dim },
+                                                );
+                                                p.with_clip_rect(name_clip).galley(
+                                                    egui::pos2(rrect.left() + 36.0, rrect.center().y - ngalley.size().y * 0.5),
+                                                    ngalley,
+                                                    if on { theme.text } else { theme.dim },
+                                                );
                                             }
-                                            ui.painter().text(
-                                                egui::pos2(rrect.left() + 4.0, rrect.center().y),
-                                                egui::Align2::LEFT_CENTER,
-                                                sym.kind,
-                                                theme::font_code(9.5),
-                                                badge_col,
-                                            );
-                                            ui.painter().text(
-                                                egui::pos2(rrect.left() + 36.0, rrect.center().y),
-                                                egui::Align2::LEFT_CENTER,
-                                                &sym.name,
-                                                theme::font_code(11.5),
-                                                if on { theme.text } else { theme.dim },
-                                            );
-                                            ui.painter().text(
-                                                egui::pos2(rrect.right() - 4.0, rrect.center().y),
-                                                egui::Align2::RIGHT_CENTER,
-                                                format!(":{}", sym.line),
-                                                theme::font_code(10.0),
-                                                theme.faint,
-                                            );
-                                            if rresp.clicked() {
+                                            if rresp.on_hover_text(format!("{} {} (line {})", sym.kind, sym.name, sym.line)).clicked() {
                                                 jump_to_symbol = Some(sym.line);
                                             }
                                         }
                                     });
-                                });
+                            }
                         });
                 },
             );
@@ -825,41 +845,61 @@ fn paint_editor_text(
     }
     if n_lines > 800 {
         app.editor_line_rows.clear();
-        let spans_id = egui::Id::new("editor_line_spans_cache");
+        let spans_id = egui::Id::new("editor_line_spans_cache_v2");
         let skey = (app.editor_path.clone(), app.editor_text.len());
-        let spans: Arc<Vec<(usize, usize)>> = ui
+        let (spans, max_cols): (Arc<Vec<(usize, usize, bool)>>, usize) = ui
             .ctx()
-            .data_mut(|d| d.get_temp::<(Option<PathBuf>, usize, Arc<Vec<(usize, usize)>>)>(spans_id))
-            .filter(|(p, len, _)| p == &skey.0 && *len == skey.1)
-            .map(|(_, _, s)| s)
+            .data_mut(|d| {
+                d.get_temp::<(Option<PathBuf>, usize, Arc<Vec<(usize, usize, bool)>>, usize)>(spans_id)
+            })
+            .filter(|(p, len, _, _)| p == &skey.0 && *len == skey.1)
+            .map(|(_, _, s, mc)| (s, mc))
             .unwrap_or_else(|| {
                 let mut v = Vec::with_capacity(n_lines);
                 let mut start = 0usize;
-                for (idx, b) in app.editor_text.bytes().enumerate() {
+                let mut in_blk = false;
+                let mut max_c = 80usize;
+                let bytes = app.editor_text.as_bytes();
+                for (idx, &b) in bytes.iter().enumerate() {
                     if b == b'\n' {
-                        v.push((start, idx));
+                        let line_s = app.editor_text.get(start..idx).unwrap_or("");
+                        max_c = max_c.max(line_s.len());
+                        v.push((start, idx, in_blk));
+                        if lang == highlight::Lang::SystemVerilog {
+                            in_blk = block_state_after(line_s, in_blk);
+                        }
                         start = idx + 1;
                     }
                 }
                 if start <= app.editor_text.len() {
-                    v.push((start, app.editor_text.len()));
+                    let line_s = app.editor_text.get(start..app.editor_text.len()).unwrap_or("");
+                    max_c = max_c.max(line_s.len());
+                    v.push((start, app.editor_text.len(), in_blk));
                 }
                 let arc = Arc::new(v);
-                ui.ctx().data_mut(|d| d.insert_temp(spans_id, (skey.0, skey.1, arc.clone())));
-                arc
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(spans_id, (skey.0, skey.1, arc.clone(), max_c)));
+                (arc, max_c)
             });
-        let viewport_w = ui.available_width().max(640.0);
+        let viewport_w = ui.available_width().max(480.0);
+        let row_w = if wrap {
+            viewport_w
+        } else {
+            (max_cols as f32 * 7.8 + 32.0).max(viewport_w)
+        };
         let selected_line = app.model.selected_source_line;
         let mut clicked_line: Option<usize> = None;
+        ui.spacing_mut().item_spacing.y = 0.0;
         let out = scroll.show_rows(ui, ROW_H, spans.len(), |ui, row_range| {
-            ui.set_min_width(viewport_w);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.set_min_width(row_w);
             for row_idx in row_range {
-                let (s, e) = spans.get(row_idx).copied().unwrap_or((0, 0));
+                let (s, e, starts_in_blk) = spans.get(row_idx).copied().unwrap_or((0, 0, false));
                 let line_str = app.editor_text.get(s..e).unwrap_or("");
                 let line_no = row_idx + 1;
                 let is_sel = selected_line == Some(line_no);
                 let (rect, resp) = ui.allocate_exact_size(
-                    egui::vec2(viewport_w, ROW_H),
+                    egui::vec2(row_w, ROW_H),
                     egui::Sense::click(),
                 );
                 if ui.is_rect_visible(rect) {
@@ -868,15 +908,17 @@ fn paint_editor_text(
                     } else if resp.hovered() {
                         ui.painter().rect_filled(rect, 0.0, theme.surface_hover.gamma_multiply(0.35));
                     }
-                    let mut job = egui::text::LayoutJob::default();
-                    job.wrap.max_width = f32::INFINITY;
-                    append_highlighted(&mut job, line_str, lang, false, theme, 13.0);
-                    let galley = ui.fonts(|f| f.layout_job(job));
-                    ui.painter().galley(
-                        egui::pos2(rect.left() + 4.0, rect.top()),
-                        galley,
-                        theme.text,
-                    );
+                    if !line_str.is_empty() {
+                        let mut job = egui::text::LayoutJob::default();
+                        job.wrap.max_width = if wrap { viewport_w - 8.0 } else { f32::INFINITY };
+                        append_highlighted(&mut job, line_str, lang, starts_in_blk, theme, 13.0);
+                        let galley = ui.fonts(|f| f.layout_job(job));
+                        ui.painter().galley(
+                            egui::pos2(rect.left() + 6.0, rect.top()),
+                            galley,
+                            theme.text,
+                        );
+                    }
                 }
                 if resp.clicked() {
                     clicked_line = Some(line_no);
@@ -1208,20 +1250,47 @@ fn paint_minimap(
         );
         text_h = galley.size().y.max(1.0);
     } else {
-        // Bars for huge files: sampled so we never paint more than ~4k rects.
-        let step = (n_lines / 4000).max(1);
-        let bh = (mini_h / n_lines as f32).max(1.0);
-        let mut idx = 0;
+        // Sampled code-bar minimap for large files (~180 rows max, zero solid gray block).
+        let spans_id = egui::Id::new("editor_line_spans_cache_v2");
+        let spans = ui
+            .ctx()
+            .data_mut(|d| {
+                d.get_temp::<(Option<PathBuf>, usize, Arc<Vec<(usize, usize, bool)>>, usize)>(spans_id)
+            })
+            .map(|(_, _, s, _)| s);
+        let max_bars = (mini_h / 3.0).floor().max(60.0) as usize;
+        let step = (n_lines / max_bars).max(1);
+        let avail_bar_w = (mini_rect.width() - 8.0).max(8.0);
+        let mut idx = 0usize;
         while idx < n_lines {
-            let y = mini_rect.min.y + idx as f32 * (mini_h / n_lines as f32);
-            painter.rect_filled(
-                egui::Rect::from_min_size(
-                    egui::pos2(mini_rect.min.x + 4.0, y),
-                    egui::vec2(mini_rect.width() - 8.0, bh),
-                ),
-                0.0,
-                theme.faint,
-            );
+            let (indent, len, is_comment) = if let Some(sp) = &spans {
+                let (s, e, in_blk) = sp.get(idx).copied().unwrap_or((0, 0, false));
+                let ls = app.editor_text.get(s..e).unwrap_or("");
+                let trimmed = ls.trim_start();
+                let ind = ls.len().saturating_sub(trimmed.len()).min(24);
+                let cmt = in_blk || trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*');
+                (ind, trimmed.len(), cmt)
+            } else {
+                (2, 32, false)
+            };
+            if len > 0 {
+                let y = mini_rect.min.y + (idx as f32 / n_lines as f32) * mini_h;
+                let x_off = (indent as f32 * 1.2).min(avail_bar_w * 0.45);
+                let bw = ((len as f32 / 80.0) * (avail_bar_w - x_off)).clamp(4.0, avail_bar_w - x_off);
+                let col = if is_comment {
+                    theme.faint.gamma_multiply(0.55)
+                } else {
+                    theme.dim.gamma_multiply(0.65)
+                };
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(mini_rect.min.x + 4.0 + x_off, y),
+                        egui::vec2(bw, 1.8),
+                    ),
+                    0.5,
+                    col,
+                );
+            }
             idx += step;
         }
         text_anchor = mini_rect.min.y;
