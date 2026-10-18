@@ -4,6 +4,13 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub mod io_plan;
+pub use io_plan::{
+    BankSsnSummary, BgaBall, BgaPackageGrid, DiffPolarity, IoDirection, IoDrcReport, IoDrcSeverity,
+    IoDrcViolation, IoPinAssignment, IoPlan, IoStandard, PackageKind, PinFunction, PinSsnEntry,
+    SsnReport, analyze_ssn, check_io_drc, report_ssn,
+};
+
 #[derive(Clone, Debug)]
 pub struct Device {
     pub part: String,
@@ -1039,6 +1046,23 @@ impl Device {
         } else {
             Err(format!("unsupported site {site}"))
         }
+    }
+
+    /// Construct the BGA package ballout coordinate grid for `kind` bound to this part's HAD IOB sites.
+    pub fn bga_package(&self, kind: PackageKind) -> BgaPackageGrid {
+        BgaPackageGrid::new(kind, Some(self))
+    }
+
+    /// Run Vivado UG899 I/O and Clock Planning DRC (`BIVC-1`, `PLIO-1`..`PLIO-8`) on this device.
+    pub fn check_io_drc(&self, kind: PackageKind, plan: &IoPlan) -> IoDrcReport {
+        let grid = self.bga_package(kind);
+        io_plan::check_io_drc(&grid, plan)
+    }
+
+    /// Run Vivado UG899 Simultaneous Switching Noise (`report_ssn`) analysis on this device.
+    pub fn analyze_ssn(&self, kind: PackageKind, plan: &IoPlan) -> SsnReport {
+        let grid = self.bga_package(kind);
+        io_plan::analyze_ssn(&grid, plan)
     }
 }
 
