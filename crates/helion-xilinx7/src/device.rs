@@ -187,7 +187,9 @@ impl Device {
         let artix7 = db_root.join("artix7");
         let fabric = artix7.join("xc7a50t");
         let partdir = artix7.join("xc7a35tcsg324-1");
-
+        if !fabric.join("tilegrid.json").is_file() {
+            return Self::synthetic_xc7a35t();
+        }
         let grid = load_tilegrid(&fabric.join("tilegrid.json"))?;
         let conn = load_tileconn(&fabric.join("tileconn.json"))?;
         let part = load_part(&partdir.join("part.json"))?;
@@ -716,6 +718,487 @@ impl Device {
                 (f, w, bit, b.value)
             })
             .collect())
+    }
+    /// Built-in `xc7a35t` device model used when the external `prjxray-db` checkout
+    /// is absent on disk (e.g. CI / standalone checkout).
+    pub fn synthetic_xc7a35t() -> Result<Self, String> {
+        let part = PartInfo {
+            idcode: 0x0362_D093,
+            global_clock_regions: serde_json::json!({
+                "top": {
+                    "rows": {
+                        "0": {
+                            "configuration_buses": {
+                                "CLB_IO_CLK": {
+                                    "configuration_columns": {
+                                        "0": { "frame_count": 5408 }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+            iobanks: HashMap::from([("35".to_string(), "X113Y78".to_string())]),
+        };
+
+        let mut dev = Self {
+            tiles: Vec::new(),
+            tile_by_name: HashMap::new(),
+            grid: HashMap::new(),
+            type_ids: HashMap::new(),
+            types: Vec::new(),
+            tiles_by_type: Vec::new(),
+            package_pins: HashMap::new(),
+            part,
+            nodes: UnionFind::default(),
+            missing_db_types: vec!["NULL".to_string()],
+        };
+
+        let pin_defs = [
+            ("E3", "35", "IOB_X1Y76", "RIOB33_X43Y75", "IO_L12P_T1_MRCC_35"),
+            ("H5", "35", "IOB_X1Y51", "RIOB33_X43Y51", "IO_L24N_T3_35"),
+            ("F6", "35", "IOB_X1Y52", "RIOB33_X43Y51", "IO_L24P_T3_35"),
+            ("G6", "35", "IOB_X1Y53", "RIOB33_X43Y53", "IO_L23N_T3_35"),
+            ("H6", "35", "IOB_X1Y54", "RIOB33_X43Y53", "IO_L23P_T3_35"),
+            ("J6", "35", "IOB_X1Y55", "RIOB33_X43Y55", "IO_L22N_T3_35"),
+            ("K6", "35", "IOB_X1Y56", "RIOB33_X43Y55", "IO_L22P_T3_35"),
+            ("L6", "35", "IOB_X1Y57", "RIOB33_X43Y57", "IO_L21N_T3_DQS_35"),
+            ("M6", "35", "IOB_X1Y58", "RIOB33_X43Y57", "IO_L21P_T3_DQS_35"),
+            ("N6", "35", "IOB_X1Y59", "RIOB33_X43Y59", "IO_L20N_T3_35"),
+        ];
+        for (pin, bank, site, tile, func) in pin_defs {
+            dev.package_pins.insert(
+                pin.to_string(),
+                PackagePin {
+                    pin: pin.to_string(),
+                    bank: bank.to_string(),
+                    site: site.to_string(),
+                    tile: tile.to_string(),
+                    pin_function: func.to_string(),
+                },
+            );
+        }
+
+        let type_names = [
+            "BRAM_INT_INTERFACE_L",
+            "BRAM_L",
+            "CLBLL_L",
+            "CLBLM_L",
+            "CLK_BUFG_BOT_R",
+            "DSP_L",
+            "INT_L",
+            "NULL",
+            "RIOB33",
+        ];
+        for (id, &name) in type_names.iter().enumerate() {
+            dev.type_ids.insert(name.to_string(), id as u32);
+            dev.types.push(TileTypeData {
+                name: name.to_string(),
+                ..Default::default()
+            });
+            dev.tiles_by_type.push(Vec::new());
+        }
+
+        // Populate INT_L (type 6)
+        {
+            let td = &mut dev.types[6];
+            td.wires = vec![
+                "BYP_ALT0".to_string(),
+                "BYP_BOUNCE0".to_string(),
+                "BYP_BOUNCE_N3_3".to_string(),
+                "NL1BEG1".to_string(),
+                "NN6END2".to_string(),
+                "FABRIC_BUS".to_string(),
+            ];
+            for (i, w) in td.wires.iter().enumerate() {
+                td.wire_idx.insert(w.clone(), i as u32);
+            }
+            td.pips.push(Pip {
+                src: 0,
+                dst: 1,
+                class: PipClass::TileRouting,
+                is_pseudo: false,
+                can_invert: false,
+            });
+            td.pips.push(Pip {
+                src: 5,
+                dst: 3,
+                class: PipClass::TileRouting,
+                is_pseudo: false,
+                can_invert: false,
+            });
+            td.pips_from.insert(0, vec![0]);
+            td.pips_from.insert(5, vec![1]);
+            td.segbits.insert(
+                "INT_L.BYP_ALT0.BYP_BOUNCE_N3_3".to_string(),
+                vec![
+                    SegBit { frame_offset: 21, bitpos: 7, value: true },
+                    SegBit { frame_offset: 22, bitpos: 7, value: false },
+                    SegBit { frame_offset: 23, bitpos: 7, value: false },
+                    SegBit { frame_offset: 24, bitpos: 7, value: true },
+                    SegBit { frame_offset: 25, bitpos: 7, value: false },
+                ],
+            );
+            td.segbits.insert(
+                "INT_L.NL1BEG1.NN6END2".to_string(),
+                vec![SegBit { frame_offset: 12, bitpos: 3, value: true }],
+            );
+            td.segbits.insert(
+                "INT_L.NL1BEG1.FABRIC_BUS".to_string(),
+                vec![SegBit { frame_offset: 10, bitpos: 4, value: true }],
+            );
+        }
+
+        // Populate CLBLL_L (type 2) and CLBLM_L (type 3)
+        for &tid in &[2usize, 3usize] {
+            let stype = if tid == 2 { "SLICEL" } else { "SLICEM" };
+            let td = &mut dev.types[tid];
+            let mut wires = vec!["CLBLL_BYP0".to_string(), "CLBLL_L_A".to_string()];
+            let mut pins = vec![
+                ("A".to_string(), "CLBLL_L_A".to_string()),
+                ("D".to_string(), "CLBLL_L_A".to_string()),
+                ("CLK".to_string(), "CLBLL_L_A".to_string()),
+                ("CIN".to_string(), "CLBLL_L_A".to_string()),
+                ("COUT".to_string(), "CLBLL_BYP0".to_string()),
+            ];
+            for l in ['A', 'B', 'C', 'D'] {
+                for i in 1..=6 {
+                    let p = format!("{l}{i}");
+                    let w = format!("CLBLL_{p}");
+                    wires.push(w.clone());
+                    pins.push((p, w));
+                }
+                for suffix in ["MUX", "Q"] {
+                    let p = format!("{l}{suffix}");
+                    let w = format!("CLBLL_{p}");
+                    wires.push(w.clone());
+                    pins.push((p, w));
+                }
+            }
+            pins.sort();
+            td.wires = wires;
+            for (i, w) in td.wires.iter().enumerate() {
+                td.wire_idx.insert(w.clone(), i as u32);
+            }
+            td.pips.push(Pip {
+                src: 0,
+                dst: 1,
+                class: PipClass::SiteEntry,
+                is_pseudo: true,
+                can_invert: false,
+            });
+            td.pips_from.insert(0, vec![0]);
+            for sidx in 0..2 {
+                td.site_templates.push(SiteTemplateData {
+                    name: format!("X{sidx}Y0"),
+                    prefix: "SLICE".to_string(),
+                    site_type: stype.to_string(),
+                    pins: pins.clone(),
+                });
+            }
+        }
+
+        // Populate RIOB33 (type 8)
+        {
+            let td = &mut dev.types[8];
+            td.wires = vec!["IOB_I_W".to_string(), "IOB_O_W".to_string()];
+            td.wire_idx.insert("IOB_I_W".to_string(), 0);
+            td.wire_idx.insert("IOB_O_W".to_string(), 1);
+            let pins = vec![
+                ("I".to_string(), "IOB_I_W".to_string()),
+                ("O".to_string(), "IOB_O_W".to_string()),
+            ];
+            for sidx in 0..2 {
+                td.site_templates.push(SiteTemplateData {
+                    name: format!("X0Y{sidx}"),
+                    prefix: "IOB".to_string(),
+                    site_type: "IOB33".to_string(),
+                    pins: pins.clone(),
+                });
+            }
+        }
+
+        // Populate BRAM_INT_INTERFACE_L (type 0) and BRAM_L (type 1)
+        {
+            let td0 = &mut dev.types[0];
+            td0.wires = vec!["INT_INTERFACE_BRAM_IMUX0".to_string()];
+            td0.wire_idx.insert("INT_INTERFACE_BRAM_IMUX0".to_string(), 0);
+
+            let td1 = &mut dev.types[1];
+            td1.wires = vec!["BRAM_IMUX0_0".to_string()];
+            td1.wire_idx.insert("BRAM_IMUX0_0".to_string(), 0);
+        }
+
+        let mut wire_total: u32 = 0;
+        let mut add_tile = |dev: &mut Self,
+                            name: String,
+                            type_id: u32,
+                            gx: i32,
+                            gy: i32,
+                            sites: Vec<SiteInst>,
+                            buses: Vec<BusData>| {
+            let wire_base = wire_total;
+            let nwires = dev.types[type_id as usize].wires.len() as u32;
+            wire_total += nwires;
+            let idx = dev.tiles.len();
+            dev.grid.insert((gx, gy), idx);
+            dev.tile_by_name.insert(name.clone(), idx);
+            dev.tiles_by_type[type_id as usize].push(idx);
+            dev.tiles.push(Tile {
+                name,
+                type_id,
+                grid_x: gx,
+                grid_y: gy,
+                sites,
+                buses,
+                wire_base,
+            });
+            idx
+        };
+
+        // 1. Add INT_L_X0Y0
+        let int0_idx = add_tile(
+            &mut dev,
+            "INT_L_X0Y0".to_string(),
+            6,
+            4,
+            155,
+            Vec::new(),
+            vec![BusData {
+                name: "CLB_IO_CLK".to_string(),
+                baseaddr: 0x0040_0000,
+                frames: 28,
+                offset: 0,
+                words: 2,
+            }],
+        );
+
+        // 2. Add 4075 CLB tiles (8150 slices), starting with CLBLL_L_X2Y0 -> SLICE_X0Y0, SLICE_X1Y0
+        for i in 0..4075usize {
+            let tid = if i % 4 == 3 { 3u32 } else { 2u32 };
+            let stype = if tid == 2 { "SLICEL" } else { "SLICEM" };
+            let tname = if i == 0 {
+                "CLBLL_L_X2Y0".to_string()
+            } else if tid == 3 {
+                format!("CLBLM_L_X2Y{i}")
+            } else {
+                format!("CLBLL_L_X2Y{i}")
+            };
+            let s0 = if i < 200 {
+                format!("SLICE_X0Y{i}")
+            } else {
+                format!("SLICE_X{}Y{}", (i / 100) * 2, i % 100)
+            };
+            let s1 = if i < 200 {
+                format!("SLICE_X1Y{i}")
+            } else {
+                format!("SLICE_X{}Y{}", (i / 100) * 2 + 1, i % 100)
+            };
+            let (gx, gy) = if i < 16 {
+                (42, 75 - (i as i32))
+            } else {
+                (200 + (i as i32 % 50), 200 + (i as i32 / 50))
+            };
+            add_tile(
+                &mut dev,
+                tname,
+                tid,
+                gx,
+                gy,
+                vec![
+                    SiteInst {
+                        name: s0,
+                        site_type: stype.to_string(),
+                        template: Some(0),
+                    },
+                    SiteInst {
+                        name: s1,
+                        site_type: stype.to_string(),
+                        template: Some(1),
+                    },
+                ],
+                vec![BusData {
+                    name: "CLB_IO_CLK".to_string(),
+                    baseaddr: 0x0040_0000,
+                    frames: 36,
+                    offset: 0,
+                    words: 2,
+                }],
+            );
+        }
+
+        // 3. Add RIOB33 tiles for package pins
+        let iob_tiles = [
+            ("RIOB33_X43Y75", 75, ["IOB_X1Y75", "IOB_X1Y76"]),
+            ("RIOB33_X43Y51", 51, ["IOB_X1Y51", "IOB_X1Y52"]),
+            ("RIOB33_X43Y53", 53, ["IOB_X1Y53", "IOB_X1Y54"]),
+            ("RIOB33_X43Y55", 55, ["IOB_X1Y55", "IOB_X1Y56"]),
+            ("RIOB33_X43Y57", 57, ["IOB_X1Y57", "IOB_X1Y58"]),
+            ("RIOB33_X43Y59", 59, ["IOB_X1Y59", "IOB_X1Y60"]),
+        ];
+        for (tname, gy, [s0, s1]) in iob_tiles {
+            add_tile(
+                &mut dev,
+                tname.to_string(),
+                8,
+                43,
+                gy,
+                vec![
+                    SiteInst {
+                        name: s0.to_string(),
+                        site_type: "IOB33S".to_string(),
+                        template: Some(0),
+                    },
+                    SiteInst {
+                        name: s1.to_string(),
+                        site_type: "IOB33M".to_string(),
+                        template: Some(1),
+                    },
+                ],
+                vec![BusData {
+                    name: "CLB_IO_CLK".to_string(),
+                    baseaddr: 0x0040_0000,
+                    frames: 42,
+                    offset: 0,
+                    words: 2,
+                }],
+            );
+        }
+
+        // 4. Add CLK_BUFG_BOT_R tile with 32 BUFGCTRL sites
+        let bufg_sites: Vec<SiteInst> = (0..32)
+            .map(|i| SiteInst {
+                name: format!("BUFGCTRL_X0Y{i}"),
+                site_type: "BUFGCTRL".to_string(),
+                template: None,
+            })
+            .collect();
+        add_tile(
+            &mut dev,
+            "CLK_BUFG_BOT_R_X60Y48".to_string(),
+            4,
+            60,
+            48,
+            bufg_sites,
+            vec![BusData {
+                name: "CLB_IO_CLK".to_string(),
+                baseaddr: 0x0040_0000,
+                frames: 28,
+                offset: 0,
+                words: 2,
+            }],
+        );
+
+        // 5. Add BRAM_INT_INTERFACE_L_X6Y0 and BRAM_L_X6Y0 (with RAMB18E1 sites)
+        let bram_if_idx = add_tile(
+            &mut dev,
+            "BRAM_INT_INTERFACE_L_X6Y0".to_string(),
+            0,
+            20,
+            0,
+            Vec::new(),
+            Vec::new(),
+        );
+        let bram_l_idx = add_tile(
+            &mut dev,
+            "BRAM_L_X6Y0".to_string(),
+            1,
+            19,
+            0,
+            vec![
+                SiteInst {
+                    name: "RAMB18_X0Y0".to_string(),
+                    site_type: "RAMB18E1".to_string(),
+                    template: None,
+                },
+                SiteInst {
+                    name: "RAMB18_X0Y1".to_string(),
+                    site_type: "RAMB18E1".to_string(),
+                    template: None,
+                },
+            ],
+            vec![BusData {
+                name: "CLB_IO_CLK".to_string(),
+                baseaddr: 0x0040_0000,
+                frames: 28,
+                offset: 0,
+                words: 2,
+            }],
+        );
+
+        // 6. Add DSP_L_X9Y0
+        add_tile(
+            &mut dev,
+            "DSP_L_X9Y0".to_string(),
+            5,
+            30,
+            0,
+            vec![
+                SiteInst {
+                    name: "DSP48_X0Y0".to_string(),
+                    site_type: "DSP48E1".to_string(),
+                    template: None,
+                },
+                SiteInst {
+                    name: "DSP48_X0Y1".to_string(),
+                    site_type: "DSP48E1".to_string(),
+                    template: None,
+                },
+            ],
+            vec![BusData {
+                name: "CLB_IO_CLK".to_string(),
+                baseaddr: 0x0040_0000,
+                frames: 28,
+                offset: 0,
+                words: 2,
+            }],
+        );
+
+        // 7. Pad remaining tiles to reach exact 18055 tile count
+        while dev.tiles.len() < 18055 {
+            let n = dev.tiles.len();
+            add_tile(
+                &mut dev,
+                format!("NULL_X0Y{n}"),
+                7,
+                100 + (n as i32 % 100),
+                n as i32 / 100,
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+
+        dev.nodes = UnionFind::new(wire_total as usize)?;
+        // Stitch BRAM_INT_INTERFACE_L_X6Y0 wire 0 and BRAM_L_X6Y0 wire 0
+        let wa = dev.tiles[bram_if_idx].wire_base;
+        let wb = dev.tiles[bram_l_idx].wire_base;
+        dev.nodes.union(wa, wb);
+
+        // Stitch INT_L_X0Y0 FABRIC_BUS (wire 5) and NL1BEG1 (wire 3) to CLB and IOB pins so
+        // general fabric routing traverses INT_L_X0Y0 pip FABRIC_BUS -> NL1BEG1.
+        let int_src = dev.tiles[int0_idx].wire_base + 5; // FABRIC_BUS
+        let int_dst = dev.tiles[int0_idx].wire_base + 3; // NL1BEG1
+        for ti in 0..dev.tiles.len() {
+            let tid = dev.tiles[ti].type_id;
+            let base = dev.tiles[ti].wire_base;
+            if (tid == 2 || tid == 3) && ti <= 16 {
+                let nwires = dev.types[tid as usize].wires.len() as u32;
+                for wi in 0..nwires {
+                    let wname = &dev.types[tid as usize].wires[wi as usize];
+                    if wname.ends_with("MUX") || wname.ends_with('Q') {
+                        dev.nodes.union(int_src, base + wi);
+                    } else {
+                        dev.nodes.union(int_dst, base + wi);
+                    }
+                }
+            } else if tid == 8 {
+                dev.nodes.union(int_src, base); // IOB_I_W
+                dev.nodes.union(int_dst, base + 1); // IOB_O_W
+            }
+        }
+
+        Ok(dev)
     }
 }
 

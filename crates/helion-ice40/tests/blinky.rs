@@ -8,16 +8,8 @@ use helion_ir::{CellKind, Design, PortDir};
 /// Build a 4-bit binary counter driving led0 from clk.
 fn blinky_design() -> Design {
     let mut d = Design::new("blinky");
-    d.ports.push(helion_ir::Port {
-        name: "clk".to_string(),
-        dir: PortDir::In,
-        attrs: Default::default(),
-    });
-    d.ports.push(helion_ir::Port {
-        name: "led0".to_string(),
-        dir: PortDir::Out,
-        attrs: Default::default(),
-    });
+    d.add_port("clk", PortDir::In);
+    d.add_port("led0", PortDir::Out);
 
     // Clock input.
     d.add_cell("clk_ib", CellKind::IobIn);
@@ -50,16 +42,16 @@ fn blinky_design() -> Design {
         let ff = format!("bit{i}_ff");
         let next = format!("next{i}");
         let q = format!("q{i}");
-        d.add_cell(lut.clone(), CellKind::Lut6 { init });
-        d.add_cell(ff.clone(), CellKind::Hff);
+        d.add_cell(&lut, CellKind::Lut6 { init });
+        d.add_cell(&ff, CellKind::Hff);
         // LUT inputs: connect q0..qi.
         for j in 0..=i {
-            d.connect(format!("q{j}"), lut.clone(), format!("I{j}"));
+            d.connect(&format!("q{j}"), &lut, &format!("I{j}"));
         }
-        d.connect(next.clone(), lut, "O");
-        d.connect(next, ff.clone(), "D");
-        d.connect(q, ff.clone(), "Q");
-        d.connect("clk_global", ff, "CLK");
+        d.connect(&next, &lut, "O");
+        d.connect(&next, &ff, "D");
+        d.connect(&q, &ff, "Q");
+        d.connect("clk_global", &ff, "CLK");
     }
 
     // LED output.

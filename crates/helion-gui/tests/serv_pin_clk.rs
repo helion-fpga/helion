@@ -57,15 +57,21 @@ fn serv_pin_wrap_clk_package_pin_and_ila() {
         prog.contains("DONE=1") || prog.contains("backend=sim"),
         "{prog}"
     );
-    ide.exec("ila_window 16").unwrap();
-    ide.exec("ila_trigger rising").unwrap();
-    let arm = ide.exec("ila_arm").unwrap();
+    ide.exec("ila depth 16").unwrap();
+    ide.exec("ila trigger rising").unwrap();
+    let arm = ide.exec("ila arm").unwrap();
     eprintln!("ila_arm={arm}");
-    eprintln!("ila_bits={}", ide.ila.bits);
+    let cap = ide.ila.capture.as_ref().expect("unified ILA capture");
+    let bits: String = cap
+        .samples
+        .iter()
+        .flat_map(|s| s.iter())
+        .map(|&b| if b == 1 { '1' } else { '0' })
+        .collect();
+    eprintln!("ila_bits={bits}");
     assert!(
-        ide.ila.bits.contains('0') && ide.ila.bits.contains('1'),
-        "filled ILA bits: {}",
-        ide.ila.bits
+        bits.contains('0') && bits.contains('1'),
+        "filled ILA bits: {bits}"
     );
 
     let mut c = IdeModel::new();

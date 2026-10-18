@@ -1,4 +1,4 @@
-//! FM-HEL-L2-UI — Device/Timing highlight + packing English for the GUI.
+//! FM-HEL-L2-UI - Device/Timing highlight + packing English for the GUI.
 //!
 //! Re-exports PNR crate APIs (`helion_sta::HighlightSet`,
 //! `highlight_set_from_path`, `critical_path_highlight`,
@@ -47,7 +47,7 @@ pub fn highlight_set_from_endpoints(
     nets: &[String],
 ) -> Result<HighlightSet, String> {
     let sites = device.resolve_path_sites(endpoints)?;
-    // Keep only CLB_/IOB_ (and DSP_/BRAM_/CLK_ if present) — all HAD Site::id forms.
+    // Keep only CLB_/IOB_ (and DSP_/BRAM_/CLK_ if present) - all HAD Site::id forms.
     let sites: Vec<String> = sites
         .into_iter()
         .filter(|id| {
@@ -87,7 +87,7 @@ pub fn packing_summary_english(placed: &Placed) -> Vec<String> {
 }
 
 /// Soft diagnostic → RTL file:line. No-op unless `learner_l2_soft_span` is on
-/// **and** a real span exists — never invents fake spans.
+/// **and** a real span exists - never invents fake spans.
 #[cfg(feature = "learner_l2_soft_span")]
 pub fn soft_span_jump(_diag: &str) -> Option<(String, usize)> {
     // W-L3 / SV soft IR carries spans later; until then refuse to fake.
@@ -176,7 +176,7 @@ mod tests {
             kind: SiteKind::Clb,
         };
         assert!(dev.contains_site(site), "fixture site in HAD");
-        let endpoints = vec![("u_lut0".into(), site)];
+        let endpoints = vec![("u_luts0".into(), site)];
         let hs =
             highlight_set_from_endpoints(&dev, &endpoints, &["clk".into(), "q".into()]).unwrap();
         assert_eq!(hs.sites, vec!["CLB_X2Y1".to_string()]);

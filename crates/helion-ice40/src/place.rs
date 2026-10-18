@@ -6,7 +6,7 @@
 //! simulated annealing minimizes bounding-box wirelength.
 
 use crate::device::{all_logic_tiles, ct256_pin_map, is_logic_tile};
-use crate::pack::{IoDir, PackedIce, PllKind};
+use crate::pack::{HardIpKind, IoDir, OscKind, PackedIce, PllKind};
 use std::collections::{HashMap, HashSet};
 
 /// A placed LUT4.
@@ -65,6 +65,41 @@ pub struct PlacedPll {
     pub y: u8,
 }
 
+/// A placed `SB_MAC16` 16x16 DSP block.
+#[derive(Clone, Debug)]
+pub struct PlacedMac16 {
+    pub name: String,
+    pub x: u8,
+    pub y: u8,
+}
+
+/// A placed `SB_SPRAM256KA` 256Kb Single-Port RAM block.
+#[derive(Clone, Debug)]
+pub struct PlacedSpram {
+    pub name: String,
+    pub x: u8,
+    pub y: u8,
+}
+
+/// A placed `SB_HFOSC` / `SB_LFOSC` internal oscillator.
+#[derive(Clone, Debug)]
+pub struct PlacedOsc {
+    pub name: String,
+    pub kind: OscKind,
+    pub out_net: String,
+    pub x: u8,
+    pub y: u8,
+}
+
+/// A placed hard IP block (`SB_I2C`, `SB_SPI`, `SB_RGBA_DRV`, `SB_LEDDA_IP`).
+#[derive(Clone, Debug)]
+pub struct PlacedHardIp {
+    pub name: String,
+    pub kind: HardIpKind,
+    pub x: u8,
+    pub y: u8,
+}
+
 /// Carry `carry_in_mux` configuration for one logic tile.
 #[derive(Clone, Debug)]
 pub struct PlacedCarryMux {
@@ -82,7 +117,7 @@ pub enum CarryMuxMode {
     FromBelow,
 }
 
-/// Backend-owned placed netlist for the HX8K.
+/// Backend-owned placed netlist for the HX8K / UltraPlus.
 #[derive(Clone, Debug, Default)]
 pub struct PlacedIce {
     pub packed: PackedIce,
@@ -91,6 +126,10 @@ pub struct PlacedIce {
     pub ios: Vec<PlacedIo>,
     pub rams: Vec<PlacedRam>,
     pub plls: Vec<PlacedPll>,
+    pub mac16s: Vec<PlacedMac16>,
+    pub sprams: Vec<PlacedSpram>,
+    pub oscs: Vec<PlacedOsc>,
+    pub hard_ips: Vec<PlacedHardIp>,
     /// Tiles whose `carry_in_mux` needs configuration (constant 0 needs no bits).
     pub carry_mux: Vec<PlacedCarryMux>,
 }
@@ -171,9 +210,10 @@ pub fn place(packed: &PackedIce) -> Result<PlacedIce, String> {
 
     // 3. PLLs to the documented 8k PLL sites.
     for pll in &packed.plls {
-        let (x, y) = match pll.kind {
-            PllKind::Pad => (16u8, 0u8),
-            PllKind::Core => (16u8, 33u8),
+        let (x, y) = if pll.kind.is_pad() {
+            (16u8, 0u8)
+        } else {
+            (16u8, 33u8)
         };
         out.plls.push(PlacedPll {
             name: pll.name.clone(),
@@ -183,6 +223,91 @@ pub fn place(packed: &PackedIce) -> Result<PlacedIce, String> {
         });
     }
 
+    // 3a-dsp. Place SB_MAC16 DSP blocks onto the 8 UltraPlus DSP sites.
+    const MAC16_SITES: [(u8, u8); 8] = [
+        (0, 5),
+        (0, 10),
+        (0, 15),
+        (0, 25),
+        (33, 5),
+        (33, 10),
+        (33, 15),
+        (33, 25),
+    ];
+    if packed.mac16s.len() > MAC16_SITES.len() {
+        return Err(format!(
+            "place: design has {} SB_MAC16 blocks, exceeding the 8 device DSP sites",
+            packed.mac16s.len()
+        ));
+    }
+    for (idx, mac) in packed.mac16s.iter().enumerate() {
+        let (x, y) = MAC16_SITES[idx];
+        out.mac16s.push(PlacedMac16 {
+            name: mac.name.clone(),
+            x,
+            y,
+        });
+    }
+
+    // 3a-spram. Place SB_SPRAM256KA blocks onto the 4 UltraPlus 256Kb SPRAM sites.
+    const SPRAM_SITES: [(u8, u8); 4] = [(0, 1), (0, 2), (33, 1), (33, 2)];
+    if packed.sprams.len() > SPRAM_SITES.len() {
+        return Err(format!(
+            "place: design has {} SB_SPRAM256KA blocks, exceeding the 4 device SPRAM sites",
+            packed.sprams.len()
+        ));
+    }
+    for (idx, spram) in packed.sprams.iter().enumerate() {
+        let (x, y) = SPRAM_SITES[idx];
+        out.sprams.push(PlacedSpram {
+            name: spram.name.clone(),
+            x,
+            y,
+        });
+    }
+
+    // 3a-osc. Place SB_HFOSC / SB_LFOSC blocks at dedicated corner oscillator sites.
+    for osc in &packed.oscs {
+        let (x, y) = match osc.kind {
+            OscKind::HfOsc => (0u8, 32u8),
+            OscKind::LfOsc => (33u8, 1u8),
+        };
+        out.oscs.push(PlacedOsc {
+            name: osc.name.clone(),
+            kind: osc.kind,
+            out_net: osc.out_net.clone(),
+            x,
+            y,
+        });
+    }
+
+    // 3a-ip. Place hard peripheral IP blocks (SB_I2C, SB_SPI, SB_RGBA_DRV, SB_LEDDA_IP).
+    for ip in &packed.hard_ips {
+        let (x, y) = match &ip.kind {
+            HardIpKind::I2c { bus_addr74 } => {
+                if (bus_addr74 & 0b0010) == 0 {
+                    (0u8, 31u8)
+                } else {
+                    (33u8, 31u8)
+                }
+            }
+            HardIpKind::Spi { bus_addr74 } => {
+                if (bus_addr74 & 0b0010) == 0 {
+                    (0u8, 3u8)
+                } else {
+                    (33u8, 3u8)
+                }
+            }
+            HardIpKind::RgbaDrv { .. } => (0u8, 30u8),
+            HardIpKind::LeddaIp => (33u8, 30u8),
+        };
+        out.hard_ips.push(PlacedHardIp {
+            name: ip.name.clone(),
+            kind: ip.kind.clone(),
+            x,
+            y,
+        });
+    }
     // Work on a mutable copy: we may insert buffer LUTs and a GND LUT.
     let mut packed = packed.clone();
 

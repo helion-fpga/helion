@@ -23,6 +23,39 @@ use helion_hw::{
 };
 use std::path::Path;
 
+pub mod ibert;
+pub mod sysmon;
+
+pub use ibert::{
+    BathtubCurve, BathtubPoint, EyeMetrics, IbertEyeScan, IbertLinkConfig, PrbsEngine,
+    PrbsPattern, erfc_approx, q_tail, run_ibert_eye_scan, sweep_bathtub,
+};
+pub use sysmon::{
+    SysmonAlarms, SysmonMonitor, SysmonRailReading, SysmonTelemetry, adc_to_temp_c,
+    adc_to_voltage, drp_addr, temp_c_to_adc, voltage_to_adc,
+};
+
+pub mod bscan_1149;
+pub mod svf_stapl;
+
+pub use bscan_1149::{
+    BoardFault, BoardNet, BoardPinRef, BoundaryScanBoard, BsdlCell, BsdlCellKind, BsdlDevice,
+    DiagnosedFault, InterconnectTestReport, parse_bsdl,
+};
+pub use svf_stapl::{
+    SvfCommand, SvfExecutionReport, execute_hw_stapl, execute_hw_svf, parse_svf, write_hw_stapl,
+    write_hw_svf,
+};
+
+pub mod axi_pcie_analyzer;
+
+pub use axi_pcie_analyzer::{
+    AxiBurstKind, AxiBurstTxn, AxiPerfMonitor, AxiPerfReport, AxiProtocolChecker,
+    AxiProtocolViolation, AxiTrafficGenConfig, AxiTrafficGenerator, AxiTrafficPattern,
+    AxiViolationKind, AxiWriteChannelSample, LatencyStats, PcieGenSpeed, PcieLinkIssue,
+    PcieLtssmAnalyzer, PcieLtssmReport, PcieLtssmState, PcieTraceSample,
+};
+
 /// Locked Bits/hw refuse codes — re-exported (identical `HELION_E_*` tokens; do not rename).
 pub use helion_hw::{ERR_CODE_EMPTY_BITSTREAM, ERR_CODE_USB_0};
 
@@ -359,5 +392,459 @@ mod tests {
         }
         assert!(!err.contains("programmer_ok=1"), "{err}");
         assert_no_board_done_claim(&err);
+    }
+
+    #[test]
+    fn sysmon_xadc_transfer_functions_and_drp_alarms() {
+        // UG480 transfer function round-trip checks.
+        for &t_c in &[-40.0, 0.0, 25.0, 62.5, 85.0, 125.0] {
+            let code = temp_c_to_adc(t_c);
+            let back = adc_to_temp_c(code);
+            assert!(
+                (back - t_c).abs() < 0.25,
+                "temp {t_c}C -> adc {code:#x} -> {back}C"
+            );
+        }
+        for &v in &[0.95, 1.00, 1.03, 1.80, 2.50] {
+            let code = voltage_to_adc(v);
+            let back = adc_to_voltage(code);
+            assert!(
+                (back - v).abs() < 0.002,
+                "volt {v}V -> adc {code:#x} -> {back}V"
+            );
+        }
+
+        let mut mon = SysmonMonitor::new(25.0);
+        assert!(!mon.telemetry.alarms.any());
+        assert_eq!(mon.read_drp(drp_addr::ALARM_FLAGS), 0);
+
+        // Normal operating sample: 52.0C, nominal rails.
+        mon.ingest_sample(52.0, 0.998, 1.795, 1.001);
+        assert!(!mon.telemetry.alarms.any());
+        assert!(mon.telemetry.max_temp_c > 51.5);
+        assert!(mon.telemetry.min_temp_c < 25.5);
+
+        // High temperature (92.0C >= 85.0C user limit) + VCCINT droop (0.94V < 0.97V).
+        mon.ingest_sample(92.0, 0.94, 1.80, 1.00);
+        assert!(mon.telemetry.alarms.user_temp_alarm);
+        assert!(!mon.telemetry.alarms.over_temp_shutdown);
+        assert!(mon.telemetry.alarms.vccint_alarm);
+        assert!(!mon.telemetry.alarms.vccaux_alarm);
+        assert!(mon.telemetry.alarms.any());
+        let flags = mon.read_drp(drp_addr::ALARM_FLAGS);
+        assert_eq!(flags & 0b0011, 0b0011, "user_temp + vccint alarm bits set");
+
+        // Over-temperature shutdown (128.0C >= 125.0C OT limit).
+        mon.ingest_sample(128.0, 1.00, 1.80, 1.00);
+        assert!(mon.telemetry.alarms.over_temp_shutdown);
+        assert!(mon.telemetry.summary_line().contains("SYSMON TEMP="));
+    }
+
+    #[test]
+    fn sysmon_bitstream_telemetry_scales_with_activity_and_refuses_empty() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut mon = SysmonMonitor::new(25.0);
+
+        let empty_err = mon
+            .sample_bitstream(&dev, &Bitstream::empty(&dev), 25.0, 0.5)
+            .unwrap_err();
+        assert!(empty_err.contains(ERR_CODE_EMPTY_BITSTREAM));
+
+        let bits = bitgen_structural_counter();
+        let idle = mon.sample_bitstream(&dev, &bits, 25.0, 0.0).unwrap();
+        let busy = mon.sample_bitstream(&dev, &bits, 25.0, 1.5).unwrap();
+        assert!(
+            busy.die_temp_c > idle.die_temp_c,
+            "higher toggle rate must increase die temp: busy={} idle={}",
+            busy.die_temp_c,
+            idle.die_temp_c
+        );
+        assert!(
+            busy.vccint.current_v <= idle.vccint.current_v,
+            "higher toggle rate must increase IR droop on VCCINT"
+        );
+    }
+
+    #[test]
+    fn ibert_prbs_lfsr_period_and_bathtub_eye_scan_metrics() {
+        // PRBS-7 LFSR must have exact maximal period 2^7 - 1 = 127.
+        let mut prbs = PrbsEngine::new(PrbsPattern::Prbs7, 0x01);
+        let init_state = prbs.lfsr;
+        for step in 1..=127 {
+            let _ = prbs.next_bit();
+            if step < 127 {
+                assert_ne!(prbs.lfsr, init_state, "premature repeat at step {step}");
+            } else {
+                assert_eq!(prbs.lfsr, init_state, "must repeat at period 127");
+            }
+        }
+        let ber_with_err = prbs.run_burst(10_000, 5);
+        assert!(ber_with_err > 0.0 && ber_with_err < 1e-2);
+
+        // Healthy 10.3125 Gbps link with CTLE + DFE enabled.
+        let good_cfg = IbertLinkConfig::default();
+        let bathtub = sweep_bathtub(&good_cfg, 41, 10_000_000_000).unwrap();
+        assert!(
+            bathtub.horizontal_opening_ui >= 0.45,
+            "healthy link horizontal opening UI={}",
+            bathtub.horizontal_opening_ui
+        );
+        assert!(
+            bathtub.center_ber < 1e-12,
+            "center BER={:e}",
+            bathtub.center_ber
+        );
+        assert!(
+            bathtub.points.first().unwrap().ber > 0.1,
+            "edge at -0.5 UI must have high BER"
+        );
+
+        let scan_open = run_ibert_eye_scan(&good_cfg, 33, 21).unwrap();
+        assert!(scan_open.metrics.margin_pass);
+        assert!(scan_open.metrics.horizontal_opening_ui >= 0.45);
+        assert!(scan_open.metrics.vertical_opening_mv >= 150.0);
+        assert!(scan_open.metrics.eye_area_ui_mv > 50.0);
+        let ascii = scan_open.render_ascii();
+        assert!(ascii.contains("IBERT Eye Scan MGT_X0Y0"));
+        assert!(ascii.contains("pass=true"));
+
+        // Severely degraded 25 dB loss channel with equalization turned off -> smaller/closed eye.
+        let mut degraded_cfg = IbertLinkConfig::default();
+        degraded_cfg.channel_loss_db = 28.0;
+        degraded_cfg.tx_pre_cursor_db = 0.0;
+        degraded_cfg.tx_post_cursor_db = 0.0;
+        degraded_cfg.rx_ctle_gain_db = 0.0;
+        degraded_cfg.rx_dfe_enabled = false;
+        let scan_degraded = run_ibert_eye_scan(&degraded_cfg, 33, 21).unwrap();
+        assert!(
+            scan_degraded.metrics.eye_area_ui_mv < scan_open.metrics.eye_area_ui_mv,
+            "unequalized high-loss channel must have smaller eye area"
+        );
+        assert!(
+            scan_degraded.metrics.vertical_opening_mv < scan_open.metrics.vertical_opening_mv
+        );
+    }
+
+    #[test]
+    fn write_and_execute_hw_svf_and_stapl_with_tdo_mask_verification() {
+        use helion_hw::Tap;
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+
+        // Empty bitstream must be refused by write_hw_svf and write_hw_stapl.
+        let empty_err = write_hw_svf(&dev, &Bitstream::empty(&dev)).unwrap_err();
+        assert!(empty_err.contains(ERR_CODE_EMPTY_BITSTREAM));
+
+        let bits = bitgen_structural_counter();
+        let svf = write_hw_svf(&dev, &bits).unwrap();
+        assert!(svf.contains("FREQUENCY 10000000 HZ;"));
+        assert!(svf.contains("SIR 6 TDI (03);"));
+        assert!(svf.contains("RUNTEST IDLE 33 TCK;"));
+
+        let mut tap = Tap::new(&dev);
+        let rep = execute_hw_svf(&mut tap, &svf).unwrap();
+        assert_eq!(rep.frequency_hz, Some(10_000_000));
+        assert_eq!(rep.sir_scans, 3);
+        assert_eq!(rep.sdr_scans, 3);
+        assert_eq!(rep.tdo_checks_passed, 2);
+        assert_eq!(rep.final_idcode, dev.idcode);
+        assert!(tap.fabric().stat.done && tap.fabric().stat.eos);
+
+        // Tampered IDCODE TDO expectation must fail execute_hw_svf with TDO mismatch.
+        let bad_svf = svf.replace(
+            &format!("TDO ({:08x})", dev.idcode),
+            "TDO (deadbeef)",
+        );
+        let mut tap_bad = Tap::new(&dev);
+        let tdo_err = execute_hw_svf(&mut tap_bad, &bad_svf).unwrap_err();
+        assert!(tdo_err.contains("SDR TDO mismatch"), "{tdo_err}");
+
+        // STAPL export & playback round-trip.
+        let stapl = write_hw_stapl(&dev, &bits).unwrap();
+        assert!(stapl.contains("ACTION PROGRAM = DO_PROGRAM;"));
+        assert!(stapl.contains("PROCEDURE DO_PROGRAM;"));
+        let mut tap_stapl = Tap::new(&dev);
+        let stapl_rep = execute_hw_stapl(&mut tap_stapl, &stapl).unwrap();
+        assert_eq!(stapl_rep.tdo_checks_passed, 2);
+        assert!(tap_stapl.fabric().stat.done);
+    }
+
+    #[test]
+    fn bsdl_roundtrip_and_ieee_1149_1_extest_interconnect_fault_diagnosis() {
+        let chip0 = BsdlDevice::helion_default("HL10T_U0", 0x0362_D093, 8);
+        let chip1 = BsdlDevice::helion_default("HL10T_U1", 0x0362_D093, 8);
+
+        // Verify BSDL text round-trip.
+        let bsdl_text = chip0.to_bsdl_string();
+        let parsed_chip0 = parse_bsdl(&bsdl_text).unwrap();
+        assert_eq!(parsed_chip0, chip0);
+
+        let mut board = BoundaryScanBoard::new(vec![chip0, chip1]);
+        // Net 0: multi-drop from U0.IO_0 -> U1.IO_0 and U1.IO_7
+        board.add_net(
+            "DATA_0",
+            BoardPinRef::new(0, "IO_0"),
+            vec![BoardPinRef::new(1, "IO_0"), BoardPinRef::new(1, "IO_7")],
+        );
+        for i in 1..6 {
+            board.add_net(
+                format!("DATA_{i}"),
+                BoardPinRef::new(0, format!("IO_{i}")),
+                vec![BoardPinRef::new(1, format!("IO_{i}"))],
+            );
+        }
+
+        // 1. Healthy board passes all Walking-1 / Walking-0 / Counting EXTEST vectors.
+        let clean_rep = board.run_interconnect_test();
+        assert!(clean_rep.pass);
+        assert!(clean_rep.diagnosed_faults.is_empty());
+        assert_eq!(clean_rep.total_bsr_bits_per_scan, 16);
+
+        // 2. Inject StuckAt0 on DATA_1, StuckAt1 on DATA_2, OpenPin on U1.IO_7 (on multi-drop DATA_0),
+        //    and BridgedNets (wired-AND) between DATA_3 and DATA_4.
+        board.inject_fault(BoardFault::StuckAt0 {
+            net_name: "DATA_1".into(),
+        });
+        board.inject_fault(BoardFault::StuckAt1 {
+            net_name: "DATA_2".into(),
+        });
+        board.inject_fault(BoardFault::OpenPin {
+            pin: BoardPinRef::new(1, "IO_7"),
+            open_pull_value: false,
+        });
+        board.inject_fault(BoardFault::BridgedNets {
+            net_a: "DATA_3".into(),
+            net_b: "DATA_4".into(),
+            wired_and: true,
+        });
+
+        let fault_rep = board.run_interconnect_test();
+        assert!(!fault_rep.pass);
+        assert_eq!(
+            fault_rep.diagnosed_faults,
+            vec![
+                DiagnosedFault::BridgedShort {
+                    net_a: "DATA_3".into(),
+                    net_b: "DATA_4".into(),
+                    wired_and: true,
+                },
+                DiagnosedFault::OpenReceiverPin {
+                    net_name: "DATA_0".into(),
+                    receiver: BoardPinRef::new(1, "IO_7"),
+                    stuck_level: false,
+                },
+                DiagnosedFault::StuckAt0 {
+                    net_name: "DATA_1".into(),
+                    receiver: BoardPinRef::new(1, "IO_1"),
+                },
+                DiagnosedFault::StuckAt1 {
+                    net_name: "DATA_2".into(),
+                    receiver: BoardPinRef::new(1, "IO_2"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn axi_traffic_generator_and_performance_monitor_metrics() {
+        for pat in [
+            AxiTrafficPattern::Sequential,
+            AxiTrafficPattern::Strided { stride_bytes: 512 },
+            AxiTrafficPattern::Random { seed: 42 },
+            AxiTrafficPattern::AddressSweep {
+                low_addr: 0x4000_0000,
+                high_addr: 0x4001_0000,
+                step_bytes: 256,
+            },
+        ] {
+            let mut cfg = AxiTrafficGenConfig::default();
+            cfg.pattern = pat;
+            cfg.burst_len = 16;
+            cfg.data_width_bits = 64;
+            let mut tg = AxiTrafficGenerator::new(cfg.clone());
+            let txns = tg.generate_bursts(40);
+            assert_eq!(txns.len(), 40);
+
+            // Verify no generated burst crosses a 4KB boundary.
+            let mut checker = AxiProtocolChecker::default();
+            for t in &txns {
+                checker.check_address_phase(t);
+            }
+            assert!(
+                checker.violations.is_empty(),
+                "generated traffic must be 4KB boundary safe: {:?}",
+                checker.violations
+            );
+
+            let mut mon = AxiPerfMonitor::new();
+            mon.record_batch(txns);
+            let rep = mon.analyze(cfg.clock_freq_mhz, cfg.data_width_bits);
+            assert!(rep.total_throughput_mbps > 100.0);
+            assert!(rep.bus_utilization_pct > 10.0 && rep.bus_utilization_pct <= 100.0);
+            assert!(rep.read_latency.min_cycles <= rep.read_latency.p50_cycles);
+            assert!(rep.read_latency.p50_cycles <= rep.read_latency.p99_cycles);
+            assert!(rep.read_latency.p99_cycles <= rep.read_latency.max_cycles);
+            assert_eq!(rep.peak_outstanding, 8);
+        }
+    }
+
+    #[test]
+    fn axi_protocol_checker_detects_pg101_violations() {
+        let mut checker = AxiProtocolChecker::new(4);
+
+        // 1. 4KB boundary crossing: start at 0x4000_0FF0 with 4 beats x 8B = 32B -> crosses 0x4000_1000.
+        let bad_4k = AxiBurstTxn {
+            id: 1,
+            is_write: true,
+            addr: 0x4000_0FF0,
+            beats: 4,
+            beat_bytes: 8,
+            burst_kind: AxiBurstKind::Incr,
+            exclusive: false,
+            issue_cycle: 10,
+            complete_cycle: 20,
+            outstanding_at_issue: 1,
+        };
+        checker.check_address_phase(&bad_4k);
+        assert!(
+            checker
+                .violations
+                .iter()
+                .any(|v| v.kind == AxiViolationKind::AwaddrBoundary4K)
+        );
+
+        // 2. Invalid exclusive burst (> 16 beats).
+        let mut bad_excl = bad_4k.clone();
+        bad_excl.addr = 0x4000_0000;
+        bad_excl.beats = 32;
+        bad_excl.exclusive = true;
+        checker.check_address_phase(&bad_excl);
+        assert!(
+            checker
+                .violations
+                .iter()
+                .any(|v| v.kind == AxiViolationKind::ExclAccessInvalid)
+        );
+
+        // 3. Unstable WDATA while stalled (WVALID=1, WREADY=0), MAXWAITS deadlock, and WLAST beat mismatch.
+        let stream = vec![
+            AxiWriteChannelSample {
+                cycle: 1,
+                wvalid: true,
+                wready: false,
+                wdata: 0x1111,
+                wstrb: 0xFF,
+                wlast: false,
+            },
+            AxiWriteChannelSample {
+                cycle: 2,
+                wvalid: true,
+                wready: false,
+                wdata: 0x2222, // Mutated while WREADY=0 -> AXI_ERRM_WDATA_STABLE!
+                wstrb: 0xFF,
+                wlast: false,
+            },
+            AxiWriteChannelSample {
+                cycle: 3,
+                wvalid: true,
+                wready: false,
+                wdata: 0x2222,
+                wstrb: 0xFF,
+                wlast: false,
+            },
+            AxiWriteChannelSample {
+                cycle: 4,
+                wvalid: true,
+                wready: false,
+                wdata: 0x2222,
+                wstrb: 0xFF,
+                wlast: false,
+            },
+            AxiWriteChannelSample {
+                cycle: 5,
+                wvalid: true,
+                wready: true,
+                wdata: 0x2222,
+                wstrb: 0xFF,
+                wlast: true, // WLAST on beat 1 when expected_beats = 2 -> AXI_ERRM_WDATA_NUM!
+            },
+        ];
+        checker.check_write_stream(2, &stream);
+        assert!(
+            checker
+                .violations
+                .iter()
+                .any(|v| v.kind == AxiViolationKind::WdataUnstable)
+        );
+        assert!(
+            checker
+                .violations
+                .iter()
+                .any(|v| v.kind == AxiViolationKind::MaxWaitsDeadlock)
+        );
+        assert!(
+            checker
+                .violations
+                .iter()
+                .any(|v| v.kind == AxiViolationKind::WdataNumMismatch)
+        );
+    }
+
+    #[test]
+    fn pcie_gen1_to_gen4_ltssm_trace_analyzer_and_equalization_diagnostics() {
+        let mut analyzer = PcieLtssmAnalyzer::new();
+        let trace = [
+            (0, PcieLtssmState::DetectQuiet, PcieGenSpeed::Gen1, 8, 4, 80),
+            (100, PcieLtssmState::DetectActive, PcieGenSpeed::Gen1, 8, 4, 80),
+            (250, PcieLtssmState::PollingActive, PcieGenSpeed::Gen1, 8, 4, 80),
+            (400, PcieLtssmState::ConfigurationLinkwidthStart, PcieGenSpeed::Gen1, 8, 4, 80),
+            (600, PcieLtssmState::ConfigurationComplete, PcieGenSpeed::Gen1, 8, 4, 80),
+            (700, PcieLtssmState::L0, PcieGenSpeed::Gen1, 8, 4, 80),
+            // Speed upgrade to Gen3 (8.0 GT/s) with Phase 0..3 Equalization
+            (900, PcieLtssmState::RecoveryRcvrLock, PcieGenSpeed::Gen1, 8, 4, 75),
+            (1000, PcieLtssmState::RecoverySpeed, PcieGenSpeed::Gen3, 8, 4, 75),
+            (1100, PcieLtssmState::RecoveryEqualizationPhase0, PcieGenSpeed::Gen3, 8, 4, 75),
+            (1200, PcieLtssmState::RecoveryEqualizationPhase1, PcieGenSpeed::Gen3, 8, 4, 75),
+            (1300, PcieLtssmState::RecoveryEqualizationPhase2, PcieGenSpeed::Gen3, 8, 7, 68),
+            (1400, PcieLtssmState::RecoveryEqualizationPhase3, PcieGenSpeed::Gen3, 8, 7, 72),
+            (1500, PcieLtssmState::L0, PcieGenSpeed::Gen3, 8, 7, 72),
+            // Speed upgrade to Gen4 (16.0 GT/s), with poor FOM on Phase 2 triggering diagnostic
+            (1700, PcieLtssmState::RecoveryRcvrLock, PcieGenSpeed::Gen3, 8, 7, 70),
+            (1800, PcieLtssmState::RecoverySpeed, PcieGenSpeed::Gen4, 8, 7, 60),
+            (1900, PcieLtssmState::RecoveryEqualizationPhase2, PcieGenSpeed::Gen4, 8, 12, 10),
+            // Fallback downgrade to Gen3 L0
+            (2000, PcieLtssmState::L0, PcieGenSpeed::Gen3, 8, 7, 65),
+        ];
+        for &(ts, state, speed, width, preset, fom) in &trace {
+            analyzer.push_sample(PcieTraceSample {
+                timestamp_ns: ts,
+                state,
+                speed,
+                link_width: width,
+                tx_eq_preset: preset,
+                rx_eq_fom: fom,
+            });
+        }
+
+        let rep = analyzer.analyze();
+        assert!(rep.reached_l0);
+        assert_eq!(rep.max_speed, PcieGenSpeed::Gen4);
+        assert_eq!(rep.final_speed, PcieGenSpeed::Gen3);
+        assert_eq!(rep.final_link_width, 8);
+        assert_eq!(rep.speed_upgrades, 2);
+        assert_eq!(rep.speed_downgrades, 1);
+        assert_eq!(rep.eq_phases_visited, vec![0, 1, 2, 3]);
+        assert_eq!(rep.recovery_retrain_count, 2);
+        assert!(rep.issues.iter().any(|i| matches!(
+            i,
+            PcieLinkIssue::EqualizationPresetFailure { preset: 12, fom: 10, .. }
+        )));
+        assert!(rep.issues.iter().any(|i| matches!(
+            i,
+            PcieLinkIssue::EqualizationFallbackDowngrade {
+                from_speed: PcieGenSpeed::Gen4,
+                to_speed: PcieGenSpeed::Gen3,
+                ..
+            }
+        )));
     }
 }

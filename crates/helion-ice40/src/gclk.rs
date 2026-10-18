@@ -55,9 +55,10 @@ pub const PADIN_EXTRA_BITS_8K: [(u8, u16, u16); 8] = [
 /// `padin_pio_db["8k"]` maps to glb net 6; the top PLL's is (16,33,1),
 /// mapped to glb net 7.
 pub fn pll_glb_net(kind: PllKind) -> u8 {
-    match kind {
-        PllKind::Pad => 6,
-        PllKind::Core => 7,
+    if kind.is_pad() {
+        6
+    } else {
+        7
     }
 }
 
@@ -124,10 +125,15 @@ pub fn plan(placed: &PlacedIce) -> Result<Vec<ClockPlan>, String> {
         }
         used[glb as usize] = true;
         net_plan.insert(pll.out_net.clone(), plans.len());
+        let mut nets = vec![pll.out_net.clone()];
+        if let Some(out_b) = &pll.out_net_b {
+            net_plan.insert(out_b.clone(), plans.len());
+            nets.push(out_b.clone());
+        }
         plans.push(ClockPlan {
             glb,
             source: ClockSource::Pll,
-            nets: vec![pll.out_net.clone()],
+            nets,
             source_net: None,
             extra_bit: Some(PADIN_EXTRA_BITS_8K[glb as usize]),
         });
@@ -210,6 +216,11 @@ fn driver_position(placed: &PlacedIce, net: &str) -> Option<(u8, u8)> {
     for ff in &placed.ffs {
         if ff.q_net == net {
             return Some((ff.x, ff.y));
+        }
+    }
+    for osc in &placed.oscs {
+        if osc.out_net == net {
+            return Some((osc.x, osc.y));
         }
     }
     None

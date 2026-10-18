@@ -105,7 +105,7 @@ impl Backend for Xilinx7Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helion_backend::Backend as _;
+    use helion_ir::resolve;
 
     /// Compile-time assertion: the trait's associated types are exactly the
     /// coordinator-owned stage types.
@@ -151,7 +151,7 @@ mod tests {
         let mut netlist = helion_ir::Design::structural_counter();
         // Arty A7 LOCs, mirroring the blinky e2e test.
         for port in &mut netlist.ports {
-            match port.name.as_str() {
+            match resolve(port.name) {
                 "clk" => port.attrs.set("LOC", "E3"),
                 "led" => port.attrs.set("LOC", "H5"),
                 _ => {}

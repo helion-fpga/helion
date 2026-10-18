@@ -8,29 +8,29 @@
 //! P_dynamic = Σ  α · C · V² · f
 //! ```
 //!
-//! * **α** — activity factor, P(0→1) per clock cycle. From VCD: `rising / cycles`.
+//! * **α** - activity factor, P(0→1) per clock cycle. From VCD: `rising / cycles`.
 //!   Vectorless fallback: clocks 1.0, data nets 0.125, IO 0.1, BRAM/DSP 0.2.
 //!   The clock tree is scaled by the *detected clock's* α: when the VCD shows
 //!   no free-running clock (gated off, or clock not dumped), the tree
-//!   contributes nothing — so a zero-activity dump yields ~0 dynamic power.
+//!   contributes nothing - so a zero-activity dump yields ~0 dynamic power.
 //!   Vectorless mode keeps the classic always-on clock assumption.
-//! * **C** — switched capacitance: cell-internal cap + routing (`base + fanout·k`).
-//! * **V** — core voltage from operating conditions (default 1.0 V).
-//! * **f** — clock frequency from the fastest STA clock, else the VCD clock.
+//! * **C** - switched capacitance: cell-internal cap + routing (`base + fanout·k`).
+//! * **V** - core voltage from operating conditions (default 1.0 V).
+//! * **f** - clock frequency from the fastest STA clock, else the VCD clock.
 //!
 //! Static power is per-resource leakage scaled by `V · (1 + 0.008·(T−25))`.
 //!
-//! ## Capacitance table — MODELED, not silicon
+//! ## Capacitance table - MODELED, not silicon
 //!
 //! The HL10T is a fictional 28nm-class FPGA. Every capacitance and leakage
 //! number below is **modeled**: scaled from published 7-series XPE proportions
 //! and typical 28nm FPGA literature values, rounded to 1–2 significant
 //! figures. They are suitable for relative comparison, budgeting, and
-//! "what toggles most" analysis — **never for signoff**. If you have measured
+//! "what toggles most" analysis - **never for signoff**. If you have measured
 //! HL10T data, replace [`CapTable::modeled_hl10t`] and [`LeakTable::modeled_hl10t`].
 
 use crate::vcd::VcdActivity;
-use helion_ir::{CellKind, Design};
+use helion_ir::{intern, resolve, CellKind, Design};
 use std::collections::{HashMap, HashSet};
 
 /// Switched capacitances in femtofarads. See module docs: modeled, not measured.
@@ -59,7 +59,7 @@ pub struct CapTable {
 }
 
 impl CapTable {
-    /// Modeled HL10T capacitances. See module docs — not silicon data.
+    /// Modeled HL10T capacitances. See module docs - not silicon data.
     pub fn modeled_hl10t() -> Self {
         Self {
             lut_internal_ff: 12.0,
@@ -94,7 +94,7 @@ pub struct LeakTable {
 }
 
 impl LeakTable {
-    /// Modeled HL10T leakage. See module docs — not silicon data.
+    /// Modeled HL10T leakage. See module docs - not silicon data.
     pub fn modeled_hl10t() -> Self {
         Self {
             lut_used_uw: 3.0,
@@ -306,9 +306,9 @@ fn hier_block(cell: &str) -> &str {
 
 /// Analyze power for `design`.
 ///
-/// * `activity` — `Some` for VCD-driven analysis, `None` for the vectorless
+/// * `activity` - `Some` for VCD-driven analysis, `None` for the vectorless
 ///   fallback (default toggle rates; report is labeled `vectorless`).
-/// * `vcd_path` — shown in the report header only.
+/// * `vcd_path` - shown in the report header only.
 pub fn analyze_power(
     design: &Design,
     cfg: &PowerConfig,
@@ -325,8 +325,8 @@ pub fn analyze_power(
         match c.kind {
             CellKind::Lut6 { .. } => n_lut += 1,
             CellKind::Hff => n_ff += 1,
-            CellKind::Bram18 => n_bram += 1,
-            CellKind::Mac27 => n_dsp += 1,
+            CellKind::Bram18 | CellKind::Bram18e1 { .. } => n_bram += 1,
+            CellKind::Mac27 | CellKind::Dsp48e1 { .. } => n_dsp += 1,
             CellKind::IobOut => n_iob += 1,
             _ => {}
         }
@@ -346,24 +346,24 @@ pub fn analyze_power(
             drives_iob: false,
         };
         for e in &n.endpoints {
-            let is_driver = e.pin == "Q" || e.pin == "O";
+            let is_driver = e.pin == intern("Q") || e.pin == intern("O");
             if is_driver && info.driver.is_none() {
-                let kind = if e.pin == "Q" {
+                let kind = if e.pin == intern("Q") {
                     DriverKind::Ff
                 } else {
                     DriverKind::Lut
                 };
-                info.driver = Some((e.cell.clone(), kind));
+                info.driver = Some((resolve(e.cell).to_string(), kind));
             } else {
                 info.fanout += 1;
             }
-            if e.pin == "I" && design.cells.iter().any(|c| {
+            if e.pin == intern("I") && design.cells.iter().any(|c| {
                 c.name == e.cell && matches!(c.kind, CellKind::IobOut)
             }) {
                 info.drives_iob = true;
             }
         }
-        nets.insert(n.name.as_str(), info);
+        nets.insert(resolve(n.name), info);
     }
 
     // ---- activity lookup: VCD signal names may carry a scope prefix ----
@@ -461,7 +461,7 @@ pub fn analyze_power(
 
     // Clock-tree activity factor: the tree switches with the detected clock.
     // When the dump shows no free-running clock (gated off, or the clock was
-    // not dumped), the tree contributes nothing — which is what makes a
+    // not dumped), the tree contributes nothing - which is what makes a
     // zero-activity dump yield ~0 dynamic power. Vectorless keeps the classic
     // always-on assumption (α = 1.0).
     let clock_alpha = if vectorless {
@@ -512,8 +512,16 @@ pub fn analyze_power(
         dyn_clk = clock_alpha * c_tree_ff * 1e-15 * v2 * f;
     }
 
-    for (net, info) in &nets {
-        let net: &str = *net;
+    // Deterministic net order. `nets` is a HashMap with a per-instance
+    // random seed, so iterating it directly reshuffles push order
+    // (top_nets, warnings) and perturbs float accumulation order on every
+    // call. The power view repaints on mouse movement, so the old code made
+    // displayed values jump as the mouse moved. Sorted order makes the
+    // report bit-identical across calls for identical inputs.
+    let mut net_names: Vec<&str> = nets.keys().copied().collect();
+    net_names.sort_unstable();
+    for net in net_names {
+        let info = &nets[net];
         let is_clock = clock_nets.iter().any(|c| c.as_str() == net);
         let (toggles, rising) = net_signal
             .get(net)
@@ -588,27 +596,27 @@ pub fn analyze_power(
             warnings.push(PowerWarning {
                 severity: PowerSeverity::Warning,
                 message: format!(
-                    "net '{net}' toggles almost every cycle (α={alpha:.2}) — consider clock gating or re-encoding"
+                    "net '{net}' toggles almost every cycle (α={alpha:.2}) - consider clock gating or re-encoding"
                 ),
             });
         }
     }
 
-    // BRAM / DSP: no per-pin activity in this kernel — modeled active-cycle term.
+    // BRAM / DSP: no per-pin activity in this kernel - modeled active-cycle term.
     let bram_alpha = if vectorless { rates.bram_dsp } else { 0.2 };
     let dsp_alpha = if vectorless { rates.bram_dsp } else { 0.2 };
     let dyn_bram = n_bram as f64 * bram_alpha * cfg.caps.bram_active_ff * 1e-15 * v2 * f;
     let dyn_dsp = n_dsp as f64 * dsp_alpha * cfg.caps.dsp_active_ff * 1e-15 * v2 * f;
     // Attribute BRAM/DSP dynamic to hierarchy blocks by instance name when possible.
     for c in &design.cells {
-        let block = hier_block(&c.name).to_string();
+        let block = hier_block(resolve(c.name)).to_string();
         match c.kind {
-            CellKind::Bram18 => {
+            CellKind::Bram18 | CellKind::Bram18e1 { .. } => {
                 let e = hier_mw.entry(block).or_insert((0.0, 0));
                 e.0 += bram_alpha * cfg.caps.bram_active_ff * 1e-15 * v2 * f;
                 e.1 += 1;
             }
-            CellKind::Mac27 => {
+            CellKind::Mac27 | CellKind::Dsp48e1 { .. } => {
                 let e = hier_mw.entry(block).or_insert((0.0, 0));
                 e.0 += dsp_alpha * cfg.caps.dsp_active_ff * 1e-15 * v2 * f;
                 e.1 += 1;
@@ -645,15 +653,26 @@ pub fn analyze_power(
         ResourcePower { name: "dsp".into(), mw: w2mw(dyn_dsp) },
         ResourcePower { name: "static".into(), mw: w2mw(static_w) },
     ];
-    by_resource.sort_by(|a, b| b.mw.partial_cmp(&a.mw).unwrap_or(std::cmp::Ordering::Equal));
+    // Tiebreak by name: equal mW must not reshuffle on repaint.
+    by_resource.sort_by(|a, b| {
+        b.mw.partial_cmp(&a.mw)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.name.cmp(&b.name))
+    });
 
     let mut by_hierarchy: Vec<HierPower> = hier_mw
         .into_iter()
         .map(|(name, (w, cells))| HierPower { name, mw: w2mw(w), cells })
         .collect();
-    by_hierarchy.sort_by(|a, b| b.mw.partial_cmp(&a.mw).unwrap_or(std::cmp::Ordering::Equal));
+    // Tiebreak by name: equal mW must not reshuffle on repaint.
+    by_hierarchy.sort_by(|a, b| {
+        b.mw.partial_cmp(&a.mw)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.name.cmp(&b.name))
+    });
 
-    top_nets.sort_by(|a, b| b.toggles.cmp(&a.toggles));
+    // Tiebreak by name: equal toggle counts must not reshuffle on repaint.
+    top_nets.sort_by(|a, b| b.toggles.cmp(&a.toggles).then_with(|| a.name.cmp(&b.name)));
     // VCD-only clocks (not design nets) still belong in the toggle table.
     if let Some(a) = activity {
         for name in &vcd_clock_names {
@@ -667,7 +686,7 @@ pub fn analyze_power(
                 });
             }
         }
-        top_nets.sort_by(|a, b| b.toggles.cmp(&a.toggles));
+        top_nets.sort_by(|a, b| b.toggles.cmp(&a.toggles).then_with(|| a.name.cmp(&b.name)));
     }
     top_nets.truncate(20);
 
@@ -675,19 +694,19 @@ pub fn analyze_power(
     if vectorless {
         warnings.push(PowerWarning {
             severity: PowerSeverity::Info,
-            message: "vectorless estimate: default toggle rates used — load a VCD (read_vcd) for measured switching activity".into(),
+            message: "vectorless estimate: default toggle rates used - load a VCD (read_vcd) for measured switching activity".into(),
         });
     } else if let Some(a) = activity {
         if a.signals.iter().all(|s| s.toggles == 0) {
             warnings.push(PowerWarning {
                 severity: PowerSeverity::Warning,
-                message: "VCD shows zero toggles — check the dump window covers active simulation time".into(),
+                message: "VCD shows zero toggles - check the dump window covers active simulation time".into(),
             });
         }
         if a.truncated {
             warnings.push(PowerWarning {
                 severity: PowerSeverity::Warning,
-                message: "VCD signal cap hit — activity is partial".into(),
+                message: "VCD signal cap hit - activity is partial".into(),
             });
         }
         let pct = 100.0 * nets_matched as f64 / nets_total.max(1) as f64;
@@ -695,13 +714,13 @@ pub fn analyze_power(
             warnings.push(PowerWarning {
                 severity: PowerSeverity::Warning,
                 message: format!(
-                    "VCD activity covers only {pct:.0}% of nets ({nets_matched}/{nets_total}) — \
+                    "VCD activity covers only {pct:.0}% of nets ({nets_matched}/{nets_total}) - \
                      check signal name mapping (hierarchical scope?)"
                 ),
             });
         }
         // Cross-check: the VCD's own measured clock period vs the configured
-        // one. A mismatch means `cycles` (and hence every α) is off — usually
+        // one. A mismatch means `cycles` (and hence every α) is off - usually
         // the operating-conditions clock doesn't match the dump's timescale.
         let vcd_half_period = clock_nets
             .iter()
@@ -724,7 +743,7 @@ pub fn analyze_power(
                 warnings.push(PowerWarning {
                     severity: PowerSeverity::Warning,
                     message: format!(
-                        "VCD clock period ~{vcd_period} ps differs from configured {cfg_p} ps — \
+                        "VCD clock period ~{vcd_period} ps differs from configured {cfg_p} ps - \
                          activity factors may be off; check operating conditions"
                     ),
                 });
@@ -735,7 +754,7 @@ pub fn analyze_power(
         warnings.push(PowerWarning {
             severity: PowerSeverity::Warning,
             message: format!(
-                "clock tree is {:.0}% of dynamic power — consider clock gating enables",
+                "clock tree is {:.0}% of dynamic power - consider clock gating enables",
                 100.0 * dyn_clk / dynamic_w
             ),
         });
@@ -890,7 +909,7 @@ endmodule
     }
 
     /// Coverage: VCD covers one of two nets, plus a stray signal that matches
-    /// nothing — the report must count coverage and list the stray signal.
+    /// nothing - the report must count coverage and list the stray signal.
     #[test]
     fn coverage_lists_unmatched_vcd_signals() {
         let mut d = Design::new("t");
@@ -974,4 +993,44 @@ endmodule
         assert!((r.static_mw - 4.0).abs() < 1e-9, "static: {}", r.static_mw);
         assert_eq!(r.dynamic_mw, r.resource("clocks"), "only clock tree (no FFs)");
     }
+
+    /// Mouse-invariance: the power view repaints on every mouse movement,
+    /// and each paint recomputes the report via `analyze_power`. The report
+    /// must be bit-identical across recomputes for identical inputs, or the
+    /// displayed values visibly jump as the mouse moves. Regression test
+    /// for Saksham's report: "moving the mouse in the power window changes
+    /// the displayed power values."
+    #[test]
+    fn power_report_stable_across_repaints() {
+        let d = counter_design();
+        let cfg = cfg_100mhz();
+        // Build a VCD with several nets at the same toggle count (ties).
+        let vcd = "$timescale 1ns $end\n$scope module counter $end\n$var wire 1 ! clk $end\n$var wire 1 \" a $end\n$var wire 1 # b $end\n$var wire 1 $ c $end\n$upscope $end\n$enddefinitions $end\n#0\n$dumpvars\n0!\n0\"\n0#\n0$\n$end\n#5\n1\"\n#10\n1!\n0\"\n1#\n#15\n1\"\n#20\n0!\n0\"\n0#\n1$\n#25\n1\"\n#30\n1!\n0\"\n#35\n1\"\n#40\n0!\n0\"\n";
+        let a = parse_vcd(vcd).expect("parse");
+        let r1 = analyze_power(&d, &cfg, Some(&a), None);
+        let mut order_changed = false;
+        let mut value_changed = false;
+        for _ in 0..20 {
+            let r2 = analyze_power(&d, &cfg, Some(&a), None);
+            let o1: Vec<&str> = r1.top_nets.iter().map(|n| n.name.as_str()).collect();
+            let o2: Vec<&str> = r2.top_nets.iter().map(|n| n.name.as_str()).collect();
+            if o1 != o2 {
+                order_changed = true;
+            }
+            if r1.total_mw.to_bits() != r2.total_mw.to_bits()
+                || r1.dynamic_mw.to_bits() != r2.dynamic_mw.to_bits()
+            {
+                value_changed = true;
+            }
+            let h1: Vec<&str> = r1.by_hierarchy.iter().map(|h| h.name.as_str()).collect();
+            let h2: Vec<&str> = r2.by_hierarchy.iter().map(|h| h.name.as_str()).collect();
+            if h1 != h2 {
+                order_changed = true;
+            }
+        }
+        println!("order_changed={order_changed} value_changed={value_changed}");
+        assert!(!order_changed, "top_nets/by_hierarchy order changed between identical calls");
+        assert!(!value_changed, "power values changed between identical calls");
+    }
+
 }

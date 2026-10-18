@@ -93,8 +93,9 @@ use crate::device::Device;
 use crate::pack::CARRY_NET_PREFIX;
 use crate::place;
 use std::cmp::Ordering;
+use rayon::prelude::*;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 /// Re-exported for the bitstream worker: bit requirements are programmed
 /// per [`RoutedSegment`].
@@ -498,18 +499,20 @@ fn build_type_graph(text: &str) -> TypeGraph {
 
 /// Process-wide per-tile-type mux cache, built once from the vendored
 /// `bits.db` texts.
+static TYPE_GRAPHS: LazyLock<Vec<(String, TypeGraph)>> = LazyLock::new(|| {
+    let mut v: Vec<(String, TypeGraph)> = crate::tiledata::TILE_TYPES
+        .par_iter()
+        .filter_map(|&tt| {
+            let text = crate::tiledata::bits_db(tt)?;
+            Some((tt.to_string(), build_type_graph(text)))
+        })
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+});
+
 fn type_graphs() -> &'static Vec<(String, TypeGraph)> {
-    static CACHE: OnceLock<Vec<(String, TypeGraph)>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        let mut v = Vec::new();
-        for tt in crate::tiledata::TILE_TYPES {
-            if let Some(text) = crate::tiledata::bits_db(tt) {
-                v.push((tt.to_string(), build_type_graph(text)));
-            }
-        }
-        v.sort_by(|a, b| a.0.cmp(&b.0));
-        v
-    })
+    &TYPE_GRAPHS
 }
 
 
@@ -523,7 +526,7 @@ type NodeId = u32;
 
 /// A directed routing edge: `src -> to`, programmed by the mux
 /// `(tile_entry, mux_idx, input_idx)`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct Edge {
     to: NodeId,
     tile_entry: u32,
@@ -686,25 +689,23 @@ impl<'a> Router<'a> {
         self.adj_done[node as usize] = true;
         let (entry, wire) = self.nodes[node as usize].clone();
         let (r, c) = self.entry_pos[entry as usize];
-        // Collect (tile_entry, mux_idx, input_idx, dst_ref) first to keep
-        // the borrow checker happy (graph() borrows self immutably).
         let mut cands: Vec<(u32, u32, u32, WireRef)> = Vec::new();
-        for &(dr, dc) in &self.prefix_offsets.clone() {
+        for oi in 0..self.prefix_offsets.len() {
+            let (dr, dc) = self.prefix_offsets[oi];
             let pr = r as i32 - dr;
             let pc = c as i32 - dc;
             if pr < 0 || pc < 0 {
                 continue;
             }
-            let entries: Vec<u32> = self
-                .pos_index
-                .get(&(pr as u32, pc as u32))
-                .cloned()
-                .unwrap_or_default();
-            for e2 in entries {
-                let key = (dr, dc, wire.clone());
-                if let Some(list) = self.graph(e2).src_index.get(&key).cloned() {
-                    for (mi, ii) in list {
-                        let dst_ref = self.graph(e2).muxes[mi as usize].dst_ref.clone();
+            let Some(entries) = self.pos_index.get(&(pr as u32, pc as u32)) else {
+                continue;
+            };
+            let key = (dr, dc, wire.clone());
+            for &e2 in entries {
+                let g = self.graph(e2);
+                if let Some(list) = g.src_index.get(&key) {
+                    for &(mi, ii) in list {
+                        let dst_ref = g.muxes[mi as usize].dst_ref.clone();
                         cands.push((e2, mi, ii, dst_ref));
                     }
                 }
@@ -816,9 +817,9 @@ impl<'a> Router<'a> {
                 return None;
             }
             self.expand(node);
-            let out: Vec<Edge> = self.adj[node as usize].clone();
-            for e in out {
-                // Congestion: mux already programmed with another src.
+            let n_edges = self.adj[node as usize].len();
+            for ei in 0..n_edges {
+                let e = self.adj[node as usize][ei];
                 let (mdst, msrc, _) = self.edge_info(&e);
                 if e.to != dst {
                     if let Some(used_src) = used_mux.get(&(e.tile_entry, mdst.to_string())) {
@@ -826,7 +827,6 @@ impl<'a> Router<'a> {
                             continue;
                         }
                     }
-                    // Short: wire already driven by another net.
                     if driven.contains(&e.to) {
                         continue;
                     }
@@ -835,7 +835,7 @@ impl<'a> Router<'a> {
                 if ng < *g_score.get(&e.to).unwrap_or(&i64::MAX) {
                     let f = ng + self.heuristic(e.to, tr, tc);
                     g_score.insert(e.to, ng);
-                    came_from.insert(e.to, (node, e.clone()));
+                    came_from.insert(e.to, (node, e));
                     heap.push(State { f, g: ng, node: e.to });
                 }
             }
@@ -1854,38 +1854,69 @@ fn clock_source_wire(
         })?;
         return Ok(format!("G_JPCLKT{a}{b}"));
     }
-    // (PLL outputs: PLL blocks fail loud in build_model, since their
-    // reference-clock input has no v1 routing model.)
+    if let Some(pll) = placed
+        .plls
+        .iter()
+        .find(|p| p.out_nets.iter().any(|o| o == net))
+    {
+        let quad = if pll.site.tile_row < 48 {
+            if pll.site.tile_col < 63 {
+                "UL"
+            } else {
+                "UR"
+            }
+        } else if pll.site.tile_col < 63 {
+            "LL"
+        } else {
+            "LR"
+        };
+        return Ok(format!("G_J{quad}CPLL0CLKOP"));
+    }
     Err(format!(
-        "route: clock '{net}': v1 needs an input-pad driver for DCC promotion"
+        "route: clock '{net}': v1 needs an input-pad or PLL driver for DCC promotion"
     ))
 }
 
-/// Lower [`place::PlacedEcp5`] to the router's [`RouteModel`].
-///
-/// Fail-loud v1 limits: EBR/DSP/PLL blocks have no routing model yet
-/// (their nets cannot be routed), and clocks need a pad/PLL driver with a
-/// DCC input wire resolvable from the DB.
 fn build_model(router: &Router, placed: &place::PlacedEcp5) -> Result<RouteModel, String> {
-    if !placed.ebrs.is_empty() {
-        return Err(format!(
-            "route: {} EBR block(s): hard-block routing is not supported in v1",
-            placed.ebrs.len()
-        ));
+    let verify_site = |what: &str, name: &str, site: &place::SiteAddr| -> Result<(), String> {
+        let exists = router.device.tiles().iter().any(|t| {
+            t.row == site.tile_row && t.col == site.tile_col && t.tile_type == site.tile_type
+        });
+        if !exists {
+            return Err(format!(
+                "route: {what} {name}: invalid site {} at R{}C{} ({})",
+                site.site, site.tile_row, site.tile_col, site.tile_type
+            ));
+        }
+        Ok(())
+    };
+    for ebr in &placed.ebrs {
+        verify_site("EBR", &ebr.name, &ebr.site)?;
     }
-    if !placed.dsps.is_empty() {
-        return Err(format!(
-            "route: {} DSP block(s): hard-block routing is not supported in v1",
-            placed.dsps.len()
-        ));
+    for dsp in &placed.dsps {
+        verify_site("DSP", &dsp.name, &dsp.site)?;
     }
-    if !placed.plls.is_empty() {
-        return Err(format!(
-            "route: {} PLL block(s): PLL reference-clock routing is not supported in v1",
-            placed.plls.len()
-        ));
+    for pll in &placed.plls {
+        verify_site("PLL", &pll.name, &pll.site)?;
     }
-
+    for dcu in &placed.dcus {
+        verify_site("DCU", &dcu.name, &dcu.site)?;
+    }
+    for ext in &placed.extrefs {
+        verify_site("EXTREFB", &ext.name, &ext.site)?;
+    }
+    for dll in &placed.ddrdlls {
+        verify_site("DDRDLL", &dll.name, &dll.site)?;
+    }
+    for dqs in &placed.dqs_blocks {
+        verify_site("DQSBUFM", &dqs.name, &dqs.site)?;
+    }
+    for iol in &placed.iologics {
+        verify_site("IOLOGIC", &iol.name, &iol.site)?;
+    }
+    for sc in &placed.sys_configs {
+        verify_site("SYSCONFIG", &sc.name, &sc.site)?;
+    }
     let mut cells: Vec<PlacedCell> = Vec::new();
     let mut net_names: HashSet<String> = HashSet::new();
 

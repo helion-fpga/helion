@@ -1,4 +1,4 @@
-// Hierarchical blinky — child tog instantiated in top
+// Hierarchical blinky - child tog instantiated in top
 module tog (
     input  logic clk,
     output logic q

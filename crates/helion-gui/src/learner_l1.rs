@@ -1,4 +1,4 @@
-//! FM-HEL-L1-GUI — Session stage / constraint provenance mirrors for the status rail.
+//! FM-HEL-L1-GUI - Session stage / constraint provenance mirrors for the status rail.
 //!
 //! Local mirrors of the Proj L1 contract (`L1-API-FOR-IDE.md`) until `wip/learner-L1`
 //! tips `Session::stage()` / `last_timing_provenance()`. Derived from Session Option

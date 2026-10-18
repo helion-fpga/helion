@@ -199,3 +199,14 @@ Rust, SystemVerilog, STA, IDE, or docs: [get involved](https://helion-fpga.githu
 ## License
 
 Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
+
+## Repository Traffic
+
+<!-- TRAFFIC-START -->
+| Metric | Total | Uniques | Days tracked |
+|---|---|---|---|
+| clones | 1560 | 594 | 14 |
+| views | 17 | 12 | 14 |
+<!-- TRAFFIC-END -->
+
+Full history: [`traffic/`](traffic/) (updated daily; GitHub drops traffic data after 14 days).

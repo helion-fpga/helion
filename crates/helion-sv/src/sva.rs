@@ -13,7 +13,7 @@
 //! [`eval`]. `helion-sim` resolves the probes at attach time and samples
 //! each posedge.
 
-use helion_ir::{CellKind, Design, PortDir};
+use helion_ir::{intern, resolve, CellKind, Design, PortDir};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -43,12 +43,13 @@ impl SvaSeverity {
     }
 }
 
-/// `$rose` / `$fell` / `$stable` sampled-value functions.
+/// `$rose` / `$fell` / `$stable` / `$past` sampled-value functions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SvaSampleFn {
     Rose,
     Fell,
     Stable,
+    Past(u32),
 }
 
 impl SvaSampleFn {
@@ -57,6 +58,7 @@ impl SvaSampleFn {
             SvaSampleFn::Rose => "$rose",
             SvaSampleFn::Fell => "$fell",
             SvaSampleFn::Stable => "$stable",
+            SvaSampleFn::Past(_) => "$past",
         }
     }
 }
@@ -97,9 +99,13 @@ pub struct ConcPropAst<'a> {
     /// True when the clocking event was `@(negedge ...)`: parses, but
     /// elaboration rejects it (the kernel is posedge-only).
     pub negedge: bool,
+    pub is_cover: bool,
+    pub(crate) disable_iff: Option<SvaBool<'a>>,
     pub(crate) antecedent: SvaBool<'a>,
-    /// Normalized delay: `|-> ##N` gives N, `|=> ##N` gives N+1.
+    /// Normalized minimum delay: `|-> ##N` gives N, `|=> ##N` gives N+1.
     pub delay: u32,
+    /// Normalized maximum delay: equals `delay` for `##N`, or `m..=n` upper bound for `##[m:n]`.
+    pub delay_max: u32,
     pub(crate) consequent: SvaBool<'a>,
     pub severity: SvaSeverity,
     pub else_msg: Option<String>,
@@ -120,18 +126,118 @@ pub struct ImmAssertAst<'a> {
     pub text: String,
 }
 
+fn parse_past_cycles(args: &[RExpr<'_>]) -> Result<u32, String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(super::sva_err(
+            "`$past` takes 1 or 2 arguments: `$past(expr [, cycles])`",
+        ));
+    }
+    if args.len() == 2 {
+        match &args[1] {
+            RExpr::Const { val, .. } if *val >= 1 && *val <= 64 => Ok(*val as u32),
+            _ => Err(super::sva_err(
+                "`$past` cycle count must be a constant integer in 1..=64",
+            )),
+        }
+    } else {
+        Ok(1)
+    }
+}
+
+fn validate_rexpr_calls(e: &RExpr<'_>) -> Result<(), String> {
+    match e {
+        RExpr::Call { name, args } => {
+            match *name {
+                "$rose" | "$fell" | "$stable" => {
+                    if args.len() != 1 {
+                        return Err(super::sva_err(format!(
+                            "`{name}` takes exactly one argument"
+                        )));
+                    }
+                    validate_rexpr_calls(&args[0])
+                }
+                "$past" => {
+                    let _ = parse_past_cycles(args)?;
+                    validate_rexpr_calls(&args[0])
+                }
+                "$sampled" | "$isunknown" | "$onehot" | "$onehot0" | "$countones" => {
+                    Err(super::sva_err(format!(
+                        "`{name}` is not in the v3.0 SVA subset"
+                    )))
+                }
+                _ => Err(super::sva_err(format!(
+                    "function call `{name}` in a property is not in the v3.0 SVA subset"
+                ))),
+            }
+        }
+        RExpr::Not(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) | RExpr::RedXor(x) => {
+            validate_rexpr_calls(x)
+        }
+        RExpr::And(a, b)
+        | RExpr::Or(a, b)
+        | RExpr::Xor(a, b)
+        | RExpr::Add(a, b)
+        | RExpr::Sub(a, b)
+        | RExpr::Mul(a, b)
+        | RExpr::Shl(a, b)
+        | RExpr::Shr(a, b)
+        | RExpr::Ashr(a, b)
+        | RExpr::Eq(a, b)
+        | RExpr::Ne(a, b)
+        | RExpr::Lt(a, b) => {
+            validate_rexpr_calls(a)?;
+            validate_rexpr_calls(b)
+        }
+        RExpr::Mux(c, t, f) => {
+            validate_rexpr_calls(c)?;
+            validate_rexpr_calls(t)?;
+            validate_rexpr_calls(f)
+        }
+        RExpr::Concat(parts) => {
+            for p in parts {
+                validate_rexpr_calls(p)?;
+            }
+            Ok(())
+        }
+        RExpr::IndexPart { base, .. } => validate_rexpr_calls(base),
+        RExpr::WordAt { addr, data } => {
+            validate_rexpr_calls(addr)?;
+            validate_rexpr_calls(data)
+        }
+        RExpr::Const { .. } | RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => Ok(()),
+    }
+}
+
 /// Rewrite a parsed [`RExpr`] into a [`SvaBool`]: `$rose` / `$fell` /
-/// `$stable` calls become [`SvaBool::Sampled`] nodes, boolean connectives are
-/// hoisted, and anything else becomes a call-free [`SvaBool::Expr`] leaf.
-/// Any other call (user function, `$past`, ...) is a named out-of-subset error.
+/// `$stable` / `$past` calls become [`SvaBool::Sampled`] nodes, boolean connectives are
+/// hoisted, and anything else becomes a validated [`SvaBool::Expr`] leaf.
 pub(crate) fn rewrite_sva_bool<'a>(e: &RExpr<'a>) -> Result<SvaBool<'a>, String> {
     match e {
         RExpr::Call { name, args } => {
             let func = match *name {
-                "$rose" => SvaSampleFn::Rose,
-                "$fell" => SvaSampleFn::Fell,
-                "$stable" => SvaSampleFn::Stable,
-                "$past" | "$sampled" | "$isunknown" | "$onehot" | "$onehot0" | "$countones" => {
+                "$rose" => {
+                    if args.len() != 1 {
+                        return Err(super::sva_err("`$rose` takes exactly one argument"));
+                    }
+                    SvaSampleFn::Rose
+                }
+                "$fell" => {
+                    if args.len() != 1 {
+                        return Err(super::sva_err("`$fell` takes exactly one argument"));
+                    }
+                    SvaSampleFn::Fell
+                }
+                "$stable" => {
+                    if args.len() != 1 {
+                        return Err(super::sva_err("`$stable` takes exactly one argument"));
+                    }
+                    SvaSampleFn::Stable
+                }
+                "$past" => {
+                    let n = parse_past_cycles(args)?;
+                    SvaSampleFn::Past(n)
+                }
+                "$sampled" | "$isunknown" | "$onehot" | "$onehot0" | "$countones" => {
                     return Err(super::sva_err(format!(
                         "`{name}` is not in the v3.0 SVA subset"
                     )));
@@ -142,11 +248,6 @@ pub(crate) fn rewrite_sva_bool<'a>(e: &RExpr<'a>) -> Result<SvaBool<'a>, String>
                     )));
                 }
             };
-            if args.len() != 1 {
-                return Err(super::sva_err(format!(
-                    "`{name}` takes exactly one argument"
-                )));
-            }
             Ok(SvaBool::Sampled {
                 func,
                 arg: Box::new(rewrite_sva_bool(&args[0])?),
@@ -161,7 +262,10 @@ pub(crate) fn rewrite_sva_bool<'a>(e: &RExpr<'a>) -> Result<SvaBool<'a>, String>
             Box::new(rewrite_sva_bool(a)?),
             Box::new(rewrite_sva_bool(b)?),
         )),
-        _ => Ok(SvaBool::Expr(e.clone())),
+        _ => {
+            validate_rexpr_calls(e)?;
+            Ok(SvaBool::Expr(e.clone()))
+        }
     }
 }
 /// Elaborated probe: one bit of signal state the sim checker samples.
@@ -329,14 +433,15 @@ pub fn eval(e: &SvaExpr, probes: &[bool], hist: &[u64]) -> (u64, u8) {
         SvaExpr::Sampled { func, arg, slot } => {
             let (cur, w) = eval(arg, probes, hist);
             let prev = hist.get(*slot).copied().unwrap_or(cur);
-            let r = match func {
+            match func {
                 // Whole-value equality with the previous cycle, masked.
-                SvaSampleFn::Stable => mask(cur, w) == mask(prev, w),
+                SvaSampleFn::Stable => (u64::from(mask(cur, w) == mask(prev, w)), 1),
                 // LSB transitions.
-                SvaSampleFn::Rose => cur & 1 == 1 && prev & 1 == 0,
-                SvaSampleFn::Fell => cur & 1 == 0 && prev & 1 == 1,
-            };
-            (u64::from(r), 1)
+                SvaSampleFn::Rose => (u64::from(cur & 1 == 1 && prev & 1 == 0), 1),
+                SvaSampleFn::Fell => (u64::from(cur & 1 == 0 && prev & 1 == 1), 1),
+                // Previous-cycle sampled value, masked to width.
+                SvaSampleFn::Past(_) => (mask(prev, w), w),
+            }
         }
     }
 }
@@ -387,7 +492,9 @@ pub struct SvaSynthOut {
 fn rexpr_text(e: &RExpr) -> String {
     match e {
         RExpr::Const { val, width, .. } => {
-            if *width <= 1 {
+            if *width == 0 {
+                format!("{val}")
+            } else if *width == 1 {
                 format!("{}", val & 1)
             } else {
                 format!("{width}'d{val}")
@@ -460,7 +567,12 @@ fn svabool_text(b: &SvaBool) -> String {
         SvaBool::Not(x) => format!("!{}", svabool_child(x)),
         SvaBool::And(a, b) => format!("{} && {}", svabool_child(a), svabool_child(b)),
         SvaBool::Or(a, b) => format!("{} || {}", svabool_child(a), svabool_child(b)),
-        SvaBool::Sampled { func, arg } => format!("{}({})", func.name(), svabool_child(arg)),
+        SvaBool::Sampled { func, arg } => match func {
+            SvaSampleFn::Past(n) if *n > 1 => {
+                format!("$past({}, {n})", svabool_child(arg))
+            }
+            _ => format!("{}({})", func.name(), svabool_child(arg)),
+        },
     }
 }
 
@@ -580,9 +692,9 @@ fn classify_probe(
     sig: &str,
 ) -> Result<SvaProbe, String> {
     if let Some(n) = design.net(net) {
-        if let Some(q) = n.endpoints.iter().find(|e| e.pin == "Q") {
+        if let Some(q) = n.endpoints.iter().find(|e| e.pin == intern("Q")) {
             let is_ff = design
-                .cell(&q.cell)
+                .cell(resolve(q.cell))
                 .map(|c| matches!(c.kind, CellKind::Hff))
                 .unwrap_or(false);
             if is_ff {
@@ -592,11 +704,10 @@ fn classify_probe(
             }
         }
     }
-    if design
-        .ports
-        .iter()
-        .any(|p| p.name == net && matches!(p.dir, PortDir::In | PortDir::Inout))
-    {
+    if design.ports.iter().any(|p| {
+        (p.name == intern(net) || p.name == intern(sig))
+            && matches!(p.dir, PortDir::In | PortDir::Inout)
+    }) {
         return Ok(SvaProbe::InputBit {
             name: net.to_string(),
         });
@@ -804,10 +915,40 @@ impl<'r> Elab<'r> {
             RExpr::Eq(a, b) => self.lower_bin(a, b, d1, SvaExpr::Eq),
             RExpr::Ne(a, b) => self.lower_bin(a, b, d1, SvaExpr::Ne),
             RExpr::Lt(a, b) => self.lower_bin(a, b, d1, SvaExpr::Lt),
-            RExpr::Call { name, .. } => Err(super::sva_err(format!(
-                "property `{}`: function call `{name}` is not in the v3.0 subset",
-                self.prop_text
-            ))),
+            RExpr::Call { name, args } => {
+                let func = match *name {
+                    "$rose" if args.len() == 1 => SvaSampleFn::Rose,
+                    "$fell" if args.len() == 1 => SvaSampleFn::Fell,
+                    "$stable" if args.len() == 1 => SvaSampleFn::Stable,
+                    "$past" => SvaSampleFn::Past(parse_past_cycles(args)?),
+                    _ => {
+                        return Err(super::sva_err(format!(
+                            "property `{}`: function call `{name}` is not in the v3.0 subset",
+                            self.prop_text
+                        )))
+                    }
+                };
+                let mut cur = self.lower_rexpr(&args[0], d1)?;
+                let stages = match func {
+                    SvaSampleFn::Past(n) => n.max(1),
+                    _ => 1,
+                };
+                for step in 0..stages {
+                    let slot = self.slots;
+                    self.slots += 1;
+                    let step_fn = if matches!(func, SvaSampleFn::Past(_)) {
+                        SvaSampleFn::Past(step + 1)
+                    } else {
+                        func
+                    };
+                    cur = SvaExpr::Sampled {
+                        func: step_fn,
+                        arg: Box::new(cur),
+                        slot,
+                    };
+                }
+                Ok(cur)
+            }
         }
     }
 
@@ -844,14 +985,26 @@ impl<'r> Elab<'r> {
                 Box::new(self.lower_bool(b, d1)?),
             )),
             SvaBool::Sampled { func, arg } => {
-                let slot = self.slots;
-                self.slots += 1;
-                let lowered = self.lower_bool(arg, d1)?;
-                Ok(SvaExpr::Sampled {
-                    func: *func,
-                    arg: Box::new(lowered),
-                    slot,
-                })
+                let mut cur = self.lower_bool(arg, d1)?;
+                let stages = match func {
+                    SvaSampleFn::Past(n) => (*n).max(1),
+                    _ => 1,
+                };
+                for step in 0..stages {
+                    let slot = self.slots;
+                    self.slots += 1;
+                    let step_fn = if matches!(func, SvaSampleFn::Past(_)) {
+                        SvaSampleFn::Past(step + 1)
+                    } else {
+                        *func
+                    };
+                    cur = SvaExpr::Sampled {
+                        func: step_fn,
+                        arg: Box::new(cur),
+                        slot,
+                    };
+                }
+                Ok(cur)
             }
         }
     }
@@ -886,6 +1039,9 @@ pub(crate) fn elaborate<'r>(
     let subst = build_subst(top);
     let mut properties = Vec::with_capacity(top.sva_conc.len());
     for ast in &top.sva_conc {
+        if ast.is_cover {
+            continue;
+        }
         if ast.negedge {
             return Err(super::sva_err(format!(
                 "property `{}` uses `@(negedge {})`: negedge sampling is not supported (the kernel is posedge-only)",
@@ -901,7 +1057,11 @@ pub(crate) fn elaborate<'r>(
             inline_stack: Vec::new(),
             prop_text: ast.text.clone(),
         };
-        let antecedent = elab.lower_bool(&ast.antecedent, 0)?;
+        let mut antecedent = elab.lower_bool(&ast.antecedent, 0)?;
+        if let Some(dis) = &ast.disable_iff {
+            let dis_e = elab.lower_bool(dis, 0)?;
+            antecedent = SvaExpr::And(Box::new(SvaExpr::Not(Box::new(dis_e))), Box::new(antecedent));
+        }
         let consequent = elab.lower_bool(&ast.consequent, 0)?;
         properties.push(SvaProperty {
             label: ast.label.clone(),
@@ -1144,14 +1304,6 @@ mod tests {
                 "assert property (@(posedge clk) a throughout b |-> c);",
                 "throughout",
             ),
-            (
-                "assert property (@(posedge clk) disable iff (!rst) a |-> b);",
-                "disable iff",
-            ),
-            (
-                "assert property (@(posedge clk) a |-> ##[1:3] b);",
-                "##[N:M]",
-            ),
             ("assert property (@(posedge clk) a |-> ##* b);", "##*"),
             (
                 "assert property (@(posedge clk) a |-> ##(1+1) b);",
@@ -1161,7 +1313,6 @@ mod tests {
                 "assert property (@(posedge clk) a |-> ##300 b);",
                 "##N",
             ),
-            ("assert property (@(posedge clk) $past(a) |-> b);", "$past"),
             (
                 "assert property (@(posedge clk) myfunc(a) |-> b);",
                 "myfunc",

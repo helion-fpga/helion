@@ -219,7 +219,7 @@ mod tests {
     fn loc_constrained_counter() -> helion_ir::Design {
         let mut d = helion_ir::Design::structural_counter();
         for port in &mut d.ports {
-            match port.name.as_str() {
+            match helion_ir::resolve(port.name) {
                 "clk" => port.attrs.set("LOC", "E3"),
                 "led" => port.attrs.set("LOC", "H5"),
                 _ => {}
@@ -282,27 +282,18 @@ mod tests {
                 ce_net: None,
                 sr_net: None,
             }],
-            iobs: vec![],
-            bufgs: vec![],
-            brams: vec![],
-            dsps: vec![],
-            carries: vec![],
+            ..Default::default()
         };
         let routed = Routed7 {
             placed: Placed7 {
                 packed: packed.clone(),
-                luts: vec![],
                 ffs: vec![crate::place::PlacedFf {
                     name: "u_ff".into(),
                     tile: "CLBLL_L_X10Y10".into(),
                     site: "SLICEL_X0Y0".into(),
                     bel: "AFF".into(),
                 }],
-                iobs: vec![],
-                bufgs: vec![],
-                brams: vec![],
-            dsps: vec![],
-            carries: vec![],
+                ..Default::default()
             },
             nets: vec![],
         };

@@ -3,7 +3,7 @@
 //! Five implementation stages (Synthesis / Opt / Place / Route / Bitstream),
 //! each a collapsing header with Run / Settings / Open-results rows. Stage
 //! state dots come from `IdeModel::step_state`; runs are queued on the engine
-//! thread via `submit_job` — never executed synchronously inside a frame.
+//! thread via `submit_job` - never executed synchronously inside a frame.
 
 use eframe::egui::{self, Color32, RichText, Sense};
 
@@ -64,7 +64,7 @@ fn paint_stage_entry(ui: &mut egui::Ui, app: &mut HelionIde, step: FlowStep) {
 fn stage_hover(app: &HelionIde, step: FlowStep) -> String {
     match app.model.step_blocked(step) {
         Some(why) => why.to_string(),
-        None => format!("{} — {}", step.label(), step.tcl()),
+        None => format!("{} - {}", step.label(), step.tcl()),
     }
 }
 
@@ -103,20 +103,24 @@ fn paint_stage_header(
     ));
     let icon_rect = egui::Rect::from_center_size(
         egui::pos2(rect.left() + 30.0, rect.center().y),
-        egui::vec2(20.0, 20.0),
+        egui::vec2(chrome::FLOW_STAGE_ICON_SIZE, chrome::FLOW_STAGE_ICON_SIZE),
     );
     icons::paint_stage(p, icon_rect, step, theme.dim);
-    p.text(
-        egui::pos2(rect.left() + 46.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        step.label(),
-        theme::font_ui(13.0),
+    let (fill, ring) = stage_dot_colors(theme, state);
+    let dot_x = rect.right() - 12.0;
+    let label_clip = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 44.0, rect.top()),
+        egui::pos2((dot_x - 10.0).max(rect.left() + 48.0), rect.bottom()),
+    );
+    let galley = p.layout_no_wrap(step.label().to_string(), theme::font_ui(13.0), theme.text);
+    p.with_clip_rect(label_clip).galley(
+        egui::pos2(rect.left() + 46.0, rect.center().y - galley.size().y * 0.5),
+        galley,
         theme.text,
     );
-    let (fill, ring) = stage_dot_colors(theme, state);
     icons::paint_stage_dot(
         p,
-        egui::pos2(rect.right() - 12.0, rect.center().y),
+        egui::pos2(dot_x, rect.center().y),
         5.0,
         fill,
         ring,
@@ -191,7 +195,10 @@ fn paint_stage_body(ui: &mut egui::Ui, app: &mut HelionIde, step: FlowStep) {
 /// Where "Open results" lands for each stage.
 fn results_tab(step: FlowStep) -> WorkspaceTab {
     match step {
-        FlowStep::Synthesis => WorkspaceTab::Hierarchy,
+        // Grammar R15: the hierarchy tree is a Z3 sidebar section now. After
+        // synthesis the netlist viewer (Schematic) is the results pane; the
+        // Files sidebar shows the hierarchy tree beside it.
+        FlowStep::Synthesis => WorkspaceTab::Schematic,
         FlowStep::Opt => WorkspaceTab::Reports,
         FlowStep::Place => WorkspaceTab::Device,
         FlowStep::Route => WorkspaceTab::Device,

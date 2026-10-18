@@ -25,8 +25,9 @@ use crate::db::{
     parse_bits_db, parse_globals, parse_iodb, parse_tilegrid, Globals, IoDb, PackagePin,
     PioMetadata, TileBits,
 };
+use rayon::prelude::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 /// Grid rows on LFE5U-85F (0..=95), from the tilegrid keys.
 pub const GRID_ROWS: u32 = 96;
@@ -192,32 +193,29 @@ pub struct ResourceCounts {
 }
 
 /// The LFE5U-85F device model.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Device {
     tiles: Vec<Tile>,
     by_type: HashMap<String, Vec<usize>>,
+    by_key: HashMap<String, usize>,
+    by_pos: HashMap<(u32, u32), Vec<usize>>,
     counts: ResourceCounts,
     iod: IoDb,
     globals: Globals,
     bits: HashMap<String, TileBits>,
 }
 
+static GLOBAL_DEV: LazyLock<Result<Device, String>> = LazyLock::new(Device::open_uncached);
+
 impl Device {
-    /// Parse the vendored Trellis database and build the device model.
-    ///
-    /// Fails loudly if any JSON file or any tile type's `bits.db` is
-    /// malformed or missing. Parse-once: use [`Device::global`] for the
-    /// process-wide instance.
-    pub fn open() -> Result<Self, String> {
+    fn open_uncached() -> Result<Self, String> {
         let tg = parse_tilegrid(include_str!("../data/tilegrid.json"))?;
         let iod = parse_iodb(include_str!("../data/iodb.json"))?;
         let globals = parse_globals(include_str!("../data/globals.json"))?;
 
         let mut tiles: Vec<Tile> = Vec::with_capacity(tg.0.len());
-        let mut positions: HashSet<(u32, u32)> = HashSet::new();
         for (key, e) in &tg.0 {
             let (row, col) = parse_key_pos(key)?;
-            positions.insert((row, col));
             let mut sites = Vec::with_capacity(e.sites.len());
             for s in &e.sites {
                 sites.push(Site {
@@ -251,26 +249,32 @@ impl Device {
         });
 
         let mut by_type: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut by_key: HashMap<String, usize> = HashMap::with_capacity(tiles.len());
+        let mut by_pos: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
         for (i, t) in tiles.iter().enumerate() {
             by_type.entry(t.tile_type.clone()).or_default().push(i);
+            by_key.insert(t.key.clone(), i);
+            by_pos.entry((t.row, t.col)).or_default().push(i);
         }
 
         let counts = count_resources(&tiles, &iod);
 
-        // Parse every vendored tile type's routing/config data now, so a
-        // corrupt bits.db fails here instead of mid-route. Note: dummy and
-        // some special tiles (OSC, POR, ...) legitimately have empty
-        // bits.db files in the Trellis DB; empty parses are accepted.
-        let mut bits = HashMap::new();
-        for tt in crate::tiledata::TILE_TYPES {
-            let text = crate::tiledata::bits_db(tt)
-                .ok_or_else(|| format!("no vendored bits.db for tile type {tt}"))?;
-            bits.insert(tt.to_string(), parse_bits_db(text));
-        }
+        // Parse every vendored tile type's routing/config data in parallel.
+        let parsed_bits: Result<Vec<(String, TileBits)>, String> = crate::tiledata::TILE_TYPES
+            .par_iter()
+            .map(|&tt| {
+                let text = crate::tiledata::bits_db(tt)
+                    .ok_or_else(|| format!("no vendored bits.db for tile type {tt}"))?;
+                Ok((tt.to_string(), parse_bits_db(text)))
+            })
+            .collect();
+        let bits: HashMap<String, TileBits> = parsed_bits?.into_iter().collect();
 
         Ok(Self {
             tiles,
             by_type,
+            by_key,
+            by_pos,
             counts,
             iod,
             globals,
@@ -278,13 +282,29 @@ impl Device {
         })
     }
 
+    /// Parse the vendored Trellis database and build the device model.
+    ///
+    /// Fails loudly if any JSON file or any tile type's `bits.db` is
+    /// malformed or missing. Shares the process-wide parsed model from
+    /// [`Device::global`].
+    pub fn open() -> Result<Self, String> {
+        Self::global().cloned()
+    }
+
     /// Process-wide device model, parsed once. Fails loudly if the vendored
     /// Trellis DB does not parse.
     pub fn global() -> Result<&'static Device, String> {
-        static DEV: OnceLock<Result<Device, String>> = OnceLock::new();
-        DEV.get_or_init(Device::open)
-            .as_ref()
-            .map_err(|e| e.clone())
+        GLOBAL_DEV.as_ref().map_err(|e| e.clone())
+    }
+
+    /// Look up a tile by its full tilegrid key in O(1).
+    pub fn tile_by_key(&self, key: &str) -> Option<&Tile> {
+        self.by_key.get(key).map(|&i| &self.tiles[i])
+    }
+
+    /// Indexes of tiles at grid `(row, col)` in O(1).
+    pub fn tiles_at(&self, row: u32, col: u32) -> &[usize] {
+        self.by_pos.get(&(row, col)).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// All tile entries, sorted by (row, col, tile_type).

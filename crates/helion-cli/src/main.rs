@@ -1,3 +1,5 @@
+mod batch_dashboard;
+
 use helion_bits::{Bitstream, bitgen, bitgen_pblock, eco_lut, readback_lut_init};
 use helion_device::Device;
 use helion_drc::check_routed;
@@ -7,13 +9,13 @@ use helion_hw::{
     CableBackend, ProgramOutcome, Tap, detect_boards, list_cables, prog_sim,
     program_hbits_with_cable, resolve_cable,
 };
-use helion_ir::Design;
+use helion_ir::{resolve, Design};
 use helion_pack::pack;
-use helion_place::{PlaceOpts, place, place_with};
+use helion_place::{PlaceOpts, place, place_with, place_with_guide};
 use helion_proj::{
     Mode, Session, constraints_from_project, expand_ip_packages, load_prj, resolve_prj_path,
 };
-use helion_route::{RouteOpts, Routed, route_with};
+use helion_route::{RouteOpts, Routed, route_with, route_with_guide};
 use helion_sta::{
     Constraints, OperatingConditions, PowerReport, TimingResult, apply_xdc, create_clock, load_sdc,
     load_xdc, report_power, report_timing_routed, report_timing_routed_xdc,
@@ -30,6 +32,72 @@ struct Compiled {
     timing: TimingResult,
 }
 
+pub(crate) fn sweep_parallel_iob_identity_luts(d: &mut Design) {
+    use helion_ir::{CellKind, Spur, intern};
+    let pin_i = intern("I");
+    let pin_pad = intern("PAD");
+    let pin_o = intern("O");
+    let pin_i0 = intern("I0");
+    let other_ipins = [
+        intern("I1"),
+        intern("I2"),
+        intern("I3"),
+        intern("I4"),
+        intern("I5"),
+    ];
+    let iob_pairs: std::collections::HashSet<(Spur, Spur)> = d
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::IobOut))
+        .filter_map(|c| {
+            let i_net = d.net_on(c.name, pin_i)?;
+            let pad_net = d.net_on(c.name, pin_pad)?;
+            (i_net != pad_net).then_some((i_net, pad_net))
+        })
+        .collect();
+    if iob_pairs.is_empty() {
+        return;
+    }
+    let mut drop_cells: std::collections::HashSet<Spur> = std::collections::HashSet::new();
+    for c in &d.cells {
+        let CellKind::Lut6 {
+            init: 0xaaaa_aaaa_aaaa_aaaa,
+        } = c.kind
+        else {
+            continue;
+        };
+        if other_ipins.iter().any(|&p| d.net_on(c.name, p).is_some()) {
+            continue;
+        }
+        let Some(i0_net) = d.net_on(c.name, pin_i0) else {
+            continue;
+        };
+        let Some(o_net) = d.net_on(c.name, pin_o) else {
+            continue;
+        };
+        if iob_pairs.contains(&(i0_net, o_net)) {
+            let has_load = d
+                .net(resolve(o_net))
+                .map(|n| {
+                    n.endpoints
+                        .iter()
+                        .any(|ep| ep.pin != pin_o && ep.pin != pin_pad)
+                })
+                .unwrap_or(false);
+            if !has_load {
+                drop_cells.insert(c.name);
+            }
+        }
+    }
+    if !drop_cells.is_empty() {
+        d.cells.retain(|c| !drop_cells.contains(&c.name));
+        for n in &mut d.nets {
+            n.endpoints.retain(|ep| !drop_cells.contains(&ep.cell));
+        }
+        d.rebuild_indexes();
+    }
+}
+
 fn synth_any(path: &str) -> Result<helion_ir::Design, String> {
     let p = Path::new(path);
     let ext = p
@@ -37,7 +105,7 @@ fn synth_any(path: &str) -> Result<helion_ir::Design, String> {
         .and_then(|e| e.to_str())
         .unwrap_or("sv")
         .to_ascii_lowercase();
-    match ext.as_str() {
+    let mut d = match ext.as_str() {
         "prj" => {
             let text = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
             let mut prj = load_prj(&text)?;
@@ -57,7 +125,9 @@ fn synth_any(path: &str) -> Result<helion_ir::Design, String> {
         "vhd" | "vhdl" => synth_vhdl_path(p),
         "c" | "cc" | "cpp" => synth_c_path(p),
         _ => synth_sv_path(p),
-    }
+    }?;
+    sweep_parallel_iob_identity_luts(&mut d);
+    Ok(d)
 }
 
 fn compile_sv(path: &str, part: &str, timing_weight: f64) -> Result<Compiled, String> {
@@ -121,7 +191,16 @@ fn compile_design_xdc(
         t0.elapsed().as_millis()
     );
     let t1 = std::time::Instant::now();
-    let placed = place_with(&packed, &dev, PlaceOpts { timing_weight, seed: 0 })?;
+    let guide = xdc.timing_guide();
+    let placed = place_with_guide(
+        &packed,
+        &dev,
+        PlaceOpts {
+            timing_weight,
+            seed: 0,
+        },
+        &guide,
+    )?;
     eprintln!(
         "hang_diag place lutff_sites={} ms={}",
         placed.lutff_sites.len(),
@@ -132,7 +211,7 @@ fn compile_design_xdc(
         max_iters: if packed.lutffs.len() > 2000 { 24 } else { 8 },
         extra_hops: 0,
     };
-    let routed = route_with(&placed, &dev, route_opts)?;
+    let routed = route_with_guide(&placed, &dev, route_opts, &guide)?;
     eprintln!(
         "hang_diag route imux={} imux_skip={} pathfinder_iters={} overused={} ms={}",
         routed.imux.len(),
@@ -223,21 +302,31 @@ fn synth_project_sources(
         );
     }
     if let Some(t) = top {
-        let mut owned: Vec<(String, String)> = Vec::new();
-        for p in paths {
-            let src = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
-            owned.push((p.display().to_string(), src));
-        }
+        // Read source files in parallel (I/O bound, safe to parallelize)
+        let owned: Vec<(String, String)> = {
+            use rayon::prelude::*;
+            paths
+                .par_iter()
+                .map(|p| {
+                    let src = std::fs::read_to_string(p)
+                        .map_err(|e| format!("{}: {e}", p.display()))?;
+                    Ok::<(String, String), String>((p.display().to_string(), src))
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        };
         let refs: Vec<(&str, &str)> = owned
             .iter()
             .map(|(a, b)| (a.as_str(), b.as_str()))
             .collect();
-        let (d, _) =
+        let (mut d, _) =
             elaborate_sv_sources(&refs, Some(t), &Default::default(), &Default::default())?;
+        sweep_parallel_iob_identity_luts(&mut d);
         Ok(d)
     } else {
         let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
-        synth_sv_files(&refs)
+        let mut d = synth_sv_files(&refs)?;
+        sweep_parallel_iob_identity_luts(&mut d);
+        Ok(d)
     }
 }
 
@@ -246,7 +335,24 @@ fn main() {
     if args.is_empty() {
         args.push("--help".into());
     }
-    let cmd = args.remove(0);
+    if batch_dashboard::VivadoCliOpts::should_intercept(&args) {
+        batch_dashboard::run_vivado_cli_or_dashboard(&args, cmd_gui);
+        return;
+    }
+    let cmd = if args
+        .first()
+        .map(|s| {
+            s == "--part"
+                || s == "--top"
+                || s.ends_with(".sv")
+                || s.ends_with(".v")
+        })
+        .unwrap_or(false)
+    {
+        "synth".to_string()
+    } else {
+        args.remove(0)
+    };
     match cmd.as_str() {
         "--version" | "-V" | "version" => {
             println!("helion {}", env!("CARGO_PKG_VERSION"));
@@ -255,6 +361,7 @@ fn main() {
         "gui" => cmd_gui(),
         "hw" => hw(args),
         "synth" => cmd_synth(&args),
+        "equiv" => cmd_equiv(&args),
         "impl" => cmd_impl(&args),
         "run" => cmd_run(&args),
         "report_timing" => cmd_timing(&args),
@@ -268,6 +375,9 @@ fn main() {
         "project" => cmd_project(&args),
         "ip" => cmd_ip(&args),
         "hnf" => cmd_hnf(&args),
+        "batch" | "tcl" | "dashboard" | "export_dashboard" => {
+            batch_dashboard::run_vivado_cli_or_dashboard(&args, cmd_gui)
+        }
         "--help" | "-h" | "help" => usage(),
         other => {
             eprintln!("unknown command {other}");
@@ -283,7 +393,8 @@ fn usage() {
   helion --version
   helion doctor
   helion gui
-  helion synth <file.sv> [--part P]
+  helion synth <file.sv> [--part P] [--verify]
+  helion equiv <golden.sv> <revised.sv> [--part P]
   helion impl <file.sv> [--part P]
   helion run <file.sv> [--cycles N] [--part P]
   helion report_timing <file.sv|.vhd> [--sdc f.sdc]
@@ -303,7 +414,8 @@ fn usage() {
   helion ip list|show <file.helion>|pack <name>
   helion hnf <file.sv> [-o out.hnf]
   helion hw list|detect
-  helion hw program|flash --cable auto|sim|usb|ofl|native [--bitstream FILE.hbits] [--part P]",
+  helion hw program|flash --cable auto|sim|usb|ofl|native [--bitstream FILE.hbits] [--part P]
+  helion -mode batch|tcl|gui [-source <script.tcl>] [-tclargs ...] [-log <file>] [-journal <file>] [-nojournal] [-notrace] [--export-dashboard <dir>]",
         v = env!("CARGO_PKG_VERSION")
     );
 }
@@ -324,20 +436,163 @@ fn positional(args: &[String]) -> Option<&str> {
     None
 }
 
+/// All positional args (for multi-file SoC support). Skips flags and their values.
+fn positionals(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "-o" {
+            i += 2;
+            continue;
+        }
+        if args[i].starts_with("--") {
+            // Flags with values: --part, --sdc, etc. take next arg; boolean flags don't.
+            // Conservative: skip flag and next arg if it doesn't look like a flag.
+            i += 1;
+            if i < args.len() && !args[i].starts_with('-') {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(args[i].as_str());
+        i += 1;
+    }
+    out
+}
+
 fn cmd_synth(args: &[String]) {
-    let path = positional(args).unwrap_or("examples/blinky.sv");
+    let files = positionals(args);
+    let path = files.first().copied().unwrap_or("examples/blinky.sv");
     let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
-    let d = synth_any(path).unwrap_or_else(|e| {
-        eprintln!("synth: {e}");
-        std::process::exit(1);
-    });
+    let top = take_flag(args, "--top");
+    let verify = args.iter().any(|a| a == "--verify");
+    // --verify: run SAT-based pre/post optimization equivalence checking.
+    // Sets HELION_PRESERVE_PRE_OPT so synth preserves the pre-opt Design,
+    // then proves equivalence between pre-opt and post-opt via varisat.
+    // SAFETY: Single-threaded CLI context; no threads spawned yet.
+    if verify {
+        unsafe { std::env::set_var("HELION_PRESERVE_PRE_OPT", "1") };
+    }
+    // Multi-file SoC support: if multiple .sv/.v files given, synthesize them together.
+    let d = if files.len() > 1 || top.is_some() {
+        let paths: Vec<std::path::PathBuf> = if files.is_empty() {
+            vec![std::path::PathBuf::from(path)]
+        } else {
+            files.iter().map(std::path::PathBuf::from).collect()
+        };
+        // All must be SV/Verilog for multi-file; otherwise fall back to single-file error.
+        let all_sv = paths.iter().all(|p| {
+            matches!(
+                p.extension().and_then(|e| e.to_str()).unwrap_or("sv").to_ascii_lowercase().as_str(),
+                "sv" | "v"
+            )
+        });
+        if !all_sv && paths.len() > 1 {
+            eprintln!("synth: multi-file only supports .sv/.v files");
+            std::process::exit(1);
+        }
+        synth_project_sources(&paths, top.as_deref()).unwrap_or_else(|e| {
+            eprintln!("synth: {e}");
+            std::process::exit(1);
+        })
+    } else {
+        synth_any(path).unwrap_or_else(|e| {
+            eprintln!("synth: {e}");
+            std::process::exit(1);
+        })
+    };
+
+    if verify {
+        unsafe { std::env::remove_var("HELION_PRESERVE_PRE_OPT") };
+        if let Some(d_pre) = helion_sv::take_pre_opt_design() {
+            let golden = helion_sv::equiv::EquivModel::from_design(&d_pre).unwrap_or_else(|e| {
+                eprintln!("verify: pre-opt model build failed: {e}");
+                std::process::exit(1);
+            });
+            let revised = helion_sv::equiv::EquivModel::from_design(&d).unwrap_or_else(|e| {
+                eprintln!("verify: post-opt model build failed: {e}");
+                std::process::exit(1);
+            });
+            match helion_sv::equiv::prove_equivalent(&golden, &revised) {
+                Ok(helion_sv::equiv::EquivVerdict::Equivalent) => {
+                    eprintln!("verify: PRE/POST EQUIVALENT (peephole opts preserved semantics)");
+                }
+                Ok(helion_sv::equiv::EquivVerdict::Counterexample(ce)) => {
+                    eprintln!(
+                        "verify: FAILED - pre/post differ at output {}",
+                        ce.differing_output
+                    );
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("verify: error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            eprintln!("verify: warning - pre-opt design not preserved (synth may have failed)");
+        }
+    }
+
     let luts = d.lut_inits();
     println!(
         "synth {} cells={} luts={} inits={luts:#x?} part={part}",
-        d.name,
+        resolve(d.name),
         d.cells.len(),
         luts.len()
     );
+}
+
+fn cmd_equiv(args: &[String]) {
+    let golden_path = positional(args).unwrap_or("examples/blinky.sv");
+    let revised_path = args
+        .iter()
+        .skip_while(|a| *a != golden_path)
+        .nth(1)
+        .cloned()
+        .unwrap_or_else(|| "examples/blinky.sv".into());
+
+    // Synthesize golden and revised in parallel (independent work)
+    let (golden_res, revised_res) = rayon::join(
+        || synth_any(golden_path),
+        || synth_any(&revised_path),
+    );
+
+    let golden = golden_res.unwrap_or_else(|e| {
+        eprintln!("equiv golden: {e}");
+        std::process::exit(1);
+    });
+    let revised = revised_res.unwrap_or_else(|e| {
+        eprintln!("equiv revised: {e}");
+        std::process::exit(1);
+    });
+
+    let golden_model = helion_sv::equiv::EquivModel::from_design(&golden).unwrap_or_else(|e| {
+        eprintln!("equiv golden model: {e}");
+        std::process::exit(1);
+    });
+    let revised_model =
+        helion_sv::equiv::EquivModel::from_design(&revised).unwrap_or_else(|e| {
+            eprintln!("equiv revised model: {e}");
+            std::process::exit(1);
+        });
+
+    match helion_sv::equiv::prove_equivalent(&golden_model, &revised_model) {
+        Ok(helion_sv::equiv::EquivVerdict::Equivalent) => {
+            println!("equiv: EQUIVALENT");
+        }
+        Ok(helion_sv::equiv::EquivVerdict::Counterexample(ce)) => {
+            println!(
+                "equiv: NOT EQUIVALENT (differing output: {})",
+                ce.differing_output
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("equiv error: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn cmd_impl(args: &[String]) {
@@ -349,7 +604,7 @@ fn cmd_impl(args: &[String]) {
     });
     println!(
         "impl {} lutffs={} iobs={} brams={} pathfinder_iters={} hops={} frames={}",
-        c.design.name,
+        resolve(c.design.name),
         c.routed.placed.packed.lutffs.len(),
         c.routed.placed.packed.iobs.len(),
         c.routed.placed.packed.brams.len(),
@@ -357,6 +612,7 @@ fn cmd_impl(args: &[String]) {
         c.routed.iob_src.first().map(|r| r.hops).unwrap_or(0),
         c.bits.frames.len()
     );
+    maybe_export_dashboard(path, &c, args);
 }
 
 fn cmd_run(args: &[String]) {
@@ -389,7 +645,7 @@ fn cmd_run(args: &[String]) {
     let bits: String = wave.iter().map(|b| if *b { '1' } else { '0' }).collect();
     println!(
         "run {} part={} STAT INIT={} DONE={} EOS={} GWE={} GSR={} GTS={} CRC_ERR={}",
-        c.design.name,
+        resolve(c.design.name),
         c.dev.part,
         sim.stat.init as u8,
         sim.stat.done as u8,
@@ -432,14 +688,14 @@ fn cmd_timing(args: &[String]) {
     if c.routed.placed.packed.lutffs.is_empty() || timing.endpoints == 0 {
         println!(
             "report_timing {} no_body cells={} (no timing: empty shell or no logic; not a closed WNS)",
-            c.design.name,
+            resolve(c.design.name),
             c.design.cells.len()
         );
         return;
     }
     println!(
         "report_timing {} WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={}",
-        c.design.name, timing.wns_ps, timing.tns_ps, timing.endpoints, timing.r2r_ps, timing.iob_ps
+        resolve(c.design.name), timing.wns_ps, timing.tns_ps, timing.endpoints, timing.r2r_ps, timing.iob_ps
     );
 }
 
@@ -453,7 +709,7 @@ fn cmd_util(args: &[String]) {
     let p = &c.routed.placed.packed;
     println!(
         "report_utilization {} LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
-        c.design.name,
+        resolve(c.design.name),
         p.lutffs.len(),
         c.dev.lut6_count(),
         p.iobs.len(),
@@ -518,7 +774,7 @@ fn cmd_reports(args: &[String]) {
     }
     println!(
         "report_timing {} WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={}",
-        c.design.name,
+        resolve(c.design.name),
         c.timing.wns_ps,
         c.timing.tns_ps,
         c.timing.endpoints,
@@ -527,7 +783,7 @@ fn cmd_reports(args: &[String]) {
     );
     println!(
         "report_utilization {} LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
-        c.design.name,
+        resolve(c.design.name),
         lutff,
         c.dev.lut6_count(),
         iob,
@@ -540,9 +796,10 @@ fn cmd_reports(args: &[String]) {
     println!("{}", pwr.text());
     println!(
         "bitstream {} bytes={} match=LUTFF,IOB,BRAM,DSP,TOTAL_UW",
-        c.design.name,
+        resolve(c.design.name),
         c.bits.packets.len()
     );
+    maybe_export_dashboard(path, &c, args);
 }
 
 fn cmd_bits(args: &[String]) {
@@ -566,7 +823,7 @@ fn cmd_bits(args: &[String]) {
         });
         println!("wrote {p} {} bytes", c.bits.packets.len());
     } else {
-        println!("bitstream {} bytes={}", c.design.name, c.bits.packets.len());
+        println!("bitstream {} bytes={}", resolve(c.design.name), c.bits.packets.len());
     }
 }
 
@@ -623,7 +880,7 @@ fn cmd_qor(args: &[String]) {
     let p = &c.routed.placed.packed;
     println!(
         "qor {} part={} LUTFF={} IOB={} BRAM={} DSP={} WNS_PS={} R2R_PS={} IOB_PS={} FRAMES={} BYTES={} ELAPSED_MS={}",
-        c.design.name,
+        resolve(c.design.name),
         c.dev.part,
         p.lutffs.len(),
         p.iobs.len(),
@@ -636,6 +893,51 @@ fn cmd_qor(args: &[String]) {
         c.bits.packets.len(),
         elapsed_ms
     );
+    maybe_export_dashboard(path, &c, args);
+}
+
+fn maybe_export_dashboard(path: &str, c: &Compiled, args: &[String]) {
+    let Some(dir) = take_flag(args, "--export-dashboard")
+        .or_else(|| take_flag(args, "-export-dashboard"))
+    else {
+        return;
+    };
+    let drc = check_routed(&c.design, &c.routed, &c.dev);
+    let pwr = power_of(c);
+    let snap = batch_dashboard::DashboardSnapshot {
+        design_name: resolve(c.design.name).to_string(),
+        requested_part: c.dev.part.clone(),
+        dev: c.dev.clone(),
+        sources: vec![path.to_string()],
+        design: c.design.clone(),
+        routed: c.routed.clone(),
+        drc,
+        timing: c.timing.clone(),
+        power: pwr,
+        bits: c.bits.clone(),
+        xdc: Constraints::default(),
+        synth_ms: 0,
+        pack_ms: 0,
+        place_ms: 0,
+        route_ms: 0,
+        sta_ms: 0,
+        bitgen_ms: 0,
+        total_ms: 0,
+    };
+    match batch_dashboard::export_dashboard_to_dir(&snap, Path::new(&dir)) {
+        Ok((jpath, hpath)) => {
+            println!(
+                "export_dashboard {} json={} html={}",
+                snap.design_name,
+                jpath.display(),
+                hpath.display()
+            );
+        }
+        Err(e) => {
+            eprintln!("export-dashboard: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn cmd_hnf(args: &[String]) {
@@ -771,7 +1073,7 @@ fn cmd_project(args: &[String]) {
         let dname = session
             .design
             .as_ref()
-            .map(|d| d.name.clone())
+            .map(|d| resolve(d.name).to_string())
             .unwrap_or_default();
         let mut sim = Fabric::new(&dev);
         sim.program(bits).unwrap_or_else(|e| {
@@ -857,7 +1159,7 @@ fn cmd_project_checkpoint_write(args: &[String]) {
     let dname = session
         .design
         .as_ref()
-        .map(|d| d.name.as_str())
+        .map(|d| resolve(d.name))
         .unwrap_or("-");
     let timing = format!(
         "report_timing {dname} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={}",
@@ -929,10 +1231,21 @@ fn cmd_project_checkpoint_eco(args: &[String]) {
         std::process::exit(1);
     });
     let hash_before = session.blinky_hash().unwrap_or(0);
-    session.eco(&dev, &cell, new_init).unwrap_or_else(|e| {
-        eprintln!("eco: {e}");
-        std::process::exit(1);
-    });
+    session
+        .eco(&dev, &cell, new_init)
+        .or_else(|e| {
+            if let Some(rest) = cell.strip_prefix("u_lut") {
+                session
+                    .eco(&dev, &format!("u_luts{rest}"), new_init)
+                    .map_err(|_| e)
+            } else {
+                Err(e)
+            }
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("eco: {e}");
+            std::process::exit(1);
+        });
     session.write_bitstream(&dev).unwrap_or_else(|e| {
         eprintln!("write_bitstream: {e}");
         std::process::exit(1);

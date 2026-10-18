@@ -4,6 +4,34 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub mod power;
+pub use power::{
+    ActivityDatabase, ActivitySource, AirflowProfile, BramWriteMode, DynamicPowerBreakdown,
+    HeatsinkProfile, NetActivity, PowerCell, PowerCellKind, PowerClock, PowerConfidence,
+    PowerNetlist, PowerOptAction, PowerOptKind, PowerOptSummary, PowerReport, RailPower,
+    ThermalConditions, VectorlessConfig, VoltageRail, analyze_power, lut6_boolean_diff_prob,
+    lut6_propagate_activity, lut6_static_prob, parse_saif, parse_vcd_activity, power_opt_design,
+    propagate_vectorless_activity,
+};
+
+pub mod io_plan;
+pub use io_plan::{
+    BankSsnSummary, BgaBall, BgaPackageGrid, DiffPolarity, IoDirection, IoDrcReport, IoDrcSeverity,
+    IoDrcViolation, IoPinAssignment, IoPlan, IoStandard, PackageKind, PinFunction, PinSsnEntry,
+    SsnReport, analyze_ssn, check_io_drc, report_ssn,
+};
+
+pub mod ultrascale;
+pub use ultrascale::{
+    Carry8Chain, Carry8Mode, Dsp48e2Config, Dsp48e2Output, Dsp48e2WideXorMode, LagunaCrossingMode,
+    PblockSlrSpec, Ramb36e2Config, SlrCascadeKind, SlrCascadeSpan, SlrRegion, SlrTopology,
+    SlrValidationReport, SlrViolation, ULTRASCALE_BLE_LETTERS, UltraScaleClbSlice,
+    UltraScaleDevice, UltraScalePart, UltraScaleSliceKind, Uram288CascadePlan, Uram288Config,
+    carry8_delay_ps, dsp48e2_delay_ps, dsp48e2_evaluate, plan_uram288_cascade,
+    sll_crossing_delay_ps, uram288_ecc_decode_72, uram288_ecc_encode_64,
+    validate_pblock_slr_assignment,
+};
+
 #[derive(Clone, Debug)]
 pub struct Device {
     pub part: String,
@@ -1039,6 +1067,45 @@ impl Device {
         } else {
             Err(format!("unsupported site {site}"))
         }
+    }
+
+    /// Run Vivado UG907 multi-rail power and junction-temperature analysis on this part.
+    pub fn analyze_power(
+        &self,
+        netlist: &PowerNetlist,
+        seed_activity: Option<&ActivityDatabase>,
+        thermal: &ThermalConditions,
+        vec_cfg: &VectorlessConfig,
+    ) -> PowerReport {
+        power::analyze_power(self, netlist, seed_activity, thermal, vec_cfg)
+    }
+
+    /// Run Vivado UG907 `power_opt_design` clock-enable & BRAM power optimization on this part.
+    pub fn power_opt_design(
+        &self,
+        netlist: &mut PowerNetlist,
+        seed_activity: Option<&ActivityDatabase>,
+        thermal: &ThermalConditions,
+        vec_cfg: &VectorlessConfig,
+    ) -> PowerOptSummary {
+        power::power_opt_design(self, netlist, seed_activity, thermal, vec_cfg)
+    }
+
+    /// Construct the BGA package ballout coordinate grid for `kind` bound to this part's HAD IOB sites.
+    pub fn bga_package(&self, kind: PackageKind) -> BgaPackageGrid {
+        BgaPackageGrid::new(kind, Some(self))
+    }
+
+    /// Run Vivado UG899 I/O and Clock Planning DRC (`BIVC-1`, `PLIO-1`..`PLIO-8`) on this device.
+    pub fn check_io_drc(&self, kind: PackageKind, plan: &IoPlan) -> IoDrcReport {
+        let grid = self.bga_package(kind);
+        io_plan::check_io_drc(&grid, plan)
+    }
+
+    /// Run Vivado UG899 Simultaneous Switching Noise (`report_ssn`) analysis on this device.
+    pub fn analyze_ssn(&self, kind: PackageKind, plan: &IoPlan) -> SsnReport {
+        let grid = self.bga_package(kind);
+        io_plan::analyze_ssn(&grid, plan)
     }
 }
 

@@ -7,8 +7,8 @@
 use super::HelionIde;
 use eframe::egui::{self};
 use helion_gui::constraints_wizard as wiz;
-use helion_gui::{IdeModel, JobKind};
-use helion_ir::PortDir;
+use helion_gui::{chrome, IdeModel, JobKind};
+use helion_ir::{resolve, PortDir};
 use std::path::PathBuf;
 
 /// Screenshot affordance: `HELION_CONSTRAINTS_WIZARD=1` auto-opens the wizard,
@@ -92,7 +92,7 @@ impl WizardUi {
     pub fn new(model: &IdeModel) -> Self {
         let ports: Vec<String> = model
             .design()
-            .map(|d| d.ports.iter().map(|p| p.name.clone()).collect())
+            .map(|d| d.ports.iter().map(|p| resolve(p.name).to_string()).collect())
             .unwrap_or_default();
         let default_port = ports
             .iter()
@@ -131,7 +131,7 @@ impl WizardUi {
                     d.ports
                         .iter()
                         .filter(|p| matches!(p.dir, PortDir::In | PortDir::Inout))
-                        .map(|p| p.name.clone())
+                        .map(|p| resolve(p.name).to_string())
                         .collect()
                 })
                 .unwrap_or_default();
@@ -141,7 +141,7 @@ impl WizardUi {
                     d.ports
                         .iter()
                         .filter(|p| matches!(p.dir, PortDir::Out | PortDir::Inout))
-                        .map(|p| p.name.clone())
+                        .map(|p| resolve(p.name).to_string())
                         .collect()
                 })
                 .unwrap_or_default();
@@ -202,7 +202,7 @@ impl WizardUi {
                         Some(PortDir::Out) => matches!(p.dir, PortDir::Out | PortDir::Inout),
                         Some(PortDir::Inout) => matches!(p.dir, PortDir::Inout),
                     })
-                    .map(|p| p.name.clone())
+                    .map(|p| resolve(p.name).to_string())
                     .collect()
             })
             .unwrap_or_default()
@@ -331,7 +331,7 @@ impl WizardUi {
         let design = match model.design() {
             Some(d) => d,
             None => {
-                errs.push(wiz::WizardError { step: wiz::WizardStep::Clocks, message: "No design loaded — open RTL first.".into() });
+                errs.push(wiz::WizardError { step: wiz::WizardStep::Clocks, message: "No design loaded - open RTL first.".into() });
                 self.errors = errs;
                 self.preview = None;
                 return false;
@@ -345,7 +345,7 @@ impl WizardUi {
         let ok = keep.is_empty();
         self.errors = keep;
         if only.is_none() && ok {
-            let text = wiz::generate_sdc(&input, &design.name);
+            let text = wiz::generate_sdc(&input, resolve(design.name));
             match wiz::validate_sdc(&text) {
                 Ok(()) => self.preview = Some(text),
                 Err(e) => {
@@ -505,9 +505,9 @@ fn paint_clocks(ui: &mut egui::Ui, app: &mut HelionIde) {
             });
             ui.horizontal(|ui| {
                 ui.label("Period (ns)");
-                ui.add(egui::TextEdit::singleline(&mut c.period_ns).desired_width(80.0));
+                ui.add(egui::TextEdit::singleline(&mut c.period_ns).desired_width(chrome::CONSTRAINT_PERIOD_FIELD_W));
                 ui.label("Duty (%)");
-                ui.add(egui::TextEdit::singleline(&mut c.duty_pct).desired_width(60.0));
+                ui.add(egui::TextEdit::singleline(&mut c.duty_pct).desired_width(chrome::CONSTRAINT_DUTY_FIELD_W));
                 ui.weak("waveform recorded for export; STA keys off period");
             });
             ui.checkbox(&mut c.generated, "Generated clock (create_generated_clock)");
@@ -523,9 +523,9 @@ fn paint_clocks(ui: &mut egui::Ui, app: &mut HelionIde) {
                             }
                         });
                     ui.label("÷");
-                    ui.add(egui::TextEdit::singleline(&mut c.divide_by).desired_width(50.0));
+                    ui.add(egui::TextEdit::singleline(&mut c.divide_by).desired_width(chrome::CONSTRAINT_DIV_FIELD_W));
                     ui.label("×");
-                    ui.add(egui::TextEdit::singleline(&mut c.multiply_by).desired_width(50.0));
+                    ui.add(egui::TextEdit::singleline(&mut c.multiply_by).desired_width(chrome::CONSTRAINT_DIV_FIELD_W));
                     ui.checkbox(&mut c.invert, "Invert");
                 });
             }
@@ -600,9 +600,9 @@ fn paint_io_delays(ui: &mut egui::Ui, app: &mut HelionIde, is_input: bool) {
                         }
                     });
                 ui.label("Min (ns)");
-                ui.add(egui::TextEdit::singleline(&mut d.min_ns).desired_width(70.0).hint_text("hold"));
+                ui.add(egui::TextEdit::singleline(&mut d.min_ns).desired_width(chrome::CONSTRAINT_DELAY_FIELD_W).hint_text("hold"));
                 ui.label("Max (ns)");
-                ui.add(egui::TextEdit::singleline(&mut d.max_ns).desired_width(70.0).hint_text("setup"));
+                ui.add(egui::TextEdit::singleline(&mut d.max_ns).desired_width(chrome::CONSTRAINT_DELAY_FIELD_W).hint_text("setup"));
             });
         });
         ui.add_space(6.0);
@@ -685,7 +685,7 @@ fn paint_exceptions(ui: &mut egui::Ui, app: &mut HelionIde) {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Delay (ns)");
-                        ui.add(egui::TextEdit::singleline(delay_ns).desired_width(80.0));
+                        ui.add(egui::TextEdit::singleline(delay_ns).desired_width(chrome::CONSTRAINT_PERIOD_FIELD_W));
                         ui.checkbox(datapath_only, "-datapath_only");
                     });
                 }
@@ -738,7 +738,7 @@ fn paint_review(ui: &mut egui::Ui, app: &mut HelionIde) {
     };
 
     if let Some(text) = &preview {
-        ui.label(egui::RichText::new("Generated SDC — parses clean against the repo SDC frontend:").strong());
+        ui.label(egui::RichText::new("Generated SDC - parses clean against the repo SDC frontend:").strong());
         ui.add(
             egui::TextEdit::multiline(&mut text.clone())
                 .code_editor()
@@ -780,7 +780,7 @@ fn paint_review(ui: &mut egui::Ui, app: &mut HelionIde) {
             }
         });
         if written.is_none() {
-            ui.weak("Write the file first — re-run timing needs the new constraints applied.");
+            ui.weak("Write the file first - re-run timing needs the new constraints applied.");
         }
     }
 
@@ -797,9 +797,9 @@ fn paint_review(ui: &mut egui::Ui, app: &mut HelionIde) {
             ui.label(egui::RichText::new("Timing after new constraints:").strong());
             if let Some(w) = wns {
                 let (txt, color) = if w < 0 {
-                    (format!("WNS = {w} ps — VIOLATED"), egui::Color32::from_rgb(255, 120, 120))
+                    (format!("WNS = {w} ps - VIOLATED"), egui::Color32::from_rgb(255, 120, 120))
                 } else {
-                    (format!("WNS = {w} ps — met"), egui::Color32::from_rgb(140, 230, 140))
+                    (format!("WNS = {w} ps - met"), egui::Color32::from_rgb(140, 230, 140))
                 };
                 ui.label(egui::RichText::new(txt).strong().color(color).monospace());
             } else {
@@ -825,7 +825,7 @@ pub fn paint(ui: &mut egui::Ui, app: &mut HelionIde) {
     ui.horizontal(|ui| {
         ui.heading("Constraints Wizard");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("✕ Close").clicked() {
+            if ui.button("× Close").clicked() {
                 app.constraints_wizard = None;
             }
         });
@@ -873,17 +873,20 @@ pub fn paint(ui: &mut egui::Ui, app: &mut HelionIde) {
         return;
     }
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        match step {
-            wiz::WizardStep::Clocks => paint_clocks(ui, app),
-            wiz::WizardStep::InputDelays => paint_io_delays(ui, app, true),
-            wiz::WizardStep::OutputDelays => paint_io_delays(ui, app, false),
-            wiz::WizardStep::Exceptions => paint_exceptions(ui, app),
-            wiz::WizardStep::Review => paint_review(ui, app),
-        }
-        let errors = app.constraints_wizard.as_ref().unwrap().errors.clone();
-        error_box(ui, &errors);
-    });
+    // No inner ScrollArea here: the wizard is page flow content, always painted
+    // inside the Timing page scroll (timing_canvas_v6), which owns scrolling.
+    // A nested area would shrink to its content and never trap the wheel, so
+    // wheeling the form would scroll the page instead (nested-scroll fix).
+    // (The editor uses the same one-outer-scroll architecture.)
+    match step {
+        wiz::WizardStep::Clocks => paint_clocks(ui, app),
+        wiz::WizardStep::InputDelays => paint_io_delays(ui, app, true),
+        wiz::WizardStep::OutputDelays => paint_io_delays(ui, app, false),
+        wiz::WizardStep::Exceptions => paint_exceptions(ui, app),
+        wiz::WizardStep::Review => paint_review(ui, app),
+    }
+    let errors = app.constraints_wizard.as_ref().unwrap().errors.clone();
+    error_box(ui, &errors);
 
     ui.add_space(6.0);
     ui.horizontal(|ui| {

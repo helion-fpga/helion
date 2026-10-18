@@ -96,19 +96,25 @@ fn ibex_pin_wrap_user_sdc_closed_wns_or_named_miss() {
         prog.contains("DONE=1") || prog.contains("backend=sim"),
         "{prog}"
     );
-    ide.exec("ila_window 16").unwrap();
-    ide.exec("ila_trigger rising").unwrap();
+    ide.exec("ila depth 16").unwrap();
+    ide.exec("ila trigger rising").unwrap();
     // Soft-hold when ILA ECO cannot grow the bitstream (HL10T affinity full after
     // deeper ysyx_ibex child fabric). Closed wrap WNS above still holds; do not
     // invent ILA samples.
-    match ide.exec("ila_arm") {
+    match ide.exec("ila arm") {
         Ok(arm) => {
             eprintln!("ila_arm={arm}");
-            eprintln!("ila_bits={}", ide.ila.bits);
+            let cap = ide.ila.capture.as_ref().expect("unified ILA capture");
+            let bits: String = cap
+                .samples
+                .iter()
+                .flat_map(|s| s.iter())
+                .map(|&b| if b == 1 { '1' } else { '0' })
+                .collect();
+            eprintln!("ila_bits={bits}");
             assert!(
-                ide.ila.bits.contains('0') && ide.ila.bits.contains('1'),
-                "filled ILA bits: {}",
-                ide.ila.bits
+                bits.contains('0') && bits.contains('1'),
+                "filled ILA bits: {bits}"
             );
         }
         Err(e) if e.contains("no-op") || e.contains("soft-hold") || e.contains("affinity") => {
