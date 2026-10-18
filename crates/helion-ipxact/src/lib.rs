@@ -1,6 +1,8 @@
 //! IEEE 1685-style pack/reimport (minimal XML). Helion-MM/ST, not AXI.
 
 use std::path::Path;
+pub mod hbm_cxl_ip;
+pub use hbm_cxl_ip::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IpCore {
@@ -852,6 +854,9 @@ pub fn catalog() -> Vec<IpCore> {
         pack_piso(),
         pack_traffic_light(),
         pack_scoreboard(),
+        pack_hbm2e_subsystem(),
+        pack_coherent_snoop_filter(),
+        pack_cxl_mem_endpoint(),
     ]
 }
 
@@ -1666,5 +1671,126 @@ file a.v
             let pkg = parse_helion(&body).unwrap();
             assert_eq!(pkg.to_ip_core().unwrap(), ip);
         }
+    }
+
+    #[test]
+    fn hbm2e_32pc_switch_row_reorder_and_cattrip_sim() {
+        let mut sim = Hbm2eSim::default();
+        // Prime PC 0, bank 0 with open row 5 (global_addr = (5 << 14))
+        sim.execute_batch(vec![Hbm2eRequest {
+            req_id: 1,
+            src_axi_port: 0,
+            global_addr: 5 << 14,
+            is_write: true,
+            data: b"HBM2e-Row5-Data".to_vec(),
+        }])
+        .unwrap();
+
+        // Submit a row-miss (row 9) followed by a row-hit (row 5): reorder queue must promote req_id 3 (row 5)!
+        let res = sim
+            .execute_batch(vec![
+                Hbm2eRequest {
+                    req_id: 2,
+                    src_axi_port: 31, // Crosses 4x4 butterfly switch to PC 0
+                    global_addr: 9 << 14,
+                    is_write: false,
+                    data: vec![0; 15],
+                },
+                Hbm2eRequest {
+                    req_id: 3,
+                    src_axi_port: 0,
+                    global_addr: 5 << 14,
+                    is_write: false,
+                    data: vec![0; 15],
+                },
+            ])
+            .unwrap();
+        assert_eq!(res[0].0, 3);
+        assert_eq!(&res[0].1, b"HBM2e-Row5-Data");
+        assert_eq!(sim.row_hit_reorders, 1);
+        assert!(sim.lateral_switch_hops >= 8);
+
+        // Verify IEEE 1500 CATTRIP thermal protection
+        sim.temp_celsius = 100;
+        assert!(sim.cattrip_asserted());
+        assert!(sim.execute_batch(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn coherent_directory_moesi_and_snoop_broadcast_elimination() {
+        let mut dir = CoherentDirectorySim::new(SnoopFilterConfig::default());
+        let addr = 0x0000_1000_0040;
+
+        // 1. Master 0 ReadShared on cold line -> Exclusive, 0 snoops sent (broadcast eliminated!)
+        let r0 = dir.process_coherent_req(0, addr, CoherentReqOpcode::ReadShared);
+        assert_eq!(r0.new_state, MoesiState::Exclusive);
+        assert_eq!(r0.snoop_targets_mask, 0);
+        assert_eq!(dir.snoop_broadcasts_eliminated, 1);
+
+        // 2. Master 3 ReadShared -> Shared, unicast snoop sent ONLY to Master 0 (mask = 1 << 0)
+        let r1 = dir.process_coherent_req(3, addr, CoherentReqOpcode::ReadShared);
+        assert_eq!(r1.new_state, MoesiState::Shared);
+        assert_eq!(r1.snoop_targets_mask, 1 << 0);
+
+        // 3. Master 5 ReadUnique -> Modified, multicast invalidation snoops sent ONLY to Masters 0 & 3
+        let r2 = dir.process_coherent_req(5, addr, CoherentReqOpcode::ReadUnique);
+        assert_eq!(r2.new_state, MoesiState::Modified);
+        assert_eq!(r2.snoop_targets_mask, (1 << 0) | (1 << 3));
+
+        // 4. MakeInvalid clears directory state to Invalid
+        let r3 = dir.process_coherent_req(5, addr, CoherentReqOpcode::MakeInvalid);
+        assert_eq!(r3.new_state, MoesiState::Invalid);
+        assert_eq!(dir.line_state(addr), MoesiState::Invalid);
+    }
+
+    #[test]
+    fn cxl_mem_hdm_decoder_flit_transactions_and_sv_generators() {
+        let mut cxl = CxlMemSim::default();
+        cxl.add_hdm_decoder(HdmDecoder {
+            base_hpa: 0x0010_0000_0000,
+            size_bytes: 0x0004_0000_0000,
+            dpa_offset: 0,
+            interleave_ways: 1,
+            interleave_granularity_bytes: 256,
+        });
+
+        let mut line = [0u8; 64];
+        line[0..8].copy_from_slice(b"CXL3-MEM");
+        let ndr = cxl.submit_m2s_rwd(
+            11,
+            CxlM2sRwdOpcode::MemWr,
+            0x0010_0000_0100,
+            &line,
+            u64::MAX,
+        );
+        assert_eq!(ndr, CxlS2mNdrOpcode::Cmp);
+
+        let rd = cxl
+            .submit_m2s_req(12, CxlM2sReqOpcode::MemRd, 0x0010_0000_0100)
+            .unwrap();
+        assert_eq!(&rd[0..8], b"CXL3-MEM");
+
+        // Unmapped HPA returns CmpE
+        assert_eq!(
+            cxl.submit_m2s_req(13, CxlM2sReqOpcode::MemRd, 0x00FF_0000_0000),
+            Err(CxlS2mNdrOpcode::CmpE)
+        );
+
+        let cat = catalog();
+        assert!(cat.iter().any(|c| c.name == "helion_hbm2e_subsystem"));
+        assert!(cat.iter().any(|c| c.name == "helion_coherent_snoop_filter"));
+        assert!(cat.iter().any(|c| c.name == "helion_cxl_mem_endpoint"));
+
+        let hbm_sv = generate_hbm2e_sv(&Hbm2eConfig::default());
+        assert!(hbm_sv.contains("module helion_hbm2e_subsystem"));
+        assert!(hbm_sv.contains("dram_status_cattrip"));
+
+        let sf_sv = generate_snoop_filter_sv(&SnoopFilterConfig::default());
+        assert!(sf_sv.contains("module helion_coherent_snoop_filter"));
+        assert!(sf_sv.contains("stat_broadcasts_eliminated"));
+
+        let cxl_sv = generate_cxl_endpoint_sv(&CxlEndpointConfig::default());
+        assert!(cxl_sv.contains("module helion_cxl_mem_endpoint"));
+        assert!(cxl_sv.contains("hdm_decode_hit"));
     }
 }
