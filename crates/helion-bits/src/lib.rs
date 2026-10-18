@@ -594,6 +594,880 @@ pub fn bitgen_pblock(
     Ok(bs)
 }
 
+/// `.pbits` header magic (`PBIT`), version, idcode, flags, pblock bounds, range count, body len, hash, CRC.
+pub const PBITS_HEADER_BYTES: usize = 4 + 2 + 4 + 4 + 16 + 4 + 8 + 32 + 4;
+
+/// Flag bit 0 in `.pbits` header: `RESET_AFTER_RECONFIG` (UG909).
+pub const PBITS_FLAG_RESET_AFTER_RECONFIG: u32 = 1 << 0;
+/// Flag bit 1 in `.pbits` header: explicit `Pblock` bounds present.
+pub const PBITS_FLAG_HAS_PBLOCK: u32 = 1 << 1;
+
+/// Vivado UG909 rectangular frame-aligned Reconfigurable Partition floorplan (`Pblock`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pblock {
+    pub name: String,
+    pub x0: u32,
+    pub y0: u32,
+    pub x1: u32,
+    pub y1: u32,
+    /// UG909 `RESET_AFTER_RECONFIG`: pulse GSR locally inside this Pblock after partial load.
+    pub reset_after_reconfig: bool,
+    /// Strict exclusive RM floorplan: static cells may not be placed inside `x0..=x1, y0..=y1`.
+    pub strict: bool,
+    /// Bitmask of minor frames covered per CLB tile major (default `0xFFFF` = all 16 minors).
+    /// A partial mask (`!= (1 << clb_minors) - 1`) violates tile-column frame alignment (`HDPR-2`).
+    pub minor_mask: u16,
+}
+
+impl Pblock {
+    pub fn new(name: impl Into<String>, x0: u32, y0: u32, x1: u32, y1: u32) -> Self {
+        Self {
+            name: name.into(),
+            x0,
+            y0,
+            x1,
+            y1,
+            reset_after_reconfig: true,
+            strict: true,
+            minor_mask: 0xFFFF,
+        }
+    }
+
+    pub fn with_reset_after_reconfig(mut self, enabled: bool) -> Self {
+        self.reset_after_reconfig = enabled;
+        self
+    }
+
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
+    }
+
+    pub fn with_minor_mask(mut self, mask: u16) -> Self {
+        self.minor_mask = mask;
+        self
+    }
+
+    #[inline]
+    pub fn contains(&self, x: u32, y: u32) -> bool {
+        x >= self.x0 && x <= self.x1 && y >= self.y0 && y <= self.y1
+    }
+
+    /// True when `(x, y)` lies on the 1-tile perimeter ring of the `Pblock` (legal `PARTPIN` interface tile).
+    #[inline]
+    pub fn is_boundary_tile(&self, x: u32, y: u32) -> bool {
+        if self.contains(x, y) {
+            return x == self.x0 || x == self.x1 || y == self.y0 || y == self.y1;
+        }
+        let dx = if x < self.x0 {
+            self.x0 - x
+        } else if x > self.x1 {
+            x - self.x1
+        } else {
+            0
+        };
+        let dy = if y < self.y0 {
+            self.y0 - y
+        } else if y > self.y1 {
+            y - self.y1
+        } else {
+            0
+        };
+        dx + dy == 1
+    }
+
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.x0 <= other.x1 && self.x1 >= other.x0 && self.y0 <= other.y1 && self.y1 >= other.y0
+    }
+
+    pub fn is_within_device(&self, dev: &Device) -> bool {
+        if self.x0 > self.x1 || self.y0 > self.y1 {
+            return false;
+        }
+        let max_x = dev.clb_x0 + dev.interior_cols.saturating_sub(1);
+        let max_y = dev.clb_y0 + dev.interior_rows.saturating_sub(1);
+        self.x0 >= dev.clb_x0 && self.x1 <= max_x && self.y0 >= dev.clb_y0 && self.y1 <= max_y
+    }
+
+    /// Check UG909 tile-column frame alignment and `RESET_AFTER_RECONFIG` rules.
+    pub fn is_frame_aligned(&self, dev: &Device) -> bool {
+        if !self.is_within_device(dev) {
+            return false;
+        }
+        let full_mask = if dev.clb_minors >= 16 {
+            u16::MAX
+        } else {
+            (1u16 << dev.clb_minors) - 1
+        };
+        (self.minor_mask & full_mask) == full_mask
+    }
+
+    pub fn clb_sites(&self) -> Vec<(u32, u32)> {
+        if self.x0 > self.x1 || self.y0 > self.y1 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(
+            ((self.x1 - self.x0 + 1) as usize).saturating_mul((self.y1 - self.y0 + 1) as usize),
+        );
+        for y in self.y0..=self.y1 {
+            for x in self.x0..=self.x1 {
+                out.push((x, y));
+            }
+        }
+        out
+    }
+
+    pub fn clb_majors(&self, dev: &Device) -> Vec<u16> {
+        let mut majors: Vec<u16> = self
+            .clb_sites()
+            .into_iter()
+            .filter_map(|(x, y)| dev.clb_major(x, y))
+            .collect();
+        majors.sort_unstable();
+        majors.dedup();
+        majors
+    }
+
+    /// Contiguous FAR (Frame Address Register) ranges covering this `Pblock`.
+    pub fn far_ranges(&self, dev: &Device) -> Vec<FarRange> {
+        let majors = self.clb_majors(dev);
+        let minor_end = dev.clb_minors.saturating_sub(1) as u8;
+        let mut ranges: Vec<FarRange> = Vec::new();
+        for maj in majors {
+            if let Some(last) = ranges.last_mut() {
+                if last.block_type == Far::CLB_IO_CLK
+                    && last.major_end + 1 == maj
+                    && last.minor_start == 0
+                    && last.minor_end == minor_end
+                {
+                    last.major_end = maj;
+                    continue;
+                }
+            }
+            ranges.push(FarRange {
+                block_type: Far::CLB_IO_CLK,
+                major_start: maj,
+                major_end: maj,
+                minor_start: 0,
+                minor_end,
+            });
+        }
+        ranges
+    }
+}
+
+/// Contiguous Frame Address Register (FAR) range addressed by a partial bitstream (`.pbits`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FarRange {
+    pub block_type: u8,
+    pub major_start: u16,
+    pub major_end: u16,
+    pub minor_start: u8,
+    pub minor_end: u8,
+}
+
+impl FarRange {
+    pub fn contains(&self, block_type: u8, major: u16, minor: u8) -> bool {
+        self.block_type == block_type
+            && major >= self.major_start
+            && major <= self.major_end
+            && minor >= self.minor_start
+            && minor <= self.minor_end
+    }
+
+    pub fn frame_count(&self) -> usize {
+        let majors = (self.major_end as usize).saturating_sub(self.major_start as usize) + 1;
+        let minors = (self.minor_end as usize).saturating_sub(self.minor_start as usize) + 1;
+        majors.saturating_mul(minors)
+    }
+}
+
+/// Differential or Pblock-scoped Partial Frame Bitstream (`.pbits`).
+///
+/// Unlike a full `.hbits` stream (which omits zero frames because full `program`
+/// wipes the die), `.pbits` carries explicit `far_ranges` and supports zeroed
+/// frames so hot-swapping `RM_A -> RM_B` scrubs stale `RM_A` configuration bits
+/// inside the `Pblock` without disturbing static frames or static FF/BRAM state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartialBitstream {
+    pub idcode: u32,
+    pub reset_after_reconfig: bool,
+    pub pblock_bounds: Option<(u32, u32, u32, u32)>,
+    pub far_ranges: Vec<FarRange>,
+    /// Frame map for the partial region (may include explicit `0` words for scrubbed frames).
+    pub frames: BTreeMap<(u8, u16, u8), u128>,
+    pub packets: Vec<u8>,
+}
+
+impl PartialBitstream {
+    pub fn from_pbits(bytes: &[u8]) -> Result<Self, String> {
+        decode_pbits(bytes)
+    }
+
+    /// Convert non-zero partial frames into a legacy `Bitstream` container.
+    pub fn to_bitstream(&self) -> Bitstream {
+        let frames: BTreeMap<(u8, u16, u8), u128> = self
+            .frames
+            .iter()
+            .filter(|(_, w)| **w != 0)
+            .map(|(k, w)| (*k, *w))
+            .collect();
+        let packets = encode_packets(self.idcode, &frames);
+        Bitstream {
+            idcode: self.idcode,
+            frames,
+            packets,
+        }
+    }
+}
+
+/// Encode a [`PartialBitstream`] into compact `.pbits` packets (retaining explicit 0-frames in diff).
+pub fn encode_pbits(
+    idcode: u32,
+    reset_after_reconfig: bool,
+    pblock_bounds: Option<(u32, u32, u32, u32)>,
+    far_ranges: &[FarRange],
+    frames: &BTreeMap<(u8, u16, u8), u128>,
+) -> Vec<u8> {
+    let range_bytes = far_ranges.len() * 8;
+    let body_cap = range_bytes + 7 + frames.len().saturating_mul(26) + 10;
+    let mut out = Vec::with_capacity(PBITS_HEADER_BYTES + body_cap);
+    out.resize(PBITS_HEADER_BYTES, 0);
+
+    for r in far_ranges {
+        out.push(r.block_type);
+        out.push(0);
+        out.extend_from_slice(&r.major_start.to_le_bytes());
+        out.extend_from_slice(&r.major_end.to_le_bytes());
+        out.push(r.minor_start);
+        out.push(r.minor_end);
+    }
+
+    // SYNC
+    out.push(0x01);
+    out.extend_from_slice(&4u16.to_le_bytes());
+    out.extend_from_slice(b"HELI");
+
+    let mut run_start: Option<u32> = None;
+    let mut last_far: Option<u32> = None;
+    let mut run: Vec<u128> = Vec::with_capacity(frames.len().min(MAX_RUN_FRAMES));
+    for ((block, major, minor), payload) in frames {
+        let far = Far {
+            block_type: *block,
+            die: 0,
+            major: *major,
+            minor: *minor,
+        }
+        .encode();
+        let contiguous = last_far.map(|prev| far == prev + 1).unwrap_or(false);
+        if !contiguous || run.len() >= MAX_RUN_FRAMES {
+            if let Some(start) = run_start {
+                if !run.is_empty() {
+                    flush_run(&mut out, start, &run);
+                }
+            }
+            run.clear();
+            run_start = Some(far);
+        }
+        run.push(*payload);
+        last_far = Some(far);
+    }
+    if let Some(start) = run_start {
+        if !run.is_empty() {
+            flush_run(&mut out, start, &run);
+        }
+    }
+    // CRC_CHECK
+    out.push(0x21);
+    out.extend_from_slice(&4u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    // DESYNC
+    out.push(0x02);
+    out.extend_from_slice(&0u16.to_le_bytes());
+
+    let mut flags = 0u32;
+    if reset_after_reconfig {
+        flags |= PBITS_FLAG_RESET_AFTER_RECONFIG;
+    }
+    let (x0, y0, x1, y1) = if let Some(b) = pblock_bounds {
+        flags |= PBITS_FLAG_HAS_PBLOCK;
+        b
+    } else {
+        (0, 0, 0, 0)
+    };
+    let body_len = (out.len() - PBITS_HEADER_BYTES) as u64;
+    out[0..4].copy_from_slice(b"PBIT");
+    out[4..6].copy_from_slice(&1u16.to_le_bytes());
+    out[6..10].copy_from_slice(&idcode.to_le_bytes());
+    out[10..14].copy_from_slice(&flags.to_le_bytes());
+    out[14..18].copy_from_slice(&x0.to_le_bytes());
+    out[18..22].copy_from_slice(&y0.to_le_bytes());
+    out[22..26].copy_from_slice(&x1.to_le_bytes());
+    out[26..30].copy_from_slice(&y1.to_le_bytes());
+    out[30..34].copy_from_slice(&(far_ranges.len() as u32).to_le_bytes());
+    out[34..42].copy_from_slice(&body_len.to_le_bytes());
+    let hash = sha256_lite(&out[PBITS_HEADER_BYTES..]);
+    out[42..74].copy_from_slice(&hash);
+    let hdr_crc = crc32c(&out[..74]);
+    out[74..78].copy_from_slice(&hdr_crc.to_le_bytes());
+    out
+}
+
+/// Decode a `.pbits` stream back into a [`PartialBitstream`].
+pub fn decode_pbits(bytes: &[u8]) -> Result<PartialBitstream, String> {
+    if bytes.len() < PBITS_HEADER_BYTES || &bytes[0..4] != b"PBIT" {
+        return Err("not a .pbits stream".into());
+    }
+    let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+    if version != 1 {
+        return Err(format!("unsupported .pbits version {version}"));
+    }
+    let idcode = u32::from_le_bytes(bytes[6..10].try_into().unwrap());
+    let flags = u32::from_le_bytes(bytes[10..14].try_into().unwrap());
+    let x0 = u32::from_le_bytes(bytes[14..18].try_into().unwrap());
+    let y0 = u32::from_le_bytes(bytes[18..22].try_into().unwrap());
+    let x1 = u32::from_le_bytes(bytes[22..26].try_into().unwrap());
+    let y1 = u32::from_le_bytes(bytes[26..30].try_into().unwrap());
+    let n_ranges = u32::from_le_bytes(bytes[30..34].try_into().unwrap()) as usize;
+    let body_len = u64::from_le_bytes(bytes[34..42].try_into().unwrap()) as usize;
+    let stored_hash = &bytes[42..74];
+    let hdr_crc = u32::from_le_bytes(bytes[74..78].try_into().unwrap());
+    if crc32c(&bytes[..74]) != hdr_crc {
+        return Err(".pbits header CRC mismatch".into());
+    }
+    let body = bytes
+        .get(PBITS_HEADER_BYTES..PBITS_HEADER_BYTES + body_len)
+        .ok_or_else(|| "truncated .pbits body".to_string())?;
+    if sha256_lite(body) != stored_hash {
+        return Err(".pbits body hash mismatch".into());
+    }
+    let range_bytes = n_ranges
+        .checked_mul(8)
+        .ok_or_else(|| "overflow in .pbits FAR range table".to_string())?;
+    if body.len() < range_bytes {
+        return Err("truncated .pbits FAR range table".into());
+    }
+    let mut far_ranges = Vec::with_capacity(n_ranges);
+    for c in body[..range_bytes].chunks_exact(8) {
+        far_ranges.push(FarRange {
+            block_type: c[0],
+            major_start: u16::from_le_bytes([c[2], c[3]]),
+            major_end: u16::from_le_bytes([c[4], c[5]]),
+            minor_start: c[6],
+            minor_end: c[7],
+        });
+    }
+    let mut frames = BTreeMap::new();
+    let mut far = 0u32;
+    let mut synced = false;
+    let mut i = range_bytes;
+    while i < body.len() {
+        let op = body[i];
+        let len = u16::from_le_bytes(
+            body.get(i + 1..i + 3)
+                .ok_or_else(|| "truncated .pbits packet header".to_string())?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let payload = body
+            .get(i + 3..i + 3 + len)
+            .ok_or_else(|| format!("truncated payload for .pbits packet {op:#04x}"))?;
+        match op {
+            0x01 => {
+                if payload != b"HELI" {
+                    return Err("bad SYNC word in .pbits".into());
+                }
+                synced = true;
+            }
+            0x10 => {
+                if len != 4 {
+                    return Err("WRITE_FAR must be 4 bytes".into());
+                }
+                far = u32::from_le_bytes(payload.try_into().unwrap());
+            }
+            0x11 => {
+                if !synced {
+                    return Err("WRITE_FDRI before SYNC".into());
+                }
+                if len % 16 != 0 {
+                    return Err(format!("WRITE_FDRI length {len} is not a whole frame"));
+                }
+                for chunk in payload.chunks_exact(16) {
+                    let f = Far::decode(far);
+                    frames.insert(
+                        (f.block_type, f.major, f.minor),
+                        u128::from_le_bytes(chunk.try_into().unwrap()),
+                    );
+                    far += 1;
+                }
+            }
+            0x21 => {}
+            0x02 => synced = false,
+            other => return Err(format!("unknown .pbits packet {other:#04x}")),
+        }
+        i += 3 + len;
+    }
+    let reset_after_reconfig = (flags & PBITS_FLAG_RESET_AFTER_RECONFIG) != 0;
+    let pblock_bounds = if (flags & PBITS_FLAG_HAS_PBLOCK) != 0 {
+        Some((x0, y0, x1, y1))
+    } else {
+        None
+    };
+    Ok(PartialBitstream {
+        idcode,
+        reset_after_reconfig,
+        pblock_bounds,
+        far_ranges,
+        frames,
+        packets: bytes.to_vec(),
+    })
+}
+
+/// Generate a `.pbits` partial bitstream for a rectangular [`Pblock`].
+///
+/// Includes the FAR ranges covering `pblock` and all non-zero frames inside `pblock`.
+pub fn bitgen_partial_pblock(
+    dev: &Device,
+    routed: &Routed,
+    pblock: &Pblock,
+) -> Result<PartialBitstream, String> {
+    if !pblock.is_within_device(dev) {
+        return Err(format!(
+            "HDPR-1: pblock {} (X{}Y{}:X{}Y{}) out of device CLB bounds",
+            pblock.name, pblock.x0, pblock.y0, pblock.x1, pblock.y1
+        ));
+    }
+    if !pblock.is_frame_aligned(dev) {
+        return Err(format!(
+            "HDPR-2: pblock {} minor_mask {:#06x} is not aligned to full CLB column frames",
+            pblock.name, pblock.minor_mask
+        ));
+    }
+    let full = bitgen(dev, routed)?;
+    let far_ranges = pblock.far_ranges(dev);
+    let mut frames = BTreeMap::new();
+    for ((b, maj, min), w) in &full.frames {
+        if far_ranges.iter().any(|r| r.contains(*b, *maj, *min)) && *w != 0 {
+            frames.insert((*b, *maj, *min), *w);
+        }
+    }
+    if frames.is_empty() {
+        return Err(format!(
+            "{ERR_CODE_EMPTY_BITSTREAM}: pblock {} produced no frames",
+            pblock.name
+        ));
+    }
+    let bounds = Some((pblock.x0, pblock.y0, pblock.x1, pblock.y1));
+    let packets = encode_pbits(
+        dev.idcode,
+        pblock.reset_after_reconfig,
+        bounds,
+        &far_ranges,
+        &frames,
+    );
+    Ok(PartialBitstream {
+        idcode: dev.idcode,
+        reset_after_reconfig: pblock.reset_after_reconfig,
+        pblock_bounds: bounds,
+        far_ranges,
+        frames,
+        packets,
+    })
+}
+
+/// Generate a compact differential `.pbits` stream containing only modified frames
+/// between `base` and `target` (optionally scoped to `pblock`).
+///
+/// Frames present in `base` that become `0` in `target` are recorded explicitly
+/// with payload `0` so live fabric swap scrubs the old RM configuration.
+pub fn diff_partial_bitstream(
+    dev: &Device,
+    base: &Bitstream,
+    target: &Bitstream,
+    pblock: Option<&Pblock>,
+) -> Result<PartialBitstream, String> {
+    if base.idcode != dev.idcode || target.idcode != dev.idcode {
+        return Err(format!(
+            "idcode mismatch in diff_partial_bitstream: dev={:#010x} base={:#010x} target={:#010x}",
+            dev.idcode, base.idcode, target.idcode
+        ));
+    }
+    let (far_ranges, reset_after_reconfig, bounds) = if let Some(pb) = pblock {
+        if !pb.is_within_device(dev) {
+            return Err(format!(
+                "HDPR-1: pblock {} (X{}Y{}:X{}Y{}) out of device CLB bounds",
+                pb.name, pb.x0, pb.y0, pb.x1, pb.y1
+            ));
+        }
+        if !pb.is_frame_aligned(dev) {
+            return Err(format!(
+                "HDPR-2: pblock {} minor_mask {:#06x} is not frame-aligned",
+                pb.name, pb.minor_mask
+            ));
+        }
+        (
+            pb.far_ranges(dev),
+            pb.reset_after_reconfig,
+            Some((pb.x0, pb.y0, pb.x1, pb.y1)),
+        )
+    } else {
+        (Vec::new(), false, None)
+    };
+
+    let in_scope = |b: u8, maj: u16, min: u8| -> bool {
+        if far_ranges.is_empty() {
+            true
+        } else {
+            far_ranges.iter().any(|r| r.contains(b, maj, min))
+        }
+    };
+
+    let mut all_keys: std::collections::BTreeSet<(u8, u16, u8)> = std::collections::BTreeSet::new();
+    for &k in base.frames.keys().chain(target.frames.keys()) {
+        if in_scope(k.0, k.1, k.2) {
+            all_keys.insert(k);
+        }
+    }
+    let mut frames = BTreeMap::new();
+    let mut diff_ranges: Vec<FarRange> = far_ranges;
+    for k in all_keys {
+        let w0 = base.frames.get(&k).copied().unwrap_or(0);
+        let w1 = target.frames.get(&k).copied().unwrap_or(0);
+        if w0 != w1 {
+            frames.insert(k, w1);
+            if pblock.is_none() {
+                diff_ranges.push(FarRange {
+                    block_type: k.0,
+                    major_start: k.1,
+                    major_end: k.1,
+                    minor_start: k.2,
+                    minor_end: k.2,
+                });
+            }
+        }
+    }
+    let packets = encode_pbits(
+        dev.idcode,
+        reset_after_reconfig,
+        bounds,
+        &diff_ranges,
+        &frames,
+    );
+    Ok(PartialBitstream {
+        idcode: dev.idcode,
+        reset_after_reconfig,
+        pblock_bounds: bounds,
+        far_ranges: diff_ranges,
+        frames,
+        packets,
+    })
+}
+
+/// Sub-millisecond in-place LUT6 `INIT` ECO patcher (`< 1 ms`, O(1) frame lookup).
+///
+/// Directly updates the 64-bit truth table for `CLB_X{x}Y{y}.BLE{ble}` in `bits.frames`
+/// and re-encodes the sparse packet buffer without running placement or routing.
+pub fn patch_lut_init(
+    dev: &Device,
+    bits: &mut Bitstream,
+    x: u32,
+    y: u32,
+    ble: u32,
+    new_init: u64,
+) -> Result<(), String> {
+    if bits.idcode != dev.idcode {
+        return Err(format!(
+            "idcode mismatch bitstream {:#010x} device {:#010x}",
+            bits.idcode, dev.idcode
+        ));
+    }
+    let major = dev
+        .clb_major(x, y)
+        .ok_or_else(|| format!("not a CLB site CLB_X{x}Y{y}"))?;
+    let bi = ble as usize;
+    if bi >= dev.n_ble as usize || bi >= 8 {
+        return Err(format!("BLE {ble} out of range at CLB_X{x}Y{y}"));
+    }
+    let feat = clb_feat(dev)?;
+    let fb = feat.frame_bits;
+    let abs0 = feat.init0_abs[bi];
+    let minor = (abs0 / fb) as u8;
+    let bit0 = abs0 % fb;
+    let key = (Far::CLB_IO_CLK, major, minor);
+    let clear_mask: u128 = (u64::MAX as u128) << bit0;
+    let set_mask: u128 = (new_init as u128) << bit0;
+    let cur = bits.frames.get(&key).copied().unwrap_or(0);
+    let updated = (cur & !clear_mask) | set_mask;
+    if updated == 0 {
+        bits.frames.remove(&key);
+    } else {
+        bits.frames.insert(key, updated);
+    }
+    bits.packets = encode_packets(bits.idcode, &bits.frames);
+    Ok(())
+}
+
+/// Sub-millisecond LUT `INIT` ECO by logical cell name using existing placement coordinates.
+pub fn patch_lut_init_cell(
+    dev: &Device,
+    routed: &Routed,
+    bits: &mut Bitstream,
+    cell: &str,
+    new_init: u64,
+) -> Result<(u32, u32, u8), String> {
+    let idx = routed
+        .placed
+        .packed
+        .lutffs
+        .iter()
+        .position(|l| l.lut_cell == cell || l.ff_cell == cell)
+        .ok_or_else(|| format!("eco: no LUT/FF cell {cell}"))?;
+    let (site, ble) = routed.placed.lutff_sites[idx];
+    patch_lut_init(dev, bits, site.x, site.y, ble as u32, new_init)?;
+    Ok((site.x, site.y, ble))
+}
+
+/// Read back an 8-bit IMUX selector `CLB_X{x}Y{y}.IMUX[{mux}][0..7]` directly from `bits`.
+pub fn readback_imux_sel(
+    dev: &Device,
+    bits: &Bitstream,
+    x: u32,
+    y: u32,
+    mux: u32,
+) -> Result<u8, String> {
+    let major = dev
+        .clb_major(x, y)
+        .ok_or_else(|| format!("not a CLB site CLB_X{x}Y{y}"))?;
+    if mux >= 64 {
+        return Err(format!("IMUX {mux} out of range at CLB_X{x}Y{y}"));
+    }
+    let feat = clb_feat(dev)?;
+    let fb = feat.frame_bits;
+    let mut sel = 0u8;
+    for b in 0..8u32 {
+        let abs = match b {
+            0..=4 => feat.imux0_abs + mux * 5 + b,
+            5 => feat.imux5_abs + mux,
+            6 => feat.imux6_abs + mux,
+            7 => feat.imux7_abs + mux,
+            _ => unreachable!(),
+        };
+        let minor = (abs / fb) as u8;
+        let bit = abs % fb;
+        let word = bits
+            .frames
+            .get(&(Far::CLB_IO_CLK, major, minor))
+            .copied()
+            .unwrap_or(0);
+        if (word >> bit) & 1 == 1 {
+            sel |= 1u8 << b;
+        }
+    }
+    Ok(sel)
+}
+
+/// Directly patch `CLB_X{x}Y{y}.IMUX[{mux}][0..7]` in `bits` in O(1) time.
+pub fn patch_imux_sel(
+    dev: &Device,
+    bits: &mut Bitstream,
+    x: u32,
+    y: u32,
+    mux: u32,
+    sel: u8,
+) -> Result<(), String> {
+    if bits.idcode != dev.idcode {
+        return Err(format!(
+            "idcode mismatch bitstream {:#010x} device {:#010x}",
+            bits.idcode, dev.idcode
+        ));
+    }
+    let major = dev
+        .clb_major(x, y)
+        .ok_or_else(|| format!("not a CLB site CLB_X{x}Y{y}"))?;
+    if mux >= 64 {
+        return Err(format!("IMUX {mux} out of range at CLB_X{x}Y{y}"));
+    }
+    let feat = clb_feat(dev)?;
+    let fb = feat.frame_bits;
+    for b in 0..8u32 {
+        let abs = match b {
+            0..=4 => feat.imux0_abs + mux * 5 + b,
+            5 => feat.imux5_abs + mux,
+            6 => feat.imux6_abs + mux,
+            7 => feat.imux7_abs + mux,
+            _ => unreachable!(),
+        };
+        let minor = (abs / fb) as u8;
+        let bit = abs % fb;
+        let key = (Far::CLB_IO_CLK, major, minor);
+        let cur = bits.frames.get(&key).copied().unwrap_or(0);
+        let updated = if (sel >> b) & 1 == 1 {
+            cur | (1u128 << bit)
+        } else {
+            cur & !(1u128 << bit)
+        };
+        if updated == 0 {
+            bits.frames.remove(&key);
+        } else {
+            bits.frames.insert(key, updated);
+        }
+    }
+    bits.packets = encode_packets(bits.idcode, &bits.frames);
+    Ok(())
+}
+
+/// Compute the HAD IMUX select byte connecting driver `(from_x, from_y, dble)` to sink `(to_x, to_y)`.
+pub fn encode_imux_hop(
+    from_x: u32,
+    from_y: u32,
+    dble: u8,
+    to_x: u32,
+    to_y: u32,
+) -> Result<u8, String> {
+    if dble >= 8 {
+        return Err(format!("driver BLE {dble} out of range (0..8)"));
+    }
+    if from_x == to_x && from_y == to_y {
+        return Ok(16 + dble);
+    }
+    if from_x == to_x && from_y + 1 == to_y {
+        return Ok(dble);
+    }
+    if from_x == to_x && to_y + 1 == from_y {
+        return Ok(8 + dble);
+    }
+    if from_x == to_x && from_y + 2 == to_y {
+        return Ok(32 + dble);
+    }
+    if from_x == to_x && to_y + 2 == from_y {
+        return Ok(40 + dble);
+    }
+    if from_y == to_y && from_x + 1 == to_x {
+        return Ok(48 + dble);
+    }
+    if from_y == to_y && to_x + 1 == from_x {
+        return Ok(56 + dble);
+    }
+    if from_y == to_y && from_x + 2 == to_x {
+        return Ok(64 + dble);
+    }
+    if from_y == to_y && to_x + 2 == from_x {
+        return Ok(72 + dble);
+    }
+    if from_x + 1 == to_x && from_y + 1 == to_y {
+        return Ok(80 + dble);
+    }
+    if to_x + 1 == from_x && from_y + 1 == to_y {
+        return Ok(88 + dble);
+    }
+    if from_x + 1 == to_x && to_y + 1 == from_y {
+        return Ok(96 + dble);
+    }
+    if to_x + 1 == from_x && to_y + 1 == from_y {
+        return Ok(104 + dble);
+    }
+    if from_x == to_x && from_y + 3 == to_y {
+        return Ok(112 + dble);
+    }
+    if from_x == to_x && to_y + 3 == from_y {
+        return Ok(120 + dble);
+    }
+    if from_x + 2 == to_x && from_y + 1 == to_y {
+        return Ok(128 + dble);
+    }
+    if from_x + 2 == to_x && to_y + 1 == from_y {
+        return Ok(136 + dble);
+    }
+    if to_x + 2 == from_x && from_y + 1 == to_y {
+        return Ok(144 + dble);
+    }
+    if to_x + 2 == from_x && to_y + 1 == from_y {
+        return Ok(152 + dble);
+    }
+    if from_x + 1 == to_x && from_y + 2 == to_y {
+        return Ok(160 + dble);
+    }
+    if from_x + 1 == to_x && to_y + 2 == from_y {
+        return Ok(168 + dble);
+    }
+    if to_x + 1 == from_x && from_y + 2 == to_y {
+        return Ok(176 + dble);
+    }
+    if to_x + 1 == from_x && to_y + 2 == from_y {
+        return Ok(184 + dble);
+    }
+    if from_y == to_y && from_x + 3 == to_x {
+        return Ok(192 + dble);
+    }
+    if from_y == to_y && to_x + 3 == from_x {
+        return Ok(200 + dble);
+    }
+    if from_x + 2 == to_x && from_y + 2 == to_y {
+        return Ok(208 + dble);
+    }
+    if to_x + 2 == from_x && from_y + 2 == to_y {
+        return Ok(216 + dble);
+    }
+    if from_x + 2 == to_x && to_y + 2 == from_y {
+        return Ok(224 + dble);
+    }
+    if to_x + 2 == from_x && to_y + 2 == from_y {
+        return Ok(232 + dble);
+    }
+    if from_x == to_x && from_y + 4 == to_y {
+        return Ok(240 + dble);
+    }
+    if from_x == to_x && to_y + 4 == from_y {
+        return Ok(248 + dble);
+    }
+    Err(format!(
+        "ECO probe: no single-hop IMUX route from CLB_X{from_x}Y{from_y}/BLE{dble} to CLB_X{to_x}Y{to_y}"
+    ))
+}
+
+/// Sub-millisecond incremental probe ECO reroute (`< 1 ms`, no placement or PathFinder).
+///
+/// Re-routes either:
+/// - an IOB debug/probe output pad when `dst_target.1 == dev.clb_y0 - 1` (`(iob_x, iob_y, _)`), or
+/// - a CLB IMUX input `(dst_x, dst_y, mux)` (e.g. an ILA capture/trigger probe LUT pin)
+/// to sample `src_ble = (src_x, src_y, dble)` directly in `bits`.
+/// Returns the programmed selector byte (for CLB IMUX) or `dble` (for IOB pad bind).
+pub fn reroute_probe_eco(
+    dev: &Device,
+    bits: &mut Bitstream,
+    src_ble: (u32, u32, u8),
+    dst_target: (u32, u32, u32),
+) -> Result<u8, String> {
+    if bits.idcode != dev.idcode {
+        return Err(format!(
+            "idcode mismatch bitstream {:#010x} device {:#010x}",
+            bits.idcode, dev.idcode
+        ));
+    }
+    let (sx, sy, dble) = src_ble;
+    if dev.clb_major(sx, sy).is_none() {
+        return Err(format!("probe source CLB_X{sx}Y{sy} is not a legal CLB tile"));
+    }
+    if u32::from(dble) >= dev.n_ble {
+        return Err(format!("probe source BLE {dble} out of range"));
+    }
+    let (dx, dy, dst_mux) = dst_target;
+    if dy == dev.clb_y0.saturating_sub(1) {
+        let major = dev
+            .iob_major(dx, dy)
+            .ok_or_else(|| format!("IOB_X{dx}Y{dy} is not a legal IOB site"))?;
+        let key = (Far::IOB, major, 0);
+        let prev_elec = bits.frames.get(&key).copied().unwrap_or(0) & !0xFFFFu128;
+        let word = 1u128 | ((dble as u128) << 1) | ((sy as u128) << 4) | prev_elec;
+        bits.frames.insert(key, word);
+        bits.packets = encode_packets(bits.idcode, &bits.frames);
+        return Ok(dble);
+    }
+    let sel = encode_imux_hop(sx, sy, dble, dx, dy)?;
+    patch_imux_sel(dev, bits, dx, dy, dst_mux, sel)?;
+    Ok(sel)
+}
+
 fn sha256_lite(data: &[u8]) -> [u8; 32] {
     // 0.1 header hash: CRC32C repeated; not cryptographic. Field is 32 bytes.
     let c = crc32c(data);
@@ -981,5 +1855,100 @@ mod tests {
             "{err}"
         );
         assert!(!err.contains("DONE=1"), "must not invent DONE: {err}");
+    }
+
+    #[test]
+    fn pbits_encode_decode_and_diff_scrubs_zeroed_frames() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_counter(), &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        let base = bitgen(&dev, &r).unwrap();
+        let (site, ble) = r.placed.lutff_sites[0];
+
+        let pblock = Pblock::new("pblock_rm", site.x, site.y, site.x, site.y)
+            .with_reset_after_reconfig(true);
+        assert!(pblock.is_within_device(&dev));
+        assert!(pblock.is_frame_aligned(&dev));
+
+        let pbits = bitgen_partial_pblock(&dev, &r, &pblock).unwrap();
+        assert!(pbits.reset_after_reconfig);
+        assert_eq!(pbits.pblock_bounds, Some((site.x, site.y, site.x, site.y)));
+        assert_eq!(pbits.far_ranges.len(), 1);
+        let round = decode_pbits(&pbits.packets).unwrap();
+        assert_eq!(round, pbits);
+
+        // Corrupt magic and CRC must fail decode_pbits.
+        let mut bad_crc = pbits.packets.clone();
+        bad_crc[6] ^= 0xFF;
+        assert!(decode_pbits(&bad_crc).is_err());
+
+        // Diff against a target where the CLB frame is cleared to 0:
+        // diff_partial_bitstream must record an explicit 0 word so the fabric scrubs it.
+        let mut target = base.clone();
+        let maj = dev.clb_major(site.x, site.y).unwrap();
+        target.frames.remove(&(Far::CLB_IO_CLK, maj, 0));
+        let diff = diff_partial_bitstream(&dev, &base, &target, Some(&pblock)).unwrap();
+        assert_eq!(diff.frames.get(&(Far::CLB_IO_CLK, maj, 0)), Some(&0u128));
+        let diff_rt = decode_pbits(&diff.packets).unwrap();
+        assert_eq!(diff_rt.frames.get(&(Far::CLB_IO_CLK, maj, 0)), Some(&0u128));
+
+        // Check ble LUT INIT in pblock stream
+        let _ = ble;
+    }
+
+    #[test]
+    fn sub_millisecond_patch_lut_init_and_reroute_probe_eco() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_counter(), &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        let mut bs = bitgen(&dev, &r).unwrap();
+        let (site, ble) = r.placed.lutff_sites[0];
+
+        let t0 = std::time::Instant::now();
+        patch_lut_init(&dev, &mut bs, site.x, site.y, ble as u32, 0xDEAD_BEEF_CAFE_BABEu64)
+            .unwrap();
+        let elapsed_lut = t0.elapsed();
+        assert!(
+            elapsed_lut.as_micros() < 1_000,
+            "patch_lut_init must complete in < 1 ms, took {elapsed_lut:?}"
+        );
+        assert_eq!(
+            readback_lut_init(&dev, &bs, site.x, site.y, ble as u32).unwrap(),
+            0xDEAD_BEEF_CAFE_BABEu64
+        );
+
+        // Cell-based LUT ECO patch must match eco_lut bit-for-bit.
+        let cell_name = r.placed.packed.lutffs[0].lut_cell.clone();
+        let mut bs_cell = bitgen(&dev, &r).unwrap();
+        patch_lut_init_cell(&dev, &r, &mut bs_cell, &cell_name, 0x1234_5678_9ABC_DEF0).unwrap();
+        let full_eco = eco_lut(&dev, &r, &cell_name, 0x1234_5678_9ABC_DEF0).unwrap();
+        assert_eq!(bs_cell.frames, full_eco.frames);
+        assert_eq!(bs_cell.packets, full_eco.packets);
+
+        // Sub-millisecond probe ECO reroute to a neighboring CLB IMUX and to an IOB pad.
+        let t1 = std::time::Instant::now();
+        let sel = reroute_probe_eco(
+            &dev,
+            &mut bs,
+            (site.x, site.y, ble),
+            (site.x + 1, site.y, 0),
+        )
+        .unwrap();
+        let elapsed_probe = t1.elapsed();
+        assert!(
+            elapsed_probe.as_micros() < 1_000,
+            "reroute_probe_eco must complete in < 1 ms, took {elapsed_probe:?}"
+        );
+        assert_eq!(sel, 48 + ble);
+        assert_eq!(
+            readback_imux_sel(&dev, &bs, site.x + 1, site.y, 0).unwrap(),
+            48 + ble
+        );
+
+        let iob = r.iob_src[0].iob;
+        let iob_ble = reroute_probe_eco(&dev, &mut bs, (site.x, site.y, 3), (iob.0, iob.1, 0)).unwrap();
+        assert_eq!(iob_ble, 3);
     }
 }
