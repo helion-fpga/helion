@@ -66,6 +66,19 @@ helion-ecp5 = { path = "crates/helion-ecp5" }
 criterion = "0.5"
 rayon = "1.8"
 
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 16
+
+[profile.release-small]
+inherits = "release"
+opt-level = "z"
+lto = "thin"
+strip = "symbols"
+codegen-units = 1
+panic = "abort"
+
 [profile.bench]
 inherits = "release"
 debug = true

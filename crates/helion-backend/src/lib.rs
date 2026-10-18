@@ -176,7 +176,9 @@ pub trait Backend {
     fn run(&self, netlist: &NetlistIr) -> Result<Self::Bitstream, String> {
         let packed = self.pack(netlist)?;
         let placed = self.place(&packed)?;
+        drop(packed);
         let routed = self.route(&placed)?;
+        drop(placed);
         self.bitstream(&routed)
     }
 
@@ -184,4 +186,141 @@ pub trait Backend {
     /// analysis must use for this device. Timing-closed means the same thing
     /// on every backend because every backend's STA consumes its own model.
     fn timing_model(&self) -> TimingModel;
+}
+
+/// Zero-allocation structural memory footprint summary of a [`NetlistIr`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NetlistFootprint {
+    pub ports: usize,
+    pub cells: usize,
+    pub nets: usize,
+    pub endpoints: usize,
+    pub instances: usize,
+    pub estimated_heap_bytes: usize,
+}
+
+impl NetlistFootprint {
+    /// Compute structural counts and estimated in-memory footprint in bytes
+    /// without allocating.
+    pub fn from_netlist(netlist: &NetlistIr) -> Self {
+        let ports = netlist.ports.len();
+        let cells = netlist.cells.len();
+        let nets = netlist.nets.len();
+        let instances = netlist.instances.len();
+        let mut endpoints = 0usize;
+        for n in &netlist.nets {
+            endpoints = endpoints.saturating_add(n.endpoints.len());
+        }
+        let port_bytes = ports.saturating_mul(core::mem::size_of::<helion_ir::Port>());
+        let cell_bytes = cells.saturating_mul(core::mem::size_of::<helion_ir::Cell>());
+        let net_bytes = nets.saturating_mul(core::mem::size_of::<helion_ir::Net>());
+        let ep_bytes = endpoints.saturating_mul(core::mem::size_of::<helion_ir::Endpoint>());
+        let inst_bytes = instances.saturating_mul(core::mem::size_of::<helion_ir::Instance>());
+        let estimated_heap_bytes = port_bytes
+            .saturating_add(cell_bytes)
+            .saturating_add(net_bytes)
+            .saturating_add(ep_bytes)
+            .saturating_add(inst_bytes);
+        Self {
+            ports,
+            cells,
+            nets,
+            endpoints,
+            instances,
+            estimated_heap_bytes,
+        }
+    }
+
+    /// True when the estimated footprint fits within `max_mb` MiB.
+    pub fn within_budget_mb(&self, max_mb: usize) -> bool {
+        self.estimated_heap_bytes <= max_mb.saturating_mul(1024 * 1024)
+    }
+}
+
+/// Per-stage memory footprint (bytes) and wall-clock duration (microseconds)
+/// across a `pack -> place -> route -> bitstream` backend run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageFootprint {
+    pub netlist_bytes: usize,
+    pub packed_bytes: usize,
+    pub placed_bytes: usize,
+    pub routed_bytes: usize,
+    pub bitstream_bytes: usize,
+    pub pack_us: u64,
+    pub place_us: u64,
+    pub route_us: u64,
+    pub bitstream_us: u64,
+}
+
+impl StageFootprint {
+    /// Total implementation runtime in microseconds.
+    pub fn total_us(&self) -> u64 {
+        self.pack_us
+            .saturating_add(self.place_us)
+            .saturating_add(self.route_us)
+            .saturating_add(self.bitstream_us)
+    }
+
+    /// Peak live stage bytes when each intermediate stage is dropped as soon
+    /// as its successor stage finishes (`max` of adjacent stage pairs).
+    pub fn peak_retained_bytes(&self) -> usize {
+        let p1 = self.netlist_bytes.saturating_add(self.packed_bytes);
+        let p2 = self
+            .netlist_bytes
+            .saturating_add(self.packed_bytes)
+            .saturating_add(self.placed_bytes);
+        let p3 = self
+            .netlist_bytes
+            .saturating_add(self.placed_bytes)
+            .saturating_add(self.routed_bytes);
+        let p4 = self
+            .netlist_bytes
+            .saturating_add(self.routed_bytes)
+            .saturating_add(self.bitstream_bytes);
+        p1.max(p2).max(p3).max(p4)
+    }
+
+    /// Cumulative sum of all stage payloads (upper bound if nothing were dropped early).
+    pub fn cumulative_stage_bytes(&self) -> usize {
+        self.netlist_bytes
+            .saturating_add(self.packed_bytes)
+            .saturating_add(self.placed_bytes)
+            .saturating_add(self.routed_bytes)
+            .saturating_add(self.bitstream_bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helion_ir::Design;
+
+    #[test]
+    fn netlist_footprint_counts_and_budget() {
+        let d = Design::structural_counter();
+        let fp = NetlistFootprint::from_netlist(&d);
+        assert_eq!(fp.ports, 2);
+        assert_eq!(fp.cells, 9);
+        assert!(fp.nets >= 8);
+        assert!(fp.endpoints >= 20);
+        assert!(fp.estimated_heap_bytes > 0);
+        assert!(fp.within_budget_mb(1));
+    }
+
+    #[test]
+    fn stage_footprint_early_drop_lowers_peak_below_cumulative() {
+        let sf = StageFootprint {
+            netlist_bytes: 4_096,
+            packed_bytes: 8_192,
+            placed_bytes: 8_192,
+            routed_bytes: 16_384,
+            bitstream_bytes: 4_096,
+            pack_us: 100,
+            place_us: 200,
+            route_us: 300,
+            bitstream_us: 50,
+        };
+        assert_eq!(sf.total_us(), 650);
+        assert!(sf.peak_retained_bytes() < sf.cumulative_stage_bytes());
+    }
 }
