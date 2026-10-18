@@ -9,6 +9,7 @@ helion-device = { workspace = true }
 helion-place = { workspace = true }
 helion-pack = { workspace = true }
 helion-ir = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

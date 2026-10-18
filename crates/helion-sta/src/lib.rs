@@ -12,6 +12,7 @@ use helion_device::Device;
 use helion_ir::{intern, resolve, CellKind, Design, PortDir, Spur};
 use helion_place::Placed;
 use helion_route::Routed;
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 mod cdc;
@@ -884,22 +885,31 @@ fn iob_pad_ps(design: &Design, tm: &TimingModel) -> i64 {
         .unwrap_or(tm.iob_ps)
 }
 
-fn lut_fanin_idx(idx: &helion_ir::PinIndex, lut: &str) -> i64 {
-    // Static pin names avoid per-call format! in the r2r hot loop.
-    const PINS: [&str; 6] = ["I0", "I1", "I2", "I3", "I4", "I5"];
-    PINS.iter().filter(|p| idx.net_on(lut, p).is_some()).count() as i64
-}
-
 fn r2r_ps(design: &Design, tm: &TimingModel) -> i64 {
-    // FM-HEL-TOP: Design::net_on is O(nets); Ibex-scale r2r walked every LUT×6
-    // pins that way (~6.8s under debug). PinIndex is O(1) after one build.
-    let idx = design.pin_index();
+    // Single pass over nets using pre-interned Spur IDs: avoids building full PinIndex
+    // and avoids per-LUT resolve() + intern() round-trips.
+    let ipins: [Spur; 6] = [
+        intern("I0"),
+        intern("I1"),
+        intern("I2"),
+        intern("I3"),
+        intern("I4"),
+        intern("I5"),
+    ];
+    let mut lut_mask: HashMap<Spur, u8> = HashMap::with_capacity(design.cells.len());
+    for n in &design.nets {
+        for e in &n.endpoints {
+            if let Some(pos) = ipins.iter().position(|&p| p == e.pin) {
+                *lut_mask.entry(e.cell).or_insert(0) |= 1u8 << pos;
+            }
+        }
+    }
     let mut max_ps = 0i64;
     for c in &design.cells {
         if !matches!(c.kind, CellKind::Lut6 { .. }) {
             continue;
         }
-        let pins = lut_fanin_idx(&idx, resolve(c.name));
+        let pins = lut_mask.get(&c.name).copied().unwrap_or(0).count_ones() as i64;
         max_ps = max_ps.max(tm.ff_ckq_ps + tm.lut_ps + pins * tm.pin_ps + tm.setup_ps);
     }
     max_ps.max(tm.ff_ckq_ps + tm.lut_ps + tm.setup_ps)
@@ -991,23 +1001,24 @@ pub fn report_timing_placed_with_model(
         .iter()
         .map(|io| io.from_net.as_str())
         .collect();
-    let iob_ps = placed
-        .lutff_sites
-        .iter()
-        .zip(placed.packed.lutffs.iter())
-        .filter_map(|((site, _), lf)| {
-            let iob = placed.iob_sites.first()?;
-            if iob_from_nets.contains(lf.q_net.as_str()) {
-                Some(
-                    tm.ff_ckq_ps + site.y.abs_diff(iob.y) as i64 * tm.hop_ps
-                        + iob_pad_ps(design, tm),
-                )
-            } else {
-                None
-            }
-        })
-        .max()
-        .unwrap_or(0);
+    let pad_ps = iob_pad_ps(design, tm);
+    let iob_ps = if let Some(iob) = placed.iob_sites.first() {
+        placed
+            .lutff_sites
+            .iter()
+            .zip(placed.packed.lutffs.iter())
+            .filter_map(|((site, _), lf)| {
+                if iob_from_nets.contains(lf.q_net.as_str()) {
+                    Some(tm.ff_ckq_ps + site.y.abs_diff(iob.y) as i64 * tm.hop_ps + pad_ps)
+                } else {
+                    None
+                }
+            })
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
     r.iob_ps = iob_ps;
     let path = r.r2r_ps.max(iob_ps);
     r.setup_ps = path;
@@ -3890,12 +3901,66 @@ pub struct HighlightSet {
     pub nets: Vec<String>,
 }
 
-fn endpoint_from_placed(placed: &Placed, cell: &str) -> TimingPathEndpoint {
-    if let Some(bel) = placed.cell_bel(cell) {
+fn build_bel_map(placed: &Placed) -> HashMap<&str, (String, String)> {
+    let mut map = HashMap::with_capacity(
+        placed.packed.lutffs.len() * 2
+            + placed.packed.iobs.len()
+            + placed.packed.macs.len()
+            + placed.packed.brams.len(),
+    );
+    for (i, lf) in placed.packed.lutffs.iter().enumerate() {
+        let Some(&(site, ble)) = placed.lutff_sites.get(i) else {
+            continue;
+        };
+        let sid = site.id();
+        if !lf.lut_cell.is_empty() {
+            map.entry(lf.lut_cell.as_str())
+                .or_insert_with(|| (sid.clone(), format!("{sid}/BLE{ble}.LUT")));
+        }
+        if !lf.ff_cell.is_empty() {
+            map.entry(lf.ff_cell.as_str())
+                .or_insert_with(|| (sid, format!("{}/BLE{ble}.FF", site.id())));
+        }
+    }
+    for (i, iob) in placed.packed.iobs.iter().enumerate() {
+        if !iob.cell.is_empty() {
+            if let Some(&s) = placed.iob_sites.get(i) {
+                let sid = s.id();
+                let bid = format!("{sid}/IOB");
+                map.entry(iob.cell.as_str()).or_insert((sid, bid));
+            }
+        }
+    }
+    for (i, mac) in placed.packed.macs.iter().enumerate() {
+        if !mac.cell.is_empty() {
+            if let Some(&s) = placed.mac_sites.get(i) {
+                let sid = s.id();
+                let bid = format!("{sid}/MAC");
+                map.entry(mac.cell.as_str()).or_insert((sid, bid));
+            }
+        }
+    }
+    for (i, bram) in placed.packed.brams.iter().enumerate() {
+        if !bram.cell.is_empty() {
+            if let Some(&s) = placed.bram_sites.get(i) {
+                let sid = s.id();
+                let bid = format!("{sid}/RAM18");
+                map.entry(bram.cell.as_str()).or_insert((sid, bid));
+            }
+        }
+    }
+    map
+}
+
+fn endpoint_from_map(
+    bel_map: &HashMap<&str, (String, String)>,
+    cell: &str,
+) -> TimingPathEndpoint {
+    if let Some((site_id, bel_id)) = bel_map.get(cell) {
         TimingPathEndpoint {
             cell: cell.to_string(),
-            site_id: bel.site.id(),
-            bel_id: bel.id(),
+            site_id: site_id.clone(),
+            bel_id: bel_id.clone(),
         }
     } else {
         TimingPathEndpoint {
@@ -3906,32 +3971,39 @@ fn endpoint_from_placed(placed: &Placed, cell: &str) -> TimingPathEndpoint {
     }
 }
 
-fn walk_ff_path(design: &Design, ff: &str) -> (String, Vec<String>, Vec<String>) {
-    let mut cells = vec![ff.to_string()];
+fn walk_ff_path_indexed(
+    design: &Design,
+    pin_to_net: &HashMap<(Spur, Spur), usize>,
+    ff_spur: Spur,
+    pin_d: Spur,
+    pin_o: Spur,
+    pin_q: Spur,
+    ipins: &[Spur; 6],
+) -> (String, Vec<String>, Vec<String>) {
+    let ff_str = resolve(ff_spur);
+    let mut cells = vec![ff_str.to_string()];
     let mut nets = Vec::new();
     // Startpoint is the FF until a real driving cell is found — never a clock net name.
-    let mut start = ff.to_string();
-    if let Some(dnet) = design.net_on(intern(ff), intern("D")) {
-        nets.push(resolve(dnet).to_string());
-        if let Some(n) = design.net(resolve(dnet)) {
-            for e in &n.endpoints {
-                if e.pin == intern("O") && !cells.iter().any(|x| x.as_str() == resolve(e.cell)) {
-                    cells.push(resolve(e.cell).to_string());
-                    for i in 0..6u8 {
-                        let pin = format!("I{i}");
-                        if let Some(inet) = design.net_on(e.cell, intern(&pin)) {
-                            if !nets.iter().any(|x| x.as_str() == resolve(inet)) {
-                                nets.push(resolve(inet).to_string());
-                            }
-                            if let Some(nn) = design.net(resolve(inet)) {
-                                for ee in &nn.endpoints {
-                                    if ee.pin == intern("Q")
-                                        && !cells.iter().any(|x| x.as_str() == resolve(ee.cell))
-                                    {
-                                        cells.push(resolve(ee.cell).to_string());
-                                        start = resolve(ee.cell).to_string();
-                                    }
-                                }
+    let mut start = ff_str.to_string();
+    if let Some(&dnet_idx) = pin_to_net.get(&(ff_spur, pin_d)) {
+        let n = &design.nets[dnet_idx];
+        nets.push(resolve(n.name).to_string());
+        for e in &n.endpoints {
+            let ec_str = resolve(e.cell);
+            if e.pin == pin_o && !cells.iter().any(|x| x.as_str() == ec_str) {
+                cells.push(ec_str.to_string());
+                for &ipin in ipins {
+                    if let Some(&inet_idx) = pin_to_net.get(&(e.cell, ipin)) {
+                        let nn = &design.nets[inet_idx];
+                        let inet_str = resolve(nn.name);
+                        if !nets.iter().any(|x| x.as_str() == inet_str) {
+                            nets.push(inet_str.to_string());
+                        }
+                        for ee in &nn.endpoints {
+                            let eec_str = resolve(ee.cell);
+                            if ee.pin == pin_q && !cells.iter().any(|x| x.as_str() == eec_str) {
+                                cells.push(eec_str.to_string());
+                                start = eec_str.to_string();
                             }
                         }
                     }
@@ -3942,27 +4014,35 @@ fn walk_ff_path(design: &Design, ff: &str) -> (String, Vec<String>, Vec<String>)
     (start, cells, nets)
 }
 
-fn walk_iob_path(design: &Design, iob: &str) -> (String, Vec<String>, Vec<String>) {
-    let mut cells = vec![iob.to_string()];
+fn walk_iob_path_indexed(
+    design: &Design,
+    pin_to_net: &HashMap<(Spur, Spur), usize>,
+    iob_spur: Spur,
+    pin_i: Spur,
+    pin_pad: Spur,
+    pin_q: Spur,
+    pin_o: Spur,
+) -> (String, Vec<String>, Vec<String>) {
+    let iob_str = resolve(iob_spur);
+    let mut cells = vec![iob_str.to_string()];
     let mut nets = Vec::new();
-    let mut start = iob.to_string();
-    if let Some(inet) = design.net_on(intern(iob), intern("I")) {
-        nets.push(resolve(inet).to_string());
-        if let Some(n) = design.net(resolve(inet)) {
-            for e in &n.endpoints {
-                // Registered Q or comb LUT O may drive the IOB I pin.
-                if (e.pin == intern("Q") || e.pin == intern("O"))
-                    && !cells.iter().any(|x| x.as_str() == resolve(e.cell))
-                {
-                    cells.push(resolve(e.cell).to_string());
-                    start = resolve(e.cell).to_string();
-                }
+    let mut start = iob_str.to_string();
+    if let Some(&inet_idx) = pin_to_net.get(&(iob_spur, pin_i)) {
+        let n = &design.nets[inet_idx];
+        nets.push(resolve(n.name).to_string());
+        for e in &n.endpoints {
+            let ec_str = resolve(e.cell);
+            // Registered Q or comb LUT O may drive the IOB I pin.
+            if (e.pin == pin_q || e.pin == pin_o) && !cells.iter().any(|x| x.as_str() == ec_str) {
+                cells.push(ec_str.to_string());
+                start = ec_str.to_string();
             }
         }
     }
-    if let Some(pad) = design.net_on(intern(iob), intern("PAD")) {
-        if !nets.iter().any(|x| x.as_str() == resolve(pad)) {
-            nets.push(resolve(pad).to_string());
+    if let Some(&pad_idx) = pin_to_net.get(&(iob_spur, pin_pad)) {
+        let pad_str = resolve(design.nets[pad_idx].name);
+        if !nets.iter().any(|x| x.as_str() == pad_str) {
+            nets.push(pad_str.to_string());
         }
     }
     (start, cells, nets)
@@ -3981,35 +4061,68 @@ pub fn timing_paths_routed_with(
     tm: &TimingModel,
 ) -> Vec<TimingPath> {
     let placed = &routed.placed;
-    let mut paths = Vec::new();
-    for c in &design.cells {
-        if !matches!(c.kind, CellKind::Hff) {
-            continue;
+    let bel_map = build_bel_map(placed);
+    let total_eps: usize = design.nets.iter().map(|n| n.endpoints.len()).sum();
+    let mut pin_to_net: HashMap<(Spur, Spur), usize> = HashMap::with_capacity(total_eps);
+    for (ni, n) in design.nets.iter().enumerate() {
+        for e in &n.endpoints {
+            pin_to_net.insert((e.cell, e.pin), ni);
         }
-        let endpoint = endpoint_from_placed(placed, resolve(c.name));
+    }
+    let pin_d = intern("D");
+    let pin_o = intern("O");
+    let pin_q = intern("Q");
+    let pin_i = intern("I");
+    let pin_pad = intern("PAD");
+    let ipins: [Spur; 6] = [
+        intern("I0"),
+        intern("I1"),
+        intern("I2"),
+        intern("I3"),
+        intern("I4"),
+        intern("I5"),
+    ];
+    let ff_spurs: Vec<Spur> = design
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::Hff))
+        .map(|c| c.name)
+        .collect();
+    let build_ff_path = |&ff_spur: &Spur| -> Option<TimingPath> {
+        let ff_name = resolve(ff_spur);
+        let endpoint = endpoint_from_map(&bel_map, ff_name);
         if endpoint.site_id.is_empty() {
-            continue;
+            return None;
         }
-        let (start, cells, nets) = walk_ff_path(design, resolve(c.name));
-        paths.push(TimingPath {
-            name: format!("{start}->{}", resolve(c.name)),
-            startpoint: endpoint_from_placed(placed, &start),
+        let (start, cells, nets) =
+            walk_ff_path_indexed(design, &pin_to_net, ff_spur, pin_d, pin_o, pin_q, &ipins);
+        Some(TimingPath {
+            name: format!("{start}->{ff_name}"),
+            startpoint: endpoint_from_map(&bel_map, &start),
             endpoint,
             cells,
             nets,
             delay_ps: t.r2r_ps,
             slack_ps: t.wns_ps,
-        });
-    }
+        })
+    };
+    let mut paths: Vec<TimingPath> = if ff_spurs.len() >= 256 {
+        ff_spurs.par_iter().filter_map(build_ff_path).collect()
+    } else {
+        ff_spurs.iter().filter_map(build_ff_path).collect()
+    };
+    let pad_ps = iob_pad_ps(design, tm);
     for c in &design.cells {
         if !matches!(c.kind, CellKind::IobOut) {
             continue;
         }
-        let endpoint = endpoint_from_placed(placed, resolve(c.name));
+        let cname = resolve(c.name);
+        let endpoint = endpoint_from_map(&bel_map, cname);
         if endpoint.site_id.is_empty() {
             continue;
         }
-        let (start, cells, nets) = walk_iob_path(design, resolve(c.name));
+        let (start, cells, nets) =
+            walk_iob_path_indexed(design, &pin_to_net, c.name, pin_i, pin_pad, pin_q, pin_o);
         // Same scale as report_timing_routed: CkQ (if FF) + hop route + pad.
         let delay_ps = routed
             .iob_src
@@ -4020,16 +4133,16 @@ pub fn timing_paths_routed_with(
                         .packed
                         .iobs
                         .iter()
-                        .any(|io| io.cell.as_str() == resolve(c.name) && io.from_net == r.net)
+                        .any(|io| io.cell.as_str() == cname && io.from_net == r.net)
             })
             .map(|r| {
                 let ckq = if r.from_ff { tm.ff_ckq_ps } else { 0 };
-                ckq + r.delay_ps + iob_pad_ps(design, tm)
+                ckq + r.delay_ps + pad_ps
             })
             .unwrap_or(t.iob_ps);
         paths.push(TimingPath {
-            name: format!("{start}->{}", resolve(c.name)),
-            startpoint: endpoint_from_placed(placed, &start),
+            name: format!("{start}->{cname}"),
+            startpoint: endpoint_from_map(&bel_map, &start),
             endpoint,
             cells,
             nets,
@@ -4447,7 +4560,7 @@ set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]
         assert_eq!(
             d.ports
                 .iter()
-                .find(|p| p.name == "led")
+                .find(|p| p.name == intern("led"))
                 .unwrap()
                 .attrs
                 .get("LOC"),
@@ -4501,7 +4614,7 @@ set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]
         assert_eq!(
             d.ports
                 .iter()
-                .find(|p| p.name == "led")
+                .find(|p| p.name == intern("led"))
                 .unwrap()
                 .attrs
                 .get("IOSTANDARD"),
