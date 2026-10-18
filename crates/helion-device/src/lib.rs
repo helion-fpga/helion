@@ -21,6 +21,17 @@ pub use io_plan::{
     SsnReport, analyze_ssn, check_io_drc, report_ssn,
 };
 
+pub mod ultrascale;
+pub use ultrascale::{
+    Carry8Chain, Carry8Mode, Dsp48e2Config, Dsp48e2Output, Dsp48e2WideXorMode, LagunaCrossingMode,
+    PblockSlrSpec, Ramb36e2Config, SlrCascadeKind, SlrCascadeSpan, SlrRegion, SlrTopology,
+    SlrValidationReport, SlrViolation, ULTRASCALE_BLE_LETTERS, UltraScaleClbSlice,
+    UltraScaleDevice, UltraScalePart, UltraScaleSliceKind, Uram288CascadePlan, Uram288Config,
+    carry8_delay_ps, dsp48e2_delay_ps, dsp48e2_evaluate, plan_uram288_cascade,
+    sll_crossing_delay_ps, uram288_ecc_decode_72, uram288_ecc_encode_64,
+    validate_pblock_slr_assignment,
+};
+
 #[derive(Clone, Debug)]
 pub struct Device {
     pub part: String,
