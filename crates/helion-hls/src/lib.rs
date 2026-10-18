@@ -10,11 +10,17 @@
 //! - Synthesizable SystemVerilog FSM + datapath + AXI4-Lite CSR / AXI4-Stream / `m_axi` / `ap_fifo` / `ap_memory`
 //!   emission and structured Vivado HLS Synthesis & Latency/Utilization Report generation.
 
+pub mod ap_math_stream;
 pub mod emit;
 pub mod parser;
 pub mod pragma;
 pub mod schedule;
 
+pub use ap_math_stream::{
+    ApFixed, ApInt, ApOverflowMode, ApQuantMode, HlsStream, hls_abs_i64, hls_clz_u64,
+    hls_cordic_sincos_q14, hls_cos_q14, hls_max_i64, hls_min_i64, hls_popcount_u64, hls_sin_q14,
+    hls_sqrt_u64,
+};
 pub use emit::{generate_hls_report, resolve_interfaces, HlsSynthesisReport, InterfacePort};
 pub use parser::{
     tokenize, BinOp, CArg, CExpr, CFunction, CStmt, CType, CVar, LValue, Parser, Tok,
@@ -660,5 +666,119 @@ void iir_filter(int x[8], int y[8], int alpha) {
             res.schedule.res_ii.max(res.schedule.rec_ii)
         );
         assert!(res.schedule.achieved_ii >= res.schedule.ii_min);
+    }
+
+    #[test]
+    fn hls_ap_int_ap_fixed_quantization_overflow_and_range_slice() {
+        // 1. ApInt bit-slice `.range(hi, lo)` and reversed `.range(lo, hi)`
+        let mut x = ApInt::from_u128(16, false, 0xABCD);
+        assert_eq!(x.range(15, 8).to_u128(), 0xAB);
+        assert_eq!(x.range(7, 0).to_u128(), 0xCD);
+        // Reverse 4-bit nibble 0b1101 (0xD) -> 0b1011 (0xB)
+        assert_eq!(x.range(0, 3).to_u128(), 0xB);
+        x.set_range(11, 4, 0x5A);
+        assert_eq!(x.to_u128(), 0xA5AD);
+
+        // 2. ApFixed quantization (`AP_TRN` vs `AP_RND` vs `AP_RND_CONV`)
+        // Q4.2 format (width=6, int_bits=4 -> 2 fractional bits, step = 0.25)
+        // Value 1.375 = 1 + 1.5 * 0.25 (halfway between 1.25 and 1.50)
+        let f_trn = ApFixed::from_f64(
+            1.375,
+            6,
+            4,
+            true,
+            ApQuantMode::ApTrn,
+            ApOverflowMode::ApWrap,
+        );
+        let f_rnd = ApFixed::from_f64(
+            1.375,
+            6,
+            4,
+            true,
+            ApQuantMode::ApRnd,
+            ApOverflowMode::ApWrap,
+        );
+        assert_eq!(f_trn.to_f64(), 1.25, "AP_TRN truncates 1.375 to 1.25");
+        assert_eq!(f_rnd.to_f64(), 1.50, "AP_RND rounds 1.375 up to 1.50");
+
+        // 3. ApFixed overflow (`AP_SAT` vs `AP_WRAP` vs `AP_SAT_SYM`)
+        // Signed Q4.2 range is [-8.0, +7.75] (raw [-32, +31])
+        let f_sat = ApFixed::from_f64(12.5, 6, 4, true, ApQuantMode::ApRnd, ApOverflowMode::ApSat);
+        let f_wrap =
+            ApFixed::from_f64(12.5, 6, 4, true, ApQuantMode::ApRnd, ApOverflowMode::ApWrap);
+        let f_sym = ApFixed::from_f64(
+            -12.5,
+            6,
+            4,
+            true,
+            ApQuantMode::ApRnd,
+            ApOverflowMode::ApSatSym,
+        );
+        assert_eq!(f_sat.to_f64(), 7.75, "AP_SAT clamps +12.5 to +7.75");
+        assert!(f_wrap.to_f64() < 0.0, "AP_WRAP wraps +12.5 into negative range");
+        assert_eq!(
+            f_sym.to_f64(),
+            -7.75,
+            "AP_SAT_SYM clamps -12.5 symmetrically to -7.75"
+        );
+    }
+
+    #[test]
+    fn hls_stream_fifo_and_hls_math_intrinsics_synthesis() {
+        // 1. HlsStream blocking & non-blocking FIFO semantics
+        let mut fifo: HlsStream<i32> = HlsStream::new("data_ch", 2);
+        assert!(fifo.empty());
+        assert!(fifo.write_nb(10));
+        assert!(fifo.write_nb(20));
+        assert!(fifo.full());
+        assert!(!fifo.write_nb(30), "write_nb on full stream must return false");
+        assert_eq!(fifo.read().unwrap(), 10);
+        assert_eq!(fifo.read_nb(), Some(20));
+        assert_eq!(fifo.read_nb(), None);
+
+        // 2. Bit-accurate `hls::math` intrinsics
+        assert_eq!(hls_sqrt_u64(0), 0);
+        assert_eq!(hls_sqrt_u64(144), 12);
+        assert_eq!(hls_sqrt_u64(10_000), 100);
+        assert_eq!(hls_abs_i64(-42), 42);
+        assert_eq!(hls_min_i64(-7, 3), -7);
+        assert_eq!(hls_max_i64(-7, 3), 3);
+        assert_eq!(hls_clz_u64(0b0001_0100, 8), 3);
+        assert_eq!(hls_popcount_u64(0b1011_0101, 8), 5);
+        let (sin0, cos0) = hls_cordic_sincos_q14(0);
+        assert!(sin0.abs() <= 16, "sin(0) in Q14 ~ 0, got {sin0}");
+        assert!((cos0 - 16384).abs() <= 16, "cos(0) in Q14 ~ 16384, got {cos0}");
+        let (sin_pi2, cos_pi2) = hls_cordic_sincos_q14(25736); // pi/2 in Q14
+        assert!((sin_pi2 - 16384).abs() <= 32, "sin(pi/2) in Q14 ~ 16384, got {sin_pi2}");
+        assert!(cos_pi2.abs() <= 32, "cos(pi/2) in Q14 ~ 0, got {cos_pi2}");
+
+        // 3. End-to-end C++ HLS synthesis with ap_fixed, .range(), hls::stream, and hls::math
+        let src = r#"
+void dsp_math_stream_kernel(
+    hls::stream<ap_fixed<16, 8, AP_RND, AP_SAT>> &in_s,
+    hls::stream<ap_fixed<16, 8, AP_RND, AP_SAT>> &out_s,
+    ap_int<16> coeff
+) {
+  #pragma HLS PIPELINE II=1
+  ap_fixed<16, 8, AP_RND, AP_SAT> x = in_s.read();
+  ap_uint<8> low_byte = x.range(7, 0);
+  ap_int<16> mag = hls::abs(x);
+  ap_int<16> root = hls::sqrt(mag);
+  ap_int<16> clamped = hls::min(root, coeff);
+  ap_fixed<16, 8, AP_RND, AP_SAT> res = clamped * coeff + low_byte;
+  out_s.write_nb(res);
+}
+"#;
+        let compiled = hls_compile(src).expect("compile dsp_math_stream_kernel");
+        assert_eq!(compiled.schedule.achieved_ii, 1);
+        assert!(compiled.sv.contains("in_s_TDATA"));
+        assert!(compiled.sv.contains("out_s_TDATA"));
+        assert!(
+            compiled
+                .design
+                .cells
+                .iter()
+                .any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. }))
+        );
     }
 }

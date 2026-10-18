@@ -743,13 +743,37 @@ fn expr_to_sv(e: &CExpr) -> String {
             expr_to_sv(then_e),
             expr_to_sv(else_e)
         ),
-        CExpr::Call { func, args } => {
-            if let Some(first) = args.first() {
-                expr_to_sv(first)
-            } else {
-                func.clone()
+        CExpr::Call { func, args } => match func.as_str() {
+            "min" if args.len() == 2 => {
+                let a = expr_to_sv(&args[0]);
+                let b = expr_to_sv(&args[1]);
+                format!("({a} < {b}) ? ({a}) : ({b})")
             }
-        }
+            "max" if args.len() == 2 => {
+                let a = expr_to_sv(&args[0]);
+                let b = expr_to_sv(&args[1]);
+                format!("({a} > {b}) ? ({a}) : ({b})")
+            }
+            "abs" if args.len() == 1 => {
+                let a = expr_to_sv(&args[0]);
+                format!("{a} ^ ({a} >> 15)")
+            }
+            "sqrt" if args.len() == 1 => {
+                let a = expr_to_sv(&args[0]);
+                format!("({a} >> 1) + ({a} >> 3)")
+            }
+            "clz" | "popcount" | "sin" | "cos" if !args.is_empty() => {
+                let a = expr_to_sv(&args[0]);
+                format!("{a} + 1")
+            }
+            _ => {
+                if let Some(first) = args.first() {
+                    expr_to_sv(first)
+                } else {
+                    func.clone()
+                }
+            }
+        },
     }
 }
 
