@@ -114,6 +114,9 @@ jobs:
           print("README traffic table updated")
           EOF
 
+          # Rebuild the charts page from history files
+          python3 .github/workflows/render_traffic.py
+
       - name: Commit history
         run: |
           git config user.name "github-actions[bot]"
