@@ -18,6 +18,12 @@ pub use power_opt::{
     PowerOptReport, extract_fdre_clock_enables, gate_bram_idle_enables, hoist_bufgce_clock_gates,
     optimize_dynamic_power,
 };
+pub mod fraig;
+pub use fraig::{
+    default_pi_pattern, eval_lut6_parallel_u64, fraig_sat_sweep, partition_candidate_classes,
+    rewrite_aig_4cut, simulate_parallel_64, CandidateEquivClass, FraigSweepStats, Rewrite4CutStats,
+    FRAIG_VAR_INIT,
+};
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
