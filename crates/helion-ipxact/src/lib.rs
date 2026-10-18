@@ -43,6 +43,8 @@ pub use fir_dds::{
 };
 pub mod crypto;
 pub use crypto::*;
+pub mod serial_noc;
+pub use serial_noc::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IpCore {
@@ -3377,5 +3379,82 @@ file a.v
         assert!(trng_sv.contains("health_rct_error"));
         assert!(trng_sv.contains("health_apt_error"));
         assert!(trng_sv.contains("vn_first_bit"));
+    }
+
+    #[test]
+    fn aurora_64b66b_jesd204bc_and_noc_xy_golden_models_roundtrip() {
+        // 1. Aurora 64B/66B 1+x^39+x^58 Scrambler / Descrambler exact roundtrip
+        let mut tx_state = 0x155_5555_5555_5555u64;
+        let mut rx_state = 0x155_5555_5555_5555u64;
+        for word in [
+            0xDEAD_BEEF_CAFE_BABEu64,
+            0x0123_4567_89AB_CDEFu64,
+            0xFFFF_0000_AAAA_5555u64,
+        ] {
+            let scr = scramble_64b66b(&mut tx_state, word);
+            assert_ne!(scr, word);
+            let descr = descramble_64b66b(&mut rx_state, scr);
+            assert_eq!(descr, word);
+        }
+
+        // 2. JESD204B/C 1+x^14+x^15 Scrambler / Descrambler & Sample Mapper roundtrip
+        let mut j_tx = 0x7FFFu16;
+        let mut j_rx = 0x7FFFu16;
+        for w in [0x1234_5678u32, 0x9ABC_DEF0u32] {
+            let s = jesd204_scramble_word(&mut j_tx, w);
+            assert_ne!(s, w);
+            let d = jesd204_descramble_word(&mut j_rx, s);
+            assert_eq!(d, w);
+        }
+        let samples = vec![0x1122, 0x3344, 0x5566, 0x7788];
+        let packed = jesd204_pack_samples(&samples, 2);
+        assert_eq!(packed.len(), 2);
+        let unpacked = jesd204_unpack_samples(&packed, samples.len());
+        assert_eq!(unpacked, samples);
+
+        // 3. 2D Mesh Wormhole NoC Dimension-Order XY Routing (0,0) -> (2,1)
+        // Must route X first: (0,0)->East->(1,0)->East->(2,0)->North->(2,1)->Local
+        let hops = trace_xy_mesh_route(0, 0, 2, 1);
+        assert_eq!(
+            hops,
+            vec![
+                (0, 0, NocDir::East),
+                (1, 0, NocDir::East),
+                (2, 0, NocDir::North),
+                (2, 1, NocDir::Local),
+            ]
+        );
+    }
+
+    #[test]
+    fn aurora_jesd204_chip2chip_and_noc_router_emit_synthesizable_sv() {
+        let cat = serial_noc_catalog();
+        assert_eq!(cat.len(), 4);
+
+        let aurora_sv = generate_aurora_link_sv(4, true);
+        assert!(aurora_sv.contains("module aurora_serial_link"));
+        assert!(aurora_sv.contains("parameter int C_NUM_LANES  = 4"));
+        assert!(aurora_sv.contains("lane_up"));
+        assert!(aurora_sv.contains("channel_up"));
+        assert!(aurora_sv.contains("tx_scrambler_lfsr"));
+
+        let jesd_sv = generate_jesd204_sv(4, 2, 2, 32);
+        assert!(jesd_sv.contains("module jesd204bc_core"));
+        assert!(jesd_sv.contains("sysref_in"));
+        assert!(jesd_sv.contains("lmfc_pulse"));
+        assert!(jesd_sv.contains("JESD_CGS"));
+        assert!(jesd_sv.contains("JESD_ILAS"));
+
+        let c2c_sv = generate_axi_chip2chip_sv(32, 64, 32);
+        assert!(c2c_sv.contains("module axi_chip2chip_bridge"));
+        assert!(c2c_sv.contains("c2c_link_status"));
+        assert!(c2c_sv.contains("c2c_tx_data"));
+        assert!(c2c_sv.contains("c2c_rx_data"));
+
+        let noc_sv = generate_noc_xy_router_sv(1, 2, 64, 4);
+        assert!(noc_sv.contains("module noc_2d_mesh_router"));
+        assert!(noc_sv.contains("compute_xy_route"));
+        assert!(noc_sv.contains("wormhole_active"));
+        assert!(noc_sv.contains("in_vc_credit_out"));
     }
 }
