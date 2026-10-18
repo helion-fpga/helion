@@ -172,7 +172,7 @@ fn vhdl_to_sv_with_softs(source: &str, origin: &str) -> Result<(String, Vec<Soft
             continue;
         }
         if p.eat("architecture") {
-            archs.push(parse_arch(&mut p, &entities, &pkg_consts)?);
+            archs.push(parse_arch(&mut p, &entities, &pkg_consts, origin)?);
             continue;
         }
         if p.eat("configuration") {
@@ -200,6 +200,7 @@ fn vhdl_to_sv_with_softs(source: &str, origin: &str) -> Result<(String, Vec<Soft
         of: top.name.clone(),
         consts: HashMap::new(),
         signals: Vec::new(),
+        memories: Vec::new(),
         components: Vec::new(),
         stmts: Vec::new(),
         parse_softs: Vec::new(),
@@ -467,10 +468,33 @@ struct Entity {
     ports: Vec<(String, &'static str, usize)>,
 }
 
+#[derive(Clone, Debug)]
+struct VhdlMem {
+    name: String,
+    width: usize,
+    depth: usize,
+    init_words: Vec<(usize, u128)>,
+}
+
+#[derive(Clone, Debug)]
+enum TextIoReadMode {
+    Hex,
+    Bin,
+    Auto,
+}
+
+#[derive(Clone, Debug)]
+struct TextIoFunc {
+    ret_type: String,
+    mode: TextIoReadMode,
+    default_file: Option<String>,
+}
+
 struct Arch {
     of: String,
     consts: HashMap<String, i64>,
     signals: Vec<(String, usize)>,
+    memories: Vec<VhdlMem>,
     components: Vec<Entity>,
     stmts: Vec<CStmt>,
     /// Parse-time softs (generate_not_lowered, …) attached to this architecture.
@@ -602,6 +626,7 @@ fn parse_arch(
     p: &mut P,
     entities: &[Entity],
     pkg_consts: &HashMap<String, i64>,
+    origin: &str,
 ) -> Result<Arch, String> {
     let _aname = p.ident()?;
     let _ = p.eat("of");
@@ -624,14 +649,35 @@ fn parse_arch(
     }
     let mut arch_consts = HashMap::new();
     let mut signals = Vec::new();
+    let mut memories: Vec<VhdlMem> = Vec::new();
+    let mut array_types: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut textio_funcs: HashMap<String, TextIoFunc> = HashMap::new();
     let mut components = Vec::new();
     while !p.eat("begin") {
         if p.peek().is_none() {
             break;
         }
         if p.eat("signal") {
-            parse_signal_list(p, &mut signals, &consts)?;
+            parse_signal_or_mem_list(
+                p,
+                &mut signals,
+                &mut memories,
+                &consts,
+                &array_types,
+                &textio_funcs,
+                origin,
+            )?;
         } else if p.eat("constant") {
+            if try_parse_const_mem(
+                p,
+                &mut memories,
+                &consts,
+                &array_types,
+                &textio_funcs,
+                origin,
+            ) {
+                continue;
+            }
             if let Ok((n, v)) = parse_constant(p, &consts) {
                 consts.insert(n.clone(), v);
                 arch_consts.insert(n, v);
@@ -640,16 +686,26 @@ fn parse_arch(
             if let Ok(c) = parse_component(p, &consts) {
                 components.push(c);
             }
-        } else if p.eat("type") || p.eat("subtype") || p.eat("attribute") || p.eat("alias") {
+        } else if p.eat("type") {
+            parse_type_decl(p, &consts, &mut array_types);
+        } else if p.eat("subtype") || p.eat("attribute") || p.eat("alias") || p.eat("file") {
             eat_decl_item(p);
-        } else if p.eat("function") || p.eat("procedure") || p.eat("impure") || p.eat("pure") {
-            skip_subprogram(p);
+        } else if p.eat("impure") || p.eat("pure") {
+            let _ = p.eat("function");
+            let _ = p.eat("procedure");
+            harvest_or_skip_subprogram(p, &mut textio_funcs);
+        } else if p.eat("function") || p.eat("procedure") {
+            harvest_or_skip_subprogram(p, &mut textio_funcs);
         } else {
             p.bump();
         }
     }
     PARSE_SOFTS.with(|s| s.borrow_mut().clear());
-    let stmts = parse_concurrent_list(p, &consts, &signals)?;
+    let mut stmts = parse_concurrent_list(p, &consts, &signals)?;
+    // Rewrite any array memory reads `mem(idx)` in stmts for memories in `memories`.
+    if !memories.is_empty() {
+        rewrite_mem_reads_in_stmts(&mut stmts, &memories);
+    }
     let parse_softs = PARSE_SOFTS.with(|s| s.borrow_mut().drain(..).collect());
     // parse_concurrent_list already consumed `end`.
     let _ = p.eat("architecture");
@@ -659,6 +715,7 @@ fn parse_arch(
         of,
         consts: arch_consts,
         signals,
+        memories,
         components,
         stmts,
         parse_softs,
@@ -782,6 +839,416 @@ fn parse_signal_list(
         signals.push((n, w.max(1)));
     }
     Ok(())
+}
+
+fn parse_type_decl(
+    p: &mut P,
+    consts: &HashMap<String, i64>,
+    array_types: &mut HashMap<String, (usize, usize)>,
+) {
+    let Ok(tname) = p.ident() else {
+        eat_decl_item(p);
+        return;
+    };
+    let _ = p.eat("is");
+    if p.eat("array") {
+        if p.eat("(") {
+            if let Some(a) = parse_int_expr_with(p, consts) {
+                if p.eat("to") || p.eat("downto") {
+                    let b = parse_int_expr_with(p, consts).unwrap_or(a);
+                    let _ = p.eat(")");
+                    let _ = p.eat("of");
+                    let elem_w = parse_type(p, consts).max(1);
+                    let depth = (a.abs_diff(b) as usize) + 1;
+                    array_types.insert(tname.to_ascii_lowercase(), (depth.max(1), elem_w));
+                    let _ = p.eat(";");
+                    return;
+                }
+            }
+        }
+    }
+    eat_decl_item(p);
+}
+
+fn harvest_or_skip_subprogram(p: &mut P, textio_funcs: &mut HashMap<String, TextIoFunc>) {
+    let start = p.i;
+    skip_subprogram(p);
+    let slice = &p.t[start..p.i.min(p.t.len())];
+    let Some(Tok::Ident(fname) | Tok::Kw(fname)) = slice.first() else {
+        return;
+    };
+    let fname_low = fname.to_ascii_lowercase();
+    let mut ret_type = String::new();
+    for idx in 0..slice.len() {
+        if matches!(&slice[idx], Tok::Kw(k) if k == "return") {
+            if let Some(Tok::Ident(rt) | Tok::Kw(rt)) = slice.get(idx + 1) {
+                ret_type = rt.to_ascii_lowercase();
+                break;
+            }
+        }
+    }
+    let mut saw_readline = false;
+    let mut mode: Option<TextIoReadMode> = None;
+    let mut default_file: Option<String> = None;
+    for idx in 0..slice.len() {
+        match &slice[idx] {
+            Tok::Ident(id) | Tok::Kw(id) => {
+                let low = id.to_ascii_lowercase();
+                if low == "readline" || low == "endfile" || low == "text" {
+                    saw_readline = true;
+                } else if low == "hread" || low == "hex_read" {
+                    mode = Some(TextIoReadMode::Hex);
+                } else if low == "bread" || low == "b_read" {
+                    mode = Some(TextIoReadMode::Bin);
+                } else if low == "read" && mode.is_none() {
+                    mode = Some(TextIoReadMode::Auto);
+                } else if low == "is" || low == "file_open" {
+                    for look in (idx + 1)..(idx + 6).min(slice.len()) {
+                        if let Tok::StrLit { raw, .. } = &slice[look] {
+                            if !raw.eq_ignore_ascii_case("read_mode") {
+                                default_file = Some(raw.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if saw_readline || mode.is_some() {
+        textio_funcs.insert(
+            fname_low,
+            TextIoFunc {
+                ret_type,
+                mode: mode.unwrap_or(TextIoReadMode::Auto),
+                default_file,
+            },
+        );
+    }
+}
+
+pub(crate) fn eval_textio_rom_init(
+    file_spec: &str,
+    origin: &str,
+    mode: &TextIoReadMode,
+    depth: usize,
+    width: usize,
+) -> Vec<(usize, u128)> {
+    let mut candidates = Vec::new();
+    let spec_path = Path::new(file_spec.trim());
+    candidates.push(spec_path.to_path_buf());
+    let orig_path = Path::new(origin);
+    if let Some(parent) = orig_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            candidates.push(parent.join(spec_path));
+        }
+    }
+    let content = candidates
+        .into_iter()
+        .find_map(|p| std::fs::read_to_string(p).ok());
+    let Some(text) = content else {
+        return Vec::new();
+    };
+    let mask = if width >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << width.max(1)) - 1
+    };
+    let mut out = Vec::new();
+    let mut addr = 0usize;
+    for line in text.lines() {
+        if addr >= depth {
+            break;
+        }
+        let trimmed = line
+            .split("--")
+            .next()
+            .unwrap_or("")
+            .split("//")
+            .next()
+            .unwrap_or("")
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        for tok in trimmed.split_whitespace() {
+            if addr >= depth {
+                break;
+            }
+            if let Some(hex_addr) = tok.strip_prefix('@') {
+                if let Ok(a) = usize::from_str_radix(hex_addr, 16) {
+                    addr = a;
+                }
+                continue;
+            }
+            let clean: String = tok.chars().filter(|c| *c != '_').collect();
+            if clean.is_empty() {
+                continue;
+            }
+            let mapped: String = clean
+                .chars()
+                .map(|c| {
+                    if matches!(c, 'x' | 'X' | 'z' | 'Z' | '-' | 'u' | 'U') {
+                        '0'
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            let val = match mode {
+                TextIoReadMode::Hex => u128::from_str_radix(&mapped, 16).unwrap_or(0),
+                TextIoReadMode::Bin => u128::from_str_radix(&mapped, 2).unwrap_or(0),
+                TextIoReadMode::Auto => {
+                    if mapped.len() == width && mapped.chars().all(|c| c == '0' || c == '1') {
+                        u128::from_str_radix(&mapped, 2).unwrap_or(0)
+                    } else if mapped.chars().all(|c| c == '0' || c == '1') && mapped.len() >= 4 {
+                        u128::from_str_radix(&mapped, 2).unwrap_or(0)
+                    } else {
+                        u128::from_str_radix(&mapped, 16)
+                            .or_else(|_| mapped.parse::<u128>())
+                            .unwrap_or(0)
+                    }
+                }
+            };
+            out.push((addr, val & mask));
+            addr += 1;
+        }
+    }
+    out
+}
+
+fn parse_mem_init_expr(
+    p: &mut P,
+    depth: usize,
+    width: usize,
+    textio_funcs: &HashMap<String, TextIoFunc>,
+    origin: &str,
+) -> Vec<(usize, u128)> {
+    if !p.eat(":=") {
+        return Vec::new();
+    }
+    let save = p.i;
+    if let Ok(fn_name) = p.ident() {
+        if let Some(tf) = textio_funcs.get(&fn_name.to_ascii_lowercase()) {
+            let mut file_arg: Option<String> = tf.default_file.clone();
+            if p.eat("(") {
+                while !p.eat(")") && p.peek().is_some() {
+                    if let Some(Tok::StrLit { raw, .. }) = p.bump() {
+                        file_arg = Some(raw.clone());
+                    }
+                }
+            }
+            if let Some(fspec) = file_arg {
+                return eval_textio_rom_init(&fspec, origin, &tf.mode, depth, width);
+            }
+        }
+    }
+    p.i = save;
+    // Skip remaining initializer tokens up to `;`
+    let mut d = 0i32;
+    while p.peek().is_some() {
+        if d == 0 && p.peek_sym(";") {
+            break;
+        }
+        if p.eat("(") {
+            d += 1;
+        } else if p.eat(")") {
+            d -= 1;
+        } else {
+            p.bump();
+        }
+    }
+    Vec::new()
+}
+
+fn parse_signal_or_mem_list(
+    p: &mut P,
+    signals: &mut Vec<(String, usize)>,
+    memories: &mut Vec<VhdlMem>,
+    consts: &HashMap<String, i64>,
+    array_types: &HashMap<String, (usize, usize)>,
+    textio_funcs: &HashMap<String, TextIoFunc>,
+    origin: &str,
+) -> Result<(), String> {
+    let mut names = vec![p.ident()?];
+    while p.eat(",") {
+        names.push(p.ident()?);
+    }
+    let _ = p.eat(":");
+    if let Some(Tok::Ident(tn) | Tok::Kw(tn)) = p.peek() {
+        let tlow = tn.to_ascii_lowercase();
+        if let Some(&(depth, width)) = array_types.get(&tlow) {
+            p.bump();
+            let init_words = parse_mem_init_expr(p, depth, width, textio_funcs, origin);
+            let _ = p.eat(";");
+            for n in names {
+                memories.push(VhdlMem {
+                    name: n,
+                    width,
+                    depth,
+                    init_words: init_words.clone(),
+                });
+            }
+            return Ok(());
+        }
+    }
+    let w = parse_type(p, consts);
+    skip_init(p);
+    let _ = p.eat(";");
+    for n in names {
+        signals.push((n, w.max(1)));
+    }
+    Ok(())
+}
+
+fn try_parse_const_mem(
+    p: &mut P,
+    memories: &mut Vec<VhdlMem>,
+    _consts: &HashMap<String, i64>,
+    array_types: &HashMap<String, (usize, usize)>,
+    textio_funcs: &HashMap<String, TextIoFunc>,
+    origin: &str,
+) -> bool {
+    let save = p.i;
+    let Ok(name) = p.ident() else {
+        p.i = save;
+        return false;
+    };
+    if !p.eat(":") {
+        p.i = save;
+        return false;
+    }
+    if let Some(Tok::Ident(tn) | Tok::Kw(tn)) = p.peek() {
+        let tlow = tn.to_ascii_lowercase();
+        if let Some(&(depth, width)) = array_types.get(&tlow) {
+            p.bump();
+            let init_words = parse_mem_init_expr(p, depth, width, textio_funcs, origin);
+            let _ = p.eat(";");
+            memories.push(VhdlMem {
+                name,
+                width,
+                depth,
+                init_words,
+            });
+            return true;
+        }
+    }
+    p.i = save;
+    false
+}
+
+fn rewrite_mem_read_str(expr: &str, memories: &[VhdlMem]) -> String {
+    let mut out = expr.to_string();
+    for mem in memories {
+        if mem.init_words.is_empty() {
+            continue;
+        }
+        let prefix = format!("{}[", mem.name);
+        while let Some(pos) = out.find(&prefix) {
+            let before_ok = pos == 0 || !ident_char(out.as_bytes()[pos - 1]);
+            if !before_ok {
+                break;
+            }
+            let idx_start = pos + prefix.len();
+            let mut d = 1i32;
+            let mut end_pos = None;
+            for (off, ch) in out[idx_start..].char_indices() {
+                if ch == '[' {
+                    d += 1;
+                } else if ch == ']' {
+                    d -= 1;
+                    if d == 0 {
+                        end_pos = Some(idx_start + off);
+                        break;
+                    }
+                }
+            }
+            let Some(close_idx) = end_pos else {
+                break;
+            };
+            let idx_expr = out[idx_start..close_idx].trim();
+            let w = mem.width.max(1);
+            let repl = if let Ok(cidx) = idx_expr.parse::<usize>() {
+                let v = mem
+                    .init_words
+                    .iter()
+                    .find(|(a, _)| *a == cidx)
+                    .map(|(_, v)| *v)
+                    .unwrap_or(0);
+                format!("{w}'d{v}")
+            } else {
+                let mut mux = format!("{w}'d0");
+                for (a, v) in mem.init_words.iter().rev() {
+                    mux = format!("(({idx_expr} == {a}) ? {w}'d{v} : {mux})");
+                }
+                mux
+            };
+            out.replace_range(pos..=close_idx, &repl);
+        }
+    }
+    out
+}
+
+fn rewrite_mem_reads_in_seq(body: &mut [SStmt], memories: &[VhdlMem]) {
+    for s in body.iter_mut() {
+        match s {
+            SStmt::Assign { rhs, .. } => {
+                *rhs = rewrite_mem_read_str(rhs, memories);
+            }
+            SStmt::If {
+                cond,
+                then_b,
+                else_b,
+            } => {
+                *cond = rewrite_mem_read_str(cond, memories);
+                rewrite_mem_reads_in_seq(then_b, memories);
+                rewrite_mem_reads_in_seq(else_b, memories);
+            }
+            SStmt::Case { sel, arms, other } => {
+                *sel = rewrite_mem_read_str(sel, memories);
+                for (_, b) in arms {
+                    rewrite_mem_reads_in_seq(b, memories);
+                }
+                rewrite_mem_reads_in_seq(other, memories);
+            }
+            SStmt::For { body, .. } => rewrite_mem_reads_in_seq(body, memories),
+        }
+    }
+}
+
+fn rewrite_mem_reads_in_stmts(stmts: &mut [CStmt], memories: &[VhdlMem]) {
+    for st in stmts.iter_mut() {
+        match st {
+            CStmt::Assign { rhs, .. } => {
+                *rhs = rewrite_mem_read_str(rhs, memories);
+            }
+            CStmt::CondAssign { arms, .. } => {
+                for (c, v) in arms {
+                    if let Some(cond) = c {
+                        *cond = rewrite_mem_read_str(cond, memories);
+                    }
+                    *v = rewrite_mem_read_str(v, memories);
+                }
+            }
+            CStmt::Selected {
+                sel, arms, other, ..
+            } => {
+                *sel = rewrite_mem_read_str(sel, memories);
+                for (_, v) in arms {
+                    *v = rewrite_mem_read_str(v, memories);
+                }
+                if let Some(o) = other {
+                    *o = rewrite_mem_read_str(o, memories);
+                }
+            }
+            CStmt::Process { body, .. } => rewrite_mem_reads_in_seq(body, memories),
+            CStmt::Inst { .. } => {}
+        }
+    }
 }
 
 fn parse_constant(p: &mut P, consts: &HashMap<String, i64>) -> Result<(String, i64), String> {
@@ -1355,11 +1822,11 @@ fn take_clock(p: &mut P) -> Option<(String, bool)> {
                 let _ = p.ident();
                 let _ = p.eat("=");
                 let rise = match p.peek() {
-                    Some(Tok::BitStr(s)) if s == "0" => {
+                    Some(Tok::BitStr(s)) | Some(Tok::StrLit { bits: s, .. }) if s == "0" => {
                         p.i += 1;
                         false
                     }
-                    Some(Tok::BitStr(_)) | Some(Tok::Num(_)) => {
+                    Some(Tok::BitStr(_)) | Some(Tok::StrLit { .. }) | Some(Tok::Num(_)) => {
                         p.i += 1;
                         true
                     }
@@ -1376,11 +1843,11 @@ fn take_clock(p: &mut P) -> Option<(String, bool)> {
         // `clk = '1' and clk'event`
         if p.eat("=") {
             let rise = match p.peek() {
-                Some(Tok::BitStr(s)) if s == "0" => {
+                Some(Tok::BitStr(s)) | Some(Tok::StrLit { bits: s, .. }) if s == "0" => {
                     p.i += 1;
                     false
                 }
-                Some(Tok::BitStr(_)) | Some(Tok::Num(_)) => {
+                Some(Tok::BitStr(_)) | Some(Tok::StrLit { .. }) | Some(Tok::Num(_)) => {
                     p.i += 1;
                     true
                 }
@@ -1558,7 +2025,35 @@ fn parse_target_sv(
 }
 
 fn parse_expr_sv(p: &mut P, consts: &HashMap<String, i64>) -> Result<String, String> {
-    parse_or_sv(p, consts)
+    let first = parse_or_sv(p, consts)?;
+    // VHDL-2019 inline conditional expression: `<expr_a> when <cond_1> else <expr_b> [when <cond_2> else ...]`
+    // Look ahead for `when <cond> else` so `with sel select val when pat,` is not stolen.
+    let save_when = p.i;
+    if p.eat("when") {
+        if let Ok(cond1) = parse_or_sv(p, consts) {
+            if p.eat("else") {
+                let mut arms = vec![(Some(cond1), first)];
+                loop {
+                    let val = parse_or_sv(p, consts)?;
+                    let save_next = p.i;
+                    if p.eat("when") {
+                        if let Ok(c) = parse_or_sv(p, consts) {
+                            if p.eat("else") {
+                                arms.push((Some(c), val));
+                                continue;
+                            }
+                        }
+                        p.i = save_next;
+                    }
+                    arms.push((None, val));
+                    break;
+                }
+                return Ok(lower_cond_arms(&arms));
+            }
+        }
+        p.i = save_when;
+    }
+    Ok(first)
 }
 
 fn parse_or_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, String> {
@@ -1726,17 +2221,10 @@ fn parse_primary_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, Strin
         let _ = p.eat(")");
         return Ok(format!("({inner})"));
     }
-    if let Some(Tok::BitStr(bits)) = p.peek() {
+    if let Some(Tok::BitStr(bits) | Tok::StrLit { bits, .. }) = p.peek() {
         let bits = bits.clone();
         p.i += 1;
         let w = bits.len().max(1);
-        if bits
-            .chars()
-            .all(|ch| matches!(ch, '0' | '1' | 'z' | 'Z' | 'x' | 'X'))
-        {
-            return Ok(format!("{w}'b{bits}"));
-        }
-        // hex already converted in tokenizer
         return Ok(format!("{w}'b{bits}"));
     }
     if let Some(n) = p.number() {
@@ -1749,14 +2237,45 @@ fn parse_primary_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, Strin
             let _ = p.ident();
         }
         if p.eat("(") {
+            // Shift functions from `numeric_std`, `numeric_std_unsigned`, and `std_logic_unsigned`
+            if n.eq_ignore_ascii_case("shl") || n.eq_ignore_ascii_case("shift_left") {
+                let val = parse_expr_sv(p, c)?;
+                let sh = if p.eat(",") {
+                    parse_expr_sv(p, c).unwrap_or_else(|_| "0".into())
+                } else {
+                    "0".into()
+                };
+                let _ = p.eat(")");
+                return Ok(format!("({val} << {sh})"));
+            }
+            if n.eq_ignore_ascii_case("shr") || n.eq_ignore_ascii_case("shift_right") {
+                let val = parse_expr_sv(p, c)?;
+                let sh = if p.eat(",") {
+                    parse_expr_sv(p, c).unwrap_or_else(|_| "0".into())
+                } else {
+                    "0".into()
+                };
+                let _ = p.eat(")");
+                return Ok(format!("({val} >> {sh})"));
+            }
             // slice, index, or function call / type cast
             if is_cast(&n) {
                 let inner = parse_expr_sv(p, c)?;
                 // optional , width
+                let mut width_arg: Option<usize> = None;
                 if p.eat(",") {
-                    let _ = parse_expr_sv(p, c);
+                    if let Some(w) = parse_int_expr_peek(p, c) {
+                        width_arg = Some(w.max(1) as usize);
+                    } else {
+                        let _ = parse_expr_sv(p, c);
+                    }
                 }
                 let _ = p.eat(")");
+                if let Some(w) = width_arg {
+                    if let Ok(num_val) = inner.trim().parse::<u128>() {
+                        return Ok(format!("{w}'d{num_val}"));
+                    }
+                }
                 return Ok(inner);
             }
             if n.eq_ignore_ascii_case("rising_edge") {
@@ -1782,15 +2301,15 @@ fn parse_primary_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, Strin
                     return Ok(format!("{n}[{a}]"));
                 }
             }
-            // function call: fold args (Helion maps known IEEE; others XOR-fold so
-            // every operand still reaches hardware).
+            // Single-argument `arr(idx_expr)` is an array/vector dynamic index if not a known multi-arg function
             let mut args = vec![parse_expr_sv(p, c).unwrap_or_else(|_| "1'b0".into())];
             while p.eat(",") {
                 args.push(parse_expr_sv(p, c).unwrap_or_else(|_| "1'b0".into()));
             }
             let _ = p.eat(")");
             if args.len() == 1 {
-                return Ok(args.remove(0));
+                let idx = args.remove(0);
+                return Ok(format!("{n}[{idx}]"));
             }
             return Ok(format!("({})", args.join(" ^ ")));
         }
@@ -1820,6 +2339,10 @@ fn is_cast(n: &str) -> bool {
             | "to_integer"
             | "conv_integer"
             | "conv_std_logic_vector"
+            | "conv_unsigned"
+            | "conv_signed"
+            | "ext"
+            | "sxt"
             | "resize"
             | "to_bit"
             | "to_bitvector"
@@ -2200,6 +2723,19 @@ fn emit_sv(
             sv.push_str(&format!("  logic {n};\n"));
         } else {
             sv.push_str(&format!("  logic [{}:0] {n};\n", w - 1));
+        }
+    }
+    for mem in &arch.memories {
+        let n = sta_clock_name(&mem.name, sta_clocks, &occupied);
+        let w = mem.width.max(1);
+        let d = mem.depth.max(1);
+        sv.push_str(&format!("  logic [{}:0] {n} [0:{}];\n", w - 1, d - 1));
+        if !mem.init_words.is_empty() {
+            sv.push_str("  initial begin\n");
+            for (addr, val) in &mem.init_words {
+                sv.push_str(&format!("    {n}[{addr}] = {w}'d{val};\n"));
+            }
+            sv.push_str("  end\n");
         }
     }
     for st in &arch.stmts {
@@ -2676,6 +3212,7 @@ enum Tok {
     Num(u128),
     Sym(String),
     BitStr(String),
+    StrLit { bits: String, raw: String },
 }
 
 struct P<'a> {
@@ -2955,15 +3492,18 @@ fn tokenize(src: &str) -> Vec<Tok> {
         }
         if c == '"' {
             i += 1;
-            let mut bits = String::new();
+            let mut raw = String::new();
             while i < chars.len() && chars[i] != '"' {
-                bits.push(chars[i]);
+                raw.push(chars[i]);
                 i += 1;
             }
             if i < chars.len() {
                 i += 1;
             }
-            out.push(Tok::BitStr(normalize_bitstr(&bits, 2)));
+            out.push(Tok::StrLit {
+                bits: normalize_bitstr(&raw, 2),
+                raw,
+            });
             continue;
         }
         if c.is_ascii_alphabetic() || c == '_' {
