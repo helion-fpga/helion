@@ -25,8 +25,11 @@ pub use ug903::*;
 // extraction, net-level crossing detection, synchronizer recognition, and
 // the 11 CdcClass violation classes layered on `report_cdc`.
 pub use cdc::{
-    classify_crossings, extract_domains, find_crossings, is_mux_select, sync_chain, CdcClass,
-    CdcCrossing, ClockDomain, CrossingSource, DomainKind, DomainMap, RawCrossing, SyncChain,
+    classify_crossings, classify_ug906_clock_pair, compute_cdc_mtbf_years, extract_domains,
+    find_crossings, is_mux_select, report_cdc_mtbf, sync_chain, CdcClass, CdcCrossing,
+    CdcMtbfReport, CdcSyncMtbfEntry, ClockDomain, ClockInteractionEntry, ClockInteractionMatrix,
+    CrossingSource, DomainKind, DomainMap, RawCrossing, SyncChain, TechCorner,
+    Ug906ClockPairClass, SECONDS_PER_YEAR,
 };
 // Legacy pair-level helpers, moved into `cdc::` (still crate-internal).
 pub(crate) use cdc::{cdc_synchronizer, clock_ff_loads, clock_net_name};
@@ -127,6 +130,22 @@ pub struct ClockInteractionCell {
     pub path_count: usize,
 }
 
+impl ClockInteractionCell {
+    /// Return the Vivado UG906 Table 2-3 pair classification for this cell.
+    pub fn ug906_class(&self, clocks: &[Clock], xdc: &Constraints) -> Ug906ClockPairClass {
+        if self.relation == ClockRelation::NoPaths {
+            return Ug906ClockPairClass::NoPaths;
+        }
+        let Some(from_clk) = clocks.iter().find(|c| c.name == self.from) else {
+            return Ug906ClockPairClass::UnsafeNoCommonClock;
+        };
+        let Some(to_clk) = clocks.iter().find(|c| c.name == self.to) else {
+            return Ug906ClockPairClass::UnsafeNoCommonClock;
+        };
+        classify_ug906_clock_pair(from_clk, to_clk, clocks, xdc)
+    }
+}
+
 /// UG949 Clock Interaction Report: N×N matrix from STA clocks + XDC exceptions.
 #[derive(Clone, Debug, Default)]
 pub struct ClockInteraction {
@@ -137,6 +156,11 @@ pub struct ClockInteraction {
 impl ClockInteraction {
     pub fn cell(&self, from: &str, to: &str) -> Option<&ClockInteractionCell> {
         self.cells.iter().find(|c| c.from == from && c.to == to)
+    }
+
+    /// Convert this report into a 2D $N \times N$ UG906 [`ClockInteractionMatrix`].
+    pub fn to_ug906_matrix(&self, xdc: &Constraints) -> ClockInteractionMatrix {
+        ClockInteractionMatrix::from_report(self, xdc)
     }
 
     pub fn timed_count(&self) -> usize {
