@@ -597,14 +597,32 @@ pub fn paint_palette(ctx: &egui::Context, app: &mut HelionIde) {
     let rows = palette_items(app, mode, &query);
 
     let mut pick: Option<PalettePick> = None;
+    // Modal backdrop scrim so underlying editor/canvas text never competes with the palette.
+    egui::Area::new(egui::Id::new("command_palette_backdrop"))
+        .order(egui::Order::Foreground)
+        .fade_in(false)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let screen = ctx.screen_rect();
+            ui.painter()
+                .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(110));
+        });
     egui::Area::new(egui::Id::new("command_palette"))
-        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 72.0))
+        .order(egui::Order::Foreground)
+        .fade_in(false)
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 82.0))
         .show(ctx, |ui| {
             egui::Frame::new()
                 .fill(theme.surface)
-                .stroke(egui::Stroke::new(1.0, theme.line))
+                .stroke(egui::Stroke::new(1.0, theme.accent_dim))
+                .shadow(egui::Shadow {
+                    offset: [0, 8],
+                    blur: 24,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(140),
+                })
                 .corner_radius(8.0)
-                .inner_margin(egui::Margin::symmetric(12, 10))
+                .inner_margin(egui::Margin::symmetric(14, 12))
                 .show(ui, |ui| {
                     ui.set_width(chrome::PALETTE_WIDTH);
                     paint_palette_header(ui, app, &theme, mode, just_opened);
@@ -612,7 +630,9 @@ pub fn paint_palette(ctx: &egui::Context, app: &mut HelionIde) {
                     if let Some(p) = paint_palette_rows(ui, app, &theme, &rows, nav) {
                         pick = Some(p);
                     }
-                    ui.add_space(4.0);
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(2.0);
                     ui.label(
                         RichText::new("↑↓ navigate · Enter run · Esc close · > commands")
                             .font(font_ui(11.0))
@@ -816,13 +836,50 @@ fn menu_help(ui: &mut egui::Ui, app: &mut HelionIde, theme: &Theme) {
 pub fn paint_menu_bar(ui: &mut egui::Ui, app: &mut HelionIde) {
     let theme = app.theme;
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.spacing_mut().button_padding = egui::vec2(8.0, 2.0);
+        ui.spacing_mut().interact_size.y = 22.0;
+        ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
+        ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+        ui.label(
+            RichText::new("HELION")
+                .font(font_ui_medium(11.0))
+                .color(theme.accent),
+        );
+        ui.add_space(6.0);
         ui.menu_button("File", |ui| menu_file(ui, app, &theme));
         ui.menu_button("Edit", |ui| menu_edit(ui, app, &theme));
         ui.menu_button("View", |ui| menu_view(ui, app, &theme));
         ui.menu_button("Flow", |ui| menu_flow(ui, app, &theme));
         ui.menu_button("Tools", |ui| menu_tools(ui, app, &theme));
         ui.menu_button("Help", |ui| menu_help(ui, app, &theme));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(6.0);
+            if ui.button_or_shortcut_pill(&theme) {
+                open_palette(app, PaletteMode::Commands);
+            }
+        });
     });
+}
+
+trait MenuShortcutPill {
+    fn button_or_shortcut_pill(&mut self, theme: &Theme) -> bool;
+}
+
+impl MenuShortcutPill for egui::Ui {
+    fn button_or_shortcut_pill(&mut self, theme: &Theme) -> bool {
+        let btn = egui::Button::new(
+            RichText::new("⌘P Go to File  ·  ⇧⌘P Commands  ·  ⌘K Shortcuts")
+                .font(font_code(10.5))
+                .color(theme.dim),
+        )
+        .fill(theme.panel)
+        .stroke(egui::Stroke::new(1.0, theme.line))
+        .corner_radius(4.0);
+        self.add(btn)
+            .on_hover_text("Open Command Palette (⇧⌘P)")
+            .clicked()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -930,14 +987,31 @@ pub fn paint_shortcut_cheatsheet(ctx: &egui::Context, app: &mut HelionIde) {
     let id = egui::Id::new("cheatsheet_query");
     let mut query: String = ctx.data(|d| d.get_temp(id)).unwrap_or_default();
     let mut close = false;
+    egui::Area::new(egui::Id::new("shortcut_cheatsheet_backdrop"))
+        .order(egui::Order::Foreground)
+        .fade_in(false)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let screen = ctx.screen_rect();
+            ui.painter()
+                .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(110));
+        });
     egui::Area::new(egui::Id::new("shortcut_cheatsheet"))
+        .order(egui::Order::Foreground)
+        .fade_in(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ctx, |ui| {
             egui::Frame::new()
                 .fill(theme.surface)
-                .stroke(egui::Stroke::new(1.0, theme.line))
+                .stroke(egui::Stroke::new(1.0, theme.accent_dim))
+                .shadow(egui::Shadow {
+                    offset: [0, 8],
+                    blur: 24,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(140),
+                })
                 .corner_radius(8.0)
-                .inner_margin(egui::Margin::symmetric(16, 12))
+                .inner_margin(egui::Margin::symmetric(16, 14))
                 .show(ui, |ui| {
                     ui.set_width(chrome::CHEATSHEET_WIDTH);
                     if paint_cheatsheet_header(ui, &theme, &mut query) {
@@ -957,7 +1031,9 @@ pub fn paint_shortcut_cheatsheet(ctx: &egui::Context, app: &mut HelionIde) {
                                 &query,
                             );
                         });
-                    ui.add_space(4.0);
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(2.0);
                     ui.label(
                         RichText::new("Esc closes · ⌘K toggles this panel")
                             .font(font_ui(11.0))
