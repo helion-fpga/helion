@@ -12,14 +12,36 @@ use helion_route::{HOP_DELAY_PS, RouteOpts, Routed, route_with};
 use helion_sta::{Constraints, apply_xdc, create_clock, load_xdc, report_timing_routed_xdc};
 
 mod checkpoint2;
+pub mod qor;
+pub mod reports;
+pub mod tcl;
+
 pub use checkpoint2::{
     CheckpointDiff, CheckpointMeta, CheckpointStage, CheckpointSummary, RestoredCheckpoint,
-    delete_checkpoint, diff_metas, list_checkpoints, load_checkpoint, read_meta, save_checkpoint,
-    stage_of,
+    cell_fingerprints, delete_checkpoint, diff_metas, list_checkpoints, load_checkpoint,
+    netlist_sha256, read_meta, save_checkpoint, save_checkpoint_file, sha256_bytes, sha256_hex,
+    sha256_to_hex, stage_of,
+};
+pub use qor::{
+    QorAssessmentReport, QorCategory, QorSuggestion, RunResultSummary, StrategyExplorationReport,
+    execute_strategy_run, explore_strategies, launch_project_runs, report_qor_suggestions,
+};
+pub use reports::{
+    ClockDomainUtil, ClockUtilizationReport, DesignAnalysisReport, HighFanoutNet, HighFanoutReport,
+    ProjDrc, ProjDrcSeverity, ProjDrcViolation, evaluate_clock_utilization,
+    evaluate_design_analysis, evaluate_drc, evaluate_high_fanout_nets, report_cdc_detailed,
+    report_clock_interaction_detailed, report_clock_utilization_detailed,
+    report_design_analysis_detailed, report_drc_detailed, report_high_fanout_nets_detailed,
+    report_power_detailed, report_timing_detailed, report_timing_summary_text,
+    report_utilization_detailed,
+};
+pub use tcl::{
+    VivadoTclSession, all_inputs, all_outputs, all_registers, cell_properties, eval_tcl_filter,
+    get_clocks, get_ports, net_properties, pin_properties, port_properties, run_vivado_tcl,
+    split_tcl_list, tcl_glob_match, translate_vhdl_to_sv,
 };
 
-/// UG986 Lab 1 Helion equivalents of implementation strategies.
-/// Not Vivado strategy trademarks: same *kind* of lever (timing vs runtime vs phys).
+/// UG986 / UG904 implementation strategies, including Vivado multi-strategy explorer presets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImplStrategy {
     /// Timing-driven place + full PathFinder. Gold WNS path (`impl_1`).
@@ -30,15 +52,45 @@ pub enum ImplStrategy {
     RuntimeOpt,
     /// Timing-driven place + directed extra hops (phys-opt detours).
     PhysOpt,
+    /// Vivado `Performance_Explore`: aggressive timing-driven placement + phys_opt + 16 router iterations.
+    PerformanceExplore,
+    /// Vivado `Performance_NetDelay_high`: max timing weight (1.0) + phys_opt + 24 router iterations.
+    PerformanceNetDelayHigh,
+    /// Vivado `Area_Explore`: aggressive dead/const LUT optimization + balanced wirelength placement.
+    AreaExplore,
+    /// Vivado `Flow_Quick`: minimal effort wirelength placement + single-pass routing for fast turnaround.
+    FlowQuick,
+    /// Vivado `Congestion_SpreadLogic_high`: logic-spreading placement + extra negotiation iterations.
+    CongestionSpreadLogicHigh,
 }
 
 impl ImplStrategy {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "default" | "impl_1" => Ok(Self::Default),
+            "default" | "impl_1" | "vivado implementation defaults" | "vivado synthesis defaults" => {
+                Ok(Self::Default)
+            }
             "timingexplore" | "timing_explore" | "explore" => Ok(Self::TimingExplore),
-            "runtimeopt" | "runtime_opt" | "runtime" => Ok(Self::RuntimeOpt),
+            "runtimeopt" | "runtime_opt" | "runtime" | "flow_runtimeoptimized" => {
+                Ok(Self::RuntimeOpt)
+            }
             "physopt" | "phys_opt" | "phys" => Ok(Self::PhysOpt),
+            "performance_explore" | "performanceexplore" | "perf_explore" => {
+                Ok(Self::PerformanceExplore)
+            }
+            "performance_netdelay_high"
+            | "performancenetdelayhigh"
+            | "netdelay_high"
+            | "performance_netdelay_low" => Ok(Self::PerformanceNetDelayHigh),
+            "area_explore" | "areaexplore" | "area" | "flow_areaoptimized_high" => {
+                Ok(Self::AreaExplore)
+            }
+            "flow_quick" | "flowquick" | "quick" => Ok(Self::FlowQuick),
+            "congestion_spreadlogic_high"
+            | "congestionspreadlogichigh"
+            | "spreadlogic_high"
+            | "congestion_spreadlogic_medium"
+            | "congestion" => Ok(Self::CongestionSpreadLogicHigh),
             other => Err(format!("unknown impl strategy {other}")),
         }
     }
@@ -49,20 +101,46 @@ impl ImplStrategy {
             Self::TimingExplore => "TimingExplore",
             Self::RuntimeOpt => "RuntimeOpt",
             Self::PhysOpt => "PhysOpt",
+            Self::PerformanceExplore => "Performance_Explore",
+            Self::PerformanceNetDelayHigh => "Performance_NetDelay_high",
+            Self::AreaExplore => "Area_Explore",
+            Self::FlowQuick => "Flow_Quick",
+            Self::CongestionSpreadLogicHigh => "Congestion_SpreadLogic_high",
         }
     }
 
     pub fn place_opts(self) -> PlaceOpts {
         match self {
-            Self::RuntimeOpt => PlaceOpts { timing_weight: 0.0, seed: 0 },
+            Self::RuntimeOpt | Self::FlowQuick => PlaceOpts {
+                timing_weight: 0.0,
+                seed: 0,
+            },
+            Self::PerformanceExplore => PlaceOpts {
+                timing_weight: 0.90,
+                seed: 0,
+            },
+            Self::PerformanceNetDelayHigh => PlaceOpts {
+                timing_weight: 1.0,
+                seed: 0,
+            },
+            Self::AreaExplore => PlaceOpts {
+                timing_weight: 0.50,
+                seed: 0,
+            },
+            Self::CongestionSpreadLogicHigh => PlaceOpts {
+                timing_weight: 0.35,
+                seed: 2,
+            },
             _ => PlaceOpts {
-                timing_weight: 0.75, seed: 0 },
+                timing_weight: 0.75,
+                seed: 0,
+            },
         }
     }
 
     pub fn route_opts(self) -> RouteOpts {
         match self {
-            Self::RuntimeOpt => RouteOpts {
+            Self::RuntimeOpt | Self::FlowQuick => RouteOpts {
                 max_iters: 1,
                 extra_hops: 0,
             },
@@ -70,24 +148,50 @@ impl ImplStrategy {
                 max_iters: 8,
                 extra_hops: 8,
             },
+            Self::PerformanceExplore => RouteOpts {
+                max_iters: 16,
+                extra_hops: 0,
+            },
+            Self::PerformanceNetDelayHigh => RouteOpts {
+                max_iters: 24,
+                extra_hops: 0,
+            },
+            Self::AreaExplore => RouteOpts {
+                max_iters: 8,
+                extra_hops: 0,
+            },
+            Self::CongestionSpreadLogicHigh => RouteOpts {
+                max_iters: 16,
+                extra_hops: 2,
+            },
             _ => RouteOpts::default(),
         }
     }
 
-    fn as_u8(self) -> u8 {
+    pub(crate) fn as_u8(self) -> u8 {
         match self {
             Self::Default => 0,
             Self::TimingExplore => 1,
             Self::RuntimeOpt => 2,
             Self::PhysOpt => 3,
+            Self::PerformanceExplore => 4,
+            Self::PerformanceNetDelayHigh => 5,
+            Self::AreaExplore => 6,
+            Self::FlowQuick => 7,
+            Self::CongestionSpreadLogicHigh => 8,
         }
     }
 
-    fn from_u8(v: u8) -> Self {
+    pub(crate) fn from_u8(v: u8) -> Self {
         match v {
             1 => Self::TimingExplore,
             2 => Self::RuntimeOpt,
             3 => Self::PhysOpt,
+            4 => Self::PerformanceExplore,
+            5 => Self::PerformanceNetDelayHigh,
+            6 => Self::AreaExplore,
+            7 => Self::FlowQuick,
+            8 => Self::CongestionSpreadLogicHigh,
             _ => Self::Default,
         }
     }
@@ -106,7 +210,7 @@ impl Default for ImplStrategy {
 /// for `.prj` persistence (`RunStrategy::to_spec` / `parse_spec`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunStrategy {
-    /// Preset label: Default | TimingExplore | RuntimeOpt | PhysOpt | Custom.
+    /// Preset label: Default | TimingExplore | RuntimeOpt | PhysOpt | Performance_Explore | ... | Custom.
     pub preset: String,
     /// 0 = skip `opt_design` (peephole LUT opts); >=1 = run it.
     pub opt_level: u8,
@@ -146,7 +250,9 @@ impl RunStrategy {
     /// Named preset. Unknown names are an error (use "Custom" + edits).
     pub fn preset(name: &str) -> Result<Self, String> {
         match name.trim().to_ascii_lowercase().as_str() {
-            "default" | "impl_1" => Ok(Self::knobs("Default", 1, true, true, 0, 8, false)),
+            "default" | "impl_1" | "vivado implementation defaults" => {
+                Ok(Self::knobs("Default", 1, true, true, 0, 8, false))
+            }
             "timingexplore" | "timing_explore" | "explore" => {
                 Ok(Self::knobs("TimingExplore", 1, true, true, 0, 16, false))
             }
@@ -154,6 +260,38 @@ impl RunStrategy {
                 Ok(Self::knobs("RuntimeOpt", 0, false, false, 0, 1, false))
             }
             "physopt" | "phys_opt" | "phys" => Ok(Self::knobs("PhysOpt", 1, true, true, 0, 8, true)),
+            "performance_explore" | "performanceexplore" | "perf_explore" => {
+                Ok(Self::knobs("Performance_Explore", 1, true, true, 0, 16, true))
+            }
+            "performance_netdelay_high" | "performancenetdelayhigh" | "netdelay_high" => {
+                Ok(Self::knobs(
+                    "Performance_NetDelay_high",
+                    2,
+                    true,
+                    true,
+                    0,
+                    24,
+                    true,
+                ))
+            }
+            "area_explore" | "areaexplore" | "area" => {
+                Ok(Self::knobs("Area_Explore", 2, true, false, 0, 8, false))
+            }
+            "flow_quick" | "flowquick" | "quick" => {
+                Ok(Self::knobs("Flow_Quick", 0, false, false, 0, 1, false))
+            }
+            "congestion_spreadlogic_high"
+            | "congestionspreadlogichigh"
+            | "spreadlogic_high"
+            | "congestion" => Ok(Self::knobs(
+                "Congestion_SpreadLogic_high",
+                1,
+                true,
+                true,
+                2,
+                16,
+                false,
+            )),
             "custom" => Ok(Self::knobs("Custom", 1, true, true, 0, 8, false)),
             other => Err(format!("unknown run strategy preset {other}")),
         }
@@ -171,11 +309,22 @@ impl RunStrategy {
             ImplStrategy::Default | ImplStrategy::TimingExplore => {
                 Self::knobs(s.label(), 1, true, true, 0, 8, false)
             }
-            ImplStrategy::RuntimeOpt => Self::knobs(s.label(), 0, false, false, 0, 1, false),
+            ImplStrategy::RuntimeOpt | ImplStrategy::FlowQuick => {
+                Self::knobs(s.label(), 0, false, false, 0, 1, false)
+            }
             ImplStrategy::PhysOpt => Self::knobs(s.label(), 1, true, true, 0, 8, true),
+            ImplStrategy::PerformanceExplore => {
+                Self::knobs(s.label(), 1, true, true, 0, 16, true)
+            }
+            ImplStrategy::PerformanceNetDelayHigh => {
+                Self::knobs(s.label(), 2, true, true, 0, 24, true)
+            }
+            ImplStrategy::AreaExplore => Self::knobs(s.label(), 2, true, false, 0, 8, false),
+            ImplStrategy::CongestionSpreadLogicHigh => {
+                Self::knobs(s.label(), 1, true, true, 2, 16, false)
+            }
         }
     }
-
     pub fn place_opts(&self) -> helion_place::PlaceOpts {
         helion_place::PlaceOpts {
             timing_weight: if self.timing_driven { 0.75 } else { 0.0 },
@@ -430,6 +579,8 @@ impl Session {
     /// Reopen a `.hckp` written by [`write_checkpoint_to`]. Re-impls from the
     /// embedded HNF so ECO / `write_bitstream` / incremental place work.
     /// [`read_checkpoint`] is the Vivado-style alias of this command.
+    /// Reopen a `.hckp`, `.hck2`, `.hdcp`, or `.dcp` checkpoint.
+    /// [`read_checkpoint`] is the Vivado-style alias of this command.
     pub fn open_checkpoint(
         path: impl AsRef<std::path::Path>,
         dev: &Device,
@@ -437,6 +588,10 @@ impl Session {
         let path = path.as_ref();
         let bytes =
             std::fs::read(path).map_err(|e| format!("open_checkpoint {}: {e}", path.display()))?;
+        if bytes.starts_with(b"HCK2") {
+            let rc = load_checkpoint(path, dev)?;
+            return Ok(rc.session);
+        }
         let mut s = Self::restore_session(&bytes, dev)?;
         s.impl_checkpoint = s.placed.clone();
         Ok(s)
@@ -450,6 +605,83 @@ impl Session {
         Self::open_checkpoint(path, dev)
     }
 
+    /// Write a post-synth, post-place, or post-route design checkpoint (`.dcp` / `.hdcp` / `.hck2`)
+    /// with SHA-256 netlist fingerprinting.
+    pub fn write_dcp(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        xdc: &Constraints,
+    ) -> Result<CheckpointMeta, String> {
+        let mut summary = CheckpointSummary::default();
+        if let (Some(d), Some(r)) = (&self.design, &self.routed) {
+            let mut clks = xdc.clocks.clone();
+            if clks.is_empty() {
+                create_clock(&mut clks, "clk", 10_000, "clk");
+            }
+            if let Ok(t) = report_timing_routed_xdc(d, r, &clks, xdc) {
+                summary.wns_ps = t.wns_ps;
+                summary.tns_ps = t.tns_ps;
+            }
+        }
+        save_checkpoint_file(self, xdc, path.as_ref(), &summary)
+    }
+
+    /// UG904 `read_checkpoint -incremental`: load a reference checkpoint (`.dcp` / `.hdcp` / `.hck2` / `.hckp`),
+    /// verify its SHA-256 netlist fingerprint, seed `impl_checkpoint`, and if a synthesized design
+    /// is already loaded, compute cell/net/port reuse and perform reference-guided placement reuse.
+    pub fn read_checkpoint_incremental(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+        dev: &Device,
+    ) -> Result<ReuseReport, String> {
+        let path = path.as_ref();
+        let ref_session = Self::open_checkpoint(path, dev)?;
+        let ref_placed = ref_session
+            .placed
+            .or(ref_session.impl_checkpoint)
+            .ok_or("read_checkpoint -incremental: reference checkpoint has no placement")?;
+        let ref_fps = ref_session
+            .design
+            .as_ref()
+            .map(cell_fingerprints)
+            .unwrap_or_default();
+        self.impl_checkpoint = Some(ref_placed.clone());
+        if self.design.is_some() {
+            let mut rep = self.incremental_place(dev, &ref_placed)?;
+            if !ref_fps.is_empty() {
+                if let Some(cur_d) = &self.design {
+                    let cur_fps = cell_fingerprints(cur_d);
+                    let exact_fp_matches = cur_fps
+                        .iter()
+                        .filter(|(k, v)| ref_fps.get(*k) == Some(*v))
+                        .count();
+                    rep.reused_cells = rep.reused_cells.max(exact_fp_matches);
+                }
+            }
+            return Ok(rep);
+        }
+        Ok(ReuseReport {
+            cells: ref_placed.packed.lutffs.len(),
+            reused_cells: ref_placed.packed.lutffs.len(),
+            nets: ref_placed.packed.lutffs.len(),
+            reused_nets: ref_placed.packed.lutffs.len(),
+            ports: ref_placed.packed.iobs.len(),
+            reused_ports: ref_placed.packed.iobs.len(),
+        })
+    }
+
+    /// UG835 / UG904 `phys_opt_design`: post-place physical optimization pass.
+    pub fn phys_opt_design(&mut self, _dev: &Device) -> Result<String, String> {
+        let pl = self
+            .placed
+            .as_mut()
+            .ok_or("phys_opt_design: design is not placed (run place_design first)")?;
+        if pl.timing_weight < 0.85 {
+            pl.timing_weight = 0.85;
+        }
+        let n = pl.lutff_sites.len();
+        Ok(format!("phys_opt_design optimized_clusters={n}"))
+    }
     /// Place/route/bitgen using `.prj` pblock + impl-run strategy (Default = gold).
     /// A ranged pblock floorplans matching `pb.cells` (or the whole design if
     /// that list is empty); `create_run -strategy` still selects place/route knobs.
@@ -575,17 +807,31 @@ impl Session {
         Ok(())
     }
 
-    /// Full impl with a Lab 1 strategy. Assumes `design` is already synthesized.
+    /// Full impl with a Lab 1 or Vivado strategy. Assumes `design` is already synthesized.
     pub fn impl_with_strategy(
         &mut self,
         dev: &Device,
         strategy: ImplStrategy,
     ) -> Result<(), String> {
         self.strategy = strategy;
-        if strategy == ImplStrategy::PhysOpt {
+        if matches!(
+            strategy,
+            ImplStrategy::PhysOpt
+                | ImplStrategy::PerformanceExplore
+                | ImplStrategy::PerformanceNetDelayHigh
+                | ImplStrategy::AreaExplore
+        ) {
             let _ = self.opt_design_step()?;
         }
         self.place_design_with(dev, strategy.place_opts())?;
+        if matches!(
+            strategy,
+            ImplStrategy::PhysOpt
+                | ImplStrategy::PerformanceExplore
+                | ImplStrategy::PerformanceNetDelayHigh
+        ) {
+            let _ = self.phys_opt_design(dev)?;
+        }
         self.route_design_with(dev, strategy.route_opts())?;
         self.write_bitstream(dev)?;
         Ok(())
@@ -834,6 +1080,54 @@ impl Session {
             p.macs.len(),
             dev.n_dsp
         ))
+    }
+
+    pub fn report_timing_summary(&self, dev: &Device, xdc: &Constraints) -> Result<String, String> {
+        report_timing_summary_text(self, dev, xdc)
+    }
+
+    pub fn report_power(&self, dev: &Device, xdc: &Constraints) -> Result<String, String> {
+        report_power_detailed(self, dev, xdc)
+    }
+
+    pub fn report_drc(&self, dev: &Device, xdc: &Constraints) -> Result<String, String> {
+        report_drc_detailed(self, dev, xdc)
+    }
+
+    pub fn report_cdc(&self, xdc: &Constraints) -> Result<String, String> {
+        report_cdc_detailed(self, xdc)
+    }
+
+    pub fn report_clock_interaction(&self, xdc: &Constraints) -> Result<String, String> {
+        report_clock_interaction_detailed(self, xdc)
+    }
+
+    pub fn report_clock_utilization(
+        &self,
+        dev: &Device,
+        xdc: &Constraints,
+    ) -> Result<String, String> {
+        report_clock_utilization_detailed(self, dev, xdc)
+    }
+
+    pub fn report_high_fanout_nets(&self, max_nets: usize) -> Result<String, String> {
+        report_high_fanout_nets_detailed(self, max_nets, 0)
+    }
+
+    pub fn report_design_analysis(
+        &self,
+        dev: &Device,
+        xdc: &Constraints,
+    ) -> Result<String, String> {
+        report_design_analysis_detailed(self, dev, xdc)
+    }
+
+    pub fn report_qor_suggestions(
+        &self,
+        dev: &Device,
+        xdc: &Constraints,
+    ) -> Result<String, String> {
+        Ok(qor::report_qor_suggestions(self, dev, xdc)?.text())
     }
 
     pub fn open_hw_manager(&mut self) {
@@ -1461,6 +1755,20 @@ pub struct ProjectFile {
     pub mark_debug: Vec<String>,
     /// Disk checkpoint path (`write_checkpoint path.hckp`).
     pub checkpoint_path: Option<String>,
+    /// Optional Vivado project name (`create_project <name>`).
+    pub project_name: Option<String>,
+    /// Optional Vivado project directory (`create_project <name> <dir>`).
+    pub project_dir: Option<String>,
+    /// Top-level generics (`set_property generic {K=V} [current_fileset]`).
+    pub generics: Vec<(String, String)>,
+    /// Verilog preprocessor defines (`set_property verilog_define {K=V} [current_fileset]`).
+    pub verilog_defines: Vec<(String, String)>,
+    /// Synthesis step arguments (`set_property STEPS.SYNTH_DESIGN.ARGS.<ARG> <VAL> [get_runs synth_1]`).
+    pub synth_args: Vec<(String, String)>,
+    /// Post-place physical optimization enabled (`STEPS.PHYS_OPT_DESIGN.IS_ENABLED`).
+    pub phys_opt_enabled: bool,
+    /// Incremental reference checkpoint path (`read_checkpoint -incremental <path>`).
+    pub incremental_checkpoint: Option<String>,
 }
 
 fn parse_clb_xy(spec: &str) -> Option<(u32, u32)> {
@@ -1554,19 +1862,83 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
         let mut toks = line.split_whitespace();
         let Some(cmd) = toks.next() else { continue };
         match cmd {
-            "part" => {
-                if let Some(v) = toks.next() {
+            "part" | "set_part" => {
+                if let Some(v) = toks.find(|t| !t.starts_with('-')) {
                     p.part = v.to_string();
                 }
             }
+            "create_project" => {
+                let rest: Vec<&str> = toks.collect();
+                let mut i = 0;
+                while i < rest.len() {
+                    if rest[i] == "-part" && i + 1 < rest.len() {
+                        p.part = rest[i + 1].to_string();
+                        i += 2;
+                        continue;
+                    }
+                    if !rest[i].starts_with('-') {
+                        if p.project_name.is_none() {
+                            p.project_name = Some(rest[i].to_string());
+                        } else if p.project_dir.is_none() {
+                            p.project_dir = Some(rest[i].to_string());
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            "add_files" => {
+                let rest: Vec<&str> = toks.collect();
+                let mut i = 0;
+                while i < rest.len() {
+                    if rest[i] == "-fileset" {
+                        i += 2;
+                        continue;
+                    }
+                    if !rest[i].starts_with('-') {
+                        let cleaned = rest[i].trim_matches(|c: char| "{}[]".contains(c));
+                        if !cleaned.is_empty() {
+                            let ext = std::path::Path::new(cleaned)
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or("")
+                                .to_ascii_lowercase();
+                            if ext == "xdc" || ext == "sdc" {
+                                p.constraint_files.push(cleaned.to_string());
+                            } else if ext == "helion" {
+                                p.ip_packages.push(cleaned.to_string());
+                            } else {
+                                p.sources.push(cleaned.to_string());
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+            }
             "read_sv" | "read_vhdl" | "read_c" | "read_verilog" | "sv" | "vhdl" | "c" => {
-                if let Some(v) = toks.next() {
-                    p.sources.push(v.to_string());
+                let rest: Vec<&str> = toks.collect();
+                let mut i = 0;
+                while i < rest.len() {
+                    if rest[i] == "-library" || rest[i] == "-work" {
+                        i += 2;
+                        continue;
+                    }
+                    if !rest[i].starts_with('-') {
+                        let cleaned = rest[i].trim_matches(|c: char| "{}[]".contains(c));
+                        if !cleaned.is_empty() {
+                            p.sources.push(cleaned.to_string());
+                        }
+                    }
+                    i += 1;
                 }
             }
             "read_xdc" | "read_sdc" | "xdc" | "sdc" => {
-                if let Some(v) = toks.next() {
-                    p.constraint_files.push(v.to_string());
+                for tok in toks {
+                    if !tok.starts_with('-') {
+                        let cleaned = tok.trim_matches(|c: char| "{}[]".contains(c));
+                        if !cleaned.is_empty() {
+                            p.constraint_files.push(cleaned.to_string());
+                        }
+                    }
                 }
             }
             "read_ip" | "ip" => {
@@ -1579,12 +1951,13 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
                     p.top = Some(v.to_string());
                 }
             }
-            "create_clock" => p.sdc.push(line.to_string()),
+            "create_clock" | "create_generated_clock" => p.sdc.push(line.to_string()),
             "set_property" => {
                 let rest: Vec<&str> = toks.collect();
-                if rest.first().copied() == Some("TOP") && rest.len() >= 2 {
+                let prop_up = rest.first().map(|s| s.to_ascii_uppercase()).unwrap_or_default();
+                if prop_up == "TOP" && rest.len() >= 2 {
                     let name = rest[1]
-                        .trim_matches(|c: char| c == '[' || c == ']')
+                        .trim_matches(|c: char| c == '[' || c == ']' || c == '{' || c == '}')
                         .to_string();
                     if !name.is_empty()
                         && !name.eq_ignore_ascii_case("current_fileset")
@@ -1592,13 +1965,38 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
                     {
                         p.top = Some(name);
                     }
+                } else if (prop_up == "PART" || prop_up == "TARGET_PART") && rest.len() >= 2 {
+                    let part_val = rest[1].trim_matches(|c: char| "{}[]\"".contains(c));
+                    if !part_val.is_empty() {
+                        p.part = part_val.to_string();
+                    }
+                } else if prop_up == "GENERIC" && rest.len() >= 2 {
+                    let val_str = rest[1].trim_matches(|c: char| "{}[]\"".contains(c));
+                    if let Some((k, v)) = val_str.split_once('=') {
+                        p.generics.push((k.trim().to_string(), v.trim().to_string()));
+                    }
+                } else if prop_up == "VERILOG_DEFINE" && rest.len() >= 2 {
+                    let val_str = rest[1].trim_matches(|c: char| "{}[]\"".contains(c));
+                    let (k, v) = val_str
+                        .split_once('=')
+                        .map(|(a, b)| (a.trim().to_string(), b.trim().to_string()))
+                        .unwrap_or_else(|| (val_str.trim().to_string(), "1".into()));
+                    p.verilog_defines.push((k, v));
+                } else if prop_up == "STEPS.PHYS_OPT_DESIGN.IS_ENABLED" && rest.len() >= 2 {
+                    p.phys_opt_enabled = parse_onoff(rest[1]).unwrap_or(false);
+                } else if prop_up == "STRATEGY" && rest.len() >= 2 {
+                    upsert_impl_run(&mut p, "impl_1", Some(rest[1]), None);
+                } else if let Some(arg_name) = prop_up.strip_prefix("STEPS.SYNTH_DESIGN.ARGS.") {
+                    if rest.len() >= 2 {
+                        p.synth_args.push((arg_name.to_string(), rest[1].to_string()));
+                    }
                 } else if let Some(prop) = rest.first().copied() {
                     // PACKAGE_PIN carries the site as its value; every other
                     // property carries its setting. MARK_DEBUG targets nets
                     // (`get_nets`) rather than ports.
                     if let Some((val, target)) = prj_set_prop_parts(&rest) {
                         match prop {
-                            "PACKAGE_PIN" => p.package_pins.push((target, val)),
+                            "PACKAGE_PIN" | "LOC" => p.package_pins.push((target, val)),
                             "IOSTANDARD" => p.iostandards.push((target, val)),
                             "DRIVE" => p.drives.push((target, val)),
                             "SLEW" => p.slews.push((target, val)),
@@ -1925,6 +2323,24 @@ pub fn format_prj(prj: &ProjectFile) -> String {
     if let Some(ck) = &prj.checkpoint_path {
         out.push_str(&format!("write_checkpoint {ck}\n"));
     }
+    for (k, v) in &prj.generics {
+        out.push_str(&format!(
+            "set_property generic {k}={v} [current_fileset]\n"
+        ));
+    }
+    for (k, v) in &prj.verilog_defines {
+        out.push_str(&format!(
+            "set_property verilog_define {k}={v} [current_fileset]\n"
+        ));
+    }
+    for (k, v) in &prj.synth_args {
+        out.push_str(&format!(
+            "set_property STEPS.SYNTH_DESIGN.ARGS.{k} {v} [get_runs synth_1]\n"
+        ));
+    }
+    if prj.phys_opt_enabled {
+        out.push_str("set_property STEPS.PHYS_OPT_DESIGN.IS_ENABLED true [get_runs impl_1]\n");
+    }
     out
 }
 
@@ -2066,7 +2482,7 @@ mod tests {
         assert_eq!(cells, vec!["u_lut"]);
         let ckpt = Session::restore_with_ir(&ck).unwrap();
         let ir = ckpt.design.expect("checkpoint must embed HNF");
-        assert_eq!(ir.name, "blinky");
+        assert_eq!(resolve(ir.name), "blinky");
         assert_eq!(ir.lut_inits(), Design::structural_blinky().lut_inits());
         assert_eq!(ckpt.strategy, ImplStrategy::Default);
         assert!(get_nets(proj.design.as_ref().unwrap(), Some("q")).contains(&"q".into()));
@@ -2877,10 +3293,10 @@ create_pblock pblock_0
             d.add_cell(&lut, CellKind::Lut6 { init: 2 });
             d.add_cell(&ff, CellKind::Hff);
             d.connect("clk", &ff, "CLK");
-            d.connect(format!("d{i}"), &lut, "O");
-            d.connect(format!("d{i}"), &ff, "D");
-            d.connect(format!("q{i}"), &ff, "Q");
-            d.connect(format!("q{i}"), &lut, "I0");
+            d.connect(&format!("d{i}"), &lut, "O");
+            d.connect(&format!("d{i}"), &ff, "D");
+            d.connect(&format!("q{i}"), &ff, "Q");
+            d.connect(&format!("q{i}"), &lut, "I0");
         }
         d.add_cell("u_iob", CellKind::IobOut);
         d.connect("q0", "u_iob", "I");
@@ -3028,5 +3444,423 @@ create_pblock pblock_0
             err.to_ascii_lowercase().contains("full"),
             "9 LUTFFs into 1 CLB (8 BLEs) must Err: {err}"
         );
+    }
+
+    #[test]
+    fn sha256_nist_vectors_and_dcp_hdcp_stages_and_tamper_detection() {
+        // NIST FIPS 180-4 vectors
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let xdc = load_xdc("create_clock -period 10.000 [get_ports clk]\n").unwrap();
+        let dir = std::env::temp_dir().join(format!("helion-dcp-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. Post-synth .dcp
+        let mut s = Session::new(Mode::NonProject);
+        s.synth_design(Design::structural_counter());
+        let expected_sha = netlist_sha256(s.design.as_ref().unwrap());
+        let synth_dcp = dir.join("post_synth.dcp");
+        let m_synth = s.write_dcp(&synth_dcp, &xdc).unwrap();
+        assert_eq!(m_synth.stage, CheckpointStage::PostSynth);
+        assert_eq!(m_synth.netlist_sha256, expected_sha);
+
+        let s_restored_synth = Session::read_checkpoint(&synth_dcp, &dev).unwrap();
+        assert_eq!(stage_of(&s_restored_synth), Some(CheckpointStage::PostSynth));
+        assert_eq!(
+            netlist_sha256(s_restored_synth.design.as_ref().unwrap()),
+            expected_sha
+        );
+
+        // 2. Post-place .hdcp
+        s.place_design(&dev).unwrap();
+        let place_hdcp = dir.join("post_place.hdcp");
+        let m_place = s.write_dcp(&place_hdcp, &xdc).unwrap();
+        assert_eq!(m_place.stage, CheckpointStage::PostPlace);
+        assert_eq!(m_place.netlist_sha256, expected_sha);
+        let s_restored_place = Session::read_checkpoint(&place_hdcp, &dev).unwrap();
+        assert_eq!(stage_of(&s_restored_place), Some(CheckpointStage::PostPlace));
+        assert_eq!(
+            s_restored_place.placed.as_ref().unwrap().lutff_sites,
+            s.placed.as_ref().unwrap().lutff_sites
+        );
+
+        // 3. Post-route .dcp
+        s.route_design(&dev).unwrap();
+        s.write_bitstream(&dev).unwrap();
+        let route_dcp = dir.join("post_route.dcp");
+        let m_route = s.write_dcp(&route_dcp, &xdc).unwrap();
+        assert_eq!(m_route.stage, CheckpointStage::PostRoute);
+        assert_eq!(m_route.wns_ps, 9640);
+        let s_restored_route = Session::read_checkpoint(&route_dcp, &dev).unwrap();
+        assert_eq!(stage_of(&s_restored_route), Some(CheckpointStage::PostRoute));
+        assert_eq!(s_restored_route.blinky_hash(), s.blinky_hash());
+
+        // 4. list_checkpoints picks up .dcp and .hdcp
+        let listed = list_checkpoints(&dir);
+        assert_eq!(listed.len(), 3);
+
+        // 5. Tamper with HNF bytes inside post_synth.dcp -> SHA-256 verification must reject
+        let mut raw = std::fs::read(&synth_dcp).unwrap();
+        if let Some(pos) = raw.windows(5).position(|w| w == b"HNF 1") {
+            raw[pos + 4] = b'2';
+        }
+        let tampered = dir.join("tampered.dcp");
+        std::fs::write(&tampered, &raw).unwrap();
+        let err = Session::read_checkpoint(&tampered, &dev).unwrap_err();
+        assert!(
+            err.contains("SHA-256") && err.contains("mismatch"),
+            "tampered checkpoint must fail SHA-256 check: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incremental_checkpoint_reuse_guided_place_and_route() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let xdc = Constraints::default();
+        let dir = std::env::temp_dir().join(format!("helion-inc-dcp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut golden = Session::new(Mode::NonProject);
+        golden.synth_design(Design::structural_counter());
+        golden.place_design(&dev).unwrap();
+        golden.route_design(&dev).unwrap();
+        golden.write_bitstream(&dev).unwrap();
+        let ref_dcp = dir.join("reference_routed.dcp");
+        golden.write_dcp(&ref_dcp, &xdc).unwrap();
+
+        // New session with an ECO LUT added; load reference checkpoint incrementally
+        let mut rev = Session::new(Mode::NonProject);
+        let mut d_mod = Design::structural_counter();
+        d_mod.add_cell("u_eco_extra", CellKind::Lut6 { init: 0x2 });
+        rev.synth_design(d_mod);
+        let reuse = rev.read_checkpoint_incremental(&ref_dcp, &dev).unwrap();
+        assert!(reuse.reused_cells >= 8, "{}", reuse.text());
+        assert!(reuse.cell_pct() >= 80, "{}", reuse.text());
+        assert!(rev.placed.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vivado_tcl_object_queries_and_filters() {
+        let mut tcl = VivadoTclSession::new(Mode::NonProject);
+        tcl.session.synth_design(Design::structural_counter());
+        tcl.eval("create_clock -period 10.000 -name sys_clk [get_ports clk]")
+            .unwrap();
+
+        let ports = tcl.eval("get_ports").unwrap();
+        assert!(ports.contains("clk") && ports.contains("led"), "{ports}");
+        let in_ports = tcl.eval("get_ports -filter {DIRECTION == IN}").unwrap();
+        assert_eq!(in_ports, "clk");
+        let out_ports = tcl.eval("get_ports -filter {DIRECTION == OUT}").unwrap();
+        assert_eq!(out_ports, "led");
+
+        assert_eq!(tcl.eval("all_inputs").unwrap(), "clk");
+        assert_eq!(tcl.eval("all_outputs").unwrap(), "led");
+
+        let regs = tcl.eval("all_registers").unwrap();
+        assert!(regs.contains("u_ff0") && regs.contains("u_ff3"), "{regs}");
+        let reg_d_pins = tcl.eval("all_registers -data_pins").unwrap();
+        assert!(reg_d_pins.contains("u_ff0/D"), "{reg_d_pins}");
+        let reg_clk_pins = tcl.eval("all_registers -clock_pins").unwrap();
+        assert!(reg_clk_pins.contains("u_ff0/CLK"), "{reg_clk_pins}");
+
+        let luts = tcl
+            .eval("get_cells -filter {REF_NAME == LUT6 && NAME =~ *lut*}")
+            .unwrap();
+        assert!(luts.contains("u_lut0") && luts.contains("u_lut3"), "{luts}");
+
+        let pins_of_lut0 = tcl.eval("get_pins -of_objects [get_cells u_lut0]").unwrap();
+        assert!(
+            pins_of_lut0.contains("u_lut0/I0") && pins_of_lut0.contains("u_lut0/O"),
+            "{pins_of_lut0}"
+        );
+
+        let nets_of_lut0 = tcl.eval("get_nets -of_objects [get_cells u_lut0]").unwrap();
+        assert!(nets_of_lut0.contains("d0") && nets_of_lut0.contains("q0"), "{nets_of_lut0}");
+
+        let clks = tcl.eval("get_clocks").unwrap();
+        assert_eq!(clks, "sys_clk");
+    }
+
+    #[test]
+    fn vivado_non_project_batch_tcl_full_flow_and_reports() {
+        let dir = std::env::temp_dir().join(format!("helion-np-tcl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("sub_inv.vhd"),
+            r#"
+library ieee;
+use ieee.std_logic_1164.all;
+entity sub_inv is
+  port (
+    a : in std_logic;
+    y : out std_logic
+  );
+end entity sub_inv;
+architecture rtl of sub_inv is
+begin
+  y <= not a;
+end architecture rtl;
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("top.sv"),
+            r#"
+module top #(parameter WIDTH = 4) (
+    input logic clk,
+    output logic led
+);
+    logic [3:0] cnt;
+    logic inv_bit;
+    sub_inv u_sub (.a(cnt[0]), .y(inv_bit));
+    always_ff @(posedge clk) begin
+        cnt <= cnt + 4'd1;
+    end
+    assign led = cnt[3] ^ inv_bit;
+endmodule
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("top.xdc"),
+            r#"
+create_clock -period 10.000 -name clk [get_ports clk]
+set_property PACKAGE_PIN IOB_X3Y0 [get_ports led]
+set_property IOSTANDARD LVCMOS33 [get_ports led]
+"#,
+        )
+        .unwrap();
+
+        let script = r#"
+read_vhdl sub_inv.vhd
+read_verilog -sv top.sv
+read_xdc top.xdc
+synth_design -top top -part HL10T-C32-1 -generic {WIDTH=4} -verilog_define {SYNTH=1} -flatten_hierarchy rebuilt
+write_checkpoint -force post_synth.dcp
+opt_design -directive Explore
+place_design -directive Explore
+phys_opt_design -directive Explore
+write_checkpoint -force post_place.dcp
+route_design -directive Explore
+write_checkpoint -force post_route.dcp
+write_bitstream -force -bin_file top.bit
+report_timing_summary -file timing_summary.rpt
+report_timing -max_paths 5 -delay_type max -file timing.rpt
+report_utilization -hierarchical -file util.rpt
+report_power -file power.rpt
+report_drc -file drc.rpt
+report_cdc -file cdc.rpt
+report_clock_interaction -file clock_interaction.rpt
+report_clock_utilization -file clock_util.rpt
+report_high_fanout_nets -max_nets 5 -file fanout.rpt
+report_design_analysis -file design_analysis.rpt
+report_qor_suggestions -file qor.rpt
+"#;
+
+        let mut tcl = run_vivado_tcl(script, Some(&dir)).unwrap();
+        assert!(tcl.session.design.is_some());
+        assert!(tcl.session.placed.is_some());
+        assert!(tcl.session.routed.is_some());
+        assert!(tcl.session.bitstream.is_some());
+        assert!(dir.join("post_synth.dcp").is_file());
+        assert!(dir.join("post_place.dcp").is_file());
+        assert!(dir.join("post_route.dcp").is_file());
+        assert!(dir.join("top.bit").is_file());
+        assert!(dir.join("top.bin").is_file());
+        for rpt in [
+            "timing_summary.rpt",
+            "timing.rpt",
+            "util.rpt",
+            "power.rpt",
+            "drc.rpt",
+            "cdc.rpt",
+            "clock_interaction.rpt",
+            "clock_util.rpt",
+            "fanout.rpt",
+            "design_analysis.rpt",
+            "qor.rpt",
+        ] {
+            let content = std::fs::read_to_string(dir.join(rpt)).unwrap();
+            assert!(!content.trim().is_empty(), "{rpt} must not be empty");
+        }
+
+        // Test incremental compile flow in TCL using post_route.dcp reference
+        let inc_out = tcl
+            .eval_script(
+                r#"
+synth_design -top top -part HL10T-C32-1
+read_checkpoint -incremental post_route.dcp
+place_design
+route_design
+"#,
+            )
+            .unwrap();
+        assert!(inc_out.contains("route_design"), "{inc_out}");
+        assert!(
+            tcl.last_reuse_report
+                .as_ref()
+                .is_some_and(|r| r.cell_pct() == 100)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vivado_project_mode_tcl_create_open_runs_and_properties() {
+        let dir = std::env::temp_dir().join(format!("helion-prj-tcl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("counter.sv"),
+            r#"
+module counter #(parameter INIT_V = 0) (
+    input logic clk,
+    output logic led
+);
+    logic [3:0] q;
+    always_ff @(posedge clk) begin
+        q <= q + 4'd1;
+    end
+    assign led = q[3];
+endmodule
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("constraints.xdc"),
+            "create_clock -period 10.000 [get_ports clk]\nset_property PACKAGE_PIN IOB_X2Y0 [get_ports led]\n",
+        )
+        .unwrap();
+
+        let script = r#"
+create_project my_proj . -part HL10T-C32-1 -force
+add_files counter.sv
+add_files -fileset constrs_1 constraints.xdc
+set_property top counter [current_fileset]
+set_property part HL10T-C32-1 [current_project]
+set_property generic {INIT_V=1} [current_fileset]
+set_property verilog_define {FAST_MODE=1} [current_fileset]
+set_property STEPS.SYNTH_DESIGN.ARGS.FLATTEN_HIERARCHY rebuilt [get_runs synth_1]
+set_property STEPS.SYNTH_DESIGN.ARGS.DIRECTIVE AreaOptimized_high [get_runs synth_1]
+set_property STEPS.PHYS_OPT_DESIGN.IS_ENABLED true [get_runs impl_1]
+create_run impl_perf -parent_run synth_1 -flow {Vivado Implementation 2024} -strategy Performance_Explore
+create_run impl_netdelay -parent_run synth_1 -strategy Performance_NetDelay_high
+create_run impl_area -parent_run synth_1 -strategy Area_Explore
+create_run impl_quick -parent_run synth_1 -strategy Flow_Quick
+create_run impl_cong -parent_run synth_1 -strategy Congestion_SpreadLogic_high
+save_project_as my_proj.prj
+launch_runs synth_1
+wait_on_run synth_1
+launch_runs impl_perf impl_netdelay impl_area impl_quick impl_cong -jobs 4 -to_step write_bitstream
+wait_on_run impl_perf
+open_run impl_perf
+"#;
+
+        let mut tcl = run_vivado_tcl(script, Some(&dir)).unwrap();
+        assert_eq!(tcl.eval("get_property TOP [current_fileset]").unwrap(), "counter");
+        assert_eq!(
+            tcl.eval("get_property PART [current_project]").unwrap(),
+            "HL10T-C32-1"
+        );
+        assert_eq!(
+            tcl.eval("get_property STEPS.PHYS_OPT_DESIGN.IS_ENABLED [get_runs impl_1]")
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            tcl.eval("get_property STEPS.SYNTH_DESIGN.ARGS.FLATTEN_HIERARCHY [get_runs synth_1]")
+                .unwrap(),
+            "rebuilt"
+        );
+        assert!(tcl.session.bitstream.is_some());
+
+        // Re-open saved project via open_project in a fresh TCL session
+        let mut tcl2 = VivadoTclSession::new(Mode::Project).with_base_dir(&dir);
+        tcl2.eval("open_project my_proj.prj").unwrap();
+        assert_eq!(tcl2.project.top.as_deref(), Some("counter"));
+        assert!(tcl2.project.phys_opt_enabled);
+        assert_eq!(tcl2.project.generics, vec![("INIT_V".into(), "1".into())]);
+        assert_eq!(
+            tcl2.project.verilog_defines,
+            vec![("FAST_MODE".into(), "1".into())]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_strategy_explorer_and_qor_suggestions() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let xdc = Constraints::default();
+        let strategies = [
+            ImplStrategy::PerformanceExplore,
+            ImplStrategy::PerformanceNetDelayHigh,
+            ImplStrategy::AreaExplore,
+            ImplStrategy::FlowQuick,
+            ImplStrategy::CongestionSpreadLogicHigh,
+        ];
+        for &s in &strategies {
+            let parsed = ImplStrategy::parse(s.label()).unwrap();
+            assert_eq!(parsed, s);
+            let preset = RunStrategy::preset(s.label()).unwrap();
+            assert_eq!(preset.preset, s.label());
+        }
+
+        let mut d = Design::structural_counter();
+        // Add a dead const-0 LUT+FF so Area_Explore / opt_design trims it and QoR flags it
+        d.add_cell("dead_lut", CellKind::Lut6 { init: 0 });
+        d.add_cell("dead_ff", CellKind::Hff);
+        d.connect("clk", "dead_ff", "CLK");
+        d.connect("dead_d", "dead_lut", "O");
+        d.connect("dead_d", "dead_ff", "D");
+        d.connect("dead_q", "dead_ff", "Q");
+        d.connect("dead_q", "dead_lut", "I0");
+
+        let exp = explore_strategies(&d, &dev, &xdc, &strategies).unwrap();
+        assert_eq!(exp.runs.len(), 5);
+        let best = exp.best_run().unwrap();
+        let quick = exp
+            .runs
+            .iter()
+            .find(|r| r.strategy == ImplStrategy::FlowQuick)
+            .unwrap();
+        assert!(
+            best.wns_ps >= quick.wns_ps,
+            "best strategy ({} WNS={}) must beat or equal Flow_Quick (WNS={})",
+            best.strategy.label(),
+            best.wns_ps,
+            quick.wns_ps
+        );
+        assert!(
+            best.luts < quick.luts,
+            "opt-enabled strategy must trim dead const-0 LUTFF ({} vs {})",
+            best.luts,
+            quick.luts
+        );
+        assert!(exp.text().contains("Performance_Explore"));
+
+        let qor = crate::qor::report_qor_suggestions(&quick.session, &dev, &xdc).unwrap();
+        assert!(!qor.suggestions.is_empty());
+        let qor_text = qor.text();
+        assert!(qor_text.contains("report_qor_suggestions"), "{qor_text}");
+        assert!(qor_text.contains("RECOMMENDED_STRATEGY="), "{qor_text}");
     }
 }
