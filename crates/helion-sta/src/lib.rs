@@ -16,7 +16,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 mod cdc;
 mod constraints_codec;
-
+pub mod signoff;
+pub use signoff::*;
 // Structural CDC analysis (v3.0 verification track): clock-domain
 // extraction, net-level crossing detection, synchronizer recognition, and
 // the 11 CdcClass violation classes layered on `report_cdc`.
@@ -4447,7 +4448,7 @@ set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]
         assert_eq!(
             d.ports
                 .iter()
-                .find(|p| p.name == "led")
+                .find(|p| p.name == intern("led"))
                 .unwrap()
                 .attrs
                 .get("LOC"),
@@ -4501,7 +4502,7 @@ set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]
         assert_eq!(
             d.ports
                 .iter()
-                .find(|p| p.name == "led")
+                .find(|p| p.name == intern("led"))
                 .unwrap()
                 .attrs
                 .get("IOSTANDARD"),
