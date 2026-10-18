@@ -8471,6 +8471,9 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
         let mut show_insp: bool = ui.ctx().data_mut(|d| d.get_temp(insp_id)).unwrap_or(true);
         let mut clear_inside = false;
         let mut clear_cone = false;
+        // Auto-fit checkbox + status labels stay inline after the row.
+        let mut do_fanin = false;
+        let mut do_fanout = false;
         ui.horizontal(|ui| {
             let top_name = model.hierarchy.top.as_deref().unwrap_or("top");
             ui.label(RichText::new("Scope:").small().color(theme.faint));
@@ -8481,6 +8484,35 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
             {
                 clear_inside = true;
                 clear_cone = true;
+            ui.checkbox(&mut model.schematic.auto_fit_on_probe, "Auto-fit path")
+                .on_hover_text("Zoom to fit the probed timing path on selection");
+            ui.checkbox(&mut model.schematic.cone_trace.stop_at_ff, "Stop at FF")
+                .on_hover_text("Stop fan-in/fan-out cone traversal at sequential HFF boundaries");
+            if ui
+                .small_button("Fan-In Cone")
+                .on_hover_text("Expand Fan-In Connectivity Cone from selected cell/net")
+                .clicked()
+            {
+                do_fanin = true;
+            }
+            if ui
+                .small_button("Fan-Out Cone")
+                .on_hover_text("Expand Fan-Out Connectivity Cone from selected cell/net")
+                .clicked()
+            {
+                do_fanout = true;
+            }
+            if let Some(root) = &model.schematic.cone_root {
+                ui.label(
+                    RichText::new(format!(
+                        "Cone {root} (hops={}, cells={}, nets={})",
+                        model.schematic.cone_depth,
+                        model.schematic.cone_trace.cells.len(),
+                        model.schematic.cone_trace.nets.len()
+                    ))
+                    .small()
+                    .weak(),
+                );
             }
             if let Some(inst) = &model.schematic.expand_inside {
                 ui.label(RichText::new("›").small().color(theme.faint));
@@ -8529,6 +8561,20 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
         }
         if clear_cone {
             let _ = model.exec("collapse_cone");
+        }
+        if do_fanin {
+            if let Some(sel) = model.selected.clone() {
+                let stop = model.schematic.cone_trace.stop_at_ff;
+                let hops = model.schematic.cone_depth.max(1);
+                let _ = model.expand_fanin_cone(&sel, hops, stop);
+            }
+        }
+        if do_fanout {
+            if let Some(sel) = model.selected.clone() {
+                let stop = model.schematic.cone_trace.stop_at_ff;
+                let hops = model.schematic.cone_depth.max(1);
+                let _ = model.expand_fanout_cone(&sel, hops, stop);
+            }
         }
     }
     if !model.timing_paths.is_empty() {
@@ -11472,6 +11518,7 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     let mut radix_cmd: Option<(String, WaveRadix)> = None;
     let mut proto_cmd: Option<(String, helion_gui::WaveProtocol)> = None;
     let mut probe_cmd: Option<String> = None;
+    let mut mode_cmd: Option<(String, helion_gui::WaveformDisplayMode)> = None;
     let mut new_cursor: Option<usize> = None;
     let mut place_a: Option<usize> = None;
     let mut place_b: Option<usize> = None;
@@ -11682,6 +11729,27 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                         ui.close();
                     }
                 }
+                ui.separator();
+                for (lbl, dm) in [
+                    ("Mode: Hex", helion_gui::WaveformDisplayMode::Hex),
+                    ("Mode: Binary", helion_gui::WaveformDisplayMode::Binary),
+                    ("Mode: Unsigned Dec", helion_gui::WaveformDisplayMode::UnsignedDec),
+                    ("Mode: Signed Dec", helion_gui::WaveformDisplayMode::SignedDec),
+                    (
+                        "Mode: Fixed-Point Q.2 (signed)",
+                        helion_gui::WaveformDisplayMode::FixedPoint {
+                            frac_bits: 2,
+                            signed: true,
+                        },
+                    ),
+                    ("Mode: Analog Step", helion_gui::WaveformDisplayMode::AnalogStep),
+                    ("Mode: Analog Linear", helion_gui::WaveformDisplayMode::AnalogLinear),
+                ] {
+                    if ui.button(lbl).clicked() {
+                        mode_cmd = Some((t_name.clone(), dm));
+                        ui.close();
+                    }
+                }
             });
         });
     }
@@ -11781,6 +11849,9 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     }
     if let Some(name) = probe_cmd {
         let _ = model.cross_probe(&name);
+    }
+    if let Some((name, dm)) = mode_cmd {
+        let _ = model.set_wave_display_mode(&format!("{name} {}", dm.label()));
     }
     if let Some((name, st)) = style_cmd {
         let _ = model.set_wave_style(&format!(
@@ -12861,17 +12932,31 @@ fn paint_trace_shape(
             }
         }
         WaveStyle::Analog => {
-            let ys = t.analog_series();
-            let max = ys.iter().cloned().fold(1.0_f64, f64::max).max(1.0);
-            let mut pts = Vec::new();
-            for (i, y) in ys.iter().enumerate() {
-                let x = rect.left() + dx * (i as f32 + 0.5);
-                let yn = 1.0 - (*y / max) as f32;
-                let py = rect.top() + 4.0 + yn * (rect.height() - 8.0);
-                pts.push(egui::pos2(x, py));
-            }
-            for w in pts.windows(2) {
-                p.line_segment([w[0], w[1]], Stroke::new(1.6_f32, green));
+            let py_vec = t.analog_samples_y(rect.top() + 4.0, rect.bottom() - 4.0);
+            if t.display_mode == helion_gui::WaveformDisplayMode::AnalogStep {
+                for (i, &py) in py_vec.iter().enumerate() {
+                    let x0 = rect.left() + dx * (i as f32);
+                    let x1 = rect.left() + dx * (i as f32 + 1.0);
+                    p.line_segment(
+                        [egui::pos2(x0, py), egui::pos2(x1, py)],
+                        Stroke::new(1.6_f32, green),
+                    );
+                    if let Some(&next_py) = py_vec.get(i + 1) {
+                        p.line_segment(
+                            [egui::pos2(x1, py), egui::pos2(x1, next_py)],
+                            Stroke::new(1.6_f32, green),
+                        );
+                    }
+                }
+            } else {
+                let mut pts = Vec::with_capacity(py_vec.len());
+                for (i, &py) in py_vec.iter().enumerate() {
+                    let x = rect.left() + dx * (i as f32 + 0.5);
+                    pts.push(egui::pos2(x, py));
+                }
+                for w in pts.windows(2) {
+                    p.line_segment([w[0], w[1]], Stroke::new(1.6_f32, green));
+                }
             }
             let _ = dim;
         }
