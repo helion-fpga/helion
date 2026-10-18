@@ -104,16 +104,6 @@ impl Drc {
         generate_remediation_script(self).to_tcl_script()
     }
 
-    pub fn add_with_severity(
-        &mut self,
-        id: &str,
-        severity: DrcSeverity,
-        objects: impl Into<String>,
-        message: impl Into<String>,
-    ) {
-        self.push(id, severity, objects, message);
-    }
-
     fn push(
         &mut self,
         id: &str,

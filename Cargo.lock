@@ -1397,6 +1397,8 @@ dependencies = [
 name = "helion-bd"
 version = "3.0.0"
 dependencies = [
+ "helion-bits",
+ "helion-device",
  "helion-ipxact",
 ]
 
@@ -1572,6 +1574,7 @@ name = "helion-ir"
 version = "3.0.0"
 dependencies = [
  "lasso",
+ "rayon",
 ]
 
 [[package]]

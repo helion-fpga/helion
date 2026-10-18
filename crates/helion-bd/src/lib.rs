@@ -14,8 +14,8 @@ pub use codegen::*;
 pub use graph::*;
 pub use helion_ipxact::{
     AddressBlock, BusInterface, BusInterfaceType, InterfaceMode, IpComponent, IpCore, IpParameter,
-    IpPort, MemoryMap, ParamValue, PortDirection, PortMapEntry, RegisterDef, ResetPolarity,
-    find_ip_component, parametric_catalog,
+    IpPort, MemoryMap, ParamValue, PortDirection, PortMapEntry, RegisterDef as IpxactRegisterDef,
+    ResetPolarity, find_ip_component, parametric_catalog,
 };
 pub use tcl::*;
 
@@ -25,9 +25,8 @@ pub use helion_bits::{
     build_minimal_elf32, build_minimal_elf64, load_elf_firmware, load_mem_firmware,
     readback_bram_word, updatemem,
 };
-use helion_ipxact::IpCore;
 pub use helion_ipxact::{
-    CacheConfig, ClintConfig, IpCore, MasterBusKind, PlicConfig, RiscvCpuConfig,
+    CacheConfig, ClintConfig, MasterBusKind, PlicConfig, RiscvCpuConfig,
     RiscvDebugModuleConfig, RiscvIsa, emit_cache_sv, emit_clint_sv, emit_plic_sv,
     emit_riscv_cpu_sv, emit_riscv_dm_sv, emit_riscv_subsystem_sv, pack_clint, pack_dcache,
     pack_icache, pack_plic, pack_riscv_dm, pack_rv32, pack_rv32imac, pack_rv64gc,
@@ -96,10 +95,10 @@ impl BlockDesign {
     }
 
     pub fn apply_automation(&mut self, rule: BdAutomationRule) -> Result<String, String> {
-        apply_bd_automation(self, rule)
+        graph::apply_bd_automation(self, rule)
     }
 
-    pub fn assign_address(&mut self) -> Result<Vec<BdAddressSegment>, String> {
+    pub fn assign_address(&mut self) -> Result<Vec<graph::BdAddressSegment>, String> {
         assign_bd_address(self)
     }
 
@@ -108,7 +107,7 @@ impl BlockDesign {
         slave_endpoint: &str,
         base_address: u64,
         range: u64,
-    ) -> Result<BdAddressSegment, String> {
+    ) -> Result<graph::BdAddressSegment, String> {
         assign_bd_address_explicit(self, slave_endpoint, base_address, range)
     }
 
@@ -1083,7 +1082,6 @@ mod tests {
         pack_gpio, pack_pwm, pack_rv32, pack_spi_mm, pack_sync_fifo, pack_timer, pack_uart,
         pack_watchdog,
     };
-    use helion_ipxact::{pack_gpio, pack_spi_mm, pack_timer, pack_uart, pack_watchdog};
 
     #[test]
     fn validate_and_emit() {
@@ -1113,7 +1111,7 @@ mod tests {
 
         // Connect slaves using UG994 connection automation (inserts axi_interconnect_0 AND axi_protocol_converter for AXI4 cpu_0!)
         for slave in ["gpio_0", "uart_0", "timer_0", "bram_ctrl_0"] {
-            apply_bd_automation(
+            graph::apply_bd_automation(
                 &mut bd,
                 BdAutomationRule::Axi4 {
                     target_cell: slave.into(),
@@ -1127,7 +1125,7 @@ mod tests {
         }
 
         // Export GPIO and UART to external board ports, and attach BRAM generator to bram_ctrl_0
-        apply_bd_automation(
+        graph::apply_bd_automation(
             &mut bd,
             BdAutomationRule::Board {
                 target_cell: "gpio_0".into(),
@@ -1136,7 +1134,7 @@ mod tests {
             },
         )
         .unwrap();
-        apply_bd_automation(
+        graph::apply_bd_automation(
             &mut bd,
             BdAutomationRule::Board {
                 target_cell: "uart_0".into(),
@@ -1145,7 +1143,7 @@ mod tests {
             },
         )
         .unwrap();
-        apply_bd_automation(
+        graph::apply_bd_automation(
             &mut bd,
             BdAutomationRule::BramCntlr {
                 target_cell: "bram_ctrl_0".into(),
@@ -1196,7 +1194,7 @@ mod tests {
         create_bd_cell(&mut bd, "axi_gpio", "gpio_0").unwrap();
         create_bd_cell(&mut bd, "axi_uartlite", "uart_0").unwrap();
 
-        apply_bd_automation(
+        graph::apply_bd_automation(
             &mut bd,
             BdAutomationRule::Axi4 {
                 target_cell: "gpio_0".into(),
@@ -1207,7 +1205,7 @@ mod tests {
             },
         )
         .unwrap();
-        apply_bd_automation(
+        graph::apply_bd_automation(
             &mut bd,
             BdAutomationRule::Axi4 {
                 target_cell: "uart_0".into(),

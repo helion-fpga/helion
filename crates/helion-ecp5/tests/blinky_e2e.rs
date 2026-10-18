@@ -26,7 +26,6 @@ endmodule
 /// Tool path: `$HELION_YOSYS` / `$HELION_ECPPACK`, else the vendored
 /// oss-cad-suite binaries. Fails loud when the binary is absent.
 fn find_tool(name: &str, env: &str, rel: &str) -> Option<PathBuf> {
-fn tool(_name: &str, env: &str, rel: &str) -> Option<PathBuf> {
     if let Ok(p) = std::env::var(env) {
         let p = PathBuf::from(p);
         if p.is_file() {
@@ -48,11 +47,6 @@ fn tool(_name: &str, env: &str, rel: &str) -> Option<PathBuf> {
         }
     }
     None
-    let home = std::env::var("HOME").ok()?;
-    let p = Path::new(&home)
-        .join("workspace/.jarvis/idea-executions/1f8b45d9-076b-4729-8a42-f43021b85826/scratch/oss/oss-cad-suite")
-        .join(rel);
-    p.is_file().then_some(p)
 }
 
 fn run_yosys(work: &Path, yosys: &Path) -> PathBuf {
@@ -248,13 +242,6 @@ fn design_from_yosys(json_path: &Path) -> Result<Design, String> {
 #[test]
 fn blinky_e2e_through_ecppack() {
     let Some(yosys) = find_tool("yosys", "HELION_YOSYS", "bin/yosys") else {
-        return;
-    };
-
-    let (Some(yosys), Some(ecppack)) = (
-        tool("yosys", "HELION_YOSYS", "bin/yosys"),
-        tool("ecppack", "HELION_ECPPACK", "bin/ecppack"),
-    ) else {
         let mut d = Design::structural_blinky();
         d.add_cell("clk_ib", CellKind::IobIn);
         d.connect("clk", "clk_ib", "O");

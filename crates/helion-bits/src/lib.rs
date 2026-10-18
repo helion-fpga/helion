@@ -469,6 +469,25 @@ pub fn decode_packets(bytes: &[u8]) -> Result<(u32, BTreeMap<(u8, u16, u8), u128
                     far += 1;
                 }
             }
+            0x12 => {
+                // MFWR (Multi-Frame Write compressed packet):
+                // 16-byte template word + N * (u32 start_far, u16 run_len) entries
+                if !synced {
+                    return Err("MFWR before SYNC".into());
+                }
+                if len < 22 || (len - 16) % 6 != 0 {
+                    return Err(format!("bad MFWR payload length {len}"));
+                }
+                let word = u128::from_le_bytes(payload[0..16].try_into().unwrap());
+                for entry in payload[16..].chunks_exact(6) {
+                    let start_far = u32::from_le_bytes(entry[0..4].try_into().unwrap());
+                    let count = u16::from_le_bytes(entry[4..6].try_into().unwrap()) as u32;
+                    for off in 0..count {
+                        let f = Far::decode(start_far + off);
+                        frames.insert((f.block_type, f.major, f.minor), word);
+                    }
+                }
+            }
             0x21 => {}
             0x02 => synced = false,
             other => return Err(format!("unknown packet {other:#04x}")),
@@ -2006,28 +2025,6 @@ pub fn load_elf_firmware(bytes: &[u8]) -> Result<FirmwareImage, String> {
                 machine,
                 segments,
             })
-            0x12 => {
-                // MFWR (Multi-Frame Write compressed packet):
-                // 16-byte template word + N * (u32 start_far, u16 run_len) entries
-                if !synced {
-                    return Err("MFWR before SYNC".into());
-                }
-                if len < 22 || (len - 16) % 6 != 0 {
-                    return Err(format!("bad MFWR payload length {len}"));
-                }
-                let word = u128::from_le_bytes(payload[0..16].try_into().unwrap());
-                for entry in payload[16..].chunks_exact(6) {
-                    let start_far = u32::from_le_bytes(entry[0..4].try_into().unwrap());
-                    let count = u16::from_le_bytes(entry[4..6].try_into().unwrap()) as u32;
-                    for off in 0..count {
-                        let f = Far::decode(start_far + off);
-                        frames.insert((f.block_type, f.major, f.minor), word);
-                    }
-                }
-            }
-            0x21 => {}
-            0x02 => synced = false,
-            other => return Err(format!("unknown packet {other:#04x}")),
         }
         other => Err(format!("updatemem: unsupported ELF class {other}")),
     }

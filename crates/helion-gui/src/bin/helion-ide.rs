@@ -8484,6 +8484,7 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
             {
                 clear_inside = true;
                 clear_cone = true;
+            }
             ui.checkbox(&mut model.schematic.auto_fit_on_probe, "Auto-fit path")
                 .on_hover_text("Zoom to fit the probed timing path on selection");
             ui.checkbox(&mut model.schematic.cone_trace.stop_at_ff, "Stop at FF")
@@ -11530,7 +11531,6 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     let active_wave_probe = model.cross_probe.wave_trace.clone();
 
     for (row_idx, t) in model.wave.traces.iter().enumerate() {
-    for t in &model.wave.traces {
         let is_probed = active_wave_probe.as_deref() == Some(t.name.as_str());
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
@@ -11555,6 +11555,7 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                 t.value_at(cursor),
                 theme::font_code(12.0),
                 theme.ok,
+            );
             if ui
                 .add_sized(
                     [110.0, 28.0],
