@@ -184,15 +184,19 @@ pub fn resolve_interfaces(
                         format!("m_axi_{b}_AWVALID"),
                         format!("m_axi_{b}_AWREADY"),
                         format!("m_axi_{b}_AWADDR"),
+                        format!("m_axi_{b}_AWLEN"),
                         format!("m_axi_{b}_WVALID"),
                         format!("m_axi_{b}_WREADY"),
                         format!("m_axi_{b}_WDATA"),
+                        format!("m_axi_{b}_WLAST"),
                         format!("m_axi_{b}_ARVALID"),
                         format!("m_axi_{b}_ARREADY"),
                         format!("m_axi_{b}_ARADDR"),
+                        format!("m_axi_{b}_ARLEN"),
                         format!("m_axi_{b}_RVALID"),
                         format!("m_axi_{b}_RREADY"),
                         format!("m_axi_{b}_RDATA"),
+                        format!("m_axi_{b}_RLAST"),
                     ],
                 });
                 csr_next_offset += 8;
@@ -1020,6 +1024,10 @@ fn emit_vivado_hls_sv(
             &format!("m_axi_{b}_AWADDR"),
         );
         push_port(
+            format!("output logic [7:0] m_axi_{b}_AWLEN"),
+            &format!("m_axi_{b}_AWLEN"),
+        );
+        push_port(
             format!("output logic m_axi_{b}_WVALID"),
             &format!("m_axi_{b}_WVALID"),
         );
@@ -1030,6 +1038,10 @@ fn emit_vivado_hls_sv(
         push_port(
             format!("output logic [{}:0] m_axi_{b}_WDATA", dw - 1),
             &format!("m_axi_{b}_WDATA"),
+        );
+        push_port(
+            format!("output logic m_axi_{b}_WLAST"),
+            &format!("m_axi_{b}_WLAST"),
         );
         push_port(
             format!("output logic m_axi_{b}_ARVALID"),
@@ -1044,6 +1056,10 @@ fn emit_vivado_hls_sv(
             &format!("m_axi_{b}_ARADDR"),
         );
         push_port(
+            format!("output logic [7:0] m_axi_{b}_ARLEN"),
+            &format!("m_axi_{b}_ARLEN"),
+        );
+        push_port(
             format!("input logic m_axi_{b}_RVALID"),
             &format!("m_axi_{b}_RVALID"),
         );
@@ -1054,6 +1070,10 @@ fn emit_vivado_hls_sv(
         push_port(
             format!("input logic [{}:0] m_axi_{b}_RDATA", dw - 1),
             &format!("m_axi_{b}_RDATA"),
+        );
+        push_port(
+            format!("input logic m_axi_{b}_RLAST"),
+            &format!("m_axi_{b}_RLAST"),
         );
     }
 
@@ -1396,20 +1416,30 @@ fn emit_vivado_hls_sv(
     }
 
     // AXI4 Master (`m_axi`) bundle handshakes
+    let burst_beats = schedule
+        .loop_schedules
+        .first()
+        .map(|l| l.trip_count.clamp(1, 256) - 1)
+        .unwrap_or(15);
     for b in maxi_bundles.keys() {
         sv.push_str(&format!(
             "    m_axi_{b}_AWVALID <= {last_pipe_en} & m_axi_{b}_AWREADY;\n"
         ));
         sv.push_str(&format!("    m_axi_{b}_AWADDR <= ap_CS_fsm;\n"));
+        sv.push_str(&format!("    m_axi_{b}_AWLEN <= {burst_beats};\n"));
         sv.push_str(&format!(
             "    m_axi_{b}_WVALID <= {last_pipe_en} & m_axi_{b}_WREADY;\n"
         ));
         sv.push_str(&format!("    m_axi_{b}_WDATA <= ap_acc_reg;\n"));
+        sv.push_str(&format!("    m_axi_{b}_WLAST <= {last_pipe_en};\n"));
         sv.push_str(&format!(
             "    m_axi_{b}_ARVALID <= ap_enable_reg_pp0_iter0 & m_axi_{b}_ARREADY;\n"
         ));
         sv.push_str(&format!("    m_axi_{b}_ARADDR <= ap_CS_fsm;\n"));
-        sv.push_str(&format!("    m_axi_{b}_RREADY <= m_axi_{b}_RVALID;\n"));
+        sv.push_str(&format!("    m_axi_{b}_ARLEN <= {burst_beats};\n"));
+        sv.push_str(&format!(
+            "    m_axi_{b}_RREADY <= m_axi_{b}_RVALID | m_axi_{b}_RLAST;\n"
+        ));
     }
 
     sv.push_str("  end\n");
