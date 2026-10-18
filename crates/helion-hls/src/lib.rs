@@ -1,8 +1,39 @@
-//! C subset → schedule/bind onto Helion LUT/FF/DSP (not string-match).
+//! Helion High-Level Synthesis (Vivado HLS UG902 parity).
 //!
-//! Static registers, `!`/`~`, `+`, `*`, constant `for` unroll. Original HLS.
+//! Supports C/C++ synthesis with:
+//! - Inline `#pragma HLS ...` and TCL `set_directive_...` directives:
+//!   `PIPELINE II=k`, `UNROLL factor=k`, `ARRAY_PARTITION variable=... type=complete|block|cyclic factor=k dim=d`,
+//!   `INLINE`, `DATAFLOW`, `ALLOCATION`, and `INTERFACE mode=s_axilite|m_axi|axis|ap_fifo|ap_memory|ap_ctrl_hs|ap_ctrl_none`.
+//! - Control-Dataflow Graph (CDFG) construction, ASAP/ALAP/SDC Bellman-Ford modulo scheduling
+//!   ($II_{\min} = \max(ResII, RecII)$), and clock-period-aware operation chaining.
+//! - Resource binding onto Helion `DSP48E1` / `Mac27`, multi-bank `RAMB18E1` (`Bram18`), `LUT6`, and `Hff` registers.
+//! - Synthesizable SystemVerilog FSM + datapath + AXI4-Lite CSR / AXI4-Stream / `m_axi` / `ap_fifo` / `ap_memory`
+//!   emission and structured Vivado HLS Synthesis & Latency/Utilization Report generation.
 
-use helion_ir::Design;
+pub mod emit;
+pub mod parser;
+pub mod pragma;
+pub mod schedule;
+
+pub use emit::{generate_hls_report, resolve_interfaces, HlsSynthesisReport, InterfacePort};
+pub use parser::{
+    tokenize, BinOp, CArg, CExpr, CFunction, CStmt, CType, CVar, LValue, Parser, Tok,
+    TranslationUnit, UnaryOp,
+};
+pub use pragma::{
+    extract_inline_pragmas, parse_pragma_line, parse_tcl_config, parse_tcl_directives,
+    AllocationDirective, AllocationKind, ArrayPartitionDirective, DataflowChannelKind,
+    DataflowDirective, HlsConfig, HlsDirective, InlineDirective, InlineMode, InterfaceDirective,
+    InterfaceMode, PartitionType, PipelineDirective, PipelineStyle, UnrollDirective,
+};
+pub use schedule::{
+    bind_resources, build_cdfg, compute_alap, compute_asap, compute_sdc_schedule,
+    resolve_top_and_inline, schedule_cdfg, ArrayBankConfig, BasicBlock, BindingResult,
+    BoundBramBank, BoundDsp, Cdfg, CdfgEdge, CdfgNode, CdfgOp, CmpKind, ControlEdge,
+    ControlEdgeKind, DataflowChannel, DataflowProcess, DepKind, LoopScheduleInfo, ScheduleResult,
+};
+
+use helion_ir::{CellKind, Design};
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10,9 +41,10 @@ pub enum Res {
     Lut,
     Ff,
     Dsp,
+    Bram,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BindOp {
     pub name: String,
     pub res: Res,
@@ -24,680 +56,105 @@ pub struct HlsResult {
     pub design: Design,
     pub ops: Vec<BindOp>,
     pub sv: String,
+    pub cdfg: Cdfg,
+    pub schedule: ScheduleResult,
+    pub binding: BindingResult,
+    pub directives: Vec<HlsDirective>,
+    pub interfaces: Vec<InterfacePort>,
+    pub report: HlsSynthesisReport,
+    pub report_text: String,
 }
 
-fn strip(s: &str) -> String {
-    let mut out = String::new();
-    for line in s.lines() {
-        let l = line.split("//").next().unwrap_or("");
-        out.push_str(l);
-        out.push('\n');
-    }
-    out
-}
-
-#[derive(Clone, Debug)]
-enum Tok {
-    Ident(String),
-    Num(u128),
-    Sym(String),
-}
-
-struct P<'a> {
-    t: &'a [Tok],
-    i: usize,
-}
-
-impl<'a> P<'a> {
-    fn peek(&self) -> Option<&'a Tok> {
-        self.t.get(self.i)
-    }
-    fn bump(&mut self) -> Option<&'a Tok> {
-        let t = self.t.get(self.i)?;
-        self.i += 1;
-        Some(t)
-    }
-    fn eat(&mut self, s: &str) -> bool {
-        match self.peek() {
-            Some(Tok::Ident(k)) if k == s => {
-                self.i += 1;
-                true
-            }
-            Some(Tok::Sym(k)) if k == s => {
-                self.i += 1;
-                true
-            }
-            _ => false,
-        }
-    }
-    fn ident(&mut self) -> Result<String, String> {
-        match self.bump() {
-            Some(Tok::Ident(s)) => Ok(s.clone()),
-            other => Err(format!("ident {other:?}")),
-        }
-    }
-    fn num(&mut self) -> Option<u128> {
-        match self.peek() {
-            Some(Tok::Num(n)) => {
-                let v = *n;
-                self.i += 1;
-                Some(v)
-            }
-            _ => None,
-        }
-    }
-}
-
-fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
-    let chars: Vec<char> = strip(src).chars().collect();
-    let mut i = 0;
-    let mut out = Vec::new();
-    while i < chars.len() {
-        let c = chars[i];
-        if c.is_whitespace() {
-            i += 1;
-            continue;
-        }
-        if c == '+' && chars.get(i + 1) == Some(&'+') {
-            out.push(Tok::Sym("++".into()));
-            i += 2;
-            continue;
-        }
-        if c == '-' && chars.get(i + 1) == Some(&'-') {
-            out.push(Tok::Sym("--".into()));
-            i += 2;
-            continue;
-        }
-        if c == '&' && chars.get(i + 1) == Some(&'&') {
-            out.push(Tok::Sym("&&".into()));
-            i += 2;
-            continue;
-        }
-        if c == '|' && chars.get(i + 1) == Some(&'|') {
-            out.push(Tok::Sym("||".into()));
-            i += 2;
-            continue;
-        }
-        if "(){};,=+-*/~!<>[]&|^".contains(c) {
-            out.push(Tok::Sym(c.to_string()));
-            i += 1;
-            continue;
-        }
-        if c.is_ascii_alphabetic() || c == '_' {
-            let mut n = String::new();
-            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
-                n.push(chars[i]);
-                i += 1;
-            }
-            out.push(Tok::Ident(n));
-            continue;
-        }
-        if c.is_ascii_digit() {
-            let mut n = String::new();
-            while i < chars.len() && chars[i].is_ascii_digit() {
-                n.push(chars[i]);
-                i += 1;
-            }
-            out.push(Tok::Num(n.parse().unwrap_or(0)));
-            continue;
-        }
-        return Err(format!("hls char {c:?}"));
-    }
-    Ok(out)
-}
-
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-struct Arg {
-    name: String,
-    ptr: bool,
-    width: usize,
-    output: bool,
-}
-
-#[derive(Clone, Debug)]
-struct Var {
-    name: String,
-    width: usize,
-    is_static: bool,
-}
-
-#[derive(Clone, Debug)]
-enum CExpr {
-    Num(u128),
-    Var(String),
-    Bit(String, usize),
-    Not(Box<CExpr>),
-    Add(Box<CExpr>, Box<CExpr>),
-    Mul(Box<CExpr>, Box<CExpr>),
-    And(Box<CExpr>, Box<CExpr>),
-    Xor(Box<CExpr>, Box<CExpr>),
-    Or(Box<CExpr>, Box<CExpr>),
-    Deref(String),
-}
-
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-enum Stmt {
-    Assign {
-        lhs: String,
-        deref: bool,
-        bit: Option<usize>,
-        rhs: CExpr,
-    },
-    For {
-        var: String,
-        start: usize,
-        end: usize,
-        body: Vec<Stmt>,
-    }, // var kept for debug
-    Return(CExpr),
-}
-
-fn parse_type(p: &mut P) -> Result<(usize, bool), String> {
-    let _ = p.eat("const");
-    let _ = p.eat("unsigned");
-    let _ = p.eat("signed");
-    if p.eat("void") {
-        return Ok((0, false));
-    }
-    if p.eat("bool") {
-        return Ok((1, false));
-    }
-    if p.eat("char") {
-        return Ok((8, false));
-    }
-    if p.eat("int") {
-        return Ok((32, false));
-    }
-    if p.eat("ap_uint") || p.eat("ap_int") {
-        if !p.eat("<") {
-            return Err("ap_int <".into());
-        }
-        let w = p.num().ok_or("ap_int width")? as usize;
-        if !p.eat(">") {
-            return Err("ap_int >".into());
-        }
-        return Ok((w.max(1), false));
-    }
-    Err("hls type".into())
-}
-
-fn parse_expr(p: &mut P) -> Result<CExpr, String> {
-    parse_or(p)
-}
-
-fn parse_or(p: &mut P) -> Result<CExpr, String> {
-    let mut e = parse_xor(p)?;
-    while p.eat("|") {
-        let r = parse_xor(p)?;
-        e = CExpr::Or(Box::new(e), Box::new(r));
-    }
-    Ok(e)
-}
-
-fn parse_xor(p: &mut P) -> Result<CExpr, String> {
-    let mut e = parse_and(p)?;
-    while p.eat("^") {
-        let r = parse_and(p)?;
-        e = CExpr::Xor(Box::new(e), Box::new(r));
-    }
-    Ok(e)
-}
-
-fn parse_and(p: &mut P) -> Result<CExpr, String> {
-    let mut e = parse_add(p)?;
-    while p.eat("&") {
-        let r = parse_add(p)?;
-        e = CExpr::And(Box::new(e), Box::new(r));
-    }
-    Ok(e)
-}
-
-fn parse_add(p: &mut P) -> Result<CExpr, String> {
-    let mut e = parse_mul(p)?;
-    while p.eat("+") || p.eat("-") {
-        let r = parse_mul(p)?;
-        e = CExpr::Add(Box::new(e), Box::new(r));
-    }
-    Ok(e)
-}
-
-fn parse_mul(p: &mut P) -> Result<CExpr, String> {
-    let mut e = parse_un(p)?;
-    while p.eat("*") {
-        let r = parse_un(p)?;
-        e = CExpr::Mul(Box::new(e), Box::new(r));
-    }
-    Ok(e)
-}
-
-fn parse_un(p: &mut P) -> Result<CExpr, String> {
-    if p.eat("!") || p.eat("~") {
-        return Ok(CExpr::Not(Box::new(parse_un(p)?)));
-    }
-    if p.eat("*") {
-        let n = p.ident()?;
-        return Ok(CExpr::Deref(n));
-    }
-    if p.eat("(") {
-        let e = parse_expr(p)?;
-        if !p.eat(")") {
-            return Err(")".into());
-        }
-        return Ok(e);
-    }
-    if let Some(n) = p.num() {
-        return Ok(CExpr::Num(n));
-    }
-    let n = p.ident()?;
-    if p.eat("[") {
-        let idx = p.num().ok_or("bit idx")? as usize;
-        if !p.eat("]") {
-            return Err("]".into());
-        }
-        return Ok(CExpr::Bit(n, idx));
-    }
-    Ok(CExpr::Var(n))
-}
-
-fn parse_stmt(p: &mut P) -> Result<Stmt, String> {
-    if p.eat("return") {
-        let e = parse_expr(p)?;
-        let _ = p.eat(";");
-        return Ok(Stmt::Return(e));
-    }
-    if p.eat("for") {
-        if !p.eat("(") {
-            return Err("for (".into());
-        }
-        let _ = p.eat("int");
-        let var = p.ident()?;
-        if !p.eat("=") {
-            return Err("for =".into());
-        }
-        let start = p.num().ok_or("for start")? as usize;
-        if !p.eat(";") {
-            return Err("for ;".into());
-        }
-        let _ = p.ident();
-        if !p.eat("<") {
-            return Err("for <".into());
-        }
-        let end = p.num().ok_or("for end")? as usize;
-        if !p.eat(";") {
-            return Err("for ;2".into());
-        }
-        // i++  |  ++i  |  i = i + 1
-        let _ = p.eat("++");
-        let _ = p.eat("--");
-        if matches!(p.peek(), Some(Tok::Ident(_))) {
-            let _ = p.ident();
-            let _ = p.eat("++");
-            let _ = p.eat("--");
-            if p.eat("=") {
-                let _ = p.ident();
-                let _ = p.eat("+");
-                let _ = p.num();
-            }
-        }
-        if !p.eat(")") {
-            return Err("for )".into());
-        }
-        let body = if p.eat("{") {
-            let mut v = Vec::new();
-            while !p.eat("}") {
-                if p.peek().is_none() {
-                    return Err("for body".into());
-                }
-                v.push(parse_stmt(p)?);
-            }
-            v
-        } else {
-            vec![parse_stmt(p)?]
-        };
-        return Ok(Stmt::For {
-            var,
-            start,
-            end,
-            body,
-        });
-    }
-    // ++name / name++
-    if p.eat("++") {
-        let n = p.ident()?;
-        let _ = p.eat(";");
-        return Ok(Stmt::Assign {
-            lhs: n.clone(),
-            deref: false,
-            bit: None,
-            rhs: CExpr::Add(Box::new(CExpr::Var(n)), Box::new(CExpr::Num(1))),
-        });
-    }
-    let deref = p.eat("*");
-    let lhs = p.ident()?;
-    if p.eat("++") {
-        let _ = p.eat(";");
-        return Ok(Stmt::Assign {
-            lhs: lhs.clone(),
-            deref: false,
-            bit: None,
-            rhs: CExpr::Add(Box::new(CExpr::Var(lhs)), Box::new(CExpr::Num(1))),
-        });
-    }
-    let bit = if p.eat("[") {
-        let idx = p.num().ok_or("lhs bit")? as usize;
-        if !p.eat("]") {
-            return Err("]".into());
-        }
-        Some(idx)
-    } else {
-        None
-    };
-    if !p.eat("=") {
-        return Err(format!("assign {lhs}"));
-    }
-    let rhs = parse_expr(p)?;
-    let _ = p.eat(";");
-    Ok(Stmt::Assign {
-        lhs,
-        deref,
-        bit,
-        rhs,
-    })
-}
-
-fn parse_unit(p: &mut P) -> Result<(String, Vec<Arg>, Vec<Var>, Vec<Stmt>), String> {
-    let (_w, _) = parse_type(p)?;
-    let fname = p.ident()?;
-    if !p.eat("(") {
-        return Err("fn (".into());
-    }
-    let mut args = Vec::new();
-    while !p.eat(")") {
-        if p.peek().is_none() {
-            return Err("fn )".into());
-        }
-        let (w, _) = parse_type(p)?;
-        let ptr = p.eat("*");
-        let n = p.ident()?;
-        args.push(Arg {
-            name: n,
-            ptr,
-            width: if ptr { 1 } else { w.max(1) },
-            output: ptr,
-        });
-        let _ = p.eat(",");
-    }
-    if !p.eat("{") {
-        return Err("fn {".into());
-    }
-    let mut vars = Vec::new();
-    let mut stmts = Vec::new();
-    while !p.eat("}") {
-        if p.peek().is_none() {
-            return Err("unterminated fn".into());
-        }
-        let is_static = p.eat("static");
-        let start = p.i;
-        if parse_type(p).is_ok() {
-            // might be decl
-            let ptr = p.eat("*");
-            if let Ok(_n) = p.ident() {
-                if p.eat("=") || p.eat(";") {
-                    // rewind equals
-                    // we already consumed = or ;
-                    let mut init = CExpr::Num(0);
-                    // If we ate '=', parse expr. Recover by checking last tok is messy;
-                    // re-parse from start.
-                    p.i = start;
-                    let _ = p.eat("static");
-                    let (w, _) = parse_type(p)?;
-                    let _ = p.eat("*");
-                    let n = p.ident()?;
-                    if p.eat("=") {
-                        init = parse_expr(p)?;
-                    }
-                    let _ = p.eat(";");
-                    let _ = (ptr, init);
-                    vars.push(Var {
-                        name: n,
-                        width: w.max(1),
-                        is_static,
-                    });
-                    continue;
-                }
-            }
-        }
-        p.i = start;
-        let _ = p.eat("static");
-        stmts.push(parse_stmt(p)?);
-    }
-    Ok((fname, args, vars, stmts))
-}
-
-fn unroll(stmts: &[Stmt], cycle: u32) -> Vec<(u32, Stmt)> {
-    let mut out = Vec::new();
-    for s in stmts {
-        match s {
-            Stmt::For {
-                var: _,
-                start,
-                end,
-                body,
-            } => {
-                for it in *start..*end {
-                    let inner = unroll(body, cycle + it as u32);
-                    out.extend(inner);
-                }
-            }
-            other => out.push((cycle, other.clone())),
-        }
-    }
-    out
-}
-
-fn expr_sv(e: &CExpr) -> String {
-    match e {
-        CExpr::Num(n) => n.to_string(),
-        CExpr::Var(s) => s.clone(),
-        CExpr::Bit(s, i) => format!("{s}[{i}]"),
-        CExpr::Not(x) => format!("~{}", expr_sv(x)),
-        CExpr::Add(a, b) => format!("{} + {}", expr_sv(a), expr_sv(b)),
-        CExpr::Mul(a, b) => format!("{} * {}", expr_sv(a), expr_sv(b)),
-        CExpr::And(a, b) => format!("{} & {}", expr_sv(a), expr_sv(b)),
-        CExpr::Xor(a, b) => format!("{} ^ {}", expr_sv(a), expr_sv(b)),
-        CExpr::Or(a, b) => format!("{} | {}", expr_sv(a), expr_sv(b)),
-        CExpr::Deref(s) => s.clone(),
-    }
-}
-
-fn walk_ops(e: &CExpr, cycle: u32, ops: &mut Vec<BindOp>) {
-    match e {
-        CExpr::Not(x) => {
-            ops.push(BindOp {
-                name: format!("not@{}", ops.len()),
-                res: Res::Lut,
-                cycle,
-            });
-            walk_ops(x, cycle, ops);
-        }
-        CExpr::Add(a, b) => {
-            ops.push(BindOp {
-                name: format!("add@{}", ops.len()),
-                res: Res::Lut,
-                cycle,
-            });
-            walk_ops(a, cycle, ops);
-            walk_ops(b, cycle, ops);
-        }
-        CExpr::Mul(a, b) => {
-            ops.push(BindOp {
-                name: format!("mul@{}", ops.len()),
-                res: Res::Dsp,
-                cycle,
-            });
-            walk_ops(a, cycle, ops);
-            walk_ops(b, cycle, ops);
-        }
-        CExpr::And(a, b) | CExpr::Xor(a, b) | CExpr::Or(a, b) => {
-            ops.push(BindOp {
-                name: format!("bit@{}", ops.len()),
-                res: Res::Lut,
-                cycle,
-            });
-            walk_ops(a, cycle, ops);
-            walk_ops(b, cycle, ops);
-        }
-        _ => {}
-    }
-}
-
-fn bind_muls(
-    e: &CExpr,
-    extra_regs: &mut Vec<(String, usize)>,
-    nbas: &mut Vec<String>,
-    mul_i: &mut usize,
-) -> CExpr {
-    match e {
-        CExpr::Mul(a, b) => {
-            let la = bind_muls(a, extra_regs, nbas, mul_i);
-            let lb = bind_muls(b, extra_regs, nbas, mul_i);
-            let t = format!("tmul{mul_i}");
-            extra_regs.push((t.clone(), 27));
-            nbas.push(format!("{t} <= {} * {};", expr_sv(&la), expr_sv(&lb)));
-            *mul_i += 1;
-            CExpr::Var(t)
-        }
-        CExpr::Not(x) => CExpr::Not(Box::new(bind_muls(x, extra_regs, nbas, mul_i))),
-        CExpr::Add(a, b) => CExpr::Add(
-            Box::new(bind_muls(a, extra_regs, nbas, mul_i)),
-            Box::new(bind_muls(b, extra_regs, nbas, mul_i)),
-        ),
-        CExpr::And(a, b) => CExpr::And(
-            Box::new(bind_muls(a, extra_regs, nbas, mul_i)),
-            Box::new(bind_muls(b, extra_regs, nbas, mul_i)),
-        ),
-        CExpr::Xor(a, b) => CExpr::Xor(
-            Box::new(bind_muls(a, extra_regs, nbas, mul_i)),
-            Box::new(bind_muls(b, extra_regs, nbas, mul_i)),
-        ),
-        CExpr::Or(a, b) => CExpr::Or(
-            Box::new(bind_muls(a, extra_regs, nbas, mul_i)),
-            Box::new(bind_muls(b, extra_regs, nbas, mul_i)),
-        ),
-        other => other.clone(),
-    }
-}
-
-fn emit_sv(
-    fname: &str,
-    args: &[Arg],
-    vars: &[Var],
-    flat: &[(u32, Stmt)],
-) -> Result<(String, Vec<BindOp>), String> {
-    let mut ops = Vec::new();
-    let mut ports: Vec<String> = vec!["input logic clk".into()];
-    for a in args {
-        if a.name == "clk" {
-            continue;
-        }
-        let w = a.width;
-        let dir = if a.output { "output" } else { "input" };
-        if w == 1 {
-            ports.push(format!("{dir} logic {}", a.name));
-        } else {
-            ports.push(format!("{dir} logic [{}:0] {}", w - 1, a.name));
-        }
-    }
-    let mut has_y = args.iter().any(|a| a.name == "y" && a.output);
-    let mut nbas = Vec::new();
-    let mut assigns = Vec::new();
-    let mut extra_regs: Vec<(String, usize)> = Vec::new();
-    let mut mul_i = 0usize;
-    for (cyc, st) in flat {
-        match st {
-            Stmt::Assign {
-                lhs,
-                deref,
-                bit,
-                rhs,
-            } => {
-                walk_ops(rhs, *cyc, &mut ops);
-                let rhs = bind_muls(rhs, &mut extra_regs, &mut nbas, &mut mul_i);
-                if *deref {
-                    assigns.push(format!("{} = {};", lhs, expr_sv(&rhs)));
-                } else {
-                    let lhs_sv = if let Some(b) = bit {
-                        format!("{lhs}[{b}]")
-                    } else {
-                        lhs.clone()
-                    };
-                    nbas.push(format!("{lhs_sv} <= {};", expr_sv(&rhs)));
-                }
-                if vars.iter().any(|v| v.name == *lhs && v.is_static) {
-                    ops.push(BindOp {
-                        name: format!("ff_{lhs}"),
-                        res: Res::Ff,
-                        cycle: *cyc,
-                    });
-                }
-            }
-            Stmt::Return(e) => {
-                walk_ops(e, *cyc, &mut ops);
-                if !has_y {
-                    ports.push("output logic [26:0] y".into());
-                    has_y = true;
-                }
-                let e = bind_muls(e, &mut extra_regs, &mut nbas, &mut mul_i);
-                nbas.push(format!("y <= {};", expr_sv(&e)));
-            }
-            Stmt::For { .. } => {}
-        }
-    }
-    let mut sv = format!("module {fname}({});\n", ports.join(", "));
-    for v in vars {
-        if v.width == 1 {
-            sv.push_str(&format!("  logic {};\n", v.name));
-        } else {
-            sv.push_str(&format!("  logic [{}:0] {};\n", v.width - 1, v.name));
-        }
-    }
-    for (n, w) in &extra_regs {
-        sv.push_str(&format!("  logic [{}:0] {n};\n", w - 1));
-    }
-    if !nbas.is_empty() {
-        sv.push_str("  always_ff @(posedge clk) begin\n");
-        for l in &nbas {
-            sv.push_str(&format!("    {l}\n"));
-        }
-        sv.push_str("  end\n");
-    }
-    for l in &assigns {
-        sv.push_str(&format!("  assign {l}\n"));
-    }
-    sv.push_str("endmodule\n");
-    if nbas.is_empty() && assigns.is_empty() {
-        return Err("hls: empty body".into());
-    }
-    Ok((sv, ops))
-}
-
+/// Compile C/C++ HLS source with default configuration (`10.0ns` target clock).
 pub fn hls_compile(source: &str) -> Result<HlsResult, String> {
-    let t = tokenize(source)?;
-    if t.is_empty() {
+    hls_compile_with_config(source, &HlsConfig::default())
+}
+
+/// Compile C/C++ HLS source alongside a Vivado HLS TCL directive script.
+pub fn hls_compile_with_tcl(source: &str, tcl: &str) -> Result<HlsResult, String> {
+    let cfg = parse_tcl_config(tcl)?;
+    hls_compile_with_config(source, &cfg)
+}
+
+/// Compile C/C++ HLS source with an explicit [`HlsConfig`].
+pub fn hls_compile_with_config(source: &str, config: &HlsConfig) -> Result<HlsResult, String> {
+    let tokens = tokenize(source)?;
+    if tokens.is_empty() {
         return Err("hls: empty".into());
     }
-    let mut p = P { t: &t, i: 0 };
-    let (fname, args, vars, stmts) = parse_unit(&mut p).map_err(|e| format!("hls: {e}"))?;
-    let flat = unroll(&stmts, 0);
-    if flat.is_empty() && vars.is_empty() {
+    let mut parser = Parser::new(&tokens);
+    let tu = parser
+        .parse_translation_unit()
+        .map_err(|e| format!("hls: {e}"))?;
+
+    let (top_fn, stage_fns, all_directives) = resolve_top_and_inline(&tu, config)?;
+    if top_fn.body.is_empty() && top_fn.vars.is_empty() {
         return Err("hls: unsupported body".into());
     }
-    let (sv, ops) = emit_sv(&fname, &args, &vars, &flat)?;
+
+    let cdfg = build_cdfg(&top_fn, &stage_fns, &all_directives);
+    let schedule = schedule_cdfg(&cdfg, &top_fn, &all_directives, config.target_clock_ns);
+    let binding = bind_resources(&cdfg, &schedule, &top_fn, &all_directives);
+    let interfaces = resolve_interfaces(&top_fn, &cdfg, &all_directives);
+
+    let sv = emit::emit_rtl(
+        &top_fn,
+        &cdfg,
+        &schedule,
+        &binding,
+        &interfaces,
+        &all_directives,
+    )?;
+
     let design =
         helion_sv::synth_sv(&sv, "hls.sv").map_err(|e| format!("sv synth: {e} :: {sv}"))?;
-    Ok(HlsResult { design, ops, sv })
+
+    let actual_dsp = design
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. }))
+        .count();
+    let actual_bram = design
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. }))
+        .count();
+    let actual_ff = design
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::Hff))
+        .count();
+    let actual_lut = design
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+        .count();
+
+    let (report, report_text) = generate_hls_report(
+        &top_fn,
+        &cdfg,
+        &schedule,
+        &binding,
+        &interfaces,
+        &config.part_name,
+        actual_dsp,
+        actual_bram,
+        actual_ff,
+        actual_lut,
+    );
+
+    Ok(HlsResult {
+        design,
+        ops: binding.bind_ops.clone(),
+        sv,
+        cdfg,
+        schedule,
+        binding,
+        directives: all_directives,
+        interfaces,
+        report,
+        report_text,
+    })
 }
 
 pub fn synth_c(source: &str) -> Result<Design, String> {
@@ -733,7 +190,10 @@ void blinky(bool *led) {
 int mac(int a, int b) { return a * b; }
 "#;
         let d = synth_c(src).unwrap();
-        assert!(d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })));
+        assert!(d
+            .cells
+            .iter()
+            .any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })));
     }
 
     #[test]
@@ -813,5 +273,392 @@ int mac2(int a, int b) {
             "loop iterations must occupy distinct schedule cycles {:?}",
             m2.ops
         );
+    }
+
+    #[test]
+    fn hls_pragma_and_tcl_directive_parser() {
+        let src = r#"
+#pragma HLS INTERFACE mode=s_axilite port=return bundle=control
+#pragma HLS INTERFACE s_axilite port=a bundle=control
+#pragma HLS INTERFACE m_axi port=gmem_buf bundle=gmem0 depth=256
+#pragma HLS INTERFACE axis port=in_stream
+#pragma HLS INTERFACE ap_fifo port=out_fifo
+#pragma HLS INTERFACE ap_memory port=table
+#pragma HLS ARRAY_PARTITION variable=A type=cyclic factor=4 dim=2
+#pragma HLS ARRAY_PARTITION variable=B block factor=2 dim=1
+#pragma HLS ARRAY_PARTITION variable=shift_reg complete dim=1
+#pragma HLS PIPELINE II=2 rewind
+#pragma HLS UNROLL factor=4 skip_exit_check
+#pragma HLS INLINE recursive
+#pragma HLS DATAFLOW interval=1
+#pragma HLS ALLOCATION instances=mul limit=2 operation
+"#;
+        let dirs = extract_inline_pragmas(src).expect("parse inline pragmas");
+        assert_eq!(dirs.len(), 14);
+        assert!(dirs.contains(&HlsDirective::Pipeline(PipelineDirective {
+            ii: Some(2),
+            rewind: true,
+            enable_flush: false,
+            style: PipelineStyle::Stp,
+            off: false,
+            target: None,
+        })));
+        assert!(dirs.contains(&HlsDirective::ArrayPartition(ArrayPartitionDirective {
+            variable: "A".into(),
+            kind: PartitionType::Cyclic,
+            factor: Some(4),
+            dim: 2,
+            target: None,
+        })));
+
+        let tcl = r#"
+create_clock -period 5.0
+set_top matmul
+set_directive_pipeline -II 1 "matmul/LOOP_J"
+set_directive_unroll -factor 4 "matmul/LOOP_K"
+set_directive_array_partition -type cyclic -factor 4 -dim 2 "matmul" A
+set_directive_array_partition -type block -factor 4 -dim 1 "matmul" B
+set_directive_interface -mode s_axilite -bundle ctrl "matmul" return
+set_directive_allocation -limit 2 -type operation "matmul" mul
+"#;
+        let cfg = parse_tcl_config(tcl).expect("parse tcl");
+        assert_eq!(cfg.target_clock_ns, 5.0);
+        assert_eq!(cfg.top_function.as_deref(), Some("matmul"));
+        assert_eq!(cfg.directives.len(), 6);
+    }
+
+    #[test]
+    fn hls_pipelined_fir_filter_with_complete_array_partition() {
+        let src = r#"
+#define N_TAPS 4
+void fir_filter(int *y, int x) {
+  #pragma HLS INTERFACE ap_ctrl_hs port=return
+  #pragma HLS INTERFACE ap_vld port=y
+  #pragma HLS PIPELINE II=1
+  static int shift_reg[N_TAPS] = {0, 0, 0, 0};
+  #pragma HLS ARRAY_PARTITION variable=shift_reg type=complete dim=1
+  const int coeff[N_TAPS] = {3, 7, 11, 5};
+  #pragma HLS ARRAY_PARTITION variable=coeff type=complete dim=1
+
+  int acc = 0;
+  SHIFT_LOOP: for (int i = 3; i >= 1; i--) {
+    shift_reg[i] = shift_reg[i - 1];
+  }
+  shift_reg[0] = x;
+
+  MAC_LOOP: for (int i = 0; i < 4; i++) {
+    acc += shift_reg[i] * coeff[i];
+  }
+  *y = acc;
+}
+"#;
+        let res = hls_compile(src).expect("fir_filter compile");
+        assert_eq!(res.schedule.achieved_ii, 1, "FIR pipeline II must be 1");
+        assert_eq!(res.schedule.res_ii, 1, "Complete partition eliminates BRAM port bottleneck");
+        assert_eq!(res.schedule.rec_ii, 1);
+        assert_eq!(
+            res.binding.bram18_count, 0,
+            "Complete array partition must map arrays to FFs, not BRAMs"
+        );
+        let dsp_cells = res
+            .design
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. }))
+            .count();
+        assert_eq!(
+            dsp_cells, 4,
+            "4-tap pipelined FIR must bind 4 parallel DSP48 blocks, sv={}",
+            res.sv
+        );
+        assert!(res.sv.contains("ap_start"));
+        assert!(res.sv.contains("ap_done"));
+        assert!(res.sv.contains("y_ap_vld"));
+        assert!(res.report_text.contains("Vivado HLS Synthesis Report for 'fir_filter'"));
+    }
+
+    #[test]
+    fn hls_matrix_multiply_array_partition_and_modulo_scheduling() {
+        // 1. Unpartitioned matrix multiplication: 4 reads to bank 0 of A and B per pipelined J iteration -> ResII = 2
+        let unpartitioned = r#"
+void matmul(int A[4][4], int B[4][4], int C[4][4]) {
+  ROW: for (int i = 0; i < 2; i++) {
+    COL: for (int j = 0; j < 2; j++) {
+      #pragma HLS PIPELINE II=1
+      int sum = 0;
+      DOT: for (int k = 0; k < 4; k++) {
+        sum += A[i][k] * B[k][j];
+      }
+      C[i][j] = sum;
+    }
+  }
+}
+"#;
+        let r_unpart = hls_compile(unpartitioned).expect("unpartitioned matmul");
+        assert!(
+            r_unpart.schedule.res_ii >= 2,
+            "Unpartitioned 4-element dot product exceeds 2-port BRAM limit (ResII={})",
+            r_unpart.schedule.res_ii
+        );
+        assert!(r_unpart.schedule.achieved_ii >= 2);
+
+        // 2. Partitioned matrix multiplication: A cyclic factor=4 dim=2, B block factor=4 dim=1 -> ResII = 1, II = 1
+        let partitioned = r#"
+void matmul(int A[4][4], int B[4][4], int C[4][4]) {
+  #pragma HLS ARRAY_PARTITION variable=A type=cyclic factor=4 dim=2
+  #pragma HLS ARRAY_PARTITION variable=B type=block factor=4 dim=1
+  ROW: for (int i = 0; i < 2; i++) {
+    COL: for (int j = 0; j < 2; j++) {
+      #pragma HLS PIPELINE II=1
+      int sum = 0;
+      DOT: for (int k = 0; k < 4; k++) {
+        sum += A[i][k] * B[k][j];
+      }
+      C[i][j] = sum;
+    }
+  }
+}
+"#;
+        let r_part = hls_compile(partitioned).expect("partitioned matmul");
+        assert_eq!(
+            r_part.schedule.res_ii, 1,
+            "4-bank partitioning resolves BRAM port conflict to ResII=1"
+        );
+        assert_eq!(r_part.schedule.achieved_ii, 1);
+        assert_eq!(r_part.cdfg.array_configs["A"].num_banks, 4);
+        assert_eq!(r_part.cdfg.array_configs["B"].num_banks, 4);
+        assert_eq!(r_part.cdfg.array_configs["C"].num_banks, 1);
+        // 4 banks for A + 4 banks for B + 1 bank for C = 9 BRAM18 banks inferred in netlist
+        let bram_cells = r_part
+            .design
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. }))
+            .count();
+        assert_eq!(bram_cells, 9, "Expected 9 BRAM18E1 cells for 4+4+1 banks");
+        assert!(
+            r_part.report.max_latency_cycles < r_unpart.report.max_latency_cycles,
+            "Partitioned II=1 matmul must have lower latency than unpartitioned II=2"
+        );
+    }
+
+    #[test]
+    fn hls_allocation_limit_scales_res_ii_and_shares_dsps() {
+        let src = r#"
+void dot4(int a[4], int b[4], int *out) {
+  #pragma HLS ARRAY_PARTITION variable=a complete
+  #pragma HLS ARRAY_PARTITION variable=b complete
+  #pragma HLS ALLOCATION instances=mul limit=2 operation
+  #pragma HLS PIPELINE II=1
+  int acc = 0;
+  LOOP: for (int i = 0; i < 4; i++) {
+    acc += a[i] * b[i];
+  }
+  *out = acc;
+}
+"#;
+        let res = hls_compile(src).expect("dot4 with allocation limit=2");
+        assert_eq!(
+            res.binding.dsp_count, 2,
+            "ALLOCATION limit=2 must cap bound DSP48 units at 2"
+        );
+        assert_eq!(
+            res.schedule.res_ii, 2,
+            "4 multiplies with 2 DSPs yields ResII = ceil(4/2) = 2"
+        );
+        assert_eq!(res.schedule.achieved_ii, 2);
+        let dsp_cells = res
+            .design
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. }))
+            .count();
+        assert_eq!(dsp_cells, 2);
+    }
+
+    #[test]
+    fn hls_axi_lite_axis_m_axi_and_fifo_interfaces() {
+        let src = r#"
+void stream_accel(
+    hls::stream<int> &in_s,
+    hls::stream<int> &out_s,
+    int *dram_ptr,
+    int *fifo_out,
+    int gain,
+    int bias
+) {
+  #pragma HLS INTERFACE s_axilite port=return bundle=control
+  #pragma HLS INTERFACE s_axilite port=gain bundle=control
+  #pragma HLS INTERFACE s_axilite port=bias bundle=control
+  #pragma HLS INTERFACE axis port=in_s
+  #pragma HLS INTERFACE axis port=out_s
+  #pragma HLS INTERFACE m_axi port=dram_ptr bundle=gmem0 depth=64
+  #pragma HLS INTERFACE ap_fifo port=fifo_out
+  #pragma HLS PIPELINE II=1
+
+  int x = in_s.read();
+  int y = x * gain + bias + *dram_ptr;
+  *fifo_out = y;
+  out_s.write(y);
+}
+"#;
+        let res = hls_compile(src).expect("stream_accel compile");
+        assert!(res.sv.contains("s_axi_control_AWVALID"));
+        assert!(res.sv.contains("s_axi_control_WDATA"));
+        assert!(res.sv.contains("s_axi_control_RDATA"));
+        assert!(res.sv.contains("m_axi_gmem0_AWVALID"));
+        assert!(res.sv.contains("m_axi_gmem0_RDATA"));
+        assert!(res.sv.contains("in_s_TDATA"));
+        assert!(res.sv.contains("in_s_TVALID"));
+        assert!(res.sv.contains("in_s_TREADY"));
+        assert!(res.sv.contains("out_s_TDATA"));
+        assert!(res.sv.contains("out_s_TVALID"));
+        assert!(res.sv.contains("out_s_TLAST"));
+        assert!(res.sv.contains("fifo_out_din"));
+        assert!(res.sv.contains("fifo_out_full_n"));
+        assert!(res.sv.contains("fifo_out_write"));
+        assert!(res.report_text.contains("s_axilite"));
+        assert!(res.report_text.contains("m_axi"));
+        assert!(res.report_text.contains("axis"));
+        assert!(res.report_text.contains("ap_fifo"));
+    }
+
+    #[test]
+    fn hls_dataflow_and_inline_pipeline() {
+        let src = r#"
+int scale_elem(int x, int factor) {
+  #pragma HLS INLINE
+  return x * factor;
+}
+
+void stage_load(int in_arr[4], int buf[4], int k) {
+  for (int i = 0; i < 4; i++) {
+    #pragma HLS PIPELINE II=1
+    buf[i] = scale_elem(in_arr[i], k);
+  }
+}
+
+void stage_compute(int buf[4], int out_arr[4]) {
+  for (int i = 0; i < 4; i++) {
+    #pragma HLS PIPELINE II=1
+    out_arr[i] = buf[i] + 1;
+  }
+}
+
+void top_dataflow(int in_arr[4], int out_arr[4], int k) {
+  #pragma HLS DATAFLOW
+  int mid_buf[4];
+  stage_load(in_arr, mid_buf, k);
+  stage_compute(mid_buf, out_arr);
+}
+"#;
+        let res = hls_compile(src).expect("top_dataflow compile");
+        assert!(res.cdfg.is_dataflow);
+        assert_eq!(res.cdfg.dataflow_processes.len(), 2);
+        assert_eq!(res.cdfg.dataflow_processes[0].name, "stage_load");
+        assert_eq!(res.cdfg.dataflow_processes[1].name, "stage_compute");
+        assert!(!res.cdfg.dataflow_channels.is_empty());
+        assert_eq!(res.cdfg.dataflow_channels[0].name, "mid_buf");
+        assert!(res.sv.contains("df_fifo_mid_buf_din"));
+        assert!(res.report.is_dataflow);
+        assert!(res.report_text.contains("dataflow"));
+    }
+
+    #[test]
+    fn hls_asap_alap_sdc_clock_period_chaining() {
+        let src = r#"
+void chained_alu(int a, int b, int c, int d, int *y) {
+  #pragma HLS INTERFACE ap_ctrl_hs port=return
+  int t1 = a + b;
+  int t2 = t1 ^ c;
+  int t3 = t2 + d;
+  int t4 = t3 * a;
+  *y = t4 + b;
+}
+"#;
+        // Relaxed clock (10.0ns) chains fast LUT operations into fewer stages than tight clock (1.8ns)
+        let relaxed_cfg = HlsConfig {
+            target_clock_ns: 10.0,
+            ..HlsConfig::default()
+        };
+        let tight_cfg = HlsConfig {
+            target_clock_ns: 1.8,
+            ..HlsConfig::default()
+        };
+        let r_rel = hls_compile_with_config(src, &relaxed_cfg).unwrap();
+        let r_tight = hls_compile_with_config(src, &tight_cfg).unwrap();
+        assert!(
+            r_tight.schedule.pipeline_depth > r_rel.schedule.pipeline_depth,
+            "Tight clock period must insert more pipeline stages ({}) than relaxed clock ({})",
+            r_tight.schedule.pipeline_depth,
+            r_rel.schedule.pipeline_depth
+        );
+        for i in 0..r_rel.cdfg.nodes.len() {
+            assert!(
+                r_rel.schedule.asap_cycles[i] <= r_rel.schedule.alap_cycles[i],
+                "ASAP cycle must be <= ALAP cycle for node {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn hls_compile_with_tcl_directives_and_multibank_memory() {
+        let src = r#"
+void vec_mac(int a[8], int b[8], int *out) {
+  int acc = 0;
+  MAC_LOOP: for (int i = 0; i < 8; i++) {
+    acc += a[i] * b[i];
+  }
+  *out = acc;
+}
+"#;
+        let tcl = r#"
+create_clock -period 8.0
+set_top vec_mac
+set_directive_interface -mode ap_ctrl_none "vec_mac" return
+set_directive_array_partition -type cyclic -factor 4 -dim 1 "vec_mac" a
+set_directive_array_partition -type block -factor 4 -dim 1 "vec_mac" b
+set_directive_unroll -factor 2 "vec_mac/MAC_LOOP"
+set_directive_pipeline -II 1 "vec_mac/MAC_LOOP"
+"#;
+        let res = hls_compile_with_tcl(src, tcl).expect("hls_compile_with_tcl");
+        assert_eq!(res.schedule.target_clock_ns, 8.0);
+        assert_eq!(res.schedule.res_ii, 1);
+        assert_eq!(res.schedule.achieved_ii, 1);
+        assert_eq!(res.schedule.loop_schedules[0].unroll_factor, 2);
+        assert!(res.sv.contains("a_0_address0"));
+        assert!(res.sv.contains("a_3_address0"));
+        assert!(res.sv.contains("b_0_address0"));
+        assert!(res.sv.contains("b_3_address0"));
+        assert!(!res.sv.contains("ap_start"), "ap_ctrl_none must omit ap_start");
+    }
+
+    #[test]
+    fn hls_recurrence_ii_under_tight_clock() {
+        let src = r#"
+void iir_filter(int x[8], int y[8], int alpha) {
+  int state = 0;
+  IIR_LOOP: for (int i = 0; i < 8; i++) {
+    #pragma HLS PIPELINE II=1
+    state = state * alpha + x[i];
+    y[i] = state;
+  }
+}
+"#;
+        let tight_cfg = HlsConfig {
+            target_clock_ns: 3.0,
+            ..HlsConfig::default()
+        };
+        let res = hls_compile_with_config(src, &tight_cfg).expect("iir_filter");
+        assert!(
+            res.schedule.rec_ii >= 2,
+            "Recurrence through multiplier under 3ns clock requires RecII >= 2, got {}",
+            res.schedule.rec_ii
+        );
+        assert_eq!(
+            res.schedule.ii_min,
+            res.schedule.res_ii.max(res.schedule.rec_ii)
+        );
+        assert!(res.schedule.achieved_ii >= res.schedule.ii_min);
     }
 }
