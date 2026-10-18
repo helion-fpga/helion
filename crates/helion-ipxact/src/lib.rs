@@ -1,6 +1,8 @@
 //! IEEE 1685-style pack/reimport (minimal XML). Helion-MM/ST, not AXI.
 
 use std::path::Path;
+pub mod mig;
+pub use mig::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IpCore {
@@ -1666,5 +1668,80 @@ file a.v
             let pkg = parse_helion(&body).unwrap();
             assert_eq!(pkg.to_ip_core().unwrap(), ip);
         }
+    }
+
+    #[test]
+    fn jedec_timing_calculator_quantizes_ddr3_ddr4_hyperram_sdram() {
+        // DDR3-1600 @ 200 MHz controller clock (5000 ps period):
+        // tRCD = ceil(13750 / 5000) = 3, tRP = 3, tRAS = ceil(35000 / 5000) = 7,
+        // tRFC = ceil(260000 / 5000) = 52, tREFI = floor(7800000 / 5000) = 1560, CL = 11, CWL = 8
+        let ddr3_cfg = MigConfig::ddr3_default();
+        assert_eq!(ddr3_cfg.timing.clk_period_ps, 5_000);
+        assert_eq!(ddr3_cfg.timing.t_rcd, 3);
+        assert_eq!(ddr3_cfg.timing.t_rp, 3);
+        assert_eq!(ddr3_cfg.timing.t_ras, 7);
+        assert_eq!(ddr3_cfg.timing.t_rfc, 52);
+        assert_eq!(ddr3_cfg.timing.t_refi, 1560);
+        assert_eq!(ddr3_cfg.timing.cl, 11);
+        assert_eq!(ddr3_cfg.timing.cwl, 8);
+
+        // DDR4-2400 @ 300 MHz controller clock (3333 ps period)
+        let ddr4_cfg = MigConfig::ddr4_default();
+        assert_eq!(ddr4_cfg.timing.t_rcd, 5);
+        assert_eq!(ddr4_cfg.timing.t_rp, 5);
+        assert_eq!(ddr4_cfg.timing.t_ras, 10);
+        assert_eq!(ddr4_cfg.timing.cl, 17);
+        assert_eq!(ddr4_cfg.timing.cwl, 12);
+
+        // HyperRAM-200 @ 100 MHz (10000 ps period)
+        let hb_cfg = MigConfig::hyperram_default();
+        assert_eq!(hb_cfg.timing.cl, 6);
+        assert_eq!(hb_cfg.timing.t_refi, 400);
+
+        // SDR-133 @ 133.33 MHz (7500 ps period)
+        let sdr_cfg = MigConfig::sdr_sdram_default();
+        assert_eq!(sdr_cfg.timing.t_rcd, 2);
+        assert_eq!(sdr_cfg.timing.t_rp, 2);
+        assert_eq!(sdr_cfg.timing.cl, 3);
+    }
+
+    #[test]
+    fn mig_ddr3_ddr4_hyperram_sdram_generators_emit_synthesizable_sv() {
+        let mcat = mig_catalog();
+        assert_eq!(mcat.len(), 4);
+
+        let ddr3_sv = MigConfig::ddr3_default().generate_sv();
+        assert!(ddr3_sv.contains("module mig_ddr3_controller"));
+        assert!(ddr3_sv.contains("init_calib_complete"));
+        assert!(ddr3_sv.contains("CALIB_WRITE_LVL"));
+        assert!(ddr3_sv.contains("CALIB_DQS_GATE"));
+        assert!(ddr3_sv.contains("CALIB_READ_EYE"));
+        assert!(ddr3_sv.contains("CMD_ACT"));
+        assert!(ddr3_sv.contains("CMD_RD"));
+        assert!(ddr3_sv.contains("CMD_WR"));
+        assert!(ddr3_sv.contains("CMD_PRE"));
+        assert!(ddr3_sv.contains("CMD_REF"));
+        assert!(ddr3_sv.contains("s_axi_awburst"));
+        assert!(ddr3_sv.contains("s_axi_rlast"));
+
+        let ddr4_sv = MigConfig::ddr4_default().generate_sv();
+        assert!(ddr4_sv.contains("module mig_ddr4_controller"));
+        assert!(ddr4_sv.contains("c0_init_calib_complete"));
+        assert!(ddr4_sv.contains("c0_ddr4_act_n"));
+        assert!(ddr4_sv.contains("c0_ddr4_bg"));
+        assert!(ddr4_sv.contains("s_axi_awlen"));
+
+        let hb_sv = MigConfig::hyperram_default().generate_sv();
+        assert!(hb_sv.contains("module hyperram_controller"));
+        assert!(hb_sv.contains("hb_rwds_i"));
+        assert!(hb_sv.contains("HB_CA_PKT"));
+        assert!(hb_sv.contains("s_axi_arlen"));
+
+        let sdr_sv = MigConfig::sdr_sdram_default().generate_sv();
+        assert!(sdr_sv.contains("module sdr_sdram_controller"));
+        assert!(sdr_sv.contains("SDR_CMD_ACT"));
+        assert!(sdr_sv.contains("SDR_CMD_PRE"));
+        assert!(sdr_sv.contains("SDR_CMD_REF"));
+        assert!(sdr_sv.contains("sdram_ras_n"));
     }
 }
