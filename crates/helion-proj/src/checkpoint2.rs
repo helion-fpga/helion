@@ -51,7 +51,137 @@ const TAG_PACKED: u8 = 3;
 const TAG_PLACED: u8 = 4;
 const TAG_ROUTED: u8 = 5;
 const TAG_BITSTREAM: u8 = 6;
+const TAG_SHA256: u8 = 7;
 
+// ---------------------------------------------------------------------------
+// FIPS 180-4 SHA-256 netlist & cell/net fingerprinting
+// ---------------------------------------------------------------------------
+
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+/// Compute FIPS 180-4 SHA-256 digest of `data`.
+pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut padded = Vec::with_capacity((data.len() + 9 + 63) & !63);
+    padded.extend_from_slice(data);
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in padded.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            let off = i * 4;
+            w[i] = u32::from_be_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut hh = h[7];
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(SHA256_K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    let mut out = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// Lowercase hex encoding of a 32-byte SHA-256 digest.
+pub fn sha256_to_hex(digest: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(64);
+    for &b in digest {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+/// Compute lowercase hex SHA-256 digest of `data`.
+pub fn sha256_hex(data: &[u8]) -> String {
+    sha256_to_hex(&sha256_bytes(data))
+}
+
+/// Canonical SHA-256 fingerprint of a [`Design`] netlist (from its HNF representation).
+pub fn netlist_sha256(design: &Design) -> String {
+    sha256_hex(design.to_hnf().as_bytes())
+}
+
+/// Per-cell structural SHA-256 fingerprints (cell kind, INIT, and connected pin->net bindings).
+/// Used by `read_checkpoint -incremental` to verify structural equivalence of reused cells.
+pub fn cell_fingerprints(design: &Design) -> BTreeMap<String, [u8; 32]> {
+    use helion_ir::resolve;
+    let pins = design.pin_index();
+    let mut out = BTreeMap::new();
+    for cell in &design.cells {
+        let cname = resolve(cell.name);
+        let mut desc = format!("cell:{cname}:kind:{:?}", cell.kind);
+        for pin in [
+            "I0", "I1", "I2", "I3", "I4", "I5", "O", "D", "Q", "CLK", "I", "PAD",
+        ] {
+            if let Some(net) = pins.net_on(cname, pin) {
+                desc.push_str(&format!(";{pin}={}", resolve(net)));
+            }
+        }
+        out.insert(cname.to_string(), sha256_bytes(desc.as_bytes()));
+    }
+    out
+}
 /// Flow stage a checkpoint was captured at.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CheckpointStage {
@@ -107,6 +237,8 @@ pub struct CheckpointMeta {
     pub wns_ps: i64,
     pub tns_ps: i64,
     pub bytes: u64,
+    /// SHA-256 hex digest of the checkpoint's HNF netlist.
+    pub netlist_sha256: String,
 }
 
 impl CheckpointMeta {
@@ -709,39 +841,31 @@ fn sanitize_name(name: &str) -> String {
 // save / load / list / delete
 // ---------------------------------------------------------------------------
 
-/// Serialize the session at its current stage into `dir/{name}.hck2`.
-pub fn save_checkpoint(
+fn is_checkpoint_ext(ext: &str) -> bool {
+    matches!(ext.to_ascii_lowercase().as_str(), "hck2" | "hdcp" | "dcp")
+}
+
+fn encode_checkpoint_bytes(
     session: &Session,
     constraints: &Constraints,
-    name: &str,
-    dir: &Path,
+    stem: &str,
+    created: u64,
     summary: &CheckpointSummary,
-) -> Result<PathBuf, String> {
+) -> Result<(Vec<u8>, CheckpointStage, (u32, u32, u32, u32, u32), String), String> {
     let stage = stage_of(session).ok_or("checkpoint: nothing to save (no design)")?;
     let design = session.design.as_ref().ok_or("checkpoint: no design")?;
-    let created = now_unix();
-    let stem = sanitize_name(name);
-    std::fs::create_dir_all(dir).map_err(|e| format!("checkpoint mkdir {}: {e}", dir.display()))?;
-    let mut path = dir.join(format!("{stem}.hck2"));
-    if path.exists() {
-        path = dir.join(format!("{stem}-{created}.hck2"));
-    }
-    let (luts, ffs, iobs, dsps, brams) = counts_of(session);
+    let counts = counts_of(session);
+    let (luts, ffs, iobs, dsps, brams) = counts;
 
     let mut w = Writer::new();
     w.buf.extend_from_slice(MAGIC);
     w.u8(VER);
     let mut h = Writer::new();
-    h.str(&stem);
+    h.str(stem);
     h.u64(created);
     h.u8(stage as u8);
     h.str(&session.part);
-    h.u8(match session.strategy {
-        ImplStrategy::Default => 0,
-        ImplStrategy::TimingExplore => 1,
-        ImplStrategy::RuntimeOpt => 2,
-        ImplStrategy::PhysOpt => 3,
-    });
+    h.u8(session.strategy.as_u8());
     h.i64(summary.wns_ps);
     h.i64(summary.tns_ps);
     h.u32(luts);
@@ -752,7 +876,11 @@ pub fn save_checkpoint(
     w.u32(h.buf.len() as u32);
     w.buf.extend_from_slice(&h.buf);
 
-    w.section(TAG_HNF, design.to_hnf().as_bytes());
+    let hnf = design.to_hnf();
+    let digest = sha256_bytes(hnf.as_bytes());
+    let digest_hex = sha256_to_hex(&digest);
+    w.section(TAG_HNF, hnf.as_bytes());
+    w.section(TAG_SHA256, &digest);
     w.section(TAG_CONSTRAINTS, &constraints.encode());
     match stage {
         CheckpointStage::PostSynth => {}
@@ -780,7 +908,71 @@ pub fn save_checkpoint(
             }
         }
     }
-    std::fs::write(&path, &w.buf).map_err(|e| format!("checkpoint write {}: {e}", path.display()))?;
+    Ok((w.buf, stage, counts, digest_hex))
+}
+
+/// Serialize the session at its current stage directly to `path` (`.dcp`, `.hdcp`, or `.hck2`).
+pub fn save_checkpoint_file(
+    session: &Session,
+    constraints: &Constraints,
+    path: &Path,
+    summary: &CheckpointSummary,
+) -> Result<CheckpointMeta, String> {
+    let created = now_unix();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(sanitize_name)
+        .unwrap_or_else(|| "checkpoint".into());
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("checkpoint mkdir {}: {e}", parent.display()))?;
+        }
+    }
+    let (bytes, stage, (luts, ffs, iobs, dsps, brams), netlist_sha256) =
+        encode_checkpoint_bytes(session, constraints, &stem, created, summary)?;
+    std::fs::write(path, &bytes)
+        .map_err(|e| format!("checkpoint write {}: {e}", path.display()))?;
+    Ok(CheckpointMeta {
+        name: stem,
+        path: path.to_path_buf(),
+        stage,
+        created_unix: created,
+        part: session.part.clone(),
+        strategy: session.strategy,
+        luts,
+        ffs,
+        iobs,
+        dsps,
+        brams,
+        wns_ps: summary.wns_ps,
+        tns_ps: summary.tns_ps,
+        bytes: bytes.len() as u64,
+        netlist_sha256,
+    })
+}
+
+/// Serialize the session at its current stage into `dir/{name}.hck2`.
+pub fn save_checkpoint(
+    session: &Session,
+    constraints: &Constraints,
+    name: &str,
+    dir: &Path,
+    summary: &CheckpointSummary,
+) -> Result<PathBuf, String> {
+    let _stage = stage_of(session).ok_or("checkpoint: nothing to save (no design)")?;
+    let created = now_unix();
+    let stem = sanitize_name(name);
+    std::fs::create_dir_all(dir).map_err(|e| format!("checkpoint mkdir {}: {e}", dir.display()))?;
+    let mut path = dir.join(format!("{stem}.hck2"));
+    if path.exists() {
+        path = dir.join(format!("{stem}-{created}.hck2"));
+    }
+    let (bytes, _, _, _) =
+        encode_checkpoint_bytes(session, constraints, &stem, created, summary)?;
+    std::fs::write(&path, &bytes)
+        .map_err(|e| format!("checkpoint write {}: {e}", path.display()))?;
     Ok(path)
 }
 
@@ -802,7 +994,7 @@ struct ParsedHeader {
 fn parse_header(bytes: &[u8]) -> Result<(ParsedHeader, Vec<(u8, Vec<u8>)>), String> {
     let mut r = Reader::new(bytes);
     if r.take(4)? != MAGIC {
-        return Err("checkpoint: bad magic (not .hck2)".into());
+        return Err("checkpoint: bad magic (not .hck2/.hdcp/.dcp)".into());
     }
     let ver = r.u8()?;
     if ver != VER {
@@ -816,12 +1008,7 @@ fn parse_header(bytes: &[u8]) -> Result<(ParsedHeader, Vec<(u8, Vec<u8>)>), Stri
         created_unix: h.u64()?,
         stage: CheckpointStage::from_u8(h.u8()?)?,
         part: h.str()?,
-        strategy: match h.u8()? {
-            1 => ImplStrategy::TimingExplore,
-            2 => ImplStrategy::RuntimeOpt,
-            3 => ImplStrategy::PhysOpt,
-            _ => ImplStrategy::Default,
-        },
+        strategy: ImplStrategy::from_u8(h.u8()?),
         wns_ps: h.i64()?,
         tns_ps: h.i64()?,
         luts: h.u32()?,
@@ -840,11 +1027,37 @@ fn parse_header(bytes: &[u8]) -> Result<(ParsedHeader, Vec<(u8, Vec<u8>)>), Stri
     Ok((hdr, sections))
 }
 
+fn extract_and_verify_sha256(sections: &[(u8, Vec<u8>)]) -> Result<String, String> {
+    let hnf_bytes = sections
+        .iter()
+        .find(|(t, _)| *t == TAG_HNF)
+        .map(|(_, p)| p.as_slice())
+        .ok_or("checkpoint: missing HNF section")?;
+    let computed = sha256_bytes(hnf_bytes);
+    if let Some((_, stored)) = sections.iter().find(|(t, _)| *t == TAG_SHA256) {
+        if stored.len() != 32 {
+            return Err(format!(
+                "checkpoint: bad SHA-256 section length {}",
+                stored.len()
+            ));
+        }
+        if stored.as_slice() != computed {
+            return Err(format!(
+                "checkpoint: SHA-256 netlist fingerprint mismatch (expected {}, got {})",
+                sha256_to_hex(stored.as_slice().try_into().unwrap()),
+                sha256_to_hex(&computed)
+            ));
+        }
+    }
+    Ok(sha256_to_hex(&computed))
+}
+
 /// Read only the header: cheap listing without parsing the design.
 pub fn read_meta(path: &Path) -> Result<CheckpointMeta, String> {
     let bytes =
         std::fs::read(path).map_err(|e| format!("checkpoint read {}: {e}", path.display()))?;
-    let (hdr, _) = parse_header(&bytes)?;
+    let (hdr, sections) = parse_header(&bytes)?;
+    let netlist_sha256 = extract_and_verify_sha256(&sections)?;
     Ok(CheckpointMeta {
         name: hdr.name,
         path: path.to_path_buf(),
@@ -860,10 +1073,11 @@ pub fn read_meta(path: &Path) -> Result<CheckpointMeta, String> {
         wns_ps: hdr.wns_ps,
         tns_ps: hdr.tns_ps,
         bytes: bytes.len() as u64,
+        netlist_sha256,
     })
 }
 
-/// List checkpoints in `dir`, newest first. Unreadable files are skipped.
+/// List checkpoints (`.hck2`, `.hdcp`, `.dcp`) in `dir`, newest first. Unreadable files are skipped.
 pub fn list_checkpoints(dir: &Path) -> Vec<CheckpointMeta> {
     let mut out = Vec::new();
     let entries = std::fs::read_dir(dir).map(|rd| rd.filter_map(|e| e.ok()).collect::<Vec<_>>());
@@ -874,7 +1088,10 @@ pub fn list_checkpoints(dir: &Path) -> Vec<CheckpointMeta> {
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
         let p = e.path();
-        if p.extension().and_then(|x| x.to_str()) != Some("hck2") {
+        let Some(ext) = p.extension().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        if !is_checkpoint_ext(ext) {
             continue;
         }
         if let Ok(m) = read_meta(&p) {
@@ -890,6 +1107,7 @@ pub fn delete_checkpoint(path: &Path) -> Result<(), String> {
 }
 
 /// Restore a checkpoint into a live `Session`. The part must match `dev`.
+/// Verifies the SHA-256 netlist fingerprint when present.
 /// Re-running reports on the result yields identical numbers to the original.
 pub fn load_checkpoint(path: &Path, dev: &Device) -> Result<RestoredCheckpoint, String> {
     let bytes =
@@ -901,6 +1119,7 @@ pub fn load_checkpoint(path: &Path, dev: &Device) -> Result<RestoredCheckpoint, 
             hdr.part, dev.part
         ));
     }
+    let netlist_sha256 = extract_and_verify_sha256(&sections)?;
     let mut hnf: Option<String> = None;
     let mut constraints: Option<Constraints> = None;
     let mut packed: Option<Packed> = None;
@@ -965,6 +1184,8 @@ pub fn load_checkpoint(path: &Path, dev: &Device) -> Result<RestoredCheckpoint, 
     session.impl_checkpoint = placed;
     session.part = hdr.part.clone();
     session.strategy = hdr.strategy;
+    session.place_opts = hdr.strategy.place_opts();
+    session.route_opts = hdr.strategy.route_opts();
     let _ = pblock_unused();
     Ok(RestoredCheckpoint {
         meta: CheckpointMeta {
@@ -982,6 +1203,7 @@ pub fn load_checkpoint(path: &Path, dev: &Device) -> Result<RestoredCheckpoint, 
             wns_ps: hdr.wns_ps,
             tns_ps: hdr.tns_ps,
             bytes: bytes.len() as u64,
+            netlist_sha256,
         },
         session,
         constraints,
