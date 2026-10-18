@@ -472,6 +472,126 @@ pub struct PackedMuxf {
     pub o_net: String,
 }
 
+/// A packed 7-Series GTP transceiver channel (`GTPE2_CHANNEL`, UG482).
+#[derive(Clone, Debug, Default)]
+pub struct PackedGtpChannel {
+    pub name: String,
+    pub rxout_div: u8,
+    pub txout_div: u8,
+    pub rx_data_width: u8,
+    pub tx_data_width: u8,
+    pub rx_int_datawidth: u8,
+    pub tx_int_datawidth: u8,
+    pub pll0clk_net: Option<String>,
+    pub pll0refclk_net: Option<String>,
+    pub pll1clk_net: Option<String>,
+    pub pll1refclk_net: Option<String>,
+    pub rxusrclk_net: Option<String>,
+    pub txusrclk_net: Option<String>,
+    pub txoutclk_net: Option<String>,
+    pub rxoutclk_net: Option<String>,
+    pub gtprxp_net: Option<String>,
+    pub gtptxp_net: Option<String>,
+}
+
+/// A packed 7-Series GTP transceiver quad PLL (`GTPE2_COMMON`, UG482).
+#[derive(Clone, Debug, Default)]
+pub struct PackedGtpCommon {
+    pub name: String,
+    pub pll0_fbdiv: u8,
+    pub pll0_fbdiv_45: u8,
+    pub pll0_refclk_div: u8,
+    pub pll1_fbdiv: u8,
+    pub pll1_fbdiv_45: u8,
+    pub pll1_refclk_div: u8,
+    pub gtrefclk0_net: Option<String>,
+    pub gtrefclk1_net: Option<String>,
+    pub pll0outclk_net: Option<String>,
+    pub pll0outrefclk_net: Option<String>,
+    pub pll1outclk_net: Option<String>,
+    pub pll1outrefclk_net: Option<String>,
+    pub pll0lock_net: Option<String>,
+    pub pll1lock_net: Option<String>,
+}
+
+/// A packed gigabit transceiver differential reference clock buffer (`IBUFDS_GTE2`).
+#[derive(Clone, Debug, Default)]
+pub struct PackedIbufdsGte2 {
+    pub name: String,
+    pub clkcm_cfg: bool,
+    pub clkrcv_trst: bool,
+    pub clkswing_cfg: u8,
+    pub i_net: Option<String>,
+    pub ib_net: Option<String>,
+    pub ceb_net: Option<String>,
+    pub o_net: String,
+    pub odiv2_net: Option<String>,
+}
+
+/// A packed 7-Series Integrated Block for PCI Express (`PCIE_2_1`, PG054).
+#[derive(Clone, Debug, Default)]
+pub struct PackedPcie {
+    pub name: String,
+    pub bar: [u32; 6],
+    pub max_payload_supported: u8,
+    pub max_link_speed: u8,
+    pub max_link_width: u8,
+    pub userclk1_net: Option<String>,
+    pub userclk2_net: Option<String>,
+    pub pipeclk_net: Option<String>,
+    pub user_lnk_up_net: Option<String>,
+}
+
+/// A packed 7-Series Dual 12-Bit 1MSPS Analog-to-Digital Converter (`XADC`, UG480).
+#[derive(Clone, Debug, Default)]
+pub struct PackedXadc {
+    pub name: String,
+    /// `INIT_40`..`INIT_5F` 16-bit configuration registers.
+    pub init_regs: BTreeMap<u8, u16>,
+    pub dclk_net: Option<String>,
+    pub den_net: Option<String>,
+    pub dwe_net: Option<String>,
+    pub drdy_net: Option<String>,
+    pub busy_net: Option<String>,
+    pub vp_net: Option<String>,
+    pub vn_net: Option<String>,
+}
+
+/// 7-Series configuration / JTAG / bitstream primitive kind (UG470 / UG953).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CfgPrimKind {
+    #[default]
+    Bscane2,
+    Icape2,
+    DnaPort,
+    FrameEcce2,
+    Startupe2,
+    UsrAccesse2,
+    Capturee2,
+}
+
+/// A packed 7-Series configuration / JTAG / silicon-ID primitive.
+#[derive(Clone, Debug, Default)]
+pub struct PackedCfgPrim {
+    pub name: String,
+    pub kind: CfgPrimKind,
+    /// `JTAG_CHAIN` (`1..=4`) for `BSCANE2`.
+    pub jtag_chain: u8,
+    pub disable_jtag: bool,
+    /// `ICAP_WIDTH` (`"X8"`, `"X16"`, `"X32"`) and `DEVICE_ID` for `ICAPE2`.
+    pub icap_width: String,
+    pub device_id: u32,
+    /// `SIM_DNA_VALUE` (57-bit) for `DNA_PORT`.
+    pub sim_dna_value: u64,
+    /// `FARSRC` (`"FAR"` or `"EFAR"`) for `FRAME_ECCE2`.
+    pub farsrc: String,
+    /// `PROG_USR` for `STARTUPE2` and `ONESHOT` for `CAPTUREE2`.
+    pub prog_usr: bool,
+    pub oneshot: bool,
+    pub clk_net: Option<String>,
+    pub out_net: Option<String>,
+}
+
 /// Backend-owned packed netlist for xc7a35t.
 #[derive(Clone, Debug, Default)]
 pub struct Packed7 {
@@ -488,8 +608,13 @@ pub struct Packed7 {
     pub iodelays: Vec<PackedIodelay>,
     pub srls: Vec<PackedSrl>,
     pub muxfs: Vec<PackedMuxf>,
+    pub gtp_channels: Vec<PackedGtpChannel>,
+    pub gtp_commons: Vec<PackedGtpCommon>,
+    pub ibufds_gte2s: Vec<PackedIbufdsGte2>,
+    pub pcies: Vec<PackedPcie>,
+    pub xadcs: Vec<PackedXadc>,
+    pub cfg_prims: Vec<PackedCfgPrim>,
 }
-
 /// Pack a [`Design`] into 7-series packable units.
 ///
 /// Inserts IBUF + BUFGCTRL for every top-level input port whose net drives
@@ -747,6 +872,29 @@ fn pack_blackbox_primitive(
             out.muxfs
                 .push(pack_muxf(cell_name, MuxfKind::Muxf8, pins)?);
         }
+        "GTPE2_CHANNEL" | "GTXE2_CHANNEL" => {
+            out.gtp_channels
+                .push(pack_gtp_channel(cell_name, pins, attrs)?);
+        }
+        "GTPE2_COMMON" | "GTXE2_COMMON" => {
+            out.gtp_commons
+                .push(pack_gtp_common(cell_name, pins, attrs)?);
+        }
+        "IBUFDS_GTE2" => {
+            out.ibufds_gte2s
+                .push(pack_ibufds_gte2(cell_name, pins, attrs)?);
+        }
+        "PCIE_2_1" => {
+            out.pcies.push(pack_pcie(cell_name, pins, attrs)?);
+        }
+        "XADC" => {
+            out.xadcs.push(pack_xadc(cell_name, pins, attrs)?);
+        }
+        "BSCANE2" | "ICAPE2" | "DNA_PORT" | "FRAME_ECCE2" | "STARTUPE2" | "USR_ACCESSE2"
+        | "CAPTUREE2" => {
+            out.cfg_prims
+                .push(pack_cfg_prim(cell_name, &up, pins, attrs)?);
+        }
         _ => {
             return Err(format!(
                 "pack: unsupported BlackBox `{module}` for 7-series (cell {cell_name})"
@@ -754,6 +902,384 @@ fn pack_blackbox_primitive(
         }
     }
     Ok(())
+}
+
+fn pack_gtp_channel(
+    cell_name: &str,
+    pins: &PinIndex,
+    attrs: &Attrs,
+) -> Result<PackedGtpChannel, String> {
+    let parse_div = |key: &str| -> Result<u8, String> {
+        let d = attrs
+            .get(key)
+            .map(parse_verilog_u64)
+            .transpose()?
+            .unwrap_or(2) as u8;
+        if !matches!(d, 1 | 2 | 4 | 8 | 16) {
+            return Err(format!(
+                "pack: GTPE2_CHANNEL {cell_name}: illegal {key}={d} (must be 1, 2, 4, 8, or 16)"
+            ));
+        }
+        Ok(d)
+    };
+    let parse_dw = |key: &str| -> Result<u8, String> {
+        let w = attrs
+            .get(key)
+            .map(parse_verilog_u64)
+            .transpose()?
+            .unwrap_or(20) as u8;
+        if !matches!(w, 16 | 20 | 32 | 40) {
+            return Err(format!(
+                "pack: GTPE2_CHANNEL {cell_name}: illegal {key}={w} (must be 16, 20, 32, or 40)"
+            ));
+        }
+        Ok(w)
+    };
+    let rxout_div = parse_div("RXOUT_DIV")?;
+    let txout_div = parse_div("TXOUT_DIV")?;
+    let rx_data_width = parse_dw("RX_DATA_WIDTH")?;
+    let tx_data_width = parse_dw("TX_DATA_WIDTH")?;
+    let rx_int_datawidth = attrs
+        .get("RX_INT_DATAWIDTH")
+        .map(parse_verilog_u64)
+        .transpose()?
+        .unwrap_or(0) as u8
+        & 1;
+    let tx_int_datawidth = attrs
+        .get("TX_INT_DATAWIDTH")
+        .map(parse_verilog_u64)
+        .transpose()?
+        .unwrap_or(0) as u8
+        & 1;
+    Ok(PackedGtpChannel {
+        name: cell_name.to_string(),
+        rxout_div,
+        txout_div,
+        rx_data_width,
+        tx_data_width,
+        rx_int_datawidth,
+        tx_int_datawidth,
+        pll0clk_net: pins
+            .net_on(cell_name, "PLL0CLK")
+            .map(|s| resolve(s).to_string()),
+        pll0refclk_net: pins
+            .net_on(cell_name, "PLL0REFCLK")
+            .map(|s| resolve(s).to_string()),
+        pll1clk_net: pins
+            .net_on(cell_name, "PLL1CLK")
+            .map(|s| resolve(s).to_string()),
+        pll1refclk_net: pins
+            .net_on(cell_name, "PLL1REFCLK")
+            .map(|s| resolve(s).to_string()),
+        rxusrclk_net: pins
+            .net_on(cell_name, "RXUSRCLK")
+            .map(|s| resolve(s).to_string()),
+        txusrclk_net: pins
+            .net_on(cell_name, "TXUSRCLK")
+            .map(|s| resolve(s).to_string()),
+        txoutclk_net: pins
+            .net_on(cell_name, "TXOUTCLK")
+            .map(|s| resolve(s).to_string()),
+        rxoutclk_net: pins
+            .net_on(cell_name, "RXOUTCLK")
+            .map(|s| resolve(s).to_string()),
+        gtprxp_net: pins
+            .net_on(cell_name, "GTPRXP")
+            .map(|s| resolve(s).to_string()),
+        gtptxp_net: pins
+            .net_on(cell_name, "GTPTXP")
+            .map(|s| resolve(s).to_string()),
+    })
+}
+
+fn pack_gtp_common(
+    cell_name: &str,
+    pins: &PinIndex,
+    attrs: &Attrs,
+) -> Result<PackedGtpCommon, String> {
+    let fbdiv = |key: &str| -> Result<u8, String> {
+        let d = attrs
+            .get(key)
+            .map(parse_verilog_u64)
+            .transpose()?
+            .unwrap_or(4) as u8;
+        if !matches!(d, 1 | 2 | 3 | 4 | 5) {
+            return Err(format!(
+                "pack: GTPE2_COMMON {cell_name}: illegal {key}={d} (must be 1..=5)"
+            ));
+        }
+        Ok(d)
+    };
+    let fbdiv45 = |key: &str| -> Result<u8, String> {
+        let d = attrs
+            .get(key)
+            .map(parse_verilog_u64)
+            .transpose()?
+            .unwrap_or(5) as u8;
+        if !matches!(d, 4 | 5) {
+            return Err(format!(
+                "pack: GTPE2_COMMON {cell_name}: illegal {key}={d} (must be 4 or 5)"
+            ));
+        }
+        Ok(d)
+    };
+    let refdiv = |key: &str| -> Result<u8, String> {
+        let d = attrs
+            .get(key)
+            .map(parse_verilog_u64)
+            .transpose()?
+            .unwrap_or(1) as u8;
+        if !matches!(d, 1 | 2) {
+            return Err(format!(
+                "pack: GTPE2_COMMON {cell_name}: illegal {key}={d} (must be 1 or 2)"
+            ));
+        }
+        Ok(d)
+    };
+    Ok(PackedGtpCommon {
+        name: cell_name.to_string(),
+        pll0_fbdiv: fbdiv("PLL0_FBDIV")?,
+        pll0_fbdiv_45: fbdiv45("PLL0_FBDIV_45")?,
+        pll0_refclk_div: refdiv("PLL0_REFCLK_DIV")?,
+        pll1_fbdiv: fbdiv("PLL1_FBDIV")?,
+        pll1_fbdiv_45: fbdiv45("PLL1_FBDIV_45")?,
+        pll1_refclk_div: refdiv("PLL1_REFCLK_DIV")?,
+        gtrefclk0_net: pins
+            .net_on(cell_name, "GTREFCLK0")
+            .map(|s| resolve(s).to_string()),
+        gtrefclk1_net: pins
+            .net_on(cell_name, "GTREFCLK1")
+            .map(|s| resolve(s).to_string()),
+        pll0outclk_net: pins
+            .net_on(cell_name, "PLL0OUTCLK")
+            .map(|s| resolve(s).to_string()),
+        pll0outrefclk_net: pins
+            .net_on(cell_name, "PLL0OUTREFCLK")
+            .map(|s| resolve(s).to_string()),
+        pll1outclk_net: pins
+            .net_on(cell_name, "PLL1OUTCLK")
+            .map(|s| resolve(s).to_string()),
+        pll1outrefclk_net: pins
+            .net_on(cell_name, "PLL1OUTREFCLK")
+            .map(|s| resolve(s).to_string()),
+        pll0lock_net: pins
+            .net_on(cell_name, "PLL0LOCK")
+            .map(|s| resolve(s).to_string()),
+        pll1lock_net: pins
+            .net_on(cell_name, "PLL1LOCK")
+            .map(|s| resolve(s).to_string()),
+    })
+}
+
+fn pack_ibufds_gte2(
+    cell_name: &str,
+    pins: &PinIndex,
+    attrs: &Attrs,
+) -> Result<PackedIbufdsGte2, String> {
+    let clkcm_cfg = parse_bool_attr(attrs, "CLKCM_CFG", true)?;
+    let clkrcv_trst = parse_bool_attr(attrs, "CLKRCV_TRST", true)?;
+    let clkswing_cfg = attrs
+        .get("CLKSWING_CFG")
+        .map(parse_verilog_u64)
+        .transpose()?
+        .unwrap_or(0b11) as u8
+        & 0b11;
+    let o_net = pins
+        .net_on(cell_name, "O")
+        .map(|s| resolve(s).to_string())
+        .ok_or_else(|| format!("pack: IBUFDS_GTE2 {cell_name} has no O net"))?;
+    Ok(PackedIbufdsGte2 {
+        name: cell_name.to_string(),
+        clkcm_cfg,
+        clkrcv_trst,
+        clkswing_cfg,
+        i_net: pins.net_on(cell_name, "I").map(|s| resolve(s).to_string()),
+        ib_net: pins.net_on(cell_name, "IB").map(|s| resolve(s).to_string()),
+        ceb_net: pins
+            .net_on(cell_name, "CEB")
+            .map(|s| resolve(s).to_string()),
+        o_net,
+        odiv2_net: pins
+            .net_on(cell_name, "ODIV2")
+            .map(|s| resolve(s).to_string()),
+    })
+}
+
+fn pack_pcie(cell_name: &str, pins: &PinIndex, attrs: &Attrs) -> Result<PackedPcie, String> {
+    let mut bar = [0u32; 6];
+    for (i, slot) in bar.iter_mut().enumerate() {
+        let k = format!("BAR{i}");
+        *slot = attrs
+            .get(&k)
+            .map(parse_verilog_u64)
+            .transpose()?
+            .unwrap_or(0) as u32;
+    }
+    let max_payload_supported = attrs
+        .get("DEV_CAP_MAX_PAYLOAD_SUPPORTED")
+        .map(parse_verilog_u64)
+        .transpose()?
+        .unwrap_or(2) as u8;
+    let max_link_speed = attrs
+        .get("LINK_CAP_MAX_LINK_SPEED")
+        .map(parse_verilog_u64)
+        .transpose()?
+        .unwrap_or(1) as u8;
+    if !matches!(max_link_speed, 1 | 2) {
+        return Err(format!(
+            "pack: PCIE_2_1 {cell_name}: illegal LINK_CAP_MAX_LINK_SPEED={max_link_speed} (must be 1=Gen1 or 2=Gen2)"
+        ));
+    }
+    let max_link_width = attrs
+        .get("LINK_CAP_MAX_LINK_WIDTH")
+        .map(parse_verilog_u64)
+        .transpose()?
+        .unwrap_or(1) as u8;
+    if !matches!(max_link_width, 1 | 2 | 4 | 8) {
+        return Err(format!(
+            "pack: PCIE_2_1 {cell_name}: illegal LINK_CAP_MAX_LINK_WIDTH={max_link_width} (must be 1, 2, 4, or 8)"
+        ));
+    }
+    Ok(PackedPcie {
+        name: cell_name.to_string(),
+        bar,
+        max_payload_supported,
+        max_link_speed,
+        max_link_width,
+        userclk1_net: pins
+            .net_on(cell_name, "USERCLK1")
+            .map(|s| resolve(s).to_string()),
+        userclk2_net: pins
+            .net_on(cell_name, "USERCLK2")
+            .map(|s| resolve(s).to_string()),
+        pipeclk_net: pins
+            .net_on(cell_name, "PIPECLK")
+            .map(|s| resolve(s).to_string()),
+        user_lnk_up_net: pins
+            .net_on(cell_name, "USERLNKUP")
+            .map(|s| resolve(s).to_string()),
+    })
+}
+
+fn pack_xadc(cell_name: &str, pins: &PinIndex, attrs: &Attrs) -> Result<PackedXadc, String> {
+    let mut init_regs = BTreeMap::new();
+    for (k, v) in &attrs.map {
+        let up = k.to_ascii_uppercase();
+        if let Some(hex_idx) = up.strip_prefix("INIT_") {
+            if hex_idx.len() == 2 && hex_idx.chars().all(|c| c.is_ascii_hexdigit()) {
+                let reg = u8::from_str_radix(hex_idx, 16).unwrap_or(0);
+                if !(0x40..=0x5F).contains(&reg) {
+                    return Err(format!(
+                        "pack: XADC {cell_name}: {up} outside legal register range INIT_40..INIT_5F"
+                    ));
+                }
+                let val = parse_verilog_u64(v)? as u16;
+                init_regs.insert(reg, val);
+            }
+        }
+    }
+    Ok(PackedXadc {
+        name: cell_name.to_string(),
+        init_regs,
+        dclk_net: pins
+            .net_on(cell_name, "DCLK")
+            .map(|s| resolve(s).to_string()),
+        den_net: pins.net_on(cell_name, "DEN").map(|s| resolve(s).to_string()),
+        dwe_net: pins.net_on(cell_name, "DWE").map(|s| resolve(s).to_string()),
+        drdy_net: pins
+            .net_on(cell_name, "DRDY")
+            .map(|s| resolve(s).to_string()),
+        busy_net: pins
+            .net_on(cell_name, "BUSY")
+            .map(|s| resolve(s).to_string()),
+        vp_net: pins.net_on(cell_name, "VP").map(|s| resolve(s).to_string()),
+        vn_net: pins.net_on(cell_name, "VN").map(|s| resolve(s).to_string()),
+    })
+}
+
+fn pack_cfg_prim(
+    cell_name: &str,
+    prim: &str,
+    pins: &PinIndex,
+    attrs: &Attrs,
+) -> Result<PackedCfgPrim, String> {
+    let kind = match prim {
+        "BSCANE2" => CfgPrimKind::Bscane2,
+        "ICAPE2" => CfgPrimKind::Icape2,
+        "DNA_PORT" => CfgPrimKind::DnaPort,
+        "FRAME_ECCE2" => CfgPrimKind::FrameEcce2,
+        "STARTUPE2" => CfgPrimKind::Startupe2,
+        "USR_ACCESSE2" => CfgPrimKind::UsrAccesse2,
+        "CAPTUREE2" => CfgPrimKind::Capturee2,
+        _ => return Err(format!("pack: unknown config primitive `{prim}`")),
+    };
+    let jtag_chain = attrs
+        .get("JTAG_CHAIN")
+        .map(parse_verilog_u64)
+        .transpose()?
+        .unwrap_or(1) as u8;
+    if kind == CfgPrimKind::Bscane2 && !(1..=4).contains(&jtag_chain) {
+        return Err(format!(
+            "pack: BSCANE2 {cell_name}: JTAG_CHAIN={jtag_chain} out of range 1..=4"
+        ));
+    }
+    let disable_jtag = parse_bool_attr(attrs, "DISABLE_JTAG", false)?;
+    let icap_width = attrs
+        .get("ICAP_WIDTH")
+        .unwrap_or("X32")
+        .trim()
+        .to_ascii_uppercase();
+    if kind == CfgPrimKind::Icape2 && !matches!(icap_width.as_str(), "X8" | "X16" | "X32") {
+        return Err(format!(
+            "pack: ICAPE2 {cell_name}: invalid ICAP_WIDTH `{icap_width}` (must be X8, X16, or X32)"
+        ));
+    }
+    let device_id = attrs
+        .get("DEVICE_ID")
+        .map(parse_verilog_u64)
+        .transpose()?
+        .unwrap_or(0x0362_D093) as u32;
+    let sim_dna_value = attrs
+        .get("SIM_DNA_VALUE")
+        .map(parse_verilog_u64)
+        .transpose()?
+        .unwrap_or(0)
+        & ((1u64 << 57) - 1);
+    let farsrc = attrs
+        .get("FARSRC")
+        .unwrap_or("EFAR")
+        .trim()
+        .to_ascii_uppercase();
+    if kind == CfgPrimKind::FrameEcce2 && !matches!(farsrc.as_str(), "EFAR" | "FAR") {
+        return Err(format!(
+            "pack: FRAME_ECCE2 {cell_name}: invalid FARSRC `{farsrc}` (must be EFAR or FAR)"
+        ));
+    }
+    let prog_usr = parse_bool_attr(attrs, "PROG_USR", false)?;
+    let oneshot = parse_bool_attr(attrs, "ONESHOT", true)?;
+    Ok(PackedCfgPrim {
+        name: cell_name.to_string(),
+        kind,
+        jtag_chain,
+        disable_jtag,
+        icap_width,
+        device_id,
+        sim_dna_value,
+        farsrc,
+        prog_usr,
+        oneshot,
+        clk_net: pins
+            .net_on(cell_name, "CLK")
+            .or_else(|| pins.net_on(cell_name, "TCK"))
+            .map(|s| resolve(s).to_string()),
+        out_net: pins
+            .net_on(cell_name, "DOUT")
+            .or_else(|| pins.net_on(cell_name, "TDI"))
+            .or_else(|| pins.net_on(cell_name, "CFGMCLK"))
+            .or_else(|| pins.net_on(cell_name, "CRCERROR"))
+            .or_else(|| pins.net_on(cell_name, "DATAVALID"))
+            .map(|s| resolve(s).to_string()),
+    })
 }
 
 fn parse_verilog_u64(raw: &str) -> Result<u64, String> {
