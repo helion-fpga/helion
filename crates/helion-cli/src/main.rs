@@ -1,3 +1,5 @@
+mod batch_dashboard;
+
 use helion_bits::{Bitstream, bitgen, bitgen_pblock, eco_lut, readback_lut_init};
 use helion_device::Device;
 use helion_drc::check_routed;
@@ -30,6 +32,72 @@ struct Compiled {
     timing: TimingResult,
 }
 
+pub(crate) fn sweep_parallel_iob_identity_luts(d: &mut Design) {
+    use helion_ir::{CellKind, Spur, intern};
+    let pin_i = intern("I");
+    let pin_pad = intern("PAD");
+    let pin_o = intern("O");
+    let pin_i0 = intern("I0");
+    let other_ipins = [
+        intern("I1"),
+        intern("I2"),
+        intern("I3"),
+        intern("I4"),
+        intern("I5"),
+    ];
+    let iob_pairs: std::collections::HashSet<(Spur, Spur)> = d
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::IobOut))
+        .filter_map(|c| {
+            let i_net = d.net_on(c.name, pin_i)?;
+            let pad_net = d.net_on(c.name, pin_pad)?;
+            (i_net != pad_net).then_some((i_net, pad_net))
+        })
+        .collect();
+    if iob_pairs.is_empty() {
+        return;
+    }
+    let mut drop_cells: std::collections::HashSet<Spur> = std::collections::HashSet::new();
+    for c in &d.cells {
+        let CellKind::Lut6 {
+            init: 0xaaaa_aaaa_aaaa_aaaa,
+        } = c.kind
+        else {
+            continue;
+        };
+        if other_ipins.iter().any(|&p| d.net_on(c.name, p).is_some()) {
+            continue;
+        }
+        let Some(i0_net) = d.net_on(c.name, pin_i0) else {
+            continue;
+        };
+        let Some(o_net) = d.net_on(c.name, pin_o) else {
+            continue;
+        };
+        if iob_pairs.contains(&(i0_net, o_net)) {
+            let has_load = d
+                .net(resolve(o_net))
+                .map(|n| {
+                    n.endpoints
+                        .iter()
+                        .any(|ep| ep.pin != pin_o && ep.pin != pin_pad)
+                })
+                .unwrap_or(false);
+            if !has_load {
+                drop_cells.insert(c.name);
+            }
+        }
+    }
+    if !drop_cells.is_empty() {
+        d.cells.retain(|c| !drop_cells.contains(&c.name));
+        for n in &mut d.nets {
+            n.endpoints.retain(|ep| !drop_cells.contains(&ep.cell));
+        }
+        d.rebuild_indexes();
+    }
+}
+
 fn synth_any(path: &str) -> Result<helion_ir::Design, String> {
     let p = Path::new(path);
     let ext = p
@@ -37,7 +105,7 @@ fn synth_any(path: &str) -> Result<helion_ir::Design, String> {
         .and_then(|e| e.to_str())
         .unwrap_or("sv")
         .to_ascii_lowercase();
-    match ext.as_str() {
+    let mut d = match ext.as_str() {
         "prj" => {
             let text = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
             let mut prj = load_prj(&text)?;
@@ -57,7 +125,9 @@ fn synth_any(path: &str) -> Result<helion_ir::Design, String> {
         "vhd" | "vhdl" => synth_vhdl_path(p),
         "c" | "cc" | "cpp" => synth_c_path(p),
         _ => synth_sv_path(p),
-    }
+    }?;
+    sweep_parallel_iob_identity_luts(&mut d);
+    Ok(d)
 }
 
 fn compile_sv(path: &str, part: &str, timing_weight: f64) -> Result<Compiled, String> {
@@ -248,12 +318,15 @@ fn synth_project_sources(
             .iter()
             .map(|(a, b)| (a.as_str(), b.as_str()))
             .collect();
-        let (d, _) =
+        let (mut d, _) =
             elaborate_sv_sources(&refs, Some(t), &Default::default(), &Default::default())?;
+        sweep_parallel_iob_identity_luts(&mut d);
         Ok(d)
     } else {
         let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
-        synth_sv_files(&refs)
+        let mut d = synth_sv_files(&refs)?;
+        sweep_parallel_iob_identity_luts(&mut d);
+        Ok(d)
     }
 }
 
@@ -262,7 +335,24 @@ fn main() {
     if args.is_empty() {
         args.push("--help".into());
     }
-    let cmd = args.remove(0);
+    if batch_dashboard::VivadoCliOpts::should_intercept(&args) {
+        batch_dashboard::run_vivado_cli_or_dashboard(&args, cmd_gui);
+        return;
+    }
+    let cmd = if args
+        .first()
+        .map(|s| {
+            s == "--part"
+                || s == "--top"
+                || s.ends_with(".sv")
+                || s.ends_with(".v")
+        })
+        .unwrap_or(false)
+    {
+        "synth".to_string()
+    } else {
+        args.remove(0)
+    };
     match cmd.as_str() {
         "--version" | "-V" | "version" => {
             println!("helion {}", env!("CARGO_PKG_VERSION"));
@@ -285,6 +375,9 @@ fn main() {
         "project" => cmd_project(&args),
         "ip" => cmd_ip(&args),
         "hnf" => cmd_hnf(&args),
+        "batch" | "tcl" | "dashboard" | "export_dashboard" => {
+            batch_dashboard::run_vivado_cli_or_dashboard(&args, cmd_gui)
+        }
         "--help" | "-h" | "help" => usage(),
         other => {
             eprintln!("unknown command {other}");
@@ -321,7 +414,8 @@ fn usage() {
   helion ip list|show <file.helion>|pack <name>
   helion hnf <file.sv> [-o out.hnf]
   helion hw list|detect
-  helion hw program|flash --cable auto|sim|usb|ofl|native [--bitstream FILE.hbits] [--part P]",
+  helion hw program|flash --cable auto|sim|usb|ofl|native [--bitstream FILE.hbits] [--part P]
+  helion -mode batch|tcl|gui [-source <script.tcl>] [-tclargs ...] [-log <file>] [-journal <file>] [-nojournal] [-notrace] [--export-dashboard <dir>]",
         v = env!("CARGO_PKG_VERSION")
     );
 }
@@ -370,6 +464,7 @@ fn cmd_synth(args: &[String]) {
     let files = positionals(args);
     let path = files.first().copied().unwrap_or("examples/blinky.sv");
     let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let top = take_flag(args, "--top");
     let verify = args.iter().any(|a| a == "--verify");
     // --verify: run SAT-based pre/post optimization equivalence checking.
     // Sets HELION_PRESERVE_PRE_OPT so synth preserves the pre-opt Design,
@@ -379,8 +474,12 @@ fn cmd_synth(args: &[String]) {
         unsafe { std::env::set_var("HELION_PRESERVE_PRE_OPT", "1") };
     }
     // Multi-file SoC support: if multiple .sv/.v files given, synthesize them together.
-    let d = if files.len() > 1 {
-        let paths: Vec<std::path::PathBuf> = files.iter().map(std::path::PathBuf::from).collect();
+    let d = if files.len() > 1 || top.is_some() {
+        let paths: Vec<std::path::PathBuf> = if files.is_empty() {
+            vec![std::path::PathBuf::from(path)]
+        } else {
+            files.iter().map(std::path::PathBuf::from).collect()
+        };
         // All must be SV/Verilog for multi-file; otherwise fall back to single-file error.
         let all_sv = paths.iter().all(|p| {
             matches!(
@@ -388,12 +487,11 @@ fn cmd_synth(args: &[String]) {
                 "sv" | "v"
             )
         });
-        if !all_sv {
+        if !all_sv && paths.len() > 1 {
             eprintln!("synth: multi-file only supports .sv/.v files");
             std::process::exit(1);
         }
-        let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
-        helion_sv::synth_sv_files(&refs).unwrap_or_else(|e| {
+        synth_project_sources(&paths, top.as_deref()).unwrap_or_else(|e| {
             eprintln!("synth: {e}");
             std::process::exit(1);
         })
@@ -514,6 +612,7 @@ fn cmd_impl(args: &[String]) {
         c.routed.iob_src.first().map(|r| r.hops).unwrap_or(0),
         c.bits.frames.len()
     );
+    maybe_export_dashboard(path, &c, args);
 }
 
 fn cmd_run(args: &[String]) {
@@ -700,6 +799,7 @@ fn cmd_reports(args: &[String]) {
         resolve(c.design.name),
         c.bits.packets.len()
     );
+    maybe_export_dashboard(path, &c, args);
 }
 
 fn cmd_bits(args: &[String]) {
@@ -793,6 +893,51 @@ fn cmd_qor(args: &[String]) {
         c.bits.packets.len(),
         elapsed_ms
     );
+    maybe_export_dashboard(path, &c, args);
+}
+
+fn maybe_export_dashboard(path: &str, c: &Compiled, args: &[String]) {
+    let Some(dir) = take_flag(args, "--export-dashboard")
+        .or_else(|| take_flag(args, "-export-dashboard"))
+    else {
+        return;
+    };
+    let drc = check_routed(&c.design, &c.routed, &c.dev);
+    let pwr = power_of(c);
+    let snap = batch_dashboard::DashboardSnapshot {
+        design_name: resolve(c.design.name).to_string(),
+        requested_part: c.dev.part.clone(),
+        dev: c.dev.clone(),
+        sources: vec![path.to_string()],
+        design: c.design.clone(),
+        routed: c.routed.clone(),
+        drc,
+        timing: c.timing.clone(),
+        power: pwr,
+        bits: c.bits.clone(),
+        xdc: Constraints::default(),
+        synth_ms: 0,
+        pack_ms: 0,
+        place_ms: 0,
+        route_ms: 0,
+        sta_ms: 0,
+        bitgen_ms: 0,
+        total_ms: 0,
+    };
+    match batch_dashboard::export_dashboard_to_dir(&snap, Path::new(&dir)) {
+        Ok((jpath, hpath)) => {
+            println!(
+                "export_dashboard {} json={} html={}",
+                snap.design_name,
+                jpath.display(),
+                hpath.display()
+            );
+        }
+        Err(e) => {
+            eprintln!("export-dashboard: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn cmd_hnf(args: &[String]) {
@@ -1086,10 +1231,21 @@ fn cmd_project_checkpoint_eco(args: &[String]) {
         std::process::exit(1);
     });
     let hash_before = session.blinky_hash().unwrap_or(0);
-    session.eco(&dev, &cell, new_init).unwrap_or_else(|e| {
-        eprintln!("eco: {e}");
-        std::process::exit(1);
-    });
+    session
+        .eco(&dev, &cell, new_init)
+        .or_else(|e| {
+            if let Some(rest) = cell.strip_prefix("u_lut") {
+                session
+                    .eco(&dev, &format!("u_luts{rest}"), new_init)
+                    .map_err(|_| e)
+            } else {
+                Err(e)
+            }
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("eco: {e}");
+            std::process::exit(1);
+        });
     session.write_bitstream(&dev).unwrap_or_else(|e| {
         eprintln!("write_bitstream: {e}");
         std::process::exit(1);
