@@ -3,6 +3,12 @@
 mod opt;
 
 pub use opt::LutOptStats;
+pub mod datapath_extract;
+pub use datapath_extract::{
+    extract_carry4_chains_from_luts, pack_muxf7_muxf8_trees, share_resource_muxed_alu,
+    AluShareStats, CarryExtractStats, MuxPackStats, FA_CARRY_INIT, FA_SUM_INIT, MUX2_INIT,
+    SUB_CARRY_INIT, XNOR2_INIT, XOR2_INIT,
+};
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
