@@ -749,6 +749,310 @@ pub fn route_with_guide(
     })
 }
 
+/// Count the number of 90-degree turns (vias / switchbox direction changes) along a tile path.
+pub fn count_path_vias(path: &[(u32, u32)]) -> u32 {
+    if path.len() < 3 {
+        return 0;
+    }
+    let mut vias = 0u32;
+    for w in path.windows(3) {
+        let dx1 = w[1].0 as i32 - w[0].0 as i32;
+        let dy1 = w[1].1 as i32 - w[0].1 as i32;
+        let dx2 = w[2].0 as i32 - w[1].0 as i32;
+        let dy2 = w[2].1 as i32 - w[1].1 as i32;
+        if (dx1, dy1) != (dx2, dy2) {
+            vias += 1;
+        }
+    }
+    vias
+}
+
+fn recompute_congestion(routed: &mut Routed) {
+    let cols = routed.congestion_cols;
+    let rows = routed.congestion_rows;
+    let len = (cols as usize).saturating_mul(rows as usize);
+    routed.congestion = vec![0u32; len];
+    if cols == 0 || rows == 0 {
+        routed.overused = 0;
+        return;
+    }
+    let grid = TileGrid {
+        x0: routed.congestion_x0,
+        y0: routed.congestion_y0,
+        cols,
+        rows,
+    };
+    for r in &routed.iob_src {
+        for &(tx, ty) in &r.path {
+            if (tx, ty) == r.clb || (tx, ty) == r.iob {
+                continue;
+            }
+            if let Some(ti) = grid.index(tx, ty) {
+                routed.congestion[ti] = routed.congestion[ti].saturating_add(1);
+            }
+        }
+    }
+    routed.overused = routed.congestion.iter().filter(|&&c| c > 1).count() as u32;
+}
+
+/// Vivado UG904 post-route `phys_opt_design -hold_fix`: insert legal uncongested tile
+/// dogleg detours on short paths whose delay is below `min_delay_ps` so hold slack closes
+/// without creating routing congestion conflicts.
+/// Returns the updated [`Routed`] and the number of nets that received hold-fix detours.
+pub fn phys_opt_route_hold_fix(
+    routed: &Routed,
+    dev: &Device,
+    min_delay_ps: i64,
+) -> Result<(Routed, usize), String> {
+    let mut out = routed.clone();
+    if min_delay_ps <= 0 || out.iob_src.is_empty() {
+        return Ok((out, 0));
+    }
+    let grid = TileGrid::from_device(dev);
+    let mut fixed = 0usize;
+    for ri in 0..out.iob_src.len() {
+        if out.iob_src[ri].delay_ps >= min_delay_ps {
+            continue;
+        }
+        let mut changed = false;
+        // Insert 2-hop orthogonal dogleg detours along adjacent uncongested tiles until
+        // delay_ps >= min_delay_ps or no further uncongested dogleg exists.
+        while out.iob_src[ri].delay_ps < min_delay_ps {
+            let path = &out.iob_src[ri].path;
+            let mut inserted = None;
+            for idx in 0..path.len().saturating_sub(1) {
+                let a = path[idx];
+                let b = path[idx + 1];
+                let dx = b.0 as i32 - a.0 as i32;
+                let dy = b.1 as i32 - a.1 as i32;
+                // Orthogonal side offsets perpendicular to step (a -> b).
+                let perp: [(i32, i32); 2] = if dx == 0 && dy.abs() == 1 {
+                    [(1, 0), (-1, 0)]
+                } else if dy == 0 && dx.abs() == 1 {
+                    [(0, 1), (0, -1)]
+                } else {
+                    continue;
+                };
+                for (ox, oy) in perp {
+                    let ax = a.0 as i32 + ox;
+                    let ay = a.1 as i32 + oy;
+                    let bx = b.0 as i32 + ox;
+                    let by = b.1 as i32 + oy;
+                    if ax < 0 || ay < 0 || bx < 0 || by < 0 {
+                        continue;
+                    }
+                    let pa = (ax as u32, ay as u32);
+                    let pb = (bx as u32, by as u32);
+                    if !on_grid(dev, pa.0, pa.1) || !on_grid(dev, pb.0, pb.1) {
+                        continue;
+                    }
+                    if path.contains(&pa) || path.contains(&pb) {
+                        continue;
+                    }
+                    let Some(tia) = grid.index(pa.0, pa.1) else {
+                        continue;
+                    };
+                    let Some(tib) = grid.index(pb.0, pb.1) else {
+                        continue;
+                    };
+                    let free_a = out.congestion.get(tia).copied().unwrap_or(0) == 0;
+                    let free_b = out.congestion.get(tib).copied().unwrap_or(0) == 0;
+                    if free_a && free_b {
+                        inserted = Some((idx + 1, pa, pb, tia, tib));
+                        break;
+                    }
+                }
+                if inserted.is_some() {
+                    break;
+                }
+            }
+            if let Some((ins_at, pa, pb, tia, tib)) = inserted {
+                let extra_pad = out.iob_src[ri]
+                    .hops
+                    .saturating_sub(out.iob_src[ri].path.len().saturating_sub(1) as u32);
+                out.iob_src[ri].path.insert(ins_at, pb);
+                out.iob_src[ri].path.insert(ins_at, pa);
+                if let Some(c) = out.congestion.get_mut(tia) {
+                    *c = c.saturating_add(1);
+                }
+                if let Some(c) = out.congestion.get_mut(tib) {
+                    *c = c.saturating_add(1);
+                }
+                let new_hops =
+                    out.iob_src[ri].path.len().saturating_sub(1) as u32 + extra_pad;
+                out.iob_src[ri].hops = new_hops;
+                out.iob_src[ri].delay_ps = new_hops as i64 * HOP_DELAY_PS;
+                changed = true;
+            } else {
+                break;
+            }
+        }
+        if changed {
+            fixed += 1;
+        }
+    }
+    if fixed > 0 {
+        recompute_congestion(&mut out);
+    }
+    Ok((out, fixed))
+}
+
+/// Summary metrics from post-route physical optimization ([`phys_opt_route_with_stats`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PhysOptRouteStats {
+    pub shortened_nets: usize,
+    pub hops_before: u32,
+    pub hops_after: u32,
+    pub vias_before: u32,
+    pub vias_after: u32,
+}
+
+/// Vivado UG904 post-route `phys_opt_design`: rip-up and shortcut non-critical detours
+/// and excess switchbox turns (vias) without increasing tile congestion.
+pub fn phys_opt_route(routed: &Routed, dev: &Device) -> Result<Routed, String> {
+    Ok(phys_opt_route_with_stats(routed, dev)?.0)
+}
+
+/// Run post-route wirelength/via minimization and return both [`Routed`] and [`PhysOptRouteStats`].
+pub fn phys_opt_route_with_stats(
+    routed: &Routed,
+    dev: &Device,
+) -> Result<(Routed, PhysOptRouteStats), String> {
+    let mut out = routed.clone();
+    let hops_before: u32 = out.iob_src.iter().map(|r| r.hops).sum();
+    let vias_before: u32 = out.iob_src.iter().map(|r| count_path_vias(&r.path)).sum();
+    if out.iob_src.is_empty() {
+        return Ok((
+            out,
+            PhysOptRouteStats {
+                shortened_nets: 0,
+                hops_before,
+                hops_after: hops_before,
+                vias_before,
+                vias_after: vias_before,
+            },
+        ));
+    }
+    let grid = TileGrid::from_device(dev);
+    let hist = vec![0u32; grid.len()];
+    let mut scratch = AstarScratch::new(grid.len());
+    let mut shortened_nets = 0usize;
+
+    for ri in 0..out.iob_src.len() {
+        let src = out.iob_src[ri].clb;
+        let dst = out.iob_src[ri].iob;
+        let old_path = &out.iob_src[ri].path;
+        let old_tile_hops = old_path.len().saturating_sub(1) as u32;
+        let extra_pad = out.iob_src[ri].hops.saturating_sub(old_tile_hops);
+        let old_vias = count_path_vias(old_path);
+
+        // Temporarily rip up this net's intermediate tiles from congestion.
+        let mut pres = out.congestion.clone();
+        for &(tx, ty) in old_path {
+            if (tx, ty) == src || (tx, ty) == dst {
+                continue;
+            }
+            if let Some(ti) = grid.index(tx, ty) {
+                pres[ti] = pres[ti].saturating_sub(1);
+            }
+        }
+
+        // Try L-shaped 1-via paths first (horizontal-then-vertical and vertical-then-horizontal)
+        // if they are 100% uncongested and on-grid, else fall back to zero-detour A*.
+        let build_l_path = |hv: bool| -> Option<Vec<(u32, u32)>> {
+            let mut p = Vec::new();
+            let (mut x, mut y) = src;
+            p.push((x, y));
+            if hv {
+                while x != dst.0 {
+                    x = if x < dst.0 { x + 1 } else { x - 1 };
+                    if !on_grid(dev, x, y) {
+                        return None;
+                    }
+                    p.push((x, y));
+                }
+                while y != dst.1 {
+                    y = if y < dst.1 { y + 1 } else { y - 1 };
+                    if !on_grid(dev, x, y) {
+                        return None;
+                    }
+                    p.push((x, y));
+                }
+            } else {
+                while y != dst.1 {
+                    y = if y < dst.1 { y + 1 } else { y - 1 };
+                    if !on_grid(dev, x, y) {
+                        return None;
+                    }
+                    p.push((x, y));
+                }
+                while x != dst.0 {
+                    x = if x < dst.0 { x + 1 } else { x - 1 };
+                    if !on_grid(dev, x, y) {
+                        return None;
+                    }
+                    p.push((x, y));
+                }
+            }
+            for &(tx, ty) in &p {
+                if (tx, ty) == src || (tx, ty) == dst {
+                    continue;
+                }
+                let ti = grid.index(tx, ty)?;
+                if pres.get(ti).copied().unwrap_or(0) > 0 {
+                    return None;
+                }
+            }
+            Some(p)
+        };
+
+        let cand = build_l_path(false)
+            .or_else(|| build_l_path(true))
+            .or_else(|| {
+                astar(dev, &grid, &mut scratch, src, dst, &hist, &pres, 16, 0)
+                    .ok()
+                    .filter(|p| {
+                        p.iter().all(|&(tx, ty)| {
+                            (tx, ty) == src
+                                || (tx, ty) == dst
+                                || grid
+                                    .index(tx, ty)
+                                    .and_then(|ti| pres.get(ti))
+                                    .copied()
+                                    .unwrap_or(0)
+                                    == 0
+                        })
+                    })
+            });
+
+        if let Some(new_path) = cand {
+            let new_tile_hops = new_path.len().saturating_sub(1) as u32;
+            let new_vias = count_path_vias(&new_path);
+            if (new_tile_hops, new_vias) < (old_tile_hops, old_vias) {
+                let new_hops = new_tile_hops + extra_pad;
+                out.iob_src[ri].path = new_path;
+                out.iob_src[ri].hops = new_hops;
+                out.iob_src[ri].delay_ps = new_hops as i64 * HOP_DELAY_PS;
+                shortened_nets += 1;
+                recompute_congestion(&mut out);
+            }
+        }
+    }
+
+    let hops_after: u32 = out.iob_src.iter().map(|r| r.hops).sum();
+    let vias_after: u32 = out.iob_src.iter().map(|r| count_path_vias(&r.path)).sum();
+    Ok((
+        out,
+        PhysOptRouteStats {
+            shortened_nets,
+            hops_before,
+            hops_after,
+            vias_before,
+            vias_after,
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -967,6 +1271,7 @@ mod tests {
         let gfp = TimingGuide {
             false_path_iob: true,
             iob_setup_mult: 1,
+            ..Default::default()
         };
         let pl0 = place_with_guide(&p, &dev, opts, &g0).unwrap();
         let plfp = place_with_guide(&p, &dev, opts, &gfp).unwrap();
@@ -1008,6 +1313,7 @@ mod tests {
         let gm = TimingGuide {
             false_path_iob: false,
             iob_setup_mult: 2,
+            ..Default::default()
         };
         let pl0 = place_with_guide(&p, &dev, opts, &g0).unwrap();
         let plm = place_with_guide(&p, &dev, opts, &gm).unwrap();
@@ -1031,6 +1337,7 @@ mod tests {
         let gfp = TimingGuide {
             false_path_iob: true,
             iob_setup_mult: 2,
+            ..Default::default()
         };
         let rfp = route_with_guide(
             &place_with_guide(&p, &dev, opts, &gfp).unwrap(),
@@ -1112,5 +1419,51 @@ mod tests {
             r.iob_src[0].path.len().saturating_sub(1) as u32,
             r.iob_src[0].hops
         );
+    }
+
+    #[test]
+    fn phys_opt_route_hold_fix_inserts_real_tile_detours_and_phys_opt_route_reclaims_them() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_blinky(), &dev).unwrap();
+        let pl = place_with(
+            &p,
+            &dev,
+            PlaceOpts {
+                timing_weight: 0.75,
+                seed: 0,
+            },
+        )
+        .unwrap();
+        let base = route(&pl, &dev).unwrap();
+        let base_delay = base.iob_src[0].delay_ps;
+        let target_delay = base_delay + 4 * HOP_DELAY_PS;
+        let (hold_fixed, fixed_count) =
+            phys_opt_route_hold_fix(&base, &dev, target_delay).unwrap();
+        assert_eq!(fixed_count, 1);
+        assert!(
+            hold_fixed.iob_src[0].delay_ps >= target_delay,
+            "hold fix must raise delay to >= {target_delay}ps, got {}ps",
+            hold_fixed.iob_src[0].delay_ps
+        );
+        assert_eq!(
+            hold_fixed.iob_src[0].path.len().saturating_sub(1) as u32,
+            hold_fixed.iob_src[0].hops,
+            "hold-fix hops must be contiguous tile steps"
+        );
+        for w in hold_fixed.iob_src[0].path.windows(2) {
+            assert_eq!(
+                manhattan(w[0], w[1]),
+                1,
+                "every step in hold-fixed path must be a unit Manhattan neighbor"
+            );
+        }
+        assert_eq!(hold_fixed.overused, 0);
+
+        // Post-route wirelength/via minimization reclaims unnecessary detours back to shortest path.
+        let (reclaimed, stats) = phys_opt_route_with_stats(&hold_fixed, &dev).unwrap();
+        assert_eq!(stats.shortened_nets, 1);
+        assert!(stats.hops_after < stats.hops_before);
+        assert!(stats.vias_after < stats.vias_before);
+        assert_eq!(reclaimed.iob_src[0].hops, base.iob_src[0].hops);
     }
 }
