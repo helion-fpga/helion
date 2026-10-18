@@ -13,6 +13,7 @@
 pub mod ap_math_stream;
 pub mod cosim;
 pub mod emit;
+pub mod flopoco_fp;
 pub mod parser;
 pub mod pragma;
 pub mod schedule;
@@ -30,6 +31,11 @@ pub use cosim::{
     run_cosim_verification,
 };
 pub use emit::{generate_hls_report, resolve_interfaces, HlsSynthesisReport, InterfacePort};
+pub use flopoco_fp::{
+    FpEvalOutput, FpExceptionFlags, FpFormat, FpOpKind, FpOperatorHwResult, FpOperatorSpec,
+    Posit16Quire, decode_posit16_2, encode_posit16_2, eval_fp_operator, eval_fp_operator_bits,
+    generate_fp_operator, generate_fp_operator_sv,
+};
 pub use parser::{
     tokenize, BinOp, CArg, CExpr, CFunction, CStmt, CType, CVar, LValue, Parser, Tok,
     TranslationUnit, UnaryOp,
@@ -1052,5 +1058,93 @@ int conv1d_csr(int *in_ptr, int *out_ptr, int coeff, int bias) {
         assert!(c_header.contains("#define XCONV1D_CSR_CONTROL_ADDR_BIAS_DATA"));
         assert!(c_header.contains("Xconv1d_csr_Start"));
         assert!(c_header.contains("Xconv1d_csr_IsDone"));
+    }
+
+    #[test]
+    fn flopoco_fp16_bf16_fp32_fp64_rne_and_lzc_flags() {
+        // 1. FP16 (E5M10) encode/decode and FAdd / FSub with LZC normalization shift
+        let fmt16 = FpFormat::Fp16;
+        let a16 = fmt16.encode_f64(1.5);
+        let b16 = fmt16.encode_f64(1.4375); // 1.5 - 1.4375 = 0.0625 (2^-4 -> LZC shift = 4)
+        let sub_spec = FpOperatorSpec::new(FpOpKind::FSub, FpFormat::Fp16, 4);
+        let out_sub = eval_fp_operator_bits(&sub_spec, a16, b16, 0);
+        assert_eq!(fmt16.decode_f64(out_sub.result_bits), 0.0625);
+        assert_eq!(out_sub.flags.lzc_shift, 4, "1.5 - 1.4375 = 2^-4 requires LZC shift of 4");
+
+        // 2. BF16 (E8M7) and Custom (E6M10) RNE round-trip
+        let bf = FpFormat::Bf16;
+        let bf_bits = bf.encode_f64(-3.25);
+        assert_eq!(bf.decode_f64(bf_bits), -3.25);
+        let custom = FpFormat::Custom {
+            exp_bits: 6,
+            frac_bits: 10,
+        };
+        assert_eq!(custom.decode_f64(custom.encode_f64(6.5)), 6.5);
+
+        // 3. Single-rounding FFma (`A * B + C`), FDiv (`div_by_zero`), FSqrt (`invalid_op`), F2I, I2F
+        let fma_spec = FpOperatorSpec::new(FpOpKind::FFma, FpFormat::Fp32, 5);
+        let a32 = FpFormat::Fp32.encode_f64(2.5);
+        let b32 = FpFormat::Fp32.encode_f64(4.0);
+        let c32 = FpFormat::Fp32.encode_f64(1.25);
+        let fma_out = eval_fp_operator(&fma_spec, a32, b32, c32);
+        assert_eq!(FpFormat::Fp32.decode_f64(fma_out.result_bits), 11.25);
+
+        let div_spec = FpOperatorSpec::new(FpOpKind::FDiv, FpFormat::Fp32, 8);
+        let zero32 = FpFormat::Fp32.encode_f64(0.0);
+        let div_zero = eval_fp_operator_bits(&div_spec, a32, zero32, 0);
+        assert!(div_zero.flags.div_by_zero);
+        assert!(div_zero.flags.is_inf);
+
+        let sqrt_spec = FpOperatorSpec::new(FpOpKind::FSqrt, FpFormat::Fp64, 10);
+        let neg64 = FpFormat::Fp64.encode_f64(-9.0);
+        let sqrt_neg = eval_fp_operator_bits(&sqrt_spec, neg64, 0, 0);
+        assert!(sqrt_neg.flags.invalid_op);
+        assert!(sqrt_neg.flags.is_nan);
+
+        let i2f_spec = FpOperatorSpec::new(FpOpKind::I2F, FpFormat::Fp32, 2);
+        let f2i_spec = FpOperatorSpec::new(FpOpKind::F2I, FpFormat::Fp32, 2);
+        let enc42 = eval_fp_operator_bits(&i2f_spec, (-42i64) as u64, 0, 0);
+        assert_eq!(FpFormat::Fp32.decode_f64(enc42.result_bits), -42.0);
+        let dec42 = eval_fp_operator_bits(&f2i_spec, enc42.result_bits, 0, 0);
+        assert_eq!(dec42.result_bits as i64, -42);
+    }
+
+    #[test]
+    fn flopoco_posit16_2_and_exact_quire_dot_product() {
+        // Posit(16, 2) regime/exponent/fraction round-trip
+        for &v in &[0.0, 1.0, -1.0, 2.5, -0.125, 16.0, -256.0, 0.0625] {
+            let p = encode_posit16_2(v);
+            let d = decode_posit16_2(p);
+            assert!((d - v).abs() < 1e-6, "Posit(16,2) round-trip mismatch for {v}: got {d}");
+        }
+        assert_eq!(encode_posit16_2(f64::NAN), 0x8000);
+        assert!(decode_posit16_2(0x8000).is_nan());
+
+        // Exact Quire cancels out +1024*1024 and -1024*1024 while preserving 0.0625*0.5 = 0.03125
+        let mut quire = Posit16Quire::new();
+        quire.fdp_accumulate(encode_posit16_2(1024.0), encode_posit16_2(1024.0));
+        quire.fdp_accumulate(encode_posit16_2(0.0625), encode_posit16_2(0.5));
+        quire.fdp_accumulate(encode_posit16_2(-1024.0), encode_posit16_2(1024.0));
+        let res_posit = quire.to_posit16_2();
+        assert_eq!(decode_posit16_2(res_posit), 0.03125);
+    }
+
+    #[test]
+    fn flopoco_pipelined_operator_sv_and_dsp48_synthesis() {
+        let fmul16 = FpOperatorSpec::new(FpOpKind::FMul, FpFormat::Fp16, 3);
+        let fma32 = FpOperatorSpec::new(FpOpKind::FFma, FpFormat::Fp32, 6);
+        let fmul64 = FpOperatorSpec::new(FpOpKind::FMul, FpFormat::Fp64, 8);
+
+        let hw16 = generate_fp_operator_sv(&fmul16).expect("synth fp16 mul");
+        let hw32 = generate_fp_operator(&fma32).expect("synth fp32 fma");
+        let hw64 = generate_fp_operator_sv(&fmul64).expect("synth fp64 mul");
+
+        assert_eq!(hw16.latency_stages, 3);
+        assert_eq!(hw16.dsp48_count, 1);
+        assert_eq!(hw32.latency_stages, 6);
+        assert_eq!(hw32.dsp48_count, 2);
+        assert!(hw32.sv.contains("input logic [15:0] op_c"));
+        assert_eq!(hw64.latency_stages, 8);
+        assert_eq!(hw64.dsp48_count, 4);
     }
 }
