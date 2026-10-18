@@ -5071,58 +5071,90 @@ fn parse_bits_width<'a>(p: &mut P<'a>) -> Result<u128, String> {
         .ok_or_else(|| format!("$bits unknown {name}"))
 }
 
-fn const_atom<'a>(p: &mut P<'a>) -> Result<u128, String> {
+fn const_atom_with_width<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
     // Unary `(-3)+W` / `(-1)+W` are elaboration consts, not a dropped always.
     if p.eat_sym('+') {
-        return const_atom(p);
+        return const_atom_with_width(p);
     }
     if p.eat_sym('-') {
-        let n = const_atom(p)?;
-        return Ok(0u128.wrapping_sub(n));
+        let (n, w) = const_atom_with_width(p)?;
+        return Ok((0u128.wrapping_sub(n), w));
     }
     // Unary reduction operators: `|x` (OR-reduce), `&x` (AND-reduce), `^x` (XOR-reduce).
     // These are common in generate conditions like `if (|WITH_CSR)`.
     if p.eat_sym('|') {
-        let n = const_atom(p)?;
-        return Ok(if n != 0 { 1 } else { 0 });
+        let (n, w) = const_atom_with_width(p)?;
+        let mask = if w == 0 || w >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << w) - 1
+        };
+        return Ok((if (n & mask) != 0 { 1 } else { 0 }, 1));
     }
     if p.eat_sym('&') {
-        let n = const_atom(p)?;
-        // AND-reduce: 1 if all bits are 1. For u128, check if n == MAX.
-        // For parameters, this is typically used with single-bit values.
-        return Ok(if n == u128::MAX { 1 } else { 0 });
+        let (n, w) = const_atom_with_width(p)?;
+        let eff_w = if w == 0 {
+            (u128::BITS - n.leading_zeros()).max(1) as usize
+        } else {
+            w
+        };
+        let mask = if eff_w >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << eff_w) - 1
+        };
+        return Ok((if (n & mask) == mask { 1 } else { 0 }, 1));
     }
     if p.eat_sym('^') {
-        let n = const_atom(p)?;
+        let (n, w) = const_atom_with_width(p)?;
+        let mask = if w == 0 || w >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << w) - 1
+        };
         // XOR-reduce: parity (1 if odd number of 1 bits).
-        return Ok((n.count_ones() % 2) as u128);
+        return Ok((((n & mask).count_ones() % 2) as u128, 1));
     }
     // Unary logical NOT `!x`
     if p.eat_sym('!') {
-        let n = const_atom(p)?;
-        return Ok(if n == 0 { 1 } else { 0 });
+        let (n, _) = const_atom_with_width(p)?;
+        return Ok((if n == 0 { 1 } else { 0 }, 1));
     }
     // Bitwise NOT `~x`
     if p.eat_sym('~') {
-        let n = const_atom(p)?;
-        return Ok(!n);
+        let (n, w) = const_atom_with_width(p)?;
+        let eff_w = if w == 0 { 32 } else { w };
+        let mask = if eff_w >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << eff_w) - 1
+        };
+        return Ok(((!n) & mask, eff_w));
     }
     if p.eat_sym('(') {
+        let save = p.i;
+        if let Ok((v, w)) = const_atom_with_width(p) {
+            if p.eat_sym(')') {
+                return Ok((v, w));
+            }
+        }
+        p.i = save;
         let v = const_u(p)?;
         if !p.eat_sym(')') {
             return Err("const )".into());
         }
-        return Ok(v);
+        return Ok((v, 0));
     }
     match p.peek() {
-        Some(Tok::Number(v, _)) => {
+        Some(Tok::Number(v, w)) => {
             let n = *v;
+            let width = *w;
             p.bump();
-            Ok(n)
+            Ok((n, width))
         }
         Some(Tok::Ident(s)) if *s == "$bits" => {
             p.bump();
-            parse_bits_width(p)
+            Ok((parse_bits_width(p)?, 32))
         }
         Some(Tok::Ident(s)) if *s == "$clog2" => {
             p.bump();
@@ -5133,7 +5165,7 @@ fn const_atom<'a>(p: &mut P<'a>) -> Result<u128, String> {
             if !p.eat_sym(')') {
                 return Err("$clog2 )".into());
             }
-            Ok(clog2_u(arg))
+            Ok((clog2_u(arg), 32))
         }
         Some(Tok::Kw(k)) if *k == "unsigned" || *k == "signed" => {
             // `unsigned'(expr)` — keyword form of a size cast. Value is inner.
@@ -5143,7 +5175,7 @@ fn const_atom<'a>(p: &mut P<'a>) -> Result<u128, String> {
             }
             let v = const_u(p)?;
             let _ = p.eat_sym(')');
-            Ok(v)
+            Ok((v, 0))
         }
         Some(Tok::Ident(s)) => {
             let mut name = s.to_string();
@@ -5152,7 +5184,7 @@ fn const_atom<'a>(p: &mut P<'a>) -> Result<u128, String> {
             if p.eat_sym('\'') && p.eat_sym('(') {
                 let v = const_u(p)?;
                 let _ = p.eat_sym(')');
-                return Ok(v);
+                return Ok((v, 0));
             }
             // `pkg::EnumLit` after skipped packages — resolve the member name.
             if matches!(p.peek(), Some(Tok::Sym(':')))
@@ -5164,24 +5196,30 @@ fn const_atom<'a>(p: &mut P<'a>) -> Result<u128, String> {
                 name = p.ident()?.to_string();
             }
             if let Some(v) = p.params.get(&name).copied() {
-                return Ok(v);
+                let w = p.widths.get(name.as_str()).copied().unwrap_or(0);
+                return Ok((v, w));
             }
             // cc_pkg::idx_width(n) / prim_util_pkg::vbits(n): clog2, minimum 1.
             if (name == "idx_width" || name == "vbits") && p.eat_sym('(') {
                 let n = const_u(p)?;
                 let _ = p.eat_sym(')');
-                return Ok(if n > 1 { clog2_u(n) } else { 1 });
+                return Ok((if n > 1 { clog2_u(n) } else { 1 }, 32));
             }
             pkg_enum_get(&name)
                 .or_else(|| enum_const_default(&name))
+                .map(|v| (v, 0))
                 .ok_or_else(|| format!("unknown param {name}"))
         }
         Some(Tok::Str(s)) => {
             p.bump();
-            Ok(str_param_hash(s))
+            Ok((str_param_hash(s), 0))
         }
         other => Err(format!("const atom {other:?}")),
     }
+}
+
+fn const_atom<'a>(p: &mut P<'a>) -> Result<u128, String> {
+    const_atom_with_width(p).map(|(v, _)| v)
 }
 
 fn const_u<'a>(p: &mut P<'a>) -> Result<u128, String> {
@@ -7049,31 +7087,81 @@ fn parse_for_unroll<'a>(p: &mut P<'a>) -> Result<(Vec<Nba<'a>>, Vec<ImmAssertAst
     Ok((out, imm_out))
 }
 
-fn parse_attr<'a>(p: &mut P<'a>) -> Option<(String, String)> {
-    let save = p.i;
-    if !p.eat_sym('(') {
-        return None;
-    }
-    if !p.eat_sym('*') {
-        p.i = save;
-        return None;
-    }
-    let k = match p.bump() {
-        Some(Tok::Ident(s) | Tok::Kw(s)) => s.to_string(),
-        _ => {
-            p.i = save;
-            return None;
+fn peek_attr<'a>(p: &P<'a>) -> bool {
+    p.peek() == Some(&Tok::Sym('(')) && p.t.get(p.i + 1) == Some(&Tok::Sym('*'))
+}
+
+fn parse_attrs<'a>(p: &mut P<'a>) -> Vec<(String, String)> {
+    let mut attrs = Vec::new();
+    while peek_attr(p) {
+        p.bump(); // '('
+        p.bump(); // '*'
+        while p.peek().is_some() {
+            if p.peek() == Some(&Tok::Sym('*')) && p.t.get(p.i + 1) == Some(&Tok::Sym(')')) {
+                p.bump(); // '*'
+                p.bump(); // ')'
+                break;
+            }
+            let key = match p.bump() {
+                Some(Tok::Ident(s) | Tok::Kw(s)) => s.to_string(),
+                Some(Tok::Sym('*')) if p.peek() == Some(&Tok::Sym(')')) => {
+                    p.bump();
+                    break;
+                }
+                _ => continue,
+            };
+            let val = if p.eat_sym('=') {
+                match p.bump() {
+                    Some(Tok::Str(s) | Tok::Ident(s) | Tok::Kw(s)) => s.to_string(),
+                    Some(Tok::Number(n, _)) => n.to_string(),
+                    _ => "1".to_string(),
+                }
+            } else {
+                "1".to_string()
+            };
+            attrs.push((key, val));
+            let _ = p.eat_sym(',');
         }
-    };
-    let _ = p.eat_sym('=');
-    let v = match p.bump() {
-        Some(Tok::Str(s) | Tok::Ident(s) | Tok::Kw(s)) => s.to_string(),
-        Some(Tok::Number(n, _)) => n.to_string(),
-        _ => "1".into(),
-    };
-    let _ = p.eat_sym('*');
-    let _ = p.eat_sym(')');
-    Some((k, v))
+    }
+    attrs
+}
+
+fn parse_attr<'a>(p: &mut P<'a>) -> Option<(String, String)> {
+    if !peek_attr(p) {
+        return None;
+    }
+    p.bump(); // '('
+    p.bump(); // '*'
+    let mut first = None;
+    while p.peek().is_some() {
+        if p.peek() == Some(&Tok::Sym('*')) && p.t.get(p.i + 1) == Some(&Tok::Sym(')')) {
+            p.bump(); // '*'
+            p.bump(); // ')'
+            break;
+        }
+        let key = match p.bump() {
+            Some(Tok::Ident(s) | Tok::Kw(s)) => s.to_string(),
+            Some(Tok::Sym('*')) if p.peek() == Some(&Tok::Sym(')')) => {
+                p.bump();
+                break;
+            }
+            _ => continue,
+        };
+        let val = if p.eat_sym('=') {
+            match p.bump() {
+                Some(Tok::Str(s) | Tok::Ident(s) | Tok::Kw(s)) => s.to_string(),
+                Some(Tok::Number(n, _)) => n.to_string(),
+                _ => "1".to_string(),
+            }
+        } else {
+            "1".to_string()
+        };
+        if first.is_none() {
+            first = Some((key, val));
+        }
+        let _ = p.eat_sym(',');
+    }
+    first
 }
 
 /// FNV-1a tag so a string parameter does not compare equal to a small integer.
@@ -8025,6 +8113,11 @@ pub(crate) fn parse_immediate_assert<'a>(
 
 
 fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst<'a>>), String> {
+    // Consume attributes preceding any statement (* full_case *), (* parallel_case *), etc.
+    let attrs = parse_attrs(p);
+    let _is_full_case = attrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("full_case"));
+    let _is_parallel_case = attrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("parallel_case"));
+
     // Immediate SVA assertion (v3.0 subset): `[label:] assert [final] (expr)
     // [else $error/$warning/$info("msg")] ;`
     if peek_assert_stmt(p) {
@@ -8061,10 +8154,12 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
         if !p.eat_sym(')') {
             return Err("if )".into());
         }
+        let _ = parse_attrs(p);
         let then_b = p.eat_kw("begin");
         let (then_raw, then_imms) = parse_seq_block(p, then_b)?;
         let then_s = normalize_nbas(p, then_raw);
         let (else_s, nested_imms) = if p.eat_kw("else") {
+            let _ = parse_attrs(p);
             let eb = p.eat_kw("begin");
             let (else_raw, else_imms) = parse_seq_block(p, eb)?;
             (normalize_nbas(p, else_raw), else_imms)
@@ -8170,8 +8265,10 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
             if p.peek().is_none() {
                 return Err("unterminated case".into());
             }
+            let _ = parse_attrs(p);
             if p.eat_kw("default") {
                 let _ = p.eat_sym(':');
+                let _ = parse_attrs(p);
                 let b = p.eat_kw("begin");
                 let (def_raw, def_imms) = parse_seq_block(p, b)?;
                 def = normalize_nbas(p, def_raw);
@@ -8187,6 +8284,7 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
             if !p.eat_sym(':') {
                 return Err("case :".into());
             }
+            let _ = parse_attrs(p);
             let b = p.eat_kw("begin");
             let (body_raw, body_imms) = parse_seq_block(p, b)?;
             let body = normalize_nbas(p, body_raw);
@@ -8324,10 +8422,18 @@ fn parse_preprocessed(pre: String) -> Result<Vec<Rtl<'static>>, String> {
             continue;
         }
         match p.peek() {
-            Some(Tok::Kw(k)) if *k == "module" => match parse_one_module(&mut p) {
-                Ok(m) => mods.push(m),
-                Err(_) => skip_until_kw(&mut p, "endmodule"),
-            },
+            Some(Tok::Kw(k)) if *k == "module" => {
+                let base_params = p.params.clone();
+                p.widths.clear();
+                p.signed.clear();
+                match parse_one_module(&mut p) {
+                    Ok(m) => mods.push(m),
+                    Err(_) => skip_until_kw(&mut p, "endmodule"),
+                }
+                p.params = base_params;
+                p.widths.clear();
+                p.signed.clear();
+            }
             _ => {
                 // Never skip_item_or_block at file scope — that can walk past `module`.
                 let _ = p.bump();
@@ -8366,7 +8472,7 @@ fn parse_param_assigns<'a>(p: &mut P<'a>) -> Result<Vec<(String, u128)>, String>
             break;
         }
         let _ = p.eat_kw("parameter");
-        let _ = p.eat_kw("localparam");
+        let is_localparam = p.eat_kw("localparam");
         skip_sv_type(p);
         if p.eat_sym('.') {
             let name = match p.ident() {
@@ -8404,14 +8510,21 @@ fn parse_param_assigns<'a>(p: &mut P<'a>) -> Result<Vec<(String, u128)>, String>
                 match const_u(p) {
                     Ok(val) => {
                         // Register immediately so later defaults can ref earlier ones
-                        // (`OW = 2 * DW`). Existing overrides in p.params win.
-                        let effective = p.params.get(name).copied().unwrap_or(val);
+                        // (`OW = 2 * DW`). Existing overrides in p.params win for parameters,
+                        // while localparams always recompute from current parameters.
+                        let effective = if is_localparam {
+                            val
+                        } else {
+                            p.params.get(name).copied().unwrap_or(val)
+                        };
                         p.params.insert(name.to_string(), effective);
-                        out.push((name.to_string(), effective));
+                        if !is_localparam {
+                            out.push((name.to_string(), effective));
+                        }
                     }
-                    Err(e) => {
-                        skip_until_arg_end(p)
-                    },
+                    Err(_) => {
+                        skip_until_arg_end(p);
+                    }
                 }
             } else {
                 skip_until_arg_end(p);
@@ -9864,7 +9977,13 @@ fn parse_module_items<'a>(
             let _ = p.eat_sym(';');
             continue;
         }
-        if p.eat_kw("parameter") || p.eat_kw("localparam") {
+        let is_param_decl = p.eat_kw("parameter");
+        let is_localparam_decl = if is_param_decl {
+            false
+        } else {
+            p.eat_kw("localparam")
+        };
+        if is_param_decl || is_localparam_decl {
             // `parameter width = 16, cycles = 1` — every name is elaborated.
             // Skipping after the first used to leave `cycles` unknown, so
             // `res[(-1)+cycles]` looked like a signal index.
@@ -9877,30 +9996,33 @@ fn parse_module_items<'a>(
                             name = p.ident().unwrap_or(name);
                         }
                         if p.eat_sym('=') {
-                            if let Some(Tok::Str(sval)) = p.peek() {
+                            let parsed_val = if let Some(Tok::Str(sval)) = p.peek() {
                                 let h = str_param_hash(sval);
                                 p.bump();
-                                p.params.entry(name.to_string()).or_insert(h);
+                                Some(h)
                             } else {
                                 let save_c = p.i;
                                 match const_u(p) {
-                                    Ok(val) => {
-                                        p.params.entry(name.to_string()).or_insert(val);
-                                        if !param_order.iter().any(|(n, _)| n.as_str() == name) {
-                                            param_order.push((name.to_string(), val));
-                                        }
-                                    }
+                                    Ok(val) => Some(val),
                                     Err(_) => {
                                         p.i = save_c;
                                         match parse_rexpr(p) {
-                                            Ok(RExpr::Const { val, .. }) => {
-                                                p.params.entry(name.to_string()).or_insert(val);
-                                                if !param_order.iter().any(|(n, _)| n.as_str() == name) {
-                                                    param_order.push((name.to_string(), val));
-                                                }
+                                            Ok(RExpr::Const { val, .. }) => Some(val),
+                                            _ => {
+                                                skip_until_arg_end(p);
+                                                None
                                             }
-                                            _ => skip_until_arg_end(p),
                                         }
+                                    }
+                                }
+                            };
+                            if let Some(val) = parsed_val {
+                                if is_localparam_decl {
+                                    p.params.insert(name.to_string(), val);
+                                } else {
+                                    let effective = *p.params.entry(name.to_string()).or_insert(val);
+                                    if !param_order.iter().any(|(n, _)| n.as_str() == name) {
+                                        param_order.push((name.to_string(), effective));
                                     }
                                 }
                             }
