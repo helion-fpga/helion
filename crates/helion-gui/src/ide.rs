@@ -34,7 +34,7 @@ use helion_sta::{
     report_methodology, report_power, report_timing_routed_xdc, report_timing_summary,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -2174,6 +2174,410 @@ fn parse_decl_line_for_symbol(raw: &str, target: &str, file: &str) -> Option<(St
     None
 }
 
+/// Direction/mode of a schematic connectivity cone trace.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConeDirection {
+    #[default]
+    Bidirectional,
+    FanIn,
+    FanOut,
+    ShortestPath,
+}
+
+/// Induced subgraph and hop-depth table from a Schematic Fan-In / Fan-Out
+/// Cone Trace (`Show Connectivity`) or `Trace Path Between Pins`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConeTraceState {
+    /// Root cell or net name (or `src` for `trace_shortest_cone_path`).
+    pub root: Option<String>,
+    /// Target cell or net name when tracing a path between `root` and `target`.
+    pub target: Option<String>,
+    /// Direction/mode of the cone trace.
+    pub direction: ConeDirection,
+    /// Maximum hop depth explored ($0 \dots \text{max\_hops}$).
+    pub max_hops: usize,
+    /// Stop traversal at sequential register (`HFF`) boundaries when `true`.
+    pub stop_at_ff: bool,
+    /// Induced subgraph cells in breadth-first / path discovery order.
+    pub cells: Vec<String>,
+    /// Induced subgraph nets in breadth-first / path discovery order.
+    pub nets: Vec<String>,
+    /// Hop depth ($0 \dots \text{max\_hops}$) for each discovered cell/net name.
+    pub hop_depths: BTreeMap<String, usize>,
+    /// Hop depth for each cell in the induced subgraph.
+    pub cell_depths: BTreeMap<String, usize>,
+    /// Hop depth for each net in the induced subgraph.
+    pub net_depths: BTreeMap<String, usize>,
+    /// Ordered sequence of nodes (`cell` / `net`) along the shortest path when traced.
+    pub path: Vec<String>,
+}
+
+impl ConeTraceState {
+    pub fn is_active(&self) -> bool {
+        self.root.is_some() && (!self.cells.is_empty() || !self.nets.is_empty())
+    }
+
+    pub fn summary_text(&self) -> String {
+        let root = self.root.as_deref().unwrap_or("-");
+        let dst = self.target.as_deref().unwrap_or("-");
+        let dir = match self.direction {
+            ConeDirection::Bidirectional => "bi",
+            ConeDirection::FanIn => "fanin",
+            ConeDirection::FanOut => "fanout",
+            ConeDirection::ShortestPath => "path",
+        };
+        let cells = if self.cells.is_empty() {
+            "-".into()
+        } else {
+            self.cells.join(",")
+        };
+        let nets = if self.nets.is_empty() {
+            "-".into()
+        } else {
+            self.nets.join(",")
+        };
+        format!(
+            "cone_trace DIR={dir} ROOT={root} TARGET={dst} MAX_HOPS={} STOP_AT_FF={} CELLS={cells} NETS={nets}",
+            self.max_hops,
+            u8::from(self.stop_at_ff)
+        )
+    }
+}
+
+fn is_ff_cell_in_design(design: &Design, cell_name: &str) -> bool {
+    design
+        .cells
+        .iter()
+        .any(|c| resolve(c.name) == cell_name && matches!(c.kind, CellKind::Hff))
+}
+
+fn normalize_cone_endpoint(spec: &str) -> &str {
+    let s = spec.trim();
+    s.split_once('/').map(|(c, _)| c).unwrap_or(s)
+}
+
+/// Expand the fan-in cone backwards from `root_cell_or_net` up to `max_hops`
+/// cell-to-cell hops (`stop_at_ff = false` by default; see [`expand_fanin_cone_opts`]).
+pub fn expand_fanin_cone(
+    design: &Design,
+    root_cell_or_net: &str,
+    max_hops: usize,
+) -> ConeTraceState {
+    expand_fanin_cone_opts(design, root_cell_or_net, max_hops, false)
+}
+
+/// Expand the fan-in cone backwards from `root_cell_or_net` up to `max_hops`
+/// hops, optionally stopping at sequential `HFF` register boundaries (`stop_at_ff`).
+pub fn expand_fanin_cone_opts(
+    design: &Design,
+    root_cell_or_net: &str,
+    max_hops: usize,
+    stop_at_ff: bool,
+) -> ConeTraceState {
+    let root = normalize_cone_endpoint(root_cell_or_net);
+    let mut state = ConeTraceState {
+        root: Some(root.to_string()),
+        target: None,
+        direction: ConeDirection::FanIn,
+        max_hops,
+        stop_at_ff,
+        ..Default::default()
+    };
+    if root.is_empty() {
+        return state;
+    }
+
+    let is_root_cell = design.cells.iter().any(|c| resolve(c.name) == root);
+    let is_root_net = design.nets.iter().any(|n| resolve(n.name) == root);
+    if !is_root_cell && !is_root_net {
+        return state;
+    }
+
+    let mut q: VecDeque<(String, usize)> = VecDeque::new();
+    if is_root_cell {
+        state.cells.push(root.to_string());
+        state.cell_depths.insert(root.to_string(), 0);
+        state.hop_depths.insert(root.to_string(), 0);
+        q.push_back((root.to_string(), 0));
+    } else {
+        state.nets.push(root.to_string());
+        state.net_depths.insert(root.to_string(), 0);
+        state.hop_depths.insert(root.to_string(), 0);
+        if max_hops > 0 {
+            if let Some(net) = design.nets.iter().find(|n| resolve(n.name) == root) {
+                for ep in &net.endpoints {
+                    if pin_is_output(resolve(ep.pin)) {
+                        let drv = resolve(ep.cell).to_string();
+                        if !state.cell_depths.contains_key(&drv) {
+                            state.cells.push(drv.clone());
+                            state.cell_depths.insert(drv.clone(), 1);
+                            state.hop_depths.entry(drv.clone()).or_insert(1);
+                            q.push_back((drv, 1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    while let Some((cell_name, depth)) = q.pop_front() {
+        if depth >= max_hops {
+            continue;
+        }
+        if depth > 0 && stop_at_ff && is_ff_cell_in_design(design, &cell_name) {
+            continue;
+        }
+        // Walk all nets feeding input pins of `cell_name`.
+        for net in &design.nets {
+            let feeds_cell = net.endpoints.iter().any(|ep| {
+                resolve(ep.cell) == cell_name.as_str() && !pin_is_output(resolve(ep.pin))
+            });
+            if !feeds_cell {
+                continue;
+            }
+            let nname = resolve(net.name).to_string();
+            let ndepth = depth + 1;
+            if !state.net_depths.contains_key(&nname) {
+                state.nets.push(nname.clone());
+                state.net_depths.insert(nname.clone(), ndepth);
+                state.hop_depths.entry(nname).or_insert(ndepth);
+            }
+            for ep in &net.endpoints {
+                if pin_is_output(resolve(ep.pin)) {
+                    let drv = resolve(ep.cell).to_string();
+                    if !state.cell_depths.contains_key(&drv) {
+                        state.cells.push(drv.clone());
+                        state.cell_depths.insert(drv.clone(), ndepth);
+                        state.hop_depths.entry(drv.clone()).or_insert(ndepth);
+                        q.push_back((drv, ndepth));
+                    }
+                }
+            }
+        }
+    }
+    state
+}
+
+/// Expand the fan-out cone forwards from `root_cell_or_net` up to `max_hops`
+/// cell-to-cell hops (`stop_at_ff = false` by default; see [`expand_fanout_cone_opts`]).
+pub fn expand_fanout_cone(
+    design: &Design,
+    root_cell_or_net: &str,
+    max_hops: usize,
+) -> ConeTraceState {
+    expand_fanout_cone_opts(design, root_cell_or_net, max_hops, false)
+}
+
+/// Expand the fan-out cone forwards from `root_cell_or_net` up to `max_hops`
+/// hops, optionally stopping at sequential `HFF` register boundaries (`stop_at_ff`).
+pub fn expand_fanout_cone_opts(
+    design: &Design,
+    root_cell_or_net: &str,
+    max_hops: usize,
+    stop_at_ff: bool,
+) -> ConeTraceState {
+    let root = normalize_cone_endpoint(root_cell_or_net);
+    let mut state = ConeTraceState {
+        root: Some(root.to_string()),
+        target: None,
+        direction: ConeDirection::FanOut,
+        max_hops,
+        stop_at_ff,
+        ..Default::default()
+    };
+    if root.is_empty() {
+        return state;
+    }
+
+    let is_root_cell = design.cells.iter().any(|c| resolve(c.name) == root);
+    let is_root_net = design.nets.iter().any(|n| resolve(n.name) == root);
+    if !is_root_cell && !is_root_net {
+        return state;
+    }
+
+    let mut q: VecDeque<(String, usize)> = VecDeque::new();
+    if is_root_cell {
+        state.cells.push(root.to_string());
+        state.cell_depths.insert(root.to_string(), 0);
+        state.hop_depths.insert(root.to_string(), 0);
+        q.push_back((root.to_string(), 0));
+    } else {
+        state.nets.push(root.to_string());
+        state.net_depths.insert(root.to_string(), 0);
+        state.hop_depths.insert(root.to_string(), 0);
+        if max_hops > 0 {
+            if let Some(net) = design.nets.iter().find(|n| resolve(n.name) == root) {
+                for ep in &net.endpoints {
+                    if !pin_is_output(resolve(ep.pin)) {
+                        let sink = resolve(ep.cell).to_string();
+                        if !state.cell_depths.contains_key(&sink) {
+                            state.cells.push(sink.clone());
+                            state.cell_depths.insert(sink.clone(), 1);
+                            state.hop_depths.entry(sink.clone()).or_insert(1);
+                            q.push_back((sink, 1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    while let Some((cell_name, depth)) = q.pop_front() {
+        if depth >= max_hops {
+            continue;
+        }
+        if depth > 0 && stop_at_ff && is_ff_cell_in_design(design, &cell_name) {
+            continue;
+        }
+        // Walk all nets driven by output pins of `cell_name`.
+        for net in &design.nets {
+            let driven_by_cell = net.endpoints.iter().any(|ep| {
+                resolve(ep.cell) == cell_name.as_str() && pin_is_output(resolve(ep.pin))
+            });
+            if !driven_by_cell {
+                continue;
+            }
+            let nname = resolve(net.name).to_string();
+            let ndepth = depth + 1;
+            if !state.net_depths.contains_key(&nname) {
+                state.nets.push(nname.clone());
+                state.net_depths.insert(nname.clone(), ndepth);
+                state.hop_depths.entry(nname).or_insert(ndepth);
+            }
+            for ep in &net.endpoints {
+                if !pin_is_output(resolve(ep.pin)) {
+                    let sink = resolve(ep.cell).to_string();
+                    if !state.cell_depths.contains_key(&sink) {
+                        state.cells.push(sink.clone());
+                        state.cell_depths.insert(sink.clone(), ndepth);
+                        state.hop_depths.entry(sink.clone()).or_insert(ndepth);
+                        q.push_back((sink, ndepth));
+                    }
+                }
+            }
+        }
+    }
+    state
+}
+
+/// Trace the shortest directed connectivity path from `src` to `dst`
+/// (cells, nets, or `cell/pin` endpoints) across the HNF design.
+pub fn trace_shortest_cone_path(design: &Design, src: &str, dst: &str) -> ConeTraceState {
+    trace_shortest_cone_path_opts(design, src, dst, false)
+}
+
+/// Trace the shortest connectivity path from `src` to `dst`, optionally
+/// stopping at intermediate `HFF` register boundaries when `stop_at_ff` is true.
+pub fn trace_shortest_cone_path_opts(
+    design: &Design,
+    src: &str,
+    dst: &str,
+    stop_at_ff: bool,
+) -> ConeTraceState {
+    let s_node = normalize_cone_endpoint(src);
+    let d_node = normalize_cone_endpoint(dst);
+    let mut state = ConeTraceState {
+        root: Some(s_node.to_string()),
+        target: Some(d_node.to_string()),
+        direction: ConeDirection::ShortestPath,
+        max_hops: 0,
+        stop_at_ff,
+        ..Default::default()
+    };
+    if s_node.is_empty() || d_node.is_empty() {
+        return state;
+    }
+
+    let cell_set: HashSet<&str> = design.cells.iter().map(|c| resolve(c.name)).collect();
+    let net_set: HashSet<&str> = design.nets.iter().map(|n| resolve(n.name)).collect();
+    if (!cell_set.contains(s_node) && !net_set.contains(s_node))
+        || (!cell_set.contains(d_node) && !net_set.contains(d_node))
+    {
+        return state;
+    }
+
+    // Directed bipartite graph: cell -> driven_net -> load_cell.
+    // Falls back to undirected adjacency only if no directed path exists.
+    for directed in [true, false] {
+        let mut parent: HashMap<String, String> = HashMap::new();
+        let mut dist: HashMap<String, usize> = HashMap::new();
+        let mut q: VecDeque<String> = VecDeque::new();
+        dist.insert(s_node.to_string(), 0);
+        q.push_back(s_node.to_string());
+
+        while let Some(cur) = q.pop_front() {
+            if cur == d_node {
+                break;
+            }
+            let cur_d = dist[&cur];
+            if cur != s_node && stop_at_ff && is_ff_cell_in_design(design, &cur) {
+                continue;
+            }
+            let mut nbrs: Vec<String> = Vec::new();
+            if cell_set.contains(cur.as_str()) {
+                for net in &design.nets {
+                    let hit = net.endpoints.iter().any(|ep| {
+                        resolve(ep.cell) == cur.as_str()
+                            && (!directed || pin_is_output(resolve(ep.pin)))
+                    });
+                    if hit {
+                        nbrs.push(resolve(net.name).to_string());
+                    }
+                }
+            }
+            if net_set.contains(cur.as_str()) {
+                if let Some(net) = design.nets.iter().find(|n| resolve(n.name) == cur.as_str()) {
+                    for ep in &net.endpoints {
+                        if !directed || !pin_is_output(resolve(ep.pin)) {
+                            nbrs.push(resolve(ep.cell).to_string());
+                        }
+                    }
+                }
+            }
+            for nb in nbrs {
+                if !dist.contains_key(&nb) {
+                    dist.insert(nb.clone(), cur_d + 1);
+                    parent.insert(nb.clone(), cur.clone());
+                    q.push_back(nb);
+                }
+            }
+        }
+
+        if dist.contains_key(d_node) {
+            let mut chain: Vec<String> = Vec::new();
+            let mut cur = d_node.to_string();
+            chain.push(cur.clone());
+            while let Some(prev) = parent.get(&cur) {
+                chain.push(prev.clone());
+                cur = prev.clone();
+            }
+            chain.reverse();
+            let mut cell_hop = 0usize;
+            for (idx, item) in chain.iter().enumerate() {
+                state.path.push(item.clone());
+                if cell_set.contains(item.as_str()) {
+                    if !state.cells.contains(item) {
+                        state.cells.push(item.clone());
+                    }
+                    state.cell_depths.insert(item.clone(), cell_hop);
+                    state.hop_depths.insert(item.clone(), cell_hop);
+                    cell_hop += 1;
+                } else if net_set.contains(item.as_str()) {
+                    let nhop = cell_hop.max(usize::from(idx > 0));
+                    if !state.nets.contains(item) {
+                        state.nets.push(item.clone());
+                    }
+                    state.net_depths.insert(item.clone(), nhop);
+                    state.hop_depths.insert(item.clone(), nhop);
+                }
+            }
+            state.max_hops = state.cells.len().saturating_sub(1);
+            return state;
+        }
+    }
+    state
+}
+
 #[derive(Clone, Debug)]
 pub struct SchematicView {
     pub nodes: Vec<SchematicNode>,
@@ -2182,6 +2586,8 @@ pub struct SchematicView {
     /// UG893 expand-cone root. `None` = show the full HNF schematic.
     pub cone_root: Option<String>,
     pub cone_depth: usize,
+    /// Interactive Fan-In / Fan-Out / Shortest-Path cone trace state.
+    pub cone_trace: ConeTraceState,
     /// Hierarchical instance names (HNF `instances`), for Expand Inside.
     pub instances: Vec<String>,
     /// Fig. 56: instance whose nested contents are on the sheet.
@@ -2214,6 +2620,7 @@ impl Default for SchematicView {
             ports: Vec::new(),
             cone_root: None,
             cone_depth: 1,
+            cone_trace: ConeTraceState::default(),
             instances: Vec::new(),
             expand_inside: None,
             highlight_cells: HashSet::new(),
@@ -2483,6 +2890,18 @@ impl SchematicView {
 
     fn cone_cell_names(&self) -> HashSet<String> {
         let base = self.sheet_cell_names();
+        if self.cone_trace.is_active() && !self.cone_trace.cells.is_empty() {
+            let traced: HashSet<String> = self
+                .cone_trace
+                .cells
+                .iter()
+                .filter(|c| base.contains(*c))
+                .cloned()
+                .collect();
+            if !traced.is_empty() {
+                return traced;
+            }
+        }
         let Some(root) = &self.cone_root else {
             return base;
         };
@@ -3377,6 +3796,189 @@ impl WaveDensity {
     }
 }
 
+/// Display and rendering mode for a waveform trace: digital radices,
+/// signed/unsigned decimal, fixed-point (`Qm.n`), or analog step/linear plots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WaveformDisplayMode {
+    #[default]
+    Hex,
+    Binary,
+    UnsignedDec,
+    SignedDec,
+    FixedPoint {
+        frac_bits: u8,
+        signed: bool,
+    },
+    AnalogStep,
+    AnalogLinear,
+}
+
+fn mask_for_width(width: u8) -> u64 {
+    let w = width.max(1) as u32;
+    if w >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << w) - 1
+    }
+}
+
+fn sign_extend_sample(raw: u64, width: u8) -> i64 {
+    let w = width.max(1);
+    if w >= 64 {
+        return raw as i64;
+    }
+    let mask = mask_for_width(w);
+    let v = raw & mask;
+    let sign_bit = 1u64 << (w - 1);
+    if (v & sign_bit) != 0 {
+        (v | !mask) as i64
+    } else {
+        v as i64
+    }
+}
+
+impl WaveformDisplayMode {
+    pub fn label(self) -> String {
+        match self {
+            Self::Hex => "Hex".into(),
+            Self::Binary => "Bin".into(),
+            Self::UnsignedDec => "UDec".into(),
+            Self::SignedDec => "SDec".into(),
+            Self::FixedPoint { frac_bits, signed } => {
+                if signed {
+                    format!("Q.{frac_bits}s")
+                } else {
+                    format!("UQ.{frac_bits}")
+                }
+            }
+            Self::AnalogStep => "AnalogStep".into(),
+            Self::AnalogLinear => "AnalogLinear".into(),
+        }
+    }
+
+    pub fn parse(spec: &str) -> Option<Self> {
+        let s = spec.trim().to_ascii_lowercase();
+        match s.as_str() {
+            "hex" | "hexadecimal" => Some(Self::Hex),
+            "bin" | "binary" => Some(Self::Binary),
+            "udec" | "unsigned" | "unsigneddec" | "dec" => Some(Self::UnsignedDec),
+            "sdec" | "signed" | "signeddec" => Some(Self::SignedDec),
+            "analogstep" | "analog_step" | "step" => Some(Self::AnalogStep),
+            "analoglinear" | "analog_linear" | "linear" | "analog" => Some(Self::AnalogLinear),
+            _ => {
+                if let Some(rest) = s
+                    .strip_prefix("q")
+                    .or_else(|| s.strip_prefix("uq"))
+                    .or_else(|| s.strip_prefix("fixed:"))
+                {
+                    let signed = !s.starts_with("uq") && !rest.ends_with('u');
+                    let clean = rest.trim_end_matches(['s', 'u']);
+                    let frac_str = clean.rsplit('.').next().unwrap_or(clean);
+                    let frac_bits: u8 = frac_str.parse().ok()?;
+                    Some(Self::FixedPoint { frac_bits, signed })
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Convert a raw sample word into its real-valued (`f64`) numeric value
+    /// according to this display mode and `width`.
+    pub fn sample_to_f64(self, raw: u64, width: u8) -> f64 {
+        let mask = mask_for_width(width);
+        let v = raw & mask;
+        match self {
+            Self::SignedDec => sign_extend_sample(v, width) as f64,
+            Self::FixedPoint { frac_bits, signed } => {
+                let scale = 2.0_f64.powi(frac_bits as i32);
+                let base = if signed {
+                    sign_extend_sample(v, width) as f64
+                } else {
+                    v as f64
+                };
+                base / scale
+            }
+            Self::Hex
+            | Self::Binary
+            | Self::UnsignedDec
+            | Self::AnalogStep
+            | Self::AnalogLinear => v as f64,
+        }
+    }
+
+    /// Format a raw sample word for cursor and table readouts.
+    pub fn format_sample(self, raw: u64, width: u8) -> String {
+        let mask = mask_for_width(width);
+        let v = raw & mask;
+        match self {
+            Self::Hex => format!("0x{v:X}"),
+            Self::Binary => {
+                let w = width.max(1) as usize;
+                format!("{v:0w$b}")
+            }
+            Self::UnsignedDec => format!("{v}"),
+            Self::SignedDec => format!("{}", sign_extend_sample(v, width)),
+            Self::FixedPoint { frac_bits, .. } => {
+                let real = self.sample_to_f64(v, width);
+                if frac_bits == 0 {
+                    format!("{real:.0}")
+                } else {
+                    let prec = (frac_bits as usize).clamp(1, 6);
+                    let s = format!("{real:.prec$}");
+                    let trimmed = s.trim_end_matches('0');
+                    if trimmed.ends_with('.') {
+                        format!("{trimmed}0")
+                    } else {
+                        trimmed.to_string()
+                    }
+                }
+            }
+            Self::AnalogStep | Self::AnalogLinear => {
+                let real = self.sample_to_f64(v, width);
+                format!("{real:.2}")
+            }
+        }
+    }
+}
+
+/// Map raw waveform samples into vertical pixel Y coordinates within `[top_y, bottom_y]`
+/// (where `top_y <= bottom_y` in screen space: maximum sample maps to `top_y`,
+/// minimum sample maps to `bottom_y`).
+pub fn compute_analog_samples_y(
+    samples: &[u64],
+    width: u8,
+    mode: WaveformDisplayMode,
+    top_y: f32,
+    bottom_y: f32,
+) -> Vec<f32> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let vals: Vec<f64> = samples
+        .iter()
+        .map(|&s| mode.sample_to_f64(s, width))
+        .collect();
+    let min_v = vals.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_v = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let span = max_v - min_v;
+    let h = bottom_y - top_y;
+    if span.abs() < 1e-12 {
+        let flat_y = if min_v <= 0.0 {
+            bottom_y
+        } else {
+            top_y + 0.5 * h
+        };
+        return vec![flat_y; samples.len()];
+    }
+    vals.into_iter()
+        .map(|v| {
+            let norm = ((v - min_v) / span).clamp(0.0, 1.0) as f32;
+            top_y + (1.0 - norm) * h
+        })
+        .collect()
+}
+
 /// One UG900 design wave object: Name, Value-at-cursor, sample series.
 /// Bus protocol decoder mode for waveform transaction lanes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -3467,6 +4069,7 @@ pub struct WaveTrace {
     pub style: WaveStyle,
     pub radix: WaveRadix,
     pub protocol: WaveProtocol,
+    pub display_mode: WaveformDisplayMode,
 }
 
 impl WaveTrace {
@@ -3478,6 +4081,7 @@ impl WaveTrace {
             style: WaveStyle::Digital,
             radix: WaveRadix::Binary,
             protocol: WaveProtocol::Auto,
+            display_mode: WaveformDisplayMode::Binary,
         }
     }
 
@@ -3489,6 +4093,7 @@ impl WaveTrace {
             style: WaveStyle::Analog,
             radix: WaveRadix::Hexadecimal,
             protocol: WaveProtocol::Auto,
+            display_mode: WaveformDisplayMode::Hex,
         }
     }
 
@@ -3502,15 +4107,38 @@ impl WaveTrace {
 
     /// Analog Y from the same engine samples (scalar 0/1 or bus integer). Not a canned sine.
     pub fn analog_series(&self) -> Vec<f64> {
-        self.samples.iter().map(|v| *v as f64).collect()
+        self.samples
+            .iter()
+            .map(|&v| self.display_mode.sample_to_f64(v, self.width))
+            .collect()
+    }
+
+    /// Screen-space vertical Y coordinates for analog rendering in `[top_y, bottom_y]`.
+    pub fn analog_samples_y(&self, top_y: f32, bottom_y: f32) -> Vec<f32> {
+        compute_analog_samples_y(&self.samples, self.width, self.display_mode, top_y, bottom_y)
+    }
+
+    /// Real-valued sample value at `idx` according to `display_mode`.
+    pub fn real_value_at(&self, idx: usize) -> f64 {
+        let v = self.samples.get(idx).copied().unwrap_or(0);
+        self.display_mode.sample_to_f64(v, self.width)
     }
 
     pub fn value_at(&self, idx: usize) -> String {
         let v = self.samples.get(idx).copied().unwrap_or(0);
-        let w = self.width.max(1) as usize;
-        match self.radix {
-            WaveRadix::Binary => format!("{v:0w$b}"),
-            WaveRadix::Hexadecimal => format!("0x{v:X}"),
+        match self.display_mode {
+            WaveformDisplayMode::UnsignedDec
+            | WaveformDisplayMode::SignedDec
+            | WaveformDisplayMode::FixedPoint { .. }
+            | WaveformDisplayMode::AnalogStep
+            | WaveformDisplayMode::AnalogLinear => self.display_mode.format_sample(v, self.width),
+            WaveformDisplayMode::Hex | WaveformDisplayMode::Binary => {
+                let w = self.width.max(1) as usize;
+                match self.radix {
+                    WaveRadix::Binary => format!("{v:0w$b}"),
+                    WaveRadix::Hexadecimal => format!("0x{v:X}"),
+                }
+            }
         }
     }
 
@@ -7955,8 +8583,27 @@ impl IdeModel {
             self.select_hw_stat("")
         } else if t == "expand_cone" || t.starts_with("expand_cone ") {
             self.expand_cone(t.strip_prefix("expand_cone").unwrap_or("").trim())
+        } else if t == "expand_fanin_cone" || t.starts_with("expand_fanin_cone ") {
+            self.expand_fanin_cone_cmd(t.strip_prefix("expand_fanin_cone").unwrap_or("").trim())
+        } else if t == "expand_fanout_cone" || t.starts_with("expand_fanout_cone ") {
+            self.expand_fanout_cone_cmd(t.strip_prefix("expand_fanout_cone").unwrap_or("").trim())
+        } else if t == "trace_shortest_cone_path"
+            || t.starts_with("trace_shortest_cone_path ")
+            || t == "trace_cone_path"
+            || t.starts_with("trace_cone_path ")
+        {
+            let spec = t
+                .strip_prefix("trace_shortest_cone_path")
+                .or_else(|| t.strip_prefix("trace_cone_path"))
+                .unwrap_or("")
+                .trim();
+            self.trace_shortest_cone_path_cmd(spec)
         } else if t == "collapse_cone" {
             self.collapse_cone()
+        } else if let Some(rest) = t.strip_prefix("wave_display_mode ") {
+            self.set_wave_display_mode(rest)
+        } else if let Some(rest) = t.strip_prefix("set_wave_display_mode ") {
+            self.set_wave_display_mode(rest)
         } else if t == "expand_inside" || t.starts_with("expand_inside ") {
             self.expand_inside(t.strip_prefix("expand_inside").unwrap_or("").trim())
         } else if t == "collapse_inside" {
@@ -10120,6 +10767,10 @@ impl IdeModel {
             .trace_mut(name)
             .ok_or_else(|| format!("wave_radix: no trace {name}"))?;
         t.radix = radix;
+        t.display_mode = match radix {
+            WaveRadix::Binary => WaveformDisplayMode::Binary,
+            WaveRadix::Hexadecimal => WaveformDisplayMode::Hex,
+        };
         Ok(format!("wave_radix {name} {r}"))
     }
 
@@ -10176,6 +10827,35 @@ impl IdeModel {
             s.push_str(&tx.row_text(self.wave.timescale_ps));
         }
         s
+    }
+
+    /// Set the [`WaveformDisplayMode`] for a trace (`<name> hex|bin|udec|sdec|q4.4|step|linear`).
+    pub fn set_wave_display_mode(&mut self, spec: &str) -> Result<String, String> {
+        let mut parts = spec.split_whitespace();
+        let name = parts
+            .next()
+            .ok_or("wave_display_mode: need <name> <mode>")?;
+        let mode_str = parts.next().unwrap_or("hex");
+        let mode = WaveformDisplayMode::parse(mode_str)
+            .ok_or_else(|| format!("wave_display_mode: unknown mode {mode_str}"))?;
+        let t = self
+            .wave
+            .trace_mut(name)
+            .ok_or_else(|| format!("wave_display_mode: no trace {name}"))?;
+        t.display_mode = mode;
+        match mode {
+            WaveformDisplayMode::Hex => {
+                t.radix = WaveRadix::Hexadecimal;
+            }
+            WaveformDisplayMode::Binary => {
+                t.radix = WaveRadix::Binary;
+            }
+            WaveformDisplayMode::AnalogStep | WaveformDisplayMode::AnalogLinear => {
+                t.style = WaveStyle::Analog;
+            }
+            _ => {}
+        }
+        Ok(format!("wave_display_mode {name} {}", mode.label()))
     }
 
     /// UG900 waveform marker at a sample (or `-time` ps). Time is the engine
@@ -11243,13 +11923,172 @@ impl IdeModel {
         let depth = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
         self.schematic.cone_root = Some(name.clone());
         self.schematic.cone_depth = depth;
+        self.schematic.cone_trace = ConeTraceState::default();
+        let _ = self.schematic.drawing_cache.borrow_mut().take();
         self.select(&name);
         self.workspace = WorkspaceTab::Schematic;
         Ok(self.schematic_text())
     }
 
+    /// Expand the schematic fan-in cone from `root` up to `max_hops` (with optional `stop_at_ff`).
+    pub fn expand_fanin_cone(
+        &mut self,
+        root: &str,
+        max_hops: usize,
+        stop_at_ff: bool,
+    ) -> Result<ConeTraceState, String> {
+        let d = self
+            .shell
+            .session
+            .design
+            .as_ref()
+            .ok_or_else(|| "expand_fanin_cone: no synthesized design".to_string())?;
+        let state = expand_fanin_cone_opts(d, root, max_hops, stop_at_ff);
+        if state.cells.is_empty() && state.nets.is_empty() {
+            return Err(format!("expand_fanin_cone: unknown root {root}"));
+        }
+        self.schematic.cone_root = state.root.clone();
+        self.schematic.cone_depth = max_hops;
+        self.schematic.highlight_cells = state.cells.iter().cloned().collect();
+        self.schematic.highlight_nets = state.nets.iter().cloned().collect();
+        self.schematic.cone_trace = state.clone();
+        let _ = self.schematic.drawing_cache.borrow_mut().take();
+        self.workspace = WorkspaceTab::Schematic;
+        Ok(state)
+    }
+
+    /// Expand the schematic fan-out cone from `root` up to `max_hops` (with optional `stop_at_ff`).
+    pub fn expand_fanout_cone(
+        &mut self,
+        root: &str,
+        max_hops: usize,
+        stop_at_ff: bool,
+    ) -> Result<ConeTraceState, String> {
+        let d = self
+            .shell
+            .session
+            .design
+            .as_ref()
+            .ok_or_else(|| "expand_fanout_cone: no synthesized design".to_string())?;
+        let state = expand_fanout_cone_opts(d, root, max_hops, stop_at_ff);
+        if state.cells.is_empty() && state.nets.is_empty() {
+            return Err(format!("expand_fanout_cone: unknown root {root}"));
+        }
+        self.schematic.cone_root = state.root.clone();
+        self.schematic.cone_depth = max_hops;
+        self.schematic.highlight_cells = state.cells.iter().cloned().collect();
+        self.schematic.highlight_nets = state.nets.iter().cloned().collect();
+        self.schematic.cone_trace = state.clone();
+        let _ = self.schematic.drawing_cache.borrow_mut().take();
+        self.workspace = WorkspaceTab::Schematic;
+        Ok(state)
+    }
+
+    /// Trace the shortest schematic cone path between `src` and `dst`.
+    pub fn trace_shortest_cone_path(
+        &mut self,
+        src: &str,
+        dst: &str,
+        stop_at_ff: bool,
+    ) -> Result<ConeTraceState, String> {
+        let d = self
+            .shell
+            .session
+            .design
+            .as_ref()
+            .ok_or_else(|| "trace_shortest_cone_path: no synthesized design".to_string())?;
+        let state = trace_shortest_cone_path_opts(d, src, dst, stop_at_ff);
+        if state.path.is_empty() {
+            return Err(format!(
+                "trace_shortest_cone_path: no path between {src} and {dst}"
+            ));
+        }
+        self.schematic.cone_root = state.root.clone();
+        self.schematic.cone_depth = state.max_hops;
+        self.schematic.highlight_cells = state.cells.iter().cloned().collect();
+        self.schematic.highlight_nets = state.nets.iter().cloned().collect();
+        self.schematic.cone_trace = state.clone();
+        let _ = self.schematic.drawing_cache.borrow_mut().take();
+        self.workspace = WorkspaceTab::Schematic;
+        Ok(state)
+    }
+
+    fn expand_fanin_cone_cmd(&mut self, spec: &str) -> Result<String, String> {
+        let mut stop_at_ff = false;
+        let mut positional = Vec::new();
+        for tok in spec.split_whitespace() {
+            if tok == "-stop_at_ff" || tok == "--stop-at-ff" {
+                stop_at_ff = true;
+            } else {
+                positional.push(tok);
+            }
+        }
+        let root = match positional.first().copied() {
+            Some(r) if !r.is_empty() => r.to_string(),
+            _ => self
+                .selected
+                .clone()
+                .ok_or_else(|| "expand_fanin_cone: select a cell/net first".to_string())?,
+        };
+        let max_hops = positional
+            .get(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let st = self.expand_fanin_cone(&root, max_hops, stop_at_ff)?;
+        Ok(st.summary_text())
+    }
+
+    fn expand_fanout_cone_cmd(&mut self, spec: &str) -> Result<String, String> {
+        let mut stop_at_ff = false;
+        let mut positional = Vec::new();
+        for tok in spec.split_whitespace() {
+            if tok == "-stop_at_ff" || tok == "--stop-at-ff" {
+                stop_at_ff = true;
+            } else {
+                positional.push(tok);
+            }
+        }
+        let root = match positional.first().copied() {
+            Some(r) if !r.is_empty() => r.to_string(),
+            _ => self
+                .selected
+                .clone()
+                .ok_or_else(|| "expand_fanout_cone: select a cell/net first".to_string())?,
+        };
+        let max_hops = positional
+            .get(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let st = self.expand_fanout_cone(&root, max_hops, stop_at_ff)?;
+        Ok(st.summary_text())
+    }
+
+    fn trace_shortest_cone_path_cmd(&mut self, spec: &str) -> Result<String, String> {
+        let mut stop_at_ff = false;
+        let mut positional = Vec::new();
+        for tok in spec.split_whitespace() {
+            if tok == "-stop_at_ff" || tok == "--stop-at-ff" {
+                stop_at_ff = true;
+            } else {
+                positional.push(tok);
+            }
+        }
+        let src = positional
+            .first()
+            .copied()
+            .ok_or("trace_shortest_cone_path: need <src> <dst>")?;
+        let dst = positional
+            .get(1)
+            .copied()
+            .ok_or("trace_shortest_cone_path: need <src> <dst>")?;
+        let st = self.trace_shortest_cone_path(src, dst, stop_at_ff)?;
+        Ok(st.summary_text())
+    }
+
     pub fn collapse_cone(&mut self) -> Result<String, String> {
         self.schematic.cone_root = None;
+        self.schematic.cone_trace = ConeTraceState::default();
+        let _ = self.schematic.drawing_cache.borrow_mut().take();
         self.workspace = WorkspaceTab::Schematic;
         Ok(self.schematic_text())
     }
@@ -24437,6 +25276,7 @@ impl IdeModel {
     fn refresh_schematic(&mut self) {
         let root = self.schematic.cone_root.take();
         let depth = self.schematic.cone_depth;
+        let cone_trace = std::mem::take(&mut self.schematic.cone_trace);
         let expand = self.schematic.expand_inside.take();
         let hl_cells = std::mem::take(&mut self.schematic.highlight_cells);
         let hl_nets = std::mem::take(&mut self.schematic.highlight_nets);
@@ -24524,6 +25364,7 @@ impl IdeModel {
             ports,
             cone_root: root,
             cone_depth: depth,
+            cone_trace,
             instances,
             expand_inside: expand,
             highlight_cells: hl_cells,
@@ -43863,6 +44704,111 @@ endmodule
             .decode_transactions()
             .iter()
             .any(|tx| tx.protocol == "UART"));
+    }
+
+    #[test]
+    fn schematic_cone_tracer_fanin_fanout_shortest_path_and_stop_at_ff() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Synthesis).unwrap();
+        let d = ide.shell.session.design.as_ref().expect("design").clone();
+
+        // Fan-in cone from output IOB `u_iob`:
+        let fi1 = expand_fanin_cone(&d, "u_iob", 1);
+        assert_eq!(fi1.direction, ConeDirection::FanIn);
+        assert_eq!(fi1.hop_depths.get("u_iob"), Some(&0));
+        assert!(fi1.cells.len() >= 2, "u_iob + upstream driver: {fi1:?}");
+        assert!(!fi1.nets.is_empty());
+
+        // Stop-at-FF boundary stops at HFF registers (`u_ff3`) without crossing
+        // backwards into the LUTs driving those HFFs:
+        let fi_stop = expand_fanin_cone_opts(&d, "u_iob", 4, true);
+        let fi_full = expand_fanin_cone_opts(&d, "u_iob", 4, false);
+        assert!(fi_stop.stop_at_ff);
+        assert!(
+            fi_full.cells.len() > fi_stop.cells.len(),
+            "unbounded fan-in crosses HFF boundary into LUTs: full={:?} stop={:?}",
+            fi_full.cells,
+            fi_stop.cells
+        );
+
+        // Fan-out cone from `u_ff0`:
+        let fo1 = expand_fanout_cone(&d, "u_ff0", 1);
+        assert_eq!(fo1.direction, ConeDirection::FanOut);
+        assert_eq!(fo1.hop_depths.get("u_ff0"), Some(&0));
+        assert!(fo1.nets.iter().any(|n| n == "cnt_0"), "{fo1:?}");
+        assert!(fo1.cells.iter().any(|c| c.starts_with("u_lut")), "{fo1:?}");
+
+        // Shortest cone path from `u_ff0` to `u_iob`:
+        let sp = trace_shortest_cone_path(&d, "u_ff0/Q", "u_iob/I");
+        assert_eq!(sp.direction, ConeDirection::ShortestPath);
+        assert_eq!(sp.cells.first().map(String::as_str), Some("u_ff0"));
+        assert_eq!(sp.cells.last().map(String::as_str), Some("u_iob"));
+        assert!(!sp.nets.is_empty());
+        assert!(sp.max_hops >= 1);
+
+        // Tcl / IdeModel integration updates SchematicView cone_trace:
+        let out = ide.exec("expand_fanout_cone u_ff0 2 -stop_at_ff").unwrap();
+        assert!(out.contains("DIR=fanout"), "{out}");
+        assert!(ide.schematic.cone_trace.is_active());
+        let path_out = ide.exec("trace_shortest_cone_path u_ff0 u_iob").unwrap();
+        assert!(path_out.contains("DIR=path"), "{path_out}");
+    }
+
+    #[test]
+    fn waveform_display_mode_fixed_point_signed_dec_and_analog_samples_y() {
+        // 4-bit two's-complement samples: 0 (0), 2 (+2), 7 (+7), 14 (-2), 15 (-1), 8 (-8)
+        let samples = vec![0u64, 2, 7, 14, 15, 8];
+
+        assert_eq!(WaveformDisplayMode::Hex.format_sample(14, 4), "0xE");
+        assert_eq!(WaveformDisplayMode::Binary.format_sample(14, 4), "1110");
+        assert_eq!(WaveformDisplayMode::UnsignedDec.format_sample(14, 4), "14");
+        assert_eq!(WaveformDisplayMode::SignedDec.format_sample(14, 4), "-2");
+        assert_eq!(WaveformDisplayMode::SignedDec.format_sample(8, 4), "-8");
+        assert_eq!(WaveformDisplayMode::SignedDec.format_sample(7, 4), "7");
+
+        // Signed Q2.2 fixed-point (4-bit total, 2 fractional bits, scale = 4.0):
+        // 6 -> +1.5, 14 (-2) -> -0.5, 13 (-3) -> -0.75
+        let q22 = WaveformDisplayMode::FixedPoint {
+            frac_bits: 2,
+            signed: true,
+        };
+        assert_eq!(q22.format_sample(6, 4), "1.5");
+        assert_eq!(q22.format_sample(14, 4), "-0.5");
+        assert_eq!(q22.format_sample(13, 4), "-0.75");
+
+        // Unsigned Q2.2 fixed-point: 14 -> 14 / 4 = 3.5
+        let uq22 = WaveformDisplayMode::FixedPoint {
+            frac_bits: 2,
+            signed: false,
+        };
+        assert_eq!(uq22.format_sample(14, 4), "3.5");
+
+        // compute_analog_samples_y maps max (+7) -> top_y (10.0) and min (-8) -> bottom_y (110.0):
+        let ys = compute_analog_samples_y(&samples, 4, WaveformDisplayMode::SignedDec, 10.0, 110.0);
+        assert_eq!(ys.len(), samples.len());
+        // Sample index 2 is +7 (max) -> top_y = 10.0
+        assert!((ys[2] - 10.0).abs() < 1e-4, "max sample -> top_y: {ys:?}");
+        // Sample index 5 is -8 (min) -> bottom_y = 110.0
+        assert!((ys[5] - 110.0).abs() < 1e-4, "min sample -> bottom_y: {ys:?}");
+        // +2 is higher on screen (smaller Y) than -2:
+        assert!(ys[1] < ys[3], "+2 must sit above -2: {ys:?}");
+
+        // Tcl / IdeModel integration on a live simulation waveform:
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Synthesis).unwrap();
+        ide.exec("sim_run 8").unwrap();
+        let r = ide.exec("wave_display_mode cnt q.1").unwrap();
+        assert!(r.contains("Q.1s"), "{r}");
+        let trace = ide.wave.trace("cnt").unwrap();
+        assert_eq!(
+            trace.display_mode,
+            WaveformDisplayMode::FixedPoint {
+                frac_bits: 1,
+                signed: true
+            }
+        );
     }
 }
 

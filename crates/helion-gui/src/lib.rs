@@ -58,6 +58,9 @@ pub use ide::{
     ConstraintRow, ConstraintSection, MidRunUi,
     Pblock, ProjectSummaryGadget, PropertyRow, ProbeSelection, CrossProbeSelection,
     RtlSymbolInfo, RtlSymbolLocation, ReportCatalogRow,
+    Pblock, ProjectSummaryGadget, PropertyRow, ProbeSelection, ReportCatalogRow,
+    ConeDirection, ConeTraceState, expand_fanin_cone, expand_fanin_cone_opts,
+    expand_fanout_cone, expand_fanout_cone_opts, trace_shortest_cone_path, trace_shortest_cone_path_opts,
     NetlistRow, NetlistTree, PackageDrawing, PackagePin, SchematicCamera, SchematicDrawing, SchematicPin,
     SchematicSymbol, SchematicView, SchematicWire, ScopeNode, SimLogRow, SimObject, EcoRow, IncrementalRow, StepState, TimingPath,
     schematic_kind_label, schematic_short_name,
@@ -65,6 +68,8 @@ pub use ide::{
     RunCol, best_run_index, sort_run_indices, sweep_wns_stats,
     UltraFastStage, Utilization, UtilizationReport, UtilOccupancy, HierOccupancy, VirtualBus,
     Waveform, WaveMarker, WaveCursorRow, WaveProtocol, WaveRadix, WaveStyle, WaveTrace, WaveTransaction, WorkspaceTab, WaveDensity,
+    Waveform, WaveMarker, WaveCursorRow, WaveRadix, WaveStyle, WaveTrace, WorkspaceTab, WaveDensity,
+    WaveformDisplayMode, compute_analog_samples_y,
 };
 pub use helion_drc::{Drc, DrcSeverity, DrcViolation};
 pub use helion_sta::{
