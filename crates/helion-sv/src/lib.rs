@@ -10421,9 +10421,16 @@ fn parse_module_items<'a>(
             continue;
         }
         if p.eat_kw("always_comb") {
+            ensure_elaborated_module_params(p);
             if sim_only_for(&cur_mod()) {
-                skip_procedural_body(p);
-                continue;
+                if !non_initial_is_sim_only(p.t) {
+                    SIM_ONLY_SEEN.with(|s| {
+                        s.borrow_mut().remove(&cur_mod());
+                    });
+                } else {
+                    skip_procedural_body(p);
+                    continue;
+                }
             }
             let block = p.eat_kw("begin");
             if p.eat_sym(':') {
@@ -10446,10 +10453,17 @@ fn parse_module_items<'a>(
         }
         if p.eat_kw("always_ff") || p.eat_kw("always") || p.eat_kw("always_latch") {
             let (combo, edge_clk, negedge_only) = skip_event_control(p);
+            ensure_elaborated_module_params(p);
             if sim_only_for(&cur_mod()) {
-                let _ = (combo, edge_clk, negedge_only);
-                skip_procedural_body(p);
-                continue;
+                if !non_initial_is_sim_only(p.t) {
+                    SIM_ONLY_SEEN.with(|s| {
+                        s.borrow_mut().remove(&cur_mod());
+                    });
+                } else {
+                    let _ = (combo, edge_clk, negedge_only);
+                    skip_procedural_body(p);
+                    continue;
+                }
             }
             let block = p.eat_kw("begin");
             if p.eat_sym(':') {
@@ -10688,6 +10702,1260 @@ fn parse_module_items<'a>(
     Ok(())
 }
 
+thread_local! {
+    static GEN_FOR_STACK: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    static GEN_UNIQUIFIED: std::cell::RefCell<HashSet<usize>> = std::cell::RefCell::new(HashSet::new());
+}
+
+struct GenForGuard;
+impl Drop for GenForGuard {
+    fn drop(&mut self) {
+        GEN_FOR_STACK.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+fn push_gen_for_index(idx: usize) -> GenForGuard {
+    GEN_FOR_STACK.with(|s| {
+        if s.borrow().is_empty() {
+            GEN_UNIQUIFIED.with(|u| u.borrow_mut().clear());
+        }
+        s.borrow_mut().push(idx);
+    });
+    GenForGuard
+}
+
+fn gen_for_suffix(fallback: usize) -> String {
+    GEN_FOR_STACK.with(|s| {
+        let b = s.borrow();
+        if b.is_empty() {
+            format!("_{fallback}")
+        } else {
+            let mut out = String::new();
+            for &v in b.iter() {
+                out.push('_');
+                out.push_str(&v.to_string());
+            }
+            out
+        }
+    })
+}
+
+/// Check whether `$display`/`$write` or `===`/`!==` against X/Z occurs outside
+/// `initial` blocks. Elaboration-time `$display` sanity checks inside `initial`
+/// blocks (e.g. `axi_interconnect`) must not mark synthesizable RTL as `sim_only`.
+fn non_initial_is_sim_only(toks: &[Tok]) -> bool {
+    let mut i = 0usize;
+    while i < toks.len() {
+        if matches!(&toks[i], Tok::Kw(k) if *k == "endmodule") {
+            break;
+        }
+        if matches!(&toks[i], Tok::Kw(k) if *k == "initial") {
+            i += 1;
+            if matches!(toks.get(i), Some(Tok::Kw(k)) if *k == "begin") {
+                i += 1;
+                if matches!(toks.get(i), Some(Tok::Sym(':'))) {
+                    i += 2;
+                }
+                let mut d = 1i32;
+                while i < toks.len() && d > 0 {
+                    match &toks[i] {
+                        Tok::Kw(k) if *k == "begin" => d += 1,
+                        Tok::Kw(k) if *k == "end" => d -= 1,
+                        Tok::Kw(k) if *k == "endmodule" => break,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            } else {
+                while i < toks.len() && !matches!(&toks[i], Tok::Sym(';')) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if let Tok::Ident(s) = &toks[i] {
+            if is_sim_display(s) {
+                return true;
+            }
+        }
+        if is_case_eq_at(toks, i) && case_eq_against_xz(toks, i) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Precedence-correct constant evaluator for generate-for bounds, localparams,
+/// parameter replications (`{M_COUNT{{M_REGIONS{32'd24}}}}`), and slice bounds.
+fn eval_gen_const<'a>(p: &mut P<'a>) -> Result<u128, String> {
+    Ok(eval_gen_const_with_width(p)?.0)
+}
+
+fn eval_gen_const_with_width<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
+    let (cond, cw) = eval_gen_lor(p)?;
+    if p.eat_sym('?') {
+        let (t, tw) = eval_gen_const_with_width(p)?;
+        if !p.eat_sym(':') {
+            return Err("gen const ?:".into());
+        }
+        let (f, fw) = eval_gen_const_with_width(p)?;
+        return Ok(if cond != 0 { (t, tw.max(fw)) } else { (f, tw.max(fw)) });
+    }
+    Ok((cond, cw))
+}
+
+fn eval_gen_lor<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
+    let (mut v, mut w) = eval_gen_land(p)?;
+    while matches!(p.peek(), Some(Tok::Lor)) {
+        p.bump();
+        let (r, _) = eval_gen_land(p)?;
+        v = u128::from(v != 0 || r != 0);
+        w = 1;
+    }
+    Ok((v, w))
+}
+
+fn eval_gen_land<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
+    let (mut v, mut w) = eval_gen_bitor(p)?;
+    while matches!(p.peek(), Some(Tok::Land)) {
+        p.bump();
+        let (r, _) = eval_gen_bitor(p)?;
+        v = u128::from(v != 0 && r != 0);
+        w = 1;
+    }
+    Ok((v, w))
+}
+
+fn eval_gen_bitor<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
+    let (mut v, mut w) = eval_gen_bitxor(p)?;
+    while p.eat_sym('|') {
+        let (r, rw) = eval_gen_bitxor(p)?;
+        v |= r;
+        w = w.max(rw);
+    }
+    Ok((v, w))
+}
+
+fn eval_gen_bitxor<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
+    let (mut v, mut w) = eval_gen_bitand(p)?;
+    while p.eat_sym('^') {
+        let (r, rw) = eval_gen_bitand(p)?;
+        v ^= r;
+        w = w.max(rw);
+    }
+    Ok((v, w))
+}
+
+fn eval_gen_bitand<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
+    let (mut v, mut w) = eval_gen_eq(p)?;
+    while p.eat_sym('&') {
+        let (r, rw) = eval_gen_eq(p)?;
+        v &= r;
+        w = w.max(rw);
+    }
+    Ok((v, w))
+}
+
+fn eval_gen_eq<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
+    let (mut v, mut w) = eval_gen_rel(p)?;
+    loop {
+        if matches!(p.peek(), Some(Tok::Eq)) {
+            p.bump();
+            let (r, _) = eval_gen_rel(p)?;
+            v = u128::from(v == r);
+            w = 1;
+        } else if matches!(p.peek(), Some(Tok::Ne)) {
+            p.bump();
+            let (r, _) = eval_gen_rel(p)?;
+            v = u128::from(v != r);
+            w = 1;
+        } else {
+            break;
+        }
+    }
+    Ok((v, w))
+}
+
+fn eval_gen_rel<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
+    let (mut v, mut w) = eval_gen_shift(p)?;
+    loop {
+        if matches!(p.peek(), Some(Tok::Le)) {
+            p.bump();
+            let (r, _) = eval_gen_shift(p)?;
+            v = u128::from(v <= r);
+            w = 1;
+        } else if matches!(p.peek(), Some(Tok::Ge)) {
+            p.bump();
+            let (r, _) = eval_gen_shift(p)?;
+            v = u128::from(v >= r);
+            w = 1;
+        } else if matches!(p.peek(), Some(Tok::Sym('<')))
+            && !matches!(p.t.get(p.i + 1), Some(Tok::Sym('<')))
+        {
+            p.bump();
+            let (r, _) = eval_gen_shift(p)?;
+            v = u128::from(v < r);
+            w = 1;
+        } else if matches!(p.peek(), Some(Tok::Sym('>')))
+            && !matches!(p.t.get(p.i + 1), Some(Tok::Sym('>')))
+        {
+            p.bump();
+            let (r, _) = eval_gen_shift(p)?;
+            v = u128::from(v > r);
+            w = 1;
+        } else {
+            break;
+        }
+    }
+    Ok((v, w))
+}
+
+fn eval_gen_shift<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
+    let (mut v, w) = eval_gen_add(p)?;
+    loop {
+        if matches!(p.peek(), Some(Tok::Sym('<')))
+            && matches!(p.t.get(p.i + 1), Some(Tok::Sym('<')))
+        {
+            p.bump();
+            p.bump();
+            let _ = p.eat_sym('<');
+            let (sh, _) = eval_gen_add(p)?;
+            v = if sh >= 128 { 0 } else { v.wrapping_shl(sh as u32) };
+        } else if matches!(p.peek(), Some(Tok::Sym('>')))
+            && matches!(p.t.get(p.i + 1), Some(Tok::Sym('>')))
+        {
+            p.bump();
+            p.bump();
+            let _ = p.eat_sym('>');
+            let (sh, _) = eval_gen_add(p)?;
+            v = if sh >= 128 { 0 } else { v.wrapping_shr(sh as u32) };
+        } else {
+            break;
+        }
+    }
+    Ok((v, w))
+}
+
+fn eval_gen_add<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
+    let (mut v, mut w) = eval_gen_mul(p)?;
+    loop {
+        if matches!(p.peek(), Some(Tok::Sym('+')))
+            && !matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+        {
+            p.bump();
+            let (r, rw) = eval_gen_mul(p)?;
+            v = v.wrapping_add(r);
+            w = w.max(rw);
+        } else if matches!(p.peek(), Some(Tok::Sym('-')))
+            && !matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+        {
+            p.bump();
+            let (r, rw) = eval_gen_mul(p)?;
+            v = v.wrapping_sub(r);
+            w = w.max(rw);
+        } else {
+            break;
+        }
+    }
+    Ok((v, w))
+}
+
+fn eval_gen_mul<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
+    let (mut v, mut w) = eval_gen_pow(p)?;
+    loop {
+        if matches!(p.peek(), Some(Tok::Sym('*')))
+            && !matches!(p.t.get(p.i + 1), Some(Tok::Sym('*')))
+        {
+            p.bump();
+            let (r, rw) = eval_gen_pow(p)?;
+            v = v.wrapping_mul(r);
+            w = w.max(rw);
+        } else if p.eat_sym('/') {
+            let (r, rw) = eval_gen_pow(p)?;
+            if r == 0 {
+                return Err("div by 0".into());
+            }
+            v /= r;
+            w = w.max(rw);
+        } else if p.eat_sym('%') {
+            let (r, rw) = eval_gen_pow(p)?;
+            if r == 0 {
+                return Err("mod by 0".into());
+            }
+            v %= r;
+            w = w.max(rw);
+        } else {
+            break;
+        }
+    }
+    Ok((v, w))
+}
+
+fn eval_gen_pow<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
+    let (base, w) = eval_gen_unary(p)?;
+    if matches!(p.peek(), Some(Tok::Sym('*')))
+        && matches!(p.t.get(p.i + 1), Some(Tok::Sym('*')))
+    {
+        p.bump();
+        p.bump();
+        let (exp, _) = eval_gen_pow(p)?;
+        return Ok((base.saturating_pow((exp as u32).min(63)), w));
+    }
+    Ok((base, w))
+}
+
+fn eval_gen_unary<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
+    if p.eat_sym('+') {
+        return eval_gen_unary(p);
+    }
+    if p.eat_sym('-') {
+        let (n, w) = eval_gen_unary(p)?;
+        return Ok((0u128.wrapping_sub(n), w));
+    }
+    if p.eat_sym('!') {
+        let (n, _) = eval_gen_unary(p)?;
+        return Ok((u128::from(n == 0), 1));
+    }
+    if p.eat_sym('~') {
+        let (n, w) = eval_gen_unary(p)?;
+        let mask = if w == 0 || w >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << w) - 1
+        };
+        return Ok(((!n) & mask, w));
+    }
+    if p.eat_sym('|') {
+        let (n, _) = eval_gen_unary(p)?;
+        return Ok((u128::from(n != 0), 1));
+    }
+    if p.eat_sym('&') {
+        let (n, w) = eval_gen_unary(p)?;
+        let mask = if w == 0 || w >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << w) - 1
+        };
+        return Ok((u128::from((n & mask) == mask), 1));
+    }
+    if p.eat_sym('^') {
+        let (n, _) = eval_gen_unary(p)?;
+        return Ok(((n.count_ones() % 2) as u128, 1));
+    }
+    eval_gen_atom(p)
+}
+
+fn eval_gen_param_select<'a>(p: &mut P<'a>, val: u128, base_w: usize) -> Result<(u128, usize), String> {
+    if !p.eat_sym('[') {
+        return Ok((val, base_w));
+    }
+    let (a, _) = eval_gen_const_with_width(p)?;
+    if p.eat_sym('+') && p.eat_sym(':') {
+        let (w, _) = eval_gen_const_with_width(p)?;
+        if !p.eat_sym(']') {
+            return Err("param +: ]".into());
+        }
+        let w = (w as usize).max(1).min(128);
+        let lo = a as usize;
+        let shifted = if lo >= 128 { 0 } else { val >> lo };
+        return Ok((shifted & care_mask(w), w));
+    }
+    if p.eat_sym('-') && p.eat_sym(':') {
+        let (w, _) = eval_gen_const_with_width(p)?;
+        if !p.eat_sym(']') {
+            return Err("param -: ]".into());
+        }
+        let w = (w as usize).max(1).min(128);
+        let hi = a as usize;
+        let lo = hi.saturating_sub(w.saturating_sub(1));
+        let shifted = if lo >= 128 { 0 } else { val >> lo };
+        return Ok((shifted & care_mask(w), w));
+    }
+    if p.eat_sym(':') {
+        let (b, _) = eval_gen_const_with_width(p)?;
+        if !p.eat_sym(']') {
+            return Err("param : ]".into());
+        }
+        let hi = (a as usize).max(b as usize);
+        let lo = (a as usize).min(b as usize);
+        let w = hi.saturating_sub(lo).saturating_add(1).max(1).min(128);
+        let shifted = if lo >= 128 { 0 } else { val >> lo };
+        return Ok((shifted & care_mask(w), w));
+    }
+    if !p.eat_sym(']') {
+        return Err("param [b] ]".into());
+    }
+    let bit = a as usize;
+    let bval = if bit >= 128 { 0 } else { (val >> bit) & 1 };
+    Ok((bval, 1))
+}
+
+fn eval_gen_atom<'a>(p: &mut P<'a>) -> Result<(u128, usize), String> {
+    if p.eat_sym('(') {
+        let (v, w) = eval_gen_const_with_width(p)?;
+        if !p.eat_sym(')') {
+            return Err("gen const )".into());
+        }
+        if matches!(p.peek(), Some(Tok::Sym('\'')))
+            && matches!(p.t.get(p.i + 1), Some(Tok::Sym('(')))
+        {
+            p.bump();
+            p.bump();
+            let (inner, _) = eval_gen_const_with_width(p)?;
+            if !p.eat_sym(')') {
+                return Err("gen cast )".into());
+            }
+            let cw = (v as usize).max(1).min(128);
+            return Ok((inner & care_mask(cw), cw));
+        }
+        return Ok((v, w));
+    }
+    if p.eat_sym('{') {
+        let (first, fw) = eval_gen_const_with_width(p)?;
+        if p.eat_sym('{') {
+            let (inner, iw) = eval_gen_const_with_width(p)?;
+            if !p.eat_sym('}') || !p.eat_sym('}') {
+                return Err("gen replic }}".into());
+            }
+            let n = (first as usize).min(128);
+            let w = iw.max(1);
+            let mut acc = 0u128;
+            let mut tw = 0usize;
+            for _ in 0..n {
+                if tw < 128 {
+                    acc |= (inner & care_mask(w.min(128))) << tw;
+                }
+                tw = tw.saturating_add(w);
+            }
+            let out_w = (n * w).max(1).min(128);
+            return Ok((acc & care_mask(out_w), out_w));
+        }
+        let mut acc = first & care_mask(fw.max(1).min(128));
+        let mut tw = fw.max(1);
+        while p.eat_sym(',') {
+            let (part, pw) = eval_gen_const_with_width(p)?;
+            let pw = pw.max(1).min(128);
+            acc = if tw >= 128 {
+                part & care_mask(pw)
+            } else {
+                (acc << pw) | (part & care_mask(pw))
+            };
+            tw = tw.saturating_add(pw).min(128);
+        }
+        if !p.eat_sym('}') {
+            return Err("gen concat }".into());
+        }
+        return Ok((acc & care_mask(tw.max(1)), tw.max(1)));
+    }
+    match p.peek() {
+        Some(Tok::Number(v, w)) => {
+            let val = *v;
+            let width = (*w).max(1);
+            p.bump();
+            if matches!(p.peek(), Some(Tok::Sym('\'')))
+                && matches!(p.t.get(p.i + 1), Some(Tok::Sym('(')))
+            {
+                p.bump();
+                p.bump();
+                let (inner, _) = eval_gen_const_with_width(p)?;
+                if !p.eat_sym(')') {
+                    return Err("gen num cast )".into());
+                }
+                let cw = (val as usize).max(1).min(128);
+                return Ok((inner & care_mask(cw), cw));
+            }
+            eval_gen_param_select(p, val, width)
+        }
+        Some(Tok::Pat { val, width, .. }) => {
+            let v = *val;
+            let w = (*width).max(1);
+            p.bump();
+            eval_gen_param_select(p, v, w)
+        }
+        Some(Tok::Str(s)) => {
+            let h = str_param_hash(s);
+            p.bump();
+            Ok((h, 32))
+        }
+        Some(Tok::Kw(k))
+            if *k == "unsigned" || *k == "signed" || *k == "int" || *k == "integer" =>
+        {
+            p.bump();
+            if !(p.eat_sym('\'') && p.eat_sym('(')) {
+                return Err("gen kw cast".into());
+            }
+            let (v, w) = eval_gen_const_with_width(p)?;
+            if !p.eat_sym(')') {
+                return Err("gen kw cast )".into());
+            }
+            Ok((v, w))
+        }
+        Some(Tok::Ident(s)) if *s == "$bits" => {
+            p.bump();
+            Ok((parse_bits_width(p)?, 32))
+        }
+        Some(Tok::Ident(s)) if *s == "$clog2" => {
+            p.bump();
+            if !p.eat_sym('(') {
+                return Err("$clog2 (".into());
+            }
+            let (arg, _) = eval_gen_const_with_width(p)?;
+            if !p.eat_sym(')') {
+                return Err("$clog2 )".into());
+            }
+            Ok((clog2_u(arg), 32))
+        }
+        Some(Tok::Ident(s)) if *s == "$unsigned" || *s == "$signed" => {
+            p.bump();
+            if !p.eat_sym('(') {
+                return Err("$unsigned (".into());
+            }
+            let (arg, w) = eval_gen_const_with_width(p)?;
+            if !p.eat_sym(')') {
+                return Err("$unsigned )".into());
+            }
+            Ok((arg, w))
+        }
+        Some(Tok::Ident(s)) => {
+            let mut name = s.to_string();
+            p.bump();
+            if p.eat_sym('\'') && p.eat_sym('(') {
+                let (inner, w) = eval_gen_const_with_width(p)?;
+                if !p.eat_sym(')') {
+                    return Err("ident cast )".into());
+                }
+                if let Some(&pw) = p.params.get(&name) {
+                    let cw = (pw as usize).max(1).min(128);
+                    return Ok((inner & care_mask(cw), cw));
+                }
+                return Ok((inner, w));
+            }
+            if matches!(p.peek(), Some(Tok::Sym(':')))
+                && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+                && matches!(p.t.get(p.i + 2), Some(Tok::Ident(_)))
+            {
+                p.bump();
+                p.bump();
+                name = p.ident()?.to_string();
+            }
+            if (name == "idx_width" || name == "vbits") && p.eat_sym('(') {
+                let (n, _) = eval_gen_const_with_width(p)?;
+                let _ = p.eat_sym(')');
+                return Ok((if n > 1 { clog2_u(n) } else { 1 }, 32));
+            }
+            if name == "calcBaseAddrs" && p.eat_sym('(') {
+                skip_until_arg_end(p);
+                let _ = p.eat_sym(')');
+                // Evaluate default aligned base addresses for axi_interconnect.
+                let m_count = p.params.get("M_COUNT").copied().unwrap_or(4) as usize;
+                let m_regions = p.params.get("M_REGIONS").copied().unwrap_or(1) as usize;
+                let addr_w = p.params.get("ADDR_WIDTH").copied().unwrap_or(32) as usize;
+                let m_addr_w = p.params.get("M_ADDR_WIDTH").copied().unwrap_or(0);
+                let mut calc = 0u128;
+                let mut base = 0u128;
+                let total = (m_count * m_regions).min(4);
+                for idx in 0..total {
+                    let w = ((m_addr_w >> (idx * 32)) & 0xffff_ffff) as u32;
+                    if w > 0 && (w as usize) <= addr_w {
+                        let size = 1u128.checked_shl(w).unwrap_or(0);
+                        let mask = size.wrapping_sub(1);
+                        if (base & mask) != 0 {
+                            base = base.wrapping_add(size).wrapping_sub(base & mask);
+                        }
+                        if idx * addr_w < 128 {
+                            calc |= (base & care_mask(addr_w.min(128))) << (idx * addr_w);
+                        }
+                        base = base.wrapping_add(size);
+                    }
+                }
+                return Ok((calc, (total * addr_w).max(1).min(128)));
+            }
+            if let Some(v) = p.params.get(&name).copied() {
+                return eval_gen_param_select(p, v, 128);
+            }
+            if let Some(v) = pkg_enum_get(&name).or_else(|| enum_const_default(&name)) {
+                return eval_gen_param_select(p, v, 32);
+            }
+            Err(format!("unknown gen const {name}"))
+        }
+        other => Err(format!("gen const atom {other:?}")),
+    }
+}
+
+/// Populate module parameters that `const_u` skipped (such as nested replications
+/// `{M_COUNT{{M_REGIONS{32'd24}}}}` or `calcBaseAddrs(0)` in `axi_interconnect`).
+fn ensure_elaborated_module_params<'a>(p: &mut P<'a>) {
+    let limit = p.i.min(p.t.len());
+    let mut idx = 0usize;
+    while idx < limit {
+        match &p.t[idx] {
+            Tok::Kw(k) if *k == "parameter" || *k == "localparam" => {
+                idx += 1;
+                let mut sub = P {
+                    t: &p.t[..limit],
+                    i: idx,
+                    arena: p.arena,
+                    params: p.params.clone(),
+                    widths: p.widths.clone(),
+                    signed: p.signed.clone(),
+                };
+                loop {
+                    skip_sv_type(&mut sub);
+                    let Ok(mut name) = sub.ident() else {
+                        break;
+                    };
+                    if matches!(sub.peek(), Some(Tok::Ident(_))) {
+                        name = sub.ident().unwrap_or(name);
+                    }
+                    skip_sv_type(&mut sub);
+                    if sub.eat_sym('=') {
+                        let val_start = sub.i;
+                        if let Ok(val) = eval_gen_const(&mut sub) {
+                            if matches!(
+                                sub.peek(),
+                                Some(Tok::Sym(',')) | Some(Tok::Sym(';')) | Some(Tok::Sym(')'))
+                            ) {
+                                p.params.entry(name.to_string()).or_insert(val);
+                                sub.params.entry(name.to_string()).or_insert(val);
+                            } else {
+                                sub.i = val_start;
+                                skip_until_arg_end(&mut sub);
+                            }
+                        } else {
+                            sub.i = val_start;
+                            skip_until_arg_end(&mut sub);
+                        }
+                    }
+                    if sub.eat_sym(',') {
+                        // In ANSI header `#(parameter A = 1, parameter B = 2)`, next
+                        // item may start with `parameter` / `localparam` or port dir.
+                        if matches!(
+                            sub.peek(),
+                            Some(Tok::Kw(kw))
+                                if matches!(*kw, "parameter" | "localparam" | "input" | "output" | "inout")
+                        ) {
+                            break;
+                        }
+                        continue;
+                    }
+                    break;
+                }
+                idx = sub.i.max(idx + 1);
+            }
+            Tok::Kw(k) if *k == "for" || *k == "always" || *k == "always_comb" || *k == "always_ff" => {
+                break;
+            }
+            _ => idx += 1,
+        }
+    }
+}
+
+fn parse_gen_for_step_signed<'a>(p: &mut P<'a>) -> Result<i64, String> {
+    let _ = parse_for_step;
+    if p.eat_sym('+') && p.eat_sym('+') {
+        let _ = p.ident()?;
+        return Ok(1);
+    }
+    if p.eat_sym('-') && p.eat_sym('-') {
+        let _ = p.ident()?;
+        return Ok(-1);
+    }
+    let var = p.ident()?;
+    if p.eat_sym('+') {
+        if p.eat_sym('+') {
+            return Ok(1);
+        }
+        if p.eat_sym('=') {
+            let n = eval_gen_const(p)? as i64;
+            return Ok(n.max(1));
+        }
+        return Err("for step +".into());
+    }
+    if p.eat_sym('-') {
+        if p.eat_sym('-') {
+            return Ok(-1);
+        }
+        if p.eat_sym('=') {
+            let n = eval_gen_const(p)? as i64;
+            return Ok(-(n.max(1)));
+        }
+        return Err("for step -".into());
+    }
+    if p.eat_sym('=') {
+        let save = p.i;
+        if let Ok(lhs_id) = p.ident() {
+            if lhs_id == var {
+                if p.eat_sym('+') {
+                    let n = eval_gen_const(p)? as i64;
+                    return Ok(n.max(1));
+                }
+                if p.eat_sym('-') {
+                    let n = eval_gen_const(p)? as i64;
+                    return Ok(-(n.max(1)));
+                }
+            }
+        }
+        p.i = save;
+        let n = eval_gen_const(p)? as i64;
+        if p.eat_sym('+') {
+            let _ = p.ident()?;
+            return Ok(n.max(1));
+        }
+        return Err("for step =".into());
+    }
+    Err("for step".into())
+}
+
+/// Scan a single generate item when a `for` loop does not have `begin ... end`.
+fn skip_gen_single_item<'a>(p: &mut P<'a>) -> Result<(), String> {
+    if p.eat_kw("begin") {
+        if p.eat_sym(':') {
+            let _ = p.ident();
+        }
+        skip_begin_end(p)?;
+        if p.eat_sym(':') {
+            let _ = p.ident();
+        }
+        return Ok(());
+    }
+    if p.eat_kw("for") {
+        if !skip_balanced_paren(p) {
+            return Err("nested for (".into());
+        }
+        return skip_gen_single_item(p);
+    }
+    if p.eat_kw("if") {
+        if !skip_balanced_paren(p) {
+            return Err("nested if (".into());
+        }
+        skip_gen_single_item(p)?;
+        while p.eat_kw("else") {
+            if p.eat_kw("if") {
+                if !skip_balanced_paren(p) {
+                    return Err("nested else if (".into());
+                }
+                skip_gen_single_item(p)?;
+            } else {
+                skip_gen_single_item(p)?;
+                break;
+            }
+        }
+        return Ok(());
+    }
+    if p.eat_kw("always") || p.eat_kw("always_comb") || p.eat_kw("always_ff") || p.eat_kw("always_latch") {
+        let _ = skip_event_control(p);
+        return skip_gen_single_item(p);
+    }
+    let mut d = 0i32;
+    while p.peek().is_some() {
+        if d == 0 && p.eat_sym(';') {
+            return Ok(());
+        }
+        match p.peek() {
+            Some(Tok::Kw(k)) if *k == "begin" => {
+                p.bump();
+                d += 1;
+            }
+            Some(Tok::Kw(k)) if *k == "end" => {
+                p.bump();
+                d -= 1;
+                if d <= 0 {
+                    if p.eat_sym(':') {
+                        let _ = p.ident();
+                    }
+                    return Ok(());
+                }
+            }
+            _ => {
+                p.bump();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Check whether `name` is declared with >=2 unpacked dimensions (`wire [W-1:0] name [M][S]`)
+/// or >=3 packed dimensions (`logic [M-1:0][S-1:0][W-1:0] name`).
+fn decl_is_multi_dim_vec(toks: &[Tok], name: &str) -> bool {
+    let mut i = 0usize;
+    while i < toks.len() {
+        if let Tok::Kw(k) = &toks[i] {
+            if matches!(*k, "wire" | "reg" | "logic" | "bit" | "input" | "output" | "inout") {
+                i += 1;
+                while i < toks.len() {
+                    if let Tok::Kw(q) = &toks[i] {
+                        if matches!(*q, "wire" | "reg" | "logic" | "bit" | "signed" | "unsigned" | "var") {
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                let mut n_packed = 0usize;
+                while matches!(toks.get(i), Some(Tok::Sym('['))) {
+                    n_packed += 1;
+                    let mut d = 1i32;
+                    i += 1;
+                    while i < toks.len() && d > 0 {
+                        match &toks[i] {
+                            Tok::Sym('[') => d += 1,
+                            Tok::Sym(']') => d -= 1,
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+                loop {
+                    let Some(Tok::Ident(id)) = toks.get(i) else {
+                        break;
+                    };
+                    let this_id = *id;
+                    i += 1;
+                    let mut n_unpacked = 0usize;
+                    while matches!(toks.get(i), Some(Tok::Sym('['))) {
+                        n_unpacked += 1;
+                        let mut d = 1i32;
+                        i += 1;
+                        while i < toks.len() && d > 0 {
+                            match &toks[i] {
+                                Tok::Sym('[') => d += 1,
+                                Tok::Sym(']') => d -= 1,
+                                _ => {}
+                            }
+                            i += 1;
+                        }
+                    }
+                    if this_id == name && (n_packed >= 3 || (n_packed >= 1 && n_unpacked >= 2)) {
+                        return true;
+                    }
+                    if matches!(toks.get(i), Some(Tok::Sym(','))) {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Evaluate top-level `localparam`/`parameter` declarations in `body` for one iteration
+/// and fold constant expressions and 2D array indices into `toks`.
+fn prepare_gen_iter_tokens<'a>(
+    body: &[Tok<'a>],
+    mod_toks: &[Tok<'a>],
+    var: &str,
+    iter_val: u128,
+    iter_params: &mut HashMap<String, u128>,
+    iter_widths: &mut HashMap<&'a str, usize>,
+    signals: &mut Vec<Signal<'a>>,
+    arena: &'a Bump,
+) -> Vec<Tok<'a>> {
+    iter_params.insert(var.to_string(), iter_val);
+    let mut local_consts: HashMap<String, u128> = HashMap::new();
+    local_consts.insert(var.to_string(), iter_val);
+
+    // Pass 1: Substitute `var` and already-known localparams at top block level,
+    // while evaluating `localparam`/`parameter` declarations in sequence.
+    let mut pass1: Vec<Tok<'a>> = Vec::with_capacity(body.len() + 2);
+    let mut idx = 0usize;
+    let mut for_depth = 0i32;
+    while idx < body.len() {
+        // Strip `: label` immediately after `end` (`end : gen_level`).
+        if matches!(body.get(idx), Some(Tok::Kw(k)) if *k == "end") {
+            pass1.push(body[idx].clone());
+            idx += 1;
+            if matches!(body.get(idx), Some(Tok::Sym(':')))
+                && matches!(body.get(idx + 1), Some(Tok::Ident(_) | Tok::Kw(_)))
+            {
+                idx += 2;
+            }
+            continue;
+        }
+        // Expand comma-separated `genvar i, j;` into separate `genvar i; genvar j;`.
+        if matches!(body.get(idx), Some(Tok::Kw(k)) if *k == "genvar")
+            && !matches!(body.last(), Some(Tok::Sym('(')))
+        {
+            idx += 1;
+            while let Some(Tok::Ident(gv)) = body.get(idx) {
+                pass1.push(Tok::Kw("genvar"));
+                pass1.push(Tok::Ident(gv));
+                pass1.push(Tok::Sym(';'));
+                idx += 1;
+                if matches!(body.get(idx), Some(Tok::Sym(','))) {
+                    idx += 1;
+                } else {
+                    break;
+                }
+            }
+            if matches!(body.get(idx), Some(Tok::Sym(';'))) {
+                idx += 1;
+            }
+            continue;
+        }
+        if matches!(body.get(idx), Some(Tok::Kw(k)) if *k == "for") {
+            for_depth += 1;
+        }
+        // Evaluate top-level `localparam` / `parameter` declarations with current loop bindings.
+        if for_depth == 0
+            && matches!(body.get(idx), Some(Tok::Kw(k)) if *k == "localparam" || *k == "parameter")
+        {
+            let kw = body[idx].clone();
+            idx += 1;
+            // Substitute known `local_consts` in the slice up to `;` so `eval_gen_const` sees `var`.
+            let decl_start = idx;
+            let mut semi_end = idx;
+            let mut pdepth = 0i32;
+            while semi_end < body.len() {
+                match &body[semi_end] {
+                    Tok::Sym('(' | '[' | '{') => pdepth += 1,
+                    Tok::Sym(')' | ']' | '}') => pdepth = (pdepth - 1).max(0),
+                    Tok::Sym(';') if pdepth == 0 => break,
+                    _ => {}
+                }
+                semi_end += 1;
+            }
+            let mut sub_toks: Vec<Tok<'a>> = Vec::with_capacity(semi_end - decl_start + 1);
+            for k_i in decl_start..semi_end {
+                let prev_dot = k_i > decl_start && matches!(body.get(k_i - 1), Some(Tok::Sym('.')));
+                let next_eq = matches!(body.get(k_i + 1), Some(Tok::Sym('=')));
+                match &body[k_i] {
+                    Tok::Ident(s) if !prev_dot && !next_eq && local_consts.contains_key(*s) => {
+                        sub_toks.push(Tok::Number(local_consts[*s], 32));
+                    }
+                    other => sub_toks.push(other.clone()),
+                }
+            }
+            sub_toks.push(Tok::Sym(';'));
+            let mut sp = P {
+                t: arena.alloc_slice_clone(&sub_toks),
+                i: 0,
+                arena,
+                params: iter_params.clone(),
+                widths: iter_widths.clone(),
+                signed: HashSet::new(),
+            };
+            loop {
+                skip_sv_type(&mut sp);
+                let Ok(mut pname) = sp.ident() else {
+                    break;
+                };
+                if matches!(sp.peek(), Some(Tok::Ident(_))) {
+                    pname = sp.ident().unwrap_or(pname);
+                }
+                skip_sv_type(&mut sp);
+                if sp.eat_sym('=') {
+                    if let Some(Tok::Str(sval)) = sp.peek() {
+                        let h = str_param_hash(sval);
+                        sp.bump();
+                        iter_params.insert(pname.to_string(), h);
+                        local_consts.insert(pname.to_string(), h);
+                        pass1.push(kw.clone());
+                        pass1.push(Tok::Ident(pname));
+                        pass1.push(Tok::Sym('='));
+                        pass1.push(Tok::Number(h, 32));
+                        pass1.push(Tok::Sym(';'));
+                    } else if let Ok(val) = eval_gen_const(&mut sp) {
+                        iter_params.insert(pname.to_string(), val);
+                        local_consts.insert(pname.to_string(), val);
+                        pass1.push(kw.clone());
+                        pass1.push(Tok::Ident(pname));
+                        pass1.push(Tok::Sym('='));
+                        pass1.push(Tok::Number(val, 32));
+                        pass1.push(Tok::Sym(';'));
+                    } else {
+                        skip_until_arg_end(&mut sp);
+                    }
+                }
+                if sp.eat_sym(',') {
+                    continue;
+                }
+                break;
+            }
+            idx = (semi_end + 1).min(body.len());
+            continue;
+        }
+        let prev_dot = idx > 0 && matches!(body.get(idx - 1), Some(Tok::Sym('.')));
+        match &body[idx] {
+            Tok::Ident(s) if !prev_dot => {
+                if let Some(&val) = local_consts.get(*s) {
+                    pass1.push(Tok::Number(val, 32));
+                } else {
+                    pass1.push(body[idx].clone());
+                }
+            }
+            other => pass1.push(other.clone()),
+        }
+        idx += 1;
+    }
+
+    // Pass 2: Fold constant parameter slices (`PARAM[base +: w]`, `PARAM[hi:lo]`, `PARAM[b]`)
+    // and fold constant subexpressions inside `[...]` brackets using `eval_gen_const`.
+    let mut pass2: Vec<Tok<'a>> = Vec::with_capacity(pass1.len());
+    let mut i = 0usize;
+    while i < pass1.len() {
+        let prev_dot = i > 0 && matches!(pass1.get(i - 1), Some(Tok::Sym('.')));
+        if let Tok::Ident(name) = &pass1[i] {
+            if !prev_dot
+                && iter_params.contains_key(*name)
+                && matches!(pass1.get(i + 1), Some(Tok::Sym('[')))
+            {
+                let mut sp = P {
+                    t: &pass1,
+                    i,
+                    arena,
+                    params: iter_params.clone(),
+                    widths: iter_widths.clone(),
+                    signed: HashSet::new(),
+                };
+                if let Ok((val, w)) = eval_gen_atom(&mut sp) {
+                    pass2.push(Tok::Number(val, w));
+                    i = sp.i;
+                    continue;
+                }
+            }
+        }
+        if matches!(pass1.get(i), Some(Tok::Sym('['))) {
+            // Find matching `]`.
+            let mut d = 1i32;
+            let mut close = i + 1;
+            while close < pass1.len() && d > 0 {
+                match &pass1[close] {
+                    Tok::Sym('[') => d += 1,
+                    Tok::Sym(']') => d -= 1,
+                    _ => {}
+                }
+                if d > 0 {
+                    close += 1;
+                }
+            }
+            if d == 0 && close > i + 1 {
+                let inner = &pass1[i + 1..close];
+                if let Some(folded) = try_fold_bracket_inner(inner, arena, iter_params, iter_widths) {
+                    pass2.push(Tok::Sym('['));
+                    pass2.extend(folded);
+                    pass2.push(Tok::Sym(']'));
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
+        pass2.push(pass1[i].clone());
+        i += 1;
+    }
+
+    // Pass 3: Handle 2D / multidimensional indexing `arr[c1][c2]` and `arr[c1][hi:lo]`.
+    let mut pass3: Vec<Tok<'a>> = Vec::with_capacity(pass2.len());
+    let mut j = 0usize;
+    while j < pass2.len() {
+        let prev_dot = j > 0 && matches!(pass2.get(j - 1), Some(Tok::Sym('.')));
+        if let Some(Tok::Ident(arr)) = pass2.get(j) {
+            let arr = *arr;
+            if !prev_dot
+                && !iter_params.contains_key(arr)
+                && matches!(pass2.get(j + 1), Some(Tok::Sym('[')))
+                && matches!(pass2.get(j + 2), Some(Tok::Number(_, _)))
+                && matches!(pass2.get(j + 3), Some(Tok::Sym(']')))
+                && matches!(pass2.get(j + 4), Some(Tok::Sym('[')))
+            {
+                let c1 = match pass2.get(j + 2) {
+                    Some(Tok::Number(v, _)) => *v as usize,
+                    _ => 0,
+                };
+                // Case 3a: `arr[c1][c2]` (two scalar constant indices)
+                if let (Some(Tok::Number(c2_u, _)), Some(Tok::Sym(']'))) =
+                    (pass2.get(j + 5), pass2.get(j + 6))
+                {
+                    let c2 = *c2_u as usize;
+                    let has_third_bracket = matches!(pass2.get(j + 7), Some(Tok::Sym('[')));
+                    let is_vec_2d =
+                        decl_is_multi_dim_vec(mod_toks, arr) || decl_is_multi_dim_vec(body, arr);
+                    let base_w = signals
+                        .iter()
+                        .find(|s| s.name == arr)
+                        .map(|s| s.width)
+                        .or_else(|| iter_widths.get(arr).copied())
+                        .unwrap_or(1)
+                        .max(1);
+                    let flat_name: &'a str = arena.alloc_str(&format!("{arr}_w{c1}_{c2}"));
+                    if is_vec_2d || has_third_bracket {
+                        if !signals.iter().any(|s| s.name == flat_name) {
+                            signals.push(Signal {
+                                name: flat_name,
+                                width: base_w,
+                                depth: 0,
+                                keep: false,
+                                mark_debug: false,
+                                force_bram: false,
+                            });
+                        }
+                        iter_widths.insert(flat_name, base_w);
+                        pass3.push(Tok::Ident(flat_name));
+                        j += 7;
+                        continue;
+                    } else {
+                        // 1-bit element of 2D array: ensure `arr` has depth >= (c1+1).max(2)
+                        // and width >= (c2+1).max(2) so `unpacked_word_q(arr, c1, w, c2)`
+                        // maps to `{arr}_w{c1}_{c2}` on both LHS and RHS, and register
+                        // `{arr}_w{c1}_{c2}` as a 1-bit signal for instance ports / NBAs.
+                        let req_d = (c1 + 1).max(2).min(4096);
+                        let req_w = (c2 + 1).max(2).min(4096);
+                        if let Some(sig) = signals.iter_mut().find(|s| s.name == arr) {
+                            sig.depth = sig.depth.max(req_d);
+                            sig.width = sig.width.max(req_w);
+                            iter_widths.insert(arr, sig.width);
+                        } else {
+                            signals.push(Signal {
+                                name: arr,
+                                width: req_w,
+                                depth: req_d,
+                                keep: false,
+                                mark_debug: false,
+                                force_bram: false,
+                            });
+                            iter_widths.insert(arr, req_w);
+                        }
+                        if !signals.iter().any(|s| s.name == flat_name) {
+                            signals.push(Signal {
+                                name: flat_name,
+                                width: 1,
+                                depth: 0,
+                                keep: false,
+                                mark_debug: false,
+                                force_bram: false,
+                            });
+                        }
+                        iter_widths.insert(flat_name, 1);
+                    }
+                } else if let (
+                    Some(Tok::Number(hi_u, _)),
+                    Some(Tok::Sym(':')),
+                    Some(Tok::Number(lo_u, _)),
+                    Some(Tok::Sym(']')),
+                ) = (
+                    pass2.get(j + 5),
+                    pass2.get(j + 6),
+                    pass2.get(j + 7),
+                    pass2.get(j + 8),
+                ) {
+                    // Case 3b: `arr[c1][hi:lo]` — ensure `arr` has sufficient depth and width.
+                    let max_b = (*hi_u as usize).max(*lo_u as usize);
+                    let req_d = (c1 + 1).max(2).min(4096);
+                    let req_w = (max_b + 1).max(2).min(4096);
+                    if let Some(sig) = signals.iter_mut().find(|s| s.name == arr) {
+                        sig.depth = sig.depth.max(req_d);
+                        sig.width = sig.width.max(req_w);
+                        iter_widths.insert(arr, sig.width);
+                    } else {
+                        signals.push(Signal {
+                            name: arr,
+                            width: req_w,
+                            depth: req_d,
+                            keep: false,
+                            mark_debug: false,
+                            force_bram: false,
+                        });
+                        iter_widths.insert(arr, req_w);
+                    }
+                }
+            }
+        }
+        pass3.push(pass2[j].clone());
+        j += 1;
+    }
+    pass3
+}
+
+/// Try to fold constant expressions inside `[...]` (`[expr]`, `[msb:lsb]`,
+/// `[base +: w]`, `[base -: w]`) using precedence-correct `eval_gen_const`.
+fn try_fold_bracket_inner<'a>(
+    inner: &[Tok<'a>],
+    arena: &'a Bump,
+    params: &HashMap<String, u128>,
+    widths: &HashMap<&'a str, usize>,
+) -> Option<Vec<Tok<'a>>> {
+    // Find top-level `+:` / `-:` or `:` inside `inner`.
+    let mut d = 0i32;
+    let mut sep_pos: Option<(usize, usize)> = None;
+    let mut i = 0usize;
+    while i < inner.len() {
+        match &inner[i] {
+            Tok::Sym('(' | '[' | '{') => d += 1,
+            Tok::Sym(')' | ']' | '}') => d -= 1,
+            Tok::Sym('+' | '-') if d == 0 && matches!(inner.get(i + 1), Some(Tok::Sym(':'))) => {
+                sep_pos = Some((i, 2));
+                break;
+            }
+            Tok::Sym(':')
+                if d == 0
+                    && !matches!(inner.get(i + 1), Some(Tok::Sym(':')))
+                    && !(i > 0 && matches!(inner.get(i - 1), Some(Tok::Sym(':')))) =>
+            {
+                // Only treat `:` as range separator if there is no top-level `?` before it.
+                if !inner[..i].iter().any(|t| matches!(t, Tok::Sym('?'))) {
+                    sep_pos = Some((i, 1));
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let eval_slice = |slice: &[Tok<'a>]| -> Option<u128> {
+        if slice.is_empty() {
+            return None;
+        }
+        let mut sp = P {
+            t: slice,
+            i: 0,
+            arena,
+            params: params.clone(),
+            widths: widths.clone(),
+            signed: HashSet::new(),
+        };
+        let val = eval_gen_const(&mut sp).ok()?;
+        if sp.i == slice.len() {
+            Some(val)
+        } else {
+            None
+        }
+    };
+    if let Some((pos, len)) = sep_pos {
+        let lhs_slice = &inner[..pos];
+        let rhs_slice = &inner[pos + len..];
+        let lhs_folded = eval_slice(lhs_slice);
+        let rhs_folded = eval_slice(rhs_slice);
+        if lhs_folded.is_none() && rhs_folded.is_none() {
+            return None;
+        }
+        let mut out = Vec::new();
+        if let Some(lv) = lhs_folded {
+            out.push(Tok::Number(lv, 32));
+        } else {
+            out.extend_from_slice(lhs_slice);
+        }
+        for k in pos..pos + len {
+            out.push(inner[k].clone());
+        }
+        if let Some(rv) = rhs_folded {
+            out.push(Tok::Number(rv, 32));
+        } else {
+            out.extend_from_slice(rhs_slice);
+        }
+        Some(out)
+    } else {
+        let v = eval_slice(inner)?;
+        Some(vec![Tok::Number(v, 32)])
+    }
+}
+
 fn parse_for_unroll_module<'a>(
     p: &mut P<'a>,
     signals: &mut Vec<Signal<'a>>,
@@ -10699,50 +11967,89 @@ fn parse_for_unroll_module<'a>(
     sva_conc: &mut Vec<ConcPropAst<'a>>,
     sva_imm: &mut Vec<ImmAssertAst<'a>>,
 ) -> Result<(), String> {
+    ensure_elaborated_module_params(p);
     if !p.eat_sym('(') {
         return Err("for (".into());
     }
-    let _ = p.eat_kw("int");
-    let _ = p.eat_kw("integer");
-    let _ = p.eat_kw("genvar");
-    let _ = p.eat_kw("unsigned");
-    let _ = p.eat_kw("signed");
+    while matches!(
+        p.peek(),
+        Some(Tok::Kw(k))
+            if matches!(
+                *k,
+                "int" | "integer" | "genvar" | "unsigned" | "signed" | "bit" | "logic" | "reg"
+            )
+    ) {
+        p.bump();
+    }
     let var = p.ident()?;
     if !p.eat_sym('=') {
         return Err("for =".into());
     }
-    let start = const_u(p)? as usize;
+    let start_val = eval_gen_const(p)? as usize;
     if !p.eat_sym(';') {
         return Err("for ;".into());
     }
-    // `unsigned'(j) < Width` — `unsigned` is a keyword, then the loop var.
+    // `unsigned'(j) < Width` — optional cast or parens around the loop var.
     if eat_unsigned_cast_prefix(p) {
+        let _ = p.ident();
+        let _ = p.eat_sym(')');
+    } else if p.eat_sym('(') {
         let _ = p.ident();
         let _ = p.eat_sym(')');
     } else {
         let _ = p.ident();
     }
-    let inclusive = if matches!(p.peek(), Some(Tok::Le)) {
+    let (inclusive, descending, ne_cmp) = if matches!(p.peek(), Some(Tok::Le)) {
         p.bump();
-        true
+        (true, false, false)
+    } else if matches!(p.peek(), Some(Tok::Ge)) {
+        p.bump();
+        (true, true, false)
+    } else if matches!(p.peek(), Some(Tok::Ne)) {
+        p.bump();
+        (false, false, true)
     } else if p.eat_sym('<') {
-        false
+        (false, false, false)
+    } else if p.eat_sym('>') {
+        (false, true, false)
     } else {
         return Err("for cmp".into());
     };
-    let end = const_u(p)? as usize;
-    let end = if inclusive {
-        end.saturating_add(1)
-    } else {
-        end
-    };
+    let end_val = eval_gen_const(p)? as usize;
     if !p.eat_sym(';') {
         return Err("for ;2".into());
     }
-    let step = parse_for_step(p)?;
+    let step_signed = parse_gen_for_step_signed(p)?;
     if !p.eat_sym(')') {
         return Err("for )".into());
     }
+    let step = step_signed.unsigned_abs().max(1) as usize;
+    let step_down = descending || (!ne_cmp && step_signed < 0) || (ne_cmp && step_signed < 0);
+    let (lo, hi) = if step_down {
+        let last = if inclusive {
+            end_val
+        } else {
+            end_val.saturating_add(1)
+        };
+        if start_val < last {
+            (0usize, 0usize)
+        } else {
+            (last, start_val.saturating_add(1))
+        }
+    } else {
+        let end = if inclusive {
+            end_val.saturating_add(1)
+        } else {
+            end_val
+        };
+        (start_val, end)
+    };
+    let empty = lo >= hi;
+    let niter = if empty {
+        0usize
+    } else {
+        (hi - lo + step - 1) / step
+    };
     let block = p.eat_kw("begin");
     if p.eat_sym(':') {
         let _ = p.ident();
@@ -10750,36 +12057,76 @@ fn parse_for_unroll_module<'a>(
     let start_i = p.i;
     if block {
         skip_begin_end(p)?;
-    } else {
-        while p.peek().is_some() && !matches!(p.peek(), Some(Tok::Sym(';'))) {
-            p.bump();
+        if p.eat_sym(':') {
+            let _ = p.ident();
         }
-        let _ = p.eat_sym(';');
+    } else {
+        skip_gen_single_item(p)?;
     }
-    let body = p.t[start_i..p.i].to_vec();
-    let niter = end.saturating_sub(start) / step.max(1);
-    if niter > 4096 {
+    let body_end = if block && p.i > start_i && matches!(p.t.get(p.i - 1), Some(Tok::Kw(k)) if *k == "end") {
+        p.i
+    } else if block {
+        // Trailing `: label` was consumed after `end`; exclude `: label` from `body`.
+        let mut e = p.i;
+        while e > start_i && !matches!(p.t.get(e - 1), Some(Tok::Kw(k)) if *k == "end") {
+            e -= 1;
+        }
+        e
+    } else {
+        p.i
+    };
+    let body = p.t[start_i..body_end].to_vec();
+    if niter > 4096 || empty {
         return Ok(());
     }
-    let mut i = start;
-    while i < end {
-        let toks: Vec<Tok<'_>> = body
-            .iter()
-            .map(|t| match t {
-                Tok::Ident(s) if s == &var => Tok::Number(i as u128, 32),
-                other => other.clone(),
-            })
-            .collect();
-        // Leaked so `RExpr` idents parsed from the rebuilt slice can borrow
-        // the token text for the parse lifetime (one small backing Vec per
-        // unrolled iteration, capped at 4096).
-        let toks: &'a [Tok<'a>] = Box::leak(toks.into_boxed_slice());
+    let mut cur_val = if step_down { hi - 1 } else { lo };
+    for _ in 0..niter {
+        let i = cur_val;
+        let _guard = push_gen_for_index(i);
+        let mut iter_params = p.params.clone();
+        let mut iter_widths = p.widths.clone();
+        let mut toks = prepare_gen_iter_tokens(
+            &body,
+            p.t,
+            var,
+            i as u128,
+            &mut iter_params,
+            &mut iter_widths,
+            signals,
+            p.arena,
+        );
+        let braceless_mod_item = !block
+            && matches!(
+                toks.first(),
+                Some(Tok::Kw(k))
+                    if matches!(
+                        *k,
+                        "for"
+                            | "if"
+                            | "assign"
+                            | "always"
+                            | "always_comb"
+                            | "always_ff"
+                            | "always_latch"
+                            | "localparam"
+                            | "parameter"
+                            | "wire"
+                            | "logic"
+                            | "reg"
+                            | "generate"
+                            | "begin"
+                    )
+            );
+        if braceless_mod_item {
+            toks.push(Tok::Kw("end"));
+        }
+        let toks: &'a [Tok<'a>] = p.arena.alloc_slice_clone(&toks);
         let mut sp = P {
             t: toks,
             i: 0,
             arena: p.arena,
-            params: p.params.clone(),
-            widths: p.widths.clone(),
+            params: iter_params,
+            widths: iter_widths,
             signed: p.signed.clone(),
         };
         let mut dummy_ports = Vec::new();
@@ -10792,13 +12139,9 @@ fn parse_for_unroll_module<'a>(
         let mut local_assigns = Vec::new();
         let mut local_insts = Vec::new();
         let mut dummy_funcs: Vec<FuncDef<'a>> = Vec::new();
-        // Assertions in generate-for bodies are threaded through unrenamed:
-        // per-iteration signal renames do not apply to them, so an assert
-        // over a per-iteration local fails loud at elaboration (unresolvable
-        // probe) instead of silently checking the wrong signal.
         let mut local_sva_conc: Vec<ConcPropAst<'a>> = Vec::new();
         let mut local_sva_imm: Vec<ImmAssertAst<'a>> = Vec::new();
-        if block {
+        if block || braceless_mod_item {
             parse_module_items(
                 &mut sp,
                 &mut dummy_ports,
@@ -10824,30 +12167,37 @@ fn parse_for_unroll_module<'a>(
         } else {
             let (gnb, gim) = parse_seq_block(&mut sp, false)?;
             if !gim.is_empty() {
-                // Immediate asserts in a generate-for body are threaded
-                // through unrenamed (see above); they fail loud at
-                // elaboration if they name per-iteration signals.
                 local_sva_imm.extend(gim);
             }
             local_nbas.extend(gnb);
         }
-        // Local decls inside the generate-for must be uniquified per iteration
-        // so vector widths survive and each copy maps to its own FF bits.
+        let suffix = gen_for_suffix(i);
         let mut subst: HashMap<&'a str, &'a str> = HashMap::new();
         for mut sig in dummy_sigs {
-            // Fresh per-iteration names are arena-borrowed: one bounded arena
-            // copy per generated signal, no per-use malloc.
-            let fresh: &'a str = sp.arena.alloc_str(&format!("{}_{i}", sig.name));
-            subst.insert(sig.name, fresh);
-            sig.name = fresh;
+            let already = GEN_UNIQUIFIED.with(|u| u.borrow().contains(&(sig.name.as_ptr() as usize)));
+            if !already {
+                let fresh: &'a str = sp.arena.alloc_str(&format!("{}{suffix}", sig.name));
+                GEN_UNIQUIFIED.with(|u| {
+                    u.borrow_mut().insert(fresh.as_ptr() as usize);
+                });
+                subst.insert(sig.name, fresh);
+                sig.name = fresh;
+            }
+            note_width(p, sig.name, sig.width);
             if !signals.iter().any(|s| s.name == sig.name) {
                 signals.push(sig);
             }
         }
         for mut inst in local_insts {
-            inst.name = sp.arena.alloc_str(&format!("{}_{i}", inst.name));
-            for (port, net) in inst.conns.iter_mut() {
-                let _ = port;
+            let already = GEN_UNIQUIFIED.with(|u| u.borrow().contains(&(inst.name.as_ptr() as usize)));
+            if !already {
+                let fresh_inst: &'a str = sp.arena.alloc_str(&format!("{}{suffix}", inst.name));
+                GEN_UNIQUIFIED.with(|u| {
+                    u.borrow_mut().insert(fresh_inst.as_ptr() as usize);
+                });
+                inst.name = fresh_inst;
+            }
+            for (_port, net) in inst.conns.iter_mut() {
                 if let Some(&n) = subst.get(*net) {
                     *net = n;
                 }
@@ -10856,7 +12206,26 @@ fn parse_for_unroll_module<'a>(
         }
         for (lhs, bit, rhs) in local_nbas {
             let lhs = subst.get(&lhs).cloned().unwrap_or(lhs);
-            nbas.push((lhs, bit, rewrite_rexpr(&rhs, &subst, p.arena)));
+            let rhs = rewrite_rexpr(&rhs, &subst, p.arena);
+            if let Some(b) = bit {
+                if let Some((word, lo)) = decode_unpacked_bit(b) {
+                    let flat_lhs: &'a str = p.arena.alloc_str(&format!("{lhs}_w{word}_{lo}"));
+                    if !signals.iter().any(|s| s.name == flat_lhs) {
+                        signals.push(Signal {
+                            name: flat_lhs,
+                            width: 1,
+                            depth: 0,
+                            keep: false,
+                            mark_debug: false,
+                            force_bram: false,
+                        });
+                    }
+                    note_width(p, flat_lhs, 1);
+                    nbas.push((flat_lhs, None, rhs));
+                    continue;
+                }
+            }
+            nbas.push((lhs, bit, rhs));
         }
         for (lhs, bit, rhs) in local_assigns {
             let lhs = subst.get(&lhs).cloned().unwrap_or(lhs);
@@ -10864,7 +12233,11 @@ fn parse_for_unroll_module<'a>(
         }
         sva_conc.extend(local_sva_conc.drain(..));
         sva_imm.extend(local_sva_imm.drain(..));
-        i += step;
+        if step_down {
+            cur_val = cur_val.saturating_sub(step);
+        } else {
+            cur_val = cur_val.saturating_add(step);
+        }
     }
     Ok(())
 }
@@ -10901,6 +12274,7 @@ fn parse_inst_net<'a>(p: &mut P<'a>) -> Option<&'a str> {
             }
         }
         if p.eat_sym('[') {
+            let b1_start = p.i;
             let mut d = 1i32;
             while d > 0 && p.peek().is_some() {
                 if p.eat_sym('[') {
@@ -10909,6 +12283,24 @@ fn parse_inst_net<'a>(p: &mut P<'a>) -> Option<&'a str> {
                     d -= 1;
                 } else {
                     p.bump();
+                }
+            }
+            let b1_end = p.i.saturating_sub(1);
+            if b1_end == b1_start + 1 {
+                if let Some(Tok::Number(c1, _)) = p.t.get(b1_start) {
+                    if matches!(p.peek(), Some(Tok::Sym('[')))
+                        && matches!(p.t.get(p.i + 1), Some(Tok::Number(_, _)))
+                        && matches!(p.t.get(p.i + 2), Some(Tok::Sym(']')))
+                        && !matches!(p.t.get(p.i + 3), Some(Tok::Sym('[')))
+                    {
+                        let c2 = match p.t.get(p.i + 1) {
+                            Some(Tok::Number(v, _)) => *v,
+                            _ => 0,
+                        };
+                        p.i += 3;
+                        skip_until_arg_end(p);
+                        return Some(p.arena.alloc_str(&format!("{name}_w{c1}_{c2}")));
+                    }
                 }
             }
         }
@@ -11163,26 +12555,27 @@ fn index_part_bit<'a>(
     // Sole unpacked word (`[1]` / `[NrHosts]` with NrHosts=1): index is
     // irrelevant. Read the packed element bits — do not build a 16-way bit mux
     // that trips wide_cone on Ibex bus address compares.
+    if let RExpr::Const { val, .. } = base {
+        if *val >= 0x1_0000 || depth > 1 {
+            let word = (*val >> 16) as usize;
+            let bit_lo = (*val & 0xffff) as usize;
+            let src = bit_lo.saturating_add(bit);
+            let eff_w = if *val >= 0x1_0000 {
+                wsrc.max(src + 1).max(2)
+            } else {
+                wsrc
+            };
+            if src >= eff_w {
+                return Ok(Expr::Const(false));
+            }
+            return Ok(Expr::Var(arena.alloc_str(&(unpacked_word_q(name, word, eff_w, src)))));
+        }
+    }
     if depth == 1 {
         if bit >= wsrc {
             return Ok(Expr::Const(false));
         }
         return Ok(Expr::Var(arena.alloc_str(&(bit_name(name, wsrc, bit)))));
-    }
-    // Const word index of unpacked/packed-multi-dim depth>1: one fixed
-    // word's packed bits. `name[w][hi:lo]` encodes base as (word<<16)|lo.
-    if depth > 1 {
-        if let RExpr::Const { val, .. } = base {
-            // `name[w][hi:lo]` encodes base as (word<<16)|lo, so a small val
-            // is word 0 with lo = val, not word = val.
-            let word = (*val >> 16) as usize;
-            let bit_lo = (*val & 0xffff) as usize;
-            let src = bit_lo.saturating_add(bit);
-            if src >= wsrc {
-                return Ok(Expr::Const(false));
-            }
-            return Ok(Expr::Var(arena.alloc_str(&(unpacked_word_q(name, word, wsrc, src)))));
-        }
     }
     if bit >= part_w {
         return Ok(Expr::Const(false));
@@ -11448,22 +12841,39 @@ fn rexpr_to_bit<'a>(e: &RExpr<'_>, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Re
                         }
                     }
                     RExpr::Shr(a, sh) => {
-                        let shift = match *sh {
-                            RExpr::Const { val, .. } => *val as usize,
-                            _ => return Err("shift amount not const".into()),
-                        };
-                        let wa = rexpr_width(a, rtl);
-                        if bit.saturating_add(shift) >= wa {
-                            memo.insert(key, Expr::Const(false));
-                        } else {
-                            let ck = tobit_key(*a, bit + shift);
-                            stack.push(ToBitTask::Build {
-                                key,
-                                op: ToBitOp::Forward(ck),
-                            });
-                            if !memo.contains_key(&ck) {
-                                stack.push(ToBitTask::Visit(*a, bit + shift));
+                        let wa = rexpr_width(a, rtl).max(1);
+                        if let RExpr::Const { val, .. } = *sh {
+                            let shift = *val as usize;
+                            if bit.saturating_add(shift) >= wa {
+                                memo.insert(key, Expr::Const(false));
+                            } else {
+                                let ck = tobit_key(*a, bit + shift);
+                                stack.push(ToBitTask::Build {
+                                    key,
+                                    op: ToBitOp::Forward(ck),
+                                });
+                                if !memo.contains_key(&ck) {
+                                    stack.push(ToBitTask::Visit(*a, bit + shift));
+                                }
                             }
+                        } else {
+                            let max_sh = wa.saturating_sub(bit).min(32);
+                            let mut acc: Option<Expr> = None;
+                            for s_val in 0..max_sh {
+                                let abit = rexpr_to_bit(a, rtl, bit + s_val, arena)?;
+                                let want = RExpr::Const {
+                                    val: s_val as u128,
+                                    width: 32,
+                                    care: u128::MAX,
+                                };
+                                let eq = cmp_eq_bits(sh, &want, rtl, true, arena)?;
+                                let term = Expr::And(arena.alloc(abit), arena.alloc(eq));
+                                acc = Some(match acc {
+                                    None => term,
+                                    Some(prev) => Expr::Or(arena.alloc(prev), arena.alloc(term)),
+                                });
+                            }
+                            memo.insert(key, acc.unwrap_or(Expr::Const(false)));
                         }
                     }
                     RExpr::Ashr(a, sh) => {
