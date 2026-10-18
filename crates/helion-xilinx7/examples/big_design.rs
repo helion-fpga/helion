@@ -37,7 +37,7 @@ fn main() {
     println!("Pack: {pack_ms}ms");
     
     let t0 = Instant::now();
-    let placed = x7.place(&packed).expect("x7 place failed");
+    let _placed = x7.place(&packed).expect("x7 place failed");
     let place_ms = t0.elapsed().as_millis();
     println!("Place: {place_ms}ms");
     

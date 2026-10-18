@@ -18,7 +18,7 @@ fn blinky_e2e_fasm() {
     let mut design = helion_sv::synth_sv(&src, "blinky.sv").expect("synth");
     // LOC constraints (Arty A7).
     for port in &mut design.ports {
-        match port.name.as_str() {
+        match helion_ir::resolve(port.name) {
             "clk" => port.attrs.set("LOC", "E3"),
             "led" => port.attrs.set("LOC", "H5"),
             _ => {}
