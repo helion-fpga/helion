@@ -19,6 +19,12 @@ pub mod cdc;
 pub mod parallel_elab;
 /// SystemVerilog Assertions, v3.0 subset (verification track, Part B).
 pub mod sva;
+/// Radix-4 Modified Booth + Wallace tree multiplier, non-restoring divider, and integer square root.
+pub mod arith_trees;
+pub use arith_trees::{
+    booth_radix4_pp_lut6_init, synthesize_booth_wallace_mul, synthesize_isqrt,
+    synthesize_nonrestoring_div_rem, BoothWallaceStats, DivRemStats, IsqrtStats,
+};
 
 // Thread-local storage for pre-optimization Design (for --verify flag).
 // When HELION_PRESERVE_PRE_OPT is set, synth_from_parsed_top clones the
@@ -5650,7 +5656,36 @@ fn parse_mul<'a>(p: &mut P<'a>) -> Result<RExpr<'a>, String> {
                     width: (*wa).max(*wb),
                     care: *ca & *cb,
                 },
-                _ => return Err("div needs const operands".into()),
+                _ => RExpr::Call {
+                    name: "$div",
+                    args: vec![e, r],
+                },
+            };
+            continue;
+        }
+        if p.eat_sym('%') {
+            let r = parse_un_r(p)?;
+            e = match (&e, &r) {
+                (
+                    RExpr::Const {
+                        val: a,
+                        width: wa,
+                        care: ca,
+                    },
+                    RExpr::Const {
+                        val: b,
+                        width: wb,
+                        care: cb,
+                    },
+                ) if *b != 0 => RExpr::Const {
+                    val: a % *b,
+                    width: (*wa).max(*wb),
+                    care: *ca & *cb,
+                },
+                _ => RExpr::Call {
+                    name: "$rem",
+                    args: vec![e, r],
+                },
             };
             continue;
         }
@@ -5971,6 +6006,37 @@ fn parse_atom_r<'a>(p: &mut P<'a>) -> Result<RExpr<'a>, String> {
                     val: w,
                     width: 32,
                     care: u128::MAX,
+                });
+            }
+            if name == "$sqrt" && p.eat_sym('(') {
+                let arg = parse_rexpr(p)?;
+                if !p.eat_sym(')') {
+                    return Err("$sqrt )".into());
+                }
+                if let RExpr::Const { val, width, care } = arg {
+                    return Ok(RExpr::Const {
+                        val: val.isqrt(),
+                        width: width.max(1),
+                        care,
+                    });
+                }
+                return Ok(RExpr::Call {
+                    name: "$sqrt",
+                    args: vec![arg],
+                });
+            }
+            if name == "$booth_mul" && p.eat_sym('(') {
+                let a = parse_rexpr(p)?;
+                if !p.eat_sym(',') {
+                    return Err("$booth_mul ,".into());
+                }
+                let b = parse_rexpr(p)?;
+                if !p.eat_sym(')') {
+                    return Err("$booth_mul )".into());
+                }
+                return Ok(RExpr::Call {
+                    name: "$booth_mul",
+                    args: vec![a, b],
                 });
             }
             // `fname(a, b)` — inlined after module parse when a FuncDef exists.
@@ -11846,6 +11912,9 @@ fn strip_self_hold<'a>(e: &Expr<'a>, self_bit: &str, arena: &'a Bump) -> Expr<'a
             memo.insert(n as *const Expr<'a>, arena.alloc(r));
             continue;
         }
+        if memo.contains_key(&(n as *const Expr<'a>)) {
+            continue;
+        }
         stack.push((n, true));
         match n {
             Expr::Not(x) => stack.push((x, false)),
@@ -12743,6 +12812,127 @@ fn emit_mac27(d: &mut Design, cell: String, rhs: &RExpr<'_>, lhs: &str) {
         d.connect(&c, &cell, "C");
     }
     d.connect(lhs, &cell, "P");
+}
+fn extract_arith_operand_nets(
+    d: &mut Design,
+    rtl: &Rtl,
+    prefix: &str,
+    expr: &RExpr<'_>,
+    target_w: usize,
+) -> Option<Vec<String>> {
+    match expr {
+        RExpr::Ident(s) if sig_depth(rtl, s) == 0 && name_known(rtl, s) => {
+            let sw = sig_width(rtl, s).max(1);
+            if sw > 32 {
+                return None;
+            }
+            Some((0..sw).map(|i| bit_name(s, sw, i)).collect())
+        }
+        RExpr::Range(s, lo, hi)
+            if sig_depth(rtl, s) == 0 && name_known(rtl, s) && *hi >= *lo =>
+        {
+            let sw = sig_width(rtl, s).max(1);
+            let rw = (*hi).saturating_sub(*lo).saturating_add(1).max(1);
+            if rw > 32 {
+                return None;
+            }
+            Some((*lo..=*hi).map(|i| bit_name(s, sw, i)).collect())
+        }
+        RExpr::Bit(s, b) if sig_depth(rtl, s) == 0 && name_known(rtl, s) => {
+            let sw = sig_width(rtl, s).max(1);
+            Some(vec![bit_name(s, sw, *b)])
+        }
+        RExpr::Const { val, width, .. } => {
+            let cw = (*width).max(target_w).max(1).min(32);
+            let mut nets = Vec::with_capacity(cw);
+            for i in 0..cw {
+                let bit_on = ((*val >> i) & 1) != 0;
+                let cell = format!("u_{prefix}_c{i}");
+                let net = format!("n_{prefix}_c{i}");
+                d.add_cell(
+                    &cell,
+                    CellKind::Lut6 {
+                        init: if bit_on { u64::MAX } else { 0 },
+                    },
+                );
+                d.connect(&net, &cell, "O");
+                let _ = d.dont_touch(&cell);
+                nets.push(net);
+            }
+            Some(nets)
+        }
+        _ => None,
+    }
+}
+
+fn try_emit_arith_tree_assign(
+    d: &mut Design,
+    rtl: &Rtl,
+    lhs: &str,
+    rhs: &RExpr<'_>,
+    idx: usize,
+) -> Option<bool> {
+    let RExpr::Call { name, args } = rhs else {
+        return None;
+    };
+    if !matches!(*name, "$div" | "$rem" | "$sqrt" | "$booth_mul") {
+        return None;
+    }
+    let w = sig_width(rtl, lhs).max(1);
+    if w > 32 {
+        return Some(false);
+    }
+    let out_nets: Vec<String> = (0..w).map(|i| bit_name(lhs, w, i)).collect();
+    let prefix = format!("atree_{lhs}_{idx}");
+    match (*name, args.as_slice()) {
+        ("$div", [a, b]) => {
+            let a_nets = extract_arith_operand_nets(d, rtl, &format!("{prefix}_a"), a, w)?;
+            let b_nets = extract_arith_operand_nets(d, rtl, &format!("{prefix}_b"), b, w)?;
+            arith_trees::synthesize_nonrestoring_div_rem(
+                d,
+                &prefix,
+                &a_nets,
+                &b_nets,
+                Some(&out_nets),
+                None,
+                false,
+            );
+            Some(true)
+        }
+        ("$rem", [a, b]) => {
+            let a_nets = extract_arith_operand_nets(d, rtl, &format!("{prefix}_a"), a, w)?;
+            let b_nets = extract_arith_operand_nets(d, rtl, &format!("{prefix}_b"), b, w)?;
+            arith_trees::synthesize_nonrestoring_div_rem(
+                d,
+                &prefix,
+                &a_nets,
+                &b_nets,
+                None,
+                Some(&out_nets),
+                false,
+            );
+            Some(true)
+        }
+        ("$sqrt", [x]) => {
+            let x_nets = extract_arith_operand_nets(d, rtl, &format!("{prefix}_x"), x, w)?;
+            arith_trees::synthesize_isqrt(d, &prefix, &x_nets, &out_nets, None);
+            Some(true)
+        }
+        ("$booth_mul", [a, b]) => {
+            let a_nets = extract_arith_operand_nets(d, rtl, &format!("{prefix}_a"), a, w)?;
+            let b_nets = extract_arith_operand_nets(d, rtl, &format!("{prefix}_b"), b, w)?;
+            arith_trees::synthesize_booth_wallace_mul(
+                d,
+                &prefix,
+                &a_nets,
+                &b_nets,
+                &out_nets,
+                false,
+            );
+            Some(true)
+        }
+        _ => Some(false),
+    }
 }
 
 fn is_mac_rhs(e: &RExpr<'_>) -> bool {
@@ -17736,43 +17926,102 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
     // side), not a 16-PI cone and not a LUT. A nested concat inside an
     // add is not this form — that add stays wide_cone.
     let mut concat_align: Vec<(String, String, usize, usize)> = Vec::new();
-    // Expand whole-wire copy assigns (Ident/Bit/Range RHS) into per-bit
-    // assigns so they go through the net_copies path that already works.
-    // Without this, wire pc = a; is silently dropped.
-    let mut expanded_assigns: Vec<(&str, Option<usize>, RExpr)> = Vec::new();
+    // Direct net aliasing for packed wire copy assigns (Ident/Bit/Range RHS)
+    // without emitting 0xaaaaaaaaaaaaaaaa identity buffer LUTs.
+    let out_ports: HashSet<&str> = rtl
+        .ports
+        .iter()
+        .filter(|(_, dir, _)| *dir == PortDir::Out)
+        .map(|(n, _, _)| *n)
+        .collect();
+    let nba_lhs: HashSet<&str> = rtl.nbas.iter().map(|(n, _, _)| *n).collect();
+    let mut lhs_assign_count: HashMap<&str, usize> = HashMap::new();
+    for (lhs, _, _) in &rtl.assigns {
+        *lhs_assign_count.entry(*lhs).or_insert(0) += 1;
+    }
+    let mut net_alias: HashMap<String, String> = HashMap::new();
     for (lhs, bit, rhs) in &rtl.assigns {
+        if sig_depth(rtl, lhs) > 0 || out_ports.contains(*lhs) || nba_lhs.contains(*lhs) {
+            continue;
+        }
         if bit.is_none() {
+            if lhs_assign_count.get(*lhs).copied().unwrap_or(0) != 1 {
+                continue;
+            }
             match rhs {
-                RExpr::Ident(s) => {
+                RExpr::Ident(s) if sig_depth(rtl, s) == 0 => {
                     let w = sig_width(rtl, lhs).max(1);
                     let sw = sig_width(rtl, s).max(1);
                     for i in 0..w {
                         let src_bit = if i < sw { i } else { sw - 1 };
-                        expanded_assigns.push((lhs, Some(i), RExpr::Bit(s, src_bit)));
+                        let dst_n = bit_name(lhs, w, i);
+                        let src_n = bit_name(s, sw, src_bit);
+                        if dst_n != src_n {
+                            net_alias.insert(dst_n, src_n);
+                        }
                     }
-                    continue;
                 }
-                RExpr::Bit(s, b) => {
-                    expanded_assigns.push((lhs, Some(0), RExpr::Bit(s, *b)));
-                    continue;
-                }
-                RExpr::Range(s, hi, lo) => {
+                RExpr::Bit(s, b) if sig_depth(rtl, s) == 0 => {
                     let w = sig_width(rtl, lhs).max(1);
+                    let sw = sig_width(rtl, s).max(1);
+                    let dst_n = bit_name(lhs, w, 0);
+                    let src_n = bit_name(s, sw, *b);
+                    if dst_n != src_n {
+                        net_alias.insert(dst_n, src_n);
+                    }
+                }
+                RExpr::Range(s, lo, hi) if sig_depth(rtl, s) == 0 && *hi >= *lo => {
+                    let w = sig_width(rtl, lhs).max(1);
+                    let sw = sig_width(rtl, s).max(1);
                     let range_w = (*hi).saturating_sub(*lo).saturating_add(1).max(1);
                     for i in 0..w {
                         let src_bit = if i < range_w { lo + i } else { *hi };
-                        expanded_assigns.push((lhs, Some(i), RExpr::Bit(s, src_bit)));
+                        let dst_n = bit_name(lhs, w, i);
+                        let src_n = bit_name(s, sw, src_bit);
+                        if dst_n != src_n {
+                            net_alias.insert(dst_n, src_n);
+                        }
                     }
-                    continue;
                 }
                 _ => {}
             }
+        } else if let Some(b) = bit {
+            if decode_unpacked_bit(*b).is_none() {
+                let w = sig_width(rtl, lhs).max(1);
+                match rhs {
+                    RExpr::Ident(s) if sig_depth(rtl, s) == 0 => {
+                        let sw = sig_width(rtl, s).max(1);
+                        let dst_n = bit_name(lhs, w, *b);
+                        let src_n = bit_name(s, sw, 0);
+                        if dst_n != src_n {
+                            net_alias.insert(dst_n, src_n);
+                        }
+                    }
+                    RExpr::Bit(s, sb) if sig_depth(rtl, s) == 0 => {
+                        let sw = sig_width(rtl, s).max(1);
+                        let dst_n = bit_name(lhs, w, *b);
+                        let src_n = bit_name(s, sw, *sb);
+                        if dst_n != src_n {
+                            net_alias.insert(dst_n, src_n);
+                        }
+                    }
+                    RExpr::Range(s, lo, _hi) if sig_depth(rtl, s) == 0 => {
+                        let sw = sig_width(rtl, s).max(1);
+                        let dst_n = bit_name(lhs, w, *b);
+                        let src_n = bit_name(s, sw, *lo);
+                        if dst_n != src_n {
+                            net_alias.insert(dst_n, src_n);
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
-        expanded_assigns.push((lhs, *bit, rhs.clone()));
     }
-    let net_copies = collect_net_copies(&expanded_assigns);
+    let net_copies = collect_net_copies(&rtl.assigns);
     let priority_grant = try_emit_priority_onehot_grant(&mut d, rtl);
-    for (lhs, bit, rhs0) in &expanded_assigns {
+    let mut n_arith_tree = 0usize;
+    for (lhs, bit, rhs0) in &rtl.assigns {
         let rhs_sub = subst_net_copies(rhs0, &net_copies, &arena);
         let rhs = &rhs_sub;
         if clock_mux_sigs.contains(*lhs) || clock_gate_sigs.contains(*lhs) {
@@ -17816,8 +18065,7 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
             }
         }
         match rhs {
-            // Ident/Bit/Range RHS are net copies, handled via net_copies substitution
-            // and direct net aliasing below. Do not skip.
+            RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => continue,
             _ => {}
         }
         // width<=32 `assign y = bus + K` (K in 1..=16) is a ripple from that
@@ -17914,6 +18162,16 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
             emit_mac27(&mut d, format!("u_mac{n_mac}"), rhs, lhs);
             n_mac += 1;
             continue;
+        }
+        if bit.is_none() {
+            if let Some(emitted) =
+                try_emit_arith_tree_assign(&mut d, rtl, lhs, rhs, n_arith_tree)
+            {
+                if emitted {
+                    n_arith_tree += 1;
+                }
+                continue;
+            }
         }
         // Unknown name is not const 0.
         if rexpr_unknown_name(rhs, rtl).is_some() {
@@ -18296,7 +18554,11 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
         // Generic wide-cone decomposition BEFORE wide_capped check.
         // Does not use AIG batch, so not subject to the cap.
         // Skip relational operators (they stay assign_not_lowered by design).
-        if cone_pi_exceeds(&expr_rom, 6) && !rel_sig.contains_key(bitn) {
+        if !wide_capped
+            && cone_pi_exceeds(&expr_rom, 6)
+            && !rel_sig.contains_key(bitn)
+            && expr_node_count(&expr_rom) <= 256
+        {
             if decompose_wide_cone(
                 &mut d,
                 &mut share,
@@ -18521,8 +18783,59 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
     // mapped LUT/FF drivers. Emitting them fills the pack then iob_trim → 0,
     // blocking the FF→PAD fallback (bare ysyx_ibex IOB=0). Prefer NBA-
     // registered top outs; else last FF → first Out.
+    let resolve_alias = |mut name: String| -> String {
+        for _ in 0..16 {
+            if let Some(next) = net_alias.get(&name) {
+                if next == &name {
+                    break;
+                }
+                name = next.clone();
+            } else {
+                break;
+            }
+        }
+        name
+    };
+    if !net_alias.is_empty() {
+        let old_nets = std::mem::take(&mut d.nets);
+        d.rebuild_indexes();
+        for mut n in old_nets {
+            let resolved = resolve_alias(resolve(n.name).to_string());
+            n.name = intern(&resolved);
+            let attrs = n.attrs.clone();
+            d.merge_net(n);
+            if let Some(dst_net) = d.net_mut(&resolved) {
+                for (k, v) in attrs.map {
+                    dst_net.attrs.set(k, v);
+                }
+            }
+        }
+    }
+    let net_has_driver = |d: &Design, net_name: &str| -> bool {
+        d.net(net_name).is_some_and(|net| {
+            net.endpoints.iter().any(|e| {
+                matches!(
+                    resolve(e.pin),
+                    "O" | "Q"
+                        | "PAD"
+                        | "O0"
+                        | "O1"
+                        | "O2"
+                        | "O3"
+                        | "CO0"
+                        | "CO1"
+                        | "CO2"
+                        | "CO3"
+                        | "DOADO"
+                        | "DOBDO"
+                        | "P"
+                )
+            })
+        })
+    };
     let mut iob_n = 0usize;
     let emit_iob = |d: &mut Design, iob_n: &mut usize, qnet: &str, pad: &str| {
+        let q_resolved = resolve_alias(qnet.to_string());
         let iob = if *iob_n == 0 {
             "u_iob".to_string()
         } else {
@@ -18530,7 +18843,7 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
         };
         *iob_n += 1;
         d.add_cell(&iob, CellKind::IobOut);
-        d.connect(qnet, &iob, "I");
+        d.connect(&q_resolved, &iob, "I");
         d.connect(pad, &iob, "PAD");
     };
     for (lhs, bit, rhs) in &rtl.assigns {
@@ -18626,43 +18939,35 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
         emit_iob(&mut d, &mut iob_n, &qnet, lhs);
     }
     if iob_n == 0 {
-        // default: last register bit to first output
+        // default: last register bit to first output, only if output has 0 drivers
+        // (or single_q where the sole FF directly drives output port q).
         if let (Some((n, _, _)), Some((qnet, _))) = (
             rtl.ports.iter().find(|(_, dir, _)| *dir == PortDir::Out),
             reg_bits.last(),
         ) {
-            d.add_cell("u_iob", CellKind::IobOut);
-            d.connect(qnet, "u_iob", "I");
-            d.connect(*n, "u_iob", "PAD");
+            let out_w = sig_width(rtl, n);
+            if (!net_has_driver(&d, n) && (is_top || out_w > 1))
+                || (single_q && *n == qnet.as_str())
+            {
+                let q_resolved = resolve_alias(qnet.clone());
+                d.add_cell("u_iob", CellKind::IobOut);
+                d.connect(&q_resolved, "u_iob", "I");
+                d.connect(*n, "u_iob", "PAD");
+            }
         }
     }
-    // Ensure every port has a net (F6 fix): unused ports must still appear
-    // in the netlist. For inputs, create an IobIn; for outputs without a
-    // driver, tie to const0 via a LUT.
-    // Note on mem_la_read (F1): it has a complex assign with 13+ inputs.
-    // The cone exceeds 6 PIs so no LUT is emitted (wide-cone skip), leaving
-    // the net with loads but no driver. Tying to 0 is functionally incorrect;
-    // proper fix is wide-cone decomposition into multiple LUT6s.
-    // TODO: implement wide-cone decomposition for >6 PI cones.
-    // Skip port fixup for gate primitive modules: they are not mapped by
-    // design (diagnostic GATE_PRIMITIVE), so no cells should be emitted.
-    // Also skip for modules with no logic cells (empty shells like tap
-    // cells): do not invent IOBs for a module with no body.
-    // Skip for submodules (not top-level): their ports get connected during
-    // flattening; running the fixup would create duplicate drivers (F2).
+    if !is_top {
+        return Ok(d);
+    }
     let is_gate_primitive = d.attrs.get("GATE_PRIMITIVE") == Some("1");
-    let has_logic = d.cells.iter().any(|c| !matches!(c.kind, CellKind::IobIn | CellKind::IobOut));
+    let has_logic = d
+        .cells
+        .iter()
+        .any(|c| !matches!(c.kind, CellKind::IobIn | CellKind::IobOut));
     for (pname, dir, _) in &rtl.ports {
         if is_gate_primitive || !has_logic || !is_top {
             continue;
         }
-        // A net with no endpoints won't be written to HNF, so treat it
-        // the same as a missing net. Some ports have phantom endpoints
-        // from cells that get optimized away; force-fix those too.
-        // ONLY fix ports in the force list (known F1 unmappable cases).
-        // For all other undriven ports, do NOT create a tie-off: that would
-        // mask a real synthesis bug (e.g. generate not elaborated). Let the
-        // W1 check fail honestly instead of inventing a constant-0 driver.
         let force = *pname == "pcpi_wait"
             || *pname == "pcpi_ready"
             || *pname == "s_axil_awvalid"
@@ -18679,27 +18984,11 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
         if !needs_fix {
             continue;
         }
-        match dir {
-            PortDir::In => {
-                let iob = format!("u_iob_fix_{pname}");
-                if d.cell(&iob).is_none() {
-                    d.add_cell(&iob, CellKind::IobIn);
-                    d.connect(pname, &iob, "O");
-                }
-            }
-            PortDir::Out => {
-                let lut = format!("u_tie_fix_{pname}");
-                if d.cell(&lut).is_none() {
-                    d.add_cell(&lut, CellKind::Lut6 { init: 0 });
-                    d.connect(pname, &lut, "O");
-                }
-            }
-            PortDir::Inout => {
-                let iob = format!("u_iob_fix_{pname}");
-                if d.cell(&iob).is_none() {
-                    d.add_cell(&iob, CellKind::IobIn);
-                    d.connect(pname, &iob, "O");
-                }
+        if matches!(dir, PortDir::Out) && !net_has_driver(&d, pname) {
+            let lut = format!("u_tie_fix_{pname}");
+            if d.cell(&lut).is_none() {
+                d.add_cell(&lut, CellKind::Lut6 { init: 0 });
+                d.connect(pname, &lut, "O");
             }
         }
     }
