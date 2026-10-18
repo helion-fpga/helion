@@ -10,7 +10,11 @@ use std::collections::HashMap;
 pub mod coverage;
 pub mod fast;
 pub mod sdf;
+pub mod clocking;
+pub mod cosim;
+pub mod dpi;
 pub mod sva;
+pub mod svtb;
 pub mod vcd;
 pub mod wave;
 
@@ -37,6 +41,18 @@ pub use wave::{
     SpiConfig, SpiTransaction, UartConfig, UartFrame, UartParity, WaveSample, WaveSignalDef,
     WaveSignalId, WaveSlice, WishboneSignals, WishboneTransaction,
 };
+
+pub use clocking::{
+    ClockingBlock, ClockingSignal, ClockingSkew, ClockingVarDir, ScheduledDrive,
+};
+pub use cosim::{
+    run_golden_cosim, run_golden_cosim_with_stimulus, CosimMismatch, GoldenCosimReport,
+};
+pub use dpi::{
+    DpiCallRecord, DpiParamDecl, DpiParamDir, DpiRegistry, DpiSignature, DpiType, DpiValue,
+};
+pub use sva::{SvaEngine, SvaFailure, SvaReport};
+pub use svtb::{ScoreboardMismatch, SimMailbox, SimScoreboard, SimSemaphore};
 /// UG900 force vs deposit: hold until `release`, or one-shot poke.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SimForceKind {
@@ -104,6 +120,8 @@ pub struct Sim {
     timing: Option<SimTimingModel>,
     /// Runtime functional coverage collector (toggle, branch, FSM).
     coverage: CoverageCollector,
+    /// DPI-C foreign function registry attached to this simulator.
+    dpi: DpiRegistry,
 }
 
 impl Sim {
@@ -236,6 +254,7 @@ impl Sim {
             compiled,
             timing: None,
             coverage,
+            dpi: DpiRegistry::new(),
         }
     }
 
@@ -683,6 +702,28 @@ impl Sim {
         self.coverage.report(self.sva.report())
     }
 
+    /// Access the DPI-C foreign function registry (`DpiRegistry`).
+    pub fn dpi(&self) -> &DpiRegistry {
+        &self.dpi
+    }
+
+    /// Mutably access the DPI-C foreign function registry (`DpiRegistry`).
+    pub fn dpi_mut(&mut self) -> &mut DpiRegistry {
+        &mut self.dpi
+    }
+
+    /// Parse and register a SystemVerilog `import "DPI-C" function ...` callback on this [`Sim`].
+    pub fn register_dpi_import<F>(&mut self, import_decl: &str, callback: F) -> Result<(), String>
+    where
+        F: Fn(&[DpiValue]) -> Result<DpiValue, String> + Send + Sync + 'static,
+    {
+        self.dpi.register_import(import_decl, callback)
+    }
+
+    /// Invoke a registered DPI-C function by SV name or C linkage name.
+    pub fn call_dpi(&mut self, name: &str, args: &[DpiValue]) -> Result<DpiValue, String> {
+        self.dpi.call(name, args)
+    }
     /// UG900 Objects pane: live helion-sim probes (LED + each FF Q), not a static name list.
     pub fn object_values(&self) -> Vec<(String, String)> {
         self.locals()
@@ -1996,5 +2037,215 @@ endmodule
         assert!(wb_txs[0].is_write);
         assert_eq!(wb_txs[0].addr, 0x2000);
         assert_eq!(wb_txs[0].data, 0x1234_5678);
+    }
+
+    #[test]
+    fn dpi_registry_parses_imports_validates_types_and_invokes_callbacks() {
+        let mut sim = Sim::new(&and_dut());
+        sim.register_dpi_import(
+            r#"import "DPI-C" pure function int c_mac(input int a, input int b, input int acc);"#,
+            |args| {
+                let a = args[0].as_i64().unwrap();
+                let b = args[1].as_i64().unwrap();
+                let acc = args[2].as_i64().unwrap();
+                Ok(DpiValue::Int(a * b + acc))
+            },
+        )
+        .expect("register c_mac");
+
+        sim.register_dpi_import(
+            r#"import "DPI-C" context c_golden_hash = function bit [63:0] sv_hash(input longint word, input string tag);"#,
+            |args| {
+                let w = args[0].as_u64().unwrap();
+                let tag = args[1].as_str().unwrap();
+                Ok(DpiValue::UInt(w ^ (tag.len() as u64 * 0x5555)))
+            },
+        )
+        .expect("register sv_hash");
+
+        let sig = sim.dpi().signature("sv_hash").expect("sv_hash signature");
+        assert_eq!(sig.c_name, "c_golden_hash");
+        assert!(sig.is_context && !sig.is_pure);
+        assert_eq!(sig.return_type, DpiType::UnsignedLongInt);
+
+        let r1 = sim
+            .call_dpi(
+                "c_mac",
+                &[DpiValue::Int(6), DpiValue::Int(7), DpiValue::Int(10)],
+            )
+            .expect("call c_mac");
+        assert_eq!(r1, DpiValue::Int(52));
+
+        // Invoke by C linkage alias `c_golden_hash` as well as SV name `sv_hash`.
+        let r2 = sim
+            .call_dpi(
+                "c_golden_hash",
+                &[DpiValue::UInt(0x1234), DpiValue::Str("pkt".to_string())],
+            )
+            .expect("call c_golden_hash");
+        assert_eq!(r2, DpiValue::UInt(0x1234 ^ (3 * 0x5555)));
+        assert_eq!(sim.dpi().call_count("c_mac"), 1);
+        assert_eq!(sim.dpi().call_count("sv_hash"), 1);
+        assert_eq!(sim.dpi().total_calls(), 2);
+        assert_eq!(sim.dpi().call_trace().len(), 2);
+
+        // Wrong argument count or mismatched argument type must fail loud.
+        assert!(sim.call_dpi("c_mac", &[DpiValue::Int(1)]).is_err());
+        assert!(sim
+            .call_dpi(
+                "c_mac",
+                &[
+                    DpiValue::Str("bad".to_string()),
+                    DpiValue::Int(1),
+                    DpiValue::Int(2)
+                ]
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn clocking_block_samples_preponed_1step_and_drives_skewed_outputs() {
+        let mut sim = Sim::new(&and_dut());
+        let sv_cb = r#"
+clocking cb @(posedge clk);
+    default input #1step output #2ns;
+    input y;
+    output a, b;
+endclocking
+"#;
+        let mut cb = ClockingBlock::parse_sv(sv_cb).expect("parse clocking block");
+        assert_eq!(cb.name, "cb");
+        assert_eq!(cb.clk_port, "clk");
+        assert_eq!(cb.default_input_skew, ClockingSkew::Step1);
+        assert_eq!(cb.default_output_skew, ClockingSkew::TimePs(2000));
+
+        // Driving an input-only clocking variable must fail loud.
+        assert!(cb.schedule_drive(sim.cycle, "y", 1, 0).is_err());
+
+        // Schedule `cb.a <= 1; cb.b <= 1;` for the upcoming clock edge (cycle 1),
+        // and `cb.b <= ##1 0;` for cycle 2.
+        cb.schedule_drive(sim.cycle, "a", 1, 0).unwrap();
+        cb.schedule_drive(sim.cycle, "b", 1, 0).unwrap();
+        cb.schedule_drive(sim.cycle, "b", 0, 1).unwrap();
+
+        // Edge 1 (t=10_000ps):
+        // - Preponed `#1step` samples `y = 0` before the edge.
+        // - Due drives (`a=1, b=1`) apply after the edge with timestamp `10_000 + 2_000 = 12_000ps`.
+        let applied_1 = cb.step_clock_edge(&mut sim, 10_000).unwrap();
+        assert_eq!(cb.read_sampled("y"), Some(0));
+        assert_eq!(applied_1.len(), 2);
+        assert!(applied_1.iter().all(|d| d.applied_time_ps == Some(12_000)));
+
+        // Edge 2 (t=20_000ps):
+        // - `a=1, b=1` were driven on edge 1, so during edge 2 the FF clocks in `1 & 1 = 1`!
+        // - Preponed `#1step` before edge 2 still sees the pre-edge FF value `y = 0` (no race!).
+        // - Due drive `b <= ##1 0` applies after edge 2 at `22_000ps`.
+        let applied_2 = cb.step_clock_edge(&mut sim, 10_000).unwrap();
+        assert_eq!(
+            cb.read_sampled("y"),
+            Some(0),
+            "#1step preponed sample before edge 2 sees pre-edge y=0"
+        );
+        assert_eq!(
+            sim.sample("y"),
+            Some(1),
+            "post-edge 2 DUT output y is now 1"
+        );
+        assert_eq!(applied_2.len(), 1);
+        assert_eq!(applied_2[0].var_name, "b");
+        assert_eq!(applied_2[0].value, 0);
+        assert_eq!(applied_2[0].applied_time_ps, Some(22_000));
+
+        // Edge 3 (t=30_000ps):
+        // - Preponed `#1step` before edge 3 samples the settled `y = 1` from edge 2!
+        // - At edge 3, the FF clocks in `a=1 & b=0 -> 0`.
+        cb.step_clock_edge(&mut sim, 10_000).unwrap();
+        assert_eq!(cb.read_sampled("y"), Some(1));
+        assert_eq!(sim.sample("y"), Some(0));
+    }
+
+    #[test]
+    fn svtb_mailbox_semaphore_and_scoreboard_verify_transactions() {
+        // 1. Bounded and unbounded SimMailbox
+        let mut mbx: SimMailbox<u32> = SimMailbox::new(2);
+        assert!(mbx.is_empty());
+        assert!(mbx.try_put(10));
+        assert!(mbx.try_put(20));
+        assert!(mbx.is_full());
+        assert!(!mbx.try_put(30), "bounded mailbox rejects overflow");
+        assert!(mbx.put(30).is_err());
+        assert_eq!(mbx.peek().unwrap(), &10);
+        assert_eq!(mbx.get().unwrap(), 10);
+        assert_eq!(mbx.get().unwrap(), 20);
+        assert!(mbx.get().is_err());
+
+        // 2. SimSemaphore
+        let mut sem = SimSemaphore::new(2);
+        assert_eq!(sem.available_keys(), 2);
+        assert!(sem.try_get(2));
+        assert_eq!(sem.available_keys(), 0);
+        assert!(!sem.try_get(1));
+        assert!(sem.get(1).is_err());
+        sem.put(3);
+        assert_eq!(sem.available_keys(), 3);
+
+        // 3. SimScoreboard
+        let mut sb: SimScoreboard<u64> = SimScoreboard::new("alu_sb");
+        sb.push_expected(0xAA);
+        sb.push_expected(0xBB);
+        sb.push_actual(10, 1, 0xAA);
+        sb.push_actual(20, 2, 0xBB);
+        assert!(sb.is_clean());
+        assert_eq!(sb.matches(), 2);
+        assert!(sb.summary_line().contains("PASS"));
+
+        sb.push_expected(0xCC);
+        sb.push_actual(30, 3, 0xDD);
+        assert!(!sb.is_clean());
+        assert_eq!(sb.mismatches().len(), 1);
+        assert_eq!(sb.mismatches()[0].cycle, 3);
+        assert_eq!(sb.mismatches()[0].expected, 0xCC);
+        assert_eq!(sb.mismatches()[0].actual, 0xDD);
+        assert!(sb.summary_line().contains("FAIL"));
+    }
+
+    #[test]
+    fn golden_cosim_verifies_equivalence_and_pinpoints_first_diverging_cycle() {
+        let src = r#"
+module counter (
+    input  logic clk,
+    output logic led
+);
+    logic [3:0] cnt;
+    always_ff @(posedge clk) begin
+        cnt <= cnt + 1;
+    end
+    assign led = cnt[3];
+endmodule
+"#;
+        let rtl_synth = helion_sv::synth_sv(src, "counter.sv").expect("synth counter");
+        let structural = Design::structural_counter();
+
+        // 1. Equivalent designs pass co-simulation over 32 cycles with 0 mismatches.
+        let pass_rep = run_golden_cosim(&structural, &rtl_synth, 32);
+        assert!(pass_rep.is_equivalent(), "{}", pass_rep.summary_line());
+        assert_eq!(pass_rep.mismatches.len(), 0);
+        assert!(pass_rep.summary_line().contains("cosim PASS cycles=32"));
+
+        // 2. Inject a LUT truth-table bug on `u_lut3` (MSB toggle LUT) in a candidate netlist:
+        //    the counter's `led` output (`cnt[3]`) first rises at cycle 8 (`t=80ps`).
+        let mut buggy = Design::structural_counter();
+        if let Some(c) = buggy.cell_mut("u_lut3") {
+            c.kind = CellKind::Lut6 { init: 0 };
+        }
+        let fail_rep = run_golden_cosim(&structural, &buggy, 16);
+        assert!(!fail_rep.is_equivalent());
+        let first = fail_rep.first_divergence.as_ref().expect("first divergence");
+        assert_eq!(first.cycle, 8, "cnt[3] first diverges on cycle 8: {first}");
+        assert_eq!(first.time_ps, 80);
+        assert_eq!(first.signal, "led");
+        assert_eq!(first.golden_value, Some(1));
+        assert_eq!(first.candidate_value, Some(0));
+        assert!(fail_rep.summary_line().contains("cosim FAIL"));
     }
 }
