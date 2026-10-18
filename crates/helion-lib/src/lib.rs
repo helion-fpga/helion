@@ -1,5 +1,18 @@
 //! HELIONLIB — original primitives (not UNISIM).
 
+pub mod sby;
+pub use sby::{
+    add_formal_assert, add_formal_assume, add_formal_bad, add_formal_cover, add_formal_fair,
+    emit_aiger_ascii, emit_btor2, emit_smtlib2_qfbv, parse_aiger_ascii, parse_btor2,
+    parse_sby_config, run_sby_task, set_ff_init, AigerAscii, Btor2Line, FormalTrace, ProofMethod,
+    SbyConfig, SbyEngine, SbyMode, SbyOptions, SbyStatus, SbyTask, SbyTaskResult, TraceStep,
+};
+pub mod equiv_sec;
+pub use equiv_sec::{
+    cec_cutpoint_sweep, sec_prove_sequential_equiv, CecResult, CutpointEquiv, FailingOutputCone,
+    RegCorrespondence, SecResult, SecStatus, SecTraceStep,
+};
+
 pub const LUT6: &str = r#"
 module LUT6 #(parameter [63:0] INIT = 64'h0) (
   input I0, I1, I2, I3, I4, I5, output O
