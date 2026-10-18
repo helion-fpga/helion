@@ -342,7 +342,7 @@ pub fn paint_welcome(ui: &mut egui::Ui, app: &mut HelionIde, theme: &Theme) {
         app.welcome_dismissed = true;
     }
     if let Some(p) = open_path {
-        app.open_path(&p);
+        app.open_path_async(&p);
     }
     if let Some(msg) = stale_toast {
         app.toasts.push(super::toasts::ToastKind::Warn, msg);

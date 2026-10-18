@@ -310,22 +310,22 @@ impl Design {
             .collect()
     }
 
-    /// True when `net_name` is a top-level output (or inout) port net.
-    /// Guards the exact port name; bit-blasted port nets use the
-    /// `{port}_{bit}` convention and are covered by their IOB loads in real
-    /// flows, so only the exact name is guarded here.
-    fn is_output_port_net(&self, net_name: Spur) -> bool {
-        self.ports.iter().any(|p| {
-            matches!(p.dir, PortDir::Out | PortDir::Inout) && p.name == net_name
-        })
+    /// Top-level output (or inout) port net set for O(1) lookup.
+    fn output_port_nets(&self) -> HashSet<Spur> {
+        self.ports
+            .iter()
+            .filter(|p| matches!(p.dir, PortDir::Out | PortDir::Inout))
+            .map(|p| p.name)
+            .collect()
     }
 
     /// Map cell name -> index of the net on its `O` pin (LUT drivers).
     fn lut_output_nets(&self) -> HashMap<Spur, usize> {
-        let mut map = HashMap::new();
+        let o_pin = crate::intern("O");
+        let mut map = HashMap::with_capacity(self.cells.len());
         for (ni, n) in self.nets.iter().enumerate() {
             for e in &n.endpoints {
-                if e.pin == crate::intern("O") {
+                if e.pin == o_pin {
                     map.insert(e.cell, ni);
                 }
             }
@@ -340,6 +340,12 @@ impl Design {
             map.insert(c.name, i);
         }
         map
+    }
+
+    fn is_output_port_net(&self, net_name: Spur) -> bool {
+        self.ports.iter().any(|p| {
+            matches!(p.dir, PortDir::Out | PortDir::Inout) && p.name == net_name
+        })
     }
 
     /// Shared guard: the driver LUT `cell_idx` with output net `ni` must not
@@ -362,6 +368,31 @@ impl Design {
         false
     }
 
+    #[inline]
+    fn driver_guarded_fast(
+        &self,
+        cell_idx: usize,
+        ni: usize,
+        ila: &HashSet<Spur>,
+        out_ports: &HashSet<Spur>,
+    ) -> bool {
+        let c = &self.cells[cell_idx];
+        if c.attrs.flag("DONT_TOUCH") {
+            return true;
+        }
+        let n = &self.nets[ni];
+        if n.attrs.flag("mark_debug") {
+            return true;
+        }
+        if ila.contains(&n.name) {
+            return true;
+        }
+        if out_ports.contains(&n.name) {
+            return true;
+        }
+        false
+    }
+
     /// Remove every LUT whose output net has no endpoint other than its own
     /// `O`. No rewiring: a zero-fanout LUT cannot affect any observable
     /// signal. Returns the number of LUTs removed.
@@ -373,43 +404,33 @@ impl Design {
     }
 
     fn sweep_dead_luts_inner(&mut self) -> usize {
-        // Zero-allocation: iterate nets directly instead of building
-        // a HashMap of LUT -> net. For each net with a single LUT driver
-        // and no other endpoints, that LUT is dead.
+        let o_pin = intern("O");
         let ila = self.ila_nets();
+        let out_ports = self.output_port_nets();
         let mut dead: Vec<usize> = Vec::new();
-        // Build cell index once for O(1) lookups (uses existing cell_ix).
         for (ni, n) in self.nets.iter().enumerate() {
-            // Find the driver (pin == "O")
-            let mut driver_ci: Option<usize> = None;
-            let mut driver_is_lut = false;
-            for e in &n.endpoints {
-                if e.pin == intern("O") {
-                    if let Some(&ci) = self.cell_ix.get(&e.cell) {
-                        if matches!(self.cells[ci].kind, CellKind::Lut6 { .. }) {
-                            driver_ci = Some(ci);
-                            driver_is_lut = true;
-                        }
-                    }
-                    break;
-                }
+            if n.endpoints.len() != 1 {
+                continue;
             }
-            let Some(ci) = driver_ci else { continue };
-            if !driver_is_lut { continue; }
-            // Dead if the net has only the driver endpoint
-            if n.endpoints.len() == 1 {
-                if !self.driver_guarded(ci, ni, &ila) {
+            let e = &n.endpoints[0];
+            if e.pin != o_pin {
+                continue;
+            }
+            if let Some(&ci) = self.cell_ix.get(&e.cell) {
+                if matches!(self.cells[ci].kind, CellKind::Lut6 { .. })
+                    && !self.driver_guarded_fast(ci, ni, &ila, &out_ports)
+                {
                     dead.push(ci);
                 }
             }
         }
-        self.remove_cells(&dead);
+        self.remove_cells_fast(&dead);
         dead.len()
     }
 
     /// Remove cells by index plus any nets left with no endpoints.
-    /// Keeps the name indexes in sync.
-    fn remove_cells(&mut self, dead: &[usize]) {
+    /// Keeps `cell_ix` in sync without rebuilding `pin_ix` mid-round.
+    fn remove_cells_fast(&mut self, dead: &[usize]) {
         if dead.is_empty() {
             return;
         }
@@ -426,7 +447,17 @@ impl Design {
             idx += 1;
             keep
         });
-        self.rebuild_indexes();
+        self.rebuild_cell_ix();
+    }
+
+    /// Remove cells by index plus any nets left with no endpoints.
+    /// Keeps the name indexes in sync.
+    fn remove_cells(&mut self, dead: &[usize]) {
+        if dead.is_empty() {
+            return;
+        }
+        self.remove_cells_fast(dead);
+        self.rebuild_net_ix();
     }
 
     /// Fold const0/const1 LUTs into fanout LUT INITs.
@@ -445,11 +476,12 @@ impl Design {
     }
 
     fn fold_lut_consts_inner(&mut self) -> usize {
+        let (i_pins, o_pin) = Self::lut_pin_spurs();
         let mut folds: Vec<ConstFold> = Vec::new();
         {
             let out_net = self.lut_output_nets();
-            let cell_idx = self.cell_index();
             let ila = self.ila_nets();
+            let out_ports = self.output_port_nets();
             for (ci, c) in self.cells.iter().enumerate() {
                 let init = match c.kind {
                     CellKind::Lut6 { init } => init,
@@ -461,25 +493,25 @@ impl Design {
                 let Some(&ni) = out_net.get(&c.name) else {
                     continue;
                 };
-                if self.driver_guarded(ci, ni, &ila) {
+                if self.driver_guarded_fast(ci, ni, &ila, &out_ports) {
                     continue;
                 }
                 let val = init != 0;
                 let mut fanouts: Vec<(usize, usize)> = Vec::new();
                 let mut ok = true;
                 for e in &self.nets[ni].endpoints {
-                    if e.cell == c.name && e.pin == intern("O") {
+                    if e.cell == c.name && e.pin == o_pin {
                         continue;
                     }
-                    let (fi, ii) = match cell_idx.get(&e.cell) {
+                    let (fi, ii) = match self.cell_ix.get(&e.cell) {
                         Some(&fi)
                             if matches!(self.cells[fi].kind, CellKind::Lut6 { .. })
                                 && !self.cells[fi].attrs.flag("DONT_TOUCH")
                                 && fi != ci =>
                         {
-                            match crate::resolve(e.pin).strip_prefix('I').and_then(|s| s.parse::<usize>().ok()) {
-                                Some(i) if i < 6 => (fi, i),
-                                _ => {
+                            match i_pins.iter().position(|&p| p == e.pin) {
+                                Some(i) => (fi, i),
+                                None => {
                                     ok = false;
                                     break;
                                 }
@@ -505,48 +537,44 @@ impl Design {
                     *init = fold_init_const(*init, *ii, val);
                 }
             }
-            // Disconnect the folded pins from the const net.
             let pins: HashSet<(Spur, Spur)> = fanouts
                 .iter()
-                .map(|(fi, ii)| (self.cells[*fi].name, intern(&format!("I{ii}"))))
+                .map(|(fi, ii)| (self.cells[*fi].name, i_pins[*ii]))
                 .collect();
             if let Some(net) = self.nets.get_mut(ni) {
                 net.endpoints
                     .retain(|e| !pins.contains(&(e.cell, e.pin)));
             }
+            for &(c, p) in &pins {
+                self.unindex_pin(c, p);
+            }
             folded += 1;
-        }
-        if folded > 0 {
-            self.rebuild_indexes();
         }
         folded
     }
 
     /// Absorb `~I0` inverter LUTs (`INIT = 0x5555…`) into fanout LUT INITs.
-    ///
-    /// Same shape as [`Design::fold_lut_consts`]: when every fanout is a LUT
-    /// input pin, the inversion is pushed into each fanout INIT (address bit
-    /// flipped) and the pin disconnected; the inverter is then dead. The
-    /// inverter's `I0` must be connected (an undriven inverter has no defined
-    /// output). Returns the number of inverters absorbed.
-    ///
-    /// Complexity: O(cells + nets + endpoints + 64 * absorbed pins).
     pub fn absorb_lut_inverters(&mut self) -> usize {
-        self.rebuild_indexes();
-        self.absorb_lut_inverters_inner()
+        self.rebuild_cell_ix();
+        let n = self.absorb_lut_inverters_inner();
+        if n > 0 {
+            self.rebuild_net_ix();
+        }
+        n
     }
 
     fn absorb_lut_inverters_inner(&mut self) -> usize {
+        let (i_pins, o_pin) = Self::lut_pin_spurs();
+        let i0_pin = i_pins[0];
         let mut folds: Vec<InvFold> = Vec::new();
         {
             let out_net = self.lut_output_nets();
-            let cell_idx = self.cell_index();
             let ila = self.ila_nets();
-            // cell -> net idx for I0 pins, to check the inverter is driven
+            let out_ports = self.output_port_nets();
             let mut i0_net: HashMap<Spur, usize> = HashMap::new();
             for (ni, n) in self.nets.iter().enumerate() {
                 for e in &n.endpoints {
-                    if e.pin == intern("I0") {
+                    if e.pin == i0_pin {
                         i0_net.insert(e.cell, ni);
                     }
                 }
@@ -557,29 +585,29 @@ impl Design {
                     continue;
                 }
                 if !i0_net.contains_key(&c.name) {
-                    continue; // undriven inverter: output undefined, do not touch
+                    continue;
                 }
                 let Some(&ni) = out_net.get(&c.name) else {
                     continue;
                 };
-                if self.driver_guarded(ci, ni, &ila) {
+                if self.driver_guarded_fast(ci, ni, &ila, &out_ports) {
                     continue;
                 }
                 let mut fanouts: Vec<(usize, usize)> = Vec::new();
                 let mut ok = true;
                 for e in &self.nets[ni].endpoints {
-                    if e.cell == c.name && e.pin == intern("O") {
+                    if e.cell == c.name && e.pin == o_pin {
                         continue;
                     }
-                    let (fi, ii) = match cell_idx.get(&e.cell) {
+                    let (fi, ii) = match self.cell_ix.get(&e.cell) {
                         Some(&fi)
                             if matches!(self.cells[fi].kind, CellKind::Lut6 { .. })
                                 && !self.cells[fi].attrs.flag("DONT_TOUCH")
                                 && fi != ci =>
                         {
-                            match crate::resolve(e.pin).strip_prefix('I').and_then(|s| s.parse::<usize>().ok()) {
-                                Some(i) if i < 6 => (fi, i),
-                                _ => {
+                            match i_pins.iter().position(|&p| p == e.pin) {
+                                Some(i) => (fi, i),
+                                None => {
                                     ok = false;
                                     break;
                                 }
@@ -607,39 +635,27 @@ impl Design {
             }
             let pins: HashSet<(Spur, Spur)> = fanouts
                 .iter()
-                .map(|(fi, ii)| (self.cells[*fi].name, intern(&format!("I{ii}"))))
+                .map(|(fi, ii)| (self.cells[*fi].name, i_pins[*ii]))
                 .collect();
             if let Some(net) = self.nets.get_mut(ni) {
                 net.endpoints
                     .retain(|e| !pins.contains(&(e.cell, e.pin)));
             }
+            for &(c, p) in &pins {
+                self.unindex_pin(c, p);
+            }
             absorbed += 1;
-        }
-        if absorbed > 0 {
-            self.rebuild_indexes();
         }
         absorbed
     }
 
-    /// Run the LUT peephole passes to fixpoint: const fold and inverter
-    /// absorption create dead LUTs, and const chains resolve one link per
-    /// round. Bounded; returns per-pass statistics.
-    ///
-    /// Complexity: O(rounds * (cells + nets + endpoints)).
+    /// Run the LUT peephole passes to fixpoint.
     pub fn peephole_opt_luts(&mut self) -> LutOptStats {
         let mut st = LutOptStats::default();
+        self.rebuild_cell_ix();
         for _ in 0..16 {
-            // Rebuild indexes once at round start. Only rebuild between passes
-            // if the previous pass actually modified the netlist.
-            self.rebuild_indexes();
             let f = self.fold_lut_consts_inner();
-            if f > 0 {
-                self.rebuild_indexes();
-            }
             let a = self.absorb_lut_inverters_inner();
-            if a > 0 {
-                self.rebuild_indexes();
-            }
             let s = self.sweep_dead_luts_inner();
             st.consts_folded += f;
             st.inverters_absorbed += a;
@@ -649,6 +665,7 @@ impl Design {
                 break;
             }
         }
+        self.rebuild_indexes();
         st
     }
 

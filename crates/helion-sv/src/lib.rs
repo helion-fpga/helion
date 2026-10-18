@@ -142,18 +142,8 @@ impl Aig {
         // with later PIs — that collision folded `q2 ^ (q0 & q1)` to const 0.
         a.collect_pis(e);
         a.output = a.expr(e);
-        // Rewrite trivial nodes (const/buffer/inverter) to simplify the AIG
-        // before LUT mapping. This is Phase 1 of ABC-style rewriting.
-        let n1 = a.rewrite_trivial_cuts();
-        // NPN-based cut rewriting (Phase 2 scaffold). Currently builds NPN
-        // classification map; full sharing implementation is future work.
-        let n2 = a.rewrite_npn_cuts();
-        // AIG balancing for delay optimization (ABC `balance`).
-        // Restructures AND trees to minimize depth.
-        let n3 = a.balance();
-        #[cfg(debug_assertions)]
-        if n1 + n2 + n3 > 0 {
-            eprintln!("AIG rewriting: {} trivial, {} npn, {} balanced", n1, n2, n3);
+        if AIG_REWRITE_ON.with(|c| c.get()) && a.ands.len() >= 2 && a.ands.len() <= 32 {
+            let _ = a.rewrite_trivial_cuts();
         }
         a
     }
@@ -484,7 +474,7 @@ impl Aig {
     /// buffer, or inverter, replace the node with the trivial implementation.
     /// Returns number of nodes rewritten.
     pub fn rewrite_trivial_cuts(&mut self) -> usize {
-        let cuts = self.enumerate_cuts(6);
+        let cuts = self.enumerate_cuts(2);
         let n_pis = self.pis.len() as u32;
         let mut rewritten = 0;
         let mut to_replace: Vec<(u32, Lit)> = Vec::new();

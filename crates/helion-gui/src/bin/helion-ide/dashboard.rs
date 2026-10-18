@@ -24,15 +24,18 @@ use super::WorkspaceTab;
 /// Collapses to one column on narrow windows. Zero dead void by construction.
 pub fn paint_dashboard(ui: &mut egui::Ui, app: &mut HelionIde) {
     let theme = app.theme;
-    egui::ScrollArea::vertical()
-        .id_salt("dashboard_scroll")
-        .auto_shrink([false, false])
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
-            let avail = ui.available_width();
-            let cols = if avail >= 760.0 { 2 } else { 1 };
-            let gap = chrome::SPACE_LG;
-            let row_spacing = ui.spacing().item_spacing.x;
-            let sw = dashboard_column_width(avail, cols, gap, row_spacing);
+            egui::ScrollArea::vertical()
+                .id_salt("dashboard_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let avail = ui.available_width();
+                    let cols = if avail >= 720.0 { 2 } else { 1 };
+                    let gap = chrome::SPACE_MD;
+                    let row_spacing = ui.spacing().item_spacing.x;
+                    let sw = dashboard_column_width(avail, cols, gap, row_spacing);
             // Vertical fill: when the viewport is taller than the content,
             // distribute the slack across rows so no dead void remains.
             let viewport_h = ui.available_height();
@@ -49,19 +52,19 @@ pub fn paint_dashboard(ui: &mut egui::Ui, app: &mut HelionIde) {
             };
             // (title, view tabs, min height, section index)
             const SECTIONS: [(&str, Option<(&str, &[&str])>, f32, usize); 8] = [
-                ("Design", None, 132.0, 0),
-                ("Synthesis", None, 146.0, 1),
-                ("Implementation", None, 168.0, 2),
+                ("Design", None, 136.0, 0),
+                ("Synthesis", None, 148.0, 1),
+                ("Implementation", None, 172.0, 2),
                 (
                     "Timing",
                     Some(("dash_timing_view", &["Summary", "Paths"])),
-                    204.0,
+                    208.0,
                     3,
                 ),
-                ("Utilization", None, 178.0, 4),
-                ("DRC", None, 140.0, 5),
-                ("Power", None, 168.0, 6),
-                ("Run History", None, 188.0, 7),
+                ("Utilization", None, 212.0, 4),
+                ("DRC", None, 160.0, 5),
+                ("Power", None, 188.0, 6),
+                ("Run History", None, 196.0, 7),
             ];
             let mut go: Option<WorkspaceTab> = None;
             for (ri, chunk) in SECTIONS.chunks(cols).enumerate() {
@@ -87,6 +90,7 @@ pub fn paint_dashboard(ui: &mut egui::Ui, app: &mut HelionIde) {
             if let Some(tab) = go {
                 open_more_workspace(app, tab);
             }
+                });
         });
 }
 
@@ -1099,26 +1103,38 @@ fn catalog_row(
     badge: Option<&str>,
     dot: egui::Color32,
 ) -> bool {
-    let mut clicked = false;
-    ui.horizontal(|ui| {
-        ui.colored_label(dot, "●");
-        if ui
-            .add(
-                egui::Label::new(egui::RichText::new(label).color(theme.text))
-                    .sense(egui::Sense::click()),
-            )
-            .clicked()
-        {
-            clicked = true;
+    let w = ui.available_width().max(80.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        if resp.hovered() {
+            p.rect_filled(rect, 4.0, theme.surface_hover);
         }
+        p.circle_filled(egui::pos2(rect.left() + 8.0, rect.center().y), 4.0, dot);
+        let mut label_right = rect.right() - 6.0;
         if let Some(b) = badge {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(b).small().color(theme.faint));
-            });
+            let bgalley = p.layout_no_wrap(b.to_string(), theme::font_ui(11.0), theme.faint);
+            let bw = bgalley.size().x;
+            let bx = (rect.right() - 6.0 - bw).max(rect.left() + 68.0);
+            label_right = (bx - 8.0).max(rect.left() + 48.0);
+            p.galley(
+                egui::pos2(bx, rect.center().y - bgalley.size().y * 0.5),
+                bgalley,
+                theme.faint,
+            );
         }
-    });
-    ui.add_space(2.0);
-    clicked
+        let label_clip = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 18.0, rect.top()),
+            egui::pos2(label_right, rect.bottom()),
+        );
+        let lgalley = p.layout_no_wrap(label.to_string(), theme::font_ui(13.0), theme.text);
+        p.with_clip_rect(label_clip).galley(
+            egui::pos2(rect.left() + 20.0, rect.center().y - lgalley.size().y * 0.5),
+            lgalley,
+            theme.text,
+        );
+    }
+    resp.clicked()
 }
 
 /// (label, badge, dot, tab) tuple builder for the catalog rows.

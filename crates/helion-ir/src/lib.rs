@@ -233,8 +233,8 @@ pub struct Design {
     /// Name → index in `nets`. `connect` / `merge_net` keep this in sync so
     /// Ibex-scale stitch is O(1) per net, not a linear scan of every net.
     net_ix: HashMap<Spur, usize>,
-    /// cell → pin → net index. Makes `net_on` O(1) instead of scanning every net.
-    pin_ix: HashMap<Spur, HashMap<Spur, usize>>,
+    /// (cell, pin) → net index. Flat map avoids 20k+ nested HashMap heap allocs on Ibex.
+    pin_ix: HashMap<(Spur, Spur), usize>,
     /// Name → index in `cells`.
     cell_ix: HashMap<Spur, usize>,
 }
@@ -400,21 +400,18 @@ impl Design {
         self.pin_ix.clear();
         self.net_ix.reserve(self.nets.len());
         for (i, n) in self.nets.iter().enumerate() {
-            self.net_ix.insert(n.name.clone(), i);
+            self.net_ix.insert(n.name, i);
             for e in &n.endpoints {
-                self.pin_ix
-                    .entry(e.cell.clone())
-                    .or_default()
-                    .insert(e.pin.clone(), i);
+                self.pin_ix.insert((e.cell, e.pin), i);
             }
         }
     }
 
-    fn rebuild_cell_ix(&mut self) {
+    pub(crate) fn rebuild_cell_ix(&mut self) {
         self.cell_ix.clear();
         self.cell_ix.reserve(self.cells.len());
         for (i, c) in self.cells.iter().enumerate() {
-            self.cell_ix.insert(c.name.clone(), i);
+            self.cell_ix.insert(c.name, i);
         }
     }
 
@@ -454,10 +451,11 @@ impl Design {
     }
 
     fn index_pin(&mut self, cell: Spur, pin: Spur, net_i: usize) {
-        self.pin_ix
-            .entry(cell)
-            .or_default()
-            .insert(pin, net_i);
+        self.pin_ix.insert((cell, pin), net_i);
+    }
+
+    pub(crate) fn unindex_pin(&mut self, cell: Spur, pin: Spur) {
+        self.pin_ix.remove(&(cell, pin));
     }
 
     /// Merge `net` into this design by name (O(1) index). Used by hierarchy stitch.
@@ -547,7 +545,7 @@ impl Design {
     }
 
     pub fn net_on(&self, cell: Spur, pin: Spur) -> Option<Spur> {
-        if let Some(&i) = self.pin_ix.get(&cell).and_then(|m| m.get(&pin)) {
+        if let Some(&i) = self.pin_ix.get(&(cell, pin)) {
             return self.nets.get(i).map(|n| n.name);
         }
         self.nets.iter().find_map(|n| {

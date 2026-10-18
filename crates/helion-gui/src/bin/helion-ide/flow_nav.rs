@@ -106,17 +106,21 @@ fn paint_stage_header(
         egui::vec2(chrome::FLOW_STAGE_ICON_SIZE, chrome::FLOW_STAGE_ICON_SIZE),
     );
     icons::paint_stage(p, icon_rect, step, theme.dim);
-    p.text(
-        egui::pos2(rect.left() + 46.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        step.label(),
-        theme::font_ui(13.0),
+    let (fill, ring) = stage_dot_colors(theme, state);
+    let dot_x = rect.right() - 12.0;
+    let label_clip = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 44.0, rect.top()),
+        egui::pos2((dot_x - 10.0).max(rect.left() + 48.0), rect.bottom()),
+    );
+    let galley = p.layout_no_wrap(step.label().to_string(), theme::font_ui(13.0), theme.text);
+    p.with_clip_rect(label_clip).galley(
+        egui::pos2(rect.left() + 46.0, rect.center().y - galley.size().y * 0.5),
+        galley,
         theme.text,
     );
-    let (fill, ring) = stage_dot_colors(theme, state);
     icons::paint_stage_dot(
         p,
-        egui::pos2(rect.right() - 12.0, rect.center().y),
+        egui::pos2(dot_x, rect.center().y),
         5.0,
         fill,
         ring,

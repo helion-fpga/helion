@@ -253,6 +253,7 @@ pub fn set_find_demo(ctx: &egui::Context, open: bool, query: &str) {
     ctx.data_mut(|d| d.insert_temp(id, st));
 }
 
+#[derive(Clone, Debug)]
 struct RtlSymbol {
     kind: &'static str,
     name: String,
@@ -389,9 +390,26 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
         let m = &app.model;
         editor_crumbs(m.source_line_rows(), cursor, lang)
     };
-    let n_lines = app.editor_text.split('\n').count().max(1);
-    let symbols = extract_rtl_symbols(&app.editor_text);
-
+    let sym_cache_id = egui::Id::new("editor_symbols_cache");
+    let cache_key = (
+        app.editor_path.clone(),
+        app.editor_text.len(),
+    );
+    let (n_lines, symbols): (usize, Arc<Vec<RtlSymbol>>) = ui
+        .ctx()
+        .data_mut(|d| {
+            d.get_temp::<(Option<PathBuf>, usize, usize, Arc<Vec<RtlSymbol>>)>(sym_cache_id)
+        })
+        .filter(|(p, len, _, _)| p == &cache_key.0 && *len == cache_key.1)
+        .map(|(_, _, nl, syms)| (nl, syms))
+        .unwrap_or_else(|| {
+            let nl = app.editor_text.split('\n').count().max(1);
+            let syms = Arc::new(extract_rtl_symbols(&app.editor_text));
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(sym_cache_id, (cache_key.0, cache_key.1, nl, syms.clone()));
+            });
+            (nl, syms)
+        });
     let mut do_open = false;
     let mut do_goto = false;
     let mut do_goto_def = false;
@@ -447,28 +465,18 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(6.0);
             if ui
-                .small_button("Cross-Probe (F4)")
+                .small_button("Probe (F4)")
                 .on_hover_text("Synchronize selection across RTL, Schematic, Device, Timing, DRC, and Waveform (F4)")
                 .clicked()
             {
                 do_cross_probe = true;
             }
             if ui
-                .small_button("Go to Def (F12)")
+                .small_button("Def (F12)")
                 .on_hover_text("Jump to SV/VHDL/XDC symbol declaration (F12 or Ctrl/⌘+Click)")
                 .clicked()
             {
                 do_goto_def = true;
-            }
-            if ui.small_button("Goto Source").clicked() {
-                do_goto = true;
-            }
-            if ui
-                .small_button("Show RTL")
-                .on_hover_text("Show the current RTL source in the text editor")
-                .clicked()
-            {
-                do_open = true;
             }
             if ui
                 .small_button("Save")
@@ -488,17 +496,17 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
             let outline_label = if aux.outline_open {
                 format!("Outline ({})", symbols.len())
             } else {
-                "Outline: off".to_string()
+                "Outline".to_string()
             };
             if ui
-                .add(egui::Button::new(RichText::new(outline_label).size(11.5)).selected(aux.outline_open))
+                .add(egui::Button::new(RichText::new(outline_label).size(11.0)).selected(aux.outline_open))
                 .on_hover_text("Toggle RTL Symbol Outline dock")
                 .clicked()
             {
                 aux.outline_open = !aux.outline_open;
             }
             if ui
-                .add(egui::Button::new(RichText::new("Find / Replace").size(11.5)).selected(aux.find_open))
+                .add(egui::Button::new(RichText::new("Find").size(11.0)).selected(aux.find_open))
                 .on_hover_text("Find and replace in current file (⌘F)")
                 .clicked()
             {
@@ -509,7 +517,11 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
     ui.separator();
 
     // ---- Inline Find / Replace Pop-up Bar ----
-    let matches = find_match_lines(&app.editor_text, &aux.find_query, aux.case_sensitive);
+    let matches = if aux.find_open && !aux.find_query.is_empty() {
+        find_match_lines(&app.editor_text, &aux.find_query, aux.case_sensitive)
+    } else {
+        Vec::new()
+    };
     if !matches.is_empty() && aux.current_match >= matches.len() {
         aux.current_match = 0;
     }
@@ -708,7 +720,7 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
                                         if symbols.is_empty() {
                                             ui.label(RichText::new("No symbols parsed.").small().color(theme.faint));
                                         }
-                                        for sym in &symbols {
+                                        for sym in symbols.iter() {
                                             let on = cursor == sym.line;
                                             let badge_col = match sym.kind {
                                                 "MOD" => theme.accent,
@@ -782,8 +794,9 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
     }
 }
 
-/// The scroll area + content-sized TextEdit. Returns the scroll output
-/// (whose `.inner` is the [`egui::text_edit::TextEditOutput`]).
+/// The scroll area + text view. Uses full `TextEdit::multiline` for files <= 800 lines,
+/// and viewport-virtualized `show_rows` for large files (e.g. 27,117-line `ysyx_ibex.sv`)
+/// so only the ~45 visible rows are syntax-highlighted and tessellated per frame.
 fn paint_editor_text(
     ui: &mut egui::Ui,
     app: &mut HelionIde,
@@ -791,12 +804,11 @@ fn paint_editor_text(
     lang: highlight::Lang,
     n_lines: usize,
     wrap: bool,
-) -> egui::scroll_area::ScrollAreaOutput<egui::text_edit::TextEditOutput> {
+) -> egui::scroll_area::ScrollAreaOutput<()> {
     let mut scroll = egui::ScrollArea::both()
         .id_salt("ug893_text_editor")
         .auto_shrink([false, false])
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible);
-    // Pending programmatic scrolls: minimap click/drag wins over breadcrumbs.
     if let Some(y) = app.editor_mini_scroll.take() {
         scroll = scroll.vertical_scroll_offset(y);
     } else {
@@ -811,6 +823,71 @@ fn paint_editor_text(
             scroll = scroll.vertical_scroll_offset(y);
         }
     }
+    if n_lines > 800 {
+        app.editor_line_rows.clear();
+        let spans_id = egui::Id::new("editor_line_spans_cache");
+        let skey = (app.editor_path.clone(), app.editor_text.len());
+        let spans: Arc<Vec<(usize, usize)>> = ui
+            .ctx()
+            .data_mut(|d| d.get_temp::<(Option<PathBuf>, usize, Arc<Vec<(usize, usize)>>)>(spans_id))
+            .filter(|(p, len, _)| p == &skey.0 && *len == skey.1)
+            .map(|(_, _, s)| s)
+            .unwrap_or_else(|| {
+                let mut v = Vec::with_capacity(n_lines);
+                let mut start = 0usize;
+                for (idx, b) in app.editor_text.bytes().enumerate() {
+                    if b == b'\n' {
+                        v.push((start, idx));
+                        start = idx + 1;
+                    }
+                }
+                if start <= app.editor_text.len() {
+                    v.push((start, app.editor_text.len()));
+                }
+                let arc = Arc::new(v);
+                ui.ctx().data_mut(|d| d.insert_temp(spans_id, (skey.0, skey.1, arc.clone())));
+                arc
+            });
+        let viewport_w = ui.available_width().max(640.0);
+        let selected_line = app.model.selected_source_line;
+        let mut clicked_line: Option<usize> = None;
+        let out = scroll.show_rows(ui, ROW_H, spans.len(), |ui, row_range| {
+            ui.set_min_width(viewport_w);
+            for row_idx in row_range {
+                let (s, e) = spans.get(row_idx).copied().unwrap_or((0, 0));
+                let line_str = app.editor_text.get(s..e).unwrap_or("");
+                let line_no = row_idx + 1;
+                let is_sel = selected_line == Some(line_no);
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(viewport_w, ROW_H),
+                    egui::Sense::click(),
+                );
+                if ui.is_rect_visible(rect) {
+                    if is_sel {
+                        ui.painter().rect_filled(rect, 0.0, theme.sel.gamma_multiply(0.45));
+                    } else if resp.hovered() {
+                        ui.painter().rect_filled(rect, 0.0, theme.surface_hover.gamma_multiply(0.35));
+                    }
+                    let mut job = egui::text::LayoutJob::default();
+                    job.wrap.max_width = f32::INFINITY;
+                    append_highlighted(&mut job, line_str, lang, false, theme, 13.0);
+                    let galley = ui.fonts(|f| f.layout_job(job));
+                    ui.painter().galley(
+                        egui::pos2(rect.left() + 4.0, rect.top()),
+                        galley,
+                        theme.text,
+                    );
+                }
+                if resp.clicked() {
+                    clicked_line = Some(line_no);
+                }
+            }
+        });
+        if let Some(ln) = clicked_line {
+            let _ = app.model.select_editor_line(&ln.to_string());
+        }
+        return out;
+    }
     scroll.show(ui, |ui| {
         let rows_rc: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
         let rows_w = rows_rc.clone();
@@ -819,10 +896,6 @@ fn paint_editor_text(
             move |lui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
                 build_editor_galley(lui, buf.as_str(), lang, &theme_c, wrap, wrap_width, &rows_w)
             };
-        // Content-sized: never scrolls internally, so the outer ScrollArea
-        // owns scrolling and the gutter/minimap stay in sync. In non-wrap
-        // mode the TextEdit is at least as wide as the viewport so it fills
-        // the panel; wider content enables the h-scrollbar.
         let viewport_w = ui.available_width().max(160.0);
         let des_w = if wrap {
             viewport_w
@@ -843,7 +916,6 @@ fn paint_editor_text(
             app.editor_content_w = out.galley.size().x.max(200.0);
         }
         app.editor_line_rows = rows_rc.borrow().clone();
-
         // Inline SV/VHDL/XDC symbol hover tooltip & Ctrl/Cmd+Click go-to-definition.
         if let Some(pos) = out.response.hover_pos() {
             let rel_y = (pos.y - out.galley_pos.y).max(0.0);
@@ -924,7 +996,6 @@ fn paint_editor_text(
                 }
             }
         }
-        out
     })
 }
 
@@ -936,7 +1007,7 @@ fn paint_gutter_overlay(
     app: &HelionIde,
     theme: &theme::Theme,
     gutter_resp: &egui::Response,
-    scroll: &egui::scroll_area::ScrollAreaOutput<egui::text_edit::TextEditOutput>,
+    scroll: &egui::scroll_area::ScrollAreaOutput<()>,
     n_lines: usize,
     wrap: bool,
     match_lines: &std::collections::HashSet<usize>,
@@ -944,9 +1015,13 @@ fn paint_gutter_overlay(
     let gutter_rect = gutter_resp.rect;
     let offset_y = scroll.state.offset.y;
     let viewport_h = scroll.inner_rect.height();
-    let line_rows = app.editor_line_rows.clone();
-    let markers = app.model.editor_markers();
-    let bookmarks = app.model.editor_bookmarks.clone();
+    let line_rows = &app.editor_line_rows;
+    let markers = if n_lines <= 2_500 {
+        app.model.editor_markers()
+    } else {
+        Vec::new()
+    };
+    let bookmarks = &app.model.editor_bookmarks;
     let selected = app.model.selected_source_line;
 
     let painter = ui.painter().with_clip_rect(gutter_rect);
@@ -958,9 +1033,14 @@ fn paint_gutter_overlay(
         ],
         egui::Stroke::new(1.0, theme.line),
     );
-    // Track cumulative content-y while walking visible lines.
-    let mut cy = 0.0;
-    let mut i = 0;
+    // Jump directly to first visible line in non-wrap mode for O(1) gutter rendering on 27k-line files.
+    let start_i = if !wrap || line_rows.len() != n_lines {
+        ((offset_y / ROW_H).floor() as usize).min(n_lines)
+    } else {
+        0
+    };
+    let mut cy = start_i as f32 * ROW_H;
+    let mut i = start_i;
     while i < n_lines {
         let h = if wrap && line_rows.len() == n_lines {
             line_rows[i] as f32 * ROW_H
@@ -1039,7 +1119,7 @@ fn paint_gutter_overlay(
 fn handle_gutter_click(
     app: &mut HelionIde,
     gutter_resp: &egui::Response,
-    scroll: &egui::scroll_area::ScrollAreaOutput<egui::text_edit::TextEditOutput>,
+    scroll: &egui::scroll_area::ScrollAreaOutput<()>,
     n_lines: usize,
     wrap: bool,
 ) {
@@ -1067,7 +1147,7 @@ fn paint_minimap(
     app: &mut HelionIde,
     theme: &theme::Theme,
     mini_resp: &egui::Response,
-    scroll: &egui::scroll_area::ScrollAreaOutput<egui::text_edit::TextEditOutput>,
+    scroll: &egui::scroll_area::ScrollAreaOutput<()>,
     n_lines: usize,
     lang: highlight::Lang,
 ) {
