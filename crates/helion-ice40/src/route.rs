@@ -620,22 +620,36 @@ pub fn route(router: &Router, placed: &PlacedIce) -> Result<RoutedIce, String> {
             let n = router.lookup(x, y + 1, "ram/WE");
             add_ram_ep(we, n, false, &format!("RAM {} WE", ram_pack.name))?;
         }
+        // Write mask bits (MASK_0..7 in RAMT, MASK_8..15 in RAMB).
+        for i in 0..8 {
+            let n = router.lookup(x, y + 1, &format!("ram/MASK_{i}"));
+            add_ram_ep(
+                &ram_pack.mask_net[i],
+                n,
+                false,
+                &format!("RAM {} MASK{i}", ram_pack.name),
+            )?;
+        }
+        for i in 8..16 {
+            let n = router.lookup(x, y, &format!("ram/MASK_{i}"));
+            add_ram_ep(
+                &ram_pack.mask_net[i],
+                n,
+                false,
+                &format!("RAM {} MASK{i}", ram_pack.name),
+            )?;
+        }
         let _ = ram;
     }
     // PLLs: the reference clock is a load on the PLL site's REFERENCECLK
     // `fabout` net (io_tile (13,0) for the bottom PLL, (13,33) for the top
-    // one; IceStorm icebox.py pllinfo_db "8k_0"/"8k_1"). The router programs
-    // the local-track -> fabout buffer, as arachne-pnr does.
-    //
-    // The PLL output (PLLOUTGLOBAL) physically drives the dedicated global
-    // clock network via the padin_glb_netwk extra bit (emitted from
-    // glb_clocks). Its routing driver is the canonical glb_netwk node,
-    // added generically below; no fabric driver exists.
+    // one; IceStorm icebox.py pllinfo_db "8k_0"/"8k_1").
     for (pi, pll) in placed.packed.plls.iter().enumerate() {
         let placed_pll = &placed.plls[pi];
-        let ref_tile = match placed_pll.kind {
-            crate::pack::PllKind::Pad => (13u8, 0u8),
-            crate::pack::PllKind::Core => (13u8, 33u8),
+        let ref_tile = if placed_pll.kind.is_pad() {
+            (13u8, 0u8)
+        } else {
+            (13u8, 33u8)
         };
         let n = router.lookup(ref_tile.0, ref_tile.1, "fabout");
         add_ep(
@@ -644,6 +658,15 @@ pub fn route(router: &Router, placed: &PlacedIce) -> Result<RoutedIce, String> {
             false,
             &format!("PLL {} REFERENCECLK", pll.name),
         )?;
+        if let Some(lock_net) = &pll.lock_net {
+            let lock_node = router.lookup(14, ref_tile.1, "io_0/D_IN_0");
+            add_ep(
+                lock_net,
+                lock_node,
+                true,
+                &format!("PLL {} LOCK", pll.name),
+            )?;
+        }
     }
 
     // Global-clock sources: route each source net to the `fabout` of its
@@ -660,6 +683,170 @@ pub fn route(router: &Router, placed: &PlacedIce) -> Result<RoutedIce, String> {
                 false,
                 &format!("global clock source -> fabout {gx},{gy}"),
             )?;
+        }
+    }
+
+    // Internal oscillators & Hard IP blocks (SB_HFOSC, SB_LFOSC, SB_MAC16,
+    // SB_SPRAM256KA, SB_I2C, SB_SPI, SB_RGBA_DRV, SB_LEDDA_IP):
+    // 1. Register all output drivers first.
+    for (oi, osc) in placed.packed.oscs.iter().enumerate() {
+        let posc = &placed.oscs[oi];
+        let drv = router.lookup(posc.x, posc.y, "io_0/D_IN_0");
+        add_ep(&osc.out_net, drv, true, &format!("OSC {} out", osc.name))?;
+    }
+
+    let mut used_lc_out: HashSet<(u8, u8, u8)> = placed
+        .luts
+        .iter()
+        .map(|l| (l.x, l.y, l.lc))
+        .chain(placed.ffs.iter().map(|f| (f.x, f.y, f.lc)))
+        .collect();
+    let mut alloc_ip_driver = |site_x: u8, site_y: u8| -> Option<NodeId> {
+        let lx = if site_x == 0 { 1u8 } else { 32u8 };
+        for dy in 0..32u8 {
+            let y = ((site_y.saturating_sub(1) + dy) % 32) + 1;
+            if !matches!(tile_kind(lx, y), Some(TileKind::Logic)) {
+                continue;
+            }
+            for lc in 0..8u8 {
+                if used_lc_out.insert((lx, y, lc)) {
+                    return router.lookup(lx, y, &format!("lutff_{lc}/out"));
+                }
+            }
+        }
+        None
+    };
+
+    for (mi, mac) in placed.packed.mac16s.iter().enumerate() {
+        let pmac = &placed.mac16s[mi];
+        for out_net in mac
+            .o_nets
+            .iter()
+            .flatten()
+            .chain(mac.co_net.iter())
+            .chain(mac.acc_ovf_net.iter())
+        {
+            let drv = alloc_ip_driver(pmac.x, pmac.y);
+            add_ep(out_net, drv, true, &format!("SB_MAC16 {} out", mac.name))?;
+        }
+    }
+    for (si, spram) in placed.packed.sprams.iter().enumerate() {
+        let pspram = &placed.sprams[si];
+        for out_net in spram.data_out_nets.iter().flatten() {
+            let drv = alloc_ip_driver(pspram.x, pspram.y);
+            add_ep(
+                out_net,
+                drv,
+                true,
+                &format!("SB_SPRAM256KA {} DATAOUT", spram.name),
+            )?;
+        }
+    }
+    for (hi, ip) in placed.packed.hard_ips.iter().enumerate() {
+        let pip = &placed.hard_ips[hi];
+        for (pin, out_net) in &ip.output_nets {
+            let drv = alloc_ip_driver(pip.x, pip.y);
+            add_ep(out_net, drv, true, &format!("HardIP {} {pin}", ip.name))?;
+        }
+    }
+
+    // 2. Register driven input loads on oscillators, DSPs, SPRAMs, and hard IPs.
+    let mut ip_in_cursor = 0usize;
+    let mut alloc_ip_load = |site_x: u8, site_y: u8| -> Option<NodeId> {
+        let lx = if site_x == 0 { 1u8 } else { 32u8 };
+        let y = site_y.clamp(1, 32);
+        let lc = ((ip_in_cursor / 4) % 8) as u8;
+        let pin = (ip_in_cursor % 4) as u8;
+        ip_in_cursor += 1;
+        router.lookup(lx, y, &format!("lutff_{lc}/in_{pin}"))
+    };
+    let push_load_if_driven =
+        |eps: &mut HashMap<String, Vec<Endpoint>>, net: &str, node: Option<NodeId>, what: &str| -> Result<(), String> {
+            if eps.get(net).is_some_and(|v| v.iter().any(|e| e.is_driver)) {
+                let node = node.ok_or_else(|| format!("route: no routing node for {what}"))?;
+                eps.entry(net.to_string()).or_default().push(Endpoint {
+                    node,
+                    is_driver: false,
+                });
+            }
+            Ok(())
+        };
+
+    for (oi, osc) in placed.packed.oscs.iter().enumerate() {
+        let posc = &placed.oscs[oi];
+        for (pin_label, opt_net) in [("PU", &osc.pu_net), ("EN", &osc.en_net)] {
+            if let Some(net) = opt_net {
+                let iob = if pin_label == "PU" { 0 } else { 1 };
+                let ld = router.lookup(posc.x, posc.y, &format!("io_{iob}/D_OUT_0"));
+                push_load_if_driven(&mut net_eps, net, ld, &format!("OSC {} {pin_label}", osc.name))?;
+            }
+        }
+    }
+    for (mi, mac) in placed.packed.mac16s.iter().enumerate() {
+        let pmac = &placed.mac16s[mi];
+        if let Some(clk) = &mac.clk_net {
+            if let Some(&pi) = net_plan.get(clk) {
+                let lx = if pmac.x == 0 { 1u8 } else { 32u8 };
+                glb_tiles.entry(pi).or_default().push((lx, pmac.y.clamp(1, 32)));
+            }
+        }
+        for in_net in mac
+            .a_nets
+            .iter()
+            .chain(mac.b_nets.iter())
+            .chain(mac.c_nets.iter())
+            .chain(mac.d_nets.iter())
+            .chain(std::iter::once(&mac.ce_net))
+            .flatten()
+        {
+            let ld = alloc_ip_load(pmac.x, pmac.y);
+            push_load_if_driven(&mut net_eps, in_net, ld, &format!("SB_MAC16 {} in", mac.name))?;
+        }
+    }
+    for (si, spram) in placed.packed.sprams.iter().enumerate() {
+        let pspram = &placed.sprams[si];
+        if let Some(clk) = &spram.clock_net {
+            if let Some(&pi) = net_plan.get(clk) {
+                let lx = if pspram.x == 0 { 1u8 } else { 32u8 };
+                glb_tiles
+                    .entry(pi)
+                    .or_default()
+                    .push((lx, pspram.y.clamp(1, 32)));
+            }
+        }
+        for in_net in spram
+            .addr_nets
+            .iter()
+            .chain(spram.data_in_nets.iter())
+            .chain(spram.mask_wren_nets.iter())
+            .chain([
+                &spram.wren_net,
+                &spram.chipselect_net,
+                &spram.standby_net,
+                &spram.sleep_net,
+                &spram.poweroff_net,
+            ])
+            .flatten()
+        {
+            let ld = alloc_ip_load(pspram.x, pspram.y);
+            push_load_if_driven(
+                &mut net_eps,
+                in_net,
+                ld,
+                &format!("SB_SPRAM256KA {} in", spram.name),
+            )?;
+        }
+    }
+    for (hi, ip) in placed.packed.hard_ips.iter().enumerate() {
+        let pip = &placed.hard_ips[hi];
+        for (pin, in_net) in &ip.input_nets {
+            if let Some(&pi) = net_plan.get(in_net) {
+                let lx = if pip.x == 0 { 1u8 } else { 32u8 };
+                glb_tiles.entry(pi).or_default().push((lx, pip.y.clamp(1, 32)));
+            } else {
+                let ld = alloc_ip_load(pip.x, pip.y);
+                push_load_if_driven(&mut net_eps, in_net, ld, &format!("HardIP {} {pin}", ip.name))?;
+            }
         }
     }
 

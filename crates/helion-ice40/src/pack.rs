@@ -188,34 +188,195 @@ pub struct PackedRam {
     pub wclk_net: String,
     pub re_net: Option<String>,
     pub we_net: Option<String>,
+    /// 16-bit write bit-mask nets (`MASK0`..`MASK15`, active when `write_mode == 0`).
+    pub mask_net: [String; 16],
+    /// Negative-edge read clock (`SB_RAM40_4KNR` / `SB_RAM40_4KNRNW` or `NEG_CLK_R=1`).
+    pub neg_clk_r: bool,
+    /// Negative-edge write clock (`SB_RAM40_4KNW` / `SB_RAM40_4KNRNW` or `NEG_CLK_W=1`).
+    pub neg_clk_w: bool,
 }
 
-/// A packed SB_PLL40.
+/// Feedback path selection for `SB_PLL40_*` primitives (`FEEDBACK_PATH` parameter).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PllFeedbackPath {
+    /// `"DELAY"` (`3'b000`).
+    Delay,
+    /// `"SIMPLE"` (`3'b001`).
+    #[default]
+    Simple,
+    /// `"PHASE_AND_DELAY"` (`3'b010`).
+    PhaseAndDelay,
+    /// `"EXTERNAL"` (`3'b110`).
+    External,
+}
+
+impl PllFeedbackPath {
+    /// 3-bit `FEEDBACK_PATH` field value in IceStorm `PLLCONFIG`.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Delay => 0b000,
+            Self::Simple => 0b001,
+            Self::PhaseAndDelay => 0b010,
+            Self::External => 0b110,
+        }
+    }
+}
+
+/// A packed `SB_PLL40_*` primitive.
 #[derive(Clone, Debug)]
 pub struct PackedPll {
     pub name: String,
     pub kind: PllKind,
     pub ref_net: String,
     pub out_net: String,
-    /// Desired output frequency in Hz (from the `FREQ` cell attribute).
+    /// Secondary output net (`PLLOUTGLOBALB` / `PLLOUTCOREB`) for `2F` / `2_PAD` PLLs.
+    pub out_net_b: Option<String>,
+    /// Optional `LOCK` status output net.
+    pub lock_net: Option<String>,
+    /// Desired output frequency in Hz (from the `FREQ` cell attribute, or computed from dividers).
     pub out_freq_hz: u64,
     /// Reference clock frequency in Hz (from the `REF_FREQ` cell attribute).
     pub ref_freq_hz: u64,
-    /// Divider settings computed from the two frequencies with the
-    /// IceStorm `icepll` algorithm (SIMPLE feedback path).
+    /// Divider settings (`DIVR`, `DIVF`, `DIVQ`, `FILTER_RANGE`) and `FEEDBACK_PATH`.
     pub divr: u8,
     pub divf: u8,
     pub divq: u8,
     pub filter_range: u8,
+    pub feedback_path: PllFeedbackPath,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PllKind {
+    /// `SB_PLL40_PAD` (`PLLTYPE = 3'b010`).
     Pad,
+    /// `SB_PLL40_CORE` (`PLLTYPE = 3'b011`).
     Core,
+    /// `SB_PLL40_2_PAD` (`PLLTYPE = 3'b100`).
+    Pad2,
+    /// `SB_PLL40_2F_PAD` (`PLLTYPE = 3'b110`).
+    Pad2F,
+    /// `SB_PLL40_2F_CORE` (`PLLTYPE = 3'b111`).
+    Core2F,
 }
 
-/// Backend-owned packed netlist for the iCE40 HX8K.
+impl PllKind {
+    /// 3-bit `PLLTYPE` field value in IceStorm `PLLCONFIG`.
+    pub const fn plltype_code(self) -> u8 {
+        match self {
+            Self::Pad => 0b010,
+            Self::Core => 0b011,
+            Self::Pad2 => 0b100,
+            Self::Pad2F => 0b110,
+            Self::Core2F => 0b111,
+        }
+    }
+
+    /// True if this PLL takes its reference clock from a package pad (`PACKAGEPIN`).
+    pub const fn is_pad(self) -> bool {
+        matches!(self, Self::Pad | Self::Pad2 | Self::Pad2F)
+    }
+}
+
+/// A packed `SB_MAC16` 16x16 multiplier + 32-bit accumulator DSP block (iCE40 UltraPlus).
+#[derive(Clone, Debug)]
+pub struct PackedMac16 {
+    pub name: String,
+    pub c_reg: bool,
+    pub a_reg: bool,
+    pub b_reg: bool,
+    pub d_reg: bool,
+    pub top_8x8_mult_reg: bool,
+    pub bot_8x8_mult_reg: bool,
+    pub pipeline_16x16_mult_reg1: bool,
+    pub pipeline_16x16_mult_reg2: bool,
+    pub topoutput_select: u8,
+    pub topaddsub_lowerinput: u8,
+    pub topaddsub_upperinput: bool,
+    pub topaddsub_carryselect: u8,
+    pub botoutput_select: u8,
+    pub botaddsub_lowerinput: u8,
+    pub botaddsub_upperinput: bool,
+    pub botaddsub_carryselect: u8,
+    pub mode_8x8: bool,
+    pub a_signed: bool,
+    pub b_signed: bool,
+    pub neg_trigger: bool,
+    /// 25-bit packed IceStorm `Mac16Config` / `IpConfig` configuration word (`C_REG`..`B_SIGNED`).
+    pub config_bits_25: u32,
+    pub clk_net: Option<String>,
+    pub ce_net: Option<String>,
+    pub a_nets: [Option<String>; 16],
+    pub b_nets: [Option<String>; 16],
+    pub c_nets: [Option<String>; 16],
+    pub d_nets: [Option<String>; 16],
+    pub o_nets: [Option<String>; 32],
+    pub co_net: Option<String>,
+    pub acc_ovf_net: Option<String>,
+}
+
+/// A packed `SB_SPRAM256KA` 256Kb (16K x 16-bit) Single-Port RAM block (iCE40 UltraPlus).
+#[derive(Clone, Debug)]
+pub struct PackedSpram {
+    pub name: String,
+    pub addr_nets: [Option<String>; 14],
+    pub data_in_nets: [Option<String>; 16],
+    pub mask_wren_nets: [Option<String>; 4],
+    pub wren_net: Option<String>,
+    pub chipselect_net: Option<String>,
+    pub clock_net: Option<String>,
+    pub standby_net: Option<String>,
+    pub sleep_net: Option<String>,
+    pub poweroff_net: Option<String>,
+    pub data_out_nets: [Option<String>; 16],
+}
+
+/// Oscillator kind (`SB_HFOSC` 48 MHz or `SB_LFOSC` 10 kHz).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OscKind {
+    HfOsc,
+    LfOsc,
+}
+
+/// A packed internal oscillator (`SB_HFOSC` / `SB_LFOSC`).
+#[derive(Clone, Debug)]
+pub struct PackedOsc {
+    pub name: String,
+    pub kind: OscKind,
+    /// `CLKHF_DIV` divider setting (`0` = 48 MHz, `1` = 24 MHz, `2` = 12 MHz, `3` = 6 MHz).
+    pub clk_hf_div: u8,
+    pub pu_net: Option<String>,
+    pub en_net: Option<String>,
+    pub out_net: String,
+}
+
+/// Kind of hard peripheral IP block (`SB_I2C`, `SB_SPI`, `SB_RGBA_DRV`, `SB_LEDDA_IP`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HardIpKind {
+    /// Hard I2C controller (`BUS_ADDR74` 4-bit address prefix).
+    I2c { bus_addr74: u8 },
+    /// Hard SPI controller (`BUS_ADDR74` 4-bit address prefix).
+    Spi { bus_addr74: u8 },
+    /// High-current RGB LED driver (`CURRENT_MODE` and 6-bit `RGB0..2_CURRENT` settings).
+    RgbaDrv {
+        current_mode: u8,
+        rgb0_current: u8,
+        rgb1_current: u8,
+        rgb2_current: u8,
+    },
+    /// Hard LED PWM fade/breathe generator (`SB_LEDDA_IP`).
+    LeddaIp,
+}
+
+/// A packed hard IP block (`SB_I2C`, `SB_SPI`, `SB_RGBA_DRV`, `SB_LEDDA_IP`).
+#[derive(Clone, Debug)]
+pub struct PackedHardIp {
+    pub name: String,
+    pub kind: HardIpKind,
+    pub input_nets: Vec<(String, String)>,
+    pub output_nets: Vec<(String, String)>,
+}
+
+/// Backend-owned packed netlist for the iCE40 HX8K / UltraPlus.
 #[derive(Clone, Debug, Default)]
 pub struct PackedIce {
     pub luts: Vec<PackedLut>,
@@ -224,6 +385,10 @@ pub struct PackedIce {
     pub clks: Vec<PackedClk>,
     pub rams: Vec<PackedRam>,
     pub plls: Vec<PackedPll>,
+    pub mac16s: Vec<PackedMac16>,
+    pub sprams: Vec<PackedSpram>,
+    pub oscs: Vec<PackedOsc>,
+    pub hard_ips: Vec<PackedHardIp>,
     /// Carry chains, in the order their sum LUTs reference via
     /// [`CarryCell::chain`].
     pub carry_chains: Vec<CarryChain>,
@@ -433,62 +598,111 @@ pub fn pack(netlist: &Design) -> Result<PackedIce, String> {
                 });
             }
             CellKind::Bram18 | CellKind::Bram18e1 { .. } => {
-                out.rams.push(pack_ram(resolve(cell.name), &pins, &cell.attrs)?);
+                out.rams
+                    .push(pack_ram(resolve(cell.name), "SB_RAM40_4K", &pins, &cell.attrs)?);
+            }
+            CellKind::BlackBox { module } if resolve(*module).starts_with("SB_RAM40_4K") => {
+                out.rams.push(pack_ram(
+                    resolve(cell.name),
+                    resolve(*module),
+                    &pins,
+                    &cell.attrs,
+                )?);
             }
             CellKind::BlackBox { module } if resolve(*module).starts_with("SB_PLL40") => {
-                let kind = if resolve(*module).contains("PAD") {
-                    PllKind::Pad
-                } else {
-                    PllKind::Core
-                };
-                let ref_net = resolve(pins
-                    .net_on(resolve(cell.name), "REFERENCECLK")
-                    .or_else(|| pins.net_on(resolve(cell.name), "I"))
-                    .ok_or_else(|| format!("pack: PLL {} has no clock input", resolve(cell.name)))?)
-                .to_string();
-                let out_net = resolve(pins
-                    .net_on(resolve(cell.name), "PLLOUTGLOBAL")
-                    .or_else(|| pins.net_on(resolve(cell.name), "O"))
-                    .ok_or_else(|| format!("pack: PLL {} has no output", resolve(cell.name)))?)
-                .to_string();
-                let out_freq_hz = match cell.attrs.get("FREQ") {
-                    Some(v) => parse_pll_freq(resolve(cell.name), "FREQ", v)?,
-                    None => {
-                        return Err(format!(
-                            "pack: PLL {} needs a FREQ attribute (desired output frequency in Hz)",
-                            resolve(cell.name)
-                        ))
-                    }
-                };
-                let ref_freq_hz = match cell.attrs.get("REF_FREQ") {
-                    Some(v) => parse_pll_freq(resolve(cell.name), "REF_FREQ", v)?,
-                    None => {
-                        return Err(format!(
-                            "pack: PLL {} needs a REF_FREQ attribute (reference clock frequency in Hz)",
-                            resolve(cell.name)
-                        ))
-                    }
-                };
-                let (divr, divf, divq, filter_range) =
-                    pll_dividers(resolve(cell.name), ref_freq_hz, out_freq_hz)?;
-                out.plls.push(PackedPll {
-                    name: resolve(cell.name).to_string(),
-                    kind,
-                    ref_net,
+                out.plls.push(pack_pll(
+                    resolve(cell.name),
+                    resolve(*module),
+                    &pins,
+                    &cell.attrs,
+                )?);
+            }
+            CellKind::BlackBox { module } if resolve(*module) == "SB_GB" => {
+                let cname = resolve(cell.name);
+                let in_net = pins
+                    .net_on(cname, "USER_SIGNAL_TO_GLOBAL_BUFFER")
+                    .or_else(|| pins.net_on(cname, "I"))
+                    .map(|s| resolve(s).to_string())
+                    .ok_or_else(|| format!("pack: SB_GB {cname} has no input net"))?;
+                let out_net = pins
+                    .net_on(cname, "GLOBAL_BUFFER_OUTPUT")
+                    .or_else(|| pins.net_on(cname, "O"))
+                    .map(|s| resolve(s).to_string())
+                    .ok_or_else(|| format!("pack: SB_GB {cname} has no output net"))?;
+                out.clks.push(PackedClk {
+                    name: cname.to_string(),
+                    in_net,
                     out_net,
-                    out_freq_hz,
-                    ref_freq_hz,
-                    divr,
-                    divf,
-                    divq,
-                    filter_range,
+                });
+            }
+            CellKind::BlackBox { module } if resolve(*module) == "SB_GB_IO" => {
+                let cname = resolve(cell.name);
+                let port = pins
+                    .net_on(cname, "PACKAGE_PIN")
+                    .or_else(|| pins.net_on(cname, "PAD"))
+                    .map(|s| resolve(s).to_string())
+                    .unwrap_or_else(|| cname.to_string());
+                let out_net = pins
+                    .net_on(cname, "GLOBAL_BUFFER_OUTPUT")
+                    .or_else(|| pins.net_on(cname, "O"))
+                    .map(|s| resolve(s).to_string())
+                    .ok_or_else(|| format!("pack: SB_GB_IO {cname} has no GLOBAL_BUFFER_OUTPUT net"))?;
+                let pad_net = pins
+                    .net_on(cname, "D_IN_0")
+                    .map(|s| resolve(s).to_string())
+                    .unwrap_or_else(|| format!("{cname}$gb_io_in"));
+                let pin = cell
+                    .attrs
+                    .get("LOC")
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| resolve_pin(netlist, &port).unwrap_or_else(|_| "J3".to_string()));
+                out.ios.push(PackedIo {
+                    name: format!("{cname}$io"),
+                    port,
+                    dir: IoDir::In,
+                    net: pad_net.clone(),
+                    pin,
+                });
+                out.clks.push(PackedClk {
+                    name: cname.to_string(),
+                    in_net: pad_net,
+                    out_net,
                 });
             }
             CellKind::Mac27 | CellKind::Dsp48e1 { .. } => {
-                return Err(format!(
-                    "pack: MAC27 {} unsupported: iCE40 HX8K has no DSP blocks",
-                    resolve(cell.name)
-                ));
+                out.mac16s
+                    .push(pack_mac16(resolve(cell.name), &pins, &cell.attrs)?);
+            }
+            CellKind::BlackBox { module } if resolve(*module) == "SB_MAC16" => {
+                out.mac16s
+                    .push(pack_mac16(resolve(cell.name), &pins, &cell.attrs)?);
+            }
+            CellKind::BlackBox { module } if resolve(*module) == "SB_SPRAM256KA" => {
+                out.sprams
+                    .push(pack_spram(resolve(cell.name), &pins)?);
+            }
+            CellKind::BlackBox { module }
+                if matches!(resolve(*module), "SB_HFOSC" | "SB_LFOSC") =>
+            {
+                out.oscs.push(pack_osc(
+                    resolve(cell.name),
+                    resolve(*module),
+                    &pins,
+                    &cell.attrs,
+                )?);
+            }
+            CellKind::BlackBox { module }
+                if matches!(
+                    resolve(*module),
+                    "SB_I2C" | "SB_SPI" | "SB_RGBA_DRV" | "SB_LEDDA_IP"
+                ) =>
+            {
+                out.hard_ips.push(pack_hard_ip(
+                    resolve(cell.name),
+                    resolve(*module),
+                    netlist,
+                    &cell.attrs,
+                )?);
             }
             CellKind::Ila { .. } => {
                 return Err(format!(
@@ -558,15 +772,23 @@ fn resolve_pin(netlist: &Design, port: &str) -> Result<String, String> {
 /// words it covers (`INIT_x` bit `p` = flat bit `x*256+p`).
 /// `x`/`z` chars count as 0, matching arachne-pnr.
 fn parse_init_attr(name: &str, attr: &str, x: usize, init: &mut [u16; 256]) -> Result<(), String> {
-    let s = attr.trim();
-    if s.len() > 64 {
+    let raw = attr.trim();
+    let s = if let Some((_, hex)) = raw.split_once("'h").or_else(|| raw.split_once("'H")) {
+        hex.trim()
+    } else if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        hex.trim()
+    } else {
+        raw
+    };
+    let cleaned: String = s.chars().filter(|&c| c != '_').collect();
+    if cleaned.len() > 64 {
         return Err(format!(
             "pack: RAM {name}: INIT_{x:X} has {} hex chars, more than 256 bits",
-            s.len()
+            cleaned.len()
         ));
     }
     // Left-pad with zeros to 256 bits.
-    let padded = format!("{:0>64}", s);
+    let padded = format!("{:0>64}", cleaned);
     for (ci, ch) in padded.chars().enumerate() {
         let digit = match ch {
             '0'..='9' => ch as u8 - b'0',
@@ -592,9 +814,14 @@ fn parse_init_attr(name: &str, attr: &str, x: usize, init: &mut [u16; 256]) -> R
     Ok(())
 }
 
-/// Parse a `WRITE_MODE` / `READ_MODE` attribute: `0`..`3` or `00`..`11`.
+/// Parse a `WRITE_MODE` / `READ_MODE` attribute: `0`..`3`, `00`..`11`, or `2'b00`..`2'b11`.
 fn parse_ram_mode(name: &str, attr_name: &str, v: &str) -> Result<u8, String> {
-    match v.trim() {
+    let s = v.trim();
+    let s = s
+        .strip_prefix("2'b")
+        .or_else(|| s.strip_prefix("0b"))
+        .unwrap_or(s);
+    match s {
         "0" | "00" => Ok(0),
         "1" | "01" => Ok(1),
         "2" | "10" => Ok(2),
@@ -605,41 +832,97 @@ fn parse_ram_mode(name: &str, attr_name: &str, v: &str) -> Result<u8, String> {
     }
 }
 
-/// Pack a Bram18 cell into SB_RAM40_4K shape.
+/// Look up an indexed pin on `cell` supporting `PREFIX{i}` and `PREFIX[{i}]`.
+fn pin_net_indexed(
+    pins: &helion_ir::PinIndex,
+    cell: &str,
+    prefixes: &[&str],
+    idx: usize,
+) -> Option<String> {
+    for prefix in prefixes {
+        if let Some(s) = pins
+            .net_on(cell, &format!("{prefix}{idx}"))
+            .or_else(|| pins.net_on(cell, &format!("{prefix}[{idx}]")))
+        {
+            return Some(resolve(s).to_string());
+        }
+    }
+    None
+}
+
+/// Parse an integer/bitstring attribute (`"1"`, `"0b10"`, `"4'b0101"`, `"16'h00FF"`).
+fn parse_bit_param(cell_name: &str, param_name: &str, raw: &str, max_val: u32) -> Result<u32, String> {
+    let s = raw.trim().trim_matches('"');
+    let cleaned: String = s.chars().filter(|&c| c != '_').collect();
+    let val = if let Some((_, bin)) = cleaned.split_once("'b").or_else(|| cleaned.split_once("'B")) {
+        u32::from_str_radix(bin, 2)
+    } else if let Some(bin) = cleaned.strip_prefix("0b").or_else(|| cleaned.strip_prefix("0B")) {
+        u32::from_str_radix(bin, 2)
+    } else if let Some((_, hex)) = cleaned.split_once("'h").or_else(|| cleaned.split_once("'H")) {
+        u32::from_str_radix(hex, 16)
+    } else if let Some(hex) = cleaned.strip_prefix("0x").or_else(|| cleaned.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16)
+    } else if let Some((_, dec)) = cleaned.split_once("'d").or_else(|| cleaned.split_once("'D")) {
+        dec.parse::<u32>()
+    } else {
+        cleaned.parse::<u32>()
+    }
+    .map_err(|_| format!("pack: {cell_name}: invalid parameter {param_name}='{raw}'"))?;
+    if val > max_val {
+        return Err(format!(
+            "pack: {cell_name}: parameter {param_name}={val} exceeds max {max_val}"
+        ));
+    }
+    Ok(val)
+}
+
+/// Pack a `Bram18` or `SB_RAM40_4K*` cell into [`PackedRam`].
 fn pack_ram(
     name: &str,
+    module: &str,
     pins: &helion_ir::PinIndex,
     attrs: &helion_ir::Attrs,
 ) -> Result<PackedRam, String> {
-    let bus = |prefix: &str, n: usize| -> Result<[String; 16], String> {
+    let bus16 = |prefixes: &[&str]| -> [String; 16] {
         let mut arr: [String; 16] = Default::default();
         for (i, slot) in arr.iter_mut().enumerate() {
-            if i < n {
-                *slot = pins
-                    .net_on(name, &format!("{prefix}{i}"))
-                    .map(|s| resolve(s).to_string())
-                    .unwrap_or("gnd".to_string());
-            } else {
-                *slot = "gnd".to_string();
-            }
+            *slot = pin_net_indexed(pins, name, prefixes, i).unwrap_or_else(|| "gnd".to_string());
         }
-        Ok(arr)
+        arr
     };
-    let addr = |prefix: &str| -> Result<[String; 11], String> {
+    let addr11 = |prefixes: &[&str]| -> [String; 11] {
         let mut arr: [String; 11] = Default::default();
         for (i, slot) in arr.iter_mut().enumerate() {
-            *slot = pins
-                .net_on(name, &format!("{prefix}{i}"))
-                .map(|s| resolve(s).to_string())
-                .unwrap_or("gnd".to_string());
+            *slot = pin_net_indexed(pins, name, prefixes, i).unwrap_or_else(|| "gnd".to_string());
         }
-        Ok(arr)
+        arr
     };
-    let need = |pin: &str| {
-        pins.net_on(name, pin)
-            .map(|s| resolve(s).to_string())
-            .ok_or_else(|| format!("pack: RAM {name} has no {pin} net"))
-    };
+    let rclk_net = pins
+        .net_on(name, "RCLK")
+        .or_else(|| pins.net_on(name, "RCLKN"))
+        .or_else(|| pins.net_on(name, "CLKARDCLK"))
+        .map(|s| resolve(s).to_string())
+        .unwrap_or_else(|| "gnd".to_string());
+    let wclk_net = pins
+        .net_on(name, "WCLK")
+        .or_else(|| pins.net_on(name, "WCLKN"))
+        .or_else(|| pins.net_on(name, "CLKBWRCLK"))
+        .map(|s| resolve(s).to_string())
+        .unwrap_or_else(|| "gnd".to_string());
+    let re_net = pins
+        .net_on(name, "RE")
+        .or_else(|| pins.net_on(name, "RCLKE"))
+        .map(|s| resolve(s).to_string());
+    let we_net = pins
+        .net_on(name, "WE")
+        .or_else(|| pins.net_on(name, "WCLKE"))
+        .map(|s| resolve(s).to_string());
+    let neg_clk_r = module.contains("NR")
+        || pins.net_on(name, "RCLKN").is_some()
+        || attrs.flag("NEG_CLK_R");
+    let neg_clk_w = module.contains("NW")
+        || pins.net_on(name, "WCLKN").is_some()
+        || attrs.flag("NEG_CLK_W");
     Ok(PackedRam {
         name: name.to_string(),
         write_mode: match attrs.get("WRITE_MODE") {
@@ -660,14 +943,445 @@ fn pack_ram(
             }
             init
         },
-        rdata_net: bus("DO", 16)?,
-        wdata_net: bus("DI", 16)?,
-        raddr_net: addr("RADDR")?,
-        waddr_net: addr("WADDR")?,
-        rclk_net: need("RCLK").unwrap_or_else(|_| "gnd".to_string()),
-        wclk_net: need("WCLK").unwrap_or_else(|_| "gnd".to_string()),
-        re_net: pins.net_on(name, "RE").map(|s| resolve(s).to_string()),
-        we_net: pins.net_on(name, "WE").map(|s| resolve(s).to_string()),
+        rdata_net: bus16(&["DO", "RDATA", "DOADO"]),
+        wdata_net: bus16(&["DI", "WDATA", "DIADI"]),
+        raddr_net: addr11(&["RADDR", "ADDRARDADDR"]),
+        waddr_net: addr11(&["WADDR", "ADDRBWRADDR"]),
+        rclk_net,
+        wclk_net,
+        re_net,
+        we_net,
+        mask_net: bus16(&["MASK"]),
+        neg_clk_r,
+        neg_clk_w,
+    })
+}
+
+/// Pack an `SB_PLL40_*` cell (`SB_PLL40_CORE`, `SB_PLL40_PAD`, `SB_PLL40_2F_CORE`,
+/// `SB_PLL40_2F_PAD`, `SB_PLL40_2_PAD`), supporting both automatic `FREQ` + `REF_FREQ`
+/// divider synthesis and explicit `DIVR` / `DIVF` / `DIVQ` / `FILTER_RANGE` / `FEEDBACK_PATH`
+/// parameters with VCO range validation.
+fn pack_pll(
+    name: &str,
+    module: &str,
+    pins: &helion_ir::PinIndex,
+    attrs: &helion_ir::Attrs,
+) -> Result<PackedPll, String> {
+    let kind = match module {
+        "SB_PLL40_2F_CORE" => PllKind::Core2F,
+        "SB_PLL40_2F_PAD" => PllKind::Pad2F,
+        "SB_PLL40_2_PAD" => PllKind::Pad2,
+        m if m.contains("PAD") => PllKind::Pad,
+        _ => PllKind::Core,
+    };
+    let ref_net = pins
+        .net_on(name, "REFERENCECLK")
+        .or_else(|| pins.net_on(name, "PACKAGEPIN"))
+        .or_else(|| pins.net_on(name, "I"))
+        .map(|s| resolve(s).to_string())
+        .ok_or_else(|| format!("pack: PLL {name} has no clock input"))?;
+    let out_net = pins
+        .net_on(name, "PLLOUTGLOBAL")
+        .or_else(|| pins.net_on(name, "PLLOUTCORE"))
+        .or_else(|| pins.net_on(name, "PLLOUTGLOBALA"))
+        .or_else(|| pins.net_on(name, "PLLOUTCOREA"))
+        .or_else(|| pins.net_on(name, "O"))
+        .map(|s| resolve(s).to_string())
+        .ok_or_else(|| format!("pack: PLL {name} has no output"))?;
+    let out_net_b = pins
+        .net_on(name, "PLLOUTGLOBALB")
+        .or_else(|| pins.net_on(name, "PLLOUTCOREB"))
+        .map(|s| resolve(s).to_string());
+    let lock_net = pins.net_on(name, "LOCK").map(|s| resolve(s).to_string());
+
+    let feedback_path = match attrs.get("FEEDBACK_PATH").map(|s| s.trim().trim_matches('"')) {
+        None | Some("SIMPLE") | Some("0b001") | Some("1") => PllFeedbackPath::Simple,
+        Some("DELAY") | Some("0b000") | Some("0") => PllFeedbackPath::Delay,
+        Some("PHASE_AND_DELAY") | Some("0b010") | Some("2") => PllFeedbackPath::PhaseAndDelay,
+        Some("EXTERNAL") | Some("0b110") | Some("6") => PllFeedbackPath::External,
+        Some(other) => {
+            return Err(format!(
+                "pack: PLL {name}: invalid FEEDBACK_PATH='{other}' (expected SIMPLE, DELAY, PHASE_AND_DELAY, or EXTERNAL)"
+            ))
+        }
+    };
+
+    let has_explicit_divs =
+        attrs.get("DIVR").is_some() || attrs.get("DIVF").is_some() || attrs.get("DIVQ").is_some();
+    if has_explicit_divs && attrs.get("FREQ").is_none() {
+        let divr = match attrs.get("DIVR") {
+            Some(v) => parse_bit_param(name, "DIVR", v, 15)? as u8,
+            None => 0,
+        };
+        let divf = match attrs.get("DIVF") {
+            Some(v) => parse_bit_param(name, "DIVF", v, 127)? as u8,
+            None => return Err(format!("pack: PLL {name}: explicit divider mode requires DIVF")),
+        };
+        let divq = match attrs.get("DIVQ") {
+            Some(v) => parse_bit_param(name, "DIVQ", v, 6)? as u8,
+            None => return Err(format!("pack: PLL {name}: explicit divider mode requires DIVQ")),
+        };
+        if !(1..=6).contains(&divq) {
+            return Err(format!(
+                "pack: PLL {name}: DIVQ={divq} is outside valid range 1..=6"
+            ));
+        }
+        let filter_range = match attrs.get("FILTER_RANGE") {
+            Some(v) => parse_bit_param(name, "FILTER_RANGE", v, 7)? as u8,
+            None => 1,
+        };
+        let ref_freq_hz = match attrs.get("REF_FREQ") {
+            Some(v) => parse_pll_freq(name, "REF_FREQ", v)?,
+            None => 12_000_000,
+        };
+        // Validate VCO and PFD frequencies against iCE40 PLL hardware limits.
+        let f_in_mhz = ref_freq_hz as f64 / 1e6;
+        let f_pfd_mhz = f_in_mhz / f64::from(divr + 1);
+        if !(10.0..=133.0).contains(&f_pfd_mhz) {
+            return Err(format!(
+                "pack: PLL {name}: PFD frequency {f_pfd_mhz:.3} MHz is outside 10-133 MHz"
+            ));
+        }
+        let f_vco_mhz = match feedback_path {
+            PllFeedbackPath::Simple => f_pfd_mhz * f64::from(divf + 1),
+            _ => f_pfd_mhz * f64::from(divf + 1) * 2f64.powi(i32::from(divq)),
+        };
+        if !(533.0..=1066.0).contains(&f_vco_mhz) {
+            return Err(format!(
+                "pack: PLL {name}: VCO frequency {f_vco_mhz:.3} MHz is outside 533-1066 MHz"
+            ));
+        }
+        let out_freq_hz = ((f_vco_mhz / 2f64.powi(i32::from(divq))) * 1e6).round() as u64;
+        Ok(PackedPll {
+            name: name.to_string(),
+            kind,
+            ref_net,
+            out_net,
+            out_net_b,
+            lock_net,
+            out_freq_hz,
+            ref_freq_hz,
+            divr,
+            divf,
+            divq,
+            filter_range,
+            feedback_path,
+        })
+    } else {
+        let out_freq_hz = match attrs.get("FREQ") {
+            Some(v) => parse_pll_freq(name, "FREQ", v)?,
+            None => {
+                return Err(format!(
+                    "pack: PLL {name} needs a FREQ attribute (desired output frequency in Hz)"
+                ))
+            }
+        };
+        let ref_freq_hz = match attrs.get("REF_FREQ") {
+            Some(v) => parse_pll_freq(name, "REF_FREQ", v)?,
+            None => {
+                return Err(format!(
+                    "pack: PLL {name} needs a REF_FREQ attribute (reference clock frequency in Hz)"
+                ))
+            }
+        };
+        let (divr, divf, divq, filter_range) = pll_dividers(name, ref_freq_hz, out_freq_hz)?;
+        Ok(PackedPll {
+            name: name.to_string(),
+            kind,
+            ref_net,
+            out_net,
+            out_net_b,
+            lock_net,
+            out_freq_hz,
+            ref_freq_hz,
+            divr,
+            divf,
+            divq,
+            filter_range,
+            feedback_path,
+        })
+    }
+}
+
+/// Pack an `SB_MAC16` (or `CellKind::Mac27` / `CellKind::Dsp48e1`) DSP cell.
+fn pack_mac16(
+    name: &str,
+    pins: &helion_ir::PinIndex,
+    attrs: &helion_ir::Attrs,
+) -> Result<PackedMac16, String> {
+    let get_param = |key: &str, max_v: u32| -> Result<u32, String> {
+        match attrs.get(key) {
+            Some(v) => parse_bit_param(name, key, v, max_v),
+            None => Ok(0),
+        }
+    };
+    let c_reg = get_param("C_REG", 1)? != 0;
+    let a_reg = get_param("A_REG", 1)? != 0;
+    let b_reg = get_param("B_REG", 1)? != 0;
+    let d_reg = get_param("D_REG", 1)? != 0;
+    let top_8x8_mult_reg = get_param("TOP_8x8_MULT_REG", 1)? != 0;
+    let bot_8x8_mult_reg = get_param("BOT_8x8_MULT_REG", 1)? != 0;
+    let pipeline_16x16_mult_reg1 = get_param("PIPELINE_16x16_MULT_REG1", 1)? != 0;
+    let pipeline_16x16_mult_reg2 = get_param("PIPELINE_16x16_MULT_REG2", 1)? != 0;
+    let topoutput_select = get_param("TOPOUTPUT_SELECT", 3)? as u8;
+    let topaddsub_lowerinput = get_param("TOPADDSUB_LOWERINPUT", 3)? as u8;
+    let topaddsub_upperinput = get_param("TOPADDSUB_UPPERINPUT", 1)? != 0;
+    let topaddsub_carryselect = get_param("TOPADDSUB_CARRYSELECT", 3)? as u8;
+    let botoutput_select = get_param("BOTOUTPUT_SELECT", 3)? as u8;
+    let botaddsub_lowerinput = get_param("BOTADDSUB_LOWERINPUT", 3)? as u8;
+    let botaddsub_upperinput = get_param("BOTADDSUB_UPPERINPUT", 1)? != 0;
+    let botaddsub_carryselect = get_param("BOTADDSUB_CARRYSELECT", 3)? as u8;
+    let mode_8x8 = get_param("MODE_8x8", 1)? != 0;
+    let a_signed = get_param("A_SIGNED", 1)? != 0;
+    let b_signed = get_param("B_SIGNED", 1)? != 0;
+    let neg_trigger = get_param("NEG_TRIGGER", 1)? != 0;
+
+    let config_bits_25 = (u32::from(c_reg))
+        | (u32::from(a_reg) << 1)
+        | (u32::from(b_reg) << 2)
+        | (u32::from(d_reg) << 3)
+        | (u32::from(top_8x8_mult_reg) << 4)
+        | (u32::from(bot_8x8_mult_reg) << 5)
+        | (u32::from(pipeline_16x16_mult_reg1) << 6)
+        | (u32::from(pipeline_16x16_mult_reg2) << 7)
+        | (u32::from(topoutput_select & 0b11) << 8)
+        | (u32::from(topaddsub_lowerinput & 0b11) << 10)
+        | (u32::from(topaddsub_upperinput) << 12)
+        | (u32::from(topaddsub_carryselect & 0b11) << 13)
+        | (u32::from(botoutput_select & 0b11) << 15)
+        | (u32::from(botaddsub_lowerinput & 0b11) << 17)
+        | (u32::from(botaddsub_upperinput) << 19)
+        | (u32::from(botaddsub_carryselect & 0b11) << 20)
+        | (u32::from(mode_8x8) << 22)
+        | (u32::from(a_signed) << 23)
+        | (u32::from(b_signed) << 24);
+
+    let bus16 = |prefixes: &[&str]| -> [Option<String>; 16] {
+        let mut arr: [Option<String>; 16] = Default::default();
+        for (i, slot) in arr.iter_mut().enumerate() {
+            *slot = pin_net_indexed(pins, name, prefixes, i);
+        }
+        arr
+    };
+    let mut o_nets: [Option<String>; 32] = Default::default();
+    for (i, slot) in o_nets.iter_mut().enumerate() {
+        *slot = pin_net_indexed(pins, name, &["O", "P"], i);
+    }
+
+    Ok(PackedMac16 {
+        name: name.to_string(),
+        c_reg,
+        a_reg,
+        b_reg,
+        d_reg,
+        top_8x8_mult_reg,
+        bot_8x8_mult_reg,
+        pipeline_16x16_mult_reg1,
+        pipeline_16x16_mult_reg2,
+        topoutput_select,
+        topaddsub_lowerinput,
+        topaddsub_upperinput,
+        topaddsub_carryselect,
+        botoutput_select,
+        botaddsub_lowerinput,
+        botaddsub_upperinput,
+        botaddsub_carryselect,
+        mode_8x8,
+        a_signed,
+        b_signed,
+        neg_trigger,
+        config_bits_25,
+        clk_net: pins.net_on(name, "CLK").map(|s| resolve(s).to_string()),
+        ce_net: pins.net_on(name, "CE").map(|s| resolve(s).to_string()),
+        a_nets: bus16(&["A"]),
+        b_nets: bus16(&["B"]),
+        c_nets: bus16(&["C"]),
+        d_nets: bus16(&["D"]),
+        o_nets,
+        co_net: pins.net_on(name, "CO").map(|s| resolve(s).to_string()),
+        acc_ovf_net: pins.net_on(name, "ACCOVF").map(|s| resolve(s).to_string()),
+    })
+}
+
+/// Pack an `SB_SPRAM256KA` 16K x 16-bit Single-Port RAM cell.
+fn pack_spram(name: &str, pins: &helion_ir::PinIndex) -> Result<PackedSpram, String> {
+    let mut addr_nets: [Option<String>; 14] = Default::default();
+    for (i, slot) in addr_nets.iter_mut().enumerate() {
+        *slot = pin_net_indexed(pins, name, &["ADDRESS", "ADDR"], i);
+    }
+    let mut data_in_nets: [Option<String>; 16] = Default::default();
+    let mut data_out_nets: [Option<String>; 16] = Default::default();
+    for i in 0..16 {
+        data_in_nets[i] = pin_net_indexed(pins, name, &["DATAIN", "DI"], i);
+        data_out_nets[i] = pin_net_indexed(pins, name, &["DATAOUT", "DO"], i);
+    }
+    let mut mask_wren_nets: [Option<String>; 4] = Default::default();
+    for (i, slot) in mask_wren_nets.iter_mut().enumerate() {
+        *slot = pin_net_indexed(pins, name, &["MASKWREN"], i);
+    }
+    Ok(PackedSpram {
+        name: name.to_string(),
+        addr_nets,
+        data_in_nets,
+        mask_wren_nets,
+        wren_net: pins.net_on(name, "WREN").map(|s| resolve(s).to_string()),
+        chipselect_net: pins
+            .net_on(name, "CHIPSELECT")
+            .map(|s| resolve(s).to_string()),
+        clock_net: pins
+            .net_on(name, "CLOCK")
+            .or_else(|| pins.net_on(name, "CLK"))
+            .map(|s| resolve(s).to_string()),
+        standby_net: pins.net_on(name, "STANDBY").map(|s| resolve(s).to_string()),
+        sleep_net: pins.net_on(name, "SLEEP").map(|s| resolve(s).to_string()),
+        poweroff_net: pins
+            .net_on(name, "POWEROFF")
+            .map(|s| resolve(s).to_string()),
+        data_out_nets,
+    })
+}
+
+/// Pack an `SB_HFOSC` or `SB_LFOSC` oscillator cell.
+fn pack_osc(
+    name: &str,
+    module: &str,
+    pins: &helion_ir::PinIndex,
+    attrs: &helion_ir::Attrs,
+) -> Result<PackedOsc, String> {
+    let kind = if module == "SB_LFOSC" {
+        OscKind::LfOsc
+    } else {
+        OscKind::HfOsc
+    };
+    let clk_hf_div = match attrs.get("CLKHF_DIV") {
+        Some(v) => parse_bit_param(name, "CLKHF_DIV", v, 3)? as u8,
+        None => 0,
+    };
+    let out_net = pins
+        .net_on(name, "CLKHF")
+        .or_else(|| pins.net_on(name, "CLKLF"))
+        .or_else(|| pins.net_on(name, "O"))
+        .map(|s| resolve(s).to_string())
+        .ok_or_else(|| format!("pack: {module} {name} has no output clock net (CLKHF/CLKLF)"))?;
+    let pu_net = pins
+        .net_on(name, "CLKHFPU")
+        .or_else(|| pins.net_on(name, "CLKLFPU"))
+        .map(|s| resolve(s).to_string());
+    let en_net = pins
+        .net_on(name, "CLKHFEN")
+        .or_else(|| pins.net_on(name, "CLKLFEN"))
+        .map(|s| resolve(s).to_string());
+    Ok(PackedOsc {
+        name: name.to_string(),
+        kind,
+        clk_hf_div,
+        pu_net,
+        en_net,
+        out_net,
+    })
+}
+
+/// Pack a hard peripheral IP cell (`SB_I2C`, `SB_SPI`, `SB_RGBA_DRV`, `SB_LEDDA_IP`).
+fn pack_hard_ip(
+    name: &str,
+    module: &str,
+    netlist: &Design,
+    attrs: &helion_ir::Attrs,
+) -> Result<PackedHardIp, String> {
+    let kind = match module {
+        "SB_I2C" => {
+            let bus_addr74 = match attrs.get("BUS_ADDR74") {
+                Some(v) => parse_bit_param(name, "BUS_ADDR74", v, 0b1111)? as u8,
+                None => 0b0001,
+            };
+            HardIpKind::I2c { bus_addr74 }
+        }
+        "SB_SPI" => {
+            let bus_addr74 = match attrs.get("BUS_ADDR74") {
+                Some(v) => parse_bit_param(name, "BUS_ADDR74", v, 0b1111)? as u8,
+                None => 0b0000,
+            };
+            HardIpKind::Spi { bus_addr74 }
+        }
+        "SB_RGBA_DRV" => {
+            let current_mode = match attrs.get("CURRENT_MODE") {
+                Some(v) => parse_bit_param(name, "CURRENT_MODE", v, 1)? as u8,
+                None => 0,
+            };
+            let rgb0_current = match attrs.get("RGB0_CURRENT") {
+                Some(v) => parse_bit_param(name, "RGB0_CURRENT", v, 0x3F)? as u8,
+                None => 0,
+            };
+            let rgb1_current = match attrs.get("RGB1_CURRENT") {
+                Some(v) => parse_bit_param(name, "RGB1_CURRENT", v, 0x3F)? as u8,
+                None => 0,
+            };
+            let rgb2_current = match attrs.get("RGB2_CURRENT") {
+                Some(v) => parse_bit_param(name, "RGB2_CURRENT", v, 0x3F)? as u8,
+                None => 0,
+            };
+            HardIpKind::RgbaDrv {
+                current_mode,
+                rgb0_current,
+                rgb1_current,
+                rgb2_current,
+            }
+        }
+        _ => HardIpKind::LeddaIp,
+    };
+
+    let is_output_pin = |pin: &str| -> bool {
+        pin.starts_with("SBDATO")
+            || pin == "SBACKO"
+            || pin == "I2CIRQ"
+            || pin == "I2CWKUP"
+            || pin == "SCLO"
+            || pin == "SCLOE"
+            || pin == "SDAO"
+            || pin == "SDAOE"
+            || pin == "SPIIRQ"
+            || pin == "SPIWKUP"
+            || pin == "SO"
+            || pin == "SOE"
+            || pin == "MO"
+            || pin == "MOE"
+            || pin == "SCKO"
+            || pin == "SCKOE"
+            || pin.starts_with("MCSNO")
+            || pin == "RGB0"
+            || pin == "RGB1"
+            || pin == "RGB2"
+            || pin.starts_with("PWMOUT")
+            || pin == "LEDDON"
+    };
+
+    let mut input_nets = Vec::new();
+    let mut output_nets = Vec::new();
+    let cell_spur = intern(name);
+    for net in &netlist.nets {
+        let nname = resolve(net.name);
+        if nname == "0" || nname == "1" || nname == "gnd" || nname == "vcc" {
+            continue;
+        }
+        for ep in &net.endpoints {
+            if ep.cell == cell_spur {
+                let pname = resolve(ep.pin).to_string();
+                if is_output_pin(&pname) {
+                    output_nets.push((pname, nname.to_string()));
+                } else {
+                    input_nets.push((pname, nname.to_string()));
+                }
+            }
+        }
+    }
+    input_nets.sort();
+    output_nets.sort();
+
+    Ok(PackedHardIp {
+        name: name.to_string(),
+        kind,
+        input_nets,
+        output_nets,
     })
 }
 
