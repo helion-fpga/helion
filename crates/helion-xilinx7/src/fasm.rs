@@ -40,15 +40,43 @@ pub enum FasmValue {
     /// Any other constant, e.g. `64'hDEADBEEF`. `width` is the explicit
     /// Verilog width when given, otherwise the addressed width.
     Bits { bits: u64, width: u32 },
+    /// Wide constant (65..=256 bits, e.g. `256'h...` for BRAM `INIT_00..INIT_7F`),
+    /// stored LSB-first in 64-bit words.
+    WideBits { words: [u64; 4], width: u32 },
 }
 
 impl FasmValue {
-    /// Integer value of this assignment (0 or 1 for [`FasmValue::One`]/[`FasmValue::Zero`]).
+    /// Low 64-bit integer value of this assignment.
     pub fn as_u64(self) -> u64 {
         match self {
             FasmValue::One => 1,
             FasmValue::Zero => 0,
             FasmValue::Bits { bits, .. } => bits,
+            FasmValue::WideBits { words, .. } => words[0],
+        }
+    }
+
+    /// True if all bits of this value are zero.
+    pub fn is_zero(self) -> bool {
+        match self {
+            FasmValue::Zero => true,
+            FasmValue::One => false,
+            FasmValue::Bits { bits, .. } => bits == 0,
+            FasmValue::WideBits { words, .. } => words == [0, 0, 0, 0],
+        }
+    }
+
+    /// Test bit `idx` (`0..256`) of this value.
+    pub fn bit(self, idx: u32) -> bool {
+        match self {
+            FasmValue::Zero => false,
+            FasmValue::One => idx == 0,
+            FasmValue::Bits { bits, .. } => idx < 64 && ((bits >> idx) & 1) == 1,
+            FasmValue::WideBits { words, .. } => {
+                let w = (idx / 64) as usize;
+                let b = idx % 64;
+                w < 4 && ((words[w] >> b) & 1) == 1
+            }
         }
     }
 }
@@ -304,6 +332,27 @@ fn parse_verilog_const(text: &str, quote: usize, address_width: u64) -> Result<F
         return Err(format!("bad Verilog digits in {text:?}"));
     }
     let clean: String = digits.bytes().filter(|&b| b != b'_').map(|b| b as char).collect();
+    let eff_w = width.unwrap_or(address_width.min(256) as u32);
+    if eff_w > 64 && address_width > 64 && base == 16 && eff_w <= 256 && u64::from(eff_w) <= address_width {
+        if clean.len() > 64 {
+            return Err(format!("value {text:?} out of range"));
+        }
+        let padded = format!("{clean:0>64}");
+        let mut words = [0u64; 4];
+        for (i, slot) in words.iter_mut().enumerate() {
+            let end = 64 - i * 16;
+            let start = end - 16;
+            *slot = u64::from_str_radix(&padded[start..end], 16)
+                .map_err(|_| format!("value {text:?} out of range"))?;
+        }
+        if words == [0, 0, 0, 0] {
+            return Ok(FasmValue::Zero);
+        }
+        if words == [1, 0, 0, 0] {
+            return Ok(FasmValue::One);
+        }
+        return Ok(FasmValue::WideBits { words, width: eff_w });
+    }
     let value = u64::from_str_radix(&clean, base)
         .map_err(|_| format!("value {text:?} out of range"))?;
     check_fits(value, width, address_width, text)?;

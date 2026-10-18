@@ -466,8 +466,7 @@ fn far_group(addr: u32) -> (u32, u32, u32) {
 /// a zero value (or zero bits of a vector) is a no-op, and address 0 is
 /// reported as `None` (bare-feature lookup).
 fn canonical_assigns(line: &FasmLine) -> Vec<(&str, Option<u32>)> {
-    let value = line.value.as_u64();
-    if value == 0 {
+    if line.value.is_zero() {
         return Vec::new();
     }
     // Without a bit selection the fasm library asserts value == 1.
@@ -479,7 +478,7 @@ fn canonical_assigns(line: &FasmLine) -> Vec<(&str, Option<u32>)> {
         None => out.push((line.feature.as_str(), None)),
         Some((hi, lo)) => {
             for addr in lo..=hi {
-                if (value >> (addr - lo)) & 1 == 1 {
+                if line.value.bit(addr - lo) {
                     out.push((line.feature.as_str(), (addr != 0).then_some(addr)));
                 }
             }
