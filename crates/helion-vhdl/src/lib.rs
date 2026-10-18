@@ -195,6 +195,204 @@ pub fn synth_vhdl_path_with_siblings(path: &Path) -> Result<Design, String> {
     Ok(map_vhdl_path_with_siblings(path)?.design)
 }
 
+/// Elaborate and map multiple VHDL (and optional companion SystemVerilog/Verilog)
+/// `(origin, source)` units together. Cross-file `package` / `package body`
+/// declarations (`use work.<pkg>.all`), separate `entity` and `architecture`
+/// files, and multi-entity hierarchies (`entity work.<child>` and `component`)
+/// are resolved across all files before lowering to `helion_sv::synth_sv_sources`.
+pub fn map_vhdl_sources(files: &[(&str, &str)]) -> Result<MapResult, String> {
+    if files.is_empty() {
+        return Err("no sources".into());
+    }
+    if files.len() == 1 && !looks_like_sv_file(files[0].0, files[0].1) {
+        return map_vhdl_origin(files[0].1, files[0].0);
+    }
+    for &(origin, source) in files {
+        if looks_like_sv_file(origin, source) {
+            continue;
+        }
+        if let Some(name) = osvvm_harness_module(source) {
+            eprintln!(
+                "diagnostic sim_only module={name} (OSVVM test harness; external entity not ingested; not a LUT; not a closed WNS)"
+            );
+            let soft = SoftDiag::new("sim_only", &name)
+                .with_detail("OSVVM test harness; external entity not ingested")
+                .with_span(span_best_effort(source, origin, &[&name]));
+            emit_diag(&soft.table_line());
+            return Ok(MapResult {
+                design: empty_named(name),
+                softs: vec![soft],
+            });
+        }
+        if let Some((kind, name)) = banner_hang_module(source) {
+            let why = match kind {
+                "vendor_wrapper" => "vendor IP wrapper; not ingested; not a LUT; not a closed WNS",
+                _ => "record or package type; not bit-blasted; not a LUT; not a closed WNS",
+            };
+            eprintln!("diagnostic {kind} module={name} ({why})");
+            let soft = SoftDiag::new(kind, &name)
+                .with_detail(why)
+                .with_span(span_best_effort(source, origin, &[&name]));
+            emit_diag(&soft.table_line());
+            return Ok(MapResult {
+                design: empty_named(name),
+                softs: vec![soft],
+            });
+        }
+    }
+    let mut vhdl_files: Vec<(&str, &str)> = Vec::new();
+    let mut sv_before: Vec<(&str, &str)> = Vec::new();
+    let mut sv_after: Vec<(&str, &str)> = Vec::new();
+    let last_is_sv = files
+        .last()
+        .map(|(o, s)| looks_like_sv_file(o, s))
+        .unwrap_or(false);
+    for &(origin, src) in files {
+        if looks_like_sv_file(origin, src) {
+            if last_is_sv {
+                sv_after.push((origin, src));
+            } else {
+                sv_before.push((origin, src));
+            }
+        } else {
+            vhdl_files.push((origin, src));
+        }
+    }
+    if vhdl_files.is_empty() {
+        let design = helion_sv::synth_sv_sources(files)?;
+        return Ok(MapResult {
+            design,
+            softs: Vec::new(),
+        });
+    }
+    let mut extra_known_bodies: HashSet<String> = HashSet::new();
+    let mut extra_module_ports: HashMap<String, Vec<(String, &'static str, usize)>> =
+        HashMap::new();
+    for &(_origin, sv_src) in sv_before.iter().chain(sv_after.iter()) {
+        if let Ok(mods) = helion_sv::list_sv_modules(sv_src) {
+            for m in mods {
+                extra_known_bodies.insert(m.to_ascii_lowercase());
+            }
+        }
+        for (mname, mports) in scan_sv_module_ports(sv_src) {
+            extra_known_bodies.insert(mname.to_ascii_lowercase());
+            extra_module_ports.insert(mname.to_ascii_lowercase(), mports);
+        }
+    }
+    let (sv, softs) =
+        vhdl_sources_to_sv_with_softs(&vhdl_files, &extra_known_bodies, &extra_module_ports)?;
+    let mut synth_inputs: Vec<(&str, &str)> = Vec::new();
+    for &(o, s) in &sv_before {
+        synth_inputs.push((o, s));
+    }
+    synth_inputs.push(("vhdl_multi.sv", sv.as_str()));
+    for &(o, s) in &sv_after {
+        synth_inputs.push((o, s));
+    }
+    let mut design = synth_sv_sources_resilient(&synth_inputs, &sv)?;
+    strip_redundant_buffer_luts(&mut design);
+    attach_sva_attrs(&mut design, &sv);
+    Ok(MapResult { design, softs })
+}
+
+/// Design-only multi-file VHDL synthesis wrapper.
+pub fn synth_vhdl_sources(files: &[(&str, &str)]) -> Result<Design, String> {
+    Ok(map_vhdl_sources(files)?.design)
+}
+
+/// Multi-file VHDL mapping from disk paths.
+pub fn map_vhdl_files(paths: &[&Path]) -> Result<MapResult, String> {
+    if paths.is_empty() {
+        return Err("no sources".into());
+    }
+    let mut owned: Vec<(String, String)> = Vec::with_capacity(paths.len());
+    for p in paths {
+        let text = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
+        owned.push((p.display().to_string(), text));
+    }
+    let refs: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    map_vhdl_sources(&refs)
+}
+
+/// Multi-file VHDL synthesis from disk paths.
+pub fn synth_vhdl_files(paths: &[&Path]) -> Result<Design, String> {
+    Ok(map_vhdl_files(paths)?.design)
+}
+
+/// Unified mixed-language (VHDL + SystemVerilog/Verilog) hierarchy elaboration
+/// and technology mapping. Resolves VHDL packages, record mode views, entities,
+/// architectures, and SV modules across any hierarchy depth.
+pub fn map_mixed_sources(files: &[(&str, &str)]) -> Result<MapResult, String> {
+    map_vhdl_sources(files)
+}
+
+/// Design-only unified mixed-language (VHDL + SystemVerilog/Verilog) synthesis.
+pub fn synth_mixed_sources(files: &[(&str, &str)]) -> Result<Design, String> {
+    Ok(map_mixed_sources(files)?.design)
+}
+
+/// Unified mixed-language (VHDL + SystemVerilog/Verilog) mapping from disk paths.
+pub fn map_mixed_files(paths: &[&Path]) -> Result<MapResult, String> {
+    map_vhdl_files(paths)
+}
+
+/// Unified mixed-language (VHDL + SystemVerilog/Verilog) synthesis from disk paths.
+pub fn synth_mixed_files(paths: &[&Path]) -> Result<Design, String> {
+    synth_vhdl_files(paths)
+}
+
+/// Translate VHDL (including VHDL-2019 mode views and PSL assertions) to SystemVerilog.
+pub fn vhdl_to_sv_str(source: &str) -> Result<String, String> {
+    vhdl_to_sv(source)
+}
+
+/// Synthesize VHDL and elaborate lowered PSL -> SVA properties via `helion_sv::sva`.
+pub fn synth_vhdl_with_sva(source: &str) -> Result<helion_sv::sva::SvaSynthOut, String> {
+    let (sv, _softs) = vhdl_to_sv_with_softs(source, "vhdl.vhd")?;
+    let mut out = helion_sv::sva::synth_sv_with_sva(&sv, "vhdl.sv")?;
+    strip_redundant_buffer_luts(&mut out.design);
+    attach_sva_attrs(&mut out.design, &sv);
+    Ok(out)
+}
+pub fn map_vhdl_path_with_siblings(path: &Path) -> Result<MapResult, String> {
+    let Some(parent) = path.parent() else {
+        return map_vhdl_path(path);
+    };
+    let Ok(rd) = std::fs::read_dir(parent) else {
+        return map_vhdl_path(path);
+    };
+    let canon_target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut sibs: Vec<std::path::PathBuf> = rd
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            let c = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+            if c == canon_target {
+                return false;
+            }
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "vhd" | "vhdl" | "sv" | "v"))
+                .unwrap_or(false)
+        })
+        .collect();
+    if sibs.is_empty() {
+        return map_vhdl_path(path);
+    }
+    sibs.sort();
+    sibs.push(path.to_path_buf());
+    let refs: Vec<&Path> = sibs.iter().map(|p| p.as_path()).collect();
+    map_vhdl_files(&refs)
+}
+
+/// Same-directory sibling synthesis for VHDL: packages, entities, architectures,
+/// and child components in sibling files are elaborated with `path` as the top file.
+pub fn synth_vhdl_path_with_siblings(path: &Path) -> Result<Design, String> {
+    Ok(map_vhdl_path_with_siblings(path)?.design)
+}
+
 fn map_vhdl_origin(source: &str, origin: &str) -> Result<MapResult, String> {
     if let Some(name) = osvvm_harness_module(source) {
         // OSVVM / PoC test harness (CreateClock, library.entity). The
@@ -232,9 +430,133 @@ fn map_vhdl_origin(source: &str, origin: &str) -> Result<MapResult, String> {
     let (sv, softs) = vhdl_to_sv_with_softs(source, origin)?;
     let mut design = helion_sv::synth_sv(&sv, "vhdl.sv")?;
     strip_redundant_buffer_luts(&mut design);
+    let mut design = match helion_sv::synth_sv(&sv, "vhdl.sv") {
+        Ok(d) => d,
+        Err(e) if sv.contains("assert property") || sv.contains("cover property") => {
+            let stripped = strip_sva_lines(&sv);
+            helion_sv::synth_sv(&stripped, "vhdl.sv").map_err(|_| e)?
+        }
+        Err(e) => return Err(e),
+    };
+    strip_redundant_buffer_luts(&mut design);
+    attach_sva_attrs(&mut design, &sv);
     Ok(MapResult { design, softs })
 }
 
+/// Remove redundant 1-input identity buffer LUTs (`0xaaaa_aaaa_aaaa_aaaa`)
+/// emitted alongside direct `IobOut` port connections or wire aliases.
+fn strip_redundant_buffer_luts(d: &mut Design) {
+    use helion_ir::{CellKind, Spur};
+    const BUF_INIT: u64 = 0xaaaa_aaaa_aaaa_aaaa;
+    let pin_o = intern("O");
+    let pin_i0 = intern("I0");
+    let pin_pad = intern("PAD");
+    let iob_cells: HashSet<Spur> = d
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::IobOut))
+        .map(|c| c.name)
+        .collect();
+    let mut iob_pad_nets: HashSet<Spur> = HashSet::new();
+    for net in &d.nets {
+        if net
+            .endpoints
+            .iter()
+            .any(|e| e.pin == pin_pad && iob_cells.contains(&e.cell))
+        {
+            iob_pad_nets.insert(net.name);
+        }
+    }
+    let mut remove_cells: HashSet<Spur> = HashSet::new();
+    for c in &d.cells {
+        let CellKind::Lut6 { init } = c.kind else {
+            continue;
+        };
+        if init != BUF_INIT {
+            continue;
+        }
+        let mut out_net: Option<Spur> = None;
+        let mut has_other_in = false;
+        for net in &d.nets {
+            for e in &net.endpoints {
+                if e.cell == c.name {
+                    if e.pin == pin_o {
+                        out_net = Some(net.name);
+                    } else if e.pin != pin_i0 {
+                        has_other_in = true;
+                    }
+                }
+            }
+        }
+        if !has_other_in {
+            if let Some(on) = out_net {
+                if iob_pad_nets.contains(&on) {
+                    remove_cells.insert(c.name);
+                }
+            }
+        }
+    }
+    if remove_cells.is_empty() {
+        return;
+    }
+    d.cells.retain(|c| !remove_cells.contains(&c.name));
+    for net in &mut d.nets {
+        net.endpoints.retain(|e| !remove_cells.contains(&e.cell));
+    }
+    d.rebuild_indexes();
+}
+
+fn synth_sv_sources_resilient(
+    synth_inputs: &[(&str, &str)],
+    vhdl_sv: &str,
+) -> Result<Design, String> {
+    match helion_sv::synth_sv_sources(synth_inputs) {
+        Ok(d) => Ok(d),
+        Err(e) if vhdl_sv.contains("assert property") || vhdl_sv.contains("cover property") => {
+            let stripped = strip_sva_lines(vhdl_sv);
+            let patched: Vec<(&str, &str)> = synth_inputs
+                .iter()
+                .map(|&(o, s)| {
+                    if o == "vhdl_multi.sv" {
+                        (o, stripped.as_str())
+                    } else {
+                        (o, s)
+                    }
+                })
+                .collect();
+            helion_sv::synth_sv_sources(&patched).map_err(|_| e)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn strip_sva_lines(sv: &str) -> String {
+    sv.lines()
+        .filter(|l| !l.contains("assert property") && !l.contains("cover property"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn attach_sva_attrs(d: &mut Design, sv: &str) {
+    let mut asserts = Vec::new();
+    let mut covers = Vec::new();
+    for line in sv.lines() {
+        let t = line.trim();
+        if t.contains("assert property") {
+            asserts.push(t.to_string());
+        } else if t.contains("cover property") {
+            covers.push(t.to_string());
+        }
+    }
+    if !asserts.is_empty() {
+        d.attrs.set("PSL_ASSERT_COUNT", asserts.len().to_string());
+        d.attrs.set("SVA_PROPERTIES", asserts.join(" | "));
+    }
+    if !covers.is_empty() {
+        d.attrs.set("PSL_COVER_COUNT", covers.len().to_string());
+        d.attrs.set("SVA_COVERS", covers.join(" | "));
+    }
+}
 /// Remove redundant 1-input identity buffer LUTs (`0xaaaa_aaaa_aaaa_aaaa`)
 /// emitted alongside direct `IobOut` port connections or wire aliases.
 fn strip_redundant_buffer_luts(d: &mut Design) {
@@ -492,6 +814,81 @@ impl TypeEnv {
         let k = name.to_ascii_lowercase();
         if let Some(r) = self.records.get(&k) {
             return Some(r);
+    }
+    out
+}
+
+fn vhdl_to_sv_with_softs(source: &str, origin: &str) -> Result<(String, Vec<SoftDiag>), String> {
+    let files = [(origin, source)];
+    let empty_bodies = HashSet::new();
+    let empty_ports = HashMap::new();
+    vhdl_sources_to_sv_with_softs(&files, &empty_bodies, &empty_ports)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VType {
+    Scalar(usize),
+    Record(String),
+    UnconstrainedArray(String),
+}
+
+#[derive(Clone, Debug)]
+struct RecordField {
+    name: String,
+    ty: VType,
+}
+
+#[derive(Clone, Debug)]
+struct RecordDef {
+    fields: Vec<RecordField>,
+}
+
+#[derive(Clone, Debug)]
+struct FuncDef {
+    gen_params: Vec<(String, i64)>,
+    params: Vec<String>,
+    body_expr: String,
+    leaf_exprs: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+struct ViewDef {
+    record_type: String,
+    /// field name (lowercase) -> "input" | "output" | "view:<subview>" | "converse:<subview>"
+    field_dirs: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GenericPkgTemplate {
+    gen_order: Vec<String>,
+    gen_defaults: HashMap<String, i64>,
+    header_toks: Vec<Tok>,
+    body_toks: Vec<Tok>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TypeEnv {
+    consts: HashMap<String, i64>,
+    pkg_consts: HashMap<String, i64>,
+    pkg_names: HashSet<String>,
+    subtypes: HashMap<String, VType>,
+    records: HashMap<String, RecordDef>,
+    views: HashMap<String, ViewDef>,
+    funcs: HashMap<String, FuncDef>,
+    rec_vars: HashMap<String, String>,
+    rec_consts: HashMap<String, HashMap<String, String>>,
+    generic_pkgs: HashMap<String, GenericPkgTemplate>,
+    unconstrained_arrays: HashMap<String, VType>,
+    bounds: HashMap<String, (i64, i64)>,
+    type_bounds: HashMap<String, (i64, i64)>,
+    default_psl_clock: Option<String>,
+}
+
+impl TypeEnv {
+    fn get_record(&self, name: &str) -> Option<&RecordDef> {
+        let k = name.to_ascii_lowercase();
+        if let Some(r) = self.records.get(&k) {
+            return Some(r);
         }
         if let Some(VType::Record(target)) = self.subtypes.get(&k) {
             return self.records.get(&target.to_ascii_lowercase());
@@ -506,6 +903,23 @@ impl TypeEnv {
         suffix_prefix: &str,
         depth: usize,
     ) -> Vec<(String, String, usize)> {
+        if depth > 16 {
+            return Vec::new();
+        None
+    }
+
+    fn get_view(&self, name: &str) -> Option<&ViewDef> {
+        self.views.get(&name.to_ascii_lowercase())
+    }
+
+    fn flatten_view_leaves(
+        &self,
+        view_name: &str,
+        converse: bool,
+        prefix: &str,
+        suffix_prefix: &str,
+        depth: usize,
+    ) -> Vec<(String, String, &'static str, usize)> {
         if depth > 16 {
             return Vec::new();
         }
@@ -717,7 +1131,62 @@ fn vhdl_sources_to_sv_with_softs(
             out.push((mname, ports));
         } else {
             p.bump();
+        let Some(vdef) = self.get_view(view_name) else {
+            return Vec::new();
+        };
+        let Some(rdef) = self.get_record(&vdef.record_type) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for f in &rdef.fields {
+            let fname_clean = f.name.replace('-', "m");
+            let fkey = f.name.to_ascii_lowercase();
+            let full = if prefix.is_empty() {
+                fname_clean.clone()
+            } else {
+                format!("{prefix}_{fname_clean}")
+            };
+            let suf = if suffix_prefix.is_empty() {
+                fname_clean.to_ascii_lowercase()
+            } else {
+                format!("{suffix_prefix}_{}", fname_clean.to_ascii_lowercase())
+            };
+            let mode = vdef
+                .field_dirs
+                .get(&fkey)
+                .map(|s| s.as_str())
+                .unwrap_or("input");
+            if let Some(sub_v) = mode.strip_prefix("view:") {
+                out.extend(self.flatten_view_leaves(sub_v, converse, &full, &suf, depth + 1));
+                continue;
+            }
+            if let Some(sub_v) = mode.strip_prefix("converse:") {
+                out.extend(self.flatten_view_leaves(sub_v, !converse, &full, &suf, depth + 1));
+                continue;
+            }
+            let base_dir: &'static str = if mode == "output" { "output" } else { "input" };
+            let dir: &'static str = if converse {
+                if base_dir == "output" {
+                    "input"
+                } else {
+                    "output"
+                }
+            } else {
+                base_dir
+            };
+            match &f.ty {
+                VType::Scalar(w) => out.push((full, suf, dir, (*w).max(1))),
+                VType::Record(sub_rec) => {
+                    for (lfull, lsuf, lw) in
+                        self.flatten_record_leaves(sub_rec, &full, &suf, depth + 1)
+                    {
+                        out.push((lfull, lsuf, dir, lw));
+                    }
+                }
+                VType::UnconstrainedArray(_) => out.push((full, suf, dir, 1)),
+            }
         }
+        out
     }
 
     if entities.is_empty() {
@@ -819,6 +1288,18 @@ impl TypeEnv {
         if let Some(r) = self.records.get(&k) {
             return Some(r);
         }
+    fn is_array_record(&self, rec_type: &str) -> bool {
+        let Some(def) = self.get_record(rec_type) else {
+            return false;
+        };
+        !def.fields.is_empty()
+            && def.fields.iter().all(|f| {
+                !f.name.is_empty()
+                    && f.name
+                        .chars()
+                        .enumerate()
+                        .all(|(i, c)| c.is_ascii_digit() || (i == 0 && (c == '-' || c == 'm')))
+            })
     }
     let dummy = Arch {
         of: top.name.clone(),
@@ -837,6 +1318,36 @@ impl TypeEnv {
             entity_occupied.insert(e.name.to_ascii_lowercase(), occupied_sv_names(e, a));
         if let Some(VType::Record(target)) = self.subtypes.get(&k) {
             return self.records.get(&target.to_ascii_lowercase());
+
+    fn make_constrained_array_record(
+        &mut self,
+        base_name: &str,
+        lo: i64,
+        hi: i64,
+        elem_ty: &VType,
+    ) -> String {
+        let elem_tag = match elem_ty {
+            VType::Scalar(w) => format!("s{w}"),
+            VType::Record(r) => format!("r_{r}"),
+            VType::UnconstrainedArray(u) => format!("u_{u}"),
+        };
+        let key = format!(
+            "__arr_{}_{}_{}_{}",
+            base_name.to_ascii_lowercase(),
+            lo.to_string().replace('-', "m"),
+            hi.to_string().replace('-', "m"),
+            elem_tag
+        );
+        if !self.records.contains_key(&key) {
+            let mut fields = Vec::new();
+            let (start, end) = (lo.min(hi), lo.max(hi));
+            for idx in start..=end {
+                fields.push(RecordField {
+                    name: idx.to_string(),
+                    ty: elem_ty.clone(),
+                });
+            }
+            self.records.insert(key.clone(), RecordDef { fields });
         }
         None
     }
@@ -858,6 +1369,18 @@ impl TypeEnv {
     for e in &entities {
         if e.name.eq_ignore_ascii_case(&top.name) {
             continue;
+        key
+    }
+
+    fn flatten_record_leaves(
+        &self,
+        rec_type: &str,
+        prefix: &str,
+        suffix_prefix: &str,
+        depth: usize,
+    ) -> Vec<(String, String, usize)> {
+        if depth > 16 {
+            return Vec::new();
         }
         let Some(a) = arch_for(&e.name) else {
             continue;
@@ -865,6 +1388,8 @@ impl TypeEnv {
     fn is_array_record(&self, rec_type: &str) -> bool {
         let Some(def) = self.get_record(rec_type) else {
             return false;
+        let Some(def) = self.get_record(rec_type) else {
+            return Vec::new();
         };
         let consts = bind_consts(&env.pkg_consts, e, a, false);
         let mut unit_softs = Vec::new();
@@ -892,6 +1417,444 @@ impl TypeEnv {
                         .enumerate()
                         .all(|(i, c)| c.is_ascii_digit() || (i == 0 && (c == '-' || c == 'm')))
             })
+        let mut out = Vec::new();
+        for f in &def.fields {
+            let fname_clean = f.name.replace('-', "m");
+            let full = if prefix.is_empty() {
+                fname_clean.clone()
+            } else {
+                format!("{prefix}_{fname_clean}")
+            };
+            let suf = if suffix_prefix.is_empty() {
+                fname_clean.to_ascii_lowercase()
+            } else {
+                format!("{suffix_prefix}_{}", fname_clean.to_ascii_lowercase())
+            };
+            match &f.ty {
+                VType::Scalar(w) => out.push((full, suf, (*w).max(1))),
+                VType::Record(sub) => {
+                    out.extend(self.flatten_record_leaves(sub, &full, &suf, depth + 1));
+                }
+                VType::UnconstrainedArray(_) => out.push((full, suf, 1)),
+            }
+        }
+        out
+    }
+    let arch = arch_for(&top.name)
+        .or_else(|| archs.last())
+        .unwrap_or(&dummy);
+    entity_clocks.insert(top.name.to_ascii_lowercase(), sta_clocks_of(arch));
+    entity_occupied.insert(top.name.to_ascii_lowercase(), occupied_sv_names(top, arch));
+    let consts = bind_consts(&env.pkg_consts, top, arch, true);
+    let mut unit_softs = Vec::new();
+    let (top_origin, top_source) = unit_origin_src(&top.name);
+    out.push_str(&emit_sv(
+        top,
+        arch,
+        &consts,
+        &known_bodies,
+        &entity_clocks,
+        &entity_occupied,
+        &entities,
+        extra_module_ports,
+        &top_origin,
+        &top_source,
+        &mut unit_softs,
+        &empty_child_softs,
+    )?);
+    entity_softs.insert(top.name.to_ascii_lowercase(), unit_softs);
+
+    fn register_rec_var(&mut self, name: &str, rec_type: &str, depth: usize) {
+        if depth > 16 {
+            return;
+        }
+        let rlow = rec_type.to_ascii_lowercase();
+        self.rec_vars.insert(name.to_ascii_lowercase(), rlow.clone());
+        if let Some(def) = self.get_record(&rlow).cloned() {
+            for f in &def.fields {
+                let fname_clean = f.name.replace('-', "m");
+                let sub_name = format!("{name}_{fname_clean}");
+                if let VType::Record(sub) = &f.ty {
+                    self.register_rec_var(&sub_name, sub, depth + 1);
+                }
+            }
+        }
+    }
+
+    fn resolve_rec_var(&self, name: &str) -> Option<String> {
+        self.rec_vars.get(&name.to_ascii_lowercase()).cloned()
+    }
+}
+
+fn eat_context_decl_or_ref(p: &mut P) {
+    let save = p.i;
+    if p.eat_ident() && p.eat("is") {
+        skip_to_end_unit(p, "context");
+    } else {
+        p.i = save;
+        eat_to_semi(p);
+    }
+}
+
+fn skip_package_unit(p: &mut P) {
+    let _ = p.eat("body");
+    let _ = p.eat_ident();
+    let _ = p.eat("is");
+    if p.eat("new") {
+        eat_to_semi(p);
+    } else {
+        skip_to_end_unit(p, "package");
+    }
+}
+
+fn vhdl_sources_to_sv_with_softs(
+    files: &[(&str, &str)],
+    extra_known_bodies: &HashSet<String>,
+    extra_module_ports: &HashMap<String, Vec<(String, &'static str, usize)>>,
+) -> Result<(String, Vec<SoftDiag>), String> {
+    let tokenized: Vec<(&str, &str, Vec<Tok>)> = files
+        .iter()
+        .map(|&(origin, src)| (origin, src, tokenize(src)))
+        .collect();
+    let mut env = TypeEnv::default();
+    env.pkg_names.insert("work".into());
+    env.pkg_names.insert("ieee".into());
+    env.pkg_names.insert("std".into());
+    env.pkg_names.insert("fixed_pkg".into());
+    env.pkg_names.insert("float_pkg".into());
+
+    // Pass 1 (twice for cross-package dependencies): harvest all packages & package bodies.
+    for _pass in 0..2 {
+        for (_origin, _src, toks) in &tokenized {
+            let mut p = P { t: toks, i: 0 };
+            while p.peek().is_some() {
+                if p.eat("library") || p.eat("use") {
+                    eat_to_semi(&mut p);
+                    continue;
+                }
+                if p.eat("context") {
+                    eat_context_decl_or_ref(&mut p);
+                    continue;
+                }
+                if p.eat("package") {
+                    let is_body = p.eat("body");
+                    parse_package(&mut p, &mut env, is_body)?;
+                    continue;
+                }
+                if p.eat("entity") {
+                    skip_to_end_unit(&mut p, "entity");
+                    continue;
+                }
+                if p.eat("architecture") {
+                    skip_to_end_unit(&mut p, "architecture");
+                    continue;
+                }
+                if p.eat("configuration") {
+                    skip_balanced_end(&mut p, "configuration");
+                    continue;
+                }
+                p.bump();
+            }
+        }
+    }
+
+    let mut child_port_overrides: HashMap<String, HashMap<String, VType>> = HashMap::new();
+    let mut child_bound_overrides: HashMap<String, HashMap<String, (i64, i64)>> = HashMap::new();
+    let mut child_generic_overrides: HashMap<String, HashMap<String, i64>> = HashMap::new();
+
+    let mut entities: Vec<Entity> = Vec::new();
+    let mut entity_origins: HashMap<String, (String, String)> = HashMap::new();
+    let mut archs: Vec<Arch> = Vec::new();
+    let mut arch_origins: HashMap<String, (String, String)> = HashMap::new();
+
+    for _elab_round in 0..2 {
+        entities.clear();
+        entity_origins.clear();
+        archs.clear();
+        arch_origins.clear();
+
+        for (origin, src, toks) in &tokenized {
+            let mut p = P { t: toks, i: 0 };
+            while p.peek().is_some() {
+                if p.eat("library") || p.eat("use") {
+                    eat_to_semi(&mut p);
+                    continue;
+                }
+                if p.eat("context") {
+                    eat_context_decl_or_ref(&mut p);
+                    continue;
+                }
+                if p.eat("package") {
+                    skip_package_unit(&mut p);
+                    continue;
+                }
+                if p.eat("entity") {
+                    let ent = parse_entity(
+                        &mut p,
+                        &mut env,
+                        &child_port_overrides,
+                        &child_bound_overrides,
+                        &child_generic_overrides,
+                    )?;
+                    entity_origins.insert(
+                        ent.name.to_ascii_lowercase(),
+                        (origin.to_string(), src.to_string()),
+                    );
+                    if let Some(existing) = entities
+                        .iter_mut()
+                        .find(|e| e.name.eq_ignore_ascii_case(&ent.name))
+                    {
+                        *existing = ent;
+                    } else {
+                        entities.push(ent);
+                    }
+                    continue;
+                }
+                if p.eat("architecture") {
+                    skip_to_end_unit(&mut p, "architecture");
+                    continue;
+                }
+                if p.eat("configuration") {
+                    skip_balanced_end(&mut p, "configuration");
+                    continue;
+                }
+                p.bump();
+            }
+        }
+
+        for (origin, src, toks) in &tokenized {
+            let mut p = P { t: toks, i: 0 };
+            while p.peek().is_some() {
+                if p.eat("library") || p.eat("use") {
+                    eat_to_semi(&mut p);
+                    continue;
+                }
+                if p.eat("context") {
+                    eat_context_decl_or_ref(&mut p);
+                    continue;
+                }
+                if p.eat("package") {
+                    skip_package_unit(&mut p);
+                    continue;
+                }
+                if p.eat("entity") {
+                    skip_to_end_unit(&mut p, "entity");
+                    continue;
+                }
+                if p.eat("architecture") {
+                    let a = parse_arch(&mut p, &entities, &env)?;
+                    arch_origins.insert(
+                        a.of.to_ascii_lowercase(),
+                        (origin.to_string(), src.to_string()),
+                    );
+                    archs.push(a);
+                    continue;
+                }
+                if p.eat("configuration") {
+                    skip_balanced_end(&mut p, "configuration");
+                    continue;
+                }
+                p.bump();
+            }
+        }
+
+        let mut changed = false;
+        for a in &archs {
+            for (rk, rv) in &a.env.records {
+                env.records.entry(rk.clone()).or_insert_with(|| rv.clone());
+            }
+            let parent_ent = entities
+                .iter()
+                .find(|e| e.name.eq_ignore_ascii_case(&a.of));
+            for st in &a.stmts {
+                let CStmt::Inst {
+                    module,
+                    conns,
+                    generic_map,
+                    ..
+                } = st
+                else {
+                    continue;
+                };
+                let mkey = module.to_ascii_lowercase();
+                if !generic_map.is_empty() {
+                    let entry = child_generic_overrides.entry(mkey.clone()).or_default();
+                    if let Some(ce) = entities.iter().find(|e| e.name.eq_ignore_ascii_case(module))
+                    {
+                        for (gk, gv) in generic_map {
+                            let resolved_k = if let Some(idx_s) = gk.strip_prefix('#') {
+                                idx_s
+                                    .parse::<usize>()
+                                    .ok()
+                                    .and_then(|i| ce.generic_order.get(i))
+                                    .cloned()
+                            } else {
+                                Some(gk.clone())
+                            };
+                            if let Some(rk) = resolved_k {
+                                if entry.insert(rk, *gv) != Some(*gv) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                let Some(ce) = entities.iter().find(|e| e.name.eq_ignore_ascii_case(module))
+                else {
+                    continue;
+                };
+                for (formal, actual) in conns {
+                    let port_info = if let Some(idx_s) = formal.strip_prefix('#') {
+                        idx_s
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|i| ce.raw_ports.get(i))
+                    } else {
+                        ce.raw_ports
+                            .iter()
+                            .find(|(n, _, _)| n.eq_ignore_ascii_case(formal))
+                    };
+                    let Some((pname, _pdir, _pty)) = port_info else {
+                        continue;
+                    };
+                    let pkey = pname.to_ascii_lowercase();
+                    let act_clean = actual.trim();
+                    if let Some(rec_t) = a.env.resolve_rec_var(act_clean) {
+                        let p_entry = child_port_overrides.entry(mkey.clone()).or_default();
+                        let new_ty = VType::Record(rec_t);
+                        if p_entry.get(&pkey) != Some(&new_ty) {
+                            p_entry.insert(pkey.clone(), new_ty);
+                            changed = true;
+                        }
+                    } else if let Some((_, w)) = a
+                        .signals
+                        .iter()
+                        .find(|(sn, _)| sn.eq_ignore_ascii_case(act_clean))
+                        .cloned()
+                        .or_else(|| {
+                            parent_ent.and_then(|pe| {
+                                pe.ports
+                                    .iter()
+                                    .find(|(pn, _, _)| pn.eq_ignore_ascii_case(act_clean))
+                                    .map(|(pn, _, pw)| (pn.clone(), *pw))
+                            })
+                        })
+                    {
+                        if w > 1 {
+                            let p_entry = child_port_overrides.entry(mkey.clone()).or_default();
+                            let new_ty = VType::Scalar(w);
+                            if p_entry.get(&pkey) != Some(&new_ty) {
+                                p_entry.insert(pkey.clone(), new_ty);
+                                changed = true;
+                            }
+                        }
+                        if let Some(&bnds) = a.env.bounds.get(&act_clean.to_ascii_lowercase()) {
+                            let b_entry = child_bound_overrides.entry(mkey.clone()).or_default();
+                            if b_entry.insert(pkey, bnds) != Some(bnds) {
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    if entities.is_empty() {
+        return Err("vhdl: need entity".into());
+    }
+    let arch_for = |name: &str| -> Option<&Arch> {
+        archs.iter().rev().find(|a| a.of.eq_ignore_ascii_case(name))
+    };
+    let mut instantiated: HashSet<String> = HashSet::new();
+    for e in &entities {
+        if let Some(a) = arch_for(&e.name) {
+            for st in &a.stmts {
+                if let CStmt::Inst { module, .. } = st {
+                    instantiated.insert(module.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    let top_name = entities
+        .iter()
+        .rev()
+        .find(|e| !instantiated.contains(&e.name.to_ascii_lowercase()))
+        .or_else(|| entities.last())
+        .map(|e| e.name.clone())
+        .ok_or_else(|| String::from("vhdl: need entity"))?;
+    let top = entities
+        .iter()
+        .rev()
+        .find(|e| e.name.eq_ignore_ascii_case(&top_name))
+        .unwrap();
+
+    let mut known_bodies: HashSet<String> = extra_known_bodies.clone();
+    for e in &entities {
+        if arch_for(&e.name).is_some() {
+            known_bodies.insert(e.name.to_ascii_lowercase());
+        }
+    }
+    let dummy = Arch {
+        of: top.name.clone(),
+        consts: HashMap::new(),
+        signals: Vec::new(),
+        components: Vec::new(),
+        stmts: Vec::new(),
+        parse_softs: Vec::new(),
+        env: env.clone(),
+    };
+    let mut entity_clocks: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut entity_occupied: HashMap<String, HashSet<String>> = HashMap::new();
+    for e in &entities {
+        if let Some(a) = arch_for(&e.name) {
+            entity_clocks.insert(e.name.to_ascii_lowercase(), sta_clocks_of(a));
+            entity_occupied.insert(e.name.to_ascii_lowercase(), occupied_sv_names(e, a));
+        }
+    }
+    let default_origin = files.last().map(|(o, _)| *o).unwrap_or("vhdl.vhd");
+    let default_source = files.last().map(|(_, s)| *s).unwrap_or("");
+    let unit_origin_src = |ename: &str| -> (String, String) {
+        let k = ename.to_ascii_lowercase();
+        if let Some((o, s)) = arch_origins.get(&k) {
+            return (o.clone(), s.clone());
+        }
+        if let Some((o, s)) = entity_origins.get(&k) {
+            return (o.clone(), s.clone());
+        }
+        (default_origin.to_string(), default_source.to_string())
+    };
+    let mut out = String::new();
+    let mut entity_softs: HashMap<String, Vec<SoftDiag>> = HashMap::new();
+    let empty_child_softs: HashMap<String, Vec<SoftDiag>> = HashMap::new();
+    for e in &entities {
+        if e.name.eq_ignore_ascii_case(&top.name) {
+            continue;
+        }
+        let Some(a) = arch_for(&e.name) else {
+            continue;
+        };
+        let consts = bind_consts(&env.pkg_consts, e, a, false);
+        let mut unit_softs = Vec::new();
+        let (u_origin, u_source) = unit_origin_src(&e.name);
+        out.push_str(&emit_sv(
+            e,
+            a,
+            &consts,
+            &known_bodies,
+            &entity_clocks,
+            &entity_occupied,
+            &entities,
+            extra_module_ports,
+            &u_origin,
+            &u_source,
+            &mut unit_softs,
+            &empty_child_softs,
+        )?);
+        entity_softs.insert(e.name.to_ascii_lowercase(), unit_softs);
     }
     let arch = arch_for(&top.name)
         .or_else(|| archs.last())
@@ -1647,6 +2610,16 @@ enum CStmt {
         generic_map: Vec<(String, i64)>,
         conns: Vec<(String, String)>,
     },
+    SvaAssert {
+        label: Option<String>,
+        clk: Option<String>,
+        prop_sv: String,
+    },
+    SvaCover {
+        label: Option<String>,
+        clk: Option<String>,
+        prop_sv: String,
+    },
 }
 
 #[derive(Clone)]
@@ -1680,6 +2653,13 @@ fn parse_package(p: &mut P, env: &mut TypeEnv, is_body: bool) -> Result<(), Stri
         env.pkg_names.insert(pkey.clone());
     }
     let _ = p.eat("is");
+    if p.eat("new") {
+        // Generic package instantiation: `package <inst> is new [work.]<base> generic map (...);`
+        let mut base = p.ident().unwrap_or_default();
+        while p.eat(".") {
+            if let Ok(sub) = p.ident() {
+                base = sub;
+            }
     if p.eat("new") {
         // Generic package instantiation: `package <inst> is new [work.]<base> generic map (...);`
         let mut base = p.ident().unwrap_or_default();
@@ -1742,6 +2722,8 @@ fn parse_package_items_until_end(p: &mut P, env: &mut TypeEnv) -> Result<(), Str
             parse_type_decl(p, env);
         } else if p.eat("subtype") {
             parse_subtype_decl(p, env);
+        } else if p.eat("view") {
+            parse_view_decl(p, env);
         } else if p.eat("component") {
             let _ = parse_component(p, env);
         } else if p.eat("package") {
@@ -1754,6 +2736,10 @@ fn parse_package_items_until_end(p: &mut P, env: &mut TypeEnv) -> Result<(), Str
         } else {
             eat_decl_item(p);
         }
+        let gmap = parse_generic_map_values(p, env);
+        eat_to_semi(p);
+        instantiate_generic_package(&pkey, &base.to_ascii_lowercase(), &gmap, env);
+        return Ok(());
     }
     Ok(())
 }
@@ -1837,6 +2823,13 @@ fn instantiate_generic_package(
         env.records.insert(k.clone(), v.clone());
         if !inst_name.is_empty() {
             env.records
+                .insert(format!("{inst_name}__{}", k.to_ascii_lowercase()), v);
+        }
+    }
+    for (k, v) in inst_env.views {
+        env.views.insert(k.clone(), v.clone());
+        if !inst_name.is_empty() {
+            env.views
                 .insert(format!("{inst_name}__{}", k.to_ascii_lowercase()), v);
         }
     }
@@ -2002,6 +2995,13 @@ fn parse_subtype_decl(p: &mut P, env: &mut TypeEnv) {
     env.subtypes.insert(skey, ty);
 }
 
+    let mut gen_order = Vec::new();
+    let mut gen_defaults = HashMap::new();
+    if !is_body && p.eat("generic") {
+        let _ = parse_generic_clause_ordered(p, &mut gen_order, &mut gen_defaults, env);
+        for (k, v) in &gen_defaults {
+            env.consts.insert(k.clone(), *v);
+            env.pkg_consts.insert(k.clone(), *v);
 fn parse_subprogram_or_proto(p: &mut P, env: &mut TypeEnv) {
     let fname = p.ident().unwrap_or_default();
     let fkey = fname.to_ascii_lowercase();
@@ -2025,6 +3025,1009 @@ fn parse_subprogram_or_proto(p: &mut P, env: &mut TypeEnv) {
                         .parse::<usize>()
                         .ok()
                         .and_then(|i| base_fn.gen_params.get(i).map(|(n, _)| n.clone()))
+                } else {
+                    Some(gk.clone())
+                };
+                if let Some(rk) = resolved {
+                    subst_map.insert(rk, gv.to_string());
+                }
+            }
+            let body_expr = replace_word_map(&base_fn.body_expr, &subst_map);
+            let leaf_exprs = base_fn
+                .leaf_exprs
+                .iter()
+                .map(|(k, v)| (k.clone(), replace_word_map(v, &subst_map)))
+                .collect();
+            env.funcs.insert(
+                fkey,
+                FuncDef {
+                    gen_params: base_fn.gen_params,
+                    params: base_fn.params,
+                    body_expr,
+                    leaf_exprs,
+                },
+            );
+        }
+        return;
+    }
+    let mut gen_order = Vec::new();
+    let mut gen_defaults = HashMap::new();
+    let mut local_env = env.clone();
+    if p.eat("generic") {
+        let _ = parse_generic_clause_ordered(p, &mut gen_order, &mut gen_defaults, &local_env);
+        for (k, v) in &gen_defaults {
+            local_env.consts.insert(k.clone(), *v);
+        }
+    }
+    let _ = p.eat("parameter");
+    let mut params = Vec::new();
+    if p.eat("(") {
+        while !p.eat(")") && p.peek().is_some() {
+            let _ = p.eat("constant");
+            let _ = p.eat("signal");
+            let _ = p.eat("variable");
+            let Some(p0) = p.eat_name() else {
+                if !p.eat(";") {
+                    p.bump();
+                }
+                continue;
+            };
+            let mut pnames = vec![p0];
+            while p.eat(",") {
+                if let Some(pn) = p.eat_name() {
+                    pnames.push(pn);
+                }
+            }
+            let _ = p.eat(":");
+            let _ = p.eat("in");
+            let _ = p.eat("out");
+            let _ = p.eat("inout");
+            let (pty, pbnds) = parse_vtype_with_bounds(p, &mut local_env);
+            skip_init(p);
+            for pn in pnames {
+                if let VType::Record(r) = &pty {
+                    local_env.register_rec_var(&pn, r, 0);
+                }
+                if let Some(b) = pbnds {
+                    local_env.bounds.insert(pn.to_ascii_lowercase(), b);
+                }
+                params.push(pn);
+            }
+            let _ = p.eat(";");
+        }
+    }
+    let mut ret_ty = VType::Scalar(1);
+    if p.eat("return") {
+        ret_ty = parse_vtype(p, &mut local_env);
+    }
+    if p.eat(";") {
+        return;
+    }
+    let _ = p.eat("is");
+    let mut local_signals = Vec::new();
+    while !p.eat("begin") && p.peek().is_some() {
+        if p.eat("variable") || p.eat("signal") {
+            let _ = parse_signal_list(p, &mut local_signals, &mut local_env);
+        } else if p.eat("constant") {
+            parse_constant_into_env(p, &mut local_env, false);
+        } else if p.eat("type") {
+            parse_type_decl(p, &mut local_env);
+        } else if p.eat("subtype") {
+            parse_subtype_decl(p, &mut local_env);
+        } else if p.eat("function") || p.eat("procedure") || p.eat("impure") || p.eat("pure") {
+            let _ = p.eat("function");
+            let _ = p.eat("procedure");
+            parse_subprogram_or_proto(p, &mut local_env);
+        } else {
+            p.bump();
+        }
+    }
+    let mut var_assigns: HashMap<String, String> = HashMap::new();
+    let mut ret_expr: Option<String> = None;
+    let mut leaf_exprs: HashMap<String, String> = HashMap::new();
+    let mut depth = 1i32;
+    while depth > 0 && p.peek().is_some() {
+        if p.eat("end") {
+            if p.eat("if") || p.eat("case") || p.eat("loop") {
+                let _ = p.eat("?");
+                let _ = p.eat(";");
+                continue;
+            }
+            let _ = p.eat("function");
+            let _ = p.eat("procedure");
+            let _ = p.eat_ident();
+            let _ = p.eat(";");
+            depth -= 1;
+            break;
+        }
+        if p.eat("return") {
+            if let VType::Record(rname) = &ret_ty {
+                if let Ok(pairs) = parse_record_rhs(p, rname, &local_env) {
+                    for (suf, val) in pairs {
+                        let sub_val = subst_func_vars(&val, &var_assigns);
+                        leaf_exprs.insert(suf, sub_val);
+                    }
+                }
+            } else if let Ok(e) = parse_expr_sv(p, &local_env) {
+                let sub_e = subst_func_vars(&e, &var_assigns);
+                ret_expr = Some(sub_e);
+            }
+            eat_to_semi(p);
+            continue;
+        }
+        if p.eat("if") {
+            if let Ok(cond) = parse_expr_sv(p, &local_env) {
+                let _ = p.eat("then");
+                if p.eat("return") {
+                    let t_val = parse_expr_sv(p, &local_env).unwrap_or_else(|_| "1'b0".into());
+                    eat_to_semi(p);
+                    if p.eat("else") && p.eat("return") {
+                        let f_val = parse_expr_sv(p, &local_env).unwrap_or_else(|_| "1'b0".into());
+                        eat_to_semi(p);
+                        ret_expr = Some(format!(
+                            "(({}) ? ({}) : ({}))",
+                            subst_func_vars(&cond, &var_assigns),
+                            subst_func_vars(&t_val, &var_assigns),
+                            subst_func_vars(&f_val, &var_assigns)
+                        ));
+                    }
+                }
+            }
+            continue;
+        }
+        let save = p.i;
+        if let Ok(lhs) = parse_target_sv(p, &local_env, &local_signals) {
+            if p.eat(":=") || p.eat("<=") {
+                if let Some(rec_type) = local_env.resolve_rec_var(&lhs) {
+                    if let Ok(pairs) = parse_record_rhs(p, &rec_type, &local_env) {
+                        for (suf, val) in pairs {
+                            let full_lhs = format!("{lhs}_{suf}");
+                            let sub_val = subst_func_vars(&val, &var_assigns);
+                            var_assigns.insert(full_lhs, sub_val);
+                        }
+                        eat_to_semi(p);
+                        continue;
+                    }
+                } else if let Ok(rhs) = parse_expr_sv(p, &local_env) {
+                    let sub_rhs = subst_func_vars(&rhs, &var_assigns);
+                    var_assigns.insert(lhs, sub_rhs);
+                    eat_to_semi(p);
+                    continue;
+                }
+            }
+        }
+        p.i = save;
+        p.bump();
+    }
+    if !fkey.is_empty() && (ret_expr.is_some() || !leaf_exprs.is_empty()) {
+        let gen_params: Vec<(String, i64)> = gen_order
+            .into_iter()
+            .map(|n| {
+                let v = gen_defaults.get(&n).copied().unwrap_or(0);
+                (n, v)
+            })
+            .collect();
+        env.funcs.insert(
+            fkey,
+            FuncDef {
+                gen_params,
+                params,
+                body_expr: ret_expr.unwrap_or_else(|| "1'b0".into()),
+                leaf_exprs,
+            },
+        );
+    }
+}
+
+fn subst_func_vars(expr: &str, vars: &HashMap<String, String>) -> String {
+    if vars.is_empty() {
+        return expr.to_string();
+    }
+    replace_word_map(expr, vars)
+}
+
+fn replace_word_map(s: &str, map: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let word = &s[start..i];
+            if let Some((_, rep)) = map.iter().find(|(k, _)| k.eq_ignore_ascii_case(word)) {
+                out.push_str(&format!("({rep})"));
+            } else {
+                out.push_str(word);
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn parse_entity(
+    p: &mut P,
+    env: &mut TypeEnv,
+    port_overrides: &HashMap<String, HashMap<String, VType>>,
+    bound_overrides: &HashMap<String, HashMap<String, (i64, i64)>>,
+    generic_overrides: &HashMap<String, HashMap<String, i64>>,
+) -> Result<Entity, String> {
+    let name = p.ident()?;
+    let ekey = name.to_ascii_lowercase();
+    let _ = p.eat("is");
+    let mut ent_env = env.clone();
+    let mut generic_order = Vec::new();
+    let mut generics = HashMap::new();
+    if p.eat("generic") {
+        parse_generic_clause_ordered(p, &mut generic_order, &mut generics, &ent_env)?;
+        if let Some(gov) = generic_overrides.get(&ekey) {
+            for (gk, gv) in gov {
+                if let Some((existing_k, _)) = generics
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(gk))
+                    .map(|(k, v)| (k.clone(), *v))
+                {
+                    generics.insert(existing_k, *gv);
+                } else {
+                    generics.insert(gk.clone(), *gv);
+                }
+            }
+        }
+        for (k, v) in &generics {
+            ent_env.consts.insert(k.clone(), *v);
+        }
+    }
+    let empty_pov = HashMap::new();
+    let empty_bov = HashMap::new();
+    let pov = port_overrides.get(&ekey).unwrap_or(&empty_pov);
+    let bov = bound_overrides.get(&ekey).unwrap_or(&empty_bov);
+    let mut ports = Vec::new();
+    let mut raw_ports = Vec::new();
+    if p.eat("port") {
+        let (flat, raw) = parse_port_clause_with_overrides(p, &mut ent_env, pov, bov)?;
+        ports = flat;
+        raw_ports = raw;
+    }
+    let mut consts: HashMap<String, i64> = HashMap::new();
+    loop {
+        if p.peek().is_none() {
+            break;
+        }
+        if p.eat("generic") && p.eat("map") {
+            skip_paren_block(p);
+            let _ = p.eat(";");
+        }
+    }
+
+    let body_start = p.i;
+    parse_package_items_until_end(p, env)?;
+    let body_end = p.i;
+    if !pkey.is_empty() && body_start <= body_end && body_end <= p.t.len() {
+        let slice = p.t[body_start..body_end].to_vec();
+        let entry = env.generic_pkgs.entry(pkey).or_default();
+        if is_body {
+            entry.body_toks = slice;
+        if p.eat("constant") {
+            if let Ok((n, v)) = parse_constant(p, &mut ent_env) {
+                consts.insert(n.clone(), v);
+                ent_env.consts.insert(n, v);
+            }
+        } else if p.eat("type") {
+            parse_type_decl(p, &mut ent_env);
+        } else if p.eat("subtype") {
+            parse_subtype_decl(p, &mut ent_env);
+        } else if p.eat("package") {
+            let is_b = p.eat("body");
+            let _ = parse_package(p, &mut ent_env, is_b);
+        } else {
+            if !gen_order.is_empty() {
+                entry.gen_order = gen_order;
+                entry.gen_defaults = gen_defaults;
+            }
+            entry.header_toks = slice;
+        }
+    }
+    Ok(())
+    skip_to_end_unit(p, "entity");
+    for (rk, rv) in &ent_env.records {
+        env.records.entry(rk.clone()).or_insert_with(|| rv.clone());
+    }
+    for (sk, sv) in &ent_env.subtypes {
+        env.subtypes.entry(sk.clone()).or_insert_with(|| sv.clone());
+    }
+    Ok(Entity {
+        name,
+        generic_order,
+        generics,
+        consts,
+        ports,
+        raw_ports,
+        rec_vars: ent_env.rec_vars,
+        bounds: ent_env.bounds,
+    })
+}
+
+thread_local! {
+    static PARSE_SOFTS: std::cell::RefCell<Vec<(String, Option<String>, String)>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+fn note_parse_soft(name: impl Into<String>, detail: Option<String>, hint: impl Into<String>) {
+    PARSE_SOFTS.with(|s| s.borrow_mut().push((name.into(), detail, hint.into())));
+}
+
+fn parse_package_items_until_end(p: &mut P, env: &mut TypeEnv) -> Result<(), String> {
+    while p.peek().is_some() {
+        if p.eat("end") {
+            let _ = p.eat("package");
+            let _ = p.eat("body");
+            let _ = p.eat_ident();
+            let _ = p.eat(";");
+fn parse_arch(p: &mut P, entities: &[Entity], base_env: &TypeEnv) -> Result<Arch, String> {
+    let _aname = p.ident()?;
+    let _ = p.eat("of");
+    let of = p.ident().unwrap_or_default();
+    let _ = p.eat("is");
+    let mut env = base_env.clone();
+    if let Some(e) = entities
+        .iter()
+        .rev()
+        .find(|e| e.name.eq_ignore_ascii_case(&of))
+    {
+        for (k, v) in &e.generics {
+            env.consts.insert(k.clone(), *v);
+        }
+        for (k, v) in &e.consts {
+            env.consts.insert(k.clone(), *v);
+        }
+        for (rk, rv) in &e.rec_vars {
+            env.rec_vars.insert(rk.clone(), rv.clone());
+        }
+        for (bk, bv) in &e.bounds {
+            env.bounds.insert(bk.clone(), *bv);
+        }
+    }
+    let mut arch_consts = HashMap::new();
+    let mut signals = Vec::new();
+    let mut components = Vec::new();
+    while !p.eat("begin") {
+        if p.peek().is_none() {
+            break;
+        }
+        if p.eat("constant") {
+            parse_constant_into_env(p, env, true);
+        } else if p.eat("type") {
+            parse_type_decl(p, env);
+        } else if p.eat("subtype") {
+            parse_subtype_decl(p, env);
+        if p.eat("signal") || p.eat("variable") || p.eat("shared") {
+            let _ = p.eat("variable");
+            parse_signal_list(p, &mut signals, &mut env)?;
+        } else if p.eat("constant") {
+            if let Some((n, v)) = parse_constant_into_env(p, &mut env, false) {
+                arch_consts.insert(n, v);
+            }
+        } else if p.eat("component") {
+            let _ = parse_component(p, env);
+        } else if p.eat("package") {
+            let sub_body = p.eat("body");
+            let _ = parse_package(p, env, sub_body);
+            if let Ok(c) = parse_component(p, &mut env) {
+                components.push(c);
+            }
+        } else if p.eat("type") {
+            parse_type_decl(p, &mut env);
+        } else if p.eat("subtype") {
+            parse_subtype_decl(p, &mut env);
+        } else if p.eat("view") {
+            parse_view_decl(p, &mut env);
+        } else if p.eat("package") {
+            let is_b = p.eat("body");
+            let _ = parse_package(p, &mut env, is_b);
+        } else if p.eat("default") {
+            parse_psl_default_clock(p, &mut env);
+        } else if p.eat("attribute") || p.eat("alias") || p.eat("use") || p.eat("library") {
+            eat_decl_item(p);
+        } else if p.eat("function") || p.eat("procedure") || p.eat("impure") || p.eat("pure") {
+            let _ = p.eat("function");
+            let _ = p.eat("procedure");
+            parse_subprogram_or_proto(p, env);
+            let _ = p.eat("function");
+            let _ = p.eat("procedure");
+            parse_subprogram_or_proto(p, &mut env);
+        } else {
+            eat_decl_item(p);
+        }
+    }
+    Ok(())
+    PARSE_SOFTS.with(|s| s.borrow_mut().clear());
+    let stmts = parse_concurrent_list(p, &mut env, &mut signals)?;
+    let parse_softs = PARSE_SOFTS.with(|s| s.borrow_mut().drain(..).collect());
+    let _ = p.eat("architecture");
+    let _ = p.eat_ident();
+    let _ = p.eat(";");
+    Ok(Arch {
+        of,
+        consts: arch_consts,
+        signals,
+        components,
+        stmts,
+        parse_softs,
+        env,
+    })
+}
+
+fn instantiate_generic_package(
+    inst_name: &str,
+    base_name: &str,
+    gmap: &[(String, i64)],
+    env: &mut TypeEnv,
+) {
+    let Some(tpl) = env.generic_pkgs.get(base_name).cloned() else {
+        return;
+    };
+    let mut inst_env = env.clone();
+    for (k, v) in &tpl.gen_defaults {
+        inst_env.consts.insert(k.clone(), *v);
+        inst_env.pkg_consts.insert(k.clone(), *v);
+    }
+    for (gk, gv) in gmap {
+        let resolved_k = if let Some(idx_s) = gk.strip_prefix('#') {
+            idx_s
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| tpl.gen_order.get(i))
+                .cloned()
+        } else {
+            tpl.gen_order
+                .iter()
+                .find(|k| k.eq_ignore_ascii_case(gk))
+                .cloned()
+                .or_else(|| Some(gk.clone()))
+        };
+        if let Some(rk) = resolved_k {
+            inst_env.consts.insert(rk.clone(), *gv);
+            inst_env.pkg_consts.insert(rk.clone(), *gv);
+            if !inst_name.is_empty() {
+                env.consts
+                    .insert(format!("{inst_name}__{}", rk.to_ascii_lowercase()), *gv);
+            }
+fn parse_generic_clause_ordered(
+    p: &mut P,
+    order: &mut Vec<String>,
+    generics: &mut HashMap<String, i64>,
+    env: &TypeEnv,
+) -> Result<(), String> {
+    let _ = p.eat("(");
+    let mut fold = env.consts.clone();
+    loop {
+        if p.eat(")") {
+            break;
+        }
+    }
+    if !tpl.header_toks.is_empty() {
+        let mut hp = P {
+            t: &tpl.header_toks,
+            i: 0,
+        };
+        let _ = parse_package_items_until_end(&mut hp, &mut inst_env);
+    }
+    if !tpl.body_toks.is_empty() {
+        let mut bp = P {
+            t: &tpl.body_toks,
+            i: 0,
+        };
+        let _ = parse_package_items_until_end(&mut bp, &mut inst_env);
+    }
+    for (k, v) in inst_env.consts {
+        env.consts.insert(k.clone(), v);
+        if !inst_name.is_empty() {
+            env.consts
+                .insert(format!("{inst_name}__{}", k.to_ascii_lowercase()), v);
+        }
+    }
+    for (k, v) in inst_env.pkg_consts {
+        env.pkg_consts.insert(k, v);
+    }
+    for (k, v) in inst_env.subtypes {
+        env.subtypes.insert(k.clone(), v.clone());
+        if !inst_name.is_empty() {
+            env.subtypes
+                .insert(format!("{inst_name}__{}", k.to_ascii_lowercase()), v);
+        let _ = p.eat("constant");
+        let mut names = vec![p.ident()?];
+        while p.eat(",") {
+            names.push(p.ident()?);
+        }
+    }
+    for (k, v) in inst_env.type_bounds {
+        env.type_bounds.insert(k.clone(), v);
+        if !inst_name.is_empty() {
+            env.type_bounds
+                .insert(format!("{inst_name}__{}", k.to_ascii_lowercase()), v);
+        let _ = p.eat(":");
+        skip_type_tokens(p);
+        let mut val = 0i64;
+        if p.peek_sym(":=") {
+            let save = p.i;
+            p.eat(":=");
+            val = parse_int_expr_with(p, &fold).unwrap_or(0);
+            p.i = save;
+            skip_init(p);
+        }
+    }
+    for (k, v) in inst_env.records {
+        env.records.insert(k.clone(), v.clone());
+        if !inst_name.is_empty() {
+            env.records
+                .insert(format!("{inst_name}__{}", k.to_ascii_lowercase()), v);
+        for n in names {
+            order.push(n.clone());
+            fold.insert(n.clone(), val);
+            generics.insert(n, val);
+        }
+    }
+    for (k, v) in inst_env.unconstrained_arrays {
+        env.unconstrained_arrays.insert(k.clone(), v.clone());
+        if !inst_name.is_empty() {
+            env.unconstrained_arrays
+                .insert(format!("{inst_name}__{}", k.to_ascii_lowercase()), v);
+        }
+    let _ = p.eat(";");
+    Ok(())
+}
+
+fn parse_port_clause(
+    p: &mut P,
+    env: &mut TypeEnv,
+) -> Result<
+    (
+        Vec<(String, &'static str, usize)>,
+        Vec<(String, &'static str, VType)>,
+    ),
+    String,
+> {
+    let empty_pov = HashMap::new();
+    let empty_bov = HashMap::new();
+    parse_port_clause_with_overrides(p, env, &empty_pov, &empty_bov)
+}
+
+fn parse_port_clause_with_overrides(
+    p: &mut P,
+    env: &mut TypeEnv,
+    port_overrides: &HashMap<String, VType>,
+    bound_overrides: &HashMap<String, (i64, i64)>,
+) -> Result<
+    (
+        Vec<(String, &'static str, usize)>,
+        Vec<(String, &'static str, VType)>,
+    ),
+    String,
+> {
+    if !p.eat("(") {
+        return Err("port (".into());
+    }
+    for (k, v) in inst_env.funcs {
+        env.funcs.insert(k.clone(), v.clone());
+        if !inst_name.is_empty() {
+            env.funcs
+                .insert(format!("{inst_name}__{}", k.to_ascii_lowercase()), v);
+    let mut ports = Vec::new();
+    let mut raw_ports = Vec::new();
+    loop {
+        if p.eat(")") {
+            break;
+        }
+    }
+    for (k, v) in inst_env.rec_consts {
+        env.rec_consts.insert(k.clone(), v.clone());
+        if !inst_name.is_empty() {
+            env.rec_consts
+                .insert(format!("{inst_name}__{}", k.to_ascii_lowercase()), v);
+        }
+    }
+}
+
+fn parse_type_decl(p: &mut P, env: &mut TypeEnv) {
+    let Ok(tname) = p.ident() else {
+        eat_to_semi(p);
+        return;
+    };
+    let tkey = tname.to_ascii_lowercase();
+    if !p.eat("is") {
+        eat_to_semi(p);
+        return;
+    }
+    if p.eat("record") {
+        let mut fields = Vec::new();
+        let mut guard = 0usize;
+        while p.peek().is_some() && guard < 4096 {
+            guard += 1;
+            if p.eat("end") {
+                let _ = p.eat("record");
+                let _ = p.eat_ident();
+                let _ = p.eat(";");
+                break;
+            }
+            let Some(f0) = p.eat_name() else {
+                if !p.eat(";") {
+                    p.bump();
+                }
+                continue;
+            };
+            let mut fnames = vec![f0];
+            while p.eat(",") {
+                if let Some(fnm) = p.eat_name() {
+                    fnames.push(fnm);
+                }
+            }
+            let _ = p.eat(":");
+            let (fty, _bnds) = parse_vtype_with_bounds(p, env);
+            skip_init(p);
+        let _ = p.eat("signal");
+        let Some(n0) = p.eat_name() else {
+            let _ = p.eat(";");
+            for fnm in fnames {
+                fields.push(RecordField {
+                    name: fnm,
+                    ty: fty.clone(),
+                });
+            }
+        }
+        env.records.insert(tkey, RecordDef { fields });
+        return;
+    }
+    if p.eat("(") {
+        let mut elems = Vec::new();
+        while !p.eat(")") && p.peek().is_some() {
+            if let Ok(el) = p.ident() {
+                elems.push(el);
+            } else {
+                p.bump();
+            }
+            let _ = p.eat(",");
+        }
+        let _ = p.eat(";");
+        let n = elems.len();
+        let w = if n <= 1 {
+            1
+        let _ = p.eat(":");
+        if p.eat("view") {
+            let paren = p.eat("(");
+            let mut vname = p.ident().unwrap_or_default();
+            let mut qual_pkg: Option<String> = None;
+            while p.eat(".") {
+                if let Ok(sub) = p.ident() {
+                    qual_pkg = Some(vname.to_ascii_lowercase());
+                    vname = sub;
+                }
+            }
+            let mut converse = false;
+            if p.eat("'") {
+                if let Ok(attr) = p.ident() {
+                    if attr.eq_ignore_ascii_case("converse") {
+                        converse = true;
+                    }
+                }
+            }
+            if paren {
+                let _ = p.eat(")");
+            }
+            if p.eat("of") {
+                let _ = parse_vtype(p, env);
+            }
+            skip_init(p);
+            let vkey = if let Some(pk) = &qual_pkg {
+                let qk = format!("{pk}__{}", vname.to_ascii_lowercase());
+                if env.views.contains_key(&qk) {
+                    qk
+                } else {
+                    vname.to_ascii_lowercase()
+                }
+            } else {
+                vname.to_ascii_lowercase()
+            };
+            if let Some(vdef) = env.get_view(&vkey).cloned() {
+                for n in names {
+                    env.register_rec_var(&n, &vdef.record_type, 0);
+                    raw_ports.push((n.clone(), "view", VType::Record(vdef.record_type.clone())));
+                    for (leaf_full, _suf, ldir, lw) in
+                        env.flatten_view_leaves(&vkey, converse, &n, "", 0)
+                    {
+                        ports.push((leaf_full, ldir, lw.max(1)));
+                    }
+                }
+            }
+            let _ = p.eat(";");
+            continue;
+        }
+        let dir = if p.eat("in") {
+            "input"
+        } else if p.eat("out") {
+            "output"
+        } else if p.eat("inout") || p.eat("buffer") {
+            "output"
+        } else if p.eat("linkage") {
+            "input"
+        } else {
+            (usize::BITS - (n - 1).leading_zeros()) as usize
+        };
+        for (idx, el) in elems.into_iter().enumerate() {
+            env.consts.entry(el).or_insert(idx as i64);
+        let (parsed_vty, parsed_bnds) = parse_vtype_with_bounds(p, env);
+        skip_init(p);
+        for n in names {
+            let nkey = n.to_ascii_lowercase();
+            let mut vty = port_overrides
+                .get(&nkey)
+                .cloned()
+                .unwrap_or_else(|| parsed_vty.clone());
+            if let VType::UnconstrainedArray(uarr) = &vty {
+                let elem_ty = env
+                    .unconstrained_arrays
+                    .get(&uarr.to_ascii_lowercase())
+                    .cloned()
+                    .unwrap_or(VType::Scalar(8));
+                let rkey = env.make_constrained_array_record(uarr, 0, 1, &elem_ty);
+                vty = VType::Record(rkey);
+            }
+            if let Some(&bnds) = bound_overrides.get(&nkey).or(parsed_bnds.as_ref()) {
+                env.bounds.insert(nkey, bnds);
+            }
+            raw_ports.push((n.clone(), dir, vty.clone()));
+            match &vty {
+                VType::Scalar(w) => ports.push((n, dir, (*w).max(1))),
+                VType::Record(rname) => {
+                    env.register_rec_var(&n, rname, 0);
+                    for (leaf_full, _suf, lw) in env.flatten_record_leaves(rname, &n, "", 0) {
+                        ports.push((leaf_full, dir, lw.max(1)));
+                    }
+                }
+                VType::UnconstrainedArray(_) => ports.push((n, dir, 1)),
+            }
+        }
+        env.subtypes.insert(tkey, VType::Scalar(w.max(1)));
+        return;
+        let _ = p.eat(";");
+    }
+    let _ = p.eat(";");
+    Ok((ports, raw_ports))
+}
+
+fn parse_component(p: &mut P, env: &mut TypeEnv) -> Result<Entity, String> {
+    let name = p.ident()?;
+    let _ = p.eat("is");
+    let mut comp_env = env.clone();
+    let mut generic_order = Vec::new();
+    let mut generics = HashMap::new();
+    if p.eat("generic") {
+        parse_generic_clause_ordered(p, &mut generic_order, &mut generics, &comp_env)?;
+        for (k, v) in &generics {
+            comp_env.consts.insert(k.clone(), *v);
+        }
+    }
+    if p.eat("array") {
+        let mut constrained_range: Option<(i64, i64)> = None;
+        if p.eat("(") {
+            if let Some(a) = parse_int_expr_peek(p, &env.consts) {
+                if p.eat("downto") || p.eat("to") {
+                    if let Some(b) = parse_int_expr_with(p, &env.consts) {
+                        constrained_range = Some((a.min(b), a.max(b)));
+                    }
+                }
+            }
+            skip_paren_rest(p);
+        }
+        let _ = p.eat("of");
+        let (elem_ty, _ebnds) = parse_vtype_with_bounds(p, env);
+        let _ = p.eat(";");
+        if let Some((lo, hi)) = constrained_range {
+            let rec_key = env.make_constrained_array_record(&tkey, lo, hi, &elem_ty);
+            if let Some(def) = env.records.get(&rec_key).cloned() {
+                env.records.insert(tkey.clone(), def);
+            }
+            env.subtypes.insert(tkey, VType::Record(rec_key));
+        } else {
+            env.unconstrained_arrays.insert(tkey.clone(), elem_ty);
+            env.subtypes.insert(tkey.clone(), VType::UnconstrainedArray(tkey));
+        }
+        return;
+    let mut ports = Vec::new();
+    let mut raw_ports = Vec::new();
+    if p.eat("port") {
+        let (flat, raw) = parse_port_clause(p, &mut comp_env)?;
+        ports = flat;
+        raw_ports = raw;
+    }
+    if p.eat("range") {
+        let a = parse_int_expr_with(p, &env.consts).unwrap_or(31);
+        let _ = p.eat("to");
+        let _ = p.eat("downto");
+        let b = parse_int_expr_with(p, &env.consts).unwrap_or(0);
+        if p.eat("units") {
+            skip_to_end_unit(p, "units");
+        } else {
+            eat_to_semi(p);
+        }
+        let span = (a.abs_diff(b) as usize) + 1;
+        let w = if span <= 1 {
+            1
+        } else {
+            (usize::BITS - (span - 1).leading_zeros()) as usize
+        };
+        env.subtypes.insert(tkey, VType::Scalar(w.max(1)));
+        return;
+    skip_to_end_unit(p, "component");
+    Ok(Entity {
+        name,
+        generic_order,
+        generics,
+        consts: HashMap::new(),
+        ports,
+        raw_ports,
+        rec_vars: comp_env.rec_vars,
+        bounds: comp_env.bounds,
+    })
+}
+
+fn push_unique_signal(signals: &mut Vec<(String, usize)>, name: String, width: usize) {
+    if !signals.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+        signals.push((name, width.max(1)));
+    }
+}
+
+fn parse_signal_list(
+    p: &mut P,
+    signals: &mut Vec<(String, usize)>,
+    env: &mut TypeEnv,
+) -> Result<(), String> {
+    let mut names = vec![p.ident()?];
+    while p.eat(",") {
+        names.push(p.ident()?);
+    }
+    let (ty, bnds) = parse_vtype_with_bounds(p, env);
+    eat_to_semi(p);
+    if let Some(b) = bnds {
+        env.type_bounds.insert(tkey.clone(), b);
+    let _ = p.eat(":");
+    let (mut vty, bnds) = parse_vtype_with_bounds(p, env);
+    if let VType::UnconstrainedArray(uarr) = &vty {
+        let elem_ty = env
+            .unconstrained_arrays
+            .get(&uarr.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or(VType::Scalar(8));
+        let rkey = env.make_constrained_array_record(uarr, 0, 1, &elem_ty);
+        vty = VType::Record(rkey);
+    }
+    skip_init(p);
+    let _ = p.eat(";");
+    for n in names {
+        if let Some(b) = bnds {
+            env.bounds.insert(n.to_ascii_lowercase(), b);
+        }
+        match &vty {
+            VType::Scalar(w) => push_unique_signal(signals, n, *w),
+            VType::Record(rname) => {
+                env.register_rec_var(&n, rname, 0);
+                for (leaf_full, _suf, lw) in env.flatten_record_leaves(rname, &n, "", 0) {
+                    push_unique_signal(signals, leaf_full, lw);
+                }
+            }
+            VType::UnconstrainedArray(_) => push_unique_signal(signals, n, 1),
+        }
+    }
+    env.subtypes.insert(tkey, ty);
+}
+
+fn parse_subtype_decl(p: &mut P, env: &mut TypeEnv) {
+    let Ok(sname) = p.ident() else {
+        eat_to_semi(p);
+        return;
+    };
+    let skey = sname.to_ascii_lowercase();
+    let _ = p.eat("is");
+    let (ty, bnds) = parse_vtype_with_bounds(p, env);
+fn parse_constant_into_env(
+    p: &mut P,
+    env: &mut TypeEnv,
+    is_pkg: bool,
+) -> Option<(String, i64)> {
+    let Ok(n) = p.ident() else {
+        eat_to_semi(p);
+        return None;
+    };
+    let _ = p.eat(":");
+    let (vty, bnds) = parse_vtype_with_bounds(p, env);
+    if let Some(b) = bnds {
+        env.bounds.insert(n.to_ascii_lowercase(), b);
+    }
+    if let VType::Record(rname) = &vty {
+        if p.eat(":=") {
+            if let Ok(pairs) = parse_record_rhs(p, rname, env) {
+                let map: HashMap<String, String> = pairs.into_iter().collect();
+                env.rec_consts.insert(n.to_ascii_lowercase(), map);
+            }
+        }
+        eat_to_semi(p);
+        return None;
+    }
+    let mut v = 0i64;
+    if p.eat(":=") {
+        let save = p.i;
+        if let Some(iv) = parse_int_expr_with(p, &env.consts) {
+            v = iv;
+        } else {
+            p.i = save;
+            if let Some(Tok::BitStr(bits)) = p.peek() {
+                let clean = bits.replace('-', "0");
+                v = i64::from_str_radix(&clean, 2).unwrap_or(0);
+                p.i += 1;
+            }
+        }
+    }
+    eat_to_semi(p);
+    if let Some(b) = bnds {
+        env.type_bounds.insert(skey.clone(), b);
+    }
+    env.subtypes.insert(skey, ty);
+    env.consts.insert(n.clone(), v);
+    if is_pkg {
+        env.pkg_consts.insert(n.clone(), v);
+    }
+    Some((n, v))
+}
+
+fn parse_constant(p: &mut P, env: &mut TypeEnv) -> Result<(String, i64), String> {
+    parse_constant_into_env(p, env, false).ok_or_else(|| "constant".into())
+}
+
+fn parse_subprogram_or_proto(p: &mut P, env: &mut TypeEnv) {
+    let fname = p.ident().unwrap_or_default();
+    let fkey = fname.to_ascii_lowercase();
+    if p.eat("is") && p.eat("new") {
+        let mut base = p.ident().unwrap_or_default();
+        while p.eat(".") {
+            if let Ok(sub) = p.ident() {
+                base = sub;
+            }
+fn parse_concurrent_list(
+    p: &mut P,
+    env: &mut TypeEnv,
+    signals: &mut Vec<(String, usize)>,
+) -> Result<Vec<CStmt>, String> {
+    let mut out = Vec::new();
+    loop {
+        if p.peek().is_none() {
+            break;
+        }
+        if p.eat("end") {
+            break;
+        }
+        let gmap = parse_generic_map_values(p, env);
+        eat_to_semi(p);
+        if let Some(base_fn) = env.funcs.get(&base.to_ascii_lowercase()).cloned() {
+            let mut subst_map = HashMap::new();
+            for (k, v) in &base_fn.gen_params {
+                subst_map.insert(k.clone(), v.to_string());
+            }
+            for (gk, gv) in &gmap {
+                let resolved = if let Some(idx_s) = gk.strip_prefix('#') {
+                    idx_s
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| base_fn.gen_params.get(i).map(|(n, _)| n.clone()))
+        match parse_concurrent_many(p, env, signals) {
+            Ok(stmts) => out.extend(stmts),
+            Err(_) => {
+                if let Some(s) = recover_assign(p, env) {
+                    out.push(s);
                 } else {
                     Some(gk.clone())
                 };
@@ -3595,6 +5598,7 @@ fn parse_qualified_ident_or_expr(p: &mut P, env: &TypeEnv) -> Result<String, Str
 }
 
 fn parse_record_aggregate(
+fn parse_concurrent_many(
     p: &mut P,
     rec_type: &str,
     env: &TypeEnv,
@@ -3602,6 +5606,22 @@ fn parse_record_aggregate(
 ) -> Result<Vec<(String, String)>, String> {
     if depth > 16 || !p.eat("(") {
         return Err("record aggregate (".into());
+    env: &mut TypeEnv,
+    signals: &mut Vec<(String, usize)>,
+) -> Result<Vec<CStmt>, String> {
+    if p.eat("default") {
+        parse_psl_default_clock(p, env);
+        return Ok(Vec::new());
+    }
+    if p.eat("assert") {
+        return Ok(parse_psl_assert(p, None, env).into_iter().collect());
+    }
+    if p.eat("cover") {
+        return Ok(parse_psl_cover(p, None, env).into_iter().collect());
+    }
+    if p.eat("report") || p.eat("severity") {
+        eat_to_semi(p);
+        return Ok(Vec::new());
     }
     let Some(def) = env.get_record(rec_type).cloned() else {
         skip_paren_rest(p);
@@ -3771,6 +5791,588 @@ fn peek_aggregate_fill_bit(p: &mut P) -> Option<char> {
     if matches!(p.peek(), Some(Tok::Ident(_)) | Some(Tok::Kw(_))) {
         let lab = p.ident()?;
         if p.eat(":") {
+            if p.eat("process") {
+                return Ok(vec![parse_process(p, env, signals)?]);
+            }
+            if p.eat("for") {
+                return Ok(parse_for_generate(p, env, signals)?.into_iter().collect());
+            }
+            if p.eat("if") {
+                return Ok(parse_if_generate(p, env, signals)?.into_iter().collect());
+            }
+            if p.eat("entity") {
+                let _ = p.eat_ident(); // work
+                let _ = p.eat(".");
+                let module = p.ident().unwrap_or_else(|_| lab.clone());
+                if p.eat("(") {
+                    skip_paren_rest(p);
+                }
+                let generic_map = parse_generic_map_values(p, env);
+                let conns = parse_port_map(p, env)?;
+                return Ok(vec![CStmt::Inst {
+                    module,
+                    name: lab,
+                    generic_map,
+                    conns,
+                }]);
+            }
+            if p.eat("component") {
+                let module = p.ident().unwrap_or_else(|_| lab.clone());
+                let generic_map = parse_generic_map_values(p, env);
+                let conns = parse_port_map(p, env)?;
+                return Ok(vec![CStmt::Inst {
+                    module,
+                    name: lab,
+                    generic_map,
+                    conns,
+                }]);
+            }
+            if matches!(p.peek(), Some(Tok::Ident(_)) | Some(Tok::Kw(_))) {
+                let module = p.ident()?;
+                let generic_map = parse_generic_map_values(p, env);
+                if p.eat("port") || p.peek_sym("(") {
+                    let conns = parse_port_map(p, env)?;
+                    return Ok(vec![CStmt::Inst {
+                        module,
+                        name: lab,
+                        generic_map,
+                        conns,
+                    }]);
+                }
+            }
+        }
+    }
+    if parens == 0 {
+        return None;
+    // Concurrent assignment, possibly conditional, possibly whole-record or aggregate.
+    let lhs = parse_target_sv(p, env, signals)?;
+    if !p.eat("<=") {
+        p.i = save;
+        skip_stmt(p);
+        return Ok(Vec::new());
+    }
+    if let Some(rec_type) = env.resolve_rec_var(&lhs) {
+        let leaves = env.flatten_record_leaves(&rec_type, &lhs, "", 0);
+        let first_map: HashMap<String, String> =
+            parse_record_rhs(p, &rec_type, env)?.into_iter().collect();
+        if p.eat("when") {
+            let mut arms: Vec<(Option<String>, HashMap<String, String>)> = Vec::new();
+            let cond = parse_expr_sv(p, env)?;
+            arms.push((Some(cond), first_map));
+            while p.eat("else") {
+                let vmap: HashMap<String, String> =
+                    parse_record_rhs(p, &rec_type, env)?.into_iter().collect();
+                if p.eat("when") {
+                    let c = parse_expr_sv(p, env)?;
+                    arms.push((Some(c), vmap));
+                } else {
+                    arms.push((None, vmap));
+                    break;
+                }
+            }
+            let _ = p.eat(";");
+            let mut out = Vec::new();
+            for (leaf_lhs, suf, _w) in leaves {
+                let leaf_arms: Vec<(Option<String>, String)> = arms
+                    .iter()
+                    .map(|(c, m)| {
+                        (
+                            c.clone(),
+                            m.get(&suf).cloned().unwrap_or_else(|| "1'b0".into()),
+                        )
+                    })
+                    .collect();
+                out.push(CStmt::CondAssign {
+                    lhs: leaf_lhs,
+                    arms: leaf_arms,
+                });
+            }
+            return Ok(out);
+        }
+        skip_after_delay(p);
+        let _ = p.eat(";");
+        let mut out = Vec::new();
+        for (leaf_lhs, suf, _w) in leaves {
+            let rhs = first_map.get(&suf).cloned().unwrap_or_else(|| "1'b0".into());
+            out.push(CStmt::Assign { lhs: leaf_lhs, rhs });
+    if p.eat("with") {
+        let sel = parse_expr_sv(p, env)?;
+        let _ = p.eat("select");
+        let is_match_sel = p.eat("?");
+        let lhs = parse_target_sv(p, env, signals)?;
+        if !p.eat("<=") {
+            return Err("select <=".into());
+        }
+        return Ok(out);
+    }
+    let bit = match p.peek() {
+        Some(Tok::BitStr(s)) if s == "1" => {
+            p.i += 1;
+            '1'
+        }
+        Some(Tok::BitStr(s)) if s == "0" => {
+            p.i += 1;
+            '0'
+        }
+        Some(Tok::Num(0)) => {
+            p.i += 1;
+            '0'
+        }
+        Some(Tok::Num(1)) => {
+            p.i += 1;
+            '1'
+        }
+        _ => {
+            p.i = save;
+            return None;
+        }
+    };
+    for _ in 0..parens {
+        if !p.eat(")") {
+            p.i = save;
+            return None;
+    let first = parse_expr_sv(p, env)?;
+    if p.eat("when") {
+        if let Some(rec_type) = env.resolve_rec_var(&lhs) {
+            let leaves = env.flatten_record_leaves(&rec_type, &lhs, "", 0);
+            let mut arms: Vec<(String, HashMap<String, String>)> = Vec::new();
+            let mut other: Option<HashMap<String, String>> = None;
+            loop {
+                let val_map: HashMap<String, String> =
+                    parse_record_rhs(p, &rec_type, env)?.into_iter().collect();
+                let _ = p.eat("when");
+                if p.eat("others") {
+                    other = Some(val_map);
+                    let _ = p.eat(";");
+                    break;
+                }
+                let pat = parse_expr_sv(p, env)?;
+                arms.push((pat, val_map));
+                if p.eat(";") {
+                    break;
+                }
+                let _ = p.eat(",");
+            }
+            let mut out = Vec::new();
+            for (leaf_lhs, suf, _w) in leaves {
+                let leaf_arms: Vec<(String, String)> = arms
+                    .iter()
+                    .map(|(pat, m)| {
+                        (
+                            pat.clone(),
+                            m.get(&suf).cloned().unwrap_or_else(|| "1'b0".into()),
+                        )
+                    })
+                    .collect();
+                let leaf_other = other.as_ref().and_then(|m| m.get(&suf).cloned());
+                out.push(CStmt::Selected {
+                    sel: sel.clone(),
+                    lhs: leaf_lhs,
+                    arms: leaf_arms,
+                    other: leaf_other,
+                });
+            }
+            return Ok(out);
+        }
+        if is_match_sel {
+            let mut cond_arms: Vec<(Option<String>, String)> = Vec::new();
+            loop {
+                let val = parse_expr_sv(p, env)?;
+                let _ = p.eat("when");
+                if p.eat("others") {
+                    cond_arms.push((None, val));
+                    let _ = p.eat(";");
+                    break;
+                }
+                let mut pat_conds = vec![parse_match_pat_cond(p, &sel, env)?];
+                while p.eat("|") {
+                    pat_conds.push(parse_match_pat_cond(p, &sel, env)?);
+                }
+                let cond = if pat_conds.len() == 1 {
+                    pat_conds.remove(0)
+                } else {
+                    format!("({})", pat_conds.join(" | "))
+                };
+                cond_arms.push((Some(cond), val));
+                if p.eat(";") {
+                    break;
+                }
+                let _ = p.eat(",");
+            }
+            return Ok(vec![CStmt::CondAssign {
+                lhs,
+                arms: cond_arms,
+            }]);
+        }
+        let mut arms = Vec::new();
+        let cond = parse_expr_sv(p, env)?;
+        arms.push((Some(cond), first));
+        while p.eat("else") {
+            let v = parse_expr_sv(p, env)?;
+            if p.eat("when") {
+                let c = parse_expr_sv(p, env)?;
+                arms.push((Some(c), v));
+            } else {
+                arms.push((None, v));
+        let mut other = None;
+        loop {
+            let val = parse_expr_sv(p, env)?;
+            let _ = p.eat("when");
+            if p.eat("others") {
+                other = Some(val);
+                let _ = p.eat(";");
+                break;
+            }
+        }
+        let _ = p.eat(";");
+        return Ok(vec![CStmt::CondAssign { lhs, arms }]);
+    }
+    Some(bit)
+}
+
+fn fill_bits_literal(width: usize, bit: char) -> String {
+    let w = width.max(1);
+    let b = if bit == '1' { '1' } else { '0' };
+    let bits: String = std::iter::repeat(b).take(w).collect();
+    format!("{w}'b{bits}")
+    skip_after_delay(p);
+    let _ = p.eat(";");
+    Ok(vec![CStmt::Assign { lhs, rhs: first }])
+}
+
+fn parse_record_rhs(
+    p: &mut P,
+    rec_type: &str,
+    env: &TypeEnv,
+) -> Result<Vec<(String, String)>, String> {
+    if p.peek_sym("(") {
+        return parse_record_aggregate(p, rec_type, env, 0);
+    }
+    let rhs_name = parse_qualified_ident_or_expr(p, env)?;
+    if let Some(cmap) = env.rec_consts.get(&rhs_name.to_ascii_lowercase()) {
+        let leaves = env.flatten_record_leaves(rec_type, "", "", 0);
+        return Ok(leaves
+            .into_iter()
+            .map(|(_full, suf, _w)| {
+                let v = cmap.get(&suf).cloned().unwrap_or_else(|| "1'b0".into());
+                (suf, v)
+            })
+            .collect());
+    }
+    if let Some((fname, args)) = rhs_name.strip_prefix("__func_call:").and_then(|s| s.split_once(':')) {
+        if let Some(fdef) = env.funcs.get(&fname.to_ascii_lowercase()) {
+            if !fdef.leaf_exprs.is_empty() {
+                let arg_list: Vec<&str> = if args.is_empty() {
+                    Vec::new()
+                } else {
+                    args.split("\x1f").collect()
+                };
+                let mut param_map = HashMap::new();
+                for (param, arg) in fdef.params.iter().zip(arg_list.iter()) {
+                    param_map.insert(param.clone(), (*arg).to_string());
+                }
+                let leaves = env.flatten_record_leaves(rec_type, "", "", 0);
+                return Ok(leaves
+                    .into_iter()
+                    .map(|(_full, suf, _w)| {
+                        let raw = fdef.leaf_exprs.get(&suf).cloned().unwrap_or_else(|| "1'b0".into());
+                        (suf, replace_word_map(&raw, &param_map))
+                    })
+                    .collect());
+            }
+        }
+    }
+    let leaves = env.flatten_record_leaves(rec_type, "", "", 0);
+    Ok(leaves
+        .into_iter()
+        .map(|(_full, suf, _w)| (suf.clone(), format!("{rhs_name}_{suf}")))
+        .collect())
+}
+
+fn parse_qualified_ident_or_expr(p: &mut P, env: &TypeEnv) -> Result<String, String> {
+    if matches!(p.peek(), Some(Tok::Ident(_)) | Some(Tok::Kw(_))) {
+        let mut n = p.ident()?;
+        let mut qual_pkg: Option<String> = None;
+        while p.eat(".") {
+            let f = p.ident()?;
+            if env.pkg_names.contains(&n.to_ascii_lowercase()) {
+                qual_pkg = Some(n.to_ascii_lowercase());
+                n = f;
+            } else {
+                n = format!("{n}_{f}");
+            }
+        }
+        while p.peek_sym("(") {
+            let is_arr = env
+                .resolve_rec_var(&n)
+                .map(|r| env.is_array_record(&r))
+                .unwrap_or(false);
+            if !is_arr {
+            let pat = parse_expr_sv(p, env)?;
+            arms.push((pat, val));
+            if p.eat(";") {
+                break;
+            }
+            let save = p.i;
+            p.eat("(");
+            if let Some(idx) = parse_int_expr_with(p, &env.consts) {
+                if p.eat(")") {
+                    let idx_s = idx.to_string().replace('-', "m");
+                    n = format!("{n}_{idx_s}");
+                    while p.eat(".") {
+                        if let Ok(f) = p.ident() {
+                            n = format!("{n}_{f}");
+                        }
+                    }
+                    continue;
+                }
+            }
+            p.i = save;
+            break;
+        }
+        if p.eat("(") {
+            let mut args = Vec::new();
+            if !p.eat(")") {
+                loop {
+                    args.push(parse_expr_sv(p, env).unwrap_or_else(|_| "1'b0".into()));
+                    if !p.eat(",") {
+                        break;
+                    }
+                }
+                let _ = p.eat(")");
+            }
+            let fk = if let Some(pk) = &qual_pkg {
+                let qk = format!("{pk}__{}", n.to_ascii_lowercase());
+                if env.funcs.contains_key(&qk) {
+                    qk
+                } else {
+                    n.to_ascii_lowercase()
+                }
+            } else {
+                n.to_ascii_lowercase()
+            };
+            if env.funcs.contains_key(&fk) {
+                return Ok(format!("__func_call:{}:{}", fk, args.join("\x1f")));
+            }
+        }
+        if let Some(pk) = &qual_pkg {
+            let qk = format!("{pk}__{}", n.to_ascii_lowercase());
+            if env.rec_consts.contains_key(&qk) {
+                return Ok(qk);
+            }
+        }
+        return Ok(n);
+    }
+    parse_expr_sv(p, env)
+}
+
+fn parse_record_aggregate(
+    p: &mut P,
+    rec_type: &str,
+    env: &TypeEnv,
+    depth: usize,
+) -> Result<Vec<(String, String)>, String> {
+    if depth > 16 || !p.eat("(") {
+        return Err("record aggregate (".into());
+    }
+    let Some(def) = env.get_record(rec_type).cloned() else {
+        skip_paren_rest(p);
+        return Ok(Vec::new());
+    };
+    let mut result: HashMap<String, String> = HashMap::new();
+    let mut others_bit: Option<char> = None;
+    let mut others_expr: Option<String> = None;
+    let mut pos_idx = 0usize;
+    while !p.eat(")") && p.peek().is_some() {
+        if p.eat("others") {
+            let _ = p.eat("=>");
+            if let Some(ch) = peek_aggregate_fill_bit(p) {
+                others_bit = Some(ch);
+            } else {
+                others_expr = Some(parse_expr_sv(p, env).unwrap_or_else(|_| "1'b0".into()));
+            }
+            let _ = p.eat(",");
+            continue;
+        }
+        // Check if named association: `field1 [| field2 ...] => val` or `0 [| 1 ...] => val`
+        let save = p.i;
+        let mut choices = Vec::new();
+        let mut is_named = false;
+        if let Some(c_int) = parse_int_expr_peek(p, &env.consts) {
+            choices.push(c_int.to_string());
+            while p.eat("|") {
+                if let Some(cn_int) = parse_int_expr_peek(p, &env.consts) {
+                    choices.push(cn_int.to_string());
+                } else {
+                    break;
+                }
+            }
+            if p.eat("=>") {
+                is_named = true;
+            }
+        } else if matches!(p.peek(), Some(Tok::Ident(_)) | Some(Tok::Kw(_))) {
+            if let Ok(c0) = p.ident() {
+                choices.push(c0);
+                while p.eat("|") {
+                    if let Ok(cn) = p.ident() {
+                        choices.push(cn);
+                    } else {
+                        break;
+                    }
+                }
+                if p.eat("=>") {
+                    is_named = true;
+                }
+            }
+        }
+        if !is_named {
+            p.i = save;
+            choices.clear();
+            if let Some(f) = def.fields.get(pos_idx) {
+                choices.push(f.name.clone());
+                pos_idx += 1;
+            }
+        }
+        if choices.len() == 1 {
+            let fname = &choices[0];
+            if let Some(fdef) = def
+                .fields
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case(fname))
+            {
+                let fkey = fdef.name.replace('-', "m").to_ascii_lowercase();
+                match &fdef.ty {
+                    VType::Scalar(w) => {
+                        let val = parse_scalar_field_rhs(p, *w, env)?;
+                        result.insert(fkey, val);
+                    }
+                    VType::Record(sub_rec) => {
+                        if let Some(ch) = peek_aggregate_fill_bit(p) {
+                            for (_full, suf, lw) in
+                                env.flatten_record_leaves(sub_rec, "", &fkey, depth + 1)
+                            {
+                                result.insert(suf, fill_bits_literal(lw, ch));
+                            }
+                        } else {
+                            let sub_pairs = parse_record_rhs(p, sub_rec, env)?;
+                            for (sub_suf, sub_val) in sub_pairs {
+                                result.insert(format!("{fkey}_{sub_suf}"), sub_val);
+                            }
+                        }
+                    }
+                    VType::UnconstrainedArray(_) => {
+                        let val = parse_scalar_field_rhs(p, 1, env)?;
+                        result.insert(fkey, val);
+                    }
+                }
+            } else {
+                let _ = parse_expr_sv(p, env);
+            }
+        } else if !choices.is_empty() {
+            if let Some(ch) = peek_aggregate_fill_bit(p) {
+                for cname in &choices {
+                    if let Some(fdef) = def
+                        .fields
+                        .iter()
+                        .find(|f| f.name.eq_ignore_ascii_case(cname))
+                    {
+                        let fkey = fdef.name.replace('-', "m").to_ascii_lowercase();
+                        match &fdef.ty {
+                            VType::Scalar(w) => {
+                                result.insert(fkey, fill_bits_literal(*w, ch));
+                            }
+                            VType::Record(sub_rec) => {
+                                for (_full, suf, lw) in
+                                    env.flatten_record_leaves(sub_rec, "", &fkey, depth + 1)
+                                {
+                                    result.insert(suf, fill_bits_literal(lw, ch));
+                                }
+                            }
+                            VType::UnconstrainedArray(_) => {
+                                result.insert(fkey, fill_bits_literal(1, ch));
+                            }
+                        }
+                    }
+                }
+            } else {
+                let v = parse_expr_sv(p, env).unwrap_or_else(|_| "1'b0".into());
+                for cname in &choices {
+                    if let Some(fdef) = def
+                        .fields
+                        .iter()
+                        .find(|f| f.name.eq_ignore_ascii_case(cname))
+                    {
+                        result.insert(
+                            fdef.name.replace('-', "m").to_ascii_lowercase(),
+                            v.clone(),
+                        );
+                    }
+                }
+            }
+        } else {
+            let _ = parse_expr_sv(p, env);
+        }
+        if !p.eat(",") {
+            if p.eat(")") {
+                break;
+            }
+        }
+        return Ok(vec![CStmt::Selected {
+            sel,
+            lhs,
+            arms,
+            other,
+        }]);
+    }
+    let all_leaves = env.flatten_record_leaves(rec_type, "", "", 0);
+    let mut out = Vec::with_capacity(all_leaves.len());
+    for (_full, suf, lw) in all_leaves {
+        if let Some(v) = result.remove(&suf) {
+            out.push((suf, v));
+        } else if let Some(ch) = others_bit {
+            out.push((suf, fill_bits_literal(lw, ch)));
+        } else if let Some(e) = &others_expr {
+            out.push((suf, e.clone()));
+        } else {
+            out.push((suf, fill_bits_literal(lw, '0')));
+        }
+    if p.eat("process") {
+        return Ok(vec![parse_process(p, env, signals)?]);
+    }
+    if p.eat("for") {
+        return Ok(parse_for_generate(p, env, signals)?.into_iter().collect());
+    }
+    Ok(out)
+}
+
+fn parse_scalar_field_rhs(p: &mut P, width: usize, env: &TypeEnv) -> Result<String, String> {
+    if let Some(ch) = peek_aggregate_fill_bit(p) {
+        return Ok(fill_bits_literal(width, ch));
+    if p.eat("if") {
+        return Ok(parse_if_generate(p, env, signals)?.into_iter().collect());
+    }
+    parse_expr_sv(p, env)
+}
+
+/// Recognizes `'0'`, `'1'`, `(others => '0')`, `(others => '1')`, or nested
+/// `(others => (others => '0'))` and returns the fill bit `'0'` or `'1'`.
+fn peek_aggregate_fill_bit(p: &mut P) -> Option<char> {
+    let save = p.i;
+    let mut parens = 0usize;
+    while p.eat("(") {
+        parens += 1;
+        if !p.eat("others") || !p.eat("=>") {
+            p.i = save;
+            return None;
+    if matches!(p.peek(), Some(Tok::Ident(_)) | Some(Tok::Kw(_))) {
+        let lab = p.ident()?;
+        if p.eat(":") {
+            if p.eat("assert") {
+                return Ok(parse_psl_assert(p, Some(lab), env).into_iter().collect());
+            }
+            if p.eat("cover") {
+                return Ok(parse_psl_cover(p, Some(lab), env).into_iter().collect());
+            }
             if p.eat("process") {
                 return Ok(vec![parse_process(p, env, signals)?]);
             }
@@ -4567,6 +7169,8 @@ fn parse_seq_many(
         let sel = parse_expr_sv(p, env)?;
         let is_match_case = p.eat("?");
         let sel = parse_expr_sv(p, env)?;
+        let is_match_case = p.eat("?");
+        let sel = parse_expr_sv(p, env)?;
         let _ = p.eat("is");
         if is_match_case {
             let mut cond_arms: Vec<(String, Vec<SStmt>)> = Vec::new();
@@ -4657,10 +7261,54 @@ fn parse_seq_many(
                 if !p.eat("|") {
                     break;
                 }
+            let mut pats = Vec::new();
+            loop {
+                if let Some(Tok::BitStr(raw)) = p.peek() {
+                    if raw.contains('-') {
+                        saw_dont_care = true;
+                        let raw_c = raw.clone();
+                        p.i += 1;
+                        pats.push(format!("__dc:{raw_c}"));
+                    } else {
+                        pats.push(parse_expr_sv(p, env)?);
+                    }
+                } else {
+                    pats.push(parse_expr_sv(p, env)?);
+                }
+                if !p.eat("|") {
+                    break;
+                }
             }
             let _ = p.eat("=>");
             let body = parse_seq_list(p, env, signals)?;
             arms.push((pats, body));
+        }
+        return Ok(vec![SStmt::Case { sel, arms, other }]);
+        if saw_dont_care {
+            let mut acc = other;
+            for (pats, then_b) in arms.into_iter().rev() {
+                let conds: Vec<String> = pats
+                    .into_iter()
+                    .map(|pt| {
+                        if let Some(raw) = pt.strip_prefix("__dc:") {
+                            bitstr_match_cond(&sel, raw)
+                        } else {
+                            format!("(({sel}) == ({pt}))")
+                        }
+                    })
+                    .collect();
+                let cond = if conds.len() == 1 {
+                    conds[0].clone()
+                } else {
+                    format!("({})", conds.join(" | "))
+                };
+                acc = vec![SStmt::If {
+                    cond,
+                    then_b,
+                    else_b: acc,
+                }];
+            }
+            return Ok(acc);
         }
         return Ok(vec![SStmt::Case { sel, arms, other }]);
         if saw_dont_care {
@@ -4702,6 +7350,7 @@ fn parse_seq_many(
         let body = parse_seq_list(p, env, signals)?;
         let _ = p.eat("end");
         let hi = parse_int_expr_with(p, &env.consts).unwrap_or(lo);
+        let hi = parse_int_expr_with(p, &env.consts).unwrap_or(lo);
         let _ = p.eat("loop");
         let start = p.i;
         let mut depth = 1i32;
@@ -4724,6 +7373,31 @@ fn parse_seq_many(
         let _ = p.eat(";");
         let (lo, hi) = if downto { (hi, lo) } else { (lo, hi) };
         return Ok(vec![SStmt::For { var, lo, hi, body }]);
+        let (a, b) = if downto { (hi, lo) } else { (lo, hi) };
+        let step = if a <= b { 1i64 } else { -1 };
+        let mut i = a;
+        let mut n = 0usize;
+        let mut unrolled = Vec::new();
+        loop {
+            if n > 4096 {
+                break;
+            }
+            let mut lenv = env.clone();
+            lenv.consts.insert(var.clone(), i);
+            let mut bp = P {
+                t: &body_toks,
+                i: 0,
+            };
+            let mut stmts = parse_seq_list(&mut bp, &lenv, signals).unwrap_or_default();
+            subst_var(&mut stmts, &var, i);
+            unrolled.extend(stmts);
+            if i == b {
+                break;
+            }
+            i += step;
+            n += 1;
+        }
+        return Ok(unrolled);
         let (a, b) = if downto { (hi, lo) } else { (lo, hi) };
         let step = if a <= b { 1i64 } else { -1 };
         let mut i = a;
@@ -5126,6 +7800,40 @@ fn parse_target_sv(
         p.i = save;
         break;
     }
+    let mut n = p.ident()?;
+    while p.eat(".") {
+        let f = p.ident()?;
+        if env.pkg_names.contains(&n.to_ascii_lowercase()) {
+            n = f;
+        } else {
+            n = format!("{n}_{f}");
+        }
+    }
+    while p.peek_sym("(") {
+        let is_arr = env
+            .resolve_rec_var(&n)
+            .map(|r| env.is_array_record(&r))
+            .unwrap_or(false);
+        if !is_arr {
+            break;
+        }
+        let save = p.i;
+        p.eat("(");
+        if let Some(idx) = parse_int_expr_with(p, &env.consts) {
+            if p.eat(")") {
+                let idx_s = idx.to_string().replace('-', "m");
+                n = format!("{n}_{idx_s}");
+                while p.eat(".") {
+                    if let Ok(f) = p.ident() {
+                        n = format!("{n}_{f}");
+                    }
+                }
+                continue;
+            }
+        }
+        p.i = save;
+        break;
+    }
     if p.eat("(") {
         if let Some(a) = parse_int_expr_with(p, &env.consts) {
             if p.eat("downto") || p.eat("to") {
@@ -5152,6 +7860,8 @@ fn parse_target_sv(
     Ok(n)
 }
 
+fn parse_expr_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
+    parse_or_sv(p, env)
 fn parse_expr_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
     parse_or_sv(p, env)
 fn parse_expr_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
@@ -5325,6 +8035,90 @@ fn parse_rel_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
         } else {
             e = format!("({e} != {r})");
         }
+    }
+    Ok(e)
+}
+
+fn expand_record_cmp(lhs: &str, rhs: &str, eq: bool, env: &TypeEnv) -> Option<String> {
+    let l_trim = lhs.trim().trim_matches(|c| c == '(' || c == ')').trim();
+    let r_trim = rhs.trim().trim_matches(|c| c == '(' || c == ')').trim();
+    let rec_type = env
+        .resolve_rec_var(l_trim)
+        .or_else(|| env.resolve_rec_var(r_trim))?;
+    let leaves = env.flatten_record_leaves(&rec_type, "", "", 0);
+    if leaves.is_empty() {
+        return None;
+    }
+    let l_cmap = env.rec_consts.get(&l_trim.to_ascii_lowercase());
+    let r_cmap = env.rec_consts.get(&r_trim.to_ascii_lowercase());
+    let mut terms = Vec::with_capacity(leaves.len());
+    for (_full, suf, _w) in leaves {
+        let le = if let Some(m) = l_cmap {
+            m.get(&suf).cloned().unwrap_or_else(|| "1'b0".into())
+        } else {
+            format!("{l_trim}_{suf}")
+        };
+        let re = if let Some(m) = r_cmap {
+            m.get(&suf).cloned().unwrap_or_else(|| "1'b0".into())
+        } else {
+            format!("{r_trim}_{suf}")
+        };
+        if eq {
+            terms.push(format!("({le} == {re})"));
+        } else {
+            terms.push(format!("({le} != {re})"));
+        }
+    }
+    let sep = if eq { " & " } else { " | " };
+    Some(format!("({})", terms.join(sep)))
+}
+
+fn parse_rel_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
+    let mut e = parse_shift_sv(p, env)?;
+    if p.eat("?=") {
+        if let Some(Tok::BitStr(raw)) = p.peek() {
+            let raw = raw.clone();
+            p.i += 1;
+            return Ok(bitstr_match_cond(&e, &raw));
+        }
+        let r = parse_shift_sv(p, env)?;
+        return Ok(format!("({e} == {r})"));
+    } else if p.eat("?/=") {
+        if let Some(Tok::BitStr(raw)) = p.peek() {
+            let raw = raw.clone();
+            p.i += 1;
+            return Ok(format!("~({})", bitstr_match_cond(&e, &raw)));
+        }
+        let r = parse_shift_sv(p, env)?;
+        return Ok(format!("({e} != {r})"));
+    } else if p.eat("=") {
+        if let Some(Tok::BitStr(raw)) = p.peek() {
+            if raw.contains('-') {
+                let raw = raw.clone();
+                p.i += 1;
+                return Ok(bitstr_match_cond(&e, &raw));
+            }
+        }
+        let r = parse_shift_sv(p, env)?;
+        if let Some(cmp) = expand_record_cmp(&e, &r, true, env) {
+            e = cmp;
+        } else {
+            e = format!("({e} == {r})");
+        }
+    } else if p.eat("/=") {
+        if let Some(Tok::BitStr(raw)) = p.peek() {
+            if raw.contains('-') {
+                let raw = raw.clone();
+                p.i += 1;
+                return Ok(format!("~({})", bitstr_match_cond(&e, &raw)));
+            }
+        }
+        let r = parse_shift_sv(p, env)?;
+        if let Some(cmp) = expand_record_cmp(&e, &r, false, env) {
+            e = cmp;
+        } else {
+            e = format!("({e} != {r})");
+        }
     } else if p.eat("<=") {
         let r = parse_shift_sv(p, env)?;
         e = format!("({e} <= {r})");
@@ -5450,6 +8244,8 @@ fn parse_primary_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
         return Ok(format!("{w}'b{bits}"));
         let w = clean.len().max(1);
         return Ok(format!("{w}'b{clean}"));
+        let w = clean.len().max(1);
+        return Ok(format!("{w}'b{clean}"));
     }
     if let Some(n) = p.number() {
         return Ok(n.to_string());
@@ -5546,12 +8342,92 @@ fn parse_primary_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
             p.i = save;
             break;
         }
+        let mut n = p.ident()?;
+        let mut qual_pkg: Option<String> = None;
+        let mut rec_const_root: Option<String> = None;
+        let mut rec_const_suf = String::new();
+        if env.rec_consts.contains_key(&n.to_ascii_lowercase()) {
+            rec_const_root = Some(n.to_ascii_lowercase());
+        }
+        while p.eat(".") {
+            let f = p.ident()?;
+            if let Some(root) = &rec_const_root {
+                if rec_const_suf.is_empty() {
+                    rec_const_suf = f.to_ascii_lowercase();
+                } else {
+                    rec_const_suf = format!("{rec_const_suf}_{}", f.to_ascii_lowercase());
+                }
+                if let Some(val) = env.rec_consts.get(root).and_then(|m| m.get(&rec_const_suf)) {
+                    n = val.clone();
+                    rec_const_root = None;
+                } else {
+                    n = format!("{n}_{f}");
+                }
+            } else if env.pkg_names.contains(&n.to_ascii_lowercase()) {
+                qual_pkg = Some(n.to_ascii_lowercase());
+                n = f;
+                let qk = qual_pkg
+                    .as_ref()
+                    .map(|pk| format!("{pk}__{}", n.to_ascii_lowercase()))
+                    .unwrap_or_default();
+                if env.rec_consts.contains_key(&qk) {
+                    rec_const_root = Some(qk);
+                } else if env.rec_consts.contains_key(&n.to_ascii_lowercase()) {
+                    rec_const_root = Some(n.to_ascii_lowercase());
+                }
+            } else {
+                n = format!("{n}_{f}");
+            }
+        }
+        while p.peek_sym("(") {
+            let is_arr = env
+                .resolve_rec_var(&n)
+                .map(|r| env.is_array_record(&r))
+                .unwrap_or(false);
+            if !is_arr {
+                break;
+            }
+            let save = p.i;
+            p.eat("(");
+            if let Some(idx) = parse_int_expr_with(p, &env.consts) {
+                if p.eat(")") {
+                    let idx_s = idx.to_string().replace('-', "m");
+                    n = format!("{n}_{idx_s}");
+                    while p.eat(".") {
+                        if let Ok(f) = p.ident() {
+                            n = format!("{n}_{f}");
+                        }
+                    }
+                    continue;
+                }
+            }
+            p.i = save;
+            break;
+        }
         if p.eat("'") {
             let _ = p.ident();
             if p.eat("(") {
                 let inner = parse_expr_sv(p, env)?;
                 let _ = p.eat(")");
                 return Ok(inner);
+            }
+            let attr = p.ident().unwrap_or_default().to_ascii_lowercase();
+            if p.eat("(") {
+                let inner = parse_expr_sv(p, env)?;
+                let _ = p.eat(")");
+                return Ok(inner);
+            }
+            if let Some(&(hi, lo)) = env
+                .bounds
+                .get(&n.to_ascii_lowercase())
+                .or_else(|| env.type_bounds.get(&n.to_ascii_lowercase()))
+            {
+                match attr.as_str() {
+                    "length" => return Ok(((hi.abs_diff(lo) as i64) + 1).to_string()),
+                    "high" | "left" => return Ok(hi.to_string()),
+                    "low" | "right" => return Ok(lo.to_string()),
+                    _ => {}
+                }
             }
             let attr = p.ident().unwrap_or_default().to_ascii_lowercase();
             if p.eat("(") {
@@ -5593,6 +8469,9 @@ fn parse_primary_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
                 let inner = parse_expr_sv(p, env)?;
                 while p.eat(",") {
                     let _ = parse_expr_sv(p, env);
+                let inner = parse_expr_sv(p, env)?;
+                while p.eat(",") {
+                    let _ = parse_expr_sv(p, env);
                 }
                 let _ = p.eat(")");
                 return Ok(inner);
@@ -5607,6 +8486,17 @@ fn parse_primary_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
                 let _ = p.eat(")");
                 return Ok(format!("__negedge_{clk}"));
             }
+            if let Some(a) = parse_int_expr_peek(p, &env.consts) {
+            let fn_lookup_key = if let Some(pk) = &qual_pkg {
+                let qk = format!("{pk}__{}", n.to_ascii_lowercase());
+                if env.funcs.contains_key(&qk) {
+                    qk
+                } else {
+                    n.to_ascii_lowercase()
+                }
+            } else {
+                n.to_ascii_lowercase()
+            };
             if let Some(a) = parse_int_expr_peek(p, &env.consts) {
             let fn_lookup_key = if let Some(pk) = &qual_pkg {
                 let qk = format!("{pk}__{}", n.to_ascii_lowercase());
@@ -5647,6 +8537,15 @@ fn parse_primary_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
                     }
                     let sa = shift_bound_index(a, &n, env);
                     return Ok(format!("{n}[{sa}]"));
+                    if let Some(fdef) = env.funcs.get(&fn_lookup_key) {
+                        let mut param_map = HashMap::new();
+                        if let Some(p0) = fdef.params.first() {
+                            param_map.insert(p0.clone(), a.to_string());
+                        }
+                        return Ok(replace_word_map(&fdef.body_expr, &param_map));
+                    }
+                    let sa = shift_bound_index(a, &n, env);
+                    return Ok(format!("{n}[{sa}]"));
                 }
             }
             let mut args = vec![parse_expr_sv(p, env).unwrap_or_else(|_| "1'b0".into())];
@@ -5655,6 +8554,13 @@ fn parse_primary_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
             }
             let _ = p.eat(")");
             if let Some(fdef) = env.funcs.get(&n.to_ascii_lowercase()) {
+                let mut param_map = HashMap::new();
+                for (param, arg) in fdef.params.iter().zip(args.iter()) {
+                    param_map.insert(param.clone(), arg.clone());
+                }
+                return Ok(replace_word_map(&fdef.body_expr, &param_map));
+            }
+            if let Some(fdef) = env.funcs.get(&fn_lookup_key) {
                 let mut param_map = HashMap::new();
                 for (param, arg) in fdef.params.iter().zip(args.iter()) {
                     param_map.insert(param.clone(), arg.clone());
@@ -5678,6 +8584,19 @@ fn parse_primary_sv(p: &mut P, env: &TypeEnv) -> Result<String, String> {
         }
         if n.eq_ignore_ascii_case("false") {
             return Ok("1'b0".into());
+        }
+        if let Some(v) = const_get(&env.consts, &n) {
+        if n.eq_ignore_ascii_case("true") {
+            return Ok("1'b1".into());
+        }
+        if n.eq_ignore_ascii_case("false") {
+            return Ok("1'b0".into());
+        }
+        if let Some(pk) = &qual_pkg {
+            let qk = format!("{pk}__{}", n.to_ascii_lowercase());
+            if let Some(v) = const_get(&env.consts, &qk) {
+                return Ok(v.to_string());
+            }
         }
         if let Some(v) = const_get(&env.consts, &n) {
         if n.eq_ignore_ascii_case("true") {
@@ -5776,6 +8695,147 @@ fn parse_int_atom(p: &mut P, c: &HashMap<String, i64>) -> Option<i64> {
     if p.eat("-") {
         return parse_int_atom(p, c).map(|x| -x);
     }
+    if p.eat("+") {
+        return parse_int_atom(p, c);
+    }
+    if p.eat("(") {
+        let v = parse_int_expr_with(p, c);
+        let _ = p.eat(")");
+        return v;
+    }
+    if let Some(n) = p.number() {
+        return Some(n as i64);
+    }
+    if matches!(p.peek(), Some(Tok::Ident(_)) | Some(Tok::Kw(_))) {
+        let save = p.i;
+        let mut n = p.ident().ok()?;
+        let mut qual_pkg: Option<String> = None;
+        while p.eat(".") {
+            if let Ok(f) = p.ident() {
+                qual_pkg = Some(n.to_ascii_lowercase());
+                n = f;
+            }
+        }
+        if matches!(
+            n.to_ascii_lowercase().as_str(),
+            "clog2" | "log2" | "ceil_log2" | "bit_width"
+        ) && p.eat("(")
+        {
+            let arg = parse_int_expr_with(p, c).unwrap_or(1);
+            let _ = p.eat(")");
+            let w = if arg <= 1 {
+                1
+            } else {
+                (u64::BITS - ((arg as u64) - 1).leading_zeros()) as i64
+            };
+            return Some(w);
+        }
+        if let Some(pk) = &qual_pkg {
+            let qk = format!("{pk}__{}", n.to_ascii_lowercase());
+            if let Some(v) = const_get(c, &qk) {
+                return Some(v);
+            }
+        }
+        if let Some(v) = const_get(c, &n) {
+            return Some(v);
+        }
+        p.i = save;
+        return None;
+    }
+    None
+}
+
+fn parse_vtype(p: &mut P, env: &mut TypeEnv) -> VType {
+    parse_vtype_with_bounds(p, env).0
+}
+
+fn parse_vtype_with_bounds(p: &mut P, env: &mut TypeEnv) -> (VType, Option<(i64, i64)>) {
+    let save = p.i;
+    if matches!(p.peek(), Some(Tok::Ident(_)) | Some(Tok::Kw(_))) {
+        if let Ok(mut tn) = p.ident() {
+            let mut qual_pkg: Option<String> = None;
+            while p.eat(".") {
+                if let Ok(sub) = p.ident() {
+                    qual_pkg = Some(tn.to_ascii_lowercase());
+                    tn = sub;
+                }
+            }
+            let raw_low = tn.to_ascii_lowercase();
+            let low = if let Some(pk) = &qual_pkg {
+                let qk = format!("{pk}__{raw_low}");
+                if env.records.contains_key(&qk)
+                    || env.subtypes.contains_key(&qk)
+                    || env.unconstrained_arrays.contains_key(&qk)
+                {
+                    qk
+                } else {
+                    raw_low.clone()
+                }
+            } else {
+                raw_low.clone()
+            };
+            if raw_low == "float32" {
+                skip_type_tail(p);
+                return (VType::Scalar(32), Some((8, -23)));
+            }
+            if raw_low == "float64" {
+                skip_type_tail(p);
+                return (VType::Scalar(64), Some((11, -52)));
+            }
+            if let Some(base_elem) = env.unconstrained_arrays.get(&low).cloned() {
+                if p.eat("(") {
+                    if let Some(a) = parse_int_expr_peek(p, &env.consts) {
+                        if p.eat("downto") || p.eat("to") {
+                            let b = parse_int_expr_with(p, &env.consts).unwrap_or(a);
+                            let _ = p.eat(")");
+                            let mut elem_ty = base_elem;
+                            if p.eat("(") {
+                                if let Some(ea) = parse_int_expr_with(p, &env.consts) {
+                                    if p.eat("downto") || p.eat("to") {
+                                        let eb = parse_int_expr_with(p, &env.consts).unwrap_or(ea);
+                                        elem_ty =
+                                            VType::Scalar((ea.abs_diff(eb) as usize) + 1);
+                                    }
+                                }
+                                let _ = p.eat(")");
+                            }
+                            skip_type_tail(p);
+                            let rkey = env.make_constrained_array_record(
+                                &low,
+                                a.min(b),
+                                a.max(b),
+                                &elem_ty,
+                            );
+                            return (VType::Record(rkey), Some((a, b)));
+                        }
+                    }
+                    skip_paren_rest(p);
+                }
+                skip_type_tail(p);
+                return (VType::UnconstrainedArray(low), None);
+            }
+            if env.get_record(&low).is_some() {
+                skip_type_tail(p);
+                return (VType::Record(low), None);
+            }
+            if let Some(sub_ty) = env.subtypes.get(&low).cloned() {
+                if !p.peek_sym("(") && !p.eat("range") {
+                    skip_type_tail(p);
+                    let bnds = env.type_bounds.get(&low).copied();
+                    return (sub_ty, bnds);
+                }
+            }
+        }
+    }
+    p.i = save;
+    let (w, bnds) = parse_type_with_bounds(p, &env.consts);
+    (VType::Scalar(w), bnds)
+}
+
+fn parse_int_atom(p: &mut P, c: &HashMap<String, i64>) -> Option<i64> {
+    if p.eat("-") {
+        return parse_int_atom(p, c).map(|x| -x);
+    }
     if p.eat("-") {
         return parse_int_atom(p, c).map(|x| -x);
     }
@@ -5846,6 +8906,30 @@ fn parse_int_atom(p: &mut P, c: &HashMap<String, i64>) -> Option<i64> {
         }
         p.i = save;
         return None;
+fn parse_type_with_bounds(
+    p: &mut P,
+    consts: &HashMap<String, i64>,
+) -> (usize, Option<(i64, i64)>) {
+    let mut is_int_default = false;
+    if p.eat("integer") || p.eat("natural") || p.eat("positive") {
+        is_int_default = true;
+    } else {
+        let _ = p.eat("std_logic");
+        let _ = p.eat("std_ulogic");
+        let _ = p.eat("std_logic_vector");
+        let _ = p.eat("std_ulogic_vector");
+        let _ = p.eat("unsigned");
+        let _ = p.eat("signed");
+        let _ = p.eat("ufixed");
+        let _ = p.eat("sfixed");
+        let _ = p.eat("float");
+        let _ = p.eat("bit");
+        let _ = p.eat("bit_vector");
+        let _ = p.eat("boolean");
+        let _ = p.eat("real");
+        let _ = p.eat("character");
+        let _ = p.eat("string");
+        let _ = p.eat("time");
     }
     None
 }
@@ -6048,6 +9132,16 @@ fn parse_type_with_bounds(
             return (w.max(1), Some((a, b)));
         }
         return ((a.abs_diff(b) as usize) + 1, Some((a, b)));
+        let hi = a.max(b).max(0) as u64;
+        if is_int_default {
+            let w = if hi <= 1 {
+                1
+            } else {
+                (u64::BITS - hi.leading_zeros()) as usize
+            };
+            return (w.max(1), Some((a, b)));
+        }
+        return ((a.abs_diff(b) as usize) + 1, Some((a, b)));
     }
     skip_type_tail(p);
     (1, None)
@@ -6239,6 +9333,26 @@ fn skip_to_end_unit(p: &mut P, kind: &str) {
                 let _ = p.eat(";");
                 continue;
             }
+            let _ = p.eat("?");
+            if p.eat("record")
+                || p.eat("units")
+                || p.eat("function")
+                || p.eat("procedure")
+                || p.eat("if")
+                || p.eat("case")
+                || p.eat("loop")
+                || p.eat("generate")
+                || p.eat("process")
+                || (kind != "view" && p.eat("view"))
+                || (kind != "component" && p.eat("component"))
+                || (kind != "package" && p.eat("package"))
+            {
+                let _ = p.eat("?");
+                let _ = p.eat("body");
+                let _ = p.eat_ident();
+                let _ = p.eat(";");
+                continue;
+            }
             let _ = p.eat(kind);
             let _ = p.eat("entity");
             let _ = p.eat("architecture");
@@ -6246,6 +9360,9 @@ fn skip_to_end_unit(p: &mut P, kind: &str) {
             let _ = p.eat("package");
             let _ = p.eat("body");
             let _ = p.eat("context");
+            let _ = p.eat("body");
+            let _ = p.eat("context");
+            let _ = p.eat("view");
             let _ = p.eat("body");
             let _ = p.eat_ident();
             let _ = p.eat(";");
@@ -6474,6 +9591,68 @@ fn emit_sv(
                 sv.push_str(&cs.join(", "));
                 sv.push_str(");\n");
             }
+            CStmt::SvaAssert {
+                label,
+                clk,
+                prop_sv,
+            } => {
+                let resolved_clk = clk
+                    .clone()
+                    .or_else(|| arch.env.default_psl_clock.clone())
+                    .or_else(|| sta_clocks.iter().next().cloned())
+                    .or_else(|| {
+                        ent.ports
+                            .iter()
+                            .find(|(n, _, _)| {
+                                n.eq_ignore_ascii_case("clk") || n.eq_ignore_ascii_case("clock")
+                            })
+                            .map(|(n, _, _)| n.clone())
+                    })
+                    .or_else(|| {
+                        ent.ports
+                            .iter()
+                            .find(|(_, d, _)| *d == "input")
+                            .map(|(n, _, _)| n.clone())
+                    })
+                    .unwrap_or_else(|| "clk".into());
+                let clk_sv = sta_clock_name(&resolved_clk, sta_clocks, &occupied);
+                let prop = rewrite_sta_clock_ident(prop_sv, sta_clocks, &occupied);
+                let pfx = label
+                    .as_ref()
+                    .map(|l| format!("{l}: "))
+                    .unwrap_or_default();
+                sv.push_str(&format!(
+                    "  {pfx}assert property (@(posedge {clk_sv}) {prop});\n"
+                ));
+            }
+            CStmt::SvaCover {
+                label,
+                clk,
+                prop_sv,
+            } => {
+                let resolved_clk = clk
+                    .clone()
+                    .or_else(|| arch.env.default_psl_clock.clone())
+                    .or_else(|| sta_clocks.iter().next().cloned())
+                    .or_else(|| {
+                        ent.ports
+                            .iter()
+                            .find(|(n, _, _)| {
+                                n.eq_ignore_ascii_case("clk") || n.eq_ignore_ascii_case("clock")
+                            })
+                            .map(|(n, _, _)| n.clone())
+                    })
+                    .unwrap_or_else(|| "clk".into());
+                let clk_sv = sta_clock_name(&resolved_clk, sta_clocks, &occupied);
+                let prop = rewrite_sta_clock_ident(prop_sv, sta_clocks, &occupied);
+                let pfx = label
+                    .as_ref()
+                    .map(|l| format!("{l}: "))
+                    .unwrap_or_default();
+                sv.push_str(&format!(
+                    "  {pfx}cover property (@(posedge {clk_sv}) {prop});\n"
+                ));
+            }
         }
     }
     sv.push_str("endmodule\n");
@@ -6494,6 +9673,77 @@ fn expand_inst_conns(
                     if let Some((pname, _dir, vty)) = rps.get(idx) {
                         match vty {
                             VType::Scalar(_) => {
+                                out.push((pname.clone(), b.clone()));
+                                continue;
+                            }
+                            VType::Record(rname) => {
+                                for (leaf_port, suf, _w) in
+                                    env.flatten_record_leaves(rname, pname, "", 0)
+                                {
+                                    let actual = if let Some(cmap) =
+                                        env.rec_consts.get(&b.to_ascii_lowercase())
+                                    {
+                                        cmap.get(&suf).cloned().unwrap_or_else(|| "1'b0".into())
+                                    } else {
+                                        format!("{b}_{suf}")
+                                    };
+                                    out.push((leaf_port, actual));
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let _ = flat_ports;
+            }
+            out.push((a.clone(), b.clone()));
+            continue;
+        }
+        if let Some(rps) = raw_ports {
+            if let Some((pname, _dir, VType::Record(rname))) =
+                rps.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(a))
+            {
+                for (leaf_port, suf, _w) in env.flatten_record_leaves(rname, pname, "", 0) {
+                    let actual = if let Some(cmap) = env.rec_consts.get(&b.to_ascii_lowercase()) {
+                        cmap.get(&suf).cloned().unwrap_or_else(|| "1'b0".into())
+                    } else {
+                        format!("{b}_{suf}")
+                    };
+                    out.push((leaf_port, actual));
+                }
+                continue;
+            }
+        }
+        if let Some(rname) = env.resolve_rec_var(b) {
+            let a_is_flat = flat_ports
+                .map(|ps| ps.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(a)))
+                .unwrap_or(false);
+            if !a_is_flat {
+                for (leaf_port, suf, _w) in env.flatten_record_leaves(&rname, a, "", 0) {
+                    out.push((leaf_port, format!("{b}_{suf}")));
+                }
+                continue;
+            }
+        }
+        out.push((a.clone(), b.clone()));
+    }
+    out
+}
+
+fn expand_inst_conns(
+    conns: &[(String, String)],
+    raw_ports: Option<&[(String, &'static str, VType)]>,
+    flat_ports: Option<&[(String, &'static str, usize)]>,
+    env: &TypeEnv,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (a, b) in conns {
+        if a.starts_with('#') {
+            if let Ok(idx) = a[1..].parse::<usize>() {
+                if let Some(rps) = raw_ports {
+                    if let Some((pname, _dir, vty)) = rps.get(idx) {
+                        match vty {
+                            VType::Scalar(_) | VType::UnconstrainedArray(_) => {
                                 out.push((pname.clone(), b.clone()));
                                 continue;
                             }
@@ -7178,6 +10428,11 @@ fn is_kw(s: &str) -> bool {
             | "protected"
             | "private"
             | "view"
+            | "always"
+            | "never"
+            | "cover"
+            | "default"
+            | "clock"
             | "force"
             | "release"
             | "parameter"
@@ -7188,13 +10443,319 @@ fn is_kw(s: &str) -> bool {
     )
 }
 
+fn parse_view_decl(p: &mut P, env: &mut TypeEnv) {
+    let Ok(vname) = p.ident() else {
+        eat_to_semi(p);
+        return;
+    };
+    let vkey = vname.to_ascii_lowercase();
+    let _ = p.eat("of");
+    let mut rname = p.ident().unwrap_or_default();
+    while p.eat(".") {
+        if let Ok(sub) = p.ident() {
+            rname = sub;
+        }
+    }
+    if p.eat("(") {
+        skip_paren_rest(p);
+    }
+    let _ = p.eat("is");
+    let mut field_dirs = HashMap::new();
+    let mut guard = 0usize;
+    while p.peek().is_some() && guard < 4096 {
+        guard += 1;
+        if p.eat("end") {
+            let _ = p.eat("view");
+            let _ = p.eat_ident();
+            let _ = p.eat(";");
+            break;
+        }
+        let Some(f0) = p.eat_name() else {
+            if !p.eat(";") {
+                p.bump();
+            }
+            continue;
+        };
+        let mut fnames = vec![f0];
+        while p.eat(",") {
+            if let Some(fnm) = p.eat_name() {
+                fnames.push(fnm);
+            }
+        }
+        let _ = p.eat(":");
+        let mode = if p.eat("view") {
+            let paren = p.eat("(");
+            let mut sv = p.ident().unwrap_or_default();
+            while p.eat(".") {
+                if let Ok(sub) = p.ident() {
+                    sv = sub;
+                }
+            }
+            let mut conv = false;
+            if p.eat("'") {
+                if let Ok(attr) = p.ident() {
+                    if attr.eq_ignore_ascii_case("converse") {
+                        conv = true;
+                    }
+                }
+            }
+            if paren {
+                let _ = p.eat(")");
+            }
+            if conv {
+                format!("converse:{}", sv.to_ascii_lowercase())
+            } else {
+                format!("view:{}", sv.to_ascii_lowercase())
+            }
+        } else if p.eat("out") || p.eat("inout") || p.eat("buffer") {
+            "output".into()
+        } else {
+            let _ = p.eat("in");
+            let _ = p.eat("linkage");
+            "input".into()
+        };
+        let _ = p.eat(";");
+        for fnm in fnames {
+            field_dirs.insert(fnm.to_ascii_lowercase(), mode.clone());
+        }
+    }
+    env.views.insert(
+        vkey,
+        ViewDef {
+            record_type: rname.to_ascii_lowercase(),
+            field_dirs,
+        },
+    );
+}
+
+fn parse_psl_default_clock(p: &mut P, env: &mut TypeEnv) {
+    if !p.eat("clock") {
+        eat_to_semi(p);
+        return;
+    }
+    let _ = p.eat("is");
+    let _ = p.eat("(");
+    if let Some((clk, _rise)) = take_clock(p) {
+        env.default_psl_clock = Some(clk);
+    } else if p.eat("posedge") || p.eat("negedge") {
+        if let Ok(clk) = p.ident() {
+            env.default_psl_clock = Some(clk);
+        }
+    } else if let Ok(clk) = p.ident() {
+        env.default_psl_clock = Some(clk);
+    }
+    eat_to_semi(p);
+}
+
+fn parse_psl_assert(p: &mut P, label: Option<String>, env: &TypeEnv) -> Option<CStmt> {
+    if p.eat("always") {
+        let (toks, clk) = collect_psl_tokens(p);
+        let prop_sv = lower_psl_always_tokens(&toks, env)?;
+        return Some(CStmt::SvaAssert {
+            label,
+            clk,
+            prop_sv,
+        });
+    }
+    if p.eat("never") {
+        let (toks, clk) = collect_psl_tokens(p);
+        let expr = parse_psl_bool_slice(&toks, env)?;
+        return Some(CStmt::SvaAssert {
+            label,
+            clk,
+            prop_sv: format!("1'b1 |-> ~({expr})"),
+        });
+    }
+    eat_to_semi(p);
+    None
+}
+
+fn parse_psl_cover(p: &mut P, label: Option<String>, env: &TypeEnv) -> Option<CStmt> {
+    let _ = p.eat("always");
+    let (toks, clk) = collect_psl_tokens(p);
+    let inner = strip_outer_delims(&toks);
+    let mut parts = Vec::new();
+    let mut cur = Vec::new();
+    for t in inner {
+        if matches!(t, Tok::Sym(s) if s == ";") {
+            if !cur.is_empty() {
+                if let Some(e) = parse_psl_bool_slice(&cur, env) {
+                    parts.push(e);
+                }
+                cur.clear();
+            }
+        } else {
+            cur.push(t.clone());
+        }
+    }
+    if !cur.is_empty() {
+        if let Some(e) = parse_psl_bool_slice(&cur, env) {
+            parts.push(e);
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let prop_sv = if parts.len() == 1 {
+        format!("1'b1 |-> ({})", parts[0])
+    } else {
+        format!("({}) |=> ({})", parts[0], parts[1..].join(" & "))
+    };
+    Some(CStmt::SvaCover {
+        label,
+        clk,
+        prop_sv,
+    })
+}
+
+fn collect_psl_tokens(p: &mut P) -> (Vec<Tok>, Option<String>) {
+    let mut toks = Vec::new();
+    let mut clk = None;
+    let mut d = 0i32;
+    while p.peek().is_some() {
+        if d <= 0 && p.eat(";") {
+            break;
+        }
+        if d <= 0 && (p.eat("report") || p.eat("severity")) {
+            eat_to_semi(p);
+            break;
+        }
+        if d <= 0 && p.eat("@") {
+            let _ = p.eat("(");
+            if let Some((c, _)) = take_clock(p) {
+                clk = Some(c);
+            } else {
+                let _ = p.eat("posedge");
+                let _ = p.eat("negedge");
+                if let Ok(c) = p.ident() {
+                    clk = Some(c);
+                }
+            }
+            let _ = p.eat(")");
+            continue;
+        }
+        if let Some(t) = p.bump() {
+            match t {
+                Tok::Sym(s) if s == "(" || s == "{" || s == "[" => d += 1,
+                Tok::Sym(s) if s == ")" || s == "}" || s == "]" => d -= 1,
+                _ => {}
+            }
+            toks.push(t.clone());
+        }
+    }
+    (toks, clk)
+}
+
+fn strip_outer_delims(toks: &[Tok]) -> &[Tok] {
+    let mut slice = toks;
+    while slice.len() >= 2 {
+        let open = match slice.first() {
+            Some(Tok::Sym(s)) if s == "(" => ")",
+            Some(Tok::Sym(s)) if s == "{" => "}",
+            _ => break,
+        };
+        if !matches!(slice.last(), Some(Tok::Sym(s)) if s == open) {
+            break;
+        }
+        let mut d = 0i32;
+        let mut matches_outer = true;
+        for (idx, t) in slice.iter().enumerate() {
+            match t {
+                Tok::Sym(s) if s == "(" || s == "{" => d += 1,
+                Tok::Sym(s) if s == ")" || s == "}" => {
+                    d -= 1;
+                    if d == 0 && idx + 1 < slice.len() {
+                        matches_outer = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if matches_outer && d == 0 {
+            slice = &slice[1..slice.len() - 1];
+        } else {
+            break;
+        }
+    }
+    slice
+}
+
+fn lower_psl_always_tokens(toks: &[Tok], env: &TypeEnv) -> Option<String> {
+    let inner = strip_outer_delims(toks);
+    if inner.is_empty() {
+        return None;
+    }
+    let mut d = 0i32;
+    let mut split_at: Option<(usize, &str)> = None;
+    for (i, t) in inner.iter().enumerate() {
+        match t {
+            Tok::Sym(s) if s == "(" || s == "[" || s == "{" => d += 1,
+            Tok::Sym(s) if s == ")" || s == "]" || s == "}" => d -= 1,
+            Tok::Sym(s) if d == 0 && (s == "->" || s == "|->" || s == "|=>") => {
+                split_at = Some((i, s.as_str()));
+                break;
+            }
+            _ => {}
+        }
+    }
+    if let Some((idx, op)) = split_at {
+        let lhs = parse_psl_bool_slice(&inner[..idx], env)?;
+        let mut rhs_slice = strip_outer_delims(&inner[idx + 1..]);
+        let mut impl_str = if op == "|=>" {
+            "|=>".to_string()
+        } else {
+            "|->".to_string()
+        };
+        if matches!(rhs_slice.first(), Some(Tok::Kw(k)) if k == "next") {
+            rhs_slice = &rhs_slice[1..];
+            if matches!(rhs_slice.first(), Some(Tok::Sym(s)) if s == "[") {
+                if let Some(Tok::Num(n)) = rhs_slice.get(1) {
+                    if matches!(rhs_slice.get(2), Some(Tok::Sym(s)) if s == "]") {
+                        impl_str = format!("|-> ##{n}");
+                        rhs_slice = &rhs_slice[3..];
+                    }
+                }
+            } else {
+                impl_str = "|=>".to_string();
+            }
+        }
+        let rhs = parse_psl_bool_slice(rhs_slice, env)?;
+        return Some(format!("({lhs}) {impl_str} ({rhs})"));
+    }
+    let expr = parse_psl_bool_slice(inner, env)?;
+    Some(format!("1'b1 |-> ({expr})"))
+}
+
+fn parse_psl_bool_slice(toks: &[Tok], env: &TypeEnv) -> Option<String> {
+    let s = strip_outer_delims(toks);
+    if s.is_empty() {
+        return None;
+    }
+    let mut p = P { t: s, i: 0 };
+    parse_expr_sv(&mut p, env).ok()
+}
+
 fn tokenize(src: &str) -> Vec<Tok> {
     let mut s = String::new();
     let chars_raw: Vec<char> = src.chars().collect();
     let mut i = 0;
-    // strip -- comments and /* */
+    // strip -- comments (except `-- psl ...` formal directives) and /* */
     while i < chars_raw.len() {
         if chars_raw[i] == '-' && chars_raw.get(i + 1) == Some(&'-') {
+            let mut j = i + 2;
+            while j < chars_raw.len() && (chars_raw[j] == ' ' || chars_raw[j] == '\t') {
+                j += 1;
+            }
+            let is_psl = j + 3 < chars_raw.len()
+                && chars_raw[j].eq_ignore_ascii_case(&'p')
+                && chars_raw[j + 1].eq_ignore_ascii_case(&'s')
+                && chars_raw[j + 2].eq_ignore_ascii_case(&'l')
+                && chars_raw[j + 3].is_whitespace();
+            if is_psl {
+                i = j + 4;
+                continue;
+            }
             while i < chars_raw.len() && chars_raw[i] != '\n' {
                 i += 1;
             }
@@ -7218,6 +10779,31 @@ fn tokenize(src: &str) -> Vec<Tok> {
         let c = chars[i];
         if c.is_whitespace() {
             i += 1;
+            continue;
+        }
+        if c == '?' && chars.get(i + 1) == Some(&'/') && chars.get(i + 2) == Some(&'=') {
+            out.push(Tok::Sym("?/=".into()));
+            i += 3;
+            continue;
+        }
+        if c == '?' && chars.get(i + 1) == Some(&'=') {
+            out.push(Tok::Sym("?=".into()));
+            i += 2;
+            continue;
+        }
+        if c == '|' && chars.get(i + 1) == Some(&'-') && chars.get(i + 2) == Some(&'>') {
+            out.push(Tok::Sym("|->".into()));
+            i += 3;
+            continue;
+        }
+        if c == '|' && chars.get(i + 1) == Some(&'=') && chars.get(i + 2) == Some(&'>') {
+            out.push(Tok::Sym("|=>".into()));
+            i += 3;
+            continue;
+        }
+        if c == '-' && chars.get(i + 1) == Some(&'>') {
+            out.push(Tok::Sym("->".into()));
+            i += 2;
             continue;
         }
         if c == '?' && chars.get(i + 1) == Some(&'/') && chars.get(i + 2) == Some(&'=') {
