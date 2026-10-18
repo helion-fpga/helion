@@ -36,6 +36,8 @@ pub struct PhysViewState {
     pub multi_select: Vec<String>,
     /// Ruler measurement selected for the inspector (click a ruler line).
     pub inspector_ruler: Option<usize>,
+    /// Multi-mode floorplan heatmap overlay selection.
+    pub heatmap_mode: physview::FloorplanHeatmapMode,
 }
 
 impl Default for PhysViewState {
@@ -53,6 +55,7 @@ impl Default for PhysViewState {
             find_needs_focus: false,
             multi_select: Vec::new(),
             inspector_ruler: None,
+            heatmap_mode: physview::FloorplanHeatmapMode::Off,
         }
     }
 }
@@ -116,16 +119,27 @@ pub fn paint_display_control(ui: &mut egui::Ui, pv: &mut PhysViewState, model: &
     ui.add_space(6.0);
     ui.separator();
     ui.label(RichText::new("Heat maps").small().color(theme.faint));
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let mut mode = pv.layers.heat_mode;
-        if ui.radio(mode == HeatMode::Off, "Off").clicked() {
+        if ui.radio(mode == HeatMode::Off && pv.heatmap_mode == physview::FloorplanHeatmapMode::Off, "Off").clicked() {
             mode = HeatMode::Off;
+            pv.heatmap_mode = physview::FloorplanHeatmapMode::Off;
         }
-        if ui.radio(mode == HeatMode::Congestion, "Congestion").clicked() {
+        if ui.radio(mode == HeatMode::Congestion || pv.heatmap_mode == physview::FloorplanHeatmapMode::RoutingCongestion, "Congestion").clicked() {
             mode = HeatMode::Congestion;
+            pv.heatmap_mode = physview::FloorplanHeatmapMode::RoutingCongestion;
         }
-        if ui.radio(mode == HeatMode::Criticality, "Criticality").clicked() {
+        if ui.radio(mode == HeatMode::Criticality || pv.heatmap_mode == physview::FloorplanHeatmapMode::SetupSlack, "Setup Slack").clicked() {
             mode = HeatMode::Criticality;
+            pv.heatmap_mode = physview::FloorplanHeatmapMode::SetupSlack;
+        }
+        if ui.radio(pv.heatmap_mode == physview::FloorplanHeatmapMode::ThermalPowerDensity, "Thermal Power").clicked() {
+            mode = HeatMode::Off;
+            pv.heatmap_mode = physview::FloorplanHeatmapMode::ThermalPowerDensity;
+        }
+        if ui.radio(pv.heatmap_mode == physview::FloorplanHeatmapMode::ControlSetUtilization, "Control Sets").clicked() {
+            mode = HeatMode::Off;
+            pv.heatmap_mode = physview::FloorplanHeatmapMode::ControlSetUtilization;
         }
         pv.layers.heat_mode = mode;
     });

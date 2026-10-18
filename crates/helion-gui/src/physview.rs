@@ -6,10 +6,11 @@
 //! binary paints these; colors are plain RGB triples here and get mapped to
 //! the app theme at the paint site.
 
-use crate::ide::{DeviceSiteView, IdeModel, TimingPath};
+use crate::ide::{DeviceSiteView, IdeModel, Pblock, TimingPath};
 use helion_device::SiteKind;
+use helion_ir::{CellKind, resolve};
 use helion_route::HOP_DELAY_PS;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // Layer model
@@ -717,6 +718,880 @@ pub fn inspect(
             .map(inspect_ruler)
             .unwrap_or_default(),
         InspectorKind::Empty => Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wave-9: Multi-Mode Floorplan Heatmap Engine
+// ---------------------------------------------------------------------------
+
+/// Vivado-class Device Floorplan Heatmap Overlay mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FloorplanHeatmapMode {
+    #[default]
+    Off,
+    RoutingCongestion,
+    SetupSlack,
+    ThermalPowerDensity,
+    ControlSetUtilization,
+}
+
+impl FloorplanHeatmapMode {
+    pub const ALL: [FloorplanHeatmapMode; 5] = [
+        FloorplanHeatmapMode::Off,
+        FloorplanHeatmapMode::RoutingCongestion,
+        FloorplanHeatmapMode::SetupSlack,
+        FloorplanHeatmapMode::ThermalPowerDensity,
+        FloorplanHeatmapMode::ControlSetUtilization,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::RoutingCongestion => "Routing Congestion",
+            Self::SetupSlack => "Setup Slack",
+            Self::ThermalPowerDensity => "Thermal Power Density",
+            Self::ControlSetUtilization => "Control-Set Utilization",
+        }
+    }
+
+    pub fn parse(spec: &str) -> Option<Self> {
+        match spec.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" => Some(Self::Off),
+            "congestion" | "routing" | "routing_congestion" | "routingcongestion" => {
+                Some(Self::RoutingCongestion)
+            }
+            "slack" | "setup_slack" | "setupslack" | "criticality" => Some(Self::SetupSlack),
+            "power" | "thermal" | "thermal_power" | "thermal_power_density" | "thermalpowerdensity" => {
+                Some(Self::ThermalPowerDensity)
+            }
+            "control_set"
+            | "controlset"
+            | "control_sets"
+            | "control_set_utilization"
+            | "controlsetutilization" => Some(Self::ControlSetUtilization),
+            _ => None,
+        }
+    }
+}
+
+/// RGB color ramp for a given [`FloorplanHeatmapMode`] and normalized `t` in `[0.0, 1.0]`.
+pub fn heatmap_mode_ramp(mode: FloorplanHeatmapMode, t: f32) -> [u8; 3] {
+    let t = t.clamp(0.0, 1.0);
+    match mode {
+        FloorplanHeatmapMode::Off => [0, 0, 0],
+        FloorplanHeatmapMode::RoutingCongestion => congestion_ramp(t),
+        FloorplanHeatmapMode::SetupSlack => {
+            const SLACK_STOPS: [[u8; 3]; 4] = [
+                [35, 190, 95],   // comfortable slack (green)
+                [180, 215, 45],  // moderate slack (lime)
+                [245, 165, 30],  // near-zero slack (amber)
+                [230, 35, 35],   // negative/violating slack (red)
+            ];
+            ramp(SLACK_STOPS, t)
+        }
+        FloorplanHeatmapMode::ThermalPowerDensity => {
+            const THERMAL_STOPS: [[u8; 3]; 4] = [
+                [35, 25, 110],   // cool leakage baseline (indigo)
+                [155, 35, 145],  // moderate switching (magenta)
+                [240, 110, 25],  // hot tile (orange)
+                [255, 230, 80],  // peak thermal density (bright yellow)
+            ];
+            ramp(THERMAL_STOPS, t)
+        }
+        FloorplanHeatmapMode::ControlSetUtilization => {
+            const CTRL_STOPS: [[u8; 3]; 4] = [
+                [25, 130, 160],  // 1 control set (teal)
+                [70, 190, 120],  // 2 control sets (emerald)
+                [240, 180, 35],  // 3 control sets (gold)
+                [225, 50, 60],   // saturated SLICE control sets (crimson)
+            ];
+            ramp(CTRL_STOPS, t)
+        }
+    }
+}
+
+/// Per-tile heatmap sample at die tile `(x, y)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TileHeatmapCell {
+    pub x: u32,
+    pub y: u32,
+    /// Normalized intensity in `[0.0, 1.0]`.
+    pub value: f32,
+    /// Raw metric value (PIP demand ratio, worst slack ps, power mW, or control-set count).
+    pub raw: f64,
+    /// RGB color triple from [`heatmap_mode_ramp`].
+    pub rgb: [u8; 3],
+}
+
+/// Complete die-indexed heatmap grid for a [`FloorplanHeatmapMode`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TileHeatmapGrid {
+    pub mode: FloorplanHeatmapMode,
+    pub x0: u32,
+    pub y0: u32,
+    pub cols: u32,
+    pub rows: u32,
+    /// Row-major `cols * rows` normalized values in `[0.0, 1.0]` (`values[dy * cols + dx]`).
+    pub values: Vec<f32>,
+    /// Row-major `cols * rows` RGB triples (`colors[dy * cols + dx]`).
+    pub colors: Vec<[u8; 3]>,
+    /// Row-major `cols * rows` tile records (`cells[dy * cols + dx]`).
+    pub cells: Vec<TileHeatmapCell>,
+    pub min_raw: f64,
+    pub max_raw: f64,
+}
+
+impl TileHeatmapGrid {
+    pub fn cell_at(&self, x: u32, y: u32) -> Option<&TileHeatmapCell> {
+        if x < self.x0 || y < self.y0 {
+            return None;
+        }
+        let dx = x - self.x0;
+        let dy = y - self.y0;
+        if dx >= self.cols || dy >= self.rows {
+            return None;
+        }
+        self.cells.get((dy * self.cols + dx) as usize)
+    }
+
+    pub fn value_at(&self, x: u32, y: u32) -> f32 {
+        self.cell_at(x, y).map(|c| c.value).unwrap_or(0.0)
+    }
+
+    pub fn color_at(&self, x: u32, y: u32) -> [u8; 3] {
+        self.cell_at(x, y).map(|c| c.rgb).unwrap_or([0, 0, 0])
+    }
+}
+
+/// Compute the normalized `[0.0, 1.0]` per-tile heatmap grid and RGB color ramps
+/// for `mode` across the device die.
+pub fn compute_tile_heatmap_grid(
+    model: &IdeModel,
+    mode: FloorplanHeatmapMode,
+) -> TileHeatmapGrid {
+    let cols = model.device.cols;
+    let rows = model.device.rows;
+    let x0 = model.device.x0;
+    let y0 = model.device.y0;
+    let n_tiles = (cols as usize).saturating_mul(rows as usize);
+    let mut grid = TileHeatmapGrid {
+        mode,
+        x0,
+        y0,
+        cols,
+        rows,
+        values: vec![0.0; n_tiles],
+        colors: vec![[0, 0, 0]; n_tiles],
+        cells: Vec::with_capacity(n_tiles),
+        min_raw: 0.0,
+        max_raw: 0.0,
+    };
+    if n_tiles == 0 {
+        return grid;
+    }
+
+    let mut raws = vec![0.0_f64; n_tiles];
+    let mut active = vec![false; n_tiles];
+    let idx_of = |x: u32, y: u32| -> Option<usize> {
+        if x < x0 || y < y0 {
+            return None;
+        }
+        let dx = x - x0;
+        let dy = y - y0;
+        if dx >= cols || dy >= rows {
+            return None;
+        }
+        Some((dy * cols + dx) as usize)
+    };
+
+    match mode {
+        FloorplanHeatmapMode::Off => {
+            for dy in 0..rows {
+                for dx in 0..cols {
+                    grid.cells.push(TileHeatmapCell {
+                        x: x0 + dx,
+                        y: y0 + dy,
+                        value: 0.0,
+                        raw: 0.0,
+                        rgb: [0, 0, 0],
+                    });
+                }
+            }
+            return grid;
+        }
+        FloorplanHeatmapMode::RoutingCongestion => {
+            // Combine Routed::congestion with route tile crossings when congestion vector is empty.
+            if model.device.congestion.len() == n_tiles {
+                for (i, &u) in model.device.congestion.iter().enumerate() {
+                    raws[i] = u as f64;
+                    active[i] = u > 0;
+                }
+            }
+            for r in &model.device.routes {
+                for &(tx, ty) in &r.tiles {
+                    if let Some(i) = idx_of(tx, ty) {
+                        if model.device.congestion.len() != n_tiles {
+                            raws[i] += 1.0;
+                        }
+                        active[i] = true;
+                    }
+                }
+            }
+            let max_u = raws.iter().copied().fold(0.0_f64, f64::max);
+            grid.min_raw = 0.0;
+            grid.max_raw = max_u;
+            for dy in 0..rows {
+                for dx in 0..cols {
+                    let i = (dy * cols + dx) as usize;
+                    let val = if max_u > 0.0 {
+                        (raws[i] / max_u).clamp(0.0, 1.0) as f32
+                    } else {
+                        0.0
+                    };
+                    let rgb = if val > 0.0 {
+                        heatmap_mode_ramp(mode, val)
+                    } else {
+                        [0, 0, 0]
+                    };
+                    grid.values[i] = val;
+                    grid.colors[i] = rgb;
+                    grid.cells.push(TileHeatmapCell {
+                        x: x0 + dx,
+                        y: y0 + dy,
+                        value: val,
+                        raw: raws[i],
+                        rgb,
+                    });
+                }
+            }
+        }
+        FloorplanHeatmapMode::SetupSlack => {
+            let mut net_slack = model.device.net_slack.clone();
+            if net_slack.is_empty() && !model.timing_paths.is_empty() {
+                net_slack = build_net_slack(&model.timing_paths);
+            }
+            let mut tile_slack: Vec<Option<i64>> = vec![None; n_tiles];
+            for r in &model.device.routes {
+                if let Some(&slk) = net_slack.get(&r.net) {
+                    for &(tx, ty) in &r.tiles {
+                        if let Some(i) = idx_of(tx, ty) {
+                            tile_slack[i] = Some(match tile_slack[i] {
+                                Some(prev) => prev.min(slk),
+                                None => slk,
+                            });
+                        }
+                    }
+                }
+            }
+            // Also project path cell slacks onto their placed sites.
+            for path in &model.timing_paths {
+                for cell in &path.cells {
+                    if let Some(site) = model.device.occupant_of(cell) {
+                        if let Some(i) = idx_of(site.x, site.y) {
+                            tile_slack[i] = Some(match tile_slack[i] {
+                                Some(prev) => prev.min(path.slack_ps),
+                                None => path.slack_ps,
+                            });
+                        }
+                    }
+                }
+            }
+            let period_ps = (model.clock_period_ps.max(1_000)) as f64;
+            let mut min_s = f64::INFINITY;
+            let mut max_s = f64::NEG_INFINITY;
+            for dy in 0..rows {
+                for dx in 0..cols {
+                    let i = (dy * cols + dx) as usize;
+                    let (val, raw, rgb) = match tile_slack[i] {
+                        Some(slk) => {
+                            let s = slk as f64;
+                            min_s = min_s.min(s);
+                            max_s = max_s.max(s);
+                            // Criticality t in [0.0, 1.0]: negative slack -> [0.75..1.0],
+                            // zero slack -> 0.70, comfortable positive slack -> 0.15..0.70.
+                            let crit = if s < 0.0 {
+                                (0.75 + (-s / 2_000.0) * 0.25).clamp(0.75, 1.0) as f32
+                            } else {
+                                (0.70 - (s / period_ps).clamp(0.0, 1.0) * 0.55).clamp(0.15, 0.70)
+                                    as f32
+                            };
+                            (crit, s, heatmap_mode_ramp(mode, crit))
+                        }
+                        None => (0.0, 0.0, [0, 0, 0]),
+                    };
+                    grid.values[i] = val;
+                    grid.colors[i] = rgb;
+                    grid.cells.push(TileHeatmapCell {
+                        x: x0 + dx,
+                        y: y0 + dy,
+                        value: val,
+                        raw,
+                        rgb,
+                    });
+                }
+            }
+            if min_s.is_finite() {
+                grid.min_raw = min_s;
+                grid.max_raw = max_s;
+            }
+        }
+        FloorplanHeatmapMode::ThermalPowerDensity => {
+            let pwr = model.power_report();
+            let static_mw_tile = (pwr.static_uw as f64 / 1000.0) / (n_tiles.max(1) as f64);
+            raws.fill(static_mw_tile);
+            let occ_count = model.device.occupied_count().max(1) as f64;
+            let dyn_logic_mw = (pwr.logic_uw + pwr.clocks_uw + pwr.signals_uw) as f64 / 1000.0;
+            let dyn_io_mw = pwr.io_uw as f64 / 1000.0;
+            let dyn_bram_mw = pwr.bram_uw as f64 / 1000.0;
+            let dyn_dsp_mw = pwr.dsp_uw as f64 / 1000.0;
+
+            for site in &model.device.sites {
+                if site.occupant.is_none() && site.bels.is_empty() {
+                    continue;
+                }
+                if let Some(i) = idx_of(site.x, site.y) {
+                    let bel_weight = (site.bels.len().max(1)) as f64;
+                    let add_mw = match site.kind {
+                        SiteKind::Clb => (dyn_logic_mw / occ_count).max(0.25) * bel_weight,
+                        SiteKind::Iob => dyn_io_mw.max(0.40),
+                        SiteKind::Bram => dyn_bram_mw.max(1.20),
+                        SiteKind::Dsp => dyn_dsp_mw.max(1.50),
+                        SiteKind::Clk => 0.35,
+                    };
+                    raws[i] += add_mw;
+                }
+            }
+            for r in &model.device.routes {
+                for &(tx, ty) in &r.tiles {
+                    if let Some(i) = idx_of(tx, ty) {
+                        raws[i] += 0.05;
+                    }
+                }
+            }
+            let min_p = raws.iter().copied().fold(f64::INFINITY, f64::min);
+            let max_p = raws.iter().copied().fold(0.0_f64, f64::max);
+            grid.min_raw = if min_p.is_finite() { min_p } else { 0.0 };
+            grid.max_raw = max_p;
+            for dy in 0..rows {
+                for dx in 0..cols {
+                    let i = (dy * cols + dx) as usize;
+                    let val = if max_p > 0.0 {
+                        (raws[i] / max_p).clamp(0.0, 1.0) as f32
+                    } else {
+                        0.0
+                    };
+                    let rgb = heatmap_mode_ramp(mode, val);
+                    grid.values[i] = val;
+                    grid.colors[i] = rgb;
+                    grid.cells.push(TileHeatmapCell {
+                        x: x0 + dx,
+                        y: y0 + dy,
+                        value: val,
+                        raw: raws[i],
+                        rgb,
+                    });
+                }
+            }
+        }
+        FloorplanHeatmapMode::ControlSetUtilization => {
+            const MAX_CTRL_SETS_PER_SLICE: f64 = 4.0;
+            for site in &model.device.sites {
+                if site.occupant.is_none() && site.bels.is_empty() {
+                    continue;
+                }
+                let Some(i) = idx_of(site.x, site.y) else {
+                    continue;
+                };
+                let mut ctrl_sets: BTreeSet<(String, String, String)> = BTreeSet::new();
+                if let Some(d) = model.shell.session.design.as_ref() {
+                    let mut cand_cells: Vec<&str> = Vec::new();
+                    if let Some(occ) = site.occupant.as_deref() {
+                        cand_cells.push(occ);
+                    }
+                    for b in &site.bels {
+                        cand_cells.push(b.as_str());
+                    }
+                    for cname in cand_cells {
+                        if let Some(cell) = d.cells.iter().find(|c| resolve(c.name) == cname) {
+                            if matches!(cell.kind, CellKind::Hff) {
+                                let mut clk = "-".to_string();
+                                let mut sr = "-".to_string();
+                                let mut ce = "-".to_string();
+                                for net in &d.nets {
+                                    for ep in &net.endpoints {
+                                        if resolve(ep.cell) == cname {
+                                            let p = resolve(ep.pin);
+                                            if p.eq_ignore_ascii_case("CLK")
+                                                || p.eq_ignore_ascii_case("C")
+                                            {
+                                                clk = resolve(net.name).to_string();
+                                            } else if p.eq_ignore_ascii_case("RST")
+                                                || p.eq_ignore_ascii_case("SR")
+                                                || p.eq_ignore_ascii_case("R")
+                                                || p.eq_ignore_ascii_case("S")
+                                            {
+                                                sr = resolve(net.name).to_string();
+                                            } else if p.eq_ignore_ascii_case("CE")
+                                                || p.eq_ignore_ascii_case("E")
+                                            {
+                                                ce = resolve(net.name).to_string();
+                                            }
+                                        }
+                                    }
+                                }
+                                ctrl_sets.insert((clk, sr, ce));
+                            }
+                        }
+                    }
+                }
+                // Fallback when synthetic site has BELs/occupant without a full HNF design:
+                if ctrl_sets.is_empty() && site.kind == SiteKind::Clb {
+                    ctrl_sets.insert(("clk".into(), "-".into(), "-".into()));
+                }
+                raws[i] = ctrl_sets.len() as f64;
+            }
+            let max_cs = raws.iter().copied().fold(0.0_f64, f64::max);
+            grid.min_raw = 0.0;
+            grid.max_raw = max_cs;
+            for dy in 0..rows {
+                for dx in 0..cols {
+                    let i = (dy * cols + dx) as usize;
+                    let val = (raws[i] / MAX_CTRL_SETS_PER_SLICE).clamp(0.0, 1.0) as f32;
+                    let rgb = if val > 0.0 {
+                        heatmap_mode_ramp(mode, val)
+                    } else {
+                        [0, 0, 0]
+                    };
+                    grid.values[i] = val;
+                    grid.colors[i] = rgb;
+                    grid.cells.push(TileHeatmapCell {
+                        x: x0 + dx,
+                        y: y0 + dy,
+                        value: val,
+                        raw: raws[i],
+                        rgb,
+                    });
+                }
+            }
+        }
+    }
+    grid
+}
+
+// ---------------------------------------------------------------------------
+// Wave-9: 2×4 (X0Y0..X1Y3) Clock-Region Grid & BUFG/MMCM Spine Visualizer
+// ---------------------------------------------------------------------------
+
+/// Color-coded clock domain badge inside a clock region.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClockDomainBadge {
+    pub net: String,
+    pub loads: usize,
+    pub rgb: [u8; 3],
+}
+
+/// Per-region clock spine, domain badges, and MMCM/PLL status in the 2×4 (`X0Y0..X1Y3`) grid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClockRegionSpine {
+    /// Region coordinate name (`"X0Y0"` .. `"X1Y3"`).
+    pub name: String,
+    pub grid_x: u32,
+    pub grid_y: u32,
+    pub x0: u32,
+    pub y0: u32,
+    pub x1: u32,
+    pub y1: u32,
+    pub total_sites: usize,
+    pub occupied_sites: usize,
+    pub bufg_used: usize,
+    pub bufg_capacity: usize,
+    pub bufh_used: usize,
+    pub bufh_capacity: usize,
+    pub clock_domains: Vec<ClockDomainBadge>,
+    pub mmcm_locked: bool,
+    pub pll_locked: bool,
+}
+
+/// 2×4 (`X0Y0..X1Y3`) Clock-Region Grid & BUFG/MMCM Spine Visualizer model.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClockRegionGrid {
+    pub cols: u32,
+    pub rows: u32,
+    /// The 8 clock regions (`X0Y0`, `X1Y0`, `X0Y1`, `X1Y1`, `X0Y2`, `X1Y2`, `X0Y3`, `X1Y3`).
+    pub regions: Vec<ClockRegionSpine>,
+    pub total_bufg_used: usize,
+    pub total_bufg_capacity: usize,
+    pub all_mmcm_locked: bool,
+}
+
+impl ClockRegionGrid {
+    pub fn region(&self, name: &str) -> Option<&ClockRegionSpine> {
+        self.regions.iter().find(|r| r.name.eq_ignore_ascii_case(name))
+    }
+}
+
+const CLOCK_DOMAIN_PALETTE: [[u8; 3]; 6] = [
+    [56, 178, 246],  // sky blue
+    [52, 211, 153],  // emerald
+    [245, 158, 11],  // amber
+    [167, 139, 250], // violet
+    [244, 114, 182], // pink
+    [45, 212, 191],  // teal
+];
+
+/// Partition the device fabric into a 2×4 (`X0Y0..X1Y3`) clock-region grid with
+/// per-region `BUFG`/`BUFH` clock spine utilization, clock net domain color badges,
+/// and MMCM/PLL lock status.
+pub fn build_clock_region_grid(model: &IdeModel) -> ClockRegionGrid {
+    let nx = 2u32;
+    let ny = 4u32;
+    let die_cols = model.device.cols.max(nx);
+    let die_rows = model.device.rows.max(ny);
+    let x0 = model.device.x0;
+    let y0 = model.device.y0;
+    let cw = die_cols.div_ceil(nx).max(1);
+    let rh = die_rows.div_ceil(ny).max(1);
+
+    // Collect active clock nets in deterministic order.
+    let mut clock_nets: Vec<String> = Vec::new();
+    for c in &model.constraints.clocks {
+        if !c.name.is_empty() && !clock_nets.contains(&c.name) {
+            clock_nets.push(c.name.clone());
+        }
+    }
+    let cn_report = model.clock_networks();
+    for net in &cn_report.networks {
+        if !net.net.is_empty() && !clock_nets.contains(&net.net) {
+            clock_nets.push(net.net.clone());
+        }
+    }
+    if clock_nets.is_empty() && model.device.occupied_count() > 0 {
+        clock_nets.push("clk".to_string());
+    }
+
+    let locked = !clock_nets.is_empty() && model.clock_period_ps > 0;
+    let mut regions = Vec::with_capacity((nx * ny) as usize);
+
+    for iy in 0..ny {
+        for ix in 0..nx {
+            let rx0 = x0 + ix * cw;
+            let ry0 = y0 + iy * rh;
+            let rx1 = (x0 + (ix + 1) * cw - 1).min(x0 + die_cols - 1).max(rx0);
+            let ry1 = (y0 + (iy + 1) * rh - 1).min(y0 + die_rows - 1).max(ry0);
+
+            let mut total_sites = 0usize;
+            let mut occupied_sites = 0usize;
+            let mut region_cells: Vec<&str> = Vec::new();
+            for s in &model.device.sites {
+                if s.x >= rx0 && s.x <= rx1 && s.y >= ry0 && s.y <= ry1 {
+                    total_sites += 1;
+                    if let Some(occ) = s.occupant.as_deref() {
+                        occupied_sites += 1;
+                        region_cells.push(occ);
+                    }
+                    for b in &s.bels {
+                        region_cells.push(b.as_str());
+                    }
+                }
+            }
+
+            let mut domains = Vec::new();
+            for (cidx, cnet) in clock_nets.iter().enumerate() {
+                let rgb = CLOCK_DOMAIN_PALETTE[cidx % CLOCK_DOMAIN_PALETTE.len()];
+                let mut loads_in_region = 0usize;
+                if let Some(d) = model.shell.session.design.as_ref() {
+                    if let Some(net) = d.nets.iter().find(|n| resolve(n.name) == cnet.as_str()) {
+                        for ep in &net.endpoints {
+                            let cname = resolve(ep.cell);
+                            if region_cells.contains(&cname) {
+                                loads_in_region += 1;
+                            }
+                        }
+                    }
+                }
+                if loads_in_region == 0 && occupied_sites > 0 && cidx == 0 {
+                    loads_in_region = occupied_sites;
+                }
+                if loads_in_region > 0 {
+                    domains.push(ClockDomainBadge {
+                        net: cnet.clone(),
+                        loads: loads_in_region,
+                        rgb,
+                    });
+                }
+            }
+
+            let bufg_used = domains.len();
+            let bufh_used = domains.iter().map(|d| usize::from(d.loads > 0)).sum();
+            regions.push(ClockRegionSpine {
+                name: format!("X{ix}Y{iy}"),
+                grid_x: ix,
+                grid_y: iy,
+                x0: rx0,
+                y0: ry0,
+                x1: rx1,
+                y1: ry1,
+                total_sites,
+                occupied_sites,
+                bufg_used,
+                bufg_capacity: 16,
+                bufh_used,
+                bufh_capacity: 12,
+                clock_domains: domains,
+                mmcm_locked: locked,
+                pll_locked: locked,
+            });
+        }
+    }
+
+    ClockRegionGrid {
+        cols: nx,
+        rows: ny,
+        regions,
+        total_bufg_used: clock_nets.len(),
+        total_bufg_capacity: 32,
+        all_mmcm_locked: locked,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wave-9: Interactive Pblock Resize & Resource Estimator
+// ---------------------------------------------------------------------------
+
+/// Eight cardinal and corner resize handles on a Pblock rectangle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PblockResizeHandle {
+    N,
+    S,
+    E,
+    W,
+    NE,
+    NW,
+    SE,
+    SW,
+}
+
+impl PblockResizeHandle {
+    pub const ALL: [PblockResizeHandle; 8] = [
+        PblockResizeHandle::N,
+        PblockResizeHandle::S,
+        PblockResizeHandle::E,
+        PblockResizeHandle::W,
+        PblockResizeHandle::NE,
+        PblockResizeHandle::NW,
+        PblockResizeHandle::SE,
+        PblockResizeHandle::SW,
+    ];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "N" => Some(Self::N),
+            "S" => Some(Self::S),
+            "E" => Some(Self::E),
+            "W" => Some(Self::W),
+            "NE" => Some(Self::NE),
+            "NW" => Some(Self::NW),
+            "SE" => Some(Self::SE),
+            "SW" => Some(Self::SW),
+            _ => None,
+        }
+    }
+}
+
+fn snap_coord_to_grid(val: i32, origin: i32, grid: i32) -> i32 {
+    if grid <= 1 {
+        return val;
+    }
+    let rel = val - origin;
+    let snapped = ((rel + grid / 2).div_euclid(grid)) * grid;
+    origin + snapped
+}
+
+/// Resize a Pblock rectangle `(x0, y0, x1, y1)` by dragging `handle` by
+/// `(delta_x, delta_y)` tiles, grid-snapping to `snap_grid` (minimum 1) and
+/// clamping within `die_bounds = (min_x, min_y, max_x, max_y)` while maintaining
+/// `x0 <= x1` and `y0 <= y1`.
+pub fn resize_pblock_rect(
+    rect: (u32, u32, u32, u32),
+    handle: PblockResizeHandle,
+    delta_x: i32,
+    delta_y: i32,
+    die_bounds: (u32, u32, u32, u32),
+    snap_grid: u32,
+) -> (u32, u32, u32, u32) {
+    let (bx0, by0, bx1, by1) = (
+        die_bounds.0.min(die_bounds.2) as i32,
+        die_bounds.1.min(die_bounds.3) as i32,
+        die_bounds.0.max(die_bounds.2) as i32,
+        die_bounds.1.max(die_bounds.3) as i32,
+    );
+    let grid = snap_grid.max(1) as i32;
+    let mut x0 = (rect.0.min(rect.2) as i32).clamp(bx0, bx1);
+    let mut y0 = (rect.1.min(rect.3) as i32).clamp(by0, by1);
+    let mut x1 = (rect.0.max(rect.2) as i32).clamp(bx0, bx1);
+    let mut y1 = (rect.1.max(rect.3) as i32).clamp(by0, by1);
+
+    match handle {
+        PblockResizeHandle::W | PblockResizeHandle::NW | PblockResizeHandle::SW => {
+            x0 = snap_coord_to_grid(x0 + delta_x, bx0, grid).clamp(bx0, x1);
+        }
+        PblockResizeHandle::E | PblockResizeHandle::NE | PblockResizeHandle::SE => {
+            x1 = snap_coord_to_grid(x1 + delta_x, bx0, grid).clamp(x0, bx1);
+        }
+        PblockResizeHandle::N | PblockResizeHandle::S => {}
+    }
+
+    match handle {
+        PblockResizeHandle::S | PblockResizeHandle::SE | PblockResizeHandle::SW => {
+            y0 = snap_coord_to_grid(y0 + delta_y, by0, grid).clamp(by0, y1);
+        }
+        PblockResizeHandle::N | PblockResizeHandle::NE | PblockResizeHandle::NW => {
+            y1 = snap_coord_to_grid(y1 + delta_y, by0, grid).clamp(y0, by1);
+        }
+        PblockResizeHandle::E | PblockResizeHandle::W => {}
+    }
+
+    (x0 as u32, y0 as u32, x1 as u32, y1 as u32)
+}
+
+/// Instant capacity vs. assigned cell demand calculation for a Pblock rectangle.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PblockResourceEstimate {
+    pub pblock_name: String,
+    pub x0: u32,
+    pub y0: u32,
+    pub x1: u32,
+    pub y1: u32,
+    /// Enclosed CLB / SLICE capacity inside `(x0..=x1, y0..=y1)`.
+    pub slice_capacity: usize,
+    /// Assigned SLICE (LUT/FF) demand for this Pblock.
+    pub slice_demand: usize,
+    /// Enclosed DSP48 site capacity inside `(x0..=x1, y0..=y1)`.
+    pub dsp48_capacity: usize,
+    /// Assigned DSP48 (`Mac27` / `Dsp48e1`) demand for this Pblock.
+    pub dsp48_demand: usize,
+    /// Enclosed RAMB18 site capacity inside `(x0..=x1, y0..=y1)`.
+    pub ramb18_capacity: usize,
+    /// Assigned RAMB18 (`Bram18` / `Bram18e1`) demand for this Pblock.
+    pub ramb18_demand: usize,
+    /// Enclosed RAMB36 equivalent capacity (`ramb18_capacity / 2`).
+    pub ramb36_capacity: usize,
+    /// Assigned RAMB36 demand for this Pblock.
+    pub ramb36_demand: usize,
+    /// True when every resource's enclosed capacity is `>=` its assigned demand.
+    pub fits: bool,
+}
+
+impl PblockResourceEstimate {
+    pub fn summary_text(&self) -> String {
+        format!(
+            "pblock_est NAME={} RANGE=CLB_X{}Y{}:CLB_X{}Y{} SLICE={}/{} DSP48={}/{} RAMB18={}/{} RAMB36={}/{} FITS={}",
+            self.pblock_name,
+            self.x0,
+            self.y0,
+            self.x1,
+            self.y1,
+            self.slice_demand,
+            self.slice_capacity,
+            self.dsp48_demand,
+            self.dsp48_capacity,
+            self.ramb18_demand,
+            self.ramb18_capacity,
+            self.ramb36_demand,
+            self.ramb36_capacity,
+            u8::from(self.fits)
+        )
+    }
+}
+
+/// Calculate enclosed `SLICE`, `DSP48`, and `RAMB18`/`RAMB36` site capacity vs.
+/// assigned cell demand for `pblock`.
+pub fn estimate_pblock_resources(model: &IdeModel, pblock: &Pblock) -> PblockResourceEstimate {
+    let mut slice_capacity = 0usize;
+    let mut dsp48_capacity = 0usize;
+    let mut ramb18_capacity = 0usize;
+    if pblock.ranged {
+        for s in &model.device.sites {
+            if pblock.contains(s.x, s.y) {
+                match s.kind {
+                    SiteKind::Clb => slice_capacity += 1,
+                    SiteKind::Dsp => dsp48_capacity += 1,
+                    SiteKind::Bram => ramb18_capacity += 1,
+                    SiteKind::Iob | SiteKind::Clk => {}
+                }
+            }
+        }
+    }
+    let ramb36_capacity = ramb18_capacity / 2;
+
+    let mut lut_demand = 0usize;
+    let mut ff_demand = 0usize;
+    let mut carry_demand = 0usize;
+    let mut dsp48_demand = 0usize;
+    let mut ramb18_demand = 0usize;
+    let mut ramb36_demand = 0usize;
+
+    if let Some(d) = model.shell.session.design.as_ref() {
+        let filter_set: HashSet<&str> = pblock.cells.iter().map(String::as_str).collect();
+        for cell in &d.cells {
+            let cname = resolve(cell.name);
+            if !filter_set.is_empty() && !filter_set.contains(cname) {
+                continue;
+            }
+            match cell.kind {
+                CellKind::Lut6 { .. } => lut_demand += 1,
+                CellKind::Hff => ff_demand += 1,
+                CellKind::Carry4 => carry_demand += 1,
+                CellKind::Mac27 | CellKind::Dsp48e1 { .. } => dsp48_demand += 1,
+                CellKind::Bram18 | CellKind::Bram18e1 { .. } => ramb18_demand += 1,
+                CellKind::IobIn
+                | CellKind::IobOut
+                | CellKind::ClockBuf
+                | CellKind::Ila { .. }
+                | CellKind::BlackBox { .. } => {}
+            }
+        }
+    } else {
+        for cname in &pblock.cells {
+            let low = cname.to_ascii_lowercase();
+            if low.contains("dsp") || low.contains("mac") {
+                dsp48_demand += 1;
+            } else if low.contains("ramb36") {
+                ramb36_demand += 1;
+                ramb18_demand += 2;
+            } else if low.contains("bram") || low.contains("ramb18") {
+                ramb18_demand += 1;
+            } else if low.contains("ff") {
+                ff_demand += 1;
+            } else {
+                lut_demand += 1;
+            }
+        }
+    }
+
+    let slice_demand = lut_demand.max(ff_demand) + carry_demand;
+    let fits = pblock.ranged
+        && slice_demand <= slice_capacity
+        && dsp48_demand <= dsp48_capacity
+        && ramb18_demand <= ramb18_capacity
+        && ramb36_demand <= ramb36_capacity;
+
+    PblockResourceEstimate {
+        pblock_name: pblock.name.clone(),
+        x0: pblock.x0,
+        y0: pblock.y0,
+        x1: pblock.x1,
+        y1: pblock.y1,
+        slice_capacity,
+        slice_demand,
+        dsp48_capacity,
+        dsp48_demand,
+        ramb18_capacity,
+        ramb18_demand,
+        ramb36_capacity,
+        ramb36_demand,
+        fits,
     }
 }
 
