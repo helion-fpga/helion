@@ -2,7 +2,10 @@
 
 mod opt;
 
-pub use opt::LutOptStats;
+pub use opt::{
+    canonicalize_lut6, lut6_input_is_dont_care, LutOptStats, MuxfKind, OptDesignStats,
+    PhysOptStats, WideConeDecomp, WideTruthTable, BUF_INIT, INV_INIT, MUXF_INIT,
+};
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
