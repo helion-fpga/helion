@@ -2158,7 +2158,6 @@ pub fn place_analytical_with_stats(
 
     let n_ble = dev.n_ble.max(1) as usize;
     let cols_count = ((max_x - min_x) as usize + 1).max(1);
-    let rows_count = ((max_y - min_y) as usize + 1).max(1);
     let mut anchor_x = x.clone();
     let mut anchor_y = y.clone();
     let outer_iters = opts.outer_iters.max(1);
