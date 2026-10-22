@@ -130,13 +130,18 @@ fn synth_any(path: &str) -> Result<helion_ir::Design, String> {
     Ok(d)
 }
 
-fn compile_sv(path: &str, part: &str, timing_weight: f64) -> Result<Compiled, String> {
+fn compile_sv(path: &str, part: &str, timing_weight: f64, seed: u64) -> Result<Compiled, String> {
     let design = synth_any(path)?;
-    compile_design(design, part, timing_weight)
+    compile_design(design, part, timing_weight, seed)
 }
 
-fn compile_design(design: Design, part: &str, timing_weight: f64) -> Result<Compiled, String> {
-    compile_design_xdc(design, part, timing_weight, &Constraints::default())
+fn compile_design(
+    design: Design,
+    part: &str,
+    timing_weight: f64,
+    seed: u64,
+) -> Result<Compiled, String> {
+    compile_design_xdc(design, part, timing_weight, &Constraints::default(), seed)
 }
 
 fn compile_design_xdc(
@@ -144,6 +149,7 @@ fn compile_design_xdc(
     part: &str,
     timing_weight: f64,
     xdc: &Constraints,
+    seed: u64,
 ) -> Result<Compiled, String> {
     apply_xdc(&mut design, xdc)?;
     let t_dev = std::time::Instant::now();
@@ -197,7 +203,7 @@ fn compile_design_xdc(
         &dev,
         PlaceOpts {
             timing_weight,
-            seed: 0,
+            seed,
         },
         &guide,
     )?;
@@ -363,6 +369,7 @@ fn main() {
         "synth" => cmd_synth(&args),
         "equiv" => cmd_equiv(&args),
         "impl" => cmd_impl(&args),
+        "multiseed" => cmd_multiseed(&args),
         "run" => cmd_run(&args),
         "report_timing" => cmd_timing(&args),
         "report_utilization" => cmd_util(&args),
@@ -598,7 +605,10 @@ fn cmd_equiv(args: &[String]) {
 fn cmd_impl(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
     let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
-    let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
+    let seed: u64 = take_flag(args, "--seed")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let c = compile_sv(path, &part, 0.0, seed).unwrap_or_else(|e| {
         eprintln!("impl: {e}");
         std::process::exit(1);
     });
@@ -615,13 +625,257 @@ fn cmd_impl(args: &[String]) {
     maybe_export_dashboard(path, &c, args);
 }
 
+/// One seed's result from the multiseed sweep.
+#[derive(Clone, Debug)]
+struct SeedResult {
+    seed: u64,
+    wns_ps: i64,
+    tns_ps: i64,
+    runtime_s: f64,
+    status: String,
+    reason: String,
+}
+
+impl SeedResult {
+    fn to_jsonl(&self) -> String {
+        // Manual JSON: no serde dependency in helion-cli. Reason is sanitized
+        // to one line with quotes/backslashes escaped.
+        let reason = self.reason.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ");
+        format!(
+            "{{\"seed\": {}, \"wns_ps\": {}, \"tns_ps\": {}, \"runtime_s\": {:.3}, \"status\": \"{}\", \"reason\": \"{}\"}}",
+            self.seed, self.wns_ps, self.tns_ps, self.runtime_s, self.status, reason
+        )
+    }
+
+    /// Parse the seed field back from a JSONL line we wrote. Returns None if
+    /// the line is not one of ours.
+    fn parse_seed(line: &str) -> Option<u64> {
+        let key = "\"seed\":";
+        let i = line.find(key)?;
+        let rest = line[i + key.len()..].trim_start();
+        let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        rest[..end].parse().ok()
+    }
+}
+
+/// Read an existing JSONL results file and return the set of seeds already
+/// recorded (ok or failed). Missing file = empty set.
+fn read_completed_seeds(path: &str) -> std::collections::HashSet<u64> {
+    let mut set = std::collections::HashSet::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return set;
+    };
+    for line in text.lines() {
+        if let Some(seed) = SeedResult::parse_seed(line) {
+            set.insert(seed);
+        }
+    }
+    set
+}
+
+/// Deterministic best-seed selection. Among seeds with status "ok" and
+/// wns_ps >= threshold, pick the highest wns_ps (most timing margin);
+/// tie-break on lowest tns_ps, then lowest seed. Returns None when no seed
+/// passes the threshold.
+fn select_best_seed<'a>(results: &'a [SeedResult], threshold: i64) -> Option<&'a SeedResult> {
+    results
+        .iter()
+        .filter(|r| r.status == "ok" && r.wns_ps >= threshold)
+        .max_by(|a, b| {
+            a.wns_ps
+                .cmp(&b.wns_ps)
+                .then_with(|| b.tns_ps.cmp(&a.tns_ps))
+                .then_with(|| b.seed.cmp(&a.seed))
+        })
+}
+
+/// Overnight multi-seed timing-closure flow.
+///
+/// Runs place+route+STA for each seed in [seed_start, seed_start + n_seeds),
+/// appends per-seed { seed, wns_ps, tns_ps, runtime_s } records to a JSONL
+/// file, and reports the best seed deterministically. Best-seed rule: among
+/// seeds with wns_ps >= threshold, highest wns_ps wins (most timing margin);
+/// ties break on lowest tns_ps, then lowest seed. Checkpoint: seeds already
+/// present in the JSONL are skipped, so a dead run resumes where it stopped
+/// instead of restarting from seed 0. Failed seeds are recorded with their
+/// reason, never silently skipped.
+fn cmd_multiseed(args: &[String]) {
+    let path = positional(args).unwrap_or("examples/blinky.sv").to_string();
+    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let n_seeds: u64 = take_flag(args, "--seeds")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+    let seed_start: u64 = take_flag(args, "--seed-start")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let jobs: usize = take_flag(args, "--jobs")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2)
+        .max(1);
+    let out_path = take_flag(args, "--out").unwrap_or_else(|| "multiseed_results.jsonl".into());
+    let threshold: i64 = take_flag(args, "--threshold")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    if n_seeds == 0 {
+        eprintln!("multiseed: --seeds must be > 0");
+        std::process::exit(1);
+    }
+
+    // Synth once; place/route/STA per seed. Synth has no seed dependence.
+    let design = synth_any(&path).unwrap_or_else(|e| {
+        eprintln!("multiseed synth: {e}");
+        std::process::exit(1);
+    });
+
+    let completed = read_completed_seeds(&out_path);
+    let seeds: Vec<u64> = (seed_start..seed_start + n_seeds)
+        .filter(|s| !completed.contains(s))
+        .collect();
+    println!(
+        "multiseed: design={} part={} seeds={}..{} jobs={} threshold_wns_ps={} ({} already done, {} to run) out={}",
+        path,
+        part,
+        seed_start,
+        seed_start + n_seeds - 1,
+        jobs,
+        threshold,
+        completed.len(),
+        seeds.len(),
+        out_path
+    );
+    if seeds.is_empty() {
+        println!("multiseed: nothing to run");
+    } else {
+        use std::io::Write;
+        use std::sync::Mutex;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&out_path)
+            .unwrap_or_else(|e| {
+                eprintln!("multiseed: cannot open {out_path}: {e}");
+                std::process::exit(1);
+            });
+        let file = Mutex::new(file);
+        let design_ref = &design;
+        let part_ref = &part;
+
+        // Rayon thread pool sized to --jobs. Each task runs the full backend
+        // for one seed and appends its record under the file mutex, so a
+        // killed run keeps every finished seed as a checkpoint.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            .build()
+            .unwrap_or_else(|e| {
+                eprintln!("multiseed: cannot build thread pool: {e}");
+                std::process::exit(1);
+            });
+        pool.install(|| {
+            use rayon::prelude::*;
+            seeds.par_iter().for_each(|&seed| {
+                let t0 = std::time::Instant::now();
+                let result = match compile_design(design_ref.clone(), part_ref, 0.0, seed) {
+                    Ok(c) => SeedResult {
+                        seed,
+                        wns_ps: c.timing.wns_ps,
+                        tns_ps: c.timing.tns_ps,
+                        runtime_s: t0.elapsed().as_secs_f64(),
+                        status: "ok".to_string(),
+                        reason: String::new(),
+                    },
+                    Err(e) => SeedResult {
+                        seed,
+                        wns_ps: 0,
+                        tns_ps: 0,
+                        runtime_s: t0.elapsed().as_secs_f64(),
+                        status: "fail".to_string(),
+                        reason: e.chars().take(200).collect(),
+                    },
+                };
+                let line = result.to_jsonl();
+                let mut f = file.lock().unwrap();
+                let _ = writeln!(f, "{line}");
+                let _ = f.flush();
+                eprintln!(
+                    "multiseed: seed={} status={} wns_ps={} tns_ps={} runtime_s={:.1}",
+                    result.seed, result.status, result.wns_ps, result.tns_ps, result.runtime_s
+                );
+            });
+        });
+    }
+
+    // Report: re-read the full JSONL (checkpointed + this run) so the
+    // best-seed decision is deterministic over everything on disk.
+    let mut results: Vec<SeedResult> = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(&out_path) {
+        for line in text.lines() {
+            // Re-parse our own lines. Keep it simple: seed + status + numbers.
+            let seed = SeedResult::parse_seed(line);
+            let status = if line.contains("\"status\": \"ok\"") {
+                "ok"
+            } else {
+                "fail"
+            };
+            let num = |key: &str| -> i64 {
+                let k = format!("\"{key}\":");
+                line.find(&k)
+                    .and_then(|i| {
+                        let rest = line[i + k.len()..].trim_start();
+                        let end = rest
+                            .find(|c: char| !c.is_ascii_digit() && c != '-')
+                            .unwrap_or(rest.len());
+                        rest[..end].parse().ok()
+                    })
+                    .unwrap_or(0)
+            };
+            if let Some(seed) = seed {
+                results.push(SeedResult {
+                    seed,
+                    wns_ps: num("wns_ps"),
+                    tns_ps: num("tns_ps"),
+                    runtime_s: 0.0,
+                    status: status.to_string(),
+                    reason: String::new(),
+                });
+            }
+        }
+    }
+    results.sort_by_key(|r| r.seed);
+    results.dedup_by_key(|r| r.seed);
+
+    let n_ok = results.iter().filter(|r| r.status == "ok").count();
+    let n_fail = results.len() - n_ok;
+    match select_best_seed(&results, threshold) {
+        Some(best) => println!(
+            "multiseed: BEST seed={} wns_ps={} tns_ps={} ({}/{} ok, {}/{} fail, threshold_wns_ps={})",
+            best.seed,
+            best.wns_ps,
+            best.tns_ps,
+            n_ok,
+            results.len(),
+            n_fail,
+            results.len(),
+            threshold
+        ),
+        None => println!(
+            "multiseed: NO seed met threshold_wns_ps={} ({}/{} ok, {}/{} fail)",
+            threshold,
+            n_ok,
+            results.len(),
+            n_fail,
+            results.len()
+        ),
+    }
+}
+
 fn cmd_run(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
     let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
     let cycles: u32 = take_flag(args, "--cycles")
         .and_then(|s| s.parse().ok())
         .unwrap_or(16);
-    let c = compile_sv(path, &part, 0.75).unwrap_or_else(|e| {
+    let c = compile_sv(path, &part, 0.75, 0).unwrap_or_else(|e| {
         eprintln!("run: {e}");
         std::process::exit(1);
     });
@@ -665,7 +919,7 @@ fn cmd_run(args: &[String]) {
 fn cmd_timing(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
     let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
-    let c = compile_sv(path, &part, 0.75).unwrap_or_else(|e| {
+    let c = compile_sv(path, &part, 0.75, 0).unwrap_or_else(|e| {
         eprintln!("report_timing: {e}");
         std::process::exit(1);
     });
@@ -702,7 +956,7 @@ fn cmd_timing(args: &[String]) {
 fn cmd_util(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
     let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
-    let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
+    let c = compile_sv(path, &part, 0.0, 0).unwrap_or_else(|e| {
         eprintln!("report_utilization: {e}");
         std::process::exit(1);
     });
@@ -736,7 +990,7 @@ fn power_of(c: &Compiled) -> PowerReport {
 fn cmd_power(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
     let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
-    let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
+    let c = compile_sv(path, &part, 0.0, 0).unwrap_or_else(|e| {
         eprintln!("report_power: {e}");
         std::process::exit(1);
     });
@@ -747,7 +1001,7 @@ fn cmd_power(args: &[String]) {
 fn cmd_reports(args: &[String]) {
     let path = positional(args).unwrap_or("examples/counter.sv");
     let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
-    let c = compile_sv(path, &part, 0.75).unwrap_or_else(|e| {
+    let c = compile_sv(path, &part, 0.75, 0).unwrap_or_else(|e| {
         eprintln!("reports: {e}");
         std::process::exit(1);
     });
@@ -806,7 +1060,7 @@ fn cmd_bits(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
     let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
     let out = take_flag(args, "-o").or_else(|| take_flag(args, "--output"));
-    let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
+    let c = compile_sv(path, &part, 0.0, 0).unwrap_or_else(|e| {
         eprintln!("bitstream: {e}");
         std::process::exit(1);
     });
@@ -834,7 +1088,7 @@ fn cmd_eco(args: &[String]) {
     let init = take_flag(args, "--init").unwrap_or_else(|| "0xAAAAAAAAAAAAAAAA".into());
     let new_init = u64::from_str_radix(init.trim_start_matches("0x").trim_start_matches("0X"), 16)
         .unwrap_or(0xAAAA_AAAA_AAAA_AAAA);
-    let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
+    let c = compile_sv(path, &part, 0.0, 0).unwrap_or_else(|e| {
         eprintln!("eco: {e}");
         std::process::exit(1);
     });
@@ -851,7 +1105,7 @@ fn cmd_eco(args: &[String]) {
 fn cmd_pblock(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
     let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
-    let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
+    let c = compile_sv(path, &part, 0.0, 0).unwrap_or_else(|e| {
         eprintln!("pblock: {e}");
         std::process::exit(1);
     });
@@ -872,7 +1126,7 @@ fn cmd_qor(args: &[String]) {
     let path = positional(args).unwrap_or("examples/counter.sv");
     let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
     let t0 = std::time::Instant::now();
-    let c = compile_sv(path, &part, 0.75).unwrap_or_else(|e| {
+    let c = compile_sv(path, &part, 0.75, 0).unwrap_or_else(|e| {
         eprintln!("qor: {e}");
         std::process::exit(1);
     });
@@ -1624,11 +1878,11 @@ fn doctor() {
         st.gts as u8,
         st.crc_err as u8
     );
-    let c = compile_design(Design::structural_blinky(), "HL10T-C32-1", 0.0).unwrap();
+    let c = compile_design(Design::structural_blinky(), "HL10T-C32-1", 0.0, 0).unwrap();
     let _ = place(&c.routed.placed.packed, &dev);
     let _ = Fabric::new(&dev);
     println!("  blinky pack/place/route/bitgen/drc: ok");
-    let cc = compile_design(Design::structural_counter(), "HL10T-C32-1", 0.75).unwrap();
+    let cc = compile_design(Design::structural_counter(), "HL10T-C32-1", 0.75, 0).unwrap();
     println!(
         "  counter lutffs={} iob_ble={} pathfinder={} WNS_PS={}",
         cc.routed.placed.packed.lutffs.len(),
@@ -1637,4 +1891,105 @@ fn doctor() {
         cc.timing.wns_ps
     );
     println!("ok");
+}
+
+#[cfg(test)]
+mod multiseed_tests {
+    use super::*;
+
+    fn mk(seed: u64, wns_ps: i64, tns_ps: i64, status: &str) -> SeedResult {
+        SeedResult {
+            seed,
+            wns_ps,
+            tns_ps,
+            runtime_s: 1.0,
+            status: status.to_string(),
+            reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn best_seed_picks_highest_wns_then_lowest_tns_then_lowest_seed() {
+        let results = vec![
+            mk(3, 100, 50, "ok"),
+            mk(1, 100, 50, "ok"),
+            mk(2, 90, 30, "ok"),
+        ];
+        let best = select_best_seed(&results, 0).unwrap();
+        // seeds 1 and 3 tie on WNS=100/TNS=50; lowest seed wins
+        assert_eq!(best.seed, 1);
+
+        let results2 = vec![mk(1, 100, 50, "ok"), mk(2, 100, 30, "ok")];
+        let best2 = select_best_seed(&results2, 0).unwrap();
+        // tie on WNS; lower TNS wins
+        assert_eq!(best2.seed, 2);
+    }
+
+    #[test]
+    fn best_seed_prefers_higher_wns_over_lower_tns() {
+        // WNS is the primary key: more margin beats less total violation
+        let results = vec![mk(1, 200, 500, "ok"), mk(2, 100, 10, "ok")];
+        let best = select_best_seed(&results, 0).unwrap();
+        assert_eq!(best.seed, 1);
+    }
+
+    #[test]
+    fn best_seed_respects_threshold_and_ignores_failures() {
+        let results = vec![
+            mk(1, -10, 5, "ok"),
+            mk(2, 0, 0, "fail"),
+            mk(3, 50, 20, "ok"),
+        ];
+        // threshold 0: seed 1 fails WNS, seed 2 failed outright
+        let best = select_best_seed(&results, 0).unwrap();
+        assert_eq!(best.seed, 3);
+        // threshold 100: nothing passes
+        assert!(select_best_seed(&results, 100).is_none());
+    }
+
+    #[test]
+    fn jsonl_roundtrip_preserves_seed() {
+        let r = SeedResult {
+            seed: 42,
+            wns_ps: 9140,
+            tns_ps: 100,
+            runtime_s: 1.234,
+            status: "ok".to_string(),
+            reason: String::new(),
+        };
+        let line = r.to_jsonl();
+        assert_eq!(SeedResult::parse_seed(&line), Some(42));
+        assert!(line.contains("\"wns_ps\": 9140"));
+    }
+
+    #[test]
+    fn jsonl_escapes_reason_safely() {
+        let mut r = mk(7, 0, 0, "fail");
+        r.reason = "place failed: \"bad\" \\ oops\nnewline".to_string();
+        let line = r.to_jsonl();
+        // No raw newlines or unescaped quotes in the record
+        assert!(!line[..line.len().saturating_sub(1)].contains('\n'));
+        assert_eq!(SeedResult::parse_seed(&line), Some(7));
+    }
+
+    #[test]
+    fn checkpoint_reads_completed_seeds() {
+        let dir = std::env::temp_dir().join("helion_multiseed_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("ckpt.jsonl");
+        let p = path.to_str().unwrap().to_string();
+        std::fs::write(
+            &path,
+            "{\"seed\": 1, \"wns_ps\": 100, \"tns_ps\": 0, \"runtime_s\": 1.0, \"status\": \"ok\", \"reason\": \"\"}\n\
+             not-json garbage\n\
+             {\"seed\": 3, \"wns_ps\": 0, \"tns_ps\": 0, \"runtime_s\": 0.5, \"status\": \"fail\", \"reason\": \"boom\"}\n",
+        )
+        .unwrap();
+        let done = read_completed_seeds(&p);
+        assert!(done.contains(&1));
+        assert!(done.contains(&3));
+        assert!(!done.contains(&2));
+        assert!(read_completed_seeds("/nonexistent/path.jsonl").is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
 }
