@@ -1,8 +1,9 @@
 # Helion project for the ZedBoard blinky (xc7z020clg484-1).
 #
-# Reproducible build (run from the repo root of the merged bring-up branch):
-#   cargo test -p helion-xilinx7 --test zedboard_e2e
-# The end-to-end driver test above runs:
+# This file declares the complete, reproducible input set for the bitstream:
+# part, RTL source, and pin constraints. The coordinator consumes it in the
+# merged bring-up branch (fm/zedboard-bringup) with the 7-series end-to-end
+# driver (same shape as crates/helion-xilinx7/tests/blinky_e2e.rs):
 #   synth examples/zedboard_blinky.sv
 #   -> read_xdc examples/zedboard.xdc (PACKAGE_PIN / IOSTANDARD / create_clock)
 #   -> pack / place / route for xc7z020
