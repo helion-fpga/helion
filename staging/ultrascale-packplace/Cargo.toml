@@ -1,0 +1,10 @@
+[package]
+name = "ultrascale-packplace-staging"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+helion-ir = { path = "../../crates/helion-ir" }
+helion-sv = { path = "../../crates/helion-sv" }
