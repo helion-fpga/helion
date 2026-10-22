@@ -6,7 +6,8 @@
 # (repo cloned 2026-10-22; every PACKAGE_PIN below is copied verbatim from
 # that file; no pin was invented or guessed).
 #
-# Signal mapping for examples/zedboard_blinky.sv:
+# Signal mapping for examples/zedboard_blinky.sv (top uses clk and led[7:0];
+# btn[4:0] pins are provided here for bring-up use):
 #   clk    <- GCLK, 100 MHz PL oscillator (Bank 13, fixed 3.3V)
 #   led[0] <- LD0 ... led[7] <- LD7 (Bank 33, fixed 3.3V, active high)
 #   btn[0] <- BTNC, btn[1] <- BTND, btn[2] <- BTNL,
