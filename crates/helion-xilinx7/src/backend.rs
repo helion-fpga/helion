@@ -27,19 +27,23 @@ pub struct Xilinx7Backend {
 }
 
 impl Xilinx7Backend {
-    /// Open the backend for `part` (e.g. `"xc7a35t"`), loading the X-Ray
-    /// device database and precomputing the routing node maps.
+    /// Open the backend for `part` (e.g. `"xc7a35t"` or `"xc7z020"`), loading
+    /// the X-Ray device database and precomputing the routing node maps.
     ///
     /// Only parts with a wired-up database are accepted; anything else is a
     /// clear error, not a silent fallback.
     pub fn open(part: impl Into<String>) -> Result<Self, String> {
         let part = part.into();
-        if part != "xc7a35t" {
-            return Err(format!(
-                "unsupported part {part}: only xc7a35t has an X-Ray database wired up"
-            ));
-        }
-        let mut device = Device::load_xc7a35t(&default_db_root())?;
+        let loader: fn(&std::path::Path) -> Result<Device, String> = match part.as_str() {
+            "xc7a35t" => Device::load_xc7a35t,
+            "xc7z020" => Device::load_xc7z020,
+            _ => {
+                return Err(format!(
+                    "unsupported part {part}: only xc7a35t and xc7z020 have X-Ray databases wired up"
+                ))
+            }
+        };
+        let mut device = loader(&default_db_root())?;
         let node_maps = build_node_map(&mut device);
         Ok(Self {
             part,
@@ -139,6 +143,17 @@ mod tests {
     fn open_rejects_unknown_part() {
         let err = Xilinx7Backend::open("xc7a100t").expect_err("unknown part must fail");
         assert!(err.contains("xc7a100t"), "{err}");
+    }
+
+    #[test]
+    fn open_accepts_xc7z020() {
+        let b = Xilinx7Backend::open("xc7z020").expect("open xc7z020");
+        assert!(
+            b.device_id().contains("xc7z020"),
+            "device_id = {}",
+            b.device_id()
+        );
+        assert_eq!(b.device().part().idcode, 0x0372_7093);
     }
 
     #[test]

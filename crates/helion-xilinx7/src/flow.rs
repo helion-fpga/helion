@@ -15,8 +15,9 @@ pub fn run(netlist: &NetlistIr) -> Result<Bitstream7, String> {
     run_for_part(netlist, "xc7a35t")
 }
 
-/// Same as [`run`] but for an explicit part. Only `xc7a35t` has an X-Ray
-/// database wired up; anything else is a clear error, not a silent fallback.
+/// Same as [`run`] but for an explicit part. `xc7a35t` and `xc7z020` have
+/// X-Ray databases wired up; anything else is a clear error, not a silent
+/// fallback.
 pub fn run_for_part(netlist: &NetlistIr, part: &str) -> Result<Bitstream7, String> {
     Xilinx7Backend::open(part)?.run(netlist)
 }
