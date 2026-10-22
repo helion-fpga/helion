@@ -238,16 +238,26 @@ fn ff_bel(bel: &str) -> Result<String, String> {
     Ok(format!("{letter}FF"))
 }
 
-/// Which AFFMUX input feeds this FF's D. When the FF is paired with a LUT
+/// Which FFMUX input feeds this FF's D. When the FF is paired with a LUT
 /// on the same BEL letter (pack's pairing invariant), D comes from the
-/// LUT's O via the `AX` mux input.
+/// LUT's O via the letter-matched mux input (`AX` for AFF, `BX` for BFF,
+/// `CX` for CFF, `DX` for DFF). The X-Ray DB only documents the
+/// letter-matched option per BEL; the bare `AX` default is invalid for
+/// B/C/D (no `BFFMUX.AX` in segbits).
 fn mux_for_ff(
     ff: &crate::place::PlacedFf,
     packed: &crate::pack::Packed7,
     placed: &Placed7,
 ) -> &'static str {
     let letter = ff.bel.chars().next().unwrap_or('A');
-    // Find the FF's D net driver: if it's a LUT on the same site+letter, use AX.
+    let mux_in: &'static str = match letter {
+        'B' => "BX",
+        'C' => "CX",
+        'D' => "DX",
+        _ => "AX",
+    };
+    // Find the FF's D net driver: if it's a LUT on the same site+letter,
+    // use the letter-matched mux input.
     if let Some(pff) = packed.ffs.iter().find(|f| f.name == ff.name) {
         for lut in &placed.luts {
             if lut.site == ff.site
@@ -259,12 +269,12 @@ fn mux_for_ff(
                     .map(|l| l.output_net == pff.d_net)
                     .unwrap_or(false)
             {
-                return "AX";
+                return mux_in;
             }
         }
     }
-    // Default: AX (most common); the router/emitter can refine.
-    "AX"
+    // Default: letter-matched input (most common); the router/emitter can refine.
+    mux_in
 }
 
 #[cfg(test)]

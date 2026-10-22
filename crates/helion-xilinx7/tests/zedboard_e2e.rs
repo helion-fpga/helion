@@ -102,6 +102,23 @@ fn load_segbits(zynq7: &Path, types: &[&str]) -> SegBitsDb {
                 .unwrap();
         }
     }
+    // prjxray-db has no segbits_riob33_sing.db (DB gap). RIOB33_SING is the
+    // single-IOB variant of RIOB33; alias its segbits so SING IOB config
+    // encodes. Bit positions are assumed compatible for the Y0 site.
+    // This is documented as a bring-up assumption to be validated on HW.
+    if types.contains(&"RIOB33_SING") {
+        let seg = zynq7.join("segbits_riob33.db");
+        if seg.is_file() {
+            let text = std::fs::read_to_string(&seg).unwrap();
+            let aliased = text.replace("RIOB33.", "RIOB33_SING.");
+            db.add_segbits(
+                "RIOB33_SING",
+                BlockType::ClbIoClk,
+                &aliased,
+            )
+            .unwrap();
+        }
+    }
     db
 }
 
