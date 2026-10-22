@@ -187,7 +187,28 @@ impl Device {
         let artix7 = db_root.join("artix7");
         let fabric = artix7.join("xc7a50t");
         let partdir = artix7.join("xc7a35tcsg324-1");
+        Self::load_from_dirs(&artix7, &fabric, &partdir)
+    }
 
+    /// Load the full `xc7z020` device model from the raw X-Ray DB.
+    ///
+    /// `db_root` is the directory holding `zynq7/` (see [`default_db_root`]).
+    /// Unlike Artix-7, prjxray-db stores the zynq7 family DB files
+    /// (`tile_type_*.json`, `segbits_*.db`, `mask_*.db`, `ppips_*.db`)
+    /// directly under `zynq7/` (shared by all zynq7 parts); only
+    /// `tilegrid.json` / `tileconn.json` live in the part-specific
+    /// `zynq7/xc7z020/` dir, with part files in `zynq7/xc7z020clg484-1/`.
+    pub fn load_xc7z020(db_root: &Path) -> Result<Self, String> {
+        let zynq7 = db_root.join("zynq7");
+        let fabric = zynq7.join("xc7z020");
+        let partdir = zynq7.join("xc7z020clg484-1");
+        Self::load_from_dirs(&zynq7, &fabric, &partdir)
+    }
+
+    /// Shared loader core: `family` holds the per-tile-type DB files,
+    /// `fabric` holds `tilegrid.json` and `tileconn.json`, and `partdir`
+    /// holds `part.json` and `package_pins.csv`.
+    fn load_from_dirs(family: &Path, fabric: &Path, partdir: &Path) -> Result<Self, String> {
         let grid = load_tilegrid(&fabric.join("tilegrid.json"))?;
         let conn = load_tileconn(&fabric.join("tileconn.json"))?;
         let part = load_part(&partdir.join("part.json"))?;
@@ -228,7 +249,7 @@ impl Device {
 
         // Load per-type DB files.
         for (id, name) in type_names.iter().enumerate() {
-            Self::load_tile_type_db(&artix7, name, &mut dev.types[id], &mut dev.missing_db_types)?;
+            Self::load_tile_type_db(family, name, &mut dev.types[id], &mut dev.missing_db_types)?;
         }
 
         // Instantiate tiles.
@@ -879,5 +900,32 @@ mod tests {
         let dev = test_device();
         assert_eq!(dev.part().idcode, 0x0362_D093);
         assert_eq!(dev.part().frame_count().unwrap(), 5408);
+    }
+
+    /// xc7z020 device, loaded once and shared by the z020 tests.
+    fn test_z020_device() -> &'static Device {
+        static DEV: OnceLock<Device> = OnceLock::new();
+        DEV.get_or_init(|| Device::load_xc7z020(&default_db_root()).expect("load xc7z020"))
+    }
+
+    #[test]
+    fn z020_loads_and_counts() {
+        let dev = test_z020_device();
+        assert_eq!(dev.tile_count(), 29359);
+        let clb_tiles: usize = dev
+            .tiles
+            .iter()
+            .filter(|t| dev.types[t.type_id as usize].name.starts_with("CLB"))
+            .count();
+        assert!(clb_tiles > 0, "xc7z020 must have CLB tiles");
+    }
+
+    #[test]
+    fn z020_part_info() {
+        let dev = test_z020_device();
+        assert_eq!(dev.part().idcode, 0x0372_7093);
+        assert_eq!(dev.part().frame_count().unwrap(), 9996);
+        // The ZedBoard package must resolve.
+        assert!(!dev.package_pins.is_empty());
     }
 }
