@@ -29,6 +29,28 @@ use crate::frames::{WORDS_PER_FRAME, XC7A35T_FRAME_COUNT, ZERO_PAD_FRAMES};
 /// IDCODE of xc7a35t (from `part.json`).
 pub const IDCODE_XC7A35T: u32 = 0x0362_D093;
 
+/// IDCODE of xc7z020 (from `zynq7/xc7z020clg484-1/part.json`).
+pub const IDCODE_XC7Z020: u32 = 0x0372_7093;
+
+/// IDCODE for a target part.
+///
+/// The IDCODE is part of the bitstream header and of the `IDCODE` register
+/// write; getting it wrong makes the FPGA reject the image. Derive it from the
+/// part rather than assuming Artix: [`BitstreamOptions::xc7frames2bit`] used to
+/// hardcode [`IDCODE_XC7A35T`] no matter which `part_name` was passed, so a
+/// caller that did not override the field by hand emitted a Zynq bitstream
+/// carrying an Artix IDCODE.
+pub fn idcode_for_part(part: &str) -> Option<u32> {
+    let p = part.to_ascii_lowercase();
+    if p.starts_with("xc7z020") {
+        Some(IDCODE_XC7Z020)
+    } else if p.starts_with("xc7a35t") {
+        Some(IDCODE_XC7A35T)
+    } else {
+        None
+    }
+}
+
 /// COR0 as written by `xc7frames2bit` (prjxray `ConfigurationOptions0Value`
 /// with pipeline-DONE-in, DONE release at startup phase 4, no stall waits,
 /// GTS release phase 5, GWE release phase 6).
@@ -180,7 +202,9 @@ impl BitstreamOptions {
     /// for a fixed timestamp (used by the byte-compare test).
     pub fn xc7frames2bit(part_name: &str, frm_file: &str, date: &str, time: &str) -> Self {
         BitstreamOptions {
-            idcode: IDCODE_XC7A35T,
+            // Derive from the part; fall back to the historical default only
+            // when the part is unknown to this table.
+            idcode: idcode_for_part(part_name).unwrap_or(IDCODE_XC7A35T),
             cor0: COR0_DEFAULT,
             part_name: part_name.to_string(),
             design_source: format!("{frm_file};Generator=xc7frames2bit"),
@@ -538,5 +562,27 @@ mod tests {
         assert_eq!(d.len(), 10);
         assert_eq!(t.len(), 8);
         assert!(d.starts_with("2026/"));
+    }
+}
+
+#[cfg(test)]
+mod idcode_tests {
+    use super::*;
+
+    #[test]
+    fn xc7frames2bit_derives_idcode_from_the_part() {
+        // A Zynq part must not inherit the Artix IDCODE.
+        let z = BitstreamOptions::xc7frames2bit("xc7z020clg484-1", "d.frm", "d", "t");
+        assert_eq!(z.idcode, IDCODE_XC7Z020);
+        assert_eq!(z.idcode, 0x0372_7093);
+        let a = BitstreamOptions::xc7frames2bit("xc7a35tcsg324-1", "d.frm", "d", "t");
+        assert_eq!(a.idcode, IDCODE_XC7A35T);
+    }
+
+    #[test]
+    fn idcode_table_is_anchored_to_part_json() {
+        assert_eq!(idcode_for_part("xc7z020"), Some(0x0372_7093));
+        assert_eq!(idcode_for_part("xc7a35t"), Some(0x0362_D093));
+        assert_eq!(idcode_for_part("xc7k325t"), None);
     }
 }
