@@ -7,7 +7,8 @@
 //! as such for the emitter.
 
 use crate::place::Placed7;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 /// What the router needs from the device model.
 pub trait RouteQuery {
@@ -24,6 +25,12 @@ pub trait RouteQuery {
     fn wire_for_site_pin(&self, site: &str, pin: &str) -> Vec<(String, String)>;
     /// Is this net on the dedicated global clock network (BUFG output)?
     fn is_clock_net(&self, net: &str) -> bool;
+    /// Real grid coordinates of a tile, for the A* heuristic. `None` disables
+    /// the heuristic for that tile (the search degrades to plain BFS), so
+    /// minimal test routers need not implement this.
+    fn tile_xy(&self, _tile: &str) -> Option<(i32, i32)> {
+        None
+    }
 }
 
 /// A single programmed pip: `tile.dst_wire <- src_wire`.
@@ -133,24 +140,116 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         add_ep(bufg.out_net.clone(), site.to_string(), "O", true);
     }
 
-    let mut nets = Vec::new();
+    // Validate every net BEFORE routing anything, so a malformed netlist is
+    // reported as such rather than as a routing failure.
     let mut net_names: Vec<String> = net_eps.keys().cloned().collect();
     net_names.sort();
-    for net in net_names {
+    for net in &net_names {
+        let eps = &net_eps[net];
+        let nd = eps.iter().filter(|e| e.is_driver).count();
+        if nd != 1 {
+            return Err(format!(
+                "route: net `{net}` has {nd} drivers (need exactly 1)"
+            ));
+        }
+    }
+
+    // Route nets one at a time against a SHARED occupancy map, ripping up and
+    // re-routing earlier nets when a later one cannot find a free path.
+    //
+    // Routing each net independently is what produced illegal bitstreams: a
+    // 7-series INT mux is one-hot, so two nets selecting different inputs of
+    // the same mux output over-drive it, and prjxray writes some of those
+    // selects with opposite polarity on the same configuration bit. The old
+    // per-net parent tree prevented double-driving WITHIN a net and did
+    // nothing across nets, while `route()` still returned Ok.
+    let routable: Vec<&String> = net_names
+        .iter()
+        .filter(|n| net_eps[*n].iter().any(|e| !e.is_driver))
+        .collect();
+    let mut occupied: HashSet<(String, String)> = HashSet::new();
+    // net -> (kind, wires it occupies)
+    let mut routed: HashMap<String, (RouteKind, Vec<(String, String)>)> = HashMap::new();
+    let mut order: Vec<String> = routable.iter().map(|s| (*s).clone()).collect();
+    let mut ripped: usize = 0;
+    let mut queue: VecDeque<String> = order.drain(..).collect();
+    let mut attempts = 0usize;
+    let max_attempts = net_eps.len().saturating_mul(24).max(256);
+    while let Some(net) = queue.pop_front() {
+        attempts += 1;
+        if attempts > max_attempts {
+            return Err(format!(
+                "route: gave up after {attempts} attempts with {} net(s) unrouted ({} rip-ups); \
+                 the design needs more routing resources than the search can free. Reduce \
+                 congestion, or route with a lower logical effort.",
+                queue.len() + 1,
+                ripped
+            ));
+        }
         let eps = &net_eps[&net];
         let drivers: Vec<&Endpoint> = eps.iter().filter(|e| e.is_driver).collect();
         let loads: Vec<&Endpoint> = eps.iter().filter(|e| !e.is_driver).collect();
-        if drivers.len() != 1 {
-            return Err(format!(
-                "route: net `{net}` has {} drivers (need exactly 1)",
-                drivers.len()
-            ));
+        match route_net(&net, drivers[0], &loads, device, &occupied) {
+            Ok(kind) => {
+                let wires = route_wires(&kind);
+                for w in &wires {
+                    occupied.insert(w.clone());
+                }
+                routed.insert(net, (kind, wires));
+            }
+            Err(_) => {
+                // Rip up every conflicting net and retry: this one first, then
+                // the ones it displaced.
+                ripped += 1;
+                let mut displaced: Vec<String> = Vec::new();
+                for other in routed.keys() {
+                    if other != &net {
+                        displaced.push(other.clone());
+                    }
+                }
+                displaced.sort();
+                for other in &displaced {
+                    if let Some((_, wires)) = routed.remove(other) {
+                        for w in &wires {
+                            occupied.remove(w);
+                        }
+                    }
+                }
+                if displaced.is_empty() {
+                    // Nothing to rip up and it still failed: genuinely
+                    // unroutable, so report the real reason.
+                    let drivers: Vec<&Endpoint> = net_eps[&net]
+                        .iter()
+                        .filter(|e| e.is_driver)
+                        .collect();
+                    let loads: Vec<&Endpoint> = net_eps[&net]
+                        .iter()
+                        .filter(|e| !e.is_driver)
+                        .collect();
+                    route_net(&net, drivers[0], &loads, device, &occupied)?;
+                    unreachable!("route_net returned Ok after Err");
+                }
+                queue.push_back(net);
+                for other in displaced {
+                    queue.push_back(other);
+                }
+            }
         }
-        if loads.is_empty() {
-            continue; // undriven net: nothing to route
+    }
+
+    let mut nets = Vec::new();
+    for net in &net_names {
+        match routed.remove(net) {
+            Some((kind, _)) => nets.push(RoutedNet7 { net: net.clone(), kind }),
+            None => {
+                // No external loads: nothing to route.
+                let eps = &net_eps[net];
+                if eps.iter().all(|e| e.is_driver) {
+                    continue;
+                }
+                unreachable!("net {net} missing from the routed set");
+            }
         }
-        let kind = route_net(&net, drivers[0], &loads, device)?;
-        nets.push(RoutedNet7 { net, kind });
     }
 
     Ok(Routed7 {
@@ -159,12 +258,34 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     })
 }
 
+/// Every `(tile, wire)` a routed net claims, so occupancy can be tracked and
+/// released on rip-up.
+fn route_wires(kind: &RouteKind) -> Vec<(String, String)> {
+    match kind {
+        // The clock spine is a dedicated network: it does not contend with
+        // ordinary fabric pips, and route_net builds it without consulting
+        // the occupancy map.
+        RouteKind::SiteInternal | RouteKind::ClockSpine => Vec::new(),
+        RouteKind::Pips(pips) => pips
+            .iter()
+            .filter(|p| !p.is_pseudo && !p.tile.contains('~'))
+            .flat_map(|p| {
+                [
+                    (p.tile.clone(), p.dst_wire.clone()),
+                    (p.tile.clone(), p.src_wire.clone()),
+                ]
+            })
+            .collect(),
+    }
+}
+
 /// Route one net from its driver to all loads.
 fn route_net(
     net: &str,
     driver: &Endpoint,
     loads: &[&Endpoint],
     device: &dyn RouteQuery,
+    occupied: &HashSet<(String, String)>,
 ) -> Result<RouteKind, String> {
     // Split loads into site-internal (same site as driver) and external.
     let (internal, external): (Vec<&&Endpoint>, Vec<&&Endpoint>) =
@@ -204,7 +325,7 @@ fn route_net(
     }
     sinks.sort();
     sinks.dedup();
-    let pips = bfs_route_all(&src_tile, &src_wire, &sinks, device).ok_or_else(|| {
+    let pips = bfs_route_all(&src_tile, &src_wire, &sinks, device, occupied).ok_or_else(|| {
         format!(
             "route: net `{net}` unroutable to one or more of {} loads",
             external_loads.len()
@@ -224,18 +345,50 @@ fn bfs_route_all(
     src_wire: &str,
     sinks: &[(String, String)],
     device: &dyn RouteQuery,
+    occupied: &HashSet<(String, String)>,
 ) -> Option<Vec<RoutedPip>> {
     let sink_set: HashSet<(&str, &str)> =
         sinks.iter().map(|(t, w)| (t.as_str(), w.as_str())).collect();
     // (tile, wire) -> parent ((tile, wire), pip used to get here)
     let mut parent: HashMap<(String, String), Option<((String, String), RoutedPip)>> = HashMap::new();
-    let mut queue: VecDeque<(String, String)> = VecDeque::new();
     let start = (src_tile.to_string(), src_wire.to_string());
+
+    // A* instead of plain BFS. Unbounded BFS expanded ~363,000 pips per net
+    // (~160M edge expansions for a 119-net design) because it explores the
+    // whole ~3.3M-node graph uniformly, with wall time swinging between 77 s
+    // and 667 s on identical input depending on hash order. Ordering the
+    // frontier by `g + manhattan_distance_to_nearest_remaining_sink` drives
+    // the search at the target instead of flooding the fabric.
+    //
+    // `BinaryHeap` is a max-heap, so costs are negated. Ties break on the
+    // node name to keep the result deterministic across runs.
+    let mut heap: BinaryHeap<Reverse<(i64, Reverse<String>, Reverse<String>)>> = BinaryHeap::new();
+    let mut g: HashMap<(String, String), i64> = HashMap::new();
+    g.insert(start.clone(), 0);
     parent.insert(start.clone(), None);
-    queue.push_back(start);
+
+    // Grid coordinates of every sink, for the heuristic.
+    let sink_xy: Vec<(i32, i32)> = sinks
+        .iter()
+        .filter_map(|(t, _)| device.tile_xy(t))
+        .collect();
+    let h = |tile: &str| -> i64 {
+        match (device.tile_xy(tile), sink_xy.is_empty()) {
+            (Some((x, y)), false) => sink_xy
+                .iter()
+                .map(|(sx, sy)| ((x - sx).abs() + (y - sy).abs()) as i64)
+                .min()
+                .unwrap_or(0),
+            // No coordinates available: behave exactly like BFS.
+            _ => 0,
+        }
+    };
+    heap.push(Reverse((h(src_tile), Reverse(start.0.clone()), Reverse(start.1.clone()))));
 
     let mut found: HashSet<(String, String)> = HashSet::new();
-    while let Some((tile, wire)) = queue.pop_front() {
+    while let Some(Reverse((_, Reverse(tile), Reverse(wire)))) = heap.pop() {
+        let cur = (tile.clone(), wire.clone());
+        let cur_g = g.get(&cur).copied().unwrap_or(i64::MAX);
         if sink_set.contains(&(tile.as_str(), wire.as_str())) {
             found.insert((tile.clone(), wire.clone()));
             if found.len() == sink_set.len() {
@@ -247,7 +400,19 @@ fn bfs_route_all(
         for (dst_wire, src_w, is_pseudo) in device.pips_from(&tile, &wire) {
             debug_assert_eq!(src_w, wire);
             let next = (tile.clone(), dst_wire.clone());
-            if !parent.contains_key(&next) {
+            // A wire already driving another net must not be selected again.
+            // A 7-series INT mux is one-hot: two nets choosing different
+            // inputs of the same mux output is an electrical over-drive, not
+            // an OR, and prjxray writes some of those selects with opposite
+            // polarity on the same bit. The parent map below only dedups
+            // WITHIN one net, so without this check two nets each legally
+            // picked a different input of the same mux and the bitstream
+            // committed an illegal configuration while route() returned Ok.
+            if occupied.contains(&next) {
+                continue;
+            }
+            let ng = cur_g.saturating_add(1);
+            if g.get(&next).map(|old| ng < *old).unwrap_or(true) {
                 let pip = RoutedPip {
                     tile: tile.clone(),
                     dst_wire: dst_wire.clone(),
@@ -255,20 +420,34 @@ fn bfs_route_all(
                     is_pseudo,
                 };
                 parent.insert(next.clone(), Some(((tile.clone(), wire.clone()), pip)));
-                queue.push_back(next);
+                g.insert(next.clone(), ng);
+                heap.push(Reverse((
+                    ng.saturating_add(h(&next.0)),
+                    Reverse(next.0.clone()),
+                    Reverse(next.1.clone()),
+                )));
             }
         }
         // Across tileconn stitching.
         for (ntile, nwire) in device.node_wires(&tile, &wire) {
             let next = (ntile.clone(), nwire.clone());
-            if !parent.contains_key(&next) {
+            if occupied.contains(&next) {
+                continue;
+            }
+            let ng = cur_g.saturating_add(1);
+            if g.get(&next).map(|old| ng < *old).unwrap_or(true) {
                 parent.insert(next.clone(), Some(((tile.clone(), wire.clone()), RoutedPip {
                     tile: format!("{tile}~{ntile}"),
                     dst_wire: nwire.clone(),
                     src_wire: wire.clone(),
                     is_pseudo: false,
                 })));
-                queue.push_back(next);
+                g.insert(next.clone(), ng);
+                heap.push(Reverse((
+                    ng.saturating_add(h(&next.0)),
+                    Reverse(next.0.clone()),
+                    Reverse(next.1.clone()),
+                )));
             }
         }
     }
@@ -441,7 +620,8 @@ mod tests {
             ("T".to_string(), "S1".to_string()),
             ("T".to_string(), "S2".to_string()),
         ];
-        let pips = bfs_route_all("T", "A", &sinks, &MuxRouter).expect("all sinks");
+        let empty = HashSet::new();
+        let pips = bfs_route_all("T", "A", &sinks, &MuxRouter, &empty).expect("all sinks");
         assert!(pips.iter().any(|p| p.dst_wire == "S1"));
         assert!(pips.iter().any(|p| p.dst_wire == "S2"));
         // The mux input must be driven once, not unioned from two branches.
@@ -451,7 +631,7 @@ mod tests {
             ("T".to_string(), "S1".to_string()),
             ("T".to_string(), "NX".to_string()),
         ];
-        assert!(bfs_route_all("T", "A", &unreachable, &MuxRouter).is_none());
+        assert!(bfs_route_all("T", "A", &unreachable, &MuxRouter, &empty).is_none());
     }
 
     #[test]
