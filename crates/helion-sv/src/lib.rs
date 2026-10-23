@@ -6747,6 +6747,29 @@ fn fold_blocking_assigns<'a>(stmts: Vec<Nba<'a>>, arena: &'a Bump, module: &str)
                         .map(|p| (*kid(p as *const RExpr<'a>)).clone())
                         .collect(),
                 ),
+                // A bit read of a signal assigned earlier in the same block.
+                // The whole-word arm above only fires when `bit.is_none()`, so
+                // `t = a & b; y = t[0];` needs this case: without it the `Bit`
+                // fell to the `other` catch-all, was cloned unchanged, and
+                // drove an undriven net (`t_0`) instead of the folded value.
+                // Substitute from the whole-word binding when the signal is
+                // bound as a word, and from the bit binding when it is bound
+                // per bit.
+                RExpr::Bit(name, idx) => {
+                    if *name == lhs {
+                        if let Some(v) = env.get(&(*name, Some(*idx))) {
+                            (*v).clone()
+                        } else if let Some(v) = env.get(&(*name, None)) {
+                            (*v).clone()
+                        } else {
+                            (*n).clone()
+                        }
+                    } else if let Some(v) = env.get(&(*name, Some(*idx))) {
+                        (*v).clone()
+                    } else {
+                        (*n).clone()
+                    }
+                }
                 RExpr::RedXor(x) => RExpr::RedXor(kid(*x as *const _)),
                 RExpr::RedAnd(x) => RExpr::RedAnd(kid(*x as *const _)),
                 RExpr::RedOr(x) => RExpr::RedOr(kid(*x as *const _)),
