@@ -12809,6 +12809,7 @@ fn try_map_xnor_and_tree(
         out: Option<&str>,
         mut level: Vec<String>,
     ) -> Option<String> {
+        eprintln!("DBG emit_and_reduce level={level:?} out={out:?}");
         if level.is_empty() {
             return None;
         }
@@ -12829,6 +12830,7 @@ fn try_map_xnor_and_tree(
                     None
                 };
                 let pins: Vec<String> = chunk.to_vec();
+                eprintln!("DBG AND chunk pins={pins:?} init={:#x}", lut6_and_n(pins.len()));
                 next.push(share.lut6(d, prefix, drive, lut6_and_n(pins.len()), &pins));
             }
             level = next;
@@ -12896,6 +12898,8 @@ fn try_map_xnor_and_tree(
         if let Expr::Not(inner) = leaf {
             let mut xnors = Vec::new();
             if collect_xnor_and(inner, &mut xnors) && !xnors.is_empty() {
+                eprintln!("DBG map_one_leaf Not with {} xnors", xnors.len());
+                for x in &xnors { eprintln!("   xnor {x:?}"); }
                 let eq = map_xnor_leaves(d, prefix, share, None, &xnors)?;
                 return Some(share.lut6(d, prefix, out, lut6_inv(), &[eq]));
             }
@@ -12917,7 +12921,10 @@ fn try_map_xnor_and_tree(
             }
         }
         xnors.clear();
-        if collect_xnor_and(expr, &mut xnors) && xnors.len() >= 2 {
+        let c = collect_xnor_and(expr, &mut xnors);
+        eprintln!("DBG top whole-expr collect_xnor_and={c} n={} expr={expr:?}", xnors.len());
+        if c && xnors.len() >= 2 {
+            eprintln!("DBG top -> map_xnor_leaves (DROPS non-xnor leaves!)");
             return map_xnor_leaves(d, prefix, share, out, &xnors);
         }
     }
@@ -12941,9 +12948,12 @@ fn try_map_xnor_and_tree(
     if !looks_eq {
         return None;
     }
+    eprintln!("DBG and_reduce nleaves={} leaves={:?}", leaves.len(), leaves);
     let mut level = Vec::new();
     for leaf in &leaves {
-        level.push(map_one_leaf(d, prefix, share, None, leaf)?);
+        let r = map_one_leaf(d, prefix, share, None, leaf)?;
+        eprintln!("DBG   leaf -> {r}");
+        level.push(r);
     }
     emit_and_reduce(d, prefix, share, out, level)
 }
@@ -12992,9 +13002,12 @@ fn try_map_bool_leaf(
     out: Option<&str>,
     leaf: &Expr,
 ) -> Option<String> {
+    eprintln!("DBG bool_leaf ENTER {leaf:?}");
     if let Some(n) = try_map_xnor_and_tree(d, leaf, prefix, out, share) {
+        eprintln!("DBG bool_leaf xnor -> {n}");
         return Some(n);
     }
+    eprintln!("DBG bool_leaf xnor failed, cone_pi_exceeds={}", cone_pi_exceeds(leaf,6));
     if !cone_pi_exceeds(leaf, 6) {
         return share.lut6_from_expr(d, prefix, out, leaf);
     }
@@ -13930,6 +13943,18 @@ fn unpacked_word_q(mem: &str, word: usize, width: usize, bit: usize) -> String {
 fn peel_word_enable<'a>(rhs: &'a RExpr<'a>, mem: &str) -> Option<(Option<RExpr<'a>>, &'a RExpr<'a>)> {
     match rhs {
         RExpr::Mux(c, t, f) => {
+            // Synchronous-clear arm: `Mux(cond, '0, next)` == `next & ~cond`.
+            // The constant sits in the TRUE arm and the next word in the FALSE
+            // arm -- the mirror of a hold mux. Ibex writes its RVFI and
+            // outstanding-DSide trackers this way
+            // (`if (!rst_ni) q[i] <= '0; else q[i] <= d[i];`); without this the
+            // whole array was refused with `bram_not_lowered`.
+            //
+            // Only an all-zero constant is claimed; `q <= rst ? 1 : ..` is not
+            // a reset form this lower understands and keeps the old refusal.
+            if matches!(**t, RExpr::Const { val: 0, .. }) {
+                return Some((Some(RExpr::Not(c)), *f));
+            }
             let hold = match *f {
                 RExpr::Ident(s) if *s == mem => true,
                 RExpr::Bit(s, _) if *s == mem => true,

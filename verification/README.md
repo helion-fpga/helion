@@ -80,6 +80,32 @@ OK: helion never sets a bit the independent reference does not.
   delta the earlier frame audit measured, and it is why the reference's frame
   list alone cannot validate the bitstream's total length.
 
+### The same check on the shipped CLI (`helion bitstream`)
+
+`helion bitstream examples/zedboard_blinky.sv --part xc7z020 \
+    --xdc examples/zedboard.xdc -o /tmp/x7/cli_zed.bit`
+
+produces a 4,045,681-byte `.bit` (xc7z020clg484-1, IDCODE 0x03727093, 9996
+frames, 2697 FASM features). Feeding the FASM from that same run to
+`fasm2frames.py` and comparing frames gives:
+
+```text
+CLI frames: 9996   ref frames: 7802   common: 7802
+frames differing: 2  ['0x4224a6', '0x4224a7']
+words CLI sets that ref does NOT: 0
+```
+
+Identical to the library path: only the `*_SING` gap, and nothing fabricated.
+
+**A caution about comparing across runs.** An earlier comparison of the CLI
+bitstream against a `.frm` generated from a *previous* run's FASM differed in
+102 frames and showed 85 words the reference did not set. That was not a bug:
+the two runs chose different (equally legal) routing pips and clock-spine
+buffers, so the old reference simply described a different route. Compare a
+bitstream only against a reference built from **its own** FASM; the useful
+invariant is "Helion sets no bit the reference does not", which needs the FASM
+to match and does not need the route to.
+
 ### Scope
 
 Not hardware-validated: there is no JTAG cable on this machine, so

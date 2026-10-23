@@ -1350,6 +1350,13 @@ fn cmd_bits(args: &[String]) {
         eprintln!("bitstream: {e}");
         std::process::exit(1);
     });
+    // A Xilinx 7-series part is served by the real xilinx7 backend, whose
+    // output is a genuine .bit. The HL10T path below is the legacy flow.
+    if part.to_ascii_lowercase().starts_with("xc7") {
+        let out_path = out.clone().unwrap_or_else(|| "out.bit".into());
+        cmd_bits_xilinx7(path, &part, &xdc, &out_path);
+        return;
+    }
     let c = compile_sv_xdc(path, &part, 0.0, &xdc).unwrap_or_else(|e| {
         eprintln!("bitstream: {e}");
         std::process::exit(1);
@@ -1369,6 +1376,79 @@ fn cmd_bits(args: &[String]) {
     } else {
         println!("bitstream {} bytes={}", c.design.name, c.bits.packets.len());
     }
+}
+
+/// `helion bitstream <file> --part xc7z020 -o out.bit`, the real 7-series flow.
+///
+/// Goes design -> pack -> place -> route -> FASM -> frames -> .bit through
+/// `helion-xilinx7`, which is the only path that produces configuration data
+/// for these parts. Pin locations come from `--xdc`; placement refuses an IOB
+/// with no LOC rather than guessing a pin.
+fn cmd_bits_xilinx7(path: &str, part: &str, xdc: &Constraints, out: &str) {
+    let mut design = match synth_any(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("bitstream: {e}");
+            std::process::exit(1);
+        }
+    };
+    // Map the parsed XDC onto the design's ports. A bit-qualified key
+    // (`led[0]`) becomes `LOC[0]` on the vector port, which is what packing
+    // reads to give each output bit its own pin.
+    for port in &mut design.ports {
+        for (key, pin) in &xdc.package_pins {
+            match key.as_str() {
+                k if k == port.name => port.attrs.set("LOC", pin.clone()),
+                k => {
+                    if let Some(rest) = k.strip_prefix(&format!("{}[", port.name)) {
+                        if let Some(bit) = rest.strip_suffix(']') {
+                            port.attrs.set(format!("LOC[{bit}]"), pin.clone());
+                        }
+                    }
+                }
+            }
+        }
+        for (key, std) in &xdc.iostandards {
+            if key == &port.name {
+                port.attrs.set("IOSTANDARD", std.clone());
+            } else if let Some(rest) = key.strip_prefix(&format!("{}[", port.name)) {
+                if let Some(bit) = rest.strip_suffix(']') {
+                    port.attrs.set(format!("IOSTANDARD[{bit}]"), std.clone());
+                }
+            }
+        }
+    }
+    let db_root = std::env::var("HELION_XILINX_DB")
+        .ok()
+        .map(std::path::PathBuf::from);
+    let t = std::time::Instant::now();
+    let got = match helion_xilinx7::build::bitstream_for_part(
+        &design,
+        part,
+        db_root.as_deref(),
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("bitstream: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(w) = got.dropped_summary() {
+        eprintln!("bitstream: WARNING: {w}");
+    }
+    if let Err(e) = std::fs::write(out, &got.bytes) {
+        eprintln!("write {out}: {e}");
+        std::process::exit(1);
+    }
+    println!(
+        "wrote {out} {} bytes (part {} idcode {:#010x}, {} frames, {} FASM features, {:.1}s)",
+        got.bytes.len(),
+        got.part,
+        got.idcode,
+        got.frame_count,
+        got.features_applied,
+        t.elapsed().as_secs_f64()
+    );
 }
 
 fn cmd_eco(args: &[String]) {

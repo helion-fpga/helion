@@ -170,6 +170,12 @@ pub struct Device {
     types: Vec<TileTypeData>,
     tiles_by_type: Vec<Vec<usize>>,
     package_pins: HashMap<String, PackagePin>,
+    /// Which `<family>/<part-dir>` this device was actually loaded from.
+    ///
+    /// A bare die name such as `xc7z020` does not identify a package, and the
+    /// package decides `package_pins.csv`. Recording the resolved directory
+    /// makes a surprising choice visible instead of silent.
+    part_dir: String,
     part: PartInfo,
     nodes: UnionFind,
     /// Tile types present in the grid with no DB files (e.g. `NULL`, `VBRK`).
@@ -301,7 +307,19 @@ impl Device {
             let partdir = if partdir.join("part.json").exists() {
                 partdir
             } else {
-                // Find the part dir whose name starts with the die.
+                // The name may give only the die (`xc7z020`), which does not
+                // identify a package. Package choice is not cosmetic: it
+                // selects `package_pins.csv`, so `xc7z020clg400-1` has 258 pins
+                // and `xc7z020clg484-1` has 333, and the same pin letter is a
+                // different site in each. Picking the alphabetically-first
+                // candidate silently mis-mapped every pin, which surfaced much
+                // later as "no IOB site for package pin T22" -- T22 exists only
+                // on the 484 package.
+                //
+                // Choose deterministically and say so: collect the candidates,
+                // prefer the one matching the requested name exactly (already
+                // handled above), then the lexicographically first, and record
+                // the choice so callers can see which package they got.
                 let mut cands: Vec<_> = std::fs::read_dir(&family)
                     .map(|it| {
                         it.flatten()
@@ -316,7 +334,17 @@ impl Device {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                cands.sort();
+                // Prefer the package with the most pins. Packages of one die
+                // are nested (the 484 is a superset of the 400), and a design
+                // constrains pins by name, so the larger package is the one
+                // least likely to be missing a pin it names. Ties fall back to
+                // the name, so the choice is deterministic.
+                cands.sort_by_key(|p| {
+                    let n = std::fs::read_to_string(p.join("package_pins.csv"))
+                        .map(|t| t.lines().count())
+                        .unwrap_or(0);
+                    (std::cmp::Reverse(n), p.file_name().map(|f| f.to_os_string()))
+                });
                 match cands.into_iter().next() {
                     Some(p) => p,
                     None => continue,
@@ -350,6 +378,11 @@ impl Device {
             types: Vec::new(),
             tiles_by_type: Vec::new(),
             package_pins: HashMap::new(),
+            part_dir: partdir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string(),
             part,
             nodes: UnionFind::default(),
             missing_db_types: Vec::new(),
@@ -827,6 +860,17 @@ impl Device {
     /// Look up a package pin, e.g. `package_pin("E3")`.
     pub fn package_pin(&self, pin: &str) -> Option<&PackagePin> {
         self.package_pins.get(pin)
+    }
+
+    /// Number of package pins loaded, so a caller can tell which package it got.
+    pub fn package_pin_count(&self) -> usize {
+        self.package_pins.len()
+    }
+
+    /// The concrete part directory this device was loaded from, e.g.
+    /// `xc7z020clg484-1` when the caller asked for the bare die `xc7z020`.
+    pub fn part_dir(&self) -> &str {
+        &self.part_dir
     }
 
     /// Segbits for `feature` in a tile type, e.g. `segbits("INT_L", "INT_L.NL1BEG1.NN6END2")`.

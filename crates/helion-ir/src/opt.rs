@@ -89,8 +89,16 @@ impl LutOptStats {
 type FanoutPin = (usize, usize);
 /// A pending const fold: (const cell idx, const net idx, const value, fanouts).
 type ConstFold = (usize, usize, bool, Vec<FanoutPin>);
-/// A pending inverter absorption: (inverter cell idx, inverter net idx, fanouts).
-type InvFold = (usize, usize, Vec<FanoutPin>);
+/// A pending inverter absorption: (inverter cell idx, inverter net idx,
+/// inverter INPUT net name, fanouts).
+///
+/// `InvFold.2` is the net the inverter reads on its `I0`. The fanout pin must
+/// be re-driven from that net: flipping the fanout INIT absorbs the inversion
+/// into the truth table, so the fanout now expects the *un-inverted* signal.
+/// Leaving the pin disconnected made every absorbed input read as a constant
+/// 0 (an unconnected LUT input reads low), so e.g. `b == 3'd4` silently became
+/// `b[2]` and matched 4, 5, 6 and 7.
+type InvFold = (usize, usize, String, Vec<FanoutPin>);
 
 impl Design {
     /// Net names observed by ILA cores (referenced by name, not by endpoint).
@@ -324,6 +332,15 @@ impl Design {
                     }
                 }
             }
+            // Inverter cell name -> its input net name, for the reconnect below.
+            let mut inv_in_net: HashMap<&str, &str> = HashMap::new();
+            for n in self.nets.iter() {
+                for e in &n.endpoints {
+                    if e.pin == "I0" {
+                        inv_in_net.insert(e.cell.as_str(), n.name.as_str());
+                    }
+                }
+            }
             for (ci, c) in self.cells.iter().enumerate() {
                 let is_inv = matches!(c.kind, CellKind::Lut6 { init } if init == INV_INIT);
                 if !is_inv {
@@ -366,12 +383,17 @@ impl Design {
                     fanouts.push((fi, ii));
                 }
                 if ok && !fanouts.is_empty() {
-                    folds.push((ci, ni, fanouts));
+                    let in_net = inv_in_net
+                        .get(c.name.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                    folds.push((ci, ni, in_net, fanouts));
                 }
             }
         }
         let mut absorbed = 0usize;
-        for (ci, ni, fanouts) in folds {
+        let mut rewires: Vec<(String, String, String)> = Vec::new();
+        for (ci, ni, in_net, fanouts) in folds {
             let _ = ci;
             for (fi, ii) in &fanouts {
                 if let CellKind::Lut6 { init } = &mut self.cells[*fi].kind {
@@ -386,7 +408,21 @@ impl Design {
                 net.endpoints
                     .retain(|e| !pins.contains(&(e.cell.clone(), e.pin.clone())));
             }
+            // The fanout INIT now encodes `!pin`, so the pin must be driven by
+            // the inverter's input. Without this the pin floated and read 0.
+            if !in_net.is_empty() {
+                for (fi, ii) in &fanouts {
+                    rewires.push((
+                        in_net.clone(),
+                        self.cells[*fi].name.clone(),
+                        format!("I{ii}"),
+                    ));
+                }
+            }
             absorbed += 1;
+        }
+        for (net, cell, pin) in rewires {
+            self.connect(net, cell, pin);
         }
         if absorbed > 0 {
             self.rebuild_indexes();
@@ -484,7 +520,15 @@ mod tests {
             _ => panic!(),
         };
         assert_eq!(init, absorb_init_invert(0x8888_8888_8888_8888, 2));
-        assert!(d.net_on("c_and", "I2").is_none());
+        // The absorbed pin must be re-driven from the inverter's INPUT (`a`),
+        // not left floating. A disconnected LUT input reads 0, so dropping the
+        // endpoint silently changed the function: the INIT now encodes `!I2`,
+        // and `!0 == 1` would make the gate ignore that input entirely.
+        assert_eq!(
+            d.net_on("c_and", "I2"),
+            Some("a"),
+            "absorbed pin must read the inverter's input net"
+        );
         assert_eq!(d.sweep_dead_luts(), 2);
         assert!(d.cell("c_inv").is_none());
         assert!(d.cell("c_dead").is_none());
