@@ -906,11 +906,6 @@ fn bfs_route_all(
     pips.sort_by(|a, b| {
         (&a.tile, &a.dst_wire, &a.src_wire).cmp(&(&b.tile, &b.dst_wire, &b.src_wire))
     });
-    if std::env::var("HELION_TRACE_PIPS").is_ok() {
-        for p in &pips {
-            eprintln!("TRACE_PIP: {} {} -> {}", p.tile, p.src_wire, p.dst_wire);
-        }
-    }
     Some(pips)
 }
 

@@ -562,6 +562,22 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     // `DI` needs no LUT: it comes straight from the slice input through the
     // `DI1MUX` select, which is already emitted. That matches Vivado, whose
     // chain slices contain no zero-INIT DI LUTs.
+    // The element that ends its chain leaves the paired half's carry-in at the
+    // `C0` reset default: nothing feeds it from above, so `CIN` would be a
+    // dangling selection where the reference has `C0`.
+    let mut chain_tail: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for c in &placed.packed.carries {
+        let mut same: Vec<&crate::pack::PackedCarry> = placed
+            .packed
+            .carries
+            .iter()
+            .filter(|o| o.chain == c.chain)
+            .collect();
+        same.sort_by_key(|o| o.index);
+        if let Some(last) = same.last() {
+            chain_tail.insert(last.name.clone());
+        }
+    }
     for carry in &placed.carries {
         let Some(pc) = placed.packed.carries.iter().find(|c| c.name == carry.name) else {
             return Err(format!(
@@ -590,7 +606,38 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         // chain, so `index == 0` identifies the entry unambiguously.
         let is_chain_entry = pc.index == 0;
         if is_chain_entry {
-            lines.push(format!("{}.{}.CARRY4.ACY0", carry.tile, site_rel));
+            if pc.cyinit.as_deref() != Some("1") {
+                lines.push(format!("{}.{}.CARRY4.ACY0", carry.tile, site_rel));
+            }
+            // A constant-1 carry-in lives in the OPPOSITE slice half from the
+            // chain body: the reference routes the entry element through
+            // `SLICEL_X1` (`PRECYINIT.AX` + `CARRY4.ACY0`) and ties
+            // `SLICEM_X0.PRECYINIT.C0`. Mirroring that keeps the half that
+            // holds the lane LUTs and flops free to be configured normally.
+            if pc.cyinit.as_deref() == Some("1") {
+                let other = other_slice_half(&site_rel).ok_or_else(|| {
+                    format!("emit: cannot find the paired slice half of {site_rel}")
+                })?;
+                // The lane-A carry selector and the `AX` arm belong to the
+                // OTHER half; the half that carries the summing lanes gets the
+                // reset-default `C0` so its own (unused) carry-in is defined.
+                // Emitting `CARRY4.ACY0` in both halves configures the lane-A
+                // mux twice and the reference only ever sets it once.
+                lines.push(format!("{}.{}.CARRY4.ACY0", carry.tile, other));
+                lines.push(format!("{}.{}.PRECYINIT.AX", carry.tile, other));
+                lines.push(format!("{}.{}.PRECYINIT.C0", carry.tile, site_rel));
+                continue;
+            }
+        }
+        // Every element also needs the NEXT element's half pinned to `CIN`.
+        // The reference sets `SLICEL_X1.PRECYINIT.CIN` on Y40..Y44 so the carry
+        // it receives from below is used, rather than falling back to the `C0`
+        // reset default which would tie that element's carry-in to 0 and sever
+        // the column route.
+        if !is_chain_entry && !chain_tail.contains(&carry.name) {
+            if let Some(other) = other_slice_half(&site_rel) {
+                lines.push(format!("{}.{}.PRECYINIT.CIN", carry.tile, other));
+            }
         }
         // The chain's carry-in. The entry element uses the constant/`AX` arm
         // selected by `cyinit`; every later element must explicitly select the
@@ -598,7 +645,19 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         // 0 and break the inter-element column route.
         let arm = match (is_chain_entry, pc.cyinit.as_deref()) {
             (true, Some("0")) => "C0",
-            (true, Some("1")) => "C1",
+            // A carry-in of constant 1 is `AX`, NOT `C1`.
+            //
+            // `C1` is an internal hard tie to logic 1; `AX` takes the slice's
+            // A-input bypass pin. Both give the adder a 1, but only `AX` is
+            // what the reference uses, and the two are not interchangeable in
+            // the fabric: with `C1` the slice's `AX` path is left unselected
+            // while the design still routes a constant-1 net to it, and the
+            // entry element's `CARRY4.ACY0` -- the lane-A carry selector -- is
+            // left on the wrong slice half. The counter then produces a
+            // transient and freezes instead of running: LD0 blinks once and
+            // goes dark. The reference sets `SLICEL_X1.PRECYINIT.AX` and
+            // `SLICEL_X1.CARRY4.ACY0`, with `C0` in the SLICEM half.
+            (true, Some("1")) => "AX",
             (true, Some(other)) => {
                 return Err(format!(
                     "emit: CARRY4 {} has cyinit `{other}`, expected `0` or `1`",
@@ -992,6 +1051,26 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     })
 }
 
+
+/// The other slice half of the same CLB (`SLICEM_X0` <-> `SLICEL_X1`).
+///
+/// X-Ray names the two halves by their index within the tile, so the pair is
+/// always `_X0` and `_X1`. A carry chain can use both, and the reference does:
+/// the entry element's `AX` carry-in sits in one half while the summing lanes
+/// stay in the other.
+fn other_slice_half(site_rel: &str) -> Option<String> {
+    // The halves differ in TYPE as well as index: a CLB is `SLICEM_X0` plus
+    // `SLICEL_X1`, not `SLICEM_X0` plus `SLICEM_X1`. Swapping only the index
+    // asks for `SLICEM_X1`, which does not exist, and the FASM writer fails
+    // with `no segbits for feature CLBLM_R.SLICEM_X1.CARRY4.ACY0`.
+    match site_rel {
+        "SLICEM_X0" => Some("SLICEL_X1".to_string()),
+        "SLICEL_X1" => Some("SLICEM_X0".to_string()),
+        "SLICEL_X0" => Some("SLICEM_X1".to_string()),
+        "SLICEM_X1" => Some("SLICEL_X0".to_string()),
+        _ => None,
+    }
+}
 
 /// Extra configuration features that enable a clock-network branch.
 ///
@@ -1875,14 +1954,35 @@ mod tests {
                 "lane {lane} must ripple, not take a pin:\n{fasm}"
             );
         }
-        // The `+1` chain entry.
+        // The `+1` chain entry takes its carry-in as `AX`, in the PAIRED slice
+        // half, not as `C1`.
+        //
+        // `C1` is an internal hard tie to logic 1. It looks equivalent and is
+        // what this emitter used to write, but it leaves the slice's `AX` path
+        // unselected while the design still routes a constant-1 net to it, and
+        // the entry's `CARRY4.ACY0` then sits on the wrong half. The counter
+        // runs for one step and freezes: LD0 blinked once and went dark. The
+        // reference sets `SLICEL_X1.PRECYINIT.AX` and `SLICEL_X1.CARRY4.ACY0`
+        // with `C0` on the chain half, so mirror that.
         assert!(
-            fasm.contains("PRECYINIT.C1"),
-            "a cyinit of `1` must select PRECYINIT.C1:\n{fasm}"
+            fasm.contains("PRECYINIT.AX"),
+            "a cyinit of `1` must select PRECYINIT.AX:\n{fasm}"
         );
-        // Mutually exclusive: no second arm.
-        for arm in ["PRECYINIT.C0", "PRECYINIT.CIN", "PRECYINIT.AX"] {
-            assert!(!fasm.contains(arm), "PRECYINIT arms are exclusive, saw {arm}");
+        assert!(
+            !fasm.contains("PRECYINIT.C1"),
+            "C1 is an internal tie and leaves the AX path unselected:\n{fasm}"
+        );
+        // The chain half keeps the reset-default `C0` for its own, unused,
+        // carry-in; the `AX` arm and the lane-A selector live on the pair.
+        assert!(
+            fasm.contains("PRECYINIT.C0"),
+            "the chain half's own carry-in must be pinned to C0:\n{fasm}"
+        );
+        // The two arms must not be selected on the same half.
+        for half in ["SLICEL_X0", "SLICEM_X1"] {
+            let ax = fasm.contains(&format!("{half}.PRECYINIT.AX"));
+            let c0 = fasm.contains(&format!("{half}.PRECYINIT.C0"));
+            assert!(!(ax && c0), "{half} must not select two PRECYINIT arms:\n{fasm}");
         }
     }
 
