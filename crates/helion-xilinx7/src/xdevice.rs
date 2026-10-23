@@ -156,6 +156,31 @@ impl<'a> DeviceQuery for XDevice<'a> {
             .min_by_key(|(d, _, _)| *d)
             .map(|(_, tile, site)| (tile, site))
     }
+
+    fn slices(&self) -> Vec<(String, String)> {
+        self.device.slices()
+    }
+
+    fn slice_column(&self, tile: &str, site: &str) -> Option<(i64, i32)> {
+        // The site name carries the column and row: the DB's slice instances are
+        // `SLICE_X<col>Y<row>`, and they agree with the tile coordinates
+        // (`CLBLM_R_X3Y7` holds `SLICE_X2Y7`/`SLICE_X3Y7`). Read them straight
+        // from the name rather than re-deriving from the tile grid, because it
+        // is the site identity the segbits and routing use.
+        //
+        // Confirm the site really belongs to this tile first, so a mismatched
+        // (tile, site) pair cannot silently produce a bogus column.
+        let idx = self.tile_idx(tile)?;
+        let t = self.device.tile(idx)?;
+        if !t.sites.iter().any(|s| s.name == site) {
+            return None;
+        }
+        let rest = site.strip_prefix("SLICE_X")?;
+        let (col, row) = rest.split_once('Y')?;
+        let col: i64 = col.parse().ok()?;
+        let row: i32 = row.parse().ok()?;
+        Some((col, row))
+    }
 }
 
 impl<'a> TimingDevice for XDevice<'a> {
