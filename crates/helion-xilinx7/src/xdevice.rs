@@ -338,6 +338,10 @@ impl<'a> RouteQuery for XDevice<'a> {
         let (tile_idx, site_idx) = self.device.site_by_name(site)?;
         let tile_name = self.tile_name(tile_idx)?.to_string();
         let pins = self.device.site_pins(tile_idx, site_idx)?;
+        if std::env::var("HELION_TRACE_PIN").is_ok() {
+            let all: Vec<_> = pins.iter().filter(|(pn,_)| pn==pin).map(|(_,w)| w.clone()).collect();
+            eprintln!("TRACE_PIN: {site}/{pin} -> {all:?} (tile {tile_name})");
+        }
         pins.iter()
             .find(|(pn, _)| pn == pin)
             .map(|(_, w)| (tile_name.clone(), w.clone()))

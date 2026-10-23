@@ -6,6 +6,7 @@
 //! resolved at place time from the device model).
 
 use helion_ir::{CellKind, Design, PortDir};
+use std::collections::HashSet;
 
 /// A packed 6-LUT.
 #[derive(Clone, Debug)]
@@ -357,9 +358,47 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
     let pins = netlist.pin_index();
     let mut out = Packed7::default();
 
+    // Cells that a CARRY4 owns, and that must therefore NOT be packed as
+    // free-standing LUTs.
+    //
+    // A carry lane's `S` (and `DI`) function is implemented by a LUT that lives
+    // in the CARRY4's OWN slice -- an intra-slice connection. `pack_carry4`
+    // reads those LUTs' INITs into `PackedCarry::lane_s_init` and `emit` writes
+    // them into the carry element's slice, so packing them again as ordinary
+    // LUTs would place a duplicate copy somewhere else. That duplicate is not
+    // merely wasteful: it was placed 37 rows away and the design was dead on
+    // hardware while every netlist-level check passed.
+    //
+    // Identify them by what actually drives the carry's lane pins, rather than
+    // by name, so the rule holds however the front end names its cells.
+    let mut carry_owned: HashSet<String> = HashSet::new();
+    for cell in &netlist.cells {
+        if !matches!(cell.kind, CellKind::Carry4) {
+            continue;
+        }
+        for letter in ["A", "B", "C", "D"] {
+            for pin in [format!("{letter}S"), format!("{letter}DI")] {
+                let Some(net) = pins.net_on(&cell.name, &pin) else {
+                    continue;
+                };
+                if let Some(lut) = netlist.cells.iter().find(|c| {
+                    matches!(c.kind, CellKind::Lut6 { .. })
+                        && pins.net_on(&c.name, "O") == Some(net)
+                }) {
+                    carry_owned.insert(lut.name.clone());
+                }
+            }
+        }
+    }
+
     for cell in &netlist.cells {
         match &cell.kind {
             CellKind::Lut6 { init } => {
+                // Owned by a CARRY4's lane: emitted into that carry element's
+                // slice, not placed independently. See `carry_owned` above.
+                if carry_owned.contains(&cell.name) {
+                    continue;
+                }
                 let mut input_nets: [Option<String>; 6] = Default::default();
                 for (i, slot) in input_nets.iter_mut().enumerate() {
                     let pin = format!("I{i}");
