@@ -96,13 +96,65 @@ pub struct PackedDsp {
 
 /// A packed carry chain (CARRY4).
 ///
-/// The IR's [`helion_ir::CellKind::Carry4`] marks a 4-bit fast carry
-/// chain; the 7-series backend places it in a SLICE and emits the CARRY4
-/// configuration. Synth inference from adder logic is future work.
+/// The IR's [`helion_ir::CellKind::Carry4`] marks a 4-bit fast carry chain; the
+/// 7-series backend places it in a SLICE and emits the CARRY4 configuration.
+///
+/// Everything emission needs is captured here. A CARRY4 is *not* configured by
+/// its propagate muxes alone: each lane's `S`/`DI` come from the slice's
+/// `O6`/`O5`, the chain entry is selected by `PRECYINIT`, and the FF that
+/// consumes a sum bit must select the carry path (`AFFMUX = XOR`). Emitting the
+/// mux bits with any of that missing configures a chain with an undefined
+/// initial carry, which silently produces wrong sums -- so the pins are carried
+/// explicitly rather than re-derived at emission time.
 #[derive(Clone, Debug)]
 pub struct PackedCarry {
     /// Source IR cell name.
     pub name: String,
+    /// Chain identity and this element's position in it (from the IR attrs
+    /// `chain` / `carry_index` / `chain_len`). Placement needs these to keep a
+    /// chain in one column; emission needs them to pair lanes with sums.
+    pub chain: String,
+    pub index: usize,
+    pub chain_len: usize,
+    /// `PRECYINIT` source for the chain's first element: `"0"` or `"1"`.
+    /// `None` for every element past the first, which is fed by `CIN`.
+    pub cyinit: Option<String>,
+    /// Per-lane operand nets, MSB-last (`[A, B, C, D]`), as `(a, b)` nets.
+    /// `None` is a constant-0 operand bit, already folded into the LUT INITs.
+    pub lane_operands: [Option<(Option<String>, Option<String>)>; 4],
+    /// Per-lane `S` / `DI` LUT INITs (`O6` / `O5`).
+    pub lane_s_init: [u64; 4],
+    pub lane_di_init: [u64; 4],
+    /// Sum nets for lanes A..D (`O0..O3`); `None` past the end of the chain.
+    pub lane_sum_net: [Option<String>; 4],
+    /// Net carrying the inter-element carry out (`COUT`) to the next element's
+    /// `CIN`; `None` for the last element of a chain.
+    pub cout_net: Option<String>,
+    /// Net on this element's `CIN` (the previous element's `COUT`).
+    pub cin_net: Option<String>,
+}
+
+impl PackedCarry {
+    /// A single-element carry with no pins.
+    ///
+    /// Only for tests that need a carry cell to exist without describing a real
+    /// chain (e.g. the emitter's refusal check). Real carries come from
+    /// [`pack_carry4`], which errors rather than leaving pins unset.
+    pub fn empty(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            chain: String::new(),
+            index: 0,
+            chain_len: 1,
+            cyinit: None,
+            lane_operands: Default::default(),
+            lane_s_init: [0; 4],
+            lane_di_init: [0; 4],
+            lane_sum_net: Default::default(),
+            cout_net: None,
+            cin_net: None,
+        }
+    }
 }
 
 /// Backend-owned packed netlist for xc7a35t.
@@ -439,9 +491,7 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                 });
             }
             CellKind::Carry4 => {
-                out.carries.push(PackedCarry {
-                    name: cell.name.clone(),
-                });
+                out.carries.push(pack_carry4(netlist, cell)?);
             }
             other => {
                 return Err(format!(
@@ -456,6 +506,97 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
     insert_data_input_iobs(netlist, &mut out)?;
 
     Ok(out)
+}
+
+/// Extract one IR `Carry4` cell into a [`PackedCarry`] with its real pins.
+///
+/// The IR cell carries its configuration on its own pins and on the pins of the
+/// per-lane LUT pair that synth emitted alongside it:
+///
+/// * `{A,B,C,D}S` / `{A,B,C,D}DI` — connected to the lane LUT outputs
+/// * `O0..O3` — the sum bits
+/// * `CIN` / `COUT` — the inter-element carry
+/// * attrs `chain`, `carry_index`, `chain_len`, `cyinit`
+///
+/// The lane LUT INITs are read back from those LUT cells (not re-derived), so
+/// packing cannot disagree with what synthesis actually emitted. Returns an
+/// error rather than a half-populated carry, because a carry missing its
+/// `PRECYINIT` would be emitted with an undefined chain entry.
+fn pack_carry4(netlist: &Design, cell: &helion_ir::Cell) -> Result<PackedCarry, String> {
+    let pins = netlist.pin_index();
+    let attr = |k: &str| cell.attrs.get(k).map(|s| s.to_string());
+    let index: usize = attr("carry_index")
+        .ok_or_else(|| format!("pack: Carry4 {} has no carry_index attr", cell.name))?
+        .parse()
+        .map_err(|_| format!("pack: Carry4 {} has a non-numeric carry_index", cell.name))?;
+    let chain_len: usize = attr("chain_len")
+        .ok_or_else(|| format!("pack: Carry4 {} has no chain_len attr", cell.name))?
+        .parse()
+        .map_err(|_| format!("pack: Carry4 {} has a non-numeric chain_len", cell.name))?;
+    let chain = attr("chain").unwrap_or_else(|| cell.name.clone());
+
+    // The lane LUTs are named after the cell plus the lane letter, with an `s`
+    // or `d` suffix for the S (O6) and DI (O5) functions respectively.
+    let lane_letters = ["A", "B", "C", "D"];
+    let mut lane_operands: [Option<(Option<String>, Option<String>)>; 4] = Default::default();
+    let mut lane_s_init = [0u64; 4];
+    let mut lane_di_init = [0u64; 4];
+    let mut lane_sum_net: [Option<String>; 4] = Default::default();
+
+    for (lane, letter) in lane_letters.iter().enumerate() {
+        // S LUT drives the `{letter}S` pin; DI LUT drives `{letter}DI`.
+        for (suffix, is_s) in [("s", true), ("d", false)] {
+            let pin = format!("{letter}{}", if is_s { "S" } else { "DI" });
+            let Some(lut_out) = pins.net_on(&cell.name, &pin) else {
+                // An unconnected lane S/DI is legal (a lane past the end of the
+                // chain); leave its INIT at 0 so the lane is a defined 0.
+                continue;
+            };
+            // The LUT driving that net, and its stored INIT.
+            let Some(lut) = netlist.cells.iter().find(|c| {
+                matches!(c.kind, CellKind::Lut6 { .. }) && pins.net_on(&c.name, "O") == Some(lut_out)
+            }) else {
+                return Err(format!(
+                    "pack: Carry4 {} lane {letter} {pin} is driven by net {lut_out}, \
+                     which has no LUT driver",
+                    cell.name
+                ));
+            };
+            let CellKind::Lut6 { init } = lut.kind else {
+                unreachable!("filtered to Lut6 above")
+            };
+            if is_s {
+                lane_s_init[lane] = init;
+            } else {
+                lane_di_init[lane] = init;
+            }
+            // Operand nets: the LUT's I0/I1 (the lane operands). I2 is unused by
+            // the carry-free S/DI functions.
+            let a = pins.net_on(&lut.name, "I0").map(|s| s.to_string());
+            let b = pins.net_on(&lut.name, "I1").map(|s| s.to_string());
+            // Record operands once, from the S LUT (both lanes see the same pair).
+            if is_s {
+                lane_operands[lane] = Some((a, b));
+            }
+        }
+        lane_sum_net[lane] = pins
+            .net_on(&cell.name, &format!("O{lane}"))
+            .map(|s| s.to_string());
+    }
+
+    Ok(PackedCarry {
+        name: cell.name.clone(),
+        chain,
+        index,
+        chain_len,
+        cyinit: attr("cyinit"),
+        lane_operands,
+        lane_s_init,
+        lane_di_init,
+        lane_sum_net,
+        cout_net: pins.net_on(&cell.name, "COUT").map(|s| s.to_string()),
+        cin_net: pins.net_on(&cell.name, "CIN").map(|s| s.to_string()),
+    })
 }
 
 /// Give every remaining top-level input port an input IOB, one per bit.
