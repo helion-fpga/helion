@@ -22,6 +22,9 @@ use helion_sv::{elaborate_sv_sources, synth_sv_files, synth_sv_path};
 use helion_vhdl::synth_vhdl_path;
 use std::path::Path;
 
+/// Part used when neither `--part` nor a `.prj` names one.
+const DEFAULT_PART: &str = "HL10T-C32-1";
+
 struct Compiled {
     dev: Device,
     design: Design,
@@ -30,8 +33,549 @@ struct Compiled {
     timing: TimingResult,
 }
 
-fn synth_any(path: &str) -> Result<helion_ir::Design, String> {
+/// Reject source that is not syntactically SystemVerilog/Verilog.
+///
+/// The helion-sv front end is deliberately lenient: `parse_module_items`
+/// recovers from anything it does not recognise (`skip_item_or_block`) so a
+/// large design with one unsupported construct still yields the logic it could
+/// map. That recovery made genuinely broken input indistinguishable from
+/// supported input at the CLI: a file with a missing `;`, an unterminated
+/// `module`, or an undeclared identifier synthesised to a plausible cell count
+/// and exited 0. A compiler that reports success on garbage is worse than one
+/// that reports a false failure, so this gate runs first and refuses input that
+/// cannot be well-formed.
+///
+/// Only unambiguous, construct-independent breakage is reported:
+///   * unbalanced `()` `[]` `{}`
+///   * `module` without its `endmodule`
+///   * a statement-ending keyword reached without a preceding `;`
+///   * an identifier used but never declared in that module
+fn check_sv_syntax(source: &str, origin: &str) -> Result<(), String> {
+    let clean = strip_sv_comments(source);
+
+    // 1. Delimiter balance, with strings and escaped identifiers skipped.
+    let mut stack: Vec<(char, usize, usize)> = Vec::new();
+    let mut line = 1usize;
+    let mut col = 1usize;
+    let bytes: Vec<char> = clean.chars().collect();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == '\n' {
+            line += 1;
+            col = 1;
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            // Skip the string literal.
+            i += 1;
+            col += 1;
+            while i < bytes.len() {
+                if bytes[i] == '\\' {
+                    i += 2;
+                    col += 2;
+                    continue;
+                }
+                if bytes[i] == '"' || bytes[i] == '\n' {
+                    break;
+                }
+                i += 1;
+                col += 1;
+            }
+            i += 1;
+            col += 1;
+            continue;
+        }
+        match c {
+            '(' | '[' | '{' => stack.push((c, line, col)),
+            ')' | ']' | '}' => {
+                let want = match c {
+                    ')' => '(',
+                    ']' => '[',
+                    _ => '{',
+                };
+                match stack.pop() {
+                    Some((open, _, _)) if open == want => {}
+                    Some((open, oline, ocol)) => {
+                        return Err(format!(
+                            "{origin}:{line}:{col}: mismatched `{c}` (unclosed `{open}` from \
+                             line {oline} column {ocol})"
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "{origin}:{line}:{col}: unexpected `{c}` with no matching opener"
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+        col += 1;
+    }
+    if let Some((open, oline, ocol)) = stack.pop() {
+        return Err(format!(
+            "{origin}: unclosed `{open}` from line {oline} column {ocol}"
+        ));
+    }
+
+    // 2. `module`/`endmodule` pairing and 3. missing `;` before a block
+    //    terminator. Both walk the token stream produced by a small scanner
+    //    that ignores comments and strings.
+    let toks = sv_tokens(&clean);
+    let mut depth = 0i32;
+    let mut open_at: Option<usize> = None;
+    // Reject a `;`-less statement directly before a block/module terminator.
+    // `endmodule` is included, so the common "missing ; on the last statement"
+    // case is caught rather than recovered into a smaller design.
+    let terminators = [
+        "end",
+        "endcase",
+        "endgenerate",
+        "endfunction",
+        "endtask",
+        "endmodule",
+    ];
+    // Tokens that legitimately precede a terminator without a `;`, or that end
+    // a construct the preprocessor owns (a missing `;` there is not an error
+    // this scan can adjudicate).
+    let ok_before_terminator = [
+        "begin", ")", "end", "endcase", "endgenerate", "endfunction", "endtask", "endmodule", "else",
+        ":", "generate", "do", "`endif", "`else", "`elsif", "`ifdef", "`ifndef", ")", ";",
+    ];
+    for (idx, t) in toks.iter().enumerate() {
+        match t.as_str() {
+            "module" => {
+                if depth == 0 {
+                    open_at = Some(idx);
+                }
+                depth += 1;
+            }
+            "endmodule" => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(format!("{origin}: `endmodule` without a matching `module`"));
+                }
+            }
+            _ => {}
+        }
+        if terminators.contains(&t.as_str()) {
+            let prev = idx
+                .checked_sub(1)
+                .and_then(|i| toks.get(i))
+                .map(|s| s.as_str())
+                .unwrap_or(";");
+            // `end : label` — the label names the block that just closed, so the
+            // token before it is the last statement's, not a `;`-less one.
+            let before = idx
+                .checked_sub(2)
+                .and_then(|i| toks.get(i))
+                .map(|s| s.as_str())
+                .unwrap_or(";");
+            if before == ":" {
+                continue;
+            }
+            if prev != ";" && !ok_before_terminator.contains(&prev) && !prev.starts_with('`') && prev != "\\" {
+                return Err(format!(
+                    "{origin}: missing `;` before `{t}` (token {idx}; previous token is `{prev}`)"
+                ));
+            }
+        }
+    }
+    if let Some(at) = open_at {
+        if depth != 0 {
+            return Err(format!(
+                "{origin}: `module` at token {at} is never closed with `endmodule`"
+            ));
+        }
+    }
+    // A `module` keyword must be followed by a name.
+    for w in toks.windows(2) {
+        if w[0] == "module"
+            && !w[1]
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_alphabetic() || c == '_')
+                .unwrap_or(false)
+        {
+            return Err(format!("{origin}: `module` is not followed by a name"));
+        }
+    }
+    // A port-list comma must separate declarations, so `input clk output y`
+    // (a missing comma) is an error rather than a silently dropped port.
+    for (idx, w) in toks.windows(3).enumerate() {
+        let dirs = ["input", "output", "inout"];
+        if dirs.contains(&w[0].as_str()) && dirs.contains(&w[2].as_str()) && w[1] != "," && w[1] != ")" {
+            return Err(format!(
+                "{origin}: missing `,` between `{}` and `{}` (token {idx})",
+                w[0], w[2]
+            ));
+        }
+    }
+    check_undeclared_idents(&toks, origin)?;
+    check_stray_tokens(&toks, origin)?;
+    check_comb_loops_src(&clean, origin)?;
+    Ok(())
+}
+
+/// Reject a combinational cycle among continuous assignments.
+///
+/// The front end silently dropped `assign a = b; assign b = a;` (the cone came
+/// out empty and `comb_bits=0`), so a cyclic design synthesised to a plausible
+/// LUT count and exited 0. The cycle is gone from the netlist by then, so it
+/// has to be found in the source: build a dependency edge `lhs -> rhs` for each
+/// `assign`, and report a cycle. Only `assign` statements participate; a
+/// register (`always @(posedge ...)`) breaks a cycle by construction, and
+/// self-assignment through a flop is not a loop.
+fn check_comb_loops_src(source: &str, origin: &str) -> Result<(), String> {
+    use std::collections::HashMap;
+
+    let toks = sv_tokens(source);
+    // Generate/`for` loop indices are not nets: `assign y[k] = x[k]` inside
+    // `for (genvar k = ...)` names the same `k` on both sides and is not a
+    // cycle. Collect them first and never treat them as signal names.
+    let mut loop_indices: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for w in toks.windows(3) {
+        if (w[0] == "genvar" || w[0] == "int" || w[0] == "integer")
+            && is_ident_tok(&w[1])
+            && (w[2] == "=" || w[2] == ";")
+        {
+            loop_indices.insert(w[1].clone());
+        }
+    }
+    // Identifier -> identifiers it combinationally depends on.
+    let mut deps: HashMap<String, Vec<String>> = HashMap::new();
+    // Any name written by a clocked/`always` block is register-backed, so it
+    // breaks a combinational cycle wherever it appears (a flop's `q` feeding
+    // its own `d` is a shift register, not a loop). Collected file-wide because
+    // a name written in one module must not be judged from another's assigns.
+    let mut flop_written: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for w in toks.windows(2) {
+        if (w[0] == "<=" || w[0] == "=")
+            && is_ident_tok(&w[1])
+        {
+            // Look back for the nearest `always`/`always_ff`/`always_comb`
+            // before this statement; `<=` is nonblocking assignment and only
+            // legal in a clocked process, which is enough to mark it.
+            if w[0] == "<=" {
+                flop_written.insert(w[1].clone());
+            }
+        }
+    }
+    let mut i = 0usize;
+    while i < toks.len() {
+        if toks[i] != "assign" {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < toks.len() && toks[end] != ";" {
+            end += 1;
+        }
+        if end >= toks.len() {
+            return Ok(());
+        }
+        let stmt = &toks[start..end];
+        // lhs is everything before the first `=`.
+        let Some(eq) = stmt.iter().position(|t| t == "=") else {
+            i = end + 1;
+            continue;
+        };
+        // A bit-indexed assignment (`or_tree[Pa] = or_tree[C0]`) is a reduction
+        // tree or array element write, not a scalar feedback edge: the index is
+        // what decides whether it is a cycle, and a token scan cannot evaluate
+        // it. Skip those rather than risk rejecting a valid design — the flat
+        // scalar case (`assign a = b; assign b = a;`) is what remains.
+        let indexed = stmt[..eq].iter().any(|t| t == "[");
+        // Struct-member assignment (`x.field = x.field`) needs field-level
+        // precision this scan does not have.
+        let member = stmt[..eq].iter().any(|t| t == ".");
+        let lhs = stmt[..eq]
+            .iter()
+            .rev()
+            .find(|t| is_ident_tok(t) && !loop_indices.contains(*t))
+            .cloned();
+        let Some(lhs) = lhs else {
+            i = end + 1;
+            continue;
+        };
+        if indexed || member {
+            i = end + 1;
+            continue;
+        }
+        let mut rhs = Vec::new();
+        let r = &stmt[eq + 1..];
+        for (j, t) in r.iter().enumerate() {
+            if !is_ident_tok(t) || is_sv_keyword(t) || loop_indices.contains(t) {
+                continue;
+            }
+            // `or_tree[C0]` is an element read, not the whole vector: skip any
+            // name immediately followed by `[`.
+            if r.get(j + 1).map(|s| s.as_str()) == Some("[") {
+                continue;
+            }
+            rhs.push(t.clone());
+        }
+        deps.entry(lhs).or_default().extend(rhs);
+        i = end + 1;
+    }
+    if deps.is_empty() {
+        return Ok(());
+    }
+
+    // Iterative DFS for a cycle, reporting the participating names.
+    // Keys are owned so the traversal holds no borrow into `deps`.
+    let mut state: HashMap<String, u8> = HashMap::new();
+    let mut path: Vec<String> = Vec::new();
+    for root in deps.keys().cloned().collect::<Vec<_>>() {
+        if state.get(&root).copied().unwrap_or(0) != 0 {
+            continue;
+        }
+        let mut stack: Vec<(String, usize)> = vec![(root.clone(), 0)];
+        state.insert(root.clone(), 1);
+        path.push(root.clone());
+        while let Some((node, ix)) = stack.pop() {
+            let nbrs: Vec<String> = deps.get(&node).cloned().unwrap_or_default();
+            if ix < nbrs.len() {
+                stack.push((node.clone(), ix + 1));
+                let nxt = nbrs[ix].clone();
+                // A register output ends the combinational path.
+                if !deps.contains_key(&nxt) || flop_written.contains(&nxt) {
+                    continue;
+                }
+                match state.get(&nxt).copied().unwrap_or(0) {
+                    1 => {
+                        let from = path.iter().position(|p| *p == nxt).unwrap_or(0);
+                        let mut cycle: Vec<String> = path[from..].to_vec();
+                        cycle.push(nxt);
+                        return Err(format!(
+                            "{origin}: combinational loop {} (each `assign` feeds the next with \
+                             no register in between, so the value has no fixed point). Break the \
+                             cycle with a register or remove the feedback.",
+                            cycle.join(" -> ")
+                        ));
+                    }
+                    0 => {
+                        state.insert(nxt.clone(), 1);
+                        path.push(nxt.clone());
+                        stack.push((nxt, 0));
+                    }
+                    _ => {}
+                }
+            } else {
+                state.insert(node.clone(), 2);
+                path.retain(|p| *p != node);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_sv_keyword(t: &str) -> bool {
+    matches!(
+        t,
+        "assign" | "wire" | "logic" | "reg" | "input" | "output" | "inout" | "begin" | "end"
+            | "if" | "else" | "case" | "endcase" | "default" | "posedge" | "negedge" | "always"
+            | "always_ff" | "always_comb" | "generate" | "endgenerate" | "for" | "int"
+            | "integer" | "parameter" | "localparam" | "signed" | "unsigned" | "bit"
+    )
+}
+
+/// Reject punctuation that appears in no legal SV construct.
+///
+/// `@` is only legal as `@(`/`@*` (an event control), so `@@` is a typo the
+/// lenient parser otherwise recovers from by dropping the whole process block.
+/// `?` likewise never doubles in real source.
+///
+/// `\` is deliberately not checked: it appears in macros and line
+/// continuations, and a token scan cannot distinguish those from a typo.
+fn check_stray_tokens(toks: &[String], origin: &str) -> Result<(), String> {
+    for (idx, t) in toks.iter().enumerate() {
+        let next = idx.checked_add(1).and_then(|i| toks.get(i)).map(|s| s.as_str());
+        match t.as_str() {
+            "@" => {
+                if !matches!(next, Some("(") | Some("*")) {
+                    return Err(format!(
+                        "{origin}: stray `@` (token {idx}); expected an event control such as `@(posedge clk)`"
+                    ));
+                }
+            }
+            "?" if next == Some("?") => {
+                return Err(format!("{origin}: stray `??` (token {idx}) is not valid syntax"));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Report an identifier that could not possibly be declared anywhere.
+///
+/// Kept deliberately narrow because this front end supports attributes
+/// (`(* mark_debug = "true" *)`), macros, hierarchical names, and instance
+/// labels that a token scan cannot model. Only the shape that has no legal
+/// reading is reported: a *bare* name that (a) appears exactly once in the
+/// whole file, (b) is not preceded by any declaration, attribute, hierarchy, or
+/// instantiation marker, and (c) sits on the right-hand side of an assignment.
+/// That is `led <= nonexistent_signal;` and nothing else — the false-positive
+/// rate of a looser rule was unacceptable on real designs.
+fn check_undeclared_idents(toks: &[String], origin: &str) -> Result<(), String> {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for t in toks {
+        if is_ident_tok(t) {
+            *counts.entry(t.as_str()).or_insert(0) += 1;
+        }
+    }
+    // True only inside `(* ... *)`, where every name is an attribute.
+    let mut attr_depth = 0i32;
+    for (idx, t) in toks.iter().enumerate() {
+        match t.as_str() {
+            "(*" => {
+                attr_depth += 1;
+                continue;
+            }
+            "*)" => {
+                attr_depth -= 1;
+                continue;
+            }
+            _ => {}
+        }
+        if attr_depth > 0 || !is_ident_tok(t) {
+            continue;
+        }
+        if counts.get(t.as_str()).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        // Must be the RHS of `=`/`<=` and not a call/instantiation/hierarchy.
+        let prev = idx.checked_sub(1).and_then(|i| toks.get(i)).map(|s| s.as_str());
+        let next = idx.checked_add(1).and_then(|i| toks.get(i)).map(|s| s.as_str());
+        if !matches!(prev, Some("=") | Some("<=")) {
+            continue;
+        }
+        if matches!(next, Some("(") | Some("#") | Some("[") | Some(".") | Some("::")) {
+            continue;
+        }
+        return Err(format!(
+            "{origin}: unknown identifier `{t}` (token {idx}): used but never declared in this file"
+        ));
+    }
+    Ok(())
+}
+
+fn is_ident_tok(t: &str) -> bool {
+    t.chars()
+        .next()
+        .map(|c| c.is_ascii_alphabetic() || c == '_')
+        .unwrap_or(false)
+        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+/// Remove `//` and `/* */` comments, preserving newlines so line numbers hold.
+fn strip_sv_comments(source: &str) -> String {
+    let b: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0usize;
+    let mut in_str = false;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            out.push(c);
+            if c == '\\' && i + 1 < b.len() {
+                out.push(b[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_str = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '/' && i + 1 < b.len() && b[i + 1] == '/' {
+            while i < b.len() && b[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && i + 1 < b.len() && b[i + 1] == '*' {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == '*' && b[i + 1] == '/') {
+                if b[i] == '\n' {
+                    out.push('\n');
+                }
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Split source into identifier/keyword/punctuation tokens, dropping strings.
+fn sv_tokens(source: &str) -> Vec<String> {
+    let b: Vec<char> = source.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            i += 1;
+            while i < b.len() && b[i] != '"' {
+                if b[i] == '\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '`' {
+            let start = i;
+            while i < b.len()
+                && (b[i].is_ascii_alphanumeric() || b[i] == '_' || b[i] == '$' || b[i] == '`')
+            {
+                i += 1;
+            }
+            out.push(b[start..i].iter().collect());
+            continue;
+        }
+        // `(*` / `*)` are single attribute delimiters, not punctuation pairs.
+        if c == '(' && b.get(i + 1) == Some(&'*') {
+            out.push("(*".into());
+            i += 2;
+            continue;
+        }
+        if c == '*' && b.get(i + 1) == Some(&')') {
+            out.push("*)".into());
+            i += 2;
+            continue;
+        }
+        // Single-character punctuation token.
+        out.push(c.to_string());
+        i += 1;
+    }
+    out
+}
+
+fn synth_any(path: &str) -> Result<Design, String> {
     let p = Path::new(path);
+
     let ext = p
         .extension()
         .and_then(|e| e.to_str())
@@ -56,13 +600,65 @@ fn synth_any(path: &str) -> Result<helion_ir::Design, String> {
         }
         "vhd" | "vhdl" => synth_vhdl_path(p),
         "c" | "cc" | "cpp" => synth_c_path(p),
-        _ => synth_sv_path(p),
+        _ => {
+            let src = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            check_sv_syntax(&src, &p.display().to_string())?;
+            synth_sv_path(p)
+        }
     }
 }
 
-fn compile_sv(path: &str, part: &str, timing_weight: f64) -> Result<Compiled, String> {
+/// DEFAULT_PART unless the source (`.prj`) or `--part` says otherwise.
+/// Precedence: explicit `--part` > `.prj` `part` > DEFAULT_PART.
+fn resolve_part(path: &str, args: &[String]) -> Result<String, String> {
+    let cli = take_flag(args, "--part");
+    if let Some(p) = cli {
+        if p.trim().is_empty() {
+            return Err("--part needs a non-empty value".into());
+        }
+        return Ok(p);
+    }
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "prj" {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("project {path}: {e}"))?;
+        let prj = load_prj(&text)?;
+        if !prj.part.trim().is_empty() {
+            return Ok(prj.part.clone());
+        }
+    }
+    Ok(DEFAULT_PART.into())
+}
+
+/// Constraints from a command-line `--xdc` file, if given.
+///
+/// `PinConstraints` (helion-xilinx7) owns PACKAGE_PIN/IOSTANDARD parsing;
+/// `load_xdc` (helion-sta) owns timing. An XDC can carry both, so each line is
+/// offered to both parsers rather than picking one and silently dropping the
+/// other half of the file.
+fn xdc_from_args(args: &[String]) -> Result<Constraints, String> {
+    let Some(path) = take_flag(args, "--xdc") else {
+        return Ok(Constraints::default());
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("--xdc {path}: {e}"))?;
+    let mut c = load_xdc(&text)?;
+    let pins = helion_xilinx7::build::PinConstraints::parse(&text);
+    for (port, pin) in &pins.package_pins {
+        c.package_pins.insert(port.clone(), pin.clone());
+    }
+    for (port, std) in &pins.io_standards {
+        c.iostandards.insert(port.clone(), std.clone());
+    }
+    Ok(c)
+}
+
+/// [`compile_sv`] with `--xdc` pin/timing constraints applied.
+fn compile_sv_xdc(path: &str, part: &str, timing_weight: f64, xdc: &Constraints) -> Result<Compiled, String> {
     let design = synth_any(path)?;
-    compile_design(design, part, timing_weight)
+    compile_design_xdc(design, part, timing_weight, xdc)
 }
 
 fn compile_design(design: Design, part: &str, timing_weight: f64) -> Result<Compiled, String> {
@@ -76,6 +672,7 @@ fn compile_design_xdc(
     xdc: &Constraints,
 ) -> Result<Compiled, String> {
     apply_xdc(&mut design, xdc)?;
+
     let t_dev = std::time::Instant::now();
     let dev = Device::load_part(part).map_err(|e| format!("HAD {part}: {e}"))?;
     eprintln!(
@@ -276,6 +873,17 @@ fn synth_project_sources(
     if paths.is_empty() {
         return Err("project has no sources".into());
     }
+    for p in paths {
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        if ext == "sv" || ext == "v" {
+            let src = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            check_sv_syntax(&src, &p.display().to_string())?;
+        }
+    }
     let all_sv = paths.iter().all(|p| {
         p.extension()
             .and_then(|e| e.to_str())
@@ -318,6 +926,12 @@ fn main() {
         args.push("--help".into());
     }
     let cmd = args.remove(0);
+    // Flag values are validated up front: `helion bitstream x.sv -o` (no value)
+    // used to be silently ignored and write nothing, which looks like success.
+    if let Err(e) = validate_flag_values(&cmd, &args) {
+        eprintln!("helion {cmd}: {e}");
+        std::process::exit(2);
+    }
     match cmd.as_str() {
         "--version" | "-V" | "version" => {
             println!("helion {}", env!("CARGO_PKG_VERSION"));
@@ -339,32 +953,67 @@ fn main() {
         "project" => cmd_project(&args),
         "ip" => cmd_ip(&args),
         "hnf" => cmd_hnf(&args),
-        "--help" | "-h" | "help" => usage(),
+        // An explicit request for help is not an error: usage goes to stdout
+        // and exits 0, so `helion --help | less` and `$(helion --help)` work.
+        "--help" | "-h" | "help" => {
+            print!("{}", usage_text());
+        }
         other => {
             eprintln!("unknown command {other}");
-            usage();
+            eprint!("{}", usage_text());
             std::process::exit(2);
         }
     }
 }
 
-fn usage() {
-    eprintln!(
+/// Flags that always require a following value.
+const VALUE_FLAGS: &[&str] = &[
+    "--part", "-o", "--output", "--sdc", "--xdc", "--cycles", "--cell", "--init", "--cable",
+    "--bitstream", "-b", "--prj",
+];
+
+/// Reject `--flag` at end of argv (or followed by another flag), which every
+/// `take_flag` caller used to read as "flag absent" and proceed happily.
+fn validate_flag_values(cmd: &str, args: &[String]) -> Result<(), String> {
+    // `hw` parses its own argv (and allows a bare positional bitstream).
+    if cmd == "hw" {
+        return Ok(());
+    }
+    for (i, a) in args.iter().enumerate() {
+        if a == "--" {
+            break;
+        }
+        if !VALUE_FLAGS.contains(&a.as_str()) {
+            continue;
+        }
+        match args.get(i + 1) {
+            None => return Err(format!("{a} needs a value")),
+            Some(v) if v.starts_with("--") => {
+                return Err(format!("{a} needs a value (got {v})"));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn usage_text() -> String {
+    format!(
         "helion {v}
   helion --version
   helion doctor
   helion gui
   helion synth <file.sv> [--part P]
-  helion impl <file.sv> [--part P]
-  helion run <file.sv> [--cycles N] [--part P]
-  helion report_timing <file.sv|.vhd> [--sdc f.sdc]
-  helion report_utilization <file.sv|.vhd>
-  helion report_power <file.sv|.vhd>
-  helion reports <file.sv|.vhd>
-  helion bitstream <file.sv|.vhd|.c|.prj> -o out.hbits
+  helion impl <file.sv> [--part P] [--xdc f.xdc]
+  helion run <file.sv> [--cycles N] [--part P] [--xdc f.xdc]
+  helion report_timing <file.sv|.vhd> [--sdc f.sdc] [--part P] [--xdc f.xdc]
+  helion report_utilization <file.sv|.vhd> [--part P] [--xdc f.xdc]
+  helion report_power <file.sv|.vhd> [--part P] [--xdc f.xdc]
+  helion reports <file.sv|.vhd> [--part P] [--xdc f.xdc]
+  helion bitstream <file.sv|.vhd|.c|.prj> -o out.hbits [--part P] [--xdc f.xdc]
   helion eco <file.sv> --cell u_lut --init 0xAAAAAAAAAAAAAAAA
   helion pblock <file.sv>
-  helion qor <file.sv>
+  helion qor <file.sv|.prj> [--part P] [--xdc f.xdc]
   helion project <file.prj>
   helion project run <file.prj> [--cycles N]
   helion project checkpoint write <file.prj> [-o out.hckp]
@@ -376,7 +1025,7 @@ fn usage() {
   helion hw list|detect
   helion hw program|flash --cable auto|sim|usb|ofl|native [--bitstream FILE.hbits] [--part P]",
         v = env!("CARGO_PKG_VERSION")
-    );
+    )
 }
 
 fn take_flag(args: &[String], name: &str) -> Option<String> {
@@ -397,24 +1046,42 @@ fn positional(args: &[String]) -> Option<&str> {
 
 fn cmd_synth(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
-    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let part = resolve_part(path, args).unwrap_or_else(|e| {
+        eprintln!("synth: {e}");
+        std::process::exit(1);
+    });
     let d = synth_any(path).unwrap_or_else(|e| {
         eprintln!("synth: {e}");
         std::process::exit(1);
     });
+    // `--part` is echoed in the line below, so it must name a real part.
+    // Synthesising is part-independent, but printing an unvalidated part is a
+    // claim the tool does not keep (it used to echo `part=!!!junk!!!` at exit 0).
+    let dev = Device::load_part(&part).unwrap_or_else(|e| {
+        eprintln!("synth: HAD {part}: {e}");
+        std::process::exit(1);
+    });
     let luts = d.lut_inits();
     println!(
-        "synth {} cells={} luts={} inits={luts:#x?} part={part}",
+        "synth {} cells={} luts={} inits={luts:#x?} part={}",
         d.name,
         d.cells.len(),
-        luts.len()
+        luts.len(),
+        dev.part
     );
 }
 
 fn cmd_impl(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
-    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
-    let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
+    let part = resolve_part(path, args).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let xdc = xdc_from_args(args).unwrap_or_else(|e| {
+        eprintln!("impl: {e}");
+        std::process::exit(1);
+    });
+    let c = compile_sv_xdc(path, &part, 0.0, &xdc).unwrap_or_else(|e| {
         eprintln!("impl: {e}");
         std::process::exit(1);
     });
@@ -432,11 +1099,18 @@ fn cmd_impl(args: &[String]) {
 
 fn cmd_run(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
-    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let part = resolve_part(path, args).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
     let cycles: u32 = take_flag(args, "--cycles")
         .and_then(|s| s.parse().ok())
         .unwrap_or(16);
-    let c = compile_sv(path, &part, 0.75).unwrap_or_else(|e| {
+    let xdc = xdc_from_args(args).unwrap_or_else(|e| {
+        eprintln!("run: {e}");
+        std::process::exit(1);
+    });
+    let c = compile_sv_xdc(path, &part, 0.75, &xdc).unwrap_or_else(|e| {
         eprintln!("run: {e}");
         std::process::exit(1);
     });
@@ -488,8 +1162,15 @@ fn cmd_run(args: &[String]) {
 
 fn cmd_timing(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
-    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
-    let c = compile_sv(path, &part, 0.75).unwrap_or_else(|e| {
+    let part = resolve_part(path, args).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let xdc = xdc_from_args(args).unwrap_or_else(|e| {
+        eprintln!("timing: {e}");
+        std::process::exit(1);
+    });
+    let c = compile_sv_xdc(path, &part, 0.75, &xdc).unwrap_or_else(|e| {
         eprintln!("report_timing: {e}");
         std::process::exit(1);
     });
@@ -525,8 +1206,15 @@ fn cmd_timing(args: &[String]) {
 
 fn cmd_util(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
-    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
-    let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
+    let part = resolve_part(path, args).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let xdc = xdc_from_args(args).unwrap_or_else(|e| {
+        eprintln!("util: {e}");
+        std::process::exit(1);
+    });
+    let c = compile_sv_xdc(path, &part, 0.0, &xdc).unwrap_or_else(|e| {
         eprintln!("report_utilization: {e}");
         std::process::exit(1);
     });
@@ -559,8 +1247,15 @@ fn power_of(c: &Compiled) -> PowerReport {
 
 fn cmd_power(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
-    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
-    let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
+    let part = resolve_part(path, args).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let xdc = xdc_from_args(args).unwrap_or_else(|e| {
+        eprintln!("power: {e}");
+        std::process::exit(1);
+    });
+    let c = compile_sv_xdc(path, &part, 0.0, &xdc).unwrap_or_else(|e| {
         eprintln!("report_power: {e}");
         std::process::exit(1);
     });
@@ -570,8 +1265,15 @@ fn cmd_power(args: &[String]) {
 /// One compile: bitstream + timing + util + power, and they must agree.
 fn cmd_reports(args: &[String]) {
     let path = positional(args).unwrap_or("examples/counter.sv");
-    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
-    let c = compile_sv(path, &part, 0.75).unwrap_or_else(|e| {
+    let part = resolve_part(path, args).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let xdc = xdc_from_args(args).unwrap_or_else(|e| {
+        eprintln!("reports: {e}");
+        std::process::exit(1);
+    });
+    let c = compile_sv_xdc(path, &part, 0.75, &xdc).unwrap_or_else(|e| {
         eprintln!("reports: {e}");
         std::process::exit(1);
     });
@@ -593,6 +1295,18 @@ fn cmd_reports(args: &[String]) {
             "reports: TOTAL_UW={} != STATIC+DYNAMIC {}",
             pwr.total_uw,
             pwr.static_uw.saturating_add(pwr.dynamic_uw)
+        );
+        std::process::exit(1);
+    }
+    // No endpoints is not a pass. `report_timing_routed` leaves WNS at the full
+    // clock period when nothing is timed, so printing "WNS_PS=10000" here read
+    // as a closed design with perfect slack. A design with nothing to time is a
+    // report the caller must not mistake for signoff.
+    if c.timing.endpoints == 0 {
+        eprintln!(
+            "reports: {} has no timing endpoints (no register-to-register or I/O paths); \
+             nothing to report — this is not a closed design",
+            c.design.name
         );
         std::process::exit(1);
     }
@@ -627,9 +1341,16 @@ fn cmd_reports(args: &[String]) {
 
 fn cmd_bits(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
-    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let part = resolve_part(path, args).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
     let out = take_flag(args, "-o").or_else(|| take_flag(args, "--output"));
-    let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
+    let xdc = xdc_from_args(args).unwrap_or_else(|e| {
+        eprintln!("bitstream: {e}");
+        std::process::exit(1);
+    });
+    let c = compile_sv_xdc(path, &part, 0.0, &xdc).unwrap_or_else(|e| {
         eprintln!("bitstream: {e}");
         std::process::exit(1);
     });
@@ -652,34 +1373,86 @@ fn cmd_bits(args: &[String]) {
 
 fn cmd_eco(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
-    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let part = resolve_part(path, args).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
     let cell = take_flag(args, "--cell").unwrap_or_else(|| "u_lut".into());
     let init = take_flag(args, "--init").unwrap_or_else(|| "0xAAAAAAAAAAAAAAAA".into());
-    let new_init = u64::from_str_radix(init.trim_start_matches("0x").trim_start_matches("0X"), 16)
-        .unwrap_or(0xAAAA_AAAA_AAAA_AAAA);
-    let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
+    // A malformed `--init` (or one wider than 64 bits) silently became the
+    // default 0xAAAA... before: the ECO then reported a plausible but wrong
+    // INIT. Reject it.
+    let new_init = parse_lut_init(&init).unwrap_or_else(|e| {
         eprintln!("eco: {e}");
         std::process::exit(1);
     });
-    let (site, ble) = c.routed.placed.lutff_sites[0];
-    let before = readback_lut_init(&c.dev, &c.bits, site.x, site.y, ble as u32).unwrap();
+    let xdc = xdc_from_args(args).unwrap_or_else(|e| {
+        eprintln!("eco: {e}");
+        std::process::exit(1);
+    });
+    let c = compile_sv_xdc(path, &part, 0.0, &xdc).unwrap_or_else(|e| {
+        eprintln!("eco: {e}");
+        std::process::exit(1);
+    });
+    // Indexing [0] panicked on a design with no placed LUT/FF (empty or
+    // port-only module). Report it as a normal error.
+    let (site, ble) = match c.routed.placed.lutff_sites.first() {
+        Some(x) => *x,
+        None => {
+            eprintln!(
+                "eco: {} has no placed LUT/FF cell, so there is nothing to edit (design cells={})",
+                c.design.name,
+                c.design.cells.len()
+            );
+            std::process::exit(1);
+        }
+    };
+    let before = readback_lut_init(&c.dev, &c.bits, site.x, site.y, ble as u32).unwrap_or_else(|e| {
+        eprintln!("eco: readback LUT INIT at CLB_X{}Y{}: {e}", site.x, site.y);
+        std::process::exit(1);
+    });
     let after_bs = eco_lut(&c.dev, &c.routed, &cell, new_init).unwrap_or_else(|e| {
         eprintln!("eco: {e}");
         std::process::exit(1);
     });
-    let after = readback_lut_init(&c.dev, &after_bs, site.x, site.y, ble as u32).unwrap();
+    let after = readback_lut_init(&c.dev, &after_bs, site.x, site.y, ble as u32).unwrap_or_else(|e| {
+        eprintln!("eco: readback edited LUT INIT at CLB_X{}Y{}: {e}", site.x, site.y);
+        std::process::exit(1);
+    });
     println!("eco {cell} INIT {before:#x} -> {after:#x}");
 }
 
 fn cmd_pblock(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
-    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
-    let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
+    let part = resolve_part(path, args).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let xdc = xdc_from_args(args).unwrap_or_else(|e| {
         eprintln!("pblock: {e}");
         std::process::exit(1);
     });
-    let (site, _) = c.routed.placed.lutff_sites[0];
-    let pb = bitgen_pblock(&c.dev, &c.routed, &[(site.x, site.y)]).unwrap();
+    let c = compile_sv_xdc(path, &part, 0.0, &xdc).unwrap_or_else(|e| {
+        eprintln!("pblock: {e}");
+        std::process::exit(1);
+    });
+    // `lutff_sites[0]` panicked on a design with nothing placed; error instead.
+    let (site, _) = match c.routed.placed.lutff_sites.first() {
+        Some(x) => *x,
+        None => {
+            eprintln!(
+                "pblock: {} has no placed LUT/FF cell, so there is no pblock to report \
+                 (design cells={})",
+                c.design.name,
+                c.design.cells.len()
+            );
+            std::process::exit(1);
+        }
+    };
+    let pb = bitgen_pblock(&c.dev, &c.routed, &[(site.x, site.y)]).unwrap_or_else(|e| {
+        eprintln!("pblock: {e}");
+        std::process::exit(1);
+    });
     println!(
         "pblock CLB_X{}Y{} frames {} / full {}",
         site.x,
@@ -693,14 +1466,31 @@ fn cmd_pblock(args: &[String]) {
 /// `crates/helion-cli/tests/qor.rs` gates (LUT, WNS, bitstream size, wall time).
 fn cmd_qor(args: &[String]) {
     let path = positional(args).unwrap_or("examples/counter.sv");
-    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let part = resolve_part(path, args).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
     let t0 = std::time::Instant::now();
-    let c = compile_sv(path, &part, 0.75).unwrap_or_else(|e| {
+    let xdc = xdc_from_args(args).unwrap_or_else(|e| {
+        eprintln!("qor: {e}");
+        std::process::exit(1);
+    });
+    let c = compile_sv_xdc(path, &part, 0.75, &xdc).unwrap_or_else(|e| {
         eprintln!("qor: {e}");
         std::process::exit(1);
     });
     let elapsed_ms = t0.elapsed().as_millis();
     let p = &c.routed.placed.packed;
+    // See `cmd_reports`: zero endpoints means WNS is just the clock period, not
+    // a measured slack. Refuse to publish it as QoR.
+    if c.timing.endpoints == 0 {
+        eprintln!(
+            "qor: {} has no timing endpoints (no register-to-register or I/O paths); \
+             no WNS to report — this is not a closed design",
+            c.design.name
+        );
+        std::process::exit(1);
+    }
     println!(
         "qor {} part={} LUTFF={} IOB={} BRAM={} DSP={} WNS_PS={} R2R_PS={} IOB_PS={} FRAMES={} BYTES={} ELAPSED_MS={}",
         c.design.name,
@@ -1089,7 +1879,8 @@ fn cmd_project_checkpoint_write_bitstream(args: &[String]) {
 
 fn load_checkpoint_session(args: &[String]) -> (Session, Device, String) {
     let path = positional(args).unwrap_or("counter.hckp").to_string();
-    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    // A checkpoint is not a `.prj`: only the CLI flag (or the default) names a part.
+    let part = take_flag(args, "--part").unwrap_or_else(|| DEFAULT_PART.into());
     let dev = Device::load_part(&part).unwrap_or_else(|e| {
         eprintln!("open_checkpoint part {part}: {e}");
         std::process::exit(1);
