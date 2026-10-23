@@ -543,7 +543,12 @@ fn bit_identical_vs_xc7frames2bit() {
     let Some(fasm_text) = synthetic_fasm(&layout, &artix7) else {
         skip!("could not synthesize FASM for {part}");
     };
-    let mut store = FrameStore::new(&layout.all_addresses());
+    // The reference `.bit` is built by xc7frames2bit, which fills every
+    // valid frame from part.json. Match it: a sparse store would shift all
+    // frames after the first missing one.
+    let part_info = helion_xilinx7::db::load::load_part(&artix7.join(&part).join("part.json"))
+        .expect("part.json");
+    let mut store = FrameStore::for_part(&part_info).expect("frame store");
     let lines = helion_xilinx7::fasm::parse_fasm(&fasm_text).expect("parse");
     store.apply_fasm(&lines, &segbits, &layout).expect("apply");
     let payload = store.fdri_payload();

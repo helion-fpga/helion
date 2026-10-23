@@ -164,9 +164,108 @@ pub struct PartInfo {
 }
 
 impl PartInfo {
+    /// All valid configuration frame addresses, in FDRI autoincrement order:
+    /// block type (CLB_IO_CLK, then BLOCK_RAM), row half (top, then bottom),
+    /// row, column, then the per-column minor frame number.
+    ///
+    /// This is **not** the union of the `tilegrid.json` `bits` ranges. Some
+    /// valid frames contain no tile configuration bits, so they do not appear
+    /// in `tilegrid.json`; the FDRI stream is nevertheless a contiguous run
+    /// over *all* valid frames. Omitting a frame shifts every later frame to
+    /// the wrong address (and `done=1` still goes high, because programming
+    /// can succeed with the design in the wrong frames).
+    ///
+    /// Use this — not the tilegrid union — when assembling a `.bit`.
+    pub fn frame_addresses(&self) -> Result<Vec<u32>, String> {
+        let regions = self
+            .global_clock_regions
+            .as_object()
+            .ok_or_else(|| "part.json: global_clock_regions is not an object".to_string())?;
+
+        let mut addrs: Vec<u32> = Vec::with_capacity(self.frame_count()? as usize);
+        // Numeric frame-address order. Bit 25:23 is the bus (CLB_IO_CLK = 0,
+        // BLOCK_RAM = 1), bit 22 is the row half (top = 0, bottom = 1),
+        // bits 21:17 rows, 16:7 columns, 6:0 minor.
+        for (block, bus_name) in [(0u32, "CLB_IO_CLK"), (1u32, "BLOCK_RAM")] {
+            for (region_name, bottom_half) in [("top", 0u32), ("bottom", 1u32)] {
+                let region = regions.get(region_name).ok_or_else(|| {
+                    format!("part.json: missing global_clock_regions.{region_name}")
+                })?;
+                let rows = region
+                    .get("rows")
+                    .and_then(|r| r.as_object())
+                    .ok_or_else(|| {
+                        format!("part.json: region {region_name} without rows")
+                    })?;
+                let mut row_keys: Vec<&String> = rows.keys().collect();
+                row_keys.sort_by_key(|k| k.parse::<u32>().unwrap_or(u32::MAX));
+                for row_key in row_keys {
+                    let row_num: u32 = row_key.parse().map_err(|_| {
+                        format!("part.json: non-numeric row {row_key:?}")
+                    })?;
+                    let buses = rows[row_key]
+                        .get("configuration_buses")
+                        .and_then(|b| b.as_object())
+                        .ok_or_else(|| {
+                            format!("part.json: {region_name} row {row_key} without buses")
+                        })?;
+                    let Some(bus) = buses.get(bus_name) else {
+                        continue;
+                    };
+                    let cols = bus
+                        .get("configuration_columns")
+                        .and_then(|c| c.as_object())
+                        .ok_or_else(|| {
+                            format!(
+                                "part.json: {region_name} row {row_key} {bus_name} without columns"
+                            )
+                        })?;
+                    let mut col_keys: Vec<&String> = cols.keys().collect();
+                    col_keys.sort_by_key(|k| k.parse::<u32>().unwrap_or(u32::MAX));
+                    for col_key in col_keys {
+                        let col_num: u32 = col_key.parse().map_err(|_| {
+                            format!("part.json: non-numeric column {col_key:?}")
+                        })?;
+                        let count = cols[col_key]
+                            .get("frame_count")
+                            .and_then(|f| f.as_u64())
+                            .ok_or_else(|| {
+                                format!(
+                                    "part.json: {region_name} row {row_key} column {col_key} \
+                                     without frame_count"
+                                )
+                            })? as u32;
+                        // Minor is a 7-bit field (bits 6:0).
+                        if count > 128 {
+                            return Err(format!(
+                                "part.json: column {col_key} frame_count {count} exceeds 128"
+                            ));
+                        }
+                        for minor in 0..count {
+                            addrs.push(
+                                (block << 23)
+                                    | (bottom_half << 22)
+                                    | (row_num << 17)
+                                    | (col_num << 7)
+                                    | minor,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if addrs.is_empty() {
+            return Err("part.json: no configuration frames".to_string());
+        }
+        addrs.sort_unstable();
+        addrs.dedup();
+        Ok(addrs)
+    }
+
     /// Total configuration frame count, summed over the clock regions.
     ///
-    /// For `xc7a35tcsg324-1` this must be 5408.
+    /// For `xc7a35tcsg324-1` this must be 5408; for `xc7z020clg484-1`, 9996.
     pub fn frame_count(&self) -> Result<u32, String> {
         let regions = self
             .global_clock_regions
@@ -279,6 +378,31 @@ mod tests {
         assert_eq!(p.idcode, 0x0362_D093);
         assert_eq!(p.frame_count().unwrap(), 5408);
         assert_eq!(p.iobanks["35"], "X113Y78");
+    }
+
+    #[test]
+    fn part_frame_addresses_are_complete_and_ordered() {
+        let p = load_part(&db_root().join("artix7/xc7a35tcsg324-1/part.json")).unwrap();
+        let addrs = p.frame_addresses().unwrap();
+        assert_eq!(addrs.len() as u32, p.frame_count().unwrap());
+        assert_eq!(addrs.len(), 5408);
+        assert!(addrs.windows(2).all(|w| w[0] < w[1]), "addresses not unique/sorted");
+    }
+
+    #[test]
+    fn part_frame_addresses_zynq7() {
+        // The zynq7 DB is optional in some checkouts; only assert when present.
+        let path = db_root().join("zynq7/xc7z020clg484-1/part.json");
+        if !path.is_file() {
+            return;
+        }
+        let p = load_part(&path).unwrap();
+        let addrs = p.frame_addresses().unwrap();
+        assert_eq!(addrs.len(), 9996);
+        // CLK_BUFG_BOT_R_X87Y48 owns frames 0x421080..0x42109d; the
+        // BUFGCTRL_X0Y0 config lives in frame 27 (0x42109b).
+        assert!(addrs.contains(&0x0042_109b));
+        assert!(addrs.windows(2).all(|w| w[0] < w[1]), "addresses not unique/sorted");
     }
 
     #[test]

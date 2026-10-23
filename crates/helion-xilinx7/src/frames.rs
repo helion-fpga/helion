@@ -316,6 +316,11 @@ pub struct FrameStore {
 
 impl FrameStore {
     /// Zero-filled store over `addrs` (sorted and deduplicated).
+    ///
+    /// **For a `.bit` this must be every valid frame of the device**, not the
+    /// union of `tilegrid.json` bit ranges — see [`FrameStore::for_part`].
+    /// The FDRI stream has no per-frame address, so a missing frame shifts
+    /// every later frame to the wrong address.
     pub fn new(addrs: &[u32]) -> Self {
         let mut sorted: Vec<u32> = addrs.to_vec();
         sorted.sort_unstable();
@@ -328,6 +333,17 @@ impl FrameStore {
             words,
             index,
         }
+    }
+
+    /// Store covering every valid configuration frame of `part`
+    /// ([`crate::db::load::PartInfo::frame_addresses`]).
+    ///
+    /// Use this, not [`FrameStore::new`] with the tilegrid union, to assemble
+    /// a `.bit`. The two differ by frames that carry no tile bits (434 on
+    /// xc7a35t, 2194 on xc7z020); dropping them misaligns the whole stream.
+    pub fn for_part(part: &crate::db::load::PartInfo) -> Result<Self, FramesError> {
+        let addrs = part.frame_addresses().map_err(|message| FramesError { message })?;
+        Ok(Self::new(&addrs))
     }
 
     /// Number of frames in the store.
