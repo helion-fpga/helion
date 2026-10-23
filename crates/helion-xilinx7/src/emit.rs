@@ -48,6 +48,20 @@ pub trait EmitDevice {
     /// the `*_SING` variants. Returning `false` skips the line rather than
     /// emitting FASM that no segbits file can resolve.
     fn iob_feature_available(&self, iob_tile: &str, site: &str, feature: &str) -> bool;
+
+    /// Every tile of `tile_type` on the part, as `(name, grid_y)` pairs.
+    ///
+    /// Clock distribution is a *chain*, not a single stage: `CLK_BUFG_REBUF`
+    /// repeaters are spaced down the clock column, and the clock only reaches
+    /// logic past a repeater once that repeater is enabled. The emitter sees
+    /// only the tiles it was routed through, so it cannot discover the rest of
+    /// the chain from the netlist alone and needs the device to enumerate them.
+    ///
+    /// The default returns nothing, which keeps the caller on its previous
+    /// single-stage behaviour if a device cannot answer.
+    fn tiles_of_type(&self, _tile_type: &str) -> Vec<(String, i32)> {
+        Vec::new()
+    }
 }
 
 /// IBUF `.IN` feature prefix for an IOSTANDARD, from
@@ -610,6 +624,93 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                 lines.push(format!("{tile}.HCLK_CMT_CK_BUFHCLK{n}_USED"));
             }
         }
+
+        // Repeater bracketing for the global-clock column.
+        //
+        // `CLK_BUFG_REBUF` tiles are bidirectional repeaters spaced ~25 rows
+        // apart down the clock column. `GCLK<n>_ENABLE_ABOVE` drives the clock
+        // up out of a repeater and `_BELOW` drives it down, so a repeater only
+        // matters when the clock has to travel *past* it. The stage that
+        // injects the clock is enabled by `clock_companions`; this pass enables
+        // every other repeater between that injection point and the far end of
+        // the placed logic, which is what Vivado does.
+        //
+        // Omitting this is invisible for a design whose flops sit right beside
+        // the HROW -- the reference blinky's do -- and silently breaks any
+        // design placed further down the column, because the clock stops at
+        // the last enabled repeater and those rows never see an edge. Deriving
+        // the set from the placed rows keeps it right for a design that spans
+        // a different part of the column, rather than hardcoding the two
+        // repeaters the reference happens to use.
+        {
+            let mut inject: Option<i32> = None;
+            let mut rebufs: Vec<i32> = Vec::new();
+            let mut logic: Vec<i32> = Vec::new();
+            let mut gclks: BTreeSet<u32> = BTreeSet::new();
+            for line in &lines {
+                let tile = line.split('.').next().unwrap_or("");
+                if is_clb_tile(tile) {
+                    if let Some(r) = tile_row(tile) {
+                        logic.push(r);
+                    }
+                    continue;
+                }
+                if !tile.starts_with("CLK_BUFG_REBUF") {
+                    continue;
+                }
+                if line.contains("_ENABLE_") {
+                    inject = tile_row(tile).or(inject);
+                }
+                for n in 0..32u32 {
+                    if line.contains(&format!("GCLK{n}_")) {
+                        gclks.insert(n);
+                    }
+                }
+            }
+            // The routed netlist names only the repeater stage it happened to
+            // use. The rest of the chain comes from the device, because the
+            // clock cannot reach logic past a repeater that is left disabled.
+            let mut chain: Vec<(i32, String)> = device
+                .tiles_of_type("CLK_BUFG_REBUF")
+                .into_iter()
+                .filter_map(|(name, y)| tile_row(&name).map(|r| (r, name)))
+                .collect();
+            chain.sort();
+            chain.dedup_by_key(|(r, _)| *r);
+            rebufs.extend(chain.iter().map(|(r, _)| *r));
+            // A repeater is an in-line amplifier, not a tap: the clock reaches
+            // logic past a repeater only once that repeater is enabled.
+            //
+            // Enable the neighbour on each side of the injection stage, then
+            // keep walking outward while a placed logic row still lies beyond
+            // the repeater just enabled. The first step is unconditional
+            // because that is what the reference does -- its flops span Y39-Y45
+            // beside an injection at Y38, so neither neighbour is on the path,
+            // yet Vivado enables both. Matching that keeps the bitstreams
+            // close; continuing to walk only when logic demands it keeps the
+            // clock correct for a design spread further down the column, where
+            // a fixed one-step rule would strand the far flops with no edge.
+            if let (Some(iy), Some(&lo), Some(&hi)) =
+                (inject, logic.iter().min(), logic.iter().max())
+            {
+                let (below, above) = rebuf_rows_to_enable(&rebufs, iy, lo, hi);
+                let name_of = |row: i32| -> Option<&str> {
+                    chain
+                        .iter()
+                        .find(|(r, _)| *r == row)
+                        .map(|(_, n)| n.as_str())
+                };
+                for (rows, dir) in [(below, "BELOW"), (above, "ABOVE")] {
+                    for row in rows {
+                        if let Some(t) = name_of(row) {
+                            for n in &gclks {
+                                lines.push(format!("{t}.GCLK{n}_ENABLE_{dir}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     lines.sort();
@@ -622,6 +723,75 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
 
 /// Extra configuration features that enable a clock-network branch.
 ///
+/// Which `CLK_BUFG_REBUF` repeaters to enable for a clock injected at
+/// `inject_y` and feeding logic spanning `lo..=hi`.
+///
+/// Returns `(below, above)`: the repeater rows to enable in each direction.
+/// A repeater is an in-line amplifier rather than a tap, so the clock reaches
+/// logic past one only once it is enabled.
+///
+/// The first repeater on each side is always taken, because that is what the
+/// reference bitstream does: its flops sit beside the injection stage, so
+/// neither neighbour is strictly on the path, yet Vivado programmes both.
+/// Beyond that the walk continues only while a logic row still lies past the
+/// repeater just enabled, which keeps the clock correct for a design spread
+/// down the column instead of stranding its far flops.
+///
+/// Kept free of I/O so the rule can be tested directly; the caller does the
+/// FASM formatting.
+fn rebuf_rows_to_enable(
+    chain: &[i32],
+    inject_y: i32,
+    lo: i32,
+    hi: i32,
+) -> (Vec<i32>, Vec<i32>) {
+    let mut ordered: Vec<i32> = chain.to_vec();
+    ordered.sort_unstable();
+    ordered.dedup();
+
+    let mut below = Vec::new();
+    // Walk outward from the injection so the first step is unconditional.
+    for row in ordered.iter().copied().filter(|r| *r < inject_y).rev() {
+        below.push(row);
+        // Stop once this repeater is at or past the lowest logic row: the
+        // next one down feeds nothing this design uses.
+        if row <= lo {
+            break;
+        }
+    }
+
+    let mut above = Vec::new();
+    for row in ordered.iter().copied().filter(|r| *r > inject_y) {
+        above.push(row);
+        if row >= hi {
+            break;
+        }
+    }
+
+    (below, above)
+}
+
+/// The `Y` index in a tile name, e.g. `CLK_BUFG_REBUF_X87Y38` -> `38`./// The `Y` index in a tile name, e.g. `CLK_BUFG_REBUF_X87Y38` -> `38`.
+///
+/// Every 7-series tile name ends in `X<col>Y<row>`, so the row is available
+/// without a device lookup. Returns `None` for a name that does not carry one,
+/// which keeps this total rather than panicking on a hand-written FASM line.
+fn tile_row(tile: &str) -> Option<i32> {
+    let y = tile.rsplit('Y').next()?;
+    // `Y38` must be all digits; `rsplit` on a name with no `Y` yields the whole
+    // string, which then fails to parse and correctly reports `None`.
+    if y.is_empty() || !y.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    y.parse().ok()
+}
+
+/// Is `tile` a CLB, i.e. a tile that can carry user logic?
+fn is_clb_tile(tile: &str) -> bool {
+    let head = tile.split('_').next().unwrap_or("");
+    head == "CLBLM" || head == "CLBLL"
+}
+
 /// X-Ray models the clock tree as a mux/route PIP *plus* separate
 /// active/enable bits. For example, HROW input `CLK_HROW_CK_IN_L0` also
 /// needs `CLK_HROW_CK_IN_L0_ACTIVE`, and the BUFG rebuffer needs
@@ -909,6 +1079,18 @@ mod tests {
         fn tile_type(&self, _tile: &str) -> Option<String> {
             Some("CLBLL_L".into())
         }
+        /// A miniature repeater column shaped like an xc7z020's: five
+        /// repeaters with the injection stage in the middle, so the walk rule
+        /// can be exercised without a real part file.
+        fn tiles_of_type(&self, tile_type: &str) -> Vec<(String, i32)> {
+            if tile_type != "CLK_BUFG_REBUF" {
+                return Vec::new();
+            }
+            [13, 38, 65, 90, 117]
+                .into_iter()
+                .map(|y| (format!("CLK_BUFG_REBUF_X87Y{y}"), y))
+                .collect()
+        }
         fn site_rel(&self, tile: &str, site: &str) -> Option<String> {
             if tile.starts_with("CLB") {
                 Some(if site.ends_with("Y0") { "SLICEL_X0".into() } else { "SLICEL_X1".into() })
@@ -1048,6 +1230,41 @@ mod tests {
     ///
     /// This is a structural invariant, so it holds for any design rather than
     /// the one hand-written fixture.
+    /// The global-clock column needs its repeaters enabled, not just the one
+    /// stage the route happened to name.
+    ///
+    /// `CLK_BUFG_REBUF` tiles are in-line amplifiers: the clock reaches logic
+    /// past a repeater only once that repeater is enabled. Emitting the enable
+    /// for the routed stage alone left `CLK_BUFG_REBUF_X87Y13` and
+    /// `_X87Y65` unprogrammed while the reference set both. `clkdiff.py` only
+    /// found it once it scanned the whole device instead of one hardcoded path.
+    #[test]
+    fn rebuf_selection_reaches_the_routed_logic() {
+        use super::rebuf_rows_to_enable as pick;
+        // An xc7z020 column, injection at Y38 -- the reference blinky's shape.
+        let chain = [13, 38, 65, 90, 117, 142];
+        let (below, above) = pick(&chain, 38, 42, 48);
+        assert_eq!(below, vec![13], "the neighbour below the injection");
+        assert_eq!(above, vec![65], "the neighbour above the injection");
+
+        // The first step on each side is unconditional, so logic that stops
+        // just above the injection still pulls in the neighbour.
+        let (below, above) = pick(&chain, 38, 5, 40);
+        assert_eq!(below, vec![13], "one repeater covers down to Y5");
+        assert_eq!(above, vec![65], "the unconditional first step upward");
+
+        // Logic spread far down the column must pull in every repeater it
+        // passes, or the rows past the last enabled one never see an edge.
+        let (below, above) = pick(&chain, 38, -20, 40);
+        assert_eq!(below, vec![13], "Y13 is the last repeater above Y-20");
+        assert_eq!(above, vec![65]);
+
+        // Symmetrically upward: walk until the highest logic row is covered.
+        let (below, above) = pick(&chain, 38, 39, 120);
+        assert_eq!(below, vec![13], "unconditional first step downward");
+        assert_eq!(above, vec![65, 90, 117, 142], "covers up to Y120");
+    }
+
     #[test]
     fn every_ff_gets_both_zini_and_zrst() {
         use std::collections::BTreeSet;
