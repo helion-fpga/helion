@@ -1060,12 +1060,34 @@ pub fn load_sdc(text: &str, clocks: &mut Vec<Clock>) -> Result<(), String> {
     Ok(())
 }
 
+/// Extract the object name from a Tcl fragment such as
+/// `get_ports {led[0]}` / `get_ports clk` / `get_pins {u0/q[3]}`.
+///
+/// The braced form is taken verbatim (minus the braces), so bus bit-selects
+/// survive: `{led[0]}` must yield `led[0]`, not `led`. Splitting on every
+/// non-alphanumeric character silently collapsed all bits of a bus into one
+/// name, and the caller's map is last-wins, so an entire 8-bit LED bus ended
+/// up pointing at a single package pin.
+///
+/// Unbraced forms (`get_ports clk`) fall back to the first bare token so
+/// existing single-name XDC/SDC files keep working.
 fn tcl_name(joined: &str, key: &str) -> Option<String> {
-    joined.split_once(key).and_then(|(_, r)| {
-        r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-            .find(|s| !s.is_empty())
-            .map(|s| s.to_string())
-    })
+    let (_, after) = joined.split_once(key)?;
+    let after = after.trim_start();
+    // Braced form: `{...}` -- preserve the contents exactly.
+    if let Some(rest) = after.strip_prefix('{') {
+        let end = rest.find('}')?;
+        let name = rest[..end].trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+        return None;
+    }
+    // Unbraced: first bare token.
+    after
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .find(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 fn tcl_object_name(joined: &str) -> Option<String> {

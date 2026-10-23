@@ -8,6 +8,7 @@ use crate::device::Device;
 use crate::emit::EmitDevice;
 use crate::place::DeviceQuery;
 use crate::route::RouteQuery;
+use crate::timing::TimingDevice;
 use std::collections::{HashMap, HashSet};
 
 /// Precomputed routing node maps, built once per [`Device`] by
@@ -115,16 +116,25 @@ impl<'a> DeviceQuery for XDevice<'a> {
             .map(|p| (p.tile.clone(), p.site.clone()))
     }
 
-    fn bufg_site(&self) -> Option<(String, String)> {
-        self.device.bufg_sites().into_iter().next()
+    fn bufg_site(&self, used: &HashSet<String>) -> Option<(String, String)> {
+        self.device
+            .bufg_sites()
+            .into_iter()
+            .find(|(tile, site)| !used.contains(site) && !used.contains(tile))
     }
 
-    fn ramb_site(&self) -> Option<(String, String)> {
-        self.device.ramb_sites().into_iter().next()
+    fn ramb_site(&self, used: &HashSet<String>) -> Option<(String, String)> {
+        self.device
+            .ramb_sites()
+            .into_iter()
+            .find(|(tile, site)| !used.contains(site) && !used.contains(tile))
     }
 
-    fn dsp_site(&self) -> Option<(String, String)> {
-        self.device.dsp_sites().into_iter().next()
+    fn dsp_site(&self, used: &HashSet<String>) -> Option<(String, String)> {
+        self.device
+            .dsp_sites()
+            .into_iter()
+            .find(|(tile, site)| !used.contains(site) && !used.contains(tile))
     }
 
     fn tile_xy(&self, tile: &str) -> Option<(i32, i32)> {
@@ -139,11 +149,21 @@ impl<'a> DeviceQuery for XDevice<'a> {
             .into_iter()
             .filter(|(_, site)| !used.contains(site))
             .filter_map(|(tile, site)| {
-                self.tile_xy(&tile)
+                <Self as DeviceQuery>::tile_xy(self, &tile)
                     .map(|(tx, ty)| ((tx - x).abs() + (ty - y).abs(), tile, site))
             })
             .min_by_key(|(d, _, _)| *d)
             .map(|(_, tile, site)| (tile, site))
+    }
+}
+
+impl<'a> TimingDevice for XDevice<'a> {
+    fn tile_xy(&self, tile: &str) -> Option<(i32, i32)> {
+        // Real grid coordinates from the device model. The numbers embedded
+        // in a tile name are NOT grid coordinates (see timing::tile_xy).
+        self.tile_idx(tile)
+            .and_then(|i| self.device.tile(i))
+            .map(|t| (t.grid_x, t.grid_y))
     }
 }
 
@@ -215,6 +235,42 @@ impl<'a> EmitDevice for XDevice<'a> {
             .map(|s| s.to_string())
     }
 
+    fn ioi_tile_for(&self, iob_tile: &str) -> Option<String> {
+        let idx = self.tile_idx(iob_tile)?;
+        let t = self.device.tile(idx)?;
+        // The IOI tile is adjacent in x (right for LIOB, left for RIOB) and
+        // shares the IOB's grid row.
+        for dx in [-1, 1, -2, 2] {
+            let Some(n) = self.device.tile_at(t.grid_x + dx, t.grid_y) else {
+                continue;
+            };
+            let Some(tt) = self.device.tile_type_name(n) else {
+                continue;
+            };
+            if tt.starts_with("LIOI3") || tt.starts_with("RIOI3") {
+                return self.tile_name(n).map(|s| s.to_string());
+            }
+        }
+        None
+    }
+
+    fn ologic_feature_available(&self, ioi_tile: &str, site: &str, feature: &str) -> bool {
+        // The segbits DB is keyed by tile TYPE and the feature name is
+        // prefixed with that type, e.g.
+        //   type "RIOI3_SING", feature "RIOI3_SING.OLOGIC_Y0.OMUX.D1".
+        // Upstream X-Ray ships *_SING / *_TBYTESRC / *_TBYTETERM IOI tiles
+        // with ppips only, so this returns false there and the emitter fails
+        // loudly instead of producing an unassemblable FASM line.
+        let Some(idx) = self.tile_idx(ioi_tile) else {
+            return false;
+        };
+        let Some(tt) = self.device.tile_type_name(idx) else {
+            return false;
+        };
+        let namespaced = format!("{tt}.{site}.{feature}");
+        self.device.segbits(tt, &namespaced).is_some()
+    }
+
     fn site_rel(&self, tile: &str, site: &str) -> Option<String> {
         let idx = self.tile_idx(tile)?;
         let t = self.device.tile(idx)?;
@@ -243,6 +299,17 @@ impl<'a> EmitDevice for XDevice<'a> {
         } else if stype.starts_with("BUFG") {
             // segbits: BUFGCTRL.BUFGCTRL_X0Y0 (full site name).
             Some(site.to_string())
+        } else if stype.starts_with("RAMB") {
+            // segbits_bram_{l,r}.db names the sites `RAMB18_Y0` / `RAMB18_Y1`
+            // -- keyed by the site's Y index inside the tile, with NO `X`.
+            // Deriving it from the site TYPE (as the generic fallback did)
+            // produced `RAMB18E1_X1`, which matches no segbits entry at all,
+            // so the block was written with no configuration bits and
+            // silently held nothing.
+            Some(format!("RAMB18_Y{pos}"))
+        } else if stype.starts_with("DSP") {
+            // segbits_dsp_{l,r}.db uses `DSP48.DSP_<x>`.
+            Some(format!("DSP48.DSP_{pos}"))
         } else {
             Some(format!("{stype}_X{pos}"))
         }
@@ -253,6 +320,61 @@ impl<'a> EmitDevice for XDevice<'a> {
 mod tests {
     use super::*;
     use crate::device::{default_db_root, Device};
+
+    /// `site_rel` must produce names the segbits DB actually defines, for
+    /// every site class. The generic `{type}_X{pos}` fallback used to invent
+    /// `RAMB18E1_X1` / `DSP48E1_X0`, which resolve to nothing, so those
+    /// blocks were emitted with no configuration at all.
+    #[test]
+    fn site_rel_matches_segbits_names() {
+        let db = default_db_root();
+        if !db.join("zynq7/xc7z020/tilegrid.json").is_file() {
+            return;
+        }
+        let mut dev = Device::load_xc7z020(&db).expect("load xc7z020");
+        let nodes = build_node_map(&mut dev);
+        let xdev = XDevice::new(&dev, nodes);
+
+        // Block RAM: segbits_bram_l.db spells the site `RAMB18_Y<n>`.
+        let (tile, site) = xdev
+            .device
+            .ramb_sites()
+            .into_iter()
+            .next()
+            .expect("a RAMB18E1 site");
+        let tt = xdev.device.tile_type_name(xdev.tile_idx(&tile).unwrap()).unwrap();
+        let rel = xdev.site_rel(&tile, &site).expect("RAMB18 site rel");
+        assert!(
+            rel.starts_with("RAMB18_Y"),
+            "BRAM rel name `{rel}` must match the segbits spelling RAMB18_Y<n>"
+        );
+        assert!(
+            xdev.device
+                .segbits(tt, &format!("{tt}.{rel}.IN_USE"))
+                .is_some(),
+            "segbits must define {tt}.{rel}.IN_USE"
+        );
+
+        // DSP: segbits_dsp_l.db uses `DSP48.DSP_<x>`.
+        let (dtile, dsite) = xdev
+            .device
+            .dsp_sites()
+            .into_iter()
+            .next()
+            .expect("a DSP48E1 site");
+        let dtt = xdev.device.tile_type_name(xdev.tile_idx(&dtile).unwrap()).unwrap();
+        let drel = xdev.site_rel(&dtile, &dsite).expect("DSP site rel");
+        assert!(
+            drel.starts_with("DSP48.DSP_"),
+            "DSP rel name `{drel}` must match the segbits spelling DSP48.DSP_<x>"
+        );
+        assert!(
+            xdev.device
+                .segbits(dtt, &format!("{dtt}.{drel}.USE_DPORT[0]"))
+                .is_some(),
+            "segbits must define {dtt}.{drel}.USE_DPORT[0]"
+        );
+    }
 
     #[test]
     fn iob_site_rel_is_top_down() {

@@ -186,28 +186,40 @@ fn route_net(
         .site_pin_wire(&driver.site, &driver.pin)
         .ok_or_else(|| format!("route: no wire for driver {}.{} (net `{net}`)", driver.site, driver.pin))?;
 
-    let mut all_pips: Vec<RoutedPip> = Vec::new();
+    // Route all loads from ONE BFS tree. A per-load BFS union is unsafe:
+    // different loads can select different sources for the same mux (e.g.
+    // HROW MUX_OUT_R0 fed by both CK_IN_L0 and CK_GCLK0), and the union bit
+    // pattern matches no valid mux feature. A single parent tree guarantees
+    // exactly one driver per wire, and is one BFS instead of one per load.
+    let mut sinks: Vec<(String, String)> = Vec::new();
     for load in &external_loads {
-        let sinks = device.wire_for_site_pin(&load.site, &load.pin);
-        if sinks.is_empty() {
+        let s = device.wire_for_site_pin(&load.site, &load.pin);
+        if s.is_empty() {
             return Err(format!(
                 "route: no wire for load {}.{} (net `{net}`)",
                 load.site, load.pin
             ));
         }
-        let pips = bfs_route(&src_tile, &src_wire, &sinks, device)
-            .ok_or_else(|| format!("route: net `{net}` unroutable to {}.{}", load.site, load.pin))?;
-        all_pips.extend(pips);
+        sinks.extend(s);
     }
-    // Dedup shared pips.
-    all_pips.sort_by(|a, b| (&a.tile, &a.dst_wire, &a.src_wire).cmp(&(&b.tile, &b.dst_wire, &b.src_wire)));
-    all_pips.dedup_by(|a, b| a.tile == b.tile && a.dst_wire == b.dst_wire && a.src_wire == b.src_wire && a.is_pseudo == b.is_pseudo);
-    Ok(RouteKind::Pips(all_pips))
+    sinks.sort();
+    sinks.dedup();
+    let pips = bfs_route_all(&src_tile, &src_wire, &sinks, device).ok_or_else(|| {
+        format!(
+            "route: net `{net}` unroutable to one or more of {} loads",
+            external_loads.len()
+        )
+    })?;
+    Ok(RouteKind::Pips(pips))
 }
 
-/// BFS from `(src_tile, src_wire)` to any of `sinks: [(tile, wire)]`.
-/// Returns the pip path in source→sink order.
-fn bfs_route(
+/// BFS from `(src_tile, src_wire)` to every sink in `sinks: [(tile, wire)]`.
+///
+/// Builds a single parent tree, so every wire — and therefore every mux —
+/// has exactly one driver. The returned pip set is the union of the tree
+/// paths, sorted for deterministic output. Returns `None` unless every sink
+/// is reachable.
+fn bfs_route_all(
     src_tile: &str,
     src_wire: &str,
     sinks: &[(String, String)],
@@ -222,11 +234,13 @@ fn bfs_route(
     parent.insert(start.clone(), None);
     queue.push_back(start);
 
-    let mut found: Option<(String, String)> = None;
+    let mut found: HashSet<(String, String)> = HashSet::new();
     while let Some((tile, wire)) = queue.pop_front() {
         if sink_set.contains(&(tile.as_str(), wire.as_str())) {
-            found = Some((tile, wire));
-            break;
+            found.insert((tile.clone(), wire.clone()));
+            if found.len() == sink_set.len() {
+                break;
+            }
         }
         // Through pips in this tile (including pseudo-pips: always-on
         // connections like the OLOGIC bypass, traversed but not emitted).
@@ -259,21 +273,36 @@ fn bfs_route(
         }
     }
 
-    let end = found?;
-    // Walk back to start, collecting pips.
+    if found.len() != sink_set.len() {
+        return None;
+    }
+
+    // Walk every sink back to the root. The parent tree gives each wire a
+    // single driver, so the union cannot over-drive a mux.
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
     let mut pips: Vec<RoutedPip> = Vec::new();
-    let mut cur = end;
-    while let Some(Some((prev, pip))) = parent.get(&cur) {
-        // Skip tileconn pseudo-pips (marked with ~); real pips only.
-        if !pip.tile.contains('~') {
-            pips.push(pip.clone());
-        }
-        cur = prev.clone();
-        if parent.get(&cur).map(|o| o.is_none()).unwrap_or(true) {
-            break;
+    for sink in found {
+        let mut cur = sink;
+        while let Some(Some((prev, pip))) = parent.get(&cur) {
+            // Skip tileconn pseudo-pips (marked with ~); real pips only.
+            if !pip.tile.contains('~')
+                && seen.insert((
+                    pip.tile.clone(),
+                    pip.dst_wire.clone(),
+                    pip.src_wire.clone(),
+                ))
+            {
+                pips.push(pip.clone());
+            }
+            cur = prev.clone();
+            if parent.get(&cur).map(|o| o.is_none()).unwrap_or(true) {
+                break;
+            }
         }
     }
-    pips.reverse();
+    pips.sort_by(|a, b| {
+        (&a.tile, &a.dst_wire, &a.src_wire).cmp(&(&b.tile, &b.dst_wire, &b.src_wire))
+    });
     Some(pips)
 }
 
@@ -382,8 +411,53 @@ mod tests {
     }
 
     #[test]
+    fn multi_sink_bfs_uses_one_parent_per_wire() {
+        struct MuxRouter;
+        impl RouteQuery for MuxRouter {
+            fn pips_from(&self, tile: &str, wire: &str) -> Vec<(String, String, bool)> {
+                match (tile, wire) {
+                    ("T", "A") => vec![("M".into(), "A".into(), false)],
+                    ("T", "M") => vec![
+                        ("S1".into(), "M".into(), false),
+                        ("S2".into(), "M".into(), false),
+                    ],
+                    _ => vec![],
+                }
+            }
+            fn node_wires(&self, _: &str, _: &str) -> Vec<(String, String)> {
+                vec![]
+            }
+            fn site_pin_wire(&self, _: &str, _: &str) -> Option<(String, String)> {
+                None
+            }
+            fn wire_for_site_pin(&self, _: &str, _: &str) -> Vec<(String, String)> {
+                vec![]
+            }
+            fn is_clock_net(&self, _: &str) -> bool {
+                false
+            }
+        }
+        let sinks = vec![
+            ("T".to_string(), "S1".to_string()),
+            ("T".to_string(), "S2".to_string()),
+        ];
+        let pips = bfs_route_all("T", "A", &sinks, &MuxRouter).expect("all sinks");
+        assert!(pips.iter().any(|p| p.dst_wire == "S1"));
+        assert!(pips.iter().any(|p| p.dst_wire == "S2"));
+        // The mux input must be driven once, not unioned from two branches.
+        assert_eq!(pips.iter().filter(|p| p.dst_wire == "M").count(), 1);
+
+        let unreachable = vec![
+            ("T".to_string(), "S1".to_string()),
+            ("T".to_string(), "NX".to_string()),
+        ];
+        assert!(bfs_route_all("T", "A", &unreachable, &MuxRouter).is_none());
+    }
+
+    #[test]
     fn clock_net_uses_spine() {
-        // Clock-spine classification is a device query; the router trusts it.
+        // The router no longer short-circuits clock nets; is_clock_net is
+        // still a device query (kept for callers that classify clocks).
         assert!(FakeRouter.is_clock_net("clk_bufg"));
         assert!(!FakeRouter.is_clock_net("n1"));
     }

@@ -34,12 +34,30 @@ pub struct TimingReport7 {
 }
 
 /// Parse `(x, y)` from a 7-series tile name like `"INT_L_X10Y100"`.
+///
+/// WARNING: these are the numbers *in the tile name*, which are NOT grid
+/// coordinates. `tilegrid.json` maps `CLBLM_R_X71Y45` to grid (176, 109) and
+/// `INT_R_X71Y45` to (175, 109), while `CLBLL_L_X40Y77` is grid (103, 75).
+/// The offsets differ per tile type and per axis, so a Manhattan distance
+/// computed from names is wrong -- it under-estimated a real FF->IOB hop by
+/// hundreds of ps on the data checked here, which would let a failing design
+/// report positive slack.
+///
+/// Prefer [`report_timing_with_device`], which takes true grid coordinates.
+/// This remains only as the fallback when no device model is supplied.
 fn tile_xy(tile: &str) -> Option<(i32, i32)> {
     let xi = tile.rfind("_X")? + 2;
     let yi = tile[xi..].find('Y').map(|i| xi + i)?;
     let x: i32 = tile[xi..yi].parse().ok()?;
     let y: i32 = tile[yi + 1..].parse().ok()?;
     Some((x, y))
+}
+
+/// Supplies real device grid coordinates, so the timing model measures true
+/// distances instead of parsing tile names.
+pub trait TimingDevice {
+    /// Grid coordinates of a tile, e.g. `"INT_R_X71Y45"` -> `(175, 109)`.
+    fn tile_xy(&self, tile: &str) -> Option<(i32, i32)>;
 }
 
 enum Driver<'a> {
@@ -121,8 +139,31 @@ pub fn report_timing(
     tm: &TimingModel,
     period_ps: u64,
 ) -> Result<TimingReport7, String> {
+    report_timing_with_device(routed, tm, period_ps, None)
+}
+
+/// Like [`report_timing`], but resolves tile positions through the device
+/// model's real grid coordinates.
+///
+/// Always prefer this when a [`Device`](crate::device::Device) is available:
+/// tile-name coordinates are not grid coordinates, so the no-device fallback
+/// mis-estimates wire delay (see [`tile_xy`]).
+pub fn report_timing_with_device(
+    routed: &Routed7,
+    tm: &TimingModel,
+    period_ps: u64,
+    device: Option<&dyn TimingDevice>,
+) -> Result<TimingReport7, String> {
     let placed: &Placed7 = &routed.placed;
     let packed: &Packed7 = &placed.packed;
+
+    // True grid coordinates when the device can answer, else name-derived.
+    let pos = |tile: &str| -> Option<(i32, i32)> {
+        match device {
+            Some(d) => d.tile_xy(tile).or_else(|| tile_xy(tile)),
+            None => tile_xy(tile),
+        }
+    };
 
     let mut drivers: HashMap<&str, Driver<'_>> = HashMap::new();
     for lut in &packed.luts {
@@ -142,17 +183,17 @@ pub fn report_timing(
 
     let mut sites: HashMap<&str, (i32, i32)> = HashMap::new();
     for lut in &placed.luts {
-        if let Some(xy) = tile_xy(&lut.tile) {
+        if let Some(xy) = pos(&lut.tile) {
             sites.insert(lut.name.as_str(), xy);
         }
     }
     for ff in &placed.ffs {
-        if let Some(xy) = tile_xy(&ff.tile) {
+        if let Some(xy) = pos(&ff.tile) {
             sites.insert(ff.name.as_str(), xy);
         }
     }
     for iob in &placed.iobs {
-        if let Some(xy) = tile_xy(&iob.tile) {
+        if let Some(xy) = pos(&iob.tile) {
             sites.insert(iob.name.as_str(), xy);
         }
     }
@@ -233,6 +274,34 @@ mod tests {
         assert_eq!(tile_xy("INT_L_X10Y100"), Some((10, 100)));
         assert_eq!(tile_xy("CLBLL_L_X12Y50"), Some((12, 50)));
         assert_eq!(tile_xy("nope"), None);
+    }
+
+    /// Name-derived coordinates are NOT grid coordinates. This documents the
+    /// trap the device-backed path exists to avoid: the same `_X71Y45` suffix
+    /// names tiles whose real grid row is ~109, so a Manhattan distance from
+    /// names badly mis-estimates wire delay.
+    #[test]
+    fn name_coords_differ_from_grid_coords() {
+        let db = crate::device::default_db_root();
+        if !db.join("zynq7/xc7z020/tilegrid.json").is_file() {
+            return;
+        }
+        let dev = crate::device::Device::load_xc7z020(&db).expect("load xc7z020");
+        let grid = |t: &str| {
+            let idx = dev.tile_by_name(t).expect("tile");
+            let tile = dev.tile(idx).unwrap();
+            (tile.grid_x, tile.grid_y)
+        };
+        let clb = grid("CLBLM_R_X71Y45");
+        let int = grid("INT_R_X71Y45");
+        // Both names claim row 45...
+        assert_eq!(tile_xy("CLBLM_R_X71Y45").unwrap().1, 45);
+        assert_eq!(tile_xy("INT_R_X71Y45").unwrap().1, 45);
+        // ...but the real grid row is far away.
+        assert_ne!(clb.1, 45, "grid row must not equal the name row: {clb:?}");
+        assert!(clb.1 > 100, "expected a large grid row, got {clb:?}");
+        assert_eq!(clb.1, int.1, "adjacent tiles share a grid row");
+        assert_eq!((clb.0 - int.0).abs(), 1, "adjacent columns");
     }
 
     #[test]

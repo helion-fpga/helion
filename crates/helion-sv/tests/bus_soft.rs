@@ -65,7 +65,13 @@ endmodule
 
 #[test]
 fn bus_n3_soft_diag() {
-    let src = fs::read_to_string("/tmp/bus_n3.sv").expect("src");
+    // Fixture lives outside the repo (a scratch Ibex bus file), so skip
+    // gracefully when it is absent -- a hard panic here fails `cargo test`
+    // on every clean checkout for reasons unrelated to the code.
+    let Ok(src) = fs::read_to_string("/tmp/bus_n3.sv") else {
+        eprintln!("SKIP: /tmp/bus_n3.sv fixture not present");
+        return;
+    };
     let d = synth_sv(&src, "bus_n3.sv").expect("bus");
     eprintln!("BUS name={} cells={}", d.name, d.cells.len());
     for k in ["WIDE_CONE", "ASSIGN_NOT_LOWERED"] {

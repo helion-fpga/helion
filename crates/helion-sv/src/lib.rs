@@ -8539,6 +8539,13 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
     let mut ports = Vec::new();
     let mut signals = Vec::new();
     if p.eat_sym('(') {
+        // Attributes of the declaration currently in effect, so that
+        // comma-continued names inherit them:
+        //   input [3:0] a, b, c   =>  a, b AND c are all [3:0] inputs.
+        // `parse_port_dir` returns None when no direction keyword is present,
+        // which is exactly the continuation case.
+        let mut prev: Option<(PortDir, usize, Option<String>)> = None;
+        let mut own_dir = false;
         loop {
             if p.eat_sym(')') {
                 break;
@@ -8546,7 +8553,13 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
             if p.peek().is_none() {
                 break;
             }
-            let dir = parse_port_dir(&mut p).unwrap_or(PortDir::In);
+            let parsed = parse_port_dir(&mut p);
+            let continuation = parsed.is_none() && prev.is_some();
+            own_dir = parsed.is_some();
+            let dir = match parsed {
+                Some(d) => d,
+                None => prev.as_ref().map(|(d, _, _)| *d).unwrap_or(PortDir::In),
+            };
             let mut is_signed = skip_logic(&mut p);
             // package::typedef or typedef name before the port ident
             while matches!(p.peek(), Some(Tok::Ident(_)))
@@ -8596,6 +8609,18 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
                 }
             }
             let (w, packed_depth) = match packed_dims.as_slice() {
+                // No explicit range on a CONTINUATION name: inherit the
+                // previous declaration's width and typedef. `input [3:0] a, b`
+                // must make `b` 4 bits wide, not 1.
+                [] if continuation => prev
+                    .as_ref()
+                    .map(|(_, pw, _)| (*pw, 0usize))
+                    .unwrap_or_else(|| {
+                        (
+                            type_name.as_deref().and_then(typed_width).unwrap_or(1),
+                            0usize,
+                        )
+                    }),
                 [] => (
                     type_name.as_deref().and_then(typed_width).unwrap_or(1),
                     0usize,
@@ -8611,6 +8636,16 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
                     (elem, outer)
                 }
             };
+            // A continuation with no explicit typedef inherits the previous
+            // one (used by `typed_width` above and by `note_sig_type`).
+            if continuation && type_name.is_none() {
+                if let Some((_, _, ref pt)) = prev {
+                    type_name = pt.clone();
+                }
+            }
+            if own_dir {
+                prev = Some((dir, w, type_name.clone()));
+            }
             match p.ident() {
                 Ok(n) => {
                     ports.push((n, dir, w));
