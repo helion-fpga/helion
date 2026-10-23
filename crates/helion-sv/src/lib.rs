@@ -6658,18 +6658,90 @@ fn fold_blocking_assigns<'a>(stmts: Vec<Nba<'a>>, arena: &'a Bump, module: &str)
     }
     let mut env: HashMap<(&'a str, Option<usize>), RExpr<'a>> = HashMap::new();
     let mut order: Vec<(&'a str, Option<usize>)> = Vec::new();
+    let mut latched: Vec<(&'a str, Option<usize>)> = Vec::new();
     for (lhs, bit, rhs) in stmts {
         let key = (lhs, bit);
+        // A self-reference survives substitution only when nothing in this
+        // block assigned the signal before the branch that reads it — i.e. the
+        // branch keeps the previous value. That is a LATCH:
+        // `always_comb if (c) q = d;` leaves `q = c ? d : q`, and there is no
+        // latch cell in the IR, so mapping it folded the feedback to 0 and
+        // silently produced `q = c & d`. A block with an unconditional base
+        // assign first (the Ibex priority-chain idiom, and packed-struct field
+        // selects) substitutes the tip away and is not a latch.
+        // Any earlier assignment to this signal (whole-word or any bit)
+        // supplies the tip, so the branch is a priority select, not a hold.
+        let had_base = env.keys().any(|(l, _)| *l == lhs);
+        if !had_base && rexpr_mentions_signal(&rhs, lhs) {
+            latched.push(key);
+        }
         let rhs = subst(&rhs, &env, lhs, bit, arena);
         if !env.contains_key(&key) {
             order.push(key);
         }
         env.insert(key, rhs);
     }
+    if !latched.is_empty() {
+        for (sig, _) in &latched {
+            note_assign_not_lowered(module, sig);
+        }
+        return Vec::new();
+    }
     order
         .into_iter()
         .filter_map(|k| env.remove(&k).map(|rhs| (k.0, k.1, rhs)))
         .collect()
+}
+
+/// True when `e` reads `signal` (any bit) anywhere in its tree.
+fn rexpr_mentions_signal(e: &RExpr<'_>, signal: &str) -> bool {
+    let mut stack: Vec<&RExpr<'_>> = vec![e];
+    while let Some(n) = stack.pop() {
+        match n {
+            RExpr::Ident(s) if *s == signal => return true,
+            RExpr::Bit(s, _) | RExpr::Range(s, _, _) if *s == signal => return true,
+            RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) | RExpr::Const { .. } => {}
+            RExpr::WordAt { data, .. } | RExpr::RedXor(data) | RExpr::RedAnd(data)
+            | RExpr::RedOr(data) | RExpr::Not(data) => stack.push(data),
+            RExpr::IndexPart { name, base, .. } => {
+                if *name == signal {
+                    return true;
+                }
+                stack.push(base);
+            }
+            RExpr::Concat(parts) => {
+                for p in parts {
+                    stack.push(p);
+                }
+            }
+            RExpr::Call { args, .. } => {
+                for a in args {
+                    stack.push(a);
+                }
+            }
+            RExpr::Mux(a, b, c) => {
+                stack.push(c);
+                stack.push(b);
+                stack.push(a);
+            }
+            RExpr::And(a, b)
+            | RExpr::Or(a, b)
+            | RExpr::Xor(a, b)
+            | RExpr::Add(a, b)
+            | RExpr::Sub(a, b)
+            | RExpr::Mul(a, b)
+            | RExpr::Shr(a, b)
+            | RExpr::Ashr(a, b)
+            | RExpr::Shl(a, b)
+            | RExpr::Eq(a, b)
+            | RExpr::Ne(a, b)
+            | RExpr::Lt(a, b) => {
+                stack.push(b);
+                stack.push(a);
+            }
+        }
+    }
+    false
 }
 
 fn normalize_nbas<'a>(p: &P<'a>, stmts: Vec<Nba<'a>>) -> Vec<Nba<'a>> {
@@ -11162,6 +11234,49 @@ fn lut6_from_bool_cone(expr: &Expr) -> Option<(u64, Vec<String>)> {
 /// Iterative post-order rebuild; the old recursion overflowed the stack on
 /// deep `Expr` trees. Children are rebuilt before parents; results are
 /// memoized by node identity.
+/// True when `e` reads the net it is about to drive.
+///
+/// A combinational assign whose cone feeds back into its own output is a
+/// LATCH: `always_comb if (c) q = d;` lowers to `q = c ? d : q`. The mapper
+/// used to call `strip_self_hold`, which rewrites that `q` to constant 0 and
+/// silently produced `q = c & d` — the held value was lost for every input
+/// with `c` low. `helion-ir` has no latch cell, so a self-referential cone
+/// must be refused loudly instead of const-folded.
+fn expr_reads_self(e: &Expr<'_>, self_bit: &str) -> bool {
+    fn is_self_family(n: &str, self_bit: &str) -> bool {
+        if n == self_bit {
+            return true;
+        }
+        let Some((base, idx)) = self_bit.rsplit_once('_') else {
+            return false;
+        };
+        if !idx.chars().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
+        n.starts_with(base)
+            && n.len() > base.len() + 1
+            && n.as_bytes()[base.len()] == b'_'
+            && n[base.len() + 1..].chars().all(|c| c.is_ascii_digit())
+    }
+    let mut stack: Vec<&Expr<'_>> = vec![e];
+    while let Some(n) = stack.pop() {
+        match n {
+            Expr::Var(nn) => {
+                if is_self_family(nn, self_bit) {
+                    return true;
+                }
+            }
+            Expr::Const(_) => {}
+            Expr::Not(x) => stack.push(x),
+            Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+                stack.push(b);
+                stack.push(a);
+            }
+        }
+    }
+    false
+}
+
 fn strip_self_hold<'a>(e: &Expr<'a>, self_bit: &str, arena: &'a Bump) -> Expr<'a> {
     fn is_self_family(n: &str, self_bit: &str) -> bool {
         if n == self_bit {
@@ -17612,6 +17727,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             }
             break;
         }
+        // A cone that reads its own output is a latch, which this toolchain
+        // cannot build. Refuse it instead of silently folding the feedback to
+        // 0 (that turned `q = c ? d : q` into `q = c & d`).
         let expr_rom = strip_self_hold(expr, bitn, &arena);
         // Cheap ≤6-PI LUT6 before expr_node_count (full tree walk). sha256_k
         // and alu bit cones hit this without the 2k-node scan.
