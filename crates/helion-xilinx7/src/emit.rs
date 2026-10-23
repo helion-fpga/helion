@@ -101,7 +101,19 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         ));
     }
 
-    // FFs: ZINI + D-mux select.
+    // FFs: ZINI + D-mux select + control signals (CE, SR).
+    //
+    // Control signal configuration (per X-Ray DB segbits_clbll_l.db):
+    // - {bel}.ZRST: SR pin acts as RESET (vs SET). Emitted when the FF has
+    //   an SR net. The Z prefix means the config bit is 0 when present.
+    // - {slice}.CEUSEDMUX: slice-level, enables the CE input mux. Needed
+    //   when any FF in the slice has a CE net.
+    // - {slice}.SRUSEDMUX: slice-level, enables the SR input mux. Needed
+    //   when any FF in the slice has an SR net.
+    // Without CEUSEDMUX/SRUSEDMUX, the FF silently ignores CE/SR pins.
+    use std::collections::HashSet;
+    let mut ce_slices: HashSet<(String, String)> = HashSet::new();
+    let mut sr_slices: HashSet<(String, String)> = HashSet::new();
     for ff in &placed.ffs {
         let site_rel = device
             .site_rel(&ff.tile, &ff.site)
@@ -112,6 +124,25 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         let mux_src = mux_for_ff(ff, packed, placed);
         lines.push(format!("{}.{}.{}.ZINI", ff.tile, site_rel, bel));
         lines.push(format!("{}.{}.{}MUX.{}", ff.tile, site_rel, bel, mux_src));
+        // Control signals: look up the packed FF for CE/SR nets.
+        if let Some(p) = packed.ffs.iter().find(|p| p.name == ff.name) {
+            if p.ce_net.is_some() {
+                ce_slices.insert((ff.tile.clone(), site_rel.clone()));
+            }
+            if p.sr_net.is_some() {
+                sr_slices.insert((ff.tile.clone(), site_rel.clone()));
+                // Configure SR as RESET (the common case; Helion IR does not
+                // distinguish set vs reset, and reset is the standard use).
+                lines.push(format!("{}.{}.{}.ZRST", ff.tile, site_rel, bel));
+            }
+        }
+    }
+    // Emit slice-level CE/SR mux enables (deduplicated).
+    for (tile, slice) in &ce_slices {
+        lines.push(format!("{}.{}.CEUSEDMUX", tile, slice));
+    }
+    for (tile, slice) in &sr_slices {
+        lines.push(format!("{}.{}.SRUSEDMUX", tile, slice));
     }
 
     // IOBs.
@@ -376,6 +407,45 @@ mod tests {
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZINI"), "got:\n{text}");
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFFMUX.AX"), "got:\n{text}");
         assert!(text.contains("RIOB33_X0Y0.IOB_Y1.LVCMOS33.DRIVE.I16"), "got:\n{text}");
+    }
+
+    #[test]
+    fn emit_ff_control_signals() {
+        // FF with CE and SR nets must emit CEUSEDMUX, SRUSEDMUX, and ZRST.
+        // Without these, the FF silently ignores its CE/SR pins.
+        let mut routed = routed_blinky();
+        routed.placed.packed.ffs[0].ce_net = Some("ce".into());
+        routed.placed.packed.ffs[0].sr_net = Some("rst".into());
+        let bs = emit_fasm(&routed, &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        assert!(
+            text.contains("CLBLL_L_X0Y0.SLICEL_X0.CEUSEDMUX"),
+            "missing CEUSEDMUX, got:\n{text}"
+        );
+        assert!(
+            text.contains("CLBLL_L_X0Y0.SLICEL_X0.SRUSEDMUX"),
+            "missing SRUSEDMUX, got:\n{text}"
+        );
+        assert!(
+            text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZRST"),
+            "missing ZRST, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn emit_ff_no_control_signals() {
+        // FF without CE/SR must NOT emit the mux enables (keeps bitstream minimal).
+        let bs = emit_fasm(&routed_blinky(), &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        assert!(
+            !text.contains("CEUSEDMUX"),
+            "unexpected CEUSEDMUX, got:\n{text}"
+        );
+        assert!(
+            !text.contains("SRUSEDMUX"),
+            "unexpected SRUSEDMUX, got:\n{text}"
+        );
+        assert!(!text.contains(".ZRST"), "unexpected ZRST, got:\n{text}");
     }
 
     #[test]
