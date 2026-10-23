@@ -20,6 +20,17 @@ pub trait EmitDevice {
     /// `("CLBLL_L_X14Y100", "SLICE_X28Y100")` → `"SLICEL_X0"`.
     /// Returns the site-type-qualified relative name.
     fn site_rel(&self, tile: &str, site: &str) -> Option<String>;
+    /// Paired IOI tile for an IOB tile (same grid row, adjacent column),
+    /// e.g. `RIOB33_X73Y45` → `RIOI3_X73Y45`. Needed to configure the
+    /// OLOGIC that sits between the fabric and the OBUF.
+    fn ioi_tile_for(&self, iob_tile: &str) -> Option<String>;
+    /// Does `tile_type` (derived from `ioi_tile`) actually carry segbits for
+    /// `site.feature`? Upstream X-Ray ships `*_SING`/`*_TBYTESRC`/
+    /// `*_TBYTETERM` IOI tiles with ppips only, so a configurable feature
+    /// emitted on them is unassemblable. Returning `false` must make the
+    /// emitter fail loudly instead of writing a FASM line that no
+    /// `segbits_*.db` can resolve.
+    fn ologic_feature_available(&self, ioi_tile: &str, site: &str, feature: &str) -> bool;
 }
 
 /// IBUF `.IN` feature prefix for an IOSTANDARD, from
@@ -188,6 +199,50 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                     site_rel,
                     slew.to_ascii_uppercase()
                 ));
+                // Connect the fabric to the OBUF through the paired OLOGIC.
+                //
+                // X-Ray models the path as:
+                //   fabric -> IOI_IMUX34_n -> IOI_OLOGIC0_D1 -> IOI_OLOGIC0_OQ
+                //          -> RIOI_O0 -> IOB_O_OUT0 -> IOB_O0 -> pad
+                // The IMUX34 -> D1 and D1 -> OQ hops are `always` pseudo-pips
+                // in ppips_rioi3.db: hard, free connections with no config
+                // bits. Emitting them as FASM is a no-op, so they are NOT
+                // emitted here (the router traverses them for connectivity).
+                //
+                // The one genuinely configurable item is the OLOGIC output mux
+                // select, `OLOGIC_Y0.OMUX.D1` (segbits_rioi3.db). `OQUSED`
+                // marks the OQ output as driven. Both are required; without
+                // OMUX.D1 the pad keeps its init value and reads as dark even
+                // though DRIVE/SLEW configured the buffer.
+                if let Some(ioi) = device.ioi_tile_for(&iob.tile) {
+                    let ologic = site_rel.replacen("IOB_", "OLOGIC_", 1);
+                    // The paired IOI tile may be a variant (RIOI3_SING,
+                    // RIOI3_TBYTESRC, RIOI3_TBYTETERM) that upstream X-Ray
+                    // ships with ppips only and no segbits at all. Emitting a
+                    // configurable feature there cannot be assembled, so it
+                    // must be a loud error rather than a silently dropped
+                    // line. If the device can tell us the OLOGIC features are
+                    // unavailable, report it; otherwise emit and let the
+                    // assembly gate in `frames` catch it.
+                    for feat in ["OMUX.D1", "OQUSED"] {
+                        if !device.ologic_feature_available(&ioi, &ologic, feat) {
+                            return Err(format!(
+                                "emit: IOB {} ({}.{}) needs OLOGIC feature `{}.{}.{}`, but tile \
+                                 type of {ioi} has no segbits for it in the X-Ray DB (upstream \
+                                 gap for *_SING/*_TBYTESRC/*_TBYTETERM IOI tiles). Move this \
+                                 output to a non-SING pin.",
+                                iob.name, iob.tile, site_rel, ioi, ologic, feat
+                            ));
+                        }
+                        lines.push(format!("{}.{}.{}", ioi, ologic, feat));
+                    }
+                } else {
+                    return Err(format!(
+                        "emit: output IOB {} ({}) has no paired IOI tile; cannot connect the \
+                         fabric to the OBUF",
+                        iob.name, iob.tile
+                    ));
+                }
             }
         }
         let _ = p;
@@ -250,34 +305,73 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         ));
     }
 
-    // RAMB18E1s. Feature path: TILE.RAMB18.<site>.IN_USE. INIT data
-    // programming from the IR's Bram18 words is not yet emitted; the
-    // block_ram.db bit mapping is future work.
-    for bram in &placed.brams {
-        let site_rel = device
-            .site_rel(&bram.tile, &bram.site)
-            .ok_or_else(|| format!("emit: no rel site for {} {}", bram.tile, bram.site))?;
-        lines.push(format!("{}.RAMB18.{}.IN_USE", bram.tile, site_rel));
+    // RAMB18E1s.
+    //
+    // Only IN_USE can be emitted today: the port/clock/width configuration and
+    // the INIT data live in `block_ram.db`, which this backend does not read.
+    // A RAMB18 that is merely marked IN_USE holds no data and has no configured
+    // ports, so the design would silently read X. Refuse instead of shipping a
+    // bitstream that programs (done=1) and misbehaves.
+    if !placed.brams.is_empty() {
+        return Err(format!(
+            "emit: design uses {} RAMB18E1 block(s) ({}), but the 7-series backend cannot \
+             configure BRAM ports or INIT data yet (needs block_ram.db; see findings/\
+             investigator_report.md C8). Refusing to emit a non-functional bitstream.",
+            placed.brams.len(),
+            placed
+                .brams
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
 
-    // DSP48E1s: placed on sites but configuration FASM not yet emitted.
-    // Full DSP configuration (USE_MULT, OPMODE, ALUMODE, INMODE, pipeline
-    // registers) requires the detailed attribute bit mapping; future work.
-    let _ = &placed.dsps;
+    // DSP48E1s.
+    //
+    // Placed on sites but no configuration is emitted (USE_MULT, OPMODE,
+    // ALUMODE, INMODE, pipeline regs all need the detailed attribute bit map).
+    // Silently discarding them would yield a bitstream whose arithmetic reads
+    // X. Fail loudly instead.
+    if !placed.dsps.is_empty() {
+        return Err(format!(
+            "emit: design uses {} DSP48E1 block(s) ({}), but the 7-series backend cannot \
+             configure DSP48E1 yet (see findings/investigator_report.md C4). Refusing to \
+             emit a non-functional bitstream.",
+            placed.dsps.len(),
+            placed
+                .dsps
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
 
-    // CARRY4s. Feature path: TILE.SLICEL_<X>.CARRY4.<bit>. The carry chain
-    // muxing uses ACY0/BCY0/CCY0/DCY0 for the 4 bits. CYINIT via PRECYINIT.
-    // NOTE: Full carry chain configuration is incomplete; this is a known
-    // limitation being addressed. For now, emit the mux bits that are in the DB.
-    for carry in &placed.carries {
-        let site_rel = device
-            .site_rel(&carry.tile, &carry.site)
-            .ok_or_else(|| format!("emit: no rel site for {} {}", carry.tile, carry.site))?;
-        // Emit the carry mux bits that exist in the X-Ray DB.
-        // ACY0/BCY0/CCY0/DCY0 select the carry propagate for each bit.
-        for bit in ["ACY0", "BCY0", "CCY0", "DCY0"] {
-            lines.push(format!("{}.{}.CARRY4.{}", carry.tile, site_rel, bit));
-        }
+    // CARRY4s.
+    //
+    // A CARRY4 needs more than the ACY0/BCY0/CCY0/DCY0 propagate muxes: its
+    // CYINIT source must be selected by PRECYINIT.{AX,C0,C1,CIN}, and the
+    // per-bit DI/S inputs come from the slice. None of that is captured today
+    // -- `PackedCarry` has only a name (pack.rs), so there is no CYINIT source
+    // and no DI/S data to emit. Emitting the mux bits alone would configure a
+    // carry chain with an undefined init: arithmetic would silently produce
+    // wrong results. Fail loudly rather than guess.
+    if !placed.carries.is_empty() {
+        return Err(format!(
+            "emit: design uses {} CARRY4 chain element(s) ({}), but the 7-series backend does \
+             not capture carry configuration: PRECYINIT (CYINIT source) and the DI/S inputs \
+             are not recorded by pack.rs, so only the propagate muxes could be emitted. \
+             Refusing to emit arithmetic that would silently miscompute. See findings/\
+             investigator_report.md C2.",
+            placed.carries.len(),
+            placed
+                .carries
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
 
     // Routing pips: TILE.DST.SRC. Pseudo-pips are always-on hard
@@ -471,6 +565,12 @@ mod tests {
                 Some("BUFGCTRL_X0Y0".into())
             }
         }
+        fn ioi_tile_for(&self, _iob_tile: &str) -> Option<String> {
+            Some("RIOI3_X0Y0".into())
+        }
+        fn ologic_feature_available(&self, _ioi: &str, _site: &str, _feature: &str) -> bool {
+            true
+        }
     }
 
     fn routed_blinky() -> Routed7 {
@@ -618,7 +718,10 @@ mod tests {
     }
 
     #[test]
-    fn emit_bram_fasm() {
+    fn emit_rejects_unconfigurable_bram_loudly() {
+        // A RAMB18 that is merely marked IN_USE has no configured ports and no
+        // INIT data, so it would silently read X. The emitter must refuse
+        // rather than ship a bitstream that programs (done=1) and misbehaves.
         use crate::pack::PackedBram;
         use crate::place::PlacedBram;
         let packed = Packed7 {
@@ -641,8 +744,68 @@ mod tests {
             carries: vec![],
         };
         let routed = Routed7 { placed, nets: vec![] };
-        let bs = emit_fasm(&routed, &FakeEmit).unwrap();
-        let text = bs.fasm.join("\n");
-        assert!(text.contains("BRAM_L_X0Y0.RAMB18.RAMB18_X0Y0.IN_USE"), "got:\n{text}");
+        let err = emit_fasm(&routed, &FakeEmit).expect_err("BRAM must be refused");
+        assert!(err.contains("u_bram"), "error must name the cell: {err}");
+        assert!(err.contains("RAMB18E1"), "error must name the primitive: {err}");
+    }
+
+    #[test]
+    fn emit_rejects_unconfigurable_dsp_loudly() {
+        use crate::pack::PackedDsp;
+        use crate::place::PlacedDsp;
+        let packed = Packed7 {
+            luts: vec![],
+            ffs: vec![],
+            iobs: vec![],
+            bufgs: vec![],
+            brams: vec![],
+            dsps: vec![PackedDsp { name: "u_dsp".into() }],
+            carries: vec![],
+        };
+        let placed = Placed7 {
+            packed: packed.clone(),
+            luts: vec![],
+            ffs: vec![],
+            iobs: vec![],
+            bufgs: vec![],
+            brams: vec![],
+            dsps: vec![PlacedDsp { name: "u_dsp".into(), tile: "DSP_L_X0Y0".into(), site: "DSP48_X0Y0".into() }],
+            carries: vec![],
+        };
+        let routed = Routed7 { placed, nets: vec![] };
+        let err = emit_fasm(&routed, &FakeEmit).expect_err("DSP must be refused");
+        assert!(err.contains("u_dsp"), "error must name the cell: {err}");
+        assert!(err.contains("DSP48E1"), "error must name the primitive: {err}");
+    }
+
+    #[test]
+    fn emit_rejects_unconfigurable_carry_loudly() {
+        // A CARRY4 without PRECYINIT has an undefined init; emitting only the
+        // propagate muxes would silently miscompute arithmetic.
+        use crate::pack::PackedCarry;
+        use crate::place::PlacedCarry;
+        let packed = Packed7 {
+            luts: vec![],
+            ffs: vec![],
+            iobs: vec![],
+            bufgs: vec![],
+            brams: vec![],
+            dsps: vec![],
+            carries: vec![PackedCarry { name: "u_carry".into() }],
+        };
+        let placed = Placed7 {
+            packed: packed.clone(),
+            luts: vec![],
+            ffs: vec![],
+            iobs: vec![],
+            bufgs: vec![],
+            brams: vec![],
+            dsps: vec![],
+            carries: vec![PlacedCarry { name: "u_carry".into(), tile: "CLBLL_L_X0Y0".into(), site: "SLICE_X0Y0".into() }],
+        };
+        let routed = Routed7 { placed, nets: vec![] };
+        let err = emit_fasm(&routed, &FakeEmit).expect_err("CARRY4 must be refused");
+        assert!(err.contains("u_carry"), "error must name the cell: {err}");
+        assert!(err.contains("PRECYINIT"), "error must explain why: {err}");
     }
 }

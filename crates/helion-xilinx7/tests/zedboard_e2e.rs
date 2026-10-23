@@ -312,11 +312,11 @@ fn zedboard_e2e_bitstream() {
     // lines for SING tiles; those 2 IOBs (led[6] on U19, led[7] on U14)
     // get default IOB configuration. Documented limitation for HW validation.
     let (lines, skipped): (Vec<_>, Vec<_>) = lines.into_iter().partition(|l| {
-        layout.tile_type(&l.tile).map(|t| t != "RIOB33_SING").unwrap_or(true)
+        layout.tile_type(&l.tile).map(|t| !t.contains("_SING")).unwrap_or(true)
     });
     if !skipped.is_empty() {
         println!(
-            "WARNING: skipped {} FASM lines for RIOB33_SING tiles (no segbits in DB)",
+            "WARNING: skipped {} FASM lines for *_SING tiles (no segbits in DB)",
             skipped.len()
         );
     }

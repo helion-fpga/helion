@@ -14,12 +14,15 @@ use std::collections::{HashMap, HashSet};
 pub trait DeviceQuery {
     /// `(tile, site)` for a package pin, e.g. `"E3"`.
     fn iob_site_for_pin(&self, pin: &str) -> Option<(String, String)>;
-    /// A BUFGCTRL site: `(tile, site)`.
-    fn bufg_site(&self) -> Option<(String, String)>;
-    /// A RAMB18E1 site: `(tile, site)`.
-    fn ramb_site(&self) -> Option<(String, String)>;
-    /// A DSP48E1 site: `(tile, site)`.
-    fn dsp_site(&self) -> Option<(String, String)>;
+    /// A BUFGCTRL site not in `used`: `(tile, site)`.
+    ///
+    /// Must respect `used`: a design with two clocks would otherwise place
+    /// both BUFGs on the same site, silently shorting them together.
+    fn bufg_site(&self, used: &HashSet<String>) -> Option<(String, String)>;
+    /// A RAMB18E1 site not in `used`: `(tile, site)`.
+    fn ramb_site(&self, used: &HashSet<String>) -> Option<(String, String)>;
+    /// A DSP48E1 site not in `used`: `(tile, site)`.
+    fn dsp_site(&self, used: &HashSet<String>) -> Option<(String, String)>;
     /// Grid coordinates of a tile (for distance estimates).
     fn tile_xy(&self, tile: &str) -> Option<(i32, i32)>;
     /// A free SLICEL site near `(x, y)`; `used` holds taken site names.
@@ -140,7 +143,7 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
     // 2. BUFGCTRLs.
     for bufg in &packed.bufgs {
         let (tile, site) = device
-            .bufg_site()
+            .bufg_site(&used_sites)
             .ok_or_else(|| format!("place: no BUFGCTRL site for {}", bufg.name))?;
         used_sites.insert(site.clone());
         out.bufgs.push(PlacedBufg {
@@ -153,7 +156,7 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
     // 2b. RAMB18E1s.
     for bram in &packed.brams {
         let (tile, site) = device
-            .ramb_site()
+            .ramb_site(&used_sites)
             .ok_or_else(|| format!("place: no RAMB18E1 site for {}", bram.name))?;
         used_sites.insert(site.clone());
         out.brams.push(PlacedBram {
@@ -166,7 +169,7 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
     // 2c. DSP48E1s.
     for dsp in &packed.dsps {
         let (tile, site) = device
-            .dsp_site()
+            .dsp_site(&used_sites)
             .ok_or_else(|| format!("place: no DSP48E1 site for {}", dsp.name))?;
         used_sites.insert(site.clone());
         out.dsps.push(PlacedDsp {
@@ -285,13 +288,13 @@ mod tests {
                 _ => None,
             }
         }
-        fn bufg_site(&self) -> Option<(String, String)> {
+        fn bufg_site(&self, _used: &HashSet<String>) -> Option<(String, String)> {
             Some(("CLK_BUFG_X0Y0".into(), "BUFGCTRL_X0Y0".into()))
         }
-        fn ramb_site(&self) -> Option<(String, String)> {
+        fn ramb_site(&self, _used: &HashSet<String>) -> Option<(String, String)> {
             Some(("BRAM_X0Y0".into(), "RAMB18_X0Y0".into()))
         }
-        fn dsp_site(&self) -> Option<(String, String)> {
+        fn dsp_site(&self, _used: &HashSet<String>) -> Option<(String, String)> {
             Some(("DSP_X0Y0".into(), "DSP48_X0Y0".into()))
         }
         fn tile_xy(&self, _tile: &str) -> Option<(i32, i32)> {
