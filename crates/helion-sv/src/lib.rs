@@ -9802,7 +9802,33 @@ fn parse_module_items<'a>(
             }
             continue;
         }
-        if p.eat_kw("always_ff") || p.eat_kw("always") || p.eat_kw("always_latch") {
+        if p.eat_kw("always_latch") {
+            // `always_latch` has no event control and no clock. It used to fall
+            // into the flop branch below, where a missing edge term meant a
+            // default clock name was invented: the design got an Hff with
+            // CLK driven by a net `clk` that exists nowhere in the module, and
+            // the latch enable was dropped. Parse the body as combinational so
+            // the latch is detected and refused instead of guessed at.
+            let block = p.eat_kw("begin");
+            if p.eat_sym(':') {
+                let _ = p.ident();
+            }
+            match parse_seq_block(&mut p, block) {
+                Ok((stmts, simms)) => {
+                    sva_imm.extend(simms);
+                    assigns.extend(fold_blocking_assigns(stmts, p.arena, &cur_mod()));
+                }
+                Err(_) => {
+                    note_skip(format!(
+                        "diagnostic skip_always module={} (always_latch body not parsed; not a LUT)",
+                        cur_mod()
+                    ));
+                    let _ = skip_item_or_block(p);
+                }
+            }
+            continue;
+        }
+        if p.eat_kw("always_ff") || p.eat_kw("always") {
             let (combo, edge_clk, negedge_only, async_rst, rst_low) = skip_event_control_async(p);
             if sim_only_for(&cur_mod()) {
                 let _ = (combo, edge_clk, negedge_only, async_rst, rst_low);
