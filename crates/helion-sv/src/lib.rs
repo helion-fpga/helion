@@ -11429,10 +11429,12 @@ fn lt_relevant_sig_bits(bus: &RelBus, c: u128) -> Option<Vec<usize>> {
     let local: Vec<usize> = if c == 0 || c > full {
         Vec::new()
     } else {
+        // Bits below the bound's lowest set bit cannot change the outcome, so
+        // only [k, w) matters. More than LUT6 of them is not a one-LUT test;
+        // `push_rel_pi` enforces that cap, so do not refuse on span alone —
+        // refusing here made a wide `bus < const` fall through to a path that
+        // dropped the compare entirely (the output pin stuck at constant 0).
         let k = c.trailing_zeros() as usize;
-        if w - k > SMALL_REL_BITS {
-            return None;
-        }
         (k..w).collect()
     };
     let pw = bus.lo.saturating_add(w);
@@ -15271,6 +15273,125 @@ fn rel_bus_bit(rtl: &Rtl, bus: &RelBus, i: usize) -> Option<String> {
     op_bit_net(rtl, &bus.name, bus.lo + i)
 }
 
+/// `bus < c` (or `bus > c`, via `ge`) too wide for one LUT6: an MSB-first
+/// ripple on the bits that can change the answer.
+///
+/// `const_range_lut` handles the narrow case as a single LUT6. When the
+/// differing span is wider than LUT6 the old code refused the compare, the
+/// refusal was swallowed, and the output pin was left stuck at constant 0 —
+/// `assign y = a < 32'h100;` with a 32-bit `a` reported `assign_not_lowered`
+/// and read 0 even for `a = 0`. Emit real logic instead.
+///
+/// MSB-first, keeping two running signals:
+///   lt = some higher bit has a=0,b=1 and all bits above it were equal
+///   eq = every bit processed so far was equal
+/// At each bit: lt |= eq & ~a & b, then eq &= (a == b).
+fn emit_ripple_ult_const(
+    d: &mut Design,
+    rtl: &Rtl,
+    out: &str,
+    bus: &RelBus,
+    c: u128,
+    ge: bool,
+) -> bool {
+    let w = bus.width;
+    if w == 0 || w > RIPPLE_CMP_MAX || bus.lo.saturating_add(w) > 128 {
+        return false;
+    }
+    if (0..w).any(|i| rel_bus_bit(rtl, bus, i).is_none()) {
+        return false;
+    }
+    let full = if w >= 128 { u128::MAX } else { (1u128 << w) - 1 };
+    let c = c & full;
+    // `bus > c` === `bus >= c + 1` === `!(bus < c + 1)`.
+    let (bound, invert) = if ge {
+        if c >= full {
+            // `bus > all-ones` is constantly false.
+            emit_lut_pins(d, &format!("u_ucmpk_{out}_zero"), out, lut6_const(false), &[]);
+            return true;
+        }
+        (c + 1, true)
+    } else {
+        (c, false)
+    };
+
+    let mut lt: Option<String> = None;
+    let mut eq: Option<String> = None;
+    for i in (0..w).rev() {
+        let an = rel_bus_bit(rtl, bus, i).expect("checked above");
+        let b1 = (bound >> i) & 1 == 1;
+        let last = i == 0;
+        // Possible direct driver of `out`: only when nothing follows.
+        let lt_net = if last && !invert {
+            out.to_string()
+        } else {
+            format!("n_ucmpk_{out}_{i}l")
+        };
+        let eq_net = format!("n_ucmpk_{out}_{i}e");
+        let lt_cell = format!("u_ucmpk_{out}_{i}l");
+        let eq_cell = format!("u_ucmpk_{out}_{i}e");
+        match (eq.as_deref(), lt.as_deref()) {
+            // MSB: lt = ~a & b ; eq = (a == b).
+            (None, None) => {
+                if b1 {
+                    emit_lut_pins(d, &lt_cell, &lt_net, lut6_and2(true, false, false), &[(&an, "I0")]);
+                    emit_lut_pins(d, &eq_cell, &eq_net, lut6_buf(), &[(&an, "I0")]);
+                } else {
+                    emit_lut_pins(d, &lt_cell, &lt_net, lut6_const(false), &[]);
+                    emit_lut_pins(d, &eq_cell, &eq_net, lut6_inv(), &[(&an, "I0")]);
+                }
+                if !last {
+                    eq = Some(eq_net);
+                }
+            }
+            // lt |= eq & ~a & b ; eq &= (a == b).
+            (Some(en), Some(ln)) => {
+                if b1 {
+                    // eq & ~a
+                    let term = format!("n_ucmpk_{out}_{i}t");
+                    emit_lut_pins(
+                        d,
+                        &format!("u_ucmpk_{out}_{i}t"),
+                        &term,
+                        lut6_and2(false, true, false),
+                        &[(&en, "I0"), (&an, "I1")],
+                    );
+                    emit_lut_pins(d, &lt_cell, &lt_net, lut6_or2(), &[(&ln, "I0"), (&term, "I1")]);
+                    if !last {
+                        emit_lut_pins(d, &eq_cell, &eq_net, lut6_buf(), &[(&en, "I0"), (&an, "I1")]);
+                        eq = Some(eq_net);
+                    }
+                } else {
+                    // b=0 contributes no `lt` term; just forward lt.
+                    emit_lut_pins(d, &lt_cell, &lt_net, lut6_buf(), &[(&ln, "I0")]);
+                    if !last {
+                        emit_lut_pins(d, &eq_cell, &eq_net, lut6_inv(), &[(&an, "I0")]);
+                        // eq' = eq & ~a
+                        let term = format!("n_ucmpk_{out}_{i}t");
+                        emit_lut_pins(
+                            d,
+                            &format!("u_ucmpk_{out}_{i}t"),
+                            &term,
+                            lut6_and2(false, false, false),
+                            &[(&en, "I0"), (&eq_net, "I1")],
+                        );
+                        eq = Some(term);
+                    }
+                }
+            }
+            _ => return false,
+        }
+        lt = Some(if last && !invert { out.to_string() } else { lt_net });
+    }
+    let Some(net) = lt else {
+        return false;
+    };
+    if invert {
+        emit_lut_pins(d, &format!("u_ucmpk_{out}_inv"), out, lut6_inv(), &[(&net, "I0")]);
+    }
+    true
+}
+
 fn as_bus_lt_pair(a: &RExpr<'_>, b: &RExpr<'_>, rtl: &Rtl) -> Option<(RelBus, RelBus)> {
     let ba = as_rel_bus(a, rtl)?;
     let bb = as_rel_bus(b, rtl)?;
@@ -15281,6 +15402,33 @@ fn as_bus_lt_pair(a: &RExpr<'_>, b: &RExpr<'_>, rtl: &Rtl) -> Option<(RelBus, Re
         return None;
     }
     Some((ba, bb))
+}
+
+/// `bus < const`, `const < bus`, `bus > const` or `bus >= const` as
+/// (bus, bound, want-greater-or-equal). `None` for anything else.
+fn as_const_rel_bus(e: &RExpr<'_>, rtl: &Rtl) -> Option<(RelBus, u128, bool)> {
+    match e {
+        RExpr::Lt(a, b) => {
+            if let (Some(bus), Some(c)) = (as_rel_bus(a, rtl), const_rel_value(b)) {
+                Some((bus, c, false))
+            } else if let (Some(c), Some(bus)) = (const_rel_value(a), as_rel_bus(b, rtl)) {
+                // `const < bus` === `bus > const`
+                Some((bus, c, true))
+            } else {
+                None
+            }
+        }
+        RExpr::Not(x) => {
+            // `!(bus < c)` === `bus >= c` === `bus > c - 1`
+            let (bus, c, ge) = as_const_rel_bus(x, rtl)?;
+            if ge {
+                Some((bus, c.checked_sub(1)?, false))
+            } else {
+                Some((bus, c.checked_sub(1)?, true))
+            }
+        }
+        _ => None,
+    }
 }
 
 fn packed_bus_lt_mix(e: &RExpr<'_>, rtl: &Rtl) -> Option<(RelBus, RelBus, bool)> {
@@ -17119,6 +17267,23 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     d.connect(pi, &lut, format!("I{pin}"));
                 }
                 continue;
+            }
+            // `bus < const` / `bus > const` wider than a LUT6: ripple the
+            // compare into real logic. Without this the refusal was swallowed
+            // and the output pin stayed at constant 0 for every input.
+            if let Some((bus, c, ge)) = as_const_rel_bus(rhs, rtl) {
+                if bus.width > SMALL_REL_BITS {
+                    let bidx = (*bit).unwrap_or(0);
+                    let bn = bit_name(lhs, w, bidx);
+                    if emit_ripple_ult_const(&mut d, rtl, &bn, &bus, c, ge) {
+                        if rel_lt {
+                            rel_sig.insert(bn.clone(), lhs.to_string());
+                        }
+                        continue;
+                    }
+                    note_assign_not_lowered(rtl.module, lhs);
+                    continue;
+                }
             }
             // Bus-vs-bus `<` / `>=` wider than a LUT6: ripple, not a 2W-PI AIG.
             if let Some((ba, bb, ge)) = packed_bus_lt_mix(rhs, rtl) {
@@ -21089,19 +21254,36 @@ endmodule
     }
 
     #[test]
-    fn wide_const_compare_stays_not_lowered() {
-        // Lowest set bit of 'h00FF is 0: every bus bit matters. Not a small LUT.
+    fn wide_const_compare_lowers_to_a_ripple_not_a_constant() {
+        // Lowest set bit of 'h00FF is 0, so every bus bit matters and the
+        // compare is wider than one LUT6. It must still produce logic: the old
+        // behavior was `ASSIGN_NOT_LOWERED`, which left `y` stuck at constant
+        // 0 for every input — `a < 16'h00FF` was false even for `a = 0`.
         let src = r#"
 module wide_cmp(input [15:0] a, output y);
   assign y = a < 16'h00FF;
 endmodule
 "#;
         let d = synth_sv(src, "wide_cmp.v").expect("wide cmp");
-        assert_eq!(
+        assert_ne!(
             d.attrs.get("ASSIGN_NOT_LOWERED"),
             Some("1"),
-            "general compare wider than a LUT6 must stay assign_not_lowered"
+            "a wide const compare is lazy-rippled, not dropped"
         );
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(
+            luts >= 8,
+            "a 16-bit ripple compare needs real LUTs, got {luts}"
+        );
+        let on_y = d
+            .nets
+            .iter()
+            .any(|n| n.name == "y" && n.endpoints.iter().any(|e| e.pin == "O"));
+        assert!(on_y, "y must be driven by the ripple compare");
     }
 
     #[test]
