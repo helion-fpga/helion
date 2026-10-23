@@ -334,6 +334,18 @@ impl<'a> EmitDevice for XDevice<'a> {
             .map(|s| s.to_string())
     }
 
+    fn tiles_of_type(&self, tile_type: &str) -> Vec<(String, i32)> {
+        let mut out = Vec::new();
+        for i in 0..self.device.tile_count() {
+            let Some(t) = self.device.tile(i) else { continue };
+            if self.device.tile_type_name(i) == Some(tile_type) {
+                out.push((t.name.clone(), t.grid_y));
+            }
+        }
+        out.sort();
+        out
+    }
+
     fn ioi_tile_for(&self, iob_tile: &str) -> Option<String> {
         let idx = self.tile_idx(iob_tile)?;
         let t = self.device.tile(idx)?;
