@@ -764,11 +764,28 @@ pub fn place_with_guide(
         // break) from both sides together so the index pairing stays exact.
         let mut packed_order_sites: Vec<(Site, u8)> = Vec::with_capacity(packed.lutffs.len());
         let mut kept_lutffs = Vec::with_capacity(packed.lutffs.len());
+        let before = packed.lutffs.len();
         for (lf, slot) in packed.lutffs.drain(..).zip(site_of) {
             if let Some(sb) = slot {
                 kept_lutffs.push(lf);
                 packed_order_sites.push(sb);
             }
+        }
+        // Dropping a cell is never a placement decision -- it deletes logic
+        // from the design. The `break` above leaves the tail of `site_of`
+        // short (or `None`), and this loop then silently discarded whatever
+        // remained, producing a bitstream implementing a SUBSET of the netlist
+        // with no error and no count. That is the worst possible failure mode:
+        // every downstream check sees a consistent, smaller, wrong design.
+        //
+        // `site_of` is built one-for-one from `packed.lutffs`, so any shortfall
+        // here means cells went unplaced. Say so.
+        if kept_lutffs.len() != before {
+            return Err(format!(
+                "place: {} of {} LUT/FF cells could not be placed and would have been dropped                  from the netlist. Refusing to emit a bitstream for a subset of the design;                  enlarge the region, relax the constraints, or reduce the design.",
+                before - kept_lutffs.len(),
+                before
+            ));
         }
         packed.lutffs = kept_lutffs;
         lutff_sites = packed_order_sites;
@@ -1412,11 +1429,26 @@ pub fn place_in_region_with_guide(
     }
     clbs.sort_by_key(|s| (s.x, s.y));
     let n_ble = dev.n_ble.max(1) as usize;
+    // Capacity is a hard limit, not a suggestion.
+    //
+    // This used to clamp with `clb_off.min(clbs.len() - 1)`, which silently
+    // mapped every cell past the end of the region onto the LAST CLB with the
+    // same BLE. Two cells then share one physical site, `or_clb_mask` ORs their
+    // INITs together, and the resulting bitstream implements neither design
+    // while the flow reports success. Failing here costs a clear error; not
+    // failing costs a wrong bitstream that looks right.
+    let capacity = clbs.len().checked_mul(n_ble).unwrap_or(0);
+    if placed.lutff_sites.len() > capacity {
+        return Err(format!(
+            "place: {} LUT/FF cells do not fit the pblock: {} CLB(s) x {} BLE = {} site(s).              Enlarge the region or reduce the design.",
+            placed.lutff_sites.len(),
+            clbs.len(),
+            n_ble,
+            capacity
+        ));
+    }
     for i in 0..placed.lutff_sites.len() {
-        let clb_off = i / n_ble;
-        let ble = (i % n_ble) as u8;
-        let idx = clb_off.min(clbs.len() - 1);
-        placed.lutff_sites[i] = (clbs[idx], ble);
+        placed.lutff_sites[i] = (clbs[i / n_ble], (i % n_ble) as u8);
     }
     let mut iobs: Vec<Site> = dev
         .iob_sites()
@@ -1430,7 +1462,14 @@ pub fn place_in_region_with_guide(
             if packed.iobs.get(i).and_then(|io| io.loc.as_ref()).is_some() {
                 continue;
             }
-            *slot = iobs[i.min(iobs.len() - 1)];
+            if i >= iobs.len() {
+                return Err(format!(
+                    "place: {} IOB cells do not fit the pblock: only {} IOB site(s) available",
+                    placed.iob_sites.len(),
+                    iobs.len()
+                ));
+            }
+            *slot = iobs[i];
         }
     }
     placed.cost = if opts.timing_weight > 0.0 {
@@ -1510,8 +1549,21 @@ mod tests {
     use helion_ir::{CellKind, Design};
     use helion_pack::pack;
 
+    /// An over-capacity design must be REFUSED, not silently truncated.
+    ///
+    /// This test used to assert the opposite: that placing
+    /// `lut6_count + 16` cells should succeed having placed only
+    /// `lut6_count` of them. That behaviour is how a bitstream comes to
+    /// implement a SUBSET of the netlist while every stage reports success --
+    /// the truncation happens in placement, so no later check can see the
+    /// missing cells, and the design that reaches the board is quietly wrong.
+    ///
+    /// The legitimate requirement behind the old test is that an over-capacity
+    /// design must not panic or abort. It must return `Err`. That is what this
+    /// now checks, and it checks the message names the shortfall so the cause
+    /// is not a mystery.
     #[test]
-    fn place_caps_lutffs_over_device_without_panic() {
+    fn place_refuses_lutffs_over_device_budget() {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let mut p = pack(&Design::structural_blinky(), &dev).unwrap();
         let proto = p.lutffs[0].clone();
@@ -1523,9 +1575,15 @@ mod tests {
             lf.q_net = format!("q{}", p.lutffs.len());
             p.lutffs.push(lf);
         }
-        let pl = place(&p, &dev).expect("over-capacity LUTFF must cap, not panic");
-        assert_eq!(pl.lutff_sites.len(), dev.lut6_count() as usize);
-        assert_eq!(pl.packed.lutffs.len(), pl.lutff_sites.len());
+        let err = place(&p, &dev).expect_err("over-capacity LUTFF must be refused");
+        assert!(
+            err.contains("could not be placed"),
+            "error must explain the shortfall, got: {err}"
+        );
+        assert!(
+            err.contains("16"),
+            "error must name how many cells do not fit, got: {err}"
+        );
     }
 
     #[test]
@@ -1539,6 +1597,10 @@ mod tests {
             io.cell = format!("u_iob{}", p.iobs.len());
             p.iobs.push(io);
         }
+        // NOTE: this reaches `place()`, whose IOB sizing is separate from the
+        // pblock path guarded in `place_with_guide`. It still truncates -- see
+        // the finding doc; collapsing it to the same refusal is the next step.
+        // The pblock path now errors, and this test covers the other one.
         let pl = place(&p, &dev).expect("over-width I/O must place on the device budget");
         assert_eq!(
             pl.iob_sites.len(),
