@@ -951,10 +951,15 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
             // placed logic, and scanning the die for a tile with the same row
             // finds the far edge of the device instead.
             for int_tile in &clock_int_tiles {
-                for n in &spine_bits {
-                    lines.push(format!("{int_tile}.GFAN0.GCLK_B{n}"));
-                    lines.push(format!("{int_tile}.GFAN1.GCLK_B{n}"));
-                }
+                // `GFAN*.GCLK_B<n>` is deliberately NOT emitted. The pip graph
+                // shows `GCLK_B<n> ->> GFAN0/GFAN1`, which makes it look
+                // required, but the reference sets that feature ZERO times
+                // across the whole die: `GCLK_B11` reaches `GFAN0`/`GFAN1`
+                // through the `CLK1.GCLK_B11` tap that is already emitted, and
+                // the fanout network needs only its bypass arms and return
+                // paths. Setting it anyway put an arm in the mux that the
+                // oracle never selects.
+                let _ = &spine_bits;
                 for alt in [0u32, 1, 4, 5] {
                     lines.push(format!("{int_tile}.BYP_ALT{alt}.GFAN0"));
                 }
