@@ -793,6 +793,10 @@ thread_local! {
     /// against X/Z is a simulation model, not a LUT and not a closed WNS.
     static SIM_ONLY_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+    /// Modules whose `$display`/`$write`/4-state-X compares are confined to
+    /// standalone `initial` blocks. Their synthesizable logic is kept.
+    static SIM_ONLY_INITIAL_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
     /// One `negedge_not_lowered` line per module+signal.
     static NEGEDGE_NOT_LOWERED_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
@@ -2020,6 +2024,58 @@ fn slice_is_sim_only(toks: &[Tok]) -> bool {
         i += 1;
     }
     false
+}
+
+/// Modules whose sim-only constructs are confined to standalone `initial`
+/// blocks. Those blocks are skipped during elaboration; the module's real
+/// logic must still be synthesised.
+fn note_sim_only_initial(module: &str) {
+    SIM_ONLY_INITIAL_SEEN.with(|s| s.borrow_mut().insert(module.to_string()));
+}
+
+fn sim_only_initial_for(module: &str) -> bool {
+    SIM_ONLY_INITIAL_SEEN.with(|s| s.borrow().contains(module))
+}
+
+/// True when every sim-only construct (`$display`/`$write`, a 4-state compare
+/// against X/Z) in the module sits in its own `initial` block, so the
+/// synthesizable logic elsewhere is unaffected.
+///
+/// A whole module used to be condemned as SIM_ONLY the moment any such
+/// construct appeared, and `synth_sub` then cleared every cell: a real design
+/// with a debug `$display` synthesised to nothing. But a vendor simulation
+/// model can also carry those constructs *inside* the `always` block that
+/// would otherwise become its logic (PLL/clock-buffer models), and those must
+/// still be refused as a whole.
+fn sim_only_is_isolated_to_initials(toks: &[Tok]) -> bool {
+    let mut i = 0usize;
+    let mut in_initial = false;
+    let mut depth = 0i32;
+    while i < toks.len() {
+        match &toks[i] {
+            Tok::Kw(k) if *k == "endmodule" => break,
+            Tok::Kw(k) if *k == "initial" => {
+                in_initial = true;
+                depth = 0;
+            }
+            Tok::Sym(';') if in_initial && depth == 0 => in_initial = false,
+            Tok::Kw(k) if *k == "begin" && in_initial => depth += 1,
+            Tok::Kw(k) if *k == "end" && in_initial => {
+                depth -= 1;
+                if depth <= 0 {
+                    in_initial = false;
+                }
+            }
+            Tok::Ident(s) if is_sim_display(s) && !in_initial => return false,
+            _ => {
+                if !in_initial && is_case_eq_at(toks, i) && case_eq_against_xz(toks, i) {
+                    return false;
+                }
+            }
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Simulation model. One line. Not a LUT, not a MAC, not a closed WNS.
@@ -8834,8 +8890,20 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
     }
     let module = p.ident()?;
     set_cur_mod(module);
+    // `$display`/`$write` anywhere condemned the WHOLE module: every cell was
+    // cleared, so a module with real `assign` logic plus one `initial
+    // $display` synthesised to nothing. Only mark the module sim-only when the
+    // slice has no synthesizable statement to lose; otherwise the individual
+    // procedure is skipped where it is parsed.
     if slice_is_sim_only(&p.t[p.i..]) {
-        note_sim_only(module);
+        // A module whose sim-only constructs sit in their own `initial` block
+        // still has synthesizable logic to keep; one whose `$display`/`===x`
+        // are woven into the `always` block that would become its logic is a
+        // simulation model and must be refused as a whole.
+        if !sim_only_is_isolated_to_initials(&p.t[p.i..]) {
+            note_sim_only(module);
+        }
+        note_sim_only_initial(module);
     }
     while p.eat_kw("import") {
         let _ = skip_item_or_block(&mut p);
