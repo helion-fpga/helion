@@ -3801,6 +3801,11 @@ enum Tok<'a> {
 fn parse_based_digits(digits: &str, base: u32) -> u128 {
     let mut val: u128 = 0;
     let mut any = false;
+    // `8'sd-5` / `8'sd+5`: the sign is part of the literal.
+    let (neg, digits) = match digits.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, digits.strip_prefix('+').unwrap_or(digits)),
+    };
     for ch in digits.chars() {
         if ch == '_' {
             continue;
@@ -3821,10 +3826,13 @@ fn parse_based_digits(digits: &str, base: u32) -> u128 {
             None => return 0,
         }
     }
-    if any {
-        val
+    if !any {
+        return 0;
+    }
+    if neg {
+        0u128.wrapping_sub(val)
     } else {
-        0
+        val
     }
 }
 
@@ -3978,6 +3986,12 @@ fn tokenize(s: &str) -> Result<Vec<Tok<'_>>, String> {
         }
         if c == '\'' {
             i += 1;
+            // Optional signed marker: `'sd5`, `8'shff`. Not recognising it made
+            // the base look like `s`, the literal was rejected, and every
+            // signed based literal silently became 0.
+            if i < b.len() && matches!(b[i] as char, 's' | 'S') {
+                i += 1;
+            }
             let mut base = 2;
             let mut saw_base = false;
             if i < b.len() {
@@ -4080,6 +4094,10 @@ fn tokenize(s: &str) -> Result<Vec<Tok<'_>>, String> {
                 // by the tick branch above. A size that fails to parse falls
                 // back to the 32-bit integer default rather than 1 bit.
                 let width: usize = n.parse().unwrap_or(32);
+                // Optional signed marker: `8'sd5`, `8'shff`.
+                if i < b.len() && matches!(b[i] as char, 's' | 'S') {
+                    i += 1;
+                }
                 let mut base = 10;
                 if i < b.len() {
                     match (b[i] as char).to_ascii_lowercase() {
@@ -4103,6 +4121,13 @@ fn tokenize(s: &str) -> Result<Vec<Tok<'_>>, String> {
                     }
                 }
                 let dstart = i;
+                // A leading sign belongs to the literal: `8'sd-5` is the
+                // number -5, not `8'sd0` followed by `- 5`. Splitting it there
+                // built `Sub(Add(a, 0), 5)`, which the nested-arith guard
+                // refused, so the whole assign emitted no logic.
+                if i < b.len() && matches!(b[i] as char, '-' | '+') {
+                    i += 1;
+                }
                 while i < b.len() {
                     let ch = b[i] as char;
                     if ch == '_' {
@@ -4911,8 +4936,19 @@ fn parse_un_r<'a>(p: &mut P<'a>) -> Result<RExpr<'a>, String> {
     if p.eat_sym('-') {
         let x = parse_un_r(p)?;
         if let RExpr::Const { val, width, care } = x {
+            // Keep `val` inside the declared width. `0 - 5` is all-ones across
+            // all 128 bits, and leaving it unmasked made the width probe see a
+            // 128-bit operand: `a + 8'sd-5` blew the cone cap and emitted no
+            // logic at all instead of `a - 5`. An unsized operand (width 0)
+            // keeps the full 128-bit value, matching `parse_atom_r`.
+            let neg = 0u128.wrapping_sub(val);
+            let neg = if width == 0 || width >= 128 {
+                neg
+            } else {
+                neg & care_mask(width)
+            };
             return Ok(RExpr::Const {
-                val: 0u128.wrapping_sub(val),
+                val: neg,
                 width,
                 care,
             });

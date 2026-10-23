@@ -495,3 +495,93 @@ fn xdc_flag_works_for_query_commands() {
 /// Helper kept so an unused-import warning never masks a real one.
 #[allow(dead_code)]
 fn _assert_path(_p: &Path) {}
+
+// ------------------------------------------- legal syntax must not be rejected --
+// The syntax gate scans tokens for punctuation that cannot appear in legal SV.
+// Two shapes look like typos to a naive scan but are ordinary Verilog, and both
+// rejected real projects before this was fixed:
+//
+//   * `32'b 0000_????_0011` — a wildcard case-decode literal. Every `?` is a
+//     don't-care digit, so a run of them is not a stray `??`.
+//   * `always @(*)` — the tokenizer emits `(*` for the `(*` of an attribute
+//     delimiter, so the `@` is followed by `(*` rather than `(`.
+//
+// A third shape, an `@` inside a comment (an SPDX email address), needs the
+// scanner to skip comments at all.
+
+#[test]
+fn wildcard_literals_in_case_items_are_legal() {
+    let s = Scratch::new("wildcard-lit");
+    let f = s.write(
+        "wild.sv",
+        r#"
+module wild(input logic [15:0] op, output logic hit);
+    always_comb begin
+        hit = 1'b0;
+        casez (op)
+            16'b 0000_0000_????_0011: hit = 1'b1;
+            16'b 0000_0001_????_????: hit = 1'b1;
+            default: hit = 1'b0;
+        endcase
+    end
+endmodule
+"#,
+    );
+    let o = helion(&["synth", f.to_str().unwrap()]);
+    assert!(o.status.success(), "wildcard literal rejected: {}", out_of(&o));
+}
+
+#[test]
+fn always_star_comb_block_is_legal() {
+    let s = Scratch::new("always-star");
+    let f = s.write(
+        "star.sv",
+        r#"
+module star(input logic a, input logic b, output logic y);
+    logic t;
+    always @(*) begin
+        t = a & b;
+    end
+    assign y = t;
+endmodule
+"#,
+    );
+    let o = helion(&["synth", f.to_str().unwrap()]);
+    assert!(o.status.success(), "always @(*) rejected: {}", out_of(&o));
+}
+
+#[test]
+fn an_at_sign_inside_a_comment_is_not_a_stray_token() {
+    let s = Scratch::new("at-in-comment");
+    let f = s.write(
+        "cmt.sv",
+        r#"
+/*
+ * SPDX-FileCopyrightText: 2022 Someone <someone@example.com>
+ */
+// Also see foo@bar in a line comment.
+module cmt(input logic clk, output logic q);
+    always @(posedge clk) q <= ~q;
+endmodule
+"#,
+    );
+    let o = helion(&["synth", f.to_str().unwrap()]);
+    assert!(o.status.success(), "comment body scanned as tokens: {}", out_of(&o));
+}
+
+#[test]
+fn a_genuinely_stray_at_sign_is_still_rejected() {
+    // The exemption must not disable the check: `@@` is a real typo that the
+    // lenient parser would otherwise recover from by dropping the block.
+    let s = Scratch::new("stray-at");
+    let f = s.write(
+        "bad.sv",
+        r#"
+module bad(input logic clk, output logic q);
+    always @@(posedge clk) q <= ~q;
+endmodule
+"#,
+    );
+    let o = helion(&["synth", f.to_str().unwrap()]);
+    assert!(!o.status.success(), "stray `@@` must be rejected, got success");
+}
