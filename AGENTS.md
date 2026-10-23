@@ -52,6 +52,16 @@ The `.app` is ad-hoc signed (`codesign --deep --force -s -`, in `scripts/build-m
 
 Clock nets are real pip routes, not free: route the spine (IOI/HCLK_CMT → BUFG_REBUF → HROW → INT CLK) and emit the per-stage active/enable companion bits (`clock_companions` in `emit.rs`). **Every stage has a gating bit and a mux bit; the mux alone leaves the branch muted.** Missing so far, all found only by diffing against a working Vivado bitstream: `HCLK_L.ENABLE_BUFFER` (the HCLK_L arm did not exist, so left-edge clocks -- i.e. the ZedBoard GCLK -- died at HROW), `CLK_HROW.BUFHCE.BUFHCE_X1Y<n>.IN_USE` (index `n` pairs with `CLK_HROW_CK_MUX_OUT_{L,R}<n>`), and input-pad `PULLTYPE.NONE`/`IN_TERM.NONE` (inputs default to a pulldown; the clock pin is an input).
 
+`CLK_BUFG_REBUF` tiles are **in-line amplifiers**, not taps: the clock reaches
+logic past a repeater only once that repeater is enabled. Programme the whole
+chain between the injection stage and the placed logic, not just the stage the
+route named -- the emitter cannot see the other repeaters from the netlist, so
+ask the device (`EmitDevice::tiles_of_type`). The reference blinky hides this
+because its flops sit beside the injection point; a design further down the
+column loses its edge past the last enabled repeater. Take the neighbour on
+each side unconditionally (Vivado does), then walk outward only while logic
+lies beyond.
+
 `clock_companions` is a hand-written table and has been wrong twice; two of the four stages we model were missing bits. Prefer deriving companions from the DB the way pips are derived. Check with `python3 scripts/clkdiff.py <ours.bit>` -- it diffs the whole spine against `~/CDA4253_A1/blinky.bit` and prints features MISSING vs Vivado. Note prjxray silently drops unmatched FASM lines, so a clean assemble proves self-consistency only.
 
 ### FF configuration: two bits per flop, and both are mandatory
