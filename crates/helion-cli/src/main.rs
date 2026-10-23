@@ -854,7 +854,7 @@ fn compile_design_xdc(
         packed.iobs = driven.into_iter().take(keep).collect();
     }
     eprintln!(
-        "hang_diag pack lutffs={} iobs={} ms={}",
+        "hang_diag pack lut_sites={} iobs={} ms={}",
         packed.lutffs.len(),
         packed.iobs.len(),
         t0.elapsed().as_millis()
@@ -1157,7 +1157,7 @@ fn cmd_impl(args: &[String]) {
         std::process::exit(1);
     });
     println!(
-        "impl {} lutffs={} iobs={} brams={} pathfinder_iters={} hops={} frames={}",
+        "impl {} lut_sites={} iobs={} brams={} pathfinder_iters={} hops={} frames={}",
         c.design.name,
         c.routed.placed.packed.lutffs.len(),
         c.routed.placed.packed.iobs.len(),
@@ -1304,9 +1304,9 @@ fn cmd_util(args: &[String]) {
                  BRAM={}/{} DSP={}/{}",
                 design.name,
                 u.part,
-                u.lutffs,
+                u.lut_sites,
                 u.lut_capacity,
-                u.lutffs,
+                u.lut_sites,
                 u.lut_capacity,
                 u.iobs_in + u.iobs_out,
                 u.iob_capacity,
@@ -1334,7 +1334,7 @@ fn cmd_util(args: &[String]) {
     });
     let p = &c.routed.placed.packed;
     println!(
-        "report_utilization {} LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
+        "report_utilization {} LUT={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
         c.design.name,
         p.lutffs.len(),
         c.dev.lut6_count(),
@@ -1399,7 +1399,7 @@ fn cmd_reports(args: &[String]) {
     let dsp = p.macs.len();
     if pwr.lutff != lutff || pwr.iob != iob || pwr.bram != bram || pwr.dsp != dsp {
         eprintln!(
-            "reports: power occupancy LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{} mismatches util",
+            "reports: power occupancy LUT={}/{} IOB={}/{} BRAM={}/{} DSP={}/{} mismatches util",
             pwr.lutff, lutff, pwr.iob, iob, pwr.bram, bram, pwr.dsp, dsp
         );
         std::process::exit(1);
@@ -1434,7 +1434,7 @@ fn cmd_reports(args: &[String]) {
         c.timing.iob_ps
     );
     println!(
-        "report_utilization {} LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
+        "report_utilization {} LUT={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
         c.design.name,
         lutff,
         c.dev.lut6_count(),
@@ -1752,8 +1752,8 @@ fn cmd_qor(args: &[String]) {
              ENDPOINTS={} ELAPSED_MS={} (7-series model estimate, not sign-off)",
             design.name,
             u.part,
-            u.lutffs,
-            u.lutffs,
+            u.lut_sites,
+            u.lut_sites,
             u.iobs_in + u.iobs_out,
             u.brams,
             u.macs,
@@ -1781,7 +1781,7 @@ fn cmd_qor(args: &[String]) {
         std::process::exit(1);
     }
     println!(
-        "qor {} part={} LUTFF={} IOB={} BRAM={} DSP={} WNS_PS={} R2R_PS={} IOB_PS={} FRAMES={} BYTES={} ELAPSED_MS={}",
+        "qor {} part={} LUT={} IOB={} BRAM={} DSP={} WNS_PS={} R2R_PS={} IOB_PS={} FRAMES={} BYTES={} ELAPSED_MS={}",
         c.design.name,
         c.dev.part,
         p.lutffs.len(),
@@ -1894,7 +1894,7 @@ fn cmd_project(args: &[String]) {
         eprintln!("project timing: {e}");
         std::process::exit(1);
     });
-    let lutffs = session
+    let lut_sites = session
         .placed
         .as_ref()
         .map(|p| p.packed.lutffs.len())
@@ -1905,7 +1905,7 @@ fn cmd_project(args: &[String]) {
         .map(|b| b.frames.len())
         .unwrap_or(0);
     println!(
-        "project {} part={} sources={} ip={} top={} xdc_files={} create_clock={} PACKAGE_PIN={} lutffs={} WNS_PS={} frames={}",
+        "project {} part={} sources={} ip={} top={} xdc_files={} create_clock={} PACKAGE_PIN={} lut_sites={} WNS_PS={} frames={}",
         path,
         prj.part,
         prj.sources.len(),
@@ -1914,7 +1914,7 @@ fn cmd_project(args: &[String]) {
         prj.constraint_files.len(),
         xdc.clocks.len(),
         xdc.package_pins.len(),
-        lutffs,
+        lut_sites,
         timing.wns_ps,
         frames
     );
@@ -2066,7 +2066,7 @@ fn cmd_project_checkpoint_open(args: &[String]) {
         eprintln!("open_checkpoint: {e}");
         std::process::exit(1);
     });
-    let lutffs = session
+    let lut_sites = session
         .placed
         .as_ref()
         .map(|p| p.lutff_sites.len())
@@ -2082,7 +2082,7 @@ fn cmd_project_checkpoint_open(args: &[String]) {
         std::process::exit(1);
     });
     println!(
-        "open_checkpoint {path} part={} lutffs={lutffs} frames={frames} hash={hash:#x}",
+        "open_checkpoint {path} part={} lut_sites={lut_sites} frames={frames} hash={hash:#x}",
         dev.part
     );
     println!("{timing}");
@@ -2487,7 +2487,7 @@ fn doctor() {
     println!("  blinky pack/place/route/bitgen/drc: ok");
     let cc = compile_design(Design::structural_counter(), "HL10T-C32-1", 0.75).unwrap();
     println!(
-        "  counter lutffs={} iob_ble={} pathfinder={} WNS_PS={}",
+        "  counter lut_sites={} iob_ble={} pathfinder={} WNS_PS={}",
         cc.routed.placed.packed.lutffs.len(),
         cc.routed.iob_src[0].ble,
         cc.routed.pathfinder_iters,
