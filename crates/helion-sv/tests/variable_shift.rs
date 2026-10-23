@@ -67,3 +67,30 @@ fn zero_shift_amount_is_identity() {
         assert_eq!(y, a, "shifting by zero must return the input unchanged");
     }
 }
+
+#[test]
+fn variable_arithmetic_right_shift_sign_fills() {
+    // `>>>` on a signed value must replicate the sign bit as the amount grows.
+    let d = synth_sv(
+        r#"module t(input logic signed [7:0] a, input logic [2:0] b, output logic signed [7:0] y);
+             assign y = a >>> b;
+           endmodule"#,
+        "t.sv",
+    )
+    .expect("synth");
+
+    for (a, want_pairs) in [
+        (0x80u64, [0x80u64, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe, 0xff]),
+        (0x40, [0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01, 0x00]),
+        (0xff, [0xff; 8]),
+    ] {
+        for b in 0..8usize {
+            let y = Netlist::drive(&d, &[("a", a, 8), ("b", b as u64, 3)]).out("y", 8);
+            assert_eq!(
+                y, want_pairs[b],
+                "a=0x{a:02x} >>> {b} must be 0x{:02x}, got 0x{y:02x}",
+                want_pairs[b]
+            );
+        }
+    }
+}
