@@ -327,11 +327,98 @@ pub struct SvElabReport {
     pub ffs: usize,
 }
 
+#[cfg(test)]
+mod syntax_cache_tests {
+    use super::*;
+
+    /// The parse cache must not serve a tree parsed under different options.
+    ///
+    /// `-D`/`-I` change the syntax tree, so a key of `(path, mtime, len)` alone
+    /// hands a `-D WIDTH=8` tree back to a `-D WIDTH=16` run on the same
+    /// unchanged file: both runs succeed and silently disagree.
+    #[test]
+    fn cache_key_separates_distinct_defines_and_includes() {
+        let dir = std::env::temp_dir().join(format!("helion_cache_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("k.sv");
+        std::fs::write(&f, "module k; endmodule\n").unwrap();
+
+        let a = SvCompileOpts {
+            defines: vec![("WIDTH".into(), "8".into())],
+            include_paths: vec![],
+        };
+        let b = SvCompileOpts {
+            defines: vec![("WIDTH".into(), "16".into())],
+            include_paths: vec![],
+        };
+        let none = SvCompileOpts::default();
+        let inc = SvCompileOpts {
+            defines: vec![],
+            include_paths: vec!["/tmp".into()],
+        };
+
+        let ka = file_mtime_key(&f, &a).unwrap();
+        let kb = file_mtime_key(&f, &b).unwrap();
+        let kn = file_mtime_key(&f, &none).unwrap();
+        let ki = file_mtime_key(&f, &inc).unwrap();
+        assert_ne!(ka, kb, "same file, different -D must not share a cache key");
+        assert_ne!(ka, kn, "a defined build must not share a key with an undefined one");
+        assert_ne!(kn, ki, "include paths are part of the parse environment");
+        // Repeating a call must be stable, or every parse misses.
+        assert_eq!(ka, file_mtime_key(&f, &a).unwrap());
+        // Define order is not significant (they are a set) ...
+        let a_rev = SvCompileOpts {
+            defines: vec![
+                ("X".into(), "1".into()),
+                ("WIDTH".into(), "8".into()),
+            ],
+            include_paths: vec![],
+        };
+        let a_rev2 = SvCompileOpts {
+            defines: vec![
+                ("WIDTH".into(), "8".into()),
+                ("X".into(), "1".into()),
+            ],
+            include_paths: vec![],
+        };
+        assert_eq!(
+            file_mtime_key(&f, &a_rev).unwrap(),
+            file_mtime_key(&f, &a_rev2).unwrap(),
+            "define order must not change the key"
+        );
+        // ... but include order is, because it changes resolution order.
+        let i1 = SvCompileOpts {
+            defines: vec![],
+            include_paths: vec!["/a".into(), "/b".into()],
+        };
+        let i2 = SvCompileOpts {
+            defines: vec![],
+            include_paths: vec!["/b".into(), "/a".into()],
+        };
+        assert_ne!(
+            file_mtime_key(&f, &i1).unwrap(),
+            file_mtime_key(&f, &i2).unwrap(),
+            "include order changes resolution and must change the key"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 pub fn parse_sv(source: &str, origin: &str) -> Result<Arc<sv_parser::SyntaxTree>, String> {
     parse_sv_opts(source, origin, &SvCompileOpts::default())
 }
 
-fn file_mtime_key(path: &Path) -> Option<(String, u64, u64)> {
+/// Cache key for a parsed file: identity, mtime, length, AND the compile
+/// options that change what the parser produces.
+///
+/// The options are part of the key because `-D`/`-I` change the syntax tree
+/// itself, not just what is elaborated from it. Keying on `(path, mtime, len)`
+/// alone means a tree first parsed with `-D WIDTH=8` is handed straight back
+/// for a later `-D WIDTH=16` run on the same unchanged file: the two runs
+/// disagree while every check passes, because the diff never reaches the
+/// parser. Folding a fingerprint of the options into the key costs one hash
+/// and makes the cache answer the question it is actually being asked.
+fn file_mtime_key(path: &Path, opts: &SvCompileOpts) -> Option<(String, u64, u64, u64)> {
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta
         .modified()
@@ -339,7 +426,23 @@ fn file_mtime_key(path: &Path) -> Option<(String, u64, u64)> {
         .duration_since(UNIX_EPOCH)
         .ok()?
         .as_nanos() as u64;
-    Some((path.display().to_string(), mtime, meta.len()))
+    // Order-independent over defines (they are a set) but include both the
+    // name and the value, and keep include paths in order: their order
+    // changes resolution.
+    let mut defs: Vec<&(String, String)> = opts.defines.iter().collect();
+    defs.sort();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (k, v) in defs {
+        std::hash::Hash::hash(k, &mut h);
+        std::hash::Hash::hash(v, &mut h);
+        std::hash::Hash::hash(&0u8, &mut h);
+    }
+    std::hash::Hash::hash(&1u8, &mut h);
+    for inc in &opts.include_paths {
+        std::hash::Hash::hash(inc, &mut h);
+    }
+    let opt_fp = std::hash::Hasher::finish(&h);
+    Some((path.display().to_string(), mtime, meta.len(), opt_fp))
 }
 
 /// `sv-parser::SyntaxTree` is !Sync (internal RefCells). Post-parse trees are
@@ -350,9 +453,9 @@ struct SharedSyntaxTree(Arc<sv_parser::SyntaxTree>);
 unsafe impl Send for SharedSyntaxTree {}
 unsafe impl Sync for SharedSyntaxTree {}
 
-fn syntax_tree_cache() -> &'static Mutex<HashMap<(String, u64, u64), SharedSyntaxTree>> {
+fn syntax_tree_cache() -> &'static Mutex<HashMap<(String, u64, u64, u64), SharedSyntaxTree>> {
     use std::sync::OnceLock;
-    static CACHE: OnceLock<Mutex<HashMap<(String, u64, u64), SharedSyntaxTree>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<(String, u64, u64, u64), SharedSyntaxTree>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -388,7 +491,7 @@ fn parse_sv_cached(
     opts: &SvCompileOpts,
 ) -> Result<Arc<sv_parser::SyntaxTree>, String> {
     let path = Path::new(origin);
-    if let Some(key) = file_mtime_key(path) {
+    if let Some(key) = file_mtime_key(path, opts) {
         if key.2 == source.len() as u64 {
             if let Ok(c) = syntax_tree_cache().lock() {
                 if let Some(hit) = c.get(&key) {
