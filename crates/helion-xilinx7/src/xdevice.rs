@@ -221,7 +221,22 @@ impl<'a> EmitDevice for XDevice<'a> {
         let pos = t.sites.iter().position(|s| s.name == site)?;
         let stype = &t.sites[pos].site_type;
         if stype.starts_with("IOB") {
-            Some(format!("IOB_Y{pos}"))
+            // X-Ray numbers the IOBs in a tile top-down: `IOB_Y0` is the
+            // highest-y site. Tilegrid instance names (and `t.sites`, which
+            // is sorted by name) run bottom-up, so reverse the rank. Getting
+            // this backwards configures the neighbouring pin: e.g. the
+            // ZedBoard 100 MHz clock on Y9 (IOB_X0Y26) must land in IOB_Y0,
+            // as it does in a Vivado bitstream.
+            let iob_positions: Vec<usize> = t
+                .sites
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.site_type.starts_with("IOB"))
+                .map(|(i, _)| i)
+                .collect();
+            let rank = iob_positions.iter().position(|&i| i == pos)?;
+            let y = iob_positions.len().saturating_sub(1) - rank;
+            Some(format!("IOB_Y{y}"))
         } else if stype.starts_with("SLICE") {
             // segbits: SLICEL_X0 / SLICEM_X1 (X index within tile).
             Some(format!("{stype}_X{pos}"))
@@ -231,5 +246,42 @@ impl<'a> EmitDevice for XDevice<'a> {
         } else {
             Some(format!("{stype}_X{pos}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::{default_db_root, Device};
+
+    #[test]
+    fn iob_site_rel_is_top_down() {
+        // ZedBoard: clk Y9 = IOB_X0Y26 (upper site of LIOB33_X0Y25),
+        // LD0 T22 = IOB_X1Y46 (upper site of RIOB33_X73Y45). X-Ray calls
+        // the upper site IOB_Y0, matching Vivado; numbering from the
+        // tilegrid's bottom-up list would put the clock on the wrong pin.
+        let db = default_db_root();
+        if !db.join("zynq7/xc7z020/tilegrid.json").is_file() {
+            return;
+        }
+        let mut dev = Device::load_xc7z020(&db).expect("load xc7z020");
+        let nodes = build_node_map(&mut dev);
+        let xdev = XDevice::new(&dev, nodes);
+        assert_eq!(
+            xdev.site_rel("LIOB33_X0Y25", "IOB_X0Y26").as_deref(),
+            Some("IOB_Y0")
+        );
+        assert_eq!(
+            xdev.site_rel("LIOB33_X0Y25", "IOB_X0Y25").as_deref(),
+            Some("IOB_Y1")
+        );
+        assert_eq!(
+            xdev.site_rel("RIOB33_X73Y45", "IOB_X1Y46").as_deref(),
+            Some("IOB_Y0")
+        );
+        assert_eq!(
+            xdev.site_rel("RIOB33_X73Y45", "IOB_X1Y45").as_deref(),
+            Some("IOB_Y1")
+        );
     }
 }

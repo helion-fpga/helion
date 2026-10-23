@@ -55,19 +55,6 @@ impl TilegridLayout {
         Some(TilegridLayout { tiles })
     }
 
-    fn all_addresses(&self) -> Vec<u32> {
-        let mut addrs = Vec::new();
-        for tile in self.tiles.values() {
-            for (geom, frames) in tile.blocks.values() {
-                for i in 0..*frames {
-                    addrs.push(geom.baseaddr + i);
-                }
-            }
-        }
-        addrs.sort();
-        addrs.dedup();
-        addrs
-    }
 }
 
 impl TileBitLayout for TilegridLayout {
@@ -142,7 +129,9 @@ fn blinky_full_bitstream() {
     types.dedup();
     let segbits = load_segbits(&artix7, &types);
 
-    let mut store = FrameStore::new(&layout.all_addresses());
+    // Every valid frame, not the tilegrid union.
+    let mut store = FrameStore::for_part(device.part()).expect("frame store");
+    assert_eq!(store.frame_count(), 5_408, "xc7a35t has 5408 frames");
     let applied = store.apply_fasm(&lines, &segbits, &layout).expect("apply FASM");
     assert!(applied > 0, "no FASM features applied");
     println!("applied {applied} FASM features");

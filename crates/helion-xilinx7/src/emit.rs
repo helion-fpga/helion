@@ -193,44 +193,61 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         let _ = p;
     }
 
-    // BUFGCTRLs. Static configuration for an I0 -> O clock buffer (BUFG).
+    // BUFGCTRLs, wired as a BUFG (I0 -> O).
     //
-    // Xilinx UG472 Fig. 2-5 "BUFG as BUFGCTRL" builds a BUFG from a
-    // BUFGCTRL by DRIVING the control pins: S0=VDD, CE0=VDD, IGNORE0=GND,
-    // S1=GND, CE1=GND, IGNORE1=VDD. UG472 Table 2-3: (CE0,S0,CE1,S1) =
-    // (1,1,0,X) or (1,1,X,0) selects I0; any other select state holds O at
-    // INIT_OUT with no toggle.
+    // Feature set copied from a Vivado 2023.2 bitstream for this board
+    // (blinky, clk on Y9, BUFGCTRL_X0Y0), decoded with the X-Ray zynq7
+    // segbits:
+    //   BUFGCTRL_X0Y0:       IN_USE, IS_IGNORE1_INVERTED, ZINV_CE0, ZINV_S0
+    //   CLK_BUFG_BUFGCTRL0_I0: CLK_BUFG_BOT_R_CK_MUXED0   (input select)
+    //   CLK_BUFG_CK_GCLK0:     CLK_BUFG_BUFGCTRL0_O       (output -> GCLK)
     //
-    // Bit meanings below are from prjxray fuzzer 042-clk-bufg-config
-    // (generate.py): a `Z` prefix means the FASM feature is the INVERSE of
-    // the Vivado attribute (feature present <=> attribute is 0/FALSE); a
-    // non-Z feature is present <=> attribute is 1/TRUE.
-    //   ZINV_S0/ZINV_S1/ZINV_CE0/ZINV_CE1 present <=> pin NOT inverted.
-    //   ZPRESELECT_I0 present <=> PRESELECT_I0=FALSE; PRESELECT_I1 absent
-    //     <=> PRESELECT_I1=FALSE (both FALSE is the Vivado default).
-    //   INIT_OUT absent <=> INIT_OUT=0 (default).
-    //   IS_IGNORE0/1_INVERTED absent <=> IGNORE pins NOT inverted (default).
+    // INIT_OUT, IS_IGNORE0_INVERTED, ZINV_CE1, ZINV_S1, ZPRESELECT_I0 and
+    // PRESELECT_I1 are all ABSENT in the reference. Do not "helpfully" add
+    // them: the ZINV bits invert the pin, so setting ZINV_S1/ZINV_CE1 is
+    // not how a BUFG deselects I1.
     //
-    // NOTE: these bits set pin polarity and defaults only; they do NOT
-    // drive the pins. S0/S1/CE0/CE1/IGNORE0/IGNORE1 must additionally be
-    // ROUTED to constants (S0=1, CE0=1, IGNORE0=0, S1=0, CE1=0,
-    // IGNORE1=1). The router does not do tie-off routing yet, so the clock
-    // will not pass until that lands. Do NOT "fix" this by omitting
-    // ZINV_S1/ZINV_CE1: omitting them INVERTS the pins (it does not drive
-    // them to 0), which freezes O at "Old Input" per Table 2-3 once the
-    // pins are driven.
+    // The control-pin puzzle resolves here: the reference does not route
+    // S0/S1/CE0/CE1/IGNORE0/IGNORE1 to constant nets either. Their
+    // effective values come from the site defaults plus these inversion
+    // bits, so no tie-off routing is needed.
+    //
+    // Both muxes are mandatory. The site config only marks the BUFGCTRL
+    // used: without the input mux no clock reaches I0, and without the
+    // output mux the buffer never drives the global clock spine that feeds
+    // FF CLK pins.
     for bufg in &placed.bufgs {
         let site_rel = device
             .site_rel(&bufg.tile, &bufg.site)
             .ok_or_else(|| format!("emit: no rel site for {} {}", bufg.tile, bufg.site))?;
-        lines.push(format!("{}.BUFGCTRL.{}.IN_USE", bufg.tile, site_rel));
-        // No inversion on any control pin: driven values pass through.
-        lines.push(format!("{}.BUFGCTRL.{}.ZINV_CE0", bufg.tile, site_rel));
-        lines.push(format!("{}.BUFGCTRL.{}.ZINV_CE1", bufg.tile, site_rel));
-        lines.push(format!("{}.BUFGCTRL.{}.ZINV_S0", bufg.tile, site_rel));
-        lines.push(format!("{}.BUFGCTRL.{}.ZINV_S1", bufg.tile, site_rel));
-        // PRESELECT_I0=FALSE, PRESELECT_I1=FALSE (Vivado defaults).
-        lines.push(format!("{}.BUFGCTRL.{}.ZPRESELECT_I0", bufg.tile, site_rel));
+        let tile_type = device
+            .tile_type(&bufg.tile)
+            .ok_or_else(|| format!("emit: no tile type for {}", bufg.tile))?;
+        let (top, slot) = bufg_slot(&site_rel, &tile_type)?;
+        // segbits name both tiles' sites BUFGCTRL_X0Y0..15; the top tile's
+        // tilegrid sites are numbered X0Y16..31.
+        let seg_site = format!("BUFGCTRL_X0Y{slot}");
+        lines.push(format!("{}.BUFGCTRL.{}.IN_USE", bufg.tile, seg_site));
+        lines.push(format!(
+            "{}.BUFGCTRL.{}.IS_IGNORE1_INVERTED",
+            bufg.tile, seg_site
+        ));
+        lines.push(format!("{}.BUFGCTRL.{}.ZINV_CE0", bufg.tile, seg_site));
+        lines.push(format!("{}.BUFGCTRL.{}.ZINV_S0", bufg.tile, seg_site));
+        // I0 input mux: BUFGCTRLn's dedicated I0 input is CK_MUXED<2n>.
+        let mux_tile = if top { "CLK_BUFG_TOP_R" } else { "CLK_BUFG_BOT_R" };
+        lines.push(format!(
+            "{}.CLK_BUFG_BUFGCTRL{slot}_I0.{mux_tile}_CK_MUXED{}",
+            bufg.tile,
+            2 * slot
+        ));
+        // O output mux onto the global clock spine: bottom tile owns
+        // GCLK0..15, the top tile GCLK16..31.
+        let gclk = if top { 16 + slot } else { slot };
+        lines.push(format!(
+            "{}.CLK_BUFG_CK_GCLK{}.CLK_BUFG_BUFGCTRL{}_O",
+            bufg.tile, gclk, slot
+        ));
     }
 
     // RAMB18E1s. Feature path: TILE.RAMB18.<site>.IN_USE. INIT data
@@ -272,6 +289,14 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                 if !pip.is_pseudo {
                     lines.push(format!("{}.{}.{}", pip.tile, pip.dst_wire, pip.src_wire));
                 }
+                // The clock distribution network has a mux/route PIP plus
+                // separate "active"/"enable" bits. A Vivado bitstream sets
+                // both; without the companions the branch is configured but
+                // muted (the exact symptom the original blinky showed).
+                let tile_type = device.tile_type(&pip.tile).unwrap_or_default();
+                for feature in clock_companions(&tile_type, &pip.dst_wire, &pip.src_wire) {
+                    lines.push(format!("{}.{}", pip.tile, feature));
+                }
             }
         }
     }
@@ -282,6 +307,82 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         fasm: lines,
         frames: Vec::new(),
     })
+}
+
+/// Extra configuration features that enable a clock-network branch.
+///
+/// X-Ray models the clock tree as a mux/route PIP *plus* separate
+/// active/enable bits. For example, HROW input `CLK_HROW_CK_IN_L0` also
+/// needs `CLK_HROW_CK_IN_L0_ACTIVE`, and the BUFG rebuffer needs
+/// `GCLK<n>_ENABLE_ABOVE`/`_BELOW`. Vivado sets both halves; a mux without
+/// its companion leaves the branch configured but muted.
+///
+/// Returns feature strings relative to `tile_type`'s tile (no tile prefix).
+fn clock_companions(tile_type: &str, dst: &str, src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if tile_type == "HCLK_CMT" {
+        if src.starts_with("HCLK_CMT_CCIO") {
+            out.push(format!("{src}_ACTIVE"));
+            out.push(format!("{src}_USED"));
+        }
+    } else if tile_type == "CLK_BUFG_REBUF" {
+        if let Some(g) = gclk_index(src).or_else(|| gclk_index(dst)) {
+            out.push(format!("GCLK{g}_ENABLE_ABOVE"));
+            out.push(format!("GCLK{g}_ENABLE_BELOW"));
+        }
+    } else if tile_type.starts_with("CLK_HROW") {
+        if src.starts_with("CLK_HROW_CK_IN_") {
+            out.push(format!("{src}_ACTIVE"));
+        } else if src.starts_with("CLK_HROW_") && src.contains("_CK_GCLK") {
+            out.push(format!("{src}_ACTIVE"));
+        }
+    } else if tile_type == "HCLK_R" {
+        if src.starts_with("HCLK_CK_BUFHCLK") {
+            out.push(format!("ENABLE_BUFFER.{src}"));
+        }
+    }
+    out
+}
+
+/// Numeric index in the first `GCLK<digits>` of `wire`.
+fn gclk_index(wire: &str) -> Option<u32> {
+    let start = wire.find("GCLK")? + "GCLK".len();
+    let digits: String = wire[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// Slot index of a `BUFGCTRL` site within its `CLK_BUFG_{BOT,TOP}_R` tile.
+///
+/// `site` is the tilegrid name: `BUFGCTRL_X0Y0..15` in the bottom tile and
+/// `BUFGCTRL_X0Y16..31` in the top tile. X-Ray's segbits name both tiles'
+/// sites `BUFGCTRL_X0Y0..15`, and number the top tile's GCLKs 16..31.
+/// Returns `(is_top, slot)`.
+fn bufg_slot(site: &str, tile_type: &str) -> Result<(bool, u32), String> {
+    let bad = || format!("emit: bad BUFGCTRL site `{site}` in {tile_type}");
+    let y: u32 = site
+        .rsplit_once('Y')
+        .and_then(|(_, y)| y.parse().ok())
+        .ok_or_else(bad)?;
+    match tile_type {
+        "CLK_BUFG_BOT_R" => {
+            if y < 16 {
+                Ok((false, y))
+            } else {
+                Err(bad())
+            }
+        }
+        "CLK_BUFG_TOP_R" => {
+            if (16..32).contains(&y) {
+                Ok((true, y - 16))
+            } else {
+                Err(bad())
+            }
+        }
+        other => Err(format!("emit: {other} is not a BUFG tile")),
+    }
 }
 
 /// `"A6LUT"` → `"ALUT"`.
@@ -468,6 +569,52 @@ mod tests {
         assert_eq!(lut_bel("A6LUT").unwrap(), "ALUT");
         assert_eq!(lut_bel("D6LUT").unwrap(), "DLUT");
         assert!(lut_bel("X6LUT").is_err());
+    }
+
+    #[test]
+    fn bufg_slot_maps_bottom_and_top() {
+        assert_eq!(bufg_slot("BUFGCTRL_X0Y0", "CLK_BUFG_BOT_R").unwrap(), (false, 0));
+        assert_eq!(bufg_slot("BUFGCTRL_X0Y15", "CLK_BUFG_BOT_R").unwrap(), (false, 15));
+        assert_eq!(bufg_slot("BUFGCTRL_X0Y16", "CLK_BUFG_TOP_R").unwrap(), (true, 0));
+        assert_eq!(bufg_slot("BUFGCTRL_X0Y31", "CLK_BUFG_TOP_R").unwrap(), (true, 15));
+        assert!(bufg_slot("BUFGCTRL_X0Y16", "CLK_BUFG_BOT_R").is_err());
+        assert!(bufg_slot("BUFGCTRL_X0Y0", "CLK_BUFG_TOP_R").is_err());
+    }
+
+    #[test]
+    fn clock_companions_cover_each_stage() {
+        assert_eq!(
+            clock_companions("HCLK_CMT", "", "HCLK_CMT_CCIO0"),
+            vec!["HCLK_CMT_CCIO0_ACTIVE", "HCLK_CMT_CCIO0_USED"]
+        );
+        assert_eq!(
+            clock_companions(
+                "CLK_BUFG_REBUF",
+                "CLK_BUFG_REBUF_R_CK_GCLK0_BOT",
+                "CLK_BUFG_REBUF_R_CK_GCLK0_TOP"
+            ),
+            vec!["GCLK0_ENABLE_ABOVE", "GCLK0_ENABLE_BELOW"]
+        );
+        assert_eq!(
+            clock_companions(
+                "CLK_HROW_BOT_R",
+                "CLK_HROW_CK_MUX_OUT_R0",
+                "CLK_HROW_CK_IN_L0"
+            ),
+            vec!["CLK_HROW_CK_IN_L0_ACTIVE"]
+        );
+        assert_eq!(
+            clock_companions(
+                "CLK_HROW_BOT_R",
+                "CLK_HROW_CK_MUX_OUT_R0",
+                "CLK_HROW_R_CK_GCLK0"
+            ),
+            vec!["CLK_HROW_R_CK_GCLK0_ACTIVE"]
+        );
+        assert_eq!(
+            clock_companions("HCLK_R", "", "HCLK_CK_BUFHCLK0"),
+            vec!["ENABLE_BUFFER.HCLK_CK_BUFHCLK0"]
+        );
     }
 
     #[test]

@@ -173,16 +173,11 @@ fn route_net(
     if external.is_empty() {
         return Ok(RouteKind::SiteInternal);
     }
-    // Clock spine: BUFG-driven nets use the dedicated network.
-    if device.is_clock_net(net) {
-        return Ok(RouteKind::ClockSpine);
-    }
-    // IBUF -> BUFG: dedicated clock input route (no general pip path).
-    let driver_is_ibuf = driver.pin == "I" && driver.site.starts_with("IOB_");
-    let loads_are_bufg = loads.iter().all(|l| l.site.starts_with("BUFGCTRL_"));
-    if driver_is_ibuf && loads_are_bufg {
-        return Ok(RouteKind::ClockSpine);
-    }
+    // Clock nets are not free: the spine is a real chain of PIPs
+    // (IOI/HCLK_CMT -> BUFG_REBUF -> HROW -> INT CLK -> slice CLK), with
+    // per-stage active/enable bits that emit.rs adds alongside each PIP.
+    // Returning `ClockSpine` here (the old behaviour) left the FFs without
+    // a clock even when the BUFG itself was configured correctly.
     // Route to external loads via pips. (Internal loads are site-local.)
     let external_loads: Vec<&Endpoint> = external.into_iter().copied().collect();
     let _ = internal; // site-internal loads need no pips

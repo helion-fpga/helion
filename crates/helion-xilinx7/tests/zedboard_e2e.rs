@@ -62,19 +62,6 @@ impl TilegridLayout {
         Some(TilegridLayout { tiles })
     }
 
-    fn all_addresses(&self) -> Vec<u32> {
-        let mut addrs = Vec::new();
-        for tile in self.tiles.values() {
-            for (geom, frames) in tile.blocks.values() {
-                for i in 0..*frames {
-                    addrs.push(geom.baseaddr + i);
-                }
-            }
-        }
-        addrs.sort();
-        addrs.dedup();
-        addrs
-    }
 }
 
 impl TileBitLayout for TilegridLayout {
@@ -263,6 +250,10 @@ fn zedboard_e2e_bitstream() {
     sites.dedup();
     assert_eq!(sites.len(), placed.iobs.len(), "duplicate IOB sites");
     println!("place: {} iobs on distinct sites", placed.iobs.len());
+    println!("place: {} ffs", placed.ffs.len());
+    for ff in &placed.ffs {
+        println!("  ff {} -> {}.{}", ff.name, ff.tile, ff.site);
+    }
 
     // Verify each led IOB landed on the DB site for its PACKAGE_PIN.
     let mut pin_site: HashMap<String, String> = HashMap::new();
@@ -301,6 +292,12 @@ fn zedboard_e2e_bitstream() {
     let fasm_text = bs.fasm.join("\n");
     assert!(fasm_text.contains(".ALUT.INIT[63:0]"), "missing LUT INIT");
     println!("FASM: {} lines", bs.fasm.len());
+    std::fs::write("/tmp/x7/zedboard_blinky.fasm", &fasm_text).ok();
+    for l in &bs.fasm {
+        if l.contains("CLK") || l.contains("BUFG") || l.contains("HROW") {
+            println!("  clock: {l}");
+        }
+    }
 
     // FASM -> frames.
     let lines = parse_fasm(&fasm_text).expect("parse our FASM");
@@ -323,7 +320,10 @@ fn zedboard_e2e_bitstream() {
             skipped.len()
         );
     }
-    let mut store = FrameStore::new(&layout.all_addresses());
+    // Every valid frame, not the tilegrid union: the FDRI stream is
+    // contiguous and omitting a frame shifts all later frames.
+    let mut store = FrameStore::for_part(device.part()).expect("frame store");
+    assert_eq!(store.frame_count(), 9_996, "xc7z020 has 9996 frames");
     let applied = store.apply_fasm(&lines, &segbits, &layout).expect("apply FASM");
     assert!(applied > 0, "no FASM features applied");
     println!("applied {applied} FASM features");
