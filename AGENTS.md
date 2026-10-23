@@ -54,4 +54,39 @@ Clock nets are real pip routes, not free: route the spine (IOI/HCLK_CMT → BUFG
 
 `clock_companions` is a hand-written table and has been wrong twice; two of the four stages we model were missing bits. Prefer deriving companions from the DB the way pips are derived. Check with `python3 scripts/clkdiff.py <ours.bit>` -- it diffs the whole spine against `~/CDA4253_A1/blinky.bit` and prints features MISSING vs Vivado. Note prjxray silently drops unmatched FASM lines, so a clean assemble proves self-consistency only.
 
+### FF configuration: two bits per flop, and both are mandatory
+
+A slice FF is configured by exactly two segbits: `AFF.ZINI` (the power-up INIT
+value) and `AFF.ZRST` (SRVAL, the value taken on set/reset). Emit **both** for
+every FF, unconditionally. Emitting `ZRST` only when the FF has an `SR` net is
+wrong: with `ZRST` clear SRVAL defaults to **1**, so a register that inits to 0
+powers up as a constant 1 -- the LED lights and never blinks, which looks
+exactly like a dead clock and sends you hunting the clock network instead. This
+cost a full investigation; the census that catches it is ZRST count == ZINI
+count across CLB tiles.
+
+`AFFMUX` selects what drives the flop and the choices are not interchangeable:
+`O6` is the LUT6 output (the normal LUT->FF path), `O5` the LUT5 output, `XOR`
+LUT6^LUT5 for carry/adder logic, and `AX`/`BX`/`CX`/`DX` the **raw slice input
+pins**, which bypass the LUT. A LUT-fed flop must use `O6`; selecting `AX`
+leaves D undriven because nothing connects to that pin.
+
+### Instrumentation: decode, do not diff FASM text
+
+`scripts/bitdiff.py` compares FASM *lines* and reports phantom misses (it
+claimed `CLK_BUFG_REBUF.GCLK0_ENABLE_ABOVE/BELOW` were absent when decoding the
+tile showed both present). Use `work/vbits.py`, which decodes both bitstreams
+through the segbits DB and compares feature sets per tile; `work/spine_tiles.json`
+lists the spine tiles. For the netlist itself, `work/sim3.py` simulates HNF and
+verifies synthesis independently of the bitstream -- settle combinational logic
+to a **fixpoint** before sampling or it reports false "STATIC" verdicts.
+
+### Output pads come only from `assign`
+
+The IOB pass walks `rtl.assigns`, so an output port driven **directly** by an
+always block gets no pad unless it is handled explicitly (registered-output
+ports are now emitted before the single-output fallback). The fallback itself
+only fires for a design with exactly one output port, so multi-output designs
+silently lost every pad and reported `IO=0` while `done=1`.
+
 IOB relative site names are top-down: the upper IOB in a tile is `IOB_Y0` (see `XDevice::site_rel`). An output IOB's fabric entry is NOT `site.O` -- that is the pad side of the OBUF, and routing to it lands on a neighbouring tile's IMUX. Use `RouteQuery::iob_output_sink`, which resolves the OLOGIC's `D1` input. For LED0 (T22) the entry is `INT_R_X73Y46.IMUX34`, one tile north of the pad's own tile.
