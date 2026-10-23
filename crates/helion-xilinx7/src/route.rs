@@ -122,6 +122,7 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     let ff_bel: HashMap<&str, &str> = placed.ffs.iter().map(|f| (f.name.as_str(), f.bel.as_str())).collect();
     let iob_site: HashMap<&str, &str> = placed.iobs.iter().map(|i| (i.name.as_str(), i.site.as_str())).collect();
     let bufg_site: HashMap<&str, &str> = placed.bufgs.iter().map(|b| (b.name.as_str(), b.site.as_str())).collect();
+    let carry_site: HashMap<&str, &str> = placed.carries.iter().map(|c| (c.name.as_str(), c.site.as_str())).collect();
 
     for lut in &packed.luts {
         let site = lut_site.get(lut.name.as_str()).copied().unwrap_or("");
@@ -146,6 +147,51 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
             eprintln!("TRACE_CLK: ff {} clk_net={} site={}", ff.name, ff.clk_net, site);
         }
         add_ep(ff.clk_net.clone(), site.to_string(), "CLK", false);
+    }
+    // Carry chains.
+    //
+    // Without this arm the chain is configured but UNCONNECTED: the lane sums
+    // are known to the router only as flip-flop `D` sinks, nothing declares
+    // them as CARRY4 outputs, and the six `COUT` -> `CIN` nets never enter the
+    // router at all. The result is a bitstream with a correct clock, a correct
+    // pad path and a fully configured carry chain whose LUT inputs are
+    // undriven -- the flops are clocked and latch a constant, so the LED
+    // lights instead of blinking.
+    //
+    // The intra-slice nets need no special handling here: `route_net` already
+    // returns `RouteKind::SiteInternal` when the driver and every load share a
+    // site, and `route_wires` gives that no pips and no occupancy. A chain
+    // placed in one column therefore has its `COUT` -> `CIN` recognised as the
+    // dedicated carry column it is, rather than being sent through the fabric
+    // on a path the hardware does not use.
+    for carry in &packed.carries {
+        let site = carry_site.get(carry.name.as_str()).copied().unwrap_or("");
+        if site.is_empty() {
+            // Unplaced carry: nothing to anchor endpoints to. Placement
+            // refuses such a chain long before here; skip rather than invent
+            // a site that would silently absorb the net.
+            continue;
+        }
+        for (lane, sum) in carry.lane_sum_net.iter().enumerate() {
+            let Some(sum) = sum else { continue };
+            // The CARRY4 lane outputs `O0..O3` drive the sum net.
+            add_ep(sum.clone(), site.to_string(), &format!("O{lane}"), true);
+            // That same lane's `S` LUT reads its operand on the slice input
+            // pin, which is what the router must reach. The pin letters match
+            // the BEL letters the emitter writes (`AS`..`DS`).
+            let letter = ["A", "B", "C", "D"][lane];
+            if let Some((a, b)) = &carry.lane_operands[lane] {
+                for net in [a, b].into_iter().flatten() {
+                    add_ep(net.clone(), site.to_string(), &format!("{letter}S"), false);
+                }
+            }
+        }
+        if let Some(cout) = &carry.cout_net {
+            add_ep(cout.clone(), site.to_string(), "COUT", true);
+        }
+        if let Some(cin) = &carry.cin_net {
+            add_ep(cin.clone(), site.to_string(), "CIN", false);
+        }
     }
     for iob in &packed.iobs {
         let site = iob_site.get(iob.name.as_str()).copied().unwrap_or("");
