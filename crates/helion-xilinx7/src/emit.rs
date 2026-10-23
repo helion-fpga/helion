@@ -1129,6 +1129,21 @@ mod tests {
             clock_companions("HCLK_CMT", "", "HCLK_CMT_CCIO0"),
             vec!["HCLK_CMT_CCIO0_ACTIVE", "HCLK_CMT_CCIO0_USED"]
         );
+        // `HCLK_CMT_L` is a distinct tile type and there are three of them on
+        // an xc7z020 against one `HCLK_CMT`. Vivado routes the ZedBoard clock
+        // through the L variant, so an untested branch here is the one most
+        // likely to be wrong in the field.
+        assert_eq!(
+            clock_companions("HCLK_CMT_L", "", "HCLK_CMT_CCIO0"),
+            vec!["HCLK_CMT_CCIO0_ACTIVE", "HCLK_CMT_CCIO0_USED"],
+            "HCLK_CMT_L must emit the same CCIO companions as HCLK_CMT"
+        );
+        // Both CCIO arms are numbered independently, so check the second one
+        // too rather than trusting index 0 to generalise.
+        assert_eq!(
+            clock_companions("HCLK_CMT_L", "", "HCLK_CMT_CCIO6"),
+            vec!["HCLK_CMT_CCIO6_ACTIVE", "HCLK_CMT_CCIO6_USED"]
+        );
         assert_eq!(
             clock_companions(
                 "CLK_BUFG_REBUF",
