@@ -27,6 +27,27 @@ pub trait DeviceQuery {
     fn tile_xy(&self, tile: &str) -> Option<(i32, i32)>;
     /// A free SLICEL site near `(x, y)`; `used` holds taken site names.
     fn slice_near(&self, x: i32, y: i32, used: &HashSet<String>) -> Option<(String, String)>;
+
+    /// All slice sites on the device: `(tile, site)`.
+    ///
+    /// Needed to find a legal carry column: a chain has to be placed as a run of
+    /// adjacent rows in one column, which cannot be discovered by probing single
+    /// sites one at a time.
+    fn slices(&self) -> Vec<(String, String)>;
+
+    /// The CARRY4 column a slice belongs to, and its position in that column.
+    ///
+    /// A carry chain is a hard *vertical* constraint: `CIN`/`COUT` are dedicated
+    /// intra-column routes, so a chain's elements must sit in adjacent rows of
+    /// one slice column. Callers need to know which slices are neighbours before
+    /// they can honour that, and the answer is device-specific (the numbers in a
+    /// tile name are not grid coordinates).
+    ///
+    /// Returns `(column_key, row)` where a larger `row` is further up the
+    /// device, and `column_key` is stable within a device: two slices are
+    /// vertically adjacent iff they share a `column_key` and differ by 1 in
+    /// `row`. Returns `None` for a site the model does not know.
+    fn slice_column(&self, tile: &str, site: &str) -> Option<(i64, i32)>;
 }
 
 /// A placed LUT: tile + slice site + BEL.
@@ -108,6 +129,75 @@ pub struct Placed7 {
 /// BEL letters within a slice: A, B, C, D.
 const BEL_LETTERS: [char; 4] = ['A', 'B', 'C', 'D'];
 
+/// Find `len` free slices in one column, in `len` consecutive rows, ordered
+/// bottom-up (element `k` is the `k`-th row above the run's base).
+///
+/// This is the physical requirement for a CARRY4 chain: `COUT` of one slice
+/// feeds `CIN` of the slice directly above it through a dedicated intra-column
+/// route, so the elements must be *adjacent rows of one column*, not merely
+/// "some free slices". Returns `None` when no column can supply such a run --
+/// the caller turns that into an error rather than splitting the chain.
+///
+/// Columns are offered nearest-first to the anchor so a chain lands close to the
+/// rest of the design; within a column the lowest suitable run wins so the
+/// choice is deterministic.
+fn column_run(
+    device: &dyn DeviceQuery,
+    ax: i32,
+    ay: i32,
+    used: &HashSet<String>,
+    len: usize,
+) -> Option<Vec<(String, String)>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    // Every slice in the device, grouped by column.
+    let mut by_col: HashMap<i64, Vec<(i32, String, String)>> = HashMap::new();
+    for (tile, site) in device.slices() {
+        if let Some((col, row)) = device.slice_column(&tile, &site) {
+            by_col.entry(col).or_default().push((row, tile, site));
+        }
+    }
+    // Columns nearest the anchor first; the column key breaks ties so the
+    // choice is deterministic.
+    let mut cols: Vec<i64> = by_col.keys().copied().collect();
+    cols.sort_by_key(|c| {
+        let dy = by_col[c]
+            .iter()
+            .map(|(r, _, _)| (*r - ay).abs())
+            .min()
+            .unwrap_or(i32::MAX);
+        (dy + (c - ax as i64).unsigned_abs() as i32, *c)
+    });
+
+    for col in cols {
+        let mut rows = by_col.remove(&col).unwrap_or_default();
+        rows.sort_by_key(|(r, _, _)| *r);
+        // Walk ascending rows looking for `len` consecutive free ones.
+        let mut i = 0;
+        while i < rows.len() {
+            let start = i;
+            let mut j = i;
+            while j + 1 < rows.len()
+                && rows[j + 1].0 == rows[j].0 + 1
+                && !used.contains(&rows[j + 1].2)
+            {
+                j += 1;
+            }
+            if !used.contains(&rows[start].2) && j + 1 - start >= len {
+                return Some(
+                    rows[start..start + len]
+                        .iter()
+                        .map(|(_, t, s)| (t.clone(), s.clone()))
+                        .collect(),
+                );
+            }
+            i = j + 1;
+        }
+    }
+    None
+}
+
 /// Place packed cells onto device sites.
 ///
 /// Errors loudly when a required site class is missing (no silent drops).
@@ -179,19 +269,59 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         });
     }
 
-    // 2d. CARRY4s. Placed in SLICE sites; the carry chain connects
-    // vertically within the column. Minimal: place on free slices.
+    // 2d. CARRY4s. A carry chain is a hard *vertical* constraint: CIN/COUT are
+    // dedicated intra-column routes, so the four bits of one CARRY4 share a
+    // slice and successive elements must sit in ADJACENT rows of ONE column.
+    // Scattering them (the old `slice_near` loop) would route a COUT to a CIN
+    // that is not physically next to it, and the chain would be silently wrong.
+    //
+    // Chains are placed one at a time; a chain that cannot get a contiguous run
+    // of free slices in a single column is an ERROR, not a fallback to a
+    // scattered placement, because a split chain cannot be made correct by
+    // routing alone.
     let (ax, ay) = anchor.unwrap_or((0, 0));
-    for carry in &packed.carries {
-        let (tile, site) = device
-            .slice_near(ax, ay, &used_sites)
-            .ok_or_else(|| format!("place: no SLICE site for CARRY4 {}", carry.name))?;
-        used_sites.insert(site.clone());
-        out.carries.push(PlacedCarry {
-            name: carry.name.clone(),
-            tile,
-            site,
-        });
+    if !packed.carries.is_empty() {
+        // Group elements by chain id, preserving their first-seen order.
+        let mut chain_order: Vec<String> = Vec::new();
+        let mut chains: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, c) in packed.carries.iter().enumerate() {
+            chains
+                .entry(c.chain.clone())
+                .or_insert_with(|| {
+                    chain_order.push(c.chain.clone());
+                    Vec::new()
+                })
+                .push(i);
+        }
+        for chain in &chain_order {
+            // LSB element first: element `k` sits `k` rows above the base, so
+            // each element's COUT reaches the next element's CIN (the chain
+            // runs upward through the column).
+            let mut ordered = chains[chain].clone();
+            ordered.sort_by_key(|&i| packed.carries[i].index);
+            let len = ordered.len();
+            let run = column_run(device, ax, ay, &used_sites, len).ok_or_else(|| {
+                format!(
+                    "place: no free slice column with {len} contiguous rows for \
+                     CARRY4 chain `{chain}` (elements: {}). A carry chain cannot \
+                     be split across columns; reduce the chain or free a column.",
+                    ordered
+                        .iter()
+                        .map(|&i| packed.carries[i].name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            for (k, &i) in ordered.iter().enumerate() {
+                let (tile, site) = run[k].clone();
+                used_sites.insert(site.clone());
+                out.carries.push(PlacedCarry {
+                    name: packed.carries[i].name.clone(),
+                    tile,
+                    site,
+                });
+            }
+        }
     }
 
     // 3. Pair FFs with their driving LUTs (FF.D == LUT.O) into one slice.
@@ -309,6 +439,22 @@ mod tests {
             }
             None
         }
+        fn slices(&self) -> Vec<(String, String)> {
+            // Two columns so a chain has somewhere to go, and so a test can tell
+            // "one column, adjacent rows" apart from "any free slices".
+            let mut v = Vec::new();
+            for x in [0, 1] {
+                for y in 0..20 {
+                    v.push((format!("CLB_X{x}Y{y}"), format!("SLICE_X{x}Y{y}")));
+                }
+            }
+            v
+        }
+        fn slice_column(&self, _tile: &str, site: &str) -> Option<(i64, i32)> {
+            let rest = site.strip_prefix("SLICE_X")?;
+            let (c, r) = rest.split_once('Y')?;
+            Some((c.parse().ok()?, r.parse().ok()?))
+        }
     }
 
     fn packed_blinky() -> Packed7 {
@@ -382,5 +528,107 @@ mod tests {
         p.iobs[0].loc = Some("Z99".into());
         let err = place(&p, &FakeDevice).unwrap_err();
         assert!(err.contains("Z99"), "got: {err}");
+    }
+
+    /// A 7-element carry chain must land in **7 adjacent rows of one column**,
+    /// ordered bottom-up. This is the physical CARRY4 requirement: `COUT` feeds
+    /// the `CIN` of the slice directly above, so a scattered placement (which
+    /// the old `slice_near` loop produced) would be silently wrong.
+    #[test]
+    fn carry_chain_places_as_a_contiguous_column() {
+        let mut p = packed_blinky();
+        p.carries = (0..7)
+            .map(|i| {
+                let mut c = crate::pack::PackedCarry::empty(format!("u_c4_{i}"));
+                c.chain = "q_inc".into();
+                c.index = i;
+                c.chain_len = 7;
+                c
+            })
+            .collect();
+        let placed = place(&p, &FakeDevice).unwrap();
+        assert_eq!(placed.carries.len(), 7);
+
+        // Every element in the same column...
+        let cols: Vec<i64> = placed
+            .carries
+            .iter()
+            .map(|c| FakeDevice.slice_column(&c.tile, &c.site).unwrap().0)
+            .collect();
+        assert!(
+            cols.windows(2).all(|w| w[0] == w[1]),
+            "chain spans more than one column: {cols:?}"
+        );
+
+        // ...in rows 0..7, each exactly one above the last. `placed.carries` is
+        // emitted in `index` order, so the rows must ascend.
+        let rows: Vec<i32> = placed
+            .carries
+            .iter()
+            .map(|c| FakeDevice.slice_column(&c.tile, &c.site).unwrap().1)
+            .collect();
+        assert_eq!(
+            rows,
+            (0..7).collect::<Vec<_>>(),
+            "chain rows must be 7 consecutive ascending rows in one column"
+        );
+        // Distinct slices: one element per row, not stacked.
+        let sites: HashSet<&str> = placed.carries.iter().map(|c| c.site.as_str()).collect();
+        assert_eq!(sites.len(), 7, "each chain element needs its own slice");
+    }
+
+    /// Two independent chains must not be given the same slices.
+    #[test]
+    fn two_chains_do_not_share_slices() {
+        let mut p = packed_blinky();
+        p.carries = (0..2)
+            .flat_map(|ch| {
+                (0..3).map(move |i| {
+                    let mut c = crate::pack::PackedCarry::empty(format!("u_c{ch}_{i}"));
+                    c.chain = format!("chain{ch}");
+                    c.index = i;
+                    c.chain_len = 3;
+                    c
+                })
+            })
+            .collect();
+        let placed = place(&p, &FakeDevice).unwrap();
+        let sites: HashSet<&str> = placed.carries.iter().map(|c| c.site.as_str()).collect();
+        assert_eq!(sites.len(), 6, "chains must not overlap slices");
+        for ch in 0..2 {
+            let name = format!("chain{ch}");
+            let mut rows: Vec<i32> = placed
+                .carries
+                .iter()
+                .filter(|c| c.name.starts_with(&format!("u_c{ch}_")))
+                .map(|c| FakeDevice.slice_column(&c.tile, &c.site).unwrap().1)
+                .collect();
+            rows.sort_unstable();
+            assert!(
+                rows.windows(2).all(|w| w[1] == w[0] + 1),
+                "{name} is not contiguous: {rows:?}"
+            );
+        }
+    }
+
+    /// A chain longer than any free column must fail loudly, not be scattered.
+    #[test]
+    fn unplaceable_chain_fails_loudly() {
+        let mut p = packed_blinky();
+        p.carries = (0..50)
+            .map(|i| {
+                let mut c = crate::pack::PackedCarry::empty(format!("u_c4_{i}"));
+                c.chain = "huge".into();
+                c.index = i;
+                c.chain_len = 50;
+                c
+            })
+            .collect();
+        let err = place(&p, &FakeDevice).unwrap_err();
+        assert!(err.contains("huge"), "error must name the chain: {err}");
+        assert!(
+            err.contains("contiguous"),
+            "error must explain the column constraint: {err}"
+        );
     }
 }
