@@ -524,14 +524,27 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     //
     // A CARRY4 is configured by three things, and all three are mandatory:
     //
-    //   1. `CARRY4.{A,B,C,D}CY0` -- the per-lane propagate mux that lets the
-    //      slice's `O6` drive that lane's `S` input. Without it the lane's
-    //      propagate term is not connected and the carry dies mid-slice.
-    //   2. `PRECYINIT.{C0,C1,CIN}` -- where the chain's initial carry comes
-    //      from. This is a 4-way MUTUALLY EXCLUSIVE mux (note the `!` polarity
-    //      bits in the DB), not independent flags, so exactly one arm is
-    //      emitted. Leaving it unset leaves the chain entry undefined and the
-    //      sums silently wrong.
+    //   1. `CARRY4.{A,B,C,D}CY0` -- the per-lane carry mux. In the site model
+    //      (`site_type_SLICEL.json`) this is a 2-way mux per lane selecting
+    //      between the raw slice pin (`AX`/`BX`/`CX`/`DX`) and `O5`: it is NOT
+    //      a "force carry-in to 0" control. Only the lane that actually starts
+    //      the chain takes the pin; every other lane ripples from the lane
+    //      below. Asserting it on all four lanes of every element -- which this
+    //      emitter used to do -- configures lanes the chain never uses and
+    //      diverges from Vivado on 3 bits per element.
+    //   2. `PRECYINIT.{C0,C1,AX,CIN}` -- the CHAIN's carry-in. This is a 4-way
+    //      MUTUALLY EXCLUSIVE mux, not independent flags.
+    //        * On the chain ENTRY the carry-in is a constant or the `AX` pin,
+    //          so the arm follows the cell's `cyinit`: `0` -> `C0`, `1` -> `C1`.
+    //        * On every LATER element the carry-in arrives on the dedicated
+    //          column route from the previous element's `COUT`, which is the
+    //          `CIN` arm.
+    //      Emitting NOTHING for a later element is the bug this code used to
+    //      have: the omitted bits read back as the reset default `C0`, which
+    //      ties that element's carry-in to constant 0 and severs the column
+    //      route. Each CARRY4 then counts from 0 on its own, so a 25-bit
+    //      counter silently becomes seven independent 4-bit counters. The
+    //      default arm is *not* "leave it alone": C0 is a real, wrong choice.
     //   3. The FF that consumes a sum bit must select the carry path
     //      (`AFFMUX = XOR`), handled in `mux_for_ff`.
     //
@@ -547,28 +560,33 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         let site_rel = device
             .site_rel(&carry.tile, &carry.site)
             .ok_or_else(|| format!("emit: no rel site for {} {}", carry.tile, carry.site))?;
-        // Every lane gets its propagate mux: a lane whose `S` is unconnected
-        // still passes the carry through, but the chain must be configured for
-        // the lanes that are used, and emitting all four matches Vivado.
-        for lane in ["A", "B", "C", "D"] {
-            lines.push(format!("{}.{}.CARRY4.{lane}CY0", carry.tile, site_rel));
+        // The carry mux. Only the element that STARTS the chain takes its
+        // lane-A carry from the slice pin; every other lane, and every lane of
+        // a later element, ripples. `index` is the element's position in its
+        // chain, so `index == 0` identifies the entry unambiguously.
+        let is_chain_entry = pc.index == 0;
+        if is_chain_entry {
+            lines.push(format!("{}.{}.CARRY4.ACY0", carry.tile, site_rel));
         }
-        // The chain entry. Only the first element of a chain has `cyinit`;
-        // every later element is fed by the previous element's COUT through the
-        // dedicated column route, which needs no PRECYINIT select.
-        if let Some(ci) = &pc.cyinit {
-            let arm = match ci.as_str() {
-                "0" => "C0",
-                "1" => "C1",
-                other => {
-                    return Err(format!(
-                        "emit: CARRY4 {} has cyinit `{other}`, expected `0` or `1`",
-                        carry.name
-                    ))
-                }
-            };
-            lines.push(format!("{}.{}.PRECYINIT.{arm}", carry.tile, site_rel));
-        }
+        // The chain's carry-in. The entry element uses the constant/`AX` arm
+        // selected by `cyinit`; every later element must explicitly select the
+        // `CIN` arm, because the reset default (`C0`) would tie its carry-in to
+        // 0 and break the inter-element column route.
+        let arm = match (is_chain_entry, pc.cyinit.as_deref()) {
+            (true, Some("0")) => "C0",
+            (true, Some("1")) => "C1",
+            (true, Some(other)) => {
+                return Err(format!(
+                    "emit: CARRY4 {} has cyinit `{other}`, expected `0` or `1`",
+                    carry.name
+                ))
+            }
+            // An entry with no recorded `cyinit` is a chain of one whose
+            // carry-in is irrelevant; `C0` is the safe, Vivado-matching arm.
+            (true, None) => "C0",
+            (false, _) => "CIN",
+        };
+        lines.push(format!("{}.{}.PRECYINIT.{arm}", carry.tile, site_rel));
     }
 
     // Routing pips: TILE.DST.SRC. Pseudo-pips are always-on hard
@@ -1688,16 +1706,22 @@ mod tests {
         assert!(err.contains("DSP48E1"), "error must name the primitive: {err}");
     }
 
-    /// A configured CARRY4 must emit its four propagate muxes plus exactly one
-    /// PRECYINIT arm. `PRECYINIT` is a 4-way mutually exclusive mux, so emitting
-    /// two arms would drive the same bits from two sources and prjxray rejects
-    /// the bitstream; emitting none leaves the chain entry undefined.
+    /// A configured CARRY4 chain entry must emit its lane-A carry mux plus the
+    /// PRECYINIT arm its `cyinit` selects. `PRECYINIT` is a 4-way mutually
+    /// exclusive mux, so emitting two arms would drive the same bits from two
+    /// sources and prjxray rejects the bitstream.
+    ///
+    /// The entry emits `ACY0` only. The old emitter emitted all four `{A..D}CY0`
+    /// and claimed that matched Vivado; decoding the real Vivado blinky shows
+    /// the entry sets `ACY0` alone, because the mux selects one lane's carry
+    /// source rather than gating every lane.
     #[test]
     fn emit_writes_carry4_muxes_and_one_precyinit_arm() {
         use crate::pack::PackedCarry;
         use crate::place::PlacedCarry;
         let mut pc = PackedCarry::empty("u_carry");
         pc.chain = "c".into();
+        pc.index = 0;
         pc.chain_len = 1;
         pc.cyinit = Some("1".into());
         let packed = Packed7 {
@@ -1726,10 +1750,16 @@ mod tests {
         let routed = Routed7 { placed, nets: vec![] };
         let bs = emit_fasm(&routed, &FakeEmit).expect("a configured CARRY4 must emit");
         let fasm = bs.fasm.join("\n");
-        for lane in ["A", "B", "C", "D"] {
+        assert!(
+            fasm.contains("CARRY4.ACY0"),
+            "the chain entry takes lane A from the slice pin:\n{fasm}"
+        );
+        // Only the entry lane. A later lane's carry ripples from the lane below,
+        // so configuring it as a pin-fed mux is wrong.
+        for lane in ["B", "C", "D"] {
             assert!(
-                fasm.contains(&format!("CARRY4.{lane}CY0")),
-                "missing {lane}CY0 propagate mux:\n{fasm}"
+                !fasm.contains(&format!("CARRY4.{lane}CY0")),
+                "lane {lane} must ripple, not take a pin:\n{fasm}"
             );
         }
         // The `+1` chain entry.
@@ -1743,10 +1773,19 @@ mod tests {
         }
     }
 
-    /// A chain element past the first is fed by CIN and must NOT emit a
-    /// PRECYINIT arm (which would fight the column route).
+    /// A chain element past the first is fed by the previous element's `COUT`
+    /// over the dedicated column route, so it must select `PRECYINIT.CIN`.
+    ///
+    /// This is the regression that froze the LED. The old emitter omitted
+    /// PRECYINIT entirely for chained elements and the test asserted that
+    /// omission. But omitted bits read back as the reset default `C0`, which
+    /// ties the element's carry-in to constant 0 and severs the column route:
+    /// each CARRY4 then counts from 0 on its own, so a 25-bit counter becomes
+    /// seven 4-bit counters. The netlist is still correct, which is why a
+    /// netlist-level simulation (work/sim3.py) kept passing while the bitstream
+    /// was wrong.
     #[test]
-    fn emit_omits_precyinit_for_chained_elements() {
+    fn emit_selects_cin_for_chained_elements() {
         use crate::pack::PackedCarry;
         use crate::place::PlacedCarry;
         let mut pc = PackedCarry::empty("u_carry1");
@@ -1771,10 +1810,16 @@ mod tests {
         let routed = Routed7 { placed, nets: vec![] };
         let bs = emit_fasm(&routed, &FakeEmit).expect("chained element must emit");
         let fasm = bs.fasm.join("\n");
-        assert!(fasm.contains("CARRY4.ACY0"), "propagate muxes still needed");
         assert!(
-            !fasm.contains("PRECYINIT"),
-            "a chained element takes its carry from CIN, not PRECYINIT:\n{fasm}"
+            fasm.contains("PRECYINIT.CIN"),
+            "a chained element takes its carry from the column route:\n{fasm}"
         );
+        assert!(
+            !fasm.contains("CARRY4.ACY0"),
+            "a chained element is not the chain entry:\n{fasm}"
+        );
+        for arm in ["PRECYINIT.C0", "PRECYINIT.C1", "PRECYINIT.AX"] {
+            assert!(!fasm.contains(arm), "PRECYINIT arms are exclusive, saw {arm}");
+        }
     }
 }
