@@ -15,6 +15,7 @@
 
 pub mod backend;
 pub mod bitstream;
+pub mod build;
 pub mod db;
 pub mod device;
 pub mod emit;
@@ -24,6 +25,7 @@ pub mod frames;
 pub mod pack;
 pub mod place;
 pub mod route;
+pub mod tilegrid;
 pub mod timing;
 pub mod xdevice;
 pub use xdevice::{build_node_map, XDevice};

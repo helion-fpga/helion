@@ -185,7 +185,109 @@ fn resolve_port(netlist: &Design, pad: &str, cell_name: &str) -> String {
     if netlist.ports.iter().any(|p| p.name == cell_name) {
         return cell_name.to_string();
     }
+    // A bit-qualified pad net (`led_0`, emitted one per output bit) resolves to
+    // its port by stripping the bit suffix; without this the port lookup would
+    // fail and the IOB would lose its LOC.
+    if let Some(base) = strip_bit_suffix(pad) {
+        if netlist.ports.iter().any(|p| p.name == base) {
+            return base.to_string();
+        }
+    }
+    // `pad[0]` style, written by sources that declare separate bit ports.
+    if let Some(open) = pad.find('[') {
+        let base = &pad[..open];
+        if netlist.ports.iter().any(|p| p.name == base) {
+            return base.to_string();
+        }
+    }
     pad.to_string()
+}
+
+/// `led_3` -> `led`, when the tail is a bit index and the base is non-empty.
+fn strip_bit_suffix(net: &str) -> Option<&str> {
+    let idx = net.rfind('_')?;
+    let (base, tail) = net.split_at(idx);
+    let digits = &tail[1..];
+    if base.is_empty() || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(base)
+}
+
+/// Resolve the `LOC` / `IOSTANDARD` (etc.) attribute for one IOB.
+///
+/// An XDC constrains the individual bits of a vector port, writing
+/// `set_property PACKAGE_PIN T22 [get_ports {led[0]}]`. A vector output is
+/// packed as one IOB per bit, but every one of those IOBs resolves its port to
+/// the same vector name `led`, so a plain `ports[led].LOC` lookup finds nothing
+/// and placement then refuses the design with "has no PACKAGE_PIN LOC".
+///
+/// The per-bit key is recovered from the IOB's own net: `helion-sv` names the
+/// pad net for output bit `n` as `<port>[<n>]` or `<port>_<n>`, and the port's
+/// `LOC` may itself carry a whole-vector value. Try, in order: the bit-qualified
+/// port name, the bit-qualified net name, then the plain port name (which also
+/// covers the scalar and single-bit cases).
+fn port_attr<'a>(
+    netlist: &'a Design,
+    port: &str,
+    net: &str,
+    cell_name: &str,
+    attr: &str,
+) -> Option<&'a str> {
+    let get = |name: &str| -> Option<&'a str> {
+        netlist
+            .ports
+            .iter()
+            .find(|p| p.name == name)
+            .and_then(|p| p.attrs.get(attr))
+    };
+    // `PinConstraints::apply` stores a bit-qualified constraint as `LOC[3]`
+    // on the vector port, so look for that key on the resolved port too.
+    let bit = bit_suffix(net.rsplit('/').next().unwrap_or(net));
+    if let Some(b) = bit {
+        if let Some(p) = netlist.ports.iter().find(|p| p.name == port) {
+            if let Some(v) = p.attrs.get(&format!("{attr}[{b}]")) {
+                return Some(v);
+            }
+        }
+    }
+    // A port literally named `led[0]` (helion-sv splits vectors this way when
+    // the source declares separate bits).
+    let net_name = net.rsplit('/').next().unwrap_or(net);
+    for candidate in [
+        net_name.to_string(),
+        net_name.replace('.', "[").trim_end_matches(']').to_string(),
+        format!("{port}[{}]", bit_suffix(net_name).unwrap_or(u32::MAX)),
+        cell_name.to_string(),
+    ] {
+        if candidate.ends_with("[4294967295]") {
+            continue;
+        }
+        if let Some(v) = get(&candidate) {
+            return Some(v);
+        }
+    }
+    get(port)
+}
+
+/// Trailing integer of a net name, e.g. `led_3` or `led[3]` -> `3`.
+fn bit_suffix(net: &str) -> Option<u32> {
+    if let Some(open) = net.rfind('[') {
+        if let Some(close) = net[open..].find(']') {
+            if let Ok(n) = net[open + 1..open + close].parse() {
+                return Some(n);
+            }
+        }
+    }
+    let tail: String = net
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    tail.parse().ok()
 }
 
 pub fn pack(netlist: &Design) -> Result<Packed7, String> {
@@ -251,16 +353,18 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                     .unwrap_or(&cell.name)
                     .to_string();
                 let port = resolve_port(netlist, &pad, &cell.name);
-                let port_def = netlist.ports.iter().find(|p| p.name == port);
                 out.iobs.push(PackedIob {
                     name: cell.name.clone(),
-                    loc: port_def.and_then(|p| p.attrs.get("LOC").map(|s| s.to_string())),
-                    iostandard: port_def
-                        .and_then(|p| p.attrs.get("IOSTANDARD"))
-                        .map(|s| s.to_string())
+                    // The PAD net, not the driver: for a vector output it is
+                    // bit-qualified (`led_0`), which is what identifies the
+                    // `LOC[0]` constraint. The driver net (`cnt_26`) says
+                    // nothing about which pin this IOB owns.
+                    loc: port_attr(netlist, &port, &pad, &cell.name, "LOC").map(str::to_string),
+                    iostandard: port_attr(netlist, &port, &pad, &cell.name, "IOSTANDARD")
+                        .map(str::to_string)
                         .unwrap_or_else(|| "LVCMOS33".to_string()),
-                    drive: port_def.and_then(|p| p.attrs.get("DRIVE").map(|s| s.to_string())),
-                    slew: port_def.and_then(|p| p.attrs.get("SLEW").map(|s| s.to_string())),
+                    drive: port_attr(netlist, &port, &pad, &cell.name, "DRIVE").map(str::to_string),
+                    slew: port_attr(netlist, &port, &pad, &cell.name, "SLEW").map(str::to_string),
                     port,
                     dir: IobDir::Out,
                     net,
@@ -276,13 +380,11 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                     .unwrap_or(&cell.name)
                     .to_string();
                 let port = resolve_port(netlist, &pad, &cell.name);
-                let port_def = netlist.ports.iter().find(|p| p.name == port);
                 out.iobs.push(PackedIob {
                     name: cell.name.clone(),
-                    loc: port_def.and_then(|p| p.attrs.get("LOC").map(|s| s.to_string())),
-                    iostandard: port_def
-                        .and_then(|p| p.attrs.get("IOSTANDARD"))
-                        .map(|s| s.to_string())
+                    loc: port_attr(netlist, &port, &pad, &cell.name, "LOC").map(str::to_string),
+                    iostandard: port_attr(netlist, &port, &pad, &cell.name, "IOSTANDARD")
+                        .map(str::to_string)
                         .unwrap_or_else(|| "LVCMOS33".to_string()),
                     drive: None,
                     slew: None,
