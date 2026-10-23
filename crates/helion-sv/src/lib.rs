@@ -2187,6 +2187,44 @@ fn lower_negedge_hffs(d: &mut Design, rtl: &Rtl) {
     }
 }
 
+/// Attach the recorded async reset terms to their flops' `SR` pin.
+///
+/// `rtl.async_resets` holds `(signal, reset, active_low)` for every
+/// `always_ff @(posedge clk or negedge rst_n)`-style block. Each written
+/// signal bit has an Hff whose `Q` net is that bit, so the reset term is
+/// connected to `SR` on exactly those cells. A signal that never became an
+/// Hff (refused by a width/depth guard) is reported, not silently dropped:
+/// the caller would otherwise ship a flop with no reset at all.
+fn attach_async_resets(d: &mut Design, rtl: &Rtl) {
+    for (signal, rst, active_low) in &rtl.async_resets {
+        let w = sig_width(rtl, signal).max(1);
+        let mut attached = 0usize;
+        for bit in 0..w {
+            let qnet = bit_name(signal, w, bit);
+            let ff = d
+                .cells
+                .iter()
+                .find(|c| matches!(c.kind, CellKind::Hff) && d.net_on(&c.name, "Q") == Some(qnet.as_str()))
+                .map(|c| c.name.clone());
+            let Some(ff) = ff else { continue };
+            // The reset net is the raw signal; polarity is expressed by which
+            // edge triggered it (a negedge reset asserts low).
+            d.connect(*rst, &ff, "SR");
+            if *active_low {
+                d.attrs.set("ASYNC_RESET_ACTIVE_LOW", "1");
+            }
+            attached += 1;
+        }
+        if attached == 0 {
+            note_skip(format!(
+                "diagnostic async_reset_not_attached module={} signal={signal} reset={rst} \
+                 (async reset had no Hff to attach to; not a silent sync-reset netlist)",
+                rtl.module
+            ));
+        }
+    }
+}
+
 fn seq_clocks_of(module: &str) -> Vec<String> {
     SEQ_WRITES.with(|s| {
         let mut out = Vec::new();
@@ -17502,6 +17540,13 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // Negedge-only always: one Hff on that clock, or one named diagnostic.
     // Do not walk a cone. Falling versus rising is not a fake WNS.
     lower_negedge_hffs(&mut d, rtl);
+
+    // Async reset: `always_ff @(posedge clk or negedge rst_n)` names a real
+    // second edge, so the reset must reach the flop's async pin. Wire the
+    // recorded reset term to `SR` (pack maps SR/RST on an Hff; the 7-series
+    // emitter sets ZRST + SRUSEDMUX). Folding it into D alone was a silent
+    // synchronous reset.
+    attach_async_resets(&mut d, rtl);
 
     // Clocked always either already became an Hff on the user's clock, or
     // one sequential_not_lowered. wide_cone already finished this module.
