@@ -6719,6 +6719,65 @@ fn fold_blocking_assigns<'a>(stmts: Vec<Nba<'a>>, arena: &'a Bump, module: &str)
         .collect()
 }
 
+/// True when any literal in `e` has don't-care (x/z) bits.
+///
+/// The parser records these as `Const { val, width, care }` with a zero care
+/// bit per unknown position. Comparisons use the mask (a don't-care bit makes
+/// `==` unknown, handled elsewhere), but an assignment has no such out: the
+/// bit-lowering step treats a masked-off bit as 0, so `4'b10xz` became the
+/// constant 8 silently. Detect the mask so the assign can be refused.
+fn rexpr_has_dont_care(e: &RExpr<'_>) -> bool {
+    let mut stack: Vec<&RExpr<'_>> = vec![e];
+    while let Some(n) = stack.pop() {
+        match n {
+            RExpr::Const { width, care, .. } => {
+                // Width 0 is an unsized literal, whose care mask covers the
+                // 32-bit integer default. Using u128::MAX there flagged every
+                // ordinary literal (`pc + 4`) as an x/z pattern.
+                let full = care_mask(if *width == 0 { 32 } else { (*width).min(128) });
+                if *care & full != full {
+                    return true;
+                }
+            }
+            RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => {}
+            RExpr::WordAt { data, .. } | RExpr::RedXor(data) | RExpr::RedAnd(data)
+            | RExpr::RedOr(data) | RExpr::Not(data) => stack.push(data),
+            RExpr::IndexPart { base, .. } => stack.push(base),
+            RExpr::Concat(parts) => {
+                for p in parts {
+                    stack.push(p);
+                }
+            }
+            RExpr::Call { args, .. } => {
+                for a in args {
+                    stack.push(a);
+                }
+            }
+            RExpr::Mux(a, b, c) => {
+                stack.push(c);
+                stack.push(b);
+                stack.push(a);
+            }
+            RExpr::And(a, b)
+            | RExpr::Or(a, b)
+            | RExpr::Xor(a, b)
+            | RExpr::Add(a, b)
+            | RExpr::Sub(a, b)
+            | RExpr::Mul(a, b)
+            | RExpr::Shr(a, b)
+            | RExpr::Ashr(a, b)
+            | RExpr::Shl(a, b)
+            | RExpr::Eq(a, b)
+            | RExpr::Ne(a, b)
+            | RExpr::Lt(a, b) => {
+                stack.push(b);
+                stack.push(a);
+            }
+        }
+    }
+    false
+}
+
 /// True when `e` reads `signal` (any bit) anywhere in its tree.
 fn rexpr_mentions_signal(e: &RExpr<'_>, signal: &str) -> bool {
     let mut stack: Vec<&RExpr<'_>> = vec![e];
@@ -17306,6 +17365,14 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 word_alias.push((lhs.to_string(), mem, word));
                 continue;
             }
+        }
+        // A literal with don't-care bits (`4'b10xz`) cannot be built: the
+        // fabric has no X or Z. Lowering used to read every such bit as 0, so
+        // `assign y = 4'b1x0z;` silently became constant 8 with no diagnostic.
+        // Refuse the whole assign instead of inventing a value.
+        if rexpr_has_dont_care(rhs) {
+            note_assign_not_lowered(&rtl.module, lhs);
+            continue;
         }
         match rhs {
             RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => {
