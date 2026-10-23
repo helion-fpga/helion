@@ -1241,6 +1241,42 @@ fn cmd_timing(args: &[String]) {
         eprintln!("timing: {e}");
         std::process::exit(1);
     });
+    // A real Xilinx part has no HL10T device file, so the flow below would fail
+    // with "read .../parts/xc7z020.toml: No such file or directory". The
+    // 7-series flow carries its own timing model, so report from that instead.
+    if part.to_ascii_lowercase().starts_with("xc7") {
+        let mut design = synth_any(path).unwrap_or_else(|e| {
+            eprintln!("report_timing: {e}");
+            std::process::exit(1);
+        });
+        apply_pin_constraints(&mut design, &xdc);
+        let db_root = std::env::var("HELION_XILINX_DB")
+            .ok()
+            .map(std::path::PathBuf::from);
+        let period = tightest_period_ps(&xdc);
+        match helion_xilinx7::build::x7_utilization(&design, &part, db_root.as_deref(), period) {
+            Ok(u) => {
+                if u.endpoints == 0 {
+                    println!(
+                        "report_timing {} no_body cells={} (no timing: no endpoints; not a closed WNS)",
+                        design.name,
+                        design.cells.len()
+                    );
+                    return;
+                }
+                println!(
+                    "report_timing {} part={} WNS_PS={} period_ps={} endpoints={} \
+                     (7-series model estimate, not sign-off)",
+                    design.name, u.part, u.wns_ps, u.period_ps, u.endpoints
+                );
+            }
+            Err(e) => {
+                eprintln!("report_timing: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let c = compile_sv_xdc(path, &part, 0.75, &xdc).unwrap_or_else(|e| {
         eprintln!("report_timing: {e}");
         std::process::exit(1);
