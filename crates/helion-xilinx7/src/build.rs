@@ -201,7 +201,7 @@ impl PinConstraints {
 /// a utilization or timing report and skips the expensive FASM/frame work.
 pub struct X7Utilization {
     /// Occupied LUT sites (each is one 6-input LUT; seen as LUT+FF pairs).
-    pub lutffs: usize,
+    pub lut_sites: usize,
     /// Occupied IOB sites, split by direction.
     pub iobs_in: usize,
     /// Output IOBs.
@@ -274,7 +274,7 @@ pub fn x7_utilization(
         .filter(|i| i.dir == crate::pack::IobDir::In)
         .count();
     Ok(X7Utilization {
-        lutffs: placed.packed.luts.len(),
+        lut_sites: placed.packed.luts.len(),
         iobs_in,
         iobs_out: placed.packed.iobs.len() - iobs_in,
         brams: placed.packed.brams.len(),
