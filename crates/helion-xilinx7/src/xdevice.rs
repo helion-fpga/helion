@@ -168,6 +168,23 @@ impl<'a> TimingDevice for XDevice<'a> {
 }
 
 impl<'a> RouteQuery for XDevice<'a> {
+    /// Real grid coordinates, so the router's A* heuristic has a distance.
+    ///
+    /// `RouteQuery::tile_xy` defaults to `None`, and nothing overrode it, so
+    /// the heuristic evaluated to 0 for every tile and A* had no direction at
+    /// all: it degenerated into flooding the entire fabric. Routing one blinky
+    /// net with 4 sinks expanded 4,534,484 distinct nodes and 14,647,731
+    /// edges, and the 90-LUT design took 164 s -- over 99% of the whole run.
+    ///
+    /// Tile *names* are not coordinates (`CLBLM_R_X71Y45` is grid (176, 109)
+    /// while `CLBLL_L_X40Y77` is grid (103, 75)), so this asks the device
+    /// instead of parsing the name.
+    fn tile_xy(&self, tile: &str) -> Option<(i32, i32)> {
+        self.tile_idx(tile)
+            .and_then(|i| self.device.tile(i))
+            .map(|t| (t.grid_x, t.grid_y))
+    }
+
     fn pips_from(&self, tile: &str, wire: &str) -> Vec<(String, String, bool)> {
         let idx = match self.tile_idx(tile) {
             Some(i) => i,

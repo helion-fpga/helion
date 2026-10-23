@@ -189,7 +189,15 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         let eps = &net_eps[&net];
         let drivers: Vec<&Endpoint> = eps.iter().filter(|e| e.is_driver).collect();
         let loads: Vec<&Endpoint> = eps.iter().filter(|e| !e.is_driver).collect();
-        match route_net(&net, drivers[0], &loads, device, &occupied) {
+        let mut blockers: Vec<(String, String)> = Vec::new();
+        match route_net(
+            &net,
+            drivers[0],
+            &loads,
+            device,
+            &occupied,
+            Some(&mut blockers),
+        ) {
             Ok(kind) => {
                 let wires = route_wires(&kind);
                 for w in &wires {
@@ -198,12 +206,20 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
                 routed.insert(net, (kind, wires));
             }
             Err(_) => {
-                // Rip up every conflicting net and retry: this one first, then
-                // the ones it displaced.
+                // Rip up only the nets that actually blocked this one, then
+                // retry this net and re-queue those.
+                //
+                // This used to discard EVERY routed net on any failure --
+                // `for other in routed.keys()` with no reference to what was
+                // actually in the way -- and re-queue all of them. Each failure
+                // therefore threw away all completed work, so routing thrashed
+                // instead of converging: an 86-LUT design took 153 s on zynq
+                // and did not finish in 40 minutes on the Artix-35T fabric.
                 ripped += 1;
+                let blocked_set: HashSet<&(String, String)> = blockers.iter().collect();
                 let mut displaced: Vec<String> = Vec::new();
-                for other in routed.keys() {
-                    if other != &net {
+                for (other, (_, wires)) in &routed {
+                    if other != &net && wires.iter().any(|w| blocked_set.contains(w)) {
                         displaced.push(other.clone());
                     }
                 }
@@ -216,17 +232,9 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
                     }
                 }
                 if displaced.is_empty() {
-                    // Nothing to rip up and it still failed: genuinely
-                    // unroutable, so report the real reason.
-                    let drivers: Vec<&Endpoint> = net_eps[&net]
-                        .iter()
-                        .filter(|e| e.is_driver)
-                        .collect();
-                    let loads: Vec<&Endpoint> = net_eps[&net]
-                        .iter()
-                        .filter(|e| !e.is_driver)
-                        .collect();
-                    route_net(&net, drivers[0], &loads, device, &occupied)?;
+                    // Nothing in the way: genuinely unroutable, so report the
+                    // real reason rather than looping.
+                    route_net(&net, drivers[0], &loads, device, &occupied, None)?;
                     unreachable!("route_net returned Ok after Err");
                 }
                 queue.push_back(net);
@@ -252,6 +260,13 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         }
     }
 
+    eprintln!(
+        "route: {} nets, {} through the queue, {} rip-ups, {} occupied wires",
+        net_names.len(),
+        attempts,
+        ripped,
+        occupied.len()
+    );
     Ok(Routed7 {
         placed: placed.clone(),
         nets,
@@ -286,6 +301,7 @@ fn route_net(
     loads: &[&Endpoint],
     device: &dyn RouteQuery,
     occupied: &HashSet<(String, String)>,
+    blocked: Option<&mut Vec<(String, String)>>,
 ) -> Result<RouteKind, String> {
     // Split loads into site-internal (same site as driver) and external.
     let (internal, external): (Vec<&&Endpoint>, Vec<&&Endpoint>) =
@@ -325,7 +341,7 @@ fn route_net(
     }
     sinks.sort();
     sinks.dedup();
-    let pips = bfs_route_all(&src_tile, &src_wire, &sinks, device, occupied).ok_or_else(|| {
+    let pips = bfs_route_all(&src_tile, &src_wire, &sinks, device, occupied, blocked).ok_or_else(|| {
         format!(
             "route: net `{net}` unroutable to one or more of {} loads",
             external_loads.len()
@@ -346,11 +362,15 @@ fn bfs_route_all(
     sinks: &[(String, String)],
     device: &dyn RouteQuery,
     occupied: &HashSet<(String, String)>,
+    // Occupied wires that stopped an expansion. Collected so a failed net can
+    // rip up only the nets that actually blocked it, instead of every net.
+    mut blocked: Option<&mut Vec<(String, String)>>,
 ) -> Option<Vec<RoutedPip>> {
     let sink_set: HashSet<(&str, &str)> =
         sinks.iter().map(|(t, w)| (t.as_str(), w.as_str())).collect();
     // (tile, wire) -> parent ((tile, wire), pip used to get here)
     let mut parent: HashMap<(String, String), Option<((String, String), RoutedPip)>> = HashMap::new();
+    let mut pops: usize = 0;
     let start = (src_tile.to_string(), src_wire.to_string());
 
     // A* instead of plain BFS. Unbounded BFS expanded ~363,000 pips per net
@@ -367,28 +387,50 @@ fn bfs_route_all(
     g.insert(start.clone(), 0);
     parent.insert(start.clone(), None);
 
-    // Grid coordinates of every sink, for the heuristic.
-    let sink_xy: Vec<(i32, i32)> = sinks
+    // Grid coordinates of every sink, tagged with the sink so the heuristic
+    // can skip the ones already reached.
+    let sink_xy: Vec<((String, String), (i32, i32))> = sinks
         .iter()
-        .filter_map(|(t, _)| device.tile_xy(t))
+        .filter_map(|(t, w)| device.tile_xy(t).map(|xy| ((t.clone(), w.clone()), xy)))
         .collect();
-    let h = |tile: &str| -> i64 {
-        match (device.tile_xy(tile), sink_xy.is_empty()) {
-            (Some((x, y)), false) => sink_xy
-                .iter()
-                .map(|(sx, sy)| ((x - sx).abs() + (y - sy).abs()) as i64)
-                .min()
-                .unwrap_or(0),
+    // Distance to the nearest sink NOT yet found.
+    //
+    // This used to be the distance to the nearest sink of ANY kind, which is
+    // the wrong estimate once that sink has been reached: the search still has
+    // to reach the others, but the heuristic kept steering it back toward the
+    // one already found. A* then stopped being goal-directed and flooded the
+    // fabric. One net needed 4,534,494 pops to reach 4 sinks, all of them
+    // inside one or two tiles of the driver; routing the 90-LUT blinky took
+    // 153 s, 99.9% of the whole run.
+    //
+    // Ignoring `found` keeps the estimate admissible (distance to the nearest
+    // still-missing sink is a lower bound on the remaining tree) and restores
+    // the goal direction. When every sink is found the search breaks anyway,
+    // so the zero estimate at that point costs nothing.
+    let h = |tile: &str, found: &HashSet<(String, String)>| -> i64 {
+        let (x, y) = match device.tile_xy(tile) {
+            Some(xy) => xy,
             // No coordinates available: behave exactly like BFS.
-            _ => 0,
-        }
+            None => return 0,
+        };
+        sink_xy
+            .iter()
+            .filter(|(k, _)| !found.contains(k))
+            .map(|(_, (sx, sy))| ((x - sx).abs() + (y - sy).abs()) as i64)
+            .min()
+            .unwrap_or(0)
     };
-    heap.push(Reverse((h(src_tile), Reverse(start.0.clone()), Reverse(start.1.clone()))));
-
     let mut found: HashSet<(String, String)> = HashSet::new();
+    heap.push(Reverse((h(src_tile, &found), Reverse(start.0.clone()), Reverse(start.1.clone()))));
+    let mut closes: HashSet<(String, String)> = HashSet::new();
+    let mut expansions: usize = 0;
     while let Some(Reverse((_, Reverse(tile), Reverse(wire)))) = heap.pop() {
+        pops += 1;
         let cur = (tile.clone(), wire.clone());
         let cur_g = g.get(&cur).copied().unwrap_or(i64::MAX);
+        if !closes.insert(cur.clone()) {
+            continue;
+        }
         if sink_set.contains(&(tile.as_str(), wire.as_str())) {
             found.insert((tile.clone(), wire.clone()));
             if found.len() == sink_set.len() {
@@ -399,7 +441,25 @@ fn bfs_route_all(
         // connections like the OLOGIC bypass, traversed but not emitted).
         for (dst_wire, src_w, is_pseudo) in device.pips_from(&tile, &wire) {
             debug_assert_eq!(src_w, wire);
+            expansions += 1;
             let next = (tile.clone(), dst_wire.clone());
+            // Never step onto a BUFGCTRL instance mux. `emit.rs` emits that
+            // input select for the net's own clock buffer, so a second net
+            // selecting it drives one configuration bit from two sources and
+            // prjxray's assembler rejects the entire bitstream:
+            //
+            //   FASM line "...BUFGCTRL0_I0.CLK_BUFG_R_FBG_OUT1" wanted to set
+            //   bit (4329626, 93, 7) but was cleared by
+            //   "...BUFGCTRL0_I0.CLK_BUFG_BOT_R_CK_MUXED0"
+            //
+            // The search finds this shortcut once the A* heuristic has real
+            // distances (`tile_xy`): the clock net leaves its own buffer and
+            // cascades BUFGCTRL1..4, which is a shorter hop count and an
+            // illegal cascade. A clock reaches its BUFG only through the path
+            // `route_net` builds, so blocking here removes just the shortcut.
+            if dst_wire.contains("FBG_OUT") {
+                continue;
+            }
             // A wire already driving another net must not be selected again.
             // A 7-series INT mux is one-hot: two nets choosing different
             // inputs of the same mux output is an electrical over-drive, not
@@ -409,6 +469,9 @@ fn bfs_route_all(
             // picked a different input of the same mux and the bitstream
             // committed an illegal configuration while route() returned Ok.
             if occupied.contains(&next) {
+                if let Some(b) = blocked.as_deref_mut() {
+                    b.push(next.clone());
+                }
                 continue;
             }
             let ng = cur_g.saturating_add(1);
@@ -422,16 +485,44 @@ fn bfs_route_all(
                 parent.insert(next.clone(), Some(((tile.clone(), wire.clone()), pip)));
                 g.insert(next.clone(), ng);
                 heap.push(Reverse((
-                    ng.saturating_add(h(&next.0)),
+                    ng.saturating_add(h(&next.0, &found)),
                     Reverse(next.0.clone()),
                     Reverse(next.1.clone()),
                 )));
             }
         }
-        // Across tileconn stitching.
+        // Across tileconn stitching. This is a real resource traversal, so it
+        // costs one hop exactly like a pip. Charging 0 made a chain of
+        // same-node wires look free, and with the A* heuristic working the
+        // search then preferred to hop the clock through five BUFGCTRL stages
+        // (BUFGCTRL1_O -> FBG_OUT2 -> BUFGCTRL2_I0 -> ...) instead of the
+        // dedicated spine: a shorter hop count, an illegal cascade, and the
+        // reference assembler refuses it as a bit set by two conflicting
+        // lines.
         for (ntile, nwire) in device.node_wires(&tile, &wire) {
+            // `node_wires` unifies a wire across every instance in a tile, and
+            // the BUFG `_CK_MUXED*` inputs share a node across all 17 slots.
+            // The search therefore steps from BUFGCTRL0's input to
+            // BUFGCTRL1's input at no cost, leaves through `FBG_OUT1`, and
+            // cascades -- reaching the clock spine in fewer hops than the
+            // dedicated path. `emit.rs` writes those input selects for the
+            // net's own buffer only, so the cascade makes one configuration
+            // bit carry two sources and prjxray refuses the bitstream:
+            //
+            //   FASM line "...BUFGCTRL0_I0.CLK_BUFG_R_FBG_OUT1" wanted to set
+            //   bit (4329626, 93, 7) but was cleared by
+            //   "...BUFGCTRL0_I0.CLK_BUFG_BOT_R_CK_MUXED0"
+            //
+            // A clock reaches its buffer only by the path `route_net` builds,
+            // so skipping this stitch removes the shortcut and nothing legal.
+            if nwire.contains("FBG_OUT") || nwire.starts_with("CLK_BUFG_R_CK_MUXED") {
+                continue;
+            }
             let next = (ntile.clone(), nwire.clone());
             if occupied.contains(&next) {
+                if let Some(b) = blocked.as_deref_mut() {
+                    b.push(next.clone());
+                }
                 continue;
             }
             let ng = cur_g.saturating_add(1);
@@ -444,7 +535,7 @@ fn bfs_route_all(
                 })));
                 g.insert(next.clone(), ng);
                 heap.push(Reverse((
-                    ng.saturating_add(h(&next.0)),
+                    ng.saturating_add(h(&next.0, &found)),
                     Reverse(next.0.clone()),
                     Reverse(next.1.clone()),
                 )));
@@ -453,7 +544,19 @@ fn bfs_route_all(
     }
 
     if found.len() != sink_set.len() {
+        eprintln!("  bfs FAIL {src_tile}.{src_wire}: {pops} pops, {} sinks", sink_set.len());
         return None;
+    }
+    if pops > 200_000 {
+        let sink_desc: Vec<String> = sinks
+            .iter()
+            .map(|(t, w)| format!("{t}.{w}@{:?}", device.tile_xy(t)))
+            .collect();
+        eprintln!(
+            "  bfs SLOW {src_tile}.{src_wire}@{:?}: {pops} pops / {} closed / {expansions} edges\n    sinks: {sink_desc:?}",
+            device.tile_xy(src_tile),
+            closes.len()
+        );
     }
 
     // Walk every sink back to the root. The parent tree gives each wire a
@@ -621,7 +724,7 @@ mod tests {
             ("T".to_string(), "S2".to_string()),
         ];
         let empty = HashSet::new();
-        let pips = bfs_route_all("T", "A", &sinks, &MuxRouter, &empty).expect("all sinks");
+        let pips = bfs_route_all("T", "A", &sinks, &MuxRouter, &empty, None).expect("all sinks");
         assert!(pips.iter().any(|p| p.dst_wire == "S1"));
         assert!(pips.iter().any(|p| p.dst_wire == "S2"));
         // The mux input must be driven once, not unioned from two branches.
@@ -631,7 +734,7 @@ mod tests {
             ("T".to_string(), "S1".to_string()),
             ("T".to_string(), "NX".to_string()),
         ];
-        assert!(bfs_route_all("T", "A", &unreachable, &MuxRouter, &empty).is_none());
+        assert!(bfs_route_all("T", "A", &unreachable, &MuxRouter, &empty, None).is_none());
     }
 
     #[test]
