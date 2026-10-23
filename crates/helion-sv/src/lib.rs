@@ -605,6 +605,9 @@ struct Rtl<'a> {
     /// edge in the sensitivity list, so it must reach the FF's async `SR`
     /// pin; folding it into the D cone would silently make it synchronous.
     async_resets: Vec<(&'a str, &'a str, bool)>,
+    /// Names declared `signed`. Context-determined widening needs this to
+    /// sign-extend rather than zero-extend.
+    signed: HashSet<&'a str>,
 }
 
 thread_local! {
@@ -5150,10 +5153,23 @@ fn parse_atom_r<'a>(p: &mut P<'a>) -> Result<RExpr<'a>, String> {
             let name: &'a str = s;
             // Ibex ALU: `$unsigned(a) + $unsigned(b)`. Value is the inner expr
             // (unsigned/signed cast does not invent bits). Not a generate miss.
+            //
+            // The cast still carries SIGN INFORMATION, which widening needs:
+            // `assign y = $signed(a);` with 8-bit `a` and 16-bit `y` must
+            // replicate `a[7]`, not zero-fill. Dropping the cast entirely made
+            // every negative value widen as if unsigned. Record the operand as
+            // signed so `rexpr_signedness_uncertain` sees it; the tree shape
+            // stays a plain Ident, so bit-lowering is unaffected.
             if (name == "$unsigned" || name == "$signed") && p.eat_sym('(') {
+                let is_signed = name == "$signed";
                 let inner = parse_rexpr(p)?;
                 if !p.eat_sym(')') {
                     return Err("$cast )".into());
+                }
+                if is_signed {
+                    if let RExpr::Ident(n) | RExpr::Range(n, _, _) = &inner {
+                        note_signed(p, n);
+                    }
                 }
                 return Ok(inner);
             }
@@ -8962,6 +8978,7 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
         sva_conc,
         sva_imm,
         async_resets,
+        signed: p.signed.clone(),
     })
 }
 
@@ -11787,17 +11804,28 @@ fn rexpr_width(e: &RExpr<'_>, rtl: &Rtl) -> usize {
     }
 }
 
-/// True when widening `e` to a wider LHS would need sign replication rather
-/// than zero fill.
+/// True when `e` is a signed expression, so widening it to a wider LHS must
+/// replicate its MSB rather than zero-fill.
 ///
-/// This frontend does not carry an inferred signedness for arbitrary
-/// expressions, so only the explicit forms are recognised: `$signed(x)` and
-/// the `signed'(x)` cast both parse to `Call`. Everything else is treated as
+/// Sign matters: `assign y = $signed(a);` with 8-bit `a` and 16-bit `y` must
+/// drive `y_15..y_8` with `a_7`, because `a = -1` has to widen to all ones.
+/// Zero-filling instead silently changed the value of every negative number.
+///
+/// Recognised: a name declared `signed` (ANSI port or net decl, tracked in
+/// `Rtl::signed`), and the `$signed`/`signed'` cast. Everything else is
 /// unsigned, which matches Verilog for the overwhelmingly common case
 /// (`assign y = a;` with unsigned `a` zero-extends).
-fn rexpr_signedness_uncertain(e: &RExpr<'_>, _rtl: &Rtl) -> bool {
+fn rexpr_signedness_uncertain(e: &RExpr<'_>, rtl: &Rtl) -> bool {
     match e {
-        RExpr::Call { name, .. } => *name == "$signed",
+        RExpr::Call { name, .. } => *name == "$signed" || *name == "signed",
+        RExpr::Ident(n) => rtl.signed.contains(n),
+        // A part-select of a signed value is signed; a bit-select is not
+        // (it is the 1-bit value, and 1-bit extension is identical either way).
+        RExpr::Range(n, _, _) => rtl.signed.contains(n),
+        // `$signed(...)` is erased to its argument at parse, so a cast whose
+        // argument is a signed name is already covered above; the explicit
+        // form below keeps the check honest if the erasure ever changes.
+        RExpr::Not(x) => rexpr_signedness_uncertain(x, rtl),
         _ => false,
     }
 }
@@ -13918,16 +13946,33 @@ fn peel_word_enable<'a>(rhs: &'a RExpr<'a>, mem: &str) -> Option<(Option<RExpr<'
 
 enum WordShiftSrc {
     Packed(String),
-    Word(usize),
+    /// A constant word select of an unpacked array: `(array, word)`.
+    /// Usually `array == mem` (`q[i] <= q[i+1]`), but it may be a *different*
+    /// array of the same element width -- Ibex stores
+    /// `pending_dside_accesses_q[i] <= pending_dside_accesses_d[i]`, where the
+    /// two arrays are distinct. `RExpr::Bit(s, w)` with `s != mem` used to
+    /// fall through to `None`, which refused the whole memory.
+    Word(String, usize),
 }
 
-/// Const-index unpacked write source: another word of the same array, or a packed vector.
+/// Const-index unpacked write source: a word of an unpacked array, or a packed vector.
 fn classify_word_src(rtl: &Rtl, mem: &str, rhs: &RExpr<'_>) -> Option<WordShiftSrc> {
     match rhs {
         RExpr::Ident(s) if *s != mem && sig_depth(rtl, s) == 0 => {
             Some(WordShiftSrc::Packed(s.to_string()))
         }
-        RExpr::Bit(s, w) if *s == mem && sig_depth(rtl, s) > 0 => Some(WordShiftSrc::Word(*w)),
+        // A word of `mem` itself, or a whole word of another unpacked array
+        // with the same element width. Same-width only: a narrower source
+        // would need a real extend/truncate mux, which is not this lower, so
+        // it keeps the old refusal (`None`) instead of inventing one.
+        RExpr::Bit(s, w)
+            if sig_depth(rtl, s) > 0 && sig_width(rtl, s).max(1) == sig_width(rtl, mem).max(1) =>
+        {
+            if *w >= sig_depth(rtl, s) {
+                return None;
+            }
+            Some(WordShiftSrc::Word((*s).to_string(), *w))
+        }
         _ => None,
     }
 }
@@ -14003,8 +14048,8 @@ fn lower_unpacked_clocked_words<'a>(rtl: &Rtl, arena: &'a Bump) -> (Vec<(String,
                 ok = false;
                 break;
             };
-            if let WordShiftSrc::Word(w) = &src {
-                if *w >= depth {
+            if let WordShiftSrc::Word(arr, w) = &src {
+                if *w >= sig_depth(rtl, arr) {
                     ok = false;
                     break;
                 }
@@ -14040,7 +14085,10 @@ fn lower_unpacked_clocked_words<'a>(rtl: &Rtl, arena: &'a Bump) -> (Vec<(String,
                             Expr::Var(arena.alloc_str(&(bit_name(s, sw, bit))))
                         }
                     }
-                    WordShiftSrc::Word(w) => Expr::Var(arena.alloc_str(&(unpacked_word_q(mem, *w, width, bit)))),
+                    WordShiftSrc::Word(arr, w) => {
+                        let sw = sig_width(rtl, arr).max(1);
+                        Expr::Var(arena.alloc_str(&(unpacked_word_q(arr, *w, sw, bit))))
+                    }
                 };
                 let qn = unpacked_word_q(mem, word, width, bit);
                 let d = if let Some(en) = en.clone() {
@@ -15866,7 +15914,16 @@ fn lower_word_pipeline(
                 } else {
                     adds.push((word, a, b));
                 }
-            } else if let Some(WordShiftSrc::Word(from)) = classify_word_src(rtl, &mem, src) {
+            } else if let Some(WordShiftSrc::Word(from_arr, from)) =
+                classify_word_src(rtl, &mem, src)
+            {
+                // This pipeline lower is a same-array shift register: it needs
+                // `shifts[w] = w - 1` within `mem`. A cross-array word source
+                // is a real transfer, not a shift, so it is not claimed here.
+                if from_arr != mem {
+                    ok = false;
+                    break;
+                }
                 saw_shift = true;
                 if let Some(slot) = shifts.iter_mut().find(|(w, _)| *w == word) {
                     *slot = (word, from);
@@ -16846,18 +16903,27 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                         _ => lw,
                     }
                     .max(1);
-                    if lw > drv_w && !rexpr_signedness_uncertain(rhs, rtl) {
+                    if lw > drv_w {
+                        // Signed narrow source replicates its sign bit; an
+                        // unsigned one zero-fills.
+                        let signed_src = rexpr_signedness_uncertain(rhs, rtl);
                         for i in drv_w..lw.min(256) {
                             let bn = bit_name(lhs, lw, i);
                             if !comb_accept(&comb_bits, &bn, &mut assign_capped) {
                                 break;
                             }
-                            comb_bits.push((bn, Expr::Const(false)));
+                            if signed_src {
+                                match rexpr_to_bit(rhs, rtl, drv_w - 1, &arena) {
+                                    Ok(e) => comb_bits.push((bn, e)),
+                                    Err(_) => {
+                                        note_assign_not_lowered(rtl.module, lhs);
+                                        break;
+                                    }
+                                }
+                            } else {
+                                comb_bits.push((bn, Expr::Const(false)));
+                            }
                         }
-                    } else if lw > drv_w {
-                        // Signed narrow source: needs sign replication, which
-                        // this frontend cannot express. Refuse loudly.
-                        note_assign_not_lowered(rtl.module, lhs);
                     }
                 }
                 continue;
@@ -17071,11 +17137,11 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             // at all. Those dangling bits were then silently dropped by IOB
             // trimming, so a 16-bit output could vanish entirely.
             //
-            // Zero-extension is correct for an unsigned RHS. A SIGNED narrow
-            // RHS would need sign replication, and this frontend carries no
-            // reliable signedness for RExpr, so that case is refused loudly
-            // rather than silently zero-extended (which would change the
-            // value: `assign y = $signed(a);` with a = -1 must be all ones).
+            // Zero-extension is correct for an unsigned RHS; a SIGNED narrow
+            // RHS needs sign replication, because `a = -1` must widen to all
+            // ones. Zero-filling it silently changed the value of every
+            // negative number (`assign y = $signed(a);` with 8-bit `a` drove
+            // `y_15..y_8` low regardless of `a_7`).
             let signed_narrow = rexpr_signedness_uncertain(rhs, rtl);
             for i in 0..w.min(256) {
                 let bn = bit_name(lhs, w, i);
@@ -17085,7 +17151,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 let bit_expr = if i < rw {
                     rexpr_to_bit(rhs, rtl, i, &arena)
                 } else if signed_narrow {
-                    Err("width_overflow: signed extension not supported".to_string())
+                    // Replicate the source MSB (`rw - 1`), which is the sign bit.
+                    rexpr_to_bit(rhs, rtl, rw - 1, &arena)
                 } else {
                     Ok(Expr::Const(false))
                 };
@@ -17988,6 +18055,7 @@ fn flatten_module_ov_vis<'s>(
         sva_conc: src.sva_conc.clone(),
         sva_imm: src.sva_imm.clone(),
         async_resets: src.async_resets.clone(),
+        signed: src.signed.clone(),
     };
     for inst in &src.insts {
         let Some(child_proto) = mods.get(inst.module) else {
@@ -20026,6 +20094,7 @@ endmodule
             mem_inits: Default::default(),
             negedge_writes: vec![],
             async_resets: vec![],
+            signed: HashSet::new(),
             sva_conc: Vec::new(),
             sva_imm: Vec::new(),
         };
@@ -20072,6 +20141,7 @@ endmodule
             mem_inits: Default::default(),
             negedge_writes: vec![],
             async_resets: vec![],
+            signed: HashSet::new(),
             sva_conc: Vec::new(),
             sva_imm: Vec::new(),
         };
@@ -20112,6 +20182,7 @@ endmodule
             mem_inits: Default::default(),
             negedge_writes: vec![],
             async_resets: vec![],
+            signed: HashSet::new(),
             sva_conc: Vec::new(),
             sva_imm: Vec::new(),
         };
@@ -23797,6 +23868,7 @@ endmodule
                 mem_inits,
                 negedge_writes: vec![],
             async_resets: vec![],
+            signed: HashSet::new(),
             sva_conc: Vec::new(),
             sva_imm: Vec::new(),
             }
@@ -23865,6 +23937,7 @@ endmodule
             mem_inits: HashMap::new(),
             negedge_writes: vec![],
             async_resets: vec![],
+            signed: HashSet::new(),
             sva_conc: vec![],
             sva_imm: vec![],
         };
@@ -23957,6 +24030,7 @@ endmodule
             mem_inits: HashMap::new(),
             negedge_writes: vec![],
             async_resets: vec![],
+            signed: HashSet::new(),
             sva_conc: vec![],
             sva_imm: vec![],
         };
@@ -24104,6 +24178,7 @@ endmodule
             mem_inits: HashMap::new(),
             negedge_writes: vec![],
             async_resets: vec![],
+            signed: HashSet::new(),
             sva_conc: vec![],
             sva_imm: vec![],
         };
