@@ -62,6 +62,15 @@ pub trait EmitDevice {
     fn tiles_of_type(&self, _tile_type: &str) -> Vec<(String, i32)> {
         Vec::new()
     }
+    /// The device row of `tile`, in the same space `tiles_of_type` reports.
+    ///
+    /// This is the tilegrid's `grid_y`, which is **not** the number in the tile
+    /// name: the name counts rows bottom-up and `grid_y` top-down. Anything
+    /// that groups tiles by row must use this, or the two spaces silently
+    /// never match.
+    fn tile_grid_y(&self, _tile: &str) -> Option<i32> {
+        None
+    }
 }
 
 /// IBUF `.IN` feature prefix for an IOSTANDARD, from
@@ -183,7 +192,22 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
 
     // Features every bitstream for this part must contain, straight from the
     // DB's `required_features.fasm`. Emit them first and unconditionally.
-    lines.extend(device.required_features());
+    //
+    // These are the static "always on" housekeeping bits. Nothing in the
+    // design references them, so they cannot be derived from routing: if the
+    // part directory does not ship the file they are simply absent, and the
+    // bitstream is quietly missing mandatory configuration. Some part
+    // directories for this die do ship it, so an absent file is a DB gap, not
+    // an absence of requirements. Warn rather than omit in silence.
+    let required = device.required_features();
+    if required.is_empty() {
+        eprintln!(
+            "emit: warning: no required_features.fasm for this part, so the \
+             always-on configuration bits are not being emitted. Other part \
+             directories for the same die ship this file."
+        );
+    }
+    lines.extend(required);
 
     // LUTs: INIT vector per occupied ALUT..DLUT.
     for lut in &placed.luts {
@@ -595,33 +619,125 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     // muted. Read it from the HCLK tiles instead, once they are all known.
     {
         use std::collections::BTreeSet;
-        let mut cmt_buf: BTreeSet<u32> = BTreeSet::new();
+        // Each `BUFHCLK<n>` belongs to exactly one band, and a band's buffers
+        // are gated by the CMT that drives that band. Pair them by *band*, not
+        // by collecting every index and every CMT-prefixed tile.
+        //
+        // `HCLK_L.ENABLE_BUFFER` only accepts n in 8..=11 and
+        // `HCLK_R.ENABLE_BUFFER` only n in 0..=7 (segbits_hclk_l/r.db), so the
+        // index alone says which band a buffer belongs to. Gating is done on
+        // `HCLK_CMT_L` for the left band and `HCLK_CMT` for the right.
+        //
+        // Getting this wrong is silent: gating buffer 8 on the right-band CMT
+        // configures a buffer on the far side of the die and leaves the real
+        // one disabled, so the spine is muted at its source and every flop on
+        // it holds its init value. That is a static LED, not a dead design --
+        // which is what made it hard to see.
+        const LEFT_BAND_FIRST: u32 = 8;
+        let mut left_buf: BTreeSet<u32> = BTreeSet::new();
+        let mut right_buf: BTreeSet<u32> = BTreeSet::new();
         for line in &lines {
             // `HCLK_L_X..Y...ENABLE_BUFFER.HCLK_CK_BUFHCLK<n>` and the
             // `HCLK_LEAF_CLK_B_*` selection that carries the same index.
             let tile = line.split('.').next().unwrap_or("");
-            if !(tile.starts_with("HCLK_L_") || tile.starts_with("HCLK_R_")) {
-                continue;
-            }
+            let band = if tile.starts_with("HCLK_L_") {
+                Some(&mut left_buf)
+            } else if tile.starts_with("HCLK_R_") {
+                Some(&mut right_buf)
+            } else {
+                None
+            };
+            let Some(band) = band else { continue };
             for tag in ["ENABLE_BUFFER.HCLK_CK_BUFHCLK", "HCLK_CK_BUFHCLK"] {
                 if let Some(rest) = line.split(tag).nth(1) {
                     if let Ok(n) = rest.trim().parse::<u32>() {
-                        cmt_buf.insert(n);
+                        band.insert(n);
                     }
                 }
             }
         }
-        // Find the CMT tile(s) in this design and gate the buffers in use.
-        let mut cmt_tiles: BTreeSet<String> = BTreeSet::new();
-        for line in &lines {
-            let tile = line.split('.').next().unwrap_or("");
-            if tile.starts_with("HCLK_CMT") {
-                cmt_tiles.insert(tile.to_string());
+        // Gate each band on the CMT tile for that band. `HCLK_CMT_L` is the
+        // left-edge CMT (three of them exist; the `_L` in the name is the
+        // band, not a side suffix), `HCLK_CMT` without `_L` is the right one.
+        //
+        // These tiles are discovered from the *device*, not from `lines`: the
+        // left CMT has no configuration of its own in a design like blinky, so
+        // it never appears in `lines` and a prefix scan over them finds
+        // nothing. Only the tile sharing the clock column with the HCLK_L/R
+        // tile that enabled the buffer may be gated -- gating the other two
+        // left CMTs configures buffers on clock columns this design does not
+        // use.
+        let mut cmt_left: BTreeSet<String> = BTreeSet::new();
+        let mut cmt_right: BTreeSet<String> = BTreeSet::new();
+        for (name, _y) in device.tiles_of_type("HCLK_CMT_L") {
+            cmt_left.insert(name);
+        }
+        for (name, _y) in device.tiles_of_type("HCLK_CMT") {
+            cmt_right.insert(name);
+        }
+        // Narrow the left CMTs to the one in the same clock column as the
+        // HCLK_L tile that enabled the buffer.
+        //
+        // Compare `grid_y`, not the number in the tile name. The prjxray
+        // tilegrid numbers its rows bottom-up in the name but top-down in
+        // `grid_y`: `HCLK_L_X174Y26` and `HCLK_CMT_L_X178Y26` both have
+        // `grid_y == 130`. Mixing the two spaces never matches, which is
+        // exactly how the left CMT stayed ungated.
+        let hclk_l_rows: BTreeSet<i32> = lines
+            .iter()
+            .filter_map(|line| {
+                let tile = line.split('.').next().unwrap_or("");
+                if !tile.starts_with("HCLK_L_") {
+                    return None;
+                }
+                device.tile_grid_y(tile)
+            })
+            .collect();
+        let mut left_cmt_for_row: Vec<(i32, String)> = Vec::new();
+        for (name, gy) in device.tiles_of_type("HCLK_CMT_L") {
+            if hclk_l_rows.contains(&gy) {
+                left_cmt_for_row.push((gy, name));
             }
         }
-        for tile in cmt_tiles {
-            for n in &cmt_buf {
-                lines.push(format!("{tile}.HCLK_CMT_CK_BUFHCLK{n}_USED"));
+        left_cmt_for_row.sort();
+        left_cmt_for_row.dedup();
+        // A band's buffers are only gated when that band is actually in use;
+        // an empty index set would otherwise emit nothing anyway.
+        if !left_buf.is_empty() {
+            if left_cmt_for_row.is_empty() {
+                // The HCLK_L tile that enabled the buffer has no CMT_L in its
+                // row, so there is no tile that can drive it. Silently skipping
+                // would leave the spine muted at its source -- a design that
+                // configures cleanly and never toggles a flop. Fail instead.
+                return Err(format!(
+                    "emit: HCLK_L enables BUFHCLK{:?} but no HCLK_CMT_L tile shares \
+                     its clock row, so nothing can gate that buffer. The clock \
+                     would be configured and muted.",
+                    left_buf
+                ));
+            }
+            for (_row, tile) in &left_cmt_for_row {
+                for n in &left_buf {
+                    lines.push(format!("{tile}.HCLK_CMT_CK_BUFHCLK{n}_USED"));
+                }
+            }
+        }
+        if !right_buf.is_empty() {
+            for tile in &cmt_right {
+                for n in &right_buf {
+                    if *n >= LEFT_BAND_FIRST {
+                        // Defensive: a right-band index >= 8 has no
+                        // `HCLK_R` enable to match, so it is a routing bug
+                        // upstream. Refuse rather than configure a buffer
+                        // that does not exist on that band.
+                        return Err(format!(
+                            "emit: BUFHCLK{n} was requested on the right band, but \
+                             HCLK_R only drives BUFHCLK0..7 (segbits_hclk_r.db). The \
+                             left-band buffers are numbered from {LEFT_BAND_FIRST}."
+                        ));
+                    }
+                    lines.push(format!("{tile}.HCLK_CMT_CK_BUFHCLK{n}_USED"));
+                }
             }
         }
 

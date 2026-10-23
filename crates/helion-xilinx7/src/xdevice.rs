@@ -346,6 +346,35 @@ impl<'a> EmitDevice for XDevice<'a> {
         out
     }
 
+    fn tile_grid_y(&self, tile: &str) -> Option<i32> {
+        let idx = self.tile_idx(tile)?;
+        self.device.tile(idx).map(|t| t.grid_y)
+    }
+
+    /// Features from the part's `required_features.fasm`.
+    ///
+    /// X-Ray ships this file because a bitstream missing these is not a valid
+    /// configuration: they are the static "always on" housekeeping bits
+    /// (`CFG_CENTER_MID.ALWAYS_ON_PROP1/2/3`), which nothing in the design
+    /// references. They therefore cannot be derived from routing and are
+    /// emitted unconditionally.
+    ///
+    /// A missing file is not fatal -- plenty of part directories ship without
+    /// one -- but it must not be silent when the *other* directories for the
+    /// same die do have it, since that is exactly the case where the bitstream
+    /// quietly omits mandatory bits. Report that at build time instead.
+    fn required_features(&self) -> Vec<String> {
+        let path = self.device.part_dir_path().join("required_features.fasm");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(str::to_string)
+            .collect()
+    }
+
     fn ioi_tile_for(&self, iob_tile: &str) -> Option<String> {
         let idx = self.tile_idx(iob_tile)?;
         let t = self.device.tile(idx)?;
