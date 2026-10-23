@@ -369,9 +369,41 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     // Routing pips: TILE.DST.SRC. Pseudo-pips are always-on hard
     // connections (e.g. OLOGIC bypass): traversed for connectivity but
     // never emitted (no configuration bits).
+    // The BUFG input selects this design's buffers need, as `(tile, wire)`.
+    // The block below writes them; a routed pip that lands on a *different*
+    // buffer's input would drive the same configuration bit from a second
+    // source, and prjxray rejects the whole bitstream:
+    //
+    //   FASM line "...BUFGCTRL0_I0.CLK_BUFG_IMUX28_0" wanted to clear bit
+    //   (4329626, 93, 8) but was set by
+    //   "...BUFGCTRL0_I0.CLK_BUFG_BOT_R_CK_MUXED0"
+    //
+    // This turned up only once the router had a working A* heuristic: with real
+    // distances, the search started preferring a short hop *through* an unused
+    // BUFG slot to reach the clock spine. Denying those wires to the search was
+    // tried and is wrong -- `CK_MUXED<n>` is shared by every BUFG in a tile, so
+    // blocking the wire also blocks the design's own legal entry. Filtering
+    // here, where the set of legitimate selects is known, keeps the search free
+    // and the emitted bits unambiguous.
+    let mut owned_bufg_inputs: HashSet<(String, String)> = HashSet::new();
+    for bufg in &placed.bufgs {
+        if let Some((top, slot)) = bufg_slot_of(device, bufg) {
+            let mux_tile = if top { "CLK_BUFG_TOP_R" } else { "CLK_BUFG_BOT_R" };
+            owned_bufg_inputs.insert((
+                bufg.tile.clone(),
+                format!("{mux_tile}_CK_MUXED{}", 2 * slot),
+            ));
+        }
+    }
+
     for net in &routed.nets {
         if let RouteKind::Pips(pips) = &net.kind {
             for pip in pips {
+                // A pip whose DESTINATION is a BUFG instance mux belongs to the
+                // clock buffer, not to this net.
+                if is_bufg_instance_mux(device, &pip.tile, &pip.dst_wire) {
+                    continue;
+                }
                 if !pip.is_pseudo {
                     lines.push(format!("{}.{}.{}", pip.tile, pip.dst_wire, pip.src_wire));
                 }
@@ -446,6 +478,27 @@ fn gclk_index(wire: &str) -> Option<u32> {
 /// `BUFGCTRL_X0Y16..31` in the top tile. X-Ray's segbits name both tiles'
 /// sites `BUFGCTRL_X0Y0..15`, and number the top tile's GCLKs 16..31.
 /// Returns `(is_top, slot)`.
+/// Is `wire` in `tile` one of a clock buffer's instance muxes?
+///
+/// These are the `CLK_BUFG_BUFGCTRL<n>_I0/I1` selects that `bufg_slot` and the
+/// BUFGCTRL loop below write. They belong to the buffer, never to general
+/// routing.
+use crate::place::PlacedBufg;
+
+fn is_bufg_instance_mux(device: &dyn EmitDevice, tile: &str, wire: &str) -> bool {
+    device
+        .tile_type(tile)
+        .map(|t| t.contains("CLK_BUFG") && wire.contains("BUFGCTRL"))
+        .unwrap_or(false)
+}
+
+/// `(is_top, slot)` for a placed buffer, or `None` if it cannot be determined.
+fn bufg_slot_of(device: &dyn EmitDevice, bufg: &PlacedBufg) -> Option<(bool, u32)> {
+    let site_rel = device.site_rel(&bufg.tile, &bufg.site)?;
+    let tile_type = device.tile_type(&bufg.tile)?;
+    bufg_slot(&site_rel, &tile_type).ok()
+}
+
 fn bufg_slot(site: &str, tile_type: &str) -> Result<(bool, u32), String> {
     let bad = || format!("emit: bad BUFGCTRL site `{site}` in {tile_type}");
     let y: u32 = site
