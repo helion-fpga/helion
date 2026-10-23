@@ -673,7 +673,7 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
             let mut chain: Vec<(i32, String)> = device
                 .tiles_of_type("CLK_BUFG_REBUF")
                 .into_iter()
-                .filter_map(|(name, y)| tile_row(&name).map(|r| (r, name)))
+                .filter_map(|(name, _y)| tile_row(&name).map(|r| (r, name)))
                 .collect();
             chain.sort();
             chain.dedup_by_key(|(r, _)| *r);
