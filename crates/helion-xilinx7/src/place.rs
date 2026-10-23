@@ -48,6 +48,14 @@ pub trait DeviceQuery {
     /// vertically adjacent iff they share a `column_key` and differ by 1 in
     /// `row`. Returns `None` for a site the model does not know.
     fn slice_column(&self, tile: &str, site: &str) -> Option<(i64, i32)>;
+
+    /// True when `site` is the SLICEM half of its CLB.
+    ///
+    /// A CLB holds two slices of different types, and they are NOT
+    /// interchangeable for a carry chain. Refusing to distinguish them placed
+    /// every chain in the SLICEL half while the reference uses SLICEM, which is
+    /// what split the lane data path from the flops that sample it.
+    fn slice_is_m(&self, tile: &str, site: &str) -> bool;
 }
 
 /// A placed LUT: tile + slice site + BEL.
@@ -152,11 +160,45 @@ fn column_run(
         return Some(Vec::new());
     }
     // Every slice in the device, grouped by column.
+    // The clock spine counts DOWN from the top of the die while the site row
+    // counts UP in the tile name, so the anchor row arrives in the site-row
+    // space only after `nearest_slice_row` translates it.
+
+    // Choose the SLICEM half of each CLB, not the SLICEL half.
+    //
+    // A CLB holds two slices, and `Device::slices()` lists `SLICEL` before
+    // `SLICEM`, so the old scan always took the SLICEL half. The reference puts
+    // its ENTIRE carry chain, lane LUTs and flops in `SLICEM_X0` and uses
+    // `SLICEL_X1` for nothing but continuing the chain (`PRECYINIT.CIN`).
+    // Splitting them -- lane `DI1MUX` in one half, the sampling flop in the
+    // other -- leaves each flop latching a static value, so LD0 sits dark where
+    // the reference bitstream blinks.
+    //
+    // Preferring the SLICEM half also matters functionally: only SLICEM can
+    // host the distributed RAM/ROM a wider design may need, so spending SLICEL
+    // on a carry chain is the wrong trade even where both would work.
     let mut by_col: HashMap<i64, Vec<(i32, String, String)>> = HashMap::new();
+    let mut preferred: HashMap<i64, Vec<(i32, String, String)>> = HashMap::new();
     for (tile, site) in device.slices() {
         if let Some((col, row)) = device.slice_column(&tile, &site) {
-            by_col.entry(col).or_default().push((row, tile, site));
+            by_col.entry(col).or_default().push((row, tile.clone(), site.clone()));
+            if device.slice_is_m(&tile, &site) {
+                preferred.entry(col).or_default().push((row, tile, site));
+            }
         }
+    }
+    // In each column keep only the SLICEM rows, and only where the whole
+    // column has them; a column that is SLICEL-only falls back to what it has.
+    // Each CLB contributes TWO slice columns -- the SLICEM half and the
+    // SLICEL half are physically distinct columns (`SLICE_X112Y42` and
+    // `SLICE_X113Y42`). A carry chain must live in a SLICEM column, so drop
+    // the SLICEL-only columns outright rather than preferring a row within
+    // each column: preferring rows leaves every SLICEL-only column in play,
+    // and since `Device::slices()` lists SLICEL first and the column sort is
+    // by distance, one of those columns wins and the chain lands in a SLICEL
+    // again.
+    if preferred.values().any(|r| !r.is_empty()) {
+        by_col.retain(|c, _| preferred.get(c).map(|r| !r.is_empty()).unwrap_or(false));
     }
     // Columns nearest the anchor first; the column key breaks ties so the
     // choice is deterministic.
@@ -170,10 +212,19 @@ fn column_run(
         (dy + (c - ax as i64).unsigned_abs() as i32, *c)
     });
 
-    for col in cols {
+    // Collect every free run of `len` consecutive rows in every column, then
+    // take the one nearest the anchor ROW.
+    //
+    // This used to walk rows ascending from the bottom of each column and take
+    // the first free run, ignoring `ay` for the row entirely. The anchor only
+    // chose the COLUMN, so logic always landed at the bottom of the die: a
+    // counter driving an LED 39 rows above it, reached only by a long
+    // northward route. Choosing by `ay` puts the logic beside the pads it
+    // serves, which is what the reference does and what the router needs.
+    let mut best: Option<(i32, Vec<(String, String)>)> = None;
+    for col in cols.clone() {
         let mut rows = by_col.remove(&col).unwrap_or_default();
         rows.sort_by_key(|(r, _, _)| *r);
-        // Walk ascending rows looking for `len` consecutive free ones.
         let mut i = 0;
         while i < rows.len() {
             let start = i;
@@ -185,17 +236,75 @@ fn column_run(
                 j += 1;
             }
             if !used.contains(&rows[start].2) && j + 1 - start >= len {
-                return Some(
-                    rows[start..start + len]
-                        .iter()
-                        .map(|(_, t, s)| (t.clone(), s.clone()))
-                        .collect(),
-                );
+                // Slide the window of `len` slots ALONG this run and keep the
+                // placement nearest the anchor row.
+                //
+                // Taking only `rows[start..start + len]` is what put the logic
+                // at the bottom of a 150-row column: the free run began at row 0
+                // and covered the whole column, so the window was pinned to rows
+                // 0..6 and the anchor at row 45 was ignored. A 7-element carry
+                // chain then sat 39 rows below the LED it drives and the output
+                // net was lost on the way.
+                //
+                // A window that straddles `ay` scores 0; otherwise the distance
+                // from `ay` to the nearer end. Scanning every window makes the
+                // choice depend on the anchor rather than on where the free run
+                // happens to begin.
+                let n = j + 1 - start;
+                let mut w = 0;
+                while w + len <= n {
+                    let lo = rows[start + w].0;
+                    let hi = rows[start + w + len - 1].0;
+                    let dist = if ay < lo {
+                        lo - ay
+                    } else if ay > hi {
+                        ay - hi
+                    } else {
+                        0
+                    };
+                    if best.as_ref().map(|(bd, _)| dist < *bd).unwrap_or(true) {
+                        let cand: Vec<(String, String)> = rows[start + w..start + w + len]
+                            .iter()
+                            .map(|(_, t, s)| (t.clone(), s.clone()))
+                            .collect();
+                        best = Some((dist, cand));
+                    }
+                    w += 1;
+                }
             }
             i = j + 1;
         }
     }
-    None
+    best.map(|(_, v)| v)
+}
+
+
+/// Translate a `grid_y` into the site-row space the placer works in.
+///
+/// The two are NOT the same axis and not linearly related: `grid_y` numbers
+/// every tile row of the die downward from the top, while a site row numbers
+/// only the slice rows upward in the tile name. `CLBLM_R_X71Y45` is `grid_y`
+/// 109 and `CLBLM_R_X71Y0` is `grid_y` 155, so the axis is reversed and
+/// compressed -- any arithmetic scale factor between them is wrong.
+///
+/// Rather than model that, ask the device: take the slice tile whose `grid_y`
+/// is nearest the anchor and use the row it reports. That is exact by
+/// construction and stays correct on any part.
+fn nearest_slice_row(device: &dyn DeviceQuery, ay_grid: i32) -> i32 {
+    let mut best: Option<(i32, i32)> = None;
+    for (tile, site) in device.slices() {
+        let Some((_col, row)) = device.slice_column(&tile, &site) else {
+            continue;
+        };
+        let Some((_x, g)) = device.tile_xy(&tile) else {
+            continue;
+        };
+        let d = (g - ay_grid).abs();
+        if best.as_ref().map(|(bd, _)| d < *bd).unwrap_or(true) {
+            best = Some((d, row));
+        }
+    }
+    best.map(|(_, r)| r).unwrap_or(0)
 }
 
 /// Place packed cells onto device sites.
@@ -209,16 +318,37 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
     let mut used_sites: HashSet<String> = HashSet::new();
 
     // 1. IOBs to package pins.
+    // Anchor the logic on the IOBs, but a POWER INPUT IS NOT A GOOD ANCHOR.
+    // Taking the first IOB in declaration order anchors on the clock pad
+    // (`clk`, package pin Y9 at the bottom edge), which put the whole counter
+    // 39 rows below the LED it drives. The long northward route that follows
+    // is where the output signal was being lost -- the LED stayed dark with a
+    // correct pad, a correct clock and a correct counter.
+    //
+    // Anchor on the OUTPUT pads instead: they are what the logic must reach,
+    // and it is their rows the reference clusters around. An output is the
+    // sink of the design; placing the logic beside it is both closer to the
+    // reference and strictly better for wirelength.
     let mut anchor: Option<(i32, i32)> = None;
-    for iob in &packed.iobs {
+    let io_order: Vec<&crate::pack::PackedIob> = packed
+        .iobs
+        .iter()
+        .filter(|i| i.dir == crate::pack::IobDir::Out)
+        .chain(packed.iobs.iter().filter(|i| i.dir != crate::pack::IobDir::Out))
+        .collect();
+    for iob in io_order {
         let pin = iob.loc.as_deref().ok_or_else(|| {
             format!("place: IOB {} (port {}) has no PACKAGE_PIN LOC", iob.name, iob.port)
         })?;
         let (tile, site) = device.iob_site_for_pin(pin).ok_or_else(|| {
             format!("place: no IOB site for package pin {pin} (port {})", iob.port)
         })?;
-        if anchor.is_none() {
-            anchor = device.tile_xy(&tile);
+        // Prefer the lowest output row as the anchor, so a design with several
+        // outputs clusters below them rather than on whichever came first.
+        if let Some((_x, y)) = device.tile_xy(&tile) {
+            if anchor.map(|(_ax, ay)| y < ay).unwrap_or(true) {
+                anchor = Some((_x, y));
+            }
         }
         used_sites.insert(site.clone());
         out.iobs.push(PlacedIob {
@@ -279,7 +409,19 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
     // of free slices in a single column is an ERROR, not a fallback to a
     // scattered placement, because a split chain cannot be made correct by
     // routing alone.
-    let (ax, ay) = anchor.unwrap_or((0, 0));
+    let (ax, ay_grid) = anchor.unwrap_or((0, 0));
+    // `tile_xy` reports `grid_y`, which counts DOWNWARD from the top of the
+    // die, while `slice_column` reports the SITE row, which counts UPWARD in
+    // the tile name. They are different spaces: the LED's tile
+    // `RIOB33_X73Y45` is `grid_y` 109, and so is `CLBLM_R_X71Y45`, whereas
+    // `CLBLM_R_X71Y0` is `grid_y` 155. Comparing one against the other silently
+    // picks the wrong end of the die -- the logic landed in rows 0..6 while the
+    // pad it drives sat in row 45, 39 rows away.
+    //
+    // Convert the anchor into site-row space by expressing it relative to the
+    // slice rows the device actually reports.
+    let ay = nearest_slice_row(device, ay_grid);
+
     if !packed.carries.is_empty() {
         // Group elements by chain id, preserving their first-seen order.
         let mut chain_order: Vec<String> = Vec::new();
@@ -503,6 +645,15 @@ mod tests {
             let rest = site.strip_prefix("SLICE_X")?;
             let (c, r) = rest.split_once('Y')?;
             Some((c.parse().ok()?, r.parse().ok()?))
+        }
+
+        /// The fake device models one slice per row in a single column, all
+        /// of which stand in for the SLICEM half. Real devices pair a SLICEM
+        /// with a SLICEL in each CLB; the tests only need the chain to be
+        /// placeable, and `column_run` degrades to "whatever the device
+        /// offers" when no column reports an SLICEM.
+        fn slice_is_m(&self, _tile: &str, _site: &str) -> bool {
+            true
         }
     }
 
