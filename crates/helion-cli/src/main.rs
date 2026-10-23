@@ -880,6 +880,17 @@ fn compile_design_xdc(
         routed.overused,
         t2.elapsed().as_millis()
     );
+    // An output IOB with no driver is a design/netlist problem, not a routing
+    // one, and it is invisible downstream -- the bitstream simply has no path
+    // to that pin. Surface it here rather than letting a fabricated route hide
+    // it.
+    if !routed.undriven_iobs.is_empty() {
+        eprintln!(
+            "warning: {} output IOB(s) have no driver in the netlist and are unrouted: {}",
+            routed.undriven_iobs.len(),
+            routed.undriven_iobs.join(", ")
+        );
+    }
     let drc = check_routed(&design, &routed, &dev);
     if !drc.ok() {
         eprintln!("hang_diag drc {}", drc.text().replace('\n', " | "));
