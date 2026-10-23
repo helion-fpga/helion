@@ -10717,42 +10717,54 @@ fn rexpr_to_bit<'a>(e: &RExpr<'_>, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Re
                         }
                     }
                     RExpr::Shr(a, sh) => {
-                        let shift = match *sh {
-                            RExpr::Const { val, .. } => *val as usize,
-                            _ => return Err("shift amount not const".into()),
-                        };
-                        let wa = rexpr_width(a, rtl);
-                        if bit.saturating_add(shift) >= wa {
-                            memo.insert(key, Expr::Const(false));
-                        } else {
-                            let ck = tobit_key(*a, bit + shift);
-                            stack.push(ToBitTask::Build {
-                                key,
-                                op: ToBitOp::Forward(ck),
-                            });
-                            if !memo.contains_key(&ck) {
-                                stack.push(ToBitTask::Visit(*a, bit + shift));
+                        let wa = rexpr_width(a, rtl).max(1);
+                        if let RExpr::Const { val, .. } = *sh {
+                            // Constant amount: a plain wire selection.
+                            let shift = *val as usize;
+                            if bit.saturating_add(shift) >= wa {
+                                memo.insert(key, Expr::Const(false));
+                            } else {
+                                let ck = tobit_key(*a, bit + shift);
+                                stack.push(ToBitTask::Build {
+                                    key,
+                                    op: ToBitOp::Forward(ck),
+                                });
+                                if !memo.contains_key(&ck) {
+                                    stack.push(ToBitTask::Visit(*a, bit + shift));
+                                }
                             }
+                        } else {
+                            // Variable amount: bit i of (a >> s) is OR over k of
+                            // (a[i+k] & (s == k)), zero when i+k is past the MSB.
+                            // This is the mirror of the Shl barrel below. The
+                            // old code refused a non-const amount, and the
+                            // caller swallowed the error, so `y = a >> b` left
+                            // y entirely undriven (it read as constant 0).
+                            let mut acc: Option<Expr> = None;
+                            for k in 0..(wa - bit) {
+                                let want = RExpr::Const {
+                                    val: k as u128,
+                                    width: 32,
+                                    care: u128::MAX,
+                                };
+                                let eq = cmp_eq_bits(sh, &want, rtl, true, arena)?;
+                                let abit = rexpr_to_bit(a, rtl, bit + k, arena)?;
+                                let term = Expr::And(arena.alloc(abit), arena.alloc(eq));
+                                acc = Some(match acc {
+                                    None => term,
+                                    Some(prev) => Expr::Or(arena.alloc(prev), arena.alloc(term)),
+                                });
+                            }
+                            memo.insert(key, acc.unwrap_or(Expr::Const(false)));
                         }
                     }
                     RExpr::Ashr(a, sh) => {
-                        let shift = match *sh {
-                            RExpr::Const { val, .. } => *val as usize,
-                            _ => return Err("ashr amount not const".into()),
-                        };
                         let wa = rexpr_width(a, rtl).max(1);
-                        let src = bit.saturating_add(shift);
-                        if src >= wa {
-                            // Sign-fill from MSB.
-                            let ck = tobit_key(*a, wa - 1);
-                            stack.push(ToBitTask::Build {
-                                key,
-                                op: ToBitOp::Forward(ck),
-                            });
-                            if !memo.contains_key(&ck) {
-                                stack.push(ToBitTask::Visit(*a, wa - 1));
-                            }
-                        } else {
+                        if let RExpr::Const { val, .. } = *sh {
+                            let shift = *val as usize;
+                            let src = bit.saturating_add(shift);
+                            // Past the MSB the sign bit is replicated.
+                            let src = if src >= wa { wa - 1 } else { src };
                             let ck = tobit_key(*a, src);
                             stack.push(ToBitTask::Build {
                                 key,
@@ -10761,6 +10773,42 @@ fn rexpr_to_bit<'a>(e: &RExpr<'_>, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Re
                             if !memo.contains_key(&ck) {
                                 stack.push(ToBitTask::Visit(*a, src));
                             }
+                        } else {
+                            // Variable amount, sign-filling: bit i is a[i+k]
+                            // when exactly one k matches and i+k < wa, else the
+                            // sign bit when s is large enough to shift past it.
+                            // Mirror of the Shl/Shr barrels.
+                            let mut acc: Option<Expr> = None;
+                            for k in 0..(wa - bit) {
+                                let want = RExpr::Const {
+                                    val: k as u128,
+                                    width: 32,
+                                    care: u128::MAX,
+                                };
+                                let eq = cmp_eq_bits(sh, &want, rtl, true, arena)?;
+                                let abit = rexpr_to_bit(a, rtl, bit + k, arena)?;
+                                let term = Expr::And(arena.alloc(abit), arena.alloc(eq));
+                                acc = Some(match acc {
+                                    None => term,
+                                    Some(prev) => Expr::Or(arena.alloc(prev), arena.alloc(term)),
+                                });
+                            }
+                            // Any shift that pushes the result below bit i
+                            // leaves the sign bit: OR in `sign & (s >= wa - bit)`.
+                            let sign = rexpr_to_bit(a, rtl, wa - 1, arena)?;
+                            let low = RExpr::Const {
+                                val: (wa - bit) as u128,
+                                width: 32,
+                                care: u128::MAX,
+                            };
+                            // ~(s < low) as `!(s < low)`.
+                            let sat = Expr::Not(arena.alloc(lt_bits(sh, &low, rtl, arena)?));
+                            let sgn = Expr::And(arena.alloc(sign), arena.alloc(sat));
+                            acc = Some(match acc {
+                                None => sgn,
+                                Some(prev) => Expr::Or(arena.alloc(prev), arena.alloc(sgn)),
+                            });
+                            memo.insert(key, acc.unwrap_or(Expr::Const(false)));
                         }
                     }
                     RExpr::Shl(a, sh) => {
@@ -12809,7 +12857,6 @@ fn try_map_xnor_and_tree(
         out: Option<&str>,
         mut level: Vec<String>,
     ) -> Option<String> {
-        eprintln!("DBG emit_and_reduce level={level:?} out={out:?}");
         if level.is_empty() {
             return None;
         }
@@ -12830,7 +12877,6 @@ fn try_map_xnor_and_tree(
                     None
                 };
                 let pins: Vec<String> = chunk.to_vec();
-                eprintln!("DBG AND chunk pins={pins:?} init={:#x}", lut6_and_n(pins.len()));
                 next.push(share.lut6(d, prefix, drive, lut6_and_n(pins.len()), &pins));
             }
             level = next;
@@ -12898,7 +12944,6 @@ fn try_map_xnor_and_tree(
         if let Expr::Not(inner) = leaf {
             let mut xnors = Vec::new();
             if collect_xnor_and(inner, &mut xnors) && !xnors.is_empty() {
-                eprintln!("DBG map_one_leaf Not with {} xnors", xnors.len());
                 for x in &xnors { eprintln!("   xnor {x:?}"); }
                 let eq = map_xnor_leaves(d, prefix, share, None, &xnors)?;
                 return Some(share.lut6(d, prefix, out, lut6_inv(), &[eq]));
@@ -12922,9 +12967,7 @@ fn try_map_xnor_and_tree(
         }
         xnors.clear();
         let c = collect_xnor_and(expr, &mut xnors);
-        eprintln!("DBG top whole-expr collect_xnor_and={c} n={} expr={expr:?}", xnors.len());
         if c && xnors.len() >= 2 {
-            eprintln!("DBG top -> map_xnor_leaves (DROPS non-xnor leaves!)");
             return map_xnor_leaves(d, prefix, share, out, &xnors);
         }
     }
@@ -12948,11 +12991,9 @@ fn try_map_xnor_and_tree(
     if !looks_eq {
         return None;
     }
-    eprintln!("DBG and_reduce nleaves={} leaves={:?}", leaves.len(), leaves);
     let mut level = Vec::new();
     for leaf in &leaves {
         let r = map_one_leaf(d, prefix, share, None, leaf)?;
-        eprintln!("DBG   leaf -> {r}");
         level.push(r);
     }
     emit_and_reduce(d, prefix, share, out, level)
@@ -13002,12 +13043,9 @@ fn try_map_bool_leaf(
     out: Option<&str>,
     leaf: &Expr,
 ) -> Option<String> {
-    eprintln!("DBG bool_leaf ENTER {leaf:?}");
     if let Some(n) = try_map_xnor_and_tree(d, leaf, prefix, out, share) {
-        eprintln!("DBG bool_leaf xnor -> {n}");
         return Some(n);
     }
-    eprintln!("DBG bool_leaf xnor failed, cone_pi_exceeds={}", cone_pi_exceeds(leaf,6));
     if !cone_pi_exceeds(leaf, 6) {
         return share.lut6_from_expr(d, prefix, out, leaf);
     }
