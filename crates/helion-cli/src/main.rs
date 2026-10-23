@@ -392,19 +392,70 @@ fn is_sv_keyword(t: &str) -> bool {
 ///
 /// `\` is deliberately not checked: it appears in macros and line
 /// continuations, and a token scan cannot distinguish those from a typo.
+/// Whether the token at `idx` sits inside a based literal such as
+/// `32'b 0000000_?????_000??_...` (wildcard case-decode tables use runs of
+/// `?`, one per don't-care digit, and every one of them is legal).
+///
+/// `sv_tokens` yields the base as three separate tokens (`32`, `'`, `b`) and
+/// each `?`, digit, and `_` as its own token, so walk back over that run and
+/// then require a size-and-base prefix (`32 ' b`) or a bare base (`' b`).
+fn in_based_literal(toks: &[String], idx: usize) -> bool {
+    let is_literal_digit = |t: &str| {
+        !t.is_empty()
+            && t.chars().all(|c| {
+                c == '?'
+                    || c == '_'
+                    || c.is_ascii_digit()
+                    || matches!(c, 'a'..='f' | 'A'..='F' | 'x' | 'X' | 'z' | 'Z')
+            })
+    };
+    let mut j = idx;
+    while j > 0 && is_literal_digit(&toks[j - 1]) {
+        j -= 1;
+    }
+    // `j` now indexes the first digit token. The tokenizer splits `32'b` into
+    // the three tokens `32`, `'`, `b`, so with a size the base letter is at
+    // `j - 1` and the quote at `j - 2`; without a size (`'b1`) the quote is at
+    // `j - 1`.
+    let is_base = |t: &str| matches!(t, "b" | "B" | "h" | "H" | "d" | "D" | "o" | "O");
+    let prev = |k: usize| -> Option<&str> { j.checked_sub(k).and_then(|n| toks.get(n)).map(String::as_str) };
+    if let Some(base) = prev(1) {
+        if is_base(base) {
+            // `32'b...` or `'b...`
+            return prev(2) == Some("'") || prev(2).is_none();
+        }
+    }
+    prev(1) == Some("'")
+}
+
 fn check_stray_tokens(toks: &[String], origin: &str) -> Result<(), String> {
     for (idx, t) in toks.iter().enumerate() {
         let next = idx.checked_add(1).and_then(|i| toks.get(i)).map(|s| s.as_str());
         match t.as_str() {
             "@" => {
-                if !matches!(next, Some("(") | Some("*")) {
+                // `@(...)`, `@*`, and `@(*)`. The last one arrives as `@` `(*`
+                // because the scanner treats `(*` as a single attribute
+                // delimiter, which is why `@(*)` (a combinational always block)
+                // used to be reported as a stray `@`.
+                let ok = match next {
+                    Some("(") | Some("*") => true,
+                    Some("(*") => toks.get(idx + 2).map(String::as_str) == Some(")"),
+                    _ => false,
+                };
+                if !ok {
                     return Err(format!(
                         "{origin}: stray `@` (token {idx}); expected an event control such as `@(posedge clk)`"
                     ));
                 }
             }
             "?" if next == Some("?") => {
-                return Err(format!("{origin}: stray `??` (token {idx}) is not valid syntax"));
+                // A run of `?` is legal as a wildcard inside a based literal
+                // (`32'b 0000_?????_...`, common in case-decode tables), where
+                // every `?` is a digit. Only a `??` with no literal before it
+                // is a typo.
+                if !in_based_literal(toks, idx) {
+                    return Err(format!("{origin}: stray `??` (token {idx}) is not valid syntax"));
+                }
             }
             _ => {}
         }
@@ -543,6 +594,26 @@ fn sv_tokens(source: &str) -> Vec<String> {
                 i += 1;
             }
             i += 1;
+            continue;
+        }
+        // Comments are not tokens. Without this, comment bodies were scanned as
+        // punctuation, so legal source was rejected: `serv_bufreg2.v` carries
+        // an SPDX line with an email address (`<olof@award-winning.me>`) whose
+        // `@` is not an event control, and `picorv32.v` has a wildcard case
+        // literal `32'b 0000_?????_...` whose `?` runs are not a typo. Both
+        // projects compiled before this token scan existed.
+        if c == '/' && b.get(i + 1) == Some(&'/') {
+            while i < b.len() && b[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && b.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i < b.len() && !(b[i] == '*' && b.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
             continue;
         }
         if c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '`' {
