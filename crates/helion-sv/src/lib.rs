@@ -4029,7 +4029,11 @@ fn tokenize(s: &str) -> Result<Vec<Tok<'_>>, String> {
                 out.push(Tok::Sym('\''));
                 continue;
             }
-            let width = if saw_base { ndigits.max(1) } else { 1 };
+            // An unsized based literal (`'h1234`) takes the 32-bit Verilog
+            // integer default. Using the digit count truncated it: `'h1234`
+            // was 4 bits wide and read 0x4, `'hff` read 0x3. A bare `'0`/`'1`
+            // is a 1-bit value and keeps width 1.
+            let width = if saw_base { 32 } else { 1 };
             let val = parse_based_digits(digits, base);
             out.push(Tok::Number(val, width));
             continue;
@@ -4072,7 +4076,10 @@ fn tokenize(s: &str) -> Result<Vec<Tok<'_>>, String> {
             let n = &s[nstart..i];
             if b.get(i) == Some(&b'\'') {
                 i += 1;
-                let width: usize = n.parse().unwrap_or(1);
+                // Sized literal (`8'h34`); the unsized `'h34` form is handled
+                // by the tick branch above. A size that fails to parse falls
+                // back to the 32-bit integer default rather than 1 bit.
+                let width: usize = n.parse().unwrap_or(32);
                 let mut base = 10;
                 if i < b.len() {
                     match (b[i] as char).to_ascii_lowercase() {
@@ -11800,7 +11807,10 @@ fn width_step<'x>(
             }
         }
         RExpr::WordAt { data, .. } => Some(child(*data as *const RExpr<'x>)?.max(1)),
-        RExpr::Const { width, .. } => Some((*width).max(1)),
+        // Width 0 is an unsized decimal, which Verilog gives the 32-bit
+        // integer default. Reporting 1 here truncated it: `assign y = 5;`
+        // widened only bit 0 and read back 1, and `assign y = 300;` read 0.
+        RExpr::Const { width, .. } => Some(if *width == 0 { 32 } else { *width }),
         RExpr::Concat(parts) => {
             let mut acc = 0usize;
             for p in parts {
