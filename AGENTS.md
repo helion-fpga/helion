@@ -62,7 +62,7 @@ column loses its edge past the last enabled repeater. Take the neighbour on
 each side unconditionally (Vivado does), then walk outward only while logic
 lies beyond.
 
-`clock_companions` is a hand-written table and has been wrong twice; two of the four stages we model were missing bits. Prefer deriving companions from the DB the way pips are derived. Check with `python3 scripts/clkdiff.py <ours.bit>` -- it diffs the whole spine against `~/CDA4253_A1/blinky.bit` and prints features MISSING vs Vivado. Note prjxray silently drops unmatched FASM lines, so a clean assemble proves self-consistency only.
+`clock_companions` is a hand-written table and has been wrong twice; two of the four stages we model were missing bits. Prefer deriving companions from the DB the way pips are derived. Check with `python3 work/clkdiff.py <ours.bit>` -- it scans **every clock tile on the device** against `~/CDA4253_A1/blinky.bit` and separates REAL diffs from benign routing choices. A single-path version is blind by construction: it can only confirm the route someone already thought of, and that is exactly how the missing REBUF enables survived. Note prjxray silently drops unmatched FASM lines, so a clean assemble proves self-consistency only.
 
 ### FF configuration: two bits per flop, and both are mandatory
 
