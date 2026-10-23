@@ -160,13 +160,31 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         let _ = p;
     }
 
-    // BUFGCTRLs. Feature path: TILE.BUFGCTRL.<site>.IN_USE.
+    // BUFGCTRLs. Configuration for I0 -> O clock buffer.
+    // Xilinx UG472: For I0->O, set S0=1, S1=0, CE0=1, IGNORE0=0, IGNORE1=1.
+    // X-Ray ZINV_ polarity: feature present => bit=0 => signal NOT inverted.
+    //   ZINV_S0 present  => S0=1 (select I0)
+    //   ZINV_S1 absent   => S1=0 (deselect I1) [bit=1 means inverted->0]
+    //   ZINV_CE0 present => CE0=1 (enable I0 path)
+    //   ZINV_CE1 absent  => CE1=0 (disable I1 path)
+    //   ZPRESELECT_I0 present, PRESELECT_I1 absent => preselect I0
     for bufg in &placed.bufgs {
         let site_rel = device
             .site_rel(&bufg.tile, &bufg.site)
             .ok_or_else(|| format!("emit: no rel site for {} {}", bufg.tile, bufg.site))?;
         lines.push(format!("{}.BUFGCTRL.{}.IN_USE", bufg.tile, site_rel));
+        lines.push(format!("{}.BUFGCTRL.{}.INIT_OUT", bufg.tile, site_rel));
         lines.push(format!("{}.BUFGCTRL.{}.IS_IGNORE0_INVERTED", bufg.tile, site_rel));
+        lines.push(format!("{}.BUFGCTRL.{}.IS_IGNORE1_INVERTED", bufg.tile, site_rel));
+        // Select I0: S0=1, S1=0
+        lines.push(format!("{}.BUFGCTRL.{}.ZINV_S0", bufg.tile, site_rel));
+        // S1=0: do NOT emit ZINV_S1 (bit=1 => S1 inverted to 0)
+        // Enable I0 path: CE0=1
+        lines.push(format!("{}.BUFGCTRL.{}.ZINV_CE0", bufg.tile, site_rel));
+        // CE1=0: do NOT emit ZINV_CE1 (bit=1 => CE1 inverted to 0)
+        // Preselect I0
+        lines.push(format!("{}.BUFGCTRL.{}.ZPRESELECT_I0", bufg.tile, site_rel));
+        // Do NOT emit PRESELECT_I1 (deselect I1)
     }
 
     // RAMB18E1s. Feature path: TILE.RAMB18.<site>.IN_USE. INIT data
@@ -184,13 +202,19 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     // registers) requires the detailed attribute bit mapping; future work.
     let _ = &placed.dsps;
 
-    // CARRY4s. Feature path: TILE.SLICEL_<X>.CARRY4.IN_USE. The carry chain
-    // muxing (CYINIT, CI) is not yet emitted; minimal placement only.
+    // CARRY4s. Feature path: TILE.SLICEL_<X>.CARRY4.<bit>. The carry chain
+    // muxing uses ACY0/BCY0/CCY0/DCY0 for the 4 bits. CYINIT via PRECYINIT.
+    // NOTE: Full carry chain configuration is incomplete; this is a known
+    // limitation being addressed. For now, emit the mux bits that are in the DB.
     for carry in &placed.carries {
         let site_rel = device
             .site_rel(&carry.tile, &carry.site)
             .ok_or_else(|| format!("emit: no rel site for {} {}", carry.tile, carry.site))?;
-        lines.push(format!("{}.{}.CARRY4.IN_USE", carry.tile, site_rel));
+        // Emit the carry mux bits that exist in the X-Ray DB.
+        // ACY0/BCY0/CCY0/DCY0 select the carry propagate for each bit.
+        for bit in ["ACY0", "BCY0", "CCY0", "DCY0"] {
+            lines.push(format!("{}.{}.CARRY4.{}", carry.tile, site_rel, bit));
+        }
     }
 
     // Routing pips: TILE.DST.SRC. Pseudo-pips are always-on hard
