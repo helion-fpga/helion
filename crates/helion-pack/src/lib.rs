@@ -91,6 +91,22 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
                 c.name
             ));
         }
+        // These three reach the same place as the two above: the main loop
+        // below matches only `Lut6` and `continue`s on everything else, so
+        // without this they would be dropped from the netlist without a word.
+        // `Carry4` is the significant one -- the IR documents it as packed,
+        // and only the xilinx7 packer actually does so.
+        if let Some(kind) = match c.kind {
+            CellKind::Carry4 => Some("Carry4 (carry chain)"),
+            CellKind::BlackBox { .. } => Some("BlackBox"),
+            CellKind::Ila { .. } => Some("Ila (integrated logic analyser)"),
+            _ => None,
+        } {
+            return Err(format!(
+                "cell {} is {kind}: unsupported for HL10T pack (multi-backend flow only)",
+                c.name
+            ));
+        }
     }
     // Ibex-scale: linear scans via Design::net_on are O(n^3). Index once.
     let pins = design.pin_index();
@@ -385,5 +401,37 @@ mod tests {
         // The gold counter (no multi-backend cells) still packs fine.
         let p = pack(&Design::structural_counter(), &dev).unwrap();
         assert_eq!(p.lutffs.len(), 4);
+    }
+
+    /// `Carry4`, `BlackBox` and `Ila` must be REJECTED, not dropped.
+    ///
+    /// The main loop matches only `Lut6` and `continue`s on everything else,
+    /// so before this guard existed these three were removed from the netlist
+    /// silently. `Carry4` is the one that matters: the IR documents it as
+    /// packed, and only the xilinx7 packer actually does so, so an HL10T
+    /// build containing a carry chain produced a bitstream without it and
+    /// reported success.
+    #[test]
+    fn pack_rejects_carry_blackbox_and_ila_for_hl10t() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let kinds = [
+            (CellKind::Carry4, "Carry4"),
+            (CellKind::BlackBox { module: "m".into() }, "BlackBox"),
+            (CellKind::Ila { net: "n".into() }, "Ila"),
+        ];
+        for (kind, label) in kinds {
+            let mut d = Design::new("drop");
+            d.add_cell("u_x", kind);
+            let err = pack(&d, &dev)
+                .expect_err(&format!("{label} must be rejected, not silently dropped"));
+            assert!(
+                err.contains("unsupported for HL10T"),
+                "{label}: expected HL10T rejection, got: {err}"
+            );
+            assert!(
+                err.contains("u_x"),
+                "{label}: error must name the offending cell, got: {err}"
+            );
+        }
     }
 }
