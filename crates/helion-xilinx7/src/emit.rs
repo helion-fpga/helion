@@ -105,7 +105,9 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     //
     // Control signal configuration (per X-Ray DB segbits_clbll_l.db):
     // - {bel}.ZRST: SR pin acts as RESET (vs SET). Emitted when the FF has
-    //   an SR net. The Z prefix means the config bit is 0 when present.
+    //   an SR net. prjxray's Z prefix names the zero-state option (ZRST =
+    //   reset-to-zero, like ZINI = init-to-zero); the FASM feature sets the
+    //   documented config bit (bit = 1), it does not clear it.
     // - {slice}.CEUSEDMUX: slice-level, enables the CE input mux. Needed
     //   when any FF in the slice has a CE net.
     // - {slice}.SRUSEDMUX: slice-level, enables the SR input mux. Needed
@@ -191,31 +193,44 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         let _ = p;
     }
 
-    // BUFGCTRLs. Configuration for I0 -> O clock buffer.
-    // Xilinx UG472: For I0->O, set S0=1, S1=0, CE0=1, IGNORE0=0, IGNORE1=1.
-    // X-Ray ZINV_ polarity: feature present => bit=0 => signal NOT inverted.
-    //   ZINV_S0 present  => S0=1 (select I0)
-    //   ZINV_S1 absent   => S1=0 (deselect I1) [bit=1 means inverted->0]
-    //   ZINV_CE0 present => CE0=1 (enable I0 path)
-    //   ZINV_CE1 absent  => CE1=0 (disable I1 path)
-    //   ZPRESELECT_I0 present, PRESELECT_I1 absent => preselect I0
+    // BUFGCTRLs. Static configuration for an I0 -> O clock buffer (BUFG).
+    //
+    // Xilinx UG472 Fig. 2-5 "BUFG as BUFGCTRL" builds a BUFG from a
+    // BUFGCTRL by DRIVING the control pins: S0=VDD, CE0=VDD, IGNORE0=GND,
+    // S1=GND, CE1=GND, IGNORE1=VDD. UG472 Table 2-3: (CE0,S0,CE1,S1) =
+    // (1,1,0,X) or (1,1,X,0) selects I0; any other select state holds O at
+    // INIT_OUT with no toggle.
+    //
+    // Bit meanings below are from prjxray fuzzer 042-clk-bufg-config
+    // (generate.py): a `Z` prefix means the FASM feature is the INVERSE of
+    // the Vivado attribute (feature present <=> attribute is 0/FALSE); a
+    // non-Z feature is present <=> attribute is 1/TRUE.
+    //   ZINV_S0/ZINV_S1/ZINV_CE0/ZINV_CE1 present <=> pin NOT inverted.
+    //   ZPRESELECT_I0 present <=> PRESELECT_I0=FALSE; PRESELECT_I1 absent
+    //     <=> PRESELECT_I1=FALSE (both FALSE is the Vivado default).
+    //   INIT_OUT absent <=> INIT_OUT=0 (default).
+    //   IS_IGNORE0/1_INVERTED absent <=> IGNORE pins NOT inverted (default).
+    //
+    // NOTE: these bits set pin polarity and defaults only; they do NOT
+    // drive the pins. S0/S1/CE0/CE1/IGNORE0/IGNORE1 must additionally be
+    // ROUTED to constants (S0=1, CE0=1, IGNORE0=0, S1=0, CE1=0,
+    // IGNORE1=1). The router does not do tie-off routing yet, so the clock
+    // will not pass until that lands. Do NOT "fix" this by omitting
+    // ZINV_S1/ZINV_CE1: omitting them INVERTS the pins (it does not drive
+    // them to 0), which freezes O at "Old Input" per Table 2-3 once the
+    // pins are driven.
     for bufg in &placed.bufgs {
         let site_rel = device
             .site_rel(&bufg.tile, &bufg.site)
             .ok_or_else(|| format!("emit: no rel site for {} {}", bufg.tile, bufg.site))?;
         lines.push(format!("{}.BUFGCTRL.{}.IN_USE", bufg.tile, site_rel));
-        lines.push(format!("{}.BUFGCTRL.{}.INIT_OUT", bufg.tile, site_rel));
-        lines.push(format!("{}.BUFGCTRL.{}.IS_IGNORE0_INVERTED", bufg.tile, site_rel));
-        lines.push(format!("{}.BUFGCTRL.{}.IS_IGNORE1_INVERTED", bufg.tile, site_rel));
-        // Select I0: S0=1, S1=0
-        lines.push(format!("{}.BUFGCTRL.{}.ZINV_S0", bufg.tile, site_rel));
-        // S1=0: do NOT emit ZINV_S1 (bit=1 => S1 inverted to 0)
-        // Enable I0 path: CE0=1
+        // No inversion on any control pin: driven values pass through.
         lines.push(format!("{}.BUFGCTRL.{}.ZINV_CE0", bufg.tile, site_rel));
-        // CE1=0: do NOT emit ZINV_CE1 (bit=1 => CE1 inverted to 0)
-        // Preselect I0
+        lines.push(format!("{}.BUFGCTRL.{}.ZINV_CE1", bufg.tile, site_rel));
+        lines.push(format!("{}.BUFGCTRL.{}.ZINV_S0", bufg.tile, site_rel));
+        lines.push(format!("{}.BUFGCTRL.{}.ZINV_S1", bufg.tile, site_rel));
+        // PRESELECT_I0=FALSE, PRESELECT_I1=FALSE (Vivado defaults).
         lines.push(format!("{}.BUFGCTRL.{}.ZPRESELECT_I0", bufg.tile, site_rel));
-        // Do NOT emit PRESELECT_I1 (deselect I1)
     }
 
     // RAMB18E1s. Feature path: TILE.RAMB18.<site>.IN_USE. INIT data
