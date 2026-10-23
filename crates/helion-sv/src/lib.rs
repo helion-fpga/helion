@@ -797,6 +797,10 @@ thread_local! {
     /// standalone `initial` blocks. Their synthesizable logic is kept.
     static SIM_ONLY_INITIAL_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+    /// One `unroll_cap` line per module whose for-loop exceeds the 4096
+    /// iteration unroll budget.
+    static UNROLL_CAP_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
     /// One `negedge_not_lowered` line per module+signal.
     static NEGEDGE_NOT_LOWERED_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
@@ -1676,6 +1680,27 @@ fn clock_gate_for(module: &str) -> bool {
 
 /// Word pipeline longer than 4, or a bound that is not a constant. One line.
 /// Extra stages are not invented. Not a closed WNS.
+/// A for-loop needs more unrolled iterations than the budget allows.
+///
+/// The unroller returned an empty statement list at this point with no
+/// diagnostic, so `for (i = 0; i < 5000; i = i + 1) ...` silently contributed
+/// nothing and the only clue was a generic `no_body` on the module.
+fn note_unroll_cap(module: &str, niter: usize) {
+    let module = if module.is_empty() { "?" } else { module };
+    let fresh = UNROLL_CAP_SEEN.with(|s| s.borrow_mut().insert(module.to_string()));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic unroll_cap module={module} iterations={niter} (loop unroll capped at 4096; body not mapped; not a LUT; not a closed WNS)"
+    ));
+}
+
+/// True when this module had a loop refused by the unroll budget.
+fn unroll_cap_for(module: &str) -> bool {
+    UNROLL_CAP_SEEN.with(|s| s.borrow().contains(module))
+}
+
 fn note_word_pipeline_cap(module: &str, signal: &str, cycles: &str) {
     let module = if module.is_empty() { "?" } else { module };
     let signal = if signal.is_empty() { "res" } else { signal };
@@ -6355,6 +6380,7 @@ fn parse_for_unroll<'a>(p: &mut P<'a>) -> Result<(Vec<Nba<'a>>, Vec<ImmAssertAst
         }
     }
     if niter > 4096 {
+        note_unroll_cap(&cur_mod(), niter);
         return Ok((Vec::new(), Vec::new()));
     }
     let step = step.max(1);
@@ -10321,6 +10347,7 @@ fn parse_for_unroll_module<'a>(
     let body = p.t[start_i..p.i].to_vec();
     let niter = end.saturating_sub(start) / step.max(1);
     if niter > 4096 {
+        note_unroll_cap(&cur_mod(), niter);
         return Ok(());
     }
     let mut i = start;
@@ -19065,6 +19092,10 @@ fn synth_from_parsed_top(
     // report a closed WNS.
     if gate_primitive_for(&top_name) {
         d.attrs.set("GATE_PRIMITIVE", "1");
+    }
+    if unroll_cap_for(&top_name) {
+        d.attrs.set("UNROLL_CAP", "1");
+        d.attrs.set("NO_BODY", "1");
     }
     if sim_only_for(&top_name) {
         d.attrs.set("SIM_ONLY", "1");
