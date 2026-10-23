@@ -271,6 +271,17 @@ fn port_attr<'a>(
 }
 
 /// Trailing integer of a net name, e.g. `led_3` or `led[3]` -> `3`.
+/// Whether `net` is the bit-`n` net of port `port`, i.e. `btn_3` for `btn`.
+///
+/// Requires the separator so a port named `btn` does not swallow an unrelated
+/// net named `btnx` or `btn_extra`.
+fn is_bit_net_of(net: &str, port: &str) -> bool {
+    net.len() > port.len() + 1
+        && net.starts_with(port)
+        && net.as_bytes()[port.len()] == b'_'
+        && net[port.len() + 1..].chars().all(|c| c.is_ascii_digit())
+}
+
 fn bit_suffix(net: &str) -> Option<u32> {
     if let Some(open) = net.rfind('[') {
         if let Some(close) = net[open..].find(']') {
@@ -442,8 +453,90 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
     }
 
     insert_clock_spine(netlist, &mut out)?;
+    insert_data_input_iobs(netlist, &mut out)?;
 
     Ok(out)
+}
+
+/// Give every remaining top-level input port an input IOB, one per bit.
+///
+/// `insert_clock_spine` only creates an input IOB for a net that drives an FF
+/// clock. Every other input port was left with no IOB at all, so the pad net
+/// (`btn_0`) had no driver anywhere in the netlist and routing refused the
+/// design with "net `btn_0` has 0 drivers (need exactly 1)". That made any
+/// design with a data input -- a button, a switch, a UART pin -- unbuildable,
+/// which is why every board test so far was output-only.
+///
+/// One IOB per bit, named after the bit's net (`btn_0`), for the same reason
+/// the output side is bit-qualified: an XDC constrains vector bits
+/// individually, so `PinConstraints` stores `LOC[0]`..`LOC[4]` on the vector
+/// port and nothing under a plain `LOC`. `port_attr` recovers the bit from the
+/// net's `_<n>` suffix, so a bit-qualified net is what makes the constraint
+/// findable. A single IOB for the whole vector would have neither a plain LOC
+/// nor a suffix and would be refused with "IOB has no PACKAGE_PIN LOC".
+///
+/// A width-1 port keeps its bare name (`bit_name` does the same), so a scalar
+/// input still resolves through a plain `LOC`.
+fn insert_data_input_iobs(netlist: &Design, packed: &mut Packed7) -> Result<(), String> {
+    // A clock spine consumes `<port>` through `<port>_ibuf`, so the port is
+    // already padded if its name is present among the input IOBs.
+    let covered: std::collections::HashSet<String> = packed
+        .iobs
+        .iter()
+        .filter(|i| i.dir == IobDir::In)
+        .map(|i| i.port.clone())
+        .collect();
+
+    for port in &netlist.ports {
+        if port.dir != PortDir::In || covered.contains(&port.name) {
+            continue;
+        }
+        // Discover the bits from the nets that actually exist rather than a
+        // declared width: `Port` carries no width, and the frontend already
+        // names input bits `<port>_<n>` only when it uses them. A bit that no
+        // logic reads has no net to drive, so there is nothing to pad.
+        let mut bits: Vec<String> = netlist
+            .nets
+            .iter()
+            .filter(|n| n.name == port.name || is_bit_net_of(&n.name, &port.name))
+            .map(|n| n.name.clone())
+            .collect();
+        bits.sort();
+        bits.dedup();
+        if bits.is_empty() {
+            bits.push(port.name.clone());
+        }
+        let width = bits.len();
+        for net in bits {
+            let bit = bit_suffix(&net).unwrap_or(0);
+            packed.iobs.push(PackedIob {
+                // Unique per bit: a shared name made two IOBs indistinguishable
+                // in reports and in the placement error messages.
+                name: format!("ibuf_{}", net),
+                port: port.name.clone(),
+                dir: IobDir::In,
+                net,
+                // `PinConstraints` stores a vector bit's pin as `LOC[3]` on the
+                // vector port and nothing under a plain `LOC`, so resolve the
+                // bit-qualified key first and fall back to the plain one for a
+                // scalar port.
+                loc: port
+                    .attrs
+                    .get(&format!("LOC[{bit}]"))
+                    .or_else(|| port.attrs.get("LOC"))
+                    .map(|s| s.to_string()),
+                iostandard: port
+                    .attrs
+                    .get(&format!("IOSTANDARD[{bit}]"))
+                    .or_else(|| port.attrs.get("IOSTANDARD"))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "LVCMOS33".to_string()),
+                drive: None,
+                slew: None,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Insert IBUF + BUFGCTRL for clock inputs.
