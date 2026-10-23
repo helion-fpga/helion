@@ -15,6 +15,16 @@ pub trait EmitDevice {
     /// (FASM tile prefixes use the type for segbits lookup, but the line
     /// itself uses the full tile name.)
     fn tile_type(&self, tile: &str) -> Option<String>;
+    /// Features the part requires in *every* bitstream, from the X-Ray DB's
+    /// `required_features.fasm`.
+    ///
+    /// These are not optional decoration: the DB ships that file precisely
+    /// because a bitstream without them is not a valid configuration for the
+    /// part. Every Helion bitstream produced before this was added omitted
+    /// them, while the working Vivado reference sets all three.
+    fn required_features(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Site name relative to its tile for FASM, e.g.
     /// `("RIOB33_X43Y75", "IOB_X1Y76")` → `"IOB_Y1"`,
     /// `("CLBLL_L_X14Y100", "SLICE_X28Y100")` → `"SLICEL_X0"`.
@@ -157,6 +167,10 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     let packed = &placed.packed;
     let mut lines: Vec<String> = Vec::new();
 
+    // Features every bitstream for this part must contain, straight from the
+    // DB's `required_features.fasm`. Emit them first and unconditionally.
+    lines.extend(device.required_features());
+
     // LUTs: INIT vector per occupied ALUT..DLUT.
     for lut in &placed.luts {
         let site_rel = device
@@ -183,17 +197,39 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     // Without CEUSEDMUX/SRUSEDMUX, the FF silently ignores CE/SR pins.
     use std::collections::HashSet;
     let mut ce_slices: HashSet<(String, String)> = HashSet::new();
+    // Slices containing at least one FF: `FFSYNC` is emitted once per slice.
+    let mut ff_slices: HashSet<(String, String)> = HashSet::new();
     let mut sr_slices: HashSet<(String, String)> = HashSet::new();
     for ff in &placed.ffs {
         let site_rel = device
             .site_rel(&ff.tile, &ff.site)
             .ok_or_else(|| format!("emit: no rel site for {} {}", ff.tile, ff.site))?;
         let bel = ff_bel(&ff.bel)?; // "AFF" -> "AFF"
-        // D from LUT O: the AFFMUX selects AX when the paired LUT drives D.
-        // (Pack pairs FF.D == LUT.O on the same BEL letter.)
+        // D from the paired LUT's O6 output; `mux_for_ff` picks O6 when the
+        // FF's D is driven by the LUT on the same BEL letter, and the raw
+        // slice input pin otherwise.
         let mux_src = mux_for_ff(ff, packed, placed);
         lines.push(format!("{}.{}.{}.ZINI", ff.tile, site_rel, bel));
         lines.push(format!("{}.{}.{}MUX.{}", ff.tile, site_rel, bel, mux_src));
+        // ZRST is emitted on EVERY flip-flop, not only ones with an SR net.
+        //
+        // prjxray's FF config model has exactly two bits per FF: `ZINI` (the
+        // power-up INIT value) and `ZRST` (SRVAL, the value the register takes
+        // on set/reset). They are a pair, and Vivado writes both for every FF
+        // it places -- across the reference blinky it sets ZRST on all 26 FFs
+        // while SRUSEDMUX is 0 everywhere, i.e. with no SR net at all.
+        //
+        // Leaving ZRST clear leaves SRVAL at its default, which is not the
+        // same as "no effect": the register's stored value is then 1, so a
+        // design that inits to 0 powers up as a constant 1. That is exactly
+        // the "LED on and frozen" symptom -- it looked like a dead clock, but
+        // the clock was fine and the register was simply pinned high.
+        //
+        // The earlier comment here claimed ZRST meant "SR pin acts as RESET"
+        // and only mattered when an SR net existed. That reading is wrong: it
+        // is the SRVAL selector, and the reset-vs-set choice is a separate
+        // concern.
+        lines.push(format!("{}.{}.{}.ZRST", ff.tile, site_rel, bel));
         // Control signals: look up the packed FF for CE/SR nets.
         if let Some(p) = packed.ffs.iter().find(|p| p.name == ff.name) {
             if p.ce_net.is_some() {
@@ -201,11 +237,20 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
             }
             if p.sr_net.is_some() {
                 sr_slices.insert((ff.tile.clone(), site_rel.clone()));
-                // Configure SR as RESET (the common case; Helion IR does not
-                // distinguish set vs reset, and reset is the standard use).
-                lines.push(format!("{}.{}.{}.ZRST", ff.tile, site_rel, bel));
             }
         }
+        ff_slices.insert((ff.tile.clone(), site_rel.clone()));
+    }
+    // `FFSYNC` configures the flip-flop's set/reset as synchronous rather than
+    // asynchronous. It is a slice-level bit with no `!` polarity
+    // (`CLBLM_R.SLICEM_X0.FFSYNC 00_48`), and Vivado sets it on *every* slice
+    // it places a flip-flop in: across the reference blinky it is present on
+    // 7 of 7 FF tiles. Helion emitted it on none, in any design ever built.
+    //
+    // A flip-flop left with this unset has its set/reset control in the wrong
+    // mode, and the register does not clock.
+    for (tile, slice) in &ff_slices {
+        lines.push(format!("{}.{}.FFSYNC", tile, slice));
     }
     // Emit slice-level CE/SR mux enables (deduplicated).
     for (tile, slice) in &ce_slices {
@@ -509,9 +554,60 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                 // both; without the companions the branch is configured but
                 // muted (the exact symptom the original blinky showed).
                 let tile_type = device.tile_type(&pip.tile).unwrap_or_default();
+                if std::env::var("HELION_DEBUG_CLK").is_ok()
+                    && (tile_type.starts_with("HCLK") || tile_type.starts_with("CLK_BUFG"))
+                {
+                    eprintln!("CLKPIP tile={} type={tile_type} src={} dst={}",
+                        pip.tile, pip.src_wire, pip.dst_wire);
+                }
                 for feature in clock_companions(&tile_type, &pip.dst_wire, &pip.src_wire) {
                     lines.push(format!("{}.{}", pip.tile, feature));
                 }
+            }
+        }
+    }
+
+    // The CMT gates each buffered clock spine it drives with
+    // `HCLK_CMT_CK_BUFHCLK<n>_USED`. `n` is NOT the CMT mux index: the mux and
+    // the buffer are independent, and `HCLK_CMT_MUX_CLK_<m>` can reach any
+    // `CK_BUFHCLK<n>` (segbits_hclk_cmt.db lists all twelve). What fixes `n`
+    // is the buffer the clock actually leaves on, i.e. the `BUFHCLK<n>` the
+    // downstream `HCLK_L`/`HCLK_R` tile enables.
+    //
+    // The reference blinky drives mux 0 but enables buffer 8, because the left
+    // edge numbers its buffer nets from 8 (`HCLK_CK_INOUT_L0` <->
+    // `HCLK_CK_BUFHCLK8`). Deriving the index from the mux therefore produces
+    // `BUFHCLK0_USED` and leaves the real buffer 8 ungated -- configured, and
+    // muted. Read it from the HCLK tiles instead, once they are all known.
+    {
+        use std::collections::BTreeSet;
+        let mut cmt_buf: BTreeSet<u32> = BTreeSet::new();
+        for line in &lines {
+            // `HCLK_L_X..Y...ENABLE_BUFFER.HCLK_CK_BUFHCLK<n>` and the
+            // `HCLK_LEAF_CLK_B_*` selection that carries the same index.
+            let tile = line.split('.').next().unwrap_or("");
+            if !(tile.starts_with("HCLK_L_") || tile.starts_with("HCLK_R_")) {
+                continue;
+            }
+            for tag in ["ENABLE_BUFFER.HCLK_CK_BUFHCLK", "HCLK_CK_BUFHCLK"] {
+                if let Some(rest) = line.split(tag).nth(1) {
+                    if let Ok(n) = rest.trim().parse::<u32>() {
+                        cmt_buf.insert(n);
+                    }
+                }
+            }
+        }
+        // Find the CMT tile(s) in this design and gate the buffers in use.
+        let mut cmt_tiles: BTreeSet<String> = BTreeSet::new();
+        for line in &lines {
+            let tile = line.split('.').next().unwrap_or("");
+            if tile.starts_with("HCLK_CMT") {
+                cmt_tiles.insert(tile.to_string());
+            }
+        }
+        for tile in cmt_tiles {
+            for n in &cmt_buf {
+                lines.push(format!("{tile}.HCLK_CMT_CK_BUFHCLK{n}_USED"));
             }
         }
     }
@@ -535,11 +631,27 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
 /// Returns feature strings relative to `tile_type`'s tile (no tile prefix).
 fn clock_companions(tile_type: &str, dst: &str, src: &str) -> Vec<String> {
     let mut out = Vec::new();
-    if tile_type == "HCLK_CMT" {
+    if tile_type == "HCLK_CMT" || tile_type == "HCLK_CMT_L" {
+        // Both CMT variants carry the same companion shape
+        // (`segbits_hclk_cmt.db` and `segbits_hclk_cmt_l.db` agree bit for
+        // bit), so one arm covers both. The right-hand tile was the only one
+        // handled, which meant a clock entering on the LEFT CMT -- the
+        // ZedBoard GCLK on Y9 -- got no companions at all.
         if src.starts_with("HCLK_CMT_CCIO") {
             out.push(format!("{src}_ACTIVE"));
             out.push(format!("{src}_USED"));
         }
+        // The CMT also gates each buffered clock spine it drives. Without the
+        // `_USED` bit the mux selecting the row is configured but the buffer
+        // is not enabled, so the spine is muted at its source.
+        // `HCLK_CMT_CK_BUFHCLK<n>_USED` (segbits_hclk_cmt.db 27_185/26_185/...).
+        // NOTE: `HCLK_CMT_CK_BUFHCLK<n>_USED` is deliberately NOT emitted
+        // here. The mux index available at this point is the wrong number:
+        // `HCLK_CMT_MUX_CLK_<m>` can reach any `CK_BUFHCLK<n>`, and the index
+        // that matters is the one the downstream HCLK tile enables. Deriving
+        // it from the mux yields `BUFHCLK0_USED` for a design that needs
+        // `BUFHCLK8_USED`. It is emitted in the post-pass at the end of
+        // `emit_fasm`, once the HCLK selection is known.
     } else if tile_type == "CLK_BUFG_REBUF" {
         if let Some(g) = gclk_index(src).or_else(|| gclk_index(dst)) {
             out.push(format!("GCLK{g}_ENABLE_ABOVE"));
@@ -600,8 +712,42 @@ fn clock_companions(tile_type: &str, dst: &str, src: &str) -> Vec<String> {
         // The two tile types have identical segbit shapes
         // (`ENABLE_BUFFER.HCLK_CK_BUFHCLK<n>`; see segbits_hclk_{l,r}.db),
         // so one arm covers both.
-        if src.starts_with("HCLK_CK_BUFHCLK") {
-            out.push(format!("ENABLE_BUFFER.{src}"));
+        //
+        // The two sides number their buffer nets from opposite ends
+        // (`ppips_hclk_{l,r}.db`):
+        //
+        //   HCLK_R: HCLK_CK_INOUT_R0..R13 <-> HCLK_CK_BUFHCLK0..13
+        //   HCLK_L: HCLK_CK_INOUT_L0..L3  <-> HCLK_CK_BUFHCLK8..11
+        //
+        // The HROW takes row `n` from `INOUT_L<n>`/`INOUT_R<n>`, so a left
+        // HCLK must enable `BUFHCLK(8+n)`. Enabling the same `n` the right
+        // side would use puts the buffer output on an `INOUT_L` that the
+        // programmed `CK_IN_L<n>` never reads, and the clock dies there --
+        // the LED lights and never blinks. `src` is the wire the router
+        // reached this tile on, so translate it rather than trusting it.
+        let left = tile_type == "HCLK_L";
+        if let Some(n) = src
+            .strip_prefix("HCLK_CK_BUFHCLK")
+            .and_then(|d| d.parse::<u32>().ok())
+        {
+            // Recover the row the clock is on, then re-encode it for this side.
+            let row = if left {
+                // Router already names a left-side net; trust it only if it
+                // is in the left band, else fold it back to a row.
+                n.checked_sub(8).unwrap_or(n)
+            } else {
+                n
+            };
+            let buf = if left { row + 8 } else { row };
+            if buf != n {
+                out.push(format!("ENABLE_BUFFER.HCLK_CK_BUFHCLK{buf}"));
+                // The leaf selection must match the buffer that is enabled.
+                out.push(format!(
+                    "HCLK_LEAF_CLK_B_TOPL{row}.HCLK_CK_BUFHCLK{buf}"
+                ));
+            } else {
+                out.push(format!("ENABLE_BUFFER.{src}"));
+            }
         }
     }
     out
@@ -711,32 +857,44 @@ fn mux_for_ff(
     packed: &crate::pack::Packed7,
     placed: &Placed7,
 ) -> &'static str {
-    let letter = ff.bel.chars().next().unwrap_or('A');
-    let mux_in: &'static str = match letter {
-        'B' => "BX",
-        'C' => "CX",
-        'D' => "DX",
-        _ => "AX",
-    };
-    // Find the FF's D net driver: if it's a LUT on the same site+letter,
-    // use the letter-matched mux input.
+    // An FF whose D is driven by its paired LUT must select the LUT OUTPUT,
+    // not a slice input pin.
+    //
+    // `AFFMUX.{A,B,C,D}X` selects the raw slice input pin of that letter --
+    // the path used when the FF takes data straight from outside the slice,
+    // bypassing the LUT. Nothing drives that pin for a LUT-fed FF, so the
+    // FF's D is left dangling and the flop holds its init value forever.
+    // That is the whole reason a counter built this way showed a lit but
+    // frozen LED: the clock was fine (the spine matches Vivado byte for
+    // byte), the pads were fine, and the FF simply never saw new data.
+    //
+    // `O6` is the LUT6 output mux (`CLBLM_R.SLICEL_X1.AFFMUX.O6 30_04 ...`),
+    // which is what Vivado selects for LUT-driven flops. `O5` would tap the
+    // 5-input output instead, and is only right for a 5-input function.
     if let Some(pff) = packed.ffs.iter().find(|f| f.name == ff.name) {
         for lut in &placed.luts {
-            if lut.site == ff.site
-                && lut.bel.starts_with(letter)
-                && packed
+            if lut.site == ff.site && lut.bel.starts_with(ff.bel.chars().next().unwrap_or('A')) {
+                let drives_ff = packed
                     .luts
                     .iter()
                     .find(|l| l.name == lut.name)
                     .map(|l| l.output_net == pff.d_net)
-                    .unwrap_or(false)
-            {
-                return mux_in;
+                    .unwrap_or(false);
+                if drives_ff {
+                    return "O6";
+                }
             }
         }
     }
-    // Default: letter-matched input (most common); the router/emitter can refine.
-    mux_in
+    // Otherwise the data really does come from the slice input pin, so use
+    // the letter-matched one. `BFFMUX.AX`/`CFFMUX.AX`/`DFFMUX.AX` do not
+    // exist in segbits, so the letter must be honoured.
+    match ff.bel.chars().next().unwrap_or('A') {
+        'B' => "BX",
+        'C' => "CX",
+        'D' => "DX",
+        _ => "AX",
+    }
 }
 
 #[cfg(test)]
@@ -822,7 +980,13 @@ mod tests {
         let text = bs.fasm.join("\n");
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.ALUT.INIT[63:0] = 64'h5555555555555555"), "got:\n{text}");
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZINI"), "got:\n{text}");
-        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFFMUX.AX"), "got:\n{text}");
+        // A LUT-fed FF must select the LUT OUTPUT (`O6`), not a slice input
+        // pin. `AFFMUX.AX` selects the raw AX pin, which nothing drives for a
+        // LUT-driven flop, so the FF's D dangles and it holds its init value
+        // forever -- a lit but frozen LED. This assertion previously demanded
+        // `AX`, i.e. it locked in the bug.
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFFMUX.O6"), "got:\n{text}");
+        assert!(!text.contains("AFFMUX.AX"), "LUT-fed FF must not use the AX bypass:\n{text}");
         // Ground-truth output pad. A real Vivado bitstream for an LVCMOS33
         // output (prjxray-db/artix7/harness/arty-a7/swbut/design.bit, tile
         // RIOB33_X43Y51) carries exactly these on each IOB of the tile. The
@@ -872,7 +1036,8 @@ mod tests {
 
     #[test]
     fn emit_ff_no_control_signals() {
-        // FF without CE/SR must NOT emit the mux enables (keeps bitstream minimal).
+        // An FF with no CE/SR nets must NOT emit the slice mux enables: with
+        // no CE or SR net there is nothing for those muxes to select.
         let bs = emit_fasm(&routed_blinky(), &FakeEmit).unwrap();
         let text = bs.fasm.join("\n");
         assert!(
@@ -883,7 +1048,17 @@ mod tests {
             !text.contains("SRUSEDMUX"),
             "unexpected SRUSEDMUX, got:\n{text}"
         );
-        assert!(!text.contains(".ZRST"), "unexpected ZRST, got:\n{text}");
+        // ZRST *is* expected even without an SR net. It is SRVAL, the value
+        // the register takes on set/reset, and it must be configured on every
+        // FF -- Vivado sets it on all 26 FFs of the reference while SRUSEDMUX
+        // is 0 everywhere. Omitting it leaves SRVAL at its default 1, so the
+        // register powers up as a constant 1: the LED lights and never
+        // blinks. This assertion used to demand its absence, i.e. it locked
+        // in the bug.
+        assert!(
+            text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZRST"),
+            "ZRST must be emitted on every FF, got:\n{text}"
+        );
     }
 
     #[test]

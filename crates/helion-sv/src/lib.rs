@@ -18437,6 +18437,53 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         let pad = pad_net(lhs, pad_bit);
         emit_iob(&mut d, &mut iob_n, &qnet, &pad);
     }
+    // Registered outputs with no `assign`.
+    //
+    // The loop above emits IOBs only while walking `rtl.assigns`, so an output
+    // port driven *directly* by an always block never got a pad at all:
+    //
+    //   module two (input clk, output reg q0, output reg q1);
+    //     always @(posedge clk) begin q0 <= ~q0; q1 <= ~q1; end
+    //   endmodule
+    //
+    // produced ZERO IobOut cells. The fallback below did not save it either,
+    // because that bail-out requires exactly one output port. `two` therefore
+    // built a bitstream with both registers placed and routed but no pads, and
+    // `report_utilization` reported IO=0 -- the LEDs could never light.
+    //
+    // Emit one pad per output-port bit that a register drives and that no
+    // earlier pass already claimed. `iob_n` doubles as the "already claimed"
+    // marker, so the assign loop's work is never duplicated.
+    {
+        let mut claimed: HashSet<String> = HashSet::new();
+        let iob_names: Vec<String> = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::IobOut))
+            .map(|c| c.name.clone())
+            .collect();
+        for cname in &iob_names {
+            if let Some(net) = d.net_on(cname, "I") {
+                claimed.insert(net.to_string());
+            }
+        }
+        let reg_q: HashSet<String> = reg_bits.iter().map(|(n, _)| n.clone()).collect();
+        for (pname, dir, width) in &rtl.ports {
+            if *dir != PortDir::Out {
+                continue;
+            }
+            let w = (*width).max(1);
+            for i in 0..w.min(256) {
+                let qnet = bit_name(pname, w, i);
+                if !reg_q.contains(&qnet) || claimed.contains(&qnet) {
+                    continue;
+                }
+                let pad = pad_net(pname, i);
+                emit_iob(&mut d, &mut iob_n, &qnet, &pad);
+                claimed.insert(qnet);
+            }
+        }
+    }
     if iob_n == 0 {
         // Last-resort fallback: connect the single most plausible register bit
         // to the first output.
@@ -24007,6 +24054,41 @@ endmodule
             luts >= 3 && luts <= 128,
             "5-state FSM should be a modest LUT tree, luts={luts}"
         );
+    }
+
+    /// Output ports driven directly by an always block must still get pads.
+    ///
+    /// The IOB pass only walks `rtl.assigns`, so `output reg q0` with no
+    /// `assign` produced ZERO IobOut cells and the design flashed with the
+    /// registers placed but nothing connected to a pin. The single-output
+    /// fallback did not catch it because that bail-out requires exactly one
+    /// output port.
+    #[test]
+    fn registered_outputs_get_pads_without_assign() {
+        let d = synth_sv(
+            "module two (input wire clk, output reg q0, output reg q1);\n\
+                 always @(posedge clk) begin q0 <= ~q0; q1 <= ~q1; end\n\
+             endmodule\n",
+            "two.sv",
+        )
+        .expect("synth");
+        let iobs: Vec<&str> = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::IobOut))
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(
+            iobs.len(),
+            2,
+            "each registered output needs its own pad, got {iobs:?}"
+        );
+        // Each pad must be driven by its own register, and the two pads must
+        // not share a net (the failure mode that made eight vector bits
+        // collapse onto one PAD net).
+        let pads: Vec<&str> = iobs.iter().filter_map(|c| d.net_on(c, "PAD")).collect();
+        assert_eq!(pads.len(), 2, "both pads need a PAD net: {pads:?}");
+        assert_ne!(pads[0], pads[1], "outputs must not share a pad net");
     }
 
     #[test]

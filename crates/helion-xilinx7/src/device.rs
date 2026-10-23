@@ -176,6 +176,9 @@ pub struct Device {
     /// package decides `package_pins.csv`. Recording the resolved directory
     /// makes a surprising choice visible instead of silent.
     part_dir: String,
+    /// Absolute directory the part's files were read from, so callers can
+    /// find sibling files such as `required_features.fasm`.
+    part_dir_path: std::path::PathBuf,
     part: PartInfo,
     nodes: UnionFind,
     /// Tile types present in the grid with no DB files (e.g. `NULL`, `VBRK`).
@@ -383,6 +386,7 @@ impl Device {
                 .and_then(|n| n.to_str())
                 .unwrap_or_default()
                 .to_string(),
+            part_dir_path: partdir.to_path_buf(),
             part,
             nodes: UnionFind::default(),
             missing_db_types: Vec::new(),
@@ -871,6 +875,11 @@ impl Device {
     /// `xc7z020clg484-1` when the caller asked for the bare die `xc7z020`.
     pub fn part_dir(&self) -> &str {
         &self.part_dir
+    }
+
+    /// Absolute directory the part was loaded from (`<db>/<family>/<part-dir>`).
+    pub fn part_dir_path(&self) -> &std::path::Path {
+        &self.part_dir_path
     }
 
     /// Segbits for `feature` in a tile type, e.g. `segbits("INT_L", "INT_L.NL1BEG1.NN6END2")`.
