@@ -5238,6 +5238,32 @@ fn parse_atom_r<'a>(p: &mut P<'a>) -> Result<RExpr<'a>, String> {
                     care: u128::MAX,
                 });
             }
+            // `$size(name)` is the constant bit width of that signal, like
+            // `$bits`. Unhandled it fell through to `RExpr::Call`, which bit
+            // lowering rejects; the error was swallowed, so `assign y =
+            // $size(a);` drove y with constant 0 and emitted no diagnostic.
+            if name == "$size" && p.eat_sym('(') {
+                let mut name = p.ident()?;
+                if matches!(p.peek(), Some(Tok::Sym(':')))
+                    && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+                    && matches!(p.t.get(p.i + 2), Some(Tok::Ident(_)))
+                {
+                    p.bump();
+                    p.bump();
+                    name = p.ident()?;
+                }
+                if !p.eat_sym(')') {
+                    return Err("$size )".into());
+                }
+                let w = typed_width(&name)
+                    .or_else(|| p.widths.get(&name).copied())
+                    .ok_or_else(|| format!("$size unknown {name}"))?;
+                return Ok(RExpr::Const {
+                    val: w as u128,
+                    width: 32,
+                    care: u128::MAX,
+                });
+            }
             // `fname(a, b)` — inlined after module parse when a FuncDef exists.
             // `$readmemh`/`$display` are statements, not this path.
             if p.eat_sym('(') {
