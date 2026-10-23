@@ -205,10 +205,137 @@ impl Device {
         Self::load_from_dirs(&zynq7, &fabric, &partdir)
     }
 
+    /// Load ANY part present in the X-Ray DB.
+    ///
+    /// The per-part loaders above are thin wrappers around
+    /// [`Self::load_from_dirs`]; this resolves the same three directories from
+    /// the part name so every die in the DB is reachable, not just the two
+    /// that happened to get a hand-written function.
+    ///
+    /// X-Ray lays the DB out as `<family>/<die>/{tilegrid,tileconn}.json` plus
+    /// `<family>/<part>/{part.json,package_pins.csv}`, with the per-tile-type
+    /// files (`tile_type_*.json`, `segbits_*.db`, ...) shared at the family
+    /// level. A die whose own `tilegrid.json` is absent borrows the fabric of
+    /// the die it is cut down from, which is what `xc7a35t` does on
+    /// `xc7a50t`; `borrowed_fabric` names that.
+    pub fn load_part_from_db(db_root: &Path, part: &str) -> Result<Self, String> {
+        let base = part
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .next()
+            .unwrap_or(part);
+        // Die name is the leading size token: `xc7z020` from
+        // `xc7z020clg484-1`, `xc7a200t` from `xc7a200tfbv484-1`. The size
+        // digits are followed by `t` for most families and then by a package
+        // code, so take `xc7` + family letter + digits + an optional `t`.
+        // Stopping at the first letter after position 3 would turn `xc7a200t`
+        // into `xc7a`, which then matched `xc7a100t`'s fabric and IDCODE.
+        let die: String = {
+            let b = base.as_bytes();
+            let mut i = 3; // past "xc7"
+            while i < b.len() && !b[i].is_ascii_digit() {
+                i += 1;
+            }
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i < b.len() && (b[i] == b't' || b[i] == b'T') {
+                i += 1;
+            }
+            base[..i].to_string()
+        };
+        let mut families: Vec<String> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(db_root) {
+            for e in entries.flatten() {
+                if e.path().is_dir() {
+                    if let Some(n) = e.file_name().to_str() {
+                        families.push(n.to_string());
+                    }
+                }
+            }
+        }
+        families.sort();
+        for fam in &families {
+            let family = db_root.join(fam);
+            if !family.join(format!("tile_type_clbll_l.json")).exists()
+                && !family.join("segbits_clbll_l.db").exists()
+            {
+                continue; // not a family dir with DB files
+            }
+            // The exact part dir, if the caller named one.
+            let partdir = family.join(part);
+            let fabric = family.join(&die);
+            // Some dies have no tilegrid of their own; try the family's other
+            // dies for a compatible fabric.
+            let fabric = if fabric.join("tilegrid.json").exists() {
+                fabric
+            } else {
+                let mut fb = None;
+                if let Ok(entries) = std::fs::read_dir(&family) {
+                    let mut cands: Vec<_> = entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            p.is_dir()
+                                && p.file_name()
+                                    .and_then(|n| n.to_str())
+                                    .map(|n| n.starts_with(&die))
+                                    .unwrap_or(false)
+                                && p.join("tilegrid.json").exists()
+                        })
+                        .collect();
+                    cands.sort();
+                    fb = cands.into_iter().next();
+                }
+                // `xc7a35t` is a cut-down `xc7a50t`: same fabric, different idcode.
+                if fb.is_none() && die.starts_with("xc7a35t") {
+                    let alt = family.join("xc7a50t");
+                    if alt.join("tilegrid.json").exists() {
+                        fb = Some(alt);
+                    }
+                }
+                match fb {
+                    Some(p) => p,
+                    None => continue,
+                }
+            };
+            let partdir = if partdir.join("part.json").exists() {
+                partdir
+            } else {
+                // Find the part dir whose name starts with the die.
+                let mut cands: Vec<_> = std::fs::read_dir(&family)
+                    .map(|it| {
+                        it.flatten()
+                            .map(|e| e.path())
+                            .filter(|p| {
+                                p.join("part.json").exists()
+                                    && p.file_name()
+                                        .and_then(|n| n.to_str())
+                                        .map(|n| n.starts_with(&die))
+                                        .unwrap_or(false)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                cands.sort();
+                match cands.into_iter().next() {
+                    Some(p) => p,
+                    None => continue,
+                }
+            };
+            return Self::load_from_dirs(&family, &fabric, &partdir);
+        }
+        Err(format!(
+            "no X-Ray database for part `{part}` (looked for a `{die}` die under {}). \
+             Set HELION_XILINX_DB to the prjxray-db root, and check that the part name is \
+             one of the DB's part directories.",
+            db_root.display()
+        ))
+    }
+
     /// Shared loader core: `family` holds the per-tile-type DB files,
     /// `fabric` holds `tilegrid.json` and `tileconn.json`, and `partdir`
     /// holds `part.json` and `package_pins.csv`.
-    fn load_from_dirs(family: &Path, fabric: &Path, partdir: &Path) -> Result<Self, String> {
+    pub fn load_from_dirs(family: &Path, fabric: &Path, partdir: &Path) -> Result<Self, String> {
         let grid = load_tilegrid(&fabric.join("tilegrid.json"))?;
         let conn = load_tileconn(&fabric.join("tileconn.json"))?;
         let part = load_part(&partdir.join("part.json"))?;
