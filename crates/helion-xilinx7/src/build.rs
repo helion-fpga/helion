@@ -202,6 +202,15 @@ impl PinConstraints {
 pub struct X7Utilization {
     /// Occupied LUT sites (each is one 6-input LUT; seen as LUT+FF pairs).
     pub lut_sites: usize,
+    /// Occupied flip-flops.
+    ///
+    /// Distinct from `lut_sites`: a slice holds one 6-input LUT *and* one FF
+    /// per BEL, and a design may use either without the other. Reporting the
+    /// LUT count for both is what made every 7-series utilization report print
+    /// an identical `LUT=` and `FF=`.
+    pub ffs: usize,
+    /// Total flip-flop sites on the device (8 per slice: 4 LUTs + 4 FFs).
+    pub ff_capacity: usize,
     /// Occupied IOB sites, split by direction.
     pub iobs_in: usize,
     /// Output IOBs.
@@ -275,6 +284,8 @@ pub fn x7_utilization(
         .count();
     Ok(X7Utilization {
         lut_sites: placed.packed.luts.len(),
+        ffs: placed.packed.ffs.len(),
+        ff_capacity: device.slices().len() * 8,
         iobs_in,
         iobs_out: placed.packed.iobs.len() - iobs_in,
         brams: placed.packed.brams.len(),

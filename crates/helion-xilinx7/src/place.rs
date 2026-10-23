@@ -206,7 +206,8 @@ fn column_run(
     cols.sort_by_key(|c| {
         let dy = by_col[c]
             .iter()
-            .map(|(r, _, _)| (*r - ay).abs())
+            .map(|(r, t, _)| device.tile_xy(t).map(|(_x, y)| y).unwrap_or(*r))
+            .map(|g| (g - ay).abs())
             .min()
             .unwrap_or(i32::MAX);
         (dy + (c - ax as i64).unsigned_abs() as i32, *c)
@@ -253,8 +254,25 @@ fn column_run(
                 let n = j + 1 - start;
                 let mut w = 0;
                 while w + len <= n {
-                    let lo = rows[start + w].0;
-                    let hi = rows[start + w + len - 1].0;
+                    // Score by the tile's REAL `grid_y`, not by the site row.
+                    //
+                    // The site row and `grid_y` are different axes running in
+                    // opposite directions: `CLBLM_R_X71Y45` is `grid_y` 109 and
+                    // `CLBLM_R_X71Y106` is `grid_y` 45. Scoring on the site row
+                    // against an anchor expressed in `grid_y` therefore picks
+                    // the tile at the OPPOSITE end of the die -- which placed a
+                    // one-flop design 64 rows from the pad it drives, with the
+                    // output net routed the length of the device. Ask the
+                    // device for the grid row and compare like with like.
+                    let gy = |k: usize| -> i32 {
+                        device
+                            .tile_xy(&rows[start + k].1)
+                            .map(|(_x, y)| y)
+                            .unwrap_or(rows[start + k].0)
+                    };
+                    let lo = gy(w);
+                    let hi = gy(w + len - 1);
+                    let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
                     let dist = if ay < lo {
                         lo - ay
                     } else if ay > hi {
@@ -420,7 +438,9 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
     //
     // Convert the anchor into site-row space by expressing it relative to the
     // slice rows the device actually reports.
-    let ay = nearest_slice_row(device, ay_grid);
+    // `ay_grid` is already the axis the comparison uses; translating it into
+    // site-row space is what mixed the two axes up in the first place.
+    let ay = ay_grid;
 
     if !packed.carries.is_empty() {
         // Group elements by chain id, preserving their first-seen order.
