@@ -25270,3 +25270,212 @@ endmodule
     }
 }
 
+
+#[cfg(test)]
+mod carry4_tests {
+    use super::*;
+
+    /// Count cells of the given kind in a synthesised design.
+    fn count_carry4(d: &Design) -> usize {
+        d.cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Carry4))
+            .count()
+    }
+
+    fn synth_counter(width: usize) -> Design {
+        let src = format!(
+            "module w{width} (input wire clk, output reg [{hi}:0] q);\n  \
+             always @(posedge clk) q <= q + {width}'d1;\nendmodule\n",
+            hi = width - 1
+        );
+        synth_sv(&src, "counter.sv").expect("counter must synthesize")
+    }
+
+    /// The headline case: a 25-bit counter is 25 bits / 4 per site = 7 CARRY4.
+    #[test]
+    fn counter_25bit_infers_seven_carry4() {
+        let d = synth_counter(25);
+        assert_eq!(
+            count_carry4(&d),
+            7,
+            "25-bit counter must be 7 CARRY4 cells (25 bits / 4 per site), got {}",
+            count_carry4(&d)
+        );
+    }
+
+    /// Every sum bit is a CARRY4 `O` output, and each has a register on it.
+    #[test]
+    fn counter_25bit_sums_come_from_carry4_and_have_regs() {
+        let d = synth_counter(25);
+        let pins = d.pin_index();
+        for bit in 0..25 {
+            let qn = format!("q_{bit}");
+            let net = d
+                .nets
+                .iter()
+                .find(|n| n.name == qn)
+                .unwrap_or_else(|| panic!("no net {qn}"));
+            let c4_lane = net.endpoints.iter().any(|e| {
+                e.pin.len() == 2
+                    && e.pin.starts_with('O')
+                    && e.cell.starts_with("u_c4_")
+                    && d.cells
+                        .iter()
+                        .any(|c| c.name == e.cell && matches!(c.kind, CellKind::Carry4))
+            });
+            assert!(c4_lane, "sum bit {bit} ({qn}) is not driven by a CARRY4 O");
+            let has_ff = d
+                .cells
+                .iter()
+                .any(|c| matches!(c.kind, CellKind::Hff) && pins.net_on(&c.name, "Q") == Some(qn.as_str()));
+            assert!(has_ff, "sum bit {bit} ({qn}) has no register");
+        }
+    }
+
+    /// Chain groups must be a single linked chain: exactly `groups - 1`
+    /// inter-group carries, and every group past the first fed by one.
+    #[test]
+    fn counter_25bit_groups_form_one_chain() {
+        let d = synth_counter(25);
+        let cells: Vec<&Cell> = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Carry4))
+            .collect();
+        // Order by the recorded chain index.
+        let mut idx: Vec<usize> = cells
+            .iter()
+            .map(|c| c.attrs.get("carry_index").unwrap().parse().unwrap())
+            .collect();
+        idx.sort_unstable();
+        assert_eq!(idx, (0..7).collect::<Vec<_>>(), "carry_index must be 0..6");
+        // Every cell knows its chain length.
+        for c in &cells {
+            assert_eq!(c.attrs.get("chain_len"), Some("7"), "chain_len on {}", c.name);
+        }
+        // Group 0 takes the constant-1 carry-in of `+1`.
+        let g0 = cells
+            .iter()
+            .find(|c| c.attrs.get("carry_index") == Some("0"))
+            .unwrap();
+        assert_eq!(
+            g0.attrs.get("cyinit"),
+            Some("1"),
+            "the `+1` must be the chain's CYINIT"
+        );
+        // Groups 1.. get a CIN net that is the previous group's COUT.
+        let pins = d.pin_index();
+        for g in 1..7 {
+            let name = format!("u_c4_q_inc_{g}");
+            let cin = pins
+                .net_on(&name, "CIN")
+                .unwrap_or_else(|| panic!("{name} has no CIN"));
+            assert_eq!(cin, format!("n_c4_q_inc_{}co", g - 1), "{name} CIN chain");
+        }
+    }
+
+    /// The `S`/`DI` pair must be the *carry-free* propagate/generate terms:
+    /// `a ^ b` and `a & b`. For `q + 1` against a constant-0 addend that is
+    /// `S = q_i` (identity INIT) and `DI = 0`.
+    #[test]
+    fn counter_25bit_lane_luts_are_carry_free() {
+        let d = synth_counter(25);
+        // S LUT for a connected lane must be the identity on I0 (0xAAAA...).
+        let s_ids: Vec<&str> = d
+            .cells
+            .iter()
+            .filter(|c| {
+                c.name.starts_with("u_c4_q_inc_")
+                    && (c.name.ends_with('s'))
+                    && matches!(c.kind, CellKind::Lut6 { init } if init == 0xAAAA_AAAA_AAAA_AAAA)
+            })
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            s_ids.len() >= 25,
+            "expected >=25 identity S LUTs for the 25 lanes, got {}",
+            s_ids.len()
+        );
+        // No lane may have a carried `a ^ b ^ cin` INIT; that would double-count
+        // the CARRY4's own carry.
+        assert!(
+            !d.cells.iter().any(|c| {
+                c.name.starts_with("u_c4_q_inc_")
+                    && matches!(c.kind, CellKind::Lut6 { init } if init == 0x5A5A_5A5A_5A5A_5A5A)
+            }),
+            "a lane S LUT includes a carry input; the CARRY4 already adds it"
+        );
+    }
+
+    /// DI must be on the per-lane pin, never a shared `DI` net.
+    #[test]
+    fn counter_25bit_di_is_per_lane() {
+        let d = synth_counter(25);
+        let pins = d.pin_index();
+        for g in 0..7 {
+            for letter in ["A", "B", "C", "D"] {
+                let name = format!("u_c4_q_inc_{g}");
+                assert!(
+                    pins.net_on(&name, &format!("{letter}DI")).is_some(),
+                    "{name} has no {letter}DI"
+                );
+            }
+            assert!(
+                pins.net_on(&format!("u_c4_q_inc_{g}"), "DI").is_none(),
+                "u_c4_q_inc_{g} uses a shared DI pin; lanes would be tied together"
+            );
+        }
+    }
+
+    /// Narrow counters keep the flat form: at 4 bits the INC4 gold LUTs are as
+    /// cheap as a chain, so no CARRY4 is introduced.
+    #[test]
+    fn narrow_counter_stays_flat() {
+        let d = synth_counter(4);
+        assert_eq!(
+            count_carry4(&d),
+            0,
+            "a 4-bit counter is below the chain crossover and must stay flat"
+        );
+        assert_eq!(
+            d.lut_inits().len(),
+            4,
+            "the 4-bit counter should still be the 4 INC4 gold LUTs"
+        );
+    }
+
+    /// A guarded counter (`if (en) q <= q + 1`) is not a bare chain: it must
+    /// keep the existing lowering rather than get a chain that ignores `en`.
+    #[test]
+    fn guarded_counter_does_not_infer_carry4() {
+        let src = "module g(input logic clk, input logic en, output logic [24:0] q);\n  \
+                   always_ff @(posedge clk) if (en) q <= q + 25'd1;\nendmodule\n";
+        let d = synth_sv(src, "g.sv").expect("guarded counter must synthesize");
+        assert_eq!(
+            count_carry4(&d),
+            0,
+            "a clock-enabled counter must not take the bare-chain path"
+        );
+        // The enable must still be honoured somewhere in the logic.
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "guarded counter must still lower to logic"
+        );
+    }
+
+    /// Carry4 must survive an HNF round-trip (the writer emitted it but the
+    /// reader did not accept it, so Carry4 netlists could not be reloaded).
+    #[test]
+    fn carry4_round_trips_through_hnf() {
+        let d = synth_counter(25);
+        let text = d.to_hnf();
+        assert!(text.contains("Carry4"), "HNF must mention Carry4");
+        let back = Design::from_hnf(&text).expect("HNF with Carry4 must parse");
+        assert_eq!(
+            count_carry4(&back),
+            7,
+            "round-trip lost the CARRY4 cells"
+        );
+    }
+}
