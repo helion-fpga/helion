@@ -600,6 +600,11 @@ struct Rtl<'a> {
     sva_conc: Vec<ConcPropAst<'a>>,
     /// Immediate SVA assertions (v3.0 subset), from procedural blocks.
     sva_imm: Vec<ImmAssertAst<'a>>,
+    /// Async-reset writes: `(signal, reset, active_low)` from
+    /// `always_ff @(posedge clk or negedge rst_n)`. The reset term is a real
+    /// edge in the sensitivity list, so it must reach the FF's async `SR`
+    /// pin; folding it into the D cone would silently make it synchronous.
+    async_resets: Vec<(&'a str, &'a str, bool)>,
 }
 
 thread_local! {
@@ -7716,46 +7721,72 @@ fn skip_until_arg_end<'a>(p: &mut P<'a>) {
 }
 
 /// Skip `@...` sensitivity. Returns `(combo, edge clock, negedge_only)`.
-/// Combo is `@*` / `@(*)` (no edge). Async `posedge clk or negedge nreset`
-/// is treated like sync; the first edge name is the user's clock.
-/// `negedge_only` is a lone falling edge — not mixed with posedge.
+/// Combo is `@*` / `@(*)`. `negedge_only` is a lone falling edge — not mixed
+/// with posedge. Use [`skip_event_control_async`] when the async reset term
+/// matters; this wrapper drops it.
 fn skip_event_control<'a>(p: &mut P<'a>) -> (bool, Option<String>, bool) {
+    let (combo, clk, neg, _rst, _rst_low) = skip_event_control_async(p);
+    (combo, clk, neg)
+}
+
+/// `(combo, edge clock, negedge_only, async reset term, reset active_low)`.
+///
+/// `always_ff @(posedge clk or negedge rst_n)` is an ASYNCHRONOUS reset: the
+/// sensitivity list really does carry a second edge. Reporting it here lets
+/// the caller attach the reset to the flop's async `SR` pin instead of
+/// folding `!rst_n` into the D cone, which would make it synchronous (the
+/// reset would then only be sampled on a clock edge).
+fn skip_event_control_async<'a>(
+    p: &mut P<'a>,
+) -> (bool, Option<String>, bool, Option<String>, bool) {
     let _ = p.eat_sym('@');
     if p.eat_sym('*') {
-        return (true, None, false);
+        return (true, None, false, None, false);
     }
     if p.eat_sym('(') {
         let start = p.i;
         if p.eat_sym('*') && matches!(p.peek(), Some(Tok::Sym(')'))) {
             p.bump();
-            return (true, None, false);
+            return (true, None, false, None, false);
         }
         p.i = start;
         let mut d = 1i32;
         let mut has_posedge = false;
         let mut has_negedge = false;
         let mut clk = None;
+        // Async reset term: the *second* edge term (or the only negedge when
+        // a posedge clock is also present). `active_low` is true for negedge.
+        let mut rst: Option<String> = None;
+        let mut rst_low = false;
         while d > 0 && p.peek().is_some() {
-            if p.eat_kw("posedge") {
-                has_posedge = true;
-                if clk.is_none() {
-                    if let Some(Tok::Ident(name)) = p.peek() {
-                        clk = Some(name.to_string());
+            if p.eat_kw("posedge") || p.eat_kw("negedge") {
+                let is_negedge = matches!(&p.t[p.i - 1], Tok::Kw(k) if *k == "negedge");
+                if is_negedge {
+                    has_negedge = true;
+                } else {
+                    has_posedge = true;
+                }
+                let name = match p.peek() {
+                    Some(Tok::Ident(name)) => {
+                        let n = name.to_string();
                         p.bump();
+                        Some(n)
+                    }
+                    _ => None,
+                };
+                if let Some(n) = name {
+                    // The first edge is the clock; a further edge term is the
+                    // async reset (only meaningful alongside a posedge clock).
+                    if clk.is_none() {
+                        clk = Some(n);
+                    } else if rst.is_none() {
+                        rst = Some(n);
+                        rst_low = is_negedge;
                     }
                 }
                 continue;
             }
-            if p.eat_kw("negedge") {
-                has_negedge = true;
-                if clk.is_none() {
-                    if let Some(Tok::Ident(name)) = p.peek() {
-                        clk = Some(name.to_string());
-                        p.bump();
-                    }
-                }
-                continue;
-            } else if p.eat_sym('(') {
+            if p.eat_sym('(') {
                 d += 1;
             } else if p.eat_sym(')') {
                 d -= 1;
@@ -7763,10 +7794,14 @@ fn skip_event_control<'a>(p: &mut P<'a>) -> (bool, Option<String>, bool) {
                 p.bump();
             }
         }
-        let has_edge = has_posedge || has_negedge;
-        return (!has_edge, clk, has_negedge && !has_posedge);
+        let _has_edge = has_posedge || has_negedge;
+        // A lone negedge is the clock (a falling-edge flop), not a reset.
+        if !has_posedge {
+            return (false, clk, has_negedge, None, false);
+        }
+        return (false, clk, false, rst, rst_low);
     }
-    (false, None, false)
+    (false, None, false, None, false)
 }
 
 fn skip_for_rest<'a>(p: &mut P<'a>) {
@@ -8782,6 +8817,7 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
     let mut mem_inits: HashMap<&'a str, BTreeMap<usize, u128>> = HashMap::new();
     let mut funcs: Vec<FuncDef<'a>> = Vec::new();
     let mut negedge_writes: Vec<NegedgeWrite<'a>> = Vec::new();
+    let mut async_resets: Vec<(&'a str, &'a str, bool)> = Vec::new();
     let mut sva_conc: Vec<ConcPropAst<'a>> = Vec::new();
     let mut sva_imm: Vec<ImmAssertAst<'a>> = Vec::new();
     skipped_funcs_clear();
@@ -8799,6 +8835,7 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
         &mut mem_inits,
         &mut funcs,
         &mut negedge_writes,
+        &mut async_resets,
         &mut sva_conc,
         &mut sva_imm,
         "endmodule",
@@ -8886,6 +8923,7 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
         negedge_writes,
         sva_conc,
         sva_imm,
+        async_resets,
     })
 }
 
@@ -8928,6 +8966,7 @@ fn parse_module_items<'a>(
     mem_inits: &mut HashMap<&'a str, BTreeMap<usize, u128>>,
     funcs: &mut Vec<FuncDef<'a>>,
     negedge_writes: &mut Vec<NegedgeWrite<'a>>,
+    async_resets: &mut Vec<(&'a str, &'a str, bool)>,
     sva_conc: &mut Vec<ConcPropAst<'a>>,
     sva_imm: &mut Vec<ImmAssertAst<'a>>,
     endkw: &str,
@@ -8999,6 +9038,7 @@ fn parse_module_items<'a>(
                 mem_inits,
                 funcs,
                 negedge_writes,
+                async_resets,
                 sva_conc,
                 sva_imm,
                 "endgenerate",
@@ -9112,6 +9152,7 @@ fn parse_module_items<'a>(
                             mem_inits,
                             funcs,
                             negedge_writes,
+                            async_resets,
                             sva_conc,
                             sva_imm,
                             "end",
@@ -9132,6 +9173,7 @@ fn parse_module_items<'a>(
                             mem_inits,
                             funcs,
                             negedge_writes,
+                            async_resets,
                             sva_conc,
                             sva_imm,
                             "else",
@@ -9172,6 +9214,7 @@ fn parse_module_items<'a>(
                             mem_inits,
                             funcs,
                             negedge_writes,
+                            async_resets,
                             sva_conc,
                             sva_imm,
                             "end",
@@ -9199,6 +9242,7 @@ fn parse_module_items<'a>(
                 assigns,
                 mem_inits,
                 negedge_writes,
+                async_resets,
                 sva_conc,
                 sva_imm,
             ) {
@@ -9589,9 +9633,9 @@ fn parse_module_items<'a>(
             continue;
         }
         if p.eat_kw("always_ff") || p.eat_kw("always") || p.eat_kw("always_latch") {
-            let (combo, edge_clk, negedge_only) = skip_event_control(p);
+            let (combo, edge_clk, negedge_only, async_rst, rst_low) = skip_event_control_async(p);
             if sim_only_for(&cur_mod()) {
-                let _ = (combo, edge_clk, negedge_only);
+                let _ = (combo, edge_clk, negedge_only, async_rst, rst_low);
                 skip_procedural_body(p);
                 continue;
             }
@@ -9630,8 +9674,32 @@ fn parse_module_items<'a>(
                             }
                         }
                     } else {
-                        // Includes async `posedge clk or negedge rst` (sync-reset mux).
+                        // A reset term in the sensitivity list makes the reset
+                        // ASYNCHRONOUS: record it so the flop gets a real `SR`
+                        // pin. Leaving it in the D cone only would make the
+                        // reset conditional on a clock edge (silently sync).
                         let clk = edge_clk.unwrap_or_else(|| "clk".into());
+                        if let Some(rst) = &async_rst {
+                            let rst: &'a str = p.arena.alloc_str(rst);
+                            if stmts.is_empty() {
+                                let sig = seq_lhs_from_toks(&p.t[body_start..p.i]);
+                                let sig: &'a str = p.arena.alloc_str(&sig);
+                                if !async_resets.iter().any(|(s, _, _)| *s == sig) {
+                                    async_resets.push((sig, rst, rst_low));
+                                }
+                            } else {
+                                let mut seen = HashSet::new();
+                                for (lhs, _, _) in &stmts {
+                                    if !seen.insert(lhs.clone()) {
+                                        continue;
+                                    }
+                                    let sig: &'a str = p.arena.alloc_str(lhs);
+                                    if !async_resets.iter().any(|(s, _, _)| *s == sig) {
+                                        async_resets.push((sig, rst, rst_low));
+                                    }
+                                }
+                            }
+                        }
                         if stmts.is_empty() {
                             let sig = seq_lhs_from_toks(&p.t[body_start..p.i]);
                             note_seq_write(&cur_mod(), &clk, &sig);
@@ -9840,6 +9908,7 @@ fn parse_for_unroll_module<'a>(
     assigns: &mut Vec<Nba<'a>>,
     mem_inits: &mut HashMap<&'a str, BTreeMap<usize, u128>>,
     negedge_writes: &mut Vec<NegedgeWrite<'a>>,
+    async_resets: &mut Vec<(&'a str, &'a str, bool)>,
     sva_conc: &mut Vec<ConcPropAst<'a>>,
     sva_imm: &mut Vec<ImmAssertAst<'a>>,
 ) -> Result<(), String> {
@@ -9957,6 +10026,7 @@ fn parse_for_unroll_module<'a>(
                 mem_inits,
                 &mut dummy_funcs,
                 negedge_writes,
+                async_resets,
                 &mut local_sva_conc,
                 &mut local_sva_imm,
                 "end",
@@ -17443,6 +17513,15 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // blocking the FF→PAD fallback (bare ysyx_ibex IOB=0). Prefer NBA-
     // registered top outs; else last FF → first Out.
     let mut iob_n = 0usize;
+    // `emit_iob` takes the pad's *net* name, not the port name. For a vector
+    // output the port name is the same string for every bit (`led`), so
+    // passing it here gave all eight IOBs the same PAD net. Downstream, pack
+    // resolves an IOB's port from its PAD net and then looks up `LOC` on it, so
+    // eight IOBs sharing one net name all resolved to the bare port `led`,
+    // which carries the per-bit constraints as `LOC[0]`..`LOC[7]` and no plain
+    // `LOC`. Placement then refused the design with "IOB has no PACKAGE_PIN
+    // LOC". A bit-qualified net (`led_0`..`led_7`) keeps the bits distinct and
+    // still resolves back to the port, because pack strips the suffix.
     let emit_iob = |d: &mut Design, iob_n: &mut usize, qnet: &str, pad: &str| {
         let iob = if *iob_n == 0 {
             "u_iob".to_string()
@@ -17454,6 +17533,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         d.connect(qnet, &iob, "I");
         d.connect(pad, &iob, "PAD");
     };
+    // PAD net name for output `port` bit `bit`.
+    let pad_net = |port: &str, bit: usize| -> String { bit_name(port, sig_width(rtl, port), bit) };
     for (lhs, bit, rhs) in &rtl.assigns {
         let is_out = rtl
             .ports
@@ -17469,7 +17550,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 let mw = sig_width(rtl, mem).max(1);
                 for i in 0..ow.min(mw).min(256) {
                     let qnet = unpacked_word_q(mem, *word, mw, i);
-                    emit_iob(&mut d, &mut iob_n, &qnet, lhs);
+                    let pad = pad_net(lhs, i);
+                    emit_iob(&mut d, &mut iob_n, &qnet, &pad);
                 }
                 continue;
             }
@@ -17485,7 +17567,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                         break;
                     }
                     let qnet = bit_name(bus, bw, src);
-                    emit_iob(&mut d, &mut iob_n, &qnet, lhs);
+                    let pad = pad_net(lhs, i);
+                    emit_iob(&mut d, &mut iob_n, &qnet, &pad);
                 }
                 continue;
             }
@@ -17526,7 +17609,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 } else {
                     bit_name(lhs, w, i)
                 };
-                emit_iob(&mut d, &mut iob_n, &qnet, lhs);
+                let pad = pad_net(lhs, i);
+                emit_iob(&mut d, &mut iob_n, &qnet, &pad);
             }
             continue;
         }
@@ -17540,7 +17624,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 if depth > 0 && *b < depth {
                     for i in 0..w.max(1).min(256) {
                         let qnet = unpacked_word_q(lhs, *b, w, i);
-                        emit_iob(&mut d, &mut iob_n, &qnet, lhs);
+                        let pad = pad_net(lhs, i);
+                        emit_iob(&mut d, &mut iob_n, &qnet, &pad);
                     }
                     continue;
                 }
@@ -17582,7 +17667,11 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             // 1-bit comb assign (not a wire name): LUT already drives lhs.
             bit_name(lhs, w, 0)
         };
-        emit_iob(&mut d, &mut iob_n, &qnet, lhs);
+        // Which pad bit this IOB owns: the assigned bit when there is one,
+        // else bit 0 (the whole-signal, width-1 case).
+        let pad_bit = bit.map(|b| b.min(w.saturating_sub(1))).unwrap_or(0);
+        let pad = pad_net(lhs, pad_bit);
+        emit_iob(&mut d, &mut iob_n, &qnet, &pad);
     }
     if iob_n == 0 {
         // Last-resort fallback: connect the single most plausible register bit
@@ -17853,6 +17942,7 @@ fn flatten_module_ov_vis<'s>(
         negedge_writes: src.negedge_writes.clone(),
         sva_conc: src.sva_conc.clone(),
         sva_imm: src.sva_imm.clone(),
+        async_resets: src.async_resets.clone(),
     };
     for inst in &src.insts {
         let Some(child_proto) = mods.get(inst.module) else {
@@ -19890,6 +19980,7 @@ endmodule
             toks: vec![],
             mem_inits: Default::default(),
             negedge_writes: vec![],
+            async_resets: vec![],
             sva_conc: Vec::new(),
             sva_imm: Vec::new(),
         };
@@ -19935,6 +20026,7 @@ endmodule
             toks: vec![],
             mem_inits: Default::default(),
             negedge_writes: vec![],
+            async_resets: vec![],
             sva_conc: Vec::new(),
             sva_imm: Vec::new(),
         };
@@ -19974,6 +20066,7 @@ endmodule
             toks: vec![],
             mem_inits: Default::default(),
             negedge_writes: vec![],
+            async_resets: vec![],
             sva_conc: Vec::new(),
             sva_imm: Vec::new(),
         };
@@ -23658,6 +23751,7 @@ endmodule
                 toks: vec![],
                 mem_inits,
                 negedge_writes: vec![],
+            async_resets: vec![],
             sva_conc: Vec::new(),
             sva_imm: Vec::new(),
             }
@@ -23725,6 +23819,7 @@ endmodule
             toks: vec![],
             mem_inits: HashMap::new(),
             negedge_writes: vec![],
+            async_resets: vec![],
             sva_conc: vec![],
             sva_imm: vec![],
         };
@@ -23816,6 +23911,7 @@ endmodule
             toks: vec![],
             mem_inits: HashMap::new(),
             negedge_writes: vec![],
+            async_resets: vec![],
             sva_conc: vec![],
             sva_imm: vec![],
         };
@@ -23962,6 +24058,7 @@ endmodule
             toks: vec![],
             mem_inits: HashMap::new(),
             negedge_writes: vec![],
+            async_resets: vec![],
             sva_conc: vec![],
             sva_imm: vec![],
         };
