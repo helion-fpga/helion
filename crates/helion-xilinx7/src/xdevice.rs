@@ -137,6 +137,7 @@ impl<'a> DeviceQuery for XDevice<'a> {
             .find(|(tile, site)| !used.contains(site) && !used.contains(tile))
     }
 
+
     fn tile_xy(&self, tile: &str) -> Option<(i32, i32)> {
         self.tile_idx(tile)
             .and_then(|i| self.device.tile(i))
@@ -168,6 +169,81 @@ impl<'a> TimingDevice for XDevice<'a> {
 }
 
 impl<'a> RouteQuery for XDevice<'a> {
+    fn iob_output_sink(&self, site: &str) -> Vec<(String, String)> {
+        // Trace, from the pad backwards, the ONLY path the fabric can use to
+        // reach it:
+        //
+        //   INT_R_X73Y46.IMUX34            <- fabric arrives here
+        //     -> RIOI3_X73Y45.IOI_IMUX34_1   (same node, tileconn)
+        //     -> IOI_OLOGIC0_D1              (real pip, IOI_IMUX34_1 -> D1)
+        //     -> IOI_OLOGIC0_OQ              (pseudo-pip)
+        //     -> RIOI_O0                     (pseudo-pip)
+        //     -> RIOB33_X73Y45.IOB_O0        (same node, tileconn)
+        //
+        // So the routable target is the *first* wire, in the neighbouring INT
+        // tile -- NOT `site.O` (`IOB_O0`), which sits on the pad side of the
+        // OBUF. Driving `IOB_O0` makes the search traverse `IOB_O_OUT0`
+        // backwards and then flood the fabric until it chances on some
+        // `IMUX34`, which is how LED0 on RIOB33_X73Y45 ended up fed from
+        // `INT_R_X73Y45.IMUX34` while its OLOGIC was actually listening on
+        // `INT_R_X73Y46.IMUX34` -- a configured, `done=1`, dark pad.
+        //
+        // Resolve it structurally rather than by hardcoding names: find the
+        // IOB's OLOGIC site, take the pip that drives its `_D1` input, and
+        // return that wire's node members. OLOGIC `Y<n>` is fed by
+        // `IOI_IMUX34_{1-n}` on a full IOI tile, but deriving it keeps the
+        // rule honest for tiles whose numbering differs.
+        let Some((tile_idx, _site_idx)) = self.device.site_by_name(site) else {
+            return Vec::new();
+        };
+        let Some(iob_tile) = self.tile_name(tile_idx).map(|s| s.to_string()) else {
+            return Vec::new();
+        };
+        let Some(rel) = self.site_rel(&iob_tile, site) else {
+            return Vec::new();
+        };
+        if !rel.starts_with("IOB_Y") {
+            return Vec::new();
+        }
+        let Some(ioi) = self.ioi_tile_for(&iob_tile) else {
+            return Vec::new();
+        };
+        // NOTE the two different spellings, which is the whole trap here:
+        // the OLOGIC's *site* (and so its segbits prefix) is `OLOGIC_Y0`,
+        // but the *wires* of that same instance are `IOI_OLOGIC0_*`.
+        // OLOGIC `n` is fed by `IOI_IMUX34_{1-n}` (verified: on
+        // RIOI3_X73Y45, `IOI_IMUX34_1 -> IOI_OLOGIC0_D1` and
+        // `IOI_IMUX34_0 -> IOI_OLOGIC1_D1`), so derive it rather than
+        // assuming `n`.
+        //
+        // Query from the IMUX side: `pips_from(tile, w)` returns pips whose
+        // *source* is `w`, so asking from `..._D1` yields the OLOGIC's
+        // internal fan-out, not its input.
+        let ologic_idx: usize = rel
+            .trim_start_matches("IOB_Y")
+            .parse()
+            .unwrap_or(usize::MAX);
+        if ologic_idx == usize::MAX {
+            return Vec::new();
+        }
+        let want = format!("IOI_OLOGIC{ologic_idx}_D1");
+        let mut out: Vec<(String, String)> = Vec::new();
+        for mux in ["IOI_IMUX34_0", "IOI_IMUX34_1"] {
+            for (dst, _src, _pseudo) in self.pips_from(&ioi, mux) {
+                if dst != want {
+                    continue;
+                }
+                // `mux` is in the same node as the INT tile's IMUX34, which
+                // is the wire the router must actually drive.
+                out.extend(self.node_wires(&ioi, mux));
+            }
+        }
+        // Deduplicate: a node yields the same set from either end.
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Real grid coordinates, so the router's A* heuristic has a distance.
     ///
     /// `RouteQuery::tile_xy` defaults to `None`, and nothing overrode it, so
@@ -183,6 +259,12 @@ impl<'a> RouteQuery for XDevice<'a> {
         self.tile_idx(tile)
             .and_then(|i| self.device.tile(i))
             .map(|t| (t.grid_x, t.grid_y))
+    }
+
+    fn tile_type_of(&self, tile: &str) -> Option<String> {
+        self.tile_idx(tile)
+            .and_then(|i| self.device.tile_type_name(i))
+            .map(|s| s.to_string())
     }
 
     fn pips_from(&self, tile: &str, wire: &str) -> Vec<(String, String, bool)> {
@@ -271,6 +353,7 @@ impl<'a> EmitDevice for XDevice<'a> {
         None
     }
 
+
     fn ologic_feature_available(&self, ioi_tile: &str, site: &str, feature: &str) -> bool {
         // The segbits DB is keyed by tile TYPE and the feature name is
         // prefixed with that type, e.g.
@@ -279,6 +362,23 @@ impl<'a> EmitDevice for XDevice<'a> {
         // with ppips only, so this returns false there and the emitter fails
         // loudly instead of producing an unassemblable FASM line.
         let Some(idx) = self.tile_idx(ioi_tile) else {
+            return false;
+        };
+        let Some(tt) = self.device.tile_type_name(idx) else {
+            return false;
+        };
+        let namespaced = format!("{tt}.{site}.{feature}");
+        self.device.segbits(tt, &namespaced).is_some()
+    }
+
+    fn iob_feature_available(&self, iob_tile: &str, site: &str, feature: &str) -> bool {
+        // Same namespacing rule as ologic_feature_available: the segbits DB is
+        // keyed by tile TYPE and the feature carries that type as its prefix,
+        // e.g. type "RIOB33", feature "RIOB33.IOB_Y1.PULLTYPE.NONE". Tiles
+        // whose segbits lack the row (e.g. RIOB33_SING, which upstream X-Ray
+        // ships with ppips only) return false so the emitter skips the line
+        // instead of writing FASM nothing can resolve.
+        let Some(idx) = self.tile_idx(iob_tile) else {
             return false;
         };
         let Some(tt) = self.device.tile_type_name(idx) else {
