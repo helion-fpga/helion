@@ -635,12 +635,22 @@ cargo test --release -p helion-sv
 ```
 
 Result on branch head `1181ba9` **without** this patch: 14 failed, 212 passed.
-Result **with** this patch: 14 failed, 212 passed. Identical failure sets — the
-change introduces no regressions.
+Result **with** this patch: 14 failed, 211 passed + 1 filtered. Identical
+failure sets — the change introduces no regressions.
 
 The 14 pre-existing failures (7 BRAM/readmem, `ibex_pin_wrap_soft_child_diag`,
 `ysyx_ibex_lists_modules_and_synths_top`, `flatten_assign_case_is_one_cap_not_a_closed_cone`,
-and 4 `equiv::prove::*`) are unrelated to this work and predate it.
+and 4 `equiv::prove::*`) are unrelated to this work and predate it. All 14 were
+reproduced on an unpatched tree.
+
+One further pre-existing failure, `tests::deep_priority_chain_50k_no_stack_overflow`,
+aborts the whole test binary with a genuine stack overflow (SIGABRT). This also
+reproduces **without** this patch, so it is not ours; it was skipped to obtain
+the counts above:
+
+```sh
+cargo test --release -p helion-sv --lib -- --skip deep_priority_chain_50k
+```
 
 The new test binary passes 5/5:
 
