@@ -548,8 +548,20 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     //   3. The FF that consumes a sum bit must select the carry path
     //      (`AFFMUX = XOR`), handled in `mux_for_ff`.
     //
-    // The `S`/`DI` LUTs themselves are ordinary `ALUT.INIT` features emitted by
-    // the LUT loop above, because the lane LUTs are real packed LUTs.
+    // The lane `S` LUTs are NOT ordinary packed LUTs: they live in the CARRY4's
+    // own slice, one per lane, and the packer records their INIT directly on
+    // `PackedCarry` (`lane_s_init`) rather than as separate LUT cells. So the
+    // generic LUT loop above never sees them and they must be written here.
+    //
+    // Omitting them leaves each lane's `S` input undriven in the fabric while
+    // the netlist still connects it, so the chain computes garbage (or, with
+    // the carry-in also wrong, freezes). Vivado's own blinky writes 48 lane LUT
+    // functions, all inside its seven chain slices; before this loop Helion
+    // wrote none of them.
+    //
+    // `DI` needs no LUT: it comes straight from the slice input through the
+    // `DI1MUX` select, which is already emitted. That matches Vivado, whose
+    // chain slices contain no zero-INIT DI LUTs.
     for carry in &placed.carries {
         let Some(pc) = placed.packed.carries.iter().find(|c| c.name == carry.name) else {
             return Err(format!(
@@ -560,6 +572,18 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         let site_rel = device
             .site_rel(&carry.tile, &carry.site)
             .ok_or_else(|| format!("emit: no rel site for {} {}", carry.tile, carry.site))?;
+        // Lane order A..D maps to ALUT..DLUT, the same letters the lane pins use.
+        for (lane, letter) in ["A", "B", "C", "D"].iter().enumerate() {
+            // A lane past the end of its chain has no `S` net; `lane_sum_net`
+            // is the marker for "this lane is real".
+            if pc.lane_sum_net[lane].is_none() {
+                continue;
+            }
+            lines.push(format!(
+                "{}.{}.{}LUT.INIT[63:0] = 64'h{:016X}",
+                carry.tile, site_rel, letter, pc.lane_s_init[lane]
+            ));
+        }
         // The carry mux. Only the element that STARTS the chain takes its
         // lane-A carry from the slice pin; every other lane, and every lane of
         // a later element, ripples. `index` is the element's position in its
