@@ -1189,15 +1189,24 @@ fn mux_for_ff(
         // term without the carry added, i.e. a counter that runs at the wrong
         // value; selecting `AX` would leave D undriven. Check the carry's sum
         // nets before the LUT path.
-        let carry_feeds_ff = placed.carries.iter().any(|pc| {
-            pc.site == ff.site
-                && placed
-                    .packed
-                    .carries
-                    .iter()
-                    .find(|c| c.name == pc.name)
-                    .map(|c| c.lane_sum_net.iter().flatten().any(|n| *n == pff.d_net))
-                    .unwrap_or(false)
+        // Match on the sum NET, not on a shared site.
+        //
+        // A chain is a vertical run of adjacent rows in one column, and it is
+        // placed before the flops that consume it, so the chain and its
+        // consumers routinely land in different columns. Requiring
+        // `pc.site == ff.site` therefore never matches for a real chain: every
+        // sum bit goes unconsumed, `mux_for_ff` falls through to the bare
+        // `AX`/`BX`/`CX`/`DX` default, and the flop is wired to a slice input
+        // pin that nothing drives. The flop then holds its init value forever
+        // -- a frozen LED with a byte-perfect clock.
+        //
+        // The sum net is the real predicate: if this carry element publishes
+        // the net sitting on the flop's D, the flop must take `XOR`.
+        let carry_feeds_ff = placed.packed.carries.iter().any(|c| {
+            c.lane_sum_net
+                .iter()
+                .flatten()
+                .any(|n| *n == pff.d_net)
         });
         if carry_feeds_ff {
             return "XOR";
