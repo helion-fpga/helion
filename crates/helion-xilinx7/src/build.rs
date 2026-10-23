@@ -429,9 +429,30 @@ pub fn bitstream_for_part(
     // Every valid frame from part.json -- never the tilegrid union.
     let mut store = FrameStore::for_part(device.part())
         .map_err(|e| BitstreamBuildError::Frames(format!("{e:?}")))?;
-    let features_applied = store
-        .apply_fasm(&kept, &segbits, &layout)
-        .map_err(|e| BitstreamBuildError::Frames(e.to_string()))?;
+    let features_applied = match store.apply_fasm(&kept, &segbits, &layout) {
+        Ok(n) => n,
+        Err(e) => {
+            // The usual cause is a fabric bigger than the die it is programmed
+            // onto, which is a property of the database rather than of this
+            // design: `xc7a35t` ships no tilegrid and borrows `xc7a50t`, whose
+            // fabric is taller than the 35T `part.json` describes. Say so
+            // instead of leaving a bare "frame ... not in store".
+            let msg = e.to_string();
+            if msg.contains("not in store") {
+                return Err(BitstreamBuildError::Frames(format!(
+                    "{msg}. \n\
+                     The fabric loaded for this part places tiles outside the die's \
+                     configuration frames, so those features have no frame to be \
+                     written into. This is a database limitation, not a design error: \
+                     a part with no tilegrid of its own borrows another die's fabric, and \
+                     the borrowed fabric can be larger than this die. Use a part that \
+                     ships its own tilegrid, or accept that the affected features \
+                     cannot be programmed on this die."
+                )));
+            }
+            return Err(BitstreamBuildError::Frames(msg));
+        }
+    };
     let frame_count = store.frame_count();
     let payload = store.fdri_payload();
 
