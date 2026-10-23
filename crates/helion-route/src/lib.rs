@@ -22,6 +22,13 @@ pub struct Routed {
     pub overused: u32,
     /// LUT-pin drivers outside bring-up IMUX reach (axis±4 / diag±2 / knight; Ibex-scale).
     pub imux_skip: u32,
+    /// Output IOBs whose net is driven by no LUT or FF in the netlist.
+    ///
+    /// These have no source, so no route exists for them. They are listed here
+    /// rather than being given a fabricated route from an arbitrary cell: a
+    /// route for a connection the design does not contain distorts congestion
+    /// and timing and can never match the netlist.
+    pub undriven_iobs: Vec<String>,
     /// Final per-tile net usage over the router TileGrid, row-major:
     /// `congestion[dy * congestion_cols + dx]` counts nets whose best path
     /// traverses tile (`congestion_x0 + dx`, `congestion_y0 + dy`).
@@ -595,12 +602,30 @@ pub fn route_with_guide(
     }
     // (src, dst, ble, packed_iob_idx) — idx must survive y-skip filtering.
     let mut nets: Vec<((u32, u32), (u32, u32), u8, usize)> = Vec::new();
+    // IOBs with no driver in the netlist, reported rather than fabricated.
+    let mut undriven_iobs: Vec<String> = Vec::new();
     if !placed.packed.lutffs.is_empty() {
         for (ii, iob_site) in placed.iob_sites.iter().enumerate() {
             let packed_iob = placed.packed.iobs.get(ii);
-            let idx = packed_iob
-                .and_then(|io| q_net_lutff.get(io.from_net.as_str()).copied())
-                .unwrap_or(0);
+            // An IOB whose net is driven by no LUT/FF has NO source. This used
+            // to fall back to `unwrap_or(0)`, routing it from whichever cell
+            // happened to be first -- producing a complete, plausible-looking
+            // path with real hops and a real delay estimate, for a connection
+            // that does not exist in the design. A fabricated route is worse
+            // than a missing one: it inflates congestion and timing reports
+            // and can never match the netlist.
+            //
+            // Skip it and record the fact, so the caller can report undriven
+            // I/O rather than silently inventing a driver for it.
+            let Some(idx) = packed_iob.and_then(|io| q_net_lutff.get(io.from_net.as_str()).copied())
+            else {
+                undriven_iobs.push(
+                    packed_iob
+                        .map(|io| io.cell.clone())
+                        .unwrap_or_else(|| format!("iob#{ii}")),
+                );
+                continue;
+            };
             let Some(&(clb, ble)) = placed.lutff_sites.get(idx) else {
                 continue;
             };
@@ -625,6 +650,7 @@ pub fn route_with_guide(
             pathfinder_iters: 0,
             overused: 0,
             imux_skip,
+            undriven_iobs: undriven_iobs.clone(),
             congestion: vec![0u32; grid.len()],
             congestion_x0: cong_x0,
             congestion_y0: cong_y0,
@@ -738,6 +764,7 @@ pub fn route_with_guide(
         placed: placed.clone(),
         iob_src,
         imux,
+        undriven_iobs,
         pathfinder_iters: iters,
         overused: best_overused,
         imux_skip,
@@ -826,6 +853,7 @@ mod tests {
         assert_eq!(r.congestion, expect);
         // Sanity: an unrouted (empty) Routed has an all-zero congestion map.
         let r2 = Routed {
+            undriven_iobs: Vec::new(),
             placed: pl.clone(),
             iob_src: Vec::new(),
             imux: Vec::new(),

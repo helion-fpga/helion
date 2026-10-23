@@ -580,6 +580,7 @@ fn dec_routed(r: &mut Reader) -> Result<Routed, String> {
     let overused = r.u32()?;
     let imux_skip = r.u32()?;
     Ok(Routed {
+        undriven_iobs: Vec::new(),
         placed,
         iob_src,
         imux,

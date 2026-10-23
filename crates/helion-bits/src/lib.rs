@@ -283,8 +283,29 @@ pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
         let site = routed.placed.bram_sites[i];
         let word = 1u128 | ((site.x as u128) << 8) | ((site.y as u128) << 16);
         acc.insert((Far::BRAM, i as u16, 0), word);
+        // Word index 0 of a BRAM lives at minor 1, so the minor offset is
+        // `1 + wi`. It must NOT be computed in `u8`: `1u8 + (wi as u8)` wraps
+        // at 256, so word 256 would alias minor 1 and OVERWRITE word 0 --
+        // silent corruption, and one the fabric model would faithfully
+        // reproduce, so a readback check would confirm the wrong content
+        // rather than catch it.
+        //
+        // Refuse an over-deep init instead of wrapping. Nothing populates
+        // `brams` on the current path, so this is a latent defect being closed
+        // before it can be exercised.
+        if b.init.len() > u8::MAX as usize {
+            return Err(format!(
+                "bitgen: BRAM {} has {} INIT words, more than the {} an 8-bit frame minor can address",
+                b.cell,
+                b.init.len(),
+                u8::MAX
+            ));
+        }
         for (wi, w) in b.init.iter().enumerate() {
-            let minor = 1u8 + (wi as u8);
+            let minor = 1u16 + wi as u16;
+            let minor = u8::try_from(minor).map_err(|_| {
+                format!("bitgen: BRAM {} word {wi} does not fit an 8-bit frame minor", b.cell)
+            })?;
             acc.insert((Far::BRAM, i as u16, minor), *w as u128);
         }
     }
@@ -897,6 +918,7 @@ mod tests {
     fn bitgen_refuses_empty_design() {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let empty = Routed {
+            undriven_iobs: Vec::new(),
             placed: helion_place::Placed {
                 packed: helion_pack::Packed {
                     lutffs: vec![],
