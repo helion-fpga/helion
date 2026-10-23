@@ -609,15 +609,24 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         // logic unconfigured, and `DI` arrives at the CARRY4 through the
         // `DI1MUX` select reading the other half -- so the carry has no
         // generate term at all.
-        if let Some(other) = other_slice_half(&site_rel) {
-            for (lane, letter) in ["A", "B", "C", "D"].iter().enumerate() {
-                if pc.lane_sum_net[lane].is_none() {
-                    continue;
+        // Only elements with a SIBLING carry element get paired-half DI LUTs.
+        //
+        // The reference writes `SLICEL_X1` lane LUTs on the six elements that
+        // pass a carry on, and none on the chain tail at Y45, which holds a
+        // single lane (`count[24]`) and has nothing above it to feed. A tail
+        // DI LUT is an extra feature the oracle does not carry -- the mirror of
+        // the missing-feature bugs, and just as wrong.
+        if pc.cout_net.is_some() {
+            if let Some(other) = other_slice_half(&site_rel) {
+                for (lane, letter) in ["A", "B", "C", "D"].iter().enumerate() {
+                    if pc.lane_sum_net[lane].is_none() {
+                        continue;
+                    }
+                    lines.push(format!(
+                        "{}.{}.{}LUT.INIT[63:0] = 64'h{:016X}",
+                        carry.tile, other, letter, pc.lane_di_init[lane]
+                    ));
                 }
-                lines.push(format!(
-                    "{}.{}.{}LUT.INIT[63:0] = 64'h{:016X}",
-                    carry.tile, other, letter, pc.lane_di_init[lane]
-                ));
             }
         }
         // The carry mux. Only the element that STARTS the chain takes its
