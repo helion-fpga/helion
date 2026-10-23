@@ -545,6 +545,26 @@ fn clock_companions(tile_type: &str, dst: &str, src: &str) -> Vec<String> {
             out.push(format!("GCLK{g}_ENABLE_ABOVE"));
             out.push(format!("GCLK{g}_ENABLE_BELOW"));
         }
+    } else if tile_type.starts_with("LIOI3") {
+        // Global-clock tap at the input pin. The IBUF output reaches the
+        // clock spine through `LIOI_I2GCLK_TOP0.IOI_ILOGIC0_O`, and that is a
+        // pseudo-pip the DB marks `always` -- it is the ONLY legal source, so
+        // the signal necessarily passes through the ILOGIC. A working Vivado
+        // bitstream additionally sets `ILOGIC_Y0.ZINV_D` on that tile, which
+        // drives the D input inverted; without it the ILOGIC does not pass
+        // the signal through and the clock stops at the pin (the counter
+        // then sits frozen at its init value). `ZINV_D` is a real segbit
+        // (`LIOI3.ILOGIC_Y0.ZINV_D 29_109`), not a pseudo-pip, so it has to
+        // be requested explicitly.
+        if dst.contains("I2GCLK") || src.contains("I2GCLK") {
+            // Name the ILOGIC that owns the tap: TOP -> Y0, BOT -> Y1.
+            let side = if dst.contains("I2GCLK_TOP") || src.contains("I2GCLK_TOP") {
+                "Y0"
+            } else {
+                "Y1"
+            };
+            out.push(format!("ILOGIC_{side}.ZINV_D"));
+        }
     } else if tile_type.starts_with("CLK_HROW") {
         if src.starts_with("CLK_HROW_CK_IN_") {
             out.push(format!("{src}_ACTIVE"));
@@ -924,6 +944,14 @@ mod tests {
         assert_eq!(
             clock_companions("HCLK_R", "", "HCLK_CK_BUFHCLK0"),
             vec!["ENABLE_BUFFER.HCLK_CK_BUFHCLK0"]
+        );
+    }
+
+    #[test]
+    fn clock_companions_enable_ilogic_clock_tap() {
+        assert_eq!(
+            clock_companions("LIOI3", "LIOI_I2GCLK_TOP0", "IOI_ILOGIC0_O"),
+            vec!["ILOGIC_Y0.ZINV_D"]
         );
     }
 
