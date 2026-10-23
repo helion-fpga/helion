@@ -15454,6 +15454,17 @@ fn packed_const_minus_bus(rhs: &RExpr<'_>, rtl: &Rtl) -> Option<(String, u128, u
     }
 }
 
+/// The next-state net for `bit` of `name`: what a register's `D` takes.
+///
+/// Kept distinct from `bit_name` so the register output and the function that
+/// feeds it are never the same net. Using one name for both makes the net
+/// driven by two cells -- the combinational result and the flop's own `Q` --
+/// which is a loop, not a register.
+fn next_bit_name(name: &str, width: usize, bit: usize) -> String {
+    let _ = width;
+    format!("n_nx_{name}_{bit}")
+}
+
 fn op_bit_net(rtl: &Rtl, name: &str, bit: usize) -> Option<String> {
     let w = sig_width(rtl, name);
     if bit >= w {
@@ -15714,8 +15725,15 @@ fn emit_carry4_map(d: &mut Design, sum: &str, tag: &str, width: usize, map: &Car
             emit_lut_pins(d, &di_cell, &di_net, di_init, &di_pins);
             d.connect(&di_net, &cell, &format!("{letter}DI"));
             // The sum bit is the CARRY4's own O output for this lane.
+            //
+            // It drives the NEXT-state net, not the register's own output.
+            // Wiring the carry straight onto `count_<bit>` makes that net
+            // driven by the carry's `O` AND by the flop's `Q`, which is a
+            // combinational loop rather than a register: the router then sees
+            // two drivers and refuses, and if it did not, the flop would have
+            // no feedback term and the counter could never advance.
             if bit < width {
-                let sum_net = bit_name(sum, width, bit);
+                let sum_net = next_bit_name(sum, width, bit);
                 d.connect(&sum_net, &cell, &format!("O{lane}"));
             }
         }
@@ -16905,10 +16923,11 @@ fn lower_wide_increment_counters(
         for bit in 0..width {
             let ff = format!("u_ff_c{sig}_{bit}");
             let qnet = bit_name(sig, width, bit);
+            let dnet = next_bit_name(sig, width, bit);
             let bit_clk = seq_clk_for(&rtl.module, &qnet, clk);
             d.add_cell(&ff, CellKind::Hff);
             d.connect(&bit_clk, &ff, "CLK");
-            d.connect(&qnet, &ff, "D");
+            d.connect(&dnet, &ff, "D");
             d.connect(&qnet, &ff, "Q");
         }
         eprintln!(
@@ -25501,12 +25520,30 @@ mod carry4_tests {
         let pins = d.pin_index();
         for bit in 0..25 {
             let qn = format!("q_{bit}");
-            let net = d
+            let _net = d
                 .nets
                 .iter()
                 .find(|n| n.name == qn)
                 .unwrap_or_else(|| panic!("no net {qn}"));
-            let c4_lane = net.endpoints.iter().any(|e| {
+            let has_ff = d.cells.iter().any(|c| {
+                matches!(c.kind, CellKind::Hff) && pins.net_on(&c.name, "Q") == Some(qn.as_str())
+            });
+            assert!(has_ff, "sum bit {bit} ({qn}) has no register");
+
+            // The CARRY4 drives the register's NEXT-STATE net, and the
+            // register drives the carry's operand. Asserting instead that the
+            // carry's `O` drives `q_<bit>` is what this test used to do, and
+            // that is exactly the defect: it makes `q_<bit>` driven by the
+            // carry AND by the flop's own `Q`, which is a combinational loop
+            // with no feedback term -- the router rejects it for having two
+            // drivers, and the counter could never advance.
+            let dnet = next_bit_name("q", 25, bit);
+            let dn = d
+                .nets
+                .iter()
+                .find(|n| n.name == dnet)
+                .unwrap_or_else(|| panic!("no next-state net {dnet} for bit {bit}"));
+            let driven_by_c4 = dn.endpoints.iter().any(|e| {
                 e.pin.len() == 2
                     && e.pin.starts_with('O')
                     && e.cell.starts_with("u_c4_")
@@ -25514,12 +25551,22 @@ mod carry4_tests {
                         .iter()
                         .any(|c| c.name == e.cell && matches!(c.kind, CellKind::Carry4))
             });
-            assert!(c4_lane, "sum bit {bit} ({qn}) is not driven by a CARRY4 O");
-            let has_ff = d
-                .cells
-                .iter()
-                .any(|c| matches!(c.kind, CellKind::Hff) && pins.net_on(&c.name, "Q") == Some(qn.as_str()));
-            assert!(has_ff, "sum bit {bit} ({qn}) has no register");
+            assert!(driven_by_c4, "next state {bit} ({dnet}) is not driven by a CARRY4 O");
+            let ff_takes_d = d.cells.iter().any(|c| {
+                matches!(c.kind, CellKind::Hff) && pins.net_on(&c.name, "D") == Some(dnet.as_str())
+            });
+            assert!(ff_takes_d, "next state {bit} ({dnet}) does not reach a register D");
+
+            // And the register's output must reach the carry's operand pin,
+            // which is what closes the feedback loop.
+            let op_lut = d.cells.iter().any(|c| {
+                c.name.starts_with("u_c4_")
+                    && matches!(c.kind, CellKind::Lut6 { .. })
+                    && ["I5", "I0", "I4", "I1"]
+                        .iter()
+                        .any(|p| pins.net_on(&c.name, p) == Some(qn.as_str()))
+            });
+            assert!(op_lut, "sum bit {bit} ({qn}) does not drive any CARRY4 operand LUT");
         }
     }
 

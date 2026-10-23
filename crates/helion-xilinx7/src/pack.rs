@@ -609,10 +609,28 @@ fn pack_carry4(netlist: &Design, cell: &helion_ir::Cell) -> Result<PackedCarry, 
             } else {
                 lane_di_init[lane] = init;
             }
-            // Operand nets: the LUT's I0/I1 (the lane operands). I2 is unused by
-            // the carry-free S/DI functions.
-            let a = pins.net_on(&lut.name, "I0").map(|s| s.to_string());
-            let b = pins.net_on(&lut.name, "I1").map(|s| s.to_string());
+            // Operand nets: the pins the S/DI LUTs actually read.
+            //
+            // The synthesised S LUT takes its operand on `I5` (which reaches
+            // the slice as `A6`, matching the reference), while the DI LUT
+            // takes it on `I0`. Reading only `I0`/`I1` therefore finds nothing
+            // for a `q + 1` counter and leaves `lane_operands` as `None`, so
+            // the register bit is never registered as a sink on the carry's
+            // operand pin and the router is never asked to drive `A6`. Try
+            // both spellings rather than assuming one.
+            let pin_net = |name: &str| -> Option<String> {
+                ["I5", "I0", "I4", "I1"]
+                    .iter()
+                    .find_map(|p| pins.net_on(&lut.name, p).map(|s| s.to_string()))
+                    .filter(|_| !name.is_empty())
+            };
+            let _ = &pin_net;
+            let a = ["I5", "I0"]
+                .iter()
+                .find_map(|p| pins.net_on(&lut.name, p).map(|s| s.to_string()));
+            let b = ["I4", "I1"]
+                .iter()
+                .find_map(|p| pins.net_on(&lut.name, p).map(|s| s.to_string()));
             // Record operands once, from the S LUT (both lanes see the same pair).
             if is_s {
                 lane_operands[lane] = Some((a, b));
