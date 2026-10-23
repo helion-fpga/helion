@@ -600,6 +600,26 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                 carry.tile, site_rel, letter, pc.lane_s_init[lane]
             ));
         }
+        // The DI (`O5`) lane LUTs live in the PAIRED slice half, not the one
+        // holding the summing lanes.
+        //
+        // The reference writes eight lane LUTs per element: `SLICEM_X0.A..D`
+        // carry the `S` (sum) functions and `SLICEL_X1.A..D` carry the `DI`
+        // (generate) ones. Emitting only the `S` half leaves half the carry
+        // logic unconfigured, and `DI` arrives at the CARRY4 through the
+        // `DI1MUX` select reading the other half -- so the carry has no
+        // generate term at all.
+        if let Some(other) = other_slice_half(&site_rel) {
+            for (lane, letter) in ["A", "B", "C", "D"].iter().enumerate() {
+                if pc.lane_sum_net[lane].is_none() {
+                    continue;
+                }
+                lines.push(format!(
+                    "{}.{}.{}LUT.INIT[63:0] = 64'h{:016X}",
+                    carry.tile, other, letter, pc.lane_di_init[lane]
+                ));
+            }
+        }
         // The carry mux. Only the element that STARTS the chain takes its
         // lane-A carry from the slice pin; every other lane, and every lane of
         // a later element, ripples. `index` is the element's position in its
