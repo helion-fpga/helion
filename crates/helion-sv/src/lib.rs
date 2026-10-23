@@ -15579,6 +15579,38 @@ fn carry4_di_init(has_a: bool, has_b: bool, b_high: bool) -> u64 {
             pat |= 1u64 << addr;
         }
     }
+    // An ABSENT operand is the constant 1 here, not 0.
+    //
+    // `DI = a & b`, and for the `q + 1` lowering `b` is the constant addend
+    // with no pin, so the strict reading gives `a & 0 = 0` and a zero INIT --
+    // which writes no bits at all. The reference instead carries the plain
+    // pass-through `a & 1 = a` on every one of its `SLICEL_X1` lane LUTs
+    // (`0xFFFF_FFFF_0000_0000`, the operand on `A6`), so a zero INIT is a
+    // visible divergence from the oracle even where the two are logically
+    // equivalent.
+    //
+    // They are equivalent for THIS counter because the `DI1MUX` arms select
+    // the other slice's bypass (`BMC31`/`CMC31`/`DMC31`), not this LUT's `O5`.
+    // Matching the reference is still worth doing: it removes the difference,
+    // and it keeps the emitted form correct for any future case where the
+    // `DI` LUT does feed the carry.
+    if !has_b && !b_high {
+        return pat | di_identity(has_a);
+    }
+    pat
+}
+
+/// The `DI` LUT's unoptimised pass-through of the operand on `A6`.
+fn di_identity(has_a: bool) -> u64 {
+    if !has_a {
+        return 0;
+    }
+    let mut pat = 0u64;
+    for addr in 0..64u32 {
+        if (addr >> 5) & 1 == 1 {
+            pat |= 1u64 << addr;
+        }
+    }
     pat
 }
 
