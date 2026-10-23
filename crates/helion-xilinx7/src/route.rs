@@ -295,6 +295,108 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     })
 }
 
+/// Preference key for the `HCLK_CMT_MUX_CLK_<n>` rows, lower first.
+///
+/// Every CMT clock row has equal routing cost, so without this the name
+/// tie-break decides and picks the largest: `MUX_CLK_9` over `MUX_CLK_0`.
+/// The left HCLK takes `HCLK_CK_BUFHCLK8..11` as `HCLK_CK_INOUT_L0..L3`
+/// (`ppips_hclk_l.db`), so row 0 (`BUFHCLK8` -> `INOUT_L0` -> `CK_IN_L0`) is
+/// the one a left-edge clock can actually reach the HROW on, and the one the
+/// working Vivado bitstream uses. Other rows are left reachable but
+/// deprioritised, since a right-edge clock legitimately uses them.
+///
+/// Non-clock wires all rank equally, so ordinary routing is unaffected.
+fn clock_row_rank(wire: &str) -> u32 {
+    // Every clock-row wire must rank by its ROW NUMBER and nothing else, so
+    // all the hops of one spine agree on a single row.
+    //
+    // The spine tiles are separate search steps -- `HCLK_CMT_MUX_CLK_<n>`,
+    // `HCLK_CK_BUFHCLK<m>`, `CLK_HROW_CK_IN_L<n>`, `CLK_HROW_CK_MUX_OUT_R<n>`,
+    // `CLK_HROW_CK_HCLK_OUT_R<n>`, `CLK_HROW_CK_BUFHCLK_R<n>` -- and each was
+    // resolving its own index independently from an equal-cost frontier, so
+    // the name tie-break gave row 0 at the CMT but row 9 downstream. A clock
+    // that enters at row 0 and leaves at row 9 never arrives: the FFs keep
+    // their init value and the LED lights without blinking.
+    //
+    // The left and right HCLK tiles number their buffer nets from opposite
+    // ends (`ppips_hclk_{l,r}.db`):
+    //
+    //   HCLK_R: HCLK_CK_INOUT_R<n> <-> HCLK_CK_BUFHCLK<n>
+    //   HCLK_L: HCLK_CK_INOUT_L<n> <-> HCLK_CK_BUFHCLK<n+8>
+    //
+    // so a left-side `BUFHCLK<m>` is row `m - 8`. Rank by that recovered row,
+    // then by the wire name. Row 0 is what the working Vivado bitstream uses
+    // for the ZedBoard GCLK on Y9.
+    let (row, wire_kind) = if let Some(n) = wire.strip_prefix("HCLK_CMT_MUX_CLK_") {
+        // The CMT side is literal: Vivado enables `MUX_CLK_0` there.
+        (n.parse::<u32>().ok(), ClkRowEnd::Cmt)
+    } else if let Some(n) = wire
+        .strip_prefix("HCLK_CK_BUFHCLK")
+        .or_else(|| wire.strip_prefix("HCLK_CMT_CK_BUFHCLK"))
+    {
+        // The HCLK tiles number their buffer nets from opposite ends
+        // (`ppips_hclk_{l,r}.db`): the right side uses 0..13, the left band is
+        // `HCLK_CK_BUFHCLK8..11` for `HCLK_CK_INOUT_L0..L3`. Recover the row.
+        (
+            n.parse::<u32>().ok().map(|m| if m >= 8 { m - 8 } else { m }),
+            ClkRowEnd::HrowBuf,
+        )
+    } else if let Some(rest) = wire.strip_prefix("CLK_HROW_CK_IN_") {
+        (
+            rest.trim_start_matches(['L', 'R']).parse::<u32>().ok(),
+            ClkRowEnd::HrowBuf,
+        )
+    } else if let Some(rest) = wire
+        .strip_prefix("CLK_HROW_CK_MUX_OUT_")
+        .or_else(|| wire.strip_prefix("CLK_HROW_CK_HCLK_OUT_"))
+        .or_else(|| wire.strip_prefix("CLK_HROW_CK_BUFHCLK_"))
+    {
+        (
+            rest.trim_start_matches(['L', 'R']).parse::<u32>().ok(),
+            ClkRowEnd::HrowBuf,
+        )
+    } else if let Some(n) = wire.strip_prefix("BUFHCE_X1Y") {
+        (n.parse::<u32>().ok(), ClkRowEnd::HrowBuf)
+    } else {
+        (None, ClkRowEnd::Other)
+    };
+    // The two ends of the spine number the SAME physical row differently, so
+    // rank each end by the value it must land on to match the reference:
+    //
+    //   HCLK_CMT_MUX_CLK_0   the CMT row the ZedBoard GCLK enters on
+    //   CLK_HROW_*_8, X1Y8   the HROW group that pairs `CK_IN_L0`
+    //                        (`MUX_OUT_R8.CK_IN_L0 26_360 26_364`)
+    //
+    // Anything else is reachable but deprioritised, so a left-edge clock
+    // cannot pick a CMT row the HROW never selects (which muted the clock and
+    // left the LED lit but frozen).
+    match wire_kind {
+        ClkRowEnd::Cmt => match row {
+            Some(0) => 0,
+            Some(n) => 100 + n,
+            None => 50,
+        },
+        ClkRowEnd::HrowBuf => match row {
+            Some(8) => 0,
+            Some(n) => 100 + n,
+            None => 50,
+        },
+        ClkRowEnd::Other => 50,
+    }
+}
+
+/// Which end of the clock spine a wire belongs to; see `clock_row_rank`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClkRowEnd {
+    /// `HCLK_CMT_MUX_CLK_<n>` -- the CMT row selector.
+    Cmt,
+    /// A `CLK_HROW_*_<n>` wire or a `BUFHCE_X1Y<n>` in the HROW tile, which
+    /// live in the row-8 group.
+    HrowBuf,
+    /// Any other wire; ranked neutrally.
+    Other,
+}
+
 /// Every `(tile, wire)` a routed net claims, so occupancy can be tracked and
 /// released on rip-up.
 fn route_wires(kind: &RouteKind) -> Vec<(String, String)> {
@@ -460,8 +562,10 @@ fn bfs_route_all(
     // the search at the target instead of flooding the fabric.
     //
     // `BinaryHeap` is a max-heap, so costs are negated. Ties break on the
-    // node name to keep the result deterministic across runs.
-    let mut heap: BinaryHeap<Reverse<(i64, Reverse<String>, Reverse<String>)>> = BinaryHeap::new();
+    // clock row first (see `clock_row_rank`) and then on the node name, to
+    // keep the result deterministic across runs.
+    let mut heap: BinaryHeap<Reverse<(i64, u32, Reverse<String>, Reverse<String>)>> =
+        BinaryHeap::new();
     let mut g: HashMap<(String, String), i64> = HashMap::new();
     g.insert(start.clone(), 0);
     parent.insert(start.clone(), None);
@@ -500,10 +604,15 @@ fn bfs_route_all(
             .unwrap_or(0)
     };
     let mut found: HashSet<(String, String)> = HashSet::new();
-    heap.push(Reverse((h(src_tile, &found), Reverse(start.0.clone()), Reverse(start.1.clone()))));
+    heap.push(Reverse((
+        h(src_tile, &found),
+        clock_row_rank(&start.1),
+        Reverse(start.0.clone()),
+        Reverse(start.1.clone()),
+    )));
     let mut closes: HashSet<(String, String)> = HashSet::new();
     let mut expansions: usize = 0;
-    while let Some(Reverse((_, Reverse(tile), Reverse(wire)))) = heap.pop() {
+    while let Some(Reverse((_, _, Reverse(tile), Reverse(wire)))) = heap.pop() {
         pops += 1;
         let cur = (tile.clone(), wire.clone());
         let cur_g = g.get(&cur).copied().unwrap_or(i64::MAX);
@@ -637,6 +746,19 @@ fn bfs_route_all(
                 g.insert(next.clone(), ng);
                 heap.push(Reverse((
                     ng.saturating_add(h(&next.0, &found)),
+                    // Clock-row preference comes BEFORE the name tie-break.
+                    //
+                    // Every `HCLK_CMT_MUX_CLK_<n>` row costs the same, so the
+                    // name tie-break decides, and it picks the lexicographically
+                    // LARGEST wire: `MUX_CLK_9` beats `MUX_CLK_0`. That row is
+                    // wrong for a left-edge clock. The left HCLK consumes
+                    // `HCLK_CK_BUFHCLK8..11` as its `HCLK_CK_INOUT_L0..L3`
+                    // (`ppips_hclk_l.db`), so `BUFHCLK9` lands on `INOUT_L1`
+                    // while the HROW gets programmed for `CK_IN_L9`. The clock
+                    // dies at that mismatch, the FFs keep their init value, and
+                    // the LED lights without ever blinking. Row 0 is the row the
+                    // working Vivado bitstream uses for the ZedBoard GCLK.
+                    clock_row_rank(&next.1),
                     Reverse(next.0.clone()),
                     Reverse(next.1.clone()),
                 )));
@@ -708,6 +830,19 @@ fn bfs_route_all(
                 g.insert(next.clone(), ng);
                 heap.push(Reverse((
                     ng.saturating_add(h(&next.0, &found)),
+                    // Clock-row preference comes BEFORE the name tie-break.
+                    //
+                    // Every `HCLK_CMT_MUX_CLK_<n>` row costs the same, so the
+                    // name tie-break decides, and it picks the lexicographically
+                    // LARGEST wire: `MUX_CLK_9` beats `MUX_CLK_0`. That row is
+                    // wrong for a left-edge clock. The left HCLK consumes
+                    // `HCLK_CK_BUFHCLK8..11` as its `HCLK_CK_INOUT_L0..L3`
+                    // (`ppips_hclk_l.db`), so `BUFHCLK9` lands on `INOUT_L1`
+                    // while the HROW gets programmed for `CK_IN_L9`. The clock
+                    // dies at that mismatch, the FFs keep their init value, and
+                    // the LED lights without ever blinking. Row 0 is the row the
+                    // working Vivado bitstream uses for the ZedBoard GCLK.
+                    clock_row_rank(&next.1),
                     Reverse(next.0.clone()),
                     Reverse(next.1.clone()),
                 )));
@@ -902,5 +1037,48 @@ mod tests {
         // still a device query (kept for callers that classify clocks).
         assert!(FakeRouter.is_clock_net("clk_bufg"));
         assert!(!FakeRouter.is_clock_net("n1"));
+    }
+}
+
+#[cfg(test)]
+mod clock_row_rank_tests {
+    use super::{clock_row_rank, ClkRowEnd};
+
+    /// The CMT must enter on row 0 and the HROW must use the row-8 group.
+    ///
+    /// These disagreeing is the exact bug that left the LED lit but frozen:
+    /// the CMT fed row 0 while the HROW was programmed for row 9, so the
+    /// clock never arrived and every FF kept its init value.
+    #[test]
+    fn cmt_and_hrow_rank_the_same_physical_row() {
+        // CMT: row 0 wins.
+        assert!(clock_row_rank("HCLK_CMT_MUX_CLK_0") < clock_row_rank("HCLK_CMT_MUX_CLK_9"));
+
+        // HROW: the row-8 group wins, because `MUX_OUT_R8` is the mux that
+        // pairs with `CLK_HROW_CK_IN_L0`.
+        assert!(clock_row_rank("CLK_HROW_CK_MUX_OUT_R8") < clock_row_rank("CLK_HROW_CK_MUX_OUT_R0"));
+        assert!(clock_row_rank("BUFHCE_X1Y8") < clock_row_rank("BUFHCE_X1Y0"));
+        assert!(clock_row_rank("CLK_HROW_CK_IN_L0") < clock_row_rank("CLK_HROW_CK_IN_L9"));
+    }
+
+    /// Ordinary fabric wires must not be reordered relative to each other.
+    #[test]
+    fn non_clock_wires_rank_neutrally() {
+        assert_eq!(clock_row_rank("IMUX34"), clock_row_rank("ER1BEG1"));
+        assert_eq!(clock_row_rank("IMUX34"), 50);
+    }
+
+    /// A left-side `BUFHCLK8` is row 0; the right side's `BUFHCLK8` is row 8.
+    #[test]
+    fn left_band_buffer_nets_recover_their_row() {
+        // Both sides' row-0 nets must outrank their row-1 nets.
+        assert!(clock_row_rank("HCLK_CK_BUFHCLK8") <= clock_row_rank("HCLK_CK_BUFHCLK9"));
+        assert!(clock_row_rank("HCLK_CK_BUFHCLK0") <= clock_row_rank("HCLK_CK_BUFHCLK1"));
+    }
+
+    #[test]
+    fn kinds_are_distinct() {
+        assert_ne!(ClkRowEnd::Cmt, ClkRowEnd::HrowBuf);
+        assert_ne!(ClkRowEnd::Other, ClkRowEnd::Cmt);
     }
 }
