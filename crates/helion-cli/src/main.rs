@@ -1334,7 +1334,7 @@ fn cmd_util(args: &[String]) {
     });
     let p = &c.routed.placed.packed;
     println!(
-        "report_utilization {} LUT={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
+        "report_utilization {} LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
         c.design.name,
         p.lutffs.len(),
         c.dev.lut6_count(),
@@ -1434,7 +1434,7 @@ fn cmd_reports(args: &[String]) {
         c.timing.iob_ps
     );
     println!(
-        "report_utilization {} LUT={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
+        "report_utilization {} LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
         c.design.name,
         lutff,
         c.dev.lut6_count(),

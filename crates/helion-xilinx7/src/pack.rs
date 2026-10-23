@@ -560,36 +560,53 @@ fn insert_clock_spine(netlist: &Design, packed: &mut Packed7) -> Result<(), Stri
         if buffered.contains(clk_net.as_str()) {
             continue;
         }
+        // The clock may come from a top-level input, or from logic inside the
+        // design (a LUT driving an FF CLK, which `examples/timing_lut_as_clock.sv`
+        // exercises). An input port needs an IBUF in front of its BUFG; an
+        // internal net is already a fabric signal, so it drives the BUFG
+        // directly. Rejecting the latter made `pack` refuse a design that
+        // Vivado accepts, and the message ("no matching top-level input port")
+        // described an internal implementation detail rather than the problem.
         let port = netlist
             .ports
             .iter()
-            .find(|p| p.dir == PortDir::In && p.name == clk_net)
-            .ok_or_else(|| {
-                format!("pack: clock net `{clk_net}` has no matching top-level input port")
-            })?;
-        let bufg_out = format!("{}_bufg", port.name);
+            .find(|p| p.dir == PortDir::In && p.name == clk_net);
+        let (clk_src, bufg_out) = match port {
+            Some(port) => {
+                packed.iobs.push(PackedIob {
+                    name: format!("ibuf_{}", port.name),
+                    loc: port.attrs.get("LOC").map(|s| s.to_string()),
+                    iostandard: port
+                        .attrs
+                        .get("IOSTANDARD")
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "LVCMOS33".to_string()),
+                    drive: None,
+                    slew: None,
+                    port: port.name.clone(),
+                    dir: IobDir::In,
+                    net: format!("{}_ibuf", port.name),
+                });
+                (
+                    format!("{}_ibuf", port.name),
+                    format!("{}_bufg", port.name),
+                )
+            }
+            None => {
+                // Internal clock. Name the buffer after the net so two
+                // different internal clocks cannot collide.
+                let stem = clk_net.trim_start_matches('\\').to_string();
+                (clk_net.clone(), format!("{stem}_bufg"))
+            }
+        };
         for ff in &mut packed.ffs {
             if ff.clk_net == clk_net {
                 ff.clk_net = bufg_out.clone();
             }
         }
-        packed.iobs.push(PackedIob {
-            name: format!("ibuf_{}", port.name),
-            loc: port.attrs.get("LOC").map(|s| s.to_string()),
-            iostandard: port
-                .attrs
-                .get("IOSTANDARD")
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "LVCMOS33".to_string()),
-            drive: None,
-            slew: None,
-            port: port.name.clone(),
-            dir: IobDir::In,
-            net: format!("{}_ibuf", port.name),
-        });
         packed.bufgs.push(PackedBufg {
-            name: format!("bufg_{}", port.name),
-            in_net: format!("{}_ibuf", port.name),
+            name: format!("bufg_{}", clk_net.trim_start_matches('\\')),
+            in_net: clk_src,
             out_net: bufg_out,
         });
     }

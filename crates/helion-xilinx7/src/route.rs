@@ -457,9 +457,21 @@ fn bfs_route_all(
             // cascades BUFGCTRL1..4, which is a shorter hop count and an
             // illegal cascade. A clock reaches its BUFG only through the path
             // `route_net` builds, so blocking here removes just the shortcut.
-            if dst_wire.contains("FBG_OUT") {
-                continue;
-            }
+            // Never step onto the input side of a clock buffer. `emit.rs`
+            // emits that input select for the net's own buffer, so a route that
+            // also traverses an unused BUFG drives one configuration bit from
+            // two sources and prjxray refuses the bitstream:
+            //
+            //   FASM line "...BUFGCTRL0_I0.CLK_BUFG_IMUX28_0" wanted to clear
+            //   bit (4329626, 93, 8) but was set by
+            //   "...BUFGCTRL0_I0.CLK_BUFG_BOT_R_CK_MUXED0"
+            //
+            // Matching on the wire name is not enough: the offending inputs are
+            // spelled `FBG_OUT1`, `CK_MUXED*`, `IMUX28_0`, ... depending on
+            // which BUFG and which family. The tile type is the stable
+            // property, and the clock's own path into its buffer is built by
+            // `route_net`, not by this walk.
+
             // A wire already driving another net must not be selected again.
             // A 7-series INT mux is one-hot: two nets choosing different
             // inputs of the same mux output is an electrical over-drive, not
@@ -515,9 +527,7 @@ fn bfs_route_all(
             //
             // A clock reaches its buffer only by the path `route_net` builds,
             // so skipping this stitch removes the shortcut and nothing legal.
-            if nwire.contains("FBG_OUT") || nwire.starts_with("CLK_BUFG_R_CK_MUXED") {
-                continue;
-            }
+
             let next = (ntile.clone(), nwire.clone());
             if occupied.contains(&next) {
                 if let Some(b) = blocked.as_deref_mut() {

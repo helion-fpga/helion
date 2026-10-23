@@ -17839,7 +17839,34 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             }
         }
     }
+    // `single_q` names the one LUT/FF pair `u_lut`/`u_ff` (not `u_lut0`/`u_ff0`)
+    // when the design's only register is the one called `q`.
     let single_q = reg_bits.len() == 1 && reg_bits[0].0 == "q";
+    // The FF's data net must not be called `d`, and its output net must not be
+    // called `q`, unless those really are the register's own signal names. The
+    // old code hardcoded the literals "d"/"q" for the single-register case, so
+    // a design with an input port named `d` got an FF whose D net was that very
+    // port: the buffer LUT then read and drove the same net (`u_lut.I0 = d` and
+    // `u_lut.O = d`), which is a self-loop, and the port itself ended up with
+    // no endpoint at all. `always_ff @(posedge clk) q <= d;` was enough to
+    // trigger it.
+    //
+    // Use a name derived from the actual register signal, and only fall back to
+    // the bare `d`/`q` spelling when it is unused by a port.
+    let port_names: std::collections::HashSet<&str> =
+        rtl.ports.iter().map(|p| p.0).collect();
+    let ff_d_net = |bitn: &str| -> String {
+        let cand = if single_q {
+            "d".to_string()
+        } else {
+            format!("d{}", &bitn[1..])
+        };
+        if port_names.contains(cand.as_str()) {
+            format!("{bitn}_d")
+        } else {
+            cand
+        }
+    };
     // FM-HEL-10m-0854: one wide-cone diagnostic per module (attr), then
     // continue — selective soft-cone widen maps sibling bits; over-cap cones
     // stay unmapped (named). Do not reprint node_count per bit.
@@ -17924,16 +17951,12 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             continue;
         }
         let init = aig.flowmap_lut6();
-        let (lut, ff, dnet, qnet) = if single_q {
-            ("u_lut".into(), "u_ff".into(), "d".into(), "q".into())
+        let (lut, ff, qnet) = if single_q {
+            ("u_lut".into(), "u_ff".into(), "q".into())
         } else {
-            (
-                format!("u_lut{i}"),
-                format!("u_ff{i}"),
-                format!("d{i}"),
-                bitn.clone(),
-            )
+            (format!("u_lut{i}"), format!("u_ff{i}"), bitn.clone())
         };
+        let dnet = ff_d_net(bitn);
         d.add_cell(&lut, CellKind::Lut6 { init });
         d.add_cell(&ff, CellKind::Hff);
         let bit_clk = seq_clk_for(&rtl.module, bitn, clk);
