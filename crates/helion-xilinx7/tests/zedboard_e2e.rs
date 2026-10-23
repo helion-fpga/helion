@@ -308,16 +308,35 @@ fn zedboard_e2e_bitstream() {
     types.sort();
     types.dedup();
     let segbits = load_segbits(&zynq7, &types);
-    // prjxray-db has no segbits for RIOB33_SING (DB gap). Filter out FASM
-    // lines for SING tiles; those 2 IOBs (led[6] on U19, led[7] on U14)
-    // get default IOB configuration. Documented limitation for HW validation.
-    let (lines, skipped): (Vec<_>, Vec<_>) = lines.into_iter().partition(|l| {
-        layout.tile_type(&l.tile).map(|t| !t.contains("_SING")).unwrap_or(true)
-    });
+    // prjxray-db ships no segbits for the `*_SING` tile types, and they must
+    // NOT be borrowed from the base type: a SING tile is a physically smaller
+    // tile with a different frame layout, so RIOB33's bit positions address
+    // words that do not exist in it (`word 102 outside 0..101`). The correct
+    // handling is to drop those lines with a loud, explicit warning rather
+    // than to either silently apply wrong bits or silently ignore them.
+    //
+    // Impact on the ZedBoard: LD6 (U19) and LD7 (U14) sit on RIOB33_SING
+    // tiles, so they get default IOB configuration. See findings/ for the
+    // upstream X-Ray gap.
+    let (lines, skipped): (Vec<_>, Vec<_>) = lines
+        .into_iter()
+        .partition(|l| {
+            layout
+                .tile_type(&l.tile)
+                .map(|t| !t.contains("_SING"))
+                .unwrap_or(true)
+        });
     if !skipped.is_empty() {
+        let mut tiles: Vec<&str> = skipped.iter().map(|l| l.tile.as_str()).collect();
+        tiles.sort();
+        tiles.dedup();
         println!(
-            "WARNING: skipped {} FASM lines for *_SING tiles (no segbits in DB)",
-            skipped.len()
+            "WARNING: {} FASM line(s) on {} *_SING tile(s) were dropped: upstream \
+             prjxray-db has no segbits for those types and their frame layout differs \
+             from the base type. Affected tiles: {}",
+            skipped.len(),
+            tiles.len(),
+            tiles.join(", ")
         );
     }
     // Every valid frame, not the tilegrid union: the FDRI stream is

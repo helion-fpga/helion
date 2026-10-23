@@ -204,37 +204,29 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                 // X-Ray models the path as:
                 //   fabric -> IOI_IMUX34_n -> IOI_OLOGIC0_D1 -> IOI_OLOGIC0_OQ
                 //          -> RIOI_O0 -> IOB_O_OUT0 -> IOB_O0 -> pad
-                // The IMUX34 -> D1 and D1 -> OQ hops are `always` pseudo-pips
-                // in ppips_rioi3.db: hard, free connections with no config
-                // bits. Emitting them as FASM is a no-op, so they are NOT
-                // emitted here (the router traverses them for connectivity).
                 //
-                // The one genuinely configurable item is the OLOGIC output mux
-                // select, `OLOGIC_Y0.OMUX.D1` (segbits_rioi3.db). `OQUSED`
-                // marks the OQ output as driven. Both are required; without
-                // OMUX.D1 the pad keeps its init value and reads as dark even
-                // though DRIVE/SLEW configured the buffer.
+                // On a full IOB/IOI pair the D1->OQ hops are `always`
+                // pseudo-pips (hard, free connections) and the ONE genuinely
+                // configurable item is the OLOGIC output-mux select
+                // `OLOGIC_Y0.OMUX.D1`, with `OQUSED` marking OQ driven.
+                // Without OMUX.D1 the pad keeps its init value and reads dark
+                // even though DRIVE/SLEW configured the buffer.
+                //
+                // SING / TBYTESRC / TBYTETERM IOI tiles are different: the
+                // whole chain is hardwired there (`IOI_IMUX34_0 -> D1`,
+                // `D1 -> OQ`, `OQ -> RIOI_O0` are all `always`) and upstream
+                // X-Ray ships NO segbits for those types. Nothing needs
+                // configuring, so nothing is emitted -- requiring segbits
+                // would wrongly reject ZedBoard LD6/LD7, which are ordinary
+                // reachable pins on a RIOI3_SING tile.
                 if let Some(ioi) = device.ioi_tile_for(&iob.tile) {
                     let ologic = site_rel.replacen("IOB_", "OLOGIC_", 1);
-                    // The paired IOI tile may be a variant (RIOI3_SING,
-                    // RIOI3_TBYTESRC, RIOI3_TBYTETERM) that upstream X-Ray
-                    // ships with ppips only and no segbits at all. Emitting a
-                    // configurable feature there cannot be assembled, so it
-                    // must be a loud error rather than a silently dropped
-                    // line. If the device can tell us the OLOGIC features are
-                    // unavailable, report it; otherwise emit and let the
-                    // assembly gate in `frames` catch it.
                     for feat in ["OMUX.D1", "OQUSED"] {
-                        if !device.ologic_feature_available(&ioi, &ologic, feat) {
-                            return Err(format!(
-                                "emit: IOB {} ({}.{}) needs OLOGIC feature `{}.{}.{}`, but tile \
-                                 type of {ioi} has no segbits for it in the X-Ray DB (upstream \
-                                 gap for *_SING/*_TBYTESRC/*_TBYTETERM IOI tiles). Move this \
-                                 output to a non-SING pin.",
-                                iob.name, iob.tile, site_rel, ioi, ologic, feat
-                            ));
+                        // Emit only where the DB defines it; elsewhere the
+                        // connection is already hardwired in silicon.
+                        if device.ologic_feature_available(&ioi, &ologic, feat) {
+                            lines.push(format!("{}.{}.{}", ioi, ologic, feat));
                         }
-                        lines.push(format!("{}.{}.{}", ioi, ologic, feat));
                     }
                 } else {
                     return Err(format!(

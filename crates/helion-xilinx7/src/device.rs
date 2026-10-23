@@ -303,6 +303,34 @@ impl Device {
         Ok(dev)
     }
 
+    /// Base tile type a `_SING` / `_TBYTESRC` / `_TBYTETERM` variant derives
+    /// from, e.g. `RIOB33_SING` -> `RIOB33`.
+    ///
+    /// These variants are physically smaller tiles with a DIFFERENT frame
+    /// layout, and upstream X-Ray ships no `segbits_*.db` for them. Their
+    /// configuration cannot be borrowed from the base type: the base type's
+    /// bit positions address words that do not exist in the variant (RIOB33
+    /// feature bits reach word 102 in a tile that only has 0..=101). Callers
+    /// use this only to *identify* such tiles so they can be avoided, never
+    /// to copy segbits.
+    pub fn variant_base_type(name: &str) -> Option<&str> {
+        for suffix in ["_SING", "_TBYTESRC", "_TBYTETERM"] {
+            if let Some(base) = name.strip_suffix(suffix) {
+                return Some(base);
+            }
+        }
+        None
+    }
+
+    /// True when this tile type has no configuration data of its own in the
+    /// X-Ray DB, so no feature can be resolved against it.
+    pub fn type_has_no_segbits(&self, tile_type: &str) -> bool {
+        match self.type_ids.get(tile_type) {
+            Some(&id) => self.types[id as usize].segbits.is_empty(),
+            None => true,
+        }
+    }
+
     /// Match tilegrid site instances against the tile type's site templates.
     fn instantiate_sites(
         tdata: &TileTypeData,
@@ -514,6 +542,8 @@ impl Device {
         Ok(())
     }
 
+
+
     /// Stitch cross-tile nodes from `tileconn.json`.
     ///
     /// For each entry, every tile of `tile_types[0]` is paired with the tile
@@ -677,6 +707,7 @@ impl Device {
         let &id = self.type_ids.get(tile_type)?;
         self.types[id as usize].segbits.get(feature).map(Vec::as_slice)
     }
+
 
     /// Global wire id for `(tile, wire index)`.
     pub fn wire_id(&self, tile_idx: usize, wire_idx: u32) -> Option<u32> {
