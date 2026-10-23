@@ -150,12 +150,80 @@ compared against a Vivado timing report. The claims above are structural: the
 header, IDCODE, frame count, and agreement with the reference assembler. Whether
 LD0 actually lights is a question only a board can answer.
 
-### Scaling is the open performance problem
+### Routing used to be 99.9% of the runtime, and no longer is
 
-Synthesis is not the bottleneck: an 86-LUT blinky on the Artix-35T
-(`xc7a35tcsg324-1`, 18,055 tiles) synthesizes in ~1 ms. Placement and routing on
-that fabric run for **over 40 minutes** without finishing, where the same design
-on the smaller zynq fabric completes in ~70-150 s. The 35T tilegrid is larger
-(18,055 vs. the 29,359-tile z020, but with a different routing-graph shape and
-far more IOB/clock tiles), and place/route appear to scale worse than linearly
-in tile count. Any claim about "running every part" has to answer this first.
+The 40-minute Artix-35T figure that used to appear here was **not** a scaling
+property of the fabric. It was three separate defects, now fixed:
+
+* `XDevice` never implemented `RouteQuery::tile_xy`, so the trait's `None`
+  default applied and the router's A* heuristic evaluated to 0 for every tile.
+  A* had no direction at all and degenerated into flooding the whole fabric:
+  routing one blinky net with 4 sinks expanded 4,534,484 distinct nodes and
+  14,647,731 edges.
+* On any routing failure the rip-up loop discarded **every** routed net
+  (`for other in routed.keys()`, with no reference to what actually blocked the
+  failed net) and re-queued all of them, so each failure threw away all
+  completed work.
+* Several copies of the same Artix probe were left running concurrently and
+  competed for CPU.
+
+Measured on `examples/zedboard_blinky.sv` (90 LUTs, `xc7z020`):
+
+| stage | before | after |
+|---|---|---|
+| route | 164,205 ms | **729 ms** |
+| whole bitstream | 165.5 s | **2.2 s** |
+| `helion qor` | 145,149 ms | **5,123 ms** |
+| `helion-xilinx7` lib suite | 82 s | **4.1 s** |
+
+The bitstream is unchanged in content across this: 9996 frames, IDCODE
+`0x03727093`, and the same 0 (blinky: 1, the `RIOB33_SING` gap) words set that
+prjxray's `fasm2frames.py` does not set.
+
+Fix 1 alone was not enough. With the heuristic working, the search started
+preferring a shorter hop **through an unused BUFG slot**, which made one
+configuration bit carry two sources and prjxray rejected the bitstream outright.
+Two further defects surfaced the same way:
+
+* The same-node stitch in `node_wires` unified the BUFG `_CK_MUXED*` inputs
+  across all 17 slots, so the search stepped from one slot's input to the next
+  for free and cascaded (`BUFGCTRL1_O -> FBG_OUT2 -> BUFGCTRL2_I0 -> ...`).
+* A routed pip could land on a different buffer's input mux. Denying those wires
+  to the search is wrong -- `CK_MUXED<n>` is shared by every BUFG in a tile, so
+  blocking the wire also blocks the design's own legal entry, and the search then
+  floods (the internal-clock design went from 0.2 s to 176 s). It is filtered at
+  emit time instead, where the legitimate selects are known.
+
+### Corpus result: 136 HDL files through the full flow
+
+Every `.sv`/`.v` file in the repository (examples, the checked-in reproducers,
+`corpus-pass/`, `tests/`, `ip/`) was run through the entire 7-series flow on
+`xc7z020`:
+
+| outcome | count | meaning |
+|---|---|---|
+| bitstream produced | 12 | valid `xc7z020clg484-1` image, IDCODE `0x03727093`, 9996 frames |
+| refused: pin constraint missing | 117 | synthesized and packed; no `PACKAGE_PIN`, so no pad to place |
+| refused: memory not lowerable | 7 | beyond the register-file path, with a named diagnostic |
+
+**No crashes, no hangs, and no unexplained failures.** The two refusal classes
+are correct behaviour, not defects: a design with no pin constraints genuinely
+cannot be turned into a bitstream, and the memory refusals name the limit they
+hit (`depth=16, width=32; limits are depth<=16, width<=32, depth*width<=128`).
+
+The corpus is what found the three synthesis/emit defects listed above. In
+particular `assign out = in;` and a LUT driving an FF clock both looked like
+"Helion is broken" and were real bugs, while the 117 pin failures only looked
+like failures because the harness ran without an XDC.
+
+### Artix-35T needs its package named exactly
+
+`xc7a35t` ships no tilegrid and borrows `xc7a50t`, whose fabric is larger than
+the 35T `part.json` describes: the 50T tilegrid reaches frame address
+`0x00c00100` while the 35T die's frames stop at `0x00401580`. Tiles out there
+have no frame to program. This is a database gap, not a Helion defect, and it is
+reported as such rather than as a bare `frame ... not in store`.
+
+Routing is not the limitation: with the package named exactly
+(`--part xc7a35tcsg324-1`), the Arty blinky places in 24 ms and routes 114 nets
+in 774 ms with zero rip-ups.
