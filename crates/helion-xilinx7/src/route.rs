@@ -142,6 +142,9 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         let bel_letter = bel.chars().next().unwrap_or('A');
         add_ep(ff.d_net.clone(), site.to_string(), "D", false);
         add_ep(ff.q_net.clone(), site.to_string(), &format!("{bel_letter}Q"), true);
+        if std::env::var("HELION_TRACE_CLK").is_ok() {
+            eprintln!("TRACE_CLK: ff {} clk_net={} site={}", ff.name, ff.clk_net, site);
+        }
         add_ep(ff.clk_net.clone(), site.to_string(), "CLK", false);
     }
     for iob in &packed.iobs {
@@ -860,7 +863,31 @@ fn bfs_route_all(
     for sink in found {
         let mut cur = sink;
         while let Some(Some((prev, pip))) = parent.get(&cur) {
-            // Skip tileconn pseudo-pips (marked with ~); real pips only.
+            // A real pip inside one tile is always emitted. A tileconn
+            // pseudo-pip (tile name contains `~`) is normally NOT emitted,
+            // because the two wires are the same physical node and the
+            // connection is structural -- there is no configuration bit for
+            // it.
+            //
+            // The exception is a tileconn that crosses from one tile into
+            // ANOTHER: the clock reaches the fabric this way
+            // (`INT_R.CLK1` -> `CLBLM_CLK1` via the `INT_R`/`CLBLM_R`
+            // tileconn), and the destination is the CLB tile the slice lives
+            // in. Discarding that hop loses the tile crossing entirely, so the
+            // emitted pips never leave the INT tile, the slice's `CLK` pin is
+            // never driven, and every flop holds its init value while all the
+            // clock-tile configuration looks perfect.
+            // A crossing tileconn (`INT_R.CLK1` -> `CLBLM_CLK1`) is
+            // structural: the prjxray DB records it as an `always` pip, so it
+            // has NO configuration bit and must not be emitted as a feature.
+            // Its job is done once the SEARCH has crossed the tile boundary --
+            // the parent chain now reaches into the CLB tile, so the slice's
+            // `CLK` pin hangs off the correct tile and the wires that feed it
+            // are placed there.
+            //
+            // Emitting it would fail with `no segbits for feature
+            // CLBLM_R.CLBLM_CLK1.CLK1`, which is exactly what happens if this
+            // hop is passed to the FASM writer.
             if !pip.tile.contains('~')
                 && seen.insert((
                     pip.tile.clone(),
@@ -879,6 +906,11 @@ fn bfs_route_all(
     pips.sort_by(|a, b| {
         (&a.tile, &a.dst_wire, &a.src_wire).cmp(&(&b.tile, &b.dst_wire, &b.src_wire))
     });
+    if std::env::var("HELION_TRACE_PIPS").is_ok() {
+        for p in &pips {
+            eprintln!("TRACE_PIP: {} {} -> {}", p.tile, p.src_wire, p.dst_wire);
+        }
+    }
     Some(pips)
 }
 

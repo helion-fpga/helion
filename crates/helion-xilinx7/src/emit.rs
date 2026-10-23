@@ -830,8 +830,34 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
             let mut rebufs: Vec<i32> = Vec::new();
             let mut logic: Vec<i32> = Vec::new();
             let mut gclks: BTreeSet<u32> = BTreeSet::new();
+            // INT tiles carrying a clock spine tap, from the emitted pips.
+            let mut clock_int_tiles: BTreeSet<String> = BTreeSet::new();
+            // Spine index (`GCLK_B<n>`) is a DIFFERENT numbering space from the
+            // repeater's `GCLK<n>_ENABLE_*`: the spine index selects which of
+            // the 32 global clock nets feeds the tile, while the repeater index
+            // names the repeater's own column net. Sharing one set mixes the
+            // two, so the fanout pass asked for `GFAN0.GCLK_B0` -- a feature
+            // that does not exist -- instead of `GCLK_B11`.
+            let mut spine_bits: BTreeSet<u32> = BTreeSet::new();
             for line in &lines {
                 let tile = line.split('.').next().unwrap_or("");
+                // A spine tap reads `INT_R_X..Y...CLK1.GCLK_B11`: the tile is
+                // the one the router chose, and the index is the spine bit.
+                if tile.starts_with("INT_") && line.contains(".GCLK_B") {
+                    let mut parts = line.split('.');
+                    let _tile = parts.next();
+                    if let Some(bit) = parts.find(|p| p.starts_with("GCLK_B")) {
+                        let digits: String = bit
+                            .trim_start_matches("GCLK_B")
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect();
+                        if let Ok(n) = digits.parse::<u32>() {
+                            spine_bits.insert(n);
+                        }
+                    }
+                    clock_int_tiles.insert(tile.to_string());
+                }
                 if is_clb_tile(tile) {
                     if let Some(r) = tile_row(tile) {
                         logic.push(r);
@@ -893,6 +919,63 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                     }
                 }
             }
+
+            // Global fanout (bypass) network for every row the clock feeds.
+            //
+            // A `GCLK_B<n>` tap in an INT tile reaches the slice clock pin in
+            // that tile, but it does NOT distribute the clock to the rest of
+            // the column. Distribution goes through the bypass network:
+            //
+            //     INT_R.GCLK_B<n> ->> GFAN0, GFAN1
+            //     INT_R.GFAN0     ->> BYP_ALT0, BYP_ALT1, BYP_ALT4, BYP_ALT5
+            //     INT_R.GFAN1     ->> BYP_ALT2, BYP_ALT3, BYP_ALT6, BYP_ALT7
+            //
+            // Omitting these leaves the clock present in exactly one INT tile.
+            // The bitstream stays valid, every clock tile matches, `clkdiff`
+            // reports no difference, and the design does not run: a single
+            // flop toggling its own output stays dark, because its clock input
+            // mux is never reached. That is the defect this pass fixes.
+            //
+            // The arms are read from the clock spine index (`n`) rather than
+            // hardcoded: `GFAN0` takes the even `BYP_ALT` arms and `GFAN1` the
+            // odd ones, and both are driven by the same `GCLK_B<n>`, so every
+            // logic row the clock reaches needs the full set of eight.
+            //
+            // `GND_WIRE` is the return path that makes the bypass network
+            // legal, and the `FAN_ALT` arms carry the distributed clock on to
+            // the inter-tile spans. All three appear in every configured row of
+            // the reference, so they are emitted together with the arms.
+            // The INT tiles the clock actually travels through come from the
+            // routed pips (`GCLK_B<n> -> CLK1`), not from the tile's row: the
+            // spine tap is in the tile the router chose, which is beside the
+            // placed logic, and scanning the die for a tile with the same row
+            // finds the far edge of the device instead.
+            for int_tile in &clock_int_tiles {
+                for n in &spine_bits {
+                    lines.push(format!("{int_tile}.GFAN0.GCLK_B{n}"));
+                    lines.push(format!("{int_tile}.GFAN1.GCLK_B{n}"));
+                }
+                for alt in [0u32, 1, 4, 5] {
+                    lines.push(format!("{int_tile}.BYP_ALT{alt}.GFAN0"));
+                }
+                for alt in [2u32, 3, 6, 7] {
+                    lines.push(format!("{int_tile}.BYP_ALT{alt}.GFAN1"));
+                }
+                lines.push(format!("{int_tile}.GFAN0.GND_WIRE"));
+                lines.push(format!("{int_tile}.GFAN1.GND_WIRE"));
+                lines.push(format!("{int_tile}.FAN_ALT1.NL1BEG_N3"));
+                // Final hop INTO the slice: `IMUX4` is the input-mux arm that
+                // reaches `CLBLM_M_CLK` (the medium slice's clock pin) through
+                // the INT/CLB tileconn. `FAN_BOUNCE1` is the bypass arm that
+                // drives it; without this the fanout network is energised but
+                // nothing taps it, so the slice clock mux is still unselected
+                // and the flops hold their init value.
+                //
+                // `IMUX4` rather than `IMUX5` because the medium slice's clock
+                // is `CLBLM_CLK1`, which the clock tileconn binds to the
+                // `IMUX4` arm; `IMUX5` serves the large slice.
+                lines.push(format!("{int_tile}.IMUX4.FAN_BOUNCE1"));
+            }
         }
     }
 
@@ -903,6 +986,7 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         frames: Vec::new(),
     })
 }
+
 
 /// Extra configuration features that enable a clock-network branch.
 ///
