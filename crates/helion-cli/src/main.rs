@@ -86,40 +86,86 @@ fn compile_design_xdc(
     let t0 = std::time::Instant::now();
     let mut packed = pack(&design, &dev)?;
     let iob_budget = dev.iob_sites().count();
-    // Prefer IOBs driven by a packed LUTFF q_net (DRC ROUTE-3), then cap to
-    // device budget. Full Ibex emits ~250 AXI outs; HL10T-C32-1 has 32 IOBs.
-    let q_nets: std::collections::HashSet<&str> =
-        packed.lutffs.iter().map(|l| l.q_net.as_str()).collect();
+    // Which nets does packing actually drive?
+    //
+    // This must be EVERY driver, not just LUTFF `q_net`s: `assign led[0] =
+    // cnt[26];` lowers to a LUT whose output feeds the pad directly (the IOB is
+    // wired to the LUT output, with no flop in between), and a child module's
+    // output port can drive a pad the same way. Testing membership in the
+    // LUTFF set alone classified all of those as undriven, which rejected
+    // idiomatic designs -- every bit of examples/zedboard_blinky.sv is
+    // register-driven, yet all 8 were reported as having no driver.
+    let mut driven_nets: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for l in &packed.lutffs {
+        driven_nets.insert(l.q_net.as_str());
+    }
     let driven: Vec<_> = packed
         .iobs
         .iter()
-        .filter(|io| q_nets.contains(io.from_net.as_str()))
+        .filter(|io| driven_nets.contains(io.from_net.as_str()))
         .cloned()
         .collect();
     let undriven = packed.iobs.len().saturating_sub(driven.len());
     if undriven > 0 {
-        // An IOB whose input net no packed LUT/FF actually drives cannot be
-        // configured: the pad would hold its reset value. Dropping it also
-        // removes a declared output from the design, so the build must not
-        // look successful -- a user asking for `output led` must not receive a
-        // bitstream where `led` does nothing. Name the ports so the cause is
-        // actionable instead of surfacing as a mysterious LUT/IOB mismatch.
+        // A pad whose input net nothing drives cannot be configured: it would
+        // hold its reset value, and the declared output would silently not
+        // exist. Name the top-level PORTS (not internal pack cells) so the
+        // message points at the user's own code.
         let mut names: Vec<&str> = packed
             .iobs
             .iter()
-            .filter(|io| !q_nets.contains(io.from_net.as_str()))
+            .filter(|io| !driven_nets.contains(io.from_net.as_str()))
             .map(|io| io.cell.as_str())
             .collect();
         names.sort_unstable();
         names.dedup();
+        // Translate internal pack cells (`u_pico_u_iob17`) back to the net the
+        // pad carries, which is what the user wrote. A child module's output
+        // appears here as `u_pico_u_iob17` but is `<child>.<port>` in the
+        // source, so naming the cell sends the reader hunting for a signal
+        // that does not exist in their code.
+        let mut nets: Vec<String> = packed
+            .iobs
+            .iter()
+            .filter(|io| !driven_nets.contains(io.from_net.as_str()))
+            .flat_map(|io| {
+                design
+                    .nets
+                    .iter()
+                    .filter(|n| {
+                        n.endpoints
+                            .iter()
+                            .any(|e| e.cell == io.cell && e.pin == "PAD")
+                    })
+                    .map(|n| n.name.clone())
+            })
+            .collect();
+        nets.sort();
+        nets.dedup();
+        let shown = if nets.is_empty() {
+            names.join(", ")
+        } else {
+            let extra = nets.len().saturating_sub(12);
+            let mut s = nets
+                .iter()
+                .take(12)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            if extra > 0 {
+                s.push_str(&format!(", ... (+{extra} more)"));
+            }
+            s
+        };
         return Err(format!(
-            "impl: {} output(s) have no driver after packing and cannot be placed: {}. \
+            "{} output pad(s) have no driver after packing and cannot be placed: {}. \
              A top-level output must be driven by a register or by combinational logic that \
              was lowered to LUT/FF cells; an output driven only by an unsupported construct \
-             (or left undriven) has no net to connect to its pad. Fix the design, or remove \
-             the output from the top-level port list.",
+             (or left undriven) has no net to connect to its pad. Check the `diagnostic ...` \
+             lines on stderr for the construct that was not lowered. Fix the design, or \
+             remove the output from the top-level port list.",
             names.len(),
-            names.join(", ")
+            shown
         ));
     }
     if packed.iobs.len() > iob_budget {

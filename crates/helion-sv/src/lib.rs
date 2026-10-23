@@ -16498,7 +16498,16 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
     }
     for k in rtl.mem_inits.keys() {
-        mem_names.insert(*k);
+        // `mem_inits` also records a scalar's `initial` value, e.g.
+        //     logic rst_sys_n;
+        //     initial begin rst_sys_n = 1'b0; #8 rst_sys_n = 1'b1; end
+        // That is a power-up value for one bit, not an array. Treating every
+        // key as a memory made `ysyx_ibex.sv` fail with "memory `rst_sys_n`
+        // was not lowered" even though `rst_sys_n` is a single wire. Only a
+        // signal that actually has unpacked depth is a memory.
+        if sig_depth(rtl, k) > 0 {
+            mem_names.insert(*k);
+        }
     }
     for s in &rtl.signals {
         if s.force_bram {
@@ -16561,12 +16570,38 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         // A refused memory is a missing feature, not a style choice: the
         // design's read data has no driver. Fail loudly so it cannot be
         // mistaken for a successful build.
+        //
+        // Report the ACTUAL reason for each memory. The previous message
+        // listed every possible cause ("depth>16, width>32, bits>128, or
+        // ram_style/force_bram") for every case, which sent users to resize an
+        // array that was in fact refused for having no readable form -- a
+        // write-only array is not too big, it is unreadable.
+        let mut reasons: Vec<String> = Vec::new();
+        for name in &sorted {
+            let depth = sig_depth(rtl, name).max(1);
+            let width = sig_width(rtl, name).max(1);
+            let why = if sig_force_bram(rtl, name) {
+                "forced to block RAM by `ram_style`/`force_bram`, but its access pattern is not \
+                 one this tool can map to a BRAM"
+                    .to_string()
+            } else if depth > 16 || width > 32 || depth.saturating_mul(width) > 128 {
+                format!(
+                    "too large for the register-file path (depth={depth}, width={width}; \
+                     limits are depth<=16, width<=32, depth*width<=128)"
+                )
+            } else {
+                format!(
+                    "its access pattern could not be lowered (depth={depth}, width={width}); a \
+                     readable form needs a clocked write and a matching read of the same word"
+                )
+            };
+            reasons.push(format!("`{name}`: {why}"));
+        }
         return Err(format!(
-            "synth_sv: memory `{}` was not lowered (depth>16, width>32, bits>128, or forced to \
-             BRAM by ram_style/force_bram). No read or write logic was emitted, so the design \
-             would be missing that memory entirely. Reduce the array size, or remove the \
-             ram_style/force_bram attribute so it infers as registers.",
-            sorted.join(",")
+            "synth_sv: {} memory/memories were not lowered, so none of their read or write logic \
+             exists in the netlist and the design would be missing that storage entirely. {}",
+            sorted.len(),
+            reasons.join("; ")
         ));
     }
     for name in &mem_names {
@@ -17520,7 +17555,26 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 // nets, concat LUTs swept as dead).
                 unpacked_word_q(lhs, word, w, lo)
             } else {
-                bit_name(lhs, w, *b)
+                // `assign led[n] = expr;` — a single output BIT.
+                //
+                // This used to emit the IOB onto `bit_name(lhs, w, b)`, i.e.
+                // the pad's own net. Nothing drives that net, so the pad ended
+                // up unconnected: examples/zedboard_blinky.sv produced eight
+                // IOBs whose `led_0`..`led_7` nets had exactly one endpoint
+                // each (the IOB itself) and `assign led[0] = cnt[26]` had no
+                // effect at all. The IOB must sit on whatever the assignment
+                // actually drives.
+                if *b < w {
+                    match drive_target(rhs, rtl) {
+                        Ok((q, _)) => q,
+                        // A constant or otherwise non-net RHS leaves the bit
+                        // with no source net; the pad still needs a name, and
+                        // the comb lowering may have created one.
+                        Err(_) => bit_name(lhs, w, *b),
+                    }
+                } else {
+                    bit_name(lhs, w, *b)
+                }
             }
         } else if let Ok((q, _)) = drive_target(rhs, rtl) {
             q
@@ -17531,14 +17585,37 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         emit_iob(&mut d, &mut iob_n, &qnet, lhs);
     }
     if iob_n == 0 {
-        // default: last register bit to first output
-        if let (Some((n, _, _)), Some((qnet, _))) = (
-            rtl.ports.iter().find(|(_, dir, _)| *dir == PortDir::Out),
-            reg_bits.last(),
-        ) {
-            d.add_cell("u_iob", CellKind::IobOut);
-            d.connect(qnet, "u_iob", "I");
-            d.connect(*n, "u_iob", "PAD");
+        // Last-resort fallback: connect the single most plausible register bit
+        // to the first output.
+        //
+        // This used to pair the FIRST output port with the LAST register bit
+        // unconditionally, which silently broke ordinary designs:
+        //   module two1(input clk, input a, input b, output reg y, output reg z);
+        //     always @(posedge clk) begin y <= a & b; z <= a | b; end
+        //   endmodule
+        // emitted ONE u_iob with `y` on PAD and `z` on its INPUT pin, so `z`
+        // could never reach a pin, and `report_utilization` said IOB=1/32.
+        // Reordering the ports made it worse: `net z u_ff1/Q u_iob/I u_iob/PAD`
+        // is a pad shorted to itself. Both exited 0 with positive slack.
+        //
+        // Only take this path when it is unambiguous: exactly one output port
+        // AND the chosen register bit is actually that port, so I and PAD can
+        // never be wired to different (or identical) nets.
+        let outs: Vec<&(&str, PortDir, usize)> = rtl
+            .ports
+            .iter()
+            .filter(|(_, dir, _)| *dir == PortDir::Out)
+            .collect();
+        if let (1, Some((qnet, _))) = (outs.len(), reg_bits.last()) {
+            let n = outs[0].0;
+            // The register bit must belong to the output we are about to
+            // connect, otherwise this pairing is a guess; refuse instead of
+            // inventing a connection.
+            if qnet.split('_').next() == Some(n) || qnet == n {
+                d.add_cell("u_iob", CellKind::IobOut);
+                d.connect(qnet, "u_iob", "I");
+                d.connect(n, "u_iob", "PAD");
+            }
         }
     }
     Ok(d)
