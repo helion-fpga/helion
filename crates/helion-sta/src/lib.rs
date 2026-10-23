@@ -1383,8 +1383,52 @@ impl Constraints {
     }
 
     /// Tightest `set_max_delay` in ps, if any.
+    ///
+    /// CAUTION: this ignores the command's `-from`/`-to` scope entirely, so it
+    /// is only meaningful when the constraints contain a single unscoped
+    /// `set_max_delay` intended to apply to the whole design. Using it as a
+    /// blanket replacement for the clock period is a signoff bug: one
+    /// `set_max_delay` on any path would then become the requirement for every
+    /// path in the design and report optimistic (false-passing) slack. Report
+    /// paths through [`Self::max_delay_ps_for_path`] instead.
     pub fn max_delay_ps(&self) -> Option<i64> {
         self.max_delays.iter().map(|m| m.delay_ps).min()
+    }
+
+    /// Tightest `set_max_delay` that actually applies to a path ending at
+    /// `to` (and optionally starting at `from`).
+    ///
+    /// An unscoped command (`set_max_delay 5.0` with neither `-from` nor
+    /// `-to`) applies to the whole design and is honoured. A scoped command
+    /// applies only when its endpoints match, so a constraint written for an
+    /// unrelated endpoint can no longer loosen every other path.
+    pub fn max_delay_ps_for_path(&self, from: &str, to: &str) -> Option<i64> {
+        self.max_delays
+            .iter()
+            .filter(|m| {
+                if m.from.is_empty() && m.to.is_empty() {
+                    return true;
+                }
+                let to_ok = m.to.is_empty() || sdc_token_eq(&m.to, to) || m.to == to;
+                let from_ok = m.from.is_empty() || sdc_token_eq(&m.from, from) || m.from == from;
+                to_ok && from_ok
+            })
+            .map(|m| m.delay_ps)
+            .min()
+    }
+
+    /// Tightest `set_max_delay` that applies to the whole design, i.e. one
+    /// written with neither `-from` nor `-to` (ps).
+    ///
+    /// This is the only form an aggregate, path-less result can honour. A
+    /// scoped `set_max_delay` targets specific endpoints and must be applied
+    /// per path via [`Self::max_delay_ps_for_path`].
+    pub fn max_delay_unscoped_ps(&self) -> Option<i64> {
+        self.max_delays
+            .iter()
+            .filter(|m| m.from.is_empty() && m.to.is_empty())
+            .map(|m| m.delay_ps)
+            .min()
     }
 
     /// Tightest `set_min_delay` in ps (largest required min delay), if any.
@@ -3758,8 +3802,24 @@ pub fn apply_xdc_delays_with(
     period_ps: u64,
     tm: &TimingModel,
 ) {
-    let false_out =
-        !xdc.false_paths.is_empty() || xdc.clock_groups_false_path() || xdc.arcs_disabled();
+    // False paths zero the I/O arc and drop the I/O contribution from setup.
+    // Both of those are design-wide effects, so they are only sound when the
+    // constraint is design-wide (`set_false_path` with no `-from`/`-to`) or
+    // when a clock-group/disabling constraint genuinely covers every arc.
+    //
+    // Applying a *scoped* false path globally is optimistic, not conservative:
+    // `set_false_path -from [get_clocks clkA] -to [get_clocks clkB]` naming
+    // clocks that do not exist anywhere moved WNS 9140 -> 9640 ps, i.e. a
+    // constraint that selected nothing silently disabled I/O analysis for the
+    // whole design. Ignoring an unmatched false path is the safe direction.
+    let scoped_false_only = !xdc.false_paths.is_empty()
+        && xdc
+            .false_paths
+            .iter()
+            .all(|f| f.contains("get_") || f.contains('/'));
+    let false_out = (!xdc.false_paths.is_empty() && !scoped_false_only)
+        || xdc.clock_groups_false_path()
+        || xdc.arcs_disabled();
     let out_d = xdc.output_delay_ps.values().copied().max().unwrap_or(0);
     let in_d = xdc.input_delay_ps.values().copied().max().unwrap_or(0);
     if false_out {
@@ -3770,9 +3830,24 @@ pub fn apply_xdc_delays_with(
     }
     let clk_net = xdc.propagated_network_ps(r.clk_net_ps);
     let sense = xdc.clock_sense_setup_ps(period_ps);
-    let req_ps = xdc
-        .max_delay_ps()
-        .unwrap_or_else(|| (period_ps as i64).saturating_mul(xdc.setup_mult() as i64));
+    // A `set_max_delay` constrains the paths its `-from`/`-to` select. It must
+    // not replace the clock period for the whole design. This function
+    // produces one aggregate result with no per-path identity, so only an
+    // UNSCOPED `set_max_delay` (neither `-from` nor `-to`) can be honoured
+    // here; a scoped one is left to the per-path analysis and is otherwise
+    // ignored. And in all cases the requirement is never RELAXED below the
+    // clock period: a loose or unrelated `set_max_delay` must not turn a
+    // failing design into a passing report.
+    //
+    // Previously any single `set_max_delay` anywhere became the requirement
+    // for every path, so `set_max_delay -from [get_pins u_slow/Q] -to
+    // [get_pins u_slow/D] 40.0` on a path that did not even exist reported
+    // WNS 9140 -> 39140 ps.
+    let period_req = (period_ps as i64).saturating_mul(xdc.setup_mult() as i64);
+    let req_ps = match xdc.max_delay_unscoped_ps() {
+        Some(d) => d.min(period_req),
+        None => period_req,
+    };
     let setup = scale_delay_ps(r.setup_ps, xdc.path_late_milli());
     r.wns_ps = req_ps
         - setup

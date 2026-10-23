@@ -5508,12 +5508,30 @@ fn parse_lhs_after_name<'a>(p: &mut P<'a>, name: &'a str) -> Result<LhsKind<'a>,
                 });
             }
             if p.eat_sym(':') {
-                let _lo = const_u(p)?;
+                // `sig[hi:lo] = rhs`. Both bounds matter: the assignment
+                // targets bits lo..=hi, not the whole signal. Discarding them
+                // (returning Whole) made every slice write land at
+                // slice-relative bit 0, so disjoint slice assignments all
+                // collapsed onto the same low bits -- e.g. four
+                // `assign y[2k+1:2k] = a[2k+1:2k];` statements left y_0..y_1
+                // undriven (then trimmed) and gave y_2..y_7 four drivers
+                // each. Silent wrong hardware, no diagnostic.
+                let lo_b = const_u(p)?;
                 if !p.eat_sym(']') {
                     return Err("]".into());
                 }
-                let _ = base;
-                return Ok(LhsKind::Whole(name));
+                let hi_b = base;
+                let (lo, hi) = if lo_b <= hi_b {
+                    (lo_b as usize, hi_b as usize)
+                } else {
+                    // Descending declaration `[0:7]`: the first bound is high.
+                    (hi_b as usize, lo_b as usize)
+                };
+                let width = hi.saturating_sub(lo).saturating_add(1).max(1);
+                if width == 1 {
+                    return Ok(LhsKind::Bit(name, lo));
+                }
+                return Ok(LhsKind::Slice { name, lo, width });
             }
             if p.eat_sym(']') {
                 if p.eat_sym('.') {
@@ -8547,6 +8565,22 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
         let mut prev: Option<(PortDir, usize, Option<String>)> = None;
         let mut own_dir = false;
         loop {
+            if p.eat_sym(')') {
+                break;
+            }
+            if p.peek().is_none() {
+                break;
+            }
+            // Attributes may annotate a port declaration:
+            //   module m ((* keep = "true" *) input logic a, output logic y);
+            // They carry no synthesis meaning here, but they MUST be consumed.
+            // Leaving `(*` in the token stream desynchronised the loop: the
+            // balance skip below started with the attribute's own `(` already
+            // eaten, so it ran past the real port separator and silently
+            // swallowed every following port. `module m ((* keep *) input a,
+            // output y, output z)` came back with only `a` declared, and
+            // attribute-before-first-port lost the entire body too.
+            let _ = parse_attr(&mut p);
             if p.eat_sym(')') {
                 break;
             }
@@ -11642,6 +11676,21 @@ fn rexpr_width(e: &RExpr<'_>, rtl: &Rtl) -> usize {
             note_width_overflow();
             0
         }
+    }
+}
+
+/// True when widening `e` to a wider LHS would need sign replication rather
+/// than zero fill.
+///
+/// This frontend does not carry an inferred signedness for arbitrary
+/// expressions, so only the explicit forms are recognised: `$signed(x)` and
+/// the `signed'(x)` cast both parse to `Call`. Everything else is treated as
+/// unsigned, which matches Verilog for the overwhelmingly common case
+/// (`assign y = a;` with unsigned `a` zero-extends).
+fn rexpr_signedness_uncertain(e: &RExpr<'_>, _rtl: &Rtl) -> bool {
+    match e {
+        RExpr::Call { name, .. } => *name == "$signed",
+        _ => false,
     }
 }
 
@@ -16456,7 +16505,77 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             mem_names.insert(s.name);
         }
     }
+    // A memory that reached `mem_names` was REFUSED by the logic-lowering
+    // path (over the depth/width caps, or `sig_force_bram` / `ram_style`), so
+    // none of its read or write logic exists in `d`. Emitting a `Bram18` cell
+    // for it would attach no pins at all: the array's address, data and
+    // enable ports end up with zero endpoints in the whole netlist, and the
+    // memory silently becomes a floating placeholder.
+    //
+    // Measured before this guard: `(* ram_style = "block" *) logic [7:0]
+    // mem [0:15]` with a normal write/read pair produced 31 cells and one
+    // pinless BRAM18 with `waddr`/`wdata`/`we` dangling, while the identical
+    // RTL WITHOUT the attribute produced the correct 166-cell register file.
+    // A pure synthesis hint must never delete a memory.
+    //
+    // Record an explicit, machine-readable attribute and leave the BRAM out,
+    // so callers can see the drop instead of silently shipping a design whose
+    // memory does nothing.
+    // A memory that reached `mem_names` was REFUSED by the logic-lowering
+    // path (over the depth/width caps, or `sig_force_bram` / `ram_style`), so
+    // none of its read or write logic exists in `d`. Emitting a `Bram18` cell
+    // for it would attach no pins at all: the array's address, data and
+    // enable ports end up with zero endpoints in the whole netlist, and the
+    // memory silently becomes a floating placeholder.
+    //
+    // Measured before this guard: `(* ram_style = "block" *) logic [7:0]
+    // mem [0:15]` with a normal write/read pair produced 31 cells and one
+    // pinless BRAM18 with `waddr`/`wdata`/`we` dangling, while the identical
+    // RTL WITHOUT the attribute produced the correct 166-cell register file.
+    // A synthesis hint must never delete a memory.
+    //
+    // Record an explicit, machine-readable attribute and leave the BRAM out,
+    // so callers can see the drop instead of silently shipping a design whose
+    // memory does nothing.
+    let mut bram_not_lowered: Vec<String> = Vec::new();
     for name in &mem_names {
+        let depth = sig_depth(rtl, name).max(
+            rtl.mem_inits
+                .get(name)
+                .and_then(|m| m.keys().max().copied())
+                .map(|a| a + 1)
+                .unwrap_or(0),
+        );
+        note_skip(format!(
+            "diagnostic bram_not_lowered module={} mem={} depth={} (memory refused by the \
+             logic-lowering path: depth>MAX_DEPTH, width>MAX_WIDTH, bits>MAX_BITS, or \
+             ram_style/force_bram; no read or write logic was emitted)",
+            rtl.module, name, depth
+        ));
+        bram_not_lowered.push((*name).to_string());
+    }
+    if !bram_not_lowered.is_empty() {
+        let mut sorted = bram_not_lowered.clone();
+        sorted.sort();
+        d.attrs.set("BRAM_NOT_LOWERED", sorted.join(","));
+        // A refused memory is a missing feature, not a style choice: the
+        // design's read data has no driver. Fail loudly so it cannot be
+        // mistaken for a successful build.
+        return Err(format!(
+            "synth_sv: memory `{}` was not lowered (depth>16, width>32, bits>128, or forced to \
+             BRAM by ram_style/force_bram). No read or write logic was emitted, so the design \
+             would be missing that memory entirely. Reduce the array size, or remove the \
+             ram_style/force_bram attribute so it infers as registers.",
+            sorted.join(",")
+        ));
+    }
+    for name in &mem_names {
+        // The memory's read/write logic was refused above, so there is nothing
+        // to connect a BRAM to. Emitting one anyway yields a cell with no
+        // pins: the design would carry a memory that silently does nothing.
+        if bram_not_lowered.iter().any(|n| n == name) {
+            continue;
+        }
         let depth = sig_depth(rtl, name).max(
             rtl.mem_inits
                 .get(name)
@@ -16565,7 +16684,41 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             }
         }
         match rhs {
-            RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => continue,
+            RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => {
+                // A pure passthrough is normally handled by the IOB emitter,
+                // which aliases output bit i onto source bit i. That is only
+                // valid while the source is at least as wide as the LHS. When
+                // the LHS is wider the assignment is context-determined:
+                // Verilog zero-extends (sign-extends for a signed source).
+                // Emitting nothing here left those high output bits with no
+                // driver, and they were then silently trimmed from the design
+                // -- `assign y = a;` with 4-bit `a` and 16-bit `y` lost
+                // y_4..y_15 entirely.
+                if bit.is_none() {
+                    let lw = sig_width(rtl, lhs);
+                    let drv_w = match rhs {
+                        RExpr::Ident(s) => sig_width(rtl, s),
+                        RExpr::Range(_, lo, hi) => (hi + 1).saturating_sub(*lo),
+                        RExpr::Bit(_, _) => 1,
+                        _ => lw,
+                    }
+                    .max(1);
+                    if lw > drv_w && !rexpr_signedness_uncertain(rhs, rtl) {
+                        for i in drv_w..lw.min(256) {
+                            let bn = bit_name(lhs, lw, i);
+                            if !comb_accept(&comb_bits, &bn, &mut assign_capped) {
+                                break;
+                            }
+                            comb_bits.push((bn, Expr::Const(false)));
+                        }
+                    } else if lw > drv_w {
+                        // Signed narrow source: needs sign replication, which
+                        // this frontend cannot express. Refuse loudly.
+                        note_assign_not_lowered(rtl.module, lhs);
+                    }
+                }
+                continue;
+            }
             _ => {}
         }
         // width<=32 `assign y = bus + K` (K in 1..=16) is a ripple from that
@@ -16767,12 +16920,33 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         } else {
             let rw = rexpr_width(rhs, rtl).min(w).max(1).min(256);
             let before = comb_bits.len();
-            for i in 0..rw.min(w) {
+            // Assignments are context-determined in Verilog: the RHS is
+            // extended to the LHS width, not truncated to its own. Iterating
+            // only to `rw` left every LHS bit above the RHS width undriven --
+            // `assign y = a;` with 4-bit `a` and 16-bit `y` drove only
+            // y_0..y_3, and the remaining outputs were nets with no driver
+            // at all. Those dangling bits were then silently dropped by IOB
+            // trimming, so a 16-bit output could vanish entirely.
+            //
+            // Zero-extension is correct for an unsigned RHS. A SIGNED narrow
+            // RHS would need sign replication, and this frontend carries no
+            // reliable signedness for RExpr, so that case is refused loudly
+            // rather than silently zero-extended (which would change the
+            // value: `assign y = $signed(a);` with a = -1 must be all ones).
+            let signed_narrow = rexpr_signedness_uncertain(rhs, rtl);
+            for i in 0..w.min(256) {
                 let bn = bit_name(lhs, w, i);
                 if !comb_accept(&comb_bits, &bn, &mut assign_capped) {
                     break;
                 }
-                match rexpr_to_bit(rhs, rtl, i, &arena) {
+                let bit_expr = if i < rw {
+                    rexpr_to_bit(rhs, rtl, i, &arena)
+                } else if signed_narrow {
+                    Err("width_overflow: signed extension not supported".to_string())
+                } else {
+                    Ok(Expr::Const(false))
+                };
+                match bit_expr {
                     Ok(e) => {
                         if rel_lt {
                             rel_sig.insert(bn.clone(), lhs.to_string());
@@ -17283,20 +17457,39 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
         let w = sig_width(rtl, lhs);
         if bit.is_none() && w > 1 {
+            // Width of the driver, so an output wider than its source is
+            // zero-extended instead of aliasing bits that do not exist.
+            // `assign y = a;` with 4-bit `a` and 16-bit `y`: iterating to the
+            // LHS width while naming the *source* bit produced references to
+            // a_4..a_15, which are not real nets -- so the high output bits
+            // had no driver and were silently trimmed away downstream.
+            let drv_w = match rhs {
+                RExpr::Ident(s) => sig_width(rtl, s).max(1),
+                RExpr::Range(_, lo, hi) => (hi + 1).saturating_sub(*lo).max(1),
+                _ => w,
+            };
             for i in 0..w.min(256) {
-                // Ident/range passthrough: the driver is the RHS bit, not a
-                // buffer LUT. Logic assigns drive the LHS bit name.
-                let qnet = match rhs {
-                    RExpr::Ident(s) => bit_name(s, sig_width(rtl, s), i),
-                    RExpr::Range(s, lo, hi) => {
-                        let idx = lo + i;
-                        if idx <= *hi {
-                            bit_name(s, sig_width(rtl, s), idx)
-                        } else {
-                            bit_name(lhs, w, i)
+                // Bits at or above the driver width are zero-extended by the
+                // comb lowering, which drives `bit_name(lhs, w, i)` to const
+                // 0. They still need an IOB: skipping them here (as an earlier
+                // version did) dropped the very output bits the zero-extension
+                // was added to produce, so `assign y = a;` with 4-bit `a` and
+                // 16-bit `y` emitted only 4 IOBs and the design lost y_4..y_15.
+                let qnet = if i < drv_w {
+                    match rhs {
+                        RExpr::Ident(s) => bit_name(s, sig_width(rtl, s), i),
+                        RExpr::Range(s, lo, hi) => {
+                            let idx = lo + i;
+                            if idx <= *hi {
+                                bit_name(s, sig_width(rtl, s), idx)
+                            } else {
+                                bit_name(lhs, w, i)
+                            }
                         }
+                        _ => bit_name(lhs, w, i),
                     }
-                    _ => bit_name(lhs, w, i),
+                } else {
+                    bit_name(lhs, w, i)
                 };
                 emit_iob(&mut d, &mut iob_n, &qnet, lhs);
             }
