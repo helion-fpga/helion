@@ -111,3 +111,51 @@ to match and does not need the route to.
 Not hardware-validated: there is no JTAG cable on this machine, so
 `openFPGALoader --detect` fails. Every claim here is about software
 correctness of the configuration data.
+
+---
+
+## Board bring-up tests (`examples/t01`..`t05`)
+
+Five single-purpose designs, each isolating one hardware path, all built for
+the ZedBoard (`xc7z020clg484-1`) through the shipped CLI:
+
+```bash
+export HELION_XILINX_DB=<workspace>/work/prjxray-db
+helion bitstream examples/t0N_*.sv --part xc7z020 \
+    --xdc examples/zedboard.xdc -o /tmp/t0N.bit
+```
+
+| Design | Path under test | Pass criterion |
+|---|---|---|
+| `t01_iob_static` | IOB output driver; no clock, no logic | LD0-LD5 pattern, LD6/LD7 excluded (no X-Ray segbits) |
+| `t02_input_passthrough` | IBUF -> LUT -> OBUF | each LED mirrors its button |
+| `t03_lut_truth_table` | LUT6 INIT | LD0/2/4/6 on, LD1/3/5/7 off |
+| `t04_ff_reset` | Hff `SR` pin, async reset | held reset sets the pattern; released, it toggles |
+| `t05_shift_chain` | FF-to-FF routing across tiles | the lit LED walks LD0 -> LD7 and wraps |
+
+All five produce a 4,045,681-byte `.bit` with a valid TLV header, the part name
+`xc7z020clg484-1`, and the device IDCODE `0x03727093` in the configuration
+stream (read out of the FDRI register writes, not the `b` record -- `b` holds
+the ASCII part name, which is easy to mistake for an IDCODE).
+
+`t02` is the test for the input-IOB fix: before it, any design with a data input
+was unbuildable (`route: net \`btn_0\` has 0 drivers`).
+
+### What is NOT verified here
+
+These bitstreams are **not confirmed on silicon**. There is no JTAG cable
+reachable from this machine (`openFPGALoader --detect` cannot open an FTDI
+device) and no Vivado installed, so nothing here has been run on a board or
+compared against a Vivado timing report. The claims above are structural: the
+header, IDCODE, frame count, and agreement with the reference assembler. Whether
+LD0 actually lights is a question only a board can answer.
+
+### Scaling is the open performance problem
+
+Synthesis is not the bottleneck: an 86-LUT blinky on the Artix-35T
+(`xc7a35tcsg324-1`, 18,055 tiles) synthesizes in ~1 ms. Placement and routing on
+that fabric run for **over 40 minutes** without finishing, where the same design
+on the smaller zynq fabric completes in ~70-150 s. The 35T tilegrid is larger
+(18,055 vs. the 29,359-tile z020, but with a different routing-graph shape and
+far more IOB/clock tiles), and place/route appear to scale worse than linearly
+in tile count. Any claim about "running every part" has to answer this first.
