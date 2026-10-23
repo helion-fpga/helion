@@ -1281,6 +1281,49 @@ fn cmd_util(args: &[String]) {
         eprintln!("{e}");
         std::process::exit(1);
     });
+    // A real Xilinx part has no HL10T device file, so the flow below would fail
+    // with "read .../parts/xc7z020.toml: No such file or directory". Report the
+    // 7-series flow's own counts instead.
+    if part.to_ascii_lowercase().starts_with("xc7") {
+        let xdc = xdc_from_args(args).unwrap_or_else(|e| {
+            eprintln!("util: {e}");
+            std::process::exit(1);
+        });
+        let mut design = synth_any(path).unwrap_or_else(|e| {
+            eprintln!("report_utilization: {e}");
+            std::process::exit(1);
+        });
+        apply_pin_constraints(&mut design, &xdc);
+        let db_root = std::env::var("HELION_XILINX_DB")
+            .ok()
+            .map(std::path::PathBuf::from);
+        let period = tightest_period_ps(&xdc);
+        match helion_xilinx7::build::x7_utilization(&design, &part, db_root.as_deref(), period) {
+            Ok(u) => println!(
+                "report_utilization {} part={} LUT={}/{} FF={}/{} IO={}/{} (in {}, out {}) \
+                 BRAM={}/{} DSP={}/{}",
+                design.name,
+                u.part,
+                u.lutffs,
+                u.lut_capacity,
+                u.lutffs,
+                u.lut_capacity,
+                u.iobs_in + u.iobs_out,
+                u.iob_capacity,
+                u.iobs_in,
+                u.iobs_out,
+                u.brams,
+                u.bram_capacity,
+                u.macs,
+                u.dsp_capacity
+            ),
+            Err(e) => {
+                eprintln!("report_utilization: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let xdc = xdc_from_args(args).unwrap_or_else(|e| {
         eprintln!("util: {e}");
         std::process::exit(1);
@@ -1455,6 +1498,52 @@ fn cmd_bits(args: &[String]) {
 /// `helion-xilinx7`, which is the only path that produces configuration data
 /// for these parts. Pin locations come from `--xdc`; placement refuses an IOB
 /// with no LOC rather than guessing a pin.
+/// The tightest clock period in the constraints, in ps.
+///
+/// The worst path in a design is bounded by the fastest clock, so the tightest
+/// period is the one to measure slack against. Defaults to 10 ns (100 MHz)
+/// when no `create_clock` was given, which matches the ZedBoard's oscillator
+/// and keeps a missing constraint from silently reporting infinite slack.
+fn tightest_period_ps(xdc: &Constraints) -> u64 {
+    xdc.clocks
+        .iter()
+        .map(|c| c.period_ps)
+        .filter(|p| *p > 0)
+        .min()
+        .unwrap_or(10_000)
+}
+
+/// Apply parsed XDC pin constraints to a design's ports.
+///
+/// A bit-qualified key (`led[0]`) becomes `LOC[0]` on the vector port, which is
+/// what packing reads to give each bit its own pin. Shared by the bitstream and
+/// utilization commands so the two cannot drift.
+fn apply_pin_constraints(design: &mut Design, xdc: &Constraints) {
+    for port in &mut design.ports {
+        for (key, pin) in &xdc.package_pins {
+            match key.as_str() {
+                k if k == port.name => port.attrs.set("LOC", pin.clone()),
+                k => {
+                    if let Some(rest) = k.strip_prefix(&format!("{}[", port.name)) {
+                        if let Some(bit) = rest.strip_suffix(']') {
+                            port.attrs.set(format!("LOC[{bit}]"), pin.clone());
+                        }
+                    }
+                }
+            }
+        }
+        for (key, std) in &xdc.iostandards {
+            if key == &port.name {
+                port.attrs.set("IOSTANDARD", std.clone());
+            } else if let Some(rest) = key.strip_prefix(&format!("{}[", port.name)) {
+                if let Some(bit) = rest.strip_suffix(']') {
+                    port.attrs.set(format!("IOSTANDARD[{bit}]"), std.clone());
+                }
+            }
+        }
+    }
+}
+
 fn cmd_bits_xilinx7(path: &str, part: &str, xdc: &Constraints, out: &str) {
     let mut design = match synth_any(path) {
         Ok(d) => d,
@@ -1626,6 +1715,55 @@ fn cmd_qor(args: &[String]) {
         eprintln!("qor: {e}");
         std::process::exit(1);
     });
+    // A real part has no HL10T device file; run the 7-series flow and report
+    // its own counts and model slack instead of a file-not-found.
+    if part.to_ascii_lowercase().starts_with("xc7") {
+        let mut design = synth_any(path).unwrap_or_else(|e| {
+            eprintln!("qor: {e}");
+            std::process::exit(1);
+        });
+        apply_pin_constraints(&mut design, &xdc);
+        let db_root = std::env::var("HELION_XILINX_DB")
+            .ok()
+            .map(std::path::PathBuf::from);
+        let period = tightest_period_ps(&xdc);
+        let u = match helion_xilinx7::build::x7_utilization(
+            &design,
+            &part,
+            db_root.as_deref(),
+            period,
+        ) {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("qor: {e}");
+                std::process::exit(1);
+            }
+        };
+        if u.endpoints == 0 {
+            eprintln!(
+                "qor: {} has no timing endpoints (no register-to-register or I/O paths); \
+                 no WNS to report -- this is not a closed design",
+                design.name
+            );
+            std::process::exit(1);
+        }
+        println!(
+            "qor {} part={} LUT={} FF={} IO={} BRAM={} DSP={} WNS_PS={} PERIOD_PS={} \
+             ENDPOINTS={} ELAPSED_MS={} (7-series model estimate, not sign-off)",
+            design.name,
+            u.part,
+            u.lutffs,
+            u.lutffs,
+            u.iobs_in + u.iobs_out,
+            u.brams,
+            u.macs,
+            u.wns_ps,
+            u.period_ps,
+            u.endpoints,
+            t0.elapsed().as_millis()
+        );
+        return;
+    }
     let c = compile_sv_xdc(path, &part, 0.75, &xdc).unwrap_or_else(|e| {
         eprintln!("qor: {e}");
         std::process::exit(1);

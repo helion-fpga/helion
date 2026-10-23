@@ -192,6 +192,104 @@ impl PinConstraints {
     }
 }
 
+/// Pack/place/route a design for a Xilinx-7 part and report what it used.
+///
+/// `report_utilization` and `qor` load devices through the HL10T path, which
+/// has no `xc7*` entries, so asking for either on a real part failed with
+/// "read .../parts/xc7z020.toml: No such file or directory". This runs the same
+/// flow as [`bitstream_for_part`] but stops before frames, which is enough for
+/// a utilization or timing report and skips the expensive FASM/frame work.
+pub struct X7Utilization {
+    /// Occupied LUT sites (each is one 6-input LUT; seen as LUT+FF pairs).
+    pub lutffs: usize,
+    /// Occupied IOB sites, split by direction.
+    pub iobs_in: usize,
+    /// Output IOBs.
+    pub iobs_out: usize,
+    /// Occupied block RAM sites.
+    pub brams: usize,
+    /// Occupied DSP sites.
+    pub macs: usize,
+    /// Total LUT6 sites on the device.
+    pub lut_capacity: usize,
+    /// Total IOB sites on the device.
+    pub iob_capacity: usize,
+    /// Total block RAM sites on the device.
+    pub bram_capacity: usize,
+    /// Total DSP sites on the device.
+    pub dsp_capacity: usize,
+    /// Resolved concrete package, e.g. `xc7z020clg484-1`.
+    pub part: String,
+    /// Worst negative slack at `period_ps`, from the 7-series timing model.
+    ///
+    /// This is a *model estimate*, not a sign-off number: `TimingModel::xilinx7`
+    /// is calibrated to DS181 magnitudes but has not been correlated against a
+    /// Vivado timing report. Treat it as an order-of-magnitude guide.
+    pub wns_ps: i64,
+    /// Timing endpoints (flip-flops) the report covered.
+    pub endpoints: usize,
+    /// The clock period the slack was measured against, in ps.
+    pub period_ps: u64,
+}
+
+/// Pack, place, and route `design` for `part` and return resource counts.
+pub fn x7_utilization(
+    design: &helion_ir::Design,
+    part: &str,
+    db_root: Option<&Path>,
+    period_ps: u64,
+) -> Result<X7Utilization, BitstreamBuildError> {
+    let root: PathBuf = match db_root {
+        Some(p) => p.to_path_buf(),
+        None => crate::device::default_db_root(),
+    };
+    let mut device =
+        Device::load_part_from_db(&root, part).map_err(BitstreamBuildError::Device)?;
+    let node_maps = build_node_map(&mut device);
+
+    let packed = crate::pack::pack(design).map_err(BitstreamBuildError::Flow)?;
+    let mut xdev = XDevice::new(&device, node_maps);
+    for b in &packed.bufgs {
+        xdev.clock_nets.insert(b.out_net.clone());
+    }
+    let placed = crate::place::place(&packed, &xdev).map_err(BitstreamBuildError::Flow)?;
+    let routed = crate::route::route(&placed, &xdev).map_err(BitstreamBuildError::Flow)?;
+
+    // Timing needs the routed netlist, and only means something with a period,
+    // so the caller supplies one. A design with no endpoints has no slack to
+    // measure; report 0 rather than the period, so an unmeasured design cannot
+    // look like a closed one.
+    let report = crate::timing::report_timing_with_device(
+        &routed,
+        &helion_backend::TimingModel::xilinx7(),
+        period_ps,
+        Some(&xdev),
+    )
+    .map_err(BitstreamBuildError::Flow)?;
+
+    let iobs_in = placed
+        .packed
+        .iobs
+        .iter()
+        .filter(|i| i.dir == crate::pack::IobDir::In)
+        .count();
+    Ok(X7Utilization {
+        lutffs: placed.packed.luts.len(),
+        iobs_in,
+        iobs_out: placed.packed.iobs.len() - iobs_in,
+        brams: placed.packed.brams.len(),
+        macs: placed.packed.dsps.len(),
+        lut_capacity: device.slices().len(),
+        iob_capacity: device.iob_sites().len(),
+        bram_capacity: device.ramb_sites().len(),
+        dsp_capacity: device.dsp_sites().len(),
+        part: device.part_dir().to_string(),
+        wns_ps: report.wns_ps,
+        endpoints: report.endpoints,
+        period_ps,
+    })
+}
+
 /// Build a `.bit` for `part` from an already-synthesised design.
 ///
 /// `db_root` is the prjxray-db root (the directory holding `artix7/` and
