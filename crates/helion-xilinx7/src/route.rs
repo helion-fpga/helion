@@ -24,6 +24,24 @@ pub trait RouteQuery {
     fn wire_for_site_pin(&self, site: &str, pin: &str) -> Vec<(String, String)>;
     /// Is this net on the dedicated global clock network (BUFG output)?
     fn is_clock_net(&self, net: &str) -> bool;
+    /// Tie-off pips driving a BUFGCTRL site's control pins to the constants
+    /// required for I0 -> O (UG472 Fig. 2-5): S0=1, CE0=1, IGNORE1=1,
+    /// S1=0, CE1=0, IGNORE0=0.
+    ///
+    /// The static config (emit.rs) sets pin polarity, but the pins are
+    /// routing inputs: left undriven, the BUFGCTRL output freezes at
+    /// INIT_OUT (UG472 Table 2-3). Fails loudly when the DB has no
+    /// tie-off path for the site.
+    fn bufg_tieoff_pips(&self, site: &str) -> Result<BufgTieoff, String>;
+}
+
+/// Tie-off pips for one BUFGCTRL site, split by driven constant.
+#[derive(Clone, Debug, Default)]
+pub struct BufgTieoff {
+    /// Pips driving S0, CE0, IGNORE1 to constant 1 (VCC).
+    pub ones: Vec<RoutedPip>,
+    /// Pips driving S1, CE1, IGNORE0 to constant 0 (GND).
+    pub zeros: Vec<RoutedPip>,
 }
 
 /// A single programmed pip: `tile.dst_wire <- src_wire`.
@@ -153,10 +171,86 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         nets.push(RoutedNet7 { net, kind });
     }
 
+    // BUFGCTRL control-pin tie-offs. The static config (emit.rs) sets pin
+    // polarity, but S0/S1/CE0/CE1/IGNORE0/IGNORE1 are routing inputs: left
+    // undriven, the BUFGCTRL output freezes at INIT_OUT with no toggle
+    // (UG472 Table 2-3), the observed "done=1, LEDs dark" failure.
+    route_bufg_tieoffs(placed, device, &mut nets)?;
+
     Ok(Routed7 {
         placed: placed.clone(),
         nets,
     })
+}
+
+/// Route constant 1/0 to every placed BUFGCTRL's control pins.
+///
+/// Appends one synthetic net per BUFGCTRL per constant
+/// (`__tieoff_<site>_1`, `__tieoff_<site>_0`). Fails loudly on any
+/// conflict: a tie-off IMUX/GFAN wire already used by other logic would
+/// short the constant (or be shorted by it).
+fn route_bufg_tieoffs(
+    placed: &Placed7,
+    device: &dyn RouteQuery,
+    nets: &mut Vec<RoutedNet7>,
+) -> Result<(), String> {
+    // Wires already used by routed pips, per tile (rails excluded:
+    // VCC_WIRE/GND_WIRE are always-on and shareable).
+    let mut used: HashSet<(String, String)> = HashSet::new();
+    for net in nets.iter() {
+        if let RouteKind::Pips(pips) = &net.kind {
+            for p in pips {
+                for w in [&p.src_wire, &p.dst_wire] {
+                    if w != "VCC_WIRE" && w != "GND_WIRE" {
+                        used.insert((p.tile.clone(), w.clone()));
+                    }
+                }
+            }
+        }
+    }
+    for bufg in &placed.bufgs {
+        let tieoff = device.bufg_tieoff_pips(&bufg.site)?;
+        let mut claim = |pips: &[RoutedPip]| -> Result<(), String> {
+            for p in pips {
+                for w in [&p.src_wire, &p.dst_wire] {
+                    if w == "VCC_WIRE" || w == "GND_WIRE" {
+                        continue;
+                    }
+                    let key = (p.tile.clone(), w.clone());
+                    if used.contains(&key) {
+                        return Err(format!(
+                            "route: BUFGCTRL {} tie-off conflicts: wire {}.{} already used",
+                            bufg.site, p.tile, w
+                        ));
+                    }
+                }
+            }
+            for p in pips {
+                for w in [&p.src_wire, &p.dst_wire] {
+                    if w != "VCC_WIRE" && w != "GND_WIRE" {
+                        used.insert((p.tile.clone(), w.clone()));
+                    }
+                }
+            }
+            Ok(())
+        };
+        claim(&tieoff.ones)?;
+        claim(&tieoff.zeros)?;
+        let tag = bufg.site.to_ascii_lowercase();
+        if !tieoff.ones.is_empty() {
+            nets.push(RoutedNet7 {
+                net: format!("__tieoff_{tag}_1"),
+                kind: RouteKind::Pips(tieoff.ones),
+            });
+        }
+        if !tieoff.zeros.is_empty() {
+            nets.push(RoutedNet7 {
+                net: format!("__tieoff_{tag}_0"),
+                kind: RouteKind::Pips(tieoff.zeros),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Route one net from its driver to all loads.
@@ -320,6 +414,9 @@ mod tests {
         fn is_clock_net(&self, net: &str) -> bool {
             net == "clk_bufg"
         }
+        fn bufg_tieoff_pips(&self, _site: &str) -> Result<BufgTieoff, String> {
+            Ok(BufgTieoff::default())
+        }
     }
 
     fn placed_two_site() -> Placed7 {
@@ -381,6 +478,9 @@ mod tests {
             fn site_pin_wire(&self, _: &str, _: &str) -> Option<(String, String)> { None }
             fn wire_for_site_pin(&self, _: &str, _: &str) -> Vec<(String, String)> { vec![] }
             fn is_clock_net(&self, _: &str) -> bool { false }
+            fn bufg_tieoff_pips(&self, _: &str) -> Result<BufgTieoff, String> {
+                Ok(BufgTieoff::default())
+            }
         }
         let err = route(&placed_two_site(), &NoRoute).unwrap_err();
         assert!(err.contains("n1"), "got: {err}");
