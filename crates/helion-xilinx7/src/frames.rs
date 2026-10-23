@@ -356,6 +356,18 @@ impl FrameStore {
         &self.addrs
     }
 
+    /// Is this frame address part of the device's configuration space?
+    ///
+    /// A fabric can be larger than the die it is being programmed onto. That
+    /// happens for `xc7a35t`, which has no tilegrid of its own and borrows the
+    /// `xc7a50t` one: the 50T fabric is taller, so some of its tiles sit on
+    /// rows the 35T `part.json` does not describe. Programming such a tile has
+    /// no frame to write, and the bitstream would be silently truncated or
+    /// rejected.
+    pub fn has_frame(&self, addr: u32) -> bool {
+        self.index.contains_key(&addr)
+    }
+
     /// Raw words of one frame, or `None` for an unknown address.
     pub fn frame_words(&self, addr: u32) -> Option<&[u32]> {
         let i = *self.index.get(&addr)?;
