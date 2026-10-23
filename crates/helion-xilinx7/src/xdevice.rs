@@ -181,6 +181,25 @@ impl<'a> DeviceQuery for XDevice<'a> {
         let row: i32 = row.parse().ok()?;
         Some((col, row))
     }
+
+    /// True when `site` is the SLICEM half of its CLB.
+    ///
+    /// Reads the site TYPE from the device model rather than guessing from the
+    /// name: both halves are called `SLICE_X<col>Y<row>`, and the only
+    /// difference is the type recorded in `tile_type_*.json`.
+    fn slice_is_m(&self, tile: &str, site: &str) -> bool {
+        let Some(idx) = self.tile_idx(tile) else {
+            return false;
+        };
+        let Some(t) = self.device.tile(idx) else {
+            return false;
+        };
+        t.sites
+            .iter()
+            .find(|s| s.name == site)
+            .map(|s| s.site_type == "SLICEM")
+            .unwrap_or(false)
+    }
 }
 
 impl<'a> TimingDevice for XDevice<'a> {
@@ -338,10 +357,6 @@ impl<'a> RouteQuery for XDevice<'a> {
         let (tile_idx, site_idx) = self.device.site_by_name(site)?;
         let tile_name = self.tile_name(tile_idx)?.to_string();
         let pins = self.device.site_pins(tile_idx, site_idx)?;
-        if std::env::var("HELION_TRACE_PIN").is_ok() {
-            let all: Vec<_> = pins.iter().filter(|(pn,_)| pn==pin).map(|(_,w)| w.clone()).collect();
-            eprintln!("TRACE_PIN: {site}/{pin} -> {all:?} (tile {tile_name})");
-        }
         pins.iter()
             .find(|(pn, _)| pn == pin)
             .map(|(_, w)| (tile_name.clone(), w.clone()))
