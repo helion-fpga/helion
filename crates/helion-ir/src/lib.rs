@@ -776,6 +776,7 @@ impl Design {
                         "Mac27" => CellKind::Mac27,
                         "Ila" => CellKind::Ila { net: rest },
                         "Bram18" => CellKind::Bram18,
+                        "Carry4" => CellKind::Carry4,
                         "BlackBox" => CellKind::BlackBox { module: rest },
                         other => return Err(format!("unknown kind {other}")),
                     };

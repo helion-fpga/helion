@@ -15373,6 +15373,180 @@ const RIPPLE_INC_MAX: usize = 64;
 /// Unsigned bus-vs-bus `<` / `>=` ripple. Ibex timer interrupt_d is 64.
 const RIPPLE_CMP_MAX: usize = 64;
 
+/// One bit of a `Carry4`-mapped ripple.
+///
+/// A 7-series CARRY4 computes four sum bits on its `O0..O3` outputs and chains
+/// its carry through dedicated intra-column `COUT`->`CIN` routes. Each bit needs
+/// a pair of LUT6 outputs in the *same slice*, feeding the CARRY4's `S` and `DI`
+/// inputs:
+///
+/// * `S`  (slice `O6`) -- the carry-free propagate term `a ^ b`.
+/// * `DI` (slice `O5`) -- the carry-free generate term `a & b`.
+///
+/// The CARRY4 adds its own carry into each lane, so neither LUT may include a
+/// carry input; doing so would double-count it. With this pair the site is a
+/// textbook full adder: `O = S ^ cin`, `carry_out = DI | (S & cin)`.
+///
+/// `a`/`b` are the operand nets for that bit. `None` means that operand bit is
+/// the constant 0, which is folded into the LUT INIT rather than invented as a
+/// net -- a floating slice input is not a zero.
+struct Carry4Bit {
+    a: Option<String>,
+    b: Option<String>,
+}
+
+/// A `CARRY4`-mapped ripple: the per-bit LUT pair plus the chain the cells form.
+struct Carry4Map {
+    /// LSB-first operand bits, one entry per sum bit.
+    bits: Vec<Carry4Bit>,
+    /// `S` LUT INITs, one per operand bit.
+    s_inits: Vec<u64>,
+    /// `DI` LUT INITs, one per operand bit.
+    di_inits: Vec<u64>,
+    /// The carry into bit 0 of the whole chain.
+    cin_low: Carry4Cin,
+}
+
+/// The carry into bit 0 of a CARRY4 chain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Carry4Cin {
+    /// Constant 0 (`PRECYINIT.C0`).
+    Zero,
+    /// Constant 1 (`PRECYINIT.C1`) -- the `+1` of `q <= q + 1`.
+    One,
+}
+
+/// Smallest width for which a CARRY4 chain is worth introducing.
+///
+/// Below this the flat ripple is already cheap -- the low 4 bits use the INC4
+/// gold LUTs, the same cost as a CARRY4 plus its LUT pair -- and a chain buys
+/// nothing while adding placement risk. At 8 bits and up the flat form starts
+/// building an AND cone over all lower bits and the chain wins quickly; the
+/// measured crossover is between 4 and 8 (work/FINDING-lut-inflation.md).
+const CARRY4_MIN_BITS: usize = 8;
+
+/// `S` (propagate) INIT: the carry-free `a ^ b`.
+fn carry4_s_init(has_a: bool, has_b: bool) -> u64 {
+    lut6_from_i012(|a, b, _c| {
+        let av = has_a && a;
+        let bv = has_b && b;
+        av ^ bv
+    })
+}
+
+/// `DI` (generate) INIT: the carry-free `a & b`.
+fn carry4_di_init(has_a: bool, has_b: bool) -> u64 {
+    lut6_from_i012(|a, b, _c| {
+        let av = has_a && a;
+        let bv = has_b && b;
+        av && bv
+    })
+}
+
+/// Build a `Carry4Map` for an LSB-first list of per-bit operands.
+fn carry4_map_from_bits(bits: Vec<Carry4Bit>, cin_low: Carry4Cin) -> Carry4Map {
+    let n = bits.len();
+    let mut s_inits = Vec::with_capacity(n);
+    let mut di_inits = Vec::with_capacity(n);
+    for bit in 0..n {
+        let has_a = bits[bit].a.is_some();
+        let has_b = bits[bit].b.is_some();
+        s_inits.push(carry4_s_init(has_a, has_b));
+        di_inits.push(carry4_di_init(has_a, has_b));
+    }
+    Carry4Map {
+        bits,
+        s_inits,
+        di_inits,
+        cin_low,
+    }
+}
+
+/// Emit a `Carry4Map`'s cells, chaining group *g*'s `COUT` to group *g+1*'s
+/// `CIN`, and return their names (LSB group first).
+///
+/// Only the *inter-group* carry is a named net: lanes A..D inside one CARRY4 are
+/// wired by the primitive itself. Per bit, two LUT6s drive the slice's `O6`
+/// (`S`) and `O5` (`DI`); the CARRY4 produces the sum bits on its own `O0..O3`.
+///
+/// The carry into bit 0 is recorded as the `cyinit` cell attr (`0` or `1`)
+/// rather than as a phantom literal net, so emission can select
+/// `PRECYINIT.{C0,C1}` without the netlist carrying a fake constant wire.
+fn emit_carry4_map(d: &mut Design, sum: &str, tag: &str, width: usize, map: &Carry4Map) -> Vec<String> {
+    let groups = map.bits.len().div_ceil(4);
+    let mut cells = Vec::with_capacity(groups);
+    // Running carry into the next group's first lane.
+    let mut carry: Option<String> = None;
+    for g in 0..groups {
+        let cell = format!("u_c4_{tag}_{g}");
+        d.add_cell(cell.clone(), CellKind::Carry4);
+        // Chain bookkeeping for pack/place, so neither stage has to re-derive
+        // the grouping from net names.
+        let _ = d.set_cell_attr(&cell, "carry_index", g.to_string());
+        let _ = d.set_cell_attr(&cell, "chain_len", groups.to_string());
+        let _ = d.set_cell_attr(&cell, "chain", tag.to_string());
+        if g == 0 {
+            let c = match map.cin_low {
+                Carry4Cin::Zero => "0",
+                Carry4Cin::One => "1",
+            };
+            let _ = d.set_cell_attr(&cell, "cyinit", c);
+        } else if let Some(n) = carry.take() {
+            d.connect(n, &cell, "CIN");
+        }
+        for lane in 0..4 {
+            let bit = g * 4 + lane;
+            let letter = ["A", "B", "C", "D"][lane];
+            let (a, b, s_init, di_init) = match map.bits.get(bit) {
+                Some(Carry4Bit { a, b }) => {
+                    (a.as_deref(), b.as_deref(), map.s_inits[bit], map.di_inits[bit])
+                }
+                // Lanes past the end of the chain: S=0, DI=0 leaves the sum bit
+                // a defined 0 and lets the carry propagate unchanged.
+                None => (None, None, 0u64, 0u64),
+            };
+            // S LUT -> O6.
+            let s_net = format!("n_c4_{tag}_{g}{letter}s");
+            let s_cell = format!("u_c4_{tag}_{g}{letter}s");
+            let mut s_pins: Vec<(&str, &str)> = Vec::new();
+            if let Some(an) = a {
+                s_pins.push((an, "I0"));
+            }
+            if let Some(bn) = b {
+                s_pins.push((bn, "I1"));
+            }
+            emit_lut_pins(d, &s_cell, &s_net, s_init, &s_pins);
+            d.connect(&s_net, &cell, &format!("{letter}S"));
+            // DI LUT -> O5, on the per-lane `ADI`/`BDI`/`CDI`/`DDI` pin. A
+            // shared `DI` pin would tie all four lanes to one net and silently
+            // corrupt the carry.
+            let di_net = format!("n_c4_{tag}_{g}{letter}d");
+            let di_cell = format!("u_c4_{tag}_{g}{letter}d");
+            let mut di_pins: Vec<(&str, &str)> = Vec::new();
+            if let Some(an) = a {
+                di_pins.push((an, "I0"));
+            }
+            if let Some(bn) = b {
+                di_pins.push((bn, "I1"));
+            }
+            emit_lut_pins(d, &di_cell, &di_net, di_init, &di_pins);
+            d.connect(&di_net, &cell, &format!("{letter}DI"));
+            // The sum bit is the CARRY4's own O output for this lane.
+            if bit < width {
+                let sum_net = bit_name(sum, width, bit);
+                d.connect(&sum_net, &cell, &format!("O{lane}"));
+            }
+        }
+        // Carry out of this group into the next group's CIN.
+        if g + 1 < groups {
+            let cout = format!("n_c4_{tag}_{g}co");
+            d.connect(&cout, &cell, "COUT");
+            carry = Some(cout);
+        }
+    }
+    cells
+}
+
 fn emit_ripple_add(d: &mut Design, rtl: &Rtl, sum: &str, width: usize, a: &str, b: &str) -> bool {
     if width == 0 || width > RIPPLE_ADD_MAX {
         return false;
@@ -16457,6 +16631,106 @@ fn lower_const_word_adds(
     lowered
 }
 
+/// `cnt <= cnt + 1` on a wide register, lowered to a `CARRY4` chain.
+///
+/// Without this, [`inc_bit_expr`] builds bit *i* as `XOR(AND(q0..q_{i-1}), q_i)`
+/// -- a flat AND cone over every lower bit. That is correct but costs ~3.3 LUTs
+/// per bit and grows with width (measured: 4 bits -> 4 LUTs, 25 bits -> 82),
+/// where Vivado spends 1 LUT for the whole 25-bit counter because the CARRY4
+/// computes the sum bits on its own `O` outputs.
+///
+/// Only the *plain* counter form is taken here: `q <= q + 1` with the whole bus
+/// as the target. The guarded forms (`if (en)`, saturating, clock-enable) keep
+/// their existing lowering, because their per-bit expression is the increment
+/// combined with a control term and is no longer a bare carry chain.
+///
+/// On success the sum bits are emitted as `Carry4` cells plus their registers,
+/// and the signal is returned; the caller's per-bit loop then skips it. Returns
+/// an empty set when the pattern does not match, so the existing path runs
+/// unchanged -- a chain is never introduced for a pattern it mis-models.
+fn lower_wide_increment_counters(
+    d: &mut Design,
+    rtl: &Rtl,
+    clk: &str,
+    already: &HashSet<String>,
+) -> HashSet<String> {
+    // Signals incremented as a whole bus, `q <= q + 1`, with no bit selects.
+    let mut names: Vec<&str> = Vec::new();
+    for (lhs, bit, rhs) in &rtl.nbas {
+        if already.contains(*lhs) || sig_depth(rtl, lhs) != 0 {
+            continue;
+        }
+        if bit.is_some() {
+            continue;
+        }
+        if !rexpr_is_plus_one(rhs) || rexpr_ident(rhs).as_deref() != Some(*lhs) {
+            continue;
+        }
+        if !names.iter().any(|n| *n == *lhs) {
+            names.push(lhs);
+        }
+    }
+    let mut lowered = HashSet::new();
+    for sig in names {
+        let width = sig_width(rtl, sig).max(1);
+        // Below the crossover the flat form is already as cheap as a chain (the
+        // low bits use the INC4 gold LUTs); do not churn those designs.
+        if width < CARRY4_MIN_BITS {
+            continue;
+        }
+        // Every bit must have a real net: a missing bit is a skip, not a
+        // zero-extended invented bus.
+        if (0..width).any(|bit| op_bit_net(rtl, sig, bit).is_none()) {
+            continue;
+        }
+        // The whole-bus NBA already implies every bit increments. The only way
+        // a bit could diverge is a separate, bit-selected NBA on the same signal
+        // in the same block (`q[3] <= something_else`), which would make the
+        // chain wrong for that bit. Refuse those.
+        if rtl.nbas.iter().any(|(l, b, _)| *l == sig && b.is_some()) {
+            continue;
+        }
+        // LSB-first operands: a = q_i, b = constant 0. The `+1` is the chain's
+        // carry-in, not an operand bit.
+        let mut bits = Vec::with_capacity(width);
+        let mut ok = true;
+        for bit in 0..width {
+            match op_bit_net(rtl, sig, bit) {
+                Some(qn) => bits.push(Carry4Bit { a: Some(qn), b: None }),
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok || bits.len() != width {
+            continue;
+        }
+        let map = carry4_map_from_bits(bits, Carry4Cin::One);
+        let tag = format!("{sig}_inc");
+        let cells = emit_carry4_map(d, sig, &tag, width, &map);
+        // Each sum bit is a `Carry4` O output already; it only needs its
+        // register. Emitted here because the caller's FF loop walks `reg_bits`,
+        // and these bits deliberately never enter it.
+        for bit in 0..width {
+            let ff = format!("u_ff_c{sig}_{bit}");
+            let qnet = bit_name(sig, width, bit);
+            let bit_clk = seq_clk_for(&rtl.module, &qnet, clk);
+            d.add_cell(&ff, CellKind::Hff);
+            d.connect(&bit_clk, &ff, "CLK");
+            d.connect(&qnet, &ff, "D");
+            d.connect(&qnet, &ff, "Q");
+        }
+        eprintln!(
+            "synth_rtl wide_increment signal={sig} bits={width} carry4={}",
+            cells.len()
+        );
+        lowered.insert(sig.to_string());
+    }
+    lowered
+}
+
+
 /// `res[0] <= a+b` plus `for (i = 1; i < cycles) res[i] <= res[i-1]`.
 /// Constant cycles 2, 3, or 4 unroll as Hff word shifts. q aliases the last
 /// word. More than 4 words, or a non-constant bound: one `word_pipeline_cap`,
@@ -17163,8 +17437,17 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // Variable-index write (depth≤32, width≤16) → Hffs on the user's clock.
     // The read stays a single variable_index_read; do not walk a wide cone.
     lowered_unpacked.extend(lower_var_index_words(&mut d, rtl, clk, &arena));
+    // Wide `cnt <= cnt + 1` -> CARRY4 cells. The flat form is an
+    // AND cone over every lower bit (~3.3 LUTs/bit); the chain is 4
+    // bits per site.
+    lowered_unpacked.extend(lower_wide_increment_counters(&mut d, rtl, clk, &lowered_unpacked));
     for (lhs, bit, rhs) in &rtl.nbas {
         if sig_depth(rtl, lhs) > 0 {
+            continue;
+        }
+        // Bits already emitted as CARRY4 cells: their driver is on the net, so
+        // no per-bit expression may be built for them.
+        if lowered_unpacked.contains(*lhs) {
             continue;
         }
         if is_mac_rhs(rhs) {
