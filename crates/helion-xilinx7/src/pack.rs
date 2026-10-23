@@ -122,6 +122,72 @@ pub struct Packed7 {
 /// Inserts IBUF + BUFGCTRL for every top-level input port whose net drives
 /// at least one FF clock pin (clock inference by use). Returns an error on
 /// unsupported cell kinds rather than silently dropping them.
+/// Make a 6-LUT truth table independent of its unconnected inputs.
+///
+/// `init[addr]` is indexed by `{I5..I0}`, i.e. bit `i` of `addr` is input Ii.
+/// An input listed as `None` in `input_nets` is NOT tied low in hardware -- it
+/// floats -- so every address pair that differs only in that bit must produce
+/// the same output. This folds the table over each floating input's address
+/// bit, choosing the value that the *connected* inputs imply. The result
+/// evaluates identically no matter what voltage the floating pin settles at.
+///
+/// With every input connected this is the identity, so fully-used LUTs are
+/// unchanged.
+fn replicate_unused_inputs(init: u64, input_nets: &[Option<String>; 6]) -> u64 {
+    let mut out = init;
+    for i in 0..6 {
+        if input_nets[i].is_some() {
+            continue;
+        }
+        // Fold address bit i away: for each base address whose bit i is 0,
+        // write its value into both the 0 and 1 variants.
+        let bit = 1u32 << i;
+        let mut folded = 0u64;
+        for addr in 0..64u32 {
+            if addr & bit == 0 {
+                let v = if (out >> addr) & 1 == 1 { 1u64 } else { 0 };
+                // Both variants take the same value, so a floating pin cannot
+                // change the output.
+                let a0 = addr;
+                let a1 = addr | bit;
+                if v == 1 {
+                    folded |= (1u64 << a0) | (1u64 << a1);
+                }
+            }
+        }
+        out = folded;
+    }
+    out
+}
+
+/// Resolve the top-level port an IOB cell belongs to.
+///
+/// The `PAD` pin is bound to the port's *net*, which for an inferred IOB is
+/// usually the port name but need not be (a user net can alias it). Looking
+/// the port up by the raw PAD net name therefore failed OPEN: when the names
+/// differed, `port_def` came back `None` and every constraint on that port --
+/// `LOC` above all -- was silently discarded, so the design was placed at a
+/// default pin. Fall back to the net's endpoints and then to the cell name so
+/// a constrained port is always found.
+fn resolve_port(netlist: &Design, pad: &str, cell_name: &str) -> String {
+    if netlist.ports.iter().any(|p| p.name == pad) {
+        return pad.to_string();
+    }
+    // A net by that name: follow it to the port whose name it represents.
+    if let Some(net) = netlist.nets.iter().find(|n| n.name == pad) {
+        for ep in &net.endpoints {
+            if netlist.ports.iter().any(|p| p.name == ep.cell) {
+                return ep.cell.clone();
+            }
+        }
+    }
+    // Cell name is the last resort and matches the inferred-IOB convention.
+    if netlist.ports.iter().any(|p| p.name == cell_name) {
+        return cell_name.to_string();
+    }
+    pad.to_string()
+}
+
 pub fn pack(netlist: &Design) -> Result<Packed7, String> {
     let pins = netlist.pin_index();
     let mut out = Packed7::default();
@@ -138,9 +204,21 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                     .net_on(&cell.name, "O")
                     .ok_or_else(|| format!("pack: LUT {} has no O net", cell.name))?
                     .to_string();
+                // An unconnected LUT input FLOATS on silicon: it is not tied
+                // low. The 6-LUT then reads an arbitrary 16-entry block of its
+                // 64-entry table depending on that input's voltage, so a
+                // 2-input AND can evaluate the wrong function. X-Ray ships no
+                // `UNUSED` tie-off feature, so the only place to make this
+                // safe is the truth table: replicate the function across every
+                // don't-care combination so the result cannot depend on a
+                // floating pin.
+                //
+                // `init[addr]` is addressed by `{I5..I0}`, so bit `i` of the
+                // address is input Ii.
+                let init = replicate_unused_inputs(*init, &input_nets);
                 out.luts.push(PackedLut {
                     name: cell.name.clone(),
-                    init: *init,
+                    init,
                     input_nets,
                     output_net,
                 });
@@ -168,10 +246,11 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                     .net_on(&cell.name, "I")
                     .ok_or_else(|| format!("pack: IOB {} has no I net", cell.name))?
                     .to_string();
-                let port = pins
+                let pad = pins
                     .net_on(&cell.name, "PAD")
                     .unwrap_or(&cell.name)
                     .to_string();
+                let port = resolve_port(netlist, &pad, &cell.name);
                 let port_def = netlist.ports.iter().find(|p| p.name == port);
                 out.iobs.push(PackedIob {
                     name: cell.name.clone(),
@@ -192,10 +271,11 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                     .net_on(&cell.name, "O")
                     .ok_or_else(|| format!("pack: IBUF {} has no O net", cell.name))?
                     .to_string();
-                let port = pins
+                let pad = pins
                     .net_on(&cell.name, "PAD")
                     .unwrap_or(&cell.name)
                     .to_string();
+                let port = resolve_port(netlist, &pad, &cell.name);
                 let port_def = netlist.ports.iter().find(|p| p.name == port);
                 out.iobs.push(PackedIob {
                     name: cell.name.clone(),
@@ -360,5 +440,62 @@ mod tests {
         d.add_cell("u_ila", CellKind::Ila { net: "x".into() });
         let err = pack(&d).unwrap_err();
         assert!(err.contains("unsupported"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod lut_tieoff_tests {
+    use super::replicate_unused_inputs;
+
+    fn nets(used: &[usize]) -> [Option<String>; 6] {
+        std::array::from_fn(|i| {
+            if used.contains(&i) {
+                Some(format!("n{i}"))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Evaluate the packed table as hardware would: address bits come from the
+    /// connected inputs, and the floating inputs take an arbitrary value.
+    fn eval(init: u64, addr: u32) -> bool {
+        (init >> addr) & 1 == 1
+    }
+
+    #[test]
+    fn two_input_and_is_independent_of_floating_inputs() {
+        // AND(I0,I1): 1 only at addr 0b000011 = 3.
+        let and2 = 1u64 << 3;
+        let packed = replicate_unused_inputs(and2, &nets(&[0, 1]));
+        // I0/I1 give the real inputs; I2..I5 float, so try every combination of
+        // them and require the same answer.
+        for f in 0..16u32 {
+            let addr = (f << 2) | 0b00;
+            assert!(!eval(packed, addr), "AND must be 0 for addr {addr:#08b}");
+        }
+        for f in 0..16u32 {
+            let addr = (f << 2) | 0b11;
+            assert!(eval(packed, addr), "AND must be 1 for addr {addr:#08b}");
+        }
+    }
+
+    #[test]
+    fn fully_connected_lut_is_unchanged() {
+        let t = 0xDEAD_BEEF_1234_5678u64;
+        assert_eq!(replicate_unused_inputs(t, &nets(&[0, 1, 2, 3, 4, 5])), t);
+    }
+
+    #[test]
+    fn buffer_with_one_input_is_constant_across_floats() {
+        // Buffer I0: table has 1 at odd addresses (addr bit0 = I0 = 1).
+        let buf = 0xAAAA_AAAA_AAAA_AAAAu64;
+        let packed = replicate_unused_inputs(buf, &nets(&[0]));
+        for f in 0..32u32 {
+            let addr_lo = (f << 1) | 0; // I0 = 0
+            assert!(!eval(packed, addr_lo), "I0=0 must give 0");
+            let addr_hi = (f << 1) | 1; // I0 = 1
+            assert!(eval(packed, addr_hi), "I0=1 must give 1");
+        }
     }
 }
