@@ -522,28 +522,53 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
 
     // CARRY4s.
     //
-    // A CARRY4 needs more than the ACY0/BCY0/CCY0/DCY0 propagate muxes: its
-    // CYINIT source must be selected by PRECYINIT.{AX,C0,C1,CIN}, and the
-    // per-bit DI/S inputs come from the slice. None of that is captured today
-    // -- `PackedCarry` has only a name (pack.rs), so there is no CYINIT source
-    // and no DI/S data to emit. Emitting the mux bits alone would configure a
-    // carry chain with an undefined init: arithmetic would silently produce
-    // wrong results. Fail loudly rather than guess.
-    if !placed.carries.is_empty() {
-        return Err(format!(
-            "emit: design uses {} CARRY4 chain element(s) ({}), but the 7-series backend does \
-             not capture carry configuration: PRECYINIT (CYINIT source) and the DI/S inputs \
-             are not recorded by pack.rs, so only the propagate muxes could be emitted. \
-             Refusing to emit arithmetic that would silently miscompute. See findings/\
-             investigator_report.md C2.",
-            placed.carries.len(),
-            placed
-                .carries
-                .iter()
-                .map(|c| c.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+    // A CARRY4 is configured by three things, and all three are mandatory:
+    //
+    //   1. `CARRY4.{A,B,C,D}CY0` -- the per-lane propagate mux that lets the
+    //      slice's `O6` drive that lane's `S` input. Without it the lane's
+    //      propagate term is not connected and the carry dies mid-slice.
+    //   2. `PRECYINIT.{C0,C1,CIN}` -- where the chain's initial carry comes
+    //      from. This is a 4-way MUTUALLY EXCLUSIVE mux (note the `!` polarity
+    //      bits in the DB), not independent flags, so exactly one arm is
+    //      emitted. Leaving it unset leaves the chain entry undefined and the
+    //      sums silently wrong.
+    //   3. The FF that consumes a sum bit must select the carry path
+    //      (`AFFMUX = XOR`), handled in `mux_for_ff`.
+    //
+    // The `S`/`DI` LUTs themselves are ordinary `ALUT.INIT` features emitted by
+    // the LUT loop above, because the lane LUTs are real packed LUTs.
+    for carry in &placed.carries {
+        let Some(pc) = placed.packed.carries.iter().find(|c| c.name == carry.name) else {
+            return Err(format!(
+                "emit: placed CARRY4 {} has no packed counterpart",
+                carry.name
+            ));
+        };
+        let site_rel = device
+            .site_rel(&carry.tile, &carry.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", carry.tile, carry.site))?;
+        // Every lane gets its propagate mux: a lane whose `S` is unconnected
+        // still passes the carry through, but the chain must be configured for
+        // the lanes that are used, and emitting all four matches Vivado.
+        for lane in ["A", "B", "C", "D"] {
+            lines.push(format!("{}.{}.CARRY4.{lane}CY0", carry.tile, site_rel));
+        }
+        // The chain entry. Only the first element of a chain has `cyinit`;
+        // every later element is fed by the previous element's COUT through the
+        // dedicated column route, which needs no PRECYINIT select.
+        if let Some(ci) = &pc.cyinit {
+            let arm = match ci.as_str() {
+                "0" => "C0",
+                "1" => "C1",
+                other => {
+                    return Err(format!(
+                        "emit: CARRY4 {} has cyinit `{other}`, expected `0` or `1`",
+                        carry.name
+                    ))
+                }
+            };
+            lines.push(format!("{}.{}.PRECYINIT.{arm}", carry.tile, site_rel));
+        }
     }
 
     // Routing pips: TILE.DST.SRC. Pseudo-pips are always-on hard
@@ -1158,6 +1183,25 @@ fn mux_for_ff(
     // which is what Vivado selects for LUT-driven flops. `O5` would tap the
     // 5-input output instead, and is only right for a 5-input function.
     if let Some(pff) = packed.ffs.iter().find(|f| f.name == ff.name) {
+        // A sum bit produced by a CARRY4 is NOT on the LUT output: the slice
+        // computes `O = S ^ carry_in`, and `AFFMUX.XOR` is the only mux arm
+        // that taps it. Selecting `O6` here would give the FF the propagate
+        // term without the carry added, i.e. a counter that runs at the wrong
+        // value; selecting `AX` would leave D undriven. Check the carry's sum
+        // nets before the LUT path.
+        let carry_feeds_ff = placed.carries.iter().any(|pc| {
+            pc.site == ff.site
+                && placed
+                    .packed
+                    .carries
+                    .iter()
+                    .find(|c| c.name == pc.name)
+                    .map(|c| c.lane_sum_net.iter().flatten().any(|n| *n == pff.d_net))
+                    .unwrap_or(false)
+        });
+        if carry_feeds_ff {
+            return "XOR";
+        }
         for lut in &placed.luts {
             if lut.site == ff.site && lut.bel.starts_with(ff.bel.chars().next().unwrap_or('A')) {
                 let drives_ff = packed
@@ -1635,12 +1679,18 @@ mod tests {
         assert!(err.contains("DSP48E1"), "error must name the primitive: {err}");
     }
 
+    /// A configured CARRY4 must emit its four propagate muxes plus exactly one
+    /// PRECYINIT arm. `PRECYINIT` is a 4-way mutually exclusive mux, so emitting
+    /// two arms would drive the same bits from two sources and prjxray rejects
+    /// the bitstream; emitting none leaves the chain entry undefined.
     #[test]
-    fn emit_rejects_unconfigurable_carry_loudly() {
-        // A CARRY4 without PRECYINIT has an undefined init; emitting only the
-        // propagate muxes would silently miscompute arithmetic.
+    fn emit_writes_carry4_muxes_and_one_precyinit_arm() {
         use crate::pack::PackedCarry;
         use crate::place::PlacedCarry;
+        let mut pc = PackedCarry::empty("u_carry");
+        pc.chain = "c".into();
+        pc.chain_len = 1;
+        pc.cyinit = Some("1".into());
         let packed = Packed7 {
             luts: vec![],
             ffs: vec![],
@@ -1648,7 +1698,7 @@ mod tests {
             bufgs: vec![],
             brams: vec![],
             dsps: vec![],
-            carries: vec![PackedCarry::empty("u_carry")],
+            carries: vec![pc],
         };
         let placed = Placed7 {
             packed: packed.clone(),
@@ -1658,11 +1708,64 @@ mod tests {
             bufgs: vec![],
             brams: vec![],
             dsps: vec![],
-            carries: vec![PlacedCarry { name: "u_carry".into(), tile: "CLBLL_L_X0Y0".into(), site: "SLICE_X0Y0".into() }],
+            carries: vec![PlacedCarry {
+                name: "u_carry".into(),
+                tile: "CLBLL_L_X0Y0".into(),
+                site: "SLICE_X0Y0".into(),
+            }],
         };
         let routed = Routed7 { placed, nets: vec![] };
-        let err = emit_fasm(&routed, &FakeEmit).expect_err("CARRY4 must be refused");
-        assert!(err.contains("u_carry"), "error must name the cell: {err}");
-        assert!(err.contains("PRECYINIT"), "error must explain why: {err}");
+        let bs = emit_fasm(&routed, &FakeEmit).expect("a configured CARRY4 must emit");
+        let fasm = bs.fasm.join("\n");
+        for lane in ["A", "B", "C", "D"] {
+            assert!(
+                fasm.contains(&format!("CARRY4.{lane}CY0")),
+                "missing {lane}CY0 propagate mux:\n{fasm}"
+            );
+        }
+        // The `+1` chain entry.
+        assert!(
+            fasm.contains("PRECYINIT.C1"),
+            "a cyinit of `1` must select PRECYINIT.C1:\n{fasm}"
+        );
+        // Mutually exclusive: no second arm.
+        for arm in ["PRECYINIT.C0", "PRECYINIT.CIN", "PRECYINIT.AX"] {
+            assert!(!fasm.contains(arm), "PRECYINIT arms are exclusive, saw {arm}");
+        }
+    }
+
+    /// A chain element past the first is fed by CIN and must NOT emit a
+    /// PRECYINIT arm (which would fight the column route).
+    #[test]
+    fn emit_omits_precyinit_for_chained_elements() {
+        use crate::pack::PackedCarry;
+        use crate::place::PlacedCarry;
+        let mut pc = PackedCarry::empty("u_carry1");
+        pc.chain = "c".into();
+        pc.index = 1;
+        pc.chain_len = 2;
+        pc.cyinit = None;
+        let packed = Packed7 {
+            luts: vec![], ffs: vec![], iobs: vec![], bufgs: vec![],
+            brams: vec![], dsps: vec![], carries: vec![pc],
+        };
+        let placed = Placed7 {
+            packed: packed.clone(),
+            luts: vec![], ffs: vec![], iobs: vec![], bufgs: vec![],
+            brams: vec![], dsps: vec![],
+            carries: vec![PlacedCarry {
+                name: "u_carry1".into(),
+                tile: "CLBLL_L_X0Y1".into(),
+                site: "SLICE_X0Y1".into(),
+            }],
+        };
+        let routed = Routed7 { placed, nets: vec![] };
+        let bs = emit_fasm(&routed, &FakeEmit).expect("chained element must emit");
+        let fasm = bs.fasm.join("\n");
+        assert!(fasm.contains("CARRY4.ACY0"), "propagate muxes still needed");
+        assert!(
+            !fasm.contains("PRECYINIT"),
+            "a chained element takes its carry from CIN, not PRECYINIT:\n{fasm}"
+        );
     }
 }
