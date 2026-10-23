@@ -97,7 +97,32 @@ fn compile_design_xdc(
         .cloned()
         .collect();
     let undriven = packed.iobs.len().saturating_sub(driven.len());
-    if packed.iobs.len() > iob_budget || undriven > 0 {
+    if undriven > 0 {
+        // An IOB whose input net no packed LUT/FF actually drives cannot be
+        // configured: the pad would hold its reset value. Dropping it also
+        // removes a declared output from the design, so the build must not
+        // look successful -- a user asking for `output led` must not receive a
+        // bitstream where `led` does nothing. Name the ports so the cause is
+        // actionable instead of surfacing as a mysterious LUT/IOB mismatch.
+        let mut names: Vec<&str> = packed
+            .iobs
+            .iter()
+            .filter(|io| !q_nets.contains(io.from_net.as_str()))
+            .map(|io| io.cell.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        return Err(format!(
+            "impl: {} output(s) have no driver after packing and cannot be placed: {}. \
+             A top-level output must be driven by a register or by combinational logic that \
+             was lowered to LUT/FF cells; an output driven only by an unsupported construct \
+             (or left undriven) has no net to connect to its pad. Fix the design, or remove \
+             the output from the top-level port list.",
+            names.len(),
+            names.join(", ")
+        ));
+    }
+    if packed.iobs.len() > iob_budget {
         let keep = driven.len().min(iob_budget);
         let keep = if packed.lutffs.len() > 2000 {
             keep.min(4)
@@ -372,7 +397,16 @@ fn cmd_run(args: &[String]) {
     let mut sim = Fabric::new(&c.dev);
     sim.program(&c.bits).unwrap();
     sim.finish_startup();
-    let iob = c.routed.iob_src[0].iob;
+    let iob = match c.routed.iob_src.first() {
+        Some(x) => x.iob,
+        None => {
+            eprintln!(
+                "run: the design has no placed output IOB to observe. A top-level output must \
+                 be driven by a register or by combinational logic lowered to LUT/FF cells."
+            );
+            std::process::exit(1);
+        }
+    };
     let mut wave = Vec::new();
     let mut changes = 0u32;
     let mut last = sim.led_at(iob.0, iob.1);
@@ -779,7 +813,17 @@ fn cmd_project(args: &[String]) {
             std::process::exit(1);
         });
         sim.finish_startup();
-        let iob = routed.iob_src[0].iob;
+        let iob = match routed.iob_src.first() {
+            Some(x) => x.iob,
+            None => {
+                eprintln!(
+                    "project run: the design has no placed output IOB to observe. A top-level \
+                     output must be driven by a register or by combinational logic lowered to \
+                     LUT/FF cells."
+                );
+                std::process::exit(1);
+            }
+        };
         let mut wave = Vec::new();
         let mut changes = 0u32;
         let mut last = sim.led_at(iob.0, iob.1);
