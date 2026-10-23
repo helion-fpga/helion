@@ -15393,6 +15393,12 @@ const RIPPLE_CMP_MAX: usize = 64;
 struct Carry4Bit {
     a: Option<String>,
     b: Option<String>,
+    /// The `b` operand is the constant 1 rather than a routed net.
+    ///
+    /// `b` is then `None` because there is no net to route, and the `+1` rides
+    /// the chain's carry-in. The `S`/`DI` LUTs still need to know the operand's
+    /// VALUE, not merely that no pin is driven.
+    b_high: bool,
 }
 
 /// A `CARRY4`-mapped ripple: the per-bit LUT pair plus the chain the cells form.
@@ -15426,21 +15432,51 @@ enum Carry4Cin {
 const CARRY4_MIN_BITS: usize = 8;
 
 /// `S` (propagate) INIT: the carry-free `a ^ b`.
-fn carry4_s_init(has_a: bool, has_b: bool) -> u64 {
-    lut6_from_i012(|a, b, _c| {
+///
+/// The operands are only known to exist, not to hold a value, so the generic
+/// form is `a ^ b` over the free slice inputs. That is correct when both
+/// operands are real signals. It is WRONG for the `q + 1` idioms, where the
+/// second operand is the constant 1 and only `a` is routed: the sum is then
+/// `a ^ 1` = `~a`, and emitting `a ^ b` leaves the LUT reading an input pin
+/// nothing drives.
+///
+/// A 25-bit `count <= count + 1` counter is exactly that shape -- the lowering
+/// passes `b: None` and puts the `+1` in the chain's carry-in -- so the entry
+/// lane came out as `S = A1` (`0xAAAA_AAAA_AAAA_AAAA`) where the reference has
+/// `S = ~A3` (`0x0F0F_0F0F_0F0F_0F0F`). The register bit reaches the slice on
+/// `A3`, so the wrong INIT meant the sum never saw the counter's own value and
+/// the LED sat lit instead of toggling.
+///
+/// `b_high` marks a constant-1 operand on the `b` side.
+fn carry4_s_init(has_a: bool, has_b: bool, b_high: bool) -> u64 {
+    // `a` sits on `I5` and `b` on `I4`, so the truth table must be built over
+    // those positions rather than the `i012` default.
+    let mut pat = 0u64;
+    for addr in 0..64u32 {
+        let a = (addr >> 5) & 1 == 1;
+        let b = (addr >> 4) & 1 == 1;
         let av = has_a && a;
-        let bv = has_b && b;
-        av ^ bv
-    })
+        let bv = if b_high { true } else { has_b && b };
+        if av ^ bv {
+            pat |= 1u64 << addr;
+        }
+    }
+    pat
 }
 
 /// `DI` (generate) INIT: the carry-free `a & b`.
-fn carry4_di_init(has_a: bool, has_b: bool) -> u64 {
-    lut6_from_i012(|a, b, _c| {
+fn carry4_di_init(has_a: bool, has_b: bool, b_high: bool) -> u64 {
+    let mut pat = 0u64;
+    for addr in 0..64u32 {
+        let a = (addr >> 5) & 1 == 1;
+        let b = (addr >> 4) & 1 == 1;
         let av = has_a && a;
-        let bv = has_b && b;
-        av && bv
-    })
+        let bv = if b_high { true } else { has_b && b };
+        if av && bv {
+            pat |= 1u64 << addr;
+        }
+    }
+    pat
 }
 
 /// Build a `Carry4Map` for an LSB-first list of per-bit operands.
@@ -15451,8 +15487,9 @@ fn carry4_map_from_bits(bits: Vec<Carry4Bit>, cin_low: Carry4Cin) -> Carry4Map {
     for bit in 0..n {
         let has_a = bits[bit].a.is_some();
         let has_b = bits[bit].b.is_some();
-        s_inits.push(carry4_s_init(has_a, has_b));
-        di_inits.push(carry4_di_init(has_a, has_b));
+        let b_high = bits[bit].b_high;
+        s_inits.push(carry4_s_init(has_a, has_b, b_high));
+        di_inits.push(carry4_di_init(has_a, has_b, b_high));
     }
     Carry4Map {
         bits,
@@ -15498,7 +15535,7 @@ fn emit_carry4_map(d: &mut Design, sum: &str, tag: &str, width: usize, map: &Car
             let bit = g * 4 + lane;
             let letter = ["A", "B", "C", "D"][lane];
             let (a, b, s_init, di_init) = match map.bits.get(bit) {
-                Some(Carry4Bit { a, b }) => {
+                Some(Carry4Bit { a, b, b_high }) => {
                     (a.as_deref(), b.as_deref(), map.s_inits[bit], map.di_inits[bit])
                 }
                 // Lanes past the end of the chain: S=0, DI=0 leaves the sum bit
@@ -15508,12 +15545,22 @@ fn emit_carry4_map(d: &mut Design, sum: &str, tag: &str, width: usize, map: &Car
             // S LUT -> O6.
             let s_net = format!("n_c4_{tag}_{g}{letter}s");
             let s_cell = format!("u_c4_{tag}_{g}{letter}s");
+            // The adder's `a` operand goes on LUT pin `I5`, which reaches the
+            // slice through `IMUX5` as input `A6`.
+            //
+            // `I0`/`A1` is the obvious-looking choice and is what this used to
+            // use, but the reference routes the register bit to `A6`: its body
+            // lanes carry `S = A6` (`0xFFFF_FFFF_0000_0000`, a plain pass-through
+            // of the operand) and its entry lane carries `S = ~A3`
+            // (`0x0F0F_0F0F_0F0F_0F0F`). Matching the pin means the `S` LUT is a
+            // pass-through too rather than a function compensating for the
+            // wrong input, and it keeps the routing identical to Vivado's.
             let mut s_pins: Vec<(&str, &str)> = Vec::new();
             if let Some(an) = a {
-                s_pins.push((an, "I0"));
+                s_pins.push((an, "I5"));
             }
             if let Some(bn) = b {
-                s_pins.push((bn, "I1"));
+                s_pins.push((bn, "I4"));
             }
             emit_lut_pins(d, &s_cell, &s_net, s_init, &s_pins);
             d.connect(&s_net, &cell, &format!("{letter}S"));
@@ -16696,7 +16743,15 @@ fn lower_wide_increment_counters(
         let mut ok = true;
         for bit in 0..width {
             match op_bit_net(rtl, sig, bit) {
-                Some(qn) => bits.push(Carry4Bit { a: Some(qn), b: None }),
+                // `b` is the constant 0 and carries no pin: the `+1` is the
+                // chain's carry-in (`Carry4Cin::One` below), not an operand
+                // bit. Marking it `b_high` instead would compute `a ^ 1` and
+                // give every lane the complementary function.
+                Some(qn) => bits.push(Carry4Bit {
+                    a: Some(qn),
+                    b: None,
+                    b_high: false,
+                }),
                 None => {
                     ok = false;
                     break;
@@ -25378,23 +25433,30 @@ mod carry4_tests {
     /// The `S`/`DI` pair must be the *carry-free* propagate/generate terms:
     /// `a ^ b` and `a & b`. For `q + 1` against a constant-0 addend that is
     /// `S = q_i` (identity INIT) and `DI = 0`.
+    ///
+    /// The identity rides the slice input the operand is wired to, which is
+    /// `A6` via LUT pin `I5`, so the INIT is `0xFFFF_FFFF_0000_0000` -- NOT
+    /// `0xAAAA_AAAA_AAAA_AAAA`. `0xAAAA...` is the identity on `I0`/`A1`, and
+    /// that is what this emitter used to produce by connecting the operand to
+    /// `I0`. The reference wires it to `A6`; its body lanes all carry
+    /// `0xFFFF_FFFF_0000_0000`, so this assertion now pins the reference's
+    /// encoding rather than a self-consistent but different one.
     #[test]
     fn counter_25bit_lane_luts_are_carry_free() {
         let d = synth_counter(25);
-        // S LUT for a connected lane must be the identity on I0 (0xAAAA...).
         let s_ids: Vec<&str> = d
             .cells
             .iter()
             .filter(|c| {
                 c.name.starts_with("u_c4_q_inc_")
                     && (c.name.ends_with('s'))
-                    && matches!(c.kind, CellKind::Lut6 { init } if init == 0xAAAA_AAAA_AAAA_AAAA)
+                    && matches!(c.kind, CellKind::Lut6 { init } if init == 0xFFFF_FFFF_0000_0000)
             })
             .map(|c| c.name.as_str())
             .collect();
         assert!(
             s_ids.len() >= 25,
-            "expected >=25 identity S LUTs for the 25 lanes, got {}",
+            "expected >=25 identity-on-A6 S LUTs for the 25 lanes, got {}",
             s_ids.len()
         );
         // No lane may have a carried `a ^ b ^ cin` INIT; that would double-count
