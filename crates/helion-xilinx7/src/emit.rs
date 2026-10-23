@@ -1648,7 +1648,7 @@ mod tests {
             bufgs: vec![],
             brams: vec![],
             dsps: vec![],
-            carries: vec![PackedCarry { name: "u_carry".into() }],
+            carries: vec![PackedCarry::empty("u_carry")],
         };
         let placed = Placed7 {
             packed: packed.clone(),
