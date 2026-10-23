@@ -334,10 +334,47 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
     let mut lut_placed: HashSet<usize> = HashSet::new();
     // BEL occupancy per site: site -> letters used.
     let mut site_bels: HashMap<String, HashSet<char>> = HashMap::new();
-
-    // Allocate a (tile, site, BEL-letter), reusing a slice with free BELs
-    // before opening a new one.
+    // Which tile each site belongs to.
     let mut site_tile: HashMap<String, String> = HashMap::new();
+
+    // Carry-sum affinity. A CARRY4's lane `n` publishes its sum on
+    // `lane_sum_net[n]`, and the flop that samples that bit belongs in the
+    // CARRY4's OWN slice at the matching letter (`O0`->A, `O1`->B, ...), because
+    // the sum reaches the flop through an intra-slice route. Placing the flop
+    // elsewhere still routes through the interconnect and still simulates
+    // correctly at netlist level, but it diverges from Vivado and costs the
+    // chain its fast path. Reserve those sites and letters now, before the
+    // generic allocator can hand them to an unrelated flop.
+    let mut ff_slot: HashMap<String, (String, String, char)> = HashMap::new();
+    for ci in 0..out.carries.len() {
+        let placed_tile = out.carries[ci].tile.clone();
+        let placed_site = out.carries[ci].site.clone();
+        let carry_name = out.carries[ci].name.clone();
+        let Some(pci) = packed.carries.iter().position(|c| c.name == carry_name) else {
+            continue;
+        };
+        let pc = &packed.carries[pci];
+        for (lane, letter) in ['A', 'B', 'C', 'D'].iter().enumerate() {
+            let Some(sum) = pc.lane_sum_net[lane].as_deref() else {
+                continue;
+            };
+            let Some(ff) = packed.ffs.iter().find(|f| f.d_net == sum) else {
+                continue;
+            };
+            site_bels
+                .entry(placed_site.clone())
+                .or_default()
+                .insert(*letter);
+            site_tile
+                .entry(placed_site.clone())
+                .or_insert_with(|| placed_tile.clone());
+            used_sites.insert(placed_site.clone());
+            ff_slot.insert(
+                ff.name.clone(),
+                (placed_tile.clone(), placed_site.clone(), *letter),
+            );
+        }
+    }
     let alloc = |used: &mut HashSet<String>,
                      site_bels: &mut HashMap<String, HashSet<char>>,
                      site_tile: &mut HashMap<String, String>,
@@ -361,6 +398,18 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
     };
     for (fi, ff) in packed.ffs.iter().enumerate() {
         let _ = fi;
+        // A flop that samples a CARRY4 sum is pinned to the carry element's own
+        // slice and lane letter; that is the whole point of the chain's fast
+        // path, and it is where Vivado puts it. See `ff_slot` above.
+        if let Some((tile, site, letter)) = ff_slot.get(&ff.name).cloned() {
+            out.ffs.push(PlacedFf {
+                name: ff.name.clone(),
+                tile,
+                site,
+                bel: format!("{letter}FF"),
+            });
+            continue;
+        }
         // Find driving LUT, if any, and not yet placed.
         let lut_idx = lut_by_output.get(ff.d_net.as_str()).copied().filter(|i| !lut_placed.contains(i));
         let (tile, site, letter) = alloc(&mut used_sites, &mut site_bels, &mut site_tile, device)?;
