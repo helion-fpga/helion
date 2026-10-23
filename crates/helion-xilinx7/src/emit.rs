@@ -186,10 +186,10 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     // FFs: ZINI + D-mux select + control signals (CE, SR).
     //
     // Control signal configuration (per X-Ray DB segbits_clbll_l.db):
-    // - {bel}.ZRST: SR pin acts as RESET (vs SET). Emitted when the FF has
-    //   an SR net. prjxray's Z prefix names the zero-state option (ZRST =
-    //   reset-to-zero, like ZINI = init-to-zero); the FASM feature sets the
-    //   documented config bit (bit = 1), it does not clear it.
+    // - {bel}.ZRST: SRVAL, the value the register takes on set/reset. This is
+    //   NOT "the SR pin acts as reset" and it is NOT conditional on the FF
+    //   having an SR net -- it is one half of the INIT/SRVAL pair and is
+    //   emitted for every FF, alongside ZINI. See the block below.
     // - {slice}.CEUSEDMUX: slice-level, enables the CE input mux. Needed
     //   when any FF in the slice has a CE net.
     // - {slice}.SRUSEDMUX: slice-level, enables the SR input mux. Needed
@@ -1031,6 +1031,51 @@ mod tests {
         assert!(
             text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZRST"),
             "missing ZRST, got:\n{text}"
+        );
+    }
+
+    #[test]
+    /// Every flip-flop in the emitted FASM must carry both halves of its
+    /// configuration.
+    ///
+    /// `ZINI` (power-up INIT) and `ZRST` (SRVAL, the set/reset value) are a
+    /// pair, and Vivado writes both for every FF it places. Emitting only
+    /// `ZINI` is not a no-op: SRVAL keeps its default of 1, so a register that
+    /// inits to 0 powers up as a constant 1 and the design looks frozen. That
+    /// fault shipped in every bitstream until it was found by diffing against
+    /// a working reference, and no test caught it because prjxray silently
+    /// drops unmatched FASM lines, so the assemble stayed green.
+    ///
+    /// This is a structural invariant, so it holds for any design rather than
+    /// the one hand-written fixture.
+    #[test]
+    fn every_ff_gets_both_zini_and_zrst() {
+        use std::collections::BTreeSet;
+        let bs = emit_fasm(&routed_blinky(), &FakeEmit).unwrap();
+        let ini: BTreeSet<&str> = bs
+            .fasm
+            .iter()
+            .filter_map(|l| l.strip_suffix(".ZINI"))
+            .collect();
+        let rst: BTreeSet<&str> = bs
+            .fasm
+            .iter()
+            .filter_map(|l| l.strip_suffix(".ZRST"))
+            .collect();
+        assert!(
+            !ini.is_empty(),
+            "expected the blinky to place flip-flops; found no .ZINI at all"
+        );
+        let missing: Vec<&&str> = ini.difference(&rst).collect();
+        let extra: Vec<&&str> = rst.difference(&ini).collect();
+        assert!(
+            missing.is_empty(),
+            "these FFs have ZINI but no ZRST, so SRVAL stays at its default 1 \
+             and they power up as constants: {missing:?}"
+        );
+        assert!(
+            extra.is_empty(),
+            "these FFs have ZRST but no ZINI: {extra:?}"
         );
     }
 
