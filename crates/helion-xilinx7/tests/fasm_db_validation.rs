@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use helion_xilinx7::build::PinConstraints;
 use helion_xilinx7::device::{default_db_root, Device};
 use helion_xilinx7::xdevice::{build_node_map, XDevice};
 use helion_xilinx7::{emit_fasm, pack, place, route};
@@ -71,8 +72,15 @@ impl DbFeatures {
                 if parts.next().is_none() {
                     continue;
                 }
+                // The DB's own text prefixes each feature with the
+                // UPPERCASE tile type (`CLBLL_L.SLICEL_X0.ALUT.INIT[08]`),
+                // even though the file it lives in is lowercase
+                // (`segbits_clbll_l.db`). Strip against the uppercase form:
+                // stripping against `tt` never matched, so every stored
+                // feature kept its prefix and `resolves` rejected the whole
+                // bitstream as fabricated.
                 let bare = name
-                    .strip_prefix(&format!("{}.", tt))
+                    .strip_prefix(&format!("{key}."))
                     .unwrap_or(name)
                     .to_string();
                 dst.entry(key.clone()).or_default().insert(bare);
@@ -160,38 +168,48 @@ fn blinky_fasm_is_fully_resolvable() {
     let mut design = helion_sv::synth_sv(&src, "zedboard_blinky.sv").expect("synth");
     let xdc = std::fs::read_to_string("../../examples/zedboard.xdc").expect("xdc");
 
-    // Apply the LED/clk LOCs from the XDC.
-    let pins = parse_package_pins(&xdc);
-    for port in &mut design.ports {
-        let key = port.name.clone();
-        if let Some(p) = pins.get(&key) {
-            port.attrs.set("LOC", p);
-        }
-    }
-    let mut packed = pack(&design).expect("pack");
-    for (i, iob) in packed.iobs.iter_mut().enumerate() {
-        if let Some(p) = pins.get(&iob.port) {
-            iob.loc = Some(p.clone());
-        } else if iob.port == "led" {
-            // Bus port: resolve led[n] by net name.
-            let bit = iob
-                .net
-                .rsplit('_')
-                .next()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(i);
-            if let Some(p) = pins.get(&format!("led[{bit}]")) {
-                iob.loc = Some(p.clone());
-            }
-        }
-        iob.iostandard = "LVCMOS33".to_string();
-    }
+    // Apply the real XDC through the same parser the CLI uses. The previous
+    // hand-rolled version keyed on `port.name`, which is `led` for the whole
+    // bus, so no LED pin ever resolved and packing then refused with
+    // "IOB u_iob (port led) has no PACKAGE_PIN LOC". Using PinConstraints
+    // keeps the test honest: it exercises the shipping parse/apply path
+    // instead of a second implementation that can drift.
+    let constraints = PinConstraints::parse(&xdc);
+    constraints.apply(&mut design);
+    let packed = pack(&design).expect("pack");
 
     let xdev = XDevice::new(&device, nodes);
     let placed = place(&packed, &xdev).expect("place");
     let routed = route(&placed, &xdev).expect("route");
     let bs = emit_fasm(&routed, &xdev).expect("emit");
-    assert_no_fabricated(&db, &bs.fasm, "zedboard blinky");
+    // Upstream `prjxray-db` ships no segbits at all for the
+    // `RIOB33_SING` tile type (ppips file is empty), so LED6/LED7 on the
+    // ZedBoard cannot be assembled by anyone -- the CLI warns and drops
+    // them. Assert that this is the ONLY unresolved group, rather than
+    // skipping the check: any other fabricated feature still fails.
+    const UNSUPPORTED: &str = "RIOB33_SING";
+    let (skipped, checked): (Vec<&String>, Vec<&String>) =
+        bs.fasm.iter().partition(|l| l.contains(UNSUPPORTED));
+    assert!(
+        !skipped.is_empty(),
+        "expected the RIOB33_SING lines the DB cannot resolve"
+    );
+    for line in &skipped {
+        let (tile, feature) = line.split_once('.').expect("tile.feature");
+        assert!(
+            !db.resolves(tile, feature),
+            "RIOB33_SING line unexpectedly resolves: {line}"
+        );
+    }
+    assert_no_fabricated(&db, &checked.iter().map(|s| (*s).clone()).collect::<Vec<_>>(), "zedboard blinky");
+
+    // Guard against the checker silently passing everything: a feature that
+    // cannot exist must be rejected. This is the regression test for the
+    // tile-type case bug, where every line was rejected and the assertions
+    // below became vacuous.
+    assert!(!db.resolves("CLBLL_L_X70Y44", "NOT_A_REAL_FEATURE.AT_ALL"));
+    assert!(!db.resolves("CLBLL_L_X70Y44", "SLICEL_X0.NOPE.INIT[00]"));
+    assert!(db.resolves("CLBLL_L_X70Y44", "CLBLL_LL_A1.CLBLL_IMUX7"));
 }
 
 /// `set_property PACKAGE_PIN <pin> [get_ports {<port>}]`, per-bit aware.
