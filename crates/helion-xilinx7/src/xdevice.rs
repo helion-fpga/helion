@@ -5,9 +5,10 @@
 //! (`IOB_X1Y76`) and FASM-relative names (`IOB_Y1`).
 
 use crate::device::Device;
+use crate::db::parse::PpipKind;
 use crate::emit::EmitDevice;
 use crate::place::DeviceQuery;
-use crate::route::RouteQuery;
+use crate::route::{BufgTieoff, RouteQuery, RoutedPip};
 use std::collections::{HashMap, HashSet};
 
 /// Precomputed routing node maps, built once per [`Device`] by
@@ -67,6 +68,116 @@ impl<'a> XDevice<'a> {
         let tile = self.tile_name(ti)?.to_string();
         let wire = self.device.wires(ti)?.get(wi as usize)?.clone();
         Some((tile, wire))
+    }
+
+    /// Find the INT tile whose `IMUX{m}` wire is stitched (via tileconn
+    /// through the INT_INTERFACE tile) to the CLK_BUFG tile's `imux_wire`.
+    /// Returns `(int_tile_name, int_imux_wire_name)`.
+    fn int_imux_for(
+        &self,
+        clk_tile: &str,
+        imux_wire: &str,
+        site: &str,
+        pin: &str,
+    ) -> Result<(String, String), String> {
+        let err = |msg: String| format!("tieoff: {msg} (site `{site}` pin `{pin}`)");
+        let wid = self
+            .wire_id_of(clk_tile, imux_wire)
+            .ok_or_else(|| err(format!("no wire `{imux_wire}` on tile `{clk_tile}`")))?;
+        let nid = self
+            .wire_to_node
+            .get(wid as usize)
+            .copied()
+            .filter(|&n| n != u32::MAX)
+            .ok_or_else(|| {
+                err(format!(
+                    "wire `{clk_tile}`.`{imux_wire}` is not stitched to any INT tile"
+                ))
+            })?;
+        let members = self
+            .node_members
+            .get(&nid)
+            .ok_or_else(|| err(format!("no node members for `{clk_tile}`.`{imux_wire}`")))?;
+        // IMUX index, e.g. CLK_BUFG_IMUX4_0 -> "4".
+        let idx = imux_wire
+            .rsplit("IMUX")
+            .next()
+            .and_then(|s| s.split('_').next())
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .ok_or_else(|| err(format!("cannot parse IMUX index from `{imux_wire}`")))?;
+        let want = format!("IMUX{idx}");
+        for &m in members {
+            let (tname, wname) = self
+                .wire_name_of(m)
+                .ok_or_else(|| err(format!("bad wire id {m}")))?;
+            if wname != want {
+                continue;
+            }
+            let ti = self
+                .tile_idx(&tname)
+                .ok_or_else(|| err(format!("unknown tile `{tname}`")))?;
+            let ttype = self.device.tile_type_name(ti).unwrap_or("");
+            if ttype == "INT_L" || ttype == "INT_R" {
+                // The rails must come from a TIEOFF site in this tile.
+                let has_tieoff = self
+                    .device
+                    .tile(ti)
+                    .map(|t| t.sites.iter().any(|s| s.site_type == "TIEOFF"))
+                    .unwrap_or(false);
+                if !has_tieoff {
+                    return Err(err(format!("INT tile `{tname}` has no TIEOFF site")));
+                }
+                return Ok((tname, wname));
+            }
+        }
+        Err(err(format!(
+            "no INT tile stitched to `{clk_tile}`.`{imux_wire}`"
+        )))
+    }
+
+    /// GFAN wire in the INT tile that can carry GND into `imux`:
+    /// GND_WIRE -> GFANx -> IMUXm (GND has no direct IMUX pip).
+    fn gfan_for_imux(
+        &self,
+        int_tile: &str,
+        imux: &str,
+        site: &str,
+        pin: &str,
+    ) -> Result<String, String> {
+        for (gfan_dst, _, _) in RouteQuery::pips_from(self, int_tile, "GND_WIRE") {
+            if !gfan_dst.starts_with("GFAN") {
+                continue;
+            }
+            let drives_imux = RouteQuery::pips_from(self, int_tile, &gfan_dst)
+                .iter()
+                .any(|(d, _, _)| d == imux);
+            if drives_imux {
+                return Ok(gfan_dst);
+            }
+        }
+        Err(format!(
+            "tieoff: no GND_WIRE -> GFAN -> `{imux}` path in `{int_tile}` (site `{site}` pin `{pin}`)"
+        ))
+    }
+
+    /// Fail loudly unless `src -> dst` is a real pip in `tile`.
+    fn require_pip(
+        &self,
+        tile: &str,
+        src: &str,
+        dst: &str,
+        site: &str,
+        pin: &str,
+    ) -> Result<(), String> {
+        let ok = RouteQuery::pips_from(self, tile, src)
+            .iter()
+            .any(|(d, _, _)| d == dst);
+        if !ok {
+            return Err(format!(
+                "tieoff: no pip `{src}` -> `{dst}` in `{tile}` (site `{site}` pin `{pin}`)"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -206,6 +317,93 @@ impl<'a> RouteQuery for XDevice<'a> {
     fn is_clock_net(&self, net: &str) -> bool {
         self.clock_nets.contains(net)
     }
+
+    fn bufg_tieoff_pips(&self, site: &str) -> Result<BufgTieoff, String> {
+        // Control pin -> required constant for I0 -> O
+        // (UG472 Fig. 2-5, Table 2-3).
+        const TIE_HIGH: [&str; 3] = ["S0", "CE0", "IGNORE1"];
+        const TIE_LOW: [&str; 3] = ["S1", "CE1", "IGNORE0"];
+
+        let (tile_idx, site_idx) = self
+            .device
+            .site_by_name(site)
+            .ok_or_else(|| format!("tieoff: unknown site `{site}`"))?;
+        let tile_name = self
+            .tile_name(tile_idx)
+            .ok_or_else(|| format!("tieoff: no tile name for site `{site}`"))?
+            .to_string();
+        let tile_type = self
+            .device
+            .tile_type_name(tile_idx)
+            .ok_or_else(|| format!("tieoff: no tile type for site `{site}`"))?
+            .to_string();
+        let pins = self
+            .device
+            .site_pins(tile_idx, site_idx)
+            .ok_or_else(|| format!("tieoff: no pin data for site `{site}`"))?;
+        let ppips = self
+            .device
+            .ppips(&tile_type)
+            .ok_or_else(|| format!("tieoff: no ppips for tile type `{tile_type}`"))?;
+
+        // Pin wire -> IMUX wire from the tile type's always-ppips, e.g.
+        // CLK_BUFG_BOT_R.CLK_BUFG_R_BUFGCTRL0_S0.CLK_BUFG_IMUX4_0 always.
+        // The CLK_BUFG tile has no TIEOFF wires; the IMUX is stitched via
+        // tileconn (through the INT_INTERFACE tile) to an INT tile IMUX,
+        // which the INT tile's TIEOFF site drives via VCC_WIRE/GND_WIRE.
+        let imux_for_pin = |pin: &str| -> Result<String, String> {
+            let pin_wire = pins
+                .iter()
+                .find(|(pn, _)| pn == pin)
+                .map(|(_, w)| w.as_str())
+                .ok_or_else(|| format!("tieoff: site `{site}` has no pin `{pin}`"))?;
+            let prefix = format!("{tile_type}.{pin_wire}.");
+            ppips
+                .iter()
+                .filter(|p| p.kind == PpipKind::Always)
+                .find_map(|p| p.name.strip_prefix(&prefix).map(str::to_string))
+                .ok_or_else(|| {
+                    format!("tieoff: no always-ppip drives `{site}` pin `{pin}` ({pin_wire})")
+                })
+        };
+
+        let mut tieoff = BufgTieoff::default();
+        for pin in TIE_HIGH {
+            let imux_wire = imux_for_pin(pin)?;
+            let (int_tile, imux) =
+                self.int_imux_for(&tile_name, &imux_wire, site, pin)?;
+            // VCC_WIRE is the IMUX default select (default ppip: no config
+            // bits). Verify the pip exists in the INT tile's graph, then
+            // record it so the FASM documents the tie-high.
+            self.require_pip(&int_tile, "VCC_WIRE", &imux, site, pin)?;
+            tieoff.ones.push(RoutedPip {
+                tile: int_tile,
+                dst_wire: imux,
+                src_wire: "VCC_WIRE".to_string(),
+                is_pseudo: false,
+            });
+        }
+        for pin in TIE_LOW {
+            let imux_wire = imux_for_pin(pin)?;
+            let (int_tile, imux) =
+                self.int_imux_for(&tile_name, &imux_wire, site, pin)?;
+            // GND_WIRE has no direct IMUX pip: GND_WIRE -> GFANx -> IMUXm.
+            let gfan = self.gfan_for_imux(&int_tile, &imux, site, pin)?;
+            tieoff.zeros.push(RoutedPip {
+                tile: int_tile.clone(),
+                dst_wire: gfan.clone(),
+                src_wire: "GND_WIRE".to_string(),
+                is_pseudo: false,
+            });
+            tieoff.zeros.push(RoutedPip {
+                tile: int_tile,
+                dst_wire: imux,
+                src_wire: gfan,
+                is_pseudo: false,
+            });
+        }
+        Ok(tieoff)
+    }
 }
 
 impl<'a> EmitDevice for XDevice<'a> {
@@ -231,5 +429,71 @@ impl<'a> EmitDevice for XDevice<'a> {
         } else {
             Some(format!("{stype}_X{pos}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::default_db_root;
+    use std::sync::OnceLock;
+
+    fn test_z020() -> &'static (Device, NodeMaps) {
+        static CELL: OnceLock<(Device, NodeMaps)> = OnceLock::new();
+        CELL.get_or_init(|| {
+            let mut dev = Device::load_xc7z020(&default_db_root()).expect("load xc7z020");
+            let maps = build_node_map(&mut dev);
+            (dev, maps)
+        })
+    }
+
+    #[test]
+    fn bufg_tieoff_paths() {
+        let (dev, maps) = test_z020();
+        let xdev = XDevice::new(dev, maps.clone());
+        let tieoff = xdev
+            .bufg_tieoff_pips("BUFGCTRL_X0Y0")
+            .expect("tie-off for BUFGCTRL_X0Y0");
+        // All tie-offs land in the INT tile stitched to the CLK_BUFG tile.
+        assert_eq!(tieoff.ones.len(), 3, "S0, CE0, IGNORE1");
+        assert_eq!(tieoff.zeros.len(), 6, "S1, CE1, IGNORE0 x2 pips each");
+        for p in tieoff.ones.iter().chain(tieoff.zeros.iter()) {
+            assert!(
+                p.tile.starts_with("INT_R_") || p.tile.starts_with("INT_L_"),
+                "tie-off pip in INT tile, got {}",
+                p.tile
+            );
+            assert!(!p.is_pseudo);
+        }
+        // S0=1, CE0=1, IGNORE1=1 via VCC_WIRE -> IMUX.
+        let mut one_dsts: Vec<&str> =
+            tieoff.ones.iter().map(|p| p.dst_wire.as_str()).collect();
+        one_dsts.sort();
+        assert_eq!(one_dsts, ["IMUX20", "IMUX4", "IMUX8"]);
+        assert!(tieoff.ones.iter().all(|p| p.src_wire == "VCC_WIRE"));
+        // S1=0, CE1=0, IGNORE0=0 via GND_WIRE -> GFAN -> IMUX.
+        let mut zero_dsts: Vec<&str> =
+            tieoff.zeros.iter().map(|p| p.dst_wire.as_str()).collect();
+        zero_dsts.sort();
+        assert_eq!(
+            zero_dsts,
+            ["GFAN0", "GFAN0", "GFAN1", "IMUX0", "IMUX12", "IMUX16"],
+            "unexpected zero pips"
+        );
+        // The GFAN -> IMUX pairings: GFAN0 drives IMUX0 (S1) and IMUX16
+        // (CE1); GFAN1 drives IMUX12 (IGNORE0).
+        for p in &tieoff.zeros {
+            if p.src_wire == "GND_WIRE" {
+                assert!(p.dst_wire == "GFAN0" || p.dst_wire == "GFAN1");
+            } else {
+                match p.dst_wire.as_str() {
+                    "IMUX0" | "IMUX16" => assert_eq!(p.src_wire, "GFAN0"),
+                    "IMUX12" => assert_eq!(p.src_wire, "GFAN1"),
+                    other => panic!("unexpected zero dst {other}"),
+                }
+            }
+        }
+        // Unknown site fails loudly.
+        assert!(xdev.bufg_tieoff_pips("BUFGCTRL_X99Y99").is_err());
     }
 }

@@ -678,6 +678,13 @@ impl Device {
         self.types[id as usize].segbits.get(feature).map(Vec::as_slice)
     }
 
+    /// Pseudo-pips for a tile type, from `ppips_<type>.db`
+    /// (e.g. `INT_R.IMUX4.VCC_WIRE default`, `CLK_BUFG_BOT_R....S0.... always`).
+    pub fn ppips(&self, tile_type: &str) -> Option<&[Ppip]> {
+        let &id = self.type_ids.get(tile_type)?;
+        Some(self.types[id as usize].ppips.as_slice())
+    }
+
     /// Global wire id for `(tile, wire index)`.
     pub fn wire_id(&self, tile_idx: usize, wire_idx: u32) -> Option<u32> {
         self.tiles.get(tile_idx).map(|t| t.wire_base + wire_idx)
