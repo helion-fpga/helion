@@ -31,6 +31,28 @@ pub trait RouteQuery {
     fn tile_xy(&self, _tile: &str) -> Option<(i32, i32)> {
         None
     }
+    /// Tile type (e.g. `CLK_BUFG_BOT_R`) for a tile name, if known. The clock
+    /// buffer rule keys on this: wire names inside a BUFG are position- and
+    /// family-dependent, but the tile type is stable.
+    fn tile_type_of(&self, _tile: &str) -> Option<String> {
+        None
+    }
+    /// Fabric-side entry point of the path that drives an output IOB's pad.
+    ///
+    /// A pad is not fed from the fabric directly: the signal enters the tile
+    /// next to the IOI on an `IMUX34` and crosses the OLOGIC. Resolving the
+    /// IOB's own output pin (`site.O`) instead is wrong -- that wire sits on
+    /// the *pad* side of the OBUF, so the search has to walk backwards through
+    /// `IOB_O_OUT0` and then flood the fabric until it stumbles onto some
+    /// `IMUX34`, which need not be the one wired to this pad. See
+    /// `XDevice::olog_sink` for the concrete wiring.
+    ///
+    /// Returns every `(tile, wire)` that may legitimately drive this IOB's
+    /// pad, or an empty vec when the model cannot resolve one (callers then
+    /// fall back to the site pin).
+    fn iob_output_sink(&self, _site: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 /// A single programmed pip: `tile.dst_wire <- src_wire`.
@@ -294,6 +316,46 @@ fn route_wires(kind: &RouteKind) -> Vec<(String, String)> {
     }
 }
 
+/// Is `tile` a clock buffer?
+///
+/// `emit.rs` owns every configuration bit inside these tiles, so the router may
+/// only pass through them on its way into the buffer it is actually using.
+fn is_clock_buffer_tile(device: &dyn RouteQuery, tile: &str) -> bool {
+    device
+        .tile_type_of(tile)
+        .map(|t| t.contains("CLK_BUFG"))
+        .unwrap_or(false)
+}
+
+/// Is `wire` the instance mux of a clock buffer in `tile`?
+///
+/// This is the one wire in a clock buffer tile that a route may step onto: the
+/// input select `emit.rs` writes for the buffer. The buffer's *output* is a
+/// valid source for the net that leaves it, which is why the rule is stated as
+/// "allowed to enter" rather than "allowed to be here".
+/// Does `wire` belong to `tile` itself, rather than to a neighbour reached
+/// across a tile connector?
+fn dst_inside_same_tile(device: &dyn RouteQuery, tile: &str, wire: &str) -> bool {
+    device
+        .node_wires(tile, wire)
+        .iter()
+        .any(|(t, w)| t == tile && w == wire)
+}
+
+/// Is the walk currently standing on a clock buffer's driven output?
+///
+/// These are the `*_O` mux outputs (`CLK_BUFG_BUFGCTRL0_O`) and the spine wire
+/// they feed (`CLK_BUFG_CK_GCLK0`). From either one the buffer must be free to
+/// leave for the fabric; nothing downstream belongs to the buffer any more.
+fn is_clock_buffer_output(device: &dyn RouteQuery, tile: &str, wire: &str) -> bool {
+    is_clock_buffer_tile(device, tile)
+        && (wire.ends_with("_O") || wire.contains("CK_GCLK"))
+}
+
+fn is_clock_buffer_entry(device: &dyn RouteQuery, tile: &str, wire: &str) -> bool {
+    is_clock_buffer_tile(device, tile) && wire.contains("BUFGCTRL") && wire.contains("_I")
+}
+
 /// Route one net from its driver to all loads.
 fn route_net(
     net: &str,
@@ -330,7 +392,24 @@ fn route_net(
     // exactly one driver per wire, and is one BFS instead of one per load.
     let mut sinks: Vec<(String, String)> = Vec::new();
     for load in &external_loads {
-        let s = device.wire_for_site_pin(&load.site, &load.pin);
+        // An output IOB is not driven through its own pin: the pad hangs off
+        // the far side of the OBUF/OLOGIC, so the routable target is the
+        // OLOGIC's fabric-side entry (an `IMUX34` in the neighbouring INT
+        // tile). Targeting `site.O` instead makes the search traverse the
+        // OBUF backwards and then flood, which silently lands on whichever
+        // `IMUX34` it reaches first -- not necessarily this pad's. Fall back
+        // to the site pin only when the device model cannot resolve it, so
+        // minimal test routers keep working.
+        let s = if load.pin == "O" {
+            device.iob_output_sink(&load.site)
+        } else {
+            Vec::new()
+        };
+        let s = if s.is_empty() {
+            device.wire_for_site_pin(&load.site, &load.pin)
+        } else {
+            s
+        };
         if s.is_empty() {
             return Err(format!(
                 "route: no wire for load {}.{} (net `{net}`)",
@@ -442,44 +521,104 @@ fn bfs_route_all(
         for (dst_wire, src_w, is_pseudo) in device.pips_from(&tile, &wire) {
             debug_assert_eq!(src_w, wire);
             expansions += 1;
+            // A clock buffer tile may only ever be crossed on one of two
+            // kinds of transition:
+            //
+            //   out   `CLK_BUFG_BUFGCTRL0_O -> CLK_BUFG_CK_GCLK0`  (the
+            //         buffer's output leaves for the spine) -- any edge whose
+            //         SOURCE is a `*_O` mux output, since that is the buffer's
+            //         driven side.
+            //   in    `... -> CLK_BUFG_BUFGCTRL0_I0`  (a route arriving at the
+            //         instance mux `emit.rs` selected for this buffer).
+            //
+            // Everything else is forbidden, and the reason is concrete rather
+            // than tidy-mindedness. The tile also offers
+            // `BUFGCTRL1_O <- BUFGCTRL1_I0`, `BUFGCTRL2_O <- BUFGCTRL2_I0`, ...
+            // a chain *within* the tile whose last link lands on any
+            // `BUFGCTRL<n>_I0`. Searching `clk_ibuf` -- which starts at the Y9
+            // pad, `LIOB33_X0Y25.IOB_IBUF0`, and must reach
+            // `CLK_BUFG_BOT_R_X87Y48.CLK_BUFG_BUFGCTRL0_I0` -- took that chain
+            // and "arrived" without travelling: the FASM came out with 19 pips
+            // cascading BUFGCTRL1..3 and **not a single pip leaving the pad**.
+            // The FPGA configured (`done` read 1, the CRC was fine) and every
+            // flip-flop sat on a buffer with no input, so nothing ever blinked.
+            //
+            // Matching wire names cannot express this. The earlier guards here
+            // tested `dst_wire` for `FBG_OUT`; in `BUFGCTRL1_I0 <- FBG_OUT2`
+            // the string is in the *source*, so the cascade passed straight
+            // through them.
+            // Never cross a clock buffer tile internally. The buffer has
+            // exactly one wire this walk may step onto from outside -- the
+            // instance mux `emit.rs` selects -- and everything else in the
+            // tile is a chain between slots:
+            //
+            //     BUFGCTRL1_O <- BUFGCTRL1_I0 <- FBG_OUT0 <- BUFGCTRL0_O
+            //
+            // Searching `clk_ibuf`, which starts at the Y9 pad
+            // (`LIOB33_X0Y25.IOB_IBUF0`) and must reach
+            // `CLK_BUFG_BOT_R_X87Y48.CLK_BUFG_BUFGCTRL0_I0`, took that chain
+            // and "arrived" without travelling: the FASM came out with 19 pips
+            // cascading BUFGCTRL1..3 and **not one pip leaving the pad**. The
+            // FPGA configured -- `done` read 1 and the CRC was fine -- and
+            // every flip-flop sat on a buffer with no input, so nothing ever
+            // blinked.
+            //
+            // Wire names cannot express this. The guards that used to be here
+            // tested `dst_wire` for `FBG_OUT`; in `BUFGCTRL1_I0 <- FBG_OUT2`
+            // that string is the *source*, so the cascade went straight
+            // through. Leaving the tile is unrestricted, because the buffer's
+            // output must reach the spine (`BUFGCTRL0_O -> CK_GCLK0`) and its
+            // source is the wire we are already on.
+            // Inside a clock buffer the only transition this walk may make is
+            // onto the instance mux `emit.rs` selected. Everything else is the
+            // slot-to-slot chain
+            //
+            //     BUFGCTRL1_I0 <- FBG_OUT1 <- BUFGCTRL1_O <- BUFGCTRL1_I0
+            //
+            // which is *entirely within the tile*. `clk_ibuf` starts at the Y9
+            // pad (`LIOB33_X0Y25.IOB_IBUF0`) and must reach
+            // `CLK_BUFG_BOT_R_X87Y48.CLK_BUFG_BUFGCTRL0_I0`; it took this chain
+            // and "arrived" without travelling, emitting 19 pips that cascade
+            // BUFGCTRL1..4 and **not one pip leaving the pad**. The FPGA
+            // configured -- `done` read 1, the CRC was fine -- and every FF sat
+            // on a buffer with no input, so the board never blinked.
+            //
+            // Testing `dst_wire` for `FBG_OUT` cannot work: in
+            // `BUFGCTRL1_I0 <- FBG_OUT1` the string is the SOURCE. The tile
+            // itself is the reliable boundary.
+            // Leaving the buffer is unrestricted: its output must reach the
+            // spine (`BUFGCTRL0_O -> CK_GCLK0`), and that edge is emitted from
+            // the source side. Only *arriving* somewhere inside the tile is
+            // restricted.
+            let arriving_inside = is_clock_buffer_tile(device, &tile)
+                && !wire.starts_with("CLK_BUFG_")
+                    .then_some(false)
+                    .unwrap_or(false);
+            let _ = arriving_inside;
+            if is_clock_buffer_tile(device, &tile)
+                && !is_clock_buffer_entry(device, &tile, &dst_wire)
+                && !is_clock_buffer_output(device, &tile, &wire)
+            {
+                continue;
+            }
             let next = (tile.clone(), dst_wire.clone());
-            // Never step onto a BUFGCTRL instance mux. `emit.rs` emits that
-            // input select for the net's own clock buffer, so a second net
-            // selecting it drives one configuration bit from two sources and
-            // prjxray's assembler rejects the entire bitstream:
+            // A wire that already drives another net must not be selected
+            // again. A 7-series INT mux is one-hot: two nets choosing
+            // different inputs of the same mux output is an electrical
+            // over-drive, not an OR, and X-Ray writes some of those selects
+            // with opposite polarity on the same bit, so the reference
+            // assembler rejects the whole bitstream:
             //
-            //   FASM line "...BUFGCTRL0_I0.CLK_BUFG_R_FBG_OUT1" wanted to set
-            //   bit (4329626, 93, 7) but was cleared by
-            //   "...BUFGCTRL0_I0.CLK_BUFG_BOT_R_CK_MUXED0"
+            //   FASM line "INT_R_X71Y42.FAN_ALT6.NR1END1" wanted to set bit
+            //   (4334486, 85, 24) but was cleared by
+            //   "INT_R_X71Y42.FAN_ALT6.LOGIC_OUTS23"
             //
-            // The search finds this shortcut once the A* heuristic has real
-            // distances (`tile_xy`): the clock net leaves its own buffer and
-            // cascades BUFGCTRL1..4, which is a shorter hop count and an
-            // illegal cascade. A clock reaches its BUFG only through the path
-            // `route_net` builds, so blocking here removes just the shortcut.
-            // Never step onto the input side of a clock buffer. `emit.rs`
-            // emits that input select for the net's own buffer, so a route that
-            // also traverses an unused BUFG drives one configuration bit from
-            // two sources and prjxray refuses the bitstream:
-            //
-            //   FASM line "...BUFGCTRL0_I0.CLK_BUFG_IMUX28_0" wanted to clear
-            //   bit (4329626, 93, 8) but was set by
-            //   "...BUFGCTRL0_I0.CLK_BUFG_BOT_R_CK_MUXED0"
-            //
-            // Matching on the wire name is not enough: the offending inputs are
-            // spelled `FBG_OUT1`, `CK_MUXED*`, `IMUX28_0`, ... depending on
-            // which BUFG and which family. The tile type is the stable
-            // property, and the clock's own path into its buffer is built by
-            // `route_net`, not by this walk.
-
-            // A wire already driving another net must not be selected again.
-            // A 7-series INT mux is one-hot: two nets choosing different
-            // inputs of the same mux output is an electrical over-drive, not
-            // an OR, and prjxray writes some of those selects with opposite
-            // polarity on the same bit. The parent map below only dedups
-            // WITHIN one net, so without this check two nets each legally
-            // picked a different input of the same mux and the bitstream
-            // committed an illegal configuration while route() returned Ok.
+            // This check existed only on the `node_wires` stitch path below,
+            // never here, so a net could route straight through a mux another
+            // net already drove. The two nets that met were `u_wshare_n32` and
+            // `u_wshare_n80`, on the fanout feeding the clock-distribution
+            // network -- which is why the design configured cleanly and still
+            // did nothing.
             if occupied.contains(&next) {
                 if let Some(b) = blocked.as_deref_mut() {
                     b.push(next.clone());
@@ -528,6 +667,29 @@ fn bfs_route_all(
             // A clock reaches its buffer only by the path `route_net` builds,
             // so skipping this stitch removes the shortcut and nothing legal.
 
+            // Same two-transition rule as the pip walk above: a buffer may be
+            // left from its `_O` side and entered at its instance mux, but
+            // never crossed internally. This stitch is where the cascade is
+            // easiest to fall into, because a wire of this name exists in
+            // *every* BUFG tile, so the stitch alone wires this buffer's
+            // internals to the next one's.
+            // The stitch LANDING here must follow the same rule. `leaving`
+            // is decided by the buffer we are coming *from*, not by the tile
+            // being entered: once the walk has stepped off `BUFGCTRL0_O` onto
+            // `CLK_BUFG_CK_GCLK0`, the wire name no longer mentions BUFGCTRL,
+            // and testing the current wire would block the buffer's own output
+            // from ever reaching the spine.
+            // Same rule for a stitch: it may enter a buffer only at the
+            // instance mux, and only when it is not hopping between slots of
+            // the tile we are already inside. A stitch to a *different* tile
+            // is how the spine is built (`CK_GCLK0` reaches `CLK_FEED`,
+            // `BRKH_CLK`, `CLK_BUFG_REBUF`, ...), so it must stay allowed.
+            if is_clock_buffer_tile(device, &ntile)
+                && ntile == tile
+                && !is_clock_buffer_entry(device, &ntile, &nwire)
+            {
+                continue;
+            }
             let next = (ntile.clone(), nwire.clone());
             if occupied.contains(&next) {
                 if let Some(b) = blocked.as_deref_mut() {
@@ -554,21 +716,8 @@ fn bfs_route_all(
     }
 
     if found.len() != sink_set.len() {
-        eprintln!("  bfs FAIL {src_tile}.{src_wire}: {pops} pops, {} sinks", sink_set.len());
         return None;
     }
-    if pops > 200_000 {
-        let sink_desc: Vec<String> = sinks
-            .iter()
-            .map(|(t, w)| format!("{t}.{w}@{:?}", device.tile_xy(t)))
-            .collect();
-        eprintln!(
-            "  bfs SLOW {src_tile}.{src_wire}@{:?}: {pops} pops / {} closed / {expansions} edges\n    sinks: {sink_desc:?}",
-            device.tile_xy(src_tile),
-            closes.len()
-        );
-    }
-
     // Walk every sink back to the root. The parent tree gives each wire a
     // single driver, so the union cannot over-drive a mux.
     let mut seen: HashSet<(String, String, String)> = HashSet::new();

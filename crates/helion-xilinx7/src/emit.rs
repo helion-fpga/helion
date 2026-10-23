@@ -31,6 +31,13 @@ pub trait EmitDevice {
     /// emitter fail loudly instead of writing a FASM line that no
     /// `segbits_*.db` can resolve.
     fn ologic_feature_available(&self, ioi_tile: &str, site: &str, feature: &str) -> bool;
+
+    /// Whether `segbits_<type>.db` defines `FEATURE` for `site` on the IOB
+    /// tile `iob_tile`. Used for the termination defaults (`PULLTYPE.NONE`,
+    /// `IN_TERM.NONE`), which exist on full `RIOB33`/`LIOB33` tiles but not on
+    /// the `*_SING` variants. Returning `false` skips the line rather than
+    /// emitting FASM that no segbits file can resolve.
+    fn iob_feature_available(&self, iob_tile: &str, site: &str, feature: &str) -> bool;
 }
 
 /// IBUF `.IN` feature prefix for an IOSTANDARD, from
@@ -46,11 +53,13 @@ fn ibuf_in_prefix(iostandard: &str) -> Result<&'static str, String> {
     }
 }
 
-/// OBUF `.DRIVE` feature prefix for an (IOSTANDARD, DRIVE) pair, from
-/// `segbits_liob33.db`. Xilinx groups standards that share drive-strength
-/// bits; the prefix is NOT always the bare standard name. Unknown
-/// combinations are a loud error, not a guessed feature.
-fn obuf_drive_prefix(iostandard: &str, drive: &str) -> Result<&'static str, String> {
+/// OBUF `.DRIVE` feature prefix AND suffix for an (IOSTANDARD, DRIVE) pair,
+/// from `segbits_liob33.db`. Xilinx groups standards that share drive-strength
+/// bits; the prefix is NOT always the bare standard name, and the suffix is
+/// the exact set of strengths that row covers (`I12_I16`, not `I16`), because
+/// the row name is the only spelling the segbits DB defines. Returns
+/// `(prefix, suffix)`; unknown combinations are a loud error, not a guess.
+fn obuf_drive_feature(iostandard: &str, drive: &str) -> Result<(&'static str, &'static str), String> {
     let std = iostandard.to_ascii_uppercase();
     let drv = drive.to_ascii_uppercase();
     let prefix = match (std.as_str(), drv.as_str()) {
@@ -64,10 +73,27 @@ fn obuf_drive_prefix(iostandard: &str, drive: &str) -> Result<&'static str, Stri
         ("LVCMOS25", "I12" | "I16") => "LVCMOS25",
         ("LVCMOS25", "I4") => "LVCMOS15_LVCMOS18_LVCMOS25",
         ("LVCMOS25", "I8") => "LVCMOS12_LVCMOS25",
-        ("LVCMOS33", "I16") => "LVCMOS33",
-        ("LVCMOS33", "I4" | "I12") => "LVCMOS33_LVTTL",
+        // `LVCMOS33.DRIVE.I16` MUST NOT be used for an output pad: on
+        // `IOB_Y0` it asserts `38_118` / `39_117` instead of clearing
+        // `38_118` and asserting `38_126` / `39_125`, and `38_118` is shared
+        // with the `IN_ONLY` feature that disables the output driver. The pad
+        // then configures, `done` reads 1, and the pin never moves.
+        //
+        // Bit evidence (segbits_riob33.db, IOB_Y0):
+        //   `LVCMOS33.DRIVE.I16` =
+        //     38_64 !38_74 !38_76 !38_98 !38_100 !38_102 !38_112 38_118
+        //     !38_126 39_65 !39_75 !39_97 !39_101 39_117 !39_119 !39_125 39_127
+        //   `LVCMOS33_LVTTL.DRIVE.I12_I16` =
+        //     38_64 !38_74 !38_76 !38_98 !38_100 !38_102 !38_112 !38_118
+        //     38_126 39_65 !39_75 !39_97 !39_101 !39_117 !39_119 39_125 39_127
+        // Ground truth: a real Vivado bitstream for an LVCMOS33 output pad
+        // (prjxray-db/artix7/harness/arty-a7/swbut/design.bit, tile
+        // RIOB33_X43Y51) emits `LVCMOS33_LVTTL.DRIVE.I12_I16`. Every
+        // LVCMOS33 strength X-Ray models (I4/I12/I16) lives on a row of the
+        // shared LVCMOS33_LVTTL group.
+        ("LVCMOS33", "I4" | "I12" | "I16") => "LVCMOS33_LVTTL",
         ("LVTTL", "I24") => "LVTTL",
-        ("LVTTL", "I4" | "I12") => "LVCMOS33_LVTTL",
+        ("LVTTL", "I4" | "I12" | "I16") => "LVCMOS33_LVTTL",
         ("LVDS_25", "I") => "LVDS_25",
         ("SSTL135", "I") => "SSTL135",
         ("TMDS_33", "I") => "TMDS_33",
@@ -77,7 +103,38 @@ fn obuf_drive_prefix(iostandard: &str, drive: &str) -> Result<&'static str, Stri
             ))
         }
     };
-    Ok(prefix)
+    // The suffix is the row's full strength set. For the shared groups the
+    // requested strength is a member of that set, so name the row exactly.
+    // Every arm returns a 'static literal so the pair can be returned by value.
+    let suffix = match (prefix, drv.as_str()) {
+        ("LVCMOS33_LVTTL", "I8") => "I12_I8",
+        ("LVCMOS33_LVTTL", _) => "I12_I16",
+        ("LVCMOS12", "I4") => "I4",
+        ("LVCMOS12", _) => "I12",
+        ("LVCMOS12_LVCMOS25", _) => "I8",
+        ("LVCMOS15", "I8") => "I8",
+        ("LVCMOS15", _) => "I12",
+        ("LVCMOS15_LVCMOS18_LVCMOS25", _) => "I4",
+        ("LVCMOS15_SSTL15", _) => "I16_I_FIXED",
+        ("LVCMOS18", "I12") => "I12_I8",
+        ("LVCMOS18", "I24") => "I24",
+        ("LVCMOS18", _) => "I16",
+        ("LVCMOS25", "I12") => "I12",
+        ("LVCMOS25", _) => "I16",
+        ("LVTTL", _) => "I24",
+        // Fixed-strength / differential standards: the segbits suffix is the
+        // bare `I`, e.g. `RIOB33.IOB_Y0.LVDS_25.DRIVE.I` and
+        // `RIOB33.IOB_Y0.SSTL135.DRIVE.I_FIXED`. `LVDS_25`/`TMDS_33` only
+        // define a DRIVE row on the master site IOB_Y0.
+        ("LVDS_25" | "TMDS_33", _) => "I",
+        ("SSTL135", _) => "I_FIXED",
+        _ => {
+            return Err(format!(
+                "emit: no DRIVE suffix for (IOSTANDARD, DRIVE) = ({iostandard}, {drive})"
+            ))
+        }
+    };
+    Ok((prefix, suffix))
 }
 
 /// Backend-owned bitstream: FASM text plus assembled configuration frames.
@@ -178,19 +235,37 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                     "{}.{}.LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVDS_25_LVTTL_SSTL135_SSTL15_TMDS_33.IN_ONLY",
                     iob.tile, site_rel
                 ));
+                // Terminations, exactly as for an output pad. An input pad
+                // needs them just as much: without `PULLTYPE.NONE` the IOB
+                // keeps its power-on pull-down, which loads a driven input
+                // and visibly degrades it. On the ZedBoard 100 MHz clock pin
+                // (Y9 -> LIOB33_X0Y25.IOB_Y0) that was the difference between
+                // a working clock and a dead design: a real Vivado bitstream
+                // for this board carries `PULLTYPE.NONE` there, and we did
+                // not. Ground truth, tile LIOB33_X0Y25 of
+                // ~/CDA4253_A1/blinky.bit: IOB_Y0 has
+                // `IN_TERM.NONE` + `PULLTYPE.NONE` + `SLEW.FAST` + `IN`.
+                //
+                // `SLEW` is deliberately NOT emitted here: it selects the
+                // output driver's edge rate and an input-only pad has no
+                // driver to shape. Vivado does set SLEW.FAST on this pin, but
+                // that is its 3.3 V input default rather than something the
+                // clock needs, and inventing it would be guessing.
+                for feat in ["PULLTYPE.NONE", "IN_TERM.NONE"] {
+                    if device.iob_feature_available(&iob.tile, &site_rel, feat) {
+                        lines.push(format!("{}.{}.{}", iob.tile, site_rel, feat));
+                    }
+                }
             }
             IobDir::Out => {
                 // OBUF: output driver enabled by DRIVE select (no IN_ONLY).
                 // The DRIVE feature prefix depends on the (standard, drive)
                 // pair (see obuf_drive_prefix).
                 let drive = p.drive.as_deref().unwrap_or("I16");
-                let prefix = obuf_drive_prefix(&p.iostandard, drive)?;
+                let (prefix, suffix) = obuf_drive_feature(&p.iostandard, drive)?;
                 lines.push(format!(
                     "{}.{}.{}.DRIVE.{}",
-                    iob.tile,
-                    site_rel,
-                    prefix,
-                    drive.to_ascii_uppercase()
+                    iob.tile, site_rel, prefix, suffix
                 ));
                 let slew = p.slew.as_deref().unwrap_or("SLOW");
                 lines.push(format!(
@@ -199,6 +274,22 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                     site_rel,
                     slew.to_ascii_uppercase()
                 ));
+                // Terminations. Ground truth: a real Vivado bitstream for a
+                // plain LVCMOS33 output pad always carries both of these on
+                // every IOB of the tile (see
+                // prjxray-db/artix7/harness/arty-a7/swbut/design.bit, tile
+                // RIOB33_X43Y51: `PULLTYPE.NONE` and `IN_TERM.NONE` appear for
+                // IOB_Y0 and IOB_Y1). They are not decorative: without
+                // `PULLTYPE.NONE` the IOB keeps its default pull-up, and
+                // without `IN_TERM.NONE` the unterminated-input bits are left
+                // at 0, which on IOB_Y1 asserts `IN_TERM.UNTUNED_SPLIT_40`.
+                // Emit them only where the DB defines them, so tiles whose
+                // segbits lack the row keep working.
+                for feat in ["PULLTYPE.NONE", "IN_TERM.NONE"] {
+                    if device.iob_feature_available(&iob.tile, &site_rel, feat) {
+                        lines.push(format!("{}.{}.{}", iob.tile, site_rel, feat));
+                    }
+                }
                 // Connect the fabric to the OBUF through the paired OLOGIC.
                 //
                 // X-Ray models the path as:
@@ -221,7 +312,13 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                 // reachable pins on a RIOI3_SING tile.
                 if let Some(ioi) = device.ioi_tile_for(&iob.tile) {
                     let ologic = site_rel.replacen("IOB_", "OLOGIC_", 1);
-                    for feat in ["OMUX.D1", "OQUSED"] {
+                    // `OSERDES.DATA_RATE_TQ.BUF` is the third row a real
+                    // Vivado bitstream always carries on a used OLOGIC: it
+                    // selects the buffered (non-DDR, non-SDR) tri-state path.
+                    // Ground truth, tile RIOI3_X43Y51 of
+                    // prjxray-db/artix7/harness/arty-a7/swbut/design.bit:
+                    // bits 32_66=1, 32_70=0, 33_69=0 -- exactly BUF.
+                    for feat in ["OMUX.D1", "OQUSED", "OSERDES.DATA_RATE_TQ.BUF"] {
                         // Emit only where the DB defines it; elsewhere the
                         // connection is already hardwired in silicon.
                         if device.ologic_feature_available(&ioi, &ologic, feat) {
@@ -454,7 +551,35 @@ fn clock_companions(tile_type: &str, dst: &str, src: &str) -> Vec<String> {
         } else if src.starts_with("CLK_HROW_") && src.contains("_CK_GCLK") {
             out.push(format!("{src}_ACTIVE"));
         }
-    } else if tile_type == "HCLK_R" {
+        // The HROW stage is `CLK_HROW_CK_MUX_OUT_{L,R}<n>` (the mux) feeding
+        // the BUFHCE that actually drives the spine. The mux alone is not
+        // enough: the BUFHCE has its own `IN_USE` enable, and without it the
+        // branch is configured but muted. Check BOTH wires, because the mux
+        // appears as `dst` for the pip that leaves it and as `src` for the
+        // pip that follows.
+        // Index `n` pairs the two (verified in segbits_clk_hrow_bot_r.db:
+        // `MUX_OUT_R8` is word 26_364/27_363 and `BUFHCE_X1Y8` is
+        // 27_358/27_359/26_355/27_355), so derive it rather than hardcoding.
+        if let Some(n) = hrow_mux_index(dst).or_else(|| hrow_mux_index(src)) {
+            out.push(format!("BUFHCE.BUFHCE_X1Y{n}.IN_USE"));
+            out.push(format!("BUFHCE.BUFHCE_X1Y{n}.ZINV_CE"));
+        }
+    } else if tile_type == "HCLK_R" || tile_type == "HCLK_L" {
+        // The ENABLE_BUFFER bit is REQUIRED, not decorative: it gates the
+        // horizontal clock buffer that feeds the leaf clock spine. Emitting
+        // only `HCLK_LEAF_CLK_B_TOPL5.HCLK_CK_BUFHCLK<n>` (the selection)
+        // leaves the buffer disabled, so the global clock reaches the HROW
+        // mux and then stops -- every FF on that spine keeps its init value.
+        //
+        // The left arm was missing entirely, and a left-side clock is exactly
+        // what a ZedBoard has: the 100 MHz GCLK enters on Y9 ->
+        // LIOB33_X0Y25 (left edge) -> HCLK_L. So the one board this backend
+        // targets was the one case that never got its buffer enabled.
+        // Ground truth, tile HCLK_L_X174Y26 of the working Vivado bitstream
+        // ~/CDA4253_A1/blinky.bit: `ENABLE_BUFFER.HCLK_CK_BUFHCLK8` present.
+        // The two tile types have identical segbit shapes
+        // (`ENABLE_BUFFER.HCLK_CK_BUFHCLK<n>`; see segbits_hclk_{l,r}.db),
+        // so one arm covers both.
         if src.starts_with("HCLK_CK_BUFHCLK") {
             out.push(format!("ENABLE_BUFFER.{src}"));
         }
@@ -462,9 +587,16 @@ fn clock_companions(tile_type: &str, dst: &str, src: &str) -> Vec<String> {
     out
 }
 
+/// Index of a `CLK_HROW_CK_MUX_OUT_{L,R}<n>` wire, which selects the matching
+/// `BUFHCE` instance in the same HROW tile.
+fn hrow_mux_index(wire: &str) -> Option<u32> {
+    let rest = wire.strip_prefix("CLK_HROW_CK_MUX_OUT_")?;
+    let rest = rest.strip_prefix('L').or_else(|| rest.strip_prefix('R'))?;
+    rest.parse().ok()
+}
+
 /// Numeric index in the first `GCLK<digits>` of `wire`.
-fn gclk_index(wire: &str) -> Option<u32> {
-    let start = wire.find("GCLK")? + "GCLK".len();
+fn gclk_index(wire: &str) -> Option<u32> {    let start = wire.find("GCLK")? + "GCLK".len();
     let digits: String = wire[start..]
         .chars()
         .take_while(|c| c.is_ascii_digit())
@@ -616,6 +748,10 @@ mod tests {
         fn ologic_feature_available(&self, _ioi: &str, _site: &str, _feature: &str) -> bool {
             true
         }
+
+        fn iob_feature_available(&self, _iob: &str, _site: &str, _feature: &str) -> bool {
+            true
+        }
     }
 
     fn routed_blinky() -> Routed7 {
@@ -667,7 +803,28 @@ mod tests {
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.ALUT.INIT[63:0] = 64'h5555555555555555"), "got:\n{text}");
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZINI"), "got:\n{text}");
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFFMUX.AX"), "got:\n{text}");
-        assert!(text.contains("RIOB33_X0Y0.IOB_Y1.LVCMOS33.DRIVE.I16"), "got:\n{text}");
+        // Ground-truth output pad. A real Vivado bitstream for an LVCMOS33
+        // output (prjxray-db/artix7/harness/arty-a7/swbut/design.bit, tile
+        // RIOB33_X43Y51) carries exactly these on each IOB of the tile. The
+        // drive row is the shared LVCMOS33_LVTTL one: `LVCMOS33.DRIVE.I16`
+        // also asserts the IN_ONLY bit 39_09 and would hold the driver off.
+        assert!(
+            text.contains("RIOB33_X0Y0.IOB_Y1.LVCMOS33_LVTTL.DRIVE.I12_I16"),
+            "got:\n{text}"
+        );
+        assert!(text.contains("RIOB33_X0Y0.IOB_Y1.PULLTYPE.NONE"), "got:\n{text}");
+        assert!(text.contains("RIOB33_X0Y0.IOB_Y1.IN_TERM.NONE"), "got:\n{text}");
+        assert!(
+            text.contains("RIOB33_X0Y0.IOB_Y1.LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVTTL_SSTL135_SSTL15.SLEW.SLOW"),
+            "got:\n{text}"
+        );
+        // And the OLOGIC side, also from the same reference bitstream.
+        assert!(text.contains("RIOI3_X0Y0.OLOGIC_Y1.OMUX.D1"), "got:\n{text}");
+        assert!(text.contains("RIOI3_X0Y0.OLOGIC_Y1.OQUSED"), "got:\n{text}");
+        assert!(
+            text.contains("RIOI3_X0Y0.OLOGIC_Y1.OSERDES.DATA_RATE_TQ.BUF"),
+            "got:\n{text}"
+        );
     }
 
     #[test]
@@ -746,7 +903,11 @@ mod tests {
                 "CLK_HROW_CK_MUX_OUT_R0",
                 "CLK_HROW_CK_IN_L0"
             ),
-            vec!["CLK_HROW_CK_IN_L0_ACTIVE"]
+            vec![
+                "CLK_HROW_CK_IN_L0_ACTIVE",
+                "BUFHCE.BUFHCE_X1Y0.IN_USE",
+                "BUFHCE.BUFHCE_X1Y0.ZINV_CE"
+            ]
         );
         assert_eq!(
             clock_companions(
@@ -754,11 +915,66 @@ mod tests {
                 "CLK_HROW_CK_MUX_OUT_R0",
                 "CLK_HROW_R_CK_GCLK0"
             ),
-            vec!["CLK_HROW_R_CK_GCLK0_ACTIVE"]
+            vec![
+                "CLK_HROW_R_CK_GCLK0_ACTIVE",
+                "BUFHCE.BUFHCE_X1Y0.IN_USE",
+                "BUFHCE.BUFHCE_X1Y0.ZINV_CE"
+            ]
         );
         assert_eq!(
             clock_companions("HCLK_R", "", "HCLK_CK_BUFHCLK0"),
             vec!["ENABLE_BUFFER.HCLK_CK_BUFHCLK0"]
+        );
+    }
+
+    #[test]
+    fn clock_companions_enable_bufhce_on_hrow() {
+        // The HROW stage is a mux (`MUX_OUT_R<n>`) feeding a BUFHCE that
+        // actually drives the spine. Emitting only the mux leaves the buffer
+        // disabled: the clock reaches the mux and stops, so every FF keeps its
+        // init value. `n` must be derived from the mux, not hardcoded.
+        // The mux arrives as `dst` (the pip that leaves it) and as `src`
+        // (the pip that follows); both must yield the enable.
+        assert_eq!(
+            clock_companions("CLK_HROW_BOT_R", "CLK_HROW_CK_MUX_OUT_R8", "X"),
+            vec!["BUFHCE.BUFHCE_X1Y8.IN_USE", "BUFHCE.BUFHCE_X1Y8.ZINV_CE"]
+        );
+        assert_eq!(
+            clock_companions("CLK_HROW_BOT_R", "X", "CLK_HROW_CK_MUX_OUT_R9"),
+            vec!["BUFHCE.BUFHCE_X1Y9.IN_USE", "BUFHCE.BUFHCE_X1Y9.ZINV_CE"]
+        );
+        assert_eq!(
+            clock_companions("CLK_HROW_TOP_R", "CLK_HROW_CK_MUX_OUT_L3", "X"),
+            vec!["BUFHCE.BUFHCE_X1Y3.IN_USE", "BUFHCE.BUFHCE_X1Y3.ZINV_CE"]
+        );
+    }
+
+    #[test]
+    fn hrow_mux_index_parses_both_sides() {
+        assert_eq!(hrow_mux_index("CLK_HROW_CK_MUX_OUT_R0"), Some(0));
+        assert_eq!(hrow_mux_index("CLK_HROW_CK_MUX_OUT_R11"), Some(11));
+        assert_eq!(hrow_mux_index("CLK_HROW_CK_MUX_OUT_L7"), Some(7));
+        assert_eq!(hrow_mux_index("CLK_HROW_CK_IN_L7"), None);
+        assert_eq!(hrow_mux_index("HCLK_CK_BUFHCLK9"), None);
+    }
+
+    #[test]
+    fn clock_companions_enable_left_side_hclk() {
+        // A left-edge clock (the ZedBoard 100 MHz GCLK on Y9) enters through
+        // HCLK_L. Only HCLK_R had an arm, so the horizontal clock buffer was
+        // never enabled and the clock died at HROW. Both tile types carry an
+        // identical `ENABLE_BUFFER.HCLK_CK_BUFHCLK<n>` segbit shape.
+        assert_eq!(
+            clock_companions("HCLK_L", "", "HCLK_CK_BUFHCLK8"),
+            vec!["ENABLE_BUFFER.HCLK_CK_BUFHCLK8"]
+        );
+        assert_eq!(
+            clock_companions("HCLK_L", "", "HCLK_CK_BUFHCLK9"),
+            vec!["ENABLE_BUFFER.HCLK_CK_BUFHCLK9"]
+        );
+        assert_eq!(
+            clock_companions("HCLK_R", "", "HCLK_CK_BUFHCLK8"),
+            vec!["ENABLE_BUFFER.HCLK_CK_BUFHCLK8"]
         );
     }
 
