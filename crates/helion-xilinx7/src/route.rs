@@ -1076,7 +1076,13 @@ fn bfs_route_all(
                 }
                 continue;
             }
-            let ng = cur_g.saturating_add(1);
+            // A tileconn hop is a real traversal and must be priced on the same
+            // scale as a pip. Charging a flat 1 while pips cost ~35-45 ps made
+            // stitches *free* by comparison, so the search preferred routes
+            // built from many cheap stitches over a short pip chain -- which is
+            // how the LED pad ended up on INT_L_X72Y45.NE2BEG1 -> ER1END1
+            // instead of the reference's two direct INT_R pips.
+            let ng = cur_g.saturating_add(if use_delay { DEFAULT_HOP_PS } else { 1 });
             if g.get(&next).map(|old| ng < *old).unwrap_or(true) {
                 parent.insert(next.clone(), Some(((tile.clone(), wire.clone()), RoutedPip {
                     tile: format!("{tile}~{ntile}"),
