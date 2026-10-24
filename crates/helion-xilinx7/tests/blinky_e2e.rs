@@ -47,9 +47,52 @@ fn blinky_e2e_fasm() {
 
     // Spot-check key features.
     assert!(text.contains(".ALUT.INIT[63:0]"), "missing LUT INIT:\n{text}");
-    assert!(text.contains(".AFF.ZINI") || text.contains("FF.ZINI"), "missing FF:\n{text}");
     assert!(text.contains("LVCMOS"), "missing IOB config:\n{text}");
     assert!(text.contains("BUFGCTRL"), "missing BUFG:\n{text}");
+
+    // A flop needs BOTH of its configuration bits, and the old assertion here
+    // was `contains(".AFF.ZINI") || contains("FF.ZINI")` -- the `||` made it
+    // pass on a build with no `AFF.ZINI` at all, and it never looked at `ZRST`.
+    //
+    // `ZINI` sets the init value and `ZRST` selects what the SR pin does to it.
+    // Leaving `ZRST` unconfigured is precisely the failure this project spent
+    // rounds on: the flop holds its init value, the LED lights, and nothing
+    // ever toggles it. That is a configured-looking bitstream that does not
+    // run, and no test in the tree noticed.
+    //
+    // Assert per packed FF, so the count has to match the netlist rather than
+    // merely being non-zero.
+    for f in &placed.ffs {
+        // `placed.ffs[].bel` is already `"AFF"`..`"DFF"`, the same spelling the
+        // emitter writes.
+        let zini = format!(".{}.ZINI", f.bel);
+        let zrst = format!(".{}.ZRST", f.bel);
+        assert!(
+            text.contains(&zini),
+            "FF {} has no {}: its power-up value is unconfigured\n{text}",
+            f.name,
+            zini
+        );
+        assert!(
+            text.contains(&zrst),
+            "FF {} has no {}: SRVAL is unconfigured, which is NOT the same as \
+             no effect -- the register then stores 1, so a design that inits to \
+             0 powers up as a constant 1\n{text}",
+            f.name,
+            zrst
+        );
+    }
+    // Tie the check to the netlist rather than to this design's shape: every
+    // packed FF must have been placed, or the loop above validated fewer
+    // flops than exist and would silently pass on a truncated placement.
+    assert_eq!(
+        placed.ffs.len(),
+        packed.ffs.len(),
+        "placed {} of {} flops; the ZINI/ZRST checks above only covered the \
+         ones that were placed",
+        placed.ffs.len(),
+        packed.ffs.len()
+    );
 
     // Write FASM for inspection / Worker C validation.
     let out = std::path::PathBuf::from("/tmp/x7/blinky.fasm");
