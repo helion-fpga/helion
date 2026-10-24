@@ -245,6 +245,32 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         .filter(|n| net_eps[*n].iter().any(|e| !e.is_driver))
         .collect();
     let mut occupied: HashSet<(String, String)> = HashSet::new();
+
+    // Reserve the muxes the emitter configures unconditionally.
+    //
+    // `emit.rs`'s clock pass owns the bypass network's arms on every clock row
+    // (`BYP_ALT{0,1,4,5}.GFAN0`, `BYP_ALT{2,3,6,7}.GFAN1`) and the `GFAN*` return
+    // paths, and it writes them without consulting the router. The router could
+    // not see those claims, so it was free to route a data net through the same
+    // bypass mux -- and on `INT_R_X71Y41` `count_11` did exactly that, driving
+    // `BYP_ALT1` from `SR1BEG_S0` while the clock drove it from `GFAN0`. Two
+    // arms on a one-hot mux means neither input is selected.
+    //
+    // Seeding occupancy with them makes the router treat those muxes as taken
+    // and detour, which is the correct behaviour: the clock's arms are fixed
+    // configuration, the data path is not. Only the MUX is reserved, not the
+    // wires around it -- a data net may still pass *through* the network on a
+    // mux the clock does not claim.
+    if let Some(clock_tiles) = clock_int_tiles_for_reservation(placed, device) {
+        for t in &clock_tiles {
+            for alt in [0u32, 1, 4, 5] {
+                occupied.insert((t.clone(), format!("MUX$BYP_ALT{alt}")));
+            }
+            for alt in [2u32, 3, 6, 7] {
+                occupied.insert((t.clone(), format!("MUX$BYP_ALT{alt}")));
+            }
+        }
+    }
     // net -> (kind, wires it occupies)
     let mut routed: HashMap<String, (RouteKind, Vec<(String, String)>)> = HashMap::new();
     let mut order: Vec<String> = routable.iter().map(|s| (*s).clone()).collect();
@@ -452,6 +478,56 @@ enum ClkRowEnd {
     Other,
 }
 
+/// The INT tiles the clock pass will configure, so the router can reserve the
+/// bypass muxes `emit.rs` claims there.
+///
+/// Derived from the placed cells' rows rather than from the routed clock: the
+/// emitter picks these tiles from the routed spine, but the reservation has to
+/// exist BEFORE routing, so it uses the logic rows the clock serves. Reserving
+/// a tile the emitter later does not touch costs a detour; failing to reserve
+/// one it does touch produces a doubled mux, which is far worse.
+fn clock_int_tiles_for_reservation(
+    placed: &Placed7,
+    device: &dyn RouteQuery,
+) -> Option<Vec<String>> {
+    let _ = device;
+    // Every placed cell that occupies a CLB, whatever vector it came from.
+    //
+    // `placed.luts` is EMPTY for this design: the placer files LUT+FF pairs
+    // under `ffs`, and the carry chain's LUTs belong to `carries`. Keying the
+    // reservation off `luts` alone found no tiles at all and silently reserved
+    // nothing -- the same empty-collection read as "no work to do" that has
+    // already produced three defects in this bring-up.
+    let mut out: Vec<String> = Vec::new();
+    let mut push_tile = |tile: &str, out: &mut Vec<String>| {
+        let parts: Vec<&str> = tile.split('_').collect();
+        if parts.len() < 3 {
+            return;
+        }
+        let t = format!("INT_{}_{}", parts[1], parts[2]);
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    };
+    for l in &placed.luts {
+        push_tile(&l.tile, &mut out);
+    }
+    for f in &placed.ffs {
+        push_tile(&f.tile, &mut out);
+    }
+    for c in &placed.carries {
+        push_tile(&c.tile, &mut out);
+    }
+    for b in &placed.bufgs {
+        push_tile(&b.tile, &mut out);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// Every `(tile, wire)` a routed net claims, so occupancy can be tracked and
 /// released on rip-up.
 fn route_wires(kind: &RouteKind) -> Vec<(String, String)> {
@@ -464,13 +540,46 @@ fn route_wires(kind: &RouteKind) -> Vec<(String, String)> {
             .iter()
             .filter(|p| !p.is_pseudo && !p.tile.contains('~'))
             .flat_map(|p| {
-                [
+                let mut v = vec![
                     (p.tile.clone(), p.dst_wire.clone()),
                     (p.tile.clone(), p.src_wire.clone()),
-                ]
+                ];
+                // A one-hot mux is a resource in its own right, and it is NOT
+                // the same resource as either of the wires entering it.
+                //
+                // Tracking only wires let two nets each reach a different
+                // SOURCE of the same mux: the sources are distinct wires so
+                // neither looked occupied, but both pips configure the same
+                // mux, and a mux with two arms lit drives neither input --
+                // its output is undefined. That produced
+                // `BYP_ALT1: ['LOGIC_OUTS4', 'SR1BEG_S0']` on `INT_R_X71Y41`,
+                // which no wire-level check could see and every test passed.
+                if let Some(mux) = mux_of_wire(&p.tile, &p.dst_wire) {
+                    v.push((p.tile.clone(), mux));
+                }
+                v
             })
             .collect(),
     }
+}
+
+/// The one-hot mux a wire belongs to, as a pseudo wire name for occupancy.
+///
+/// `INT_R_X71Y41.BYP_ALT1` and `INT_R_X71Y41.FAN_ALT1` are muxes; the nets that
+/// reach them arrive on ordinary wires (`LOGIC_OUTS4`, `SR1BEG_S0`). Adding the
+/// mux itself to the occupancy set makes two nets contend for it, so the second
+/// net is rip-up-and-rerouted instead of quietly double-driving the select bits.
+fn mux_of_wire(_tile: &str, wire: &str) -> Option<String> {
+    for family in ["IMUX", "BYP_ALT", "FAN_ALT"] {
+        if let Some(rest) = wire.strip_prefix(family) {
+            // Only a pure `<family><n>` wire is a mux output; `IMUX4_R` or
+            // similar span names are ordinary wires.
+            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                return Some(format!("MUX${wire}"));
+            }
+        }
+    }
+    None
 }
 
 /// Is `tile` a clock buffer?
