@@ -1187,6 +1187,30 @@ fn bfs_route_all(
                 }
                 continue;
             }
+            // The alt-mux backbone belongs to the clock, always.
+            //
+            // `emit.rs` writes `BYP_ALT{0,1,4,5}.GFAN0`, `BYP_ALT{2,3,6,7}.GFAN1`
+            // and the `FAN_ALT{1,3,5}` arms on every clock row without asking the
+            // router. The occupancy reservation above covers only tiles that
+            // already hold a clock or a placed cell, and it fails in the worst
+            // way when the router reaches one of these muxes from an unexpected
+            // direction: the emitter sees the claim, *skips* the arm it was
+            // going to write, and the row silently loses its backbone instead
+            // of merely contesting a mux.
+            //
+            // Hardware measurement: deleting `BYP_ALT1.GFAN0`,
+            // `BYP_ALT4.GFAN0` and `FAN_ALT3.NL1END_S3_0` from one row of the
+            // working reference turns a blinking LD0 into a static one. Those
+            // are exactly the three arms the emitter was dropping on the
+            // counter rows, and the reference never drives any of these muxes
+            // from data -- it ties every one to `GFAN0`/`GFAN1`.
+            //
+            // Blocking the destination wire is the right level: these are not
+            // spare routing, and a data net that would use one has a real
+            // alternative, since `IMUX` is reachable from ordinary wires.
+            if dst_wire.starts_with("BYP_ALT") || dst_wire.starts_with("FAN_ALT") {
+                continue;
+            }
             let ng = cur_g.saturating_add(if use_delay {
                 // On this DB every fabric pip has `delay_ns == None`, so the
                 // first term is always `DEFAULT_HOP_PS`. `arm_penalty` is what
