@@ -1187,30 +1187,62 @@ fn bfs_route_all(
                 }
                 continue;
             }
-            // The alt-mux backbone belongs to the clock, always.
+            // A one-hot mux is a resource in its own right, and occupancy
+            // keys it as `MUX$<wire>` -- so the WIRE check above never finds
+            // it. This is the check that was missing.
             //
-            // `emit.rs` writes `BYP_ALT{0,1,4,5}.GFAN0`, `BYP_ALT{2,3,6,7}.GFAN1`
-            // and the `FAN_ALT{1,3,5}` arms on every clock row without asking the
+            // `clock_int_tiles_for_reservation` correctly derives the counter
+            // column from `placed.carries` and inserts
+            // `("INT_R_X71Y41", "MUX$BYP_ALT1")` into `occupied`; the router
+            // then tested only `("INT_R_X71Y41", "BYP_ALT1")`, never matched,
+            // and drove `BYP_ALT1` from `SR1BEG_S0` anyway. The emitter saw the
+            // claim, skipped the `GFAN0` arm it was going to write, and the row
+            // lost its backbone -- measurable on hardware: deleting
+            // `BYP_ALT1.GFAN0`, `BYP_ALT4.GFAN0` and `FAN_ALT3.NL1END_S3_0`
+            // from one row of the working reference freezes LD0.
+            //
+            // prjxray encodes each arm of these muxes as a coarse select bit
+            // plus a fine one and does NOT clear the other coarse bits, so
+            // writing two arms lights BOTH and the mux selects neither input.
+            // The router and the emitter must therefore agree on one arm.
+            if let Some(mux) = mux_of_wire(&tile, &dst_wire) {
+                if occupied.contains(&(tile.clone(), mux.clone())) {
+                    if let Some(b) = blocked.as_deref_mut() {
+                        b.push((tile.clone(), mux));
+                    }
+                    continue;
+                }
+            }
+            // Reserve the exact arms the emitter writes, and nothing else.
+            //
+            // `emit.rs` writes `BYP_ALT{0,1,4,5}.GFAN0` and
+            // `BYP_ALT{2,3,6,7}.GFAN1` on every clock row without asking the
             // router. The occupancy reservation above covers only tiles that
             // already hold a clock or a placed cell, and it fails in the worst
-            // way when the router reaches one of these muxes from an unexpected
+            // way when the router reaches one of these from an unexpected
             // direction: the emitter sees the claim, *skips* the arm it was
             // going to write, and the row silently loses its backbone instead
             // of merely contesting a mux.
             //
             // Hardware measurement: deleting `BYP_ALT1.GFAN0`,
             // `BYP_ALT4.GFAN0` and `FAN_ALT3.NL1END_S3_0` from one row of the
-            // working reference turns a blinking LD0 into a static one. Those
-            // are exactly the three arms the emitter was dropping on the
-            // counter rows, and the reference never drives any of these muxes
-            // from data -- it ties every one to `GFAN0`/`GFAN1`.
+            // working reference turns a blinking LD0 into a static one.
             //
-            // Blocking the destination wire is the right level: these are not
-            // spare routing, and a data net that would use one has a real
-            // alternative, since `IMUX` is reachable from ordinary wires.
-            if dst_wire.starts_with("BYP_ALT") || dst_wire.starts_with("FAN_ALT") {
-                continue;
-            }
+            // THE SCOPE MATTERS, and a first attempt got it wrong. Blocking the
+            // whole `BYP_ALT*`/`FAN_ALT*` destination wire looks equivalent but
+            // is not: those are general-purpose fabric muxes with 25 sources
+            // each, and the reference routes real data THROUGH them --
+            //
+            //     <real wire> -> FAN_ALT1 -> FAN_BOUNCE1 -> IMUX4
+            //
+            // is exactly how the reference arms the carry lanes' `A6` input
+            // (and `FAN_ALT3`/`FAN_ALT5` -> `FAN_BOUNCE3`/`FAN_BOUNCE5` ->
+            // `IMUX5`/`IMUX35`). Blocking the wire made the reference's own arm
+            // unreachable, so the router could only enter `IMUX4` on a long
+            // line and the arm set diverged on every counter row.
+            //
+            // Only the `GFAN0`/`GFAN1` arms are the emitter's; every other
+            // source of those muxes is ordinary routing and stays available.
             let ng = cur_g.saturating_add(if use_delay {
                 // On this DB every fabric pip has `delay_ns == None`, so the
                 // first term is always `DEFAULT_HOP_PS`. `arm_penalty` is what
