@@ -309,6 +309,22 @@ impl Aig {
     }
 }
 
+/// Is `init` the `flowmap_lut6` table for a single-input pass-through?
+///
+/// `flowmap_lut6` evaluates the cone over `1 << k` addresses and then
+/// **replicates** that pattern to fill all 64 bits, so that a function of fewer
+/// than six inputs behaves the same however the unused pins are driven. For one
+/// input the identity `S = I0` is the 2-entry pattern `0b10` repeated, i.e.
+/// `0xAAAA_AAAA_AAAA_AAAA`.
+///
+/// This exists so the caller can skip emitting a LUT that would only be a wire.
+/// Checking `init == 0` looks right and is not: `0` is the replicated constant
+/// table, which is reachable from a different cone.
+fn repl_identity(init: u64) -> bool {
+    const PAT: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+    init == PAT
+}
+
 /// UG900 Compilation tab over helion-sv (include + `define), not xvlog.
 #[derive(Clone, Debug, Default)]
 pub struct SvCompileOpts {
@@ -18515,6 +18531,41 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             (format!("u_lut{i}"), format!("u_ff{i}"), bitn.clone())
         };
         let dnet = ff_d_net(bitn);
+        // A register assigned straight from another net (`LD0 <= count[24]`)
+        // needs no LUT at all: the AIG is a single primary input. Emitting one
+        // anyway is not harmless. The LUT gets placed in the flop's slice, the
+        // flop is wired to its `O6` output, and if the LUT's own inputs never
+        // get routed -- which is what happened on the ZedBoard blinky -- `O6`
+        // is a constant, the flop samples it forever, and the bitstream is
+        // complete, well-formed and inert. Every structural check passes: the
+        // frame count, the IDCODE, the clock spine, the ZINI/ZRST census and
+        // the `O6` predicate itself (it matched a real LUT really driving the
+        // `D` net). Only the data path was missing.
+        //
+        // Wiring the flop's `D` to the source net directly removes the cell
+        // that can dangle, and lets `mux_for_ff` pick a path that is actually
+        // driven -- the carry `XOR` when the source is a chain sum, which is
+        // also what the working reference bitstream does.
+        // The identity table for one input is not `0`: `flowmap_lut6` fills the
+        // 2-entry pattern and then REPLICATES it across all 64 bits, so
+        // `S = I0` comes out as `0b10` repeated = `0xAAAA...`. Testing for `0`
+        // silently misses every real pass-through.
+        if aig.pis.len() == 1 && aig.ands.is_empty() && repl_identity(init) {
+            // Plain pass-through `q <= src`, no inversion and no logic.
+            let src = aig.pis[0].clone();
+            d.add_cell(&ff, CellKind::Hff);
+            let bit_clk = seq_clk_for(&rtl.module, bitn, clk);
+            d.connect(&bit_clk, &ff, "CLK");
+            d.connect(&src, &ff, "D");
+            d.connect(&qnet, &ff, "Q");
+            if keep_bits.contains(bitn) {
+                let _ = d.dont_touch(&ff);
+            }
+            if md_bits.contains(bitn) {
+                let _ = d.mark_debug(&qnet);
+            }
+            continue;
+        }
         d.add_cell(&lut, CellKind::Lut6 { init });
         d.add_cell(&ff, CellKind::Hff);
         let bit_clk = seq_clk_for(&rtl.module, bitn, clk);
@@ -20081,14 +20132,27 @@ mod tests {
 
     #[test]
     fn inverter_and_buffer_and_zero_differ() {
+        // A register assigned straight from a net (`q <= q`) is a wire, not
+        // logic: emitting a pass-through LUT for it is what produced the
+        // ZedBoard's dead `LD0`. That register's LUT had no routed inputs, the
+        // flop took its `O6` output, and the design configured, reported
+        // `done=1` and never changed state. So a buffer now lowers to a bare
+        // flop and carries no LUT at all.
+        //
+        // An inverter still needs a real cell, and a constant must stay
+        // distinguishable from both.
+        let buf = synth_sv(&wrap("q"), "t.sv").expect("buf synth");
+        assert!(
+            buf.cell("u_lut").is_none(),
+            "a pass-through register must not emit a LUT"
+        );
+        assert!(buf.cell("u_ff").is_some(), "but the flop itself must remain");
+
         let inv = lut_init_of(&wrap("~q")).expect("inv");
-        let buf = lut_init_of(&wrap("q")).expect("buf");
         let z = lut_init_of(&wrap("1'b0")).expect("zero");
         assert_eq!(inv, 0x5555_5555_5555_5555);
-        assert_eq!(buf, 0xAAAA_AAAA_AAAA_AAAA);
         assert_eq!(z, 0);
-        assert_ne!(inv, buf);
-        assert_ne!(buf, z);
+        assert_ne!(inv, z);
     }
 
     #[test]

@@ -144,6 +144,124 @@ pub struct Routed7 {
     pub nets: Vec<RoutedNet7>,
 }
 
+impl Routed7 {
+    /// Is a flip-flop's data input physically driven?
+    ///
+    /// `mux_for_ff` chooses the flop's `D` mux from the *netlist* -- which
+    /// cell claims the flop's `D` net -- and that says nothing about whether
+    /// the router ever delivered the net to the flop's slice. When it did not,
+    /// the flop samples a constant: the bitstream is complete, the device
+    /// reports `done=1`, and the logic never changes state.
+    ///
+    /// This is the ZedBoard blinky's failure mode. `LD0 <= count[24]` is a
+    /// register-to-register assignment, so `mux_for_ff` found no same-site LUT
+    /// driving `D` and no matching carry sum, and fell back to the raw slice
+    /// pin `BX`. The router had put the source flop's output on other slices
+    /// entirely -- `INT_R_X71Y45` drives only `IMUX4` -- so the pin was dead.
+    /// The clock spine (0 diffs device-wide against Vivado), the output pad,
+    /// the IOLOGIC and the hardware-proven `IMUX34 <- NR1END1` arm were all
+    /// correct at the time, and every structural check passed.
+    ///
+    /// Three ways a flop's `D` can legitimately be driven:
+    ///
+    /// 1. a carry sum on the flop's **own lane** -- no routing involved, which
+    ///    is exactly why Vivado merges an output register into the chain;
+    /// 2. a LUT in the flop's own slice (`mux_for_ff` returns `O6`), whose
+    ///    inputs the router must have delivered; or
+    /// 3. routing that reaches the flop's slice at all.
+    ///
+    /// (1) is checked against the carry's published lane sums rather than the
+    /// slice alone, because a slice holds four lanes and a chain in lane A
+    /// does not feed a flop on lane B. The blinky hit precisely that: carry
+    /// and register shared `SLICE_X112Y45`, so a site-level test said
+    /// `driven`, while the register sat on lane B and was dark.
+    ///
+    /// (3) stays deliberately coarse -- "anything reaches the slice" -- because
+    /// no site-pin-level model of the INT tile exists here. A false `true`
+    /// restores the old silent behaviour; a false `false` would reject a
+    /// working design, which is the worse error.
+    pub fn ff_data_is_driven(
+        &self,
+        tile: &str,
+        site: &str,
+        bel: &str,
+        d_net: &str,
+    ) -> bool {
+        // (1) A carry sum on this flop's own lane. `lane_sum_net` is indexed
+        // by lane A..D, so the index *is* the lane.
+        for c in &self.placed.packed.carries {
+            let Some(lane) = c
+                .lane_sum_net
+                .iter()
+                .position(|n| n.as_deref() == Some(d_net))
+            else {
+                continue;
+            };
+            // The chain must sit in this very slice -- a CLB tile holds both a
+            // `SLICEM` and a `SLICEL`, and a chain in one does not feed a flop
+            // in the other -- and the lane must be the flop's own lane.
+            let same_slice = self
+                .placed
+                .carries
+                .iter()
+                .any(|pc| pc.name == c.name && pc.tile == tile && pc.site == site);
+            if same_slice && Some(lane_letter(lane)) == bel.chars().next() {
+                return true;
+            }
+        }
+        // (2) A LUT in this slice whose output is the flop's `D`. Its own
+        // inputs must have been routed, which (3) below covers.
+        // (3) Any routed net ending in this slice.
+        let idx = match bel_slice_index(bel) {
+            Some(i) => i,
+            // Not a slice BEL shape we model: stay permissive rather than
+            // reject a working design.
+            None => return true,
+        };
+        // INT tiles present 48 `IMUX<n>` mux outputs. They are 16 groups of
+        // three -- `{IMUX g, g+8, g+16}` and `{IMUX g+24, g+32, g+40}` share
+        // sources -- so the slice a given `IMUX<n>` feeds is not a contiguous
+        // range. Rather than encode that here, accept any `IMUX` in the tile:
+        // this test is a safety net for a completely unrouted slice, and the
+        // lane-accurate case is (1).
+        let _ = idx;
+        self.nets.iter().any(|n| {
+            if let RouteKind::Pips(pips) = &n.kind {
+                pips.iter().any(|p| {
+                    p.tile == tile && p.dst_wire.starts_with("IMUX")
+                })
+            } else {
+                false
+            }
+        })
+    }
+}
+
+/// Slice index 0..3 for a BEL (`"AFF"`, `"BFF"`, ...).
+///
+/// `INT` tiles present 48 `IMUX<n>` mux outputs; the four slices of a CLB take
+/// them in A, B, C, D order. The slice *site* name (`SLICE_X112Y45`) does not
+/// carry the letter; the placed BEL does.
+pub fn bel_slice_index(bel: &str) -> Option<usize> {
+    match bel.chars().next()? {
+        'A' => Some(0),
+        'B' => Some(1),
+        'C' => Some(2),
+        'D' => Some(3),
+        _ => None,
+    }
+}
+
+/// Lane letter for a carry lane index 0..3.
+fn lane_letter(i: usize) -> char {
+    match i {
+        0 => 'A',
+        1 => 'B',
+        2 => 'C',
+        _ => 'D',
+    }
+}
+
 /// A routing endpoint: site + pin + whether it's a driver.
 #[derive(Clone, Debug)]
 struct Endpoint {
