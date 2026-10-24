@@ -1073,17 +1073,25 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                 lines.push(format!("{int_tile}.GFAN0.GND_WIRE"));
                 lines.push(format!("{int_tile}.GFAN1.GND_WIRE"));
                 lines.push(format!("{int_tile}.FAN_ALT1.NL1BEG_N3"));
-                // Final hop INTO the slice: `IMUX4` is the input-mux arm that
-                // reaches `CLBLM_M_CLK` (the medium slice's clock pin) through
-                // the INT/CLB tileconn. `FAN_BOUNCE1` is the bypass arm that
-                // drives it; without this the fanout network is energised but
-                // nothing taps it, so the slice clock mux is still unselected
-                // and the flops hold their init value.
+                // The clock reaches the slice through `CLBLM_CLK0`/`CLBLM_CLK1`,
+                // which are fed by the `INT_*.CLK0/CLK1.<arm>` feature above
+                // (`CLK1.GCLK_B11`). No `IMUX` is involved: from the tile model
+                // the only pips into `CLBLM_M_CLK` are `CLBLM_CLK1->...`, and
+                // `IMUX4` reaches `CLBLM_M_A6`, a DATA pin.
                 //
-                // `IMUX4` rather than `IMUX5` because the medium slice's clock
-                // is `CLBLM_CLK1`, which the clock tileconn binds to the
-                // `IMUX4` arm; `IMUX5` serves the large slice.
-                lines.push(format!("{int_tile}.IMUX4.FAN_BOUNCE1"));
+                // This block used to emit `{int_tile}.IMUX4.FAN_BOUNCE1` here,
+                // described as the clock's final hop. It is not, and the
+                // consequence was severe once the router learned to drive `A6`:
+                // both wrote the same mux, so `IMUX4` ended up with TWO arms
+                // selected -- the router's `GFAN1` and this `FAN_BOUNCE1` --
+                // on six of the seven counter rows. A one-hot input mux with
+                // two inputs selected has an undefined output, so the lane
+                // operand was garbage even though the route reported success.
+                //
+                // The reference never double-selects a mux anywhere on the die;
+                // measured with `work/muxcheck.py`. The operand path is the
+                // router's to own, and the clock path was already complete
+                // without this line.
             }
         }
     }
