@@ -269,6 +269,44 @@ Two related traps, both hit for real:
   the adder lane; a flop on lane B is fed by routing. Four lanes share a slice,
   so matching on the slice alone is not enough.
 
+### Structure is not behaviour; decode the bitstream and run it
+
+Every structural check on this flow -- frame count, IDCODE, feature diff
+against a reference, clock reachability, pad presence, ZINI/ZRST census --
+passed on an image whose output register sampled a constant and left LD0 dark
+forever. A check that an image is *shaped* right is not a check that it *does*
+anything, and this flow has hidden dead designs behind that gap more than once.
+
+`crates/helion-xilinx7/tests/behaviour_counter.rs` closes it: it decodes the
+emitted FASM back into a circuit and runs it. The adder model, derived from the
+CARRY4 truth table and not assumed, for lane `n` holding bit `n` with the
+constant 1 as the LUT's other operand and `CY_n` the carry out of lane `n-1`:
+
+```
+S  = bit_n ^ 1        the LUT's XOR output
+O  = S ^ CY_n         what FFMUX.XOR drives into the flop
+CO = S ? 1 : CY_n     the carry passed to lane n+1
+```
+
+Starting from all-zero with `CY_0 = 0` this yields 1, 2, 3, ... Use it as the
+model of record. Three ways to get this wrong, all hit while writing the test:
+
+- **Treating `CY` as the incoming carry into the sum** rather than the carry
+  out of the lane below. Every bit then toggles independently, no carry
+  propagates, and the decoder reports "never advances" for a bitstream that
+  demonstrably counts. The reference is what catches it -- keep it as a case.
+- **Keying the decode on `(slice, lane)`.** All seven rows' `SLICEM_X0` then
+  collapse into one entry and a 26-flop chain reads as 4 lanes. The row is
+  part of the key.
+- **Assuming the `ZINI` polarity.** Which value a set `ZINI` encodes is an
+  X-Ray convention, so try both and require that one produces a counter.
+
+The pattern generalises: when a property matters and the existing checks are
+structural, write a decoder that reconstructs the property and run it. Verify
+the new check by breaking the thing it guards -- this one was confirmed
+non-vacuous by dropping the chain filter (fails, finds 0) and by stopping the
+carry from propagating (fails, does not count).
+
 ### An unused LUT still has an init, and Vivado picks a different one
 
 The single remaining non-routing difference against `~/CDA4253_A1/blinky.bit` is
