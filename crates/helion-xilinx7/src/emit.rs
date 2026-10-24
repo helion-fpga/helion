@@ -190,6 +190,33 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     let packed = &placed.packed;
     let mut lines: Vec<String> = Vec::new();
 
+    // Every `(tile, mux)` the router routed through, as `BYP_ALT<n>`-style
+    // names. The clock pass below must not assert a fixed arm on any of these,
+    // or the mux ends up with two coarse select bits lit.
+    //
+    // Built from the routed pips rather than by re-running the reservation
+    // logic: the pips are the ground truth for what the router actually chose,
+    // and the reservation is a superset that includes muxes no pip used.
+    let mut routed_mux_in_use: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    for net in &routed.nets {
+        if let crate::route::RouteKind::Pips(pips) = &net.kind {
+            for p in pips {
+                if p.is_pseudo || p.tile.contains('~') {
+                    continue;
+                }
+                for family in ["BYP_ALT", "FAN_ALT", "IMUX"] {
+                    if let Some(rest) = p.dst_wire.strip_prefix(family) {
+                        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                            routed_mux_in_use
+                                .insert((p.tile.clone(), format!("{family}{rest}")));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Features every bitstream for this part must contain, straight from the
     // DB's `required_features.fasm`. Emit them first and unconditionally.
     //
@@ -1064,10 +1091,39 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                 // paths. Setting it anyway put an arm in the mux that the
                 // oracle never selects.
                 let _ = &spine_bits;
+                // Do NOT assert a bypass arm on a mux the router has already
+                // used.
+                //
+                // These arms are fixed configuration, but `BYP_ALT<n>` is a
+                // ONE-HOT mux and the router may legitimately reach it for a
+                // data net. prjxray encodes each arm as a coarse select bit
+                // plus a fine one and, crucially, does NOT clear the other
+                // coarse bits -- so writing both features lights BOTH coarse
+                // bits and the mux selects neither input:
+                //
+                //   BYP_ALT1.GFAN0      20_15, 24_15
+                //   BYP_ALT1.SR1BEG_S0  18_14, 23_15, 24_15, 25_15
+                //
+                // Measured on `INT_R_X71Y41` before this fix: 18_14=1 AND
+                // 20_15=1, with both features decoding as active. The router
+                // had chosen `SR1BEG_S0` for `count_11` and the emitter wrote
+                // `GFAN0` for the clock on the same tile.
+                //
+                // Reserving the mux in the router (which is done, and works --
+                // the router does avoid these) is not enough on its own,
+                // because the emitter's line is not a routed pip and so never
+                // reaches the occupancy map. The two sides have to agree, and
+                // the router's choice is the one backed by a real path.
                 for alt in [0u32, 1, 4, 5] {
+                    if routed_mux_in_use.contains(&(int_tile.clone(), format!("BYP_ALT{alt}"))) {
+                        continue;
+                    }
                     lines.push(format!("{int_tile}.BYP_ALT{alt}.GFAN0"));
                 }
                 for alt in [2u32, 3, 6, 7] {
+                    if routed_mux_in_use.contains(&(int_tile.clone(), format!("BYP_ALT{alt}"))) {
+                        continue;
+                    }
                     lines.push(format!("{int_tile}.BYP_ALT{alt}.GFAN1"));
                 }
                 lines.push(format!("{int_tile}.GFAN0.GND_WIRE"));
