@@ -132,3 +132,43 @@ An IOB whose port bit has genuinely no `PACKAGE_PIN` is **dropped at pack time,
 not left unplaced** (Vivado warns and completes). Dropping it later does not
 work: the IOB keeps a load endpoint with no driver and routing then dies with
 `no wire for load .O`.
+
+### A pin can land in a tile type that ships no segbits, and that is silent too
+
+A real ZedBoard puts LED6 and LED7 on `U19` and `U14`, which are
+`RIOB33_SING_X73Y49` and `RIOB33_SING_X73Y0`. X-Ray ships no `segbits_*` for the
+`_SING` variants, so those pads currently emit nothing: our own
+`examples/zedboard.xdc` loses 2 of its 8 LEDs and still exits 0 with a
+full-size image. The emitter does print a `dropped_summary()`, so
+`--test build_bitstream` now asserts `dropped.is_empty()` -- a pre-existing
+`features_applied > 2000` bound did not catch this and was removed, because the
+baseline per-tile configuration dominates that count and drifts with every
+routing change. **Guard the thing that is missing, not a proxy for it.**
+
+Borrowing is possible and `tilegrid.json`'s `alias` says how: it names the base
+type and the site remap (`IOB33_Y0 -> IOB33_Y1`). A per-site split of
+`segbits_riob33.db` shows why that matters -- the base `IOB_Y0` bits live in
+words 2..3 and do not fit a 2-word variant, while `IOB_Y1` lives in words 0..1
+and does. The "word 102 outside 0..101" that made this look impossible comes
+from adding the *base* tile's word index to the *variant's* offset, which only
+the remapped-away site does. So: keep features whose relative word index is
+below the variant's word count, and rewrite the site per the alias.
+
+Two traps, both hit in practice. Gate on the presence of an `alias` record, not
+on the name -- `variant_base_type` also strips `_TBYTESRC`/`_TBYTETERM`, and
+those **do** ship their own segbits. And `LIOB33_SING`/`LIOI3_SING` sit on the
+clock edge: writing configuration into them makes the clock spine unroutable
+(`net clk_bufg unroutable to 25 loads`). Blinky's image must stay
+`ce510391ba5debb119d92137808d7839`.
+
+### Absence of a segbits feature does not mean a pip is unwritable
+
+`Device::pip_is_encodable` exists to keep the router off pips the DB cannot
+encode (`LIOI3.IOI_BYP3_0->>IOI_IMUX_RC0` reaches the sink in the model and then
+fails at emission). But rejecting every pip with no matching feature breaks the
+clock: BUFG's `CLK_BUFG_R_FBG_OUT0` and REBUF's `GCLK0_1_DN_TEST_RING_IN` are
+traversed in the working reference and have no feature of their own. The check
+is therefore advisory and returns `true`; tightening it needs a positive test
+for "described but uncharacterised", never an absence test. A pip's FASM key is
+`<TYPE>.<DST>.<SRC>` -- destination first, **with** the type prefix.
+
