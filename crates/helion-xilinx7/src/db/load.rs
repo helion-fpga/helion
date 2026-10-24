@@ -97,6 +97,29 @@ pub struct PipInfo {
     pub is_pseudo: serde_json::Value,
     #[serde(default)]
     pub can_invert: serde_json::Value,
+    /// Timing block: `{"delay": ["min_rise","min_fall","max_rise","max_fall"],
+    /// "in_cap": "...", "res": "..."}`. All values are strings in the DB.
+    ///
+    /// Every pip in `tile_type_INT_R.json` carries this, and until round 31
+    /// Helion discarded it -- leaving the router with hop counts and no notion
+    /// of distance, so a long line through an unrelated tile cost the same as
+    /// a direct interconnect hop.
+    #[serde(default)]
+    pub src_to_dst: Option<serde_json::Value>,
+}
+
+/// Minimum `src_to_dst.delay[0]` of a pip in nanoseconds, if the DB has it.
+///
+/// `delay` is `[min_rise, min_fall, max_rise, max_fall]`; the minimum is the
+/// conservative choice for a cost model that should not *under*-price a hop.
+pub fn pip_delay_ns(v: Option<&serde_json::Value>) -> Option<f64> {
+    let d = v?.get("delay")?;
+    let first = d.as_array()?.first()?;
+    match first {
+        serde_json::Value::String(s) => s.parse::<f64>().ok(),
+        serde_json::Value::Number(n) => n.as_f64(),
+        _ => None,
+    }
 }
 
 /// Interpret the DB's loose `"1"`/`1`/`"0"`/`0` booleans.

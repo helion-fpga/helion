@@ -10,6 +10,28 @@ use crate::place::Placed7;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
+/// Cost units charged for one hop, from the pip's propagation delay.
+///
+/// Delays are ~0.03-0.15 ns and integer costs are wanted, so a hop is priced in
+/// **picoseconds**. A pip with no timing data charges `DEFAULT_HOP_PS`, the
+/// typical interconnect delay, so an untimed pip is neither free nor
+/// prohibitively expensive.
+///
+/// Why this exists: with every hop costing exactly 1, a route that wandered
+/// through an unrelated tile's long lines tied with a direct interconnect hop
+/// and could win on tie-breaking. Hardware disagreed -- the indirect route lit
+/// nothing (`INT_R_X73Y46.IMUX34.WW2END0` is dark, `NR1END1` blinks). nextpnr
+/// avoids this by being delay-driven; this is the same idea, and it is what
+/// `tile_type_*.json`'s `src_to_dst.delay` was always there to support.
+const DEFAULT_HOP_PS: i64 = 45;
+
+fn hop_cost(delay_ns: Option<f64>) -> i64 {
+    match delay_ns {
+        Some(ns) => ((ns * 1000.0).round() as i64).max(1),
+        None => DEFAULT_HOP_PS,
+    }
+}
+
 /// What the router needs from the device model.
 pub trait RouteQuery {
     /// Pips with `src_wire == wire` in `tile`: `(dst_wire, src_wire, is_pseudo)`.
@@ -25,10 +47,31 @@ pub trait RouteQuery {
     fn wire_for_site_pin(&self, site: &str, pin: &str) -> Vec<(String, String)>;
     /// Is this net on the dedicated global clock network (BUFG output)?
     fn is_clock_net(&self, net: &str) -> bool;
-    /// Real grid coordinates of a tile, for the A* heuristic. `None` disables
+    /// Cost units charged for one hop, from the pip's propagation delay.
+///
+/// Delays are ~0.03-0.15 ns and integer costs are wanted, so a hop is priced in
+/// **picoseconds**. A pip with no timing data charges `DEFAULT_HOP_PS`, the
+/// typical interconnect delay, so an untimed pip is neither free nor
+/// prohibitively expensive.
+///
+/// Why this exists: with every hop costing exactly 1, a route that wandered
+/// through an unrelated tile's long lines tied with a direct interconnect hop
+/// and could win on tie-breaking. Hardware disagreed -- the indirect route lit
+/// nothing (`INT_R_X73Y46.IMUX34.WW2END0` is dark, `NR1END1` blinks). nextpnr
+/// avoids this by being delay-driven; this is the same idea, and it is what
+/// `tile_type_*.json`'s `src_to_dst.delay` was always there to support.
+
+/// Real grid coordinates of a tile, for the A* heuristic. `None` disables
     /// the heuristic for that tile (the search degrades to plain BFS), so
     /// minimal test routers need not implement this.
     fn tile_xy(&self, _tile: &str) -> Option<(i32, i32)> {
+        None
+    }
+    /// Propagation delay in ns for the pip `wire -> dst_wire` in `tile`.
+    ///
+    /// `None` means "no timing data"; the router charges a default hop. The
+    /// default returns `None`, so minimal test routers keep hop-count costing.
+    fn pip_delay(&self, _tile: &str, _wire: &str, _dst_wire: &str) -> Option<f64> {
         None
     }
     /// Tile type (e.g. `CLK_BUFG_BOT_R`) for a tile name, if known. The clock
@@ -926,7 +969,7 @@ fn bfs_route_all(
                 }
                 continue;
             }
-            let ng = cur_g.saturating_add(1);
+            let ng = cur_g.saturating_add(hop_cost(device.pip_delay(&tile, &wire, &dst_wire)));
             if g.get(&next).map(|old| ng < *old).unwrap_or(true) {
                 let pip = RoutedPip {
                     tile: tile.clone(),

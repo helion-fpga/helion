@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use crate::db::load::{
     BusInfo, PartInfo, TileConnEntry, TileGridEntry, TileTypeFile, load_part, load_tile_type,
-    load_tileconn, load_tilegrid, loose_bool, read_text,
+    load_tileconn, load_tilegrid, loose_bool, pip_delay_ns, read_text,
 };
 use crate::db::parse::{PackagePin, Ppip, SegBit, parse_mask_line, parse_package_pins, parse_ppips_line, parse_segbits_line};
 
@@ -54,6 +54,13 @@ pub struct Pip {
     pub class: PipClass,
     pub is_pseudo: bool,
     pub can_invert: bool,
+    /// Propagation delay in nanoseconds from `src_to_dst.delay[0]`, or `None`
+    /// when the DB has no timing for this pip.
+    ///
+    /// The router charges this so that a long detour through an unrelated tile
+    /// costs more than a direct interconnect hop. Without it every hop cost the
+    /// same and an impossible-looking shortcut won on hop count.
+    pub delay_ns: Option<f64>,
 }
 
 /// One site pin: (pin name, tile wire).
@@ -654,6 +661,7 @@ impl Device {
             let is_pseudo = loose_bool(&p.is_pseudo);
             let can_invert = loose_bool(&p.can_invert);
             let directional = loose_bool(&p.is_directional);
+            let delay_ns = pip_delay_ns(p.src_to_dst.as_ref());
             let push = |tdata: &mut TileTypeData, s: u32, d: u32| {
                 let idx = tdata.pips.len() as u32;
                 tdata.pips.push(Pip {
@@ -662,6 +670,7 @@ impl Device {
                     class: classify(&tdata.wires[s as usize], &tdata.wires[d as usize]),
                     is_pseudo,
                     can_invert,
+                    delay_ns,
                 });
                 tdata.pips_from.entry(s).or_default().push(idx);
             };
@@ -839,6 +848,21 @@ impl Device {
         let td = &self.types[t.type_id as usize];
         let Some(&w) = td.wire_idx.get(wire) else { return Vec::new() };
         td.pips_from.get(&w).map(|v| v.iter().map(|&i| &td.pips[i as usize]).collect()).unwrap_or_default()
+    }
+
+    /// Propagation delay of the pip `wire -> dst_wire` in this tile, in ns.
+    ///
+    /// `None` when the pip does not exist or the DB carries no timing for it;
+    /// the router then falls back to a flat hop cost.
+    pub fn pip_delay(&self, tile_idx: usize, wire: &str, dst_wire: &str) -> Option<f64> {
+        let t = self.tiles.get(tile_idx)?;
+        let td = &self.types[t.type_id as usize];
+        let s = *td.wire_idx.get(wire)?;
+        let d = *td.wire_idx.get(dst_wire)?;
+        td.pips
+            .iter()
+            .find(|p| p.src == s && p.dst == d)
+            .and_then(|p| p.delay_ns)
     }
 
     /// Find a site by full name: `(tile_idx, site_idx)`.
