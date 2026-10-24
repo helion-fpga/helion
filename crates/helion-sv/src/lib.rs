@@ -15578,6 +15578,37 @@ fn carry4_s_init(has_a: bool, has_b: bool, b_high: bool) -> u64 {
     pat
 }
 
+/// `S` (propagate) INIT for the CARRY4 chain's ENTRY lane (bit 0).
+///
+/// The reference parks the operand on `A3` **negated**, not on `A6` as the body
+/// lanes do, so the INIT is the single-input pattern `~A3` =
+/// `0x0F0F_0F0F_0F0F_0F0F`. Decoded from `CLBLM_R_X71Y39.SLICEM_X0.ALUT` in the
+/// working blinky bitstream; the six body lanes decode as plain `A6`
+/// (`0xFFFF_FFFF_0000_0000`).
+///
+/// The entry lane is where the chain's carry-in arrives, so its LUT shares the
+/// `A3` pin with the `PRECYINIT.AX` arm that supplies that carry. This is a
+/// pin-placement difference, not a logic difference: both `~A3` and `A6`
+/// compute "the operand", each against the pin its own half actually drives.
+///
+/// With a constant-1 addend the entry lane's operand is still `a`; the `+1`
+/// rides `PRECYINIT`, so this must NOT fold the increment in.
+fn carry4_s_init_entry(has_a: bool, has_b: bool, b_high: bool) -> u64 {
+    if !has_a && !has_b {
+        return 0;
+    }
+    let _ = b_high;
+    // `~A3`: set for every address with A3 clear (A3 is bit 2, A1 is LSB).
+    let mut pat = 0u64;
+    for addr in 0..64u32 {
+        let a3 = (addr >> 2) & 1 == 1;
+        if !a3 {
+            pat |= 1u64 << addr;
+        }
+    }
+    pat
+}
+
 /// `DI` (generate) INIT: the carry-free `a & b`.
 fn carry4_di_init(has_a: bool, has_b: bool, b_high: bool) -> u64 {
     let mut pat = 0u64;
@@ -15648,7 +15679,28 @@ fn carry4_map_from_bits(bits: Vec<Carry4Bit>, cin_low: Carry4Cin) -> Carry4Map {
         // `~A3` with the constant arriving on `A3` from the paired slice half,
         // and its body lanes are plain `A6` pass-throughs. `cin_low` records
         // the carry-in; it is emitted as a `PRECYINIT` arm, not as an INIT.
-        s_inits.push(carry4_s_init(has_a, has_b, b_high));
+        //
+        // The ENTRY lane (bit 0) is a different function from the body lanes.
+        // Decoding `SLICEM_X0.ALUT` per lane against the reference bitstream
+        // (`CLBLM_R_X71Y39`, the summing half of the blinky counter):
+        //
+        //     lane Y39   (entry)  !A3
+        //     lanes Y40..Y45      A6
+        //
+        // Six of seven lanes agree, which is what makes the seventh real. Both
+        // are the operand pass-through, but the entry lane parks it on `A3`
+        // negated while the body lanes park it on `A6`. `A3` is where the
+        // paired `SLICEL_X1` half presents its carry (`PRECYINIT.AX`), so the
+        // entry LUT and the carry entry share a pin.
+        //
+        // Emitting `A6` on the entry lane as well diverged from the reference
+        // on 48 INIT bits. The fix is to invert the operand for lane 0 only.
+        let s = if bit == 0 {
+            carry4_s_init_entry(has_a, has_b, b_high)
+        } else {
+            carry4_s_init(has_a, has_b, b_high)
+        };
+        s_inits.push(s);
         di_inits.push(carry4_di_init(has_a, has_b, b_high));
     }
     Carry4Map {
@@ -25637,6 +25689,12 @@ mod carry4_tests {
     /// `I0`. The reference wires it to `A6`; its body lanes all carry
     /// `0xFFFF_FFFF_0000_0000`, so this assertion now pins the reference's
     /// encoding rather than a self-consistent but different one.
+    ///
+    /// The **entry lane** of the chain is the exception. Decoding
+    /// `CLBLM_R_X71Y39.SLICEM_X0.ALUT` in the working blinky bitstream gives
+    /// `~A3` (`0x0F0F_0F0F_0F0F_0F0F`) for lane 0 and `A6` for the six body
+    /// lanes, because the entry LUT shares the `A3` pin with the `PRECYINIT.AX`
+    /// carry-in arm. So exactly one lane per chain carries the inverted pattern.
     #[test]
     fn counter_25bit_lane_luts_are_carry_free() {
         let d = synth_counter(25);
@@ -25650,10 +25708,26 @@ mod carry4_tests {
             })
             .map(|c| c.name.as_str())
             .collect();
+        // 25 lanes, minus the single entry lane that uses `~A3`.
         assert!(
-            s_ids.len() >= 25,
-            "expected >=25 identity-on-A6 S LUTs for the 25 lanes, got {}",
+            s_ids.len() >= 24,
+            "expected >=24 identity-on-A6 S LUTs (25 lanes less the ~A3 entry), got {}",
             s_ids.len()
+        );
+        // Exactly one lane -- the chain entry -- must use the reference's
+        // inverted `~A3` pattern.
+        let entry_ids = d
+            .cells
+            .iter()
+            .filter(|c| {
+                c.name.starts_with("u_c4_q_inc_")
+                    && (c.name.ends_with('s'))
+                    && matches!(c.kind, CellKind::Lut6 { init } if init == 0x0F0F_0F0F_0F0F_0F0F)
+            })
+            .count();
+        assert_eq!(
+            entry_ids, 1,
+            "expected exactly one ~A3 entry-lane S LUT, got {entry_ids}"
         );
         // No lane may have a carried `a ^ b ^ cin` INIT; that would double-count
         // the CARRY4's own carry.
