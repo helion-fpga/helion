@@ -595,8 +595,40 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         }
         // Find driving LUT, if any, and not yet placed.
         let lut_idx = lut_by_output.get(ff.d_net.as_str()).copied().filter(|i| !lut_placed.contains(i));
-        let (tile, site, letter) = alloc(&mut used_sites, &mut site_bels, &mut site_tile, device)?;
+        // A register that samples another register (`LD0 <= count[24]`) belongs
+        // in that register's slice when a lane is free: `Q -> D` within a slice
+        // is an intra-slice connection that needs no routing at all.
+        //
+        // This is what Vivado does with the blinky's output register, and it is
+        // where the earlier failure came from. `alloc` picks the first site with
+        // a free lane in iteration order, which for this design landed the flop
+        // one row away in a slice the router never reached, so it sampled a
+        // constant while the image looked perfect. Co-locating removes the
+        // routing question entirely rather than relying on the router to solve
+        // it.
+        //
+        // Only when the source register is already placed: if it is not, there
+        // is no slice to share and the generic allocator is correct.
+        let source_slice: Option<(String, String, char)> = packed
+            .ffs
+            .iter()
+            .find(|f| f.q_net == ff.d_net)
+            .and_then(|src| ff_slot.get(&src.name))
+            .and_then(|(st, ss, _sl)| {
+                // Reuse the source's slice only if it still has a spare lane.
+                let taken = site_bels.get(ss)?;
+                BEL_LETTERS
+                    .iter()
+                    .find(|c| !taken.contains(c))
+                    .map(|c| (st.clone(), ss.clone(), *c))
+            });
+        let (tile, site, letter) = match source_slice {
+            Some((st, ss, c)) => (st, ss, c),
+            None => alloc(&mut used_sites, &mut site_bels, &mut site_tile, device)?,
+        };
         site_bels.get_mut(&site).unwrap().insert(letter);
+        used_sites.insert(site.clone());
+        site_tile.entry(site.clone()).or_insert_with(|| tile.clone());
         if let Some(li) = lut_idx {
             // Pair: LUT takes the same letter's LUT BEL, FF takes the FF BEL.
             // (Same letter keeps the intra-slice route trivial.)
