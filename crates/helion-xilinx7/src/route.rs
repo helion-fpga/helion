@@ -757,7 +757,18 @@ fn route_net(
     }
     sinks.sort();
     sinks.dedup();
-    let pips = bfs_route_all(&src_tile, &src_wire, &sinks, device, occupied, blocked).ok_or_else(|| {
+    // Clock nets keep flat hop costing: their spine is hand-modelled in
+    // `emit.rs` (per-stage active/enable companions) and delay pricing picked
+    // an RCLK mux prjxray never characterised, making the route unemittable.
+    //
+    // `is_clock_net` only knows BUFG *outputs*, so the pad-to-BUFG input net
+    // (`clk_ibuf`) is not in it -- and that is precisely the net that reached
+    // the uncharacterised mux. Catch it by looking at what the net drives.
+    let drives_clock_pin = external_loads
+        .iter()
+        .any(|l| matches!(l.pin.as_str(), "C" | "CLK" | "I" | "I0" | "I1"));
+    let is_clk = device.is_clock_net(net) || drives_clock_pin;
+    let pips = bfs_route_all(&src_tile, &src_wire, &sinks, device, occupied, !is_clk, blocked).ok_or_else(|| {
         format!(
             "route: net `{net}` unroutable to one or more of {} loads",
             external_loads.len()
@@ -772,12 +783,19 @@ fn route_net(
 /// has exactly one driver. The returned pip set is the union of the tree
 /// paths, sorted for deterministic output. Returns `None` unless every sink
 /// is reachable.
+///
+/// `use_delay` prices hops by real pip propagation delay instead of a flat
+/// one-per-hop. It is OFF for clock nets: their route is the dedicated spine,
+/// `emit.rs` writes hand-derived companion bits for each stage, and pricing by
+/// delay sent `clk_bufg` through `LIOI3_X0Y25.IOI_IMUX_RC0` -- a pip prjxray
+/// never characterised, so the route could not be emitted at all.
 fn bfs_route_all(
     src_tile: &str,
     src_wire: &str,
     sinks: &[(String, String)],
     device: &dyn RouteQuery,
     occupied: &HashSet<(String, String)>,
+    use_delay: bool,
     // Occupied wires that stopped an expansion. Collected so a failed net can
     // rip up only the nets that actually blocked it, instead of every net.
     mut blocked: Option<&mut Vec<(String, String)>>,
@@ -969,7 +987,11 @@ fn bfs_route_all(
                 }
                 continue;
             }
-            let ng = cur_g.saturating_add(hop_cost(device.pip_delay(&tile, &wire, &dst_wire)));
+            let ng = cur_g.saturating_add(if use_delay {
+                hop_cost(device.pip_delay(&tile, &wire, &dst_wire))
+            } else {
+                1
+            });
             if g.get(&next).map(|old| ng < *old).unwrap_or(true) {
                 let pip = RoutedPip {
                     tile: tile.clone(),
@@ -1277,7 +1299,7 @@ mod tests {
             ("T".to_string(), "S2".to_string()),
         ];
         let empty = HashSet::new();
-        let pips = bfs_route_all("T", "A", &sinks, &MuxRouter, &empty, None).expect("all sinks");
+        let pips = bfs_route_all("T", "A", &sinks, &MuxRouter, &empty, true, None).expect("all sinks");
         assert!(pips.iter().any(|p| p.dst_wire == "S1"));
         assert!(pips.iter().any(|p| p.dst_wire == "S2"));
         // The mux input must be driven once, not unioned from two branches.
@@ -1287,7 +1309,7 @@ mod tests {
             ("T".to_string(), "S1".to_string()),
             ("T".to_string(), "NX".to_string()),
         ];
-        assert!(bfs_route_all("T", "A", &unreachable, &MuxRouter, &empty, None).is_none());
+        assert!(bfs_route_all("T", "A", &unreachable, &MuxRouter, &empty, true, None).is_none());
     }
 
     #[test]
