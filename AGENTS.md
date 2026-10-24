@@ -366,12 +366,43 @@ four lanes per row, with `SLICEM_X0.PRECYINIT.AX` starting it at Y39 and
 row for row** against `~/CDA4253_A1/blinky.bit`, and the column emits 113
 carry/FF features on both sides.
 
-The one remaining difference is a pure placement choice: Vivado puts the 26th
-flop (the registered `LD0`) in `CLBLM_R_X71Y44.SLICEL_X1` -- the adjacent slice
-of the chain's last row -- while Helion puts it in
-`CLBLM_R_X71Y45.SLICEM_X0.BFF`, one row further up. Both are chained slices
-with `FFMUX.XOR` and `PRECYINIT.CIN`, so both take the adder sum in hardware.
-The three features simply move one row. This is a QoR/placement-realism
-difference, not a correctness one; do not chase it looking for a dark LED.
+The most recent confirmed state (round 52, after the placements were made to
+match and the LED still did not blink) corrects two earlier conclusions here.
+
+First, the placement note below proved to be exactly the thing to chase: putting
+the register on the chain's lane A instead of lane D left LD0 lit and motionless
+because a CARRY4 lane's `FFMUX.XOR` binds a flop to ITS OWN lane's sum, and lane
+A and lane D of a chained row latch different values. Matching the reference's
+lane (`CLBLM_R_X71Y44.SLICEL_X1.DFF`, commit `db33e26`) was necessary. It was
+not sufficient -- the LED stayed static, so do not treat the placements as
+the whole story.
+
+Second, the alt-mux "backbone" is not uniform across the column, which text
+diffs of FASM obscure because `BYP_ALT*` arms share coarse config bits with
+data arms. Decoded per row against the reference:
+
+- `INT_R_X71Y40..Y44` (middle rows, full CIN-fed CARRY4): identical 13-feature
+  template on both sides -- `BYP_ALT{0..7}.GFAN*` ties plus
+  `FAN_ALT1.NL1BEG_N3` / `FAN_ALT3.NL1END_S3_0` / `FAN_ALT5.LOGIC_OUTS6`.
+- `INT_R_X71Y39` (chain start, `PRECYINIT.AX`): the reference ties
+  `BYP_ALT2/3/4/6/7` only, arms `BYP_ALT0` from a data wire (`EL1END0`), and
+  configures `FAN_ALT5.LOGIC_OUTS6` but no `FAN_ALT1`/`FAN_ALT3` arm.
+- `INT_R_X71Y45` (chain end, one lane): the reference keeps `FAN_ALT1.NL1BEG_N3`
+  and the `BYP_ALT1/3/4/6` ties only.
+
+Deleting three mid-row features (`BYP_ALT1.GFAN0`, `BYP_ALT4.GFAN0`,
+`FAN_ALT3.NL1END_S3_0`) from the working reference froze LD0 on hardware, so
+the middle-row template is load-bearing; the Y39/Y45 differences are the
+router's per-row choices on top of it. The four arms into the chain slice's
+real operand pins (`IMUX4/12/35/43` -> SLICEM A6/B6/C6/D6) match the reference
+since commit `28dfa68`; the four `_L_` arms into `SLICEL_X1` are per-row
+routing choices not derivable from the netlist.
+
+The invariant that must never regress: no `BYP_ALT*`/`FAN_ALT*` mux may have
+two arms selected anywhere on the die -- prjxray's coarse+fine arm encoding
+means two arms select NEITHER input, the output is undefined, and every
+structural check still passes. Audit with `python3 work/altmux.py <ours.bit>
+<ref.bit>`; both decode, never diff FASM text. Background in
+`work/FINDING-round47-backbone.md`, `work/FINDING-round47-arms-reassessed.md`.
 
 
