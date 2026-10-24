@@ -115,8 +115,38 @@ fn every_carry_lane_operand_is_routed() {
 
     // And the routing must actually reach an input mux: an operand that ends
     // anywhere else never drives the LUT.
-    eprintln!("DBG operand_nets={} seen={} pairs={:?}", operand_nets.len(), seen_operands,
-        routed_pairs.iter().take(12).collect::<Vec<_>>());
+    // Reaching an `IMUX` is NOT the same as driving it. `BYP_BOUNCE*` and
+    // `FAN_BOUNCE*` are relay wires: they look like ordinary pip destinations
+    // and they do terminate on an `IMUX`, but a net that arrives on one stops
+    // at the relay and never enters the slice. The earlier version of this
+    // test only asserted reachability, so a design whose operands ALL arrive
+    // on bounce relays passed it -- measured: 26 bounce arms, 0 real.
+    //
+    // What enters the slice is a pip whose SOURCE is a real routing wire. Track
+    // the wires a pip leaves FROM and require at least one non-relay arm.
+    let mut bounce_arms = Vec::new();
+    let mut real_arms = Vec::new();
+    for net in &routed.nets {
+        if !operand_nets.contains(&net.net) {
+            continue;
+        }
+        if let RouteKind::Pips(pips) = &net.kind {
+            for p in pips {
+                if !p.dst_wire.starts_with("IMUX") {
+                    continue;
+                }
+                let relay = p.src_wire.contains("BOUNCE");
+                let entry = (p.tile.clone(), p.dst_wire.clone(), p.src_wire.clone());
+                if relay { bounce_arms.push(entry) } else { real_arms.push(entry) }
+            }
+        }
+    }
+    assert!(
+        !real_arms.is_empty(),
+        "every carry operand enters the slice on a bounce relay ({} of them),          so none of them actually drives the lane's `S` LUT: the adder has a          floating input and the chain cannot advance. Sample: {:?}",
+        bounce_arms.len(),
+        bounce_arms.iter().take(4).collect::<Vec<_>>()
+    );
     let imux = routed_pairs
         .iter()
         .filter(|(_, w)| w.starts_with("IMUX"))
