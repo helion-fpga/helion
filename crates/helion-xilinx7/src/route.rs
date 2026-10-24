@@ -182,7 +182,13 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
             let letter = ["A", "B", "C", "D"][lane];
             if let Some((a, b)) = &carry.lane_operands[lane] {
                 for net in [a, b].into_iter().flatten() {
-                    add_ep(net.clone(), site.to_string(), &format!("{letter}S"), false);
+                    // The slice has no `AS` pin. A LUT's `S` input is wired to
+                    // the slice input pin `A6` (and `B6`..`D6`), which is what
+                    // the emitter configures and what the reference arms
+                    // through `IMUX4`/`IMUX5`. `AS` resolved to nothing, so
+                    // every carry operand endpoint was silently dropped and
+                    // the operands were never routed at all.
+                    add_ep(net.clone(), site.to_string(), &format!("{letter}6"), false);
                 }
             }
         }
