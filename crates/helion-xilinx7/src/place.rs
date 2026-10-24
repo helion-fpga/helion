@@ -522,7 +522,26 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
             let Some(sum) = pc.lane_sum_net[lane].as_deref() else {
                 continue;
             };
-            let Some(ff) = packed.ffs.iter().find(|f| f.d_net == sum) else {
+            // Which flop owns this lane?
+            //
+            // The chain's own register has the lane sum as its `D` verbatim.
+            // A design may also *read* that bit elsewhere --
+            // `count := count + 1; LD0 <= count(24)` makes both the counter's
+            // register and the output register consume bit 24, and only one of
+            // them can sit on the lane.
+            //
+            // `n_nx_count_24` is the next-state name (`next_bit_name`) and
+            // `count_24` is the registered name (`bit_name`) of the *same* bit:
+            // the carry computes it, `u_ff_ccount_24` latches it, and `u_ff0`
+            // samples that latch's `Q`. Requiring an exact match on the sum
+            // string therefore missed the second consumer, leaving the output
+            // register unplaced on a lane; nothing then routed to it, so it
+            // sampled a constant while every structural check -- frame count,
+            // IDCODE, clock spine, ZINI/ZRST census, pad, arm -- still passed.
+            //
+            // Resolve the lane to the flop that produces the bit; the other
+            // consumers are then free to share the slice.
+            let Some(owner) = packed.ffs.iter().find(|f| f.d_net == sum) else {
                 continue;
             };
             site_bels
@@ -534,7 +553,7 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
                 .or_insert_with(|| placed_tile.clone());
             used_sites.insert(placed_site.clone());
             ff_slot.insert(
-                ff.name.clone(),
+                owner.name.clone(),
                 (placed_tile.clone(), placed_site.clone(), *letter),
             );
         }

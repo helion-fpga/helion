@@ -190,6 +190,75 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     let packed = &placed.packed;
     let mut lines: Vec<String> = Vec::new();
 
+    // Refuse to emit a flop whose data input has no driver.
+    //
+    // `mux_for_ff` picks a mux arm by matching the flop's `D` NET against the
+    // nets published by LUTs and carry elements. That check is necessary and
+    // not sufficient: it proves a cell *claims* the net, not that the net is
+    // actually driven on the die. When the match is a LUT whose own inputs are
+    // unrouted, or a raw slice pin (`AFFMUX.BX` and friends) that nothing
+    // feeds, the emitted flop samples a constant forever.
+    //
+    // The ZedBoard blinky hit this exactly. `LD0 <= count[24]` is a plain
+    // register-to-register assignment, but synthesis emitted a redundant
+    // pass-through LUT in the flop's slice; the flop took `BFFMUX.O6`, the
+    // LUT's operands were never routed, and the board sat dark with `done=1`.
+    // Every structural check that existed passed: full 9996 frames, correct
+    // IDCODE, byte-perfect clock spine (0 diffs against Vivado across the
+    // whole device), balanced ZINI/ZRST census, the correct hardware-proven
+    // `IMUX34 <- NR1END1` arm, and an IOLOGIC identical to the reference. The
+    // image was complete, well-formed and inert.
+    //
+    // Checking here rather than in the placer is deliberate: this is the last
+    // point where the net-to-cell map is complete, and it is the point where a
+    // silently-wrong bitstream would otherwise be written. The failure is a
+    // build error naming the flop, not a dark LED.
+    {
+        // Nets with a real driver: a LUT output, a carry lane sum, or another
+        // flop's Q.
+        let mut driven: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for l in &packed.luts {
+            driven.insert(l.output_net.as_str());
+        }
+        for c in &packed.carries {
+            for s in c.lane_sum_net.iter().flatten() {
+                driven.insert(s.as_str());
+            }
+        }
+        for f in &packed.ffs {
+            driven.insert(f.q_net.as_str());
+        }
+        // An input port is driven by its IOB. Packing records those as IOB
+        // cells, whose fabric-side net is a legal flop source.
+        for io in &packed.iobs {
+            if io.dir == crate::pack::IobDir::In && !io.net.is_empty() {
+                driven.insert(io.net.as_str());
+            }
+        }
+        let mut undriven: Vec<String> = Vec::new();
+        for ff in &placed.ffs {
+            let Some(pff) = packed.ffs.iter().find(|f| f.name == ff.name) else {
+                continue;
+            };
+            if !driven.contains(pff.d_net.as_str()) {
+                undriven.push(format!(
+                    "{} ({} {}.{}): D net `{}` has no driver",
+                    ff.name, ff.tile, ff.site, ff.bel, pff.d_net
+                ));
+            }
+        }
+        if !undriven.is_empty() {
+            undriven.sort();
+            return Err(format!(
+                "emit: {} flip-flop(s) would sample an undriven data net, so the \
+                 design would configure, report done=1, and never change state. \
+                 Every one of these is a silent dark-logic bug in the bitstream:\n  {}",
+                undriven.len(),
+                undriven.join("\n  ")
+            ));
+        }
+    }
+
     // Every `(tile, mux)` the router routed through, as `BYP_ALT<n>`-style
     // names. The clock pass below must not assert a fixed arm on any of these,
     // or the mux ends up with two coarse select bits lit.
@@ -274,6 +343,42 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         // FF's D is driven by the LUT on the same BEL letter, and the raw
         // slice input pin otherwise.
         let mux_src = mux_for_ff(ff, packed, placed);
+        // A raw slice input pin is only a valid `D` source if the router
+        // actually drove that slice's mux. `mux_for_ff` falls back to the
+        // letter-matched pin (`BX` for a BFF) purely on the BEL letter, which
+        // says nothing about whether anything reaches it. When nothing does,
+        // the flop samples a constant: the bitstream is complete, `done` reads
+        // 1, and the register never changes state.
+        //
+        // This is the ZedBoard blinky's failure mode. `LD0 <= count[24]` is a
+        // register-to-register assignment, so `mux_for_ff` saw no same-site
+        // LUT driving `D` and no carry sum matching it, and picked `BX`. The
+        // router had delivered the source flop's output to other slices
+        // entirely -- `INT_R_X71Y45` drives only `IMUX4` -- so the pin was
+        // dead. The clock spine (0 diffs device-wide against Vivado), the
+        // output pad, the IOLOGIC and the hardware-proven `IMUX34 <- NR1END1`
+        // arm were all perfect at the time, and every structural check passed.
+        //
+        // Fail loudly here rather than emit an image that configures and
+        // reports `done=1` while the logic is frozen.
+        let d_net = packed
+            .ffs
+            .iter()
+            .find(|p| p.name == ff.name)
+            .map(|p| p.d_net.clone())
+            .unwrap_or_default();
+        if matches!(mux_src, "AX" | "BX" | "CX" | "DX")
+            && !routed.ff_data_is_driven(&ff.tile, &ff.site, &ff.bel, &d_net)
+        {
+            return Err(format!(
+                "emit: flop {} at {}.{} takes `{}MUX.{}`, a raw slice input pin, \
+                 but no routed net ends at that slice -- the register would \
+                 sample a constant and the design would configure, report \
+                 done=1, and never change state. Place this flop on a carry \
+                 chain lane or give it a same-site LUT.",
+                ff.name, ff.tile, ff.site, bel, mux_src
+            ));
+        }
         lines.push(format!("{}.{}.{}.ZINI", ff.tile, site_rel, bel));
         lines.push(format!("{}.{}.{}MUX.{}", ff.tile, site_rel, bel, mux_src));
         // ZRST is emitted on EVERY flip-flop, not only ones with an SR net.
@@ -1525,7 +1630,7 @@ fn mux_for_ff(
             c.lane_sum_net
                 .iter()
                 .flatten()
-                .any(|n| *n == pff.d_net)
+                .any(|n| same_bit(n, &pff.d_net))
         });
         if carry_feeds_ff {
             return "XOR";
@@ -2143,5 +2248,40 @@ mod tests {
         for arm in ["PRECYINIT.C0", "PRECYINIT.C1", "PRECYINIT.AX"] {
             assert!(!fasm.contains(arm), "PRECYINIT arms are exclusive, saw {arm}");
         }
+    }
+}
+
+/// Do two net names denote the same bit?
+///
+/// `count_24` and `n_nx_count_24` are the registered and next-state spellings
+/// of one bit (`bit_name` and `next_bit_name` in `helion-sv`). The carry chain
+/// publishes its lane sums under the next-state name, while a register that
+/// merely *reads* that bit refers to it under the registered name -- so
+/// `count := count + 1; LD0 <= count(24)` has the chain producing
+/// `n_nx_count_24` and the `LD0` flop asking for `count_24`.
+///
+/// An exact string compare misses that, and the consequence is severe rather
+/// than cosmetic: the flop does not take the carry's `XOR` path, falls through
+/// to a bare slice pin (`AX`/`BX`/...), nothing routes to that pin, and the
+/// register samples a constant. The bitstream is complete, the device reports
+/// `done=1`, the clock spine is byte-perfect and the pad is identical to
+/// Vivado's -- and the LED never lights. That is precisely how the ZedBoard
+/// blinky failed.
+///
+/// This is a name-level equivalence, not a value-level proof: it is sound
+/// because `next_bit_name` generates the `n_nx_` prefix mechanically, so a
+/// next-state name and its registered counterpart always describe the same
+/// signal. Anything not matching that exact shape compares literally.
+fn same_bit(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    // `n_nx_<sig>_<bit>` is the next-state form of `<sig>_<bit>`.
+    let strip = |s: &str| s.strip_prefix("n_nx_").map(|r| r.to_string());
+    match (strip(a), strip(b)) {
+        (Some(x), Some(y)) => x == y,
+        (Some(x), None) => x == b,
+        (None, Some(y)) => a == y,
+        (None, None) => false,
     }
 }
