@@ -226,17 +226,60 @@ Round 42 disproved a hand-derived routing topology by asking the node graph;
 this disproved a "missing flop" by reading the actual source. Both premises had
 been assumed rather than checked.
 
+### A register and the carry bit it reads have two different names
+
+The single most expensive bug on this flow. `count := count + 1; LD0 <= count(24)`
+puts the same bit 24 on the wire under **two spellings**:
+
+```
+u_ff_ccount_24  d_net = n_nx_count_24    <- the carry lane sum (next_bit_name)
+u_ff0           d_net = count_24         <- the output register (bit_name)
+```
+
+`next_bit_name` prefixes `n_nx_`; `bit_name` does not. Every comparison in the
+codebase was an exact string match, so nothing linked the chain's output to the
+register that reads it. The `LD0` flop was never pinned to the carry lane,
+`mux_for_ff` fell through to the bare slice pin `BX`, nothing routed there, and
+the register sampled a constant forever.
+
+The image looked perfect on every axis that had ever been checked: 9996 frames,
+correct IDCODE, byte-perfect clock spine (0 diffs against Vivado across the
+whole device), balanced `ZINI`/`ZRST` (104/104 -- the flop was configured
+correctly, it was simply fed nothing), the hardware-proven
+`INT_R_X73Y46.IMUX34 <- NR1END1` arm, and an IOLOGIC identical to the
+reference. `done` read 1. The LED stayed dark.
+
+`same_bit()` in `emit.rs` resolves the two spellings. It is a name-level
+equivalence and sound because the `n_nx_` prefix is generated mechanically, so
+a next-state name and its registered counterpart always denote one signal.
+
+**Tell-tale for this class:** a flop that is configured, clocked and reset
+correctly but never changes state. The failing question is not "is the flop
+right?" -- it is "does anything drive its `D`?". `emit_fasm` now refuses to
+emit such a flop, naming the flop, site and mux arm, because a plausible-
+looking inert bitstream is far worse than a build error.
+
+Two related traps, both hit for real:
+
+- **A chain in the tile is not a chain in the slice.** A CLB holds a `SLICEM`
+  and a `SLICEL`; a carry in one does not feed a flop in the other. A
+  site-level "is it driven" test reported `driven` for the dead register
+  because both shared `SLICE_X112Y45`.
+- **A chain must also be on the flop's own lane.** `AFFMUX.XOR` makes lane A
+  the adder lane; a flop on lane B is fed by routing. Four lanes share a slice,
+  so matching on the slice alone is not enough.
+
 ### Instrument the predicate before editing it
 
 `mux_for_ff` picks `XOR` when a carry element publishes the net on the flop's
 `D`, else `O6` for a LUT-fed flop. On the registered blinky the LD0 register
-emits `BFFMUX.O6` where the reference emits `DFFMUX.XOR`, which reads like a
+emitted `BFFMUX.O6` where the reference emits `DFFMUX.XOR`, which reads like a
 broken predicate. A trace printing `d_net` and whether the predicate matched
 showed **25 of 26 flops taking `XOR`**, including every counter bit; the single
-`O6` is the registered output, whose `D` genuinely is not a carry sum. The
-predicate was correct all along -- Vivado instead merged its output register
-into the chain's last lane, which is a placement and mapping decision, not an
-emitter fix.
+`O6` is the registered output, whose `D` genuinely is not a carry sum *under
+that spelling*. The predicate's structure was right; what it compared was not
+(see the `n_nx_` note above). Instrumenting first is what kept this from being
+"fixed" in the wrong place -- the actual repair is one equivalence function.
 
 Note also that a register may legitimately sit in a slice that is also carrying
 the chain: `AFFMUX.XOR` (chain lane) and `BFFMUX.O6` (the register) are
@@ -247,4 +290,21 @@ The LED output path checks out feature-for-feature against the reference:
 `PULLTYPE.NONE`, `SLEW.SLOW`, `DRIVE.I12_I16` and `IN_TERM.NONE`. Do not look
 for an `OLOGIC.OQUSED` bit to confirm an output pad -- the known-good reference
 does not have one either, so its absence proves nothing.
+
+### Where the counter actually lives, and what is left to differ
+
+The 25-bit counter's carry chain runs up column `X71`, `CLBLM_R_X71Y39..Y45`,
+four lanes per row, with `SLICEM_X0.PRECYINIT.AX` starting it at Y39 and
+`CIN` at every row above. After the `same_bit` fix the chains are **identical
+row for row** against `~/CDA4253_A1/blinky.bit`, and the column emits 113
+carry/FF features on both sides.
+
+The one remaining difference is a pure placement choice: Vivado puts the 26th
+flop (the registered `LD0`) in `CLBLM_R_X71Y44.SLICEL_X1` -- the adjacent slice
+of the chain's last row -- while Helion puts it in
+`CLBLM_R_X71Y45.SLICEM_X0.BFF`, one row further up. Both are chained slices
+with `FFMUX.XOR` and `PRECYINIT.CIN`, so both take the adder sum in hardware.
+The three features simply move one row. This is a QoR/placement-realism
+difference, not a correctness one; do not chase it looking for a dark LED.
+
 
