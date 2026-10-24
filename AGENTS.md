@@ -269,6 +269,35 @@ Two related traps, both hit for real:
   the adder lane; a flop on lane B is fed by routing. Four lanes share a slice,
   so matching on the slice alone is not enough.
 
+### An unused LUT still has an init, and Vivado picks a different one
+
+The single remaining non-routing difference against `~/CDA4253_A1/blinky.bit` is
+one LUT init on an **unused** LUT:
+
+```
+CLBLM_R_X71Y39.SLICEL_X1.ALUT
+  reference 0xff00ff0000000000
+  Helion    0xffffffff00000000
+```
+
+It is unused: no `ALUT` output mux selects it and no flop samples it, and both
+bitstreams agree exactly on `SLICEL_X1.CARRY4.ACY0`, `NOCLKINV` and
+`PRECYINIT.AX`. So this cannot affect behaviour, and it is the *only* such
+difference on the whole device -- counting every `(tile, slice, LUT)` init
+field across all tile types gives exactly one differing entry.
+
+Worth keeping for two reasons. First, a "16 extra bits in `ALUT.INIT[32..39]`
+and `[48..55]`" reading looks alarming and invites a hunt for a writer bug; it
+is not one. `frames.rs` already rejects a word index `>= WORDS_PER_FRAME`, and
+`CLBLM_R`'s geometry (`offset: 79`, `words: 2`) maps these to words 79 and 80,
+comfortably in range -- the segbits frame offsets 26/27 are *not* word offsets
+and must not be added to `words`.
+
+Second, Vivado canonicalises the init of a LUT it does not use -- here to a
+repeating `0xff00` pattern -- where Helion writes all-ones. If character-exact
+bitstream equality is ever pursued, this is one of the differences to
+canonicalise, and it is a safe one to change because nothing reads it.
+
 ### Instrument the predicate before editing it
 
 `mux_for_ff` picks `XOR` when a carry element publishes the net on the flop's
