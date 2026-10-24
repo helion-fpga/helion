@@ -710,14 +710,32 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
                     // silently returned the source slice, putting the flop back
                     // on the chain. Derive the sibling from the device instead.
                     let (sib_tile, sib) = sibling_slice(&*device, st, ss, &site_tile, true)?;
+                    // The lane matters, and NOT in the way "first free" implies.
+                    //
+                    // A slice's carry column runs A->B->C->D from `CIN`. Every
+                    // `XFFMUX.XOR` binds a flop to *its own lane's* sum, so the
+                    // same mux on a different lane latches a different value:
+                    // lane A takes `bit ^ CYin` straight from the incoming
+                    // carry, lane D takes `bit ^ CY(A..C)` after the column has
+                    // propagated through three lanes.
+                    //
+                    // The reference puts this register on `DFF`. Choosing the
+                    // first free lane (`A`) configures cleanly, leaves every
+                    // structural check passing, and makes the LED **static**
+                    // rather than dark: the flop is clocked and latches a real
+                    // -- but wrong -- sum, so it holds a constant instead of
+                    // toggling. Take the LAST lane of the column, matching the
+                    // reference.
+                    //
                     // The sibling half may not have been touched yet, so it has
                     // no entry; an absent entry means no lanes taken, not
                     // "unavailable". Reading it as the latter silently fell
                     // back to the source slice and put the flop back on the
                     // chain -- the exact bug this branch exists to avoid.
-                    let free = BEL_LETTERS.iter().find(|c| {
-                        site_bels.get(&sib).map_or(true, |t| !t.contains(c))
-                    });
+                    let free = BEL_LETTERS
+                        .iter()
+                        .rev()
+                        .find(|c| site_bels.get(&sib).map_or(true, |t| !t.contains(c)));
                     free.map(|c| (sib_tile.clone(), sib.clone(), *c))
                 } else {
                     let taken = site_bels.get(ss)?;
