@@ -15634,6 +15634,20 @@ fn carry4_map_from_bits(bits: Vec<Carry4Bit>, cin_low: Carry4Cin) -> Carry4Map {
         let has_a = bits[bit].a.is_some();
         let has_b = bits[bit].b.is_some();
         let b_high = bits[bit].b_high;
+        // Lane 0's `S` stays the plain pass-through even when the chain's
+        // carry-in is 1. Do NOT fold the `+1` in here as a `~a` on lane 0.
+        //
+        // That looks like it fixes a stuck counter and does the opposite. The
+        // carry-in of 1 is supplied by the chain entry's `PRECYINIT.AX` arm
+        // with `AX` driven to a constant 1 -- see the arm selection in
+        // `helion-xilinx7/src/emit.rs`, which mirrors the reference. Inverting
+        // lane 0's `S` as well would inject the `+1` a SECOND time, giving a
+        // counter that steps by 2, or one that toggles and freezes.
+        //
+        // The reference is the authority on this shape: its entry lane is
+        // `~A3` with the constant arriving on `A3` from the paired slice half,
+        // and its body lanes are plain `A6` pass-throughs. `cin_low` records
+        // the carry-in; it is emitted as a `PRECYINIT` arm, not as an INIT.
         s_inits.push(carry4_s_init(has_a, has_b, b_high));
         di_inits.push(carry4_di_init(has_a, has_b, b_high));
     }
