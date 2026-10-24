@@ -1465,6 +1465,22 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn a6_is_not_site_internal() {
+        // `count_n` is driven by the flop's `AQ` and read by the carry lane's
+        // `A6`. Both are pins of ONE slice, but the slice does not wire `AQ` to
+        // `A6` internally -- the signal must leave for the interconnect's input
+        // mux and come back. Classifying `A6` as site-internal returns
+        // `SiteInternal`, emits no pips, and leaves the adder's operand
+        // undriven, which is the static-LED defect.
+        for p in ["A6", "B6", "C6", "D6"] {
+            assert!(!super::is_site_internal_pin(p), "{p} must route externally");
+        }
+        // The flop's own `D`, reached from the lane LUT inside the slice, is
+        // the one genuinely internal case.
+        assert!(super::is_site_internal_pin("D"));
+    }
+
     fn unroutable_net_fails_loudly() {
         struct NoRoute;
         impl RouteQuery for NoRoute {
