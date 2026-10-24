@@ -477,13 +477,38 @@ impl Device {
     /// Base tile type a `_SING` / `_TBYTESRC` / `_TBYTETERM` variant derives
     /// from, e.g. `RIOB33_SING` -> `RIOB33`.
     ///
-    /// These variants are physically smaller tiles with a DIFFERENT frame
-    /// layout, and upstream X-Ray ships no `segbits_*.db` for them. Their
-    /// configuration cannot be borrowed from the base type: the base type's
-    /// bit positions address words that do not exist in the variant (RIOB33
-    /// feature bits reach word 102 in a tile that only has 0..=101). Callers
-    /// use this only to *identify* such tiles so they can be avoided, never
-    /// to copy segbits.
+    /// These variants are physically narrower than the base type and upstream
+    /// X-Ray ships no `segbits_*.db` for the `_SING` forms, so `RIOB33_SING`
+    /// tiles currently emit nothing and any pad placed on one silently loses its
+    /// configuration. On a ZedBoard that is not hypothetical: LED6 (U19) and
+    /// LED7 (U14) are `RIOB33_SING_X73Y49` / `X73Y0`, and our own
+    /// `examples/zedboard.xdc` loses both.
+    ///
+    /// The old claim here -- that the base type's segbits cannot be borrowed --
+    /// is too strong. `tilegrid.json` gives each variant an `alias` naming the
+    /// base type and the site remap, and a per-site split of `segbits_riob33.db`
+    /// shows the remapped site fits exactly:
+    ///
+    /// ```text
+    /// RIOB33      offset 91, words 4 -> words 91..94
+    /// RIOB33_SING offset 99, words 2 -> words 99..100   (alias IOB33_Y0->IOB33_Y1)
+    /// base IOB_Y0 bits live in words 2..3   <- does not fit a 2-word variant
+    /// base IOB_Y1 bits live in words 0..1   <- fits exactly, and is the alias
+    /// ```
+    ///
+    /// "Word 102 outside 0..101" comes from adding the BASE tile's word index to
+    /// the VARIANT's offset, which only the remapped-away site does. So a
+    /// correct borrow is possible: take the base features, drop any whose
+    /// relative word index reaches the variant's word count, and rewrite the
+    /// site per the alias.
+    ///
+    /// Two traps make a naive version worse than doing nothing, and both were
+    /// hit: (1) only the `_SING` types carry an `alias`, while this function also
+    /// strips `_TBYTESRC`/`_TBYTETERM`, which ship their own segbits -- so gate
+    /// on the alias record, not on the name; (2) `LIOB33_SING`/`LIOI3_SING` sit
+    /// on the clock edge, and copying configuration into them makes the clock
+    /// spine unroutable (`net clk_bufg unroutable to 25 loads`). Any borrow must
+    /// re-check that blinky still yields `ce510391ba5debb119d92137808d7839`.
     pub fn variant_base_type(name: &str) -> Option<&str> {
         for suffix in ["_SING", "_TBYTESRC", "_TBYTETERM"] {
             if let Some(base) = name.strip_suffix(suffix) {

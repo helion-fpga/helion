@@ -58,7 +58,21 @@ fn zedboard_bitstream_matches_the_hand_built_flow() {
     // must carry that package name, because the header is what a programmer
     // displays and what identifies the image.
     assert_eq!(got.part, "xc7z020clg484-1");
-    assert!(got.features_applied > 2_000, "applied {}", got.features_applied);
+    // The baseline per-tile configuration dominates this count and drifts with
+    // every routing change, so a tight bound only ever measures that drift. The
+    // real guard against an empty image is that output pads exist at all, which
+    // is pinned by `tests/output_pads.rs` (round 39's silent failure produced a
+    // full-size bitstream with a healthy feature count and zero pads).
+    assert!(
+        got.features_applied > 1_000,
+        "applied {} -- an image this sparse means emission produced nothing",
+        got.features_applied
+    );
+    assert!(
+        got.dropped.is_empty(),
+        "{}",
+        got.dropped_summary().unwrap_or_default()
+    );
 
     // The header must name the right part and IDCODE.
     let head = &got.bytes[..64.min(got.bytes.len())];
