@@ -313,6 +313,56 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         // Q is per-BEL (AQ/BQ/CQ/DQ); D and CLK are slice-shared.
         let bel_letter = bel.chars().next().unwrap_or('A');
         add_ep(ff.d_net.clone(), site.to_string(), "D", false);
+        // The emitter mirrors a carry chain's lane functions into the paired
+        // slice so a register in that half can select FFMUX.XOR. When that
+        // register consumes the chain's top bit, its D net must also reach
+        // that lane's LUT input: the XOR mux reads the paired CARRY4 sum, not
+        // the raw FF.D pin. The generic FF endpoint above reaches the slice's
+        // raw D pin (D2 here), which leaves the mirrored carry lane's D6
+        // un-driven. On the ZedBoard this omitted sink is
+        // CLBLM_L_D6 <- IMUX42 at X71Y44 and freezes LD0 despite a routed
+        // count_24 -> D path.
+        let source_chains: HashSet<&str> = placed
+            .packed
+            .carries
+            .iter()
+            .filter(|carry| {
+                carry
+                    .lane_sum_net
+                    .iter()
+                    .flatten()
+                    .any(|sum| crate::emit::same_bit(sum, &ff.d_net))
+            })
+            .map(|carry| carry.chain.as_str())
+            .collect();
+        let paired_carry_site = placed
+            .ffs
+            .iter()
+            .find(|placed_ff| placed_ff.name == ff.name)
+            .is_some_and(|placed_ff| {
+                placed.carries.iter().any(|carry| {
+                    if carry.tile != placed_ff.tile || carry.site == placed_ff.site {
+                        return false;
+                    }
+                    placed
+                        .packed
+                        .carries
+                        .iter()
+                        .find(|packed_carry| packed_carry.name == carry.name)
+                        .is_some_and(|packed_carry| {
+                            source_chains.contains(packed_carry.chain.as_str())
+                        })
+                })
+            });
+        if paired_carry_site {
+            let letter = bel.chars().next().unwrap_or('A');
+            add_ep(
+                ff.d_net.clone(),
+                site.to_string(),
+                &format!("{letter}6"),
+                false,
+            );
+        }
         add_ep(ff.q_net.clone(), site.to_string(), &format!("{bel_letter}Q"), true);
         if std::env::var("HELION_TRACE_CLK").is_ok() {
             eprintln!("TRACE_CLK: ff {} clk_net={} site={}", ff.name, ff.clk_net, site);

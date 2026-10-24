@@ -2295,7 +2295,7 @@ mod tests {
 /// because `next_bit_name` generates the `n_nx_` prefix mechanically, so a
 /// next-state name and its registered counterpart always describe the same
 /// signal. Anything not matching that exact shape compares literally.
-fn same_bit(a: &str, b: &str) -> bool {
+pub(crate) fn same_bit(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }
