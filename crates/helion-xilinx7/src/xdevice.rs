@@ -213,18 +213,6 @@ impl<'a> TimingDevice for XDevice<'a> {
 }
 
 impl<'a> RouteQuery for XDevice<'a> {
-    /// Forwarded so the router can arm the sibling slice's input pins.
-    ///
-    /// A CLB's two slices share a tile and differ only in recorded site type,
-    /// so locating the pair needs the device's site table, not a name guess.
-    fn slices(&self) -> Vec<(String, String)> {
-        DeviceQuery::slices(self)
-    }
-
-    fn slice_is_m(&self, tile: &str, site: &str) -> bool {
-        DeviceQuery::slice_is_m(self, tile, site)
-    }
-
     fn iob_output_sink(&self, site: &str) -> Vec<(String, String)> {
         // Trace, from the pad backwards, the ONLY path the fabric can use to
         // reach it:

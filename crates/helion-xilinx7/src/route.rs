@@ -74,20 +74,6 @@ pub trait RouteQuery {
     fn pip_delay(&self, _tile: &str, _wire: &str, _dst_wire: &str) -> Option<f64> {
         None
     }
-    /// Every `(tile, site)` slice instance on the device.
-    ///
-    /// Defaulted to empty so minimal test routers need not implement it; the
-    /// only caller tolerates an empty answer by simply not adding the endpoint.
-    fn slices(&self) -> Vec<(String, String)> {
-        Vec::new()
-    }
-    /// Is `site` in `tile` the SLICEM half of its CLB?
-    ///
-    /// Both halves are named `SLICE_X<col>Y<row>`; only the recorded site TYPE
-    /// distinguishes them, so this cannot be guessed from the name.
-    fn slice_is_m(&self, _tile: &str, _site: &str) -> bool {
-        false
-    }
     /// Can `wire -> dst_wire` in `tile` be written to a bitstream?
     ///
     /// Some pips exist in `tile_type_*.json` but have no segbits, so prjxray
@@ -374,27 +360,6 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
                     // every carry operand endpoint was silently dropped and
                     // the operands were never routed at all.
                     add_ep(net.clone(), site.to_string(), &format!("{letter}6"), false);
-                    // Arm the SIBLING slice's same input pin as well.
-                    //
-                    // A CLB holds two slices -- `SLICEM_X0` (which carries the
-                    // chain) and `SLICEL_X1` -- and the reference arms BOTH
-                    // halves of every lane on every counter row:
-                    //
-                    //   IMUX4 -> CLBLM_M_A6   and  IMUX5  -> CLBLM_L_A6
-                    //   IMUX12 -> CLBLM_M_B6 and  IMUX13 -> CLBLM_L_B6
-                    //   IMUX35 -> CLBLM_M_C6 and  IMUX34 -> CLBLM_L_C6
-                    //   IMUX43 -> CLBLM_M_D6 and  IMUX42 -> CLBLM_L_D6
-                    //
-                    // Measured: every counter row in BLINK-242 drives eight
-                    // arms, four `_M_` and four `_L_`; we drove only the four
-                    // `_M_` ones. The SLICEL half is otherwise configured
-                    // identically on both sides (130 features, byte-identical
-                    // `PRECYINIT.CIN` and LUT inits), so the arms are the only
-                    // difference -- and a slice input mux with no arm selected
-                    // leaves that LUT input floating.
-                    if let Some(sib) = sibling_slice_site(device, site) {
-                        add_ep(net.clone(), sib, &format!("{letter}6"), false);
-                    }
                 }
             }
         }
@@ -829,35 +794,6 @@ fn route_wires(kind: &RouteKind) -> Vec<(String, String)> {
             })
             .collect(),
     }
-}
-
-/// The other slice of `site`'s CLB, or `None` if it has no sibling.
-///
-/// A CLB holds exactly two slices, `SLICEM_X0` and `SLICEL_X1`, and they share
-/// a tile. Enumerating the tile's own sites is the only sound way to find the
-/// pair: both are named `SLICE_X<col>Y<row>` and differ solely in their
-/// recorded site TYPE, so neither the name nor a coordinate guess identifies
-/// which is which. (`sibling_slice` in `place.rs` learned this the hard way --
-/// probing `x-1` finds nothing of this tile at all.)
-///
-/// Used to arm the sibling half's input pins. The reference drives both halves
-/// of every carry lane on every counter row; see the call site for why.
-fn sibling_slice_site(device: &dyn RouteQuery, site: &str) -> Option<String> {
-    // Find the site's own tile first: the caller has a site name but no tile.
-    // Only `placed.carries` lacks a tile field, and a site name is unique on
-    // the die, so locating it by search is exact rather than a guess.
-    let tile = device
-        .slices()
-        .into_iter()
-        .find(|(_, s)| s == site)
-        .map(|(t, _)| t)?;
-    let want_m = !device.slice_is_m(&tile, site);
-    device
-        .slices()
-        .into_iter()
-        .filter(|(tt, _)| *tt == tile)
-        .map(|(_, s)| s)
-        .find(|cand| cand != site && device.slice_is_m(&tile, cand) == want_m)
 }
 
 /// The one-hot mux a wire belongs to, as a pseudo wire name for occupancy.
