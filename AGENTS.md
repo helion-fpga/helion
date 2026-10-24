@@ -193,3 +193,36 @@ is therefore advisory and returns `true`; tightening it needs a positive test
 for "described but uncharacterised", never an absence test. A pip's FASM key is
 `<TYPE>.<DST>.<SRC>` -- destination first, **with** the type prefix.
 
+### Check the reference's SOURCE before trusting a diff against its bitstream
+
+The ZedBoard ground truth is `~/CDA4253_A1/blinky.bit`, and its source is
+**`blinky.vhd`** -- not the SystemVerilog stand-in that comparisons had been
+built from. The two are not equivalent, and the difference explains the anomaly
+that drove a long investigation:
+
+```vhdl
+if rising_edge(clk) then
+    count := count + 1;
+    LD0 <= count(24);      -- REGISTERED output: 26 carry-chain flops
+end if;
+```
+
+versus the stand-in's `assign LD0 = count[24]` -- combinational, 25 flops. The
+reference has one more flop **because the design has one more flop**. Everything
+"missing" was the difference between the two circuits, including the
+`NR1END1`-vs-`NE2END1` arm divergence: different source registers land on
+different wires. Use `work/ref/blinky_reg.sv` (the faithful equivalent) as the
+baseline.
+
+A related counting trap: the same physical slice decodes through all four
+`CLB*` tile-type tables. `SLICEL_X1.DFF.ZINI` is frame word 31 bit 59 in
+`segbits_clblm_r.db`, `segbits_clblm_l.db`, `segbits_clbll_l.db` **and**
+`segbits_clbll_r.db`, so summing over tile types multiplies one flop by four
+("104 vs 100"). Deduplicate on `(tile, slice, FF letter)` before drawing any
+conclusion from a count.
+
+Before comparing two artifacts, confirm they are supposed to be the same thing.
+Round 42 disproved a hand-derived routing topology by asking the node graph;
+this disproved a "missing flop" by reading the actual source. Both premises had
+been assumed rather than checked.
+
