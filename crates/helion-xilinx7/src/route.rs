@@ -513,6 +513,18 @@ fn is_clock_buffer_entry(device: &dyn RouteQuery, tile: &str, wire: &str) -> boo
     is_clock_buffer_tile(device, tile) && wire.contains("BUFGCTRL") && wire.contains("_I")
 }
 
+/// Is `pin` wired to the slice's own output without leaving the site?
+///
+/// The slice's internal connections are the ones the dedicated BEL-to-BEL
+/// paths provide: a LUT's output reaches its own packed flop's `D` directly,
+/// and the carry chain's `S`/`DI`/`O` pins are fed by the site's own logic.
+/// Everything else -- the LUT input pins `A`..`D`, `A1`..`A6`, `AI`, `AX` --
+/// is reached through the routing tile's input mux, so a same-site load on one
+/// of those must be routed like any cross-tile load.
+fn is_site_internal_pin(pin: &str) -> bool {
+    matches!(pin, "D" | "S" | "DI" | "O0" | "O1" | "O2" | "O3" | "CI" | "COUT" | "CIN")
+}
+
 /// Route one net from its driver to all loads.
 fn route_net(
     net: &str,
@@ -522,9 +534,25 @@ fn route_net(
     occupied: &HashSet<(String, String)>,
     blocked: Option<&mut Vec<(String, String)>>,
 ) -> Result<RouteKind, String> {
-    // Split loads into site-internal (same site as driver) and external.
-    let (internal, external): (Vec<&&Endpoint>, Vec<&&Endpoint>) =
-        loads.iter().partition(|l| l.site == driver.site);
+    // Split loads into site-internal and external.
+    //
+    // "Same site" is NOT the same as "site-internal". A slice input pin is
+    // reached only through the routing tile's input mux, so a load on `A6`
+    // whose driver is a flop in the *same* slice still has to leave the slice
+    // and come back:
+    //
+    //     Q -> CLBLM_M_AQ -> [tileconn] -> INT -> IMUX4 -> CLBLM_M_A6 -> A6
+    //
+    // Partitioning on `l.site == driver.site` alone classified that as
+    // site-internal and returned early with no pips, so every carry operand
+    // was reported routed while nothing was emitted -- which is exactly why
+    // arming the operand muxes changed the bitstream's feature count but left
+    // the routed wire count at 84. Only pins the slice actually wires
+    // internally (the packed FF's `D`, reached from the LUT output) may skip
+    // routing.
+    let (internal, external): (Vec<&&Endpoint>, Vec<&&Endpoint>) = loads
+        .iter()
+        .partition(|l| l.site == driver.site && is_site_internal_pin(&l.pin));
     // If all loads are site-internal, no pips needed.
     if external.is_empty() {
         return Ok(RouteKind::SiteInternal);
