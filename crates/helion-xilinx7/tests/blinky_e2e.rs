@@ -94,6 +94,46 @@ fn blinky_e2e_fasm() {
         packed.ffs.len()
     );
 
+    // No one-hot mux may have two arms written.
+    //
+    // `BYP_ALT<n>` and `IMUX<n>` select exactly one source, and prjxray encodes
+    // each arm as a coarse select bit plus a fine one WITHOUT clearing the
+    // other coarse bits. Two arms therefore light two coarse bits and the mux
+    // drives neither input -- a configured-looking bitstream with an undefined
+    // data path.
+    //
+    // This actually happened: the clock pass wrote `BYP_ALT1.GFAN0` while the
+    // router had routed a counter bit through `BYP_ALT1.SR1BEG_S0` on the same
+    // tile, leaving `INT_R_X71Y41.BYP_ALT1` with both coarse bits set. The
+    // reference never does this anywhere on the die, and every test passed.
+    let mut arms: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for l in &bs.fasm {
+        let mut it = l.splitn(3, '.');
+        let (Some(tile), Some(field), Some(arm)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let is_mux = ["IMUX", "BYP_ALT", "FAN_ALT"].iter().any(|p| {
+            field
+                .strip_prefix(p)
+                .is_some_and(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_digit()))
+        });
+        if is_mux {
+            arms.entry(format!("{tile}.{field}"))
+                .or_default()
+                .push(arm.to_string());
+        }
+    }
+    for (mux, a) in &arms {
+        assert!(
+            a.len() == 1,
+            "one-hot mux {mux} has {} arms selected: {a:?}. The arms' coarse \
+             select bits are not cleared against each other, so the mux drives \
+             neither input.\n{text}",
+            a.len()
+        );
+    }
+
     // Write FASM for inspection / Worker C validation.
     let out = std::path::PathBuf::from("/tmp/x7/blinky.fasm");
     std::fs::create_dir_all(out.parent().unwrap()).ok();
