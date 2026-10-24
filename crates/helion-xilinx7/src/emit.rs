@@ -1233,7 +1233,30 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                 }
                 lines.push(format!("{int_tile}.GFAN0.GND_WIRE"));
                 lines.push(format!("{int_tile}.GFAN1.GND_WIRE"));
+                // The `FAN_ALT` backbone is FIXED CONFIGURATION, not a route.
+                //
+                // Isolated on hardware: taking the working reference and
+                // removing only `BYP_ALT1.GFAN0`, `BYP_ALT4.GFAN0` and
+                // `FAN_ALT3.NL1END_S3_0` from one counter row turns a blinking
+                // LD0 into a static one. Three arms, three features, and the
+                // LED stops toggling.
+                //
+                // We were emitting `FAN_ALT1` only and letting the router drive
+                // `BYP_ALT1`/`BYP_ALT4` and `FAN_ALT3`/`FAN_ALT5` from data
+                // wires. That is wrong twice over: those muxes are the clock's
+                // bypass network, and stealing them both removes the backbone
+                // the reference depends on and puts the router onto a marginal
+                // path it would never have chosen otherwise. The reference
+                // drives all three `FAN_ALT{1,3,5}` arms on EVERY counter row,
+                // uniformly, with `GFAN0`/`GFAN1` on the `BYP_ALT` muxes.
+                //
+                // `FAN_ALT1` was already here; `FAN_ALT3`/`FAN_ALT5` were not,
+                // which is exactly the third feature the hardware experiment
+                // named. Emit the whole backbone rather than the one arm that
+                // happened to be noticed.
                 lines.push(format!("{int_tile}.FAN_ALT1.NL1BEG_N3"));
+                lines.push(format!("{int_tile}.FAN_ALT3.NL1END_S3_0"));
+                lines.push(format!("{int_tile}.FAN_ALT5.LOGIC_OUTS6"));
                 // The clock reaches the slice through `CLBLM_CLK0`/`CLBLM_CLK1`,
                 // which are fed by the `INT_*.CLK0/CLK1.<arm>` feature above
                 // (`CLK1.GCLK_B11`). No `IMUX` is involved: from the tile model
