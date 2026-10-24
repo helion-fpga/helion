@@ -161,6 +161,27 @@ clock edge: writing configuration into them makes the clock spine unroutable
 (`net clk_bufg unroutable to 25 loads`). Blinky's image must stay
 `ce510391ba5debb119d92137808d7839`.
 
+The borrowing is **not landed**, and the reason is structural. Splitting
+`segbits_riob33.db` by which words a feature needs shows the variant is not a
+subset but a clean split -- `IOB_Y1`'s 38 features all fit words 0..1, while
+`IOB_Y0`'s 43 all need words >=2 -- so a `RIOB33_SING` tile can only ever be
+`IOB_Y1`. Selecting the site is therefore the whole problem, and `alias.sites`
+is per **tile instance**, not per type:
+
+```
+RIOB33_SING_X73Y0 : start_offset=2  sites={"IOB33_Y0": "IOB33_Y0"}
+RIOB33_SING_X73Y49: start_offset=0  sites={"IOB33_Y0": "IOB33_Y1"}
+```
+
+Both are keyed by the same local name while meaning different things, and
+`start_offset` is 2 in a base tile with 2 sites -- it indexes the die-level site
+list. `SegBitsDb` is keyed by tile **type**, so a correct borrow needs a
+per-instance table or a per-instance site selection at the FASM lookup. Do not
+"fix" this by aggregating the alias by type; that is silently wrong for one of
+the two tiles. With the word filter in place the emitter fails loudly and
+specifically (`no segbits for feature "RIOB33_SING.IOB_Y0....SLEW.SLOW"`) rather
+than producing a padless image, which is the right intermediate state.
+
 ### Absence of a segbits feature does not mean a pip is unwritable
 
 `Device::pip_is_encodable` exists to keep the router off pips the DB cannot
