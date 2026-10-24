@@ -57,6 +57,43 @@ fn every_carry_lane_operand_is_routed() {
     let placed = place(&packed, &xdev).expect("place");
     let routed = route(&placed, &xdev).expect("route");
 
+    // A registered output that consumes a carry sum is placed in the paired
+    // slice and uses FFMUX.XOR there. Its source bit must reach the lane LUT
+    // input as well as the raw FF.D endpoint, or the mirrored carry sum is
+    // constant. This guards the ZedBoard failure where count_24 reached D2
+    // but never reached SLICEL D6 / IMUX42.
+    let output_ff = packed
+        .ffs
+        .iter()
+        .find(|ff| ff.q_net == "LD0")
+        .expect("LD0 FF");
+    let output_placed = placed
+        .ffs
+        .iter()
+        .find(|ff| ff.name == output_ff.name)
+        .expect("placed LD0 FF");
+    let input_wire = format!(
+        "CLBLM_L_{}6",
+        output_placed.bel.chars().next().unwrap_or('A')
+    );
+    let routed_output_d = routed
+        .nets
+        .iter()
+        .find(|net| net.net == output_ff.d_net)
+        .expect("LD0 D net route");
+    let reaches_paired_carry_input = match &routed_output_d.kind {
+        RouteKind::Pips(pips) => pips
+            .iter()
+            .any(|pip| pip.tile == output_placed.tile && pip.dst_wire == input_wire),
+        _ => false,
+    };
+    assert!(
+        reaches_paired_carry_input,
+        "registered output source `{}` must reach paired carry input {input_wire} in {}; its raw D route alone does not feed FFMUX.XOR",
+        output_ff.d_net,
+        output_placed.tile
+    );
+
     // Collect every (site, pin) the router actually delivered a net to, from
     // the pips it emitted. A pip's destination wire is the interconnect wire;
     // the slice pin is reached from the tile that owns the site.

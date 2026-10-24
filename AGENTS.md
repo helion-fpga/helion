@@ -419,4 +419,6 @@ structural check still passes. Audit with `python3 work/altmux.py <ours.bit>
 <ref.bit>`; both decode, never diff FASM text. Background in
 `work/FINDING-round47-backbone.md`, `work/FINDING-round47-arms-reassessed.md`.
 
+### Carry-sum register routing
 
+When an output FF consumes a carry-chain sum and is assigned to the paired slice, its source net must reach both the raw FF D route and the matching lane LUT input (`A6`/`B6`/`C6`/`D6`). The emitter selects `FFMUX.XOR` for this case, so a route only to raw `D` does not feed the carry sum. The regression is `carry_operand_routed::every_carry_lane_operand_is_routed`; the ZedBoard example is `count_24` to `LD0` at `INT_R_X71Y44.IMUX42` / `CLBLM_L_D6`.
