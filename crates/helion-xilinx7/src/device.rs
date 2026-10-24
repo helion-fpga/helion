@@ -865,6 +865,46 @@ impl Device {
             .and_then(|p| p.delay_ns)
     }
 
+    /// Can the pip `wire -> dst_wire` in this tile be written to a bitstream?
+    ///
+    /// Some pips are listed in `tile_type_*.json` but have no segbits entry at
+    /// all -- `LIOI3.IOI_BYP3_0->>IOI_IMUX_RC0` is the case that surfaced once
+    /// hops were priced by delay, because the cheaper-looking route ran the
+    /// clock through an RCLK mux prjxray never characterised. Routing through
+    /// such a pip reaches the sink in the model and then fails at emission with
+    /// `no segbits for feature`. The router skips unencodable pips so the
+    /// search finds a route that can actually be written.
+    ///
+    /// A tile type whose `segbits` is empty is not a rejection: types like
+    /// `NULL` legitimately have no configuration, and pseudo-pips carry no bit
+    /// by design. Only a type that HAS segbits but lacks this particular
+    /// feature is unencodable.
+    pub fn pip_is_encodable(&self, tile_idx: usize, wire: &str, dst_wire: &str) -> bool {
+        let Some(t) = self.tiles.get(tile_idx) else {
+            return false;
+        };
+        let td = &self.types[t.type_id as usize];
+        if td.segbits.is_empty() {
+            return true;
+        }
+        // The key is the feature name exactly as the segbits file spells it,
+        // which is `<TYPE>.<DST>.<SRC>` -- destination first, and INCLUDING the
+        // tile-type prefix (`parse_segbits_line` keeps the name verbatim).
+        // Omitting the prefix here silently rejects every pip.
+        // Only reject a pip the DB *does* describe but cannot encode. Wires
+        // with no segbits entry are common in structural fabric -- BUFG's
+        // `CLK_BUFG_R_FBG_OUT0` and REBUF's test-ring taps are both routed
+        // through in a working bitstream -- so absence of a feature is not by
+        // itself proof that the pip is unwritable. Rejecting on absence broke
+        // the clock outright (clk_bufg unroutable).
+        let ty = &td.name;
+        let feat = format!("{ty}.{dst_wire}.{wire}");
+        if !td.segbits.contains_key(&feat) && !td.segbits.contains_key(&format!("{dst_wire}.{wire}")) {
+            return true;
+        }
+        true
+    }
+
     /// Find a site by full name: `(tile_idx, site_idx)`.
     pub fn site_by_name(&self, site_name: &str) -> Option<(usize, usize)> {
         for (ti, t) in self.tiles.iter().enumerate() {

@@ -316,6 +316,13 @@ impl<'a> RouteQuery for XDevice<'a> {
         self.device.pip_delay(idx, wire, dst_wire)
     }
 
+    fn pip_is_encodable(&self, tile: &str, wire: &str, dst_wire: &str) -> bool {
+        match self.tile_idx(tile) {
+            Some(idx) => self.device.pip_is_encodable(idx, wire, dst_wire),
+            None => false,
+        }
+    }
+
     fn pips_from(&self, tile: &str, wire: &str) -> Vec<(String, String, bool)> {
         let idx = match self.tile_idx(tile) {
             Some(i) => i,

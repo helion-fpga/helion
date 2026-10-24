@@ -74,6 +74,16 @@ pub trait RouteQuery {
     fn pip_delay(&self, _tile: &str, _wire: &str, _dst_wire: &str) -> Option<f64> {
         None
     }
+    /// Can `wire -> dst_wire` in `tile` be written to a bitstream?
+    ///
+    /// Some pips exist in `tile_type_*.json` but have no segbits, so prjxray
+    /// never reverse-engineered the bit -- `LIOI3.IOI_BYP3_0->>IOI_IMUX_RC0`
+    /// is one. Routing through one reaches the sink in the model and then
+    /// fails at emission with `no segbits for feature`. Defaults to `true` so
+    /// minimal test routers are unaffected.
+    fn pip_is_encodable(&self, _tile: &str, _wire: &str, _dst_wire: &str) -> bool {
+        true
+    }
     /// Tile type (e.g. `CLK_BUFG_BOT_R`) for a tile name, if known. The clock
     /// buffer rule keys on this: wire names inside a BUFG are position- and
     /// family-dependent, but the tile type is stable.
@@ -882,6 +892,16 @@ fn bfs_route_all(
         // connections like the OLOGIC bypass, traversed but not emitted).
         for (dst_wire, src_w, is_pseudo) in device.pips_from(&tile, &wire) {
             debug_assert_eq!(src_w, wire);
+            // A real pip the DB cannot encode is not a usable route: selecting
+            // it reaches the sink in the model and then fails at emission with
+            // `no segbits for feature`. `LIOI3.IOI_BYP3_0->>IOI_IMUX_RC0` is
+            // the case that surfaced once hops were priced by delay -- the
+            // cheaper-looking route ran the clock through an RCLK mux prjxray
+            // never characterised. Skipping it makes the search find a route
+            // that can actually be written.
+            if !is_pseudo && !device.pip_is_encodable(&tile, &wire, &dst_wire) {
+                continue;
+            }
             expansions += 1;
             // A clock buffer tile may only ever be crossed on one of two
             // kinds of transition:
