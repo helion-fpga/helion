@@ -1560,35 +1560,24 @@ fn tightest_period_ps(xdc: &Constraints) -> u64 {
         .unwrap_or(10_000)
 }
 
-/// Apply parsed XDC pin constraints to a design's ports.
+/// Apply parsed XDC pin constraints to a design's ports for the 7-series flow.
 ///
-/// A bit-qualified key (`led[0]`) becomes `LOC[0]` on the vector port, which is
-/// what packing reads to give each bit its own pin. Shared by the bitstream and
-/// utilization commands so the two cannot drift.
+/// Uses `helion_xilinx7`'s mapper, NOT `helion_sta::Constraints::apply`. The two
+/// do different jobs and the difference matters here: `helion_sta` records a
+/// whole-port `LOC` via `Design::set_loc`, which cannot express a per-bit pin
+/// (`led[0]` and `led[7]` are different package pins of one port), whereas
+/// packing reads `LOC[<bit>]` attributes on the vector port to give each output
+/// bit its own IOB. Calling the wrong one silently dropped every vector-bit
+/// constraint and produced a bitstream with no output pads at all, exit code 0.
+///
+/// The mapper accepts both bit spellings: `led[0]` as an XDC usually writes it,
+/// and `led_0` as Helion's own `bit_name` spells a vector bit's net.
 fn apply_pin_constraints(design: &mut Design, xdc: &Constraints) {
-    for port in &mut design.ports {
-        for (key, pin) in &xdc.package_pins {
-            match key.as_str() {
-                k if k == port.name => port.attrs.set("LOC", pin.clone()),
-                k => {
-                    if let Some(rest) = k.strip_prefix(&format!("{}[", port.name)) {
-                        if let Some(bit) = rest.strip_suffix(']') {
-                            port.attrs.set(format!("LOC[{bit}]"), pin.clone());
-                        }
-                    }
-                }
-            }
-        }
-        for (key, std) in &xdc.iostandards {
-            if key == &port.name {
-                port.attrs.set("IOSTANDARD", std.clone());
-            } else if let Some(rest) = key.strip_prefix(&format!("{}[", port.name)) {
-                if let Some(bit) = rest.strip_suffix(']') {
-                    port.attrs.set(format!("IOSTANDARD[{bit}]"), std.clone());
-                }
-            }
-        }
-    }
+    let pc = helion_xilinx7::build::PinConstraints {
+        package_pins: xdc.package_pins.clone(),
+        io_standards: xdc.iostandards.clone(),
+    };
+    pc.apply(design);
 }
 
 fn cmd_bits_xilinx7(path: &str, part: &str, xdc: &Constraints, out: &str) {
@@ -1599,32 +1588,10 @@ fn cmd_bits_xilinx7(path: &str, part: &str, xdc: &Constraints, out: &str) {
             std::process::exit(1);
         }
     };
-    // Map the parsed XDC onto the design's ports. A bit-qualified key
-    // (`led[0]`) becomes `LOC[0]` on the vector port, which is what packing
-    // reads to give each output bit its own pin.
-    for port in &mut design.ports {
-        for (key, pin) in &xdc.package_pins {
-            match key.as_str() {
-                k if k == port.name => port.attrs.set("LOC", pin.clone()),
-                k => {
-                    if let Some(rest) = k.strip_prefix(&format!("{}[", port.name)) {
-                        if let Some(bit) = rest.strip_suffix(']') {
-                            port.attrs.set(format!("LOC[{bit}]"), pin.clone());
-                        }
-                    }
-                }
-            }
-        }
-        for (key, std) in &xdc.iostandards {
-            if key == &port.name {
-                port.attrs.set("IOSTANDARD", std.clone());
-            } else if let Some(rest) = key.strip_prefix(&format!("{}[", port.name)) {
-                if let Some(bit) = rest.strip_suffix(']') {
-                    port.attrs.set(format!("IOSTANDARD[{bit}]"), std.clone());
-                }
-            }
-        }
-    }
+    // Map the parsed XDC onto the design's ports via the 7-series mapper.
+    // This used to be a third, bracket-only copy of the same logic, which is
+    // how a flat-spelled constraint (`led_0`) got silently dropped here.
+    apply_pin_constraints(&mut design, xdc);
     let db_root = std::env::var("HELION_XILINX_DB")
         .ok()
         .map(std::path::PathBuf::from);
