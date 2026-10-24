@@ -355,6 +355,8 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         .chain(packed.iobs.iter().filter(|i| i.dir != crate::pack::IobDir::Out))
         .collect();
     for iob in io_order {
+        // Packing drops an output IOB whose port bit has no PACKAGE_PIN, so a
+        // missing `loc` here means a genuinely unplaceable IOB and stays fatal.
         let pin = iob.loc.as_deref().ok_or_else(|| {
             format!("place: IOB {} (port {}) has no PACKAGE_PIN LOC", iob.name, iob.port)
         })?;
