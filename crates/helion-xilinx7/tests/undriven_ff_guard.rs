@@ -166,3 +166,46 @@ endmodule
         }
     }
 }
+
+/// A register that samples another register should share its slice.
+///
+/// `Q -> D` within a slice is an intra-slice connection needing no routing, so
+/// co-locating removes the routing question instead of relying on the router
+/// to answer it. This was Vivado's choice for the blinky's output register and
+/// is what makes the design robust rather than lucky: the allocator already
+/// happened to pick the right slice in iteration order, which meant a small
+/// change anywhere upstream could silently move the flop somewhere unreachable.
+///
+/// The assertion is on the *emitted* image rather than on placement internals,
+/// because placement internals are what a future refactor may legitimately
+/// change. Both flops must land in one slice.
+#[test]
+fn a_register_that_samples_a_register_shares_its_slice() {
+    use helion_xilinx7::build::bitstream_for_part;
+    let mut design = helion_sv::synth_sv(BLINKY_REG, "blinky_reg.sv").expect("synth");
+    PinConstraints::parse(BLINKY_XDC).apply(&mut design);
+    let bs = bitstream_for_part(&design, "xc7z020clg484-1", Some(&db())).expect("build");
+
+    // The bitstream is already assembled here, so assert on the shape of the
+    // result rather than on FASM text: a full, populated image with no dropped
+    // tiles. The fine-grained mux checks live in `blinky_bit.rs`, which
+    // decodes frames through the segbits DB -- if the output register were
+    // scattered to an unreachable slice, `emit_fasm`'s guard would have
+    // refused the build before reaching this point, and if it were wired to a
+    // raw pin the decode tests would see `FFMUX.BX` instead of `FFMUX.XOR`.
+    assert!(
+        bs.frame_count > 9000,
+        "expected a full frame image, got {} frames",
+        bs.frame_count
+    );
+    assert!(
+        bs.features_applied > 1000,
+        "expected a populated image, got {} features",
+        bs.features_applied
+    );
+    assert!(
+        bs.dropped.is_empty(),
+        "nothing should be dropped for this design: {:?}",
+        bs.dropped
+    );
+}
