@@ -311,6 +311,11 @@ impl<'a> RouteQuery for XDevice<'a> {
             .map(|s| s.to_string())
     }
 
+    fn pip_delay(&self, tile: &str, wire: &str, dst_wire: &str) -> Option<f64> {
+        let idx = self.tile_idx(tile)?;
+        self.device.pip_delay(idx, wire, dst_wire)
+    }
+
     fn pips_from(&self, tile: &str, wire: &str) -> Vec<(String, String, bool)> {
         let idx = match self.tile_idx(tile) {
             Some(i) => i,
