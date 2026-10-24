@@ -357,6 +357,8 @@ fn bit_suffix(net: &str) -> Option<u32> {
 pub fn pack(netlist: &Design) -> Result<Packed7, String> {
     let pins = netlist.pin_index();
     let mut out = Packed7::default();
+    // Output IOBs dropped because their port bit has no PACKAGE_PIN.
+    let mut unconstrained_outputs: Vec<String> = Vec::new();
 
     // Cells that a CARRY4 owns, and that must therefore NOT be packed as
     // free-standing LUTs.
@@ -455,13 +457,26 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                     .unwrap_or(&cell.name)
                     .to_string();
                 let port = resolve_port(netlist, &pad, &cell.name);
+                // An output IOB whose port bit has no PACKAGE_PIN is DROPPED,
+                // matching Vivado, which leaves an unconstrained port unbonded
+                // and still completes the build.
+                //
+                // A vector output is packed one IOB per bit, so `output reg
+                // [7:0] led` with an XDC that constrains only `led[0]` -- the
+                // common case, and what nearly every board tutorial writes --
+                // used to abort the whole build. Keeping the IOB but not
+                // placing it is not enough: its net has a load endpoint and no
+                // driver, so routing then failed with "no wire for load .O".
+                // Dropping it here removes the pad from the netlist entirely,
+                // so the unconstrained bit is never built.
+                let loc = port_attr(netlist, &port, &pad, &cell.name, "LOC").map(str::to_string);
+                if loc.is_none() {
+                    unconstrained_outputs.push(format!("{} (port {})", cell.name, port));
+                    continue;
+                }
                 out.iobs.push(PackedIob {
                     name: cell.name.clone(),
-                    // The PAD net, not the driver: for a vector output it is
-                    // bit-qualified (`led_0`), which is what identifies the
-                    // `LOC[0]` constraint. The driver net (`cnt_26`) says
-                    // nothing about which pin this IOB owns.
-                    loc: port_attr(netlist, &port, &pad, &cell.name, "LOC").map(str::to_string),
+                    loc,
                     iostandard: port_attr(netlist, &port, &pad, &cell.name, "IOSTANDARD")
                         .map(str::to_string)
                         .unwrap_or_else(|| "LVCMOS33".to_string()),
@@ -543,6 +558,14 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
 
     insert_clock_spine(netlist, &mut out)?;
     insert_data_input_iobs(netlist, &mut out)?;
+
+    if !unconstrained_outputs.is_empty() {
+        eprintln!(
+            "pack: WARNING: {} output IOB(s) have no PACKAGE_PIN and were dropped: {}",
+            unconstrained_outputs.len(),
+            unconstrained_outputs.join(", ")
+        );
+    }
 
     Ok(out)
 }
