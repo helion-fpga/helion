@@ -226,3 +226,25 @@ Round 42 disproved a hand-derived routing topology by asking the node graph;
 this disproved a "missing flop" by reading the actual source. Both premises had
 been assumed rather than checked.
 
+### Instrument the predicate before editing it
+
+`mux_for_ff` picks `XOR` when a carry element publishes the net on the flop's
+`D`, else `O6` for a LUT-fed flop. On the registered blinky the LD0 register
+emits `BFFMUX.O6` where the reference emits `DFFMUX.XOR`, which reads like a
+broken predicate. A trace printing `d_net` and whether the predicate matched
+showed **25 of 26 flops taking `XOR`**, including every counter bit; the single
+`O6` is the registered output, whose `D` genuinely is not a carry sum. The
+predicate was correct all along -- Vivado instead merged its output register
+into the chain's last lane, which is a placement and mapping decision, not an
+emitter fix.
+
+Note also that a register may legitimately sit in a slice that is also carrying
+the chain: `AFFMUX.XOR` (chain lane) and `BFFMUX.O6` (the register) are
+different lanes of one slice and coexist. Do not "fix" that into a conflict.
+
+The LED output path checks out feature-for-feature against the reference:
+`RIOB33_X73Y45` and `RIOI3_X73Y45` are **identical**, including
+`PULLTYPE.NONE`, `SLEW.SLOW`, `DRIVE.I12_I16` and `IN_TERM.NONE`. Do not look
+for an `OLOGIC.OQUSED` bit to confirm an output pad -- the known-good reference
+does not have one either, so its absence proves nothing.
+
