@@ -23,7 +23,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 /// nothing (`INT_R_X73Y46.IMUX34.WW2END0` is dark, `NR1END1` blinks). nextpnr
 /// avoids this by being delay-driven; this is the same idea, and it is what
 /// `tile_type_*.json`'s `src_to_dst.delay` was always there to support.
-const DEFAULT_HOP_PS: i64 = 45;
+pub const DEFAULT_HOP_PS: i64 = 45;
 
 fn hop_cost(delay_ns: Option<f64>) -> i64 {
     match delay_ns {
@@ -519,6 +519,68 @@ fn clock_row_rank(wire: &str) -> u32 {
     }
 }
 
+/// Extra cost charged for stepping onto a wire that feeds an IOB output mux,
+/// over and above the flat `DEFAULT_HOP_PS`.
+///
+/// The fabric DB carries **no delay data at all** -- `src_to_dst` exists as a
+/// key in 62 `tile_type_*.json` files and is empty in every one of them -- so
+/// `hop_cost` charges `DEFAULT_HOP_PS` for every hop on the device. The A*
+/// comment claims the search is delay-driven; on this DB it cannot be. Every
+/// way into a given mux therefore costs exactly the same, and the search stops
+/// at whichever one it reaches first.
+///
+/// Round 26 measured what that costs on hardware. On the LED pad's tile
+/// (`INT_R_X73Y46`) the arm `NR1END1` lights LD0; `WW2END0` leaves it dark.
+/// Our builds picked `NE2END1` (combinational) and `NW2END1` (registered) --
+/// neither is the arm the working reference uses. Round 42 proved all of them
+/// are electrically *reachable*, so this is a preference problem, not a
+/// connectivity one.
+///
+/// A tie-break cannot express the preference. The search `break`s the moment
+/// it reaches its sink, so it never expands the alternative arms at all: on
+/// the registered blinky `NW2END1` is pushed into `IMUX34` at cost 301 and
+/// `NR1END1` is never considered. The preference has to be part of the cost.
+///
+/// The reference reaches its arm with a short vertical turn:
+///
+/// ```text
+/// INT_R_X73Y45  NR1BEG1 <- ER1END1     (the tile directly below the pad)
+/// INT_R_X73Y46  IMUX34  <- NR1END1
+/// ```
+///
+/// `NR1END1` is a northward long line fed by `NR1BEG1` one row below -- one
+/// dedicated stitch. `NE2`/`NW2`/`WW` are diagonal arms fed laterally out of a
+/// neighbouring CLB, which is why the search finds them first: the counter's
+/// flops sit in that column.
+///
+/// The penalty is deliberately small relative to `DEFAULT_HOP_PS` (45). It
+/// only has to break a tie between arms of the same mux, and it must not
+/// make the search prefer a longer route that happens to end on a vertical
+/// long line -- that would trade a correct arm for a worse path. Other arms
+/// stay fully reachable; pads that legitimately use them are unaffected
+/// because within one mux every candidate pays the same flat hop.
+fn arm_penalty(wire: &str, dst_wire: &str) -> i64 {
+    // Only mux-entry wires are ranked. `IMUX<n>` is the slice/pad input mux
+    // naming in the interconnect tiles, and it is the only place where a
+    // choice of this kind is invisible to the delay model.
+    if !dst_wire.starts_with("IMUX") {
+        return 0;
+    }
+    match wire {
+        // Vertical long lines: the direct stitch along the column.
+        "NR1END1" | "SR1END1" => 0,
+        // Everything else pays ONE FULL HOP. Measured on the registered
+        // blinky, the arms into `INT_R_X73Y46.IMUX34` cost: `NR1END1` 314,
+        // `NW2END1` 302 -- the lateral arm is 12 units (about a quarter hop)
+        // shorter, so the search reaches it first and `break`s at the sink
+        // before the vertical arm is ever expanded. A penalty of 1 does not
+        // close a 12-unit gap; one hop does, and it bounds the detour to a
+        // single hop so the router cannot be lured onto an arbitrarily longer
+        // path just because it ends on a vertical long line.
+        _ => DEFAULT_HOP_PS,
+    }
+}
+
 /// Which end of the clock spine a wire belongs to; see `clock_row_rank`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClkRowEnd {
@@ -1008,7 +1070,12 @@ fn bfs_route_all(
                 continue;
             }
             let ng = cur_g.saturating_add(if use_delay {
+                // On this DB every fabric pip has `delay_ns == None`, so the
+                // first term is always `DEFAULT_HOP_PS`. `arm_penalty` is what
+                // actually distinguishes the ways into an IOB output mux; see
+                // its doc comment.
                 hop_cost(device.pip_delay(&tile, &wire, &dst_wire))
+                    .saturating_add(arm_penalty(&wire, &dst_wire))
             } else {
                 1
             });
