@@ -100,3 +100,35 @@ only fires for a design with exactly one output port, so multi-output designs
 silently lost every pad and reported `IO=0` while `done=1`.
 
 IOB relative site names are top-down: the upper IOB in a tile is `IOB_Y0` (see `XDevice::site_rel`). An output IOB's fabric entry is NOT `site.O` -- that is the pad side of the OBUF, and routing to it lands on a neighbouring tile's IMUX. Use `RouteQuery::iob_output_sink`, which resolves the OLOGIC's `D1` input. For LED0 (T22) the entry is `INT_R_X73Y46.IMUX34`, one tile north of the pad's own tile.
+
+### An XDC bit constraint has two spellings, and a dropped one is silent
+
+`led[0]` is what an XDC writes; `led_0` is what `bit_name` gives a vector bit's
+net. **Both must resolve**, and there is exactly one mapper that does it:
+`helion_xilinx7::build::PinConstraints::apply`. Do not hand-roll the mapping --
+the CLI used to carry two extra bracket-only copies, which is how the flat
+spelling got dropped on the bitstream path after another path had been fixed.
+
+`helion_sta::Constraints::apply` is a **different** function and wrong here: it
+records a whole-port `LOC` through `Design::set_loc`, which cannot express a
+per-bit pin (`led[0]` and `led[7]` are different package pins of one port),
+while packing reads `LOC[<bit>]` on the vector port to give each bit its own IOB.
+
+The failure mode is the worst kind, so do not trust exit code 0: an
+unrecognised key records no `LOC`, packing treats the bit as unconstrained and
+drops its IOB, and the build **succeeds** with a full-size bitstream, the full
+9996 frames and no output pads at all (1742 FASM, 0 `OLOGIC.OQUSED`). The
+existing assertions -- frame count, IDCODE, header package name,
+`features_applied > 2000` -- all pass on that broken image, because the baseline
+per-tile configuration dominates the count.
+
+The check that catches it is to count placed output sites against the number of
+constrained output bits; `crates/helion-xilinx7/tests/output_pads.rs` pins that
+for both spellings, that the two agree, that a partly-constrained vector keeps
+exactly its constrained bits, and that near-misses (`ledx_2`, `led_foo`) are
+still rejected. Verify a new guard fails on the broken code before trusting it.
+
+An IOB whose port bit has genuinely no `PACKAGE_PIN` is **dropped at pack time,
+not left unplaced** (Vivado warns and completes). Dropping it later does not
+work: the IOB keeps a load endpoint with no driver and routing then dies with
+`no wire for load .O`.
