@@ -558,6 +558,71 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
             );
         }
     }
+    // Find the other CLB half's slice for `site`, given the device model.
+    //
+    // `prefer_lower_row` makes the search prefer the row *below* the chain's
+    // last row when the caller is placing a register that merely reads a chain
+    // bit. That is where Vivado puts the blinky's output register: the 25-bit
+    // chain ends at `SLICEM_X0` lane A of row N, and its consumer sits in
+    // `SLICEL_X1` lane D of row N-1. Keeping the flop in the chain's own row is
+    // electrically fine but leaves the reference comparison off by one row for
+    // no benefit, and this flow has already spent several rounds unable to tell
+    // a benign row offset from a real defect.
+    fn sibling_slice(
+        device: &dyn DeviceQuery,
+        tile: &str,
+        site: &str,
+        _site_tile: &HashMap<String, String>,
+        prefer_lower_row: bool,
+    ) -> Option<(String, String)> {
+        // Enumerate the tile's own sites rather than guessing at names. The two
+        // halves of a CLB are `SLICE_X112Y45` (SLICEM) and `SLICE_X113Y45`
+        // (SLICEL) -- adjacent X, same Y -- and probing `x-1` first finds
+        // nothing of this tile at all.
+        let want_m = !device.slice_is_m(tile, site);
+        let pick = |t: &str| -> Option<String> {
+            device
+                .slices()
+                .into_iter()
+                .filter(|(tt, _)| tt == t)
+                .map(|(_, s)| s)
+                .find(|cand| cand != site && device.slice_is_m(t, cand) == want_m)
+        };
+        if !prefer_lower_row {
+            return pick(tile).map(|s| (tile.to_string(), s));
+        }
+        // The two CLB halves differ in **X**, not Y: `SLICE_X112Y45` is the
+        // SLICEM and `SLICE_X113Y45` the SLICEL of one tile. So "one row down"
+        // is (X sibling, Y-1), and probing the same X at Y-1 lands back on a
+        // SLICEM -- which then fails the `slice_is_m == want_m` test and
+        // silently falls through to the chain's own row.
+        let rest = site.strip_prefix("SLICE_X")?;
+        let (xs, ys) = rest.split_once('Y')?;
+        let x: i32 = xs.parse().ok()?;
+        let y: i32 = ys.parse().ok()?;
+        // Find the sibling half's X at the same row, then step down one row.
+        let sib_x = device
+            .slices()
+            .into_iter()
+            .filter(|(t, _)| t == tile)
+            .find(|(_, s2)| s2 != site && device.slice_is_m(tile, s2) == want_m)
+            .and_then(|(_, s2)| s2.strip_prefix("SLICE_X").map(|r| r.to_string()))
+            .and_then(|r| r.split_once('Y').map(|(xx, _)| xx.to_string()));
+        let _ = x;
+        if let Some(xx) = sib_x {
+            let below = format!("SLICE_X{xx}Y{}", y - 1);
+            for (t, s) in device.slices() {
+                if s == below && device.slice_is_m(&t, &s) == want_m {
+                    // The row below lives in a *different tile*, so return it
+                    // together with its tile; writing the site against the
+                    // chain's tile fails with "no rel site".
+                    return Some((t.clone(), s.clone()));
+                }
+            }
+        }
+        pick(tile).map(|s| (tile.to_string(), s))
+    }
+
     let alloc = |used: &mut HashSet<String>,
                      site_bels: &mut HashMap<String, HashSet<char>>,
                      site_tile: &mut HashMap<String, String>,
@@ -609,24 +674,67 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         //
         // Only when the source register is already placed: if it is not, there
         // is no slice to share and the generic allocator is correct.
+        // A register that samples another register (`LD0 <= count[24]`) must not
+        // be given a lane of the *source's own slice* when that slice is part of
+        // a carry chain. A lane in a chain slice is not just a spare flop: the
+        // carry column runs A->B->C->D through every configured lane, so adding
+        // one appends a stage to the chain. The blinky's 25-bit counter then
+        // became 26 lanes deep and LD0 stayed dark, while the working reference
+        // keeps the chain at 25 and puts the output register in the *sibling*
+        // slice of the same CLB (`SLICEM_X0` chain -> `SLICEL_X1` flop).
+        //
+        // A CLB has one SLICEM and one SLICEL half with separate carry columns,
+        // so the sibling slice is the correct home: still intra-tile, still no
+        // routing, but off the chain.
         let source_slice: Option<(String, String, char)> = packed
             .ffs
             .iter()
             .find(|f| f.q_net == ff.d_net)
             .and_then(|src| ff_slot.get(&src.name))
             .and_then(|(st, ss, _sl)| {
-                // Reuse the source's slice only if it still has a spare lane.
-                let taken = site_bels.get(ss)?;
-                BEL_LETTERS
+                // Prefer the sibling slice; fall back to the source's own slice
+                // only when the source is not on a carry chain, where an extra
+                // lane is harmless.
+                // `packed.carries` carries no placement, so ask the already
+                // placed carries which slice the chain actually occupies.
+                let on_chain = out
+                    .carries
                     .iter()
-                    .find(|c| !taken.contains(c))
-                    .map(|c| (st.clone(), ss.clone(), *c))
+                    .any(|c| c.tile == *st && c.site == *ss);
+                if on_chain {
+                    // Placement site names are `SLICE_X<n>Y<m>` with the two CLB
+                    // halves at *adjacent X coordinates* (`SLICE_X112Y42` is the
+                    // SLICEM, `SLICE_X113Y42` the SLICEL) -- NOT the `SLICEM_X0`
+                    // / `SLICEL_X1` spelling FASM uses. Renaming on the
+                    // SLICEM_/SLICEL_ prefix therefore matched nothing and
+                    // silently returned the source slice, putting the flop back
+                    // on the chain. Derive the sibling from the device instead.
+                    let (sib_tile, sib) = sibling_slice(&*device, st, ss, &site_tile, true)?;
+                    // The sibling half may not have been touched yet, so it has
+                    // no entry; an absent entry means no lanes taken, not
+                    // "unavailable". Reading it as the latter silently fell
+                    // back to the source slice and put the flop back on the
+                    // chain -- the exact bug this branch exists to avoid.
+                    let free = BEL_LETTERS.iter().find(|c| {
+                        site_bels.get(&sib).map_or(true, |t| !t.contains(c))
+                    });
+                    free.map(|c| (sib_tile.clone(), sib.clone(), *c))
+                } else {
+                    let taken = site_bels.get(ss)?;
+                    BEL_LETTERS
+                        .iter()
+                        .find(|c| !taken.contains(c))
+                        .map(|c| (st.clone(), ss.clone(), *c))
+                }
             });
         let (tile, site, letter) = match source_slice {
             Some((st, ss, c)) => (st, ss, c),
             None => alloc(&mut used_sites, &mut site_bels, &mut site_tile, device)?,
         };
-        site_bels.get_mut(&site).unwrap().insert(letter);
+        // A sibling slice chosen directly may never have been touched, so it
+        // has no `site_bels` entry yet. Create it rather than assuming the
+        // allocator already did.
+        site_bels.entry(site.clone()).or_default().insert(letter);
         used_sites.insert(site.clone());
         site_tile.entry(site.clone()).or_insert_with(|| tile.clone());
         if let Some(li) = lut_idx {
