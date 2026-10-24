@@ -14,6 +14,7 @@
 //! currently hold placeholder stage types and will grow the real flow logic.
 
 pub mod backend;
+pub mod bitimport;
 pub mod bitstream;
 pub mod build;
 pub mod db;

@@ -269,6 +269,20 @@ Two related traps, both hit for real:
   the adder lane; a flop on lane B is fed by routing. Four lanes share a slice,
   so matching on the slice alone is not enough.
 
+### Bitstream import: the reverse path is landed
+
+`crates/helion-xilinx7/src/bitimport.rs` reads a `.bit` back into frames:
+envelope TLV walk, Type-1 FDRI(count=0) + Type-2 header pair with a
+**27-bit** count (`& 0x07FF_FFFF` -- a 31-bit mask reads truncation on any
+payload over 128M words, which is every part), then the frame walk with
+202 zero pad words between `far_group`s. The Rust masks differ from the
+Python reference (`work/x7decode.py`) by exactly those two constants; keep
+the two decoders byte-compatible when you touch either. Goldens:
+`tests/fixtures/BLINK-242.bit` (1,010,808 payload words; `` frame window
+0x422380 w[89]=0x0A420800, w[90]=0x00010000`). The frames walk needs
+`HELION_XILINX_DB` and mirrors the writer's rule: walk `part.json`'s
+`frame_addresses()`, never the tilegrid union.
+
 ### Structure is not behaviour; decode the bitstream and run it
 
 Every structural check on this flow -- frame count, IDCODE, feature diff
