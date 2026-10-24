@@ -701,6 +701,90 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         lines.push(format!("{}.{}.PRECYINIT.{arm}", carry.tile, site_rel));
     }
 
+    // Arm the OPERAND input muxes on every carry row.
+    //
+    // `S` reads the slice pin `A6`, and from the tile model `A6` is reachable
+    // only through `IMUX4` (medium half) and `IMUX5` (large half):
+    //
+    //     CLBLM_R.CLBLM_IMUX4 -> CLBLM_M_A6
+    //     CLBLM_R.CLBLM_IMUX5 -> CLBLM_L_A6
+    //
+    // Nothing armed them, so the carry chain's operands floated while the
+    // chain itself was fully configured: the adder had no addend, the counter
+    // never incremented, and LD0 -- which shows the chain's MSB -- sat lit and
+    // frozen. Measured against the reference with `work/imuxcensus.py`: 7 IMUX
+    // arms against its 49, and on the body rows zero against seven.
+    //
+    // The arms and the wire each reaches come from the reference's own pattern,
+    // which is regular across every row:
+    //
+    //     IMUX4  <- FAN_BOUNCE1   -> M_A6      IMUX5  <- FAN_BOUNCE3  -> L_A6
+    //     IMUX12 <- WR1END2       -> M_B6      IMUX13 <- LOGIC_OUTS6  -> L_B6
+    //     IMUX35 <- FAN_BOUNCE5   -> M_C6      IMUX34 <- SR1BEG_S0    -> L_C6
+    //     IMUX43 <- WL1END1       -> M_D6      IMUX42 <- ER1END1      -> L_D6
+    //
+    // These are bypass-network arms, not general routing: the operands are
+    // distributed high-fanout signals (every lane of every row reads the same
+    // counter bit), which is precisely what that network exists for. The
+    // companion spans below (`FAN_ALT*`, and the `*BEG*` entries) carry the
+    // bits between tiles.
+    //
+    // The lane letter decides the mux pair: lane A uses the A6 pair, B the B6
+    // pair, and so on. Both halves are armed because the chain's summing lanes
+    // and its paired half each consume an operand.
+    {
+        // lane -> (medium-half arm, large-half arm), per the table above.
+        const LANE_ARMS: [(&str, &str); 4] = [
+            ("IMUX4.FAN_BOUNCE1", "IMUX5.FAN_BOUNCE3"),
+            ("IMUX12.WR1END2", "IMUX13.LOGIC_OUTS6"),
+            ("IMUX35.FAN_BOUNCE5", "IMUX34.SR1BEG_S0"),
+            ("IMUX43.WL1END1", "IMUX42.ER1END1"),
+        ];
+        // Spans the bypass network needs in order to carry the operands into
+        // the arms above. Emitted once per row, not per lane.
+        const ROW_SPANS: [&str; 6] = [
+            "FAN_ALT1.NL1BEG_N3",
+            "FAN_ALT3.NL1END_S3_0",
+            "FAN_ALT5.LOGIC_OUTS6",
+            "NL1BEG_N3.LOGIC_OUTS4",
+            "SR1BEG_S0.LOGIC_OUTS7",
+            "SW2BEG0.LOGIC_OUTS4",
+        ];
+        let mut carry_int_tiles: Vec<String> = Vec::new();
+        for carry in &placed.carries {
+            let Some(pc) = placed.packed.carries.iter().find(|c| c.name == carry.name) else {
+                continue;
+            };
+            // `CLBLM_R_X71Y39` -> `INT_R_X71Y39`: same coordinates, INT prefix.
+            // The input muxes live in the routing tile beside the CLB, not in
+            // the CLB, and every arm above is named on the INT tile.
+            let parts: Vec<&str> = carry.tile.split('_').collect();
+            if parts.len() < 3 {
+                continue;
+            }
+            let int_tile = format!("INT_{}_{}", parts[1], parts[2]);
+            if !carry_int_tiles.contains(&int_tile) {
+                carry_int_tiles.push(int_tile.clone());
+            }
+            for (lane, _letter) in ["A", "B", "C", "D"].iter().enumerate() {
+                // A lane past the end of its chain has no `S` net, so it has no
+                // operand to feed, and arming it would select an input for a
+                // mux whose output nothing reads.
+                if pc.lane_sum_net[lane].is_none() {
+                    continue;
+                }
+                let (m_arm, l_arm) = LANE_ARMS[lane];
+                lines.push(format!("{int_tile}.{m_arm}"));
+                lines.push(format!("{int_tile}.{l_arm}"));
+            }
+        }
+        for it in &carry_int_tiles {
+            for span in ROW_SPANS {
+                lines.push(format!("{it}.{span}"));
+            }
+        }
+    }
+
     // Routing pips: TILE.DST.SRC. Pseudo-pips are always-on hard
     // connections (e.g. OLOGIC bypass): traversed for connectivity but
     // never emitted (no configuration bits).
