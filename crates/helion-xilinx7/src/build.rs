@@ -494,14 +494,34 @@ pub fn bitstream_for_part(
 
 /// Does `key` name `port`? `Some(Some(bit))` for `led[3]` against `led`,
 /// `Some(None)` for an exact match, `None` if unrelated.
+///
+/// Both bit spellings are accepted. `led[3]` is what an XDC normally writes,
+/// but `led_3` is what Helion's own `bit_name` emits for a vector bit's net, so
+/// a constraint written in the flat form must resolve too. Accepting only the
+/// bracket form silently DROPPED every `led_0..led_7` constraint: no `LOC` was
+/// recorded, packing then treated the bits as unconstrained and dropped their
+/// IOBs, and the build finished with exit 0 and a bitstream containing no
+/// output pads at all. A silent wrong answer is worse than the hard error it
+/// replaced, so both spellings resolve here.
 fn bit_of_port(key: &str, port: &str) -> Option<Option<u32>> {
     if key == port {
         return Some(None);
     }
-    let open = key.rfind('[')?;
-    let close = key[open..].find(']')? + open;
-    if &key[..open] == port {
-        return key[open + 1..close].parse().ok().map(Some);
+    if let Some(open) = key.rfind('[') {
+        let close = key[open..].find(']')? + open;
+        if &key[..open] == port {
+            return key[open + 1..close].parse().ok().map(Some);
+        }
+    }
+    // Flat form: `led_3` for port `led`. Requires the separator so a port named
+    // `btn` does not swallow an unrelated `btnx`, and a digits-only suffix so
+    // `led_foo` is not read as a bit index.
+    if let Some(rest) = key.strip_prefix(port) {
+        if let Some(bit) = rest.strip_prefix('_') {
+            if !bit.is_empty() && bit.bytes().all(|c| c.is_ascii_digit()) {
+                return bit.parse().ok().map(Some);
+            }
+        }
     }
     None
 }
@@ -553,5 +573,20 @@ fn family_dir(db_root: &Path, part: &str) -> PathBuf {
         p
     } else {
         db_root.to_path_buf()
+    }
+}
+
+#[cfg(test)]
+mod round39_bit_of_port {
+    use super::bit_of_port;
+    #[test]
+    fn flat_and_bracket_forms_both_resolve() {
+        assert_eq!(bit_of_port("led_0", "led"), Some(Some(0)));
+        assert_eq!(bit_of_port("led_7", "led"), Some(Some(7)));
+        assert_eq!(bit_of_port("led[3]", "led"), Some(Some(3)));
+        assert_eq!(bit_of_port("led", "led"), Some(None));
+        assert_eq!(bit_of_port("clk", "led"), None);
+        assert_eq!(bit_of_port("ledx_0", "led"), None);
+        assert_eq!(bit_of_port("led_foo", "led"), None);
     }
 }
