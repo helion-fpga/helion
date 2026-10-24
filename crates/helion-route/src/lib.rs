@@ -629,7 +629,25 @@ pub fn route_with_guide(
             let Some(&(clb, ble)) = placed.lutff_sites.get(idx) else {
                 continue;
             };
+            // The IOB row sits directly north of the CLB row it belongs to, so
+            // a pad's driver must be strictly south of the pad. An IOB whose
+            // driver is not gets no route -- and this used to `continue` with
+            // no counter and no log, so the pad simply vanished from `nets`
+            // while the router still reported `overused = 0` and returned a
+            // complete-looking `Routed`. That is the same silent-drop shape as
+            // the `unwrap_or(0)` directly above, and the audit flags it as the
+            // second half of one finding for exactly that reason.
+            //
+            // Record it instead. It is still not routed -- there is nowhere
+            // legal to route it from -- but the caller can now see that an
+            // output pad is unconnected rather than discovering it on hardware.
             if clb.y <= iob_site.y {
+                undriven_iobs.push(format!(
+                    "{} (driver at CLB y{} is not south of pad y{})",
+                    packed_iob.map(|io| io.cell.clone()).unwrap_or_else(|| format!("iob#{ii}")),
+                    clb.y,
+                    iob_site.y
+                ));
                 continue;
             }
             nets.push(((clb.x, clb.y), (iob_site.x, iob_site.y), ble, ii));
