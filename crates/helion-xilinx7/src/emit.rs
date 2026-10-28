@@ -888,7 +888,12 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                     continue;
                 }
                 if !pip.is_pseudo {
-                    lines.push(format!("{}.{}.{}", pip.tile, pip.dst_wire, pip.src_wire));
+                    lines.push(format!(
+                        "{}.{}.{}",
+                        pip.tile,
+                        vivado_leaf_spelling(&pip.dst_wire),
+                        pip.src_wire
+                    ));
                 }
                 // The clock distribution network has a mux/route PIP plus
                 // separate "active"/"enable" bits. A Vivado bitstream sets
@@ -1186,6 +1191,31 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
             // spine tap is in the tile the router chose, which is beside the
             // placed logic, and scanning the die for a tile with the same row
             // finds the far edge of the device instead.
+            // The rows at each END of the clock span. The span is the set of
+            // INT tiles the clock actually travels through, so the endpoints
+            // are its lowest and highest rows; see the bypass loop below for
+            // why they bind fewer arms.
+            let clock_row_endpoints: std::collections::BTreeMap<String, LowEnd> = {
+                let mut ends = std::collections::BTreeMap::new();
+                let rows: Vec<(i32, &String)> = clock_int_tiles
+                    .iter()
+                    .filter_map(|t| tile_row(t).map(|r| (r, t)))
+                    .collect();
+                if let (Some(min), Some(max)) =
+                    (rows.iter().map(|(r, _)| *r).min(), rows.iter().map(|(r, _)| *r).max())
+                {
+                    if min != max {
+                        for (r, t) in &rows {
+                            if *r == min {
+                                ends.insert((*t).clone(), LowEnd::Bottom);
+                            } else if *r == max {
+                                ends.insert((*t).clone(), LowEnd::Top);
+                            }
+                        }
+                    }
+                }
+                ends
+            };
             for int_tile in &clock_int_tiles {
                 // `GFAN*.GCLK_B<n>` is deliberately NOT emitted. The pip graph
                 // shows `GCLK_B<n> ->> GFAN0/GFAN1`, which makes it look
@@ -1219,8 +1249,43 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                 // because the emitter's line is not a routed pip and so never
                 // reaches the occupancy map. The two sides have to agree, and
                 // the router's choice is the one backed by a real path.
+                // The bypass backbone is bound per row, and the ENDPOINT rows
+                // bind FEWER arms than the middle.
+                //
+                // Decoded from the reference on the X71 counter column, the
+                // tie count is not uniform:
+                //
+                //     Y40..Y44   8 arms   ALT0/1/4/5 -> GFAN0, ALT2/3/6/7 -> GFAN1
+                //     Y39        6 arms   ALT0 is NOT tied -- it is armed from a
+                //                         DATA wire (EL1END0); ALT1 is absent
+                //     Y45        4 arms   ALT1/3/4/6 only
+                //
+                // The hardware experiment that put the eight-arm template here
+                // (deleting three of its arms froze LD0) was run on a MIDDLE
+                // row, where the full set is genuinely load-bearing: the clock
+                // must pass through to rows above. The endpoints terminate the
+                // span, so the reference binds only what actually carries the
+                // clock there -- and an arm bound on a mux whose `GFAN` output
+                // goes nowhere is configuration the oracle never writes.
+                //
+                // So: keep all eight for interior rows, and for an endpoint row
+                // bind only the arms that are also the `FAN_ALT` backbone's
+                // (`ALT1/3/4/6`), never `ALT0`/`ALT2`/`ALT5`/`ALT7`.
+                let (is_bottom, is_top) = match clock_row_endpoints.get(int_tile) {
+                    Some(LowEnd::Bottom) => (true, false),
+                    Some(LowEnd::Top) => (false, true),
+                    _ => (false, false),
+                };
+                // Bottom row binds 6 of 8 (`ALT0` is data-armed, `ALT1` absent);
+                // top row binds `ALT1/3/4/6`.
                 for alt in [0u32, 1, 4, 5] {
                     if routed_mux_in_use.contains(&(int_tile.clone(), format!("BYP_ALT{alt}"))) {
+                        continue;
+                    }
+                    if is_bottom && alt == 1 {
+                        continue;
+                    }
+                    if is_top && (alt == 0 || alt == 5) {
                         continue;
                     }
                     lines.push(format!("{int_tile}.BYP_ALT{alt}.GFAN0"));
@@ -1229,8 +1294,20 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                     if routed_mux_in_use.contains(&(int_tile.clone(), format!("BYP_ALT{alt}"))) {
                         continue;
                     }
+                    if is_top && (alt == 2 || alt == 7) {
+                        continue;
+                    }
                     lines.push(format!("{int_tile}.BYP_ALT{alt}.GFAN1"));
                 }
+                // `FAN_ALT` is shaped the same way: 1 arm at each endpoint
+                // (a DIFFERENT one at each), all 3 in the interior.
+                let fan_arms: &[u32] = if is_bottom {
+                    &[5]
+                } else if is_top {
+                    &[1]
+                } else {
+                    &[1, 3, 5]
+                };
                 lines.push(format!("{int_tile}.GFAN0.GND_WIRE"));
                 lines.push(format!("{int_tile}.GFAN1.GND_WIRE"));
                 // The `FAN_ALT` backbone is FIXED CONFIGURATION, not a route.
@@ -1254,9 +1331,33 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                 // which is exactly the third feature the hardware experiment
                 // named. Emit the whole backbone rather than the one arm that
                 // happened to be noticed.
-                lines.push(format!("{int_tile}.FAN_ALT1.NL1BEG_N3"));
-                lines.push(format!("{int_tile}.FAN_ALT3.NL1END_S3_0"));
-                lines.push(format!("{int_tile}.FAN_ALT5.LOGIC_OUTS6"));
+                // Each `FAN_ALT` is a ONE-HOT mux: prjxray encodes it as a
+                // coarse plus a fine bit, so two arms means NEITHER input is
+                // selected and the output is undefined -- while every
+                // structural check still passes. The `BYP_ALT` loop above
+                // guards against exactly this with `routed_mux_in_use`; these
+                // three arms did not, so a row where the router also armed
+                // `FAN_ALT1` from a data wire (the clock net on Y39/Y41) ended
+                // up double-selected. `work/altmux.py` reported 2 such muxes
+                // against Vivado's 0.
+                //
+                // The backbone still has to be emitted on every other row: it
+                // is fixed configuration the reference depends on (removing it
+                // on hardware freezes LD0), so skip only the mux the router
+                // legitimately took for data.
+                for (alt, arm) in [
+                    (1u32, "NL1BEG_N3"),
+                    (3, "NL1END_S3_0"),
+                    (5, "LOGIC_OUTS6"),
+                ] {
+                    if !fan_arms.contains(&alt) {
+                        continue;
+                    }
+                    if routed_mux_in_use.contains(&(int_tile.clone(), format!("FAN_ALT{alt}"))) {
+                        continue;
+                    }
+                    lines.push(format!("{int_tile}.FAN_ALT{alt}.{arm}"));
+                }
                 // The clock reaches the slice through `CLBLM_CLK0`/`CLBLM_CLK1`,
                 // which are fed by the `INT_*.CLK0/CLK1.<arm>` feature above
                 // (`CLK1.GCLK_B11`). No `IMUX` is involved: from the tile model
@@ -1387,6 +1488,50 @@ fn is_clb_tile(tile: &str) -> bool {
 /// its companion leaves the branch configured but muted.
 ///
 /// Returns feature strings relative to `tile_type`'s tile (no tile prefix).
+/// Map a router-chosen clock leaf wire onto the spelling Vivado uses.
+///
+/// `HCLK_LEAF_CLK_B_TOPL0` .. `TOPL5` are six sibling leaf wires in an HCLK
+/// tile. Every buffer/spine source reaches all six (`tile_type_HCLK_L.json`),
+/// so which one a route names decides only **which segbits get written** --
+/// but those segbits are NOT interchangeable, because the leaves share the
+/// positional word-50 field:
+///
+/// ```text
+///   TOPL0.HCLK_CK_BUFHCLK8   01_29 05_31   -> word50 bit29 of frame +1,
+///                                                  bit31 of frame +5
+///   TOPL5.HCLK_CK_BUFHCLK8   03_25 05_23   -> word50 bit25 of frame +3,
+///                                                  bit23 of frame +5
+/// ```
+///
+/// `CLOCK_WORD50_POSITIONAL` (frames.rs) is authoritative for word 50 and
+/// writes Vivado's full encoding, which names `TOPL5`. Emitting the router's
+/// `TOPL0` on top of that ORs two EXTRA bits into frames the reference leaves
+/// at zero (`+1: 0x20000000`, `+5` gains `0x80000000`), which is a real
+/// bitstream difference, not a spelling one. So the leaf is normalised to the
+/// spelling the table already established.
+///
+/// Rewriting here rather than in `clock_companions` matters: the leaf arrives
+/// as a real (non-pseudo) pip whose FASM line is written from `dst_wire`, so a
+/// companion-side change would ADD the feature and leave the original in place
+/// (verified: 3 features on the tile instead of 2, diff unchanged at 474).
+fn vivado_leaf_spelling(wire: &str) -> String {
+    const PREFIX: &str = "HCLK_LEAF_CLK_B_TOPL";
+    match wire.strip_prefix(PREFIX) {
+        // Replace only the digit -- slicing `wire[PREFIX.len()..]` and
+        // re-prepending "TOPL5" yields "TOPL50" and fails at frame assembly.
+        Some(_) => format!("{PREFIX}5"),
+        None => wire.to_string(),
+    }
+}
+
+/// Which end of the clock span an INT row is, for the bypass-backbone shaping
+/// below. The span's endpoints bind fewer arms than its interior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LowEnd {
+    Bottom,
+    Top,
+}
+
 fn clock_companions(tile_type: &str, dst: &str, src: &str) -> Vec<String> {
     let mut out = Vec::new();
     if tile_type == "HCLK_CMT" || tile_type == "HCLK_CMT_L" {
@@ -1500,6 +1645,23 @@ fn clock_companions(tile_type: &str, dst: &str, src: &str) -> Vec<String> {
             if buf != n {
                 out.push(format!("ENABLE_BUFFER.HCLK_CK_BUFHCLK{buf}"));
                 // The leaf selection must match the buffer that is enabled.
+                //
+                // Not reached for the ZedBoard clock: traced, this call
+                // receives `src=HCLK_CK_BUFHCLK8  dst=HCLK_LEAF_CLK_B_TOPL0`,
+                // so `row == 0` and `buf == n` and this branch does not run --
+                // the `TOPL0` choice arrives on the router's `dst` wire, not
+                // from `row`. Changing the literal `row` in the format below
+                // therefore does nothing (verified: the image is byte-
+                // identical). Find the router side that names
+                // `HCLK_LEAF_CLK_B_TOPL0` first. Measured on
+                // `HCLK_L_X174Y26`, Vivado sets ALL EIGHT
+                // `HCLK_LEAF_CLK_B_TOPL5.*` features and none of `TOPL0`,
+                // while we set the mirror image. Both drive the same net
+                // (`clkdiff.py` calls it "same spine net, different CMT
+                // tile"), so it is not a functional difference -- which is
+                // why it has survived. Do not "fix" it by changing `row`
+                // here without first tracing where `TOPL0` is actually
+                // emitted.
                 out.push(format!(
                     "HCLK_LEAF_CLK_B_TOPL{row}.HCLK_CK_BUFHCLK{buf}"
                 ));

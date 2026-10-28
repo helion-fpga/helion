@@ -123,6 +123,12 @@ pub struct PackedCarry {
     /// Per-lane operand nets, MSB-last (`[A, B, C, D]`), as `(a, b)` nets.
     /// `None` is a constant-0 operand bit, already folded into the LUT INITs.
     pub lane_operands: [Option<(Option<String>, Option<String>)>; 4],
+    /// The slice-input pin (1..=6) each operand net lands on, per lane and
+    /// operand slot (`[a, b]`), `None` when unknown (routers fall back to 6).
+    /// The chain-start lane folds its +1 through `I2` (slice pin `A3`, fed by
+    /// `IMUX1`) — the hard route to `A6` while the mask reads `A3` left bit 0
+    /// sampling a VCC tie and froze the counter one increment past 2^24.
+    pub lane_operand_pins: [[Option<u8>; 2]; 4],
     /// Per-lane `S` / `DI` LUT INITs (`O6` / `O5`).
     pub lane_s_init: [u64; 4],
     pub lane_di_init: [u64; 4],
@@ -149,6 +155,7 @@ impl PackedCarry {
             chain_len: 1,
             cyinit: None,
             lane_operands: Default::default(),
+            lane_operand_pins: Default::default(),
             lane_s_init: [0; 4],
             lane_di_init: [0; 4],
             lane_sum_net: Default::default(),
@@ -601,6 +608,7 @@ fn pack_carry4(netlist: &Design, cell: &helion_ir::Cell) -> Result<PackedCarry, 
     // or `d` suffix for the S (O6) and DI (O5) functions respectively.
     let lane_letters = ["A", "B", "C", "D"];
     let mut lane_operands: [Option<(Option<String>, Option<String>)>; 4] = Default::default();
+    let mut lane_operand_pins: [[Option<u8>; 2]; 4] = Default::default();
     let mut lane_s_init = [0u64; 4];
     let mut lane_di_init = [0u64; 4];
     let mut lane_sum_net: [Option<String>; 4] = Default::default();
@@ -632,30 +640,29 @@ fn pack_carry4(netlist: &Design, cell: &helion_ir::Cell) -> Result<PackedCarry, 
             } else {
                 lane_di_init[lane] = init;
             }
-            // Operand nets: the pins the S/DI LUTs actually read.
+            // Operand nets: every LUT input pin that carries a net, with the
+            // slice pin (1..=6) it reaches (`I0`..`I5` -> `A1`..`A6`).
             //
-            // The synthesised S LUT takes its operand on `I5` (which reaches
-            // the slice as `A6`, matching the reference), while the DI LUT
-            // takes it on `I0`. Reading only `I0`/`I1` therefore finds nothing
-            // for a `q + 1` counter and leaves `lane_operands` as `None`, so
-            // the register bit is never registered as a sink on the carry's
-            // operand pin and the router is never asked to drive `A6`. Try
-            // both spellings rather than assuming one.
-            let pin_net = |name: &str| -> Option<String> {
-                ["I5", "I0", "I4", "I1"]
-                    .iter()
-                    .find_map(|p| pins.net_on(&lut.name, p).map(|s| s.to_string()))
-                    .filter(|_| !name.is_empty())
-            };
-            let _ = &pin_net;
-            let a = ["I5", "I0"]
+            // The plain lanes take their operand on `I5` (`A6`), the DI LUT
+            // its operand on `I0` (`A1`), and the chain-start lane folds its
+            // +1 through `I2` (`A3`/IMUX1). Probing only some spellings left
+            // the fold lane with no operand at all, so the router was never
+            // asked to drive `A3` and the mask sampled a VCC tie.
+            let mut ins: Vec<(u8, String)> = ["I5", "I4", "I3", "I2", "I1", "I0"]
                 .iter()
-                .find_map(|p| pins.net_on(&lut.name, p).map(|s| s.to_string()));
-            let b = ["I4", "I1"]
-                .iter()
-                .find_map(|p| pins.net_on(&lut.name, p).map(|s| s.to_string()));
+                .enumerate()
+                .filter_map(|(i, p)| {
+                    pins.net_on(&lut.name, p).map(|s| ((6 - i) as u8, s.to_string()))
+                })
+                .collect();
+            ins.sort_by_key(|(p, _)| std::cmp::Reverse(*p));
+            let the_pin = |slot: usize| ins.get(slot).map(|(p, _)| *p);
+            let the_net = |slot: usize| ins.get(slot).map(|(_, n)| n.clone());
+            let a = the_net(0);
+            let b = the_net(1);
             // Record operands once, from the S LUT (both lanes see the same pair).
             if is_s {
+                lane_operand_pins[lane] = [the_pin(0), the_pin(1)];
                 lane_operands[lane] = Some((a, b));
             }
         }
@@ -671,6 +678,7 @@ fn pack_carry4(netlist: &Design, cell: &helion_ir::Cell) -> Result<PackedCarry, 
         chain_len,
         cyinit: attr("cyinit"),
         lane_operands,
+        lane_operand_pins,
         lane_s_init,
         lane_di_init,
         lane_sum_net,

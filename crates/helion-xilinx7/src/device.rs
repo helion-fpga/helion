@@ -773,6 +773,19 @@ impl Device {
                     let (Some(&ia), Some(&ib)) = (ia, ib) else { continue };
                     let ga = self.tiles[ta].wire_base + ia;
                     let gb = self.tiles[tb].wire_base + ib;
+                    if std::env::var("HELION_TRACE_STITCH").is_ok()
+                        && wa.contains("SR1BEG1")
+                        && self.tiles[ta].name.starts_with("INT_R_X71Y4")
+                    {
+                        eprintln!(
+                            "STITCH: entry delta {:?} ta={} tb={} union {}.{} <-> {}.{}",
+                            e.grid_deltas,
+                            self.tiles[ta].name,
+                            self.tiles[tb].name,
+                            wa, self.tiles[ta].name,
+                            wb, self.tiles[tb].name,
+                        );
+                    }
                     self.nodes.union(ga, gb);
                 }
             }
@@ -884,9 +897,15 @@ impl Device {
         let td = &self.types[t.type_id as usize];
         let s = *td.wire_idx.get(wire)?;
         let d = *td.wire_idx.get(dst_wire)?;
-        td.pips
+        // Walk the `pips_from` index rather than scanning the whole pip list:
+        // an INT tile carries several thousand pips and the BFS prices one hop
+        // per edge, so the linear find was the route stage's dominant cost
+        // once sink counts grew (the paired-half operand endpoints).
+        td.pips_from
+            .get(&s)?
             .iter()
-            .find(|p| p.src == s && p.dst == d)
+            .filter_map(|&pi| td.pips.get(pi as usize))
+            .find(|p| p.dst == d)
             .and_then(|p| p.delay_ns)
     }
 

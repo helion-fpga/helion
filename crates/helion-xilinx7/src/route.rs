@@ -6,7 +6,7 @@
 //! and the dedicated global clock network need no pips and are recorded
 //! as such for the emitter.
 
-use crate::place::Placed7;
+use crate::place::{Placed7, PlacedCarry};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
@@ -45,6 +45,15 @@ pub trait RouteQuery {
     fn site_pin_wire(&self, site: &str, pin: &str) -> Option<(String, String)>;
     /// All `(tile, wire)` that can drive a site input pin.
     fn wire_for_site_pin(&self, site: &str, pin: &str) -> Vec<(String, String)>;
+    /// The other SLICE site of `tile` — the mate half of a CLB tile. A carry
+    /// chain's S LUTs live in one half and its DI (generate) LUTs in the
+    /// other, and both read the same operand nets, so the router must be able
+    /// to reach both halves. `None` when unknown (callers skip the paired
+    /// endpoint rather than guessing the sibling's name).
+    fn slice_pair(&self, tile: &str, site: &str) -> Option<String> {
+        let _ = (tile, site);
+        None
+    }
     /// Is this net on the dedicated global clock network (BUFG output)?
     fn is_clock_net(&self, net: &str) -> bool;
     /// Cost units charged for one hop, from the pip's propagation delay.
@@ -225,16 +234,41 @@ impl Routed7 {
         // this test is a safety net for a completely unrouted slice, and the
         // lane-accurate case is (1).
         let _ = idx;
+        // A slice's inputs are driven from the INT tile of the SAME grid
+        // position, not from the CLB tile: `CLBLM_R_X71Y51`'s operands arrive
+        // on `INT_R_X71Y51`'s `IMUX<n>` outputs. Comparing the pip's tile to
+        // the CLB name directly never matches, which made this whole branch
+        // dead and rejected every flop whose `D` came from routing rather than
+        // from its own slice -- the internal-clock design failed to build with
+        // "takes AFFMUX.AX ... but no routed net ends at that slice" while its
+        // `d` net was demonstrably routed to `INT_R_X71Y51.IMUX43`.
+        let int_tile = int_tile_for_clb(tile);
         self.nets.iter().any(|n| {
             if let RouteKind::Pips(pips) = &n.kind {
                 pips.iter().any(|p| {
-                    p.tile == tile && p.dst_wire.starts_with("IMUX")
+                    (p.tile == tile || Some(p.tile.as_str()) == int_tile.as_deref())
+                        && p.dst_wire.starts_with("IMUX")
                 })
             } else {
                 false
             }
         })
     }
+}
+
+
+/// The `INT` tile that feeds a `CLB` tile of the same grid position.
+///
+/// 7-series keeps them as separate tiles with different type letters, so the
+/// mapping is by suffix: `CLBLM_R_X71Y51` / `CLBLL_L_X71Y51` ->
+/// `INT_R_X71Y51` / `INT_L_X71Y51`. Returns `None` for anything that is not a
+/// CLB, so callers fall back to an exact name match.
+fn int_tile_for_clb(tile: &str) -> Option<String> {
+    let rest = tile
+        .strip_prefix("CLBLM_")
+        .or_else(|| tile.strip_prefix("CLBLL_"))?;
+    // `R_X71Y51` -> `INT_R_X71Y51`
+    Some(format!("INT_{rest}"))
 }
 
 /// Slice index 0..3 for a BEL (`"AFF"`, `"BFF"`, ...).
@@ -312,7 +346,24 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         let bel = ff_bel.get(ff.name.as_str()).copied().unwrap_or("AFF");
         // Q is per-BEL (AQ/BQ/CQ/DQ); D and CLK are slice-shared.
         let bel_letter = bel.chars().next().unwrap_or('A');
-        add_ep(ff.d_net.clone(), site.to_string(), "D", false);
+        // A flop whose D is a CARRY4 sum selects `FFMUX.XOR`, which taps the
+        // adder inside the slice: the raw `D` pin is NOT read by that flop.
+        // Emitting a routed `D` sink for it anyway put a load inside the
+        // flop's own CLB tile on a net whose only other sinks are the carry
+        // lanes, and the router then competed with those lanes for the tile's
+        // one-hot input arms -- `count_24` and the four Y44 operands ripped
+        // each other up without converging. Sinks the flop actually reads are
+        // added below (`D6` for FFMUX.XOR).
+        let xor_flop = placed.packed.carries.iter().any(|carry| {
+            carry
+                .lane_sum_net
+                .iter()
+                .flatten()
+                .any(|sum| crate::emit::same_bit(sum, &ff.d_net))
+        });
+        if !xor_flop {
+            add_ep(ff.d_net.clone(), site.to_string(), "D", false);
+        }
         // The emitter mirrors a carry chain's lane functions into the paired
         // slice so a register in that half can select FFMUX.XOR. When that
         // register consumes the chain's top bit, its D net must also reach
@@ -322,51 +373,7 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         // un-driven. On the ZedBoard this omitted sink is
         // CLBLM_L_D6 <- IMUX42 at X71Y44 and freezes LD0 despite a routed
         // count_24 -> D path.
-        let source_chains: HashSet<&str> = placed
-            .packed
-            .carries
-            .iter()
-            .filter(|carry| {
-                carry
-                    .lane_sum_net
-                    .iter()
-                    .flatten()
-                    .any(|sum| crate::emit::same_bit(sum, &ff.d_net))
-            })
-            .map(|carry| carry.chain.as_str())
-            .collect();
-        let paired_carry_site = placed
-            .ffs
-            .iter()
-            .find(|placed_ff| placed_ff.name == ff.name)
-            .is_some_and(|placed_ff| {
-                placed.carries.iter().any(|carry| {
-                    if carry.tile != placed_ff.tile || carry.site == placed_ff.site {
-                        return false;
-                    }
-                    placed
-                        .packed
-                        .carries
-                        .iter()
-                        .find(|packed_carry| packed_carry.name == carry.name)
-                        .is_some_and(|packed_carry| {
-                            source_chains.contains(packed_carry.chain.as_str())
-                        })
-                })
-            });
-        if paired_carry_site {
-            let letter = bel.chars().next().unwrap_or('A');
-            add_ep(
-                ff.d_net.clone(),
-                site.to_string(),
-                &format!("{letter}6"),
-                false,
-            );
-        }
-        add_ep(ff.q_net.clone(), site.to_string(), &format!("{bel_letter}Q"), true);
-        if std::env::var("HELION_TRACE_CLK").is_ok() {
-            eprintln!("TRACE_CLK: ff {} clk_net={} site={}", ff.name, ff.clk_net, site);
-        }
+add_ep(ff.q_net.clone(), site.to_string(), &format!("{bel_letter}Q"), true);
         add_ep(ff.clk_net.clone(), site.to_string(), "CLK", false);
     }
     // Carry chains.
@@ -386,6 +393,7 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     // dedicated carry column it is, rather than being sent through the fabric
     // on a path the hardware does not use.
     for carry in &packed.carries {
+        let placed_carry = placed.carries.iter().find(|c| c.name == carry.name);
         let site = carry_site.get(carry.name.as_str()).copied().unwrap_or("");
         if site.is_empty() {
             // Unplaced carry: nothing to anchor endpoints to. Placement
@@ -402,14 +410,44 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
             // the BEL letters the emitter writes (`AS`..`DS`).
             let letter = ["A", "B", "C", "D"][lane];
             if let Some((a, b)) = &carry.lane_operands[lane] {
-                for net in [a, b].into_iter().flatten() {
-                    // The slice has no `AS` pin. A LUT's `S` input is wired to
-                    // the slice input pin `A6` (and `B6`..`D6`), which is what
-                    // the emitter configures and what the reference arms
-                    // through `IMUX4`/`IMUX5`. `AS` resolved to nothing, so
-                    // every carry operand endpoint was silently dropped and
-                    // the operands were never routed at all.
-                    add_ep(net.clone(), site.to_string(), &format!("{letter}6"), false);
+                for (slot, net) in [a, b].into_iter().enumerate() {
+                    let Some(net) = net else { continue };
+                    // Use the pin the LUT mask actually reads: the chain-start
+                    // lane folds its +1 through `A3` (`IMUX1`), the other
+                    // lanes read `A6`. Routing every operand to `A6` bound the
+                    // start mask to a VCC tie and froze bit 0 one increment
+                    // past the fold.
+                    let pin = carry.lane_operand_pins[lane][slot].unwrap_or(6);
+                    add_ep(net.clone(), site.to_string(), &format!("{letter}{pin}"), false);
+                    // The DI (generate) LUTs live in the tile's mate half and
+                    // read the same operand nets. Without endpoints there the
+                    // router arms their IMUXes at the mate half but leaves the
+                    // long-line loops behind them undriven, so every DI lane
+                    // but the register's own samples a VCC tie.
+                    // The mate half reads the SAME operand nets but on the
+                    // NEXT lane, wrapping into the next row's lane A. Seeding
+                    // one bit at a time into `~/CDA4253_A1/blinky.bit` and
+                    // reading the L-half pins shows it directly:
+                    //
+                    //     bit20 -> LY43D   bit21 -> LY44A   bit22 -> LY44B
+                    //     bit23 -> LY44C   bit24 -> LY44D
+                    //
+                    // i.e. the DI (generate) half is the carry-chain look-ahead
+                    // shifted by one lane, not a mirror of its own lane. Binding
+                    // the mate to the same lane put every L-half lane one bit
+                    // behind the reference and left `count_24` off `LY44D`
+                    // entirely, which is what `carry_operand_routed` reports.
+                    if let Some(pc) = placed_carry {
+                        let target = mate_lane_target(placed, device, pc, lane);
+                        if let Some((mate_site, mate_letter)) = target {
+                            add_ep(
+                                net.clone(),
+                                mate_site,
+                                &format!("{mate_letter}{pin}"),
+                                false,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -494,8 +532,29 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     }
     // net -> (kind, wires it occupies)
     let mut routed: HashMap<String, (RouteKind, Vec<(String, String)>)> = HashMap::new();
+    // Nets that terminate on an IOB output are the only ones the IMUX arm
+    // ranking protects (see `arm_penalty`): the LED pad's vertical arm beats
+    // its lateral one only by a bounded margin. Everything else — the carry
+    // operand muxes the reference direct-arms from LOGIC_LOOPS and fan
+    // muxes — routes unpenalised.
+    let pad_out_nets: HashSet<String> = net_eps
+        .iter()
+        .filter(|(_, eps)| {
+            eps.iter()
+                .any(|e| !e.is_driver && !device.iob_output_sink(&e.site).is_empty())
+        })
+        .map(|(net, _)| net.clone())
+        .collect();
     let mut order: Vec<String> = routable.iter().map(|s| (*s).clone()).collect();
     let mut ripped: usize = 0;
+    // Wires a net lost a rip-up contest over. A retry re-runs the identical
+    // search, so without this the router reproduces the same choice, loses the
+    // same mux again and cycles forever: on the 25-bit blinky `count_24` and
+    // the four Y44 operand nets all need arms in `INT_R_X71Y44`, and every
+    // sweep ripped the others up to take the same arm back. Forbidding the
+    // contested wires on the retry makes the net pick its next-best path
+    // instead. Cleared as soon as the net routes.
+    let mut avoid: HashMap<String, HashSet<(String, String)>> = HashMap::new();
     let mut queue: VecDeque<String> = order.drain(..).collect();
     let mut attempts = 0usize;
     let max_attempts = net_eps.len().saturating_mul(24).max(256);
@@ -514,6 +573,9 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         let drivers: Vec<&Endpoint> = eps.iter().filter(|e| e.is_driver).collect();
         let loads: Vec<&Endpoint> = eps.iter().filter(|e| !e.is_driver).collect();
         let mut blockers: Vec<(String, String)> = Vec::new();
+        let pad_out = pad_out_nets.contains(&net);
+        let avoiding: HashSet<(String, String)> =
+            avoid.get(&net).cloned().unwrap_or_default();
         match route_net(
             &net,
             drivers[0],
@@ -521,8 +583,11 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
             device,
             &occupied,
             Some(&mut blockers),
+            pad_out,
+            &avoiding,
         ) {
             Ok(kind) => {
+                avoid.remove(&net);
                 let wires = route_wires(&kind);
                 for w in &wires {
                     occupied.insert(w.clone());
@@ -558,9 +623,22 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
                 if displaced.is_empty() {
                     // Nothing in the way: genuinely unroutable, so report the
                     // real reason rather than looping.
-                    route_net(&net, drivers[0], &loads, device, &occupied, None)?;
+                    route_net(
+                        &net,
+                        drivers[0],
+                        &loads,
+                        device,
+                        &occupied,
+                        None,
+                        pad_out,
+                        &avoiding,
+                    )?;
                     unreachable!("route_net returned Ok after Err");
                 }
+                avoid
+                    .entry(net.clone())
+                    .or_default()
+                    .extend(blockers.iter().cloned());
                 queue.push_back(net);
                 for other in displaced {
                     queue.push_back(other);
@@ -727,11 +805,77 @@ fn clock_row_rank(wire: &str) -> u32 {
 /// long line -- that would trade a correct arm for a worse path. Other arms
 /// stay fully reachable; pads that legitimately use them are unaffected
 /// because within one mux every candidate pays the same flat hop.
-fn arm_penalty(wire: &str, dst_wire: &str) -> i64 {
-    // Only mux-entry wires are ranked. `IMUX<n>` is the slice/pad input mux
-    // naming in the interconnect tiles, and it is the only place where a
-    // choice of this kind is invisible to the delay model.
-    if !dst_wire.starts_with("IMUX") {
+/// Extra cost for an `HCLK` leaf-trunk edge, or 0 for the one to prefer.
+///
+/// `HCLK_L`/`HCLK_R` offer six sibling leaf trunks (`TOPL0..TOPL5`, and the
+/// mirrored `BOTL*`) fed from the SAME buffer, so a plain hop search picks one
+/// arbitrarily -- it picks `TOPL0`, whose spine trunk is `GCLK_L_B6`. But only
+/// one leaf can be enabled, and `emit.rs`'s `vivado_leaf_spelling` enables
+/// `TOPL5` (`GCLK_L_B11`) because that is the encoding `CLOCK_WORD50_POSITIONAL`
+/// already carries for this device.
+///
+/// Why a wrong leaf is a dead clock and not a spelling difference:
+///
+/// ```text
+///   HCLK_L:  BUFHCLK8 -> TOPL0  (spine GCLK_L_B6)
+///            BUFHCLK8 -> TOPL5  (spine GCLK_L_B11)
+///   INT_R.GCLK_B6  / GCLK_B11  <- driven ONLY from INT_L (tileconn [1,0])
+///   INT_L has no CLK0/CLK1 source of its own -- it only carries the trunk
+/// ```
+///
+/// So `INT_R.CLK1` arms a mux fed by a trunk nothing drives: the image is
+/// valid, every structural check passes, and the clock is dead. `work/bitsim.py`
+/// does not model clock taps at all, so it too reports success.
+///
+/// This is ranked on BOTH cost paths. Clock nets use flat hop costing, which
+/// skips `arm_penalty` entirely -- putting the rule there made it dead code,
+/// verified: `arm_penalty` was never once called with a leaf destination.
+fn leaf_penalty(dst_wire: &str, is_clock: bool) -> i64 {
+    if !is_clock || !dst_wire.starts_with("HCLK_LEAF_CLK_B_") {
+        return 0;
+    }
+    if dst_wire.ends_with("TOPL5") || dst_wire.ends_with("BOTL5") {
+        0
+    } else {
+        DEFAULT_HOP_PS
+    }
+}
+
+fn arm_penalty(wire: &str, dst_wire: &str, pad_out: bool) -> i64 {
+    // Only mux-entry wires are ranked, and only on a net whose sink is a pad
+    // output.
+    //
+    // The penalty exists for ONE measured case: the arms into the LED pad's
+    // `INT_R_X73Y46.IMUX34`, where a lateral feed is a quarter-hop shorter
+    // than the vertical the reference uses, so an unranked search always
+    // broke at the wrong arm. Applied fabric-wide it priced every CLB operand
+    // mux (the golden direct-arms them: `IMUX13 <- LOGIC_OUTS6`,
+    // `IMUX35 <- FAN_BOUNCE5`), which pushed the carry lanes' feeds onto
+    // long-line detours — and with the paired-half endpoints doubling those
+    // nets, the detour flood became the route stage's dominant cost.
+    // Carry operand muxes: the reference's arm choice is not a free variable.
+    //
+    // Decoded from `~/CDA4253_A1/blinky.bit`, the reference arms the same four
+    // operand muxes identically on EVERY row of the counter column:
+    //
+    //     IMUX4  <- FAN_BOUNCE1   IMUX12 <- WR1END2
+    //     IMUX5  <- FAN_BOUNCE3   IMUX13 <- LOGIC_OUTS6
+    //     IMUX42 <- ER1END1       IMUX43 <- WL1END1
+    //
+    // (Y45, the chain's last row, arms only `IMUX4` and `IMUX43`.) Ranking
+    // those sources first is what turns our per-row ad-hoc arms into the
+    // reference's uniform pattern; the alternatives stay reachable at one hop
+    // of extra cost, so the search still converges when a preferred family is
+    // taken by another net.
+    if !pad_out && dst_wire.starts_with("IMUX") {
+        let preferred = matches!(
+            wire,
+            "FAN_BOUNCE1" | "FAN_BOUNCE3" | "FAN_BOUNCE5" | "LOGIC_OUTS6" | "ER1END1"
+                | "WL1END1" | "WR1END2" | "SR1END1" | "NR1END1"
+        );
+        return if preferred { 0 } else { DEFAULT_HOP_PS };
+    }
+    if !pad_out || !dst_wire.starts_with("IMUX") {
         return 0;
     }
     match wire {
@@ -745,7 +889,21 @@ fn arm_penalty(wire: &str, dst_wire: &str) -> i64 {
         // close a 12-unit gap; one hop does, and it bounds the detour to a
         // single hop so the router cannot be lured onto an arbitrarily longer
         // path just because it ends on a vertical long line.
-        _ => DEFAULT_HOP_PS,
+        //
+        // Two hops, not one. Measured on the registered blinky, the arms into
+        // `INT_R_X73Y46.IMUX34` reach the sink at:
+        //
+        //     FAN_BOUNCE1  cur_g 298   NR1END1  cur_g 343
+        //
+        // a gap of EXACTLY `DEFAULT_HOP_PS`. A one-hop penalty therefore only
+        // ties (298+45 == 343+0) and the search still breaks at the lateral
+        // arm, because it reaches the sink first in expansion order. The gap
+        // and the hop cost being equal is a coincidence of this design, not a
+        // guarantee -- so prefer the vertical arm by a clear margin rather
+        // than by `<= 1`. The alternatives stay at `cur_g + 2*hop`, which is
+        // still far below the cost of any long detour, so a design that needs
+        // a lateral arm is not blocked: it just has to be the only way in.
+        _ => DEFAULT_HOP_PS.saturating_mul(2),
     }
 }
 
@@ -917,6 +1075,52 @@ fn is_site_internal_pin(pin: &str) -> bool {
     matches!(pin, "D" | "S" | "DI" | "O0" | "O1" | "O2" | "O3" | "CI" | "COUT" | "CIN")
 }
 
+
+/// Where a carry lane's operand must ALSO land on the mate half.
+///
+/// Returns `(site, lane_letter)`. On the paired (DI / generate) half the same
+/// operand appears one lane EARLIER, wrapping into the previous row's lane D.
+/// Measured against `~/CDA4253_A1/blinky.bit` by seeding a single bit and
+/// reading back every lane pin:
+///
+///     bit18 -> MY43C + LY43B     bit21 -> MY44B + LY44A
+///     bit19 -> MY43D + LY43C     bit22 -> MY44C + LY44B
+///     bit20 -> MY44A + LY43D     bit23 -> MY44D + LY44C
+///                                bit24 -> MY45A + LY44D
+///
+/// so the L lane is always one behind the M lane (`-1`), not one ahead; lane
+/// `A` therefore rolls back into the previous chain element's lane `D`.
+fn mate_lane_target(
+    placed: &Placed7,
+    device: &dyn RouteQuery,
+    carry: &PlacedCarry,
+    lane: usize,
+) -> Option<(String, char)> {
+    const LANES: [char; 4] = ['A', 'B', 'C', 'D'];
+    if lane != 0 {
+        let mate = device.slice_pair(&carry.tile, &carry.site)?;
+        return Some((mate, LANES[lane - 1]));
+    }
+    // Lane A's earlier lane is the previous chain element's lane D.
+    let packed = placed
+        .packed
+        .carries
+        .iter()
+        .find(|c| c.name == carry.name)?;
+    if packed.index == 0 {
+        return None;
+    }
+    let previous_name = placed
+        .packed
+        .carries
+        .iter()
+        .find(|c| c.chain == packed.chain && c.index + 1 == packed.index)
+        .map(|c| c.name.clone())?;
+    let previous = placed.carries.iter().find(|pc| pc.name == previous_name)?;
+    let mate = device.slice_pair(&previous.tile, &previous.site)?;
+    Some((mate, LANES[3]))
+}
+
 /// Route one net from its driver to all loads.
 fn route_net(
     net: &str,
@@ -925,6 +1129,8 @@ fn route_net(
     device: &dyn RouteQuery,
     occupied: &HashSet<(String, String)>,
     blocked: Option<&mut Vec<(String, String)>>,
+    pad_out: bool,
+    avoid: &HashSet<(String, String)>,
 ) -> Result<RouteKind, String> {
     // Split loads into site-internal and external.
     //
@@ -1008,7 +1214,18 @@ fn route_net(
         .iter()
         .any(|l| matches!(l.pin.as_str(), "C" | "CLK" | "I" | "I0" | "I1"));
     let is_clk = device.is_clock_net(net) || drives_clock_pin;
-    let pips = bfs_route_all(&src_tile, &src_wire, &sinks, device, occupied, !is_clk, blocked).ok_or_else(|| {
+    let pips = bfs_route_all(
+        &src_tile,
+        &src_wire,
+        &sinks,
+        device,
+        occupied,
+        !is_clk,
+        blocked,
+        pad_out,
+        avoid,
+    )
+    .ok_or_else(|| {
         format!(
             "route: net `{net}` unroutable to one or more of {} loads",
             external_loads.len()
@@ -1039,6 +1256,8 @@ fn bfs_route_all(
     // Occupied wires that stopped an expansion. Collected so a failed net can
     // rip up only the nets that actually blocked it, instead of every net.
     mut blocked: Option<&mut Vec<(String, String)>>,
+    pad_out: bool,
+    avoid: &HashSet<(String, String)>,
 ) -> Option<Vec<RoutedPip>> {
     let sink_set: HashSet<(&str, &str)> =
         sinks.iter().map(|(t, w)| (t.as_str(), w.as_str())).collect();
@@ -1055,9 +1274,14 @@ fn bfs_route_all(
     // the search at the target instead of flooding the fabric.
     //
     // `BinaryHeap` is a max-heap, so costs are negated. Ties break on the
-    // clock row first (see `clock_row_rank`) and then on the node name, to
-    // keep the result deterministic across runs.
-    let mut heap: BinaryHeap<Reverse<(i64, u32, Reverse<String>, Reverse<String>)>> =
+    // clock row first (see `clock_row_rank`) and then on a monotonic push
+    // counter, which is as deterministic as the old wire-name tie-break (the
+    // push order is data-driven and repeatable) without a full string memcmp
+    // per pop. The sampled profile had `BinaryHeap::pop` spending ~55% of the
+    // route stage in those compares once the paired-half endpoints doubled the
+    // long-detour nets; a unique `seq` makes every entry distinct, so the node
+    // strings are never compared at all.
+    let mut heap: BinaryHeap<Reverse<(i64, u32, u64, (String, String))>> =
         BinaryHeap::new();
     let mut g: HashMap<(String, String), i64> = HashMap::new();
     g.insert(start.clone(), 0);
@@ -1097,15 +1321,17 @@ fn bfs_route_all(
             .unwrap_or(0)
     };
     let mut found: HashSet<(String, String)> = HashSet::new();
+    let mut seq: u64 = 0;
     heap.push(Reverse((
         h(src_tile, &found),
         clock_row_rank(&start.1),
-        Reverse(start.0.clone()),
-        Reverse(start.1.clone()),
+        seq,
+        start.clone(),
     )));
+    seq += 1;
     let mut closes: HashSet<(String, String)> = HashSet::new();
     let mut expansions: usize = 0;
-    while let Some(Reverse((_, _, Reverse(tile), Reverse(wire)))) = heap.pop() {
+    while let Some(Reverse((_, _, _, (tile, wire)))) = heap.pop() {
         pops += 1;
         let cur = (tile.clone(), wire.clone());
         let cur_g = g.get(&cur).copied().unwrap_or(i64::MAX);
@@ -1231,6 +1457,9 @@ fn bfs_route_all(
             // `u_wshare_n80`, on the fanout feeding the clock-distribution
             // network -- which is why the design configured cleanly and still
             // did nothing.
+            if avoid.contains(&next) {
+                continue;
+            }
             if occupied.contains(&next) {
                 if let Some(b) = blocked.as_deref_mut() {
                     b.push(next.clone());
@@ -1293,13 +1522,25 @@ fn bfs_route_all(
             //
             // Only the `GFAN0`/`GFAN1` arms are the emitter's; every other
             // source of those muxes is ordinary routing and stays available.
+            // HCLK leaf-trunk preference, applied on BOTH cost paths.
+            //
+            // `arm_penalty` is skipped entirely for clock nets (`use_delay` is
+            // false for them), and the leaf pip is exactly a clock-net edge --
+            // so the ranking cannot live there. See `leaf_penalty`.
+            let leaf_cost = leaf_penalty(&dst_wire, !use_delay);
             let ng = cur_g.saturating_add(if use_delay {
                 // On this DB every fabric pip has `delay_ns == None`, so the
                 // first term is always `DEFAULT_HOP_PS`. `arm_penalty` is what
                 // actually distinguishes the ways into an IOB output mux; see
                 // its doc comment.
                 hop_cost(device.pip_delay(&tile, &wire, &dst_wire))
-                    .saturating_add(arm_penalty(&wire, &dst_wire))
+                    .saturating_add(arm_penalty(&wire, &dst_wire, pad_out))
+                    .saturating_add(leaf_cost)
+            } else if leaf_cost > 0 {
+                // Flat-hop path: any extra cost would break the "one per hop"
+                // invariant the clock spine relies on, so only the DISfavoured
+                // leaf pays, and it pays a full hop.
+                DEFAULT_HOP_PS
             } else {
                 1
             });
@@ -1314,22 +1555,24 @@ fn bfs_route_all(
                 g.insert(next.clone(), ng);
                 heap.push(Reverse((
                     ng.saturating_add(h(&next.0, &found)),
-                    // Clock-row preference comes BEFORE the name tie-break.
+                    // Clock-row preference comes BEFORE the tie-break.
                     //
                     // Every `HCLK_CMT_MUX_CLK_<n>` row costs the same, so the
-                    // name tie-break decides, and it picks the lexicographically
-                    // LARGEST wire: `MUX_CLK_9` beats `MUX_CLK_0`. That row is
-                    // wrong for a left-edge clock. The left HCLK consumes
-                    // `HCLK_CK_BUFHCLK8..11` as its `HCLK_CK_INOUT_L0..L3`
-                    // (`ppips_hclk_l.db`), so `BUFHCLK9` lands on `INOUT_L1`
-                    // while the HROW gets programmed for `CK_IN_L9`. The clock
-                    // dies at that mismatch, the FFs keep their init value, and
-                    // the LED lights without ever blinking. Row 0 is the row the
+                    // tie-break decides, and the name version picked the
+                    // lexicographically LARGEST wire: `MUX_CLK_9` beats
+                    // `MUX_CLK_0`. That row is wrong for a left-edge clock.
+                    // The left HCLK consumes `HCLK_CK_BUFHCLK8..11` as its
+                    // `HCLK_CK_INOUT_L0..L3` (`ppips_hclk_l.db`), so
+                    // `BUFHCLK9` lands on `INOUT_L1` while the HROW gets
+                    // programmed for `CK_IN_L9`. The clock dies at that
+                    // mismatch, the FFs keep their init value, and the LED
+                    // lights without ever blinking. Row 0 is the row the
                     // working Vivado bitstream uses for the ZedBoard GCLK.
                     clock_row_rank(&next.1),
-                    Reverse(next.0.clone()),
-                    Reverse(next.1.clone()),
+                    seq,
+                    next.clone(),
                 )));
+                seq += 1;
             }
         }
         // Across tileconn stitching. This is a real resource traversal, so it
@@ -1381,6 +1624,9 @@ fn bfs_route_all(
                 continue;
             }
             let next = (ntile.clone(), nwire.clone());
+            if avoid.contains(&next) {
+                continue;
+            }
             if occupied.contains(&next) {
                 if let Some(b) = blocked.as_deref_mut() {
                     b.push(next.clone());
@@ -1404,22 +1650,14 @@ fn bfs_route_all(
                 g.insert(next.clone(), ng);
                 heap.push(Reverse((
                     ng.saturating_add(h(&next.0, &found)),
-                    // Clock-row preference comes BEFORE the name tie-break.
-                    //
-                    // Every `HCLK_CMT_MUX_CLK_<n>` row costs the same, so the
-                    // name tie-break decides, and it picks the lexicographically
-                    // LARGEST wire: `MUX_CLK_9` beats `MUX_CLK_0`. That row is
-                    // wrong for a left-edge clock. The left HCLK consumes
-                    // `HCLK_CK_BUFHCLK8..11` as its `HCLK_CK_INOUT_L0..L3`
-                    // (`ppips_hclk_l.db`), so `BUFHCLK9` lands on `INOUT_L1`
-                    // while the HROW gets programmed for `CK_IN_L9`. The clock
-                    // dies at that mismatch, the FFs keep their init value, and
-                    // the LED lights without ever blinking. Row 0 is the row the
-                    // working Vivado bitstream uses for the ZedBoard GCLK.
+                    // Clock-row preference comes BEFORE the tie-break: see the
+                    // pip push above for why the wire-name tie-break sent a
+                    // left-edge clock into the wrong HCLK row.
                     clock_row_rank(&next.1),
-                    Reverse(next.0.clone()),
-                    Reverse(next.1.clone()),
+                    seq,
+                    next.clone(),
                 )));
+                seq += 1;
             }
         }
     }
@@ -1632,7 +1870,7 @@ mod tests {
             ("T".to_string(), "S2".to_string()),
         ];
         let empty = HashSet::new();
-        let pips = bfs_route_all("T", "A", &sinks, &MuxRouter, &empty, true, None).expect("all sinks");
+        let pips = bfs_route_all("T", "A", &sinks, &MuxRouter, &empty, true, None, false, &empty).expect("all sinks");
         assert!(pips.iter().any(|p| p.dst_wire == "S1"));
         assert!(pips.iter().any(|p| p.dst_wire == "S2"));
         // The mux input must be driven once, not unioned from two branches.
@@ -1642,7 +1880,7 @@ mod tests {
             ("T".to_string(), "S1".to_string()),
             ("T".to_string(), "NX".to_string()),
         ];
-        assert!(bfs_route_all("T", "A", &unreachable, &MuxRouter, &empty, true, None).is_none());
+        assert!(bfs_route_all("T", "A", &unreachable, &MuxRouter, &empty, true, None, false, &empty).is_none());
     }
 
     #[test]

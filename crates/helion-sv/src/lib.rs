@@ -3561,8 +3561,115 @@ fn stitch_own_into(
     prefix: &str,
     port_map: &HashMap<String, String>,
 ) {
+    stitch_own_into_with(dst, own, prefix, port_map, false)
+}
+
+/// `drop_iobs` splices out the child's IOB cells while stitching.
+///
+/// A child module is lowered on its own, so ITS output ports are shaped exactly
+/// like a top module's. Lowering `module inc4(input clk, output msb); ...
+/// assign msb = cnt[3]; endmodule` standalone yields
+///
+/// ```text
+///     cnt_3  u_ff3.Q, u_lut3.I3, u_iob.I     <- the real driver
+///     msb    u_iob.PAD                       <- and nothing else
+/// ```
+///
+/// so the `assign` never binds the port net to its source: the IOB cell IS the
+/// binding. Stitched into a parent, those cells kept the CHILD's port names
+/// (`u00_u_iob` with `PAD` on the parent's net `a`), which is why every
+/// hierarchical design died with
+/// `route: net 'a' has 0 drivers (need exactly 1)` -- and why a design with
+/// ONE child only appeared to work, since there the child's output was the
+/// whole design.
+///
+/// Dropping the cell alone makes it worse (the port loses its only link), so
+/// the PAD net is rewired onto the net that fed the dropped cell's `I` pin.
+/// That preserves exactly the connection the IOB represented, without handing
+/// the child a pinned pad.
+fn stitch_own_into_with(
+    dst: &mut Design,
+    own: &Design,
+    prefix: &str,
+    port_map: &HashMap<String, String>,
+    drop_iobs: bool,
+) {
     let t0 = std::time::Instant::now();
+    // dropped IOB cell -> net feeding its `I` pin (the true driver of the port)
+    let mut iob_src: HashMap<&str, &str> = HashMap::new();
+    if drop_iobs {
+        for c in &own.cells {
+            if !matches!(c.kind, CellKind::IobOut) {
+                continue;
+            }
+            if let Some(src) = own.nets.iter().find_map(|n| {
+                n.endpoints
+                    .iter()
+                    .any(|e| e.cell == c.name && e.pin == "I")
+                    .then_some(n.name.as_str())
+            }) {
+                iob_src.insert(c.name.as_str(), src);
+            }
+        }
+    }
+    // PAD net -> the source net that replaces it.
+    //
+    // Only splice when the PAD net has NO driver of its own. The two child
+    // shapes in the wild are
+    //
+    //   inc4   msb  u_iob.PAD                        (nothing drives the port)
+    //          cnt_3 u_ff3.Q, u_lut3.I3, u_iob.I      (the IOB is the link)
+    //   xor4   y    u_clut0_s0.O, u_iob.I, u_iob.PAD (port is self-driven)
+    //
+    // Splicing the second shape re-points the port at the IOB's I net and the
+    // real driver (`u_clut0_s0.O`) is dropped, which surfaced as
+    // `pack: LUT r0_u_clut0_s0 has no O net`.
+    let mut pad_splice: HashMap<&str, &str> = HashMap::new();
+    let mut self_driven_pads: HashSet<&str> = HashSet::new();
+    if !iob_src.is_empty() {
+        for n in &own.nets {
+            let pad_only_iob = n
+                .endpoints
+                .iter()
+                .any(|e| e.pin == "PAD" && iob_src.contains_key(e.cell.as_str()));
+            if !pad_only_iob {
+                continue;
+            }
+            // Endpoints that are real cell outputs (Q/O) mean the port already
+            // has a driver; leave it alone.
+            let driven_by_cell = n.endpoints.iter().any(|e| {
+                own.cells
+                    .iter()
+                    .any(|c| c.name == e.cell && !matches!(c.kind, CellKind::IobOut))
+                    && matches!(e.pin.as_str(), "Q" | "O")
+            });
+            // A self-driven port keeps its own net (splice would drop the
+            // real driver) but must still be relieved of the child's IOB.
+            let src = n.endpoints.iter().find_map(|e| {
+                (e.pin == "PAD").then(|| iob_src.get(e.cell.as_str()).copied()).flatten()
+            });
+            match (driven_by_cell, src) {
+                (false, Some(src)) => {
+                    pad_splice.insert(n.name.as_str(), src);
+                }
+                // Self-driven: keep the net as-is, but remember the PAD net so
+                // its IOB endpoints are filtered out like any other dropped
+                // cell (the `drop_iobs` endpoint filter already does this).
+                (true, Some(_)) => {}
+                _ => {}
+            }
+            if driven_by_cell {
+                self_driven_pads.insert(n.name.as_str());
+            }
+        }
+    }
+    let resolve = |name: &str| -> String {
+        pad_splice.get(name).map(|s| s.to_string()).unwrap_or_else(|| name.to_string())
+    };
     for c in &own.cells {
+        if drop_iobs && matches!(c.kind, CellKind::IobOut) {
+            continue;
+        }
         let mut name = String::with_capacity(prefix.len() + c.name.len());
         name.push_str(prefix);
         name.push_str(&c.name);
@@ -3572,37 +3679,85 @@ fn stitch_own_into(
             attrs: c.attrs.clone(),
         });
     }
-    for n in &own.nets {
-        let abs_name = if let Some(p) = port_map.get(n.name.as_str()) {
+    // Net identity comes from `port_map` FIRST: a child output net is `msb`
+    // there (`msb -> a`), and only then is it spliced onto its source
+    // `cnt_3`. Resolving the splice first looked like it worked but renamed
+    // the parent's `a` to the child-internal `cnt_3` and dropped it.
+    let abs_of = |n: &str| -> String {
+        if let Some(p) = port_map.get(n) {
             p.clone()
         } else if prefix.is_empty() {
-            n.name.clone()
+            n.to_string()
         } else {
-            let mut s = String::with_capacity(prefix.len() + n.name.len());
+            let mut s = String::with_capacity(prefix.len() + n.len());
             s.push_str(prefix);
-            s.push_str(&n.name);
+            s.push_str(n);
             s
-        };
-        let endpoints = n
-            .endpoints
-            .iter()
-            .map(|e| {
-                let mut cell = String::with_capacity(prefix.len() + e.cell.len());
-                cell.push_str(prefix);
-                cell.push_str(&e.cell);
-                Endpoint {
-                    cell,
-                    pin: e.pin.clone(),
-                }
+        }
+    };
+    // The net a PAD net was spliced ONTO (`cnt_3`) is now folded into the port
+    // net (`a`); emitting it separately would duplicate every endpoint and
+    // leave a shadow net with no reader.
+    let spliced_sources: HashSet<&str> = pad_splice.values().copied().collect();
+    for n in &own.nets {
+        if spliced_sources.contains(n.name.as_str()) {
+            continue;
+        }
+        // A spliced PAD net contributes its endpoints to its source net
+        // instead of becoming a net of its own; emitting both would leave one
+        // of them driverless.
+        // The spliced SOURCE net (`cnt_3`) supplies the endpoints, but the
+        // resulting net is still the PORT the PAD net was mapped to (`a`).
+        // Naming it after the source gave `u00_cnt_3`, a net nobody reads.
+        let src_net = resolve(n.name.as_str());
+        let abs_name = abs_of(n.name.as_str());
+        // Endpoints on a dropped IOB cell would name a cell that is not there.
+        let endpoints: Vec<Endpoint> = n_endpoints(own, &src_net)
+            .into_iter()
+            .filter(|e| !(drop_iobs && matches!(e.0, CellKind::IobOut)))
+            .map(|(_, cell, pin)| {
+                let mut c = String::with_capacity(prefix.len() + cell.len());
+                c.push_str(prefix);
+                c.push_str(&cell);
+                Endpoint { cell: c, pin }
             })
             .collect();
+        if endpoints.is_empty() {
+            continue;
+        }
         dst.merge_net(Net {
             name: abs_name,
             endpoints,
-            attrs: n.attrs.clone(),
+            attrs: n_attrs(own, &src_net),
         });
     }
     synth_sub_add(0, t0.elapsed().as_millis(), 0);
+}
+
+/// `(kind, cell, pin)` for every endpoint of net `n`, or of the merged net that
+/// `n` was spliced onto.
+fn n_endpoints<'a>(own: &'a Design, n: &str) -> Vec<(CellKind, String, String)> {
+    let kind_of = |cell: &str| {
+        own.cells
+            .iter()
+            .find(|c| c.name == cell)
+            .map(|c| c.kind.clone())
+            .unwrap_or(CellKind::IobOut)
+    };
+    own.nets
+        .iter()
+        .filter(|net| net.name == n)
+        .flat_map(|net| net.endpoints.iter())
+        .map(|e| (kind_of(&e.cell), e.cell.clone(), e.pin.clone()))
+        .collect()
+}
+
+fn n_attrs<'a>(own: &'a Design, n: &str) -> helion_ir::Attrs {
+    own.nets
+        .iter()
+        .find(|net| net.name == n)
+        .map(|net| net.attrs.clone())
+        .unwrap_or_default()
 }
 
 fn mark_debug_prefixed(dst: &mut Design, proto: &Rtl, prefix: &str) {
@@ -3805,7 +3960,7 @@ fn emit_module_into(
             };
             let cmap = abs_inst_port_map(child_ref, inst, prefix, &self_ports);
             let cs = soft_from_design(child_ref);
-            stitch_own_into(dst, child_ref, &child_prefix, &cmap);
+            stitch_own_into_with(dst, child_ref, &child_prefix, &cmap, true);
             cs
         } else if !ov.is_empty() && child_proto.insts.is_empty() {
             match elaborate_rtl(child_proto, &ov) {
@@ -3813,7 +3968,7 @@ fn emit_module_into(
                     let cd = lower_own_cached(&elab)?;
                     let cmap = abs_inst_port_map(&cd, inst, prefix, &self_ports);
                     let cs = soft_from_design(&cd);
-                    stitch_own_into(dst, &cd, &child_prefix, &cmap);
+                    stitch_own_into_with(dst, &cd, &child_prefix, &cmap, true);
                     cs
                 }
                 Err(e) => {
@@ -3841,6 +3996,92 @@ fn emit_module_into(
     Ok(summary)
 }
 
+/// Give every top-level output port that nothing yet pads an IOB cell.
+///
+/// `synth_rtl` binds pads only for outputs it sees on `rtl.assigns`, which
+/// covers a leaf design but NOT the hierarchical path: in
+///
+/// ```text
+///     module hier(input clk, output led);
+///         tog u0 (.clk(clk), .q(led));
+///     endmodule
+/// ```
+///
+/// `led` is driven by an instance output and has no `assign` of its own, so no
+/// pad was ever created and `run` failed with "the design has no placed output
+/// IOB to observe". The child's own IOB used to stand in for it by accident --
+/// the very cells that made every multi-child design unroutable -- so removing
+/// them exposed the missing root pad rather than causing it.
+fn bind_unbound_output_ports(d: &mut Design, proto: &Rtl) {
+    // Only the hierarchical path needs this, and only when the design has NO
+    // pads at all. `synth_rtl` builds pads for every output it sees on an
+    // `assign`, and those IOBs carry the DRIVER net (`cnt_19`..`cnt_26` on the
+    // ZedBoard blinky), which pack and the pin constraints rely on. Adding a
+    // second pad on the port-spelled net (`led_0`..`led_7`) renames the net
+    // the IOB points at and silently detaches all eight LEDs.
+    if d.cells.iter().any(|c| matches!(c.kind, CellKind::IobOut)) {
+        return;
+    }
+    let has_iob = |d: &Design, net: &str| {
+        d.nets.iter().any(|n| {
+            n.name == net
+                && n.endpoints.iter().any(|e| {
+                    e.pin == "PAD"
+                        && d.cells
+                            .iter()
+                            .any(|c| c.name == e.cell && matches!(c.kind, CellKind::IobOut))
+                })
+        })
+    };
+    let mut n = d
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::IobOut))
+        .count();
+    for (pname, dir, width) in &proto.ports {
+        if *dir != PortDir::Out {
+            continue;
+        }
+        let w = (*width).max(1);
+        for bit in 0..w.min(256) {
+            let net = if w == 1 {
+                (*pname).to_string()
+            } else {
+                format!("{pname}_{bit}")
+            };
+            // Only pad a port bit that something actually drives; a pad on an
+            // undriven net is the silent-dead-design failure this flow keeps
+            // getting bitten by.
+            let driven = d
+                .nets
+                .iter()
+                .find(|x| x.name == net)
+                .map(|x| {
+                    x.endpoints.iter().any(|e| {
+                        d.cells.iter().any(|c| {
+                            c.name == e.cell
+                                && !matches!(c.kind, CellKind::IobOut)
+                                && matches!(e.pin.as_str(), "Q" | "O")
+                        })
+                    })
+                })
+                .unwrap_or(false);
+            if !driven || has_iob(d, &net) {
+                continue;
+            }
+            let cell = if n == 0 {
+                "u_iob".to_string()
+            } else {
+                format!("u_iob{n}")
+            };
+            n += 1;
+            d.add_cell(&cell, CellKind::IobOut);
+            d.connect(&net, &cell, "I");
+            d.connect(&net, &cell, "PAD");
+        }
+    }
+}
+
 fn assemble_module(
     mods: &HashMap<String, Rtl>,
     name: &str,
@@ -3866,6 +4107,7 @@ fn assemble_module(
     }
     let summary = emit_module_into(mods, name, "", &port_map, &mut d, visiting)?;
     apply_soft_to_design(&mut d, &summary);
+    bind_unbound_output_ports(&mut d, proto);
     d.name = proto.module.to_string();
     Ok(d)
 }
@@ -10633,7 +10875,36 @@ fn parse_inst_net<'a>(p: &mut P<'a>) -> Option<&'a str> {
             }
         }
         if p.eat_sym('[') {
-            let mut d = 1i32;
+            // A plain `name[<const>]` bit select means that bit's own net,
+            // which the netlist spells `name_<bit>` (see `bit_name`). The
+            // brackets used to be skipped and the BASE name returned, which
+            // aliased every bit of the vector onto one net: with
+            //
+            //     inc4 u00 (.clk(clk), .msb(m[0]));
+            //     inc4 u01 (.clk(clk), .msb(m[1]));
+            //
+            // both instances connected to `m`, so the packed design saw two
+            // drivers on one net instead of one driver per bit.
+            // Peek the first token: only `[<const>]` followed immediately by
+            // `]` is a plain bit select. A range (`m[3:0]`) or an expression
+            // keeps the old whole-net behaviour rather than inventing a name.
+            let bit = match p.peek() {
+                Some(Tok::Number(v, _)) => Some(*v as usize),
+                _ => None,
+            };
+            p.bump();
+            // Consume the closing `]` of the bit select as well. Leaving it
+            // made `skip_until_arg_end` stop dead on `]`, so the caller's
+            // `eat_sym(')')` and the argument loop's `,` both failed and the
+            // connection list ended after the first bit-selected argument.
+            let bit = match (bit, p.peek()) {
+                (Some(b), Some(Tok::Sym(']'))) => {
+                    p.bump();
+                    Some(b)
+                }
+                _ => None,
+            };
+            let mut d = if bit.is_some() { 0 } else { 1i32 };
             while d > 0 && p.peek().is_some() {
                 if p.eat_sym('[') {
                     d += 1;
@@ -10643,6 +10914,17 @@ fn parse_inst_net<'a>(p: &mut P<'a>) -> Option<&'a str> {
                     p.bump();
                 }
             }
+            skip_until_arg_end(p);
+            if let Some(b) = bit {
+                // Fall through to the shared tail below rather than returning
+                // here: this arm used to `return` early, which left the
+                // argument loop's `,` unconsumed and truncated the connection
+                // list after the first bit-selected argument (`r0` got only
+                // `.a`, so `b`/`c`/`d` never connected).
+                let named = p.arena.alloc_str(&format!("{name}_{b}"));
+                return Some(named);
+            }
+            return Some(name);
         }
         skip_until_arg_end(p);
         return Some(name);
@@ -14678,6 +14960,105 @@ fn lower_unpacked_clocked_words<'a>(rtl: &Rtl, arena: &'a Bump) -> (Vec<(String,
     (out, lowered)
 }
 
+/// Read-side mux for a VARIABLE word index of an already-lowered unpacked
+/// array.
+///
+/// The write side of a small array lowers to one flop per bit
+/// (`<mem>_w<word>_<bit>`), but a read like `assign dout = mem[addr];` was left
+/// alone: the assign loop skips anything `rhs_unpacked_index` reports, on the
+/// grounds that walking a wide cone into a >96 AND term is not a LUT. That is
+/// right for a huge array and wrong for a register file -- at the depth the
+/// write side accepts (depth*width <= 128) the read is a mux tree over one-hot
+/// selects, which LUT6s are exactly the right primitive for.
+///
+/// The consequence of the skip was silent in the wrong direction: the memory
+/// itself lowered fine (flops exist, writes land), so the design looked almost
+/// built, but the read output had no driver and packing failed with
+/// `N output pad(s) have no driver`. Nothing in that message points at the
+/// array, so it reads like an IO problem.
+///
+/// Builds `(addr == 0) ? w0 : (addr == 1) ? w1 : ... : w<depth-1>` for one bit.
+/// The comparison against the LOW bit of `addr` is needed only when the depth
+/// exceeds 1, so a depth-1 array is a plain wire.
+fn unpacked_read_mux_expr<'a>(
+    rtl: &Rtl,
+    arena: &'a Bump,
+    mem: &str,
+    width: usize,
+    bit: usize,
+    addr_sig: &str,
+    addr_w: usize,
+) -> Option<Expr<'a>> {
+    let depth = sig_depth(rtl, mem);
+    if depth == 0 || depth > 64 {
+        return None;
+    }
+    // Word select: true when `addr` names word `k`. An AND over the addr bits
+    // that word `k` requires, each possibly inverted.
+    let a: &'a str = arena.alloc_str(addr_sig);
+    let mut acc: Option<Expr<'a>> = None;
+    for word in (0..depth).rev() {
+        let src = unpacked_word_q(mem, word, width, bit);
+        let cand: Expr<'a> = Expr::Var(arena.alloc_str(&src));
+        acc = Some(match acc {
+            None => cand,
+            Some(rest) => {
+                let mut sel: Option<Expr<'a>> = None;
+                for b in 0..addr_w.max(1) {
+                    let v: Expr<'a> = if addr_w <= 1 {
+                        Expr::Var(a)
+                    } else {
+                        Expr::Var(arena.alloc_str(&(bit_name(addr_sig, addr_w, b))))
+                    };
+                    let term: Expr<'a> = if (word >> b) & 1 == 1 {
+                        v
+                    } else {
+                        Expr::Not(arena.alloc(v))
+                    };
+                    sel = Some(match sel {
+                        None => term,
+                        Some(prev) => Expr::And(arena.alloc(prev), arena.alloc(term)),
+                    });
+                }
+                // A selector for an unreachable word never asserts.
+                let cond: Expr<'a> = sel.unwrap_or(Expr::Const(false));
+                Expr::Or(
+                    arena.alloc(Expr::And(arena.alloc(cond), arena.alloc(cand))),
+                    arena.alloc(rest),
+                )
+            }
+        });
+    }
+    acc
+}
+
+/// Match `mem[addr]` (or `mem[addr][hi:lo]`) and return
+/// `(mem, addr_signal, addr_width)`. Only a whole-word read with a plain
+/// signal index qualifies; anything else stays on the old path.
+fn unpacked_word_read<'x>(rhs: &'x RExpr<'x>, rtl: &Rtl) -> Option<(&'x str, &'x str, usize)> {
+    let mut stack: Vec<&'x RExpr<'x>> = vec![rhs];
+    while let Some(n) = stack.pop() {
+        match n {
+            RExpr::IndexPart { name, base, .. } => {
+                // `name` is the array; `base` is the word index (or a slice).
+                // Depth 1 counts: a one-word array is still storage, and its
+                // read is a plain pass-through of `mem_w0_<b>`. Requiring
+                // depth > 1 left it undriven, which surfaced as
+                // "output pad(s) have no driver" for a 1x4 memory.
+                if sig_depth(rtl, name) >= 1 {
+                    if let RExpr::Ident(a) = **base {
+                        let w = sig_width(rtl, a).max(1);
+                        return Some((name, a, w));
+                    }
+                }
+                stack.push(*base);
+            }
+            _ => push_rexpr_children(n, &mut stack),
+        }
+    }
+    None
+}
+
 /// Constant word index of an unpacked array. A signal index is not a constant.
 fn const_rexpr_usize(e: &RExpr<'_>) -> Option<usize> {
     match e {
@@ -15783,12 +16164,29 @@ fn emit_carry4_map(d: &mut Design, sum: &str, tag: &str, width: usize, map: &Car
             // (`0x0F0F_0F0F_0F0F_0F0F`). Matching the pin means the `S` LUT is a
             // pass-through too rather than a function compensating for the
             // wrong input, and it keeps the routing identical to Vivado's.
+            // EXCEPTION: the entry lane's `S` init is `~A3`, not the body-lane
+            // pass-through, so its operand must arrive on `I2` (slice pin `A3`,
+            // `IMUX1`) and NOT on `I5`/`A6`.
+            //
+            // Wiring it to `I5` like every other lane left the LUT reading
+            // `A6` while its mask was built for `A3`. `A3` was then driven by
+            // nothing, sampled the INT tile's VCC default, and `~A3` evaluated
+            // to 0 for every counter state -- bit 0 could never carry, so the
+            // whole chain sat frozen at 0 while every structural check passed
+            // (both images had `init = 0x0f0f0f0f0f0f0f0f` and `FFMUX.XOR`).
+            //
+            // Decoded from `GT-blinky.bit`, the reference's entry lane reads
+            // pin 3 = 0 and pin 6 = 1, i.e. it consumes `A3` and leaves `A6`
+            // floating high; ours read pin 3 = 1 and pin 6 = 0. Same INIT,
+            // opposite pins -- configuration was right and the route was
+            // wrong. `work/bitsim.py` pins the difference to bit 0 alone.
+            let entry_lane = bit == 0;
             let mut s_pins: Vec<(&str, &str)> = Vec::new();
             if let Some(an) = a {
-                s_pins.push((an, "I5"));
+                s_pins.push((an, if entry_lane { "I2" } else { "I5" }));
             }
             if let Some(bn) = b {
-                s_pins.push((bn, "I4"));
+                s_pins.push((bn, if entry_lane { "I3" } else { "I4" }));
             }
             emit_lut_pins(d, &s_cell, &s_net, s_init, &s_pins);
             d.connect(&s_net, &cell, &format!("{letter}S"));
@@ -18196,6 +18594,43 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         // into a >16 PI / >96 AND cone. Write-side Hffs, if any, still time.
         // A constant word index was already aliased above.
         if rhs_reads_seq_mem(rhs, rtl) || rhs_unpacked_index(rhs, rtl) {
+            // A read of an array whose WRITE side was lowered to a word of
+            // flops is a mux over those flops, not a wide cone: `mem[addr]`
+            // with addr a wire is one-hot selects over `<mem>_w<k>_<b>`. Try
+            // that before giving up, so a synthesizable register file does not
+            // lose its read port and then fail packing with the misleading
+            // "output pads have no driver".
+            let word_read = unpacked_word_read(rhs, rtl);
+            if let Some((mem, addr_sig, addr_w)) = word_read {
+              if lowered_unpacked.contains(mem) && sig_depth(rtl, mem) > 0 {
+                let w = sig_width(rtl, lhs).max(1);
+                let mw = sig_width(rtl, mem).max(1);
+                let mut all = true;
+                let mut bits: Vec<(String, Expr)> = Vec::new();
+                for i in 0..w {
+                    // Wider lhs than the stored word: high bits are zero.
+                    let e = if i < mw {
+                        unpacked_read_mux_expr(rtl, &arena, mem, mw, i, addr_sig, addr_w)
+                    } else {
+                        None
+                    };
+                    match e {
+                        Some(e) => bits.push((bit_name(lhs, w, i), e)),
+                        None if i >= mw => continue,
+                        None => {
+                            all = false;
+                            break;
+                        }
+                    }
+                }
+                if all && !bits.is_empty() {
+                    for (name, e) in bits {
+                        reg_bits.push((name, e));
+                    }
+                    continue;
+                }
+              }
+            }
             // word_pipeline_cap is the one diagnostic for an unrolled bound.
             if !lowered_unpacked.is_empty() && !word_pipeline_cap_for(&rtl.module) {
                 note_variable_index_read(&rtl.module, lhs);

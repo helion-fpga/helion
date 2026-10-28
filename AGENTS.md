@@ -161,26 +161,60 @@ clock edge: writing configuration into them makes the clock spine unroutable
 (`net clk_bufg unroutable to 25 loads`). Blinky's image must stay
 `ce510391ba5debb119d92137808d7839`.
 
-The borrowing is **not landed**, and the reason is structural. Splitting
-`segbits_riob33.db` by which words a feature needs shows the variant is not a
-subset but a clean split -- `IOB_Y1`'s 38 features all fit words 0..1, while
-`IOB_Y0`'s 43 all need words >=2 -- so a `RIOB33_SING` tile can only ever be
-`IOB_Y1`. Selecting the site is therefore the whole problem, and `alias.sites`
-is per **tile instance**, not per type:
+**Borrowing is landed for the half that fits, and refused for the half that
+does not.** The split is bit position, not word index: within the same two
+words, `IOB_Y1`'s features sit at bit positions 0..63 and `IOB_Y0`'s at 64..127.
+A `RIOB33_SING` tile hosts exactly one half, and `alias.sites` says which:
 
 ```
-RIOB33_SING_X73Y0 : start_offset=2  sites={"IOB33_Y0": "IOB33_Y0"}
-RIOB33_SING_X73Y49: start_offset=0  sites={"IOB33_Y0": "IOB33_Y1"}
+RIOB33_SING_X73Y49  alias {"IOB33_Y0": "IOB33_Y1"}  -> low half   fits, borrowed
+RIOB33_SING_X73Y0   alias {"IOB33_Y0": "IOB33_Y0"}  -> high half  cannot fit
 ```
 
-Both are keyed by the same local name while meaning different things, and
-`start_offset` is 2 in a base tile with 2 sites -- it indexes the die-level site
-list. `SegBitsDb` is keyed by tile **type**, so a correct borrow needs a
-per-instance table or a per-instance site selection at the FASM lookup. Do not
-"fix" this by aggregating the alias by type; that is silently wrong for one of
-the two tiles. With the word filter in place the emitter fails loudly and
-specifically (`no segbits for feature "RIOB33_SING.IOB_Y0....SLEW.SLOW"`) rather
-than producing a padless image, which is the right intermediate state.
+On the ZedBoard that is LED6 (U19) recovered and LED7 (U14) still unprogrammable
+from upstream segbits. `build_bitstream` pins the split exactly, rather than
+asserting an empty drop list -- requiring empty would forbid the working borrow
+as well as the impossible one.
+
+Three spellings of one site meet here and **none of them match**:
+
+```
+FASM / segbits    IOB_Y0
+tilegrid `sites`  IOB_X1Y49
+alias remap       IOB33_Y0 -> IOB33_Y1   (die-level names)
+```
+
+The alias VALUE names the site the base type knows it as, so the lookup must
+rewrite the local name wholesale (`IOB_Y0` -> `IOB_Y1`) instead of looking up
+or comparing the FASM name. Getting this wrong reads as "does not fit" and
+silently drops a pad that would have worked -- it cost several wrong turns here,
+including a fit test that rejected the good instance.
+
+The drop decision is per **instance**, never per type: the two `_SING` pads are
+one type and land on opposite sides of the split. `TileBitLayout::tile_alias`
+resolves it from the tilegrid, and `borrowed_bits_fit` in `build.rs` decides
+before the frame write so the writer never aborts mid-image.
+
+Work in **words from the block**, not in bit positions:
+
+```
+word = block.offset + start_offset + bitpos / 32
+```
+
+`start_offset` was parsed by nobody until recently, and a row-pair of IO tiles
+shares one 4-word budget: `RIOB33_SING_X73Y0` has `offset 0` but
+`start_offset 2`, so it owns words 2..3 of the pair, not 0..1. `IOB_Y1`'s bits
+(pos 0..63, i.e. words 0..1) land on 2..3 and fit; `IOB_Y0`'s (pos 64..127,
+words 2..3) land on 4..5 and do not. The fit test is therefore
+`bitpos / 32 < 2` **without** re-adding the skew -- adding it in both places
+double-counts and gives the opposite answer.
+
+Two wrong turns are worth knowing. First, `bitpos < 64` was used as if bit
+positions were word indices; it happened to give the right verdict for the
+right pad by accident. Second, on noticing `start_offset` was ignored, the fit
+test was "corrected" to `bitpos / 32 < 2` on top of an offset that already
+included the skew, which briefly reported LED7 as borrowable. Re-derive the
+arithmetic from the two formulas above before changing either.
 
 ### Absence of a segbits feature does not mean a pip is unwritable
 
@@ -321,34 +355,66 @@ the new check by breaking the thing it guards -- this one was confirmed
 non-vacuous by dropping the chain filter (fails, finds 0) and by stopping the
 carry from propagating (fails, does not count).
 
-### An unused LUT still has an init, and Vivado picks a different one
+### Block-by-block diffing: the residual is SIX tiles, not 70 bits
 
-The single remaining non-routing difference against `~/CDA4253_A1/blinky.bit` is
-one LUT init on an **unused** LUT:
+`work/blockdiff.py` applies the X-Ray method here (they characterise a region of
+interest at a time -- `work/prjxray-db/artix7/harness/README.md`). No Zynq
+harness ships, but none is needed: tilegrid + segbits are complete, so a block
+is just a tile rectangle.
 
 ```
-CLBLM_R_X71Y39.SLICEL_X1.ALUT
-  reference 0xff00ff0000000000
-  Helion    0xffffffff00000000
+CLEAN BLOCKS: 17 of 19        differing tiles: 6 of 15,000+
 ```
 
-It is unused: no `ALUT` output mux selects it and no flop samples it, and both
-bitstreams agree exactly on `SLICEL_X1.CARRY4.ACY0`, `NOCLKINV` and
-`PRECYINIT.AX`. So this cannot affect behaviour, and it is the *only* such
-difference on the whole device -- counting every `(tile, slice, LUT)` init
-field across all tile types gives exactly one differing entry.
+Everything outside Y32..Y47 is BIT-IDENTICAL to Vivado. The six are
+`CLBLM_R_X71Y39`, `INT_L_X70Y39`, `INT_R_X69Y39`, `INT_R_X71Y39`,
+`INT_R_X71Y41`, `INT_R_X71Y42` -- and the clock backbone
+`BYP_ALT{0..7} <- GFAN0/GFAN1` is IDENTICAL on Y40..Y45. All six reduce to:
+(i) the inert unused-`ALUT` init already documented above; (ii) Y39, where
+Vivado arms `BYP_ALT0` from DATA (`EL1END0`) and we tie `GFAN0` -- emitted
+config, since bottom-row shaping skips `ALT1` but still writes `ALT0`;
+(iii) Y41, one contested `FAN_ALT1` (Vivado goes via `NL1BEG_N3`, we burn an
+arc into `NR1BEG0` and land `IMUX4` on the cross-row `FAN_BOUNCE_S3_0` --
+both sides still reach `FAN_BOUNCE1`); (iv) Y42, one extra `FAN_ALT0.NR1END0`.
 
-Worth keeping for two reasons. First, a "16 extra bits in `ALUT.INIT[32..39]`
-and `[48..55]`" reading looks alarming and invites a hunt for a writer bug; it
-is not one. `frames.rs` already rejects a word index `>= WORDS_PER_FRAME`, and
-`CLBLM_R`'s geometry (`offset: 79`, `words: 2`) maps these to words 79 and 80,
-comfortably in range -- the segbits frame offsets 26/27 are *not* word offsets
-and must not be added to `words`.
+"Dead" for the Y39 `ALUT` was verified at the pin level, not assumed: across
+that tile's `SLICEL_X1`, **zero** mux segbits are set on EITHER side -- no
+`AFFMUX`, `AOUTMUX`, `ACLKINV` or `ALUT.DI1MUX` -- so nothing selects that LUT
+and no flop samples it. It is inert in both images. (An earlier note here
+claimed `Slicel_X1` has no `AOUTMUX` in the DB; that is wrong -- 12 exist. The
+reason it is inert is that none is set, not that the mux is missing.)
 
-Second, Vivado canonicalises the init of a LUT it does not use -- here to a
-repeating `0xff00` pattern -- where Helion writes all-ones. If character-exact
-bitstream equality is ever pursued, this is one of the differences to
-canonicalise, and it is a safe one to change because nothing reads it.
+**Trap: "no intra-tile pips" does NOT mean dead.** `NR1BEG0` shares the
+fed-but-no-outgoing-pips set with `IMUX*`, `FAN*`, `CLK*` -- normal, because
+those exits are tileconns/LUT inputs. `NR1BEG0`'s tileconn is `[0,-1] ->
+NR1END0`, so it is dead only because **Y40 configures no `NR1END*`**. Follow the
+tileconn and check the far tile before calling a wire dead.
+
+**The routing residue is a 4-unit cost tie**, not an unranked rule:
+`CLBLM_M_DQ -> IMUX34` is `FAN_BOUNCE1` 140 vs `SR1BEG_S0` 136 (Vivado's pick)
+against `DEFAULT_HOP_PS` 45. Adding `SR1BEG_S0` to `arm_penalty` made the image
+WORSE (70 -> 84 bits) because that list applies fabric-wide. Rounds 33, 34 and
+37 agree from different angles; do not re-open it by ranking.
+
+### `bitsim.py` only reads CARRY-CHAIN flops, so it reports live designs as frozen
+
+`work/bitsim.py`'s `bits()` returns FFs whose mux is `XOR`, i.e. the carry
+chain's own lanes. For a design with no registered adder output -- a toggle, or
+a counter whose bits are not chained -- `bits()` is **empty**. `state_int()`
+then returns `None` (which prints as `0`), the simulator never updates any
+flop, and every `D` stays `False` forever. A live design reads as dead.
+
+Confirmed on `examples/hier.sv` (one `q <= ~q` flop) and
+`examples/complex.sv` (16 4-bit counters): both reported
+`distinct_states=1 transitions=0` from `run_bit`, while `work/sim3.py` on the
+same sources shows `hier`'s `led` alternating every cycle and `complex`'s
+`u00_cnt` counting 0..7 and wrapping with `tog` alternating. `memsim.py` has the
+same shape of flaw, and its `reg` probe is hardcoded to the blinky's
+`('L', 44, 'D')`, so it reports nothing meaningful for any other design.
+
+**Use `sim3.py` (HNF, any design) unless the question is specifically about the
+blinky's carry chain.** Verify a simulator against a known answer before
+believing a "frozen" verdict.
 
 ### Instrument the predicate before editing it
 
@@ -422,3 +488,521 @@ structural check still passes. Audit with `python3 work/altmux.py <ours.bit>
 ### Carry-sum register routing
 
 When an output FF consumes a carry-chain sum and is assigned to the paired slice, its source net must reach both the raw FF D route and the matching lane LUT input (`A6`/`B6`/`C6`/`D6`). The emitter selects `FFMUX.XOR` for this case, so a route only to raw `D` does not feed the carry sum. The regression is `carry_operand_routed::every_carry_lane_operand_is_routed`; the ZedBoard example is `count_24` to `LD0` at `INT_R_X71Y44.IMUX42` / `CLBLM_L_D6`.
+
+#### Route retries must not repeat themselves
+
+A rip-up retry re-runs the identical search against an identical occupancy
+set, so it reproduces the same choice and loses the same mux again. On the
+25-bit blinky that cost hours: `count_24` and the four Y44 operand nets all
+need arms in `INT_R_X71Y44`, and every sweep ripped the others up to take the
+same arm back -- 12+ re-entries of the same four nets, no progress, no error.
+`route()` now keeps `avoid: net -> wires it lost a contest over`, skips them in
+both expansion paths, and clears the set when the net routes. Durable lesson:
+**any loop that retries a deterministic search needs per-attempt state**, or it
+cannot converge.
+
+Two related traps found the same way. Instrument with explicit file I/O
+(`/tmp/NETTRACE.log`), not `eprintln`: in this harness the test binary's stderr
+trace never appeared even with an unconditional print, while the file trace was
+immediate. And the "same-tile sink floods the A* heuristic" diagnosis is wrong
+for this router: `bfs_route_all` already routes all sinks in one multi-sink
+A*, and no single search exceeded 10M pops. Measure before accepting it.
+
+#### The reference's operand arms are uniform, and ours are not yet
+
+Decoded per row from `~/CDA4253_A1/blinky.bit`, the reference arms the same
+four operand muxes identically on every counter row:
+
+```
+IMUX4 <- FAN_BOUNCE1    IMUX12 <- WR1END2
+IMUX5 <- FAN_BOUNCE3    IMUX13 <- LOGIC_OUTS6
+IMUX42 <- ER1END1       IMUX43 <- WL1END1
+```
+
+Y45 (the chain's last row) arms only `IMUX4` and `IMUX43`. We match `IMUX4`,
+`IMUX12` and `IMUX43` but still pick `NL1BEG_N3` for `IMUX5`, `FAN_BOUNCE3`
+for `IMUX13` and `SR1BEG_S0` for `IMUX42`. Ranking those families in
+`arm_penalty` did NOT change any arm, so the choice is decided earlier than hop
+cost -- look at sink threading, not the cost model.
+
+The observable consequence is in `work/bitsim.py`: with an alternating seed the
+reference's `L`-half lane pins read `1,0,1,0` while ours read `0,1,0,1` -- the
+`L` (DI/generate) half is bound to the complement of the bits the `M` half
+sees, on every row. Both halves' LUT inits and pin-6 coverage are identical, so
+this is an arm/lane-binding difference, not a missing route.
+
+#### SOLVED: the paired half reads the operand one lane EARLIER
+
+That complement was a one-lane offset in the mate endpoints, now fixed by
+`mate_lane_target` in `route.rs`. Seed exactly one counter bit into
+`~/CDA4253_A1/blinky.bit` and read back every lane pin; the reference is
+perfectly regular:
+
+```
+bit18 -> MY43C + LY43B     bit21 -> MY44B + LY44A
+bit19 -> MY43D + LY43C     bit22 -> MY44C + LY44B
+bit20 -> MY44A + LY43D     bit23 -> MY44D + LY44C
+                           bit24 -> MY45A + LY44D
+```
+
+The L lane is always the M lane MINUS ONE, and lane `A` rolls back into the
+**previous** chain element's lane `D` -- not `+1`, and not the same lane. The
+old code bound the mate to the same lane, which put every L-half lane one bit
+behind the reference and left `count_24` off `LY44D` entirely.
+
+Two wrong guesses were made before measuring: first `+1` (lanes two ahead of
+the reference), then reading the earlier `0,1,0,1` pattern as "the complement".
+Both looked plausible; only per-bit seeding settled it. **Seed one bit at a
+time** for this class of question -- an all-ones or all-zeros seed cannot
+distinguish a tie-off from a live value, and alternating seeds hide an offset
+that happens to be even.
+
+After the fix our `L`-half map is identical to the reference for bits 18..24,
+`carry_operand_routed` passes on its own merits (`count_24` really does reach
+`CLBLM_L_D6`), and `work/bitsim.py` traces match the reference digit for digit
+from zero-start, mid-count and across the 2^24 wrap, with zero X's.
+
+#### SOLVED (round 29): the counter was frozen because the entry lane read the wrong pin
+
+The blinky's counter never advanced in simulation while every structural check
+passed. **Root cause: the carry chain's entry lane wired its operand to the
+wrong slice pin.**
+
+The entry lane's `S` LUT is `~A3` (INIT `0x0f0f_0f0f_0f0f_0f0f`); the body lanes
+are a plain `A6` pass-through (INIT `0xffff_ffff_0000_0000`). `emit_carry4_map`
+put every lane's operand on `I5`, which reaches slice pin `A6` -- correct for
+the body lanes, wrong for the entry lane, whose mask reads `A3`. Nothing drove
+`A3`, it fell back to the INT tile's VCC default, and `~A3` was 0 for every
+state, so **bit 0 could never carry and the chain sat at 0 forever**.
+
+Both images had the identical INIT and the identical `FFMUX.XOR`, which is why
+configuration-level checks could not see it. Only the pins differed:
+
+```
+GT-blinky.bit   entry lane  pin3 = 0  pin6 = 1   <- consumes A3, A6 floats high
+ours (before)   entry lane  pin3 = 1  pin6 = 0   <- reads A6, A3 floats high
+```
+
+The fix is `entry_lane = bit == 0` in `emit_carry4_map`: the entry lane's `a`
+goes on `I2` (`A3`, `IMUX1`) and `b` on `I3`. The router then drives
+`CLBLM_M_A3 <- CLBLM_IMUX1` exactly as the reference does.
+`work/bitsim.py` now matches the reference on every seed (zero, wrap, one-hot)
+with zero X's, and all 32 `(idx,o5,zini,co,cy0m)` conventions agree.
+
+**Why the existing test missed it.** `behaviour_counter` sweeps BOTH `ZINI`
+polarities and passes if either counts. A frozen chain decodes identically
+under each polarity, so the sweep cannot distinguish it from a working one. The
+new guard `the_entry_lane_reads_its_operand_on_a3_not_a6` asserts the actual
+routing (`CLBLM_M_A3.CLBLM_IMUX1` present, `CLBLM_M_A6.CLBLM_IMUX4` absent) and
+was verified non-vacuous by reverting the fix and watching it fail.
+
+**Two traps hit while diagnosing this, both worth keeping:**
+
+- **`active_features` adds the tile's `offset` to the word index**
+  (`word = geom["CLB_IO_CLK"]["offset"] + bp // 32`). A hand-rolled bit patcher
+  that indexes the frame directly writes to the wrong word chain-silently, and
+  every "the patch changed nothing" conclusion drawn from it is void. This is
+  the same "the word index is already absolute" trap recorded above.
+- **Routing hypotheses must be tested one variable at a time, and the
+  configuration must be proven identical first.** Two wrong theories (the
+  `IMUX4`/`IMUX5` arms, then the `CLK0/CLK1` B6-vs-B11 taps) were each
+  disproven by patching and re-simulating. What finally located the defect was
+  diffing per-lane pin values rather than per-tile feature lists: the feature
+  diff showed six plausible arm changes, while the pin diff showed exactly one
+  wrong input on exactly one lane.
+
+#### Rounds 30-34: the leaf, the backbone, and the cost tie
+
+Four leads, all measured, all now closed or accepted. Kept in one place because
+they share one lesson: **a ranking rule only works on the cost path that
+reaches the edge.** `arm_penalty` is skipped for every clock net
+(`use_delay == false`), so clock-edge preferences must live in `leaf_penalty`.
+
+- **R30/31, the clock leaf.** The route took `TOPL0` while only `TOPL5` was
+  enabled -- the clock landed on a trunk nothing drove. `leaf_penalty` now pins
+  it; every counter row arms `CLK1.GCLK_B11` like the reference. Diff 120 -> 88.
+  Guard: `behaviour_counter::the_clock_leaf_matches_the_enabled_trunk` inspects
+  the ROUTE, not the FASM, because `vivado_leaf_spelling` rewrites leaf names
+  to `TOPL5` on the way out. Re-deriving `TOPL0` is a regression with a measured
+  signature (+2 word-50 bits).
+- **R32, the backbone is not uniform.** Only interior rows carry all eight
+  `BYP_ALT` ties; endpoints are thinner, in different places. `LowEnd::{Bottom,Top}`
+  off `clock_row_endpoints` shapes both. Diff 88 -> 70. Do not "simplify" back
+  to a uniform loop. Guard: `INT_R_X71Y40..Y44` must keep `BYP_ALT1.GFAN0`,
+  `BYP_ALT4.GFAN0`, `FAN_ALT3.NL1END_S3_0` -- deleting exactly those three is the
+  hardware-verified way to freeze the LED.
+- **R33/34, the residual is a cost-order gap.** At `INT_R_X71Y41.FAN_ALT1` the
+  competing sources sit at `g` = 14 (`GFAN1`, the backbone), 91 (`LOGIC_OUTS7`,
+  which wins) and 230 (`NL1BEG_N3`, what the reference uses) -- a gap of 139
+  against `DEFAULT_HOP_PS` 45. No sane penalty closes that, and forcing it is a
+  genuine quality loss traded for a bit-diff. Reverted. Prefer
+  `sim3.py`/`blockdiff.py` over re-deriving this.
+
+#### Where the objective stands after round 29
+
+| requirement | status |
+| --- | --- |
+| functionally identical to Vivado | **MET in simulation** (every seed, 32/32 conventions) |
+| bit-for-bit equivalent | **NOT MET** -- 120 differing bits |
+| validated on real hardware | **NOT DONE** -- never flashed |
+
+The 120 bits are the classes already attributed above (spine one-hot encoding,
+per-row alt-mux arms, one unused-LUT init). None of them affects behaviour:
+that is now demonstrated rather than assumed, because the counter increments
+identically to the hardware-verified reference on every seed.
+
+Do not treat "simulation matches" as hardware validation. `bitsim.py` is a
+model of the fabric written from the X-Ray DB, not the fabric itself, and this
+file records two prior occasions where a structurally perfect image was dead on
+the board. The only evidence that closes the objective is a ZedBoard flashing
+`blinky_reg.bit` and the LED blinking.
+
+#### `bitsim.py --gate` grades the REFERENCE, not your image
+
+`--gate` sweeps conventions against its built-in reference only (it names
+`BLINK-242.bit`, which is NOT Vivado -- see the round-19 note; use
+`work/oracle.py` to check what any file actually is). It never
+opens the bitstream you pass it, so `GATE-LOCKED` is a statement about the
+simulator's settings, not a verdict on any image -- and it stays locked while
+the image is already correct. The graded path is the positional argument with
+NO flag. Note that path's own defaults (`idx=rev`) report the reference as
+`not-blinking` too, so it is not a usable oracle as written; compare trace rows
+from `run_bit` directly instead.
+
+
+### A flop's inputs arrive from the INT tile, not the CLB tile
+
+`Routed7::ff_data_is_driven` is the safety net that stops an unrouted flop
+being emitted. Its third case ("routing reaches this slice") compared the
+pip's tile against the flop's CLB tile name:
+
+```
+flop site   CLBLM_R_X71Y51
+pip tile    INT_R_X71Y51     <- never equal
+```
+
+7-series keeps the slice and its input muxes in **separate tiles**, so that
+comparison could never match and the whole branch was dead. Any design whose
+flop `D` came from routing rather than from its own slice was rejected with
+`takes AFFMUX.AX ... but no routed net ends at that slice` while the net was
+demonstrably routed to `INT_R_X71Y51.IMUX43`. `internal_clock`'s
+`internal_clock_reaches_a_bitstream` had been failing on this for a long time
+and looked like a clock or mux-selection bug; the mux was right and the routing
+was right.
+
+`int_tile_for_clb` maps `CLBLM_<L|R>_X<n>Y<m>` / `CLBLL_<L|R>_...` to
+`INT_<L|R>_X<n>Y<m>` by suffix. Verify any change here against
+`undriven_ff_guard`, which still has to fire on a genuinely dead flop -- a
+permissive `ff_data_is_driven` turns the one guard against silent dead designs
+into a no-op.
+
+### A register file's COMBINATIONAL read port was silently missing
+
+The write side of a small unpacked array lowers to one flop per bit
+(`<mem>_w<word>_<bit>`), and the clocked read (`dout <= mem[addr]`) worked. The
+COMBINATIONAL read did not:
+
+```systemverilog
+always_ff @(posedge clk) if (we) mem[addr] <= din;
+assign dout = mem[addr];          // <- no read logic at all
+```
+
+The assign loop bails on anything `rhs_unpacked_index` reports, on the grounds
+that walking a wide cone into a >96 AND term is not a LUT. True for a huge
+array, wrong for a register file: at the caps the write side already accepts
+(depth<=16, width<=32, depth*width<=128) the read is a mux over one-hot selects,
+which is exactly what LUT6s are for. So a perfectly ordinary 16x8 register file
+could not be built.
+
+**The failure mode was misattributed, which is what let it live.** The array
+itself lowered fine -- flops existed, writes landed -- so the design looked
+almost built and failed at PACKING with
+
+```
+run: 8 output pad(s) have no driver after packing and cannot be placed: dout_0 .. dout_7
+```
+
+Nothing in that message mentions the memory. The real diagnostic
+(`variable_index_read module=regmem signal=dout`) was on stderr and read like a
+timing note.
+
+Fixed by `unpacked_read_mux_expr` in `helion-sv`: for an array whose write side
+is in `lowered_unpacked`, each `dout` bit becomes
+`(addr==0)?w0:(addr==1)?w1:...:w<depth-1>`. Depth 1 qualifies too -- a one-word
+array is still storage and its read is a pass-through; requiring depth > 1 left
+a 1x4 memory undriven with the same misleading message.
+
+**Two traps when writing the regression test** (`tests/unpacked_variable_read.rs`),
+both of which made an early version vacuous:
+
+- `endpoints.is_empty()` is ALWAYS false for a top-level output, because port
+  binding attaches an endpoint even with nothing driving it. The probe showed
+  `dout_0 ep=[u_iob:I, u_iob:PAD]` -- two endpoints, no driver. That is
+  precisely how the defect hid.
+- The net carrying `dout_i` is not always NAMED `dout_i`: a constant index
+  ALIASES the output onto `<mem>_w3_0`, so `dout_0` is then only the pad side.
+
+So follow the wire instead: find the IOB whose `PAD` endpoint is on the port,
+then check whether the net on that IOB's `I` pin has a LUT6/HFF endpoint. This
+mirrors the packer, whose test is membership in the packed LUT/FF Q set. Verify
+any such guard by disabling the fix -- done here: with the new block forced off,
+exactly the two guard tests fail and the three controls still pass.
+
+### OPEN: the register-file read mux passes the smoke test but NOT a truth-table
+
+The round-35 fix makes a 16x8 register file BUILD, and `unpacked_variable_read`
+pins that it lowers to a driven output. What was never checked is that it reads
+the RIGHT WORD. `work/memsim.py` now does that check on the HNF netlist (force
+the storage flops and the address bus, settle the combinational part to a
+fixpoint, read the value reaching each `led_<b>` sink) and **it FAILS**:
+
+```
+addr= 0 expect=0x05 got=0x0d     addr= 9 expect=0x0e got=0x0f
+addr= 1 expect=0x04 got=0x0d     addr=11 expect=0x0c got=0x0d
+addr= 2 expect=0x07 got=0x0f     addr=12 expect=0x0a got=0x0b
+...                              addr=14 expect=0x08 got=0x09
+12 of 16 words wrong; 4 happen to match
+```
+
+**Diagnosis is not finished, so do not "fix" this blind.** Read the failure
+shape before acting on it:
+
+- Only the LOW address bit appears ignored: `addr` 0/1 give the same value,
+  2/3 the same, 4/5, 6/7, 8/9, 10/11, 12/13, 14/15. Every pair differs only in
+  address bit 0.
+- The value returned for a pair is not the word for either member of the pair,
+  so it is not simply "reads the odd word of a pair".
+
+The likeliest reading is a defect in the NEW `unpacked_read_mux_expr`, in how
+the per-bit selector is built (`addr_w <= 1` uses the whole bus, otherwise
+`bit_name(addr_sig, addr_w, b)`), which deserves one measurement before any
+edit. The second possibility is that `work/memsim.py` itself is still wrong:
+its first version read the output register's `Q` (never settled -- `drive()`
+evaluates combinational cells only) and reported every word as 0, and the
+negative control reported "detected" while the whole table was reading zero, so
+that control does NOT currently prove the harness is sound. **Establish that the
+harness agrees with a case whose answer is known before trusting this table.**
+
+Related trap found the same session: the standard library has a module named
+`bisect`, and `work/bisect.py` SHADOWS it. Any script in `work/` that imports a
+module depending on `bisect` (e.g. `random`) will execute `work/bisect.py`
+instead, printing its usage banner. Run such scripts via
+`runpy.run_path(...)` or rename the file.
+
+### Known gap: no BRAM inference in `helion-sv`
+
+`pico_acceptance::picorv32_with_bram_end_to_end` fails at `synth_sv`, before any
+back-end work: a depth=32/width=8 memory exceeds the register-file limits
+(depth<=16, width<=32, depth*width<=128) and there is no block-RAM lowering to
+fall back on. Refusing loudly is correct -- a half-lowered memory would carry
+read data with no driver -- so this is a missing feature, not a regression.
+Do not "fix" it by raising the register-file limits: that turns one BRAM into
+thousands of flops.
+
+### `BLINK-242.bit` is NOT Vivado, and two one-hot muxes were double-armed
+
+Two findings from round 19, both found only because the oracle was finally
+checksummed. Run `python3 work/oracle.py` before trusting any comparison.
+
+**The oracle was misidentified.** `work/ref/BLINK-242.bit` was used as the
+golden for several rounds; it is a *Helion* build (md5 `3cdb9a46`, 4045681
+bytes, BD payload 3,369,061 -- identical to `OURS-r25.bit`). Vivado's output is
+`work/ref/GT-blinky.bit` (md5 `3f6d7cfa`, **4045666** bytes, payload 2,646,636),
+and a second independent Vivado build (`GT2-blinky.bit`) has the same size. So
+size alone identifies the producer, and a "diff against BLINK-242" was
+Helion-vs-Helion -- the same circular-result class as `/tmp/ref/blinky.bit`.
+`OURS-r25.bit` is also *dead* (`[0,0,0,0,0,0]` from zero start), so nothing
+should be calibrated against it either. `work/oracle.py` now refuses any file
+that is not Vivado's, by md5, and exits non-zero.
+
+**`FAN_ALT` arms were double-selected.** `emit.rs` wrote the `FAN_ALT{1,3,5}`
+backbone unconditionally while the router could *also* arm `FAN_ALT1` from a
+data wire (the clock net on Y39/Y41). prjxray encodes these as one-hot
+coarse+fine, so two arms select **neither** input and the output is undefined
+-- while every structural check passes. `work/altmux.py` reported 2
+double-selected muxes against Vivado's 0. The `BYP_ALT` loop directly above
+already guarded with `routed_mux_in_use`; the `FAN_ALT` copies did not. Fixed
+by skipping only the mux the router legitimately took. Now 0 on both sides.
+
+**`arm_penalty` was one hop short.** The LED pad's tile (`INT_R_X73Y46`) must
+take `IMUX34 <- NR1END1`; we took `FAN_BOUNCE1`. Instrumenting the two
+candidates showed why:
+
+```
+FAN_BOUNCE1  cur_g 298 + pen 45 = 343
+NR1END1      cur_g 343 + pen  0 = 343     <- exact tie
+```
+
+The preferred vertical arm arrives exactly `DEFAULT_HOP_PS` later, so a
+one-hop penalty only tied and the search broke at whichever reached the sink
+first. The unranked penalty is now **two** hops. Alternatives stay reachable
+(they merely have to be the only way in), `INT_R_X73Y46` became IDENTICAL to
+Vivado, `INT_R_X73Y45` gained its `NR1BEG1.ER1END1` stitch, and `clkdiff.py`
+went from 1 REAL diff to **0**.
+
+Lesson: when a preference is expressed as a cost margin, measure the actual
+gap before choosing the margin. "One hop" sounded like enough and was
+arbitrary; the trace gave the exact number in one run.
+
+### Word 50 of clock tiles: Vivado sets it, no segbit names it
+
+The largest remaining gap to bit-for-bit equality, and it was invisible to
+every tool in this repo until round 20.
+
+`work/ref/GT-blinky.bit` sets word 50 of **52 frames** across the clock
+network to a per-tile value, most of which no segbit names.
+
+These are NOT all clock tiles. An earlier enumeration used `break` inside a
+loop over block types and attributed one tile's value to several, which made it
+look as if every clock tile were nonzero. Re-derived properly against the
+reference, word 50 is nonzero on only these two under `HCLK*` types:
+
+```
+HCLK_L_X174Y26  0x49ae
+HCLK_R_X175Y26  0x103e
+```
+
+The 350 bits are spread over **52 frames** (the spine spans many frames per
+tile, including `CLK_HROW_BOT_R` and `CFG_CENTER_MID`), and Helion writes 0x0
+to most of them. We do already set 5 of the 52, each a single bit that is a
+subset of Vivado's value -- so we emit part of this field, just not most of it.
+
+**One wrong alternate is FIXED (round 22).** On `HCLK_L_X174Y26` Vivado sets
+all eight `HCLK_LEAF_CLK_B_TOPL5.*` features for its buffer and none of
+`TOPL0`; Helion set the mirror image, because the router reaches `TOPL0`.
+`TOPL0..TOPL5` are six sibling leaf wires with no outgoing pips -- every
+buffer/spine source reaches all six (`tile_type_HCLK_L.json`), and they
+terminate in the tile, so naming one only decides which segbits get written.
+That does **not** make the spellings free: the leaves collide with the
+positional word-50 field (`TOPL0` sets word50 bit29 of frame `+1` and bit31 of
+`+5`, `TOPL5` sets bit25 of `+3` and bit23 of `+5`), so emitting the router's
+`TOPL0` on top of `CLOCK_WORD50_POSITIONAL` ORs two extra bits into frames the
+reference leaves at zero. Normalising to `TOPL5` is therefore correct, not
+cosmetic -- see the round-30 note below.
+Normalised by `vivado_leaf_spelling` in `emit.rs`. That tile is now
+feature-identical to Vivado and the image went 474 -> 470 bits at exactly
+Vivado's file size.
+
+Two traps on the way there, both real:
+
+- **Fix it at the pip line, not in `clock_companions`.** The leaf arrives as a
+  NON-pseudo pip whose FASM line is written from `dst_wire`. A companion-side
+  change ADDS the `TOPL5` feature and leaves `TOPL0` in place -- verified: three
+  features on the tile instead of two, diff stuck at 474.
+- **`format!("{PREFIX}5{}", &wire[PREFIX.len()..])` yields `TOPL50`.** The
+  slice after `strip_prefix` still holds the leaf digit. That panics at frame
+  assembly with `no segbits for feature ..._TOPL50...`, and because the library
+  had not relinked it kept reporting the OLD component's error while the source
+  read correctly -- force a `cargo build -p helion-xilinx7` before believing
+  that a string-level fix had no effect.
+
+**What is left in word 50 is NOT ours (verified round 23).** Attribute the 52
+remaining frames by EXACT block extent (`base + offset .. + words`), not a
+`base .. base+200` sweep -- the sweep mis-attributes badly and is what made an
+earlier round think our own tile was still wrong. Doing it exactly:
+
+```
+tiles our design actually uses       differing frames
+  HCLK_L_X174Y26                          NONE
+  HCLK_R_X175Y26                          NONE
+  CLK_HROW_BOT_R_X87Y26                   NONE
+  HCLK_CMT_L_X178Y26                      NONE
+```
+
+**SOLVED (round 24): word 50 is a positional table, and it now matches.**
+Diff went **470 -> 120 bits**, unnamed bits 350 -> **0**, `clkdiff` unnamed
+136 -> **0**, at the same 4,045,666-byte file size. `apply_clock_word_50` in
+`frames.rs` writes it after `apply_fasm`, from `CLOCK_WORD50_POSITIONAL`.
+
+**The key MUST include the far-group.** This is the trap that cost a round. An
+offset-only key looks right because 50 of the offsets carry one value across
+groups -- but an offset repeats ~5x per row, so an offset-keyed table wrote
+**256** frames where Vivado writes **52**, and the diff went the wrong way
+(470 -> 2352). Each far-group has its own set of programmed offsets and only
+`0x9b` appears in several. Key is `(far_group, offset)`; `far_group` is
+`addr >> 12` for this grouping (`frames::far_group` is a different split --
+do not swap them).
+
+It is NOT a constant and NOT "unused-tile defaults": 42 distinct patterns, and
+group 0x422 programs 42 frames while 0x401 programs 3. Our own word-50 bits were
+always a strict subset of Vivado's, which is why leaving the rest at zero still
+produced a working image -- the table is for bit-identity, not for function.
+
+**Round 27: the 120 bits decompose into three classes, and none is a defect.**
+
+Bit-level split of the residual diff (decode, then classify per cluster):
+
+```
+320 bits  CLK0/CLK1 spine-encoding bits   the B6-vs-B11 one-hot group:
+                                          choosing B6 sets a different coarse
+                                          bit, so ONE selector choice shows up
+                                          as many mismatched bits
+1032 bits FAN_ALT*/IMUX* arms             per-row router choices on Y39/Y45
+ 16 bits CLBLM_R_X71Y39.SLICEL_X1.ALUT   unused-LUT canonicalisation
+```
+
+Three things worth recording, each measured rather than assumed:
+
+- **`IMUX10` vs `IMUX5` on Y39 is not a mis-route.** Vivado arms
+  `IMUX10.LOGIC_OUTS5`, Helion arms `IMUX5.FAN_BOUNCE3`. `INT_R_X71Y39` has
+  **no `OUTMUX` feature at all**, so nothing drives `LOGIC_OUTS5` -- Vivado's
+  arm is a dangling stub, and `LOGIC_OUTS5`'s only driver would be a slice
+  output mux in the same tile, which is not configured. Do not chase this to
+  "our router picked the wrong pin": both muxes are unused for this design.
+- **`CLK1.GCLK_B6` vs `GCLK_B11` produces a 320-BIT diff from ONE choice.**
+  The arm is one-hot coarse+fine, so `B6` and `B11` share no coarse bit --
+  every shared multiplexer bit differs. This is why the residual looks like
+  "hundreds of routed-arm errors" when it is a single selector decision per
+  tile. Both reach `CLK1` with identical 0.058 ns delay.
+- **The Y39 `ALUT` init is NOT a DI function and NOT the `0xff00` canonical
+  form.** Solved from the reference bits: `0xff0fff0f0f0f0f0f`, which depends
+  only on `{A3, A4, A6}` = `A4 AND (A6 OR !A3)`. It is **unused** -- there is
+  no `OUTMUX` feature anywhere in that tile and all four lanes take
+  `AFFMUX.XOR` from the CARRY4 -- so Vivado is canonicalising the init of a
+  LUT nothing reads. Do NOT hardcode this value: it is Vivado's choice for an
+  unread LUT, and the earlier `0xff00` note in this file is a *different*
+  case, so the canonical form is not even constant.
+
+**Round 26: the last 120 bits are row-specific alt-mux choices, not a bug.**
+After word 50 the diff is 120 named bits, all on the X71 counter column's INT
+tiles. Decoded per row, `BYP_ALT{0..7}` is **identical on both sides for
+Y40..Y44** (all eight arms, route and reference). The only divergences are the
+chain's ENDPOINTS:
+
+```
+Y39  ref: ALT0->EL1END0, ALT1 absent, ALT2/3/4/5/6/7 tied
+     our: ALT0->GFAN0,   ALT1->GFAN0,  ALT2..7 tied
+Y45  ref: only ALT1, ALT3, ALT4, ALT6
+     our: all eight
+```
+
+`altmux` reports 0 double-selected on BOTH sides, so this is not the one-hot
+hazard coming back -- it is that Vivado arms `BYP_ALT<n>` from a DATA wire
+(`EL1END0`) where the router happens to reach it, and leaves the arm blank when
+nothing reaches it. That is real per-row routing, not fixed configuration, so
+it cannot be derived from a topology rule; matching it means matching the
+router's choice of data net on those two rows, and the same is true of the
+`CLK1.GCLK_B6`-vs-`B11` tap (`GCLK_B6` and `GCLK_B11` both reach `CLK1` with
+identical 0.058 ns delay -- a free selector choice in a 12-way mux, same class
+as the `TOPL0`/`TOPL5` leaf). **Do not "fix" either by hardcoding an index**:
+the mapping is per-design, and a hardcoded `B11` breaks any design whose clock
+lands on a different spine.
+
+Three traps, all hit:
+
+- **`clkdiff.py` cannot see it.** Its `scan()` compares only NAMED segbits
+  features, and `segbits_hclk_r.db` / `segbits_clk_hrow_bot_r.db` have no
+  entry for word 50 at all. So it printed "identical tiles: 180 of 181, REAL
+  diffs: 0" while every one of those tiles differed here. A clean clkdiff is
+  NOT evidence of byte-identity. It now reports
+  `unnamed clock words differing: N` alongside the verdict.
+- **The word index is already absolute.** `CLB_IO_CLK.offset` is 50 with
+  `words: 1` for `HCLK_R_X171Y26`, and the frame is `baseaddr + frame_offset`
+  (rawdiff's `0x42228b`), NOT `baseaddr`. Indexing the frame at `offset` after
+  adding `offset` to the address double-counts and reports a false 0.
+- **`baseaddr` is a hex STRING** in the tilegrid, not an int.
+
+Vivado is deterministic here: `GT-blinky.bit` and `GT2-blinky.bit` (two
+separate builds of this source) agree on word 50 in every tile, and the two
+bitstreams differ ONLY in a 4-byte timestamp in the header. So a fixed map
+does exist and is matchable — this is tractable work, not an unknowable.

@@ -279,3 +279,99 @@ fn the_emitted_bitstream_implements_a_live_counter() {
     );
     let _ = init_high;
 }
+
+/// The entry lane's operand must arrive on `A3` (`IMUX1`), not on `A6`.
+///
+/// This is the guard for the defect that made the whole counter inert while
+/// every other check passed. The entry lane's `S` LUT is `~A3` (INIT
+/// `0x0f0f_0f0f_0f0f_0f0f`); the body lanes are a plain `A6` pass-through.
+/// Emitting the entry lane's operand on `I5` like every other lane left the
+/// LUT reading `A6` while its mask was built for `A3`, so `A3` fell back to
+/// the INT tile's VCC default and `~A3` was 0 for every state -- bit 0 could
+/// never carry and the chain sat at 0 forever.
+///
+/// The counting model above could not see it: it sweeps both `ZINI`
+/// polarities, and a frozen chain decodes identically under each. What
+/// separates a working image is that the entry lane's operand PIN is one the
+/// router actually drove.
+#[test]
+fn the_entry_lane_reads_its_operand_on_a3_not_a6() {
+    let fasm = build_fasm();
+    let entry = "CLBLM_R_X71Y39";
+
+    // The CLB -> INT arm that feeds slice pin `A3`.
+    let feeds_a3 = format!("{entry}.CLBLM_M_A3.CLBLM_IMUX1");
+    let feeds_a6 = format!("{entry}.CLBLM_M_A6.CLBLM_IMUX4");
+    assert!(
+        fasm.iter().any(|l| l == &feeds_a3),
+        "the chain entry lane's operand is not routed to `{feeds_a3}`;\
+         \nwithout it bit 0 reads the VCC default and the counter never carries.\n\
+         entry-lane arms present: {:?}",
+        fasm.iter().filter(|l| l.starts_with(entry)).collect::<Vec<_>>()
+    );
+    assert!(
+        !fasm.iter().any(|l| l == &feeds_a6),
+        "the chain entry lane's operand must not be routed to `{feeds_a6}`: the \
+         entry LUT mask is `~A3`, so an `A6` feed leaves the mask reading a pin \
+         nothing drives and the counter freezes"
+    );
+}
+
+/// Build the routed design, so the check can see the leaf the ROUTER chose.
+///
+/// The emitted FASM cannot answer this: `vivado_leaf_spelling` rewrites every
+/// leaf to `TOPL5` on the way out, so a FASM-level assertion passes no matter
+/// which trunk the route actually took. Verified: reverting `leaf_penalty`
+/// left a FASM-based version of this guard green.
+fn route_design() -> helion_xilinx7::route::Routed7 {
+    let mut dev = Device::load_part_from_db(&db_root(), "xc7z020").expect("load device");
+    let nm = build_node_map(&mut dev);
+    let mut design = helion_sv::synth_sv(BLINKY_REG, "blinky_reg.sv").expect("synth");
+    helion_xilinx7::build::PinConstraints::parse(BLINKY_XDC).apply(&mut design);
+    let packed = pack(&design).expect("pack");
+    let mut xdev = XDevice::new(&dev, nm);
+    for b in &packed.bufgs {
+        xdev.clock_nets.insert(b.out_net.clone());
+    }
+    let placed = place(&packed, &xdev).expect("place");
+    route(&placed, &xdev).expect("route")
+}
+
+/// The clock must arrive on the HCLK leaf trunk that is actually enabled.
+///
+/// `HCLK_L` offers six sibling leaf trunks (`TOPL0..TOPL5`) off the same
+/// buffer, so an unranked search picks one arbitrarily -- and it picked
+/// `TOPL0` (spine `GCLK_L_B6`). Only one leaf can be enabled and the emitter
+/// enables `TOPL5` (`GCLK_L_B11`), so the image armed every `INT_R.CLK1` mux
+/// from a trunk nothing drove. Every structural check passed anyway: frame
+/// count, IDCODE, feature counts, and `work/bitsim.py` (which does not model
+/// clock taps at all). The clock was dead and the LED would never have blinked.
+#[test]
+fn the_clock_leaf_matches_the_enabled_trunk() {
+    let routed = route_design();
+    let mut leaves: Vec<String> = Vec::new();
+    for net in &routed.nets {
+        if let helion_xilinx7::route::RouteKind::Pips(pips) = &net.kind {
+            for pip in pips {
+                if pip.dst_wire.starts_with("HCLK_LEAF_CLK_B_") {
+                    leaves.push(pip.dst_wire.clone());
+                }
+            }
+        }
+    }
+    assert!(
+        !leaves.is_empty(),
+        "no HCLK leaf is routed at all, so the clock reaches no trunk"
+    );
+    let wrong: Vec<&String> = leaves
+        .iter()
+        .filter(|l| !(l.ends_with("TOPL5") || l.ends_with("BOTL5")))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "the clock is routed through a leaf trunk that is never enabled: {wrong:?}\n\
+         only TOPL5/BOTL5 carry a clock, because `vivado_leaf_spelling` enables \
+         that one; every other leaf leaves the INT tile's CLK mux armed from an \
+         undriven trunk (valid bitstream, dead clock)"
+    );
+}

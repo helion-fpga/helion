@@ -155,13 +155,11 @@ fn zedboard_e2e_bitstream() {
         assert_eq!(pins.get(&key).map(String::as_str), Some(*want), "pin for {key}");
     }
 
-    // LOC on the clk port (single-bit).
-    for port in &mut design.ports {
-        if port.name == "clk" {
-            port.attrs.set("LOC", "Y9");
-            port.attrs.set("IOSTANDARD", "LVCMOS33");
-        }
-    }
+    // Per-bit LOCs go through the ONE mapper that resolves both `led[0]` and
+    // `led_0` (AGENTS: do not hand-roll the mapping). Hand-applying only the
+    // clk pin left every LED bit unconstrained, and pack dropped all 8 LED
+    // IOBs before the post-pack patch below could ever re-pin them.
+    helion_xilinx7::build::PinConstraints::parse(&xdc).apply(&mut design);
 
     // The bit-select workaround that used to live here is GONE: helion-sv now
     // wires each led IOB's I pin to the driver net itself, so a design
@@ -180,7 +178,17 @@ fn zedboard_e2e_bitstream() {
     }
 
     let mut packed = pack(&design).expect("pack");
-    assert!(!packed.luts.is_empty(), "no LUTs packed");
+    // This design is an adder + registers + combinational LED taps. The
+    // adder's lane LUTs are booked inside `carries`, so a standalone-LUT
+    // count of zero is correct here; the things that must exist are the
+    // carry chain and all nine IOBs (clk + 8 leds). A smaller IOB count
+    // means per-bit PACKAGE_PINs were not applied and pack dropped them.
+    assert!(!packed.carries.is_empty(), "no carry chain packed");
+    assert_eq!(
+        packed.iobs.len(),
+        9,
+        "clk + 8 led IOBs expected; fewer means constraints were dropped at pack"
+    );
     println!(
         "pack: {} luts, {} ffs, {} iobs, {} bufgs",
         packed.luts.len(),
