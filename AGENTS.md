@@ -748,46 +748,41 @@ mirrors the packer, whose test is membership in the packed LUT/FF Q set. Verify
 any such guard by disabling the fix -- done here: with the new block forced off,
 exactly the two guard tests fail and the three controls still pass.
 
-### OPEN: the register-file read mux passes the smoke test but NOT a truth-table
+### SOLVED: a register file read back the TOP word for every address
 
-The round-35 fix makes a 16x8 register file BUILD, and `unpacked_variable_read`
-pins that it lowers to a driven output. What was never checked is that it reads
-the RIGHT WORD. `work/memsim.py` now does that check on the HNF netlist (force
-the storage flops and the address bus, settle the combinational part to a
-fixpoint, read the value reaching each `led_<b>` sink) and **it FAILS**:
+`unpacked_read_mux_expr` builds `mem[addr]` as
+`OR over words w of (addr == w) ? mem_w : 0`, descending from the top word.
+The top word was emitted **bare**, with no `addr == depth-1` guard, so it
+became an unconditional OR term of every other word:
 
 ```
-addr= 0 expect=0x05 got=0x0d     addr= 9 expect=0x0e got=0x0f
-addr= 1 expect=0x04 got=0x0d     addr=11 expect=0x0c got=0x0d
-addr= 2 expect=0x07 got=0x0f     addr=12 expect=0x0a got=0x0b
-...                              addr=14 expect=0x08 got=0x09
-12 of 16 words wrong; 4 happen to match
+depth 2:  mem1 | (mem0 & ~addr)      instead of      addr ? mem1 : mem0
 ```
 
-**Diagnosis is not finished, so do not "fix" this blind.** Read the failure
-shape before acting on it:
+Every word needs its guard; `acc` now starts at `Const(false)` and every word
+goes through the same `Or(And(sel, word), acc)`. The fixed-xor against the
+symptom: `addr=0` returns `0xFF` whenever the top word is all ones.
 
-- Only the LOW address bit appears ignored: `addr` 0/1 give the same value,
-  2/3 the same, 4/5, 6/7, 8/9, 10/11, 12/13, 14/15. Every pair differs only in
-  address bit 0.
-- The value returned for a pair is not the word for either member of the pair,
-  so it is not simply "reads the odd word of a pair".
+**Two harness bugs nearly hid this**, and both are the same class -- a
+simulator that agrees with itself.
 
-The likeliest reading is a defect in the NEW `unpacked_read_mux_expr`, in how
-the per-bit selector is built (`addr_w <= 1` uses the whole bus, otherwise
-`bit_name(addr_sig, addr_w, b)`), which deserves one measurement before any
-edit. The second possibility is that `work/memsim.py` itself is still wrong:
-its first version read the output register's `Q` (never settled -- `drive()`
-evaluates combinational cells only) and reported every word as 0, and the
-negative control reported "detected" while the whole table was reading zero, so
-that control does NOT currently prove the harness is sound. **Establish that the
-harness agrees with a case whose answer is known before trusting this table.**
+- The evaluator matched a gate's output net by its CELL name, but the output
+  net is whatever the `O` pin drives (`u_wshare_l41` drives `u_wshare_n41`).
+  It read nothing and reported every word wrong for the wrong reason.
+  Resolve outputs through the `O` pin endpoint.
+- The truth table never hit the failing row. The corruption is "top word leaks
+  in", so it shows only when the TOP word holds a 1 that a lower-addressed
+  word must mask off. My first table set the top word to `0x00`, which is
+  exactly the value that cannot expose it, and every depth passed against
+  known-broken code. **Pick the table from the failure condition, not from a
+  hash of the index.**
 
-Related trap found the same session: the standard library has a module named
-`bisect`, and `work/bisect.py` SHADOWS it. Any script in `work/` that imports a
-module depending on `bisect` (e.g. `random`) will execute `work/bisect.py`
-instead, printing its usage banner. Run such scripts via
-`runpy.run_path(...)` or rename the file.
+Validate any such harness on a case whose answer is known first: a plain
+`d = d[s]` 4:1 mux was enough to prove the evaluator sound before trusting it.
+
+The regression is `tests/unpacked_variable_read.rs::read_returns_the_right_word_*`
+(depth 2/4/8/16). It was verified non-vacuous by running it against the
+pre-fix source: all four fail there and all pass after.
 
 ### Known gap: no BRAM inference in `helion-sv`
 
