@@ -14993,43 +14993,47 @@ fn unpacked_read_mux_expr<'a>(
     if depth == 0 || depth > 64 {
         return None;
     }
-    // Word select: true when `addr` names word `k`. An AND over the addr bits
-    // that word `k` requires, each possibly inverted.
+    // `acc = OR over words w of (addr == w) ? mem_w : 0`, built downward.
+    //
+    // EVERY word needs its selector, including the last one. Emitting the
+    // final word bare (no `addr == w` guard) turns it into an extra OR term,
+    // so `mem[depth-1]` leaks into every other word's result. For depth 2
+    // that yields `mem1 | (mem0 & ~addr)` instead of `addr ? mem1 : mem0` --
+    // wrong whenever the top word holds a 1 while a lower word is selected
+    // (`addr=1, mem0=1, mem1=0` reads 1).
     let a: &'a str = arena.alloc_str(addr_sig);
-    let mut acc: Option<Expr<'a>> = None;
+    let mut acc: Expr<'a> = Expr::Const(false);
     for word in (0..depth).rev() {
         let src = unpacked_word_q(mem, word, width, bit);
         let cand: Expr<'a> = Expr::Var(arena.alloc_str(&src));
-        acc = Some(match acc {
-            None => cand,
-            Some(rest) => {
-                let mut sel: Option<Expr<'a>> = None;
-                for b in 0..addr_w.max(1) {
-                    let v: Expr<'a> = if addr_w <= 1 {
-                        Expr::Var(a)
-                    } else {
-                        Expr::Var(arena.alloc_str(&(bit_name(addr_sig, addr_w, b))))
-                    };
-                    let term: Expr<'a> = if (word >> b) & 1 == 1 {
-                        v
-                    } else {
-                        Expr::Not(arena.alloc(v))
-                    };
-                    sel = Some(match sel {
-                        None => term,
-                        Some(prev) => Expr::And(arena.alloc(prev), arena.alloc(term)),
-                    });
-                }
-                // A selector for an unreachable word never asserts.
-                let cond: Expr<'a> = sel.unwrap_or(Expr::Const(false));
-                Expr::Or(
-                    arena.alloc(Expr::And(arena.alloc(cond), arena.alloc(cand))),
-                    arena.alloc(rest),
-                )
-            }
-        });
+        // Word select: an AND over the addr bits this word requires.
+        let mut sel: Option<Expr<'a>> = None;
+        for b in 0..addr_w.max(1) {
+            let v: Expr<'a> = if addr_w <= 1 {
+                Expr::Var(a)
+            } else {
+                Expr::Var(arena.alloc_str(&(bit_name(addr_sig, addr_w, b))))
+            };
+            let term: Expr<'a> = if (word >> b) & 1 == 1 {
+                v
+            } else {
+                Expr::Not(arena.alloc(v))
+            };
+            sel = Some(match sel {
+                None => term,
+                Some(prev) => Expr::And(arena.alloc(prev), arena.alloc(term)),
+            });
+        }
+        // A selector for an unreachable word never asserts. This is applied
+        // to EVERY word: emitting the top word bare made it an unconditional
+        // extra OR term of every other word.
+        let cond: Expr<'a> = sel.unwrap_or(Expr::Const(false));
+        acc = Expr::Or(
+            arena.alloc(Expr::And(arena.alloc(cond), arena.alloc(cand))),
+            arena.alloc(acc),
+        );
     }
-    acc
+    Some(acc)
 }
 
 /// Match `mem[addr]` (or `mem[addr][hi:lo]`) and return
