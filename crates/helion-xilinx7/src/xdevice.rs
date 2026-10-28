@@ -213,6 +213,30 @@ impl<'a> TimingDevice for XDevice<'a> {
 }
 
 impl<'a> RouteQuery for XDevice<'a> {
+    fn slice_pair(&self, tile: &str, site: &str) -> Option<String> {
+        // A CLB tile holds exactly two SLICE sites (positions 0 and 1 in the
+        // tile's site list; segbits names them `SLICEM_X0`/`SLICEL_X1`). The
+        // carry chain's S LUTs live in one half, its DI (generate) LUTs in
+        // the other, and both read the same operand nets — the router needs
+        // the sibling's full site name to reach both halves. Derive it from
+        // the tile's own site list rather than a full-name X-coordinate guess.
+        let idx = self.tile_idx(tile)?;
+        let t = self.device.tile(idx)?;
+        let pos = t.sites.iter().position(|s| s.name == site)?;
+        let slices: Vec<usize> = t
+            .sites
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.site_type.starts_with("SLICE"))
+            .map(|(i, _)| i)
+            .collect();
+        if slices.len() != 2 {
+            return None;
+        }
+        let rank = slices.iter().position(|&i| i == pos)?;
+        t.sites.get(slices[(rank + 1) % 2]).map(|s| s.name.clone())
+    }
+
     fn iob_output_sink(&self, site: &str) -> Vec<(String, String)> {
         // Trace, from the pad backwards, the ONLY path the fabric can use to
         // reach it:

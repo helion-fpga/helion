@@ -13,7 +13,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::frames::{BlockType, FrameAddr, TileBitLayout};
+use crate::frames::{BlockType, FrameAddr, TileAlias, TileBitLayout};
 
 /// One tile's geometry from `tilegrid.json`.
 #[derive(Clone, Debug)]
@@ -26,6 +26,19 @@ pub struct TileEntry {
     pub grid_x: Option<i64>,
     /// Grid row, when present.
     pub grid_y: Option<i64>,
+    /// Borrowed layout for a tile type that ships no segbits of its own,
+    /// e.g. `RIOB33_SING` hosting a slice of `RIOB33`.
+    pub alias: Option<TileAlias>,
+    /// Word offset into the borrowed (or own) block's window at which this
+    /// instance's sites start.
+    ///
+    /// A row-pair of IO tiles shares one 4-word budget. A 2-word `_SING`
+    /// variant placed at the bottom of the pair has `start_offset = 2` and so
+    /// occupies words 2..3 of the *pair*, which is why its `offset` alone (0)
+    /// does not describe where its bits go. Ignoring this field puts a
+    /// `_SING` tile's configuration 2 words too low -- into its neighbour's
+    /// half of the frame.
+    pub start_offset: u32,
 }
 
 /// Every tile in a device, indexed by tile instance name.
@@ -57,6 +70,8 @@ impl TilegridLayout {
                 .ok_or_else(|| format!("tile {name}: missing \"type\""))?
                 .to_string();
             let mut blocks = HashMap::new();
+            let mut tile_alias: Option<TileAlias> = None;
+            let mut start_offset: u32 = 0;
             if let Some(bits) = info.get("bits").and_then(|b| b.as_object()) {
                 for (bus, b) in bits {
                     let block = match bus.as_str() {
@@ -73,6 +88,27 @@ impl TilegridLayout {
                     let offset = b.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                     let frames = b.get("frames").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                     blocks.insert(block, (FrameAddr { baseaddr, offset }, frames));
+                    // `alias` is per tile INSTANCE and nested under the block:
+                    // one `_SING` pad maps its only site to `IOB33_Y0`, the
+                    // other to `IOB33_Y1`, and they differ in whether the
+                    // borrowed bits fit at all.
+                    start_offset = b.get("start_offset").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    if let Some(alias) = b.get("alias").and_then(|a| a.as_object()) {
+                        if let Some(base_type) = alias.get("type").and_then(|t| t.as_str()) {
+                            let mut sites = std::collections::BTreeMap::new();
+                            if let Some(map) = alias.get("sites").and_then(|s| s.as_object()) {
+                                for (k, v) in map {
+                                    if let Some(v) = v.as_str() {
+                                        sites.insert(k.clone(), v.to_string());
+                                    }
+                                }
+                            }
+                            tile_alias = Some(TileAlias {
+                                base_type: base_type.to_string(),
+                                sites,
+                            });
+                        }
+                    }
                 }
             }
             tiles.insert(
@@ -82,6 +118,8 @@ impl TilegridLayout {
                     blocks,
                     grid_x: info.get("grid_x").and_then(|v| v.as_i64()),
                     grid_y: info.get("grid_y").and_then(|v| v.as_i64()),
+                    alias: tile_alias,
+                    start_offset,
                 },
             );
         }
@@ -139,10 +177,23 @@ impl TilegridLayout {
 
 impl TileBitLayout for TilegridLayout {
     fn frame_addr(&self, tile: &str, block: BlockType) -> Option<FrameAddr> {
-        Some(self.tiles.get(tile)?.blocks.get(&block)?.0)
+        let t = self.tiles.get(tile)?;
+        let geom = t.blocks.get(&block)?.0;
+        // A `_SING` variant shares a row-pair's word budget with its base
+        // type and takes the half its `start_offset` selects. A base tile has
+        // `start_offset = 0` (and no alias), so this is a no-op for it.
+        let start = if t.alias.is_some() { t.start_offset } else { 0 };
+        Some(FrameAddr {
+            baseaddr: geom.baseaddr,
+            offset: geom.offset.saturating_add(start),
+        })
     }
 
     fn tile_type(&self, tile: &str) -> Option<&str> {
         Some(self.tiles.get(tile)?.tile_type.as_str())
+    }
+
+    fn tile_alias(&self, tile: &str) -> Option<&TileAlias> {
+        self.tiles.get(tile)?.alias.as_ref()
     }
 }

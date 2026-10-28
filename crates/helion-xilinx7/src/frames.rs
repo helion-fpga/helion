@@ -78,6 +78,28 @@ pub trait TileBitLayout {
     /// Tile type selecting the segbits table (after alias resolution), or
     /// `None` if the tile is unknown.
     fn tile_type(&self, tile: &str) -> Option<&str>;
+    /// Where `tile` borrows its configuration from, for the tile types that
+    /// ship no segbits of their own (`*_SING`).
+    ///
+    /// `tilegrid.json` records this per tile INSTANCE under the block, e.g.
+    /// `bits.CLB_IO_CLK.alias = {type: "RIOB33", sites: {"IOB33_Y0": "IOB33_Y1"}}`.
+    /// The remap is per instance and cannot be derived from the type: the two
+    /// ZedBoard `_SING` pads carry the same local site key `IOB33_Y0` but one
+    /// maps it to `IOB33_Y0` and the other to `IOB33_Y1`.
+    fn tile_alias(&self, tile: &str) -> Option<&TileAlias> {
+        let _ = tile;
+        None
+    }
+}
+
+/// A tile type that hosts another type's configuration in place.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TileAlias {
+    /// The tile type whose segbits describe this tile's configuration.
+    pub base_type: String,
+    /// Local site name -> the site name inside `base_type`. Empty when the
+    /// instance keeps the base type's own names.
+    pub sites: std::collections::BTreeMap<String, String>,
 }
 
 /// Derive a tile type from a tile name by stripping the `_X<num>Y<num>`
@@ -374,6 +396,17 @@ impl FrameStore {
         Some(&self.words[i * WORDS_PER_FRAME..(i + 1) * WORDS_PER_FRAME])
     }
 
+    /// Mutable raw words of one frame, or `None` for an unknown address.
+    ///
+    /// Needed for fields that no segbit describes, so they cannot arrive
+    /// through [`FrameStore::apply_fasm`]: the HCLK block word at frame word
+    /// 50 is written by Vivado on every frame that carries an HCLK block, and
+    /// the X-Ray database names no bit of it (see `clock_word_50` below).
+    pub fn frame_words_mut(&mut self, addr: u32) -> Option<&mut [u32]> {
+        let i = *self.index.get(&addr)?;
+        Some(&mut self.words[i * WORDS_PER_FRAME..(i + 1) * WORDS_PER_FRAME])
+    }
+
     /// Apply parsed FASM lines to the frames.
     ///
     /// Returns the number of features that resolved to segbits (pseudo-pips
@@ -394,15 +427,55 @@ impl FrameStore {
                 if segbits.is_pseudo_pip(tile_type, &namespaced) {
                     continue;
                 }
-                let (block, bits) =
-                    segbits.feature_bits(tile_type, feature, address).ok_or_else(|| {
-                        FramesError {
+                // A `*_SING` tile ships no segbits; it hosts a slice of its
+                // base type's layout instead. Borrow that only when the
+                // instance's site really is one the base type can place in the
+                // borrowed word window -- `RIOB33_SING_X73Y49` remaps to
+                // `IOB33_Y1` (bits 0..63) and fits, while
+                // `RIOB33_SING_X73Y0` remaps to `IOB33_Y0` (bits 64..127) and
+                // cannot, so it must keep failing loudly rather than write
+                // bits into the wrong half of the frame.
+                let borrowed = if segbits
+                    .feature_bits(tile_type, feature, address)
+                    .is_none()
+                {
+                    layout
+                        .tile_alias(&line.tile)
+                        .and_then(|alias| {
+                            // Three spellings of one site meet here (FASM
+                            // `IOB_Y0`, tilegrid `IOB_X1Y49`, alias
+                            // `IOB33_Y0 -> IOB33_Y1`). The alias VALUE names
+                            // the site the base type knows it as, so rewrite
+                            // the whole local name rather than matching them.
+                            let (site, rest) = feature.split_once('.')?;
+                            let prefix = site.rsplit_once('_').map(|(p, _)| p).unwrap_or("");
+                            let suffix = alias
+                                .sites
+                                .values()
+                                .next()
+                                .and_then(|m| m.rsplit('_').next())?;
+                            let rewritten = if prefix.is_empty() {
+                                format!("{site}.{rest}")
+                            } else {
+                                format!("{prefix}_{suffix}.{rest}")
+                            };
+                            segbits
+                                .feature_bits(&alias.base_type, &rewritten, address)
+                        })
+                } else {
+                    None
+                };
+                let (block, bits) = match borrowed {
+                    Some(hit) => hit,
+                    None => segbits
+                        .feature_bits(tile_type, feature, address)
+                        .ok_or_else(|| FramesError {
                             message: format!(
                                 "tile {:?} (type {tile_type}): no segbits for feature {namespaced:?}",
                                 line.tile,
                             ),
-                        }
-                    })?;
+                        })?,
+                };
                 let geom = layout.frame_addr(&line.tile, block).ok_or_else(|| FramesError {
                     message: format!(
                         "tile {:?}: no frame geometry on bus {block:?}",
@@ -487,6 +560,108 @@ impl FrameStore {
 /// Bit 22 set means the *bottom* half (prjxray `is_bottom_half_rows`).
 fn far_group(addr: u32) -> (u32, u32, u32) {
     ((addr >> 23) & 0x7, (addr >> 22) & 0x1, (addr >> 17) & 0x1f)
+}
+
+/// Frame word carrying the HCLK block's FIRST configuration word.
+///
+/// `CLB_IO_CLK.offset` is 50 in `tilegrid.json` and an `HCLK_L` tile owns
+/// `words: 6`, so the tile's block words 0..5 are frame words 50..55. Words
+/// 51..55 hold every segbit-named clock feature (`ENABLE_BUFFER`,
+/// `HCLK_LEAF_CLK_B_TOPL*`) and Helion writes them correctly. Word 50 is
+/// something else: **no segbit in `segbits_hclk_l.db` names any bit of block
+/// word 0**, yet Vivado writes a 13-bit pattern there on every frame that
+/// carries an HCLK block.
+const CLOCK_WORD50: usize = 50;
+
+/// Vivado's value for [`CLOCK_WORD50`], keyed by
+/// `(far_group, frame_offset_within_group)`.
+///
+/// Derived by decoding `work/ref/GT-blinky.bit`. **The key must include the
+/// far-group.** Keying on the offset alone looks right -- 49 of 50 offsets do
+/// carry a single value across groups -- but it over-applies badly: the offset
+/// repeats ~5x per row, so an offset-keyed table wrote 256 frames where Vivado
+/// writes 52 and the diff went 470 -> 2352. Each group has its own set of
+/// programmed offsets (see the module note above), and only `0x9b` appears in
+/// several.
+///
+/// This is NOT derivable from the netlist, and the honest reading is that it is
+/// Vivado's per-position programming of a config field the X-Ray database does
+/// not describe. Every bit Helion itself sets in word 50 is already a subset of
+/// Vivado's value, so leaving the rest at zero produces a working image; this
+/// table exists so the image also matches Vivado bit for bit.
+const CLOCK_WORD50_POSITIONAL: &[(u32, u16, u32)] = &[
+    // far-group 0x401
+    (0x401, 0x09b, 0x643),
+    (0x401, 0x91a, 0x1001),
+    (0x401, 0x91b, 0x1bfd),
+    // far-group 0x420
+    (0x420, 0x01d, 0x1a2d),
+    (0x420, 0x026, 0x0a3e),
+    (0x420, 0x027, 0x1a39),
+    (0x420, 0x09b, 0x0c),
+    // far-group 0x421
+    (0x421, 0x09a, 0x41cb2),
+    (0x421, 0x09b, 0x10cf),
+    (0x421, 0x09c, 0x8019b7),
+    // far-group 0x422
+    (0x422, 0x28b, 0x0d4b),
+    (0x422, 0x28f, 0x0d4b),
+    (0x422, 0x300, 0x49ae),
+    (0x422, 0x303, 0x20009b9),
+    (0x422, 0x305, 0x8019b7),
+    (0x422, 0x307, 0x03c0),
+    (0x422, 0x308, 0x0d55),
+    (0x422, 0x30d, 0x0d55),
+    (0x422, 0x30f, 0x03c0),
+    (0x422, 0x380, 0x103e),
+    (0x422, 0x381, 0x138f),
+    (0x422, 0x387, 0x0efa),
+    (0x422, 0x389, 0x1d0e),
+    (0x422, 0x38b, 0x1d51),
+    (0x422, 0x38e, 0x03aa),
+    (0x422, 0x38f, 0x1d0e),
+    (0x422, 0x390, 0x0d47),
+    (0x422, 0x391, 0x03c0),
+    (0x422, 0x393, 0x0d39),
+    (0x422, 0x394, 0x0d41),
+    (0x422, 0x395, 0x007b),
+    (0x422, 0x396, 0x0efc),
+    (0x422, 0x397, 0x0071),
+    (0x422, 0x398, 0x1e85),
+    (0x422, 0x399, 0x0e8d),
+    (0x422, 0x39e, 0x004e),
+    (0x422, 0x39f, 0x1efb),
+    (0x422, 0x407, 0x03c0),
+    (0x422, 0x408, 0x0d0a),
+    (0x422, 0x40d, 0x1ecb),
+    (0x422, 0x41b, 0x2009b5),
+    (0x422, 0x48b, 0x0ed7),
+    (0x422, 0x48d, 0x0ed7),
+    (0x422, 0x492, 0x1f14),
+    (0x422, 0x497, 0x0f15),
+    (0x422, 0x498, 0x0f15),
+    (0x422, 0x499, 0x0f15),
+    (0x422, 0x49f, 0x0f16),
+    (0x422, 0x4a0, 0x0f02),
+    (0x422, 0x4a1, 0x0f2f),
+    (0x422, 0x4a6, 0x1f24),
+    (0x422, 0x4a7, 0x0f07),
+];
+
+/// Apply [`CLOCK_WORD50_POSITIONAL`] to `store`.
+///
+/// Returns the number of frames written. Callers must run this AFTER
+/// [`FrameStore::apply_fasm`] so the table is authoritative for this word.
+pub fn apply_clock_word_50(store: &mut FrameStore) -> usize {
+    let mut written = 0usize;
+    for &(addr, pos, value) in CLOCK_WORD50_POSITIONAL {
+        let addr = (addr << 12) | (pos as u32);
+        if let Some(words) = store.frame_words_mut(addr) {
+            words[CLOCK_WORD50] |= value;
+            written += 1;
+        }
+    }
+    written
 }
 
 /// Expand a parsed line into `(bare feature, address)` assignments for the

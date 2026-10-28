@@ -2096,10 +2096,20 @@ impl SchematicView {
         if self.expand_inside.is_none() && self.instances.len() == 1 {
             let inst = self.instances[0].as_str();
             let members = self.instance_member_cells(inst);
+            // Root-level pad cells belong to the TOP module, not to the
+            // child instance, so they must not veto the collapse. When the
+            // hierarchical front end began giving `hier.sv` its own `u_iob`
+            // (the child's pad used to stand in for it), this list stopped
+            // being a pure subset of `members` and the child's cells leaked
+            // onto the collapsed sheet.
             let logic: Vec<&str> = self
                 .nodes
                 .iter()
-                .filter(|n| !n.kind.starts_with("instance") && !n.kind.starts_with("PORT"))
+                .filter(|n| {
+                    !n.kind.starts_with("instance")
+                        && !n.kind.starts_with("PORT")
+                        && !n.kind.starts_with("IOB")
+                })
                 .map(|n| n.name.as_str())
                 .collect();
             if !logic.is_empty() && logic.iter().all(|n| members.contains(*n)) {

@@ -13,7 +13,7 @@
 //! still reports `done=1`; the tilegrid union is 2194 frames short on xc7z020.
 //! See `helion/AGENTS.md`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::bitstream::{self, BitstreamOptions};
@@ -21,7 +21,7 @@ use crate::device::Device;
 use crate::emit::emit_fasm;
 use crate::fasm::parse_fasm;
 use crate::frames::{BlockType, SegBitsDb, TileBitLayout};
-use crate::frames::FrameStore;
+use crate::frames::{apply_clock_word_50, FrameStore};
 use crate::tilegrid::TilegridLayout;
 use crate::emit::EmitDevice;
 use crate::xdevice::{build_node_map, XDevice};
@@ -64,9 +64,10 @@ impl GeneratedBitstream {
         let tiles: Vec<&str> = self.dropped.iter().map(|d| d.tile.as_str()).collect();
         let lines: usize = self.dropped.iter().map(|d| d.lines).sum();
         Some(format!(
-            "{lines} FASM line(s) on {} tile(s) were dropped: upstream prjxray-db has no \
-             segbits for those tile types and their frame layout differs from the base \
-             type. Affected tiles: {}",
+            "{lines} FASM line(s) on {} tile(s) were dropped. A *_SING tile hosts only \
+             one half of its base type's two-site layout; instances whose tilegrid alias \
+             lands in the upper half (bits 64..127) cannot be programmed from upstream \
+             segbits. Affected tiles: {}",
             tiles.len(),
             tiles.join(", ")
         ))
@@ -367,15 +368,60 @@ pub fn bitstream_for_part(
         let lower = t.to_lowercase();
         let seg = family.join(format!("segbits_{lower}.db"));
         if is_sing && !seg.is_file() {
-            dropped.push(DroppedTile {
-                tile: String::new(),
-                tile_type: t.clone(),
-                lines: counts.get(t).copied().unwrap_or(0),
-                reason: format!(
-                    "no segbits_{lower}.db upstream; a *SING tile has a different frame \
-                     layout from its base type, so its bits cannot be borrowed"
-                ),
-            });
+            // Types that ship their own segbits are never borrowed
+            // (`_TBYTESRC`/`_TBYTETERM` do), so this is only about `_SING`.
+            //
+            // The drop is per INSTANCE, not per type. A `_SING` tile hosts a
+            // half of its base type's two-site layout, and the tilegrid alias
+            // says which half. `RIOB33_SING_X73Y49` maps its site to
+            // `IOB33_Y1`, whose bits are the low 0..63 of the block's two
+            // words, so they land inside the smaller tile and can be borrowed;
+            // `RIOB33_SING_X73Y0` maps to `IOB33_Y0`, whose bits are 64..127
+            // and do not fit. Deciding by type dropped both.
+            let borrowable: Vec<&str> = lines
+                .iter()
+                .filter(|l| layout.tile_type(&l.tile) == Some(t.as_str()))
+                .map(|l| l.tile.as_str())
+                .filter(|tile| layout.tile_alias(tile).is_some())
+                .collect();
+            if borrowable.is_empty() {
+                dropped.push(DroppedTile {
+                    tile: String::new(),
+                    tile_type: t.clone(),
+                    lines: counts.get(t).copied().unwrap_or(0),
+                    reason: format!(
+                        "no segbits_{lower}.db upstream and no usable tilegrid alias: a \
+                         *SING tile hosts only one half of its base type's layout"
+                    ),
+                });
+                continue;
+            }
+            // Give the borrowable instances their base type's table, which the
+            // per-instance site remap in `apply_fasm` will rewrite.
+            let base_type: String = layout
+                .tile_alias(borrowable[0])
+                .map(|a| a.base_type.clone())
+                .unwrap_or_default();
+            let base_seg = family.join(format!("segbits_{}.db", base_type.to_lowercase()));
+            if base_seg.is_file() {
+                let text = std::fs::read_to_string(&base_seg)
+                    .map_err(|e| BitstreamBuildError::Fasm(format!("{}: {e}", base_seg.display())))?;
+                // `add_segbits` is idempotent for a type already loaded from
+                // the base tile's own iteration.
+                let _ = segbits.add_segbits(&base_type, BlockType::ClbIoClk, &text);
+            }
+            // Non-borrowable instances of this type still drop.
+            let borrowed: BTreeSet<&str> = borrowable.into_iter().collect();
+            for l in &lines {
+                if layout.tile_type(&l.tile) == Some(t.as_str()) && !borrowed.contains(l.tile.as_str()) {
+                    dropped.push(DroppedTile {
+                        tile: l.tile.clone(),
+                        tile_type: t.clone(),
+                        lines: 1,
+                        reason: format!("no segbits_{lower}.db upstream and no usable tilegrid alias"),
+                    });
+                }
+            }
             continue;
         }
         if seg.is_file() {
@@ -395,9 +441,15 @@ pub fn bitstream_for_part(
         }
     }
 
+    // A borrowed instance whose remapped bits still land outside the tile is
+    // the case `RIOB33_SING_X73Y0` hits: its alias maps to `IOB33_Y0`, whose
+    // bits are 64..127, but the smaller tile only hosts 0..63. Those lines are
+    // dropped rather than written into the neighbouring half of the frame --
+    // silently programming the wrong pad is worse than losing one.
+    // Detect by looking for the type-level failure the segment write reported.
     // Expand the per-type drop record into per-tile, which is what a user
     // needs in order to know which pins are affected.
-    let dropped_types: BTreeSet<String> = dropped.iter().map(|d| d.tile_type.clone()).collect();
+    let mut dropped_types: BTreeSet<String> = dropped.iter().map(|d| d.tile_type.clone()).collect();
     let mut dropped_tiles: Vec<DroppedTile> = Vec::new();
     if !dropped_types.is_empty() {
         let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
@@ -427,9 +479,60 @@ pub fn bitstream_for_part(
         }
     }
 
+    // Decide up front which instances of a borrowed type can actually host
+    // their remapped bits, so the frame write never sees a line it must abort
+    // on. A `_SING` tile is two words wide and the base type splits its two
+    // sites across bits 0..63 and 64..127; only the low half fits.
+    let mut borrow_ok: HashMap<String, bool> = HashMap::new();
+    for l in &lines {
+        borrow_ok.entry(l.tile.clone()).or_insert_with(|| {
+            let Some(t) = layout.tile_type(&l.tile) else {
+                return true;
+            };
+            if !t.contains("_SING") || !device.type_has_no_segbits(t) {
+                return true;
+            }
+            let Some(alias) = layout.tile_alias(&l.tile) else {
+                return false;
+            };
+            // Does every feature this tile emits resolve in the base type
+            // once the site name is remapped, with its bits inside the tile?
+            lines
+                .iter()
+                .filter(|o| o.tile == l.tile)
+                .all(|o| borrowed_bits_fit(&segbits, alias, &o.feature, o.bit_range.map(|(lo, _)| lo)))
+        });
+    }
+    let mut unfittable: BTreeSet<String> = BTreeSet::new();
+    for (tile, ok) in &borrow_ok {
+        if !ok {
+            unfittable.insert(tile.clone());
+        }
+    }
+    if !unfittable.is_empty() {
+        for tile in &unfittable {
+            let tile_type = layout.tile_type(tile).unwrap_or("?").to_string();
+            let reason = format!(
+                "borrowed layout does not fit this instance: its tilegrid alias maps the \
+                 site onto the base type's upper word half (bits 64..127) while a *SING \
+                 tile hosts only bits 0..63 (tile type {tile_type})"
+            );
+            dropped_tiles.push(DroppedTile {
+                tile: tile.clone(),
+                tile_type: tile_type.clone(),
+                lines: lines.iter().filter(|l| &l.tile == tile).count(),
+                reason,
+            });
+            dropped_types.insert(tile_type);
+        }
+    }
+
     let kept: Vec<_> = lines
         .into_iter()
         .filter(|l| {
+            if unfittable.contains(&l.tile) {
+                return false;
+            }
             layout
                 .tile_type(&l.tile)
                 .map(|t| !dropped_types.contains(t))
@@ -465,6 +568,11 @@ pub fn bitstream_for_part(
         }
     };
     let frame_count = store.frame_count();
+
+    // Undescribed clock-network configuration, applied from a positional table
+    // rather than from segbits -- see `CLOCK_WORD50_POSITIONAL`.
+    apply_clock_word_50(&mut store);
+
     let payload = store.fdri_payload();
 
     // The header names the concrete part directory (`xc7z020clg484-1`), not the
@@ -589,4 +697,69 @@ mod round39_bit_of_port {
         assert_eq!(bit_of_port("ledx_0", "led"), None);
         assert_eq!(bit_of_port("led_foo", "led"), None);
     }
+}
+
+/// Does every bit of `feature`, looked up in the alias's base type after the
+/// site name is remapped, land inside a two-word hosting tile?
+///
+/// Nearly all `RIOB33` bits sit at positions 0..63 (`IOB_Y1`) or 64..127
+/// (`IOB_Y0`) within the same two words, so the test is simply which half.
+fn borrowed_bits_fit(
+    segbits: &SegBitsDb,
+    alias: &crate::frames::TileAlias,
+    feature: &str,
+    address: Option<u32>,
+) -> bool {
+    let Some((site, rest)) = feature.split_once('.') else {
+        return false;
+    };
+    // Three different spellings of one site meet here, and none of them
+    // equals another:
+    //
+    //   FASM / segbits      IOB_Y0
+    //   tilegrid `sites`    IOB_X1Y49
+    //   alias remap         IOB33_Y0 -> IOB33_Y1   (die-level names)
+    //
+    // What the alias VALUE selects is the segbits site letter, so
+    // `IOB33_Y1` means the feature must be looked up as `IOB_Y1`. Matching on
+    // the literal FASM site name finds nothing, which reads as "does not fit"
+    // and drops a pad that would have worked.
+    // The FASM site name is the tile's LOCAL name; the alias value is the
+    // site the base type knows it as. Rewrite wholesale rather than comparing
+    // them -- they are never spelled the same way.
+    let local_prefix = site.rsplit_once('_').map(|(p, _)| p).unwrap_or("");
+    let target_suffix = alias
+        .sites
+        .values()
+        .next()
+        .and_then(|mapped| mapped.rsplit('_').next())
+        .unwrap_or("");
+    let rewritten = if local_prefix.is_empty() || target_suffix.is_empty() {
+        format!("{site}.{rest}")
+    } else {
+        format!("{local_prefix}_{target_suffix}.{rest}")
+    };
+    let Some((_, bits)) = segbits
+        .feature_bits(&alias.base_type, &rewritten, address)
+        .or_else(|| segbits.feature_bits(&alias.base_type, feature, address))
+    else {
+        return false;
+    };
+    // Where a feature's bits land, in words, is
+    //
+    //     block.offset + start_offset + bitpos / 32
+    //
+    // and a `_SING` variant owns only the two words starting at
+    // `start_offset` within its row-pair. So the bit positions that fit are
+    // `bitpos / 32 < 2`, measured from the block -- `IOB_Y1` sits at
+    // positions 0..63 (words 0..1) and its instance adds no skew, while
+    // `IOB_Y0` sits at 64..127 (words 2..3) and lands PAST the two words the
+    // variant owns. For `RIOB33_SING_X73Y0` that is words 4..5 against a
+    // window of 2..3.
+    //
+    // A previous version of this test compared bit positions directly
+    // (`bitpos < 64`) after having also added `start_offset` to the frame
+    // offset, which double-counted the skew. Stated in words from the block,
+    // the rule is the simple one below.
+    bits.iter().all(|b| b.bitpos / 32 < 2)
 }

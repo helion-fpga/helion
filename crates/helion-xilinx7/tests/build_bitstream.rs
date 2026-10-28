@@ -68,9 +68,18 @@ fn zedboard_bitstream_matches_the_hand_built_flow() {
         "applied {} -- an image this sparse means emission produced nothing",
         got.features_applied
     );
-    assert!(
-        got.dropped.is_empty(),
-        "{}",
+    // A `*_SING` tile hosts only one half of its base type's layout. The
+    // ZedBoard's LED7 pad (U14) is `RIOB33_SING_X73Y0`, whose alias lands in
+    // the upper half (bits 64..127) and so cannot be programmed from upstream
+    // segbits at all; LED6 (U19 / `_X73Y49`) lands in the lower half and IS
+    // borrowed. Pin that split rather than requiring an empty list, which
+    // would silently forbid the working borrow along with the impossible one.
+    let dropped_tiles: Vec<&str> = got.dropped.iter().map(|d| d.tile.as_str()).collect();
+    assert_eq!(
+        dropped_tiles,
+        vec!["RIOB33_SING_X73Y0"],
+        "only the upper-half _SING pad may be dropped; LED6 (RIOB33_SING_X73Y49) must be \
+         borrowed. Summary: {}",
         got.dropped_summary().unwrap_or_default()
     );
 
