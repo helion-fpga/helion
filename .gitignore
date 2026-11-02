@@ -12,3 +12,7 @@ gold-*.log
 *.ppm
 docs/mac-bench-2.0.4/
 
+
+# Python bytecode (docs/zedboard-tools/*.py)
+__pycache__/
+*.pyc
