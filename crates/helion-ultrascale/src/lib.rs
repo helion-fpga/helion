@@ -28,7 +28,7 @@ pub use bitloc::{
 pub use device::{UltraScaleDevice, Xcvu3pSpec};
 pub use device_file::{
     ArchSummary, BitLocator, BramResolution, DeviceFile, DeviceFileError, Far, FarBlockType,
-    ProvisionalNote, NUM_18K_BRAM_PER_COLUMN,
+    NUM_18K_BRAM_PER_COLUMN, ProvisionalNote,
 };
 pub use fabric::{
     EmptyTimingDb, EmptyWireDb, FabricWithPlaceholders, TimingDb, UltraScaleFabric, WireDb,
