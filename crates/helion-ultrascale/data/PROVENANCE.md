@@ -88,9 +88,11 @@ so no site-type JSON feeds the INT audit directly.
   (untracked in the base worktree; not present in this worktree).
 - License: MIT. Verified 2026-11-07: the clone's `LICENSE` file is the
   MIT license, Copyright (c) 2022 EPFL VLSC.
-- The 4.5 MB `resources/archs/ULTRASCALE_PLUS.json` is NOT copied here;
-  the device-file worker owns the arch JSON. The pointers this crew relies
-  on, for the record:
+- The 4.5 MB `resources/archs/ULTRASCALE_PLUS.json` is NOT copied here
+  in full; the device-file worker owns the arch JSON. The four
+  LUT/FF/BRAM bit-location tables extracted from it ARE vendored here
+  as `ultrascale_plus_lut_ff_bram.json`; see the subsection below.
+- The pointers this crew relies on, for the record:
   - LUT INIT: `{CLEL_L,CLEL_R,CLEM,CLEM_R}.LutLoc.Y_ofst[0..59].frame_ofst[{A..H}6LUT]` (64 offsets each) and `.minor[...]`
   - FF init/config: same file, `.RegLoc.Y_ofst[0..59].frame_ofst[{A..H}FF, {A..H}FF2]` and `.minor[...]` (16 FF names)
   - BRAM content: `BRAM.BramMemLoc.Y_ofst[0..23].frame_ofst` (16384 offsets) and `.minor[...]`
@@ -98,6 +100,26 @@ so no site-type JSON feeds the INT audit directly.
   - FAR layout: `src/arch_spec.py`, class `UltraScalePlusSpec` (UG570 table 9-21)
 - Pointers verified against the day-1 scout report
   (`~/workspace/helion-ultra-bitgen-segbits/report.md`).
+
+### Vendored BitFiltrator tables (LUT / FF / BRAM bit locations)
+
+Extracted verbatim from `resources/archs/ULTRASCALE_PLUS.json` by the
+lut-ff-bram worker (branch `fm/ultra-bitgen-lut`, commit 0e81099; merged
+to `fm/ultra-bitstream` as a09df12). Extraction details, table layout,
+and cross-checks are in `README.md` in this directory; provenance is
+recorded here, the single index for this directory.
+
+| File | Source SHA-256 | License |
+|---|---|---|
+| ultrascale_plus_lut_ff_bram.json | c6320fe7322d918fc3995f9122f62b0f4ab7b282b517bf8231d0c63ac70b436c | MIT, Copyright (c) 2022 EPFL VLSC |
+| generate_tables.py | extraction script, not vendored data | MIT |
+
+Source SHA-256 is of `resources/archs/ULTRASCALE_PLUS.json` in the
+BitFiltrator reference clone at commit
+`79b9bd66ecae31354936143180fa578dc5732baf` (recomputed 2026-11-07
+during the segbits-vendor rebase onto a09df12). The extracted tables
+are byte-identical to the source sections; `generate_tables.py`
+asserts the table counts and warns if the source hash changes.
 
 ## What is NOT here (rejected or missing)
 
