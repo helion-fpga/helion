@@ -158,6 +158,13 @@ impl UltraScaleDevice {
                 TileKind::Clel | TileKind::Clem => ClbBelInventory::bels_at(*id),
                 TileKind::Dsp => vec![Bel::new(BelKind::Dsp48e2, *id, 0)],
                 TileKind::Bram => vec![
+                    // BRAM capacity accounting (CTO ruling G3): one tile is
+                    // ONE RAMB36E2 or TWO RAMB18E2 halves, never both. The
+                    // two Ramb18e2 BELs are alternate views of the same
+                    // physical halves, not additional capacity: 720 tiles
+                    // hold 720 RAMB36E2 or 1440 RAMB18E2 halves, and the
+                    // counts must never be added together. A design uses a
+                    // tile as one RAMB36 or as two RAMB18, never both.
                     Bel::new(BelKind::Ramb36e2, *id, 0),
                     Bel::new(BelKind::Ramb18e2, *id, 0),
                     Bel::new(BelKind::Ramb18e2, *id, 1),
@@ -292,6 +299,49 @@ mod tests {
             320,
             "URAM288 count derived from 90.0 Mb"
         );
+    }
+
+    #[test]
+    fn bram_capacity_is_720_ramb36_with_no_double_count() {
+        // G3: BRAM tile capacity is 720 RAMB36E2 total (derived from
+        // 25.3 Mb). The two RAMB18E2 BELs per tile are alternate views
+        // of the same physical halves, not additional capacity: a tile
+        // used as one RAMB36 cannot also be used as two RAMB18, so the
+        // counts must never be added (720 + 1440 would double count).
+        let d = UltraScaleDevice::xcvu3p();
+        assert_eq!(d.count_tiles(TileKind::Bram), 720, "BRAM tile count");
+        assert_eq!(
+            d.count_bels(BelKind::Ramb36e2),
+            720,
+            "RAMB36E2 count is the tile count"
+        );
+        assert_eq!(
+            d.count_bels(BelKind::Ramb18e2),
+            1440,
+            "RAMB18E2 halves are exactly two per tile"
+        );
+        assert_eq!(
+            d.count_bels(BelKind::Ramb18e2),
+            2 * d.count_bels(BelKind::Ramb36e2),
+            "halves are the same tiles viewed as halves, not extra capacity"
+        );
+        // Per tile: exactly one RAMB36 view and two RAMB18 views.
+        for (id, kind) in d.tiles() {
+            if kind != TileKind::Bram {
+                continue;
+            }
+            let bels = d.bels_at(id);
+            assert_eq!(
+                bels.iter().filter(|b| b.kind == BelKind::Ramb36e2).count(),
+                1,
+                "BRAM tile {id:?} must have exactly one RAMB36 view"
+            );
+            assert_eq!(
+                bels.iter().filter(|b| b.kind == BelKind::Ramb18e2).count(),
+                2,
+                "BRAM tile {id:?} must have exactly two RAMB18 views"
+            );
+        }
     }
 
     #[test]
