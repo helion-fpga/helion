@@ -40,7 +40,7 @@ fn place_lut_and_ff_through_fabric_api() {
     assert_eq!(ff.name(), Some("AQ".to_string()));
 
     // Record the placement.
-    let placements = vec![
+    let placements = [
         Placement {
             bel_tile: lut.tile,
             bel_kind: lut.kind,
