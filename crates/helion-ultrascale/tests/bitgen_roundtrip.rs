@@ -49,12 +49,13 @@
 //! the preamble; later frames start from 0 after the CRC-register write):
 //!   F2 = 0x9ac4dc29, F1 = 0xaa75db0b, F3 = 0x66924d7d
 //!
-//! Expected stream: 729 words = 2916 bytes. Sync word at byte 48 (word 12).
+//! Expected stream: 733 words = 2932 bytes. Sync word at byte 48 (word 12).
 //! Packet word offsets: RCRC header 14, IDCODE header 16, WCFG header 18,
 //! F2 FAR 20 / FDRI 22 / FARrw 116 / CRC 118 (value 119),
 //! F1 FAR 120 / FDRI 122 / FARrw 216 / CRC 218 (value 219),
 //! F3 FAR 220 / FDRI 222 / FARrw 316 / CRC 318 (value 319),
-//! ending RCRC 320, GRESTORE 324, DGHIGH 327, trailing NOOPs 329..728.
+//! ending RCRC 320, GRESTORE 324, DGHIGH 327, START 329, DESYNC 331,
+//! trailing NOOPs 333..732.
 
 use helion_ultrascale::bitgen::{
     BitRef, SYNC_WORD, StubDevice, StubSegbitsDb, emit_bitstream, emit_frames, parse_bitstream,
@@ -159,7 +160,7 @@ fn bitstream_has_expected_length_sync_headers_and_crcs() {
     let device = test_device();
     let db = test_db();
     let bytes = emit_bitstream(FASM, &device, &db).unwrap();
-    assert_eq!(bytes.len(), 729 * 4);
+    assert_eq!(bytes.len(), 733 * 4);
 
     // Preamble: 8 dummy, bus width detect, bus width sync, 2 dummy, sync, NOOP.
     assert_eq!(word(&bytes, 12), SYNC_WORD);
@@ -208,7 +209,8 @@ fn bitstream_has_expected_length_sync_headers_and_crcs() {
     assert_eq!(word(&bytes, 318), 0x3000_0001);
     assert_eq!(word(&bytes, 319), 0x6692_4d7d);
 
-    // Ending: RCRC, 2 NOOP, GRESTORE, NOOP, DGHIGH, 400 NOOP.
+    // Ending: RCRC, 2 NOOP, GRESTORE, NOOP, DGHIGH, START, DESYNC,
+    // 400 NOOP. START = 5 and DESYNC = 13 are UG570 table 9-22 codes.
     assert_eq!(word(&bytes, 320), 0x3000_8001);
     assert_eq!(word(&bytes, 321), 0x0000_0007);
     assert_eq!(word(&bytes, 322), 0x2000_0000);
@@ -218,7 +220,11 @@ fn bitstream_has_expected_length_sync_headers_and_crcs() {
     assert_eq!(word(&bytes, 326), 0x2000_0000);
     assert_eq!(word(&bytes, 327), 0x3000_8001);
     assert_eq!(word(&bytes, 328), 0x0000_0003);
-    for i in 329..729 {
+    assert_eq!(word(&bytes, 329), 0x3000_8001);
+    assert_eq!(word(&bytes, 330), 0x0000_0005);
+    assert_eq!(word(&bytes, 331), 0x3000_8001);
+    assert_eq!(word(&bytes, 332), 0x0000_000D);
+    for i in 333..733 {
         assert_eq!(word(&bytes, i), 0x2000_0000, "trailing NOOP at word {i}");
     }
 }
