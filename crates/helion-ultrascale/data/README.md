@@ -135,4 +135,13 @@ inside the file) but it is NOT confirmed: confirmation needs Vivado
 since Oct 22, 2026. Nothing provisional in this file may be presented
 as confirmed. See the generator script and COORD.md for the full list
 of assumptions, including the 49,250 vs 49,260 CLB discrepancy and the
-frame-total gap against UG570 (71,664 computed vs 71,820 listed).
+frame-total gap against UG570: the generator computes 73,035 frames,
+which OVERSHOOTS the UG570 Table 1 count of 71,820 by 1,215 (1.7%).
+That is the opposite direction from xcku3p (16 under) and is recorded
+as evidence about the construction, not tuned away: the 7-row count
+may be wrong, the per-row std table may over-count IO columns for
+VU3P, or UG570 Table 1 may count differently. This supersedes the
+71,664 anticipation in the first draft of this section, which no
+rows x (std + BRAM) construction with these tables reproduces.
+`tests/device_file_xcvu3p.rs` pins the computed total so any
+generator change fails loudly here.
