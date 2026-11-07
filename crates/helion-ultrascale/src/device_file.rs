@@ -456,7 +456,9 @@ impl DeviceFile {
             .get(&x)
             .copied()
             .ok_or_else(|| {
-                DeviceFileError::OutOfRange(format!("no BRAM reg column {x} in SLR {slr} row {row}"))
+                DeviceFileError::OutOfRange(format!(
+                    "no BRAM reg column {x} in SLR {slr} row {row}"
+                ))
             })
     }
 
@@ -595,8 +597,8 @@ impl FromStr for DeviceFile {
 
     /// Parse a device file from its JSON text.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let raw: DeviceFileRaw = serde_json::from_str(text)
-            .map_err(|e| DeviceFileError::Json(e.to_string()))?;
+        let raw: DeviceFileRaw =
+            serde_json::from_str(text).map_err(|e| DeviceFileError::Json(e.to_string()))?;
         Ok(DeviceFile { raw })
     }
 }
@@ -663,10 +665,7 @@ fn json_get<'v>(
         .ok_or_else(|| DeviceFileError::Missing(format!("{what} has no {key}")))
 }
 
-fn parse_bram_table(
-    value: &serde_json::Value,
-    what: &str,
-) -> Result<BramLocMap, DeviceFileError> {
+fn parse_bram_table(value: &serde_json::Value, what: &str) -> Result<BramLocMap, DeviceFileError> {
     let y_ofst = json_get(value, "Y_ofst", what)?;
     let mut out = BTreeMap::new();
     for (k, entry) in json_object(y_ofst, &format!("{what} Y_ofst"))? {
@@ -707,8 +706,10 @@ impl ArchSummary {
         let root = json_object(&value, "arch summary")?;
         let bram = json_get(&value, "BRAM", "arch summary")?;
         let bram_mem = parse_bram_table(json_get(bram, "BramMemLoc", "BRAM")?, "BramMemLoc")?;
-        let bram_parity =
-            parse_bram_table(json_get(bram, "BramMemParityLoc", "BRAM")?, "BramMemParityLoc")?;
+        let bram_parity = parse_bram_table(
+            json_get(bram, "BramMemParityLoc", "BRAM")?,
+            "BramMemParityLoc",
+        )?;
         let mut lut = BTreeMap::new();
         let mut reg = BTreeMap::new();
         for (tile_type, tile) in root {
@@ -824,18 +825,16 @@ impl ArchSummary {
     /// BRAM content bit locations for a Y offset: (minors, frame
     /// offsets), one entry per content bit.
     pub fn bram_mem_loc_arrays(&self, y_ofst: u32) -> Result<(&[u32], &[u32]), DeviceFileError> {
-        let (minors, ofsts) = self.bram_mem.get(&y_ofst).ok_or_else(|| {
-            DeviceFileError::OutOfRange(format!("no BramMemLoc Y_ofst {y_ofst}"))
-        })?;
+        let (minors, ofsts) = self
+            .bram_mem
+            .get(&y_ofst)
+            .ok_or_else(|| DeviceFileError::OutOfRange(format!("no BramMemLoc Y_ofst {y_ofst}")))?;
         Ok((minors, ofsts))
     }
 
     /// BRAM parity bit locations for a Y offset: (minors, frame
     /// offsets), one entry per parity bit.
-    pub fn bram_parity_loc_arrays(
-        &self,
-        y_ofst: u32,
-    ) -> Result<(&[u32], &[u32]), DeviceFileError> {
+    pub fn bram_parity_loc_arrays(&self, y_ofst: u32) -> Result<(&[u32], &[u32]), DeviceFileError> {
         let (minors, ofsts) = self.bram_parity.get(&y_ofst).ok_or_else(|| {
             DeviceFileError::OutOfRange(format!("no BramMemParityLoc Y_ofst {y_ofst}"))
         })?;
@@ -938,10 +937,7 @@ impl<'a> BitLocator<'a> {
 
     /// Resolve a LUT BEL to (SLR, FARs, frame offsets), one FAR and
     /// one offset per INIT bit, in INIT order.
-    pub fn locate_lut(
-        &self,
-        name: &str,
-    ) -> Result<(String, Vec<Far>, Vec<u32>), DeviceFileError> {
+    pub fn locate_lut(&self, name: &str) -> Result<(String, Vec<Far>, Vec<u32>), DeviceFileError> {
         let (bel_x, bel_y, bel_name) = Self::parse_slice_bel(name)?;
         if !is_lut_name(&bel_name) {
             return Err(DeviceFileError::UnknownBel(format!(
@@ -950,9 +946,7 @@ impl<'a> BitLocator<'a> {
         }
         let slr_name = self.slr_name(bel_y, NUM_CLB_PER_COLUMN)?;
         let row_major = self.row_major(bel_y, &slr_name, NUM_CLB_PER_COLUMN)?;
-        let col_major = self
-            .device
-            .clb_col_major(&slr_name, row_major, bel_x)?;
+        let col_major = self.device.clb_col_major(&slr_name, row_major, bel_x)?;
         let tile_type = self
             .device
             .clb_tile_type(&slr_name, row_major, bel_x)?
@@ -961,7 +955,12 @@ impl<'a> BitLocator<'a> {
         let (minors, ofsts) = self.arch.lut_loc(&tile_type, y_ofst, &bel_name)?;
         let mut fars = Vec::with_capacity(minors.len());
         for minor in minors {
-            fars.push(Far::new(FarBlockType::ClbIoClk, row_major, col_major, *minor)?);
+            fars.push(Far::new(
+                FarBlockType::ClbIoClk,
+                row_major,
+                col_major,
+                *minor,
+            )?);
         }
         Ok((slr_name, fars, ofsts.to_vec()))
     }
@@ -976,9 +975,7 @@ impl<'a> BitLocator<'a> {
         }
         let slr_name = self.slr_name(bel_y, NUM_CLB_PER_COLUMN)?;
         let row_major = self.row_major(bel_y, &slr_name, NUM_CLB_PER_COLUMN)?;
-        let col_major = self
-            .device
-            .clb_col_major(&slr_name, row_major, bel_x)?;
+        let col_major = self.device.clb_col_major(&slr_name, row_major, bel_x)?;
         let tile_type = self
             .device
             .clb_tile_type(&slr_name, row_major, bel_x)?
@@ -1079,10 +1076,7 @@ impl<'a> BitLocator<'a> {
                                 checked += 1;
                             }
                             for suffix in ["FF", "FF2"] {
-                                let ff = format!(
-                                    "SLICE_X{x}Y{bel_y}/{}{suffix}",
-                                    letter as char
-                                );
+                                let ff = format!("SLICE_X{x}Y{bel_y}/{}{suffix}", letter as char);
                                 let (_, far, _) = self.locate_reg(&ff)?;
                                 if far.minor >= n_minors {
                                     return Err(DeviceFileError::OutOfRange(format!(
@@ -1115,9 +1109,7 @@ impl<'a> BitLocator<'a> {
                     .device
                     .num_minors_per_bram_content_col_major(slr_name, row_major)?;
                 for x in 0..n_cols as u32 {
-                    let col_major = self
-                        .device
-                        .bram_content_col_major(slr_name, row_major, x)?;
+                    let col_major = self.device.bram_content_col_major(slr_name, row_major, x)?;
                     let n_minors = minors_table[col_major as usize];
                     for y_ofst in 0..NUM_18K_BRAM_PER_COLUMN {
                         let bel_y = abs_row * NUM_18K_BRAM_PER_COLUMN + y_ofst;
@@ -1142,9 +1134,7 @@ impl<'a> BitLocator<'a> {
 
 fn is_lut_name(bel: &str) -> bool {
     // [A-H]6LUT
-    bel.len() == 5
-        && (b'A'..=b'H').contains(&bel.as_bytes()[0])
-        && bel.ends_with("6LUT")
+    bel.len() == 5 && (b'A'..=b'H').contains(&bel.as_bytes()[0]) && bel.ends_with("6LUT")
 }
 
 fn is_ff_name(bel: &str) -> bool {
@@ -1165,8 +1155,8 @@ mod tests {
     }
 
     fn load_xcku3p() -> (DeviceFile, ArchSummary) {
-        let device = DeviceFile::from_path(&data_dir().join("xcku3p.json"))
-            .expect("xcku3p.json must load");
+        let device =
+            DeviceFile::from_path(&data_dir().join("xcku3p.json")).expect("xcku3p.json must load");
         let arch = ArchSummary::from_path(&data_dir().join("ULTRASCALE_PLUS.json"))
             .expect("ULTRASCALE_PLUS.json must load");
         (device, arch)
@@ -1200,7 +1190,9 @@ mod tests {
     #[test]
     fn xcku3p_structure_validates_and_clb_counts_agree() {
         let (device, _) = load_xcku3p();
-        let checked = device.validate_structure().expect("structure must validate");
+        let checked = device
+            .validate_structure()
+            .expect("structure must validate");
         assert!(checked > 0);
         assert_eq!(device.slr_idx("SLR0").unwrap(), 0);
         assert_eq!(device.slr_clock_region_col_range("SLR0").unwrap(), (0, 3));
@@ -1263,7 +1255,10 @@ mod tests {
         assert_eq!(fars[2].to_hex(), "00003005");
         assert_eq!(fars[3].to_hex(), "00003004");
         assert!(fars.iter().all(|f| f.row == 0 && f.col == 48));
-        assert_eq!(&ofsts[0..8], &[2271, 2271, 2271, 2271, 2270, 2270, 2270, 2270]);
+        assert_eq!(
+            &ofsts[0..8],
+            &[2271, 2271, 2271, 2271, 2270, 2270, 2270, 2270]
+        );
         // Offsets descend one per four INIT bits: last is 2271 - 15.
         assert_eq!(ofsts[63], 2256);
         // A6LUT in the same slice uses minors 11..8.
@@ -1308,9 +1303,11 @@ mod tests {
         let distinct: std::collections::HashSet<u32> =
             mem_fars.iter().map(|f| f.to_u32()).collect();
         assert_eq!(distinct.len(), 256);
-        assert!(mem_fars
-            .iter()
-            .all(|f| f.block_type == FarBlockType::BramContent && f.row == 0 && f.col == 0));
+        assert!(
+            mem_fars
+                .iter()
+                .all(|f| f.block_type == FarBlockType::BramContent && f.row == 0 && f.col == 0)
+        );
     }
 
     #[test]
