@@ -66,8 +66,18 @@
 //! - `parse_bitstream` returns the FASM of features whose configuration is
 //!   observable in the frames. A valued feature whose value is all zero
 //!   sets no bits and is indistinguishable from an absent feature, so it is
-//!   dropped on parse-back. Round-trip exactness holds for observable
-//!   features; the test pins this boundary.
+//!   dropped on parse-back. The same boundary holds for a valueless
+//!   feature with no set bits (an all-`!` feature such as a mux default
+//!   like VCC_WIRE or an FF `.V1`): it sets no bits, so it is dropped on
+//!   parse-back; otherwise every all-`!` feature of every tile would be
+//!   emitted for unconfigured frames. Round-trip exactness holds for
+//!   observable features; the tests pin this boundary.
+//! - FF INIT parse-back renders the DB vocabulary `.V0`/`.V1`, never bare
+//!   `AFF.INIT`. A set INIT bit renders as `.V0`; a clear bit renders
+//!   nothing (`.V1` is all-`!`, hence unobservable, per the boundary
+//!   above). The value-to-feature polarity mapping (which of V0/V1 means
+//!   INIT=1) is BLOCKED on a polarity experiment; this module pins only
+//!   the bit pattern, never a value meaning.
 //! - Frames with set bits no enumerated feature explains fail loud in
 //!   `parse_bitstream` (`UnexplainedBits`). Use `parse_frames` for foreign
 //!   bitstreams whose DB coverage is incomplete.
@@ -1250,12 +1260,28 @@ pub fn parse_bitstream(
             let present = if valued {
                 any_set
             } else {
-                all_set_bits_one(&frames, base_far, refs)
+                // A valueless feature is present only when it sets at
+                // least one bit and every listed bit agrees: all set bits
+                // read 1 and all `!` bits read 0. The n_set > 0 clause is
+                // load-bearing: `all_set_bits_one` is vacuously true for
+                // an all-`!` feature, and without it every all-`!` feature
+                // of every tile would be emitted for unconfigured frames
+                // (VCC_WIRE for every INT mux, `.V1` for every FF). A
+                // `!` bit reading 1 means the feature is absent (another
+                // selection holds), not an error; the error path is
+                // reserved for genuinely inconsistent input.
+                n_set > 0
+                    && all_set_bits_one(&frames, base_far, refs)
+                    && all_zero_bits_zero(&frames, base_far, refs)
             };
             if !present {
                 continue;
             }
             // A present feature must have all its `!` bits reading 0.
+            // For valueless features this is already implied by the
+            // presence rule above; the check guards valued features,
+            // where presence is any-set and a `!` bit reading 1 is
+            // genuinely inconsistent input.
             for r in refs.iter().filter(|r| r.must_be_zero) {
                 let far = base_far + r.frame;
                 if frame_bit(&frames, far, r.bit) {
@@ -1323,11 +1349,20 @@ fn frame_bit(frames: &BTreeMap<u32, FrameWords>, far: u32, bit: u16) -> bool {
 }
 
 /// True when every listed non-`!` bit reads 1 (presence test for a
-/// valueless feature). Vacuously true for an empty set-bit list.
+/// valueless feature). Vacuously true for an empty set-bit list, so
+/// callers must also require at least one set bit; an all-`!` feature
+/// is never present on parse-back.
 fn all_set_bits_one(frames: &BTreeMap<u32, FrameWords>, base_far: u32, refs: &[BitRef]) -> bool {
     refs.iter()
         .filter(|r| !r.must_be_zero)
         .all(|r| frame_bit(frames, base_far + r.frame, r.bit))
+}
+
+/// True when every listed `!` bit reads 0.
+fn all_zero_bits_zero(frames: &BTreeMap<u32, FrameWords>, base_far: u32, refs: &[BitRef]) -> bool {
+    refs.iter()
+        .filter(|r| r.must_be_zero)
+        .all(|r| !frame_bit(frames, base_far + r.frame, r.bit))
 }
 
 /// Format reconstructed value bits (LSB-first vec, bit 0 is LSB) as
