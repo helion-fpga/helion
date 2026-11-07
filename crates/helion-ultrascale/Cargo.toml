@@ -12,3 +12,5 @@ serde_json = { version = "1" }
 # Only the INT PIP audit test parses JSON (tile_type_INT.json).
 # Same pattern as helion-ecp5 / helion-xilinx7 / helion-gui.
 serde_json = "1"
+helion-ir = { workspace = true }
+helion-sv = { workspace = true }
