@@ -6,3 +6,8 @@ license.workspace = true
 
 [dependencies]
 serde_json = { version = "1" }
+
+[dev-dependencies]
+# Only the INT PIP audit test parses JSON (tile_type_INT.json).
+# Same pattern as helion-ecp5 / helion-xilinx7 / helion-gui.
+serde_json = "1"
