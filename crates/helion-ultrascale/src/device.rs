@@ -12,7 +12,10 @@
 //! Derived counts (shown with derivation, not AMD-published directly):
 //! - RAMB36E2: 25.3 Mb * 1024 Kb/Mb / 36 Kb = 719.6, rounds to 720
 //! - URAM288: 90.0 Mb * 1024 Kb/Mb / 288 Kb = 320 exactly
-//! - CLB slices: 394,000 LUTs / 8 per slice = 49,250
+//! - CLB slices: 49,260, giving 49,260 x 8 = 394,080 LUTs and
+//!   49,260 x 16 = 788,160 FFs (XMP103 rounds these to 394K / 788K;
+//!   49,250 was a rounding artifact of dividing the rounded 394,000,
+//!   CTO ruling 2026-11-07)
 //!
 //! CLB structure from UG574. Tile type vocabulary from BitFiltrator
 //! tileType_siteType_pairs (CLEL_L/R, CLEM/R, DSP, BRAM).
@@ -43,8 +46,10 @@ impl Xcvu3pSpec {
     pub const RAMB36_COUNT: u32 = 720;
     /// URAM288 count, derived: 90.0 * 1024 / 288 = 320 exactly.
     pub const URAM288_COUNT: u32 = 320;
-    /// CLB slice count, derived: 394_000 / 8 = 49,250.
-    pub const CLB_SLICE_COUNT: u32 = 49_250;
+    /// CLB slice count: 49,260 (CTO ruling 2026-11-07: 49,250 was a
+    /// rounding artifact of XMP103's 394K figure; 49,260 x 8 = 394,080
+    /// LUTs, 49,260 x 16 = 788,160 FFs).
+    pub const CLB_SLICE_COUNT: u32 = 49_260;
 }
 
 /// xcku3p aggregate resources. Values from AMD XMP103 v2.8 and DS890,
@@ -62,9 +67,12 @@ impl Xcvu3pSpec {
 ///
 /// Known discrepancy, owned by the device-file worker: the device file
 /// reports `num_slices` 27,120 (113 CLB columns x 4 clock rows x 60),
-/// which is one clock row (6,780 slices) more than AMD's 20,340. The
-/// model uses AMD's count; the device file's per-row column layout needs
-/// Vivado confirmation before the grid is treated as physical.
+/// which is one clock row (6,780 slices) more than AMD's 20,340. CTO
+/// ruling 2026-11-07: the file's `num_slices` contradicts its own
+/// `num_luts` 162,720 (= 20,340 x 8) and is a file-header anomaly, not
+/// ground truth. The model uses AMD's 20,340; the device file's per-row
+/// column layout needs Vivado confirmation before the grid is treated
+/// as physical.
 pub struct Xcku3pSpec;
 
 impl Xcku3pSpec {
@@ -310,12 +318,17 @@ mod tests {
 
     #[test]
     fn xcvu3p_clb_counts_match_amd_docs() {
-        // XMP103: 394K LUTs, 788K FFs. Model: 49,250 slices x (8 LUT + 16 FF).
+        // XMP103 rounds to 394K LUTs, 788K FFs. Model: 49,260 slices
+        // x (8 LUT + 16 FF) = 394,080 LUTs, 788,160 FFs (CTO ruling
+        // 2026-11-07: 49,250 was a rounding artifact of dividing the
+        // rounded 394,000; 49,260 x 8 = 394,080, verified 2026-11-07).
         let d = UltraScaleDevice::xcvu3p();
         let luts = d.count_bels(BelKind::Lut6);
         let ffs = d.count_bels(BelKind::FdRe);
-        assert_eq!(luts, 49_250 * 8, "LUT count must match 394K from XMP103");
-        assert_eq!(ffs, 49_250 * 16, "FF count must match 788K from XMP103");
+        assert_eq!(luts, 49_260 * 8, "LUT count must be 394,080");
+        assert_eq!(luts, 394_080);
+        assert_eq!(ffs, 49_260 * 16, "FF count must be 788,160");
+        assert_eq!(ffs, 788_160);
         // Within 1% of published K numbers (394K, 788K).
         assert!((luts as f64 - 394_000.0).abs() / 394_000.0 < 0.01);
         assert!((ffs as f64 - 788_000.0).abs() / 788_000.0 < 0.01);
@@ -325,7 +338,7 @@ mod tests {
     fn xcvu3p_carry8_one_per_slice() {
         // UG574: one CARRY8 per CLB slice.
         let d = UltraScaleDevice::xcvu3p();
-        assert_eq!(d.count_bels(BelKind::Carry8), 49_250);
+        assert_eq!(d.count_bels(BelKind::Carry8), 49_260);
     }
 
     #[test]
