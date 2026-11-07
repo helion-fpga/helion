@@ -111,6 +111,15 @@ impl Bel {
 
     /// BEL name in UG574 letter convention, e.g. "A6LUT", "AQ", "CARRY8".
     /// Returns None for indices outside the valid range for the kind.
+    ///
+    /// Names are injective within a tile: two different BELs never share a
+    /// name. Wide muxes use the UG574 lettered names (F7AMUX..F7DMUX,
+    /// F8AMUX, F8BMUX). The two RAMB18 halves of a BRAM tile are
+    /// RAMB18E2_L (Bel index 0, lower half) and RAMB18E2_U (Bel index 1,
+    /// upper half), following the Project U-Ray L/U naming; the index to
+    /// half mapping is a convention of this model, not a Vivado-verified
+    /// fact. Any consumer that keys on name (including the FASM handoff)
+    /// can therefore tell the halves apart.
     pub fn name(&self) -> Option<String> {
         match self.kind {
             BelKind::Lut6 => {
@@ -136,7 +145,39 @@ impl Bel {
                     None
                 }
             }
-            _ => Some(self.kind.unisim().to_string()),
+            BelKind::F7Mux => {
+                if self.index < 4 {
+                    Some(format!("F7{}MUX", (b'A' + self.index as u8) as char))
+                } else {
+                    None
+                }
+            }
+            BelKind::F8Mux => {
+                if self.index < 2 {
+                    Some(format!("F8{}MUX", (b'A' + self.index as u8) as char))
+                } else {
+                    None
+                }
+            }
+            BelKind::F9Mux => {
+                if self.index == 0 {
+                    Some("F9MUX".to_string())
+                } else {
+                    None
+                }
+            }
+            BelKind::Ramb18e2 => match self.index {
+                0 => Some("RAMB18E2_L".to_string()),
+                1 => Some("RAMB18E2_U".to_string()),
+                _ => None,
+            },
+            BelKind::Dsp48e2 | BelKind::Ramb36e2 | BelKind::Uram288 => {
+                if self.index == 0 {
+                    Some(self.kind.unisim().to_string())
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -199,6 +240,55 @@ mod tests {
         assert_eq!(luts, 8);
         assert_eq!(ffs, 16);
         assert_eq!(carry, 1);
+    }
+
+    #[test]
+    fn bel_names_are_injective_within_a_tile() {
+        // Critic F1 (base review): Bel::name() must identify a BEL, so no
+        // two BELs on one tile may share a name. Covers the wide muxes and
+        // the two RAMB18 halves, the cases the old fallback arm aliased.
+        let tile = TileId::new(0, 0);
+        let mut names = std::collections::HashSet::new();
+        for bel in ClbBelInventory::bels_at(tile) {
+            let name = bel.name().expect("every CLB BEL must have a name");
+            assert!(names.insert(name.clone()), "duplicate BEL name {name}");
+        }
+        // Wide mux lettering per UG574.
+        assert_eq!(
+            Bel::new(BelKind::F7Mux, tile, 0).name(),
+            Some("F7AMUX".to_string())
+        );
+        assert_eq!(
+            Bel::new(BelKind::F7Mux, tile, 3).name(),
+            Some("F7DMUX".to_string())
+        );
+        assert_eq!(Bel::new(BelKind::F7Mux, tile, 4).name(), None);
+        assert_eq!(
+            Bel::new(BelKind::F8Mux, tile, 1).name(),
+            Some("F8BMUX".to_string())
+        );
+        assert_eq!(Bel::new(BelKind::F8Mux, tile, 2).name(), None);
+        assert_eq!(
+            Bel::new(BelKind::F9Mux, tile, 0).name(),
+            Some("F9MUX".to_string())
+        );
+        assert_eq!(Bel::new(BelKind::F9Mux, tile, 1).name(), None);
+        // RAMB18 halves are distinct names.
+        assert_eq!(
+            Bel::new(BelKind::Ramb18e2, tile, 0).name(),
+            Some("RAMB18E2_L".to_string())
+        );
+        assert_eq!(
+            Bel::new(BelKind::Ramb18e2, tile, 1).name(),
+            Some("RAMB18E2_U".to_string())
+        );
+        assert_eq!(Bel::new(BelKind::Ramb18e2, tile, 2).name(), None);
+        // Single-instance hard blocks name only at index 0.
+        assert_eq!(
+            Bel::new(BelKind::Dsp48e2, tile, 0).name(),
+            Some("DSP48E2".to_string())
+        );
+        assert_eq!(Bel::new(BelKind::Dsp48e2, tile, 1).name(), None);
     }
 
     #[test]
