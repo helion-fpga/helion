@@ -149,15 +149,11 @@ impl PackedUltraSlice {
         for c in self.ff_clk.values() {
             clks.insert(c.as_str());
         }
-        for c in self.ff_ce.values() {
-            if let Some(s) = c {
-                ces.insert(s.as_str());
-            }
+        for c in self.ff_ce.values().flatten() {
+            ces.insert(c.as_str());
         }
-        for s in self.ff_sr.values() {
-            if let Some(s) = s {
-                srs.insert(s.as_str());
-            }
+        for s in self.ff_sr.values().flatten() {
+            srs.insert(s.as_str());
         }
         clks.insert(clk);
         if let Some(c) = ce {
