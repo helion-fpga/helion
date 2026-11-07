@@ -5,7 +5,7 @@
 //! model; it exists so the PathFinder core can be developed and tested before
 //! the real WireDb lands.
 
-use crate::fabric::{UltraSite, WireDb, WireId};
+use crate::fabric::{UltraSite, WireDb, WireId, WireInfo};
 use std::collections::HashMap;
 
 pub struct MockWireDb {
@@ -90,5 +90,12 @@ impl WireDb for MockWireDb {
         self.pin_wires
             .get(&(site.x, site.y, bel.to_string(), pin.to_string()))
             .copied()
+    }
+
+    /// The mock has grid positions only, no names: it can never feed
+    /// the router-to-PIP translator. Expected; the mock is algorithm
+    /// scaffolding, not a real device model.
+    fn wire_info(&self, _wire: WireId) -> Option<WireInfo<'_>> {
+        None
     }
 }

@@ -11,6 +11,23 @@ use crate::device::UltraScaleDevice;
 /// Wire node identifier: index into a WireDb node table.
 pub type WireId = u32;
 
+/// A wire's name and Vivado tile name, for the router-to-PIP translator.
+///
+/// Added by CTO ruling on the int-pip naming seam (COORD.md 2026-11-07):
+/// the router emits wire-ID paths, the int-pip emitter consumes named
+/// PIPs (`IntPip { tile, src, dst }`), and this query is the bridge
+/// between them. The routing-graph WireDb returns `Some` from its
+/// DB-derived node table; `EmptyWireDb` and the mock return `None`.
+/// The translator fails loud on any unnamed wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WireInfo<'a> {
+    /// Wire name exactly as it appears in the segbits DB, e.g.
+    /// `BOUNCE_E_0_FT1`.
+    pub name: &'a str,
+    /// Vivado tile name, e.g. `INT_X12Y45`.
+    pub tile: &'a str,
+}
+
 /// Physical site identifier. Shape per the day-1 router contract; `kind`
 /// follows the router scaffold convention: 0=CLB, 1=IOB, 2=DSP, 3=BRAM,
 /// 4=URAM, 5=CLK.
@@ -36,6 +53,9 @@ pub trait WireDb: Send + Sync {
     fn wire_xy(&self, wire: WireId) -> (i32, i32);
     /// Entry wire driven by a BEL pin.
     fn wire_for_bel_pin(&self, site: UltraSite, bel: &str, pin: &str) -> Option<WireId>;
+    /// Wire name and tile name for the router-to-PIP translator.
+    /// `None` when this database cannot name wires (placeholder, mock).
+    fn wire_info(&self, wire: WireId) -> Option<WireInfo<'_>>;
 }
 
 /// Timing database seam. The timing agent provides the implementation.
@@ -66,6 +86,10 @@ impl WireDb for EmptyWireDb {
     }
 
     fn wire_for_bel_pin(&self, _site: UltraSite, _bel: &str, _pin: &str) -> Option<WireId> {
+        None
+    }
+
+    fn wire_info(&self, _wire: WireId) -> Option<WireInfo<'_>> {
         None
     }
 }
@@ -171,5 +195,89 @@ mod tests {
     fn fabric_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<FabricWithPlaceholders>();
+    }
+
+    /// Test-only WireDb backed by two verbatim lines from prjuray-db
+    /// zynqusp/segbits_int.db (commit affbc5e, CC0 1.0), tile INT_X12Y45:
+    ///   INT.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1 64_00 !66_00 !68_00 !72_00 !72_01 !74_00
+    ///   INT.PIP.INODE_E_1_FT1.BYPASS_E4 !57_00
+    struct NamedTestDb {
+        names: Vec<(&'static str, &'static str)>,
+        fanout: Vec<Vec<WireId>>,
+    }
+
+    impl NamedTestDb {
+        fn new() -> Self {
+            Self {
+                names: vec![
+                    ("BOUNCE_E_0_FT1", "INT_X12Y45"),
+                    ("INODE_E_1_FT1", "INT_X12Y45"),
+                    ("BYPASS_E4", "INT_X12Y45"),
+                ],
+                fanout: vec![vec![1], vec![2], vec![]],
+            }
+        }
+    }
+
+    impl WireDb for NamedTestDb {
+        fn wire_count(&self) -> usize {
+            self.names.len()
+        }
+
+        fn fanout(&self, wire: WireId) -> &[WireId] {
+            &self.fanout[wire as usize]
+        }
+
+        fn wire_xy(&self, _wire: WireId) -> (i32, i32) {
+            (12, 45)
+        }
+
+        fn wire_for_bel_pin(&self, site: UltraSite, bel: &str, pin: &str) -> Option<WireId> {
+            match (site.x, site.y, bel, pin) {
+                (12, 45, "A6LUT", "O6") => Some(0),
+                (12, 45, "A6LUT", "A1") => Some(1),
+                _ => None,
+            }
+        }
+
+        fn wire_info(&self, wire: WireId) -> Option<WireInfo<'_>> {
+            self.names
+                .get(wire as usize)
+                .map(|(name, tile)| WireInfo { name, tile })
+        }
+    }
+
+    #[test]
+    fn db_backed_wire_db_wire_info_names_wires() {
+        let db = NamedTestDb::new();
+        assert_eq!(
+            db.wire_info(0),
+            Some(WireInfo {
+                name: "BOUNCE_E_0_FT1",
+                tile: "INT_X12Y45"
+            })
+        );
+        assert_eq!(
+            db.wire_info(1),
+            Some(WireInfo {
+                name: "INODE_E_1_FT1",
+                tile: "INT_X12Y45"
+            })
+        );
+        assert_eq!(
+            db.wire_info(2),
+            Some(WireInfo {
+                name: "BYPASS_E4",
+                tile: "INT_X12Y45"
+            })
+        );
+        assert_eq!(db.wire_info(3), None);
+    }
+
+    #[test]
+    fn empty_wire_db_wire_info_is_none() {
+        let db = EmptyWireDb;
+        assert_eq!(db.wire_info(0), None);
+        assert_eq!(db.wire_info(999), None);
     }
 }

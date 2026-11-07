@@ -45,7 +45,7 @@ pub use device_file::{
 };
 pub use fabric::{
     EmptyTimingDb, EmptyWireDb, FabricWithPlaceholders, TimingDb, UltraScaleFabric, UltraSite,
-    WireDb, WireId,
+    WireDb, WireId, WireInfo,
 };
 pub use int_pip::{
     EmittedPip, IntPip, IntPipError, MissingPip, PipResolution, emit_pips, emitted_to_fasm,
