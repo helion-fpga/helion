@@ -8,15 +8,34 @@
 use crate::bel::{Bel, TileId, TileKind};
 use crate::device::UltraScaleDevice;
 
+/// Wire node identifier: index into a WireDb node table.
+pub type WireId = u32;
+
+/// Physical site identifier. Shape per the day-1 router contract; `kind`
+/// follows the router scaffold convention: 0=CLB, 1=IOB, 2=DSP, 3=BRAM,
+/// 4=URAM, 5=CLK.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct UltraSite {
+    pub x: i32,
+    pub y: i32,
+    pub kind: u8,
+}
+
 /// Routing graph seam. The routing-graph agent provides the implementation.
 ///
-/// Required queries (to be finalized by the routing-graph agent):
+/// Required queries (day-1 contract, router agent 2026-10-22):
 /// - wires incident to a BEL pin
 /// - wire-to-wire connectivity (PIP model)
 /// - tile-to-tile adjacency
 pub trait WireDb: Send + Sync {
     /// Number of wire nodes in the database. Zero for the placeholder.
     fn wire_count(&self) -> usize;
+    /// Downstream wires reachable through one PIP. Slice is stable.
+    fn fanout(&self, wire: WireId) -> &[WireId];
+    /// Physical tile coords for A* heuristic.
+    fn wire_xy(&self, wire: WireId) -> (i32, i32);
+    /// Entry wire driven by a BEL pin.
+    fn wire_for_bel_pin(&self, site: UltraSite, bel: &str, pin: &str) -> Option<WireId>;
 }
 
 /// Timing database seam. The timing agent provides the implementation.
@@ -36,6 +55,18 @@ pub struct EmptyWireDb;
 impl WireDb for EmptyWireDb {
     fn wire_count(&self) -> usize {
         0
+    }
+
+    fn fanout(&self, _wire: WireId) -> &[WireId] {
+        &[]
+    }
+
+    fn wire_xy(&self, _wire: WireId) -> (i32, i32) {
+        (0, 0)
+    }
+
+    fn wire_for_bel_pin(&self, _site: UltraSite, _bel: &str, _pin: &str) -> Option<WireId> {
+        None
     }
 }
 
@@ -78,6 +109,14 @@ impl FabricWithPlaceholders {
     pub fn xcvu3p() -> Self {
         Self {
             device: UltraScaleDevice::xcvu3p(),
+            wires: EmptyWireDb,
+            timing: EmptyTimingDb,
+        }
+    }
+
+    pub fn xcku3p() -> Self {
+        Self {
+            device: UltraScaleDevice::xcku3p(),
             wires: EmptyWireDb,
             timing: EmptyTimingDb,
         }
