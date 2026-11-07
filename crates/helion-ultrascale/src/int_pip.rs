@@ -116,7 +116,7 @@ pub enum IntPipError {
         tile: String,
         feature: String,
         frame: u32,
-        bit: u8,
+        bit: u16,
     },
 }
 
@@ -214,7 +214,7 @@ pub fn emit_pips(
 /// frame, and bit.
 pub fn verify_zero_bits(
     emitted: &[EmittedPip],
-    base_reads_one: &dyn Fn(u32, u8) -> bool,
+    base_reads_one: &dyn Fn(u32, u16) -> bool,
 ) -> Result<(), IntPipError> {
     for e in emitted {
         for b in &e.zero_bits {
