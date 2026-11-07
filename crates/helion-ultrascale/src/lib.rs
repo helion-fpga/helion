@@ -12,7 +12,6 @@
 //!   DSP, BRAM), confirmed against Vivado tile naming
 
 pub mod bel;
-pub mod bel;
 pub mod bitgen;
 pub mod bitloc;
 pub mod device;
