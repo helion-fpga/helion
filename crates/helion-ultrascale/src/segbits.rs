@@ -25,16 +25,27 @@ use std::path::Path;
 
 /// One configuration bit reference: frame number, bit index within the frame,
 /// and whether the bit must read 0 (`!` token) instead of being set.
+///
+/// `bit` is u16, not u8: the vendored HPIO/HDIO DBs prove u8 cannot hold
+/// the data (segbits_hdio_top_right.db has bit 1390,
+/// segbits_hdio_bot_right.db bit 1310, segbits_hpio_right.db bit 1359;
+/// prjuray `parse_tagbit` returns a bit address within the frame, and a
+/// 93-word UltraScale+ frame holds 2976 bit positions). The ported
+/// loader took u8 because it was verified against segbits_int.db only
+/// (observed 0..47). Widened by segbits-vendor in the vendoring commit
+/// so the full vendored set loads; see the `bit_width_above_u8` test.
+/// This deviates from INTERFACES.md (`bit: u8`) and needs
+/// orchestrator / critic-interfaces sign-off.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct BitRef {
     pub frame: u32,
-    pub bit: u8,
+    pub bit: u16,
     pub must_be_zero: bool,
 }
 
 impl BitRef {
     /// A bit that must be set: `<frame>_<bit>`.
-    pub fn set(frame: u32, bit: u8) -> Self {
+    pub fn set(frame: u32, bit: u16) -> Self {
         Self {
             frame,
             bit,
@@ -43,7 +54,7 @@ impl BitRef {
     }
 
     /// A bit that must read 0: `!<frame>_<bit>`.
-    pub fn zero(frame: u32, bit: u8) -> Self {
+    pub fn zero(frame: u32, bit: u16) -> Self {
         Self {
             frame,
             bit,
@@ -234,10 +245,11 @@ impl SegbitsDb for FileSegbitsDb {
     }
 }
 
-/// Parse one bit token: `!`?`<frame>_<bit>`. Frame is a u32; bit is a u8.
-/// Observed range in zynqusp/segbits_int.db is 0..47 (76 frames, 48 bit
-/// positions); the parser accepts the full u8 range and lets the DB be the
-/// authority, rather than hard-coding the observed range.
+/// Parse one bit token: `!`?`<frame>_<bit>`. Frame is a u32; bit is a u16.
+/// Observed range in zynqusp/segbits_int.db is 0..47, but the vendored
+/// HPIO/HDIO DBs run to bit 1390, so the parser accepts the full u16
+/// range and lets the DB be the authority, rather than hard-coding the
+/// observed range.
 fn parse_bit_token(tok: &str) -> Result<BitRef, String> {
     let (must_be_zero, body) = match tok.strip_prefix('!') {
         Some(rest) => (true, rest),
@@ -261,15 +273,15 @@ fn parse_bit_token(tok: &str) -> Result<BitRef, String> {
     let bit_n: u32 = bit_s
         .parse()
         .map_err(|_| format!("bit token {:?} has a non-numeric bit", tok))?;
-    if bit_n > u8::MAX as u32 {
+    if bit_n > u16::MAX as u32 {
         return Err(format!(
-            "bit token {:?} has bit {} outside 0..256",
+            "bit token {:?} has bit {} outside 0..65536",
             tok, bit_n
         ));
     }
     Ok(BitRef {
         frame,
-        bit: bit_n as u8,
+        bit: bit_n as u16,
         must_be_zero,
     })
 }
@@ -337,7 +349,7 @@ mod tests {
     fn malformed_lines_fail_loud() {
         for bad in [
             "INT.PIP.A.B 64_XX\n",
-            "INT.PIP.A.B 64_256\n",
+            "INT.PIP.A.B 64_65536\n",
             "INT.PIP.A.B 6400\n",
             "INT.PIP.A.B\n",
             "INTPIP 64_00\n",
@@ -371,5 +383,49 @@ mod tests {
         let err = FileSegbitsDb::from_file(std::path::Path::new("/nonexistent/segbits_int.db"))
             .unwrap_err();
         assert!(matches!(err, SegbitsLoadError::Io(_)));
+    }
+
+    #[test]
+    fn bit_width_above_u8_parses_exactly() {
+        // Regression test for the u8 to u16 widening (segbits-vendor).
+        // Verbatim line from vendored segbits_hdio_bot_right.db: the bit
+        // offset 1310 does not fit u8, and the ported loader rejected it.
+        let text = "HDIO_BOT_RIGHT.PIP.HDIO_LOGICPAIR_50_OPFFS_Q.HDIO_LOGICPAIR_50_OPFFS_D1 00_1310\n";
+        let db = FileSegbitsDb::from_text(text, "fixture").unwrap();
+        let bits = db
+            .lookup(
+                "HDIO_BOT_RIGHT",
+                "PIP.HDIO_LOGICPAIR_50_OPFFS_Q.HDIO_LOGICPAIR_50_OPFFS_D1",
+            )
+            .unwrap();
+        assert_eq!(bits, &[BitRef::set(0, 1310)]);
+    }
+
+    #[test]
+    fn all_vendored_dbs_load() {
+        // Regression test for the u8 to u16 widening (segbits-vendor).
+        // Loads every vendored DB file from repo data and checks the
+        // counts from data/PROVENANCE.md. The HPIO and HDIO files fail
+        // to load under a u8 bit type (max bit 1390), so this test
+        // fails before the widening and passes after it.
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+        let mut total = 0;
+        for (name, count) in [
+            ("segbits_int.db", 3778),
+            ("segbits_hpio_right.db", 1560),
+            ("segbits_hdio_top_right.db", 812),
+            ("segbits_hdio_bot_right.db", 828),
+            ("segbits_cmt_right.db", 104),
+        ] {
+            let db = FileSegbitsDb::from_file(&data.join(name))
+                .unwrap_or_else(|e| panic!("vendored {name} must load: {e}"));
+            assert_eq!(db.feature_count(), count, "feature count for {name}");
+            total += count;
+        }
+        assert_eq!(total, 7082, "total vendored features");
+        let db = FileSegbitsDb::from_file(&data.join("segbits_int.db")).unwrap();
+        assert_eq!(db.tile_types(), &["INT".to_string()]);
+        let db = FileSegbitsDb::from_file(&data.join("segbits_hpio_right.db")).unwrap();
+        assert_eq!(db.tile_types(), &["HPIO_RIGHT".to_string()]);
     }
 }

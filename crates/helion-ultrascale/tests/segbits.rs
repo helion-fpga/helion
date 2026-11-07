@@ -4,11 +4,6 @@
 //! commit 6bb30b6 on fm/ultra-bitgen-int) against the vendored repo
 //! data in `crates/helion-ultrascale/data/`. Paths come from
 //! `CARGO_MANIFEST_DIR`, never from `/tmp`.
-//!
-//! NOTE: only the INT and CMT DBs are loaded whole here. The HPIO and
-//! HDIO DBs contain bit offsets above 255 (max 1390), which the
-//! ported loader rejects under its u8 bit type; loading them whole is
-//! covered by the u16 widening commit, which adds its regression test.
 
 use helion_ultrascale::{BitRef, FileSegbitsDb, SegbitsDb};
 use std::path::PathBuf;
@@ -47,6 +42,17 @@ fn cmt_features_resolve() {
         .lookup("CMT_RIGHT", "PIP.CLK_HROUTE_1_5.VCC_WIRE")
         .is_some());
     assert_eq!(db.feature_count(), 104);
+}
+
+#[test]
+fn hpio_features_with_wide_bit_offsets_resolve() {
+    // Bit offsets above 255 (max 1359 in this file) load exactly after
+    // the u8 to u16 widening; see the unit regression tests.
+    let db = FileSegbitsDb::from_file(&data_file("segbits_hpio_right.db")).unwrap();
+    assert_eq!(db.feature_count(), 1560);
+    assert!(db
+        .lookup("HPIO_RIGHT", "IOB_X0Y0.DCITERMDISABLE_USED.V0")
+        .is_some());
 }
 
 #[test]
