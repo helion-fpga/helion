@@ -256,13 +256,16 @@ fn parse_frames_matches_emit_frames() {
 fn all_zero_valued_feature_is_dropped_on_parse_back() {
     // A valued feature whose value is all zero sets no bits and is
     // indistinguishable from an absent feature. This pins the documented
-    // limit: parse-back drops it.
+    // limit: parse-back drops the A6LUT line. The AFF.INIT.V1 line in
+    // the output is NOT a failure of that limit: the AFF INIT bit reads
+    // 0 and V1 is the exact complement of V0, so the FF INIT value is
+    // observable and renders (bit = NOT(INIT), so bit 0 is INIT 1).
     let device = test_device();
     let db = test_db();
     let fasm = "SLICE_X0Y0.A6LUT.INIT[63:0] = 64'h0000000000000000\n";
     let bytes = emit_bitstream(fasm, &device, &db).unwrap();
     let back = parse_bitstream(&bytes, &device, &db).unwrap();
-    assert_eq!(back, "");
+    assert_eq!(back, "SLICE_X0Y0.AFF.INIT.V1\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -392,8 +395,11 @@ fn all_bang_mux_routed_case_round_trips() {
 fn all_bang_mux_untouched_case_round_trips() {
     // D1 spurious-lines mode: before the fix, parse-back emitted a
     // VCC_WIRE line for the untouched mux (all-zero frames), breaking
-    // round-trip exactness. An all-`!` feature sets no bits, so it is
-    // indistinguishable from absent and must not be emitted.
+    // round-trip exactness. An all-`!` feature with no exact complement
+    // sets no bits, so it is indistinguishable from absent and must not
+    // be emitted. (An all-`!` feature WITH a complement, such as an FF
+    // .V1, does render; VCC_WIRE has none: no single feature sets
+    // exactly its six bits with no `!` bits.)
     let device = bounce_device();
     let db = bounce_db();
     let bytes = emit_bitstream("", &device, &db).unwrap();
@@ -403,14 +409,81 @@ fn all_bang_mux_untouched_case_round_trips() {
 
 #[test]
 fn all_bang_feature_explicitly_selected_is_dropped_on_parse_back() {
-    // VCC_WIRE sets no bits, so it is indistinguishable from absent
-    // (same boundary as the all-zero-value limit for valued features).
-    // Emit accepts it (it constrains the mux bits to zero) but
-    // parse-back drops it.
+    // VCC_WIRE sets no bits and has no exact complement, so it is
+    // indistinguishable from absent (same boundary as the all-zero-value
+    // limit for valued features). Emit accepts it (it constrains the
+    // mux bits to zero) but parse-back drops it.
     let device = bounce_device();
     let db = bounce_db();
     let fasm = "INT_X0Y0.PIP.BOUNCE_E_0_FT1.VCC_WIRE\n";
     let bytes = emit_bitstream(fasm, &device, &db).unwrap();
     let back = parse_bitstream(&bytes, &device, &db).unwrap();
     assert_eq!(back, "");
+}
+
+// ---------------------------------------------------------------------------
+// FF INIT polarity (researcher session 1, resolved from f4pga/prjuray).
+//
+// Mapping: INIT value 0 selects .V0, which SETS the bit; INIT value 1
+// selects .V1, which CLEARS the bit. bit = NOT(INIT). SRVAL is the
+// same. Source chain: tools/dump_features.tcl:897-902 names the feature
+// from the cell INIT property, so the V suffix IS the attribute value
+// (INIT 1'b0 gives V0, INIT 1'b1 gives V1); utils/spec/flipflops.py:100
+// instantiates .INIT(1'b0) or .INIT(1'b1); vendored DB lines
+// CLEL_L.AFF.INIT.V0 12_02, V1 !12_02 and BFF.INIT.V0 12_04,
+// V1 !12_04 confirm V0 sets and V1 clears. Bit positions below are
+// those real vendored positions (frame offset 12, bits 2 and 4), not
+// the stub scheme test_db uses for AFF (bit 64, kept clear of the
+// LUT bits 63..0).
+// ---------------------------------------------------------------------------
+
+fn polarity_device() -> StubDevice {
+    StubDevice::new(
+        "xcku3p",
+        Some(0x04A6_3093),
+        vec![("SLICE_X0Y0".to_string(), "CLEL_L".to_string(), 0x500)],
+        vec![0x50C],
+    )
+}
+
+fn polarity_db() -> StubSegbitsDb {
+    StubSegbitsDb::new(vec![
+        (
+            "CLEL_L".to_string(),
+            "AFF.INIT.V0".to_string(),
+            vec![BitRef::set(12, 2)],
+        ),
+        (
+            "CLEL_L".to_string(),
+            "AFF.INIT.V1".to_string(),
+            vec![BitRef::clear(12, 2)],
+        ),
+        (
+            "CLEL_L".to_string(),
+            "BFF.INIT.V0".to_string(),
+            vec![BitRef::set(12, 4)],
+        ),
+        (
+            "CLEL_L".to_string(),
+            "BFF.INIT.V1".to_string(),
+            vec![BitRef::clear(12, 4)],
+        ),
+    ])
+}
+
+#[test]
+fn ff_init_polarity_renders_v0_for_bit_one_and_v1_for_bit_zero() {
+    // A bit reading 1 renders .V0 (INIT 0); a bit reading 0 renders
+    // .V1 (INIT 1). No inversion is applied in the parse path: the
+    // DB's V0/V1 features already encode the polarity (V0 sets, V1
+    // clears), so rendering the matching feature renders the right
+    // value. The bare AFF.INIT spelling is non-canonical and must
+    // not appear.
+    let device = polarity_device();
+    let db = polarity_db();
+    let fasm = "SLICE_X0Y0.AFF.INIT.V0\nSLICE_X0Y0.BFF.INIT.V1\n";
+    let bytes = emit_bitstream(fasm, &device, &db).unwrap();
+    let back = parse_bitstream(&bytes, &device, &db).unwrap();
+    assert_eq!(back, fasm);
+    assert!(!back.contains("AFF.INIT\n") && !back.contains("BFF.INIT\n"));
 }
