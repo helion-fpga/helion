@@ -83,7 +83,7 @@ fn locate_int_db() -> PathBuf {
 }
 
 /// Independent parse result: feature -> (set bits, zero bits), each sorted.
-type ParsedSegbits = HashMap<String, (Vec<(u32, u8)>, Vec<(u32, u8)>)>;
+type ParsedSegbits = HashMap<String, (Vec<(u32, u16)>, Vec<(u32, u16)>)>;
 
 /// Independent segbits parser, written for this test only. Maps a feature
 /// string to (set bits, zero bits), each a sorted Vec of (frame, bit).
@@ -106,7 +106,7 @@ fn independent_parse(raw: &str) -> ParsedSegbits {
                 None => (false, tok),
             };
             let (f, b) = body.split_once('_').unwrap();
-            let pair = (f.parse::<u32>().unwrap(), b.parse::<u8>().unwrap());
+            let pair = (f.parse::<u32>().unwrap(), b.parse::<u16>().unwrap());
             if neg {
                 zero.push(pair);
             } else {
@@ -171,8 +171,8 @@ fn bfs_path(adj: &HashMap<String, Vec<String>>, start: &str, goal: &str) -> Opti
     None
 }
 
-fn sorted_bits(bits: &[helion_ultrascale::BitRef]) -> Vec<(u32, u8)> {
-    let mut v: Vec<(u32, u8)> = bits.iter().map(|b| (b.frame, b.bit)).collect();
+fn sorted_bits(bits: &[helion_ultrascale::BitRef]) -> Vec<(u32, u16)> {
+    let mut v: Vec<(u32, u16)> = bits.iter().map(|b| (b.frame, b.bit)).collect();
     v.sort();
     v
 }
@@ -270,13 +270,13 @@ fn full_db_every_line_parses_and_resolves() {
         let bits = db.lookup("INT", feature).unwrap_or_else(|| {
             panic!("loader missed feature {}", feature);
         });
-        let mut got_set: Vec<(u32, u8)> = bits
+        let mut got_set: Vec<(u32, u16)> = bits
             .iter()
             .filter(|b| !b.must_be_zero)
             .map(|b| (b.frame, b.bit))
             .collect();
         got_set.sort();
-        let mut got_zero: Vec<(u32, u8)> = bits
+        let mut got_zero: Vec<(u32, u16)> = bits
             .iter()
             .filter(|b| b.must_be_zero)
             .map(|b| (b.frame, b.bit))

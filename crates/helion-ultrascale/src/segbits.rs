@@ -34,8 +34,8 @@ use std::path::Path;
 /// loader took u8 because it was verified against segbits_int.db only
 /// (observed 0..47). Widened by segbits-vendor in the vendoring commit
 /// so the full vendored set loads; see the `bit_width_above_u8` test.
-/// This deviates from INTERFACES.md (`bit: u8`) and needs
-/// orchestrator / critic-interfaces sign-off.
+/// INTERFACES.md states `bit: u16` (orchestrator ruling 2026-11-07 on
+/// segbits-vendor 98e282a).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct BitRef {
     pub frame: u32,
@@ -390,7 +390,8 @@ mod tests {
         // Regression test for the u8 to u16 widening (segbits-vendor).
         // Verbatim line from vendored segbits_hdio_bot_right.db: the bit
         // offset 1310 does not fit u8, and the ported loader rejected it.
-        let text = "HDIO_BOT_RIGHT.PIP.HDIO_LOGICPAIR_50_OPFFS_Q.HDIO_LOGICPAIR_50_OPFFS_D1 00_1310\n";
+        let text =
+            "HDIO_BOT_RIGHT.PIP.HDIO_LOGICPAIR_50_OPFFS_Q.HDIO_LOGICPAIR_50_OPFFS_D1 00_1310\n";
         let db = FileSegbitsDb::from_text(text, "fixture").unwrap();
         let bits = db
             .lookup(
