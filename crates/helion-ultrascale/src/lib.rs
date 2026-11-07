@@ -14,6 +14,7 @@
 pub mod bel;
 pub mod bitloc;
 pub mod device;
+pub mod device_file;
 pub mod fabric;
 pub mod int_pip;
 pub mod segbits;
@@ -25,6 +26,10 @@ pub use bitloc::{
     NUM_CLB_PER_COLUMN, PlacedBit,
 };
 pub use device::{UltraScaleDevice, Xcvu3pSpec};
+pub use device_file::{
+    ArchSummary, BitLocator, BramResolution, DeviceFile, DeviceFileError, Far, FarBlockType,
+    NUM_18K_BRAM_PER_COLUMN, ProvisionalNote,
+};
 pub use fabric::{
     EmptyTimingDb, EmptyWireDb, FabricWithPlaceholders, TimingDb, UltraScaleFabric, WireDb,
 };
