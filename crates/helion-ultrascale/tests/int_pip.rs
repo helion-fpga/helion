@@ -202,10 +202,16 @@ fn blinky_int_tile_route_matches_db_bit_exact() {
         "BFS route must match the independently verified path"
     );
 
-    // Emit PIPs for the route.
+    // Emit PIPs for the route. The DB spells each PIP sink-first
+    // (PIP.<dst>.<src>), so for consecutive path wires w[0], w[1],
+    // w[0] is the physical sink (dst) and w[1] the physical source
+    // (src). The emitted feature strings are byte-identical to the
+    // pre-rename build. The BFS above walks DB edges in their written
+    // order; its DRIVER/SINK labels name the walk start/end, not
+    // physical signal flow, and the verified path is unchanged.
     let pips: Vec<IntPip> = path
         .windows(2)
-        .map(|w| IntPip::new(TILE, &w[0], &w[1]))
+        .map(|w| IntPip::new(TILE, &w[1], &w[0]))
         .collect();
     assert_eq!(pips.len(), 11, "12-wire path has 11 PIP hops");
     let res = resolve_pips("blinky", &pips, &db);

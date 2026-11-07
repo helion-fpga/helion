@@ -2,10 +2,15 @@
 //!
 //! A routed net crosses INT tiles through PIPs (programmable interconnect
 //! points). Each PIP is one mux selection inside one INT tile, named
-//! `<tile>.PIP.<src>.<dst>` in FASM, e.g.
-//! `INT_X12Y45.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1`. The segbits DB gives the
-//! exact configuration bits for that selection, including `!` bits that must
-//! read 0 in the base frameset.
+//! `<tile>.PIP.<dst>.<src>` in FASM, SINK-FIRST: the first component is
+//! the sink wire (the mux output), the second is the source wire (the
+//! selected mux input), e.g.
+//! `INT_X12Y45.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1`, where BOUNCE_E_0_FT1 is
+//! the sink and INODE_E_1_FT1 is the source. The DB feature is
+//! `PIP.<dst>.<src>` (dst.src matches 3770/3774 in the INT PIP audit,
+//! src.dst matches 0/3774). The segbits DB gives the exact configuration
+//! bits for that selection, including `!` bits that must read 0 in the
+//! base frameset.
 //!
 //! Rules, from the crew brief and SPEC.md:
 //! - Every emitted bit comes from a DB lookup. A guessed PIP encoding is a
@@ -28,7 +33,14 @@ use crate::segbits::{BitRef, SegbitsDb};
 use std::fmt;
 
 /// One INT PIP: a mux selection from wire `src` to wire `dst` in INT tile
-/// `tile` (Vivado tile name, e.g. `INT_X12Y45`).
+/// `tile` (Vivado tile name, e.g. `INT_X12Y45`). `src` is the physical
+/// source wire (the selected mux input), `dst` is the physical sink wire
+/// (the mux output). The DB spells the feature sink-first
+/// (`PIP.<dst>.<src>`); `feature()` builds that order. Do not fill these
+/// fields in DB order: under the old naming they were inverted, and a
+/// translator filling src/dst in physical direction under the old
+/// `feature()` would have emitted `PIP.INODE.BOUNCE`, which is not in
+/// the DB.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct IntPip {
     pub tile: String,
@@ -46,8 +58,9 @@ impl IntPip {
     }
 
     /// Segbits feature string, exactly as it appears in the DB.
+    /// Sink-first: `PIP.<dst>.<src>`.
     pub fn feature(&self) -> String {
-        format!("PIP.{}.{}", self.src, self.dst)
+        format!("PIP.{}.{}", self.dst, self.src)
     }
 
     /// Tile type for the DB lookup: the part of the tile name before the
@@ -59,7 +72,8 @@ impl IntPip {
         }
     }
 
-    /// FASM line for this PIP, no value: `<tile>.PIP.<src>.<dst>`.
+    /// FASM line for this PIP, no value: `<tile>.PIP.<dst>.<src>`
+    /// (sink-first).
     pub fn fasm_line(&self) -> String {
         format!("{}.{}", self.tile, self.feature())
     }
@@ -98,7 +112,7 @@ impl fmt::Display for MissingPip {
         write!(
             f,
             "{}.PIP.{}.{} (design {})",
-            self.tile, self.src, self.dst, self.design
+            self.tile, self.dst, self.src, self.design
         )
     }
 }
@@ -270,7 +284,9 @@ mod tests {
 
     #[test]
     fn pip_names_match_db_vocabulary() {
-        let pip = IntPip::new("INT_X12Y45", "BOUNCE_E_0_FT1", "INODE_E_1_FT1");
+        // Physical direction: INODE drives BOUNCE. The DB spells the
+        // feature sink-first, so the emitted string keeps BOUNCE first.
+        let pip = IntPip::new("INT_X12Y45", "INODE_E_1_FT1", "BOUNCE_E_0_FT1");
         assert_eq!(pip.feature(), "PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1");
         assert_eq!(pip.tile_type(), "INT");
         assert_eq!(
@@ -282,7 +298,7 @@ mod tests {
     #[test]
     fn bounce_pip_emits_exact_bits() {
         let db = fixture_db();
-        let pip = IntPip::new("INT_X12Y45", "BOUNCE_E_0_FT1", "INODE_E_1_FT1");
+        let pip = IntPip::new("INT_X12Y45", "INODE_E_1_FT1", "BOUNCE_E_0_FT1");
         let emitted = emit_pips("blinky", &[pip], &db).unwrap();
         assert_eq!(emitted.len(), 1);
         let e = &emitted[0];
@@ -306,7 +322,7 @@ mod tests {
     #[test]
     fn zero_bit_assertion_passes_on_zero_base_and_fires_on_one() {
         let db = fixture_db();
-        let pip = IntPip::new("INT_X12Y45", "BOUNCE_E_0_FT1", "INODE_E_1_FT1");
+        let pip = IntPip::new("INT_X12Y45", "INODE_E_1_FT1", "BOUNCE_E_0_FT1");
         let emitted = emit_pips("blinky", &[pip], &db).unwrap();
         assert!(verify_zero_bits(&emitted, &|_, _| false).is_ok());
         // Base reads 1 at 66_00, one of the BOUNCE zero bits.
@@ -327,7 +343,7 @@ mod tests {
     #[test]
     fn missing_pip_fails_loud_with_exact_list() {
         let db = fixture_db();
-        let good = IntPip::new("INT_X12Y45", "BOUNCE_E_0_FT1", "INODE_E_1_FT1");
+        let good = IntPip::new("INT_X12Y45", "INODE_E_1_FT1", "BOUNCE_E_0_FT1");
         let bad = IntPip::new("INT_X12Y45", "NOPE_SRC", "NOPE_DST");
         let res = resolve_pips("blinky", &[good.clone(), bad.clone()], &db);
         assert_eq!(res.emitted.len(), 1);
@@ -342,11 +358,11 @@ mod tests {
         );
         let err = emit_pips("blinky", &[good, bad], &db).unwrap_err();
         let text = format!("{}", err);
-        assert!(text.contains("INT_X12Y45.PIP.NOPE_SRC.NOPE_DST"));
+        assert!(text.contains("INT_X12Y45.PIP.NOPE_DST.NOPE_SRC"));
         assert!(text.contains("blinky"));
         assert_eq!(
             missing_pip_report(&res.missing),
-            "Missing PIPs: 1\n  INT_X12Y45.PIP.NOPE_SRC.NOPE_DST (design blinky)\n"
+            "Missing PIPs: 1\n  INT_X12Y45.PIP.NOPE_DST.NOPE_SRC (design blinky)\n"
         );
     }
 

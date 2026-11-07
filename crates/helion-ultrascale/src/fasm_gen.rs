@@ -13,10 +13,10 @@
 //!
 //! Canonical spelling: `{site}.{FF}.INIT.V0` / `.V1` and
 //! `{site}.{FF}.SRVAL.V0` / `.V1`, V selected by value. No bare
-//! `AFF.INIT = 1'b0` spelling: that is the lut worker's bitloc
-//! `ff_init_fasm`, bit=value, INVERTED per the resolved polarity
-//! (bit = NOT(INIT); INIT 0 -> V0 -> bit SET, INIT 1 -> V1 -> bit
-//! CLEAR). The lut worker's emission must change separately; this module
+//! `AFF.INIT = 1'b0` spelling: the lut worker's bitloc `ff_init_fasm`
+//! now emits the same canonical `.V0`/`.V1` lines (merged 7f80b54,
+//! critic session 9 PASS), with the resolved polarity (bit = NOT(INIT);
+//! INIT 0 -> V0 -> bit SET, INIT 1 -> V1 -> bit CLEAR). This module
 //! emits canonical lines. The bit polarity is handled by segbits
 //! resolution (V0 sets, V1 clears); the FASM line carries no value.
 //!
@@ -42,30 +42,11 @@ pub struct FfAttr {
 
 /// FASM / BitFiltrator FF name for a BEL index 0..16: `AFF`..`HFF2`.
 /// Bel index 0 is AQ (AFF), 1 is AQ2 (AFF2), through 15 is HQ2 (HFF2).
-/// Duplicated from bitloc::ff_fasm_name (lut worker's file, not in this
-/// branch yet); the orchestrator reconciles at merge and the generator
-/// then calls bitloc directly. Deliberately NOT re-exported at the crate
-/// root, so it cannot collide with bitloc's copy.
+/// Single source of truth: bitloc::ff_fasm_name (merged lut-ff-bram
+/// tables); this wrapper only maps the error to String. Deliberately NOT
+/// re-exported at the crate root, so it cannot collide with bitloc's copy.
 pub fn ff_fasm_name(ff_index: u8) -> Result<&'static str, String> {
-    match ff_index {
-        0 => Ok("AFF"),
-        1 => Ok("AFF2"),
-        2 => Ok("BFF"),
-        3 => Ok("BFF2"),
-        4 => Ok("CFF"),
-        5 => Ok("CFF2"),
-        6 => Ok("DFF"),
-        7 => Ok("DFF2"),
-        8 => Ok("EFF"),
-        9 => Ok("EFF2"),
-        10 => Ok("FFF"),
-        11 => Ok("FFF2"),
-        12 => Ok("GFF"),
-        13 => Ok("GFF2"),
-        14 => Ok("HFF"),
-        15 => Ok("HFF2"),
-        other => Err(format!("ULTRA FASM: FF BEL index {other} out of range 0..16")),
-    }
+    crate::bitloc::ff_fasm_name(ff_index).map_err(|e| format!("{e}"))
 }
 
 /// FASM line for one FF INIT: `{site}.{FF}.INIT.V0` or `.V1`.
