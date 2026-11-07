@@ -13,9 +13,11 @@ use helion_ultrascale::bitloc::{
     BitLoc, BitLocError, Block, BramHalfContent, BramTileUse, ClbTileType, LutMode,
     bram_mem_location, bram_mem_locations, bram_mem_placed_bits, bram_parity_location,
     bram_parity_locations, bram_parity_placed_bits, bram_tile_fasm, bram18_fasm,
-    bram36_placed_bits, ff_fasm_name, ff_init_fasm, ff_location, ff_placed_bit, lut_fasm_name,
-    lut_init_fasm, lut_locations, lut_placed_bits,
+    bram36_placed_bits, ff_fasm_name, ff_init_fasm, ff_location, ff_placed_bit, ff_srval_fasm,
+    ff_srval_location, ff_srval_placed_bit, lut_fasm_name, lut_init_fasm, lut_locations,
+    lut_placed_bits,
 };
+use helion_ultrascale::segbits::{BitRef, FileSegbitsDb, SegbitsDb};
 use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
@@ -307,13 +309,17 @@ fn ff_y30_hand_checked_bit() {
 
 #[test]
 fn ff_init_zero_and_one() {
+    // Resolved polarity (researcher session 1): bit = NOT(INIT).
+    // INIT 0 sets the bit, INIT 1 clears it. The session-1 test asserted
+    // the inverted values (bit = value); that was the bug this session
+    // fixes.
     let zero = ff_placed_bit(ClbTileType::ClelL, 0, 0, false).unwrap();
     assert_eq!(zero.block, Block::FfInit);
     assert_eq!((zero.minor, zero.frame_ofst), (12, 2));
-    assert!(!zero.value);
+    assert!(zero.value);
     let one = ff_placed_bit(ClbTileType::ClelL, 0, 0, true).unwrap();
     assert_eq!((one.minor, one.frame_ofst), (12, 2));
-    assert!(one.value);
+    assert!(!one.value);
     // Same location for INIT 0 and INIT 1; only the value differs.
     assert_eq!(zero.minor, one.minor);
     assert_eq!(zero.frame_ofst, one.frame_ofst);
@@ -323,11 +329,11 @@ fn ff_init_zero_and_one() {
 fn ff_fasm_lines() {
     assert_eq!(
         ff_init_fasm(23, 45, 0, false).unwrap(),
-        "SLICE_X23Y45.AFF.INIT = 1'b0"
+        "SLICE_X23Y45.AFF.INIT.V0"
     );
     assert_eq!(
         ff_init_fasm(23, 45, 1, true).unwrap(),
-        "SLICE_X23Y45.AFF2.INIT = 1'b1"
+        "SLICE_X23Y45.AFF2.INIT.V1"
     );
     assert_eq!(ff_fasm_name(0).unwrap(), "AFF");
     assert_eq!(ff_fasm_name(1).unwrap(), "AFF2");
@@ -336,6 +342,255 @@ fn ff_fasm_lines() {
         ff_location(ClbTileType::ClelL, 0, 16),
         Err(BitLocError::FfIndexOutOfRange(16))
     );
+}
+/// Verbatim INIT/SRVAL lines for all 16 FFs in CLEL_L and CLEM, copied
+/// from prjuray-db `zynqusp/segbits_clel_l.db` and `segbits_clem.db`
+/// (commit affbc5e555ebae16475f32e8fb2d6565d4204f3f, CC0 1.0). The CLEL
+/// DBs are not vendored in the repo (only int/hpio/hdio/cmt are), so
+/// this excerpt is the test's copy of the DB, extracted by script from
+/// the clone and never generated from the code under test.
+const FF_SEGBITS_FIXTURE: &str = r#"
+CLEL_L.AFF.INIT.V0 12_02
+CLEL_L.AFF.INIT.V1 !12_02
+CLEL_L.AFF.SRVAL.V0 12_01
+CLEL_L.AFF.SRVAL.V1 !12_01
+CLEL_L.AFF2.INIT.V0 12_14
+CLEL_L.AFF2.INIT.V1 !12_14
+CLEL_L.AFF2.SRVAL.V0 12_13
+CLEL_L.AFF2.SRVAL.V1 !12_13
+CLEL_L.BFF.INIT.V0 12_04
+CLEL_L.BFF.INIT.V1 !12_04
+CLEL_L.BFF.SRVAL.V0 12_05
+CLEL_L.BFF.SRVAL.V1 !12_05
+CLEL_L.BFF2.INIT.V0 12_16
+CLEL_L.BFF2.INIT.V1 !12_16
+CLEL_L.BFF2.SRVAL.V0 12_17
+CLEL_L.BFF2.SRVAL.V1 !12_17
+CLEL_L.CFF.INIT.V0 12_08
+CLEL_L.CFF.INIT.V1 !12_08
+CLEL_L.CFF.SRVAL.V0 12_07
+CLEL_L.CFF.SRVAL.V1 !12_07
+CLEL_L.CFF2.INIT.V0 12_20
+CLEL_L.CFF2.INIT.V1 !12_20
+CLEL_L.CFF2.SRVAL.V0 12_19
+CLEL_L.CFF2.SRVAL.V1 !12_19
+CLEL_L.DFF.INIT.V0 12_10
+CLEL_L.DFF.INIT.V1 !12_10
+CLEL_L.DFF.SRVAL.V0 12_11
+CLEL_L.DFF.SRVAL.V1 !12_11
+CLEL_L.DFF2.INIT.V0 12_22
+CLEL_L.DFF2.INIT.V1 !12_22
+CLEL_L.DFF2.SRVAL.V0 12_23
+CLEL_L.DFF2.SRVAL.V1 !12_23
+CLEL_L.EFF.INIT.V0 12_26
+CLEL_L.EFF.INIT.V1 !12_26
+CLEL_L.EFF.SRVAL.V0 12_25
+CLEL_L.EFF.SRVAL.V1 !12_25
+CLEL_L.EFF2.INIT.V0 12_38
+CLEL_L.EFF2.INIT.V1 !12_38
+CLEL_L.EFF2.SRVAL.V0 12_37
+CLEL_L.EFF2.SRVAL.V1 !12_37
+CLEL_L.FFF.INIT.V0 12_28
+CLEL_L.FFF.INIT.V1 !12_28
+CLEL_L.FFF.SRVAL.V0 12_29
+CLEL_L.FFF.SRVAL.V1 !12_29
+CLEL_L.FFF2.INIT.V0 12_40
+CLEL_L.FFF2.INIT.V1 !12_40
+CLEL_L.FFF2.SRVAL.V0 12_41
+CLEL_L.FFF2.SRVAL.V1 !12_41
+CLEL_L.GFF.INIT.V0 12_32
+CLEL_L.GFF.INIT.V1 !12_32
+CLEL_L.GFF.SRVAL.V0 12_31
+CLEL_L.GFF.SRVAL.V1 !12_31
+CLEL_L.GFF2.INIT.V0 12_44
+CLEL_L.GFF2.INIT.V1 !12_44
+CLEL_L.GFF2.SRVAL.V0 12_43
+CLEL_L.GFF2.SRVAL.V1 !12_43
+CLEL_L.HFF.INIT.V0 12_34
+CLEL_L.HFF.INIT.V1 !12_34
+CLEL_L.HFF.SRVAL.V0 12_35
+CLEL_L.HFF.SRVAL.V1 !12_35
+CLEL_L.HFF2.INIT.V0 12_46
+CLEL_L.HFF2.INIT.V1 !12_46
+CLEL_L.HFF2.SRVAL.V0 12_47
+CLEL_L.HFF2.SRVAL.V1 !12_47
+CLEM.AFF.INIT.V0 12_02
+CLEM.AFF.INIT.V1 !12_02
+CLEM.AFF.SRVAL.V0 12_01
+CLEM.AFF.SRVAL.V1 !12_01
+CLEM.AFF2.INIT.V0 12_14
+CLEM.AFF2.INIT.V1 !12_14
+CLEM.AFF2.SRVAL.V0 12_13
+CLEM.AFF2.SRVAL.V1 !12_13
+CLEM.BFF.INIT.V0 12_04
+CLEM.BFF.INIT.V1 !12_04
+CLEM.BFF.SRVAL.V0 12_05
+CLEM.BFF.SRVAL.V1 !12_05
+CLEM.BFF2.INIT.V0 12_16
+CLEM.BFF2.INIT.V1 !12_16
+CLEM.BFF2.SRVAL.V0 12_17
+CLEM.BFF2.SRVAL.V1 !12_17
+CLEM.CFF.INIT.V0 12_08
+CLEM.CFF.INIT.V1 !12_08
+CLEM.CFF.SRVAL.V0 12_07
+CLEM.CFF.SRVAL.V1 !12_07
+CLEM.CFF2.INIT.V0 12_20
+CLEM.CFF2.INIT.V1 !12_20
+CLEM.CFF2.SRVAL.V0 12_19
+CLEM.CFF2.SRVAL.V1 !12_19
+CLEM.DFF.INIT.V0 12_10
+CLEM.DFF.INIT.V1 !12_10
+CLEM.DFF.SRVAL.V0 12_11
+CLEM.DFF.SRVAL.V1 !12_11
+CLEM.DFF2.INIT.V0 12_22
+CLEM.DFF2.INIT.V1 !12_22
+CLEM.DFF2.SRVAL.V0 12_23
+CLEM.DFF2.SRVAL.V1 !12_23
+CLEM.EFF.INIT.V0 12_26
+CLEM.EFF.INIT.V1 !12_26
+CLEM.EFF.SRVAL.V0 12_25
+CLEM.EFF.SRVAL.V1 !12_25
+CLEM.EFF2.INIT.V0 12_38
+CLEM.EFF2.INIT.V1 !12_38
+CLEM.EFF2.SRVAL.V0 12_37
+CLEM.EFF2.SRVAL.V1 !12_37
+CLEM.FFF.INIT.V0 12_28
+CLEM.FFF.INIT.V1 !12_28
+CLEM.FFF.SRVAL.V0 12_29
+CLEM.FFF.SRVAL.V1 !12_29
+CLEM.FFF2.INIT.V0 12_40
+CLEM.FFF2.INIT.V1 !12_40
+CLEM.FFF2.SRVAL.V0 12_41
+CLEM.FFF2.SRVAL.V1 !12_41
+CLEM.GFF.INIT.V0 12_32
+CLEM.GFF.INIT.V1 !12_32
+CLEM.GFF.SRVAL.V0 12_31
+CLEM.GFF.SRVAL.V1 !12_31
+CLEM.GFF2.INIT.V0 12_44
+CLEM.GFF2.INIT.V1 !12_44
+CLEM.GFF2.SRVAL.V0 12_43
+CLEM.GFF2.SRVAL.V1 !12_43
+CLEM.HFF.INIT.V0 12_34
+CLEM.HFF.INIT.V1 !12_34
+CLEM.HFF.SRVAL.V0 12_35
+CLEM.HFF.SRVAL.V1 !12_35
+CLEM.HFF2.INIT.V0 12_46
+CLEM.HFF2.INIT.V1 !12_46
+CLEM.HFF2.SRVAL.V0 12_47
+CLEM.HFF2.SRVAL.V1 !12_47
+"#;
+
+#[test]
+fn ff_srval_fasm_and_location() {
+    assert_eq!(
+        ff_srval_fasm(23, 45, 0, false).unwrap(),
+        "SLICE_X23Y45.AFF.SRVAL.V0"
+    );
+    assert_eq!(
+        ff_srval_fasm(23, 45, 2, true).unwrap(),
+        "SLICE_X23Y45.BFF.SRVAL.V1"
+    );
+    // A letter: SRVAL one bit below INIT (AFF INIT 2, SRVAL 1).
+    assert_eq!(
+        ff_srval_location(ClbTileType::ClelL, 0, 0).unwrap(),
+        BitLoc {
+            minor: 12,
+            frame_ofst: 1
+        }
+    );
+    // B letter: SRVAL one bit above INIT (BFF INIT 4, SRVAL 5).
+    assert_eq!(
+        ff_srval_location(ClbTileType::ClelL, 0, 2).unwrap(),
+        BitLoc {
+            minor: 12,
+            frame_ofst: 5
+        }
+    );
+    // The delta is a within-slice offset, so it survives the +96
+    // clock-region jump: AFF INIT at Y30 is 1538, SRVAL is 1537.
+    assert_eq!(
+        ff_srval_location(ClbTileType::ClelL, 30, 0).unwrap(),
+        BitLoc {
+            minor: 12,
+            frame_ofst: 1537
+        }
+    );
+    // Placed SRVAL bit: same inverse polarity as INIT.
+    let zero = ff_srval_placed_bit(ClbTileType::ClelL, 0, 0, false).unwrap();
+    assert_eq!(zero.block, Block::FfInit);
+    assert_eq!((zero.minor, zero.frame_ofst), (12, 1));
+    assert!(zero.value);
+    let one = ff_srval_placed_bit(ClbTileType::ClelL, 0, 0, true).unwrap();
+    assert_eq!((one.minor, one.frame_ofst), (12, 1));
+    assert!(!one.value);
+    assert_eq!(
+        ff_srval_location(ClbTileType::ClelL, 0, 16),
+        Err(BitLocError::FfIndexOutOfRange(16))
+    );
+}
+
+#[test]
+fn ff_init_srval_resolve_through_segbits() {
+    // The emitted FASM feature, resolved through the segbits DB, must set
+    // or clear exactly the bit the table locates, with the resolved
+    // polarity (bit = NOT(value)): V0 sets, V1 clears, for INIT and
+    // SRVAL alike. The DB is the authority here; the table locations,
+    // the FASM spelling, and the placed-bit values are all checked
+    // against it, for all 16 FFs in both tile types.
+    let db = FileSegbitsDb::from_text(FF_SEGBITS_FIXTURE, "ff_init_srval fixture").unwrap();
+    assert_eq!(db.feature_count(), 128);
+    for (tile_type, tile_key) in [(ClbTileType::ClelL, "CLEL_L"), (ClbTileType::Clem, "CLEM")] {
+        for ff in 0..16u8 {
+            let name = ff_fasm_name(ff).unwrap();
+            // The table location is the DB bit: at Y0 the frame offset
+            // equals the bit the DB line carries for this FF.
+            let init_loc = ff_location(tile_type, 0, ff).unwrap();
+            let srval_loc = ff_srval_location(tile_type, 0, ff).unwrap();
+            assert_eq!(init_loc.minor, 12);
+            assert_eq!(srval_loc.minor, 12);
+            // INIT 0 emits .V0, which the DB resolves to setting the bit.
+            assert_eq!(
+                ff_init_fasm(23, 45, ff, false).unwrap(),
+                format!("SLICE_X23Y45.{name}.INIT.V0")
+            );
+            assert_eq!(
+                db.lookup(tile_key, &format!("{name}.INIT.V0")).unwrap(),
+                &[BitRef::set(12, init_loc.frame_ofst as u16)]
+            );
+            // INIT 1 emits .V1, which the DB resolves to clearing it.
+            assert_eq!(
+                ff_init_fasm(23, 45, ff, true).unwrap(),
+                format!("SLICE_X23Y45.{name}.INIT.V1")
+            );
+            assert_eq!(
+                db.lookup(tile_key, &format!("{name}.INIT.V1")).unwrap(),
+                &[BitRef::zero(12, init_loc.frame_ofst as u16)]
+            );
+            // SRVAL the same, at the derived SRVAL location.
+            assert_eq!(
+                ff_srval_fasm(23, 45, ff, false).unwrap(),
+                format!("SLICE_X23Y45.{name}.SRVAL.V0")
+            );
+            assert_eq!(
+                db.lookup(tile_key, &format!("{name}.SRVAL.V0")).unwrap(),
+                &[BitRef::set(12, srval_loc.frame_ofst as u16)]
+            );
+            assert_eq!(
+                ff_srval_fasm(23, 45, ff, true).unwrap(),
+                format!("SLICE_X23Y45.{name}.SRVAL.V1")
+            );
+            assert_eq!(
+                db.lookup(tile_key, &format!("{name}.SRVAL.V1")).unwrap(),
+                &[BitRef::zero(12, srval_loc.frame_ofst as u16)]
+            );
+            // The placed bits carry the same polarity: value 0 sets the
+            // bit the V0 line sets, value 1 clears it.
+            assert!(ff_placed_bit(tile_type, 0, ff, false).unwrap().value);
+            assert!(!ff_placed_bit(tile_type, 0, ff, true).unwrap().value);
+            assert!(ff_srval_placed_bit(tile_type, 0, ff, false).unwrap().value);
+            assert!(!ff_srval_placed_bit(tile_type, 0, ff, true).unwrap().value);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
