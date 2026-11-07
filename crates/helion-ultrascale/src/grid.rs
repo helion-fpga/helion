@@ -4,9 +4,9 @@
 //! Site names follow Vivado site naming (`SLICE_X{x}Y{y}`). Tile names are
 //! PROVISIONAL (`CLBLL_L_X{x}Y{y}` for SLICEL, `CLBLM_L_X{x}Y{y}` for
 //! SLICEM): the logical grid has no left/right half distinction, so `_L`
-//! is used uniformly until the device-file worker lands real tile names.
-//! The device-file worker owns tile naming; this adapter only maps what
-//! the device model already knows.
+//! is used uniformly. The device file has landed (merged 9289fed), but
+//! this adapter is not yet wired to it. The device-file worker owns tile
+//! naming; this adapter only maps what the device model already knows.
 
 use crate::device::UltraScaleDevice;
 use crate::pack::SliceKind;
