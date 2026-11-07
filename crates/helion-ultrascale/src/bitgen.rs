@@ -17,13 +17,17 @@
 //!   bit N%32, LSB-first within the word), per-frame CRC packet sequence
 //!   (`bitstream.py` comment: WCFG, FAR, FDRI, FAR rewrite, CRC), sync word
 //!   and dummy words (`bitstream_spec.py`), 2 end-of-row padding frames.
-//! - prjxray `tools/bits2rbt/crc.h` and the `bitstream_crc.py` gist derived
-//!   from Unisim SIM_CONFIGE2.vhd: the configuration CRC is CRC-32C
+//! - prjxray `tools/bits2rbt/crc.h`: the configuration CRC is CRC-32C
 //!   (Castagnoli, reflected polynomial 0x82F63B78), computed LSB-first over
 //!   37 bits per (5-bit register address, 32-bit data word) pair, starting
 //!   from 0 after RCRC. Validated here against a real Vivado bitstream: the
 //!   BitFiltrator per-frame CRC example (123-word all-zero frame, FAR 1)
-//!   reproduces CRC 0x06b1285e exactly.
+//!   reproduces CRC 0x06b1285e exactly. A previously listed register
+//!   exclusion list ([15, 18, 20, 21, 22], cited to an unverifiable
+//!   `bitstream_crc.py` gist derived from Unisim SIM_CONFIGE2.vhd) was
+//!   removed: no such source exists on disk, and bits2rbt
+//!   `GetFpgaConfigurationCRC` feeds every non-NOP write packet into the
+//!   CRC with no exclusions.
 //! - Vivado 7-series bitstream `zedboard_blinky.bit` (in this workspace):
 //!   observed preamble register order and ending sequence (RCRC, GRESTORE,
 //!   DGHIGH_LFRM, START, DESYNC, trailing NOOPs). That file carries no
@@ -156,10 +160,6 @@ pub mod block {
     pub const CLB_IO_CLK: u8 = 0;
     pub const BRAM_CONTENT: u8 = 1;
 }
-
-/// Register addresses whose writes do NOT feed the configuration CRC
-/// (SIM_CONFIGE2 model, prjxray `bitstream_crc.py`).
-const CRC_EXCLUDED_REGS: [u8; 5] = [15, 18, 20, 21, 22];
 
 /// Trailing NOOP count after DESYNC, matching the observed Vivado
 /// 7-series bitstream in this workspace (`zedboard_blinky.bit`: 400).
@@ -833,8 +833,11 @@ impl CrcState {
     }
 
     /// Feed one packet: each data word feeds as (address, word), except
-    /// RCRC resets to 0 without feeding, a CRC-register write checks then
-    /// resets, and excluded registers do not feed.
+    /// RCRC resets to 0 without feeding and a CRC-register write checks
+    /// then resets. Every non-NOP write packet feeds: the previously
+    /// listed register exclusion list was removed (critic FLAG F-A), no
+    /// source for it exists, and bits2rbt `GetFpgaConfigurationCRC`
+    /// feeds every non-NOP write with no exclusions.
     ///
     /// Returns the value to write into the CRC register for a CRC write, or
     /// None for other packets.
@@ -847,9 +850,6 @@ impl CrcState {
             let value = self.crc;
             self.crc = 0;
             return Some(value);
-        }
-        if CRC_EXCLUDED_REGS.contains(&addr) {
-            return None;
         }
         for word in data {
             self.crc = crc32c_step(addr as u32, *word, self.crc);
