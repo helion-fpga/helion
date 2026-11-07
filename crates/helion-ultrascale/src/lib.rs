@@ -12,6 +12,7 @@
 //!   DSP, BRAM), confirmed against Vivado tile naming
 
 pub mod bel;
+pub mod bitgen;
 pub mod bitloc;
 pub mod device;
 pub mod device_file;
@@ -20,6 +21,10 @@ pub mod int_pip;
 pub mod segbits;
 
 pub use bel::{Bel, BelKind, ClbBelInventory, TileId, TileKind};
+pub use bitgen::{
+    BitgenDevice, BitgenError, DUMMY_WORD, FRAME_WORDS, FasmEntry, FasmValue, FrameWords,
+    SYNC_WORD, StubDevice, StubSegbitsDb, far_decode, far_encode,
+};
 pub use bitloc::{
     BRAM_MEM_BITS, BRAM_PARITY_BITS, BitLoc, BitLocError, Block, BramHalf, BramHalfContent,
     BramTileUse, ClbTileType, FRAME_BITS, LUT_INIT_BITS, LutMode, NUM_BRAM18_PER_COLUMN,
