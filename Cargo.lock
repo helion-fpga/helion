@@ -1702,6 +1702,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "helion-ultrascale"
+version = "3.0.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "helion-vhdl"
 version = "3.0.0"
 dependencies = [
