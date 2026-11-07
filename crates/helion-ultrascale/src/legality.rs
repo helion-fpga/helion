@@ -163,15 +163,11 @@ pub fn check_legality(
         for clk in slice.ff_clk.values() {
             clks.insert(clk.as_str());
         }
-        for ce in slice.ff_ce.values() {
-            if let Some(c) = ce {
-                ces.insert(c.as_str());
-            }
+        for ce in slice.ff_ce.values().flatten() {
+            ces.insert(ce.as_str());
         }
-        for sr in slice.ff_sr.values() {
-            if let Some(s) = sr {
-                srs.insert(s.as_str());
-            }
+        for sr in slice.ff_sr.values().flatten() {
+            srs.insert(sr.as_str());
         }
         if clks.len() > limits.max_clk {
             violations.push(LegalityViolation::ControlSet {
