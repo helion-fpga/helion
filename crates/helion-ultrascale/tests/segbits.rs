@@ -38,9 +38,10 @@ fn day_one_example_pip_resolves_through_public_api() {
 #[test]
 fn cmt_features_resolve() {
     let db = FileSegbitsDb::from_file(&data_file("segbits_cmt_right.db")).unwrap();
-    assert!(db
-        .lookup("CMT_RIGHT", "PIP.CLK_HROUTE_1_5.VCC_WIRE")
-        .is_some());
+    assert!(
+        db.lookup("CMT_RIGHT", "PIP.CLK_HROUTE_1_5.VCC_WIRE")
+            .is_some()
+    );
     assert_eq!(db.feature_count(), 104);
 }
 
@@ -50,17 +51,19 @@ fn hpio_features_with_wide_bit_offsets_resolve() {
     // the u8 to u16 widening; see the unit regression tests.
     let db = FileSegbitsDb::from_file(&data_file("segbits_hpio_right.db")).unwrap();
     assert_eq!(db.feature_count(), 1560);
-    assert!(db
-        .lookup("HPIO_RIGHT", "IOB_X0Y0.DCITERMDISABLE_USED.V0")
-        .is_some());
+    assert!(
+        db.lookup("HPIO_RIGHT", "IOB_X0Y0.DCITERMDISABLE_USED.V0")
+            .is_some()
+    );
 }
 
 #[test]
 fn unknown_lookups_fail_loud_with_none() {
     let db = FileSegbitsDb::from_file(&data_file("segbits_int.db")).unwrap();
     assert!(db.lookup("INT", "PIP.DOES.NOT.EXIST").is_none());
-    assert!(db
-        .lookup("DSP", "PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1")
-        .is_none());
+    assert!(
+        db.lookup("DSP", "PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1")
+            .is_none()
+    );
     assert!(db.lookup("", "").is_none());
 }
