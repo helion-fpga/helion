@@ -1,4 +1,5 @@
 mod batch_dashboard;
+mod ultra;
 
 use helion_bits::{Bitstream, bitgen, bitgen_pblock, eco_lut, readback_lut_init};
 use helion_device::Device;
@@ -395,7 +396,7 @@ fn usage() {
   helion gui
   helion synth <file.sv> [--part P] [--verify]
   helion equiv <golden.sv> <revised.sv> [--part P]
-  helion impl <file.sv> [--part P]
+  helion impl <file.sv> [--part P] [--seed N]
   helion run <file.sv> [--cycles N] [--part P]
   helion report_timing <file.sv|.vhd> [--sdc f.sdc]
   helion report_utilization <file.sv|.vhd>
@@ -598,6 +599,19 @@ fn cmd_equiv(args: &[String]) {
 fn cmd_impl(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
     let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    // Seed exists for the UltraScale+ flow (multiseed contract); the HL10T
+    // flow still uses seed 0. Correction to the brief: `helion impl --seed`
+    // did not exist in this branch until this change.
+    let seed: u64 = take_flag(args, "--seed")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if ultra::is_ultra_part(&part) {
+        if let Err(e) = ultra::run_impl(path, &part, seed) {
+            eprintln!("impl: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
         eprintln!("impl: {e}");
         std::process::exit(1);
