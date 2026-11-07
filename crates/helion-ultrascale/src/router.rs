@@ -160,6 +160,10 @@ impl AstarScratch {
 
 /// A* from src wire to dst wire.
 /// Returns the wire path or None if unreachable.
+/// Eight arguments is the day-1 scaffold signature (db, scratch, src,
+/// dst, congestion history, presence, presence factor, tie seed); a
+/// parameter split would churn the router scaffold for no semantic gain.
+#[allow(clippy::too_many_arguments)]
 fn astar(
     wires: &dyn WireDb,
     scratch: &mut AstarScratch,
@@ -280,11 +284,13 @@ pub fn route_ultra(
             })?;
         let mut sink_wires = Vec::with_capacity(net.sinks.len());
         for (site, bel, pin) in &net.sinks {
-            let w = wires.wire_for_bel_pin(*site, bel, pin).ok_or_else(|| RouteError {
-                net: net.name.clone(),
-                location: format!("sink pin {}.{}.{} has no wire", site.x, bel, pin),
-                kind: RouteErrorKind::NoPath,
-            })?;
+            let w = wires
+                .wire_for_bel_pin(*site, bel, pin)
+                .ok_or_else(|| RouteError {
+                    net: net.name.clone(),
+                    location: format!("sink pin {}.{}.{} has no wire", site.x, bel, pin),
+                    kind: RouteErrorKind::NoPath,
+                })?;
             sink_wires.push(w);
         }
         resolved.push((net.name.clone(), src_wire, sink_wires));
@@ -310,7 +316,10 @@ pub fn route_ultra(
         pres.fill(0);
         let pres_fac = 1i64 + iter as i64;
         // Seed perturbs tie-breaks per iteration.
-        let tie_seed = opts.seed.wrapping_mul(0xBF58_476D_1CE4_E5B9).wrapping_add(iter as u64);
+        let tie_seed = opts
+            .seed
+            .wrapping_mul(0xBF58_476D_1CE4_E5B9)
+            .wrapping_add(iter as u64);
 
         let mut routes: Vec<Vec<WireId>> = Vec::with_capacity(nets.len());
         let mut failed: Option<RouteError> = None;
@@ -323,7 +332,16 @@ pub fn route_ultra(
             let mut net_wires: Vec<WireId> = Vec::new();
             let mut seen = vec![false; n_wires];
             for &sink in sinks {
-                match astar(wires, &mut scratch, *src, sink, &hist, &pres, pres_fac, tie_seed) {
+                match astar(
+                    wires,
+                    &mut scratch,
+                    *src,
+                    sink,
+                    &hist,
+                    &pres,
+                    pres_fac,
+                    tie_seed,
+                ) {
                     Some(path) => {
                         for &w in &path {
                             let wi = w as usize;
@@ -372,9 +390,7 @@ pub fn route_ultra(
 
         let overused = pres.iter().filter(|c| **c > 1).count() as u32;
         let wire_count: u64 = ordered.iter().map(|r| r.len() as u64).sum();
-        if overused < best_overused
-            || (overused == best_overused && wire_count < best_wire_count)
-        {
+        if overused < best_overused || (overused == best_overused && wire_count < best_wire_count) {
             best_overused = overused;
             best_wire_count = wire_count;
             best_routes = ordered;
@@ -409,7 +425,10 @@ pub fn route_ultra(
         }
         return Err(RouteError {
             net: worst_net,
-            location: format!("{} shared by {} nets after {} iters", worst_loc, worst_c, iters_used),
+            location: format!(
+                "{} shared by {} nets after {} iters",
+                worst_loc, worst_c, iters_used
+            ),
             kind: RouteErrorKind::OveruseTimeout,
         });
     }

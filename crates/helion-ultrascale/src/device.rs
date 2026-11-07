@@ -195,8 +195,16 @@ impl UltraScaleDevice {
             }
         }
         assert_eq!(dsp_left, 0, "DSP placement must consume all {}", counts.dsp);
-        assert_eq!(bram_left, 0, "BRAM placement must consume all {}", counts.bram);
-        assert_eq!(uram_left, 0, "URAM placement must consume all {}", counts.uram);
+        assert_eq!(
+            bram_left, 0,
+            "BRAM placement must consume all {}",
+            counts.bram
+        );
+        assert_eq!(
+            uram_left, 0,
+            "URAM placement must consume all {}",
+            counts.uram
+        );
 
         // CLB tiles: fill remaining slots up to exactly the slice count.
         let mut clb_left = counts.clb_slices;
@@ -223,7 +231,11 @@ impl UltraScaleDevice {
                 break;
             }
         }
-        assert_eq!(clb_left, 0, "CLB placement must consume all {}", counts.clb_slices);
+        assert_eq!(
+            clb_left, 0,
+            "CLB placement must consume all {}",
+            counts.clb_slices
+        );
 
         // Remaining empty slots become I/O tiles.
         for y in 0..grid_h {

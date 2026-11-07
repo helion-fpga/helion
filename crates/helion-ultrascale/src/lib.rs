@@ -48,17 +48,19 @@ pub use fabric::{
     EmptyTimingDb, EmptyWireDb, FabricWithPlaceholders, TimingDb, UltraScaleFabric, UltraSite,
     WireDb, WireId, WireInfo,
 };
-pub use fasm_gen::{emit_ff_fasm, ff_init_fasm_line, ff_srval_fasm_line, FfAttr};
+pub use fasm_gen::{FfAttr, emit_ff_fasm, ff_init_fasm_line, ff_srval_fasm_line};
 pub use int_pip::{
     EmittedPip, IntPip, IntPipError, MissingPip, PipResolution, emit_pips, emitted_to_fasm,
     missing_pip_report, resolve_pips, verify_zero_bits,
 };
-pub use legality::{check_legality, LegalityViolation};
-pub use pack::{
-    pack_ultra, ControlSetLimits, PackedUltraSlice, SliceKind, UltraBel, UltraPacked,
+pub use legality::{LegalityViolation, check_legality};
+pub use pack::{ControlSetLimits, PackedUltraSlice, SliceKind, UltraBel, UltraPacked, pack_ultra};
+pub use place::{
+    PlacedUltraSlice, UltraGrid, UltraPlaceOpts, UltraPlaced, place_ultra, seeded_order,
 };
-pub use place::{place_ultra, seeded_order, PlacedUltraSlice, UltraGrid, UltraPlaceOpts, UltraPlaced};
-pub use router::{route_ultra, RoutableNet, RouteError, RouteErrorKind, UltraRouted, UltraRouteOpts};
+pub use router::{
+    RoutableNet, RouteError, RouteErrorKind, UltraRouteOpts, UltraRouted, route_ultra,
+};
 pub use segbits::{BitRef, FileSegbitsDb, SegbitsDb, SegbitsLoadError};
-pub use sta::{sta_routed, StaNetlist, TimingReport};
-pub use timing_db::{preliminary_xcvu3p, DelaySource, SourcedDelay, UltraScaleTimingDb};
+pub use sta::{StaNetlist, TimingReport, sta_routed};
+pub use timing_db::{DelaySource, SourcedDelay, UltraScaleTimingDb, preliminary_xcvu3p};

@@ -146,15 +146,15 @@ impl PackedUltraSlice {
         let mut clks: HashSet<&str> = HashSet::new();
         let mut ces: HashSet<&str> = HashSet::new();
         let mut srs: HashSet<&str> = HashSet::new();
-        for (_, c) in &self.ff_clk {
+        for c in self.ff_clk.values() {
             clks.insert(c.as_str());
         }
-        for (_, c) in &self.ff_ce {
+        for c in self.ff_ce.values() {
             if let Some(s) = c {
                 ces.insert(s.as_str());
             }
         }
-        for (_, s) in &self.ff_sr {
+        for s in self.ff_sr.values() {
             if let Some(s) = s {
                 srs.insert(s.as_str());
             }
@@ -200,7 +200,7 @@ pub struct PackStats {
 }
 
 /// Packs a design into UltraScale slices.
-/// 
+///
 /// This is a structural packer: it groups LUTs and their driven FFs,
 /// packs CARRY8 chains, and respects SLICEM legality. It does not yet
 /// do timing-driven packing (phase 2).
@@ -310,7 +310,9 @@ pub fn pack_ultra(
             }
         }
         if !placed {
-            return Err(format!("cannot place FF {ff_name}: no slice with compatible control set"));
+            return Err(format!(
+                "cannot place FF {ff_name}: no slice with compatible control set"
+            ));
         }
     }
 
@@ -368,13 +370,7 @@ mod tests {
         let mut slice = PackedUltraSlice::new("SLICE_X0Y0".to_string(), SliceKind::Logic);
         // Fill with 16 FFs on same clock.
         for i in 0..16 {
-            assert!(slice.can_place_ff(
-                i,
-                "clk",
-                &None,
-                &None,
-                &limits
-            ));
+            assert!(slice.can_place_ff(i, "clk", &None, &None, &limits));
             slice.ffs.insert(i, format!("ff{i}"));
             slice.ff_clk.insert(i, "clk".to_string());
             slice.ff_ce.insert(i, None);

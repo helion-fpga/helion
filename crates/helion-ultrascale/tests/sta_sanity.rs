@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use helion_ultrascale::sta::{sta_routed, StaNetlist, TimingReport};
+use helion_ultrascale::sta::{StaNetlist, TimingReport, sta_routed};
 use helion_ultrascale::timing_db::preliminary_xcvu3p;
+use std::collections::HashMap;
 
 /// Synthetic 2-bit counter: ff0 -> lut -> ff1, ff1 -> lut -> ff0.
 struct CounterNetlist {

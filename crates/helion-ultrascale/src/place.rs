@@ -210,8 +210,8 @@ pub fn place_ultra(
     for &order_idx in &order {
         let packed_idx = remaining[order_idx];
         let slice = &packed[packed_idx];
-        let needs_memory = slice.kind == SliceKind::Memory
-            || slice.lut_is_memory.values().any(|&b| b);
+        let needs_memory =
+            slice.kind == SliceKind::Memory || slice.lut_is_memory.values().any(|&b| b);
 
         let candidates = if needs_memory {
             &memory_sites

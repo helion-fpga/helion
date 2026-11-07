@@ -8,10 +8,10 @@
 //! this adapter is not yet wired to it. The device-file worker owns tile
 //! naming; this adapter only maps what the device model already knows.
 
+use crate::TileKind;
 use crate::device::UltraScaleDevice;
 use crate::pack::SliceKind;
 use crate::place::UltraGrid;
-use crate::TileKind;
 
 impl UltraGrid for UltraScaleDevice {
     fn slice_sites(&self) -> Vec<(String, String, i32, i32, SliceKind)> {

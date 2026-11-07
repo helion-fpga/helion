@@ -52,10 +52,7 @@ fn determinism_same_seed_identical_routes() {
 #[test]
 fn determinism_different_seeds_both_complete() {
     let db = small_db();
-    let nets = vec![
-        net("n0", 1, 1, &[(8, 8)]),
-        net("n1", 8, 1, &[(1, 8)]),
-    ];
+    let nets = vec![net("n0", 1, 1, &[(8, 8)]), net("n1", 8, 1, &[(1, 8)])];
     let mut seen_routes = Vec::new();
     for seed in [1u64, 2, 3, 7, 12345] {
         let opts = UltraRouteOpts {
@@ -92,7 +89,12 @@ fn completion_three_designs_zero_unrouted() {
             net("c", 0, 9, &[(2, 7)]),
             net("d", 9, 9, &[(7, 7)]),
         ],
-        vec![net("clk_en", 5, 5, &[(0, 0), (9, 0), (0, 9), (9, 9), (5, 0)])],
+        vec![net(
+            "clk_en",
+            5,
+            5,
+            &[(0, 0), (9, 0), (0, 9), (9, 9), (5, 0)],
+        )],
     ];
     for (i, nets) in designs.iter().enumerate() {
         let opts = UltraRouteOpts {
@@ -155,10 +157,7 @@ fn fail_loud_on_unroutable_net() {
         max_iters: 1,
     };
     let err = route_ultra(&nets, &db, opts).expect_err("must fail loudly");
-    assert!(
-        !err.net.is_empty(),
-        "error must name the congested net"
-    );
+    assert!(!err.net.is_empty(), "error must name the congested net");
     assert!(
         !err.location.is_empty(),
         "error must give the congestion location"

@@ -18,23 +18,25 @@ use std::collections::{HashMap, HashSet};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LegalityViolation {
     /// Slice exceeds LUT capacity.
-    TooManyLuts { slice: String, count: usize, max: usize },
+    TooManyLuts {
+        slice: String,
+        count: usize,
+        max: usize,
+    },
     /// Slice exceeds FF capacity.
-    TooManyFfs { slice: String, count: usize, max: usize },
+    TooManyFfs {
+        slice: String,
+        count: usize,
+        max: usize,
+    },
     /// Slice has more than one CARRY8.
     MultipleCarry8 { slice: String },
     /// Memory-type LUT on a Logic slice.
     MemoryLutOnSlicel { slice: String, lut: String },
     /// Control-set violation.
-    ControlSet {
-        slice: String,
-        detail: String,
-    },
+    ControlSet { slice: String, detail: String },
     /// CARRY8 chain not vertically contiguous.
-    CarryChainBroken {
-        chain: Vec<String>,
-        detail: String,
-    },
+    CarryChainBroken { chain: Vec<String>, detail: String },
     /// Site used by multiple slices.
     DuplicateSite { site: String },
     /// Placed on wrong slice kind.
@@ -158,15 +160,15 @@ pub fn check_legality(
         let mut clks: HashSet<&str> = HashSet::new();
         let mut ces: HashSet<&str> = HashSet::new();
         let mut srs: HashSet<&str> = HashSet::new();
-        for (_, clk) in &slice.ff_clk {
+        for clk in slice.ff_clk.values() {
             clks.insert(clk.as_str());
         }
-        for (_, ce) in &slice.ff_ce {
+        for ce in slice.ff_ce.values() {
             if let Some(c) = ce {
                 ces.insert(c.as_str());
             }
         }
-        for (_, sr) in &slice.ff_sr {
+        for sr in slice.ff_sr.values() {
             if let Some(s) = sr {
                 srs.insert(s.as_str());
             }
@@ -227,10 +229,7 @@ pub fn check_legality(
                         break;
                     }
                 }
-                let head_name = packed[head_idx]
-                    .carry8
-                    .clone()
-                    .unwrap_or_default();
+                let head_name = packed[head_idx].carry8.clone().unwrap_or_default();
                 chain_groups.entry(head_name).or_default().push(p);
             }
         }
@@ -246,19 +245,13 @@ pub fn check_legality(
             if group[w].x != group[w - 1].x {
                 violations.push(LegalityViolation::CarryChainBroken {
                     chain: vec![chain_name.clone()],
-                    detail: format!(
-                        "X changed from {} to {}",
-                        group[w - 1].x, group[w].x
-                    ),
+                    detail: format!("X changed from {} to {}", group[w - 1].x, group[w].x),
                 });
             }
             if group[w].y != group[w - 1].y + 1 {
                 violations.push(LegalityViolation::CarryChainBroken {
                     chain: vec![chain_name.clone()],
-                    detail: format!(
-                        "Y not contiguous: {} -> {}",
-                        group[w - 1].y, group[w].y
-                    ),
+                    detail: format!("Y not contiguous: {} -> {}", group[w - 1].y, group[w].y),
                 });
             }
         }
@@ -355,8 +348,7 @@ mod tests {
         assert!(!violations.is_empty());
         assert!(violations.iter().any(|v| matches!(
             v,
-            LegalityViolation::MemoryLutOnSlicel { .. }
-                | LegalityViolation::WrongSliceKind { .. }
+            LegalityViolation::MemoryLutOnSlicel { .. } | LegalityViolation::WrongSliceKind { .. }
         )));
     }
 
@@ -377,9 +369,10 @@ mod tests {
 
         let placed = place_ultra(&vec![s0.clone()], &grid, &UltraPlaceOpts::default()).unwrap();
         let violations = check_legality(&vec![s0], &placed.slices, &grid, &limits);
-        assert!(violations.iter().any(|v| matches!(
-            v,
-            LegalityViolation::ControlSet { .. }
-        )));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, LegalityViolation::ControlSet { .. }))
+        );
     }
 }
