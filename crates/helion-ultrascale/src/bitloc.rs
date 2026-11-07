@@ -32,10 +32,25 @@
 //! FASM emission follows the crew contract (`INTERFACES.md`) and the
 //! day-1 scout report (`report.md`, route-to-bitgen handoff):
 //! `SLICE_XxYy.A6LUT.INIT[63:0] = 64'h...`,
-//! `SLICE_XxYy.AFF.INIT = 1'b0`,
+//! `SLICE_XxYy.AFF.INIT.V0` / `SLICE_XxYy.AFF.INIT.V1`,
+//! `SLICE_XxYy.AFF.SRVAL.V0` / `SLICE_XxYy.AFF.SRVAL.V1`,
 //! `RAMB18_XxYy.INIT[16383:0] = 16384'h...`,
 //! `RAMB36_XxYy.INIT[32767:0] = 32768'h...`. INIT values expand MSB-first
 //! across the listed bits, bit 0 = LSB of the value.
+//!
+//! FF INIT/SRVAL polarity (resolved 2026-11-07, researcher session 1):
+//! the configuration bit is the INVERSE of the attribute value: INIT 0
+//! selects the `.V0` feature, which sets the bit; INIT 1 selects `.V1`,
+//! which clears it. Same for SRVAL. The V suffix names the attribute
+//! value (prjuray `tools/dump_features.tcl:897-902` builds the feature
+//! as `$bel_name.INIT.V[string range $init_prop end end]` from the cell
+//! property; `utils/spec/flipflops.py:100` instantiates `.INIT(1'b0)` /
+//! `.INIT(1'b1)`). The vendored DB lines agree:
+//! `CLEL_L.AFF.INIT.V0 12_02`, `V1 !12_02`;
+//! `CLEL_L.AFF.SRVAL.V0 12_01`, `V1 !12_01`. The session-1 emission
+//! (bit = value, valued spelling `AFF.INIT = 1'b0/1`) was inverted and
+//! non-canonical; the `.V0`/`.V1` spelling below selects the feature by
+//! value and lets segbits resolution carry the polarity.
 //!
 //! LUTRAM is BLOCKED, fail loud. The BitFiltrator paper section V-B does
 //! not state that LUTRAM uses the same INIT bits as LUTs: it describes
@@ -642,7 +657,10 @@ pub fn ff_location(
     })
 }
 
-/// The placed INIT bit for one FF.
+/// The placed INIT bit for one FF. The configuration bit is the inverse
+/// of the INIT value (bit = NOT(INIT), resolved from the fuzzer source;
+/// see the module docs): INIT 0 sets the bit, INIT 1 clears it. The
+/// session-1 value (bit = value) was inverted.
 pub fn ff_placed_bit(
     tile_type: ClbTileType,
     slice_y: u32,
@@ -654,11 +672,15 @@ pub fn ff_placed_bit(
         block: Block::FfInit,
         minor: loc.minor,
         frame_ofst: loc.frame_ofst,
-        value: init,
+        value: !init,
     })
 }
 
-/// FASM line for one FF: `SLICE_X{x}Y{y}.{AFF}.INIT = 1'b0` or `1'b1`.
+/// FASM line for one FF: `SLICE_X{x}Y{y}.{AFF}.INIT.V0` (INIT 0) or
+/// `.INIT.V1` (INIT 1). The V suffix names the INIT value; the bit
+/// polarity comes from segbits resolution (V0 sets the bit, V1 clears
+/// it). The valued spelling (`AFF.INIT = 1'b0/1`) is non-canonical and
+/// is never emitted.
 pub fn ff_init_fasm(
     slice_x: u32,
     slice_y: u32,
@@ -666,8 +688,78 @@ pub fn ff_init_fasm(
     init: bool,
 ) -> Result<String, BitLocError> {
     let name = ff_fasm_name(ff_index)?;
-    let bit = if init { '1' } else { '0' };
-    Ok(format!("SLICE_X{slice_x}Y{slice_y}.{name}.INIT = 1'b{bit}"))
+    let v = if init { '1' } else { '0' };
+    Ok(format!("SLICE_X{slice_x}Y{slice_y}.{name}.INIT.V{v}"))
+}
+
+/// Frame-offset delta from a FF's INIT bit to its SRVAL bit, within one
+/// slice. Verified against prjuray-db `segbits_clel_l.db`,
+/// `segbits_clel_r.db`, `segbits_clem.db`, and `segbits_clem_r.db` for
+/// all 16 FFs: A/C/E/G letters sit one bit below INIT, B/D/F/H letters
+/// one bit above. The delta is a within-slice offset, so it holds at
+/// every slice Y: the whole 48-bit slice block shifts with Y (plus the
+/// +96 clock-region jump at Y 30), and relative offsets inside the block
+/// do not change. The derivation is checked against verbatim DB lines in
+/// `tests/lut_ff_bram.rs` (`ff_init_srval_resolve_through_segbits`).
+fn srval_frame_ofst_delta(ff_index: u8) -> i64 {
+    // Letter index 0=A, 1=B, ... 7=H; even letters -1, odd letters +1.
+    if (ff_index / 2) % 2 == 0 { -1 } else { 1 }
+}
+
+/// The single (`minor`, `frame_ofst`) pair holding one FF's SRVAL bit.
+///
+/// The vendored BitFiltrator JSON carries no SRVAL table (RegLoc is the
+/// INIT location only), so this derives the SRVAL location from the INIT
+/// location by the DB-verified within-slice delta (see
+/// [`srval_frame_ofst_delta`]): same frame minor, one frame offset below
+/// INIT for A/C/E/G FFs, one above for B/D/F/H FFs. Out-of-range results
+/// fail loud instead of wrapping.
+pub fn ff_srval_location(
+    tile_type: ClbTileType,
+    slice_y: u32,
+    ff_index: u8,
+) -> Result<BitLoc, BitLocError> {
+    let init = ff_location(tile_type, slice_y, ff_index)?;
+    let ofst = init.frame_ofst as i64 + srval_frame_ofst_delta(ff_index);
+    if ofst < 0 || ofst >= FRAME_BITS as i64 {
+        return Err(BitLocError::TableCorrupt(format!(
+            "SRVAL frame offset {ofst} out of range for FF {ff_index} at slice Y {slice_y}"
+        )));
+    }
+    Ok(BitLoc {
+        minor: init.minor,
+        frame_ofst: ofst as u32,
+    })
+}
+
+/// The placed SRVAL bit for one FF. Same inverse polarity as INIT
+/// (bit = NOT(SRVAL)): SRVAL 0 sets the bit, SRVAL 1 clears it.
+pub fn ff_srval_placed_bit(
+    tile_type: ClbTileType,
+    slice_y: u32,
+    ff_index: u8,
+    srval: bool,
+) -> Result<PlacedBit, BitLocError> {
+    let loc = ff_srval_location(tile_type, slice_y, ff_index)?;
+    Ok(PlacedBit {
+        block: Block::FfInit,
+        minor: loc.minor,
+        frame_ofst: loc.frame_ofst,
+        value: !srval,
+    })
+}
+
+/// FASM line for one FF's SRVAL: `SLICE_X{x}Y{y}.{AFF}.SRVAL.V0`
+/// (SRVAL 0) or `.SRVAL.V1` (SRVAL 1). Same spelling rule as INIT.
+pub fn ff_srval_fasm(
+    slice_x: u32,
+    slice_y: u32,
+    ff_index: u8,
+    srval: bool,
+) -> Result<String, BitLocError> {
+    let name = ff_fasm_name(ff_index)?;
+    let v = if srval { '1' } else { '0' };
+    Ok(format!("SLICE_X{slice_x}Y{slice_y}.{name}.SRVAL.V{v}"))
 }
 
 // ---------------------------------------------------------------------------
