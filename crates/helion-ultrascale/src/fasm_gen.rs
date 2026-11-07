@@ -59,11 +59,7 @@ pub fn ff_init_fasm_line(site: &str, ff_index: u8, init: Option<bool>) -> Result
 
 /// FASM line for one FF SRVAL: `{site}.{FF}.SRVAL.V0` or `.V1`.
 /// `None` (unspecified) defaults to V0 (Xilinx default SRVAL 0).
-pub fn ff_srval_fasm_line(
-    site: &str,
-    ff_index: u8,
-    srval: Option<bool>,
-) -> Result<String, String> {
+pub fn ff_srval_fasm_line(site: &str, ff_index: u8, srval: Option<bool>) -> Result<String, String> {
     let name = ff_fasm_name(ff_index)?;
     let v = if srval.unwrap_or(false) { 1 } else { 0 };
     Ok(format!("{site}.{name}.SRVAL.V{v}"))
@@ -103,8 +99,8 @@ pub fn emit_ff_fasm(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pack::{pack_ultra, ControlSetLimits, SliceKind};
-    use crate::place::{place_ultra, UltraGrid, UltraPlaceOpts};
+    use crate::pack::{ControlSetLimits, SliceKind, pack_ultra};
+    use crate::place::{UltraGrid, UltraPlaceOpts, place_ultra};
 
     /// Minimal grid for pack/place-through-generate tests: 4x4 logic sites.
     struct SmallGrid;
@@ -223,8 +219,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "AFF", "AFF2", "BFF", "BFF2", "CFF", "CFF2", "DFF", "DFF2", "EFF", "EFF2",
-                "FFF", "FFF2", "GFF", "GFF2", "HFF", "HFF2",
+                "AFF", "AFF2", "BFF", "BFF2", "CFF", "CFF2", "DFF", "DFF2", "EFF", "EFF2", "FFF",
+                "FFF2", "GFF", "GFF2", "HFF", "HFF2",
             ]
         );
         assert!(ff_fasm_name(16).is_err());
@@ -268,12 +264,7 @@ mod tests {
         let luts = vec![("lut0".to_string(), 0xAAAAAAAAAAAAAAAAu64, false)];
         let ffs = vec![("q_reg".to_string(), "clk".to_string(), None, None)];
         let packed = pack_ultra(&luts, &ffs, &[], &limits).unwrap();
-        let placed = place_ultra(
-            &packed.slices,
-            &SmallGrid,
-            &UltraPlaceOpts::default(),
-        )
-        .unwrap();
+        let placed = place_ultra(&packed.slices, &SmallGrid, &UltraPlaceOpts::default()).unwrap();
         let lines = emit_ff_fasm(&packed.slices, &placed, &HashMap::new()).unwrap();
         assert_eq!(lines.len(), 2, "one FF gives one INIT plus one SRVAL line");
         assert!(lines[0].ends_with(".AFF.INIT.V0"), "got {}", lines[0]);
