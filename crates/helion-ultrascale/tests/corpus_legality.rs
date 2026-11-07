@@ -4,10 +4,10 @@
 //! UltraScale+, and verifies legality. This is the acceptance test
 //! from the pack-place brief.
 
-use std::collections::HashMap;
 use helion_ultrascale::legality::check_legality;
-use helion_ultrascale::pack::{pack_ultra, ControlSetLimits, SliceKind};
-use helion_ultrascale::place::{place_ultra, UltraGrid, UltraPlaceOpts};
+use helion_ultrascale::pack::{ControlSetLimits, SliceKind, pack_ultra};
+use helion_ultrascale::place::{UltraGrid, UltraPlaceOpts, place_ultra};
+use std::collections::HashMap;
 
 /// Fake xcvu3p-like grid for testing.
 /// Real grid comes from device-model agent's UltraScaleFabric.
@@ -54,7 +54,7 @@ fn extract_cells(
     Vec<(String, String, Option<String>, Option<String>)>,
     Vec<Vec<String>>,
 ) {
-    use helion_ir::{resolve, CellKind};
+    use helion_ir::{CellKind, resolve};
 
     let mut luts = Vec::new();
     let mut ffs = Vec::new();
@@ -99,7 +99,9 @@ fn extract_cells(
                         design.nets.iter().find(|n| n.name == *net).and_then(|n| {
                             n.endpoints.iter().find_map(|ep| {
                                 let ep_name = resolve(ep.cell).to_string();
-                                if ep_name.starts_with("u_carry") || ep.pin == helion_ir::intern("CO3") {
+                                if ep_name.starts_with("u_carry")
+                                    || ep.pin == helion_ir::intern("CO3")
+                                {
                                     Some(ep_name)
                                 } else {
                                     None
@@ -148,10 +150,9 @@ fn extract_cells(
 }
 
 fn test_design(name: &str, sv_path: &str, top: &str) {
-    let sv = std::fs::read_to_string(sv_path)
-        .unwrap_or_else(|_| panic!("cannot read {sv_path}"));
-    let design = helion_sv::synth_sv(&sv, top)
-        .unwrap_or_else(|e| panic!("synth failed for {name}: {e}"));
+    let sv = std::fs::read_to_string(sv_path).unwrap_or_else(|_| panic!("cannot read {sv_path}"));
+    let design =
+        helion_sv::synth_sv(&sv, top).unwrap_or_else(|e| panic!("synth failed for {name}: {e}"));
 
     let (luts, ffs, chains) = extract_cells(&design);
     println!(
