@@ -1,0 +1,69 @@
+SLICE_X23Y45/B6LUT
+INIT[ 0] -> SLR0, frame address: 0x00003007 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   7), frame offset: 2271, frame byte offset in bitstream: 1285
+INIT[ 1] -> SLR0, frame address: 0x00003006 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   6), frame offset: 2271, frame byte offset in bitstream: 901
+INIT[ 2] -> SLR0, frame address: 0x00003005 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   5), frame offset: 2271, frame byte offset in bitstream: 517
+INIT[ 3] -> SLR0, frame address: 0x00003004 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   4), frame offset: 2271, frame byte offset in bitstream: 133
+INIT[ 4] -> SLR0, frame address: 0x00003007 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   7), frame offset: 2270, frame byte offset in bitstream: 1285
+INIT[ 5] -> SLR0, frame address: 0x00003006 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   6), frame offset: 2270, frame byte offset in bitstream: 901
+INIT[ 6] -> SLR0, frame address: 0x00003005 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   5), frame offset: 2270, frame byte offset in bitstream: 517
+INIT[ 7] -> SLR0, frame address: 0x00003004 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   4), frame offset: 2270, frame byte offset in bitstream: 133
+INIT[ 8] -> SLR0, frame address: 0x00003007 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   7), frame offset: 2269, frame byte offset in bitstream: 1285
+INIT[ 9] -> SLR0, frame address: 0x00003006 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   6), frame offset: 2269, frame byte offset in bitstream: 901
+INIT[10] -> SLR0, frame address: 0x00003005 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   5), frame offset: 2269, frame byte offset in bitstream: 517
+INIT[11] -> SLR0, frame address: 0x00003004 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   4), frame offset: 2269, frame byte offset in bitstream: 133
+INIT[12] -> SLR0, frame address: 0x00003007 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   7), frame offset: 2268, frame byte offset in bitstream: 1285
+INIT[13] -> SLR0, frame address: 0x00003006 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   6), frame offset: 2268, frame byte offset in bitstream: 901
+INIT[14] -> SLR0, frame address: 0x00003005 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   5), frame offset: 2268, frame byte offset in bitstream: 517
+INIT[15] -> SLR0, frame address: 0x00003004 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   4), frame offset: 2268, frame byte offset in bitstream: 133
+INIT[16] -> SLR0, frame address: 0x00003007 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   7), frame offset: 2267, frame byte offset in bitstream: 1285
+INIT[17] -> SLR0, frame address: 0x00003006 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   6), frame offset: 2267, frame byte offset in bitstream: 901
+INIT[18] -> SLR0, frame address: 0x00003005 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   5), frame offset: 2267, frame byte offset in bitstream: 517
+INIT[19] -> SLR0, frame address: 0x00003004 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   4), frame offset: 2267, frame byte offset in bitstream: 133
+INIT[20] -> SLR0, frame address: 0x00003007 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   7), frame offset: 2266, frame byte offset in bitstream: 1285
+INIT[21] -> SLR0, frame address: 0x00003006 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   6), frame offset: 2266, frame byte offset in bitstream: 901
+INIT[22] -> SLR0, frame address: 0x00003005 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   5), frame offset: 2266, frame byte offset in bitstream: 517
+INIT[23] -> SLR0, frame address: 0x00003004 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   4), frame offset: 2266, frame byte offset in bitstream: 133
+INIT[24] -> SLR0, frame address: 0x00003007 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   7), frame offset: 2265, frame byte offset in bitstream: 1285
+INIT[25] -> SLR0, frame address: 0x00003006 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   6), frame offset: 2265, frame byte offset in bitstream: 901
+INIT[26] -> SLR0, frame address: 0x00003005 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   5), frame offset: 2265, frame byte offset in bitstream: 517
+INIT[27] -> SLR0, frame address: 0x00003004 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   4), frame offset: 2265, frame byte offset in bitstream: 133
+INIT[28] -> SLR0, frame address: 0x00003007 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   7), frame offset: 2264, frame byte offset in bitstream: 1285
+INIT[29] -> SLR0, frame address: 0x00003006 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   6), frame offset: 2264, frame byte offset in bitstream: 901
+INIT[30] -> SLR0, frame address: 0x00003005 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   5), frame offset: 2264, frame byte offset in bitstream: 517
+INIT[31] -> SLR0, frame address: 0x00003004 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   4), frame offset: 2264, frame byte offset in bitstream: 133
+INIT[32] -> SLR0, frame address: 0x00003007 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   7), frame offset: 2263, frame byte offset in bitstream: 1285
+INIT[33] -> SLR0, frame address: 0x00003006 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   6), frame offset: 2263, frame byte offset in bitstream: 901
+INIT[34] -> SLR0, frame address: 0x00003005 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   5), frame offset: 2263, frame byte offset in bitstream: 517
+INIT[35] -> SLR0, frame address: 0x00003004 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   4), frame offset: 2263, frame byte offset in bitstream: 133
+INIT[36] -> SLR0, frame address: 0x00003007 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   7), frame offset: 2262, frame byte offset in bitstream: 1285
+INIT[37] -> SLR0, frame address: 0x00003006 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   6), frame offset: 2262, frame byte offset in bitstream: 901
+INIT[38] -> SLR0, frame address: 0x00003005 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   5), frame offset: 2262, frame byte offset in bitstream: 517
+INIT[39] -> SLR0, frame address: 0x00003004 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   4), frame offset: 2262, frame byte offset in bitstream: 133
+INIT[40] -> SLR0, frame address: 0x00003007 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   7), frame offset: 2261, frame byte offset in bitstream: 1285
+INIT[41] -> SLR0, frame address: 0x00003006 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   6), frame offset: 2261, frame byte offset in bitstream: 901
+INIT[42] -> SLR0, frame address: 0x00003005 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   5), frame offset: 2261, frame byte offset in bitstream: 517
+INIT[43] -> SLR0, frame address: 0x00003004 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   4), frame offset: 2261, frame byte offset in bitstream: 133
+INIT[44] -> SLR0, frame address: 0x00003007 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   7), frame offset: 2260, frame byte offset in bitstream: 1285
+INIT[45] -> SLR0, frame address: 0x00003006 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   6), frame offset: 2260, frame byte offset in bitstream: 901
+INIT[46] -> SLR0, frame address: 0x00003005 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   5), frame offset: 2260, frame byte offset in bitstream: 517
+INIT[47] -> SLR0, frame address: 0x00003004 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   4), frame offset: 2260, frame byte offset in bitstream: 133
+INIT[48] -> SLR0, frame address: 0x00003007 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   7), frame offset: 2259, frame byte offset in bitstream: 1285
+INIT[49] -> SLR0, frame address: 0x00003006 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   6), frame offset: 2259, frame byte offset in bitstream: 901
+INIT[50] -> SLR0, frame address: 0x00003005 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   5), frame offset: 2259, frame byte offset in bitstream: 517
+INIT[51] -> SLR0, frame address: 0x00003004 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   4), frame offset: 2259, frame byte offset in bitstream: 133
+INIT[52] -> SLR0, frame address: 0x00003007 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   7), frame offset: 2258, frame byte offset in bitstream: 1285
+INIT[53] -> SLR0, frame address: 0x00003006 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   6), frame offset: 2258, frame byte offset in bitstream: 901
+INIT[54] -> SLR0, frame address: 0x00003005 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   5), frame offset: 2258, frame byte offset in bitstream: 517
+INIT[55] -> SLR0, frame address: 0x00003004 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   4), frame offset: 2258, frame byte offset in bitstream: 133
+INIT[56] -> SLR0, frame address: 0x00003007 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   7), frame offset: 2257, frame byte offset in bitstream: 1285
+INIT[57] -> SLR0, frame address: 0x00003006 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   6), frame offset: 2257, frame byte offset in bitstream: 901
+INIT[58] -> SLR0, frame address: 0x00003005 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   5), frame offset: 2257, frame byte offset in bitstream: 517
+INIT[59] -> SLR0, frame address: 0x00003004 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   4), frame offset: 2257, frame byte offset in bitstream: 133
+INIT[60] -> SLR0, frame address: 0x00003007 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   7), frame offset: 2256, frame byte offset in bitstream: 1285
+INIT[61] -> SLR0, frame address: 0x00003006 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   6), frame offset: 2256, frame byte offset in bitstream: 901
+INIT[62] -> SLR0, frame address: 0x00003005 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   5), frame offset: 2256, frame byte offset in bitstream: 517
+INIT[63] -> SLR0, frame address: 0x00003004 (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =   4), frame offset: 2256, frame byte offset in bitstream: 133
+
+SLICE_X23Y45/BFF
+INIT -> SLR0, frame address: 0x0000300c (BLOCK_TYPE = CLB_IO_CLK, ROW_ADDR =   0, COL_ADDR =  48, MINOR_ADDR =  12), frame offset: 2260, frame byte offset in bitstream: 1669
+
