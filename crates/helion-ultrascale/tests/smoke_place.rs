@@ -40,7 +40,7 @@ fn place_lut_and_ff_through_fabric_api() {
     assert_eq!(ff.name(), Some("AQ".to_string()));
 
     // Record the placement.
-    let placements = vec![
+    let placements = [
         Placement {
             bel_tile: lut.tile,
             bel_kind: lut.kind,
@@ -67,8 +67,16 @@ fn place_lut_and_ff_through_fabric_api() {
 
     // Verify the BELs are still reported at the tile (no aliasing).
     let requery = fabric.bels_at(clb_tile);
-    assert!(requery.iter().any(|b| b.kind == BelKind::Lut6 && b.index == 0));
-    assert!(requery.iter().any(|b| b.kind == BelKind::FdRe && b.index == 0));
+    assert!(
+        requery
+            .iter()
+            .any(|b| b.kind == BelKind::Lut6 && b.index == 0)
+    );
+    assert!(
+        requery
+            .iter()
+            .any(|b| b.kind == BelKind::FdRe && b.index == 0)
+    );
 
     println!(
         "placed {} onto {} {} at {}",

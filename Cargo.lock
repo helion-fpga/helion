@@ -1961,6 +1961,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "helion-ultrascale"
+version = "3.0.0"
+dependencies = [
+ "helion-ir",
+ "helion-sv",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "helion-update"
 version = "4.0.0"
 dependencies = [

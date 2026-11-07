@@ -12,12 +12,18 @@
 //!   DSP, BRAM), confirmed against Vivado tile naming
 
 pub mod bel;
+pub mod bitloc;
 pub mod device;
 pub mod fabric;
 pub mod int_pip;
 pub mod segbits;
 
 pub use bel::{Bel, BelKind, ClbBelInventory, TileId, TileKind};
+pub use bitloc::{
+    BRAM_MEM_BITS, BRAM_PARITY_BITS, BitLoc, BitLocError, Block, BramHalf, BramHalfContent,
+    BramTileUse, ClbTileType, FRAME_BITS, LUT_INIT_BITS, LutMode, NUM_BRAM18_PER_COLUMN,
+    NUM_CLB_PER_COLUMN, PlacedBit,
+};
 pub use device::{UltraScaleDevice, Xcvu3pSpec};
 pub use fabric::{
     EmptyTimingDb, EmptyWireDb, FabricWithPlaceholders, TimingDb, UltraScaleFabric, WireDb,
