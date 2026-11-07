@@ -15,7 +15,7 @@
 //!   INT_X0Y0.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1
 //!   RAMB18_X0Y0.INIT_00 = 256'h8000...0001
 //!   SLICE_X0Y0.A6LUT.INIT[63:0] = 64'h8000000000000001
-//!   SLICE_X0Y0.AFF.INIT
+//!   SLICE_X0Y0.AFF.INIT.V0
 //!
 //! Stub device (xcku3p, IDCODE 0x04A63093 per UG570 table 2):
 //!   SLICE_X0Y0  type CLEL_L  base FAR 0x00000500 (block 0, row 0, col 5, minor 0)
@@ -27,9 +27,16 @@
 //! INIT lists are MSB-first: list index 0 is the most significant value
 //! bit, per the brief):
 //!   CLEL_L A6LUT.INIT[63:0] : 64 refs, frame offset 12, bits 63..0
-//!   CLEL_L AFF.INIT         : 1 ref, frame offset 12, bit 64
+//!   CLEL_L AFF.INIT.V0      : 1 ref, frame offset 12, bit 64
+//!   CLEL_L AFF.INIT.V1      : 1 ref, frame offset 12, `!` bit 64
 //!   INT    PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1 : set bit 100, `!` bits 101, 102
 //!   BRAM   INIT_00          : 256 refs, frame offset 0, bits 255..0
+//!
+//! The FF INIT spelling is the DB vocabulary `.V0`/`.V1` (interfaces
+//! critic session 2 item 5), not bare `AFF.INIT`. V0 sets the INIT bit;
+//! V1 requires it clear. The value-to-feature polarity mapping (which
+//! of V0/V1 means INIT=1) is still BLOCKED on a polarity experiment,
+//! so this test pins only the bit pattern, never a value meaning.
 //!
 //! Expected frames (hand-computed):
 //!   F2 = 0x00000304: word3 = 0x00000010 (frame bit 100), rest 0
@@ -57,7 +64,7 @@ use helion_ultrascale::bitgen::{
 const FASM: &str = "INT_X0Y0.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1\n\
 RAMB18_X0Y0.INIT_00 = 256'h8000000000000000000000000000000000000000000000000000000000000001\n\
 SLICE_X0Y0.A6LUT.INIT[63:0] = 64'h8000000000000001\n\
-SLICE_X0Y0.AFF.INIT\n";
+SLICE_X0Y0.AFF.INIT.V0\n";
 
 const F2: u32 = 0x0000_0304;
 const F1: u32 = 0x0000_050C;
@@ -89,8 +96,13 @@ fn test_db() -> StubSegbitsDb {
         ("CLEL_L".to_string(), "A6LUT.INIT[63:0]".to_string(), lut),
         (
             "CLEL_L".to_string(),
-            "AFF.INIT".to_string(),
+            "AFF.INIT.V0".to_string(),
             vec![BitRef::set(12, 64)],
+        ),
+        (
+            "CLEL_L".to_string(),
+            "AFF.INIT.V1".to_string(),
+            vec![BitRef::clear(12, 64)],
         ),
         (
             "INT".to_string(),
@@ -242,6 +254,156 @@ fn all_zero_valued_feature_is_dropped_on_parse_back() {
     let device = test_device();
     let db = test_db();
     let fasm = "SLICE_X0Y0.A6LUT.INIT[63:0] = 64'h0000000000000000\n";
+    let bytes = emit_bitstream(fasm, &device, &db).unwrap();
+    let back = parse_bitstream(&bytes, &device, &db).unwrap();
+    assert_eq!(back, "");
+}
+
+// ---------------------------------------------------------------------------
+// All-`!` valueless features (critic session 6 D1).
+//
+// The real `segbits_int.db` BOUNCE_E_0_FT1 mux (prjuray-db, verified
+// against the on-disk clone): six selections each set exactly one bit
+// of 64_00, 66_00, 68_00, 72_00, 72_01, 74_00, and VCC_WIRE sets
+// nothing and requires all six clear. Frame numbers below are offsets
+// from the INT tile base FAR 0x300, so the config order lists
+// 0x340, 0x342, 0x344, 0x348, 0x34A.
+// ---------------------------------------------------------------------------
+
+fn bounce_device() -> StubDevice {
+    StubDevice::new(
+        "xcku3p",
+        Some(0x04A6_3093),
+        vec![("INT_X0Y0".to_string(), "INT".to_string(), 0x300)],
+        vec![0x340, 0x342, 0x344, 0x348, 0x34A],
+    )
+}
+
+fn bounce_db() -> StubSegbitsDb {
+    StubSegbitsDb::new(vec![
+        (
+            "INT".to_string(),
+            "PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1".to_string(),
+            vec![
+                BitRef::set(64, 0),
+                BitRef::clear(66, 0),
+                BitRef::clear(68, 0),
+                BitRef::clear(72, 0),
+                BitRef::clear(72, 1),
+                BitRef::clear(74, 0),
+            ],
+        ),
+        (
+            "INT".to_string(),
+            "PIP.BOUNCE_E_0_FT1.INODE_E_5_FT1".to_string(),
+            vec![
+                BitRef::clear(64, 0),
+                BitRef::clear(66, 0),
+                BitRef::set(68, 0),
+                BitRef::clear(72, 0),
+                BitRef::clear(72, 1),
+                BitRef::clear(74, 0),
+            ],
+        ),
+        (
+            "INT".to_string(),
+            "PIP.BOUNCE_E_0_FT1.INODE_E_9_FT1".to_string(),
+            vec![
+                BitRef::clear(64, 0),
+                BitRef::clear(66, 0),
+                BitRef::clear(68, 0),
+                BitRef::clear(72, 0),
+                BitRef::set(72, 1),
+                BitRef::clear(74, 0),
+            ],
+        ),
+        (
+            "INT".to_string(),
+            "PIP.BOUNCE_E_0_FT1.INODE_E_BLN_54_FT1".to_string(),
+            vec![
+                BitRef::clear(64, 0),
+                BitRef::clear(66, 0),
+                BitRef::clear(68, 0),
+                BitRef::set(72, 0),
+                BitRef::clear(72, 1),
+                BitRef::clear(74, 0),
+            ],
+        ),
+        (
+            "INT".to_string(),
+            "PIP.BOUNCE_E_0_FT1.INODE_E_BLN_58_FT1".to_string(),
+            vec![
+                BitRef::clear(64, 0),
+                BitRef::set(66, 0),
+                BitRef::clear(68, 0),
+                BitRef::clear(72, 0),
+                BitRef::clear(72, 1),
+                BitRef::clear(74, 0),
+            ],
+        ),
+        (
+            "INT".to_string(),
+            "PIP.BOUNCE_E_0_FT1.INODE_E_BLN_62_FT1".to_string(),
+            vec![
+                BitRef::clear(64, 0),
+                BitRef::clear(66, 0),
+                BitRef::clear(68, 0),
+                BitRef::clear(72, 0),
+                BitRef::clear(72, 1),
+                BitRef::set(74, 0),
+            ],
+        ),
+        (
+            "INT".to_string(),
+            "PIP.BOUNCE_E_0_FT1.VCC_WIRE".to_string(),
+            vec![
+                BitRef::clear(64, 0),
+                BitRef::clear(66, 0),
+                BitRef::clear(68, 0),
+                BitRef::clear(72, 0),
+                BitRef::clear(72, 1),
+                BitRef::clear(74, 0),
+            ],
+        ),
+    ])
+}
+
+#[test]
+fn all_bang_mux_routed_case_round_trips() {
+    // D1 error mode: before the fix, parse-back errored with
+    // MustBeZeroViolated for VCC_WIRE because 64_00 reads 1 when the
+    // mux is routed to INODE_E_1_FT1. A `!` bit reading 1 must mean
+    // the feature is absent (another selection holds), not an error.
+    let device = bounce_device();
+    let db = bounce_db();
+    let fasm = "INT_X0Y0.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1\n";
+    let bytes = emit_bitstream(fasm, &device, &db).unwrap();
+    let back = parse_bitstream(&bytes, &device, &db).unwrap();
+    assert_eq!(back, fasm);
+}
+
+#[test]
+fn all_bang_mux_untouched_case_round_trips() {
+    // D1 spurious-lines mode: before the fix, parse-back emitted a
+    // VCC_WIRE line for the untouched mux (all-zero frames), breaking
+    // round-trip exactness. An all-`!` feature sets no bits, so it is
+    // indistinguishable from absent and must not be emitted.
+    let device = bounce_device();
+    let db = bounce_db();
+    let bytes = emit_bitstream("", &device, &db).unwrap();
+    let back = parse_bitstream(&bytes, &device, &db).unwrap();
+    assert_eq!(back, "");
+}
+
+#[test]
+fn all_bang_feature_explicitly_selected_is_dropped_on_parse_back() {
+    // VCC_WIRE sets no bits, so it is indistinguishable from absent
+    // (same boundary as the all-zero-value limit for valued features).
+    // Emit accepts it (it constrains the mux bits to zero) but
+    // parse-back drops it.
+    let device = bounce_device();
+    let db = bounce_db();
+    let fasm = "INT_X0Y0.PIP.BOUNCE_E_0_FT1.VCC_WIRE\n";
     let bytes = emit_bitstream(fasm, &device, &db).unwrap();
     let back = parse_bitstream(&bytes, &device, &db).unwrap();
     assert_eq!(back, "");
