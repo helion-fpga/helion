@@ -81,6 +81,7 @@ helion-xilinx7 = { path = "crates/helion-xilinx7" }
 helion-ice40 = { path = "crates/helion-ice40" }
 helion-ecp5 = { path = "crates/helion-ecp5" }
 helion-targets = { path = "crates/helion-targets" }
+helion-ultrascale = { path = "crates/helion-ultrascale" }
 helion-update = { path = "crates/helion-update" }
 helion-zb-front = { path = "crates/zb/helion-zb-front" }
 criterion = "0.5"
