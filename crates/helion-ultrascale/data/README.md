@@ -24,6 +24,11 @@ reproducible with `generate_tables.py`.
   notice covers this copy.
 - Extracted: 2026-11-07, with `generate_tables.py`, which asserts the
   table counts above and warns if the source hash changes.
+- This file is the per-table extraction record. The directory-level
+  provenance index is `PROVENANCE.md` in this directory; it records the
+  same source SHA-256 and license for these tables alongside the prjuray
+  segbits DBs, and points back here. If the source hash changes, update
+  both files.
 
 ## Reading the tables
 
