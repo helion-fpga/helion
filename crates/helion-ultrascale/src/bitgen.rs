@@ -97,6 +97,7 @@
 //!   `parse_bitstream` (`UnexplainedBits`). Use `parse_frames` for foreign
 //!   bitstreams whose DB coverage is incomplete.
 
+use crate::segbits::{BitRef, SegbitsDb};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
@@ -417,54 +418,16 @@ impl fmt::Display for BitgenError {
 impl std::error::Error for BitgenError {}
 
 // ---------------------------------------------------------------------------
-// Segbits DB and device traits
+// Device traits
 // ---------------------------------------------------------------------------
-
-/// One configuration bit from the segbits database.
-///
-/// `frame` is a frame offset relative to the tile base FAR from the device
-/// file (prjxray segbits convention). The absolute FAR is
-/// `tile_base_far + frame` as a u32 sum, which carries through minor, column,
-/// row, and block type in FAR increment order. `bit` is the bit offset
-/// within the frame, 0..2976 (word bit/32, bit bit%32, LSB-first in the word,
-/// per BitFiltrator `frame.py`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BitRef {
-    pub frame: u32,
-    pub bit: u16,
-    pub must_be_zero: bool,
-}
-
-impl BitRef {
-    pub fn set(frame: u32, bit: u16) -> Self {
-        Self {
-            frame,
-            bit,
-            must_be_zero: false,
-        }
-    }
-    pub fn clear(frame: u32, bit: u16) -> Self {
-        Self {
-            frame,
-            bit,
-            must_be_zero: true,
-        }
-    }
-}
-
-/// Segbits database. The segbits-vendor worker owns the trait and the data;
-/// this shape is the INTERFACES.md contract plus `features`, which
-/// `parse_bitstream` needs to invert the mapping.
-pub trait SegbitsDb {
-    /// Bit list for (tile_type, feature), or None if the feature is unknown.
-    /// For INIT features the list is ordered MSB-first: list index 0 is the
-    /// most significant value bit.
-    fn lookup(&self, tile_type: &str, feature: &str) -> Option<&[BitRef]>;
-    /// All tile types in the database.
-    fn tile_types(&self) -> &[String];
-    /// All feature names for a tile type, for parse-back enumeration.
-    fn features(&self, tile_type: &str) -> &[String];
-}
+//
+// `BitRef` and `SegbitsDb` live in `crate::segbits` (the loader's home):
+// the single definition, with u16 bit width and `features()`, per the
+// interfaces session 2 item 6 reconciliation. This module used to define
+// its own duplicates (`set`/`clear` constructors); they are deleted here.
+// Constructor spelling picked: `set`/`zero`, the loader's spelling, because
+// `zero` names the `!` token's meaning (the bit must read 0) and matches
+// the `must_be_zero` field; `clear` is dropped and its call sites renamed.
 
 /// Device data the emitter consumes. Implemented by the device-file worker
 /// for the real device file; the logical grid in `device.rs` does NOT
@@ -1719,7 +1682,7 @@ mod tests {
             (
                 "CLEL_L".to_string(),
                 "BFF.INIT".to_string(),
-                vec![BitRef::clear(12, 64)],
+                vec![BitRef::zero(12, 64)],
             ),
         ]);
         let err =
