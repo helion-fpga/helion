@@ -81,6 +81,11 @@ pub trait SegbitsDb {
     fn lookup(&self, tile_type: &str, feature: &str) -> Option<&[BitRef]>;
     /// Sorted tile types present in the database.
     fn tile_types(&self) -> &[String];
+    /// All feature names for a tile type, sorted, for parse-back
+    /// enumeration. Empty for an unknown tile type. The list enumerates
+    /// exactly the features `lookup` resolves for the tile type: no
+    /// missing, no extras.
+    fn features(&self, tile_type: &str) -> &[String];
 }
 
 /// Failure to load or parse a segbits file. Malformed lines fail loud: a
@@ -140,6 +145,7 @@ impl std::error::Error for SegbitsLoadError {}
 pub struct FileSegbitsDb {
     entries: HashMap<(String, String), Vec<BitRef>>,
     tile_types: Vec<String>,
+    features: HashMap<String, Vec<String>>,
     source: String,
 }
 
@@ -156,6 +162,7 @@ impl FileSegbitsDb {
     pub fn from_text(text: &str, source: &str) -> Result<Self, SegbitsLoadError> {
         let mut entries: HashMap<(String, String), Vec<BitRef>> = HashMap::new();
         let mut tile_types: Vec<String> = Vec::new();
+        let mut features: HashMap<String, Vec<String>> = HashMap::new();
         for (idx, raw) in text.lines().enumerate() {
             let line_no = idx + 1;
             let line = raw.trim();
@@ -212,12 +219,20 @@ impl FileSegbitsDb {
             if !tile_types.iter().any(|t| t == tile_type) {
                 tile_types.push(tile_type.to_string());
             }
+            features
+                .entry(tile_type.to_string())
+                .or_default()
+                .push(feature.to_string());
             entries.insert(key, bits);
         }
         tile_types.sort();
+        for list in features.values_mut() {
+            list.sort();
+        }
         Ok(Self {
             entries,
             tile_types,
+            features,
             source: source.to_string(),
         })
     }
@@ -242,6 +257,13 @@ impl SegbitsDb for FileSegbitsDb {
 
     fn tile_types(&self) -> &[String] {
         &self.tile_types
+    }
+
+    fn features(&self, tile_type: &str) -> &[String] {
+        self.features
+            .get(tile_type)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 }
 
@@ -335,6 +357,66 @@ mod tests {
         assert!(
             db.lookup("CLB", "PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn features_enumerates_exactly_what_lookup_resolves() {
+        // Merge requirement (interfaces session 2 item 3): features()
+        // enumerates exactly the features lookup() resolves for the tile
+        // type, no missing, no extras, sorted; empty for unknown types.
+        let db = FileSegbitsDb::from_text(FIXTURE, "fixture").unwrap();
+        assert_eq!(
+            db.features("INT"),
+            &[
+                "PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1".to_string(),
+                "PIP.INODE_E_1_FT1.BYPASS_E4".to_string(),
+            ]
+        );
+        for feature in db.features("INT") {
+            assert!(
+                db.lookup("INT", feature).is_some(),
+                "listed feature {feature} must resolve"
+            );
+        }
+        assert!(db.features("CLB").is_empty());
+        // Vendored INT DB: every listed feature resolves, and the list
+        // length equals the entry count, so there are no missing and no
+        // extras. (A list built from a different source than lookup
+        // would show up here as a count mismatch or a failed lookup.)
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+        let db = FileSegbitsDb::from_file(&data.join("segbits_int.db")).unwrap();
+        assert_eq!(db.features("INT").len(), 3778);
+        assert_eq!(db.features("INT").len(), db.feature_count());
+        for feature in db.features("INT") {
+            assert!(db.lookup("INT", feature).is_some());
+        }
+    }
+
+    #[test]
+    fn lookup_preserves_db_file_order() {
+        // The loader must not sort or reorder bit tokens: the bitgen
+        // contract requires INIT lists ordered MSB-first, and the DB
+        // file order is the only place that order is established.
+        // Bits here are deliberately out of numeric order.
+        let text = "CLEL_L.A6LUT.INIT[2:0] 12_02 12_00 12_01\n";
+        let db = FileSegbitsDb::from_text(text, "fixture").unwrap();
+        assert_eq!(
+            db.lookup("CLEL_L", "A6LUT.INIT[2:0]").unwrap(),
+            &[BitRef::set(12, 2), BitRef::set(12, 0), BitRef::set(12, 1)]
+        );
+        // The BYPASS fixture line, exact file order including `!` tokens.
+        let db = FileSegbitsDb::from_text(FIXTURE, "fixture").unwrap();
+        assert_eq!(
+            db.lookup("INT", "PIP.INODE_E_1_FT1.BYPASS_E4").unwrap(),
+            &[
+                BitRef::zero(57, 0),
+                BitRef::zero(59, 0),
+                BitRef::zero(61, 0),
+                BitRef::set(65, 1),
+                BitRef::zero(67, 1),
+                BitRef::zero(69, 1),
+            ]
         );
     }
 
