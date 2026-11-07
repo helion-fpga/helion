@@ -185,3 +185,12 @@ fn fail_loud_on_clock_net_phase1() {
     let err = route_ultra(&[n], &db, opts).expect_err("clock nets are phase 2");
     assert_eq!(err.kind, RouteErrorKind::ClockNetInPhase1);
 }
+
+#[test]
+fn mock_wire_info_is_none() {
+    // The mock has grid positions only and cannot name wires, so it can
+    // never feed the router-to-PIP translator. Expected.
+    let db = small_db();
+    assert_eq!(db.wire_info(0), None);
+    assert_eq!(db.wire_info(42), None);
+}
