@@ -70,18 +70,29 @@
 //! - `parse_bitstream` returns the FASM of features whose configuration is
 //!   observable in the frames. A valued feature whose value is all zero
 //!   sets no bits and is indistinguishable from an absent feature, so it is
-//!   dropped on parse-back. The same boundary holds for a valueless
-//!   feature with no set bits (an all-`!` feature such as a mux default
-//!   like VCC_WIRE or an FF `.V1`): it sets no bits, so it is dropped on
-//!   parse-back; otherwise every all-`!` feature of every tile would be
-//!   emitted for unconfigured frames. Round-trip exactness holds for
-//!   observable features; the tests pin this boundary.
+//!   dropped on parse-back. A valueless all-`!` feature is dropped too,
+//!   UNLESS it is the exact complement of another feature of the same
+//!   tile type (a binary attribute pair such as FF INIT .V0/.V1, where
+//!   V1's zero set is V0's set and V0 lists no `!` bits): exactly one of
+//!   the pair holds in every bit pattern, so the all-`!` half is
+//!   observable and renders. A mux default such as VCC_WIRE has no
+//!   complement and is dropped; otherwise every all-`!` feature of every
+//!   tile would be emitted for unconfigured frames. Round-trip exactness
+//!   holds for observable features; the tests pin this boundary.
 //! - FF INIT parse-back renders the DB vocabulary `.V0`/`.V1`, never bare
-//!   `AFF.INIT`. A set INIT bit renders as `.V0`; a clear bit renders
-//!   nothing (`.V1` is all-`!`, hence unobservable, per the boundary
-//!   above). The value-to-feature polarity mapping (which of V0/V1 means
-//!   INIT=1) is BLOCKED on a polarity experiment; this module pins only
-//!   the bit pattern, never a value meaning.
+//!   `AFF.INIT`. Polarity, resolved by researcher session 1 from
+//!   f4pga/prjuray (tools/dump_features.tcl:897-902 names the feature
+//!   from the cell INIT property, so the V suffix IS the attribute
+//!   value; utils/spec/flipflops.py:100 instantiates .INIT(1'b0/1'b1);
+//!   vendored DB lines CLEL_L.AFF.INIT.V0 12_02, V1 !12_02 confirm):
+//!   INIT value 0 selects .V0, which SETS the bit; INIT value 1 selects
+//!   .V1, which CLEARS the bit. bit = NOT(INIT). SRVAL is the same:
+//!   bit = NOT(SRVAL). So a bit reading 1 renders .V0 (INIT 0) and a
+//!   bit reading 0 renders .V1 (INIT 1). Consequence: parse-back renders
+//!   exactly one .V0/.V1 line per FF in the device for DBs with the pair
+//!   structure, so round-trip exactness on real device data requires
+//!   the input FASM to specify every FF's INIT (complete FASM); a
+//!   partial FASM gains .V1 lines for unmentioned FFs.
 //! - Frames with set bits no enumerated feature explains fail loud in
 //!   `parse_bitstream` (`UnexplainedBits`). Use `parse_frames` for foreign
 //!   bitstreams whose DB coverage is incomplete.
@@ -1226,10 +1237,19 @@ pub fn parse_bitstream(
     let mut explained: HashSet<(u32, u16)> = HashSet::new();
     // (tile, feature, value-string-or-None) lines, collected then sorted.
     let mut lines: Vec<(String, String, Option<String>)> = Vec::new();
+    // For each tile type, the set-bit signatures of features that list no
+    // `!` bits. An all-`!` feature whose zero signature is one of these
+    // is the exact complement of that feature (a binary attribute pair
+    // such as FF INIT .V0/.V1). Built lazily per tile type; a tile type
+    // appears on many tiles.
+    let mut complement_sets: HashMap<String, HashSet<Vec<(u32, u16)>>> = HashMap::new();
     for tile in device.tile_names() {
         let tile_type = device
             .tile_type(tile)
             .ok_or_else(|| BitgenError::UnknownTileType { tile: tile.clone() })?;
+        let complements = complement_sets
+            .entry(tile_type.to_string())
+            .or_insert_with(|| complement_signatures(segbits, tile_type));
         let base_far = device
             .tile_base_far(tile)
             .ok_or_else(|| BitgenError::UnknownTileType { tile: tile.clone() })?;
@@ -1270,19 +1290,26 @@ pub fn parse_bitstream(
             let present = if valued {
                 any_set
             } else {
-                // A valueless feature is present only when it sets at
-                // least one bit and every listed bit agrees: all set bits
-                // read 1 and all `!` bits read 0. The n_set > 0 clause is
-                // load-bearing: `all_set_bits_one` is vacuously true for
-                // an all-`!` feature, and without it every all-`!` feature
-                // of every tile would be emitted for unconfigured frames
-                // (VCC_WIRE for every INT mux, `.V1` for every FF). A
-                // `!` bit reading 1 means the feature is absent (another
+                // A valueless feature is present when every listed bit
+                // agrees (all set bits 1, all `!` bits 0) and the feature
+                // is observable: it sets at least one bit, or it is the
+                // exact complement of another feature of the same tile
+                // type (a binary attribute pair such as FF INIT .V0/.V1,
+                // where V1's zero set is V0's set and V0 lists no `!`
+                // bits). An all-`!` feature with no complement (a mux
+                // default such as VCC_WIRE) sets nothing and is
+                // indistinguishable from absent, so it is dropped. A `!`
+                // bit reading 1 means the feature is absent (another
                 // selection holds), not an error; the error path is
-                // reserved for genuinely inconsistent input.
-                n_set > 0
-                    && all_set_bits_one(&frames, base_far, refs)
+                // reserved for genuinely inconsistent input. No inversion
+                // is applied here: the DB's V0/V1 features already encode
+                // the polarity (V0 sets, V1 clears), so rendering the
+                // matching feature renders the right value.
+                let has_complement =
+                    n_set == 0 && !refs.is_empty() && complements.contains(&zero_signature(refs));
+                all_set_bits_one(&frames, base_far, refs)
                     && all_zero_bits_zero(&frames, base_far, refs)
+                    && (n_set > 0 || has_complement)
             };
             if !present {
                 continue;
@@ -1360,8 +1387,8 @@ fn frame_bit(frames: &BTreeMap<u32, FrameWords>, far: u32, bit: u16) -> bool {
 
 /// True when every listed non-`!` bit reads 1 (presence test for a
 /// valueless feature). Vacuously true for an empty set-bit list, so
-/// callers must also require at least one set bit; an all-`!` feature
-/// is never present on parse-back.
+/// callers must also require observability: at least one set bit, or
+/// an exact complement (see the presence rule in `parse_bitstream`).
 fn all_set_bits_one(frames: &BTreeMap<u32, FrameWords>, base_far: u32, refs: &[BitRef]) -> bool {
     refs.iter()
         .filter(|r| !r.must_be_zero)
@@ -1373,6 +1400,37 @@ fn all_zero_bits_zero(frames: &BTreeMap<u32, FrameWords>, base_far: u32, refs: &
     refs.iter()
         .filter(|r| r.must_be_zero)
         .all(|r| !frame_bit(frames, base_far + r.frame, r.bit))
+}
+
+/// Sorted (frame, bit) pairs of a feature's `!` bits.
+fn zero_signature(refs: &[BitRef]) -> Vec<(u32, u16)> {
+    let mut sig: Vec<(u32, u16)> = refs
+        .iter()
+        .filter(|r| r.must_be_zero)
+        .map(|r| (r.frame, r.bit))
+        .collect();
+    sig.sort();
+    sig
+}
+
+/// Set-bit signatures of the features of one tile type that list no `!`
+/// bits. An all-`!` feature whose zero signature is in this set is the
+/// exact complement of one of these features (a binary attribute pair
+/// such as FF INIT .V0/.V1). Features the DB lists but lookup cannot
+/// resolve are skipped here; the main loop fails loud on them.
+fn complement_signatures(segbits: &dyn SegbitsDb, tile_type: &str) -> HashSet<Vec<(u32, u16)>> {
+    let mut set = HashSet::new();
+    for feature in segbits.features(tile_type) {
+        if let Some(refs) = segbits.lookup(tile_type, feature) {
+            if refs.is_empty() || refs.iter().any(|r| r.must_be_zero) {
+                continue;
+            }
+            let mut sig: Vec<(u32, u16)> = refs.iter().map(|r| (r.frame, r.bit)).collect();
+            sig.sort();
+            set.insert(sig);
+        }
+    }
+    set
 }
 
 /// Format reconstructed value bits (LSB-first vec, bit 0 is LSB) as
