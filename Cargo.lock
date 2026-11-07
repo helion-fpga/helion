@@ -1702,6 +1702,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "helion-ultrascale"
+version = "3.0.0"
+
+[[package]]
 name = "helion-vhdl"
 version = "3.0.0"
 dependencies = [
