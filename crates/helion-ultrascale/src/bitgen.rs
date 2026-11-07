@@ -26,8 +26,8 @@
 //!   reproduces CRC 0x06b1285e exactly.
 //! - Vivado 7-series bitstream `zedboard_blinky.bit` (in this workspace):
 //!   observed preamble register order and ending sequence (RCRC, GRESTORE,
-//!   DGHIGH_LFRM, trailing NOOPs). That file carries no CRC packets, so it
-//!   does not validate CRC values.
+//!   DGHIGH_LFRM, START, DESYNC, trailing NOOPs). That file carries no
+//!   CRC packets, so it does not validate CRC values.
 //!
 //! Contract notes (for the critic and the interfaces owner). The
 //! INTERFACES.md shapes are followed except where they cannot work:
@@ -161,7 +161,7 @@ pub mod block {
 /// (SIM_CONFIGE2 model, prjxray `bitstream_crc.py`).
 const CRC_EXCLUDED_REGS: [u8; 5] = [15, 18, 20, 21, 22];
 
-/// Trailing NOOP count after DGHIGH_LFRM, matching the observed Vivado
+/// Trailing NOOP count after DESYNC, matching the observed Vivado
 /// 7-series bitstream in this workspace (`zedboard_blinky.bit`: 400).
 const TRAILING_NOOPS: usize = 400;
 
@@ -874,7 +874,7 @@ fn type1_write_header(reg: u8, word_count: u32) -> u32 {
 /// workspace for preamble/ending, BitFiltrator per-frame CRC comment for the
 /// frame loop): dummy words, bus width detect, sync, NOOP, RCRC, IDCODE,
 /// WCFG, then per frame in config order FAR, FDRI (93 words), FAR rewrite,
-/// CRC, then RCRC, GRESTORE, DGHIGH_LFRM, trailing NOOPs.
+/// CRC, then RCRC, GRESTORE, DGHIGH_LFRM, START, DESYNC, trailing NOOPs.
 pub fn emit_bitstream(
     fasm: &str,
     device: &dyn BitgenDevice,
@@ -933,13 +933,23 @@ pub fn emit_bitstream(
         words.push(value);
     }
 
-    // Ending, mirroring the observed Vivado file: RCRC, GRESTORE, DGHIGH.
+    // Ending, mirroring the observed Vivado file: RCRC, GRESTORE,
+    // DGHIGH_LFRM, START, DESYNC, trailing NOOPs. START runs the startup
+    // sequence (DONE goes high); without it the configured device never
+    // runs. DESYNC terminates the stream; it is also this module's own
+    // parse_frames end marker. The FAR/MASK/CTL0 writes Vivado emits
+    // after START are NOT emitted: their UltraScale+ values are unknown
+    // (the 7-series values 0x03be0000 / 0x501 are not UltraScale+
+    // values). The ~100 NOOP words Vivado emits between DGHIGH_LFRM and
+    // START are not reproduced: their exact count is tier-2 detail.
     push_write(&mut words, &mut crc, reg::CMD, &[cmd::RCRC]);
     words.push(NOOP_WORD);
     words.push(NOOP_WORD);
     push_write(&mut words, &mut crc, reg::CMD, &[cmd::GRESTORE]);
     words.push(NOOP_WORD);
     push_write(&mut words, &mut crc, reg::CMD, &[cmd::DGHIGH_LFRM]);
+    push_write(&mut words, &mut crc, reg::CMD, &[cmd::START]);
+    push_write(&mut words, &mut crc, reg::CMD, &[cmd::DESYNC]);
     words.extend([NOOP_WORD; TRAILING_NOOPS]);
 
     let mut out = Vec::with_capacity(words.len() * 4);
