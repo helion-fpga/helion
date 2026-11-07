@@ -22,8 +22,8 @@ pub mod segbits;
 
 pub use bel::{Bel, BelKind, ClbBelInventory, TileId, TileKind};
 pub use bitgen::{
-    BitRef, BitgenDevice, BitgenError, DUMMY_WORD, FRAME_BITS, FRAME_WORDS, FasmEntry, FasmValue,
-    FrameWords, SYNC_WORD, SegbitsDb, StubDevice, StubSegbitsDb, far_decode, far_encode,
+    BitgenDevice, BitgenError, DUMMY_WORD, FRAME_WORDS, FasmEntry, FasmValue, FrameWords,
+    SYNC_WORD, StubDevice, StubSegbitsDb, far_decode, far_encode,
 };
 pub use bitloc::{
     BRAM_MEM_BITS, BRAM_PARITY_BITS, BitLoc, BitLocError, Block, BramHalf, BramHalfContent,

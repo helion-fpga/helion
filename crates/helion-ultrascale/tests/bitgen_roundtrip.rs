@@ -34,9 +34,11 @@
 //!
 //! The FF INIT spelling is the DB vocabulary `.V0`/`.V1` (interfaces
 //! critic session 2 item 5), not bare `AFF.INIT`. V0 sets the INIT bit;
-//! V1 requires it clear. The value-to-feature polarity mapping (which
-//! of V0/V1 means INIT=1) is still BLOCKED on a polarity experiment,
-//! so this test pins only the bit pattern, never a value meaning.
+//! V1 requires it clear. The value-to-feature polarity mapping is
+//! RESOLVED (researcher session 1, verified from the fuzzer source):
+//! bit = NOT(INIT) and bit = NOT(SRVAL); V0 is selected by value 0
+//! and sets the bit, V1 by value 1 and clears it. This test pins the
+//! bit pattern and the value meaning together.
 //!
 //! Expected frames (hand-computed):
 //!   F2 = 0x00000304: word3 = 0x00000010 (frame bit 100), rest 0
@@ -57,8 +59,9 @@
 //! ending RCRC 320, GRESTORE 324, DGHIGH 327, START 329, DESYNC 331,
 //! trailing NOOPs 333..732.
 
+use helion_ultrascale::BitRef;
 use helion_ultrascale::bitgen::{
-    BitRef, SYNC_WORD, StubDevice, StubSegbitsDb, emit_bitstream, emit_frames, parse_bitstream,
+    SYNC_WORD, StubDevice, StubSegbitsDb, emit_bitstream, emit_frames, parse_bitstream,
     parse_frames,
 };
 
@@ -103,15 +106,15 @@ fn test_db() -> StubSegbitsDb {
         (
             "CLEL_L".to_string(),
             "AFF.INIT.V1".to_string(),
-            vec![BitRef::clear(12, 64)],
+            vec![BitRef::zero(12, 64)],
         ),
         (
             "INT".to_string(),
             "PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1".to_string(),
             vec![
                 BitRef::set(4, 100),
-                BitRef::clear(4, 101),
-                BitRef::clear(4, 102),
+                BitRef::zero(4, 101),
+                BitRef::zero(4, 102),
             ],
         ),
         ("BRAM".to_string(), "INIT_00".to_string(), bram),
@@ -295,70 +298,70 @@ fn bounce_db() -> StubSegbitsDb {
             "PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1".to_string(),
             vec![
                 BitRef::set(64, 0),
-                BitRef::clear(66, 0),
-                BitRef::clear(68, 0),
-                BitRef::clear(72, 0),
-                BitRef::clear(72, 1),
-                BitRef::clear(74, 0),
+                BitRef::zero(66, 0),
+                BitRef::zero(68, 0),
+                BitRef::zero(72, 0),
+                BitRef::zero(72, 1),
+                BitRef::zero(74, 0),
             ],
         ),
         (
             "INT".to_string(),
             "PIP.BOUNCE_E_0_FT1.INODE_E_5_FT1".to_string(),
             vec![
-                BitRef::clear(64, 0),
-                BitRef::clear(66, 0),
+                BitRef::zero(64, 0),
+                BitRef::zero(66, 0),
                 BitRef::set(68, 0),
-                BitRef::clear(72, 0),
-                BitRef::clear(72, 1),
-                BitRef::clear(74, 0),
+                BitRef::zero(72, 0),
+                BitRef::zero(72, 1),
+                BitRef::zero(74, 0),
             ],
         ),
         (
             "INT".to_string(),
             "PIP.BOUNCE_E_0_FT1.INODE_E_9_FT1".to_string(),
             vec![
-                BitRef::clear(64, 0),
-                BitRef::clear(66, 0),
-                BitRef::clear(68, 0),
-                BitRef::clear(72, 0),
+                BitRef::zero(64, 0),
+                BitRef::zero(66, 0),
+                BitRef::zero(68, 0),
+                BitRef::zero(72, 0),
                 BitRef::set(72, 1),
-                BitRef::clear(74, 0),
+                BitRef::zero(74, 0),
             ],
         ),
         (
             "INT".to_string(),
             "PIP.BOUNCE_E_0_FT1.INODE_E_BLN_54_FT1".to_string(),
             vec![
-                BitRef::clear(64, 0),
-                BitRef::clear(66, 0),
-                BitRef::clear(68, 0),
+                BitRef::zero(64, 0),
+                BitRef::zero(66, 0),
+                BitRef::zero(68, 0),
                 BitRef::set(72, 0),
-                BitRef::clear(72, 1),
-                BitRef::clear(74, 0),
+                BitRef::zero(72, 1),
+                BitRef::zero(74, 0),
             ],
         ),
         (
             "INT".to_string(),
             "PIP.BOUNCE_E_0_FT1.INODE_E_BLN_58_FT1".to_string(),
             vec![
-                BitRef::clear(64, 0),
+                BitRef::zero(64, 0),
                 BitRef::set(66, 0),
-                BitRef::clear(68, 0),
-                BitRef::clear(72, 0),
-                BitRef::clear(72, 1),
-                BitRef::clear(74, 0),
+                BitRef::zero(68, 0),
+                BitRef::zero(72, 0),
+                BitRef::zero(72, 1),
+                BitRef::zero(74, 0),
             ],
         ),
         (
             "INT".to_string(),
             "PIP.BOUNCE_E_0_FT1.INODE_E_BLN_62_FT1".to_string(),
             vec![
-                BitRef::clear(64, 0),
-                BitRef::clear(66, 0),
-                BitRef::clear(68, 0),
-                BitRef::clear(72, 0),
-                BitRef::clear(72, 1),
+                BitRef::zero(64, 0),
+                BitRef::zero(66, 0),
+                BitRef::zero(68, 0),
+                BitRef::zero(72, 0),
+                BitRef::zero(72, 1),
                 BitRef::set(74, 0),
             ],
         ),
@@ -366,12 +369,12 @@ fn bounce_db() -> StubSegbitsDb {
             "INT".to_string(),
             "PIP.BOUNCE_E_0_FT1.VCC_WIRE".to_string(),
             vec![
-                BitRef::clear(64, 0),
-                BitRef::clear(66, 0),
-                BitRef::clear(68, 0),
-                BitRef::clear(72, 0),
-                BitRef::clear(72, 1),
-                BitRef::clear(74, 0),
+                BitRef::zero(64, 0),
+                BitRef::zero(66, 0),
+                BitRef::zero(68, 0),
+                BitRef::zero(72, 0),
+                BitRef::zero(72, 1),
+                BitRef::zero(74, 0),
             ],
         ),
     ])
@@ -456,7 +459,7 @@ fn polarity_db() -> StubSegbitsDb {
         (
             "CLEL_L".to_string(),
             "AFF.INIT.V1".to_string(),
-            vec![BitRef::clear(12, 2)],
+            vec![BitRef::zero(12, 2)],
         ),
         (
             "CLEL_L".to_string(),
@@ -466,7 +469,7 @@ fn polarity_db() -> StubSegbitsDb {
         (
             "CLEL_L".to_string(),
             "BFF.INIT.V1".to_string(),
-            vec![BitRef::clear(12, 4)],
+            vec![BitRef::zero(12, 4)],
         ),
     ])
 }
