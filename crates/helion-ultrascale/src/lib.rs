@@ -18,6 +18,7 @@ pub mod bitloc;
 pub mod device;
 pub mod device_file;
 pub mod fabric;
+pub mod fasm_gen;
 pub mod grid;
 pub mod int_pip;
 pub mod legality;
@@ -47,6 +48,7 @@ pub use fabric::{
     EmptyTimingDb, EmptyWireDb, FabricWithPlaceholders, TimingDb, UltraScaleFabric, UltraSite,
     WireDb, WireId, WireInfo,
 };
+pub use fasm_gen::{emit_ff_fasm, ff_init_fasm_line, ff_srval_fasm_line, FfAttr};
 pub use int_pip::{
     EmittedPip, IntPip, IntPipError, MissingPip, PipResolution, emit_pips, emitted_to_fasm,
     missing_pip_report, resolve_pips, verify_zero_bits,

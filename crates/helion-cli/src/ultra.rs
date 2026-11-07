@@ -7,18 +7,20 @@
 //!
 //! Current honest state (see COORD.md gate):
 //! - SYNTH, PACK, PLACE, LEGALITY, STA (preliminary) run.
+//! - FF FASM (complete, INIT/SRVAL default V0) is generated after legality.
 //! - ROUTE is blocked: the fabric WireDb is empty (no routing graph yet).
 //! - BITGEN is not implemented (bitgen-core owns emit_bitstream).
-//! - INT_PIP emission is blocked on the WireDb naming seam (proposal in
-//!   COORD.md, needs CTO ruling).
+//! - INT_PIP emission awaits the router-to-PIP translator, which maps
+//!   routes to IntPips via the WireDb naming seam (CTO ruling 2026-11-07,
+//!   option A, implemented in fabric::WireDb::wire_info).
 //! - Clock nets are phase 2 for the router (it rejects them loudly) and
 //!   IOBs have no placed site in this flow yet; both are recorded in the
 //!   gate, not hidden.
 
 use helion_ir::{intern, resolve, CellKind, Design};
 use helion_ultrascale::{
-    check_legality, pack_ultra, place_ultra, preliminary_xcvu3p, route_ultra, sta_routed,
-    ControlSetLimits, FabricWithPlaceholders, RoutableNet, StaNetlist, TimingReport,
+    check_legality, emit_ff_fasm, pack_ultra, place_ultra, preliminary_xcvu3p, route_ultra,
+    sta_routed, ControlSetLimits, FabricWithPlaceholders, RoutableNet, StaNetlist, TimingReport,
     UltraPlaceOpts, UltraRouteOpts, UltraScaleDevice, UltraScaleFabric,
 };
 use std::collections::{HashMap, HashSet};
@@ -281,6 +283,16 @@ pub fn run_impl(path: &str, part: &str, seed: u64) -> Result<(), String> {
         return Err(msg);
     }
     println!("hang_diag ultra legality ok violations=0");
+
+    // FF FASM (complete): every placed FF gets an INIT line and an SRVAL
+    // line, default V0 when unspecified (CTO ruling 2026-11-07, complete
+    // FASM; Xilinx default INIT/SRVAL 0). helion-ir Hff carries no
+    // INIT/SRVAL params, so the attribute map is empty today and every
+    // FF defaults to V0. Generated here, consumed by the BITGEN stage
+    // once ROUTE lands; it does not depend on routing.
+    let ff_fasm = emit_ff_fasm(&packed.slices, &placed, &HashMap::new())
+        .map_err(|e| format!("ULTRA FASM: {e}"))?;
+    println!("hang_diag ultra fasm ff_lines={}", ff_fasm.len());
 
     // Preliminary STA on the placed netlist (Manhattan estimates, ballpark
     // delays; NOT signoff timing).
