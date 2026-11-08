@@ -421,9 +421,21 @@ fn mux_for_ff(
         'D' => "DX",
         _ => "AX",
     };
-    // Find the FF's D net driver: if it's a LUT on the same site+letter,
-    // use the letter-matched mux input.
+    // D from carry O: the FFMUX selects XOR (the carry sum bit), never a
+    // letter input. The golden chain shows FFMUX.XOR on every chain FF.
+    // Without this the FF would sample AX instead of the sum: wrong
+    // silicon with no loud failure, so this check comes first.
     if let Some(pff) = packed.ffs.iter().find(|f| f.name == ff.name) {
+        let from_carry = packed.carries.iter().any(|c| {
+            c.o_nets
+                .iter()
+                .any(|o| o.as_deref() == Some(pff.d_net.as_str()))
+        });
+        if from_carry {
+            return "XOR";
+        }
+        // Otherwise the D net driver, when it is a LUT on the same
+        // site+letter, selects the letter-matched mux input.
         for lut in &placed.luts {
             if lut.site == ff.site
                 && lut.bel.starts_with(letter)
@@ -573,6 +585,14 @@ mod tests {
             PlacedCarry { name: "u_c0".into(), tile: "CLB_X0Y0".into(), site: "SLICE_X0Y0".into() },
             PlacedCarry { name: "u_c1".into(), tile: "CLB_X0Y1".into(), site: "SLICE_X0Y1".into() },
         ];
+        // One chain FF per group to pin the FFMUX.XOR rule.
+        r.placed.packed.ffs.push(PackedFf {
+            name: "u_ff0".into(), d_net: "o0".into(), q_net: "q0".into(),
+            clk_net: "clk_bufg".into(), ce_net: None, sr_net: None,
+        });
+        r.placed.ffs.push(PlacedFf {
+            name: "u_ff0".into(), tile: "CLB_X0Y0".into(), site: "SLICE_X0Y0".into(), bel: "AFF".into(),
+        });
         r
     }
 
@@ -585,6 +605,8 @@ mod tests {
         assert!(text.contains("CLB_X0Y1.SLICEL_X1.PRECYINIT.CIN"), "got:\n{text}");
         assert_eq!(text.matches("CARRY4.ACY0").count(), 1, "got:\n{text}");
         assert!(!text.contains("BCY0") && !text.contains("CCY0") && !text.contains("DCY0"), "got:\n{text}");
+        // Chain FF samples the sum through FFMUX.XOR, never a letter input.
+        assert!(text.contains("CLB_X0Y0.SLICEL_X0.AFFMUX.XOR"), "got:\n{text}");
     }
 
     #[test]
