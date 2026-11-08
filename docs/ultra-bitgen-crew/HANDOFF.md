@@ -14,6 +14,93 @@ This file plus the crew docs in this directory plus the harness in
 `crates/helion-ultrascale/harness/` are the complete resume kit. A new person
 should be able to start from here without re-analyzing the project.
 
+## The goal
+
+Build a non-Vivado tool that produces bitstreams identical to Vivado's, for
+any design, on real AMD/Xilinx parts. Identical means a zero bit-level diff
+against a real Vivado bitstream for the same design (tier 2), not just against
+public databases (tier 1). The ZedBoard is the main focus right now because it
+is real hardware that can verify the work; UltraScale+ continues in parallel
+because its encoding layer is the furthest along. The goal is not "better than
+Yosys". The goal is Vivado, exactly.
+
+## Read this first, in this order
+
+1. This file (state, goal, fix list).
+2. `SPEC.md` (the definition of done and the greedy loop rules).
+3. `INTERFACES.md` (the contracts: FASM format, SegbitsDb, BitRef, BitgenDevice,
+   diff report format, the block registry).
+4. The tail of `COORD.md` (the latest queue state and the newest session).
+5. The latest session in `CRITIQUE.md` (the newest critic verdict).
+6. `BRIEFS/tilegrid-research.md` (the tilegrid question and the Q6 probe).
+7. Then the code: `crates/helion-ultrascale/src/bitgen.rs`,
+   `src/segbits.rs`, `src/bitloc.rs`, `src/device_file.rs`,
+   `src/bitgen_device.rs`, `src/bin/helion-bitgen.rs`.
+
+## What we are making: the fix list
+
+Every item states what it is, why it matters, and what done looks like. A fix
+is done only when its test proves it. Nothing here is done on a claim.
+
+1. IO_CONFIG tilegrid. What: the xcku3p tilegrid, the map from tile names to
+   absolute frame addresses, which IO_CONFIG needs. Why: IO_CONFIG is the
+   largest blocked block (55 bits). Done when: IO_CONFIG reads green on both
+   designs with no other block regressed. Status: blocked. No tilegrid exists
+   in any public source, and the device file says HPIO_L, not HPIO_RIGHT.
+   Unblocker: the Q6 Vivado probe (see the license section).
+2. BRAM golden design. What: a design that uses block RAM, plus the
+   whole-array INIT to per-word INIT translation the DB expects. Why: BRAM
+   content and parity have never been exercised. Done when: BRAM_CONTENT and
+   BRAM_PARITY read green. Status: not started.
+3. DSP48E2, URAM288, CLK encodings. What: the configuration-bit encodings for
+   DSP slices, URAM, and clocking. Why: no design using them can ever match
+   Vivado without them. Done when: each block reads green. Status: blocked,
+   needs Vivado fuzzing (license).
+4. LUTRAM table. What: the bit locations for LUT RAM. Why: LUTRAM designs
+   cannot be encoded without it. Done when: LUTRAM reads green, or it is
+   proven that only Vivado logic-location data can supply the table. Status:
+   blocked, no public table exists.
+5. CARRY8 harness block. What: CARRY8 as its own block in the harness
+   registry and the FASM classifier. Why: CARRY8 bits must never be folded
+   into LUT_INIT or any other block. Done when: the block exists and reports
+   green/red on designs that use CARRY8. Status: ruled, not implemented.
+6. xcvu3p frame-total gap. What: our computed frame total is 73,035 against
+   UG570 Table 1's 71,820. Why: the xcvu3p device file cannot be trusted
+   until the gap is explained. Done when: resolved by Vivado confirmation.
+   Status: open, flagged provisional, never tuned away.
+7. Random-design generator and the 100-design loop. What: a seeded generator
+   producing random valid FASM designs covering every block, plus the harness
+   loop that diffs them. Why: 2 toy designs prove almost nothing; 100 random
+   designs prove the pipeline. Done when: 100/100 green at tier 1. Status:
+   not started.
+8. Tier 2 Vivado diff. What: a zero diff against real Vivado bitstreams for
+   the same 100 designs. Why: tier 1 is public data; only tier 2 proves
+   Vivado-equivalence. Done when: 100/100 green at tier 2. Status: never run,
+   license checkout unverified.
+9. End-to-end flow. What: Verilog in, bitstream out. ROUTE, a real WireDb,
+   the router-to-PIP translator, real pack/place, and a real timing DB. Why:
+   the pipeline currently takes hand-written FASM in; no real design can flow
+   through it. Done when: a Verilog design flows to a bitstream through
+   Helion on this part. Status: ROUTE fails loud, WireDb empty, translator
+   not written, pack/place are staging code.
+10. Synthesis quality. What: a netlist as good as Vivado's. The K=4 mapper
+    repair, Carry4 adder inference, BRAM inference, the picorv32 frontend
+    loop, the cv32e40p gaps. Why: a perfect bitgen that faithfully encodes a
+    bad netlist still produces a bad design. Done when: the QoR scoreboard
+    (currently 23 red, 13 green vs Yosys on 36 designs) is green against
+    Vivado. Status: open, owned by the QoR campaign, not this crew.
+11. Bitstream details. What: the preamble registers Vivado writes, the exact
+    ending sequence, the frame-0 CRC state, the last-of-row 2-zero-padding
+    path, the all-zero-value parse limit. Why: each is a place where our
+    bitstream can differ from Vivado's without any block noticing. Done when:
+    each is observed from a real Vivado bitstream or proven correct. Status:
+    preamble not emitted on purpose (values unknown), ending mirrored from
+    7-series, frame-0 CRC derived by linear algebra, padding never exercised.
+12. Harness speed. What: make the diff loop fast. Why: a full run takes
+    about 9 minutes for 2 designs, mostly walking 16.5 MB bitstreams; the
+    100-design loop needs it faster. Done when: a 2-design run is a few
+    minutes at most. Status: open, performance only, outputs are correct.
+
 ## What is proven (tier 1: zero diff vs public segbits DBs)
 
 Base tip `060b230`: `cargo test -j2 -p helion-ultrascale` gives 153 passed,
