@@ -283,10 +283,14 @@ Tailscale on the Mac, or lock the Mac / let it sleep.
 Vivado 2017.3 lives on the USF cluster, host sc.rc.usf.edu, login
 srivastava1. The sandbox cannot reach it (campus / VPN only). The license
 server is 27000@license2.forest.usf.edu. It refused connections from Oct 22
-through Nov 7, 2026, then answered on Nov 8 at about 10:30 EST (first time
-since Oct 22). A real license checkout is still unverified: no lmutil or
-Vivado exists on this VM. Never claim Vivado-equivalence without a real
-Vivado bitstream diff at zero.
+through Nov 7, 2026. On Nov 8 at about 10:30 EST the port appeared to
+answer, but that finding was proven VOID later the same day (about 13:30
+EST): a control test showed direct TCP connects from this VM succeed to
+every port, including known-closed ones (license2:1, example.com:81), so
+the sandbox gateway accepts the handshake and the check proves nothing
+about the license server. The license state is UNKNOWN. A real license
+checkout is still unverified: no lmutil or Vivado exists on this VM. Never
+claim Vivado-equivalence without a real Vivado bitstream diff at zero.
 
 The Q6 Vivado probe is the unblocker for the UltraScale+ tilegrid. It is a
 Tcl probe that runs on the cluster: step 1, tile inventory (extract_device_
@@ -403,10 +407,17 @@ examples/zedboard_static.sv. Do not commit them without the user's word.
   then.
 - Nov 7, 2026: UltraScale+ bitgen crew launched. LUT/FF/INT green tier 1.
 - Nov 8, 2026: FRAMING green formal (SRVAL fix, critic 15 PASS); INT
-  column rule corrected (critic 16 PASS); license port 27000 answered for
-  the first time since Oct 22; the user ordered fix-everything plus a
+  column rule corrected (critic 16 PASS); the user ordered fix-everything plus a
   100-design driver (cron bitgen-100-driver, hourly); focus shifted to the
   ZedBoard; everything saved and pushed to GitHub; the user handed the
   coding work to Muse Code and ordered this handoff; the Tailscale setup
   went through two diagnosis rounds (Remote Login off, then Remote Login on
   but still failing, firewall or Tailscale SSH now suspected).
+- Nov 8, 2026, about 13:30 EST: correction, the license-port finding is
+  void (see the license section). The bitgen-100 driver run at 12:27 EST
+  spawned orchestrator session 15 for the BRAM golden design; it stopped
+  on a cron timeout with uncommitted changes (bitgen.rs BRAM emit branch,
+  tests/bram_emit.rs) and a compile error E0027 in tests/bram_emit.rs:226,
+  zero commits, nothing green. Resume order: fix the E0027 pattern (one
+  line), re-run the bram_emit tests, commit the golden files, then run
+  the harness and request the critic.
