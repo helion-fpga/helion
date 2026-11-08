@@ -907,6 +907,43 @@ impl<'a> RouteQuery for XDevice<'a> {
         };
         static_line(&hclk, &hclk_type, "ENABLE_BUFFER.HCLK_CK_BUFHCLK8")?;
         static_line(&cmt, &cmt_type, "HCLK_CMT_CK_BUFHCLK8_USED")?;
+        // CMT input side: the clock input corridor crosses the
+        // HCLK_CMT tile through MUX_CLK_0 (routed as a normal pip on
+        // the input net), and the CCIO input is marked active and
+        // used. One HCLK_CMT tile per clock row: take the one in the
+        // HROW tile's row, and fail loudly on anything else.
+        let mut cmt_in: Vec<String> = Vec::new();
+        for ti in 0..self.device.tile_count() {
+            if self.device.tile_type_name(ti).unwrap_or("") != "HCLK_CMT" {
+                continue;
+            }
+            let Some(name) = self.tile_name(ti) else {
+                continue;
+            };
+            if !name.ends_with(row_suffix.as_str()) {
+                continue;
+            }
+            if !cmt_in.contains(&name.to_string()) {
+                cmt_in.push(name.to_string());
+            }
+        }
+        if cmt_in.len() != 1 {
+            return Err(err(format!(
+                "expected exactly one HCLK_CMT tile in row {row}, found {}: {}",
+                cmt_in.len(),
+                cmt_in.join(", ")
+            )));
+        }
+        let cmt_in_type = self
+            .device
+            .tile_type_name(
+                self.tile_idx(&cmt_in[0])
+                    .ok_or_else(|| err(format!("no tile index for {}", cmt_in[0])))?,
+            )
+            .ok_or_else(|| err(format!("no tile type for {}", cmt_in[0])))?
+            .to_string();
+        static_line(&cmt_in[0], &cmt_in_type, "HCLK_CMT_CCIO0_ACTIVE")?;
+        static_line(&cmt_in[0], &cmt_in_type, "HCLK_CMT_CCIO0_USED")?;
         Ok(spine)
     }
 }
@@ -1108,7 +1145,7 @@ mod tests {
             tiles.contains(&("CLK_BUFG_REBUF_X87Y65", "GCLK0_ENABLE_ABOVE")),
             "missing upward reach, got {statics:?}"
         );
-        assert_eq!(statics.len(), 10, "extra enables, got {statics:?}");
+        assert_eq!(statics.len(), 12, "extra enables, got {statics:?}");
         // Unknown site fails loudly.
         assert!(xdev.bufg_spine("BUFGCTRL_X99Y99").is_err());
     }
@@ -1212,6 +1249,30 @@ mod tests {
                 && f == "HCLK_CMT_CK_BUFHCLK8_USED"),
             "missing CMT USED, got {statics:?}"
         );
+    }
+
+    #[test]
+    fn bufg_spine_cmt_ccio() {
+        let (dev, maps) = test_z020();
+        let xdev = XDevice::new(dev, maps.clone());
+        let spine = xdev
+            .bufg_spine("BUFGCTRL_X0Y0")
+            .expect("spine for BUFGCTRL_X0Y0");
+        // Vivado ground truth (ZB-10 same-RTL oracle): the clock input
+        // corridor crosses the single HCLK_CMT tile through MUX_CLK_0
+        // (already routed), and the CCIO0 input is marked active and
+        // used. Both features are single oracle-1 bits, so no ghost
+        // check applies.
+        let mut statics = spine.statics.clone();
+        statics.sort();
+        for feat in ["HCLK_CMT_CCIO0_ACTIVE", "HCLK_CMT_CCIO0_USED"] {
+            assert!(
+                statics
+                    .iter()
+                    .any(|(t, f)| t == "HCLK_CMT_X8Y26" && f == feat),
+                "missing static {feat}, got {statics:?}"
+            );
+        }
     }
 
     #[test]
