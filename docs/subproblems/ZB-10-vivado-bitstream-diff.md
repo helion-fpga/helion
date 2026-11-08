@@ -130,8 +130,37 @@ Record in /tmp/x7/blinky_reg_diff2.json. The BUFGCTRL config block
 is zero differing bits. Remaining, in order of attack:
 
 1. Clock input/output routing (router): input-mux pips
-   CK_MUXED0/IMUX24_0/IMUX28_0, output pip BUFGCTRL0_O to GCLK0,
-   REBUF enables. Helion detours through GFAN/GCLK instead.
+   CK_MUXED0/IMUX24_0/IMUX28_0 DONE via general BFS (third run);
+   still open: output pip BUFGCTRL0_O to GCLK0, REBUF enables.
 2. HCLK region buffers (new gap, needs a file).
 3. ZB-04 carry chain vs LUT counter.
 4. Placement-freedom routing (needs canonicalised comparison).
+
+## Third run (Nov 8, 2026, Mac, input routing fix)
+
+route.rs routes IBUF to BUFG through general BFS pips instead of
+the bitless ClockSpine case. Result: 4,732 (record
+/tmp/x7/blinky_reg_diff3.json). The BFS found Vivado's exact input
+corridor: input-mux bit plus 4 HROW/CMT input bits matched, zero
+new ours-bits. All ref-side BUFG/REBUF bits still open at this
+point: O to GCLK0 pip, REBUF enables and stitch.
+
+## Fourth run (Nov 8, 2026, Mac, spine stitching)
+
+New BufgSpine path (xdevice + route + emit): O exit to GCLK0,
+TOP to BOT stitch conducted downward, REBUF ENABLE_ABOVE/BELOW
+following entry-plus-edge-feed pattern. Pinned by unit test
+bufg_spine_paths. Result: 4,726 (record
+/tmp/x7/blinky_reg_diff4.json, JSON in
+/tmp/x7/blinky_reg_diff5.json after the stitch flip). Every
+ref-side BUFG/REBUF bit now matches. Remaining BUFG-tile diffs
+are 10 Helion-only tie-off clusters: Vivado ties off with zero
+bits in these frames (its tie-off selections unknown).
+
+## HCLK verdict (Nov 8, 2026, Mac): BLOCKED on new fuzzing
+
+Vivado's HCLK word-50 bits verified by hand (tile HCLK_R_X175Y26,
+offset 23, bits 0/4/5/6) against segbits_hclk_r.db: the file
+covers frames 00 to 05 only, the tile has 26 frames. Row-buffer
+bits are outside public data. All ~350 UNNAMED bits trace to this
+class. Needs Vivado fuzzing (license). Not grindable further here.
