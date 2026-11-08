@@ -46,8 +46,10 @@ for the same design). A design counts only when green at both tiers.
 ## What was tried and what failed
 
 - Nothing tried. No real Vivado bitstream has ever been diffed against a
-  Helion bitstream on this part. The license was down for 17 days, then
-  the port answered, but no checkout has been proven.
+  Helion bitstream on this part. The license was down for 17 days (Oct 22
+  through Nov 7, by connection-refused checks). A Nov 8 "port answered"
+  report was later proven void by a control test, so the license state is
+  unknown, and no checkout has been proven.
 
 ## What to do
 
