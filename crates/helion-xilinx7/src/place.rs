@@ -254,6 +254,45 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         }
     }
 
+    // 2d2. Carry co-placement slots (ZB-04): each used carry bit reserves
+    // its BEL letter in its slice; the O-driven FF and the S-driving LUT
+    // of bit j take letter j in the carry slice, so S/DI/O stay
+    // site-internal. Unused letters of partial groups stay open for
+    // generic fill. LUT and FF BELs are distinct, so slots track by class.
+    let packed_carry_by_name: HashMap<&str, &PackedCarry> = packed
+        .carries
+        .iter()
+        .map(|c| (c.name.as_str(), c))
+        .collect();
+    // BEL occupancy per site: site -> letters used.
+    let mut site_bels: HashMap<String, HashSet<char>> = HashMap::new();
+    // Allocate a (tile, site, BEL-letter), reusing a slice with free BELs
+    // before opening a new one.
+    let mut site_tile: HashMap<String, String> = HashMap::new();
+    let mut o_slot: HashMap<&str, (String, String, char)> = HashMap::new();
+    let mut s_slot: HashMap<&str, (String, String, char)> = HashMap::new();
+    for pc in &out.carries {
+        let Some(packed_c) = packed_carry_by_name.get(pc.name.as_str()) else {
+            continue;
+        };
+        site_bels.entry(pc.site.clone()).or_default();
+        site_tile.insert(pc.site.clone(), pc.tile.clone());
+        for j in 0..4 {
+            let letter = BEL_LETTERS[j];
+            if packed_c.o_nets[j].is_some() || packed_c.s_nets[j].is_some() {
+                site_bels.get_mut(&pc.site).unwrap().insert(letter);
+            }
+            if let Some(o) = &packed_c.o_nets[j] {
+                o_slot.insert(o.as_str(), (pc.tile.clone(), pc.site.clone(), letter));
+            }
+            if let Some(s) = &packed_c.s_nets[j] {
+                s_slot.insert(s.as_str(), (pc.tile.clone(), pc.site.clone(), letter));
+            }
+        }
+    }
+    let mut carry_lut_slots: HashSet<(String, char)> = HashSet::new();
+    let mut carry_ff_slots: HashSet<(String, char)> = HashSet::new();
+
     // 3. Pair FFs with their driving LUTs (FF.D == LUT.O) into one slice.
     let lut_by_output: HashMap<&str, usize> = packed
         .luts
@@ -262,12 +301,10 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         .map(|(i, l)| (l.output_net.as_str(), i))
         .collect();
     let mut lut_placed: HashSet<usize> = HashSet::new();
-    // BEL occupancy per site: site -> letters used.
-    let mut site_bels: HashMap<String, HashSet<char>> = HashMap::new();
 
     // Allocate a (tile, site, BEL-letter), reusing a slice with free BELs
-    // before opening a new one.
-    let mut site_tile: HashMap<String, String> = HashMap::new();
+    // before opening a new one. (site_bels/site_tile were declared with
+    // the carry slots above so carry slices join the same occupancy map.)
     let alloc = |used: &mut HashSet<String>,
                      site_bels: &mut HashMap<String, HashSet<char>>,
                      site_tile: &mut HashMap<String, String>,
@@ -291,6 +328,23 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
     };
     for (fi, ff) in packed.ffs.iter().enumerate() {
         let _ = fi;
+        // Carry-driven FF: same slice and letter as its carry bit, so the
+        // O-to-D path stays site-internal. A double-booked slot fails loud.
+        if let Some((tile, site, letter)) = o_slot.get(ff.d_net.as_str()) {
+            if !carry_ff_slots.insert((site.clone(), *letter)) {
+                return Err(format!(
+                    "place: FF {} collides on {site}.{letter}FF in carry slice",
+                    ff.name
+                ));
+            }
+            out.ffs.push(PlacedFf {
+                name: ff.name.clone(),
+                tile: tile.clone(),
+                site: site.clone(),
+                bel: format!("{letter}FF"),
+            });
+            continue;
+        }
         // Find driving LUT, if any, and not yet placed.
         let lut_idx = lut_by_output.get(ff.d_net.as_str()).copied().filter(|i| !lut_placed.contains(i));
         let (tile, site, letter) = alloc(&mut used_sites, &mut site_bels, &mut site_tile, device)?;
@@ -318,6 +372,25 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
     // Remaining unpaired LUTs.
     for (li, lut) in packed.luts.iter().enumerate() {
         if lut_placed.contains(&li) {
+            continue;
+        }
+        // S-driving LUT: same slice and letter as its carry bit, so the
+        // LUT-O-to-S path stays site-internal. Shares the letter with the
+        // bit FF (LUT and FF BELs are distinct); two LUTs on one slot fail.
+        if let Some((tile, site, letter)) = s_slot.get(lut.output_net.as_str()) {
+            if !carry_lut_slots.insert((site.clone(), *letter)) {
+                return Err(format!(
+                    "place: LUT {} collides on {site}.{letter}6LUT in carry slice",
+                    lut.name
+                ));
+            }
+            out.luts.push(PlacedLut {
+                name: lut.name.clone(),
+                init: lut.init,
+                tile: tile.clone(),
+                site: site.clone(),
+                bel: format!("{letter}6LUT"),
+            });
             continue;
         }
         let (tile, site, letter) = alloc(&mut used_sites, &mut site_bels, &mut site_tile, device)?;
@@ -488,6 +561,66 @@ mod tests {
         assert_eq!(sites, vec!["SLICE_X0Y0", "SLICE_X1Y0", "SLICE_X0Y1"]);
         let names: Vec<&str> = placed.carries.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["u_c0", "u_c1", "u_c2"]);
+    }
+
+    /// Carry co-placement: each bit FF (D from carry O) and each S-LUT (O
+    /// to carry S) take their bit letter in the carry slice. The head
+    /// CYINIT one-LUT places generically.
+    #[test]
+    fn place_carry_ff_and_slut_share_carry_slice() {
+        let mut p = packed_blinky();
+        p.carries = vec![
+            packed_carry("u_c0", "one", Some("co0")),
+            packed_carry("u_c1", "co0", None),
+        ];
+        // Full group 0 (bits 0-3) + partial group 1 (bits 0-1).
+        for j in 0..4 {
+            p.carries[0].o_nets[j] = Some(format!("o{j}"));
+            p.carries[0].s_nets[j] = Some(format!("s{j}"));
+        }
+        for j in 0..2 {
+            p.carries[1].o_nets[j] = Some(format!("o{}", 4 + j));
+            p.carries[1].s_nets[j] = Some(format!("s{}", 4 + j));
+        }
+        for j in 0..6 {
+            p.ffs.push(PackedFf {
+                name: format!("u_ff{j}"),
+                d_net: format!("o{j}"),
+                q_net: format!("q{j}"),
+                clk_net: "clk_bufg".into(),
+                ce_net: None,
+                sr_net: None,
+            });
+            p.luts.push(PackedLut {
+                name: format!("u_s{j}"),
+                init: 0xFFFF_FFFF_0000_0000,
+                input_nets: [None, None, None, None, None, Some(format!("q{j}"))],
+                output_net: format!("s{j}"),
+            });
+        }
+        p.luts.push(PackedLut {
+            name: "u_one".into(),
+            init: u64::MAX,
+            input_nets: [None, None, None, None, None, None],
+            output_net: "one".into(),
+        });
+        let placed = place(&p, &FakeDevice).unwrap();
+        let ff = |n: &str| placed.ffs.iter().find(|f| f.name == n).unwrap();
+        let lut = |n: &str| placed.luts.iter().find(|l| l.name == n).unwrap();
+        // Bit j takes BEL letter j in the group slice.
+        assert_eq!((ff("u_ff0").site.as_str(), ff("u_ff0").bel.as_str()), ("SLICE_X0Y0", "AFF"));
+        assert_eq!((ff("u_ff3").site.as_str(), ff("u_ff3").bel.as_str()), ("SLICE_X0Y0", "DFF"));
+        assert_eq!((ff("u_ff4").site.as_str(), ff("u_ff4").bel.as_str()), ("SLICE_X1Y0", "AFF"));
+        assert_eq!((ff("u_ff5").site.as_str(), ff("u_ff5").bel.as_str()), ("SLICE_X1Y0", "BFF"));
+        assert_eq!((lut("u_s0").site.as_str(), lut("u_s0").bel.as_str()), ("SLICE_X0Y0", "A6LUT"));
+        assert_eq!((lut("u_s2").site.as_str(), lut("u_s2").bel.as_str()), ("SLICE_X0Y0", "C6LUT"));
+        assert_eq!((lut("u_s4").site.as_str(), lut("u_s4").bel.as_str()), ("SLICE_X1Y0", "A6LUT"));
+        // No S/FF cell spilled to a foreign slice.
+        for f in &placed.ffs {
+            if f.name.starts_with("u_ff") {
+                assert!(f.site == "SLICE_X0Y0" || f.site == "SLICE_X1Y0", "{}", f.site);
+            }
+        }
     }
 
     /// A carry cycle has no head: fail loudly instead of scattering.
