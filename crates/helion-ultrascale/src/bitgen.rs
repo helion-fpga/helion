@@ -840,7 +840,16 @@ fn bram_array_value_bits(
 
 /// Write one frame bit, failing loud on overflow, an out-of-range bit
 /// offset, or a conflicting earlier write. Shared by the segbits path
-/// and the BRAM path so the two cannot drift apart.
+/// and the BRAM path so the two cannot drift apart. The bit is always
+/// recorded in `written` (conflict detection); the frame entry is
+/// materialized only when `materialize` is true. The segbits path
+/// passes true (its old behaviour: every listed ref materializes its
+/// frame). The BRAM path passes `want`: a whole-array line lists
+/// 16384 dense bits, and materializing all 256 zero minors would put
+/// zero frames in the frameset that no config order needs to list
+/// (emit_bitstream already emits untouched config-order frames as
+/// zeros, and a zero frame outside a stub config order fails loud
+/// with FrameNotInConfigOrder).
 fn write_frame_bit(
     frames: &mut BTreeMap<u32, FrameWords>,
     written: &mut HashMap<(u32, u16), bool>,
@@ -850,6 +859,7 @@ fn write_frame_bit(
     frame: u32,
     bit: u16,
     want: bool,
+    materialize: bool,
 ) -> Result<(), BitgenError> {
     if bit as usize >= FRAME_BITS {
         return Err(BitgenError::BadFar {
@@ -872,6 +882,9 @@ fn write_frame_bit(
         }
     }
     written.insert((far, bit), want);
+    if !materialize {
+        return Ok(());
+    }
     let words = frames.entry(far).or_insert([0u32; FRAME_WORDS]);
     let slot = &mut words[(bit / 32) as usize];
     if want {
@@ -953,6 +966,7 @@ pub fn emit_frames(
                         frame,
                         placed_bit.frame_ofst as u16,
                         placed_bit.value,
+                        placed_bit.value,
                     )?;
                 }
                 continue;
@@ -1026,6 +1040,7 @@ pub fn emit_frames(
                 r.frame,
                 r.bit,
                 want,
+                true,
             )?;
         }
     }
