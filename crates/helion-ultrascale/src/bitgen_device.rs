@@ -19,22 +19,30 @@
 //!   column). `tile_base_far` is therefore
 //!   `Far(ClbIoClk, row_major, col_major, 0)`.
 //! - INT tiles (`INT_X<x>Y<r>`, r the FAR row): PROVISIONAL rule,
-//!   the same rule the diff harness reference uses
-//!   (`harness/reference.py`, `INT_COL_OFFSET_FROM_CLB = -1`,
-//!   xczu3eg-derived): INT column major = CLB column major - 1.
+//!   tile-type dependent, the same rule the diff harness reference
+//!   uses (`harness/reference.py`, `int_col_offset_from_clb`,
+//!   xczu3eg-derived): CLEL_R columns take INT column major =
+//!   CLB column major - 1; CLEL_L, CLEM, and CLEM_R columns take
+//!   CLB column major + 1. Two independent public sources agree
+//!   on the split: the xczu3eg tilegrid geometry (prjuray-db,
+//!   `~/workspace/ultra-bitgen-crew/BRIEFS/tilegrid-research.md`
+//!   Q5.2) and the xcku3p device-file minors table (Q5.3: 52 CLB
+//!   columns have a 76-minor left neighbour, all CLEL_R; 61 have
+//!   one on the right, all other CLB types; 0 overlap, 0 neither).
 //!   The device file confirms the rule where the golden exercises
 //!   it: INT_X0Y0 resolves to major 4, which carries exactly 76
 //!   minors, the INT segbits frame span (vendored
 //!   `segbits_int.db`, frames 0..75). The rule is validated, not
 //!   assumed: an INT tile resolves only when its rule-derived
 //!   column carries at least 76 minors; otherwise `tile_base_far`
-//!   and `tile_type` return `None` (fail loud). On xcku3p the
-//!   rule is invalid for 61 of 113 CLB columns per row (the second
-//!   CLB of each pair, whose left neighbour is another CLB
-//!   column, not an INT column); those INT tiles do not resolve.
-//!   The xcku3p tilegrid is the arbiter: when it lands, this rule
-//!   is replaced by ground truth. Until then, INT placement is
-//!   absolute-provisional, exactly as the harness flags it.
+//!   and `tile_type` return `None` (fail loud). On xcku3p every
+//!   CLB column resolves (113 per row); on xcvu3p the tail CLB
+//!   columns 113..117 resolve to no 76-minor neighbour and do
+//!   not resolve. The +1 side has never been exercised by a
+//!   golden (every golden INT line is INT_X0Y0 on CLEL_R column
+//!   0), so INT placement stays absolute-provisional until the
+//!   xcku3p tilegrid lands, which is the arbiter that replaces
+//!   this rule with ground truth.
 //! - RAMB18 tiles (`RAMB18_X<x>Y<y>`, y absolute 18K Y): ground
 //!   truth from the device file (BRAM content column major, 24
 //!   18K blocks per column), tile type `BRAM` (the device file's
@@ -142,13 +150,15 @@ fn slr_row_for_y(device: &DeviceFile, y: u32, per_column: u32) -> Option<(&str, 
     None
 }
 
-/// INT column major for a CLB column, by the provisional rule (CLB
-/// column major - 1, harness `reference.py`), validated against the
-/// device file: the rule-derived column must carry at least
-/// `INT_FRAME_SPAN` minors. Returns the SLR name and the INT column
-/// major, or `None` when the tile does not resolve (unknown row,
-/// unknown CLB column, or the rule points at a column too short to
-/// hold INT frames).
+/// INT column major for a CLB column, by the provisional
+/// tile-type-dependent rule (CLEL_R: CLB column major - 1; every
+/// other CLB tile type: CLB column major + 1, harness
+/// `reference.py`), validated against the device file: the
+/// rule-derived column must carry at least `INT_FRAME_SPAN`
+/// minors. Returns the SLR name and the INT column major, or
+/// `None` when the tile does not resolve (unknown row, unknown
+/// CLB column, or the rule points at a column too short to hold
+/// INT frames).
 fn int_col_major(device: &DeviceFile, clb_x: u32, row_major: u32) -> Option<(&str, u32)> {
     for slr in device.slr_names() {
         let rows = device.row_majors(slr).ok()?;
@@ -156,7 +166,14 @@ fn int_col_major(device: &DeviceFile, clb_x: u32, row_major: u32) -> Option<(&st
             continue;
         }
         let clb_major = device.clb_col_major(slr, row_major, clb_x).ok()?;
-        let int_major = clb_major.checked_sub(1)?;
+        let tile_type = device.clb_tile_type(slr, row_major, clb_x).ok()?;
+        // CLEL_R columns are served by the INT column on the left;
+        // CLEL_L, CLEM, and CLEM_R columns by the one on the right.
+        let int_major = if tile_type == "CLEL_R" {
+            clb_major.checked_sub(1)?
+        } else {
+            clb_major.checked_add(1)?
+        };
         let minors = device.num_minors_per_std_col_major(slr, row_major).ok()?;
         let n = *minors.get(int_major as usize)?;
         if n >= INT_FRAME_SPAN {
