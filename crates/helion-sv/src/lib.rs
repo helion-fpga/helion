@@ -16264,13 +16264,25 @@ fn emit_carry_increment(
     w: usize,
 ) {
     let groups = w.div_ceil(4);
+    // I5-only O6 passthrough (golden S-LUT INIT 0xffffffff00000000): O
+    // follows bit 5 of the LUT input word; L1 mystery inputs fold to zero.
+    const S_LUT_INIT: u64 = 0xFFFF_FFFF_0000_0000;
     let one = format!("u_carry_{lhs}_one");
     d.add_cell(&one, CellKind::Lut6 { init: u64::MAX });
     d.connect(&one, &one, "O");
+    // A pad sits between compute groups c_k and c_{k+1} for 1 <= k <= n-3
+    // (never after the head, never before the tail): the backend walks the
+    // linkage in strict alternation, so pads land on the skipped X1 slots
+    // exactly like the golden transparent pads (X1@Y40-43: S=0 gives
+    // CO=CY, no FFs, unconnected I5 reads low). Fewer than 4 groups need
+    // no pads (every step stays adjacent).
+    let pad_after = |k: usize| k >= 1 && k + 3 <= groups;
     for g in 0..groups {
         let base = g * 4;
         let cin = if g == 0 {
             one.clone()
+        } else if pad_after(g - 1) {
+            format!("u_carry_{lhs}_pco{}", g - 1)
         } else {
             format!("u_carry_{lhs}_co{}", g - 1)
         };
@@ -16288,10 +16300,20 @@ fn emit_carry_increment(
                 d.connect(format!("u_carry_{lhs}_o{}", base + j), &cname, format!("O{j}"));
             }
         }
+        if pad_after(g) {
+            let pname = format!("u_carry_{lhs}_pad{g}");
+            d.add_cell(&pname, CellKind::Carry4);
+            d.connect(format!("u_carry_{lhs}_co{g}"), &pname, "CI");
+            d.connect(format!("u_carry_{lhs}_pco{g}"), &pname, "CO");
+            for j in 0..4 {
+                let ps = format!("u_carry_{lhs}_ps{g}_{j}");
+                d.connect(&ps, &pname, format!("S{j}"));
+                let slut = format!("u_carry_{lhs}_ps{g}_{j}_lut");
+                d.add_cell(&slut, CellKind::Lut6 { init: S_LUT_INIT });
+                d.connect(&ps, &slut, "O");
+            }
+        }
     }
-    // I5-only O6 passthrough (golden S-LUT INIT 0xffffffff00000000): O
-    // follows bit 5 of the LUT input word; L1 mystery inputs fold to zero.
-    const S_LUT_INIT: u64 = 0xFFFF_FFFF_0000_0000;
     for i in 0..w {
         let bit = bit_name(lhs, w, i);
         let s = format!("u_carry_{lhs}_s{i}");

@@ -286,7 +286,7 @@ fn blinky_reg_carry_e2e_fasm() {
 
     let mut packed = pack(&design).expect("pack");
     assert_eq!(packed.ffs.len(), 26, "expected 26 FFs");
-    assert_eq!(packed.carries.len(), 7, "expected 7 carry groups");
+    assert_eq!(packed.carries.len(), 11, "expected 7 compute groups plus 4 pads");
     for iob in &mut packed.iobs {
         if iob.port == "LD0" {
             iob.loc = Some("T22".to_string());
@@ -303,20 +303,35 @@ fn blinky_reg_carry_e2e_fasm() {
         xdev.clock_nets.insert(b.out_net.clone());
     }
     let placed = place(&packed, &xdev).expect("place");
-    assert_eq!(placed.carries.len(), 7);
+    assert_eq!(placed.carries.len(), 11);
     assert_eq!(placed.carries[0].site, "SLICE_X113Y39", "anchor honored");
     assert_eq!(placed.carries[0].tile, "CLBLM_R_X71Y39", "golden head tile");
+    // Golden slice order: computes and pads strictly alternate from the
+    // head (X1@Y39, X0@Y40, X1@Y40, ... , X0@Y44, X1@Y44).
+    let sites: Vec<&str> = placed.carries.iter().map(|c| c.site.as_str()).collect();
+    assert_eq!(
+        sites,
+        vec![
+            "SLICE_X113Y39",
+            "SLICE_X112Y40", "SLICE_X113Y40",
+            "SLICE_X112Y41", "SLICE_X113Y41",
+            "SLICE_X112Y42", "SLICE_X113Y42",
+            "SLICE_X112Y43", "SLICE_X113Y43",
+            "SLICE_X112Y44", "SLICE_X113Y44",
+        ],
+        "golden slice order"
+    );
     let routed = route(&placed, &xdev).expect("route");
 
     let bs = emit_fasm(&routed, &xdev).expect("emit");
     let fasm_text = bs.fasm.join("\n");
     assert_eq!(fasm_text.matches("PRECYINIT.AX").count(), 1, "one chain head");
-    assert_eq!(fasm_text.matches("PRECYINIT.CIN").count(), 6, "six chained groups");
+    assert_eq!(fasm_text.matches("PRECYINIT.CIN").count(), 10, "six chained computes plus four pads");
     assert_eq!(fasm_text.matches("CARRY4.ACY0").count(), 1, "head bit A only");
     assert_eq!(
         fasm_text.matches("64'hFFFFFFFF00000000").count(),
-        25,
-        "25 S-LUT passthrough INITs"
+        41,
+        "25 compute plus 16 pad S-LUT passthrough INITs"
     );
     assert_eq!(fasm_text.matches("FFMUX.XOR").count(), 25, "chain FF D muxes");
     assert!(!fasm_text.contains("BCY0"), "no BCY0:\n{fasm_text}");
