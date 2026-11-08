@@ -25,9 +25,14 @@
   Decoded: unconnected reads LOW (elimination proof); X1@Y40-43
   pads transparent (S=0 gives CO=CY); head CYINIT=1 from X0-ALUT
   const-1 into AX; CO = S ? O5 : CY per site JSON (our DI-low sim
-  exact here). Open: S-input routing convergence, transparent pad
-  emission, head const-1 ALUT, general O5 eval in sim; HCLK waits
-  on license.
+  exact here).
+- Status: stage 4a pads (Nov 8, 2026, commit 1734c0c). Synth emits
+  transparent pads between compute groups (pad after c_k for
+  1 <= k <= n-3); backend walks them unchanged into golden slice
+  order (asserted). Sim proves transparency (70 cycles, 7 compute
+  plus 4 pads). Run nine: 1,264. Open: S-input routing
+  convergence, head const-1 ALUT, LD0-tail placement, general O5
+  eval in sim; HCLK waits on license.
 
 ## Goal
 
