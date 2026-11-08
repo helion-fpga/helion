@@ -1,0 +1,31 @@
+# golden FASM: counter on xcku3p
+# seed: 20261107
+# source: examples/counter.sv in the worktree (blinky: registered
+# inverter, led = q; counter: 4-bit incrementer, led = cnt[3]).
+# placement: all logic in SLICE_X0Y0 (xcku3p: row major 0, CLB column 0,
+# tile type CLEL_R per the BitFiltrator xcku3p device file).
+# PROVISIONAL: INT and HPIO tile coordinates below use the logical CLB
+# column index as the tile X, NOT a verified Vivado tile X. No xcku3p
+# tilegrid exists in any public DB yet. The PIP and IO feature strings
+# are verified to exist in prjuray-db segbits_int.db and
+# segbits_hpio_right.db. The route is the frozen chosen target, not a
+# Vivado-produced route. The harness resolves INT PIPs with the
+# xczu3eg-derived rule INT column major = CLB column major - 1,
+# flagged absolute-provisional in every record.
+SLICE_X0Y0.A6LUT.INIT[63:0] = 0x5555555555555555
+SLICE_X0Y0.B6LUT.INIT[63:0] = 0x6666666666666666
+SLICE_X0Y0.C6LUT.INIT[63:0] = 0x7878787878787878
+SLICE_X0Y0.D6LUT.INIT[63:0] = 0x7f807f807f807f80
+SLICE_X0Y0.AFF.INIT = 0
+SLICE_X0Y0.AFF.SRVAL = 0
+SLICE_X0Y0.BFF.INIT = 0
+SLICE_X0Y0.BFF.SRVAL = 0
+SLICE_X0Y0.CFF.INIT = 0
+SLICE_X0Y0.CFF.SRVAL = 0
+SLICE_X0Y0.DFF.INIT = 0
+SLICE_X0Y0.DFF.SRVAL = 0
+INT_X0Y0.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1
+INT_X0Y0.PIP.INT_NODE_GLOBAL_0_INT_OUT0.GCLK_B_0_0
+INT_X0Y0.PIP.IMUX_E0.INODE_E_5_FT1
+HPIO_RIGHT_X0Y0.IOB_X0Y0.IOSTANDARD_IN.LVCMOS12
+HPIO_RIGHT_X0Y0.IOB_X0Y1.IOSTANDARD_OUT.LVCMOS12_IDRIVE_I2_SLEW_SLEW_SLOW
