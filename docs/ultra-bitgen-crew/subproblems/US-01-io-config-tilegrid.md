@@ -67,7 +67,8 @@ evidence from a real Vivado probe or a public source, not a guess.
    vs HPIO_L); step 2, one row-0 HPIO tile base FAR plus frame count;
    step 3, the offset ruling. It cannot run from this VM; it needs Vivado
    on the cluster or a working license checkout (see the license section
-   in docs/HANDOFF.md; port 27000 answered Nov 8, checkout unverified).
+   in docs/HANDOFF.md; the Nov 8 "port answered" finding was proven void
+   the same day, license state unknown, checkout unverified).
 2. If step 1 says HPIO_RIGHT does not exist on xcku3p, stop and re-scope:
    IO_CONFIG needs an HPIO_L fuzzing campaign, and the goldens' HPIO_RIGHT
    lines need re-examination. Do not force the tilegrid to fit HPIO_RIGHT.

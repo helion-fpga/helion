@@ -27,10 +27,13 @@ for the same design). A design counts only when green at both tiers.
   disagrees with Vivado is a real bug.
 - The license history: the license server 27000@license2.forest.usf.edu
   refused connections from Oct 22 through Nov 7, 2026. On Nov 8 at about
-  10:30 EST the port answered (driver run twice, direct TCP check once,
-  still open at 11:09 EST). A real license checkout is still UNVERIFIED:
-  no lmutil or Vivado exists on this VM. A port answering is not a
-  checkout.
+  10:30 EST the port appeared to answer, but that finding was proven VOID
+  later the same day (about 13:30 EST): a control test showed direct TCP
+  connects from this VM succeed to every port, including known-closed ones
+  (license2:1, example.com:81), so the sandbox gateway accepts the
+  handshake and the check proves nothing about the license server. The
+  license state is UNKNOWN. A real license checkout is still UNVERIFIED:
+  no lmutil or Vivado exists on this VM.
 - Vivado 2017.3 lives on the USF cluster, host sc.rc.usf.edu, login
   srivastava1. The sandbox cannot reach it (campus / VPN only). The user
   was following up with the lab admin as of Oct 22, 2026.
