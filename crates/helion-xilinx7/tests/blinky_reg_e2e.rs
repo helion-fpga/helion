@@ -293,6 +293,10 @@ fn blinky_reg_carry_e2e_fasm() {
             iob.iostandard = "LVCMOS33".to_string();
         }
     }
+    // Convergence run: pin the chain head on the golden head slice
+    // (SLICE_X113Y39, tile CLBLM_R_X71Y39) so the first frames overlap
+    // the oracle and the diff measures encodings, not positions.
+    packed.carry_anchor = Some("SLICE_X113Y39".into());
 
     let mut xdev = XDevice::new(&device, node_maps);
     for b in &packed.bufgs {
@@ -300,6 +304,8 @@ fn blinky_reg_carry_e2e_fasm() {
     }
     let placed = place(&packed, &xdev).expect("place");
     assert_eq!(placed.carries.len(), 7);
+    assert_eq!(placed.carries[0].site, "SLICE_X113Y39", "anchor honored");
+    assert_eq!(placed.carries[0].tile, "CLBLM_R_X71Y39", "golden head tile");
     let routed = route(&placed, &xdev).expect("route");
 
     let bs = emit_fasm(&routed, &xdev).expect("emit");
@@ -347,4 +353,9 @@ fn blinky_reg_carry_e2e_fasm() {
     std::fs::create_dir_all(out.parent().unwrap()).ok();
     std::fs::write(&out, &bit).unwrap();
     println!("wrote {} ({} bytes)", out.display(), bit.len());
+    // Carry FASM artifact for the canonical (placement-independent) chain
+    // comparison against the golden decode.
+    let fasm_out = PathBuf::from("/tmp/x7/blinky_reg_carry.fasm");
+    std::fs::write(&fasm_out, &fasm_text).unwrap();
+    println!("wrote {} ({} lines)", fasm_out.display(), bs.fasm.len());
 }
