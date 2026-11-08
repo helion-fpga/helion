@@ -234,6 +234,19 @@ Next: S-input routing convergence (per-input IMUX mapping from INT
 pip decode) plus transparent pad emission, then the head const-1
 ALUT. HCLK UNNAMED still waits on the license.
 
+Clock-architecture note (Nov 8, 2026): the ref-only column bits are
+dominated by clock DISTRIBUTION (GFAN0/GFAN1/CLK0/CLK1 fanout per
+INT tile plus FFSYNC per FF), which our ClockSpine path never
+emits: our slice CLK arrivals are unconfigured (zero FFSYNC in our
+FASM), so no Helion bitstream can clock its FFs on silicon yet.
+Golden also uses a BUFHCE in the HROW tile that our spine lacks,
+and four GCLK branches (B0-B3) plus GCLK_B11 feed. Fixing arrival
+is a correctness stage of its own (route slice-CLK endpoints plus
+emit FFSYNC and the per-tile fanout), ahead of any hardware blink
+claim. Reader note: work/carrysim.py docstring quotes a stale
+X0-ALUT value; live reads agree with the raw-word decode, and the
+INIT index padding (`INIT[00]`) explains the apparent reader gap.
+
 ## Ninth run (Nov 8, 2026, Mac, pads)
 
 Same anchored carry pair with transparent pads (commit 1734c0c):
