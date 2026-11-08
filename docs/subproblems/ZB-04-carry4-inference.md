@@ -82,40 +82,45 @@ contain PRECYINIT plus the ACY0/BCY0/CCY0/DCY0 mux bits for those cells.
   docs/zedboard-handoff/findings/blinky_chain_golden.txt (Nov 8,
   2026).
 
-## Golden chain (decoded Nov 8, 2026 from GT-blinky.bit)
+## Golden chain (decoded Nov 8, 2026 from GT-blinky.bit, verified v2)
 
-Vivado's 25-bit counter plus registered LD0 (26 flops) in
-CLBLM_R_X71, rows Y39 to Y45. Every used FF: ZINI+ZRST set,
-FFMUX.CY and FFMUX.XOR both set, FFSYNC set (FFSYNC is a ZB-03
-gap: unimplemented). Every chain LUT: INIT 0xffffffff00000000,
-except the entry slice (below).
+Method warning that bit the first decode: CLBLM tiles share 36
+frames, 2 words per tile. Any decode that sweeps whole frames per
+tile smears neighbors (it invented 46 FFs and FFMUX.CY bits).
+The v2 decoder restricts to the tile's own words and requires
+full segbits term sets; scripts archived in
+docs/zedboard-handoff/findings/ (chain_golden.py, carry_census.py,
+blinky_chain_golden.txt). Device-wide census: exactly 12 chained
+halves, all in X71Y39-Y45 (utilization reports 13 CARRY4, off by
+one, unexplained, recorded below).
 
-- Y39 entry: SLICEL_X1 PRECYINIT.AX + CARRY4.ACY0; ALUT
-  0xff00ff0000000000, BLUT/CLUT/DLUT 0xffffffff00000000.
-  SLICEM_X0 ALUT 0x0f0f0f0f0f0f0f0f, other LUTs
-  0xffffffff00000000; 4 FFs, FFSYNC, no PRECYINIT, no CARRY4 mux
-  bit on M0.
-- Y40-Y43: both halves PRECYINIT.CIN, all LUTs
-  0xffffffff00000000, 8 FFs each, FFSYNC on M0.
-- Y44: SLICEL_X1 PRECYINIT.CIN with DFF only (bit 24);
-  SLICEM_X0 PRECYINIT.CIN with 4 FFs; FFSYNC both halves.
-- Y45: SLICEM_X0 AFF only (the LD0 output FF), PRECYINIT.CIN,
-  FFSYNC, ALUT 0xffffffff00000000, AFFMUX.CY set (D fed from
-  carry, not fabric).
-- Chained cells need no ACY0/BCY0/CCY0/DCY0 (only the AX entry
-  sets ACY0); no INIT_OUT, CEUSEDMUX, SRUSEDMUX anywhere.
+Vivado's 25-bit counter plus registered LD0 is exactly 26 FFs:
+
+- Y39-Y43: SLICEM_X0 holds 4 FFs each (bits 0-23); SLICEL_X1
+  holds NO FFs. Y44: SLICEM_X0 4 FFs plus SLICEL_X1 DFF (bit
+  24). Y45: SLICEM_X0 AFF only (LD0). Total 20+5+1 = 26.
+- Every used FF: ZINI+ZRST set, FFMUX.XOR set (only XOR, never
+  CY), FFSYNC set (FFSYNC is a ZB-03 gap: unimplemented).
+- Every chain LUT: INIT 0xffffffff00000000, except entry:
+  SLICEL_X1.ALUT 0xff00ff0000000000, SLICEM_X0.ALUT
+  0x0f0f0f0f0f0f0f0f (Y39).
+- PRECYINIT: SLICEL_X1 AX at Y39 then CIN Y40-Y44; SLICEM_X0
+  CIN Y40-Y45. M0(Y39) and both halves of Y38/Y46 read C0, which
+  is the all-clear default (no chain there).
+- Only one CARRY4 mux bit in the repo: ACY0 at the AX entry.
+  No INIT_OUT, CEUSEDMUX, SRUSEDMUX anywhere.
 
 Open questions (do not guess; trace before implementing):
 
-- M0(Y39) carry source: 4 FFs with FFMUX.CY but no PRECYINIT
-  and no CARRY4 mux bit. Needs net-level tracing (which nets
-  drive its S/DI) before choosing the entry model.
-- FFMUX.CY+XOR both set on every FF: reproduce both bits
-  exactly; mux semantics unverified.
-- LD0 AFF D source: AFFMUX.CY implies carry-O feed; confirm
-  against INT routing before wiring pack output.
-- Bit-to-BEL map (which counter bit sits where) needs the
-  S/DI/Q net tracing, not just config bits.
+- L1(Y39-Y43) role: chained carry plus 4 LUTs each, zero FFs.
+  S inputs are intra-slice (no S site pins exist), so no S/DI
+  routing is needed, but what the L1 carry computes is unknown.
+- 12 chained halves vs 13 reported CARRY4s: one unaccounted.
+  Y39 M0 (default C0) is the suspect; verify before relying.
+- Bit-to-BEL map inside M0 halves needs S/DI/Q net tracing.
+- FFMUX.XOR-only means FF D comes from LUT O, not carry O;
+  the inference design must reproduce that wiring, not assume
+  DFFMUX.CY.
 
 ## Dependencies
 
