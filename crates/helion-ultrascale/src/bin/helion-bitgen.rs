@@ -59,7 +59,8 @@
 //! No em dashes anywhere.
 
 use helion_ultrascale::bitgen::{
-    BitgenDevice, BitgenError, emit_bitstream, parse_bitstream, parse_fasm, parse_frames,
+    BitgenDevice, BitgenError, BramFeature, bram_feature_placed_bits, emit_bitstream,
+    parse_bitstream, parse_bram_tile, parse_fasm, parse_frames,
 };
 use helion_ultrascale::device_file::DeviceFile;
 use helion_ultrascale::segbits::{FileSegbitsDb, SegbitsDb};
@@ -361,6 +362,53 @@ fn bits_for_bytes(
         let base_far = device
             .tile_base_far(&entry.tile)
             .ok_or_else(|| format!("parse-back tile {} has no base FAR", entry.tile))?;
+        // BRAM parse-back lines resolve through the bit-location
+        // tables, never through segbits: no vendored segbits DB
+        // carries BRAM INIT, so the lookup below would fail loud on
+        // every BRAM line. The block label comes from the placed bit
+        // itself (BRAM_CONTENT / BRAM_PARITY). Conversion is the emit
+        // inverse: frame = minor - base_minor, bit = frame_ofst.
+        if tile_type == "BRAM" {
+            if let Some(bram_feature) = BramFeature::parse(&entry.feature) {
+                let (_, bram_y) = parse_bram_tile(&entry.tile).ok_or_else(|| {
+                    format!("parse-back tile {} is not a RAMB18 tile", entry.tile)
+                })?;
+                let value = entry.value.as_ref().ok_or_else(|| {
+                    format!(
+                        "parse-back feature {}.{} has no value",
+                        entry.tile, entry.feature
+                    )
+                })?;
+                let base_minor = base_far & 0xFF;
+                let placed =
+                    bram_feature_placed_bits(bram_y, bram_feature, value).map_err(|e| {
+                        format!(
+                            "BRAM resolve failed for {}.{}: {e}",
+                            entry.tile, entry.feature
+                        )
+                    })?;
+                for p in &placed {
+                    if !p.value {
+                        continue;
+                    }
+                    let frame = p.minor.checked_sub(base_minor).ok_or_else(|| {
+                        format!(
+                            "tile {} feature {}: BRAM minor {} is below base minor {base_minor}",
+                            entry.tile, entry.feature, p.minor
+                        )
+                    })?;
+                    let far = base_far.checked_add(frame).ok_or_else(|| {
+                        format!(
+                            "tile {} feature {}: base FAR overflow",
+                            entry.tile, entry.feature
+                        )
+                    })?;
+                    bits.entry((far, p.frame_ofst as u16))
+                        .or_insert(p.block.name());
+                }
+                continue;
+            }
+        }
         let refs = segbits.lookup(tile_type, &entry.feature).ok_or_else(|| {
             format!(
                 "parse-back feature {}.{} is not in the segbits DB",
