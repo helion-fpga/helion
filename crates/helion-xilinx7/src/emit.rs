@@ -130,8 +130,10 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     // FFs: ZINI + D-mux select + control signals (CE, SR).
     //
     // Control signal configuration (per X-Ray DB segbits_clbll_l.db):
-    // - {bel}.ZRST: SR pin acts as RESET (vs SET). Emitted when the FF has
-    //   an SR net. prjxray's Z prefix names the zero-state option (ZRST =
+    // - {bel}.ZRST: SR pin acts as RESET (vs SET). Always emitted:
+    //   with an SR net it configures reset polarity, without one it
+    //   records the tied-off reset (the oracle has it on every FF).
+    //   prjxray's Z prefix names the zero-state option (ZRST =
     //   reset-to-zero, like ZINI = init-to-zero); the FASM feature sets the
     //   documented config bit (bit = 1), it does not clear it.
     // - {slice}.CEUSEDMUX: slice-level, enables the CE input mux. Needed
@@ -159,10 +161,13 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
             }
             if p.sr_net.is_some() {
                 sr_slices.insert((ff.tile.clone(), site_rel.clone()));
-                // Configure SR as RESET (the common case; Helion IR does not
-                // distinguish set vs reset, and reset is the standard use).
-                lines.push(format!("{}.{}.{}.ZRST", ff.tile, site_rel, bel));
             }
+            // SR as RESET (the common case; Helion IR does not
+            // distinguish set vs reset, and reset is the standard use).
+            // With no SR net Vivado ties the reset pin low and still
+            // programs ZRST: the ZB-10 oracle carries ZRST on every
+            // chain FF.
+            lines.push(format!("{}.{}.{}.ZRST", ff.tile, site_rel, bel));
         }
     }
     // Emit slice-level CE/SR mux enables (deduplicated).
@@ -175,9 +180,10 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
 
     // FF clock arrival (ZB-10): every placed FF slice gets FFSYNC
     // (without it the FFs cannot clock), and its serving INT tile
-    // gets the arrival set. NOCLKINV is intentionally absent: it is
-    // an inverted feature and our zero-initialized frames already
-    // match Vivado exactly. The serving tile is the same-X INT tile
+    // gets the arrival set. Every used slice also gets NOCLKINV
+    // (clock not inverted): the oracle programs it on all chain
+    // slices, so the zero-initialized frame does not match Vivado.
+    // The serving tile is the same-X INT tile
     // on the slice's side (proven for the X71 column; anything else
     // fails loudly at the existence check). Clock wire by slice
     // letter: SLICE_X0 takes CLK1, SLICE_X1 takes CLK0 (ZB-10 oracle
@@ -191,6 +197,48 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
             .site_rel(&ff.tile, &ff.site)
             .ok_or_else(|| format!("emit: no rel site for {} {}", ff.tile, ff.site))?;
         ff_slices.insert((ff.tile.clone(), site_rel));
+    }
+    // Every slice with placed content (LUT, FF, or carry), in
+    // deterministic order. Slices are identified by device rel site.
+    let mut used_slices: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    for lut in &placed.luts {
+        let site_rel = device
+            .site_rel(&lut.tile, &lut.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", lut.tile, lut.site))?;
+        used_slices.insert((lut.tile.clone(), site_rel));
+    }
+    for ff in &placed.ffs {
+        let site_rel = device
+            .site_rel(&ff.tile, &ff.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", ff.tile, ff.site))?;
+        used_slices.insert((ff.tile.clone(), site_rel));
+    }
+    for c in &placed.carries {
+        let site_rel = device
+            .site_rel(&c.tile, &c.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", c.tile, c.site))?;
+        used_slices.insert((c.tile.clone(), site_rel));
+    }
+    for (tile, slice) in &used_slices {
+        lines.push(format!("{tile}.{slice}.NOCLKINV"));
+    }
+    // SLICEM address-input defaults (ZB-10): a used SLICEM slice runs
+    // its A/B/C LUTs in logic mode with the DI1 address mux parked
+    // on the cascade input, even for unused letters (the oracle shows
+    // all three on slices using only ALUT). SLICEL has no DI muxes
+    // and the D LUT has no default in the oracle.
+    const DI1_DEFAULTS: [(&str, &str); 3] = [
+        ("ALUT", "BDI1_BMC31"),
+        ("BLUT", "DI_CMC31"),
+        ("CLUT", "DI_DMC31"),
+    ];
+    for (tile, slice) in &used_slices {
+        if !slice.starts_with("SLICEM") {
+            continue;
+        }
+        for (bel, src) in DI1_DEFAULTS {
+            lines.push(format!("{tile}.{slice}.{bel}.DI1MUX.{src}"));
+        }
     }
     // Serving INT tile per FF slice, with the CLK letters it needs.
     let mut int_arrival: std::collections::BTreeMap<String, (bool, bool)> = std::collections::BTreeMap::new();
@@ -567,7 +615,9 @@ mod tests {
             Some("CLBLL_L".into())
         }
         fn site_rel(&self, tile: &str, site: &str) -> Option<String> {
-            if tile.starts_with("CLB") {
+            if tile.starts_with("CLBLM") {
+                Some("SLICEM_X0".into())
+            } else if tile.starts_with("CLB") {
                 Some(if site.ends_with("Y0") { "SLICEL_X0".into() } else { "SLICEL_X1".into() })
             } else if tile.starts_with("RIOB") {
                 Some("IOB_Y1".into())
@@ -650,6 +700,47 @@ mod tests {
         assert!(text.contains("INT_L_X0Y0.CLK1.GCLK_B11"), "got:\n{text}");
         assert!(text.contains("INT_L_X0Y0.BYP_ALT0.GFAN0"), "got:\n{text}");
         assert!(text.contains("INT_L_X0Y0.BYP_ALT7.GFAN1"), "got:\n{text}");
+    }
+
+    #[test]
+    fn emit_ff_without_sr_net_gets_zrst() {
+        // ZB-10 oracle: every chain FF has ZRST (reset, tied off) even
+        // with no SR net. The blinky fixture FF has sr_net None.
+        let bs = emit_fasm(&routed_blinky(), &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZRST"), "got:\n{text}");
+    }
+
+    #[test]
+    fn emit_used_slice_gets_noclockinv() {
+        // ZB-10 oracle: every used slice programs NOCLKINV (the
+        // zero-initialized frame does not match Vivado here).
+        let bs = emit_fasm(&routed_blinky(), &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.NOCLKINV"), "got:\n{text}");
+    }
+
+    #[test]
+    fn emit_slicem_slice_gets_di1mux_defaults() {
+        // ZB-10 oracle: every used SLICEM slice programs the DI1MUX
+        // address defaults on A/B/C (even with no B/C LUTs); the D
+        // LUT and SLICEL slices never carry them.
+        let mut r = routed_blinky();
+        r.placed.packed.luts[0].output_net = "dm".into();
+        r.placed.luts[0].tile = "CLBLM_R_X0Y0".into();
+        r.placed.luts[0].site = "SLICE_X0Y0".into();
+        r.placed.packed.ffs[0].d_net = "dm".into();
+        r.placed.ffs[0].tile = "CLBLM_R_X0Y0".into();
+        r.placed.ffs[0].site = "SLICE_X0Y0".into();
+        let bs = emit_fasm(&r, &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        assert!(text.contains("CLBLM_R_X0Y0.SLICEM_X0.ALUT.DI1MUX.BDI1_BMC31"), "got:\n{text}");
+        assert!(text.contains("CLBLM_R_X0Y0.SLICEM_X0.BLUT.DI1MUX.DI_CMC31"), "got:\n{text}");
+        assert!(text.contains("CLBLM_R_X0Y0.SLICEM_X0.CLUT.DI1MUX.DI_DMC31"), "got:\n{text}");
+        assert!(!text.contains("DLUT.DI1MUX"), "got:\n{text}");
+        // The L-type blinky slice must stay clean.
+        let base = emit_fasm(&routed_blinky(), &FakeEmit).unwrap().fasm.join("\n");
+        assert!(!base.contains("DI1MUX"), "got:\n{base}");
     }
 
     #[test]
@@ -858,7 +949,10 @@ mod tests {
 
     #[test]
     fn emit_ff_no_control_signals() {
-        // FF without CE/SR must NOT emit the mux enables (keeps bitstream minimal).
+        // FF without CE/SR must NOT emit the mux enables (the oracle
+        // has neither), but MUST emit ZRST: the ZB-10 oracle carries
+        // ZRST on every chain FF, which have no SR nets (tied-off
+        // reset). Minimalism is not the goal; oracle identity is.
         let bs = emit_fasm(&routed_blinky(), &FakeEmit).unwrap();
         let text = bs.fasm.join("\n");
         assert!(
@@ -869,7 +963,10 @@ mod tests {
             !text.contains("SRUSEDMUX"),
             "unexpected SRUSEDMUX, got:\n{text}"
         );
-        assert!(!text.contains(".ZRST"), "unexpected ZRST, got:\n{text}");
+        assert!(
+            text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZRST"),
+            "missing tied-off ZRST, got:\n{text}"
+        );
     }
 
     #[test]
