@@ -98,8 +98,8 @@
 //!   bitstreams whose DB coverage is incomplete.
 
 use crate::bitloc::{
-    bram_mem_placed_bits, bram_parity_placed_bits, BitLocError, PlacedBit, BRAM_MEM_BITS,
-    BRAM_PARITY_BITS,
+    BRAM_MEM_BITS, BRAM_PARITY_BITS, BitLoc, BitLocError, PlacedBit, bram_mem_locations,
+    bram_mem_placed_bits, bram_parity_locations, bram_parity_placed_bits,
 };
 use crate::segbits::{BitRef, SegbitsDb};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -802,6 +802,42 @@ pub fn bram_feature_placed_bits(
     Ok(placed[feature.first_bit..feature.first_bit + feature.bit_count].to_vec())
 }
 
+/// Read one BRAM array (content or parity) back from the frames.
+/// `locs` is the bit-location table for this tile's Y row, list index
+/// = absolute bit. Returns the value bits LSB-first (bit i is absolute
+/// bit i) and marks every (far, bit) the array can set as explained,
+/// so the unexplained check in `parse_bitstream` does not fire on
+/// BRAM frames. This is the emit inverse: frame = minor - base_minor,
+/// bit = frame_ofst.
+fn bram_array_value_bits(
+    frames: &BTreeMap<u32, FrameWords>,
+    explained: &mut HashSet<(u32, u16)>,
+    base_far: u32,
+    locs: &[BitLoc],
+) -> Result<Vec<bool>, BitgenError> {
+    let base_minor = base_far & 0xFF;
+    let mut value_bits = vec![false; locs.len()];
+    for (i, loc) in locs.iter().enumerate() {
+        let frame = loc
+            .minor
+            .checked_sub(base_minor)
+            .ok_or_else(|| BitgenError::BadFar {
+                reason: format!("BRAM minor {} is below base minor {base_minor}", loc.minor),
+            })?;
+        let far = base_far
+            .checked_add(frame)
+            .ok_or_else(|| BitgenError::BadFar {
+                reason: format!("BRAM base FAR 0x{base_far:08x} + offset {frame} overflows"),
+            })?;
+        let bit = u16::try_from(loc.frame_ofst).map_err(|_| BitgenError::BadFar {
+            reason: format!("BRAM frame_ofst {} exceeds u16", loc.frame_ofst),
+        })?;
+        explained.insert((far, bit));
+        value_bits[i] = frame_bit(frames, far, bit);
+    }
+    Ok(value_bits)
+}
+
 /// Write one frame bit, failing loud on overflow, an out-of-range bit
 /// offset, or a conflicting earlier write. Shared by the segbits path
 /// and the BRAM path so the two cannot drift apart.
@@ -1436,6 +1472,52 @@ pub fn parse_bitstream(
         let base_far = device
             .tile_base_far(tile)
             .ok_or_else(|| BitgenError::UnknownTileType { tile: tile.clone() })?;
+        // BRAM tiles render through the bit-location tables, never
+        // through segbits: no vendored segbits DB carries BRAM INIT.
+        // Each array renders only when it holds a set bit (valued
+        // presence is any-set, the same rule as the segbits path): an
+        // all-zero array is indistinguishable from absent and is
+        // dropped. The table pair sets are disjoint across all 24 Y
+        // rows (verified from the vendored JSON), so reading this
+        // tile's positions cannot pick up a neighbouring tile's bits.
+        // Fast path: a tile whose 256 FARs hold no set bit renders
+        // nothing and explains nothing (the unexplained check only
+        // consults set bits), so skip the table reads for it.
+        if tile_type == "BRAM" {
+            let has_set = frames
+                .range(base_far..base_far.saturating_add(256))
+                .any(|(_, words)| words.iter().any(|w| *w != 0));
+            if has_set {
+                let (_, bram_y) = parse_bram_tile(tile)
+                    .ok_or_else(|| BitgenError::UnknownTile { tile: tile.clone() })?;
+                let content = bram_array_value_bits(
+                    &frames,
+                    &mut explained,
+                    base_far,
+                    &bram_mem_locations(bram_y)?,
+                )?;
+                if content.iter().any(|b| *b) {
+                    lines.push((
+                        tile.clone(),
+                        "INIT[16383:0]".to_string(),
+                        Some(format_value(&content)),
+                    ));
+                }
+                let parity = bram_array_value_bits(
+                    &frames,
+                    &mut explained,
+                    base_far,
+                    &bram_parity_locations(bram_y)?,
+                )?;
+                if parity.iter().any(|b| *b) {
+                    lines.push((
+                        tile.clone(),
+                        "INITP[2047:0]".to_string(),
+                        Some(format_value(&parity)),
+                    ));
+                }
+            }
+        }
         for feature in segbits.features(tile_type) {
             let refs = segbits.lookup(tile_type, feature).ok_or_else(|| {
                 BitgenError::InconsistentFeature {
