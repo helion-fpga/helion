@@ -200,3 +200,19 @@ that builds this bitstream is untouched, so this run is a
 no-regression confirmation, not a reduction. The diff moves only
 once the backend consumes Carry4 (pack pin nets plus place, route,
 emit), which is the next stage.
+
+## Seventh run (Nov 8, 2026, Mac, after full backend carry-through)
+
+Same pair, rebuilt default-flow Helion side (all three bitstream e2e
+green). Result: 4,688 (record /tmp/x7/blinky_reg_diff10.json),
+identical again. Expected: the carry flow is still opt-in, so the
+default bitstream is unchanged; this run proves the place/route/emit
+carry changes are no-ops for designs without Carry4 cells (87 lib
+tests plus all e2e green). A separate carry bitstream now exists at
+/tmp/x7/blinky_reg_carry.bit (opt-in flow, golden-shaped chain
+features, proven by blinky_reg_carry_e2e_fasm). Its raw diff against
+the oracle is not yet meaningful: our placer puts the chain in a
+different column (placement freedom, open item), so positions differ
+even where encodings agree. Next: placement match to the golden
+column (CLBLM_R_X71Y39 upward), then a canonicalised per-cell
+comparison.

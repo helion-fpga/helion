@@ -9,7 +9,17 @@
   `synth_sv_carry` lowers a single whole-register `lhs <= lhs + 1`
   to Carry4 cells plus S-LUTs and rewired FFs; helion-sim models
   the chain; 3 sim tests prove equivalence to the cone flow.
-  Backend carry-through (pack pin nets, place, route, emit) open.
+- Status: stage 2 carry-through done (Nov 8, 2026, commits 5df9be5
+  through 1933bec). Pack captures pin nets; chained groups place on
+  adjacent column slices (ZB-08, cascade order proven from golden:
+  ascending name Y, X0 to X1); co nets route as dedicated Cascade;
+  S-LUT plus FF co-place by letter; emit writes PRECYINIT.AX once,
+  PRECYINIT.CIN per chained group, lone ACY0, FFMUX.XOR on chain
+  FFs; DI reads S-LUT O5 internally (zero-LUT deleted). E2E test
+  blinky_reg_carry_e2e_fasm proves the full flow to bits. Default
+  flow untouched (diff still 4688, run ten). Open: placement match
+  to the golden column; head-slice ALUT INIT micro-diffs
+  (0xff00ff../0x0f0f.. vs passthrough).
 
 ## Goal
 
