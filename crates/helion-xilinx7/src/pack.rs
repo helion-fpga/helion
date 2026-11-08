@@ -108,7 +108,11 @@ pub struct PackedCarry {
     /// Source IR cell name.
     pub name: String,
     /// Net on CI (carry in: prior group CO, or the CYINIT source net).
+    /// Empty for a CYINIT-config head (`cyinit_c0`): the CI pin stays
+    /// unconnected and no net routes to it.
     pub ci_net: String,
+    /// Chain head with CYINIT from config (golden PRECYINIT.C0).
+    pub cyinit_c0: bool,
     /// Net on CO (carry out to the next group CI).
     pub co_net: Option<String>,
     /// Nets on S0..S3.
@@ -276,11 +280,18 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                     di_nets[j] = pin(&format!("DI{j}"));
                     o_nets[j] = pin(&format!("O{j}"));
                 }
+                let cyinit_c0 = cell.attrs.flag("CYINIT");
+                let ci_net = match pin("CI") {
+                    Some(n) => n,
+                    None if cyinit_c0 => String::new(),
+                    None => {
+                        return Err(format!("pack: CARRY4 {} has no CI net", cell.name));
+                    }
+                };
                 out.carries.push(PackedCarry {
                     name: cell.name.clone(),
-                    ci_net: pin("CI").ok_or_else(|| {
-                        format!("pack: CARRY4 {} has no CI net", cell.name)
-                    })?,
+                    ci_net,
+                    cyinit_c0,
                     co_net: pin("CO"),
                     s_nets,
                     di_nets,

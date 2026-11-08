@@ -16255,6 +16255,40 @@ fn propagate_const_wires<'a>(rtl: &mut Rtl<'a>, arena: &'a Bump) {
 // passthrough INIT (O5 reads the low 32 INIT bits, all zero), and the
 // backend leaves the DI mux at its default O5 input. The golden oracle
 // shows no DI-mux FASM lines and no zero LUT.
+/// Extended carry stage for a registered top-bit load (`LD0 <= count[24]`).
+/// Chains on the count tail CO with a Q-fed-back passthrough S, mirroring
+/// the golden Y45 LD0 stage (A-LUT passthrough, chained CIN, XOR FF).
+/// `reg` is the counter, `ld` the 1-bit load register.
+fn emit_carry_top_load(
+    d: &mut Design,
+    carry_ffs: &mut Vec<(String, String)>,
+    rtl: &Rtl,
+    clk: &str,
+    reg: &str,
+    ld: &str,
+) {
+    const S_LUT_INIT: u64 = 0xFFFF_FFFF_0000_0000;
+    let tail = sig_width(rtl, reg).div_ceil(4) - 1;
+    let cname = format!("u_carry_{ld}_c");
+    d.add_cell(&cname, CellKind::Carry4);
+    d.connect(format!("u_carry_{reg}_co{tail}"), &cname, "CI");
+    let s = format!("u_carry_{ld}_s0");
+    d.connect(&s, &cname, "S0");
+    let slut = format!("u_carry_{ld}_s0_lut");
+    d.add_cell(&slut, CellKind::Lut6 { init: S_LUT_INIT });
+    d.connect(&s, &slut, "O");
+    let q = bit_name(ld, sig_width(rtl, ld), 0);
+    d.connect(&q, &slut, "I5");
+    let o = format!("u_carry_{ld}_o0");
+    d.connect(&o, &cname, "O0");
+    let ff = format!("u_carry_{ld}_ff");
+    d.add_cell(&ff, CellKind::Hff);
+    d.connect(seq_clk_for(&rtl.module, &q, clk), &ff, "CLK");
+    d.connect(&o, &ff, "D");
+    d.connect(&q, &ff, "Q");
+    carry_ffs.push((ff, q));
+}
+
 fn emit_carry_increment(
     d: &mut Design,
     carry_ffs: &mut Vec<(String, String)>,
@@ -16262,14 +16296,12 @@ fn emit_carry_increment(
     clk: &str,
     lhs: &str,
     w: usize,
+    tail_co: bool,
 ) {
     let groups = w.div_ceil(4);
     // I5-only O6 passthrough (golden S-LUT INIT 0xffffffff00000000): O
     // follows bit 5 of the LUT input word; L1 mystery inputs fold to zero.
     const S_LUT_INIT: u64 = 0xFFFF_FFFF_0000_0000;
-    let one = format!("u_carry_{lhs}_one");
-    d.add_cell(&one, CellKind::Lut6 { init: u64::MAX });
-    d.connect(&one, &one, "O");
     // A pad sits between compute groups c_k and c_{k+1} for 1 <= k <= n-3
     // (never after the head, never before the tail): the backend walks the
     // linkage in strict alternation, so pads land on the skipped X1 slots
@@ -16277,28 +16309,108 @@ fn emit_carry_increment(
     // four routed passthrough S-LUTs, no FFs). Fewer than 4 groups need
     // no pads (every step stays adjacent).
     let pad_after = |k: usize| k >= 1 && k + 3 <= groups;
+    // Head transit (blinky-grounded: present exactly when pads exist): a
+    // carry bridging g0 to g1 so computes land on X0 slices and pads on
+    // X1, like the golden Y39X1 transit. S0 is a Q1 passthrough; the
+    // other positions stay bare (they propagate in sim and silicon).
+    let transit = groups >= 4;
+    let tco = format!("u_carry_{lhs}_tco");
+    // Tail packing: a partial tail group packs top-aligned (a 1-bit tail
+    // sits at j=3, like the golden bit 24 at Y44X1-D); full groups are
+    // unaffected. Low unused positions take sub-cone Q passthroughs
+    // (highest first from T-1 downward, lowest from the south group top),
+    // provably exact like the pad fill.
+    let tail = groups - 1;
+    let ntail = w - tail * 4;
+    let top = w - 1;
     for g in 0..groups {
         let base = g * 4;
-        let cin = if g == 0 {
-            one.clone()
-        } else if pad_after(g - 1) {
-            format!("u_carry_{lhs}_pco{}", g - 1)
-        } else {
-            format!("u_carry_{lhs}_co{}", g - 1)
-        };
         let cname = format!("u_carry_{lhs}_c{g}");
         d.add_cell(&cname, CellKind::Carry4);
-        d.connect(&cin, &cname, "CI");
-        // No CO endpoint on the tail group: nothing consumes the final
-        // carry-out, and an undriven-load cascade net would fail routing.
-        if g + 1 < groups {
+        if g == 0 {
+            // Chain head: CYINIT from config (golden PRECYINIT.C0, no
+            // routing, no const-1 LUT). The CI pin stays unconnected;
+            // pack/sim/emit read the CYINIT flag (proven 1: a 0 would
+            // stick bit 0 and break the chain the oracle provably runs).
+            let _ = d.set_cell_attr(&cname, "CYINIT", "1");
+        } else {
+            let cin = if g == 1 && transit {
+                tco.clone()
+            } else if pad_after(g - 1) {
+                format!("u_carry_{lhs}_pco{}", g - 1)
+            } else {
+                format!("u_carry_{lhs}_co{}", g - 1)
+            };
+            d.connect(&cin, &cname, "CI");
+        }
+        // CO on every group except an unconsumed tail: a bare tail CO
+        // net (one driver, no load) would fail cascade purity loudly.
+        if g + 1 < groups || tail_co {
             d.connect(format!("u_carry_{lhs}_co{g}"), &cname, "CO");
         }
-        for j in 0..4 {
-            if base + j < w {
-                d.connect(format!("u_carry_{lhs}_s{}", base + j), &cname, format!("S{j}"));
-                d.connect(format!("u_carry_{lhs}_o{}", base + j), &cname, format!("O{j}"));
+        if g == tail && groups > 1 {
+            // Multi-group tail: top-aligned with below-fill. Exact
+            // because the group carry-in already ANDs every bit below
+            // the group, so sub-top fill Qs only duplicate AND terms.
+            for i in 0..ntail {
+                let j = 4 - ntail + i;
+                d.connect(format!("u_carry_{lhs}_s{}", base + i), &cname, format!("S{j}"));
+                d.connect(format!("u_carry_{lhs}_o{}", base + i), &cname, format!("O{j}"));
             }
+            let mut fb = top.saturating_sub(1);
+            for j in (0..4 - ntail).rev() {
+                let fillbit = if j == 0 {
+                    base.saturating_sub(5)
+                } else {
+                    let b = fb;
+                    fb = fb.saturating_sub(1);
+                    b
+                };
+                let ts = format!("u_carry_{lhs}_ts{j}");
+                d.connect(&ts, &cname, format!("S{j}"));
+                let slut = format!("u_carry_{lhs}_ts{j}_lut");
+                d.add_cell(&slut, CellKind::Lut6 { init: S_LUT_INIT });
+                d.connect(&ts, &slut, "O");
+                d.connect(&bit_name(lhs, w, fillbit), &slut, "I5");
+            }
+        } else if g == tail {
+            // Single-group tail (tail is the head): bottom-aligned with
+            // above-fill. The head carry-in is const 1, not a below-AND,
+            // so below-fill would add AND terms and corrupt the first
+            // sum; above-fill only duplicates terms into the carry-out.
+            for j in 0..4 {
+                if j < ntail {
+                    d.connect(format!("u_carry_{lhs}_s{}", base + j), &cname, format!("S{j}"));
+                    d.connect(format!("u_carry_{lhs}_o{}", base + j), &cname, format!("O{j}"));
+                } else {
+                    let fillbit = top.saturating_sub(1 + (j - ntail));
+                    let ts = format!("u_carry_{lhs}_ts{j}");
+                    d.connect(&ts, &cname, format!("S{j}"));
+                    let slut = format!("u_carry_{lhs}_ts{j}_lut");
+                    d.add_cell(&slut, CellKind::Lut6 { init: S_LUT_INIT });
+                    d.connect(&ts, &slut, "O");
+                    d.connect(&bit_name(lhs, w, fillbit), &slut, "I5");
+                }
+            }
+        } else {
+            for j in 0..4 {
+                if base + j < w {
+                    d.connect(format!("u_carry_{lhs}_s{}", base + j), &cname, format!("S{j}"));
+                    d.connect(format!("u_carry_{lhs}_o{}", base + j), &cname, format!("O{j}"));
+                }
+            }
+        }
+        if transit && g == 0 {
+            let pname = format!("u_carry_{lhs}_transit");
+            d.add_cell(&pname, CellKind::Carry4);
+            d.connect(format!("u_carry_{lhs}_co{g}"), &pname, "CI");
+            d.connect(&tco, &pname, "CO");
+            let ts = format!("u_carry_{lhs}_trs");
+            d.connect(&ts, &pname, "S0");
+            let slut = format!("u_carry_{lhs}_trs_lut");
+            d.add_cell(&slut, CellKind::Lut6 { init: S_LUT_INIT });
+            d.connect(&ts, &slut, "O");
+            d.connect(&bit_name(lhs, w, 1), &slut, "I5");
         }
         if pad_after(g) {
             // Transparent pad with routed S-fill. The golden oracle pads
@@ -16426,9 +16538,37 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // only fires when the increment is the single update to its register.
     // Mixing carry and cone FFs on one Q net would double-drive it.
     let mut nba_counts: HashMap<&str, usize> = HashMap::new();
+    // Registers taking the carry fast path (mirrors the branch below), and
+    // single top-bit loads (`ld <= reg[top]`, 1-bit `ld`) on them: each
+    // becomes an extended carry stage chained on the tail CO instead of
+    // cone logic (golden Y45 LD0 stage).
+    let mut carry_regs: HashSet<&str> = HashSet::new();
+    let mut top_loads: HashMap<&str, &str> = HashMap::new();
     if carry_infer_enabled() {
         for (lhs, _, _) in &rtl.nbas {
             *nba_counts.entry(*lhs).or_insert(0) += 1;
+        }
+        for (lhs, bit, rhs) in &rtl.nbas {
+            if bit.is_none()
+                && rexpr_is_plus_one(rhs)
+                && rexpr_ident(rhs).as_deref() == Some(*lhs)
+                && nba_counts.get(lhs) == Some(&1)
+            {
+                carry_regs.insert(*lhs);
+            }
+        }
+        for (lhs, bit, rhs) in &rtl.nbas {
+            // Degenerate 1-bit counters stay cone: the stage samples the
+            // chained carry, which needs at least one real carry below it.
+            if bit.is_none()
+                && sig_width(rtl, lhs) == 1
+                && let RExpr::Bit(reg, idx) = rhs
+                && sig_width(rtl, reg) >= 2
+                && *idx + 1 == sig_width(rtl, reg)
+                && carry_regs.contains(*reg)
+            {
+                top_loads.entry(*reg).or_insert(*lhs);
+            }
         }
     }
     // (carry FF cell, Q net) pairs for keep/mark_debug after the loop.
@@ -16457,12 +16597,25 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             // carry fast path under opt-in; the cone path below is skipped so
             // each Q net keeps exactly one FF driver.
             if carry_infer_enabled() && nba_counts.get(lhs) == Some(&1) {
-                emit_carry_increment(&mut d, &mut carry_ffs, rtl, clk, lhs, w);
+                let tail_co = top_loads.contains_key(*lhs);
+                emit_carry_increment(&mut d, &mut carry_ffs, rtl, clk, lhs, w, tail_co);
                 continue;
             }
             for i in 0..w {
                 reg_bits.push((bit_name(lhs, w, i), inc_bit_expr(lhs, w, i, &arena)));
             }
+        } else if bit.is_none()
+            && carry_infer_enabled()
+            && let RExpr::Bit(reg, _) = rhs
+            && top_loads.get(*reg) == Some(lhs)
+        {
+            // Registered top-bit load (`LD0 <= count[24]`): an extended
+            // carry stage chained on the tail CO (golden Y45 LD0 stage),
+            // not cone logic. The stage FF samples S^CIN with S fed back
+            // from its own Q, so it toggles on the full-wrap carry: same
+            // half-rate blink as the RTL, one edge a cycle later.
+            emit_carry_top_load(&mut d, &mut carry_ffs, rtl, clk, reg, lhs);
+            continue;
         } else if let RExpr::Mux(cond, t, f) = rhs {
             if rexpr_is_plus_one(f)
                 && rexpr_ident(f).as_deref() == Some(*lhs)
@@ -18453,6 +18606,100 @@ mod tests {
     #[test]
     fn deep_priority_chain_50k_no_stack_overflow() {
         synth_priority_chain(50_000);
+    }
+
+    /// ZB-10 tail convergence netlist shape on blinky_reg (25-bit counter
+    /// plus registered LD0): the tail group packs top-aligned (bit 24 at
+    /// S3/O3 with a CO endpoint), a transit cell bridges g0 to g1, and a
+    /// top-bit load becomes an extended carry stage sampling the chained
+    /// carry. Mirrors the golden oracle (Y44X1-D, Y45X0-A, Y39X1 transit).
+    fn carry_blinky_reg_design() -> Design {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/blinky_reg.sv");
+        let src = std::fs::read_to_string(&root).expect("blinky_reg.sv");
+        synth_sv_carry(&src, "blinky_reg.sv").expect("carry synth")
+    }
+
+    fn cell_pin(d: &Design, cell: &str, pin: &str) -> Option<String> {
+        d.pin_index()
+            .net_on(cell, pin)
+            .map(|s| s.to_string())
+    }
+
+    #[test]
+    fn carry_tail_top_align_ld0_stage_transit() {
+        let d = carry_blinky_reg_design();
+        // Chain head: CYINIT from config (golden PRECYINIT.C0). No CI
+        // net, no const-1 LUT anywhere.
+        assert_eq!(cell_pin(&d, "u_carry_count_c0", "CI"), None);
+        let c0 = d.cells.iter().find(|c| c.name == "u_carry_count_c0").expect("c0");
+        assert!(c0.attrs.flag("CYINIT"), "head carries CYINIT=1");
+        assert!(
+            d.cells.iter().all(|c| !c.name.ends_with("_one")),
+            "no const-1 LUT"
+        );
+        // Tail group: bit 24 at position 3 with a carry-out endpoint.
+        assert_eq!(
+            cell_pin(&d, "u_carry_count_c6", "S3"),
+            Some("u_carry_count_s24".to_string()),
+            "bit 24 S at j=3"
+        );
+        assert_eq!(
+            cell_pin(&d, "u_carry_count_c6", "O3"),
+            Some("u_carry_count_o24".to_string()),
+            "bit 24 O at j=3"
+        );
+        assert_eq!(
+            cell_pin(&d, "u_carry_count_c6", "CO"),
+            Some("u_carry_count_co6".to_string()),
+            "tail carries out"
+        );
+        // Tail fill: low positions take sub-cone Q passthroughs.
+        assert_eq!(
+            cell_pin(&d, "u_carry_count_c6", "S2"),
+            Some("u_carry_count_ts2".to_string())
+        );
+        // Transit bridges g0 to g1 with a Q1 passthrough on S0.
+        assert_eq!(
+            cell_pin(&d, "u_carry_count_transit", "CI"),
+            Some("u_carry_count_co0".to_string())
+        );
+        assert_eq!(
+            cell_pin(&d, "u_carry_count_transit", "CO"),
+            Some("u_carry_count_tco".to_string())
+        );
+        assert_eq!(
+            cell_pin(&d, "u_carry_count_c1", "CI"),
+            Some("u_carry_count_tco".to_string())
+        );
+        // LD0 top-bit load is an extended carry stage, not cone logic.
+        assert_eq!(
+            cell_pin(&d, "u_carry_LD0_c", "CI"),
+            Some("u_carry_count_co6".to_string())
+        );
+        assert_eq!(
+            cell_pin(&d, "u_carry_LD0_c", "S0"),
+            Some("u_carry_LD0_s0".to_string())
+        );
+        assert_eq!(
+            cell_pin(&d, "u_carry_LD0_c", "O0"),
+            Some("u_carry_LD0_o0".to_string())
+        );
+        assert_eq!(
+            cell_pin(&d, "u_carry_LD0_ff", "D"),
+            Some("u_carry_LD0_o0".to_string())
+        );
+        assert_eq!(
+            cell_pin(&d, "u_carry_LD0_ff", "Q"),
+            Some("LD0".to_string())
+        );
+        // No cone FF left driving LD0.
+        let cone_ld0 = d.cells.iter().filter(|c| {
+            matches!(c.kind, CellKind::Hff)
+                && cell_pin(&d, &c.name, "Q").as_deref() == Some("LD0")
+                && c.name != "u_carry_LD0_ff"
+        });
+        assert_eq!(cone_ld0.count(), 0, "LD0 has exactly one FF, the stage FF");
     }
 
     /// Parse a test expression (leaked arena, test-only).
