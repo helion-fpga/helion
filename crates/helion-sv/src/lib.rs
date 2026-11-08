@@ -16277,7 +16277,11 @@ fn emit_carry_increment(
         let cname = format!("u_carry_{lhs}_c{g}");
         d.add_cell(&cname, CellKind::Carry4);
         d.connect(&cin, &cname, "CI");
-        d.connect(format!("u_carry_{lhs}_co{g}"), &cname, "CO");
+        // No CO endpoint on the tail group: nothing consumes the final
+        // carry-out, and an undriven-load cascade net would fail routing.
+        if g + 1 < groups {
+            d.connect(format!("u_carry_{lhs}_co{g}"), &cname, "CO");
+        }
         for j in 0..4 {
             if base + j < w {
                 d.connect(format!("u_carry_{lhs}_s{}", base + j), &cname, format!("S{j}"));

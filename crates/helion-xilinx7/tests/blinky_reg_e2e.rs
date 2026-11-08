@@ -259,3 +259,92 @@ fn blinky_reg_e2e_bitstream() {
     std::fs::write(&out, &bit).unwrap();
     println!("wrote {} ({} bytes)", out.display(), bit.len());
 }
+
+/// End-to-end carry flow (ZB-04 stage 2g, opt-in): the same RTL through
+/// `synth_sv_carry` must pack 7 chained groups, place them, route the
+/// cascade without fabric pips, and emit golden-shaped chain features
+/// (PRECYINIT.AX once, PRECYINIT.CIN six times, one ACY0, 25 S-LUT
+/// passthrough INITs, FFMUX.XOR on chain FFs). Features must resolve to
+/// real segbits (apply_fasm), proving the paths are not typos. Writes a
+/// separate bit file; the default-flow oracle pair file is untouched.
+#[test]
+fn blinky_reg_carry_e2e_fasm() {
+    let db_root = default_db_root();
+    let zynq7 = db_root.join("zynq7");
+    let mut device = Device::load_xc7z020(&db_root).expect("load xc7z020");
+    let node_maps = build_node_map(&mut device);
+
+    let src =
+        std::fs::read_to_string("../../examples/blinky_reg.sv").expect("blinky_reg.sv");
+    let mut design = helion_sv::synth_sv_carry(&src, "blinky_reg.sv").expect("carry synth");
+    for port in &mut design.ports {
+        if port.name == "clk" {
+            port.attrs.set("LOC", "Y9");
+            port.attrs.set("IOSTANDARD", "LVCMOS33");
+        }
+    }
+
+    let mut packed = pack(&design).expect("pack");
+    assert_eq!(packed.ffs.len(), 26, "expected 26 FFs");
+    assert_eq!(packed.carries.len(), 7, "expected 7 carry groups");
+    for iob in &mut packed.iobs {
+        if iob.port == "LD0" {
+            iob.loc = Some("T22".to_string());
+            iob.iostandard = "LVCMOS33".to_string();
+        }
+    }
+
+    let mut xdev = XDevice::new(&device, node_maps);
+    for b in &packed.bufgs {
+        xdev.clock_nets.insert(b.out_net.clone());
+    }
+    let placed = place(&packed, &xdev).expect("place");
+    assert_eq!(placed.carries.len(), 7);
+    let routed = route(&placed, &xdev).expect("route");
+
+    let bs = emit_fasm(&routed, &xdev).expect("emit");
+    let fasm_text = bs.fasm.join("\n");
+    assert_eq!(fasm_text.matches("PRECYINIT.AX").count(), 1, "one chain head");
+    assert_eq!(fasm_text.matches("PRECYINIT.CIN").count(), 6, "six chained groups");
+    assert_eq!(fasm_text.matches("CARRY4.ACY0").count(), 1, "head bit A only");
+    assert_eq!(
+        fasm_text.matches("64'hFFFFFFFF00000000").count(),
+        25,
+        "25 S-LUT passthrough INITs"
+    );
+    assert_eq!(fasm_text.matches("FFMUX.XOR").count(), 25, "chain FF D muxes");
+    assert!(!fasm_text.contains("BCY0"), "no BCY0:\n{fasm_text}");
+    println!("carry FASM: {} lines", bs.fasm.len());
+
+    // Every chain feature must resolve to real segbits.
+    let lines = parse_fasm(&fasm_text).expect("parse our FASM");
+    let layout =
+        TilegridLayout::load(&zynq7.join("xc7z020/tilegrid.json")).expect("tilegrid layout");
+    let mut types: Vec<&str> = lines.iter().filter_map(|l| layout.tile_type(&l.tile)).collect();
+    types.sort();
+    types.dedup();
+    let segbits = load_segbits(&zynq7, &types);
+    let (lines, _): (Vec<_>, Vec<_>) = lines.into_iter().partition(|l| {
+        layout.tile_type(&l.tile).map(|t| t != "RIOB33_SING").unwrap_or(true)
+    });
+    let full = full_device_addresses_from_dir(
+        &db_root.join("zynq7/xc7z020clg484-1"),
+    )
+    .expect("part.json frame list");
+    let mut store = FrameStore::new(&full);
+    let applied = store.apply_fasm(&lines, &segbits, &layout).expect("apply FASM");
+    assert!(applied > 0, "no FASM features applied");
+
+    let payload = store.fdri_payload();
+    let opts = BitstreamOptions {
+        idcode: IDCODE_XC7Z020,
+        part_name: "xc7z020clg484-1".to_string(),
+        design_source: "blinky_reg_carry;Generator=helion-xilinx7".to_string(),
+        ..BitstreamOptions::xc7frames2bit("xc7z020clg484-1", "blinky_reg_carry.frm", "2026/11/08", "00:00:00")
+    };
+    let bit = bitstream::write_bit(&payload, &opts).expect("write .bit");
+    let out = PathBuf::from("/tmp/x7/blinky_reg_carry.bit");
+    std::fs::create_dir_all(out.parent().unwrap()).ok();
+    std::fs::write(&out, &bit).unwrap();
+    println!("wrote {} ({} bytes)", out.display(), bit.len());
+}
