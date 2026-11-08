@@ -321,26 +321,63 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
     // Allocate a (tile, site, BEL-letter), reusing a slice with free BELs
     // before opening a new one. (site_bels/site_tile were declared with
     // the carry slots above so carry slices join the same occupancy map.)
+    // Foreign logic stays out of chain slices: the oracle chain tiles
+    // hold chain logic only, and packing strays into transit gaps crowded
+    // the head INT until the const-1 route failed loudly. Reuse passes run
+    // in sorted site order (HashMap iteration is per-process random, and
+    // unsorted reuse made bitstreams nondeterministic run to run).
+    let carry_sites: HashSet<String> =
+        out.carries.iter().map(|c| c.site.clone()).collect();
+    // Fresh-slice search center: the chain head tile when carries exist
+    // (foreign logic in a carry design is carry support, e.g. the CYINIT
+    // const-1, and colocating it keeps its route short; the IOB anchor
+    // once flung it 70 columns west past sparse fabric until its head-CI
+    // route failed loudly), else the IOB anchor as before.
+    let (fx, fy) = out
+        .carries
+        .first()
+        .and_then(|c| device.tile_xy(&c.tile))
+        .unwrap_or((ax, ay));
     let alloc = |used: &mut HashSet<String>,
                      site_bels: &mut HashMap<String, HashSet<char>>,
                      site_tile: &mut HashMap<String, String>,
                      device: &dyn DeviceQuery|
      -> Result<(String, String, char), String> {
-        for (site, bels) in site_bels.iter() {
+        let mut sites: Vec<&String> = site_bels.keys().collect();
+        sites.sort();
+        // Pass 1: open slices without carry cells, in sorted order.
+        for site in sites.iter() {
+            if carry_sites.contains(*site) {
+                continue;
+            }
+            let bels = &site_bels[*site];
             if bels.len() < 4 {
                 if let Some(letter) = BEL_LETTERS.iter().find(|c| !bels.contains(c)) {
-                    let tile = site_tile.get(site).cloned().unwrap_or_default();
-                    return Ok((tile, site.clone(), *letter));
+                    let tile = site_tile.get(*site).cloned().unwrap_or_default();
+                    return Ok((tile, (*site).clone(), *letter));
                 }
             }
         }
-        let (tile, site) = device
-            .slice_near(ax, ay, used)
-            .ok_or_else(|| "place: no free SLICEL site".to_string())?;
-        used.insert(site.clone());
-        site_tile.insert(site.clone(), tile.clone());
-        site_bels.entry(site.clone()).or_default();
-        Ok((tile, site, 'A'))
+        // Pass 2: a fresh slice near the search center, rather than
+        // spilling foreign logic into carry-slice gaps.
+        if let Some((tile, site)) = device.slice_near(fx, fy, used) {
+            used.insert(site.clone());
+            site_tile.insert(site.clone(), tile.clone());
+            site_bels.entry(site.clone()).or_default();
+            return Ok((tile, site, 'A'));
+        }
+        // Pass 3 (last resort, dense packing with no fresh slice): reuse
+        // a carry-slice gap in sorted order.
+        for site in sites.iter() {
+            let bels = &site_bels[*site];
+            if bels.len() < 4 {
+                if let Some(letter) = BEL_LETTERS.iter().find(|c| !bels.contains(c)) {
+                    let tile = site_tile.get(*site).cloned().unwrap_or_default();
+                    return Ok((tile, (*site).clone(), *letter));
+                }
+            }
+        }
+        Err("place: no free SLICEL site".to_string())
     };
     for (fi, ff) in packed.ffs.iter().enumerate() {
         let _ = fi;
@@ -559,6 +596,7 @@ mod tests {
         PackedCarry {
             name: name.into(),
             ci_net: ci.into(),
+            cyinit_c0: false,
             co_net: co.map(|s| s.into()),
             s_nets: Default::default(),
             di_nets: Default::default(),
@@ -636,12 +674,19 @@ mod tests {
         assert_eq!((lut("u_s0").site.as_str(), lut("u_s0").bel.as_str()), ("SLICE_X0Y0", "A6LUT"));
         assert_eq!((lut("u_s2").site.as_str(), lut("u_s2").bel.as_str()), ("SLICE_X0Y0", "C6LUT"));
         assert_eq!((lut("u_s4").site.as_str(), lut("u_s4").bel.as_str()), ("SLICE_X1Y0", "A6LUT"));
-        // No S/FF cell spilled to a foreign slice.
+        // Carry-bit FFs stay co-placed in carry slices; the generic
+        // LUT+FF pair opens a fresh slice instead of a carry gap.
         for f in &placed.ffs {
-            if f.name.starts_with("u_ff") {
+            if f.name == "u_ff" {
+                assert_ne!(f.site, "SLICE_X0Y0");
+                assert_ne!(f.site, "SLICE_X1Y0");
+            } else if f.name.starts_with("u_ff") {
                 assert!(f.site == "SLICE_X0Y0" || f.site == "SLICE_X1Y0", "{}", f.site);
             }
         }
+        // The generic LUT+FF pair above already proves foreign logic
+        // opens a fresh slice instead of a carry gap (chain tiles hold
+        // chain logic only, as in the oracle).
     }
 
     /// A pinned chain-head anchor is honored: the head lands on the pinned

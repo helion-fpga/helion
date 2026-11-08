@@ -261,9 +261,10 @@ fn blinky_reg_e2e_bitstream() {
 }
 
 /// End-to-end carry flow (ZB-04 stage 2g, opt-in): the same RTL through
-/// `synth_sv_carry` must pack 7 chained groups, place them, route the
-/// cascade without fabric pips, and emit golden-shaped chain features
-/// (PRECYINIT.AX once, PRECYINIT.CIN six times, one ACY0, 25 S-LUT
+/// `synth_sv_carry` must pack 7 chained groups plus head transit plus LD0
+/// extended stage, place them, route the cascade without fabric pips, and
+/// emit golden-shaped chain features (PRECYINIT.C0 once, PRECYINIT.AX once
+/// for the transit, PRECYINIT.CIN eleven times, one ACY0, 46 S-LUT
 /// passthrough INITs, FFMUX.XOR on chain FFs). Features must resolve to
 /// real segbits (apply_fasm), proving the paths are not typos. Writes a
 /// separate bit file; the default-flow oracle pair file is untouched.
@@ -286,7 +287,11 @@ fn blinky_reg_carry_e2e_fasm() {
 
     let mut packed = pack(&design).expect("pack");
     assert_eq!(packed.ffs.len(), 26, "expected 26 FFs");
-    assert_eq!(packed.carries.len(), 11, "expected 7 compute groups plus 4 pads");
+    assert_eq!(
+        packed.carries.len(),
+        13,
+        "expected 7 compute groups plus 4 pads plus transit plus LD0 stage"
+    );
     for iob in &mut packed.iobs {
         if iob.port == "LD0" {
             iob.loc = Some("T22".to_string());
@@ -294,30 +299,31 @@ fn blinky_reg_carry_e2e_fasm() {
         }
     }
     // Convergence run: pin the chain head on the golden head slice
-    // (SLICE_X113Y39, tile CLBLM_R_X71Y39) so the first frames overlap
+    // (SLICE_X112Y39, tile CLBLM_R_X71Y39) so the first frames overlap
     // the oracle and the diff measures encodings, not positions.
-    packed.carry_anchor = Some("SLICE_X113Y39".into());
+    packed.carry_anchor = Some("SLICE_X112Y39".into());
 
     let mut xdev = XDevice::new(&device, node_maps);
     for b in &packed.bufgs {
         xdev.clock_nets.insert(b.out_net.clone());
     }
     let placed = place(&packed, &xdev).expect("place");
-    assert_eq!(placed.carries.len(), 11);
-    assert_eq!(placed.carries[0].site, "SLICE_X113Y39", "anchor honored");
+    assert_eq!(placed.carries.len(), 13);
+    assert_eq!(placed.carries[0].site, "SLICE_X112Y39", "anchor honored");
     assert_eq!(placed.carries[0].tile, "CLBLM_R_X71Y39", "golden head tile");
-    // Golden slice order: computes and pads strictly alternate from the
-    // head (X1@Y39, X0@Y40, X1@Y40, ... , X0@Y44, X1@Y44).
+    // Golden slice order: head compute on X0, transit on X1, then
+    // computes on X0 and pads on X1, tail on X1, LD0 stage on Y45 X0.
     let sites: Vec<&str> = placed.carries.iter().map(|c| c.site.as_str()).collect();
     assert_eq!(
         sites,
         vec![
-            "SLICE_X113Y39",
+            "SLICE_X112Y39", "SLICE_X113Y39",
             "SLICE_X112Y40", "SLICE_X113Y40",
             "SLICE_X112Y41", "SLICE_X113Y41",
             "SLICE_X112Y42", "SLICE_X113Y42",
             "SLICE_X112Y43", "SLICE_X113Y43",
             "SLICE_X112Y44", "SLICE_X113Y44",
+            "SLICE_X112Y45",
         ],
         "golden slice order"
     );
@@ -325,15 +331,33 @@ fn blinky_reg_carry_e2e_fasm() {
 
     let bs = emit_fasm(&routed, &xdev).expect("emit");
     let fasm_text = bs.fasm.join("\n");
-    assert_eq!(fasm_text.matches("PRECYINIT.AX").count(), 1, "one chain head");
-    assert_eq!(fasm_text.matches("PRECYINIT.CIN").count(), 10, "six chained computes plus four pads");
+    assert_eq!(fasm_text.matches("PRECYINIT.C0").count(), 1, "CYINIT-config head");
+    assert_eq!(fasm_text.matches("PRECYINIT.AX").count(), 1, "head-driven transit");
+    assert_eq!(
+        fasm_text.matches("PRECYINIT.CIN").count(),
+        11,
+        "six chained computes plus four pads plus LD0 stage"
+    );
     assert_eq!(fasm_text.matches("CARRY4.ACY0").count(), 1, "head bit A only");
     assert_eq!(
         fasm_text.matches("64'hFFFFFFFF00000000").count(),
-        41,
-        "25 compute plus 16 pad-fill S-LUT passthrough INITs"
+        46,
+        "25 compute plus 16 pad-fill plus 3 tail-fill plus transit plus LD0 S-LUTs"
     );
-    assert_eq!(fasm_text.matches("FFMUX.XOR").count(), 25, "chain FF D muxes");
+    assert_eq!(fasm_text.matches("FFMUX.XOR").count(), 26, "chain FF D muxes");
+    // Tail placement: bit 24 on Y44 X1-D, LD0 on Y45 X0-A, no fabric LD0.
+    assert!(
+        fasm_text.contains("CLBLM_R_X71Y44.SLICEL_X1.DFF"),
+        "bit 24 at Y44X1-D"
+    );
+    assert!(
+        !fasm_text.contains("X71Y44.SLICEL_X1.BFF"),
+        "no fabric LD0 at Y44X1-B"
+    );
+    assert!(
+        fasm_text.contains("CLBLM_R_X71Y45.SLICEM_X0.AFF"),
+        "LD0 stage at Y45X0-A"
+    );
     assert!(!fasm_text.contains("BCY0"), "no BCY0:\n{fasm_text}");
     println!("carry FASM: {} lines", bs.fasm.len());
 

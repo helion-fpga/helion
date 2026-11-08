@@ -8,7 +8,7 @@
 use crate::pack::IobDir;
 use crate::place::Placed7;
 use crate::route::{RouteKind, Routed7};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// What the emitter needs from the device model.
 pub trait EmitDevice {
@@ -381,17 +381,30 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
 
     // CARRY4s (ZB-04). Feature paths: TILE.SLICEL_<X>.CARRY4.<bit> and
     // TILE.SLICEL_<X>.PRECYINIT.<src>. Derived from the blinky golden
-    // chain (docs/zedboard-handoff/findings/blinky_chain_golden.txt):
-    // every chained group takes PRECYINIT.CIN (carry in from the slice
-    // below through the dedicated cascade); the chain head takes
-    // PRECYINIT.AX (CYINIT from the AX pin, fed by the const-1 LUT) or
-    // PRECYINIT.C0 (CYINIT tied 0). The *CY0 line appears only on the
-    // head bit A: it steers bit A onto the CYINIT mux instead of the CIN
-    // cascade; every other bit cascades by default with no FASM line.
+    // chain (GT-blinky.bit decodes): a chained group takes PRECYINIT.CIN
+    // (carry in from the slice below through the dedicated cascade),
+    // except a group chained directly on the head, which takes
+    // PRECYINIT.AX (golden Y39X1 transit); a CYINIT-config head takes
+    // PRECYINIT.C0 (CYINIT tied 1: a 0 would stick bit 0 and break the
+    // chain the oracle provably runs). CARRY4.ACY0 accompanies AX
+    // exactly (head-AX and transit-AX show it; C0 and CIN never do).
     let co_nets: HashSet<&str> = packed
         .carries
         .iter()
         .filter_map(|c| c.co_net.as_deref())
+        .collect();
+    // Chain heads (CI not chained): a group chained directly on a head
+    // selects the head-driven cascade variant.
+    let head_names: HashSet<&str> = packed
+        .carries
+        .iter()
+        .filter(|c| !co_nets.contains(c.ci_net.as_str()))
+        .map(|c| c.name.as_str())
+        .collect();
+    let co_driver: HashMap<&str, &str> = packed
+        .carries
+        .iter()
+        .filter_map(|c| c.co_net.as_deref().map(|co| (co, c.name.as_str())))
         .collect();
     for carry in &placed.carries {
         let site_rel = device
@@ -402,10 +415,23 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
             .iter()
             .find(|c| c.name == carry.name)
             .ok_or_else(|| format!("emit: placed CARRY4 {} has no packed cell", carry.name))?;
-        if co_nets.contains(packed_c.ci_net.as_str()) {
-            lines.push(format!("{}.{}.PRECYINIT.CIN", carry.tile, site_rel));
+        // ACY0 accompanies AX exactly (golden: head-AX and transit-AX
+        // carry it; C0 and CIN never do).
+        let mut use_ax = false;
+        if packed_c.cyinit_c0 {
+            lines.push(format!("{}.{}.PRECYINIT.C0", carry.tile, site_rel));
+        } else if co_nets.contains(packed_c.ci_net.as_str()) {
+            let head_driven = co_driver
+                .get(packed_c.ci_net.as_str())
+                .is_some_and(|d| head_names.contains(*d));
+            if head_driven {
+                lines.push(format!("{}.{}.PRECYINIT.AX", carry.tile, site_rel));
+                use_ax = true;
+            } else {
+                lines.push(format!("{}.{}.PRECYINIT.CIN", carry.tile, site_rel));
+            }
         } else {
-            // Chain head: CYINIT source is the CI net driver.
+            // Legacy const-LUT head: CYINIT source is the CI net driver.
             let driver_init = packed
                 .luts
                 .iter()
@@ -414,6 +440,7 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
             match driver_init {
                 Some(u64::MAX) => {
                     lines.push(format!("{}.{}.PRECYINIT.AX", carry.tile, site_rel));
+                    use_ax = true;
                 }
                 Some(0) => {
                     lines.push(format!("{}.{}.PRECYINIT.C0", carry.tile, site_rel));
@@ -425,10 +452,9 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                     ));
                 }
             }
-            // Head bit A steers onto the CYINIT mux; only when bit 0 is used.
-            if packed_c.o_nets[0].is_some() || packed_c.s_nets[0].is_some() {
-                lines.push(format!("{}.{}.CARRY4.ACY0", carry.tile, site_rel));
-            }
+        }
+        if use_ax {
+            lines.push(format!("{}.{}.CARRY4.ACY0", carry.tile, site_rel));
         }
     }
 
@@ -675,9 +701,9 @@ mod tests {
         );
     }
 
-    /// Golden shapes: TILE.SLICEL_X*.PRECYINIT.{AX,CIN} plus a lone
-    /// CARRY4.ACY0 on the head bit A (blinky_chain_golden.txt: ACY0 once,
-    /// no BCY0/CCY0/DCY0 anywhere in the chain).
+    /// Golden shapes: TILE.SLICEL_X*.PRECYINIT.{AX,CIN} with ACY0
+    /// accompanying AX exactly (head-driven cascade variant), and no
+    /// BCY0/CCY0/DCY0 anywhere in the chain.
     fn routed_carry_chain() -> Routed7 {
         let mut r = routed_blinky();
         r.placed.packed.luts.push(PackedLut {
@@ -687,21 +713,28 @@ mod tests {
         });
         r.placed.packed.carries = vec![
             PackedCarry {
-                name: "u_c0".into(), ci_net: "one".into(), co_net: Some("co0".into()),
+                name: "u_c0".into(), ci_net: "one".into(), cyinit_c0: false, co_net: Some("co0".into()),
                 s_nets: [Some("s0".into()), None, None, None],
                 di_nets: [None, None, None, None],
                 o_nets: [Some("o0".into()), None, None, None],
             },
             PackedCarry {
-                name: "u_c1".into(), ci_net: "co0".into(), co_net: None,
+                name: "u_c1".into(), ci_net: "co0".into(), cyinit_c0: false, co_net: Some("co1".into()),
                 s_nets: [Some("s1".into()), None, None, None],
                 di_nets: [None, None, None, None],
                 o_nets: [Some("o1".into()), None, None, None],
+            },
+            PackedCarry {
+                name: "u_c2".into(), ci_net: "co1".into(), cyinit_c0: false, co_net: None,
+                s_nets: [Some("s2".into()), None, None, None],
+                di_nets: [None, None, None, None],
+                o_nets: [Some("o2".into()), None, None, None],
             },
         ];
         r.placed.carries = vec![
             PlacedCarry { name: "u_c0".into(), tile: "CLBLL_L_X0Y0".into(), site: "SLICE_X0Y0".into() },
             PlacedCarry { name: "u_c1".into(), tile: "CLBLL_L_X0Y1".into(), site: "SLICE_X0Y1".into() },
+            PlacedCarry { name: "u_c2".into(), tile: "CLBLL_L_X0Y2".into(), site: "SLICE_X0Y2".into() },
         ];
         // One chain FF per group to pin the FFMUX.XOR rule.
         r.placed.packed.ffs.push(PackedFf {
@@ -718,10 +751,15 @@ mod tests {
     fn emit_carry_chain_precyinit_matches_golden() {
         let bs = emit_fasm(&routed_carry_chain(), &FakeEmit).unwrap();
         let text = bs.fasm.join("\n");
+        // Legacy const-1 head: AX plus ACY0.
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.PRECYINIT.AX"), "got:\n{text}");
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.CARRY4.ACY0"), "got:\n{text}");
-        assert!(text.contains("CLBLL_L_X0Y1.SLICEL_X1.PRECYINIT.CIN"), "got:\n{text}");
-        assert_eq!(text.matches("CARRY4.ACY0").count(), 1, "got:\n{text}");
+        // Group chained directly on the head (transit variant): AX plus ACY0.
+        assert!(text.contains("CLBLL_L_X0Y1.SLICEL_X1.PRECYINIT.AX"), "got:\n{text}");
+        assert!(text.contains("CLBLL_L_X0Y1.SLICEL_X1.CARRY4.ACY0"), "got:\n{text}");
+        // Group chained on a mid group: CIN with no ACY0.
+        assert!(text.contains("CLBLL_L_X0Y2.SLICEL_X1.PRECYINIT.CIN"), "got:\n{text}");
+        assert_eq!(text.matches("CARRY4.ACY0").count(), 2, "got:\n{text}");
         assert!(!text.contains("BCY0") && !text.contains("CCY0") && !text.contains("DCY0"), "got:\n{text}");
         // Chain FF samples the sum through FFMUX.XOR, never a letter input.
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFFMUX.XOR"), "got:\n{text}");

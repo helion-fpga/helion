@@ -58,6 +58,9 @@ struct CarryPins {
     ci: Option<String>,
     s: [Option<String>; 4],
     di: [Option<String>; 4],
+    /// Chain head with CYINIT from config (golden PRECYINIT.C0): an
+    /// unconnected CI reads 1, not 0.
+    cyinit: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +159,7 @@ impl Sim {
             }
             let mut pins = CarryPins::default();
             pins.ci = pin_ix.net_on(&c.name, "CI").map(|s| s.to_string());
+            pins.cyinit = c.attrs.flag("CYINIT");
             for j in 0..4 {
                 pins.s[j] = pin_ix
                     .net_on(&c.name, &format!("S{j}"))
@@ -352,7 +356,7 @@ impl Sim {
     ) -> Option<bool> {
         let pins = self.carry.get(cell)?;
         let mut c = match pins.ci.as_deref() {
-            None => Some(false),
+            None => Some(pins.cyinit),
             Some(n) => resolve(n),
         }?;
         for j in 0..4u8 {
@@ -386,7 +390,7 @@ impl Sim {
     ) -> Option<bool> {
         let pins = self.carry.get(cell)?;
         let mut c = match pins.ci.as_deref() {
-            None => Some(false),
+            None => Some(pins.cyinit),
             Some(n) => self.eval_net(n, memo, stack),
         }?;
         for j in 0..4u8 {
@@ -1483,18 +1487,59 @@ endmodule
         }
     }
 
-    /// Golden RTL (25-bit counter + registered LD0): 7 compute Carry4, 4
-    /// transparent pads, 26 FFs. Traces to the real Vivado oracle via
+    /// Golden RTL (25-bit counter + registered LD0): 7 compute Carry4 plus
+    /// head transit plus LD0 extended stage (9 non-pad), 4 transparent
+    /// pads, 26 FFs. Traces to the real Vivado oracle via
     /// examples/blinky_reg.sv, the documented equivalent of
     /// ~/CDA4253_A1/blinky.vhd. 5000 cycles exercises bits 0-12 through
     /// the first two transparent pads (bit 12 toggles past 4096); 70
     /// cycles never reached bit 8, leaving pad transparency unproven.
+    /// LD0 matches vacuously here (both flows hold 0 for 5000 cycles);
+    /// its wrap-toggle relationship is proven by
+    /// `carry_top_load_toggles_on_wrap`, since the stage (S fed back
+    /// from its own Q) intentionally differs from the cone post-increment
+    /// sum on edges.
     #[test]
     fn carry_increment_matches_cone_sim_on_blinky_reg() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/blinky_reg.sv");
         let src = std::fs::read_to_string(&root).expect("blinky_reg.sv");
-        assert_carry_matches_cone(&src, "blinky_reg.sv", 7, 4, 26, 5000);
+        assert_carry_matches_cone(&src, "blinky_reg.sv", 9, 4, 26, 5000);
+    }
+
+    /// LD0 extended stage semantics on a 3-bit counter with
+    /// `LD0 <= count[2]`: count Qs match the cone flow exactly through a
+    /// full 16-cycle double wrap, while LD0 toggles only on the
+    /// full-wrap carry (0 on cycles 1-7, 1 on 8-15, 0 at 16). This is the
+    /// golden Y45 behavior (S fed back from LD0 Q): same half-rate blink
+    /// as the RTL, not the cone post-increment edge.
+    #[test]
+    fn carry_top_load_toggles_on_wrap() {
+        use helion_sv::{synth_sv, synth_sv_carry};
+        let src = "module t3(input wire clk, output reg LD0);\n\
+                   reg [2:0] count = 0;\n\
+                   always @(posedge clk) begin count <= count + 1'b1; LD0 <= count[2]; end\nendmodule\n";
+        let cone = synth_sv(src, "t3.sv").expect("cone synth");
+        let carry = synth_sv_carry(src, "t3.sv").expect("carry synth");
+        let mut sc = Sim::new(&cone);
+        let mut sk = Sim::new(&carry);
+        for cycle in 1..=16u32 {
+            sc.step_posedge(10);
+            sk.step_posedge(10);
+            for q in ["count_0", "count_1", "count_2"] {
+                assert_eq!(
+                    sk.net_value(q),
+                    sc.net_value(q),
+                    "cycle {cycle}: Q net {q} must match"
+                );
+            }
+            let want_ld0 = (8..16).contains(&cycle);
+            assert_eq!(
+                sk.net_value("LD0"),
+                Some(want_ld0),
+                "cycle {cycle}: LD0 toggles only on the full wrap"
+            );
+        }
     }
 
     /// Different width (8 bits, 2 groups) plus full wraparound at 256: proves
