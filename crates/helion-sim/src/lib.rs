@@ -5,7 +5,7 @@
 
 use helion_ir::{CellKind, Design, PortDir};
 use helion_sv::sva::{SvaImmProp, SvaProperty};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub mod sva;
 pub mod vcd;
@@ -33,8 +33,31 @@ enum NetDriver {
     Ff(String),
     /// Net driven by a LUT O pin — value is the INIT evaluated on live inputs.
     Lut(String),
+    /// Net driven by a Carry4 O0-O3 pin (`out` 0-3) or CO pin (`out` 4):
+    /// value is the MUXCY/XOR chain evaluated on live S/DI/CI inputs.
+    Carry { cell: String, out: u8 },
     /// No resolvable driver (top-level input port, undriven, …) — probes read X.
     Undriven,
+}
+
+/// Carry4 output pin name → chain position (O0-O3 → 0-3, CO → 4).
+fn carry_out_pin(pin: &str) -> Option<u8> {
+    match pin {
+        "O0" => Some(0),
+        "O1" => Some(1),
+        "O2" => Some(2),
+        "O3" => Some(3),
+        "CO" => Some(4),
+        _ => None,
+    }
+}
+
+/// Live input nets of one Carry4 cell (ZB-04 stage 1 fast path).
+#[derive(Clone, Debug, Default)]
+struct CarryPins {
+    ci: Option<String>,
+    s: [Option<String>; 4],
+    di: [Option<String>; 4],
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +95,13 @@ pub struct Sim {
     /// ILA probe support: driver per net + LUT input net per pin (all 6 pins).
     net_drivers: HashMap<String, NetDriver>,
     lut_input_nets: HashMap<String, [Option<String>; 6]>,
+    /// Carry4 cell → live input nets (ZB-04 stage 1 fast path).
+    carry: HashMap<String, CarryPins>,
+    /// FF → (Carry4 cell, chain position) when D is carry-driven.
+    ff_d_carry: HashMap<String, (String, u8)>,
+    /// Net → (Carry4 cell, chain position) for every carry-driven net, so
+    /// the step path resolves chained carries (group CI from prior CO).
+    net_carry_o: HashMap<String, (String, u8)>,
 }
 
 impl Sim {
@@ -86,6 +116,12 @@ impl Sim {
         let mut net_ff: HashMap<String, String> = HashMap::new();
         let mut net_lut_o: HashMap<String, String> = HashMap::new();
         let mut ff_d_lut = HashMap::new();
+        let carry_cells: HashSet<String> = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Carry4))
+            .map(|c| c.name.clone())
+            .collect();
         for n in &d.nets {
             if let Some(q) = n.endpoints.iter().find(|e| e.pin == "Q") {
                 net_ff.insert(n.name.clone(), q.cell.clone());
@@ -112,6 +148,24 @@ impl Sim {
             }
         }
         let pin_ix = d.pin_index();
+        // ZB-04 stage 1: live input nets per Carry4 cell for chain eval.
+        let mut carry: HashMap<String, CarryPins> = HashMap::new();
+        for c in &d.cells {
+            if !carry_cells.contains(&c.name) {
+                continue;
+            }
+            let mut pins = CarryPins::default();
+            pins.ci = pin_ix.net_on(&c.name, "CI").map(|s| s.to_string());
+            for j in 0..4 {
+                pins.s[j] = pin_ix
+                    .net_on(&c.name, &format!("S{j}"))
+                    .map(|s| s.to_string());
+                pins.di[j] = pin_ix
+                    .net_on(&c.name, &format!("DI{j}"))
+                    .map(|s| s.to_string());
+            }
+            carry.insert(c.name.clone(), pins);
+        }
         let iob_from_ff = d.cells.iter().find_map(|c| {
             if !matches!(c.kind, CellKind::IobOut) {
                 return None;
@@ -145,6 +199,7 @@ impl Sim {
         }
         // ILA probe maps: driver per net (Q beats O on multi-endpoint nets) and
         // the net on every LUT input pin so chained LUTs evaluate exactly.
+        // Carry4 O/CO pins resolve through the chain evaluator below.
         let mut net_drivers = HashMap::new();
         for n in &d.nets {
             let driver = n
@@ -158,8 +213,36 @@ impl Sim {
                         .find(|e| e.pin == "O")
                         .map(|e| NetDriver::Lut(e.cell.clone()))
                 })
+                .or_else(|| {
+                    n.endpoints.iter().find_map(|e| {
+                        if !carry_cells.contains(&e.cell) {
+                            return None;
+                        }
+                        carry_out_pin(&e.pin)
+                            .map(|out| NetDriver::Carry { cell: e.cell.clone(), out })
+                    })
+                })
                 .unwrap_or(NetDriver::Undriven);
             net_drivers.insert(n.name.clone(), driver);
+        }
+        // Nets driven by a Carry4 O/CO pin resolve through chain eval; FFs
+        // whose D is carry-driven additionally step from chain eval.
+        let mut ff_d_carry: HashMap<String, (String, u8)> = HashMap::new();
+        let mut net_carry_o: HashMap<String, (String, u8)> = HashMap::new();
+        for n in &d.nets {
+            let driven = n.endpoints.iter().find(|e| e.pin == "D");
+            let from_carry = n.endpoints.iter().find_map(|e| {
+                if !carry_cells.contains(&e.cell) {
+                    return None;
+                }
+                carry_out_pin(&e.pin).map(|out| (e.cell.clone(), out))
+            });
+            if let Some((cell, out)) = from_carry {
+                net_carry_o.insert(n.name.clone(), (cell.clone(), out));
+                if let Some(f) = driven {
+                    ff_d_carry.insert(f.cell.clone(), (cell, out));
+                }
+            }
         }
         let mut lut_input_nets: HashMap<String, [Option<String>; 6]> = HashMap::new();
         for c in &d.cells {
@@ -192,6 +275,9 @@ impl Sim {
             iob_pad_to_i,
             net_drivers,
             lut_input_nets,
+            carry,
+            ff_d_carry,
+            net_carry_o,
         }
     }
 
@@ -225,8 +311,94 @@ impl Sim {
             memo.insert(net.to_string(), v);
             return v;
         }
+        // ZB-04 stage 1: carry-driven nets (chained group CI from prior CO,
+        // sum nets feeding nothing LUT-like) resolve through chain eval so
+        // multi-group chains propagate within one step.
+        if let Some((cell, out)) = self.net_carry_o.get(net).cloned() {
+            stack.push(net.to_string());
+            let mut resolve = |n: &str| Some(self.pin_net_value(n, memo, stack));
+            let v = self.carry_output_live(&cell, out, &mut resolve);
+            stack.pop();
+            if let Some(b) = v {
+                memo.insert(net.to_string(), b);
+                return b;
+            }
+        }
         memo.insert(net.to_string(), false);
         false
+    }
+
+    /// One MUXCY/XOR slice: (sum, carry_out) from (S, DI, carry_in).
+    /// Shared kernel of both chain evaluators below.
+    fn carry_slice(s: bool, di: bool, c: bool) -> (bool, bool) {
+        (s ^ c, if s { c } else { di })
+    }
+
+    /// Live Carry4 chain output for the step path (`String`-keyed memo via
+    /// `resolve`, usually [`Sim::pin_net_value`]). `out` 0-3 selects sum bit
+    /// O, `out` 4 selects the carry out CO. Unconnected inputs tie low; a
+    /// connected but unresolvable input yields X (None).
+    fn carry_output_live(
+        &self,
+        cell: &str,
+        out: u8,
+        resolve: &mut dyn FnMut(&str) -> Option<bool>,
+    ) -> Option<bool> {
+        let pins = self.carry.get(cell)?;
+        let mut c = match pins.ci.as_deref() {
+            None => Some(false),
+            Some(n) => resolve(n),
+        }?;
+        for j in 0..4u8 {
+            let s = match pins.s[j as usize].as_deref() {
+                None => Some(false),
+                Some(n) => resolve(n),
+            }?;
+            let di = match pins.di[j as usize].as_deref() {
+                None => Some(false),
+                Some(n) => resolve(n),
+            }?;
+            let (o, cn) = Self::carry_slice(s, di, c);
+            c = cn;
+            if j == out {
+                return Some(o);
+            }
+        }
+        Some(c)
+    }
+
+    /// Live Carry4 chain output for the ILA probe path (`&str`-keyed memo,
+    /// recursive through [`Sim::eval_net`]). Same chain semantics as
+    /// [`Sim::carry_output_live`]; separate loop only because the two memos
+    /// have invariantly different key types.
+    fn carry_output_net<'s>(
+        &'s self,
+        cell: &'s str,
+        out: u8,
+        memo: &mut HashMap<&'s str, bool>,
+        stack: &mut Vec<&'s str>,
+    ) -> Option<bool> {
+        let pins = self.carry.get(cell)?;
+        let mut c = match pins.ci.as_deref() {
+            None => Some(false),
+            Some(n) => self.eval_net(n, memo, stack),
+        }?;
+        for j in 0..4u8 {
+            let s = match pins.s[j as usize].as_deref() {
+                None => Some(false),
+                Some(n) => self.eval_net(n, memo, stack),
+            }?;
+            let di = match pins.di[j as usize].as_deref() {
+                None => Some(false),
+                Some(n) => self.eval_net(n, memo, stack),
+            }?;
+            let (o, cn) = Self::carry_slice(s, di, c);
+            c = cn;
+            if j == out {
+                return Some(o);
+            }
+        }
+        Some(c)
     }
 
     /// Live LUT output with driven inputs and multi-level chains resolved.
@@ -454,6 +626,20 @@ impl Sim {
             let o = self.lut_output_live(lut, &mut memo, &mut stack);
             next_q.insert(ff.clone(), o);
         }
+        // ZB-04 stage 1: carry-driven FFs step from chain eval on the same
+        // edge and memo. Step semantics match the LUT path: unresolvable
+        // reads as 0 (loops/X surface through the ILA probe path instead).
+        let carries: Vec<(String, String, u8)> = self
+            .ff_d_carry
+            .iter()
+            .map(|(f, (c, o))| (f.clone(), c.clone(), *o))
+            .collect();
+        for (ff, cell, out) in &carries {
+            let mut resolve = |n: &str| Some(self.pin_net_value(n, &mut memo, &mut stack));
+            if let Some(o) = self.carry_output_live(cell, *out, &mut resolve) {
+                next_q.insert(ff.clone(), o);
+            }
+        }
         for (k, v) in next_q {
             self.ff_q.insert(k, v);
         }
@@ -550,6 +736,13 @@ impl Sim {
                         val = Some(o);
                         break;
                     }
+                } else if carry_out_pin(&e.pin).is_some() && self.carry.contains_key(&e.cell) {
+                    // ZB-04 stage 1: Carry4-driven nets resolve through chain
+                    // eval so VCD dumps include sum/carry nets.
+                    if let Some(o) = self.net_value(&n.name) {
+                        val = Some(o);
+                        break;
+                    }
                 }
             }
             if let Some(v) = val {
@@ -620,6 +813,12 @@ impl Sim {
                 } else {
                     Some((init >> addr) & 1 == 1)
                 }
+            }
+            NetDriver::Carry { cell, out } => {
+                stack.push(net);
+                let v = self.carry_output_net(cell, *out, memo, stack);
+                stack.pop();
+                v
             }
         };
         if let Some(b) = v {
@@ -1153,4 +1352,124 @@ endmodule
         s.step_posedge(10);
         assert_eq!(s.sample("u_ff"), Some(1));
     }
+
+    /// Hand-built 4-bit incrementer on one Carry4: proves the chain evaluator
+    /// counts 0..15 without any synthesis in the loop.
+    fn carry4_counter_dut() -> Design {
+        let mut d = Design::new("carry4cnt");
+        d.add_port("clk", PortDir::In);
+        d.add_cell("u_one", CellKind::Lut6 { init: u64::MAX });
+        d.connect("one", "u_one", "O");
+        d.add_cell("u_zero", CellKind::Lut6 { init: 0 });
+        d.connect("zero", "u_zero", "O");
+        d.add_cell("u_c", CellKind::Carry4);
+        d.connect("one", "u_c", "CI");
+        for j in 0..4 {
+            d.connect(format!("s{j}"), "u_c", format!("S{j}"));
+            d.connect("zero", "u_c", format!("DI{j}"));
+            d.connect(format!("o{j}"), "u_c", format!("O{j}"));
+        }
+        for i in 0..4 {
+            d.add_cell(format!("u_s{i}"), CellKind::Lut6 { init: 0xFFFF_FFFF_0000_0000 });
+            d.connect(format!("q{i}"), format!("u_s{i}"), "I5");
+            d.connect(format!("s{i}"), format!("u_s{i}"), "O");
+            d.add_cell(format!("u_ff{i}"), CellKind::Hff);
+            d.connect("clk", format!("u_ff{i}"), "CLK");
+            d.connect(format!("o{i}"), format!("u_ff{i}"), "D");
+            d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
+        }
+        d
+    }
+
+    #[test]
+    fn carry4_chain_counts_binary() {
+        let d = carry4_counter_dut();
+        let mut s = Sim::new(&d);
+        // ILA probe path resolves a carry-driven sum net between edges.
+        assert_eq!(s.net_value("o0"), Some(true), "CI=1 so O0=~Q0=1 pre-step");
+        for want in 1u32..=16 {
+            s.step_posedge(10);
+            let mut got = 0u32;
+            for i in 0..4 {
+                if s.net_value(&format!("q{i}")) == Some(true) {
+                    got |= 1 << i;
+                }
+            }
+            assert_eq!(got, want & 0xF, "cycle {want}: counter Q must read {0:X}", want & 0xF);
+        }
+    }
+
+    /// ZB-04 stage 1 equivalence oracle: the carry path on any whole-register
+    /// increment must simulate identically to the default cone flow, with the
+    /// same Q nets, `want_carry` Carry4 cells, and `want_ff` FFs. The oracle
+    /// here is differential (cone flow), not the Vivado bitstream; bit-level
+    /// Vivado equivalence waits on the backend Carry4 consumer (later stage).
+    fn assert_carry_matches_cone(
+        src: &str,
+        origin: &str,
+        want_carry: usize,
+        want_ff: usize,
+        cycles: u32,
+    ) {
+        use helion_sv::{synth_sv, synth_sv_carry};
+        let cone = synth_sv(src, origin).expect("cone synth");
+        let carry = synth_sv_carry(src, origin).expect("carry synth");
+
+        let count_kind = |d: &Design, pred: fn(&CellKind) -> bool| {
+            d.cells.iter().filter(|c| pred(&c.kind)).count()
+        };
+        assert_eq!(count_kind(&cone, |k| matches!(k, CellKind::Carry4)), 0);
+        assert_eq!(count_kind(&carry, |k| matches!(k, CellKind::Carry4)), want_carry);
+        assert_eq!(count_kind(&cone, |k| matches!(k, CellKind::Hff)), want_ff);
+        assert_eq!(count_kind(&carry, |k| matches!(k, CellKind::Hff)), want_ff);
+
+        let qnets = |d: &Design| {
+            let mut names: Vec<String> = d
+                .nets
+                .iter()
+                .filter(|n| n.endpoints.iter().any(|e| e.pin == "Q"))
+                .map(|n| n.name.clone())
+                .collect();
+            names.sort();
+            names
+        };
+        let cone_q = qnets(&cone);
+        assert_eq!(cone_q.len(), want_ff, "cone Q nets: {cone_q:?}");
+        assert_eq!(qnets(&carry), cone_q, "carry path keeps the same Q nets");
+
+        let mut sc = Sim::new(&cone);
+        let mut sk = Sim::new(&carry);
+        for cycle in 1..=cycles {
+            sc.step_posedge(10);
+            sk.step_posedge(10);
+            for q in &cone_q {
+                assert_eq!(
+                    sk.net_value(q),
+                    sc.net_value(q),
+                    "cycle {cycle}: Q net {q} must match",
+                );
+            }
+        }
+    }
+
+    /// Golden RTL (25-bit counter + registered LD0): 7 Carry4, 26 FFs.
+    /// Traces to the real Vivado oracle via examples/blinky_reg.sv, the
+    /// documented equivalent of ~/CDA4253_A1/blinky.vhd.
+    #[test]
+    fn carry_increment_matches_cone_sim_on_blinky_reg() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/blinky_reg.sv");
+        let src = std::fs::read_to_string(&root).expect("blinky_reg.sv");
+        assert_carry_matches_cone(&src, "blinky_reg.sv", 7, 26, 70);
+    }
+
+    /// Different width (8 bits, 2 groups) plus full wraparound at 256: proves
+    /// the grouping and chaining logic generalizes instead of fitting blinky.
+    #[test]
+    fn carry_increment_matches_cone_sim_on_8bit_wrap() {
+        let src = "module cnt8(input wire clk, output reg [7:0] q);\n\
+                   always @(posedge clk) q <= q + 1'b1;\nendmodule\n";
+        assert_carry_matches_cone(src, "cnt8.sv", 2, 8, 300);
+    }
+
 }

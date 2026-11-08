@@ -3031,14 +3031,18 @@ enum OwnForStitch {
 /// would re-synth; small cells (csr/buf/counter) stay cached for reuse.
 fn lower_own_for_stitch(rtl: &Rtl) -> Result<OwnForStitch, String> {
     let key = own_cache_key(rtl);
-    if let Some(hit) = own_cache_get(&key, &rtl.module) {
-        return Ok(OwnForStitch::Cached(hit));
+    // Carry inference changes the lowered cells; the cache is keyed on RTL
+    // alone, so bypass it while inference is on (no cross-flag poisoning).
+    if !carry_infer_enabled() {
+        if let Some(hit) = own_cache_get(&key, &rtl.module) {
+            return Ok(OwnForStitch::Cached(hit));
+        }
     }
     own_cache_note_rebuilt(&rtl.module);
     let t0 = std::time::Instant::now();
     let d = synth_rtl(rtl)?;
     synth_sub_add(t0.elapsed().as_millis(), 0, 0);
-    if d.cells.len() <= 512 {
+    if !carry_infer_enabled() && d.cells.len() <= 512 {
         own_cache_insert(key, Arc::new(d.clone_data()));
     }
     Ok(OwnForStitch::Fresh(d))
@@ -3069,16 +3073,18 @@ fn design_from_arc(arc: Arc<Design>) -> Design {
 /// inserting Arc before `try_unwrap` forced clone+rebuild on every miss.
 fn lower_own_cached(rtl: &Rtl) -> Result<Design, String> {
     let key = own_cache_key(rtl);
-    if let Some(hit) = own_cache_get(&key, &rtl.module) {
-        let mut d = hit.clone_data();
-        d.rebuild_indexes();
-        return Ok(d);
+    if !carry_infer_enabled() {
+        if let Some(hit) = own_cache_get(&key, &rtl.module) {
+            let mut d = hit.clone_data();
+            d.rebuild_indexes();
+            return Ok(d);
+        }
     }
     own_cache_note_rebuilt(&rtl.module);
     let t0 = std::time::Instant::now();
     let d = synth_rtl(rtl)?;
     synth_sub_add(t0.elapsed().as_millis(), 0, 0);
-    if d.cells.len() <= 512 {
+    if !carry_infer_enabled() && d.cells.len() <= 512 {
         own_cache_insert(key, Arc::new(d.clone_data()));
     }
     Ok(d)
@@ -16235,6 +16241,69 @@ fn propagate_const_wires<'a>(rtl: &mut Rtl<'a>, arena: &'a Bump) {
     });
 }
 
+// ZB-04 stage 1: whole-register increment on the carry fast path.
+// Lowers one `lhs <= lhs + 1` nonblocking update to a Carry4 chain plus
+// per-bit S-LUTs (Q passthrough) and rewires each FF D net to its sum bit,
+// following the IR pin convention in helion-ir Carry4 docs (CI/CO, S3..S0
+// MSB-first, DI3..DI0, O3..O0) and the golden recipe in
+// docs/zedboard-handoff/findings/blinky_chain_golden.txt. Bit endpoint
+// order is LSB-first within each nibble group, matching the probe; the
+// backend maps endpoints to physical pins. No reg_bits/Expr work happens
+// here, so the normal per-bit cone path must be skipped for this update.
+fn emit_carry_increment(
+    d: &mut Design,
+    carry_ffs: &mut Vec<(String, String)>,
+    rtl: &Rtl,
+    clk: &str,
+    lhs: &str,
+    w: usize,
+) {
+    let groups = w.div_ceil(4);
+    let one = format!("u_carry_{lhs}_one");
+    d.add_cell(&one, CellKind::Lut6 { init: u64::MAX });
+    d.connect(&one, &one, "O");
+    let zero = format!("u_carry_{lhs}_zero");
+    d.add_cell(&zero, CellKind::Lut6 { init: 0 });
+    d.connect(&zero, &zero, "O");
+    for g in 0..groups {
+        let base = g * 4;
+        let cin = if g == 0 {
+            one.clone()
+        } else {
+            format!("u_carry_{lhs}_co{}", g - 1)
+        };
+        let cname = format!("u_carry_{lhs}_c{g}");
+        d.add_cell(&cname, CellKind::Carry4);
+        d.connect(&cin, &cname, "CI");
+        d.connect(format!("u_carry_{lhs}_co{g}"), &cname, "CO");
+        for j in 0..4 {
+            if base + j < w {
+                d.connect(format!("u_carry_{lhs}_s{}", base + j), &cname, format!("S{j}"));
+                d.connect(&zero, &cname, format!("DI{j}"));
+                d.connect(format!("u_carry_{lhs}_o{}", base + j), &cname, format!("O{j}"));
+            }
+        }
+    }
+    // I5-only O6 passthrough (golden S-LUT INIT 0xffffffff00000000): O
+    // follows bit 5 of the LUT input word; L1 mystery inputs fold to zero.
+    const S_LUT_INIT: u64 = 0xFFFF_FFFF_0000_0000;
+    for i in 0..w {
+        let bit = bit_name(lhs, w, i);
+        let s = format!("u_carry_{lhs}_s{i}");
+        let o = format!("u_carry_{lhs}_o{i}");
+        let slut = format!("u_carry_{lhs}_s{i}_lut");
+        d.add_cell(&slut, CellKind::Lut6 { init: S_LUT_INIT });
+        d.connect(&bit, &slut, "I5");
+        d.connect(&s, &slut, "O");
+        let ff = format!("u_carry_{lhs}_ff{i}");
+        d.add_cell(&ff, CellKind::Hff);
+        d.connect(seq_clk_for(&rtl.module, &bit, clk), &ff, "CLK");
+        d.connect(&o, &ff, "D");
+        d.connect(&bit, &ff, "Q");
+        carry_ffs.push((ff, bit));
+    }
+}
+
 fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // FM-HEL-AREA-01: fold constant-driven wires before mapping so the AIG
     // builder sees `Expr::Const` (XNOR-with-const -> wire, AND-with-c0 -> c0).
@@ -16313,6 +16382,17 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // Variable-index write (depth≤32, width≤16) → Hffs on the user's clock.
     // The read stays a single variable_index_read; do not walk a wide cone.
     lowered_unpacked.extend(lower_var_index_words(&mut d, rtl, clk, &arena));
+    // ZB-04 stage 1: count whole-register writers so the carry fast path
+    // only fires when the increment is the single update to its register.
+    // Mixing carry and cone FFs on one Q net would double-drive it.
+    let mut nba_counts: HashMap<&str, usize> = HashMap::new();
+    if carry_infer_enabled() {
+        for (lhs, _, _) in &rtl.nbas {
+            *nba_counts.entry(*lhs).or_insert(0) += 1;
+        }
+    }
+    // (carry FF cell, Q net) pairs for keep/mark_debug after the loop.
+    let mut carry_ffs: Vec<(String, String)> = Vec::new();
     for (lhs, bit, rhs) in &rtl.nbas {
         if sig_depth(rtl, lhs) > 0 {
             continue;
@@ -16333,6 +16413,13 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 reg_bits.push((bit_name(lhs, w, *b), e));
             }
         } else if rexpr_is_plus_one(rhs) && rexpr_ident(rhs).as_deref() == Some(*lhs) {
+            // ZB-04 stage 1: single whole-register `lhs <= lhs + 1` takes the
+            // carry fast path under opt-in; the cone path below is skipped so
+            // each Q net keeps exactly one FF driver.
+            if carry_infer_enabled() && nba_counts.get(lhs) == Some(&1) {
+                emit_carry_increment(&mut d, &mut carry_ffs, rtl, clk, lhs, w);
+                continue;
+            }
             for i in 0..w {
                 reg_bits.push((bit_name(lhs, w, i), inc_bit_expr(lhs, w, i, &arena)));
             }
@@ -16904,6 +16991,17 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
         if md_bits.contains(bitn) {
             let _ = d.mark_debug(&qnet);
+        }
+    }
+
+    // ZB-04 stage 1: keep/mark_debug follow carry-chain FFs by Q net, the
+    // same rule the cone path applies above.
+    for (ff, bitn) in &carry_ffs {
+        if keep_bits.contains(bitn) {
+            let _ = d.dont_touch(ff);
+        }
+        if md_bits.contains(bitn) {
+            let _ = d.mark_debug(bitn);
         }
     }
 
@@ -18080,6 +18178,30 @@ pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
     // out-of-subset rejections raised) uniformly; elaboration only acts when
     // the top module actually carries assertions.
     sva::synth_sv_with_sva(source, origin).map(|o| o.design)
+}
+
+thread_local! {
+    static CARRY_INFER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Like [`synth_sv`], but whole-register `reg <= reg + 1` updates lower to
+/// Carry4 chains (plus S-LUTs and rewired FF D nets) instead of LUT ripple
+/// trees. Opt-in: the default flow is untouched. The backend consumes the
+/// cells in a later stage; until then only IR shape and simulation prove it.
+pub fn synth_sv_carry(source: &str, origin: &str) -> Result<Design, String> {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CARRY_INFER.set(false);
+        }
+    }
+    CARRY_INFER.set(true);
+    let _guard = Guard;
+    synth_sv(source, origin)
+}
+
+fn carry_infer_enabled() -> bool {
+    CARRY_INFER.get()
 }
 
 /// Module names in one SV file (helion-sv parse). UG900 SIM_TOP candidates.
