@@ -78,6 +78,31 @@ the FF. LD0 fully dark means the clock never reached the FF.
 Depends on ZB-01 for hardware validation. Related to ZB-07 (site
 selection) and ZB-10 (Vivado diff as ground truth).
 
+## Vivado ground truth (Nov 8, 2026, Mac, from ZB-10)
+
+First same-RTL diff ever run: Helion examples/blinky_reg.sv build
+(/tmp/x7/blinky_reg_helion.bit) vs Vivado GT-blinky.bit. Caution: the
+diffed Helion build is from fm/zedboard-fix-router, which does NOT
+contain the 7-feature fix (that lives on fm/zedboard-fix-bufg). What
+the diff proves about this branch's BUFG emit:
+
+- Helion sets ZINV_CE1 and ZINV_S1 (frame 0x42109a word 93 bit 11,
+  ours=1 ref=0). Vivado does not. Confirms the I1-path diagnosis: do
+  not emit these for the I0 clock.
+- Vivado sets IS_IGNORE1_INVERTED (frame 0x42109b word 93 bit 12,
+  ours=0 ref=1). Helion does not. Add it.
+- Vivado sets CLK_BUFG input-mux pips CK_MUXED0, IMUX24_0, IMUX28_0
+  (frame 0x42109a word 93 bit 8, ours=0 ref=1). Helion routes no
+  input mux into the BUFG. Missing clock-input routing.
+- Helion sets ZPRESELECT_I0 (frame 0x42109a word 93 bit 2, ours=1
+  ref=0). Vivado does not. Open question against the 7-feature list:
+  recheck whether I0 to O needs it.
+- IS_IGNORE0_INVERTED does not differ: both sides agree on it.
+- Wider clock tree: Vivado enables HCLK region buffers (word-50 bits
+  across HCLK_R, HCLK_IOI3, CLK_HROW_BOT_R, all ref=1 ours=0).
+  Helion emits zero HCLK bits. Separate gap, file it if it is not
+  owned already.
+
 ## Rules
 
 - No em dashes anywhere.

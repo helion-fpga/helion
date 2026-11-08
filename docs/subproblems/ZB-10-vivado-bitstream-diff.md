@@ -81,3 +81,43 @@ frames). Related to US-08.
 - Never fabricate. A bit is either identical or it is not; report the
   positions.
 - Do not compare bitstreams from different designs or different pin maps.
+
+## First run (Nov 8, 2026, Mac)
+
+Pair: Helion examples/blinky_reg.sv build
+(/tmp/x7/blinky_reg_helion.bit, 4,045,666 bytes, from
+crates/helion-xilinx7/tests/blinky_reg_e2e.rs) vs Vivado
+~/CDA4253_A1/blinky.bit (= work/ref/GT-blinky.bit, md5 3f6d7cfa...,
+verified before the run). Same RTL, same part, same pins (clk Y9,
+LD0 T22). Commands:
+
+- `cargo test --release -p helion-xilinx7 --test blinky_reg_e2e`
+  (no env setup; DB auto-resolved)
+- `python3 work/rawdiff.py /tmp/x7/blinky_reg_helion.bit
+  work/ref/GT-blinky.bit --json /tmp/x7/blinky_reg_diff.json`
+
+Result: 4,741 differing bits in 3,219 clusters (4,391 NAMED,
+350 UNNAMED, 15 in unclaimed frames). Full list in
+/tmp/x7/blinky_reg_diff.json. Tool note: rawdiff walks the full
+device frame map, so both inputs must be full-device payloads; the
+pre-fix partial Helion payload fails with "payload exhausted".
+
+Classification:
+
+- (a) Owned by ZB-02: ZINV_CE1/ZINV_S1 set by Helion only;
+  IS_IGNORE1_INVERTED and CLK_BUFG input-mux pips set by Vivado
+  only; ZPRESELECT_I0 set by Helion only (open question). Details
+  in ZB-02.
+- (a) Owned by ZB-04: Vivado implements the counter as a CARRY4
+  chain (PRECYINIT, ACY0, 0xffffffff00000000 LUTs); Helion builds
+  it from LUTs. All chain-slice diffs trace to this.
+- (b) New gap, needs a file: HCLK region clock buffers. Vivado
+  sets word-50 bits across HCLK_R, HCLK_IOI3, CLK_HROW_BOT_R
+  (hundreds of ref=1 ours=0, all UNNAMED); Helion emits zero HCLK
+  bits.
+- (c) Placement freedom: CLB/INT routing diffs outside the items
+  above. The two placers put logic in different slices, so raw
+  positions differ even where encodings agree. A canonicalised
+  per-cell comparison is still open.
+- Not done: zero diff. This run is the baseline all fixes measure
+  against.
