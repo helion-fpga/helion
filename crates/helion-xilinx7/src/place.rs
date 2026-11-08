@@ -6,7 +6,7 @@
 //! get their own slice. The placer queries the device through
 //! [`DeviceQuery`] so the algorithm stays independent of the DB layout.
 
-use crate::pack::{IobDir, Packed7};
+use crate::pack::{IobDir, Packed7, PackedCarry};
 use std::collections::{HashMap, HashSet};
 
 /// What the placer needs from the device model. Implemented by the real DB
@@ -24,6 +24,13 @@ pub trait DeviceQuery {
     fn tile_xy(&self, tile: &str) -> Option<(i32, i32)>;
     /// A free SLICEL site near `(x, y)`; `used` holds taken site names.
     fn slice_near(&self, x: i32, y: i32, used: &HashSet<String>) -> Option<(String, String)>;
+    /// The free slice directly above `site` up the carry column: the slice
+    /// whose CIN is driven by `site`'s COUT through the dedicated cascade
+    /// wire. 7-series order, proven by the blinky golden chain (X71Y39 to
+    /// Y45): ascending slice name Y, X0 before X1 within a tile. Returns
+    /// `None` when the neighbor is taken or the column ends; the caller
+    /// must fail loudly, since a non-adjacent cascade is unroutable.
+    fn slice_above(&self, site: &str, used: &HashSet<String>) -> Option<(String, String)>;
 }
 
 /// A placed LUT: tile + slice site + BEL.
@@ -102,6 +109,47 @@ pub struct Placed7 {
     pub carries: Vec<PlacedCarry>,
 }
 
+/// Order packed carries into chains by CO-to-CI net linkage (ZB-08).
+///
+/// Each chain runs head to tail: the head is the group whose CI net is not
+/// driven by any other group CO in this design. Linkage is by net name,
+/// never by cell naming. Two chains may share one CI net (one const source
+/// feeding two CYINITs); a mid-chain fork or a cycle leaves a group
+/// unreachable from any head and fails loudly.
+fn order_carry_chains(carries: &[PackedCarry]) -> Result<Vec<Vec<&PackedCarry>>, String> {
+    let by_ci: HashMap<&str, &PackedCarry> =
+        carries.iter().map(|c| (c.ci_net.as_str(), c)).collect();
+    let co_nets: HashSet<&str> = carries
+        .iter()
+        .filter_map(|c| c.co_net.as_deref())
+        .collect();
+    let mut chains = Vec::new();
+    let mut placed: HashSet<&str> = HashSet::new();
+    for head in carries.iter().filter(|c| !co_nets.contains(c.ci_net.as_str())) {
+        let mut chain = Vec::new();
+        let mut cur: Option<&PackedCarry> = Some(head);
+        while let Some(c) = cur {
+            if !placed.insert(c.name.as_str()) {
+                return Err(format!("place: CARRY4 chain cycles at {}", c.name));
+            }
+            chain.push(c);
+            cur = c.co_net.as_deref().and_then(|co| by_ci.get(co).copied());
+        }
+        chains.push(chain);
+    }
+    if placed.len() != carries.len() {
+        let missing = carries
+            .iter()
+            .find(|c| !placed.contains(c.name.as_str()))
+            .map(|c| c.name.as_str())
+            .unwrap_or("?");
+        return Err(format!(
+            "place: CARRY4 {missing} is not reachable from any chain head (cycle?)"
+        ));
+    }
+    Ok(chains)
+}
+
 /// BEL letters within a slice: A, B, C, D.
 const BEL_LETTERS: [char; 4] = ['A', 'B', 'C', 'D'];
 
@@ -176,19 +224,34 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         });
     }
 
-    // 2d. CARRY4s. Placed in SLICE sites; the carry chain connects
-    // vertically within the column. Minimal: place on free slices.
+    // 2d. CARRY4s, ordered into chains by CO-to-CI net linkage (ZB-08).
+    // Each chain head goes on a free slice near the anchor; every next
+    // group goes directly above its predecessor so the dedicated COUT to
+    // CIN cascade wire reaches. A broken column fails loudly: scattering
+    // chained groups would leave the CO nets unroutable.
     let (ax, ay) = anchor.unwrap_or((0, 0));
-    for carry in &packed.carries {
-        let (tile, site) = device
-            .slice_near(ax, ay, &used_sites)
-            .ok_or_else(|| format!("place: no SLICE site for CARRY4 {}", carry.name))?;
-        used_sites.insert(site.clone());
-        out.carries.push(PlacedCarry {
-            name: carry.name.clone(),
-            tile,
-            site,
-        });
+    for chain in order_carry_chains(&packed.carries)? {
+        let mut prev_site: Option<String> = None;
+        for carry in chain {
+            let (tile, site) = match &prev_site {
+                None => device.slice_near(ax, ay, &used_sites).ok_or_else(|| {
+                    format!("place: no SLICE site for CARRY4 {}", carry.name)
+                })?,
+                Some(prev) => device.slice_above(prev, &used_sites).ok_or_else(|| {
+                    format!(
+                        "place: no free slice above {} for chained CARRY4 {}",
+                        prev, carry.name
+                    )
+                })?,
+            };
+            used_sites.insert(site.clone());
+            prev_site = Some(site.clone());
+            out.carries.push(PlacedCarry {
+                name: carry.name.clone(),
+                tile,
+                site,
+            });
+        }
     }
 
     // 3. Pair FFs with their driving LUTs (FF.D == LUT.O) into one slice.
@@ -274,7 +337,7 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pack::{PackedBufg, PackedFf, PackedIob, PackedLut};
+    use crate::pack::{PackedBufg, PackedCarry, PackedFf, PackedIob, PackedLut};
 
     struct FakeDevice;
     impl DeviceQuery for FakeDevice {
@@ -305,6 +368,23 @@ mod tests {
                 }
             }
             None
+        }
+        // Same parity rule as the real device: X1 of the same tile after
+        // X0, else X0 of the tile one row higher. Tile name follows site.
+        fn slice_above(&self, site: &str, used: &HashSet<String>) -> Option<(String, String)> {
+            let rest = site.strip_prefix("SLICE_X")?;
+            let (xs, ys) = rest.split_once('Y')?;
+            let x: i32 = xs.parse().ok()?;
+            let y: i32 = ys.parse().ok()?;
+            let (tx, ty) = if x % 2 == 0 { (x + 1, y) } else { (x - 1, y + 1) };
+            if !(0..100).contains(&ty) {
+                return None;
+            }
+            let want = format!("SLICE_X{tx}Y{ty}");
+            if used.contains(&want) {
+                return None;
+            }
+            Some((format!("CLB_X{tx}Y{ty}"), want))
         }
     }
 
@@ -379,5 +459,65 @@ mod tests {
         p.iobs[0].loc = Some("Z99".into());
         let err = place(&p, &FakeDevice).unwrap_err();
         assert!(err.contains("Z99"), "got: {err}");
+    }
+
+    fn packed_carry(name: &str, ci: &str, co: Option<&str>) -> PackedCarry {
+        PackedCarry {
+            name: name.into(),
+            ci_net: ci.into(),
+            co_net: co.map(|s| s.into()),
+            s_nets: Default::default(),
+            di_nets: Default::default(),
+            o_nets: Default::default(),
+        }
+    }
+
+    /// A 3-group chain (listed tail-first to prove ordering is by net
+    /// linkage, not input order) must land on consecutive column slices:
+    /// X0Y0, X1Y0, X0Y1.
+    #[test]
+    fn place_chained_carries_stack_up_the_column() {
+        let mut p = packed_blinky();
+        p.carries = vec![
+            packed_carry("u_c2", "co1", None),
+            packed_carry("u_c0", "one", Some("co0")),
+            packed_carry("u_c1", "co0", Some("co1")),
+        ];
+        let placed = place(&p, &FakeDevice).unwrap();
+        let sites: Vec<&str> = placed.carries.iter().map(|c| c.site.as_str()).collect();
+        assert_eq!(sites, vec!["SLICE_X0Y0", "SLICE_X1Y0", "SLICE_X0Y1"]);
+        let names: Vec<&str> = placed.carries.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["u_c0", "u_c1", "u_c2"]);
+    }
+
+    /// A carry cycle has no head: fail loudly instead of scattering.
+    #[test]
+    fn place_carry_cycle_fails_loudly() {
+        let mut p = packed_blinky();
+        p.carries = vec![
+            packed_carry("u_c0", "b", Some("a")),
+            packed_carry("u_c1", "a", Some("b")),
+        ];
+        let err = place(&p, &FakeDevice).unwrap_err();
+        assert!(err.contains("chain head"), "got: {err}");
+    }
+
+    /// Fake column rule mirrors the device: X1 of the same tile after X0,
+    /// X0 of the next row after X1; taken neighbor yields None.
+    #[test]
+    fn fake_slice_above_follows_column_rule() {
+        let dev = FakeDevice;
+        let used = HashSet::new();
+        assert_eq!(
+            dev.slice_above("SLICE_X0Y0", &used),
+            Some(("CLB_X1Y0".into(), "SLICE_X1Y0".into()))
+        );
+        assert_eq!(
+            dev.slice_above("SLICE_X1Y0", &used),
+            Some(("CLB_X0Y1".into(), "SLICE_X0Y1".into()))
+        );
+        let mut taken = HashSet::new();
+        taken.insert("SLICE_X1Y0".into());
+        assert_eq!(dev.slice_above("SLICE_X0Y0", &taken), None);
     }
 }
