@@ -331,7 +331,7 @@ fn blinky_reg_carry_e2e_fasm() {
     assert_eq!(
         fasm_text.matches("64'hFFFFFFFF00000000").count(),
         41,
-        "25 compute plus 16 pad S-LUT passthrough INITs"
+        "25 compute plus 16 pad-fill S-LUT passthrough INITs"
     );
     assert_eq!(fasm_text.matches("FFMUX.XOR").count(), 25, "chain FF D muxes");
     assert!(!fasm_text.contains("BCY0"), "no BCY0:\n{fasm_text}");

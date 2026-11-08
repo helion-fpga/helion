@@ -16273,8 +16273,8 @@ fn emit_carry_increment(
     // A pad sits between compute groups c_k and c_{k+1} for 1 <= k <= n-3
     // (never after the head, never before the tail): the backend walks the
     // linkage in strict alternation, so pads land on the skipped X1 slots
-    // exactly like the golden transparent pads (X1@Y40-43: S=0 gives
-    // CO=CY, no FFs, unconnected I5 reads low). Fewer than 4 groups need
+    // exactly like the golden transparent pads (X1@Y40-43: carry plus
+    // four routed passthrough S-LUTs, no FFs). Fewer than 4 groups need
     // no pads (every step stays adjacent).
     let pad_after = |k: usize| k >= 1 && k + 3 <= groups;
     for g in 0..groups {
@@ -16301,16 +16301,29 @@ fn emit_carry_increment(
             }
         }
         if pad_after(g) {
+            // Transparent pad with routed S-fill. The golden oracle pads
+            // (X1@Y40-43) carry four passthrough S-LUTs each (INIT
+            // 0xffffffff00000000, no FFs); every pad S input is routed,
+            // fed from sub-cone Q nets. Fill rule (provably exact: each
+            // fill bit is 1 whenever the pad carry-in is 1, so CO=CY and
+            // the pad is transparent): A takes the top Q of the compute
+            // group below (south entry, like the oracle NL1 loopback),
+            // B/C take that tile X0 C/D Qs (the oracle taps LOGIC_OUTS6/7
+            // directly), D repeats C. Floating I5 here would read S=0 and
+            // kill the chain above bit 8 (proven by the 5000-cycle sim).
             let pname = format!("u_carry_{lhs}_pad{g}");
             d.add_cell(&pname, CellKind::Carry4);
             d.connect(format!("u_carry_{lhs}_co{g}"), &pname, "CI");
             d.connect(format!("u_carry_{lhs}_pco{g}"), &pname, "CO");
+            let base = g * 4;
+            let fill = [base - 1, base + 2, base + 3, base + 3];
             for j in 0..4 {
                 let ps = format!("u_carry_{lhs}_ps{g}_{j}");
                 d.connect(&ps, &pname, format!("S{j}"));
                 let slut = format!("u_carry_{lhs}_ps{g}_{j}_lut");
                 d.add_cell(&slut, CellKind::Lut6 { init: S_LUT_INIT });
                 d.connect(&ps, &slut, "O");
+                d.connect(&bit_name(lhs, w, fill[j]), &slut, "I5");
             }
         }
     }
