@@ -17,9 +17,17 @@
   PRECYINIT.CIN per chained group, lone ACY0, FFMUX.XOR on chain
   FFs; DI reads S-LUT O5 internally (zero-LUT deleted). E2E test
   blinky_reg_carry_e2e_fasm proves the full flow to bits. Default
-  flow untouched (diff still 4688, run ten). Open: placement match
-  to the golden column; head-slice ALUT INIT micro-diffs
-  (0xff00ff../0x0f0f.. vs passthrough).
+  flow untouched (diff still 4688, run ten).
+- Status: stage 3 convergence (Nov 8, 2026, commits 99a863c plus
+  77ccc66). General carry-anchor pins the chain head; the anchored
+  run overlaps the golden column and diffs 1,812 vs oracle (run
+  eight). carrysim judges our carry bitstream a working counter.
+  Decoded: unconnected reads LOW (elimination proof); X1@Y40-43
+  pads transparent (S=0 gives CO=CY); head CYINIT=1 from X0-ALUT
+  const-1 into AX; CO = S ? O5 : CY per site JSON (our DI-low sim
+  exact here). Open: S-input routing convergence, transparent pad
+  emission, head const-1 ALUT, general O5 eval in sim; HCLK waits
+  on license.
 
 ## Goal
 
