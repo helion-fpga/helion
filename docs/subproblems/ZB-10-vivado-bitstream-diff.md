@@ -234,6 +234,23 @@ Next: S-input routing convergence (per-input IMUX mapping from INT
 pip decode) plus transparent pad emission, then the head const-1
 ALUT. HCLK UNNAMED still waits on the license.
 
+## Ninth run (Nov 8, 2026, Mac, pads)
+
+Same anchored carry pair with transparent pads (commit 1734c0c):
+1,264 differing bits in 868 clusters (record
+/tmp/x7/carry_vs_oracle_diff2.json: 914 NAMED, 350 UNNAMED, 15
+unclaimed), down from 1,812. Composition: 568 ROUTING, 272
+LUT_INIT, 58 FF_CFG, 12 CLOCK, 3 OTHER, 1 CARRY_CFG, 350 UNNAMED.
+Pads closed 4 CARRY_CFG plus ~510 LUT_INIT/FF bits; placed order
+matches the golden slices exactly (X1@Y39, X0/X1 @Y40-43,
+X0@Y44, X1@Y44, asserted in the e2e). Last CARRY_CFG bit is the
+LD0-tail tile (Y45 SLICEM PRECYINIT: golden LD0 slice carries CIN,
+ours places LD0 generically). carrysim judges the pad-carrying
+build a working counter (plus a fixed tool crash when the sibling
+half outnumbers the target lanes); oracle re-validates unchanged
+after the tool fix. Sim proves pads transparent (70 cycles
+cone-identical with 4 pads in the chain).
+
 ## Seventh run (Nov 8, 2026, Mac, after full backend carry-through)
 
 Same pair, rebuilt default-flow Helion side (all three bitstream e2e
