@@ -12,6 +12,15 @@ use crate::place::DeviceQuery;
 use crate::route::{BufgSpine, BufgTieoff, RouteQuery, RoutedPip};
 use std::collections::{HashMap, HashSet};
 
+/// Parse a full slice site name `SLICE_X{x}Y{y}` into `(x, y)`. Even x is
+/// the X0/M slice, odd x the X1/L slice; tile Y matches name Y. Shared by
+/// the cascade neighbor rule so fakes and the device cannot drift apart.
+pub(crate) fn parse_slice_xy(site: &str) -> Option<(i32, i32)> {
+    let rest = site.strip_prefix("SLICE_X")?;
+    let (xs, ys) = rest.split_once('Y')?;
+    Some((xs.parse().ok()?, ys.parse().ok()?))
+}
+
 /// Precomputed routing node maps, built once per [`Device`] by
 /// [`build_node_map`] and shared (cloned) across flow stages.
 ///
@@ -258,16 +267,25 @@ impl<'a> DeviceQuery for XDevice<'a> {
             .map(|(_, tile, site)| (tile, site))
     }
 
+    fn anchor_slice(&self, site: &str, used: &HashSet<String>) -> Option<(String, String)> {
+        // A caller-pinned chain-head site: validate the name parses, the
+        // slice exists on the device, and it is still free.
+        parse_slice_xy(site)?;
+        if used.contains(site) {
+            return None;
+        }
+        self.device
+            .slices()
+            .into_iter()
+            .find(|(_, s)| s == site)
+    }
+
     fn slice_above(&self, site: &str, used: &HashSet<String>) -> Option<(String, String)> {
-        // Full site names are `SLICE_X{x}Y{y}` (even x = X0/M, odd x = X1/L;
-        // tile Y matches name Y; each tile holds one even/odd pair). The
-        // cascade neighbor is the next slice up the column: X1 of the same
-        // tile after X0, else X0 of the tile one name-Y higher: X113Y39 is
-        // followed by X112Y40. Proven by the blinky golden chain.
-        let rest = site.strip_prefix("SLICE_X")?;
-        let (xs, ys) = rest.split_once('Y')?;
-        let x: i32 = xs.parse().ok()?;
-        let y: i32 = ys.parse().ok()?;
+        // The cascade neighbor is the next slice up the column: X1 of the
+        // same tile after X0, else X0 of the tile one name-Y higher:
+        // X113Y39 is followed by X112Y40. Proven by the blinky golden
+        // chain (X71Y39 to Y45, alternating with transparent X1 pads).
+        let (x, y) = parse_slice_xy(site)?;
         let (tx, ty) = if x % 2 == 0 { (x + 1, y) } else { (x - 1, y + 1) };
         let want = format!("SLICE_X{tx}Y{ty}");
         if used.contains(&want) {

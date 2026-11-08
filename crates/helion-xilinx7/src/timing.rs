@@ -287,6 +287,7 @@ mod tests {
             brams: vec![],
             dsps: vec![],
             carries: vec![],
+            carry_anchor: None,
         };
         let routed = Routed7 {
             placed: Placed7 {

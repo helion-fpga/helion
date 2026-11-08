@@ -504,6 +504,7 @@ mod tests {
             brams: vec![],
             dsps: vec![],
             carries: vec![],
+            carry_anchor: None,
         };
         let placed = Placed7 {
             packed: packed.clone(),
@@ -735,6 +736,7 @@ mod tests {
             brams: vec![PackedBram { name: "u_bram".into(), init: vec![] }],
             dsps: vec![],
             carries: vec![],
+            carry_anchor: None,
         };
         let placed = Placed7 {
             packed: packed.clone(),

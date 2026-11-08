@@ -129,6 +129,11 @@ pub struct Packed7 {
     pub brams: Vec<PackedBram>,
     pub dsps: Vec<PackedDsp>,
     pub carries: Vec<PackedCarry>,
+    /// Optional pinned site for the first carry-chain head (e.g.
+    /// `SLICE_X113Y39`). General mechanism for convergence runs: the
+    /// caller pins a golden column, the placer never invents one.
+    /// `None` (the default) places the head near the anchor instead.
+    pub carry_anchor: Option<String>,
 }
 
 /// Pack a [`Design`] into 7-series packable units.
