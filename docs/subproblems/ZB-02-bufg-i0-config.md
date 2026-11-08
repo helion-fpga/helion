@@ -103,6 +103,25 @@ the diff proves about this branch's BUFG emit:
   Helion emits zero HCLK bits. Separate gap, file it if it is not
   owned already.
 
+## Second run (Nov 8, 2026, Mac, after the emit fix)
+
+emit.rs now emits exactly IN_USE, ZINV_CE0, ZINV_S0,
+IS_IGNORE1_INVERTED (commit on fm/zedboard-fix-router; pinned by
+unit test emit_bufg_i0_config_matches_vivado). Rebuilt blinky_reg
+and re-ran the ZB-10 diff: 4,741 down to 4,737, and the BUFGCTRL
+config block is zero differing bits. Consequences:
+
+- ZPRESELECT_I0 question answered: removed, block is zero without
+  it.
+- The 7-feature list on fm/zedboard-fix-bufg (which adds INIT_OUT,
+  IS_IGNORE0_INVERTED, ZPRESELECT_I0) sets 3 bits Vivado does not
+  set. For Vivado-identical output those must go; whether they are
+  harmless on hardware is unproven until t02.
+- Still open on the clock path (router work, not static emit):
+  CLK_BUFG input-mux pips, the BUFGCTRL0_O to GCLK0 output pip,
+  and the REBUF enables. Helion routes the clock input through a
+  GFAN/GCLK detour instead.
+
 ## Rules
 
 - No em dashes anywhere.
