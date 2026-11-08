@@ -33,8 +33,22 @@ the 4 header lines.
 | segbits_hdio_top_right.db | 812 | 447d033863858ec0d712625bbd8370f8b0243f8a96ea80d7979b89eba9cff28b |
 | segbits_hdio_bot_right.db | 828 | 7dccae1fdba384c2ba39baf883ab61579857b5dc02e578bd65eb259d401654ba |
 | segbits_cmt_right.db | 104 | 01d806d0f55ba62ed2af2deafa5c2160f00477bc76ff7df2a5c69cac40ca4459 |
+| segbits_clel_l.db | 768 | c977e335ce757de5e0caa4d161de932dedf5b4d4c8c97f663680ee6506bc2501 |
+| segbits_clel_r.db | 768 | f6564ea5b04f25dd77c22d41d45348af407243d84894689ecb4204df2ae52fa1 |
+| segbits_clem.db | 829 | c1d4c6c156df25d6dad6f2b62610e5733933222d7d046e935db90ed57bea2bb2 |
+| segbits_clem_r.db | 829 | b8b40c13498ffe89c9c79d27cb64200fa3e4db1e789ded8b0709dd4400468bc7 |
 
-Total vendored segbits features: 7082.
+Total vendored segbits features: 10276.
+
+The four CLB DBs (CLEL_L, CLEL_R, CLEM, CLEM_R) were vendored 2026-11-07
+by the emitter worker (branch `fm/ultra-bitgen-emitter`), same source
+repo, commit, and license as the five above, because the emitter needs
+the CLB encodings to emit LUT INIT and FF INIT for the golden designs.
+Same 4-line header, same byte-identity rule, same verification. The
+emitter derives the single-feature `X6LUT.INIT[63:0]` lists from the
+per-bit `XLUT.INIT[i]` lines of these DBs at load time (see
+`FileSegbitsDb::synthesize_lut_init` in `src/segbits.rs`); the derived
+lists are not stored on disk.
 
 ### Origin-info DBs (`.origin_info.db` files)
 
@@ -49,6 +63,10 @@ same verification rule.
 | segbits_hdio_top_right.origin_info.db | 812 | ae96512ab0b1744a2ed629d6512693b7f5b8c611f7cb10b2cb9df50d51edb950 |
 | segbits_hdio_bot_right.origin_info.db | 828 | 57019d0dd3630949824becd7b92b2d3fb83738ba3e16d751e21f8739340a4d7f |
 | segbits_cmt_right.origin_info.db | 104 | f0eb87f07a05fe69addc5ba51e2715d1b967f13a6446a6e7f0be4a909285bdb8 |
+| segbits_clel_l.origin_info.db | 768 | a9c04251d7d78827e7ed1dfae2b7be1edcf5302b923b5a224043cf8cd7f8459f |
+| segbits_clel_r.origin_info.db | 768 | 1571cef21927800cddc70100ab08e61209145736b619d7692001a3304d7be754 |
+| segbits_clem.origin_info.db | 829 | 27a0ccaa65895a667104e8ecb0efab7d91987a14a9af78880766276eeba4a3dc |
+| segbits_clem_r.origin_info.db | 829 | 41e75c70b73fa609aea24bed5e8778adb7aacf9a79a08cefcbe3583d058e054f |
 
 ### Tile-type and site-type JSONs
 
