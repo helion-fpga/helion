@@ -81,6 +81,10 @@ pub enum RouteKind {
     SiteInternal,
     /// Dedicated clock spine (BUFG → global network → FF.CLK).
     ClockSpine,
+    /// Dedicated carry cascade (COUT → CIN of the slice above). No fabric
+    /// pips: CIN has no pip path (proven by the empty CIN pip set in the
+    /// CLBLM DB), so this net must never emit pips.
+    Cascade,
     /// General fabric route through INT pips.
     Pips(Vec<RoutedPip>),
 }
@@ -170,11 +174,63 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         add_ep(bufg.out_net.clone(), site.to_string(), "O", true);
     }
 
+    // Carry endpoints (ZB-04). The placer co-places each bit S-LUT and FF
+    // in the group slice, so S/O nets classify site-internal below. DI
+    // gets no endpoints: it reads the S-LUT O5 internally by mux default.
+    // Head CI arrives at the slice AX pin through fabric; chained CI joins
+    // its co net (dedicated cascade, classified in the net loop).
+    let carry_site: HashMap<&str, &str> = placed
+        .carries
+        .iter()
+        .map(|c| (c.name.as_str(), c.site.as_str()))
+        .collect();
+    let mut co_nets: HashSet<&str> = HashSet::new();
+    for carry in &packed.carries {
+        if let Some(co) = &carry.co_net {
+            co_nets.insert(co.as_str());
+        }
+    }
+    for carry in &packed.carries {
+        let site = carry_site.get(carry.name.as_str()).copied().unwrap_or("");
+        for j in 0..4 {
+            if let Some(o) = &carry.o_nets[j] {
+                add_ep(o.clone(), site.to_string(), &format!("O{j}"), true);
+            }
+            if let Some(s) = &carry.s_nets[j] {
+                add_ep(s.clone(), site.to_string(), &format!("S{j}"), false);
+            }
+        }
+        if let Some(co) = &carry.co_net {
+            add_ep(co.clone(), site.to_string(), "CO", true);
+        }
+        if co_nets.contains(carry.ci_net.as_str()) {
+            add_ep(carry.ci_net.clone(), site.to_string(), "CI", false);
+        } else {
+            // Chain head: CYINIT arrives at AX through fabric (golden uses
+            // PRECYINIT.AX fed by the const-1 LUT).
+            add_ep(carry.ci_net.clone(), site.to_string(), "AX", false);
+        }
+    }
+
     let mut nets = Vec::new();
     let mut net_names: Vec<String> = net_eps.keys().cloned().collect();
     net_names.sort();
     for net in net_names {
         let eps = &net_eps[&net];
+        if co_nets.contains(net.as_str()) {
+            // Dedicated cascade: exactly one CO driver plus one CI load.
+            // Any fabric fanout is a broken chain, not a route job.
+            let ok = eps.len() == 2
+                && eps.iter().any(|e| e.pin == "CO" && e.is_driver)
+                && eps.iter().any(|e| e.pin == "CI" && !e.is_driver);
+            if !ok {
+                return Err(format!(
+                    "route: cascade net `{net}` must be exactly CO-driver plus CI-load"
+                ));
+            }
+            nets.push(RoutedNet7 { net, kind: RouteKind::Cascade });
+            continue;
+        }
         let drivers: Vec<&Endpoint> = eps.iter().filter(|e| e.is_driver).collect();
         let loads: Vec<&Endpoint> = eps.iter().filter(|e| !e.is_driver).collect();
         if drivers.len() != 1 {
@@ -408,8 +464,8 @@ fn bfs_route(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pack::{IobDir, Packed7, PackedIob, PackedLut};
-    use crate::place::{Placed7, PlacedIob, PlacedLut};
+    use crate::pack::{IobDir, Packed7, PackedCarry, PackedFf, PackedIob, PackedLut};
+    use crate::place::{Placed7, PlacedCarry, PlacedFf, PlacedIob, PlacedLut};
 
     struct FakeRouter;
     impl RouteQuery for FakeRouter {
@@ -431,12 +487,14 @@ mod tests {
         fn site_pin_wire(&self, site: &str, pin: &str) -> Option<(String, String)> {
             match (site, pin) {
                 ("SLICE_X0", "AMUX") => Some(("INT_X0".into(), "B".into())),
+                ("SLICE_X1", "AMUX") => Some(("INT_X1".into(), "C".into())),
                 _ => None,
             }
         }
         fn wire_for_site_pin(&self, site: &str, pin: &str) -> Vec<(String, String)> {
             match (site, pin) {
                 ("IOB_X1", "O") => vec![("INT_X1".into(), "D".into())],
+                ("SLICE_X0", "AX") => vec![("INT_X1".into(), "D".into())],
                 _ => vec![],
             }
         }
@@ -526,5 +584,121 @@ mod tests {
         // Clock-spine classification is a device query; the router trusts it.
         assert!(FakeRouter.is_clock_net("clk_bufg"));
         assert!(!FakeRouter.is_clock_net("n1"));
+    }
+
+    /// Two chained groups with co-placed FFs/S-LUTs: co net takes the
+    /// dedicated cascade (no pips), S/O nets stay site-internal, head CI
+    /// routes through fabric to AX. FF clocks reuse o0 (fixture keeps the
+    /// driver count exact without a BUFG).
+    fn placed_carry_chain() -> Placed7 {
+        let packed = Packed7 {
+            luts: vec![
+                PackedLut {
+                    name: "u_one".into(), init: u64::MAX,
+                    input_nets: [None, None, None, None, None, None],
+                    output_net: "one".into(),
+                },
+                PackedLut {
+                    name: "u_s0".into(), init: 1,
+                    input_nets: [None, None, None, None, None, None],
+                    output_net: "s0".into(),
+                },
+                PackedLut {
+                    name: "u_s1".into(), init: 1,
+                    input_nets: [None, None, None, None, None, None],
+                    output_net: "s1".into(),
+                },
+            ],
+            ffs: vec![
+                PackedFf {
+                    name: "u_ff0".into(), d_net: "o0".into(), q_net: "q0".into(),
+                    clk_net: "o0".into(), ce_net: None, sr_net: None,
+                },
+                PackedFf {
+                    name: "u_ff1".into(), d_net: "o1".into(), q_net: "q1".into(),
+                    clk_net: "o1".into(), ce_net: None, sr_net: None,
+                },
+            ],
+            iobs: vec![],
+            bufgs: vec![],
+            brams: vec![],
+            dsps: vec![],
+            carries: vec![
+                PackedCarry {
+                    name: "u_c0".into(), ci_net: "one".into(), co_net: Some("co0".into()),
+                    s_nets: [Some("s0".into()), None, None, None],
+                    di_nets: [None, None, None, None],
+                    o_nets: [Some("o0".into()), None, None, None],
+                },
+                PackedCarry {
+                    name: "u_c1".into(), ci_net: "co0".into(), co_net: None,
+                    s_nets: [Some("s1".into()), None, None, None],
+                    di_nets: [None, None, None, None],
+                    o_nets: [Some("o1".into()), None, None, None],
+                },
+            ],
+        };
+        Placed7 {
+            packed,
+            luts: vec![
+                PlacedLut { name: "u_one".into(), init: u64::MAX, tile: "CLB_X1".into(), site: "SLICE_X1".into(), bel: "A6LUT".into() },
+                PlacedLut { name: "u_s0".into(), init: 1, tile: "CLB_X0".into(), site: "SLICE_X0".into(), bel: "A6LUT".into() },
+                PlacedLut { name: "u_s1".into(), init: 1, tile: "CLB_X1".into(), site: "SLICE_X1".into(), bel: "A6LUT".into() },
+            ],
+            ffs: vec![
+                PlacedFf { name: "u_ff0".into(), tile: "CLB_X0".into(), site: "SLICE_X0".into(), bel: "AFF".into() },
+                PlacedFf { name: "u_ff1".into(), tile: "CLB_X1".into(), site: "SLICE_X1".into(), bel: "AFF".into() },
+            ],
+            iobs: vec![],
+            bufgs: vec![],
+            brams: vec![],
+            dsps: vec![],
+            carries: vec![
+                PlacedCarry { name: "u_c0".into(), tile: "CLB_X0".into(), site: "SLICE_X0".into() },
+                PlacedCarry { name: "u_c1".into(), tile: "CLB_X1".into(), site: "SLICE_X1".into() },
+            ],
+        }
+    }
+
+    fn kind_of(routed: &Routed7, net: &str) -> String {
+        match &routed.nets.iter().find(|n| n.net == net).unwrap().kind {
+            RouteKind::SiteInternal => "internal".into(),
+            RouteKind::Cascade => "cascade".into(),
+            RouteKind::ClockSpine => "spine".into(),
+            RouteKind::Pips(p) => format!("pips{}", p.len()),
+        }
+    }
+
+    #[test]
+    fn carry_chain_routes_cascade_plus_internal_plus_ax() {
+        let routed = route(&placed_carry_chain(), &FakeRouter).unwrap();
+        assert_eq!(kind_of(&routed, "co0"), "cascade");
+        assert_eq!(kind_of(&routed, "o0"), "internal");
+        assert_eq!(kind_of(&routed, "o1"), "internal");
+        assert_eq!(kind_of(&routed, "s0"), "internal");
+        assert_eq!(kind_of(&routed, "s1"), "internal");
+        // Head CI: one-LUT at SLICE_X1 to AX at SLICE_X0, one pip.
+        assert_eq!(kind_of(&routed, "one"), "pips1");
+        // No fabric pips anywhere on carry-internal nets.
+        for n in &routed.nets {
+            if matches!(n.kind, RouteKind::Cascade | RouteKind::SiteInternal) {
+                continue;
+            }
+            assert_eq!(n.net, "one", "only the head CI routes, got {}", n.net);
+        }
+    }
+
+    #[test]
+    fn cascade_net_with_fabric_fanout_fails_loudly() {
+        let mut p = placed_carry_chain();
+        // A LUT sensing the co net: cascade fanout is illegal.
+        p.packed.luts.push(PackedLut {
+            name: "u_probe".into(), init: 1,
+            input_nets: [Some("co0".into()), None, None, None, None, None],
+            output_net: "probe".into(),
+        });
+        p.luts.push(PlacedLut { name: "u_probe".into(), init: 1, tile: "CLB_X1".into(), site: "SLICE_X1".into(), bel: "B6LUT".into() });
+        let err = route(&p, &FakeRouter).unwrap_err();
+        assert!(err.contains("co0") && err.contains("cascade"), "got: {err}");
     }
 }
