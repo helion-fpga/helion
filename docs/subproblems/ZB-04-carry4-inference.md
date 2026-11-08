@@ -4,8 +4,12 @@
   (emit side). The emit side is dead code until this lands.
 - Branch: fm/zedboard-fix-carry4, tip d2d067a (finding only, no
   implementation). Worktree: ~/workspace/helion-zed-bringup.
-- Status: not started. This is new implementation work, not a fix to
-  existing code.
+- Status: stage 1 done (Nov 8, 2026, commit 9f90549 on
+  fm/zedboard-fix-router, not fm/zedboard-fix-carry4). Opt-in
+  `synth_sv_carry` lowers a single whole-register `lhs <= lhs + 1`
+  to Carry4 cells plus S-LUTs and rewired FFs; helion-sim models
+  the chain; 3 sim tests prove equivalence to the cone flow.
+  Backend carry-through (pack pin nets, place, route, emit) open.
 
 ## Goal
 
