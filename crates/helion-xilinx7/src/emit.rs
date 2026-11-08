@@ -173,6 +173,80 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         lines.push(format!("{}.{}.SRUSEDMUX", tile, slice));
     }
 
+    // FF clock arrival (ZB-10): every placed FF slice gets FFSYNC
+    // (without it the FFs cannot clock), and its serving INT tile
+    // gets the arrival set. NOCLKINV is intentionally absent: it is
+    // an inverted feature and our zero-initialized frames already
+    // match Vivado exactly. The serving tile is the same-X INT tile
+    // on the slice's side (proven for the X71 column; anything else
+    // fails loudly at the existence check). Clock wire by slice
+    // letter: SLICE_X0 takes CLK1, SLICE_X1 takes CLK0 (ZB-10 oracle
+    // mapping; any other slice name fails loudly). BYP_ALT lines are
+    // skipped on tiles where the router already drives BYP_ALT (the
+    // head tile's input corridor): emitting the uniform GFAN
+    // selection there would double-drive the mux.
+    let mut ff_slices: HashSet<(String, String)> = HashSet::new();
+    for ff in &placed.ffs {
+        let site_rel = device
+            .site_rel(&ff.tile, &ff.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", ff.tile, ff.site))?;
+        ff_slices.insert((ff.tile.clone(), site_rel));
+    }
+    // Serving INT tile per FF slice, with the CLK letters it needs.
+    let mut int_arrival: std::collections::BTreeMap<String, (bool, bool)> = std::collections::BTreeMap::new();
+    for (tile, slice) in &ff_slices {
+        lines.push(format!("{tile}.{slice}.FFSYNC"));
+        let mut parts = tile.split('_');
+        let (_family, side, xypart) = match (parts.next(), parts.next(), parts.next()) {
+            (Some(fam), Some(side), Some(xy)) if parts.next().is_none() => (fam, side, xy),
+            _ => return Err(format!("emit: cannot parse slice tile `{tile}`")),
+        };
+        let xy = xypart.strip_prefix('X').ok_or_else(|| format!("emit: cannot parse slice tile `{tile}`"))?;
+        let (x, y) = xy.split_once('Y').ok_or_else(|| format!("emit: cannot parse slice tile `{tile}`"))?;
+        let serving = format!("INT_{side}_X{x}Y{y}");
+        device.tile_type(&serving).ok_or_else(|| format!("emit: no serving INT tile `{serving}` for `{tile}`"))?;
+        let clk1 = if slice.ends_with("_X0") {
+            true
+        } else if slice.ends_with("_X1") {
+            false
+        } else {
+            return Err(format!("emit: unknown slice `{slice}` for clock mapping"));
+        };
+        let entry = int_arrival.entry(serving).or_insert((false, false));
+        if clk1 {
+            entry.1 = true;
+        } else {
+            entry.0 = true;
+        }
+    }
+    // Tiles where the router already drives BYP_ALT (input corridor).
+    let mut byp_owned: HashSet<String> = HashSet::new();
+    for net in &routed.nets {
+        if let RouteKind::Pips(pips) = &net.kind {
+            for p in pips {
+                if p.dst_wire.contains("BYP_ALT") || p.src_wire.contains("BYP_ALT") {
+                    byp_owned.insert(p.tile.clone());
+                }
+            }
+        }
+    }
+    const BYP_FROM_GFAN: [(u8, u8); 8] = [(0, 0), (1, 0), (2, 1), (3, 1), (4, 0), (5, 0), (6, 1), (7, 1)];
+    for (int, (need_clk0, need_clk1)) in &int_arrival {
+        lines.push(format!("{int}.GFAN0.GND_WIRE"));
+        lines.push(format!("{int}.GFAN1.GND_WIRE"));
+        if *need_clk0 {
+            lines.push(format!("{int}.CLK0.GCLK_B11"));
+        }
+        if *need_clk1 {
+            lines.push(format!("{int}.CLK1.GCLK_B11"));
+        }
+        if !byp_owned.contains(int) {
+            for (alt, gfan) in BYP_FROM_GFAN {
+                lines.push(format!("{int}.BYP_ALT{alt}.GFAN{gfan}"));
+            }
+        }
+    }
+
     // IOBs.
     for iob in &placed.iobs {
         let site_rel = device
@@ -536,6 +610,49 @@ mod tests {
     }
 
     #[test]
+    fn emit_ff_clock_arrival() {
+        // Every placed FF slice gets FFSYNC (its FFs cannot clock
+        // without it), and its serving INT tile gets the clock arrival
+        // set: grounded GFANs, GCLK_B11 into the slice's CLK wire
+        // (X0 takes CLK1, X1 takes CLK0, the ZB-10 oracle mapping),
+        // and the uniform BYP_ALT from GFAN selection.
+        let bs = emit_fasm(&routed_blinky(), &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.FFSYNC"), "got:\n{text}");
+        assert!(text.contains("INT_L_X0Y0.GFAN0.GND_WIRE"), "got:\n{text}");
+        assert!(text.contains("INT_L_X0Y0.GFAN1.GND_WIRE"), "got:\n{text}");
+        assert!(text.contains("INT_L_X0Y0.CLK1.GCLK_B11"), "got:\n{text}");
+        assert!(text.contains("INT_L_X0Y0.BYP_ALT0.GFAN0"), "got:\n{text}");
+        assert!(text.contains("INT_L_X0Y0.BYP_ALT7.GFAN1"), "got:\n{text}");
+    }
+
+    #[test]
+    fn emit_arrival_skips_router_owned_byp() {
+        // The head tile's BYP_ALT0 carries the clock input corridor
+        // (router-owned): arrival must not double-drive it, but GFAN,
+        // CLK, and FFSYNC still go out.
+        use crate::route::RoutedPip;
+        let mut routed = routed_blinky();
+        routed.nets.push(RoutedNet7 {
+            net: "clk_in".into(),
+            kind: RouteKind::Pips(vec![RoutedPip {
+                tile: "INT_L_X0Y0".into(),
+                dst_wire: "BYP_ALT0".into(),
+                src_wire: "NR1END0".into(),
+                is_pseudo: false,
+            }]),
+        });
+        let bs = emit_fasm(&routed, &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        // The only BYP_ALT line is the router's own pip, never a
+        // GFAN selection from arrival.
+        assert_eq!(text.matches("BYP_ALT").count(), 1, "got:\n{text}");
+        assert!(text.contains("INT_L_X0Y0.GFAN0.GND_WIRE"), "got:\n{text}");
+        assert!(text.contains("INT_L_X0Y0.CLK1.GCLK_B11"), "got:\n{text}");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.FFSYNC"), "got:\n{text}");
+    }
+
+    #[test]
     fn emit_ff_control_signals() {
         // FF with CE and SR nets must emit CEUSEDMUX, SRUSEDMUX, and ZRST.
         // Without these, the FF silently ignores its CE/SR pins.
@@ -583,8 +700,8 @@ mod tests {
             },
         ];
         r.placed.carries = vec![
-            PlacedCarry { name: "u_c0".into(), tile: "CLB_X0Y0".into(), site: "SLICE_X0Y0".into() },
-            PlacedCarry { name: "u_c1".into(), tile: "CLB_X0Y1".into(), site: "SLICE_X0Y1".into() },
+            PlacedCarry { name: "u_c0".into(), tile: "CLBLL_L_X0Y0".into(), site: "SLICE_X0Y0".into() },
+            PlacedCarry { name: "u_c1".into(), tile: "CLBLL_L_X0Y1".into(), site: "SLICE_X0Y1".into() },
         ];
         // One chain FF per group to pin the FFMUX.XOR rule.
         r.placed.packed.ffs.push(PackedFf {
@@ -592,7 +709,7 @@ mod tests {
             clk_net: "clk_bufg".into(), ce_net: None, sr_net: None,
         });
         r.placed.ffs.push(PlacedFf {
-            name: "u_ff0".into(), tile: "CLB_X0Y0".into(), site: "SLICE_X0Y0".into(), bel: "AFF".into(),
+            name: "u_ff0".into(), tile: "CLBLL_L_X0Y0".into(), site: "SLICE_X0Y0".into(), bel: "AFF".into(),
         });
         r
     }
@@ -601,13 +718,13 @@ mod tests {
     fn emit_carry_chain_precyinit_matches_golden() {
         let bs = emit_fasm(&routed_carry_chain(), &FakeEmit).unwrap();
         let text = bs.fasm.join("\n");
-        assert!(text.contains("CLB_X0Y0.SLICEL_X0.PRECYINIT.AX"), "got:\n{text}");
-        assert!(text.contains("CLB_X0Y0.SLICEL_X0.CARRY4.ACY0"), "got:\n{text}");
-        assert!(text.contains("CLB_X0Y1.SLICEL_X1.PRECYINIT.CIN"), "got:\n{text}");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.PRECYINIT.AX"), "got:\n{text}");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.CARRY4.ACY0"), "got:\n{text}");
+        assert!(text.contains("CLBLL_L_X0Y1.SLICEL_X1.PRECYINIT.CIN"), "got:\n{text}");
         assert_eq!(text.matches("CARRY4.ACY0").count(), 1, "got:\n{text}");
         assert!(!text.contains("BCY0") && !text.contains("CCY0") && !text.contains("DCY0"), "got:\n{text}");
         // Chain FF samples the sum through FFMUX.XOR, never a letter input.
-        assert!(text.contains("CLB_X0Y0.SLICEL_X0.AFFMUX.XOR"), "got:\n{text}");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFFMUX.XOR"), "got:\n{text}");
     }
 
     #[test]
