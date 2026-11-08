@@ -41,6 +41,10 @@ dark. Any of LD0-LD4 dark, or LD5 lit, is a failure.
 ## What was tried and what failed
 
 - Nothing hardware-tried. t01 has never been flashed.
+- H1 answered by ZB-10 diff (Nov 8, 2026, Mac), no hardware needed:
+  the output path does NOT use an OLOGIC bypass. Vivado configures
+  the OLOGIC explicitly (OQUSED + OMUX.D1 + DATA_RATE_TQ.BUF), now
+  implemented in emit.rs. The old "OLOGIC bypass" comment was wrong.
 
 ## What to do
 
