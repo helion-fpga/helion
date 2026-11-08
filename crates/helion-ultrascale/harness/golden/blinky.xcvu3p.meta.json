@@ -1,0 +1,24 @@
+{
+  "design": "blinky",
+  "fasm_sha256": "94ddab54d9980d9b1dc102d6099c3b5105b5ad91b679a34bacf21c62df7f78ca",
+  "notes": "INT/HPIO tile X is the logical CLB column index, not a verified Vivado tile X (no xcku3p tilegrid in any public DB). xcvu3p placement reuses the xcku3p coordinates verbatim and is provisional until the xcvu3p device file lands.",
+  "part": "xcvu3p",
+  "placement_hash": "7e8aaf3e1d6180da67c459ed09238fa467bce431a11712951f8b131c28aebec9",
+  "provisional_tiles": [
+    "INT_X0Y0",
+    "HPIO_RIGHT_X0Y0"
+  ],
+  "seed": 20261107,
+  "sites": [
+    {
+      "bel": "A6LUT",
+      "role": "lut",
+      "tile": "SLICE_X0Y0"
+    },
+    {
+      "bel": "AFF",
+      "role": "ff",
+      "tile": "SLICE_X0Y0"
+    }
+  ]
+}
