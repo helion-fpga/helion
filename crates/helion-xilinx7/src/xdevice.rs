@@ -808,6 +808,105 @@ impl<'a> RouteQuery for XDevice<'a> {
         spine.statics.push((hrow.clone(), "CLK_HROW_R_CK_GCLK0_ACTIVE".to_string()));
         spine.statics.push((hrow.clone(), format!("BUFHCE.{}.IN_USE", bufh[0])));
         spine.statics.push((hrow.clone(), format!("BUFHCE.{}.ZINV_CE", bufh[0])));
+        // HCLK distribution: the HROW hands the clock to the HCLK
+        // backbone row, which carries it across the die. The tileconn
+        // DB has no HROW to HCLK stitch (both BUFHCE pins sit on
+        // singleton nodes), so the tiles come from row geometry
+        // instead: the same name-Y row as the HROW tile. The CMT tile
+        // is unique per row; the leaf tile is the nearest HCLK_L tile
+        // west of it (Vivado-observed for a single bottom-region clock,
+        // ZB-10 blinky oracle). If a future design shows a different
+        // leaf, this fails loudly at segbits verification.
+        // Vivado-observed line set: leaf B_TOPL5 buffer BUFHCLK8 on
+        // the HCLK_L tile with the buffer enabled, and BUFHCLK8 marked
+        // used on the HCLK_CMT_L tile. Sibling leaf buffers are overlap
+        // ghosts (each carries a bit the oracle lacks). Every line is
+        // segbits-verified; anything unresolvable fails loudly. Only
+        // the segbits-named features go out here: the row's UNNAMED
+        // bits live in frames shared with the CLB/INT columns and are
+        // disentangled at the per-cell comparison stage, not guessed.
+        // The CMT input side (CCIO) is a separate stage.
+        let row = hrow
+            .rsplit('Y')
+            .next()
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+            .ok_or_else(|| err(format!("cannot parse row from {hrow}")))?;
+        let row_suffix = format!("Y{row}");
+        let mut cmt_tiles: Vec<(String, i32)> = Vec::new();
+        let mut leaf_cands: Vec<(String, i32)> = Vec::new();
+        for ti in 0..self.device.tile_count() {
+            let ttype = self.device.tile_type_name(ti).unwrap_or("");
+            if ttype != "HCLK_CMT_L" && ttype != "HCLK_L" {
+                continue;
+            }
+            let Some(name) = self.tile_name(ti) else {
+                continue;
+            };
+            if !name.ends_with(row_suffix.as_str()) {
+                continue;
+            }
+            let gx = self.device.tile(ti).map(|t| t.grid_x).unwrap_or(-1);
+            if ttype == "HCLK_CMT_L" {
+                cmt_tiles.push((name.to_string(), gx));
+            } else if !leaf_cands.iter().any(|(t, _)| t == name) {
+                leaf_cands.push((name.to_string(), gx));
+            }
+        }
+        if cmt_tiles.len() != 1 {
+            return Err(err(format!(
+                "expected exactly one HCLK_CMT_L tile in row {row}, found {}",
+                cmt_tiles.len()
+            )));
+        }
+        let (cmt, cmt_x) = cmt_tiles[0].clone();
+        // Nearest HCLK_L tile west of the CMT tile.
+        leaf_cands.retain(|(_, gx)| *gx < cmt_x);
+        leaf_cands.sort_by_key(|(_, gx)| std::cmp::Reverse(*gx));
+        let hclk = leaf_cands.first().map(|(t, _)| t.clone()).ok_or_else(|| {
+            err(format!("no HCLK_L tile west of {cmt} in row {row}"))
+        })?;
+        let hclk_type = self
+            .device
+            .tile_type_name(self.tile_idx(&hclk).ok_or_else(|| err(format!("no tile index for {hclk}")))?)
+            .ok_or_else(|| err(format!("no tile type for {hclk}")))?
+            .to_string();
+        let cmt_type = self
+            .device
+            .tile_type_name(self.tile_idx(&cmt).ok_or_else(|| err(format!("no tile index for {cmt}")))?)
+            .ok_or_else(|| err(format!("no tile type for {cmt}")))?
+            .to_string();
+        // Exactly one leaf buffer: BUFHCLK8. The sibling buffers
+        // that rawdiff attributes to the same field bits are overlap
+        // ghosts again (same proof as the HROW tap: each carries a bit
+        // the oracle lacks, while BUFHCLK8's entry reproduces the
+        // oracle field exactly). Channel 8 end to end.
+        let leaf = "HCLK_LEAF_CLK_B_TOPL5";
+        for src in ["HCLK_CK_BUFHCLK8"] {
+            let feat = format!("{hclk_type}.{leaf}.{src}");
+            match self.device.segbits(&hclk_type, &feat) {
+                Some(bits) if !bits.is_empty() => {
+                    spine.pips.push(RoutedPip {
+                        tile: hclk.clone(),
+                        dst_wire: leaf.to_string(),
+                        src_wire: src.to_string(),
+                        is_pseudo: false,
+                    });
+                }
+                _ => return Err(err(format!("no segbits for {feat}"))),
+            }
+        }
+        let mut static_line = |tile: &str, ttype: &str, feat: &str| -> Result<(), String> {
+            let full = format!("{ttype}.{feat}");
+            match self.device.segbits(ttype, &full) {
+                Some(bits) if !bits.is_empty() => {
+                    spine.statics.push((tile.to_string(), feat.to_string()));
+                    Ok(())
+                }
+                _ => Err(err(format!("no segbits for {full}"))),
+            }
+        };
+        static_line(&hclk, &hclk_type, "ENABLE_BUFFER.HCLK_CK_BUFHCLK8")?;
+        static_line(&cmt, &cmt_type, "HCLK_CMT_CK_BUFHCLK8_USED")?;
         Ok(spine)
     }
 }
@@ -1009,7 +1108,7 @@ mod tests {
             tiles.contains(&("CLK_BUFG_REBUF_X87Y65", "GCLK0_ENABLE_ABOVE")),
             "missing upward reach, got {statics:?}"
         );
-        assert_eq!(statics.len(), 8, "extra enables, got {statics:?}");
+        assert_eq!(statics.len(), 10, "extra enables, got {statics:?}");
         // Unknown site fails loudly.
         assert!(xdev.bufg_spine("BUFGCTRL_X99Y99").is_err());
     }
@@ -1050,6 +1149,7 @@ mod tests {
             "wrong HROW source, got {:?}",
             spine.pips
         );
+        // HCLK row (next stage below); the HROW statics stay exact.
         let mut statics = spine.statics.clone();
         statics.sort();
         for feat in [
@@ -1065,6 +1165,53 @@ mod tests {
                 "missing static {feat}, got {statics:?}"
             );
         }
+    }
+
+    #[test]
+    fn bufg_spine_hclk_leaf() {
+        let (dev, maps) = test_z020();
+        let xdev = XDevice::new(dev, maps.clone());
+        let spine = xdev
+            .bufg_spine("BUFGCTRL_X0Y0")
+            .expect("spine for BUFGCTRL_X0Y0");
+        // Vivado ground truth (ZB-10 same-RTL oracle): exactly one
+        // leaf buffer, B_TOPL5 BUFHCLK8, on HCLK_L_X174Y26, the buffer
+        // enabled, and BUFHCLK8 marked used on HCLK_CMT_L_X178Y26.
+        // Sibling buffers are overlap ghosts (each carries a bit the
+        // oracle lacks); BUFHCLK8's entry reproduces the oracle leaf
+        // field exactly.
+        let hclk = "HCLK_L_X174Y26";
+        let leaf = "HCLK_LEAF_CLK_B_TOPL5";
+        let hclk_pips: Vec<_> = spine
+            .pips
+            .iter()
+            .filter(|p| p.tile == hclk)
+            .collect();
+        assert_eq!(
+            hclk_pips.len(),
+            1,
+            "exactly one HCLK leaf line, got {:?}",
+            spine.pips
+        );
+        assert!(
+            hclk_pips[0].dst_wire == leaf
+                && hclk_pips[0].src_wire == "HCLK_CK_BUFHCLK8"
+                && !hclk_pips[0].is_pseudo,
+            "wrong HCLK leaf line, got {:?}",
+            spine.pips
+        );
+        let mut statics = spine.statics.clone();
+        statics.sort();
+        assert!(
+            statics.iter().any(|(t, f)| t == hclk
+                && f == "ENABLE_BUFFER.HCLK_CK_BUFHCLK8"),
+            "missing ENABLE_BUFFER, got {statics:?}"
+        );
+        assert!(
+            statics.iter().any(|(t, f)| t == "HCLK_CMT_L_X178Y26"
+                && f == "HCLK_CMT_CK_BUFHCLK8_USED"),
+            "missing CMT USED, got {statics:?}"
+        );
     }
 
     #[test]
