@@ -606,6 +606,208 @@ impl<'a> RouteQuery for XDevice<'a> {
         for tile in &above {
             spine.statics.push((tile.clone(), format!("GCLK{gclk}_ENABLE_ABOVE")));
         }
+        // HROW fanout: the global line feeds the horizontal clock row,
+        // whose mux fans our clock out to the GCLK branches reaching
+        // the INT tiles, through a BUFHCE. Vivado's observed shape for
+        // a single bottom-region clock (ZB-10 blinky oracle): exactly
+        // one HROW tile on the GCLK node, the MUX_OUT wire fed by
+        // CK_IN_L0 (our clock enters the HROW on CK_IN_L0 through the
+        // CASCO input path), three more CK_IN wires on the same mux,
+        // eleven R_CK_GCLK branches, BUFHCE in use with uninverted CE.
+        // Every constructed pip is verified against the DB below and
+        // the build fails loudly on any absence: an unverified guess
+        // here could short two clocks onto one branch.
+        // HROW tile discovery (logic, no hardcoded tile): walk back
+        // from the BUFG I0 pin through its input mux to the tileconn
+        // node. The clock input corridor reaches the BUFG through
+        // exactly one HROW tile (CK_IN_L0 to CASCO inside it, then a
+        // bitless node up to the BUFG mux), and Vivado fans the clock
+        // back out through that same tile.
+        let i0_wire = pins
+            .iter()
+            .find(|(pn, _)| pn == "I0")
+            .map(|(_, w)| w.clone())
+            .ok_or_else(|| err(format!("site has no pin `I0`")))?;
+        // The I0 driver, discovered by scanning the tile's wires for
+        // the source of a real pip into I0 (no constructed names).
+        let bti = self
+            .tile_idx(&tile_name)
+            .ok_or_else(|| err(format!("no tile index for {tile_name}")))?;
+        let bwires = self
+            .device
+            .wires(bti)
+            .ok_or_else(|| err(format!("no wires for {tile_name}")))?;
+        let mut i0_srcs: Vec<String> = Vec::new();
+        for w in bwires.iter() {
+            for (d, s, pseudo) in RouteQuery::pips_from(self, &tile_name, w) {
+                if d == i0_wire && s == *w && !pseudo && !i0_srcs.contains(w) {
+                    i0_srcs.push(w.clone());
+                }
+            }
+        }
+        // The corridor driver: the candidate whose node reaches an
+        // HROW tile (CK_IN to CASCO inside it). The other I0 mux
+        // inputs (fabric IMUX, feedback FBG) never touch the HROW.
+        let mut corridor: Vec<String> = Vec::new();
+        for cand in &i0_srcs {
+            let cwid_opt = self.wire_id_of(&tile_name, cand);
+            let Some(cwid) = cwid_opt else { continue };
+            let Some(&cnid) = self.wire_to_node.get(cwid as usize) else {
+                continue;
+            };
+            if cnid == u32::MAX {
+                continue;
+            }
+            let hits_hrow = self
+                .node_members
+                .get(&cnid)
+                .map(|ms| {
+                    ms.iter().any(|&m| {
+                        self.wire_name_of(m).map(|(t, _)| self.tile_idx(&t)).flatten().map(
+                            |ti| {
+                                self.device
+                                    .tile_type_name(ti)
+                                    .unwrap_or("")
+                                    .starts_with("CLK_HROW")
+                            },
+                        ).unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            if hits_hrow {
+                corridor.push(cand.clone());
+            }
+        }
+        if corridor.len() != 1 {
+            return Err(err(format!(
+                "expected exactly one HROW-fed I0 driver, found {}: {}",
+                corridor.len(),
+                corridor.join(", ")
+            )));
+        }
+        let src_wid = self
+            .wire_id_of(&tile_name, &corridor[0])
+            .ok_or_else(|| err(format!("no wire `{}`", corridor[0])))?;
+        let src_nid = self
+            .wire_to_node
+            .get(src_wid as usize)
+            .copied()
+            .filter(|&n| n != u32::MAX)
+            .ok_or_else(|| err(format!("`{}` is not stitched anywhere", corridor[0])))?;
+        let src_members = self
+            .node_members
+            .get(&src_nid)
+            .ok_or_else(|| err(format!("no node members")))?;
+        let mut hrow_tiles: Vec<String> = Vec::new();
+        for &m in src_members {
+            let Some((tname, _)) = self.wire_name_of(m) else {
+                continue;
+            };
+            let Some(ti) = self.tile_idx(&tname) else {
+                continue;
+            };
+            if self
+                .device
+                .tile_type_name(ti)
+                .unwrap_or("")
+                .starts_with("CLK_HROW")
+                && !hrow_tiles.iter().any(|t| t == &tname)
+            {
+                hrow_tiles.push(tname);
+            }
+        }
+        if hrow_tiles.len() != 1 {
+            return Err(err(format!(
+                "expected exactly one HROW tile feeding {}, found {}",
+                corridor[0],
+                hrow_tiles.len()
+            )));
+        }
+        let hrow = hrow_tiles[0].clone();
+        // HROW clock-mux config. The HROW mux is a wide selector (32
+        // R_CK_GCLK spine taps plus CK_IN/CK_INT inputs) with exactly
+        // one source picked: the tap carrying our global line,
+        // R_CK_GCLK{gclk}. The CK_IN wires and sibling taps that
+        // rawdiff attributes to the same field bits are overlap ghosts:
+        // every one of their segbits entries carries a bit the oracle
+        // lacks, while the tap's entry reproduces the oracle field
+        // exactly (carry_vs_oracle_diff3 analysis). Emitting all of
+        // them at once oversets the field and risks contention on
+        // silicon, so exactly one source line goes out.
+        // These are segbits-only features (the pip DB carries no
+        // MUX_OUT or R_CK_GCLK pips: the mux fans out only to a pseudo
+        // HCLK wire there), so the emitted line is verified against the
+        // segbits DB instead, and the build fails loudly on anything
+        // unresolvable. Channel R8 and BUFHCE_X1Y8 are Vivado-observed
+        // data for a single bottom-region clock (ZB-10 blinky oracle):
+        // the mux output must reach the HCLK row (checked below), and
+        // multi-clock channel generality is unproven.
+        let hti = self
+            .tile_idx(&hrow)
+            .ok_or_else(|| err(format!("no tile index for {hrow}")))?;
+        let hrow_type = self
+            .device
+            .tile_type_name(hti)
+            .ok_or_else(|| err(format!("no tile type for {hrow}")))?
+            .to_string();
+        let mux = "CLK_HROW_CK_MUX_OUT_R8".to_string();
+        // The mux output must reach the HCLK row through its hard
+        // (pseudo) connection, else the channel is dead.
+        let hclk_out = "CLK_HROW_CK_HCLK_OUT_R8".to_string();
+        let reaches_hclk = RouteQuery::pips_from(self, &hrow, &mux)
+            .iter()
+            .any(|(d, s, _)| d == &hclk_out && s == &mux);
+        if !reaches_hclk {
+            return Err(err(format!("{hrow}.{mux} does not reach {hclk_out}")));
+        }
+        // Every emitted HROW line must resolve in segbits (feature
+        // keys carry the tile-type prefix, e.g.
+        // `CLK_HROW_BOT_R.CLK_HROW_CK_MUX_OUT_R8.CLK_HROW_CK_IN_L0`).
+        let mut pip_line = |dst: &str, src: &str| -> Result<(), String> {
+            let feat = format!("{hrow_type}.{dst}.{src}");
+            match self.device.segbits(&hrow_type, &feat) {
+                Some(bits) if !bits.is_empty() => {
+                    spine.pips.push(RoutedPip {
+                        tile: hrow.clone(),
+                        dst_wire: dst.to_string(),
+                        src_wire: src.to_string(),
+                        is_pseudo: false,
+                    });
+                    Ok(())
+                }
+                _ => Err(err(format!("no segbits for {hrow_type}.{feat}"))),
+            }
+        };
+        // Exactly one source: the spine tap of our global line.
+        pip_line(&mux, &format!("CLK_HROW_R_CK_GCLK{gclk}"))?;
+        // BUFHCE site (logic: the BUFHCE whose I pin is our mux wire).
+        let htile = self
+            .device
+            .tile(hti)
+            .ok_or_else(|| err(format!("no tile data for {hrow}")))?;
+        let mut bufh: Vec<String> = Vec::new();
+        for (si, s) in htile.sites.iter().enumerate() {
+            if !s.site_type.starts_with("BUFHCE") {
+                continue;
+            }
+            let pins = self
+                .device
+                .site_pins(hti, si)
+                .ok_or_else(|| err(format!("no pin data for site {}", s.name)))?;
+            if pins.iter().any(|(pn, w)| pn == "I" && *w == mux) {
+                bufh.push(s.name.clone());
+            }
+        }
+        if bufh.len() != 1 {
+            return Err(err(format!(
+                "expected exactly one BUFHCE fed by {mux} in {hrow}, found {}",
+                bufh.len()
+            )));
+        }
+        spine.statics.push((hrow.clone(), "CLK_HROW_CK_IN_L0_ACTIVE".to_string()));
+        spine.statics.push((hrow.clone(), "CLK_HROW_R_CK_GCLK0_ACTIVE".to_string()));
+        spine.statics.push((hrow.clone(), format!("BUFHCE.{}.IN_USE", bufh[0])));
+        spine.statics.push((hrow.clone(), format!("BUFHCE.{}.ZINV_CE", bufh[0])));
         Ok(spine)
     }
 }
@@ -807,9 +1009,62 @@ mod tests {
             tiles.contains(&("CLK_BUFG_REBUF_X87Y65", "GCLK0_ENABLE_ABOVE")),
             "missing upward reach, got {statics:?}"
         );
-        assert_eq!(statics.len(), 4, "extra enables, got {statics:?}");
+        assert_eq!(statics.len(), 8, "extra enables, got {statics:?}");
         // Unknown site fails loudly.
         assert!(xdev.bufg_spine("BUFGCTRL_X99Y99").is_err());
+    }
+
+    #[test]
+    fn bufg_spine_hrow_fanout() {
+        let (dev, maps) = test_z020();
+        let xdev = XDevice::new(dev, maps.clone());
+        let spine = xdev
+            .bufg_spine("BUFGCTRL_X0Y0")
+            .expect("spine for BUFGCTRL_X0Y0");
+        // Vivado ground truth (ZB-10 same-RTL oracle): the clock
+        // passes through CLK_HROW_BOT_R_X87Y26, mux MUX_OUT_R8
+        // selecting exactly one source, the R_CK_GCLK0 spine tap
+        // carrying GCLK0 (the sibling taps and CK_IN wires that
+        // rawdiff attributes to the same field are overlap ghosts:
+        // each carries a bit the oracle lacks), with BUFHCE_X1Y8 in
+        // use (CE not inverted).
+        let hrow = "CLK_HROW_BOT_R_X87Y26";
+        let mux = "CLK_HROW_CK_MUX_OUT_R8";
+        let hrow_pips: Vec<_> = spine
+            .pips
+            .iter()
+            .filter(|p| p.tile == hrow)
+            .collect();
+        assert_eq!(
+            hrow_pips.len(),
+            1,
+            "exactly one HROW source line, got {:?}",
+            spine.pips
+        );
+        // The tap feature names the mux as DST (Vivado's convention:
+        // `MUX_OUT_R8.R_CK_GCLK0`), exactly as the oracle records it.
+        assert!(
+            hrow_pips[0].dst_wire == mux
+                && hrow_pips[0].src_wire == "CLK_HROW_R_CK_GCLK0"
+                && !hrow_pips[0].is_pseudo,
+            "wrong HROW source, got {:?}",
+            spine.pips
+        );
+        let mut statics = spine.statics.clone();
+        statics.sort();
+        for feat in [
+            "CLK_HROW_CK_IN_L0_ACTIVE",
+            "CLK_HROW_R_CK_GCLK0_ACTIVE",
+            "BUFHCE.BUFHCE_X1Y8.IN_USE",
+            "BUFHCE.BUFHCE_X1Y8.ZINV_CE",
+        ] {
+            assert!(
+                statics
+                    .iter()
+                    .any(|(t, f)| t == hrow && f == feat),
+                "missing static {feat}, got {statics:?}"
+            );
+        }
     }
 
     #[test]
