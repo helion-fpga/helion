@@ -75,6 +75,47 @@ contain PRECYINIT plus the ACY0/BCY0/CCY0/DCY0 mux bits for those cells.
 - DB: ~/workspace/xilinx-dbsrc, segbits_clbll_l.db (PRECYINIT.AX/CIN/C0/C1,
   CARRY4.ACY0/BCY0/CCY0/DCY0).
 - Test: ~/workspace/zedboard-hw-loop/tests/t03_carry4_counter.sv.
+- Golden decode script:
+  docs/zedboard-handoff/findings/chain_golden.py (reads GT-blinky.bit
+  via work/x7decode.py in the Mac handoff package, resolves features
+  via segbits_clblm_r.db). Full output:
+  docs/zedboard-handoff/findings/blinky_chain_golden.txt (Nov 8,
+  2026).
+
+## Golden chain (decoded Nov 8, 2026 from GT-blinky.bit)
+
+Vivado's 25-bit counter plus registered LD0 (26 flops) in
+CLBLM_R_X71, rows Y39 to Y45. Every used FF: ZINI+ZRST set,
+FFMUX.CY and FFMUX.XOR both set, FFSYNC set (FFSYNC is a ZB-03
+gap: unimplemented). Every chain LUT: INIT 0xffffffff00000000,
+except the entry slice (below).
+
+- Y39 entry: SLICEL_X1 PRECYINIT.AX + CARRY4.ACY0; ALUT
+  0xff00ff0000000000, BLUT/CLUT/DLUT 0xffffffff00000000.
+  SLICEM_X0 ALUT 0x0f0f0f0f0f0f0f0f, other LUTs
+  0xffffffff00000000; 4 FFs, FFSYNC, no PRECYINIT, no CARRY4 mux
+  bit on M0.
+- Y40-Y43: both halves PRECYINIT.CIN, all LUTs
+  0xffffffff00000000, 8 FFs each, FFSYNC on M0.
+- Y44: SLICEL_X1 PRECYINIT.CIN with DFF only (bit 24);
+  SLICEM_X0 PRECYINIT.CIN with 4 FFs; FFSYNC both halves.
+- Y45: SLICEM_X0 AFF only (the LD0 output FF), PRECYINIT.CIN,
+  FFSYNC, ALUT 0xffffffff00000000, AFFMUX.CY set (D fed from
+  carry, not fabric).
+- Chained cells need no ACY0/BCY0/CCY0/DCY0 (only the AX entry
+  sets ACY0); no INIT_OUT, CEUSEDMUX, SRUSEDMUX anywhere.
+
+Open questions (do not guess; trace before implementing):
+
+- M0(Y39) carry source: 4 FFs with FFMUX.CY but no PRECYINIT
+  and no CARRY4 mux bit. Needs net-level tracing (which nets
+  drive its S/DI) before choosing the entry model.
+- FFMUX.CY+XOR both set on every FF: reproduce both bits
+  exactly; mux semantics unverified.
+- LD0 AFF D source: AFFMUX.CY implies carry-O feed; confirm
+  against INT routing before wiring pack output.
+- Bit-to-BEL map (which counter bit sits where) needs the
+  S/DI/Q net tracing, not just config bits.
 
 ## Dependencies
 
