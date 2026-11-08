@@ -246,6 +246,132 @@ impl FileSegbitsDb {
     pub fn feature_count(&self) -> usize {
         self.entries.len()
     }
+
+    /// Load and merge several segbits files into one database. Files are
+    /// loaded in order; a feature present in two files fails loud with
+    /// [`SegbitsLoadError::DuplicateFeature`] (line 0: no single line
+    /// owns a cross-file clash). Intra-file duplicates fail with their
+    /// own line number from [`FileSegbitsDb::from_file`].
+    pub fn from_files(paths: &[&Path]) -> Result<Self, SegbitsLoadError> {
+        let mut merged: Option<Self> = None;
+        for path in paths {
+            let db = Self::from_file(path)?;
+            match merged.as_mut() {
+                None => merged = Some(db),
+                Some(m) => m.merge(db)?,
+            }
+        }
+        Ok(merged.unwrap_or_else(|| Self {
+            entries: HashMap::new(),
+            tile_types: Vec::new(),
+            features: HashMap::new(),
+            source: String::new(),
+        }))
+    }
+
+    /// Merge another database into this one. Duplicate `(tile_type,
+    /// feature)` fails loud; the database is unchanged on failure.
+    /// Feature lists stay sorted.
+    pub fn merge(&mut self, other: Self) -> Result<(), SegbitsLoadError> {
+        for (key, _) in other.entries.iter() {
+            if self.entries.contains_key(key) {
+                return Err(SegbitsLoadError::DuplicateFeature {
+                    line_no: 0,
+                    tile_type: key.0.clone(),
+                    feature: key.1.clone(),
+                });
+            }
+        }
+        for (key, bits) in other.entries {
+            if !self.tile_types.iter().any(|t| *t == key.0) {
+                self.tile_types.push(key.0.clone());
+            }
+            self.features
+                .entry(key.0.clone())
+                .or_default()
+                .push(key.1.clone());
+            self.entries.insert(key, bits);
+        }
+        self.tile_types.sort();
+        for list in self.features.values_mut() {
+            list.sort();
+        }
+        Ok(())
+    }
+
+    /// Synthesize single-feature `X6LUT.INIT[63:0]` entries from the
+    /// per-bit `XLUT.INIT[i]` lines of each CLB tile type present.
+    ///
+    /// The prjuray CLB DBs carry LUT INIT as 64 one-bit features
+    /// (`ALUT.INIT[0]` .. `ALUT.INIT[63]`, one set-bit token each),
+    /// while the emitter and the harness golden FASM use one 64-bit
+    /// feature (`A6LUT.INIT[63:0]`, MSB-first expansion per the bitgen
+    /// contract). The synthesized list is MSB-first: list index 0 is
+    /// INIT bit 63, list index 63 is INIT bit 0, each taken from the
+    /// matching per-bit entry. The two sources agree bit for bit (the
+    /// harness cross-checks the same per-bit entries against
+    /// BitFiltrator LutLoc on every run), so the synthesis adds no new
+    /// encoding, only a regrouping.
+    ///
+    /// A letter is synthesized only when all 64 per-bit entries exist.
+    /// A per-bit entry with anything other than exactly one set-bit
+    /// token fails loud: a `!` token or a multi-bit list cannot be one
+    /// INIT bit. An already-present `X6LUT.INIT[63:0]` is left alone,
+    /// so calling this twice is a no-op. Feature lists stay sorted.
+    pub fn synthesize_lut_init(&mut self) -> Result<(), SegbitsLoadError> {
+        for tile_type in ["CLEL_L", "CLEL_R", "CLEM", "CLEM_R"] {
+            if !self.tile_types.iter().any(|t| t == tile_type) {
+                continue;
+            }
+            for letter in b'A'..=b'H' {
+                let letter = letter as char;
+                let target = format!("{letter}6LUT.INIT[63:0]");
+                if self
+                    .entries
+                    .contains_key(&(tile_type.to_string(), target.clone()))
+                {
+                    continue;
+                }
+                let mut refs: Vec<BitRef> = Vec::with_capacity(64);
+                let mut complete = true;
+                for i in (0..64).rev() {
+                    let per_bit = format!("{letter}LUT.INIT[{i}]");
+                    match self.entries.get(&(tile_type.to_string(), per_bit.clone())) {
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                        Some(bits) => {
+                            if bits.len() != 1 || bits[0].must_be_zero {
+                                return Err(SegbitsLoadError::MalformedLine {
+                                    line_no: 0,
+                                    line: format!("{tile_type}.{per_bit}"),
+                                    reason: format!(
+                                        "LUT INIT bit {i} must list exactly one set bit, found {} token(s)",
+                                        bits.len()
+                                    ),
+                                });
+                            }
+                            refs.push(bits[0]);
+                        }
+                    }
+                }
+                if !complete {
+                    continue;
+                }
+                self.features
+                    .entry(tile_type.to_string())
+                    .or_default()
+                    .push(target.clone());
+                self.features
+                    .get_mut(tile_type)
+                    .expect("tile type entry just pushed")
+                    .sort();
+                self.entries.insert((tile_type.to_string(), target), refs);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl SegbitsDb for FileSegbitsDb {
@@ -510,5 +636,133 @@ mod tests {
         assert_eq!(db.tile_types(), &["INT".to_string()]);
         let db = FileSegbitsDb::from_file(&data.join("segbits_hpio_right.db")).unwrap();
         assert_eq!(db.tile_types(), &["HPIO_RIGHT".to_string()]);
+    }
+
+    #[test]
+    fn merge_combines_disjoint_dbs_and_rejects_duplicates() {
+        let a =
+            FileSegbitsDb::from_text("INT.PIP.A.B 64_00\nCLEL_R.AFF.INIT.V0 12_02\n", "a").unwrap();
+        let b = FileSegbitsDb::from_text("HPIO_RIGHT.IOB.X.I 02_10\n", "b").unwrap();
+        let mut m = a;
+        m.merge(b).unwrap();
+        assert_eq!(m.feature_count(), 3);
+        assert_eq!(m.tile_types(), &["CLEL_R", "HPIO_RIGHT", "INT"]);
+        assert!(m.lookup("HPIO_RIGHT", "IOB.X.I").is_some());
+        let dup = FileSegbitsDb::from_text("INT.PIP.A.B 65_00\n", "dup").unwrap();
+        assert!(matches!(
+            m.merge(dup),
+            Err(SegbitsLoadError::DuplicateFeature { .. })
+        ));
+        assert_eq!(m.feature_count(), 3, "failed merge leaves the DB unchanged");
+    }
+
+    #[test]
+    fn synthesize_lut_init_builds_msb_first_list() {
+        // 64 per-bit entries for A, frame i bit (2*i) for INIT bit i.
+        let mut text = String::new();
+        for i in 0..64 {
+            text.push_str(&format!("CLEL_R.ALUT.INIT[{i}] {i:02}_{:02}\n", 2 * i));
+        }
+        let mut db = FileSegbitsDb::from_text(&text, "fixture").unwrap();
+        db.synthesize_lut_init().unwrap();
+        let list = db.lookup("CLEL_R", "A6LUT.INIT[63:0]").unwrap().to_vec();
+        assert_eq!(list.len(), 64);
+        // MSB-first: list index 0 is INIT bit 63, index 63 is INIT bit 0.
+        assert_eq!(list[0], BitRef::set(63, 126));
+        assert_eq!(list[63], BitRef::set(0, 0));
+        assert_eq!(list[1], BitRef::set(62, 124));
+        // Idempotent: a second call changes nothing.
+        let before = db.feature_count();
+        db.synthesize_lut_init().unwrap();
+        assert_eq!(db.feature_count(), before);
+        assert_eq!(
+            db.lookup("CLEL_R", "A6LUT.INIT[63:0]").unwrap(),
+            list.as_slice()
+        );
+    }
+
+    #[test]
+    fn synthesize_lut_init_skips_incomplete_letters() {
+        let mut text = String::new();
+        for i in 0..64 {
+            text.push_str(&format!("CLEL_R.ALUT.INIT[{i}] {i:02}_00\n"));
+        }
+        for i in 0..3 {
+            text.push_str(&format!("CLEL_R.BLUT.INIT[{i}] {i:02}_01\n"));
+        }
+        let mut db = FileSegbitsDb::from_text(&text, "fixture").unwrap();
+        db.synthesize_lut_init().unwrap();
+        assert!(db.lookup("CLEL_R", "A6LUT.INIT[63:0]").is_some());
+        assert!(db.lookup("CLEL_R", "B6LUT.INIT[63:0]").is_none());
+    }
+
+    #[test]
+    fn synthesize_lut_init_rejects_must_be_zero_per_bit() {
+        let mut text = String::new();
+        for i in 0..64 {
+            if i == 7 {
+                text.push_str("CLEL_R.ALUT.INIT[7] !07_00\n");
+            } else {
+                text.push_str(&format!("CLEL_R.ALUT.INIT[{i}] {i:02}_00\n"));
+            }
+        }
+        let mut db = FileSegbitsDb::from_text(&text, "fixture").unwrap();
+        assert!(matches!(
+            db.synthesize_lut_init(),
+            Err(SegbitsLoadError::MalformedLine { .. })
+        ));
+    }
+
+    #[test]
+    fn vendored_clb_dbs_load_and_synthesize() {
+        // The four CLB DBs vendored by the emitter worker (PROVENANCE.md).
+        // Counts are the upstream line counts from the same table.
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+        let mut total = 0;
+        for (name, count) in [
+            ("segbits_clel_l.db", 768),
+            ("segbits_clel_r.db", 768),
+            ("segbits_clem.db", 829),
+            ("segbits_clem_r.db", 829),
+        ] {
+            let db = FileSegbitsDb::from_file(&data.join(name))
+                .unwrap_or_else(|e| panic!("vendored {name} must load: {e}"));
+            assert_eq!(db.feature_count(), count, "feature count for {name}");
+            total += count;
+        }
+        assert_eq!(total, 3194, "total vendored CLB features");
+        let mut db = FileSegbitsDb::from_files(&[
+            &data.join("segbits_clel_l.db"),
+            &data.join("segbits_clel_r.db"),
+            &data.join("segbits_clem.db"),
+            &data.join("segbits_clem_r.db"),
+        ])
+        .unwrap();
+        assert_eq!(db.feature_count(), 3194);
+        db.synthesize_lut_init().unwrap();
+        // 4 tile types x 8 LUT letters, each a 64-bit MSB-first list.
+        for tile_type in ["CLEL_L", "CLEL_R", "CLEM", "CLEM_R"] {
+            for letter in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'] {
+                let feat = format!("{letter}6LUT.INIT[63:0]");
+                let list = db
+                    .lookup(tile_type, &feat)
+                    .unwrap_or_else(|| panic!("{tile_type}.{feat} must synthesize"));
+                assert_eq!(list.len(), 64, "{tile_type}.{feat} length");
+                assert!(
+                    list.iter().all(|r| !r.must_be_zero),
+                    "{tile_type}.{feat} must list set bits only"
+                );
+            }
+        }
+        // Cross-check against the BitFiltrator LutLoc table (bitloc.rs):
+        // the synthesized list for CLEL_R A6LUT, read MSB-first, must
+        // equal the table's (minor, frame_ofst) pairs in INIT-bit order.
+        let locs = crate::bitloc::lut_locations(crate::bitloc::ClbTileType::ClelR, 0, 0).unwrap();
+        let list = db.lookup("CLEL_R", "A6LUT.INIT[63:0]").unwrap();
+        for i in 0..64 {
+            let r = list[63 - i];
+            assert_eq!(r.frame, locs[i].minor, "LUT INIT bit {i} minor");
+            assert_eq!(r.bit as u32, locs[i].frame_ofst, "LUT INIT bit {i} offset");
+        }
     }
 }
