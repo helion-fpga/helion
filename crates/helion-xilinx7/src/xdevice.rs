@@ -257,6 +257,27 @@ impl<'a> DeviceQuery for XDevice<'a> {
             .min_by_key(|(d, _, _)| *d)
             .map(|(_, tile, site)| (tile, site))
     }
+
+    fn slice_above(&self, site: &str, used: &HashSet<String>) -> Option<(String, String)> {
+        // Full site names are `SLICE_X{x}Y{y}` (even x = X0/M, odd x = X1/L;
+        // tile Y matches name Y; each tile holds one even/odd pair). The
+        // cascade neighbor is the next slice up the column: X1 of the same
+        // tile after X0, else X0 of the tile one name-Y higher: X113Y39 is
+        // followed by X112Y40. Proven by the blinky golden chain.
+        let rest = site.strip_prefix("SLICE_X")?;
+        let (xs, ys) = rest.split_once('Y')?;
+        let x: i32 = xs.parse().ok()?;
+        let y: i32 = ys.parse().ok()?;
+        let (tx, ty) = if x % 2 == 0 { (x + 1, y) } else { (x - 1, y + 1) };
+        let want = format!("SLICE_X{tx}Y{ty}");
+        if used.contains(&want) {
+            return None;
+        }
+        self.device
+            .slices()
+            .into_iter()
+            .find(|(_, s)| s == &want)
+    }
 }
 
 impl<'a> RouteQuery for XDevice<'a> {
