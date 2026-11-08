@@ -13,6 +13,7 @@
 
 pub mod bel;
 pub mod bitgen;
+pub mod bitgen_device;
 pub mod bitloc;
 pub mod device;
 pub mod device_file;
