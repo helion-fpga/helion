@@ -157,6 +157,29 @@ ref-side BUFG/REBUF bit now matches. Remaining BUFG-tile diffs
 are 10 Helion-only tie-off clusters: Vivado ties off with zero
 bits in these frames (its tie-off selections unknown).
 
+## Fifth run (Nov 8, 2026, Mac, IOB package)
+
+Two fixes: site_rel maps IOB BEL by site type (IOB33M master goes
+to IOB_Y0, IOB33S slave to IOB_Y1; pinned by
+iob_site_rel_master_slave), and emit adds the Vivado IOB package
+(DRIVE I12 via I12_I16, input FAST slew, PULLTYPE/IN_TERM NONE,
+ILOGIC ZINV_D, OLOGIC OQUSED + OMUX.D1 + DATA_RATE_TQ.BUF;
+pinned by emit_iob_vivado_defaults). Decoded exact values from
+the oracle with work scripts (note: DATA_RATE is BUF, not SDR).
+Result: 4,698 (record /tmp/x7/blinky_reg_diff6.json for the BEL
+fix, /tmp/x7/blinky_reg_diff7.json for the package). The IOB
+block (both pins, config + logic + pull + drive + slew) is zero
+differing bits.
+
+Regression note: the package first broke zedboard_e2e two ways,
+both fixed same day. (1) Bare "IOB33" SING sites have no
+master/slave marking: site_rel falls back to site position there
+(UNPROVEN, ZB-09 owns SING truth). (2) SING IOI tiles have no
+logic segbits: ioi_tile returns None for SING pairs, so no
+OLOGIC/ILOGIC lines there (error was "no segbits for feature
+RIOI3_SING.OLOGIC_Y0.OMUX.D1"). Record /tmp/x7/blinky_reg_diff8.json
+confirms 4,688 on the final build.
+
 ## HCLK verdict (Nov 8, 2026, Mac): BLOCKED on new fuzzing
 
 Vivado's HCLK word-50 bits verified by hand (tile HCLK_R_X175Y26,
