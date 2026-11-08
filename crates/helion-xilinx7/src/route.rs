@@ -449,6 +449,15 @@ fn is_power_wire(wire: &str) -> bool {
         || wire.starts_with("GCLK_")
 }
 
+/// Clock-bypass mux outputs (`BYP_ALT*`): owned by clock arrival (the
+/// uniform BYP_ALT from GFAN program) and the clock input corridor.
+/// A signal net that selects one forces arrival emit to drop the GFAN
+/// program for the whole tile, so only tieoff and clock-path nets
+/// (the `allow_power` exemption) may enter them.
+fn is_byp_wire(wire: &str) -> bool {
+    wire.starts_with("BYP_ALT")
+}
+
 /// Another net already owns this wire: entering it would short the two
 /// nets (or double-drive a mux). Same-net sharing across loads of one
 /// net stays legal.
@@ -499,6 +508,9 @@ fn bfs_route(
             if !allow_power && is_power_wire(&dst_wire) {
                 continue;
             }
+            if !allow_power && is_byp_wire(&dst_wire) {
+                continue;
+            }
             if owned_elsewhere(claimed, net, &tile, &dst_wire) {
                 continue;
             }
@@ -517,6 +529,9 @@ fn bfs_route(
         // Across tileconn stitching.
         for (ntile, nwire) in device.node_wires(&tile, &wire) {
             if !allow_power && is_power_wire(&nwire) {
+                continue;
+            }
+            if !allow_power && is_byp_wire(&nwire) {
                 continue;
             }
             if owned_elsewhere(claimed, net, &ntile, &nwire) {
@@ -815,6 +830,65 @@ mod tests {
         let exempt = bfs_route("INT_X0", "A", &sinks, &FakeRouter, true, "n", &empty).unwrap();
         assert!(
             exempt.iter().any(|p| p.dst_wire == "GFAN0" || p.src_wire == "GFAN0"),
+            "shortcut not taken, got {exempt:?}"
+        );
+    }
+
+    #[test]
+    fn bfs_avoids_byp_wires() {
+        // BYP_ALT muxes belong to clock arrival (the uniform BYP_ALT
+        // from GFAN program) and the clock input corridor: signal nets
+        // must never select them, or arrival emit has to drop the GFAN
+        // program for the whole tile (ZB-10 oracle: golden chain tiles
+        // program all eight BYP_ALT from GFAN, signals stay off).
+        struct BypTrap;
+        impl RouteQuery for BypTrap {
+            fn pips_from(&self, tile: &str, wire: &str) -> Vec<(String, String, bool)> {
+                // Shortcut A -> BYP_ALT0 -> D comes first (order must
+                // not matter); the signal path A -> B -> C -> D is
+                // longer but the only legal one for signals.
+                match (tile, wire) {
+                    ("INT_X0", "A") => vec![
+                        ("BYP_ALT0".into(), "A".into(), false),
+                        ("B".into(), "A".into(), false),
+                    ],
+                    ("INT_X0", "B") => vec![("C".into(), "B".into(), false)],
+                    ("INT_X1", "C") => vec![("D".into(), "C".into(), false)],
+                    ("INT_X1", "BYP_ALT0") => vec![("D".into(), "BYP_ALT0".into(), false)],
+                    _ => vec![],
+                }
+            }
+            fn node_wires(&self, tile: &str, wire: &str) -> Vec<(String, String)> {
+                match (tile, wire) {
+                    ("INT_X0", "C") => vec![("INT_X1".into(), "C".into())],
+                    ("INT_X0", "BYP_ALT0") => vec![("INT_X1".into(), "BYP_ALT0".into())],
+                    _ => vec![],
+                }
+            }
+            fn site_pin_wire(&self, _: &str, _: &str) -> Option<(String, String)> { None }
+            fn wire_for_site_pin(&self, _: &str, _: &str) -> Vec<(String, String)> { vec![] }
+            fn is_clock_net(&self, _: &str) -> bool { false }
+            fn bufg_tieoff_pips(&self, _: &str) -> Result<BufgTieoff, String> {
+                Ok(BufgTieoff::default())
+            }
+            fn bufg_spine(&self, _: &str) -> Result<BufgSpine, String> {
+                Ok(BufgSpine::default())
+            }
+        }
+        let sinks = vec![("INT_X1".into(), "D".into())];
+        let empty: HashMap<(String, String), String> = HashMap::new();
+        // Restricted: the BYP_ALT0 shortcut is skipped despite coming
+        // first; the signal path A -> B -> C -> D goes out.
+        let clean = bfs_route("INT_X0", "A", &sinks, &BypTrap, false, "n", &empty).unwrap();
+        assert_eq!(clean.len(), 3, "got {clean:?}");
+        assert!(
+            clean.iter().all(|p| !is_byp_wire(&p.dst_wire) && !is_byp_wire(&p.src_wire)),
+            "BYP wire used, got {clean:?}"
+        );
+        // Exempted (tieoff and clock-path nets): the shortcut is taken.
+        let exempt = bfs_route("INT_X0", "A", &sinks, &BypTrap, true, "n", &empty).unwrap();
+        assert!(
+            exempt.iter().any(|p| p.dst_wire == "BYP_ALT0" || p.src_wire == "BYP_ALT0"),
             "shortcut not taken, got {exempt:?}"
         );
     }
