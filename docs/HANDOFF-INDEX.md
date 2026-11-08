@@ -103,6 +103,11 @@ and the proof is shown.
     (it describes the 10-bit config as a guess). Read HANDOFF.md instead.
   - subproblems/: all 25 sub-problem files plus INDEX.md (the per-track
     index with the status table and the suggested order).
+  - The same package is also on GitHub, on branch
+    fm/zedboard-fix-router under docs/zedboard-handoff/ (the code
+    snapshot, tests, xray-db, findings, programming instructions, and
+    README), so a fresh agent can clone it instead of taking the zip.
+    The zip itself is not in git; everything in it is in the repos.
   - code/: snapshot of crates/helion-xilinx7/src (Oct 22, 2026).
   - tests/: t01-t05, zedboard_blinky.sv, zedboard.xdc.
   - xray-db/: segbits_clk_bufg_bot_r.db, segbits_clbll_l.db.
