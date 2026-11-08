@@ -8,6 +8,7 @@
 use crate::pack::IobDir;
 use crate::place::Placed7;
 use crate::route::{RouteKind, Routed7};
+use std::collections::HashSet;
 
 /// What the emitter needs from the device model.
 pub trait EmitDevice {
@@ -304,18 +305,56 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     // registers) requires the detailed attribute bit mapping; future work.
     let _ = &placed.dsps;
 
-    // CARRY4s. Feature path: TILE.SLICEL_<X>.CARRY4.<bit>. The carry chain
-    // muxing uses ACY0/BCY0/CCY0/DCY0 for the 4 bits. CYINIT via PRECYINIT.
-    // NOTE: Full carry chain configuration is incomplete; this is a known
-    // limitation being addressed. For now, emit the mux bits that are in the DB.
+    // CARRY4s (ZB-04). Feature paths: TILE.SLICEL_<X>.CARRY4.<bit> and
+    // TILE.SLICEL_<X>.PRECYINIT.<src>. Derived from the blinky golden
+    // chain (docs/zedboard-handoff/findings/blinky_chain_golden.txt):
+    // every chained group takes PRECYINIT.CIN (carry in from the slice
+    // below through the dedicated cascade); the chain head takes
+    // PRECYINIT.AX (CYINIT from the AX pin, fed by the const-1 LUT) or
+    // PRECYINIT.C0 (CYINIT tied 0). The *CY0 line appears only on the
+    // head bit A: it steers bit A onto the CYINIT mux instead of the CIN
+    // cascade; every other bit cascades by default with no FASM line.
+    let co_nets: HashSet<&str> = packed
+        .carries
+        .iter()
+        .filter_map(|c| c.co_net.as_deref())
+        .collect();
     for carry in &placed.carries {
         let site_rel = device
             .site_rel(&carry.tile, &carry.site)
             .ok_or_else(|| format!("emit: no rel site for {} {}", carry.tile, carry.site))?;
-        // Emit the carry mux bits that exist in the X-Ray DB.
-        // ACY0/BCY0/CCY0/DCY0 select the carry propagate for each bit.
-        for bit in ["ACY0", "BCY0", "CCY0", "DCY0"] {
-            lines.push(format!("{}.{}.CARRY4.{}", carry.tile, site_rel, bit));
+        let packed_c = packed
+            .carries
+            .iter()
+            .find(|c| c.name == carry.name)
+            .ok_or_else(|| format!("emit: placed CARRY4 {} has no packed cell", carry.name))?;
+        if co_nets.contains(packed_c.ci_net.as_str()) {
+            lines.push(format!("{}.{}.PRECYINIT.CIN", carry.tile, site_rel));
+        } else {
+            // Chain head: CYINIT source is the CI net driver.
+            let driver_init = packed
+                .luts
+                .iter()
+                .find(|l| l.output_net == packed_c.ci_net)
+                .map(|l| l.init);
+            match driver_init {
+                Some(u64::MAX) => {
+                    lines.push(format!("{}.{}.PRECYINIT.AX", carry.tile, site_rel));
+                }
+                Some(0) => {
+                    lines.push(format!("{}.{}.PRECYINIT.C0", carry.tile, site_rel));
+                }
+                other => {
+                    return Err(format!(
+                        "emit: CARRY4 {} head CI net `{}` needs a const-1 (AX) or const-0 (C0) LUT driver, got {other:?}",
+                        carry.name, packed_c.ci_net
+                    ));
+                }
+            }
+            // Head bit A steers onto the CYINIT mux; only when bit 0 is used.
+            if packed_c.o_nets[0].is_some() || packed_c.s_nets[0].is_some() {
+                lines.push(format!("{}.{}.CARRY4.ACY0", carry.tile, site_rel));
+            }
         }
     }
 
@@ -406,8 +445,8 @@ fn mux_for_ff(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pack::{IobDir, Packed7, PackedFf, PackedIob, PackedLut};
-    use crate::place::{Placed7, PlacedFf, PlacedIob, PlacedLut};
+    use crate::pack::{IobDir, Packed7, PackedCarry, PackedFf, PackedIob, PackedLut};
+    use crate::place::{Placed7, PlacedCarry, PlacedFf, PlacedIob, PlacedLut};
     use crate::route::{Routed7, RoutedNet7, RouteKind};
 
     struct FakeEmit;
@@ -504,6 +543,57 @@ mod tests {
             text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZRST"),
             "missing ZRST, got:\n{text}"
         );
+    }
+
+    /// Golden shapes: TILE.SLICEL_X*.PRECYINIT.{AX,CIN} plus a lone
+    /// CARRY4.ACY0 on the head bit A (blinky_chain_golden.txt: ACY0 once,
+    /// no BCY0/CCY0/DCY0 anywhere in the chain).
+    fn routed_carry_chain() -> Routed7 {
+        let mut r = routed_blinky();
+        r.placed.packed.luts.push(PackedLut {
+            name: "u_one".into(), init: u64::MAX,
+            input_nets: [None, None, None, None, None, None],
+            output_net: "one".into(),
+        });
+        r.placed.packed.carries = vec![
+            PackedCarry {
+                name: "u_c0".into(), ci_net: "one".into(), co_net: Some("co0".into()),
+                s_nets: [Some("s0".into()), None, None, None],
+                di_nets: [None, None, None, None],
+                o_nets: [Some("o0".into()), None, None, None],
+            },
+            PackedCarry {
+                name: "u_c1".into(), ci_net: "co0".into(), co_net: None,
+                s_nets: [Some("s1".into()), None, None, None],
+                di_nets: [None, None, None, None],
+                o_nets: [Some("o1".into()), None, None, None],
+            },
+        ];
+        r.placed.carries = vec![
+            PlacedCarry { name: "u_c0".into(), tile: "CLB_X0Y0".into(), site: "SLICE_X0Y0".into() },
+            PlacedCarry { name: "u_c1".into(), tile: "CLB_X0Y1".into(), site: "SLICE_X0Y1".into() },
+        ];
+        r
+    }
+
+    #[test]
+    fn emit_carry_chain_precyinit_matches_golden() {
+        let bs = emit_fasm(&routed_carry_chain(), &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        assert!(text.contains("CLB_X0Y0.SLICEL_X0.PRECYINIT.AX"), "got:\n{text}");
+        assert!(text.contains("CLB_X0Y0.SLICEL_X0.CARRY4.ACY0"), "got:\n{text}");
+        assert!(text.contains("CLB_X0Y1.SLICEL_X1.PRECYINIT.CIN"), "got:\n{text}");
+        assert_eq!(text.matches("CARRY4.ACY0").count(), 1, "got:\n{text}");
+        assert!(!text.contains("BCY0") && !text.contains("CCY0") && !text.contains("DCY0"), "got:\n{text}");
+    }
+
+    #[test]
+    fn emit_carry_head_without_const_driver_fails_loudly() {
+        let mut r = routed_carry_chain();
+        // Non-const driver on the head CI: no valid CYINIT source.
+        r.placed.packed.luts.iter_mut().find(|l| l.name == "u_one").unwrap().init = 1;
+        let err = emit_fasm(&r, &FakeEmit).unwrap_err();
+        assert!(err.contains("one") && err.contains("const-1"), "got: {err}");
     }
 
     #[test]
