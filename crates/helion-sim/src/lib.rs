@@ -1401,13 +1401,16 @@ endmodule
 
     /// ZB-04 stage 1 equivalence oracle: the carry path on any whole-register
     /// increment must simulate identically to the default cone flow, with the
-    /// same Q nets, `want_carry` Carry4 cells, and `want_ff` FFs. The oracle
-    /// here is differential (cone flow), not the Vivado bitstream; bit-level
-    /// Vivado equivalence waits on the backend Carry4 consumer (later stage).
+    /// same Q nets, `want_carry` compute Carry4 cells plus `want_pads`
+    /// transparent pads (synth names pads `_pad`), and `want_ff` FFs. The
+    /// oracle here is differential (cone flow), not the Vivado bitstream;
+    /// bit-level Vivado equivalence waits on the backend Carry4 consumer
+    /// (later stage).
     fn assert_carry_matches_cone(
         src: &str,
         origin: &str,
         want_carry: usize,
+        want_pads: usize,
         want_ff: usize,
         cycles: u32,
     ) {
@@ -1418,8 +1421,16 @@ endmodule
         let count_kind = |d: &Design, pred: fn(&CellKind) -> bool| {
             d.cells.iter().filter(|c| pred(&c.kind)).count()
         };
+        let is_pad = |c: &helion_ir::Cell| c.name.contains("_pad");
         assert_eq!(count_kind(&cone, |k| matches!(k, CellKind::Carry4)), 0);
-        assert_eq!(count_kind(&carry, |k| matches!(k, CellKind::Carry4)), want_carry);
+        assert_eq!(
+            carry.cells.iter().filter(|c| matches!(c.kind, CellKind::Carry4) && !is_pad(c)).count(),
+            want_carry
+        );
+        assert_eq!(
+            carry.cells.iter().filter(|c| matches!(c.kind, CellKind::Carry4) && is_pad(c)).count(),
+            want_pads
+        );
         assert_eq!(count_kind(&cone, |k| matches!(k, CellKind::Hff)), want_ff);
         assert_eq!(count_kind(&carry, |k| matches!(k, CellKind::Hff)), want_ff);
 
@@ -1452,24 +1463,26 @@ endmodule
         }
     }
 
-    /// Golden RTL (25-bit counter + registered LD0): 7 Carry4, 26 FFs.
-    /// Traces to the real Vivado oracle via examples/blinky_reg.sv, the
-    /// documented equivalent of ~/CDA4253_A1/blinky.vhd.
+    /// Golden RTL (25-bit counter + registered LD0): 7 compute Carry4, 4
+    /// transparent pads, 26 FFs. Traces to the real Vivado oracle via
+    /// examples/blinky_reg.sv, the documented equivalent of
+    /// ~/CDA4253_A1/blinky.vhd.
     #[test]
     fn carry_increment_matches_cone_sim_on_blinky_reg() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/blinky_reg.sv");
         let src = std::fs::read_to_string(&root).expect("blinky_reg.sv");
-        assert_carry_matches_cone(&src, "blinky_reg.sv", 7, 26, 70);
+        assert_carry_matches_cone(&src, "blinky_reg.sv", 7, 4, 26, 70);
     }
 
     /// Different width (8 bits, 2 groups) plus full wraparound at 256: proves
     /// the grouping and chaining logic generalizes instead of fitting blinky.
+    /// Two groups need no pads (every step stays adjacent).
     #[test]
     fn carry_increment_matches_cone_sim_on_8bit_wrap() {
         let src = "module cnt8(input wire clk, output reg [7:0] q);\n\
                    always @(posedge clk) q <= q + 1'b1;\nendmodule\n";
-        assert_carry_matches_cone(src, "cnt8.sv", 2, 8, 300);
+        assert_carry_matches_cone(src, "cnt8.sv", 2, 0, 8, 300);
     }
 
 }
