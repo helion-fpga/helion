@@ -220,6 +220,18 @@ pub enum CellKind {
     /// marker; the 7-series backend maps it to CARRY4 sites. Synth inference
     /// from adder logic is future work; currently only explicitly
     /// instantiated Carry4 cells are packed.
+    ///
+    /// Pin convention (net endpoints reference these pin names):
+    /// `CI` chained carry in (entry cell: const-1 net for increment;
+    /// the backend selects PRECYINIT.AX vs CIN from placement), `CO`
+    /// chained carry out to the next cell's `CI`, `S0`-`S3` propagate
+    /// (each driven by a LUT O6 output), `DI0`-`DI3` generate (each
+    /// driven by a LUT O5 output or a const net), `O0`-`O3` sum
+    /// outputs (each drives its bit FF's D; the backend maps this
+    /// intra-slice, no routing). S/DI/O association is logical: the
+    /// backend pairs each Carry4 with its 4 S/DI LUTs and 4 FFs by
+    /// these nets. Ground truth for the mapping is ZB-04's golden
+    /// chain (blinky_chain_golden.txt).
     Carry4,
     /// Hierarchical black box (unelaborated IP / DFX partition).
     BlackBox { module: String },
