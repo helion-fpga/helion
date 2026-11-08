@@ -336,8 +336,14 @@ impl Sim {
 
     /// Live Carry4 chain output for the step path (`String`-keyed memo via
     /// `resolve`, usually [`Sim::pin_net_value`]). `out` 0-3 selects sum bit
-    /// O, `out` 4 selects the carry out CO. Unconnected inputs tie low; a
-    /// connected but unresolvable input yields X (None).
+    /// O, `out` 4 selects the carry out CO. A bare S pin (no S net, as in
+    /// the golden oracle head-transit unused positions) propagates: the
+    /// oracle chain provably passes through slices with unconnected S,
+    /// so bare S reads high and CO follows CIN. A LUT-driven S evaluates
+    /// normally (a passthrough with floating inputs reads 0, which kills
+    /// the chain by construction). Bare DI stays low (irrelevant under
+    /// propagate). Other unconnected inputs tie low; a connected but
+    /// unresolvable input yields X (None).
     fn carry_output_live(
         &self,
         cell: &str,
@@ -351,7 +357,7 @@ impl Sim {
         }?;
         for j in 0..4u8 {
             let s = match pins.s[j as usize].as_deref() {
-                None => Some(false),
+                None => Some(true),
                 Some(n) => resolve(n),
             }?;
             let di = match pins.di[j as usize].as_deref() {
@@ -369,8 +375,8 @@ impl Sim {
 
     /// Live Carry4 chain output for the ILA probe path (`&str`-keyed memo,
     /// recursive through [`Sim::eval_net`]). Same chain semantics as
-    /// [`Sim::carry_output_live`]; separate loop only because the two memos
-    /// have invariantly different key types.
+    /// [`Sim::carry_output_live`] (bare S propagates); separate loop only
+    /// because the two memos have invariantly different key types.
     fn carry_output_net<'s>(
         &'s self,
         cell: &'s str,
@@ -385,7 +391,7 @@ impl Sim {
         }?;
         for j in 0..4u8 {
             let s = match pins.s[j as usize].as_deref() {
-                None => Some(false),
+                None => Some(true),
                 Some(n) => self.eval_net(n, memo, stack),
             }?;
             let di = match pins.di[j as usize].as_deref() {
@@ -1433,6 +1439,20 @@ endmodule
         );
         assert_eq!(count_kind(&cone, |k| matches!(k, CellKind::Hff)), want_ff);
         assert_eq!(count_kind(&carry, |k| matches!(k, CellKind::Hff)), want_ff);
+        // Transparent pads carry four routed passthrough S-LUTs each (the
+        // oracle pads X1@Y40-43 all show passthrough INITs; synth names
+        // them `_ps`). A floating pad I5 would read S=0, killing the
+        // chain above bit 8.
+        assert_eq!(
+            carry
+                .cells
+                .iter()
+                .filter(|c| matches!(c.kind, CellKind::Lut6 { .. })
+                    && (c.name.contains("_pad") || c.name.contains("_ps")))
+                .count(),
+            4 * want_pads,
+            "each pad needs four S-fill LUTs"
+        );
 
         let qnets = |d: &Design| {
             let mut names: Vec<String> = d
@@ -1466,13 +1486,15 @@ endmodule
     /// Golden RTL (25-bit counter + registered LD0): 7 compute Carry4, 4
     /// transparent pads, 26 FFs. Traces to the real Vivado oracle via
     /// examples/blinky_reg.sv, the documented equivalent of
-    /// ~/CDA4253_A1/blinky.vhd.
+    /// ~/CDA4253_A1/blinky.vhd. 5000 cycles exercises bits 0-12 through
+    /// the first two transparent pads (bit 12 toggles past 4096); 70
+    /// cycles never reached bit 8, leaving pad transparency unproven.
     #[test]
     fn carry_increment_matches_cone_sim_on_blinky_reg() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/blinky_reg.sv");
         let src = std::fs::read_to_string(&root).expect("blinky_reg.sv");
-        assert_carry_matches_cone(&src, "blinky_reg.sv", 7, 4, 26, 70);
+        assert_carry_matches_cone(&src, "blinky_reg.sv", 7, 4, 26, 5000);
     }
 
     /// Different width (8 bits, 2 groups) plus full wraparound at 256: proves
