@@ -98,11 +98,25 @@ pub struct PackedDsp {
 ///
 /// The IR's [`helion_ir::CellKind::Carry4`] marks a 4-bit fast carry
 /// chain; the 7-series backend places it in a SLICE and emits the CARRY4
-/// configuration. Synth inference from adder logic is future work.
+/// configuration. Pin nets are captured here so place can keep chained
+/// groups adjacent, route can treat the CO-to-CI cascade as a dedicated
+/// wire, and emit can select the CYINIT source. Per-bit entries are
+/// `None` for unused bits (partial top group); CI is required, CO is
+/// optional (chain end may leave it unconnected).
 #[derive(Clone, Debug)]
 pub struct PackedCarry {
     /// Source IR cell name.
     pub name: String,
+    /// Net on CI (carry in: prior group CO, or the CYINIT source net).
+    pub ci_net: String,
+    /// Net on CO (carry out to the next group CI).
+    pub co_net: Option<String>,
+    /// Nets on S0..S3.
+    pub s_nets: [Option<String>; 4],
+    /// Nets on DI0..DI3.
+    pub di_nets: [Option<String>; 4],
+    /// Nets on O0..O3 (sum bits).
+    pub o_nets: [Option<String>; 4],
 }
 
 /// Backend-owned packed netlist for xc7a35t.
@@ -246,8 +260,26 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                 });
             }
             CellKind::Carry4 => {
+                let pin = |p: &str| {
+                    pins.net_on(&cell.name, p).map(|s| s.to_string())
+                };
+                let mut s_nets: [Option<String>; 4] = Default::default();
+                let mut di_nets: [Option<String>; 4] = Default::default();
+                let mut o_nets: [Option<String>; 4] = Default::default();
+                for j in 0..4 {
+                    s_nets[j] = pin(&format!("S{j}"));
+                    di_nets[j] = pin(&format!("DI{j}"));
+                    o_nets[j] = pin(&format!("O{j}"));
+                }
                 out.carries.push(PackedCarry {
                     name: cell.name.clone(),
+                    ci_net: pin("CI").ok_or_else(|| {
+                        format!("pack: CARRY4 {} has no CI net", cell.name)
+                    })?,
+                    co_net: pin("CO"),
+                    s_nets,
+                    di_nets,
+                    o_nets,
                 });
             }
             other => {
@@ -360,5 +392,60 @@ mod tests {
         d.add_cell("u_ila", CellKind::Ila { net: "x".into() });
         let err = pack(&d).unwrap_err();
         assert!(err.contains("unsupported"), "got: {err}");
+    }
+
+    /// Two chained Carry4 groups (second partial, no CO): pack must capture
+    /// every pin net so place/route/emit can follow the chain, and fail
+    /// loudly on a missing CI.
+    fn carry_chain_design() -> Design {
+        let mut d = Design::new("carry2");
+        d.add_port("clk", PortDir::In);
+        d.add_cell("u_c0", CellKind::Carry4);
+        d.connect("one", "u_c0", "CI");
+        d.connect("co0", "u_c0", "CO");
+        for j in 0..4 {
+            d.connect(format!("s{j}"), "u_c0", format!("S{j}"));
+            d.connect("zero", "u_c0", format!("DI{j}"));
+            d.connect(format!("o{j}"), "u_c0", format!("O{j}"));
+        }
+        // Partial top group: bits 0-1 only, chain end (no CO endpoint).
+        d.add_cell("u_c1", CellKind::Carry4);
+        d.connect("co0", "u_c1", "CI");
+        for j in 0..2 {
+            d.connect(format!("s{}", 4 + j), "u_c1", format!("S{j}"));
+            d.connect("zero", "u_c1", format!("DI{j}"));
+            d.connect(format!("o{}", 4 + j), "u_c1", format!("O{j}"));
+        }
+        d
+    }
+
+    #[test]
+    fn pack_carry_captures_chain_pin_nets() {
+        let packed = pack(&carry_chain_design()).unwrap();
+        assert_eq!(packed.carries.len(), 2);
+        let c0 = &packed.carries[0];
+        assert_eq!(c0.ci_net, "one");
+        assert_eq!(c0.co_net.as_deref(), Some("co0"));
+        assert_eq!(c0.s_nets[0].as_deref(), Some("s0"));
+        assert_eq!(c0.di_nets[3].as_deref(), Some("zero"));
+        assert_eq!(c0.o_nets[2].as_deref(), Some("o2"));
+        let c1 = &packed.carries[1];
+        // Cascade linkage by net name, not cell naming.
+        assert_eq!(c1.ci_net, "co0");
+        assert_eq!(c1.co_net, None);
+        assert_eq!(c1.s_nets[1].as_deref(), Some("s5"));
+        assert_eq!(c1.s_nets[2], None);
+        assert_eq!(c1.di_nets[3], None);
+        assert_eq!(c1.o_nets[0].as_deref(), Some("o4"));
+        assert_eq!(c1.o_nets[3], None);
+    }
+
+    #[test]
+    fn pack_carry_without_ci_fails_loudly() {
+        let mut d = Design::new("noci");
+        d.add_cell("u_c", CellKind::Carry4);
+        d.connect("co", "u_c", "CO");
+        let err = pack(&d).unwrap_err();
+        assert!(err.contains("no CI net"), "got: {err}");
     }
 }
