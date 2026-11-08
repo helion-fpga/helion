@@ -16,7 +16,8 @@ pub trait EmitDevice {
     /// itself uses the full tile name.)
     fn tile_type(&self, tile: &str) -> Option<String>;
     /// Site name relative to its tile for FASM, e.g.
-    /// `("RIOB33_X43Y75", "IOB_X1Y76")` → `"IOB_Y1"`,
+    /// `("RIOB33_X43Y75", "IOB_X1Y76")` → `"IOB_Y0"` for a master site
+    /// (`IOB_Y1` for slave),
     /// `("CLBLL_L_X14Y100", "SLICE_X28Y100")` → `"SLICEL_X0"`.
     /// Returns the site-type-qualified relative name.
     fn site_rel(&self, tile: &str, site: &str) -> Option<String>;
@@ -25,6 +26,12 @@ pub trait EmitDevice {
     /// Defaults to none; the XDevice impl derives them from the DB.
     fn bufg_spine_static(&self, _tile: &str, _site: &str) -> Vec<(String, String)> {
         Vec::new()
+    }
+    /// IOI tile paired with an IOB tile (same bank side, same row),
+    /// for OLOGIC/ILOGIC features. Defaults to none; the XDevice impl
+    /// finds it in the DB.
+    fn ioi_tile(&self, _iob_tile: &str) -> Option<String> {
+        None
     }
 }
 
@@ -73,6 +80,18 @@ fn obuf_drive_prefix(iostandard: &str, drive: &str) -> Result<&'static str, Stri
         }
     };
     Ok(prefix)
+}
+
+/// FASM drive value for an (IOSTANDARD, DRIVE) pair. Usually the drive
+/// string itself, but the LVCMOS33 12mA selection lives in the shared
+/// LVCMOS33_LVTTL family as I12_I16 (Vivado ground truth, ZB-10).
+fn obuf_drive_value(iostandard: &str, drive: &str) -> String {
+    let std = iostandard.to_ascii_uppercase();
+    let drv = drive.to_ascii_uppercase();
+    match (std.as_str(), drv.as_str()) {
+        ("LVCMOS33", "I12") => "I12_I16".to_string(),
+        _ => drv,
+    }
 }
 
 /// Backend-owned bitstream: FASM text plus assembled configuration frames.
@@ -173,19 +192,38 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                     "{}.{}.LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVDS_25_LVTTL_SSTL135_SSTL15_TMDS_33.IN_ONLY",
                     iob.tile, site_rel
                 ));
+                // Vivado default input slew is FAST (ground truth:
+                // LIOB33_X0Y25 IOB_Y0 SLEW.FAST on the GCLK input).
+                // Only LVCMOS33 has DB evidence; other standards keep
+                // the old behavior (no slew line).
+                if p.iostandard.eq_ignore_ascii_case("LVCMOS33") {
+                    let slew = p.slew.as_deref().unwrap_or("FAST");
+                    lines.push(format!(
+                        "{}.{}.LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVTTL.SLEW.{}",
+                        iob.tile,
+                        site_rel,
+                        slew.to_ascii_uppercase()
+                    ));
+                }
+                // Input path: no inversion on D (Vivado ILOGIC_Y0.ZINV_D).
+                if let Some(logic_tile) = device.ioi_tile(&iob.tile) {
+                    let logic = site_rel.replace("IOB_", "ILOGIC_");
+                    lines.push(format!("{logic_tile}.{logic}.ZINV_D"));
+                }
             }
             IobDir::Out => {
                 // OBUF: output driver enabled by DRIVE select (no IN_ONLY).
                 // The DRIVE feature prefix depends on the (standard, drive)
-                // pair (see obuf_drive_prefix).
-                let drive = p.drive.as_deref().unwrap_or("I16");
+                // pair (see obuf_drive_prefix); the FASM value additionally
+                // depends on the pair (see obuf_drive_value). Vivado
+                // default drive for LVCMOS33 is 12mA (ground truth:
+                // LVCMOS33_LVTTL.DRIVE.I12_I16 on the LD0 output).
+                let drive = p.drive.as_deref().unwrap_or("I12");
                 let prefix = obuf_drive_prefix(&p.iostandard, drive)?;
+                let value = obuf_drive_value(&p.iostandard, drive);
                 lines.push(format!(
                     "{}.{}.{}.DRIVE.{}",
-                    iob.tile,
-                    site_rel,
-                    prefix,
-                    drive.to_ascii_uppercase()
+                    iob.tile, site_rel, prefix, value
                 ));
                 let slew = p.slew.as_deref().unwrap_or("SLOW");
                 lines.push(format!(
@@ -194,8 +232,21 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                     site_rel,
                     slew.to_ascii_uppercase()
                 ));
+                // Output path: OLOGIC used, D1 mux, single-data-rate
+                // bypass (Vivado ground truth on the LD0 output).
+                if let Some(logic_tile) = device.ioi_tile(&iob.tile) {
+                    let logic = site_rel.replace("IOB_", "OLOGIC_");
+                    lines.push(format!("{logic_tile}.{logic}.OQUSED"));
+                    lines.push(format!("{logic_tile}.{logic}.OMUX.D1"));
+                    lines.push(format!(
+                        "{logic_tile}.{logic}.OSERDES.DATA_RATE_TQ.BUF"
+                    ));
+                }
             }
         }
+        // Vivado defaults on every IOB: no pull, no input termination.
+        lines.push(format!("{}.{}.PULLTYPE.NONE", iob.tile, site_rel));
+        lines.push(format!("{}.{}.IN_TERM.NONE", iob.tile, site_rel));
         let _ = p;
     }
 
@@ -426,7 +477,10 @@ mod tests {
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.ALUT.INIT[63:0] = 64'h5555555555555555"), "got:\n{text}");
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZINI"), "got:\n{text}");
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFFMUX.AX"), "got:\n{text}");
-        assert!(text.contains("RIOB33_X0Y0.IOB_Y1.LVCMOS33.DRIVE.I16"), "got:\n{text}");
+        // Vivado default drive for LVCMOS33 outputs is 12mA (ZB-10).
+        assert!(text.contains("RIOB33_X0Y0.IOB_Y1.LVCMOS33_LVTTL.DRIVE.I12_I16"), "got:\n{text}");
+        assert!(text.contains("RIOB33_X0Y0.IOB_Y1.PULLTYPE.NONE"), "got:\n{text}");
+        assert!(text.contains("RIOB33_X0Y0.IOB_Y1.IN_TERM.NONE"), "got:\n{text}");
     }
 
     #[test]
@@ -486,6 +540,52 @@ mod tests {
             "CLK_BUFG_BOT_R_X0Y0.BUFGCTRL.BUFGCTRL_X0Y0.ZINV_S0",
         ];
         assert_eq!(got, want, "BUFGCTRL I0 feature set");
+    }
+
+    #[test]
+    fn emit_iob_vivado_defaults() {
+        // Vivado ground truth (ZB-10 same-RTL diff, GT-blinky.bit):
+        // LVCMOS33 outputs use DRIVE I12 (I12_I16 feature) with SLOW
+        // slew; inputs use FAST slew; both use PULLTYPE/IN_TERM NONE.
+        // (FakeEmit has no IOI tile, so no OLOGIC/ILOGIC lines here;
+        // the e2e diff verifies those.)
+        let mut routed = routed_blinky();
+        routed.placed.packed.iobs.push(PackedIob {
+            name: "u_ibuf".into(), port: "clk".into(), dir: IobDir::In,
+            net: "clk".into(), loc: Some("H6".into()), iostandard: "LVCMOS33".into(),
+            drive: None, slew: None,
+        });
+        routed.placed.iobs.push(PlacedIob {
+            name: "u_ibuf".into(), port: "clk".into(), dir: IobDir::In,
+            tile: "LIOB33_X0Y0".into(), site: "IOB_X0Y0".into(),
+        });
+        let bs = emit_fasm(&routed, &FakeEmit).unwrap();
+        let iob: Vec<&str> = bs
+            .fasm
+            .iter()
+            .map(String::as_str)
+            .filter(|l| l.contains("IOB_Y1.PULLTYPE") || l.contains("IN_TERM") || l.contains("SLEW.FAST") || l.contains("DRIVE.I12"))
+            .collect();
+        assert!(
+            iob.iter().any(|l| l.ends_with("IOB_Y1.LVCMOS33_LVTTL.DRIVE.I12_I16")),
+            "missing I12 drive, got:\n{}",
+            bs.fasm.join("\n")
+        );
+        assert!(
+            iob.iter().any(|l| l.ends_with("IOB_Y1.PULLTYPE.NONE")),
+            "missing PULLTYPE.NONE, got:\n{}",
+            bs.fasm.join("\n")
+        );
+        assert!(
+            iob.iter().any(|l| l.ends_with("IOB_Y1.IN_TERM.NONE")),
+            "missing IN_TERM.NONE, got:\n{}",
+            bs.fasm.join("\n")
+        );
+        assert!(
+            iob.iter().any(|l| l.contains("SLEW.FAST")),
+            "missing input FAST slew, got:\n{}",
+            bs.fasm.join("\n")
+        );
     }
 
     #[test]
