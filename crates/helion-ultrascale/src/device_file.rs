@@ -43,6 +43,7 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 use serde::Deserialize;
 
@@ -267,6 +268,14 @@ struct DeviceFileRaw {
 #[derive(Clone, Debug)]
 pub struct DeviceFile {
     raw: DeviceFileRaw,
+    /// Lazily computed tile-name list for the `BitgenDevice` impl
+    /// (`bitgen_device.rs`). Computed on first use, never at load:
+    /// most consumers (the BEL locator, the demo validation) never
+    /// need the full tile enumeration.
+    pub(crate) tile_names_cache: OnceLock<Vec<String>>,
+    /// Lazily computed config-order FAR list for the `BitgenDevice`
+    /// impl. Same laziness rationale as `tile_names_cache`.
+    pub(crate) config_order_cache: OnceLock<Vec<u32>>,
 }
 
 impl DeviceFile {
@@ -328,6 +337,14 @@ impl DeviceFile {
     /// SLR names in file order.
     pub fn slr_names(&self) -> Vec<&str> {
         self.raw.slrs.keys().map(String::as_str).collect()
+    }
+
+    /// Row-major keys of an SLR's `rowMajors` table, sorted ascending.
+    /// A row major is the FAR row index inside the SLR (the same index
+    /// `BitLocator` passes to `Far::new` as the row); for both files on
+    /// disk it runs 0..=max_far_row_idx.
+    pub fn row_majors(&self, name: &str) -> Result<Vec<u32>, DeviceFileError> {
+        Ok(self.slr(name)?.row_majors.keys().copied().collect())
     }
 
     /// SLR names ordered by config order index (configuration order).
@@ -599,7 +616,11 @@ impl FromStr for DeviceFile {
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let raw: DeviceFileRaw =
             serde_json::from_str(text).map_err(|e| DeviceFileError::Json(e.to_string()))?;
-        Ok(DeviceFile { raw })
+        Ok(DeviceFile {
+            raw,
+            tile_names_cache: OnceLock::new(),
+            config_order_cache: OnceLock::new(),
+        })
     }
 }
 
