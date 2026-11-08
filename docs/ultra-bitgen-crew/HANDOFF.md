@@ -198,10 +198,14 @@ files.
 ## License and the Q6 probe
 
 - License server 27000@license2.forest.usf.edu: connection refused Oct 22
-  through Nov 7. On Nov 8 about 10:27-10:31 EST the port ANSWERED (driver run
-  twice, direct TCP check once). A real license checkout is still UNVERIFIED:
-  no lmutil or Vivado exists on this VM. The real test is Vivado on the
-  cluster (sc.rc.usf.edu, campus/VPN only) or the PinPlanning probe.
+  through Nov 7. On Nov 8 about 10:27-10:31 EST the port appeared to ANSWER,
+  but that finding was proven VOID later the same day (about 13:30 EST): a
+  control test showed direct TCP connects from this VM succeed to every port,
+  including known-closed ones (license2:1, example.com:81), so the sandbox
+  gateway accepts the handshake and the check proves nothing about the license
+  server. The license state is UNKNOWN. A real license checkout is still
+  UNVERIFIED: no lmutil or Vivado exists on this VM. The real test is Vivado
+  on the cluster (sc.rc.usf.edu, campus/VPN only) or the PinPlanning probe.
 - The Q6 Vivado probe is the tilegrid unblocker. It is written up in
   `BRIEFS/tilegrid-research.md` (1,173 lines): step 1 tile inventory
   (extract_device_info.tcl plus `TILE_TYPE =~ HPIO*` arbiter queries, which

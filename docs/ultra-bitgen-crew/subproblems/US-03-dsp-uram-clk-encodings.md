@@ -37,8 +37,9 @@ them, with no other block regressed.
 
 - Nothing tried. No fuzzing run has ever happened for these blocks; the
   license server refused connections from Oct 22 through Nov 7, 2026, and
-  answered on Nov 8 at about 10:30 EST, but a real checkout is still
-  unverified.
+  appeared to answer on Nov 8 at about 10:30 EST, but that finding was
+  proven void the same day (see docs/HANDOFF.md), and a real checkout is
+  still unverified.
 
 ## What to do
 
