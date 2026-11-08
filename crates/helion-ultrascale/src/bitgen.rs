@@ -97,6 +97,10 @@
 //!   `parse_bitstream` (`UnexplainedBits`). Use `parse_frames` for foreign
 //!   bitstreams whose DB coverage is incomplete.
 
+use crate::bitloc::{
+    bram_mem_placed_bits, bram_parity_placed_bits, BitLocError, PlacedBit, BRAM_MEM_BITS,
+    BRAM_PARITY_BITS,
+};
 use crate::segbits::{BitRef, SegbitsDb};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -281,6 +285,8 @@ pub enum BitgenError {
     CrcMismatch { far: u32, expected: u32, found: u32 },
     /// A frame bit is set that no enumerated feature explains.
     UnexplainedBits { far: u32, bits: Vec<u16> },
+    /// The vendored BRAM bit-location table failed to load.
+    BramTable { reason: String },
     /// A feature reads back inconsistently from the frames.
     InconsistentFeature {
         tile: String,
@@ -395,6 +401,9 @@ impl fmt::Display for BitgenError {
                     "FAR 0x{far:08x} has set bits no feature explains: {bits:?}"
                 )
             }
+            BitgenError::BramTable { reason } => {
+                write!(f, "BRAM bit-location table failed to load: {reason}")
+            }
             BitgenError::InconsistentFeature {
                 tile,
                 feature,
@@ -416,6 +425,14 @@ impl fmt::Display for BitgenError {
 }
 
 impl std::error::Error for BitgenError {}
+
+impl From<BitLocError> for BitgenError {
+    fn from(e: BitLocError) -> Self {
+        BitgenError::BramTable {
+            reason: e.to_string(),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Device traits
@@ -674,6 +691,161 @@ fn feature_is_valued(feature: &str) -> bool {
 /// One configuration frame: FAR plus 93 words.
 pub type FrameWords = [u32; FRAME_WORDS];
 
+/// A BRAM INIT/INITP feature spelling on a RAMB tile.
+///
+/// Whole-array form (the `bram18_fasm` spelling, one format site in
+/// `bitloc.rs`): `INIT[16383:0]` (16384 bits) and `INITP[2047:0]`
+/// (2048 bits). Per-word form (the confirmed Vivado
+/// primitive-property spelling): `INIT_00`..`INIT_3F` and
+/// `INITP_00`..`INITP_07` (256 bits each, suffix is the word number
+/// in hex). Absolute bit i of the value is INIT word i/256, bit i%256;
+/// bit 0 is the LSB of the value. Any other spelling returns None and
+/// the caller fails loud through the segbits lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BramFeature {
+    /// True for INITP (parity), false for INIT (content).
+    pub parity: bool,
+    /// First absolute bit the feature covers.
+    pub first_bit: usize,
+    /// Number of absolute bits the feature covers.
+    pub bit_count: usize,
+}
+
+impl BramFeature {
+    /// Parse a BRAM feature spelling. Returns None for any other spelling.
+    pub fn parse(feature: &str) -> Option<Self> {
+        if feature == "INIT[16383:0]" {
+            return Some(Self {
+                parity: false,
+                first_bit: 0,
+                bit_count: BRAM_MEM_BITS,
+            });
+        }
+        if feature == "INITP[2047:0]" {
+            return Some(Self {
+                parity: true,
+                first_bit: 0,
+                bit_count: BRAM_PARITY_BITS,
+            });
+        }
+        if let Some(suffix) = feature.strip_prefix("INIT_") {
+            if suffix.len() == 2 {
+                if let Ok(word) = u32::from_str_radix(suffix, 16) {
+                    if word < 64 {
+                        return Some(Self {
+                            parity: false,
+                            first_bit: word as usize * 256,
+                            bit_count: 256,
+                        });
+                    }
+                }
+            }
+            return None;
+        }
+        if let Some(suffix) = feature.strip_prefix("INITP_") {
+            if suffix.len() == 2 {
+                if let Ok(word) = u32::from_str_radix(suffix, 16) {
+                    if word < 8 {
+                        return Some(Self {
+                            parity: true,
+                            first_bit: word as usize * 256,
+                            bit_count: 256,
+                        });
+                    }
+                }
+            }
+            return None;
+        }
+        None
+    }
+}
+
+/// Parse `RAMB18_X<x>Y<y>` into (x, y). RAMB36 tiles have no resolver.
+pub fn parse_bram_tile(tile: &str) -> Option<(u32, u32)> {
+    let rest = tile.strip_prefix("RAMB18_X")?;
+    let (x_text, y_text) = rest.split_once('Y')?;
+    let x: u32 = x_text.parse().ok()?;
+    let y: u32 = y_text.parse().ok()?;
+    Some((x, y))
+}
+
+/// Placed bits for one BRAM feature value, in absolute-bit order,
+/// restricted to the feature's range. Value bit k is absolute bit
+/// (`first_bit` + k) of the array. The returned bits carry the
+/// bit-location table's (minor, frame_ofst) for each absolute bit.
+pub fn bram_feature_placed_bits(
+    bram_y: u32,
+    feature: BramFeature,
+    value: &FasmValue,
+) -> Result<Vec<PlacedBit>, BitgenError> {
+    let mut content = [0u64; 256];
+    let mut parity = [0u64; 32];
+    for k in 0..feature.bit_count {
+        // Value bit k is the feature-relative bit; absolute bit is
+        // first_bit + k. (The value holds only this feature's bits,
+        // not the whole array, so indexing value.bit(first_bit + k)
+        // would read past a per-word value and drop every set bit.)
+        if value.bit(k) {
+            let abs = feature.first_bit + k;
+            if feature.parity {
+                parity[abs / 64] |= 1u64 << (abs % 64);
+            } else {
+                content[abs / 64] |= 1u64 << (abs % 64);
+            }
+        }
+    }
+    let placed = if feature.parity {
+        bram_parity_placed_bits(bram_y, &parity)?
+    } else {
+        bram_mem_placed_bits(bram_y, &content)?
+    };
+    Ok(placed[feature.first_bit..feature.first_bit + feature.bit_count].to_vec())
+}
+
+/// Write one frame bit, failing loud on overflow, an out-of-range bit
+/// offset, or a conflicting earlier write. Shared by the segbits path
+/// and the BRAM path so the two cannot drift apart.
+fn write_frame_bit(
+    frames: &mut BTreeMap<u32, FrameWords>,
+    written: &mut HashMap<(u32, u16), bool>,
+    tile: &str,
+    feature: &str,
+    base_far: u32,
+    frame: u32,
+    bit: u16,
+    want: bool,
+) -> Result<(), BitgenError> {
+    if bit as usize >= FRAME_BITS {
+        return Err(BitgenError::BadFar {
+            reason: format!("tile {tile} feature {feature}: frame bit {bit} exceeds {FRAME_BITS}"),
+        });
+    }
+    let far = base_far.checked_add(frame).ok_or_else(|| BitgenError::BadFar {
+        reason: format!(
+            "tile {tile} feature {feature}: base FAR 0x{base_far:08x} + offset {frame} overflows"
+        ),
+    })?;
+    if let Some(prev) = written.get(&(far, bit)) {
+        if *prev != want {
+            return Err(BitgenError::ConflictingBit {
+                tile: tile.to_string(),
+                feature: feature.to_string(),
+                far,
+                bit,
+            });
+        }
+    }
+    written.insert((far, bit), want);
+    let words = frames.entry(far).or_insert([0u32; FRAME_WORDS]);
+    let slot = &mut words[(bit / 32) as usize];
+    if want {
+        *slot |= 1u32 << (bit % 32);
+    } else {
+        *slot &= !(1u32 << (bit % 32));
+    }
+    Ok(())
+}
+
 /// Resolve FASM entries to frames. Frame bits start at 0; `!` bits must read
 /// 0 in the frameset as built so far, and two features writing different
 /// values to one bit is an error.
@@ -697,6 +869,59 @@ pub fn emit_frames(
                 .ok_or_else(|| BitgenError::UnknownTileType {
                     tile: entry.tile.clone(),
                 })?;
+        // BRAM INIT/INITP resolves through the bit-location tables,
+        // never through segbits: no vendored segbits DB carries BRAM
+        // INIT features. The branch runs before the segbits lookup;
+        // any other feature on a BRAM tile falls through to the
+        // lookup and fails loud there. Conversion (INTERFACES.md):
+        // frame = minor - base_minor, bit = frame_ofst, where
+        // base_minor is the minor field of tile_base_far (0 for a
+        // RAMB18 tile today, but the subtraction is written out so
+        // a future non-zero base minor stays correct).
+        if tile_type == "BRAM" {
+            if let Some(bram_feature) = BramFeature::parse(&entry.feature) {
+                let (_, bram_y) =
+                    parse_bram_tile(&entry.tile).ok_or_else(|| BitgenError::UnknownTile {
+                        tile: entry.tile.clone(),
+                    })?;
+                let value = entry.value.as_ref().ok_or_else(|| BitgenError::BadValue {
+                    tile: entry.tile.clone(),
+                    feature: entry.feature.clone(),
+                    value: String::new(),
+                })?;
+                if value.significant_bits() > bram_feature.bit_count {
+                    return Err(BitgenError::ValueTooWide {
+                        tile: entry.tile.clone(),
+                        feature: entry.feature.clone(),
+                        bits: bram_feature.bit_count,
+                        value_bits: value.significant_bits(),
+                    });
+                }
+                let base_minor = base_far & 0xFF;
+                let placed = bram_feature_placed_bits(bram_y, bram_feature, value)?;
+                for placed_bit in &placed {
+                    let frame = placed_bit.minor.checked_sub(base_minor).ok_or_else(|| {
+                        BitgenError::BadFar {
+                            reason: format!(
+                                "tile {} feature {}: BRAM minor {} is below base minor {base_minor}",
+                                entry.tile, entry.feature, placed_bit.minor
+                            ),
+                        }
+                    })?;
+                    write_frame_bit(
+                        &mut frames,
+                        &mut written,
+                        &entry.tile,
+                        &entry.feature,
+                        base_far,
+                        frame,
+                        placed_bit.frame_ofst as u16,
+                        placed_bit.value,
+                    )?;
+                }
+                continue;
+            }
+        }
         let refs = segbits.lookup(tile_type, &entry.feature).ok_or_else(|| {
             BitgenError::UnknownFeature {
                 tile: entry.tile.clone(),
@@ -734,9 +959,11 @@ pub fn emit_frames(
                         entry.tile, entry.feature, r.frame
                     ),
                 })?;
-            let words = frames.entry(far).or_insert([0u32; FRAME_WORDS]);
-            let current = (words[(r.bit / 32) as usize] >> (r.bit % 32)) & 1 == 1;
             if r.must_be_zero {
+                // Materialize the frame entry, as before: a zero
+                // checked frame is part of the emitted frameset.
+                let words = frames.entry(far).or_insert([0u32; FRAME_WORDS]);
+                let current = (words[(r.bit / 32) as usize] >> (r.bit % 32)) & 1 == 1;
                 if current {
                     return Err(BitgenError::MustBeZeroViolated {
                         tile: entry.tile.clone(),
@@ -754,23 +981,16 @@ pub fn emit_frames(
                 None => true,
             };
             set_idx += 1;
-            if let Some(prev) = written.get(&(far, r.bit)) {
-                if *prev != want {
-                    return Err(BitgenError::ConflictingBit {
-                        tile: entry.tile.clone(),
-                        feature: entry.feature.clone(),
-                        far,
-                        bit: r.bit,
-                    });
-                }
-            }
-            written.insert((far, r.bit), want);
-            let slot = &mut words[(r.bit / 32) as usize];
-            if want {
-                *slot |= 1u32 << (r.bit % 32);
-            } else {
-                *slot &= !(1u32 << (r.bit % 32));
-            }
+            write_frame_bit(
+                &mut frames,
+                &mut written,
+                &entry.tile,
+                &entry.feature,
+                base_far,
+                r.frame,
+                r.bit,
+                want,
+            )?;
         }
     }
     Ok(frames)
