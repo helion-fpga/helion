@@ -28,12 +28,15 @@
 //! relative path that only works from the repo root would be a bug.
 //!
 //! Device seam (`load_device`): the emitter consumes the `BitgenDevice`
-//! trait. Today only xcku3p exists, as a `StubDevice` with the three
-//! tiles the golden designs use (see the provenance comments there).
-//! A parallel worker implements `BitgenDevice` for the real `DeviceFile`;
-//! when it lands, `load_device` returns that implementation instead and
-//! the stub table is deleted. Do not extend the stub table with more
-//! invented tiles: unknown parts fail loud here.
+//! trait. `xcku3p` loads the real `DeviceFile` from the vendored
+//! `data/xcku3p.json` (critic session 13 FLAG F4). One provisional
+//! bridge remains: the real impl does not resolve HPIO tiles (no column
+//! mapping in the device file), but the v1 goldens carry HPIO lines, so
+//! `HPIO_RIGHT_X0Y0` still resolves to the stub's provisional base FAR
+//! 0x000 (critic session 13 FLAG F1). The harness blocks IO_CONFIG
+//! before comparing, so no greenness depends on that value, and it must
+//! never be consumed as ground truth. The bridge dies the day the
+//! xcku3p tilegrid lands. Unknown parts fail loud here.
 //!
 //! FASM vocabulary gap, closed here (not in the library): the golden
 //! FASM uses `A6LUT.INIT[63:0]` and valued `AFF.INIT = 0`, while the
@@ -56,9 +59,9 @@
 //! No em dashes anywhere.
 
 use helion_ultrascale::bitgen::{
-    BitgenDevice, BitgenError, StubDevice, emit_bitstream, parse_bitstream, parse_fasm,
-    parse_frames,
+    BitgenDevice, BitgenError, emit_bitstream, parse_bitstream, parse_fasm, parse_frames,
 };
+use helion_ultrascale::device_file::DeviceFile;
 use helion_ultrascale::segbits::{FileSegbitsDb, SegbitsDb};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -192,53 +195,88 @@ fn load_segbits(data_dir: &Path) -> Result<FileSegbitsDb, String> {
     Ok(db)
 }
 
-/// Device for a part. SEAM: today only xcku3p exists, as a StubDevice
-/// with the three tiles the golden designs use. The real `DeviceFile`
-/// implementation of `BitgenDevice` (parallel worker, interfaces
-/// session 2 item 4 FLAG) replaces this function body when it lands;
-/// the stub table is then deleted, not extended.
+/// Device for a part. The real `DeviceFile` implementation of
+/// `BitgenDevice` (interfaces session 2 item 4 FLAG, merged at
+/// 1ad06df) is the device: SLICE base FARs from the file's own CLB
+/// column majors, INT base FARs by the provisional rule (CLB column
+/// major - 1, validated against the file's minors table), RAMB18
+/// from the BRAM content columns, and the full 41,460-frame config
+/// order, so `emit_bitstream` writes every real frame (untouched
+/// frames as zeros) instead of the stub's touched-frames-only stream.
 ///
-/// Tile base FARs, all derived from the vendored xcku3p device file
-/// (`data/xcku3p.json`, BitFiltrator), never invented:
-/// - SLICE_X0Y0: CLB column 0, row major 0. `clb_colMajors["0"]` is 5,
-///   tile type CLEL_R, so base FAR = far(block 0, row 0, col 5, minor 0)
-///   = 0x500. Verified against the device file by the
-///   `stub_base_fars_match_device_file` test.
-/// - INT_X0Y0: serves CLB column 0. The INT column rule
-///   (harness/reference.py, xczu3eg-derived, provisional for xcku3p)
-///   is INT column major = CLB column major - 1, so col 4, base FAR =
-///   far(0, 0, 4, 0) = 0x400. Verified the same way.
-/// - HPIO_RIGHT_X0Y0: PROVISIONAL base FAR 0x000. No public HPIO
-///   column major exists (the harness resolves HPIO tile-relative for
-///   exactly this reason, and bit_locator.py has no HPIO lookup). The
-///   value is chosen only to be distinct from the SLICE (0x500) and INT
-///   (0x400) bases and consistent between emit and parse; IO_CONFIG is
-///   blocked tile-relative in the harness, so no block's greenness
-///   depends on it. The real DeviceFile impl replaces it.
+/// One provisional bridge stays (critic session 13 FLAG F1): the
+/// real impl returns `None` for HPIO tiles, but the v1 goldens carry
+/// `HPIO_RIGHT_X0Y0` lines, so that one tile still resolves to the
+/// stub's provisional base FAR 0x000 with tile type `HPIO_RIGHT`.
+/// The value is admitted invented (no public HPIO column major
+/// exists); the harness blocks IO_CONFIG before comparing, so no
+/// block's greenness depends on it. The bridge is exactly one tile,
+/// not a table: every other tile the file does not resolve still
+/// fails loud. It dies when the xcku3p tilegrid lands.
 ///
-/// Config order is empty: the stub does not know the device config
-/// order, so emit writes touched frames only (the documented
-/// `BitgenDevice` behavior for an empty config order). The full
-/// 41,460-frame config order comes with the real DeviceFile impl.
-fn load_device(part: &str) -> Result<Box<dyn BitgenDevice>, String> {
+/// Only `xcku3p` is wired. `xcvu3p.json` exists on disk but is
+/// provisional (computed frame total 73,035 vs UG570 Table 1's
+/// 71,820), so it stays unwired until that gap is resolved by a
+/// CTO decision; any other part fails loud here.
+struct HpioProvisionalFallback {
+    inner: DeviceFile,
+    /// The real impl's tile list plus the one bridged HPIO tile:
+    /// `parse_bitstream` only visits tiles in this list, so omitting
+    /// the HPIO tile would leave its emitted bits unexplained and
+    /// parse would fail loud on them.
+    names: Vec<String>,
+}
+
+impl BitgenDevice for HpioProvisionalFallback {
+    fn part(&self) -> &str {
+        <DeviceFile as BitgenDevice>::part(&self.inner)
+    }
+
+    fn idcode(&self) -> Option<u32> {
+        <DeviceFile as BitgenDevice>::idcode(&self.inner)
+    }
+
+    fn tile_type(&self, tile: &str) -> Option<&str> {
+        if tile == "HPIO_RIGHT_X0Y0" {
+            return Some("HPIO_RIGHT");
+        }
+        <DeviceFile as BitgenDevice>::tile_type(&self.inner, tile)
+    }
+
+    fn tile_base_far(&self, tile: &str) -> Option<u32> {
+        if tile == "HPIO_RIGHT_X0Y0" {
+            return Some(0x000);
+        }
+        <DeviceFile as BitgenDevice>::tile_base_far(&self.inner, tile)
+    }
+
+    fn tile_names(&self) -> &[String] {
+        &self.names
+    }
+
+    fn config_order_fars(&self) -> &[u32] {
+        <DeviceFile as BitgenDevice>::config_order_fars(&self.inner)
+    }
+}
+
+fn load_device(part: &str, data_dir: &Path) -> Result<Box<dyn BitgenDevice>, String> {
     match part {
-        "xcku3p" => Ok(Box::new(StubDevice::new(
-            "xcku3p",
-            Some(0x04A6_3093),
-            vec![
-                ("SLICE_X0Y0".to_string(), "CLEL_R".to_string(), 0x500),
-                ("INT_X0Y0".to_string(), "INT".to_string(), 0x400),
-                (
-                    "HPIO_RIGHT_X0Y0".to_string(),
-                    "HPIO_RIGHT".to_string(),
-                    0x000,
-                ),
-            ],
-            vec![],
-        ))),
+        "xcku3p" => {
+            let file = DeviceFile::from_path(&data_dir.join("xcku3p.json")).map_err(|e| {
+                format!(
+                    "cannot load device file {}: {e}",
+                    data_dir.join("xcku3p.json").display()
+                )
+            })?;
+            let mut names: Vec<String> = <DeviceFile as BitgenDevice>::tile_names(&file).to_vec();
+            names.push("HPIO_RIGHT_X0Y0".to_string());
+            names.sort();
+            names.dedup();
+            Ok(Box::new(HpioProvisionalFallback { inner: file, names }))
+        }
         other => Err(format!(
             "part {other} has no emitter device yet: only xcku3p is wired; \
-            other parts need the real DeviceFile BitgenDevice implementation"
+            xcvu3p.json is provisional until its frame-total gap is resolved"
         )),
     }
 }
@@ -265,7 +303,7 @@ fn cmd_emit(
         }
     };
     let text = translate_ff_valued_fasm(&text)?;
-    let device = load_device(part)?;
+    let device = load_device(part, data_dir)?;
     let segbits = load_segbits(data_dir)?;
     let bytes = emit_bitstream(&text, device.as_ref(), &segbits)
         .map_err(|e: BitgenError| format!("emit failed: {e}"))?;
@@ -277,7 +315,7 @@ fn cmd_emit(
 fn cmd_parse(bit_path: &str, part: &str, data_dir: &Path) -> Result<String, String> {
     let bytes =
         std::fs::read(bit_path).map_err(|e| format!("cannot read bitstream {bit_path}: {e}"))?;
-    let device = load_device(part)?;
+    let device = load_device(part, data_dir)?;
     let segbits = load_segbits(data_dir)?;
     parse_bitstream(&bytes, device.as_ref(), &segbits)
         .map_err(|e: BitgenError| format!("parse failed: {e}"))
@@ -297,7 +335,7 @@ fn cmd_parse(bit_path: &str, part: &str, data_dir: &Path) -> Result<String, Stri
 fn cmd_bits(bit_path: &str, part: &str, data_dir: &Path) -> Result<String, String> {
     let bytes =
         std::fs::read(bit_path).map_err(|e| format!("cannot read bitstream {bit_path}: {e}"))?;
-    let device = load_device(part)?;
+    let device = load_device(part, data_dir)?;
     let segbits = load_segbits(data_dir)?;
     bits_for_bytes(&bytes, device.as_ref(), &segbits)
 }
@@ -642,11 +680,12 @@ mod tests {
     }
 
     #[test]
-    fn stub_base_fars_match_device_file() {
-        // The stub base FARs are derived from the vendored xcku3p device
-        // file, not invented. Recompute them here from the file and
-        // assert the stub agrees, so a device-file change fails loudly
-        // here instead of silently shifting every emitted bit.
+    fn real_device_fars_match_device_file() {
+        // The emitter's device base FARs come from the vendored xcku3p
+        // device file itself. Recompute them here from the file and
+        // assert the loaded device agrees, so a device-file change
+        // fails loudly here instead of silently shifting every
+        // emitted bit.
         use helion_ultrascale::device_file::DeviceFile;
         let dev = DeviceFile::from_path(&data_dir().join("xcku3p.json")).unwrap();
         let clb_col = dev.clb_col_major("SLR0", 0, 0).unwrap();
@@ -658,18 +697,30 @@ mod tests {
         // INT column rule (reference.py): INT col = CLB col - 1.
         let int_base = far_encode(0, 0, (clb_col - 1) as u16, 0).unwrap();
         assert_eq!(int_base, 0x400);
-        // The stub itself agrees.
-        let stub = load_device("xcku3p").unwrap();
-        assert_eq!(stub.tile_type("SLICE_X0Y0"), Some("CLEL_R"));
-        assert_eq!(stub.tile_base_far("SLICE_X0Y0"), Some(0x500));
-        assert_eq!(stub.tile_base_far("INT_X0Y0"), Some(0x400));
-        assert_eq!(stub.idcode(), Some(0x04A6_3093));
+        // The loaded device agrees.
+        let device = load_device("xcku3p", &data_dir()).unwrap();
+        assert_eq!(device.tile_type("SLICE_X0Y0"), Some("CLEL_R"));
+        assert_eq!(device.tile_base_far("SLICE_X0Y0"), Some(0x500));
+        assert_eq!(device.tile_base_far("INT_X0Y0"), Some(0x400));
+        assert_eq!(device.idcode(), Some(0x04A6_3093));
+        // The HPIO bridge (critic session 13 FLAG F1): the one
+        // provisional value the real impl does not cover. It is
+        // invented, pinned here so any change is deliberate, and
+        // must never be consumed as ground truth.
+        assert_eq!(device.tile_type("HPIO_RIGHT_X0Y0"), Some("HPIO_RIGHT"));
+        assert_eq!(device.tile_base_far("HPIO_RIGHT_X0Y0"), Some(0x000));
+        // A tile the file does not cover at all still fails loud.
+        assert_eq!(device.tile_type("CMT_RIGHT_X0Y0"), None);
+        assert_eq!(device.tile_base_far("CMT_RIGHT_X0Y0"), None);
+        // The bridged tile is in the tile list, or parse-back would
+        // fail on its emitted bits as unexplained.
+        assert!(device.tile_names().contains(&"HPIO_RIGHT_X0Y0".to_string()));
     }
 
     #[test]
     fn unknown_part_fails_loud() {
-        assert!(load_device("xcvu3p").is_err());
-        assert!(load_device("xczu3eg").is_err());
+        assert!(load_device("xcvu3p", &data_dir()).is_err());
+        assert!(load_device("xczu3eg", &data_dir()).is_err());
     }
 
     #[test]
@@ -768,7 +819,7 @@ mod tests {
         // the library's own round trip plus a spot check that the
         // parse-back renders the canonical .V0 spelling.
         let golden = include_str!("../../tests/fixtures/blinky.xcku3p.fasm");
-        let device = load_device("xcku3p").unwrap();
+        let device = load_device("xcku3p", &data_dir()).unwrap();
         let segbits = load_segbits(&data_dir()).unwrap();
         let translated = translate_ff_valued_fasm(golden).unwrap();
         let bytes = emit_bitstream(&translated, device.as_ref(), &segbits).unwrap();
@@ -817,7 +868,7 @@ mod tests {
     #[test]
     fn bits_labels_blinky_set_bits() {
         let golden = include_str!("../../tests/fixtures/blinky.xcku3p.fasm");
-        let device = load_device("xcku3p").unwrap();
+        let device = load_device("xcku3p", &data_dir()).unwrap();
         let segbits = load_segbits(&data_dir()).unwrap();
         let translated = translate_ff_valued_fasm(golden).unwrap();
         let bytes = emit_bitstream(&translated, device.as_ref(), &segbits).unwrap();
