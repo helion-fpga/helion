@@ -36,6 +36,9 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
+
+use serde_json::Value;
 
 use crate::fasm::{FasmLine, FasmValue};
 
@@ -299,6 +302,78 @@ impl fmt::Display for FramesError {
 }
 
 impl Error for FramesError {}
+
+/// Full ordered frame-address list for a part, from its parsed `part.json`.
+///
+/// Walks `global_clock_regions` top/bottom, rows, configuration buses
+/// (CLB_IO_CLK on bus 0, BLOCK_RAM on bus 1), columns and minors, in FAR
+/// order. A bitstream must write every one of these frames in order from
+/// FAR 0: the FAR autoincrementer advances on each written frame, so a
+/// partial payload shifts every later frame onto the wrong address on
+/// silicon. Untouched frames are emitted as zeros, exactly like Vivado.
+pub fn full_device_addresses(part: &Value) -> Vec<u32> {
+    let mut out = Vec::new();
+    let regions = part.get("global_clock_regions");
+    for (name, half) in [("top", 0u32), ("bottom", 1u32)] {
+        let rows = regions
+            .and_then(|r| r.get(name))
+            .and_then(|h| h.get("rows"));
+        let Some(rows) = rows.and_then(|r| r.as_object()) else {
+            continue;
+        };
+        let mut row_ids: Vec<u32> = rows
+            .keys()
+            .filter_map(|k| k.parse().ok())
+            .collect();
+        row_ids.sort_unstable();
+        for row in row_ids {
+            let buses = rows
+                .get(&row.to_string())
+                .and_then(|r| r.get("configuration_buses"));
+            for (bus_name, block) in [("CLB_IO_CLK", 0u32), ("BLOCK_RAM", 1u32)] {
+                let cols = buses
+                    .and_then(|b| b.get(bus_name))
+                    .and_then(|b| b.get("configuration_columns"));
+                let Some(cols) = cols.and_then(|c| c.as_object()) else {
+                    continue;
+                };
+                let mut col_ids: Vec<u32> = cols
+                    .keys()
+                    .filter_map(|k| k.parse().ok())
+                    .collect();
+                col_ids.sort_unstable();
+                for col in col_ids {
+                    let frames = cols
+                        .get(&col.to_string())
+                        .and_then(|c| c.get("frame_count"))
+                        .and_then(|f| f.as_u64())
+                        .unwrap_or(0);
+                    for minor in 0..frames {
+                        out.push(
+                            (block << 23)
+                                | (half << 22)
+                                | (row << 17)
+                                | (col << 7)
+                                | minor as u32,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// Load `part.json` from a part directory and return the full ordered
+/// frame-address list (see [`full_device_addresses`]).
+pub fn full_device_addresses_from_dir(part_dir: &Path) -> Result<Vec<u32>, String> {
+    let text = std::fs::read_to_string(part_dir.join("part.json"))
+        .map_err(|e| format!("cannot read {}: {e}", part_dir.join("part.json").display()))?;
+    let part: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("cannot parse part.json: {e}"))?;
+    Ok(full_device_addresses(&part))
+}
 
 /// All configuration frames of the device, keyed by absolute frame address.
 ///
@@ -567,6 +642,35 @@ CLBLL_L.SLICEL_X0.AFF.ZINI 10_03 !10_04
         layout.add_tile("INT_L_X10Y146", "INT_L", BlockType::ClbIoClk, 0x0000_0000, 0);
         layout.add_tile("CLBLL_L_X12Y34", "CLBLL_L", BlockType::ClbIoClk, 0x0000_1000, 0);
         layout
+    }
+
+    #[test]
+    fn full_device_addresses_walk_part_json_in_far_order() {
+        // Hermetic: inline part.json fragment, no DB read.
+        let part: Value = serde_json::from_str(
+            r#"{"global_clock_regions": {
+                "top": {"rows": {
+                    "0": {"configuration_buses": {
+                        "CLB_IO_CLK": {"configuration_columns": {
+                            "1": {"frame_count": 2}, "0": {"frame_count": 1}}},
+                        "BLOCK_RAM": {"configuration_columns": {
+                            "0": {"frame_count": 1}}}}}}},
+                "bottom": {"rows": {
+                    "0": {"configuration_buses": {
+                        "CLB_IO_CLK": {"configuration_columns": {
+                            "0": {"frame_count": 1}}}}}}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            full_device_addresses(&part),
+            vec![
+                0x0000_0000,
+                0x0000_0080,
+                0x0000_0081,
+                0x0040_0000,
+                0x0080_0000,
+            ]
+        );
     }
 
     #[test]

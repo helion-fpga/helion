@@ -17,7 +17,8 @@ use helion_xilinx7::bitstream::{self, BitstreamOptions};
 use helion_xilinx7::device::{default_db_root, Device};
 use helion_xilinx7::fasm::parse_fasm;
 use helion_xilinx7::frames::{
-    BlockType, FrameAddr, FrameStore, SegBitsDb, TileBitLayout,
+    full_device_addresses_from_dir, BlockType, FrameAddr, FrameStore, SegBitsDb,
+    TileBitLayout,
 };
 use helion_xilinx7::xdevice::{build_node_map, XDevice};
 use helion_xilinx7::{emit_fasm, pack, place, route};
@@ -60,20 +61,6 @@ impl TilegridLayout {
             tiles.insert(name.clone(), TileEntry { tile_type, blocks });
         }
         Some(TilegridLayout { tiles })
-    }
-
-    fn all_addresses(&self) -> Vec<u32> {
-        let mut addrs = Vec::new();
-        for tile in self.tiles.values() {
-            for (geom, frames) in tile.blocks.values() {
-                for i in 0..*frames {
-                    addrs.push(geom.baseaddr + i);
-                }
-            }
-        }
-        addrs.sort();
-        addrs.dedup();
-        addrs
     }
 }
 
@@ -323,7 +310,16 @@ fn zedboard_e2e_bitstream() {
             skipped.len()
         );
     }
-    let mut store = FrameStore::new(&layout.all_addresses());
+    // Full device frame list in FAR order: the FAR autoincrementer advances
+    // on each written frame, so a partial payload would shift every later
+    // frame onto the wrong address on silicon. Untouched frames stay zero,
+    // exactly like Vivado.
+    let full = full_device_addresses_from_dir(
+        &db_root.join("zynq7/xc7z020clg484-1"),
+    )
+    .expect("part.json frame list");
+    assert_eq!(full.len(), 9996, "xc7z020 frame count");
+    let mut store = FrameStore::new(&full);
     let applied = store.apply_fasm(&lines, &segbits, &layout).expect("apply FASM");
     assert!(applied > 0, "no FASM features applied");
     println!("applied {applied} FASM features");
