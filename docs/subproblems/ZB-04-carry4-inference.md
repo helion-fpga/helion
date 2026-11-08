@@ -118,9 +118,42 @@ Open questions (do not guess; trace before implementing):
 - 12 chained halves vs 13 reported CARRY4s: one unaccounted.
   Y39 M0 (default C0) is the suspect; verify before relying.
 - Bit-to-BEL map inside M0 halves needs S/DI/Q net tracing.
-- FFMUX.XOR-only means FF D comes from LUT O, not carry O;
-  the inference design must reproduce that wiring, not assume
-  DFFMUX.CY.
+- FFMUX.XOR-only means FF D comes from the XORCY sum output,
+  not carry CO and not fabric LUT O. The D connection is
+  intra-slice (no routing, no S/DI routing either: S has no site
+  pins at all). The only carry nets that can leave a slice are
+  AX (entry CYINIT source, routable via BYP pips), CIN/COUT
+  (cascade), DI (single site pin), and Q fanout. Net-level
+  consequence: a carry group needs zero inter-slice routing
+  except AX/DI feed and the CO cascade.
+- L1(Y39-Y43) carry with zero FFs: its LUTs/chain serve the M0
+  computation in the same CLB (S/DI assist). Pack must keep
+  M0+L1 of a chain CLB together; exact bit roles need net
+  tracing but reproduction needs only the recipe below.
+
+## Reproduction recipe (what the backend must emit per group)
+
+Per 4-bit group (middle groups; entry differs): 1 Carry4 cell
+with S0-S3 nets from 4 LUT O6 outputs (each LUT INIT
+0xffffffff00000000, i.e. O6=Q on A5 and O5=0), DI0-DI3 from the
+same LUTs' O5 (=0) or const-0, CI chained from previous CO
+(PRECYINIT.CIN, no mux bits), 4 FFs with D on the carry O nets
+(DFFMUX.XOR), ZINI+ZRST, FFSYNC. Entry group: CYINIT=1 via
+PRECYINIT.AX (AX from a 1-source), ACY0 set, ALUT INITs
+0xff00ff0000000000 (L1) and 0x0f0f0f0f0f0f0f0f (M0).
+Top partial group as Y44/Y45. IR pin convention is documented
+on CellKind::Carry4 (CI, CO, S0-S3, DI0-DI3, O0-O3); entry CI
+takes a const-1 net and the backend picks AX vs CIN.
+
+## Interception point (helion-sv)
+
+Per-bit cones are built around map_wide_cones (u_wshare_ trees),
+so recognition must happen BEFORE per-bit cone splitting, on the
+whole update `reg[N:0] <= reg + const`. helion-sim exists as a
+crate: any inference must prove equivalence by simulating the
+original RTL against the inferred netlist before it ships
+(a wrong Carry4 is worse than none). Detection stays opt-in
+until the backend consumes the cells end to end.
 
 ## Dependencies
 
