@@ -16250,6 +16250,11 @@ fn propagate_const_wires<'a>(rtl: &mut Rtl<'a>, arena: &'a Bump) {
 // order is LSB-first within each nibble group, matching the probe; the
 // backend maps endpoints to physical pins. No reg_bits/Expr work happens
 // here, so the normal per-bit cone path must be skipped for this update.
+//
+// DI needs no source cell: each S-LUT's O5 output is const 0 for the
+// passthrough INIT (O5 reads the low 32 INIT bits, all zero), and the
+// backend leaves the DI mux at its default O5 input. The golden oracle
+// shows no DI-mux FASM lines and no zero LUT.
 fn emit_carry_increment(
     d: &mut Design,
     carry_ffs: &mut Vec<(String, String)>,
@@ -16262,9 +16267,6 @@ fn emit_carry_increment(
     let one = format!("u_carry_{lhs}_one");
     d.add_cell(&one, CellKind::Lut6 { init: u64::MAX });
     d.connect(&one, &one, "O");
-    let zero = format!("u_carry_{lhs}_zero");
-    d.add_cell(&zero, CellKind::Lut6 { init: 0 });
-    d.connect(&zero, &zero, "O");
     for g in 0..groups {
         let base = g * 4;
         let cin = if g == 0 {
@@ -16279,7 +16281,6 @@ fn emit_carry_increment(
         for j in 0..4 {
             if base + j < w {
                 d.connect(format!("u_carry_{lhs}_s{}", base + j), &cname, format!("S{j}"));
-                d.connect(&zero, &cname, format!("DI{j}"));
                 d.connect(format!("u_carry_{lhs}_o{}", base + j), &cname, format!("O{j}"));
             }
         }
