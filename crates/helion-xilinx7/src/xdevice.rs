@@ -8,7 +8,7 @@ use crate::device::Device;
 use crate::db::parse::PpipKind;
 use crate::emit::EmitDevice;
 use crate::place::DeviceQuery;
-use crate::route::{BufgTieoff, RouteQuery, RoutedPip};
+use crate::route::{BufgSpine, BufgTieoff, RouteQuery, RoutedPip};
 use std::collections::{HashMap, HashSet};
 
 /// Precomputed routing node maps, built once per [`Device`] by
@@ -404,6 +404,170 @@ impl<'a> RouteQuery for XDevice<'a> {
         }
         Ok(tieoff)
     }
+
+    fn bufg_spine(&self, site: &str) -> Result<BufgSpine, String> {
+        let err = |msg: String| format!("spine: {msg} (site `{site}`)");
+        let (tile_idx, site_idx) = self
+            .device
+            .site_by_name(site)
+            .ok_or_else(|| err(format!("unknown site")))?;
+        let tile_name = self
+            .tile_name(tile_idx)
+            .ok_or_else(|| err(format!("no tile name")))?
+            .to_string();
+        let pins = self
+            .device
+            .site_pins(tile_idx, site_idx)
+            .ok_or_else(|| err(format!("no pin data")))?;
+        let o_wire = pins
+            .iter()
+            .find(|(pn, _)| pn == "O")
+            .map(|(_, w)| w.clone())
+            .ok_or_else(|| err(format!("site has no pin `O`")))?;
+        // Lowest global-clock index with a real (non-pseudo) O-exit pip.
+        // A pseudo marking here contradicts Vivado, which sets the bit.
+        let mut picked: Option<(u8, String)> = None;
+        let mut saw_pseudo = false;
+        for g in 0..32u8 {
+            let dst = format!("CLK_BUFG_CK_GCLK{g}");
+            for (d, s, pseudo) in RouteQuery::pips_from(self, &tile_name, &o_wire) {
+                if d == dst && s == o_wire {
+                    if pseudo {
+                        saw_pseudo = true;
+                    } else {
+                        picked = Some((g, dst));
+                    }
+                    break;
+                }
+            }
+            if picked.is_some() {
+                break;
+            }
+        }
+        let (gclk, o_dst) = picked.ok_or_else(|| {
+            err(format!(
+                "no O-exit pip (pseudo-marked: {saw_pseudo})"
+            ))
+        })?;
+        // CLK_BUFG_REBUF tiles on the global line's node (tileconn).
+        let o_wid = self
+            .wire_id_of(&tile_name, &o_dst)
+            .ok_or_else(|| err(format!("no wire `{o_dst}`")))?;
+        let nid = self
+            .wire_to_node
+            .get(o_wid as usize)
+            .copied()
+            .filter(|&n| n != u32::MAX)
+            .ok_or_else(|| err(format!("`{o_dst}` is not stitched anywhere")))?;
+        let members = self
+            .node_members
+            .get(&nid)
+            .ok_or_else(|| err(format!("no node members")))?;
+        // (tile, grid_y) of node-member REBUF tiles, plus every REBUF
+        // tile below the entry in the same column (the DB node omits the
+        // bottom-edge feed, but Vivado enables it: GCLK0_ENABLE_BELOW on
+        // the lowest tile).
+        let clk_xy = self
+            .tile_idx(&tile_name)
+            .and_then(|i| self.device.tile(i))
+            .map(|t| (t.grid_x, t.grid_y));
+        let mut node_rebuf: Vec<(String, i32)> = Vec::new();
+        for &m in members {
+            let Some((tname, _)) = self.wire_name_of(m) else {
+                continue;
+            };
+            let Some(ti) = self.tile_idx(&tname) else {
+                continue;
+            };
+            if self.device.tile_type_name(ti).unwrap_or("") != "CLK_BUFG_REBUF" {
+                continue;
+            }
+            let y = self.device.tile(ti).map(|t| t.grid_y).unwrap_or(0);
+            if !node_rebuf.iter().any(|(t, _)| t == &tname) {
+                node_rebuf.push((tname, y));
+            }
+        }
+        if node_rebuf.is_empty() {
+            return Err(err(format!("no CLK_BUFG_REBUF tile on the GCLK{gclk} node")));
+        }
+        let bot = format!("CLK_BUFG_REBUF_R_CK_GCLK{gclk}_BOT");
+        let top = format!("CLK_BUFG_REBUF_R_CK_GCLK{gclk}_TOP");
+        // Entry tile: bottommost (largest grid_y; grid_y decreases
+        // upward on the die) node REBUF tile holding the TOP to BOT
+        // stitch. Vivado conducts the stitch downward (dst BOT, src
+        // TOP): the clock enters the spine above the entry and flows
+        // down through it toward the bottom edge.
+        let mut stitched: Vec<(String, i32)> = Vec::new();
+        for (tile, y) in &node_rebuf {
+            let has_stitch = RouteQuery::pips_from(self, tile, &top)
+                .iter()
+                .any(|(d, s, pseudo)| d == &bot && s == &top && !pseudo);
+            if has_stitch {
+                stitched.push((tile.clone(), *y));
+            }
+        }
+        stitched.sort_by_key(|(_, y)| std::cmp::Reverse(*y));
+        let (entry_tile, entry_y) = stitched
+            .first()
+            .cloned()
+            .ok_or_else(|| err(format!("no BOT to TOP stitch for GCLK{gclk}")))?;
+        let mut spine = BufgSpine {
+            gclk,
+            pips: vec![
+                RoutedPip {
+                    tile: tile_name.clone(),
+                    dst_wire: o_dst.clone(),
+                    src_wire: o_wire,
+                    is_pseudo: false,
+                },
+                RoutedPip {
+                    tile: entry_tile.clone(),
+                    dst_wire: bot.clone(),
+                    src_wire: top.clone(),
+                    is_pseudo: false,
+                },
+            ],
+            statics: Vec::new(),
+        };
+        // grid_y decreases upward on the die: silicon-below means
+        // greater grid_y. BELOW on the entry plus every REBUF tile below
+        // it in the same column (down to the bottom edge); ABOVE on the
+        // entry plus node tiles above it. Matches Vivado's observed
+        // pattern: bottom edge fed, upward reach through the entry,
+        // nothing above the loads.
+        let mut below: Vec<String> = vec![entry_tile.clone()];
+        if let Some((ex, _)) = clk_xy {
+            for ti in 0..self.device.tile_count() {
+                let is_rebuf =
+                    self.device.tile_type_name(ti).unwrap_or("") == "CLK_BUFG_REBUF";
+                let geom = self.device.tile(ti).map(|t| (t.grid_x, t.grid_y));
+                if let (true, Some((gx, gy))) = (is_rebuf, geom) {
+                    if gx == ex && gy > entry_y {
+                        if let Some(name) = self.tile_name(ti) {
+                            below.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        below.sort();
+        below.dedup();
+        let mut above: Vec<String> = vec![entry_tile.clone()];
+        for (tile, y) in &node_rebuf {
+            if *y < entry_y {
+                above.push(tile.clone());
+            }
+        }
+        above.sort();
+        above.dedup();
+        for tile in &below {
+            spine.statics.push((tile.clone(), format!("GCLK{gclk}_ENABLE_BELOW")));
+        }
+        for tile in &above {
+            spine.statics.push((tile.clone(), format!("GCLK{gclk}_ENABLE_ABOVE")));
+        }
+        Ok(spine)
+    }
 }
 
 impl<'a> EmitDevice for XDevice<'a> {
@@ -411,6 +575,14 @@ impl<'a> EmitDevice for XDevice<'a> {
         self.tile_idx(tile)
             .and_then(|i| self.device.tile_type_name(i))
             .map(|s| s.to_string())
+    }
+
+    fn bufg_spine_static(&self, _tile: &str, site: &str) -> Vec<(String, String)> {
+        // route() runs bufg_spine first and fails loudly there; this
+        // identical call then succeeds. Empty on error by construction.
+        RouteQuery::bufg_spine(self, site)
+            .map(|s| s.statics)
+            .unwrap_or_default()
     }
 
     fn site_rel(&self, tile: &str, site: &str) -> Option<String> {
@@ -495,5 +667,61 @@ mod tests {
         }
         // Unknown site fails loudly.
         assert!(xdev.bufg_tieoff_pips("BUFGCTRL_X99Y99").is_err());
+    }
+
+    #[test]
+    fn bufg_spine_paths() {
+        let (dev, maps) = test_z020();
+        let xdev = XDevice::new(dev, maps.clone());
+        let spine = xdev
+            .bufg_spine("BUFGCTRL_X0Y0")
+            .expect("spine for BUFGCTRL_X0Y0");
+        // Vivado drives global line 0 from this site.
+        assert_eq!(spine.gclk, 0);
+        // O exit plus the entry REBUF stitch, conducted downward
+        // (dst BOT, src TOP) exactly as Vivado emits it.
+        assert!(
+            spine.pips.iter().any(|p| p.dst_wire == "CLK_BUFG_CK_GCLK0"
+                && p.src_wire == "CLK_BUFG_BUFGCTRL0_O"
+                && !p.is_pseudo),
+            "missing O exit, got {:?}",
+            spine.pips
+        );
+        assert!(
+            spine.pips.iter().any(|p| p.dst_wire
+                == "CLK_BUFG_REBUF_R_CK_GCLK0_BOT"
+                && p.src_wire == "CLK_BUFG_REBUF_R_CK_GCLK0_TOP"
+                && !p.is_pseudo),
+            "missing TOP to BOT stitch, got {:?}",
+            spine.pips
+        );
+        // Vivado's observed pattern for bottom-region loads: BELOW on
+        // the entry plus tiles below it in the column, ABOVE on the
+        // entry plus node tiles above it.
+        let mut statics = spine.statics.clone();
+        statics.sort();
+        let tiles: Vec<(&str, &str)> = statics
+            .iter()
+            .map(|(t, f)| (t.as_str(), f.as_str()))
+            .collect();
+        assert!(
+            tiles.contains(&("CLK_BUFG_REBUF_X87Y13", "GCLK0_ENABLE_BELOW")),
+            "missing bottom-edge feed, got {statics:?}"
+        );
+        assert!(
+            tiles.contains(&("CLK_BUFG_REBUF_X87Y38", "GCLK0_ENABLE_BELOW")),
+            "missing entry BELOW, got {statics:?}"
+        );
+        assert!(
+            tiles.contains(&("CLK_BUFG_REBUF_X87Y38", "GCLK0_ENABLE_ABOVE")),
+            "missing entry ABOVE, got {statics:?}"
+        );
+        assert!(
+            tiles.contains(&("CLK_BUFG_REBUF_X87Y65", "GCLK0_ENABLE_ABOVE")),
+            "missing upward reach, got {statics:?}"
+        );
+        assert_eq!(statics.len(), 4, "extra enables, got {statics:?}");
+        // Unknown site fails loudly.
+        assert!(xdev.bufg_spine("BUFGCTRL_X99Y99").is_err());
     }
 }

@@ -20,6 +20,12 @@ pub trait EmitDevice {
     /// `("CLBLL_L_X14Y100", "SLICE_X28Y100")` → `"SLICEL_X0"`.
     /// Returns the site-type-qualified relative name.
     fn site_rel(&self, tile: &str, site: &str) -> Option<String>;
+    /// Static clock-spine lines for a BUFGCTRL site: `(tile, feature)`
+    /// rebuffer enables, emitted as bare `TILE.FEATURE` FASM lines.
+    /// Defaults to none; the XDevice impl derives them from the DB.
+    fn bufg_spine_static(&self, _tile: &str, _site: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 /// IBUF `.IN` feature prefix for an IOSTANDARD, from
@@ -226,6 +232,10 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         lines.push(format!("{}.BUFGCTRL.{}.ZINV_S0", bufg.tile, site_rel));
         // IGNORE1 inverted, exactly as Vivado emits it.
         lines.push(format!("{}.BUFGCTRL.{}.IS_IGNORE1_INVERTED", bufg.tile, site_rel));
+        // Rebuffer enables for this BUFG's global line (bare features).
+        for (tile, feat) in device.bufg_spine_static(&bufg.tile, &bufg.site) {
+            lines.push(format!("{tile}.{feat}"));
+        }
     }
 
     // RAMB18E1s. Feature path: TILE.RAMB18.<site>.IN_USE. INIT data
