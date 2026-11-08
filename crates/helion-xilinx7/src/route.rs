@@ -175,10 +175,14 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     }
 
     // Carry endpoints (ZB-04). The placer co-places each bit S-LUT and FF
-    // in the group slice, so S/O nets classify site-internal below. DI
-    // gets no endpoints: it reads the S-LUT O5 internally by mux default.
-    // Head CI arrives at the slice AX pin through fabric; chained CI joins
-    // its co net (dedicated cascade, classified in the net loop).
+    // in the group slice. The s-net endpoints below are the LUT-output
+    // to carry-S legs (dedicated site-internal path, pin S{j}); the
+    // S-LUT *input* legs live on the Q nets via the placed LUT input
+    // endpoints, and those route through fabric (the oracle feeds every
+    // counter S input from INT). DI gets no endpoints: it reads the
+    // S-LUT O5 internally by mux default. Head CI arrives at the slice
+    // AX pin through fabric; chained CI joins its co net (dedicated
+    // cascade, classified in the net loop).
     let carry_site: HashMap<&str, &str> = placed
         .carries
         .iter()
@@ -213,6 +217,12 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     }
 
     let mut nets = Vec::new();
+    // Wire ownership across nets in this run: (tile, wire) -> net.
+    // A net that enters another net's wire would short against it or
+    // double-drive a mux, so BFS routes around claimed wires and fails
+    // loudly when no path remains. Power rails stay shareable (they
+    // are excluded from claims at commit time).
+    let mut claimed: HashMap<(String, String), String> = HashMap::new();
     let mut net_names: Vec<String> = net_eps.keys().cloned().collect();
     net_names.sort();
     for net in net_names {
@@ -242,7 +252,19 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         if loads.is_empty() {
             continue; // undriven net: nothing to route
         }
-        let kind = route_net(&net, drivers[0], &loads, device)?;
+        let kind = route_net(&net, drivers[0], &loads, device, &claimed)?;
+        if let RouteKind::Pips(pips) = &kind {
+            for p in pips {
+                for w in [&p.src_wire, &p.dst_wire] {
+                    if is_power_wire(w) {
+                        continue;
+                    }
+                    claimed
+                        .entry((p.tile.clone(), w.clone()))
+                        .or_insert_with(|| net.clone());
+                }
+            }
+        }
         nets.push(RoutedNet7 { net, kind });
     }
 
@@ -340,16 +362,33 @@ fn route_bufg_tieoffs(
     Ok(())
 }
 
+/// Slice LUT input pins (`A1`-`A6` through `D1`-`D6`): loads here
+/// always route through fabric, never site-internal.
+fn is_lut_input_pin(pin: &str) -> bool {
+    let b = pin.as_bytes();
+    b.len() == 2 && (b'A'..=b'D').contains(&b[0]) && b[1].is_ascii_digit()
+}
+
 /// Route one net from its driver to all loads.
+///
+/// `claimed` maps wires to the nets that already own them; BFS routes
+/// around foreign-owned wires (see [`bfs_route`]).
 fn route_net(
     net: &str,
     driver: &Endpoint,
     loads: &[&Endpoint],
     device: &dyn RouteQuery,
+    claimed: &HashMap<(String, String), String>,
 ) -> Result<RouteKind, String> {
-    // Split loads into site-internal (same site as driver) and external.
-    let (internal, external): (Vec<&&Endpoint>, Vec<&&Endpoint>) =
-        loads.iter().partition(|l| l.site == driver.site);
+    // Split loads into site-internal (same site as driver and not a
+    // LUT input) and external. Slice LUT inputs (A1-A6 and friends)
+    // always arrive through fabric IMUX, even from the same slice:
+    // 7-series has no site-local LUT-input path, and the oracle feeds
+    // every counter S input from INT. Routing one through the
+    // site-internal shortcut would silently unconnect it on silicon.
+    let (internal, external): (Vec<&&Endpoint>, Vec<&&Endpoint>) = loads
+        .iter()
+        .partition(|l| l.site == driver.site && !is_lut_input_pin(&l.pin));
     // If all loads are site-internal, no pips needed.
     if external.is_empty() {
         return Ok(RouteKind::SiteInternal);
@@ -371,6 +410,13 @@ fn route_net(
         .ok_or_else(|| format!("route: no wire for driver {}.{} (net `{net}`)", driver.site, driver.pin))?;
 
     let mut all_pips: Vec<RoutedPip> = Vec::new();
+    // Tieoff nets (driven by power) and clock-path nets (into BUFG I
+    // pins or slice CLK pins) may use power and clock wires; every
+    // other net stays on signal wires.
+    let allow_power = is_power_wire(&src_wire)
+        || external_loads
+            .iter()
+            .any(|l| matches!(l.pin.as_str(), "I0" | "I1" | "CLK"));
     for load in &external_loads {
         let sinks = device.wire_for_site_pin(&load.site, &load.pin);
         if sinks.is_empty() {
@@ -379,8 +425,8 @@ fn route_net(
                 load.site, load.pin
             ));
         }
-        let pips = bfs_route(&src_tile, &src_wire, &sinks, device)
-            .ok_or_else(|| format!("route: net `{net}` unroutable to {}.{}", load.site, load.pin))?;
+        let pips = bfs_route(&src_tile, &src_wire, &sinks, device, allow_power, net, claimed)
+            .ok_or_else(|| format!("route: net `{net}` unroutable to {}.{} (src {src_tile}.{src_wire})", load.site, load.pin))?;
         all_pips.extend(pips);
     }
     // Dedup shared pips.
@@ -389,13 +435,44 @@ fn route_net(
     Ok(RouteKind::Pips(all_pips))
 }
 
+/// Power and clock-distribution wires (`GND_WIRE`, `VCC_WIRE`, `GFAN*`,
+/// `GCLK_*`): never signal carriers. Routing a signal through one
+/// either shorts it against its tieoff driver or parks the load on a
+/// constant (the oracle's S inputs read live Q copies, never ground).
+fn is_power_wire(wire: &str) -> bool {
+    wire == "GND_WIRE"
+        || wire == "VCC_WIRE"
+        || wire.starts_with("GFAN")
+        || wire.starts_with("GCLK_")
+}
+
+/// Another net already owns this wire: entering it would short the two
+/// nets (or double-drive a mux). Same-net sharing across loads of one
+/// net stays legal.
+fn owned_elsewhere(
+    claimed: &HashMap<(String, String), String>,
+    net: &str,
+    tile: &str,
+    wire: &str,
+) -> bool {
+    claimed
+        .get(&(tile.to_string(), wire.to_string()))
+        .map(|owner| owner != net)
+        .unwrap_or(false)
+}
+
 /// BFS from `(src_tile, src_wire)` to any of `sinks: [(tile, wire)]`.
-/// Returns the pip path in source→sink order.
+/// Returns the pip path in source→sink order. With `allow_power`
+/// false, power wires are never entered: tieoff nets (driven by power)
+/// and clock-path nets set it, every other net stays on signal wires.
 fn bfs_route(
     src_tile: &str,
     src_wire: &str,
     sinks: &[(String, String)],
     device: &dyn RouteQuery,
+    allow_power: bool,
+    net: &str,
+    claimed: &HashMap<(String, String), String>,
 ) -> Option<Vec<RoutedPip>> {
     let sink_set: HashSet<(&str, &str)> =
         sinks.iter().map(|(t, w)| (t.as_str(), w.as_str())).collect();
@@ -416,6 +493,12 @@ fn bfs_route(
         // connections like the OLOGIC bypass, traversed but not emitted).
         for (dst_wire, src_w, is_pseudo) in device.pips_from(&tile, &wire) {
             debug_assert_eq!(src_w, wire);
+            if !allow_power && is_power_wire(&dst_wire) {
+                continue;
+            }
+            if owned_elsewhere(claimed, net, &tile, &dst_wire) {
+                continue;
+            }
             let next = (tile.clone(), dst_wire.clone());
             if !parent.contains_key(&next) {
                 let pip = RoutedPip {
@@ -430,6 +513,12 @@ fn bfs_route(
         }
         // Across tileconn stitching.
         for (ntile, nwire) in device.node_wires(&tile, &wire) {
+            if !allow_power && is_power_wire(&nwire) {
+                continue;
+            }
+            if owned_elsewhere(claimed, net, &ntile, &nwire) {
+                continue;
+            }
             let next = (ntile.clone(), nwire.clone());
             if !parent.contains_key(&next) {
                 parent.insert(next.clone(), Some(((tile.clone(), wire.clone()), RoutedPip {
@@ -470,17 +559,31 @@ mod tests {
     struct FakeRouter;
     impl RouteQuery for FakeRouter {
         fn pips_from(&self, tile: &str, wire: &str) -> Vec<(String, String, bool)> {
-            // Tiny graph: INT_X0: A -> B -> C ; INT_X1: C -> D
+            // Tiny graph: INT_X0: A -> B -> {C, E} ; INT_X1: C -> {D, E},
+            // plus a power-wire trap: A -> GFAN0 first (order must not
+            // matter), GFAN0 stitched across, GFAN0 -> D. The E
+            // branches give later nets room around earlier claims.
             match (tile, wire) {
-                ("INT_X0", "A") => vec![("B".into(), "A".into(), false)],
-                ("INT_X0", "B") => vec![("C".into(), "B".into(), false)],
-                ("INT_X1", "C") => vec![("D".into(), "C".into(), false)],
+                ("INT_X0", "A") => vec![
+                    ("GFAN0".into(), "A".into(), false),
+                    ("B".into(), "A".into(), false),
+                ],
+                ("INT_X0", "B") => vec![
+                    ("C".into(), "B".into(), false),
+                    ("E".into(), "B".into(), false),
+                ],
+                ("INT_X1", "C") => vec![
+                    ("D".into(), "C".into(), false),
+                    ("E".into(), "C".into(), false),
+                ],
+                ("INT_X1", "GFAN0") => vec![("D".into(), "GFAN0".into(), false)],
                 _ => vec![],
             }
         }
         fn node_wires(&self, tile: &str, wire: &str) -> Vec<(String, String)> {
             match (tile, wire) {
                 ("INT_X0", "C") => vec![("INT_X1".into(), "C".into())],
+                ("INT_X0", "GFAN0") => vec![("INT_X1".into(), "GFAN0".into())],
                 _ => vec![],
             }
         }
@@ -488,6 +591,7 @@ mod tests {
             match (site, pin) {
                 ("SLICE_X0", "AMUX") => Some(("INT_X0".into(), "B".into())),
                 ("SLICE_X1", "AMUX") => Some(("INT_X1".into(), "C".into())),
+                ("SLICE_X0", "AQ") => Some(("INT_X0".into(), "A".into())),
                 _ => None,
             }
         }
@@ -495,6 +599,8 @@ mod tests {
             match (site, pin) {
                 ("IOB_X1", "O") => vec![("INT_X1".into(), "D".into())],
                 ("SLICE_X0", "AX") => vec![("INT_X1".into(), "D".into())],
+                ("SLICE_X0", "A6") => vec![("INT_X0".into(), "E".into())],
+                ("SLICE_X1", "A6") => vec![("INT_X1".into(), "E".into())],
                 _ => vec![],
             }
         }
@@ -688,6 +794,69 @@ mod tests {
             }
             assert_eq!(n.net, "one", "only the head CI routes, got {}", n.net);
         }
+    }
+
+    #[test]
+    fn bfs_avoids_power_wires() {
+        let sinks = vec![("INT_X1".into(), "D".into())];
+        let empty: HashMap<(String, String), String> = HashMap::new();
+        // Restricted: the GFAN0 shortcut is skipped despite coming
+        // first; the signal path A -> B -> C -> D goes out.
+        let clean = bfs_route("INT_X0", "A", &sinks, &FakeRouter, false, "n", &empty).unwrap();
+        assert_eq!(clean.len(), 3, "got {clean:?}");
+        assert!(
+            clean.iter().all(|p| !is_power_wire(&p.dst_wire) && !is_power_wire(&p.src_wire)),
+            "power wire used, got {clean:?}"
+        );
+        // Exempted (tieoff and clock-path nets): the shortcut is taken.
+        let exempt = bfs_route("INT_X0", "A", &sinks, &FakeRouter, true, "n", &empty).unwrap();
+        assert!(
+            exempt.iter().any(|p| p.dst_wire == "GFAN0" || p.src_wire == "GFAN0"),
+            "shortcut not taken, got {exempt:?}"
+        );
+    }
+
+    #[test]
+    fn bfs_avoids_foreign_claimed_wires() {
+        let sinks = vec![("INT_X1".into(), "D".into())];
+        let mut claimed: HashMap<(String, String), String> = HashMap::new();
+        claimed.insert(("INT_X0".into(), "B".into()), "other".into());
+        // Foreign-owned B blocks the only signal path: no route, so
+        // the caller fails loudly instead of shorting two nets.
+        assert!(
+            bfs_route("INT_X0", "A", &sinks, &FakeRouter, false, "mine", &claimed).is_none(),
+            "routed through foreign wire"
+        );
+        // Same-net ownership stays legal across loads of one net.
+        claimed.insert(("INT_X0".into(), "B".into()), "mine".into());
+        let pips = bfs_route("INT_X0", "A", &sinks, &FakeRouter, false, "mine", &claimed).unwrap();
+        assert_eq!(pips.len(), 3, "got {pips:?}");
+    }
+
+    #[test]
+    fn lut_input_load_routes_through_fabric() {
+        let mut placed = placed_carry_chain();
+        // S-LUT u_s0 senses the co-sited FF output q0 on I5: the A6
+        // load must route through fabric (7-series has no site-local
+        // LUT-input path), while the D load next door stays internal.
+        placed.packed.luts[1].input_nets[5] = Some("q0".into());
+        let routed = route(&placed, &FakeRouter).unwrap();
+        assert_eq!(kind_of(&routed, "q0"), "pips2");
+        assert_eq!(kind_of(&routed, "o0"), "internal");
+    }
+
+    #[test]
+    fn lut_input_pin_rule() {
+        assert!(is_lut_input_pin("A6"));
+        assert!(is_lut_input_pin("B1"));
+        assert!(is_lut_input_pin("D6"));
+        assert!(!is_lut_input_pin("D"));
+        assert!(!is_lut_input_pin("AQ"));
+        assert!(!is_lut_input_pin("CE"));
+        assert!(!is_lut_input_pin("SR"));
+        assert!(!is_lut_input_pin("AX"));
+        assert!(!is_lut_input_pin("AMUX"));
+        assert!(!is_lut_input_pin("S0"));
     }
 
     #[test]
