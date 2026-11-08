@@ -201,6 +201,39 @@ no-regression confirmation, not a reduction. The diff moves only
 once the backend consumes Carry4 (pack pin nets plus place, route,
 emit), which is the next stage.
 
+## Eighth run (Nov 8, 2026, Mac, anchored convergence)
+
+Carry bitstream (/tmp/x7/blinky_reg_carry.bit, head anchored on the
+golden head slice SLICE_X113Y39) vs oracle: 1,812 differing bits in
+1,070 clusters (record /tmp/x7/carry_vs_oracle_diff1.json: 1,462
+NAMED, 350 UNNAMED, 15 unclaimed), down from 4,688. Composition:
+784 LUT_INIT, 432 plus ~100 OTHER routing (INT/GFAN/LOGIC_OUTS: Q
+fanout, CYINIT AX route, LD0 cone), 90 FF_CFG (slice positions),
+20 CLOCK, 5 CARRY_CFG (pad-slice CINs at Y43-Y45 where golden
+extends past our chain end), 350 UNNAMED (HCLK, license-blocked).
+Head lines match golden exactly (PRECYINIT.AX plus ACY0 on
+CLBLM_R_X71Y39.SLICEL_X1). Independent check: work/carrysim.py
+judges our carry bitstream a working counter with toggling top bit
+(same instrument that validates the oracle; reader caveat: its
+INIT reader underreports some high bits, verdict direction robust).
+
+Decoded this round (raw frame words, not the filtered views):
+unconnected LUT inputs read LOW (proven by elimination: pad S-LUT
+I5 pins and head AX have no driving pips, no TIEOFF, no VCC, yet
+silicon counts; float-high breaks the pads, float-low fits all
+evidence). Pads (X1@Y40-43 S-LUT complements plus CINs) are
+transparent pass-throughs (S=0 gives CO=CY). Head CYINIT=1 comes
+from X0-ALUT (0x0f0f0f0f0f0f0f0f = NOT-A3 with A3 unconnected,
+const 1) into AX; our flow instead fans one-LUT to AX through
+fabric (proven working, bit-different). The O5-vs-DI question is
+settled per prjxray site JSON: CO = S ? O5 : CY, and O5 is const 0
+for passthrough INITs, so our DI-tied-low sim model is exact for
+this design (general O5 eval is a later sim upgrade).
+
+Next: S-input routing convergence (per-input IMUX mapping from INT
+pip decode) plus transparent pad emission, then the head const-1
+ALUT. HCLK UNNAMED still waits on the license.
+
 ## Seventh run (Nov 8, 2026, Mac, after full backend carry-through)
 
 Same pair, rebuilt default-flow Helion side (all three bitstream e2e
