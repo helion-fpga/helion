@@ -2,7 +2,8 @@
 //!
 //! [`XDevice`] wraps the X-Ray [`Device`] model and answers the narrow
 //! queries the flow stages need, translating between absolute site names
-//! (`IOB_X1Y76`) and FASM-relative names (`IOB_Y1`).
+//! (`IOB_X1Y76`) and FASM-relative names (`IOB_Y0` master / `IOB_Y1`
+//! slave by site type).
 
 use crate::device::Device;
 use crate::db::parse::PpipKind;
@@ -585,13 +586,60 @@ impl<'a> EmitDevice for XDevice<'a> {
             .unwrap_or_default()
     }
 
+    fn ioi_tile(&self, iob_tile: &str) -> Option<String> {
+        // Same bank side (L/R), same row (grid_y), nearest column: the
+        // IOI tile sits one over from its IOB tile (e.g. RIOB33_X73Y45
+        // with RIOI3_X73Y45). SING pairs are a known DB gap (ZB-09):
+        // prjxray has no SING logic segbits, so no OLOGIC/ILOGIC lines
+        // there (the IOB-tile lines still flow to the SING filter).
+        let side = iob_tile.chars().next()?;
+        let want = format!("{side}IOI3");
+        let anchor = self.tile_idx(iob_tile)?;
+        let anchor_tile = self.device.tile(anchor)?;
+        let (ax, ay) = (anchor_tile.grid_x, anchor_tile.grid_y);
+        let mut best: Option<(i32, String)> = None;
+        for ti in 0..self.device.tile_count() {
+            let ttype = self.device.tile_type_name(ti).unwrap_or("");
+            if !ttype.starts_with(&want) {
+                continue;
+            }
+            if ttype.contains("SING") {
+                continue;
+            }
+            let t = self.device.tile(ti)?;
+            if t.grid_y != ay {
+                continue;
+            }
+            let dx = (t.grid_x - ax).abs();
+            let Some(name) = self.tile_name(ti) else {
+                continue;
+            };
+            let entry = (dx, name.to_string());
+            if best.as_ref().map(|(bdx, _)| dx < *bdx).unwrap_or(true) {
+                best = Some(entry);
+            }
+        }
+        best.map(|(_, name)| name)
+    }
+
     fn site_rel(&self, tile: &str, site: &str) -> Option<String> {
         let idx = self.tile_idx(tile)?;
         let t = self.device.tile(idx)?;
         let pos = t.sites.iter().position(|s| s.name == site)?;
         let stype = &t.sites[pos].site_type;
         if stype.starts_with("IOB") {
-            Some(format!("IOB_Y{pos}"))
+            // segbits: IOB_Y0 = master BEL, IOB_Y1 = slave BEL. This is
+            // the site TYPE, not the site position in the tile: T22 lives
+            // on IOB_X1Y46 (second site in its tile) but Vivado emits
+            // IOB_Y0 because the site is a master (ZB-10 ground truth).
+            // Bare "IOB33" (SING tiles) has no master/slave marking: fall
+            // back to site position, exactly the old behavior. That BEL
+            // is UNPROVEN (ZB-09 owns SING truth); M/S sites are exact.
+            match stype.as_str() {
+                "IOB33M" => Some("IOB_Y0".to_string()),
+                "IOB33S" => Some("IOB_Y1".to_string()),
+                _ => Some(format!("IOB_Y{pos}")),
+            }
         } else if stype.starts_with("SLICE") {
             // segbits: SLICEL_X0 / SLICEM_X1 (X index within tile).
             Some(format!("{stype}_X{pos}"))
@@ -723,5 +771,48 @@ mod tests {
         assert_eq!(statics.len(), 4, "extra enables, got {statics:?}");
         // Unknown site fails loudly.
         assert!(xdev.bufg_spine("BUFGCTRL_X99Y99").is_err());
+    }
+
+    #[test]
+    fn iob_site_rel_master_slave() {
+        // Vivado ground truth (ZB-10 same-RTL diff): single-ended pins
+        // use the master BEL (IOB_Y0); the FASM BEL comes from the site
+        // type, not the site position in the tile.
+        use crate::emit::EmitDevice;
+        let (dev, maps) = test_z020();
+        let xdev = XDevice::new(dev, maps.clone());
+        // T22 (LD0 output): master site -> IOB_Y0.
+        assert_eq!(
+            xdev.site_rel("RIOB33_X73Y45", "IOB_X1Y46").as_deref(),
+            Some("IOB_Y0")
+        );
+        // Neighbor slave site -> IOB_Y1.
+        assert_eq!(
+            xdev.site_rel("RIOB33_X73Y45", "IOB_X1Y45").as_deref(),
+            Some("IOB_Y1")
+        );
+        // Y9 (clk input): master site -> IOB_Y0 (Vivado ILOGIC_Y0).
+        assert_eq!(
+            xdev.site_rel("LIOB33_X0Y25", "IOB_X0Y26").as_deref(),
+            Some("IOB_Y0")
+        );
+    }
+
+    #[test]
+    fn ioi_tile_pairing() {
+        use crate::emit::EmitDevice;
+        let (dev, maps) = test_z020();
+        let xdev = XDevice::new(dev, maps.clone());
+        // Paired IOI tile, same row, one column over.
+        assert_eq!(
+            xdev.ioi_tile("RIOB33_X73Y45").as_deref(),
+            Some("RIOI3_X73Y45")
+        );
+        assert_eq!(
+            xdev.ioi_tile("LIOB33_X0Y25").as_deref(),
+            Some("LIOI3_X0Y25")
+        );
+        // SING pairs are a known DB gap (ZB-09): no logic lines there.
+        assert_eq!(xdev.ioi_tile("RIOB33_SING_X73Y49"), None);
     }
 }
