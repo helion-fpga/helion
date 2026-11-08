@@ -187,3 +187,16 @@ offset 23, bits 0/4/5/6) against segbits_hclk_r.db: the file
 covers frames 00 to 05 only, the tile has 26 frames. Row-buffer
 bits are outside public data. All ~350 UNNAMED bits trace to this
 class. Needs Vivado fuzzing (license). Not grindable further here.
+
+## Sixth run (Nov 8, 2026, Mac, after ZB-04 stage 1 commit 9f90549)
+
+Same pair, rebuilt Helion side (`cargo test --release -p
+helion-xilinx7 --test blinky_reg_e2e`, env unset, output
+4,045,666 bytes). Oracle md5 re-verified 3f6d7cfa before the run.
+Result: 4,688 (record /tmp/x7/blinky_reg_diff9.json: 4,338 NAMED,
+350 UNNAMED, 15 unclaimed), identical to run five. Expected: the
+stage 1 carry path is opt-in (`synth_sv_carry`), the default flow
+that builds this bitstream is untouched, so this run is a
+no-regression confirmation, not a reduction. The diff moves only
+once the backend consumes Carry4 (pack pin nets plus place, route,
+emit), which is the next stage.
