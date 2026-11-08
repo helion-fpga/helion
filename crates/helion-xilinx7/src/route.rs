@@ -33,6 +33,11 @@ pub trait RouteQuery {
     /// INIT_OUT (UG472 Table 2-3). Fails loudly when the DB has no
     /// tie-off path for the site.
     fn bufg_tieoff_pips(&self, site: &str) -> Result<BufgTieoff, String>;
+    /// Clock spine stitching for a BUFGCTRL site: O exit to the lowest
+    /// available global clock line, REBUF BOT to TOP stitches, and the
+    /// static rebuffer enables for every CLK_BUFG_REBUF tile on that
+    /// line's node. Fails loudly when the DB has no spine path.
+    fn bufg_spine(&self, site: &str) -> Result<BufgSpine, String>;
 }
 
 /// Tie-off pips for one BUFGCTRL site, split by driven constant.
@@ -42,6 +47,20 @@ pub struct BufgTieoff {
     pub ones: Vec<RoutedPip>,
     /// Pips driving S1, CE1, IGNORE0 to constant 0 (GND).
     pub zeros: Vec<RoutedPip>,
+}
+
+/// Clock spine stitching for one BUFGCTRL site: O to a global clock
+/// line, through the rebuffer tiles. Real pips travel the normal Pips
+/// channel; static rebuffer enables travel
+/// [`crate::emit::EmitDevice::bufg_spine_static`].
+#[derive(Clone, Debug, Default)]
+pub struct BufgSpine {
+    /// Global clock index, lowest with a real O-exit pip (Vivado uses 0).
+    pub gclk: u8,
+    /// Real pips: O exit plus REBUF BOT to TOP stitches.
+    pub pips: Vec<RoutedPip>,
+    /// Static lines: `(tile, feature)` rebuffer enables.
+    pub statics: Vec<(String, String)>,
 }
 
 /// A single programmed pip: `tile.dst_wire <- src_wire`.
@@ -176,6 +195,18 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     // undriven, the BUFGCTRL output freezes at INIT_OUT with no toggle
     // (UG472 Table 2-3), the observed "done=1, LEDs dark" failure.
     route_bufg_tieoffs(placed, device, &mut nets)?;
+
+    // Clock spine stitching per BUFGCTRL: O exit to the global line plus
+    // REBUF stitches. Without these the clock never leaves the BUFG site.
+    for bufg in &placed.bufgs {
+        let spine = device.bufg_spine(&bufg.site)?;
+        if !spine.pips.is_empty() {
+            nets.push(RoutedNet7 {
+                net: format!("__spine_{}", bufg.site.to_ascii_lowercase()),
+                kind: RouteKind::Pips(spine.pips),
+            });
+        }
+    }
 
     Ok(Routed7 {
         placed: placed.clone(),
@@ -415,6 +446,9 @@ mod tests {
         fn bufg_tieoff_pips(&self, _site: &str) -> Result<BufgTieoff, String> {
             Ok(BufgTieoff::default())
         }
+        fn bufg_spine(&self, _site: &str) -> Result<BufgSpine, String> {
+            Ok(BufgSpine::default())
+        }
     }
 
     fn placed_two_site() -> Placed7 {
@@ -478,6 +512,9 @@ mod tests {
             fn is_clock_net(&self, _: &str) -> bool { false }
             fn bufg_tieoff_pips(&self, _: &str) -> Result<BufgTieoff, String> {
                 Ok(BufgTieoff::default())
+            }
+            fn bufg_spine(&self, _: &str) -> Result<BufgSpine, String> {
+                Ok(BufgSpine::default())
             }
         }
         let err = route(&placed_two_site(), &NoRoute).unwrap_err();
