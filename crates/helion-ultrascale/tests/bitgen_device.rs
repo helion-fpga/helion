@@ -15,11 +15,15 @@
 //!   frame 10, `INIT[2]` frame 9. The locator minors for the
 //!   same BELs are 12, 12, and 11, 10, 9, so DB frame == locator
 //!   minor and the tile base minor is 0.
-//! - INT_X0Y0 resolves by the provisional harness rule (CLB
-//!   column major - 1): CLB column 0 is major 5, so the INT
-//!   column is major 4, which carries exactly 76 minors, the
-//!   INT segbits frame span (vendored `segbits_int.db`, frames
-//!   0..75). Base FAR is therefore 0x400.
+//! - INT_X0Y0 resolves by the provisional harness rule, tile-type
+//!   dependent (CLEL_R: CLB column major - 1): CLB column 0 is
+//!   major 5, so the INT column is major 4, which carries exactly
+//!   76 minors, the INT segbits frame span (vendored
+//!   `segbits_int.db`, frames 0..75). Base FAR is therefore 0x400.
+//!   INT_X1Y0 resolves by the +1 branch (CLB column 1 is CLEM,
+//!   major 6, INT major 7, 76 minors): base FAR 0x700, the same
+//!   INT column INT_X2Y0 resolves to (CLB column 2 is CLEL_R,
+//!   major 8, INT major 7).
 //! - The two golden PIP lines resolve to set bits (0x440, bit 0)
 //!   for BOUNCE (`64_00`) and (0x429, bit 3) for GCLK (`41_03`)
 //!   in the vendored `segbits_int.db`.
@@ -141,11 +145,15 @@ fn int_tile_resolves_by_provisional_rule_and_validates() {
     assert_eq!(device.tile_base_far("INT_X0Y0"), Some(0x0000_0400));
     // INT_X2Y0 also resolves: CLB column 2 is major 8, INT major 7.
     assert_eq!(device.tile_base_far("INT_X2Y0"), Some(0x0000_0700));
-    // INT_X1Y0 does NOT resolve: CLB column 1 is major 6, the rule
-    // points at major 5, which carries only 16 minors (CLB column
-    // 0's column), not the 76 an INT tile needs. Fail loud.
-    assert_eq!(device.tile_type("INT_X1Y0"), None);
-    assert_eq!(device.tile_base_far("INT_X1Y0"), None);
+    // INT_X1Y0 resolves by the +1 branch: CLB column 1 is CLEM,
+    // major 6, so the INT column is major 7 (76 minors), the same
+    // INT column INT_X2Y0 resolves to. Base FAR 0x700.
+    assert_eq!(device.tile_type("INT_X1Y0"), Some("INT"));
+    assert_eq!(device.tile_base_far("INT_X1Y0"), Some(0x0000_0700));
+    // INT_X7Y0 resolves by the +1 branch too: CLB column 7 is
+    // CLEL_L, major 18, INT major 19 (76 minors). Base FAR 0x1300.
+    assert_eq!(device.tile_type("INT_X7Y0"), Some("INT"));
+    assert_eq!(device.tile_base_far("INT_X7Y0"), Some(0x0000_1300));
     // INT tiles exist in every FAR row.
     assert_eq!(device.tile_base_far("INT_X0Y3"), Some(0x000C_0400));
     assert_eq!(device.tile_base_far("INT_X0Y4"), None);
@@ -194,14 +202,15 @@ fn tile_names_enumerate_resolving_tiles_xcku3p() {
     // Sorted, unique.
     assert!(names.windows(2).all(|w| w[0] < w[1]));
     assert_eq!(names.len(), names.iter().collect::<HashSet<_>>().len());
-    // Counts: 27,120 SLICE + 208 INT (52 valid CLB columns per row
-    // x 4 rows) + 960 RAMB18 (10 cols x 4 rows x 24).
-    assert_eq!(names.len(), 27_120 + 208 + 960);
+    // Counts: 27,120 SLICE + 452 INT (all 113 CLB columns per row
+    // resolve under the tile-type-dependent rule: 52 via -1, 61
+    // via +1, x 4 rows) + 960 RAMB18 (10 cols x 4 rows x 24).
+    assert_eq!(names.len(), 27_120 + 452 + 960);
     assert_eq!(
         names.iter().filter(|n| n.starts_with("SLICE_")).count(),
         27_120
     );
-    assert_eq!(names.iter().filter(|n| n.starts_with("INT_")).count(), 208);
+    assert_eq!(names.iter().filter(|n| n.starts_with("INT_")).count(), 452);
     assert_eq!(
         names.iter().filter(|n| n.starts_with("RAMB18_")).count(),
         960
@@ -209,7 +218,8 @@ fn tile_names_enumerate_resolving_tiles_xcku3p() {
     assert!(names.contains(&"SLICE_X0Y0".to_string()));
     assert!(names.contains(&"SLICE_X112Y239".to_string()));
     assert!(names.contains(&"INT_X0Y0".to_string()));
-    assert!(!names.contains(&"INT_X1Y0".to_string()));
+    assert!(names.contains(&"INT_X1Y0".to_string()));
+    assert!(names.contains(&"INT_X112Y3".to_string()));
     assert!(names.contains(&"RAMB18_X0Y0".to_string()));
     assert!(!names.iter().any(|n| n.starts_with("HPIO")));
     assert!(!names.iter().any(|n| n.starts_with("RAMB36")));
@@ -220,18 +230,25 @@ fn tile_names_enumerate_resolving_tiles_xcvu3p() {
     let (device, _) = load_xcvu3p();
     let names = device.tile_names();
     assert!(names.windows(2).all(|w| w[0] < w[1]));
-    // Counts: 49,260 SLICE + 364 INT (52 valid CLB columns per row
-    // x 7 rows) + 1,680 RAMB18 (10 cols x 7 rows x 24).
-    assert_eq!(names.len(), 49_260 + 364 + 1_680);
+    // Counts: 49,260 SLICE + 791 INT (113 resolving CLB columns
+    // per row x 7 rows; the tail CLB columns 113..117 resolve to
+    // no 76-minor neighbour and do not resolve) + 1,680 RAMB18
+    // (10 cols x 7 rows x 24).
+    assert_eq!(names.len(), 49_260 + 791 + 1_680);
     assert_eq!(
         names.iter().filter(|n| n.starts_with("SLICE_")).count(),
         49_260
     );
-    assert_eq!(names.iter().filter(|n| n.starts_with("INT_")).count(), 364);
+    assert_eq!(names.iter().filter(|n| n.starts_with("INT_")).count(), 791);
     assert_eq!(
         names.iter().filter(|n| n.starts_with("RAMB18_")).count(),
         1_680
     );
+    // The +1 branch resolves CLEM column 1 here too, while the
+    // tail column 113 (CLEM_R, major 230, neighbours 8 and 16
+    // minors) fails loud.
+    assert!(names.contains(&"INT_X1Y0".to_string()));
+    assert!(!names.contains(&"INT_X113Y0".to_string()));
 }
 
 #[test]
