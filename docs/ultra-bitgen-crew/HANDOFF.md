@@ -1,5 +1,11 @@
 # UltraScale+ bitgen handoff: everything needed to resume from here
 
+> A fresh combined handoff covering both tracks (ZedBoard and UltraScale+),
+> the goal, both fix lists, the hardware loop, and the Mac access problem,
+> is at `docs/HANDOFF.md` on branch fm/zedboard-fix-router and in the
+> zedboard-handoff folder. Read that file first. This file is the
+> UltraScale+ detail underneath it.
+
 State as of Nov 8, 2026, about 11:45 EST. Branch `fm/ultra-bitstream`, tip `060b230`
 (merge of the tile-type-dependent INT column offset, `a63f49c`). Pushed to
 `github.com/helion-fpga/helion` on that branch. Nothing merged to master.
