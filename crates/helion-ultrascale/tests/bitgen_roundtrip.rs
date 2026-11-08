@@ -13,15 +13,27 @@
 //!
 //! Test design (canonical sorted FASM order):
 //!   INT_X0Y0.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1
-//!   RAMB18_X0Y0.INIT_00 = 256'h8000...0001
+//!   RAMB18_X0Y0.INIT[16383:0] = 16384'h<4096 digits, bits 0 and 255 set>
 //!   SLICE_X0Y0.A6LUT.INIT[63:0] = 64'h8000000000000001
 //!   SLICE_X0Y0.AFF.INIT.V0
+//!
+//! BRAM renders through the bit-location tables, never through segbits:
+//! content bit 0 is (minor 0, ofst 0) and bit 255 is (minor 3, ofst 107)
+//! at Y_ofst 0 (vendored ultrascale_plus_lut_ff_bram.json, U-Ray
+//! verified). The per-word spelling INIT_00 sets the same two bits and
+//! is covered by per_word_spelling_emits_identical_frames; parse-back
+//! normalizes to the whole-array spelling, so the round-trip FASM uses
+//! it. The stub segbits DB carries NO BRAM entry (the real vendored
+//! DBs carry none either); a stale BRAM entry here would render a
+//! second, conflicting INIT_00 line on parse-back.
 //!
 //! Stub device (xcku3p, IDCODE 0x04A63093 per UG570 table 2):
 //!   SLICE_X0Y0  type CLEL_L  base FAR 0x00000500 (block 0, row 0, col 5, minor 0)
 //!   INT_X0Y0    type INT     base FAR 0x00000300 (block 0, row 0, col 3, minor 0)
 //!   RAMB18_X0Y0 type BRAM    base FAR 0x01000000 (block 1, row 0, col 0, minor 0)
-//!   config order (ascending FAR): 0x304, 0x50C, 0x1000000
+//!   config order (ascending FAR): 0x304, 0x50C, 0x1000000, 0x1000003.
+//!   Only the two BRAM minors with set bits are listed: emit does not
+//!   materialize all-zero BRAM minors.
 //!
 //! Stub segbits DB (BitRef.frame is a frame offset from the tile base FAR;
 //! INIT lists are MSB-first: list index 0 is the most significant value
@@ -30,7 +42,6 @@
 //!   CLEL_L AFF.INIT.V0      : 1 ref, frame offset 12, bit 64
 //!   CLEL_L AFF.INIT.V1      : 1 ref, frame offset 12, `!` bit 64
 //!   INT    PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1 : set bit 100, `!` bits 101, 102
-//!   BRAM   INIT_00          : 256 refs, frame offset 0, bits 255..0
 //!
 //! The FF INIT spelling is the DB vocabulary `.V0`/`.V1` (interfaces
 //! critic session 2 item 5), not bare `AFF.INIT`. V0 sets the INIT bit;
@@ -44,20 +55,25 @@
 //!   F2 = 0x00000304: word3 = 0x00000010 (frame bit 100), rest 0
 //!   F1 = 0x0000050C: word0 = 0x00000001 (bit 0), word1 = 0x80000000 (bit 63),
 //!                     word2 = 0x00000001 (bit 64), rest 0
-//!   F3 = 0x01000000: word0 = 0x00000001 (bit 0), word7 = 0x80000000 (bit 255)
+//!   F3a = 0x01000000: word0 = 0x00000001 (content bit 0), rest 0
+//!   F3d = 0x01000003: word3 = 0x00000800 (content bit 255: ofst 107,
+//!                     word 3 bit 11), rest 0
 //!
 //! Expected CRCs (Python reference, emit order RCRC, IDCODE, WCFG, frames;
 //! the IDCODE write feeds the CRC, so only the first frame's CRC depends on
-//! the preamble; later frames start from 0 after the CRC-register write):
-//!   F2 = 0x9ac4dc29, F1 = 0xaa75db0b, F3 = 0x66924d7d
+//! the preamble; later frames start from 0 after the CRC-register write.
+//! The port was validated by reproducing the pre-BRAM-branch known CRCs
+//! F2 = 0x9ac4dc29, F1 = 0xaa75db0b, F3 = 0x66924d7d for the old layout):
+//!   F2 = 0x9ac4dc29, F1 = 0xaa75db0b, F3a = 0xd9880946, F3d = 0x0b9f8503
 //!
-//! Expected stream: 733 words = 2932 bytes. Sync word at byte 48 (word 12).
+//! Expected stream: 833 words = 3332 bytes. Sync word at byte 48 (word 12).
 //! Packet word offsets: RCRC header 14, IDCODE header 16, WCFG header 18,
 //! F2 FAR 20 / FDRI 22 / FARrw 116 / CRC 118 (value 119),
 //! F1 FAR 120 / FDRI 122 / FARrw 216 / CRC 218 (value 219),
-//! F3 FAR 220 / FDRI 222 / FARrw 316 / CRC 318 (value 319),
-//! ending RCRC 320, GRESTORE 324, DGHIGH 327, START 329, DESYNC 331,
-//! trailing NOOPs 333..732.
+//! F3a FAR 220 / FDRI 222 / FARrw 316 / CRC 318 (value 319),
+//! F3d FAR 320 / FDRI 322 / FARrw 416 / CRC 418 (value 419),
+//! ending RCRC 420, GRESTORE 424, DGHIGH 427, START 429, DESYNC 431,
+//! trailing NOOPs 433..832.
 
 use helion_ultrascale::BitRef;
 use helion_ultrascale::bitgen::{
@@ -65,14 +81,31 @@ use helion_ultrascale::bitgen::{
     parse_frames,
 };
 
-const FASM: &str = "INT_X0Y0.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1\n\
-RAMB18_X0Y0.INIT_00 = 256'h8000000000000000000000000000000000000000000000000000000000000001\n\
-SLICE_X0Y0.A6LUT.INIT[63:0] = 64'h8000000000000001\n\
-SLICE_X0Y0.AFF.INIT.V0\n";
+/// Whole-array BRAM INIT value with absolute bits 0 and 255 set:
+/// 4096 hex digits, digit 63 from the right is 8, rightmost digit is 1.
+fn bram_init_hex() -> String {
+    let mut s = "0".repeat(4032);
+    s.push('8');
+    s.push_str(&"0".repeat(62));
+    s.push('1');
+    debug_assert_eq!(s.len(), 4096);
+    s
+}
+
+fn test_fasm() -> String {
+    format!(
+        "INT_X0Y0.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1\n\
+        RAMB18_X0Y0.INIT[16383:0] = 16384'h{}\n\
+        SLICE_X0Y0.A6LUT.INIT[63:0] = 64'h8000000000000001\n\
+        SLICE_X0Y0.AFF.INIT.V0\n",
+        bram_init_hex()
+    )
+}
 
 const F2: u32 = 0x0000_0304;
 const F1: u32 = 0x0000_050C;
-const F3: u32 = 0x0100_0000;
+const F3A: u32 = 0x0100_0000;
+const F3D: u32 = 0x0100_0003;
 
 fn test_device() -> StubDevice {
     StubDevice::new(
@@ -83,7 +116,7 @@ fn test_device() -> StubDevice {
             ("INT_X0Y0".to_string(), "INT".to_string(), 0x300),
             ("RAMB18_X0Y0".to_string(), "BRAM".to_string(), 0x100_0000),
         ],
-        vec![F2, F1, F3],
+        vec![F2, F1, F3A, F3D],
     )
 }
 
@@ -91,10 +124,6 @@ fn test_db() -> StubSegbitsDb {
     let mut lut: Vec<BitRef> = Vec::new();
     for bit in (0..64).rev() {
         lut.push(BitRef::set(12, bit));
-    }
-    let mut bram: Vec<BitRef> = Vec::new();
-    for bit in (0..256).rev() {
-        bram.push(BitRef::set(0, bit));
     }
     StubSegbitsDb::new(vec![
         ("CLEL_L".to_string(), "A6LUT.INIT[63:0]".to_string(), lut),
@@ -117,7 +146,6 @@ fn test_db() -> StubSegbitsDb {
                 BitRef::zero(4, 102),
             ],
         ),
-        ("BRAM".to_string(), "INIT_00".to_string(), bram),
     ])
 }
 
@@ -131,8 +159,8 @@ fn word(bytes: &[u8], index: usize) -> u32 {
 fn frames_match_hand_computed_words() {
     let device = test_device();
     let db = test_db();
-    let frames = emit_frames(FASM, &device, &db).unwrap();
-    assert_eq!(frames.len(), 3);
+    let frames = emit_frames(&test_fasm(), &device, &db).unwrap();
+    assert_eq!(frames.len(), 4);
 
     let f2 = frames.get(&F2).unwrap();
     assert_eq!(f2[3], 0x0000_0010);
@@ -148,22 +176,23 @@ fn frames_match_hand_computed_words() {
             .all(|(i, w)| (0..3).contains(&i) || *w == 0)
     );
 
-    let f3 = frames.get(&F3).unwrap();
-    assert_eq!(f3[0], 0x0000_0001);
-    assert_eq!(f3[7], 0x8000_0000);
-    assert!(
-        f3.iter()
-            .enumerate()
-            .all(|(i, w)| i == 0 || i == 7 || *w == 0)
-    );
+    let f3a = frames.get(&F3A).unwrap();
+    assert_eq!(f3a[0], 0x0000_0001);
+    assert!(f3a.iter().enumerate().all(|(i, w)| i == 0 || *w == 0));
+    // Minors 1 and 2 hold no set bit and are not materialized.
+    assert!(!frames.contains_key(&0x0100_0001));
+    assert!(!frames.contains_key(&0x0100_0002));
+    let f3d = frames.get(&F3D).unwrap();
+    assert_eq!(f3d[3], 0x0000_0800);
+    assert!(f3d.iter().enumerate().all(|(i, w)| i == 3 || *w == 0));
 }
 
 #[test]
 fn bitstream_has_expected_length_sync_headers_and_crcs() {
     let device = test_device();
     let db = test_db();
-    let bytes = emit_bitstream(FASM, &device, &db).unwrap();
-    assert_eq!(bytes.len(), 733 * 4);
+    let bytes = emit_bitstream(&test_fasm(), &device, &db).unwrap();
+    assert_eq!(bytes.len(), 833 * 4);
 
     // Preamble: 8 dummy, bus width detect, bus width sync, 2 dummy, sync, NOOP.
     assert_eq!(word(&bytes, 12), SYNC_WORD);
@@ -201,33 +230,42 @@ fn bitstream_has_expected_length_sync_headers_and_crcs() {
     assert_eq!(word(&bytes, 218), 0x3000_0001);
     assert_eq!(word(&bytes, 219), 0xaa75_db0b);
 
-    // Frame F3.
+    // Frame F3a (BRAM minor 0).
     assert_eq!(word(&bytes, 220), 0x3000_2001);
-    assert_eq!(word(&bytes, 221), F3);
+    assert_eq!(word(&bytes, 221), F3A);
     assert_eq!(word(&bytes, 222), 0x3000_405D);
     assert_eq!(word(&bytes, 223), 0x0000_0001);
-    assert_eq!(word(&bytes, 230), 0x8000_0000);
     assert_eq!(word(&bytes, 316), 0x3000_2001);
-    assert_eq!(word(&bytes, 317), F3);
+    assert_eq!(word(&bytes, 317), F3A);
     assert_eq!(word(&bytes, 318), 0x3000_0001);
-    assert_eq!(word(&bytes, 319), 0x6692_4d7d);
+    assert_eq!(word(&bytes, 319), 0xd988_0946);
+
+    // Frame F3d (BRAM minor 3).
+    assert_eq!(word(&bytes, 320), 0x3000_2001);
+    assert_eq!(word(&bytes, 321), F3D);
+    assert_eq!(word(&bytes, 322), 0x3000_405D);
+    assert_eq!(word(&bytes, 326), 0x0000_0800);
+    assert_eq!(word(&bytes, 416), 0x3000_2001);
+    assert_eq!(word(&bytes, 417), F3D);
+    assert_eq!(word(&bytes, 418), 0x3000_0001);
+    assert_eq!(word(&bytes, 419), 0x0b9f_8503);
 
     // Ending: RCRC, 2 NOOP, GRESTORE, NOOP, DGHIGH, START, DESYNC,
     // 400 NOOP. START = 5 and DESYNC = 13 are UG570 table 9-22 codes.
-    assert_eq!(word(&bytes, 320), 0x3000_8001);
-    assert_eq!(word(&bytes, 321), 0x0000_0007);
-    assert_eq!(word(&bytes, 322), 0x2000_0000);
-    assert_eq!(word(&bytes, 323), 0x2000_0000);
-    assert_eq!(word(&bytes, 324), 0x3000_8001);
-    assert_eq!(word(&bytes, 325), 0x0000_000A);
-    assert_eq!(word(&bytes, 326), 0x2000_0000);
-    assert_eq!(word(&bytes, 327), 0x3000_8001);
-    assert_eq!(word(&bytes, 328), 0x0000_0003);
-    assert_eq!(word(&bytes, 329), 0x3000_8001);
-    assert_eq!(word(&bytes, 330), 0x0000_0005);
-    assert_eq!(word(&bytes, 331), 0x3000_8001);
-    assert_eq!(word(&bytes, 332), 0x0000_000D);
-    for i in 333..733 {
+    assert_eq!(word(&bytes, 420), 0x3000_8001);
+    assert_eq!(word(&bytes, 421), 0x0000_0007);
+    assert_eq!(word(&bytes, 422), 0x2000_0000);
+    assert_eq!(word(&bytes, 423), 0x2000_0000);
+    assert_eq!(word(&bytes, 424), 0x3000_8001);
+    assert_eq!(word(&bytes, 425), 0x0000_000A);
+    assert_eq!(word(&bytes, 426), 0x2000_0000);
+    assert_eq!(word(&bytes, 427), 0x3000_8001);
+    assert_eq!(word(&bytes, 428), 0x0000_0003);
+    assert_eq!(word(&bytes, 429), 0x3000_8001);
+    assert_eq!(word(&bytes, 430), 0x0000_0005);
+    assert_eq!(word(&bytes, 431), 0x3000_8001);
+    assert_eq!(word(&bytes, 432), 0x0000_000D);
+    for i in 433..833 {
         assert_eq!(word(&bytes, i), 0x2000_0000, "trailing NOOP at word {i}");
     }
 }
@@ -236,23 +274,43 @@ fn bitstream_has_expected_length_sync_headers_and_crcs() {
 fn round_trip_returns_identical_fasm() {
     let device = test_device();
     let db = test_db();
-    let bytes = emit_bitstream(FASM, &device, &db).unwrap();
+    let fasm = test_fasm();
+    let bytes = emit_bitstream(&fasm, &device, &db).unwrap();
     let back = parse_bitstream(&bytes, &device, &db).unwrap();
-    assert_eq!(back, FASM);
+    assert_eq!(back, fasm);
+}
+
+#[test]
+fn per_word_spelling_emits_identical_frames() {
+    // The per-word spelling is accepted on emit and lands the same
+    // two BRAM bits as the whole-array spelling; only the spelling
+    // differs, not the bits. Parse-back normalizes to whole-array,
+    // so this test (not the round-trip test) is where per-word
+    // coverage lives.
+    let device = test_device();
+    let db = test_db();
+    let per_word = "RAMB18_X0Y0.INIT_00 = 256'h8000000000000000000000000000000000000000000000000000000000000001\n";
+    let a = emit_frames(per_word, &device, &db).unwrap();
+    let b = emit_frames(&test_fasm(), &device, &db).unwrap();
+    let bram_a: Vec<_> = a.iter().filter(|(far, _)| **far >= 0x0100_0000).collect();
+    let bram_b: Vec<_> = b.iter().filter(|(far, _)| **far >= 0x0100_0000).collect();
+    assert_eq!(bram_a, bram_b);
 }
 
 #[test]
 fn parse_frames_matches_emit_frames() {
     let device = test_device();
     let db = test_db();
-    let bytes = emit_bitstream(FASM, &device, &db).unwrap();
-    let emitted = emit_frames(FASM, &device, &db).unwrap();
+    let fasm = test_fasm();
+    let bytes = emit_bitstream(&fasm, &device, &db).unwrap();
+    let emitted = emit_frames(&fasm, &device, &db).unwrap();
     let parsed = parse_frames(&bytes).unwrap();
     assert_eq!(parsed, emitted);
-    assert_eq!(parsed.len(), 3);
+    assert_eq!(parsed.len(), 4);
     assert_eq!(parsed[&F2][3], 0x0000_0010);
     assert_eq!(parsed[&F1][1], 0x8000_0000);
-    assert_eq!(parsed[&F3][7], 0x8000_0000);
+    assert_eq!(parsed[&F3A][0], 0x0000_0001);
+    assert_eq!(parsed[&F3D][3], 0x0000_0800);
 }
 
 #[test]
