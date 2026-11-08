@@ -8,6 +8,10 @@ Nov 8 Tailscale setup doc. Those files stay on disk for history, but if
 anything disagrees with this file, this file wins. A new agent should be
 able to start from here without re-analyzing the project.
 
+The handoff is divided into 25 sub-problems, each a standalone file, and
+the storage map is docs/HANDOFF-INDEX.md: read it to find where every
+file, branch, worktree, crew log, bitstream, and data set lives.
+
 ## The goal, in plain words
 
 Build a non-Vivado tool that produces bitstreams identical to Vivado's, for
