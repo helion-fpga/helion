@@ -268,13 +268,11 @@ fn route_net(
         return Ok(RouteKind::SiteInternal);
     }
     // Clock spine: BUFG-driven nets use the dedicated network.
+    // (The spine exit pips are emitted with the BUFG site stitching, not
+    // here. The IBUF -> BUFG input path below routes through general
+    // pips on purpose: Vivado drives it through CLK_BUFG input-mux
+    // pips, and a bitless special case could never match that.)
     if device.is_clock_net(net) {
-        return Ok(RouteKind::ClockSpine);
-    }
-    // IBUF -> BUFG: dedicated clock input route (no general pip path).
-    let driver_is_ibuf = driver.pin == "I" && driver.site.starts_with("IOB_");
-    let loads_are_bufg = loads.iter().all(|l| l.site.starts_with("BUFGCTRL_"));
-    if driver_is_ibuf && loads_are_bufg {
         return Ok(RouteKind::ClockSpine);
     }
     // Route to external loads via pips. (Internal loads are site-local.)
