@@ -205,32 +205,27 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     // (generate.py): a `Z` prefix means the FASM feature is the INVERSE of
     // the Vivado attribute (feature present <=> attribute is 0/FALSE); a
     // non-Z feature is present <=> attribute is 1/TRUE.
-    //   ZINV_S0/ZINV_S1/ZINV_CE0/ZINV_CE1 present <=> pin NOT inverted.
-    //   ZPRESELECT_I0 present <=> PRESELECT_I0=FALSE; PRESELECT_I1 absent
-    //     <=> PRESELECT_I1=FALSE (both FALSE is the Vivado default).
-    //   INIT_OUT absent <=> INIT_OUT=0 (default).
-    //   IS_IGNORE0/1_INVERTED absent <=> IGNORE pins NOT inverted (default).
+    //   ZINV_S0/ZINV_CE0 present <=> pin NOT inverted.
+    //   IS_IGNORE1_INVERTED present <=> IGNORE1 inverted (Vivado sets it).
+    //   INIT_OUT, IS_IGNORE0_INVERTED absent <=> defaults (0, not inverted).
     //
-    // NOTE: these bits set pin polarity and defaults only; they do NOT
-    // drive the pins. S0/S1/CE0/CE1/IGNORE0/IGNORE1 must additionally be
-    // ROUTED to constants (S0=1, CE0=1, IGNORE0=0, S1=0, CE1=0,
-    // IGNORE1=1). The router does not do tie-off routing yet, so the clock
-    // will not pass until that lands. Do NOT "fix" this by omitting
-    // ZINV_S1/ZINV_CE1: omitting them INVERTS the pins (it does not drive
-    // them to 0), which freezes O at "Old Input" per Table 2-3 once the
-    // pins are driven.
+    // Feature set is Vivado ground truth from the ZB-10 same-RTL diff
+    // (GT-blinky.bit): IN_USE, ZINV_CE0, ZINV_S0, IS_IGNORE1_INVERTED.
+    // ZINV_S1/ZINV_CE1 belong to the I1 path and Vivado does not set
+    // them here; neither does it set ZPRESELECT_I0. The old advice to
+    // keep ZINV_S1/ZINV_CE1 is overruled: pin driving is the router's
+    // job (route_bufg_tieoffs drives S0=1, CE0=1, IGNORE0=0, S1=0,
+    // CE1=0, IGNORE1=1), polarity bits only select inversion.
     for bufg in &placed.bufgs {
         let site_rel = device
             .site_rel(&bufg.tile, &bufg.site)
             .ok_or_else(|| format!("emit: no rel site for {} {}", bufg.tile, bufg.site))?;
         lines.push(format!("{}.BUFGCTRL.{}.IN_USE", bufg.tile, site_rel));
-        // No inversion on any control pin: driven values pass through.
+        // No inversion on the driven I0-path pins: values pass through.
         lines.push(format!("{}.BUFGCTRL.{}.ZINV_CE0", bufg.tile, site_rel));
-        lines.push(format!("{}.BUFGCTRL.{}.ZINV_CE1", bufg.tile, site_rel));
         lines.push(format!("{}.BUFGCTRL.{}.ZINV_S0", bufg.tile, site_rel));
-        lines.push(format!("{}.BUFGCTRL.{}.ZINV_S1", bufg.tile, site_rel));
-        // PRESELECT_I0=FALSE, PRESELECT_I1=FALSE (Vivado defaults).
-        lines.push(format!("{}.BUFGCTRL.{}.ZPRESELECT_I0", bufg.tile, site_rel));
+        // IGNORE1 inverted, exactly as Vivado emits it.
+        lines.push(format!("{}.BUFGCTRL.{}.IS_IGNORE1_INVERTED", bufg.tile, site_rel));
     }
 
     // RAMB18E1s. Feature path: TILE.RAMB18.<site>.IN_USE. INIT data
@@ -445,6 +440,42 @@ mod tests {
             text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZRST"),
             "missing ZRST, got:\n{text}"
         );
+    }
+
+    #[test]
+    fn emit_bufg_i0_config_matches_vivado() {
+        // Vivado ground truth from the ZB-10 same-RTL diff
+        // (GT-blinky.bit): a BUFG on the I0 path emits exactly IN_USE,
+        // ZINV_CE0, ZINV_S0, IS_IGNORE1_INVERTED. ZINV_CE1/ZINV_S1
+        // select the I1 path and ZPRESELECT_I0 is absent in Vivado.
+        use crate::pack::PackedBufg;
+        use crate::place::PlacedBufg;
+        let mut routed = routed_blinky();
+        routed.placed.packed.bufgs.push(PackedBufg {
+            name: "bufg_clk".into(),
+            in_net: "clk".into(),
+            out_net: "clk_bufg".into(),
+        });
+        routed.placed.bufgs.push(PlacedBufg {
+            name: "bufg_clk".into(),
+            tile: "CLK_BUFG_BOT_R_X0Y0".into(),
+            site: "BUFGCTRL_X0Y0".into(),
+        });
+        let bs = emit_fasm(&routed, &FakeEmit).unwrap();
+        let got: Vec<&str> = bs
+            .fasm
+            .iter()
+            .map(String::as_str)
+            .filter(|l| l.contains("BUFGCTRL_X0Y0"))
+            .collect();
+        // NOTE: emit_fasm sorts lines; IS_IGNORE1_INVERTED < ZINV_*.
+        let want = [
+            "CLK_BUFG_BOT_R_X0Y0.BUFGCTRL.BUFGCTRL_X0Y0.IN_USE",
+            "CLK_BUFG_BOT_R_X0Y0.BUFGCTRL.BUFGCTRL_X0Y0.IS_IGNORE1_INVERTED",
+            "CLK_BUFG_BOT_R_X0Y0.BUFGCTRL.BUFGCTRL_X0Y0.ZINV_CE0",
+            "CLK_BUFG_BOT_R_X0Y0.BUFGCTRL.BUFGCTRL_X0Y0.ZINV_S0",
+        ];
+        assert_eq!(got, want, "BUFGCTRL I0 feature set");
     }
 
     #[test]
