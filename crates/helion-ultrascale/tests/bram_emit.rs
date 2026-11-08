@@ -18,7 +18,7 @@
 //!
 //! No em dashes anywhere.
 
-use helion_ultrascale::bitgen::{emit_bitstream, emit_frames, BitgenError};
+use helion_ultrascale::bitgen::{BitgenError, emit_bitstream, emit_frames, parse_bitstream};
 use helion_ultrascale::{DeviceFile, FileSegbitsDb};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -158,12 +158,7 @@ fn bram_fail_loud() {
     let device = load_device();
     let db = load_db();
     // RAMB36 tiles do not resolve: unknown tile, before any feature.
-    let err = emit_frames(
-        "RAMB36_X0Y0.INIT[32767:0] = 0x1\n",
-        &device,
-        &db,
-    )
-    .unwrap_err();
+    let err = emit_frames("RAMB36_X0Y0.INIT[32767:0] = 0x1\n", &device, &db).unwrap_err();
     assert_eq!(
         err,
         BitgenError::UnknownTile {
@@ -171,12 +166,7 @@ fn bram_fail_loud() {
         }
     );
     // Unknown BRAM tile column.
-    let err = emit_frames(
-        "RAMB18_X99Y0.INIT[16383:0] = 0x1\n",
-        &device,
-        &db,
-    )
-    .unwrap_err();
+    let err = emit_frames("RAMB18_X99Y0.INIT[16383:0] = 0x1\n", &device, &db).unwrap_err();
     assert_eq!(
         err,
         BitgenError::UnknownTile {
@@ -209,10 +199,7 @@ fn bram_fail_loud() {
         "valueless BRAM INIT: {err:?}"
     );
     // A per-word value wider than the word.
-    let fasm = format!(
-        "RAMB18_X0Y0.INIT_00 = 0x1{}\n",
-        "0".repeat(64)
-    );
+    let fasm = format!("RAMB18_X0Y0.INIT_00 = 0x1{}\n", "0".repeat(64));
     let err = emit_frames(&fasm, &device, &db).unwrap_err();
     assert!(
         matches!(err, BitgenError::ValueTooWide { bits: 256, .. }),
@@ -223,7 +210,114 @@ fn bram_fail_loud() {
                 RAMB18_X0Y0.INIT[16383:0] = 0x0\n";
     let err = emit_frames(fasm, &device, &db).unwrap_err();
     assert!(
-        matches!(err, BitgenError::ConflictingBit { far: 0x0100_0000, bit: 0, .. }),
+        matches!(
+            err,
+            BitgenError::ConflictingBit {
+                far: 0x0100_0000,
+                bit: 0,
+                ..
+            }
+        ),
         "conflicting BRAM writes: {err:?}"
     );
+}
+
+#[test]
+fn bram_roundtrip_parse_back() {
+    let device = load_device();
+    let db = load_db();
+    let fasm = golden_fasm();
+    let bytes = emit_bitstream(&fasm, &device, &db).unwrap();
+    // Parse-back must not fail loud on the set BRAM bits (the
+    // UnexplainedBits failure this commit fixes), and must render the
+    // two whole-array lines with the exact golden values, in the
+    // Verilog spelling the emitter renders.
+    let back = parse_bitstream(&bytes, &device, &db).unwrap();
+    let content = pattern_u64_words(64);
+    let parity = pattern_u64_words(8);
+    let expect_content = format!(
+        "RAMB18_X0Y0.INIT[16383:0] = 16384'h{}\n",
+        words_to_hex(&content)
+    );
+    let expect_parity = format!(
+        "RAMB18_X0Y0.INITP[2047:0] = 2048'h{}\n",
+        words_to_hex(&parity)
+    );
+    assert!(
+        back.contains(&expect_content),
+        "parse-back content line missing:\n{back}"
+    );
+    assert!(
+        back.contains(&expect_parity),
+        "parse-back parity line missing:\n{back}"
+    );
+    // Re-emitting the parse-back reproduces the original frames.
+    let frames_a = emit_frames(&fasm, &device, &db).unwrap();
+    let frames_b = emit_frames(&back, &device, &db).unwrap();
+    assert_eq!(frames_a, frames_b, "emit(parse(emit(fasm))) frames differ");
+}
+
+#[test]
+fn bram_parse_back_all_zero_drops_line() {
+    let device = load_device();
+    let db = load_db();
+    // An all-zero array is indistinguishable from absent (valued
+    // presence is any-set), so parse-back drops the line rather than
+    // rendering a zero value. The frames carry no set BRAM bit, so
+    // nothing is unexplained either.
+    let fasm = "RAMB18_X0Y0.INIT[16383:0] = 0x0\nRAMB18_X0Y0.INITP[2047:0] = 0x0\n";
+    let bytes = emit_bitstream(fasm, &device, &db).unwrap();
+    let back = parse_bitstream(&bytes, &device, &db).unwrap();
+    assert!(
+        !back.contains("RAMB18_X0Y0"),
+        "all-zero BRAM must render no line, got:\n{back}"
+    );
+}
+
+#[test]
+fn bram_bits_subcommand_labels() {
+    // End to end through the built binary: emit the golden design,
+    // then `bits` must label every set bit BRAM_CONTENT/BRAM_PARITY
+    // with the golden counts (8192 content, 1024 parity).
+    let device = load_device();
+    let db = load_db();
+    let dir = std::env::temp_dir().join("helion-bram-bits-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bit_path = dir.join("bram.bit");
+    let bytes = emit_bitstream(&golden_fasm(), &device, &db).unwrap();
+    std::fs::write(&bit_path, &bytes).unwrap();
+    let exe = env!("CARGO_BIN_EXE_helion-bitgen");
+    let out = std::process::Command::new(exe)
+        .args([
+            "bits",
+            "--bit",
+            bit_path.to_str().unwrap(),
+            "--part",
+            "xcku3p",
+            "--data-dir",
+            data_dir().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "bits subcommand failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    let mut content = 0usize;
+    let mut parity = 0usize;
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let _far = parts.next().unwrap();
+        let _bit = parts.next().unwrap();
+        let _val = parts.next().unwrap();
+        match parts.next().unwrap() {
+            "BRAM_CONTENT" => content += 1,
+            "BRAM_PARITY" => parity += 1,
+            other => panic!("unexpected block label {other} in line {line}"),
+        }
+    }
+    assert_eq!(content, 8192, "content bit count");
+    assert_eq!(parity, 1024, "parity bit count");
 }
