@@ -121,3 +121,17 @@ Classification:
   per-cell comparison is still open.
 - Not done: zero diff. This run is the baseline all fixes measure
   against.
+
+## Second run (Nov 8, 2026, Mac, after the ZB-02 emit fix)
+
+Same pair, rebuilt Helion side. Result: 4,737 differing bits
+(4,387 NAMED, 350 UNNAMED, 15 unclaimed), down 4 from 4,741.
+Record in /tmp/x7/blinky_reg_diff2.json. The BUFGCTRL config block
+is zero differing bits. Remaining, in order of attack:
+
+1. Clock input/output routing (router): input-mux pips
+   CK_MUXED0/IMUX24_0/IMUX28_0, output pip BUFGCTRL0_O to GCLK0,
+   REBUF enables. Helion detours through GFAN/GCLK instead.
+2. HCLK region buffers (new gap, needs a file).
+3. ZB-04 carry chain vs LUT counter.
+4. Placement-freedom routing (needs canonicalised comparison).
