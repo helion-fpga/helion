@@ -529,6 +529,7 @@ mod tests {
             brams: vec![],
             dsps: vec![],
             carries: vec![],
+            carry_anchor: None,
         };
         Placed7 {
             packed,
@@ -637,6 +638,7 @@ mod tests {
                     o_nets: [Some("o1".into()), None, None, None],
                 },
             ],
+            carry_anchor: None,
         };
         Placed7 {
             packed,

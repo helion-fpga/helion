@@ -24,6 +24,11 @@ pub trait DeviceQuery {
     fn tile_xy(&self, tile: &str) -> Option<(i32, i32)>;
     /// A free SLICEL site near `(x, y)`; `used` holds taken site names.
     fn slice_near(&self, x: i32, y: i32, used: &HashSet<String>) -> Option<(String, String)>;
+    /// Claim one caller-pinned slice site (chain-head anchor). Returns the
+    /// `(tile, site)` when the name is a real free slice site, else `None`;
+    /// the caller fails loudly. General mechanism: tests and flows pin
+    /// golden columns with it, never the placer itself.
+    fn anchor_slice(&self, site: &str, used: &HashSet<String>) -> Option<(String, String)>;
     /// The free slice directly above `site` up the carry column: the slice
     /// whose CIN is driven by `site`'s COUT through the dedicated cascade
     /// wire. 7-series order, proven by the blinky golden chain (X71Y39 to
@@ -225,18 +230,29 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
     }
 
     // 2d. CARRY4s, ordered into chains by CO-to-CI net linkage (ZB-08).
-    // Each chain head goes on a free slice near the anchor; every next
-    // group goes directly above its predecessor so the dedicated COUT to
-    // CIN cascade wire reaches. A broken column fails loudly: scattering
-    // chained groups would leave the CO nets unroutable.
+    // The first chain head honors `packed.carry_anchor` when set (a pinned
+    // site for convergence measurements); every other head goes on a free
+    // slice near the anchor. Every next group goes directly above its
+    // predecessor so the dedicated COUT to CIN cascade wire reaches. A
+    // broken column fails loudly: scattering chained groups would leave
+    // the CO nets unroutable.
     let (ax, ay) = anchor.unwrap_or((0, 0));
+    let mut carry_anchor = packed.carry_anchor.clone();
     for chain in order_carry_chains(&packed.carries)? {
         let mut prev_site: Option<String> = None;
         for carry in chain {
             let (tile, site) = match &prev_site {
-                None => device.slice_near(ax, ay, &used_sites).ok_or_else(|| {
-                    format!("place: no SLICE site for CARRY4 {}", carry.name)
-                })?,
+                None => match carry_anchor.take() {
+                    Some(pinned) => device.anchor_slice(&pinned, &used_sites).ok_or_else(|| {
+                        format!(
+                            "place: carry anchor site {pinned} is not a free slice (CARRY4 {})",
+                            carry.name
+                        )
+                    })?,
+                    None => device.slice_near(ax, ay, &used_sites).ok_or_else(|| {
+                        format!("place: no SLICE site for CARRY4 {}", carry.name)
+                    })?,
+                },
                 Some(prev) => device.slice_above(prev, &used_sites).ok_or_else(|| {
                     format!(
                         "place: no free slice above {} for chained CARRY4 {}",
@@ -445,10 +461,7 @@ mod tests {
         // Same parity rule as the real device: X1 of the same tile after
         // X0, else X0 of the tile one row higher. Tile name follows site.
         fn slice_above(&self, site: &str, used: &HashSet<String>) -> Option<(String, String)> {
-            let rest = site.strip_prefix("SLICE_X")?;
-            let (xs, ys) = rest.split_once('Y')?;
-            let x: i32 = xs.parse().ok()?;
-            let y: i32 = ys.parse().ok()?;
+            let (x, y) = crate::xdevice::parse_slice_xy(site)?;
             let (tx, ty) = if x % 2 == 0 { (x + 1, y) } else { (x - 1, y + 1) };
             if !(0..100).contains(&ty) {
                 return None;
@@ -458,6 +471,13 @@ mod tests {
                 return None;
             }
             Some((format!("CLB_X{tx}Y{ty}"), want))
+        }
+        fn anchor_slice(&self, site: &str, used: &HashSet<String>) -> Option<(String, String)> {
+            let (x, y) = crate::xdevice::parse_slice_xy(site)?;
+            if !(0..100).contains(&y) || used.contains(site) {
+                return None;
+            }
+            Some((format!("CLB_X{x}Y{y}"), site.to_string()))
         }
     }
 
@@ -507,6 +527,7 @@ mod tests {
             brams: vec![],
             dsps: vec![],
             carries: vec![],
+            carry_anchor: None,
         }
     }
 
@@ -621,6 +642,32 @@ mod tests {
                 assert!(f.site == "SLICE_X0Y0" || f.site == "SLICE_X1Y0", "{}", f.site);
             }
         }
+    }
+
+    /// A pinned chain-head anchor is honored: the head lands on the pinned
+    /// site and the chain walks up from there. The mechanism is general;
+    /// convergence runs pin golden columns with it.
+    #[test]
+    fn place_carry_anchor_pins_chain_head() {
+        let mut p = packed_blinky();
+        p.carry_anchor = Some("SLICE_X0Y5".into());
+        p.carries = vec![
+            packed_carry("u_c0", "one", Some("co0")),
+            packed_carry("u_c1", "co0", None),
+        ];
+        let placed = place(&p, &FakeDevice).unwrap();
+        let sites: Vec<&str> = placed.carries.iter().map(|c| c.site.as_str()).collect();
+        assert_eq!(sites, vec!["SLICE_X0Y5", "SLICE_X1Y5"]);
+    }
+
+    /// A garbage anchor fails loudly, never silently near.
+    #[test]
+    fn place_carry_bad_anchor_fails_loudly() {
+        let mut p = packed_blinky();
+        p.carry_anchor = Some("NOPE".into());
+        p.carries = vec![packed_carry("u_c0", "one", None)];
+        let err = place(&p, &FakeDevice).unwrap_err();
+        assert!(err.contains("NOPE") && err.contains("anchor"), "got: {err}");
     }
 
     /// A carry cycle has no head: fail loudly instead of scattering.
