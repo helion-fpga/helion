@@ -22,15 +22,29 @@ use crate::db::parse::{PackagePin, Ppip, SegBit, parse_mask_line, parse_package_
 
 /// Root of the raw X-Ray database.
 ///
-/// `HELION_XILINX_DB` wins; otherwise `~/workspace/xilinx-dbsrc`.
+/// `HELION_XILINX_DB` wins; otherwise the first of these that exists:
+/// `~/workspace/xilinx-dbsrc` (Linux VM), then
+/// `~/Documents/zedboard-helion-debug/work/prjxray-db` (MacBook).
+/// When none exists, the VM path is returned so the error names it.
 pub fn default_db_root() -> PathBuf {
     if let Ok(p) = std::env::var("HELION_XILINX_DB") {
         return PathBuf::from(p);
     }
-    match std::env::var("HOME") {
-        Ok(home) => PathBuf::from(home).join("workspace/xilinx-dbsrc"),
-        Err(_) => PathBuf::from("xilinx-dbsrc"),
+    let mut candidates = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join("workspace/xilinx-dbsrc"));
+        candidates.push(home.join("Documents/zedboard-helion-debug/work/prjxray-db"));
     }
+    candidates.push(PathBuf::from("xilinx-dbsrc"));
+    first_existing_dir(&candidates).unwrap_or_else(|| {
+        candidates.into_iter().next().unwrap_or_else(|| PathBuf::from("xilinx-dbsrc"))
+    })
+}
+
+/// First candidate that is an existing directory, if any.
+fn first_existing_dir(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates.iter().find(|p| p.is_dir()).cloned()
 }
 
 /// Pip classification used by the router and bitstream emitter.
@@ -773,6 +787,25 @@ mod tests {
     fn test_device() -> &'static Device {
         static DEV: OnceLock<Device> = OnceLock::new();
         DEV.get_or_init(|| Device::load_xc7a35t(&default_db_root()).expect("load xc7a35t"))
+    }
+
+    #[test]
+    fn first_existing_dir_picks_first_present() {
+        // Hermetic: scratch dirs under temp, no env mutation.
+        let base =
+            std::env::temp_dir().join(format!("helion_db_probe_{}", std::process::id()));
+        let missing = base.join("a-missing");
+        let first = base.join("b-present");
+        let second = base.join("c-present");
+        std::fs::create_dir_all(&first).expect("mkdir first");
+        std::fs::create_dir_all(&second).expect("mkdir second");
+        assert_eq!(
+            first_existing_dir(&[missing.clone(), first.clone(), second]),
+            Some(first)
+        );
+        assert_eq!(first_existing_dir(&[missing]), None);
+        assert_eq!(first_existing_dir(&[]), None);
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
