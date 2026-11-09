@@ -776,3 +776,50 @@ Remainder stands: 350 word-50 route detail (fuzzing), 134 named
 route choice (cost model or second sample), 15 unclaimed trailing
 minors. Gates: xilinx7 lib 107, sv lib 228, sim lib 32, all green
 with pipefail-guarded result lines. No behavior change.
+
+## Twenty-first run (Nov 9, 2026, Mac, internet second sample, 484 held)
+
+Rebuilt with no env setup (e2e green), rawdiff re-verified at 484
+(record /tmp/x7/carry_vs_oracle_diff36.json). Per user direction,
+hunted the internet for real Vivado 7-series bitstreams instead of
+waiting on the license.
+
+What worked: Red Pitaya ecosystem image (pavel-demin, 120MB,
+20+ Vivado 2025.1 bitstreams, header-stamped part strings).
+`led_blinker_122_88.bit` is our exact die (7z020, clg400 package:
+same silicon, INT tiles identical). Dead ends logged honestly:
+pavel's git repos are source-only (no .bit), PYNQ does not commit
+base.bit, open-dpu-zedboard ships only .xsa, the extra course
+blinky (blinky_proj, b06c9299) is payload-identical to the oracle
+(0 rawdiff bits, header timestamp only), and the A3 adder samples
+are unclocked. New reusable scratch tooling (kept out of the
+repo): /tmp/x7/cmpdec.py (COMPRESS=TRUE FAR/MFWR/FDRI decoder,
+MFWR-zero assumption asserted: 9922 writes, 0 nonzero words),
+/tmp/x7/byp_survey.py, /tmp/x7/pipcensus.py.
+
+Two-sample BYP verdict (GT 2023.2 clg484 vs RP 2025.1 clg400,
+full INT censuses /tmp/x7/census_gt.json 23 tiles,
+/tmp/x7/census_rp.json 126 tiles): the tie subset correlates
+with nothing. RP's column uses {2,5,7}, {0,2,5,7}, {0,5} down
+its rows against our {2-7}, all-8, {1,3,4,6}; chip-wide, zero
+BYP_BOUNCE/BYP wires are consumed by any pip in either design,
+so ties are pure parking with no consumer basis; CLK letter,
+position, HCLK adjacency, and FF occupancy all dead (RP tiles
+share identical X1 occupancy with differing subsets; RP also
+cross-validates our X1-to-CLK0 mapping on an independent
+sample). Five dead mechanisms across two samples: the subset
+is Vivado router-state residue, derivable only by fuzzing.
+
+Detour mechanism upgrade from GT fanout census: every source
+drives exactly 2 loads (zero fanout variation), so the
+ring-vs-source split is source selection for unobservable
+L-lane sinks (golden ships distant bits, we sample locally;
+same values, rate-equivalent LED), and S24 is a value-neutral
+path variant. Both arbitrary without Vivado's cost function.
+
+Remainder stands, all parked on outside inputs: 350 word-50
+route detail (fuzzing license), 134 named route choice
+(Vivado cost function), 15 unclaimed trailing minors. Gates:
+xilinx7 lib 107, sv lib 228, sim lib 32, all green with
+pipefail-guarded result lines. No behavior change (no test
+change: log-only turn).
