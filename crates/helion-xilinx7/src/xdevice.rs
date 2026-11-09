@@ -963,6 +963,10 @@ impl<'a> EmitDevice for XDevice<'a> {
             .unwrap_or_default()
     }
 
+    fn required_features(&self) -> Vec<String> {
+        self.device.required_features().to_vec()
+    }
+
     fn ioi_tile(&self, iob_tile: &str) -> Option<String> {
         // Same bank side (L/R), same row (grid_y), nearest column: the
         // IOI tile sits one over from its IOB tile (e.g. RIOB33_X73Y45

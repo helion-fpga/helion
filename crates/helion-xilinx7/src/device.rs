@@ -185,6 +185,11 @@ pub struct Device {
     tiles_by_type: Vec<Vec<usize>>,
     package_pins: HashMap<String, PackagePin>,
     part: PartInfo,
+    /// Static always-on housekeeping features from the part directory's
+    /// `required_features.fasm` (e.g. `CFG_CENTER_MID.ALWAYS_ON_PROP*`):
+    /// nothing in the design references them, so they cannot be derived
+    /// from routing and are emitted unconditionally.
+    required: Vec<String>,
     nodes: UnionFind,
     /// Tile types present in the grid with no DB files (e.g. `NULL`, `VBRK`).
     pub missing_db_types: Vec<String>,
@@ -228,6 +233,24 @@ impl Device {
         let part = load_part(&partdir.join("part.json"))?;
         let pins_text = read_text(&partdir.join("package_pins.csv"))?;
         let pins = parse_package_pins(&pins_text)?;
+        // The part's static always-on features. A missing file warns
+        // rather than errors: plenty of part directories ship without
+        // one, but then the bitstream quietly omits mandatory bits.
+        let required = match std::fs::read_to_string(partdir.join("required_features.fasm")) {
+            Ok(text) => text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+                .collect(),
+            Err(_) => {
+                eprintln!(
+                    "device: warning: no required_features.fasm for this part, \
+                     always-on configuration bits will not be emitted"
+                );
+                Vec::new()
+            }
+        };
 
         let mut dev = Self {
             tiles: Vec::new(),
@@ -238,6 +261,7 @@ impl Device {
             tiles_by_type: Vec::new(),
             package_pins: HashMap::new(),
             part,
+            required,
             nodes: UnionFind::default(),
             missing_db_types: Vec::new(),
         };
@@ -711,6 +735,12 @@ impl Device {
         } else {
             None
         }
+    }
+
+    /// Static always-on features from `required_features.fasm`, emitted
+    /// unconditionally (they cannot be derived from routing).
+    pub fn required_features(&self) -> &[String] {
+        &self.required
     }
 
     /// Number of distinct electrical nodes after stitching.

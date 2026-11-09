@@ -357,6 +357,14 @@ fn blinky_reg_carry_e2e_fasm() {
         fasm_text.contains("CLBLM_R_X71Y39.SLICEL_X1.ALUT.INIT[63:0] = 64'hFF00FF0000000000"),
         "transit S0 AND INIT"
     );
+    // Part always-on bits from required_features.fasm: static, not
+    // derivable from routing, emitted unconditionally.
+    for prop in ["ALWAYS_ON_PROP1", "ALWAYS_ON_PROP2", "ALWAYS_ON_PROP3"] {
+        assert!(
+            fasm_text.contains(&format!("CFG_CENTER_MID_X123Y84.{prop}")),
+            "always-on {prop}"
+        );
+    }
     assert_eq!(fasm_text.matches("FFMUX.XOR").count(), 26, "chain FF D muxes");
     // Tail placement: bit 24 on Y44 X1-D, LD0 on Y45 X0-A, no fabric LD0.
     assert!(
