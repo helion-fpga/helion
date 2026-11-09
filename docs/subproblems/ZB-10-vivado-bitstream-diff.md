@@ -1088,3 +1088,26 @@ proven pre-existing on the clean base (stashed re-run fails
 identically; unrelated FFSYNC/ZRST emit assertions). No
 behavior change beyond the 28 bits. Next: HCLK word-50
 derivation from local samples, then named route bits.
+
+## Thirty-second run (Nov 9, 2026, Mac, leaf/input codes landed, 456 to 412)
+
+Scanned all HCLK tiles for words stable across 8 diverse builds
+(2017.3, 2022.1, oracle; single/multi-clock; BOT/TOP loads; BUFG
+and BUFH clocks; three directive variants) and found six: the
+HCLK_L leaf-buffer pair, the HCLK_CMT_L feed word, and three
+HCLK_IOI3 clock-input words, all version-stable and
+netlist-stable. Holdouts confirmed the split: input codes hold
+for every topology (shared Y9 input path), leaf codes only for
+BOT taps (TOP taps use different leaf tiles, unmeasured).
+Extended clkdist with leaf_codes (trunks 0-1, BOT R8, gated
+elsewhere) and input_codes (fixed full words, single-clock
+gate), hooked both into the carry e2e assembly next to the
+HROW codes, failing-first assertions failed before and pass
+after (all six words now bit-exact). rawdiff: 412 (134 named,
+278 unnamed, 15 unclaimed), down exactly the 44 new bits. Full
+xilinx7 suite: 111 lib + all integration green except the two
+ff_control_bits failures proven pre-existing on the clean base.
+No behavior change beyond the 44 bits. Next: per-load HCLK
+delay-tap rule (needs load-to-minor mapping), then named route
+bits. Cluster tunnel still down; G4-G7 and 2022.1 probe data
+stranded.
