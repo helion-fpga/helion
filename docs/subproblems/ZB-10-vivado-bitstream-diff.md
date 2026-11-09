@@ -680,3 +680,59 @@ Remainder stands: 350 word-50 route detail (per-column encoding,
 needs Vivado fuzzing), 134 named route choice (needs cost model).
 Gates: xilinx7 lib 107, sv lib 228, sim lib 32, all green with
 pipefail-guarded result lines. No behavior change.
+
+## Nineteenth run (Nov 9, 2026, Mac, PIP-level route survey, 484 held)
+
+Rebuilt with no env setup (e2e green), rawdiff re-verified at 484
+(record /tmp/x7/carry_vs_oracle_diff34.json, identical to diff33).
+Session goal reactivated by user request: Vivado-equivalent
+bitstreams from the native bitgen for a variety of programs, plus a
+ZedBoard blinky flash. Loop continues with yesterday's methods
+(rebuild, rawdiff, measured probes, gates, log, commit).
+
+PIP-level survey of the detour tiles (X69-73, Y36-48, both designs;
+records /tmp/x7/pip_detour_gt_ours.json, /tmp/x7/chain_pips.json,
+/tmp/x7/nets_gt.json, /tmp/x7/nets_ours.json; scratch scripts
+removed after use):
+
+- The 134 named bits collapse to 61 PIP features (34 GT-only, 27
+  ours-only), all INT_R/INT_L. Placement, slices, INITs match 100
+  percent (zero named CLB bits).
+- M-datapath proven identical: every M-side IMUX (4/12/13/34/35/43)
+  selects the same source in both designs in every row Y39-45, and
+  all same-tile driver PIPs are shared (absent from the diff). The
+  counter core Graham Bell identical in routing, not just structure.
+- Only L-side IMUX42/IMUX5 (L-D6/L-A6) differ, in a rigid per-row
+  pattern Y40-43: GT takes south-neighbor flop bits (IMUX42 from
+  OUTS4 below via SW2 west plus ER1 ring east, IMUX5 from OUTS5
+  below via NL1 north plus FAN tap), ours takes local/east bits
+  (IMUX42 from OUTS7 same tile via SR1, IMUX5 from the X72 east
+  detour via NW2). Each link verified against tileconn; NL1BEG_N3
+  is local-only (same-tile FAN taps), NL1BEG0 north is occupied by
+  OUTS5, which is why the south bit cannot go north directly.
+- L-OUTS pins are undriven in Y40-43 in both designs, so L-lane
+  outputs are unobservable there; only Y44-top feeds the LED path
+  in GT. M-IMUX sources never include L-OUTS, so L values cannot
+  reach the M chain through any configured input.
+- LED path: GT drives LD0 from L-DFF(Y44) through the ER1 ring
+  and NR1; ours drives it from M-AFF(Y45) through ER1 and NE2.
+  Derived equations give both the same 2^24-equivalent blink
+  (ours toggles its LD0 flop on the bit23 carry-out overflow).
+- carrysim assumes own-Q for LUT A6 and never checks actual wires,
+  so its verdict cannot adjudicate GT-vs-ours L-inputs; both pass
+  it trivially. The count_24/LD0 flop assignment question (same
+  BELs, possibly swapped logical bits) stays open: GT's Y45 SW2
+  dead-ends in empty X70Y46 in-window, and odd-index BOUNCE plus
+  some spans are absent from tileconn (the known tileconn gap).
+  Closing it needs a wire-accurate sim or silicon, not more
+  static tracing.
+- Net-tracing lessons recorded: tileconn covers boundary wires
+  only; regular spans verified empirically per link; a leaked loop
+  variable once nested a probe record (repaired, records intact).
+
+Remainder stands with upgraded mechanism (not cost-model-unknown):
+350 word-50 per-column route detail (needs Vivado fuzzing), 134
+named of which the M-core is proven identical and the rest is
+L-shadow plus LED-path variants with no derivable rule. Gates:
+xilinx7 lib 107, sv lib 228, sim lib 32, all green with
+pipefail-guarded result lines. No behavior change.
