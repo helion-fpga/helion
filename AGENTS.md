@@ -1120,6 +1120,35 @@ exactly like a `VCC_WIRE` tie. So:
 - **16 (Y41 + Y39 leftover)** — genuine A-vs-B router choices on the 4-unit
   cost tie already documented; free to match, no correctness impact.
 
+**VERIFIED by patch (round 2):** `work/bitpatch.py` on three dead-wire bits
+(`0x42228b:79`, `0x42230d:79`, `0x422308:79`) takes the diff **70 -> 67**,
+`altmux.py` still reports 0 double-selected on both sides, file length
+unchanged and readback matching. So the dead-wire bits are independent of
+everything else and setting them is side-effect-free -- the theory holds
+mechanically, it is only the *wisdom* of emitting them that is in question.
+Decision taken: defer until the small-design campaign says whether Vivado
+writes dead-wire arms in every design or only this one.
+
+Also worth knowing before re-deriving it: `FAN_ALT0` on Y42 is the ONE cluster
+where the ROUTER, not the backbone, is responsible -- `emit.rs` only ever
+writes `FAN_ALT{1,3,5}`, so `BYP_BOUNCE_N3_2 -> FAN_ALT0` is a real hop the
+router took and Vivado avoided. The pip's delay is `[0,0,0,0]` and `FAN_ALT0`
+has real fanout (`FAN0`, `FAN_BOUNCE0`), so this is a routing-efficiency
+difference, not a bug, and it is the closest thing in the residual to a
+genuine QoR question.
+
+Two traps in checking "is this wire dead", both hit this round and both give
+the WRONG answer if used alone:
+
+- Counting a wire as live because it appears as a `src_wire` in `pips` is
+  backwards -- that is what a dead wire does (it has fanout and no driver).
+  Liveness needs an incoming edge: a pip with `dst_wire == W`, or a tileconn
+  with `dst == W`.
+- Searching all `tile_type_*` files for the bare wire name crosses tile
+  instances. `INT_L.EL1END0` being driven says nothing about
+  `INT_R.EL1END0`; they are different wires on different tiles. Scope the
+  check to the tile type being questioned.
+
 **Practical consequence:** chasing the literal 0 down from 70 mostly means
 copying Vivado's arbitrary selection of dead-end wires. That is achievable —
 `emit` already special-cases the Y39 bottom row — but it is *encoding
