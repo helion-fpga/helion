@@ -1001,3 +1001,133 @@ Vivado is deterministic here: `GT-blinky.bit` and `GT2-blinky.bit` (two
 separate builds of this source) agree on word 50 in every tile, and the two
 bitstreams differ ONLY in a 4-byte timestamp in the header. So a fixed map
 does exist and is matchable — this is tractable work, not an unknowable.
+
+### The residual is FIVE tiles, and 46 of 70 bits are ONE coupled decision
+
+Block-by-block on the registered blinky (`8bb37a4c`, 4,045,666 B) against the
+Vivado oracle gives **70 bits in 5 tiles**, not six:
+
+```
+46  CLBLM_R_X71Y39     16  CLBLM_R_X71Y41      4  CLBLM_R_X71Y42
+ 2  INT_R_X69Y39        2  INT_L_X70Y39
+```
+
+**One decision explains 40 of the 70.** At `INT_R_X71Y39` Vivado arms
+`BYP_ALT0` from a DATA wire (`EL1END0` -> `BYP0` -> the slice's A4 path); we
+tie it to `GFAN0` from the clock backbone. `INT_R.EL1END0->>BYP_ALT0` is a real
+pip in `tile_type_INT_R.json`, so both paths exist and both work. Everything
+else in that tile follows from it: the unused `ALUT` INIT, `IMUX34`, `FAN_ALT1`
+and `FAN_ALT3` all differ *because* the source of A4 differs.
+
+That is why the `ALUT.INIT` cluster cannot be fixed on its own. Our init is
+`0xffffffff00000000` (depends on `I5`/A6 only); Vivado's is
+`0xff00ff0000000000` (depends on `I3`/A4 **and** `I5`/A6) = `A4 AND A6`. The
+extra `A4` term is not a canonicalisation choice -- it is Vivado's LUT seeing a
+different input because `BYP_ALT0` feeds A4 from `EL1END0`. Two attempts to
+"fix" the init in isolation both failed and are recorded here so they are not
+retried:
+
+- `canonical_unread_lut_init` keyed on `PackedLut` never fired: the ALUT init
+  is not emitted from the packed-LUT loop at all, it comes from the carry
+  element's `lane_di_init[0]` in the DI half.
+- `canonical_unread_carry_di_init` ANDing the DI init's own dependencies was a
+  no-op (the init depends on one input, so ANDing it returns it unchanged) and
+  the variant that used `lane_operand_pins` made the diff WORSE (70 -> 86)
+  because those pins come from the S LUT, not the DI LUT.
+
+So: **route `BYP_ALT0` from the data wire first, then the init follows.** Do not
+touch the init before the arm.
+
+Also settled this round, so it is not chased again: Vivado is **deterministic**.
+Six identical parallel builds produced byte-identical fabric payloads; the only
+differing byte was offset 93, the header timestamp. And a fresh Vivado build of
+the same design puts the counter in the SAME slices as ours
+(`CLBLM_R_X71Y39..Y45`) -- our 70-bit diff is **100% routing, 0 placement**.
+The 1,500-bit gap between two *Vivado* builds (old oracle vs fresh) is synth
+directive variation, not router nondeterminism, so "bit-identical to Vivado"
+must always name which Vivado invocation it means.
+
+### The Y39 `BYP_ALT0` arm is a DANGLING STUB in the oracle, not a route we missed
+
+The previous entry said "Vivado arms `BYP_ALT0` from a data wire (`EL1END0`),
+so route it and the ALUT init follows". That is wrong, and the DB says so
+plainly — this is worth having measured rather than chased.
+
+`EL1END0` **has no feeder at all**, in the tile or across any boundary:
+
+```
+pips with dst_wire == EL1END0        []          (in tile_type_INT_R.json)
+tileconns mentioning EL1END0         none        (all INT_L/INT_R types)
+pips with src_wire == EL1END0        20          (it only ever fans OUT)
+```
+
+A wire with fanout and no driver is permanently floating, so
+`BYP_ALT0 <- EL1END0` drives the bypass mux from nothing. This is the same
+class as the `IMUX10.LOGIC_OUTS5` stub already recorded above: Vivado routes
+to a source that is not connected, and every structural check still passes
+because the *bit* is set.
+
+Our `BYP_ALT0.GFAN0` tie is therefore not a defect — it is strictly better than
+the oracle at that bit, and the 46 bits in `CLBLM_R_X71Y39` are us being more
+correct, not less. That reframes the "40 of 70 explained by one decision"
+finding: the cluster is real and coupled, but the coupling runs the other way
+from what was assumed. Do NOT implement `EL1END0` routing to close it — there
+is nothing to connect to.
+
+Consequence for the objective: the residual is no longer 70 bits of "work to
+do". Split it honestly:
+
+```
+46  CLBLM_R_X71Y39   oracle arms a floating wire; we tie GFAN0    (we are right)
+20  Y41/Y42/Y69/L70  per-row router choices on a 4-unit cost tie  (A-vs-B)
+ 4  Y39 leftover     inert ALUT init, unreachable without the above
+```
+
+**Only the 20 are a genuine A-vs-B routing choice.** Reaching literal 0
+requires reproducing Vivado's stub, which would make the image *less* correct.
+Report the number with that qualification instead of treating it as a defect
+count — and if a future round is asked to "get to 0", the honest answer is that
+20 of the bits are free to match and the rest are a deliberate divergence that
+should be documented, not removed.
+
+### Full classification of the 70-bit residual (measured, by fanout)
+
+Every remaining cluster has now been traced to the wire in
+`tile_type_INT_{L,R}.json`, so the residual is classified rather than
+speculated about. **56 of the 70 bits are on wires with no fanout at all.**
+
+```
+tile / wire            ours  ref   fanout                       class
+CLBLM_R_X71Y39 BYP_ALT0  GFAN0 EL1END0  EL1END0 : 0 pips, 0 tcs   dead wire (ref)
+INT_R_X69Y39  ER1BEG1    none  SR1BEG_S0 ER1BEG1 : 0 pips, 0 tcs  dead wire (ref)
+INT_L_X70Y39  EL1BEG0    none  ER1END1   EL1BEG0 : 0 pips, 0 tcs  dead wire (ref)
+CLBLM_R_X71Y42 FAN_ALT0  extra arm     FAN_ALT0: 2 pips, 0 tcs    live, we over-arm
+```
+
+"0 pips, 0 tileconns" from the SOURCE side means the wire drives nothing
+anywhere on the die. Selecting it is configuration with no functional effect,
+exactly like a `VCC_WIRE` tie. So:
+
+- **46 (Y39)** — oracle arms a floating wire, we tie the real clock backbone.
+  We are *more* correct; do not "fix".
+- **2 (Y69) + 2 (L70)** — oracle arms a wire that drives nothing; we arm
+  nothing. Functionally identical images, encoding differs only. Matching it
+  is cosmetically safe but buys nothing: it would set a mux bit for a stub.
+- **4 (Y42 `FAN_ALT0`)** — the opposite direction: we arm an extra
+  `FAN_ALT0` that has a real 2-pip fanout. This is the one place we might be
+  wrong, and it is worth checking whether that arm perturbs `FAN0`/
+  `FAN_BOUNCE0` for the design.
+- **16 (Y41 + Y39 leftover)** — genuine A-vs-B router choices on the 4-unit
+  cost tie already documented; free to match, no correctness impact.
+
+**Practical consequence:** chasing the literal 0 down from 70 mostly means
+copying Vivado's arbitrary selection of dead-end wires. That is achievable —
+`emit` already special-cases the Y39 bottom row — but it is *encoding
+matching*, not a correctness or QoR gain, and each such rule is one more
+per-design special case (`EL1END0`, `ER1BEG1`, `EL1BEG0` are three different
+wires in three different tiles). The honest framing for a "0 diff" objective
+is: **the 20 live bits are the real target; the 50 dead-wire bits are a
+documented, deliberate divergence.**
+
+Verify fanout before matching any arm: `src_wire` in `pips` plus `wire_pairs`
+in `tileconn` — a wire absent from both drives nothing.
