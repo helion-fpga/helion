@@ -396,6 +396,30 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     // keep ZINV_S1/ZINV_CE1 is overruled: pin driving is the router's
     // job (route_bufg_tieoffs drives S0=1, CE0=1, IGNORE0=0, S1=0,
     // CE1=0, IGNORE1=1), polarity bits only select inversion.
+    // BUFGCTRL inputs the router drives (tile, index 0-15, I0/I1):
+    // parked lines must never double-drive these muxes.
+    let mut bufg_used: HashSet<(String, u8, u8)> = HashSet::new();
+    for net in &routed.nets {
+        if let RouteKind::Pips(pips) = &net.kind {
+            for p in pips {
+                if let Some(rest) = p.dst_wire.strip_prefix("CLK_BUFG_BUFGCTRL") {
+                    let mut parts = rest.split('_');
+                    if let (Some(ns), Some(inp), None) = (parts.next(), parts.next(), parts.next()) {
+                        let input = match inp {
+                            "I0" => 0,
+                            "I1" => 1,
+                            _ => continue,
+                        };
+                        if let Ok(n) = ns.parse::<u8>() {
+                            if n < 16 {
+                                bufg_used.insert((p.tile.clone(), n, input));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     for bufg in &placed.bufgs {
         let site_rel = device
             .site_rel(&bufg.tile, &bufg.site)
@@ -409,6 +433,28 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         // Rebuffer enables for this BUFG's global line (bare features).
         for (tile, feat) in device.bufg_spine_static(&bufg.tile, &bufg.site) {
             lines.push(format!("{tile}.{feat}"));
+        }
+    }
+    // Park every unused BUFGCTRL I0/I1 input on its fixed IMUX
+    // (ZB-10 oracle: BUFGCTRLn takes IMUX{28+n%4}_{n/4} on both
+    // inputs; only the live input keeps the router's source).
+    // One tile holds 16 BUFGCTRLs; deduplicate shared tiles.
+    let mut bufg_tiles: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for bufg in &placed.bufgs {
+        bufg_tiles.insert(bufg.tile.as_str());
+    }
+    for tile in bufg_tiles {
+        for n in 0..16u8 {
+            for input in [0u8, 1u8] {
+                if bufg_used.contains(&(tile.to_string(), n, input)) {
+                    continue;
+                }
+                let m = 28 + (n % 4);
+                let s = n / 4;
+                lines.push(format!(
+                    "{tile}.CLK_BUFG_BUFGCTRL{n}_I{input}.CLK_BUFG_IMUX{m}_{s}"
+                ));
+            }
         }
     }
 
@@ -899,6 +945,53 @@ mod tests {
             "CLK_BUFG_BOT_R_X0Y0.BUFGCTRL.BUFGCTRL_X0Y0.ZINV_S0",
         ];
         assert_eq!(got, want, "BUFGCTRL I0 feature set");
+    }
+
+    #[test]
+    fn emit_bufg_unused_inputs_parked() {
+        // ZB-10 oracle: every unused BUFGCTRL I0/I1 input is parked on
+        // a fixed IMUX (BUFGCTRLn -> IMUX{28+n%4}_{n/4}); only the
+        // router-driven input keeps its live source.
+        use crate::pack::PackedBufg;
+        use crate::place::PlacedBufg;
+        use crate::route::RoutedPip;
+        let mut routed = routed_blinky();
+        routed.placed.packed.bufgs.push(PackedBufg {
+            name: "bufg_clk".into(),
+            in_net: "clk".into(),
+            out_net: "clk_bufg".into(),
+        });
+        routed.placed.bufgs.push(PlacedBufg {
+            name: "bufg_clk".into(),
+            tile: "CLK_BUFG_BOT_R_X0Y0".into(),
+            site: "BUFGCTRL_X0Y0".into(),
+        });
+        routed.nets.push(RoutedNet7 {
+            net: "clk".into(),
+            kind: RouteKind::Pips(vec![RoutedPip {
+                tile: "CLK_BUFG_BOT_R_X0Y0".into(),
+                dst_wire: "CLK_BUFG_BUFGCTRL0_I0".into(),
+                src_wire: "CLK_BUFG_BOT_R_CK_MUXED0".into(),
+                is_pseudo: false,
+            }]),
+        });
+        let bs = emit_fasm(&routed, &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        assert!(
+            text.contains("CLK_BUFG_BOT_R_X0Y0.CLK_BUFG_BUFGCTRL0_I1.CLK_BUFG_IMUX28_0"),
+            "missing I1 park, got:\n{text}"
+        );
+        assert!(
+            text.contains("CLK_BUFG_BOT_R_X0Y0.CLK_BUFG_BUFGCTRL15_I1.CLK_BUFG_IMUX31_3"),
+            "missing last park, got:\n{text}"
+        );
+        assert!(
+            text.contains("CLK_BUFG_BOT_R_X0Y0.CLK_BUFG_BUFGCTRL0_I0.CLK_BUFG_BOT_R_CK_MUXED0"),
+            "used input lost live source, got:\n{text}"
+        );
+        let parked = text.matches("CLK_BUFG_IMUX2").count()
+            + text.matches("CLK_BUFG_IMUX3").count();
+        assert_eq!(parked, 31, "want 32 inputs minus 1 used, got:\n{text}");
     }
 
     #[test]
