@@ -275,7 +275,7 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     // polarity, but S0/S1/CE0/CE1/IGNORE0/IGNORE1 are routing inputs: left
     // undriven, the BUFGCTRL output freezes at INIT_OUT with no toggle
     // (UG472 Table 2-3), the observed "done=1, LEDs dark" failure.
-    route_bufg_tieoffs(placed, device, &mut nets)?;
+    route_bufg_tieoffs(placed, device)?;
 
     // Clock spine stitching per BUFGCTRL: O exit to the global line plus
     // REBUF stitches. Without these the clock never leaves the BUFG site.
@@ -295,72 +295,21 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     })
 }
 
-/// Route constant 1/0 to every placed BUFGCTRL's control pins.
+/// Validate every placed BUFGCTRL's tie-off path, but emit no fabric
+/// tie-off nets.
 ///
-/// Appends one synthetic net per BUFGCTRL per constant
-/// (`__tieoff_<site>_1`, `__tieoff_<site>_0`). Fails loudly on any
-/// conflict: a tie-off IMUX/GFAN wire already used by other logic would
-/// short the constant (or be shorted by it).
-fn route_bufg_tieoffs(
-    placed: &Placed7,
-    device: &dyn RouteQuery,
-    nets: &mut Vec<RoutedNet7>,
-) -> Result<(), String> {
-    // Wires already used by routed pips, per tile (rails excluded:
-    // VCC_WIRE/GND_WIRE are always-on and shareable).
-    let mut used: HashSet<(String, String)> = HashSet::new();
-    for net in nets.iter() {
-        if let RouteKind::Pips(pips) = &net.kind {
-            for p in pips {
-                for w in [&p.src_wire, &p.dst_wire] {
-                    if w != "VCC_WIRE" && w != "GND_WIRE" {
-                        used.insert((p.tile.clone(), w.clone()));
-                    }
-                }
-            }
-        }
-    }
+/// The ZB-10 oracle programs zero tie-offs device-wide (a power-IMUX
+/// scan of golden finds none, not even for BUFG controls): IGNORE1
+/// masks S1/CE1, and the HIGH pins match the IMUX default select, so
+/// fabric drive is redundant programming. The device query still runs
+/// so an unknown site (or a DB without a tie-off path) fails loudly
+/// here instead of silently under-driving the clock mux.
+fn route_bufg_tieoffs(placed: &Placed7, device: &dyn RouteQuery) -> Result<(), String> {
     for bufg in &placed.bufgs {
-        let tieoff = device.bufg_tieoff_pips(&bufg.site)?;
-        let mut claim = |pips: &[RoutedPip]| -> Result<(), String> {
-            for p in pips {
-                for w in [&p.src_wire, &p.dst_wire] {
-                    if w == "VCC_WIRE" || w == "GND_WIRE" {
-                        continue;
-                    }
-                    let key = (p.tile.clone(), w.clone());
-                    if used.contains(&key) {
-                        return Err(format!(
-                            "route: BUFGCTRL {} tie-off conflicts: wire {}.{} already used",
-                            bufg.site, p.tile, w
-                        ));
-                    }
-                }
-            }
-            for p in pips {
-                for w in [&p.src_wire, &p.dst_wire] {
-                    if w != "VCC_WIRE" && w != "GND_WIRE" {
-                        used.insert((p.tile.clone(), w.clone()));
-                    }
-                }
-            }
-            Ok(())
-        };
-        claim(&tieoff.ones)?;
-        claim(&tieoff.zeros)?;
-        let tag = bufg.site.to_ascii_lowercase();
-        if !tieoff.ones.is_empty() {
-            nets.push(RoutedNet7 {
-                net: format!("__tieoff_{tag}_1"),
-                kind: RouteKind::Pips(tieoff.ones),
-            });
-        }
-        if !tieoff.zeros.is_empty() {
-            nets.push(RoutedNet7 {
-                net: format!("__tieoff_{tag}_0"),
-                kind: RouteKind::Pips(tieoff.zeros),
-            });
-        }
+        // Validation only: an unknown site (or a DB without a tie-off
+        // path) still fails loudly. The paths themselves stay off
+        // fabric (see fn docs).
+        device.bufg_tieoff_pips(&bufg.site).map(|_| ())?;
     }
     Ok(())
 }
@@ -571,8 +520,8 @@ fn bfs_route(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pack::{IobDir, Packed7, PackedCarry, PackedFf, PackedIob, PackedLut};
-    use crate::place::{Placed7, PlacedCarry, PlacedFf, PlacedIob, PlacedLut};
+    use crate::pack::{IobDir, Packed7, PackedBufg, PackedCarry, PackedFf, PackedIob, PackedLut};
+    use crate::place::{Placed7, PlacedBufg, PlacedCarry, PlacedFf, PlacedIob, PlacedLut};
 
     struct FakeRouter;
     impl RouteQuery for FakeRouter {
@@ -890,6 +839,78 @@ mod tests {
         assert!(
             exempt.iter().any(|p| p.dst_wire == "BYP_ALT0" || p.src_wire == "BYP_ALT0"),
             "shortcut not taken, got {exempt:?}"
+        );
+    }
+
+    #[test]
+    fn bufg_tieoffs_stay_off_fabric() {
+        // ZB-10 oracle: a device-wide power-IMUX scan of golden shows
+        // zero tieoff programming, not even for BUFG controls (IGNORE1
+        // masks S1/CE1, HIGH pins match IMUX defaults). The router must
+        // not emit __tieoff nets even when the device offers paths.
+        struct TieoffDevice;
+        impl RouteQuery for TieoffDevice {
+            fn pips_from(&self, tile: &str, wire: &str) -> Vec<(String, String, bool)> {
+                FakeRouter.pips_from(tile, wire)
+            }
+            fn node_wires(&self, tile: &str, wire: &str) -> Vec<(String, String)> {
+                FakeRouter.node_wires(tile, wire)
+            }
+            fn site_pin_wire(&self, site: &str, pin: &str) -> Option<(String, String)> {
+                FakeRouter.site_pin_wire(site, pin)
+            }
+            fn wire_for_site_pin(&self, site: &str, pin: &str) -> Vec<(String, String)> {
+                if (site, pin) == ("BUFGCTRL_X0Y0", "I0") {
+                    return vec![("INT_X0".into(), "B".into())];
+                }
+                FakeRouter.wire_for_site_pin(site, pin)
+            }
+            fn is_clock_net(&self, net: &str) -> bool {
+                FakeRouter.is_clock_net(net)
+            }
+            fn bufg_tieoff_pips(&self, _: &str) -> Result<BufgTieoff, String> {
+                Ok(BufgTieoff {
+                    ones: vec![RoutedPip {
+                        tile: "INT_X0".into(),
+                        dst_wire: "IMUX0".into(),
+                        src_wire: "VCC_WIRE".into(),
+                        is_pseudo: false,
+                    }],
+                    zeros: vec![RoutedPip {
+                        tile: "INT_X0".into(),
+                        dst_wire: "GFAN0".into(),
+                        src_wire: "GND_WIRE".into(),
+                        is_pseudo: false,
+                    }],
+                })
+            }
+            fn bufg_spine(&self, site: &str) -> Result<BufgSpine, String> {
+                FakeRouter.bufg_spine(site)
+            }
+        }
+        let mut placed = placed_two_site();
+        // BUFG taps the existing n1 net (driven by u_inv) and drives
+        // clk_bufg into an output pad, so every net has a driver.
+        placed.packed.bufgs.push(PackedBufg {
+            name: "b".into(), in_net: "n1".into(), out_net: "clk_bufg".into(),
+        });
+        placed.bufgs.push(PlacedBufg {
+            name: "b".into(), tile: "CLK_X".into(), site: "BUFGCTRL_X0Y0".into(),
+        });
+        placed.packed.iobs.push(PackedIob {
+            name: "obuf_clk".into(), port: "c".into(), dir: IobDir::Out,
+            net: "clk_bufg".into(), loc: None, iostandard: "LVCMOS33".into(),
+            drive: None, slew: None,
+        });
+        placed.iobs.push(PlacedIob {
+            name: "obuf_clk".into(), port: "c".into(), dir: IobDir::Out,
+            tile: "IOB_T".into(), site: "IOB_X1".into(),
+        });
+        let routed = route(&placed, &TieoffDevice).unwrap();
+        assert!(
+            routed.nets.iter().all(|n| !n.net.starts_with("__tieoff")),
+            "tieoff nets on fabric: {:?}",
+            routed.nets.iter().map(|n| &n.net).collect::<Vec<_>>()
         );
     }
 

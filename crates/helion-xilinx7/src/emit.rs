@@ -393,9 +393,10 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     // (GT-blinky.bit): IN_USE, ZINV_CE0, ZINV_S0, IS_IGNORE1_INVERTED.
     // ZINV_S1/ZINV_CE1 belong to the I1 path and Vivado does not set
     // them here; neither does it set ZPRESELECT_I0. The old advice to
-    // keep ZINV_S1/ZINV_CE1 is overruled: pin driving is the router's
-    // job (route_bufg_tieoffs drives S0=1, CE0=1, IGNORE0=0, S1=0,
-    // CE1=0, IGNORE1=1), polarity bits only select inversion.
+    // keep ZINV_S1/ZINV_CE1 is overruled, and there is no fabric
+    // drive at all: the ZB-10 oracle programs zero tie-offs
+    // device-wide (IGNORE1 masks S1/CE1, HIGH pins match IMUX
+    // defaults), so polarity bits only select inversion.
     // BUFGCTRL inputs the router drives (tile, index 0-15, I0/I1):
     // parked lines must never double-drive these muxes.
     let mut bufg_used: HashSet<(String, u8, u8)> = HashSet::new();
