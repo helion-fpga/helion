@@ -577,3 +577,56 @@ choice with no derivable rule from one sample, so it stays parked
 with the cost-model work.
 Gates: xilinx7 lib 107, sv lib 228, sim lib 32, all green with
 pipefail-guarded result lines. No behavior change.
+
+## Seventeenth run (Nov 9, 2026, Mac, multi-sample word-50 campaign, 484 held)
+
+Rebuilt with no env setup (e2e green), rawdiff re-verified at 484
+(record /tmp/x7/carry_vs_oracle_diff32.json, bit-identical to diff31:
+484 bits, 382 clusters, 134 named, 350 unnamed). Deterministic rebuild
+confirmed across days.
+
+GT2 killed as a second sample: rawdiff GT-blinky.bit vs GT2-blinky.bit
+is 0 bits (record /tmp/x7/gt_vs_gt2.json). The md5s differ only in .bit
+header timestamps; Vivado 2023.2 is payload-deterministic for this
+source, so GT2 carries no new information.
+
+New independent samples from the A3 coursework builds (all Vivado
+2023.2, 7z020clg484, md5-verified): fa4b_dataflow (a2bfcb03),
+fa4b_structural (fec193838, same design, different RTL style), and
+bcd_2_bin (65430953). Probes in /tmp/x7/w50_probe.py, w50_fullmap.py,
+w50_correlate.py, w50_tilecorr.py, fadiff.py (scratch, uncommitted).
+
+Findings, all measured:
+
+- Word 50 is the HCLK tile's own config word: every column frame gives
+  50 tiles words 0-49, the HCLK tile word 50 (off=50, words=1), and 50
+  tiles words 51-100. Confirmed in tilegrid claims and in the
+  prjxray configuration docs (101 words: 100 for connected tiles, 1
+  for the horizontal clock row).
+- The 350 word-50 diffs split four ways across the samples: 46 set in
+  ALL four Vivado bitstreams (all 13 CFG_CENTER_MID bits plus 33 in
+  HCLK_R_X175Y26 / HCLK_IOI3_X185Y26, record
+  /tmp/x7/w50_universal.json), 255 only in blinky (clocked bottom
+  region), 35 fa-only, 14 bcd-only. Chip-wide word-50 counts are
+  GT 356, faD 554, faS 520, bcd 614, ours 6 (all 6 match GT).
+- Each design programs the HCLK rows of the regions it uses: GT only
+  the Y26 row, fa/bcd the Y78/Y130 rows plus right-edge IO tiles.
+  faD vs faS (same design) agree everywhere except HCLK_R_X175Y78
+  (122 vs 104 bits), while their used-tile sets are identical and
+  differ by one route word in INT_R/CLBLM_R_X71Y94, the same column
+  whose frames carry that HCLK tile's word. So the HCLK word tracks
+  per-column route detail, not mere tile usage; per-row-usage and
+  per-frame-ECC models both die on this pair (same rows used, six
+  frames flip for a one-word route delta).
+- Our FASM emits zero HCLK features and golden decodes zero named
+  HCLK features on these tiles, so the 200-line segbits_hclk DB is
+  silent on all of it. No derivable rule exists from four samples:
+  the 46 universals stay unimplemented (a measured constant without
+  a mechanism is hardcoding, not a rule), and the column-detail
+  encoding needs controlled Vivado fuzzing or many more clocked
+  samples to derive.
+
+Remainder stands, reclassified with evidence: 46 universal-default,
+255 clock-region route detail, 49 IO/bank route detail, 134 named
+route choice. Gates: xilinx7 lib 107, sv lib 228, sim lib 32, all
+green with pipefail-guarded result lines. No behavior change.
