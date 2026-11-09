@@ -860,3 +860,37 @@ Remainder stands: 350 word-50 (unfuzzed HCLK minors 6-25),
 134 named (cost function), 15 trailing minors. Gates: xilinx7
 lib 107, sv lib 228, sim lib 32, all green with pipefail-guarded
 result lines. No behavior change (log-only turn).
+
+## Twenty-third run (Nov 9, 2026, Mac, LED-tap structure, 484 held)
+
+Rebuilt with no env setup (e2e green), rawdiff re-verified at 484
+(record /tmp/x7/carry_vs_oracle_diff38.json). Chased the LED-path
+bucket to the bottom and it is structural, not a rule.
+
+Our LD0 flop is Y45-X0-AFF (D = XOR of S and carry24); golden's
+is Y44-L-DFF (D = Q24 via ER1 ring tour back into its own tile).
+IOB proximity predicts ours (2 tiles away) over golden (3), so
+proximity is dead. Mid-investigation a dark-LED pulse was derived
+from a misread S wire (S assumed GND-tied) and then disproved
+from our own FASM lines 507-513: OUTS4 to NL1BEG_N3 to FAN_ALT1
+to FAN_BOUNCE1 to IMUX4 to M_A6, with ALUT INIT upper half all
+ones, gives S0 = LD0's own Q. So ours toggles on overflow
+(period and duty equal to golden's Q24 square, one cycle phase
+lead): no silicon bug, and the standing sim/test story holds.
+The existing test gap is noted honestly: 5000-cycle cone
+comparisons never reach 2^24, and the toggle test pins the
+S-feedback config, so the pulse-vs-toggle distinction would
+have been caught by neither had S really been 0.
+
+Bit-identity consequence: matching golden needs a route-fed D
+flop at Y44-L plus the perverse same-tile ring tour, which is
+unlearnable from any sample count. LED bucket parked with
+cause. Side consistency: our Y45 GFAN ties feed no pip at all,
+matching the tie-subset verdict that ties are consumerless
+parking.
+
+Remainder stands: 350 word-50 (unfuzzed HCLK minors),
+134 named (cost function plus structural LED), 15 trailing
+minors. Gates: xilinx7 lib 107, sv lib 228, sim lib 32, all
+green with pipefail-guarded result lines. No behavior change
+(log-only turn).
