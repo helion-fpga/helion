@@ -1020,3 +1020,30 @@ have, and it caps at the same DB ceiling anyway, so it could
 only audit our encoder, not reveal new bits. Gates: xilinx7
 lib 107, sv lib 228, sim lib 32, all green with pipefail-guarded
 result lines. No behavior change (log-only turn).
+
+## Twenty-ninth run (Nov 9, 2026, Mac, Vivado fuzzing window opened, 484 held)
+
+The SSH tunnel to the USF cluster is live and real Vivado runs
+there, so the license UNKNOWN blocker is being settled by
+experiment instead of speculation. Resolved the install layout
+(nested Vivado/2017.3 tree) and confirmed Vivado 2017.3 starts
+(Vivado v2017.3 SW Build 2018833). The cluster env already sets
+LM_LICENSE_FILE=27000@license2.rc.usf.edu, which Vivado reads.
+Also found a 2022.1-ep11 install, so both versions build the
+same RTL for a version-sensitivity comparison. No behavior
+change in Helion (log-only turn); diff baseline stays 484.
+
+Campaign (all jobs build xc7z020clg484-1 from the oracle RTL
+plus variants, non-project flow, full outputs: synth/placed/
+routed .dcp, route/timing/util/clock reports, routed Verilog,
+routed XDC with ROUTE strings, .bit, .bin):
+control17 (job 25297) blinky on 2017.3, control22 (25298)
+blinky on 2022.1, dr-place17/dr-route17/dr-xnd17 directive
+sweeps, ck3-17 (MMCM 3-clock design, multi-BUFG HCLK variety),
+bufh-17 (BUFHCE regional clock, HROW coverage), bufgloc-17
+(BUFG forced to BUFGCTRL_X0Y1). All 8 running across
+sccompute0-2. Next: pull routed XDC/DCP/bit files, derive the
+HCLK minor 6-25 and HROW non-BUFHCE mappings plus route-choice
+stats from Vivado's own outputs, then implement the next
+diff-grounded fix. Gates: suite re-verification deferred to
+the fix turn (no code touched).
