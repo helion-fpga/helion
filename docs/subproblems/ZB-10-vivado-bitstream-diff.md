@@ -952,3 +952,33 @@ Remainder stands: 350 word-50 (unfuzzed HCLK minors 6-25),
 corridor), 15 trailing minors. Gates: xilinx7 lib 107, sv lib
 228, sim lib 32, all green with pipefail-guarded result lines.
 No behavior change (log-only turn).
+
+## Twenty-sixth run (Nov 9, 2026, Mac, trailing minors, 484 held)
+
+Rebuilt with no env setup (e2e green), rawdiff re-verified at 484
+(record /tmp/x7/carry_vs_oracle_diff41.json). Attacked the 15
+trailing-minor bits plus the universal-constant question with
+the 12-design pool, and found the frame-ownership answer.
+
+Two false alarms died by arithmetic before acting: our supposed
+stray high bits in trailing words are set in golden too (bit 18
+shared, XOR clean), and the JSON was right all along. Real
+finding: trailing word-50 bits exist with zero decoded HROW
+features (RP blinker programs them with none), so the trail
+bits ARE HROW programming living entirely in unfuzzed trailing
+minors 26-28, same gap class as HCLK. The trail pattern tracks
+clock topology (BUFHCE sites, GCLK selects) across 16 HROW
+tiles in 11 designs, but learning that mapping needs
+clock-topology modeling, so it parks with the fuzzing bucket.
+Universal constants (CFG 0x40191a/b identical across GT, RP,
+faD, bcd) noted with strengthened N but left unimplemented per
+the standing anti-hardcode rule. Tooling trap fixed along the
+way: the plain FDRI parser silently returns garbage frames on
+compressed streams, so all loaders now branch on the header
+stamp (/tmp/x7/w50pool.py, hrowcensus.py).
+
+Remainder stands: 350 word-50 (unfuzzed HCLK minors),
+134 named (cost function, scenic tours, S-stub), 15 trailing
+(unfuzzed HROW minors, clock-topology modeled). Gates: xilinx7
+lib 107, sv lib 228, sim lib 32, all green with pipefail-guarded
+result lines. No behavior change (log-only turn).
