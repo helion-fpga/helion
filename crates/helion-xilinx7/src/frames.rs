@@ -421,6 +421,32 @@ impl FrameStore {
         Some(&self.words[i * WORDS_PER_FRAME..(i + 1) * WORDS_PER_FRAME])
     }
 
+    /// OR raw bit masks into frames: `(frame address, word index, mask)`.
+    ///
+    /// Covers configuration bits no segbits feature names (e.g. ZB-10
+    /// HROW trunk-distribution codes, measured from Vivado builds).
+    /// Unknown frames and out-of-range words fail loudly; masks that set
+    /// no new bits still count as applied when the frame and word exist.
+    pub fn apply_raw_bits(&mut self, bits: &[(u32, u32, u32)]) -> Result<usize, FramesError> {
+        let mut applied = 0usize;
+        for &(addr, word, mask) in bits {
+            let frame_idx = *self.index.get(&addr).ok_or_else(|| FramesError {
+                message: format!("raw bits: frame {addr:#010x} not in store"),
+            })?;
+            if word as usize >= WORDS_PER_FRAME {
+                return Err(FramesError {
+                    message: format!(
+                        "raw bits: word {word} outside 0..{WORDS_PER_FRAME}"
+                    ),
+                });
+            }
+            let slot = &mut self.words[frame_idx * WORDS_PER_FRAME + word as usize];
+            *slot |= mask;
+            applied += 1;
+        }
+        Ok(applied)
+    }
+
     /// Apply parsed FASM lines to the frames.
     ///
     /// Returns the number of features that resolved to segbits (pseudo-pips

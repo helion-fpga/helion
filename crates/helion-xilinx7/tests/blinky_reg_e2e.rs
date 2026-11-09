@@ -13,7 +13,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use helion_xilinx7::bitstream::{self, BitstreamOptions};
+use helion_xilinx7::clkdist::{self, HrowTap, HrowTile};
 use helion_xilinx7::device::{default_db_root, Device};
+use helion_xilinx7::route::RouteQuery;
 use helion_xilinx7::fasm::parse_fasm;
 use helion_xilinx7::frames::{
     full_device_addresses_from_dir, BlockType, FrameAddr, FrameStore, SegBitsDb,
@@ -400,6 +402,87 @@ fn blinky_reg_carry_e2e_fasm() {
     let mut store = FrameStore::new(&full);
     let applied = store.apply_fasm(&lines, &segbits, &layout).expect("apply FASM");
     assert!(applied > 0, "no FASM features applied");
+    // ZB-10 clock fuzz hook: HROW trunk-distribution raw codes from the
+    // routed clock spine (measured Vivado behavior, see clkdist). Only
+    // single-clock designs are in the measured domain; anything else
+    // keeps today's behavior (codes unset) rather than guessed bits.
+    if routed.placed.bufgs.len() == 1 {
+        let site = routed.placed.bufgs[0].site.clone();
+        let spine = xdev.bufg_spine(&site).expect("spine for clock hook");
+        if let Some(hp) = spine
+            .pips
+            .iter()
+            .find(|p| p.tile.contains("CLK_HROW"))
+        {
+            let tile = if hp.tile.contains("_BOT_") {
+                HrowTile::Bot
+            } else if hp.tile.contains("_TOP_") {
+                HrowTile::Top
+            } else {
+                panic!("clock hook: unexpected HROW tile {}", hp.tile);
+            };
+            let tail =
+                hp.dst_wire.rsplit("MUX_OUT_").next().expect("mux tail");
+            let (side_r, mux): (bool, u8) = match tail.strip_prefix('R') {
+                Some(n) => (true, n.parse().expect("R mux index")),
+                None => (
+                    false,
+                    tail.strip_prefix('L').expect("L mux").parse().expect("L mux index"),
+                ),
+            };
+            let tap = HrowTap { tile, side_r, mux };
+            if let Some(codes) = clkdist::hrow_codes(spine.gclk, &tap) {
+                let (bot_name, top_name) = clkdist::hrow_tile_names();
+                let home_name = match tap.tile {
+                    HrowTile::Bot => bot_name,
+                    HrowTile::Top => top_name,
+                };
+                assert_eq!(hp.tile, home_name, "HROW tile moved; remeasure clkdist");
+                let base = |t: &str| {
+                    layout
+                        .frame_addr(t, BlockType::ClbIoClk)
+                        .expect("hrow geometry")
+                        .baseaddr
+                };
+                let raw = vec![
+                    (base(bot_name) + 26, 50, codes.bot_26),
+                    (base(bot_name) + 27, 50, codes.bot_27),
+                    (base(top_name) + 27, 50, codes.top_27),
+                    (
+                        base(home_name) + u32::from(codes.tap_minor),
+                        50,
+                        codes.tap_code,
+                    ),
+                ];
+                let n = store.apply_raw_bits(&raw).expect("hrow raw codes");
+                assert_eq!(n, 4, "hrow raw codes applied");
+            }
+        }
+    }
+    // ZB-10 clock fuzz: Vivado programs HROW trunk-distribution codes in
+    // word 50 that no segbits feature names (12 single-trunk samples,
+    // GCLK0-3 x BOT/TOP taps, agreeing across 2017.3, 2022.1, oracle).
+    // The clkdist hook above must reproduce the oracle row exactly.
+    assert_eq!(
+        store.frame_words(0x00421080 + 26).expect("BOT m26")[50],
+        0x00041cb2,
+        "BOT HROW m26 trunk code"
+    );
+    assert_eq!(
+        store.frame_words(0x00421080 + 27).expect("BOT m27")[50],
+        0x000010cf,
+        "BOT HROW m27 trunk code"
+    );
+    assert_eq!(
+        store.frame_words(0x00421080 + 28).expect("BOT m28")[50],
+        0x008019b7,
+        "BOT HROW m28 tap code"
+    );
+    assert_eq!(
+        store.frame_words(0x00401080 + 27).expect("TOP m27")[50],
+        0x00000643,
+        "TOP HROW m27 through code"
+    );
 
     let payload = store.fdri_payload();
     let opts = BitstreamOptions {
