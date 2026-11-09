@@ -207,9 +207,9 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         if let Some(co) = &carry.co_net {
             add_ep(co.clone(), site.to_string(), "CO", true);
         }
-        if carry.cyinit_c0 {
-            // Chain head with CYINIT from config (golden PRECYINIT.C0):
-            // no net routes to CI; the pin stays unconnected.
+        if carry.cyinit.is_some() {
+            // Chain head with CYINIT from config (emit selects C0/C1 by
+            // value): no net routes to CI; the pin stays unconnected.
         } else if co_nets.contains(carry.ci_net.as_str()) {
             add_ep(carry.ci_net.clone(), site.to_string(), "CI", false);
         } else {
@@ -699,13 +699,13 @@ mod tests {
             dsps: vec![],
             carries: vec![
                 PackedCarry {
-                    name: "u_c0".into(), ci_net: "one".into(), cyinit_c0: false, co_net: Some("co0".into()),
+                    name: "u_c0".into(), ci_net: "one".into(), cyinit: None, co_net: Some("co0".into()),
                     s_nets: [Some("s0".into()), None, None, None],
                     di_nets: [None, None, None, None],
                     o_nets: [Some("o0".into()), None, None, None],
                 },
                 PackedCarry {
-                    name: "u_c1".into(), ci_net: "co0".into(), cyinit_c0: false, co_net: None,
+                    name: "u_c1".into(), ci_net: "co0".into(), cyinit: None, co_net: None,
                     s_nets: [Some("s1".into()), None, None, None],
                     di_nets: [None, None, None, None],
                     o_nets: [Some("o1".into()), None, None, None],

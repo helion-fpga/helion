@@ -391,3 +391,38 @@ equivalence test, then e2e plus rawdiff (expect about minus 60:
 32 X0-ALUT plus 16 X1-ALUT plus A-route features). No rushed carry
 edit this run per the wrong-Carry4 rule; bitstream and diff
 unchanged at 557.
+
+## Tenth run (Nov 8, 2026, Mac, head construction switch, 557 to 503)
+
+Implemented the ninth-run fix design with one scoping change: X1-A
+keeps a passthrough (I3-pass on A4, float-immune, sim-clean and
+silicon-clean) instead of golden's AND shape, which needs a float-high
+LUT-input rule in sim that collides with the standing equivalence
+rule. The 16 AND-shape bits stay open honestly.
+
+- helion-sv: head CYINIT flag 1 to 0; head S0 LUT to NOT-I2
+  (0x0f0f0f0f0f0f0f0f) on I2/A3; transit S0 LUT to I3-pass
+  (0xff00ff00ff00ff00) on I3/A4. Pins flow through the existing
+  I-to-A index machinery, no backend pin code touched.
+- pack: cyinit_c0 bool to cyinit Option<bool> with loud value
+  parsing; route/place/emit fixtures to None.
+- emit: value mapping (Some(true) to C1, Some(false) to C0) plus a
+  synthetic mapping test; the old unconditional C0 was the
+  silicon-freeze.
+- sim: undriven DI0 on a CYINIT=0 config head reads high in both
+  evaluators (AX-fed float path, golden-parity, oracle-blink
+  proven). Both cone tests (blinky 5000-cycle, 8-bit wrap) pass on
+  the new triple; they discriminate the rule (without it bit 1
+  sticks at cycle 2).
+- e2e: S-LUT passthrough count 49 to 47 plus explicit head and
+  transit INIT asserts at the golden tiles. Router reproduced
+  golden's exact IMUX1.LOGIC_OUTS4 and IMUX10.LOGIC_OUTS5; the old
+  FAN/WR1 A-feed detours are gone.
+- Gates: sv lib 228, sim lib 32, xilinx7 lib 106, all four e2e
+  (blinky_bit, carry, default reg, zedboard) green; determinism
+  re-verified (two identical FASM hashes across rebuilds).
+- Record /tmp/x7/carry_vs_oracle_diff23.json: 503 bits (59
+  ours-only, 444 ref-only). Y39-A closed except the parked 16
+  AND-shape bits. Remainder: HCLK (~350, license), S detours
+  (delay model, eighth run), X1-AND shape (16, sim float rule),
+  arrival quirks plus corridor plus CFG_CENTER smalls.

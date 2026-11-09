@@ -341,8 +341,21 @@ fn blinky_reg_carry_e2e_fasm() {
     assert_eq!(fasm_text.matches("CARRY4.ACY0").count(), 1, "head bit A only");
     assert_eq!(
         fasm_text.matches("64'hFFFFFFFF00000000").count(),
-        49,
-        "25 compute plus 16 pad-fill plus 3 tail-fill plus transit S0 plus 3 transit B/C/D plus LD0 S-LUTs"
+        47,
+        "24 compute plus 16 pad-fill plus 3 tail-fill plus 3 transit B/C/D plus LD0 S-LUTs (head S0 and transit S0 have their own shapes below)"
+    );
+    // Head S0 is the inverted propagate (NOT Q0 on A3, golden Y39X0
+    // ALUT shape): CYINIT is const-0, so a passthrough would stick bit
+    // 0 and freeze the chain on silicon.
+    assert!(
+        fasm_text.contains("CLBLM_R_X71Y39.SLICEM_X0.ALUT.INIT[63:0] = 64'h0F0F0F0F0F0F0F0F"),
+        "head S0 NOT-I2 INIT"
+    );
+    // Transit S0 is the Q1 passthrough on I3/A4 (golden Y39X1 ALUT
+    // position; only its AND gate shape stays open).
+    assert!(
+        fasm_text.contains("CLBLM_R_X71Y39.SLICEL_X1.ALUT.INIT[63:0] = 64'hFF00FF00FF00FF00"),
+        "transit S0 I3-pass INIT"
     );
     assert_eq!(fasm_text.matches("FFMUX.XOR").count(), 26, "chain FF D muxes");
     // Tail placement: bit 24 on Y44 X1-D, LD0 on Y45 X0-A, no fabric LD0.
