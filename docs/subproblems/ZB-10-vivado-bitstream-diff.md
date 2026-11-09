@@ -545,3 +545,16 @@ without a wirelength / delay cost model, so it parks with the rest.
 Remainder stands: HCLK unnamed (~330, license), detours both sides
 plus pad-A fill plus arrival (cost model), CFG_CENTER word-50 unnamed
 (license), corridor plus complements. No behavior change.
+
+## Fifteenth run (Nov 8, 2026, Mac, RIO slice classified, 484 held)
+
+Rebuilt with no env setup (e2e green), rawdiff re-verified at 484
+with identical cluster counts (record
+/tmp/x7/carry_vs_oracle_diff29.json: 382 clusters, 134 named, 350
+unnamed), confirming a deterministic rebuild. Remainder audit of the
+RIO slice: the 12 RIOB33 / RIOI3 records are tile-overlap artifacts,
+not IOB config divergence. Every one names INT_R route pips only
+(NR1BEG1 endpoints, IMUX34 BOUNCE selections at X73Y45-46); no
+OLOGIC / OMUX / IOB feature appears. Same parked detour class.
+Gates: xilinx7 lib 107, sv lib 228, sim lib 32, all green with
+pipefail-guarded result lines. No behavior change.
