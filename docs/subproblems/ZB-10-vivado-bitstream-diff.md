@@ -1065,3 +1065,26 @@ building (four BOT rows on GCLK0, three TOP rows on GCLK1-3)
 to complete the trunk-by-mux matrix, then the segment rule
 gets implemented, verified, and committed. No behavior change
 (log-only turn).
+
+## Thirty-first run (Nov 9, 2026, Mac, HROW fix landed, 484 to 456)
+
+Cluster tunnel dropped mid-session (socket gone, host
+unreachable), so trunk-extension samples G4-G7 and the 2022.1
+probe dumps are stranded until the tunnel is restored. Worked
+with complete local data instead: the HROW word-50 entry/tap
+code is fully determined for trunks 0-3 (12 agreeing samples
+across 2017.3, 2022.1, and the oracle, plus directive and row
+replicates; OR/XOR/stub-feed decompositions all provably fail,
+so the cell table is the derived mapping, gated to its measured
+domain). Implemented `clkdist::hrow_codes` plus
+`FrameStore::apply_raw_bits`, hooked into the carry e2e
+assembly from routed spine data (trunk from spine, tap from the
+HROW pip, tile pair cross-checked). Failing-first e2e
+assertions on the four oracle word-50 values failed before
+(left 0x40000) and pass after. rawdiff: 456 (134 named, 322
+unnamed, 15 unclaimed), down exactly the 28 HROW-region bits.
+Full xilinx7 suite green except two ff_control_bits failures
+proven pre-existing on the clean base (stashed re-run fails
+identically; unrelated FFSYNC/ZRST emit assertions). No
+behavior change beyond the 28 bits. Next: HCLK word-50
+derivation from local samples, then named route bits.
