@@ -17594,6 +17594,21 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         emit_iob(&mut d, &mut iob_n, &qnet, lhs);
     }
     if iob_n == 0 {
+        // Carry flow first: NBA-driven outputs consumed by carry stages
+        // never reach reg_bits (the fast-path branches skip it), but
+        // their stage FF Q nets are live single-driven nets. Prefer
+        // those over the last cone register bit.
+        for (n, dir, _) in &rtl.ports {
+            if *dir != PortDir::Out {
+                continue;
+            }
+            let qnet = bit_name(n, sig_width(rtl, n), 0);
+            if carry_ffs.iter().any(|(_, q)| q == &qnet) {
+                emit_iob(&mut d, &mut iob_n, &qnet, n);
+            }
+        }
+    }
+    if iob_n == 0 {
         // default: last register bit to first output
         if let (Some((n, _, _)), Some((qnet, _))) = (
             rtl.ports.iter().find(|(_, dir, _)| *dir == PortDir::Out),
@@ -18624,6 +18639,29 @@ mod tests {
         d.pin_index()
             .net_on(cell, pin)
             .map(|s| s.to_string())
+    }
+
+    #[test]
+    fn carry_top_load_drives_output_iob() {
+        // The top-load branch must not drop the registered output
+        // port: LD0 needs an IobOut fed by its stage FF Q, or the pin
+        // goes dark on silicon (ZB-10: golden drives T22 from the LD0
+        // FF through OLOGIC).
+        let d = carry_blinky_reg_design();
+        let iob = d
+            .cells
+            .iter()
+            .find(|c| {
+                matches!(c.kind, CellKind::IobOut)
+                    && cell_pin(&d, &c.name, "PAD").as_deref() == Some("LD0")
+            })
+            .expect("LD0 IobOut");
+        let i_net = cell_pin(&d, &iob.name, "I").expect("IOB I net");
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)
+                && cell_pin(&d, &c.name, "Q").as_deref() == Some(i_net.as_str())),
+            "LD0 IOB must sense a stage FF Q, got {i_net}"
+        );
     }
 
     #[test]
