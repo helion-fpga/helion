@@ -318,3 +318,32 @@ different column (placement freedom, open item), so positions differ
 even where encodings agree. Next: placement match to the golden
 column (CLBLM_R_X71Y39 upward), then a canonicalised per-cell
 comparison.
+
+## Eighth run (Nov 8, 2026, Mac, S24 detour root cause)
+
+Question: golden feeds Y44 S24 via OUTS3,ER1BEG_S0,ER1END1,IMUX42
+while ours uses a 5-pip FAN chain for the same net. Hypothesis was a
+router graph gap (missing stitch or pip). Disproven end to end:
+
+- The OUTS3,ER1BEG_S0 edge exists in tile_type_INT_R.json.
+- Independent Python union-find over tileconn.json plus tilegrid.json
+  reproduces our stitched node exactly (8 members incl. the queried
+  wire; ours reports the same 7 plus self). Stitching is bit-exact,
+  not truncated. ER1BEG_S0 and ER1END1 are simply different nodes:
+  the S0 turn joins row-45 line 0 east; END1 taps line 1 driven from
+  INT_L_X70Y44.
+- Full ER1 ring traced: OUTS3,WR1BEG_S0,WR1 node west,
+  WR1END_S1_0,SR1BEG_S0,ER1BEG1 (all X70Y44), line-1 node east back,
+  ER1END1,IMUX42 (Y44). 6 edges vs FAN 5. BFS by hop count
+  legitimately prefers FAN.
+- Contention map (same in both designs): SR1 carries the transit S
+  feed (OUTS7) and EE4BEG3 carries an S-feed exit, so the 2-pip SR1
+  path and the 3-pip EE4/WL1 dogleg are taken for both routers. The
+  divergence is purely second-choice: FAN vs ER1 ring.
+- GT2-blinky.bit (second Vivado build) is byte-identical to the
+  oracle (0 diff), so there is no second placement sample.
+
+Verdict: S-feed detours stay parked on a delay model. No code change
+this run; bitstream and diff unchanged at 557. Keeper test added:
+bfs_finds_shortest_s24_feed_on_real_graph pins the 2-pip SR1 path on
+the real xc7z020 graph (lib suite 105 passed).
