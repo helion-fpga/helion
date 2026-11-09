@@ -347,3 +347,47 @@ Verdict: S-feed detours stay parked on a delay model. No code change
 this run; bitstream and diff unchanged at 557. Keeper test added:
 bfs_finds_shortest_s24_feed_on_real_graph pins the 2-pip SR1 path on
 the real xc7z020 graph (lib suite 105 passed).
+
+## Ninth run (Nov 8, 2026, Mac, CYINIT root cause, no hardware needed)
+
+Question: PRECYINIT.C0 appears in both bitstreams, but our intent is
+CYINIT=1 while golden inverts S0. Both cannot be right under one C0
+meaning. Decisive evidence from Vivado's own synth netlist
+(CDA4253_A1/vivado-on-silicon-mac/blinky_proj/blinky.runs/synth_1/blinky.dcp,
+blinky.edf inside): head CARRY4 count_reg_0__i_1 has CYINIT on net
+&_const0_. So C0 is const-0, and the helion-sv comment claiming
+"proven 1" (lib.rs:16334) is backwards reasoning that must be fixed
+with the construction.
+
+Consequences, all verified by decode this run:
+
+- Golden triple (correct incrementer): CYINIT=0, S0 = NOT Q0
+  (X0-ALUT INIT = index mod 8 below 4; Q0 on A3 proven by
+  CLBLM_IMUX1 to CLBLM_M_A3 in tile_type_CLBLM_R.json), DI0 = 1
+  (no DI drive among all 261 plus 23 Y39 features, so undriven
+  float-high, which the blink-proven oracle confirms reads high).
+  Check: O0 = NOT Q0 xor 0 toggles, CO0 = (NOT Q0)?0:1 = Q0.
+- Golden S1..S3 are plain Q passthroughs (X0 B/C/D INIT exactly bits
+  32..63; routes IMUX12/IMUX35/IMUX43 already match ours), so X0
+  differs only in ALUT (32 bits of the joint symmetric difference).
+- X1-A is AND(Q1 via A4, float A6): INIT bits 40..47 plus 56..63,
+  pin proven by CLBLM_IMUX10 to CLBLM_L_A4. X1 differs only in gate
+  shape (16 bits), functionally identical under float-high.
+- Our triple (CYINIT=0 via C0, S0 = Q0 A6-passthrough, DI0 =
+  float-high 1): O0 = Q0 stuck, counter frozen. Our carry bitstream
+  is dead on silicon by construction. helion-sim passes because it
+  models the CYINIT=1 intent flag (sim lib.rs:162) and never reads
+  the emitted C0 bit: control-bit semantics are a hole in the
+  CARRY4 equivalence rule and must be covered by the fix test.
+- Our DI0 is undriven too (21 DI1MUX lines, zero DI0MUX in our
+  FASM), so float-high DI is already assumed by both designs.
+
+Fix design for the next turn (construction switch, carry flow only):
+flag head CYINIT 0, force head S0 LUT to NOT-Q on A3 and X1-A LUT
+to the AND shape on A4 at pack level (same forcing class as the
+transit trio), fix the emit mapping (flag 1 to C1, flag 0 to C0),
+leave DI undriven, model undriven-high in helion-sim with a cone
+equivalence test, then e2e plus rawdiff (expect about minus 60:
+32 X0-ALUT plus 16 X1-ALUT plus A-route features). No rushed carry
+edit this run per the wrong-Carry4 rule; bitstream and diff
+unchanged at 557.
