@@ -16412,14 +16412,14 @@ fn emit_carry_increment(
             d.connect(&tco, &pname, "CO");
             let ts = format!("u_carry_{lhs}_trs");
             d.connect(&ts, &pname, "S0");
-            // Transit S0 is a Q1 passthrough on I3 (A4 pin, golden Y39X1
-            // A route IMUX10 from OUTS5). I3-pass INIT 0xff00ff00ff00ff00
-            // (bits 8-15, 24-31, 40-47, 56-63) is float-immune (output
-            // depends on I3 alone), so sim and silicon agree exactly;
-            // only golden's AND gate shape (float A6, the I5=0 half)
-            // stays open. I5 stays unconnected and floats.
+            // Transit S0 is AND(Q1 on I3, float-high A6 on I5), golden
+            // Y39X1 ALUT shape 0xff00ff0000000000 (bits 40-47, 56-63).
+            // Under float-high (which the blink-proven oracle relies on
+            // for this exact pin) this reads exactly as a Q1 passthrough,
+            // and sim models undriven S-feed inputs high for the same
+            // reason. I5 stays unconnected and floats, like the oracle.
             let slut = format!("u_carry_{lhs}_trs_lut");
-            d.add_cell(&slut, CellKind::Lut6 { init: 0xFF00_FF00_FF00_FF00 });
+            d.add_cell(&slut, CellKind::Lut6 { init: 0xFF00_FF00_0000_0000 });
             d.connect(&ts, &slut, "O");
             d.connect(&bit_name(lhs, w, 1), &slut, "I3");
             // B/C/D (golden Y39X1 B<-bit2, C<-bit3, D<-east): AND-side
@@ -16442,10 +16442,10 @@ fn emit_carry_increment(
             // fed from sub-cone Q nets. Fill rule (provably exact: each
             // fill bit is 1 whenever the pad carry-in is 1, so CO=CY and
             // the pad is transparent): A takes the top Q of the compute
-            // group below (south entry, like the oracle NL1 loopback),
-            // B/C take that tile X0 C/D Qs (the oracle taps LOGIC_OUTS6/7
-            // directly), D repeats C. Floating I5 here would read S=0 and
-            // kill the chain above bit 8 (proven by the 5000-cycle sim).
+            // group below (south entry), B/C take that tile X0 C/D Qs
+            // (the oracle taps LOGIC_OUTS6/7 directly), D repeats C.
+            // Every pad S input stays routed (never floated) so sim and
+            // silicon agree bit for bit under the float-high model.
             let pname = format!("u_carry_{lhs}_pad{g}");
             d.add_cell(&pname, CellKind::Carry4);
             d.connect(format!("u_carry_{lhs}_co{g}"), &pname, "CI");
@@ -18754,9 +18754,9 @@ mod tests {
             cell_pin(&d, "u_carry_count_c6", "S2"),
             Some("u_carry_count_ts2".to_string())
         );
-        // Transit bridges g0 to g1 with a Q1 passthrough on S0 (I3/A4,
-        // float-immune I3-pass shape, not the I5 passthrough: golden
-        // Y39X1 A route IMUX10 comes from OUTS5).
+        // Transit bridges g0 to g1 with AND(Q1 on I3/A4, float-high A6
+        // on I5): golden Y39X1 ALUT shape, reading as a Q1 passthrough
+        // under float-high. Golden Y39X1 A route IMUX10 comes from OUTS5.
         assert_eq!(
             cell_pin(&d, "u_carry_count_transit", "CI"),
             Some("u_carry_count_co0".to_string())
@@ -18767,8 +18767,8 @@ mod tests {
             .find(|c| c.name == "u_carry_count_trs_lut")
             .expect("transit S0 LUT");
         assert!(
-            matches!(trs_lut.kind, CellKind::Lut6 { init: 0xFF00_FF00_FF00_FF00 }),
-            "transit S0 LUT is I3-pass, got {:?}",
+            matches!(trs_lut.kind, CellKind::Lut6 { init: 0xFF00_FF00_0000_0000 }),
+            "transit S0 LUT is AND(I3,I5), got {:?}",
             trs_lut.kind
         );
         assert_eq!(

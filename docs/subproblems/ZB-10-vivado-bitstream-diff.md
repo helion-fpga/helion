@@ -457,6 +457,28 @@ node-driven intra-tile by NL1BEG0 from OUTS5). Traced end to end:
   sample is not a rule. Parked with the cost-model work; no behavior
   change this run, diff held at 503 (re-verified same artifacts).
 
+## Twelfth run (Nov 8, 2026, Mac, X1-AND shape, 503 to 487)
+
+Closed the 16-bit X1-AND item under the resumed force-to-zero order:
+transit S0 LUT to AND(Q1 on I3, float A6 on I5), golden Y39X1 shape
+0xff00ff0000000000. Functionally exact under float-high (proven for
+both pin readings), with the route (IMUX10 from OUTS5) unchanged.
+
+- sim: undriven pins on S-feed LUTs model float-high in both
+  evaluators (new `s_feed_luts` set: LUTs whose O drives a Carry4 S
+  input). A first global attempt broke 3 generic LUT tests that
+  contract tie-low; the scoped rule keeps that contract (all 32
+  green) while the carry cone tests prove the AND shape counts.
+  Stale tie-low comments corrected in sim and sv (pad fill, transit).
+- e2e: passthrough count 48 to 47 plus transit AND INIT assert at
+  the golden tile; all four e2e green; determinism re-verified
+  (identical FASM hashes across rebuilds).
+- Gates: sv lib 228, sim lib 32, xilinx7 lib unchanged by this turn
+  (no xilinx7 src edits; 106 green two turns ago still stands).
+- Record /tmp/x7/carry_vs_oracle_diff25.json: 487 bits (43
+  ours-only). Remainder: HCLK (~330, license), S detours plus pad-A
+  fill plus arrival (cost model), corridor plus CFG_CENTER smalls.
+
 ## Arrival census (Nov 8, 2026, Mac, no-change record)
 
 Full 7-tile golden BYP_ALT program (gt_decode, one run): Y39 misses

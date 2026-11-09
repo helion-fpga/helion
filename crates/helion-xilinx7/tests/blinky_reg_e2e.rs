@@ -342,7 +342,7 @@ fn blinky_reg_carry_e2e_fasm() {
     assert_eq!(
         fasm_text.matches("64'hFFFFFFFF00000000").count(),
         47,
-        "24 compute plus 16 pad-fill plus 3 tail-fill plus 3 transit B/C/D plus LD0 S-LUTs (head S0 and transit S0 have their own shapes below)"
+        "24 compute plus 16 pad-fill plus 3 tail-fill plus 3 transit B/C/D plus LD0 (head S0 and transit S0 have their own shapes)"
     );
     // Head S0 is the inverted propagate (NOT Q0 on A3, golden Y39X0
     // ALUT shape): CYINIT is const-0, so a passthrough would stick bit
@@ -351,11 +351,11 @@ fn blinky_reg_carry_e2e_fasm() {
         fasm_text.contains("CLBLM_R_X71Y39.SLICEM_X0.ALUT.INIT[63:0] = 64'h0F0F0F0F0F0F0F0F"),
         "head S0 NOT-I2 INIT"
     );
-    // Transit S0 is the Q1 passthrough on I3/A4 (golden Y39X1 ALUT
-    // position; only its AND gate shape stays open).
+    // Transit S0 is AND(Q1 on I3/A4, float-high A6): golden Y39X1
+    // ALUT shape, reading as a Q1 passthrough under float-high.
     assert!(
-        fasm_text.contains("CLBLM_R_X71Y39.SLICEL_X1.ALUT.INIT[63:0] = 64'hFF00FF00FF00FF00"),
-        "transit S0 I3-pass INIT"
+        fasm_text.contains("CLBLM_R_X71Y39.SLICEL_X1.ALUT.INIT[63:0] = 64'hFF00FF0000000000"),
+        "transit S0 AND INIT"
     );
     assert_eq!(fasm_text.matches("FFMUX.XOR").count(), 26, "chain FF D muxes");
     // Tail placement: bit 24 on Y44 X1-D, LD0 on Y45 X0-A, no fabric LD0.
