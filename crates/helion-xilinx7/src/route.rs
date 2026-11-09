@@ -914,6 +914,52 @@ mod tests {
         );
     }
 
+    /// ZB-10 S24 feed on the real xc7z020 graph: with zero claims BFS
+    /// must find the 2-pip SR1 path (LOGIC_OUTS3 -> SR1BEG_S0 ->
+    /// IMUX42). This pins graph completeness (tileconn stitching plus
+    /// INT_R pips): if stitching ever truncates a node or a pip goes
+    /// missing, the shortest path changes and this test fails.
+    /// Provenance: an independent Python BFS over tileconn.json plus
+    /// tile_type_INT_R.json finds the same 2-edge path (ZB-10 run log).
+    /// Note the golden bitstream does NOT take this path: SR1 carries
+    /// the transit S feed (OUTS7) in both designs, so the S24 net takes
+    /// a second choice (ours: FAN chain, golden: ER1 ring). That
+    /// divergence is a cost-function question, not a graph gap.
+    #[test]
+    fn bfs_finds_shortest_s24_feed_on_real_graph() {
+        use crate::device::{default_db_root, Device};
+        use crate::xdevice::{build_node_map, XDevice};
+
+        let db_root = default_db_root();
+        let mut device = Device::load_xc7z020(&db_root).expect("load xc7z020");
+        let maps = build_node_map(&mut device);
+        let xdev = XDevice::new(&device, maps);
+        let sinks = vec![("INT_R_X71Y44".to_string(), "IMUX42".to_string())];
+        let claimed: HashMap<(String, String), String> = HashMap::new();
+        let pips = bfs_route(
+            "INT_R_X71Y44",
+            "LOGIC_OUTS3",
+            &sinks,
+            &xdev,
+            false,
+            "probe",
+            &claimed,
+        )
+        .expect("no S24 path on real graph");
+        let hops: Vec<(&str, &str)> = pips
+            .iter()
+            .map(|p| (p.src_wire.as_str(), p.dst_wire.as_str()))
+            .collect();
+        assert_eq!(
+            hops,
+            vec![
+                ("LOGIC_OUTS3", "SR1BEG_S0"),
+                ("SR1BEG_S0", "IMUX42"),
+            ],
+            "shortest S24 feed changed: {hops:?}"
+        );
+    }
+
     #[test]
     fn bfs_avoids_foreign_claimed_wires() {
         let sinks = vec![("INT_X1".into(), "D".into())];
