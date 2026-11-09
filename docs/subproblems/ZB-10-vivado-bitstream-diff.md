@@ -530,3 +530,18 @@ transit needs no clock yet keeps {0,2,5,7}), and vertical
 branch patterns show no connected tree. The program reflects
 Vivado clock-tree tap topology, unknowable without its clock
 router. Parked; Y45 over-programming (10 ours-only bits) stays.
+
+## Fourteenth run (Nov 8, 2026, Mac, CMT detour classified, 484 held)
+
+Rebuilt with no env setup (e2e green), rawdiff re-verified at 484
+(record /tmp/x7/carry_vs_oracle_diff28.json: 43 ours-only, 134
+named, 350 unnamed). Remainder audit of the one unclassified
+cluster: CMT_TOP_L_UPPER_T (14 records, 12 ours-only) is the left-side
+mirror of the parked detour bucket. Ours drives the INT_L X72Y39-45
+spans through NW2BEG3 / NE2BEG1 long lines; golden takes ER1BEG1
+(the ER1 ring) for the same spans. Same route-choice class as the
+right-side FAN-vs-ER1 detours: no grounded rule picks the ring
+without a wirelength / delay cost model, so it parks with the rest.
+Remainder stands: HCLK unnamed (~330, license), detours both sides
+plus pad-A fill plus arrival (cost model), CFG_CENTER word-50 unnamed
+(license), corridor plus complements. No behavior change.
