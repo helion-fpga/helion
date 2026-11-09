@@ -736,3 +736,43 @@ named of which the M-core is proven identical and the rest is
 L-shadow plus LED-path variants with no derivable rule. Gates:
 xilinx7 lib 107, sv lib 228, sim lib 32, all green with
 pipefail-guarded result lines. No behavior change.
+
+## Twentieth run (Nov 9, 2026, Mac, delay PoC plus BYP survey, 484 held)
+
+Rebuilt with no env setup (e2e green), rawdiff re-verified at 484
+(record /tmp/x7/carry_vs_oracle_diff35.json, identical cluster
+counts). Two new probes, both negative with cause.
+
+Delay PoC (unparks then re-parks the cost-model question): the open
+DB ships per-pip delays in tile_type_INT_R/L.json (3737 pips
+covered), so edge weights looked derivable. Tested on the true
+same-net S24 detour: ours (5-pip FAN chain, from our FASM)
+sums to 0.165 typ against golden's ring at 0.191 before counting
+the ring's two unmodeled wire hops (OUTS3 to ER1BEG_S0 0.044,
+WR1END_S1_0 to SR1BEG_S0 0.056, SR1BEG_S0 to ER1BEG1 0.044,
+ER1END1 to IMUX42 0.047). Delay weighting would not pick the
+ring, so Vivado's choice here is not delay-driven and DB delays
+cannot ground the detour rule. Killed with numbers, not assumed.
+
+BYP tie-subset hunt (the ~10 ours-only Y45 arrival bits): golden
+ties ALT {1,3,4,6} at Y45 and skips ALT1 at Y39 while we tie all
+8; unset muxes sit at the ppips VCC_WIRE default (logic 1), so
+this is a real 0-vs-1 programming divergence. Dead ends, each
+measured: downstream consumption does not explain it (golden
+Y45 ALT3/4/6 outputs unconsumed in-tile and in all three
+neighbor tiles, yet tied); CLK presence does not (CLK1-only on
+every arrival tile Y39-45 in both designs; golden Y44 also has
+CLK0 exactly like ours); HCLK adjacency does not (INT column
+continuous through Y45, HCLK rows at 26/78/130). Multi-sample
+test failed for lack of samples: fa4b_dataflow and fa4b_structural
+(md5-verified a2bfcb03, fec19383) program zero BYP/CLK bits
+chip-wide (unclocked), and bcd_2_bin (65430953) has a single
+GFAN-consumer tile and no arrival programming. No second clocked
+sample exists, so the tie subset has no derivable rule from one
+sample and stays parked. Scratch probe /tmp/x7/byp_survey.py kept
+out of the repo.
+
+Remainder stands: 350 word-50 route detail (fuzzing), 134 named
+route choice (cost model or second sample), 15 unclaimed trailing
+minors. Gates: xilinx7 lib 107, sv lib 228, sim lib 32, all green
+with pipefail-guarded result lines. No behavior change.
