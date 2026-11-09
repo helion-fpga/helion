@@ -1047,3 +1047,21 @@ HCLK minor 6-25 and HROW non-BUFHCE mappings plus route-choice
 stats from Vivado's own outputs, then implement the next
 diff-grounded fix. Gates: suite re-verification deferred to
 the fix turn (no code touched).
+
+## Thirtieth run (Nov 9, 2026, Mac, HROW word-50 code being derived, 484 held)
+
+Rebuilt with no env setup (blinky_reg e2e green), rawdiff
+re-verified at 484 (134 NAMED, 350 UNNAMED, 15 unclaimed).
+The 15 trailing bits are HROW word-50 low bits 0-13 in minors
+26/27/28, all unmapped in the open DB, and cluster data proves
+they are deterministic functions of clock topology, not
+version noise: control17 and control22 match the oracle
+exactly (0x41cb2/0x10cf/0x8019b7), while BUFG-site, BUFH, and
+multi-clock variants move them lawfully. Tie-subset parking is
+now evidence-backed: Vivado's own <const0> tie patterns vary
+across directives on identical netlists, so they are router
+internals, not matchable logic. Seven more sweep jobs are
+building (four BOT rows on GCLK0, three TOP rows on GCLK1-3)
+to complete the trunk-by-mux matrix, then the segment rule
+gets implemented, verified, and committed. No behavior change
+(log-only turn).
