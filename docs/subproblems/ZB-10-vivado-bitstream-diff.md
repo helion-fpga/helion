@@ -630,3 +630,53 @@ Remainder stands, reclassified with evidence: 46 universal-default,
 255 clock-region route detail, 49 IO/bank route detail, 134 named
 route choice. Gates: xilinx7 lib 107, sv lib 228, sim lib 32, all
 green with pipefail-guarded result lines. No behavior change.
+
+## Eighteenth run (Nov 9, 2026, Mac, B242 deconstruction plus fix hunt, 484 held)
+
+Rebuilt with no env setup (e2e green), rawdiff re-verified at 484
+(record /tmp/x7/carry_vs_oracle_diff33.json, identical to diff32).
+
+BLINK-242 deconstructed, and it is a trap: rawdiff against GT is only
+64 bits (record /tmp/x7/b242_vs_gt.json), all word-50 ref-only, zero
+named, zero ours-only. Its config stream geometry is byte-identical
+to GT (1011391 words, FDRI 1010808, same FAR sequence), so it is GT
+frame content passed through Helion tooling minus 64 bits, not an
+independent build. Its 292 word-50 bits are a strict subset of GT
+(0 extras), including the same trailing 15. Do not use it as a
+sample: any rule learned from it is oracle inheritance. The 64 it
+drops (HROW 28, HCLK_IOI3 21, CFG 13, HCLK_CMT 2) mark the old
+frame round-trip gap, not a rule.
+
+Fix hunt across the remainder, all negative with cause:
+
+- Ours-only named 43 (IMUX per-row bits Y39-Y44, FAN_ALT Y44,
+  BYP_ALT Y45, CMT mirror 12) are our sides of already-parked
+  route choices (ring-vs-source, arrival taps, detour mirror).
+  No new rule.
+- NO-TILE 15 are word 50 of trailing CLB-frame minors (col 71,
+  minors 30-31 of 26-35, no w50 owner in tilegrid). Survey: each
+  design programs trailing word-50 in exactly one column, its
+  own (GT 15, faD 34, bcd 55). faD vs faS use the same trailing
+  minors but different bits, so trailing words track per-column
+  route detail like the HCLK words, not usage. No rule.
+- Upstream prjxray-db segbits for all HCLK/HROW/CFG types are
+  byte-identical to ours (fetched Nov 9). No new knowledge.
+- Mask DB bits have zero overlap with any word-50 pattern.
+  Not the mechanism.
+- Our FASM clock/HCLK features match golden exactly (HROW
+  BUFHCE 6, HCLK_CMT 1+3, HCLK_L ENABLE/LEAF 2, all decoded in
+  GT). Nothing missing at FASM level.
+
+Classification correction: the 13 CFG word-50 bits are universal
+(set in all four Vivado samples, record /tmp/x7/w50_universal.json),
+not GT-only/design-driven as the sixteenth-run note held. That note
+used Helion builds (B242, OURS-r25) as negative evidence, which is
+circular now that B242 is proven GT-derived. They stay unimplemented
+anyway: N=4 universality without a mechanism is still hardcoding,
+and the other 33 universals share a bank-33 common cause, so even
+universality needs a no-bank-33 sample to confirm.
+
+Remainder stands: 350 word-50 route detail (per-column encoding,
+needs Vivado fuzzing), 134 named route choice (needs cost model).
+Gates: xilinx7 lib 107, sv lib 228, sim lib 32, all green with
+pipefail-guarded result lines. No behavior change.
