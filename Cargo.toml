@@ -28,6 +28,7 @@ members = [
     "crates/helion-hl10t",
     "crates/helion-ice40",
     "crates/helion-ecp5",
+    "crates/helion-rune",
 ]
 
 [workspace.package]
@@ -35,7 +36,9 @@ version = "3.0.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/helion-fpga/helion"
-rust-version = "1.85.0"
+# Mirrors Rune's pinned toolchain (rune/rust-toolchain.toml): Rune declares no
+# rust-version but uses let-chains, which rustc 1.85 cannot parse.
+rust-version = "1.99.1"
 
 [workspace.dependencies]
 helion-ir = { path = "crates/helion-ir" }
