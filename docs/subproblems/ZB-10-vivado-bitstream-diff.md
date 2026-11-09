@@ -923,3 +923,32 @@ Remainder stands: 350 word-50 (unfuzzed HCLK minors 6-25),
 15 trailing minors. Gates: xilinx7 lib 107, sv lib 228, sim
 lib 32, all green with pipefail-guarded result lines. No
 behavior change (log-only turn).
+
+## Twenty-fifth run (Nov 9, 2026, Mac, LD0 correction, 484 held)
+
+Rebuilt with no env setup (e2e green), rawdiff re-verified at 484
+(record /tmp/x7/carry_vs_oracle_diff40.json). This run corrects
+a standing survey claim with decoded evidence.
+
+Flop census forces it: all 26 flop muxes are XOR-fed in BOTH
+designs (golden Y44 X1-D plus X0 A-D and Y45 X0-A verified by
+decode; ours identical BEL for BEL), so golden's LD0 flop is
+Y45-X0-AFF (toggle on overflow via S-feedback), exactly like
+ours. The nineteenth-run note's "golden drives LD0 from
+L-DFF(Y44)" is wrong; Y44-L holds counter bit 23 in both.
+Proximity as a rule died earlier anyway (it predicts ours).
+
+The real LED divergence is same-net routing, proven endpoint
+to endpoint: both drive Y45-AFF.Q to X73Y46-IMUX34 to OLOGIC
+D1 to the IOB. Ours goes direct (same-tile ER1 east, NE2 hop
+via X72Y45). Golden tours (OUTS4 southwest via SW2BEG0 to
+X70Y44, ER1 east along Y44, climb back to Y45, ER1 through
+X72Y45, NR1 north). Same source, same sink, scenic vs direct:
+pure cost-function arbitrariness, same class as S24, parked
+forever. No structural difference remains in the LED bucket.
+
+Remainder stands: 350 word-50 (unfuzzed HCLK minors 6-25),
+134 named (cost function, scenic-tour detours, S-stub
+corridor), 15 trailing minors. Gates: xilinx7 lib 107, sv lib
+228, sim lib 32, all green with pipefail-guarded result lines.
+No behavior change (log-only turn).
