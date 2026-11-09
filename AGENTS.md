@@ -1126,8 +1126,31 @@ exactly like a `VCC_WIRE` tie. So:
 unchanged and readback matching. So the dead-wire bits are independent of
 everything else and setting them is side-effect-free -- the theory holds
 mechanically, it is only the *wisdom* of emitting them that is in question.
-Decision taken: defer until the small-design campaign says whether Vivado
-writes dead-wire arms in every design or only this one.
+**ANSWERED (round 3, small-design campaign): it is systematic, and we already
+do it too.** Four fresh Vivado builds of different circuits on the cluster
+(`t01_ff` one toggle, `t02_cnt4` 4-bit counter, `t03_and` LUT-only, `t04_cnt8`
+8-bit counter) were decoded for "dead-end mux arms" -- arms of `ER1BEG1`/
+`EL1BEG0`, which are muxes with 20 input arms and **zero outgoing pips and zero
+outgoing tileconns**, i.e. they drive nothing:
+
+```
+t01_ff    1 dead arm        t04_cnt8  2 dead arms
+t02_cnt4  1 dead arm        t03_and   0 dead arms (almost no routing)
+oracle    9 dead arms       OURS      7 dead arms
+```
+
+So this is **routine behaviour, not a blinky quirk** -- and Helion already does
+it 7 times on blinky without any special case, purely as a side effect of the
+router's choice. The 2 arms we miss (`ER1BEG1` on X69Y39, `EL1BEG0` on X70Y39)
+are per-design noise, not a rule we are failing to implement. **Do not build an
+emit rule for them**: there is no general rule to find, and a per-tile table
+would not transfer to another design.
+
+Corollary worth keeping: a wire being a "dead end" is about OUTGOING edges
+only. `ER1BEG1`/`EL1BEG0` have 20 incoming arms and 0 outgoing; `EL1END0` is
+the mirror (0 incoming, 20 outgoing). Checking "is it in `dst_wire`" alone
+answers the wrong question in both directions -- count both sides and say which
+you mean.
 
 Also worth knowing before re-deriving it: `FAN_ALT0` on Y42 is the ONE cluster
 where the ROUTER, not the backbone, is responsible -- `emit.rs` only ever
