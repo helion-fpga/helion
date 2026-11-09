@@ -16329,11 +16329,15 @@ fn emit_carry_increment(
         let cname = format!("u_carry_{lhs}_c{g}");
         d.add_cell(&cname, CellKind::Carry4);
         if g == 0 {
-            // Chain head: CYINIT from config (golden PRECYINIT.C0, no
-            // routing, no const-1 LUT). The CI pin stays unconnected;
-            // pack/sim/emit read the CYINIT flag (proven 1: a 0 would
-            // stick bit 0 and break the chain the oracle provably runs).
-            let _ = d.set_cell_attr(&cname, "CYINIT", "1");
+            // Chain head: CYINIT is const-0 (golden PRECYINIT.C0; the
+            // oracle synth netlist ties head CYINIT to const0). The CI
+            // pin stays unconnected and no const LUT is built. The S0
+            // propagate is therefore inverted (NOT Q0: with CYINIT=0 a
+            // Q0 passthrough would stick bit 0 and freeze the chain on
+            // silicon), and DI0 reads float-high on silicon, which sim
+            // models (see carry DI0 rule). Pack maps the flag value to
+            // the PRECYINIT source (0 to C0, 1 to C1).
+            let _ = d.set_cell_attr(&cname, "CYINIT", "0");
         } else {
             let cin = if g == 1 && transit {
                 tco.clone()
@@ -16408,10 +16412,16 @@ fn emit_carry_increment(
             d.connect(&tco, &pname, "CO");
             let ts = format!("u_carry_{lhs}_trs");
             d.connect(&ts, &pname, "S0");
+            // Transit S0 is a Q1 passthrough on I3 (A4 pin, golden Y39X1
+            // A route IMUX10 from OUTS5). I3-pass INIT 0xff00ff00ff00ff00
+            // (bits 8-15, 24-31, 40-47, 56-63) is float-immune (output
+            // depends on I3 alone), so sim and silicon agree exactly;
+            // only golden's AND gate shape (float A6, the I5=0 half)
+            // stays open. I5 stays unconnected and floats.
             let slut = format!("u_carry_{lhs}_trs_lut");
-            d.add_cell(&slut, CellKind::Lut6 { init: S_LUT_INIT });
+            d.add_cell(&slut, CellKind::Lut6 { init: 0xFF00_FF00_FF00_FF00 });
             d.connect(&ts, &slut, "O");
-            d.connect(&bit_name(lhs, w, 1), &slut, "I5");
+            d.connect(&bit_name(lhs, w, 1), &slut, "I3");
             // B/C/D (golden Y39X1 B<-bit2, C<-bit3, D<-east): AND-side
             // samples on covered Qs. D shares C's tap (bit3); golden's
             // east detour is a timing artifact no shortest-path router
@@ -16452,13 +16462,24 @@ fn emit_carry_increment(
             }
         }
     }
+    // Head S0 is an inverted propagate on I2 (NOT Q0 on A3, golden
+    // Y39X0 ALUT shape 0x0f0f0f0f0f0f0f0f): CYINIT is const-0, so the
+    // sum bit needs the complement. I2 maps to the A3 pin; the other
+    // inputs float and are don't-cares in this INIT. All other S-LUTs
+    // stay I5 passthroughs (golden B/C/D shapes).
+    const HEAD_S0_INIT: u64 = 0x0F0F_0F0F_0F0F_0F0F;
     for i in 0..w {
         let bit = bit_name(lhs, w, i);
         let s = format!("u_carry_{lhs}_s{i}");
         let o = format!("u_carry_{lhs}_o{i}");
         let slut = format!("u_carry_{lhs}_s{i}_lut");
-        d.add_cell(&slut, CellKind::Lut6 { init: S_LUT_INIT });
-        d.connect(&bit, &slut, "I5");
+        let (init, pin) = if i == 0 {
+            (HEAD_S0_INIT, "I2")
+        } else {
+            (S_LUT_INIT, "I5")
+        };
+        d.add_cell(&slut, CellKind::Lut6 { init });
+        d.connect(&bit, &slut, pin);
         d.connect(&s, &slut, "O");
         let ff = format!("u_carry_{lhs}_ff{i}");
         d.add_cell(&ff, CellKind::Hff);
@@ -18680,11 +18701,34 @@ mod tests {
     #[test]
     fn carry_tail_top_align_ld0_stage_transit() {
         let d = carry_blinky_reg_design();
-        // Chain head: CYINIT from config (golden PRECYINIT.C0). No CI
-        // net, no const-1 LUT anywhere.
+        // Chain head: CYINIT const-0 from config (golden PRECYINIT.C0,
+        // oracle synth netlist ties head CYINIT to const0). No CI net,
+        // no const LUT anywhere.
         assert_eq!(cell_pin(&d, "u_carry_count_c0", "CI"), None);
         let c0 = d.cells.iter().find(|c| c.name == "u_carry_count_c0").expect("c0");
-        assert!(c0.attrs.flag("CYINIT"), "head carries CYINIT=1");
+        assert_eq!(
+            c0.attrs.get("CYINIT"),
+            Some("0"),
+            "head carries CYINIT=0"
+        );
+        // Head S0 is the inverted propagate (NOT Q0 on I2/A3): with
+        // CYINIT=0 a passthrough would stick bit 0 on silicon.
+        let s0_lut = d
+            .cells
+            .iter()
+            .find(|c| c.name == "u_carry_count_s0_lut")
+            .expect("head S0 LUT");
+        assert!(
+            matches!(s0_lut.kind, CellKind::Lut6 { init: 0x0F0F_0F0F_0F0F_0F0F }),
+            "head S0 LUT is NOT-I2, got {:?}",
+            s0_lut.kind
+        );
+        assert_eq!(
+            cell_pin(&d, "u_carry_count_s0_lut", "I2"),
+            Some("count_0".to_string()),
+            "Q0 on I2"
+        );
+        assert_eq!(cell_pin(&d, "u_carry_count_s0_lut", "I5"), None);
         assert!(
             d.cells.iter().all(|c| !c.name.ends_with("_one")),
             "no const-1 LUT"
@@ -18710,11 +18754,29 @@ mod tests {
             cell_pin(&d, "u_carry_count_c6", "S2"),
             Some("u_carry_count_ts2".to_string())
         );
-        // Transit bridges g0 to g1 with a Q1 passthrough on S0.
+        // Transit bridges g0 to g1 with a Q1 passthrough on S0 (I3/A4,
+        // float-immune I3-pass shape, not the I5 passthrough: golden
+        // Y39X1 A route IMUX10 comes from OUTS5).
         assert_eq!(
             cell_pin(&d, "u_carry_count_transit", "CI"),
             Some("u_carry_count_co0".to_string())
         );
+        let trs_lut = d
+            .cells
+            .iter()
+            .find(|c| c.name == "u_carry_count_trs_lut")
+            .expect("transit S0 LUT");
+        assert!(
+            matches!(trs_lut.kind, CellKind::Lut6 { init: 0xFF00_FF00_FF00_FF00 }),
+            "transit S0 LUT is I3-pass, got {:?}",
+            trs_lut.kind
+        );
+        assert_eq!(
+            cell_pin(&d, "u_carry_count_trs_lut", "I3"),
+            Some("count_1".to_string()),
+            "Q1 on I3"
+        );
+        assert_eq!(cell_pin(&d, "u_carry_count_trs_lut", "I5"), None);
         assert_eq!(
             cell_pin(&d, "u_carry_count_transit", "CO"),
             Some("u_carry_count_tco".to_string())

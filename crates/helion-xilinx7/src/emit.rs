@@ -480,9 +480,11 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     // (carry in from the slice below through the dedicated cascade),
     // except a group chained directly on the head, which takes
     // PRECYINIT.AX (golden Y39X1 transit); a CYINIT-config head takes
-    // PRECYINIT.C0 (CYINIT tied 1: a 0 would stick bit 0 and break the
-    // chain the oracle provably runs). CARRY4.ACY0 accompanies AX
-    // exactly (head-AX and transit-AX show it; C0 and CIN never do).
+    // PRECYINIT.C0 for CYINIT=0 or C1 for CYINIT=1. C0 is const-0
+    // (the oracle synth netlist ties head CYINIT to const0); mapping a
+    // CYINIT=1 intent to C0 freezes bit 0 on silicon. CARRY4.ACY0
+    // accompanies AX exactly (head-AX and transit-AX show it; C0, C1
+    // and CIN never do).
     let co_nets: HashSet<&str> = packed
         .carries
         .iter()
@@ -513,8 +515,11 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         // ACY0 accompanies AX exactly (golden: head-AX and transit-AX
         // carry it; C0 and CIN never do).
         let mut use_ax = false;
-        if packed_c.cyinit_c0 {
-            lines.push(format!("{}.{}.PRECYINIT.C0", carry.tile, site_rel));
+        if let Some(high) = packed_c.cyinit {
+            // CYINIT from config: the value selects the source. C0 is
+            // const-0, C1 is const-1; crossing them freezes silicon.
+            let src = if high { "C1" } else { "C0" };
+            lines.push(format!("{}.{}.PRECYINIT.{}", carry.tile, site_rel, src));
         } else if co_nets.contains(packed_c.ci_net.as_str()) {
             let head_driven = co_driver
                 .get(packed_c.ci_net.as_str())
@@ -851,19 +856,19 @@ mod tests {
         });
         r.placed.packed.carries = vec![
             PackedCarry {
-                name: "u_c0".into(), ci_net: "one".into(), cyinit_c0: false, co_net: Some("co0".into()),
+                name: "u_c0".into(), ci_net: "one".into(), cyinit: None, co_net: Some("co0".into()),
                 s_nets: [Some("s0".into()), None, None, None],
                 di_nets: [None, None, None, None],
                 o_nets: [Some("o0".into()), None, None, None],
             },
             PackedCarry {
-                name: "u_c1".into(), ci_net: "co0".into(), cyinit_c0: false, co_net: Some("co1".into()),
+                name: "u_c1".into(), ci_net: "co0".into(), cyinit: None, co_net: Some("co1".into()),
                 s_nets: [Some("s1".into()), None, None, None],
                 di_nets: [None, None, None, None],
                 o_nets: [Some("o1".into()), None, None, None],
             },
             PackedCarry {
-                name: "u_c2".into(), ci_net: "co1".into(), cyinit_c0: false, co_net: None,
+                name: "u_c2".into(), ci_net: "co1".into(), cyinit: None, co_net: None,
                 s_nets: [Some("s2".into()), None, None, None],
                 di_nets: [None, None, None, None],
                 o_nets: [Some("o2".into()), None, None, None],
@@ -901,6 +906,32 @@ mod tests {
         assert!(!text.contains("BCY0") && !text.contains("CCY0") && !text.contains("DCY0"), "got:\n{text}");
         // Chain FF samples the sum through FFMUX.XOR, never a letter input.
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFFMUX.XOR"), "got:\n{text}");
+    }
+
+    /// CYINIT value selects the PRECYINIT source: 0 to C0, 1 to C1.
+    /// C0 is const-0 (oracle synth netlist ties head CYINIT to const0),
+    /// so a CYINIT=1 intent mapped to C0 would freeze bit 0 on silicon.
+    #[test]
+    fn emit_carry_config_head_selects_c0_or_c1_by_value() {
+        use crate::pack::PackedCarry;
+        use crate::place::PlacedCarry;
+        for (high, want) in [(false, "PRECYINIT.C0"), (true, "PRECYINIT.C1")] {
+            let mut r = routed_blinky();
+            r.placed.packed.carries = vec![PackedCarry {
+                name: "u_h".into(), ci_net: String::new(), cyinit: Some(high),
+                co_net: Some("coh".into()),
+                s_nets: [Some("s0".into()), None, None, None],
+                di_nets: [None, None, None, None],
+                o_nets: [Some("o0".into()), None, None, None],
+            }];
+            r.placed.carries = vec![PlacedCarry {
+                name: "u_h".into(), tile: "CLBLL_L_X0Y0".into(), site: "SLICE_X0Y0".into(),
+            }];
+            let text = emit_fasm(&r, &FakeEmit).unwrap().fasm.join("\n");
+            assert!(text.contains(&format!("CLBLL_L_X0Y0.SLICEL_X0.{want}")), "got:\n{text}");
+            let other = if high { "PRECYINIT.C0" } else { "PRECYINIT.C1" };
+            assert!(!text.contains(other), "crossed CYINIT source, got:\n{text}");
+        }
     }
 
     #[test]

@@ -596,7 +596,7 @@ mod tests {
         PackedCarry {
             name: name.into(),
             ci_net: ci.into(),
-            cyinit_c0: false,
+            cyinit: None,
             co_net: co.map(|s| s.into()),
             s_nets: Default::default(),
             di_nets: Default::default(),

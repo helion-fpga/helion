@@ -58,8 +58,8 @@ struct CarryPins {
     ci: Option<String>,
     s: [Option<String>; 4],
     di: [Option<String>; 4],
-    /// Chain head with CYINIT from config (golden PRECYINIT.C0): an
-    /// unconnected CI reads 1, not 0.
+    /// Chain head with CYINIT from config: an unconnected CI reads the
+    /// flag value (0 for the const-0 head, matching PRECYINIT.C0).
     cyinit: bool,
 }
 
@@ -345,9 +345,13 @@ impl Sim {
     /// oracle chain provably passes through slices with unconnected S,
     /// so bare S reads high and CO follows CIN. A LUT-driven S evaluates
     /// normally (a passthrough with floating inputs reads 0, which kills
-    /// the chain by construction). Bare DI stays low (irrelevant under
-    /// propagate). Other unconnected inputs tie low; a connected but
-    /// unresolvable input yields X (None).
+    /// the chain by construction). Bare DI stays low except DI0 on a
+    /// CYINIT=0 config head, which reads float-high on silicon: the DI0
+    /// path is AX-fed and undriven in both bitstreams (no DI FASM lines
+    /// in 261 plus 23 golden Y39 features), and the blink-proven oracle
+    /// needs DI0=1 for its carry out (CO0 = S0?0:DI0 with S0 = NOT Q0).
+    /// Other unconnected inputs tie low; a connected but unresolvable
+    /// input yields X (None).
     fn carry_output_live(
         &self,
         cell: &str,
@@ -359,12 +363,15 @@ impl Sim {
             None => Some(pins.cyinit),
             Some(n) => resolve(n),
         }?;
+        // Undriven DI0 on a CYINIT=0 config head reads high (see above).
+        let di0_high = pins.ci.is_none() && !pins.cyinit;
         for j in 0..4u8 {
             let s = match pins.s[j as usize].as_deref() {
                 None => Some(true),
                 Some(n) => resolve(n),
             }?;
             let di = match pins.di[j as usize].as_deref() {
+                None if j == 0 && di0_high => Some(true),
                 None => Some(false),
                 Some(n) => resolve(n),
             }?;
@@ -393,12 +400,16 @@ impl Sim {
             None => Some(pins.cyinit),
             Some(n) => self.eval_net(n, memo, stack),
         }?;
+        // Same head-DI0 rule as carry_output_live: undriven DI0 on a
+        // CYINIT=0 config head reads float-high on silicon.
+        let di0_high = pins.ci.is_none() && !pins.cyinit;
         for j in 0..4u8 {
             let s = match pins.s[j as usize].as_deref() {
                 None => Some(true),
                 Some(n) => self.eval_net(n, memo, stack),
             }?;
             let di = match pins.di[j as usize].as_deref() {
+                None if j == 0 && di0_high => Some(true),
                 None => Some(false),
                 Some(n) => self.eval_net(n, memo, stack),
             }?;
