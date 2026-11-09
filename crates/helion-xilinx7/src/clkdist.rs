@@ -62,6 +62,55 @@ pub fn hrow_tile_names() -> (&'static str, &'static str) {
     ("CLK_HROW_BOT_R_X87Y26", "CLK_HROW_TOP_R_X87Y78")
 }
 
+/// Leaf-buffer distribution codes for the trunk's HCLK leaf buffer
+/// (word 50 low bits of two HCLK tiles). Measured on the same BOT-tap
+/// samples as [`hrow_codes`]: trunks 0 and 1 agree exactly (further
+/// trunks stranded by a dropped cluster tunnel), TOP taps use different
+/// leaf tiles outside this table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeafCodes {
+    /// HCLK_L_X174Y26 minor 3 word 50 low bits (buffer input code).
+    pub l174_m03: u32,
+    /// HCLK_L_X174Y26 minor 5 word 50 low bits (buffer tap code).
+    pub l174_m05: u32,
+    /// HCLK_CMT_L_X178Y26 minor 27 word 50 low bits (CMT feed code).
+    pub cmtl_m27: u32,
+}
+
+/// HCLK tiles carrying [`LeafCodes`], in field order.
+pub fn leaf_tile_names() -> (&'static str, &'static str) {
+    ("HCLK_L_X174Y26", "HCLK_CMT_L_X178Y26")
+}
+
+pub fn leaf_codes(gclk: u8, tap: &HrowTap) -> Option<LeafCodes> {
+    if tap.tile != HrowTile::Bot || tap.side_r != true || tap.mux != 8 {
+        return None;
+    }
+    match gclk {
+        0 | 1 => Some(LeafCodes {
+            l174_m03: 0x9b9,
+            l174_m05: 0x19b7,
+            cmtl_m27: 0x9b5,
+        }),
+        _ => None,
+    }
+}
+
+/// Clock-input distribution codes (HCLK_IOI3_X1Y26 word 50): programmed
+/// identically by every sample (8 builds across 2017.3, 2022.1, oracle;
+/// single- and multi-clock; BOT- and TOP-region loads; BUFG and BUFH
+/// clocks) because all share the same Y9 clock-pin input path. Gated to
+/// single-clock designs like the rest of this module.
+pub fn input_tile_name() -> &'static str {
+    "HCLK_IOI3_X1Y26"
+}
+
+/// `(minor, word, full-word value)` for the clock-input tile. Full
+/// values (not just low bits): every sample agrees bit-for-bit here.
+pub fn input_codes() -> [(u32, u32, u32); 3] {
+    [(29, 50, 0x1a2d), (38, 50, 0x0a3e), (39, 50, 0x1a39)]
+}
+
 /// Measured HROW word-50 distribution codes for a single-GCLK-trunk clock
 /// through the given tap. Returns `None` outside the measured domain
 /// (trunk above 3, tap mux other than R8, or no trunk): the caller must
@@ -142,6 +191,34 @@ mod tests {
                 "cell gclk={g} tile={tile:?}"
             );
         }
+    }
+
+    /// Leaf-buffer cells reproduce the BOT-tap samples for trunks 0-1.
+    #[test]
+    fn leaf_table_reproduces_measured_cells() {
+        for g in [0u8, 1] {
+            let got = leaf_codes(g, &r8(HrowTile::Bot)).expect("leaf cell");
+            assert_eq!(
+                got,
+                LeafCodes {
+                    l174_m03: 0x9b9,
+                    l174_m05: 0x19b7,
+                    cmtl_m27: 0x9b5,
+                },
+                "leaf cell gclk={g}"
+            );
+        }
+        assert!(leaf_codes(2, &r8(HrowTile::Bot)).is_none(), "trunk 2 leaf");
+        assert!(leaf_codes(0, &r8(HrowTile::Top)).is_none(), "TOP leaf");
+    }
+
+    /// Input codes are fixed full words shared by every sample.
+    #[test]
+    fn input_codes_are_fixed() {
+        assert_eq!(
+            input_codes(),
+            [(29, 50, 0x1a2d), (38, 50, 0x0a3e), (39, 50, 0x1a39)]
+        );
     }
 
     /// Outside the measured domain the lookup refuses: trunk 4+,

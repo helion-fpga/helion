@@ -456,7 +456,33 @@ fn blinky_reg_carry_e2e_fasm() {
                 ];
                 let n = store.apply_raw_bits(&raw).expect("hrow raw codes");
                 assert_eq!(n, 4, "hrow raw codes applied");
+                // Same cell drives the leaf-buffer codes (BOT-tap HCLK
+                // leaf buffer + CMT feed, measured identical for G0/G1).
+                if let Some(leaf) = clkdist::leaf_codes(spine.gclk, &tap) {
+                    let (l174_name, cmtl_name) = clkdist::leaf_tile_names();
+                    let leaf_raw = vec![
+                        (base(l174_name) + 3, 50, leaf.l174_m03),
+                        (base(l174_name) + 5, 50, leaf.l174_m05),
+                        (base(cmtl_name) + 27, 50, leaf.cmtl_m27),
+                    ];
+                    let n = store.apply_raw_bits(&leaf_raw).expect("leaf raw codes");
+                    assert_eq!(n, 3, "leaf raw codes applied");
+                }
             }
+        }
+        // Clock-input distribution codes: every sample shares the Y9
+        // input path, so these hold for any single-clock design.
+        {
+            let ioi3_base = layout
+                .frame_addr(clkdist::input_tile_name(), BlockType::ClbIoClk)
+                .expect("input tile geometry")
+                .baseaddr;
+            let input_raw: Vec<(u32, u32, u32)> = clkdist::input_codes()
+                .iter()
+                .map(|&(m, w, v)| (ioi3_base + m, w, v))
+                .collect();
+            let n = store.apply_raw_bits(&input_raw).expect("input raw codes");
+            assert_eq!(n, 3, "input raw codes applied");
         }
     }
     // ZB-10 clock fuzz: Vivado programs HROW trunk-distribution codes in
@@ -482,6 +508,37 @@ fn blinky_reg_carry_e2e_fasm() {
         store.frame_words(0x00401080 + 27).expect("TOP m27")[50],
         0x00000643,
         "TOP HROW m27 through code"
+    );
+    // ZB-10 clock fuzz, part 2: leaf-buffer and clock-input codes.
+    assert_eq!(
+        store.frame_words(0x00422300 + 3).expect("L174 m03")[50],
+        0x020009b9,
+        "HCLK_L leaf m03 buffer code"
+    );
+    assert_eq!(
+        store.frame_words(0x00422300 + 5).expect("L174 m05")[50],
+        0x008019b7,
+        "HCLK_L leaf m05 tap code"
+    );
+    assert_eq!(
+        store.frame_words(0x00422400 + 27).expect("CMTL m27")[50],
+        0x002009b5,
+        "HCLK_CMT_L m27 feed code"
+    );
+    assert_eq!(
+        store.frame_words(0x00420000 + 29).expect("IOI3 m29")[50],
+        0x00001a2d,
+        "HCLK_IOI3 input m29 code"
+    );
+    assert_eq!(
+        store.frame_words(0x00420000 + 38).expect("IOI3 m38")[50],
+        0x00000a3e,
+        "HCLK_IOI3 input m38 code"
+    );
+    assert_eq!(
+        store.frame_words(0x00420000 + 39).expect("IOI3 m39")[50],
+        0x00001a39,
+        "HCLK_IOI3 input m39 code"
     );
 
     let payload = store.fdri_payload();
