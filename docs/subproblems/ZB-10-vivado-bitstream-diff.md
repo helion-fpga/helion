@@ -498,6 +498,19 @@ XDevice serves it, emit_fasm prepends it.
 - Record /tmp/x7/carry_vs_oracle_diff27.json: 484 bits. The 3 named
   CFG entries are gone; the 13 unnamed word-50 bits stay (license).
 
+## Thirteenth run (Nov 8, 2026, Mac, multicast sharing, 484 held)
+
+New mechanism finding inside the detour bucket. Y39-S3 (D-LUT,
+samples bit3) shares the SR1 stem with transit-C (trs2, also samples
+bit3): ours is IMUX42 from SR1BEG_S0 (2 pips), golden takes the ER1
+ring for the same net. Same-net stem sharing falls out of
+ownership-keyed claims (one driver, two taps: legal multicast), so
+our router shares regardless of order; golden routes per-sink
+exclusive (transit-first order artifact). Forcing exclusive claims
+to match would break legal multicast, risk routability, and buy
+nothing functional. Parked with the cost-model work; rebuild green,
+rawdiff re-verified at 484, no behavior change.
+
 ## Tool-flow negatives (Nov 8, 2026, Mac, no-change record)
 
 Two hypothesis classes closed from Vivado's own artifacts: the
