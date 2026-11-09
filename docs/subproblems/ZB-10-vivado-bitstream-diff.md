@@ -264,6 +264,45 @@ half outnumbers the target lanes); oracle re-validates unchanged
 after the tool fix. Sim proves pads transparent (70 cycles
 cone-identical with 4 pads in the chain).
 
+## Tenth run (Nov 8, 2026, Mac, 892 to 557)
+
+Six diff-grounded commits on fm/zedboard-fix-router (all gates green,
+never master): BYP_ALT reservation for clock arrival (f5b9e12, 892 to
+710: signals camped on clock-arrival muxes, forcing emit to drop the
+uniform GFAN program); slice defaults ZRST/NOCLKINV/SLICEM-DI1MUX
+(861b2ec, 710 to 684: only ZRST carries set bits, the other two are
+clear-bit features already matched); BUFGCTRL parking (3ff0d2f, no bit
+change, all-clear parks); fabric BUFG tieoff deletion (1f969bf, 684 to
+674: device-wide power-IMUX scan of golden finds zero tieoff
+programming; IGNORE1 masks the low pins); carry top-load LD0 IobOut
+(53a5523, 674 to 665: the pin was dark, top-load skipped IOB emit);
+transit B/C/D S-LUTs (2d556c9, 665 to 557: golden Y39X1 full group,
+AND-idempotent covered-Q samples; golden IMUX13/IMUX34 selections
+emerged from correct nets). Record /tmp/x7/carry_vs_oracle_diff21.json:
+557 bits (89 ours-only, 468 ref-only), 207 NAMED, 350 UNNAMED.
+
+Remainder classification (all verified by decode, no gaps except
+noted). (1) Y39 head A pair (~100 bits): golden X0-ALUT is NOR(Q0
+via A3, float A4) and X1-ALUT is AND(float A6, Q1 via A4); ours uses
+A6 passthroughs. Replicating needs CYINIT/DI/A4/A6 float polarities,
+which no decode can supply; our own silicon correctness already bets
+on CYINIT-high. BLOCKED on hardware: propose a ZB-01 float-character
+design (LUT sensing a float input routed to an LD pin, plus CYINIT
+variants). (2) S-feed detours (west/east/south long lines, LD0 north
+dogleg): mid X1 proven FF-less AND positions (no FFs Y40-43 X1 by
+decode), so their S choices are don't-care by AND-idempotence;
+X0 (FF'd) IMUX selections already match (6 of 8 per mid tile), only
+upstream hop detours differ (timing class, needs a delay model).
+(3) HCLK row (~350 UNNAMED): segbits covers 6 of 26 HCLK frames,
+blocked on Vivado fuzzing license. (4) Structurally parked small
+items: Y45 BYP_ALT0/2/5/7 unset and Y39 BYP_ALT1 unset (arrival
+quirk, no rule found); corridor EL1 to Y39-BYP_ALT0 dangling stub
+(far-east driver, not replicable by rule); CFG_CENTER ALWAYS_ON
+props (3 set bits, single-sample evidence, part-specific tile
+naming); OLOGIC/ILOGIC mode defaults (clear bits, zero diff effect).
+S24 scare of this run was refuted by probe (own-Q24 end to end;
+a Y39/Y44 misread); determinism re-verified (3 identical FASM hashes).
+
 ## Seventh run (Nov 8, 2026, Mac, after full backend carry-through)
 
 Same pair, rebuilt default-flow Helion side (all three bitstream e2e
