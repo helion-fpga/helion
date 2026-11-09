@@ -479,6 +479,16 @@ both pin readings), with the route (IMUX10 from OUTS5) unchanged.
   ours-only). Remainder: HCLK (~330, license), S detours plus pad-A
   fill plus arrival (cost model), corridor plus CFG_CENTER smalls.
 
+## Tool-flow negatives (Nov 8, 2026, Mac, no-change record)
+
+Two hypothesis classes closed from Vivado's own artifacts: the
+journal shows bare `place_design` / `route_design` (default
+directives, so detours are default behavior, not exploration), and
+the placed utilization report shows FDRE 26 plus CARRY4 13 (exactly
+our counts, so phys_opt replicated nothing). Structural parity at
+cell level; divergence is purely placement-detail (matched),
+INIT/route choice, and clock programming.
+
 ## Arrival census (Nov 8, 2026, Mac, no-change record)
 
 Full 7-tile golden BYP_ALT program (gt_decode, one run): Y39 misses
