@@ -894,3 +894,32 @@ Remainder stands: 350 word-50 (unfuzzed HCLK minors),
 minors. Gates: xilinx7 lib 107, sv lib 228, sim lib 32, all
 green with pipefail-guarded result lines. No behavior change
 (log-only turn).
+
+## Twenty-fourth run (Nov 9, 2026, Mac, corridor traced, 484 held)
+
+Rebuilt with no env setup (e2e green), rawdiff re-verified at 484
+(record /tmp/x7/carry_vs_oracle_diff39.json). Traced the Y39
+corridor to its mechanism and killed two theories doing it.
+
+Direction semantics first (BEG drives, END sinks): the corridor
+net originates in the design's east (an OUTS4 S/shadow bit via
+SW2BEG0 at X71), runs west to X69 (ER1BEG1 from WW2END0), and
+comes back east into Y39-BYP_ALT0, dead at both ends (X68/X67
+and Y38/Y40 neighbors decode to zero features; BYP outputs
+consumerless chip-wide). The drive-by-clock theory died on the
+trace: it is an S-net stub tour to X69 and back, not clock, and
+the RP sample has no analog. Single-sample vestige, no
+derivable rule. Side note: our clock input jumps IBUF to BUFG
+via the dedicated CK_MUXED network without touching fabric,
+so even the corridor's neighborhood differs structurally.
+
+Our-only emission arithmetic also checked and rejected: our Y45
+BYP ties feed no pip at all, so principled non-parking would
+emit zero ties, but golden keeps four, netting zero diff change
+while moving bits. Correctly left alone.
+
+Remainder stands: 350 word-50 (unfuzzed HCLK minors 6-25),
+134 named (cost function, structural LED, S-stub corridor),
+15 trailing minors. Gates: xilinx7 lib 107, sv lib 228, sim
+lib 32, all green with pipefail-guarded result lines. No
+behavior change (log-only turn).
