@@ -1090,6 +1090,55 @@ count — and if a future round is asked to "get to 0", the honest answer is tha
 20 of the bits are free to match and the rest are a deliberate divergence that
 should be documented, not removed.
 
+### `rawdiff.py`'s tile label is ONE of many, and its feature names are annotations
+
+Two traps in the machine-readable diff, both hit in round 3 on a non-blinky
+design and both capable of sending an investigation the wrong way for hours.
+
+**`tiles[0].tile` is not the owner.** A frame base address is shared by dozens
+of tiles -- `0x422408` is claimed by `CMT_TOP_L_LOWER_B_X178Y9`,
+`CMT_TOP_L_UPPER_T_X178Y44`, `HCLK_CMT_L_X178Y26`, `HCLK_L_X181Y26` and all
+fifty `INT_L_X72Y*` -- and the JSON reports whichever sorts first. A cluster
+labelled `CMT_TOP_L_UPPER_T` that reads "131 bits in a clock tile" was really
+`INT_L_X72Y46` word 93, ordinary routing. Resolve the owner yourself: for each
+tile take `baseaddr`, `frames` and `offset`, require
+`baseaddr <= addr < baseaddr + frames` AND `offset <= word < offset + words`,
+and prefer the tile whose offset is LARGEST (the most specific match). Ignoring
+the word bound makes every tile in the base-address group a candidate.
+
+**`is named` does not mean `is identified`.** `features` is the list of segbits
+whose `(frame_offset, bit)` happens to cover the bit -- an annotation, not the
+reason the bit is set (`rawdiff.py` says so in its own docstring). So a bit can
+be tagged `INT_L.ER1BEG1.LOGIC_OUTS_L22` and still belong to a completely
+different tile type. Use the tag to guess, never to conclude.
+
+Both were live in one round: the "clock network is broken on the new design"
+reading was wrong, and `clkdiff.py`'s `REAL diffs: 25` was counting these
+routing bits because its own tile attribution uses the same first-match rule.
+
+### `any_design_bit.rs`: build ANY design, for whole-design diffing
+
+`crates/helion-xilinx7/tests/any_design_bit.rs` turns a source file straight
+into a `.bit` so a design other than the blinky can be diffed against Vivado.
+It is inert unless `HELION_SRC` is set (so it stays out of the suite):
+
+```
+HELION_XILINX_DB=$DB HELION_SRC=/path/d.sv HELION_XDC=/path/d.xdc \
+HELION_OUT=/tmp/x7/d.bit \
+  cargo test --release -p helion-xilinx7 --test any_design_bit -- --nocapture
+```
+
+`HELION_XDC` is optional. It asserts only that the image is a valid 9996-frame
+`xc7z020` build; content is left to `rawdiff.py`, because asserting here would
+bake today's expectations in and defeat the purpose of the diff.
+
+**First cross-design result (`t02_cnt4`, a 4-bit counter): 739 differing bits**
+against Vivado's build of the same source, versus 70 for the blinky -- and
+`CLBLM_R_X71Y47/Y46` alone accounts for 352 of them, i.e. the counter's own
+CLB configuration. So the blinky's 70 is NOT representative of this flow's
+general accuracy; treat 739 as the honest baseline for "does this generalise",
+and do not quote blinky's number as the toolchain's bit-match rate.
+
 ### Full classification of the 70-bit residual (measured, by fanout)
 
 Every remaining cluster has now been traced to the wire in
