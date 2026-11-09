@@ -823,3 +823,40 @@ route detail (fuzzing license), 134 named route choice
 xilinx7 lib 107, sv lib 228, sim lib 32, all green with
 pipefail-guarded result lines. No behavior change (no test
 change: log-only turn).
+
+## Twenty-second run (Nov 9, 2026, Mac, word-50 pooled mining, 484 held)
+
+Rebuilt with no env setup (e2e green), rawdiff re-verified at 484
+(record /tmp/x7/carry_vs_oracle_diff37.json). Attacked the 350-bit
+word-50 bucket with the 11-design internet haul (GT 2023.2 plus 10
+Vivado 2025.1 same-die builds, md5/header-verified).
+
+Tooling fixed and built (scratch, out of repo): plain-path FDRI
+parser silently misreads COMPRESS=TRUE streams (found 125 garbage
+frames in vna), so all loaders now branch on the header stamp;
+new /tmp/x7/w50pool.py pools (route-words, w50) minor samples:
+/tmp/x7/w50pool.json holds 4075 samples. faD/faS/bcd files
+recovered from the course package (A3, md5 match): faD vs faS is
+80 bits (20 named IMUX/INIT at X71Y94, 60 unnamed HCLK), but the
+route delta is multi-word, not the hoped-for minimal pair.
+
+Mining results, all negative with cause: bitwise-OR and
+column-parity of same-frame route words are disjoint from w50
+sets (0 and 17 exact of 3768); no single route word-index
+predicts any w50 bit (3725 samples); apparent perfect
+correlates (w50[16] == w73/77/93/97.31) collapse to 6 samples
+at one frame where 5 bits move together. Gap scoped exactly:
+covered HCLK features match ours bit-for-bit (HCLK_R 0=0,
+HCLK_L 2=2 on GT tiles), and the open DB's HCLK segbits use
+only frame offsets 00-05 while Vivado programs word 50 in
+minors 0-25, so the whole bucket is unfuzzed HCLK minors 6-25
+(plus beyond-05 minors generally). Second-sample structure
+confirmed (RP programs word-50 only in route-nonzero frames on
+exactly its used rows); the code itself needs fuzzing or a far
+larger learnable dataset. HCLK_CMT tiles program zero word-50
+despite routes (control data point).
+
+Remainder stands: 350 word-50 (unfuzzed HCLK minors 6-25),
+134 named (cost function), 15 trailing minors. Gates: xilinx7
+lib 107, sv lib 228, sim lib 32, all green with pipefail-guarded
+result lines. No behavior change (log-only turn).
