@@ -100,6 +100,10 @@ pub struct Sim {
     lut_input_nets: HashMap<String, [Option<String>; 6]>,
     /// Carry4 cell → live input nets (ZB-04 stage 1 fast path).
     carry: HashMap<String, CarryPins>,
+    /// LUTs whose O drives a Carry4 S input: undriven pins on these model
+    /// silicon float-high (the reference tool relies on S-path floats);
+    /// every other LUT ties undriven pins low.
+    s_feed_luts: HashSet<String>,
     /// FF → (Carry4 cell, chain position) when D is carry-driven.
     ff_d_carry: HashMap<String, (String, u8)>,
     /// Net → (Carry4 cell, chain position) for every carry-driven net, so
@@ -169,6 +173,16 @@ impl Sim {
                     .map(|s| s.to_string());
             }
             carry.insert(c.name.clone(), pins);
+        }
+        // LUTs driving Carry4 S inputs model float-high (see
+        // `s_feed_luts`): collect them via the O-net driver map.
+        let mut s_feed_luts: HashSet<String> = HashSet::new();
+        for pins in carry.values() {
+            for s in pins.s.iter().flatten() {
+                if let Some(lut) = net_lut_o.get(s) {
+                    s_feed_luts.insert(lut.clone());
+                }
+            }
         }
         let iob_from_ff = d.cells.iter().find_map(|c| {
             if !matches!(c.kind, CellKind::IobOut) {
@@ -280,6 +294,7 @@ impl Sim {
             net_drivers,
             lut_input_nets,
             carry,
+            s_feed_luts,
             ff_d_carry,
             net_carry_o,
         }
@@ -350,8 +365,8 @@ impl Sim {
     /// path is AX-fed and undriven in both bitstreams (no DI FASM lines
     /// in 261 plus 23 golden Y39 features), and the blink-proven oracle
     /// needs DI0=1 for its carry out (CO0 = S0?0:DI0 with S0 = NOT Q0).
-    /// Other unconnected inputs tie low; a connected but unresolvable
-    /// input yields X (None).
+    /// Undriven pins on S-feed LUTs read high (see `s_feed_luts`); a
+    /// connected but unresolvable input yields X (None).
     fn carry_output_live(
         &self,
         cell: &str,
@@ -423,6 +438,11 @@ impl Sim {
     }
 
     /// Live LUT output with driven inputs and multi-level chains resolved.
+    /// Undriven inputs tie low, except on LUTs feeding Carry4 S inputs:
+    /// those model silicon float-high, which the reference tool relies
+    /// on (golden Y39X1 ALUT is AND(Q1, float A6)). Modeling low there
+    /// would kill chains that run on silicon; everywhere else the
+    /// tie-low contract stands (see the generic LUT tests).
     fn lut_output_live(
         &self,
         lut: &str,
@@ -430,12 +450,16 @@ impl Sim {
         stack: &mut Vec<String>,
     ) -> bool {
         let init = self.lut_init.get(lut).copied().unwrap_or(0);
+        let float_high = self.s_feed_luts.contains(lut);
         let mut addr = 0u64;
-        if let Some(pins) = self.lut_pin_nets.get(lut) {
-            for (pin, net) in pins {
-                if self.pin_net_value(net, memo, stack) {
-                    addr |= 1 << pin;
-                }
+        let pins = self.lut_pin_nets.get(lut);
+        for pin in 0..6u8 {
+            let high = match pins.and_then(|ps| ps.iter().find(|(p, _)| *p == pin)) {
+                None => float_high,
+                Some((_, net)) => self.pin_net_value(net, memo, stack),
+            };
+            if high {
+                addr |= 1 << pin;
             }
         }
         (init >> addr) & 1 == 1
@@ -808,6 +832,9 @@ impl Sim {
             NetDriver::Lut(cell) => {
                 let init = self.lut_init.get(cell).copied().unwrap_or(0);
                 let inputs = self.lut_input_nets.get(cell);
+                // Same split as `lut_output_live`: S-feed LUT floats read
+                // high, everything else ties low.
+                let float_high = self.s_feed_luts.contains(cell.as_str());
                 stack.push(net);
                 let mut addr = 0u64;
                 let mut unknown = false;
@@ -815,11 +842,10 @@ impl Sim {
                     let net_on_pin = inputs
                         .and_then(|ins| ins.get(pin))
                         .and_then(|o| o.as_deref());
-                    // Unconnected LUT inputs tie low — same as `step_posedge`,
-                    // which only drives addr bits from connected FF Qs. Only a
-                    // connected-but-unresolvable net (undriven, loop) yields X.
+                    // Only a connected-but-unresolvable net (undriven,
+                    // loop) yields X.
                     let bit = match net_on_pin {
-                        None => Some(false),
+                        None => Some(float_high),
                         Some(n) => self.eval_net(n, memo, stack),
                     };
                     match bit {
@@ -1454,10 +1480,9 @@ endmodule
         );
         assert_eq!(count_kind(&cone, |k| matches!(k, CellKind::Hff)), want_ff);
         assert_eq!(count_kind(&carry, |k| matches!(k, CellKind::Hff)), want_ff);
-        // Transparent pads carry four routed passthrough S-LUTs each (the
-        // oracle pads X1@Y40-43 all show passthrough INITs; synth names
-        // them `_ps`). A floating pad I5 would read S=0, killing the
-        // chain above bit 8.
+        // Transparent pads carry four routed S-LUTs each (synth names them
+        // `_ps`). Pad inputs stay routed (never floated) so sim and
+        // silicon agree bit for bit; S-feed floats model high.
         assert_eq!(
             carry
                 .cells
