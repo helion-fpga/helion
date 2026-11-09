@@ -558,3 +558,22 @@ not IOB config divergence. Every one names INT_R route pips only
 OLOGIC / OMUX / IOB feature appears. Same parked detour class.
 Gates: xilinx7 lib 107, sv lib 228, sim lib 32, all green with
 pipefail-guarded result lines. No behavior change.
+
+## Sixteenth run (Nov 8, 2026, Mac, contention probe negative, 484 held)
+
+Rebuilt with no env setup (e2e green), rawdiff re-verified at 484
+(record /tmp/x7/carry_vs_oracle_diff30.json). New probe of the
+detour class: full segbits decode (gt_decode) of both bitstreams at
+INT_R_X71Y44, plus a 22-tile census of multi-driven LOGIC_OUTS pins
+in both. Golden: LOGIC_OUTS3 injects once into the ER1 ring
+(ER1BEG_S0) and FAN_ALT3 taps back from it (NL1END_S3_0). Ours: the
+same source fans out directly (FAN_ALT3.LOGIC_OUTS3) with the second
+sink on a separate chain (IMUX5.NW2END3, IMUX42.FAN_BOUNCE7). Two
+candidate rules died on the data: golden multi-drives LOGIC_OUTS in
+25 cases across the 22 tiles (no single-load rule), and no wire is
+driven twice anywhere (no contention forced the ring). The
+divergence is a genuine inject-at-source vs inject-ring-then-tap
+choice with no derivable rule from one sample, so it stays parked
+with the cost-model work.
+Gates: xilinx7 lib 107, sv lib 228, sim lib 32, all green with
+pipefail-guarded result lines. No behavior change.
