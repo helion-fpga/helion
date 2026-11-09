@@ -456,3 +456,13 @@ node-driven intra-tile by NL1BEG0 from OUTS5). Traced end to end:
   in our own graph without delays, but hardcoding local-BQ from one
   sample is not a rule. Parked with the cost-model work; no behavior
   change this run, diff held at 503 (re-verified same artifacts).
+
+## Arrival census (Nov 8, 2026, Mac, no-change record)
+
+Full 7-tile golden BYP_ALT program (gt_decode, one run): Y39 misses
+{1} (ALT0 is the corridor stub), Y40-44 full house, Y45 misses
+{0,2,5,7}. Per-slice clock-need mappings all die on Y39 (its X1
+transit needs no clock yet keeps {0,2,5,7}), and vertical
+branch patterns show no connected tree. The program reflects
+Vivado clock-tree tap topology, unknowable without its clock
+router. Parked; Y45 over-programming (10 ours-only bits) stays.
