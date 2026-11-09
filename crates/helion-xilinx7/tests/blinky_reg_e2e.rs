@@ -341,8 +341,8 @@ fn blinky_reg_carry_e2e_fasm() {
     assert_eq!(fasm_text.matches("CARRY4.ACY0").count(), 1, "head bit A only");
     assert_eq!(
         fasm_text.matches("64'hFFFFFFFF00000000").count(),
-        46,
-        "25 compute plus 16 pad-fill plus 3 tail-fill plus transit plus LD0 S-LUTs"
+        49,
+        "25 compute plus 16 pad-fill plus 3 tail-fill plus transit S0 plus 3 transit B/C/D plus LD0 S-LUTs"
     );
     assert_eq!(fasm_text.matches("FFMUX.XOR").count(), 26, "chain FF D muxes");
     // Tail placement: bit 24 on Y44 X1-D, LD0 on Y45 X0-A, no fabric LD0.

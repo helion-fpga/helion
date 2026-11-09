@@ -16311,8 +16311,9 @@ fn emit_carry_increment(
     let pad_after = |k: usize| k >= 1 && k + 3 <= groups;
     // Head transit (blinky-grounded: present exactly when pads exist): a
     // carry bridging g0 to g1 so computes land on X0 slices and pads on
-    // X1, like the golden Y39X1 transit. S0 is a Q1 passthrough; the
-    // other positions stay bare (they propagate in sim and silicon).
+    // X1, like the golden Y39X1 transit. S0 is a Q1 passthrough; B/C/D
+    // sample covered Qs (golden Y39X1 full group), AND-idempotent with
+    // the head carry-out, so the count chain is unchanged.
     let transit = groups >= 4;
     let tco = format!("u_carry_{lhs}_tco");
     // Tail packing: a partial tail group packs top-aligned (a 1-bit tail
@@ -16411,6 +16412,18 @@ fn emit_carry_increment(
             d.add_cell(&slut, CellKind::Lut6 { init: S_LUT_INIT });
             d.connect(&ts, &slut, "O");
             d.connect(&bit_name(lhs, w, 1), &slut, "I5");
+            // B/C/D (golden Y39X1 B<-bit2, C<-bit3, D<-east): AND-side
+            // samples on covered Qs. D shares C's tap (bit3); golden's
+            // east detour is a timing artifact no shortest-path router
+            // reproduces, and any covered Q preserves the AND.
+            for (j, bit) in [(1usize, 2usize), (2, 3), (3, 3)] {
+                let ts = format!("u_carry_{lhs}_trs{j}");
+                d.connect(&ts, &pname, format!("S{j}"));
+                let slut = format!("u_carry_{lhs}_trs{j}_lut");
+                d.add_cell(&slut, CellKind::Lut6 { init: S_LUT_INIT });
+                d.connect(&ts, &slut, "O");
+                d.connect(&bit_name(lhs, w, bit), &slut, "I5");
+            }
         }
         if pad_after(g) {
             // Transparent pad with routed S-fill. The golden oracle pads
@@ -18710,6 +18723,30 @@ mod tests {
             cell_pin(&d, "u_carry_count_c1", "CI"),
             Some("u_carry_count_tco".to_string())
         );
+        // Transit B/C/D (golden Y39X1 full group): AND-side samples on
+        // covered Qs, AND-idempotent with the head carry-out, so the
+        // count chain is provably unchanged and no FF sits downstream.
+        for (j, bit) in [(1usize, 2usize), (2, 3), (3, 3)] {
+            assert_eq!(
+                cell_pin(&d, "u_carry_count_transit", &format!("S{j}")),
+                Some(format!("u_carry_count_trs{j}"))
+            );
+            let lut = format!("u_carry_count_trs{j}_lut");
+            let init = d
+                .cells
+                .iter()
+                .find(|c| c.name == lut)
+                .and_then(|c| match c.kind {
+                    CellKind::Lut6 { init } => Some(init),
+                    _ => None,
+                })
+                .expect("transit S-LUT");
+            assert_eq!(init, 0xFFFF_FFFF_0000_0000, "passthrough {lut}");
+            assert_eq!(
+                cell_pin(&d, &lut, "I5"),
+                Some(format!("count_{bit}"))
+            );
+        }
         // LD0 top-bit load is an extended carry stage, not cone logic.
         assert_eq!(
             cell_pin(&d, "u_carry_LD0_c", "CI"),
