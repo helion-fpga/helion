@@ -982,3 +982,24 @@ Remainder stands: 350 word-50 (unfuzzed HCLK minors),
 (unfuzzed HROW minors, clock-topology modeled). Gates: xilinx7
 lib 107, sv lib 228, sim lib 32, all green with pipefail-guarded
 result lines. No behavior change (log-only turn).
+
+## Twenty-seventh run (Nov 9, 2026, Mac, universals verdict, 484 held)
+
+Rebuilt with no env setup (e2e green), rawdiff re-verified at 484
+(record /tmp/x7/carry_vs_oracle_diff43.json). Put the universal-constant
+question to all 14 same-die designs (GT, faD, faS, bcd, 10 RP 7z020
+builds, two Vivado versions, two packages).
+
+HCLK universals: dead. Zero word bits survive 14 samples (the
+4-sample claim was route-detail coincidence), killing a
+would-be hardcode with data. CFG universals: 16 bits hold at
+14/14 (13 word-50 plus 3 word-68, frames 0x40191a/b), ours has
+zero of them. Decision, held deliberately: left unimplemented.
+Sample-only constants without a bit-to-meaning mapping are
+hardcoding no matter how high N gets, and that rule came from
+the user directly. The required-features precedent does not
+transfer (those are DB-named features; these are not). Logged
+as falsifiable: a meaning assignment or a fuzzing license flips
+it. Gates: xilinx7 lib 107, sv lib 228, sim lib 32, all green
+with pipefail-guarded result lines. No behavior change (log-only
+turn).
