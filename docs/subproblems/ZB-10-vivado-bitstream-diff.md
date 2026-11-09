@@ -479,6 +479,25 @@ both pin readings), with the route (IMUX10 from OUTS5) unchanged.
   ours-only). Remainder: HCLK (~330, license), S detours plus pad-A
   fill plus arrival (cost model), corridor plus CFG_CENTER smalls.
 
+## Thirteenth run (Nov 8, 2026, Mac, always-on port, 487 to 484)
+
+Cross-build frame comparison showed word 68 set in every Vivado
+build and every old Helion build but zero in ours, while word 50 is
+GT-only (design-driven, stays parked). The word-68 bits are
+CFG_CENTER_MID.ALWAYS_ON_PROP1/2/3, and an orphan Oct 23 commit
+(1044433, on no branch) shows our line never ported the
+`required_features()` mechanism: read the part directory's
+`required_features.fasm` at load, emit unconditionally, warn if
+missing. Ported exactly that (data-driven from the open DB, not
+oracle-pasted): Device carries the list, EmitDevice defaults empty,
+XDevice serves it, emit_fasm prepends it.
+
+- Gates: xilinx7 lib 107 (new mapping test), sv 228 and sim 32
+  untouched and standing, all four e2e green, determinism
+  re-verified (identical FASM hashes across rebuilds).
+- Record /tmp/x7/carry_vs_oracle_diff27.json: 484 bits. The 3 named
+  CFG entries are gone; the 13 unnamed word-50 bits stay (license).
+
 ## Tool-flow negatives (Nov 8, 2026, Mac, no-change record)
 
 Two hypothesis classes closed from Vivado's own artifacts: the

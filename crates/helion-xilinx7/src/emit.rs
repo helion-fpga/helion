@@ -34,6 +34,12 @@ pub trait EmitDevice {
     fn ioi_tile(&self, _iob_tile: &str) -> Option<String> {
         None
     }
+    /// Static always-on housekeeping features for this part, from the
+    /// DB's `required_features.fasm`. Defaults to none; the XDevice
+    /// impl reads the part directory at load.
+    fn required_features(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// IBUF `.IN` feature prefix for an IOSTANDARD, from
@@ -114,6 +120,12 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     let placed = &routed.placed;
     let packed = &placed.packed;
     let mut lines: Vec<String> = Vec::new();
+
+    // Features every bitstream for this part must contain, straight from
+    // the DB's `required_features.fasm`. These static always-on bits are
+    // referenced by nothing in the design, so they cannot be derived from
+    // routing: emit them first and unconditionally.
+    lines.extend(device.required_features());
 
     // LUTs: INIT vector per occupied ALUT..DLUT.
     for lut in &placed.luts {
@@ -906,6 +918,28 @@ mod tests {
         assert!(!text.contains("BCY0") && !text.contains("CCY0") && !text.contains("DCY0"), "got:\n{text}");
         // Chain FF samples the sum through FFMUX.XOR, never a letter input.
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFFMUX.XOR"), "got:\n{text}");
+    }
+
+    /// Required part features (from `required_features.fasm`) emit first
+    /// and unconditionally: nothing in the design references them.
+    #[test]
+    fn emit_required_features_come_first() {
+        struct ReqEmit;
+        impl EmitDevice for ReqEmit {
+            fn tile_type(&self, _tile: &str) -> Option<String> {
+                Some("CLBLL_L".into())
+            }
+            fn site_rel(&self, _tile: &str, _site: &str) -> Option<String> {
+                Some("SLICEL_X0".into())
+            }
+            fn required_features(&self) -> Vec<String> {
+                vec!["CFG_CENTER_MID_X123Y84.ALWAYS_ON_PROP1".into()]
+            }
+        }
+        let r = routed_blinky();
+        let text = emit_fasm(&r, &ReqEmit).unwrap().fasm.join("\n");
+        let first = text.lines().next().unwrap_or("");
+        assert_eq!(first, "CFG_CENTER_MID_X123Y84.ALWAYS_ON_PROP1");
     }
 
     /// CYINIT value selects the PRECYINIT source: 0 to C0, 1 to C1.
