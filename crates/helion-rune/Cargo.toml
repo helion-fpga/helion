@@ -1,0 +1,29 @@
+[package]
+name = "helion-rune"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Helion Vivado-style IDE shell on Rune (from-scratch views, no egui)"
+
+[[bin]]
+name = "helion-rune"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned to the audited local rev a7f276c3630f85a06a0230295da4d2bd172d8d3b
+# (/Users/saksham/rune); path deps keep headless builds reproducible offline.
+rune = { path = "../../../rune/crates/rune", features = ["native-file-dialog"] }
+rune-kit = { path = "../../../rune/crates/rune-kit" }
+# Real engine flows for runs.rs (same crates helion-ide --headless drives via
+# IdeModel; helion-rune never depends on the helion-gui lib itself).
+helion-device = { path = "../helion-device" }
+helion-drc = { path = "../helion-drc" }
+helion-ir = { path = "../helion-ir" }
+helion-pack = { path = "../helion-pack" }
+helion-place = { path = "../helion-place" }
+helion-proj = { path = "../helion-proj" }
+helion-sta = { path = "../helion-sta" }
+helion-sv = { path = "../helion-sv" }
+helion-vhdl = { path = "../helion-vhdl" }
+helion-sim = { path = "../helion-sim" }

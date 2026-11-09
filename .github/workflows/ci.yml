@@ -10,7 +10,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.99.1
       - name: workspace tests
         run: cargo test --workspace
         continue-on-error: true
@@ -27,7 +27,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.99.1
       - name: workspace tests
         run: cargo test --workspace
         continue-on-error: true

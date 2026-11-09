@@ -34,13 +34,12 @@ eframe = { version = "0.32.3", default-features = false, features = ["glow", "de
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# rfd's Linux xdg-portal path pulls ashpd → zbus. zbus ≥5.14 / zvariant ≥5.10
-# need rustc 1.87; Helion CI and rust-version are 1.85.0. Pin the last 1.85
-# MSRV line so Open HDL stays a native picker on Linux.
+# rfd's Linux xdg-portal path pulls ashpd → zbus. Pinned in lockstep with
+# the rune accesskit_unix floor (zbus ^5.19); workspace MSRV is 1.99.1.
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = "=5.13.2"
-zbus_macros = "=5.13.2"
-zbus_names = "=4.3.1"
-zvariant = "=5.9.2"
-zvariant_derive = "=5.9.2"
-zvariant_utils = "=3.3.0"
+zbus = "=5.19.0"
+zbus_macros = "=5.19.0"
+zbus_names = "=4.3.5"
+zvariant = "=5.15.1"
+zvariant_derive = "=5.15.1"
+zvariant_utils = "=4.2.0"
