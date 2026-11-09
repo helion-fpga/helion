@@ -1003,3 +1003,20 @@ as falsifiable: a meaning assignment or a fuzzing license flips
 it. Gates: xilinx7 lib 107, sv lib 228, sim lib 32, all green
 with pipefail-guarded result lines. No behavior change (log-only
 turn).
+
+## Twenty-eighth run (Nov 9, 2026, Mac, HROW gap scoped, 484 held)
+
+Rebuilt with no env setup (e2e green), rawdiff re-verified at 484
+(record /tmp/x7/carry_vs_oracle_diff44.json). Followed the
+trailing-word lead into the HROW segbits and scoped the gap
+instead of closing it: the open DB covers BUFHCE plus CASCO mux
+selects fully in trailing minors 26-29, our six HROW features
+match golden's exactly, yet seven trailing bits differ. Those
+bits belong to non-BUFHCE/non-CASCO HROW functions the DB never
+fuzzed (likely GCLK segment enables), so learning them needs
+row-to-bit mapping work at fuzzing grade. Open-fasm2frames
+route skipped honestly: the tool needs venv deps we do not
+have, and it caps at the same DB ceiling anyway, so it could
+only audit our encoder, not reveal new bits. Gates: xilinx7
+lib 107, sv lib 228, sim lib 32, all green with pipefail-guarded
+result lines. No behavior change (log-only turn).
