@@ -179,10 +179,13 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     // to carry-S legs (dedicated site-internal path, pin S{j}); the
     // S-LUT *input* legs live on the Q nets via the placed LUT input
     // endpoints, and those route through fabric (the oracle feeds every
-    // counter S input from INT). DI gets no endpoints: it reads the
-    // S-LUT O5 internally by mux default. Head CI arrives at the slice
-    // AX pin through fabric; chained CI joins its co net (dedicated
-    // cascade, classified in the net loop).
+    // counter S input from INT). DI gets no endpoints and no FASM
+    // lines in either bitstream: DI0 reads the undriven AX path high
+    // (the blink-proven oracle needs DI0=1 for head CO0) while DI1-3
+    // read low (LUTRAM MC defaults), which is what pads need to
+    // transmit; sim models exactly this split. A CYINIT-config head
+    // leaves CI unconnected (C0/C1 from config); chained CI joins its
+    // co net (dedicated cascade, classified in the net loop).
     let carry_site: HashMap<&str, &str> = placed
         .carries
         .iter()

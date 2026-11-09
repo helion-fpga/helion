@@ -426,3 +426,33 @@ rule. The 16 AND-shape bits stay open honestly.
   AND-shape bits. Remainder: HCLK (~350, license), S detours
   (delay model, eighth run), X1-AND shape (16, sim float rule),
   arrival quirks plus corridor plus CFG_CENTER smalls.
+
+## Eleventh run (Nov 8, 2026, Mac, pad-A sample divergence, 503 held)
+
+Question: our pad-A route uses a 5-tile NW2 cascade (X72,
+NW2BEG3 from WW4END3, 8 ours-only bits) while golden feeds pad-A
+locally (Y40: IMUX5 from FAN_BOUNCE3 via FAN_ALT3 from NL1END_S3_0,
+node-driven intra-tile by NL1BEG0 from OUTS5). Traced end to end:
+
+- Different source nets, not a route divergence: ours samples the
+  south top Q (Y40 pad-A from Y39 bit3 via EE4/WW4/NW2, the sv fill
+  rule), golden samples the local group BQ (Y40 bit5 via NL1).
+- Both transmit: brute-forced pad MUXCY cascade over all states
+  shows ours {Q3,Q6,Q7,Q7} and golden {Q5,Q6,Q7,Q7} both pass CI
+  through exactly when DI reads 0 (pads) with DI0=1 at the head.
+  (An earlier by-hand model with the wrong pad CI failed both
+  designs and disagreed with the passing 5000-cycle cone test; the
+  error was using head CO0 instead of the pad CI, plus DI confusion.
+  The brute force plus the green cone test is the record.)
+- DI plumbing refined: DI gets no endpoints and no FASM lines in
+  either bitstream. DI0 reads the undriven AX path high (the oracle
+  needs DI0=1 for head CO0; an O5-read would give NOT Q0 and break
+  it, refuting the old route.rs O5 comment, corrected this run).
+  DI1-3 read low (LUTRAM MC defaults), which pads need. Sim models
+  exactly this split and the cone tests prove it.
+- Verdict: the sample choice (nearest-local vs south-covered) is a
+  wirelength/timing cost decision, same bucket as the eighth-run
+  detours. A future fill-selection rule could minimize BFS distance
+  in our own graph without delays, but hardcoding local-BQ from one
+  sample is not a rule. Parked with the cost-model work; no behavior
+  change this run, diff held at 503 (re-verified same artifacts).
