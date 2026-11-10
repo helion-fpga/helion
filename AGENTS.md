@@ -1090,6 +1090,38 @@ count — and if a future round is asked to "get to 0", the honest answer is tha
 20 of the bits are free to match and the rest are a deliberate divergence that
 should be documented, not removed.
 
+#### Round 4 status: what is measured, and what the objective still needs
+
+Cross-design bit-diff against Vivado's build of the SAME source:
+
+```
+design                      differing bits   of which unnamed (word 50)
+blinky (25-bit, carry)             70                   0
+toggle flop (1 FF)                303                 229
+4-bit counter                     735                 349
+```
+
+Improvements landed this round, each verified against the blinky being
+byte-identical (`8bb37a4c`):
+
+- non-carry logic no longer spends SLICEM halves (`slice_near` tie-break):
+  toggle 355 -> 303, named 126 -> 74
+- `any_design_bit` harness, so a design other than the blinky can be diffed at
+  all
+- a pre-existing `route.rs` doctest failure fixed
+
+**The objective (`100% match across different designs`) is NOT met and is not
+close.** The dominant blocker is identified but not solved: word 50's table is
+a blinky snapshot applied to every design, which alone accounts for 229 of the
+toggle's 303 bits and 349 of cnt4's 735. Everything else left is either
+per-design placement (cnt4 lands in Y46 where we pick Y47 -- both legal, no
+XDC constrains it) or the per-row A-vs-B routing already documented.
+
+Test baseline is unchanged: one `helion-xilinx7` failure,
+`pico_acceptance::picorv32_with_bram_end_to_end`, which is the documented
+missing-BRAM-inference gap and pre-existing. Do not attribute it to a
+placement change.
+
 ### FOUND: `CLOCK_WORD50_POSITIONAL` is a BLINKY SNAPSHOT, not a device map
 
 The largest single cause of cross-design mismatch, and the reason the blinky's
