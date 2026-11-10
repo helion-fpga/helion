@@ -1090,6 +1090,59 @@ count — and if a future round is asked to "get to 0", the honest answer is tha
 20 of the bits are free to match and the rest are a deliberate divergence that
 should be documented, not removed.
 
+### FOUND: `CLOCK_WORD50_POSITIONAL` is a BLINKY SNAPSHOT, not a device map
+
+The largest single cause of cross-design mismatch, and the reason the blinky's
+good number does not transfer.
+
+`apply_clock_word_50` writes a hardcoded table derived by decoding
+`work/ref/GT-blinky.bit`, and writes it **unconditionally, for every design**
+(`frames.rs`, `CLOCK_WORD50_POSITIONAL`, applied as `words[50] |= value`).
+
+Word 50 is **design-dependent**. Across four Vivado builds of different
+circuits, 9,927 frames agree and **69 frames differ**, and the nonzero subset
+is different for every design:
+
+```
+design   frames with nonzero word 50 (of the 69 design-dependent ones)
+blinky   38        toggle  19        cnt4  39        cnt8  51
+```
+
+So the table encodes *which clock resources this particular design uses*, not a
+fixed device default. Applying the blinky's copy to another design sets bits
+Vivado leaves clear. Measured on the toggle flop:
+
+```
+bits we set that Vivado did not : 176
+bits Vivado set that we did not :  53
+```
+
+and **all 229 of the toggle's unnamed differing bits are word 50** (113 HCLK_R,
+56 HCLK_L, 46 HCLK_IOI3, 14 CLBLM_R). It is the dominant class on any design
+that is not the blinky -- on cnt4 it is 349 unnamed bits.
+
+Diagnostic that made it obvious: print the `blinky` column alongside `ours` in
+a per-frame table. Ours matched the blinky oracle **digit for digit on every
+row** while Vivado's differed, because ours *is* the blinky's table.
+
+Do not "fix" this by deleting the table: the blinky needs it (it is what took
+the image 470 -> 120 bits), and a clean `clkdiff` does not prove byte-equality.
+The open question is what the field encodes so it can be derived per design;
+`frames.rs` currently records it as "not derivable from the netlist, a config
+field the X-Ray database does not describe", which is an admission, not an
+answer. Working hypotheses worth testing, cheapest first:
+
+1. It may track which `HCLK`/`BUFG`/`REBUF` sites the design's clock route
+   actually touches -- i.e. a positional encoding of the clock *route*, which
+   Helion already computes and could emit instead of copying a table.
+2. It may be per-`far_group` state that Vivado leaves at zero when a group is
+   unused; the toggle's 176 over-set bits are concentrated in frames whose
+   blinky value is nonzero but whose toggle value is 0.
+
+Also note the applier is `|=` and never clears, so once word 50 is set the
+design cannot express a zero there. Any per-design derivation must write the
+field outright rather than OR into it.
+
 ### `rawdiff.py`'s tile label is ONE of many, and its feature names are annotations
 
 Two traps in the machine-readable diff, both hit in round 3 on a non-blinky
