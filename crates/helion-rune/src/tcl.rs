@@ -176,6 +176,19 @@ pub const COMMANDS: &[&str] = &[
     "enable_bp",
     "disable_bp",
     "delete_bp",
+    "memory",
+    "memories",
+    "select_memory",
+    "select_memory_word",
+    "locals",
+    "select_local",
+    "forces",
+    "force_table",
+    "force_constants",
+    "add_force",
+    "deposit",
+    "remove_force",
+    "select_force",
     "report_property",
     "list_property",
     "list_properties",
@@ -2424,6 +2437,16 @@ fn dispatch_host(
         "enable_bp" => cmd_enable_bp(s, argv, line),
         "disable_bp" => cmd_disable_bp(s, argv, line),
         "delete_bp" => cmd_delete_bp(s, argv, line),
+        "memory" | "memories" => cmd_memory(s, argv, line),
+        "select_memory" => cmd_select_memory(s, argv, line),
+        "select_memory_word" => cmd_select_memory_word(s, argv, line),
+        "locals" => cmd_locals(s, argv, line),
+        "select_local" => cmd_select_local(s, argv, line),
+        "forces" | "force_table" | "force_constants" => cmd_forces(s, argv, line),
+        "add_force" => cmd_add_force(s, argv, line),
+        "deposit" => cmd_deposit(s, argv, line),
+        "remove_force" => cmd_remove_force(s, argv, line),
+        "select_force" => cmd_select_force(s, argv, line),
         "report_property" => cmd_report_property(s, argv, line),
         "list_property" | "list_properties" => cmd_list_property(s, argv, line),
         "select_objects" => cmd_select_objects(s, argv, line, false),
@@ -3611,7 +3634,108 @@ fn cmd_breakpoints(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
         return Ctl::err(line, wrong_args("breakpoints"));
     }
     s.center = crate::state::CenterPane::Debug;
+    s.debug.tab = crate::views::debug::DebugTab::Breakpoints;
     Ctl::Value(crate::views::debug::breakpoints_text(s))
+}
+
+/// Open the Memory tab and dump its table (old `memory` / `memories`).
+fn cmd_memory(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
+    if argv.len() != 1 {
+        return Ctl::err(line, wrong_args("memory"));
+    }
+    s.center = crate::state::CenterPane::Debug;
+    match crate::views::debug::open_memory(s) {
+        Ok(out) => Ctl::Value(out),
+        Err(e) => Ctl::err(line, e),
+    }
+}
+
+fn cmd_select_memory(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
+    let spec = argv.get(1..).unwrap_or_default().join(" ");
+    s.center = crate::state::CenterPane::Debug;
+    match crate::views::debug::select_memory(s, &spec) {
+        Ok(out) => Ctl::Value(out),
+        Err(e) => Ctl::err(line, e),
+    }
+}
+
+fn cmd_select_memory_word(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
+    let spec = argv.get(1..).unwrap_or_default().join(" ");
+    s.center = crate::state::CenterPane::Debug;
+    match crate::views::debug::select_memory_word(s, &spec) {
+        Ok(out) => Ctl::Value(out),
+        Err(e) => Ctl::err(line, e),
+    }
+}
+
+/// Open the Locals tab and dump its table (old `locals`).
+fn cmd_locals(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
+    if argv.len() != 1 {
+        return Ctl::err(line, wrong_args("locals"));
+    }
+    s.center = crate::state::CenterPane::Debug;
+    match crate::views::debug::open_locals(s) {
+        Ok(out) => Ctl::Value(out),
+        Err(e) => Ctl::err(line, e),
+    }
+}
+
+fn cmd_select_local(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
+    let spec = argv.get(1..).unwrap_or_default().join(" ");
+    s.center = crate::state::CenterPane::Debug;
+    match crate::views::debug::select_local(s, &spec) {
+        Ok(out) => Ctl::Value(out),
+        Err(e) => Ctl::err(line, e),
+    }
+}
+
+/// Open the Forces tab and dump its table (old `forces` / `force_table` /
+/// `force_constants`).
+fn cmd_forces(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
+    if argv.len() != 1 {
+        return Ctl::err(line, wrong_args("forces"));
+    }
+    s.center = crate::state::CenterPane::Debug;
+    match crate::views::debug::open_forces(s) {
+        Ok(out) => Ctl::Value(out),
+        Err(e) => Ctl::err(line, e),
+    }
+}
+
+fn cmd_add_force(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
+    let spec = argv.get(1..).unwrap_or_default().join(" ");
+    s.center = crate::state::CenterPane::Debug;
+    match crate::views::debug::add_force(s, &spec) {
+        Ok(out) => Ctl::Value(out),
+        Err(e) => Ctl::err(line, e),
+    }
+}
+
+fn cmd_deposit(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
+    let spec = argv.get(1..).unwrap_or_default().join(" ");
+    s.center = crate::state::CenterPane::Debug;
+    match crate::views::debug::add_deposit(s, &spec) {
+        Ok(out) => Ctl::Value(out),
+        Err(e) => Ctl::err(line, e),
+    }
+}
+
+fn cmd_remove_force(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
+    let spec = argv.get(1..).unwrap_or_default().join(" ");
+    s.center = crate::state::CenterPane::Debug;
+    match crate::views::debug::remove_force(s, &spec) {
+        Ok(out) => Ctl::Value(out),
+        Err(e) => Ctl::err(line, e),
+    }
+}
+
+fn cmd_select_force(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
+    let spec = argv.get(1..).unwrap_or_default().join(" ");
+    s.center = crate::state::CenterPane::Debug;
+    match crate::views::debug::select_force(s, &spec) {
+        Ok(out) => Ctl::Value(out),
+        Err(e) => Ctl::err(line, e),
+    }
 }
 
 /// Run the interactive event engine (`sim_run [cycles]`). Missing or
@@ -4536,6 +4660,21 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
         "enable_bp" => ("enable_bp ?id|index|name?", "enable one breakpoint"),
         "disable_bp" => ("disable_bp ?id|index|name?", "disable one breakpoint"),
         "delete_bp" => ("delete_bp ?id|index|name?", "delete one breakpoint"),
+        "memory" | "memories" => ("memory", "open memory and dump LUT INIT arrays"),
+        "select_memory" => ("select_memory name|index", "select a memory array"),
+        "select_memory_word" => ("select_memory_word addr", "select a memory word"),
+        "locals" => ("locals", "open locals and dump live probes"),
+        "select_local" => ("select_local name|index", "select one locals row"),
+        "forces" | "force_table" | "force_constants" => {
+            ("forces", "open force constants and dump the table")
+        }
+        "add_force" => (
+            "add_force ?-deposit? signal value ?-radix bin|hex? ?-start_time ps? ?-cancel_after ps?",
+            "hold or schedule a signal value",
+        ),
+        "deposit" => ("deposit signal value", "one-shot poke a signal"),
+        "remove_force" => ("remove_force ?signal|index?", "drop a force row"),
+        "select_force" => ("select_force signal|index", "select one force row"),
         "report_property" => (
             "report_property object",
             "all properties of an object as a table",
@@ -4654,6 +4793,8 @@ fn help_overview() -> String {
         "  get_property prop obj | set_property name value objs | report_property obj | list_property obj",
         "  assign_package_pin port pin | package | select_package_pin pin",
         "  sim_run sim_step sim_restart | breakpoints add_bp select_breakpoint enable_bp disable_bp delete_bp",
+        "  memory select_memory select_memory_word | locals select_local",
+        "  forces add_force deposit remove_force select_force",
         "  select_objects highlight_objects get_selected_objects | current_design | clear",
         "Flow: synth_design|read_sv file opt_design place_design route_design write_bitstream write_checkpoint",
         "  create_clock report_timing report_utilization mark_debug eco open_hw_manager program_hw report_die report_featuremap",
@@ -5944,7 +6085,7 @@ mod tests {
         eval_command(&mut s, "sim_run");
         assert_eq!(s.debug.breakpoints[0].hits, 1, "value hit must count");
         assert!(
-            has_line(&s, "sim_run HIT id=1 signal=led value=1"),
+            has_line(&s, "sim_run HIT id=1 SIGNAL=led VALUE=1"),
             "{:?}",
             lines(&s)
         );
@@ -6005,6 +6146,250 @@ mod tests {
         eval_command(&mut s, "enable_bp");
         assert!(
             last_error(&s).contains("enable/disable: select a breakpoint first"),
+            "{:?}",
+            lines(&s)
+        );
+    }
+
+    #[test]
+    fn memory_commands_open_and_select_words() {
+        let mut s = AppState::demo();
+        eval_command(&mut s, "memory");
+        assert!(
+            last_error(&s).contains("sim: no design (synth first)"),
+            "{:?}",
+            lines(&s)
+        );
+        crate::views::debug::seed_debug_fixture(&mut s).expect("fixture must seed");
+        eval_command(&mut s, "memories");
+        assert_eq!(s.center, crate::state::CenterPane::Debug);
+        assert_eq!(
+            s.debug.tab,
+            crate::views::debug::DebugTab::Memory,
+            "memories is the memory alias"
+        );
+        assert!(has_line(&s, "memory n="), "{:?}", lines(&s));
+        assert!(!s.debug.memories.is_empty(), "counter has LUTs");
+        assert!(
+            has_line(&s, "TYPE=lut_init"),
+            "LUT INIT arrays must list: {:?}",
+            lines(&s)
+        );
+        assert!(
+            has_line(&s, "NAME=seq TYPE=seq"),
+            "packed sequential word must list: {:?}",
+            lines(&s)
+        );
+        // "seq" sorts first with a single word; exercise a 64-word LUT ROM.
+        let lut = s
+            .debug
+            .memories
+            .iter()
+            .find(|m| m.kind == "lut_init")
+            .map(|m| m.name.clone())
+            .expect("counter LUT ROM");
+        eval_command(&mut s, &format!("select_memory {lut}"));
+        assert_eq!(s.debug.selected_memory.as_deref(), Some(lut.as_str()));
+        assert!(
+            has_line(&s, &format!("NAME={lut} TYPE=")),
+            "{:?}",
+            lines(&s)
+        );
+        assert!(has_line(&s, "memory_words n="), "{:?}", lines(&s));
+        eval_command(&mut s, "select_memory_word 1");
+        assert_eq!(s.debug.selected_memory_addr, Some(1));
+        assert!(has_line(&s, "ADDR=1 DATA="), "{:?}", lines(&s));
+        eval_command(&mut s, "select_memory_word 0x2");
+        assert_eq!(s.debug.selected_memory_addr, Some(2));
+        eval_command(&mut s, "select_memory bogus");
+        assert!(
+            last_error(&s).contains("select_memory: no memory bogus"),
+            "{:?}",
+            lines(&s)
+        );
+        eval_command(&mut s, "select_memory 999");
+        assert!(
+            last_error(&s).contains("select_memory: no row 999"),
+            "{:?}",
+            lines(&s)
+        );
+        eval_command(&mut s, "select_memory_word 9999");
+        assert!(
+            last_error(&s).contains("select_memory_word: no addr 9999"),
+            "{:?}",
+            lines(&s)
+        );
+        eval_command(&mut s, "select_memory_word bogus");
+        assert!(
+            last_error(&s).contains("select_memory_word: bad addr bogus"),
+            "{:?}",
+            lines(&s)
+        );
+    }
+
+    #[test]
+    fn locals_commands_follow_live_state() {
+        let mut s = AppState::demo();
+        eval_command(&mut s, "locals");
+        assert!(
+            last_error(&s).contains("sim: no design (synth first)"),
+            "{:?}",
+            lines(&s)
+        );
+        crate::views::debug::seed_debug_fixture(&mut s).expect("fixture must seed");
+        eval_command(&mut s, "locals");
+        assert_eq!(s.center, crate::state::CenterPane::Debug);
+        assert_eq!(s.debug.tab, crate::views::debug::DebugTab::Locals);
+        assert!(has_line(&s, "locals n="), "{:?}", lines(&s));
+        assert!(
+            has_line(&s, "scope=counter"),
+            "locals default to the design top: {:?}",
+            lines(&s)
+        );
+        assert!(
+            has_line(&s, "NAME=led TYPE=port VALUE=0"),
+            "{:?}",
+            lines(&s)
+        );
+        eval_command(&mut s, "select_local led");
+        assert_eq!(s.debug.selected_local.as_deref(), Some("led"));
+        eval_command(&mut s, "sim_run 8");
+        eval_command(&mut s, "locals");
+        assert!(
+            has_line(&s, "NAME=led TYPE=port VALUE=1"),
+            "locals must follow the engine: {:?}",
+            lines(&s)
+        );
+        eval_command(&mut s, "select_local 999");
+        assert!(
+            last_error(&s).contains("select_local: no row 999"),
+            "{:?}",
+            lines(&s)
+        );
+        eval_command(&mut s, "select_local bogus");
+        assert!(
+            last_error(&s).contains("select_local: no local bogus"),
+            "{:?}",
+            lines(&s)
+        );
+    }
+
+    #[test]
+    fn force_commands_cover_hold_deposit_and_schedule() {
+        let mut s = AppState::demo();
+        eval_command(&mut s, "forces");
+        assert!(
+            has_line(
+                &s,
+                "forces n=0 kernel=idle engine=helion-sim no forces - add_force"
+            ),
+            "forces opens without an engine: {:?}",
+            lines(&s)
+        );
+        assert_eq!(s.debug.tab, crate::views::debug::DebugTab::Forces);
+        eval_command(&mut s, "add_force led 1");
+        assert!(
+            last_error(&s).contains("sim: no design (synth first)"),
+            "{:?}",
+            lines(&s)
+        );
+        crate::views::debug::seed_debug_fixture(&mut s).expect("fixture must seed");
+        eval_command(&mut s, "add_force led 1");
+        assert_eq!(s.debug.selected_force.as_deref(), Some("led"));
+        assert!(
+            has_line(
+                &s,
+                "NAME=led KIND=force VALUE=1 RADIX=bin START_PS=0 CANCEL_PS=0 STATUS=Active"
+            ),
+            "{:?}",
+            lines(&s)
+        );
+        eval_command(&mut s, "force_table");
+        assert!(has_line(&s, "forces n=1"), "{:?}", lines(&s));
+        eval_command(&mut s, "force_constants");
+        assert!(has_line(&s, "forces n=1"), "{:?}", lines(&s));
+        eval_command(&mut s, "select_force 0");
+        assert_eq!(s.debug.selected_force.as_deref(), Some("led"));
+        // Re-adding the same signal replaces the row (kind/value/radix).
+        eval_command(&mut s, "add_force led 0 -radix hex");
+        assert_eq!(s.debug.forces.len(), 1);
+        assert!(
+            has_line(&s, "NAME=led KIND=force VALUE=0 RADIX=hex"),
+            "{:?}",
+            lines(&s)
+        );
+        eval_command(&mut s, "deposit led 1");
+        assert!(
+            has_line(&s, "NAME=led KIND=deposit") && has_line(&s, "STATUS=Released"),
+            "{:?}",
+            lines(&s)
+        );
+        eval_command(&mut s, "remove_force");
+        assert!(s.debug.forces.is_empty(), "empty spec drops the selection");
+        assert!(s.debug.selected_force.is_none());
+        eval_command(&mut s, "remove_force");
+        assert!(
+            last_error(&s).contains("remove_force: need <signal>"),
+            "{:?}",
+            lines(&s)
+        );
+        // Scheduled holds go Pending until the engine time passes start.
+        eval_command(&mut s, "add_force led 1 -start_time 1ns");
+        assert!(
+            has_line(
+                &s,
+                "NAME=led KIND=force VALUE=1 RADIX=bin START_PS=1000 CANCEL_PS=0 STATUS=Pending"
+            ),
+            "ns suffix parses to ps: {:?}",
+            lines(&s)
+        );
+        eval_command(&mut s, "sim_run 1");
+        assert_eq!(s.debug.forces[0].status, "Active");
+        eval_command(&mut s, "add_force");
+        assert!(
+            last_error(&s).contains("add_force: need <signal> <value>"),
+            "{:?}",
+            lines(&s)
+        );
+        eval_command(&mut s, "add_force bogus 1");
+        assert!(
+            last_error(&s).contains("add_force: no signal bogus"),
+            "{:?}",
+            lines(&s)
+        );
+        eval_command(&mut s, "add_force led 1 -radix oct");
+        assert!(
+            last_error(&s).contains("add_force: bad radix oct"),
+            "{:?}",
+            lines(&s)
+        );
+        eval_command(&mut s, "add_force led 1 -bogus 2");
+        assert!(
+            last_error(&s).contains("add_force: unknown flag -bogus"),
+            "{:?}",
+            lines(&s)
+        );
+        eval_command(&mut s, "add_force led zz -radix hex");
+        assert!(
+            last_error(&s).contains("add_force: bad hex zz"),
+            "{:?}",
+            lines(&s)
+        );
+        eval_command(&mut s, "select_force");
+        assert!(
+            last_error(&s).contains("select_force: missing name"),
+            "{:?}",
+            lines(&s)
+        );
+        eval_command(&mut s, "select_force bogus");
+        assert!(
+            last_error(&s).contains("select_force: no row bogus"),
+            "{:?}",
+            lines(&s)
+        );
+        eval_command(&mut s, "deposit");
+        assert!(
+            last_error(&s).contains("deposit: need <signal> <value>"),
             "{:?}",
             lines(&s)
         );
@@ -6207,6 +6592,19 @@ mod tests {
             "enable_bp",
             "disable_bp",
             "delete_bp",
+            "memory",
+            "memories",
+            "select_memory",
+            "select_memory_word",
+            "locals",
+            "select_local",
+            "forces",
+            "force_table",
+            "force_constants",
+            "add_force",
+            "deposit",
+            "remove_force",
+            "select_force",
         ] {
             assert!(
                 COMMANDS.contains(&verb),

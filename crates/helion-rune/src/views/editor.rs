@@ -196,6 +196,24 @@ fn active_buffer(s: &AppState) -> BufferKind {
     }
 }
 
+/// (Tab name, buffer text) of the active editor tab for debugger Source
+/// classification. Reads the routed line buffer; callers flush the live
+/// field first so typing is never stranded.
+pub(crate) fn active_buffer_text(s: &AppState) -> Option<(String, String)> {
+    let name = s.editor.tabs.get(s.editor.active)?.clone();
+    Some((name, active_lines(s).join("\n")))
+}
+
+/// Park the caret at the start of 0-based `line` (clamped). Shared by
+/// gutter taps and debugger source cross-probing.
+pub(crate) fn move_cursor_to(s: &mut AppState, line: usize) {
+    sync_edit(s);
+    let line = line.min(line_count(s).saturating_sub(1));
+    let byte = s.editor.edit.line_range(line).start;
+    s.editor.edit.set_caret(byte);
+    s.editor.cursor_line = line;
+}
+
 /// Mutable lines of the active buffer.
 fn active_lines_mut(s: &mut AppState) -> &mut Vec<String> {
     match active_buffer(s) {
@@ -830,13 +848,22 @@ fn breadcrumb(s: &AppState, t: &VivadoTheme) -> El {
 /// One code line: right-aligned gutter number plus highlighted mono code.
 /// The cursor line gets the pale-yellow [`VivadoTheme::current_line`] wash;
 /// pressing a line moves the cursor there.
-/// Gutter row: right-aligned line number, bright on the caret line; click
-/// parks the caret at the line start.
-fn gutter_row(n: usize, current: bool, t: &VivadoTheme) -> El {
-    row()
+/// Gutter row: debugger breakpoint/PC markers plus the right-aligned line
+/// number, bright on the caret line; click parks the caret at the line
+/// start. Markers paint only when the viewed tab is the classified debug
+/// source (matching name and line count), so stale rows never mislead.
+fn gutter_row(s: &AppState, n: usize, current: bool, t: &VivadoTheme) -> El {
+    let line = n + 1;
+    let armed = crate::views::debug::gutter_markers(s)
+        .map(|m| m.armed.contains(&line))
+        .unwrap_or(false);
+    let pc = crate::views::debug::gutter_markers(s)
+        .map(|m| m.pc == Some(line))
+        .unwrap_or(false);
+    let mut cell = row()
         .key(format!("editor-gutter-{n}"))
         .role("button")
-        .label(format!("Line {}", n + 1))
+        .label(format!("Line {line}"))
         .focusable(true)
         .w(GUTTER_W)
         .h(LINE_H)
@@ -845,17 +872,29 @@ fn gutter_row(n: usize, current: bool, t: &VivadoTheme) -> El {
         .pr(8.0)
         .hover(t.selection)
         .on_press(move |s: &mut AppState| {
-            sync_edit(s);
-            let line = n.min(line_count(s).saturating_sub(1));
-            let byte = s.editor.edit.line_range(line).start;
-            s.editor.edit.set_caret(byte);
-            s.editor.cursor_line = line;
-        })
-        .child(
-            text(format!("{}", n + 1))
+            move_cursor_to(s, n);
+        });
+    if pc {
+        cell = cell.child(
+            text("▶")
+                .key(format!("editor-pc-{n}"))
                 .font(VivadoTheme::FONT_MONO.mono().lh(LINE_H))
-                .color(if current { t.text } else { t.text_faint }),
-        )
+                .color(t.pass),
+        );
+    }
+    if armed {
+        cell = cell.child(
+            text("●")
+                .key(format!("editor-bp-{n}"))
+                .font(VivadoTheme::FONT_MONO.mono().lh(LINE_H))
+                .color(t.fail),
+        );
+    }
+    cell.child(
+        text(format!("{line}"))
+            .font(VivadoTheme::FONT_MONO.mono().lh(LINE_H))
+            .color(if current { t.text } else { t.text_faint }),
+    )
 }
 
 /// Whole-buffer spans for the live field: syntax colors plus a wash over
@@ -912,7 +951,7 @@ pub fn editor_pane(s: &AppState, t: &VivadoTheme) -> El {
     let caret = caret_line(s);
     let mut gutter = col().w(GUTTER_W);
     for n in 0..count {
-        gutter = gutter.child(gutter_row(n, n == caret, t));
+        gutter = gutter.child(gutter_row(s, n, n == caret, t));
     }
     let field: &TextEdit = &s.editor.edit;
     // One scroll container over gutter + field (the OG's single-ScrollArea
