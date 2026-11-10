@@ -98,5 +98,25 @@ with tests, keep `cargo test -p helion-rune` green, rebuild + relaunch.
   tests plus `debug` and `debug-breakpoints` scenes. Full suite 300 lib
   + 38 snap green. Empty/populated/run snapshots verified in dark and
   light. `sim_restart` preserves batch history and only appends its own
-  marker. REMAIN: Memory/Locals/Forces panes, interactive-wave sync,
-  fabric-kernel debugging, source-line gutter, then ILA surface audit.
+  marker.
+- Pass 8: debugger slice 2 — Memory/Locals/Forces panes. The Debug
+  surface is now four UG900 tabs over one shared Run/Step/Restart
+  transport: Breakpoints (unchanged table), Memory (LUT INIT ROMs plus
+  the packed `seq` word, with a Contents section and word selection),
+  Locals (live led/register probes with scope filtering), and Force
+  Constants (Force/Deposit/Run recipes, selection-gated Remove). Tab
+  taps evaluate the real open verbs, so `memory`/`locals` elaborate
+  the engine instead of showing hollow panes. Added `memory`,
+  `memories`, `select_memory`, `select_memory_word`, `locals`,
+  `select_local`, `forces`, `force_table`, `force_constants`,
+  `add_force`, `deposit`, `remove_force`, and `select_force` with the
+  old dump text, selection rules, value/radix/time parsing, and error
+  words. Forces drive the real engine: holds flatten the LED waveform
+  until released, deposits poke once, `-start_time`/`-cancel_after`
+  flip Pending/Active/Released across runs, and restart re-arms
+  surviving holds. 10 new tests plus `debug-memory`, `debug-locals`,
+  and `debug-forces` scenes. Full suite 310 lib + 38 snap green.
+  All three panes snap-verified in dark and light. REMAIN:
+  source-gutter line breakpoints, interactive-wave sync (trace
+  mounting, scopes/objects/add_wave), fabric-kernel debugging, then
+  ILA surface audit.

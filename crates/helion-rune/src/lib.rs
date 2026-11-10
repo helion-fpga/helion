@@ -347,6 +347,27 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
             crate::tcl::eval_command(s, "add_bp led 1");
         }
     }),
+    ("debug-memory", |s| {
+        s.center = state::CenterPane::Debug;
+        if views::debug::seed_debug_fixture(s).is_ok() {
+            crate::tcl::eval_command(s, "memory");
+            crate::tcl::eval_command(s, "select_memory seq");
+            crate::tcl::eval_command(s, "select_memory_word 0");
+        }
+    }),
+    ("debug-locals", |s| {
+        s.center = state::CenterPane::Debug;
+        if views::debug::seed_debug_fixture(s).is_ok() {
+            crate::tcl::eval_command(s, "locals");
+            crate::tcl::eval_command(s, "select_local led");
+        }
+    }),
+    ("debug-forces", |s| {
+        s.center = state::CenterPane::Debug;
+        if views::debug::seed_debug_fixture(s).is_ok() {
+            crate::tcl::eval_command(s, "add_force led 1");
+        }
+    }),
     ("program", |s| {
         s.center = state::CenterPane::Program;
         s.flow.impl_run = state::RunStatus::Complete;
