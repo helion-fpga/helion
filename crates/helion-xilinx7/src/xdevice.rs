@@ -145,16 +145,41 @@ impl<'a> DeviceQuery for XDevice<'a> {
     }
 
     fn slice_near(&self, x: i32, y: i32, used: &HashSet<String>) -> Option<(String, String)> {
+        // Prefer a SLICEL half, at equal distance, for logic that has no
+        // carry chain.
+        //
+        // Only one half of every CLB is a SLICEM, and SLICEM is the scarce
+        // resource: it is the only half that can host distributed RAM and the
+        // only half a carry chain can run in (`column_run` filters to it). So
+        // spending SLICEM on a plain LUT/flop costs a capability that a
+        // SLICEL would not, and it is the wrong trade whenever both work.
+        //
+        // This used to break ties arbitrarily -- `min_by_key` on distance with
+        // no half preference, i.e. whichever `slices()` listed first. Measured
+        // against Vivado on three designs, that is systematically wrong:
+        //
+        //     design        Vivado SLICEM/SLICEL    ours (before)
+        //     toggle flop          0 / 2                 2 / 0
+        //     4-bit counter        0 / 2                 4 / 0
+        //     blinky (carry)      26 / 2                26 / 2   <- matched
+        //
+        // Vivado only uses SLICEM when the design has a carry chain; the
+        // blinky agreed purely because it has one, which is exactly how this
+        // hid. Distance still dominates: the tie-break only decides between
+        // equidistant slices, so this cannot push logic off its anchor.
         self.device
             .slices()
             .into_iter()
             .filter(|(_, site)| !used.contains(site))
             .filter_map(|(tile, site)| {
-                <Self as DeviceQuery>::tile_xy(self, &tile)
-                    .map(|(tx, ty)| ((tx - x).abs() + (ty - y).abs(), tile, site))
+                <Self as DeviceQuery>::tile_xy(self, &tile).map(|(tx, ty)| {
+                    let d = (tx - x).abs() + (ty - y).abs();
+                    // `false` sorts before `true`, so SLICEL wins the tie.
+                    (d, self.slice_is_m(&tile, &site), tile, site)
+                })
             })
-            .min_by_key(|(d, _, _)| *d)
-            .map(|(_, tile, site)| (tile, site))
+            .min_by_key(|(d, is_m, _, _)| (*d, *is_m))
+            .map(|(_, _, tile, site)| (tile, site))
     }
 
     fn slices(&self) -> Vec<(String, String)> {
