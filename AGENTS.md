@@ -1116,6 +1116,50 @@ Both were live in one round: the "clock network is broken on the new design"
 reading was wrong, and `clkdiff.py`'s `REAL diffs: 25` was counting these
 routing bits because its own tile attribution uses the same first-match rule.
 
+### SOLVED: non-carry logic was spending SLICEM halves
+
+The first defect found by diffing designs other than the blinky, and one the
+blinky could never have exposed.
+
+Only one half of each CLB is a `SLICEM`, and it is the scarce resource: it is
+the only half that can host distributed RAM and the only half a carry chain can
+run in (`column_run` filters candidates to it). `slice_near` broke ties
+arbitrarily -- `min_by_key` on Manhattan distance with no half preference, i.e.
+whichever `Device::slices()` listed first, which on this device is the SLICEM:
+
+```
+design                 Vivado SLICEM/SLICEL    ours (before)
+toggle flop                  0 / 2                 2 / 0
+4-bit counter                0 / 2                 4 / 0
+blinky (carry chain)        26 / 2                26 / 2   <- matched
+```
+
+Vivado uses SLICEM only when the design has a carry chain. **The blinky agreed
+purely because it has one**, which is exactly how this survived: the single
+design the whole flow was calibrated against was the one design the wrong rule
+happened to get right.
+
+Fix: `slice_near` now sorts on `(distance, is_slicem)`, so a SLICEL wins an
+equidistant tie. Distance still dominates, so this cannot push logic off its
+anchor. Effect on the toggle design: **355 -> 303 differing bits, named
+126 -> 74**, and its flop half now matches Vivado exactly. Blinky is
+byte-identical (`8bb37a4c`) -- the carry path does not go through `slice_near`.
+
+Guard: `tests/slicem_preference.rs` asserts BOTH directions -- a toggle must
+configure no SLICEM (`TILE.SLICEM_X0.AFF.ZINI` absent) and the blinky's carry
+chain must still configure SLICEM. Verified non-vacuous by reverting the
+one-line tie-break: the toggle guard fails and the carry guard still passes,
+so it catches the real defect without banning SLICEM globally.
+
+**Parsing trap that made the first version vacuous:** the FASM shape is
+`TILE.SLICEM_X0.AFF.ZINI` -- the half is the SECOND dot-field. Reading the
+first field finds only `CLBLM_R` and reports "no slice configuration at all"
+for a working design, so the guard passed for the wrong reason.
+
+The generalisable lesson: a preference encoded as a distance tie-break is
+invisible to every design that does not exercise the tie. Cross-design diffing
+is what surfaced it, which is the whole reason `any_design_bit` exists.
+
 ### `any_design_bit.rs`: build ANY design, for whole-design diffing
 
 `crates/helion-xilinx7/tests/any_design_bit.rs` turns a source file straight

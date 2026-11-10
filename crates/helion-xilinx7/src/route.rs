@@ -1083,10 +1083,12 @@ fn is_site_internal_pin(pin: &str) -> bool {
 /// Measured against `~/CDA4253_A1/blinky.bit` by seeding a single bit and
 /// reading back every lane pin:
 ///
-///     bit18 -> MY43C + LY43B     bit21 -> MY44B + LY44A
-///     bit19 -> MY43D + LY43C     bit22 -> MY44C + LY44B
-///     bit20 -> MY44A + LY43D     bit23 -> MY44D + LY44C
-///                                bit24 -> MY45A + LY44D
+/// ```text
+/// bit18 -> MY43C + LY43B     bit21 -> MY44B + LY44A
+/// bit19 -> MY43D + LY43C     bit22 -> MY44C + LY44B
+/// bit20 -> MY44A + LY43D     bit23 -> MY44D + LY44C
+///                            bit24 -> MY45A + LY44D
+/// ```
 ///
 /// so the L lane is always one behind the M lane (`-1`), not one ahead; lane
 /// `A` therefore rolls back into the previous chain element's lane `D`.
