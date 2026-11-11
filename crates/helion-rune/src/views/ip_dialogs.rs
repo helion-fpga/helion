@@ -470,7 +470,7 @@ pub fn package_dialog(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme, kit: &
             "ip-pkg",
             "Package IP",
             reason,
-            pk.error.as_deref().map(|e| (e, true)),
+            pk.error.as_deref().map(|e| (e, true)).or(reason.map(|r| (r, false))),
             t,
             kit,
             |s: &mut AppState| {
