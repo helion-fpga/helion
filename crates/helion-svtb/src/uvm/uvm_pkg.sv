@@ -654,6 +654,9 @@ package uvm_pkg;
     virtual function string get_type_name();
       return "uvm_root";
     endfunction
+    virtual function string m_report_path();
+      return "reporter";
+    endfunction
 
     function void set_timeout(time timeout, bit overridable = 1);
       m_timeout = timeout;
@@ -1068,6 +1071,8 @@ package uvm_pkg;
   endclass
 
   class uvm_tlm_analysis_fifo #(type T = int) extends uvm_tlm_fifo #(T);
+    typedef uvm_tlm_analysis_fifo #(T) this_type;
+    `uvm_component_param_utils(this_type)
     uvm_tlm_fifo_imp #(T) analysis_export;
     function new(string name, uvm_component parent = null);
       super.new(name, parent, 0);
@@ -1288,6 +1293,8 @@ package uvm_pkg;
   endclass
 
   class uvm_sequencer #(type REQ = uvm_sequence_item, type RSP = REQ) extends uvm_sequencer_base;
+    typedef uvm_sequencer #(REQ, RSP) this_type;
+    `uvm_component_param_utils(this_type)
     uvm_seq_item_pull_imp #(REQ, RSP) seq_item_export;
     function new(string name, uvm_component parent = null);
       super.new(name, parent);
