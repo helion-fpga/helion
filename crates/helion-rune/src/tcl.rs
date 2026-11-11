@@ -232,6 +232,20 @@ pub const COMMANDS: &[&str] = &[
     "cancel_runs",
     "open_report",
     "launch_simulation",
+    // Verification (testbench runner, simulation settings, logic analyzer).
+    "tb_rescan",
+    "tb_select",
+    "tb_run",
+    "tb_run_all",
+    "tb_stop",
+    "tb_vcd",
+    "tb_wave",
+    "tb_jump",
+    "set_timescale",
+    "set_runtime",
+    "sim_settings",
+    "compile_sim",
+    "elaborate_sim",
 ];
 
 /// Max nested `[...]` evaluation depth (mirrors the real interp's cap idea;
@@ -264,6 +278,14 @@ impl Ctl {
             msg: msg.into(),
             line,
         })
+    }
+}
+
+/// Map a view-level `Result` onto the interpreter's value/error.
+fn ctl_of(r: Result<String, String>, line: usize) -> Ctl {
+    match r {
+        Ok(v) => Ctl::Value(v),
+        Err(e) => Ctl::err(line, e),
     }
 }
 
@@ -2378,7 +2400,7 @@ fn synth_prj_path(path: &std::path::Path) -> Result<helion_ir::Design, String> {
 /// Take an elaborated netlist into the console design AND the flow session
 /// (both stay in sync; views read `tcl.design`, flow verbs read the
 /// session). Reports the old `synth {name} cells {n} luts {m}` line.
-fn store_design(s: &mut AppState, design: helion_ir::Design) -> String {
+pub(crate) fn store_design(s: &mut AppState, design: helion_ir::Design) -> String {
     let summary = format!(
         "synth {} cells {} luts {}",
         helion_ir::resolve(design.name),
@@ -2475,6 +2497,14 @@ fn dispatch_host(
         },
         "synth_design" | "read_sv" | "read_verilog" | "read_vhdl" | "hds::synth" => {
             cmd_synth(s, argv, line)
+        }
+        "tb_rescan" | "tb_select" | "tb_run" | "tb_run_all" | "tb_stop" | "tb_vcd" | "tb_wave"
+        | "tb_jump" => ctl_of(crate::views::tb::exec_tb(s, name, &argv[1..]), line),
+        "set_timescale" | "set_runtime" | "sim_settings" | "compile_sim" | "elaborate_sim" => {
+            ctl_of(
+                crate::views::sim_settings::exec_settings(s, name, &argv[1..]),
+                line,
+            )
         }
         "opt_design" => {
             if s.tcl.design.is_none() {
@@ -4830,6 +4860,40 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
             "open a report surface",
         ),
         "launch_simulation" => ("launch_simulation", "start a real testbench simulation run"),
+        "tb_rescan" => ("tb_rescan", "discover *_tb.sv / tb_*.sv testbenches again"),
+        "tb_select" => ("tb_select name|index", "select a testbench in the Sim pane"),
+        "tb_run" => (
+            "tb_run ?name|index?",
+            "run a testbench on the helion-sim worker",
+        ),
+        "tb_run_all" => ("tb_run_all", "run every discovered testbench in turn"),
+        "tb_stop" => ("tb_stop", "stop the running simulation"),
+        "tb_vcd" => ("tb_vcd ?on|off?", "dump run.vcd from testbench runs"),
+        "tb_wave" => (
+            "tb_wave ?file.vcd?",
+            "open a testbench VCD in the waveform viewer",
+        ),
+        "tb_jump" => (
+            "tb_jump index",
+            "open failure N of the selected testbench in the editor",
+        ),
+        "set_timescale" => ("set_timescale time", "set TIMESCALE_PS (e.g. 10ns)"),
+        "set_runtime" => (
+            "set_runtime cycles|time",
+            "set RUNTIME_CYCLES (or RUNTIME_PS)",
+        ),
+        "sim_settings" => (
+            "sim_settings ?KEY ?value??",
+            "show or set Simulation Settings (SIM_TOP, PARAM, RUNTIME_CYCLES, ...)",
+        ),
+        "compile_sim" => (
+            "compile_sim",
+            "compile the RTL with helion-sv (INCLUDE_PATH/DEFINE)",
+        ),
+        "elaborate_sim" => (
+            "elaborate_sim",
+            "elaborate SIM_TOP with PARAM into helion-sim",
+        ),
         _ => return None,
     })
 }
@@ -4849,6 +4913,8 @@ fn help_overview() -> String {
         "  create_clock report_timing report_utilization mark_debug eco open_hw_manager program_hw report_die report_featuremap",
         "More: unset list_properties read_verilog read_vhdl add_probe program_hw_devices report_hw_targets write_hnf",
         "  hds::synth hds::impl hds::flow hds::tree | history launch_runs cancel_runs open_report",
+        "Verify: launch_simulation tb_rescan tb_select tb_run tb_run_all tb_stop tb_vcd tb_wave tb_jump",
+        "  set_timescale set_runtime sim_settings compile_sim elaborate_sim",
         "help <command> for usage. See docs/tcl-subset.md for the supported subset.",
     ]
     .join("\n")

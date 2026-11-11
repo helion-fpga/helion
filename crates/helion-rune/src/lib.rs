@@ -276,9 +276,14 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
     }),
     ("wave", |s| {
         s.center = state::CenterPane::Wave;
+        views::wave_demo::seed_demo_wave(s);
+    }),
+    ("wave-empty", |s| {
+        s.center = state::CenterPane::Wave;
     }),
     ("wave-cursors", |s| {
         s.center = state::CenterPane::Wave;
+        views::wave_demo::seed_demo_wave(s);
         s.wave.cursor = 48;
         s.wave.cursor_a = Some(16);
         s.wave.cursor_b = Some(64);
@@ -303,7 +308,7 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
             s.vcd.timescale_ps = live.timescale_ps.max(1);
             s.vcd.duration_ps = live.duration_ps;
             s.vcd.signals = live.traces.iter().map(|t| t.name.clone()).collect();
-            s.wave.live = Some(live);
+            s.wave.mount_live(live);
             s.wave.live_selected = Some(0);
             s.wave.cursor = 100;
             s.wave.cursor_a = Some(16);
@@ -317,25 +322,16 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
     }),
     ("sim", |s| {
         s.center = state::CenterPane::Sim;
+        views::tb::seed_examples_fixture(s);
     }),
     ("sim-detail", |s| {
         s.center = state::CenterPane::Sim;
-        s.sim.selected = Some(1);
-        s.sim.statuses = vec![views::wave::TbStatus::Failed, views::wave::TbStatus::Passed];
-        s.sim.history = vec![
-            views::wave::SimRun {
-                tb: "project1_tb",
-                status: views::wave::TbStatus::Passed,
-                units: 9600,
-                errors: 0,
-            },
-            views::wave::SimRun {
-                tb: "counter_tb",
-                status: views::wave::TbStatus::Failed,
-                units: 400,
-                errors: 3,
-            },
-        ];
+        // Real runs in a temp copy: counter_early_tb fails, counter_tb passes.
+        if views::tb::seed_run_fixture(s).is_ok() {
+            s.sim.selected = Some(0);
+        }
+        // The fixture's run toasts would cover the history table.
+        s.toasts = state::ToastState::default();
     }),
     ("debug", |s| {
         s.center = state::CenterPane::Debug;
@@ -525,7 +521,7 @@ fn center_pane(s: &AppState, t: &VivadoTheme) -> El {
         state::CenterPane::Schematic => views::schematic::schematic_pane(s, t),
         state::CenterPane::Device => views::device::device_pane(s, t),
         state::CenterPane::Wave => views::wave::wave_pane(s, t),
-        state::CenterPane::Sim => views::wave::sim_pane(s, t),
+        state::CenterPane::Sim => views::tb_view::sim_pane(s, t),
         state::CenterPane::Debug => views::debug::debug_pane(s, t),
         state::CenterPane::Program => views::program::program_pane(s, t),
         state::CenterPane::Reports => views::reports::reports_pane(s, t),
@@ -605,7 +601,7 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
 /// channel every frame so both workers stream without blocking the UI.
 pub fn poll_all(s: &mut AppState, t: f64, tx: &mut rune::Tx) -> bool {
     let runs_dirty = runs::poll(s, t, tx);
-    let sim_dirty = views::wave::poll(s, t, tx);
+    let sim_dirty = views::tb::poll(s, t, tx);
     // Safety net: out-of-band buffer swaps (project reseed clears tabs)
     // re-mirror the live edit field; a no-op when already synced.
     views::editor::sync_edit(s);

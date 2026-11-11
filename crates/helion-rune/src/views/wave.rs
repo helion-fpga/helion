@@ -1,36 +1,23 @@
-//! Simulation waveform viewer + testbench manager (Vivado SIMULATION layout).
+//! Simulation waveform viewer (Vivado SIMULATION layout).
 //!
-//! New Rune `El` code written from scratch for the Vivado brief. Two center
-//! surfaces share this batch:
+//! New Rune `El` code written from scratch for the Vivado brief. The Wave
+//! surface (`CenterPane::Wave`) is the Vivado simulator window: a Scope panel
+//! over an Objects panel (signals of the scope with cursor values), a signal
+//! Name/Value column, and a trace canvas with a time ruler, the main cursor,
+//! A/B measurement cursors, and named markers. Run/restart/next-edge, zoom,
+//! and the radix control (Bin/Hex/Dec/Signed, per selected trace or global)
+//! live on the toolbar; the readout strip shows cursor/A/B/delta times.
 //!
-//! - Wave (`CenterPane::Wave`): the Vivado simulator window — a Scope panel
-//!   (testbench hierarchy) over an Objects panel (signals of the scope with
-//!   live values and per-row `add_wave`), a signal Name/Value column, and a
-//!   trace canvas with a time ruler, the main cursor, A/B measurement
-//!   cursors, and named markers. Run/restart/step, zoom, and Hex/Bin radix
-//!   live on the toolbar; the readout strip shows cursor/A/B/delta times.
-//! - Sim (`CenterPane::Sim`): the testbench list (name + run-status badge)
-//!   with a detail pane (DUT instance, port map, clocks, decls, last run,
-//!   run history) that launches the run and opens the waveform.
-//!
-//! Trace data mirrors the `helion-gui` domain read-only: [`sample`] draws
-//! the VCD shapes on the uniform viewer grid (`vcd_wave.rs`: one sample per
-//! `timescale_ps`, zero-order hold between events), [`WaveSigId::VbLed`]
-//! packs its members LSB-first like `Waveform::rebuild_virtual_buses`
-//! (`ide.rs`), and [`TbStatus`] labels match `tb.rs::TbStatus`.
-//!
-//! Live runs (deep-03-sim-vcd-live) bind the real engine: [`launch_tb`]
-//! elaborates the RTL (`helion_sv`/`helion_vhdl`, same dispatch as
-//! `synth_hdl_path`), runs the `helion-sim` event kernel via
-//! `helion_sim::vcd::dump_vcd`, and imports the
-//! resulting VCD text with the fresh [`import_vcd_text`] parser (IEEE 1364
-//! subset, same grid semantics as `vcd_wave.rs::import_vcd_waves`: uniform
-//! grid, zero-order hold, `x`/`z`→0, 1/2/5 coarsening past
-//! [`MAX_LIVE_SAMPLES`]). The import lands in [`WaveState::live`]; the viewer
-//! renders live lanes, the readout/radix/cursors/markers operate on the live
-//! grid, and the sim log streams into [`SimState::log`] (the console
-//! Simulation tab renders it). Demo [`sample`] shapes remain as the explicit
-//! pre-run fallback, labelled by the live banner.
+//! Only real data renders in production: before any simulation the pane is
+//! an empty state with a real Run button. A run (testbench or free-running
+//! design, orchestrated by [`crate::views::tb`]) produces VCD text that the
+//! fresh [`import_vcd_text`] parser (IEEE 1364 subset, same grid semantics as
+//! `vcd_wave.rs::import_vcd_waves`: uniform grid, zero-order hold,
+//! `x`/`z`→0, 1/2/5 coarsening past [`MAX_LIVE_SAMPLES`]) lands in
+//! [`WaveState::live`]. Scopes and objects derive from the imported
+//! hierarchical names. The built-in demo shapes live in
+//! [`crate::views::wave_demo`] and mount only when a scene or test seeds that
+//! fixture ([`WaveState::demo`]).
 //!
 //! All colors come from [`VivadoTheme`]; no manual geometry beyond the
 //! sample grid scaled by the zoom factor.
@@ -50,25 +37,22 @@
 //! - `crates/helion-vhdl/src/lib.rs:12`: `synth_vhdl(source)`.
 //! - `crates/helion-sim/src/vcd.rs:53`: `dump_vcd(design, cycles, timescale_ps)`.
 //! - `crates/helion-gui/src/vcd_wave.rs:143`: `import_vcd_waves` grid semantics.
-//! - `crates/helion-gui/src/tb.rs:36`: `TB_PS_PER_UNIT` (1ns), `:40` history keep.
 //! - `crates/helion-gui/src/ide.rs:4273,4367`: `WaveMarker`/`Waveform` shapes.
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-    mpsc,
-};
+use std::collections::HashMap;
 
 use rune::tok::TextStyle;
-use rune::{El, LineCap, ScrollSpec, Shape, Tx, canvas, col, el, icon, row, text};
+use rune::{El, LineCap, ScrollSpec, Shape, canvas, col, el, icon, row, text};
 use rune_kit::glyphs;
 
-use crate::state::{AppState, ConsoleLine, MsgSev, RunStatus, ToastKind};
+use crate::state::{AppState, ConsoleLine, MsgSev};
 use crate::theme::VivadoTheme;
 use crate::views::sources::pane_header;
+pub use crate::views::tb::{cancel_sim, launch, launch_default_tb, poll, poll_sim};
+pub use crate::views::wave_demo::{
+    SAMPLES, SimObject, SimScope, WaveSigId, bus_runs, format_value, objects, pack_virtual, sample,
+};
 
-/// Samples on the demo VCD grid (`vcd_wave.rs` uniform-grid convention).
-pub const SAMPLES: usize = 96;
 /// Pixels per sample at 100% zoom: the full 96-sample sheet (384pt) fits the
 /// trace viewport so every lane, cursor, and marker stays inside the shell.
 const BASE_PPS: f32 = 4.0;
@@ -108,140 +92,9 @@ pub const MAX_LIVE_SIGNALS: usize = 1024;
 pub const MAX_LIVE_SAMPLES: usize = 8192;
 /// Live lanes shown before the "+N more" row (the sheet stays compact).
 pub const LIVE_SHOWN: usize = 8;
-/// Max sim channel events drained per frame.
-const MAX_SIM_DRAIN: usize = 256;
-/// Kept sim run-history entries, newest first (mirrors `TB_HISTORY_KEEP`).
-pub const SIM_HISTORY_KEEP: usize = 20;
 
 /// Pin/value type: smaller than CAD body text.
 const FONT_PIN: TextStyle = TextStyle::new(10.0, 400.0);
-
-/// Every trace the wave panel can show. Scalars draw stepped levels, buses
-/// draw the Vivado envelope; [`WaveSigId::VbLed`] is the virtual bus packed
-/// from its members LSB-first (mirrors `rebuild_virtual_buses`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WaveSigId {
-    Clk,
-    RstN,
-    DivClk,
-    Counter,
-    Led,
-    Seg,
-    An,
-    Done,
-    VbLed,
-}
-
-impl WaveSigId {
-    pub const ALL: [WaveSigId; 9] = [
-        WaveSigId::Clk,
-        WaveSigId::RstN,
-        WaveSigId::DivClk,
-        WaveSigId::Counter,
-        WaveSigId::Led,
-        WaveSigId::Seg,
-        WaveSigId::An,
-        WaveSigId::Done,
-        WaveSigId::VbLed,
-    ];
-
-    /// Traces mounted before any `add_wave`.
-    pub const DEFAULT: [WaveSigId; 6] = [
-        WaveSigId::Clk,
-        WaveSigId::RstN,
-        WaveSigId::DivClk,
-        WaveSigId::Counter,
-        WaveSigId::Led,
-        WaveSigId::VbLed,
-    ];
-
-    /// Virtual-bus members, LSB first (mirrors `rebuild_virtual_buses`).
-    pub const VB_MEMBERS: [WaveSigId; 2] = [WaveSigId::Led, WaveSigId::DivClk];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            WaveSigId::Clk => "clk",
-            WaveSigId::RstN => "rst_n",
-            WaveSigId::DivClk => "divclk",
-            WaveSigId::Counter => "counter[7:0]",
-            WaveSigId::Led => "led[3:0]",
-            WaveSigId::Seg => "seg[7:0]",
-            WaveSigId::An => "an[3:0]",
-            WaveSigId::Done => "done",
-            WaveSigId::VbLed => "vb_led[4:0]",
-        }
-    }
-
-    pub fn slug(self) -> &'static str {
-        match self {
-            WaveSigId::Clk => "clk",
-            WaveSigId::RstN => "rst-n",
-            WaveSigId::DivClk => "divclk",
-            WaveSigId::Counter => "counter",
-            WaveSigId::Led => "led",
-            WaveSigId::Seg => "seg",
-            WaveSigId::An => "an",
-            WaveSigId::Done => "done",
-            WaveSigId::VbLed => "vb-led",
-        }
-    }
-
-    pub fn width(self) -> u8 {
-        match self {
-            WaveSigId::Clk | WaveSigId::RstN | WaveSigId::DivClk | WaveSigId::Done => 1,
-            WaveSigId::Counter | WaveSigId::Seg => 8,
-            WaveSigId::Led | WaveSigId::An => 4,
-            WaveSigId::VbLed => 5,
-        }
-    }
-
-    pub fn is_bus(self) -> bool {
-        self.width() > 1
-    }
-
-    pub fn name_key(self) -> String {
-        format!("wave-name-{}", self.slug())
-    }
-
-    pub fn value_key(self) -> String {
-        format!("wave-value-{}", self.slug())
-    }
-
-    pub fn lane_key(self) -> String {
-        format!("wave-lane-{}", self.slug())
-    }
-}
-
-/// Demo VCD shape: the sample value of `id` at grid index `i`, zero-order
-/// hold between the demo events (`vcd_wave.rs` sampling convention).
-pub fn sample(id: WaveSigId, i: usize) -> u64 {
-    let i = (i.min(SAMPLES.saturating_sub(1))) as u64;
-    match id {
-        WaveSigId::Clk => i % 2,
-        WaveSigId::RstN => u64::from(i >= 8),
-        WaveSigId::DivClk => (i / 16) % 2,
-        WaveSigId::Counter => (i / 2) & 0xFF,
-        WaveSigId::Led => (i / 8) & 0xF,
-        WaveSigId::Seg => (i / 4) & 0xFF,
-        WaveSigId::An => (i / 32) & 0xF,
-        WaveSigId::Done => u64::from(i >= 88),
-        WaveSigId::VbLed => pack_virtual(&WaveSigId::VB_MEMBERS, i as usize),
-    }
-}
-
-/// Pack virtual-bus members LSB-first, masking each to its width (mirrors
-/// `Waveform::rebuild_virtual_buses` in `ide.rs`).
-pub fn pack_virtual(members: &[WaveSigId], i: usize) -> u64 {
-    let mut val = 0u64;
-    let mut bit = 0u32;
-    for m in members {
-        let w = u32::from(m.width().max(1));
-        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-        val |= (sample(*m, i) & mask) << bit;
-        bit = bit.saturating_add(w);
-    }
-    val
-}
 
 /// One live trace imported from a real VCD dump: hierarchical signal name,
 /// declared width, and uniform-grid samples (`u64`, `x`/`z` already mapped
@@ -304,15 +157,7 @@ impl LiveWave {
 
 /// Value of a live trace at grid index `i` in `radix` (scalars stay `0`/`1`).
 pub fn format_live_value(trace: &LiveTrace, i: usize, radix: WaveRadix) -> String {
-    let v = trace.value_at(i);
-    if !trace.is_bus() {
-        return if v == 0 { "0".into() } else { "1".into() };
-    }
-    let w = usize::from(trace.width.max(1));
-    match radix {
-        WaveRadix::Hex => format!("{:0nib$X}", v, nib = w.div_ceil(4)),
-        WaveRadix::Bin => format!("{v:0w$b}", w = w),
-    }
+    radix.format(trace.value_at(i), trace.width)
 }
 
 /// Constant-value runs of a live trace: (start, end-exclusive, value).
@@ -687,53 +532,75 @@ pub enum WaveRadix {
     #[default]
     Hex,
     Bin,
+    /// Unsigned decimal.
+    Dec,
+    /// Two's-complement decimal over the trace width.
+    Signed,
 }
 
 impl WaveRadix {
+    /// Toolbar order.
+    pub const ALL: [WaveRadix; 4] = [
+        WaveRadix::Bin,
+        WaveRadix::Hex,
+        WaveRadix::Dec,
+        WaveRadix::Signed,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             WaveRadix::Hex => "Hex",
             WaveRadix::Bin => "Bin",
+            WaveRadix::Dec => "Dec",
+            WaveRadix::Signed => "Signed",
         }
     }
 
+    /// Next radix in toolbar order (Hex → Bin keeps the old toggle's
+    /// first step; the cycle then visits Dec and Signed).
     pub fn toggle(self) -> Self {
         match self {
             WaveRadix::Hex => WaveRadix::Bin,
-            WaveRadix::Bin => WaveRadix::Hex,
+            WaveRadix::Bin => WaveRadix::Dec,
+            WaveRadix::Dec => WaveRadix::Signed,
+            WaveRadix::Signed => WaveRadix::Hex,
         }
     }
-}
 
-/// Value of `id` at grid index `i` in `radix` (scalars stay `0`/`1`).
-pub fn format_value(id: WaveSigId, i: usize, radix: WaveRadix) -> String {
-    let v = sample(id, i);
-    if !id.is_bus() {
-        return if v == 0 { "0".into() } else { "1".into() };
-    }
-    let w = usize::from(id.width());
-    match radix {
-        WaveRadix::Hex => format!("{:0nib$X}", v, nib = w.div_ceil(4)),
-        WaveRadix::Bin => format!("{v:0w$b}", w = w),
-    }
-}
-
-/// Constant-value runs of a bus trace: (start, end-exclusive, value).
-/// Scalars return one full-width run; used for the envelope labels.
-pub fn bus_runs(id: WaveSigId) -> Vec<(usize, usize, u64)> {
-    let mut runs = Vec::new();
-    let mut start = 0;
-    let mut cur = sample(id, 0);
-    for i in 1..SAMPLES {
-        let v = sample(id, i);
-        if v != cur {
-            runs.push((start, i, cur));
-            start = i;
-            cur = v;
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "hex" | "hexadecimal" => Some(WaveRadix::Hex),
+            "bin" | "binary" => Some(WaveRadix::Bin),
+            "dec" | "unsigned" | "decimal" => Some(WaveRadix::Dec),
+            "signed" | "sdec" => Some(WaveRadix::Signed),
+            _ => None,
         }
     }
-    runs.push((start, SAMPLES, cur));
-    runs
+
+    /// Format `v` (masked to `width` bits). Scalars always read `0`/`1`.
+    pub fn format(self, v: u64, width: u8) -> String {
+        let w = u32::from(width.clamp(1, 64));
+        let v = if w >= 64 { v } else { v & ((1u64 << w) - 1) };
+        if w == 1 {
+            return if v == 0 { "0".into() } else { "1".into() };
+        }
+        let wu = w as usize;
+        match self {
+            WaveRadix::Hex => format!("{:0nib$X}", v, nib = wu.div_ceil(4)),
+            WaveRadix::Bin => format!("{v:0wu$b}"),
+            WaveRadix::Dec => v.to_string(),
+            WaveRadix::Signed => {
+                let signed = if w >= 64 {
+                    v as i64
+                } else if (v >> (w - 1)) & 1 == 1 {
+                    (v as i64) - (1i64 << w)
+                } else {
+                    v as i64
+                };
+                signed.to_string()
+            }
+        }
+    }
 }
 
 /// Grid length: live sample count once a sim run imports a VCD, else the
@@ -778,168 +645,6 @@ impl WaveMarker {
     }
 }
 
-/// Simulation scope in the Scope panel (Vivado sim hierarchy).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SimScope {
-    /// Top testbench scope.
-    #[default]
-    Tb,
-    /// DUT instance scope.
-    Dut,
-    /// Clock-generator scope.
-    ClkGen,
-}
-
-impl SimScope {
-    pub const ALL: [SimScope; 3] = [SimScope::Tb, SimScope::Dut, SimScope::ClkGen];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            SimScope::Tb => "tb_project1",
-            SimScope::Dut => "dut",
-            SimScope::ClkGen => "clk_gen",
-        }
-    }
-
-    pub fn detail(self) -> &'static str {
-        match self {
-            SimScope::Tb => "testbench top",
-            SimScope::Dut => "project1_demo instance",
-            SimScope::ClkGen => "clock generator",
-        }
-    }
-
-    pub fn key(self) -> &'static str {
-        match self {
-            SimScope::Tb => "wave-scope-tb",
-            SimScope::Dut => "wave-scope-dut",
-            SimScope::ClkGen => "wave-scope-clkgen",
-        }
-    }
-}
-
-/// One row of the Objects panel: name, data type, and the wave signal it
-/// adds (instances and constants have none).
-#[derive(Clone, Copy, Debug)]
-pub struct SimObject {
-    pub name: &'static str,
-    pub slug: &'static str,
-    pub dtype: &'static str,
-    pub sig: Option<WaveSigId>,
-    /// Fixed display value (instances, parameters); `None` reads the cursor.
-    pub fixed: Option<&'static str>,
-}
-
-/// Objects of a scope, in Vivado panel order.
-pub fn objects(scope: SimScope) -> &'static [SimObject] {
-    match scope {
-        SimScope::Tb => &[
-            SimObject {
-                name: "clk",
-                slug: "clk",
-                dtype: "wire",
-                sig: Some(WaveSigId::Clk),
-                fixed: None,
-            },
-            SimObject {
-                name: "rst_n",
-                slug: "rst-n",
-                dtype: "reg",
-                sig: Some(WaveSigId::RstN),
-                fixed: None,
-            },
-            SimObject {
-                name: "done",
-                slug: "done",
-                dtype: "wire",
-                sig: Some(WaveSigId::Done),
-                fixed: None,
-            },
-            SimObject {
-                name: "dut",
-                slug: "dut",
-                dtype: "project1_demo",
-                sig: None,
-                fixed: Some("-"),
-            },
-            SimObject {
-                name: "clk_gen",
-                slug: "clk-gen",
-                dtype: "module",
-                sig: None,
-                fixed: Some("-"),
-            },
-        ],
-        SimScope::Dut => &[
-            SimObject {
-                name: "clk",
-                slug: "clk",
-                dtype: "input",
-                sig: Some(WaveSigId::Clk),
-                fixed: None,
-            },
-            SimObject {
-                name: "rst_n",
-                slug: "rst-n",
-                dtype: "input",
-                sig: Some(WaveSigId::RstN),
-                fixed: None,
-            },
-            SimObject {
-                name: "divclk",
-                slug: "divclk",
-                dtype: "reg",
-                sig: Some(WaveSigId::DivClk),
-                fixed: None,
-            },
-            SimObject {
-                name: "counter[7:0]",
-                slug: "counter",
-                dtype: "reg [7:0]",
-                sig: Some(WaveSigId::Counter),
-                fixed: None,
-            },
-            SimObject {
-                name: "led[3:0]",
-                slug: "led",
-                dtype: "output [3:0]",
-                sig: Some(WaveSigId::Led),
-                fixed: None,
-            },
-            SimObject {
-                name: "seg[7:0]",
-                slug: "seg",
-                dtype: "output [7:0]",
-                sig: Some(WaveSigId::Seg),
-                fixed: None,
-            },
-            SimObject {
-                name: "an[3:0]",
-                slug: "an",
-                dtype: "output [3:0]",
-                sig: Some(WaveSigId::An),
-                fixed: None,
-            },
-        ],
-        SimScope::ClkGen => &[
-            SimObject {
-                name: "clk",
-                slug: "clk",
-                dtype: "reg",
-                sig: Some(WaveSigId::Clk),
-                fixed: None,
-            },
-            SimObject {
-                name: "half_period",
-                slug: "half-period",
-                dtype: "integer",
-                sig: None,
-                fixed: Some("5 ns"),
-            },
-        ],
-    }
-}
-
 /// Wave-owned UI state: cursor, A/B cursors, markers, selection, added pool
 /// signals, scope, zoom, radix, plus the live engine import (when a sim run
 /// has produced one) and the live trace selection.
@@ -960,12 +665,24 @@ pub struct WaveState {
     /// Selected live trace index (only meaningful while [`WaveState::live`]
     /// is `Some`).
     pub live_selected: Option<usize>,
+    /// Per-trace radix overrides by trace name; [`WaveState::radix`] is the
+    /// default for traces without one.
+    pub trace_radix: HashMap<String, WaveRadix>,
+    /// Render the built-in demo fixture ([`crate::views::wave_demo`]) while
+    /// no live import exists. Only scenes/tests set it; production starts
+    /// on the empty state.
+    pub demo: bool,
+    /// Selected live scope (hierarchical prefix); `None` = first scope.
+    pub live_scope: Option<String>,
+    /// Live trace indices mounted as lanes, in lane order; empty = the
+    /// first [`LIVE_SHOWN`] traces.
+    pub live_lanes: Vec<usize>,
 }
 
 impl Default for WaveState {
     fn default() -> Self {
         Self {
-            cursor: 48,
+            cursor: 0,
             cursor_a: None,
             cursor_b: None,
             markers: Vec::new(),
@@ -976,6 +693,10 @@ impl Default for WaveState {
             radix: WaveRadix::Hex,
             live: None,
             live_selected: None,
+            trace_radix: HashMap::new(),
+            demo: false,
+            live_scope: None,
+            live_lanes: Vec::new(),
         }
     }
 }
@@ -1005,12 +726,14 @@ impl WaveState {
         true
     }
 
-    /// Grid length: live sample count once imported, else demo [`SAMPLES`].
+    /// Grid length: live sample count once imported, the demo [`SAMPLES`]
+    /// under the fixture, else a single empty sample.
     pub fn sample_len(&self) -> usize {
-        self.live
-            .as_ref()
-            .map(|l| l.sample_len().max(1))
-            .unwrap_or(SAMPLES)
+        match &self.live {
+            Some(l) => l.sample_len().max(1),
+            None if self.demo => SAMPLES,
+            None => 1,
+        }
     }
 
     /// Whether live engine traces are mounted (vs the demo fallback grid).
@@ -1018,13 +741,123 @@ impl WaveState {
         self.live.as_ref().is_some_and(|l| !l.is_empty())
     }
 
-    /// Live traces shown as lanes (first [`LIVE_SHOWN`]; the rest hide behind
-    /// the "+N more" row so the sheet stays compact).
+    /// Whether the pane has anything to draw (live import or demo fixture).
+    pub fn has_data(&self) -> bool {
+        self.has_live() || self.demo
+    }
+
+    /// Radix for the trace named `name`: its override, else the default.
+    pub fn radix_for(&self, name: &str) -> WaveRadix {
+        self.trace_radix.get(name).copied().unwrap_or(self.radix)
+    }
+
+    /// Name of the selected trace (live selection first, then demo).
+    pub fn selected_name(&self) -> Option<String> {
+        if self.has_live() {
+            let live = self.live.as_ref()?;
+            return live.traces.get(self.live_selected?).map(|t| t.name.clone());
+        }
+        if self.demo {
+            return self.selected.map(|id| id.name().to_string());
+        }
+        None
+    }
+
+    /// Radix shown by the toolbar: the selected trace's, else the default.
+    pub fn active_radix(&self) -> WaveRadix {
+        match self.selected_name() {
+            Some(n) => self.radix_for(&n),
+            None => self.radix,
+        }
+    }
+
+    /// Apply `radix` to the selected trace, or to every trace without an
+    /// override when nothing is selected. Returns the Tcl echo.
+    pub fn set_radix(&mut self, radix: WaveRadix) -> String {
+        match self.selected_name() {
+            Some(name) => {
+                self.trace_radix.insert(name.clone(), radix);
+                format!(
+                    "set_property radix {} [get_waves {{{name}}}]",
+                    radix.label().to_lowercase()
+                )
+            }
+            None => {
+                self.radix = radix;
+                format!("set_radix {}", radix.label().to_lowercase())
+            }
+        }
+    }
+
+    /// Live traces shown as lanes (first [`LIVE_SHOWN`] by default; the rest
+    /// stay in Objects until added, so the sheet stays compact).
     pub fn live_shown(&self) -> usize {
-        self.live
-            .as_ref()
-            .map(|l| l.traces.len().min(LIVE_SHOWN))
-            .unwrap_or(0)
+        self.lanes().len()
+    }
+
+    /// Mounted live lane trace indices, in lane order.
+    pub fn lanes(&self) -> Vec<usize> {
+        let n = self.live.as_ref().map(|l| l.traces.len()).unwrap_or(0);
+        if self.live_lanes.is_empty() {
+            (0..n.min(LIVE_SHOWN)).collect()
+        } else {
+            self.live_lanes.iter().copied().filter(|&i| i < n).collect()
+        }
+    }
+
+    /// Mount live trace `idx` as a lane; `false` when already mounted.
+    pub fn add_live_lane(&mut self, idx: usize) -> bool {
+        let mut lanes = self.lanes();
+        let n = self.live.as_ref().map(|l| l.traces.len()).unwrap_or(0);
+        if idx >= n || lanes.contains(&idx) {
+            return false;
+        }
+        lanes.push(idx);
+        self.live_lanes = lanes;
+        true
+    }
+
+    /// Selected live scope, defaulting to the first scope of the import.
+    pub fn current_live_scope(&self) -> Option<String> {
+        let live = self.live.as_ref()?;
+        let scopes = live_scopes(live);
+        match &self.live_scope {
+            Some(sel) if scopes.contains(sel) => Some(sel.clone()),
+            _ => scopes.into_iter().next(),
+        }
+    }
+
+    /// Replace the live import: lanes, scope, and selection reset and every
+    /// cursor clamps onto the new grid (the cursor parks at the end).
+    pub fn mount_live(&mut self, live: LiveWave) {
+        self.live = Some(live);
+        self.live_lanes.clear();
+        self.live_scope = None;
+        self.live_selected = None;
+        self.clamp_to_grid();
+        self.cursor = self.sample_len().saturating_sub(1);
+    }
+
+    /// Move the cursor to the next transition of the selected trace (one
+    /// sample when nothing is selected or no later edge exists).
+    pub fn next_edge(&mut self) {
+        let n = self.sample_len();
+        let from = self.cursor;
+        let value_at = |i: usize| -> Option<u64> {
+            if let Some(live) = self.live.as_ref().filter(|l| !l.is_empty()) {
+                let t = live.traces.get(self.live_selected?)?;
+                Some(t.value_at(i))
+            } else if self.demo {
+                Some(sample(self.selected?, i))
+            } else {
+                None
+            }
+        };
+        let next = value_at(from).and_then(|v0| (from + 1..n).find(|&i| value_at(i) != Some(v0)));
+        match next {
+            Some(i) => self.cursor = i,
+            None => self.step_cursor(1),
+        }
     }
 
     /// Clamp cursor, A/B, markers, and live selection onto the current grid.
@@ -1077,612 +910,40 @@ impl WaveState {
     }
 }
 
-/// Per-testbench run status; labels mirror `tb.rs::TbStatus`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TbStatus {
-    #[default]
-    Idle,
-    Running,
-    Passed,
-    Failed,
+/// Hierarchical scope of a trace name: everything before the last `.`.
+pub fn trace_scope(name: &str) -> String {
+    match name.rfind('.') {
+        Some(i) => name[..i].to_string(),
+        None => String::new(),
+    }
 }
 
-impl TbStatus {
-    pub fn label(self) -> &'static str {
-        match self {
-            TbStatus::Idle => "Not run",
-            TbStatus::Running => "Running",
-            TbStatus::Passed => "Passed",
-            TbStatus::Failed => "Failed",
+/// Distinct scopes of a live import, in first-appearance order.
+pub fn live_scopes(live: &LiveWave) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in &live.traces {
+        let sc = trace_scope(&t.name);
+        if !out.contains(&sc) {
+            out.push(sc);
         }
     }
+    out
 }
 
-/// One discovered testbench (mirrors `tb.rs::TbFile` + run summary).
-#[derive(Clone, Copy, Debug)]
-pub struct TbEntry {
-    pub name: &'static str,
-    pub path: &'static str,
-    pub dut: &'static str,
-    pub inst: &'static str,
-    pub vcd: &'static str,
-    pub units: u64,
-}
-
-/// Demo testbenches in discovery order (`tb.rs::discover_testbenches` sorts
-/// by name; statuses live in [`SimState`] so runs can mutate them).
-pub const TBS: [TbEntry; 2] = [
-    TbEntry {
-        name: "counter_tb",
-        path: "C:/EE214/project_1/project_1.srcs/sim_1/new/counter_tb.v",
-        dut: "counter",
-        inst: "dut",
-        vcd: "counter_tb.vcd",
-        units: 400,
-    },
-    TbEntry {
-        name: "project1_tb",
-        path: "C:/EE214/project_1/project_1.srcs/sim_1/new/project1_tb.v",
-        dut: "project1_demo",
-        inst: "dut",
-        vcd: "project1_tb.vcd",
-        units: 9600,
-    },
-];
-
-/// Port map rows of a testbench's DUT instance.
-pub fn tb_ports(i: usize) -> &'static [(&'static str, &'static str)] {
-    match i {
-        0 => &[("clk", "clk"), ("rst_n", "rst_n"), ("count[7:0]", "count")],
-        _ => &[
-            ("clk", "clk"),
-            ("rst_n", "rst_n"),
-            ("led[15:0]", "led"),
-            ("seg[7:0]", "seg"),
-            ("an[3:0]", "an"),
-        ],
-    }
-}
-
-/// Clock generators of a testbench (signal, period).
-pub fn tb_clocks(i: usize) -> &'static [(&'static str, &'static str)] {
-    match i {
-        0 => &[("clk", "10 ns")],
-        _ => &[("clk", "10 ns"), ("divclk", "320 ns")],
-    }
-}
-
-/// Testbench decls: (name, width, init), mirroring `tb.rs::TbDecl`.
-pub fn tb_decls(i: usize) -> &'static [(&'static str, u32, &'static str)] {
-    match i {
-        0 => &[("clk", 1, "0"), ("rst_n", 1, "1"), ("count", 8, "-")],
-        _ => &[
-            ("clk", 1, "0"),
-            ("rst_n", 1, "1"),
-            ("done", 1, "-"),
-            ("errors", 32, "0"),
-        ],
-    }
-}
-
-/// One kept run-history entry (mirrors `TB_HISTORY_KEEP` newest-first).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SimRun {
-    pub tb: &'static str,
-    pub status: TbStatus,
-    pub units: u64,
-    pub errors: u32,
-}
-
-/// One worker -> UI sim message. Lines stream live; the terminal event
-/// carries the real import (or the real error).
-#[derive(Debug)]
-pub enum SimEvent {
-    Line { text: String, sev: MsgSev },
-    Finished(Result<SimArtifacts, String>),
-    Cancelled,
-}
-
-/// Real sim completion payload: the imported live wave plus the run summary.
-#[derive(Clone, Debug, Default)]
-pub struct SimArtifacts {
-    pub live: LiveWave,
-    pub tb: usize,
-    pub units: u64,
-    pub errors: u32,
-    pub summary: String,
-}
-
-/// The live sim worker handle: its event channel plus the cancel flag the
-/// worker checks between stages.
-#[derive(Clone)]
-struct ActiveSim {
-    tb: usize,
-    rx: Arc<Mutex<mpsc::Receiver<SimEvent>>>,
-    cancel: Arc<AtomicBool>,
-}
-
-impl std::fmt::Debug for ActiveSim {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ActiveSim")
-            .field("tb", &self.tb)
-            .field("cancelled", &self.cancel.load(Ordering::Relaxed))
-            .finish()
-    }
-}
-
-/// Sim-owned UI state: list selection, per-testbench statuses, history, the
-/// real streamed sim log, and the at-most-one live worker.
-#[derive(Clone, Debug)]
-pub struct SimState {
-    pub selected: Option<usize>,
-    pub statuses: Vec<TbStatus>,
-    pub history: Vec<SimRun>,
-    /// Real buffered sim log lines (the console Simulation tab renders
-    /// these; empty until the first run streams).
-    pub log: Vec<ConsoleLine>,
-    active: Option<ActiveSim>,
-}
-
-impl Default for SimState {
-    fn default() -> Self {
-        Self {
-            selected: None,
-            statuses: vec![TbStatus::Idle; TBS.len()],
-            history: Vec::new(),
-            log: Vec::new(),
-            active: None,
-        }
-    }
-}
-
-impl SimState {
-    pub fn status(&self, i: usize) -> TbStatus {
-        self.statuses.get(i).copied().unwrap_or(TbStatus::Idle)
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.active.is_some()
-    }
-
-    pub fn active_tb(&self) -> Option<usize> {
-        self.active.as_ref().map(|a| a.tb)
-    }
-
-    pub fn cancel_requested(&self) -> bool {
-        self.active
-            .as_ref()
-            .is_some_and(|a| a.cancel.load(Ordering::Relaxed))
-    }
-
-    fn active_rx(&self) -> Option<Arc<Mutex<mpsc::Receiver<SimEvent>>>> {
-        self.active.as_ref().map(|a| a.rx.clone())
-    }
-
-    fn set_active(&mut self, tb: usize, rx: mpsc::Receiver<SimEvent>, cancel: Arc<AtomicBool>) {
-        self.active = Some(ActiveSim {
-            tb,
-            rx: Arc::new(Mutex::new(rx)),
-            cancel,
-        });
-    }
-
-    fn clear_active(&mut self) {
-        self.active = None;
-    }
-
-    fn request_cancel(&self) {
-        if let Some(a) = &self.active {
-            a.cancel.store(true, Ordering::Relaxed);
-        }
-    }
-
-    /// Drop any live sim (flagging cancel first) and reset to idle. The
-    /// orphaned worker's sends fail silently and it exits on its own.
-    pub fn reset(&mut self) {
-        self.request_cancel();
-        *self = SimState::default();
-    }
-}
-
-/// Engine cycles for a testbench: its time units (ns, `TB_PS_PER_UNIT`) over
-/// the live period, clamped into the wave grid.
-pub fn tb_cycles(i: usize) -> u32 {
-    let units = TBS.get(i).map(|t| t.units).unwrap_or(100);
-    let cycles =
-        (units.saturating_mul(1_000) / LIVE_PERIOD_PS.max(1)).clamp(1, u64::from(LIVE_MAX_CYCLES));
-    cycles as u32
-}
-
-/// Resolve the editor RTL buffer for a sim run (used when no elaborated
-/// Tcl design exists; [`launch_tb`] prefers the live `tcl.design`).
-fn resolve_design_src(s: &AppState) -> Result<(String, String), String> {
-    if s.editor.lines.iter().all(|l| l.trim().is_empty()) {
-        return Err("launch_simulation: the RTL buffer is empty (open a source first)".into());
-    }
-    let origin = s
-        .editor
-        .tabs
-        .get(s.editor.active)
-        .cloned()
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| "design.v".into());
-    Ok((origin, s.editor.lines.join("\n")))
-}
-
-/// Launch testbench `tb` on the engine worker. Sets Running immediately (the
-/// badge/test assertion window); the worker streams lines and delivers the
-/// live VCD import via [`poll_sim`]. Fails without touching state when a sim
-/// is already active or no RTL source resolves.
-pub fn launch_tb(s: &mut AppState, tb: usize) -> Result<(), String> {
-    if tb >= TBS.len() {
-        return Err(format!("launch_simulation: no testbench index {tb}"));
-    }
-    if let Some(busy) = s.sim.active_tb() {
-        return Err(format!(
-            "{} is already running",
-            TBS.get(busy).map(|t| t.name).unwrap_or("sim")
-        ));
-    }
-    // Prefer the elaborated Tcl design when one exists (real `Sim` over the
-    // live `helion_ir::Design`); else stage the editor RTL buffer.
-    let use_tcl_design = s.tcl.design.is_some();
-    let (origin, src) = if use_tcl_design {
-        (
-            s.tcl
-                .design_name
-                .clone()
-                .unwrap_or_else(|| "tcl_design.v".into()),
-            String::new(),
-        )
-    } else {
-        resolve_design_src(s)?
-    };
-    let tcl_design = if use_tcl_design {
-        s.tcl.design.clone()
-    } else {
-        None
-    };
-    let cycles = tb_cycles(tb);
-    let (tx, rx) = mpsc::channel();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let worker_cancel = cancel.clone();
-    let tb_name = TBS[tb].name.to_string();
-    std::thread::Builder::new()
-        .name(format!("helion-sim-{tb_name}"))
-        .spawn(move || {
-            sim_worker(
-                tb,
-                tb_name,
-                origin,
-                src,
-                tcl_design,
-                cycles,
-                tx,
-                worker_cancel,
-            )
-        })
-        .map_err(|e| format!("failed to spawn sim thread: {e}"))?;
-    s.sim.set_active(tb, rx, cancel);
-    s.sim.statuses[tb] = TbStatus::Running;
-    s.flow.sim = RunStatus::Running;
-    s.sim.history.insert(
-        0,
-        SimRun {
-            tb: TBS[tb].name,
-            status: TbStatus::Running,
-            units: 0,
-            errors: 0,
-        },
-    );
-    s.sim.history.truncate(SIM_HISTORY_KEEP);
-    Ok(())
-}
-
-/// Launch the selected testbench, defaulting to `project1_tb` when nothing
-/// is selected (the console Simulation prompt uses this).
-pub fn launch_default_tb(s: &mut AppState) -> Result<(), String> {
-    let tb = s.sim.selected.unwrap_or(TBS.len() - 1);
-    launch_tb(s, tb)
-}
-
-/// UI/Tcl entry: echo the verb and launch the default testbench on the
-/// real worker, mirroring `runs::launch` (error toast on failure; the sim
-/// state is only touched once the worker thread is spawned).
-pub fn launch(s: &mut AppState) {
-    s.console.lines.push(ConsoleLine {
-        text: "launch_simulation".into(),
-        sev: MsgSev::Info,
-    });
-    if let Err(e) = launch_default_tb(s) {
-        s.console.lines.push(ConsoleLine {
-            text: format!("ERROR: {e}"),
-            sev: MsgSev::Error,
-        });
-        s.toasts
-            .push(ToastKind::Error, "Cannot start simulation", &e);
-    }
-}
-
-/// Flag the active sim for cancellation (the worker stops between stages).
-pub fn cancel_sim(s: &mut AppState) {
-    match s.sim.active_tb() {
-        Some(tb) => {
-            s.sim.request_cancel();
-            let line = format!(
-                "stop_simulation {}",
-                TBS.get(tb).map(|t| t.name).unwrap_or("sim")
-            );
-            s.console.lines.push(ConsoleLine {
-                text: line.clone(),
-                sev: MsgSev::Info,
-            });
-            s.sim.log.push(ConsoleLine {
-                text: line,
-                sev: MsgSev::Info,
-            });
-        }
-        None => {
-            s.toasts
-                .push(ToastKind::Info, "No active simulation", "Nothing to stop");
-        }
-    }
-}
-
-/// Drain pending sim worker events into console/log/wave state. Returns true
-/// when anything changed (drives `AppSpec::poll`'s dirty flag).
-pub fn poll_sim(s: &mut AppState) -> bool {
-    let tb = match s.sim.active_tb() {
-        Some(t) => t,
-        None => return false,
-    };
-    let rx = match s.sim.active_rx() {
-        Some(rx) => rx,
-        None => return false,
-    };
-    let mut changed = false;
-    for _ in 0..MAX_SIM_DRAIN {
-        let next = rx.lock().unwrap_or_else(|e| e.into_inner()).try_recv();
-        match next {
-            Ok(event) => {
-                deliver_sim(s, tb, event);
-                changed = true;
-                if !s.sim.is_active() {
-                    break;
-                }
-            }
-            Err(mpsc::TryRecvError::Empty) => break,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                deliver_sim(
-                    s,
-                    tb,
-                    SimEvent::Finished(Err("sim worker exited unexpectedly".into())),
-                );
-                changed = true;
-                break;
-            }
-        }
-    }
-    changed
-}
-
-/// `AppSpec::poll` wiring for sim: pump the sim channel every frame.
-pub fn poll(s: &mut AppState, _t: f64, _tx: &mut Tx) -> bool {
-    poll_sim(s)
-}
-
-/// Apply one sim worker event: lines go to the Tcl console AND the sim log
-/// buffer; the terminal event mounts the live VCD import (or the error).
-pub fn deliver_sim(s: &mut AppState, tb: usize, event: SimEvent) {
-    match event {
-        SimEvent::Line { text, sev } => {
-            s.console.lines.push(ConsoleLine {
-                text: text.clone(),
-                sev,
-            });
-            s.sim.log.push(ConsoleLine { text, sev });
-        }
-        SimEvent::Finished(result) => {
-            match result {
-                Ok(art) => {
-                    let n_traces = art.live.traces.len();
-                    let n_samples = art.live.sample_len();
-                    s.vcd.timescale_ps = art.live.timescale_ps.max(1);
-                    s.vcd.duration_ps = art.live.duration_ps;
-                    s.vcd.signals = art
-                        .live
-                        .traces
-                        .iter()
-                        .take(64)
-                        .map(|t| t.name.clone())
-                        .collect();
-                    s.wave.live = Some(art.live);
-                    s.wave.clamp_to_grid();
-                    // Move the cursor onto the live grid end so the import is
-                    // visible immediately (mirrors `sim_run` cursor-to-end).
-                    let last = s.wave.sample_len().saturating_sub(1);
-                    s.wave.cursor = last;
-                    s.sim.statuses[tb] = TbStatus::Passed;
-                    s.flow.sim = RunStatus::Complete;
-                    if let Some(h) = s.sim.history.first_mut() {
-                        h.status = TbStatus::Passed;
-                        h.units = art.units;
-                        h.errors = art.errors;
-                    }
-                    let detail = format!(
-                        "{} · {} signals, {} samples",
-                        art.summary, n_traces, n_samples
-                    );
-                    s.toasts
-                        .push(ToastKind::Success, "Simulation complete", &detail);
-                    let done = format!("sim_run done: {detail}");
-                    s.console.lines.push(ConsoleLine {
-                        text: done.clone(),
-                        sev: MsgSev::Info,
-                    });
-                    s.sim.log.push(ConsoleLine {
-                        text: done,
-                        sev: MsgSev::Info,
-                    });
-                }
-                Err(e) => {
-                    s.sim.statuses[tb] = TbStatus::Failed;
-                    s.flow.sim = RunStatus::Failed;
-                    if let Some(h) = s.sim.history.first_mut() {
-                        h.status = TbStatus::Failed;
-                    }
-                    let line = format!("ERROR: {e}");
-                    s.console.lines.push(ConsoleLine {
-                        text: line.clone(),
-                        sev: MsgSev::Error,
-                    });
-                    s.sim.log.push(ConsoleLine {
-                        text: line,
-                        sev: MsgSev::Error,
-                    });
-                    s.toasts.push(
-                        ToastKind::Error,
-                        "Simulation failed",
-                        &truncate_chars(&e, 140),
-                    );
-                }
-            }
-            s.sim.clear_active();
-        }
-        SimEvent::Cancelled => {
-            s.sim.statuses[tb] = TbStatus::Idle;
-            s.flow.sim = RunStatus::NotStarted;
-            if let Some(h) = s.sim.history.first_mut() {
-                h.status = TbStatus::Idle;
-            }
-            let line = format!(
-                "{} cancelled by user",
-                TBS.get(tb).map(|t| t.name).unwrap_or("sim")
-            );
-            s.console.lines.push(ConsoleLine {
-                text: line.clone(),
-                sev: MsgSev::Info,
-            });
-            s.sim.log.push(ConsoleLine {
-                text: line,
-                sev: MsgSev::Info,
-            });
-            s.toasts
-                .push(ToastKind::Warning, "Simulation stopped", "Run cancelled");
-            s.sim.clear_active();
-        }
-    }
-}
-
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max).collect();
-        out.push('…');
-        out
-    }
-}
-
-/// The sim worker body: elaborate, run `helion-sim`, import the VCD, and
-/// stream every stage line. Checks cancel between stages.
-#[allow(clippy::too_many_arguments)]
-fn sim_worker(
-    tb: usize,
-    tb_name: String,
-    origin: String,
-    src: String,
-    tcl_design: Option<helion_ir::Design>,
-    cycles: u32,
-    tx: mpsc::Sender<SimEvent>,
-    cancel: Arc<AtomicBool>,
-) {
-    let send = |text: String, sev: MsgSev| {
-        let _ = tx.send(SimEvent::Line { text, sev });
-    };
-    let is_cancelled = || cancel.load(Ordering::Relaxed);
-    send(format!("elaborate {tb_name} <- {origin}"), MsgSev::Info);
-    let design = match tcl_design {
-        Some(d) => d,
-        None => {
-            if src.trim().is_empty() {
-                let _ = tx.send(SimEvent::Finished(Err(
-                    "launch_simulation: the RTL buffer is empty (open a source first)".into(),
-                )));
-                return;
-            }
-            let ext = std::path::Path::new(&origin)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            let synth: Result<helion_ir::Design, String> = if matches!(ext.as_str(), "vhd" | "vhdl")
-            {
-                helion_vhdl::synth_vhdl(&src).map_err(|e| format!("synth_design failed: {e}"))
-            } else {
-                helion_sv::synth_sv(&src, &origin).map_err(|e| format!("synth_design failed: {e}"))
-            };
-            match synth {
-                Ok(d) => d,
-                Err(e) => {
-                    let _ = tx.send(SimEvent::Finished(Err(e)));
-                    return;
-                }
-            }
-        }
-    };
-    send(
-        format!(
-            "synth_design cells={} luts={}",
-            design.cells.len(),
-            design.lut_inits().len()
-        ),
-        MsgSev::Info,
-    );
-    if is_cancelled() {
-        let _ = tx.send(SimEvent::Cancelled);
+/// Add a live Objects row to the canvas, echoing the Vivado verb.
+fn add_live_object(s: &mut AppState, idx: usize) {
+    let Some(name) = s
+        .wave
+        .live
+        .as_ref()
+        .and_then(|l| l.traces.get(idx))
+        .map(|t| t.name.clone())
+    else {
         return;
-    }
-    let cycles = cycles.clamp(1, LIVE_MAX_CYCLES);
-    send(
-        format!("sim_run start cycles={cycles} timescale_ps={LIVE_PERIOD_PS}"),
-        MsgSev::Info,
-    );
-    let vcd = helion_sim::vcd::dump_vcd(&design, cycles, LIVE_PERIOD_PS);
-    if is_cancelled() {
-        let _ = tx.send(SimEvent::Cancelled);
-        return;
-    }
-    let mut live = match import_vcd_text(&vcd) {
-        Ok(l) => l,
-        Err(e) => {
-            let _ = tx.send(SimEvent::Finished(Err(format!("VCD import failed: {e}"))));
-            return;
-        }
     };
-    live.source = format!("{tb_name} ({cycles} cycles, helion-sim)");
-    live.cycles = cycles;
-    send(
-        format!(
-            "dump_vcd signals={} samples={} timescale_ps={} duration_ps={}{}",
-            live.traces.len(),
-            live.sample_len(),
-            live.timescale_ps,
-            live.duration_ps,
-            if live.truncated { " (truncated)" } else { "" },
-        ),
-        MsgSev::Info,
-    );
-    let units = u64::from(cycles).saturating_mul(LIVE_PERIOD_PS) / 1_000;
-    let summary = format!("{tb_name} PASSED: sim_time={units} ns");
-    send(summary.clone(), MsgSev::Info);
-    let _ = tx.send(SimEvent::Finished(Ok(SimArtifacts {
-        live,
-        tb,
-        units,
-        errors: 0,
-        summary,
-    })));
+    if s.wave.add_live_lane(idx) {
+        echo(s, format!("add_wave {{{name}}}"));
+    }
 }
 
 /// Echo a Tcl verb to the console without flipping run state.
@@ -1704,27 +965,6 @@ fn add_object(s: &mut AppState, obj: SimObject) {
     let Some(id) = obj.sig else { return };
     if s.wave.add_signal(id) {
         echo(s, format!("add_wave {{{}}}", obj.name));
-    }
-}
-
-/// Launch the selected testbench on the real engine worker.
-fn run_selected_tb(s: &mut AppState) {
-    let Some(i) = s.sim.selected else { return };
-    if i >= TBS.len() {
-        return;
-    }
-    echo(
-        s,
-        format!("launch_simulation -simset sim_1 -tb {}", TBS[i].name),
-    );
-    echo(s, "run 100 ns".into());
-    if let Err(e) = launch_tb(s, i) {
-        s.console.lines.push(ConsoleLine {
-            text: format!("ERROR: {e}"),
-            sev: MsgSev::Error,
-        });
-        s.toasts
-            .push(ToastKind::Error, "Cannot start simulation", &e);
     }
 }
 
@@ -1883,9 +1123,114 @@ fn live_lane_shape(s: &AppState, t: &VivadoTheme, trace: &LiveTrace) -> Shape {
     shape
 }
 
+/// Toolbar button that renders disabled (with the reason as its accessible
+/// description and tooltip) when `enabled` is false.
+fn tool_btn_state(key: &str, label: &str, t: &VivadoTheme, enabled: bool, why: &str) -> El {
+    let btn = tool_btn(key, label, t);
+    if enabled {
+        btn
+    } else {
+        btn.disabled(true)
+            .focusable(false)
+            .description(why)
+            .help(why)
+            .layer_opacity(0.45)
+    }
+}
+
+/// Toolbar Run: start the selected testbench (or the free-running design).
+fn run_from_wave(s: &mut AppState) {
+    echo(s, "run all".into());
+    if let Err(e) = launch_default_tb(s) {
+        s.console.lines.push(ConsoleLine {
+            text: format!("ERROR: {e}"),
+            sev: MsgSev::Error,
+        });
+        s.toasts.push(
+            crate::state::ToastKind::Error,
+            "Cannot start simulation",
+            &e,
+        );
+    }
+}
+
+/// Toolbar Restart: rerun the last simulation from time zero.
+fn restart_from_wave(s: &mut AppState) {
+    echo(s, "restart".into());
+    if let Err(e) = crate::views::tb::rerun_last(s) {
+        s.console.lines.push(ConsoleLine {
+            text: format!("ERROR: {e}"),
+            sev: MsgSev::Error,
+        });
+        s.toasts.push(
+            crate::state::ToastKind::Error,
+            "Cannot restart simulation",
+            &e,
+        );
+    }
+}
+
+/// Radix segments: apply to the selected trace, or to all traces when none
+/// is selected (the leading caption says which).
+fn radix_control(s: &AppState, t: &VivadoTheme) -> El {
+    let active = s.wave.active_radix();
+    let target = match s.wave.selected_name() {
+        Some(n) => n.rsplit('.').next().unwrap_or(&n).to_string(),
+        None => "all".into(),
+    };
+    let mut segs = row()
+        .key("wave-radix")
+        .role("radiogroup")
+        .label(format!("Radix for {target}"))
+        .h(20.0)
+        .items_center()
+        .border(1.0, t.border);
+    for r in WaveRadix::ALL {
+        let on = r == active;
+        segs = segs.child(
+            el().key(format!("wave-radix-{}", r.label().to_lowercase()))
+                .role("radio")
+                .label(r.label())
+                .focusable(true)
+                .focus_selected(on)
+                .h_full()
+                .px(6.0)
+                .center()
+                .fill(if on { t.selection } else { t.panel_bg })
+                .hover(t.selection)
+                .on_press(move |s: &mut AppState| {
+                    let verb = s.wave.set_radix(r);
+                    echo(s, verb);
+                })
+                .child(text(r.label()).font(VivadoTheme::FONT_UI).color(t.text)),
+        );
+    }
+    row()
+        .gap(4.0)
+        .items_center()
+        .child(
+            el().max_w(96.0).child(
+                pin_label(&format!("Radix ({target})"), t)
+                    .truncate()
+                    .help_when_truncated(format!("Radix ({target})")),
+            ),
+        )
+        .child(segs)
+}
+
 /// Sim toolbar: run controls, zoom, cursor step, A/B + markers, radix.
 fn wave_toolbar(s: &AppState, t: &VivadoTheme) -> El {
-    let running = s.flow.sim == RunStatus::Running;
+    let running = s.sim.is_active();
+    let can_restart = !running && s.sim.last_run().is_some();
+    let run_btn = if running {
+        tool_btn("wave-run", "■ Stop", t)
+            .help("Stop the running simulation")
+            .on_press(|s: &mut AppState| cancel_sim(s))
+    } else {
+        tool_btn("wave-run", "▶ Run", t)
+            .help("Run the selected testbench, or the design for RUNTIME_CYCLES when there is none")
+            .on_press(run_from_wave)
+    };
     row()
         .key("wave-toolbar")
         .w_full()
@@ -1894,36 +1239,25 @@ fn wave_toolbar(s: &AppState, t: &VivadoTheme) -> El {
         .gap(3.0)
         .items_center()
         .fill(t.header_bg)
+        .child(run_btn)
         .child(
-            tool_btn("wave-run", if running { "❚❚ Pause" } else { "▶ Run" }, t).on_press(
-                move |s: &mut AppState| {
-                    if running {
-                        cancel_sim(s);
-                        return;
-                    }
-                    echo(s, "run 100 ns".into());
-                    if let Err(e) = launch_default_tb(s) {
-                        s.console.lines.push(ConsoleLine {
-                            text: format!("ERROR: {e}"),
-                            sev: MsgSev::Error,
-                        });
-                        s.toasts
-                            .push(ToastKind::Error, "Cannot start simulation", &e);
-                    }
+            tool_btn_state(
+                "wave-restart",
+                "↺ Restart",
+                t,
+                can_restart,
+                if running {
+                    "Stop the running simulation first"
+                } else {
+                    "No simulation has run yet"
                 },
-            ),
+            )
+            .on_press(restart_from_wave),
         )
         .child(
-            tool_btn("wave-restart", "↺ Restart", t).on_press(|s: &mut AppState| {
-                s.wave.cursor = 0;
-                echo(s, "restart".into());
-            }),
-        )
-        .child(
-            tool_btn("wave-step", "Step", t).on_press(|s: &mut AppState| {
-                s.wave.step_cursor(1);
-                echo(s, "step".into());
-            }),
+            tool_btn("wave-step", "Next edge", t)
+                .help("Move the cursor to the next transition of the selected trace")
+                .on_press(|s: &mut AppState| s.wave.next_edge()),
         )
         .child(tool_btn("wave-zoom-out", "−", t).on_press(|s: &mut AppState| s.wave.zoom_out()))
         .child(
@@ -1960,9 +1294,6 @@ fn wave_toolbar(s: &AppState, t: &VivadoTheme) -> El {
                 let n = s.wave.markers.len();
                 let c = s.wave.cursor;
                 let name = format!("M{n}");
-                // Clamp to the live grid when one is mounted; the demo
-                // `WaveMarker::new` clamp (SAMPLES) would strand markers on
-                // long engine dumps.
                 let last = s.wave.sample_len().saturating_sub(1);
                 s.wave.markers.push(WaveMarker {
                     name: name.clone(),
@@ -1971,18 +1302,23 @@ fn wave_toolbar(s: &AppState, t: &VivadoTheme) -> El {
                 echo(s, format!("add_marker {name} {}", time_label(s, c)));
             }),
         )
-        .child(
-            tool_btn("wave-radix", s.wave.radix.label(), t).on_press(|s: &mut AppState| {
-                s.wave.radix = s.wave.radix.toggle();
-                echo(
-                    s,
-                    format!("set_radix {}", s.wave.radix.label().to_lowercase()),
-                );
-            }),
-        )
+        .child(el().grow(1.0))
+        .child(radix_control(s, t))
 }
 
-/// Scope panel: the sim hierarchy tree (testbench top, DUT, clock gen).
+/// Panel title row shared by the Scope/Objects panels.
+fn panel_head(title: &str, t: &VivadoTheme) -> El {
+    row()
+        .w_full()
+        .h(ROW_H)
+        .px(6.0)
+        .items_center()
+        .fill(t.header_bg)
+        .child(text(title).font(VivadoTheme::FONT_TITLE).color(t.text))
+}
+
+/// Scope panel: the demo hierarchy under the fixture, else the scopes the
+/// live VCD declares.
 fn scope_panel(s: &AppState, t: &VivadoTheme) -> El {
     let mut body = col()
         .key("wave-scopes")
@@ -1991,15 +1327,53 @@ fn scope_panel(s: &AppState, t: &VivadoTheme) -> El {
         .h(SCOPE_H)
         .fill(t.panel_bg)
         .border(1.0, t.border)
-        .child(
-            row()
-                .w_full()
-                .h(ROW_H)
-                .px(6.0)
-                .items_center()
-                .fill(t.header_bg)
-                .child(text("Scope").font(VivadoTheme::FONT_TITLE).color(t.text)),
-        );
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(panel_head("Scope", t));
+    if let Some(live) = s.wave.live.as_ref().filter(|l| !l.is_empty()) {
+        let current = s.wave.current_live_scope();
+        for (k, scope) in live_scopes(live).into_iter().enumerate() {
+            let selected = current.as_deref() == Some(scope.as_str());
+            let shown = if scope.is_empty() {
+                "(top)".to_string()
+            } else {
+                scope.clone()
+            };
+            let pick = scope.clone();
+            body = body.child(
+                row()
+                    .key(format!("wave-live-scope-{k}"))
+                    .role("treeitem")
+                    .label(shown.clone())
+                    .focus_selected(selected)
+                    .focusable(true)
+                    .w_full()
+                    .h(ROW_H)
+                    .items_center()
+                    .gap(4.0)
+                    .pl(6.0)
+                    .pr(6.0)
+                    .fill(if selected { t.selection } else { t.panel_bg })
+                    .hover(t.selection)
+                    .on_press(move |s: &mut AppState| {
+                        s.wave.live_scope = Some(pick.clone());
+                        echo(s, format!("select_scope {pick}"));
+                    })
+                    .child(
+                        icon(&glyphs::TRIANGLE_RIGHT, 9.0)
+                            .color(t.text_dim)
+                            .a11y_hidden(),
+                    )
+                    .child(
+                        ui_label(&shown, t)
+                            .truncate()
+                            .help_when_truncated(shown.clone()),
+                    ),
+            );
+        }
+        return body;
+    }
     for scope in SimScope::ALL {
         let selected = s.wave.scope == scope;
         body = body.child(
@@ -2031,9 +1405,24 @@ fn scope_panel(s: &AppState, t: &VivadoTheme) -> El {
     body
 }
 
-/// Objects panel: signals of the scope with live cursor values and per-row
-/// `add_wave` for signals not yet on the canvas.
-fn objects_panel(s: &AppState, t: &VivadoTheme) -> El {
+/// Objects header row (Name / Value / Type).
+fn objects_head(t: &VivadoTheme) -> El {
+    row()
+        .key("wave-objects-head")
+        .w_full()
+        .h(ROW_H)
+        .px(6.0)
+        .gap(6.0)
+        .items_center()
+        .fill(t.header_bg)
+        .child(el().w(88.0).child(pin_label("Name", t)))
+        .child(el().w(56.0).child(pin_label("Value", t)))
+        .child(el().grow(1.0).child(pin_label("Type", t)))
+}
+
+/// Objects panel over the live import: traces of the selected scope with
+/// cursor values; traces not yet on the canvas offer `add_wave`.
+fn live_objects_panel(s: &AppState, t: &VivadoTheme, live: &LiveWave) -> El {
     let mut body = col()
         .key("wave-objects")
         .w_full()
@@ -2041,23 +1430,87 @@ fn objects_panel(s: &AppState, t: &VivadoTheme) -> El {
         .min_h(0.0)
         .fill(t.panel_bg)
         .border(1.0, t.border)
-        .child(
-            row()
-                .key("wave-objects-head")
-                .w_full()
-                .h(ROW_H)
-                .px(6.0)
-                .gap(6.0)
-                .items_center()
-                .fill(t.header_bg)
-                .child(el().w(88.0).child(pin_label("Name", t)))
-                .child(el().w(56.0).child(pin_label("Value", t)))
-                .child(el().grow(1.0).child(pin_label("Type", t))),
-        );
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(objects_head(t));
+    let scope = s.wave.current_live_scope().unwrap_or_default();
+    let lanes = s.wave.lanes();
+    for (idx, trace) in live.traces.iter().enumerate() {
+        if trace_scope(&trace.name) != scope {
+            continue;
+        }
+        let selected = s.wave.live_selected == Some(idx);
+        let value = format_live_value(trace, s.wave.cursor, s.wave.radix_for(&trace.name));
+        let dtype = if trace.is_bus() {
+            format!("wire [{}:0]", trace.width - 1)
+        } else {
+            "wire".to_string()
+        };
+        let mut r = row()
+            .key(format!("wave-live-object-{idx}"))
+            .role("treeitem")
+            .label(trace.name.clone())
+            .focus_selected(selected)
+            .focusable(true)
+            .w_full()
+            .h(ROW_H)
+            .px(6.0)
+            .gap(6.0)
+            .items_center()
+            .fill(if selected { t.selection } else { t.panel_bg })
+            .hover(t.selection)
+            .on_press(move |s: &mut AppState| select_live_trace(s, idx))
+            .child(
+                el().w(88.0).child(
+                    ui_label(trace.leaf(), t)
+                        .truncate()
+                        .help_when_truncated(trace.name.clone()),
+                ),
+            )
+            .child(
+                el().w(56.0).child(
+                    mono_value(&value, t)
+                        .truncate()
+                        .help_when_truncated(value.clone()),
+                ),
+            )
+            .child(
+                el().grow(1.0)
+                    .min_w(0.0)
+                    .child(pin_label(&dtype, t).truncate()),
+            );
+        if !lanes.contains(&idx) {
+            r = r.child(
+                tool_btn(&format!("wave-live-add-{idx}"), "+", t)
+                    .label(format!("Add {} to wave", trace.name))
+                    .help("Add to the waveform")
+                    .on_press(move |s: &mut AppState| add_live_object(s, idx)),
+            );
+        }
+        body = body.child(r);
+    }
+    body
+}
+
+/// Objects panel: the demo scope's objects under the fixture, else the live
+/// scope's traces.
+fn objects_panel(s: &AppState, t: &VivadoTheme) -> El {
+    if let Some(live) = s.wave.live.as_ref().filter(|l| !l.is_empty()) {
+        return live_objects_panel(s, t, live);
+    }
+    let mut body = col()
+        .key("wave-objects")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .fill(t.panel_bg)
+        .border(1.0, t.border)
+        .child(objects_head(t));
     for obj in objects(s.wave.scope).iter().copied() {
         let value = match (obj.fixed, obj.sig) {
             (Some(f), _) => f.into(),
-            (None, Some(id)) => format_value(id, s.wave.cursor, s.wave.radix),
+            (None, Some(id)) => format_value(id, s.wave.cursor, s.wave.radix_for(id.name())),
             (None, None) => "-".into(),
         };
         let mut r = row()
@@ -2089,8 +1542,8 @@ fn objects_panel(s: &AppState, t: &VivadoTheme) -> El {
     body
 }
 
-/// Live-source banner: names the engine import behind the lanes, or labels
-/// the demo fallback grid so pre-run traces are never mistaken for sim data.
+/// Source banner: names the engine import behind the lanes, or labels the
+/// demo fixture so its traces are never mistaken for sim data.
 fn live_banner(s: &AppState, t: &VivadoTheme) -> El {
     let (label, ink) = match &s.wave.live {
         Some(live) => (
@@ -2103,13 +1556,11 @@ fn live_banner(s: &AppState, t: &VivadoTheme) -> El {
             ),
             t.pass,
         ),
-        None if s.sim.is_active() || s.flow.sim == RunStatus::Running => {
-            ("Simulating… streaming into the wave viewer".into(), t.link)
-        }
-        None => (
-            "Demo traces — Run Simulation for live VCD data".into(),
-            t.text_faint,
+        None if s.sim.is_active() => (
+            "Simulating… the waveform loads when the run finishes".into(),
+            t.link,
         ),
+        None => ("Demo traces (fixture)".into(), t.text_faint),
     };
     row()
         .key("wave-live-banner")
@@ -2118,11 +1569,17 @@ fn live_banner(s: &AppState, t: &VivadoTheme) -> El {
         .px(8.0)
         .items_center()
         .fill(t.header_bg)
-        .child(text(label).font(VivadoTheme::FONT_UI).color(ink))
+        .child(
+            text(label.clone())
+                .font(VivadoTheme::FONT_UI)
+                .color(ink)
+                .truncate()
+                .help_when_truncated(label),
+        )
 }
 
-/// Live Name/Value column: one row per imported engine trace (first
-/// [`LIVE_SHOWN`]), selection shared with the live lanes.
+/// Live Name/Value column: one row per mounted lane, selection shared with
+/// the live lanes; each value uses that trace's radix.
 fn live_names_column(s: &AppState, t: &VivadoTheme, live: &LiveWave) -> El {
     let mut body = col()
         .key("wave-names")
@@ -2142,8 +1599,13 @@ fn live_names_column(s: &AppState, t: &VivadoTheme, live: &LiveWave) -> El {
                 .child(el().w(119.0).child(pin_label("Name", t)))
                 .child(el().grow(1.0).child(pin_label("Value", t))),
         );
-    for (idx, trace) in live.traces.iter().enumerate().take(LIVE_SHOWN) {
+    let lanes = s.wave.lanes();
+    for &idx in &lanes {
+        let Some(trace) = live.traces.get(idx) else {
+            continue;
+        };
         let selected = s.wave.live_selected == Some(idx);
+        let value = format_live_value(trace, s.wave.cursor, s.wave.radix_for(&trace.name));
         body = body.child(
             row()
                 .key(format!("wave-live-name-{idx}"))
@@ -2175,19 +1637,27 @@ fn live_names_column(s: &AppState, t: &VivadoTheme, live: &LiveWave) -> El {
                     })
                     .a11y_hidden(),
                 )
-                .child(el().w(104.0).child(ui_label(trace.leaf(), t)))
+                .child(
+                    el().w(104.0).child(
+                        ui_label(trace.leaf(), t)
+                            .truncate()
+                            .help_when_truncated(trace.name.clone()),
+                    ),
+                )
                 .child(
                     el().key(format!("wave-live-value-{idx}"))
                         .grow(1.0)
                         .min_w(0.0)
-                        .child(mono_value(
-                            &format_live_value(trace, s.wave.cursor, s.wave.radix),
-                            t,
-                        )),
+                        .child(
+                            mono_value(&value, t)
+                                .truncate()
+                                .help_when_truncated(value.clone()),
+                        ),
                 ),
         );
     }
-    if live.traces.len() > LIVE_SHOWN {
+    let hidden = live.traces.len().saturating_sub(lanes.len());
+    if hidden > 0 {
         body = body.child(
             row()
                 .key("wave-live-more")
@@ -2195,17 +1665,14 @@ fn live_names_column(s: &AppState, t: &VivadoTheme, live: &LiveWave) -> El {
                 .h(ROW_H)
                 .px(6.0)
                 .items_center()
-                .child(pin_label(
-                    &format!("+{} more in VCD", live.traces.len() - LIVE_SHOWN),
-                    t,
-                )),
+                .child(pin_label(&format!("+{hidden} more — add from Objects"), t)),
         );
     }
     body
 }
 
 /// Signal Name/Value column: live engine rows once imported, else the demo
-/// fallback rows.
+/// fixture rows.
 fn names_column(s: &AppState, t: &VivadoTheme) -> El {
     if let Some(live) = &s.wave.live {
         if !live.is_empty() {
@@ -2265,7 +1732,7 @@ fn names_column(s: &AppState, t: &VivadoTheme) -> El {
                         .grow(1.0)
                         .min_w(0.0)
                         .child(mono_value(
-                            &format_value(id, s.wave.cursor, s.wave.radix),
+                            &format_value(id, s.wave.cursor, s.wave.radix_for(id.name())),
                             t,
                         )),
                 ),
@@ -2284,8 +1751,6 @@ fn ruler(s: &AppState, t: &VivadoTheme) -> El {
         .fill(t.panel_bg)
         .child(canvas(ruler_shape(s, t)).w_full().h_full());
     let n = sample_len(s);
-    // Long live grids label every GRID_STEP samples like the demo grid; the
-    // step stays readable because labels sit 64px apart at 100% zoom.
     let mut g = 0;
     while g <= n {
         // The end tick keeps its line but no label: the text would run off
@@ -2322,9 +1787,10 @@ fn ruler(s: &AppState, t: &VivadoTheme) -> El {
     r
 }
 
-/// One trace lane: the trace canvas plus bus value labels on wide runs.
+/// One demo trace lane: the trace canvas plus bus value labels on wide runs.
 fn lane(s: &AppState, t: &VivadoTheme, id: WaveSigId) -> El {
     let pps = s.wave.pps();
+    let radix = s.wave.radix_for(id.name());
     let mut l = el()
         .key(id.lane_key())
         .w(s.wave.sheet_w())
@@ -2339,7 +1805,7 @@ fn lane(s: &AppState, t: &VivadoTheme, id: WaveSigId) -> El {
         for (a, b, _v) in bus_runs(id) {
             let px = (b - a) as f32 * pps;
             if px >= 28.0 {
-                let label = format_value(id, a, s.wave.radix);
+                let label = format_value(id, a, radix);
                 l = l.child(
                     text(label)
                         .font(FONT_PIN)
@@ -2355,6 +1821,7 @@ fn lane(s: &AppState, t: &VivadoTheme, id: WaveSigId) -> El {
 /// One live trace lane: the engine canvas plus bus value labels on wide runs.
 fn live_lane(s: &AppState, t: &VivadoTheme, idx: usize, trace: &LiveTrace) -> El {
     let pps = s.wave.pps();
+    let radix = s.wave.radix_for(&trace.name);
     let mut l = el()
         .key(format!("wave-live-lane-{idx}"))
         .w(s.wave.sheet_w())
@@ -2368,8 +1835,9 @@ fn live_lane(s: &AppState, t: &VivadoTheme, idx: usize, trace: &LiveTrace) -> El
     if trace.is_bus() {
         for (a, b, _v) in live_bus_runs(trace) {
             let px = (b - a) as f32 * pps;
-            if px >= 28.0 {
-                let label = format_live_value(trace, a, s.wave.radix);
+            let label = format_live_value(trace, a, radix);
+            // Labels mount only where the run is wide enough to hold them.
+            if px >= 12.0 + label.chars().count() as f32 * 6.0 {
                 l = l.child(
                     text(label)
                         .font(FONT_PIN)
@@ -2377,8 +1845,6 @@ fn live_lane(s: &AppState, t: &VivadoTheme, idx: usize, trace: &LiveTrace) -> El
                         .absolute(a as f32 * pps + 4.0, 5.0),
                 );
             }
-            // Long live buses can hold thousands of narrow runs; labels only
-            // mount on wide ones, so no cap is needed.
         }
     }
     l
@@ -2417,27 +1883,26 @@ fn cursor_overlays(s: &AppState, t: &VivadoTheme, lanes_h: f32) -> Vec<El> {
 /// demo lanes) in one horizontal pan container so ticks, traces, and cursors
 /// stay aligned.
 fn wave_canvas(s: &AppState, t: &VivadoTheme) -> El {
-    let live_count = s.wave.live_shown();
-    let use_live = s.wave.has_live() && live_count > 0;
+    let use_live = s.wave.has_live();
+    let lanes = s.wave.lanes();
     let lanes_h = if use_live {
-        live_count as f32 * LANE_H
+        lanes.len() as f32 * LANE_H
     } else {
         s.wave.visible().len() as f32 * LANE_H
     };
     let mut sheet = el().w(s.wave.sheet_w()).h(lanes_h).fill(t.panel_bg);
     if use_live {
         if let Some(live) = &s.wave.live {
-            for (row, trace) in live.traces.iter().enumerate().take(live_count) {
-                let mut l = live_lane(s, t, row, trace);
-                l = l.absolute(0.0, row as f32 * LANE_H);
-                sheet = sheet.child(l);
+            for (row, &idx) in lanes.iter().enumerate() {
+                if let Some(trace) = live.traces.get(idx) {
+                    sheet =
+                        sheet.child(live_lane(s, t, idx, trace).absolute(0.0, row as f32 * LANE_H));
+                }
             }
         }
     } else {
         for (row, id) in s.wave.visible().iter().enumerate() {
-            let mut l = lane(s, t, *id);
-            l = l.absolute(0.0, row as f32 * LANE_H);
-            sheet = sheet.child(l);
+            sheet = sheet.child(lane(s, t, *id).absolute(0.0, row as f32 * LANE_H));
         }
     }
     for overlay in cursor_overlays(s, t, lanes_h) {
@@ -2476,7 +1941,7 @@ fn wave_readout(s: &AppState, t: &VivadoTheme) -> El {
     if let (Some(a), Some(b)) = (s.wave.cursor_a, s.wave.cursor_b) {
         let da = time_ps(s, a) as i64;
         let db = time_ps(s, b) as i64;
-        let d = (db - da).abs() as u64;
+        let d = (db - da).unsigned_abs();
         r = r.child(
             el().key("wave-delta")
                 .child(dim_label(&format!("Δ: {}", time_label_ps(d)), t)),
@@ -2489,31 +1954,82 @@ fn wave_readout(s: &AppState, t: &VivadoTheme) -> El {
             .live_selected
             .and_then(|i| s.wave.live.as_ref()?.traces.get(i))
         {
-            Some(trace) => format!(
-                "Selected: {} = {} ({})",
-                trace.leaf(),
-                format_live_value(trace, s.wave.cursor, s.wave.radix),
-                s.wave.radix.label().to_lowercase()
-            ),
+            Some(trace) => {
+                let radix = s.wave.radix_for(&trace.name);
+                format!(
+                    "Selected: {} = {} ({})",
+                    trace.leaf(),
+                    format_live_value(trace, s.wave.cursor, radix),
+                    radix.label().to_lowercase()
+                )
+            }
             None => "No signal selected".into(),
         }
     } else {
         match s.wave.selected {
-            Some(id) => format!(
-                "Selected: {} = {} ({})",
-                id.name(),
-                format_value(id, s.wave.cursor, s.wave.radix),
-                s.wave.radix.label().to_lowercase()
-            ),
+            Some(id) => {
+                let radix = s.wave.radix_for(id.name());
+                format!(
+                    "Selected: {} = {} ({})",
+                    id.name(),
+                    format_value(id, s.wave.cursor, radix),
+                    radix.label().to_lowercase()
+                )
+            }
             None => "No signal selected".into(),
         }
     };
-    r.child(el().key("wave-sel").grow(1.0).child(dim_label(&sel, t)))
+    r.child(
+        el().key("wave-sel").grow(1.0).min_w(0.0).child(
+            dim_label(&sel, t)
+                .truncate()
+                .help_when_truncated(sel.clone()),
+        ),
+    )
 }
 
-/// Wave center surface: scopes/objects left, names + trace canvas right.
-pub fn wave_pane(s: &AppState, t: &VivadoTheme) -> El {
+/// Empty state before any waveform exists: one sentence plus the one real
+/// action (Run, or Stop while a run is in flight).
+fn wave_empty(s: &AppState, t: &VivadoTheme) -> El {
+    let (message, action) = if s.sim.is_active() {
+        (
+            format!(
+                "Simulating {} — the waveform loads when it finishes.",
+                s.sim.active_label()
+            ),
+            tool_btn("wave-empty-stop", "■ Stop", t).on_press(|s: &mut AppState| cancel_sim(s)),
+        )
+    } else {
+        let ready = crate::views::tb::can_launch(s);
+        let why = ready.clone().err().unwrap_or_default();
+        (
+            "No waveform yet — run a simulation to see its traces here.".to_string(),
+            tool_btn_state("wave-empty-run", "▶ Run Simulation", t, ready.is_ok(), &why)
+                .on_press(run_from_wave),
+        )
+    };
     col()
+        .key("wave-empty")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .center()
+        .gap(10.0)
+        .padding(16.0)
+        .child(
+            text(message.clone())
+                .font(VivadoTheme::FONT_UI)
+                .color(t.text_dim)
+                .truncate()
+                .help_when_truncated(message),
+        )
+        .child(action)
+}
+
+/// Wave center surface: scopes/objects left, names + trace canvas right; the
+/// empty state before any waveform exists.
+pub fn wave_pane(s: &AppState, t: &VivadoTheme) -> El {
+    let pane = col()
         .key("wave")
         .grow(1.0)
         .h_full()
@@ -2521,8 +2037,11 @@ pub fn wave_pane(s: &AppState, t: &VivadoTheme) -> El {
         .min_h(0.0)
         .fill(t.panel_bg)
         .border(1.0, t.border)
-        .child(pane_header("Waveform - sim_1", "wave-pane", t))
-        .child(live_banner(s, t))
+        .child(pane_header("Waveform - sim_1", "wave-pane", t));
+    if !s.wave.has_data() {
+        return pane.child(wave_empty(s, t));
+    }
+    pane.child(live_banner(s, t))
         .child(wave_toolbar(s, t))
         .child(
             row()
@@ -2563,277 +2082,6 @@ pub fn wave_pane(s: &AppState, t: &VivadoTheme) -> El {
         .child(wave_readout(s, t))
 }
 
-/// Status badge ink for a testbench state.
-fn tb_ink(status: TbStatus, t: &VivadoTheme) -> rune::Color {
-    match status {
-        TbStatus::Passed => t.pass,
-        TbStatus::Failed => t.fail,
-        TbStatus::Running => t.link,
-        TbStatus::Idle => t.text_faint,
-    }
-}
-
-/// Testbench list: discovered files with run-status badges.
-fn tb_list(s: &AppState, t: &VivadoTheme) -> El {
-    let mut body = col()
-        .key("sim-list")
-        .w(260.0)
-        .h_full()
-        .min_h(0.0)
-        .fill(t.panel_bg)
-        .border(1.0, t.border)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .child(
-            row()
-                .w_full()
-                .h(ROW_H)
-                .px(6.0)
-                .items_center()
-                .fill(t.header_bg)
-                .child(
-                    text(format!("Testbenches ({})", TBS.len()))
-                        .font(VivadoTheme::FONT_TITLE)
-                        .color(t.text),
-                ),
-        );
-    for (i, tb) in TBS.iter().enumerate() {
-        let selected = s.sim.selected == Some(i);
-        let status = s.sim.status(i);
-        body = body.child(
-            row()
-                .key(format!("sim-tb-{i}"))
-                .role("treeitem")
-                .label(format!("{} ({})", tb.name, status.label()))
-                .focus_selected(selected)
-                .focusable(true)
-                .w_full()
-                .h(28.0)
-                .px(6.0)
-                .gap(6.0)
-                .items_center()
-                .fill(if selected { t.selection } else { t.panel_bg })
-                .hover(t.selection)
-                .on_press(move |s: &mut AppState| {
-                    s.sim.selected = Some(i);
-                    echo(s, format!("select_objects [get_files {}]", TBS[i].name));
-                })
-                .child(el().grow(1.0).min_w(0.0).child(ui_label(tb.name, t)))
-                .child(
-                    el().key(format!("sim-tb-status-{i}"))
-                        .child(text(status.label()).font(FONT_PIN).color(tb_ink(status, t))),
-                ),
-        );
-    }
-    body
-}
-
-/// One label/value detail row.
-fn detail_row(key: &str, label: &str, value: &str, t: &VivadoTheme) -> El {
-    row()
-        .key(key)
-        .w_full()
-        .h(ROW_H)
-        .px(8.0)
-        .gap(8.0)
-        .items_center()
-        .child(el().w(120.0).child(pin_label(label, t)))
-        .child(el().grow(1.0).min_w(0.0).child(ui_label(value, t)))
-}
-
-/// Testbench detail: DUT instance, port map, clocks, decls, last run, and
-/// the run / open-waveform actions.
-fn tb_detail(s: &AppState, t: &VivadoTheme) -> El {
-    let Some(i) = s.sim.selected else {
-        return el()
-            .key("sim-detail-prompt")
-            .grow(1.0)
-            .h_full()
-            .center()
-            .child(dim_label("Select a testbench to see its details", t));
-    };
-    let i = i.min(TBS.len() - 1);
-    let tb = &TBS[i];
-    let status = s.sim.status(i);
-    let mut body = col()
-        .key("sim-detail")
-        .grow(1.0)
-        .h_full()
-        .min_w(0.0)
-        .min_h(0.0)
-        .fill(t.panel_bg)
-        .border(1.0, t.border)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .child(detail_row("sim-detail-name", "Testbench", tb.name, t))
-        .child(detail_row("sim-detail-path", "Path", tb.path, t))
-        .child(
-            row()
-                .key("sim-detail-status")
-                .w_full()
-                .h(ROW_H)
-                .px(8.0)
-                .gap(8.0)
-                .items_center()
-                .child(el().w(120.0).child(pin_label("Status", t)))
-                .child(
-                    el().grow(1.0).min_w(0.0).child(
-                        text(status.label())
-                            .font(VivadoTheme::FONT_UI)
-                            .color(tb_ink(status, t)),
-                    ),
-                ),
-        )
-        .child(detail_row(
-            "sim-detail-dut",
-            "DUT instance",
-            &format!("{} {}", tb.inst, tb.dut),
-            t,
-        ))
-        .child(detail_row(
-            "sim-detail-vcd",
-            "Wave database",
-            &match &s.wave.live {
-                Some(live) => live.source.clone(),
-                None => format!("{} (not simulated yet)", tb.vcd),
-            },
-            t,
-        ));
-    body = body.child(
-        row()
-            .key("sim-detail-actions")
-            .w_full()
-            .h(TOOL_H)
-            .px(8.0)
-            .gap(6.0)
-            .items_center()
-            .child(tool_btn("sim-detail-run", "▶ Run", t).on_press(run_selected_tb))
-            .child(
-                tool_btn("sim-detail-stop", "■ Stop", t).on_press(|s: &mut AppState| cancel_sim(s)),
-            )
-            .child(
-                tool_btn("sim-detail-open-wave", "Open Waveform", t).on_press(
-                    |s: &mut AppState| {
-                        s.navigate(crate::state::CenterPane::Wave);
-                        echo(s, "open_wave_config".into());
-                    },
-                ),
-            ),
-    );
-    body = body.child(
-        col().key("sim-detail-ports").w_full().child(
-            row()
-                .w_full()
-                .h(ROW_H)
-                .px(8.0)
-                .items_center()
-                .fill(t.header_bg)
-                .child(text("Port map").font(VivadoTheme::FONT_TITLE).color(t.text)),
-        ),
-    );
-    for (port, sig) in tb_ports(i) {
-        body = body.child(detail_row(&format!("sim-port-{port}"), port, sig, t));
-    }
-    let clocks: Vec<String> = tb_clocks(i)
-        .iter()
-        .map(|(c, p)| format!("{c} ({p})"))
-        .collect();
-    body = body.child(detail_row(
-        "sim-detail-clocks",
-        "Clocks",
-        &clocks.join(", "),
-        t,
-    ));
-    let decls: Vec<String> = tb_decls(i)
-        .iter()
-        .map(|(n, w, init)| format!("{n}[{w}] = {init}"))
-        .collect();
-    body = body.child(detail_row(
-        "sim-detail-decls",
-        "Decls",
-        &decls.join(", "),
-        t,
-    ));
-    body = body.child(
-        col().key("sim-detail-history").w_full().child(
-            row()
-                .w_full()
-                .h(ROW_H)
-                .px(8.0)
-                .items_center()
-                .fill(t.header_bg)
-                .child(
-                    text("Run history")
-                        .font(VivadoTheme::FONT_TITLE)
-                        .color(t.text),
-                ),
-        ),
-    );
-    if s.sim.history.is_empty() {
-        body = body.child(detail_row(
-            "sim-detail-history-empty",
-            "Runs",
-            "No runs yet",
-            t,
-        ));
-    }
-    for (h, run) in s.sim.history.iter().enumerate() {
-        body = body.child(detail_row(
-            &format!("sim-detail-history-{h}"),
-            run.tb,
-            &format!(
-                "{} ({} units, {} errors)",
-                run.status.label(),
-                run.units,
-                run.errors
-            ),
-            t,
-        ));
-    }
-    body
-}
-
-/// Sim center surface: testbench list plus detail.
-pub fn sim_pane(s: &AppState, t: &VivadoTheme) -> El {
-    col()
-        .key("sim")
-        .grow(1.0)
-        .h_full()
-        .min_w(0.0)
-        .min_h(0.0)
-        .fill(t.panel_bg)
-        .border(1.0, t.border)
-        .child(pane_header("Simulation - sim_1", "sim-pane", t))
-        .child(
-            row()
-                .key("sim-toolbar")
-                .w_full()
-                .h(TOOL_H)
-                .px(4.0)
-                .gap(3.0)
-                .items_center()
-                .fill(t.header_bg)
-                .child(
-                    tool_btn("sim-discover", "Discover", t).on_press(|s: &mut AppState| {
-                        echo(s, "get_files -filter {NAME =~ *_tb*}".into());
-                    }),
-                ),
-        )
-        .child(
-            row()
-                .key("sim-body")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .gap(6.0)
-                .padding(6.0)
-                .child(tb_list(s, t))
-                .child(tb_detail(s, t)),
-        )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2852,12 +2100,7 @@ mod tests {
     fn wave_state() -> AppState {
         let mut s = init();
         s.center = crate::state::CenterPane::Wave;
-        s
-    }
-
-    fn sim_state() -> AppState {
-        let mut s = init();
-        s.center = crate::state::CenterPane::Sim;
+        crate::views::wave_demo::seed_demo_wave(&mut s);
         s
     }
 
@@ -2941,7 +2184,10 @@ mod tests {
 
     #[test]
     fn cursor_clamps_to_the_grid() {
-        let mut w = WaveState::default();
+        let mut w = WaveState {
+            demo: true,
+            ..WaveState::default()
+        };
         w.cursor = 0;
         w.step_cursor(-5);
         assert_eq!(w.cursor, 0);
@@ -3093,65 +2339,12 @@ mod tests {
         tap(&mut rt, "wave-cursor-prev");
         tap(&mut rt, "wave-marker-0");
         assert_eq!(rt.state.wave.cursor, 49, "marker jumps the cursor back");
-        tap(&mut rt, "wave-radix");
-        assert_eq!(rt.state.wave.radix, WaveRadix::Bin);
-    }
-
-    #[test]
-    fn sim_tree_exposes_list_and_prompt_without_selection() {
-        let mut rt = harness_with(sim_state());
-        rt.frame(0.0);
-        for key in [
-            "sim",
-            "sim-toolbar",
-            "sim-discover",
-            "sim-list",
-            "sim-tb-0",
-            "sim-tb-status-0",
-            "sim-tb-1",
-            "sim-tb-status-1",
-            "sim-detail-prompt",
-        ] {
-            assert!(rt.find(key).is_some(), "missing sim key: {key}");
-        }
-        assert!(rt.find("sim-detail").is_none(), "detail needs a selection");
-        assert!(rt.find("sim-detail-run").is_none(), "run needs a selection");
-    }
-
-    #[test]
-    fn sim_select_runs_and_opens_the_waveform() {
-        let mut rt = harness_with(sim_state());
-        rt.frame(0.0);
-        tap(&mut rt, "sim-tb-1");
-        assert_eq!(rt.state.sim.selected, Some(1));
-        for key in [
-            "sim-detail",
-            "sim-detail-name",
-            "sim-detail-dut",
-            "sim-detail-ports",
-            "sim-detail-clocks",
-            "sim-detail-decls",
-            "sim-detail-run",
-            "sim-detail-open-wave",
-            "sim-detail-history",
-        ] {
-            assert!(rt.find(key).is_some(), "missing sim detail key: {key}");
-        }
-        tap(&mut rt, "sim-detail-run");
-        assert_eq!(rt.state.sim.status(1), TbStatus::Running);
-        assert_eq!(rt.state.flow.sim, RunStatus::Running);
-        assert_eq!(rt.state.sim.history.len(), 1);
-        assert!(
-            rt.state
-                .console
-                .lines
-                .iter()
-                .any(|l| l.text == "launch_simulation -simset sim_1 -tb project1_tb"),
-            "run echoes its Tcl verb"
+        tap(&mut rt, "wave-radix-bin");
+        assert_eq!(
+            rt.state.wave.radix,
+            WaveRadix::Bin,
+            "no selection sets the default"
         );
-        tap(&mut rt, "sim-detail-open-wave");
-        assert_eq!(rt.state.center, crate::state::CenterPane::Wave);
-        assert!(rt.find("wave").is_some(), "waveform opens");
     }
 
     const LIVE_VCD: &str = "\
@@ -3252,12 +2445,11 @@ $upscope $end\n$enddefinitions $end\n\
     }
 
     #[test]
-    fn sim_launch_streams_log_and_mounts_live() {
+    fn design_run_streams_log_and_mounts_live() {
         let mut s = init();
-        s.sim.selected = Some(0);
-        launch_tb(&mut s, 0).expect("launch");
-        assert_eq!(s.sim.status(0), TbStatus::Running);
-        assert_eq!(s.flow.sim, RunStatus::Running);
+        launch_default_tb(&mut s).expect("launch");
+        assert!(s.sim.is_active());
+        assert_eq!(s.flow.sim, crate::state::RunStatus::Running);
         let start = std::time::Instant::now();
         while s.sim.is_active() {
             poll_sim(&mut s);
@@ -3269,21 +2461,84 @@ $upscope $end\n$enddefinitions $end\n\
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
-        poll_sim(&mut s);
-        assert!(!s.sim.log.is_empty(), "engine must stream sim log lines");
         assert!(
-            s.sim
-                .log
-                .iter()
-                .any(|l| l.text.starts_with("synth_design ")),
-            "stages must stream"
+            s.sim.log.iter().any(|l| l.text.starts_with("elaborated ")),
+            "stages must stream: {:?}",
+            s.sim.log
         );
         let live = s.wave.live.as_ref().expect("VCD import must mount");
         assert!(!live.traces.is_empty(), "live traces must load");
-        assert!(live.cycles > 0, "live must record its engine cycles");
+        assert_eq!(
+            live.cycles, s.debug.runtime_cycles,
+            "RUNTIME_CYCLES drives it"
+        );
         assert!(!s.vcd.signals.is_empty(), "vcd dims must follow the import");
-        assert_eq!(s.sim.status(0), TbStatus::Passed);
-        assert_eq!(s.flow.sim, RunStatus::Complete);
+        assert_eq!(s.flow.sim, crate::state::RunStatus::Complete);
+    }
+
+    #[test]
+    fn production_starts_on_the_empty_state_with_a_real_run() {
+        let mut s = init();
+        s.center = crate::state::CenterPane::Wave;
+        let mut rt = harness_with(s);
+        rt.frame(0.0);
+        assert!(rt.find("wave-empty").is_some(), "empty state mounts");
+        assert!(rt.find("wave-empty-run").is_some(), "one real action");
+        assert!(rt.find("wave-name-clk").is_none(), "no demo traces");
+        assert!(rt.find("wave-toolbar").is_none());
+        tap(&mut rt, "wave-empty-run");
+        assert!(rt.state.sim.is_active(), "Run starts a real simulation");
+        crate::views::tb::cancel_sim(&mut rt.state);
+    }
+
+    #[test]
+    fn radix_formats_dec_and_signed_over_the_width() {
+        assert_eq!(WaveRadix::Dec.format(0xF, 4), "15");
+        assert_eq!(WaveRadix::Signed.format(0xF, 4), "-1");
+        assert_eq!(WaveRadix::Signed.format(0x7, 4), "7");
+        assert_eq!(WaveRadix::Signed.format(0x80, 8), "-128");
+        assert_eq!(WaveRadix::Hex.format(0x1F, 4), "F", "masks to width");
+        assert_eq!(WaveRadix::Bin.format(5, 4), "0101");
+        assert_eq!(WaveRadix::Signed.format(1, 1), "1", "scalars stay 0/1");
+        assert_eq!(WaveRadix::parse("signed"), Some(WaveRadix::Signed));
+    }
+
+    #[test]
+    fn next_edge_jumps_to_the_selected_trace_transition() {
+        let mut s = live_state();
+        s.wave.cursor = 0;
+        s.wave.live_selected = Some(1); // top.cnt changes every 10 ns
+        s.wave.next_edge();
+        let cnt = &s.wave.live.as_ref().unwrap().traces[1];
+        let c = s.wave.cursor;
+        assert!(
+            c > 0 && cnt.value_at(c) != cnt.value_at(0),
+            "cursor {c} lands on an edge"
+        );
+        s.wave.live_selected = None;
+        let before = s.wave.cursor;
+        s.wave.next_edge();
+        assert_eq!(s.wave.cursor, before + 1, "no selection steps one sample");
+    }
+
+    #[test]
+    fn live_scopes_and_objects_add_hidden_traces() {
+        let mut s = live_state();
+        let live = s.wave.live.clone().unwrap();
+        assert_eq!(live_scopes(&live), vec!["top".to_string()]);
+        // Only the first lane is mounted; the second is added from Objects.
+        s.wave.live_lanes = vec![0];
+        let mut rt = harness_with(s);
+        rt.frame(0.0);
+        assert!(rt.find("wave-live-scope-0").is_some());
+        assert!(rt.find("wave-live-object-1").is_some());
+        assert!(rt.find("wave-live-lane-1").is_none());
+        tap(&mut rt, "wave-live-add-1");
+        assert!(
+            rt.find("wave-live-lane-1").is_some(),
+            "add_wave mounts the lane"
+        );
+        assert!(rt.find("wave-live-add-1").is_none());
     }
 
     #[test]
@@ -3332,8 +2587,14 @@ $upscope $end\n$enddefinitions $end\n\
             rt.find("wave-live-value-1").is_some(),
             "live bus value must mount"
         );
-        tap(&mut rt, "wave-radix");
-        assert_eq!(rt.state.wave.radix, WaveRadix::Bin);
+        tap(&mut rt, "wave-radix-bin");
+        assert_eq!(
+            rt.state.wave.radix_for("top.cnt"),
+            WaveRadix::Bin,
+            "selected trace only"
+        );
+        assert_eq!(rt.state.wave.radix, WaveRadix::Hex, "the default stays");
+        assert_eq!(rt.state.wave.radix_for("top.clk"), WaveRadix::Hex);
         let trace = &rt.state.wave.live.as_ref().expect("live").traces[1];
         assert_eq!(format_live_value(trace, 10, WaveRadix::Bin), "0001");
         assert_eq!(format_live_value(trace, 10, WaveRadix::Hex), "1");
