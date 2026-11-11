@@ -1097,6 +1097,16 @@ pub struct AppState {
     pub runs: crate::runs::RunsState,
     /// Off-UI-thread engine jobs (report re-runs, Tcl `program_hw`).
     pub jobs: crate::jobs::JobsState,
+    /// Keyed background engine tasks (I/O reports, vectored power, ECO, DFX).
+    pub bg: crate::bg::BgState,
+    /// ECO session over the last implementation run.
+    pub eco: crate::views::eco::EcoState,
+    /// Reconfigurable partitions and the last DFX run.
+    pub dfx: crate::views::dfx::DfxState,
+    /// Out-of-context module flags and their cached runs.
+    pub ooc: crate::views::ooc::OocState,
+    /// Coverage view tab + editor overlay toggle.
+    pub coverage: crate::views::coverage::CoverageView,
     /// Persistent Tcl session behind the `tcl>` input (vars, history, design).
     pub tcl: crate::tcl::TclSession,
     /// Theme choice: follow the OS (`cx.system_dark`) or a manual View-menu
@@ -1148,6 +1158,12 @@ pub enum CenterPane {
     /// Timing constraints parsed from the project XDC: clocks, I/O delay,
     /// exceptions, I/O placement.
     Constraints,
+    /// ECO: edit the implemented netlist, incremental bitstream.
+    Eco,
+    /// Partial reconfiguration: partitions, modules, partial bitstreams.
+    Dfx,
+    /// Code coverage of the last testbench run.
+    Coverage,
 }
 
 /// Status-bar verb. Typed, with the exact Helion wording in one place.
@@ -1302,6 +1318,11 @@ impl AppState {
             toasts: ToastState::default(),
             runs: crate::runs::RunsState::default(),
             jobs: crate::jobs::JobsState::default(),
+            bg: crate::bg::BgState::default(),
+            eco: crate::views::eco::EcoState::default(),
+            dfx: crate::views::dfx::DfxState::default(),
+            ooc: crate::views::ooc::OocState::default(),
+            coverage: crate::views::coverage::CoverageView::default(),
             tcl: crate::tcl::TclSession::default(),
             theme: crate::theme::ThemeMode::default(),
             palette: crate::views::palette::PaletteState::default(),

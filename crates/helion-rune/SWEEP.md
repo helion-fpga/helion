@@ -16,7 +16,7 @@ with tests, keep `cargo test -p helion-rune` green, rebuild + relaunch.
 | `constraints_wizard*` | `views/dialogs.rs`, `views/constraints.rs` | PARTIAL — Constraints pane DONE; wizard still single-row per kind |
 | `physview*` | `views/device*.rs` | DONE — site-kind layers, congestion/criticality heat, pblocks overlay + table, rulers, canvas keys, I/O quick-set; no clock regions (HAD has no region table) |
 | `schem_lod.rs` / schematic | `views/schematic*.rs` | DONE — fan-in/out cones (hops, stop-at-FF), expand/collapse cone + inside, selection history, Fit, sheet find, Mark Debug/Add Probe |
-| `power.rs` | `views/reports.rs`, `analysis.rs` | PARTIAL — vectorless rails/blocks DONE; VCD power not ported |
+| `power.rs` | `views/reports.rs`, `views/reports/vec_power.rs`, `helion_sta::vcd_power` | DONE — vectorless rails/blocks plus VCD-driven power (engine moved to helion-sta) |
 | `qor.rs` | `views/reports.rs` | DONE (helion-proj QoR engine) |
 | `ila.rs` | `helion-verif`, `views/ila*.rs` | DONE |
 | `tb.rs` | `helion-verif`, `views/tb*.rs` | DONE |
@@ -29,12 +29,26 @@ with tests, keep `cargo test -p helion-rune` green, rebuild + relaunch.
 
 ## Remaining gaps
 
-- Device: pblocks are floorplan constraints only (the run worker does not
-  place into them yet); no clock-region layer/table (no HAD region model);
-  no pblock delete (the `.prj` format has no delete command).
-- Design Runs: no ECO changes table (runs keep no persistent session; the
-  console `eco` verb covers the backend's single ECO). Checkpoints live
-  under the temp dir. helion-proj bug: reopening a seeded `.hckp` resets
+- Device: no clock-region layer/table (no HAD region model); no pblock
+  delete (the `.prj` format has no delete command). Ranged pblocks now
+  steer placement (`helion_place::place_with_regions`) and `PBLK-1` DRC
+  flags members outside their pblock.
+- ECO: the ECO view edits the routed netlist of the last run (INIT,
+  reconnect, buffer, add/remove cell, route-only) and writes a full plus
+  incremental `.pbits` bitstream; the session is rebuilt from the run, not
+  persisted across restarts. Checkpoints live under the temp dir.
+- DFX: partitions live in the session (no `.prj` DFX commands); static
+  routing is re-run per module (no locked static routes in helion-route).
+- Coverage: testbench line/branch plus DUT netlist toggle/mux/FSM; DUT
+  line coverage needs source-line attribution in helion-sv (absent).
+- VHDL simulation: SV testbenches drive VHDL DUTs; VHDL testbenches
+  (`wait for`, `report`, signal `after`) need a behavioral VHDL
+  interpreter (helion-vhdl drops them during synthesis).
+- UVM: needs classes, inheritance, parameterized classes, virtual
+  methods, macros, queues/dynamic/associative arrays, fork/join, virtual
+  interfaces and a randomize() front end; none exist in helion-sv or the
+  testbench interpreter (helion-sim's CRV solver is a Rust API only).
+  `$urandom`, `$urandom_range` and `randcase` are supported. helion-proj bug: reopening a seeded `.hckp` resets
   the seed to 0 and fails its hash check.
 - Waveform tools (decoders, analog, virtual bus) need real simulation
   traces; they are disabled on the demo fixture.

@@ -15,7 +15,9 @@
 //! - `crates/rune/src/color.rs`: `color::hex` (used ONLY in [`theme`]).
 
 pub mod analysis;
+pub mod bg;
 pub mod doctor;
+pub mod ext_verbs;
 pub mod jobs;
 pub mod layout;
 pub mod live;
@@ -665,6 +667,73 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
             },
         ];
     }),
+    ("reports-clockutil", |s| {
+        s.center = state::CenterPane::Reports;
+        views::reports::demo_impl_complete(s);
+        views::reports::io::scene_fill(s, views::reports::ReportNav::ClockUtil);
+    }),
+    ("reports-ctrlsets", |s| {
+        s.center = state::CenterPane::Reports;
+        views::reports::demo_impl_complete(s);
+        views::reports::io::scene_fill(s, views::reports::ReportNav::ControlSets);
+    }),
+    ("reports-ssn", |s| {
+        s.center = state::CenterPane::Reports;
+        views::reports::demo_impl_complete(s);
+        views::reports::io::scene_fill(s, views::reports::ReportNav::Ssn);
+    }),
+    ("reports-ssn-light", |s| {
+        s.center = state::CenterPane::Reports;
+        s.theme = theme::ThemeMode::Light;
+        views::reports::demo_impl_complete(s);
+        views::reports::io::scene_fill(s, views::reports::ReportNav::Ssn);
+    }),
+    ("reports-power-vcd", |s| {
+        s.center = state::CenterPane::Reports;
+        views::reports::demo_impl_complete(s);
+        s.reports_view.selected = views::reports::ReportNav::Power;
+        views::reports::vec_power::scene_fill(s);
+    }),
+    ("reports-ibis", |s| {
+        s.center = state::CenterPane::Reports;
+        views::reports::demo_impl_complete(s);
+        views::reports::io::scene_fill(s, views::reports::ReportNav::Ibis);
+    }),
+    ("eco", |s| {
+        s.center = state::CenterPane::Eco;
+        views::reports::demo_impl_complete(s);
+        views::eco::scene_fill(s);
+    }),
+    ("coverage", |s| {
+        s.center = state::CenterPane::Coverage;
+        views::tb::seed_coverage_fixture(s);
+    }),
+    ("coverage-light", |s| {
+        s.center = state::CenterPane::Coverage;
+        s.theme = theme::ThemeMode::Light;
+        views::tb::seed_coverage_fixture(s);
+    }),
+    ("eco-light", |s| {
+        s.center = state::CenterPane::Eco;
+        s.theme = theme::ThemeMode::Light;
+        views::reports::demo_impl_complete(s);
+        views::eco::scene_fill(s);
+    }),
+    ("coverage-empty", |s| {
+        s.center = state::CenterPane::Coverage;
+    }),
+    ("runs-ooc", |s| {
+        s.console.tab = views::console::ConsoleTab::DesignRuns;
+        s.layout.console_h = 520.0;
+        views::ooc::scene_fill(s);
+    }),
+    ("dfx", |s| {
+        s.center = state::CenterPane::Dfx;
+        views::dfx::scene_fill(s);
+    }),
+    ("eco-empty", |s| {
+        s.center = state::CenterPane::Eco;
+    }),
     ("reports-no-run", |s| {
         s.center = state::CenterPane::Reports;
     }),
@@ -1137,6 +1206,9 @@ fn center_pane(s: &AppState, t: &VivadoTheme) -> El {
         state::CenterPane::Bitstream => views::bitstream::bitstream_pane(s, t),
         state::CenterPane::Find => views::find::find_pane(s, t),
         state::CenterPane::Constraints => views::constraints::constraints_pane(s, t),
+        state::CenterPane::Eco => views::eco::eco_pane(s, t),
+        state::CenterPane::Dfx => views::dfx::dfx_pane(s, t),
+        state::CenterPane::Coverage => views::coverage::coverage_pane(s, t),
     }
 }
 
@@ -1264,6 +1336,7 @@ pub fn poll_all(s: &mut AppState, t: f64, tx: &mut rune::Tx) -> bool {
     let tabs_dirty = layout::sync_tabs(s);
     let jobs_dirty = jobs::poll(s, tx);
     let diag_dirty = views::editor_diag::poll(s, t, tx);
+    let bg_dirty = bg::poll(s, Some(tx));
     runs_dirty
         || sim_dirty
         || ila_dirty
@@ -1273,6 +1346,7 @@ pub fn poll_all(s: &mut AppState, t: f64, tx: &mut rune::Tx) -> bool {
         || tabs_dirty
         || jobs_dirty
         || diag_dirty
+        || bg_dirty
 }
 
 pub fn app_spec() -> AppSpec<AppState> {

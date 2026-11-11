@@ -179,16 +179,37 @@ pub enum DrcInputs {
         part: String,
         routed: helion_route::Routed,
         design: helion_ir::Design,
+        pblocks: Vec<helion_proj::PrjPblock>,
     },
     Placed {
         part: String,
         design: helion_ir::Design,
         placed: helion_place::Placed,
+        pblocks: Vec<helion_proj::PrjPblock>,
     },
+}
+
+/// `PBLK-1` rows: pblock members placed outside their pblock.
+fn pblock_items(
+    design: &helion_ir::Design,
+    placed: &helion_place::Placed,
+    pblocks: &[helion_proj::PrjPblock],
+) -> Vec<crate::state::DrcItem> {
+    if pblocks.is_empty() {
+        return Vec::new();
+    }
+    let regions = helion_proj::pblock_regions(design, pblocks);
+    helion_drc::check_pblocks(placed, &regions)
+        .items
+        .iter()
+        .map(crate::runs::drc_item_from)
+        .collect()
 }
 
 /// DRC inputs for the current state, or why DRC cannot run.
 pub fn drc_inputs(s: &AppState) -> Result<DrcInputs, String> {
+    let pblocks: Vec<helion_proj::PrjPblock> =
+        s.device.pblocks.iter().filter(|p| p.ranged).cloned().collect();
     let routed_inputs = run_inputs(s)
         .ok()
         .and_then(|RunInputs { ctx, design }| ctx.routed.map(|r| (ctx.part, r, design)));
@@ -197,6 +218,7 @@ pub fn drc_inputs(s: &AppState) -> Result<DrcInputs, String> {
             part,
             routed,
             design,
+            pblocks,
         })
     } else if let (Some(design), Some(placed)) =
         (s.tcl.session.design.as_ref(), s.tcl.session.placed.as_ref())
@@ -205,6 +227,7 @@ pub fn drc_inputs(s: &AppState) -> Result<DrcInputs, String> {
             part: s.project.part.clone(),
             design: design.clone(),
             placed: placed.clone(),
+            pblocks,
         })
     } else {
         Err("no placed design (launch_runs impl_1 or place_design first)".into())
@@ -218,8 +241,12 @@ pub fn compute_drc(inp: &DrcInputs, emit: &impl Fn(String, MsgSev)) -> Result<Dr
             part,
             routed,
             design,
+            pblocks,
         } => crate::runs::resolve_device(part, emit).map(|dev| {
             let drc = helion_drc::check_routed(design, routed, &dev);
+            let mut items: Vec<crate::state::DrcItem> =
+                drc.items.iter().map(crate::runs::drc_item_from).collect();
+            items.extend(pblock_items(design, &routed.placed, pblocks));
             let signoff = helion_drc::check_bitstream_signoff(
                 design,
                 routed,
@@ -227,7 +254,7 @@ pub fn compute_drc(inp: &DrcInputs, emit: &impl Fn(String, MsgSev)) -> Result<Dr
                 &helion_drc::SignoffConfig::default(),
             );
             DrcState {
-                items: drc.items.iter().map(crate::runs::drc_item_from).collect(),
+                items,
                 bitgen_allowed: Some(signoff.bitgen_allowed),
                 signoff_summary: signoff.summary_line(),
                 unrouted: signoff.unrouted_nets,
@@ -240,10 +267,14 @@ pub fn compute_drc(inp: &DrcInputs, emit: &impl Fn(String, MsgSev)) -> Result<Dr
             part,
             design,
             placed,
+            pblocks,
         } => crate::runs::resolve_device(part, emit).map(|dev| {
             let drc = helion_drc::check_placed(design, placed, &dev);
+            let mut items: Vec<crate::state::DrcItem> =
+                drc.items.iter().map(crate::runs::drc_item_from).collect();
+            items.extend(pblock_items(design, placed, pblocks));
             DrcState {
-                items: drc.items.iter().map(crate::runs::drc_item_from).collect(),
+                items,
                 has_run: true,
                 pre_route: true,
                 ..DrcState::default()

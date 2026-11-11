@@ -264,6 +264,8 @@ pub struct RunArtifacts {
     /// Incremental reuse report (`ReuseReport::text`) when the run placed
     /// against a reference checkpoint.
     pub reuse: Option<String>,
+    /// Out-of-context modules the run synthesized or restored.
+    pub ooc: Vec<crate::views::ooc::OocRow>,
 }
 
 /// The live worker handle: its event channel plus the cancel flag the
@@ -564,6 +566,11 @@ pub fn start_run_spec(
         return Err(format!("{busy} is already running"));
     }
     let pins = snapshot_pin_constraints(s);
+    // Floorplan: the open project's ranged pblocks steer placement.
+    let pblocks: Vec<helion_proj::PrjPblock> =
+        s.device.pblocks.iter().filter(|p| p.ranged).cloned().collect();
+    let ooc: Vec<String> = s.ooc.enabled.iter().cloned().collect();
+    let ooc_cache = crate::views::ooc::cache_dir(s);
     let kind = spec.kind;
     let strategy = spec.strategy.clone();
     let incremental = spec.incremental.clone();
@@ -587,6 +594,9 @@ pub fn start_run_spec(
                 RunFiles {
                     checkpoint: ckpt,
                     incremental,
+                    pblocks,
+                    ooc,
+                    ooc_cache,
                 },
                 tx,
                 worker_cancel,
@@ -821,6 +831,9 @@ pub fn deliver(s: &mut AppState, kind: RunKind, event: RunEvent) {
 /// Apply a completed run's artifacts to the report/design views (the
 /// completion path and `Make active` share it).
 pub fn apply_artifacts(s: &mut AppState, art: RunArtifacts) {
+    for row in &art.ooc {
+        s.ooc.runs.insert(row.module.clone(), Ok(row.clone()));
+    }
     if art.analysis.is_some() {
         s.runs.analysis = art.analysis.clone();
     }
@@ -962,6 +975,11 @@ struct RunFiles {
     checkpoint: Option<PathBuf>,
     /// Reference checkpoint for incremental placement.
     incremental: Option<PathBuf>,
+    /// Ranged `.prj` pblocks the placer must honor.
+    pblocks: Vec<helion_proj::PrjPblock>,
+    /// Modules synthesized out of context (cached) and stitched in.
+    ooc: Vec<String>,
+    ooc_cache: PathBuf,
 }
 
 fn run_worker(
@@ -977,6 +995,9 @@ fn run_worker(
     let RunFiles {
         checkpoint,
         incremental,
+        pblocks,
+        ooc,
+        ooc_cache,
     } = files;
     let send = |text: String, sev: MsgSev| {
         let _ = tx.send(RunEvent::Line { text, sev });
@@ -991,7 +1012,16 @@ fn run_worker(
 
     send(format!("open_source {}", source.display()), MsgSev::Info);
 
-    let mut design = match synth_source(&source) {
+    let mut ooc_rows = Vec::new();
+    let synthesized = if ooc.is_empty() {
+        synth_source(&source)
+    } else {
+        crate::views::ooc::synth_with_ooc(&source, &part_req, &ooc, &ooc_cache, &send).map(|(d, rows)| {
+            ooc_rows = rows;
+            d
+        })
+    };
+    let mut design = match synthesized {
         Ok(d) => {
             send(
                 format!(
@@ -1041,6 +1071,7 @@ fn run_worker(
     let (xdc, clks) = load_run_constraints(&source, &send);
     let mut art = RunArtifacts {
         cells: design.cells.len(),
+        ooc: ooc_rows,
         ..RunArtifacts::default()
     };
 
@@ -1112,6 +1143,25 @@ fn run_worker(
                 return;
             }
         },
+        None if !pblocks.is_empty() => {
+            match session.place_design_with_pblocks(&dev, strategy.place_opts(), &pblocks) {
+                Ok(stats) => {
+                    for st in stats {
+                        send(
+                            format!(
+                                "place_design pblock {} clusters={} capacity={} moved={} evicted={}",
+                                st.name, st.lutffs, st.capacity, st.moved, st.evicted
+                            ),
+                            MsgSev::Info,
+                        );
+                    }
+                }
+                Err(e) => {
+                    finish(Err(format!("place_design failed: {e}")));
+                    return;
+                }
+            }
+        }
         None => {
             if let Err(e) = session.place_design_with(&dev, strategy.place_opts()) {
                 finish(Err(format!("place_design failed: {e}")));
@@ -1243,7 +1293,18 @@ fn run_worker(
         MsgSev::Info,
     );
     art.power = Some(power_state_from(&pr, &xdc.operating_conditions));
-    let drc = helion_drc::check_routed(design, routed, &dev);
+    let mut drc = helion_drc::check_routed(design, routed, &dev);
+    if !pblocks.is_empty() {
+        // Floorplan check: every pblock member inside its pblock (`PBLK-1`).
+        let regions = helion_proj::pblock_regions(design, &pblocks);
+        let pb = helion_drc::check_pblocks(&routed.placed, &regions);
+        send(
+            format!("report_drc pblocks={} PBLK-1={}", regions.len(), pb.items.len()),
+            MsgSev::Info,
+        );
+        drc.items.extend(pb.items);
+        drc.violations.extend(pb.violations);
+    }
     send(
         format!("report_drc violations={}", drc.items.len()),
         MsgSev::Info,
@@ -1562,6 +1623,30 @@ pub(crate) fn resolve_device(
                 format!("no Helion device model (tried {part_req}, {FALLBACK_PART}): {e}")
             })
         }
+    }
+}
+
+/// SystemVerilog files behind a run source: the `.prj`'s `.sv`/`.v`
+/// sources, else the file itself.
+pub(crate) fn rtl_files(source: &std::path::Path) -> Result<Vec<PathBuf>, String> {
+    if source.extension().is_some_and(|e| e.eq_ignore_ascii_case("prj")) {
+        let text = std::fs::read_to_string(source).map_err(|e| format!("{}: {e}", source.display()))?;
+        let prj = helion_proj::load_prj(&text)?;
+        let files: Vec<PathBuf> = prj
+            .sources
+            .iter()
+            .map(|f| helion_proj::resolve_prj_path(source, f))
+            .filter(|p| {
+                p.extension()
+                    .is_some_and(|e| matches!(e.to_string_lossy().to_ascii_lowercase().as_str(), "sv" | "v"))
+            })
+            .collect();
+        if files.is_empty() {
+            return Err("the project has no SystemVerilog sources".into());
+        }
+        Ok(files)
+    } else {
+        Ok(vec![source.to_path_buf()])
     }
 }
 
@@ -2558,6 +2643,7 @@ mod tests {
             analysis: None,
             checkpoint: None,
             reuse: None,
+            ooc: Vec::new(),
         };
         deliver(&mut s, RunKind::Synth, RunEvent::Finished(Ok(art)));
         assert_eq!(s.flow.synth, RunStatus::Complete);
@@ -2700,6 +2786,40 @@ mod tests {
                 .iter()
                 .any(|l| l.text.starts_with("write_bitstream")),
             "log must carry the real bitstream stage line"
+        );
+    }
+
+    #[test]
+    fn impl_run_places_every_cell_inside_the_project_pblock() {
+        let src = counter_source();
+        let mut s = AppState::demo();
+        s.device.pblocks = vec![helion_proj::PrjPblock {
+            name: "pb_core".into(),
+            x0: 5,
+            y0: 5,
+            x1: 8,
+            y1: 8,
+            ranged: true,
+            cells: Vec::new(),
+        }];
+        start_run(&mut s, RunKind::Impl, src, "HL10T-C32-1".into()).expect("start");
+        pump_until_idle(&mut s, Duration::from_secs(180));
+        assert_eq!(s.flow.impl_run, RunStatus::Complete);
+        let placed = s.runs.live_placed.as_ref().expect("placement");
+        assert!(!placed.lutff_sites.is_empty());
+        for (site, _) in &placed.lutff_sites {
+            assert!(
+                (5..=8).contains(&site.x) && (5..=8).contains(&site.y),
+                "cell outside pb_core at {site:?}"
+            );
+        }
+        assert!(
+            s.runs.impl_log.iter().any(|l| l.text.starts_with("place_design pblock pb_core")),
+            "the log names the pblock the placer honored"
+        );
+        assert!(
+            !s.drc.items.iter().any(|d| d.id == "PBLK-1"),
+            "a legal floorplan has no PBLK-1 rows"
         );
     }
 
