@@ -559,22 +559,12 @@ fn server_panel(s: &AppState, t: &VivadoTheme) -> El {
 
 /// Target node: cable pick and the JTAG chain it reaches.
 fn target_panel(s: &AppState, t: &VivadoTheme) -> El {
-    let part = program_part(s);
-    let chain = match &s.program.stat {
-        Some(st) => format!("{} · IDCODE {:#010x} · IR 6 bits", st.part, st.idcode),
-        None => format!("{part} · IDCODE not read (Refresh STAT)"),
-    };
     col()
         .key("program-target-panel")
         .w_full()
         .gap(10.0)
         .child(cable_card(s, t))
-        .child(cad::card(
-            "program-chain",
-            "JTAG Chain",
-            cad::cut(chain, cad::mono_style(), t.text).key("program-chain-device"),
-            t,
-        ))
+        .child(crate::views::hw_jtag_view::chain_card(s, t))
 }
 
 /// Device node: the original Program Device surface.

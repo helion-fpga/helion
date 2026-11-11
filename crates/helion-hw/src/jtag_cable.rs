@@ -18,9 +18,10 @@ use crate::jtag_engine::{JtagEngine, MpssePort, stat_from_word};
 use crate::{IR_USR1, Tap, TapState, Usr1RleUpload};
 
 /// Which kind of cable a flow ran on — shown on every result.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CableKind {
     /// In-process Helion TAP (high-level shifts).
+    #[default]
     Sim,
     /// Native JTAG engine → MPSSE bytes → in-process mock FTDI → TAP ticks.
     NativeMock,

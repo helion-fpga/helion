@@ -292,6 +292,28 @@ fn chosen_table(s: &AppState, t: &VivadoTheme) -> El {
         .child(rows)
 }
 
+/// Which cable Program uses, and how far that path is verified.
+fn cable_line(s: &AppState, t: &VivadoTheme) -> El {
+    use helion_hw::CableKind;
+    let kind = dbg::planned_cable(s);
+    let (ink, note) = match kind {
+        CableKind::Sim => (t.text_dim, "in-process Helion TAP — the verified path".to_string()),
+        CableKind::NativeMock => (
+            t.text_dim,
+            "MPSSE engine → simulated FTDI + Helion TAP (fixture board)".to_string(),
+        ),
+        CableKind::NativeUsb => (t.warn, crate::views::hw_native::NATIVE_NOTE.to_string()),
+    };
+    row()
+        .key("hw-setup-cable")
+        .w_full()
+        .h(cad::ROW_H)
+        .items_center()
+        .gap(8.0)
+        .child(cad::badge(kind.label(), ink, t))
+        .child(el().grow(1.0).min_w(0.0).child(cad::cut(note, VivadoTheme::FONT_UI, t.text_dim)))
+}
+
 fn build_card(s: &AppState, t: &VivadoTheme) -> El {
     let d = &s.program.debug;
     let impl_why = dbg::implement_block(s);
@@ -323,7 +345,7 @@ fn build_card(s: &AppState, t: &VivadoTheme) -> El {
     if let Some(k) = d.busy() {
         actions = actions.child(cad::dim(k.busy_label(), t).key("hw-setup-busy"));
     }
-    let mut body = col().w_full().gap(4.0).child(actions);
+    let mut body = col().w_full().gap(4.0).child(actions).child(cable_line(s, t));
     if let Some(w) = why_line(impl_why.as_deref().or(prog_why.as_deref()), "hw-setup-why", t) {
         body = body.child(w);
     }
@@ -504,7 +526,7 @@ fn core_head(s: &AppState, kind: DebugCoreKind, t: &VivadoTheme) -> El {
             "Target",
             snap.map(|s| s.part.clone()).unwrap_or_default(),
             t.text,
-            "Simulation cable · Helion TAP",
+            snap.map(|s| s.cable.label()).unwrap_or("Simulation cable"),
             t,
         ))
         .child(cad::kpi(
@@ -916,8 +938,16 @@ pub fn vio_panel(s: &AppState, t: &VivadoTheme) -> El {
                 .w_full()
                 .gap(6.0)
                 .child(cad::cut(
-                    "Drive overrides the flop that feeds the net on every clock until Release \
-                     (sim cable).",
+                    format!(
+                        "Drive overrides the flop that feeds the net on every clock until \
+                         Release ({}).",
+                        s.program
+                            .debug
+                            .snap
+                            .as_ref()
+                            .map(|sn| sn.cable.label())
+                            .unwrap_or("Simulation cable")
+                    ),
                     VivadoTheme::FONT_UI,
                     t.text_dim,
                 ))
