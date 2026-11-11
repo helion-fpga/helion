@@ -21,6 +21,9 @@ pub use io_plan::{
     SsnReport, analyze_ssn, check_io_drc, report_ssn,
 };
 
+pub mod ibis;
+pub use ibis::{IbisModel, IbisPin, write_ibis};
+
 pub mod ultrascale;
 pub use ultrascale::{
     Carry8Chain, Carry8Mode, Dsp48e2Config, Dsp48e2Output, Dsp48e2WideXorMode, LagunaCrossingMode,
@@ -1094,6 +1097,27 @@ impl Device {
     /// Construct the BGA package ballout coordinate grid for `kind` bound to this part's HAD IOB sites.
     pub fn bga_package(&self, kind: PackageKind) -> BgaPackageGrid {
         BgaPackageGrid::new(kind, Some(self))
+    }
+
+    /// Smallest modeled BGA package whose user I/O balls bind every HAD IOB
+    /// site of this part (the package `report_ssn` / `write_ibis` use when
+    /// the part names none).
+    pub fn default_package_kind(&self) -> PackageKind {
+        let need = self.iob_sites().count();
+        let mut kinds = [
+            PackageKind::Cpg236,
+            PackageKind::Csg324,
+            PackageKind::Cabga381,
+            PackageKind::Fgg484,
+        ];
+        kinds.sort_by_key(|k| k.ball_count());
+        kinds
+            .into_iter()
+            .find(|k| {
+                let g = self.bga_package(*k);
+                self.iob_sites().all(|s| g.ball_for_site(s).is_some()) && need > 0
+            })
+            .unwrap_or(PackageKind::Fgg484)
     }
 
     /// Run Vivado UG899 I/O and Clock Planning DRC (`BIVC-1`, `PLIO-1`..`PLIO-8`) on this device.

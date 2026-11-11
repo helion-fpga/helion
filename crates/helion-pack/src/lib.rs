@@ -6,6 +6,11 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::collections::BTreeMap;
 
+pub mod control_sets;
+pub use control_sets::{
+    CONTROL_SET_BUCKETS, ControlSetReport, ControlSetRow, ff_control_sets, report_control_sets,
+};
+
 #[derive(Clone, Debug)]
 pub struct Packed {
     pub lutffs: Vec<PackedLutFf>,
