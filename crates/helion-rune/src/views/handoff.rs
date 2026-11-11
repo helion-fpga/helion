@@ -293,10 +293,15 @@ fn export_dialog(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme, kit: &Kit) 
     let reason = export_reason(s).or_else(|| {
         s.handoff.hw_path.text.trim().is_empty().then(|| "Choose an output file.".to_string())
     });
-    let status = s.handoff.hw_last.as_ref().map(|r| match r {
-        Ok(v) => (v.as_str(), false),
-        Err(e) => (e.as_str(), true),
-    });
+    let status = s
+        .handoff
+        .hw_last
+        .as_ref()
+        .map(|r| match r {
+            Ok(v) => (v.as_str(), false),
+            Err(e) => (e.as_str(), true),
+        })
+        .or(reason.as_deref().map(|r| (r, false)));
     let panel = col().w_full().child(body).child(hrule(t)).child(footer(
         "hw",
         "Export",
@@ -346,10 +351,18 @@ fn archive_dialog(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme, kit: &Kit)
             project_prj(s).map(|p| p.display().to_string()).unwrap_or_else(|| "not on disk".into()),
             t,
         ))
-        .child(row().key("ar-runs").gap(8.0).items_center().child(cb.build(kit)).child(cad::dim(
-            if runs.is_dir() { runs.display().to_string() } else { "no run results yet".into() },
-            t,
-        )))
+        .child(
+            row().key("ar-runs").w_full().gap(8.0).items_center().child(cb.build(kit)).child(
+                rune::el().grow(1.0).min_w(0.0).child(
+                    cad::cut(
+                        if runs.is_dir() { runs.display().to_string() } else { "no run results yet".into() },
+                        VivadoTheme::FONT_UI,
+                        t.text_dim,
+                    )
+                    .truncate_middle(),
+                ),
+            ),
+        )
         .child(
             cad::dim("Sources, constraints and IP packages are copied in and every path in the .prj is rewritten relative to the archive.", t)
                 .wrap()
@@ -358,10 +371,15 @@ fn archive_dialog(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme, kit: &Kit)
     let reason = archive_reason(s).or_else(|| {
         s.handoff.ar_path.text.trim().is_empty().then(|| "Choose an archive file.".to_string())
     });
-    let status = s.handoff.ar_last.as_ref().map(|r| match r {
-        Ok(v) => (v.as_str(), false),
-        Err(e) => (e.as_str(), true),
-    });
+    let status = s
+        .handoff
+        .ar_last
+        .as_ref()
+        .map(|r| match r {
+            Ok(v) => (v.as_str(), false),
+            Err(e) => (e.as_str(), true),
+        })
+        .or(reason.as_deref().map(|r| (r, false)));
     let panel = col().w_full().child(body).child(hrule(t)).child(footer(
         "ar",
         "Archive",
