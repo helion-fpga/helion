@@ -1533,6 +1533,109 @@ impl TbRunConfig {
     }
 }
 
+/// One testbench `if` / `assert` and how often each arm ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TbBranchCov {
+    pub line: usize,
+    /// `if` or `assert`.
+    pub kind: &'static str,
+    /// Times the condition was true (then-arm / assertion passed).
+    pub true_hits: u64,
+    /// Times the condition was false (else-arm / assertion fired).
+    pub false_hits: u64,
+}
+
+/// Code coverage of one testbench run: statement (line) and branch
+/// coverage of the testbench source, plus the DUT's netlist-level toggle /
+/// branch (mux select, FF enable) / FSM coverage collected by the
+/// `helion-sim` kernel on every clock edge. DUT *line* coverage is not
+/// available: the DUT is simulated as a synthesized netlist whose cells
+/// carry no source-line attribution.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TbCoverage {
+    pub tb_file: PathBuf,
+    pub dut_file: PathBuf,
+    /// Executable testbench lines and how often each ran (ascending line).
+    pub lines: Vec<(usize, u64)>,
+    pub branches: Vec<TbBranchCov>,
+    pub dut: helion_sim::FunctionalCoverageReport,
+}
+
+impl TbCoverage {
+    pub fn lines_hit(&self) -> usize {
+        self.lines.iter().filter(|(_, n)| *n > 0).count()
+    }
+
+    pub fn line_pct(&self) -> f64 {
+        if self.lines.is_empty() {
+            100.0
+        } else {
+            100.0 * self.lines_hit() as f64 / self.lines.len() as f64
+        }
+    }
+
+    pub fn branch_arms_hit(&self) -> usize {
+        self.branches
+            .iter()
+            .map(|b| usize::from(b.true_hits > 0) + usize::from(b.false_hits > 0))
+            .sum()
+    }
+
+    pub fn branch_pct(&self) -> f64 {
+        if self.branches.is_empty() {
+            100.0
+        } else {
+            100.0 * self.branch_arms_hit() as f64 / (2 * self.branches.len()) as f64
+        }
+    }
+
+    /// `report_coverage` summary line.
+    pub fn summary_line(&self) -> String {
+        format!(
+            "coverage tb_lines={}/{} ({:.1}%) tb_branches={:.1}% dut_toggle={:.1}% dut_branch={:.1}% dut_fsm={:.1}%",
+            self.lines_hit(),
+            self.lines.len(),
+            self.line_pct(),
+            self.branch_pct(),
+            self.dut.toggle_bin_coverage_pct(),
+            self.dut.branch_coverage_pct(),
+            self.dut.fsm_state_coverage_pct()
+        )
+    }
+}
+
+fn stmt_line(s: &Stmt) -> usize {
+    match s {
+        Stmt::Assign { line, .. }
+        | Stmt::Delay { line, .. }
+        | Stmt::WaitEdge { line, .. }
+        | Stmt::Sys { line, .. }
+        | Stmt::Assert { line, .. }
+        | Stmt::If { line, .. }
+        | Stmt::Repeat { line, .. }
+        | Stmt::Finish { line } => *line,
+    }
+}
+
+/// Every executable statement line of `stmts` (recursing into bodies).
+fn collect_lines(stmts: &[Stmt], out: &mut std::collections::BTreeMap<usize, u64>, branches: &mut Vec<TbBranchCov>) {
+    for s in stmts {
+        out.entry(stmt_line(s)).or_insert(0);
+        match s {
+            Stmt::If { then_b, else_b, line, .. } => {
+                branches.push(TbBranchCov { line: *line, kind: "if", true_hits: 0, false_hits: 0 });
+                collect_lines(then_b, out, branches);
+                collect_lines(else_b, out, branches);
+            }
+            Stmt::Assert { line, .. } => {
+                branches.push(TbBranchCov { line: *line, kind: "assert", true_hits: 0, false_hits: 0 });
+            }
+            Stmt::Repeat { body, .. } => collect_lines(body, out, branches),
+            _ => {}
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TbOutcome {
     pub passed: bool,
@@ -1553,6 +1656,8 @@ pub struct TbOutcome {
     pub dut_module: String,
     /// DUT instance name from the testbench (for schematic highlight).
     pub dut_instance: String,
+    /// Code coverage collected during the run.
+    pub coverage: TbCoverage,
 }
 
 #[derive(Clone, Debug)]
@@ -1611,6 +1716,10 @@ struct Interp<'a> {
     vcd_samples: Vec<(u64, usize, u64, bool)>,
     vcd_last: Vec<Option<(u64, bool)>>,
     posedge_count: u64,
+    /// Statement executions per testbench line.
+    line_hits: std::collections::BTreeMap<usize, u64>,
+    /// `(line, condition)` outcomes of `if` / `assert`.
+    branch_hits: HashMap<usize, (u64, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -2022,6 +2131,7 @@ impl<'a> Interp<'a> {
                 }
             }
         };
+        *self.line_hits.entry(stmt_line(&stmt)).or_insert(0) += 1;
         match stmt {
             Stmt::Assign { target, expr, line } => {
                 self.exec_assign(&target, &expr, line)?;
@@ -2045,14 +2155,18 @@ impl<'a> Interp<'a> {
             }
             Stmt::Assert { cond, task, fmt, args, line } => {
                 let (v, _, _) = self.eval(&cond)?;
+                let e = self.branch_hits.entry(line).or_insert((0, 0));
+                if v != 0 { e.0 += 1 } else { e.1 += 1 }
                 if v == 0 {
                     if self.exec_sys(task, &fmt, &args, line)? {
                         self.stopped = true;
                     }
                 }
             }
-            Stmt::If { cond, then_b, else_b, .. } => {
+            Stmt::If { cond, then_b, else_b, line } => {
                 let (v, _, _) = self.eval(&cond)?;
+                let e = self.branch_hits.entry(line).or_insert((0, 0));
+                if v != 0 { e.0 += 1 } else { e.1 += 1 }
                 let branch = if v != 0 { then_b } else { else_b };
                 self.stack.push(Frame::Stmts { stmts: branch, pc: 0 });
             }
@@ -2383,6 +2497,8 @@ pub fn run_testbench(
         vcd_samples: Vec::new(),
         vcd_last,
         posedge_count: 0,
+        line_hits: std::collections::BTreeMap::new(),
+        branch_hits: HashMap::new(),
     };
 
     // Time-0 initializers (constant expressions only).
@@ -2414,6 +2530,27 @@ pub fn run_testbench(
     let log_lines = ip.log.clone();
     let vcd_samples = std::mem::take(&mut ip.vcd_samples);
     let trace_names = ip.trace_names.clone();
+    let coverage = {
+        let mut lines = std::collections::BTreeMap::new();
+        let mut branches = Vec::new();
+        collect_lines(&prog.initial, &mut lines, &mut branches);
+        for (l, n) in &ip.line_hits {
+            lines.insert(*l, *n);
+        }
+        for b in &mut branches {
+            if let Some((t, f)) = ip.branch_hits.get(&b.line) {
+                b.true_hits = *t;
+                b.false_hits = *f;
+            }
+        }
+        TbCoverage {
+            tb_file: cfg.tb_path.clone(),
+            dut_file: dut_path.clone(),
+            lines: lines.into_iter().collect(),
+            branches,
+            dut: ip.sim.coverage_report(),
+        }
+    };
 
     // Artifacts: <tb_dir>/.helion/tb_runs/<stem>_<unix>/{run.log,run.vcd}
     let stem = cfg
@@ -2512,6 +2649,7 @@ pub fn run_testbench(
         runtime_ms,
         dut_module: prog.dut_module.clone(),
         dut_instance: prog.dut_instance.clone(),
+        coverage,
     })
 }
 
@@ -2988,6 +3126,28 @@ impl std::fmt::Debug for TbRunRequest {
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn run_collects_tb_line_branch_and_dut_coverage() {
+        let dir = tmp_dir("coverage");
+        write_file(&dir, "and_dut.sv", AND_DUT);
+        let tb = write_file(
+            &dir,
+            "and_dut_tb.sv",
+            "module and_dut_tb;\n    logic clk;\n    logic a;\n    logic b;\n    logic y;\n    and_dut dut (.clk(clk), .a(a), .b(b), .y(y));\n    always #5 clk = ~clk;\n    initial begin\n        a = 1; b = 1;\n        @(posedge clk); @(posedge clk);\n        if (y == 1) $display(\"high\");\n        else $display(\"low\");\n        if (y == 7) $display(\"never\");\n        assert (y == 1) else $error(\"bad\");\n        $finish;\n    end\nendmodule\n",
+        );
+        let out = run_testbench(&TbRunConfig::new(tb), None).unwrap();
+        let c = &out.coverage;
+        assert!(c.lines.len() >= 6, "{:?}", c.lines);
+        assert_eq!(c.lines_hit(), c.lines.len() - 1, "only the untaken else line is missed: {:?}", c.lines);
+        let ifs: Vec<_> = c.branches.iter().filter(|b| b.kind == "if").collect();
+        assert_eq!(ifs.len(), 2);
+        assert_eq!((ifs[0].true_hits, ifs[0].false_hits), (1, 0));
+        assert_eq!((ifs[1].true_hits, ifs[1].false_hits), (0, 1));
+        assert!(c.branches.iter().any(|b| b.kind == "assert" && b.true_hits == 1));
+        assert!(c.dut.cycles_sampled > 0 && c.dut.total_nets() > 0);
+        assert!(c.summary_line().starts_with("coverage tb_lines="));
+    }
 
     fn tmp_dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("helion_tb_{name}_{}", std::process::id()));
