@@ -3043,6 +3043,26 @@ module and_dut_tb;
 endmodule
 "#;
 
+    /// The shipped `examples/counter_tb.sv` must pass against
+    /// `examples/counter.sv` (run in a temp copy: runs write `.helion/`).
+    #[test]
+    fn shipped_counter_testbench_passes() {
+        let ex = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let d = tmp_dir("shipped_counter");
+        for f in ["counter.sv", "counter_tb.sv"] {
+            std::fs::copy(ex.join(f), d.join(f)).unwrap();
+        }
+        let found = discover_testbenches(&d);
+        assert_eq!(found.len(), 1);
+        let mut cfg = TbRunConfig::new(found[0].path.clone());
+        cfg.vcd = true;
+        let out = run_testbench(&cfg, None).unwrap();
+        assert!(out.passed, "{}: {:?}", out.summary, out.failures);
+        assert_eq!(out.displays, 2, "{:?}", out.log);
+        assert!(out.vcd_path.is_some_and(|p| p.is_file()));
+        assert_eq!(out.dut_module, "counter");
+    }
+
     #[test]
     fn discovery_matches_tb_suffix_and_prefix() {
         let d = tmp_dir("discover");
