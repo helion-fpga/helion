@@ -38,6 +38,8 @@ The details are in the [changelog](CHANGELOG.md#400--unreleased).
 - **Two Lattice backends.** iCE40-HX8K on Project IceStorm data (`.asc`
   output) and ECP5 LFE5U-85F on Project Trellis data (text config for
   `ecppack`), selectable from the New Project part picker.
+- **Verification.** Class-based SystemVerilog testbenches with a UVM
+  subset, behavioral VHDL testbenches, and DUT line and branch coverage.
 - **Windowless modes** for scripts and CI: `--headless`, `--source`,
   `--stdin`, `--version`, `--doctor`, on the IDE's own Tcl interpreter.
 - **A self-contained build.** Rune is vendored in `third_party/rune`, Rust
@@ -79,8 +81,10 @@ Ordered roughly by priority. None of these are promised for a date.
 **IDE**
 - The open items in [`SWEEP.md`](crates/helion-rune/SWEEP.md): a clock-region
   layer (needs a region model in HAD), pblock deletion in `.prj`, DFX
-  partitions persisted in the project, DUT line coverage, VHDL testbenches,
-  horizontal scrolling in large-file mode.
+  partitions persisted in the project and locked static routes, horizontal
+  scrolling in large-file mode, richer VHDL diagnostics.
+- Testbench engine limits: 4-state and wider-than-64-bit values, structs,
+  covergroups and DPI in class-based testbenches.
 
 **Project**
 - Make the full workspace test run a required CI check (it is

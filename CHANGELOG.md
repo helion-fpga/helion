@@ -94,7 +94,25 @@ ECP5) join the HL10 and Xilinx 7-series flows. The empty-XDC
   an IBIS writer, SSN over placed ports, VCD-driven power in `helion-sta`,
   `$urandom`, `$urandom_range` and `randcase` in testbenches, SystemVerilog
   testbenches driving VHDL DUTs, and C/RTL co-simulation in the gate
-  simulator.
+  simulator, with an FSMD RTL emitter so co-simulation exercises the C
+  function. iCE40 and ECP5 runs report family utilization, timing, DRC and
+  die geometry.
+- **Class-based SystemVerilog testbenches and a UVM subset**
+  (`helion-svtb`): classes with inheritance, virtual methods and parameters,
+  dynamic arrays, queues, associative arrays, `fork`/`join`, events,
+  mailboxes, semaphores, virtual interfaces with clocking blocks, constrained
+  randomization, macros and `` `include ``, and a documented `uvm_pkg`
+  subset (factory, phases and objections, `config_db`, TLM, sequences,
+  reporting). The Simulation pane picks a UVM test (`+UVM_TESTNAME`) and
+  shows the UVM report summary. `examples/uvm_counter` verifies
+  `counter.sv`. Limits are reported as errors: 2-state values up to 64 bits,
+  no structs, covergroups or DPI.
+- **VHDL testbenches** (`*_tb.vhd`): a behavioral VHDL simulator with delta
+  cycles, `wait on/until/for`, `after` delays, resolved `std_logic`,
+  `report`/`assert`, `numeric_std` and `textio` output; SV or VHDL DUTs.
+  `examples/counter_tb.vhd` is a self-checking example.
+- **DUT RTL line and branch coverage** in the Coverage view and the editor
+  gutter, from source-location probes inserted at synthesis.
 - `helion-verif`: the ILA and testbench engines, extracted so the IDE and
   CLI share them. `examples/counter_tb.sv` is a self-checking testbench.
 - `helion equiv` and `helion synth --verify`: SAT-based equivalence between
@@ -132,6 +150,11 @@ ECP5) join the HL10 and Xilinx 7-series flows. The empty-XDC
   [`TRADEMARKS.md`](TRADEMARKS.md) covers the Helion name and logo.
 - Interned net and cell names (`Spur`) across the IR and backends.
 - Test builds hide real FTDI devices; `HELION_TEST_REAL_USB=1` opts in.
+
+- An implementation run with unrouted nets or overused routing now logs a
+  critical warning and skips the bitstream instead of reporting a clean run;
+  Tcl `write_bitstream` applies the same gate (`-force` to overwrite an
+  existing file).
 
 ### Deprecated
 

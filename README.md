@@ -25,7 +25,7 @@
 
 <p align="center">
   <img src="docs/screenshots/ide-summary.png" alt="Helion IDE Project Summary after implementing the full Ibex RV32 core" width="900"><br>
-  <em>The Helion IDE after a full implementation of the ysyx Ibex RV32 core on an HL10S part.</em>
+  <em>The Project Summary after running implementation on the full ysyx Ibex RV32 core (HL10S-C64-1).</em>
 </p>
 
 ## What is Helion
@@ -52,19 +52,19 @@ documentation projects. No vendor tools, libraries or databases are needed.
 
 ## Screenshots
 
-All screenshots are of a real implementation of the full Ibex RV32 core, not mock-ups.
+Every screenshot is the IDE on a real run of the full Ibex RV32 core, not a mock-up.
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/ide-device.png" alt="Device view of the routed Ibex design"><br><sub><b>Device.</b> The routed design on the die, with nets drawn.</sub></td>
-    <td width="50%"><img src="docs/screenshots/ide-timing.png" alt="Timing analysis view"><br><sub><b>Timing.</b> Intra-clock paths from STA on the routed design.</sub></td>
+    <td width="50%"><img src="docs/screenshots/ide-device.png" alt="Device view of the Ibex design on the die"><br><sub><b>Device.</b> Ibex placed on the die, with nets drawn.</sub></td>
+    <td width="50%"><img src="docs/screenshots/ide-timing.png" alt="Timing analysis view"><br><sub><b>Timing.</b> Intra-clock paths from static timing analysis.</sub></td>
   </tr>
   <tr>
     <td width="50%"><img src="docs/screenshots/ide-schematic.png" alt="Schematic view"><br><sub><b>Schematic.</b> The implemented netlist, with fan-in and fan-out cones.</sub></td>
     <td width="50%"><img src="docs/screenshots/ide-editor.png" alt="Source editor"><br><sub><b>Editor.</b> SystemVerilog source with highlighting and diagnostics.</sub></td>
   </tr>
   <tr>
-    <td colspan="2"><img src="docs/screenshots/ide-console.png" alt="Tcl console with utilization and timing reports"><br><sub><b>Tcl console.</b> <code>report_utilization</code> and <code>report_timing -max_paths 5</code> on the routed design.</sub></td>
+    <td colspan="2"><img src="docs/screenshots/ide-console.png" alt="Tcl console with utilization and timing reports"><br><sub><b>Tcl console.</b> <code>report_utilization</code> and <code>report_timing -max_paths 5</code> after implementation.</sub></td>
   </tr>
 </table>
 
@@ -89,7 +89,8 @@ All screenshots are of a real implementation of the full Ibex RV32 core, not moc
 **Simulation and verification**
 - Event simulator and cycle-level fabric model; testbench runner with self-checking testbenches
 - Waveform viewer with cursors, analog and fixed-point display, and SPI/UART/AXI-Lite/FSM decoders
-- Code coverage, SystemVerilog assertions (subset), SAT-based equivalence checking (`helion equiv`)
+- Class-based SystemVerilog testbenches with a UVM subset, VHDL testbenches, line and branch coverage
+- SystemVerilog assertions (subset) and SAT-based equivalence checking (`helion equiv`)
 
 **Hardware and debug**
 - Hardware Manager with a simulated cable, openFPGALoader, and a native FTDI JTAG engine
