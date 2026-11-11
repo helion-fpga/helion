@@ -607,6 +607,86 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         }
         s.toasts = Default::default();
     }),
+    ("hw-jtag-native", |s| {
+        // Native FTDI cable wired to the fixture board (Helion between two
+        // neighbours): real MPSSE chain scan + a USER2 round trip.
+        s.center = state::CenterPane::Program;
+        s.program.node = views::hw_tree::HwNode::Target;
+        let board = views::hw_native::MockBoard::Chain {
+            part: "HL10T-C32-1".into(),
+        };
+        if views::hw_native::use_mock_board(s, board).is_ok() {
+            for (verb, args) in [
+                ("refresh_hw_target", vec![]),
+                ("scan_ir_hw_jtag", vec!["6", "-tdi", "22"]),
+                ("scan_dr_hw_jtag", vec!["64", "-tdi", "0x1234ABCD"]),
+                ("scan_dr_hw_jtag", vec!["64", "-tdi", "0"]),
+            ] {
+                let args: Vec<String> = args.into_iter().map(String::from).collect();
+                let _ = views::hw_native::tcl_verb(s, verb, &args);
+            }
+        }
+    }),
+    ("hw-jtag-native-light", |s| {
+        s.theme = theme::ThemeMode::Light;
+        s.center = state::CenterPane::Program;
+        s.program.node = views::hw_tree::HwNode::Target;
+        let board = views::hw_native::MockBoard::Chain {
+            part: "HL10T-C32-1".into(),
+        };
+        if views::hw_native::use_mock_board(s, board).is_ok() {
+            let _ = views::hw_native::tcl_verb(s, "refresh_hw_target", &[]);
+        }
+    }),
+    ("hw-jtag-usb", |s| {
+        // Native FTDI with no fixture: the real USB path, not yet scanned.
+        s.center = state::CenterPane::Program;
+        s.program.node = views::hw_tree::HwNode::Target;
+        s.program.cable = views::program::CableChoice::Native;
+    }),
+    ("hw-setup-native", |s| {
+        // Set Up Debug with the Native FTDI cable picked (real USB path).
+        s.center = state::CenterPane::Program;
+        s.program.node = views::hw_tree::HwNode::SetupDebug;
+        let _ = views::hw_debug::seed_debug_fixture(s, views::hw_debug::FixtureStage::Picked);
+        s.program.cable = views::program::CableChoice::Native;
+    }),
+    ("hw-ila-native", |s| {
+        // The full debug flow over the native engine and the fixture board.
+        s.center = state::CenterPane::Program;
+        let stage = views::hw_debug::FixtureStage::Live;
+        if views::hw_debug::seed_debug_fixture_native(s, stage).is_ok() {
+            s.program.node = views::hw_tree::HwNode::Core(helion_debug::DebugCoreKind::Ila);
+        }
+    }),
+    ("hw-ila-native-light", |s| {
+        s.theme = theme::ThemeMode::Light;
+        s.center = state::CenterPane::Program;
+        let stage = views::hw_debug::FixtureStage::Live;
+        if views::hw_debug::seed_debug_fixture_native(s, stage).is_ok() {
+            s.program.node = views::hw_tree::HwNode::Core(helion_debug::DebugCoreKind::Ila);
+        }
+    }),
+    ("hw-cfgmem-native", |s| {
+        // Program / verify / read back over the native engine into the
+        // fixture board's SPI flash.
+        s.center = state::CenterPane::Program;
+        if views::bitstream::seed_bitstream_fixture(s).is_ok() {
+            if let Some(p) = helion_hw::find_cfgmem_part("mt25ql128") {
+                let board = views::hw_native::MockBoard::Helion {
+                    part: s.bitstream.part.clone(),
+                    flash: p.jedec_id.map(|id| (id, p.capacity_bytes())),
+                };
+                if views::hw_native::use_mock_board(s, board).is_ok() {
+                    for verb in ["create_hw_cfgmem", "write_cfgmem", "program_hw_cfgmem", "readback_hw_cfgmem"] {
+                        let args = if verb == "create_hw_cfgmem" { vec!["mt25ql128".to_string()] } else { vec![] };
+                        let _ = views::hw_cfgmem::tcl_verb(s, verb, &args);
+                    }
+                }
+            }
+        }
+        s.toasts = Default::default();
+    }),
     ("hw-cfgmem-add", |s| {
         s.center = state::CenterPane::Program;
         s.program.node = views::hw_tree::HwNode::CfgMem;

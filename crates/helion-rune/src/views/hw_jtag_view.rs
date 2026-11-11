@@ -264,12 +264,7 @@ pub fn chain_card(s: &AppState, t: &VivadoTheme) -> El {
     }
     body = body.child(chain_table(s, t));
     if let Some(log) = scan_log(s, t) {
-        body = body
-            .child(cad::caps(
-                "Raw scans (scan_ir_hw_jtag / scan_dr_hw_jtag)",
-                t,
-            ))
-            .child(log);
+        body = body.child(cad::caps("Raw scans", t)).child(log);
     }
     cad::card("program-chain", "JTAG Chain", body, t)
 }
