@@ -489,6 +489,18 @@ impl JtagAxiMaster {
         }
     }
 
+    /// A master with no address map: every access answers `DECERR` until
+    /// [`JtagAxiMaster::map_region`] adds a real aperture (no modelled slaves).
+    pub fn bare(core_name: impl Into<String>, slot_id: u8) -> Self {
+        Self {
+            core_name: core_name.into(),
+            slot_id,
+            regions: Vec::new(),
+            mem: BTreeMap::new(),
+            txn_count: 0,
+        }
+    }
+
     pub fn map_region(&mut self, region: AxiRegion) {
         self.regions.push(region);
     }
@@ -568,13 +580,19 @@ impl JtagAxiMaster {
                         overall_resp = AxiResp::SlvErr;
                         break;
                     }
-                    self.mem.insert(beat_addr, word);
-                    if let (Some(major), Some(t)) = (region.bram_aperture_major, tap.as_deref_mut())
-                    {
-                        let word_idx = ((beat_addr - region.base_addr) / 4) as usize;
-                        if word_idx < 255 {
-                            t.fabric_mut()
-                                .bram_write_word(major, word_idx, u64::from(word));
+                    match (region.bram_aperture_major, tap.as_deref_mut()) {
+                        // Live fabric aperture: the BRAM data plane is the only
+                        // copy, so later reads see fabric-side updates too.
+                        (Some(major), Some(t)) => {
+                            let word_idx = ((beat_addr - region.base_addr) / 4) as usize;
+                            if word_idx < 255 {
+                                t.fabric_mut()
+                                    .bram_write_word(major, word_idx, u64::from(word));
+                            }
+                            self.mem.remove(&beat_addr);
+                        }
+                        _ => {
+                            self.mem.insert(beat_addr, word);
                         }
                     }
                 }
@@ -583,7 +601,7 @@ impl JtagAxiMaster {
                     if let (Some(major), Some(t)) = (region.bram_aperture_major, tap.as_deref_mut())
                     {
                         let word_idx = ((beat_addr - region.base_addr) / 4) as usize;
-                        if word_idx < 255 && !self.mem.contains_key(&beat_addr) {
+                        if word_idx < 255 {
                             val = t.fabric().bram_read_word(major, word_idx) as u32;
                         }
                     }
