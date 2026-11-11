@@ -1,6 +1,19 @@
 // Helion HB1: PicoRV32 wrap on Helion-MM. Not Zynq PS. Not an original core.
 // PicoRV32 is ISC (Claire Wolf / YosysHQ). See third_party/picorv32/LICENSE.
-module h_rv32_hb1 (
+// Configurable through the IP customization dialog (Vivado CONFIG.*): each
+// parameter passes straight through to PicoRV32; defaults keep the original
+// HB1 configuration.
+module h_rv32_hb1 #(
+    parameter [0:0]  ENABLE_COUNTERS = 0,
+    parameter [0:0]  BARREL_SHIFTER  = 0,
+    parameter [0:0]  COMPRESSED_ISA  = 0,
+    parameter [0:0]  CATCH_MISALIGN  = 0,
+    parameter [0:0]  CATCH_ILLINSN   = 0,
+    parameter [0:0]  ENABLE_MUL      = 0,
+    parameter [0:0]  ENABLE_DIV      = 0,
+    parameter [31:0] PROGADDR_RESET  = 32'h00000000,
+    parameter [31:0] STACKADDR       = 32'hffffffff
+) (
     input  wire        clk,
     input  wire        resetn,
     output wire        mm_valid,
@@ -13,10 +26,15 @@ module h_rv32_hb1 (
 );
     // Official PicoRV32 native mem interface mapped to Helion-MM.
     picorv32 #(
-        .ENABLE_COUNTERS(0),
-        .COMPRESSED_ISA(0),
-        .CATCH_MISALIGN(0),
-        .CATCH_ILLINSN(0)
+        .ENABLE_COUNTERS(ENABLE_COUNTERS),
+        .BARREL_SHIFTER(BARREL_SHIFTER),
+        .COMPRESSED_ISA(COMPRESSED_ISA),
+        .CATCH_MISALIGN(CATCH_MISALIGN),
+        .CATCH_ILLINSN(CATCH_ILLINSN),
+        .ENABLE_MUL(ENABLE_MUL),
+        .ENABLE_DIV(ENABLE_DIV),
+        .PROGADDR_RESET(PROGADDR_RESET),
+        .STACKADDR(STACKADDR)
     ) u_pico (
         .clk(clk),
         .resetn(resetn),

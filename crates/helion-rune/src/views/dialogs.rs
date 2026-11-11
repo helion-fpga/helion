@@ -63,6 +63,16 @@ pub enum DialogId {
     NewProject,
     Constraints,
     AddSources,
+    /// IP Integrator: Run Connection Automation preview.
+    IpAutomation,
+    /// IP Integrator: Customize IP (per-cell CONFIG.* parameters).
+    IpCustomize,
+    /// IP Integrator: Package IP into the user repository.
+    PackageIp,
+    /// File > Export > Export Hardware (hardware platform hand-off).
+    ExportHardware,
+    /// File > Archive Project.
+    ArchiveProject,
 }
 
 impl DialogId {
@@ -72,6 +82,11 @@ impl DialogId {
             DialogId::NewProject => "create",
             DialogId::Constraints => "xdc",
             DialogId::AddSources => "add-sources",
+            DialogId::IpAutomation => "ip-auto",
+            DialogId::IpCustomize => "ip-cust",
+            DialogId::PackageIp => "ip-pkg",
+            DialogId::ExportHardware => "hw",
+            DialogId::ArchiveProject => "ar",
         }
     }
 }
@@ -194,7 +209,7 @@ impl CreateStep {
             CreateStep::Info => "Name the project and choose the folder that will hold it.",
             CreateStep::Sources => "Add RTL sources now, or later from the Sources pane.",
             CreateStep::Constraints => "Add XDC/SDC constraint files (clocks, pins, delays).",
-            CreateStep::Part => "Choose the Helion device the project targets.",
+            CreateStep::Part => "Choose a board, or the device the project targets.",
             CreateStep::Summary => "Review the project, then create it on disk.",
         }
     }
@@ -250,10 +265,6 @@ const IMPL_STRATS: &[&str] = &[
     "RuntimeOpt",
     "Flow_Quick",
 ];
-/// Parts the New Project wizard offers: exactly the parts the backend can
-/// place/route (`helion_device::Device::list_parts`; every entry must load —
-/// see `wizard_parts_all_load_in_the_backend`).
-const PARTS: &[&str] = &["HL10T-C32-1", "HL10M-C128-1", "HL10S-C64-1"];
 
 /// Index into an option list that can never panic on UI state.
 fn pick<'a>(opts: &[&'a str], i: usize) -> &'a str {
@@ -325,12 +336,27 @@ pub struct CreateState {
     pub location: TextEdit,
     pub top: TextEdit,
     pub constr_set: usize,
+    /// Index into `catalog.parts`.
     pub part: usize,
+    /// Implementable parts + boards (`views::part_picker`).
+    pub catalog: crate::views::part_picker::PartCatalog,
+    pub part_filter: TextEdit,
+    /// Selected board (sets the part, offers its pin XDC).
+    pub board: Option<String>,
+    /// Add the board's pin constraints as an XDC on Finish.
+    pub board_xdc: bool,
     pub error: Option<String>,
     /// RTL files picked on the Add Sources page.
     pub sources: Vec<String>,
     /// XDC/SDC files picked on the Add Constraints page.
     pub constraints: Vec<String>,
+}
+
+impl CreateState {
+    /// The picked part name.
+    pub fn part_name(&self) -> Option<&str> {
+        self.catalog.parts.get(self.part).map(|p| p.part.as_str())
+    }
 }
 
 impl Default for CreateState {
@@ -346,6 +372,10 @@ impl Default for CreateState {
             top: TextEdit::new(""),
             constr_set: 0,
             part: 0,
+            catalog: crate::views::part_picker::PartCatalog::load(),
+            part_filter: TextEdit::new(""),
+            board: None,
+            board_xdc: false,
             error: None,
             sources: Vec::new(),
             constraints: Vec::new(),
@@ -1311,7 +1341,7 @@ fn create_error(c: &CreateState) -> Option<String> {
     if c.location.text.trim().is_empty() {
         return Some("Project location is required.".into());
     }
-    if PARTS.get(c.part).is_none() {
+    if c.part_name().is_none() {
         return Some("Choose a default part.".into());
     }
     None
@@ -1328,7 +1358,7 @@ fn finish_create(s: &mut AppState) {
     let name = s.dialogs.create.name.text.trim().to_string();
     let location = s.dialogs.create.location.text.trim().to_string();
     let top = s.dialogs.create.top.text.trim().to_string();
-    let part = pick(PARTS, s.dialogs.create.part).to_string();
+    let part = s.dialogs.create.part_name().unwrap_or_default().to_string();
     match write_new_project(&s.dialogs.create, &name, &location, &part, &top) {
         Ok(prj) => {
             s.dialogs.close();
@@ -1376,6 +1406,13 @@ fn write_new_project(
             "read_sv"
         };
         text.push_str(&format!("{verb} {f}\n"));
+    }
+    if let Some(b) = c.board.as_deref().and_then(|b| c.catalog.board(b)) {
+        text.push_str(&format!("# board {}\n", b.board));
+        if c.board_xdc && !b.pins.is_empty() {
+            let xdc = crate::views::part_picker::write_board_xdc(&dir, b)?;
+            text.push_str(&format!("read_xdc {}\n", xdc.display()));
+        }
     }
     for f in &c.constraints {
         let verb = if f.to_ascii_lowercase().ends_with(".sdc") {
@@ -1564,9 +1601,8 @@ pub(crate) fn wiz_footer(
     ))
 }
 
-fn create_page(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme, kit: &Kit) -> El {
+fn create_page(_layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme, kit: &Kit) -> El {
     let c = &s.dialogs.create;
-    let pop = s.dialogs.pop;
     let mut page = col()
         .key("create-body")
         .w_full()
@@ -1655,32 +1691,7 @@ fn create_page(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme, kit: &Kit) ->
             ));
         }
         CreateStep::Part => {
-            page = page
-                .child(field_row(
-                    "Part:",
-                    WIZ_LABEL_W,
-                    pop_select(
-                        layer,
-                        kit,
-                        t,
-                        "create-part",
-                        "Default part",
-                        PopId::CreatePart,
-                        pick(PARTS, c.part),
-                        &static_opts(PARTS),
-                        pop == Some(PopId::CreatePart),
-                        |s: &mut AppState, i| s.dialogs.create.part = i,
-                    )
-                    .grow(1.0)
-                    .min_w(0.0),
-                    t,
-                ))
-                .child(field_row(
-                    "Family:",
-                    WIZ_LABEL_W,
-                    value_box("Helion", t).grow(1.0).min_w(0.0),
-                    t,
-                ));
+            page = page.child(crate::views::part_picker::part_page(s, t, kit));
         }
         CreateStep::Summary => {
             let name = if c.name.text.trim().is_empty() {
@@ -1704,7 +1715,16 @@ fn create_page(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme, kit: &Kit) ->
                 .child(field_row(
                     "Part:",
                     WIZ_LABEL_W,
-                    value_box(pick(PARTS, c.part), t).grow(1.0).min_w(0.0),
+                    value_box(
+                        &match (&c.board, c.part_name()) {
+                            (Some(b), Some(p)) => format!("{p} (board {b})"),
+                            (None, Some(p)) => p.to_string(),
+                            _ => "None".into(),
+                        },
+                        t,
+                    )
+                    .grow(1.0)
+                    .min_w(0.0),
                     t,
                 ))
                 .child(field_row(
@@ -1965,6 +1985,12 @@ pub fn push_dialogs(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme) {
             crate::views::xdc_wizard::xdc_dialog(layer, &mut pops, s, t, &kit)
         }
         DialogId::AddSources => add_sources_dialog(s, t, &kit, layer),
+        DialogId::IpAutomation | DialogId::IpCustomize | DialogId::PackageIp => {
+            crate::views::ip_dialogs::push(id, layer, s, t, &kit)
+        }
+        DialogId::ExportHardware | DialogId::ArchiveProject => {
+            crate::views::handoff::push(id, layer, s, t, &kit)
+        }
     }
     layer.extend(pops);
 }
@@ -2096,11 +2122,14 @@ mod tests {
     }
 
     #[test]
-    fn wizard_parts_all_load_in_the_backend() {
-        for part in PARTS {
+    fn wizard_parts_all_have_a_backend() {
+        let c = CreateState::default();
+        assert!(!c.catalog.parts.is_empty());
+        for p in &c.catalog.parts {
             assert!(
-                helion_device::Device::load_part(part).is_ok(),
-                "wizard part {part} must have a backend HAD model"
+                helion_targets::family_of(&p.part).is_some(),
+                "wizard part {} must be implementable",
+                p.part
             );
         }
     }

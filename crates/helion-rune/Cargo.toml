@@ -44,3 +44,7 @@ helion-debug = { path = "../helion-debug" }
 # Saved waveform configurations (`.wcfg` JSON).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# HLS (C synthesis + gate-level C/RTL co-simulation) and the implementable
+# part registry / family flow dispatch (iCE40, ECP5, 7-series).
+helion-hls = { path = "../helion-hls" }
+helion-targets = { path = "../helion-targets" }

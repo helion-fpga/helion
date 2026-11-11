@@ -103,6 +103,8 @@ enum MenuAct {
     NextBookmark,
     ToggleOutline,
     Templates,
+    ExportHw,
+    Archive,
 }
 
 /// One dropdown row: a dispatchable item, a caps section caption, or a rule.
@@ -225,6 +227,14 @@ fn menu_rows(id: MenuId, s: &AppState) -> Vec<MenuRow> {
             rows.extend([
                 Sep,
                 hot("Save", "save_file", "⌘S", A::Save),
+                gate(
+                    item("Export Hardware…", "write_hw_platform", A::ExportHw),
+                    no_project,
+                ),
+                gate(
+                    item("Archive Project…", "archive_project", A::Archive),
+                    no_project,
+                ),
                 gate(
                     item("Close Project", "close_project", A::CloseProject),
                     no_project,
@@ -456,8 +466,16 @@ fn menu_rows(id: MenuId, s: &AppState) -> Vec<MenuRow> {
             item("Waveform", "show_view Wave", A::Nav(CenterPane::Wave)),
             item("Debug", "show_view Debug", A::Nav(CenterPane::Debug)),
             item("Logic Analyzer", "ila", A::Nav(CenterPane::Ila)),
+            item("Code Coverage", "report_coverage", A::Nav(CenterPane::Coverage)),
             Sep,
             item("IP Integrator", "ip_catalog", A::Nav(CenterPane::Ip)),
+            item("High-Level Synthesis", "open_hls", A::Nav(CenterPane::Hls)),
+            item("ECO", "eco_open", A::Nav(CenterPane::Eco)),
+            item(
+                "Partial Reconfiguration",
+                "report_partitions",
+                A::Nav(CenterPane::Dfx),
+            ),
             item(
                 "Bitstream",
                 "report_bitstream",
@@ -510,6 +528,7 @@ fn menu_rows(id: MenuId, s: &AppState) -> Vec<MenuRow> {
 pub enum FlowSection {
     ProjectManager,
     IpIntegrator,
+    Hls,
     Simulation,
     RtlAnalysis,
     Synthesis,
@@ -518,9 +537,10 @@ pub enum FlowSection {
 }
 
 impl FlowSection {
-    pub const ALL: [FlowSection; 7] = [
+    pub const ALL: [FlowSection; 8] = [
         FlowSection::ProjectManager,
         FlowSection::IpIntegrator,
+        FlowSection::Hls,
         FlowSection::Simulation,
         FlowSection::RtlAnalysis,
         FlowSection::Synthesis,
@@ -537,6 +557,7 @@ impl FlowSection {
             FlowSection::Synthesis => 4,
             FlowSection::Implementation => 5,
             FlowSection::ProgramDebug => 6,
+            FlowSection::Hls => 7,
         }
     }
 
@@ -544,6 +565,7 @@ impl FlowSection {
         match self {
             FlowSection::ProjectManager => "PROJECT MANAGER",
             FlowSection::IpIntegrator => "IP INTEGRATOR",
+            FlowSection::Hls => "HIGH-LEVEL SYNTHESIS",
             FlowSection::Simulation => "SIMULATION",
             FlowSection::RtlAnalysis => "RTL ANALYSIS",
             FlowSection::Synthesis => "SYNTHESIS",
@@ -698,12 +720,52 @@ fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
                 CenterPane::Ip,
                 |s| s.ip.tab = crate::views::ip::BdTab::Diagram,
             ),
+            link(
+                section,
+                "Run Connection Automation",
+                "apply_bd_automation",
+                Some(CenterPane::Ip),
+                Some(DialogId::IpAutomation),
+                None,
+            ),
             goto(
                 section,
                 "Generate Block Design",
                 "bd_hdl",
                 CenterPane::Ip,
                 |s| s.ip.tab = crate::views::ip::BdTab::Hdl,
+            ),
+            link(
+                section,
+                "Package IP",
+                "package_ip",
+                Some(CenterPane::Ip),
+                Some(DialogId::PackageIp),
+                None,
+            ),
+        ],
+        FlowSection::Hls => vec![
+            link(
+                section,
+                "Open HLS Project",
+                "open_hls",
+                Some(CenterPane::Hls),
+                None,
+                None,
+            ),
+            goto(
+                section,
+                "Run C Synthesis",
+                "csynth_design",
+                CenterPane::Hls,
+                |s| crate::tcl::eval_command(s, "csynth_design"),
+            ),
+            goto(
+                section,
+                "Run C/RTL Co-Simulation",
+                "cosim_design",
+                CenterPane::Hls,
+                |s| crate::tcl::eval_command(s, "cosim_design"),
             ),
         ],
         FlowSection::Simulation => vec![
@@ -738,6 +800,14 @@ fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
                 "Open Debug",
                 "breakpoints",
                 Some(CenterPane::Debug),
+                None,
+                None,
+            ),
+            link(
+                section,
+                "Code Coverage",
+                "report_coverage",
+                Some(CenterPane::Coverage),
                 None,
                 None,
             ),
@@ -826,6 +896,15 @@ fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
                 "report_pblocks",
                 CenterPane::Device,
                 |s| crate::tcl::eval_command(s, "report_pblocks"),
+            ),
+            link(section, "ECO", "eco_open", Some(CenterPane::Eco), None, None),
+            link(
+                section,
+                "Partial Reconfiguration",
+                "report_partitions",
+                Some(CenterPane::Dfx),
+                None,
+                None,
             ),
             timing_page(
                 section,
@@ -1058,7 +1137,7 @@ const TOOLS_RUN: &[Tool] = &[
 #[derive(Clone, Debug)]
 pub struct ChromeState {
     pub open_menu: Option<MenuId>,
-    pub collapsed: [bool; 7],
+    pub collapsed: [bool; 8],
     /// Help ▸ About dialog is showing.
     pub about_open: bool,
 }
@@ -1067,8 +1146,11 @@ impl Default for ChromeState {
     fn default() -> Self {
         // IP Integrator starts folded: block design is an occasional task,
         // and folding it keeps the synthesis-to-bitstream flow on screen.
-        let mut collapsed = [false; 7];
+        // IP Integrator and HLS start folded: occasional tasks; folding
+        // them keeps the synthesis-to-bitstream flow on screen.
+        let mut collapsed = [false; 8];
         collapsed[FlowSection::IpIntegrator.index()] = true;
+        collapsed[FlowSection::Hls.index()] = true;
         Self {
             open_menu: None,
             collapsed,
@@ -1250,6 +1332,8 @@ fn dispatch_menu(s: &mut AppState, tcl: &'static str, act: MenuAct, tx: &mut Tx)
             crate::views::editor::goto_next_bookmark(s, tx);
         }
         MenuAct::Templates => crate::views::templates::open(s),
+        MenuAct::ExportHw => crate::views::handoff::open_export(s),
+        MenuAct::Archive => crate::views::handoff::open_archive(s),
         MenuAct::ToggleOutline => {
             s.navigate(CenterPane::Editor);
             s.editor.outline_open = !s.editor.outline_open;
@@ -1563,7 +1647,7 @@ pub fn flow_rail(s: &AppState, t: &VivadoTheme) -> El {
                     .hover(t.selection)
                     .on_press(|s: &mut AppState| {
                         let any_open = s.chrome.collapsed.contains(&false);
-                        s.chrome.collapsed = [any_open; 7];
+                        s.chrome.collapsed = [any_open; 8];
                     })
                     .child(
                         icon(&glyphs::CHEVRON_UP, 12.0)
@@ -2131,10 +2215,10 @@ mod tests {
             rt.find("menu-view-menu").is_some(),
             "View dropdown must mount"
         );
-        // Start, Summary, rule, 7 design views, rule, 4 sim views, rule,
-        // 3 hardware views, rule, Symbol Outline, rule, THEME caption:
-        // Light 23, Dark 24, System 25.
-        tap(&mut rt, "menu-view-item24");
+        // Start, Summary, rule, 7 design views, rule, 5 sim views, rule,
+        // 6 hardware/flow views, rule, Symbol Outline, rule, THEME caption:
+        // Light 27, Dark 28, System 29.
+        tap(&mut rt, "menu-view-item28");
         assert_eq!(rt.state.theme, ThemeMode::Dark, "Dark Theme pins dark");
         assert_eq!(rt.state.chrome.open_menu, None);
         assert!(
@@ -2146,10 +2230,10 @@ mod tests {
             "theme pin must echo its Tcl verb"
         );
         tap(&mut rt, "menu-view");
-        tap(&mut rt, "menu-view-item23");
+        tap(&mut rt, "menu-view-item27");
         assert_eq!(rt.state.theme, ThemeMode::Light, "Light Theme pins light");
         tap(&mut rt, "menu-view");
-        tap(&mut rt, "menu-view-item25");
+        tap(&mut rt, "menu-view-item29");
         assert_eq!(
             rt.state.theme,
             ThemeMode::System,

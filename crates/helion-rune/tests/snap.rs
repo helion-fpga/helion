@@ -244,8 +244,13 @@ fn create_wizard_walks_to_summary_and_finish_applies_the_project() {
     rt.state.dialogs.create.location = rune::TextEdit::new(root.display().to_string());
     rt.invalidate();
     rt.frame(0.05);
-    for _ in 0..4 {
+    for i in 0..4 {
         tap(&mut rt, "create-next");
+        // Pages differ in height (the part picker is taller): let the
+        // dialog's fit animation settle before the next press.
+        for k in 1..=20 {
+            rt.frame(0.1 + i as f64 + k as f64 / 30.0);
+        }
     }
     assert_eq!(rt.state.dialogs.create.step, CreateStep::Summary);
     tap(&mut rt, "create-finish");

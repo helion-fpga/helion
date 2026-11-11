@@ -17,7 +17,7 @@ use rune::{El, Shape, canvas, col, el, text};
 use crate::state::AppState;
 use crate::theme::VivadoTheme;
 use crate::views::cad::FONT_PIN;
-use crate::views::ip::{IpState, select_ip};
+use crate::views::ip_model::{IpState, open_customize, select_cell};
 
 // Canvas geometry (world points at 100%).
 const MARGIN: f32 = 16.0;
@@ -105,30 +105,33 @@ fn pin(name: &str, iface: bool, output: bool, x: f32, y: f32) -> BdPin {
     }
 }
 
-/// Lay out ports, the Helion-MM interconnect (when a Helion-MM slave
-/// exists), and the cores; route clk/resetn/interface nets orthogonally
-/// with one vertical trunk per net so lines never overlap.
+/// Lay out what `helion_bd::emit_system` instantiated: input ports, the
+/// Helion-MM master cell, the interconnect (only when the HDL has one), and
+/// the remaining cells; route clk/resetn/interface nets orthogonally with one
+/// trunk per net. Unconnected cells draw their pins without wires (their
+/// pins are top-level ports in the HDL).
 pub fn drawing(ip: &IpState) -> BdDrawing {
     let Some(bd) = &ip.bd else {
         return BdDrawing::default();
     };
-    let cores: Vec<(String, String)> = bd
-        .cores
-        .iter()
-        .map(|n| {
-            let bus = ip.core(n).map(|c| c.bus.clone()).unwrap_or_default();
-            (n.clone(), bus)
-        })
-        .collect();
-    let has_hub = cores.iter().any(|(_, b)| b == "Helion-MM");
+    let emit = bd.emit.as_ref().ok();
+    let ic = emit.and_then(|e| e.interconnect.clone());
+    let ext_master = ic.as_ref().is_some_and(|i| i.master.is_none());
+    let any_connected = bd.sys.cells.iter().any(|c| c.connected);
     let top = MARGIN + TITLE_H;
-    let hub_x = MARGIN + PORT_W + COL_GAP;
-    let clk_y = top + 20.0;
-    let rst_y = top + 44.0;
     let mut symbols = Vec::new();
-    for (name, y) in [("clk", clk_y), ("resetn", rst_y)] {
+    // Column 0: design input ports.
+    let mut port_names: Vec<&str> = Vec::new();
+    if any_connected {
+        port_names.extend(["clk", "resetn"]);
+    }
+    if ext_master {
+        port_names.push("s_mm");
+    }
+    for (i, name) in port_names.iter().enumerate() {
+        let y = top + 20.0 + i as f32 * 24.0;
         symbols.push(BdSymbol {
-            name: name.into(),
+            name: (*name).into(),
             kind: SymKind::Port,
             core: String::new(),
             bus: String::new(),
@@ -136,53 +139,92 @@ pub fn drawing(ip: &IpState) -> BdDrawing {
             y: y - PORT_H / 2.0,
             w: PORT_W,
             h: PORT_H,
-            pins: vec![pin(name, false, true, MARGIN + PORT_W + STUB, y)],
+            pins: vec![pin(name, *name == "s_mm", true, MARGIN + PORT_W + STUB, y)],
         });
     }
-    if has_hub {
-        symbols.push(BdSymbol {
-            name: "mm_interconnect".into(),
-            kind: SymKind::Interconnect,
-            core: String::new(),
-            bus: "Helion-MM".into(),
-            x: hub_x,
-            y: top,
-            w: HUB_W,
-            h: HUB_H,
-            pins: vec![
-                pin("clk", false, false, hub_x - STUB, clk_y),
-                pin("resetn", false, false, hub_x - STUB, rst_y),
-                pin("clk", false, true, hub_x + HUB_W + STUB, clk_y),
-                pin("resetn", false, true, hub_x + HUB_W + STUB, rst_y),
-                pin("M_MM", true, true, hub_x + HUB_W + STUB, top + 66.0),
-            ],
-        });
-    }
-    let core_x = if has_hub {
-        hub_x + HUB_W + COL_GAP
-    } else {
-        hub_x
+    let mut x = MARGIN + PORT_W + COL_GAP;
+    let cell_h = |c: &helion_bd::SysCell| -> f32 {
+        let left = 2 + usize::from(c.role() == Some(helion_ipxact::MmRole::Slave));
+        let right = ext_pins(c).len().min(MAX_EXT) + usize::from(ext_pins(c).len() > MAX_EXT)
+            + usize::from(c.role() == Some(helion_ipxact::MmRole::Master));
+        (left.max(right) as f32 * 16.0 + 18.0).max(CORE_H)
     };
-    for (i, (name, bus)) in cores.iter().enumerate() {
-        let y = top + i as f32 * (CORE_H + TITLE_H + ROW_GAP);
-        let iface = if bus == "Helion-ST" { "S_ST" } else { "S_MM" };
-        symbols.push(BdSymbol {
-            name: format!("u_{name}"),
+    let core_sym = |c: &helion_bd::SysCell, x: f32, y: f32| -> BdSymbol {
+        let h = cell_h(c);
+        let mut pins = Vec::new();
+        let mut ly = y + 16.0;
+        for p in ["clk", "resetn"] {
+            if c.model.module.port(p).is_some() {
+                pins.push(pin(p, false, false, x - STUB, ly));
+                ly += 16.0;
+            }
+        }
+        if c.role() == Some(helion_ipxact::MmRole::Slave) {
+            pins.push(pin("S_MM", true, false, x - STUB, ly));
+        }
+        let mut ry = y + 16.0;
+        if c.role() == Some(helion_ipxact::MmRole::Master) {
+            pins.push(pin("M_MM", true, true, x + CORE_W + STUB, ry));
+            ry += 16.0;
+        }
+        let ext = ext_pins(c);
+        for e in ext.iter().take(MAX_EXT) {
+            pins.push(pin(e, false, true, x + CORE_W + STUB, ry));
+            ry += 16.0;
+        }
+        if ext.len() > MAX_EXT {
+            pins.push(pin(&format!("+{} more", ext.len() - MAX_EXT), false, true, x + CORE_W + STUB, ry));
+        }
+        BdSymbol {
+            name: c.inst.clone(),
             kind: SymKind::Core,
-            core: name.clone(),
-            bus: bus.clone(),
-            x: core_x,
+            core: c.model.core.name.clone(),
+            bus: c.model.core.bus.clone(),
+            x,
             y,
             w: CORE_W,
-            h: CORE_H,
+            h,
+            pins,
+        }
+    };
+    // Column 1: the bus master (processor) when connected.
+    let master = ic.as_ref().and_then(|i| i.master.clone());
+    if let Some(m) = master.as_ref().and_then(|m| bd.sys.cell(m)) {
+        symbols.push(core_sym(m, x, top));
+        x += CORE_W + COL_GAP;
+    }
+    // Column 2: the interconnect the HDL instantiates.
+    let hub_h = HUB_H.max(32.0 + 16.0 * 2.0);
+    if let Some(i) = &ic {
+        symbols.push(BdSymbol {
+            name: i.inst.clone(),
+            kind: SymKind::Interconnect,
+            core: i.module.clone(),
+            bus: "Helion-MM".into(),
+            x,
+            y: top,
+            w: HUB_W,
+            h: hub_h,
             pins: vec![
-                pin("clk", false, false, core_x - STUB, y + 16.0),
-                pin("resetn", false, false, core_x - STUB, y + 32.0),
-                pin(iface, true, false, core_x - STUB, y + 48.0),
+                pin("clk", false, false, x - STUB, top + 16.0),
+                pin("resetn", false, false, x - STUB, top + 32.0),
+                pin("S_MM", true, false, x - STUB, top + 48.0),
+                pin("M_MM", true, true, x + HUB_W + STUB, top + 48.0),
             ],
         });
+        x += HUB_W + COL_GAP;
     }
-    // Route: ports -> hub (straight), then hub (or ports) -> each core.
+    // Column 3: every other cell, stacked.
+    let mut y = top;
+    for c in &bd.sys.cells {
+        if Some(&c.inst) == master.as_ref() {
+            continue;
+        }
+        let sym = core_sym(c, x, y);
+        y += sym.h + TITLE_H + ROW_GAP;
+        symbols.push(sym);
+    }
+    // Wires.
     let mut wires = Vec::new();
     let find = |name: &str| symbols.iter().find(|s| s.name == name);
     let route = |a: (f32, f32), b: (f32, f32), trunk: f32| -> Vec<[f32; 2]> {
@@ -192,56 +234,68 @@ pub fn drawing(ip: &IpState) -> BdDrawing {
             vec![[a.0, a.1], [trunk, a.1], [trunk, b.1], [b.0, b.1]]
         }
     };
-    let hub = find("mm_interconnect").cloned();
+    let mut nets = 0;
+    let connected: Vec<&str> = bd
+        .sys
+        .cells
+        .iter()
+        .filter(|c| c.connected)
+        .map(|c| c.inst.as_str())
+        .collect();
     for (net, offset) in [("clk", 16.0), ("resetn", 30.0)] {
-        let port = find(net).cloned().expect("port symbol");
-        let port_tip = port.pin(net, true).expect("port pin");
-        let src = match &hub {
-            Some(h) => {
-                let dst = h.pin(net, false).expect("hub input");
+        let Some(tip) = find(net).and_then(|p| p.pin(net, true)) else {
+            continue;
+        };
+        nets += 1;
+        let targets = symbols
+            .iter()
+            .filter(|s| s.kind == SymKind::Interconnect || connected.contains(&s.name.as_str()));
+        for t in targets {
+            if let Some(dst) = t.pin(net, false) {
                 wires.push(BdWire {
                     net: net.into(),
                     iface: false,
-                    src: port.name.clone(),
-                    dst: h.name.clone(),
-                    pts: route(port_tip, dst, port_tip.0 + offset),
+                    src: net.into(),
+                    dst: t.name.clone(),
+                    pts: route(tip, dst, tip.0 + offset),
                 });
-                (h.name.clone(), h.pin(net, true).expect("hub output"))
             }
-            None => (port.name.clone(), port_tip),
-        };
-        for c in symbols.iter().filter(|s| s.kind == SymKind::Core) {
-            let dst = c.pin(net, false).expect("core pin");
-            wires.push(BdWire {
-                net: net.into(),
-                iface: false,
-                src: src.0.clone(),
-                dst: c.name.clone(),
-                pts: route(src.1, dst, src.1.0 + offset),
-            });
         }
     }
-    let mut nets = 2;
-    if let Some(h) = &hub {
-        let m = h.pin("M_MM", true).expect("hub master");
-        for c in symbols
-            .iter()
-            .filter(|s| s.kind == SymKind::Core && s.bus == "Helion-MM")
-        {
-            let dst = c.pin("S_MM", false).expect("slave pin");
+    if let Some(i) = &ic {
+        let hub = find(&i.inst).cloned().expect("hub symbol");
+        let s_in = hub.pin("S_MM", false).expect("hub S_MM");
+        let src = match &master {
+            Some(m) => find(m).and_then(|s| s.pin("M_MM", true)).map(|p| (m.clone(), p)),
+            None => find("s_mm").and_then(|s| s.pin("s_mm", true)).map(|p| ("s_mm".to_string(), p)),
+        };
+        if let Some((name, tip)) = src {
             wires.push(BdWire {
-                net: format!("{}_mm", c.name),
+                net: "mm_master".into(),
                 iface: true,
-                src: h.name.clone(),
-                dst: c.name.clone(),
-                pts: route(m, dst, m.0 + 44.0),
+                src: name,
+                dst: hub.name.clone(),
+                pts: route(tip, s_in, s_in.0 - 24.0),
             });
             nets += 1;
+        }
+        let m = hub.pin("M_MM", true).expect("hub M_MM");
+        for sl in &i.slaves {
+            if let Some(dst) = find(&sl.inst).and_then(|s| s.pin("S_MM", false)) {
+                wires.push(BdWire {
+                    net: format!("{}_mm", sl.inst),
+                    iface: true,
+                    src: hub.name.clone(),
+                    dst: sl.inst.clone(),
+                    pts: route(m, dst, m.0 + 28.0),
+                });
+                nets += 1;
+            }
         }
     }
     let w = symbols
         .iter()
-        .map(|s| s.x + s.w + MARGIN)
+        .map(|s| s.x + s.w + MARGIN + 90.0)
         .fold(320.0f32, f32::max);
     let h = symbols
         .iter()
@@ -255,6 +309,21 @@ pub fn drawing(ip: &IpState) -> BdDrawing {
         h,
     }
 }
+
+/// Right-side pins a cell exports (non clock/reset, non Helion-MM bus).
+fn ext_pins(c: &helion_bd::SysCell) -> Vec<String> {
+    c.model
+        .module
+        .ports
+        .iter()
+        .filter(|p| !helion_ipxact::is_clock_or_reset(&p.name))
+        .filter(|p| c.role().is_none() || !helion_ipxact::is_mm_signal(&p.name))
+        .map(|p| p.name.clone())
+        .collect()
+}
+
+/// Exported pins drawn per cell before collapsing into `+N more`.
+const MAX_EXT: usize = 4;
 
 // ---- canvas view ----
 
@@ -323,7 +392,8 @@ fn symbol_nodes(s: &AppState, sy: &BdSymbol, t: &VivadoTheme) -> Vec<El> {
                 .child(text(sy.name.clone()).font(FONT_PIN.mono()).color(t.text)),
         ];
     }
-    let selected = sy.kind == SymKind::Core && s.ip.selected.as_deref() == Some(sy.core.as_str());
+    let selected =
+        sy.kind == SymKind::Core && s.ip.selected_cell.as_deref() == Some(sy.name.as_str());
     let caption = if sy.kind == SymKind::Interconnect {
         "Helion-MM".to_string()
     } else {
@@ -379,15 +449,20 @@ fn symbol_nodes(s: &AppState, sy: &BdSymbol, t: &VivadoTheme) -> Vec<El> {
             ),
     );
     if sy.kind == SymKind::Core {
-        let core = sy.core.clone();
+        let inst = sy.name.clone();
+        let inst2 = sy.name.clone();
         node = node
             .role("button")
             .label(format!("{} ({})", sy.name, sy.core))
+            .description("Double-click to customize")
             .focus_selected(selected)
             .focusable(true)
             .hover(t.selection)
             .on_press(move |s: &mut AppState| {
-                let _ = select_ip(s, &core);
+                let _ = select_cell(s, &inst);
+            })
+            .on_double_press(move |s: &mut AppState| {
+                let _ = open_customize(s, &inst2);
             });
     }
     vec![

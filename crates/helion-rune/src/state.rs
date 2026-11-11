@@ -1082,6 +1082,10 @@ pub struct AppState {
     pub program: crate::views::program::ProgramState,
     /// IP Catalog + Block Design state (catalog, selection, BD, outputs).
     pub ip: crate::views::ip::IpState,
+    /// High-Level Synthesis pane (kernel, directives, synth/cosim results).
+    pub hls: crate::views::hls::HlsState,
+    /// Export Hardware / Archive Project dialog drafts.
+    pub handoff: crate::views::handoff::HandoffState,
     /// Find Results state (query, scopes, selected hit).
     pub find: crate::views::find::FindState,
     /// Settings dialog + New Project / Constraints wizard UI state.
@@ -1164,6 +1168,9 @@ pub enum CenterPane {
     Dfx,
     /// Code coverage of the last testbench run.
     Coverage,
+    /// High-Level Synthesis: C/C++ kernel, directives, C synthesis report,
+    /// generated RTL, C/RTL co-simulation.
+    Hls,
 }
 
 /// Status-bar verb. Typed, with the exact Helion wording in one place.
@@ -1310,6 +1317,8 @@ impl AppState {
             ila: crate::views::ila::IlaState::default(),
             program: crate::views::program::ProgramState::default(),
             ip: crate::views::ip::IpState::default(),
+            hls: crate::views::hls::HlsState::default(),
+            handoff: crate::views::handoff::HandoffState::default(),
             find: crate::views::find::FindState::default(),
             dialogs: crate::views::dialogs::DialogState::default(),
             center: CenterPane::Summary,
