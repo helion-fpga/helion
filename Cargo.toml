@@ -31,6 +31,7 @@ members = [
     "crates/helion-targets",
     "crates/helion-rune",
     "crates/helion-verif",
+    "crates/helion-svtb",
 ]
 # Vendored Rune UI framework (its own workspace; see scripts/sync-rune.sh).
 exclude = ["third_party"]
@@ -60,6 +61,7 @@ helion-sim = { path = "crates/helion-sim" }
 helion-ipxact = { path = "crates/helion-ipxact" }
 helion-bd = { path = "crates/helion-bd" }
 helion-proj = { path = "crates/helion-proj" }
+helion-svtb = { path = "crates/helion-svtb" }
 helion-gui = { path = "crates/helion-gui" }
 helion-lab = { path = "crates/helion-lab" }
 helion-verif = { path = "crates/helion-verif" }

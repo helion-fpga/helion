@@ -2071,6 +2071,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "helion-svtb"
+version = "3.0.0"
+dependencies = [
+ "helion-ir",
+ "helion-sim",
+ "helion-sv",
+]
+
+[[package]]
 name = "helion-targets"
 version = "3.0.0"
 dependencies = [
@@ -2090,6 +2099,7 @@ dependencies = [
  "helion-ir",
  "helion-sim",
  "helion-sv",
+ "helion-svtb",
  "helion-vhdl",
  "serde",
  "serde_json",

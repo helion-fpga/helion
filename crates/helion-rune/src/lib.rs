@@ -495,6 +495,18 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         // The fixture's run toasts would cover the history table.
         s.toasts = state::ToastState::default();
     }),
+    ("sim-uvm", |s| {
+        s.center = state::CenterPane::Sim;
+        // examples/uvm_counter against examples/counter.sv (passes).
+        let _ = views::tb_uvm::seed_uvm_fixture(s, false);
+        s.toasts = state::ToastState::default();
+    }),
+    ("sim-uvm-fail", |s| {
+        s.center = state::CenterPane::Sim;
+        // Same environment against a broken counter (scoreboard errors).
+        let _ = views::tb_uvm::seed_uvm_fixture(s, true);
+        s.toasts = state::ToastState::default();
+    }),
     ("ila", |s| {
         s.center = state::CenterPane::Ila;
         let _ = views::ila::seed_ila_fixture(s);
@@ -854,6 +866,26 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
     }),
     ("coverage-empty", |s| {
         s.center = state::CenterPane::Coverage;
+    }),
+    ("coverage-dut", |s| {
+        s.center = state::CenterPane::Coverage;
+        views::coverage_dut::seed_fixture(s);
+        s.coverage.tab = views::coverage::CovTab::DutLines;
+    }),
+    ("coverage-dut-light", |s| {
+        s.center = state::CenterPane::Coverage;
+        s.theme = theme::ThemeMode::Light;
+        views::coverage_dut::seed_fixture(s);
+        s.coverage.tab = views::coverage::CovTab::DutBranches;
+    }),
+    ("coverage-dut-gutter", |s| {
+        views::coverage_dut::seed_fixture(s);
+        views::coverage_dut::open_dut(s);
+    }),
+    ("coverage-dut-gutter-light", |s| {
+        s.theme = theme::ThemeMode::Light;
+        views::coverage_dut::seed_fixture(s);
+        views::coverage_dut::open_dut(s);
     }),
     ("runs-ooc", |s| {
         s.console.tab = views::console::ConsoleTab::DesignRuns;

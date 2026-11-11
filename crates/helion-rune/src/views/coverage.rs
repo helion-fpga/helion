@@ -2,17 +2,19 @@
 //!
 //! Engine: `helion_verif::tb::TbCoverage`, collected by `run_testbench`:
 //! testbench statement (line) and `if`/`assert` branch coverage from the
-//! interpreter, plus the DUT's netlist-level toggle, branch (mux select /
-//! flip-flop enable) and FSM coverage from the `helion-sim` kernel. The
-//! editor gutter colors executed / missed testbench lines when the overlay
-//! is on ([`line_hits`]). DUT *line* coverage is not offered: the DUT is
-//! simulated as a synthesized netlist without source-line attribution.
+//! interpreter, the DUT's netlist-level toggle, branch (mux select /
+//! flip-flop enable) and FSM coverage from the `helion-sim` kernel, and the
+//! DUT's RTL line / `if`-`case` arm coverage from line probes synthesized
+//! into the simulated netlist (see [`crate::views::coverage_dut`]). With the
+//! overlay on, the editor gutter colors executed / missed testbench and DUT
+//! lines ([`gutter_mark`]); partially covered DUT branches show amber.
 
 use rune::{El, col, el, row};
 
 use crate::state::{AppState, CenterPane};
 use crate::theme::VivadoTheme;
 use crate::views::cad;
+use crate::views::coverage_dut::{self as dut, GutterMark, MarkState};
 use crate::views::report_kit::{self as kit, header_row, num_cell, plain_row, select_row, table};
 use crate::views::sources::pane_header;
 use helion_verif::tb::TbCoverage;
@@ -24,6 +26,8 @@ pub enum CovTab {
     #[default]
     Lines,
     Branches,
+    DutLines,
+    DutBranches,
     Toggles,
     Fsm,
 }
@@ -62,6 +66,27 @@ pub fn line_hits(s: &AppState, line: usize) -> Option<u64> {
     c.lines.iter().find(|(l, _)| *l == line).map(|(_, n)| *n)
 }
 
+/// Gutter coverage mark of 1-based `line` in the active editor file when the
+/// overlay is on: testbench lines from the interpreter, DUT lines and
+/// branches from the RTL line probes (`None` for lines without coverage).
+pub fn gutter_mark(s: &AppState, line: usize) -> Option<GutterMark> {
+    if !s.coverage.overlay {
+        return None;
+    }
+    let (_, c) = latest(s)?;
+    let tab = s.editor.tabs.get(s.editor.active)?;
+    let path = s.editor.paths.get(tab)?;
+    if path == &c.tb_file {
+        let h = c.lines.iter().find(|(l, _)| *l == line).map(|(_, n)| *n)?;
+        return Some(if h == 0 {
+            GutterMark { state: MarkState::Missed, help: "Not executed in the last testbench run".into() }
+        } else {
+            GutterMark { state: MarkState::Hit, help: format!("Executed {h}× in the last testbench run") }
+        });
+    }
+    dut::dut_mark(c, path, line)
+}
+
 fn pct_color(p: f64, t: &VivadoTheme) -> rune::Color {
     if p >= 90.0 {
         t.pass
@@ -95,6 +120,7 @@ fn kpis(c: &TbCoverage, t: &VivadoTheme) -> El {
         } else {
             cad::kpi("cov-kpi-dutbranch", "DUT mux / enable", format!("{:.1}%", d.branch_coverage_pct()), pct_color(d.branch_coverage_pct(), t), format!("{} conditions", d.branches.len()), t)
         })
+        .children(dut::kpis(c, t, pct_color))
         .child(if d.fsms.is_empty() {
             cad::kpi("cov-kpi-fsm", "DUT FSM states", "n/a", t.text_faint, "no state registers", t)
         } else {
@@ -115,12 +141,7 @@ fn files(c: &TbCoverage, t: &VivadoTheme) -> El {
         .child(num_cell(format!("{}/{}", c.lines_hit(), c.lines.len()), 80.0, t.text))
         .child(num_cell(format!("{:.1}", c.line_pct()), 64.0, pct_color(c.line_pct(), t)))
         .child(el().w(150.0).child(kit::link("cov-open-tb", "Open with coverage", t, open_tb)));
-    let dut = plain_row("cov-file-dut")
-        .child(kit::text_cell(c.dut_file.display().to_string(), 1.0, t.text))
-        .child(kit::fixed_cell("Netlist toggle / FSM", 150.0, t.text_dim))
-        .child(num_cell("n/a", 80.0, t.text_faint).help("The DUT simulates as a synthesized netlist; cells carry no source lines."))
-        .child(num_cell(format!("{:.1}", c.dut.toggle_bin_coverage_pct()), 64.0, pct_color(c.dut.toggle_bin_coverage_pct(), t)))
-        .child(el().w(150.0));
+    let dut = dut::file_row(c, t, pct_color);
     table(head, col().w_full().child(tb).child(dut), t).key("cov-files")
 }
 
@@ -183,6 +204,8 @@ fn tab_body(s: &AppState, c: &TbCoverage, t: &VivadoTheme) -> El {
             }
             table(head, body, t)
         }
+        CovTab::DutLines => dut::lines_tab(c, t),
+        CovTab::DutBranches => dut::branches_tab(c, t),
         CovTab::Toggles => {
             let mut nets: Vec<_> = c.dut.net_toggles.iter().collect();
             nets.sort_by_key(|n| (n.bins_hit(), n.net.clone()));
@@ -250,6 +273,8 @@ pub fn coverage_pane(s: &AppState, t: &VivadoTheme) -> El {
             for (k, label, tab) in [
                 ("cov-tab-lines", "Statements", CovTab::Lines),
                 ("cov-tab-branches", "Branches", CovTab::Branches),
+                ("cov-tab-dutlines", "DUT Lines", CovTab::DutLines),
+                ("cov-tab-dutbranches", "DUT Branches", CovTab::DutBranches),
                 ("cov-tab-toggles", "Toggles", CovTab::Toggles),
                 ("cov-tab-fsm", "FSM", CovTab::Fsm),
             ] {
