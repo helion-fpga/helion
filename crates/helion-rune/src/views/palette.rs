@@ -152,6 +152,7 @@ fn pane_label(pane: CenterPane) -> &'static str {
         CenterPane::Constraints => "Timing Constraints",
         CenterPane::Eco => "ECO",
         CenterPane::Dfx => "Partial Reconfiguration",
+        CenterPane::Coverage => "Code Coverage",
     }
 }
 

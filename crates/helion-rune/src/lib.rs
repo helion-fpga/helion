@@ -656,6 +656,18 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         views::reports::demo_impl_complete(s);
         views::eco::scene_fill(s);
     }),
+    ("coverage", |s| {
+        s.center = state::CenterPane::Coverage;
+        views::tb::seed_coverage_fixture(s);
+    }),
+    ("coverage-empty", |s| {
+        s.center = state::CenterPane::Coverage;
+    }),
+    ("runs-ooc", |s| {
+        s.console.tab = views::console::ConsoleTab::DesignRuns;
+        s.layout.console_h = 520.0;
+        views::ooc::scene_fill(s);
+    }),
     ("dfx", |s| {
         s.center = state::CenterPane::Dfx;
         views::dfx::scene_fill(s);
@@ -1133,6 +1145,7 @@ fn center_pane(s: &AppState, t: &VivadoTheme) -> El {
         state::CenterPane::Constraints => views::constraints::constraints_pane(s, t),
         state::CenterPane::Eco => views::eco::eco_pane(s, t),
         state::CenterPane::Dfx => views::dfx::dfx_pane(s, t),
+        state::CenterPane::Coverage => views::coverage::coverage_pane(s, t),
     }
 }
 

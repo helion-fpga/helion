@@ -264,6 +264,8 @@ pub struct RunArtifacts {
     /// Incremental reuse report (`ReuseReport::text`) when the run placed
     /// against a reference checkpoint.
     pub reuse: Option<String>,
+    /// Out-of-context modules the run synthesized or restored.
+    pub ooc: Vec<crate::views::ooc::OocRow>,
 }
 
 /// The live worker handle: its event channel plus the cancel flag the
@@ -567,6 +569,8 @@ pub fn start_run_spec(
     // Floorplan: the open project's ranged pblocks steer placement.
     let pblocks: Vec<helion_proj::PrjPblock> =
         s.device.pblocks.iter().filter(|p| p.ranged).cloned().collect();
+    let ooc: Vec<String> = s.ooc.enabled.iter().cloned().collect();
+    let ooc_cache = crate::views::ooc::cache_dir(s);
     let kind = spec.kind;
     let strategy = spec.strategy.clone();
     let incremental = spec.incremental.clone();
@@ -591,6 +595,8 @@ pub fn start_run_spec(
                     checkpoint: ckpt,
                     incremental,
                     pblocks,
+                    ooc,
+                    ooc_cache,
                 },
                 tx,
                 worker_cancel,
@@ -825,6 +831,9 @@ pub fn deliver(s: &mut AppState, kind: RunKind, event: RunEvent) {
 /// Apply a completed run's artifacts to the report/design views (the
 /// completion path and `Make active` share it).
 pub fn apply_artifacts(s: &mut AppState, art: RunArtifacts) {
+    for row in &art.ooc {
+        s.ooc.runs.insert(row.module.clone(), Ok(row.clone()));
+    }
     if art.analysis.is_some() {
         s.runs.analysis = art.analysis.clone();
     }
@@ -968,6 +977,9 @@ struct RunFiles {
     incremental: Option<PathBuf>,
     /// Ranged `.prj` pblocks the placer must honor.
     pblocks: Vec<helion_proj::PrjPblock>,
+    /// Modules synthesized out of context (cached) and stitched in.
+    ooc: Vec<String>,
+    ooc_cache: PathBuf,
 }
 
 fn run_worker(
@@ -984,6 +996,8 @@ fn run_worker(
         checkpoint,
         incremental,
         pblocks,
+        ooc,
+        ooc_cache,
     } = files;
     let send = |text: String, sev: MsgSev| {
         let _ = tx.send(RunEvent::Line { text, sev });
@@ -998,7 +1012,16 @@ fn run_worker(
 
     send(format!("open_source {}", source.display()), MsgSev::Info);
 
-    let mut design = match synth_source(&source) {
+    let mut ooc_rows = Vec::new();
+    let synthesized = if ooc.is_empty() {
+        synth_source(&source)
+    } else {
+        crate::views::ooc::synth_with_ooc(&source, &part_req, &ooc, &ooc_cache, &send).map(|(d, rows)| {
+            ooc_rows = rows;
+            d
+        })
+    };
+    let mut design = match synthesized {
         Ok(d) => {
             send(
                 format!(
@@ -1048,6 +1071,7 @@ fn run_worker(
     let (xdc, clks) = load_run_constraints(&source, &send);
     let mut art = RunArtifacts {
         cells: design.cells.len(),
+        ooc: ooc_rows,
         ..RunArtifacts::default()
     };
 
@@ -1599,6 +1623,30 @@ pub(crate) fn resolve_device(
                 format!("no Helion device model (tried {part_req}, {FALLBACK_PART}): {e}")
             })
         }
+    }
+}
+
+/// SystemVerilog files behind a run source: the `.prj`'s `.sv`/`.v`
+/// sources, else the file itself.
+pub(crate) fn rtl_files(source: &std::path::Path) -> Result<Vec<PathBuf>, String> {
+    if source.extension().is_some_and(|e| e.eq_ignore_ascii_case("prj")) {
+        let text = std::fs::read_to_string(source).map_err(|e| format!("{}: {e}", source.display()))?;
+        let prj = helion_proj::load_prj(&text)?;
+        let files: Vec<PathBuf> = prj
+            .sources
+            .iter()
+            .map(|f| helion_proj::resolve_prj_path(source, f))
+            .filter(|p| {
+                p.extension()
+                    .is_some_and(|e| matches!(e.to_string_lossy().to_ascii_lowercase().as_str(), "sv" | "v"))
+            })
+            .collect();
+        if files.is_empty() {
+            return Err("the project has no SystemVerilog sources".into());
+        }
+        Ok(files)
+    } else {
+        Ok(vec![source.to_path_buf()])
     }
 }
 
@@ -2595,6 +2643,7 @@ mod tests {
             analysis: None,
             checkpoint: None,
             reuse: None,
+            ooc: Vec::new(),
         };
         deliver(&mut s, RunKind::Synth, RunEvent::Finished(Ok(art)));
         assert_eq!(s.flow.synth, RunStatus::Complete);

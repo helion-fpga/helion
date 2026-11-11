@@ -1668,6 +1668,24 @@ pub const ALL: &[SceneExpect] = &[
         absent: &["summary", "eco-empty"],
     },
     SceneExpect {
+        name: "coverage",
+        surface: "coverage",
+        keys: &["cov-pane", "cov-summary", "cov-kpi-lines", "cov-kpi-toggle", "cov-files", "cov-open-tb", "cov-tabs", "cov-line-0"],
+        absent: &["summary", "cov-empty"],
+    },
+    SceneExpect {
+        name: "coverage-empty",
+        surface: "coverage",
+        keys: &["cov-pane", "cov-empty", "cov-open-sim"],
+        absent: &["summary", "cov-files"],
+    },
+    SceneExpect {
+        name: "runs-ooc",
+        surface: "console",
+        keys: &["runs-ooc", "runs-ooc-scan", "runs-ooc-row-0", "runs-ooc-row-1", "runs-ooc-toggle-1", "runs-ooc-run-1"],
+        absent: &[],
+    },
+    SceneExpect {
         name: "dfx",
         surface: "dfx",
         keys: &[
