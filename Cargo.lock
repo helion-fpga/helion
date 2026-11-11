@@ -2055,6 +2055,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "helion-verif"
+version = "3.0.0"
+dependencies = [
+ "helion-ir",
+ "helion-sim",
+ "helion-sv",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "helion-vhdl"
 version = "3.0.0"
 dependencies = [
