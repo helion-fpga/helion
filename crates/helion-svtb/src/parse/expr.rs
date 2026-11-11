@@ -423,6 +423,7 @@ impl Parser<'_> {
                 self.p += 2;
                 return self.parse_ident_primary("randomize".into(), loc).map(|e| match e {
                     Expr::Ident(_) => Expr::Ident("std::randomize".into()),
+                    Expr::Call { args, named, with, loc, .. } => Expr::Call { f: Box::new(Expr::Ident("std::randomize".into())), args, named, with, loc },
                     other => other,
                 });
             }
