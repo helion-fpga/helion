@@ -23,6 +23,7 @@ pub mod program;
 pub mod report_kit;
 pub mod reports;
 pub mod schematic;
+pub mod schematic_cone;
 pub mod sim_settings;
 pub mod sources;
 pub mod start;

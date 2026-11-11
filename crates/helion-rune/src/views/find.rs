@@ -230,6 +230,7 @@ pub fn select_hit(s: &mut AppState, hit: &FindHit) {
         }
         FindKind::Net => {
             s.device.selected = Some(DeviceSel::Net(hit.name.clone()));
+            s.schematic.selected = Some(SchemSel::Net(hit.name.clone()));
         }
         FindKind::Port => {
             s.schematic.selected = Some(SchemSel::Port(hit.name.clone()));
