@@ -798,6 +798,40 @@ impl Session {
         Ok(())
     }
 
+    /// Place the design honoring every ranged `.prj` pblock at once
+    /// ([`helion_place::place_with_regions`]): each pblock owns its
+    /// `add_cells_to_pblock` cells (an instance name owns every cell of that
+    /// instance), and a pblock with no cells owns the whole design.
+    /// Unranged pblocks are ignored (they have no rectangle yet).
+    pub fn place_design_with_pblocks(
+        &mut self,
+        dev: &Device,
+        opts: PlaceOpts,
+        pblocks: &[PrjPblock],
+    ) -> Result<Vec<helion_place::RegionStats>, String> {
+        let d = self.design.as_ref().ok_or("place_design: no design")?;
+        let regions = pblock_regions(d, pblocks);
+        if regions.is_empty() {
+            self.place_design_with(dev, opts)?;
+            return Ok(Vec::new());
+        }
+        let packed = pack(d, dev)?;
+        let (placed, stats) = helion_place::place_with_regions(
+            &packed,
+            dev,
+            opts,
+            &regions,
+            &helion_place::TimingGuide::default(),
+        )?;
+        self.packed = Some(packed);
+        self.placed = Some(placed);
+        self.routed = None;
+        self.bitstream = None;
+        self.place_opts = opts;
+        self.pblock = pblocks.iter().find(|p| p.ranged).cloned();
+        Ok(stats)
+    }
+
     /// Partial bitstream for Pblock sites (`helion-bits::bitgen_pblock`).
     pub fn write_pblock_bitstream(
         &self,
@@ -1531,6 +1565,34 @@ fn decode_impl_knobs(
         place_opts,
         route_opts,
     ))
+}
+
+/// Placer region constraints for the ranged `.prj` pblocks of `design`.
+/// A pblock member naming a hierarchy instance owns every cell flattened
+/// under it (`inst_*`, `inst.*`, `inst/*`).
+pub fn pblock_regions(design: &Design, pblocks: &[PrjPblock]) -> Vec<helion_place::RegionConstraint> {
+    let instances: std::collections::HashSet<String> = design
+        .instances
+        .iter()
+        .map(|i| resolve(i.name).to_string())
+        .collect();
+    pblocks
+        .iter()
+        .filter(|p| p.ranged)
+        .map(|p| {
+            let mut r = helion_place::RegionConstraint::new(p.name.clone(), p.x0, p.y0, p.x1, p.y1);
+            for c in &p.cells {
+                if instances.contains(c) {
+                    for sep in ["_", ".", "/"] {
+                        r.prefixes.push(format!("{c}{sep}"));
+                    }
+                } else {
+                    r.cells.push(c.clone());
+                }
+            }
+            r
+        })
+        .collect()
 }
 
 fn cell_listed_in_pblock(cells: &[String], names: &[&str]) -> bool {
@@ -3184,6 +3246,39 @@ create_pblock pblock_0
             def.blinky_hash(),
             "create_run RuntimeOpt must change the bitstream vs Default"
         );
+    }
+
+    #[test]
+    fn place_design_with_pblocks_honors_every_ranged_pblock() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let pb = |name: &str, x0, y0, x1, y1, cells: &[&str]| PrjPblock {
+            name: name.into(),
+            x0,
+            y0,
+            x1,
+            y1,
+            ranged: true,
+            cells: cells.iter().map(|c| c.to_string()).collect(),
+        };
+        let pblocks = vec![
+            pb("pb_lo", 1, 1, 2, 2, &["u_lut0", "u_lut1"]),
+            pb("pb_hi", 7, 7, 8, 8, &["u_lut3"]),
+            PrjPblock {
+                ranged: false,
+                ..pb("pb_unranged", 0, 0, 0, 0, &["u_lut2"])
+            },
+        ];
+        let mut s = Session::new(Mode::Project);
+        s.synth_design(Design::structural_counter());
+        let stats = s
+            .place_design_with_pblocks(&dev, ImplStrategy::Default.place_opts(), &pblocks)
+            .unwrap();
+        assert_eq!(stats.len(), 2, "unranged pblocks are skipped");
+        let regions = pblock_regions(s.design.as_ref().unwrap(), &pblocks);
+        let placed = s.placed.as_ref().unwrap();
+        assert!(helion_place::region_violations(placed, &regions).is_empty());
+        s.route_design(&dev).unwrap();
+        s.write_bitstream(&dev).unwrap();
     }
 
     #[test]

@@ -760,6 +760,13 @@ fn plio_rule(id: &str) -> Option<RuleDefinition> {
             "# Connect driver to IOB {<OBJ>}",
             "Drive top-level output ports from a valid internal LUT or flip-flop.",
         ),
+        "PBLK-1" => (
+            DrcSeverity::Error,
+            "Pblock member placed outside its region",
+            "A cell assigned to a Pblock (`add_cells_to_pblock`) sits on a site outside the Pblock rectangle.",
+            "resize_pblock <PBLOCK> -add CLB_XaYb:CLB_XcYd\nplace_design",
+            "Grow the Pblock to fit its cells, or remove cells from it, then re-run placement.",
+        ),
         "DSP-1" | "BRAM-1" | "IOB-1" => (
             DrcSeverity::Error,
             "Site placement count mismatch",
