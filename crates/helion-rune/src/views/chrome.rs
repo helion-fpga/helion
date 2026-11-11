@@ -98,6 +98,10 @@ enum MenuAct {
     ToggleFocus,
     Docs,
     About,
+    GotoDefinition,
+    ToggleBookmark,
+    NextBookmark,
+    ToggleOutline,
 }
 
 /// One dropdown row: a dispatchable item, a caps section caption, or a rule.
@@ -240,6 +244,11 @@ fn menu_rows(id: MenuId, s: &AppState) -> Vec<MenuRow> {
                 "⇧⌘F",
                 A::Nav(CenterPane::Find),
             ),
+            Sep,
+            hot("Go to Definition", "goto_definition", "F12", A::GotoDefinition),
+            item("Toggle Bookmark", "bookmark", A::ToggleBookmark),
+            hot("Next Bookmark", "next_bookmark", "F2", A::NextBookmark),
+            Sep,
             hot(
                 "Go to File…",
                 "palette_files",
@@ -456,6 +465,13 @@ fn menu_rows(id: MenuId, s: &AppState) -> Vec<MenuRow> {
                 "Hardware Manager",
                 "show_view Program",
                 A::Nav(CenterPane::Program),
+            ),
+            Sep,
+            check(
+                "Symbol Outline",
+                "toggle_outline",
+                A::ToggleOutline,
+                s.editor.outline_open,
             ),
             Sep,
             Caption("THEME"),
@@ -1214,6 +1230,23 @@ fn dispatch_menu(s: &mut AppState, tcl: &'static str, act: MenuAct, tx: &mut Tx)
             }
         }
         MenuAct::About => s.chrome.about_open = true,
+        MenuAct::GotoDefinition => {
+            s.navigate(CenterPane::Editor);
+            crate::views::editor_outline::goto_definition_ui(s, tx);
+        }
+        MenuAct::ToggleBookmark => {
+            s.navigate(CenterPane::Editor);
+            let line = s.editor.cursor_line;
+            crate::views::editor_diag::toggle_bookmark(s, line);
+        }
+        MenuAct::NextBookmark => {
+            s.navigate(CenterPane::Editor);
+            crate::views::editor::goto_next_bookmark(s, tx);
+        }
+        MenuAct::ToggleOutline => {
+            s.navigate(CenterPane::Editor);
+            s.editor.outline_open = !s.editor.outline_open;
+        }
     }
 }
 
@@ -2092,8 +2125,9 @@ mod tests {
             "View dropdown must mount"
         );
         // Start, Summary, rule, 7 design views, rule, 4 sim views, rule,
-        // 3 hardware views, rule, THEME caption: Light 21, Dark 22, System 23.
-        tap(&mut rt, "menu-view-item22");
+        // 3 hardware views, rule, Symbol Outline, rule, THEME caption:
+        // Light 23, Dark 24, System 25.
+        tap(&mut rt, "menu-view-item24");
         assert_eq!(rt.state.theme, ThemeMode::Dark, "Dark Theme pins dark");
         assert_eq!(rt.state.chrome.open_menu, None);
         assert!(
@@ -2105,10 +2139,10 @@ mod tests {
             "theme pin must echo its Tcl verb"
         );
         tap(&mut rt, "menu-view");
-        tap(&mut rt, "menu-view-item21");
+        tap(&mut rt, "menu-view-item23");
         assert_eq!(rt.state.theme, ThemeMode::Light, "Light Theme pins light");
         tap(&mut rt, "menu-view");
-        tap(&mut rt, "menu-view-item23");
+        tap(&mut rt, "menu-view-item25");
         assert_eq!(
             rt.state.theme,
             ThemeMode::System,

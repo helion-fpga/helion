@@ -1439,12 +1439,71 @@ pub(crate) fn load_ctx_constraints(
     load_run_constraints(&ctx.source, emit)
 }
 
+/// Constraint files a `.prj` run input declares, resolved like its sources
+/// and filtered to files that exist. `None` for non-`.prj` inputs.
+fn prj_constraint_files(source: &std::path::Path) -> Option<Vec<PathBuf>> {
+    if !source
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("prj"))
+    {
+        return None;
+    }
+    let text = std::fs::read_to_string(source).ok()?;
+    let prj = crate::pickers::load_prj_lenient(&text).ok()?;
+    let src = source.to_path_buf();
+    Some(
+        prj.constraint_files
+            .iter()
+            .chain(prj.sdc.iter())
+            .map(|c| helion_proj::resolve_prj_path(&src, c))
+            .filter(|p| p.is_file())
+            .collect(),
+    )
+}
+
 pub(crate) fn load_run_constraints(
     source: &PathBuf,
     emit: &impl Fn(String, MsgSev),
 ) -> (helion_sta::Constraints, Vec<helion_sta::Clock>) {
     let mut xdc = helion_sta::Constraints::default();
+    // A `.prj` declares its constraint files (`read_xdc`/`read_sdc`); load
+    // those together. Otherwise use the source's sibling .sdc/.xdc.
+    if let Some(files) = prj_constraint_files(source)
+        && !files.is_empty()
+    {
+        let mut text = String::new();
+        for f in &files {
+            match std::fs::read_to_string(f) {
+                Ok(t) => {
+                    text.push_str(&t);
+                    text.push('\n');
+                }
+                Err(e) => emit(
+                    format!("WARN: read_xdc {} skipped: {e}", f.display()),
+                    MsgSev::Warn,
+                ),
+            }
+        }
+        match helion_sta::load_xdc(&text) {
+            Ok(c) => {
+                let n = c.clocks.len();
+                xdc = c;
+                let names: Vec<String> = files.iter().map(|f| f.display().to_string()).collect();
+                emit(
+                    format!("read_xdc {} clocks={n}", names.join(" ")),
+                    MsgSev::Info,
+                );
+            }
+            Err(e) => emit(
+                format!("WARN: project constraints skipped: {e}"),
+                MsgSev::Warn,
+            ),
+        }
+    }
     for ext in ["sdc", "xdc"] {
+        if !xdc.clocks.is_empty() {
+            break;
+        }
         let cand = source.with_extension(ext);
         if cand.is_file() {
             match std::fs::read_to_string(&cand)
@@ -2273,6 +2332,23 @@ pub(crate) fn drc_item_from(v: &helion_drc::DrcViolation) -> DrcItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prj_constraints_are_read_from_the_project_file() {
+        let dir = std::env::temp_dir().join(format!("helion-prjc-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("c")).unwrap();
+        std::fs::write(dir.join("top.sv"), "module top(input clk); endmodule\n").unwrap();
+        std::fs::write(
+            dir.join("c/timing.xdc"),
+            "create_clock -name sysclk -period 8 [get_ports clk]\n",
+        )
+        .unwrap();
+        let prj = dir.join("p.prj");
+        std::fs::write(&prj, "part HL10T-C32-1\nread_sv top.sv\nread_xdc c/timing.xdc\n").unwrap();
+        let (xdc, _) = load_run_constraints(&prj, &|_, _| {});
+        assert_eq!(xdc.clocks.len(), 1, "the .prj's read_xdc file is honored");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn impl_strategy_labels_map_to_real_presets() {

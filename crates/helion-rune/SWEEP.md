@@ -29,16 +29,22 @@ with tests, keep `cargo test -p helion-rune` green, rebuild + relaunch.
 
 ## Remaining gaps
 
-- Device: pblocks are floorplan constraints only (runs do not place into
-  them yet); no clock-region layer/table (no HAD region model).
-- Design Runs: ECO changes table (runs keep no persistent session; the
-  console `eco` verb covers the backend's single ECO).
-- Constraints wizard: multi-row steps, generated clocks, write-to-disk +
-  re-run timing comparison.
-- Editor: very large files build one gutter row per line (no
-  virtualization yet); no outline/minimap/go-to-definition.
-- Re-analysis (`analysis.rs`) and Tcl `program_hw` run on the UI thread.
-- Program over openFPGALoader/FTDI is wired but untested on a board.
+- Device: pblocks are floorplan constraints only (the run worker does not
+  place into them yet); no clock-region layer/table (no HAD region model);
+  no pblock delete (the `.prj` format has no delete command).
+- Design Runs: no ECO changes table (runs keep no persistent session; the
+  console `eco` verb covers the backend's single ECO). Checkpoints live
+  under the temp dir. helion-proj bug: reopening a seeded `.hckp` resets
+  the seed to 0 and fails its hash check.
+- Waveform tools (decoders, analog, virtual bus) need real simulation
+  traces; they are disabled on the demo fixture.
+- Editor large-file mode (>1500 lines): long lines truncate instead of
+  scrolling sideways; a row click restores the previous column.
+- VHDL diagnostics are rare (the VHDL frontend reports few errors).
+- Program over openFPGALoader/FTDI is wired but untested on a board; no
+  STAT readback over openFPGALoader.
+- Re-analysis reads the last run's design: the Constraints Wizard's
+  re-run needs a Synthesis/Implementation run first.
 
 ## Pass log
 
@@ -138,3 +144,13 @@ with tests, keep `cargo test -p helion-rune` green, rebuild + relaunch.
   `.prj`), rulers, canvas keys, Zoom to Selection, real Fit, I/O quick-set
   and Placed/Objects columns. Scenes `schematic-cone`, `device-heat`,
   `device-pblocks`, `device-io-quickset`.
+- Pass 10 (round two, merged): schematic cones/history/find/fit + mark
+  debug; device site/heat-map/pblock/ruler layers, pblock table, canvas
+  keys, I/O quick-set; waveform fixed-point/analog, SPI/UART/AXI-Lite/FSM
+  decoders, virtual bus, trace edit, density; Design Runs table, run
+  creation/queue/seed sweep, checkpoints, incremental; five-step
+  Constraints Wizard with port validation, write-to-file and WNS
+  before/after; editor virtualization, outline, parse diagnostics,
+  bookmarks, go to definition, match case; report re-runs and program_hw
+  on worker jobs; runs read a `.prj`'s declared constraint files.
+  466 lib + 41 snap + 42 helion-verif green.
