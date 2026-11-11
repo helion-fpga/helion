@@ -252,6 +252,9 @@ pub struct MaxDelayRow {
 /// Re-run timing outcome (old `TimingOutcome`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum TimingOutcome {
+    /// No synthesized design yet: `synth_1` is running and timing re-runs
+    /// when it completes ([`on_run_finished`]).
+    AwaitingRun,
     Running,
     Done {
         before: Option<i64>,
@@ -630,14 +633,89 @@ fn write_reason(s: &AppState, issue_count: usize, rows: usize) -> Option<String>
     }
 }
 
+/// What "Re-run timing" does right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rerun {
+    /// Re-analyze the last run with the written file.
+    Analyze,
+    /// No synthesized design: run `synth_1` first, then re-analyze.
+    SynthFirst,
+    Unavailable(&'static str),
+}
+
+/// The Re-run action for the current state (`written`: the reviewed SDC
+/// is on disk).
+pub fn rerun_action(s: &AppState, written: bool) -> Rerun {
+    if !written {
+        return Rerun::Unavailable("Write the constraints first: re-analysis reads the file.");
+    }
+    if s.dialogs.xdc.timing == Some(TimingOutcome::AwaitingRun) {
+        return Rerun::Unavailable("Synthesis is running: timing re-runs when it finishes.");
+    }
+    if s.runs.is_active() {
+        return Rerun::Unavailable("A run is in progress");
+    }
+    if s.runs.analysis.is_none() || s.runs.live_design.is_none() {
+        return match crate::runs::resolve_source(s) {
+            Ok(_) => Rerun::SynthFirst,
+            Err(_) => Rerun::Unavailable("Add a design source: re-analysis needs a synthesized design."),
+        };
+    }
+    if let Some(why) = crate::analysis::timing_unavailable(s).or_else(|| crate::jobs::analysis_busy(s)) {
+        return Rerun::Unavailable(why);
+    }
+    Rerun::Analyze
+}
+
 /// Why "Re-run timing" is unavailable (`None` = enabled).
 fn rerun_reason(s: &AppState, written: bool) -> Option<&'static str> {
-    if !written {
-        Some("Write the constraints first: re-analysis reads the file.")
-    } else if let Some(why) = crate::analysis::timing_unavailable(s) {
-        Some(why)
+    match rerun_action(s, written) {
+        Rerun::Unavailable(why) => Some(why),
+        Rerun::Analyze | Rerun::SynthFirst => None,
+    }
+}
+
+/// The Re-run button: analyze now, or synthesize first and analyze when
+/// the run completes.
+fn rerun_pressed(s: &mut AppState) {
+    match rerun_action(s, s.dialogs.xdc.written.is_some()) {
+        Rerun::Analyze => rerun_timing(s),
+        Rerun::SynthFirst => synth_then_rerun(s),
+        Rerun::Unavailable(_) => {}
+    }
+}
+
+/// Launch `synth_1` through the run machinery; [`on_run_finished`]
+/// re-runs timing once it completes.
+fn synth_then_rerun(s: &mut AppState) {
+    console(
+        s,
+        "constraints wizard: no synthesized design; launching synth_1, timing re-runs when it finishes".into(),
+        MsgSev::Info,
+    );
+    crate::runs::launch(s, crate::runs::RunKind::Synth);
+    s.dialogs.xdc.timing = Some(if s.runs.is_active() {
+        TimingOutcome::AwaitingRun
     } else {
-        crate::jobs::analysis_busy(s)
+        TimingOutcome::Failed("Synthesis could not start (see the Tcl console).".into())
+    });
+}
+
+/// Run completion hook ([`crate::runs::deliver`]): finish a pending
+/// "synthesize, then re-run timing".
+pub fn on_run_finished(s: &mut AppState, ok: bool) {
+    if s.dialogs.xdc.timing != Some(TimingOutcome::AwaitingRun) {
+        return;
+    }
+    s.dialogs.xdc.timing = None;
+    match (ok, rerun_action(s, s.dialogs.xdc.written.is_some())) {
+        (true, Rerun::Analyze) => rerun_timing(s),
+        (true, Rerun::Unavailable(why)) => s.dialogs.xdc.timing = Some(TimingOutcome::Failed(why.into())),
+        _ => {
+            s.dialogs.xdc.timing = Some(TimingOutcome::Failed(
+                "Synthesis did not complete: fix the run, then re-run timing.".into(),
+            ))
+        }
     }
 }
 
@@ -1085,6 +1163,55 @@ mod tests {
             "re-analysis used the written 4 ns clock: {:?}",
             s2.timing.clocks
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rerun_without_a_run_synthesizes_first_then_reports_wns() {
+        let dir = std::env::temp_dir().join(format!("helion-xdc-wiz-synth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = crate::jobs::test_support::analyzed_state();
+        s.editor.xdc_lines.clear();
+        crate::scenes::xdc_wizard_rows_for(&mut s, "clk", "clk", 5.0);
+        s.project.location = dir.display().to_string();
+        s.project.name = "wiz3".into();
+        s.project_files = crate::project::ProjectFiles::default();
+        write_to_target(&mut s).expect("write");
+        // No prior run, but a source the run machinery can synthesize.
+        s.runs.source = s.runs.analysis.take().map(|a| a.source);
+        s.runs.live_design = None;
+        assert_eq!(rerun_action(&s, true), Rerun::SynthFirst);
+        s.runs.source = None;
+        s.editor.tabs.clear();
+        assert!(matches!(rerun_action(&s, true), Rerun::Unavailable(r) if r.contains("design source")));
+        let src = crate::jobs::test_support::analyzed_state().runs.analysis.unwrap().source;
+        s.runs.source = Some(src);
+        rerun_pressed(&mut s);
+        assert_eq!(s.dialogs.xdc.timing, Some(TimingOutcome::AwaitingRun));
+        assert!(s.runs.is_active(), "synth_1 started through the run machinery");
+        assert!(rerun_reason(&s, true).unwrap().contains("Synthesis is running"));
+        let start = std::time::Instant::now();
+        while s.runs.is_active() {
+            crate::runs::poll_runs(&mut s);
+            assert!(start.elapsed() < std::time::Duration::from_secs(180), "synth timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(s.dialogs.xdc.timing, Some(TimingOutcome::Running), "timing re-runs on completion");
+        crate::jobs::wait_idle(&mut s);
+        match &s.dialogs.xdc.timing {
+            Some(TimingOutcome::Done { after, .. }) => assert_eq!(*after, s.timing.wns_ps),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            s.timing.clocks.iter().any(|c| c.name == "clk" && c.period_ps == 5000),
+            "re-analysis used the written 5 ns clock: {:?}",
+            s.timing.clocks
+        );
+        // A failed or cancelled run ends the wait with a reason.
+        s.dialogs.xdc.timing = Some(TimingOutcome::AwaitingRun);
+        on_run_finished(&mut s, false);
+        assert!(matches!(&s.dialogs.xdc.timing, Some(TimingOutcome::Failed(e)) if e.contains("did not complete")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
