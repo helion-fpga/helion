@@ -11,9 +11,11 @@
 //! selected / Launch all / Cancel queue / Make active); checkpoints mirror
 //! 4970 using `Session::write_dcp` / `open_checkpoint`.
 //!
-//! Incremental compile and ECO tables are not here: the worker owns no
-//! persistent session for them, and the console `eco` verb already covers
-//! the one ECO the backend supports.
+//! Incremental runs (B:5160) place against the active run's checkpoint via
+//! `Session::read_checkpoint_incremental` and list their `ReuseReport`.
+//! The ECO table (B:5260) is not here: runs keep no persistent session to
+//! edit, and the console `eco` verb already covers the one ECO the backend
+//! supports.
 
 use rune::{El, ScrollSpec, TextEdit, col, el, icon, row, text};
 use rune_kit::glyphs;
@@ -111,6 +113,34 @@ pub struct RunsUi {
     /// Index into [`PRESETS`].
     pub preset: usize,
     pub preset_pop: bool,
+    /// New runs place incrementally against the active run's checkpoint.
+    pub incremental: bool,
+}
+
+/// The active run's routed checkpoint, when it is still on disk: the
+/// reference an incremental run reuses.
+pub fn active_checkpoint(s: &AppState) -> Option<(String, std::path::PathBuf)> {
+    let name = s.runs.active_result.clone()?;
+    checkpoints(s)
+        .into_iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(n, p, _)| (n, p))
+}
+
+/// Make the runs `names` incremental against `reference`.
+pub fn set_incremental(s: &mut AppState, names: &[String], reference: &std::path::Path) {
+    for n in names {
+        if let Some(d) = s.runs.defs.iter_mut().find(|d| &d.name == n) {
+            d.incremental = Some(reference.to_path_buf());
+        }
+        echo(
+            s,
+            format!(
+                "set_property INCREMENTAL_CHECKPOINT {{{}}} [get_runs {n}]",
+                reference.display()
+            ),
+        );
+    }
 }
 
 /// Row status, derived from the worker, the queue, and run history.
@@ -205,7 +235,13 @@ pub fn run_rows(s: &AppState) -> Vec<RunRow> {
             let strategy = match (spec.kind, spec.is_builtin()) {
                 (RunKind::Synth, _) => s.flow.synth_strategy.clone(),
                 (RunKind::Impl, true) => s.flow.impl_strategy.clone(),
-                (RunKind::Impl, false) => strategy_label(&spec.strategy),
+                (RunKind::Impl, false) => {
+                    let mut l = strategy_label(&spec.strategy);
+                    if spec.incremental.is_some() {
+                        l.push_str(" · incremental");
+                    }
+                    l
+                }
             };
             let done = s
                 .runs
@@ -396,6 +432,7 @@ pub fn create_runs(
             name: n.clone(),
             kind: RunKind::Impl,
             strategy,
+            incremental: None,
         });
         out.push(n.clone());
     }
@@ -637,6 +674,11 @@ fn create_form(s: &AppState, t: &VivadoTheme) -> El {
         let preset = PRESETS[s.runs.ui.preset.min(PRESETS.len() - 1)];
         match create_runs(s, &name, preset, &seeds) {
             Ok(names) => {
+                if s.runs.ui.incremental {
+                    if let Some((_, reference)) = active_checkpoint(s) {
+                        set_incremental(s, &names, &reference);
+                    }
+                }
                 if launch {
                     for n in &names {
                         let _ = enqueue(s, n);
@@ -717,6 +759,22 @@ fn create_form(s: &AppState, t: &VivadoTheme) -> El {
             t,
             |s| &mut s.runs.ui.seeds,
         ))
+        .child({
+            let ck = active_checkpoint(s);
+            let why = ck
+                .is_none()
+                .then_some("Make a run with a routed checkpoint active first");
+            let on = s.runs.ui.incremental && ck.is_some();
+            let label = match &ck {
+                Some((n, _)) if on => format!("Incremental from {n}"),
+                _ => "Incremental: off".to_string(),
+            };
+            tool_btn("runs-create-incr", &label, t, why, |s| {
+                s.runs.ui.incremental = !s.runs.ui.incremental
+            })
+            .fill(if on { t.selection } else { t.panel_bg })
+            .help("Place against the active run's checkpoint (read_checkpoint -incremental)")
+        })
         .child(tool_btn(
             "runs-create-go",
             &create_label,
@@ -987,6 +1045,54 @@ fn checkpoints_section(s: &AppState, t: &VivadoTheme) -> El {
     c
 }
 
+/// Incremental reuse of runs that placed against a reference checkpoint
+/// (`ReuseReport::text`); absent until one has.
+fn reuse_section(s: &AppState, t: &VivadoTheme) -> Option<El> {
+    let rows: Vec<&RunRecord> = s
+        .runs
+        .history
+        .iter()
+        .filter(|r| r.reuse.is_some())
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    let cols = [ColSpec::fixed("Run", 120.0), ColSpec::grow("Reuse", 1.0)];
+    let mut c = col()
+        .key("runs-reuse")
+        .w_full()
+        .child(
+            row()
+                .w_full()
+                .h(28.0)
+                .px(8.0)
+                .pt(8.0)
+                .items_center()
+                .child(cad::title("Incremental Reuse", t)),
+        )
+        .child(cad::header("runs-reuse-head", &cols, t));
+    for (k, r) in rows.into_iter().enumerate() {
+        let reuse = r.reuse.clone().unwrap_or_default();
+        c = c.child(
+            cad::table_row(
+                format!("runs-reuse-{k}"),
+                format!("Reuse of {}", r.name),
+                false,
+                t,
+            )
+            .child(cad::cell(
+                &cols[0],
+                cad::cut(r.name.clone(), VivadoTheme::FONT_UI, t.text),
+            ))
+            .child(cad::cell(
+                &cols[1],
+                cad::cut(reuse, cad::mono_style(), t.text_dim),
+            )),
+        );
+    }
+    Some(c)
+}
+
 /// Design Runs tab body.
 pub fn runs_body(s: &AppState, t: &VivadoTheme) -> El {
     let mut table = col().key("runs-table").w_full().child(header(s, t));
@@ -1011,7 +1117,8 @@ pub fn runs_body(s: &AppState, t: &VivadoTheme) -> El {
                 stick_bottom: false,
             })
             .child(table)
-            .child(checkpoints_section(s, t)),
+            .child(checkpoints_section(s, t))
+            .children(reuse_section(s, t)),
     )
 }
 
@@ -1276,6 +1383,27 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(r.state.tcl.session.placed.is_some());
+        // An incremental run reuses the active run's checkpoint.
+        let mut s = r.state;
+        assert_eq!(
+            active_checkpoint(&s).map(|c| c.0).as_deref(),
+            Some("seeded")
+        );
+        let names = create_runs(&mut s, "incr", "Default", &[]).unwrap();
+        let reference = active_checkpoint(&s).unwrap().1;
+        set_incremental(&mut s, &names, &reference);
+        assert!(run_rows(&s)[3].strategy.ends_with("· incremental"));
+        enqueue(&mut s, "incr").unwrap();
+        pump_until_idle(&mut s);
+        let rec = s.runs.last_record("incr").unwrap().clone();
+        assert_eq!(rec.outcome, RunOutcome::Complete, "{:?}", s.runs.impl_log);
+        assert!(
+            rec.reuse
+                .as_deref()
+                .is_some_and(|r| r.starts_with("reuse cells="))
+        );
+        let r = rt(s);
+        assert!(r.find("runs-reuse-0").is_some());
         let _ = std::fs::remove_dir_all(root);
     }
 

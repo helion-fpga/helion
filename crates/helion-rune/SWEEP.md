@@ -20,7 +20,7 @@ with tests, keep `cargo test -p helion-rune` green, rebuild + relaunch.
 | `qor.rs` | `views/reports.rs` | DONE (helion-proj QoR engine) |
 | `ila.rs` | `helion-verif`, `views/ila*.rs` | DONE |
 | `tb.rs` | `helion-verif`, `views/tb*.rs` | DONE |
-| `vcd.rs` + `vcd_wave.rs` | `views/wave.rs` | DONE — live VCD scopes/objects, per-trace radix; no protocol decoders |
+| `vcd.rs` + `vcd_wave.rs` | `views/wave*.rs`, `helion-verif::wave` | DONE — live VCD scopes/objects, radix + fixed-point + analog step/linear, AXI-Lite/SPI/UART/FSM decoder lanes, virtual buses, lane reorder/remove, density, object filter, Shift/Alt-click A/B |
 | hardware / bitstream / IP-BD / find panes | `views/program.rs`, `views/bitstream.rs`, `views/ip*.rs`, `views/find.rs` | DONE |
 | timing / CDC / clock interaction / reports | `views/timing.rs`, `views/reports.rs`, `analysis.rs` | DONE |
 | `tcl/*` | `tcl.rs` | DONE |
@@ -32,9 +32,8 @@ with tests, keep `cargo test -p helion-rune` green, rebuild + relaunch.
 - Schematic: fan-in/fan-out cones (stop-at-FF, hops), expand/collapse cone.
 - Device: congestion/criticality heat maps, pblock and clock-region tables,
   ruler; I/O quick-set rows (IOSTANDARD/DRIVE/SLEW...).
-- Waveform: protocol decoders (AXI-Lite/SPI/UART), analog style, virtual bus.
-- Design Runs: per-run LUT/FF/WNS columns, run creation with strategy sweep,
-  checkpoints, incremental/ECO reports.
+- Design Runs: ECO changes table (runs keep no persistent session; the
+  console `eco` verb covers the backend's single ECO).
 - Constraints wizard: multi-row steps, generated clocks, write-to-disk +
   re-run timing comparison.
 - Editor: very large files build one gutter row per line (no
