@@ -258,6 +258,7 @@ fn program_card(s: &AppState, t: &VivadoTheme) -> El {
         .child(op_btn("hw-cfg-verify", "Verify", CfgOp::Verify, false))
         .child(op_btn("hw-cfg-blank", "Blank Check", CfgOp::BlankCheck, false))
         .child(op_btn("hw-cfg-erase", "Erase", CfgOp::Erase, false))
+        .child(op_btn("hw-cfg-readback", "Read Back", CfgOp::Readback, false))
         .child(op_btn("hw-cfg-boot", "Boot from Flash", CfgOp::Boot, false));
     if let Some(op) = c.busy() {
         actions = actions.child(cad::dim(op.busy_label(), t).key("hw-cfg-busy"));
@@ -286,7 +287,7 @@ fn program_card(s: &AppState, t: &VivadoTheme) -> El {
                 }
                 res = res.child(cad::dim(
                     format!(
-                        "{} sector(s) erased · {} page(s) programmed · {} USER1 DR scans",
+                        "{} sector(s) erased · {} page(s) programmed · {} JTAG DR scans",
                         rep.sectors_erased, rep.pages_programmed, rep.jtag_dr_scans
                     ),
                     t,
@@ -324,10 +325,19 @@ fn program_card(s: &AppState, t: &VivadoTheme) -> El {
 pub fn cfgmem_panel(s: &AppState, t: &VivadoTheme) -> El {
     let mut c = col().key("hw-cfg").w_full().gap(10.0);
     if let Some(p) = s.program.cfgmem.part {
-        let path = if s.program.cable == crate::views::hw::CableChoice::Sim {
-            "Simulation cable · TAP USER1 → JEDEC SPI flash model"
-        } else {
-            "Board cable · openFPGALoader -f (writes the bitstream; no readback)"
+        let (kind, path) = match cm::flash_path(s) {
+            cm::FlashPath::Sim => (
+                "Indirect SPI".to_string(),
+                "Simulation cable · TAP USER1 → JEDEC SPI flash model".to_string(),
+            ),
+            cm::FlashPath::Native => (
+                "Native SPI over JTAG".to_string(),
+                format!("{} · TAP SPI_ACCESS → board flash", s.program.native.kind().label()),
+            ),
+            cm::FlashPath::Ofl => (
+                "openFPGALoader".to_string(),
+                "Board cable · openFPGALoader -f (writes the bitstream; no readback)".to_string(),
+            ),
         };
         c = c.child(
             row()
@@ -342,7 +352,7 @@ pub fn cfgmem_panel(s: &AppState, t: &VivadoTheme) -> El {
                     format!("{} · {} Mbit · JEDEC {}", p.vendor, p.density_mbit, p.jedec_hex()),
                     t,
                 ))
-                .child(cad::kpi("hw-cfg-kpi-path", "Programming path", if s.program.cable == crate::views::hw::CableChoice::Sim { "Indirect SPI" } else { "openFPGALoader" }, t.text, path, t)),
+                .child(cad::kpi("hw-cfg-kpi-path", "Programming path", kind, t.text, path, t)),
         );
         c = c.child(image_card(s, t)).child(program_card(s, t)).child(
             row().child(cad::btn(

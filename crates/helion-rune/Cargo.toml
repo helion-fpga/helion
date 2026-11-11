@@ -33,7 +33,8 @@ helion-sim = { path = "../helion-sim" }
 helion-verif = { path = "../helion-verif" }
 # Hardware Manager (cable resolve / detect / program / STAT), IP catalog and
 # block design (same crates IdeModel drives).
-helion-hw = { path = "../helion-hw" }
+# usb-native: the native FTDI JTAG engine opens real cables through rusb.
+helion-hw = { path = "../helion-hw", features = ["usb-native"] }
 helion-bd = { path = "../helion-bd" }
 helion-ipxact = { path = "../helion-ipxact" }
 # Bitstream frames/packets kept in state (FAR table) and STAT bit names.

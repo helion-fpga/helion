@@ -34,6 +34,8 @@ pub mod hw_cfgmem_view;
 pub mod hw_debug;
 pub mod hw_debug_tcl;
 pub mod hw_debug_view;
+pub mod hw_jtag_view;
+pub mod hw_native;
 pub mod hw_tree;
 pub mod ip;
 pub mod ip_canvas;
