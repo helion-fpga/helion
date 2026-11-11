@@ -23,7 +23,7 @@ body:
     id: cmd
     attributes:
       label: Command or path
-      placeholder: cargo test -p helion-gui --lib … / helion-ide --headless examples/counter.sv
+      placeholder: cargo test -p helion-rune --lib … / helion-ide --headless examples/counter.sv
   - type: textarea
     id: log
     attributes:

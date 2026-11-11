@@ -541,6 +541,45 @@ struct ParsedCmd {
 /// (the console echoes the last, mirroring `tcl_eval`); the first error or
 /// non-local control aborts the rest (Tcl semantics). Returns the final
 /// control state so bodies propagate `return`/`break`/`continue`.
+/// Worst negative slack (ps) of the routed design, running implementation
+/// first if needed (what `report_timing` reports).
+pub fn wns_ps(s: &mut AppState) -> Result<i64, String> {
+    ensure_timing(s, 0)
+        .map(|(_, t, _)| t.wns_ps)
+        .map_err(|e| e.msg)
+}
+
+/// Run `script` synchronously, as batch mode does (`helion-ide --source`,
+/// `--stdin`, `--headless`): every verb runs on this thread, including the
+/// engine-heavy ones the console hands to a worker. Returns the `puts` output
+/// plus the last value, or the first error (with its line).
+pub fn eval_batch(s: &mut AppState, script: &str) -> Result<String, String> {
+    let mut puts_out = Vec::new();
+    let mut values = Vec::new();
+    let ctl = eval_script(s, script, &mut puts_out, 0, &mut values);
+    let mut out = puts_out.join("\n");
+    let push = |out: &mut String, v: &str| {
+        if !v.is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(v);
+        }
+    };
+    match ctl {
+        Ctl::Error(e) => {
+            push(&mut out, &format!("{} (line {})", e.msg, e.line));
+            Err(out)
+        }
+        _ => {
+            if let Some(v) = values.last() {
+                push(&mut out, v);
+            }
+            Ok(out)
+        }
+    }
+}
+
 /// The scripted interpreter path for one line (job-parity tests).
 #[cfg(test)]
 pub(crate) fn eval_script_for_test(

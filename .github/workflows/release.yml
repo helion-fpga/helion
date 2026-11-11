@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: aarch64-apple-darwin
       - name: version
@@ -47,7 +47,7 @@ jobs:
       - name: verify app signature
         run: codesign --verify --deep --strict dist/Helion.app && echo "ad-hoc signature OK"
       - name: helion-prog
-        run: cargo build --release --target aarch64-apple-darwin -p helion-hw
+        run: cargo build --locked --release --target aarch64-apple-darwin -p helion-hw
       - name: zip app
         run: |
           mkdir -p dist/upload
@@ -71,15 +71,22 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.99.1
       - name: version
         id: meta
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           case "$TAG" in v*.*.*) ;; *) TAG="v0.0.0-dev" ;; esac
           echo "ver=${TAG#v}" >> "$GITHUB_OUTPUT"
+      # Rune (third_party/rune) links libxkbcommon and libwayland-client;
+      # helion-hw's native FTDI path links libusb.
+      - name: system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libwayland-dev libusb-1.0-0-dev
       - name: build
-        run: cargo build --release -p helion-cli -p helion-gui -p helion-hw
+        run: cargo build --locked --release -p helion-cli -p helion-rune -p helion-hw
       - name: unix tarball
         run: |
           mkdir -p dist/upload
@@ -119,7 +126,8 @@ jobs:
           {
             echo "Helion ${TAG#v}"
             echo
-            echo "Original FPGA family + CAD. Native Apple Silicon app; Linux CLI tarball."
+            echo "Original FPGA family + CAD. Native Apple Silicon app; Linux tarball (helion CLI + helion-ide)."
+            echo "Linux helion-ide needs libxkbcommon0, libwayland-client0 and libusb-1.0-0 (present on desktop distros)."
             echo "Unsigned macOS build — Gatekeeper will warn. Apache-2.0 OR MIT."
             echo
             sh scripts/changelog-excerpt.sh "$TAG"

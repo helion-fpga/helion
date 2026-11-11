@@ -4,23 +4,36 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+env:
+  CARGO_TERM_COLOR: always
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
+      # Rune (vendored in third_party/rune) links libxkbcommon and
+      # libwayland-client; helion-hw's native FTDI path links libusb.
+      - name: system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libwayland-dev libusb-1.0-0-dev
+      - name: lockfile is current
+        run: cargo metadata --locked --format-version 1 > /dev/null
+      - name: IDE and hardware tests
+        run: cargo test --locked -p helion-rune --lib -p helion-hw
       - name: workspace tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
         continue-on-error: true
       - name: counter gold
         run: |
           set -euo pipefail
-          cargo run -q -p helion-gui --bin helion-ide -- --headless examples/counter.sv | tee gold-ubuntu.log
+          cargo run --locked -q -p helion-rune --bin helion-ide -- --headless examples/counter.sv | tee gold-ubuntu.log
           grep -F 'WNS_PS=9640' gold-ubuntu.log
       - name: release helion-ide
-        run: cargo check --release -p helion-gui --bin helion-ide
+        run: cargo check --locked --release -p helion-rune --bin helion-ide
 
   macos:
     runs-on: macos-latest
@@ -28,15 +41,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
+      - name: IDE and hardware tests
+        run: cargo test --locked -p helion-rune -p helion-hw
       - name: workspace tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
         continue-on-error: true
-      - name: build helion-ide
-        run: cargo build -p helion-gui --bin helion-ide
       - name: counter gold
         run: |
           set -euo pipefail
-          cargo run -q -p helion-gui --bin helion-ide -- --headless examples/counter.sv | tee gold.log
+          cargo run --locked -q -p helion-rune --bin helion-ide -- --headless examples/counter.sv | tee gold.log
           grep -F 'WNS_PS=9640' gold.log
       - name: release helion-ide
-        run: cargo check --release -p helion-gui --bin helion-ide
+        run: cargo check --locked --release -p helion-rune --bin helion-ide

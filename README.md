@@ -124,7 +124,7 @@ cargo run -p helion-cli -- run examples/counter.sv --cycles 16
 Headless gold (the number that must not silently move):
 
 ```bash
-cargo run -p helion-gui --bin helion-ide -- --headless examples/counter.sv
+cargo run -p helion-rune --bin helion-ide -- --headless examples/counter.sv
 # must print WNS_PS=9640
 ```
 
@@ -132,7 +132,7 @@ cargo run -p helion-gui --bin helion-ide -- --headless examples/counter.sv
 
 Prebuilt binaries are on the [releases page](https://github.com/helion-fpga/helion/releases/latest):
 
-- Linux x86_64 (`.tar.gz`)
+- Linux x86_64 (`.tar.gz`; the IDE needs `libxkbcommon0`, `libwayland-client0` and `libusb-1.0-0`, present on desktop distros)
 - macOS arm64 (`.zip` and `.tar.gz`)
 - `SHA256SUMS.txt` for verification
 
@@ -144,14 +144,25 @@ xattr -cr /Applications/Helion.app
 
 ## Building from source
 
-Prerequisites: Rust 1.85 or newer (install via [rustup](https://rustup.rs)).
+Prerequisites: [rustup](https://rustup.rs). The repo's `rust-toolchain.toml`
+pins Rust 1.99.1 and rustup installs it on first build. Everything else comes
+with the clone: the Rune UI framework the IDE is built on is vendored in
+`third_party/rune` (MIT), and `Cargo.lock` pins every crates.io dependency.
+
+On Linux, install the system libraries the IDE and the native JTAG cable
+driver link against:
+
+```bash
+sudo apt-get install pkg-config libxkbcommon-dev libwayland-dev libusb-1.0-0-dev   # Debian/Ubuntu
+sudo dnf install pkgconf libxkbcommon-devel wayland-devel libusb1-devel            # Fedora
+```
 
 ```bash
 git clone https://github.com/helion-fpga/helion.git
 cd helion
-cargo build --release
+cargo build --release --locked -p helion-cli -p helion-rune
 # CLI:  ./target/release/helion
-# IDE:  ./target/release/helion-ide
+# IDE:  ./target/release/helion-ide   (--help lists the windowless modes)
 ```
 
 Run the test suite:

@@ -1,28 +1,20 @@
-//! `helion-rune` binary: the Vivado-style IDE shell on Rune.
-//! `cargo run -p helion-rune` opens the window;
-//! `cargo run -p helion-rune -- --snap hello.png --scene on` renders headless
-//! (flags from `rune/crates/rune/src/tooling.rs`: `--snap/--tree/--scene`).
-//!
-//! `--version` / `--doctor` never open a window (old `doctor.rs`), so they
-//! are intercepted before Rune parses its own flags.
+//! `helion-ide`: the Helion FPGA IDE (Vivado-style shell on the Rune UI).
+//! `helion-ide` opens the window (Start page or the project/file named on the
+//! command line); `--headless`, `--source`, `--stdin`, `--version`,
+//! `--doctor` and `--help` never open one (see [`helion_rune::cli`]).
+//! `--snap out.png --scene name` renders headless for docs and tests (flags
+//! from Rune's tooling).
 
 fn main() {
-    match std::env::args().nth(1).as_deref() {
-        Some("--version") | Some("-V") | Some("version") => {
-            println!("{}", helion_rune::doctor::version_line());
-            return;
-        }
-        Some("--doctor") | Some("doctor") => {
-            print!("{}", helion_rune::doctor::doctor_report());
-            return;
-        }
-        _ => {}
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = helion_rune::cli::run(&args) {
+        std::process::exit(code);
     }
     let mut spec = helion_rune::app_spec();
     // Headless tooling (`--snap`, `--scene`, `--tree`, scripts) renders the
     // deterministic demo state; a real launch boots the Start page or the
     // project named on the command line, with saved prefs.
-    if !std::env::args().skip(1).any(|a| a.starts_with("--")) {
+    if !args.iter().any(|a| a.starts_with("--")) {
         spec.init = helion_rune::boot;
     }
     rune::run(spec);

@@ -16,7 +16,7 @@ body:
     id: crate
     attributes:
       label: Crate
-      placeholder: helion-sv, helion-gui, helion-sta, …
+      placeholder: helion-sv, helion-rune, helion-sta, …
     validations:
       required: true
   - type: input

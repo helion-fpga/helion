@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# Legacy egui IDE, kept until the Rune IDE (crates/helion-rune) replaces it on
+# master. Its binary is helion-ide-egui; `helion-ide` is the Rune IDE.
+autobins = false
+
+[[bin]]
+name = "helion-ide-egui"
+path = "src/bin/helion-ide.rs"
 
 [features]
 default = ["learner_l1_stage"]

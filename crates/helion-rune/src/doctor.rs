@@ -8,7 +8,7 @@ use std::fmt::Write;
 use std::process::Command;
 
 pub fn version_line() -> String {
-    format!("helion-rune {}", env!("CARGO_PKG_VERSION"))
+    format!("helion-ide {}", env!("CARGO_PKG_VERSION"))
 }
 
 /// Compile-time target triple from cargo (`TARGET`). `aarch64-apple-darwin` on
@@ -83,7 +83,7 @@ mod tests {
     fn doctor_prints_toolchain_had_and_triple() {
         let d = doctor_report();
         assert!(
-            d.starts_with(concat!("helion-rune ", env!("CARGO_PKG_VERSION"))),
+            d.starts_with(concat!("helion-ide ", env!("CARGO_PKG_VERSION"))),
             "{d}"
         );
         assert!(d.contains("target "), "{d}");
