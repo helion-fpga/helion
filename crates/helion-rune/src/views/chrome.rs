@@ -798,6 +798,13 @@ fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
                 None,
                 None,
             ),
+            goto(
+                section,
+                "Floorplanning",
+                "report_pblocks",
+                CenterPane::Device,
+                |s| crate::tcl::eval_command(s, "report_pblocks"),
+            ),
             timing_page(
                 section,
                 "Report Clock Interaction",

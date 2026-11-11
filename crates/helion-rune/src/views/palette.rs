@@ -110,7 +110,12 @@ const PANES: [CenterPane; 16] = [
 ];
 
 /// Tcl recipes shared by the registry (old `menu_tcl_recipes`).
-const TCL_RECIPES: [(&str, &str); 11] = [
+const TCL_RECIPES: [(&str, &str); 16] = [
+    ("Schematic: fan-in cone", "expand_fanin_cone"),
+    ("Schematic: fan-out cone", "expand_fanout_cone"),
+    ("Schematic: collapse cone", "collapse_cone"),
+    ("Fit die to view (Device)", "device_zoom_fit"),
+    ("Floorplanning: pblocks", "report_pblocks"),
     ("Report timing", "report_timing"),
     ("Report utilization", "report_utilization"),
     ("Report timing summary", "report_timing_summary"),
