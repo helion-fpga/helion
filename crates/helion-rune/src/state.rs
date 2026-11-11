@@ -1084,6 +1084,8 @@ pub struct AppState {
     pub ip: crate::views::ip::IpState,
     /// High-Level Synthesis pane (kernel, directives, synth/cosim results).
     pub hls: crate::views::hls::HlsState,
+    /// Export Hardware / Archive Project dialog drafts.
+    pub handoff: crate::views::handoff::HandoffState,
     /// Find Results state (query, scopes, selected hit).
     pub find: crate::views::find::FindState,
     /// Settings dialog + New Project / Constraints wizard UI state.
@@ -1298,6 +1300,7 @@ impl AppState {
             program: crate::views::program::ProgramState::default(),
             ip: crate::views::ip::IpState::default(),
             hls: crate::views::hls::HlsState::default(),
+            handoff: crate::views::handoff::HandoffState::default(),
             find: crate::views::find::FindState::default(),
             dialogs: crate::views::dialogs::DialogState::default(),
             center: CenterPane::Summary,

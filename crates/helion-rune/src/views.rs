@@ -18,6 +18,7 @@ pub mod editor_diag;
 pub mod editor_gutter;
 pub mod editor_outline;
 pub mod editor_scale;
+pub mod handoff;
 pub mod highlight;
 pub mod hls;
 pub mod hls_view;

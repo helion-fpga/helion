@@ -592,6 +592,19 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         s.toasts = Default::default();
         s.center = state::CenterPane::Hls;
     }),
+    ("export-hardware", |s| {
+        s.center = state::CenterPane::Ip;
+        for core in ["h_rv32_hb1", "h_uart", "h_gpio"] {
+            let _ = views::ip::create_bd_cell(s, core);
+        }
+        let _ = views::ip::apply_automation(s);
+        s.handoff.hw_path = rune::TextEdit::new("/projects/project_1/design_1.hwp");
+        views::handoff::open_export(s);
+    }),
+    ("archive-project", |s| {
+        s.handoff.ar_path = rune::TextEdit::new("/projects/project_1_archive.zip");
+        views::handoff::open_archive(s);
+    }),
     ("ip-automation", |s| {
         s.center = state::CenterPane::Ip;
         for core in ["h_rv32_hb1", "h_uart", "h_gpio", "h_sync_fifo"] {

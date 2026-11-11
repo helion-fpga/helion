@@ -19,6 +19,10 @@ pub const VERBS: &[&str] = &[
     "cosim_design",
     "open_hls",
     "add_hls_rtl",
+    "write_hw_platform",
+    "archive_project",
+    "get_boards",
+    "get_parts",
 ];
 
 /// One-line usage + description for `help <verb>`.
@@ -51,6 +55,16 @@ pub fn help(name: &str) -> Option<(&'static str, &'static str)> {
         ),
         "open_hls" => ("open_hls file.cpp", "open a C/C++ kernel in the HLS pane"),
         "add_hls_rtl" => ("add_hls_rtl", "write the generated SystemVerilog and add it to the project"),
+        "write_hw_platform" => (
+            "write_hw_platform ?-include_bit|-no_bit? ?file.hwp?",
+            "hardware platform hand-off: bitstream, address map, board/part, BD HDL",
+        ),
+        "archive_project" => (
+            "archive_project ?-include_runs? ?file.zip?",
+            "zip the project with sources/constraints/IP and relative paths",
+        ),
+        "get_boards" => ("get_boards", "list boards with their part and pins"),
+        "get_parts" => ("get_parts ?pattern?", "list every part a backend can implement, by family"),
         _ => return None,
     })
 }
@@ -96,6 +110,34 @@ pub fn tcl_verb(s: &mut AppState, name: &str, args: &[String]) -> Result<String,
         }
         "csynth_design" | "cosim_design" | "open_hls" | "add_hls_rtl" => {
             crate::views::hls::tcl_verb(s, name, args)
+        }
+        "write_hw_platform" | "archive_project" => crate::views::handoff::tcl_verb(s, name, args),
+        "get_boards" => {
+            let mut out = Vec::new();
+            for b in helion_device::Device::list_boards()? {
+                let board = helion_device::Device::load_board(&b)?;
+                out.push(format!(
+                    "{} part={} pins={}",
+                    board.board,
+                    board.part,
+                    board
+                        .pins
+                        .iter()
+                        .map(|p| format!("{}:{}", p.port, p.site))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
+            }
+            Ok(out.join("\n"))
+        }
+        "get_parts" => {
+            let q = arg(args, 0).to_ascii_lowercase();
+            Ok(helion_targets::implementable_parts()
+                .into_iter()
+                .filter(|p| q.is_empty() || p.part.to_ascii_lowercase().contains(&q))
+                .map(|p| format!("{} family={} {}", p.part, p.family.label(), p.summary))
+                .collect::<Vec<_>>()
+                .join("\n"))
         }
         _ => Err(format!("{name}: not an ecosystem verb")),
     }

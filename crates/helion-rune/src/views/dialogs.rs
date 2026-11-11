@@ -69,6 +69,10 @@ pub enum DialogId {
     IpCustomize,
     /// IP Integrator: Package IP into the user repository.
     PackageIp,
+    /// File > Export > Export Hardware (hardware platform hand-off).
+    ExportHardware,
+    /// File > Archive Project.
+    ArchiveProject,
 }
 
 impl DialogId {
@@ -81,6 +85,8 @@ impl DialogId {
             DialogId::IpAutomation => "ip-auto",
             DialogId::IpCustomize => "ip-cust",
             DialogId::PackageIp => "ip-pkg",
+            DialogId::ExportHardware => "hw",
+            DialogId::ArchiveProject => "ar",
         }
     }
 }
@@ -1981,6 +1987,9 @@ pub fn push_dialogs(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme) {
         DialogId::AddSources => add_sources_dialog(s, t, &kit, layer),
         DialogId::IpAutomation | DialogId::IpCustomize | DialogId::PackageIp => {
             crate::views::ip_dialogs::push(id, layer, s, t, &kit)
+        }
+        DialogId::ExportHardware | DialogId::ArchiveProject => {
+            crate::views::handoff::push(id, layer, s, t, &kit)
         }
     }
     layer.extend(pops);

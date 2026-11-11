@@ -692,6 +692,14 @@ pub fn ip_pane(s: &AppState, t: &VivadoTheme) -> El {
             t,
             pkg_reason.as_deref(),
             |s: &mut AppState| s.dialogs.open(crate::views::dialogs::DialogId::PackageIp),
+        ))
+        .child(cad::tool_sep(t))
+        .child(cad::btn(
+            "ip-export-hw",
+            "Export Hardware…",
+            t,
+            crate::views::handoff::export_reason(s).as_deref(),
+            crate::views::handoff::open_export,
         ));
     col()
         .key("ip")
