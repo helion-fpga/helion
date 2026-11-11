@@ -1964,6 +1964,7 @@ dependencies = [
  "helion-bits",
  "helion-debug",
  "helion-device",
+ "helion-fabric",
  "helion-hw",
  "helion-ipxact",
  "helion-ir",
@@ -2011,6 +2012,8 @@ dependencies = [
  "helion-vhdl",
  "rune",
  "rune-kit",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2040,6 +2043,7 @@ dependencies = [
  "helion-pack",
  "helion-place",
  "helion-route",
+ "helion-sim",
  "helion-sv",
  "rayon",
 ]
@@ -2069,6 +2073,7 @@ dependencies = [
  "helion-ir",
  "helion-sim",
  "helion-sv",
+ "helion-vhdl",
  "serde",
  "serde_json",
 ]

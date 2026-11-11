@@ -1118,6 +1118,7 @@ pub fn runs_body(s: &AppState, t: &VivadoTheme) -> El {
             })
             .child(table)
             .child(checkpoints_section(s, t))
+            .child(crate::views::ooc::ooc_section(s, t))
             .children(reuse_section(s, t)),
     )
 }

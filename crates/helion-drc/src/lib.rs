@@ -380,6 +380,27 @@ fn check_io_electrical(design: &Design, d: &mut Drc) {
     }
 }
 
+/// UG906 floorplan check: every Pblock member must sit inside its Pblock
+/// (`PBLK-1`, one error per misplaced cell, via
+/// [`helion_place::region_violations`]).
+pub fn check_pblocks(placed: &Placed, regions: &[helion_place::RegionConstraint]) -> Drc {
+    let mut d = Drc::default();
+    for v in helion_place::region_violations(placed, regions) {
+        d.add(
+            "PBLK-1",
+            v.cell.clone(),
+            format!(
+                "{} placed at {} outside pblock {} ({})",
+                v.cell,
+                v.site.id(),
+                v.region,
+                v.range
+            ),
+        );
+    }
+    d
+}
+
 pub fn check_routed(design: &Design, routed: &Routed, dev: &Device) -> Drc {
     let mut d = check_placed(design, &routed.placed, dev);
     if !routed.placed.packed.iobs.is_empty() && routed.iob_src.is_empty() {
@@ -427,6 +448,33 @@ mod tests {
         let pl = place(&p, &dev).unwrap();
         let r = route(&pl, &dev).unwrap();
         check_routed(&d, &r, &dev).fail().unwrap();
+    }
+
+    #[test]
+    fn pblock_members_outside_their_region_are_pblk1_errors() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let d = Design::structural_counter();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let cell = pl.packed.lutffs[0].lut_cell.clone();
+        let s0 = pl.lutff_sites[0].0;
+        let (x, y) = if s0.x > 4 { (1, 1) } else { (8, 8) };
+        let far = helion_place::RegionConstraint::new("pb_far", x, y, x, y).with_cells([cell.clone()]);
+        let drc = check_pblocks(&pl, &[far.clone()]);
+        assert_eq!(drc.error_count(), 1);
+        assert_eq!(drc.items[0].id, "PBLK-1");
+        assert_eq!(drc.items[0].objects, cell);
+        assert!(crate::lookup_rule("PBLK-1").is_some());
+        // Once legalized, the same constraint is clean.
+        let (legal, _) = helion_place::place_with_regions(
+            &p,
+            &dev,
+            helion_place::PlaceOpts::default(),
+            &[far.clone()],
+            &helion_place::TimingGuide::default(),
+        )
+        .unwrap();
+        assert!(check_pblocks(&legal, &[far]).ok());
     }
 
     #[test]

@@ -317,6 +317,35 @@ pub const COMMANDS: &[&str] = &[
     "write_cfgmem",
     "program_hw_cfgmem",
     "boot_hw_device",
+    // Clocking / I/O reports.
+    "report_clock_utilization",
+    "report_control_sets",
+    "report_ssn",
+    "write_ibis",
+    "report_power_vcd",
+    // ECO.
+    "eco_open",
+    "eco_set_lut_init",
+    "eco_connect_pin",
+    "eco_insert_buffer",
+    "eco_add_lut",
+    "eco_add_ff",
+    "eco_remove_cell",
+    "eco_place_route",
+    "eco_route",
+    "write_eco_bitstream",
+    // Partial reconfiguration.
+    "create_partition",
+    "add_reconfig_module",
+    "launch_dfx",
+    "report_partitions",
+    // Out-of-context synthesis.
+    "set_ooc",
+    "synth_ooc",
+    "report_ooc",
+    "report_coverage",
+    "save_wave_config",
+    "open_wave_config",
 ];
 
 /// Max nested `[...]` evaluation depth (mirrors the real interp's cap idea;
@@ -2959,6 +2988,10 @@ fn dispatch_host(
             crate::views::hw_cfgmem::tcl_verb(s, n, argv.get(1..).unwrap_or_default()),
             line,
         ),
+        n if crate::ext_verbs::is_verb(n) => ctl_result(
+            crate::ext_verbs::tcl_verb(s, n, argv.get(1..).unwrap_or_default()),
+            line,
+        ),
         _ => unknown_command(s, name, line),
     }
 }
@@ -5399,7 +5432,7 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
         n if crate::views::hw_cfgmem::VERBS.contains(&n) => {
             return crate::views::hw_cfgmem::help(n);
         }
-        _ => return None,
+        _ => return crate::ext_verbs::help(name),
     })
 }
 
@@ -5430,6 +5463,11 @@ fn help_overview() -> String {
         "HW debug: implement_debug_core write_debug_probes refresh_hw_device run_hw_ila wait_on_hw_ila upload_hw_ila_data",
         "  refresh_hw_vio set_property OUTPUT_VALUE v probe | create_hw_axi_txn run_hw_axi get_hw_ilas get_hw_vios get_hw_axis",
         "  get_cfgmem_parts create_hw_cfgmem write_cfgmem program_hw_cfgmem boot_hw_device",
+        "I/O & clocking: report_clock_utilization report_control_sets report_ssn write_ibis report_power_vcd",
+        "ECO: eco_open eco_set_lut_init eco_connect_pin eco_insert_buffer eco_add_lut eco_add_ff eco_remove_cell",
+        "  eco_place_route eco_route write_eco_bitstream",
+        "DFX: create_partition add_reconfig_module launch_dfx report_partitions | OOC: set_ooc synth_ooc report_ooc",
+        "Coverage: report_coverage | Wave layout: save_wave_config open_wave_config",
         "help <command> for usage. See docs/tcl-subset.md for the supported subset.",
     ]
     .join("\n")

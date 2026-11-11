@@ -476,6 +476,7 @@ pub fn launch_testbench(s: &mut AppState, i: usize) -> Result<(), String> {
                 tb_path: path,
                 vcd,
                 max_units: engine::TB_DEFAULT_MAX_UNITS,
+                seed: 1,
                 cancel: Some(cancel),
             };
             let r = engine::run_testbench(&cfg, Some(&stx));
@@ -801,8 +802,12 @@ fn finish_tb(s: &mut AppState, i: usize, r: Result<TbOutcome, TbError>) {
                 },
             });
             if let Some(vcd) = &out.vcd_path {
-                if let Err(e) = load_vcd_into_wave(s, vcd, &format!("{name} (testbench VCD)")) {
-                    s.sim.push_log(format!("WARNING: {e}"), MsgSev::Warn);
+                match load_vcd_into_wave(s, vcd, &format!("{name} (testbench VCD)")) {
+                    Ok(_) => {
+                        let tb_path = out.coverage.tb_file.clone();
+                        crate::views::wave_cfg::auto_restore(s, &tb_path);
+                    }
+                    Err(e) => s.sim.push_log(format!("WARNING: {e}"), MsgSev::Warn),
                 }
             }
             match status {
@@ -1080,6 +1085,7 @@ pub fn run_testbench_now(s: &mut AppState, i: usize) -> Result<(), String> {
         tb_path: item.file.path.clone(),
         vcd: s.sim.vcd,
         max_units: engine::TB_DEFAULT_MAX_UNITS,
+        seed: 1,
         cancel: None,
     };
     let (stx, srx) = mpsc::channel();
@@ -1202,6 +1208,23 @@ pub fn last_vcd(s: &AppState) -> Option<PathBuf> {
             .rev()
             .find_map(|h| h.vcd_path.clone().filter(|p| p.is_file()))
     })
+}
+
+/// Scene fixture: run `examples/counter_tb.sv` from a temp copy so the
+/// Coverage view shows a real run's coverage (never writes into the repo).
+pub fn seed_coverage_fixture(s: &mut AppState) {
+    let ex = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let dir = std::env::temp_dir().join("helion-rune-scenes").join("coverage");
+    let _ = std::fs::create_dir_all(&dir);
+    for f in ["counter.sv", "counter_tb.sv"] {
+        let _ = std::fs::copy(ex.join(f), dir.join(f));
+    }
+    s.sim.dir_override = Some(dir.clone());
+    rescan(s);
+    let Some(i) = s.sim.tbs.iter().position(|t| t.file.name == "counter_tb") else { return };
+    let cfg = helion_verif::tb::TbRunConfig::new(s.sim.tbs[i].file.path.clone());
+    s.sim.tbs[i].last = Some(helion_verif::tb::run_testbench(&cfg, None));
+    s.sim.selected = Some(i);
 }
 
 /// Scenes/tests: discover the repo `examples/` testbenches (read-only).

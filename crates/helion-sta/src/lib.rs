@@ -22,6 +22,9 @@ pub use signoff::*;
 pub mod ug903;
 pub use ug903::*;
 pub mod pba_ssta;
+
+/// VCD-driven (vectored) power analysis, ported from the old IDE.
+pub mod vcd_power;
 pub use pba_ssta::*;
 // Structural CDC analysis (v3.0 verification track): clock-domain
 // extraction, net-level crossing detection, synchronizer recognition, and
