@@ -66,6 +66,8 @@ pub struct UsbFtdiPort {
     #[cfg(feature = "usb-native")]
     max_packet: usize,
     pub detail: String,
+    /// Cable GPIO profile, from the USB descriptor strings.
+    pub pins: crate::mpsse::CablePins,
 }
 
 /// Open the first MPSSE-capable FTDI (or the one at `bus`/`addr`), channel
@@ -124,7 +126,18 @@ pub fn open_usb_ftdi(at: Option<(u8, u8)>, ch: char) -> Result<UsbFtdiPort, Stri
             ep_in,
             index,
             max_packet,
-            detail: format!("{} channel {}", pick.detail(), ch.to_ascii_uppercase()),
+            // The enumeration line's "detect-only" caveat is about listing;
+            // an opened port is driven by the JTAG engine.
+            detail: format!(
+                "{} channel {}",
+                pick.detail()
+                    .replace(" detect-only (no program DONE claimed)", ""),
+                ch.to_ascii_uppercase()
+            ),
+            pins: crate::mpsse::CablePins::for_usb(
+                pick.manufacturer.as_deref(),
+                pick.product.as_deref(),
+            ),
         })
     }
 }
@@ -154,6 +167,10 @@ impl UsbFtdiPort {
 impl MpssePort for UsbFtdiPort {
     fn describe(&self) -> String {
         self.detail.clone()
+    }
+
+    fn pins(&self) -> crate::mpsse::CablePins {
+        self.pins
     }
 
     fn usb_reset(&mut self) -> Result<(), String> {

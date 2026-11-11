@@ -96,10 +96,57 @@ pub mod pin {
     pub const JTAG_IDLE: u8 = TMS;
 }
 
+/// GPIO levels a cable needs around the four JTAG pins. Digilent cables gate
+/// their JTAG level shifters with ADBUS7 and ACBUS5/6: with the generic
+/// profile the buffers stay off and TDO floats high (no chain).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CablePins {
+    pub name: &'static str,
+    pub low_val: u8,
+    pub low_dir: u8,
+    pub high_val: u8,
+    pub high_dir: u8,
+}
+
+impl CablePins {
+    /// Bare AN_129 wiring: TCK/TDI/TMS out, TDO in, nothing else driven.
+    pub const GENERIC: Self = Self {
+        name: "generic FTDI",
+        low_val: pin::JTAG_IDLE,
+        low_dir: pin::JTAG_DIR,
+        high_val: 0x00,
+        high_dir: 0x00,
+    };
+    /// Digilent HS2/HS3 and on-board Digilent JTAG (ZedBoard, Arty, Basys,
+    /// Nexys): ADBUS5-7 out (ADBUS7 high enables the buffer), ACBUS5/6 out low.
+    pub const DIGILENT: Self = Self {
+        name: "Digilent",
+        low_val: 0xE8,
+        low_dir: 0xEB,
+        high_val: 0x00,
+        high_dir: 0x60,
+    };
+
+    /// Pick the profile from the USB descriptor strings.
+    pub fn for_usb(manufacturer: Option<&str>, product: Option<&str>) -> Self {
+        let is = |s: Option<&str>, w: &str| s.is_some_and(|s| s.to_ascii_lowercase().contains(w));
+        if is(manufacturer, "digilent") || is(product, "digilent") {
+            Self::DIGILENT
+        } else {
+            Self::GENERIC
+        }
+    }
+}
+
 /// FTDI `SIO_SET_BITMODE` mode for MPSSE.
 pub const BITMODE_MPSSE: u8 = 0x02;
 /// FTDI `SIO_SET_BITMODE` mode for reset (back to UART/FIFO).
 pub const BITMODE_RESET: u8 = 0x00;
+
+/// Above this TCK the engine samples TDO on the falling edge. Measured on a
+/// ZedBoard (on-board Digilent FT232H + level shifters): rising-edge reads
+/// are exact up to 15 MHz and every bit arrives one clock late at 30 MHz.
+pub const READ_FALLING_ABOVE_HZ: u32 = 15_000_000;
 
 /// TCK frequency in Hz for `divisor`: `master / ((1 + divisor) * 2)` where
 /// the master clock is 60 MHz with divide-by-5 off (H-series) or 12 MHz with
@@ -153,6 +200,7 @@ pub const MAX_BYTES_PER_CMD: usize = 65_536;
 pub struct MpsseCmd {
     buf: Vec<u8>,
     reads: Vec<ReadSeg>,
+    read_falling: bool,
 }
 
 impl MpsseCmd {
@@ -162,6 +210,22 @@ impl MpsseCmd {
 
     pub fn bytes(&self) -> &[u8] {
         &self.buf
+    }
+
+    /// Sample TDO on the falling TCK edge in the read opcodes queued after
+    /// this. At high TCK a buffered cable's TDO arrives later than half a
+    /// period; the falling edge gives it a full period (see [`READ_FALLING_ABOVE_HZ`]).
+    pub fn read_on_falling(&mut self, on: bool) -> &mut Self {
+        self.read_falling = on;
+        self
+    }
+
+    fn read_op(&self, opc: u8) -> u8 {
+        if self.read_falling {
+            opc | flag::READ_NEG
+        } else {
+            opc
+        }
     }
 
     pub fn reads(&self) -> &[ReadSeg] {
@@ -256,7 +320,11 @@ impl MpsseCmd {
         if tdi {
             b |= 0x80;
         }
-        let opc = if read { op::TMS_INOUT } else { op::TMS_OUT };
+        let opc = if read {
+            self.read_op(op::TMS_INOUT)
+        } else {
+            op::TMS_OUT
+        };
         self.buf.extend_from_slice(&[opc, n - 1, b]);
         if read {
             self.reads.push(ReadSeg::Bits(n));
@@ -266,7 +334,11 @@ impl MpsseCmd {
 
     /// Clock whole bytes on TDI (TMS held), split at [`MAX_BYTES_PER_CMD`].
     pub fn data_bytes(&mut self, data: &[u8], read: bool) -> &mut Self {
-        let opc = if read { op::BYTES_INOUT } else { op::BYTES_OUT };
+        let opc = if read {
+            self.read_op(op::BYTES_INOUT)
+        } else {
+            op::BYTES_OUT
+        };
         for chunk in data.chunks(MAX_BYTES_PER_CMD) {
             let n = chunk.len() - 1;
             self.buf
@@ -282,7 +354,11 @@ impl MpsseCmd {
     /// Clock `n` (1..=8) bits on TDI, LSB first.
     pub fn data_bits(&mut self, bits: u8, n: u8, read: bool) -> &mut Self {
         assert!((1..=8).contains(&n), "bit burst is 1..=8 bits");
-        let opc = if read { op::BITS_INOUT } else { op::BITS_OUT };
+        let opc = if read {
+            self.read_op(op::BITS_INOUT)
+        } else {
+            op::BITS_OUT
+        };
         let mask = if n == 8 { 0xFF } else { (1u8 << n) - 1 };
         self.buf.extend_from_slice(&[opc, n - 1, bits & mask]);
         if read {
@@ -309,12 +385,17 @@ impl MpsseCmd {
     /// divide-by-5 off, adaptive clocking off, 3-phase off, loopback off,
     /// ADBUS idle levels/directions, ACBUS all inputs, TCK divisor.
     pub fn jtag_init(&mut self, divisor: u16) -> &mut Self {
+        self.jtag_init_with(divisor, CablePins::GENERIC)
+    }
+
+    /// [`Self::jtag_init`] with a cable's extra GPIO levels.
+    pub fn jtag_init_with(&mut self, divisor: u16, pins: CablePins) -> &mut Self {
         self.div5(false)
             .adaptive(false)
             .three_phase(false)
             .loopback(false)
-            .set_low(pin::JTAG_IDLE, pin::JTAG_DIR)
-            .set_high(0x00, 0x00)
+            .set_low(pins.low_val, pins.low_dir)
+            .set_high(pins.high_val, pins.high_dir)
             .divisor(divisor)
     }
 
@@ -459,6 +540,23 @@ mod tests {
             ]
         );
         assert_eq!(c.read_len(), 0);
+    }
+
+    #[test]
+    fn digilent_cables_enable_their_jtag_buffers() {
+        assert_eq!(
+            CablePins::for_usb(Some("Digilent"), Some("Digilent USB Device")),
+            CablePins::DIGILENT
+        );
+        assert_eq!(
+            CablePins::for_usb(Some("FTDI"), Some("Dual RS232-HS")),
+            CablePins::GENERIC
+        );
+        let mut c = MpsseCmd::new();
+        c.jtag_init_with(0x0001, CablePins::DIGILENT);
+        assert_eq!(&c.bytes()[4..10], &[0x80, 0xE8, 0xEB, 0x82, 0x00, 0x60]);
+        // TDO (ADBUS2) must stay an input on every profile.
+        assert_eq!(CablePins::DIGILENT.low_dir & pin::TDO, 0);
     }
 
     #[test]

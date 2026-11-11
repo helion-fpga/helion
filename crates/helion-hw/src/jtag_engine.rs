@@ -40,6 +40,10 @@ pub trait MpssePort: Send {
     fn is_mock(&self) -> bool {
         false
     }
+    /// GPIO levels this cable needs besides TCK/TDI/TDO/TMS.
+    fn pins(&self) -> mpsse::CablePins {
+        mpsse::CablePins::GENERIC
+    }
 }
 
 /// IEEE 1149.1 TAP controller states (all 16).
@@ -232,7 +236,8 @@ impl<P: MpssePort> JtagEngine<P> {
         port.usb_reset()?;
         port.set_latency_timer(2)?;
         port.set_bitmode(0x00, mpsse::BITMODE_RESET)?;
-        port.set_bitmode(mpsse::pin::JTAG_DIR, mpsse::BITMODE_MPSSE)?;
+        let pins = port.pins();
+        port.set_bitmode(pins.low_dir, mpsse::BITMODE_MPSSE)?;
         port.purge()?;
         // AN_135 sync: a bogus opcode must echo back as 0xFA, opcode.
         for bogus in [0xAAu8, 0xAB] {
@@ -249,7 +254,7 @@ impl<P: MpssePort> JtagEngine<P> {
         }
         let divisor = mpsse::divisor_for_hz(tck_hz);
         let mut c = MpsseCmd::new();
-        c.jtag_init(divisor);
+        c.jtag_init_with(divisor, pins);
         port.write(c.bytes())?;
         let mut e = Self {
             port,
@@ -288,6 +293,15 @@ impl<P: MpssePort> JtagEngine<P> {
 
     pub fn divisor(&self) -> u16 {
         self.divisor
+    }
+
+    /// `true` when TDO is sampled on the falling TCK edge (high TCK).
+    pub fn read_falling(&self) -> bool {
+        match std::env::var("HELION_JTAG_READ_EDGE").as_deref() {
+            Ok("falling") => true,
+            Ok("rising") => false,
+            _ => self.tck_hz() > mpsse::READ_FALLING_ABOVE_HZ,
+        }
     }
 
     pub fn tck_hz(&self) -> u32 {
@@ -410,6 +424,7 @@ impl<P: MpssePort> JtagEngine<P> {
         let enter = self.state.path_to(shift);
         self.queue_tms(&enter, false);
         let mut cmd = MpsseCmd::new();
+        cmd.read_on_falling(self.read_falling());
         let body = n - 1;
         let whole = body / 8;
         let rem = body % 8;

@@ -12,7 +12,7 @@
 //!   [`crate::views::hw_native::open_cable`]) and enumerates the hub.
 //! - ILA arm/upload, VIO refresh/drive and AXI transactions are BSCAN hub
 //!   frames on that cable, each on a worker; the UI keeps a snapshot that
-//!   names the cable (`native FTDI · not yet verified on a board`).
+//!   names the cable (`native FTDI · USB (chain scan verified on hardware; programming unverified)`).
 //!
 //! openFPGALoader cables are refused with the reason: openFPGALoader cannot
 //! shift `USER1` data registers.

@@ -88,6 +88,17 @@ pub fn enumerate_ftdi() -> NativeUsbScan {
 
 #[cfg(feature = "usb-native")]
 fn enumerate_ftdi_rusb() -> NativeUsbScan {
+    // Unit tests never see (or open, or write to) a real cable: one plugged
+    // into the dev machine would otherwise get Helion opcodes shifted into it.
+    // HELION_TEST_REAL_USB=1 opts a deliberate hardware test run back in.
+    #[cfg(test)]
+    if std::env::var_os("HELION_TEST_REAL_USB").is_none() {
+        return NativeUsbScan {
+            probes: Vec::new(),
+            note: "test build: real USB hidden (set HELION_TEST_REAL_USB=1 to expose it)".into(),
+            feature_enabled: true,
+        };
+    }
     let devices = match rusb::devices() {
         Ok(d) => d,
         Err(e) => {
