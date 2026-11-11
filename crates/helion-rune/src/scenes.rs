@@ -138,6 +138,38 @@ pub const ALL: &[SceneExpect] = &[
         absent: &["summary", "timing-pane", "start-page"],
     },
     SceneExpect {
+        name: "editor-outline",
+        surface: "editor",
+        keys: &[
+            "editor-outline",
+            "editor-outline-head",
+            "editor-outline-count",
+            "editor-sym-0",
+            "editor-field",
+            "editor-tool-outline",
+            "editor-tool-definition",
+        ],
+        absent: &["editor-rows", "summary"],
+    },
+    SceneExpect {
+        name: "editor-diagnostics",
+        surface: "editor",
+        keys: &[
+            "editor-diag-count",
+            "editor-tick-0",
+            "editor-find-case",
+            "editor-tool-bookmark",
+            "editor-tool-next-bookmark",
+        ],
+        absent: &["editor-rows", "summary"],
+    },
+    SceneExpect {
+        name: "editor-large",
+        surface: "editor",
+        keys: &["editor-scroll", "editor-row-0", "editor-gutter-0", "editor-outline"],
+        absent: &["editor-field", "summary"],
+    },
+    SceneExpect {
         name: "console",
         surface: "console",
         keys: &[
@@ -1567,4 +1599,38 @@ pub fn xdc_wizard_review(s: &mut AppState) {
         });
     }
     s.toasts.items.clear();
+}
+
+/// Editor with a real sv-parser error in the demo buffer (diagnostics as the
+/// worker would leave them), a bookmark, and case-insensitive find.
+pub fn editor_diagnostics(s: &mut AppState) {
+    s.center = crate::state::CenterPane::Editor;
+    crate::views::editor::sync_edit(s);
+    let mut text = s.editor.edit.text.clone();
+    if let Some(at) = text.find("reg divclk = 1'b0;") {
+        // Drop the semicolon: the next line is where sv-parser stops.
+        text.replace_range(at + 17..at + 18, "");
+    }
+    s.editor.lines = text.lines().map(str::to_string).collect();
+    s.editor.edit = rune::TextEdit::new(text.clone());
+    let tab = s.editor.tabs[s.editor.active].clone();
+    s.editor.diag.items = crate::views::editor_diag::compute(&text, &tab);
+    s.editor.diag.key = Some((tab, crate::views::editor_scale::fingerprint(&text)));
+    crate::views::editor_diag::toggle_bookmark(s, 2);
+    s.editor.find_open = true;
+    s.editor.find_ignore_case = true;
+    s.editor.find_query = rune::TextEdit::new("CLK");
+    let line = s.editor.diag.items.first().map(|d| d.line).unwrap_or(0);
+    crate::views::editor::move_cursor_to(s, line);
+}
+
+/// The 27k-line `examples/ysyx_ibex.sv` (the old IDE's large-file case) in
+/// virtual-row mode with the outline open.
+pub fn editor_large(s: &mut AppState) {
+    s.center = crate::state::CenterPane::Editor;
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/ysyx_ibex.sv");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        crate::views::editor::open_file_tab(s, "ysyx_ibex.sv".into(), text, path);
+    }
+    s.editor.outline_open = true;
 }
