@@ -337,6 +337,15 @@ pub fn write_cfgmem_mcs(image: &[u8], base_addr: u32, bus_width: CfgBusWidth) ->
 /// Parse and validate an Intel HEX (`.mcs`) configuration image, verifying every record's
 /// two's-complement checksum and reconstructing the contiguous flash byte image.
 pub fn parse_cfgmem_mcs(mcs_text: &str, bus_width: CfgBusWidth) -> Result<Vec<u8>, String> {
+    parse_cfgmem_mcs_at(mcs_text, bus_width).map(|(_, bytes)| bytes)
+}
+
+/// Like [`parse_cfgmem_mcs`], also returning the lowest flash byte address
+/// (the `write_cfgmem -loadbit "up <addr>"` start the image was built for).
+pub fn parse_cfgmem_mcs_at(
+    mcs_text: &str,
+    bus_width: CfgBusWidth,
+) -> Result<(u32, Vec<u8>), String> {
     let mut upper_addr: u32 = 0;
     let mut bytes_map: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut min_addr: Option<u32> = None;
@@ -425,9 +434,9 @@ pub fn parse_cfgmem_mcs(mcs_text: &str, bus_width: CfgBusWidth) -> Result<Vec<u8
     }
 
     if bus_width.bit_swap_required() {
-        Ok(swap_byte_bits(&out))
+        Ok((base, swap_byte_bits(&out)))
     } else {
-        Ok(out)
+        Ok((base, out))
     }
 }
 

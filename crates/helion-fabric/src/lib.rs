@@ -752,7 +752,11 @@ impl Fabric {
 
     /// Read programmed BRAM INIT word `addr` of BRAM major `idx` (not pack-only).
     pub fn bram_init_word(&self, idx: u16, addr: usize) -> u64 {
-        let minor = 1u8 + addr as u8;
+        // INIT minors are 1..=255; past that the word does not exist (the
+        // USR1 read pointer can walk off the end of a bank).
+        let Ok(minor) = u8::try_from(addr + 1) else {
+            return 0;
+        };
         self.frames
             .get(&(Far::BRAM, idx, minor))
             .copied()
