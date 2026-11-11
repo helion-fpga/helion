@@ -660,6 +660,17 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         s.center = state::CenterPane::Coverage;
         views::tb::seed_coverage_fixture(s);
     }),
+    ("coverage-light", |s| {
+        s.center = state::CenterPane::Coverage;
+        s.theme = theme::ThemeMode::Light;
+        views::tb::seed_coverage_fixture(s);
+    }),
+    ("eco-light", |s| {
+        s.center = state::CenterPane::Eco;
+        s.theme = theme::ThemeMode::Light;
+        views::reports::demo_impl_complete(s);
+        views::eco::scene_fill(s);
+    }),
     ("coverage-empty", |s| {
         s.center = state::CenterPane::Coverage;
     }),

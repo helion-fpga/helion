@@ -1674,6 +1674,18 @@ pub const ALL: &[SceneExpect] = &[
         absent: &["summary", "cov-empty"],
     },
     SceneExpect {
+        name: "coverage-light",
+        surface: "coverage",
+        keys: &["cov-pane", "cov-kpi-lines", "cov-line-0"],
+        absent: &["summary", "cov-empty"],
+    },
+    SceneExpect {
+        name: "eco-light",
+        surface: "eco",
+        keys: &["eco-pane", "eco-form", "eco-change-0"],
+        absent: &["summary", "eco-empty"],
+    },
+    SceneExpect {
         name: "coverage-empty",
         surface: "coverage",
         keys: &["cov-pane", "cov-empty", "cov-open-sim"],
