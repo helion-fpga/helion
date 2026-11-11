@@ -331,6 +331,7 @@ fn zedboard_e2e_bitstream() {
         idcode: IDCODE_XC7Z020,
         part_name: "xc7z020clg484-1".to_string(),
         design_source: "zedboard_blinky;Generator=helion-xilinx7".to_string(),
+        write_crc: true,
         ..BitstreamOptions::xc7frames2bit("xc7z020clg484-1", "zedboard_blinky.frm", "2026/10/22", "00:00:00")
     };
     let bit = bitstream::write_bit(&payload, &opts).expect("write .bit");

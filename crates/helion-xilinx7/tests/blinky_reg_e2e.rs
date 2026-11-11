@@ -240,6 +240,7 @@ fn blinky_reg_e2e_bitstream() {
         idcode: IDCODE_XC7Z020,
         part_name: "xc7z020clg484-1".to_string(),
         design_source: "blinky_reg;Generator=helion-xilinx7".to_string(),
+        write_crc: true,
         ..BitstreamOptions::xc7frames2bit("xc7z020clg484-1", "blinky_reg.frm", "2026/11/08", "00:00:00")
     };
     let bit = bitstream::write_bit(&payload, &opts).expect("write .bit");
@@ -546,6 +547,7 @@ fn blinky_reg_carry_e2e_fasm() {
         idcode: IDCODE_XC7Z020,
         part_name: "xc7z020clg484-1".to_string(),
         design_source: "blinky_reg_carry;Generator=helion-xilinx7".to_string(),
+        write_crc: true,
         ..BitstreamOptions::xc7frames2bit("xc7z020clg484-1", "blinky_reg_carry.frm", "2026/11/08", "00:00:00")
     };
     let bit = bitstream::write_bit(&payload, &opts).expect("write .bit");
