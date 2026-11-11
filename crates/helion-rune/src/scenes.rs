@@ -1144,6 +1144,30 @@ pub const ALL: &[SceneExpect] = &[
         absent: &["reports-no-run", "reports-method-hint", "reports-util"],
     },
     SceneExpect {
+        name: "constraints",
+        surface: "constraints",
+        keys: &[
+            "constraints-pane",
+            "constraints-header",
+            "constraints-file",
+            "constraints-open-editor",
+            "constraints-wizard",
+            "constraints-clocks",
+            "constraints-row-0",
+            "constraints-row-1",
+            "constraints-io-delay",
+            "constraints-exceptions",
+            "constraints-source",
+            "constraints-source-line",
+        ],
+        absent: &[
+            "constraints-errors",
+            "constraints-source-hint",
+            "summary",
+            "editor",
+        ],
+    },
+    SceneExpect {
         name: "palette-files",
         surface: "palette",
         keys: &[

@@ -232,6 +232,16 @@ pub const COMMANDS: &[&str] = &[
     "cancel_runs",
     "open_report",
     "launch_simulation",
+    // Rune analysis reports: navigate to the report surface, re-run the
+    // engine where the last run left inputs, and return the text dump.
+    "report_timing_summary",
+    "report_clock_interaction",
+    "report_cdc",
+    "report_clock_networks",
+    "report_power",
+    "report_methodology",
+    "report_drc",
+    "report_constraints",
 ];
 
 /// Max nested `[...]` evaluation depth (mirrors the real interp's cap idea;
@@ -2686,6 +2696,14 @@ fn dispatch_host(
         "hds::flow" => Ctl::Value("synth opt place route bits hw".into()),
         "hds::tree" => Ctl::Value(s.tcl.tree_nodes.join(" ")),
         "open_report" => cmd_open_report(s, argv, line),
+        "report_timing_summary"
+        | "report_clock_interaction"
+        | "report_cdc"
+        | "report_clock_networks"
+        | "report_power"
+        | "report_methodology"
+        | "report_drc"
+        | "report_constraints" => cmd_report_analysis(s, name, argv, line),
         _ => unknown_command(s, name, line),
     }
 }
@@ -4288,6 +4306,119 @@ fn cmd_open_report(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
     Ctl::Value(String::new())
 }
 
+/// The Rune analysis report verbs: navigate to the report surface, re-run
+/// the engine where the last run left its inputs (STA for the timing
+/// summary and methodology, the DRC deck, `report_power`), and return the
+/// text dump of the resulting state. Missing results are honest errors
+/// naming the run that produces them.
+fn cmd_report_analysis(s: &mut AppState, name: &str, argv: &[String], line: usize) -> Ctl {
+    use crate::analysis as an;
+    use crate::state::CenterPane;
+    use crate::views::reports::ReportNav;
+    use crate::views::timing::TimingNav;
+    if argv.len() != 1 {
+        return Ctl::err(line, wrong_args(name));
+    }
+    let no_timing = || {
+        Ctl::err(
+            line,
+            format!("{name}: no timing results (launch_runs synth_1 or impl_1 first)"),
+        )
+    };
+    let goto_timing = |s: &mut AppState, nav: TimingNav| {
+        s.navigate(CenterPane::Timing);
+        s.timing_view.selected = nav;
+    };
+    let goto_report = |s: &mut AppState, nav: ReportNav| {
+        s.navigate(CenterPane::Reports);
+        s.reports_view.selected = nav;
+    };
+    match name {
+        "report_timing_summary" => {
+            goto_timing(s, TimingNav::Summary);
+            if an::timing_unavailable(s).is_none() {
+                if let Err(e) = an::rerun_timing(s) {
+                    return Ctl::err(line, format!("{name}: {e}"));
+                }
+            }
+            if !s.timing.has_run {
+                return no_timing();
+            }
+            Ctl::Value(an::timing_summary_text(&s.timing))
+        }
+        "report_clock_interaction" => {
+            goto_timing(s, TimingNav::ClockInteraction);
+            if !s.timing.has_run {
+                return no_timing();
+            }
+            Ctl::Value(an::clock_interaction_text(&s.timing))
+        }
+        "report_cdc" => {
+            goto_timing(s, TimingNav::InterClock);
+            if !s.timing.has_run {
+                return no_timing();
+            }
+            Ctl::Value(an::cdc_text(&s.timing))
+        }
+        "report_clock_networks" => {
+            goto_timing(s, TimingNav::ClockSummary);
+            if !s.timing.has_run {
+                return no_timing();
+            }
+            Ctl::Value(an::clock_networks_text(&s.timing))
+        }
+        "report_power" => {
+            goto_report(s, ReportNav::Power);
+            if an::timing_unavailable(s).is_none() {
+                if let Err(e) = an::rerun_power(s) {
+                    return Ctl::err(line, format!("{name}: {e}"));
+                }
+            }
+            if !an::power_ready(s) {
+                return Ctl::err(
+                    line,
+                    format!("{name}: no power results (launch_runs synth_1 or impl_1 first)"),
+                );
+            }
+            Ctl::Value(an::power_text(&s.power))
+        }
+        "report_methodology" => {
+            goto_report(s, ReportNav::Methodology);
+            if an::timing_unavailable(s).is_none() {
+                if let Err(e) = an::rerun_methodology(s) {
+                    return Ctl::err(line, format!("{name}: {e}"));
+                }
+            }
+            if !s.timing.has_run {
+                return no_timing();
+            }
+            Ctl::Value(an::methodology_text(&s.timing))
+        }
+        "report_drc" => {
+            goto_report(s, ReportNav::Drc);
+            if an::drc_unavailable(s).is_none() {
+                if let Err(e) = an::rerun_drc(s) {
+                    return Ctl::err(line, format!("{name}: {e}"));
+                }
+            }
+            if !s.drc.has_run {
+                return Ctl::err(
+                    line,
+                    format!("{name}: no placed design (launch_runs impl_1 or place_design first)"),
+                );
+            }
+            Ctl::Value(an::drc_text(&s.drc))
+        }
+        _ => {
+            s.navigate(CenterPane::Constraints);
+            let parsed = crate::views::constraints::parse_constraints(
+                &crate::views::constraints::xdc_lines(s),
+            );
+            Ctl::Value(crate::views::constraints::constraints_text(&parsed))
+        }
+    }
+}
+
 // ---- -filter expression language (mirroring `interp.rs:2239`) ----
 
 /// Evaluate a Vivado-style `-filter` expression (`==`, `!=`, `=~`, `!~`,
@@ -4830,6 +4961,35 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
             "open a report surface",
         ),
         "launch_simulation" => ("launch_simulation", "start a real testbench simulation run"),
+        "report_timing_summary" => (
+            "report_timing_summary",
+            "re-run STA on the last run's design and open the Design Timing Summary",
+        ),
+        "report_clock_interaction" => (
+            "report_clock_interaction",
+            "open the From x To clock interaction matrix",
+        ),
+        "report_cdc" => ("report_cdc", "open the clock-domain crossing report"),
+        "report_clock_networks" => (
+            "report_clock_networks",
+            "open the clock trees: loads, buffers, fanout, insertion",
+        ),
+        "report_power" => (
+            "report_power",
+            "re-run report_power on the last run's design and open it",
+        ),
+        "report_methodology" => (
+            "report_methodology",
+            "re-run the methodology checks and open them",
+        ),
+        "report_drc" => (
+            "report_drc",
+            "re-run DRC (routed, or pre-route on a placed design) and open it",
+        ),
+        "report_constraints" => (
+            "report_constraints",
+            "open the Timing Constraints parsed from the project XDC",
+        ),
         _ => return None,
     })
 }
@@ -4849,6 +5009,8 @@ fn help_overview() -> String {
         "  create_clock report_timing report_utilization mark_debug eco open_hw_manager program_hw report_die report_featuremap",
         "More: unset list_properties read_verilog read_vhdl add_probe program_hw_devices report_hw_targets write_hnf",
         "  hds::synth hds::impl hds::flow hds::tree | history launch_runs cancel_runs open_report",
+        "Reports: report_timing_summary report_clock_interaction report_cdc report_clock_networks",
+        "  report_power report_methodology report_drc report_constraints",
         "help <command> for usage. See docs/tcl-subset.md for the supported subset.",
     ]
     .join("\n")
@@ -6666,8 +6828,17 @@ mod tests {
             "cancel_runs",
             "open_report",
             "launch_simulation",
+            "report_timing_summary",
+            "report_clock_interaction",
+            "report_cdc",
+            "report_clock_networks",
+            "report_power",
+            "report_methodology",
+            "report_drc",
+            "report_constraints",
         ] {
             assert!(COMMANDS.contains(&extra), "rune-only {extra} must stay");
+            assert!(help_topic(extra).is_some(), "rune-only {extra} needs help");
         }
     }
 

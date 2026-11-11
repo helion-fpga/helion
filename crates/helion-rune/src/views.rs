@@ -2,6 +2,7 @@
 
 pub mod chrome;
 pub mod console;
+pub mod constraints;
 pub mod debug;
 pub mod device;
 pub mod dialogs;
