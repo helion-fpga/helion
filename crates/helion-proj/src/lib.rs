@@ -17,6 +17,7 @@ pub mod reports;
 pub mod io_reports;
 pub mod eco;
 pub mod dfx;
+pub mod prj_dfx;
 pub mod ooc;
 pub mod tcl;
 
@@ -1856,8 +1857,12 @@ pub struct ProjectFile {
     pub pulltypes: Vec<(String, String)>,
     pub diff_terms: Vec<(String, String)>,
     pub in_terms: Vec<(String, String)>,
-    /// Floorplan pblocks (`create_pblock` / `resize_pblock` / `add_cells_to_pblock`).
+    /// Floorplan pblocks (`create_pblock` / `resize_pblock` /
+    /// `add_cells_to_pblock` / `delete_pblocks`).
     pub pblocks: Vec<PrjPblock>,
+    /// UG909 reconfigurable partitions (`create_partition` /
+    /// `add_reconfig_module` …, see [`prj_dfx`]).
+    pub partitions: Vec<prj_dfx::PrjPartition>,
     /// Implementation runs (`create_run impl_1 -strategy Default`).
     pub impl_runs: Vec<PrjImplRun>,
     /// Debug nets (`mark_debug <net>` / `set_property MARK_DEBUG`): ILA probes
@@ -2214,6 +2219,21 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
                     }
                 }
             }
+            "delete_pblocks" => {
+                // `delete_pblocks [get_pblocks a] b -hier`: drop each named
+                // pblock (its members are released) and unbind partitions.
+                for tok in toks {
+                    let t = tok.trim_matches(|c: char| "{}[]".contains(c));
+                    if t.is_empty() || t.starts_with('-') || prj_token_is_helper(t) {
+                        continue;
+                    }
+                    p.pblocks.retain(|b| b.name != t);
+                    prj_dfx::release_pblock(&mut p.partitions, t);
+                }
+            }
+            c if prj_dfx::VERBS.contains(&c) => {
+                prj_dfx::apply(&mut p.partitions, line)?;
+            }
             "create_run" => {
                 let rest: Vec<&str> = toks.collect();
                 let mut name = String::new();
@@ -2415,6 +2435,7 @@ pub fn format_prj(prj: &ProjectFile) -> String {
             out.push_str(&format!("add_cells_to_pblock {} {c}\n", pb.name));
         }
     }
+    out.push_str(&prj_dfx::format(&prj.partitions));
     for r in &prj.impl_runs {
         let strat = if r.strategy.is_empty() {
             "Default"
@@ -2945,6 +2966,70 @@ write_checkpoint counter.hckp
         assert_eq!(again.checkpoint_path, prj.checkpoint_path);
         assert_eq!(again.sources, prj.sources);
         assert_eq!(again.constraint_files, prj.constraint_files);
+    }
+
+    #[test]
+    fn delete_pblocks_releases_members_and_round_trips() {
+        let text = "part HL10T-C32-1\nread_sv top.sv\n\
+create_pblock pa\nresize_pblock pa -add {CLB_X1Y1:CLB_X2Y2}\nadd_cells_to_pblock pa u_lut0\n\
+create_pblock pb\nresize_pblock pb -add {CLB_X4Y4:CLB_X5Y5}\n\
+create_partition rp0 -pblock pa -instance u_rm\n\
+delete_pblocks [get_pblocks pa]\n";
+        let prj = load_prj(text).unwrap();
+        assert_eq!(prj.pblocks.len(), 1);
+        assert_eq!(prj.pblocks[0].name, "pb");
+        assert_eq!(prj.partitions[0].pblock, None, "the partition lost its pblock");
+        let design = Design::structural_counter();
+        assert!(
+            pblock_regions(&design, &prj.pblocks)
+                .iter()
+                .all(|r| !r.cells.iter().any(|c| c == "u_lut0")),
+            "deleted pblock's members are no longer constrained"
+        );
+        let saved = format_prj(&prj);
+        assert!(!saved.contains("create_pblock pa\n"), "{saved}");
+        let again = load_prj(&saved).unwrap();
+        assert_eq!(again.pblocks, prj.pblocks);
+        assert_eq!(again.partitions, prj.partitions);
+        // Recreating after delete starts from scratch (no stale members).
+        let re = load_prj(&format!("{text}create_pblock pa\n")).unwrap();
+        assert!(re.pblocks.iter().any(|p| p.name == "pa" && p.cells.is_empty() && !p.ranged));
+        // Tcl session verb.
+        let mut t = VivadoTclSession::new(Mode::Project);
+        t.eval("create_pblock pq").unwrap();
+        t.eval("create_pblock pr").unwrap();
+        t.eval("delete_pblocks pq").unwrap();
+        assert_eq!(t.eval("get_pblocks").unwrap(), "pr");
+    }
+
+    #[test]
+    fn format_prj_round_trips_dfx_partitions() {
+        let text = "part HL10T-C32-1\nread_sv top.v\n\
+create_pblock pblock_rp0\nresize_pblock pblock_rp0 -add {CLB_X6Y5:CLB_X8Y8}\n\
+create_partition rp0 -pblock pblock_rp0 -instance u_rm\n\
+add_reconfig_module rp0 rm_inv rtl/rm_inv.v\n\
+add_reconfig_module rp0 rm_buf {rtl/rm buf.v} rtl/extra.v\n\
+add_reconfig_module rp0 rm_old old.v\ndelete_reconfig_module rp0 rm_old\n\
+create_partition rp1\ndelete_partition rp1\n";
+        let prj = load_prj(text).unwrap();
+        assert_eq!(prj.partitions.len(), 1);
+        let rp = &prj.partitions[0];
+        assert_eq!(rp.pblock.as_deref(), Some("pblock_rp0"));
+        assert_eq!(rp.instance.as_deref(), Some("u_rm"));
+        let names: Vec<&str> = rp.modules.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["rm_inv", "rm_buf"]);
+        assert_eq!(rp.modules[1].sources, ["rtl/rm buf.v", "rtl/extra.v"]);
+        let saved = format_prj(&prj);
+        assert!(saved.contains("add_reconfig_module rp0 rm_buf {rtl/rm buf.v} rtl/extra.v"), "{saved}");
+        let again = load_prj(&saved).unwrap();
+        assert_eq!(again.partitions, prj.partitions);
+        let dfx = again.partitions[0]
+            .to_dfx(&again.pblocks, Some(std::path::Path::new("/proj/p.prj")))
+            .unwrap();
+        assert_eq!((dfx.pblock.x0, dfx.pblock.y1), (6, 8));
+        assert_eq!(dfx.instance, "u_rm");
+        // Unknown verbs from newer files are still ignored; bad DFX lines are errors.
+        assert!(load_prj("read_sv a.v\nadd_reconfig_module rp0 m\n").is_err());
     }
 
     #[test]
