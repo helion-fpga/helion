@@ -3,15 +3,16 @@ body:
   - type: markdown
     attributes:
       value: |
-        Helion-legal only. Public vendor guides are a capability checklist, not source to copy.
+        Ideas are welcome. Helion is original CAD: public vendor guides are a capability checklist, not source to copy.
   - type: textarea
     id: idea
     attributes:
       label: Idea
+      description: What you would like Helion to do, and why.
     validations:
       required: true
   - type: textarea
     id: engine
     attributes:
-      label: Which engine would own it
-      placeholder: helion-sv / sta / gui IdeModel / docs / …
+      label: Which part of Helion would own it
+      placeholder: helion-sv / helion-sta / helion-rune (IDE) / helion-hw / docs / ...

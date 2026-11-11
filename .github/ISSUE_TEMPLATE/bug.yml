@@ -1,16 +1,34 @@
 name: Bug report
-description: Something in Helion CAD or the IDE is wrong
+description: Something in Helion (CLI, IDE, engines, hardware) is wrong
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        Helion engines only (HAD / HNF / Session / STA / sim). Do not attach AMD/Xilinx bitstreams or UNISIM netlists.
+        Thanks for reporting. Please do not attach vendor bitstreams, UNISIM netlists or encrypted vendor IP.
+        Security issues go through [SECURITY.md](https://github.com/helion-fpga/helion/blob/master/SECURITY.md), not here.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - IDE (helion-ide)
+        - CLI (helion)
+        - Synthesis (SystemVerilog / VHDL / HLS)
+        - Place and route
+        - Timing, power, DRC
+        - Simulation and waveforms
+        - Hardware Manager and debug (JTAG, ILA, VIO)
+        - Device families (HL10, iCE40, ECP5, 7-series)
+        - Build, packaging, docs
+        - Other
+    validations:
+      required: true
   - type: textarea
     id: what
     attributes:
       label: What happened
-      placeholder: Command, pane, or test that failed
+      description: The command, pane or test, and what it did.
     validations:
       required: true
   - type: textarea
@@ -19,18 +37,39 @@ body:
       label: What you expected
     validations:
       required: true
-  - type: input
-    id: cmd
+  - type: textarea
+    id: repro
     attributes:
-      label: Command or path
-      placeholder: cargo test -p helion-rune --lib … / helion-ide --headless examples/counter.sv
+      label: Steps to reproduce
+      description: The smallest design and the exact commands. Attach the design if you can.
+      placeholder: |
+        1. helion-ide examples/counter.prj
+        2. Run Implementation
+        3. ...
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `helion-ide --version` (or `helion --version`), or the commit you built.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15 (Apple Silicon) / Ubuntu 24.04 x86_64 / ...
+    validations:
+      required: true
   - type: textarea
     id: log
     attributes:
-      label: Log excerpt
+      label: Log excerpt or `helion-ide --doctor` output
       render: text
-  - type: input
+  - type: dropdown
     id: gold
     attributes:
-      label: Did empty-XDC counter still print WNS_PS=9640?
-      placeholder: yes / no / did not run
+      label: Does `helion-ide --headless examples/counter.sv` still print WNS_PS=9640?
+      options:
+        - "Yes"
+        - "No"
+        - Did not run

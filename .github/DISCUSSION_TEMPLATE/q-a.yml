@@ -4,7 +4,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Questions about building, HAD, or how a crate works. Bugs still go to Issues.
+        Questions about building, using or extending Helion. Bugs go to Issues.
   - type: textarea
     id: q
     attributes:
@@ -12,7 +12,13 @@ body:
     validations:
       required: true
   - type: input
+    id: version
+    attributes:
+      label: Version and platform
+      placeholder: helion-ide --version, and your OS
+  - type: textarea
     id: cmd
     attributes:
-      label: What you already ran
-      placeholder: cargo test -p … / helion-ide --headless examples/counter.sv
+      label: What you already tried
+      placeholder: Commands you ran and what they printed
+      render: text
