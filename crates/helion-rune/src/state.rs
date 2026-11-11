@@ -825,6 +825,8 @@ pub struct AppState {
     pub debug: crate::views::debug::DebugState,
     /// Hardware Manager UI state (cable, detect, program run, STAT).
     pub program: crate::views::program::ProgramState,
+    /// IP Catalog + Block Design state (catalog, selection, BD, outputs).
+    pub ip: crate::views::ip::IpState,
     /// Settings dialog + New Project / Constraints wizard UI state.
     pub dialogs: crate::views::dialogs::DialogState,
     /// Which center surface the shell shows (Summary dashboard or editor).
@@ -868,6 +870,8 @@ pub enum CenterPane {
     Program,
     /// Implementation reports: Utilization / Power / DRC detail bodies.
     Reports,
+    /// IP Catalog + Block Design (IP Integrator canvas, address map, HDL).
+    Ip,
     /// Bitstream: KPIs plus the FAR-addressed configuration frame table.
     Bitstream,
 }
@@ -1015,6 +1019,7 @@ impl AppState {
             sim: crate::views::wave::SimState::default(),
             debug: crate::views::debug::DebugState::default(),
             program: crate::views::program::ProgramState::default(),
+            ip: crate::views::ip::IpState::default(),
             dialogs: crate::views::dialogs::DialogState::default(),
             center: CenterPane::Summary,
             nav_back: Vec::new(),
@@ -1093,6 +1098,7 @@ impl AppState {
         self.drc = DrcState::default();
         self.bitstream = BitstreamState::default();
         self.program.reset_results();
+        self.ip = crate::views::ip::IpState::default();
         self.toasts = ToastState::default();
         self.runs.reset();
         // A new project invalidates the sim log, the live VCD import, and
