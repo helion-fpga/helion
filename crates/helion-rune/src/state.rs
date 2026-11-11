@@ -875,6 +875,8 @@ pub struct AppState {
     pub timing_view: crate::views::timing::TimingView,
     /// Reports center-pane UI state (selected Utilization/Power/DRC entry).
     pub reports_view: crate::views::reports::ReportsView,
+    /// Constraints center-pane UI state (selected constraint row).
+    pub constraints_view: crate::views::constraints::ConstraintsView,
     /// DRC violations reported by the last run (empty = clean).
     pub drc: DrcState,
     /// Bitstream written by the last implementation run.
@@ -934,6 +936,9 @@ pub enum CenterPane {
     Program,
     /// Implementation reports: Utilization / Power / DRC detail bodies.
     Reports,
+    /// Timing constraints parsed from the project XDC: clocks, I/O delay,
+    /// exceptions, I/O placement.
+    Constraints,
 }
 
 /// Status-bar verb. Typed, with the exact Helion wording in one place.
@@ -1072,6 +1077,7 @@ impl AppState {
             sources: crate::views::sources::SourcesState::default(),
             timing_view: crate::views::timing::TimingView::default(),
             reports_view: crate::views::reports::ReportsView::default(),
+            constraints_view: crate::views::constraints::ConstraintsView::default(),
             drc: DrcState::default(),
             schematic: crate::views::schematic::SchematicState::default(),
             device: crate::views::device::DeviceState::default(),

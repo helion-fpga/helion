@@ -452,6 +452,32 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         ];
         s.reports_view.selected_method = Some(0);
     }),
+    ("constraints", |s| {
+        s.center = state::CenterPane::Constraints;
+        s.editor.xdc_lines = [
+            "# Clocks",
+            "create_clock -period 10.000 -name clk [get_ports clk]",
+            "create_generated_clock -name clk_div -source [get_ports clk] -divide_by 4 [get_pins divclk_reg/Q]",
+            "",
+            "# I/O delays",
+            "set_input_delay -clock clk 2.000 [get_ports btn]",
+            "set_output_delay -clock clk 1.500 [get_ports {led[0]}]",
+            "",
+            "# Exceptions",
+            "set_false_path -from [get_ports btn] -to [get_cells sync_reg]",
+            "set_max_delay -datapath_only 4.000 -from [get_cells cnt_reg] -to [get_cells led_reg]",
+            "",
+            "# Pins",
+            "set_property PACKAGE_PIN E3 [get_ports clk]",
+            "set_property IOSTANDARD LVCMOS33 [get_ports clk]",
+            "set_property PACKAGE_PIN H6 [get_ports {led[0]}]",
+            "set_property IOSTANDARD LVCMOS33 [get_ports {led[0]}]",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        s.constraints_view.selected = Some(1);
+    }),
     ("palette-files", |s| {
         views::palette::open_palette(s, views::palette::PaletteMode::Files);
     }),
@@ -744,6 +770,7 @@ fn center_pane(s: &AppState, t: &VivadoTheme) -> El {
         state::CenterPane::Debug => views::debug::debug_pane(s, t),
         state::CenterPane::Program => views::program::program_pane(s, t),
         state::CenterPane::Reports => views::reports::reports_pane(s, t),
+        state::CenterPane::Constraints => views::constraints::constraints_pane(s, t),
     }
 }
 
