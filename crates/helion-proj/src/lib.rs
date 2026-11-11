@@ -17,6 +17,7 @@ pub mod reports;
 pub mod io_reports;
 pub mod eco;
 pub mod dfx;
+pub mod ooc;
 pub mod tcl;
 
 pub mod ip_packager;
