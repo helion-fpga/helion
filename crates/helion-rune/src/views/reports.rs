@@ -204,6 +204,10 @@ pub struct ReportsView {
     pub qor: Option<QorSnapshot>,
     pub qor_error: Option<String>,
     pub selected_qor: Option<String>,
+    /// Selected DRC row (index into [`crate::state::DrcState::items`]).
+    pub selected_drc: Option<usize>,
+    /// Selected methodology row (index into `TimingState::methodology`).
+    pub selected_method: Option<usize>,
 }
 
 /// Fill the typed post-implementation fixture state the report scenes
@@ -286,6 +290,9 @@ pub fn demo_impl_complete(s: &mut AppState) {
         total_mw: 142,
         dynamic_mw: 38,
         static_mw: 104,
+        total_uw: 142_000,
+        dynamic_uw: 38_000,
+        static_uw: 104_000,
         clocks_uw: 12500,
         logic_uw: 8600,
         signals_uw: 9800,

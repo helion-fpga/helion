@@ -8,6 +8,7 @@ pub mod dialogs;
 pub mod editor;
 pub mod palette;
 pub mod program;
+pub mod report_kit;
 pub mod reports;
 pub mod schematic;
 pub mod sources;

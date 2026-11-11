@@ -37,10 +37,10 @@ use std::sync::{
 use rune::Tx;
 
 use crate::state::{
-    AppState, BitstreamState, CdcRow, ClockNetRow, ConsoleLine, DrcItem, DrcSev, HierRow,
-    MethodRow, MsgSev, PowerState, RunStatus, StatusVerb, TimingClock, TimingGroupKind,
-    TimingGroupRow, TimingPathGroup, TimingPathRow, TimingPinRow, TimingState, ToastKind,
-    UtilState,
+    AppState, BitstreamState, CdcRow, ClockInteractionRow, ClockNetRow, ClockRel, ConsoleLine,
+    DrcItem, DrcSev, HierRow, MethodRow, MsgSev, PowerState, RunStatus, StatusVerb, TimingClock,
+    TimingGroupKind, TimingGroupRow, TimingPathGroup, TimingPathRow, TimingPinRow, TimingState,
+    ToastKind, UtilState,
 };
 
 /// Fallback device when the project part has no Helion HAD model (same
@@ -105,6 +105,64 @@ pub struct RunSignoff {
     pub overused: u32,
 }
 
+/// What the last successful run analyzed, kept so reports re-run on demand
+/// (STA, DRC, power, methodology, utilization) without a new flow run.
+/// The design itself is [`RunsState::live_design`].
+#[derive(Clone)]
+pub struct AnalysisCtx {
+    pub kind: RunKind,
+    /// Staged RTL whose sibling `.sdc`/`.xdc` the run loaded; re-analysis
+    /// re-reads it so on-disk constraint edits take effect.
+    pub source: PathBuf,
+    /// Device part the run targeted (fallback already applied).
+    pub part: String,
+    /// Routed result (implementation runs only).
+    pub routed: Option<helion_route::Routed>,
+}
+
+impl std::fmt::Debug for AnalysisCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnalysisCtx")
+            .field("kind", &self.kind)
+            .field("source", &self.source)
+            .field("part", &self.part)
+            .field("routed", &self.routed.is_some())
+            .finish()
+    }
+}
+
+/// How a finished run ended (Run History status column).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunOutcome {
+    Complete,
+    Failed,
+    Cancelled,
+}
+
+impl RunOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            RunOutcome::Complete => "Complete",
+            RunOutcome::Failed => "Failed",
+            RunOutcome::Cancelled => "Cancelled",
+        }
+    }
+}
+
+/// One finished run, recorded when its terminal event lands.
+#[derive(Clone, Debug)]
+pub struct RunRecord {
+    /// 1-based launch order within the session.
+    pub seq: usize,
+    pub kind: RunKind,
+    pub outcome: RunOutcome,
+    /// Worst setup slack the run reported (`None` when it produced none).
+    pub wns_ps: Option<i64>,
+    /// Slice LUTs + registers the run counted (`None` without utilization).
+    pub lut_ff: Option<u32>,
+    pub duration_ms: u64,
+}
+
 /// Real completion payload. Every `Some` was computed from engine reports
 /// on the worker; `None` means that report genuinely could not run (its
 /// reason is in the log) and the old state is kept.
@@ -126,6 +184,8 @@ pub struct RunArtifacts {
     /// One-line real summary for the toast (`"12 cells, 5 endpoints"`).
     pub summary: String,
     pub cells: usize,
+    /// Re-analysis context for on-demand reports.
+    pub analysis: Option<AnalysisCtx>,
 }
 
 /// The live worker handle: its event channel plus the cancel flag the
@@ -135,6 +195,7 @@ struct ActiveRun {
     kind: RunKind,
     rx: Arc<Mutex<mpsc::Receiver<RunEvent>>>,
     cancel: Arc<AtomicBool>,
+    started: std::time::Instant,
 }
 
 impl std::fmt::Debug for ActiveRun {
@@ -169,6 +230,10 @@ pub struct RunsState {
     /// Die geometry cached when the placement lands (views read this; they
     /// only load a HAD model on the no-run-yet path).
     pub live_geom: Option<crate::live::LiveDieGeom>,
+    /// Re-analysis context of the last successful run (`None` until one).
+    pub analysis: Option<AnalysisCtx>,
+    /// Finished runs, oldest first (Summary Run History card).
+    pub history: Vec<RunRecord>,
     active: Option<ActiveRun>,
 }
 
@@ -184,6 +249,8 @@ impl std::fmt::Debug for RunsState {
             )
             .field("live_placed", &self.live_placed.is_some())
             .field("live_part", &self.live_part)
+            .field("analysis", &self.analysis)
+            .field("history", &self.history)
             .field("active", &self.active)
             .finish()
     }
@@ -215,11 +282,40 @@ impl RunsState {
             kind,
             rx: Arc::new(Mutex::new(rx)),
             cancel,
+            started: std::time::Instant::now(),
         });
     }
 
     fn clear_active(&mut self) {
         self.active = None;
+    }
+
+    /// Milliseconds since the active run started (0 when idle).
+    fn active_elapsed_ms(&self) -> u64 {
+        self.active
+            .as_ref()
+            .map(|a| a.started.elapsed().as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Append a finished run to the history (newest last).
+    fn record(
+        &mut self,
+        kind: RunKind,
+        outcome: RunOutcome,
+        wns_ps: Option<i64>,
+        lut_ff: Option<u32>,
+    ) {
+        let duration_ms = self.active_elapsed_ms();
+        let seq = self.history.len() + 1;
+        self.history.push(RunRecord {
+            seq,
+            kind,
+            outcome,
+            wns_ps,
+            lut_ff,
+            duration_ms,
+        });
     }
 
     fn request_cancel(&self) {
@@ -430,6 +526,12 @@ pub fn deliver(s: &mut AppState, kind: RunKind, event: RunEvent) {
                 .count();
             match result {
                 Ok(art) => {
+                    let wns = art.timing.as_ref().and_then(|t| t.wns_ps);
+                    let lut_ff = art.util.as_ref().map(|u| u.luts_used + u.regs_used);
+                    s.runs.record(kind, RunOutcome::Complete, wns, lut_ff);
+                    if art.analysis.is_some() {
+                        s.runs.analysis = art.analysis.clone();
+                    }
                     if let Some(t) = art.timing {
                         s.timing = t;
                     }
@@ -493,6 +595,7 @@ pub fn deliver(s: &mut AppState, kind: RunKind, event: RunEvent) {
                     );
                 }
                 Err(e) => {
+                    s.runs.record(kind, RunOutcome::Failed, None, None);
                     match kind {
                         RunKind::Synth => s.flow.synth = RunStatus::Failed,
                         RunKind::Impl => s.flow.impl_run = RunStatus::Failed,
@@ -517,6 +620,7 @@ pub fn deliver(s: &mut AppState, kind: RunKind, event: RunEvent) {
             s.runs.clear_active();
         }
         RunEvent::Cancelled => {
+            s.runs.record(kind, RunOutcome::Cancelled, None, None);
             match kind {
                 RunKind::Synth => s.flow.synth = RunStatus::NotStarted,
                 RunKind::Impl => s.flow.impl_run = RunStatus::NotStarted,
@@ -686,6 +790,12 @@ fn run_worker(
 
     if kind == RunKind::Synth {
         run_synth_reports(&design, &xdc, &clks, &part_req, &mut art, &send);
+        art.analysis = Some(AnalysisCtx {
+            kind,
+            source: source.clone(),
+            part: part_req.clone(),
+            routed: None,
+        });
         art.design = Some(design);
         art.summary = summarize(&art);
         finish(Ok(art));
@@ -758,6 +868,7 @@ fn run_worker(
     // Live-view payload, cloned before `write_bitstream` reborrows `session`.
     let live_design = design.clone();
     let live_placed = routed.placed.clone();
+    let live_routed = routed.clone();
     let mut timing_opt: Option<helion_sta::TimingResult> = None;
     match helion_sta::report_timing_routed_xdc(design, routed, &clks, &xdc) {
         Ok(t) => {
@@ -882,6 +993,12 @@ fn run_worker(
     art.design = Some(live_design);
     art.placed = Some(live_placed);
     art.part = dev.part.clone();
+    art.analysis = Some(AnalysisCtx {
+        kind,
+        source,
+        part: dev.part.clone(),
+        routed: Some(live_routed),
+    });
     art.summary = summarize(&art);
     finish(Ok(art));
 }
@@ -970,7 +1087,7 @@ fn run_synth_reports(
 
 /// Sibling `.sdc`/`.xdc` first (mirroring `ide.rs:22753 load_sibling_sdc`),
 /// else an implicit 10 ns clock (mirroring `clocks_for_sta`'s fallback).
-fn load_run_constraints(
+pub(crate) fn load_run_constraints(
     source: &PathBuf,
     emit: &impl Fn(String, MsgSev),
 ) -> (helion_sta::Constraints, Vec<helion_sta::Clock>) {
@@ -1012,7 +1129,7 @@ fn load_run_constraints(
 }
 
 /// Project part first, HL10T fallback with a loud warning (never silent).
-fn resolve_device(
+pub(crate) fn resolve_device(
     part_req: &str,
     emit: &impl Fn(String, MsgSev),
 ) -> Result<helion_device::Device, String> {
@@ -1118,7 +1235,7 @@ fn summarize(art: &RunArtifacts) -> String {
 /// Full timing state from one STA analysis: summary slacks plus clocks,
 /// groups, endpoint paths with UG903 pin rows (placed runs only), clock
 /// networks, CDC, methodology, and the raw delay split.
-fn timing_state_from(
+pub(crate) fn timing_state_from(
     s: &helion_sta::TimingSummary,
     timing: Option<&helion_sta::TimingResult>,
     design: &helion_ir::Design,
@@ -1127,6 +1244,7 @@ fn timing_state_from(
 ) -> TimingState {
     let clks = s.clocks.clone();
     let networks = helion_sta::report_clock_networks(&clks, Some(design), placed);
+    let interaction = helion_sta::report_clock_interaction(&clks, xdc, timing);
     let cdc = helion_sta::report_cdc(&clks, xdc, timing, Some(design));
     let methodology = helion_sta::report_methodology(&clks, xdc, timing, Some(design));
     let (r2r_ps, iob_ps, setup_ps, hold_ps, hold_slack_ps, route_ps, clk_net_ps) =
@@ -1154,12 +1272,13 @@ fn timing_state_from(
         clocks: clks.iter().map(clock_row_from).collect(),
         groups: s.groups.iter().map(group_row_from).collect(),
         paths: match (timing, placed) {
-            (Some(t), Some(p)) => extract_timing_paths(design, t, p),
+            (Some(t), Some(p)) => extract_timing_paths(design, t, p, &clks),
             _ => Vec::new(),
         },
         clock_networks: networks.clocks.iter().map(clock_net_row_from).collect(),
         cdc: cdc.violations.iter().map(cdc_row_from).collect(),
         methodology: methodology.checks.iter().map(method_row_from).collect(),
+        clock_interaction: interaction.cells.iter().map(interaction_row_from).collect(),
         r2r_ps,
         iob_ps,
         setup_ps,
@@ -1185,6 +1304,8 @@ fn clock_row_from(c: &helion_sta::Clock) -> TimingClock {
 
 fn group_row_from(g: &helion_sta::TimingSummaryGroup) -> TimingGroupRow {
     TimingGroupRow {
+        whs_ps: g.whs_ps,
+        ths_ps: g.ths_ps,
         name: g.name.clone(),
         from: g.from.clone(),
         to: g.to.clone(),
@@ -1203,9 +1324,11 @@ fn clock_net_row_from(c: &helion_sta::ClockNetwork) -> ClockNetRow {
     ClockNetRow {
         name: c.name.clone(),
         period_ps: c.period_ps,
+        source: c.source.clone(),
         net: c.net.clone(),
         loads: c.n_loads,
         buffers: c.n_buffers,
+        fanout: c.fanout,
         insertion_ps: c.insertion_ps,
     }
 }
@@ -1219,10 +1342,48 @@ fn cdc_row_from(v: &helion_sta::CdcViolation) -> CdcRow {
         endpoints: v.endpoints,
         sync: v.synchronizer,
         wns_ps: v.wns_ps,
+        relation: v.relation.as_str().into(),
     }
 }
 
-fn method_row_from(v: &helion_sta::MethodologyViolation) -> MethodRow {
+fn clock_rel_from(r: helion_sta::ClockRelation) -> ClockRel {
+    use helion_sta::ClockRelation as R;
+    match r {
+        R::Timed => ClockRel::Timed,
+        R::TimedGenerated => ClockRel::TimedGenerated,
+        R::TimedUnsafe => ClockRel::TimedUnsafe,
+        R::TimedDatapath => ClockRel::TimedDatapath,
+        R::FalsePath => ClockRel::FalsePath,
+        R::PartialFalsePath => ClockRel::PartialFalsePath,
+        R::Asynchronous => ClockRel::Asynchronous,
+        R::Exclusive => ClockRel::Exclusive,
+        R::NoPaths => ClockRel::NoPaths,
+    }
+}
+
+fn interaction_row_from(c: &helion_sta::ClockInteractionCell) -> ClockInteractionRow {
+    ClockInteractionRow {
+        from: c.from.clone(),
+        to: c.to.clone(),
+        relation: clock_rel_from(c.relation),
+        common_period_ps: c.common_period_ps,
+        requirement_ps: c.requirement_ps,
+        wns_ps: c.wns_ps,
+        path_count: c.path_count,
+    }
+}
+
+/// STA clock driven from `net` (its source port or name), or the only
+/// clock of a single-clock analysis; `""` when none applies.
+fn clock_of_net(clks: &[helion_sta::Clock], net: &str) -> String {
+    clks.iter()
+        .find(|c| c.source == net || c.name == net)
+        .or_else(|| if clks.len() == 1 { clks.first() } else { None })
+        .map(|c| c.name.clone())
+        .unwrap_or_default()
+}
+
+pub(crate) fn method_row_from(v: &helion_sta::MethodologyViolation) -> MethodRow {
     MethodRow {
         id: v.id.clone(),
         severity: v.severity.as_str().into(),
@@ -1242,6 +1403,7 @@ fn extract_timing_paths(
     design: &helion_ir::Design,
     t: &helion_sta::TimingResult,
     placed: &helion_place::Placed,
+    clks: &[helion_sta::Clock],
 ) -> Vec<TimingPathRow> {
     let site_map = build_site_map(placed);
     let (max_reg, max_iob) = if design.cells.len() > 2_000 {
@@ -1263,6 +1425,12 @@ fn extract_timing_paths(
         let (start, lut) = reg_path_start(design, cname);
         let pins = r2r_pin_rows(design, &site_map, &start, lut.as_deref(), cname);
         let delay_ps = pins.last().map(|p| p.path_ps).unwrap_or(t.r2r_ps);
+        let launch_clock = if is_hff(design, &start) {
+            clock_of_net(clks, hff_clk_net(design, &start))
+        } else {
+            String::new()
+        };
+        let capture_clock = clock_of_net(clks, hff_clk_net(design, cname));
         paths.push(TimingPathRow {
             name: format!("{start}->{cname}"),
             from: start,
@@ -1271,6 +1439,8 @@ fn extract_timing_paths(
             delay_ps,
             group: TimingPathGroup::Register,
             pins,
+            launch_clock,
+            capture_clock,
         });
     }
     let mut iob_count = 0usize;
@@ -1286,6 +1456,11 @@ fn extract_timing_paths(
         let start = iob_path_start(design, cname);
         let pins = iob_pin_rows(design, &site_map, t, &start, cname);
         let delay_ps = pins.last().map(|p| p.path_ps).unwrap_or(t.iob_ps);
+        let launch_clock = if is_hff(design, &start) {
+            clock_of_net(clks, hff_clk_net(design, &start))
+        } else {
+            String::new()
+        };
         paths.push(TimingPathRow {
             name: format!("{start}->{cname}"),
             from: start,
@@ -1294,6 +1469,11 @@ fn extract_timing_paths(
             delay_ps,
             group: TimingPathGroup::Output,
             pins,
+            launch_clock,
+            // Output ports have no capture register; the capture clock is
+            // the `set_output_delay -clock` reference, which helion-sta does
+            // not carry per port.
+            capture_clock: String::new(),
         });
     }
     // Worst slack first so the detail tables open on the critical path.
@@ -1617,7 +1797,7 @@ fn iob_pin_rows(
 /// `ide.rs:25129 refresh_reports`; one FF per LUT site class as in
 /// `ide.rs:20467 vcd_power_report`) plus hierarchy occupancy from the
 /// elaborated design (mirroring `hierarchical_occupancy`).
-fn util_state_from(
+pub(crate) fn util_state_from(
     packed: &helion_pack::Packed,
     design: &helion_ir::Design,
     dev: &helion_device::Device,
@@ -1691,7 +1871,7 @@ fn bump_hier_cell(h: &mut HierRow, kind: &helion_ir::CellKind) {
     }
 }
 
-fn power_state_from(
+pub(crate) fn power_state_from(
     r: &helion_sta::PowerReport,
     oc: &helion_sta::OperatingConditions,
 ) -> PowerState {
@@ -1699,6 +1879,9 @@ fn power_state_from(
         total_mw: (r.total_uw.max(0) / 1000) as u32,
         dynamic_mw: (r.dynamic_uw.max(0) / 1000) as u32,
         static_mw: (r.static_uw.max(0) / 1000) as u32,
+        total_uw: r.total_uw.max(0) as u32,
+        dynamic_uw: r.dynamic_uw.max(0) as u32,
+        static_uw: r.static_uw.max(0) as u32,
         clocks_uw: r.clocks_uw.max(0) as u32,
         logic_uw: r.logic_uw.max(0) as u32,
         signals_uw: r.signals_uw.max(0) as u32,
@@ -1722,7 +1905,7 @@ fn power_state_from(
     }
 }
 
-fn drc_item_from(v: &helion_drc::DrcViolation) -> DrcItem {
+pub(crate) fn drc_item_from(v: &helion_drc::DrcViolation) -> DrcItem {
     DrcItem {
         id: v.id.clone(),
         severity: match v.severity {
@@ -1932,6 +2115,7 @@ mod tests {
             design: None,
             placed: None,
             part: String::new(),
+            analysis: None,
         };
         deliver(&mut s, RunKind::Synth, RunEvent::Finished(Ok(art)));
         assert_eq!(s.flow.synth, RunStatus::Complete);

@@ -12,10 +12,12 @@
 //!
 //! Data shapes mirror `helion-gui` read-only: [`TimingState`] numbers mirror
 //! `helion_sta::TimingSummary` picosecond slacks, clocks/groups/paths mirror
-//! the STA reports, and [`PathRow`] renders `ide.rs::TimingPathPin`-shaped
-//! rows (`cell`/`incr`/`path`/`location`/`net`) from real run state. Every
-//! table binds [`AppState::timing`]; empty sections render a disabled reason,
-//! never demo constants.
+//! the STA reports, and the pin tables render `ide.rs::TimingPathPin`-shaped
+//! rows (`cell`/`incr`/`path`/`location`/`net`/`fanout`) from real run state.
+//! Every table binds [`AppState::timing`]; empty sections render a disabled
+//! reason, never demo constants. The path table/detail live in [`paths`];
+//! the clock interaction matrix, CDC, clock networks, groups and the slack
+//! histogram live in [`clocks`].
 //!
 //! Rune API citations (rev `a7f276c3630f85a06a0230295da4d2bd172d8d3b`):
 //! - `crates/rune/src/el.rs`: `row()/col()/el()/text()/icon()`, `ScrollSpec`.
@@ -23,16 +25,23 @@
 //! - `crates/rune/src/el/text.rs`: `.truncate()` for long labels.
 //! - `crates/rune-kit/src/glyphs.rs`: `TRIANGLE_RIGHT`, `CIRCLE_X`.
 
-use rune::{Align, El, ScrollSpec, col, el, icon, row, text};
+mod clocks;
+mod paths;
+
+pub use paths::{PathSort, path_elements, toggle_sort};
+
+use rune::{El, ScrollSpec, col, el, icon, row, text};
 use rune_kit::glyphs;
 
 use crate::state::{
-    AppState, ConsoleLine, MsgSev, RunStatus, TimingGroupKind, TimingPathGroup, TimingPathRow,
-    TimingState,
+    AppState, RunStatus, TimingGroupKind, TimingPathGroup, TimingPathRow, TimingState,
 };
 use crate::theme::VivadoTheme;
+use crate::views::report_kit as kit;
 use crate::views::sources::pane_header;
 use crate::views::summary::format_ns;
+
+use paths::PinRow;
 
 /// Report-tree width (the brief shows a narrow left nav beside wide tables).
 const NAV_W: f32 = 220.0;
@@ -45,18 +54,14 @@ const LABEL_W: f32 = 208.0;
 /// Summary-grid row-label width (short metric names; acronyms live in the
 /// column headers so the three analysis columns fit the center pane).
 const SUM_LABEL_W: f32 = 150.0;
-/// Path-table header band height.
-const TABLE_HEADER_H: f32 = 22.0;
-/// Path-table row height (compact CAD density).
-const TABLE_ROW_H: f32 = 20.0;
-/// Incr/Path column widths (right-aligned nanoseconds).
-const INCR_W: f32 = 92.0;
-const PATH_W: f32 = 76.0;
-/// Location column width (fits "Site: SLICE_X65Y68").
-const LOC_W: f32 = 140.0;
+/// Check-table short column width.
+const CHECK_W: f32 = 110.0;
+/// Check-table severity column width.
+const SEV_W: f32 = 110.0;
 
-/// Left report-tree entries, in `lab3-Fig9.png` order. Typed so selection is
-/// never a string.
+/// Left report-tree entries, in `lab3-Fig9.png` order (plus the UG949
+/// Clock Interaction report after the clock summary). Typed so selection
+/// is never a string.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TimingNav {
     GeneralInfo,
@@ -64,6 +69,7 @@ pub enum TimingNav {
     #[default]
     Summary,
     ClockSummary,
+    ClockInteraction,
     CheckTiming,
     IntraClock,
     InterClock,
@@ -71,11 +77,12 @@ pub enum TimingNav {
 }
 
 impl TimingNav {
-    pub const ALL: [TimingNav; 8] = [
+    pub const ALL: [TimingNav; 9] = [
         TimingNav::GeneralInfo,
         TimingNav::TimerSettings,
         TimingNav::Summary,
         TimingNav::ClockSummary,
+        TimingNav::ClockInteraction,
         TimingNav::CheckTiming,
         TimingNav::IntraClock,
         TimingNav::InterClock,
@@ -88,6 +95,7 @@ impl TimingNav {
             TimingNav::TimerSettings => "Timer Settings",
             TimingNav::Summary => "Design Timing Summary",
             TimingNav::ClockSummary => "Clock Summary",
+            TimingNav::ClockInteraction => "Clock Interaction",
             TimingNav::CheckTiming => "Check Timing",
             TimingNav::IntraClock => "Intra-Clock Paths",
             TimingNav::InterClock => "Inter-Clock Paths",
@@ -101,6 +109,7 @@ impl TimingNav {
             TimingNav::TimerSettings => "timing-nav-settings",
             TimingNav::Summary => "timing-nav-summary",
             TimingNav::ClockSummary => "timing-nav-clocks",
+            TimingNav::ClockInteraction => "timing-nav-interaction",
             TimingNav::CheckTiming => "timing-nav-check",
             TimingNav::IntraClock => "timing-nav-intra",
             TimingNav::InterClock => "timing-nav-inter",
@@ -120,79 +129,24 @@ impl TimingNav {
     }
 }
 
-/// Timing center-pane UI state: which report-tree entry is shown, and which
-/// real path the detail tables break down (`None` = worst slack first).
-#[derive(Clone, Copy, Debug, Default)]
+/// Timing center-pane UI state: which report-tree entry is shown, which
+/// real path the detail tables break down (`None` = worst slack first),
+/// the selected clock-interaction cell, and the path-table filter/sort.
+#[derive(Clone, Debug, Default)]
 pub struct TimingView {
     pub selected: TimingNav,
     pub selected_path: Option<usize>,
-}
-
-/// One grouped path-table row rendered from a real [`TimingPinRow`]:
-/// the UG903 delay type plus its cumulative nanoseconds.
-struct PathRow {
-    delay: String,
-    incr_ns: Option<f64>,
-    path_ns: Option<f64>,
-    /// Bare site (`CLB_X1Y2`); rendered as `Site: CLB_X1Y2`.
-    loc: String,
-    resource: String,
-    /// Blue linked delay cell dispatching a select-objects Tcl verb.
-    delay_link: bool,
-}
-
-impl PathRow {
-    fn plain(delay: String, resource: String) -> Self {
-        PathRow {
-            delay,
-            incr_ns: None,
-            path_ns: None,
-            loc: String::new(),
-            resource,
-            delay_link: false,
-        }
-    }
-}
-
-/// Real pin rows for one path, in dataflow order. `clk` launch pins head
-/// the Source Clock group; `cell`/`net`/`setup`/`iob` pins form the Data
-/// group; the destination group derives the requirement from the run's
-/// clocks plus this path's slack.
-fn path_rows(path: &TimingPathRow) -> (Vec<PathRow>, Vec<PathRow>) {
-    let mut src = Vec::new();
-    let mut data = Vec::new();
-    for pin in &path.pins {
-        let row = PathRow {
-            delay: pin.delay_type.clone(),
-            incr_ns: Some(pin.incr_ps as f64 / 1000.0),
-            path_ns: Some(pin.path_ps as f64 / 1000.0),
-            loc: pin.location.clone(),
-            resource: pin.pin.clone(),
-            delay_link: pin.delay_type == "cell",
-        };
-        if pin.delay_type == "clk" {
-            src.push(row);
-        } else {
-            data.push(row);
-        }
-    }
-    (src, data)
-}
-
-/// Paths of one family for the Intra/Other report pages, as
-/// `(state_index, row)` pairs so taps select the real path.
-fn family_paths(s: &AppState, group: TimingPathGroup) -> Vec<(usize, &TimingPathRow)> {
-    s.timing
-        .paths
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| p.group == group)
-        .collect()
+    /// Index into [`TimingState::clock_interaction`].
+    pub selected_interaction: Option<usize>,
+    /// Path-table filter (From / To / group, case-insensitive).
+    pub path_filter: rune::TextEdit,
+    /// Path-table sort column and direction (`true` = ascending).
+    pub path_sort: Option<(PathSort, bool)>,
 }
 
 /// The path the detail tables break down: the tapped selection when valid,
 /// else the worst-slack path runs store first.
-fn detail_path(s: &AppState) -> Option<(usize, &TimingPathRow)> {
+pub(crate) fn detail_path(s: &AppState) -> Option<(usize, &TimingPathRow)> {
     if let Some(i) = s.timing_view.selected_path {
         if let Some(p) = s.timing.paths.get(i) {
             return Some((i, p));
@@ -212,14 +166,6 @@ fn ui_label(content: String, t: &VivadoTheme) -> El {
 
 fn dim_label(content: &str, t: &VivadoTheme) -> El {
     text(content).font(VivadoTheme::FONT_UI).color(t.text_dim)
-}
-
-/// Echo a Tcl verb to the console without flipping run state.
-fn echo(s: &mut AppState, tcl: String) {
-    s.console.lines.push(ConsoleLine {
-        text: tcl,
-        sev: MsgSev::Info,
-    });
 }
 
 /// Whether every reported constraint is met (negative slack fails).
@@ -294,6 +240,7 @@ fn na_cell(key: &'static str, t: &VivadoTheme) -> El {
         .h(ROW_H)
         .center_y()
         .label("Not analyzed by helion-sta")
+        .help("Pulse-width checks are not in helion-sta")
         .child(dim_label("n/a", t))
 }
 
@@ -435,168 +382,10 @@ fn summary_block(s: &AppState, t: &VivadoTheme) -> El {
         .child(verdict)
 }
 
-/// Nanoseconds cell text with an optional `(r)` rise marker.
-fn incr_text(edge: Option<&'static str>, ns: Option<f64>) -> String {
-    match (edge, ns) {
-        (Some(e), Some(v)) => format!("{e} {v:.3}"),
-        (None, Some(v)) => format!("{v:.3}"),
-        (_, None) => String::new(),
-    }
-}
-
-/// One path-table row: Delay Type | Incr | Path | Location | Resource.
-fn path_row(key_prefix: &str, index: usize, row_data: &PathRow, t: &VivadoTheme) -> El {
-    let delay_cell = if row_data.delay_link {
-        let tcl = format!("select_objects -quiet [get_cells {}]", row_data.resource);
-        el().key(format!("{key_prefix}-delay-{index}"))
-            .role("button")
-            .label(format!("Select {}", row_data.resource))
-            .focusable(true)
-            .h(TABLE_ROW_H)
-            .center_y()
-            .hover(t.selection)
-            .on_press(move |s: &mut AppState| echo(s, tcl.clone()))
-            .child(
-                text(row_data.delay.clone())
-                    .font(VivadoTheme::FONT_UI)
-                    .color(t.link)
-                    .truncate(),
-            )
-    } else {
-        el().h(TABLE_ROW_H).center_y().child(
-            text(row_data.delay.clone())
-                .font(VivadoTheme::FONT_UI)
-                .color(t.text)
-                .truncate(),
-        )
-    };
-    let loc = if row_data.loc.is_empty() {
-        String::new()
-    } else {
-        format!("Site: {}", row_data.loc)
-    };
-    row()
-        .w_full()
-        .h(TABLE_ROW_H)
-        .items_center()
-        .gap(8.0)
-        .px(8.0)
-        .child(delay_cell.grow(2.0).min_w(0.0))
-        .child(
-            el().w(INCR_W).h(TABLE_ROW_H).center_y().child(
-                text(incr_text(None, row_data.incr_ns))
-                    .font(VivadoTheme::FONT_UI)
-                    .color(t.text)
-                    .align(Align::End),
-            ),
-        )
-        .child(
-            el().w(PATH_W).h(TABLE_ROW_H).center_y().child(
-                text(
-                    row_data
-                        .path_ns
-                        .map(|v| format!("{v:.3}"))
-                        .unwrap_or_default(),
-                )
-                .font(VivadoTheme::FONT_UI)
-                .color(t.text)
-                .align(Align::End),
-            ),
-        )
-        .child(
-            el().w(LOC_W)
-                .h(TABLE_ROW_H)
-                .center_y()
-                .child(dim_label(&loc, t).truncate()),
-        )
-        .child(
-            el().grow(3.0)
-                .min_w(0.0)
-                .h(TABLE_ROW_H)
-                .center_y()
-                .child(ui_label(row_data.resource.clone(), t).truncate()),
-        )
-}
-
-/// One grouped table: bold section title, column band, rows, bold footer.
-/// The source-clock group has no footer in the brief (`None`); Data Path ends
-/// in Arrival Time and the destination group in Required Time.
-fn path_table(
-    key_prefix: &'static str,
-    title: &'static str,
-    rows: &[PathRow],
-    footer: Option<(&'static str, &'static str, f64)>,
-    t: &VivadoTheme,
-) -> El {
-    let mut body = col().w_full();
-    for (index, row_data) in rows.iter().enumerate() {
-        body = body.child(path_row(key_prefix, index, row_data, t));
-    }
-    let header_cell = |content: &'static str| -> El {
-        text(content)
-            .font(VivadoTheme::FONT_UI)
-            .color(t.text_dim)
-            .truncate()
-    };
-    let mut table = col()
-        .w_full()
-        .fill(t.panel_bg)
-        .border(1.0, t.border)
-        .child(
-            row()
-                .w_full()
-                .h(TABLE_HEADER_H)
-                .items_center()
-                .gap(8.0)
-                .px(8.0)
-                .fill(t.header_bg)
-                .child(header_cell("Delay Type").grow(2.0).min_w(0.0))
-                .child(el().w(INCR_W).child(header_cell("Incr (ns)")))
-                .child(el().w(PATH_W).child(header_cell("Path (ns)")))
-                .child(el().w(LOC_W).child(header_cell("Location")))
-                .child(header_cell("Netlist Resource(s)").grow(3.0).min_w(0.0)),
-        )
-        .child(body);
-    if let Some((label_text, key, value)) = footer {
-        table = table.child(
-            row()
-                .w_full()
-                .h(TABLE_ROW_H)
-                .items_center()
-                .gap(8.0)
-                .px(8.0)
-                .child(
-                    text(label_text)
-                        .font(VivadoTheme::FONT_TITLE)
-                        .color(t.text)
-                        .grow(2.0)
-                        .min_w(0.0),
-                )
-                .child(el().w(INCR_W))
-                .child(
-                    el().w(PATH_W).child(
-                        text(format!("{value:.3}"))
-                            .font(VivadoTheme::FONT_TITLE)
-                            .color(t.text)
-                            .align(Align::End)
-                            .key(key),
-                    ),
-                )
-                .child(el().w(LOC_W))
-                .child(el().grow(3.0).min_w(0.0)),
-        );
-    }
-    col()
-        .key(key_prefix)
-        .w_full()
-        .gap(2.0)
-        .child(text(title).font(VivadoTheme::FONT_TITLE).color(t.text))
-        .child(table)
-}
-
-/// The three grouped detail tables for the selected real path: launch
-/// clock context plus launch pins, the UG903 pin rows, and the requirement
-/// derived from the run's clocks plus this path's slack.
+/// The selected path's detail: delay-split header, element chips, and the
+/// three grouped pin tables (launch clock context plus launch pins, the
+/// UG903 data rows, and the requirement derived from the run's clocks plus
+/// this path's slack).
 fn detail_tables(s: &AppState, t: &VivadoTheme) -> El {
     let Some((_, path)) = detail_path(s) else {
         return col().key("timing-detail").w_full().gap(8.0).child(
@@ -607,8 +396,13 @@ fn detail_tables(s: &AppState, t: &VivadoTheme) -> El {
             .key("timing-detail-path"),
         );
     };
-    let (_, data) = path_rows(path);
-    let clk = s.timing.clocks.first();
+    let data = paths::data_rows(path);
+    let clk = s
+        .timing
+        .clocks
+        .iter()
+        .find(|c| c.name == path.launch_clock)
+        .or_else(|| s.timing.clocks.first());
     let clk_name = clk.map(|c| c.name.as_str()).unwrap_or("clk");
     let clk_source = clk.map(|c| c.source.as_str()).unwrap_or("clk");
     let net = s.timing.clock_networks.iter().find(|n| n.name == clk_name);
@@ -617,113 +411,86 @@ fn detail_tables(s: &AppState, t: &VivadoTheme) -> El {
         None => (clk_source.to_string(), 0, 0.0),
     };
     let mut src = vec![
-        PathRow {
-            delay: format!("(clock {clk_name} rise edge)"),
+        PinRow {
             incr_ns: Some(0.0),
             path_ns: Some(0.0),
-            loc: String::new(),
-            resource: clk_source.to_string(),
-            delay_link: false,
+            ..PinRow::plain(format!("(clock {clk_name} rise edge)"), clk_source)
         },
-        PathRow {
-            delay: format!("net (fo={loads})"),
-            incr_ns: None,
-            path_ns: None,
-            loc: String::new(),
-            resource: net_name.clone(),
-            delay_link: false,
+        PinRow {
+            net: net_name.clone(),
+            fanout: Some(loads),
+            ..PinRow::plain("clock net", net_name.clone())
         },
-        PathRow {
-            delay: "clock network insertion".into(),
+        PinRow {
             incr_ns: Some(insertion_ns),
             path_ns: Some(insertion_ns),
-            loc: String::new(),
-            resource: net_name,
-            delay_link: false,
+            net: net_name.clone(),
+            ..PinRow::plain("clock network insertion", net_name)
         },
     ];
     match path.pins.iter().find(|p| p.delay_type == "clk") {
         Some(launch) => {
-            src.push(PathRow {
-                delay: String::new(),
-                incr_ns: None,
-                path_ns: None,
+            src.push(PinRow {
                 loc: launch.location.clone(),
-                resource: launch.pin.clone(),
-                delay_link: false,
+                net: launch.net.clone(),
+                fanout: Some(launch.fanout),
+                ..PinRow::plain("", launch.pin.clone())
             });
-            src.push(PathRow {
-                delay: "launch cell".into(),
-                incr_ns: None,
-                path_ns: None,
+            src.push(PinRow {
                 loc: launch.location.clone(),
-                resource: launch.cell.clone(),
-                delay_link: true,
+                link_cell: Some(launch.cell.clone()),
+                ..PinRow::plain("launch cell", launch.cell.clone())
             });
         }
         None => {
-            src.push(PathRow::plain(
-                "No launch register on this path (combinational startpoint)".into(),
-                String::new(),
+            src.push(PinRow::plain(
+                "No launch register on this path (combinational startpoint)",
+                "",
             ));
         }
     }
     let arrival_ns = path.delay_ps as f64 / 1000.0;
     let required_ns = arrival_ns + path.slack_ps as f64 / 1000.0;
-    let period_ns = clk.map(|c| c.period_ps as f64 / 1000.0).unwrap_or(0.0);
+    let capture = s
+        .timing
+        .clocks
+        .iter()
+        .find(|c| c.name == path.capture_clock)
+        .or(clk);
+    let cap_name = capture.map(|c| c.name.as_str()).unwrap_or(clk_name);
+    let period_ns = capture.map(|c| c.period_ps as f64 / 1000.0).unwrap_or(0.0);
     let dst = vec![
-        PathRow {
-            delay: format!("(clock {clk_name} capture edge)"),
-            incr_ns: None,
+        PinRow {
             path_ns: Some(required_ns),
-            loc: String::new(),
-            resource: String::new(),
-            delay_link: false,
+            ..PinRow::plain(format!("(clock {cap_name} capture edge)"), "")
         },
-        PathRow {
-            delay: "clock period".into(),
+        PinRow {
             incr_ns: Some(period_ns),
             path_ns: Some(period_ns),
-            loc: String::new(),
-            resource: clk_name.to_string(),
-            delay_link: false,
+            ..PinRow::plain("clock period", cap_name)
         },
-        PathRow::plain(
-            "clock uncertainty (not modeled by helion-sta)".into(),
-            String::new(),
-        ),
+        PinRow::plain("clock uncertainty (not modeled by helion-sta)", ""),
     ];
     col()
         .key("timing-detail")
         .w_full()
         .gap(8.0)
-        .child(
-            ui_label(
-                format!(
-                    "Path: {} -> {} (slack {:.3} ns)",
-                    path.from,
-                    path.to,
-                    path.slack_ps as f64 / 1000.0
-                ),
-                t,
-            )
-            .key("timing-detail-path"),
-        )
-        .child(path_table(
+        .child(paths::detail_header(path, t))
+        .child(paths::pin_table(
             "timing-src-clk",
             "Source Clock Path",
             &src,
             None,
             t,
         ))
-        .child(path_table(
+        .child(paths::pin_table(
             "timing-data",
             "Data Path",
             &data,
             Some(("Arrival Time", "timing-arrival", arrival_ns)),
             t,
         ))
-        .child(path_table(
+        .child(paths::pin_table(
             "timing-dst-clk",
             "Destination Clock Path",
             &dst,
@@ -739,112 +506,33 @@ fn empty_section(key_prefix: &str, title: &str, reason: &str, t: &VivadoTheme) -
         .key(key_prefix)
         .w_full()
         .gap(2.0)
-        .child(text(title).font(VivadoTheme::FONT_TITLE).color(t.text))
         .child(
-            row()
-                .key(format!("{key_prefix}-empty"))
-                .w_full()
-                .h(TABLE_ROW_H)
-                .items_center()
-                .px(8.0)
-                .child(dim_label(reason, t)),
+            text(title.to_string())
+                .font(VivadoTheme::FONT_TITLE)
+                .color(t.text),
         )
+        .child(kit::empty_state(
+            format!("{key_prefix}-empty"),
+            reason,
+            None,
+            t,
+        ))
 }
 
-/// Path-list table for the Intra/Other report pages, from real
-/// [`TimingPathRow`]s. Tapping a row selects it for the detail tables and
-/// echoes its `report_timing` verb.
-fn path_list(
-    key_prefix: &'static str,
+/// Paths section of one family: the 8-column table, or the honest reason
+/// it has no rows.
+fn paths_section(
+    s: &AppState,
+    family: TimingPathGroup,
     title: &'static str,
-    entries: &[(usize, &TimingPathRow)],
+    reason: &str,
     t: &VivadoTheme,
 ) -> El {
-    let mut body = col().w_full();
-    for (index, (state_index, entry)) in entries.iter().enumerate() {
-        let tcl = format!("report_timing -from {} -to {}", entry.from, entry.to);
-        let slack_ns = entry.slack_ps as f64 / 1000.0;
-        let slack = if entry.slack_ps < 0 { t.fail } else { t.text };
-        let select = *state_index;
-        body = body.child(
-            el().key(format!("{key_prefix}-row-{index}"))
-                .role("button")
-                .label(format!("Report {} slack {:.3} ns", entry.name, slack_ns))
-                .focusable(true)
-                .w_full()
-                .h(TABLE_ROW_H)
-                .hover(t.selection)
-                .on_press(move |s: &mut AppState| {
-                    s.timing_view.selected_path = Some(select);
-                    echo(s, tcl.clone());
-                })
-                .child(
-                    row()
-                        .w_full()
-                        .h(TABLE_ROW_H)
-                        .items_center()
-                        .gap(8.0)
-                        .px(8.0)
-                        .child(
-                            ui_label(entry.name.clone(), t)
-                                .grow(1.0)
-                                .min_w(0.0)
-                                .truncate(),
-                        )
-                        .child(
-                            ui_label(entry.from.clone(), t)
-                                .grow(2.0)
-                                .min_w(0.0)
-                                .truncate(),
-                        )
-                        .child(
-                            ui_label(entry.to.clone(), t)
-                                .grow(2.0)
-                                .min_w(0.0)
-                                .truncate(),
-                        )
-                        .child(
-                            el().w(PATH_W).child(
-                                text(format!("{slack_ns:.3} ns"))
-                                    .font(VivadoTheme::FONT_UI)
-                                    .color(slack)
-                                    .align(Align::End),
-                            ),
-                        ),
-                ),
-        );
+    if s.timing.paths.iter().any(|p| p.group == family) {
+        paths::paths_table(s, family, title, t)
+    } else {
+        empty_section("timing-paths", title, reason, t)
     }
-    let header_cell = |content: &'static str| -> El {
-        text(content)
-            .font(VivadoTheme::FONT_UI)
-            .color(t.text_dim)
-            .truncate()
-    };
-    col()
-        .key(key_prefix)
-        .w_full()
-        .gap(2.0)
-        .child(text(title).font(VivadoTheme::FONT_TITLE).color(t.text))
-        .child(
-            col()
-                .w_full()
-                .fill(t.panel_bg)
-                .border(1.0, t.border)
-                .child(
-                    row()
-                        .w_full()
-                        .h(TABLE_HEADER_H)
-                        .items_center()
-                        .gap(8.0)
-                        .px(8.0)
-                        .fill(t.header_bg)
-                        .child(header_cell("Name").grow(1.0).min_w(0.0))
-                        .child(header_cell("From").grow(2.0).min_w(0.0))
-                        .child(header_cell("To").grow(2.0).min_w(0.0))
-                        .child(el().w(PATH_W).child(header_cell("Slack (ns)"))),
-                )
-                .child(body),
-        )
 }
 
 /// Clock Summary page: the run's real STA clocks plus their clock-tree
@@ -858,11 +546,16 @@ fn clock_table(s: &AppState, t: &VivadoTheme) -> El {
             t,
         );
     }
+    let head = kit::header_row(t)
+        .child(kit::header_cell("Clock", t).grow(2.0).min_w(0.0))
+        .child(kit::header_num("Period (ns)", 88.0, t))
+        .child(kit::header_num("Frequency (MHz)", 112.0, t))
+        .child(kit::header_cell("Source", t).grow(1.0).min_w(0.0))
+        .child(kit::header_cell("Generated", t).grow(1.0).min_w(0.0));
     let mut body = col().w_full();
     for (index, clk) in s.timing.clocks.iter().enumerate() {
-        let period = format!("{:.3} ns", clk.period_ps as f64 / 1000.0);
         let freq = if clk.period_ps > 0 {
-            format!("{:.3} MHz", 1_000_000.0 / clk.period_ps as f64)
+            format!("{:.3}", 1_000_000.0 / clk.period_ps as f64)
         } else {
             "n/a".into()
         };
@@ -872,291 +565,36 @@ fn clock_table(s: &AppState, t: &VivadoTheme) -> El {
             "no".into()
         };
         body = body.child(
-            row()
-                .key(format!("timing-clock-row-{index}"))
-                .w_full()
-                .h(TABLE_ROW_H)
-                .items_center()
-                .gap(8.0)
-                .px(8.0)
-                .child(
-                    text(clk.name.clone())
-                        .font(VivadoTheme::FONT_UI)
-                        .color(t.link)
-                        .grow(2.0)
-                        .min_w(0.0)
-                        .truncate(),
-                )
-                .child(ui_label(period, t).grow(1.0).min_w(0.0))
-                .child(ui_label(freq, t).grow(1.0).min_w(0.0))
-                .child(ui_label(generated, t).grow(1.0).min_w(0.0).truncate()),
+            kit::plain_row(format!("timing-clock-row-{index}"))
+                .child(kit::text_cell(clk.name.clone(), 2.0, t.link))
+                .child(kit::num_cell(kit::ns3(clk.period_ps as i64), 88.0, t.text))
+                .child(kit::num_cell(freq, 112.0, t.text))
+                .child(kit::text_cell(clk.source.clone(), 1.0, t.text_dim))
+                .child(kit::text_cell(generated, 1.0, t.text_dim)),
         );
     }
-    let header_cell = |content: &'static str| -> El {
-        text(content)
-            .font(VivadoTheme::FONT_UI)
-            .color(t.text_dim)
-            .truncate()
-    };
-    let mut page = col()
+    col()
         .key("timing-clocks")
         .w_full()
-        .gap(2.0)
-        .child(
-            text("Clock Summary")
-                .font(VivadoTheme::FONT_TITLE)
-                .color(t.text),
-        )
+        .gap(10.0)
         .child(
             col()
-                .w_full()
-                .fill(t.panel_bg)
-                .border(1.0, t.border)
-                .child(
-                    row()
-                        .w_full()
-                        .h(TABLE_HEADER_H)
-                        .items_center()
-                        .gap(8.0)
-                        .px(8.0)
-                        .fill(t.header_bg)
-                        .child(header_cell("Clock").grow(2.0).min_w(0.0))
-                        .child(header_cell("Period").grow(1.0).min_w(0.0))
-                        .child(header_cell("Frequency").grow(1.0).min_w(0.0))
-                        .child(header_cell("Generated").grow(1.0).min_w(0.0)),
-                )
-                .child(body),
-        );
-    if s.timing.clock_networks.is_empty() {
-        page = page.child(
-            dim_label(
-                "No clock trees — networks bind when a run analyzes clocks.",
-                t,
-            )
-            .key("timing-clknet-empty"),
-        );
-    } else {
-        let mut nets = col().w_full();
-        for (index, net) in s.timing.clock_networks.iter().enumerate() {
-            nets = nets.child(
-                row()
-                    .key(format!("timing-clknet-row-{index}"))
-                    .w_full()
-                    .h(TABLE_ROW_H)
-                    .items_center()
-                    .gap(8.0)
-                    .px(8.0)
-                    .child(
-                        ui_label(net.name.clone(), t)
-                            .grow(2.0)
-                            .min_w(0.0)
-                            .truncate(),
-                    )
-                    .child(ui_label(net.net.clone(), t).grow(2.0).min_w(0.0).truncate())
-                    .child(ui_label(net.loads.to_string(), t).grow(1.0).min_w(0.0))
-                    .child(ui_label(net.buffers.to_string(), t).grow(1.0).min_w(0.0))
-                    .child(
-                        ui_label(format_ns(net.insertion_ps), t)
-                            .grow(1.0)
-                            .min_w(0.0),
-                    ),
-            );
-        }
-        page = page.child(
-            col()
-                .key("timing-clknet")
                 .w_full()
                 .gap(2.0)
-                .child(
-                    text("Clock Networks")
-                        .font(VivadoTheme::FONT_TITLE)
-                        .color(t.text),
-                )
-                .child(
-                    col()
-                        .w_full()
-                        .fill(t.panel_bg)
-                        .border(1.0, t.border)
-                        .child(
-                            row()
-                                .w_full()
-                                .h(TABLE_HEADER_H)
-                                .items_center()
-                                .gap(8.0)
-                                .px(8.0)
-                                .fill(t.header_bg)
-                                .child(header_cell("Clock").grow(2.0).min_w(0.0))
-                                .child(header_cell("Net").grow(2.0).min_w(0.0))
-                                .child(header_cell("Loads").grow(1.0).min_w(0.0))
-                                .child(header_cell("Buffers").grow(1.0).min_w(0.0))
-                                .child(header_cell("Insertion").grow(1.0).min_w(0.0)),
-                        )
-                        .child(nets),
-                ),
-        );
-    }
-    page
-}
-
-/// Path-group table (`Group | From | To | WNS | TNS | Endpoints`) from the
-/// real `report_timing_summary` groups of one kind.
-fn groups_table(
-    key_prefix: &'static str,
-    title: &'static str,
-    groups: &[&crate::state::TimingGroupRow],
-    t: &VivadoTheme,
-) -> El {
-    let header_cell = |content: &'static str| -> El {
-        text(content)
-            .font(VivadoTheme::FONT_UI)
-            .color(t.text_dim)
-            .truncate()
-    };
-    let mut body = col().w_full();
-    for (index, g) in groups.iter().enumerate() {
-        let wns = g.wns_ps.map(format_ns).unwrap_or_else(|| "n/a".into());
-        let ink = if g.wns_ps.is_some_and(|w| w < 0) {
-            t.fail
-        } else {
-            t.text
-        };
-        body = body.child(
-            row()
-                .key(format!("{key_prefix}-row-{index}"))
-                .w_full()
-                .h(TABLE_ROW_H)
-                .items_center()
-                .gap(8.0)
-                .px(8.0)
-                .child(ui_label(g.name.clone(), t).grow(2.0).min_w(0.0).truncate())
-                .child(ui_label(g.from.clone(), t).grow(1.0).min_w(0.0).truncate())
-                .child(ui_label(g.to.clone(), t).grow(1.0).min_w(0.0).truncate())
-                .child(
-                    el().w(PATH_W).child(
-                        text(wns)
-                            .font(VivadoTheme::FONT_UI)
-                            .color(ink)
-                            .align(Align::End),
-                    ),
-                )
-                .child(
-                    el().w(PATH_W).child(
-                        text(format_ns(g.tns_ps))
-                            .font(VivadoTheme::FONT_UI)
-                            .color(t.text)
-                            .align(Align::End),
-                    ),
-                )
-                .child(ui_label(g.endpoints.to_string(), t).grow(1.0).min_w(0.0)),
-        );
-    }
-    col()
-        .key(key_prefix)
-        .w_full()
-        .gap(2.0)
-        .child(text(title).font(VivadoTheme::FONT_TITLE).color(t.text))
-        .child(
-            col()
-                .w_full()
-                .fill(t.panel_bg)
-                .border(1.0, t.border)
-                .child(
-                    row()
-                        .w_full()
-                        .h(TABLE_HEADER_H)
-                        .items_center()
-                        .gap(8.0)
-                        .px(8.0)
-                        .fill(t.header_bg)
-                        .child(header_cell("Group").grow(2.0).min_w(0.0))
-                        .child(header_cell("From").grow(1.0).min_w(0.0))
-                        .child(header_cell("To").grow(1.0).min_w(0.0))
-                        .child(el().w(PATH_W).child(header_cell("WNS")))
-                        .child(el().w(PATH_W).child(header_cell("TNS")))
-                        .child(header_cell("Endpoints").grow(1.0).min_w(0.0)),
-                )
-                .child(body),
+                .child(kit::section_title("Clock Summary", t))
+                .child(kit::table(head, body, t)),
         )
-}
-
-/// CDC violations table (`From | To | Check | Severity | Endpoints`) from
-/// the real `report_cdc` rows.
-fn cdc_table(s: &AppState, t: &VivadoTheme) -> El {
-    let header_cell = |content: &'static str| -> El {
-        text(content)
-            .font(VivadoTheme::FONT_UI)
-            .color(t.text_dim)
-            .truncate()
-    };
-    let mut body = col().w_full();
-    for (index, v) in s.timing.cdc.iter().enumerate() {
-        let ink = match v.severity.as_str() {
-            "Critical" => t.fail,
-            "Warning" => t.warn,
-            _ => t.text,
-        };
-        body = body.child(
-            row()
-                .key(format!("timing-cdc-row-{index}"))
-                .w_full()
-                .h(TABLE_ROW_H)
-                .items_center()
-                .gap(8.0)
-                .px(8.0)
-                .child(ui_label(v.from.clone(), t).grow(1.0).min_w(0.0).truncate())
-                .child(ui_label(v.to.clone(), t).grow(1.0).min_w(0.0).truncate())
-                .child(ui_label(v.check.clone(), t).grow(1.0).min_w(0.0))
-                .child(
-                    text(v.severity.clone())
-                        .font(VivadoTheme::FONT_UI)
-                        .color(ink)
-                        .grow(1.0)
-                        .min_w(0.0),
-                )
-                .child(ui_label(v.endpoints.to_string(), t).grow(1.0).min_w(0.0)),
-        );
-    }
-    col()
-        .key("timing-cdc")
-        .w_full()
-        .gap(2.0)
-        .child(
-            text("CDC Violations")
-                .font(VivadoTheme::FONT_TITLE)
-                .color(t.text),
-        )
-        .child(
-            col()
-                .w_full()
-                .fill(t.panel_bg)
-                .border(1.0, t.border)
-                .child(
-                    row()
-                        .w_full()
-                        .h(TABLE_HEADER_H)
-                        .items_center()
-                        .gap(8.0)
-                        .px(8.0)
-                        .fill(t.header_bg)
-                        .child(header_cell("From").grow(1.0).min_w(0.0))
-                        .child(header_cell("To").grow(1.0).min_w(0.0))
-                        .child(header_cell("Check").grow(1.0).min_w(0.0))
-                        .child(header_cell("Severity").grow(1.0).min_w(0.0))
-                        .child(header_cell("Endpoints").grow(1.0).min_w(0.0)),
-                )
-                .child(body),
-        )
+        .child(clocks::networks_section(s, t))
 }
 
 /// Methodology checks table (`Check | Severity | Objects | Message`) from
 /// the real `report_methodology` rows.
 fn method_table(s: &AppState, t: &VivadoTheme) -> El {
-    let header_cell = |content: &'static str| -> El {
-        text(content)
-            .font(VivadoTheme::FONT_UI)
-            .color(t.text_dim)
-            .truncate()
-    };
+    let head = kit::header_row(t)
+        .child(el().w(CHECK_W).child(kit::header_cell("Check", t)))
+        .child(el().w(SEV_W).child(kit::header_cell("Severity", t)))
+        .child(kit::header_cell("Objects", t).grow(2.0).min_w(0.0))
+        .child(kit::header_cell("Message", t).grow(3.0).min_w(0.0));
     let mut body = col().w_full();
     for (index, v) in s.timing.methodology.iter().enumerate() {
         let ink = match v.severity.as_str() {
@@ -1165,64 +603,19 @@ fn method_table(s: &AppState, t: &VivadoTheme) -> El {
             _ => t.text,
         };
         body = body.child(
-            row()
-                .key(format!("timing-method-row-{index}"))
-                .w_full()
-                .h(TABLE_ROW_H)
-                .items_center()
-                .gap(8.0)
-                .px(8.0)
-                .child(ui_label(v.id.clone(), t).grow(1.0).min_w(0.0))
-                .child(
-                    text(v.severity.clone())
-                        .font(VivadoTheme::FONT_UI)
-                        .color(ink)
-                        .grow(1.0)
-                        .min_w(0.0),
-                )
-                .child(
-                    ui_label(v.objects.clone(), t)
-                        .grow(2.0)
-                        .min_w(0.0)
-                        .truncate(),
-                )
-                .child(
-                    ui_label(v.message.clone(), t)
-                        .grow(3.0)
-                        .min_w(0.0)
-                        .truncate(),
-                ),
+            kit::plain_row(format!("timing-method-row-{index}"))
+                .child(kit::fixed_cell(v.id.clone(), CHECK_W, t.text))
+                .child(kit::fixed_cell(v.severity.clone(), SEV_W, ink))
+                .child(kit::text_cell(v.objects.clone(), 2.0, t.text))
+                .child(kit::text_cell(v.message.clone(), 3.0, t.text)),
         );
     }
     col()
         .key("timing-method")
         .w_full()
         .gap(2.0)
-        .child(
-            text("Methodology Checks")
-                .font(VivadoTheme::FONT_TITLE)
-                .color(t.text),
-        )
-        .child(
-            col()
-                .w_full()
-                .fill(t.panel_bg)
-                .border(1.0, t.border)
-                .child(
-                    row()
-                        .w_full()
-                        .h(TABLE_HEADER_H)
-                        .items_center()
-                        .gap(8.0)
-                        .px(8.0)
-                        .fill(t.header_bg)
-                        .child(header_cell("Check").grow(1.0).min_w(0.0))
-                        .child(header_cell("Severity").grow(1.0).min_w(0.0))
-                        .child(header_cell("Objects").grow(2.0).min_w(0.0))
-                        .child(header_cell("Message").grow(3.0).min_w(0.0)),
-                )
-                .child(body),
-        )
+        .child(kit::section_title("Methodology Checks", t))
+        .child(kit::table(head, body, t))
 }
 
 /// Small `label: value` info card for the non-table report pages.
@@ -1251,62 +644,61 @@ fn info_card(
         )
 }
 
-/// Right-hand report content for the selected tree entry.
-fn report_content(s: &AppState, t: &VivadoTheme) -> El {
-    if !s.timing.has_run {
-        if s.flow.impl_run == RunStatus::Running {
-            return col().w_full().padding(8.0).child(
-                row()
-                    .key("timing-run-status")
-                    .w_full()
-                    .h(40.0)
-                    .items_center()
-                    .justify_center()
-                    .gap(4.0)
-                    .child(dim_label(
-                        "Implementation is running — follow progress in the Tcl Console",
-                        t,
-                    )),
-            );
-        }
+/// Empty report: a run-in-progress notice, or one sentence plus the one
+/// call-to-action that really launches the implementation run.
+fn no_run_content(s: &AppState, t: &VivadoTheme) -> El {
+    let running = s.flow.impl_run == RunStatus::Running || s.flow.synth == RunStatus::Running;
+    if running {
         return col().w_full().padding(8.0).child(
             row()
-                .key("timing-no-run")
+                .key("timing-run-status")
                 .w_full()
                 .h(40.0)
                 .items_center()
                 .justify_center()
                 .gap(4.0)
-                .child(
-                    el().key("timing-run-impl")
-                        .role("button")
-                        .label("Run Implementation")
-                        .focusable(true)
-                        .h(ROW_H)
-                        .px(2.0)
-                        .center_y()
-                        .hover(t.selection)
-                        .on_press(|s: &mut AppState| {
-                            crate::runs::launch(s, crate::runs::RunKind::Impl);
-                        })
-                        .child(
-                            text("Run Implementation")
-                                .font(VivadoTheme::FONT_UI)
-                                .color(t.link),
-                        ),
-                )
-                .child(dim_label("to see timing results", t)),
+                .child(dim_label(
+                    "A run is in progress — follow it in the Tcl Console.",
+                    t,
+                )),
         );
     }
-    let mut content = col().w_full().gap(10.0).padding(8.0);
+    col().w_full().padding(8.0).child(
+        row()
+            .key("timing-no-run")
+            .w_full()
+            .h(40.0)
+            .items_center()
+            .justify_center()
+            .gap(4.0)
+            .child(kit::link(
+                "timing-run-impl",
+                "Run Implementation",
+                t,
+                |s: &mut AppState| crate::runs::launch(s, crate::runs::RunKind::Impl),
+            ))
+            .child(dim_label("to see timing results.", t)),
+    )
+}
+
+/// Right-hand report content for the selected tree entry.
+fn report_content(s: &AppState, t: &VivadoTheme) -> El {
+    if !s.timing.has_run {
+        return no_run_content(s, t);
+    }
+    let mut content = col().w_full().gap(12.0).padding(8.0);
     match s.timing_view.selected {
         TimingNav::Summary => {
             content = content
                 .child(summary_block(s, t))
+                .child(clocks::slack_histogram(s, t))
                 .child(detail_tables(s, t));
         }
         TimingNav::ClockSummary => {
             content = content.child(clock_table(s, t));
+        }
+        TimingNav::ClockInteraction => {
+            content = content.child(clocks::interaction_page(s, t));
         }
         TimingNav::GeneralInfo => {
             let design = if s.timing.design.is_empty() {
@@ -1362,7 +754,7 @@ fn report_content(s: &AppState, t: &VivadoTheme) -> El {
                             "Methodology checks:".into(),
                             s.timing.methodology.len().to_string(),
                         ),
-                        ("CDC violations:".into(), s.timing.cdc.len().to_string()),
+                        ("CDC crossings:".into(), s.timing.cdc.len().to_string()),
                         ("Clocks:".into(), s.timing.clocks.len().to_string()),
                         ("Endpoints:".into(), s.timing.endpoints.to_string()),
                     ],
@@ -1372,25 +764,22 @@ fn report_content(s: &AppState, t: &VivadoTheme) -> El {
         }
         TimingNav::IntraClock => {
             let groups = family_groups(s, TimingGroupKind::Intra);
-            let paths = family_paths(s, TimingPathGroup::Register);
-            content = content.child(groups_section(
-                "timing-groups",
-                "Intra-Clock Groups",
-                &groups,
-                "No intra-clock groups — the summary groups bind when a run analyzes clocks.",
-                t,
-            ));
-            if paths.is_empty() {
-                content = content.child(empty_section(
-                    "timing-paths",
+            content = content
+                .child(groups_section(
+                    "timing-groups",
+                    "Intra-Clock Groups",
+                    &groups,
+                    "No intra-clock groups — the summary groups bind when a run analyzes clocks.",
+                    t,
+                ))
+                .child(paths_section(
+                    s,
+                    TimingPathGroup::Register,
                     "Intra-Clock Paths",
                     "No register paths — paths need placement (Run Implementation).",
                     t,
-                ));
-            } else {
-                content = content.child(path_list("timing-paths", "Intra-Clock Paths", &paths, t));
-            }
-            content = content.child(detail_tables(s, t));
+                ))
+                .child(detail_tables(s, t));
         }
         TimingNav::InterClock => {
             let groups = family_groups(s, TimingGroupKind::Inter);
@@ -1409,32 +798,29 @@ fn report_content(s: &AppState, t: &VivadoTheme) -> El {
                     t,
                 ));
             } else {
-                content = content.child(cdc_table(s, t));
-                content = content.child(inter_paths_note(t));
+                content = content
+                    .child(clocks::cdc_section(s, t))
+                    .child(inter_paths_note(t));
             }
-            content = content.child(detail_tables(s, t));
         }
         TimingNav::OtherGroups => {
             let groups = family_groups(s, TimingGroupKind::Other);
-            let paths = family_paths(s, TimingPathGroup::Output);
-            content = content.child(groups_section(
-                "timing-groups",
-                "Other Path Groups",
-                &groups,
-                "No group_path groups — user groups bind from XDC group_path.",
-                t,
-            ));
-            if paths.is_empty() {
-                content = content.child(empty_section(
-                    "timing-paths",
-                    "Other Paths",
+            content = content
+                .child(groups_section(
+                    "timing-groups",
+                    "Other Path Groups",
+                    &groups,
+                    "No group_path groups — user groups bind from XDC group_path.",
+                    t,
+                ))
+                .child(paths_section(
+                    s,
+                    TimingPathGroup::Output,
+                    "Output Paths",
                     "No output paths — paths need placement (Run Implementation).",
                     t,
-                ));
-            } else {
-                content = content.child(path_list("timing-paths", "Other Paths", &paths, t));
-            }
-            content = content.child(detail_tables(s, t));
+                ))
+                .child(detail_tables(s, t));
         }
     }
     content
@@ -1451,7 +837,7 @@ fn groups_section(
     if groups.is_empty() {
         empty_section(key_prefix, title, empty_reason, t)
     } else {
-        groups_table(key_prefix, title, groups, t)
+        clocks::groups_table(key_prefix, title, groups, t)
     }
 }
 
@@ -1469,17 +855,7 @@ fn check_tables(s: &AppState, t: &VivadoTheme) -> El {
     } else {
         tables = tables.child(method_table(s, t));
     }
-    if s.timing.cdc.is_empty() {
-        tables = tables.child(empty_section(
-            "timing-cdc",
-            "CDC Violations",
-            "No CDC pairs — single-clock design.",
-            t,
-        ));
-    } else {
-        tables = tables.child(cdc_table(s, t));
-    }
-    tables
+    tables.child(clocks::cdc_section(s, t))
 }
 
 /// Honest note under the Inter-Clock CDC table: per-path crossings need
@@ -1492,8 +868,48 @@ fn inter_paths_note(t: &VivadoTheme) -> El {
                 "Per-path crossings need per-path clock tags (helion-sta paths are clock-agnostic) — groups and CDC above carry the inter-clock result.",
                 t,
             )
+            .wrap()
             .key("timing-paths-note"),
         )
+}
+
+/// Re-run STA through the real `report_timing_summary` verb.
+fn rerun_summary(s: &mut AppState) {
+    crate::tcl::eval_command(s, "report_timing_summary");
+}
+
+/// Action bar under the pane header: the report name plus the
+/// Report Timing Summary (re-run) action.
+fn action_bar(s: &AppState, t: &VivadoTheme) -> El {
+    let stage = match s.runs.analysis.as_ref().map(|a| a.routed.is_some()) {
+        Some(true) => "Post-implementation analysis",
+        Some(false) => "Post-synthesis estimate",
+        None if s.timing.has_run => "Last analysis",
+        None => "No analysis yet",
+    };
+    row()
+        .key("timing-actions")
+        .w_full()
+        .h(30.0)
+        .items_center()
+        .gap(8.0)
+        .px(8.0)
+        .border_sides([0.0, 0.0, 1.0, 0.0], t.border_light)
+        .child(
+            text(stage)
+                .font(VivadoTheme::FONT_UI)
+                .color(t.text_dim)
+                .truncate()
+                .key("timing-stage"),
+        )
+        .child(el().grow(1.0))
+        .child(kit::action_button(
+            "timing-rerun",
+            "Report Timing Summary",
+            crate::analysis::timing_unavailable(s),
+            t,
+            rerun_summary,
+        ))
 }
 
 /// The center Timing pane wired into the shell.
@@ -1510,6 +926,7 @@ pub fn timing_pane(s: &AppState, t: &VivadoTheme) -> El {
         .fill(t.panel_bg)
         .border(1.0, t.border)
         .child(pane_header("Timing", "timing", t))
+        .child(action_bar(s, t))
         .child(
             row()
                 .w_full()
@@ -1622,6 +1039,8 @@ mod tests {
                 kind: TimingGroupKind::Intra,
                 wns_ps: Some(2061),
                 tns_ps: 0,
+                whs_ps: Some(-1545),
+                ths_ps: -3069,
                 endpoints: 112,
             }],
             paths: vec![TimingPathRow {
@@ -1631,6 +1050,8 @@ mod tests {
                 slack_ps: 2061,
                 delay_ps: 7939,
                 group: TimingPathGroup::Register,
+                launch_clock: "clk".into(),
+                capture_clock: "clk".into(),
                 pins: vec![
                     TimingPinRow {
                         cell: "cnt_3".into(),
@@ -1667,9 +1088,11 @@ mod tests {
             clock_networks: vec![ClockNetRow {
                 name: "clk".into(),
                 period_ps: 10_000,
+                source: "clk".into(),
                 net: "clk".into(),
                 loads: 8,
                 buffers: 1,
+                fanout: 8,
                 insertion_ps: 120,
             }],
             design: "project1_demo".into(),
@@ -1776,6 +1199,7 @@ mod tests {
             let key = match nav {
                 TimingNav::Summary => "timing-summary",
                 TimingNav::ClockSummary => "timing-clocks",
+                TimingNav::ClockInteraction => "timing-ci",
                 TimingNav::GeneralInfo | TimingNav::TimerSettings | TimingNav::CheckTiming => {
                     "timing-info-card"
                 }
@@ -1804,29 +1228,219 @@ mod tests {
         assert!(rt_met.find("timing-verdict").is_some());
     }
 
+    /// Wheel the report until `key` is presented inside the scroll
+    /// viewport (rows below the fold are clipped and take no taps).
+    fn scroll_into_view(rt: &mut Runtime<AppState>, key: &str) {
+        for i in 0..40 {
+            let vp = rt.presented("timing-scroll").unwrap().0;
+            let r = rt
+                .presented(key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+                .0;
+            if r[1] >= vp[1] && r[1] + r[3] <= vp[1] + vp[3] {
+                return;
+            }
+            rt.wheel(vp[0] + vp[2] / 2.0, vp[1] + vp[3] / 2.0, -120.0);
+            rt.frame(0.1 + i as f64 * (1.0 / 60.0));
+        }
+        panic!("{key} never scrolled into view");
+    }
+
     #[test]
-    fn delay_link_echoes_select_without_flipping_runs() {
-        let mut rt = harness_with(fig9_state());
+    fn delay_link_selects_the_cell_through_tcl() {
+        let mut s = fig9_state();
+        crate::live::seed_live_fixture(&mut s).expect("live fixture");
+        // Point the launch register at a real fixture cell so the Tcl
+        // `select_objects` verb resolves it.
+        s.timing.paths[0].pins[0].cell = "u_div_u_ff0".into();
+        let mut rt = harness_with(s);
         rt.frame(0.0);
-        // The IBUF row sits inside the visible scroll window; rows below the
-        // fold are clipped by the viewport, so taps target presented links.
+        scroll_into_view(&mut rt, "timing-src-clk-delay-4");
         tap(&mut rt, "timing-src-clk-delay-4");
         assert_eq!(rt.state.flow.impl_run, RunStatus::NotStarted);
         assert!(
             rt.state
-                .console
-                .lines
+                .tcl
+                .selected
                 .iter()
-                .any(|l| l.text.starts_with("select_objects")),
-            "delay link echoes its Tcl verb"
+                .any(|o| o.name == "u_div_u_ff0"),
+            "the link must really select the cell: {:?}",
+            rt.state.tcl.selected
         );
     }
 
     #[test]
-    fn incr_cells_match_vivado_text() {
-        assert_eq!(incr_text(Some("(r)"), Some(1.458)), "(r) 1.458");
-        assert_eq!(incr_text(None, Some(1.972)), "1.972");
-        assert_eq!(incr_text(None, None), "");
+    fn element_chips_follow_the_selected_path() {
+        let mut rt = harness_with(fig9_state());
+        rt.frame(0.0);
+        for key in [
+            "timing-detail-split",
+            "timing-elements",
+            "timing-element-0",
+            "timing-hist",
+            "timing-hist-count",
+        ] {
+            assert!(rt.find(key).is_some(), "missing {key}");
+        }
+        let chips = path_elements(&rt.state.timing.paths[0]);
+        assert_eq!(chips.first().map(|e| e.id.as_str()), Some("clk"));
+        assert!(chips.iter().any(|e| e.is_cell && e.id == "cnt_7"));
+    }
+
+    #[test]
+    fn paths_table_filters_sorts_and_selects() {
+        use crate::state::{TimingPathGroup, TimingPathRow};
+        let mut s = fig9_state();
+        let base = s.timing.paths[0].clone();
+        s.timing.paths.push(TimingPathRow {
+            name: "a_0->z_9".into(),
+            from: "a_0".into(),
+            to: "z_9".into(),
+            slack_ps: -250,
+            group: TimingPathGroup::Register,
+            ..base
+        });
+        s.timing_view.selected = TimingNav::IntraClock;
+        let mut rt = harness_with(s);
+        rt.frame(0.0);
+        for key in [
+            "timing-paths-filter",
+            "timing-paths-sort-from",
+            "timing-paths-sort-to",
+            "timing-paths-sort-slack",
+            "timing-paths-sort-levels",
+            "timing-paths-row-1",
+        ] {
+            assert!(rt.find(key).is_some(), "missing {key}");
+        }
+        tap(&mut rt, "timing-paths-sort-slack");
+        assert_eq!(
+            rt.state.timing_view.path_sort,
+            Some((PathSort::Slack, true))
+        );
+        tap(&mut rt, "timing-paths-row-0");
+        assert_eq!(
+            rt.state.timing_view.selected_path,
+            Some(1),
+            "row 0 after an ascending slack sort is the -0.250 ns path"
+        );
+        tap(&mut rt, "timing-paths-sort-slack");
+        assert_eq!(
+            rt.state.timing_view.path_sort,
+            Some((PathSort::Slack, false))
+        );
+        rt.state.timing_view.path_filter = rune::TextEdit::new("z_9");
+        rt.invalidate();
+        rt.frame(0.2);
+        assert!(rt.find("timing-paths-row-0").is_some());
+        assert!(
+            rt.find("timing-paths-row-1").is_none(),
+            "filter keeps one path"
+        );
+        rt.state.timing_view.path_filter = rune::TextEdit::new("nothing-matches");
+        rt.invalidate();
+        rt.frame(0.3);
+        tap(&mut rt, "timing-paths-clear-filter");
+        assert!(rt.state.timing_view.path_filter.text.is_empty());
+    }
+
+    #[test]
+    fn clock_interaction_matrix_selects_a_cell() {
+        use crate::state::{ClockInteractionRow, ClockRel};
+        let mut s = fig9_state();
+        let cell = |from: &str, to: &str, relation: ClockRel| ClockInteractionRow {
+            from: from.into(),
+            to: to.into(),
+            relation,
+            common_period_ps: 10_000,
+            requirement_ps: 10_000,
+            wns_ps: (relation == ClockRel::Timed).then_some(2061),
+            path_count: 4,
+        };
+        s.timing.clock_interaction = vec![
+            cell("clk", "clk", ClockRel::Timed),
+            cell("clk", "clk2", ClockRel::TimedUnsafe),
+            cell("clk2", "clk", ClockRel::Asynchronous),
+            cell("clk2", "clk2", ClockRel::Timed),
+        ];
+        s.timing_view.selected = TimingNav::ClockInteraction;
+        let mut rt = harness_with(s);
+        rt.frame(0.0);
+        for key in [
+            "timing-ci",
+            "timing-ci-matrix",
+            "timing-ci-cell-0-0",
+            "timing-ci-cell-1-1",
+            "timing-ci-legend",
+            "timing-ci-hint",
+        ] {
+            assert!(rt.find(key).is_some(), "missing {key}");
+        }
+        tap(&mut rt, "timing-ci-cell-0-1");
+        assert_eq!(rt.state.timing_view.selected_interaction, Some(1));
+        assert!(rt.find("timing-ci-detail").is_some(), "detail must show");
+    }
+
+    #[test]
+    fn groups_cdc_and_networks_show_the_new_columns() {
+        use crate::state::CdcRow;
+        let mut s = fig9_state();
+        s.timing.cdc = vec![CdcRow {
+            from: "clk".into(),
+            to: "clk2".into(),
+            severity: "Critical".into(),
+            check: "CDC-1".into(),
+            endpoints: 3,
+            sync: false,
+            wns_ps: Some(-40),
+            relation: "Timed (unsafe)".into(),
+        }];
+        s.timing_view.selected = TimingNav::InterClock;
+        let mut rt = harness_with(s);
+        rt.frame(0.0);
+        for key in [
+            "timing-cdc-chips",
+            "timing-cdc-critical",
+            "timing-cdc-safe",
+            "timing-cdc-row-0",
+        ] {
+            assert!(rt.find(key).is_some(), "missing {key}");
+        }
+        rt.state.timing_view.selected = TimingNav::IntraClock;
+        rt.invalidate();
+        rt.frame(0.1);
+        assert!(
+            rt.find("timing-groups-row-0").is_some(),
+            "group rows with WHS/THS"
+        );
+        rt.state.timing_view.selected = TimingNav::ClockSummary;
+        rt.invalidate();
+        rt.frame(0.2);
+        for key in [
+            "timing-clknet",
+            "timing-clknet-totals",
+            "timing-clknet-row-0",
+        ] {
+            assert!(rt.find(key).is_some(), "missing {key}");
+        }
+    }
+
+    #[test]
+    fn report_timing_summary_action_is_disabled_without_a_run_context() {
+        let mut rt = harness_with(fig9_state());
+        rt.frame(0.0);
+        assert!(rt.find("timing-rerun").is_some(), "action must render");
+        let before = rt.state.console.lines.len();
+        tap(&mut rt, "timing-rerun");
+        assert_eq!(
+            rt.state.console.lines.len(),
+            before,
+            "a disabled action must not run anything"
+        );
+    }
+
+    #[test]
+    fn ns_text_matches_vivado() {
         assert_eq!(format_ns(2061), "2.061 ns");
         assert_eq!(format_ns(-3069), "-3.069 ns");
     }
@@ -1852,6 +1466,8 @@ mod tests {
                 slack_ps: 2061,
                 delay_ps: 7939,
                 group: TimingPathGroup::Register,
+                launch_clock: "clk".into(),
+                capture_clock: "clk".into(),
                 pins: vec![TimingPinRow {
                     cell: "cnt_3".into(),
                     pin: "cnt_3/Q".into(),
@@ -1870,6 +1486,8 @@ mod tests {
                 slack_ps: 3309,
                 delay_ps: 6691,
                 group: TimingPathGroup::Output,
+                launch_clock: "clk".into(),
+                capture_clock: String::new(),
                 pins: vec![],
             },
         ];
