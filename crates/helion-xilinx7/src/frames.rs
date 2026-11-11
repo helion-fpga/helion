@@ -81,6 +81,43 @@ pub trait TileBitLayout {
     /// Tile type selecting the segbits table (after alias resolution), or
     /// `None` if the tile is unknown.
     fn tile_type(&self, tile: &str) -> Option<&str>;
+    /// `tilegrid.json` `bits.<block>.alias` record for `tile`, if any.
+    ///
+    /// The `_SING` I/O tiles (`LIOB33_SING`, `RIOI3_SING`, ...) have no
+    /// segbits of their own: they are encoded with the regular tile type's
+    /// segbits, shifted down by `start_offset` words, for the one site the
+    /// tile really has. Without this, every FASM line for those pads is
+    /// unencodable and the pad stays unconfigured on silicon.
+    fn alias(&self, _tile: &str, _block: BlockType) -> Option<TileAlias> {
+        None
+    }
+}
+
+/// A `tilegrid.json` bits alias: encode this tile as `tile_type`, with every
+/// segbits bit position moved down by `start_offset` words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TileAlias {
+    /// Tile type whose segbits encode this tile (e.g. `RIOB33`).
+    pub tile_type: String,
+    /// Word offset of this tile's window inside the alias tile's window.
+    pub start_offset: u32,
+}
+
+impl TileAlias {
+    /// Map a feature named in the SING tile's own site naming to the alias
+    /// tile's naming. With `start_offset == 0` the SING tile's only site is
+    /// the alias tile's `*_Y1` half; with `start_offset == 2` it is `*_Y0`.
+    pub fn alias_feature(&self, feature: &str) -> String {
+        if self.start_offset != 0 {
+            return feature.to_string();
+        }
+        match feature.split_once('.') {
+            Some((site, rest)) if site.ends_with("_Y0") => {
+                format!("{}1.{rest}", &site[..site.len() - 1])
+            }
+            _ => feature.to_string(),
+        }
+    }
 }
 
 /// Derive a tile type from a tile name by stripping the `_X<num>Y<num>`
@@ -459,19 +496,26 @@ impl FrameStore {
     ) -> Result<usize, FramesError> {
         let mut applied = 0usize;
         for line in lines {
-            let tile_type = layout.tile_type(&line.tile).ok_or_else(|| FramesError {
+            let own_type = layout.tile_type(&line.tile).ok_or_else(|| FramesError {
                 message: format!("unknown tile {:?}", line.tile),
             })?;
+            let alias = layout.alias(&line.tile, BlockType::ClbIoClk);
+            let tile_type = alias.as_ref().map_or(own_type, |a| a.tile_type.as_str());
+            let shift = alias.as_ref().map_or(0, |a| a.start_offset * 32);
             for (feature, address) in canonical_assigns(line) {
+                let feature = match &alias {
+                    Some(a) => a.alias_feature(feature),
+                    None => feature.to_string(),
+                };
                 let namespaced = format!("{tile_type}.{feature}");
                 if segbits.is_pseudo_pip(tile_type, &namespaced) {
                     continue;
                 }
                 let (block, bits) =
-                    segbits.feature_bits(tile_type, feature, address).ok_or_else(|| {
+                    segbits.feature_bits(tile_type, &feature, address).ok_or_else(|| {
                         FramesError {
                             message: format!(
-                                "tile {:?} (type {tile_type}): no segbits for feature {namespaced:?}",
+                                "tile {:?} (type {own_type}): no segbits for feature {namespaced:?}",
                                 line.tile,
                             ),
                         }
@@ -482,7 +526,7 @@ impl FrameStore {
                         line.tile
                     ),
                 })?;
-                self.apply_bits(&namespaced, geom, bits)?;
+                self.apply_bits(&namespaced, geom, bits, shift)?;
                 applied += 1;
             }
         }
@@ -494,8 +538,18 @@ impl FrameStore {
         feature: &str,
         geom: FrameAddr,
         bits: &[SegBit],
+        shift: u32,
     ) -> Result<(), FramesError> {
         for b in bits {
+            // Alias tiles: the tile's window starts `shift` bits into the
+            // alias tile's window. A bit below it belongs to the half the
+            // tile does not have, which a correct alias feature never uses.
+            let bitpos = b.bitpos.checked_sub(shift).ok_or_else(|| FramesError {
+                message: format!(
+                    "feature {feature:?}: bit {} below alias window start {shift}",
+                    b.bitpos
+                ),
+            })?;
             let frame = geom.baseaddr.checked_add(b.frame_offset).ok_or_else(|| {
                 FramesError {
                     message: format!("feature {feature:?}: frame address overflow"),
@@ -503,7 +557,7 @@ impl FrameStore {
             })?;
             let word = geom
                 .offset
-                .checked_add(b.bitpos / 32)
+                .checked_add(bitpos / 32)
                 .ok_or_else(|| FramesError {
                     message: format!("feature {feature:?}: word offset overflow"),
                 })?;
@@ -518,7 +572,7 @@ impl FrameStore {
                 message: format!("feature {feature:?}: frame {frame:#010x} not in store"),
             })?;
             let slot = &mut self.words[frame_idx * WORDS_PER_FRAME + word as usize];
-            let bit = b.bitpos % 32;
+            let bit = bitpos % 32;
             // A set feature sets plain bits and clears `!` bits.
             if b.invert {
                 *slot &= !(1u32 << bit);
@@ -536,13 +590,19 @@ impl FrameStore {
     ///
     /// Requires the store to hold the device's complete frame set in
     /// numeric order (which [`FrameStore::new`] guarantees).
+    ///
+    /// Every frame is written with its ECC recomputed (word 50, bits
+    /// [12:0]; see [`frame_ecc`]), whatever those bits held in the store.
     pub fn fdri_payload(&self) -> Vec<u32> {
         let mut out = Vec::with_capacity(
             (self.addrs.len() + 2 * (ZERO_PAD_FRAMES + 1)) * WORDS_PER_FRAME,
         );
         for (n, &addr) in self.addrs.iter().enumerate() {
             let base = n * WORDS_PER_FRAME;
+            let start = out.len();
             out.extend_from_slice(&self.words[base..base + WORDS_PER_FRAME]);
+            let ecc = frame_ecc(&out[start..start + WORDS_PER_FRAME]);
+            out[start + ECC_WORD] = (out[start + ECC_WORD] & !ECC_MASK) | ecc;
             let boundary = match self.addrs.get(n + 1) {
                 Some(&next) => far_group(next) != far_group(addr),
                 // Unconditional trailing pad after the last frame.
@@ -554,6 +614,54 @@ impl FrameStore {
         }
         out
     }
+}
+
+/// Word of each frame holding the frame ECC.
+pub const ECC_WORD: usize = 50;
+/// ECC bits within [`ECC_WORD`].
+pub const ECC_MASK: u32 = 0x1FFF;
+
+/// 7-series per-frame ECC: a 13-bit SECDED Hamming code over the frame's
+/// other bits, stored in word 50 bits [12:0] (the same computation as
+/// Project X-Ray's `xc7series::icap_ecc`).
+///
+/// It is a pure function of the frame contents. Vivado writes it into every
+/// frame; checked bit-exact against all 9,996 frames of eight Vivado
+/// ZedBoard bitstreams (2023.2 and 2026.1). It does not change behaviour on
+/// silicon, but without it no bitstream can be bit-identical to Vivado's,
+/// and readback ECC checking reports every touched frame as corrupt. The
+/// "word 50" bits earlier work tried to learn per clock topology are this.
+pub fn frame_ecc(words: &[u32]) -> u32 {
+    let mut ecc: u32 = 0;
+    for (idx, &w) in words.iter().enumerate().take(WORDS_PER_FRAME) {
+        let idx = idx as u32;
+        let mut val = idx * 32;
+        val += if idx > 0x25 {
+            0x1360
+        } else if idx > 0x6 {
+            0x1340
+        } else {
+            0x1320
+        };
+        let mut word = if idx as usize == ECC_WORD { w & !ECC_MASK } else { w };
+        let mut i = 0;
+        while word != 0 {
+            if word & 1 == 1 {
+                ecc ^= val + i;
+            }
+            word >>= 1;
+            i += 1;
+        }
+        if idx == 100 {
+            let mut v = ecc & 0xFFF;
+            v ^= v >> 8;
+            v ^= v >> 4;
+            v ^= v >> 2;
+            v ^= v >> 1;
+            ecc ^= (v & 1) << 12;
+        }
+    }
+    ecc & ECC_MASK
 }
 
 /// (bus, half, row) group of a frame address: FAR bits 25:23, 22, 21:17.

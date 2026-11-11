@@ -291,6 +291,38 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         }
     }
     const BYP_FROM_GFAN: [(u8, u8); 8] = [(0, 0), (1, 0), (2, 1), (3, 1), (4, 0), (5, 0), (6, 1), (7, 1)];
+    // Bypass inputs that must read 1, never ground. A PRECYINIT.C0 carry
+    // head (`cyinit == Some(false)`) computes bit 0 as S0 = !Q0 with its
+    // carry generate DI0 taken from the AX bypass pin, which must read 1
+    // (an unprogrammed BYP_ALT reads VCC by default, X-Ray ppip
+    // `INT_*.BYP_ALT*.VCC_WIRE default`). Grounding it through GFAN froze
+    // the counter at bit 0: the extracted netlist toggled only bit 0, and
+    // removing exactly this one tie made it match the RTL for 2^25 cycles.
+    // AX reaches the INT tile on BYP_ALT1 for slice X0 and BYP_ALT0 for
+    // slice X1, identically on CLBLL_L/R and CLBLM_L/R (tileconn + ppips).
+    let mut keep_high: HashSet<(String, u8)> = HashSet::new();
+    for carry in &placed.carries {
+        let Some(pc) = packed.carries.iter().find(|p| p.name == carry.name) else {
+            continue;
+        };
+        if pc.cyinit != Some(false) {
+            continue;
+        }
+        let site_rel = device
+            .site_rel(&carry.tile, &carry.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", carry.tile, carry.site))?;
+        let ax_alt = if site_rel.ends_with("_X0") {
+            1
+        } else if site_rel.ends_with("_X1") {
+            0
+        } else {
+            return Err(format!("emit: unknown slice `{site_rel}` for carry head AX"));
+        };
+        let mut parts = carry.tile.split('_');
+        if let (Some(_), Some(side), Some(xy), None) = (parts.next(), parts.next(), parts.next(), parts.next()) {
+            keep_high.insert((format!("INT_{side}_{xy}"), ax_alt));
+        }
+    }
     for (int, (need_clk0, need_clk1)) in &int_arrival {
         lines.push(format!("{int}.GFAN0.GND_WIRE"));
         lines.push(format!("{int}.GFAN1.GND_WIRE"));
@@ -302,6 +334,9 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         }
         if !byp_owned.contains(int) {
             for (alt, gfan) in BYP_FROM_GFAN {
+                if keep_high.contains(&(int.clone(), alt)) {
+                    continue;
+                }
                 lines.push(format!("{int}.BYP_ALT{alt}.GFAN{gfan}"));
             }
         }
@@ -965,6 +1000,34 @@ mod tests {
             assert!(text.contains(&format!("CLBLL_L_X0Y0.SLICEL_X0.{want}")), "got:\n{text}");
             let other = if high { "PRECYINIT.C0" } else { "PRECYINIT.C1" };
             assert!(!text.contains(other), "crossed CYINIT source, got:\n{text}");
+        }
+    }
+
+    /// A PRECYINIT.C0 head computes bit 0 from DI0 = AX, which must read 1.
+    /// The FF-slice arrival program grounds the serving tile's BYP_ALT
+    /// muxes through GFAN; it must leave the head's AX bypass alone
+    /// (BYP_ALT1 for slice X0), or bit 0 never carries and the counter
+    /// freezes. Every other BYP_ALT stays grounded (carry DI = 0).
+    #[test]
+    fn emit_c0_carry_head_keeps_ax_bypass_high() {
+        use crate::pack::PackedCarry;
+        use crate::place::PlacedCarry;
+        let mut r = routed_blinky();
+        r.placed.packed.carries = vec![PackedCarry {
+            name: "u_h".into(), ci_net: String::new(), cyinit: Some(false),
+            co_net: Some("coh".into()),
+            s_nets: [Some("s0".into()), None, None, None],
+            di_nets: [None, None, None, None],
+            o_nets: [Some("o0".into()), None, None, None],
+        }];
+        r.placed.carries = vec![PlacedCarry {
+            name: "u_h".into(), tile: "CLBLL_L_X0Y0".into(), site: "SLICE_X0Y0".into(),
+        }];
+        let text = emit_fasm(&r, &FakeEmit).unwrap().fasm.join("\n");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.PRECYINIT.C0"), "got:\n{text}");
+        assert!(!text.contains("INT_L_X0Y0.BYP_ALT1."), "head AX bypass grounded, got:\n{text}");
+        for alt in [0, 2, 3, 4, 5, 6, 7] {
+            assert!(text.contains(&format!("INT_L_X0Y0.BYP_ALT{alt}.GFAN")), "BYP_ALT{alt} lost its tie, got:\n{text}");
         }
     }
 
