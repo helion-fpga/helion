@@ -1880,6 +1880,30 @@ pub const ALL: &[SceneExpect] = &[
         absent: &["summary", "cov-files"],
     },
     SceneExpect {
+        name: "coverage-dut",
+        surface: "coverage",
+        keys: &["cov-pane", "cov-kpi-dutlines", "cov-kpi-dutarms", "cov-open-dut", "cov-tab-dutlines", "cov-dut-lines", "cov-dutline-0"],
+        absent: &["summary", "cov-empty", "cov-dut-empty", "cov-line-0"],
+    },
+    SceneExpect {
+        name: "coverage-dut-light",
+        surface: "coverage",
+        keys: &["cov-pane", "cov-dut-branches", "cov-dutarm-0-0", "cov-dutarm-0-1"],
+        absent: &["summary", "cov-empty", "cov-dut-empty"],
+    },
+    SceneExpect {
+        name: "coverage-dut-gutter",
+        surface: "editor",
+        keys: &["editor", "editor-field", "editor-gutter-13", "editor-gutter-21"],
+        absent: &["summary", "cov-pane"],
+    },
+    SceneExpect {
+        name: "coverage-dut-gutter-light",
+        surface: "editor",
+        keys: &["editor", "editor-field", "editor-gutter-21"],
+        absent: &["summary", "cov-pane"],
+    },
+    SceneExpect {
         name: "runs-ooc",
         surface: "console",
         keys: &["runs-ooc", "runs-ooc-scan", "runs-ooc-row-0", "runs-ooc-row-1", "runs-ooc-toggle-1", "runs-ooc-run-1"],

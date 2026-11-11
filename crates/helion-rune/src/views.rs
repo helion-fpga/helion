@@ -6,6 +6,7 @@ pub mod chrome;
 pub mod console;
 pub mod constraints;
 pub mod coverage;
+pub mod coverage_dut;
 pub mod debug;
 pub mod device;
 pub mod dfx;

@@ -278,7 +278,7 @@ pub(crate) fn gutter_row(
                 .color(t.pass),
         );
     }
-    let cov = crate::views::coverage::line_hits(s, line);
+    let cov = crate::views::coverage::gutter_mark(s, line);
     let number = row()
         .key(format!("editor-gutter-{n}"))
         .role("button")
@@ -298,8 +298,12 @@ pub(crate) fn gutter_row(
                 .font(mono)
                 .color(if pc && (armed || disabled) {
                     t.pass
-                } else if let Some(h) = cov {
-                    if h == 0 { t.fail } else { t.pass }
+                } else if let Some(m) = &cov {
+                    match m.state {
+                        crate::views::coverage_dut::MarkState::Hit => t.pass,
+                        crate::views::coverage_dut::MarkState::Partial => t.warn,
+                        crate::views::coverage_dut::MarkState::Missed => t.fail,
+                    }
                 } else if current {
                     t.text
                 } else {
@@ -307,8 +311,7 @@ pub(crate) fn gutter_row(
                 }),
         );
     let number = match cov {
-        Some(0) => number.help("Not executed in the last testbench run"),
-        Some(h) => number.help(format!("Executed {h}× in the last testbench run")),
+        Some(m) => number.help(m.help),
         None => number,
     };
     row()
