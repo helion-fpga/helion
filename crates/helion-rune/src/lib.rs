@@ -106,6 +106,17 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         s.console.tab = views::console::ConsoleTab::DesignRuns;
         s.flow.synth = state::RunStatus::Complete;
     }),
+    ("runs-table", |s| {
+        seed_runs_fixture(s);
+    }),
+    ("runs-create", |s| {
+        seed_runs_fixture(s);
+        s.runs.ui.create_open = true;
+        s.runs.ui.name = rune::TextEdit::new("sweep");
+        s.runs.ui.seeds = rune::TextEdit::new("4, 5, 6");
+        s.runs.ui.preset = 1;
+        s.runs.ui.preset_pop = true;
+    }),
     ("summary", |_| {}),
     ("summary-synth-complete", |s| {
         s.flow.synth = state::RunStatus::Complete;
@@ -594,6 +605,7 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
                 wns_ps: Some(3120),
                 lut_ff: Some(2310),
                 duration_ms: 1840,
+                ..Default::default()
             },
             runs::RunRecord {
                 seq: 2,
@@ -602,6 +614,7 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
                 wns_ps: None,
                 lut_ff: None,
                 duration_ms: 950,
+                ..Default::default()
             },
             runs::RunRecord {
                 seq: 3,
@@ -610,6 +623,7 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
                 wns_ps: Some(2061),
                 lut_ff: Some(2415),
                 duration_ms: 64_300,
+                ..Default::default()
             },
         ];
     }),
@@ -628,6 +642,61 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
 /// Representative timing report output the timing scenes share (single
 /// 10ns clock, one intra group, worst path first with UG903 pin rows),
 /// shaped like real `TimingState` so snapshots render tables.
+/// Design Runs fixture (scenes only): finished records with real-shaped
+/// metrics, created runs (one never launched), and impl_1 active. Nothing
+/// is queued: an idle worker would start a queued run at once.
+fn seed_runs_fixture(s: &mut AppState) {
+    use runs::{RunKind, RunOutcome, RunRecord, RunSpec};
+    s.console.tab = views::console::ConsoleTab::DesignRuns;
+    s.layout.console_h = 300.0;
+    s.flow.synth = state::RunStatus::Complete;
+    s.flow.impl_run = state::RunStatus::Complete;
+    let strat = |p: &str, seed: u64| {
+        let mut st = helion_proj::RunStrategy::preset(p).expect("preset");
+        st.placer_seed = seed;
+        st
+    };
+    for (name, st) in [
+        ("impl_2", strat("TimingExplore", 0)),
+        ("sweep_s1", strat("Default", 1)),
+        ("sweep_s2", strat("Default", 2)),
+        ("sweep_s3", strat("Default", 3)),
+    ] {
+        s.runs.defs.push(RunSpec {
+            name: name.into(),
+            kind: RunKind::Impl,
+            strategy: st,
+        });
+    }
+    let rec = |seq, name: &str, kind, outcome, wns: Option<i64>, tns, luts: Option<u32>, ms| RunRecord {
+        seq,
+        kind,
+        outcome,
+        wns_ps: wns,
+        tns_ps: tns,
+        luts,
+        ffs: luts.map(|l| l / 2 + 7),
+        bram: luts.map(|_| 2),
+        dsp: luts.map(|_| 1),
+        lut_ff: luts.map(|l| l + l / 2 + 7),
+        duration_ms: ms,
+        name: name.into(),
+        artifacts: (outcome == RunOutcome::Complete)
+            .then(|| Box::new(runs::RunArtifacts::default())),
+        ..Default::default()
+    };
+    s.runs.history = vec![
+        rec(1, "synth_1", RunKind::Synth, RunOutcome::Complete, Some(3120), Some(0), Some(398), 1840),
+        rec(2, "impl_1", RunKind::Impl, RunOutcome::Complete, Some(2061), Some(0), Some(412), 6400),
+        rec(3, "impl_2", RunKind::Impl, RunOutcome::Complete, Some(-120), Some(-480), Some(415), 9100),
+        rec(4, "sweep_s1", RunKind::Impl, RunOutcome::Complete, Some(1874), Some(0), Some(412), 6900),
+        rec(5, "sweep_s2", RunKind::Impl, RunOutcome::Failed, None, None, None, 2100),
+    ];
+    s.runs.active_result = Some("impl_1".into());
+    s.runs.ui.selected = Some("impl_2".into());
+    s.runs.ui.sort = Some((views::runs_table::RunCol::Wns, true));
+}
+
 fn seed_timing_fixture(s: &mut AppState) {
     s.timing.clocks = vec![state::TimingClock {
         name: "clk".into(),
@@ -1022,6 +1091,7 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
     views::dialogs::push_dialogs(&mut layer, s, &t);
     views::device::push_device_pops(&mut layer, s, &t);
     views::wave_decode::push_wave_pops(&mut layer, s, &t);
+    views::runs_table::push_runs_pops(&mut layer, s, &t);
     views::status::push_toasts(&mut layer, s, &t);
     views::palette::push_palette(&mut layer, s, &t);
     views::palette::push_cheatsheet(&mut layer, s, &t);

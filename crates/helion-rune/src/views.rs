@@ -20,6 +20,7 @@ pub mod palette;
 pub mod program;
 pub mod report_kit;
 pub mod reports;
+pub mod runs_table;
 pub mod schematic;
 pub mod sim_settings;
 pub mod sources;
