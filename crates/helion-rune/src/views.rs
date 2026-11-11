@@ -63,5 +63,6 @@ pub mod wave;
 pub mod wave_cfg;
 pub mod wave_decode;
 pub mod wave_demo;
+pub mod wave_real;
 pub mod wave_style;
 pub mod xdc_wizard;
