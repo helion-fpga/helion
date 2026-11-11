@@ -5,41 +5,42 @@ with tests, keep `cargo test -p helion-rune` green, rebuild + relaunch.
 
 ## Old module → new home (status)
 
-| Old (`helion-gui`) | Lines | New home | Status |
-|---|---|---|---|
-| `bin/helion-ide/commands.rs` palette/menu/cheatsheet | 1048 | `views/palette.rs` | DONE (pass 1) |
-| `bin/helion-ide/editor.rs` + `highlight.rs` | 1460+773 | `views/editor.rs` | done (earlier) |
-| `chrome.rs` + `bin/.../flow_nav,layouts,theme,toasts,icons` | ~3.4K | `views/chrome.rs`, `theme.rs` | done (earlier) |
-| run dispatch (`dispatch` fake echo) | — | `views/chrome.rs` launches real runs | FIXED (this session) |
-| `bin/.../hierarchy.rs` | 516 | `views/sources.rs` | verify depth |
-| `bin/.../welcome.rs` | 357 | `views/start.rs` | verify depth |
-| `bin/.../dashboard.rs` | 1363 | `views/summary.rs` | verify depth |
-| `constraints_wizard.rs` + `..._ui.rs` | 691+921 | `views/dialogs.rs` XDC | verify depth |
-| `physview.rs` + `physview_panels.rs` | 977+569 | `views/device.rs` | verify depth |
-| `bin/.../schem_lod.rs` | 238 | `views/schematic.rs` | verify depth |
-| `power.rs` | 1036 | `views/reports.rs` power | verify depth |
-| `qor.rs` | 1212 | `views/reports.rs`, `views/summary.rs` | verify depth |
-| `ila.rs` | 1181 | partial? (`reports/summary/tcl` mention ILA) | AUDIT then port gap |
-| `tb.rs` testbench | 3285 | `views/wave.rs` sim | verify depth |
-| `vcd.rs` + `vcd_wave.rs` | 544+455 | `views/wave.rs` | verify depth |
-| `tcl/design,interp,parse` | ~3.3K | `tcl.rs` | DONE (pass 3: full parity + `launch_simulation`) |
-| `ide.rs` main panels | 45291 | distributed over views | audit per-surface |
-| `surface.rs` | 1207 | n/a (test harness, not UI) | AUDITED (pass 3: nothing to port) |
-| `doctor.rs` (`--doctor`/`--version`) | 123 | `doctor.rs` + `main.rs` + `build.rs` | DONE (pass 2) |
-| `open_dialog.rs` | 55 | `pickers.rs` | done (earlier) |
-| `lib.rs` (`GpuiShell`, synth dispatch) | 367 | `runs.rs`, `live.rs` | done (earlier) |
-| `learner_l1.rs`, `learner_l2.rs` | 257+201 | none | AUDIT (likely low value) |
-| `bin/.../fuzz.rs` | 1746 | none (harness, not UI) | skip unless asked |
+| Old (`helion-gui`) | New home | Status |
+|---|---|---|
+| `commands.rs` palette/menu/cheatsheet | `views/palette.rs`, `views/chrome.rs` | DONE — every menu row real; palette reaches all 16 panes, project files, report verbs |
+| `editor.rs` + `highlight.rs` | `views/editor.rs`, `views/highlight.rs` | DONE — SV/VHDL/Tcl lexer, find+replace, Ln/Col, per-file buffers, cut/copy |
+| `chrome.rs`, `flow_nav`, `layouts`, `toasts` | `views/chrome.rs`, `layout.rs`, `views/status.rs` | DONE — resizable/hideable docks, presets, focus mode, prefs; rail with live run status |
+| `hierarchy.rs` (sources) | `project.rs`, `views/sources.rs` | DONE — real project files from `.prj`; Add Sources persists to the `.prj` |
+| `welcome.rs` | `views/start.rs` | DONE — launcher, recents, bundled example; boot lands here |
+| `dashboard.rs` | `views/summary.rs` | DONE — run history, worst endpoints, real Run Implementation |
+| `constraints_wizard*` | `views/dialogs.rs`, `views/constraints.rs` | PARTIAL — Constraints pane DONE; wizard still single-row per kind |
+| `physview*` | `views/device.rs` | PARTIAL — die/package/I-O/find; no heat maps, pblocks, ruler |
+| `schem_lod.rs` / schematic | `views/schematic.rs` | PARTIAL — no fan-in/out cones, no expand-cone |
+| `power.rs` | `views/reports.rs`, `analysis.rs` | PARTIAL — vectorless rails/blocks DONE; VCD power not ported |
+| `qor.rs` | `views/reports.rs` | DONE (helion-proj QoR engine) |
+| `ila.rs` | `helion-verif`, `views/ila*.rs` | DONE |
+| `tb.rs` | `helion-verif`, `views/tb*.rs` | DONE |
+| `vcd.rs` + `vcd_wave.rs` | `views/wave.rs` | DONE — live VCD scopes/objects, per-trace radix; no protocol decoders |
+| hardware / bitstream / IP-BD / find panes | `views/program.rs`, `views/bitstream.rs`, `views/ip*.rs`, `views/find.rs` | DONE |
+| timing / CDC / clock interaction / reports | `views/timing.rs`, `views/reports.rs`, `analysis.rs` | DONE |
+| `tcl/*` | `tcl.rs` | DONE |
+| `doctor.rs`, `open_dialog.rs`, `lib.rs` | `doctor.rs`, `pickers.rs`, `runs.rs` | DONE |
+| `surface.rs`, `fuzz.rs`, `learner_*` | — | not UI; skipped |
 
-## Known gaps (filed, not yet ported)
+## Remaining gaps
 
-- `read_xdc` Tcl verb missing → palette `ExampleXdc` omitted; runs only
-  discover sibling `.sdc`/`.xdc` on disk.
-- Palette files mode lists open tabs only (no project-source inventory or
-  recents in new IDE yet).
-- `ToggleSidebar` / `ToggleDensity` omitted (no counterpart); `⌘J`, `Alt+Z`
-  unbound for the same reason.
-- `launch_runs` on a Tcl-read `.prj`: worker supports `.prj` (verify live).
+- Schematic: fan-in/fan-out cones (stop-at-FF, hops), expand/collapse cone.
+- Device: congestion/criticality heat maps, pblock and clock-region tables,
+  ruler; I/O quick-set rows (IOSTANDARD/DRIVE/SLEW...).
+- Waveform: protocol decoders (AXI-Lite/SPI/UART), analog style, virtual bus.
+- Design Runs: per-run LUT/FF/WNS columns, run creation with strategy sweep,
+  checkpoints, incremental/ECO reports.
+- Constraints wizard: multi-row steps, generated clocks, write-to-disk +
+  re-run timing comparison.
+- Editor: very large files build one gutter row per line (no
+  virtualization yet); no outline/minimap/go-to-definition.
+- Re-analysis (`analysis.rs`) and Tcl `program_hw` run on the UI thread.
+- Program over openFPGALoader/FTDI is wired but untested on a board.
 
 ## Pass log
 
@@ -120,3 +121,12 @@ with tests, keep `cargo test -p helion-rune` green, rebuild + relaunch.
   source-gutter line breakpoints, interactive-wave sync (trace
   mounting, scopes/objects/add_wave), fabric-kernel debugging, then
   ILA surface audit.
+- Pass 9 (shell + parallel ports): real shell (layout/prefs, menus,
+  status bar, toasts, Start page, project files, per-file editor buffers,
+  SV/VHDL/Tcl highlighting, console filter, honest flow rail), then three
+  merged ports: analysis (clock interaction, path table/detail, histogram,
+  CDC/clock nets, report re-runs, Constraints pane, run history),
+  hardware (helion-hw Hardware Manager, Bitstream FAR table, IP Integrator,
+  Find Results) and verification (helion-verif ILA + testbench runner, sim
+  settings, honest wave pane). Implementation strategy presets drive the
+  run worker. 401 lib + 41 snap + 32 helion-verif green.
