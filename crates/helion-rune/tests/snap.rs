@@ -291,25 +291,33 @@ fn reports_nav_switches_detail_bodies_and_prompt_arms_impl() {
         rt.find("reports-drc-row-1").is_some(),
         "seeded rows must mount"
     );
-    tap(&mut rt, "reports-drc-rule-1");
+    tap(&mut rt, "reports-drc-row-1");
+    assert_eq!(
+        rt.state.reports_view.selected_drc,
+        Some(1),
+        "row tap selects the violation"
+    );
     assert!(
-        rt.state
-            .console
-            .lines
-            .iter()
-            .any(|l| l.text == "report_drc -rule REQP-144"),
-        "rule link must echo its Tcl verb"
+        rt.find("reports-drc-detail").is_some(),
+        "selection opens the detail panel"
     );
     let mut rt = rt_for("reports-no-run");
-    tap(&mut rt, "reports-run-impl");
-    assert_eq!(rt.state.flow.impl_run, RunStatus::Running);
+    tap(&mut rt, "reports-run-synth");
+    assert_eq!(rt.state.flow.synth, RunStatus::Running);
     assert!(
         rt.state
             .console
             .lines
             .iter()
-            .any(|l| l.text == "launch_runs impl_1")
+            .any(|l| l.text == "launch_runs synth_1")
     );
+    runs::cancel_run(&mut rt.state);
+    let start = Instant::now();
+    while rt.state.runs.is_active() {
+        runs::poll_runs(&mut rt.state);
+        assert!(start.elapsed() < Duration::from_secs(60), "run timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 #[test]
