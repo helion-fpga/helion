@@ -1735,6 +1735,7 @@ dependencies = [
  "helion-bits",
  "helion-device",
  "helion-ipxact",
+ "helion-sv",
 ]
 
 [[package]]
@@ -2059,6 +2060,19 @@ dependencies = [
  "rayon",
  "sv-parser",
  "varisat",
+]
+
+[[package]]
+name = "helion-targets"
+version = "3.0.0"
+dependencies = [
+ "helion-backend",
+ "helion-device",
+ "helion-ecp5",
+ "helion-ice40",
+ "helion-ir",
+ "helion-sv",
+ "helion-xilinx7",
 ]
 
 [[package]]

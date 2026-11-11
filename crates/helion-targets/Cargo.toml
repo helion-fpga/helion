@@ -1,0 +1,17 @@
+[package]
+name = "helion-targets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Which parts each Helion backend can implement end to end, and flow dispatch for the non-HL10T families"
+
+[dependencies]
+helion-ir = { workspace = true }
+helion-device = { workspace = true }
+helion-backend = { workspace = true }
+helion-ice40 = { workspace = true }
+helion-ecp5 = { workspace = true }
+helion-xilinx7 = { workspace = true }
+
+[dev-dependencies]
+helion-sv = { workspace = true }
