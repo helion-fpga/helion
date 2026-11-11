@@ -9,10 +9,17 @@
 //! the pre-ECO image as a `.pbits` partial). The session is built from the
 //! last implementation run's routed design; every engine step runs on a
 //! [`crate::bg`] worker that takes the session and hands it back.
+//!
+//! With a `.prj` open the session persists under
+//! `<project>/.helion/eco/` (`helion_proj::eco_store`: base + current
+//! `.hck2` checkpoints and a journal of applied ops), saved by the worker
+//! after every change, and [`restore_for_project`] reloads it when the
+//! project opens, so an ECO survives an app restart mid-edit.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use helion_proj::eco::{EcoImpl, EcoOp};
+use helion_proj::eco_store::{self, EcoEntry, EcoJournal, EcoOutputRecord};
 use rune::{El, TextEdit, col, el, row, text};
 
 use crate::state::{AppState, CenterPane, ConsoleLine, MsgSev};
@@ -100,6 +107,8 @@ pub struct EcoState {
     pub value: TextEdit,
     pub status: Option<Result<String, String>>,
     pub output: Option<Result<EcoOutput, String>>,
+    /// Restored from disk: the state directory and when it was saved.
+    pub restored: Option<(PathBuf, u64)>,
 }
 
 impl Default for EcoState {
@@ -117,7 +126,147 @@ impl Default for EcoState {
             value: TextEdit::new(""),
             status: None,
             output: None,
+            restored: None,
         }
+    }
+}
+
+/// `<project>/.helion/eco` for the open `.prj`, if one is open.
+pub fn store_dir(s: &AppState) -> Option<PathBuf> {
+    crate::views::device_floor::project_prj(s)
+        .and_then(Path::parent)
+        .map(eco_store::eco_dir)
+}
+
+/// The journal for the current UI state (what gets saved next to the
+/// checkpoints).
+fn journal_of(s: &AppState) -> EcoJournal {
+    EcoJournal {
+        part: s.eco.part.clone(),
+        pending: s.eco.pending,
+        entries: s
+            .eco
+            .ops
+            .iter()
+            .map(|r| EcoEntry { op: r.op.clone(), result: r.result.clone() })
+            .collect(),
+        output: match &s.eco.output {
+            Some(Ok(o)) => Some(EcoOutputRecord {
+                bit: o.bit.clone(),
+                pbits: o.pbits.clone(),
+                full_frames: o.full_frames,
+                changed_frames: o.changed_frames,
+            }),
+            _ => None,
+        },
+    }
+}
+
+/// Worker-side save after a change: `session` changed when `with_session`.
+fn save(dir: &Option<PathBuf>, session: &helion_proj::Session, journal: &EcoJournal, with_session: bool) -> Option<String> {
+    let dir = dir.as_ref()?;
+    let r = if with_session {
+        eco_store::save_eco_state(dir, session, journal)
+    } else {
+        eco_store::save_eco_journal(dir, journal)
+    };
+    r.err()
+}
+
+fn save_failed(s: &mut AppState, e: Option<String>) {
+    if let Some(e) = e {
+        log(s, format!("WARNING: ECO session not saved: {e}"), MsgSev::Warn);
+    }
+}
+
+/// Reload a saved ECO session when `prj` opens (worker: decode the
+/// checkpoints). Returns whether a restore started.
+pub fn restore_for_project(s: &mut AppState, prj: &Path) -> bool {
+    let Some(dir) = prj.parent().map(eco_store::eco_dir) else { return false };
+    if !eco_store::has_eco(&dir) {
+        return false;
+    }
+    let part = match eco_store::read_eco_journal(&dir) {
+        Ok(Some(j)) if !j.part.is_empty() => j.part,
+        Ok(_) => s.project.part.clone(),
+        Err(e) => {
+            log(s, format!("ERROR: eco restore: {e}"), MsgSev::Error);
+            return false;
+        }
+    };
+    let d2 = dir.clone();
+    crate::bg::spawn(
+        s,
+        TASK,
+        move || -> Result<Option<eco_store::StoredEco>, String> {
+            let dev = crate::runs::resolve_device(&part, &|_, _| {})?;
+            eco_store::load_eco(&d2, &dev)
+        },
+        move |s, r| match r {
+            Ok(Some(st)) => apply_restored(s, st, dir),
+            Ok(None) => {}
+            Err(e) => note(s, Err(format!("eco restore {}: {e}", dir.display()))),
+        },
+    )
+}
+
+/// Fold a restored session into the view.
+fn apply_restored(s: &mut AppState, st: eco_store::StoredEco, dir: PathBuf) {
+    let j = st.journal;
+    s.eco = EcoState {
+        kind: s.eco.kind,
+        session: Some(Box::new(st.session)),
+        part: j.part,
+        base: Some(st.base),
+        ops: j.entries.into_iter().map(|e| EcoRow { op: e.op, result: e.result }).collect(),
+        pending: j.pending,
+        output: j.output.map(|o| {
+            Ok(EcoOutput {
+                bit: o.bit,
+                pbits: o.pbits,
+                full_frames: o.full_frames,
+                changed_frames: o.changed_frames,
+            })
+        }),
+        status: None,
+        restored: Some((dir.clone(), st.saved_unix)),
+        ..std::mem::take(&mut s.eco)
+    };
+    let n = s.eco.ops.len();
+    note(s, Ok(format!("eco restored {} changes={n}{}", dir.display(), if s.eco.pending { " (place & route pending)" } else { "" })));
+}
+
+/// Why Discard is unavailable (`None` = enabled).
+pub fn discard_unavailable(s: &AppState) -> Option<&'static str> {
+    if crate::bg::busy(s, TASK) {
+        Some("Working…")
+    } else if s.eco.session.is_none() {
+        Some("No ECO session")
+    } else {
+        None
+    }
+}
+
+/// Drop the ECO session and its saved state.
+pub fn discard(s: &mut AppState) -> Result<String, String> {
+    if let Some(r) = discard_unavailable(s) {
+        return Err(format!("eco_discard: {r}"));
+    }
+    if let Some(dir) = store_dir(s) {
+        eco_store::clear_eco(&dir)?;
+    }
+    s.eco = EcoState { kind: s.eco.kind, ..EcoState::default() };
+    Ok("eco_discard".into())
+}
+
+/// Coarse age of a save (`saved` seconds since epoch).
+pub fn age_text(saved: u64, now: u64) -> String {
+    let d = now.saturating_sub(saved);
+    match d {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{} min ago", d / 60),
+        3600..=86_399 => format!("{} h ago", d / 3600),
+        _ => format!("{} d ago", d / 86_400),
     }
 }
 
@@ -156,10 +305,11 @@ pub fn open(s: &mut AppState) -> Result<String, String> {
     let routed = ctx.routed.ok_or("eco_open: the last run is not routed")?;
     let design = s.runs.live_design.clone().ok_or("eco_open: the last run kept no design")?;
     let part = ctx.part;
+    let store = store_dir(s);
     let started = crate::bg::spawn(
         s,
         TASK,
-        move || -> Result<(helion_proj::Session, helion_bits::Bitstream, String), String> {
+        move || -> Result<(helion_proj::Session, helion_bits::Bitstream, String, Option<String>), String> {
             let dev = crate::runs::resolve_device(&part, &|_, _| {})?;
             let mut session = helion_proj::Session::new(helion_proj::Mode::Project);
             session.part = dev.part.clone();
@@ -169,10 +319,12 @@ pub fn open(s: &mut AppState) -> Result<String, String> {
             session.impl_checkpoint = Some(routed.placed.clone());
             session.routed = Some(routed);
             let base = session.write_bitstream(&dev)?.clone();
-            Ok((session, base, dev.part))
+            // A fresh session replaces any saved one for this project.
+            let saved = store.as_ref().and_then(|d| eco_store::save_eco_base(d, &session).err());
+            Ok((session, base, dev.part, saved))
         },
         |s, r| match r {
-            Ok((session, base, part)) => {
+            Ok((session, base, part, save_err)) => {
                 let cells = session.design.as_ref().map(|d| d.cells.len()).unwrap_or(0);
                 s.eco = EcoState {
                     kind: s.eco.kind,
@@ -182,8 +334,10 @@ pub fn open(s: &mut AppState) -> Result<String, String> {
                     output: None,
                     pending: false,
                     status: None,
+                    restored: None,
                     ..std::mem::take(&mut s.eco)
                 };
+                save_failed(s, save_err);
                 note(
                     s,
                     Ok(format!(
@@ -229,15 +383,24 @@ pub fn apply(s: &mut AppState, op: EcoOp) -> Result<String, String> {
     let mut session = s.eco.session.take().ok_or("eco: open the implemented design first (eco_open)")?;
     let part = s.eco.part.clone();
     let op2 = op.clone();
+    let store = store_dir(s);
+    let mut journal = journal_of(s);
     crate::bg::spawn(
         s,
         TASK,
         move || {
             let r = crate::runs::resolve_device(&part, &|_, _| {}).and_then(|dev| session.apply_eco(&dev, &op2));
-            (session, r)
+            if r.is_ok() {
+                journal.pending |= op2.is_structural();
+                journal.output = None;
+            }
+            journal.entries.push(EcoEntry { op: op2, result: r.clone() });
+            let saved = save(&store, &session, &journal, r.is_ok());
+            (session, r, saved)
         },
-        move |s, (session, r): (Box<helion_proj::Session>, Result<String, String>)| {
+        move |s, (session, r, saved): (Box<helion_proj::Session>, Result<String, String>, Option<String>)| {
             s.eco.session = Some(session);
+            save_failed(s, saved);
             if r.is_ok() && op.is_structural() {
                 s.eco.pending = true;
             }
@@ -258,15 +421,25 @@ pub fn implement(s: &mut AppState, how: EcoImpl) -> Result<String, String> {
     }
     let mut session = s.eco.session.take().ok_or("eco: open the implemented design first (eco_open)")?;
     let part = s.eco.part.clone();
+    let store = store_dir(s);
+    let mut journal = journal_of(s);
     crate::bg::spawn(
         s,
         TASK,
         move || {
             let r = crate::runs::resolve_device(&part, &|_, _| {}).and_then(|dev| session.eco_implement(&dev, how));
-            (session, r)
+            let saved = if r.is_ok() {
+                journal.pending = false;
+                journal.output = None;
+                save(&store, &session, &journal, true)
+            } else {
+                None
+            };
+            (session, r, saved)
         },
-        move |s, (session, r): (Box<helion_proj::Session>, Result<Option<helion_proj::ReuseReport>, String>)| {
+        move |s, (session, r, saved): (Box<helion_proj::Session>, Result<Option<helion_proj::ReuseReport>, String>, Option<String>)| {
             s.eco.session = Some(session);
+            save_failed(s, saved);
             let verb = if how == EcoImpl::RouteOnly { "route_design -eco" } else { "place_design -incremental; route_design" };
             let r = r.map(|rep| match rep {
                 Some(rep) => format!("{verb} {}", rep.text()),
@@ -274,6 +447,7 @@ pub fn implement(s: &mut AppState, how: EcoImpl) -> Result<String, String> {
             });
             if r.is_ok() {
                 s.eco.pending = false;
+                s.eco.output = None;
             }
             note(s, r);
         },
@@ -294,6 +468,8 @@ pub fn write_bitstream(s: &mut AppState) -> Result<String, String> {
     let part = s.eco.part.clone();
     let dir = crate::bg::output_dir(s).join("eco");
     let n = s.eco.ops.iter().filter(|o| o.result.is_ok()).count();
+    let store = store_dir(s);
+    let mut journal = journal_of(s);
     crate::bg::spawn(
         s,
         TASK,
@@ -314,10 +490,20 @@ pub fn write_bitstream(s: &mut AppState) -> Result<String, String> {
                     changed_frames: out.incremental.frames.len(),
                 })
             })();
-            (session, r)
+            let saved = r.as_ref().ok().and_then(|o| {
+                journal.output = Some(EcoOutputRecord {
+                    bit: o.bit.clone(),
+                    pbits: o.pbits.clone(),
+                    full_frames: o.full_frames,
+                    changed_frames: o.changed_frames,
+                });
+                save(&store, &session, &journal, true)
+            });
+            (session, r, saved)
         },
-        |s, (session, r): (Box<helion_proj::Session>, Result<EcoOutput, String>)| {
+        |s, (session, r, saved): (Box<helion_proj::Session>, Result<EcoOutput, String>, Option<String>)| {
             s.eco.session = Some(session);
+            save_failed(s, saved);
             let line = r.as_ref().map(|o| {
                 format!(
                     "write_eco_bitstream {} changed_frames={}/{} incremental={}",
@@ -496,6 +682,38 @@ fn output(s: &AppState, t: &VivadoTheme) -> El {
     c
 }
 
+/// Where the session is saved (or was restored from), when a project is open.
+fn persistence_row(s: &AppState, t: &VivadoTheme) -> Option<El> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let (txt, color) = match (&s.eco.restored, store_dir(s)) {
+        (Some((dir, saved)), _) => (
+            format!("Restored session · saved {} · {}", age_text(*saved, now), dir.display()),
+            t.accent,
+        ),
+        (None, Some(dir)) if s.eco.session.is_some() => (format!("Saved with the project · {}", dir.display()), t.text_dim),
+        (None, Some(_)) => return None,
+        (None, None) if s.eco.session.is_some() => {
+            ("Not saved: open a project to keep ECO sessions across restarts.".to_string(), t.text_faint)
+        }
+        (None, None) => return None,
+    };
+    let full = txt.clone();
+    Some(
+        row()
+            .key("eco-persist")
+            .w_full()
+            .h(22.0)
+            .items_center()
+            .gap(6.0)
+            .px(8.0)
+            .fill(t.rail_bg)
+            .border(1.0, t.border_light)
+            .child(cad::cut(txt, VivadoTheme::FONT_UI, color).grow(1.0).min_w(0.0).help_when_truncated(full)),
+    )
+}
+
 pub fn eco_pane(s: &AppState, t: &VivadoTheme) -> El {
     let open_reason = open_unavailable(s);
     let open_btn = kit::action_button(
@@ -518,6 +736,10 @@ pub fn eco_pane(s: &AppState, t: &VivadoTheme) -> El {
         None if crate::bg::busy(s, TASK) => "Working…".into(),
         None => "Edit the routed netlist of the last implementation run.".into(),
     };
+    let discard_btn = kit::action_button("eco-discard", "Discard Session", discard_unavailable(s), t, |s: &mut AppState| {
+        let r = discard(s);
+        note(s, r);
+    });
     let mut body = col().w_full().gap(10.0).padding(8.0).child(
         row()
             .w_full()
@@ -525,8 +747,12 @@ pub fn eco_pane(s: &AppState, t: &VivadoTheme) -> El {
             .items_center()
             .gap(8.0)
             .child(cad::cut(summary, VivadoTheme::FONT_UI, if s.eco.pending { t.warn } else { t.text_dim }).grow(1.0).min_w(0.0).key("eco-summary"))
+            .child(discard_btn)
             .child(open_btn),
     );
+    if let Some(row) = persistence_row(s, t) {
+        body = body.child(row);
+    }
     if s.eco.session.is_some() || !s.eco.ops.is_empty() {
         body = body.child(form(s, t)).child(changes(s, t)).child(actions(s, t)).child(output(s, t));
     } else if let Some(Err(e)) = &s.eco.status {
@@ -566,6 +792,7 @@ pub fn tcl_verb(s: &mut AppState, name: &str, args: &[String]) -> Result<String,
         "eco_place_route" => implement(s, EcoImpl::PlaceAndRoute),
         "eco_route" => implement(s, EcoImpl::RouteOnly),
         "write_eco_bitstream" => write_bitstream(s),
+        "eco_discard" => discard(s),
         _ => Err(format!("{name}: not an ECO verb")),
     }
 }
@@ -581,6 +808,7 @@ pub const VERBS: &[&str] = &[
     "eco_place_route",
     "eco_route",
     "write_eco_bitstream",
+    "eco_discard",
 ];
 
 pub fn help(name: &str) -> Option<(&'static str, &'static str)> {
@@ -595,6 +823,7 @@ pub fn help(name: &str) -> Option<(&'static str, &'static str)> {
         "eco_place_route" => ("eco_place_route", "incremental place + route of the ECO netlist"),
         "eco_route" => ("eco_route", "re-route the ECO netlist keeping placement"),
         "write_eco_bitstream" => ("write_eco_bitstream", "write the ECO bitstream and its incremental .pbits"),
+        "eco_discard" => ("eco_discard", "drop the ECO session and its saved .helion/eco state"),
         _ => return None,
     })
 }
@@ -658,6 +887,75 @@ mod tests {
         assert!(out.changed_frames > 0 && out.changed_frames <= out.full_frames);
         assert!(out.pbits.starts_with(std::env::temp_dir()));
         assert!(std::fs::metadata(&out.pbits).unwrap().len() > 0);
+    }
+
+    #[test]
+    fn eco_session_survives_a_restart_in_the_project_dir() {
+        let dir = std::env::temp_dir().join(format!("helion-eco-prj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prj = dir.join("p.prj");
+        std::fs::write(&prj, "part HL10T-C32-1\nread_sv top.sv\n").unwrap();
+        let mut s = crate::views::reports::io::tests::implemented_state();
+        s.runs.source = Some(prj.clone());
+        tcl_verb(&mut s, "eco_open", &[]).unwrap();
+        crate::bg::wait_all(&mut s);
+        let store = dir.join(".helion").join("eco");
+        assert_eq!(store_dir(&s).as_deref(), Some(store.as_path()));
+        assert!(store.join("base.hck2").is_file(), "{:?}", s.eco.status);
+        let lut = s.eco.session.as_ref().unwrap().design.as_ref().unwrap().cells.iter()
+            .find(|c| matches!(c.kind, helion_ir::CellKind::Lut6 { .. }))
+            .map(|c| helion_ir::resolve(c.name).to_string())
+            .unwrap();
+        tcl_verb(&mut s, "eco_set_lut_init", &[lut.clone(), "64'h3".into()]).unwrap();
+        crate::bg::wait_all(&mut s);
+        tcl_verb(&mut s, "eco_remove_cell", &["no_such_cell".into()]).unwrap();
+        crate::bg::wait_all(&mut s);
+        tcl_verb(&mut s, "eco_add_lut", &["eco_lut".into(), "2".into()]).unwrap();
+        crate::bg::wait_all(&mut s);
+        assert!(s.eco.pending);
+        drop(s);
+
+        // Restart: a fresh app opening the project restores the session.
+        let mut s2 = AppState::demo();
+        s2.runs.source = Some(prj.clone());
+        assert!(crate::views::device_floor::sync_from_project(&mut s2));
+        crate::bg::wait_all(&mut s2);
+        assert!(s2.eco.session.is_some(), "{:?}", s2.eco.status);
+        assert_eq!(s2.eco.ops.len(), 3);
+        assert!(s2.eco.ops[1].result.is_err(), "failed ops are journaled too");
+        assert!(s2.eco.pending, "pending place & route survives");
+        assert!(s2.eco.restored.as_ref().is_some_and(|(d, _)| d == &store));
+        let d = s2.eco.session.as_ref().unwrap().design.as_ref().unwrap();
+        assert!(d.cell("eco_lut").is_some());
+        assert!(matches!(d.cell(&lut).unwrap().kind, helion_ir::CellKind::Lut6 { init: 3 }));
+        tcl_verb(&mut s2, "eco_place_route", &[]).unwrap();
+        crate::bg::wait_all(&mut s2);
+        assert!(!s2.eco.pending, "{:?}", s2.eco.status);
+        tcl_verb(&mut s2, "write_eco_bitstream", &[]).unwrap();
+        crate::bg::wait_all(&mut s2);
+        let out = s2.eco.output.clone().unwrap().unwrap();
+        assert!(out.pbits.starts_with(&dir), "project outputs land beside the .prj");
+        drop(s2);
+
+        let mut s3 = AppState::demo();
+        s3.runs.source = Some(prj);
+        crate::views::device_floor::sync_from_project(&mut s3);
+        crate::bg::wait_all(&mut s3);
+        assert!(!s3.eco.pending);
+        assert_eq!(s3.eco.output.as_ref().unwrap().as_ref().unwrap().pbits, out.pbits);
+        assert_eq!(discard_unavailable(&s3), None);
+        tcl_verb(&mut s3, "eco_discard", &[]).unwrap();
+        assert!(s3.eco.session.is_none() && !store.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn age_text_is_coarse() {
+        assert_eq!(age_text(100, 130), "just now");
+        assert_eq!(age_text(0, 600), "10 min ago");
+        assert_eq!(age_text(0, 7200), "2 h ago");
+        assert_eq!(age_text(0, 3 * 86_400), "3 d ago");
     }
 
     #[test]

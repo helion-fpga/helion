@@ -931,6 +931,24 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
     ("eco-empty", |s| {
         s.center = state::CenterPane::Eco;
     }),
+    ("eco-restored", |s| scenes::eco_restored(s, false)),
+    ("eco-restored-light", |s| scenes::eco_restored(s, true)),
+    ("dfx-light", |s| {
+        s.center = state::CenterPane::Dfx;
+        s.theme = theme::ThemeMode::Light;
+        views::dfx::scene_fill(s);
+    }),
+    ("device-pblocks-light", |s| {
+        s.center = state::CenterPane::Device;
+        s.theme = theme::ThemeMode::Light;
+        let _ = live::seed_live_fixture(s);
+        crate::tcl::eval_command(s, "create_pblock pblock_div -add CLB_X2Y14:CLB_X5Y18");
+        crate::tcl::eval_command(s, "create_pblock pblock_led");
+        s.device.pblock_sel = None;
+        s.device.zoom = 0.35;
+    }),
+    ("xdc-wizard-synth-first", |s| scenes::xdc_wizard_synth_first(s, false)),
+    ("xdc-wizard-synth-first-light", |s| scenes::xdc_wizard_synth_first(s, true)),
     ("reports-no-run", |s| {
         s.center = state::CenterPane::Reports;
     }),

@@ -997,9 +997,14 @@ fn review_page(cx: &Cx, all: &[Issue]) -> El {
     } else {
         write_reason(s, all.len(), w.row_count()).or_else(|| parse.as_ref().err().cloned())
     };
+    let rerun = rerun_action(s, written);
     let rreason = rerun_reason(s, written);
     let rerun_label = if s.jobs.wizard_pending() {
         "Analyzing…"
+    } else if w.timing == Some(TimingOutcome::AwaitingRun) {
+        "Synthesizing…"
+    } else if rerun == Rerun::SynthFirst {
+        "Synthesize & re-run timing"
     } else {
         "Re-run timing"
     };
@@ -1020,13 +1025,14 @@ fn review_page(cx: &Cx, all: &[Issue]) -> El {
                 }
             },
         ))
-        .child(crate::views::cad::btn(
-            "xdc-rerun",
-            rerun_label,
-            t,
-            rreason,
-            rerun_timing,
-        ))
+        .child({
+            let b = crate::views::cad::btn("xdc-rerun", rerun_label, t, rreason, rerun_pressed);
+            if rerun == Rerun::SynthFirst {
+                b.help("No synthesized design yet: runs synth_1, then re-runs timing with this file.")
+            } else {
+                b
+            }
+        })
         .child(el().grow(1.0))
         .child(dlg_button_tx(
             "xdc-export",
@@ -1063,6 +1069,13 @@ fn review_page(cx: &Cx, all: &[Issue]) -> El {
 fn timing_card(s: &AppState, t: &VivadoTheme, written: bool) -> El {
     let w = &s.dialogs.xdc;
     let body: El = match (&w.timing, written) {
+        (Some(TimingOutcome::AwaitingRun), _) => {
+            text("Synthesis (synth_1) is running: timing re-runs with the new constraints when it finishes.")
+                .key("xdc-awaiting-run")
+                .font(VivadoTheme::FONT_UI)
+                .color(t.text_dim)
+                .truncate()
+        }
         (Some(TimingOutcome::Running), _) => text("Timing analysis is running on a worker…")
             .font(VivadoTheme::FONT_UI)
             .color(t.text_dim),
@@ -1108,6 +1121,10 @@ fn timing_card(s: &AppState, t: &VivadoTheme, written: bool) -> El {
             .truncate()
             .help_when_truncated(e.clone()),
         _ if !written => dim_label("Write the file, then re-run timing to compare WNS.", t),
+        _ if rerun_action(s, written) == Rerun::SynthFirst => dim_label(
+            "No synthesized design yet: Synthesize & re-run timing runs synth_1, then compares WNS.",
+            t,
+        ),
         _ => dim_label("Re-run timing to compare WNS with the new constraints.", t),
     };
     col()
