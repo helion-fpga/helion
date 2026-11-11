@@ -1,210 +1,216 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="theme-color" content="#fbfbfa" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Architecture: crates, HAD, HNF, Session</title>
-  <meta name="description" content="Helion crate map, HL10T-C32-1 HAD facts, HNF IR, Tcl Session, FeatureMap .hbits. Gold WNS_PS=9640." />
-  <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
-  <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=v4" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Helion architecture</title>
+  <meta name="description" content="How Helion is built: the synthesis-to-bitstream pipeline, the crate map, HL10 parts in HAD, the HNF netlist, XDC constraints, bitstreams and the Rune-based IDE.">
+  <meta name="theme-color" content="#fbfaf8" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0f1013" media="(prefers-color-scheme: dark)">
+  <link rel="canonical" href="https://helion-fpga.github.io/helion/architecture.html">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="favicon.png" type="image/png" sizes="32x32">
+  <link rel="apple-touch-icon" href="brand/apple-touch-icon.png">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Helion">
+  <meta property="og:title" content="Helion architecture">
+  <meta property="og:description" content="How Helion is built: the synthesis-to-bitstream pipeline, the crate map, HL10 parts in HAD, the HNF netlist, XDC constraints, bitstreams and the Rune-based IDE.">
+  <meta property="og:image" content="https://helion-fpga.github.io/helion/brand/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=5">
+  <script>try{var t=localStorage.getItem("helion-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
 </head>
 <body>
-  <a class="skip" href="#main">Skip to main content</a>
-  <header class="pill-nav" id="pillNav">
-    <a class="brand" href="index.html"><img src="brand/mark.png" alt="" width="30" height="30" /><span>Helion</span></a>
-    <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu"><span></span><span></span></button>
-    <nav id="site-nav">
-      <span class="limelight" aria-hidden="true"></span>
-      <a href="index.html">Home</a>
-      <a href="use.html">Use</a>
-      <a href="start.html">Start</a>
-      <a href="architecture.html" class="active">Architecture</a>
-      <a href="wiki.html">Wiki</a>
-      <a href="benchmarks.html">Benchmarks</a>
-      <a href="get-involved.html">Get involved</a>
-      <a href="https://github.com/helion-fpga/helion">GitHub</a>
-    </nav>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="wrap header-inner">
+      <a class="brand" href="index.html"><img src="brand/mark-48.png" alt="" width="30" height="30"><span>Helion</span></a>
+      <nav class="site-nav" id="site-nav" aria-label="Main">
+        <a href="start.html">Get started</a>
+        <a href="use.html">User guide</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="benchmarks.html">Benchmarks</a>
+        <a href="roadmap.html">Roadmap</a>
+        <a href="wiki.html">Docs</a>
+        <a href="get-involved.html">Community</a>
+      </nav>
+      <div class="header-actions">
+        <button type="button" class="icon-btn theme-toggle" aria-label="Switch theme"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+        <a class="icon-btn" href="https://github.com/helion-fpga/helion" aria-label="Helion on GitHub"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="gh-label">GitHub</span></a>
+        <button type="button" class="icon-btn nav-toggle" aria-controls="site-nav" aria-expanded="false" aria-label="Open menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+      </div>
+    </div>
   </header>
 
-  <main id="main" class="page">
-    <div class="prose">
+  <main id="main">
+    <div class="wrap page-head">
       <h1>Architecture</h1>
-      <p class="lede">
-        One Session, many crates. Device facts live in HAD TOML. The IDE paints
-        that Session; it does not reimplement CAD. This is not a vendor-tool wrapper.
-      </p>
+      <p class="lede">One set of engines behind the CLI, the Tcl session and the IDE. Device facts in data files, families behind a backend trait, nothing from vendor tools.</p>
+    </div>
+    <div class="wrap doc">
+      <nav class="doc-nav" aria-label="On this page">
+        <p>On this page</p>
+        <ul>
+          <li><a href="#pipeline">Pipeline</a></li>
+          <li><a href="#crates">Crates</a></li>
+          <li><a href="#parts">HL10 parts (HAD)</a></li>
+          <li><a href="#hnf">Netlist and checkpoints</a></li>
+          <li><a href="#constraints">Constraints (XDC/SDC)</a></li>
+          <li><a href="#bitstreams">Bitstreams</a></li>
+          <li><a href="#ide">The IDE</a></li>
+        </ul>
+      </nav>
+      <article class="prose">
+        <h2 id="pipeline">Pipeline</h2>
+        <p>Helion is a Rust workspace. Each stage of the flow is a crate with a narrow interface, and the CLI, the Tcl session and the IDE all call the same crates. Device facts live in data files, never in the compiler.</p>
+        <pre><code>SystemVerilog / VHDL / C
+  helion-sv, helion-vhdl, helion-hls      synthesis to the HNF netlist (helion-ir)
+  helion-targets                           pick the family backend for the part
+    HL10      helion-pack, helion-place, helion-route, helion-bits   -&gt; .hbits
+    iCE40     helion-ice40                                           -&gt; IceStorm .asc
+    ECP5      helion-ecp5                                            -&gt; Trellis config
+    7-series  helion-xilinx7                                         -&gt; FASM, frames, .bit
+  helion-sta, helion-drc                   timing, power, CDC, DRC and methodology
+  helion-sim, helion-fabric, helion-verif  simulation, testbenches, coverage
+  helion-hw, helion-debug                  JTAG, programming, ILA, VIO, JTAG-to-AXI
+  helion-proj                              projects, runs, checkpoints, Tcl session
+  helion-cli (helion), helion-rune (helion-ide)</code></pre>
+        <p>The compiler never knows what a LUT is <em>for</em>: the netlist IR is vendor-neutral, and each family implements the <code>Backend</code> trait (pack, place, route, bitstream). Adding a device family means writing a backend, not forking the compiler.</p>
 
-      <h2>Pipeline</h2>
-      <pre><code>helion-sv / vhdl / hls  →  HNF
-helion-pack → place → route (PathFinder)
-helion-sta (XDC) → helion-drc → helion-bits
-helion-fabric / helion-sim / helion-hw
-helion-gui IdeModel paints the Session</code></pre>
+        <h2 id="crates">Crates</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Crate</th><th>Job</th></tr></thead>
+          <tbody>
+            <tr><td><code>helion-sv</code></td><td>SystemVerilog frontend (sv-parser), elaboration, AIG synthesis and LUT6 mapping</td></tr>
+            <tr><td><code>helion-vhdl</code></td><td>VHDL-2008 elaborator onto the same LUT/FF path</td></tr>
+            <tr><td><code>helion-hls</code></td><td>C high-level synthesis: scheduling, binding, RTL emission, C/RTL co-simulation</td></tr>
+            <tr><td><code>helion-ir</code></td><td>HNF netlist: cells, nets, ports and attributes (<code>DONT_TOUCH</code>, <code>mark_debug</code>, <code>LOC</code>)</td></tr>
+            <tr><td><code>helion-pack</code>, <code>helion-place</code>, <code>helion-route</code></td><td>HL10 packing, placement (with pblock regions) and PathFinder A* routing</td></tr>
+            <tr><td><code>helion-sta</code></td><td>Static timing, XDC/SDC constraints, CDC, clock interaction, power</td></tr>
+            <tr><td><code>helion-drc</code></td><td>DRC and methodology checks</td></tr>
+            <tr><td><code>helion-bits</code></td><td>HL10 FeatureMap frames, sparse <code>.hbits</code>, partial bitstreams</td></tr>
+            <tr><td><code>helion-backend</code>, <code>helion-targets</code></td><td>The <code>Backend</code> trait; the registry of implementable parts and family dispatch</td></tr>
+            <tr><td><code>helion-ice40</code>, <code>helion-ecp5</code>, <code>helion-xilinx7</code></td><td>Vendor-family backends on IceStorm, Trellis and Project X-Ray data</td></tr>
+            <tr><td><code>helion-device</code></td><td>Loads HAD part files</td></tr>
+            <tr><td><code>helion-sim</code>, <code>helion-fabric</code></td><td>Event simulator and the cycle-level HL10 fabric model</td></tr>
+            <tr><td><code>helion-verif</code>, <code>helion-svtb</code></td><td>Testbench runner, ILA engine, waveforms, coverage; class-based SV and UVM subset</td></tr>
+            <tr><td><code>helion-hw</code>, <code>helion-debug</code>, <code>helion-lab</code></td><td>IEEE 1149.1 TAP, FTDI MPSSE engine, openFPGALoader, configuration memory; ILA, VIO, JTAG-to-AXI; lab tools</td></tr>
+            <tr><td><code>helion-ipxact</code>, <code>helion-bd</code></td><td>IP packages and catalog; block design</td></tr>
+            <tr><td><code>helion-proj</code></td><td>Projects (<code>.prj</code>), runs, checkpoints (<code>.hckp</code>), ECO, DFX, QoR, the Tcl session</td></tr>
+            <tr><td><code>helion-cli</code></td><td>The <code>helion</code> binary</td></tr>
+            <tr><td><code>helion-rune</code></td><td>The <code>helion-ide</code> binary, on the vendored Rune UI framework (<code>third_party/rune</code>)</td></tr>
+            <tr><td><code>helion-gui</code></td><td>The legacy egui IDE (<code>helion-ide-egui</code>), removed with 4.0</td></tr>
+          </tbody>
+        </table></div>
 
-      <h2>Crates</h2>
-      <div class="table-wrap"><table>
-        <thead><tr><th>Crate</th><th>Job</th></tr></thead>
-        <tbody>
-          <tr><td><code>helion-sv</code></td><td>SystemVerilog subset, preprocess, synth to LUT6/FF (sv-parser + AIG + FlowMap)</td></tr>
-          <tr><td><code>helion-vhdl</code></td><td>VHDL-2008 elaborator, same LUT/FF path as SV</td></tr>
-          <tr><td><code>helion-hls</code></td><td>C subset onto LUT/FF/DSP</td></tr>
-          <tr><td><code>helion-ir</code></td><td>HNF cells/nets/ports (<code>DONT_TOUCH</code>, <code>mark_debug</code>, <code>LOC</code>)</td></tr>
-          <tr><td><code>helion-pack</code></td><td>LUTFF, IOB, MAC27, BRAM18</td></tr>
-          <tr><td><code>helion-place</code></td><td>Timing-driven place (timing_weight 0.75 on gold run)</td></tr>
-          <tr><td><code>helion-route</code></td><td>PathFinder A* with hop delay in the cost</td></tr>
-          <tr><td><code>helion-sta</code></td><td>XDC/SDC constraints, WNS + hold (see <code>crates/helion-sta/src/lib.rs::load_xdc</code>)</td></tr>
-          <tr><td><code>helion-drc</code></td><td>Occupancy, unrouted IO, clocks</td></tr>
-          <tr><td><code>helion-bits</code></td><td>FeatureMap frames, sparse <code>.hbits</code>, partial (DFX)</td></tr>
-          <tr><td><code>helion-backend</code></td><td><code>Backend</code> trait with associated types; each device family implements pack, place, route, bitgen</td></tr>
-          <tr><td><code>helion-xilinx7</code></td><td>Xilinx 7-series backend: xc7a35t device model, pack, place, route, FASM emission, frames to <code>.bit</code></td></tr>
-          <tr><td><code>helion-fabric</code> / <code>helion-sim</code></td><td>Cycle fabric (6-input IMUX LUT + FF + IOB + STAT) and event kernel</td></tr>
-          <tr><td><code>helion-hw</code></td><td>IEEE 1149.1 TAP, sim cable, OFL / native MPSSE</td></tr>
-          <tr><td><code>helion-gui</code></td><td><code>IdeModel</code> + eframe shell (<code>helion-ide</code>)</td></tr>
-          <tr><td><code>helion-proj</code></td><td>Tcl Session commands and <code>.prj</code> / <code>read_ip</code></td></tr>
-          <tr><td><code>helion-device</code></td><td>HAD load</td></tr>
-          <tr><td><code>helion-cli</code></td><td><code>helion</code> binary</td></tr>
-        </tbody>
-      </table></div>
+        <h2 id="parts">HL10 parts (HAD)</h2>
+        <p>The Helion architecture database (HAD) describes each HL10 part in a TOML file under <code>devices/helion/parts/</code>. CAD code queries these files; it never hardcodes a die. Every CLB has 8 BLEs (a 6-input LUT and a flip-flop each).</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Part</th><th>CLB grid</th><th class="num">LUT6</th><th class="num">User I/O</th><th class="num">BRAM18</th><th class="num">MAC27</th><th>IDCODE</th></tr></thead>
+          <tbody>
+            <tr><td><code>HL10T-C32-1</code></td><td>32 x 32</td><td class="num">8,192</td><td class="num">32</td><td class="num">8</td><td class="num">0</td><td><code>0x00011A1F</code></td></tr>
+            <tr><td><code>HL10T-DSP1</code></td><td>32 x 32</td><td class="num">8,192</td><td class="num">32</td><td class="num">8</td><td class="num">1</td><td><code>0x00011A1F</code></td></tr>
+            <tr><td><code>HL10S-C64-1</code></td><td>64 x 64</td><td class="num">32,768</td><td class="num">48</td><td class="num">16</td><td class="num">4</td><td><code>0x00021A1F</code></td></tr>
+            <tr><td><code>HL10M-C128-1</code></td><td>128 x 128</td><td class="num">131,072</td><td class="num">64</td><td class="num">32</td><td class="num">8</td><td><code>0x00031A1F</code></td></tr>
+          </tbody>
+        </table></div>
+        <figure class="had">
+          <svg viewBox="0 0 360 340" role="img" aria-label="HL10T-C32-1 die: IO ring, clock spine, 32 by 32 CLB array">
+            <rect x="0" y="0" width="360" height="340" fill="#0d1210"/>
+            <rect x="12" y="12" width="336" height="28" fill="#c47a3a"/>
+            <rect x="12" y="300" width="336" height="28" fill="#c47a3a"/>
+            <rect x="12" y="40" width="28" height="260" fill="#c47a3a"/>
+            <rect x="320" y="40" width="28" height="260" fill="#c47a3a"/>
+            <rect x="44" y="40" width="22" height="260" fill="#e2b43a"/>
+            <rect x="70" y="40" width="246" height="260" fill="#163226" stroke="#3d8f6a" stroke-width="1"/>
+            <text x="180" y="31" text-anchor="middle" fill="#081510" font-size="13" font-family="ui-monospace, monospace">IO ring, 32 user IO</text>
+            <text x="180" y="319" text-anchor="middle" fill="#081510" font-size="13" font-family="ui-monospace, monospace">IO</text>
+            <text x="55" y="178" text-anchor="middle" fill="#081510" font-size="11" font-family="ui-monospace, monospace" transform="rotate(-90 55 178)">CLK x=1</text>
+            <text x="193" y="165" text-anchor="middle" fill="#ebe6d4" font-size="16" font-family="ui-monospace, monospace">32 x 32 CLB</text>
+            <text x="193" y="188" text-anchor="middle" fill="#b7b09a" font-size="12" font-family="ui-monospace, monospace">HL10T-C32-1</text>
+          </svg>
+          <figcaption>HL10T-C32-1 as described in <code>devices/helion/parts/HL10T-C32-1.toml</code>. Empty-XDC counter gold: <span class="gold">WNS_PS=9640</span>.</figcaption>
+        </figure>
+        <p>HL10T-C32-1 grid: x=0 IO, x=1 clock spine (8 global clocks), x=2..33 CLB, x=34 IO; y=0 IO, y=1..32 interior, y=33 IO. Speed grade 1. There is no HL10 silicon; HL10 bitstreams load into Helion's fabric model and simulator.</p>
 
-      <h2 id="xdc">XDC (<code>load_xdc</code>)</h2>
-      <p>
-        Constraint commands Helion parses are the first-token arms of
-        <code>load_xdc</code> in <code>crates/helion-sta/src/lib.rs</code>.
-        Point at that crate; do not treat this as a vendor constraint product.
-        Object queries (<code>get_ports</code>, <code>get_pins</code>,
-        <code>get_clocks</code>, <code>get_cells</code>) are arguments, not extra
-        commands. Unknown first tokens are ignored. Empty-XDC gold stays
-        <span class="gold">WNS_PS=9640</span>.
-      </p>
-      <p>Commands (only these):</p>
-      <pre><code>create_clock
-create_generated_clock
-set_input_delay
-set_output_delay
-set_false_path
-set_multicycle_path
-set_max_delay
-set_min_delay
-set_clock_groups
-set_clock_uncertainty
-set_clock_latency
-set_disable_timing
-set_case_analysis
-set_propagated_clock
-set_clock_sense
-set_input_jitter
-set_system_jitter
-set_timing_derate
-set_bus_skew
-group_path
-set_max_time_borrow
-set_data_check
-set_operating_conditions
-set_property</code></pre>
-      <p>
-        <code>set_property</code> keys: <code>PACKAGE_PIN</code>,
-        <code>IOSTANDARD</code>, <code>DRIVE</code>, <code>SLEW</code>,
-        <code>PULLTYPE</code>, <code>DIFF_TERM</code>, <code>IN_TERM</code>.
-      </p>
-      <p>
-        Tcl Session CAD commands (<code>synth_design</code>,
-        <code>place_design</code>, …) are a different list, below. They are not
-        <code>load_xdc</code> commands.
-      </p>
+        <h2 id="hnf">Netlist and checkpoints</h2>
+        <p>HNF is Helion's netlist format. Cells, nets and ports carry attributes such as <code>DONT_TOUCH</code>, <code>mark_debug</code> and <code>LOC</code>; <code>(* keep *)</code> and <code>(* mark_debug *)</code> in RTL flow into it. <code>helion hnf file.sv</code> writes a netlist that round-trips. Checkpoints (<code>.hckp</code>) embed the netlist, and restoring one must reproduce the same bitstream hash.</p>
 
-      <h2>Part HL10T-C32-1</h2>
-      <p>
-        CAD must query <code>devices/helion/parts/HL10T-C32-1.toml</code>. How to
-        open it in the IDE: <a href="use.html">Use</a>.
-      </p>
-      <div class="table-wrap"><table>
-        <thead><tr><th>Field</th><th>Value</th></tr></thead>
-        <tbody>
-          <tr><td>part</td><td><code>HL10T-C32-1</code></td></tr>
-          <tr><td>idcode</td><td><code>0x00011A1F</code></td></tr>
-          <tr><td>interior CLB</td><td>32&times;32 (1024 CLB sites, 8 BLE each)</td></tr>
-          <tr><td>user IO</td><td>32 (IO ring)</td></tr>
-          <tr><td>clock spine</td><td>x=1, 8 gclk</td></tr>
-          <tr><td>BRAM18</td><td>8</td></tr>
-          <tr><td>MAC27</td><td>0 on this SKU</td></tr>
-          <tr><td>speed</td><td>1</td></tr>
-          <tr><td>grid</td><td>x=0 IO, x=1 CLK, x=2..33 CLB, x=34 IO; y=0 IO, y=1..32 interior, y=33 IO</td></tr>
-        </tbody>
-      </table></div>
-      <figure class="had">
-        <svg viewBox="0 0 360 340" role="img" aria-label="HL10T-C32-1 labeled die: IO ring, clock spine, CLB array">
-          <rect x="0" y="0" width="360" height="340" fill="#050c09"/>
-          <rect x="12" y="12" width="336" height="28" fill="#c47a3a"/>
-          <rect x="12" y="300" width="336" height="28" fill="#c47a3a"/>
-          <rect x="12" y="40" width="28" height="260" fill="#c47a3a"/>
-          <rect x="320" y="40" width="28" height="260" fill="#c47a3a"/>
-          <rect x="44" y="40" width="22" height="260" fill="#e2b43a"/>
-          <rect x="70" y="40" width="246" height="260" fill="#163226" stroke="#3d8f6a" stroke-width="1"/>
-          <text x="180" y="31" text-anchor="middle" fill="#081510" font-size="13" font-family="ui-monospace, monospace">IO ring · 32 user IO</text>
-          <text x="180" y="319" text-anchor="middle" fill="#081510" font-size="13" font-family="ui-monospace, monospace">IO</text>
-          <text x="55" y="178" text-anchor="middle" fill="#081510" font-size="11" font-family="ui-monospace, monospace" transform="rotate(-90 55 178)">CLK x=1</text>
-          <text x="193" y="165" text-anchor="middle" fill="#ebe6d4" font-size="16" font-family="ui-monospace, monospace">32 × 32 CLB</text>
-          <text x="193" y="188" text-anchor="middle" fill="#b7b09a" font-size="12" font-family="ui-monospace, monospace">HL10T-C32-1</text>
-        </svg>
-        <figcaption>Labeled HAD regions. Empty-XDC counter gold <span class="gold">WNS_PS=9640</span>.</figcaption>
-      </figure>
+        <h2 id="constraints">Constraints (XDC/SDC)</h2>
+        <p>Constraint files are parsed by <code>load_xdc</code> in <code>crates/helion-sta</code>. These commands are understood; object queries (<code>get_ports</code>, <code>get_pins</code>, <code>get_clocks</code>, <code>get_cells</code>) appear as their arguments. Unknown commands are ignored.</p>
+        <pre><code>create_clock               create_generated_clock     set_input_delay
+set_output_delay           set_false_path             set_multicycle_path
+set_max_delay              set_min_delay              set_clock_groups
+set_clock_uncertainty      set_clock_latency          set_disable_timing
+set_case_analysis          set_propagated_clock       set_clock_sense
+set_input_jitter           set_system_jitter          set_timing_derate
+set_bus_skew               group_path                 set_max_time_borrow
+set_data_check             set_operating_conditions   set_property</code></pre>
+        <p><code>set_property</code> keys: <code>PACKAGE_PIN</code>, <code>IOSTANDARD</code>, <code>DRIVE</code>, <code>SLEW</code>, <code>PULLTYPE</code>, <code>DIFF_TERM</code>, <code>IN_TERM</code>. The Tcl session's flow commands (<code>synth_design</code>, <code>place_design</code> and so on) are a separate list; see the <a href="use.html#tcl">user guide</a>.</p>
 
-      <h2>IR (HNF)</h2>
-      <p>
-        Cells, nets, and ports carry <code>DONT_TOUCH</code>, <code>mark_debug</code>,
-        and <code>LOC</code>. <code>helion hnf file.sv</code> writes a round-trippable
-        netlist. Checkpoints embed HNF. Restore must reproduce the same bitstream hash.
-        <code>(* keep *)</code> / <code>(* mark_debug *)</code> and <code>for</code>
-        generate unroll into that IR.
-      </p>
+        <h2 id="bitstreams">Bitstreams</h2>
+        <p>HL10 bitstreams are FeatureMap frames written as sparse <code>.hbits</code>: only configured frames are stored, and partial bitstreams cover DFX regions and ECO updates. The primitives are LUT6, HFF, MAC27 and BRAM18. The vendor-family backends write the formats their open toolchains read: IceStorm <code>.asc</code>, Trellis text config, and FASM with frames and <code>.bit</code> for 7-series.</p>
 
-      <h2 id="tcl">Tcl Session</h2>
-      <p>
-        CAD Session (not the <a href="#xdc"><code>load_xdc</code></a> list):
-        <code>synth_design</code>, <code>opt_design</code>, <code>place_design</code>,
-        <code>route_design</code>, <code>write_bitstream</code>, <code>write_hnf</code>,
-        <code>get_cells</code> / <code>get_nets</code> / <code>get_pins</code>,
-        <code>set_property</code>, <code>report_timing</code>,
-        <code>report_utilization</code>, <code>open_hw_manager</code>,
-        <code>program_hw</code>, <code>mark_debug</code>, <code>eco</code>,
-        <code>write_checkpoint</code>, <code>report_die</code>.
-        Each command drives the real engine.
-      </p>
+        <h2 id="ide">The IDE</h2>
+        <p><code>helion-ide</code> is built on <a href="https://github.com/anomalyco/rune">Rune</a>, an MIT-licensed Rust UI framework vendored at a fixed upstream commit in <code>third_party/rune</code>. The IDE never reimplements CAD: views read the engine state, and every control goes through the same Tcl verbs the console exposes. Long jobs run on background workers. The UI rule is that a control does real work or renders disabled with the reason.</p>
 
-      <h2>Bitstream</h2>
-      <p>
-        FeatureMap frames, sparse <code>.hbits</code> (encode/decode), partial program
-        (DFX). Gold counter is 185 bytes because only configured frames are written.
-        HELIONLIB primitives: LUT6, HFF, MAC27, BRAM18. Device facts live in HAD, not
-        hardcoded in the CAD.
-      </p>
-
-      <h2>Gold</h2>
-      <p>
-        Empty-XDC <code>examples/counter.sv</code> at 10.000 ns:
-        4 LUTFF, 1 IOB, <span class="gold">WNS_PS=9640</span>,
-        <code>LED[16]=0000000111111110</code>. QoR is gated in
-        <code>crates/helion-cli/tests/qor.rs</code>. A LUT / WNS / bitstream-size
-        change must update the table in the same commit with a reason.
-      </p>
-      <p class="cta">
-        <a class="btn" href="use.html">Use Helion</a>
-        <a class="btn ghost" href="roadmap.html">Roadmap (2.0 shipped)</a>
-      </p>
+      </article>
     </div>
   </main>
 
-  <footer class="site-foot">
-    <div class="foot-inner">
-      <span>AGPL-3.0 &middot; <a href="https://github.com/saksham-45">@saksham-45</a> &middot; <a href="https://github.com/helion-fpga">helion-fpga</a></span>
-      <span><a href="legal.html">Legal</a> &middot; <a href="start.html">Start</a> &middot; <a href="https://github.com/helion-fpga/helion">GitHub</a></span>
+  <footer class="site-footer">
+    <div class="wrap">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <a class="brand" href="index.html"><img src="brand/mark-48.png" alt="" width="30" height="30"><span>Helion</span></a>
+          <p>Open-source FPGA CAD and an original FPGA family, written in Rust.</p>
+        </div>
+        <div>
+          <h4>Product</h4>
+          <ul>
+            <li><a href="https://github.com/helion-fpga/helion/releases/latest">Download</a></li>
+            <li><a href="start.html">Get started</a></li>
+            <li><a href="use.html">User guide</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/CHANGELOG.md">Changelog</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Docs</h4>
+          <ul>
+            <li><a href="architecture.html">Architecture</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/docs/tcl-subset.md">Tcl reference</a></li>
+            <li><a href="benchmarks.html">Benchmarks</a></li>
+            <li><a href="roadmap.html">Roadmap</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Community</h4>
+          <ul>
+            <li><a href="get-involved.html">Get involved</a></li>
+            <li><a href="contribute.html">Contribute code</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/discussions">Discussions</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/CODE_OF_CONDUCT.md">Code of conduct</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Project</h4>
+          <ul>
+            <li><a href="legal.html">License and legal</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/SECURITY.md">Security</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/GOVERNANCE.md">Governance</a></li>
+            <li><a href="https://github.com/helion-fpga/helion">GitHub</a></li>
+          </ul>
+        </div>
+      </div>
+      <div class="footer-legal">
+        <span>Helion is licensed under <a href="https://github.com/helion-fpga/helion/blob/master/LICENSE">AGPL-3.0-or-later</a>.</span>
+        <span>"Helion" and the Helion logo are trademarks of Saksham Srivastava. <a href="https://github.com/helion-fpga/helion/blob/master/TRADEMARKS.md">Trademark policy</a></span>
+      </div>
     </div>
   </footer>
-  <script src="site.js?v=v4"></script>
+  <script src="site.js?v=5"></script>
 </body>
 </html>
