@@ -296,6 +296,37 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         let _ = live::seed_live_fixture(s);
         s.device.view = views::device::DeviceView::Package;
     }),
+    ("device-heat", |s| {
+        s.center = state::CenterPane::Device;
+        let _ = views::device_layers::seed_heat_fixture(s);
+        s.device.layers.criticality = true;
+        s.device.layers.rulers = true;
+        s.device.zoom = 0.35;
+    }),
+    ("device-pblocks", |s| {
+        s.center = state::CenterPane::Device;
+        let _ = live::seed_live_fixture(s);
+        crate::tcl::eval_command(s, "create_pblock pblock_div -add CLB_X2Y14:CLB_X5Y18");
+        crate::tcl::eval_command(s, "add_cells_to_pblock pblock_div u_div_u_ff0 u_div_u_ff1");
+        crate::tcl::eval_command(s, "create_pblock pblock_led");
+        s.device.pblock_sel = Some("pblock_div".into());
+        // Frame rows 0..18 so the CLB pblock reads with the IOB row.
+        s.device.zoom = 0.35;
+    }),
+    ("device-io-quickset", |s| {
+        s.center = state::CenterPane::Device;
+        let _ = live::seed_live_fixture(s);
+        s.device.io_selected = Some("seg".into());
+        if let Some(cell) = views::device::io_port_rows(s)
+            .into_iter()
+            .find(|r| r.name == "seg")
+            .and_then(|r| r.iob_cell)
+        {
+            s.device.selected = Some(views::device::DeviceSel::Cell(cell));
+        }
+        crate::tcl::eval_command(s, "set_property IOSTANDARD SSTL15 [get_ports seg]");
+        crate::tcl::eval_command(s, "set_property DRIVE 8 [get_ports seg]");
+    }),
     ("wave", |s| {
         s.center = state::CenterPane::Wave;
         views::wave_demo::seed_demo_wave(s);
@@ -998,7 +1029,8 @@ pub fn poll_all(s: &mut AppState, t: f64, tx: &mut rune::Tx) -> bool {
     // re-mirror the live edit field; a no-op when already synced.
     views::editor::sync_edit(s);
     let hw_dirty = views::program::poll(s);
-    runs_dirty || sim_dirty || ila_dirty || hw_dirty || toasts_dirty
+    let pblocks_dirty = views::device_floor::sync_from_project(s);
+    runs_dirty || sim_dirty || ila_dirty || hw_dirty || toasts_dirty || pblocks_dirty
 }
 
 pub fn app_spec() -> AppSpec<AppState> {

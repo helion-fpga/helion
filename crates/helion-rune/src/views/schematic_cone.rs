@@ -96,7 +96,9 @@ impl ConeRow {
     pub fn sel(&self, live: &LiveNetlist) -> SchemSel {
         match self.obj {
             ConeObj::Cell => SchemSel::Cell(self.name.clone()),
-            ConeObj::Net if live.ports_in.contains(&self.name) || live.ports_out.contains(&self.name) => {
+            ConeObj::Net
+                if live.ports_in.contains(&self.name) || live.ports_out.contains(&self.name) =>
+            {
                 SchemSel::Port(self.name.clone())
             }
             ConeObj::Net => SchemSel::Net(self.name.clone()),
@@ -135,7 +137,11 @@ impl ConeTrace {
                 .filter(|r| r.obj == obj)
                 .map(|r| r.name.as_str())
                 .collect();
-            if v.is_empty() { "-".to_string() } else { v.join(",") }
+            if v.is_empty() {
+                "-".to_string()
+            } else {
+                v.join(",")
+            }
         };
         format!(
             "cone_trace DIR={} ROOT={} TARGET=- MAX_HOPS={} STOP_AT_FF={} CELLS={} NETS={}",
@@ -401,7 +407,10 @@ impl SchematicState {
             return None;
         }
         let z = ((vw - 4.0) / WORLD_W).min((vh - 4.0) / world_h);
-        Some(z.clamp(crate::views::schematic::ZOOM_MIN, crate::views::schematic::ZOOM_MAX))
+        Some(z.clamp(
+            crate::views::schematic::ZOOM_MIN,
+            crate::views::schematic::ZOOM_MAX,
+        ))
     }
 }
 
@@ -563,7 +572,9 @@ pub const VERBS: &[&str] = &[
 fn selection_root(s: &AppState) -> Result<String, String> {
     match &s.schematic.selected {
         Some(SchemSel::Cell(n)) | Some(SchemSel::Port(n)) | Some(SchemSel::Net(n)) => Ok(n.clone()),
-        Some(SchemSel::Hier(n)) => Err(format!("{n} is a hierarchy block; select a cell, port, or net")),
+        Some(SchemSel::Hier(n)) => Err(format!(
+            "{n} is a hierarchy block; select a cell, port, or net"
+        )),
         None => Err("select a cell, port, or net first".into()),
     }
 }
@@ -653,7 +664,12 @@ pub fn tcl_verb(s: &mut AppState, name: &str, args: &[String]) -> Result<String,
                     Some(SchemSel::Hier(h)) => h.clone(),
                     Some(other) => match live.owner_of(other.name()) {
                         Some(o) => o.to_string(),
-                        None => return Err(format!("{name}: {} is not inside a hierarchy block", other.name())),
+                        None => {
+                            return Err(format!(
+                                "{name}: {} is not inside a hierarchy block",
+                                other.name()
+                            ));
+                        }
                     },
                     None => return Err(format!("{name}: select an instance first")),
                 },
@@ -778,7 +794,11 @@ pub fn find_box(s: &AppState, t: &VivadoTheme, live: Option<&LiveNetlist>) -> El
     let hits = live
         .map(|l| find_hits(l, &s.schematic.find.text, s.schematic.find_kind).len())
         .unwrap_or(0);
-    let mut seg = row().key("schematic-find-scope").role("group").label("Find scope").gap(0.0);
+    let mut seg = row()
+        .key("schematic-find-scope")
+        .role("group")
+        .label("Find scope")
+        .gap(0.0);
     for kind in SheetFind::ALL {
         let on = s.schematic.find_kind == kind;
         seg = seg.child(
@@ -870,7 +890,11 @@ pub fn cone_toolbar(s: &AppState, t: &VivadoTheme, live: Option<&LiveNetlist>) -
     let fan = move |dir: ConeDir| {
         move |s: &mut AppState| {
             if let Ok(root) = selection_root(s) {
-                let flag = if s.schematic.stop_at_ff { " -stop_at_ff" } else { "" };
+                let flag = if s.schematic.stop_at_ff {
+                    " -stop_at_ff"
+                } else {
+                    ""
+                };
                 crate::tcl::eval_command(
                     s,
                     &format!("{} {root} {}{flag}", dir.verb(), s.schematic.cone_hops),
@@ -885,37 +909,48 @@ pub fn cone_toolbar(s: &AppState, t: &VivadoTheme, live: Option<&LiveNetlist>) -
         _ => None,
     };
     let inside_expanded = inside.as_deref().map(|h| s.schematic.is_expanded(h));
-    let stepper = |key: &'static str, label: &'static str, glyph: &'static str, next: usize, ok: bool| {
-        let mut b = el()
-            .key(key)
-            .role("button")
-            .label(label)
-            .size(20.0, 22.0)
-            .center()
-            .child(cad::ui(glyph, t));
-        if ok {
-            b = b.focusable(true).hover(t.selection).on_press(move |s: &mut AppState| {
-                s.schematic.cone_hops = next;
-                if let Some(c) = s.schematic.cone.clone() {
-                    let flag = if c.stop_at_ff { " -stop_at_ff" } else { "" };
-                    crate::tcl::eval_command(
-                        s,
-                        &format!("{} {} {next}{flag}", c.dir.verb(), c.root),
-                    );
-                }
-            });
-        } else {
-            b = b.disabled(true).layer_opacity(0.4);
-        }
-        b
-    };
-    let mut stop = Checkbox::new(s.schematic.stop_at_ff)
+    let stepper =
+        |key: &'static str, label: &'static str, glyph: &'static str, next: usize, ok: bool| {
+            let mut b = el()
+                .key(key)
+                .role("button")
+                .label(label)
+                .size(20.0, 22.0)
+                .center()
+                .child(cad::ui(glyph, t));
+            if ok {
+                b = b
+                    .focusable(true)
+                    .hover(t.selection)
+                    .on_press(move |s: &mut AppState| {
+                        s.schematic.cone_hops = next;
+                        if let Some(c) = s.schematic.cone.clone() {
+                            let flag = if c.stop_at_ff { " -stop_at_ff" } else { "" };
+                            crate::tcl::eval_command(
+                                s,
+                                &format!("{} {} {next}{flag}", c.dir.verb(), c.root),
+                            );
+                        }
+                    });
+            } else {
+                b = b.disabled(true).layer_opacity(0.4);
+            }
+            b
+        };
+    let stop = Checkbox::new(s.schematic.stop_at_ff)
         .label("Stop at FF")
         .on_toggle::<AppState>(|s: &mut AppState| {
             s.schematic.stop_at_ff = !s.schematic.stop_at_ff;
             if let Some(c) = s.schematic.cone.clone() {
-                let flag = if s.schematic.stop_at_ff { " -stop_at_ff" } else { "" };
-                crate::tcl::eval_command(s, &format!("{} {} {}{flag}", c.dir.verb(), c.root, c.hops));
+                let flag = if s.schematic.stop_at_ff {
+                    " -stop_at_ff"
+                } else {
+                    ""
+                };
+                crate::tcl::eval_command(
+                    s,
+                    &format!("{} {} {}{flag}", c.dir.verb(), c.root, c.hops),
+                );
             }
         });
     let inside_reason = |want_expanded: bool| -> Option<&'static str> {
@@ -1040,7 +1075,11 @@ pub fn cone_results(s: &AppState, t: &VivadoTheme, live: &LiveNetlist) -> Option
         cone.root,
         cone.hops,
         if cone.hops == 1 { "" } else { "s" },
-        if cone.stop_at_ff { " · stop at FF" } else { "" },
+        if cone.stop_at_ff {
+            " · stop at FF"
+        } else {
+            ""
+        },
     );
     let mut rows = col().w_full();
     for (i, r) in cone.rows.iter().enumerate() {
@@ -1060,9 +1099,20 @@ pub fn cone_results(s: &AppState, t: &VivadoTheme, live: &LiveNetlist) -> Option
             })
             .child(cad::cell(
                 &CONE_COLS[0],
-                cad::cut(r.name.clone(), cad::mono_style(), if r.name == cone.root && !selected { t.accent } else { t.text }),
+                cad::cut(
+                    r.name.clone(),
+                    cad::mono_style(),
+                    if r.name == cone.root && !selected {
+                        t.accent
+                    } else {
+                        t.text
+                    },
+                ),
             ))
-            .child(cad::cell(&CONE_COLS[1], cad::cut(r.kind.clone(), VivadoTheme::FONT_UI, t.text_dim)))
+            .child(cad::cell(
+                &CONE_COLS[1],
+                cad::cut(r.kind.clone(), VivadoTheme::FONT_UI, t.text_dim),
+            ))
             .child(cad::cell(&CONE_COLS[2], cad::mono(r.hops.to_string(), t))),
         );
     }
@@ -1096,7 +1146,9 @@ pub fn cone_results(s: &AppState, t: &VivadoTheme, live: &LiveNetlist) -> Option
                     .w_full()
                     .grow(1.0)
                     .min_h(0.0)
-                    .scroll(rune::ScrollSpec { stick_bottom: false })
+                    .scroll(rune::ScrollSpec {
+                        stick_bottom: false,
+                    })
                     .child(rows),
             ),
     )
@@ -1114,16 +1166,28 @@ pub fn debug_actions(s: &AppState, t: &VivadoTheme, live: &LiveNetlist) -> El {
     if marked {
         r = r.child(cad::badge("DEBUG", t.warn, t).key("schematic-debug-badge"));
     }
-    r.child(cad::btn("schematic-mark-debug", "Mark Debug", t, reason, move |s: &mut AppState| {
-        if let Some(n) = &a {
-            crate::tcl::eval_command(s, &format!("mark_debug {n}"));
-        }
-    }))
-    .child(cad::btn("schematic-add-probe", "Add Probe", t, reason, move |s: &mut AppState| {
-        if let Some(n) = &b {
-            crate::tcl::eval_command(s, &format!("add_probe {n}"));
-        }
-    }))
+    r.child(cad::btn(
+        "schematic-mark-debug",
+        "Mark Debug",
+        t,
+        reason,
+        move |s: &mut AppState| {
+            if let Some(n) = &a {
+                crate::tcl::eval_command(s, &format!("mark_debug {n}"));
+            }
+        },
+    ))
+    .child(cad::btn(
+        "schematic-add-probe",
+        "Add Probe",
+        t,
+        reason,
+        move |s: &mut AppState| {
+            if let Some(n) = &b {
+                crate::tcl::eval_command(s, &format!("add_probe {n}"));
+            }
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -1185,7 +1249,10 @@ mod tests {
         for r in &stopped.rows {
             assert!(r.hops <= 8);
         }
-        assert!(one.summary_text().starts_with("cone_trace DIR=fanout ROOT="));
+        assert!(
+            one.summary_text()
+                .starts_with("cone_trace DIR=fanout ROOT=")
+        );
     }
 
     #[test]
@@ -1194,8 +1261,18 @@ mod tests {
         let d = live_design(&s).unwrap();
         let root = some_ff(&s);
         let cone = trace(d, &root, ConeDir::FanIn, 2, false).unwrap();
-        assert!(cone.rows.iter().any(|r| r.obj == ConeObj::Net && r.hops == 1), "{cone:?}");
-        assert!(cone.rows.iter().any(|r| r.obj == ConeObj::Cell && r.hops >= 1), "{cone:?}");
+        assert!(
+            cone.rows
+                .iter()
+                .any(|r| r.obj == ConeObj::Net && r.hops == 1),
+            "{cone:?}"
+        );
+        assert!(
+            cone.rows
+                .iter()
+                .any(|r| r.obj == ConeObj::Cell && r.hops >= 1),
+            "{cone:?}"
+        );
         assert!(trace(d, "no_such_thing", ConeDir::FanIn, 2, false).is_err());
         // A net root walks from the net, and `cell/pin` roots normalize.
         let by_pin = trace(d, &format!("{root}/Q"), ConeDir::FanIn, 1, false).unwrap();
@@ -1209,14 +1286,26 @@ mod tests {
         crate::tcl::eval_command(&mut s, &format!("expand_fanout_cone {root} 2 -stop_at_ff"));
         let c = s.schematic.cone.clone().expect("cone traced");
         assert_eq!((c.dir, c.hops, c.stop_at_ff), (ConeDir::FanOut, 2, true));
-        assert!(s.console.lines.iter().any(|l| l.text.starts_with("cone_trace DIR=fanout")));
+        assert!(
+            s.console
+                .lines
+                .iter()
+                .any(|l| l.text.starts_with("cone_trace DIR=fanout"))
+        );
         crate::tcl::eval_command(&mut s, "expand_cone");
-        assert_eq!(s.schematic.cone.as_ref().unwrap().hops, 3, "bare expand_cone adds a hop");
+        assert_eq!(
+            s.schematic.cone.as_ref().unwrap().hops,
+            3,
+            "bare expand_cone adds a hop"
+        );
         crate::tcl::eval_command(&mut s, "collapse_cone");
         assert!(s.schematic.cone.is_none());
         crate::tcl::eval_command(&mut s, "expand_fanin_cone");
         assert!(
-            s.console.lines.iter().any(|l| l.text.contains("select a cell, port, or net first")),
+            s.console
+                .lines
+                .iter()
+                .any(|l| l.text.contains("select a cell, port, or net first")),
             "no selection is an error, not a guess"
         );
     }
@@ -1229,7 +1318,12 @@ mod tests {
         crate::tcl::eval_command(&mut s, "expand_inside u_led");
         assert!(s.schematic.is_expanded("u_led"));
         crate::tcl::eval_command(&mut s, "expand_inside nope");
-        assert!(s.console.lines.iter().any(|l| l.text.contains("no hierarchical instance nope")));
+        assert!(
+            s.console
+                .lines
+                .iter()
+                .any(|l| l.text.contains("no hierarchical instance nope"))
+        );
     }
 
     #[test]
@@ -1244,7 +1338,10 @@ mod tests {
         assert_eq!(st.go_back(), None);
         assert_eq!(st.go_forward(), Some(SchemSel::Cell("b".into())));
         st.push_history(&SchemSel::Cell("d".into()));
-        assert!(!st.can_go_forward(), "a new selection drops forward history");
+        assert!(
+            !st.can_go_forward(),
+            "a new selection drops forward history"
+        );
         assert_eq!(st.history.len(), 3);
     }
 
@@ -1252,7 +1349,10 @@ mod tests {
     fn find_hits_follow_scope_and_query() {
         let s = fixture();
         let live = live_netlist(&s).unwrap();
-        assert_eq!(find_hits(&live, "", SheetFind::Cells).len(), live.cells.len());
+        assert_eq!(
+            find_hits(&live, "", SheetFind::Cells).len(),
+            live.cells.len()
+        );
         assert_eq!(
             find_hits(&live, "", SheetFind::Ports).len(),
             live.ports_in.len() + live.ports_out.len()
@@ -1275,10 +1375,21 @@ mod tests {
         assert!(rt.find("schematic-cone").is_some());
         assert!(rt.find("schematic-cone-row-0").is_some());
         tap(&mut rt, "schematic-hops-inc");
-        assert_eq!(rt.state.schematic.cone.as_ref().unwrap().hops, 3, "stepper re-traces");
+        assert_eq!(
+            rt.state.schematic.cone.as_ref().unwrap().hops,
+            3,
+            "stepper re-traces"
+        );
         tap(&mut rt, "schematic-cone-row-1");
         let want = rt.state.schematic.cone.as_ref().unwrap().rows[1].clone();
-        assert_eq!(rt.state.schematic.selected.as_ref().map(|s| s.name().to_string()), Some(want.name));
+        assert_eq!(
+            rt.state
+                .schematic
+                .selected
+                .as_ref()
+                .map(|s| s.name().to_string()),
+            Some(want.name)
+        );
         tap(&mut rt, "schematic-prev");
         assert_eq!(
             rt.state.schematic.selected,
@@ -1299,9 +1410,18 @@ mod tests {
         rt.frame(0.0);
         tap(&mut rt, "schematic-mark-debug");
         assert!(
-            rt.state.console.lines.iter().any(|l| l.text == "mark_debug divclk"),
+            rt.state
+                .console
+                .lines
+                .iter()
+                .any(|l| l.text == "mark_debug divclk"),
             "{:?}",
-            rt.state.console.lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+            rt.state
+                .console
+                .lines
+                .iter()
+                .map(|l| &l.text)
+                .collect::<Vec<_>>()
         );
         assert!(net_marked(&rt.state, "divclk"));
         rt.invalidate();
@@ -1325,13 +1445,19 @@ mod tests {
         rt.frame(0.0);
         rt.frame(1.0 / 60.0);
         let [vw, vh] = rt.state.schematic.viewport;
-        assert!(vw > 100.0 && vh > 100.0, "canvas reports its viewport: {vw}x{vh}");
+        assert!(
+            vw > 100.0 && vh > 100.0,
+            "canvas reports its viewport: {vw}x{vh}"
+        );
         tap(&mut rt, "schematic-zoom-in");
         tap(&mut rt, "schematic-zoom-fit");
         let live = live_netlist(&rt.state).unwrap();
         let h = crate::views::schematic::SchemLayout::of(&live, &rt.state.schematic).world_h;
         let z = rt.state.schematic.zoom;
-        assert!(WORLD_W * z <= vw + 0.5 && h * z <= vh + 0.5, "fit shows the whole sheet");
+        assert!(
+            WORLD_W * z <= vw + 0.5 && h * z <= vh + 0.5,
+            "fit shows the whole sheet"
+        );
         assert!(
             WORLD_W * z >= vw - 6.0 || h * z >= vh - 6.0,
             "fit fills one axis of the viewport"
@@ -1357,6 +1483,10 @@ mod tests {
             mods: rune::Mods::default(),
         });
         rt.frame(1.0 / 60.0);
-        assert_ne!(rt.state.schematic.selected, Some(first), "Return cycles to the next hit");
+        assert_ne!(
+            rt.state.schematic.selected,
+            Some(first),
+            "Return cycles to the next hit"
+        );
     }
 }

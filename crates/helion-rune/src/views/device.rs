@@ -59,13 +59,15 @@ pub use crate::views::device_io::{IoPortRow, io_port_rows, push_device_pops};
 pub use crate::views::device_package::{
     PackageGrid, PackagePin, package_grid_text, package_pin, package_pins,
 };
+pub use crate::views::device_floor::DeviceBottom;
+pub use crate::views::device_layers::{DeviceLayers, LayerId};
 use crate::views::device_io::io_ports_table;
 use crate::views::device_package::{package_pane, package_pin_key};
 
 /// Tile width in world points.
-const TILE_W: f32 = 40.0;
+pub(crate) const TILE_W: f32 = 40.0;
 /// Tile height in world points.
-const TILE_H: f32 = 42.0;
+pub(crate) const TILE_H: f32 = 42.0;
 /// Layers panel width.
 const LAYERS_W: f32 = 158.0;
 /// Find + inspector column width.
@@ -79,9 +81,9 @@ const TOOL_H: f32 = 26.0;
 /// Zoom step per in/out press.
 const ZOOM_STEP: f32 = 1.25;
 /// Zoom limits.
-const ZOOM_MIN: f32 = 0.25;
+pub(crate) const ZOOM_MIN: f32 = 0.1;
 /// Zoom limits.
-const ZOOM_MAX: f32 = 4.0;
+pub(crate) const ZOOM_MAX: f32 = 4.0;
 
 /// Canvas label type: smaller than CAD body text.
 const FONT_PIN: TextStyle = TextStyle::new(10.0, 400.0);
@@ -181,97 +183,6 @@ impl DeviceView {
     }
 }
 
-/// Die canvas layer visibility. Typed flags behind the layers panel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeviceLayers {
-    pub sites: bool,
-    pub cells: bool,
-    pub nets: bool,
-    /// Requested regions visibility; always renders off (no region model).
-    pub regions: bool,
-}
-
-impl Default for DeviceLayers {
-    fn default() -> Self {
-        Self {
-            sites: true,
-            cells: true,
-            nets: false,
-            regions: false,
-        }
-    }
-}
-
-/// Layer panel rows. Typed so toggles are never strings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LayerId {
-    Sites,
-    Cells,
-    Nets,
-    Regions,
-}
-
-impl LayerId {
-    pub const ALL: [LayerId; 4] = [
-        LayerId::Sites,
-        LayerId::Cells,
-        LayerId::Nets,
-        LayerId::Regions,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            LayerId::Sites => "Site tiles",
-            LayerId::Cells => "Placed cells",
-            LayerId::Nets => "Net spans",
-            LayerId::Regions => "Clock regions",
-        }
-    }
-
-    pub fn key(self) -> &'static str {
-        match self {
-            LayerId::Sites => "device-layer-sites",
-            LayerId::Cells => "device-layer-cells",
-            LayerId::Nets => "device-layer-nets",
-            LayerId::Regions => "device-layer-regions",
-        }
-    }
-
-    /// The regions layer is unwirable: the HAD model exposes sites but no
-    /// clock-region table, so it stays visibly disabled with a reason.
-    pub fn enabled(self) -> bool {
-        !matches!(self, LayerId::Regions)
-    }
-
-    pub fn disabled_reason(self) -> Option<&'static str> {
-        match self {
-            LayerId::Regions => Some("No HAD region table"),
-            _ => None,
-        }
-    }
-
-    pub fn get(self, layers: &DeviceLayers) -> bool {
-        match self {
-            LayerId::Sites => layers.sites,
-            LayerId::Cells => layers.cells,
-            LayerId::Nets => layers.nets,
-            LayerId::Regions => layers.regions,
-        }
-    }
-
-    pub fn toggle(self, layers: &mut DeviceLayers) {
-        if !self.enabled() {
-            return;
-        }
-        match self {
-            LayerId::Sites => layers.sites = !layers.sites,
-            LayerId::Cells => layers.cells = !layers.cells,
-            LayerId::Nets => layers.nets = !layers.nets,
-            LayerId::Regions => {}
-        }
-    }
-}
-
 /// Device-owned UI state: die/package view, zoom, shared cross-probe
 /// selection, layer flags, find palette visibility, and the find filter edit.
 #[derive(Clone, Debug)]
@@ -285,6 +196,17 @@ pub struct DeviceState {
     /// Port whose Package Pin popover is open (`None` closed; exclusive —
     /// see [`push_device_pops`]).
     pub io_pin_pop: Option<String>,
+    /// Port the I/O quick-set rows act on.
+    pub io_selected: Option<String>,
+    /// Die canvas viewport size in points (from `on_layout`; Fit reads it).
+    pub viewport: [f32; 2],
+    /// Floorplan pblocks (helion-proj `PrjPblock`s) and the selected one.
+    pub pblocks: Vec<helion_proj::PrjPblock>,
+    pub pblock_sel: Option<String>,
+    /// Project `.prj` the pblocks were loaded from.
+    pub pblocks_from: Option<std::path::PathBuf>,
+    /// Bottom panel tab (I/O Ports or Pblocks).
+    pub bottom: DeviceBottom,
 }
 
 impl Default for DeviceState {
@@ -297,6 +219,12 @@ impl Default for DeviceState {
             find_open: true,
             find: rune::TextEdit::new(""),
             io_pin_pop: None,
+            io_selected: None,
+            viewport: [0.0, 0.0],
+            pblocks: Vec::new(),
+            pblock_sel: None,
+            pblocks_from: None,
+            bottom: DeviceBottom::IoPorts,
         }
     }
 }
@@ -308,10 +236,6 @@ impl DeviceState {
 
     pub fn zoom_out(&mut self) {
         self.zoom = (self.zoom / ZOOM_STEP).max(ZOOM_MIN);
-    }
-
-    pub fn zoom_fit(&mut self) {
-        self.zoom = 1.0;
     }
 
     pub fn zoom_label(&self) -> String {
@@ -473,9 +397,34 @@ fn device_toolbar(s: &AppState, t: &VivadoTheme) -> El {
                     .px(6.0)
                     .center()
                     .hover(t.selection)
-                    .on_press(|s: &mut AppState| s.device.zoom_fit())
+                    .on_press_tx(|s: &mut AppState, tx: &mut Tx| {
+                        crate::tcl::eval_command(s, "device_zoom_fit");
+                        tx.scroll_to_instant("device-canvas", 0.0, 0.0);
+                    })
                     .child(ui_label("Fit", t)),
-            );
+            )
+            .child({
+                let why = crate::views::device_layers::zoom_selection_unavailable(s);
+                let mut b = el()
+                    .key("device-zoom-selection")
+                    .role("button")
+                    .label("Zoom to selection")
+                    .h(22.0)
+                    .px(6.0)
+                    .center()
+                    .child(ui_label("Zoom to Selection", t));
+                match why {
+                    None => {
+                        b = b.focusable(true).hover(t.selection).on_press_tx(
+                            |s: &mut AppState, tx: &mut Tx| {
+                                crate::views::device_layers::zoom_to_selection(s, tx)
+                            },
+                        )
+                    }
+                    Some(r) => b = b.disabled(true).description(r).help(r).layer_opacity(0.45),
+                }
+                b
+            });
     }
     bar.child(view_toggle(DeviceView::Die, s, t))
         .child(view_toggle(DeviceView::Package, s, t))
@@ -509,7 +458,7 @@ fn device_toolbar(s: &AppState, t: &VivadoTheme) -> El {
 /// with their reason.
 fn layers_panel(s: &AppState, t: &VivadoTheme) -> El {
     let kit = t.kit();
-    let mut body = col()
+    let body = col()
         .key("device-layers")
         .role("group")
         .label("Die layers")
@@ -526,23 +475,45 @@ fn layers_panel(s: &AppState, t: &VivadoTheme) -> El {
                 .fill(t.header_bg)
                 .child(text("Layers").font(VivadoTheme::FONT_TITLE).color(t.text)),
         );
+    let geom = live_geom(s);
+    let mut rows = col().w_full();
     for layer in LayerId::ALL {
-        let mut check = Checkbox::new(layer.get(&s.device.layers))
+        let why = layer.unavailable(s, &geom);
+        let check = Checkbox::new(layer.get(&s.device.layers) && why.is_none())
             .label(layer.label())
-            .disabled(!layer.enabled())
-            .on_toggle::<AppState>(move |s: &mut AppState| layer.toggle(&mut s.device.layers));
-        if let Some(reason) = layer.disabled_reason() {
-            check = check.description(reason);
+            .disabled(why.is_some())
+            .on_toggle::<AppState>(move |s: &mut AppState| {
+                crate::views::device_layers::toggle_layer(s, layer);
+            });
+        let mut built = check.build(&kit).key(layer.key()).grow(1.0).min_w(0.0);
+        if let Some(r) = why {
+            built = built.description(r).help(r);
         }
-        body = body.child(check.build(&kit).key(layer.key()));
+        let mut line = row().w_full().items_center().pr(8.0).child(built);
+        if let Some(k) = layer.shortcut() {
+            line = line.child(
+                text(k.to_string())
+                    .font(crate::views::cad::FONT_PIN.mono())
+                    .color(t.text_faint)
+                    .a11y_hidden(),
+            );
+        }
+        rows = rows.child(line);
     }
-    body = body.child(
+    rows = rows.child(
         el().w_full()
             .px(8.0)
             .py(4.0)
-            .child(dim_label("Toggle die layers", t)),
+            .child(dim_label("Keys 1–9 · 0 heat · F fit · R rulers", t).truncate()),
     );
-    body
+    body.child(
+        col()
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .scroll(rune::ScrollSpec { stick_bottom: false })
+            .child(rows),
+    )
 }
 
 /// One real site tile rect at 100%: `[x, y, 1, 1]` in site units.
@@ -567,7 +538,8 @@ fn die_shape(
     let mut shape = Shape::new();
     // Site tiles from the real part geometry (mirrors the Device iterators:
     // CLB grid, bottom IOB row, CLK spine, DSP/BRAM columns).
-    if s.device.layers.sites {
+    let lay = s.device.layers;
+    if lay.clb {
         for dy in 0..geom.interior_rows {
             for dx in 0..geom.interior_cols {
                 let [ox, oy, w, h] = tile_rect(geom, geom.clb_x0 + dx, geom.clb_y0 + dy);
@@ -588,12 +560,16 @@ fn die_shape(
                 );
             }
         }
-        // Bottom IOB row under each CLB column.
+    }
+    // Bottom IOB row under each CLB column.
+    if lay.iob {
         let iob_y = geom.clb_y0.saturating_sub(1);
         for dx in 0..geom.interior_cols {
             shape = special_tile(shape, geom, z, geom.clb_x0 + dx, iob_y, t.die_tile, t.pass);
         }
-        // CLK spine, DSP and BRAM columns (outlines over the CLB grid).
+    }
+    // CLK spine, DSP and BRAM columns (outlines over the CLB grid).
+    if lay.clk {
         for dy in 0..geom.interior_rows {
             shape = outline_tile(
                 shape,
@@ -604,13 +580,19 @@ fn die_shape(
                 t.die_region,
             );
         }
+    }
+    if lay.dsp {
         for i in 0..geom.n_dsp {
             shape = outline_tile(shape, geom, z, geom.dsp_x, geom.dsp_y0 + i * 2, t.link);
         }
+    }
+    if lay.bram {
         for i in 0..geom.n_bram {
             shape = outline_tile(shape, geom, z, geom.bram_x, geom.bram_y0 + i * 2, t.warn);
         }
     }
+    // Congestion / criticality heat over the tiles, under cells and spans.
+    shape = crate::views::device_layers::heat_shape(shape, s, t, geom, placed);
     // Die frame.
     shape = shape.stroke(
         vec![
@@ -770,7 +752,11 @@ fn cell_node(
         .focusable(true)
         .absolute(x * z, y * z)
         .size(w * z, h * z)
-        .fill(t.die_cell)
+        .fill(if crate::views::device_layers::heat_on(s, geom) {
+            t.die_cell.alpha(0.12)
+        } else {
+            t.die_cell
+        })
         .border(
             if selected { 2.0 } else { 1.0 },
             if selected { t.fail } else { t.text },
@@ -813,6 +799,9 @@ fn device_canvas(
                 .w_full()
                 .h_full(),
         );
+    for node in crate::views::device_layers::pblock_nodes(s, t, geom) {
+        sheet = sheet.child(node);
+    }
     match (live, placed) {
         (Some(live), Some(placed)) if s.device.cell_visible() => {
             for cell in &live.cells {
@@ -861,6 +850,9 @@ fn device_canvas(
         }
         _ => {}
     }
+    for node in crate::views::device_layers::ruler_nodes(s, t, geom) {
+        sheet = sheet.child(node);
+    }
     sheet = sheet.child(
         text(format!("{} · Device", geom.part))
             .font(FONT_PIN)
@@ -880,6 +872,15 @@ fn device_canvas(
         .fill(t.die_bg)
         .border(1.0, t.border)
         .scroll_xy()
+        .focusable(true)
+        .on_key(crate::views::device_layers::canvas_key)
+        .on_layout(|s: &mut AppState, r: [f32; 4]| {
+            let v = [r[2], r[3]];
+            let old = s.device.viewport;
+            if (v[0] - old[0]).abs() > 0.5 || (v[1] - old[1]).abs() > 0.5 {
+                s.device.viewport = v;
+            }
+        })
         .child(sheet)
 }
 
@@ -945,6 +946,9 @@ fn find_palette(
         .role("search")
         .label("Find die elements")
         .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .max_h(FIND_H + 48.0)
         .fill(t.panel_bg)
         .border(1.0, t.border)
         .child(
@@ -972,7 +976,7 @@ fn find_palette(
                 .on_edit(|s: &mut AppState| &mut s.device.find)
                 .on_submit(|s: &mut AppState, _tx: &mut Tx| select_first_match(s)),
         );
-    let mut list = col().w_full().h(FIND_H).scroll_xy();
+    let mut list = col().w_full().grow(1.0).min_h(0.0).max_h(FIND_H).scroll_xy();
     if hits.is_empty() {
         list = list.child(
             row().w_full().h(ROW_H).items_center().px(8.0).child(
@@ -1006,8 +1010,6 @@ fn device_inspector(
         .key("device-inspector")
         .role("status")
         .w_full()
-        .grow(1.0)
-        .min_h(0.0)
         .fill(t.panel_bg)
         .border(1.0, t.border)
         .child(
@@ -1179,15 +1181,54 @@ fn device_status(
         .gap(8.0)
         .px(8.0)
         .fill(t.header_bg)
-        .child(dim_label(&text, t))
+        .child(dim_label(&text, t).truncate().grow(1.0).min_w(0.0))
+        .children(crate::views::device_layers::heat_legend(s, t, geom))
 }
 
 
+
+/// Bottom panel under the die: I/O Ports (with quick-set) or Pblocks.
+fn bottom_panel(s: &AppState, t: &VivadoTheme) -> El {
+    let ports = io_port_rows(s).len();
+    let tabs = row()
+        .key("device-bottom-tabs")
+        .role("tablist")
+        .w_full()
+        .items_center()
+        .fill(t.header_bg)
+        .child(crate::views::cad::tab(
+            "device-tab-io",
+            &format!("I/O Ports ({ports})"),
+            s.device.bottom == DeviceBottom::IoPorts,
+            t,
+            |s: &mut AppState| s.device.bottom = DeviceBottom::IoPorts,
+        ))
+        .child(crate::views::cad::tab(
+            "device-tab-pblocks",
+            &format!("Pblocks ({})", s.device.pblocks.len()),
+            s.device.bottom == DeviceBottom::Pblocks,
+            t,
+            |s: &mut AppState| s.device.bottom = DeviceBottom::Pblocks,
+        ));
+    col()
+        .key("device-bottom")
+        .w_full()
+        .min_w(0.0)
+        .fill(t.panel_bg)
+        .border(1.0, t.border)
+        .child(tabs)
+        .child(match s.device.bottom {
+            DeviceBottom::IoPorts => io_ports_table(s, t),
+            DeviceBottom::Pblocks => crate::views::device_floor::pblocks_table(s, t),
+        })
+}
 
 pub fn device_pane(s: &AppState, t: &VivadoTheme) -> El {
     let geom = live_geom(s);
     let live = live_netlist(s);
     let placed = live_placed(s);
+    // The find list gives up height first, so the inspector (and its
+    // Locate link) always fits when the bottom tabs take space.
     let mut right = col().w(RIGHT_W).h_full().gap(6.0).min_h(0.0);
     if s.device.find_open {
         right = right.child(find_palette(s, t, live.as_ref(), placed.as_ref()));
@@ -1198,6 +1239,7 @@ pub fn device_pane(s: &AppState, t: &VivadoTheme) -> El {
         .grow(1.0)
         .h_full()
         .min_h(0.0)
+        .min_w(0.0)
         .fill(t.panel_bg)
         .border(1.0, t.border)
         .child(pane_header("Device", "device-pane", t))
@@ -1221,7 +1263,7 @@ pub fn device_pane(s: &AppState, t: &VivadoTheme) -> El {
                 .child(package_pane(s, t))
                 .child(right),
         })
-        .child(io_ports_table(s, t))
+        .child(bottom_panel(s, t))
         .child(device_status(s, t, &geom, live.as_ref(), placed.as_ref()))
 }
 
@@ -1259,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn layers_gate_cells_and_nets_but_never_regions() {
+    fn layers_gate_cells_and_nets() {
         let mut st = DeviceState::default();
         assert!(st.cell_visible());
         assert!(!st.net_visible());
@@ -1269,12 +1311,9 @@ mod tests {
         assert!(!st.cell_visible());
         assert!(st.net_visible());
         assert!(
-            !LayerId::Regions.enabled(),
-            "regions stay disabled: no HAD region table"
+            LayerId::ALL.iter().all(|l| !l.label().contains("region")),
+            "no clock-region layer: the HAD model has no region table"
         );
-        assert!(LayerId::Regions.disabled_reason().is_some());
-        LayerId::Regions.toggle(&mut st.layers);
-        assert!(!st.layers.regions, "disabled toggle must be a no-op");
     }
 
     #[test]
@@ -1283,7 +1322,7 @@ mod tests {
         assert_eq!(st.zoom_label(), "100%");
         st.zoom_in();
         assert_eq!(st.zoom_label(), "125%");
-        st.zoom_fit();
+        st.zoom_out();
         assert_eq!(st.zoom_label(), "100%");
     }
 
@@ -1346,11 +1385,10 @@ mod tests {
             "device-view-package",
             "device-find-toggle",
             "device-layers",
-            "device-layer-sites",
+            "device-layer-clb",
             "device-layer-cells",
             "device-layer-nets",
-            "device-layer-regions",
-            "device-canvas",
+                        "device-canvas",
             "device-cell-u-div-u-ff0",
             "device-cell-u-ff0",
             "device-die-label",
@@ -1516,6 +1554,13 @@ mod tests {
         tap(&mut rt, "device-zoom-in");
         assert!(rt.state.device.zoom > 1.5);
         tap(&mut rt, "device-zoom-fit");
-        assert_eq!(rt.state.device.zoom, 1.0);
+        let geom = live_geom(&rt.state);
+        let [vw, vh] = rt.state.device.viewport;
+        let z = rt.state.device.zoom;
+        assert!(vw > 100.0 && vh > 100.0, "canvas reports its viewport");
+        assert!(
+            world_w(&geom) * z <= vw + 0.5 && world_h(&geom) * z <= vh + 0.5,
+            "fit shows the whole die"
+        );
     }
 }

@@ -406,13 +406,25 @@ mod tests {
         s
     }
 
+    thread_local!(static CLOCK: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) });
+
+    /// Advance the test clock so layout springs settle between presses.
+    fn tick(rt: &mut Runtime<AppState>) {
+        let t = CLOCK.with(|c| {
+            c.set(c.get() + 0.5);
+            c.get()
+        });
+        rt.frame(t);
+    }
+
     fn tap(rt: &mut Runtime<AppState>, key: &str) {
+        tick(rt);
         let (x, y) = rt.find(key).unwrap_or_else(|| panic!("missing key: {key}"));
         rt.pointer_move(x, y);
-        rt.frame(1.0 / 60.0);
+        tick(rt);
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
-        rt.frame(1.0 / 60.0);
+        tick(rt);
     }
 
     #[test]

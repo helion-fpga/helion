@@ -97,49 +97,75 @@ pub fn io_port_rows(s: &AppState) -> Vec<IoPortRow> {
         .collect()
 }
 
+/// Fixed column widths after the growing Name column.
+const IO_COLS: [(&str, f32); 12] = [
+    ("Dir", 44.0),
+    ("Site", 84.0),
+    ("Placed", 52.0),
+    ("Package Pin", 120.0),
+    ("IOSTANDARD", 92.0),
+    ("Drive", 48.0),
+    ("Slew", 48.0),
+    ("Pull Type", 72.0),
+    ("Diff Term", 64.0),
+    ("In Term", 120.0),
+    ("Objects", 64.0),
+    ("", 0.0),
+];
+/// Table content width before it scrolls horizontally.
+const IO_MIN_W: f32 = 1000.0;
+
+/// Netlist cells on a port's net (the `Objects` column).
+fn port_objects(s: &AppState, port: &str) -> usize {
+    crate::live::live_netlist(s)
+        .and_then(|l| l.net(port).map(|n| n.cells.len()))
+        .unwrap_or(0)
+}
+
 /// I/O Ports planning table under the die canvas (old Package tab's port
-/// grid, read-only): name/dir/site/pin + pin constraints. Row taps
-/// cross-probe the die (placed IOB cell, else the port net).
+/// grid): name/dir/site/placed/pin + pin constraints + objects. Row taps
+/// cross-probe the die (placed IOB cell, else the port net) and pick the
+/// port the quick-set rows act on.
 pub(crate) fn io_ports_table(s: &AppState, t: &VivadoTheme) -> El {
     let rows = io_port_rows(s);
-    let mut body = col().w_full();
-    body = body.child(
-        row()
-            .key("device-io-head")
-            .w_full()
-            .items_center()
-            .px(8.0)
-            .child(el().grow(1.0).min_w(0.0).child(dim_label("Name", t)))
-            .child(el().w(44.0).child(dim_label("Dir", t)))
-            .child(el().w(96.0).child(dim_label("Site", t)))
-            .child(el().w(128.0).child(dim_label("Package Pin", t)))
-            .child(el().w(96.0).child(dim_label("IOSTANDARD", t)))
-            .child(el().w(56.0).child(dim_label("Drive", t)))
-            .child(el().w(56.0).child(dim_label("Slew", t)))
-            .child(el().w(72.0).child(dim_label("Pull Type", t)))
-            .child(el().w(64.0).child(dim_label("Diff Term", t)))
-            .child(el().w(96.0).child(dim_label("In Term", t))),
-    );
+    let mut head = row()
+        .key("device-io-head")
+        .w_full()
+        .h(crate::views::cad::HEAD_H)
+        .items_center()
+        .px(8.0)
+        .fill(t.header_bg)
+        .child(el().grow(1.0).min_w(96.0).child(dim_label("Name", t)));
+    for (title, w) in IO_COLS.iter().filter(|(_, w)| *w > 0.0) {
+        head = head.child(el().w(*w).child(dim_label(title, t)));
+    }
+    let mut body = col().w_full().min_w(IO_MIN_W).child(head);
     if rows.is_empty() {
         body = body.child(
             dim_label("Synth a design to list ports.", t)
                 .key("device-io-empty")
-                .px(8.0),
+                .px(8.0)
+                .py(4.0),
         );
     }
     for (i, r) in rows.iter().enumerate() {
-        let sel = match (&r.iob_cell, s.device.selected.as_ref()) {
-            (Some(cell), Some(DeviceSel::Cell(n))) => n == cell,
-            (None, Some(DeviceSel::Net(n))) => n == &r.name,
-            _ => false,
-        };
+        let sel = s.device.io_selected.as_deref() == Some(r.name.as_str())
+            || match (&r.iob_cell, s.device.selected.as_ref()) {
+                (Some(cell), Some(DeviceSel::Cell(n))) => n == cell,
+                (None, Some(DeviceSel::Net(n))) => n == &r.name,
+                _ => false,
+            };
         let pick = match r.iob_cell.clone() {
             Some(cell) => DeviceSel::Cell(cell),
             None => DeviceSel::Net(r.name.clone()),
         };
+        let port = r.name.clone();
+        let objects = port_objects(s, &r.name);
+        let w = |k: usize| IO_COLS[k].1;
         let mut line = row()
             .key(format!("device-io-row-{i}"))
             .role("row")
+            .label(format!("Port {}", r.name))
             .w_full()
             .h(22.0)
             .items_center()
@@ -147,35 +173,35 @@ pub(crate) fn io_ports_table(s: &AppState, t: &VivadoTheme) -> El {
             .hover(t.selection)
             .on_press(move |s: &mut AppState| {
                 s.device.selected = Some(pick.clone());
+                s.device.io_selected = Some(port.clone());
             })
             .child(
                 el().grow(1.0)
-                    .min_w(0.0)
-                    .child(ui_label(&r.name, t).truncate()),
+                    .min_w(96.0)
+                    .child(ui_label(&r.name, t).truncate().help_when_truncated(r.name.clone())),
             )
-            .child(el().w(44.0).child(ui_label(r.dir, t)))
-            .child(el().w(96.0).child(mono_cell(IoPortRow::cell(&r.site), t)))
+            .child(el().w(w(0)).child(ui_label(r.dir, t)))
+            .child(el().w(w(1)).child(mono_cell(IoPortRow::cell(&r.site), t)))
+            .child(el().w(w(2)).child(ui_label(if r.site.is_some() { "Yes" } else { "No" }, t)))
             .child(
-                el().w(128.0)
+                el().w(w(3))
+                    .pr(8.0)
                     .child(pin_trigger(&r.name, IoPortRow::cell(&r.package_pin), t)),
             )
+            .child(el().w(w(4)).child(mono_cell(IoPortRow::cell(&r.iostandard), t)))
+            .child(el().w(w(5)).child(mono_cell(IoPortRow::cell(&r.drive), t)))
+            .child(el().w(w(6)).child(mono_cell(IoPortRow::cell(&r.slew), t)))
+            .child(el().w(w(7)).child(mono_cell(IoPortRow::cell(&r.pulltype), t)))
+            .child(el().w(w(8)).child(mono_cell(IoPortRow::cell(&r.diff_term), t)))
+            .child(el().w(w(9)).child(mono_cell(IoPortRow::cell(&r.in_term), t)))
             .child(
-                el().w(96.0)
-                    .child(mono_cell(IoPortRow::cell(&r.iostandard), t)),
-            )
-            .child(el().w(56.0).child(mono_cell(IoPortRow::cell(&r.drive), t)))
-            .child(el().w(56.0).child(mono_cell(IoPortRow::cell(&r.slew), t)))
-            .child(
-                el().w(72.0)
-                    .child(mono_cell(IoPortRow::cell(&r.pulltype), t)),
-            )
-            .child(
-                el().w(64.0)
-                    .child(mono_cell(IoPortRow::cell(&r.diff_term), t)),
-            )
-            .child(
-                el().w(96.0)
-                    .child(mono_cell(IoPortRow::cell(&r.in_term), t)),
+                el().w(w(10)).child(
+                    text(format!("{objects} cells"))
+                        .font(VivadoTheme::FONT_MONO.mono())
+                        .color(t.text_dim)
+                        .w_full()
+                        .align(rune::Align::End),
+                ),
             );
         if sel {
             line = line.fill(t.selection);
@@ -185,28 +211,17 @@ pub(crate) fn io_ports_table(s: &AppState, t: &VivadoTheme) -> El {
     col()
         .key("device-io-ports")
         .w_full()
-        .max_h(190.0)
-        .fill(t.panel_bg)
-        .border(1.0, t.border)
-        .child(
-            row()
-                .w_full()
-                .items_center()
-                .gap(8.0)
-                .px(8.0)
-                .py(4.0)
-                .child(ui_label("I/O Ports", t))
-                .child(dim_label(&format!("{} ports", rows.len()), t)),
-        )
+        .min_w(0.0)
         .child(
             col()
+                .key("device-io-scroll")
                 .w_full()
-                .max_h(156.0)
-                .scroll(rune::ScrollSpec {
-                    stick_bottom: false,
-                })
+                .min_w(0.0)
+                .max_h(112.0)
+                .scroll_xy()
                 .child(body),
         )
+        .child(crate::views::device_io_quick::quickset(s, t, &rows))
 }
 
 fn mono_cell(content: &str, t: &VivadoTheme) -> El {

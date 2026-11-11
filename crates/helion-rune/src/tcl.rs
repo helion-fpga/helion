@@ -285,6 +285,14 @@ pub const COMMANDS: &[&str] = &[
     "schematic_next",
     "next_view",
     "schematic_zoom_fit",
+    // Device floorplanning (old pblock verbs) and die fit.
+    "create_pblock",
+    "resize_pblock",
+    "add_cells_to_pblock",
+    "get_pblocks",
+    "report_pblocks",
+    "select_pblock",
+    "device_zoom_fit",
 ];
 
 /// Max nested `[...]` evaluation depth (mirrors the real interp's cap idea;
@@ -2828,6 +2836,10 @@ fn dispatch_host(
             crate::views::schematic_cone::tcl_verb(s, n, argv.get(1..).unwrap_or_default()),
             line,
         ),
+        n if crate::views::device_floor::VERBS.contains(&n) => ctl_result(
+            crate::views::device_floor::tcl_verb(s, n, argv.get(1..).unwrap_or_default()),
+            line,
+        ),
         _ => unknown_command(s, name, line),
     }
 }
@@ -5224,6 +5236,16 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
             "step through the schematic selection history",
         ),
         "schematic_zoom_fit" => ("schematic_zoom_fit", "fit the schematic sheet to its viewport"),
+        "create_pblock" | "resize_pblock" => (
+            "create_pblock name ?-add CLB_XaYb:CLB_XcYd? | resize_pblock name -add range",
+            "create or resize a floorplan pblock (saved to the open .prj)",
+        ),
+        "add_cells_to_pblock" => ("add_cells_to_pblock name cells…", "assign cells to a pblock"),
+        "get_pblocks" | "report_pblocks" | "select_pblock" => (
+            "get_pblocks | report_pblocks | select_pblock name",
+            "list, report, or select floorplan pblocks",
+        ),
+        "device_zoom_fit" => ("device_zoom_fit", "fit the die to the Device viewport"),
         _ => return None,
     })
 }
@@ -5251,6 +5273,7 @@ fn help_overview() -> String {
         "  report_power report_methodology report_drc report_constraints",
         "Schematic: expand_fanin_cone expand_fanout_cone expand_cone collapse_cone expand_inside collapse_inside",
         "  schematic_previous schematic_next schematic_zoom_fit",
+        "Floorplan: create_pblock resize_pblock add_cells_to_pblock get_pblocks report_pblocks select_pblock device_zoom_fit",
         "help <command> for usage. See docs/tcl-subset.md for the supported subset.",
     ]
     .join("\n")
