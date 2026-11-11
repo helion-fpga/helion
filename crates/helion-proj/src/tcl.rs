@@ -1427,7 +1427,9 @@ impl VivadoTclSession {
             | "group_path"
             | "set_max_time_borrow"
             | "set_data_check" => self.cmd_inline_xdc(argv),
-            "create_pblock" | "resize_pblock" | "add_cells_to_pblock" => self.cmd_pblock(argv),
+            "create_pblock" | "resize_pblock" | "add_cells_to_pblock" | "delete_pblocks" => {
+                self.cmd_pblock(argv)
+            }
             "mark_debug" => {
                 let net = argv.get(1).ok_or("mark_debug: missing net")?;
                 for n in split_tcl_list(net) {
@@ -1795,6 +1797,7 @@ impl VivadoTclSession {
         text.push('\n');
         if let Ok(parsed) = load_prj(&text) {
             self.project.pblocks = parsed.pblocks;
+            self.project.partitions = parsed.partitions;
         }
         Ok(line)
     }
