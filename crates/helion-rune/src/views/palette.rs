@@ -90,24 +90,37 @@ pub enum PaletteCommand {
 }
 
 /// Center panes in palette display order.
-const PANES: [CenterPane; 11] = [
+const PANES: [CenterPane; 16] = [
     CenterPane::Summary,
     CenterPane::Editor,
     CenterPane::Timing,
+    CenterPane::Constraints,
     CenterPane::Start,
     CenterPane::Schematic,
     CenterPane::Device,
+    CenterPane::Find,
     CenterPane::Wave,
     CenterPane::Sim,
     CenterPane::Debug,
+    CenterPane::Ila,
+    CenterPane::Ip,
+    CenterPane::Bitstream,
     CenterPane::Program,
     CenterPane::Reports,
 ];
 
 /// Tcl recipes shared by the registry (old `menu_tcl_recipes`).
-const TCL_RECIPES: [(&str, &str); 3] = [
+const TCL_RECIPES: [(&str, &str); 11] = [
     ("Report timing", "report_timing"),
     ("Report utilization", "report_utilization"),
+    ("Report timing summary", "report_timing_summary"),
+    ("Report clock interaction", "report_clock_interaction"),
+    ("Report CDC", "report_cdc"),
+    ("Report clock networks", "report_clock_networks"),
+    ("Report power", "report_power"),
+    ("Report methodology", "report_methodology"),
+    ("Report DRC", "report_drc"),
+    ("Report bitstream", "report_bitstream"),
     (
         "Create clock 10ns",
         "create_clock -name clk -period 10 [get_ports clk]",
@@ -131,7 +144,7 @@ fn pane_label(pane: CenterPane) -> &'static str {
         CenterPane::Ip => "IP Integrator",
         CenterPane::Bitstream => "Bitstream",
         CenterPane::Find => "Find Results",
-        CenterPane::Constraints => "Constraints",
+        CenterPane::Constraints => "Timing Constraints",
     }
 }
 
@@ -586,6 +599,9 @@ pub fn match_chord(key: &KeyEvent) -> Option<ChordAction> {
     if key.is_command('j') {
         return Some(ChordAction::ToggleSidebar);
     }
+    if key.is_command('f') && key.mods.shift {
+        return Some(ChordAction::GoTo(CenterPane::Find));
+    }
     if key.is_command('f') {
         return Some(ChordAction::Find);
     }
@@ -692,6 +708,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("⌘O", "Open project or file…"),
     ("⌘S", "Save open file"),
     ("⌘F", "Find in the open file"),
+    ("⇧⌘F", "Find cells, ports and nets in the design"),
     ("⌘↩", "Implement: synthesis → opt → place → route"),
     ("⌘1", "Go to Editor"),
     ("⌘2", "Go to Device"),
@@ -1271,15 +1288,16 @@ mod tests {
     fn edit_menu_opens_both_palette_modes() {
         // One runtime per mode: the open palette's modal scrim covers the
         // menubar, so a second menu tap in the same runtime cannot land.
-        // Edit: Undo, Redo, rule, Find, Go to File (4), Command Palette (5).
+        // Edit: Undo, Redo, rule, Find in File, Find in Design, Go to File
+        // (5), Command Palette (6).
         let mut rt = rt_with(|_| {});
         tap(&mut rt, "menu-edit");
-        tap(&mut rt, "menu-edit-item4");
+        tap(&mut rt, "menu-edit-item5");
         assert!(rt.state.palette.open);
         assert_eq!(rt.state.palette.mode, PaletteMode::Files);
         let mut rt = rt_with(|_| {});
         tap(&mut rt, "menu-edit");
-        tap(&mut rt, "menu-edit-item5");
+        tap(&mut rt, "menu-edit-item6");
         assert!(rt.state.palette.open);
         assert_eq!(rt.state.palette.mode, PaletteMode::Commands);
     }

@@ -235,6 +235,12 @@ fn menu_rows(id: MenuId, s: &AppState) -> Vec<MenuRow> {
             Sep,
             hot("Find in File…", "find", "⌘F", A::Find),
             hot(
+                "Find in Design…",
+                "find",
+                "⇧⌘F",
+                A::Nav(CenterPane::Find),
+            ),
+            hot(
                 "Go to File…",
                 "palette_files",
                 "⌘P",
@@ -293,11 +299,21 @@ fn menu_rows(id: MenuId, s: &AppState) -> Vec<MenuRow> {
                 ),
                 Sep,
                 item(
+                    "Edit Timing Constraints",
+                    "report_constraints",
+                    A::Nav(CenterPane::Constraints),
+                ),
+                item(
                     "Report Timing Summary",
                     "report_timing_summary",
                     A::Nav(CenterPane::Timing),
                 ),
                 item("Open Reports", "show_view Reports", A::Nav(CenterPane::Reports)),
+                item(
+                    "Open Bitstream Report",
+                    "report_bitstream",
+                    A::Nav(CenterPane::Bitstream),
+                ),
             ]);
             rows
         }
@@ -324,6 +340,9 @@ fn menu_rows(id: MenuId, s: &AppState) -> Vec<MenuRow> {
                 ),
                 no_project,
             ),
+            Sep,
+            item("IP Catalog", "ip_catalog", A::Nav(CenterPane::Ip)),
+            item("Logic Analyzer", "ila", A::Nav(CenterPane::Ila)),
             Sep,
             item("Keyboard Shortcuts", "shortcuts", A::Cheatsheet),
         ],
@@ -414,11 +433,25 @@ fn menu_rows(id: MenuId, s: &AppState) -> Vec<MenuRow> {
             ),
             hot("Device", "show_view Device", "⌘2", A::Nav(CenterPane::Device)),
             hot("Timing", "show_view Timing", "⌘3", A::Nav(CenterPane::Timing)),
+            item(
+                "Timing Constraints",
+                "report_constraints",
+                A::Nav(CenterPane::Constraints),
+            ),
             item("Reports", "show_view Reports", A::Nav(CenterPane::Reports)),
+            item("Find Results", "find", A::Nav(CenterPane::Find)),
             Sep,
             item("Simulation", "show_view Sim", A::Nav(CenterPane::Sim)),
             item("Waveform", "show_view Wave", A::Nav(CenterPane::Wave)),
             item("Debug", "show_view Debug", A::Nav(CenterPane::Debug)),
+            item("Logic Analyzer", "ila", A::Nav(CenterPane::Ila)),
+            Sep,
+            item("IP Integrator", "ip_catalog", A::Nav(CenterPane::Ip)),
+            item(
+                "Bitstream",
+                "report_bitstream",
+                A::Nav(CenterPane::Bitstream),
+            ),
             item(
                 "Hardware Manager",
                 "show_view Program",
@@ -521,6 +554,8 @@ struct FlowEntry {
     status: Option<RunStatus>,
     /// `Some(reason)` disables the entry with that tooltip.
     blocked: Option<&'static str>,
+    /// Extra action after navigation (pick a report page, open a tab, ...).
+    act: Option<fn(&mut AppState)>,
 }
 
 #[derive(Clone, Copy)]
@@ -556,6 +591,7 @@ fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
         report,
         status: None,
         blocked: None,
+        act: None,
     };
     let blocked = run_blocked(s);
     let run = |section: FlowSection,
@@ -574,8 +610,24 @@ fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
         report: None,
         status: Some(status),
         blocked,
+        act: None,
     };
     let no_project = s.project.name.is_empty().then_some("Open or create a project first");
+    // A navigation entry with a follow-up action.
+    let goto = |section: FlowSection,
+                label: &'static str,
+                tcl: &'static str,
+                pane: CenterPane,
+                act: fn(&mut AppState)| FlowEntry {
+        act: Some(act),
+        ..link(section, label, tcl, Some(pane), None, None)
+    };
+    let timing_page = |section: FlowSection,
+                       label: &'static str,
+                       tcl: &'static str,
+                       act: fn(&mut AppState)| {
+        goto(section, label, tcl, CenterPane::Timing, act)
+    };
     match section {
         FlowSection::ProjectManager => vec![
             link(
@@ -597,28 +649,48 @@ fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
                     None,
                 )
             },
-            FlowEntry {
-                blocked: no_project,
-                ..link(
-                    section,
-                    "Constraints Wizard",
-                    "constraints_wizard",
-                    None,
-                    Some(DialogId::Constraints),
-                    None,
-                )
-            },
-        ],
-        // Block-design entries arrive with the IP surface.
-        FlowSection::IpIntegrator => Vec::new(),
-        FlowSection::Simulation => vec![
             link(
+                section,
+                "IP Catalog",
+                "ip_catalog",
+                Some(CenterPane::Ip),
+                None,
+                None,
+            ),
+        ],
+        FlowSection::IpIntegrator => vec![
+            goto(
+                section,
+                "Create Block Design",
+                "create_bd",
+                CenterPane::Ip,
+                |s| {
+                    crate::tcl::eval_command(s, "create_bd");
+                    s.ip.tab = crate::views::ip::BdTab::Diagram;
+                },
+            ),
+            goto(
+                section,
+                "Open Block Design",
+                "open_bd_design",
+                CenterPane::Ip,
+                |s| s.ip.tab = crate::views::ip::BdTab::Diagram,
+            ),
+            goto(
+                section,
+                "Generate Block Design",
+                "bd_hdl",
+                CenterPane::Ip,
+                |s| s.ip.tab = crate::views::ip::BdTab::Hdl,
+            ),
+        ],
+        FlowSection::Simulation => vec![
+            goto(
                 section,
                 "Simulation Settings",
                 "sim_settings",
-                Some(CenterPane::Sim),
-                None,
-                None,
+                CenterPane::Sim,
+                |s| s.sim_settings.open = true,
             ),
             FlowEntry {
                 blocked: no_project,
@@ -648,14 +720,24 @@ fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
                 None,
             ),
         ],
-        FlowSection::RtlAnalysis => vec![link(
-            section,
-            "Open Elaborated Design",
-            "open_run -elaborated",
-            Some(CenterPane::Schematic),
-            None,
-            None,
-        )],
+        FlowSection::RtlAnalysis => vec![
+            link(
+                section,
+                "Open Elaborated Design",
+                "open_run -elaborated",
+                Some(CenterPane::Schematic),
+                None,
+                None,
+            ),
+            link(
+                section,
+                "Find in Design",
+                "find",
+                Some(CenterPane::Find),
+                None,
+                None,
+            ),
+        ],
         FlowSection::Synthesis => vec![
             run(
                 section,
@@ -673,13 +755,30 @@ fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
                 None,
                 None,
             ),
+            FlowEntry {
+                blocked: no_project,
+                ..link(
+                    section,
+                    "Constraints Wizard",
+                    "constraints_wizard",
+                    None,
+                    Some(DialogId::Constraints),
+                    None,
+                )
+            },
             link(
+                section,
+                "Edit Timing Constraints",
+                "report_constraints",
+                Some(CenterPane::Constraints),
+                None,
+                None,
+            ),
+            timing_page(
                 section,
                 "Report Timing Summary",
                 "report_timing_summary",
-                Some(CenterPane::Timing),
-                None,
-                None,
+                |s| s.timing_view.selected = crate::views::timing::TimingNav::Summary,
             ),
         ],
         FlowSection::Implementation => vec![
@@ -699,6 +798,30 @@ fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
                 None,
                 None,
             ),
+            timing_page(
+                section,
+                "Report Clock Interaction",
+                "report_clock_interaction",
+                |s| {
+                    s.timing_view.selected = crate::views::timing::TimingNav::ClockInteraction
+                },
+            ),
+            link(
+                section,
+                "Report Methodology",
+                "report_methodology",
+                Some(CenterPane::Reports),
+                None,
+                Some(ReportNav::Methodology),
+            ),
+            link(
+                section,
+                "Report DRC",
+                "report_drc",
+                Some(CenterPane::Reports),
+                None,
+                Some(ReportNav::Drc),
+            ),
             link(
                 section,
                 "Report Utilization",
@@ -715,14 +838,6 @@ fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
                 None,
                 Some(ReportNav::Power),
             ),
-            link(
-                section,
-                "Report DRC",
-                "report_drc",
-                Some(CenterPane::Reports),
-                None,
-                Some(ReportNav::Drc),
-            ),
         ],
         FlowSection::ProgramDebug => vec![
             FlowEntry {
@@ -737,14 +852,30 @@ fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
                     } else {
                         RunStatus::NotStarted
                     },
-                    Some(CenterPane::Program),
+                    Some(CenterPane::Bitstream),
                 )
             },
+            link(
+                section,
+                "Open Bitstream Report",
+                "report_bitstream",
+                Some(CenterPane::Bitstream),
+                None,
+                None,
+            ),
             link(
                 section,
                 "Open Hardware Manager",
                 "open_hw_manager",
                 Some(CenterPane::Program),
+                None,
+                None,
+            ),
+            link(
+                section,
+                "Open Logic Analyzer",
+                "ila",
+                Some(CenterPane::Ila),
                 None,
                 None,
             ),
@@ -882,7 +1013,7 @@ const TOOLS_RUN: &[Tool] = &[
         tcl: "launch_runs -to_step write_bitstream",
         icon: ToolIcon::Chip,
         starts: Some(RunTarget::Bitstream),
-        nav: Some(CenterPane::Program),
+        nav: Some(CenterPane::Bitstream),
     },
     Tool {
         id: "hw-manager",
@@ -895,12 +1026,26 @@ const TOOLS_RUN: &[Tool] = &[
 ];
 
 /// Chrome-owned UI state: which dropdown is open, which rail sections fold.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ChromeState {
     pub open_menu: Option<MenuId>,
     pub collapsed: [bool; 7],
     /// Help ▸ About dialog is showing.
     pub about_open: bool,
+}
+
+impl Default for ChromeState {
+    fn default() -> Self {
+        // IP Integrator starts folded: block design is an occasional task,
+        // and folding it keeps the synthesis-to-bitstream flow on screen.
+        let mut collapsed = [false; 7];
+        collapsed[FlowSection::IpIntegrator.index()] = true;
+        Self {
+            open_menu: None,
+            collapsed,
+            about_open: false,
+        }
+    }
 }
 
 impl ChromeState {
@@ -1021,7 +1166,7 @@ fn dispatch_menu(s: &mut AppState, tcl: &'static str, act: MenuAct, tx: &mut Tx)
             s,
             tcl,
             Some(RunTarget::Bitstream),
-            Some(CenterPane::Program),
+            Some(CenterPane::Bitstream),
             None,
             None,
         ),
@@ -1428,12 +1573,13 @@ pub fn flow_rail(s: &AppState, t: &VivadoTheme) -> El {
         );
         if !collapsed {
             for entry in entries {
-                let (tcl, starts, nav, dialog, report) = (
+                let (tcl, starts, nav, dialog, report, act) = (
                     entry.tcl,
                     entry.starts,
                     entry.nav,
                     entry.dialog,
                     entry.report,
+                    entry.act,
                 );
                 let enabled = entry.blocked.is_none();
                 let mut row_el = row()
@@ -1452,7 +1598,10 @@ pub fn flow_rail(s: &AppState, t: &VivadoTheme) -> El {
                     row_el = row_el.description(reason).help(reason);
                 } else {
                     row_el = row_el.hover(t.selection).on_press(move |s: &mut AppState| {
-                        dispatch_full(s, tcl, starts, nav, dialog, report)
+                        dispatch_full(s, tcl, starts, nav, dialog, report);
+                        if let Some(act) = act {
+                            act(s);
+                        }
                     });
                 }
                 if entry.run_icon {
@@ -1898,12 +2047,12 @@ mod tests {
     }
 
     #[test]
-    fn toolbar_bitstream_launches_impl_and_opens_program() {
+    fn toolbar_bitstream_launches_impl_and_opens_bitstream_report() {
         let mut rt = harness();
         rt.frame(0.0);
         tap(&mut rt, "tool-gen-bitstream");
         assert_eq!(rt.state.flow.impl_run, RunStatus::Running);
-        assert_eq!(rt.state.center, CenterPane::Program);
+        assert_eq!(rt.state.center, CenterPane::Bitstream);
         assert!(
             rt.state
                 .console
@@ -1935,9 +2084,9 @@ mod tests {
             rt.find("menu-view-menu").is_some(),
             "View dropdown must mount"
         );
-        // Start, Summary, rule, 5 design views, rule, 4 sim/hw views, rule,
-        // THEME caption: Light 15, Dark 16, Follow System 17.
-        tap(&mut rt, "menu-view-item16");
+        // Start, Summary, rule, 7 design views, rule, 4 sim views, rule,
+        // 3 hardware views, rule, THEME caption: Light 21, Dark 22, System 23.
+        tap(&mut rt, "menu-view-item22");
         assert_eq!(rt.state.theme, ThemeMode::Dark, "Dark Theme pins dark");
         assert_eq!(rt.state.chrome.open_menu, None);
         assert!(
@@ -1949,10 +2098,10 @@ mod tests {
             "theme pin must echo its Tcl verb"
         );
         tap(&mut rt, "menu-view");
-        tap(&mut rt, "menu-view-item15");
+        tap(&mut rt, "menu-view-item21");
         assert_eq!(rt.state.theme, ThemeMode::Light, "Light Theme pins light");
         tap(&mut rt, "menu-view");
-        tap(&mut rt, "menu-view-item17");
+        tap(&mut rt, "menu-view-item23");
         assert_eq!(
             rt.state.theme,
             ThemeMode::System,
