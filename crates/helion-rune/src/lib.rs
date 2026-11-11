@@ -35,6 +35,18 @@ use rune::{AppSpec, Cx, El, col, el, row, text};
 const TITLE: &str = "project_1 - Helion";
 const SIZE: (f32, f32) = (1440.0, 900.0);
 
+/// Scene helper: mount the named leaf traces (in order) as the lanes.
+fn scene_lanes(s: &mut AppState, leaves: &[&str]) {
+    let Some(live) = s.wave.live.as_ref() else {
+        return;
+    };
+    s.wave.live_lanes = leaves
+        .iter()
+        .filter_map(|l| live.traces.iter().position(|t| t.leaf() == *l))
+        .collect();
+    s.wave.lanes_custom = true;
+}
+
 /// Named headless states (`--scene NAME`; see `tooling.rs::AppSpec::scenes`).
 /// Per-surface scenes arrive with their view batches; the scaffold ships the
 /// hello pair so `--snap/--tree` work from day one.
@@ -335,6 +347,49 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
             }];
             s.wave.clamp_to_grid();
         }
+    }),
+    ("wave-decoders", |s| {
+        s.center = state::CenterPane::Wave;
+        views::wave_demo::seed_protocol_fixture(s);
+        let hdl = views::wave_demo::PROTOCOL_FIXTURE_HDL;
+        use views::wave_decode::DecoderKind;
+        for kind in [DecoderKind::Spi, DecoderKind::Uart, DecoderKind::Fsm, DecoderKind::AxiLite] {
+            s.wave.add_decoder(kind, hdl);
+        }
+        scene_lanes(s, &["sclk", "mosi", "miso", "cs_n", "uart_tx", "state"]);
+        s.wave.live_selected = s.wave.lanes().last().copied();
+        s.wave.zoom = 0.4;
+        s.wave.cursor = 44;
+    }),
+    ("wave-analog", |s| {
+        use views::wave_style::{Analog, Density, TraceDisplay};
+        s.center = state::CenterPane::Wave;
+        views::wave_demo::seed_protocol_fixture(s);
+        scene_lanes(s, &["dac", "saw", "cnt_0", "cnt_1", "cnt_2", "cnt_3"]);
+        let lanes = s.wave.lanes();
+        s.wave.live_selected = Some(lanes[2]);
+        s.wave.style.multi = lanes[3..6].to_vec();
+        let _ = s.wave.create_virtual_bus();
+        s.wave.style.display.insert(
+            "bus_tb.dac".into(),
+            TraceDisplay {
+                fixed: helion_verif::wave::FixedPoint::parse("Q.6"),
+                analog: Some(Analog::Linear),
+            },
+        );
+        s.wave.style.display.insert(
+            "bus_tb.saw".into(),
+            TraceDisplay {
+                fixed: None,
+                analog: Some(Analog::Step),
+            },
+        );
+        s.wave.style.density = Density::Compact;
+        s.wave.live_selected = Some(lanes[0]);
+        s.wave.zoom = 0.4;
+        s.wave.cursor = 30;
+        s.wave.cursor_a = Some(30);
+        s.wave.cursor_b = Some(90);
     }),
     ("sim", |s| {
         s.center = state::CenterPane::Sim;
@@ -966,6 +1021,7 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
     let mut layer = Vec::new();
     views::dialogs::push_dialogs(&mut layer, s, &t);
     views::device::push_device_pops(&mut layer, s, &t);
+    views::wave_decode::push_wave_pops(&mut layer, s, &t);
     views::status::push_toasts(&mut layer, s, &t);
     views::palette::push_palette(&mut layer, s, &t);
     views::palette::push_cheatsheet(&mut layer, s, &t);
