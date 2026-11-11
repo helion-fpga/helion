@@ -238,8 +238,8 @@ nextpnr's; calibrating it is on the roadmap.
 ## Project status and roadmap
 
 The next release is **4.0**: the new Rune-based IDE replaces the egui IDE,
-the native JTAG engine reaches real hardware, and the build is
-self-contained. See the [changelog](CHANGELOG.md) for the details.
+iCE40 and ECP5 backends join HL10 and Xilinx 7-series, the native JTAG
+engine reaches real hardware, and the build is self-contained. See the [changelog](CHANGELOG.md) for the details.
 
 Next up: verifying native programming on boards, timing-model calibration
 against real silicon, wiring the October campaign's optimization passes into
