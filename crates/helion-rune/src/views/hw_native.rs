@@ -28,9 +28,7 @@ pub const TCK_CHOICES: [u32; 5] = [30_000_000, 15_000_000, 6_000_000, 1_000_000,
 pub const SCAN_LOG_MAX: usize = 32;
 
 /// Plain-language verification status for the native path.
-pub const NATIVE_NOTE: &str = "Native FTDI engine: MPSSE encoding checked byte-for-byte against \
-    the FTDI spec and run end to end against a simulated FTDI + Helion TAP. Not yet verified on a \
-    physical board.";
+pub const NATIVE_NOTE: &str = "MPSSE bytes checked against the FTDI spec and a simulated FTDI + Helion TAP; never run on a physical board.";
 
 /// Fixture board behind the native cable (scenes/tests only).
 #[derive(Clone, Debug, PartialEq, Eq)]

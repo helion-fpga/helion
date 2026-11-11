@@ -285,13 +285,15 @@ fn program_card(s: &AppState, t: &VivadoTheme) -> El {
                             .key(format!("hw-cfg-step-{i}")),
                     );
                 }
-                res = res.child(cad::dim(
-                    format!(
-                        "{} sector(s) erased · {} page(s) programmed · {} JTAG DR scans",
-                        rep.sectors_erased, rep.pages_programmed, rep.jtag_dr_scans
-                    ),
-                    t,
-                ));
+                let mut parts = Vec::new();
+                if rep.sectors_erased > 0 {
+                    parts.push(format!("{} sector(s) erased", rep.sectors_erased));
+                }
+                if rep.pages_programmed > 0 {
+                    parts.push(format!("{} page(s) programmed", rep.pages_programmed));
+                }
+                parts.push(format!("{} JTAG DR scans", cad::grouped(rep.jtag_dr_scans)));
+                res = res.child(cad::dim(parts.join(" · "), t));
             }
             None => {
                 res = res.child(cad::cut(
