@@ -40,6 +40,7 @@ pub use trigger::{
 };
 pub use target::{
     AXI_BRAM_BASE, AXI_BRAM_STRIDE, AXI_BRAM_WORDS, DebugBuild, HwDebugTarget, HwIlaCapture,
+    NO_BOARD_MODEL,
     HwIlaRun, HwTrigger, HwVioProbe, VALUE_COMPARE_BITS, implement_debug, value_compare_init,
 };
 pub use vio_axi::{

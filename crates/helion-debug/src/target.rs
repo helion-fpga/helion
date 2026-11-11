@@ -6,12 +6,20 @@
 //!   the netlist with [`insert_debug_cores`], then packs, places, routes and
 //!   bitgens it, and checks that every probe, the edge match unit, the value
 //!   comparator and the capture BRAM landed in the bitstream.
-//! - [`HwDebugTarget`] programs that bitstream into a Helion TAP (the sim
-//!   cable) and keeps the fabric alive between operations. Every core access
-//!   is a BSCAN hub frame shifted through `IR_USR1` on that TAP; the ILA window
-//!   is uploaded from the capture BRAM with the RLE `USR1` protocol.
+//! - [`HwDebugTarget`] programs that bitstream over a [`JtagCable`] — the
+//!   in-process Helion TAP (Simulation cable) or the native FTDI MPSSE
+//!   engine — and keeps the device between operations. Every core access is
+//!   a BSCAN hub frame shifted through `IR_USR1` on that cable; the ILA
+//!   window is uploaded from the capture BRAM with the RLE `USR1` protocol
+//!   and decoded from TDO.
 //!
-//! Sim-cable semantics (stated, not hidden):
+//! The debug cores' on-chip behaviour (user clocks, capture writes, VIO
+//! override) is modelled by the simulated fabric behind the cable
+//! ([`JtagCable::board`]): the sim TAP itself, or the board the mock FTDI
+//! clocks. A real USB cable has no board model, so those steps refuse with
+//! [`NO_BOARD_MODEL`] rather than inventing samples.
+//!
+//! Simulated-board semantics (stated, not hidden):
 //! - The fabric advances only when an operation runs user clocks
 //!   ([`HwDebugTarget::run_cycles`], an ILA arm, a VIO refresh).
 //! - Trigger reprogramming patches the match / comparator LUT INITs live
@@ -24,7 +32,8 @@
 use helion_bits::Bitstream;
 use helion_device::{Device, Site};
 use helion_fabric::{IlaMatchKind, Stat};
-use helion_hw::Tap;
+use helion_fabric::Fabric;
+use helion_hw::{CableKind, JtagCable, Tap, usr1_upload_rle_via};
 use helion_ir::{Design, resolve};
 use helion_pack::pack;
 use helion_route::Routed;
@@ -234,10 +243,15 @@ pub struct HwVioProbe {
     pub driving: bool,
 }
 
-/// A programmed device with debug cores, reached over the sim cable.
+/// Why a capture / VIO / AXI step cannot run on a cable without a board model.
+pub const NO_BOARD_MODEL: &str = "this step needs the debug cores' on-chip logic, which Helion \
+    models only in the simulated fabric; it is not yet verified on a physical board \
+    (use the Simulation cable, or the native FTDI engine's mock device in tests)";
+
+/// A programmed device with debug cores, reached over a [`JtagCable`].
 pub struct HwDebugTarget {
     pub part: String,
-    tap: Tap,
+    cable: Box<dyn JtagCable>,
     pub build: DebugBuild,
     pub hub: BscanDebugHub,
     pub vio: Option<VioCore>,
@@ -256,6 +270,7 @@ impl std::fmt::Debug for HwDebugTarget {
             .field("part", &self.part)
             .field("cores", &self.hub.slots.len())
             .field("cycles", &self.cycles)
+            .field("cable", &self.cable.kind())
             .finish()
     }
 }
@@ -279,17 +294,34 @@ fn channel_name(ch: &LtxProbeChannel) -> String {
 }
 
 impl HwDebugTarget {
-    /// Program `build` into a fresh Helion TAP and enumerate the hub.
+    /// Program `build` into a fresh Helion TAP (Simulation cable).
     pub fn program_sim(dev: &Device, build: DebugBuild) -> Result<Self, String> {
+        Self::program_on(dev, build, Box::new(Tap::new(dev)))
+    }
+
+    /// Program `build` over `cable` (IDCODE check, CFG_W, STAT DONE read
+    /// back over the cable) and enumerate the hub with a USER1 frame.
+    pub fn program_on(
+        dev: &Device,
+        build: DebugBuild,
+        mut cable: Box<dyn JtagCable>,
+    ) -> Result<Self, String> {
         if dev.part != build.part {
             return Err(format!(
                 "program_hw_devices: debug build is for {}, device is {}",
                 build.part, dev.part
             ));
         }
-        let mut tap = Tap::new(dev);
-        let idcode = tap.read_idcode();
-        let stat = tap.program(&build.bits)?;
+        let idcode = cable.read_idcode()?;
+        if idcode & 0x0FFF_FFFF != dev.idcode & 0x0FFF_FFFF {
+            return Err(format!(
+                "program_hw_devices: IDCODE {idcode:#010x} on {} is not {} ({:#010x})",
+                cable.kind().label(),
+                dev.part,
+                dev.idcode
+            ));
+        }
+        let stat = cable.program(&build.bits)?;
         if !stat.done {
             return Err("program_hw_devices: DONE stayed low after CFG_W".into());
         }
@@ -317,16 +349,16 @@ impl HwDebugTarget {
                 m
             });
         let n_out = vio.as_ref().map(|v| v.probes_out.len()).unwrap_or(0);
-        // Hub discovery over the TAP (`refresh_hw_device`).
-        let _ = hub.transact_via_tap(
-            &mut tap,
+        // Hub discovery over the cable (`refresh_hw_device`).
+        let _ = hub.transact_via_cable(
+            cable.as_mut(),
             crate::bscan::BSCAN_HUB_BROADCAST_SLOT,
             hub_opcode::DISCOVER,
             0,
         )?;
         Ok(Self {
             part: dev.part.clone(),
-            tap,
+            cable,
             build,
             hub,
             vio,
@@ -338,11 +370,38 @@ impl HwDebugTarget {
         })
     }
 
-    /// Re-read IDCODE + STAT over the TAP.
-    pub fn refresh_stat(&mut self) -> Stat {
-        self.idcode = self.tap.read_idcode();
-        self.stat = self.tap.read_stat();
-        self.stat.clone()
+    /// Re-read IDCODE + STAT over the cable.
+    pub fn refresh_stat(&mut self) -> Result<Stat, String> {
+        self.idcode = self.cable.read_idcode()?;
+        self.stat = self.cable.read_stat()?;
+        Ok(self.stat.clone())
+    }
+
+    /// Which cable this target is on.
+    pub fn cable_kind(&self) -> CableKind {
+        self.cable.kind()
+    }
+
+    /// Cable description (port, chain position, TCK).
+    pub fn cable_detail(&self) -> String {
+        self.cable.describe()
+    }
+
+    /// (IR scans, DR scans) on a native cable; `(0, 0)` on the sim TAP.
+    pub fn cable_scans(&self) -> (usize, usize) {
+        self.cable.scans()
+    }
+
+    /// The simulated board behind the cable (`None` on a real cable).
+    pub fn board(&mut self) -> Option<&mut Tap> {
+        self.cable.board()
+    }
+
+    fn fab(&mut self) -> Result<&mut Fabric, String> {
+        self.cable
+            .board()
+            .map(|t| t.fabric_mut())
+            .ok_or_else(|| NO_BOARD_MODEL.to_string())
     }
 
     /// Debug cores the hub reports: `(slot, name, kind, uuid)`.
@@ -375,7 +434,7 @@ impl HwDebugTarget {
         if pokes.is_empty() {
             return Ok(());
         }
-        let fab = self.tap.fabric_mut();
+        let fab = self.fab()?;
         for (site, ble, v) in pokes {
             fab.set_ble_q(site.x, site.y, u32::from(ble), v);
         }
@@ -386,7 +445,7 @@ impl HwDebugTarget {
     /// Run `n` user clocks (VIO overrides re-applied after each edge).
     pub fn run_cycles(&mut self, n: usize) -> Result<(), String> {
         for _ in 0..n {
-            self.tap.fabric_mut().step_user();
+            self.fab()?.step_user();
             self.apply_vio_force()?;
             self.cycles += 1;
         }
@@ -438,7 +497,7 @@ impl HwDebugTarget {
                     IlaTriggerKind::Falling
                 };
                 let (site, ble) = self.lut_site("ila_match_lut", MATCH_HIT_NET)?;
-                self.tap.fabric_mut().patch_lut_init_live(
+                self.fab()?.patch_lut_init_live(
                     site.x,
                     site.y,
                     u32::from(ble),
@@ -454,17 +513,22 @@ impl HwDebugTarget {
             HwTrigger::Value { value, mask } => {
                 let (site, ble) = self.lut_site(CMP_LUT_CELL, CMP_HIT_NET)?;
                 let init = value_compare_init(value, mask, nets.len());
-                self.tap
-                    .fabric_mut()
+                self.fab()?
                     .patch_lut_init_live(site.x, site.y, u32::from(ble), init)?;
                 (IlaMatchKind::Value, CMP_HIT_NET)
             }
         };
         let ctrl = ((window as u64) << 16) | ((pre as u64) << 32) | kind as u64;
+        // Board model first: a cable without one refuses before arming.
+        self.fab()?;
         self.hub
-            .transact_via_tap(&mut self.tap, slot, hub_opcode::WRITE_CTRL, ctrl)?;
-        self.hub
-            .transact_via_tap(&mut self.tap, slot, hub_opcode::ARM_TRIGGER, kind as u64)?;
+            .transact_via_cable(self.cable.as_mut(), slot, hub_opcode::WRITE_CTRL, ctrl)?;
+        self.hub.transact_via_cable(
+            self.cable.as_mut(),
+            slot,
+            hub_opcode::ARM_TRIGGER,
+            kind as u64,
+        )?;
 
         let mut sites = Vec::with_capacity(nets.len());
         for n in &nets {
@@ -474,7 +538,7 @@ impl HwDebugTarget {
         let major = self.build.capture_major;
         let mut wr = 0usize;
         let mut cycles = 0usize;
-        self.tap.fabric_mut().ila_arm_fsm(kind, window, pre);
+        self.fab()?.ila_arm_fsm(kind, window, pre);
         loop {
             if cycles >= run.max_cycles.max(window) {
                 return Err(format!(
@@ -482,11 +546,11 @@ impl HwDebugTarget {
                     run.trigger.label()
                 ));
             }
-            self.tap.fabric_mut().step_user();
+            self.fab()?.step_user();
             self.apply_vio_force()?;
             self.cycles += 1;
             cycles += 1;
-            let fab = self.tap.fabric_mut();
+            let fab = self.fab()?;
             fab.refresh_comb();
             let mut word = 0u64;
             for (i, (site, ble)) in sites.iter().enumerate() {
@@ -505,15 +569,23 @@ impl HwDebugTarget {
                 }
             }
         }
-        if !self.tap.fabric().ila_fsm.fired {
+        if !self.fab()?.ila_fsm.fired {
             return Err("run_hw_ila: trigger FSM finished without firing".into());
         }
-        self.hub
-            .transact_via_tap(&mut self.tap, slot, hub_opcode::UPLOAD_BRAM, major as u64)?;
+        self.hub.transact_via_cable(
+            self.cable.as_mut(),
+            slot,
+            hub_opcode::UPLOAD_BRAM,
+            major as u64,
+        )?;
         let start = (wr - window) % window;
-        let rle = self
-            .tap
-            .usr1_upload_bram_rle(major, start as u32, window, window as u32);
+        let rle = usr1_upload_rle_via(
+            self.cable.as_mut(),
+            major,
+            start as u32,
+            window,
+            window as u32,
+        )?;
         if rle.words.len() != window {
             return Err(format!(
                 "upload_hw_ila_data: uploaded {} words, expected {window}",
@@ -559,7 +631,11 @@ impl HwDebugTarget {
         let r = {
             let placed = &self.build.routed.placed;
             let design = &self.build.design;
-            let fab = self.tap.fabric();
+            let fab = self
+                .cable
+                .board()
+                .ok_or_else(|| NO_BOARD_MODEL.to_string())?
+                .fabric();
             let mut words = Vec::new();
             for p in &vio.probes_in {
                 let mut w = 0u64;
@@ -578,10 +654,10 @@ impl HwDebugTarget {
                 let mut err = None;
                 for (i, w) in words.into_iter().enumerate() {
                     let name = vio.probes_in[i].name.clone();
-                    let tap = &mut self.tap;
+                    let cable = self.cable.as_mut();
                     vio.probes_in[i].observe(w);
-                    if let Err(e) = self.hub.transact_via_tap(
-                        tap,
+                    if let Err(e) = self.hub.transact_via_cable(
+                        cable,
                         vio.slot_id,
                         hub_opcode::PROBE_READ,
                         w,
@@ -616,7 +692,7 @@ impl HwDebugTarget {
         let name = vio.probes_out[idx].name.clone();
         vio.set_probe_out(&name, value)?;
         let mut vio = self.vio.take().expect("checked");
-        let r = vio_commit_via_tap(&mut vio, &mut self.hub, &mut self.tap);
+        let r = vio_commit_via_cable(&mut vio, &mut self.hub, self.cable.as_mut());
         let committed = vio.probes_out[idx].committed_value;
         self.vio = Some(vio);
         r?;
@@ -686,7 +762,7 @@ impl HwDebugTarget {
             .axi
             .as_mut()
             .ok_or("run_hw_axi: no JTAG-to-AXI core in the debug build")?;
-        axi.run_hw_axi_on_tap(txn, &mut self.hub, &mut self.tap)
+        axi.run_hw_axi_on_cable(txn, &mut self.hub, self.cable.as_mut())
     }
 
     /// AXI apertures the master can reach.
@@ -708,16 +784,16 @@ impl HwDebugTarget {
     }
 }
 
-fn vio_commit_via_tap(
+fn vio_commit_via_cable(
     vio: &mut VioCore,
     hub: &mut BscanDebugHub,
-    tap: &mut Tap,
+    cable: &mut dyn JtagCable,
 ) -> Result<usize, String> {
     let mut frames = 0usize;
     for (ch_idx, p) in vio.probes_out.iter_mut().enumerate() {
         if p.dirty {
             let payload = ((ch_idx as u64 & 0xFF) << 40) | (p.staged_value & 0x00FF_FFFF_FFFF);
-            hub.transact_via_tap(tap, vio.slot_id, hub_opcode::PROBE_WRITE, payload)?;
+            hub.transact_via_cable(cable, vio.slot_id, hub_opcode::PROBE_WRITE, payload)?;
             p.committed_value = p.staged_value;
             p.dirty = false;
             p.commit_count += 1;
@@ -770,7 +846,7 @@ mod tests {
         assert!(t.stat.done);
         assert_eq!(t.cores().len(), 1);
         assert_eq!(t.cores()[0].2, DebugCoreKind::Ila);
-        assert!(t.refresh_stat().done);
+        assert!(t.refresh_stat().unwrap().done);
     }
 
     #[test]
@@ -918,7 +994,7 @@ mod tests {
         for _ in 0..5 {
             t.run_cycles(1).unwrap();
             let (site, ble) = t.site("q1").unwrap();
-            assert!(t.tap.fabric().ble_out(site.x, site.y, u32::from(ble)));
+            assert!(t.board().unwrap().fabric().ble_out(site.x, site.y, u32::from(ble)));
         }
         t.release_vio_output(&out.name).unwrap();
         assert!(!t.vio_probes().iter().any(|p| p.driving));
@@ -945,13 +1021,13 @@ mod tests {
         .unwrap();
         assert_eq!(t.run_hw_axi(&mut wr).unwrap(), AxiResp::Okay);
         let major = t.build.capture_major;
-        assert_eq!(t.tap.fabric().bram_read_word(major, 2) as u32, 0xDEAD_0001);
+        assert_eq!(t.board().unwrap().fabric().bram_read_word(major, 2) as u32, 0xDEAD_0001);
         let mut rd =
             crate::create_hw_axi_txn("rd", base + 8, crate::AxiTxnKind::Read, 2, vec![]).unwrap();
         assert_eq!(t.run_hw_axi(&mut rd).unwrap(), AxiResp::Okay);
         assert_eq!(rd.read_data, vec![0xDEAD_0001, 0xDEAD_0002]);
         // Fabric-side update is visible to the next read (no stale host cache).
-        t.tap.fabric_mut().bram_write_word(major, 2, 0x55);
+        t.board().unwrap().fabric_mut().bram_write_word(major, 2, 0x55);
         let mut rd2 =
             crate::create_hw_axi_txn("rd2", base + 8, crate::AxiTxnKind::Read, 1, vec![]).unwrap();
         t.run_hw_axi(&mut rd2).unwrap();
@@ -959,5 +1035,154 @@ mod tests {
         let mut dec =
             crate::create_hw_axi_txn("x", 0x4000_0000, crate::AxiTxnKind::Read, 1, vec![]).unwrap();
         assert_eq!(t.run_hw_axi(&mut dec).unwrap(), AxiResp::DecErr);
+    }
+
+    // --- Native FTDI engine (MPSSE bytes → mock FTDI → simulated board) ----
+
+    fn native(dev: &Device) -> Box<dyn JtagCable> {
+        let eng = helion_hw::JtagEngine::open(helion_hw::MockFtdi::helion(dev), 15_000_000)
+            .expect("mock FTDI opens");
+        Box::new(eng)
+    }
+
+    #[test]
+    fn native_engine_runs_ila_end_to_end() {
+        let dev = dev();
+        let d = Design::structural_counter();
+        let build = implement_debug(&dev, &d, &cfg(&["q0", "q1", "q2", "q3"])).unwrap();
+        let mut t = HwDebugTarget::program_on(&dev, build.clone(), native(&dev)).unwrap();
+        assert_eq!(t.cable_kind(), CableKind::NativeMock);
+        assert!(t.stat.done && t.idcode == dev.idcode);
+        let (ir0, dr0) = t.cable_scans();
+        assert!(ir0 > 0 && dr0 > 0, "program + discovery went over MPSSE");
+        let run = HwIlaRun {
+            trigger: HwTrigger::Value { value: 9, mask: 0xF },
+            window: 8,
+            pre_trigger: 2,
+            max_cycles: 256,
+        };
+        let cap = t.run_hw_ila(&run).unwrap();
+        assert_eq!(counter_value(&cap, 2), 9, "{:?}", cap.words);
+        assert_eq!(counter_value(&cap, 1), 8);
+        // Same capture as the Simulation cable.
+        let mut sim = HwDebugTarget::program_sim(&dev, build).unwrap();
+        assert_eq!(sim.run_hw_ila(&run).unwrap().words, cap.words);
+        assert!(t.cable_scans().1 > dr0 + cap.upload_dr_scans);
+        assert!(t.refresh_stat().unwrap().done);
+    }
+
+    #[test]
+    fn native_engine_runs_vio_and_axi_end_to_end() {
+        let dev = dev();
+        let d = Design::structural_counter();
+        let mut c = cfg(&["q0"]);
+        c.vio_probes_in = vec!["q3".into()];
+        c.vio_probes_out = vec!["q1".into()];
+        c.insert_jtag_axi = true;
+        let build = implement_debug(&dev, &d, &c).unwrap();
+        let mut t = HwDebugTarget::program_on(&dev, build, native(&dev)).unwrap();
+        assert_eq!(t.cores().len(), 3);
+        t.refresh_hw_vio(20).unwrap();
+        let _ = t.refresh_hw_vio(20).unwrap();
+        let q3 = t
+            .vio_probes()
+            .into_iter()
+            .find(|p| p.nets == vec!["q3".to_string()])
+            .unwrap();
+        assert!(q3.transitions > 0, "{q3:?}");
+        let out = t
+            .vio_probes()
+            .into_iter()
+            .find(|p| p.direction == LtxProbeDirection::ProbeOut)
+            .unwrap();
+        assert_eq!(t.set_vio_output(&out.name, 1).unwrap(), 1);
+        t.run_cycles(3).unwrap();
+        let (site, ble) = t.site("q1").unwrap();
+        assert!(t.board().unwrap().fabric().ble_out(site.x, site.y, u32::from(ble)));
+        let base = t.axi_regions()[0].base_addr;
+        let mut wr = crate::create_hw_axi_txn(
+            "wr",
+            base,
+            crate::AxiTxnKind::Write,
+            1,
+            vec![0xC0FF_EE01],
+        )
+        .unwrap();
+        assert_eq!(t.run_hw_axi(&mut wr).unwrap(), AxiResp::Okay);
+        let mut rd =
+            crate::create_hw_axi_txn("rd", base, crate::AxiTxnKind::Read, 1, vec![]).unwrap();
+        t.run_hw_axi(&mut rd).unwrap();
+        assert_eq!(rd.read_data, vec![0xC0FF_EE01]);
+    }
+
+    #[test]
+    fn native_engine_refuses_a_wrong_part() {
+        let dev = dev();
+        let d = Design::structural_counter();
+        let build = implement_debug(&dev, &d, &cfg(&["q0"])).unwrap();
+        // A chain whose only device is not a Helion part.
+        let chain = vec![helion_hw::MockChainDevice::Generic(helion_hw::GenericTap::new(
+            Some(0x0362_D093),
+            6,
+        ))];
+        let eng = helion_hw::JtagEngine::open(helion_hw::MockFtdi::with_chain(chain), 1_000_000)
+            .unwrap();
+        let err = HwDebugTarget::program_on(&dev, build, Box::new(eng)).unwrap_err();
+        assert!(err.contains("IDCODE"), "{err}");
+    }
+
+    #[test]
+    fn cable_without_board_model_refuses_capture() {
+        // A cable with no board model behind it (the shape of a real USB
+        // FTDI): TAP-level steps work, capture refuses honestly.
+        struct NoBoard(Tap);
+        impl JtagCable for NoBoard {
+            fn kind(&self) -> CableKind {
+                CableKind::NativeUsb
+            }
+            fn describe(&self) -> String {
+                "no-board".into()
+            }
+            fn shift_ir(&mut self, ir: u8) -> Result<(), String> {
+                JtagCable::shift_ir(&mut self.0, ir)
+            }
+            fn shift_dr_u64(&mut self, v: u64) -> Result<u64, String> {
+                JtagCable::shift_dr_u64(&mut self.0, v)
+            }
+            fn shift_dr_bits(&mut self, v: &[u8], n: usize) -> Result<Vec<u8>, String> {
+                self.0.shift_dr_bits(v, n)
+            }
+            fn read_idcode(&mut self) -> Result<u32, String> {
+                JtagCable::read_idcode(&mut self.0)
+            }
+            fn read_stat(&mut self) -> Result<Stat, String> {
+                JtagCable::read_stat(&mut self.0)
+            }
+            fn program(&mut self, b: &Bitstream) -> Result<Stat, String> {
+                JtagCable::program(&mut self.0, b)
+            }
+            fn board(&mut self) -> Option<&mut Tap> {
+                None
+            }
+            fn scans(&self) -> (usize, usize) {
+                (0, 0)
+            }
+        }
+        let dev = dev();
+        let d = Design::structural_counter();
+        let build = implement_debug(&dev, &d, &cfg(&["q0"])).unwrap();
+        let mut t =
+            HwDebugTarget::program_on(&dev, build, Box::new(NoBoard(Tap::new(&dev)))).unwrap();
+        assert!(t.stat.done);
+        let err = t
+            .run_hw_ila(&HwIlaRun {
+                trigger: HwTrigger::Immediate,
+                window: 8,
+                pre_trigger: 0,
+                max_cycles: 64,
+            })
+            .unwrap_err();
+        assert!(err.contains("not yet verified on a physical board"), "{err}");
+        assert!(t.run_cycles(1).is_err());
     }
 }

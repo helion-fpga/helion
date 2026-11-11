@@ -343,6 +343,8 @@ pub struct ProgramState {
     pub debug: crate::views::hw_debug::HwDebugState,
     /// Configuration memory device under the hardware device.
     pub cfgmem: crate::views::hw_cfgmem::CfgMemState,
+    /// Native FTDI cable: TCK, scanned chain, raw scan log.
+    pub native: crate::views::hw_native::NativeState,
     job: Option<HwJob>,
 }
 
@@ -918,7 +920,8 @@ pub fn deliver(s: &mut AppState, ev: HwEvent) {
 pub fn poll(s: &mut AppState) -> bool {
     let dbg = crate::views::hw_debug::poll(s);
     let cfg = crate::views::hw_cfgmem::poll(s);
-    poll_program(s) || dbg || cfg
+    let nat = crate::views::hw_native::poll(s);
+    poll_program(s) || dbg || cfg || nat
 }
 
 fn poll_program(s: &mut AppState) -> bool {
