@@ -31,7 +31,7 @@ pub use cosim::{
     evaluate_c_kernel_reference, extract_kernel_m_axi_bursts, generate_cosim_testbench,
     run_cosim_verification,
 };
-pub use rtl_cosim::{COSIM_MAX_CYCLES, run_rtl_cosim};
+pub use rtl_cosim::{COSIM_MAX_CYCLES, run_rtl_cosim, run_rtl_cosim_with};
 pub use emit::{generate_hls_report, resolve_interfaces, HlsSynthesisReport, InterfacePort};
 pub use flopoco_fp::{
     FpEvalOutput, FpExceptionFlags, FpFormat, FpOpKind, FpOperatorHwResult, FpOperatorSpec,
