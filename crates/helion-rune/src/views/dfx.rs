@@ -46,23 +46,7 @@ fn log(s: &mut AppState, text: String, sev: MsgSev) {
 
 /// Static RTL files: the open `.prj`'s SV/V sources, else the run source.
 pub fn static_sources(s: &AppState) -> Result<Vec<PathBuf>, String> {
-    let src = crate::runs::resolve_source(s)?;
-    if src.extension().is_some_and(|e| e.eq_ignore_ascii_case("prj")) {
-        let text = std::fs::read_to_string(&src).map_err(|e| format!("{}: {e}", src.display()))?;
-        let prj = helion_proj::load_prj(&text)?;
-        let files: Vec<PathBuf> = prj
-            .sources
-            .iter()
-            .map(|f| helion_proj::resolve_prj_path(&src, f))
-            .filter(|p| p.extension().is_some_and(|e| matches!(e.to_string_lossy().to_ascii_lowercase().as_str(), "sv" | "v")))
-            .collect();
-        if files.is_empty() {
-            return Err("the project has no SystemVerilog sources".into());
-        }
-        Ok(files)
-    } else {
-        Ok(vec![src])
-    }
+    crate::runs::rtl_files(&crate::runs::resolve_source(s)?)
 }
 
 /// Top-level hierarchy instances of the last run's design.

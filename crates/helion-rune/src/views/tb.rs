@@ -1204,6 +1204,23 @@ pub fn last_vcd(s: &AppState) -> Option<PathBuf> {
     })
 }
 
+/// Scene fixture: run `examples/counter_tb.sv` from a temp copy so the
+/// Coverage view shows a real run's coverage (never writes into the repo).
+pub fn seed_coverage_fixture(s: &mut AppState) {
+    let ex = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let dir = std::env::temp_dir().join("helion-rune-scenes").join("coverage");
+    let _ = std::fs::create_dir_all(&dir);
+    for f in ["counter.sv", "counter_tb.sv"] {
+        let _ = std::fs::copy(ex.join(f), dir.join(f));
+    }
+    s.sim.dir_override = Some(dir.clone());
+    rescan(s);
+    let Some(i) = s.sim.tbs.iter().position(|t| t.file.name == "counter_tb") else { return };
+    let cfg = helion_verif::tb::TbRunConfig::new(s.sim.tbs[i].file.path.clone());
+    s.sim.tbs[i].last = Some(helion_verif::tb::run_testbench(&cfg, None));
+    s.sim.selected = Some(i);
+}
+
 /// Scenes/tests: discover the repo `examples/` testbenches (read-only).
 pub fn seed_examples_fixture(s: &mut AppState) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");

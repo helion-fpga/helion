@@ -318,6 +318,11 @@ pub const COMMANDS: &[&str] = &[
     "add_reconfig_module",
     "launch_dfx",
     "report_partitions",
+    // Out-of-context synthesis.
+    "set_ooc",
+    "synth_ooc",
+    "report_ooc",
+    "report_coverage",
 ];
 
 /// Max nested `[...]` evaluation depth (mirrors the real interp's cap idea;
@@ -5413,7 +5418,8 @@ fn help_overview() -> String {
         "I/O & clocking: report_clock_utilization report_control_sets report_ssn write_ibis report_power_vcd",
         "ECO: eco_open eco_set_lut_init eco_connect_pin eco_insert_buffer eco_add_lut eco_add_ff eco_remove_cell",
         "  eco_place_route eco_route write_eco_bitstream",
-        "DFX: create_partition add_reconfig_module launch_dfx report_partitions",
+        "DFX: create_partition add_reconfig_module launch_dfx report_partitions | OOC: set_ooc synth_ooc report_ooc",
+        "Coverage: report_coverage",
         "help <command> for usage. See docs/tcl-subset.md for the supported subset.",
     ]
     .join("\n")
