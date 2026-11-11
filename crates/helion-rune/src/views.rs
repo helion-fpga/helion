@@ -7,6 +7,7 @@ pub mod console;
 pub mod constraints;
 pub mod debug;
 pub mod device;
+pub mod dfx;
 pub mod device_floor;
 pub mod device_io;
 pub mod device_io_quick;

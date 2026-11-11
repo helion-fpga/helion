@@ -656,6 +656,10 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         views::reports::demo_impl_complete(s);
         views::eco::scene_fill(s);
     }),
+    ("dfx", |s| {
+        s.center = state::CenterPane::Dfx;
+        views::dfx::scene_fill(s);
+    }),
     ("eco-empty", |s| {
         s.center = state::CenterPane::Eco;
     }),
@@ -1128,6 +1132,7 @@ fn center_pane(s: &AppState, t: &VivadoTheme) -> El {
         state::CenterPane::Find => views::find::find_pane(s, t),
         state::CenterPane::Constraints => views::constraints::constraints_pane(s, t),
         state::CenterPane::Eco => views::eco::eco_pane(s, t),
+        state::CenterPane::Dfx => views::dfx::dfx_pane(s, t),
     }
 }
 
