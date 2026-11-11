@@ -173,6 +173,10 @@ else
 fi
 [ -f "$RES/devices/helion/parts/HL10T-C32-1.toml" ] || die "HAD missing in bundle"
 
+# Licenses: Helion's own, plus the vendored Rune UI framework (MIT) the IDE links.
+cp "$ROOT/LICENSE" "$RES/LICENSE"
+cp "$ROOT/third_party/rune/LICENSE" "$RES/LICENSE-RUNE"
+
 if [ -d "$ROOT/examples" ]; then
     for f in "$ROOT/examples"/*; do
         [ -e "$f" ] || continue
