@@ -791,8 +791,12 @@ pub struct AppState {
     pub device: crate::views::device::DeviceState,
     /// Waveform viewer UI state (cursors, markers, scope, zoom, radix).
     pub wave: crate::views::wave::WaveState,
-    /// Testbench list/detail UI state (selection, statuses, history).
-    pub sim: crate::views::wave::SimState,
+    /// Testbench runner state (discovery, runs, history, sim log).
+    pub sim: crate::views::tb::SimState,
+    /// Simulation Settings knobs + Compile/Elaborate results.
+    pub sim_settings: crate::views::sim_settings::SimSettingsState,
+    /// Logic Analyzer (simulation ILA): probes, trigger, capture, viewer.
+    pub ila: crate::views::ila::IlaState,
     /// Interactive debugger UI state (persistent event engine, breakpoints).
     pub debug: crate::views::debug::DebugState,
     /// Hardware Manager UI state (connection, cable/target picks, program run).
@@ -842,6 +846,8 @@ pub enum CenterPane {
     Sim,
     /// Interactive debugger: breakpoints over the persistent event engine.
     Debug,
+    /// Logic Analyzer: simulation ILA probes, trigger, capture viewer.
+    Ila,
     /// Hardware Manager: open target, cable/target pickers, program + results.
     Program,
     /// Implementation reports: Utilization / Power / DRC detail bodies.
@@ -972,18 +978,8 @@ impl AppState {
             util: UtilState::default(),
             power: PowerState::default(),
             bitstream: BitstreamState::default(),
-            vcd: VcdState {
-                timescale_ps: 1000,
-                duration_ps: 96_000,
-                signals: vec![
-                    "clk".into(),
-                    "rst_n".into(),
-                    "divclk".into(),
-                    "counter[7:0]".into(),
-                    "led[3:0]".into(),
-                    "vb_led[4:0]".into(),
-                ],
-            },
+            // No simulation has run: VCD dims stay empty until a real import.
+            vcd: VcdState::default(),
             hello_on: false,
             status: StatusVerb::Ready,
             chrome: crate::views::chrome::ChromeState::default(),
@@ -994,8 +990,10 @@ impl AppState {
             schematic: crate::views::schematic::SchematicState::default(),
             device: crate::views::device::DeviceState::default(),
             wave: crate::views::wave::WaveState::default(),
-            sim: crate::views::wave::SimState::default(),
+            sim: crate::views::tb::SimState::default(),
+            sim_settings: crate::views::sim_settings::SimSettingsState::default(),
             debug: crate::views::debug::DebugState::default(),
+            ila: crate::views::ila::IlaState::default(),
             program: crate::views::program::ProgramState::default(),
             dialogs: crate::views::dialogs::DialogState::default(),
             center: CenterPane::Summary,
@@ -1083,9 +1081,22 @@ impl AppState {
         // A new project invalidates the sim log, the live VCD import, and
         // the VCD dims; wave view prefs (scope/zoom/radix) stay session-wide.
         self.sim.reset();
+        // Settings knobs are session preferences; compile/elab results
+        // belong to the old project's sources.
+        self.sim_settings.modules = None;
+        self.sim_settings.elab = None;
+        self.sim_settings.editing = None;
+        self.sim_settings.error = None;
+        let (cycles, ts) = (self.debug.runtime_cycles, self.debug.timescale_ps);
         self.debug = crate::views::debug::DebugState::default();
+        self.debug.runtime_cycles = cycles;
+        self.debug.timescale_ps = ts;
+        // The old design's probes and capture do not carry over.
+        self.ila = crate::views::ila::IlaState::default();
         self.wave.live = None;
         self.wave.live_selected = None;
+        self.wave.live_lanes.clear();
+        self.wave.live_scope = None;
         self.wave.clamp_to_grid();
         self.vcd = VcdState::default();
         // A new project invalidates the elaborated design and its variables;
