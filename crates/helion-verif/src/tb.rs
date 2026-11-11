@@ -1583,6 +1583,9 @@ pub struct TbRunConfig {
     pub seed: u64,
     /// Set by the UI thread to stop an in-flight run (`tb_stop`).
     pub cancel: Option<Arc<AtomicBool>>,
+    /// `+NAME` / `+NAME=value` plusargs for class-based testbenches
+    /// (`+UVM_TESTNAME=…`, `+UVM_VERBOSITY=…`).
+    pub plusargs: Vec<String>,
 }
 
 impl TbRunConfig {
@@ -1593,6 +1596,7 @@ impl TbRunConfig {
             max_units: TB_DEFAULT_MAX_UNITS,
             seed: 1,
             cancel: None,
+            plusargs: Vec::new(),
         }
     }
 }
@@ -1610,11 +1614,17 @@ pub struct TbBranchCov {
 }
 
 /// Code coverage of one testbench run: statement (line) and branch
-/// coverage of the testbench source, plus the DUT's netlist-level toggle /
+/// coverage of the testbench source, the DUT's netlist-level toggle /
 /// branch (mux select, FF enable) / FSM coverage collected by the
-/// `helion-sim` kernel on every clock edge. DUT *line* coverage is not
-/// available: the DUT is simulated as a synthesized netlist whose cells
-/// carry no source-line attribution.
+/// `helion-sim` kernel on every clock edge, and — for a SystemVerilog DUT
+/// synthesized with line probes ([`synth_dut_for_coverage`]) — RTL line and
+/// `if` / `case` arm coverage of the DUT source.
+///
+/// DUT line semantics (see `helion_sim::line_coverage`): a statement in a
+/// clocked block is hit on each rising edge where its enclosing conditions
+/// held on the pre-edge values; a combinational statement / arm is hit in
+/// each observed settled state where it was reached; a continuous `assign`
+/// is hit when its value changed between observed states.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TbCoverage {
     pub tb_file: PathBuf,
@@ -1623,6 +1633,36 @@ pub struct TbCoverage {
     pub lines: Vec<(usize, u64)>,
     pub branches: Vec<TbBranchCov>,
     pub dut: helion_sim::FunctionalCoverageReport,
+    /// Instrumented DUT source lines (every file of the DUT hierarchy, by
+    /// file then line) and their hit counts.
+    pub dut_lines: Vec<helion_sim::RtlLineHits>,
+    /// DUT `if` / `case` branches and how often each arm was taken.
+    pub dut_branches: Vec<helion_sim::RtlBranchHits>,
+    /// DUT lines synthesis could not instrument, with the reason.
+    pub dut_not_instrumented: Vec<helion_sim::RtlLineGap>,
+    /// Why DUT line coverage is missing (`None` when it was collected).
+    pub dut_line_note: Option<String>,
+}
+
+/// Synthesize a testbench DUT for simulation with coverage: SystemVerilog
+/// gets RTL line probes (`helion_sv::synth_sv_path_line_cov`); when that
+/// fails, or for VHDL, the plain netlist is returned with a note saying why
+/// DUT line coverage is unavailable.
+pub fn synth_dut_for_coverage(path: &Path) -> Result<(helion_ir::Design, Option<String>), String> {
+    let vhdl = path
+        .extension()
+        .is_some_and(|e| matches!(e.to_string_lossy().to_ascii_lowercase().as_str(), "vhd" | "vhdl"));
+    if vhdl {
+        let d = helion_vhdl::synth_vhdl_path(path)?;
+        return Ok((d, Some("DUT line coverage is SystemVerilog-only (VHDL DUT)".into())));
+    }
+    match helion_sv::synth_sv_path_line_cov(path) {
+        Ok(d) => Ok((d, None)),
+        Err(e) => {
+            let d = helion_sv::synth_sv_path(path)?;
+            Ok((d, Some(format!("DUT line probes could not be synthesized: {e}"))))
+        }
+    }
 }
 
 impl TbCoverage {
@@ -1653,10 +1693,79 @@ impl TbCoverage {
         }
     }
 
+    /// Fill the DUT line / branch fields from the simulator's report.
+    pub fn set_dut_line_coverage(&mut self, r: helion_sim::LineCoverageReport, note: Option<String>) {
+        self.dut_line_note = match note {
+            Some(n) => Some(n),
+            None if !r.instrumented => Some("the DUT netlist carries no line probes".into()),
+            None => None,
+        };
+        self.dut_lines = r.lines;
+        self.dut_branches = r.branches;
+        self.dut_not_instrumented = r.not_instrumented;
+    }
+
+    pub fn dut_lines_hit(&self) -> usize {
+        self.dut_lines.iter().filter(|l| l.hits > 0).count()
+    }
+
+    pub fn dut_line_pct(&self) -> f64 {
+        if self.dut_lines.is_empty() {
+            100.0
+        } else {
+            100.0 * self.dut_lines_hit() as f64 / self.dut_lines.len() as f64
+        }
+    }
+
+    pub fn dut_arms_total(&self) -> usize {
+        self.dut_branches.iter().map(|b| b.arms.len()).sum()
+    }
+
+    pub fn dut_arms_hit(&self) -> usize {
+        self.dut_branches.iter().map(|b| b.arms_hit()).sum()
+    }
+
+    pub fn dut_branch_pct(&self) -> f64 {
+        if self.dut_arms_total() == 0 {
+            100.0
+        } else {
+            100.0 * self.dut_arms_hit() as f64 / self.dut_arms_total() as f64
+        }
+    }
+
+    /// Hit count of DUT `file:line` (`None` when not instrumented).
+    pub fn dut_line_hits(&self, file: &Path, line: usize) -> Option<u64> {
+        self.dut_lines
+            .iter()
+            .find(|l| l.line as usize == line && same_file(Path::new(&l.file), file))
+            .map(|l| l.hits)
+    }
+
+    /// DUT branches whose `if` / `case` keyword sits on `file:line`.
+    pub fn dut_branches_at(&self, file: &Path, line: usize) -> Vec<&helion_sim::RtlBranchHits> {
+        self.dut_branches
+            .iter()
+            .filter(|b| b.line as usize == line && same_file(Path::new(&b.file), file))
+            .collect()
+    }
+
     /// `report_coverage` summary line.
     pub fn summary_line(&self) -> String {
+        let dut_lines = if self.dut_line_note.is_some() && self.dut_lines.is_empty() {
+            "dut_lines=n/a".to_string()
+        } else {
+            format!(
+                "dut_lines={}/{} ({:.1}%) dut_arms={}/{} ({:.1}%)",
+                self.dut_lines_hit(),
+                self.dut_lines.len(),
+                self.dut_line_pct(),
+                self.dut_arms_hit(),
+                self.dut_arms_total(),
+                self.dut_branch_pct()
+            )
+        };
         format!(
-            "coverage tb_lines={}/{} ({:.1}%) tb_branches={:.1}% dut_toggle={:.1}% dut_branch={:.1}% dut_fsm={:.1}%",
+            "coverage tb_lines={}/{} ({:.1}%) tb_branches={:.1}% dut_toggle={:.1}% dut_branch={:.1}% dut_fsm={:.1}% {dut_lines}",
             self.lines_hit(),
             self.lines.len(),
             self.line_pct(),
@@ -1666,6 +1775,13 @@ impl TbCoverage {
             self.dut.fsm_state_coverage_pct()
         )
     }
+}
+
+/// Same file on disk (falls back to path equality when either is missing).
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b
+        || (a.file_name() == b.file_name()
+            && matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y))
 }
 
 fn stmt_line(s: &Stmt) -> usize {
@@ -1728,6 +1844,8 @@ pub struct TbOutcome {
     pub dut_instance: String,
     /// Code coverage collected during the run.
     pub coverage: TbCoverage,
+    /// UVM report summary when the testbench ran a UVM test.
+    pub uvm: Option<crate::classtb::UvmSummary>,
 }
 
 #[derive(Clone, Debug)]
@@ -2483,21 +2601,18 @@ pub fn run_testbench(
     let file_label = cfg.tb_path.to_string_lossy().into_owned();
     let src = std::fs::read_to_string(&cfg.tb_path)
         .map_err(|e| TbError::new(&file_label, 0, format!("cannot read: {e}")))?;
+    // Class-based / UVM testbenches run on the helion-svtb engine.
+    if helion_svtb::wants_engine(&src) {
+        return crate::classtb::run_class_testbench(cfg, tx);
+    }
     let prog = parse_testbench(&file_label, &src)?;
 
     let dut_path = find_dut_source(&tb_dir, &prog.dut_module)?;
     let dut_label = dut_path.to_string_lossy().into_owned();
-    let is_vhdl = dut_path
-        .extension()
-        .is_some_and(|e| matches!(e.to_string_lossy().to_ascii_lowercase().as_str(), "vhd" | "vhdl"));
-    let design = if is_vhdl {
-        // Mixed language: SV stimulus driving a VHDL DUT (helion-vhdl
-        // elaborates it to the same netlist the SV path produces).
-        helion_vhdl::synth_vhdl_path(&dut_path)
-    } else {
-        helion_sv::synth_sv_path(&dut_path)
-    }
-    .map_err(|e| TbError::new(&dut_label, 0, format!("synthesis failed: {e}")))?;
+    // Mixed language: a VHDL DUT elaborates (helion-vhdl) to the same kind
+    // of netlist; a SystemVerilog DUT also carries RTL line-coverage probes.
+    let (design, dut_line_note) = synth_dut_for_coverage(&dut_path)
+        .map_err(|e| TbError::new(&dut_label, 0, format!("synthesis failed: {e}")))?;
     let sim = helion_sim::Sim::new(&design);
 
     let dut_inputs: std::collections::HashSet<String> =
@@ -2665,13 +2780,16 @@ pub fn run_testbench(
                 b.false_hits = *f;
             }
         }
-        TbCoverage {
+        let mut c = TbCoverage {
             tb_file: cfg.tb_path.clone(),
             dut_file: dut_path.clone(),
             lines: lines.into_iter().collect(),
             branches,
             dut: ip.sim.coverage_report(),
-        }
+            ..TbCoverage::default()
+        };
+        c.set_dut_line_coverage(ip.sim.line_coverage_report(), dut_line_note);
+        c
     };
 
     // Artifacts: <tb_dir>/.helion/tb_runs/<stem>_<unix>/{run.log,run.vcd}
@@ -2772,6 +2890,7 @@ pub fn run_testbench(
         dut_module: prog.dut_module.clone(),
         dut_instance: prog.dut_instance.clone(),
         coverage,
+        uvm: None,
     })
 }
 
@@ -3272,6 +3391,43 @@ mod tests {
     }
 
     #[test]
+    fn run_collects_dut_rtl_line_and_branch_coverage() {
+        let dir = tmp_dir("dut_lines");
+        let dut = write_file(
+            &dir,
+            "sel_dut.sv",
+            "module sel_dut (\n    input  logic clk,\n    input  logic rst,\n    input  logic en,\n    output logic [3:0] q\n);\n    logic [3:0] cnt;\n    always_ff @(posedge clk) begin\n        if (rst)\n            cnt <= 4'd0;\n        else if (en)\n            cnt <= cnt + 4'd1;\n    end\n    assign q = cnt;\nendmodule\n",
+        );
+        let tb = write_file(
+            &dir,
+            "sel_dut_tb.sv",
+            "module sel_dut_tb;\n    logic clk;\n    logic rst;\n    logic en;\n    logic [3:0] q;\n    sel_dut dut (.clk(clk), .rst(rst), .en(en), .q(q));\n    always #5 clk = ~clk;\n    initial begin\n        rst = 1; en = 0;\n        @(posedge clk);\n        rst = 0;\n        @(posedge clk); @(posedge clk);\n        $finish;\n    end\nendmodule\n",
+        );
+        let out = run_testbench(&TbRunConfig::new(tb), None).unwrap();
+        let c = &out.coverage;
+        assert_eq!(c.dut_line_note, None);
+        let hits = |l| c.dut_line_hits(&dut, l).unwrap_or_else(|| panic!("line {l} not instrumented: {:?}", c.dut_lines));
+        assert!(hits(9) >= 2, "`if (rst)` runs on every edge");
+        assert!(hits(10) >= 1 && hits(11) >= 1);
+        assert_eq!(hits(12), 0, "en never set: the increment never runs");
+        assert_eq!(hits(14), 0, "q never changes");
+        let arms = |l| -> Vec<(String, u64)> {
+            let b = c.dut_branches_at(&dut, l);
+            assert_eq!(b.len(), 1, "branch at {l}");
+            b[0].arms.iter().map(|a| (a.label.clone(), a.hits)).collect()
+        };
+        let rst = arms(9);
+        assert!(rst[0].1 >= 1 && rst[1].1 >= 1, "{rst:?}");
+        let en = arms(11);
+        assert_eq!(en[0], ("true".to_string(), 0));
+        assert!(en[1].1 >= 1);
+        assert_eq!((c.dut_arms_hit(), c.dut_arms_total()), (3, 4));
+        assert!(c.dut_lines_hit() < c.dut_lines.len());
+        assert!(c.summary_line().contains(" dut_lines="), "{}", c.summary_line());
+        assert!(c.dut.net_toggles.iter().all(|t| !t.net.contains("__lcov")));
+    }
+
+    #[test]
     fn urandom_and_randcase_are_seeded_and_weighted() {
         let dir = tmp_dir("rand");
         write_file(&dir, "and_dut.sv", AND_DUT);
@@ -3299,6 +3455,8 @@ mod tests {
         let tb = write_file(&dir, "and_dut_tb.sv", AND_TB_PASS);
         let out = run_testbench(&TbRunConfig::new(tb), None).unwrap();
         assert!(out.coverage.dut_file.extension().is_some_and(|e| e == "vhd"));
+        assert!(out.coverage.dut_line_note.as_deref().is_some_and(|n| n.contains("VHDL")));
+        assert!(out.coverage.summary_line().ends_with("dut_lines=n/a"));
         assert!(out.passed, "{:?} {:?}", out.failures, out.log.iter().map(|l| &l.text).collect::<Vec<_>>());
     }
 
@@ -3438,7 +3596,7 @@ endmodule
         write_file(&d, "and_dut.sv", AND_DUT);
         let tb = write_file(&d, "and_dut_tb.sv", AND_TB_PASS);
         let (tx, rx) = mpsc::channel();
-        let cfg = TbRunConfig { tb_path: tb, vcd: true, max_units: TB_DEFAULT_MAX_UNITS, seed: 1, cancel: None };
+        let cfg = TbRunConfig { tb_path: tb, vcd: true, max_units: TB_DEFAULT_MAX_UNITS, seed: 1, cancel: None, plusargs: vec![] };
         let out = run_testbench(&cfg, Some(&tx)).unwrap();
         assert!(out.passed, "failures: {:?}", out.failures);
         assert!(out.failures.is_empty());
@@ -3516,6 +3674,7 @@ endmodule
             max_units: TB_DEFAULT_MAX_UNITS,
             seed: 1,
             cancel: Some(cancel),
+            plusargs: vec![],
         };
         let out = run_testbench(&cfg, None).unwrap();
         assert!(out.stopped, "outcome: {:?}", out.summary);
@@ -3542,7 +3701,7 @@ endmodule
             "and_dut_tb.sv",
             "module and_dut_tb;\nlogic clk;\nand_dut dut (.clk(clk), .a(clk), .b(clk), .y(clk));\nalways #5 clk = ~clk;\ninitial begin\n#100000000;\n$finish;\nend\nendmodule\n",
         );
-        let cfg = TbRunConfig { tb_path: tb, vcd: false, max_units: 100, seed: 1, cancel: None };
+        let cfg = TbRunConfig { tb_path: tb, vcd: false, max_units: 100, seed: 1, cancel: None, plusargs: vec![] };
         let e = run_testbench(&cfg, None).unwrap_err();
         assert!(e.msg.contains("timed out"), "{e}");
     }

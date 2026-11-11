@@ -79,6 +79,8 @@ pub struct TbInfo {
     pub clocks: Vec<(String, u64)>,
     /// `(name, width)`.
     pub decls: Vec<(String, u32)>,
+    /// Class-based / UVM testbench facts (`None` for the stimulus subset).
+    pub class: Option<helion_verif::classtb::ClassTbInfo>,
 }
 
 /// One discovered testbench: the file, its parse, status, and last result.
@@ -98,6 +100,15 @@ impl TbItem {
         let info = std::fs::read_to_string(&file.path)
             .map_err(|e| format!("{label}: cannot read: {e}"))
             .and_then(|src| {
+                if helion_verif::classtb::is_class_testbench(&src) {
+                    // Class-based / UVM: helion-svtb front end.
+                    return helion_verif::classtb::inspect_class_testbench(&file.path)
+                        .map(|c| {
+                            let (dut_module, dut_instance) = c.duts.first().cloned().unwrap_or_default();
+                            TbInfo { dut_module, dut_instance, class: Some(c), ..TbInfo::default() }
+                        })
+                        .map_err(|e| e.to_string());
+                }
                 engine::parse_testbench(&label, &src)
                     .map(|p| TbInfo {
                         dut_module: p.dut_module,
@@ -109,6 +120,7 @@ impl TbItem {
                             .map(|c| (c.sig, c.half_period_units))
                             .collect(),
                         decls: p.decls.into_iter().map(|d| (d.name, d.width)).collect(),
+                        class: None,
                     })
                     .map_err(|e| e.to_string())
             });
@@ -200,6 +212,9 @@ pub struct SimState {
     pub progress_ns: u64,
     /// Index into [`SimState::log`] where the running job's lines start.
     pub run_log_start: usize,
+    /// Chosen UVM test per testbench file (`+UVM_TESTNAME`); absent = the
+    /// test named in the testbench's `run_test()` call.
+    pub uvm_test: std::collections::BTreeMap<PathBuf, String>,
     last_run: Option<RunTarget>,
     active: Option<ActiveSim>,
 }
@@ -219,6 +234,7 @@ impl Default for SimState {
             queue: Vec::new(),
             progress_ns: 0,
             run_log_start: 0,
+            uvm_test: std::collections::BTreeMap::new(),
             last_run: None,
             active: None,
         }
@@ -465,6 +481,7 @@ pub fn launch_testbench(s: &mut AppState, i: usize) -> Result<(), String> {
     let name = item.name().to_string();
     let path = item.file.path.clone();
     let vcd = s.sim.vcd;
+    let plusargs = crate::views::tb_uvm::plusargs(s, &path);
     let (stx, srx) = mpsc::channel();
     spawn_job(
         s,
@@ -478,6 +495,7 @@ pub fn launch_testbench(s: &mut AppState, i: usize) -> Result<(), String> {
                 max_units: engine::TB_DEFAULT_MAX_UNITS,
                 seed: 1,
                 cancel: Some(cancel),
+                plusargs,
             };
             let r = engine::run_testbench(&cfg, Some(&stx));
             drop(stx);
@@ -488,8 +506,10 @@ pub fn launch_testbench(s: &mut AppState, i: usize) -> Result<(), String> {
     s.sim.selected.get_or_insert(i);
     s.sim.last_run = Some(RunTarget::Testbench(i));
     s.flow.sim = RunStatus::Running;
+    let uvm = crate::views::tb_uvm::plusargs(s, &s.sim.tbs[i].file.path).join(" ");
     let line = format!(
-        "tb_run {name}{}",
+        "tb_run {name}{}{}",
+        if uvm.is_empty() { String::new() } else { format!(" {uvm}") },
         if s.sim.vcd { " (VCD dump on)" } else { "" }
     );
     s.sim.push_log(line, MsgSev::Info);
@@ -1087,6 +1107,7 @@ pub fn run_testbench_now(s: &mut AppState, i: usize) -> Result<(), String> {
         max_units: engine::TB_DEFAULT_MAX_UNITS,
         seed: 1,
         cancel: None,
+        plusargs: crate::views::tb_uvm::plusargs(s, &item.file.path),
     };
     let (stx, srx) = mpsc::channel();
     let r = engine::run_testbench(&cfg, Some(&stx));
@@ -1177,6 +1198,7 @@ pub fn exec_tb(s: &mut AppState, verb: &str, args: &[String]) -> Result<String, 
             };
             open_vcd(s, &path, "testbench VCD")
         }
+        "tb_uvm_test" => crate::views::tb_uvm::exec_uvm_test(s, arg.trim()),
         "tb_jump" => {
             let k: usize = arg
                 .trim()

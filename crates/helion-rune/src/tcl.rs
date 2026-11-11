@@ -244,6 +244,7 @@ pub const COMMANDS: &[&str] = &[
     "tb_vcd",
     "tb_wave",
     "tb_jump",
+    "tb_uvm_test",
     "set_timescale",
     "set_runtime",
     "sim_settings",
@@ -2692,7 +2693,7 @@ fn dispatch_host(
             cmd_synth(s, argv, line)
         }
         "tb_rescan" | "tb_select" | "tb_run" | "tb_run_all" | "tb_stop" | "tb_vcd" | "tb_wave"
-        | "tb_jump" => ctl_of(crate::views::tb::exec_tb(s, name, &argv[1..]), line),
+        | "tb_jump" | "tb_uvm_test" => ctl_of(crate::views::tb::exec_tb(s, name, &argv[1..]), line),
         "set_timescale" | "set_runtime" | "sim_settings" | "compile_sim" | "elaborate_sim" => {
             ctl_of(
                 crate::views::sim_settings::exec_settings(s, name, &argv[1..]),
@@ -5418,6 +5419,10 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
             "run a testbench on the helion-sim worker",
         ),
         "tb_run_all" => ("tb_run_all", "run every discovered testbench in turn"),
+        "tb_uvm_test" => (
+            "tb_uvm_test ?name|-default?",
+            "choose the UVM test (+UVM_TESTNAME) of the selected testbench",
+        ),
         "tb_stop" => ("tb_stop", "stop the running simulation"),
         "tb_vcd" => ("tb_vcd ?on|off?", "dump run.vcd from testbench runs"),
         "tb_wave" => (
@@ -5575,7 +5580,7 @@ fn help_overview() -> String {
         "  create_clock report_timing report_utilization mark_debug eco open_hw_manager program_hw report_die report_featuremap",
         "More: unset list_properties read_verilog read_vhdl add_probe program_hw_devices report_hw_targets write_hnf",
         "  hds::synth hds::impl hds::flow hds::tree | history launch_runs cancel_runs open_report",
-        "Verify: launch_simulation tb_rescan tb_select tb_run tb_run_all tb_stop tb_vcd tb_wave tb_jump",
+        "Verify: launch_simulation tb_rescan tb_select tb_run tb_run_all tb_stop tb_vcd tb_wave tb_jump tb_uvm_test",
         "  set_timescale set_runtime sim_settings compile_sim elaborate_sim | ila <subcommand>",
         "Hardware/IP: report_hw_stat select_hw_stat | ip_catalog select_ip generate_ip create_bd create_bd_cell bd_drawing bd_hdl",
         "  apply_bd_automation assign_bd_address validate_bd_design set_bd_cell_property select_bd_cell delete_bd_objs generate_bd package_ip",

@@ -900,6 +900,55 @@ impl RandConstraintSolver {
         candidates
     }
 
+    /// Narrow `dom` of `var` using `var OP expr` clauses whose other side
+    /// evaluates under the current partial assignment.
+    fn refine_dynamic(e: &RandExpr, var: &str, env: &HashMap<String, u64>, dom: &mut DomainIntervals) {
+        let is_var = |x: &RandExpr| matches!(x, RandExpr::Var(n) if n == var);
+        match e {
+            RandExpr::And(a, b) => {
+                Self::refine_dynamic(a, var, env, dom);
+                Self::refine_dynamic(b, var, env, dom);
+            }
+            RandExpr::Eq(a, b) | RandExpr::Ne(a, b) | RandExpr::Lt(a, b) | RandExpr::Le(a, b) | RandExpr::Gt(a, b) | RandExpr::Ge(a, b) => {
+                // Normalize to `var OP k`.
+                let (k, flipped) = if is_var(a) {
+                    match b.eval(env) {
+                        Some(k) => (k, false),
+                        None => return,
+                    }
+                } else if is_var(b) {
+                    match a.eval(env) {
+                        Some(k) => (k, true),
+                        None => return,
+                    }
+                } else {
+                    return;
+                };
+                let range = match (e, flipped) {
+                    (RandExpr::Eq(..), _) => Some((k, k)),
+                    (RandExpr::Lt(..), false) | (RandExpr::Gt(..), true) => {
+                        if k == 0 { None } else { Some((0, k - 1)) }
+                    }
+                    (RandExpr::Le(..), false) | (RandExpr::Ge(..), true) => Some((0, k)),
+                    (RandExpr::Gt(..), false) | (RandExpr::Lt(..), true) => {
+                        if k == u64::MAX { None } else { Some((k + 1, u64::MAX)) }
+                    }
+                    (RandExpr::Ge(..), false) | (RandExpr::Le(..), true) => Some((k, u64::MAX)),
+                    (RandExpr::Ne(..), _) => {
+                        dom.exclude(&DomainIntervals::from_ranges(&[(k, k)]));
+                        return;
+                    }
+                    _ => return,
+                };
+                match range {
+                    Some(r) => dom.intersect(&DomainIntervals::from_ranges(&[r])),
+                    None => dom.ranges.clear(),
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn shuffle_slice(&mut self, slice: &mut [u64]) {
         for i in (1..slice.len()).rev() {
             let j = self.rng.below((i + 1) as u64) as usize;
@@ -1007,6 +1056,23 @@ impl RandConstraintSolver {
                     local_dom = tmp_doms.remove(&var.name).unwrap();
                     local_dist = tmp_dists.remove(&var.name);
                 }
+            }
+        }
+
+        // Bounds from relations to already-assigned variables
+        // (`b == a + 5`, `len > addr`): without this a 32-bit domain would
+        // only be sampled at random points and equalities never hit.
+        for c in clauses {
+            match c {
+                RandConstraint::Expr(e) => Self::refine_dynamic(e, &var.name, env, &mut local_dom),
+                RandConstraint::Implies { cond, body } if cond.eval(env) == Some(1) => {
+                    for b in body {
+                        if let RandConstraint::Expr(e) = b {
+                            Self::refine_dynamic(e, &var.name, env, &mut local_dom);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -1544,6 +1610,36 @@ impl CovergroupEngine {
             crosses: cross_reports,
             illegal_violations: self.violations.clone(),
             overall_coverage_pct,
+        }
+    }
+}
+
+#[cfg(test)]
+mod relation_tests {
+    use super::*;
+
+    #[test]
+    fn equality_and_bounds_to_assigned_vars_solve_on_32_bit_domains() {
+        let mut c = RandClass::new("t");
+        c.add_rand("a", 32).add_rand("b", 32).add_rand("c", 32);
+        c.add_constraint(
+            "rel",
+            vec![
+                RandConstraint::Expr(RandExpr::Lt(Box::new(RandExpr::var("a")), Box::new(RandExpr::val(10)))),
+                RandConstraint::Expr(RandExpr::Eq(
+                    Box::new(RandExpr::var("b")),
+                    Box::new(RandExpr::Add(Box::new(RandExpr::var("a")), Box::new(RandExpr::val(5)))),
+                )),
+                RandConstraint::Expr(RandExpr::Gt(Box::new(RandExpr::var("c")), Box::new(RandExpr::var("b")))),
+                RandConstraint::Expr(RandExpr::Lt(Box::new(RandExpr::var("c")), Box::new(RandExpr::val(20)))),
+                RandConstraint::SolveBefore { before: "a".into(), after: "b".into() },
+                RandConstraint::SolveBefore { before: "b".into(), after: "c".into() },
+            ],
+        );
+        let mut s = RandConstraintSolver::new(c, 7);
+        for _ in 0..50 {
+            let v = s.randomize().expect("satisfiable");
+            assert!(v["a"] < 10 && v["b"] == v["a"] + 5 && v["c"] > v["b"] && v["c"] < 20, "{v:?}");
         }
     }
 }
