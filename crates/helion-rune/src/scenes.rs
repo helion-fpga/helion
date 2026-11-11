@@ -1018,6 +1018,8 @@ pub const ALL: &[SceneExpect] = &[
             "sim-list",
             "sim-tb-0",
             "sim-tb-status-0",
+            // examples/ ships counter_tb.sv and counter_tb.vhd.
+            "sim-tb-1",
             "sim-detail-prompt",
             "sim-settings",
             "sim-setting-runtime-cycles",
@@ -1027,7 +1029,7 @@ pub const ALL: &[SceneExpect] = &[
             "sim-history-empty",
         ],
         absent: &[
-            "sim-tb-1",
+            "sim-tb-2",
             "sim-list-empty",
             "sim-detail",
             "sim-detail-run",
@@ -1075,6 +1077,23 @@ pub const ALL: &[SceneExpect] = &[
             "timing-pane",
             "summary",
         ],
+    },
+    SceneExpect {
+        name: "sim-vhdl",
+        surface: "sim",
+        keys: &[
+            "sim",
+            "sim-list",
+            "sim-tb-0",
+            "sim-tb-1",
+            "sim-detail",
+            "sim-detail-dut",
+            "sim-detail-clocks",
+            "sim-failures",
+            "sim-failure-0",
+            "sim-log",
+        ],
+        absent: &["sim-detail-prompt", "sim-failures-none"],
     },
     SceneExpect {
         name: "ila",
@@ -1704,6 +1723,30 @@ pub const ALL: &[SceneExpect] = &[
             "editor",
             "timing-pane",
         ],
+    },
+    SceneExpect {
+        name: "reports-ice40",
+        surface: "reports",
+        keys: &["reports-pane", "reports-util-title", "reports-util-row-0", "reports-util-kpis"],
+        absent: &[],
+    },
+    SceneExpect {
+        name: "device-ice40",
+        surface: "device",
+        keys: &["device", "device-family-badge", "device-family-summary", "device-family-canvas", "device-family-legend", "device-family-placed"],
+        absent: &["device-family-empty", "device-canvas"],
+    },
+    SceneExpect {
+        name: "timing-ice40",
+        surface: "timing",
+        keys: &["timing-title", "timing-model"],
+        absent: &[],
+    },
+    SceneExpect {
+        name: "hls-fir-cosim",
+        surface: "hls",
+        keys: &["hls", "hls-kpi-rtl", "hls-cosim-status", "hls-cosim-row-0", "hls-cosim-row-1"],
+        absent: &["hls-cosim-empty", "hls-cosim-error"],
     },
     SceneExpect {
         name: "reports-power",
