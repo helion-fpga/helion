@@ -247,6 +247,22 @@ pub const COMMANDS: &[&str] = &[
     "compile_sim",
     "elaborate_sim",
     "ila",
+    // Hardware Manager / IP Integrator / Bitstream / Find (old `Model::exec`).
+    "report_hw_stat",
+    "select_hw_stat",
+    "ip_catalog",
+    "select_ip",
+    "generate_ip",
+    "create_bd",
+    "create_bd_design",
+    "create_bd_cell",
+    "bd_drawing",
+    "bd_hdl",
+    "report_bitstream",
+    "select_bitstream_frame",
+    "find",
+    "sheet_find",
+    "select_find",
 ];
 
 /// Max nested `[...]` evaluation depth (mirrors the real interp's cap idea;
@@ -2581,6 +2597,8 @@ fn dispatch_host(
                 .as_ref()
                 .map(|b| b.packets.len())
                 .unwrap_or(0);
+            // The Bitstream surface shows the console artifact too.
+            crate::views::bitstream::adopt_session_bitstream(s);
             Ctl::Value(format!("write_bitstream {n} bytes"))
         }
         "write_checkpoint" => {
@@ -2683,7 +2701,10 @@ fn dispatch_host(
                 .skip(1)
                 .find_map(|a| a.strip_prefix("cable="))
                 .unwrap_or("auto");
-            match s.tcl.session.program_hw_cable(&dev, cable) {
+            let result = s.tcl.session.program_hw_cable(&dev, cable);
+            // The Hardware Manager pane mirrors the console program result.
+            crate::views::program::note_tcl_program(s, &result);
+            match result {
                 Ok(v) => Ctl::Value(v),
                 Err(e) => Ctl::err(line, e),
             }
@@ -2718,7 +2739,70 @@ fn dispatch_host(
         "hds::flow" => Ctl::Value("synth opt place route bits hw".into()),
         "hds::tree" => Ctl::Value(s.tcl.tree_nodes.join(" ")),
         "open_report" => cmd_open_report(s, argv, line),
+        "report_hw_stat" | "report_hw" | "hw_stat" => {
+            s.navigate(crate::state::CenterPane::Program);
+            ctl_result(crate::views::program::report_hw_stat(s), line)
+        }
+        "select_hw_stat" => {
+            let spec = argv.get(1..).unwrap_or_default().join(" ");
+            s.navigate(crate::state::CenterPane::Program);
+            ctl_result(crate::views::program::select_hw_stat(s, &spec), line)
+        }
+        "ip_catalog" => {
+            s.navigate(crate::state::CenterPane::Ip);
+            Ctl::Value(crate::views::ip::refresh_catalog(s))
+        }
+        "select_ip" => {
+            let spec = argv.get(1..).unwrap_or_default().join(" ");
+            ctl_result(crate::views::ip::select_ip(s, &spec), line)
+        }
+        "generate_ip" => {
+            let spec = argv.get(1..).unwrap_or_default().join(" ");
+            ctl_result(crate::views::ip::generate_ip(s, &spec), line)
+        }
+        "create_bd" | "create_bd_design" | "ip_integrator" => {
+            ctl_result(crate::views::ip::create_block_design(s), line)
+        }
+        "create_bd_cell" => {
+            let spec = argv.get(1..).unwrap_or_default().join(" ");
+            ctl_result(crate::views::ip::create_bd_cell(s, &spec), line)
+        }
+        "bd_drawing" => {
+            crate::views::ip::ensure_bd(s);
+            Ctl::Value(crate::views::ip::drawing_text(s))
+        }
+        "bd_hdl" => {
+            crate::views::ip::ensure_bd(s);
+            Ctl::Value(crate::views::ip::hdl_text(s))
+        }
+        "report_bitstream" | "bitstream" => {
+            ctl_result(crate::views::bitstream::report_bitstream(s), line)
+        }
+        "select_bitstream_frame" => {
+            let spec = argv.get(1..).unwrap_or_default().join(" ");
+            ctl_result(crate::views::bitstream::select_frame(s, &spec), line)
+        }
+        "find" | "find_results" => {
+            let query = argv.get(1..).unwrap_or_default().join(" ");
+            ctl_result(crate::views::find::find(s, &query), line)
+        }
+        "sheet_find" => {
+            let kind = argv.get(1..).unwrap_or_default().join(" ");
+            ctl_result(crate::views::find::sheet_find(s, &kind), line)
+        }
+        "select_find" => {
+            let spec = argv.get(1..).unwrap_or_default().join(" ");
+            ctl_result(crate::views::find::select_find(s, &spec), line)
+        }
         _ => unknown_command(s, name, line),
+    }
+}
+
+/// Map a view-model result onto the console: value or `ERROR:` line.
+fn ctl_result(r: Result<String, String>, line: usize) -> Ctl {
+    match r {
+        Ok(v) => Ctl::Value(v),
+        Err(e) => Ctl::err(line, e),
     }
 }
 
@@ -4900,6 +4984,49 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
             "ila add|bus|remove|trigger|trigger_at|depth|preratio|clock|radix|capture|arm|disarm|status|save|load|export_vcd ...",
             "simulation logic analyzer (opens the Logic Analyzer pane)",
         ),
+        "report_hw_stat" => (
+            "report_hw_stat",
+            "read IDCODE + STAT (sim TAP, or the sim-programmed fabric)",
+        ),
+        "select_hw_stat" => ("select_hw_stat NAME|BIT", "select one STAT bit card"),
+        "ip_catalog" => (
+            "ip_catalog",
+            "list the helion-ipxact IP catalog (VLNV, bus)",
+        ),
+        "select_ip" => (
+            "select_ip name|vlnv|index",
+            "select an IP core in the catalog",
+        ),
+        "generate_ip" => (
+            "generate_ip ?name?",
+            "write the core's IP-XACT output products",
+        ),
+        "create_bd" | "create_bd_design" => {
+            ("create_bd", "create an empty block design (design_1)")
+        }
+        "create_bd_cell" => (
+            "create_bd_cell ?name?",
+            "add a Helion-MM/ST core to the block design",
+        ),
+        "bd_drawing" => ("bd_drawing", "block-design canvas symbols and wires"),
+        "bd_hdl" => ("bd_hdl", "generated HDL instance table (helion-bd emit_sv)"),
+        "report_bitstream" => (
+            "report_bitstream",
+            "bitstream KPIs plus the FAR frame table",
+        ),
+        "select_bitstream_frame" => (
+            "select_bitstream_frame index|FAR|block ?major minor?",
+            "select one configuration frame",
+        ),
+        "find" => ("find ?query?", "search live cells, ports, and nets"),
+        "sheet_find" => (
+            "sheet_find cells|ports|nets",
+            "find every object of one type",
+        ),
+        "select_find" => (
+            "select_find name|index|kind:name",
+            "select a find hit and cross-probe it",
+        ),
         _ => return None,
     })
 }
@@ -4921,6 +5048,8 @@ fn help_overview() -> String {
         "  hds::synth hds::impl hds::flow hds::tree | history launch_runs cancel_runs open_report",
         "Verify: launch_simulation tb_rescan tb_select tb_run tb_run_all tb_stop tb_vcd tb_wave tb_jump",
         "  set_timescale set_runtime sim_settings compile_sim elaborate_sim | ila <subcommand>",
+        "Hardware/IP: report_hw_stat select_hw_stat | ip_catalog select_ip generate_ip create_bd create_bd_cell bd_drawing bd_hdl",
+        "  report_bitstream select_bitstream_frame | find sheet_find select_find",
         "help <command> for usage. See docs/tcl-subset.md for the supported subset.",
     ]
     .join("\n")
