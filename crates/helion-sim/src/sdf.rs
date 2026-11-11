@@ -1026,6 +1026,18 @@ impl SimTimingModel {
                     net_max_arr[*o_net as usize] = max_a;
                     net_src_pin[*o_net as usize] = Some((node.cell_name.clone(), "O".to_string()));
                 }
+                ConeNodeKind::Mul { .. } => {
+                    // No SDF arcs for multipliers: outputs inherit the
+                    // latest/earliest input arrival.
+                    let ins = node.input_nets();
+                    let min_a = ins.iter().filter_map(|&n| net_min_arr[n as usize]).min();
+                    let max_a = ins.iter().filter_map(|&n| net_max_arr[n as usize]).max();
+                    for o in node.output_nets() {
+                        net_min_arr[o as usize] = min_a;
+                        net_max_arr[o as usize] = max_a;
+                        net_src_pin[o as usize] = Some((node.cell_name.clone(), "P".to_string()));
+                    }
+                }
             }
         }
 
