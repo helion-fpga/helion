@@ -276,6 +276,15 @@ pub fn load_from_prj(s: &mut AppState, prj_path: &Path, prj: &helion_proj::Proje
     crate::views::device_floor::sync_from_project(s);
     let _ = crate::views::ip::refresh_catalog(s);
     let top = s.project.top.clone();
+    // A file that declares the project top is shown (and probed) as that
+    // module, not as whichever module it happens to declare first.
+    if let Some(t) = top.as_deref() {
+        for f in &mut s.project_files.files {
+            if f.modules.iter().any(|m| m == t) {
+                f.module = Some(t.to_string());
+            }
+        }
+    }
     if let Some(i) = s.project_files.top_index(top.as_deref()) {
         if s.project.top.is_none() {
             s.project.top = s.project_files.files[i].module.clone();
@@ -441,6 +450,21 @@ mod tests {
             Some("blinky".into())
         );
         assert_eq!(first_module("set_property PACKAGE_PIN"), None);
+    }
+
+    #[test]
+    fn a_multi_module_file_shows_the_project_top() {
+        let prj = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/ibex_core.prj");
+        let text = std::fs::read_to_string(&prj).unwrap();
+        let parsed = helion_proj::load_prj(&text).unwrap();
+        let mut s = crate::init();
+        s.empty_project();
+        s.reseed_for_new_project("ibex_core".into(), "x".into(), parsed.part.clone(), parsed.top.clone());
+        load_from_prj(&mut s, &prj, &parsed);
+        let f = &s.project_files.files[0];
+        assert!(f.modules.len() > 1, "ysyx_ibex.sv declares many modules");
+        assert_ne!(f.modules[0], "ysyx_ibex");
+        assert_eq!(f.module.as_deref(), Some("ysyx_ibex"));
     }
 
     #[test]
