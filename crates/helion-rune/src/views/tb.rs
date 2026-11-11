@@ -1207,7 +1207,7 @@ pub fn last_vcd(s: &AppState) -> Option<PathBuf> {
 /// Scenes/tests: discover the repo `examples/` testbenches (read-only).
 pub fn seed_examples_fixture(s: &mut AppState) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
-    s.sim.dir_override = Some(dir);
+    s.sim.dir_override = Some(std::fs::canonicalize(&dir).unwrap_or(dir));
     rescan(s);
 }
 
