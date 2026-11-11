@@ -618,8 +618,30 @@ impl Engine<'_> {
                     }
                 }
                 None => {
-                    // Defaults resolve in the class's declaring scope.
-                    let dctx = Ctx { scopes: vec![], this: None, class: outer, ns };
+                    // Defaults resolve in the class's declaring scope, with
+                    // earlier parameters visible (`type RSP = REQ`).
+                    let earlier = |n: &str| bound.iter().find(|(b, _)| b == n).map(|(_, v)| v.clone());
+                    let named = match &p.default {
+                        Some(ParamArg::Expr(Expr::Ident(n))) => Some(n.clone()),
+                        Some(ParamArg::Type(DataType::Named { path })) if path.len() == 1 && path[0].params.is_none() => Some(path[0].name.clone()),
+                        _ => None,
+                    };
+                    if let Some(v) = named.as_deref().and_then(earlier) {
+                        bound.push((p.name.clone(), v));
+                        continue;
+                    }
+                    let scope: ScopeRef = Rc::new(RefCell::new(HashMap::new()));
+                    for (n, v) in &bound {
+                        if let ParamVal::Val(v) = v {
+                            let ty = match v {
+                                Value::Str(_) => Ty::Str,
+                                Value::Int(_, w, s) => Ty::int(*w, *s),
+                                _ => Ty::int(32, true),
+                            };
+                            scope.borrow_mut().insert(n.clone(), Var { ty, v: v.clone() });
+                        }
+                    }
+                    let dctx = Ctx { scopes: vec![scope], this: None, class: outer, ns };
                     let (ty, v) = self.param_value(&dctx, p)?;
                     match v {
                         Some(v) => ParamVal::Val(v),

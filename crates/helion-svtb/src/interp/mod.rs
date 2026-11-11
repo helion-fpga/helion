@@ -368,6 +368,7 @@ pub struct Engine<'a> {
 impl<'a> Engine<'a> {
     pub fn new(unit: Rc<SourceUnit>, map: SourceMap, cfg: RunConfig, sink: &'a mut dyn FnMut(Event)) -> Self {
         let seed = cfg.seed;
+        let budget = cfg.max_slice;
         Self {
             map: map.clone(),
             nss: Vec::new(),
@@ -398,7 +399,7 @@ impl<'a> Engine<'a> {
             res: RunResult { map, ..Default::default() },
             rng: seed ^ 0x9E37_79B9_7F4A_7C15,
             dollar: Vec::new(),
-            slice_budget: 0,
+            slice_budget: budget,
             final_blocks: Vec::new(),
             unit,
             with_item: Vec::new(),
