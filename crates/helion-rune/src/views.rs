@@ -7,6 +7,8 @@ pub mod console;
 pub mod constraints;
 pub mod debug;
 pub mod device;
+pub mod device_io;
+pub mod device_package;
 pub mod dialogs;
 pub mod editor;
 pub mod highlight;
