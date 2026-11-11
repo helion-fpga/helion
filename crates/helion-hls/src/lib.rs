@@ -16,6 +16,7 @@ pub mod emit;
 pub mod flopoco_fp;
 pub mod parser;
 pub mod pragma;
+pub mod rtl_cosim;
 pub mod schedule;
 pub mod systolic_csr_dataflow;
 
@@ -30,6 +31,7 @@ pub use cosim::{
     evaluate_c_kernel_reference, extract_kernel_m_axi_bursts, generate_cosim_testbench,
     run_cosim_verification,
 };
+pub use rtl_cosim::{COSIM_MAX_CYCLES, run_rtl_cosim};
 pub use emit::{generate_hls_report, resolve_interfaces, HlsSynthesisReport, InterfacePort};
 pub use flopoco_fp::{
     FpEvalOutput, FpExceptionFlags, FpFormat, FpOpKind, FpOperatorHwResult, FpOperatorSpec,

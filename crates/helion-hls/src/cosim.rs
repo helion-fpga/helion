@@ -588,6 +588,10 @@ fn eval_sim_expr(
     }
 }
 
+/// Schedule-model co-simulation report. **Does not simulate the RTL**: the
+/// RTL outputs are the C outputs (plus `inject_rtl_fault_delta`). Use
+/// [`crate::run_rtl_cosim`] for a real gate-level C/RTL co-simulation.
+///
 /// Run Vivado HLS C/RTL Co-Simulation (`cosim_design`):
 /// 1. Synthesizes `source` into SystemVerilog RTL and netlist (`hls_compile`).
 /// 2. Extracts coalesced `m_axi` burst descriptors (`AWLEN`/`ARLEN` beat packing & 4 KiB splitting).

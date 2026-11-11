@@ -1875,6 +1875,7 @@ name = "helion-hls"
 version = "3.0.0"
 dependencies = [
  "helion-ir",
+ "helion-sim",
  "helion-sv",
 ]
 
