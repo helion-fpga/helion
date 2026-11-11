@@ -23,6 +23,8 @@ pub use fraig::{
     rewrite_aig_4cut, simulate_parallel_64, CandidateEquivClass, FraigSweepStats, Rewrite4CutStats,
     FRAIG_VAR_INIT,
 };
+pub mod src_loc;
+pub use src_loc::{LineProbe, LineProbeKind, SrcLoc, LCOV_ALWAYS, LCOV_ATTR, SRC_ATTR, SRC_SEP};
 pub mod datapath_extract;
 pub use datapath_extract::{
     extract_carry4_chains_from_luts, pack_muxf7_muxf8_trees, share_resource_muxed_alu,

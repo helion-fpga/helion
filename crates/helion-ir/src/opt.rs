@@ -531,11 +531,13 @@ impl Design {
         }
         let mut folded = 0usize;
         for (ci, ni, val, fanouts) in folds {
-            let _ = ci;
+            // The folded constant's source lines now live in its fanouts.
+            let src = self.cells[ci].attrs.clone();
             for (fi, ii) in &fanouts {
                 if let CellKind::Lut6 { init } = &mut self.cells[*fi].kind {
                     *init = fold_init_const(*init, *ii, val);
                 }
+                self.cells[*fi].attrs.merge_src_from(&src);
             }
             let pins: HashSet<(Spur, Spur)> = fanouts
                 .iter()
@@ -627,11 +629,13 @@ impl Design {
         }
         let mut absorbed = 0usize;
         for (ci, ni, fanouts) in folds {
-            let _ = ci;
+            // The absorbed inverter's source lines now live in its fanouts.
+            let src = self.cells[ci].attrs.clone();
             for (fi, ii) in &fanouts {
                 if let CellKind::Lut6 { init } = &mut self.cells[*fi].kind {
                     *init = absorb_init_invert(*init, *ii);
                 }
+                self.cells[*fi].attrs.merge_src_from(&src);
             }
             let pins: HashSet<(Spur, Spur)> = fanouts
                 .iter()
@@ -2222,6 +2226,21 @@ mod tests {
         assert_eq!(d.sweep_dead_luts(), 2);
         assert!(d.cell("c_inv").is_none());
         assert!(d.cell("c_dead").is_none());
+    }
+
+    #[test]
+    fn folding_and_absorbing_merge_src_into_fanout() {
+        use crate::SrcLoc;
+        let mut d = lut_design();
+        d.cell_mut("c_inv").unwrap().attrs.add_src(&SrcLoc::new("t.sv", 4));
+        d.cell_mut("c_const").unwrap().attrs.add_src(&SrcLoc::new("t.sv", 2));
+        d.cell_mut("c_and").unwrap().attrs.add_src(&SrcLoc::new("t.sv", 9));
+        d.peephole_opt_luts();
+        assert!(d.cell("c_inv").is_none() && d.cell("c_const").is_none());
+        assert_eq!(
+            d.cell("c_and").unwrap().attrs.src_locs(),
+            vec![SrcLoc::new("t.sv", 2), SrcLoc::new("t.sv", 4), SrcLoc::new("t.sv", 9)]
+        );
     }
 
     #[test]
