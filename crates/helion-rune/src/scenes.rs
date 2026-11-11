@@ -815,6 +815,7 @@ pub const ALL: &[SceneExpect] = &[
             "device-pblock-create",
             "device-pblock-add-cell",
             "device-pblock-fit",
+            "device-pblock-delete",
             "device-pblock-row-0",
             "device-pblock-row-1",
         ],
@@ -1954,6 +1955,8 @@ pub const ALL: &[SceneExpect] = &[
         keys: &[
             "dfx-pane",
             "dfx-new",
+            "dfx-delete",
+            "dfx-saved",
             "dfx-tab-0",
             "dfx-partition",
             "dfx-pblock-pblock_rp0",
@@ -1970,6 +1973,42 @@ pub const ALL: &[SceneExpect] = &[
         surface: "eco",
         keys: &["eco-pane", "eco-empty", "eco-open"],
         absent: &["summary", "eco-form"],
+    },
+    SceneExpect {
+        name: "eco-restored",
+        surface: "eco",
+        keys: &["eco-pane", "eco-persist", "eco-discard", "eco-open", "eco-form", "eco-change-0", "eco-change-1"],
+        absent: &["summary", "eco-empty"],
+    },
+    SceneExpect {
+        name: "eco-restored-light",
+        surface: "eco",
+        keys: &["eco-pane", "eco-persist", "eco-discard", "eco-change-0"],
+        absent: &["summary", "eco-empty"],
+    },
+    SceneExpect {
+        name: "dfx-light",
+        surface: "dfx",
+        keys: &["dfx-pane", "dfx-saved", "dfx-delete", "dfx-new", "dfx-partition", "dfx-module-0"],
+        absent: &["summary", "dfx-empty"],
+    },
+    SceneExpect {
+        name: "device-pblocks-light",
+        surface: "device",
+        keys: &["device-pblocks", "device-pblocks-bar", "device-pblock-delete", "device-pblock-row-0", "device-pblock-row-1"],
+        absent: &["device-pblocks-empty", "device-io-ports"],
+    },
+    SceneExpect {
+        name: "xdc-wizard-synth-first",
+        surface: "dialogs",
+        keys: &["xdc-sdc", "xdc-write", "xdc-rerun", "xdc-timing", "xdc-written"],
+        absent: &["xdc-wns-after", "xdc-awaiting-run"],
+    },
+    SceneExpect {
+        name: "xdc-wizard-synth-first-light",
+        surface: "dialogs",
+        keys: &["xdc-rerun", "xdc-timing", "xdc-awaiting-run"],
+        absent: &["xdc-wns-after"],
     },
     SceneExpect {
         name: "reports-no-run",
@@ -2166,6 +2205,36 @@ pub fn xdc_wizard_review(s: &mut AppState) {
         });
     }
     s.toasts.items.clear();
+}
+
+/// Review step with the file written but no synthesized design: Re-run
+/// offers "Synthesize & re-run timing". `awaiting` shows the state while
+/// synth_1 runs (no run is actually started in the scene).
+pub fn xdc_wizard_synth_first(s: &mut AppState, awaiting: bool) {
+    xdc_wizard_review(s);
+    s.dialogs.xdc.timing = None;
+    s.runs.analysis = None;
+    s.runs.source = Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter.sv"));
+    if awaiting {
+        s.theme = crate::theme::ThemeMode::Light;
+        s.dialogs.xdc.timing = Some(crate::views::xdc_wizard::TimingOutcome::AwaitingRun);
+    }
+}
+
+/// ECO session restored from a project's `.helion/eco` (ten minutes old).
+pub fn eco_restored(s: &mut AppState, light: bool) {
+    s.center = crate::state::CenterPane::Eco;
+    if light {
+        s.theme = crate::theme::ThemeMode::Light;
+    }
+    crate::views::reports::demo_impl_complete(s);
+    crate::views::eco::scene_fill(s);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let dir = std::path::PathBuf::from("/home/fpga/blinky/.helion/eco");
+    s.eco.restored = Some((dir, now.saturating_sub(600)));
+    s.eco.status = Some(Ok("eco restored /home/fpga/blinky/.helion/eco changes=2 (place & route pending)".into()));
 }
 
 /// Editor with a real sv-parser error in the demo buffer (diagnostics as the

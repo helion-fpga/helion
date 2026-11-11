@@ -1121,6 +1121,10 @@ fn timing_card(s: &AppState, t: &VivadoTheme, written: bool) -> El {
             .truncate()
             .help_when_truncated(e.clone()),
         _ if !written => dim_label("Write the file, then re-run timing to compare WNS.", t),
+        _ if rerun_action(s, written) == Rerun::SynthFirst => dim_label(
+            "No synthesized design yet: Synthesize & re-run timing runs synth_1, then compares WNS.",
+            t,
+        ),
         _ => dim_label("Re-run timing to compare WNS with the new constraints.", t),
     };
     col()
