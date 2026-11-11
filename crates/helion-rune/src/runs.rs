@@ -554,7 +554,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 /// Resolve the RTL source: the explicit override when set, else the current
 /// editor RTL buffer materialized to a temp file.
-fn resolve_source(s: &AppState) -> Result<PathBuf, String> {
+pub(crate) fn resolve_source(s: &AppState) -> Result<PathBuf, String> {
     if let Some(p) = &s.runs.source {
         return Ok(p.clone());
     }

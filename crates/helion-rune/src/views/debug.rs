@@ -2166,7 +2166,8 @@ fn debug_tab_strip(s: &AppState, t: &VivadoTheme) -> El {
 
 /// Shared debugger transport: Run/Step/Restart stay mounted on every tab
 /// (the old panes repeat these buttons per workspace tab).
-fn debug_toolbar(_s: &AppState, t: &VivadoTheme) -> El {
+fn debug_toolbar(s: &AppState, t: &VivadoTheme) -> El {
+    let run_label = format!("Run {}", s.debug.runtime_cycles.max(1));
     row()
         .key("debug-toolbar")
         .role("toolbar")
@@ -2177,7 +2178,8 @@ fn debug_toolbar(_s: &AppState, t: &VivadoTheme) -> El {
         .px(8.0)
         .fill(t.panel_bg)
         .child(
-            debug_btn("debug-run", "Run 16", t, true)
+            debug_btn("debug-run", &run_label, t, true)
+                .help("Run RUNTIME_CYCLES cycles (Simulation Settings)")
                 .on_press(|s: &mut AppState| crate::tcl::eval_command(s, "sim_run")),
         )
         .child(

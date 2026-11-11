@@ -2000,6 +2000,7 @@ dependencies = [
  "helion-sim",
  "helion-sta",
  "helion-sv",
+ "helion-verif",
  "helion-vhdl",
  "rune",
  "rune-kit",

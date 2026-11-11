@@ -475,8 +475,12 @@ fn wave_cursors_measure_delta_and_markers_echo_tcl() {
         rt.find("wave-marker-2").is_some(),
         "new marker flag must mount"
     );
-    tap(&mut rt, "wave-radix");
-    assert_eq!(rt.state.wave.radix, WaveRadix::Bin);
+    tap(&mut rt, "wave-radix-bin");
+    assert_eq!(
+        rt.state.wave.radix_for("vb_led[4:0]"),
+        WaveRadix::Bin,
+        "radix applies to the selected trace"
+    );
     tap(&mut rt, "wave-scope-dut");
     tap(&mut rt, "wave-object-add-an");
     assert!(
@@ -491,20 +495,44 @@ fn wave_cursors_measure_delta_and_markers_echo_tcl() {
 
 #[test]
 fn sim_run_arms_flow_and_opens_the_waveform() {
-    use helion_rune::views::wave::TbStatus;
+    use helion_rune::views::tb::TbStatus;
     let mut rt = rt_for("sim-detail");
-    assert_eq!(rt.state.sim.selected, Some(1));
+    assert_eq!(rt.state.sim.selected, Some(0));
+    assert_eq!(
+        rt.state.sim.status(0),
+        TbStatus::Failed,
+        "fixture ran for real"
+    );
     tap(&mut rt, "sim-detail-run");
-    assert_eq!(rt.state.sim.status(1), TbStatus::Running);
+    assert_eq!(rt.state.sim.status(0), TbStatus::Running);
     assert_eq!(rt.state.flow.sim, RunStatus::Running);
     assert!(
         rt.state
             .console
             .lines
             .iter()
-            .any(|l| l.text == "launch_simulation -simset sim_1 -tb project1_tb"),
+            .any(|l| l.text == "launch_simulation -simset sim_1 -tb counter_early_tb"),
         "run must echo its Tcl verb"
     );
+    helion_rune::views::tb::cancel_sim(&mut rt.state);
+    let start = Instant::now();
+    while rt.state.sim.is_active() {
+        helion_rune::views::tb::poll_sim(&mut rt.state);
+        assert!(start.elapsed() < Duration::from_secs(60));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut rt = Runtime::new(
+        rt.state.clone(),
+        helion_rune::view,
+        helion_rune::app_spec().size,
+        Env {
+            system_dark: false,
+            scale: 2.0,
+        },
+    );
+    rt.frame(1.0 / 60.0);
+    tap(&mut rt, "sim-tb-1");
+    assert_eq!(rt.state.sim.selected, Some(1));
     tap(&mut rt, "sim-detail-open-wave");
     assert_eq!(rt.state.center, CenterPane::Wave);
     assert!(rt.find("wave-canvas").is_some(), "waveform must mount");
