@@ -490,8 +490,116 @@ fn stat_section(s: &AppState, t: &VivadoTheme) -> El {
     section
 }
 
-/// The center Hardware Manager pane wired into the shell.
+/// Server node: this process's hardware layer and the last USB scan.
+fn server_panel(s: &AppState, t: &VivadoTheme) -> El {
+    let mut body = col()
+        .w_full()
+        .gap(0.0)
+        .child(cad::kv(
+            "Server",
+            cad::mono("localhost · in-process helion-hw (no hw_server daemon)", t),
+            LABEL_W + 30.0,
+            t,
+        ));
+    match &s.program.detect {
+        None => {
+            body = body.child(cad::kv(
+                "USB scan",
+                cad::dim("Not scanned — Detect lists USB programmers.", t),
+                LABEL_W + 30.0,
+                t,
+            ));
+        }
+        Some(d) => {
+            let ofl = d
+                .usb
+                .ofl_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "not on PATH".into());
+            body = body
+                .child(cad::kv(
+                    "openFPGALoader",
+                    cad::cut(ofl, cad::mono_style(), t.text),
+                    LABEL_W + 30.0,
+                    t,
+                ))
+                .child(cad::kv(
+                    "USB probes",
+                    cad::mono(d.usb.probes.len().to_string(), t),
+                    LABEL_W + 30.0,
+                    t,
+                ))
+                .child(cad::kv(
+                    "Native FTDI",
+                    cad::cut(d.usb.native_note.clone(), VivadoTheme::FONT_UI, t.text_dim),
+                    LABEL_W + 30.0,
+                    t,
+                ))
+                .child(cad::kv(
+                    "Note",
+                    cad::cut(d.note.clone(), VivadoTheme::FONT_UI, t.text_dim),
+                    LABEL_W + 30.0,
+                    t,
+                ));
+            for (i, p) in d.usb.probes.iter().enumerate() {
+                body = body.child(
+                    cad::cut(p.detail.clone(), cad::mono_style(), t.text)
+                        .key(format!("program-usb-probe-{i}")),
+                );
+            }
+        }
+    }
+    col()
+        .key("program-server")
+        .w_full()
+        .gap(10.0)
+        .child(cad::card("program-server-card", "Hardware Server", body, t))
+}
+
+/// Target node: cable pick and the JTAG chain it reaches.
+fn target_panel(s: &AppState, t: &VivadoTheme) -> El {
+    let part = program_part(s);
+    let chain = match &s.program.stat {
+        Some(st) => format!("{} · IDCODE {:#010x} · IR 6 bits", st.part, st.idcode),
+        None => format!("{part} · IDCODE not read (Refresh STAT)"),
+    };
+    col()
+        .key("program-target-panel")
+        .w_full()
+        .gap(10.0)
+        .child(cable_card(s, t))
+        .child(cad::card(
+            "program-chain",
+            "JTAG Chain",
+            cad::cut(chain, cad::mono_style(), t.text).key("program-chain-device"),
+            t,
+        ))
+}
+
+/// Device node: the original Program Device surface.
+fn device_panel(s: &AppState, t: &VivadoTheme) -> El {
+    let left = col()
+        .w(LEFT_W)
+        .gap(10.0)
+        .child(cable_card(s, t))
+        .child(bitstream_card(s, t));
+    let right = col()
+        .grow(1.0)
+        .min_w(0.0)
+        .gap(10.0)
+        .child(program_card(s, t));
+    col()
+        .w_full()
+        .gap(10.0)
+        .child(row().w_full().gap(10.0).child(left).child(right))
+        .child(stat_section(s, t))
+}
+
+/// The center Hardware Manager pane wired into the shell: the hardware
+/// tree on the left drives which panel shows on the right.
 pub fn program_pane(s: &AppState, t: &VivadoTheme) -> El {
+    use crate::views::hw_tree::HwNode;
     let busy = s.program.busy();
     let detect_reason = busy.map(|k| format!("Busy: {}", k.busy_label()));
     let stat_reason = stat_block_reason(s);
@@ -510,20 +618,41 @@ pub fn program_pane(s: &AppState, t: &VivadoTheme) -> El {
             stat_reason.as_deref(),
             refresh_stat,
         ))
+        .child(cad::tool_sep(t))
+        .child(cad::btn(
+            "program-setup-debug",
+            "Set Up Debug",
+            t,
+            None,
+            |s: &mut AppState| s.program.node = HwNode::SetupDebug,
+        ))
+        .child(cad::btn(
+            "program-add-cfgmem",
+            "Add Configuration Memory",
+            t,
+            None,
+            |s: &mut AppState| s.program.node = HwNode::CfgMem,
+        ))
         .child(el().grow(1.0));
     if let Some(k) = busy {
         tools = tools.child(cad::dim(k.busy_label(), t).key("program-busy"));
+    } else if let Some(k) = s.program.debug.busy() {
+        tools = tools.child(cad::dim(k.busy_label(), t).key("program-busy"));
+    } else if let Some(op) = s.program.cfgmem.busy() {
+        tools = tools.child(cad::dim(op.busy_label(), t).key("program-busy"));
     }
-    let left = col()
-        .w(LEFT_W)
-        .gap(10.0)
-        .child(cable_card(s, t))
-        .child(bitstream_card(s, t));
-    let right = col()
-        .grow(1.0)
-        .min_w(0.0)
-        .gap(10.0)
-        .child(program_card(s, t));
+    let panel = match s.program.node {
+        HwNode::Server => server_panel(s, t),
+        HwNode::Target => target_panel(s, t),
+        HwNode::Device => device_panel(s, t),
+        HwNode::SetupDebug => crate::views::hw_debug_view::setup_panel(s, t),
+        HwNode::Core(helion_debug::DebugCoreKind::Vio) => crate::views::hw_debug_view::vio_panel(s, t),
+        HwNode::Core(helion_debug::DebugCoreKind::JtagAxi) => {
+            crate::views::hw_debug_view::axi_panel(s, t)
+        }
+        HwNode::Core(_) => crate::views::hw_debug_view::ila_panel(s, t),
+        HwNode::CfgMem => crate::views::hw_cfgmem_view::cfgmem_panel(s, t),
+    };
     col()
         .key("program")
         .grow(1.0)
@@ -534,22 +663,29 @@ pub fn program_pane(s: &AppState, t: &VivadoTheme) -> El {
         .child(pane_header("Hardware Manager", "program", t))
         .child(tools)
         .child(
-            col()
-                .key("program-scroll")
+            row()
+                .key("program-body")
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)
-                .scroll(ScrollSpec {
-                    stick_bottom: false,
-                })
+                .child(crate::views::hw_tree::tree(s, t))
                 .child(
                     col()
-                        .w_full()
-                        .gap(10.0)
-                        .padding(8.0)
-                        .child(banner(s, t))
-                        .child(row().w_full().gap(10.0).child(left).child(right))
-                        .child(stat_section(s, t)),
+                        .key("program-scroll")
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .h_full()
+                        .scroll(ScrollSpec {
+                            stick_bottom: false,
+                        })
+                        .child(
+                            col()
+                                .w_full()
+                                .gap(10.0)
+                                .padding(8.0)
+                                .child(banner(s, t))
+                                .child(panel),
+                        ),
                 ),
         )
 }

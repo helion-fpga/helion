@@ -41,6 +41,7 @@ pub use native_usb::{
 };
 pub mod bitstream_crypto;
 pub mod cfgmem;
+pub mod cfgmem_device;
 pub mod spi_flash;
 pub mod xvc;
 pub use bitstream_crypto::{
@@ -52,8 +53,12 @@ pub use cfgmem::{
     CFG_BUS_WIDTH_DETECT, CFG_BUS_WIDTH_SYNC, CFG_CMD_IPROG, CFG_DUMMY_WORD, CFG_SYNC_WORD,
     CfgBusWidth, MULTIBOOT_HEADER_MAGIC, MultiBootConfig, MultiBootHeader, MultiBootLoadReport,
     build_multiboot_flash_image, crc32_ieee, decode_multiboot_header, encode_multiboot_header,
-    parse_cfgmem_mcs, simulate_multiboot_load, swap_bits_in_byte, swap_byte_bits,
+    parse_cfgmem_mcs, parse_cfgmem_mcs_at, simulate_multiboot_load, swap_bits_in_byte, swap_byte_bits,
     write_cfgmem_bin, write_cfgmem_mcs,
+};
+pub use cfgmem_device::{
+    CFGMEM_PARTS, CfgMemFormat, CfgMemImage, CfgMemInterface, CfgMemPart, CfgMemProgramOpts,
+    CfgMemReport, CfgMemSession, find_cfgmem_part, read_cfgmem_file, write_cfgmem,
 };
 pub use spi_flash::{
     DEFAULT_JEDEC_ID, FlashVerifyReport, JtagSpiBridge, SPI_CMD_BE, SPI_CMD_PP, SPI_CMD_QREAD,
