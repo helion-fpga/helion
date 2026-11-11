@@ -491,6 +491,9 @@ pub struct CheckpointIr {
     pub strategy: ImplStrategy,
     pub pblock: Option<PrjPblock>,
     pub timing_weight: f64,
+    /// Placer perturbation seed (0 for checkpoints written before seeds
+    /// were persisted).
+    pub placer_seed: u64,
     pub route_max_iters: u32,
     pub route_extra_hops: u32,
 }
@@ -1311,7 +1314,9 @@ impl Session {
         s.strategy = ck.strategy;
         s.pblock = ck.pblock.clone();
         s.place_opts = PlaceOpts {
-            timing_weight: ck.timing_weight, seed: 0 };
+            timing_weight: ck.timing_weight,
+            seed: ck.placer_seed,
+        };
         s.route_opts = RouteOpts {
             max_iters: ck.route_max_iters,
             extra_hops: ck.route_extra_hops,
@@ -1444,6 +1449,7 @@ impl Session {
             strategy,
             pblock,
             timing_weight: place_opts.timing_weight,
+            placer_seed: place_opts.seed,
             route_max_iters: route_opts.max_iters,
             route_extra_hops: route_opts.extra_hops,
         })
@@ -1452,6 +1458,18 @@ impl Session {
 
 const HKNB: &[u8; 4] = b"HKNB";
 const HKNB_VER: u8 = 1;
+/// Knobs flag: a `u64` placer seed follows the (optional) pblock section.
+const KNB_SEED: u8 = 2;
+
+fn read_seed(bytes: &[u8], i: usize, flags: u8) -> Result<u64, String> {
+    if flags & KNB_SEED == 0 {
+        return Ok(0);
+    }
+    bytes
+        .get(i..i + 8)
+        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        .ok_or_else(|| "truncated hckp placer seed".to_string())
+}
 
 fn write_u16_str(v: &mut Vec<u8>, s: &str) {
     let b = s.as_bytes();
@@ -1485,7 +1503,9 @@ fn encode_impl_knobs(
     v.push(HKNB_VER);
     v.push(strategy.as_u8());
     let pb = pblock.filter(|p| p.ranged);
-    v.push(if pb.is_some() { 1 } else { 0 });
+    // flags: bit 0 = pblock section, bit 1 = placer seed trailer (u64).
+    let seeded = place_opts.seed != 0;
+    v.push(u8::from(pb.is_some()) | if seeded { KNB_SEED } else { 0 });
     v.push(0);
     let milli = (place_opts.timing_weight * 1000.0).round() as u32;
     v.extend_from_slice(&milli.to_le_bytes());
@@ -1503,6 +1523,9 @@ fn encode_impl_knobs(
         for c in &pb.cells {
             write_u16_str(&mut v, c);
         }
+    }
+    if seeded {
+        v.extend_from_slice(&place_opts.seed.to_le_bytes());
     }
     v
 }
@@ -1528,13 +1551,16 @@ fn decode_impl_knobs(
     let milli = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
     let max_iters = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
     let extra_hops = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
-    let place_opts = PlaceOpts {
-        timing_weight: milli as f64 / 1000.0, seed: 0 };
+    let mut place_opts = PlaceOpts {
+        timing_weight: milli as f64 / 1000.0,
+        seed: 0,
+    };
     let route_opts = RouteOpts {
         max_iters,
         extra_hops,
     };
     if flags & 1 == 0 {
+        place_opts.seed = read_seed(bytes, 20, flags)?;
         return Ok((strategy, None, place_opts, route_opts));
     }
     let mut i = 20;
@@ -1558,6 +1584,7 @@ fn decode_impl_knobs(
     for _ in 0..n {
         cells.push(read_u16_str(bytes, &mut i)?);
     }
+    place_opts.seed = read_seed(bytes, i, flags)?;
     Ok((
         strategy,
         Some(PrjPblock {
@@ -3231,6 +3258,41 @@ create_pblock pblock_0
         let meta = Session::restore_with_ir(&old).unwrap();
         assert_eq!(meta.strategy, ImplStrategy::Default);
         assert!(meta.pblock.is_none());
+    }
+
+    /// Implement the counter with placer `seed` (Default timing weight).
+    fn seeded_counter(dev: &Device, seed: u64) -> Session {
+        let mut s = Session::new(Mode::Project);
+        s.synth_design(Design::structural_counter());
+        let opts = PlaceOpts { seed, ..ImplStrategy::Default.place_opts() };
+        s.place_design_with(dev, opts).unwrap();
+        s.route_design_with(dev, ImplStrategy::Default.route_opts()).unwrap();
+        s.write_bitstream(dev).unwrap();
+        s
+    }
+
+    #[test]
+    fn seeded_hckp_reopens_with_its_seed_and_hash() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let h0 = seeded_counter(&dev, 0).blinky_hash().unwrap();
+        // A seed whose placement (hence bitstream) differs from seed 0.
+        let (seed, s) = (1..=16u64)
+            .map(|k| (k, seeded_counter(&dev, k)))
+            .find(|(_, s)| s.blinky_hash() != Some(h0))
+            .expect("some placer seed must move the counter");
+        let h = s.blinky_hash().unwrap();
+        let dir = std::env::temp_dir().join(format!("helion-hckp-seed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seeded.hckp");
+        let mut s = s;
+        s.write_checkpoint_to(&path).unwrap();
+        let meta = Session::restore_with_ir(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(meta.placer_seed, seed, "the knobs carry the seed");
+        let reopened = Session::open_checkpoint(&path, &dev)
+            .unwrap_or_else(|e| panic!("seed {seed} checkpoint must reopen: {e}"));
+        assert_eq!(reopened.place_opts.seed, seed);
+        assert_eq!(reopened.blinky_hash(), Some(h));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
