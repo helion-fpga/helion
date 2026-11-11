@@ -45,7 +45,7 @@ use rune_kit::{
     Button, ButtonVariant, Checkbox, Dialog, Kit, Placement, Popover, TextInput, glyphs,
 };
 
-use crate::state::{AppState, ConsoleLine, MsgSev};
+use crate::state::{AppState, ConsoleLine, MsgSev, ToastKind};
 use crate::theme::VivadoTheme;
 
 /// Settings-tree width (the brief shows a narrow nav beside a wide pane).
@@ -214,13 +214,11 @@ impl CreateStep {
 
     fn hint(self) -> &'static str {
         match self {
-            CreateStep::Info => "Enter a project name and the directory that will hold it.",
-            CreateStep::Sources => "Add RTL sources now, or add them later from the Sources pane.",
-            CreateStep::Constraints => {
-                "Pick the active constraint set for synthesis and implementation."
-            }
-            CreateStep::Part => "Choose the default Xilinx part for the project.",
-            CreateStep::Summary => "Review the project before it is created.",
+            CreateStep::Info => "Name the project and choose the folder that will hold it.",
+            CreateStep::Sources => "Add RTL sources now, or later from the Sources pane.",
+            CreateStep::Constraints => "Add XDC/SDC constraint files (clocks, pins, delays).",
+            CreateStep::Part => "Choose the Helion device the project targets.",
+            CreateStep::Summary => "Review the project, then create it on disk.",
         }
     }
 
@@ -406,6 +404,10 @@ pub struct CreateState {
     pub constr_set: usize,
     pub part: usize,
     pub error: Option<String>,
+    /// RTL files picked on the Add Sources page.
+    pub sources: Vec<String>,
+    /// XDC/SDC files picked on the Add Constraints page.
+    pub constraints: Vec<String>,
 }
 
 impl Default for CreateState {
@@ -413,11 +415,17 @@ impl Default for CreateState {
         Self {
             step: CreateStep::Info,
             name: TextEdit::new(""),
-            location: TextEdit::new("C:/EE214"),
+            location: TextEdit::new(
+                crate::pickers::default_projects_dir()
+                    .display()
+                    .to_string(),
+            ),
             top: TextEdit::new(""),
             constr_set: 0,
             part: 0,
             error: None,
+            sources: Vec::new(),
+            constraints: Vec::new(),
         }
     }
 }
@@ -1399,8 +1407,18 @@ fn settings_dialog(
 
 /// New Project validation: the name is required, the part index must exist.
 fn create_error(c: &CreateState) -> Option<String> {
-    if c.name.text.trim().is_empty() {
+    let name = c.name.text.trim();
+    if name.is_empty() {
         return Some("Project name is required.".into());
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Some("Use letters, digits, '_' or '-' in the project name.".into());
+    }
+    if c.location.text.trim().is_empty() {
+        return Some("Project location is required.".into());
     }
     if PARTS.get(c.part).is_none() {
         return Some("Choose a default part.".into());
@@ -1420,10 +1438,134 @@ fn finish_create(s: &mut AppState) {
     let location = s.dialogs.create.location.text.trim().to_string();
     let top = s.dialogs.create.top.text.trim().to_string();
     let part = pick(PARTS, s.dialogs.create.part).to_string();
-    let top = if top.is_empty() { None } else { Some(top) };
-    s.reseed_for_new_project(name.clone(), location.clone(), part.clone(), top);
-    echo(s, format!("create_project {name} {location} -part {part}"));
-    s.dialogs.close();
+    match write_new_project(&s.dialogs.create, &name, &location, &part, &top) {
+        Ok(prj) => {
+            s.dialogs.close();
+            s.dialogs.create = CreateState::default();
+            // Opening resets the session (console included), so journal after.
+            crate::pickers::open_path(s, &prj);
+            echo(s, format!("create_project {name} {location} -part {part}"));
+        }
+        Err(e) => {
+            s.dialogs.create.step = CreateStep::Summary;
+            s.dialogs.create.error = Some(e);
+        }
+    }
+}
+
+/// Create `<location>/<name>/<name>.prj` listing the part, top, and the
+/// picked sources and constraints. Refuses to overwrite an existing project.
+fn write_new_project(
+    c: &CreateState,
+    name: &str,
+    location: &str,
+    part: &str,
+    top: &str,
+) -> Result<std::path::PathBuf, String> {
+    let dir = std::path::PathBuf::from(location).join(name);
+    let prj = dir.join(format!("{name}.prj"));
+    if prj.exists() {
+        return Err(format!("A project already exists at {}", prj.display()));
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Couldn't create {}: {e}", dir.display()))?;
+    let mut text = format!(
+        "# Helion project\ncreate_project {name} {}\npart {part}\n",
+        dir.display()
+    );
+    if !top.is_empty() {
+        text.push_str(&format!("top {top}\n"));
+    }
+    for f in &c.sources {
+        let verb = if f.to_ascii_lowercase().ends_with(".vhd")
+            || f.to_ascii_lowercase().ends_with(".vhdl")
+        {
+            "read_vhdl"
+        } else {
+            "read_sv"
+        };
+        text.push_str(&format!("{verb} {f}\n"));
+    }
+    for f in &c.constraints {
+        let verb = if f.to_ascii_lowercase().ends_with(".sdc") {
+            "read_sdc"
+        } else {
+            "read_xdc"
+        };
+        text.push_str(&format!("{verb} {f}\n"));
+    }
+    std::fs::write(&prj, text).map_err(|e| format!("Couldn't write {}: {e}", prj.display()))?;
+    Ok(prj)
+}
+
+/// A wizard file list with per-row remove, plus the Add Files button.
+fn wizard_files(
+    key: &'static str,
+    files: &[String],
+    constraints: bool,
+    empty: &'static str,
+    kit: &Kit,
+    t: &VivadoTheme,
+) -> El {
+    let mut list = col().key(key).w_full().gap(2.0);
+    if files.is_empty() {
+        list = list.child(dim_label(empty, t));
+    }
+    for (i, f) in files.iter().enumerate() {
+        let name = std::path::Path::new(f)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| f.clone());
+        list = list.child(
+            row()
+                .key(format!("{key}-{i}"))
+                .w_full()
+                .h(22.0)
+                .items_center()
+                .gap(6.0)
+                .child(ui_label(name.clone(), t))
+                .child(
+                    text(f.clone())
+                        .font(VivadoTheme::FONT_UI)
+                        .color(t.text_faint)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate_middle(),
+                )
+                .child(
+                    el().key(format!("{key}-remove-{i}"))
+                        .role("button")
+                        .label(format!("Remove {name}"))
+                        .focusable(true)
+                        .size(20.0, 20.0)
+                        .radius(3.0)
+                        .center()
+                        .hover(t.selection)
+                        .on_press(move |s: &mut AppState| {
+                            let l = if constraints {
+                                &mut s.dialogs.create.constraints
+                            } else {
+                                &mut s.dialogs.create.sources
+                            };
+                            if i < l.len() {
+                                l.remove(i);
+                            }
+                        })
+                        .child(dim_label("×", t)),
+                ),
+        );
+    }
+    col()
+        .w_full()
+        .gap(6.0)
+        .child(list)
+        .child(row().child(dlg_button_tx(
+            format!("{key}-add"),
+            "Add Files…",
+            false,
+            kit,
+            move |_: &mut AppState, tx: &mut Tx| crate::pickers::wizard_file(tx, constraints),
+        )))
 }
 
 /// One wizard-rail row: step number, title, current highlight.
@@ -1571,7 +1713,7 @@ fn create_page(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme, kit: &Kit) ->
                             text_field(
                                 "create-location",
                                 &c.location,
-                                "C:/EE214",
+                                "~/helion-projects",
                                 kit,
                                 |s: &mut AppState| &mut s.dialogs.create.location,
                             )
@@ -1590,43 +1732,34 @@ fn create_page(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme, kit: &Kit) ->
         }
         CreateStep::Sources => {
             page = page
+                .child(wizard_files(
+                    "create-sources",
+                    &c.sources,
+                    false,
+                    "No sources yet. You can also add them later.",
+                    kit,
+                    t,
+                ))
                 .child(field_row(
                     "Top module:",
                     WIZ_LABEL_W,
                     text_field(
                         "create-top",
                         &c.top,
-                        "project1_demo",
+                        "auto-detect",
                         kit,
                         |s: &mut AppState| &mut s.dialogs.create.top,
                     ),
                     t,
-                ))
-                .child(field_row(
-                    "Language:",
-                    WIZ_LABEL_W,
-                    value_box("Verilog", t).grow(1.0).min_w(0.0),
-                    t,
                 ));
         }
         CreateStep::Constraints => {
-            page = page.child(field_row(
-                "Constraint set:",
-                WIZ_LABEL_W,
-                pop_select(
-                    layer,
-                    kit,
-                    t,
-                    "create-constrs",
-                    "Constraint set",
-                    PopId::CreateConstrSet,
-                    pick(CONSTR_SETS, c.constr_set),
-                    &static_opts(CONSTR_SETS),
-                    pop == Some(PopId::CreateConstrSet),
-                    |s: &mut AppState, i| s.dialogs.create.constr_set = i,
-                )
-                .grow(1.0)
-                .min_w(0.0),
+            page = page.child(wizard_files(
+                "create-constraints",
+                &c.constraints,
+                true,
+                "No constraints yet. Without a clock, timing uses an implicit 10 ns clock.",
+                kit,
                 t,
             ));
         }
@@ -1682,7 +1815,36 @@ fn create_page(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme, kit: &Kit) ->
                     WIZ_LABEL_W,
                     value_box(pick(PARTS, c.part), t).grow(1.0).min_w(0.0),
                     t,
-                ));
+                ))
+                .child(field_row(
+                    "Sources:",
+                    WIZ_LABEL_W,
+                    value_box(&format!("{} file(s)", c.sources.len()), t)
+                        .grow(1.0)
+                        .min_w(0.0),
+                    t,
+                ))
+                .child(field_row(
+                    "Constraints:",
+                    WIZ_LABEL_W,
+                    value_box(&format!("{} file(s)", c.constraints.len()), t)
+                        .grow(1.0)
+                        .min_w(0.0),
+                    t,
+                ))
+                .child(
+                    dim_label(
+                        &format!(
+                            "Creates {}/{}/{}.prj",
+                            c.location.text.trim(),
+                            name,
+                            name
+                        ),
+                        t,
+                    )
+                    .key("create-summary-path")
+                    .truncate_middle(),
+                );
         }
     }
     page
@@ -2293,16 +2455,36 @@ fn add_sources_dialog(s: &AppState, t: &VivadoTheme, kit: &Kit, layer: &mut Vec<
                         crate::pickers::add_sources_kind(s.dialogs.add_sources.kind);
                     let files = s.dialogs.add_sources.files.clone();
                     if files.is_empty() {
-                        echo(s, "add_files".into());
-                    } else {
-                        let list = files
-                            .iter()
-                            .map(|f| format!("{{{f}}}"))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        echo(s, format!("add_files -fileset {fileset} {list}"));
+                        s.dialogs.close();
+                        return;
                     }
-                    s.dialogs.close();
+                    let set = match s.dialogs.add_sources.kind {
+                        1 => crate::project::FileSet::Constraints,
+                        2 => crate::project::FileSet::Simulation,
+                        _ => crate::project::FileSet::Design,
+                    };
+                    let paths: Vec<std::path::PathBuf> =
+                        files.iter().map(std::path::PathBuf::from).collect();
+                    let list = files
+                        .iter()
+                        .map(|f| format!("{{{f}}}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    match crate::project::commit_add_sources(s, &paths, set) {
+                        Ok((n, prj)) => {
+                            echo(s, format!("add_files -fileset {fileset} {list}"));
+                            let detail = match prj {
+                                Some(p) => format!("{n} file(s) · saved to {}", p.display()),
+                                None => format!("{n} file(s) added to {fileset}"),
+                            };
+                            s.toasts.push(ToastKind::Success, "Sources added", &detail);
+                            s.dialogs.add_sources.files.clear();
+                            s.dialogs.close();
+                        }
+                        Err(e) => {
+                            s.toasts.push(ToastKind::Error, "Add Sources failed", &e);
+                        }
+                    }
                 },
             ))
             .child(dlg_button(
@@ -2446,17 +2628,27 @@ mod tests {
             s.dialogs.create.name = TextEdit::new("proj2");
             s.dialogs.create.step = CreateStep::Summary;
         });
+        let name = format!("proj2_{}", std::process::id());
+        rt.state.dialogs.create.name = TextEdit::new(name.clone());
+        rt.invalidate();
+        rt.frame(0.05);
         tap(&mut rt, "create-finish");
-        assert_eq!(rt.state.dialogs.open, None);
-        assert_eq!(rt.state.project.name, "proj2");
-        let last = rt
-            .state
-            .console
-            .lines
-            .last()
-            .map(|l| l.text.clone())
-            .unwrap_or_default();
-        assert!(last.starts_with("create_project proj2"), "tcl: {last}");
+        assert_eq!(rt.state.dialogs.open, None, "{:?}", rt.state.dialogs.create.error);
+        assert_eq!(rt.state.project.name, name);
+        let prj = crate::pickers::default_projects_dir()
+            .join(&name)
+            .join(format!("{name}.prj"));
+        assert!(prj.is_file(), "project file must exist on disk");
+        assert_eq!(rt.state.runs.source.as_deref(), Some(prj.as_path()));
+        assert!(
+            rt.state
+                .console
+                .lines
+                .iter()
+                .any(|l| l.text.starts_with(&format!("create_project {name}"))),
+            "create journals its Tcl"
+        );
+        let _ = std::fs::remove_dir_all(prj.parent().unwrap());
     }
 
     #[test]
@@ -2608,8 +2800,15 @@ mod tests {
         assert_eq!(rt.state.status, StatusVerb::Ready);
         assert!(!rt.state.timing.has_run, "new project clears timing");
         assert!(
-            rt.state.toasts.items.is_empty(),
-            "new project clears toasts"
+            !rt.state
+                .toasts
+                .items
+                .iter()
+                .any(|t| t.title == "Implementation failed"),
+            "new project clears the old project's toasts"
+        );
+        let _ = std::fs::remove_dir_all(
+            crate::pickers::default_projects_dir().join("proj2"),
         );
         assert!(
             rt.state.nav_back.is_empty(),

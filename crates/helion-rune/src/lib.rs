@@ -15,8 +15,10 @@
 //! - `crates/rune/src/color.rs`: `color::hex` (used ONLY in [`theme`]).
 
 pub mod doctor;
+pub mod layout;
 pub mod live;
 pub mod pickers;
+pub mod project;
 pub mod runs;
 pub mod scenes;
 pub mod state;
@@ -500,8 +502,39 @@ fn seed_timing_fixture(s: &mut AppState) {
     s.timing.temp_c = 25;
 }
 
+/// Initial state for tests and headless scenes: the in-memory demo project,
+/// so snapshots never depend on the machine they render on.
 pub fn init() -> AppState {
     AppState::demo()
+}
+
+/// Initial state for an interactive launch: saved layout/theme/recents, then
+/// a project from `HELION_OPEN` or the first non-flag argument, else the
+/// Start page. `HELION_DEMO=1` boots the demo project instead.
+pub fn boot() -> AppState {
+    if std::env::var_os("HELION_DEMO").is_some() {
+        let mut s = init();
+        layout::load(&mut s);
+        return s;
+    }
+    let mut s = AppState::demo();
+    s.empty_project();
+    s.project.location.clear();
+    s.center = state::CenterPane::Start;
+    s.nav_back.clear();
+    layout::load(&mut s);
+    let arg = std::env::var_os("HELION_OPEN")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::args()
+                .skip(1)
+                .find(|a| !a.starts_with('-'))
+                .map(std::path::PathBuf::from)
+        });
+    if let Some(path) = arg {
+        pickers::open_path(&mut s, &path);
+    }
+    s
 }
 
 fn menu_bar(s: &AppState, t: &VivadoTheme) -> El {
@@ -536,6 +569,30 @@ fn status_bar(s: &AppState, t: &VivadoTheme) -> El {
     views::status::status_bar(s, t)
 }
 
+/// Middle band: Flow Navigator | Sources column | center pane, each dock
+/// shown per [`layout::LayoutState`]. The Sources column carries a drag
+/// splitter on its right edge; focus mode leaves the center pane alone.
+fn workspace(s: &AppState, t: &VivadoTheme) -> El {
+    // 6pt gutters throughout; the splitters *are* the gutters they sit in,
+    // so a resizable edge never adds extra space.
+    let mut band = row()
+        .key("workspace")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .padding(6.0)
+        .pb(if s.layout.console_visible() { 0.0 } else { 6.0 });
+    if s.layout.flow_visible() {
+        band = band.child(flow_rail(s, t)).child(el().w(6.0).h_full());
+    }
+    if s.layout.sources_visible() {
+        band = band
+            .child(sources_column(s, t))
+            .child(layout::sources_splitter(t));
+    }
+    band.child(center_pane(s, t))
+}
+
 /// Root view: Vivado shell skeleton (titlebar, menu, rail, summary, status).
 /// Full surfaces arrive per batch; this proves theme + state + scenes render.
 pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
@@ -567,24 +624,18 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
         )
         .child(menu_bar(s, &t))
         .child(views::chrome::icon_toolbar(s, &t))
-        .child(
-            row()
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .gap(6.0)
-                .padding(6.0)
-                .child(flow_rail(s, &t))
-                .child(sources_column(s, &t))
-                .child(center_pane(s, &t)),
-        )
-        .child(
-            el().w_full()
-                .px(6.0)
-                .pb(6.0)
-                .child(views::console::console_pane(s, &t)),
-        )
-        .child(status_bar(s, &t));
+        .child(workspace(s, &t));
+    if s.layout.console_visible() {
+        shell = shell
+            .child(layout::console_splitter(&t))
+            .child(
+                el().w_full()
+                    .px(6.0)
+                    .pb(6.0)
+                    .child(views::console::console_pane(s, &t)),
+            );
+    }
+    shell = shell.child(status_bar(s, &t));
     if let Some(overlay) = views::chrome::menu_overlay(s, &t) {
         shell = shell.child(overlay);
     }
@@ -594,6 +645,7 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
     views::status::push_toasts(&mut layer, s, &t);
     views::palette::push_palette(&mut layer, s, &t);
     views::palette::push_cheatsheet(&mut layer, s, &t);
+    views::chrome::push_about(&mut layer, s, &t);
     if layer.is_empty() {
         shell
     } else {
@@ -606,10 +658,15 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
 pub fn poll_all(s: &mut AppState, t: f64, tx: &mut rune::Tx) -> bool {
     let runs_dirty = runs::poll(s, t, tx);
     let sim_dirty = views::wave::poll(s, t, tx);
+    // Toasts expire on the poll clock; sleep until the next one is due.
+    let (toasts_dirty, next) = s.toasts.tick(t);
+    if let Some(secs) = next {
+        tx.wake_after(std::time::Duration::from_secs_f64(secs.max(0.05)));
+    }
     // Safety net: out-of-band buffer swaps (project reseed clears tabs)
     // re-mirror the live edit field; a no-op when already synced.
     views::editor::sync_edit(s);
-    runs_dirty || sim_dirty
+    runs_dirty || sim_dirty || toasts_dirty
 }
 
 pub fn app_spec() -> AppSpec<AppState> {

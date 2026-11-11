@@ -108,15 +108,23 @@ fn parent_dir(path: &Path) -> String {
         .unwrap_or_else(|| std::env::temp_dir().display().to_string())
 }
 
-/// Consume the Open answer: `.prj` parses through the real
-/// `helion_proj::load_prj` and reseeds the project; an HDL source loads its
-/// real contents into an editor tab. Cancel is silent; errors toast.
+/// Consume the Open answer. Cancel is silent; errors toast.
 fn apply_open_project(s: &mut AppState, result: FileDialogResult) {
-    let path = match result {
-        Err(e) => return fail(s, "Open Project", &e.to_string()),
-        Ok(None) => return,
-        Ok(Some(p)) => p,
-    };
+    match result {
+        Err(e) => fail(s, "Open Project", &e.to_string()),
+        Ok(None) => {}
+        Ok(Some(p)) => open_path(s, &p),
+    }
+}
+
+/// Open a project or HDL file from any entry point (file dialog, recent
+/// list, bundled example, command line).
+///
+/// A `.prj` parses through the real `helion_proj::load_prj`, replaces the
+/// open project, becomes the run input (so synthesis elaborates every
+/// project source with its constraints) and loads its sources into editor
+/// tabs. Any other file opens as an editor tab. Both land in the recent list.
+pub fn open_path(s: &mut AppState, path: &Path) {
     let verb = format!("open_project {}", path.display());
     let ext = path
         .extension()
@@ -124,25 +132,29 @@ fn apply_open_project(s: &mut AppState, result: FileDialogResult) {
         .unwrap_or("")
         .to_ascii_lowercase();
     if ext == "prj" {
-        let prj = match std::fs::read_to_string(&path)
+        let prj = match std::fs::read_to_string(path)
             .map_err(|e| e.to_string())
-            .and_then(|text| helion_proj::load_prj(&text))
+            .and_then(|text| load_prj_lenient(&text))
         {
             Err(e) => return fail(s, "Open Project", &format!("{}: {e}", path.display())),
             Ok(prj) => prj,
         };
-        let name = prj.project_name.clone().unwrap_or_else(|| stem(&path));
-        let location = prj.project_dir.clone().unwrap_or_else(|| parent_dir(&path));
+        let name = prj.project_name.clone().unwrap_or_else(|| stem(path));
+        let location = prj.project_dir.clone().unwrap_or_else(|| parent_dir(path));
+        s.empty_project();
         s.reseed_for_new_project(name.clone(), location, prj.part.clone(), prj.top.clone());
+        s.runs.source = Some(path.to_path_buf());
+        crate::project::load_from_prj(s, path, &prj);
         s.navigate(crate::state::CenterPane::Summary);
         echo(s, verb);
+        crate::layout::remember_project(s, &path.display().to_string());
         s.toasts.push(ToastKind::Success, "Project opened", &name);
     } else {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| stem(&path));
-        let text = match std::fs::read_to_string(&path) {
+            .unwrap_or_else(|| stem(path));
+        let text = match std::fs::read_to_string(path) {
             Err(e) => {
                 return fail(
                     s,
@@ -152,11 +164,126 @@ fn apply_open_project(s: &mut AppState, result: FileDialogResult) {
             }
             Ok(text) => text,
         };
-        crate::views::editor::open_file_tab(s, name.clone(), text, path);
+        if s.project.name.is_empty() {
+            // A bare HDL file with no project open becomes a one-file
+            // project so the flow, Sources and Summary have something real.
+            s.empty_project();
+            s.reseed_for_new_project(
+                stem(path),
+                parent_dir(path),
+                "HL10T-C32-1".into(),
+                None,
+            );
+            if crate::views::debug::is_rtl_source(&name) {
+                s.runs.source = Some(path.to_path_buf());
+            }
+        }
+        crate::project::add_file(s, path);
+        crate::views::editor::open_file_tab(s, name.clone(), text, path.to_path_buf());
         s.navigate(crate::state::CenterPane::Editor);
         echo(s, verb);
+        crate::layout::remember_project(s, &path.display().to_string());
         s.toasts.push(ToastKind::Success, "Opened", &name);
     }
+}
+
+/// New Project wizard: pick an RTL source (`constraints == false`) or a
+/// constraints file into the wizard's lists (deduped).
+pub fn wizard_file(tx: &mut Tx, constraints: bool) {
+    let (label, exts) = if constraints {
+        ("Constraints", CONSTRAINT_EXTENSIONS)
+    } else {
+        ("Design Sources", RTL_EXTENSIONS)
+    };
+    let options = FileDialogOptions {
+        title: format!("Add {label}"),
+        ..Default::default()
+    }
+    .filter(label, exts);
+    tx.open_file(options, move |s: &mut AppState, result, _| match result {
+        Err(e) => fail(s, "Add files", &e.to_string()),
+        Ok(None) => {}
+        Ok(Some(p)) => {
+            let p = p.display().to_string();
+            let list = if constraints {
+                &mut s.dialogs.create.constraints
+            } else {
+                &mut s.dialogs.create.sources
+            };
+            if !list.contains(&p) {
+                list.push(p);
+            }
+        }
+    });
+}
+
+/// Default parent folder for new projects (`~/helion-projects`; the temp
+/// dir in tests so they never write into the user's home).
+pub fn default_projects_dir() -> PathBuf {
+    if cfg!(test) {
+        return std::env::temp_dir().join("helion-rune-test-projects");
+    }
+    std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join("helion-projects"))
+        .unwrap_or_else(|| std::env::temp_dir().join("helion-projects"))
+}
+
+/// `helion_proj::load_prj`, except that a project with no sources yet (a
+/// fresh New Project) still opens: the IDE shows it empty and the flow
+/// reports "no sources" until some are added.
+pub fn load_prj_lenient(text: &str) -> Result<helion_proj::ProjectFile, String> {
+    match helion_proj::load_prj(text) {
+        Err(e) if e.contains("no sources") => {
+            let mut p = helion_proj::ProjectFile {
+                part: "HL10T-C32-1".into(),
+                ..Default::default()
+            };
+            for line in text.lines() {
+                let mut toks = line.split_whitespace();
+                match toks.next() {
+                    Some("part") => {
+                        if let Some(v) = toks.next() {
+                            p.part = v.into();
+                        }
+                    }
+                    Some("top") => p.top = toks.next().map(str::to_string),
+                    Some("create_project") => {
+                        let rest: Vec<&str> = toks.collect();
+                        let mut i = 0;
+                        while i < rest.len() {
+                            if rest[i] == "-part" && i + 1 < rest.len() {
+                                p.part = rest[i + 1].into();
+                                i += 2;
+                                continue;
+                            }
+                            if p.project_name.is_none() {
+                                p.project_name = Some(rest[i].into());
+                            } else if p.project_dir.is_none() {
+                                p.project_dir = Some(rest[i].into());
+                            }
+                            i += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(p)
+        }
+        other => other,
+    }
+}
+
+/// Close the open project and return to the Start page.
+pub fn close_project(s: &mut AppState) {
+    if s.project.name.is_empty() {
+        return;
+    }
+    let name = s.project.name.clone();
+    s.empty_project();
+    s.runs.source = None;
+    s.project_files = crate::project::ProjectFiles::default();
+    s.navigate(crate::state::CenterPane::Start);
+    echo(s, format!("close_project {name}"));
 }
 
 /// Raise the Add Sources picker for one [`ADD_SOURCES_KINDS`] entry.

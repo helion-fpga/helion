@@ -39,8 +39,6 @@ const TOOLBAR_H: f32 = 28.0;
 const LINE_H: f32 = 18.0;
 /// Gutter width: breakpoint slot plus 4-digit line numbers in the 12px mono face.
 const GUTTER_W: f32 = 58.0;
-/// Directory shown in the breadcrumb (matches the `rd-*.png` brief).
-const EDITOR_DIR: &str = "C:/EE214/project_1/project_1.srcs/sources_1/new";
 
 /// Verilog keywords painted in the theme keyword color.
 const VERILOG_KEYWORDS: &[&str] = &[
@@ -227,10 +225,94 @@ fn active_lines_mut(s: &mut AppState) -> &mut Vec<String> {
 /// tab's text before the active index moves, so routing never uses it).
 fn buffer_kind_for_tab(s: &AppState, i: usize) -> BufferKind {
     match s.editor.tabs.get(i).map(|t| t.as_str()) {
-        Some("project1_tb.v") => BufferKind::Tb,
-        Some(name) if name.ends_with(".xdc") => BufferKind::Xdc,
+        Some(name) if is_constraint_name(name) => BufferKind::Xdc,
+        Some(name) if crate::state::is_tb_name(name) => BufferKind::Tb,
         _ => BufferKind::Rtl,
     }
+}
+
+fn slot(kind: BufferKind) -> usize {
+    match kind {
+        BufferKind::Rtl => 0,
+        BufferKind::Xdc => 1,
+        BufferKind::Tb => 2,
+    }
+}
+
+/// Move a primary buffer (lines + undo/redo) out, leaving it empty.
+fn take_buffer(ed: &mut EditorState, kind: BufferKind) -> crate::state::ParkedBuffer {
+    use std::mem::take;
+    let (lines, undo, redo) = match kind {
+        BufferKind::Rtl => (&mut ed.lines, &mut ed.undo_stack, &mut ed.redo_stack),
+        BufferKind::Xdc => (&mut ed.xdc_lines, &mut ed.xdc_undo_stack, &mut ed.xdc_redo_stack),
+        BufferKind::Tb => (&mut ed.tb_lines, &mut ed.tb_undo_stack, &mut ed.tb_redo_stack),
+    };
+    crate::state::ParkedBuffer {
+        lines: take(lines),
+        undo: take(undo),
+        redo: take(redo),
+    }
+}
+
+fn put_buffer(ed: &mut EditorState, kind: BufferKind, buf: crate::state::ParkedBuffer) {
+    let (lines, undo, redo) = match kind {
+        BufferKind::Rtl => (&mut ed.lines, &mut ed.undo_stack, &mut ed.redo_stack),
+        BufferKind::Xdc => (&mut ed.xdc_lines, &mut ed.xdc_undo_stack, &mut ed.xdc_redo_stack),
+        BufferKind::Tb => (&mut ed.tb_lines, &mut ed.tb_undo_stack, &mut ed.tb_redo_stack),
+    };
+    *lines = buf.lines;
+    *undo = buf.undo;
+    *redo = buf.redo;
+}
+
+/// Make tab `i` own its kind's primary buffer: park the previous owner's
+/// lines and history, then restore tab `i`'s parked buffer (or start empty
+/// for a brand-new file; an unowned buffer is adopted as-is). Callers flush
+/// the live field first so the previous owner's typing is parked with it.
+fn claim_buffer(s: &mut AppState, i: usize) {
+    let Some(name) = s.editor.tabs.get(i).cloned() else {
+        return;
+    };
+    let kind = buffer_kind_for_tab(s, i);
+    let k = slot(kind);
+    if s.editor.owners[k].as_deref() == Some(name.as_str()) {
+        return;
+    }
+    let parked = s.editor.parked.remove(&name);
+    let prev = s.editor.owners[k].take();
+    if prev.is_some() || parked.is_some() {
+        let current = take_buffer(&mut s.editor, kind);
+        if let Some(prev) = prev
+            && s.editor.tabs.contains(&prev)
+        {
+            s.editor.parked.insert(prev, current);
+        }
+        if let Some(buf) = parked {
+            put_buffer(&mut s.editor, kind, buf);
+        }
+    }
+    s.editor.owners[k] = Some(name);
+}
+
+/// Forget tab `i`'s buffer before it closes: drop its parked copy, and if it
+/// owns a primary buffer, empty that buffer so no other file adopts it.
+fn release_buffer(s: &mut AppState, i: usize) {
+    let Some(name) = s.editor.tabs.get(i).cloned() else {
+        return;
+    };
+    s.editor.parked.remove(&name);
+    let kind = buffer_kind_for_tab(s, i);
+    let k = slot(kind);
+    if s.editor.owners[k].as_deref() == Some(name.as_str()) {
+        s.editor.owners[k] = None;
+        let _ = take_buffer(&mut s.editor, kind);
+    }
+}
+
+/// XDC/SDC constraint files share the constraints buffer and highlighter.
+pub fn is_constraint_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.ends_with(".xdc") || n.ends_with(".sdc")
 }
 
 /// Write the live field text back into the buffer it mirrors. Every action
@@ -279,6 +361,7 @@ pub fn sync_edit(s: &mut AppState) {
         return;
     }
     flush_edit(s);
+    claim_buffer(s, s.editor.active);
     let text = active_lines(s).join("\n");
     let at = s.editor.cursor_line;
     s.editor.edit = TextEdit::new(text);
@@ -412,6 +495,7 @@ pub fn open_file_tab(s: &mut AppState, name: String, text: String, path: std::pa
         s.editor.tabs.push(name.clone());
         s.editor.active = s.editor.tabs.len() - 1;
     }
+    claim_buffer(s, s.editor.active);
     let fresh: Vec<String> = text.lines().map(str::to_string).collect();
     s.editor.push_undo_active(active_is_xdc(s));
     *active_lines_mut(s) = fresh;
@@ -465,7 +549,7 @@ pub(crate) fn active_is_xdc(s: &AppState) -> bool {
     s.editor
         .tabs
         .get(s.editor.active)
-        .is_some_and(|t| t.ends_with(".xdc"))
+        .is_some_and(|t| is_constraint_name(t))
 }
 
 /// Lines of the active buffer (Verilog, XDC constraints, or testbench).
@@ -522,6 +606,7 @@ fn close_tab(s: &mut AppState, i: usize) {
         return;
     }
     flush_edit(s);
+    release_buffer(s, i);
     s.editor.tabs.remove(i);
     s.editor.edit_tab = None;
     s.editor.active = s.editor.active.min(s.editor.tabs.len().saturating_sub(1));
@@ -822,11 +907,16 @@ fn tab_strip(s: &AppState, t: &VivadoTheme) -> El {
 
 /// Full-path breadcrumb under the tabs, middle-truncated like Vivado.
 fn breadcrumb(s: &AppState, t: &VivadoTheme) -> El {
+    // The real disk path when the tab has one; unsaved buffers say so
+    // rather than inventing a location.
     let path = s
         .editor
         .tabs
         .get(s.editor.active)
-        .map(|name| format!("{EDITOR_DIR}/{name}"))
+        .map(|name| match s.editor.paths.get(name) {
+            Some(p) => p.display().to_string(),
+            None => format!("{name} — not saved to disk"),
+        })
         .unwrap_or_else(|| "(no open file)".into());
     row()
         .key("editor-path")

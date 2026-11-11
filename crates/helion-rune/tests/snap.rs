@@ -41,6 +41,10 @@ fn rt_for_env(scene: &str, system_dark: bool) -> Runtime<AppState> {
 
 fn tap(rt: &mut Runtime<AppState>, key: &str) {
     let (x, y) = rt.find(key).unwrap_or_else(|| panic!("missing key: {key}"));
+    // Move first, like a live pointer: a press teleported onto a tree that
+    // just changed (an overlay such as a toast mounting) lands on stale hover.
+    rt.pointer_move(x, y);
+    rt.frame(1.0 / 60.0);
     rt.pointer_down(x, y);
     rt.pointer_up(x, y);
     rt.frame(1.0 / 60.0);
@@ -360,15 +364,22 @@ fn schematic_select_zoom_and_cross_probe_sources() {
         "props must show the cell"
     );
     tap(&mut rt, "schematic-locate");
+    // The fixture's top (counter_top) is not declared by any demo project
+    // file: locate says so instead of selecting an unrelated file.
     assert_eq!(rt.state.sources.selected, SourceFileId::Demo);
     assert!(
         rt.state
-            .console
-            .lines
+            .toasts
+            .items
             .iter()
-            .any(|l| l.text == "select_objects [get_files project1_demo.v]"),
-        "locate must echo its Tcl verb"
+            .any(|t| t.title == "Not in project sources"),
+        "locate must report that no project file declares the top"
     );
+    // Let the toast's entrance settle on the clock (the helper's frames all
+    // run at the same instant) before the next press.
+    for i in 0..20 {
+        rt.frame(0.1 + i as f64 * 0.05);
+    }
     tap(&mut rt, "schematic-hier-u-led");
     assert_eq!(
         rt.state.schematic.selected,
@@ -433,11 +444,11 @@ fn device_select_layers_find_and_locate() {
     assert_eq!(rt.state.sources.selected, SourceFileId::Demo);
     assert!(
         rt.state
-            .console
-            .lines
+            .toasts
+            .items
             .iter()
-            .any(|l| l.text == "select_objects [get_files project1_demo.v]"),
-        "locate must echo its Tcl verb"
+            .any(|t| t.title == "Not in project sources"),
+        "locate must report that no project file declares the top"
     );
     tap(&mut rt, "device-find-toggle");
     assert!(
@@ -748,8 +759,9 @@ fn flow_menu_runs_flip_and_opens_navigate() {
     tap(&mut rt, "menu-flow-item0");
     assert_eq!(rt.state.flow.synth, RunStatus::Running);
     let mut rt = rt_for("summary");
+    // Synth, Impl, Bitstream, rule, Run Simulation, rule, Open Elaborated (6).
     tap(&mut rt, "menu-flow");
-    tap(&mut rt, "menu-flow-item4");
+    tap(&mut rt, "menu-flow-item6");
     assert_eq!(
         rt.state.center,
         CenterPane::Schematic,
@@ -760,8 +772,9 @@ fn flow_menu_runs_flip_and_opens_navigate() {
 #[test]
 fn view_menu_switches_center_panes() {
     let mut rt = rt_for("summary");
+    // Start, Summary, rule, Editor (3), Schematic (4), ...
     tap(&mut rt, "menu-view");
-    tap(&mut rt, "menu-view-item1");
+    tap(&mut rt, "menu-view-item3");
     assert_eq!(
         rt.state.center,
         CenterPane::Editor,
@@ -769,7 +782,7 @@ fn view_menu_switches_center_panes() {
     );
     let mut rt = rt_for("summary");
     tap(&mut rt, "menu-view");
-    tap(&mut rt, "menu-view-item3");
+    tap(&mut rt, "menu-view-item4");
     assert_eq!(
         rt.state.center,
         CenterPane::Schematic,
@@ -781,13 +794,15 @@ fn view_menu_switches_center_panes() {
 fn window_menu_switches_console_tabs() {
     use helion_rune::views::console::ConsoleTab;
     let mut rt = rt_for("summary");
+    // Dock toggles (0-3), rule, CONSOLE caption, then Tcl (6), Messages (7),
+    // Log, Reports, Design Runs (10).
     tap(&mut rt, "menu-window");
-    tap(&mut rt, "menu-window-item1");
+    tap(&mut rt, "menu-window-item7");
     assert_eq!(rt.state.console.tab, ConsoleTab::Messages);
     assert!(rt.find("console-messages").is_some());
     let mut rt = rt_for("summary");
     tap(&mut rt, "menu-window");
-    tap(&mut rt, "menu-window-item4");
+    tap(&mut rt, "menu-window-item10");
     assert_eq!(rt.state.console.tab, ConsoleTab::DesignRuns);
 }
 
@@ -858,8 +873,8 @@ fn toolbar_save_undo_redo_act() {
             .console
             .lines
             .iter()
-            .any(|l| l.text == "save_project" || l.text == "save_file"),
-        "save must echo"
+            .any(|l| l.text.starts_with("save_file ")),
+        "toolbar save must write the file and journal its path"
     );
 }
 
@@ -1187,3 +1202,4 @@ fn xdc_wizard_finish_round_trips_review_content_to_disk() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
