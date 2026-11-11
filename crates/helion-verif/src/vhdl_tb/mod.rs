@@ -101,6 +101,21 @@ pub fn parse_vhdl_testbench(file: &str, src: &str) -> Result<TbProgram, TbError>
             }
         }
     }
+    // Time constants (`constant CLK_PERIOD : time := 10 ns;`) for clock
+    // half-period detection.
+    let mut times: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for d in &arch.decls {
+        if let ast::Decl::Object { class: ast::ObjClass::Constant, names, init: Some(Expr::Time(fs)), .. } = d {
+            for n in names {
+                times.insert(n.clone(), *fs);
+            }
+        }
+    }
+    let time_of = |e: &Expr| match e {
+        Expr::Time(fs) => Some(*fs),
+        Expr::Name(n) => times.get(n).copied(),
+        _ => None,
+    };
     for c in &arch.stmts {
         match c {
             Concurrent::Instance { label, unit, ports, .. } if prog.dut_module.is_empty() => {
@@ -117,12 +132,11 @@ pub fn parse_vhdl_testbench(file: &str, src: &str) -> Result<TbProgram, TbError>
                 if let Some((Expr::Unary(ast::UnOp::Not, inner), Some(after))) = arms[0].0.elems.first() {
                     if matches!(&**inner, Expr::Name(n) if n == t) {
                         let half = match after {
-                            Expr::Time(fs) => Some(*fs),
-                            Expr::Binary(ast::BinOp::Div, a, b) => match (&**a, &**b) {
-                                (Expr::Time(fs), Expr::Int(d)) if *d != 0 => Some(fs / d),
+                            Expr::Binary(ast::BinOp::Div, a, b) => match (time_of(a), &**b) {
+                                (Some(fs), Expr::Int(d)) if *d != 0 => Some(fs / d),
                                 _ => None,
                             },
-                            _ => None,
+                            other => time_of(other),
                         };
                         if let Some(h) = half {
                             prog.clocks.push(ClockGen { sig: t.clone(), half_period_units: (h / value::FS_PER_NS).max(1) as u64, line: *line });

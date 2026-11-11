@@ -110,6 +110,16 @@ pub fn discover_testbenches(dir: &Path) -> Vec<TbFile> {
             });
         }
     }
+    // `counter_tb.sv` and `counter_tb.vhd` side by side: show the file
+    // name so the two runs are distinguishable.
+    let stems: Vec<String> = out.iter().map(|t| t.name.clone()).collect();
+    for t in &mut out {
+        if stems.iter().filter(|s| **s == t.name).count() > 1 {
+            if let Some(f) = t.path.file_name().and_then(|f| f.to_str()) {
+                t.name = f.to_string();
+            }
+        }
+    }
     out.sort_by(|a, b| a.name.cmp(&b.name).then(a.path.cmp(&b.path)));
     out
 }
