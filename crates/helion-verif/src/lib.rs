@@ -9,6 +9,9 @@
 //!   `tb_*.sv`), the stimulus-subset parser, DUT lookup, the interpreter that
 //!   drives `helion-sim` (`$display`/`assert`/`$error`/`$fatal`), VCD/log
 //!   writing, and the persisted run history.
+//! - [`vhdl_tb`]: the behavioral VHDL simulator behind `*_tb.vhd`
+//!   testbenches (event-driven kernel with delta cycles; DUTs run
+//!   behaviorally or as helion-sim netlists) producing the same outcome.
 //! - [`wave`]: waveform display math (fixed-point `Qm.n`, analog Y
 //!   mapping, LSB-first virtual-bus packing) and the SPI / UART / AXI-Lite /
 //!   FSM protocol decoders behind the viewer's decoded lanes. The display
@@ -26,4 +29,5 @@
 
 pub mod ila;
 pub mod tb;
+pub mod vhdl_tb;
 pub mod wave;
