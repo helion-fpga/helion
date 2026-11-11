@@ -214,6 +214,8 @@ fn is_kw(s: &str) -> bool {
             | "assert"
             | "posedge"
             | "negedge"
+            | "randcase"
+            | "endcase"
     )
 }
 
@@ -654,6 +656,8 @@ pub enum Expr {
     Un(UnOp, Box<Expr>),
     Bin(BinOp, Box<Expr>, Box<Expr>),
     Time,
+    /// `$urandom` / `$random` (no range) or `$urandom_range(max, min)`.
+    Urandom { max: Option<Box<Expr>>, min: Option<Box<Expr>> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -691,6 +695,9 @@ pub enum Stmt {
     Assert { cond: Expr, task: SysTask, fmt: String, args: Vec<Expr>, line: usize },
     If { cond: Expr, then_b: Vec<Stmt>, else_b: Vec<Stmt>, line: usize },
     Repeat { count: Expr, body: Vec<Stmt>, line: usize },
+    /// `randcase w: stmt; … endcase` — one arm, picked with probability
+    /// weight / total weight.
+    RandCase { arms: Vec<(Expr, Vec<Stmt>)>, line: usize },
     Finish { line: usize },
 }
 
@@ -1085,6 +1092,22 @@ impl<'a> Parser<'a> {
             };
             return Ok(Stmt::If { cond, then_b, else_b, line });
         }
+        if self.eat_kw("randcase") {
+            let mut arms = Vec::new();
+            while !self.eat_kw("endcase") {
+                if self.peek().is_none() {
+                    return Err(self.err("randcase without endcase"));
+                }
+                let w = self.parse_expr()?;
+                self.expect(&Tok::Colon)?;
+                let body = vec![self.parse_stmt()?];
+                arms.push((w, body));
+            }
+            if arms.is_empty() {
+                return Err(self.err_at(self.pos.saturating_sub(1), "randcase has no items"));
+            }
+            return Ok(Stmt::RandCase { arms, line });
+        }
         if self.eat_kw("repeat") {
             self.expect(&Tok::LParen)?;
             let count = self.parse_expr()?;
@@ -1328,6 +1351,29 @@ impl<'a> Parser<'a> {
                         if s == "$time" {
                             return Ok(Expr::Time);
                         }
+                        if s == "$urandom" || s == "$random" {
+                            // Optional `()` / `(seed)`; the run seed governs.
+                            if self.peek() == Some(&Tok::LParen) {
+                                self.pos += 1;
+                                if self.peek() != Some(&Tok::RParen) {
+                                    let _ = self.parse_expr()?;
+                                }
+                                self.expect(&Tok::RParen)?;
+                            }
+                            return Ok(Expr::Urandom { max: None, min: None });
+                        }
+                        if s == "$urandom_range" {
+                            self.expect(&Tok::LParen)?;
+                            let max = self.parse_expr()?;
+                            let min = if self.peek() == Some(&Tok::Comma) {
+                                self.pos += 1;
+                                Some(Box::new(self.parse_expr()?))
+                            } else {
+                                None
+                            };
+                            self.expect(&Tok::RParen)?;
+                            return Ok(Expr::Urandom { max: Some(Box::new(max)), min });
+                        }
                         if is_kw(&s) {
                             return Err(self.err_at(
                                 self.pos - 1,
@@ -1391,7 +1437,7 @@ pub fn find_dut_source(dir: &Path, dut: &str) -> Result<PathBuf, TbError> {
             .and_then(|x| x.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        if ext != "sv" && ext != "v" {
+        if !matches!(ext.as_str(), "sv" | "v" | "vhd" | "vhdl") {
             continue;
         }
         if is_testbench_file(&p) {
@@ -1402,7 +1448,10 @@ pub fn find_dut_source(dir: &Path, dut: &str) -> Result<PathBuf, TbError> {
     cands.sort();
     for p in &cands {
         let text = std::fs::read_to_string(p).unwrap_or_default();
-        if module_declared(&text, dut) {
+        let vhdl = p
+            .extension()
+            .is_some_and(|e| matches!(e.to_string_lossy().to_ascii_lowercase().as_str(), "vhd" | "vhdl"));
+        if (vhdl && entity_declared(&text, dut)) || (!vhdl && module_declared(&text, dut)) {
             return Ok(p.clone());
         }
     }
@@ -1411,10 +1460,22 @@ pub fn find_dut_source(dir: &Path, dut: &str) -> Result<PathBuf, TbError> {
         0,
         format!(
             "DUT module `{dut}` not found: put its synthesizable .sv/.v \
-             (with `module {dut}`) in {}",
+             (with `module {dut}`) or .vhd (with `entity {dut} is`) in {}",
             dir.display()
         ),
     ))
+}
+
+/// True when VHDL `text` declares `entity <name> is` (case-insensitive,
+/// `--` comments skipped).
+fn entity_declared(text: &str, name: &str) -> bool {
+    text.lines().any(|line| {
+        let l = line.split("--").next().unwrap_or("").trim().to_ascii_lowercase();
+        let mut w = l.split_whitespace();
+        w.next() == Some("entity")
+            && w.next() == Some(name.to_ascii_lowercase().as_str())
+            && w.next() == Some("is")
+    })
 }
 
 /// True when `text` declares `module <name>` outside comments.
@@ -1518,6 +1579,8 @@ pub struct TbRunConfig {
     pub tb_path: PathBuf,
     pub vcd: bool,
     pub max_units: u64,
+    /// Seed of `$urandom` / `$urandom_range` / `randcase` (run-reproducible).
+    pub seed: u64,
     /// Set by the UI thread to stop an in-flight run (`tb_stop`).
     pub cancel: Option<Arc<AtomicBool>>,
 }
@@ -1528,6 +1591,7 @@ impl TbRunConfig {
             tb_path,
             vcd: false,
             max_units: TB_DEFAULT_MAX_UNITS,
+            seed: 1,
             cancel: None,
         }
     }
@@ -1613,6 +1677,7 @@ fn stmt_line(s: &Stmt) -> usize {
         | Stmt::Assert { line, .. }
         | Stmt::If { line, .. }
         | Stmt::Repeat { line, .. }
+        | Stmt::RandCase { line, .. }
         | Stmt::Finish { line } => *line,
     }
 }
@@ -1631,6 +1696,11 @@ fn collect_lines(stmts: &[Stmt], out: &mut std::collections::BTreeMap<usize, u64
                 branches.push(TbBranchCov { line: *line, kind: "assert", true_hits: 0, false_hits: 0 });
             }
             Stmt::Repeat { body, .. } => collect_lines(body, out, branches),
+            Stmt::RandCase { arms, .. } => {
+                for (_, b) in arms {
+                    collect_lines(b, out, branches);
+                }
+            }
             _ => {}
         }
     }
@@ -1720,6 +1790,8 @@ struct Interp<'a> {
     line_hits: std::collections::BTreeMap<usize, u64>,
     /// `(line, condition)` outcomes of `if` / `assert`.
     branch_hits: HashMap<usize, (u64, u64)>,
+    /// SplitMix64 state behind `$urandom` and `randcase`.
+    rng: std::cell::Cell<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -1878,10 +1950,31 @@ impl<'a> Interp<'a> {
         Ok((val, w, has_x))
     }
 
+    /// Next 32-bit pseudo-random value (SplitMix64, seeded per run).
+    fn urandom(&self) -> u64 {
+        let mut z = self.rng.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
+        self.rng.set(z);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (z ^ (z >> 31)) & 0xFFFF_FFFF
+    }
+
     fn eval(&self, e: &Expr) -> Result<(u64, u32, bool), TbError> {
         match e {
             Expr::Num(v, w) => Ok((*v, *w, false)),
             Expr::Time => Ok((self.time_ns(), 32, false)),
+            Expr::Urandom { max: None, .. } => Ok((self.urandom(), 32, false)),
+            Expr::Urandom { max: Some(hi), min } => {
+                let (a, _, _) = self.eval(hi)?;
+                let b = match min {
+                    Some(m) => self.eval(m)?.0,
+                    None => 0,
+                };
+                // IEEE 1800: the bounds may come in either order.
+                let (lo, hi) = (a.min(b), a.max(b));
+                let span = hi - lo + 1;
+                Ok((lo + self.urandom() % span.max(1), 32, false))
+            }
             Expr::Sig(n) => self.resolve(n),
             Expr::Bit(n, idx) => {
                 let (v, _, x) = self.resolve(n)?;
@@ -2170,6 +2263,25 @@ impl<'a> Interp<'a> {
                 let branch = if v != 0 { then_b } else { else_b };
                 self.stack.push(Frame::Stmts { stmts: branch, pc: 0 });
             }
+            Stmt::RandCase { arms, line } => {
+                let mut weights = Vec::with_capacity(arms.len());
+                for (w, _) in &arms {
+                    weights.push(self.eval(w)?.0);
+                }
+                let total: u64 = weights.iter().sum();
+                if total == 0 {
+                    self.log_warn(format!("line {line}: randcase: every weight is zero, no item runs"));
+                } else {
+                    let mut pick = self.urandom() % total;
+                    for ((_, body), w) in arms.into_iter().zip(weights) {
+                        if pick < w {
+                            self.stack.push(Frame::Stmts { stmts: body, pc: 0 });
+                            break;
+                        }
+                        pick -= w;
+                    }
+                }
+            }
             Stmt::Repeat { count, body, line } => {
                 let (n, _, _) = self.eval(&count)?;
                 if n > 100_000_000 {
@@ -2375,8 +2487,17 @@ pub fn run_testbench(
 
     let dut_path = find_dut_source(&tb_dir, &prog.dut_module)?;
     let dut_label = dut_path.to_string_lossy().into_owned();
-    let design = helion_sv::synth_sv_path(&dut_path)
-        .map_err(|e| TbError::new(&dut_label, 0, format!("synthesis failed: {e}")))?;
+    let is_vhdl = dut_path
+        .extension()
+        .is_some_and(|e| matches!(e.to_string_lossy().to_ascii_lowercase().as_str(), "vhd" | "vhdl"));
+    let design = if is_vhdl {
+        // Mixed language: SV stimulus driving a VHDL DUT (helion-vhdl
+        // elaborates it to the same netlist the SV path produces).
+        helion_vhdl::synth_vhdl_path(&dut_path)
+    } else {
+        helion_sv::synth_sv_path(&dut_path)
+    }
+    .map_err(|e| TbError::new(&dut_label, 0, format!("synthesis failed: {e}")))?;
     let sim = helion_sim::Sim::new(&design);
 
     let dut_inputs: std::collections::HashSet<String> =
@@ -2499,6 +2620,7 @@ pub fn run_testbench(
         posedge_count: 0,
         line_hits: std::collections::BTreeMap::new(),
         branch_hits: HashMap::new(),
+        rng: std::cell::Cell::new(cfg.seed),
     };
 
     // Time-0 initializers (constant expressions only).
@@ -3149,6 +3271,37 @@ mod tests {
         assert!(c.summary_line().starts_with("coverage tb_lines="));
     }
 
+    #[test]
+    fn urandom_and_randcase_are_seeded_and_weighted() {
+        let dir = tmp_dir("rand");
+        write_file(&dir, "and_dut.sv", AND_DUT);
+        let tb = write_file(
+            &dir,
+            "and_dut_tb.sv",
+            "module and_dut_tb;\n    logic clk;\n    logic a;\n    logic b;\n    logic y;\n    logic [7:0] r;\n    logic [7:0] hits;\n    and_dut dut (.clk(clk), .a(a), .b(b), .y(y));\n    always #5 clk = ~clk;\n    initial begin\n        hits = 0;\n        repeat (20) begin\n            r = $urandom_range(9, 3);\n            assert (r >= 3) else $error(\"low %0d\", r);\n            assert (r <= 9) else $error(\"high %0d\", r);\n            randcase\n                0 : hits = hits + 100;\n                1 : hits = hits + 1;\n            endcase\n        end\n        a = $urandom;\n        $display(\"hits=%0d\", hits);\n        assert (hits == 20) else $error(\"zero-weight arm ran\");\n        $finish;\n    end\nendmodule\n",
+        );
+        let out = run_testbench(&TbRunConfig::new(tb.clone()), None).unwrap();
+        assert!(out.passed, "{:?}", out.failures);
+        let mut cfg = TbRunConfig::new(tb);
+        cfg.seed = 7;
+        let out2 = run_testbench(&cfg, None).unwrap();
+        assert!(out2.passed);
+    }
+
+    #[test]
+    fn sv_testbench_drives_a_vhdl_dut() {
+        let dir = tmp_dir("vhdl_dut");
+        write_file(
+            &dir,
+            "and_dut.vhd",
+            "library ieee;\nuse ieee.std_logic_1164.all;\nentity and_dut is\n  port (clk : in std_logic; a : in std_logic; b : in std_logic; y : out std_logic);\nend entity;\narchitecture rtl of and_dut is\n  signal q : std_logic := '0';\nbegin\n  process (clk) begin\n    if rising_edge(clk) then q <= a and b; end if;\n  end process;\n  y <= q;\nend architecture;\n",
+        );
+        let tb = write_file(&dir, "and_dut_tb.sv", AND_TB_PASS);
+        let out = run_testbench(&TbRunConfig::new(tb), None).unwrap();
+        assert!(out.coverage.dut_file.extension().is_some_and(|e| e == "vhd"));
+        assert!(out.passed, "{:?} {:?}", out.failures, out.log.iter().map(|l| &l.text).collect::<Vec<_>>());
+    }
+
     fn tmp_dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("helion_tb_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -3285,7 +3438,7 @@ endmodule
         write_file(&d, "and_dut.sv", AND_DUT);
         let tb = write_file(&d, "and_dut_tb.sv", AND_TB_PASS);
         let (tx, rx) = mpsc::channel();
-        let cfg = TbRunConfig { tb_path: tb, vcd: true, max_units: TB_DEFAULT_MAX_UNITS, cancel: None };
+        let cfg = TbRunConfig { tb_path: tb, vcd: true, max_units: TB_DEFAULT_MAX_UNITS, seed: 1, cancel: None };
         let out = run_testbench(&cfg, Some(&tx)).unwrap();
         assert!(out.passed, "failures: {:?}", out.failures);
         assert!(out.failures.is_empty());
@@ -3361,6 +3514,7 @@ endmodule
             tb_path: tb,
             vcd: false,
             max_units: TB_DEFAULT_MAX_UNITS,
+            seed: 1,
             cancel: Some(cancel),
         };
         let out = run_testbench(&cfg, None).unwrap();
@@ -3388,7 +3542,7 @@ endmodule
             "and_dut_tb.sv",
             "module and_dut_tb;\nlogic clk;\nand_dut dut (.clk(clk), .a(clk), .b(clk), .y(clk));\nalways #5 clk = ~clk;\ninitial begin\n#100000000;\n$finish;\nend\nendmodule\n",
         );
-        let cfg = TbRunConfig { tb_path: tb, vcd: false, max_units: 100, cancel: None };
+        let cfg = TbRunConfig { tb_path: tb, vcd: false, max_units: 100, seed: 1, cancel: None };
         let e = run_testbench(&cfg, None).unwrap_err();
         assert!(e.msg.contains("timed out"), "{e}");
     }

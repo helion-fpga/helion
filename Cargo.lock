@@ -2011,6 +2011,8 @@ dependencies = [
  "helion-vhdl",
  "rune",
  "rune-kit",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2070,6 +2072,7 @@ dependencies = [
  "helion-ir",
  "helion-sim",
  "helion-sv",
+ "helion-vhdl",
  "serde",
  "serde_json",
 ]
