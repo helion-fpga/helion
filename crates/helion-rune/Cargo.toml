@@ -27,3 +27,5 @@ helion-sta = { path = "../helion-sta" }
 helion-sv = { path = "../helion-sv" }
 helion-vhdl = { path = "../helion-vhdl" }
 helion-sim = { path = "../helion-sim" }
+# ILA capture + testbench runner engines (UI-free; extracted from helion-gui).
+helion-verif = { path = "../helion-verif" }

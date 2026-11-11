@@ -2000,6 +2000,7 @@ dependencies = [
  "helion-sim",
  "helion-sta",
  "helion-sv",
+ "helion-verif",
  "helion-vhdl",
  "rune",
  "rune-kit",
@@ -2052,6 +2053,17 @@ dependencies = [
  "rayon",
  "sv-parser",
  "varisat",
+]
+
+[[package]]
+name = "helion-verif"
+version = "3.0.0"
+dependencies = [
+ "helion-ir",
+ "helion-sim",
+ "helion-sv",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
