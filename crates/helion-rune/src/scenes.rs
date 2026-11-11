@@ -138,6 +138,38 @@ pub const ALL: &[SceneExpect] = &[
         absent: &["summary", "timing-pane", "start-page"],
     },
     SceneExpect {
+        name: "editor-outline",
+        surface: "editor",
+        keys: &[
+            "editor-outline",
+            "editor-outline-head",
+            "editor-outline-count",
+            "editor-sym-0",
+            "editor-field",
+            "editor-tool-outline",
+            "editor-tool-definition",
+        ],
+        absent: &["editor-rows", "summary"],
+    },
+    SceneExpect {
+        name: "editor-diagnostics",
+        surface: "editor",
+        keys: &[
+            "editor-diag-count",
+            "editor-tick-0",
+            "editor-find-case",
+            "editor-tool-bookmark",
+            "editor-tool-next-bookmark",
+        ],
+        absent: &["editor-rows", "summary"],
+    },
+    SceneExpect {
+        name: "editor-large",
+        surface: "editor",
+        keys: &["editor-scroll", "editor-row-0", "editor-gutter-0", "editor-outline"],
+        absent: &["editor-field", "summary"],
+    },
+    SceneExpect {
         name: "console",
         surface: "console",
         keys: &[
@@ -435,10 +467,53 @@ pub const ALL: &[SceneExpect] = &[
             "xdc-sdc",
             "xdc-sdc-0",
             "xdc-finish",
-            "xdc-export-row",
+            "xdc-actions",
             "xdc-export",
+            "xdc-write",
+            "xdc-rerun",
         ],
         absent: &["settings-dialog", "create-split"],
+    },
+    SceneExpect {
+        name: "xdc-wizard-clocks",
+        surface: "dialogs",
+        keys: &[
+            "xdc-split",
+            "xdc-clk-table",
+            "xdc-clk-add",
+            "xdc-gen-table",
+            "xdc-gen-add",
+            "xdc-known-clocks",
+        ],
+        absent: &["xdc-no-design", "xdc-sdc", "settings-dialog"],
+    },
+    SceneExpect {
+        name: "xdc-wizard-delays",
+        surface: "dialogs",
+        keys: &["xdc-in-table", "xdc-in-add", "xdc-in-head"],
+        absent: &["xdc-clk-table", "xdc-no-design"],
+    },
+    SceneExpect {
+        name: "xdc-wizard-exceptions",
+        surface: "dialogs",
+        keys: &["xdc-fp-table", "xdc-md-table", "xdc-fp-add", "xdc-md-add"],
+        absent: &["xdc-clk-table", "xdc-no-design"],
+    },
+    SceneExpect {
+        name: "xdc-wizard-review",
+        surface: "dialogs",
+        keys: &[
+            "xdc-sdc",
+            "xdc-sdc-parse",
+            "xdc-target",
+            "xdc-write",
+            "xdc-rerun",
+            "xdc-timing",
+            "xdc-wns-before",
+            "xdc-wns-after",
+            "xdc-written",
+        ],
+        absent: &["xdc-review-issues", "settings-dialog"],
     },
     SceneExpect {
         name: "add-sources",
@@ -1617,4 +1692,110 @@ pub fn state_for(name: &str) -> Option<AppState> {
 /// matches the catalog so `--scene` coverage never drifts.
 pub fn spec_names() -> Vec<&'static str> {
     crate::SCENES.iter().map(|(n, _)| *n).collect()
+}
+
+// ---- scene/test fixtures (never used by production paths) ----
+
+/// Fixture RTL for the Constraints Wizard scenes: a clock, a reset, a
+/// two-bit switch bus and a strobe in; LEDs and a serial bit out.
+const WIZARD_RTL: &str = "module wiz_top(input logic clk, input logic rst, \
+input logic [1:0] sw, input logic start, output logic tx, output logic [3:0] led);\n\
+logic [3:0] q;\n\
+always_ff @(posedge clk) if (rst) q <= 4'd0; else if (start) q <= q + {2'b00, sw};\n\
+assign led = q;\n\
+assign tx = q[0] ^ sw[1];\n\
+endmodule\n";
+
+/// Give the wizard a real synthesized design (live design of a run).
+pub fn xdc_wizard_design(s: &mut AppState) {
+    if let Ok(d) = helion_sv::synth_sv(WIZARD_RTL, "wiz_top.sv") {
+        s.runs.live_design = Some(d);
+    }
+}
+
+/// Representative wizard rows over the fixture design: a primary clock, a
+/// generated clock, input/output delays, a false path and a max delay.
+pub fn xdc_wizard_rows(s: &mut AppState) {
+    xdc_wizard_rows_for(s, "clk_sys", "clk", 8.0);
+    let w = &mut s.dialogs.xdc;
+    w.add_generated("clk_div2", "clk_sys", "q_reg/Q", "2");
+}
+
+/// Wizard rows for any design: clock `name` on `port` at `period_ns`, then
+/// one delay per direction, a false path and a max delay over the design's
+/// first other input and first output.
+pub fn xdc_wizard_rows_for(s: &mut AppState, name: &str, port: &str, period_ns: f64) {
+    let ctx = crate::views::xdc_wizard::Ctx::from_state(s);
+    let ports = ctx.ports.clone().unwrap_or_default();
+    let input = ports
+        .iter()
+        .find(|(n, d)| n != port && *d == helion_ir::PortDir::In)
+        .map(|(n, _)| n.clone())
+        .unwrap_or_default();
+    let output = ports
+        .iter()
+        .find(|(_, d)| *d == helion_ir::PortDir::Out)
+        .map(|(n, _)| n.clone())
+        .unwrap_or_default();
+    let w = &mut s.dialogs.xdc;
+    w.add_clock(name, port, &format!("{period_ns:.3}"), "50");
+    w.add_delay(false, &input, name, "0.500", "1.500");
+    w.add_delay(true, &output, name, "", "2.000");
+    w.add_false_path(&input, false, name, true);
+    w.add_max_delay(&input, &output, "6.000", true);
+}
+
+/// Review step after a real write into a temp project directory, with a
+/// recorded before/after WNS (fixture numbers for the snapshot).
+pub fn xdc_wizard_review(s: &mut AppState) {
+    xdc_wizard_design(s);
+    xdc_wizard_rows(s);
+    let dir = std::env::temp_dir().join("helion-rune-scene-xdc");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+    s.project.location = dir.display().to_string();
+    s.dialogs.open(crate::views::dialogs::DialogId::Constraints);
+    s.dialogs.xdc.step = crate::views::xdc_wizard::XdcStep::Review;
+    s.dialogs.xdc.visited = 4;
+    if crate::views::xdc_wizard::write_to_target(s).is_ok() {
+        s.dialogs.xdc.timing = Some(crate::views::xdc_wizard::TimingOutcome::Done {
+            before: Some(-412),
+            after: Some(138),
+        });
+    }
+    s.toasts.items.clear();
+}
+
+/// Editor with a real sv-parser error in the demo buffer (diagnostics as the
+/// worker would leave them), a bookmark, and case-insensitive find.
+pub fn editor_diagnostics(s: &mut AppState) {
+    s.center = crate::state::CenterPane::Editor;
+    crate::views::editor::sync_edit(s);
+    let mut text = s.editor.edit.text.clone();
+    if let Some(at) = text.find("reg divclk = 1'b0;") {
+        // Drop the semicolon: the next line is where sv-parser stops.
+        text.replace_range(at + 17..at + 18, "");
+    }
+    s.editor.lines = text.lines().map(str::to_string).collect();
+    s.editor.edit = rune::TextEdit::new(text.clone());
+    let tab = s.editor.tabs[s.editor.active].clone();
+    s.editor.diag.items = crate::views::editor_diag::compute(&text, &tab);
+    s.editor.diag.key = Some((tab, crate::views::editor_scale::fingerprint(&text)));
+    crate::views::editor_diag::toggle_bookmark(s, 2);
+    s.editor.find_open = true;
+    s.editor.find_ignore_case = true;
+    s.editor.find_query = rune::TextEdit::new("CLK");
+    let line = s.editor.diag.items.first().map(|d| d.line).unwrap_or(0);
+    crate::views::editor::move_cursor_to(s, line);
+}
+
+/// The 27k-line `examples/ysyx_ibex.sv` (the old IDE's large-file case) in
+/// virtual-row mode with the outline open.
+pub fn editor_large(s: &mut AppState) {
+    s.center = crate::state::CenterPane::Editor;
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/ysyx_ibex.sv");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        crate::views::editor::open_file_tab(s, "ysyx_ibex.sv".into(), text, path);
+    }
+    s.editor.outline_open = true;
 }

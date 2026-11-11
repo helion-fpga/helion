@@ -491,6 +491,9 @@ pub fn program_block_reason(s: &AppState) -> Option<String> {
     if let Some(kind) = s.program.busy() {
         return Some(format!("Busy: {}", kind.busy_label()));
     }
+    if let Some(why) = crate::jobs::program_busy(s) {
+        return Some(format!("Busy: {why}"));
+    }
     if bits_source(s).is_none() {
         return Some("No bitstream yet. Generate Bitstream first.".into());
     }

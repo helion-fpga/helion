@@ -613,6 +613,7 @@ pub fn seed_heat_fixture(s: &mut AppState) -> Result<(), String> {
         source: std::env::temp_dir().join("helion-heat-fixture-none.sv"),
         part: crate::live::FIXTURE_PART.to_string(),
         routed: Some(routed),
+        constraints: None,
     });
     crate::analysis::rerun_timing(s)
 }
