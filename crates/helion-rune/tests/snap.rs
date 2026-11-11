@@ -702,6 +702,16 @@ fn flow_rail_open_designs_navigate_to_their_views() {
     );
 }
 
+/// Wheel the Flow Navigator to its end and let the scroll settle.
+fn rail_to_bottom(rt: &mut Runtime<AppState>) {
+    let (x, y) = rt.find("flow-rail-scroll").expect("rail scroll area");
+    rt.pointer_move(x, y);
+    rt.wheel(x, y, -2000.0);
+    for i in 0..30 {
+        rt.frame(0.1 + i as f64 * 0.05);
+    }
+}
+
 #[test]
 fn flow_rail_simulation_and_program_navigate() {
     let mut rt = rt_for("summary");
@@ -726,13 +736,17 @@ fn flow_rail_simulation_and_program_navigate() {
         "run must echo its Tcl verb"
     );
     let mut rt = rt_for("summary");
+    // At the default 900pt window the rail scrolls: wheel it down like a
+    // user before reaching PROGRAM AND DEBUG.
+    rail_to_bottom(&mut rt);
     tap(&mut rt, "flow-program-and-debug-generate-bitstream");
     assert_eq!(
         rt.state.center,
-        CenterPane::Program,
-        "bitstream must open program"
+        CenterPane::Bitstream,
+        "generate bitstream opens the bitstream report it fills"
     );
     let mut rt = rt_for("summary");
+    rail_to_bottom(&mut rt);
     tap(&mut rt, "flow-program-and-debug-open-hardware-manager");
     assert_eq!(
         rt.state.center,
@@ -1332,4 +1346,5 @@ fn xdc_wizard_finish_round_trips_review_content_to_disk() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
 
