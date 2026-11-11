@@ -238,6 +238,83 @@ endmodule
 """
 
 
+def rtl_verilog_tb(top: str, ports: list["Port"], clock: str | None, in_bits: list[str], out_bits: list[str],
+                   n_cycles: int, stim: str, trace: str) -> str:
+    decl, conn, drive, sample = [], [], [], []
+    for p in ports:
+        w = "" if p.width is None else f"[{p.hi}:{p.lo}] "
+        if p.direction == "in":
+            decl.append(f"reg {w}{p.name} = 0;")
+        else:
+            decl.append(f"wire {w}{p.name};")
+        conn.append(f".{p.name}({p.name})")
+    n = max(1, len(in_bits))
+    for i, b in enumerate(in_bits):
+        drive.append(f"    {b} = vec[{n - 1 - i}];")
+    for b in out_bits:
+        sample.append(f'    $fwrite(fo, "%s", bitc({b}));')
+    clk_lo = f"    {clock} = 1'b0;" if clock else ""
+    clk_hi = f"    {clock} = 1'b1;" if clock else ""
+    return f"""`timescale 1ns/1ps
+module tb_rtl;
+{chr(10).join(decl)}
+{top} dut({', '.join(conn)});
+integer fi, fo, k, rc;
+reg [{n}-1:0] vec;
+function [7:0] bitc(input v);
+  bitc = (v === 1'b1) ? "1" : (v === 1'b0) ? "0" : (v === 1'bz) ? "z" : "x";
+endfunction
+initial begin
+  fi = $fopen("{stim}", "r");
+  fo = $fopen("{trace}", "w");
+  for (k = 0; k < {n_cycles}; k = k + 1) begin
+    rc = $fscanf(fi, "%b", vec);
+{clk_lo}
+{chr(10).join(drive)}
+    #5;
+{clk_hi}
+    #4;
+{chr(10).join(sample)}
+    $fwrite(fo, "\\n");
+    #1;
+  end
+  $fclose(fo);
+  $finish;
+end
+endmodule
+"""
+
+
+def sv_ports(rtl: list[str], top: str) -> list["Port"]:
+    text = "\n".join(re.sub(r"//[^\n]*", "", open(f).read()) for f in rtl)
+    m = re.search(rf"module\s+{top}\s*(?:#\s*\(.*?\)\s*)?\((.*?)\)\s*;", text, re.S)
+    if not m:
+        raise ValueError(f"module {top} not found")
+    ports = []
+    cur_dir, cur_rng = None, None
+    for item in m.group(1).split(","):
+        item = item.strip()
+        mm = re.match(r"(input|output|inout)?\s*(?:wire|logic|reg)?\s*(?:signed\s*)?(\[\s*(\d+)\s*:\s*(\d+)\s*\])?\s*(\w+)$", item)
+        if not mm:
+            continue
+        if mm.group(1):
+            cur_dir = mm.group(1)
+            cur_rng = (mm.group(3), mm.group(4)) if mm.group(2) else None
+        elif mm.group(2):
+            cur_rng = (mm.group(3), mm.group(4))
+        d = "in" if cur_dir == "input" else "out"
+        if cur_rng:
+            hi, lo = int(cur_rng[0]), int(cur_rng[1])
+            ports.append(Port(mm.group(5), d, abs(hi - lo) + 1, hi, lo))
+        else:
+            ports.append(Port(mm.group(5), d, None))
+    return ports
+
+
+def is_verilog(rtl: list[str]) -> bool:
+    return rtl[0].endswith((".v", ".sv"))
+
+
 # ---- run -------------------------------------------------------------------------
 
 @dataclass
@@ -260,7 +337,7 @@ def run(workdir: str, rtl_files: list[str], top: str, xdc: str, netlist_v: str,
         ports_in: set[str], ports_out: set[str], cycles: int = 2000, seed: int = 1) -> CosimResult:
     os.makedirs(workdir, exist_ok=True)
     pin_of, clocks = parse_xdc(xdc)
-    ports = vhdl_ports(rtl_files, top)
+    ports = sv_ports(rtl_files, top) if is_verilog(rtl_files) else vhdl_ports(rtl_files, top)
     clock = next((p.name for p in ports if p.name in clocks), None)
     if clock is None:
         clock = next((p.name for p in ports if p.direction == "in" and p.width is None and re.fullmatch(r"(clk|clock|gclk|sysclk)", p.name, re.I)), None)
@@ -273,19 +350,34 @@ def run(workdir: str, rtl_files: list[str], top: str, xdc: str, netlist_v: str,
     open(stim, "w").write("\n".join(make_stimulus(in_bits, cycles, seed)) + "\n")
     rtl_trace = os.path.join(workdir, "rtl.trace")
     net_trace = os.path.join(workdir, "net.trace")
-    open(os.path.join(workdir, "tb.vhd"), "w").write(
-        vhdl_tb(top, ports, clock, in_bits, out_bits, stim, rtl_trace))
+    if is_verilog(rtl_files):
+        open(os.path.join(workdir, "tb_rtl.v"), "w").write(
+            rtl_verilog_tb(top, ports, clock, in_bits, out_bits, cycles, stim, rtl_trace))
+    else:
+        open(os.path.join(workdir, "tb.vhd"), "w").write(
+            vhdl_tb(top, ports, clock, in_bits, out_bits, stim, rtl_trace))
     open(os.path.join(workdir, "tb.v"), "w").write(
         verilog_tb(pin_of, ports_in, ports_out, pin_of.get(clock) if clock else None,
                    in_bits, out_bits, cycles, stim, net_trace))
     logs = []
-    r = subprocess.run(["nvc", "--std=2008", "-L", workdir, "--work", f"work:{workdir}/work", "-a", *rtl_files,
-                        os.path.join(workdir, "tb.vhd"), "-e", "tb", "-r"],
-                       capture_output=True, text=True, cwd=workdir)
-    logs.append(r.stdout + r.stderr)
-    if r.returncode != 0:
-        res.log = "\n".join(logs)
-        raise RuntimeError(f"nvc failed:\n{res.log[-3000:]}")
+    if is_verilog(rtl_files):
+        r = subprocess.run(["iverilog", "-g2012", "-o", os.path.join(workdir, "rtl.vvp"),
+                            os.path.join(workdir, "tb_rtl.v"), *rtl_files], capture_output=True, text=True)
+        logs.append(r.stdout + r.stderr)
+        if r.returncode == 0:
+            r = subprocess.run(["vvp", "-n", os.path.join(workdir, "rtl.vvp")], capture_output=True, text=True, cwd=workdir)
+            logs.append(r.stdout[-2000:] + r.stderr[-2000:])
+        if r.returncode != 0:
+            res.log = "\n".join(logs)
+            raise RuntimeError(f"RTL iverilog failed:\n{res.log[-3000:]}")
+    else:
+        r = subprocess.run(["nvc", "--std=2008", "-L", workdir, "--work", f"work:{workdir}/work", "-a", *rtl_files,
+                            os.path.join(workdir, "tb.vhd"), "-e", "tb", "-r"],
+                           capture_output=True, text=True, cwd=workdir)
+        logs.append(r.stdout + r.stderr)
+        if r.returncode != 0:
+            res.log = "\n".join(logs)
+            raise RuntimeError(f"nvc failed:\n{res.log[-3000:]}")
     r = subprocess.run(["iverilog", "-g2012", "-o", os.path.join(workdir, "net.vvp"),
                         os.path.join(workdir, "tb.v"), netlist_v], capture_output=True, text=True)
     logs.append(r.stdout + r.stderr)

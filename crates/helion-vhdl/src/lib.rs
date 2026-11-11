@@ -145,8 +145,9 @@ fn last_entity_is(source: &str) -> Option<String> {
     best
 }
 
-#[allow(dead_code)] // unit tests and direct VHDL-to-SV translation utility
-fn vhdl_to_sv(source: &str) -> Result<String, String> {
+/// Translate VHDL source to the SystemVerilog that `helion_sv` synthesizes.
+/// Exposed so the translation can be inspected and tested on its own.
+pub fn vhdl_to_sv(source: &str) -> Result<String, String> {
     Ok(vhdl_to_sv_with_softs(source, "vhdl.vhd")?.0)
 }
 
