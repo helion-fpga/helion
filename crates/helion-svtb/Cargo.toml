@@ -1,0 +1,14 @@
+[package]
+name = "helion-svtb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Helion class-based SystemVerilog testbench engine: preprocessor, parser, and an event-driven interpreter (classes, processes, constrained random, UVM subset) driving helion-sim DUTs"
+
+[dependencies]
+helion-ir = { workspace = true }
+helion-sim = { workspace = true }
+
+[dev-dependencies]
+helion-sv = { workspace = true }
