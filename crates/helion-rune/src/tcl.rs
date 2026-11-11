@@ -296,6 +296,27 @@ pub const COMMANDS: &[&str] = &[
     "report_pblocks",
     "select_pblock",
     "device_zoom_fit",
+    // Hardware debug (Set Up Debug, hw ILA / VIO / JTAG-to-AXI).
+    "implement_debug_core",
+    "write_debug_probes",
+    "refresh_hw_device",
+    "get_hw_ilas",
+    "get_hw_vios",
+    "get_hw_axis",
+    "run_hw_ila",
+    "wait_on_hw_ila",
+    "upload_hw_ila_data",
+    "display_hw_ila_data",
+    "refresh_hw_vio",
+    "create_hw_axi_txn",
+    "run_hw_axi",
+    "get_hw_axi_txns",
+    // Configuration memory.
+    "get_cfgmem_parts",
+    "create_hw_cfgmem",
+    "write_cfgmem",
+    "program_hw_cfgmem",
+    "boot_hw_device",
 ];
 
 /// Max nested `[...]` evaluation depth (mirrors the real interp's cap idea;
@@ -2930,6 +2951,14 @@ fn dispatch_host(
             crate::views::device_floor::tcl_verb(s, n, argv.get(1..).unwrap_or_default()),
             line,
         ),
+        n if crate::views::hw_debug_tcl::VERBS.contains(&n) => ctl_result(
+            crate::views::hw_debug_tcl::tcl_verb(s, n, argv.get(1..).unwrap_or_default()),
+            line,
+        ),
+        n if crate::views::hw_cfgmem::VERBS.contains(&n) => ctl_result(
+            crate::views::hw_cfgmem::tcl_verb(s, n, argv.get(1..).unwrap_or_default()),
+            line,
+        ),
         _ => unknown_command(s, name, line),
     }
 }
@@ -4170,6 +4199,16 @@ fn cmd_select_package_pin(s: &mut AppState, argv: &[String], line: usize) -> Ctl
 }
 
 fn cmd_set_property(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
+    // VIO output probes: `set_property OUTPUT_VALUE v [get_hw_probes p]`.
+    if argv
+        .get(1)
+        .is_some_and(|k| k.eq_ignore_ascii_case("OUTPUT_VALUE"))
+    {
+        let (Some(v), Some(p)) = (argv.get(2), argv.get(3)) else {
+            return Ctl::err(line, "set_property OUTPUT_VALUE: value probe");
+        };
+        return ctl_result(crate::views::hw_debug_tcl::tcl_output_value(s, v, p), line);
+    }
     // Like old `Model::exec`, PACKAGE_PIN/LOC never reaches the generic Tcl
     // property handler (including its repeated-command result). Option flags
     // keep their old parsing position: only an immediate key intercepts.
@@ -5356,6 +5395,10 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
             "list, report, or select floorplan pblocks",
         ),
         "device_zoom_fit" => ("device_zoom_fit", "fit the die to the Device viewport"),
+        n if crate::views::hw_debug_tcl::VERBS.contains(&n) => return crate::views::hw_debug_tcl::help(n),
+        n if crate::views::hw_cfgmem::VERBS.contains(&n) => {
+            return crate::views::hw_cfgmem::help(n);
+        }
         _ => return None,
     })
 }
@@ -5384,6 +5427,9 @@ fn help_overview() -> String {
         "Schematic: expand_fanin_cone expand_fanout_cone expand_cone collapse_cone expand_inside collapse_inside",
         "  schematic_previous schematic_next schematic_zoom_fit",
         "Floorplan: create_pblock resize_pblock add_cells_to_pblock get_pblocks report_pblocks select_pblock device_zoom_fit",
+        "HW debug: implement_debug_core write_debug_probes refresh_hw_device run_hw_ila wait_on_hw_ila upload_hw_ila_data",
+        "  refresh_hw_vio set_property OUTPUT_VALUE v probe | create_hw_axi_txn run_hw_axi get_hw_ilas get_hw_vios get_hw_axis",
+        "  get_cfgmem_parts create_hw_cfgmem write_cfgmem program_hw_cfgmem boot_hw_device",
         "help <command> for usage. See docs/tcl-subset.md for the supported subset.",
     ]
     .join("\n")

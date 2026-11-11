@@ -128,6 +128,11 @@ pub struct IlaState {
     pub last_error: Option<String>,
     /// Last saved/loaded session file.
     pub session_path: Option<PathBuf>,
+    /// `Some(core · part · cable)` when the capture came from a hardware ILA
+    /// (Hardware Manager upload); `None` for a simulation capture.
+    pub hardware: Option<String>,
+    /// Trigger description of the hardware capture (`value 0x5 & 0xF @ 6`).
+    pub hardware_trigger: String,
 }
 
 impl Default for IlaState {
@@ -155,6 +160,8 @@ impl Default for IlaState {
             selected_probe: None,
             last_error: None,
             session_path: None,
+            hardware: None,
+            hardware_trigger: String::new(),
         };
         s.sync_fields();
         s
@@ -283,7 +290,20 @@ impl IlaState {
     }
 
     /// Mount a finished (or loaded) capture: fit, cursor on the trigger.
+    /// Show a window uploaded from a hardware ILA, labelled as hardware.
+    pub fn mount_hardware_capture(&mut self, cap: IlaCapture, label: String, trigger: String) {
+        self.mount_capture(cap);
+        self.hardware = Some(label);
+        self.hardware_trigger = trigger;
+    }
+
+    /// Hardware source label of the mounted capture (`None` = simulation).
+    pub fn hardware_label(&self) -> Option<&str> {
+        self.hardware.as_deref()
+    }
+
     fn mount_capture(&mut self, cap: IlaCapture) {
+        self.hardware = None;
         let trig = cap.trigger_sample;
         self.capture = Some(cap);
         self.viewer.cursor = trig;

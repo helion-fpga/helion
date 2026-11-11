@@ -337,6 +337,12 @@ pub struct ProgramState {
     /// Why the last STAT read produced no word (shown instead of cards).
     pub stat_note: Option<String>,
     pub stat_selected: Option<&'static str>,
+    /// Hardware tree selection (drives which panel shows).
+    pub node: crate::views::hw_tree::HwNode,
+    /// Set Up Debug + the programmed debug target (ILA / VIO / AXI).
+    pub debug: crate::views::hw_debug::HwDebugState,
+    /// Configuration memory device under the hardware device.
+    pub cfgmem: crate::views::hw_cfgmem::CfgMemState,
     job: Option<HwJob>,
 }
 
@@ -385,6 +391,15 @@ impl ProgramState {
 
     /// Reset per-project results (cable pick and last scan stay).
     pub fn reset_results(&mut self) {
+        // A new project invalidates the debug build, the programmed debug
+        // target and any flash image (unless a worker still owns them).
+        if self.debug.busy().is_none() {
+            self.debug.reset();
+        }
+        if self.cfgmem.busy().is_none() {
+            self.cfgmem = Default::default();
+        }
+        self.node = Default::default();
         self.phase = ProgramPhase::Idle;
         self.stage = 0;
         self.stage_label.clear();
@@ -901,6 +916,12 @@ pub fn deliver(s: &mut AppState, ev: HwEvent) {
 
 /// `AppSpec::poll` wiring: drain the hardware worker.
 pub fn poll(s: &mut AppState) -> bool {
+    let dbg = crate::views::hw_debug::poll(s);
+    let cfg = crate::views::hw_cfgmem::poll(s);
+    poll_program(s) || dbg || cfg
+}
+
+fn poll_program(s: &mut AppState) -> bool {
     let Some(job) = s.program.job.clone() else {
         return false;
     };
