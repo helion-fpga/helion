@@ -370,19 +370,32 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
     }),
     ("program", |s| {
         s.center = state::CenterPane::Program;
-        s.flow.impl_run = state::RunStatus::Complete;
-        s.status = state::StatusVerb::ImplementationComplete;
+    }),
+    ("program-nousb", |s| {
+        // A real implementation-run bitstream plus a scan with no USB
+        // programmer: Automatic cable refuses board DONE with the reason.
+        s.center = state::CenterPane::Program;
+        let _ = views::bitstream::seed_bitstream_fixture(s);
+        s.program.detect = Some(views::program::no_usb_fixture());
     }),
     ("program-done", |s| {
+        // Real sim-cable program (Session::program_hw_cable) of a real
+        // fixture bitstream, applied synchronously for the snapshot.
         s.center = state::CenterPane::Program;
-        s.flow.impl_run = state::RunStatus::Complete;
-        s.status = state::StatusVerb::ImplementationComplete;
-        s.program.connected = true;
-        s.program.phase = views::program::ProgramPhase::Done;
-        s.program.progress = 100;
-        let detail = s.program.done_detail();
-        s.toasts
-            .push(state::ToastKind::Success, "Device programmed", &detail);
+        if views::bitstream::seed_bitstream_fixture(s).is_ok() {
+            s.program.detect = Some(views::program::no_usb_fixture());
+            s.program.cable = views::program::CableChoice::Sim;
+            if let Some((bits, _)) = views::program::bits_source(s) {
+                let job = views::program::ProgramJob {
+                    cable: "sim".into(),
+                    part: s.bitstream.part.clone(),
+                    bits,
+                };
+                let done = views::program::program_blocking(&job, &|_| {});
+                views::program::deliver(s, done);
+                s.program.stat_selected = Some("DONE");
+            }
+        }
     }),
     ("bitstream", |s| {
         s.center = state::CenterPane::Bitstream;
@@ -616,10 +629,11 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
 pub fn poll_all(s: &mut AppState, t: f64, tx: &mut rune::Tx) -> bool {
     let runs_dirty = runs::poll(s, t, tx);
     let sim_dirty = views::wave::poll(s, t, tx);
+    let hw_dirty = views::program::poll(s);
     // Safety net: out-of-band buffer swaps (project reseed clears tabs)
     // re-mirror the live edit field; a no-op when already synced.
     views::editor::sync_edit(s);
-    runs_dirty || sim_dirty
+    runs_dirty || sim_dirty || hw_dirty
 }
 
 pub fn app_spec() -> AppSpec<AppState> {

@@ -232,7 +232,9 @@ pub const COMMANDS: &[&str] = &[
     "cancel_runs",
     "open_report",
     "launch_simulation",
-    // Bitstream (old `Model::exec`).
+    // Hardware Manager / IP Integrator / Bitstream / Find (old `Model::exec`).
+    "report_hw_stat",
+    "select_hw_stat",
     "report_bitstream",
     "select_bitstream_frame",
 ];
@@ -2656,7 +2658,10 @@ fn dispatch_host(
                 .skip(1)
                 .find_map(|a| a.strip_prefix("cable="))
                 .unwrap_or("auto");
-            match s.tcl.session.program_hw_cable(&dev, cable) {
+            let result = s.tcl.session.program_hw_cable(&dev, cable);
+            // The Hardware Manager pane mirrors the console program result.
+            crate::views::program::note_tcl_program(s, &result);
+            match result {
                 Ok(v) => Ctl::Value(v),
                 Err(e) => Ctl::err(line, e),
             }
@@ -2691,6 +2696,15 @@ fn dispatch_host(
         "hds::flow" => Ctl::Value("synth opt place route bits hw".into()),
         "hds::tree" => Ctl::Value(s.tcl.tree_nodes.join(" ")),
         "open_report" => cmd_open_report(s, argv, line),
+        "report_hw_stat" | "report_hw" | "hw_stat" => {
+            s.navigate(crate::state::CenterPane::Program);
+            ctl_result(crate::views::program::report_hw_stat(s), line)
+        }
+        "select_hw_stat" => {
+            let spec = argv.get(1..).unwrap_or_default().join(" ");
+            s.navigate(crate::state::CenterPane::Program);
+            ctl_result(crate::views::program::select_hw_stat(s, &spec), line)
+        }
         "report_bitstream" | "bitstream" => {
             ctl_result(crate::views::bitstream::report_bitstream(s), line)
         }
@@ -4850,6 +4864,11 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
             "open a report surface",
         ),
         "launch_simulation" => ("launch_simulation", "start a real testbench simulation run"),
+        "report_hw_stat" => (
+            "report_hw_stat",
+            "read IDCODE + STAT (sim TAP, or the sim-programmed fabric)",
+        ),
+        "select_hw_stat" => ("select_hw_stat NAME|BIT", "select one STAT bit card"),
         "report_bitstream" => (
             "report_bitstream",
             "bitstream KPIs plus the FAR frame table",

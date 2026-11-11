@@ -43,7 +43,7 @@ pub const CHECKPOINT_EXTENSIONS: &[&str] = &["hck2", "dcp"];
 /// `tcl.pre` / `tcl.post` hook-script filter.
 pub const TCL_EXTENSIONS: &[&str] = &["tcl"];
 /// Program-device bitstream filter.
-pub const BITSTREAM_EXTENSIONS: &[&str] = &["bit", "bin"];
+pub const BITSTREAM_EXTENSIONS: &[&str] = &["hbits", "bit", "bin"];
 /// Constraints-wizard export filter.
 pub const XDC_EXTENSIONS: &[&str] = &["xdc", "sdc"];
 
@@ -206,15 +206,14 @@ fn apply_bitstream(s: &mut AppState, result: FileDialogResult) {
         Ok(None) => return,
         Ok(Some(p)) => p,
     };
-    s.program.bitstream = path.display().to_string();
     echo(
         s,
         format!(
-            "set_property PROGRAM.FILE {{{}}} [get_hw_devices {}]",
-            s.program.bitstream,
-            s.program.target.name()
+            "set_property PROGRAM.FILE {{{}}} [current_hw_device]",
+            path.display()
         ),
     );
+    s.program.file = Some(path);
 }
 
 /// Raise the New Project location folder picker.

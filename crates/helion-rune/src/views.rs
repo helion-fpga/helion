@@ -8,6 +8,7 @@ pub mod debug;
 pub mod device;
 pub mod dialogs;
 pub mod editor;
+pub mod hw;
 pub mod palette;
 pub mod program;
 pub mod reports;

@@ -823,7 +823,7 @@ pub struct AppState {
     pub sim: crate::views::wave::SimState,
     /// Interactive debugger UI state (persistent event engine, breakpoints).
     pub debug: crate::views::debug::DebugState,
-    /// Hardware Manager UI state (connection, cable/target picks, program run).
+    /// Hardware Manager UI state (cable, detect, program run, STAT).
     pub program: crate::views::program::ProgramState,
     /// Settings dialog + New Project / Constraints wizard UI state.
     pub dialogs: crate::views::dialogs::DialogState,
@@ -1092,6 +1092,7 @@ impl AppState {
         self.power = PowerState::default();
         self.drc = DrcState::default();
         self.bitstream = BitstreamState::default();
+        self.program.reset_results();
         self.toasts = ToastState::default();
         self.runs.reset();
         // A new project invalidates the sim log, the live VCD import, and
