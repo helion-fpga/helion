@@ -16,6 +16,7 @@
 
 pub mod analysis;
 pub mod doctor;
+pub mod eco_tcl;
 pub mod jobs;
 pub mod layout;
 pub mod live;
@@ -565,10 +566,27 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
     }),
     ("ip-bd", |s| {
         s.center = state::CenterPane::Ip;
-        for core in ["h_uart", "h_gpio", "h_timer"] {
+        for core in ["h_rv32_hb1", "h_uart", "h_gpio", "h_timer"] {
             let _ = views::ip::create_bd_cell(s, core);
         }
-        let _ = views::ip::select_ip(s, "h_gpio");
+        let _ = views::ip::apply_automation(s);
+        let _ = views::ip::select_cell(s, "h_gpio_0");
+    }),
+    ("ip-automation", |s| {
+        s.center = state::CenterPane::Ip;
+        for core in ["h_rv32_hb1", "h_uart", "h_gpio", "h_sync_fifo"] {
+            let _ = views::ip::create_bd_cell(s, core);
+        }
+        s.dialogs.open(views::dialogs::DialogId::IpAutomation);
+    }),
+    ("ip-customize", |s| {
+        s.center = state::CenterPane::Ip;
+        for core in ["h_rv32_hb1", "h_uart"] {
+            let _ = views::ip::create_bd_cell(s, core);
+        }
+        let _ = views::ip::apply_automation(s);
+        let _ = views::ip::set_cell_param(s, "h_rv32_hb1_0", "ENABLE_MUL", "1");
+        let _ = views::ip::open_customize(s, "h_rv32_hb1_0");
     }),
     ("bitstream", |s| {
         s.center = state::CenterPane::Bitstream;

@@ -25,6 +25,8 @@ pub mod find;
 pub mod hw;
 pub mod ip;
 pub mod ip_canvas;
+pub mod ip_dialogs;
+pub mod ip_model;
 pub mod palette;
 pub mod program;
 pub mod report_kit;

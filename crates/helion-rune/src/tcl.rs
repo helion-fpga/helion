@@ -296,6 +296,15 @@ pub const COMMANDS: &[&str] = &[
     "report_pblocks",
     "select_pblock",
     "device_zoom_fit",
+    // IP Integrator automation, HLS, boards, hand-off (crate::eco_tcl).
+    "apply_bd_automation",
+    "assign_bd_address",
+    "validate_bd_design",
+    "set_bd_cell_property",
+    "select_bd_cell",
+    "delete_bd_objs",
+    "generate_bd",
+    "package_ip",
 ];
 
 /// Max nested `[...]` evaluation depth (mirrors the real interp's cap idea;
@@ -2926,6 +2935,10 @@ fn dispatch_host(
             crate::views::schematic_cone::tcl_verb(s, n, argv.get(1..).unwrap_or_default()),
             line,
         ),
+        n if crate::eco_tcl::VERBS.contains(&n) => ctl_result(
+            crate::eco_tcl::tcl_verb(s, n, argv.get(1..).unwrap_or_default()),
+            line,
+        ),
         n if crate::views::device_floor::VERBS.contains(&n) => ctl_result(
             crate::views::device_floor::tcl_verb(s, n, argv.get(1..).unwrap_or_default()),
             line,
@@ -5356,7 +5369,7 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
             "list, report, or select floorplan pblocks",
         ),
         "device_zoom_fit" => ("device_zoom_fit", "fit the die to the Device viewport"),
-        _ => return None,
+        _ => return crate::eco_tcl::help(name),
     })
 }
 
@@ -5378,6 +5391,7 @@ fn help_overview() -> String {
         "Verify: launch_simulation tb_rescan tb_select tb_run tb_run_all tb_stop tb_vcd tb_wave tb_jump",
         "  set_timescale set_runtime sim_settings compile_sim elaborate_sim | ila <subcommand>",
         "Hardware/IP: report_hw_stat select_hw_stat | ip_catalog select_ip generate_ip create_bd create_bd_cell bd_drawing bd_hdl",
+        "  apply_bd_automation assign_bd_address validate_bd_design set_bd_cell_property select_bd_cell delete_bd_objs generate_bd package_ip",
         "  report_bitstream select_bitstream_frame | find sheet_find select_find",
         "Reports: report_timing_summary report_clock_interaction report_cdc report_clock_networks",
         "  report_power report_methodology report_drc report_constraints",

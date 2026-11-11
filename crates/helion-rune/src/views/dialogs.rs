@@ -63,6 +63,12 @@ pub enum DialogId {
     NewProject,
     Constraints,
     AddSources,
+    /// IP Integrator: Run Connection Automation preview.
+    IpAutomation,
+    /// IP Integrator: Customize IP (per-cell CONFIG.* parameters).
+    IpCustomize,
+    /// IP Integrator: Package IP into the user repository.
+    PackageIp,
 }
 
 impl DialogId {
@@ -72,6 +78,9 @@ impl DialogId {
             DialogId::NewProject => "create",
             DialogId::Constraints => "xdc",
             DialogId::AddSources => "add-sources",
+            DialogId::IpAutomation => "ip-auto",
+            DialogId::IpCustomize => "ip-cust",
+            DialogId::PackageIp => "ip-pkg",
         }
     }
 }
@@ -1965,6 +1974,9 @@ pub fn push_dialogs(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme) {
             crate::views::xdc_wizard::xdc_dialog(layer, &mut pops, s, t, &kit)
         }
         DialogId::AddSources => add_sources_dialog(s, t, &kit, layer),
+        DialogId::IpAutomation | DialogId::IpCustomize | DialogId::PackageIp => {
+            crate::views::ip_dialogs::push(id, layer, s, t, &kit)
+        }
     }
     layer.extend(pops);
 }
