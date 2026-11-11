@@ -61,7 +61,7 @@ HAD: Architecture Database parts beyond `HL10T-C32-1`. Device facts stay in TOML
 
 **Current tip: [v2.0.4](https://github.com/helion-fpga/helion/releases/tag/v2.0.4).** Patch line after the 2.0 bar: ship measured STA / bitgen / place-legalize / synth_rtl / parse cuts without moving gold. SOFT ≠ PASS held. Empty-XDC counter stays **WNS_PS=9640**.
 
-Axes landed through 2.0.4 (see [CHANGELOG](CHANGELOG.md) and [docs/perf-2.0.4.md](docs/perf-2.0.4.md)):
+Axes landed through 2.0.4 (see [CHANGELOG](CHANGELOG.md) and [notes/reports/perf-2.0.4.md](notes/reports/perf-2.0.4.md)):
 
 - STA: `report_timing_placed` IOB `from_net` HashSet (O(1) membership).
 - Bitgen: frame buffer write path (no `.hbits` format growth).
