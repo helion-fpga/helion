@@ -1281,10 +1281,53 @@ pub fn seed_run_fixture(s: &mut AppState) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// Scene/test fixture: the VHDL `examples/counter_tb.vhd` (SV counter DUT
+/// as a netlist) plus a copy that expects `led` one bit early, both run in
+/// a temp dir; the failing one is selected.
+pub fn seed_vhdl_fixture(s: &mut AppState) -> Result<PathBuf, String> {
+    let ex = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let dir = std::env::temp_dir().join(format!("helion-rune-vhdl-fixture-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    for f in ["counter.sv", "counter_tb.vhd"] {
+        std::fs::copy(ex.join(f), dir.join(f)).map_err(|e| format!("{f}: {e}"))?;
+    }
+    let tb = std::fs::read_to_string(ex.join("counter_tb.vhd")).map_err(|e| e.to_string())?;
+    let bad = tb.replace("entity counter_tb is", "entity counter_early_tb is").replace("of counter_tb is", "of counter_early_tb is").replace("expected := model(3);", "expected := model(2);");
+    std::fs::write(dir.join("counter_early_tb.vhd"), bad).map_err(|e| e.to_string())?;
+    s.sim.dir_override = Some(dir.clone());
+    rescan(s);
+    for i in 0..s.sim.tbs.len() {
+        run_testbench_now(s, i)?;
+    }
+    s.sim.selected = s.sim.tbs.iter().position(|t| t.file.name == "counter_early_tb");
+    Ok(dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::init;
+
+    #[test]
+    fn vhdl_testbenches_run_from_the_pane_with_failures_and_wave() {
+        let mut s = init();
+        let dir = seed_vhdl_fixture(&mut s).expect("fixture");
+        assert_eq!(s.sim.tbs.len(), 2);
+        let ok = s.sim.tbs.iter().find(|t| t.file.name == "counter_tb").expect("counter_tb");
+        let info = ok.info.as_ref().expect("VHDL summary parse");
+        assert_eq!(info.dut_module, "counter");
+        assert_eq!(info.clocks, vec![("clk".to_string(), 5)]);
+        assert!(matches!(&ok.last, Some(Ok(o)) if o.passed && o.vcd_path.is_some()));
+        let i = s.sim.selected.expect("failing tb selected");
+        let Some(Ok(out)) = &s.sim.tbs[i].last else { panic!("no outcome") };
+        assert!(!out.passed);
+        let f = &out.failures[0];
+        assert!(f.file.ends_with("counter_early_tb.vhd"));
+        // The failure jumps the editor to the assert line.
+        jump_to_failure(&mut s, i, 0).expect("jump");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn pump(s: &mut AppState) {
         let start = std::time::Instant::now();
@@ -1326,7 +1369,12 @@ mod tests {
             Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter.sv"));
         ensure_scanned(&mut s);
         let names: Vec<&str> = s.sim.tbs.iter().map(|t| t.name()).collect();
-        assert_eq!(names, vec!["counter_tb"], "examples ship one testbench");
+        // SV and VHDL versions of the counter testbench; same stem, so the
+        // list shows file names.
+        assert_eq!(names, vec!["counter_tb.sv", "counter_tb.vhd"]);
+        let vhdl = s.sim.tbs[1].info.as_ref().expect("counter_tb.vhd parses");
+        assert_eq!(vhdl.dut_module, "counter");
+        assert_eq!(vhdl.clocks, vec![("clk".to_string(), 5)]);
         let info = s.sim.tbs[0].info.as_ref().expect("counter_tb parses");
         assert_eq!(info.dut_module, "counter");
         assert_eq!(info.dut_instance, "dut");
