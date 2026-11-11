@@ -176,16 +176,12 @@ fn toolbar_run_arms_rail_runs_table_and_console_echo() {
     tap(&mut rt, "tool-run-synth");
     assert_eq!(rt.state.flow.synth, RunStatus::Running);
     assert!(
-        rt.find("flow-synthesis-open").is_some(),
-        "rail must relabel once started"
+        rt.find("flow-synthesis-run").is_some(),
+        "Run Synthesis stays on the rail (with its live status) so it can re-run"
     );
     assert!(
-        rt.find("flow-synthesis-run").is_none(),
-        "armed entry must leave"
-    );
-    assert!(
-        rt.find("flow-synthesis-open-synthesized-design").is_none(),
-        "static Open row must leave once the run entry relabels (no duplicate labels)"
+        rt.find("flow-synthesis-open-synthesized-design").is_some(),
+        "Open Synthesized Design stays listed"
     );
     assert!(
         rt.state
@@ -592,7 +588,7 @@ fn start_page_opens_the_create_wizard_over_the_shell() {
 // --- func-01-navigation journeys: every rail/menu/link/toolbar hop is live ---
 
 #[test]
-fn flow_rail_open_designs_navigate_to_schematic() {
+fn flow_rail_open_designs_navigate_to_their_views() {
     let mut rt = rt_for("summary");
     tap(&mut rt, "flow-rtl-analysis-open-elaborated-design");
     assert_eq!(
@@ -612,8 +608,8 @@ fn flow_rail_open_designs_navigate_to_schematic() {
     tap(&mut rt, "flow-implementation-open-implemented-design");
     assert_eq!(
         rt.state.center,
-        CenterPane::Schematic,
-        "implemented must open schematic"
+        CenterPane::Device,
+        "the implemented (placed + routed) design opens on the device"
     );
 }
 

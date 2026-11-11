@@ -319,28 +319,32 @@ fn tab_strip(s: &AppState, t: &VivadoTheme) -> El {
     strip
 }
 
-/// Small toolbar icon button echoing a Tcl verb.
-fn tool_btn(
-    key: &'static str,
-    tip: &'static str,
-    tcl: &'static str,
-    t: &VivadoTheme,
-    glyph: El,
-) -> El {
-    el().key(key)
-        .role("button")
-        .label(tip)
-        .focusable(true)
-        .size(22.0, 22.0)
-        .center()
-        .hover(t.selection)
-        .on_press(move |s: &mut AppState| echo(s, tcl))
-        .child(glyph)
+/// Whether a transcript line passes the toolbar text filter.
+fn passes(s: &AppState, text: &str) -> bool {
+    let q = s.console.filter.text.trim();
+    q.is_empty() || text.to_lowercase().contains(&q.to_lowercase())
 }
 
-/// Console toolbar: search, copy, save, and a real Clear action.
-fn console_toolbar(t: &VivadoTheme) -> El {
-    row()
+/// Lines the active tab shows (filters applied), for Copy.
+fn visible_lines(s: &AppState) -> Vec<String> {
+    let sev_ok = |sev: MsgSev| match s.console.tab {
+        ConsoleTab::Messages => match s.console.msg_sev {
+            None => sev != MsgSev::Info,
+            Some(want) => sev == want,
+        },
+        _ => true,
+    };
+    s.console
+        .lines
+        .iter()
+        .filter(|l| sev_ok(l.sev) && passes(s, &l.text))
+        .map(|l| l.text.clone())
+        .collect()
+}
+
+/// Console toolbar: filter toggle (+ field), copy what's shown, clear.
+fn console_toolbar(s: &AppState, t: &VivadoTheme) -> El {
+    let mut bar = row()
         .key("console-toolbar")
         .role("toolbar")
         .w_full()
@@ -349,20 +353,70 @@ fn console_toolbar(t: &VivadoTheme) -> El {
         .gap(2.0)
         .px(6.0)
         .fill(t.panel_bg)
-        .child(tool_btn(
-            "console-search",
-            "Find in console",
-            "search_log",
-            t,
-            icon(&glyphs::SEARCH, 13.0).color(t.text_dim).a11y_hidden(),
-        ))
-        .child(tool_btn(
-            "console-copy",
-            "Copy console output",
-            "copy_log",
-            t,
-            icon(&glyphs::COPY, 13.0).color(t.text_dim).a11y_hidden(),
-        ))
+        .child(
+            el().key("console-search")
+                .role("button")
+                .label("Filter console")
+                .help("Filter lines")
+                .focusable(true)
+                .size(22.0, 22.0)
+                .radius(3.0)
+                .center()
+                .hover(t.selection)
+                .on_press(|s: &mut AppState| {
+                    s.console.filter_open = !s.console.filter_open;
+                    if !s.console.filter_open {
+                        s.console.filter.clear();
+                    }
+                })
+                .child(
+                    icon(&glyphs::SEARCH, 13.0)
+                        .color(if s.console.filter_open { t.accent } else { t.text_dim })
+                        .a11y_hidden(),
+                ),
+        )
+        .child(
+            el().key("console-copy")
+                .role("button")
+                .label("Copy shown lines")
+                .help("Copy shown lines")
+                .focusable(true)
+                .size(22.0, 22.0)
+                .radius(3.0)
+                .center()
+                .hover(t.selection)
+                .on_press_tx(|s: &mut AppState, tx: &mut Tx| {
+                    let lines = visible_lines(s);
+                    let n = lines.len();
+                    tx.copy(lines.join("\n"));
+                    s.toasts.push(
+                        crate::state::ToastKind::Info,
+                        "Copied",
+                        &format!("{n} line{}", if n == 1 { "" } else { "s" }),
+                    );
+                })
+                .child(icon(&glyphs::COPY, 13.0).color(t.text_dim).a11y_hidden()),
+        );
+    if s.console.filter_open {
+        bar = bar.child(
+            text_input(&s.console.filter, VivadoTheme::FONT_UI)
+                .single_line()
+                .key("console-filter")
+                .label("Filter console lines")
+                .w(240.0)
+                .mx(4.0)
+                .px(6.0)
+                .py(2.0)
+                .fill(t.chrome_bg)
+                .border(1.0, t.border_light)
+                .radius(4.0)
+                .color(t.text)
+                .placeholder("Filter lines", t.text_faint)
+                .caret(t.text, t.selection)
+                .on_edit(|s: &mut AppState| &mut s.console.filter),
+        );
+    }
+    bar
         .child(
             el().key("console-clear")
                 .role("button")
@@ -399,7 +453,9 @@ fn tcl_body(s: &AppState, t: &VivadoTheme) -> El {
         );
     } else {
         for (n, line) in s.console.lines.iter().enumerate() {
-            lines = lines.child(log_line(n, &line.text, line.sev, t));
+            if passes(s, &line.text) {
+                lines = lines.child(log_line(n, &line.text, line.sev, t));
+            }
         }
     }
     let input: &TextEdit = &s.console.input;
@@ -452,6 +508,65 @@ fn tcl_body(s: &AppState, t: &VivadoTheme) -> El {
 /// Messages body: derived counts plus the warning/error lines.
 fn messages_body(s: &AppState, t: &VivadoTheme) -> El {
     let (infos, warns, crits, errors) = message_counts(s);
+    // Severity chips: All (every warning and error) or one severity.
+    let chip = |key: &'static str, label: String, sev: Option<MsgSev>, ink: rune::Color| {
+        let active = s.console.msg_sev == sev;
+        el().key(key)
+            .role("button")
+            .label(label.clone())
+            .focusable(true)
+            .focus_selected(active)
+            .h(18.0)
+            .px(8.0)
+            .radius(9.0)
+            .center()
+            .fill(if active { t.selection } else { t.panel_bg })
+            .border(1.0, if active { t.accent } else { t.border })
+            .hover(t.selection)
+            .on_press(move |s: &mut AppState| s.console.msg_sev = sev)
+            .child(text(label).font(VivadoTheme::FONT_UI).color(ink))
+    };
+    let chips = row()
+        .key("console-msg-chips")
+        .w_full()
+        .h(LINE_H + 6.0)
+        .items_center()
+        .gap(6.0)
+        .px(8.0)
+        .child(chip(
+            "console-msg-all",
+            format!("All issues {}", warns + crits + errors),
+            None,
+            t.text,
+        ))
+        .child(chip(
+            "console-msg-errors",
+            format!("Errors {errors}"),
+            Some(MsgSev::Error),
+            if errors > 0 { t.fail } else { t.text_dim },
+        ))
+        .child(chip(
+            "console-msg-critical",
+            format!("Critical {crits}"),
+            Some(MsgSev::Critical),
+            if crits > 0 { t.fail } else { t.text_dim },
+        ))
+        .child(chip(
+            "console-msg-warnings",
+            format!("Warnings {warns}"),
+            Some(MsgSev::Warn),
+            if warns > 0 { t.warn } else { t.text_dim },
+        ))
+        .child(el().grow(1.0))
+        .child(
+            text(format!(
+                "{} encountered.",
+                format_counts(infos, warns, crits, errors)
+            ))
+            .font(VivadoTheme::FONT_UI)
+            .color(t.text_faint)
+            .key("console-msg-summary"),
+        );
     let mut body = col()
         .key("console-messages")
         .w_full()
@@ -460,33 +575,39 @@ fn messages_body(s: &AppState, t: &VivadoTheme) -> El {
         .py(4.0)
         .scroll(ScrollSpec {
             stick_bottom: false,
-        })
-        .child(
-            row().w_full().h(LINE_H).items_center().px(8.0).child(
-                text(format!(
-                    "{} encountered.",
-                    format_counts(infos, warns, crits, errors)
-                ))
-                .font(VivadoTheme::FONT_MONO.mono())
-                .color(t.text)
-                .key("console-msg-summary"),
-            ),
-        );
+        });
+    let want = s.console.msg_sev;
     let mut n = 0;
-    for line in s.console.lines.iter().filter(|l| l.sev != MsgSev::Info) {
+    for line in s.console.lines.iter().filter(|l| match want {
+        None => l.sev != MsgSev::Info,
+        Some(sev) => l.sev == sev,
+    }) {
+        if !passes(s, &line.text) {
+            continue;
+        }
         body = body.child(log_line(n, &line.text, line.sev, t));
         n += 1;
     }
     if n == 0 {
+        let empty = if s.console.filter.text.trim().is_empty() && want.is_none() {
+            "No warnings or errors."
+        } else {
+            "No messages match the filter."
+        };
         body = body.child(
             row().w_full().h(LINE_H).items_center().px(8.0).child(
-                text("(No warnings or errors)")
+                text(empty)
                     .font(VivadoTheme::FONT_UI)
                     .color(t.text_faint),
             ),
         );
     }
-    body
+    col()
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(chips)
+        .child(body)
 }
 
 /// Prompt shown when a sim run has no log output yet. The link launches
@@ -913,7 +1034,7 @@ pub fn console_pane(s: &AppState, t: &VivadoTheme) -> El {
     if s.console.collapsed {
         return pane;
     }
-    pane = pane.child(console_toolbar(t));
+    pane = pane.child(console_toolbar(s, t));
     pane = pane.child(match s.console.tab {
         ConsoleTab::Tcl => tcl_body(s, t),
         ConsoleTab::Messages => messages_body(s, t),
