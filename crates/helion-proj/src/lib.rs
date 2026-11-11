@@ -16,6 +16,7 @@ pub mod qor;
 pub mod reports;
 pub mod io_reports;
 pub mod eco;
+pub mod dfx;
 pub mod tcl;
 
 pub mod ip_packager;

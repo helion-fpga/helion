@@ -1964,6 +1964,7 @@ dependencies = [
  "helion-bits",
  "helion-debug",
  "helion-device",
+ "helion-fabric",
  "helion-hw",
  "helion-ipxact",
  "helion-ir",
