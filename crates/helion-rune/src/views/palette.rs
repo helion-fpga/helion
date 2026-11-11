@@ -1293,16 +1293,16 @@ mod tests {
     fn edit_menu_opens_both_palette_modes() {
         // One runtime per mode: the open palette's modal scrim covers the
         // menubar, so a second menu tap in the same runtime cannot land.
-        // Edit: Undo, Redo, rule, Find in File, Find in Design, Go to File
-        // (5), Command Palette (6).
+        // Edit: Undo, Redo, rule, Find in File, Find in Design, rule, Go to
+        // Definition, Toggle/Next Bookmark, rule, Go to File (10), Palette (11).
         let mut rt = rt_with(|_| {});
         tap(&mut rt, "menu-edit");
-        tap(&mut rt, "menu-edit-item5");
+        tap(&mut rt, "menu-edit-item10");
         assert!(rt.state.palette.open);
         assert_eq!(rt.state.palette.mode, PaletteMode::Files);
         let mut rt = rt_with(|_| {});
         tap(&mut rt, "menu-edit");
-        tap(&mut rt, "menu-edit-item6");
+        tap(&mut rt, "menu-edit-item11");
         assert!(rt.state.palette.open);
         assert_eq!(rt.state.palette.mode, PaletteMode::Commands);
     }
