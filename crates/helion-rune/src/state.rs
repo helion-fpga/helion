@@ -387,6 +387,9 @@ pub struct TimingGroupRow {
     pub kind: TimingGroupKind,
     pub wns_ps: Option<i64>,
     pub tns_ps: i64,
+    /// Hold slacks of the group (`TimingSummaryGroup::whs_ps/ths_ps`).
+    pub whs_ps: Option<i64>,
+    pub ths_ps: i64,
     pub endpoints: usize,
 }
 
@@ -404,6 +407,14 @@ impl TimingPathGroup {
         match self {
             TimingPathGroup::Register => "Intra-Clock",
             TimingPathGroup::Output => "Other Path Groups",
+        }
+    }
+
+    /// Short family name for the paths table `Path group` column.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            TimingPathGroup::Register => "Register",
+            TimingPathGroup::Output => "Output",
         }
     }
 }
@@ -433,6 +444,52 @@ pub struct TimingPathRow {
     pub delay_ps: i64,
     pub group: TimingPathGroup,
     pub pins: Vec<TimingPinRow>,
+    /// STA clock launching the startpoint (`""` when no clock drives it).
+    pub launch_clock: String,
+    /// STA clock capturing the endpoint (`""` when no clock captures it).
+    pub capture_clock: String,
+}
+
+impl TimingPathRow {
+    /// Combinational + sequential cell arcs (not nets), mirroring
+    /// `ide.rs::TimingPath::logic_ps`.
+    pub fn logic_ps(&self) -> i64 {
+        self.pins
+            .iter()
+            .filter(|p| matches!(p.delay_type.as_str(), "cell" | "setup" | "iob"))
+            .map(|p| p.incr_ps)
+            .sum()
+    }
+
+    /// Net / pin-load arcs, mirroring `ide.rs::TimingPath::net_ps`.
+    pub fn net_ps(&self) -> i64 {
+        self.pins
+            .iter()
+            .filter(|p| p.delay_type == "net")
+            .map(|p| p.incr_ps)
+            .sum()
+    }
+
+    /// Logic levels: combinational cells between the launch register and
+    /// the endpoint (UG906 "Logic Levels"; the launch FF's own clock-to-Q
+    /// arc is not a level).
+    pub fn levels(&self) -> usize {
+        let launch = self
+            .pins
+            .iter()
+            .find(|p| p.delay_type == "clk")
+            .map(|p| p.cell.as_str());
+        let mut cells: Vec<&str> = Vec::new();
+        for p in &self.pins {
+            if p.delay_type == "cell"
+                && Some(p.cell.as_str()) != launch
+                && !cells.contains(&p.cell.as_str())
+            {
+                cells.push(p.cell.as_str());
+            }
+        }
+        cells.len()
+    }
 }
 
 /// One `report_clock_networks` tree, mirroring `helion_sta::ClockNetwork`
@@ -441,9 +498,13 @@ pub struct TimingPathRow {
 pub struct ClockNetRow {
     pub name: String,
     pub period_ps: u64,
+    /// Clock source object (`get_ports clk` target).
+    pub source: String,
     pub net: String,
     pub loads: usize,
     pub buffers: usize,
+    /// Net fanout (`ClockNetwork::fanout`).
+    pub fanout: usize,
     pub insertion_ps: i64,
 }
 
@@ -457,6 +518,99 @@ pub struct CdcRow {
     pub endpoints: usize,
     pub sync: bool,
     pub wns_ps: Option<i64>,
+    /// UG949 relation of the pair (`ClockRelation::as_str`).
+    pub relation: String,
+}
+
+/// UG949 clock-pair relation, mirroring `helion_sta::ClockRelation`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClockRel {
+    #[default]
+    Timed,
+    TimedGenerated,
+    TimedUnsafe,
+    TimedDatapath,
+    FalsePath,
+    PartialFalsePath,
+    Asynchronous,
+    Exclusive,
+    NoPaths,
+}
+
+/// Visual class of a clock-pair relation (the matrix legend).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClockRelClass {
+    /// Timed on a common clock: safe.
+    Safe,
+    /// Excepted (false path / asynchronous / exclusive): ignored by STA.
+    Ignored,
+    /// Partially excepted or datapath-only: review.
+    Partial,
+    /// Unrelated clocks timed without an exception: unsafe CDC.
+    Unsafe,
+    /// No timing paths between the pair.
+    NoPaths,
+}
+
+impl ClockRel {
+    pub fn label(self) -> &'static str {
+        match self {
+            ClockRel::Timed => "Timed",
+            ClockRel::TimedGenerated => "Timed (generated)",
+            ClockRel::TimedUnsafe => "Timed (unsafe)",
+            ClockRel::TimedDatapath => "Timed (datapath)",
+            ClockRel::FalsePath => "False Path",
+            ClockRel::PartialFalsePath => "Partial False Path",
+            ClockRel::Asynchronous => "Asynchronous",
+            ClockRel::Exclusive => "Exclusive",
+            ClockRel::NoPaths => "No Paths",
+        }
+    }
+
+    pub fn class(self) -> ClockRelClass {
+        match self {
+            ClockRel::Timed | ClockRel::TimedGenerated => ClockRelClass::Safe,
+            ClockRel::TimedUnsafe => ClockRelClass::Unsafe,
+            ClockRel::TimedDatapath | ClockRel::PartialFalsePath => ClockRelClass::Partial,
+            ClockRel::FalsePath | ClockRel::Asynchronous | ClockRel::Exclusive => {
+                ClockRelClass::Ignored
+            }
+            ClockRel::NoPaths => ClockRelClass::NoPaths,
+        }
+    }
+}
+
+impl ClockRelClass {
+    pub const ALL: [ClockRelClass; 5] = [
+        ClockRelClass::Safe,
+        ClockRelClass::Partial,
+        ClockRelClass::Unsafe,
+        ClockRelClass::Ignored,
+        ClockRelClass::NoPaths,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ClockRelClass::Safe => "Timed (safe)",
+            ClockRelClass::Ignored => "User ignored",
+            ClockRelClass::Partial => "Partial / datapath",
+            ClockRelClass::Unsafe => "Timed (unsafe)",
+            ClockRelClass::NoPaths => "No paths",
+        }
+    }
+}
+
+/// One From x To cell of `report_clock_interaction`, mirroring
+/// `helion_sta::ClockInteractionCell`.
+#[derive(Clone, Debug, Default)]
+pub struct ClockInteractionRow {
+    pub from: String,
+    pub to: String,
+    pub relation: ClockRel,
+    pub common_period_ps: u64,
+    pub requirement_ps: i64,
+    pub wns_ps: Option<i64>,
+    pub path_count: usize,
 }
 
 /// One `report_methodology` check, mirroring
@@ -501,6 +655,9 @@ pub struct TimingState {
     pub cdc: Vec<CdcRow>,
     /// Constraint checks (`report_methodology`).
     pub methodology: Vec<MethodRow>,
+    /// N x N clock-pair matrix (`report_clock_interaction`), row-major in
+    /// clock order.
+    pub clock_interaction: Vec<ClockInteractionRow>,
     /// Raw `TimingResult` delay split, picoseconds.
     pub r2r_ps: i64,
     pub iob_ps: i64,
@@ -559,6 +716,11 @@ pub struct PowerState {
     pub total_mw: u32,
     pub dynamic_mw: u32,
     pub static_mw: u32,
+    /// Exact rails in microwatts (`PowerReport::total/dynamic/static_uw`);
+    /// the `_mw` fields above are their whole-milliwatt summaries.
+    pub total_uw: u32,
+    pub dynamic_uw: u32,
+    pub static_uw: u32,
     pub clocks_uw: u32,
     pub logic_uw: u32,
     pub signals_uw: u32,
@@ -620,6 +782,9 @@ pub struct DrcState {
     pub overused: u32,
     /// True once a run evaluated DRC (even with zero violations).
     pub has_run: bool,
+    /// The rows come from the pre-route deck (`check_placed`) on a placed,
+    /// not yet routed design.
+    pub pre_route: bool,
 }
 
 /// Bitstream result, mirroring the `write_bitstream` log line
