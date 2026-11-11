@@ -92,29 +92,20 @@ pub enum SettingsPage {
     Synthesis,
     Implementation,
     Bitstream,
-    Ip,
     ToolProject,
-    SourceFile,
     Display,
-    TextEditor,
 }
 
 impl SettingsPage {
-    const PROJECT: [SettingsPage; 7] = [
+    const PROJECT: [SettingsPage; 6] = [
         SettingsPage::General,
         SettingsPage::Simulation,
         SettingsPage::Elaboration,
         SettingsPage::Synthesis,
         SettingsPage::Implementation,
         SettingsPage::Bitstream,
-        SettingsPage::Ip,
     ];
-    const TOOL: [SettingsPage; 4] = [
-        SettingsPage::ToolProject,
-        SettingsPage::SourceFile,
-        SettingsPage::Display,
-        SettingsPage::TextEditor,
-    ];
+    const TOOL: [SettingsPage; 2] = [SettingsPage::ToolProject, SettingsPage::Display];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -124,11 +115,8 @@ impl SettingsPage {
             SettingsPage::Synthesis => "Synthesis",
             SettingsPage::Implementation => "Implementation",
             SettingsPage::Bitstream => "Bitstream",
-            SettingsPage::Ip => "IP",
             SettingsPage::ToolProject => "Project",
-            SettingsPage::SourceFile => "Source File",
             SettingsPage::Display => "Display",
-            SettingsPage::TextEditor => "Text Editor",
         }
     }
 
@@ -140,27 +128,21 @@ impl SettingsPage {
             SettingsPage::Synthesis => "settings-nav-synthesis",
             SettingsPage::Implementation => "settings-nav-implementation",
             SettingsPage::Bitstream => "settings-nav-bitstream",
-            SettingsPage::Ip => "settings-nav-ip",
             SettingsPage::ToolProject => "settings-nav-tool-project",
-            SettingsPage::SourceFile => "settings-nav-source-file",
             SettingsPage::Display => "settings-nav-display",
-            SettingsPage::TextEditor => "settings-nav-text-editor",
         }
     }
 
     fn blurb(self) -> &'static str {
         match self {
             SettingsPage::General => "Specify the project name, part, and top module.",
-            SettingsPage::Simulation => "Specify the simulator and testbench options.",
+            SettingsPage::Simulation => "Simulator and simulation language.",
             SettingsPage::Elaboration => "Specify various settings associated to Elaboration.",
             SettingsPage::Synthesis => "Specify various settings associated to Synthesis",
             SettingsPage::Implementation => "Specify various settings associated to Implementation",
             SettingsPage::Bitstream => "Specify the bitstream generation options.",
-            SettingsPage::Ip => "Specify the IP repository and core options.",
-            SettingsPage::ToolProject => "Specify the default project directory and behavior.",
-            SettingsPage::SourceFile => "Specify how source files open in the editor.",
-            SettingsPage::Display => "Specify fonts, themes, and window density.",
-            SettingsPage::TextEditor => "Specify editor tabs, indent, and trim behavior.",
+            SettingsPage::ToolProject => "Where new projects are created by default.",
+            SettingsPage::Display => "Theme and window layout.",
         }
     }
 }
@@ -177,6 +159,8 @@ pub enum PopId {
     Fsm,
     SimSimulator,
     ImplStrategy,
+    Theme,
+    LayoutPreset,
     CreateConstrSet,
     CreatePart,
     XdcClock,
@@ -314,10 +298,21 @@ const FLATTEN_OPTS: &[&str] = &["rebuilt", "none", "full"];
 const ON_OFF: &[&str] = &["off", "on"];
 const DIRECTIVES: &[&str] = &["Default", "PerformanceOptimized", "AreaOptimized"];
 const FSM_OPTS: &[&str] = &["auto", "one_hot", "gray", "sequential"];
-const SIMULATORS: &[&str] = &["Mixed", "Helion Simulator", "Questa", "Xcelium"];
+/// Simulation language (the built-in helion-sim simulates all three).
+const SIMULATORS: &[&str] = &["Mixed", "Verilog", "VHDL"];
+const THEMES: &[&str] = &["Follow System", "Light", "Dark"];
+/// Implementation strategies: the real `helion_proj::RunStrategy` presets
+/// (each sets opt level, timing-driven placement, router effort, ...).
 const IMPL_STRATS: &[&str] = &[
-    "Helion Implementation Defaults",
-    "Helion Implementation PerformanceOptimized",
+    "Default",
+    "TimingExplore",
+    "Performance_Explore",
+    "Performance_NetDelay_high",
+    "PhysOpt",
+    "Area_Explore",
+    "Congestion_SpreadLogic_high",
+    "RuntimeOpt",
+    "Flow_Quick",
 ];
 /// Parts the New Project wizard offers: exactly the parts the backend can
 /// place/route (`helion_device::Device::list_parts`; every entry must load —
@@ -1157,6 +1152,14 @@ fn simple_page(
             body = body.child(field_row(
                 "Simulator:",
                 LABEL_W,
+                value_box("helion-sim (built-in event-driven)", t)
+                    .grow(1.0)
+                    .min_w(0.0),
+                t,
+            ));
+            body = body.child(field_row(
+                "Language:",
+                LABEL_W,
                 pop_select(
                     layer,
                     kit,
@@ -1219,47 +1222,89 @@ fn simple_page(
                 t,
             ));
         }
-        SettingsPage::Ip => {
-            body = body.child(field_row(
-                "Repository:",
-                LABEL_W,
-                value_box("C:/EE214/project_1/project_1.ipdefs", t)
+        SettingsPage::ToolProject => {
+            body = body
+                .child(field_row(
+                    "Default directory:",
+                    LABEL_W,
+                    value_box(
+                        &crate::pickers::default_projects_dir().display().to_string(),
+                        t,
+                    )
                     .grow(1.0)
                     .min_w(0.0),
-                t,
-            ));
-        }
-        SettingsPage::ToolProject => {
-            body = body.child(field_row(
-                "Default directory:",
-                LABEL_W,
-                value_box("C:/EE214", t).grow(1.0).min_w(0.0),
-                t,
-            ));
-        }
-        SettingsPage::SourceFile => {
-            body = body.child(field_row(
-                "Open in:",
-                LABEL_W,
-                value_box("Text Editor", t).grow(1.0).min_w(0.0),
-                t,
-            ));
+                    t,
+                ))
+                .child(dim_label(
+                    "New Project proposes this folder; each project gets its own subfolder.",
+                    t,
+                ));
         }
         SettingsPage::Display => {
-            body = body.child(field_row(
-                "Theme:",
-                LABEL_W,
-                value_box("Light", t).grow(1.0).min_w(0.0),
-                t,
-            ));
-        }
-        SettingsPage::TextEditor => {
-            body = body.child(field_row(
-                "Tab width:",
-                LABEL_W,
-                value_box("4", t).grow(1.0).min_w(0.0),
-                t,
-            ));
+            use crate::theme::ThemeMode;
+            let theme_ix = match s.theme {
+                ThemeMode::System => 0,
+                ThemeMode::Light => 1,
+                ThemeMode::Dark => 2,
+            };
+            let presets: Vec<&'static str> = crate::layout::LayoutPreset::ALL
+                .iter()
+                .map(|p| p.label())
+                .collect();
+            let preset_ix = crate::layout::LayoutPreset::ALL
+                .iter()
+                .position(|p| *p == s.layout.preset)
+                .unwrap_or(0);
+            body = body
+                .child(field_row(
+                    "Theme:",
+                    LABEL_W,
+                    pop_select(
+                        layer,
+                        kit,
+                        t,
+                        "settings-theme",
+                        "Theme",
+                        PopId::Theme,
+                        pick(THEMES, theme_ix),
+                        &static_opts(THEMES),
+                        pop == Some(PopId::Theme),
+                        |s: &mut AppState, i| {
+                            s.theme = match i {
+                                1 => ThemeMode::Light,
+                                2 => ThemeMode::Dark,
+                                _ => ThemeMode::System,
+                            };
+                            crate::layout::save(s);
+                        },
+                    )
+                    .grow(1.0)
+                    .min_w(0.0),
+                    t,
+                ))
+                .child(field_row(
+                    "Layout:",
+                    LABEL_W,
+                    pop_select(
+                        layer,
+                        kit,
+                        t,
+                        "settings-layout",
+                        "Layout preset",
+                        PopId::LayoutPreset,
+                        pick(&presets, preset_ix),
+                        &static_opts(&presets),
+                        pop == Some(PopId::LayoutPreset),
+                        |s: &mut AppState, i| {
+                            if let Some(p) = crate::layout::LayoutPreset::ALL.get(i) {
+                                crate::layout::apply_preset(s, *p);
+                            }
+                        },
+                    )
+                    .grow(1.0)
+                    .min_w(0.0),
+                    t,
+                ));
         }
         SettingsPage::Synthesis => {}
     }

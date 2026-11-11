@@ -328,12 +328,13 @@ pub fn start_run(
         return Err(format!("{} is already running", busy.run_name()));
     }
     let pins = snapshot_pin_constraints(s);
+    let strategy = impl_strategy_for(&s.flow.impl_strategy);
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = cancel.clone();
     std::thread::Builder::new()
         .name(format!("helion-run-{}", kind.run_name()))
-        .spawn(move || run_worker(kind, source, part, pins, tx, worker_cancel))
+        .spawn(move || run_worker(kind, source, part, pins, strategy, tx, worker_cancel))
         .map_err(|e| format!("failed to spawn run thread: {e}"))?;
     s.runs.set_active(kind, rx, cancel);
     match kind {
@@ -610,11 +611,21 @@ fn is_rtl_source(name: &str) -> bool {
 
 /// The worker body: real engine flow (synth [+ opt/place/route]) streaming
 /// real stage lines, then the real reports (or the real error).
+/// The implementation strategy a project setting names: a real
+/// `helion_proj::RunStrategy` preset (Default, TimingExplore, RuntimeOpt,
+/// ...), falling back to Default for legacy labels.
+pub fn impl_strategy_for(label: &str) -> helion_proj::RunStrategy {
+    helion_proj::RunStrategy::preset(label.trim())
+        .or_else(|_| helion_proj::RunStrategy::preset("default"))
+        .unwrap_or_else(|_| helion_proj::RunStrategy::fallback())
+}
+
 fn run_worker(
     kind: RunKind,
     source: PathBuf,
     part_req: String,
     pins: Vec<(String, String, String)>,
+    strategy: helion_proj::RunStrategy,
     tx: mpsc::Sender<RunEvent>,
     cancel: Arc<AtomicBool>,
 ) {
@@ -705,7 +716,24 @@ fn run_worker(
         cancelled();
         return;
     }
-    if let Err(e) = session.place_design(&dev) {
+    send(
+        format!("Implementation strategy: {}", strategy.preset),
+        MsgSev::Info,
+    );
+    if strategy.opt_level >= 1 {
+        match session.opt_design_step() {
+            Ok(n) => send(format!("opt_design removed={n}"), MsgSev::Info),
+            Err(e) => {
+                finish(Err(format!("opt_design failed: {e}")));
+                return;
+            }
+        }
+        if is_cancelled() {
+            cancelled();
+            return;
+        }
+    }
+    if let Err(e) = session.place_design_with(&dev, strategy.place_opts()) {
         finish(Err(format!("place_design failed: {e}")));
         return;
     }
@@ -724,7 +752,7 @@ fn run_worker(
         cancelled();
         return;
     }
-    if let Err(e) = session.route_design(&dev) {
+    if let Err(e) = session.route_design_with(&dev, strategy.route_opts()) {
         finish(Err(format!("route_design failed: {e}")));
         return;
     }
@@ -1738,6 +1766,17 @@ fn drc_item_from(v: &helion_drc::DrcViolation) -> DrcItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn impl_strategy_labels_map_to_real_presets() {
+        assert_eq!(impl_strategy_for("TimingExplore").preset, "TimingExplore");
+        assert_eq!(impl_strategy_for("RuntimeOpt").opt_level, 0);
+        assert_eq!(
+            impl_strategy_for("Helion Implementation Defaults").preset,
+            "Default",
+            "legacy labels fall back to Default"
+        );
+    }
     use std::time::{Duration, Instant};
 
     fn counter_source() -> PathBuf {

@@ -891,7 +891,7 @@ impl AppState {
                 synth_strategy: "Helion Synthesis Defaults".into(),
                 synth_reports: "Helion Synthesis Default Reports".into(),
                 impl_run: RunStatus::NotStarted,
-                impl_strategy: "Helion Implementation Defaults".into(),
+                impl_strategy: "Default".into(),
                 impl_reports: "Helion Implementation Default Reports".into(),
                 sim: RunStatus::NotStarted,
             },
@@ -1173,7 +1173,7 @@ mod tests {
         assert_eq!(s.project.part, "HL10T-C32-1");
         assert_eq!(s.project.top, None);
         assert_eq!(s.flow.synth_strategy, "Helion Synthesis Defaults");
-        assert_eq!(s.flow.impl_strategy, "Helion Implementation Defaults");
+        assert_eq!(s.flow.impl_strategy, "Default");
         assert!(
             s.console
                 .lines
