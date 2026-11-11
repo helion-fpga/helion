@@ -676,10 +676,64 @@ fn editor_toolbar(t: &VivadoTheme) -> El {
                 }
             }));
         } else {
-            bar = bar.child(tool_btn((*key).into(), tip, glyph, move |s| echo(s, tcl)));
+            // Cut / Copy: the selection, or the caret's whole line when
+            // nothing is selected, onto the system clipboard.
+            let cut = matches!(kind, EditorTool::Cut);
+            bar = bar.child(
+                el().key(String::from(*key))
+                    .role("button")
+                    .label(*tip)
+                    .help(*tip)
+                    .focusable(true)
+                    .size(24.0, 24.0)
+                    .center()
+                    .on_press_tx(move |s: &mut AppState, tx: &mut Tx| {
+                        clipboard_action(s, tx, cut);
+                        let _ = tcl;
+                    })
+                    .child(glyph),
+            );
         }
     }
     bar
+}
+
+/// Copy (or cut) the selection — or the caret line when nothing is
+/// selected — to the clipboard. Cutting is one undo step.
+fn clipboard_action(s: &mut AppState, tx: &mut Tx, cut: bool) {
+    if s.editor.tabs.is_empty() {
+        return;
+    }
+    let edit = &s.editor.edit;
+    let selected = edit.selected().to_string();
+    if !selected.is_empty() {
+        tx.copy(selected);
+        if cut {
+            flush_edit(s);
+            s.editor.push_undo_active(active_is_xdc(s));
+            s.editor.edit.insert("");
+            s.editor.dirty = true;
+            flush_edit(s);
+        }
+        return;
+    }
+    let line = caret_line(s);
+    let range = s.editor.edit.line_range(line);
+    let text = s.editor.edit.text[range.clone()].to_string();
+    tx.copy(format!("{text}\n"));
+    if cut {
+        flush_edit(s);
+        s.editor.push_undo_active(active_is_xdc(s));
+        let lines = active_lines_mut(s);
+        if line < lines.len() {
+            lines.remove(line);
+        }
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        s.editor.dirty = true;
+        reload_edit(s);
+    }
 }
 
 /// Find bar under the toolbar: query field, live match count, prev/next
