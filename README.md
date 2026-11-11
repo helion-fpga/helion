@@ -1,156 +1,162 @@
 <p align="center">
-  <img src="docs/brand/lockup.png" alt="Helion" width="420">
+  <img src="docs/brand/lockup.png" alt="Helion FPGA CAD" width="420">
 </p>
 
 <p align="center">
-  <strong>The full FPGA flow in one Rust binary: synth, pack, place, route, timing, bitstream.</strong>
-</p>
-
-<p align="center">
-  <a href="https://github.com/helion-fpga/helion/releases/latest">Download</a> &bull;
-  <a href="https://helion-fpga.github.io/helion/">Docs</a> &bull;
-  <a href="CHANGELOG.md">Changelog</a> &bull;
-  <a href="ROADMAP.md">Roadmap</a> &bull;
-  <a href="CONTRIBUTING.md">Contributing</a>
+  <strong>An open-source FPGA design suite in Rust: synthesis, place and route, timing,<br>simulation, bitstreams and hardware debug, in one CLI and one IDE.</strong>
 </p>
 
 <p align="center">
   <a href="https://github.com/helion-fpga/helion/actions/workflows/ci.yml"><img src="https://github.com/helion-fpga/helion/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/helion-fpga/helion/releases/latest"><img src="https://img.shields.io/github/v/release/helion-fpga/helion" alt="Latest release"></a>
   <a href="https://github.com/helion-fpga/helion/releases"><img src="https://img.shields.io/github/downloads/helion-fpga/helion/total.svg" alt="Downloads"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License"></a>
+  <a href="rust-toolchain.toml"><img src="https://img.shields.io/badge/rust-1.99.1-orange.svg" alt="Rust 1.99.1"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg" alt="License: AGPL-3.0-or-later"></a>
 </p>
 
 <p align="center">
-  <a href="docs/screenshots/demo-run.mp4"><img src="docs/screenshots/demo-teaser.gif" alt="Helion IDE: full implement flow on complex.sv, synth through route, device view, schematic, timing, waveform" width="800"></a><br>
-  <em>65-second tour: editor, synth to route, device view, schematic, timing reports, waveform. <a href="docs/screenshots/demo-run.mp4">Watch the full video</a>.</em>
+  <a href="https://helion-fpga.github.io/helion/">Website</a> &middot;
+  <a href="https://helion-fpga.github.io/helion/start.html">Install</a> &middot;
+  <a href="https://helion-fpga.github.io/helion/use.html">User guide</a> &middot;
+  <a href="CHANGELOG.md">Changelog</a> &middot;
+  <a href="ROADMAP.md">Roadmap</a> &middot;
+  <a href="CONTRIBUTING.md">Contributing</a>
 </p>
 
-Helion is an FPGA CAD suite: write SystemVerilog or VHDL, run one command, and get a placed, routed, timing-closed bitstream. No vendor tools, no black boxes. It targets its own HL10T die, Xilinx 7-series parts (xc7a35t today), iCE40 (HX8K), and ECP5 (LFE5U-85F), and it is architected for more: the compiler emits a vendor-neutral netlist IR, and each device family is a backend.
+<p align="center">
+  <img src="docs/screenshots/ide-summary.png" alt="Helion IDE Project Summary after implementing the full Ibex RV32 core" width="900"><br>
+  <em>The Helion IDE after a full implementation of the ysyx Ibex RV32 core on an HL10S part.</em>
+</p>
+
+## What is Helion
+
+Helion is a complete FPGA CAD flow written from scratch in Rust. You give it
+SystemVerilog, VHDL or C; it synthesizes, packs, places, routes, runs static
+timing analysis and writes a bitstream. The same engines drive a command-line
+tool (`helion`), a Tcl console, and a desktop IDE (`helion-ide`) with the
+views you expect from a commercial tool: Flow Navigator, device floorplan,
+schematic, timing analysis, waveforms, reports and a Hardware Manager.
+
+Helion has its own FPGA architecture, **HL10**, described in an open
+architecture database (HAD), and backends for **Lattice iCE40**, **Lattice
+ECP5** and **Xilinx 7-series** parts built on the open bitstream
+documentation projects. No vendor tools, libraries or databases are needed.
+
+- **Deterministic.** Same RTL in, same bits out. QoR tests fail when LUT
+  counts, WNS or bitstream size regress, and CI checks the gold timing number
+  on every push.
+- **Self-contained.** One clone builds the CLI, the IDE and the device data.
+  Nothing outside the repository and crates.io is needed.
+- **Honest UI.** Every control in the IDE does real work, or is disabled and
+  says why.
 
 ## Screenshots
 
-All from real runs.
+All screenshots are of a real implementation of the full Ibex RV32 core, not mock-ups.
 
-<p align="center">
-  <img src="docs/screenshots/ide-physview.png" alt="Physical View 2.0: device view with heat maps, inspector, and layer controls" width="800"><br>
-  <em>Physical View 2.0: complex.sv placed, 71 LUTFFs + 22 IOBs, journal showing the real opt/place/route run, WNS_PS=8740</em>
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/ide-schematic.png" alt="Schematic with level-of-detail block view on a 12k-cell design" width="800"><br>
-  <em>Schematic with level-of-detail blocks on a 12,174-cell Ibex</em>
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/ide-waveform.png" alt="Waveform viewer with density toggle" width="800"><br>
-  <em>Waveform viewer: real 16-cycle sim on complex.sv, LED trace toggling</em>
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/ide-crossprobe.png" alt="Cross-probing a cell in the device view" width="800"><br>
-  <em>Cross-probing: cell u_ff0 selected, routes highlighted on the die, Inspector populated</em>
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/ide-tcl.png" alt="Tcl console" width="800"><br>
-  <em>Real Tcl console: synth_design, place_design, write_bitstream, get_cells</em>
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/ide-qor.png" alt="QoR suggestions engine" width="800"><br>
-  <em>QoR suggestions engine with measured impact ranking</em>
-</p>
-
-## Why Helion
-
-- **One binary, whole flow.** `helion implement design.prj` runs synthesis, packing, placement, PathFinder routing, STA, bitstream. No toolchain stitching.
-- **Deterministic.** Same RTL in, same bits out. The QoR gate fails the build if LUT counts, WNS, or bitstream bytes move without a reason recorded in the same commit.
-- **Fail-loud.** Over-capacity designs error instead of emitting a clipped bitstream; congested routing is refused, never silently clipped.
-- **Measured.** Frontend allocations fell 24.2M to 409k (down 98%) across the perf campaign; the area campaign cut uart 420 to 244 LUTs (down 42%). Every number traces to the benchmark report or a pushed commit.
-- **Multi-vendor by design.** `NetlistIR` plus a `Backend` trait. HL10T, Xilinx 7-series, iCE40, and ECP5 are the first four backends, not the only ones.
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/ide-device.png" alt="Device view of the routed Ibex design"><br><sub><b>Device.</b> The routed design on the die, with nets drawn.</sub></td>
+    <td width="50%"><img src="docs/screenshots/ide-timing.png" alt="Timing analysis view"><br><sub><b>Timing.</b> Intra-clock paths from STA on the routed design.</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/ide-schematic.png" alt="Schematic view"><br><sub><b>Schematic.</b> The implemented netlist, with fan-in and fan-out cones.</sub></td>
+    <td width="50%"><img src="docs/screenshots/ide-editor.png" alt="Source editor"><br><sub><b>Editor.</b> SystemVerilog source with highlighting and diagnostics.</sub></td>
+  </tr>
+  <tr>
+    <td colspan="2"><img src="docs/screenshots/ide-console.png" alt="Tcl console with utilization and timing reports"><br><sub><b>Tcl console.</b> <code>report_utilization</code> and <code>report_timing -max_paths 5</code> on the routed design.</sub></td>
+  </tr>
+</table>
 
 ## Features
 
-**Compile**
-- SystemVerilog / VHDL-2008-subset frontend, AIG-based synthesis with ABC-style rewriting (structural hashing, cut-based resynthesis)
-- LUT6/FF/DSP/BRAM packing, simulated-annealing placement, PathFinder routing
-- Graph-based STA: WNS/TNS, hold checks, per-path reports
-- Bitstream generation with hash-verified round trips
+**Design entry and synthesis**
+- SystemVerilog (IEEE 1800 synthesizable subset) and VHDL-2008 subset frontends; C high-level synthesis
+- AIG-based logic synthesis with ABC-style rewriting, LUT6 mapping, carry, DSP and block-RAM inference
+- Out-of-context module synthesis with a checkpoint cache; IP packages (`.helion`), IP Catalog and block design
 
-**Xilinx 7-series backend (v3.0)**
-- xc7a35t device model from open bitstream databases (Project X-Ray)
-- Pack, place, route, FASM emission, frames-to-bitstream, all in Rust, zero vendor tools
-- FASM output byte-identical to prjxray's encoder; generated bitstreams decode through Project X-Ray tooling with zero unconverted bits and the correct IDCODE
-- Hard blocks: CARRY4, RAMB18E1/RAMB36E1, DSP48E1, BUFG clocking, IO standards from X-Ray segbits; per-device timing model consumed by STA
+**Implementation**
+- Packing, placement and PathFinder routing; pblock placement regions
+- Design runs with strategies and seed sweeps, checkpoints (`.hckp`), incremental runs
+- ECO edits with incremental bitstreams; partial reconfiguration (DFX) with per-module partial bitstreams
+- Bitstream generation for every supported family
 
-**iCE40 backend**
-- iCE40-HX8K from Project IceStorm device data; pack, place, A* route, `.asc` emission, all in Rust, zero vendor tools
-- LUT6 to LUT4 Shannon decomposition, bit-exact against arachne-pnr
-- SB_CARRY chains, SB_RAM40_4K INIT (bit-exact vs arachne-pnr), SB_PLL40 config (exact vs arachne-pnr), global clock network
-- `.asc` output round-trips bit-perfect through icepack/iceunpack
+**Analysis**
+- Graph-based STA: WNS/TNS, hold, per-path reports, clock interaction, XDC/SDC constraints
+- Clock-domain-crossing analysis with eleven violation classes
+- Utilization, vectorless and VCD-driven power, DRC and methodology checks, control sets, SSN, IBIS, QoR suggestions
 
-**ECP5 backend**
-- LFE5U-85F from the Project Trellis open bitstream database; pack, place, A* route, textcfg emission, all in Rust, zero vendor tools
-- CCU2 carry chains (Xilinx MUXCY semantics preserved bit-for-bit), DP16KD block RAM with INIT, MULT18X18D DSP, PLL, DCC global clocks
-- 24-bit counter blinky end to end: yosys to textcfg (852 arcs), accepted by `ecppack` with a valid ECP5 preamble
+**Simulation and verification**
+- Event simulator and cycle-level fabric model; testbench runner with self-checking testbenches
+- Waveform viewer with cursors, analog and fixed-point display, and SPI/UART/AXI-Lite/FSM decoders
+- Code coverage, SystemVerilog assertions (subset), SAT-based equivalence checking (`helion equiv`)
 
-**Verification (v3.0)**
-- SAT-based combinational equivalence checking (miter + Tseitin, FFs cut to pseudo-IOs)
-- SystemVerilog assertions: immediate and concurrent assert, implication operators, `$rose`/`$fell`/`$stable`
-- Clock-domain-crossing structural analysis (11 violation classes), integrated in the IDE
+**Hardware and debug**
+- Hardware Manager with a simulated cable, openFPGALoader, and a native FTDI JTAG engine
+- Integrated logic analyzer (ILA), VIO and JTAG-to-AXI over any JTAG cable
+- Configuration memory: erase, blank check, program, verify, read back
 
 **IDE**
-- Physical View 2.0: FPGA resource layers, solo/isolate, inspector, congestion and timing heat maps, find palette, ruler
-- Schematic with level-of-detail for large designs, hierarchy browser, waveform viewer
-- Cross-probing, Tcl console, design runs with strategy sweep, checkpoints, testbench runner, constraints wizard, QoR suggestions, VCD-driven power, integrated logic analyzer
+- Vivado-style shell: Flow Navigator, Sources, Summary, command palette, dockable panes, light and dark themes
+- Device view with I/O planning, package pins, pblocks and heat maps; schematic; timing; waveform; reports
+- Tcl console on the same engines as the GUI, plus windowless modes for scripts and CI
 
-## The full tour
+The [user guide](https://helion-fpga.github.io/helion/use.html) walks through each one.
 
-<p align="center">
-  <a href="docs/screenshots/demo-run.mp4"><img src="docs/screenshots/demo-poster.png" alt="Helion IDE full-flow tour: editor, implement, device view, schematic, timing, waveform" width="800"></a><br>
-  <em>65 seconds, no audio: editor, implement flow, device view, schematic, timing reports, waveform sim on complex.sv. Click to watch.</em>
-</p>
+## Supported devices
 
-## Quickstart
+| Family | Parts | Bitstream output | How it is checked |
+|---|---|---|---|
+| **Helion HL10** | `HL10T-C32-1` (8,192 LUT6), `HL10T-DSP1`, `HL10S-C64-1` (32,768 LUT6), `HL10M-C128-1` (131,072 LUT6) | `.hbits` | Gold QoR tests; bitstreams load into Helion's fabric model and simulator |
+| **Lattice iCE40** | `ice40-hx8k` | IceStorm `.asc` (`icepack` makes the `.bin`) | `.asc` round-trips bit-exactly through icepack/iceunpack |
+| **Lattice ECP5** | `LFE5U-85F` | Trellis text config (`ecppack` makes the `.bit`) | Blinky config accepted by `ecppack` |
+| **Xilinx 7-series** | `xc7a35t` | FASM, frames and `.bit` | Blinky FASM-to-frames is byte-identical to prjxray; needs the Project X-Ray database on disk |
 
-```bash
-git clone https://github.com/helion-fpga/helion.git
-cd helion
-cargo run -p helion-cli -- run examples/counter.sv --cycles 16
-# LED[16]=0000000111111110, same bits in the fabric model and the event sim
-```
+HL10 is Helion's own architecture. Its parts are defined in
+[`devices/helion/`](devices/helion/); there is no HL10 silicon. Bitstreams for
+the iCE40, ECP5 and 7-series backends have not yet been tested on boards.
 
-Headless gold (the number that must not silently move):
+**Hardware Manager.** The native JTAG engine drives FTDI MPSSE cables
+(FT2232H, FT232H, including Digilent's on-board cables). Chain scans are
+verified on a real ZedBoard (Zynq-7020 plus ARM DAP, 1 to 30 MHz).
+Programming over the native cable is implemented but not yet verified on a
+board. [openFPGALoader](https://github.com/trabucayre/openFPGALoader), when
+installed, is used for program and flash; the simulated cable programs the
+HL10 fabric model.
 
-```bash
-cargo run -p helion-rune --bin helion-ide -- --headless examples/counter.sv
-# must print WNS_PS=9640
-```
+## Install
 
-## Installation
+### Prebuilt binaries
 
-Prebuilt binaries are on the [releases page](https://github.com/helion-fpga/helion/releases/latest):
+Every tagged release on the
+[releases page](https://github.com/helion-fpga/helion/releases/latest) has:
 
-- Linux x86_64 (`.tar.gz`; the IDE needs `libxkbcommon0`, `libwayland-client0` and `libusb-1.0-0`, present on desktop distros)
-- macOS arm64 (`.zip` and `.tar.gz`)
-- `SHA256SUMS.txt` for verification
+| File | Contents |
+|---|---|
+| `Helion-X.Y.Z-macos-arm64.zip` | `Helion.app` for Apple Silicon |
+| `helion-X.Y.Z-aarch64-apple-darwin.tar.gz` | `helion`, `helion-ide`, `helion-prog`, device data, examples |
+| `helion-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | The same for Linux x86_64 |
+| `SHA256SUMS.txt` | Checksums |
 
-macOS note: the app is ad-hoc signed, not notarized. On first launch, clear the quarantine flag once:
+The Linux IDE needs `libxkbcommon0`, `libwayland-client0` and
+`libusb-1.0-0`, which desktop distributions already have. The macOS app is
+ad-hoc signed, not notarized; clear the quarantine flag once after
+downloading:
 
 ```bash
 xattr -cr /Applications/Helion.app
 ```
 
-## Building from source
+### From source
 
-Prerequisites: [rustup](https://rustup.rs). The repo's `rust-toolchain.toml`
-pins Rust 1.99.1 and rustup installs it on first build. Everything else comes
-with the clone: the Rune UI framework the IDE is built on is vendored in
-`third_party/rune` (MIT), and `Cargo.lock` pins every crates.io dependency.
+Prerequisites: [rustup](https://rustup.rs). The repository's
+`rust-toolchain.toml` pins Rust 1.99.1 and rustup installs it on the first
+build. Everything else comes with the clone: the Rune UI framework the IDE is
+built on is vendored in `third_party/rune` (MIT), and `Cargo.lock` pins every
+crates.io dependency.
 
-On Linux, install the system libraries the IDE and the native JTAG cable
-driver link against:
+On Linux, install the system libraries the IDE and the native JTAG driver
+link against:
 
 ```bash
 sudo apt-get install pkg-config libxkbcommon-dev libwayland-dev libusb-1.0-0-dev   # Debian/Ubuntu
@@ -165,57 +171,117 @@ cargo build --release --locked -p helion-cli -p helion-rune
 # IDE:  ./target/release/helion-ide   (--help lists the windowless modes)
 ```
 
-Run the test suite:
+On macOS, `./scripts/build-macos-app.sh` assembles `dist/Helion.app`.
+
+## Quickstart
+
+**Command line**
 
 ```bash
-cargo test --workspace
+helion run examples/counter.sv --cycles 16
+# LED[16]=0000000111111110  (same bits in the fabric model and the event simulator)
+
+helion impl examples/counter.sv            # synth, pack, place, route, STA, bitstream
+helion report_timing examples/counter.sv   # timing report
+helion --help                              # every command
 ```
+
+**IDE**
+
+```bash
+helion-ide                         # Start page with recent projects and bundled examples
+helion-ide examples/counter.prj    # open a project
+```
+
+**Scripts and CI**, without a window, on the IDE's own Tcl interpreter:
+
+```bash
+helion-ide --headless examples/counter.sv   # full flow + report_timing; prints WNS_PS=9640
+helion-ide --source flow.tcl                # Tcl batch, exit 1 on the first error
+helion-ide --stdin                          # line-by-line Tcl console
+helion-ide --doctor                         # target triple, device data, self-check
+```
+
+`WNS_PS=9640` on the empty-constraint `examples/counter.sv` is the project's
+gold number: CI fails if it moves without a reason recorded in the same
+commit.
 
 ## Benchmarks
 
-10 real designs, identical RTL, Helion vs Yosys 0.69 + nextpnr-ecp5. Full report: [`docs/benchmarks/benchmark-report-2026-10-10.md`](docs/benchmarks/benchmark-report-2026-10-10.md).
+Ten real designs, identical RTL, Helion 2.0.5 against Yosys 0.69 +
+nextpnr-ecp5 (October 2026). Full method and results:
+[`docs/benchmarks/benchmark-report-2026-10-10.md`](docs/benchmarks/benchmark-report-2026-10-10.md).
 
-| Design | Helion LUT6 | WNS (ps) | Helion wall | Yosys+nextpnr wall |
-|---|---|---|---|---|
-| PicoRV32 | 2477 | 8700 | 3.5 s | 10.4 s |
-| AES-128 | 6534 | 8700 | 1.9 s | ~332 s |
-| UART | 379 | 9600 | 0.3 s | 5.8 s |
-| SPI | 62 | 9580 | 0.03 s | 3.6 s |
+| Design | Helion LUT6 | Helion WNS (ps) | Helion wall | Yosys + nextpnr wall |
+|---|---:|---:|---:|---:|
+| PicoRV32 | 2,477 | 8,700 | 3.5 s | 10.4 s |
+| AES-128 | 6,534 | 8,700 | 1.9 s | ~332 s |
+| UART | 379 | 9,600 | 0.3 s | 5.8 s |
+| SPI master | 62 | 9,580 | 0.03 s | 3.6 s |
 
-Caveat: Helion targets its own LUT6 fabric while the baseline targets Lattice LUT4, so absolute LUT counts are not silicon-to-silicon. Yosys+ABC produces 2 to 5x fewer LUTs (uart 420 to 244 LUTs so far). Helion's delay model is simpler and more optimistic than signoff STA; calibration is on the roadmap.
+Read these with care: Helion targeted its own LUT6 fabric and the baseline a
+Lattice LUT4 part, so LUT counts are not like for like, and Yosys + ABC still
+produces fewer LUTs. Helion's delay model is simpler and more optimistic than
+nextpnr's; calibrating it is on the roadmap.
 
-## Architecture
+## Documentation
 
-```
-RTL -> helion-sv (synth) -> NetlistIR -> Backend trait
-                                       |- HL10T: pack -> place -> route -> STA -> bitstream
-                                       `- Xilinx 7-series: pack -> place -> route -> FASM -> frames -> .bit
-```
+| | |
+|---|---|
+| [Getting started](https://helion-fpga.github.io/helion/start.html) | Install, build, first run |
+| [User guide](https://helion-fpga.github.io/helion/use.html) | The IDE and the CLI, view by view |
+| [Architecture](https://helion-fpga.github.io/helion/architecture.html) | Pipeline, crates, HAD parts, IR, constraints |
+| [Tcl reference](docs/tcl-subset.md) | The Tcl language and commands the console supports |
+| [Benchmarks](https://helion-fpga.github.io/helion/benchmarks.html) | Measured results and caveats |
+| [Changelog](CHANGELOG.md) | What changed in each release |
 
-The compiler never knows what a LUT is *for*. `NetlistIR` is vendor-neutral; each device family implements the `Backend` trait (pack, place, route, bitgen). Adding a device means writing a backend, not forking the compiler. Part facts live in HAD (`devices/helion/`), not hardcoded in the compiler.
+## Project status and roadmap
 
-**Legal fence:** Helion ships no proprietary vendor IP or databases. Vendor backends are built on open bitstream databases only.
+The next release is **4.0**: the new Rune-based IDE replaces the egui IDE,
+the native JTAG engine reaches real hardware, and the build is
+self-contained. See the [changelog](CHANGELOG.md) for the details.
 
-## Roadmap
-
-- Timing-model calibration, then timing-driven pack/place/route
-- Interactive Tcl console (autocomplete, design-database introspection)
-
-Done: backend hardening (trait driver, per-device timing models, 7-series hard blocks, big-design place and route proof), iCE40 backend on Project IceStorm, ECP5 backend on Project Trellis.
+Next up: verifying native programming on boards, timing-model calibration
+against real silicon, wiring the October campaign's optimization passes into
+the default flow, and the remaining IDE gaps listed in
+[`crates/helion-rune/SWEEP.md`](crates/helion-rune/SWEEP.md). The
+[roadmap](ROADMAP.md) has the full list.
 
 ## Contributing
 
-Rust, SystemVerilog, STA, IDE, or docs: [get involved](https://helion-fpga.github.io/helion/get-involved.html). See [CONTRIBUTING.md](CONTRIBUTING.md) and [good first issues](https://github.com/helion-fpga/helion/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
+Contributions are welcome: Rust, SystemVerilog, STA, the IDE, docs or
+testing. Start with [CONTRIBUTING.md](CONTRIBUTING.md), the
+[good first issues](https://github.com/helion-fpga/helion/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
+and [Discussions](https://github.com/helion-fpga/helion/discussions).
+Please read the [Code of Conduct](CODE_OF_CONDUCT.md). Security issues go
+through [SECURITY.md](SECURITY.md).
 
-## License
+## License and trademarks
 
-Licensed under [AGPL-3.0-or-later](LICENSE).
+Helion is licensed under [AGPL-3.0-or-later](LICENSE).
 
-The "Helion" name and logo are trademarks of Saksham Srivastava; see
-[TRADEMARKS.md](TRADEMARKS.md). The AGPL covers the code, not the brand:
-if you fork or redistribute a modified version, rename it.
+"Helion" and the Helion logo are trademarks of Saksham Srivastava; see
+[TRADEMARKS.md](TRADEMARKS.md). The license covers the code, not the brand:
+if you distribute a modified version, give it a different name.
 
-## Repository Traffic
+## Acknowledgements
+
+- [Rune](https://github.com/anomalyco/rune) (MIT), the UI framework the IDE
+  is built on, vendored in [`third_party/rune`](third_party/rune).
+- [Project X-Ray](https://github.com/f4pga/prjxray),
+  [Project IceStorm](https://github.com/YosysHQ/icestorm) and
+  [Project Trellis](https://github.com/YosysHQ/prjtrellis), whose open
+  bitstream documentation the vendor backends are built on.
+- [sv-parser](https://github.com/dalance/sv-parser) and
+  [varisat](https://github.com/jix/varisat), among the crates.io
+  dependencies listed in `Cargo.lock`.
+- The open-source cores used as examples and benchmarks, including
+  [Ibex](https://github.com/lowRISC/ibex),
+  [PicoRV32](https://github.com/YosysHQ/picorv32) and
+  [SERV](https://github.com/olofk/serv), under their own licenses.
+
+<details>
+<summary>Repository traffic</summary>
 
 <!-- TRAFFIC-START -->
 | Metric | Total | Uniques | Days tracked |
@@ -224,4 +290,6 @@ if you fork or redistribute a modified version, rename it.
 | views | 17 | 12 | 14 |
 <!-- TRAFFIC-END -->
 
-Full history: [`traffic/`](traffic/) (updated daily; GitHub drops traffic data after 14 days).
+Full history: [`traffic/`](traffic/), updated daily (GitHub keeps traffic data for 14 days).
+
+</details>
