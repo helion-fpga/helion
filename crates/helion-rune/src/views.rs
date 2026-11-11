@@ -45,6 +45,7 @@ pub mod tb;
 pub mod tb_view;
 pub mod timing;
 pub mod wave;
+pub mod wave_cfg;
 pub mod wave_decode;
 pub mod wave_demo;
 pub mod wave_style;

@@ -12,12 +12,16 @@ pub fn is_verb(name: &str) -> bool {
         || crate::views::dfx::VERBS.contains(&name)
         || crate::views::ooc::VERBS.contains(&name)
         || crate::views::coverage::VERBS.contains(&name)
+        || crate::views::wave_cfg::VERBS.contains(&name)
 }
 
 /// Run one verb (`args` without the verb name).
 pub fn tcl_verb(s: &mut AppState, name: &str, args: &[String]) -> Result<String, String> {
     if crate::views::reports::io::VERBS.contains(&name) {
         return crate::views::reports::io::tcl_verb(s, name, args);
+    }
+    if crate::views::wave_cfg::VERBS.contains(&name) {
+        return crate::views::wave_cfg::tcl_verb(s, name, args);
     }
     if crate::views::coverage::VERBS.contains(&name) {
         return crate::views::coverage::tcl_verb(s, name, args);
@@ -61,6 +65,7 @@ pub fn help(name: &str) -> Option<(&'static str, &'static str)> {
         n if crate::views::dfx::VERBS.contains(&n) => return crate::views::dfx::help(n),
         n if crate::views::ooc::VERBS.contains(&n) => return crate::views::ooc::help(n),
         n if crate::views::coverage::VERBS.contains(&n) => return crate::views::coverage::help(n),
+        n if crate::views::wave_cfg::VERBS.contains(&n) => return crate::views::wave_cfg::help(n),
         _ => return None,
     })
 }
