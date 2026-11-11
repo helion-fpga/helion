@@ -107,8 +107,6 @@ pub struct RunResult {
     pub log: Vec<LogLine>,
     /// Statement executions per `(file id, line)`.
     pub line_hits: BTreeMap<(u32, u32), u64>,
-    /// Executable statement lines per file id (zero-hit lines included).
-    pub lines: BTreeMap<(u32, u32), ()>,
     /// `if` / `assert` outcomes per `(file, line)`: (true, false).
     pub branches: BTreeMap<(u32, u32), (u64, u64, &'static str)>,
     pub map: SourceMap,

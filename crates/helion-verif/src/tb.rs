@@ -1583,6 +1583,9 @@ pub struct TbRunConfig {
     pub seed: u64,
     /// Set by the UI thread to stop an in-flight run (`tb_stop`).
     pub cancel: Option<Arc<AtomicBool>>,
+    /// `+NAME` / `+NAME=value` plusargs for class-based testbenches
+    /// (`+UVM_TESTNAME=…`, `+UVM_VERBOSITY=…`).
+    pub plusargs: Vec<String>,
 }
 
 impl TbRunConfig {
@@ -1593,6 +1596,7 @@ impl TbRunConfig {
             max_units: TB_DEFAULT_MAX_UNITS,
             seed: 1,
             cancel: None,
+            plusargs: Vec::new(),
         }
     }
 }
@@ -1840,6 +1844,8 @@ pub struct TbOutcome {
     pub dut_instance: String,
     /// Code coverage collected during the run.
     pub coverage: TbCoverage,
+    /// UVM report summary when the testbench ran a UVM test.
+    pub uvm: Option<crate::classtb::UvmSummary>,
 }
 
 #[derive(Clone, Debug)]
@@ -2595,6 +2601,10 @@ pub fn run_testbench(
     let file_label = cfg.tb_path.to_string_lossy().into_owned();
     let src = std::fs::read_to_string(&cfg.tb_path)
         .map_err(|e| TbError::new(&file_label, 0, format!("cannot read: {e}")))?;
+    // Class-based / UVM testbenches run on the helion-svtb engine.
+    if helion_svtb::wants_engine(&src) {
+        return crate::classtb::run_class_testbench(cfg, tx);
+    }
     let prog = parse_testbench(&file_label, &src)?;
 
     let dut_path = find_dut_source(&tb_dir, &prog.dut_module)?;
@@ -2880,6 +2890,7 @@ pub fn run_testbench(
         dut_module: prog.dut_module.clone(),
         dut_instance: prog.dut_instance.clone(),
         coverage,
+        uvm: None,
     })
 }
 
@@ -3585,7 +3596,7 @@ endmodule
         write_file(&d, "and_dut.sv", AND_DUT);
         let tb = write_file(&d, "and_dut_tb.sv", AND_TB_PASS);
         let (tx, rx) = mpsc::channel();
-        let cfg = TbRunConfig { tb_path: tb, vcd: true, max_units: TB_DEFAULT_MAX_UNITS, seed: 1, cancel: None };
+        let cfg = TbRunConfig { tb_path: tb, vcd: true, max_units: TB_DEFAULT_MAX_UNITS, seed: 1, cancel: None, plusargs: vec![] };
         let out = run_testbench(&cfg, Some(&tx)).unwrap();
         assert!(out.passed, "failures: {:?}", out.failures);
         assert!(out.failures.is_empty());
@@ -3663,6 +3674,7 @@ endmodule
             max_units: TB_DEFAULT_MAX_UNITS,
             seed: 1,
             cancel: Some(cancel),
+            plusargs: vec![],
         };
         let out = run_testbench(&cfg, None).unwrap();
         assert!(out.stopped, "outcome: {:?}", out.summary);
@@ -3689,7 +3701,7 @@ endmodule
             "and_dut_tb.sv",
             "module and_dut_tb;\nlogic clk;\nand_dut dut (.clk(clk), .a(clk), .b(clk), .y(clk));\nalways #5 clk = ~clk;\ninitial begin\n#100000000;\n$finish;\nend\nendmodule\n",
         );
-        let cfg = TbRunConfig { tb_path: tb, vcd: false, max_units: 100, seed: 1, cancel: None };
+        let cfg = TbRunConfig { tb_path: tb, vcd: false, max_units: 100, seed: 1, cancel: None, plusargs: vec![] };
         let e = run_testbench(&cfg, None).unwrap_err();
         assert!(e.msg.contains("timed out"), "{e}");
     }

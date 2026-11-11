@@ -2099,6 +2099,7 @@ dependencies = [
  "helion-ir",
  "helion-sim",
  "helion-sv",
+ "helion-svtb",
  "helion-vhdl",
  "serde",
  "serde_json",
