@@ -1,0 +1,6 @@
+# rustup installs and selects this toolchain automatically in this repo.
+# Matches [workspace.package] rust-version and the vendored Rune UI
+# (third_party/rune), which needs newer syntax than older compilers parse.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]

@@ -7,14 +7,16 @@ rust-version.workspace = true
 description = "Helion Vivado-style IDE shell on Rune (from-scratch views, no egui)"
 
 [[bin]]
-name = "helion-rune"
+# The shipped IDE binary (Helion.app, release tarballs, `helion gui`).
+name = "helion-ide"
 path = "src/main.rs"
 
 [dependencies]
-# Pinned to the audited local rev a7f276c3630f85a06a0230295da4d2bd172d8d3b
-# (a sibling checkout at ../rune); path deps keep headless builds reproducible offline.
-rune = { path = "../../../rune/crates/rune", features = ["native-file-dialog"] }
-rune-kit = { path = "../../../rune/crates/rune-kit" }
+# Rune is vendored at one exact upstream commit (third_party/rune/VENDORED.md),
+# so a plain Helion clone or source tarball builds offline with no sibling
+# checkout. Update with scripts/sync-rune.sh.
+rune = { path = "../../third_party/rune/crates/rune", features = ["native-file-dialog"] }
+rune-kit = { path = "../../third_party/rune/crates/rune-kit" }
 # Real engine flows for runs.rs (same crates helion-ide --headless drives via
 # IdeModel; helion-rune never depends on the helion-gui lib itself).
 helion-device = { path = "../helion-device" }

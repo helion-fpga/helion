@@ -32,13 +32,15 @@ members = [
     "crates/helion-rune",
     "crates/helion-verif",
 ]
+# Vendored Rune UI framework (its own workspace; see scripts/sync-rune.sh).
+exclude = ["third_party"]
 
 [workspace.package]
 version = "3.0.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/helion-fpga/helion"
-# Mirrors Rune's pinned toolchain (rune/rust-toolchain.toml): Rune declares no
+# Mirrors Rune's pinned toolchain (rust-toolchain.toml upstream): Rune declares no
 # rust-version but uses let-chains, which rustc 1.85 cannot parse.
 rust-version = "1.99.1"
 
