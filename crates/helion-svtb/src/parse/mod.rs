@@ -398,7 +398,7 @@ impl<'a> Parser<'a> {
         if let Some(m) = self.peek_ident().map(str::to_string) {
             let mut k = 1;
             if self.is_op_at(1, "#") {
-                k = 1 + self.skip_balanced_from(2).map(|n| n + 1).ok_or_else(|| self.err("unbalanced #("))?;
+                k = self.skip_balanced_from(2).ok_or_else(|| self.err("unbalanced #("))?;
             }
             if matches!(self.tok_at(k), Some(Tok::Id(_))) && self.is_op_at(k + 1, "(") {
                 self.p += 1;
@@ -715,7 +715,7 @@ impl<'a> Parser<'a> {
                 let iface = self.ident()?;
                 if self.is_op("#") {
                     let n = self.skip_balanced_from(1).ok_or_else(|| self.err("unbalanced #("))?;
-                    self.p += 1 + n;
+                    self.p += n;
                 }
                 let modport = if self.is_op(".") && matches!(self.tok_at(1), Some(Tok::Id(_))) {
                     self.p += 1;

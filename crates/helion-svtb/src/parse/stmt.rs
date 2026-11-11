@@ -31,7 +31,7 @@ impl Parser<'_> {
         loop {
             if self.is_op_at(k, "#") && self.is_op_at(k + 1, "(") {
                 match self.skip_balanced_from(k + 1) {
-                    Some(n) => k += 1 + n,
+                    Some(n) => k = n,
                     None => return false,
                 }
             }
