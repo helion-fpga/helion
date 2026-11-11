@@ -64,16 +64,27 @@ const RULER_H: f32 = 22.0;
 const LEFT_W: f32 = 260.0;
 /// Scope panel height; Objects takes the rest.
 const SCOPE_H: f32 = 112.0;
-/// Ruler/grid tick every N samples.
+/// Ruler/grid tick every N samples (at least; see [`grid_step`]).
 const GRID_STEP: usize = 16;
+
+/// Samples between grid lines at `pps`: [`GRID_STEP`], doubled until the
+/// lines stand at least 8pt apart, so a fitted long run keeps a readable
+/// grid instead of a hatch (and draws a bounded number of lines).
+pub(crate) fn grid_step(pps: f32) -> usize {
+    let mut g = GRID_STEP;
+    while (g as f32) * pps < 8.0 && g < 1 << 20 {
+        g *= 2;
+    }
+    g
+}
 /// Tree row height (compact CAD density).
 const ROW_H: f32 = 20.0;
 /// Toolbar height.
 const TOOL_H: f32 = 26.0;
 /// Zoom step per in/out press.
 const ZOOM_STEP: f32 = 1.25;
-/// Zoom limits.
-const ZOOM_MIN: f32 = 0.25;
+/// Zoom limits (the low end fits an 8192-sample real trace in 256pt).
+const ZOOM_MIN: f32 = 1.0 / 128.0;
 /// Zoom limits.
 const ZOOM_MAX: f32 = 4.0;
 
@@ -917,6 +928,18 @@ impl WaveState {
         self.zoom = 1.0;
     }
 
+    /// Fit the whole grid into a trace viewport `view_w` points wide (100%
+    /// when the width is unknown, as before the first layout).
+    pub fn zoom_fit_to(&mut self, view_w: Option<f32>) {
+        let n = self.sample_len();
+        match view_w.filter(|w| *w > 0.0) {
+            Some(w) if n > 0 => {
+                self.zoom = (w / (n as f32 * BASE_PPS)).clamp(ZOOM_MIN, ZOOM_MAX);
+            }
+            _ => self.zoom_fit(),
+        }
+    }
+
     pub fn zoom_label(&self) -> String {
         format!("{}%", (self.zoom * 100.0).round())
     }
@@ -1091,7 +1114,7 @@ fn ruler_shape(s: &AppState, t: &VivadoTheme) -> Shape {
     while g <= n {
         let x = g as f32 * pps;
         shape = shape.line([x, 10.0], [x, RULER_H], 1.0, LineCap::Butt, t.text_faint);
-        g += GRID_STEP;
+        g += grid_step(pps);
     }
     shape
 }
@@ -1110,7 +1133,7 @@ fn live_lane_shape(s: &AppState, t: &VivadoTheme, trace: &LiveTrace, lane_h: f32
     while g <= n {
         let x = g as f32 * pps;
         shape = shape.line([x, 0.0], [x, lane_h], 1.0, LineCap::Butt, t.wave_grid);
-        g += GRID_STEP;
+        g += grid_step(pps);
     }
     let hi = 4.0;
     let lo = lane_h - 4.0;
@@ -1249,6 +1272,8 @@ fn radix_control(s: &AppState, t: &VivadoTheme) -> El {
 
 /// Sim toolbar: run controls, zoom, cursor step, A/B + markers, radix.
 fn wave_toolbar(s: &AppState, t: &VivadoTheme) -> El {
+    // The trace viewport's width as last laid out, for Fit.
+    let fit_w = rune::memo::layout_size("wave-canvas").map(|[w, _]| w);
     let running = s.sim.is_active();
     let can_restart = !running && s.sim.last_run().is_some();
     let run_btn = if running {
@@ -1296,7 +1321,7 @@ fn wave_toolbar(s: &AppState, t: &VivadoTheme) -> El {
                 .child(dim_label(&s.wave.zoom_label(), t)),
         )
         .child(tool_btn("wave-zoom-in", "+", t).on_press(|s: &mut AppState| s.wave.zoom_in()))
-        .child(tool_btn("wave-zoom-fit", "Fit", t).on_press(|s: &mut AppState| s.wave.zoom_fit()))
+        .child(tool_btn("wave-zoom-fit", "Fit", t).on_press(move |s: &mut AppState| s.wave.zoom_fit_to(fit_w)))
         .child(
             tool_btn("wave-cursor-prev", "‹", t)
                 .on_press(|s: &mut AppState| s.wave.step_cursor(-1)),
@@ -1849,7 +1874,8 @@ fn ruler(s: &AppState, t: &VivadoTheme) -> El {
         .child(canvas(ruler_shape(s, t)).w_full().h_full());
     let n = sample_len(s);
     // Label every k-th tick so labels keep >= 56pt apart at any zoom.
-    let stride = ((56.0 / (GRID_STEP as f32 * pps)).ceil() as usize).max(1) * GRID_STEP;
+    let step = grid_step(pps);
+    let stride = ((56.0 / (step as f32 * pps)).ceil() as usize).max(1) * step;
     let mut g = 0;
     while g <= n {
         // The end tick keeps its line but no label: the text would run off
@@ -1863,7 +1889,7 @@ fn ruler(s: &AppState, t: &VivadoTheme) -> El {
                     .absolute(g as f32 * pps + 3.0, 1.0),
             );
         }
-        g += GRID_STEP;
+        g += step;
     }
     for (i, m) in s.wave.markers.iter().enumerate() {
         let x = m.sample as f32 * pps;
