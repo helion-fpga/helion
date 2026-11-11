@@ -313,6 +313,16 @@ fn summary_block(s: &AppState, t: &VivadoTheme) -> El {
                 .color(t.text)
                 .key("timing-title"),
         )
+        // Non-HL10T parts: say which delay model produced the numbers.
+        .children((!s.timing.model.is_empty()).then(|| {
+            text(format!("Delay model: {}", s.timing.model))
+                .font(VivadoTheme::FONT_UI)
+                .color(t.warn)
+                .key("timing-model")
+                .w_full()
+                .truncate()
+                .help_when_truncated(s.timing.model.clone())
+        }))
         .child(
             row()
                 .w_full()

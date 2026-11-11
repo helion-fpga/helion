@@ -711,6 +711,9 @@ pub struct TimingState {
     /// Operating conditions behind the analysis (`set_operating_conditions`).
     pub voltage_mv: i64,
     pub temp_c: i64,
+    /// Delay model behind the numbers when it is not the HL10T gold model
+    /// (`""` for Helion parts), e.g. the iCE40 model and its caveat.
+    pub model: String,
 }
 
 /// One hierarchy occupancy row, mirroring `ide.rs::HierOccupancy`
@@ -746,6 +749,34 @@ pub struct UtilState {
     pub hier: Vec<HierRow>,
     /// Design the occupancy was counted from.
     pub design: String,
+    /// Non-Helion family the counts come from (`""` for HL10T parts): the
+    /// row labels then name that family's primitives (`LUT4`, `EBR`, ...).
+    pub family: String,
+    /// Family resource names for the six rows (LUT, register, RAM, I/O,
+    /// DSP, global clock), set with `family`.
+    pub family_labels: Vec<String>,
+}
+
+impl UtilState {
+    /// `(label, used, available)` rows in display order.
+    pub fn rows(&self) -> Vec<(String, u32, u32)> {
+        const HELION: [&str; 6] = ["Slice LUTs", "Slice Registers", "Block RAM Tile", "Bonded IOB", "DSPs", "BUFGCTRL"];
+        let vals = [
+            (self.luts_used, self.luts_avail),
+            (self.regs_used, self.regs_avail),
+            (self.bram_used, self.bram_avail),
+            (self.io_used, self.io_avail),
+            (self.dsp_used, self.dsp_avail),
+            (self.bufg_used, self.bufg_avail),
+        ];
+        vals.iter()
+            .enumerate()
+            .map(|(i, (u, a))| {
+                let label = self.family_labels.get(i).cloned().unwrap_or_else(|| HELION[i].to_string());
+                (label, *u, *a)
+            })
+            .collect()
+    }
 }
 
 /// Post-implementation on-chip power split, in milliwatts, plus the UG907

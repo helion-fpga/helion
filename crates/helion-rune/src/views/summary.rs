@@ -109,13 +109,14 @@ fn run_impl_link(key: &'static str, t: &VivadoTheme) -> El {
 }
 
 /// One `label: value` row.
-fn kv(label_text: &'static str, value: El, t: &VivadoTheme) -> El {
+fn kv(label_text: impl Into<String>, value: El, t: &VivadoTheme) -> El {
+    let label_text: String = label_text.into();
     row()
         .w_full()
         .h(ROW_H)
         .items_center()
         .gap(6.0)
-        .child(el().w(LABEL_W).child(dim_label(label_text, t)))
+        .child(el().w(LABEL_W).child(dim_label(&label_text, t).truncate().help_when_truncated(label_text.clone())))
         .child(value)
 }
 
@@ -693,17 +694,17 @@ fn util_card(s: &AppState, t: &VivadoTheme) -> El {
             .padding(8.0)
             .gap(2.0)
             .child(kv(
-                "Slice LUTs:",
+                format!("{}:", u.rows()[0].0),
                 ui_label(&format_util(u.luts_used, u.luts_avail), t).key("summary-luts"),
                 t,
             ))
             .child(kv(
-                "Slice Registers:",
+                format!("{}:", u.rows()[1].0),
                 ui_label(&format_util(u.regs_used, u.regs_avail), t).key("summary-regs"),
                 t,
             ))
             .child(kv(
-                "Block RAM Tile:",
+                format!("{}:", u.rows()[2].0),
                 ui_label(&format_util(u.bram_used, u.bram_avail), t).key("summary-bram"),
                 t,
             ))

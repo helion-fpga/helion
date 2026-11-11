@@ -507,6 +507,12 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         let _ = views::tb_uvm::seed_uvm_fixture(s, true);
         s.toasts = state::ToastState::default();
     }),
+    ("sim-vhdl", |s| {
+        s.center = state::CenterPane::Sim;
+        // examples/counter_tb.vhd and a failing copy, run in a temp dir.
+        let _ = views::tb::seed_vhdl_fixture(s);
+        s.toasts = state::ToastState::default();
+    }),
     ("ila", |s| {
         s.center = state::CenterPane::Ila;
         let _ = views::ila::seed_ila_fixture(s);
@@ -786,6 +792,32 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
     ("reports", |s| {
         s.center = state::CenterPane::Reports;
         views::reports::demo_impl_complete(s);
+    }),
+    ("reports-ice40", |s| {
+        // Real iCE40 implementation of examples/counter.sv: LUT4/DFF/EBR
+        // rows against HX8K capacities.
+        s.center = state::CenterPane::Reports;
+        let _ = runs_family::seed_family_fixture(s, "ice40-hx8k");
+    }),
+    ("device-ice40", |s| {
+        s.center = state::CenterPane::Device;
+        let _ = runs_family::seed_family_fixture(s, "ice40-hx8k");
+    }),
+    ("timing-ice40", |s| {
+        s.center = state::CenterPane::Timing;
+        let _ = runs_family::seed_family_fixture(s, "ice40-hx8k");
+    }),
+    ("hls-fir-cosim", |s| {
+        // The FIR MAC kernel that used to read back 0 in co-simulation.
+        s.hls.source = rune::TextEdit::new("void fir_mac(int a[4], int b[4], int bias, int *out) {\n  #pragma HLS PIPELINE II=1\n  #pragma HLS ARRAY_PARTITION variable=a complete\n  #pragma HLS ARRAY_PARTITION variable=b complete\n  int acc = bias;\n  for (int i = 0; i < 4; i++) {\n    acc += a[i] * b[i];\n  }\n  *out = acc;\n}\n");
+        s.hls.vectors = rune::TextEdit::new("a=[1,2,3,4] b=[10,20,30,40] bias=5\na=[-3,7,0,9] b=[2,-5,11,1] bias=-1\n");
+        let _ = views::hls::start_synth(s);
+        views::hls::wait(s);
+        let _ = views::hls::start_cosim(s);
+        views::hls::wait(s);
+        s.hls.tab = views::hls::HlsTab::Cosim;
+        s.toasts = Default::default();
+        s.center = state::CenterPane::Hls;
     }),
     ("reports-power", |s| {
         s.center = state::CenterPane::Reports;

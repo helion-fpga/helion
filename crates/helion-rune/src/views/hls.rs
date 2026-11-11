@@ -302,8 +302,13 @@ pub fn cosim_reason(s: &AppState) -> Option<String> {
     if let Some(r) = synth_reason(s) {
         return Some(r);
     }
-    if s.hls.result().is_none() {
+    let Some(r) = s.hls.result() else {
         return Some("Run C synthesis first.".into());
+    };
+    if let helion_hls::RtlKind::InterfaceShell { reason } = &r.rtl {
+        return Some(format!(
+            "The RTL is an interface shell ({reason} is not supported by the FSMD emitter), so simulating it would not check the C function."
+        ));
     }
     match parse_vectors(&s.hls.vectors.text) {
         Ok(v) if v.is_empty() => Some("Enter at least one test vector (e.g. a=5 b=7).".into()),
