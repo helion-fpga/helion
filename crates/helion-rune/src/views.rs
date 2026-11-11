@@ -9,6 +9,8 @@ pub mod device;
 pub mod dialogs;
 pub mod editor;
 pub mod hw;
+pub mod ip;
+pub mod ip_canvas;
 pub mod palette;
 pub mod program;
 pub mod reports;

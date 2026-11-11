@@ -235,6 +235,14 @@ pub const COMMANDS: &[&str] = &[
     // Hardware Manager / IP Integrator / Bitstream / Find (old `Model::exec`).
     "report_hw_stat",
     "select_hw_stat",
+    "ip_catalog",
+    "select_ip",
+    "generate_ip",
+    "create_bd",
+    "create_bd_design",
+    "create_bd_cell",
+    "bd_drawing",
+    "bd_hdl",
     "report_bitstream",
     "select_bitstream_frame",
 ];
@@ -2705,6 +2713,33 @@ fn dispatch_host(
             s.navigate(crate::state::CenterPane::Program);
             ctl_result(crate::views::program::select_hw_stat(s, &spec), line)
         }
+        "ip_catalog" => {
+            s.navigate(crate::state::CenterPane::Ip);
+            Ctl::Value(crate::views::ip::refresh_catalog(s))
+        }
+        "select_ip" => {
+            let spec = argv.get(1..).unwrap_or_default().join(" ");
+            ctl_result(crate::views::ip::select_ip(s, &spec), line)
+        }
+        "generate_ip" => {
+            let spec = argv.get(1..).unwrap_or_default().join(" ");
+            ctl_result(crate::views::ip::generate_ip(s, &spec), line)
+        }
+        "create_bd" | "create_bd_design" | "ip_integrator" => {
+            ctl_result(crate::views::ip::create_block_design(s), line)
+        }
+        "create_bd_cell" => {
+            let spec = argv.get(1..).unwrap_or_default().join(" ");
+            ctl_result(crate::views::ip::create_bd_cell(s, &spec), line)
+        }
+        "bd_drawing" => {
+            crate::views::ip::ensure_bd(s);
+            Ctl::Value(crate::views::ip::drawing_text(s))
+        }
+        "bd_hdl" => {
+            crate::views::ip::ensure_bd(s);
+            Ctl::Value(crate::views::ip::hdl_text(s))
+        }
         "report_bitstream" | "bitstream" => {
             ctl_result(crate::views::bitstream::report_bitstream(s), line)
         }
@@ -4869,6 +4904,27 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
             "read IDCODE + STAT (sim TAP, or the sim-programmed fabric)",
         ),
         "select_hw_stat" => ("select_hw_stat NAME|BIT", "select one STAT bit card"),
+        "ip_catalog" => (
+            "ip_catalog",
+            "list the helion-ipxact IP catalog (VLNV, bus)",
+        ),
+        "select_ip" => (
+            "select_ip name|vlnv|index",
+            "select an IP core in the catalog",
+        ),
+        "generate_ip" => (
+            "generate_ip ?name?",
+            "write the core's IP-XACT output products",
+        ),
+        "create_bd" | "create_bd_design" => {
+            ("create_bd", "create an empty block design (design_1)")
+        }
+        "create_bd_cell" => (
+            "create_bd_cell ?name?",
+            "add a Helion-MM/ST core to the block design",
+        ),
+        "bd_drawing" => ("bd_drawing", "block-design canvas symbols and wires"),
+        "bd_hdl" => ("bd_hdl", "generated HDL instance table (helion-bd emit_sv)"),
         "report_bitstream" => (
             "report_bitstream",
             "bitstream KPIs plus the FAR frame table",

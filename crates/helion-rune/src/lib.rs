@@ -397,6 +397,17 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
             }
         }
     }),
+    ("ip", |s| {
+        s.center = state::CenterPane::Ip;
+        let _ = views::ip::select_ip(s, "h_uart");
+    }),
+    ("ip-bd", |s| {
+        s.center = state::CenterPane::Ip;
+        for core in ["h_uart", "h_gpio", "h_timer"] {
+            let _ = views::ip::create_bd_cell(s, core);
+        }
+        let _ = views::ip::select_ip(s, "h_gpio");
+    }),
     ("bitstream", |s| {
         s.center = state::CenterPane::Bitstream;
         if views::bitstream::seed_bitstream_fixture(s).is_ok() {
@@ -551,6 +562,7 @@ fn center_pane(s: &AppState, t: &VivadoTheme) -> El {
         state::CenterPane::Debug => views::debug::debug_pane(s, t),
         state::CenterPane::Program => views::program::program_pane(s, t),
         state::CenterPane::Reports => views::reports::reports_pane(s, t),
+        state::CenterPane::Ip => views::ip::ip_pane(s, t),
         state::CenterPane::Bitstream => views::bitstream::bitstream_pane(s, t),
     }
 }

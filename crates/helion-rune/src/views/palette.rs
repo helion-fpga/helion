@@ -118,6 +118,7 @@ fn pane_label(pane: CenterPane) -> &'static str {
         CenterPane::Debug => "Debug",
         CenterPane::Program => "Hardware Manager",
         CenterPane::Reports => "Reports",
+        CenterPane::Ip => "IP Integrator",
         CenterPane::Bitstream => "Bitstream",
     }
 }
