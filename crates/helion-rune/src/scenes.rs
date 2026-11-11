@@ -450,7 +450,18 @@ pub const ALL: &[SceneExpect] = &[
     SceneExpect {
         name: "create-part",
         surface: "dialogs",
-        keys: &["create-split", "create-part-box", "create-part-opt-0"],
+        keys: &[
+            "create-split",
+            "create-part-page",
+            "create-boards",
+            "create-board-HB1",
+            "create-part-search",
+            "create-part-table",
+            "create-part-row-HL10T-C32-1",
+            "create-part-row-ice40-hx8k",
+            "create-part-row-LFE5U-85F",
+            "create-board-xdc",
+        ],
         absent: &["settings-dialog", "xdc-split"],
     },
     SceneExpect {

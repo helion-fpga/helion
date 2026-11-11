@@ -23,6 +23,7 @@ pub mod live;
 pub mod pickers;
 pub mod project;
 pub mod runs;
+pub mod runs_family;
 pub mod scenes;
 pub mod state;
 pub mod tcl;
@@ -219,7 +220,7 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         s.dialogs.open(views::dialogs::DialogId::NewProject);
         s.dialogs.create.name = rune::TextEdit::new("project_2");
         s.dialogs.create.step = views::dialogs::CreateStep::Part;
-        s.dialogs.pop = Some(views::dialogs::PopId::CreatePart);
+        views::part_picker::pick_board(s, Some("HB1".into()));
     }),
     ("constraints-wizard", |s| {
         s.dialogs.open(views::dialogs::DialogId::Constraints);
