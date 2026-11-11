@@ -827,6 +827,8 @@ pub struct AppState {
     pub program: crate::views::program::ProgramState,
     /// IP Catalog + Block Design state (catalog, selection, BD, outputs).
     pub ip: crate::views::ip::IpState,
+    /// Find Results state (query, scopes, selected hit).
+    pub find: crate::views::find::FindState,
     /// Settings dialog + New Project / Constraints wizard UI state.
     pub dialogs: crate::views::dialogs::DialogState,
     /// Which center surface the shell shows (Summary dashboard or editor).
@@ -874,6 +876,8 @@ pub enum CenterPane {
     Ip,
     /// Bitstream: KPIs plus the FAR-addressed configuration frame table.
     Bitstream,
+    /// Find Results over the live netlist (cells / ports / nets).
+    Find,
 }
 
 /// Status-bar verb. Typed, with the exact Helion wording in one place.
@@ -1020,6 +1024,7 @@ impl AppState {
             debug: crate::views::debug::DebugState::default(),
             program: crate::views::program::ProgramState::default(),
             ip: crate::views::ip::IpState::default(),
+            find: crate::views::find::FindState::default(),
             dialogs: crate::views::dialogs::DialogState::default(),
             center: CenterPane::Summary,
             nav_back: Vec::new(),
@@ -1099,6 +1104,7 @@ impl AppState {
         self.bitstream = BitstreamState::default();
         self.program.reset_results();
         self.ip = crate::views::ip::IpState::default();
+        self.find.selected = None;
         self.toasts = ToastState::default();
         self.runs.reset();
         // A new project invalidates the sim log, the live VCD import, and

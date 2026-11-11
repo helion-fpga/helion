@@ -1075,6 +1075,33 @@ pub const ALL: &[SceneExpect] = &[
         absent: &["bitstream-table", "bitstream-kpis", "summary"],
     },
     SceneExpect {
+        name: "find",
+        surface: "find",
+        keys: &[
+            "find",
+            "find-toolbar",
+            "find-query",
+            "find-scope-cell",
+            "find-scope-port",
+            "find-scope-net",
+            "find-count",
+            "find-table",
+            "find-head",
+            "find-row-0",
+            "find-detail",
+            "find-detail-name",
+            "find-show-device",
+            "find-show-schematic",
+        ],
+        absent: &["find-empty", "find-nomatch", "summary", "editor"],
+    },
+    SceneExpect {
+        name: "find-empty",
+        surface: "find",
+        keys: &["find", "find-empty", "find-run-synth"],
+        absent: &["find-table", "find-toolbar", "summary"],
+    },
+    SceneExpect {
         name: "reports",
         surface: "reports",
         keys: &[

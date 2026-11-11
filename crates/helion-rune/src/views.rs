@@ -8,6 +8,7 @@ pub mod debug;
 pub mod device;
 pub mod dialogs;
 pub mod editor;
+pub mod find;
 pub mod hw;
 pub mod ip;
 pub mod ip_canvas;

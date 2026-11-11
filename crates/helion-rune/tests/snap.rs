@@ -217,6 +217,7 @@ fn menus_toggle_on_every_center_surface() {
         ("reports-no-run", CenterPane::Reports),
         ("ip", CenterPane::Ip),
         ("bitstream-empty", CenterPane::Bitstream),
+        ("find-empty", CenterPane::Find),
     ] {
         let mut rt = rt_for(scene);
         assert_eq!(rt.state.center, center, "[{scene}] wrong center pane");
@@ -550,6 +551,23 @@ fn program_flow_sim_cable_programs_the_real_bitstream() {
         rt.find("toast-0").is_some(),
         "completion must raise a toast"
     );
+}
+
+#[test]
+fn new_surfaces_navigate_from_tcl() {
+    let mut rt = rt_for("summary");
+    rt.update(|s, _| helion_rune::tcl::eval_command(s, "ip_catalog"));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.center, CenterPane::Ip);
+    assert!(rt.find("ip").is_some());
+    rt.update(|s, _| helion_rune::tcl::eval_command(s, "report_bitstream"));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.center, CenterPane::Bitstream);
+    assert!(rt.find("bitstream-empty").is_some());
+    rt.update(|s, _| helion_rune::tcl::eval_command(s, "find clk"));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.center, CenterPane::Find);
+    assert!(rt.find("find-empty").is_some());
 }
 
 #[test]

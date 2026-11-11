@@ -417,6 +417,15 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
     ("bitstream-empty", |s| {
         s.center = state::CenterPane::Bitstream;
     }),
+    ("find", |s| {
+        s.center = state::CenterPane::Find;
+        if live::seed_live_fixture(s).is_ok() {
+            let _ = views::find::select_find(s, "cell:u_div_u_luts2");
+        }
+    }),
+    ("find-empty", |s| {
+        s.center = state::CenterPane::Find;
+    }),
     ("reports", |s| {
         s.center = state::CenterPane::Reports;
         views::reports::demo_impl_complete(s);
@@ -564,6 +573,7 @@ fn center_pane(s: &AppState, t: &VivadoTheme) -> El {
         state::CenterPane::Reports => views::reports::reports_pane(s, t),
         state::CenterPane::Ip => views::ip::ip_pane(s, t),
         state::CenterPane::Bitstream => views::bitstream::bitstream_pane(s, t),
+        state::CenterPane::Find => views::find::find_pane(s, t),
     }
 }
 
