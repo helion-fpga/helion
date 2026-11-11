@@ -322,6 +322,10 @@ impl CoverageCollector {
             toggles.insert(name.clone(), NetToggleStats::new(name));
         }
         for n in &design.nets {
+            // Line-coverage probe nets are instrumentation, not DUT nets.
+            if helion_ir::LineProbe::is_probe(&n.attrs) {
+                continue;
+            }
             let name = resolve(n.name).to_string();
             if name != "0" && name != "1" && name != "1'b0" && name != "1'b1" {
                 toggles.insert(name.clone(), NetToggleStats::new(name));

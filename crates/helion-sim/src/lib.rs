@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 pub mod coverage;
 pub mod fast;
+pub mod line_coverage;
 pub mod sdf;
 pub mod clocking;
 pub mod cosim;
@@ -22,6 +23,10 @@ pub mod wave;
 pub use coverage::{
     BranchCoverageStats, CoverageCollector, FsmCoverageStats, FunctionalCoverageReport,
     NetToggleStats,
+};
+pub use line_coverage::{
+    LineCoverageCollector, LineCoverageReport, RtlArmHits, RtlBranchHits, RtlLineGap,
+    RtlLineHits, RtlLineKind,
 };
 pub use fast::{
     CompiledFf, CompiledNode, CompiledSim, ConeNodeKind, LevelizedSchedule, Logic4, NET_ONE,
@@ -131,6 +136,10 @@ pub struct Sim {
     timing: Option<SimTimingModel>,
     /// Runtime functional coverage collector (toggle, branch, FSM).
     coverage: CoverageCollector,
+    /// RTL line / branch coverage from line-probe nets (empty unless the
+    /// design was synthesized with probes). Interior mutability: a settled
+    /// combinational state is observed lazily when [`Sim::sample`] reads it.
+    line_cov: std::cell::RefCell<LineCoverageCollector>,
     /// DPI-C foreign function registry attached to this simulator.
     dpi: DpiRegistry,
     /// IEEE 1364 / 1800 VPI signal introspection registry.
@@ -245,6 +254,7 @@ impl Sim {
         }
         let compiled = CompiledSim::new(d);
         let coverage = CoverageCollector::from_design(d, &compiled);
+        let line_cov = std::cell::RefCell::new(LineCoverageCollector::from_design(d));
         let vpi = VpiRegistry::new(d);
         Self {
             time: 0,
@@ -268,6 +278,7 @@ impl Sim {
             compiled,
             timing: None,
             coverage,
+            line_cov,
             dpi: DpiRegistry::new(),
             vpi,
         }
@@ -303,6 +314,17 @@ impl Sim {
             memo.insert(net.to_string(), v);
             return v;
         }
+        // An output port's PAD net carries the value on its IOB's I pin
+        // (logic that reads back an output, e.g. a line-coverage probe).
+        if let Some(i) = self.iob_pad_to_i.get(net).cloned() {
+            if i != net {
+                stack.push(net.to_string());
+                let v = self.pin_net_value(&i, memo, stack);
+                stack.pop();
+                memo.insert(net.to_string(), v);
+                return v;
+            }
+        }
         memo.insert(net.to_string(), false);
         false
     }
@@ -326,12 +348,50 @@ impl Sim {
         (init >> addr) & 1 == 1
     }
 
+    /// Value of a line-probe net in the current state: LUT chains over FF /
+    /// input leaves (as [`Sim::sample`]), else the compiled engine's value.
+    fn probe_value(&self, net: &str, memo: &mut HashMap<String, bool>, stack: &mut Vec<String>) -> bool {
+        if self.net_ff.contains_key(net) || self.net_lut_o.contains_key(net) || self.input_values.contains_key(net) {
+            return self.pin_net_value(net, memo, stack);
+        }
+        self.compiled.sample(net).is_some_and(|v| v != 0)
+    }
+
+    /// Observe the line probes: `edge` = a rising edge is about to happen
+    /// (pre-edge values); the combinational state counts only when it
+    /// changed since its last observation.
+    fn observe_lines(&self, edge: bool) {
+        let mut lc = self.line_cov.borrow_mut();
+        if !lc.is_instrumented() {
+            return;
+        }
+        let state = std::mem::replace(&mut lc.dirty, false);
+        if !edge && !state {
+            return;
+        }
+        let mut memo = HashMap::new();
+        let mut stack = Vec::new();
+        lc.observe(edge, state, |net| self.probe_value(net, &mut memo, &mut stack));
+    }
+
+    fn lines_dirty(&mut self) {
+        self.line_cov.get_mut().dirty = true;
+    }
+
+    /// RTL line / branch coverage so far (see [`line_coverage`]); empty and
+    /// `instrumented == false` unless the design carries line probes.
+    pub fn line_coverage_report(&self) -> LineCoverageReport {
+        self.observe_lines(false);
+        self.line_cov.borrow().report()
+    }
+
     /// Drive a top-level input (or inout) port. The value flows through
     /// combinational LUT chains on the next [`Sim::step_posedge`], and
     /// [`Sim::sample`] reads it back immediately.
     pub fn drive_input(&mut self, port: &str, value: bool) -> Result<(), String> {
         match self.ports.get(port) {
             Some(PortDir::In) | Some(PortDir::Inout) => {
+                self.lines_dirty();
                 self.input_values.insert(port.to_string(), value);
                 let _ = self.compiled.drive_input(port, value);
                 self.compiled.eval_comb_2state();
@@ -417,6 +477,8 @@ impl Sim {
     /// net / output port (output IOBs are followed PAD → I). Returns `None`
     /// for undriven/unknown names instead of panicking.
     pub fn sample(&self, name: &str) -> Option<u64> {
+        // Reading the DUT settles it: count the new state for line coverage.
+        self.observe_lines(false);
         if name.eq_ignore_ascii_case("led") {
             return Some(u64::from(self.led));
         }
@@ -490,6 +552,7 @@ impl Sim {
             .resolve_signal(name)
             .ok_or_else(|| format!("deposit: no signal {name}"))?;
         self.forces.remove(&key);
+        self.lines_dirty();
         self.write_signal(&key, value)
     }
 
@@ -498,6 +561,7 @@ impl Sim {
         let key = self
             .resolve_signal(name)
             .ok_or_else(|| format!("force: no signal {name}"))?;
+        self.lines_dirty();
         self.write_signal(&key, value)?;
         self.forces.insert(key, value);
         Ok(())
@@ -508,6 +572,7 @@ impl Sim {
         let key = self
             .resolve_signal(name)
             .ok_or_else(|| format!("remove_force: no signal {name}"))?;
+        self.lines_dirty();
         self.forces.remove(&key);
         Ok(())
     }
@@ -531,6 +596,8 @@ impl Sim {
         let mut vpi = std::mem::take(&mut self.vpi);
         let _ = vpi.flush_inertial_puts(self);
         self.vpi = vpi;
+        // Line coverage: clocked blocks run on this edge with pre-edge values.
+        self.observe_lines(true);
         self.time += delay;
         self.cycle += 1;
         // SVA preponed region: concurrent properties + non-final immediate
@@ -585,6 +652,7 @@ impl Sim {
             let _ = self.compiled.set_ff_4state(ff, Logic4::from_bool(val));
         }
         self.coverage.sample_compiled(&self.compiled);
+        self.lines_dirty();
         // SVA postponed region: `assert final` sees the committed state.
         self.sva
             .sample_post(self.time, self.cycle, &self.ff_q, &self.stim);
