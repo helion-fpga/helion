@@ -232,6 +232,9 @@ pub const COMMANDS: &[&str] = &[
     "cancel_runs",
     "open_report",
     "launch_simulation",
+    // Bitstream (old `Model::exec`).
+    "report_bitstream",
+    "select_bitstream_frame",
 ];
 
 /// Max nested `[...]` evaluation depth (mirrors the real interp's cap idea;
@@ -2549,6 +2552,8 @@ fn dispatch_host(
                 .as_ref()
                 .map(|b| b.packets.len())
                 .unwrap_or(0);
+            // The Bitstream surface shows the console artifact too.
+            crate::views::bitstream::adopt_session_bitstream(s);
             Ctl::Value(format!("write_bitstream {n} bytes"))
         }
         "write_checkpoint" => {
@@ -2686,7 +2691,22 @@ fn dispatch_host(
         "hds::flow" => Ctl::Value("synth opt place route bits hw".into()),
         "hds::tree" => Ctl::Value(s.tcl.tree_nodes.join(" ")),
         "open_report" => cmd_open_report(s, argv, line),
+        "report_bitstream" | "bitstream" => {
+            ctl_result(crate::views::bitstream::report_bitstream(s), line)
+        }
+        "select_bitstream_frame" => {
+            let spec = argv.get(1..).unwrap_or_default().join(" ");
+            ctl_result(crate::views::bitstream::select_frame(s, &spec), line)
+        }
         _ => unknown_command(s, name, line),
+    }
+}
+
+/// Map a view-model result onto the console: value or `ERROR:` line.
+fn ctl_result(r: Result<String, String>, line: usize) -> Ctl {
+    match r {
+        Ok(v) => Ctl::Value(v),
+        Err(e) => Ctl::err(line, e),
     }
 }
 
@@ -4830,6 +4850,14 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
             "open a report surface",
         ),
         "launch_simulation" => ("launch_simulation", "start a real testbench simulation run"),
+        "report_bitstream" => (
+            "report_bitstream",
+            "bitstream KPIs plus the FAR frame table",
+        ),
+        "select_bitstream_frame" => (
+            "select_bitstream_frame index|FAR|block ?major minor?",
+            "select one configuration frame",
+        ),
         _ => return None,
     })
 }

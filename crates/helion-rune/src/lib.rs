@@ -384,6 +384,15 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         s.toasts
             .push(state::ToastKind::Success, "Device programmed", &detail);
     }),
+    ("bitstream", |s| {
+        s.center = state::CenterPane::Bitstream;
+        if views::bitstream::seed_bitstream_fixture(s).is_ok() {
+            let _ = views::bitstream::select_frame(s, "2");
+        }
+    }),
+    ("bitstream-empty", |s| {
+        s.center = state::CenterPane::Bitstream;
+    }),
     ("reports", |s| {
         s.center = state::CenterPane::Reports;
         views::reports::demo_impl_complete(s);
@@ -529,6 +538,7 @@ fn center_pane(s: &AppState, t: &VivadoTheme) -> El {
         state::CenterPane::Debug => views::debug::debug_pane(s, t),
         state::CenterPane::Program => views::program::program_pane(s, t),
         state::CenterPane::Reports => views::reports::reports_pane(s, t),
+        state::CenterPane::Bitstream => views::bitstream::bitstream_pane(s, t),
     }
 }
 
