@@ -15,12 +15,12 @@
 use helion_bits::Bitstream;
 use helion_fabric::Stat;
 
+use crate::IR_SPI_ACCESS;
 use crate::jtag_cable::JtagCable;
 use crate::spi_flash::{
     SPI_CMD_PP, SPI_CMD_RDID, SPI_CMD_RDSR, SPI_CMD_READ, SPI_CMD_SE, SPI_CMD_WREN, SPI_PAGE_SIZE,
     SPI_STATUS_WEL, SPI_STATUS_WIP,
 };
-use crate::IR_SPI_ACCESS;
 
 /// Bytes per READ transaction (keeps one DR scan bounded).
 pub const READ_CHUNK: usize = 16 * 1024;
@@ -78,7 +78,12 @@ pub trait SpiPort {
 
     fn erase_sector(&mut self, addr: u32) -> Result<(), String> {
         self.write_enable()?;
-        self.spi_xfer(&[SPI_CMD_SE, (addr >> 16) as u8, (addr >> 8) as u8, addr as u8])?;
+        self.spi_xfer(&[
+            SPI_CMD_SE,
+            (addr >> 16) as u8,
+            (addr >> 8) as u8,
+            addr as u8,
+        ])?;
         self.wait_ready()
     }
 
@@ -87,7 +92,12 @@ pub trait SpiPort {
             return Err("program_page: more than one 256-byte page".into());
         }
         self.write_enable()?;
-        let mut cmd = vec![SPI_CMD_PP, (addr >> 16) as u8, (addr >> 8) as u8, addr as u8];
+        let mut cmd = vec![
+            SPI_CMD_PP,
+            (addr >> 16) as u8,
+            (addr >> 8) as u8,
+            addr as u8,
+        ];
         cmd.extend_from_slice(data);
         self.spi_xfer(&cmd)?;
         self.wait_ready()

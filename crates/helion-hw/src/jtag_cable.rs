@@ -238,7 +238,8 @@ mod tests {
         let d = dev();
         let fill = |t: &mut Tap| {
             for i in 0..12usize {
-                t.fabric_mut().bram_write_word(0, i, if i < 8 { 0 } else { 0x1_0000_0000_0001 });
+                t.fabric_mut()
+                    .bram_write_word(0, i, if i < 8 { 0 } else { 0x1_0000_0000_0001 });
             }
         };
         let mut sim = Tap::new(&d);

@@ -547,7 +547,9 @@ impl<P: MpssePort> JtagEngine<P> {
         }
         if devs.iter().all(|d| d.0.is_none()) {
             self.chain.clear();
-            return Err("jtag: TDO stuck low — no IDCODE on the chain (cable not connected?)".into());
+            return Err(
+                "jtag: TDO stuck low — no IDCODE on the chain (cable not connected?)".into(),
+            );
         }
         let total_ir = self.measure_ir_len()?;
         let known: usize = devs.iter().filter_map(|d| d.1.map(|k| k.0 as usize)).sum();
@@ -693,12 +695,18 @@ mod tests {
             }
             assert_eq!(c, JtagState::Reset, "from {s:?}");
         }
-        assert_eq!(JtagState::Idle.path_to(JtagState::ShiftDr), vec![true, false, false]);
+        assert_eq!(
+            JtagState::Idle.path_to(JtagState::ShiftDr),
+            vec![true, false, false]
+        );
         assert_eq!(
             JtagState::Idle.path_to(JtagState::ShiftIr),
             vec![true, true, false, false]
         );
-        assert_eq!(JtagState::Exit1Dr.path_to(JtagState::Idle), vec![true, false]);
+        assert_eq!(
+            JtagState::Exit1Dr.path_to(JtagState::Idle),
+            vec![true, false]
+        );
         assert_eq!(JtagState::Idle.path_to(JtagState::Idle), Vec::<bool>::new());
         assert_eq!(
             JtagState::PauseDr.path_to(JtagState::ShiftIr),

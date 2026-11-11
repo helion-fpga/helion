@@ -210,20 +210,29 @@ impl MpsseCmd {
     }
 
     pub fn adaptive(&mut self, on: bool) -> &mut Self {
-        self.buf
-            .push(if on { op::ADAPTIVE_ON } else { op::ADAPTIVE_OFF });
+        self.buf.push(if on {
+            op::ADAPTIVE_ON
+        } else {
+            op::ADAPTIVE_OFF
+        });
         self
     }
 
     pub fn three_phase(&mut self, on: bool) -> &mut Self {
-        self.buf
-            .push(if on { op::THREE_PHASE_ON } else { op::THREE_PHASE_OFF });
+        self.buf.push(if on {
+            op::THREE_PHASE_ON
+        } else {
+            op::THREE_PHASE_OFF
+        });
         self
     }
 
     pub fn loopback(&mut self, on: bool) -> &mut Self {
-        self.buf
-            .push(if on { op::LOOPBACK_ON } else { op::LOOPBACK_OFF });
+        self.buf.push(if on {
+            op::LOOPBACK_ON
+        } else {
+            op::LOOPBACK_OFF
+        });
         self
     }
 
@@ -260,7 +269,8 @@ impl MpsseCmd {
         let opc = if read { op::BYTES_INOUT } else { op::BYTES_OUT };
         for chunk in data.chunks(MAX_BYTES_PER_CMD) {
             let n = chunk.len() - 1;
-            self.buf.extend_from_slice(&[opc, (n & 0xFF) as u8, (n >> 8) as u8]);
+            self.buf
+                .extend_from_slice(&[opc, (n & 0xFF) as u8, (n >> 8) as u8]);
             self.buf.extend_from_slice(chunk);
             if read {
                 self.reads.push(ReadSeg::Bytes(chunk.len()));
@@ -373,8 +383,14 @@ mod tests {
         // Data shifting opcodes are the flag sums AN_108 §3.3/3.4/3.5 lists.
         use flag::*;
         assert_eq!(op::BYTES_OUT, WRITE_NEG | LSB_FIRST | DO_WRITE_TDI);
-        assert_eq!(op::BITS_OUT, WRITE_NEG | BIT_MODE | LSB_FIRST | DO_WRITE_TDI);
-        assert_eq!(op::BYTES_INOUT, WRITE_NEG | LSB_FIRST | DO_WRITE_TDI | DO_READ_TDO);
+        assert_eq!(
+            op::BITS_OUT,
+            WRITE_NEG | BIT_MODE | LSB_FIRST | DO_WRITE_TDI
+        );
+        assert_eq!(
+            op::BYTES_INOUT,
+            WRITE_NEG | LSB_FIRST | DO_WRITE_TDI | DO_READ_TDO
+        );
         assert_eq!(
             op::BITS_INOUT,
             WRITE_NEG | BIT_MODE | LSB_FIRST | DO_WRITE_TDI | DO_READ_TDO
@@ -385,7 +401,14 @@ mod tests {
             WRITE_NEG | BIT_MODE | LSB_FIRST | DO_WRITE_TMS | DO_READ_TDO
         );
         // Every JTAG opcode writes on -ve and reads on +ve.
-        for o in [op::BYTES_OUT, op::BITS_OUT, op::BYTES_INOUT, op::BITS_INOUT, op::TMS_OUT, op::TMS_INOUT] {
+        for o in [
+            op::BYTES_OUT,
+            op::BITS_OUT,
+            op::BYTES_INOUT,
+            op::BITS_INOUT,
+            op::TMS_OUT,
+            op::TMS_INOUT,
+        ] {
             assert_eq!(o & WRITE_NEG, WRITE_NEG);
             assert_eq!(o & READ_NEG, 0);
         }
@@ -415,7 +438,10 @@ mod tests {
         assert_eq!(c.bytes(), &[0x4B, 0x04, 0x1F]);
         let mut c = MpsseCmd::new();
         c.set_low(0x08, 0x0B).set_high(0x00, 0x00).divisor(0x05DB);
-        assert_eq!(c.bytes(), &[0x80, 0x08, 0x0B, 0x82, 0x00, 0x00, 0x86, 0xDB, 0x05]);
+        assert_eq!(
+            c.bytes(),
+            &[0x80, 0x08, 0x0B, 0x82, 0x00, 0x00, 0x86, 0xDB, 0x05]
+        );
         let mut c = MpsseCmd::new();
         c.clock_bits(8).get_low().send_immediate();
         assert_eq!(c.bytes(), &[0x8E, 0x07, 0x81, 0x87]);
@@ -428,7 +454,9 @@ mod tests {
         c.jtag_init(0x0001);
         assert_eq!(
             c.bytes(),
-            &[0x8A, 0x97, 0x8D, 0x85, 0x80, 0x08, 0x0B, 0x82, 0x00, 0x00, 0x86, 0x01, 0x00]
+            &[
+                0x8A, 0x97, 0x8D, 0x85, 0x80, 0x08, 0x0B, 0x82, 0x00, 0x00, 0x86, 0x01, 0x00
+            ]
         );
         assert_eq!(c.read_len(), 0);
     }
@@ -449,7 +477,9 @@ mod tests {
     #[test]
     fn bit_reads_are_left_aligned() {
         let mut c = MpsseCmd::new();
-        c.data_bytes(&[0, 0], true).data_bits(0, 3, true).tms(0b011, 3, false, true);
+        c.data_bytes(&[0, 0], true)
+            .data_bits(0, 3, true)
+            .tms(0b011, 3, false, true);
         // bytes LE 0x34 0x12; 3 bits 1,0,1 at bits 5..7 = 0b101_00000; TMS first bit 1 at bit5.
         let rx = [0x34, 0x12, 0b1010_0000, 0b0010_0000];
         let segs = c.decode(&rx).unwrap();

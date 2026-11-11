@@ -17,9 +17,9 @@ use std::collections::VecDeque;
 
 use helion_device::Device;
 
+use crate::Tap;
 use crate::jtag_engine::{JtagState, MpssePort};
 use crate::mpsse::{flag, op, pin};
-use crate::Tap;
 
 /// A plain IEEE 1149.1 device: IDCODE (opcode 1) or BYPASS (all ones), IR
 /// capture pattern `…01`. Used as a chain neighbour in tests.
@@ -53,7 +53,11 @@ impl GenericTap {
     }
 
     fn reset_ir(&self) -> u64 {
-        if self.idcode.is_some() { 1 } else { self.ones() }
+        if self.idcode.is_some() {
+            1
+        } else {
+            self.ones()
+        }
     }
 
     pub fn tick(&mut self, tms: bool, tdi: bool) -> bool {
@@ -62,7 +66,11 @@ impl GenericTap {
             JtagState::ShiftDr => self.dr_shift & 1 == 1,
             _ => false,
         };
-        let dr_len = if self.ir == 1 && self.idcode.is_some() { 32 } else { 1 };
+        let dr_len = if self.ir == 1 && self.idcode.is_some() {
+            32
+        } else {
+            1
+        };
         match self.state {
             JtagState::ShiftIr => {
                 self.ir_shift = (self.ir_shift >> 1) | (u64::from(tdi) << (self.ir_len - 1));
@@ -216,10 +224,15 @@ impl MockFtdi {
             ));
         }
         if self.low_dir & pin::TDO != 0 {
-            return Err("mock FTDI: TDO (ADBUS2) driven as an output — would fight the target".into());
+            return Err(
+                "mock FTDI: TDO (ADBUS2) driven as an output — would fight the target".into(),
+            );
         }
         if self.adaptive {
-            return Err("mock FTDI: adaptive clocking on but the board has no RTCK — the chip would stall".into());
+            return Err(
+                "mock FTDI: adaptive clocking on but the board has no RTCK — the chip would stall"
+                    .into(),
+            );
         }
         if self.three_phase {
             return Err("mock FTDI: 3-phase clocking is for I2C; JTAG targets mis-sample".into());
@@ -374,7 +387,9 @@ impl MockFtdi {
             }
             let n = self.pending[at + 1] as usize + 1;
             if n > 8 || (w_tms && n > 7) {
-                return Err(format!("mock FTDI: opcode {opc:#04x} length {n} bits out of range"));
+                return Err(format!(
+                    "mock FTDI: opcode {opc:#04x} length {n} bits out of range"
+                ));
             }
             let has_data = w_tdi || w_tms;
             let used = if has_data { 3 } else { 2 };
@@ -393,7 +408,11 @@ impl MockFtdi {
             } else {
                 let tms = self.tms_pin();
                 for i in 0..n {
-                    let b = if lsb { (data >> i) & 1 } else { (data >> (7 - i)) & 1 };
+                    let b = if lsb {
+                        (data >> i) & 1
+                    } else {
+                        (data >> (7 - i)) & 1
+                    };
                     let tdi = if w_tdi { b == 1 } else { self.tdi_pin() };
                     let tdo = self.clock(tms, tdi)?;
                     got = if lsb {
@@ -411,7 +430,8 @@ impl MockFtdi {
             if !self.need(at, 3) {
                 return Ok(None);
             }
-            let n = (usize::from(self.pending[at + 1]) | (usize::from(self.pending[at + 2]) << 8)) + 1;
+            let n =
+                (usize::from(self.pending[at + 1]) | (usize::from(self.pending[at + 2]) << 8)) + 1;
             let used = if w_tdi { 3 + n } else { 3 };
             if !self.need(at, used) {
                 return Ok(None);
@@ -421,7 +441,11 @@ impl MockFtdi {
                 let data = if w_tdi { self.pending[at + 3 + k] } else { 0 };
                 let mut got = 0u8;
                 for i in 0..8 {
-                    let b = if lsb { (data >> i) & 1 } else { (data >> (7 - i)) & 1 };
+                    let b = if lsb {
+                        (data >> i) & 1
+                    } else {
+                        (data >> (7 - i)) & 1
+                    };
                     let tdi = if w_tdi { b == 1 } else { self.tdi_pin() };
                     let tdo = self.clock(tms, tdi)?;
                     if tdo {
@@ -556,7 +580,10 @@ mod tests {
         m.write(&[0x0B, 0x4B]).unwrap();
         m.write(&[0x04, 0x1F]).unwrap();
         assert_eq!(m.tck_count, 5);
-        assert_eq!(m.helion_tap().unwrap().state, crate::TapState::TestLogicReset);
+        assert_eq!(
+            m.helion_tap().unwrap().state,
+            crate::TapState::TestLogicReset
+        );
     }
 
     #[test]
@@ -596,7 +623,10 @@ mod tests {
         assert_eq!(e.read_idcode().unwrap(), d.idcode);
         assert_eq!(e.read_stat_word().unwrap(), Stat::RESET_WORD);
         // Captured IR equals the previous instruction (Helion capture = IR).
-        assert_eq!(e.shift_ir(u64::from(IR_IDCODE)).unwrap(), u64::from(crate::IR_STAT));
+        assert_eq!(
+            e.shift_ir(u64::from(IR_IDCODE)).unwrap(),
+            u64::from(crate::IR_STAT)
+        );
         assert!(e.stats.bytes_in > 0 && e.stats.dr_scans >= 2);
         assert_eq!(e.set_tck_hz(1_000_000).unwrap(), 1_000_000);
         assert_eq!(e.port().divisor, 29);
@@ -613,13 +643,23 @@ mod tests {
         ];
         let mut e = JtagEngine::open(MockFtdi::with_chain(chain), 15_000_000).unwrap();
         let ids: Vec<_> = e.chain().iter().map(|c| c.idcode).collect();
-        assert_eq!(ids, vec![Some(0x0362_D093), None, Some(d.idcode), Some(0x0BA0_0477)]);
+        assert_eq!(
+            ids,
+            vec![Some(0x0362_D093), None, Some(d.idcode), Some(0x0BA0_0477)]
+        );
         let lens: Vec<_> = e.chain().iter().map(|c| c.ir_len).collect();
-        assert_eq!(lens, vec![6, 5, 6, 4], "bypass-only device gets the remainder");
+        assert_eq!(
+            lens,
+            vec![6, 5, 6, 4],
+            "bypass-only device gets the remainder"
+        );
         assert_eq!(e.target(), 2, "Helion picked as target");
         assert_eq!(e.read_idcode().unwrap(), d.idcode);
         // CFG_W through three bypassed neighbours.
-        assert!(e.program(&Bitstream::empty(&d)).is_err(), "empty bitstream refused");
+        assert!(
+            e.program(&Bitstream::empty(&d)).is_err(),
+            "empty bitstream refused"
+        );
         let bits = counter_bits(&d);
         let st = e.program(&bits).unwrap();
         assert!(st.done);
@@ -634,10 +674,18 @@ mod tests {
     fn user_chains_two_to_four_round_trip() {
         let d = dev();
         let mut e = JtagEngine::open(MockFtdi::helion(&d), 6_000_000).unwrap();
-        for (chain, v) in [(2u8, 0x1122_3344_5566_7788u64), (3, 0xDEAD_BEEF), (4, u64::MAX)] {
+        for (chain, v) in [
+            (2u8, 0x1122_3344_5566_7788u64),
+            (3, 0xDEAD_BEEF),
+            (4, u64::MAX),
+        ] {
             let _ = e.user_dr(chain, &v.to_le_bytes(), 64).unwrap();
             let back = e.user_dr(chain, &0u64.to_le_bytes(), 64).unwrap();
-            assert_eq!(u64::from_le_bytes(back[..8].try_into().unwrap()), v, "USER{chain}");
+            assert_eq!(
+                u64::from_le_bytes(back[..8].try_into().unwrap()),
+                v,
+                "USER{chain}"
+            );
         }
         let tap = e.port().helion_tap().unwrap();
         assert_eq!(tap.user_register(IR_USR2), Some(0));
