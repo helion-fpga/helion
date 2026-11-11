@@ -100,7 +100,10 @@ impl TbItem {
         let info = std::fs::read_to_string(&file.path)
             .map_err(|e| format!("{label}: cannot read: {e}"))
             .and_then(|src| {
-                if helion_verif::classtb::is_class_testbench(&src) {
+                // VHDL first: the class-based sniffing is SystemVerilog-only.
+                if !helion_verif::vhdl_tb::is_vhdl_path(&file.path)
+                    && helion_verif::classtb::is_class_testbench(&src)
+                {
                     // Class-based / UVM: helion-svtb front end.
                     return helion_verif::classtb::inspect_class_testbench(&file.path)
                         .map(|c| {

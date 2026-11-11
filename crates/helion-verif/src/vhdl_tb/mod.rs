@@ -320,6 +320,16 @@ pub fn run_vhdl_testbench(cfg: &TbRunConfig, tx: Option<&mpsc::Sender<TbStreamEv
         lines: lines.into_iter().collect(),
         branches,
         dut: k.bridges.first().map(|b| b.sim_coverage()).unwrap_or_default(),
+        // Per-line DUT attribution comes from the SV testbench runner's
+        // instrumented synthesis; the VHDL kernel does not collect it yet.
+        dut_lines: Vec::new(),
+        dut_branches: Vec::new(),
+        dut_not_instrumented: Vec::new(),
+        dut_line_note: Some(
+            "DUT line coverage is collected for SystemVerilog testbenches only; \
+             this VHDL testbench reports testbench line/branch and DUT toggle coverage"
+                .into(),
+        ),
     };
 
     // Artifacts.
@@ -351,6 +361,7 @@ pub fn run_vhdl_testbench(cfg: &TbRunConfig, tx: Option<&mpsc::Sender<TbStreamEv
         None
     };
     Ok(TbOutcome {
+        uvm: None,
         passed,
         stopped: stopped_by_user,
         sim_time_ns,
