@@ -1,6 +1,6 @@
 # Helion 2.0.4 — ibex_pin_wrap stage deltas
 
-Engineering table only. Source: [GitHub Release v2.0.4](https://github.com/helion-fpga/helion/releases/tag/v2.0.4) / [CHANGELOG](../CHANGELOG.md). Gold lock unchanged: empty-XDC `examples/counter.sv` **WNS_PS=9640**. SOFT ≠ PASS.
+Engineering table only. Source: [GitHub Release v2.0.4](https://github.com/helion-fpga/helion/releases/tag/v2.0.4) / [CHANGELOG](../../CHANGELOG.md). Gold lock unchanged: empty-XDC `examples/counter.sv` **WNS_PS=9640**. SOFT ≠ PASS.
 
 Command: release `helion impl examples/ibex_pin_wrap.sv`.
 

@@ -1,35 +1,33 @@
-# Helion site
+# Helion website
 
-Static pages for GitHub Pages (`docs/` → https://helion-fpga.github.io/helion/).
+Static pages published to GitHub Pages at
+<https://helion-fpga.github.io/helion/> by
+[`.github/workflows/pages.yml`](../.github/workflows/pages.yml) on every push to
+`master` that touches `docs/`. There is no build step: edit the HTML, open it
+in a browser, commit.
 
 | Page | Job |
 |---|---|
-| `index.html` | Goal: original FPGA family + in-repo CAD + IDE, not a vendor wrapper |
-| `start.html` | Download 2.0.4, build, gold, Helion.app layout |
-| `use.html` | User guide (rail, CLI, Device die, Tcl, IP, program honesty) |
-| `wiki.html` | Documentation index with summaries |
-| `architecture.html` | Crate map, labeled HAD, `load_xdc` command list |
-| `roadmap.html` | 1.4 → 2.0 shipped + 2.0.x grind; canonical markdown is [`ROADMAP.md`](../ROADMAP.md) |
-| `get-involved.html` | LMMS-style on-ramp |
-| `contribute.html` | Coding path |
-| `legal.html` | Fence |
+| `index.html` | Landing page: what Helion is, the IDE, features, devices, download |
+| `start.html` | Install a release or build from source; first run |
+| `use.html` | User guide for the IDE (`helion-ide`) and the CLI (`helion`) |
+| `architecture.html` | Pipeline, crate map, HAD parts, HNF, constraints, Tcl |
+| `benchmarks.html` | Measured comparison against Yosys + nextpnr, with caveats |
+| `roadmap.html` | What 4.0 delivers and what comes next (mirrors `ROADMAP.md`) |
+| `wiki.html` | Documentation index |
+| `get-involved.html` | On-ramp for new contributors |
+| `contribute.html` | Code map and pull-request rules |
+| `legal.html` | License, trademarks, and the legal fence |
+| `404.html` | Not-found page |
 
-Deploy: `.github/workflows/pages.yml` on push to `master` when `docs/` changes.
+Shared assets: `style.css` (design tokens, light and dark themes), `site.js`
+(navigation, theme toggle), `brand/` (logos, marks, social image),
+`screenshots/` (IDE screenshots used by the README and the site).
 
-## Developer crumbs (FM-HEL-TOP notes)
+Reference docs published alongside the site:
 
-Branch work notes (not the public on-ramp). Gold hold: **WNS_PS=9640**. Cap holds: **imux_skip=0**, **IOB=1**.
+- [`tcl-subset.md`](tcl-subset.md): the Tcl language and commands the IDE console supports
+- [`benchmarks/`](benchmarks/): full benchmark reports
 
-| Note | What |
-|---|---|
-| [`FM-HEL-TOP-helion-ip-package.md`](FM-HEL-TOP-helion-ip-package.md) | Format-1 `.helion` + `read_ip` |
-| [`FM-HEL-TOP-ofl-box.md`](FM-HEL-TOP-ofl-box.md) | Box OFL install + scan-usb header honesty |
-| [`FM-HEL-TOP-tap-ibex-smoke.md`](FM-HEL-TOP-tap-ibex-smoke.md) | Ibex mpsse-sim STAT smoke |
-| [`FM-HEL-TOP-place-legalize-speed.md`](FM-HEL-TOP-place-legalize-speed.md) | Affinity place ~3s→~0.23s |
-| [`FM-HEL-TOP-synth-wall.md`](FM-HEL-TOP-synth-wall.md) | keep/md + STA PinIndex → ~1.40s pin-wrap |
-| [`perf-2.0.4.md`](perf-2.0.4.md) | v2.0.4 ibex_pin_wrap stage ms (parse/synth/legalize/imux_skip) |
-| [`FM-HEL-TOP-aig-flowmap-residual.md`](FM-HEL-TOP-aig-flowmap-residual.md) | AIG/flowmap residual **STOP** (no cheap wall cut) |
-| [`FM-HEL-TOP-air-budgets.md`](FM-HEL-TOP-air-budgets.md) | Air idle budgets |
-| [`ip/README.md`](../ip/README.md) | `.helion` package how-to |
-
-Also: native/live FTDI/OFL, IMUX reach, soft Helion-ahead — same `FM-HEL-TOP-*.md` prefix. Run logs and screenshot dumps (`suite-shots/`, numbered `FM-HEL-VIVADO-P5-catalog*.txt`) stay out of git.
+Internal engineering notes live in [`notes/`](../notes/) at the repository
+root and are not published.
