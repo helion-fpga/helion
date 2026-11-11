@@ -6,13 +6,16 @@
 //! - Set Up Debug runs [`helion_debug::implement_debug`] (insert ILA/VIO/AXI
 //!   cores + BSCAN hub, pack/place/route/bitgen) on a worker and writes the
 //!   `.ltx` probes file and the debug `.hbits` next to the run checkpoints.
-//! - Program runs [`helion_debug::HwDebugTarget::program_sim`] (Helion TAP,
-//!   the Simulation cable) and enumerates the hub.
+//! - Program runs [`helion_debug::HwDebugTarget::program_on`] over the
+//!   Simulation cable (in-process Helion TAP) or the Native FTDI cable
+//!   (`helion-hw`'s MPSSE JTAG engine, opened by
+//!   [`crate::views::hw_native::open_cable`]) and enumerates the hub.
 //! - ILA arm/upload, VIO refresh/drive and AXI transactions are BSCAN hub
-//!   frames on that TAP, each on a worker; the UI keeps a snapshot.
+//!   frames on that cable, each on a worker; the UI keeps a snapshot that
+//!   names the cable (`native FTDI · not yet verified on a board`).
 //!
-//! Board cables are refused with the reason: neither openFPGALoader nor the
-//! native FTDI path in `helion-hw` can shift `USER1` data registers.
+//! openFPGALoader cables are refused with the reason: openFPGALoader cannot
+//! shift `USER1` data registers.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
@@ -21,6 +24,7 @@ use helion_debug::{
     AxiRegion, AxiResp, AxiTxnKind, DebugBuild, DebugCoreKind, DebugInsertConfig, HwDebugTarget,
     HwIlaCapture, HwIlaRun, HwTrigger, HwVioProbe, LtxProbeDirection, create_hw_axi_txn,
 };
+use helion_hw::CableKind;
 use rune::TextEdit;
 
 use crate::state::{AppState, CenterPane, ConsoleLine, MsgSev, ToastKind};
@@ -138,6 +142,11 @@ pub struct TargetSnap {
     pub done: bool,
     pub idcode: u32,
     pub hub_frames: usize,
+    /// Cable the target is on and its description (port, TCK, chain slot).
+    pub cable: CableKind,
+    pub cable_detail: String,
+    /// (IR, DR) scans the native engine has shifted (0 on the sim TAP).
+    pub scans: (usize, usize),
 }
 
 impl TargetSnap {
@@ -164,6 +173,9 @@ impl TargetSnap {
             done: t.stat.done,
             idcode: t.idcode,
             hub_frames: t.hub.total_dr_scans,
+            cable: t.cable_kind(),
+            cable_detail: t.cable_detail(),
+            scans: t.cable_scans(),
         }
     }
 
@@ -447,16 +459,26 @@ pub fn marked_nets(s: &AppState) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Why debug cores cannot run on the current cable (`None` = Simulation).
+/// Why debug cores cannot run on the current cable (`None` = Simulation or
+/// Native FTDI).
 pub fn cable_block(s: &AppState) -> Option<String> {
-    if s.program.cable == crate::views::hw::CableChoice::Sim {
-        None
-    } else {
-        Some(
-            "Debug cores need USER1 data-register scans; openFPGALoader and the native FTDI \
-             path in helion-hw cannot shift them. Select the Simulation cable."
+    use crate::views::hw::CableChoice;
+    match s.program.cable {
+        CableChoice::Sim | CableChoice::Native => None,
+        _ => Some(
+            "Debug cores need USER1 data-register scans, which openFPGALoader cannot shift. \
+             Select the Native FTDI or Simulation cable."
                 .into(),
-        )
+        ),
+    }
+}
+
+/// Cable the next Program would use, as the panels label it.
+pub fn planned_cable(s: &AppState) -> CableKind {
+    if s.program.cable == crate::views::hw::CableChoice::Native {
+        s.program.native.kind()
+    } else {
+        CableKind::Sim
     }
 }
 
@@ -617,22 +639,33 @@ pub fn implement(s: &mut AppState) -> Result<String, String> {
     Ok(msg)
 }
 
-/// Program the debug bitstream into the sim TAP and enumerate the hub.
+/// Program the debug bitstream over the selected cable and enumerate the hub.
 pub fn program(s: &mut AppState) -> Result<String, String> {
     if let Some(why) = program_block(s) {
         return Err(format!("program_hw_devices: {why}"));
     }
     let build = s.program.debug.build.clone().expect("checked");
     let part = build.part.clone();
+    let native = (s.program.cable == crate::views::hw::CableChoice::Native)
+        .then(|| s.program.native.open_cfg());
+    let cable = if native.is_some() { "native" } else { "sim" };
     console(
         s,
-        format!("program_hw_devices debug bitstream part={part} cable=sim"),
+        format!("program_hw_devices debug bitstream part={part} cable={cable}"),
         MsgSev::Info,
     );
-    let msg = format!("program_hw_devices part={part}");
+    // Re-programming releases the cable the old target held.
+    s.program.debug.target = None;
+    let msg = format!("program_hw_devices part={part} cable={cable}");
     spawn(s, DbgJobKind::Program, move || {
         let r = helion_device::Device::load_part(&part).and_then(|dev| {
-            let t = HwDebugTarget::program_sim(&dev, (*build).clone())?;
+            let t = match native {
+                Some(cfg) => {
+                    let (cable, _) = crate::views::hw_native::open_cable(&cfg)?;
+                    HwDebugTarget::program_on(&dev, (*build).clone(), cable)?
+                }
+                None => HwDebugTarget::program_sim(&dev, (*build).clone())?,
+            };
             let snap = TargetSnap::of(&t);
             Ok((Arc::new(Mutex::new(t)), snap))
         });
@@ -911,7 +944,14 @@ pub fn show_in_viewer(s: &mut AppState) -> Result<String, String> {
         .clone()
         .ok_or("display_hw_ila_data: no debug build")?;
     let view = to_viewer(&cap, &build);
-    let label = format!("{} · {} · sim cable", cap.core, build.part);
+    let cable = s
+        .program
+        .debug
+        .snap
+        .as_ref()
+        .map(|t| t.cable.label())
+        .unwrap_or(CableKind::Sim.label());
+    let label = format!("{} · {} · {cable}", cap.core, build.part);
     let trigger = match cap.trigger {
         HwTrigger::Value { value, mask } => format!("value {value:#x} & {mask:#x}"),
         t => t.label().to_string(),
@@ -965,9 +1005,10 @@ pub fn deliver(s: &mut AppState, ev: DbgEvent) {
             console(
                 s,
                 format!(
-                    "program_hw_devices: DONE={} · {} debug core(s) on the hub",
+                    "program_hw_devices: DONE={} · {} debug core(s) on the hub · {}",
                     u8::from(snap.done),
-                    snap.cores.len()
+                    snap.cores.len(),
+                    snap.cable.label()
                 ),
                 MsgSev::Info,
             );
@@ -1078,9 +1119,31 @@ pub enum FixtureStage {
 /// Seed the real fixture design and run the real debug flow up to `stage`
 /// (each step through the worker, waited on). Scenes/tests only.
 pub fn seed_debug_fixture(s: &mut AppState, stage: FixtureStage) -> Result<(), String> {
+    seed_debug_fixture_on(s, stage, false)
+}
+
+/// [`seed_debug_fixture`] on the Native FTDI cable wired to the in-process
+/// mock FTDI board (every TAP access is real MPSSE traffic). Scenes/tests.
+pub fn seed_debug_fixture_native(s: &mut AppState, stage: FixtureStage) -> Result<(), String> {
+    seed_debug_fixture_on(s, stage, true)
+}
+
+fn seed_debug_fixture_on(
+    s: &mut AppState,
+    stage: FixtureStage,
+    native: bool,
+) -> Result<(), String> {
     use std::time::Duration;
     crate::live::seed_live_fixture(s)?;
-    s.program.cable = crate::views::hw::CableChoice::Sim;
+    if native {
+        let (_, part) = crate::live::live_device(s);
+        crate::views::hw_native::use_mock_board(
+            s,
+            crate::views::hw_native::MockBoard::Helion { part, flash: None },
+        )?;
+    } else {
+        s.program.cable = crate::views::hw::CableChoice::Sim;
+    }
     let nets = candidate_nets(s);
     if nets.len() < 6 {
         return Err(format!("fixture: too few flop nets {nets:?}"));
@@ -1209,12 +1272,50 @@ mod tests {
     }
 
     #[test]
-    fn board_cables_block_debug_with_a_reason() {
+    fn ofl_cables_block_debug_with_a_reason() {
         let mut s = debug_state();
         s.program.cable = crate::views::hw::CableChoice::Usb;
         s.program.debug.build = None;
         assert!(program_block(&s).is_some());
         assert!(cable_block(&s).unwrap().contains("USER1"));
+        s.program.cable = crate::views::hw::CableChoice::Native;
+        assert!(cable_block(&s).is_none(), "native FTDI is allowed");
+        assert_eq!(planned_cable(&s), CableKind::NativeUsb);
+    }
+
+    #[test]
+    fn native_cable_full_flow_over_mock_ftdi() {
+        let mut s = debug_state();
+        seed_debug_fixture_native(&mut s, FixtureStage::Live).unwrap();
+        let snap = s.program.debug.snap.clone().unwrap();
+        assert_eq!(snap.cable, CableKind::NativeMock);
+        assert!(snap.done && snap.scans.1 > 0, "{snap:?}");
+        let cap = s.program.debug.last_capture.clone().unwrap();
+        assert_eq!(cap.words.len(), 24);
+        assert_eq!(s.program.debug.axi_log.len(), 3);
+        assert!(crate::views::hw_native::held_by_debug(&s));
+        assert!(crate::views::hw_native::scan_block(&s).unwrap().contains("Close Target"));
+        crate::views::hw_native::close_target(&mut s).unwrap();
+        assert!(crate::views::hw_native::scan_block(&s).is_none());
+        // The released board answers a fresh chain scan.
+        crate::views::hw_native::tcl_verb(&mut s, "refresh_hw_target", &[]).unwrap();
+        assert_eq!(s.program.native.chain.as_ref().unwrap().devices.len(), 1);
+    }
+
+    #[test]
+    fn native_program_without_a_cable_fails_honestly() {
+        let mut s = debug_state();
+        seed_debug_fixture(&mut s, FixtureStage::Picked).unwrap();
+        implement(&mut s).unwrap();
+        assert!(wait_idle(&mut s, Duration::from_secs(120)));
+        s.program.cable = crate::views::hw::CableChoice::Native;
+        program(&mut s).unwrap();
+        assert!(wait_idle(&mut s, Duration::from_secs(30)));
+        // No FTDI on this host: no target, and the error says why.
+        if s.program.debug.target.is_none() {
+            let e = s.program.debug.last_error.clone().unwrap();
+            assert!(e.contains("FTDI") || e.contains("usb"), "{e}");
+        }
     }
 
     #[test]

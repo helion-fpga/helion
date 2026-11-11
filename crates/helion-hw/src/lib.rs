@@ -27,8 +27,22 @@ use helion_device::Device;
 use helion_fabric::{Fabric, Stat};
 use std::cell::Cell;
 
+pub mod jtag_cable;
+pub mod jtag_engine;
+pub mod mock_ftdi;
+pub mod mpsse;
 pub mod mpsse_sim;
+pub mod native_cfgmem;
 pub mod native_mpsse;
+mod tap_ports;
+use tap_ports::user_index;
+pub mod usb_ftdi;
+pub use jtag_cable::{CableKind, JtagCable, usr1_upload_rle_via};
+pub use jtag_engine::{ChainDevice, JtagEngine, JtagState, MpssePort, known_ir_len};
+pub use mock_ftdi::{GenericTap, MockChainDevice, MockFtdi};
+pub use native_cfgmem::SpiOverJtag;
+pub use tap_ports::{is_user_chain, user_chain_ir};
+pub use usb_ftdi::{UsbFtdiPort, open_usb_ftdi, strip_modem_status};
 pub mod native_usb;
 pub use mpsse_sim::{FtdiBitbangSim, MpsseSimError};
 pub use native_mpsse::{
@@ -78,11 +92,15 @@ pub enum TapState {
     CaptureDr,
     ShiftDr,
     Exit1Dr,
+    PauseDr,
+    Exit2Dr,
     UpdateDr,
     SelectIr,
     CaptureIr,
     ShiftIr,
     Exit1Ir,
+    PauseIr,
+    Exit2Ir,
     UpdateIr,
 }
 
@@ -97,6 +115,18 @@ pub const IR_CFG_W: u8 = 0b010000;
 /// advances the RLE token cursor, or auto-increments the address (TDI bit63=0).
 /// This is the JTAG upload path for deep ILA — not a host `bram_read_word` backdoor.
 pub const IR_USR1: u8 = 0b000010;
+/// BSCAN user chains 2..4. Each ends in a 64-bit user data register: Update-DR
+/// latches the shifted word, Capture-DR loads the latched word back.
+pub const IR_USR2: u8 = 0b100010;
+pub const IR_USR3: u8 = 0b100011;
+pub const IR_USR4: u8 = 0b100100;
+/// Configuration-flash SPI access (the Lattice `LSC_PROG_SPI` style): while
+/// this IR is active and the board wires a flash to the config SPI pins,
+/// Shift-DR drives MOSI from TDI and TDO returns MISO; CS# is low from
+/// Capture-DR to Update-DR. See [`Tap::attach_config_flash`].
+pub const IR_SPI_ACCESS: u8 = 0b111010;
+/// IEEE 1149.1 BYPASS (all ones): 1-bit DR that captures 0.
+pub const IR_BYPASS: u8 = 0b111111;
 
 /// Magic in bits[63:48] of the first Capture-DR word after an RLE arm.
 pub const USR1_RLE_HEADER_MAGIC: u16 = 0xC0DE;
@@ -131,6 +161,10 @@ pub struct Tap {
     usr1_rle_queue: Vec<u64>,
     /// Next token index for Capture-DR while `usr1_rle_active`.
     usr1_rle_idx: usize,
+    /// USER2..USER4 64-bit user data registers.
+    user_regs: [u64; 3],
+    /// Board-wired configuration flash reached by [`IR_SPI_ACCESS`].
+    spi: Option<tap_ports::ConfigFlashPort>,
 }
 
 impl Tap {
@@ -151,6 +185,8 @@ impl Tap {
             usr1_rle_active: false,
             usr1_rle_queue: Vec::new(),
             usr1_rle_idx: 0,
+            user_regs: [0; 3],
+            spi: None,
         }
     }
 
@@ -183,6 +219,7 @@ impl Tap {
     pub fn tick(&mut self, tms: bool, tdi: bool) -> bool {
         let tdo = match self.state {
             TapState::ShiftIr | TapState::CaptureIr => (self.ir_shift & 1) != 0,
+            TapState::ShiftDr if self.ir == IR_SPI_ACCESS => self.spi_miso(),
             TapState::ShiftDr | TapState::CaptureDr => (self.dr_shift & 1) != 0,
             _ => false,
         };
@@ -195,7 +232,14 @@ impl Tap {
                 self.shlen = self.shlen.saturating_add(1);
             }
             TapState::ShiftDr => {
-                if self.ir == IR_CFG_W {
+                if self.ir == IR_SPI_ACCESS {
+                    self.spi_mosi(tdi);
+                } else if self.ir == IR_BYPASS {
+                    self.dr_shift = u64::from(tdi);
+                } else if is_user_chain(self.ir) {
+                    self.dr_shift = (self.dr_shift >> 1) | ((u64::from(tdi)) << 63);
+                    self.shlen = self.shlen.saturating_add(1);
+                } else if self.ir == IR_CFG_W {
                     // Variable-length CFG_W stream (full `.hbits` packets).
                     let byte_i = (self.cfg_bit_count / 8) as usize;
                     let bit_i = (self.cfg_bit_count % 8) as u8;
@@ -222,6 +266,11 @@ impl Tap {
         let prev = self.state;
         self.tms(tms);
 
+        if self.state == TapState::TestLogicReset && prev != TapState::TestLogicReset {
+            // IEEE 1149.1: Test-Logic-Reset selects IDCODE.
+            self.ir = IR_IDCODE;
+            self.spi_release();
+        }
         if self.state == TapState::CaptureIr && prev != TapState::CaptureIr {
             self.ir_shift = self.ir & 0x3f;
             self.shlen = 0;
@@ -231,6 +280,11 @@ impl Tap {
                 IR_IDCODE => u64::from(self.fabric.idcode),
                 IR_STAT => u64::from(self.fabric.stat.word()),
                 IR_USR1 => self.usr1_capture_dr_word(),
+                IR_USR2 | IR_USR3 | IR_USR4 => self.user_regs[user_index(self.ir)],
+                IR_SPI_ACCESS => {
+                    self.spi_select();
+                    0
+                }
                 IR_CFG_W => {
                     self.cfg_buf.clear();
                     self.cfg_bit_count = 0;
@@ -246,7 +300,8 @@ impl Tap {
         }
         if self.state == TapState::UpdateDr && prev != TapState::UpdateDr {
             if self.ir == IR_CFG_W && !self.cfg_buf.is_empty() {
-                match Bitstream::from_packets(&self.cfg_buf) {
+                let stream = tap_ports::cfg_sync(&self.cfg_buf, self.cfg_bit_count as usize);
+                match Bitstream::from_packets(&stream) {
                     Ok(bits) => match self.fabric.program(&bits) {
                         Ok(()) => {
                             self.fabric.finish_startup();
@@ -262,6 +317,10 @@ impl Tap {
                 }
             } else if self.ir == IR_USR1 {
                 self.usr1_update_dr();
+            } else if is_user_chain(self.ir) {
+                self.user_regs[user_index(self.ir)] = self.dr_shift;
+            } else if self.ir == IR_SPI_ACCESS {
+                self.spi_release();
             }
         }
         tdo
@@ -287,7 +346,11 @@ impl Tap {
             (ShiftDr, false) => ShiftDr,
             (ShiftDr, true) => Exit1Dr,
             (Exit1Dr, true) => UpdateDr,
-            (Exit1Dr, false) => ShiftDr,
+            (Exit1Dr, false) => PauseDr,
+            (PauseDr, false) => PauseDr,
+            (PauseDr, true) => Exit2Dr,
+            (Exit2Dr, false) => ShiftDr,
+            (Exit2Dr, true) => UpdateDr,
             (UpdateDr, false) => RunTestIdle,
             (UpdateDr, true) => SelectDr,
             (SelectIr, true) => TestLogicReset,
@@ -297,7 +360,11 @@ impl Tap {
             (ShiftIr, false) => ShiftIr,
             (ShiftIr, true) => Exit1Ir,
             (Exit1Ir, true) => UpdateIr,
-            (Exit1Ir, false) => ShiftIr,
+            (Exit1Ir, false) => PauseIr,
+            (PauseIr, false) => PauseIr,
+            (PauseIr, true) => Exit2Ir,
+            (Exit2Ir, false) => ShiftIr,
+            (Exit2Ir, true) => UpdateIr,
             (UpdateIr, false) => RunTestIdle,
             (UpdateIr, true) => SelectDr,
         };

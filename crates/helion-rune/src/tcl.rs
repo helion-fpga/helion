@@ -3009,6 +3009,10 @@ fn dispatch_host(
             crate::views::hw_cfgmem::tcl_verb(s, n, argv.get(1..).unwrap_or_default()),
             line,
         ),
+        n if crate::views::hw_native::VERBS.contains(&n) => ctl_result(
+            crate::views::hw_native::tcl_verb(s, n, argv.get(1..).unwrap_or_default()),
+            line,
+        ),
         n if crate::ext_verbs::is_verb(n) => ctl_result(
             crate::ext_verbs::tcl_verb(s, n, argv.get(1..).unwrap_or_default()),
             line,
@@ -4263,6 +4267,16 @@ fn cmd_set_property(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
         };
         return ctl_result(crate::views::hw_debug_tcl::tcl_output_value(s, v, p), line);
     }
+    // Native cable TCK: `set_property PARAM.FREQUENCY hz [current_hw_target]`.
+    if argv
+        .get(1)
+        .is_some_and(|k| k.eq_ignore_ascii_case("PARAM.FREQUENCY"))
+    {
+        let Some(hz) = argv.get(2).and_then(|v| v.parse::<u32>().ok()) else {
+            return Ctl::err(line, "set_property PARAM.FREQUENCY: hz");
+        };
+        return ctl_result(crate::views::hw_native::set_tck(s, hz), line);
+    }
     // Like old `Model::exec`, PACKAGE_PIN/LOC never reaches the generic Tcl
     // property handler (including its repeated-command result). Option flags
     // keep their old parsing position: only an immediate key intercepts.
@@ -5452,6 +5466,9 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
         n if crate::views::hw_debug_tcl::VERBS.contains(&n) => return crate::views::hw_debug_tcl::help(n),
         n if crate::views::hw_cfgmem::VERBS.contains(&n) => {
             return crate::views::hw_cfgmem::help(n);
+        }
+        n if crate::views::hw_native::VERBS.contains(&n) => {
+            return crate::views::hw_native::help(n);
         }
         _ => return crate::ext_verbs::help(name).or_else(|| crate::eco_tcl::help(name)),
     })

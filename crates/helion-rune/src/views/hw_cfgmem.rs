@@ -4,10 +4,12 @@
 //!
 //! Every step is `helion-hw`: [`helion_hw::write_cfgmem`] builds the `.mcs`
 //! / `.bin` image, [`helion_hw::CfgMemSession`] runs the indirect SPI flow
-//! over the Simulation cable (TAP `USER1` → JEDEC SPI flash model). On a
-//! board cable, Program writes the bitstream to SPI flash through
-//! openFPGALoader (`-f`); erase / verify / blank check / boot are not
-//! available there and say so.
+//! over the Simulation cable (TAP `USER1` → JEDEC SPI flash model) or the
+//! Native FTDI cable (MPSSE JTAG engine → the TAP's `SPI_ACCESS` port →
+//! the board's flash; not yet verified on a physical board). On an
+//! openFPGALoader cable, Program writes the bitstream to SPI flash through
+//! `openFPGALoader -f`; erase / verify / blank check / boot are not
+//! available there and say so. BPI parts stay image-only (no BPI model).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
@@ -29,6 +31,7 @@ pub enum CfgOp {
     Erase,
     BlankCheck,
     Boot,
+    Readback,
     BoardProgram,
 }
 
@@ -40,6 +43,7 @@ impl CfgOp {
             CfgOp::Erase => "Flash erased",
             CfgOp::BlankCheck => "Blank check finished",
             CfgOp::Boot => "Booted from flash",
+            CfgOp::Readback => "Flash read back",
             CfgOp::BoardProgram => "openFPGALoader wrote flash",
         }
     }
@@ -51,6 +55,7 @@ impl CfgOp {
             CfgOp::Erase => "Erasing flash…",
             CfgOp::BlankCheck => "Blank checking…",
             CfgOp::Boot => "Booting from flash…",
+            CfgOp::Readback => "Reading flash back…",
             CfgOp::BoardProgram => "openFPGALoader writing flash…",
         }
     }
@@ -139,8 +144,23 @@ fn console(s: &mut AppState, text: impl Into<String>, sev: MsgSev) {
     });
 }
 
-fn sim(s: &AppState) -> bool {
-    s.program.cable == CableChoice::Sim
+/// Which flash path the selected cable gives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlashPath {
+    /// Simulation cable: USER1 bridge into the flash model.
+    Sim,
+    /// Native FTDI: MPSSE JTAG engine → TAP SPI_ACCESS → board flash.
+    Native,
+    /// openFPGALoader `-f` (program only, no readback).
+    Ofl,
+}
+
+pub fn flash_path(s: &AppState) -> FlashPath {
+    match s.program.cable {
+        CableChoice::Sim => FlashPath::Sim,
+        CableChoice::Native => FlashPath::Native,
+        _ => FlashPath::Ofl,
+    }
 }
 
 /// `create_hw_cfgmem`: attach the picked part to the device.
@@ -276,7 +296,20 @@ pub fn op_block(s: &AppState, op: CfgOp) -> Option<String> {
         return Some(format!("Busy: {}", b.busy_label()));
     }
     let part = c.part?;
-    if !sim(s) {
+    if flash_path(s) == FlashPath::Native {
+        if part.jedec_id.is_none() {
+            return Some(format!(
+                "{} is a BPI part: helion-hw has no BPI flash model to program.",
+                part.name
+            ));
+        }
+        if crate::views::hw_native::held_by_debug(s) {
+            return Some(
+                "The programmed debug target holds the native cable. Close Target releases it."
+                    .into(),
+            );
+        }
+    } else if flash_path(s) == FlashPath::Ofl {
         if op != CfgOp::Program {
             return Some(
                 "Board flash erase/verify/boot are not wired: helion-hw drives board flash only \
@@ -291,8 +324,7 @@ pub fn op_block(s: &AppState, op: CfgOp) -> Option<String> {
             return Some("No bitstream yet. Generate Bitstream first.".into());
         }
         return None;
-    }
-    if c.session.is_none() {
+    } else if c.session.is_none() {
         return Some(format!(
             "{} is a BPI part: helion-hw has no BPI flash model to program.",
             part.name
@@ -305,9 +337,79 @@ pub fn op_block(s: &AppState, op: CfgOp) -> Option<String> {
         CfgOp::Program if !(c.opts.erase || c.opts.blank_check || c.opts.program || c.opts.verify) => {
             Some("Select at least one step.".into())
         }
-        CfgOp::Boot if c.flashed.is_none() => Some("Program the flash first.".into()),
+        CfgOp::Boot | CfgOp::Readback if c.flashed.is_none() => {
+            Some("Program the flash first.".into())
+        }
         _ => None,
     }
+}
+
+/// Run one flash operation on an open session (worker side).
+fn exec(
+    sess: &mut CfgMemSession,
+    op: CfgOp,
+    image: Option<CfgMemImage>,
+    opts: CfgMemProgramOpts,
+    flashed: Option<(u32, usize, u32)>,
+    readback_to: PathBuf,
+) -> CfgResult {
+    let path = sess.cable_kind().label();
+    match op {
+        CfgOp::Program => result(op, sess.program(image.as_ref().expect("checked"), opts)),
+        CfgOp::Verify => {
+            let img = image.expect("checked");
+            result(op, sess.verify(img.start_addr, &img.payload))
+        }
+        CfgOp::BlankCheck => {
+            let img = image.expect("checked");
+            result(op, sess.blank_check(img.start_addr, img.payload.len()))
+        }
+        CfgOp::Erase => match &image {
+            Some(img) => result(op, sess.erase(img.start_addr, img.payload.len())),
+            None => result(op, sess.erase_all()),
+        },
+        CfgOp::Readback => {
+            let (start, len, _) = flashed.expect("checked");
+            let r = sess.readback(start, len).and_then(|(mut rep, data)| {
+                if let Some(dir) = readback_to.parent() {
+                    std::fs::create_dir_all(dir).map_err(|e| format!("readback: {e}"))?;
+                }
+                std::fs::write(&readback_to, &data)
+                    .map_err(|e| format!("readback: write {}: {e}", readback_to.display()))?;
+                rep.steps.push(format!("wrote {}", readback_to.display()));
+                Ok(rep)
+            });
+            result(op, r)
+        }
+        CfgOp::Boot => {
+            let (start, len, _) = flashed.expect("checked");
+            match sess.boot(start, len) {
+                Ok(st) => CfgResult {
+                    op,
+                    ok: st.done,
+                    report: None,
+                    line: format!(
+                        "boot from flash {start:#x}: DONE={} GWE={} CRC_ERR={} ({path})",
+                        u8::from(st.done),
+                        u8::from(st.gwe),
+                        u8::from(st.crc_err)
+                    ),
+                },
+                Err(e) => CfgResult {
+                    op,
+                    ok: false,
+                    report: None,
+                    line: e,
+                },
+            }
+        }
+        CfgOp::BoardProgram => unreachable!("openFPGALoader path runs elsewhere"),
+    }
+}
+
+/// Where Read Back writes the flash contents.
+pub fn readback_path(s: &AppState) -> PathBuf {
+    image_dir(s).join("readback.bin")
 }
 
 fn spawn(s: &mut AppState, op: CfgOp, body: impl FnOnce() -> CfgResult + Send + 'static) {
@@ -352,7 +454,7 @@ pub fn run(s: &mut AppState, op: CfgOp) -> Result<String, String> {
     }
     let c = &s.program.cfgmem;
     let part = c.part.expect("checked");
-    if !sim(s) {
+    if flash_path(s) == FlashPath::Ofl {
         // Board: openFPGALoader -f with the bitstream (never claims a verify
         // the tool did not report).
         let Some((bits_src, _)) = crate::views::program::bits_source(s) else {
@@ -396,7 +498,6 @@ pub fn run(s: &mut AppState, op: CfgOp) -> Result<String, String> {
         });
         return Ok(format!("program_hw_cfgmem {} (board)", part.name));
     }
-    let sess = c.session.clone().expect("checked");
     let image = c.image.clone();
     let opts = c.opts;
     let flashed = c.flashed;
@@ -406,52 +507,38 @@ pub fn run(s: &mut AppState, op: CfgOp) -> Result<String, String> {
         CfgOp::Erase => "erase_hw_cfgmem",
         CfgOp::BlankCheck => "blank_check_hw_cfgmem",
         CfgOp::Boot => "boot_hw_device",
+        CfgOp::Readback => "readback_hw_cfgmem",
         CfgOp::BoardProgram => "program_hw_cfgmem",
     };
+    let out = readback_path(s);
+    if flash_path(s) == FlashPath::Native {
+        // Each operation opens the native cable, runs, and releases it.
+        let cfg = s.program.native.open_cfg();
+        console(
+            s,
+            format!("{verb} {} via {}", part.name, s.program.native.kind().label()),
+            MsgSev::Info,
+        );
+        spawn(s, op, move || {
+            let sess = crate::views::hw_native::open_cable(&cfg)
+                .and_then(|(cable, _)| CfgMemSession::over_cable(part, cable));
+            match sess {
+                Ok(mut sess) => exec(&mut sess, op, image, opts, flashed, out),
+                Err(e) => CfgResult {
+                    op,
+                    ok: false,
+                    report: None,
+                    line: e,
+                },
+            }
+        });
+        return Ok(format!("{verb} {} (native)", part.name));
+    }
+    let sess = c.session.clone().expect("checked");
     console(s, format!("{verb} {}", part.name), MsgSev::Info);
     spawn(s, op, move || {
         let mut sess = sess.lock().unwrap_or_else(|e| e.into_inner());
-        match op {
-            CfgOp::Program => {
-                let img = image.expect("checked");
-                result(op, sess.program(&img, opts))
-            }
-            CfgOp::Verify => {
-                let img = image.expect("checked");
-                result(op, sess.verify(img.start_addr, &img.payload))
-            }
-            CfgOp::BlankCheck => {
-                let img = image.expect("checked");
-                result(op, sess.blank_check(img.start_addr, img.payload.len()))
-            }
-            CfgOp::Erase => match &image {
-                Some(img) => result(op, sess.erase(img.start_addr, img.payload.len())),
-                None => result(op, sess.erase_all()),
-            },
-            CfgOp::Boot => {
-                let (start, len, _) = flashed.expect("checked");
-                match sess.boot(start, len) {
-                    Ok(st) => CfgResult {
-                        op,
-                        ok: st.done,
-                        report: None,
-                        line: format!(
-                            "boot from flash {start:#x}: DONE={} GWE={} CRC_ERR={} (sim fabric)",
-                            u8::from(st.done),
-                            u8::from(st.gwe),
-                            u8::from(st.crc_err)
-                        ),
-                    },
-                    Err(e) => CfgResult {
-                        op,
-                        ok: false,
-                        report: None,
-                        line: e,
-                    },
-                }
-            }
-            CfgOp::BoardProgram => unreachable!("board path handled above"),
-        }
+        exec(&mut sess, op, image, opts, flashed, out)
     });
     Ok(format!("{verb} {}", part.name))
 }
@@ -524,6 +611,7 @@ pub const VERBS: &[&str] = &[
     "create_hw_cfgmem",
     "write_cfgmem",
     "program_hw_cfgmem",
+    "readback_hw_cfgmem",
     "boot_hw_device",
 ];
 
@@ -542,7 +630,11 @@ pub fn help(verb: &str) -> Option<(&'static str, &'static str)> {
             "program_hw_cfgmem ?-file f? ?-noerase? ?-blank_check? ?-noprogram? ?-noverify? | -erase_only | -verify_only",
             "erase / blank check / program / verify the configuration flash",
         ),
-        "boot_hw_device" => ("boot_hw_device", "configure the device from flash (sim cable)"),
+        "readback_hw_cfgmem" => (
+            "readback_hw_cfgmem",
+            "read the programmed flash range back to readback.bin",
+        ),
+        "boot_hw_device" => ("boot_hw_device", "configure the device from flash"),
         _ => return None,
     })
 }
@@ -643,9 +735,13 @@ pub fn tcl_verb(s: &mut AppState, verb: &str, args: &[String]) -> Result<String,
             }
         }
         "boot_hw_device" => {
-                let r = run(s, CfgOp::Boot);
-                finish(s, r)
-            },
+            let r = run(s, CfgOp::Boot);
+            finish(s, r)
+        }
+        "readback_hw_cfgmem" => {
+            let r = run(s, CfgOp::Readback);
+            finish(s, r)
+        }
         other => Err(format!("{other}: not a cfgmem verb")),
     }
 }
@@ -707,5 +803,38 @@ mod tests {
         s.program.cable = CableChoice::Usb;
         assert!(op_block(&s, CfgOp::Erase).unwrap().contains("openFPGALoader"));
         assert!(op_block(&s, CfgOp::Program).unwrap().contains("USB"));
+        s.program.cable = CableChoice::Native;
+        assert!(op_block(&s, CfgOp::Erase).is_none(), "native FTDI erases");
+    }
+
+    #[test]
+    fn native_flow_program_verify_readback_boot_over_mock_ftdi() {
+        let mut s = state();
+        let part = helion_hw::find_cfgmem_part("mt25ql128").unwrap();
+        crate::views::hw_native::use_mock_board(
+            &mut s,
+            crate::views::hw_native::MockBoard::Helion {
+                part: "HL10T-C32-1".into(),
+                flash: Some((part.jedec_id.unwrap(), part.capacity_bytes())),
+            },
+        )
+        .unwrap();
+        tcl_verb(&mut s, "create_hw_cfgmem", &["mt25ql128".into()]).unwrap();
+        tcl_verb(&mut s, "write_cfgmem", &["-format".into(), "bin".into(), "-interface".into(), "SPIx1".into()]).unwrap();
+        let out = tcl_verb(&mut s, "program_hw_cfgmem", &[]).unwrap();
+        assert!(out.contains("verify:") && out.contains("match"), "{out}");
+        let rep = s.program.cfgmem.result.clone().unwrap().report.unwrap();
+        assert!(rep.jtag_dr_scans > 0 && rep.verified == Some(true));
+        let rb = tcl_verb(&mut s, "readback_hw_cfgmem", &[]).unwrap();
+        assert!(rb.contains("read back"), "{rb}");
+        let img = s.program.cfgmem.image.clone().unwrap();
+        assert_eq!(std::fs::read(readback_path(&s)).unwrap(), img.payload);
+        let boot = tcl_verb(&mut s, "boot_hw_device", &[]).unwrap();
+        assert!(boot.contains("DONE=1") && boot.contains("mock device"), "{boot}");
+        // The flash bytes live on the fixture board, not in the UI.
+        let on_board = s.program.native.mock.as_ref().unwrap().with_board(|m| {
+            m.helion_tap().unwrap().config_flash().unwrap().mem[..img.payload.len()].to_vec()
+        });
+        assert_eq!(on_board, Some(img.payload));
     }
 }

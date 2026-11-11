@@ -20,6 +20,8 @@
 use crate::cfgmem::{
     CfgBusWidth, crc32_ieee, parse_cfgmem_mcs_at, swap_byte_bits, write_cfgmem_mcs,
 };
+use crate::jtag_cable::{CableKind, JtagCable};
+use crate::native_cfgmem::{SpiOverJtag, SpiPort};
 use crate::spi_flash::{JtagSpiBridge, SPI_SECTOR_SIZE, SpiFlashSim};
 use crate::{Bitstream, Stat, Tap};
 use helion_device::Device;
@@ -379,54 +381,106 @@ pub struct CfgMemReport {
     pub nonblank_bytes: Option<usize>,
 }
 
-/// Indirect flash programming over the sim cable.
+/// Where the session's flash lives.
+enum Link {
+    /// Simulation cable: TAP + flash model behind the USER1 bridge.
+    Sim { tap: Tap, flash: SpiFlashSim },
+    /// Any [`JtagCable`] reaching the board's flash through
+    /// [`crate::IR_SPI_ACCESS`] (native FTDI: real MPSSE traffic).
+    Cable(Box<dyn JtagCable>),
+}
+
+/// Indirect flash programming (`create_hw_cfgmem` … `program_hw_cfgmem`).
 pub struct CfgMemSession {
     pub part: &'static CfgMemPart,
-    tap: Tap,
-    flash: SpiFlashSim,
+    link: Link,
 }
 
 impl std::fmt::Debug for CfgMemSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CfgMemSession")
             .field("part", &self.part.name)
+            .field("cable", &self.cable_kind())
             .finish()
     }
+}
+
+fn spi_part_id(part: &CfgMemPart) -> Result<[u8; 3], String> {
+    part.jedec_id.ok_or_else(|| {
+        format!(
+            "create_hw_cfgmem: {} is BPI; helion-hw has no BPI flash model \
+             (write_cfgmem -interface BPIx16 images are still generated)",
+            part.name
+        )
+    })
 }
 
 impl CfgMemSession {
     /// `create_hw_cfgmem -hw_device D PART` on the sim cable.
     pub fn new(dev: &Device, part: &'static CfgMemPart) -> Result<Self, String> {
-        let id = part.jedec_id.ok_or_else(|| {
-            format!(
-                "create_hw_cfgmem: {} is BPI; helion-hw has no BPI flash model \
-                 (write_cfgmem -interface BPIx16 images are still generated)",
-                part.name
-            )
-        })?;
+        let id = spi_part_id(part)?;
         let mut flash = SpiFlashSim::new(part.capacity_bytes());
         flash.jedec_id = id;
         Ok(Self {
             part,
-            tap: Tap::new(dev),
-            flash,
+            link: Link::Sim {
+                tap: Tap::new(dev),
+                flash,
+            },
         })
     }
 
-    fn with_bridge<R>(
+    /// `create_hw_cfgmem` on a native cable: the flash is whatever the board
+    /// wires to the device's configuration SPI pins.
+    pub fn over_cable(
+        part: &'static CfgMemPart,
+        cable: Box<dyn JtagCable>,
+    ) -> Result<Self, String> {
+        spi_part_id(part)?;
+        Ok(Self {
+            part,
+            link: Link::Cable(cable),
+        })
+    }
+
+    pub fn cable_kind(&self) -> CableKind {
+        match &self.link {
+            Link::Sim { .. } => CableKind::Sim,
+            Link::Cable(c) => c.kind(),
+        }
+    }
+
+    pub fn cable_detail(&self) -> String {
+        match &self.link {
+            Link::Sim { .. } => "Simulation cable · USER1 SPI bridge model".into(),
+            Link::Cable(c) => format!("{} · IR SPI_ACCESS", c.describe()),
+        }
+    }
+
+    fn with_port<R>(
         &mut self,
-        f: impl FnOnce(&mut JtagSpiBridge) -> Result<R, String>,
+        f: impl FnOnce(&mut dyn SpiPort) -> Result<R, String>,
     ) -> Result<(R, usize), String> {
-        let flash = std::mem::replace(&mut self.flash, SpiFlashSim::new(0));
-        let mut bridge = JtagSpiBridge::new(&mut self.tap, flash);
-        let r = f(&mut bridge);
-        let scans = bridge.jtag_dr_scans;
-        self.flash = bridge.flash;
-        r.map(|v| (v, scans))
+        match &mut self.link {
+            Link::Sim { tap, flash } => {
+                let fl = std::mem::replace(flash, SpiFlashSim::new(0));
+                let mut bridge = JtagSpiBridge::new(tap, fl);
+                let r = f(&mut bridge);
+                let scans = bridge.jtag_dr_scans;
+                *flash = bridge.flash;
+                r.map(|v| (v, scans))
+            }
+            Link::Cable(c) => {
+                let mut spi = SpiOverJtag::new(c.as_mut());
+                let r = f(&mut spi);
+                let scans = spi.scans;
+                r.map(|v| (v, scans))
+            }
+        }
     }
 
     fn check_range(&self, start: u32, len: usize) -> Result<(), String> {
-        if start as usize + len > self.flash.mem.len() {
+        if start as usize + len > self.part.capacity_bytes() {
             return Err(format!(
                 "cfgmem: range {start:#x}+{len:#x} past the {} Mbit part",
                 self.part.density_mbit
@@ -435,9 +489,9 @@ impl CfgMemSession {
         Ok(())
     }
 
-    /// `RDID` over the bridge; errors if it does not match the part.
+    /// `RDID` over the cable; errors if it does not match the part.
     pub fn read_id(&mut self) -> Result<[u8; 3], String> {
-        let (id, _) = self.with_bridge(|b| b.read_jedec_id())?;
+        let (id, _) = self.with_port(|b| b.jedec_id())?;
         if Some(id) != self.part.jedec_id {
             return Err(format!(
                 "cfgmem: JEDEC ID {id:02X?} does not match {} ({})",
@@ -451,16 +505,15 @@ impl CfgMemSession {
     /// Erase the 64 KiB sectors covering `[start, start+len)`.
     pub fn erase(&mut self, start: u32, len: usize) -> Result<CfgMemReport, String> {
         self.check_range(start, len.max(1))?;
-        let before = self.flash.sectors_erased;
         let first = start as usize / SPI_SECTOR_SIZE;
         let last = (start as usize + len.max(1) - 1) / SPI_SECTOR_SIZE;
-        let (_, scans) = self.with_bridge(|b| {
+        let (_, scans) = self.with_port(|b| {
             for sec in first..=last {
                 b.erase_sector((sec * SPI_SECTOR_SIZE) as u32)?;
             }
             Ok(())
         })?;
-        let n = self.flash.sectors_erased - before;
+        let n = last + 1 - first;
         Ok(CfgMemReport {
             steps: vec![format!(
                 "erase: {n} sector(s) {:#x}..{:#x}",
@@ -475,14 +528,30 @@ impl CfgMemSession {
 
     /// Erase the whole part.
     pub fn erase_all(&mut self) -> Result<CfgMemReport, String> {
-        let cap = self.flash.mem.len();
+        let cap = self.part.capacity_bytes();
         self.erase(0, cap)
     }
 
-    /// Count non-erased bytes in a range (read back over the bridge).
+    /// Read `len` bytes at `start` back over the cable.
+    pub fn readback(&mut self, start: u32, len: usize) -> Result<(CfgMemReport, Vec<u8>), String> {
+        self.check_range(start, len)?;
+        let (data, scans) = self.with_port(|b| b.read(start, len))?;
+        let crc = crc32_ieee(&data);
+        Ok((
+            CfgMemReport {
+                steps: vec![format!("read back: {len} byte(s) at {start:#x} · CRC32 {crc:08X}")],
+                jtag_dr_scans: scans,
+                readback_crc32: Some(crc),
+                ..CfgMemReport::default()
+            },
+            data,
+        ))
+    }
+
+    /// Count non-erased bytes in a range (read back over the cable).
     pub fn blank_check(&mut self, start: u32, len: usize) -> Result<CfgMemReport, String> {
         self.check_range(start, len)?;
-        let (data, scans) = self.with_bridge(|b| b.read_data(start, len, true))?;
+        let (data, scans) = self.with_port(|b| b.read(start, len))?;
         let nonblank = data.iter().filter(|&&b| b != 0xFF).count();
         Ok(CfgMemReport {
             steps: vec![format!(
@@ -503,7 +572,7 @@ impl CfgMemSession {
     /// Read back and compare against `payload` at `start`.
     pub fn verify(&mut self, start: u32, payload: &[u8]) -> Result<CfgMemReport, String> {
         self.check_range(start, payload.len())?;
-        let (data, scans) = self.with_bridge(|b| b.read_data(start, payload.len(), true))?;
+        let (data, scans) = self.with_port(|b| b.read(start, payload.len()))?;
         let exp = crc32_ieee(payload);
         let got = crc32_ieee(&data);
         let ok = data == payload;
@@ -567,21 +636,22 @@ impl CfgMemSession {
             rep.nonblank_bytes = Some(0);
         }
         if opts.program {
-            let before = self.flash.pages_programmed;
             let payload = image.payload.clone();
-            let (_, scans) = self.with_bridge(|b| {
+            let (pages, scans) = self.with_port(|b| {
                 let end = start as usize + payload.len();
                 let mut cur = start as usize;
+                let mut pages = 0usize;
                 while cur < end {
                     let room = crate::SPI_PAGE_SIZE - cur % crate::SPI_PAGE_SIZE;
                     let n = room.min(end - cur);
                     let off = cur - start as usize;
                     b.program_page(cur as u32, &payload[off..off + n])?;
+                    pages += 1;
                     cur += n;
                 }
-                Ok(())
+                Ok(pages)
             })?;
-            rep.pages_programmed = self.flash.pages_programmed - before;
+            rep.pages_programmed = pages;
             rep.jtag_dr_scans += scans;
             rep.steps.push(format!(
                 "program: {} byte(s) in {} page(s) at {start:#x}",
@@ -606,18 +676,23 @@ impl CfgMemSession {
     }
 
     /// Configure the fabric from flash (`boot_hw_device` after programming):
-    /// reads `len` bytes at `start` over the bridge and runs CFG_W.
+    /// reads `len` bytes at `start` back over the cable and runs CFG_W.
     pub fn boot(&mut self, start: u32, len: usize) -> Result<Stat, String> {
         self.check_range(start, len)?;
-        let (st, _) = self.with_bridge(|b| b.boot_fabric_from_flash(start, len))?;
+        let (st, _) = self.with_port(|b| b.boot(start, len))?;
         Ok(st)
     }
 
-    /// Raw flash bytes (tests / hex views).
-    pub fn flash_bytes(&self, start: u32, len: usize) -> &[u8] {
-        let s = (start as usize).min(self.flash.mem.len());
-        let e = (s + len).min(self.flash.mem.len());
-        &self.flash.mem[s..e]
+    /// Flash-model bytes (tests): the sim flash, or the mock board's flash.
+    /// `None` on a real cable — read it back with [`Self::readback`].
+    pub fn model_bytes(&mut self, start: u32, len: usize) -> Option<Vec<u8>> {
+        let mem = match &mut self.link {
+            Link::Sim { flash, .. } => &flash.mem,
+            Link::Cable(c) => &c.board()?.config_flash()?.mem,
+        };
+        let s = (start as usize).min(mem.len());
+        let e = (s + len).min(mem.len());
+        Some(mem[s..e].to_vec())
     }
 }
 
@@ -711,7 +786,7 @@ mod tests {
         assert_eq!(rep.verified, Some(true));
         assert!(rep.sectors_erased >= 1 && rep.pages_programmed >= 1);
         assert!(rep.jtag_dr_scans > 0);
-        assert_eq!(s.flash_bytes(0, img.payload.len()), &img.payload[..]);
+        assert_eq!(s.model_bytes(0, img.payload.len()).unwrap(), img.payload);
         // Blank check without erase now fails honestly.
         let opts = CfgMemProgramOpts {
             erase: false,
@@ -728,6 +803,38 @@ mod tests {
         let v = s.verify(0, &img.payload).unwrap();
         assert_eq!(v.verified, Some(false));
         assert!(s.boot(0, img.payload.len()).is_err());
+    }
+
+    #[test]
+    fn native_session_erase_program_verify_readback_boot_over_mpsse() {
+        let (dev, b) = bits();
+        let p = part("w25q32jv");
+        let img = write_cfgmem(&b, p, CfgMemFormat::Bin, CfgMemInterface::SpiX1, 0).unwrap();
+        let mut board = crate::MockFtdi::helion(&dev);
+        let mut flash = SpiFlashSim::new(p.capacity_bytes());
+        flash.jedec_id = p.jedec_id.unwrap();
+        board.helion_tap_mut().unwrap().attach_config_flash(flash);
+        let eng = crate::JtagEngine::open(board, 15_000_000).unwrap();
+        let mut s = CfgMemSession::over_cable(p, Box::new(eng)).unwrap();
+        assert_eq!(s.cable_kind(), CableKind::NativeMock);
+        assert_eq!(s.read_id().unwrap(), [0xEF, 0x40, 0x16]);
+        let rep = s.program(&img, CfgMemProgramOpts::default()).unwrap();
+        assert_eq!(rep.verified, Some(true));
+        assert!(rep.sectors_erased >= 1 && rep.pages_programmed >= 1);
+        assert_eq!(s.model_bytes(0, img.payload.len()).unwrap(), img.payload);
+        let (rb, data) = s.readback(0, img.payload.len()).unwrap();
+        assert_eq!(data, img.payload);
+        assert_eq!(rb.readback_crc32, Some(crc32_ieee(&img.payload)));
+        let st = s.boot(0, img.payload.len()).unwrap();
+        assert!(st.done, "booted from the flash image over the native engine");
+        s.erase(0, img.payload.len()).unwrap();
+        assert_eq!(s.verify(0, &img.payload).unwrap().verified, Some(false));
+        // Wrong part on the board: JEDEC mismatch is reported, not assumed.
+        let other = part("mt25ql128");
+        let board2 = crate::MockFtdi::helion(&dev);
+        let eng2 = crate::JtagEngine::open(board2, 1_000_000).unwrap();
+        let mut s2 = CfgMemSession::over_cable(other, Box::new(eng2)).unwrap();
+        assert!(s2.read_id().unwrap_err().contains("no SPI flash"));
     }
 
     #[test]
