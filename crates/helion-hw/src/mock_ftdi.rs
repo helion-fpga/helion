@@ -375,10 +375,12 @@ impl MockFtdi {
                  a JTAG target samples there (encoder bug)"
             ));
         }
-        if r_tdo && opc & flag::READ_NEG != 0 {
+        let tck = crate::mpsse::tck_hz(self.divisor, self.div5);
+        if r_tdo && opc & flag::READ_NEG != 0 && tck <= crate::mpsse::READ_FALLING_ABOVE_HZ {
             return Err(format!(
-                "mock FTDI: opcode {opc:#04x} samples TDO on the falling edge — \
-                 JTAG TDO is valid on the rising edge (encoder bug)"
+                "mock FTDI: opcode {opc:#04x} samples TDO on the falling edge at {tck} Hz — \
+                 below {} Hz TDO is read on the rising edge (encoder bug)",
+                crate::mpsse::READ_FALLING_ABOVE_HZ
             ));
         }
         if bit_mode {
@@ -668,6 +670,28 @@ mod tests {
         e.select_target(0).unwrap();
         e.shift_ir(0b000001).unwrap();
         assert_eq!(e.shift_dr_u32(0).unwrap(), 0x0362_D093);
+    }
+
+    #[test]
+    fn zedboard_chain_reads_at_every_tck_with_the_edge_switch() {
+        // Zynq PL + ARM DAP, as on a ZedBoard; 30 MHz switches to
+        // falling-edge TDO reads (the mock refuses them at <= 15 MHz).
+        let chain = vec![
+            MockChainDevice::Generic(GenericTap::new(Some(0x2372_7093), 6)),
+            MockChainDevice::Generic(GenericTap::new(Some(0x4BA0_0477), 4)),
+        ];
+        let mut e = JtagEngine::open(MockFtdi::with_chain(chain), 6_000_000).unwrap();
+        let want = e.chain().to_vec();
+        assert_eq!(want.len(), 2);
+        assert_eq!((want[0].ir_len, want[1].ir_len), (6, 4));
+        for hz in [1_000_000u32, 15_000_000, 30_000_000] {
+            e.set_tck_hz(hz).unwrap();
+            assert_eq!(e.read_falling(), hz > crate::mpsse::READ_FALLING_ABOVE_HZ);
+            assert_eq!(e.scan_chain().unwrap(), &want[..], "{hz} Hz");
+            e.select_target(0).unwrap();
+            e.shift_ir(0b000001).unwrap();
+            assert_eq!(e.shift_dr_u32(0).unwrap(), 0x2372_7093, "{hz} Hz");
+        }
     }
 
     #[test]

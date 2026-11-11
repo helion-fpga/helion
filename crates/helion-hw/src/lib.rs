@@ -1728,6 +1728,14 @@ pub fn program_via_openfpgaloader_for_part(
             "program: dry-run only (HELION_OFL_DRY_RUN=1); would run: {command}"
         ));
     }
+    // Unit tests may only drive fixture OFL scripts they wrote to the temp
+    // dir: a real openFPGALoader would program whatever board is attached.
+    #[cfg(test)]
+    if !ofl.starts_with(std::env::temp_dir()) {
+        return Err(format!(
+            "program: test build refuses to program through a real openFPGALoader ({command})"
+        ));
+    }
     let mut cmd = std::process::Command::new(&ofl);
     cmd.args(&args);
     let out = cmd
@@ -2150,7 +2158,7 @@ mod tests {
 
     #[test]
     fn detect_lists_sim_and_ofl_backends() {
-        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let _guard = OFL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("HELION_OFL");
             std::env::remove_var("HELION_OPENFPGALOADER");
@@ -2200,7 +2208,7 @@ mod tests {
 
     #[test]
     fn cached_cable_resolve_does_not_reshell_ofl() {
-        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let _guard = OFL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let n0 = usb_scan_invocations();
         let det = detect_boards();
         let n1 = usb_scan_invocations();
@@ -2227,7 +2235,7 @@ mod tests {
 
     #[test]
     fn auto_usb0_program_refuses_done_no_soft_hold() {
-        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let _guard = OFL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join("helion-auto-usb0");
         let _ = std::fs::create_dir_all(&dir);
         let dev = Device::load_part("HL10T-C32-1").unwrap();
@@ -2260,7 +2268,7 @@ mod tests {
 
     #[test]
     fn auto_usb0_nonempty_structural_counter_refuses_usb_0() {
-        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let _guard = OFL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join("helion-auto-usb0-counter");
         let _ = std::fs::create_dir_all(&dir);
         let (dev, bits) = bitgen_structural_counter();
@@ -2272,6 +2280,10 @@ mod tests {
         }
         unsafe {
             std::env::remove_var("HELION_OFL_DRY_RUN");
+        }
+        if !scan_usb_probes().probes.is_empty() {
+            eprintln!("skip: a real JTAG cable is attached (this test needs USB=0)");
+            return;
         }
         let cable = resolve_cable("auto").unwrap();
         assert_eq!(cable.backend, CableBackend::OpenFpgaLoader);
@@ -2293,7 +2305,7 @@ mod tests {
 
     #[test]
     fn ofl_program_fails_honestly_without_device_or_binary() {
-        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let _guard = OFL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join("helion-ofl-test");
         let _ = std::fs::create_dir_all(&dir);
         let bits_path = dir.join("counter.hbits");
@@ -2318,7 +2330,7 @@ mod tests {
 
     #[test]
     fn ofl_dry_run_logs_and_refuses_done() {
-        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let _guard = OFL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join("helion-ofl-dry");
         let _ = std::fs::create_dir_all(&dir);
         let fake = dir.join("fake-ofl");
@@ -2386,7 +2398,7 @@ mod tests {
 
     #[test]
     fn had_board_id_helpers_and_ofl_board_defaults() {
-        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let _guard = OFL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let t = lookup_had_board("HL10T-C32-1").expect("T part");
         assert_eq!(t.idcode, 0x0001_1A1F);
         assert_eq!(t.ofl_board, "helion_hl10t");
@@ -2420,7 +2432,7 @@ mod tests {
 
     #[test]
     fn native_usb_stub_not_implemented_falls_back_to_ofl() {
-        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let _guard = OFL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join("helion-native-fallback");
         let _ = std::fs::create_dir_all(&dir);
         let fake = dir.join("fake-ofl");
@@ -2663,7 +2675,7 @@ mod tests {
 
     #[test]
     fn ofl_verify_parse_refuses_done_on_verify_fail_phrase() {
-        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let _guard = OFL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join("helion-ofl-verify-fail");
         let _ = std::fs::create_dir_all(&dir);
         let fake = dir.join("fake-ofl");
@@ -2756,7 +2768,7 @@ mod tests {
 
     #[test]
     fn ofl_dry_run_env_still_refuses_done_with_fixture_binary() {
-        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let _guard = OFL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join("helion-ofl-dry-fixture");
         let _ = std::fs::create_dir_all(&dir);
         let fake = dir.join("fake-ofl");
@@ -2827,7 +2839,7 @@ mod tests {
     /// When real `openFPGALoader` is on PATH (box apt install): detect sees binary, 0 probes, no DONE.
     #[test]
     fn ofl_real_binary_on_path_detect_zero_probes_no_done() {
-        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let _guard = OFL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Clear overrides so PATH / system OFL is used when present.
         unsafe {
             std::env::remove_var("HELION_OPENFPGALOADER");
@@ -2950,7 +2962,7 @@ mod tests {
 
     #[test]
     fn had_board_lookup_and_ofl_board_resolve() {
-        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let _guard = OFL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("HELION_OFL_BOARD");
         }
@@ -3180,7 +3192,7 @@ mod tests {
     #[test]
     fn ofl_refuses_empty_frame_hbits_before_spawn_no_done() {
         // Strongest proof: no fake OFL on PATH — empty-frame HBIT still Err before spawn.
-        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let _guard = OFL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join("helion-ofl-empty-frames");
         let _ = std::fs::create_dir_all(&dir);
         let missing = dir.join("missing-openFPGALoader-must-not-matter");

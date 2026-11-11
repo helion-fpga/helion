@@ -34,7 +34,9 @@ impl CableKind {
         match self {
             CableKind::Sim => "Simulation cable",
             CableKind::NativeMock => "native FTDI · mock device",
-            CableKind::NativeUsb => "native FTDI · not yet verified on a board",
+            CableKind::NativeUsb => {
+                "native FTDI · USB (chain scan verified on hardware; programming unverified)"
+            }
         }
     }
 

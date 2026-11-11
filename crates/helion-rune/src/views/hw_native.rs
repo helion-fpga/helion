@@ -534,6 +534,7 @@ pub fn wait_idle(s: &mut AppState, timeout: std::time::Duration) -> bool {
 // ---- Tcl ----
 
 pub const VERBS: &[&str] = &[
+    "open_hw_target",
     "refresh_hw_target",
     "close_hw_target",
     "get_hw_devices",
@@ -543,6 +544,10 @@ pub const VERBS: &[&str] = &[
 
 pub fn help(verb: &str) -> Option<(&'static str, &'static str)> {
     Some(match verb {
+        "open_hw_target" => (
+            "open_hw_target ?-cable auto|sim|usb|native?",
+            "select the programming cable; native opens the FTDI and scans the chain",
+        ),
         "refresh_hw_target" => (
             "refresh_hw_target",
             "scan the native FTDI JTAG chain (IDCODEs, IR lengths)",
@@ -577,6 +582,25 @@ fn finish(s: &mut AppState, started: Result<String, String>) -> Result<String, S
 
 pub fn tcl_verb(s: &mut AppState, verb: &str, args: &[String]) -> Result<String, String> {
     match verb {
+        "open_hw_target" => {
+            if let Some(i) = args.iter().position(|a| a == "-cable") {
+                let spec = args
+                    .get(i + 1)
+                    .ok_or("open_hw_target: -cable needs auto|sim|usb|native")?;
+                s.program.cable = crate::views::hw::CableChoice::parse(spec).ok_or_else(|| {
+                    format!("open_hw_target: unknown cable '{spec}' (auto|sim|usb|native)")
+                })?;
+            }
+            if s.program.cable != crate::views::hw::CableChoice::Native {
+                return Ok(format!(
+                    "open_hw_target: cable {} (chain scan needs -cable native)",
+                    s.program.cable.label()
+                ));
+            }
+            let r = scan(s);
+            finish(s, r)?;
+            Ok(device_lines(s))
+        }
         "refresh_hw_target" => {
             let r = scan(s);
             finish(s, r)?;
@@ -679,6 +703,21 @@ mod tests {
         assert_eq!(c.devices.len(), 3);
         assert_eq!(c.tck_hz, 6_000_000);
         assert_eq!(c.divisor, 4);
+    }
+
+    #[test]
+    fn open_hw_target_selects_the_cable_and_scans_on_native() {
+        let mut s = state();
+        let a = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let out = tcl_verb(&mut s, "open_hw_target", &a(&["-cable", "sim"])).unwrap();
+        assert!(out.contains("Simulation"), "{out}");
+        assert_eq!(s.program.cable, crate::views::hw::CableChoice::Sim);
+        assert!(tcl_verb(&mut s, "open_hw_target", &a(&["-cable", "bogus"])).is_err());
+        assert!(tcl_verb(&mut s, "open_hw_target", &a(&["-cable"])).is_err());
+        let out = tcl_verb(&mut s, "open_hw_target", &a(&["-cable", "native"])).unwrap();
+        assert!(out.contains("Helion HL10T"), "{out}");
+        assert_eq!(s.program.native.chain.as_ref().unwrap().devices.len(), 3);
+        assert!(help("open_hw_target").is_some());
     }
 
     #[test]
