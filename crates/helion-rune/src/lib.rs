@@ -478,6 +478,36 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         .collect();
         s.constraints_view.selected = Some(1);
     }),
+    ("summary-runs", |s| {
+        views::reports::demo_impl_complete(s);
+        seed_timing_fixture(s);
+        s.runs.history = vec![
+            runs::RunRecord {
+                seq: 1,
+                kind: runs::RunKind::Synth,
+                outcome: runs::RunOutcome::Complete,
+                wns_ps: Some(3120),
+                lut_ff: Some(2310),
+                duration_ms: 1840,
+            },
+            runs::RunRecord {
+                seq: 2,
+                kind: runs::RunKind::Impl,
+                outcome: runs::RunOutcome::Failed,
+                wns_ps: None,
+                lut_ff: None,
+                duration_ms: 950,
+            },
+            runs::RunRecord {
+                seq: 3,
+                kind: runs::RunKind::Impl,
+                outcome: runs::RunOutcome::Complete,
+                wns_ps: Some(2061),
+                lut_ff: Some(2415),
+                duration_ms: 64_300,
+            },
+        ];
+    }),
     ("palette-files", |s| {
         views::palette::open_palette(s, views::palette::PaletteMode::Files);
     }),
