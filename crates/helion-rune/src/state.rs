@@ -188,6 +188,19 @@ pub struct EditorState {
     pub owners: [Option<String>; 3],
     /// Lines + undo history of open tabs that don't own their buffer.
     pub parked: std::collections::HashMap<String, ParkedBuffer>,
+    /// Find ignores case ("Match case" off). Off by default: find has
+    /// always been case-sensitive.
+    pub find_ignore_case: bool,
+    /// Symbol outline strip shown beside the code.
+    pub outline_open: bool,
+    /// Bookmarked 0-based lines per tab name.
+    pub bookmarks: std::collections::HashMap<String, std::collections::BTreeSet<usize>>,
+    /// Large-file mode: the caret line's own field (the rest of the file
+    /// renders as virtual rows) and which line it mirrors.
+    pub line_edit: rune::TextEdit,
+    pub line_at: Option<usize>,
+    /// Parse diagnostics of the active buffer (worker-computed).
+    pub diag: crate::views::editor_diag::DiagState,
 }
 
 /// A non-active file's buffer and undo history (see [`EditorState::owners`]).
@@ -1254,6 +1267,7 @@ impl AppState {
                 edit_tab: None,
                 owners: [None, None, None],
                 parked: std::collections::HashMap::new(),
+                ..EditorState::default()
             },
             timing: TimingState::default(),
             util: UtilState::default(),

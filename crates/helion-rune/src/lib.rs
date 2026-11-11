@@ -71,6 +71,14 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         s.editor.tabs.push("project1_tb.v".into());
         s.editor.active = 2;
     }),
+    ("editor-outline", |s| {
+        s.center = state::CenterPane::Editor;
+        s.editor.outline_open = true;
+        views::editor::sync_edit(s);
+        views::editor::move_cursor_to(s, 26);
+    }),
+    ("editor-diagnostics", |s| scenes::editor_diagnostics(s)),
+    ("editor-large", |s| scenes::editor_large(s)),
     ("console", |_| {}),
     ("console-tcl", |s| {
         crate::tcl::eval_command(s, "set part xc7z007s");
@@ -1022,7 +1030,8 @@ pub fn poll_all(s: &mut AppState, t: f64, tx: &mut rune::Tx) -> bool {
     views::editor::sync_edit(s);
     let hw_dirty = views::program::poll(s);
     let jobs_dirty = jobs::poll(s, tx);
-    runs_dirty || sim_dirty || ila_dirty || hw_dirty || toasts_dirty || jobs_dirty
+    let diag_dirty = views::editor_diag::poll(s, t, tx);
+    runs_dirty || sim_dirty || ila_dirty || hw_dirty || toasts_dirty || jobs_dirty || diag_dirty
 }
 
 pub fn app_spec() -> AppSpec<AppState> {

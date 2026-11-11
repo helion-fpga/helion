@@ -250,6 +250,73 @@ pub fn highlight_line(line: &str, dialect: Dialect, t: &VivadoTheme) -> Vec<Span
     highlight(line, dialect, t)
 }
 
+/// One line's spans when the line may start inside an SV `/* … */` block
+/// comment (`in_block`, from [`block_open_after`] over the lines above).
+/// This is what lets a virtualized editor lex only the rows it shows.
+pub fn highlight_line_from(line: &str, dialect: Dialect, in_block: bool, t: &VivadoTheme) -> Vec<Span> {
+    if dialect != Dialect::Verilog || !in_block {
+        return highlight(line, dialect, t);
+    }
+    let comment = |a: usize, b: usize| Span::new(a, b).color(t.code_comment).italic();
+    match line.find("*/") {
+        None => vec![comment(0, line.len())],
+        Some(p) => {
+            let e = p + 2;
+            let mut out = vec![comment(0, e)];
+            for sp in highlight(&line[e..], dialect, t) {
+                let mut sp = sp;
+                sp.start += e as u32;
+                sp.end += e as u32;
+                out.push(sp);
+            }
+            out
+        }
+    }
+}
+
+/// Whether an SV block comment is still open at the end of `line`, given
+/// whether one was open at its start. Strings and `//` comments are skipped
+/// the same way [`highlight`] skips them. Other dialects never carry state.
+pub fn block_open_after(line: &str, dialect: Dialect, in_block: bool) -> bool {
+    if dialect != Dialect::Verilog {
+        return false;
+    }
+    let b = line.as_bytes();
+    let mut open = in_block;
+    let mut i = 0;
+    while i < b.len() {
+        if open {
+            match line[i..].find("*/") {
+                Some(p) => {
+                    open = false;
+                    i += p + 2;
+                }
+                None => return true,
+            }
+            continue;
+        }
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => return false,
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                open = true;
+                i += 2;
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    open
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +384,40 @@ mod tests {
         assert!(p.contains(&("-period".into(), t.code_type)));
         assert!(p.contains(&("10".into(), t.code_number)));
         assert!(p.contains(&("# main".into(), t.code_comment)));
+    }
+
+    #[test]
+    fn per_line_lexing_matches_the_whole_buffer() {
+        let t = theme();
+        let src = "wire a; /* open\n still comment\n done */ reg b; // x /*\nlogic c;";
+        let whole = highlight(src, Dialect::Verilog, &t);
+        let mut in_block = false;
+        let mut off = 0u32;
+        let mut per_line = Vec::new();
+        for line in src.split('\n') {
+            for mut sp in highlight_line_from(line, Dialect::Verilog, in_block, &t) {
+                sp.start += off;
+                sp.end += off;
+                per_line.push((sp.start, sp.end, sp.color));
+            }
+            in_block = block_open_after(line, Dialect::Verilog, in_block);
+            off += line.len() as u32 + 1;
+        }
+        // Every whole-buffer span is covered by the per-line spans (block
+        // comments split at line ends, everything else identical).
+        for sp in &whole {
+            let covered = per_line
+                .iter()
+                .filter(|(a, b, c)| *a >= sp.start && *b <= sp.end && *c == sp.color)
+                .map(|(a, b, _)| b - a)
+                .sum::<u32>();
+            let newlines = src[sp.start as usize..sp.end as usize].matches('\n').count() as u32;
+            assert_eq!(covered + newlines, sp.end - sp.start, "span {:?}", (sp.start, sp.end));
+        }
+        assert!(!block_open_after("x /* a */ y", Dialect::Verilog, false));
+        assert!(block_open_after("x /* a", Dialect::Verilog, false));
+        assert!(!block_open_after("\"/*\" y", Dialect::Verilog, false));
+        assert!(!block_open_after("-- /*", Dialect::Vhdl, false));
     }
 
     #[test]
