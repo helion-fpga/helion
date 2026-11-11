@@ -553,10 +553,8 @@ impl JtagAxiMaster {
             txn.dr_scans += 1;
 
             let Some(region) = self.find_region(beat_addr).cloned() else {
+                // No slave answers: report DECERR without inventing read data.
                 overall_resp = AxiResp::DecErr;
-                if txn.kind == AxiTxnKind::Read {
-                    txn.read_data.push(0xDEAD_BEEF);
-                }
                 break;
             };
 
