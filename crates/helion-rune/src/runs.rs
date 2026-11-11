@@ -161,6 +161,68 @@ pub struct RunRecord {
     /// Slice LUTs + registers the run counted (`None` without utilization).
     pub lut_ff: Option<u32>,
     pub duration_ms: u64,
+    /// Design-run name (`synth_1`, `impl_1`, `impl_2`, `sweep_s3`).
+    pub name: String,
+    /// Strategy the run used (`RunStrategy::to_spec`, or the synth label).
+    pub strategy: String,
+    /// Total negative slack, picoseconds (`None` without timing).
+    pub tns_ps: Option<i64>,
+    /// Utilization split (`None` without a utilization report).
+    pub luts: Option<u32>,
+    pub ffs: Option<u32>,
+    pub bram: Option<u32>,
+    pub dsp: Option<u32>,
+    /// Routed `.hck2` design checkpoint the worker wrote (impl runs).
+    pub checkpoint: Option<PathBuf>,
+    /// The completed run's artifacts, kept so `Make active` can re-apply
+    /// them to the report views (`None` for failed/cancelled runs).
+    pub artifacts: Option<Box<RunArtifacts>>,
+}
+
+impl Default for RunRecord {
+    fn default() -> Self {
+        Self {
+            seq: 0,
+            kind: RunKind::Synth,
+            outcome: RunOutcome::Complete,
+            wns_ps: None,
+            lut_ff: None,
+            duration_ms: 0,
+            name: String::new(),
+            strategy: String::new(),
+            tns_ps: None,
+            luts: None,
+            ffs: None,
+            bram: None,
+            dsp: None,
+            checkpoint: None,
+            artifacts: None,
+        }
+    }
+}
+
+/// What one run executes: its design-run name, flow, and the strategy
+/// knobs (seed included) that travel to the worker with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunSpec {
+    pub name: String,
+    pub kind: RunKind,
+    pub strategy: helion_proj::RunStrategy,
+}
+
+impl RunSpec {
+    /// The built-in `synth_1` / `impl_1` run with the project strategy.
+    pub fn builtin(s: &AppState, kind: RunKind) -> Self {
+        Self {
+            name: kind.run_name().to_string(),
+            kind,
+            strategy: impl_strategy_for(&s.flow.impl_strategy),
+        }
+    }
+
+    pub fn is_builtin(&self) -> bool {
+        self.name == self.kind.run_name()
+    }
 }
 
 /// Real completion payload. Every `Some` was computed from engine reports
@@ -186,6 +248,8 @@ pub struct RunArtifacts {
     pub cells: usize,
     /// Re-analysis context for on-demand reports.
     pub analysis: Option<AnalysisCtx>,
+    /// Routed checkpoint written after the bitstream (impl runs only).
+    pub checkpoint: Option<PathBuf>,
 }
 
 /// The live worker handle: its event channel plus the cancel flag the
@@ -193,6 +257,7 @@ pub struct RunArtifacts {
 #[derive(Clone)]
 struct ActiveRun {
     kind: RunKind,
+    spec: RunSpec,
     rx: Arc<Mutex<mpsc::Receiver<RunEvent>>>,
     cancel: Arc<AtomicBool>,
     started: std::time::Instant,
@@ -234,6 +299,17 @@ pub struct RunsState {
     pub analysis: Option<AnalysisCtx>,
     /// Finished runs, oldest first (Summary Run History card).
     pub history: Vec<RunRecord>,
+    /// User-created design runs (beyond `synth_1` / `impl_1`).
+    pub defs: Vec<RunSpec>,
+    /// Runs waiting for the worker, launched one at a time in order.
+    pub queue: std::collections::VecDeque<RunSpec>,
+    /// Run whose results the report views show (`Make active`).
+    pub active_result: Option<String>,
+    /// Where impl runs write their routed checkpoints (`None` = the temp
+    /// staging dir, the same root the RTL is staged under).
+    pub checkpoint_root: Option<PathBuf>,
+    /// Design Runs table UI state ([`crate::views::runs_table`]).
+    pub ui: crate::views::runs_table::RunsUi,
     active: Option<ActiveRun>,
 }
 
@@ -265,6 +341,16 @@ impl RunsState {
         self.active.as_ref().map(|a| a.kind)
     }
 
+    /// Name of the run on the worker (`None` when idle).
+    pub fn active_name(&self) -> Option<&str> {
+        self.active.as_ref().map(|a| a.spec.name.as_str())
+    }
+
+    /// Latest finished record of the run named `name`.
+    pub fn last_record(&self, name: &str) -> Option<&RunRecord> {
+        self.history.iter().rev().find(|r| r.name == name)
+    }
+
     /// True once [`cancel_run`] was requested and the worker has not yet
     /// delivered its terminal event.
     pub fn cancel_requested(&self) -> bool {
@@ -277,9 +363,10 @@ impl RunsState {
         self.active.as_ref().map(|a| a.rx.clone())
     }
 
-    fn set_active(&mut self, kind: RunKind, rx: mpsc::Receiver<RunEvent>, cancel: Arc<AtomicBool>) {
+    fn set_active(&mut self, spec: RunSpec, rx: mpsc::Receiver<RunEvent>, cancel: Arc<AtomicBool>) {
         self.active = Some(ActiveRun {
-            kind,
+            kind: spec.kind,
+            spec,
             rx: Arc::new(Mutex::new(rx)),
             cancel,
             started: std::time::Instant::now(),
@@ -298,23 +385,40 @@ impl RunsState {
             .unwrap_or(0)
     }
 
-    /// Append a finished run to the history (newest last).
-    fn record(
-        &mut self,
-        kind: RunKind,
-        outcome: RunOutcome,
-        wns_ps: Option<i64>,
-        lut_ff: Option<u32>,
-    ) {
+    /// Append a finished run to the history (newest last), with the
+    /// metrics its artifacts carry.
+    fn record(&mut self, kind: RunKind, outcome: RunOutcome, art: Option<&RunArtifacts>) {
         let duration_ms = self.active_elapsed_ms();
         let seq = self.history.len() + 1;
+        let (name, strategy) = match self.active.as_ref() {
+            Some(a) => (
+                a.spec.name.clone(),
+                if kind == RunKind::Synth {
+                    "Vivado Synthesis Defaults".to_string()
+                } else {
+                    a.spec.strategy.to_spec()
+                },
+            ),
+            None => (kind.run_name().to_string(), String::new()),
+        };
+        let timing = art.and_then(|a| a.timing.as_ref());
+        let util = art.and_then(|a| a.util.as_ref());
         self.history.push(RunRecord {
             seq,
             kind,
             outcome,
-            wns_ps,
-            lut_ff,
+            wns_ps: timing.and_then(|t| t.wns_ps),
+            lut_ff: util.map(|u| u.luts_used + u.regs_used),
             duration_ms,
+            name,
+            strategy,
+            tns_ps: timing.filter(|t| t.wns_ps.is_some()).map(|t| t.tns_ps),
+            luts: util.map(|u| u.luts_used),
+            ffs: util.map(|u| u.regs_used),
+            bram: util.map(|u| u.bram_used),
+            dsp: util.map(|u| u.dsp_used),
+            checkpoint: art.and_then(|a| a.checkpoint.clone()),
+            artifacts: art.map(|a| Box::new(a.clone())),
         });
     }
 
@@ -420,30 +524,90 @@ pub fn start_run(
     source: PathBuf,
     part: String,
 ) -> Result<(), String> {
-    if let Some(busy) = s.runs.active_kind() {
-        return Err(format!("{} is already running", busy.run_name()));
+    let spec = RunSpec::builtin(s, kind);
+    start_run_spec(s, spec, source, part)
+}
+
+/// Root under which impl runs write `<run>/<run>_routed.hck2`.
+pub fn checkpoint_root(s: &AppState) -> PathBuf {
+    s.runs
+        .checkpoint_root
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join("helion-rune-runs").join("checkpoints"))
+}
+
+/// Start the run `spec` (its own strategy and seed) on the worker. Only
+/// the built-in `synth_1`/`impl_1` drive the flow-card statuses; every
+/// run drives the status bar.
+pub fn start_run_spec(
+    s: &mut AppState,
+    spec: RunSpec,
+    source: PathBuf,
+    part: String,
+) -> Result<(), String> {
+    if let Some(busy) = s.runs.active_name() {
+        return Err(format!("{busy} is already running"));
     }
     let pins = snapshot_pin_constraints(s);
-    let strategy = impl_strategy_for(&s.flow.impl_strategy);
+    let kind = spec.kind;
+    let strategy = spec.strategy.clone();
+    let ckpt = (kind == RunKind::Impl).then(|| {
+        checkpoint_root(s)
+            .join(&spec.name)
+            .join(format!("{}_routed.hck2", spec.name))
+    });
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = cancel.clone();
     std::thread::Builder::new()
-        .name(format!("helion-run-{}", kind.run_name()))
-        .spawn(move || run_worker(kind, source, part, pins, strategy, tx, worker_cancel))
+        .name(format!("helion-run-{}", spec.name))
+        .spawn(move || run_worker(kind, source, part, pins, strategy, ckpt, tx, worker_cancel))
         .map_err(|e| format!("failed to spawn run thread: {e}"))?;
-    s.runs.set_active(kind, rx, cancel);
+    let builtin = spec.is_builtin();
+    s.runs.set_active(spec, rx, cancel);
     match kind {
         RunKind::Synth => {
-            s.flow.synth = RunStatus::Running;
+            if builtin {
+                s.flow.synth = RunStatus::Running;
+            }
             s.status = StatusVerb::SynthesisRunning;
         }
         RunKind::Impl => {
-            s.flow.impl_run = RunStatus::Running;
+            if builtin {
+                s.flow.impl_run = RunStatus::Running;
+            }
             s.status = StatusVerb::ImplementationRunning;
         }
     }
     Ok(())
+}
+
+/// Launch the next queued run when the worker is idle. Called every frame
+/// from [`poll`]; a run that cannot start is dropped with an error line
+/// so the rest of the queue keeps moving.
+pub fn pump_queue(s: &mut AppState) -> bool {
+    if s.runs.is_active() {
+        return false;
+    }
+    let Some(spec) = s.runs.queue.pop_front() else {
+        return false;
+    };
+    s.console.lines.push(ConsoleLine {
+        text: format!("launch_runs {}", spec.name),
+        sev: MsgSev::Info,
+    });
+    let started = resolve_source(s).and_then(|src| {
+        let part = s.project.part.clone();
+        start_run_spec(s, spec.clone(), src, part)
+    });
+    if let Err(e) = started {
+        s.console.lines.push(ConsoleLine {
+            text: format!("ERROR: {}: {e}", spec.name),
+            sev: MsgSev::Error,
+        });
+        s.toasts.push(ToastKind::Error, &format!("Cannot start {}", spec.name), &e);
+    }
+    true
 }
 
 /// Flag the active run for cancellation (the worker stops between stages)
@@ -504,7 +668,9 @@ pub fn poll_runs(s: &mut AppState) -> bool {
 
 /// `AppSpec::poll` wiring: pump the run channel every frame.
 pub fn poll(s: &mut AppState, _t: f64, _tx: &mut Tx) -> bool {
-    poll_runs(s)
+    let a = poll_runs(s);
+    let b = pump_queue(s);
+    a || b
 }
 
 /// Apply one worker event: lines go to the Tcl console AND the run's log
@@ -527,67 +693,34 @@ pub fn deliver(s: &mut AppState, kind: RunKind, event: RunEvent) {
                 .count();
             match result {
                 Ok(art) => {
-                    let wns = art.timing.as_ref().and_then(|t| t.wns_ps);
-                    let lut_ff = art.util.as_ref().map(|u| u.luts_used + u.regs_used);
-                    s.runs.record(kind, RunOutcome::Complete, wns, lut_ff);
-                    if art.analysis.is_some() {
-                        s.runs.analysis = art.analysis.clone();
-                    }
-                    if let Some(t) = art.timing {
-                        s.timing = t;
-                    }
-                    if let Some(u) = art.util {
-                        s.util = u;
-                    }
-                    if let Some(p) = art.power {
-                        s.power = p;
-                    }
-                    if let Some(d) = art.drc {
-                        s.drc.items = d;
-                        s.drc.has_run = true;
-                    }
-                    if let Some(g) = art.signoff {
-                        s.drc.bitgen_allowed = Some(g.bitgen_allowed);
-                        s.drc.signoff_summary = g.summary;
-                        s.drc.unrouted = g.unrouted;
-                        s.drc.overused = g.overused;
-                        s.drc.has_run = true;
-                    }
-                    if let Some(b) = art.bitstream {
-                        s.bitstream = b;
-                    }
-                    if let Some(d) = art.design {
-                        s.runs.live_design = Some(d);
-                    }
-                    if let Some(p) = art.placed {
-                        s.runs.live_placed = Some(p);
-                    }
-                    if !art.part.is_empty() {
-                        if let Ok(dev) = helion_device::Device::load_part(&art.part) {
-                            s.runs.live_geom = Some(crate::live::LiveDieGeom::from_device(&dev));
-                        }
-                        s.runs.live_part = art.part;
-                    }
+                    s.runs.record(kind, RunOutcome::Complete, Some(&art));
+                    let builtin = s.runs.active.as_ref().is_none_or(|a| a.spec.is_builtin());
+                    let name = s
+                        .runs
+                        .active_name()
+                        .unwrap_or(kind.run_name())
+                        .to_string();
+                    apply_artifacts(s, art.clone());
+                    s.runs.active_result = Some(name.clone());
                     let verb = match kind {
                         RunKind::Synth => {
-                            s.flow.synth = RunStatus::Complete;
+                            if builtin {
+                                s.flow.synth = RunStatus::Complete;
+                            }
                             StatusVerb::SynthesisComplete
                         }
                         RunKind::Impl => {
-                            s.flow.impl_run = RunStatus::Complete;
+                            if builtin {
+                                s.flow.impl_run = RunStatus::Complete;
+                            }
                             StatusVerb::ImplementationComplete
                         }
                     };
                     s.status = verb;
                     let detail = if art.summary.is_empty() {
-                        format!("{} finished with {} Errors", kind.run_name(), errors)
+                        format!("{name} finished with {errors} Errors")
                     } else {
-                        format!(
-                            "{} finished with {} Errors · {}",
-                            kind.run_name(),
-                            errors,
-                            art.summary
-                        )
+                        format!("{name} finished with {errors} Errors · {}", art.summary)
                     };
                     s.toasts.push(
                         ToastKind::Success,
@@ -596,10 +729,13 @@ pub fn deliver(s: &mut AppState, kind: RunKind, event: RunEvent) {
                     );
                 }
                 Err(e) => {
-                    s.runs.record(kind, RunOutcome::Failed, None, None);
-                    match kind {
-                        RunKind::Synth => s.flow.synth = RunStatus::Failed,
-                        RunKind::Impl => s.flow.impl_run = RunStatus::Failed,
+                    s.runs.record(kind, RunOutcome::Failed, None);
+                    let builtin = s.runs.active.as_ref().is_none_or(|a| a.spec.is_builtin());
+                    if builtin {
+                        match kind {
+                            RunKind::Synth => s.flow.synth = RunStatus::Failed,
+                            RunKind::Impl => s.flow.impl_run = RunStatus::Failed,
+                        }
                     }
                     s.status = StatusVerb::Failed;
                     let line = format!("ERROR: {e}");
@@ -621,13 +757,19 @@ pub fn deliver(s: &mut AppState, kind: RunKind, event: RunEvent) {
             s.runs.clear_active();
         }
         RunEvent::Cancelled => {
-            s.runs.record(kind, RunOutcome::Cancelled, None, None);
-            match kind {
-                RunKind::Synth => s.flow.synth = RunStatus::NotStarted,
-                RunKind::Impl => s.flow.impl_run = RunStatus::NotStarted,
+            s.runs.record(kind, RunOutcome::Cancelled, None);
+            let builtin = s.runs.active.as_ref().is_none_or(|a| a.spec.is_builtin());
+            if builtin {
+                match kind {
+                    RunKind::Synth => s.flow.synth = RunStatus::NotStarted,
+                    RunKind::Impl => s.flow.impl_run = RunStatus::NotStarted,
+                }
             }
             s.status = StatusVerb::Ready;
-            let line = format!("{} cancelled by user", kind.run_name());
+            let line = format!(
+                "{} cancelled by user",
+                s.runs.active_name().unwrap_or(kind.run_name())
+            );
             s.console.lines.push(ConsoleLine {
                 text: line.clone(),
                 sev: MsgSev::Info,
@@ -643,6 +785,49 @@ pub fn deliver(s: &mut AppState, kind: RunKind, event: RunEvent) {
             );
             s.runs.clear_active();
         }
+    }
+}
+
+/// Apply a completed run's artifacts to the report/design views (the
+/// completion path and `Make active` share it).
+pub fn apply_artifacts(s: &mut AppState, art: RunArtifacts) {
+    if art.analysis.is_some() {
+        s.runs.analysis = art.analysis.clone();
+    }
+    if let Some(t) = art.timing {
+        s.timing = t;
+    }
+    if let Some(u) = art.util {
+        s.util = u;
+    }
+    if let Some(p) = art.power {
+        s.power = p;
+    }
+    if let Some(d) = art.drc {
+        s.drc.items = d;
+        s.drc.has_run = true;
+    }
+    if let Some(g) = art.signoff {
+        s.drc.bitgen_allowed = Some(g.bitgen_allowed);
+        s.drc.signoff_summary = g.summary;
+        s.drc.unrouted = g.unrouted;
+        s.drc.overused = g.overused;
+        s.drc.has_run = true;
+    }
+    if let Some(b) = art.bitstream {
+        s.bitstream = b;
+    }
+    if let Some(d) = art.design {
+        s.runs.live_design = Some(d);
+    }
+    if let Some(p) = art.placed {
+        s.runs.live_placed = Some(p);
+    }
+    if !art.part.is_empty() {
+        if let Ok(dev) = helion_device::Device::load_part(&art.part) {
+            s.runs.live_geom = Some(crate::live::LiveDieGeom::from_device(&dev));
+        }
+        s.runs.live_part = art.part;
     }
 }
 
@@ -730,6 +915,7 @@ fn run_worker(
     part_req: String,
     pins: Vec<(String, String, String)>,
     strategy: helion_proj::RunStrategy,
+    checkpoint: Option<PathBuf>,
     tx: mpsc::Sender<RunEvent>,
     cancel: Arc<AtomicBool>,
 ) {
@@ -830,6 +1016,9 @@ fn run_worker(
         format!("Implementation strategy: {}", strategy.preset),
         MsgSev::Info,
     );
+    if strategy.placer_seed != 0 {
+        send(format!("place_design -seed {}", strategy.placer_seed), MsgSev::Info);
+    }
     if strategy.opt_level >= 1 {
         match session.opt_design_step() {
             Ok(n) => send(format!("opt_design removed={n}"), MsgSev::Info),
@@ -1013,6 +1202,29 @@ fn run_worker(
             art.bitstream = Some(state);
         }
         Err(e) => send(format!("WARN: write_bitstream skipped: {e}"), MsgSev::Warn),
+    }
+    // Routed design checkpoint (`Session::write_dcp`, the HCK2 format that
+    // stores the placement itself, so seeded runs reopen exactly with
+    // `open_checkpoint`; the legacy `.hckp` replays placement with seed 0).
+    // A failed write is a warning, not a failed run.
+    if let Some(path) = checkpoint {
+        match session.write_dcp(&path, &xdc) {
+            Ok(meta) => {
+                send(
+                    format!(
+                        "write_checkpoint {} stage={:?} bytes={} luts={} ffs={}",
+                        meta.path.display(),
+                        meta.stage,
+                        meta.bytes,
+                        meta.luts,
+                        meta.ffs
+                    ),
+                    MsgSev::Info,
+                );
+                art.checkpoint = Some(path);
+            }
+            Err(e) => send(format!("WARN: write_checkpoint skipped: {e}"), MsgSev::Warn),
+        }
     }
     art.design = Some(live_design);
     art.placed = Some(live_placed);
@@ -2152,6 +2364,7 @@ mod tests {
             placed: None,
             part: String::new(),
             analysis: None,
+            checkpoint: None,
         };
         deliver(&mut s, RunKind::Synth, RunEvent::Finished(Ok(art)));
         assert_eq!(s.flow.synth, RunStatus::Complete);
