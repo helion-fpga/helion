@@ -19,6 +19,8 @@ pub mod editor_gutter;
 pub mod editor_outline;
 pub mod editor_scale;
 pub mod highlight;
+pub mod hls;
+pub mod hls_view;
 pub mod ila;
 pub mod ila_view;
 pub mod find;

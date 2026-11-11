@@ -572,6 +572,25 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         let _ = views::ip::apply_automation(s);
         let _ = views::ip::select_cell(s, "h_gpio_0");
     }),
+    ("hls", |s| {
+        s.hls.source = rune::TextEdit::new(
+            "// Running sum over a 4-tap window (scene fixture).\nint sum4(int a[4]) {\n  int s = 0;\n  for (int i = 0; i < 4; i++) {\n    #pragma HLS PIPELINE II=1\n    s += a[i];\n  }\n  return s;\n}\n",
+        );
+        let _ = views::hls::start_synth(s);
+        views::hls::wait(s);
+        s.toasts = Default::default();
+        s.center = state::CenterPane::Hls;
+    }),
+    ("hls-cosim", |s| {
+        s.hls.source = rune::TextEdit::new(views::hls::NEW_KERNEL);
+        s.hls.vectors = rune::TextEdit::new("a=1 b=2 c=3\na=-5 b=7 c=100\na=40 b=2 c=0\n");
+        let _ = views::hls::start_synth(s);
+        views::hls::wait(s);
+        let _ = views::hls::start_cosim(s);
+        views::hls::wait(s);
+        s.toasts = Default::default();
+        s.center = state::CenterPane::Hls;
+    }),
     ("ip-automation", |s| {
         s.center = state::CenterPane::Ip;
         for core in ["h_rv32_hb1", "h_uart", "h_gpio", "h_sync_fifo"] {
@@ -1103,6 +1122,7 @@ fn center_pane(s: &AppState, t: &VivadoTheme) -> El {
         state::CenterPane::Bitstream => views::bitstream::bitstream_pane(s, t),
         state::CenterPane::Find => views::find::find_pane(s, t),
         state::CenterPane::Constraints => views::constraints::constraints_pane(s, t),
+        state::CenterPane::Hls => views::hls_view::hls_pane(s, t),
     }
 }
 
@@ -1212,7 +1232,7 @@ pub fn poll_all(s: &mut AppState, t: f64, tx: &mut rune::Tx) -> bool {
     views::editor::sync_edit(s);
     let hw_dirty = views::program::poll(s);
     let pblocks_dirty = views::device_floor::sync_from_project(s);
-    let jobs_dirty = jobs::poll(s, tx);
+    let jobs_dirty = jobs::poll(s, tx) | views::hls::poll(s, tx);
     let diag_dirty = views::editor_diag::poll(s, t, tx);
     runs_dirty
         || sim_dirty

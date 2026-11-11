@@ -15,6 +15,10 @@ pub const VERBS: &[&str] = &[
     "delete_bd_objs",
     "generate_bd",
     "package_ip",
+    "csynth_design",
+    "cosim_design",
+    "open_hls",
+    "add_hls_rtl",
 ];
 
 /// One-line usage + description for `help <verb>`.
@@ -40,6 +44,13 @@ pub fn help(name: &str) -> Option<(&'static str, &'static str)> {
             "package_ip file top ?vendor library version?",
             "package a module into the project's user IP repository",
         ),
+        "csynth_design" => ("csynth_design ?-clock ns?", "C synthesis of the HLS kernel (schedule, bind, emit RTL)"),
+        "cosim_design" => (
+            "cosim_design ?-vectors {a=1 b=2;a=3 b=4}?",
+            "C/RTL co-simulation: the synthesized netlist in helion-sim vs the C model",
+        ),
+        "open_hls" => ("open_hls file.cpp", "open a C/C++ kernel in the HLS pane"),
+        "add_hls_rtl" => ("add_hls_rtl", "write the generated SystemVerilog and add it to the project"),
         _ => return None,
     })
 }
@@ -82,6 +93,9 @@ pub fn tcl_verb(s: &mut AppState, name: &str, args: &[String]) -> Result<String,
             ip::refresh_catalog(s);
             s.ip.selected = Some(model.core.name.clone());
             Ok(format!("package_ip {} bus={}", model.core.vlnv(), model.core.bus))
+        }
+        "csynth_design" | "cosim_design" | "open_hls" | "add_hls_rtl" => {
+            crate::views::hls::tcl_verb(s, name, args)
         }
         _ => Err(format!("{name}: not an ecosystem verb")),
     }
