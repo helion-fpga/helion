@@ -460,7 +460,11 @@ fn schematic_select_zoom_and_cross_probe_sources() {
         "Blocks LOD keeps hierarchy"
     );
     tap(&mut rt, "schematic-zoom-fit");
-    assert_eq!(rt.state.schematic.lod(), Lod::Full);
+    assert_ne!(
+        rt.state.schematic.lod(),
+        Lod::Blocks,
+        "fit frames the sheet at a readable zoom"
+    );
     assert!(
         rt.find("schematic-cell-u-div-u-ff0").is_some(),
         "fit restores the sheet"

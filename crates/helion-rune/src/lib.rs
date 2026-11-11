@@ -272,6 +272,12 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         s.schematic.selected = Some(views::schematic::SchemSel::Cell("u_div_u_ff0".into()));
         s.schematic.collapsed.insert("u_led".into());
     }),
+    ("schematic-cone", |s| {
+        s.center = state::CenterPane::Schematic;
+        let _ = live::seed_live_fixture(s);
+        s.schematic.selected = Some(views::schematic::SchemSel::Cell("u_div_u_ff0".into()));
+        crate::tcl::eval_command(s, "expand_fanout_cone u_div_u_ff0 2");
+    }),
     ("device", |s| {
         s.center = state::CenterPane::Device;
         let _ = live::seed_live_fixture(s);

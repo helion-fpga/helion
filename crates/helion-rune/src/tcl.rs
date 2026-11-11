@@ -273,6 +273,18 @@ pub const COMMANDS: &[&str] = &[
     "report_methodology",
     "report_drc",
     "report_constraints",
+    // Schematic connectivity (old `Model::exec` cone/inside/history verbs).
+    "expand_cone",
+    "expand_fanin_cone",
+    "expand_fanout_cone",
+    "collapse_cone",
+    "expand_inside",
+    "collapse_inside",
+    "schematic_previous",
+    "previous_view",
+    "schematic_next",
+    "next_view",
+    "schematic_zoom_fit",
 ];
 
 /// Max nested `[...]` evaluation depth (mirrors the real interp's cap idea;
@@ -2812,6 +2824,10 @@ fn dispatch_host(
         | "report_methodology"
         | "report_drc"
         | "report_constraints" => cmd_report_analysis(s, name, argv, line),
+        n if crate::views::schematic_cone::VERBS.contains(&n) => ctl_result(
+            crate::views::schematic_cone::tcl_verb(s, n, argv.get(1..).unwrap_or_default()),
+            line,
+        ),
         _ => unknown_command(s, name, line),
     }
 }
@@ -2829,7 +2845,9 @@ fn ctl_result(r: Result<String, String>, line: usize) -> Ctl {
 /// `tcl.design` directly, and they never call flow verbs after).
 fn sync_session_design(s: &mut AppState) {
     if s.tcl.session.design.is_none() {
-        if let Some(d) = s.tcl.design.clone() {
+        // The views show the last run's design first; accept it when the
+        // console has not elaborated one (so Mark Debug on a run design works).
+        if let Some(d) = s.tcl.design.clone().or_else(|| s.runs.live_design.clone()) {
             s.tcl.session.synth_design(d);
         }
     }
@@ -5188,6 +5206,24 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
             "report_constraints",
             "open the Timing Constraints parsed from the project XDC",
         ),
+        "expand_fanin_cone" | "expand_fanout_cone" => (
+            "expand_fanin_cone|expand_fanout_cone ?root? ?hops? ?-stop_at_ff?",
+            "trace a fan-in/fan-out cone from a cell or net on the schematic",
+        ),
+        "expand_cone" => (
+            "expand_cone ?root? ?hops?",
+            "trace both directions, or grow the active cone by one hop",
+        ),
+        "collapse_cone" => ("collapse_cone", "clear the schematic cone highlight"),
+        "expand_inside" | "collapse_inside" => (
+            "expand_inside|collapse_inside ?instance?",
+            "open or close a hierarchy block on the schematic",
+        ),
+        "schematic_previous" | "previous_view" | "schematic_next" | "next_view" => (
+            "schematic_previous|schematic_next",
+            "step through the schematic selection history",
+        ),
+        "schematic_zoom_fit" => ("schematic_zoom_fit", "fit the schematic sheet to its viewport"),
         _ => return None,
     })
 }
@@ -5213,6 +5249,8 @@ fn help_overview() -> String {
         "  report_bitstream select_bitstream_frame | find sheet_find select_find",
         "Reports: report_timing_summary report_clock_interaction report_cdc report_clock_networks",
         "  report_power report_methodology report_drc report_constraints",
+        "Schematic: expand_fanin_cone expand_fanout_cone expand_cone collapse_cone expand_inside collapse_inside",
+        "  schematic_previous schematic_next schematic_zoom_fit",
         "help <command> for usage. See docs/tcl-subset.md for the supported subset.",
     ]
     .join("\n")
