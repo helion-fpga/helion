@@ -16,6 +16,7 @@ pub mod qor;
 pub mod reports;
 pub mod io_reports;
 pub mod eco;
+pub mod eco_store;
 pub mod dfx;
 pub mod prj_dfx;
 pub mod ooc;
