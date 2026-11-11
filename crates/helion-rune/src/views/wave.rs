@@ -1332,6 +1332,7 @@ fn wave_toolbar(s: &AppState, t: &VivadoTheme) -> El {
             }),
         )
         .child(el().grow(1.0))
+        .child(crate::views::wave_cfg::toolbar_buttons(s, t))
         .child(radix_control(s, t))
 }
 

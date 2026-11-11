@@ -323,6 +323,8 @@ pub const COMMANDS: &[&str] = &[
     "synth_ooc",
     "report_ooc",
     "report_coverage",
+    "save_wave_config",
+    "open_wave_config",
 ];
 
 /// Max nested `[...]` evaluation depth (mirrors the real interp's cap idea;
@@ -5419,7 +5421,7 @@ fn help_overview() -> String {
         "ECO: eco_open eco_set_lut_init eco_connect_pin eco_insert_buffer eco_add_lut eco_add_ff eco_remove_cell",
         "  eco_place_route eco_route write_eco_bitstream",
         "DFX: create_partition add_reconfig_module launch_dfx report_partitions | OOC: set_ooc synth_ooc report_ooc",
-        "Coverage: report_coverage",
+        "Coverage: report_coverage | Wave layout: save_wave_config open_wave_config",
         "help <command> for usage. See docs/tcl-subset.md for the supported subset.",
     ]
     .join("\n")

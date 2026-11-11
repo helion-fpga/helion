@@ -476,6 +476,7 @@ pub fn launch_testbench(s: &mut AppState, i: usize) -> Result<(), String> {
                 tb_path: path,
                 vcd,
                 max_units: engine::TB_DEFAULT_MAX_UNITS,
+                seed: 1,
                 cancel: Some(cancel),
             };
             let r = engine::run_testbench(&cfg, Some(&stx));
@@ -801,8 +802,12 @@ fn finish_tb(s: &mut AppState, i: usize, r: Result<TbOutcome, TbError>) {
                 },
             });
             if let Some(vcd) = &out.vcd_path {
-                if let Err(e) = load_vcd_into_wave(s, vcd, &format!("{name} (testbench VCD)")) {
-                    s.sim.push_log(format!("WARNING: {e}"), MsgSev::Warn);
+                match load_vcd_into_wave(s, vcd, &format!("{name} (testbench VCD)")) {
+                    Ok(_) => {
+                        let tb_path = out.coverage.tb_file.clone();
+                        crate::views::wave_cfg::auto_restore(s, &tb_path);
+                    }
+                    Err(e) => s.sim.push_log(format!("WARNING: {e}"), MsgSev::Warn),
                 }
             }
             match status {
@@ -1080,6 +1085,7 @@ pub fn run_testbench_now(s: &mut AppState, i: usize) -> Result<(), String> {
         tb_path: item.file.path.clone(),
         vcd: s.sim.vcd,
         max_units: engine::TB_DEFAULT_MAX_UNITS,
+        seed: 1,
         cancel: None,
     };
     let (stx, srx) = mpsc::channel();
