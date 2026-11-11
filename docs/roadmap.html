@@ -1,181 +1,172 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="theme-color" content="#fbfbfa" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Roadmap: Helion 2.0 shipped; 2.0.x grind</title>
-  <meta name="description" content="Helion FM-HEL-14 roadmap: 1.4 to 3.0 shipped. Current v3.0.0. Gold WNS_PS=9640." />
-  <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
-  <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=v4" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Helion roadmap</title>
+  <meta name="description" content="What Helion 4.0 delivers (Rune IDE, iCE40 and ECP5, UVM and VHDL testbenches, native JTAG) and what comes next, with every shipped release.">
+  <meta name="theme-color" content="#fbfaf8" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0f1013" media="(prefers-color-scheme: dark)">
+  <link rel="canonical" href="https://helion-fpga.github.io/helion/roadmap.html">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="favicon.png" type="image/png" sizes="32x32">
+  <link rel="apple-touch-icon" href="brand/apple-touch-icon.png">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Helion">
+  <meta property="og:title" content="Helion roadmap">
+  <meta property="og:description" content="What Helion 4.0 delivers (Rune IDE, iCE40 and ECP5, UVM and VHDL testbenches, native JTAG) and what comes next, with every shipped release.">
+  <meta property="og:image" content="https://helion-fpga.github.io/helion/brand/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=5">
+  <script>try{var t=localStorage.getItem("helion-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
 </head>
 <body>
-  <a class="skip" href="#main">Skip to main content</a>
-  <header class="pill-nav" id="pillNav">
-    <a class="brand" href="index.html"><img src="brand/mark.png" alt="" width="30" height="30" /><span>Helion</span></a>
-    <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu"><span></span><span></span></button>
-    <nav id="site-nav">
-      <span class="limelight" aria-hidden="true"></span>
-      <a href="index.html">Home</a>
-      <a href="use.html">Use</a>
-      <a href="start.html">Start</a>
-      <a href="architecture.html">Architecture</a>
-      <a href="wiki.html">Wiki</a>
-      <a href="benchmarks.html">Benchmarks</a>
-      <a href="get-involved.html">Get involved</a>
-      <a href="https://github.com/helion-fpga/helion">GitHub</a>
-    </nav>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="wrap header-inner">
+      <a class="brand" href="index.html"><img src="brand/mark-48.png" alt="" width="30" height="30"><span>Helion</span></a>
+      <nav class="site-nav" id="site-nav" aria-label="Main">
+        <a href="start.html">Get started</a>
+        <a href="use.html">User guide</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="benchmarks.html">Benchmarks</a>
+        <a href="roadmap.html">Roadmap</a>
+        <a href="wiki.html">Docs</a>
+        <a href="get-involved.html">Community</a>
+      </nav>
+      <div class="header-actions">
+        <button type="button" class="icon-btn theme-toggle" aria-label="Switch theme"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+        <a class="icon-btn" href="https://github.com/helion-fpga/helion" aria-label="Helion on GitHub"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="gh-label">GitHub</span></a>
+        <button type="button" class="icon-btn nav-toggle" aria-controls="site-nav" aria-expanded="false" aria-label="Open menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+      </div>
+    </div>
   </header>
 
-  <main id="main" class="page">
-    <div class="prose">
-      <h1>Roadmap (1.4 to 2.0 shipped; 2.0.x grind)</h1>
-      <p class="lede">
-        FM-HEL-14. Original FPGA family plus in-repo CAD. Gold lock: empty-XDC
-        <code>examples/counter.sv</code> stays <span class="gold">WNS_PS=9640</span>
-        on every step. Current release:
-        <a href="https://github.com/helion-fpga/helion/releases/tag/v3.0.0">v3.0.0</a>.
-        Canonical markdown:
-        <a href="https://github.com/helion-fpga/helion/blob/master/ROADMAP.md">ROADMAP.md</a>.
-        GitHub:
-        <a href="https://github.com/helion-fpga/helion/milestones">milestones</a>.
-      </p>
+  <main id="main">
+    <div class="wrap page-head">
+      <h1>Roadmap</h1>
+      <p class="lede">What the next release delivers, what comes after it, and what has shipped. No dates we cannot keep.</p>
+    </div>
+    <div class="wrap doc">
+      <nav class="doc-nav" aria-label="On this page">
+        <p>On this page</p>
+        <ul>
+          <li><a href="#releases">Releases</a></li>
+          <li><a href="#v4">What 4.0 delivers</a></li>
+          <li><a href="#next">After 4.0</a></li>
+        </ul>
+      </nav>
+      <article class="prose">
+        <h2 id="releases">Releases</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Release</th><th>Status</th><th>Theme</th></tr></thead>
+          <tbody>
+            <tr><td><strong>4.0</strong></td><td><span class="badge accent">In preparation</span></td><td>Rune IDE, iCE40 and ECP5 backends, UVM and VHDL testbenches, self-contained build, native JTAG on real hardware</td></tr>
+            <tr><td><a href="https://github.com/helion-fpga/helion/releases/tag/v3.0.0">3.0</a></td><td><span class="badge ok">Shipped</span></td><td>Xilinx 7-series backend; SAT equivalence, SVA, CDC; Physical View 2.0</td></tr>
+            <tr><td><a href="https://github.com/helion-fpga/helion/releases/tag/v2.5.0">2.5</a></td><td><span class="badge ok">Shipped</span></td><td>Cross-probing, Tcl console, design runs, checkpoints, ILA</td></tr>
+            <tr><td><a href="https://github.com/helion-fpga/helion/releases/tag/v2.1.0">2.1</a></td><td><span class="badge ok">Shipped</span></td><td>Performance and area campaigns, IDE rebuild</td></tr>
+            <tr><td><a href="https://github.com/helion-fpga/helion/releases/tag/v2.0.0">2.0</a> to 2.0.5</td><td><span class="badge ok">Shipped</span></td><td>Public open-source CAD bar, then runtime and QoR grind</td></tr>
+            <tr><td>1.4 to 1.7</td><td><span class="badge ok">Shipped</span></td><td>SystemVerilog elaborator, PnR and STA, project and CLI, first IDE, VHDL, HAD</td></tr>
+          </tbody>
+        </table></div>
+        <p>The gold lock holds across all of them: empty-XDC <code>examples/counter.sv</code> reports <span class="gold">WNS_PS=9640</span> and simulates to <code>LED[16]=0000000111111110</code>.</p>
 
-      <div class="table-wrap"><table>
-        <thead><tr><th>Release</th><th>Status</th><th>Workers</th><th>What</th><th>Milestone</th></tr></thead>
-        <tbody>
-          <tr>
-            <td><strong>1.4</strong></td>
-            <td>shipped</td>
-            <td>W1</td>
-            <td>SystemVerilog elaborator; gold 9640</td>
-            <td><a href="https://github.com/helion-fpga/helion/milestone/1">1.4</a></td>
-          </tr>
-          <tr>
-            <td><strong>1.5</strong></td>
-            <td>shipped</td>
-            <td>W2 + W4</td>
-            <td>PNR/STA + project/CLI</td>
-            <td><a href="https://github.com/helion-fpga/helion/milestone/2">1.5</a></td>
-          </tr>
-          <tr>
-            <td><strong>1.6</strong></td>
-            <td>shipped</td>
-            <td>W5 + W3</td>
-            <td>IDE + lab</td>
-            <td><a href="https://github.com/helion-fpga/helion/milestone/3">1.6</a></td>
-          </tr>
-          <tr>
-            <td><strong>1.7</strong></td>
-            <td>shipped</td>
-            <td>W6 + W8</td>
-            <td>VHDL + HAD</td>
-            <td><a href="https://github.com/helion-fpga/helion/milestone/4">1.7</a></td>
-          </tr>
-          <tr>
-            <td><strong>2.0</strong></td>
-            <td>shipped</td>
-            <td></td>
-            <td>Public OSS CAD bar (<a href="https://github.com/helion-fpga/helion/releases/tag/v2.0.0">v2.0.0</a>)</td>
-            <td><a href="https://github.com/helion-fpga/helion/milestone/5">2.0</a></td>
-          </tr>
-          <tr>
-            <td><strong>2.0.x</strong></td>
-            <td>current</td>
-            <td></td>
-            <td>Post-bar STA / bitgen / place-legalize / synth / parse opt; gold lock unchanged</td>
-            <td><a href="https://github.com/helion-fpga/helion/releases/tag/v2.0.4">v2.0.4</a></td>
-          </tr>
-        </tbody>
-      </table></div>
-      <p>CI (W7) is not a product release. It gates gold on Ubuntu and <code>macos-latest</code> (both require <code>WNS_PS=9640</code>).</p>
+        <h2 id="v4">What 4.0 delivers</h2>
+        <ul>
+          <li><strong>A new IDE.</strong> <code>helion-ide</code> is rebuilt on the Rune UI framework, with Flow Navigator, Sources, Summary, device view with I/O planning and pblocks, schematic, timing, waveform, simulation, coverage, Hardware Manager, IP catalog and block design, HLS, ECO, DFX and out-of-context runs, reports, a Tcl console, a command palette and language templates.</li>
+          <li><strong>Two Lattice backends.</strong> iCE40-HX8K on IceStorm data and ECP5 LFE5U-85F on Trellis data, next to HL10 and Xilinx 7-series.</li>
+          <li><strong>Verification.</strong> Class-based SystemVerilog testbenches with a UVM subset, VHDL testbenches, and line and branch coverage of the design under test.</li>
+          <li><strong>Windowless modes</strong> for scripts and CI: <code>--headless</code>, <code>--source</code>, <code>--stdin</code>, <code>--version</code>, <code>--doctor</code>.</li>
+          <li><strong>A self-contained build.</strong> Rune vendored in <code>third_party/rune</code>, Rust 1.99.1 pinned, <code>Cargo.lock</code> enforced.</li>
+          <li><strong>Native JTAG on real hardware.</strong> Chain scans verified on a ZedBoard from 1 to 30 MHz, with a Digilent pin profile and falling-edge sampling above 15 MHz.</li>
+          <li><strong>The egui IDE retires.</strong> It stays buildable as <code>helion-ide-egui</code> until 4.0 merges to <code>master</code>.</li>
+        </ul>
+        <p>Every change is listed in the <a href="https://github.com/helion-fpga/helion/blob/master/CHANGELOG.md">changelog</a>.</p>
 
-      <h2>1.4: SV elaborator (W1)</h2>
-      <p>
-        Lower public-widen SOFT: <code>always</code> / <code>case</code> / functions /
-        memories / generates onto Helion LUT/FF. Ports-only shells stay
-        <code>cells=0</code> / <code>no_body</code>. SOFT &ne; PASS. Gold
-        <span class="gold">WNS_PS=9640</span>.
-      </p>
+        <h2 id="next">After 4.0</h2>
+        <p>Ordered roughly by priority. None of these has a date.</p>
+        <h3>Hardware</h3>
+        <ul>
+          <li>Verify programming over the native FTDI cable on a board (scanning is verified; programming is not).</li>
+          <li>Status readback when programming through openFPGALoader.</li>
+          <li>Load iCE40, ECP5 and 7-series bitstreams on real boards; today they are checked against the open toolchains only.</li>
+        </ul>
+        <h3>Quality of results</h3>
+        <ul>
+          <li>Calibrate the timing models against measured data, then make pack, place and route fully timing-driven. The 7-series model is preliminary.</li>
+          <li>Bring the optimization passes added in the October campaign (priority-cut mapping, SAT sweeping, carry-chain extraction, timing-driven routing, detailed placement, path-based analysis) into the default flow, each behind the QoR tests.</li>
+          <li>Close the remaining buckets from the 1,000-design corpus: latch cells, primitive wrappers, enable folding.</li>
+        </ul>
+        <h3>IDE</h3>
+        <ul>
+          <li>A clock-region layer (needs a region model in HAD), pblock deletion, DFX partitions saved in the project, horizontal scrolling for very large files, richer VHDL diagnostics.</li>
+          <li>Wider testbench support: 4-state and wide values, structs, covergroups and DPI in class-based testbenches.</li>
+        </ul>
+        <h3>Project</h3>
+        <ul>
+          <li>Make the full workspace test run a required CI check; today the IDE, hardware and gold checks are required.</li>
+          <li>Notarized macOS builds, once an Apple Developer ID is available.</li>
+          <li>More maintainers. See <a href="get-involved.html">Get involved</a>.</li>
+        </ul>
+        <p>The canonical copy of this plan is <a href="https://github.com/helion-fpga/helion/blob/master/ROADMAP.md">ROADMAP.md</a>; issues are tracked in <a href="https://github.com/helion-fpga/helion/milestones">milestones</a>.</p>
 
-      <h2>1.5: PNR/STA (W2) + project/CLI (W4)</h2>
-      <p>
-        Timing-driven place/route must move closed WNS (sites/hops). Constraint
-        commands come from <code>helion-sta::load_xdc</code>
-        (<a href="architecture.html#xdc">Architecture</a>). Tcl Session CAD is a
-        separate list. Restartable <code>.prj</code> / <code>.hckp</code>.
-      </p>
-
-      <h2>1.6: IDE (W5) + lab (W3)</h2>
-      <p>
-        Desktop <code>helion-ide</code> chrome without mixing hang work into
-        elaborator commits. Lab: native FTDI / OFL STAT TDO DONE=1, then a real LED.
-        No invented TAP STAT.
-      </p>
-
-      <h2>1.7: VHDL (W6) + HAD (W8)</h2>
-      <p>
-        VHDL-2008 elaborator on the same LUT/FF path as SV. HAD parts beyond
-        <code>HL10T-C32-1</code>. Device facts stay in TOML.
-      </p>
-
-      <h2>2.0: public OSS CAD bar</h2>
-      <p>
-        <strong>Shipped as <a href="https://github.com/helion-fpga/helion/releases/tag/v2.0.0">v2.0.0</a>.</strong>
-        A stranger can clone, <code>cargo test --workspace</code>, run headless gold
-        <span class="gold">WNS_PS=9640</span>, and trust the
-        <a href="legal.html">legal fence</a>.
-      </p>
-
-      <h2>2.0.x: post-bar runtime / QoR grind</h2>
-      <p>
-        Patch line after the 2.0 bar: measured STA / bitgen / place-legalize /
-        synth_rtl / parse cuts without moving gold. SOFT &ne; PASS.
-        Empty-XDC counter stays <span class="gold">WNS_PS=9640</span>.
-        Release <code>helion impl examples/ibex_pin_wrap.sv</code> deltas:
-        parse 416→353 ms, synth_rtl 670→524 ms, place legalize 213→23 ms,
-        imux_skip 158→123. Table:
-        <a href="https://github.com/helion-fpga/helion/blob/master/notes/reports/perf-2.0.4.md">notes/reports/perf-2.0.4.md</a>.
-      </p>
-
-      <h2>2.5: best-in-market IDE</h2>
-      <p>
-        <strong>Shipped as <a href="https://github.com/helion-fpga/helion/releases/tag/v2.5.0">v2.5.0</a>.</strong>
-        Cross-probing, real Tcl console, design runs with strategy sweep,
-        checkpoints, testbench runner, constraints wizard, QoR suggestions engine,
-        VCD-driven power, integrated logic analyzer, plus toast/macOS fixes and
-        the UX/editor batch.
-      </p>
-
-      <h2>3.0: second backend, verification</h2>
-      <p>
-        <strong>Shipped as <a href="https://github.com/helion-fpga/helion/releases/tag/v3.0.0">v3.0.0</a>.</strong>
-        Xilinx 7-series backend (xc7a35t: pack, place, route, FASM, frames,
-        <code>.bit</code>, zero vendor tools, open bitstream databases only),
-        verification track (SAT-based equivalence checking, SystemVerilog
-        assertions, CDC structural analysis), Physical View 2.0, 12 review
-        criticals fixed, debug-build stack-overflow fix. Gold
-        <span class="gold">WNS_PS=9640</span> untouched throughout.
-      </p>
-
-      <p class="cta">
-        <a class="btn" href="https://github.com/helion-fpga/helion/blob/master/ROADMAP.md">ROADMAP.md</a>
-        <a class="btn ghost" href="https://github.com/helion-fpga/helion/milestones">GitHub milestones</a>
-        <a class="btn ghost" href="get-involved.html">Get involved</a>
-      </p>
+      </article>
     </div>
   </main>
 
-  <footer class="site-foot">
-    <div class="foot-inner">
-      <span>AGPL-3.0 &middot; <a href="https://github.com/saksham-45">@saksham-45</a> &middot; <a href="https://github.com/helion-fpga">helion-fpga</a></span>
-      <span><a href="legal.html">Legal</a> &middot; <a href="start.html">Start</a> &middot; <a href="https://github.com/helion-fpga/helion">GitHub</a></span>
+  <footer class="site-footer">
+    <div class="wrap">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <a class="brand" href="index.html"><img src="brand/mark-48.png" alt="" width="30" height="30"><span>Helion</span></a>
+          <p>Open-source FPGA CAD and an original FPGA family, written in Rust.</p>
+        </div>
+        <div>
+          <h4>Product</h4>
+          <ul>
+            <li><a href="https://github.com/helion-fpga/helion/releases/latest">Download</a></li>
+            <li><a href="start.html">Get started</a></li>
+            <li><a href="use.html">User guide</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/CHANGELOG.md">Changelog</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Docs</h4>
+          <ul>
+            <li><a href="architecture.html">Architecture</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/docs/tcl-subset.md">Tcl reference</a></li>
+            <li><a href="benchmarks.html">Benchmarks</a></li>
+            <li><a href="roadmap.html">Roadmap</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Community</h4>
+          <ul>
+            <li><a href="get-involved.html">Get involved</a></li>
+            <li><a href="contribute.html">Contribute code</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/discussions">Discussions</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/CODE_OF_CONDUCT.md">Code of conduct</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Project</h4>
+          <ul>
+            <li><a href="legal.html">License and legal</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/SECURITY.md">Security</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/GOVERNANCE.md">Governance</a></li>
+            <li><a href="https://github.com/helion-fpga/helion">GitHub</a></li>
+          </ul>
+        </div>
+      </div>
+      <div class="footer-legal">
+        <span>Helion is licensed under <a href="https://github.com/helion-fpga/helion/blob/master/LICENSE">AGPL-3.0-or-later</a>.</span>
+        <span>"Helion" and the Helion logo are trademarks of Saksham Srivastava. <a href="https://github.com/helion-fpga/helion/blob/master/TRADEMARKS.md">Trademark policy</a></span>
+      </div>
     </div>
   </footer>
-  <script src="site.js?v=v4"></script>
+  <script src="site.js?v=5"></script>
 </body>
 </html>
