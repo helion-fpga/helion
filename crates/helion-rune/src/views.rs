@@ -56,6 +56,7 @@ pub mod status;
 pub mod summary;
 pub mod templates;
 pub mod tb;
+pub mod tb_uvm;
 pub mod tb_view;
 pub mod timing;
 pub mod wave;
