@@ -71,14 +71,15 @@ impl TbStatus {
     }
 }
 
-/// True for `*_tb.sv`, `tb_*.sv` (also `.v`), case-insensitive.
+/// True for `*_tb.sv`, `tb_*.sv` (also `.v`, `.vhd`, `.vhdl`),
+/// case-insensitive.
 pub fn is_testbench_file(path: &Path) -> bool {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if ext != "sv" && ext != "v" {
+    if !matches!(ext.as_str(), "sv" | "v" | "vhd" | "vhdl") {
         return false;
     }
     let stem = path
@@ -1417,6 +1418,9 @@ impl<'a> Parser<'a> {
 
 /// Parse testbench source text.
 pub fn parse_testbench(file: &str, src: &str) -> Result<TbProgram, TbError> {
+    if crate::vhdl_tb::is_vhdl_path(Path::new(file)) {
+        return crate::vhdl_tb::parse_vhdl_testbench(file, src);
+    }
     let toks = lex(file, src)?;
     Parser::new(file, toks).parse()
 }
@@ -2478,6 +2482,9 @@ pub fn run_testbench(
     cfg: &TbRunConfig,
     tx: Option<&mpsc::Sender<TbStreamEvent>>,
 ) -> Result<TbOutcome, TbError> {
+    if crate::vhdl_tb::is_vhdl_path(&cfg.tb_path) {
+        return crate::vhdl_tb::run_vhdl_testbench(cfg, tx);
+    }
     let started = std::time::Instant::now();
     let tb_dir = cfg.tb_path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     let file_label = cfg.tb_path.to_string_lossy().into_owned();
