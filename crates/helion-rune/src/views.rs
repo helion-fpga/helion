@@ -13,6 +13,7 @@ pub mod device_io_quick;
 pub mod device_layers;
 pub mod device_package;
 pub mod dialogs;
+pub mod eco;
 pub mod editor;
 pub mod editor_diag;
 pub mod editor_gutter;

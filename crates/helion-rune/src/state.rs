@@ -1097,6 +1097,10 @@ pub struct AppState {
     pub runs: crate::runs::RunsState,
     /// Off-UI-thread engine jobs (report re-runs, Tcl `program_hw`).
     pub jobs: crate::jobs::JobsState,
+    /// Keyed background engine tasks (I/O reports, vectored power, ECO, DFX).
+    pub bg: crate::bg::BgState,
+    /// ECO session over the last implementation run.
+    pub eco: crate::views::eco::EcoState,
     /// Persistent Tcl session behind the `tcl>` input (vars, history, design).
     pub tcl: crate::tcl::TclSession,
     /// Theme choice: follow the OS (`cx.system_dark`) or a manual View-menu
@@ -1146,6 +1150,8 @@ pub enum CenterPane {
     /// Timing constraints parsed from the project XDC: clocks, I/O delay,
     /// exceptions, I/O placement.
     Constraints,
+    /// ECO: edit the implemented netlist, incremental bitstream.
+    Eco,
 }
 
 /// Status-bar verb. Typed, with the exact Helion wording in one place.
@@ -1300,6 +1306,8 @@ impl AppState {
             toasts: ToastState::default(),
             runs: crate::runs::RunsState::default(),
             jobs: crate::jobs::JobsState::default(),
+            bg: crate::bg::BgState::default(),
+            eco: crate::views::eco::EcoState::default(),
             tcl: crate::tcl::TclSession::default(),
             theme: crate::theme::ThemeMode::default(),
             palette: crate::views::palette::PaletteState::default(),

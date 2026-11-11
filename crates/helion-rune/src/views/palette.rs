@@ -150,6 +150,7 @@ fn pane_label(pane: CenterPane) -> &'static str {
         CenterPane::Bitstream => "Bitstream",
         CenterPane::Find => "Find Results",
         CenterPane::Constraints => "Timing Constraints",
+        CenterPane::Eco => "ECO",
     }
 }
 
