@@ -1005,6 +1005,37 @@ pub const ALL: &[SceneExpect] = &[
         absent: &["wave-decoders", "wave-empty", "summary"],
     },
     SceneExpect {
+        name: "wave-real-tools",
+        surface: "wave",
+        keys: &[
+            "wave",
+            "wave-trace-bar",
+            "wave-decoders",
+            "wave-dec-add-spi",
+            "wave-dec-lane-0-mosi",
+            "wave-dec-lane-0-miso",
+            "wave-dec-lane-1-uart",
+            "wave-dec-lane-2-state",
+            "wave-dec-lane-3-write",
+            "wave-dec-lane-3-read",
+            "wave-style-linear",
+            "wave-sheet",
+        ],
+        absent: &["wave-dec-empty", "wave-empty", "summary"],
+    },
+    SceneExpect {
+        name: "wave-real-bus",
+        surface: "wave",
+        keys: &[
+            "wave",
+            "wave-trace-bar",
+            "wave-make-bus",
+            "wave-style-step",
+            "wave-sheet",
+        ],
+        absent: &["wave-decoders", "wave-empty", "summary"],
+    },
+    SceneExpect {
         name: "sim",
         surface: "sim",
         keys: &[
