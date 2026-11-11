@@ -1465,6 +1465,18 @@ pub const ALL: &[SceneExpect] = &[
         absent: &["hls-cosim-empty", "hls-cosim-error"],
     },
     SceneExpect {
+        name: "export-hardware",
+        surface: "ip",
+        keys: &["hw-dialog", "hw-body", "hw-path", "hw-bitstream", "hw-ok", "hw-cancel", "ip-export-hw"],
+        absent: &["hw-status", "ar-dialog"],
+    },
+    SceneExpect {
+        name: "archive-project",
+        surface: "dialogs",
+        keys: &["ar-dialog", "ar-body", "ar-path", "ar-runs", "ar-ok"],
+        absent: &["hw-dialog"],
+    },
+    SceneExpect {
         name: "ip-automation",
         surface: "ip",
         keys: &[

@@ -229,3 +229,4 @@ mod tests {
         assert!(!matches(&c.catalog.parts[0], "zzz"));
     }
 }
+
