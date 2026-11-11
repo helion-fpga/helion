@@ -457,28 +457,9 @@ pub fn pane_header(title: &'static str, key_prefix: &'static str, t: &VivadoThem
                 ));
         }
         _ => {
-            right = right
-                .child(header_ctl(
-                    format!("{key_prefix}-max"),
-                    &format!("{title}: maximize"),
-                    "Maximize or restore this pane (⇧⌘M)",
-                    "⤢",
-                    t,
-                    crate::layout::toggle_focus,
-                ))
-                .child(header_ctl(
-                    format!("{key_prefix}-close"),
-                    &format!("{title}: close"),
-                    "Close this view",
-                    "×",
-                    t,
-                    |s: &mut AppState| {
-                        s.layout.focus = false;
-                        if !s.go_back() {
-                            s.navigate(crate::state::CenterPane::Summary);
-                        }
-                    },
-                ));
+            // Center panes: the shell's view tab strip is their header
+            // (label, close, maximize), so no second title row is drawn.
+            return el().key(format!("{key_prefix}-title-slot")).w_full().h(0.0).a11y_hidden();
         }
     }
     header.child(right)

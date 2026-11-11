@@ -101,6 +101,8 @@ pub struct LayoutState {
     pub sources_tree_collapsed: bool,
     /// Source File Properties card collapsed to its header.
     pub props_collapsed: bool,
+    /// Open center views, left to right (the view tab strip).
+    pub open_views: Vec<CenterPane>,
     /// Splitter drag in flight: the size at press, so cancel can restore.
     drag_from: Option<f32>,
 }
@@ -118,6 +120,7 @@ impl Default for LayoutState {
             sources_w: SOURCES_W,
             sources_tree_collapsed: false,
             props_collapsed: false,
+            open_views: vec![CenterPane::Summary],
             drag_from: None,
         }
     }
@@ -307,6 +310,151 @@ fn drag_size(
             }
         }
     }
+}
+
+/// Keep the current center view in the tab strip (views can be opened by
+/// menus, rail, palette, Tcl or cross-probes; all land here).
+pub fn sync_tabs(s: &mut AppState) -> bool {
+    if s.layout.open_views.contains(&s.center) {
+        return false;
+    }
+    s.layout.open_views.push(s.center);
+    true
+}
+
+/// Close a view tab. Closing the active tab activates its left neighbour
+/// (else the right one); the last tab never closes.
+pub fn close_tab(s: &mut AppState, pane: CenterPane) {
+    let tabs = &mut s.layout.open_views;
+    let Some(i) = tabs.iter().position(|p| *p == pane) else {
+        return;
+    };
+    if tabs.len() <= 1 {
+        return;
+    }
+    tabs.remove(i);
+    s.nav_back.retain(|p| *p != pane);
+    s.nav_forward.retain(|p| *p != pane);
+    if s.center == pane {
+        let next = tabs[i.saturating_sub(1).min(tabs.len() - 1)];
+        s.center = next;
+    }
+}
+
+/// Close every tab but `keep`.
+pub fn close_other_tabs(s: &mut AppState, keep: CenterPane) {
+    s.layout.open_views.retain(|p| *p == keep);
+    if s.layout.open_views.is_empty() {
+        s.layout.open_views.push(keep);
+    }
+    s.center = keep;
+}
+
+/// The view tab strip over the center pane: one tab per open view, active
+/// tab raised with an accent underline, × to close (hidden on the last tab).
+/// Middle of the strip scrolls sideways when many views are open.
+pub fn view_tabs(s: &AppState, t: &VivadoTheme) -> El {
+    use rune::{col, text};
+    let mut tabs = s.layout.open_views.clone();
+    if !tabs.contains(&s.center) {
+        tabs.push(s.center);
+    }
+    let closable = tabs.len() > 1;
+    let mut strip = row()
+        .key("view-tabs")
+        .role("tablist")
+        .w_full()
+        .h(24.0)
+        .items_end()
+        .gap(1.0)
+        .px(4.0)
+        .fill(t.header_bg);
+    for pane in tabs {
+        let active = pane == s.center;
+        let label = crate::views::palette::pane_label(pane);
+        let mut tab = row()
+            .key(format!("view-tab-{pane:?}"))
+            .role("tab")
+            .label(label)
+            .focus_selected(active)
+            .focusable(true)
+            .h(23.0)
+            .pl(12.0)
+            .pr(if closable { 4.0 } else { 12.0 })
+            .gap(6.0)
+            .items_center()
+            .radius(4.0)
+            .fill(if active { t.panel_bg } else { t.header_bg })
+            .hover(t.selection)
+            .on_press(move |s: &mut AppState| s.navigate(pane))
+            .child(
+                col()
+                    .h_full()
+                    .justify_center()
+                    .child(
+                        text(label)
+                            .font(if active {
+                                VivadoTheme::FONT_TITLE
+                            } else {
+                                VivadoTheme::FONT_UI
+                            })
+                            .color(if active { t.text } else { t.text_dim }),
+                    ),
+            );
+        if closable {
+            tab = tab.child(
+                el().key(format!("view-tab-close-{pane:?}"))
+                    .role("button")
+                    .label(format!("Close {label}"))
+                    .help("Close tab")
+                    .focusable(true)
+                    .size(18.0, 18.0)
+                    .radius(3.0)
+                    .center()
+                    .hover(t.border_light)
+                    .on_press(move |s: &mut AppState| close_tab(s, pane))
+                    .child(text("×").font(VivadoTheme::FONT_UI).color(t.text_faint)),
+            );
+        }
+        if active {
+            tab = tab.border_sides([0.0, 0.0, 2.0, 0.0], t.accent);
+        }
+        strip = strip.child(tab);
+    }
+    let maximize = el()
+        .key("view-tabs-max")
+        .role("button")
+        .label(if s.layout.focus {
+            "Restore layout"
+        } else {
+            "Maximize view"
+        })
+        .help("Maximize or restore the view (⇧⌘M)")
+        .focusable(true)
+        .size(22.0, 20.0)
+        .radius(3.0)
+        .center()
+        .hover(t.selection)
+        .on_press(toggle_focus)
+        .child(
+            text(if s.layout.focus { "⤡" } else { "⤢" })
+                .font(VivadoTheme::FONT_UI)
+                .color(t.text_dim),
+        );
+    row()
+        .w_full()
+        .h(24.0)
+        .items_center()
+        .fill(t.header_bg)
+        .border(1.0, t.border)
+        .child(
+            el().grow(1.0)
+                .min_w(0.0)
+                .h_full()
+                .scroll_x()
+                .child(strip),
+        )
+        .child(el().px(4.0).child(maximize))
 }
 
 /// Record a project in the recent list (newest first, deduped, capped).

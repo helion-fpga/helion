@@ -1323,6 +1323,7 @@ impl AppState {
         self.nav_back.push(self.center);
         self.nav_forward.clear();
         self.center = pane;
+        crate::layout::sync_tabs(self);
     }
 
     /// Step back through center-pane history; false when there is none.

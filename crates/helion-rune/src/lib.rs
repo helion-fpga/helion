@@ -1161,7 +1161,21 @@ fn workspace(s: &AppState, t: &VivadoTheme) -> El {
             .child(sources_column(s, t))
             .child(layout::sources_splitter(t));
     }
-    band.child(center_pane(s, t))
+    // Center column: open-view tabs over the active surface (no tabs on
+    // the empty-project Start page, which owns the whole column).
+    let mut center = col().grow(1.0).h_full().min_w(0.0).min_h(0.0);
+    if !s.project.name.is_empty() {
+        center = center.child(layout::view_tabs(s, t));
+    }
+    band.child(
+        center.child(
+            row()
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .child(center_pane(s, t)),
+        ),
+    )
 }
 
 /// Root view: Vivado shell skeleton (titlebar, menu, rail, summary, status).
@@ -1242,6 +1256,7 @@ pub fn poll_all(s: &mut AppState, t: f64, tx: &mut rune::Tx) -> bool {
     views::editor::sync_edit(s);
     let hw_dirty = views::program::poll(s);
     let pblocks_dirty = views::device_floor::sync_from_project(s);
+    let tabs_dirty = layout::sync_tabs(s);
     let jobs_dirty = jobs::poll(s, tx);
     let diag_dirty = views::editor_diag::poll(s, t, tx);
     runs_dirty
@@ -1250,6 +1265,7 @@ pub fn poll_all(s: &mut AppState, t: f64, tx: &mut rune::Tx) -> bool {
         || hw_dirty
         || toasts_dirty
         || pblocks_dirty
+        || tabs_dirty
         || jobs_dirty
         || diag_dirty
 }

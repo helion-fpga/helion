@@ -508,6 +508,9 @@ fn device_select_layers_find_and_locate() {
             .any(|t| t.title == "Not in project sources"),
         "locate must report that no project file declares the top"
     );
+    for i in 0..20 {
+        rt.frame(0.1 + i as f64 * 0.05);
+    }
     tap(&mut rt, "device-find-toggle");
     assert!(
         rt.find("device-find").is_none(),
