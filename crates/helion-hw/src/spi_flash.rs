@@ -62,6 +62,28 @@ impl SpiFlashSim {
         (self.status_reg & SPI_STATUS_WEL) != 0
     }
 
+    /// The byte the flash drives on MISO while the host clocks byte
+    /// `prefix.len()` of a transaction whose earlier MOSI bytes are `prefix`.
+    /// Pure (no side effects): the bit-level SPI port on the TAP uses it to
+    /// produce TDO in real time; side effects happen in [`Self::transfer`]
+    /// when CS# rises. Mirrors `transfer`'s full-duplex `rx` exactly.
+    pub fn drive_byte(&self, prefix: &[u8]) -> u8 {
+        let i = prefix.len();
+        let Some(&op) = prefix.first() else {
+            return 0x00;
+        };
+        let addr = || {
+            ((prefix[1] as usize) << 16) | ((prefix[2] as usize) << 8) | (prefix[3] as usize)
+        };
+        match op {
+            SPI_CMD_RDID => self.jedec_id.get(i - 1).copied().unwrap_or(0),
+            SPI_CMD_RDSR => self.status_reg,
+            SPI_CMD_READ if i >= 4 => self.mem.get(addr() + (i - 4)).copied().unwrap_or(0),
+            SPI_CMD_QREAD if i >= 5 => self.mem.get(addr() + (i - 5)).copied().unwrap_or(0),
+            _ => 0x00,
+        }
+    }
+
     /// Execute one complete `CS#` low -> `tx_bytes` -> `CS#` high SPI transaction
     /// and return the full-duplex `rx_bytes` shifted out on MISO / DQ[3:0].
     pub fn transfer(&mut self, tx: &[u8]) -> Result<Vec<u8>, String> {
