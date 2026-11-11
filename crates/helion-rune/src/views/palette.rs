@@ -87,6 +87,7 @@ pub enum PaletteCommand {
     AddSources,
     ConstraintsWizard,
     About,
+    HwNode(crate::views::hw_tree::HwNode),
 }
 
 /// Center panes in palette display order.
@@ -185,6 +186,17 @@ impl PaletteCommand {
         cmds.push(PaletteCommand::AddSources);
         cmds.push(PaletteCommand::ConstraintsWizard);
         cmds.push(PaletteCommand::About);
+        use crate::views::hw_tree::HwNode;
+        use helion_debug::DebugCoreKind;
+        for node in [
+            HwNode::SetupDebug,
+            HwNode::Core(DebugCoreKind::Ila),
+            HwNode::Core(DebugCoreKind::Vio),
+            HwNode::Core(DebugCoreKind::JtagAxi),
+            HwNode::CfgMem,
+        ] {
+            cmds.push(PaletteCommand::HwNode(node));
+        }
         cmds
     }
 
@@ -213,6 +225,18 @@ impl PaletteCommand {
             PaletteCommand::AddSources => "Add sources…".into(),
             PaletteCommand::ConstraintsWizard => "Constraints wizard…".into(),
             PaletteCommand::About => "About Helion".into(),
+            PaletteCommand::HwNode(node) => {
+                use crate::views::hw_tree::HwNode;
+                use helion_debug::DebugCoreKind;
+                match node {
+                    HwNode::SetupDebug => "Hardware: Set Up Debug".into(),
+                    HwNode::Core(DebugCoreKind::Ila) => "Hardware: ILA".into(),
+                    HwNode::Core(DebugCoreKind::Vio) => "Hardware: VIO".into(),
+                    HwNode::Core(DebugCoreKind::JtagAxi) => "Hardware: JTAG-to-AXI".into(),
+                    HwNode::CfgMem => "Hardware: Configuration Memory".into(),
+                    _ => "Hardware Manager".into(),
+                }
+            }
         }
     }
 
@@ -532,6 +556,10 @@ pub fn run_command(s: &mut AppState, cmd: PaletteCommand, tx: &mut Tx) {
             s.dialogs.open(crate::views::dialogs::DialogId::Constraints)
         }
         PaletteCommand::About => s.chrome.about_open = true,
+        PaletteCommand::HwNode(node) => {
+            s.navigate(CenterPane::Program);
+            s.program.node = node;
+        }
     }
 }
 
