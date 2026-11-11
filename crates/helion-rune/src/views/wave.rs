@@ -56,8 +56,6 @@ pub use crate::views::wave_demo::{
 /// Pixels per sample at 100% zoom: the full 96-sample sheet (384pt) fits the
 /// trace viewport so every lane, cursor, and marker stays inside the shell.
 const BASE_PPS: f32 = 4.0;
-/// Trace lane height (compact CAD density).
-const LANE_H: f32 = 24.0;
 /// Signal Name/Value column width.
 const NAME_W: f32 = 208.0;
 /// Time ruler height.
@@ -675,8 +673,18 @@ pub struct WaveState {
     /// Selected live scope (hierarchical prefix); `None` = first scope.
     pub live_scope: Option<String>,
     /// Live trace indices mounted as lanes, in lane order; empty = the
-    /// first [`LIVE_SHOWN`] traces.
+    /// first [`LIVE_SHOWN`] traces (unless [`WaveState::lanes_custom`]).
     pub live_lanes: Vec<usize>,
+    /// The lane list was edited (add/remove/reorder): `live_lanes` is
+    /// authoritative even when empty.
+    pub lanes_custom: bool,
+    /// Density, fixed-point/analog display, virtual buses, multi-select
+    /// ([`crate::views::wave_style`]).
+    pub style: crate::views::wave_style::WaveStyleState,
+    /// Protocol decoders ([`crate::views::wave_decode`]).
+    pub decode: crate::views::wave_decode::WaveDecodeState,
+    /// Objects-panel signal filter (matches full names across scopes).
+    pub filter: rune::TextEdit,
 }
 
 impl Default for WaveState {
@@ -697,6 +705,10 @@ impl Default for WaveState {
             demo: false,
             live_scope: None,
             live_lanes: Vec::new(),
+            lanes_custom: false,
+            style: Default::default(),
+            decode: Default::default(),
+            filter: rune::TextEdit::new(""),
         }
     }
 }
@@ -777,6 +789,9 @@ impl WaveState {
         match self.selected_name() {
             Some(name) => {
                 self.trace_radix.insert(name.clone(), radix);
+                if let Some(d) = self.style.display.get_mut(&name) {
+                    d.fixed = None;
+                }
                 format!(
                     "set_property radix {} [get_waves {{{name}}}]",
                     radix.label().to_lowercase()
@@ -798,7 +813,7 @@ impl WaveState {
     /// Mounted live lane trace indices, in lane order.
     pub fn lanes(&self) -> Vec<usize> {
         let n = self.live.as_ref().map(|l| l.traces.len()).unwrap_or(0);
-        if self.live_lanes.is_empty() {
+        if self.live_lanes.is_empty() && !self.lanes_custom {
             (0..n.min(LIVE_SHOWN)).collect()
         } else {
             self.live_lanes.iter().copied().filter(|&i| i < n).collect()
@@ -814,6 +829,7 @@ impl WaveState {
         }
         lanes.push(idx);
         self.live_lanes = lanes;
+        self.lanes_custom = true;
         true
     }
 
@@ -832,6 +848,10 @@ impl WaveState {
     pub fn mount_live(&mut self, live: LiveWave) {
         self.live = Some(live);
         self.live_lanes.clear();
+        self.lanes_custom = false;
+        self.style.multi.clear();
+        self.decode.pick = None;
+        self.rebuild_virtual_buses();
         self.live_scope = None;
         self.live_selected = None;
         self.clamp_to_grid();
@@ -1015,17 +1035,18 @@ fn tool_btn(key: &str, label: &str, t: &VivadoTheme) -> El {
 /// the bus envelope with pinched transitions.
 fn lane_shape(s: &AppState, t: &VivadoTheme, id: WaveSigId) -> Shape {
     let pps = s.wave.pps();
+    let lane_h = s.wave.style.density.lane_h();
     let w = s.wave.sheet_w();
     let mut shape = Shape::new();
     let mut g = 0;
     while g <= SAMPLES {
         let x = g as f32 * pps;
-        shape = shape.line([x, 0.0], [x, LANE_H], 1.0, LineCap::Butt, t.wave_grid);
+        shape = shape.line([x, 0.0], [x, lane_h], 1.0, LineCap::Butt, t.wave_grid);
         g += GRID_STEP;
     }
     let hi = 4.0;
-    let lo = LANE_H - 4.0;
-    let mid = LANE_H / 2.0;
+    let lo = lane_h - 4.0;
+    let mid = lane_h / 2.0;
     if !id.is_bus() {
         let mut pts = vec![[0.0, if sample(id, 0) == 0 { lo } else { hi }]];
         for i in 1..SAMPLES {
@@ -1077,20 +1098,23 @@ fn ruler_shape(s: &AppState, t: &VivadoTheme) -> Shape {
 
 /// Grid + trace shape of one live lane: gridlines plus the stepped scalar or
 /// bus envelope drawn from the imported engine samples.
-fn live_lane_shape(s: &AppState, t: &VivadoTheme, trace: &LiveTrace) -> Shape {
+fn live_lane_shape(s: &AppState, t: &VivadoTheme, trace: &LiveTrace, lane_h: f32) -> Shape {
     let pps = s.wave.pps();
     let n = sample_len(s);
+    if trace.is_bus() && s.wave.display_of(&trace.name).analog.is_some() {
+        return crate::views::wave_style::analog_shape(s, t, trace, lane_h, n);
+    }
     let w = s.wave.sheet_w();
     let mut shape = Shape::new();
     let mut g = 0;
     while g <= n {
         let x = g as f32 * pps;
-        shape = shape.line([x, 0.0], [x, LANE_H], 1.0, LineCap::Butt, t.wave_grid);
+        shape = shape.line([x, 0.0], [x, lane_h], 1.0, LineCap::Butt, t.wave_grid);
         g += GRID_STEP;
     }
     let hi = 4.0;
-    let lo = LANE_H - 4.0;
-    let mid = LANE_H / 2.0;
+    let lo = lane_h - 4.0;
+    let mid = lane_h / 2.0;
     let at = |i: usize| trace.value_at(i);
     if !trace.is_bus() {
         let mut pts = vec![[0.0, if at(0) == 0 { lo } else { hi }]];
@@ -1174,6 +1198,11 @@ fn restart_from_wave(s: &mut AppState) {
 /// is selected (the leading caption says which).
 fn radix_control(s: &AppState, t: &VivadoTheme) -> El {
     let active = s.wave.active_radix();
+    // A fixed-point trace reads in its Q format: no radix segment is lit.
+    let fixed = s
+        .wave
+        .selected_trace()
+        .is_some_and(|tr| tr.is_bus() && s.wave.display_of(&tr.name).fixed.is_some());
     let target = match s.wave.selected_name() {
         Some(n) => n.rsplit('.').next().unwrap_or(&n).to_string(),
         None => "all".into(),
@@ -1186,7 +1215,7 @@ fn radix_control(s: &AppState, t: &VivadoTheme) -> El {
         .items_center()
         .border(1.0, t.border);
     for r in WaveRadix::ALL {
-        let on = r == active;
+        let on = r == active && !fixed;
         segs = segs.child(
             el().key(format!("wave-radix-{}", r.label().to_lowercase()))
                 .role("radio")
@@ -1423,26 +1452,27 @@ fn objects_head(t: &VivadoTheme) -> El {
 /// Objects panel over the live import: traces of the selected scope with
 /// cursor values; traces not yet on the canvas offer `add_wave`.
 fn live_objects_panel(s: &AppState, t: &VivadoTheme, live: &LiveWave) -> El {
-    let mut body = col()
-        .key("wave-objects")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .fill(t.panel_bg)
-        .border(1.0, t.border)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .child(objects_head(t));
+    let mut body = col().w_full();
     let scope = s.wave.current_live_scope().unwrap_or_default();
     let lanes = s.wave.lanes();
+    let query = object_query(s);
+    let mut shown = 0usize;
     for (idx, trace) in live.traces.iter().enumerate() {
-        if trace_scope(&trace.name) != scope {
+        // A filter searches every scope by full name; otherwise the
+        // selected scope's traces list.
+        let hit = match &query {
+            Some(q) => trace.name.to_lowercase().contains(q),
+            None => trace_scope(&trace.name) == scope,
+        };
+        if !hit {
             continue;
         }
+        shown += 1;
         let selected = s.wave.live_selected == Some(idx);
-        let value = format_live_value(trace, s.wave.cursor, s.wave.radix_for(&trace.name));
-        let dtype = if trace.is_bus() {
+        let value = s.wave.trace_value(trace, s.wave.cursor);
+        let dtype = if s.wave.is_virtual(&trace.name) {
+            format!("vbus [{}:0]", trace.width - 1)
+        } else if trace.is_bus() {
             format!("wire [{}:0]", trace.width - 1)
         } else {
             "wire".to_string()
@@ -1490,7 +1520,58 @@ fn live_objects_panel(s: &AppState, t: &VivadoTheme, live: &LiveWave) -> El {
         }
         body = body.child(r);
     }
-    body
+    objects_frame(s, t, body, shown)
+}
+
+/// Lowercased Objects filter, `None` when empty.
+fn object_query(s: &AppState) -> Option<String> {
+    let q = s.wave.filter.text.trim().to_lowercase();
+    (!q.is_empty()).then_some(q)
+}
+
+/// Objects frame: filter field, header, the rows, and an honest
+/// no-match line when the filter hides everything.
+fn objects_frame(s: &AppState, t: &VivadoTheme, rows: El, shown: usize) -> El {
+    let mut frame = col()
+        .key("wave-objects")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .fill(t.panel_bg)
+        .border(1.0, t.border)
+        .child(
+            el().w_full().padding(4.0).child(crate::views::cad::search_input(
+                "wave-objects-filter",
+                &s.wave.filter,
+                "Filter signals",
+                t,
+                |s: &mut AppState| &mut s.wave.filter,
+            )),
+        )
+        .child(objects_head(t));
+    if shown == 0 {
+        if let Some(q) = object_query(s) {
+            frame = frame.child(
+                row()
+                    .key("wave-objects-nomatch")
+                    .w_full()
+                    .h(ROW_H)
+                    .px(6.0)
+                    .items_center()
+                    .child(dim_label(&format!("No signal matches \"{q}\""), t).truncate()),
+            );
+        }
+    }
+    frame.child(
+        col()
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .child(rows),
+    )
 }
 
 /// Objects panel: the demo scope's objects under the fixture, else the live
@@ -1499,15 +1580,17 @@ fn objects_panel(s: &AppState, t: &VivadoTheme) -> El {
     if let Some(live) = s.wave.live.as_ref().filter(|l| !l.is_empty()) {
         return live_objects_panel(s, t, live);
     }
-    let mut body = col()
-        .key("wave-objects")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .fill(t.panel_bg)
-        .border(1.0, t.border)
-        .child(objects_head(t));
+    let mut body = col().w_full();
+    let query = object_query(s);
+    let mut shown = 0usize;
     for obj in objects(s.wave.scope).iter().copied() {
+        if query
+            .as_ref()
+            .is_some_and(|q| !obj.name.to_lowercase().contains(q))
+        {
+            continue;
+        }
+        shown += 1;
         let value = match (obj.fixed, obj.sig) {
             (Some(f), _) => f.into(),
             (None, Some(id)) => format_value(id, s.wave.cursor, s.wave.radix_for(id.name())),
@@ -1539,7 +1622,7 @@ fn objects_panel(s: &AppState, t: &VivadoTheme) -> El {
         }
         body = body.child(r);
     }
-    body
+    objects_frame(s, t, body, shown)
 }
 
 /// Source banner: names the engine import behind the lanes, or labels the
@@ -1600,12 +1683,23 @@ fn live_names_column(s: &AppState, t: &VivadoTheme, live: &LiveWave) -> El {
                 .child(el().grow(1.0).child(pin_label("Value", t))),
         );
     let lanes = s.wave.lanes();
-    for &idx in &lanes {
+    let sel = s.wave.selection();
+    for (lrow, _, lane_h) in crate::views::wave_decode::live_rows(&s.wave) {
+        let idx = match lrow {
+            crate::views::wave_decode::LiveRow::Trace(idx) => idx,
+            crate::views::wave_decode::LiveRow::Decoded { dec, title, lane } => {
+                let key = format!("wave-dec-name-{dec}-{}", lane.name.to_lowercase());
+                body = body.child(crate::views::wave_decode::decoded_name_row(
+                    key, &title, &lane, lane_h, t,
+                ));
+                continue;
+            }
+        };
         let Some(trace) = live.traces.get(idx) else {
             continue;
         };
-        let selected = s.wave.live_selected == Some(idx);
-        let value = format_live_value(trace, s.wave.cursor, s.wave.radix_for(&trace.name));
+        let selected = sel.contains(&idx);
+        let value = s.wave.trace_value(trace, s.wave.cursor);
         body = body.child(
             row()
                 .key(format!("wave-live-name-{idx}"))
@@ -1614,13 +1708,15 @@ fn live_names_column(s: &AppState, t: &VivadoTheme, live: &LiveWave) -> El {
                 .focus_selected(selected)
                 .focusable(true)
                 .w_full()
-                .h(LANE_H)
+                .h(lane_h)
                 .px(6.0)
                 .gap(6.0)
                 .items_center()
                 .fill(if selected { t.selection } else { t.panel_bg })
                 .hover(t.selection)
-                .on_press(move |s: &mut AppState| select_live_trace(s, idx))
+                .on_press_tx(move |s: &mut AppState, tx: &mut rune::Tx| {
+                    crate::views::wave_style::press_name(s, idx, tx)
+                })
                 .child(
                     icon(
                         if trace.is_bus() {
@@ -1707,7 +1803,7 @@ fn names_column(s: &AppState, t: &VivadoTheme) -> El {
                 .focus_selected(selected)
                 .focusable(true)
                 .w_full()
-                .h(LANE_H)
+                .h(s.wave.style.density.lane_h())
                 .px(6.0)
                 .gap(6.0)
                 .items_center()
@@ -1751,11 +1847,13 @@ fn ruler(s: &AppState, t: &VivadoTheme) -> El {
         .fill(t.panel_bg)
         .child(canvas(ruler_shape(s, t)).w_full().h_full());
     let n = sample_len(s);
+    // Label every k-th tick so labels keep >= 56pt apart at any zoom.
+    let stride = ((56.0 / (GRID_STEP as f32 * pps)).ceil() as usize).max(1) * GRID_STEP;
     let mut g = 0;
     while g <= n {
         // The end tick keeps its line but no label: the text would run off
         // the sheet edge.
-        if g < n {
+        if g < n && g % stride == 0 {
             let label = time_label(s, g);
             r = r.child(
                 text(label)
@@ -1791,10 +1889,11 @@ fn ruler(s: &AppState, t: &VivadoTheme) -> El {
 fn lane(s: &AppState, t: &VivadoTheme, id: WaveSigId) -> El {
     let pps = s.wave.pps();
     let radix = s.wave.radix_for(id.name());
+    let lane_h = s.wave.style.density.lane_h();
     let mut l = el()
         .key(id.lane_key())
         .w(s.wave.sheet_w())
-        .h(LANE_H)
+        .h(lane_h)
         .fill(if s.wave.selected == Some(id) {
             t.selection
         } else {
@@ -1810,7 +1909,7 @@ fn lane(s: &AppState, t: &VivadoTheme, id: WaveSigId) -> El {
                     text(label)
                         .font(FONT_PIN)
                         .color(t.text)
-                        .absolute(a as f32 * pps + 4.0, 5.0),
+                        .absolute(a as f32 * pps + 4.0, (lane_h - 14.0) / 2.0),
                 );
             }
         }
@@ -1819,30 +1918,30 @@ fn lane(s: &AppState, t: &VivadoTheme, id: WaveSigId) -> El {
 }
 
 /// One live trace lane: the engine canvas plus bus value labels on wide runs.
-fn live_lane(s: &AppState, t: &VivadoTheme, idx: usize, trace: &LiveTrace) -> El {
+fn live_lane(s: &AppState, t: &VivadoTheme, idx: usize, trace: &LiveTrace, lane_h: f32) -> El {
     let pps = s.wave.pps();
-    let radix = s.wave.radix_for(&trace.name);
+    let analog = s.wave.display_of(&trace.name).analog.is_some();
     let mut l = el()
         .key(format!("wave-live-lane-{idx}"))
         .w(s.wave.sheet_w())
-        .h(LANE_H)
-        .fill(if s.wave.live_selected == Some(idx) {
+        .h(lane_h)
+        .fill(if s.wave.selection().contains(&idx) {
             t.selection
         } else {
             t.panel_bg
         })
-        .child(canvas(live_lane_shape(s, t, trace)).w_full().h_full());
-    if trace.is_bus() {
+        .child(canvas(live_lane_shape(s, t, trace, lane_h)).w_full().h_full());
+    if trace.is_bus() && !analog {
         for (a, b, _v) in live_bus_runs(trace) {
             let px = (b - a) as f32 * pps;
-            let label = format_live_value(trace, a, radix);
+            let label = s.wave.trace_value(trace, a);
             // Labels mount only where the run is wide enough to hold them.
             if px >= 12.0 + label.chars().count() as f32 * 6.0 {
                 l = l.child(
                     text(label)
                         .font(FONT_PIN)
                         .color(t.text)
-                        .absolute(a as f32 * pps + 4.0, 5.0),
+                        .absolute(a as f32 * pps + 4.0, (lane_h - 14.0) / 2.0),
                 );
             }
         }
@@ -1883,26 +1982,41 @@ fn cursor_overlays(s: &AppState, t: &VivadoTheme, lanes_h: f32) -> Vec<El> {
 /// demo lanes) in one horizontal pan container so ticks, traces, and cursors
 /// stay aligned.
 fn wave_canvas(s: &AppState, t: &VivadoTheme) -> El {
+    use crate::views::wave_decode::{LiveRow, decoded_lane, live_rows};
     let use_live = s.wave.has_live();
-    let lanes = s.wave.lanes();
+    let lane_h = s.wave.style.density.lane_h();
+    let rows = if use_live { live_rows(&s.wave) } else { Vec::new() };
     let lanes_h = if use_live {
-        lanes.len() as f32 * LANE_H
+        rows.last().map(|(_, y, h)| y + h).unwrap_or(0.0)
     } else {
-        s.wave.visible().len() as f32 * LANE_H
+        s.wave.visible().len() as f32 * lane_h
     };
-    let mut sheet = el().w(s.wave.sheet_w()).h(lanes_h).fill(t.panel_bg);
+    let mut sheet = el()
+        .key("wave-sheet")
+        .w(s.wave.sheet_w())
+        .h(lanes_h)
+        .fill(t.panel_bg);
     if use_live {
         if let Some(live) = &s.wave.live {
-            for (row, &idx) in lanes.iter().enumerate() {
-                if let Some(trace) = live.traces.get(idx) {
-                    sheet =
-                        sheet.child(live_lane(s, t, idx, trace).absolute(0.0, row as f32 * LANE_H));
+            for (lrow, y, h) in rows {
+                match lrow {
+                    LiveRow::Trace(idx) => {
+                        if let Some(trace) = live.traces.get(idx) {
+                            sheet = sheet.child(live_lane(s, t, idx, trace, h).absolute(0.0, y));
+                        }
+                    }
+                    LiveRow::Decoded { dec, lane, .. } => {
+                        let key = format!("wave-dec-lane-{dec}-{}", lane.name.to_lowercase());
+                        sheet = sheet.child(decoded_lane(s, key, &lane, h, t).absolute(0.0, y));
+                    }
                 }
             }
         }
+        // Click parks the cursor; Shift-click places A, Alt-click B.
+        sheet = sheet.on_drag(crate::views::wave_style::press_sheet);
     } else {
         for (row, id) in s.wave.visible().iter().enumerate() {
-            sheet = sheet.child(lane(s, t, *id).absolute(0.0, row as f32 * LANE_H));
+            sheet = sheet.child(lane(s, t, *id).absolute(0.0, row as f32 * lane_h));
         }
     }
     for overlay in cursor_overlays(s, t, lanes_h) {
@@ -1954,15 +2068,12 @@ fn wave_readout(s: &AppState, t: &VivadoTheme) -> El {
             .live_selected
             .and_then(|i| s.wave.live.as_ref()?.traces.get(i))
         {
-            Some(trace) => {
-                let radix = s.wave.radix_for(&trace.name);
-                format!(
-                    "Selected: {} = {} ({})",
-                    trace.leaf(),
-                    format_live_value(trace, s.wave.cursor, radix),
-                    radix.label().to_lowercase()
-                )
-            }
+            Some(trace) => format!(
+                "Selected: {} = {} ({})",
+                trace.leaf(),
+                s.wave.trace_value(trace, s.wave.cursor),
+                s.wave.format_tag(trace)
+            ),
             None => "No signal selected".into(),
         }
     } else {
@@ -2043,6 +2154,7 @@ pub fn wave_pane(s: &AppState, t: &VivadoTheme) -> El {
     }
     pane.child(live_banner(s, t))
         .child(wave_toolbar(s, t))
+        .child(crate::views::wave_style::trace_bar(s, t))
         .child(
             row()
                 .key("wave-body")
@@ -2058,7 +2170,11 @@ pub fn wave_pane(s: &AppState, t: &VivadoTheme) -> El {
                         .h_full()
                         .gap(6.0)
                         .child(scope_panel(s, t))
-                        .child(objects_panel(s, t)),
+                        .child(objects_panel(s, t))
+                        .children(
+                            (s.wave.decode.panel_open && s.wave.has_live())
+                                .then(|| crate::views::wave_decode::decoder_panel(s, t)),
+                        ),
                 )
                 .child(
                     col()

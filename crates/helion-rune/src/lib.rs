@@ -35,6 +35,18 @@ use rune::{AppSpec, Cx, El, col, el, row, text};
 const TITLE: &str = "project_1 - Helion";
 const SIZE: (f32, f32) = (1440.0, 900.0);
 
+/// Scene helper: mount the named leaf traces (in order) as the lanes.
+fn scene_lanes(s: &mut AppState, leaves: &[&str]) {
+    let Some(live) = s.wave.live.as_ref() else {
+        return;
+    };
+    s.wave.live_lanes = leaves
+        .iter()
+        .filter_map(|l| live.traces.iter().position(|t| t.leaf() == *l))
+        .collect();
+    s.wave.lanes_custom = true;
+}
+
 /// Named headless states (`--scene NAME`; see `tooling.rs::AppSpec::scenes`).
 /// Per-surface scenes arrive with their view batches; the scaffold ships the
 /// hello pair so `--snap/--tree` work from day one.
@@ -93,6 +105,17 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
     ("console-runs", |s| {
         s.console.tab = views::console::ConsoleTab::DesignRuns;
         s.flow.synth = state::RunStatus::Complete;
+    }),
+    ("runs-table", |s| {
+        seed_runs_fixture(s);
+    }),
+    ("runs-create", |s| {
+        seed_runs_fixture(s);
+        s.runs.ui.create_open = true;
+        s.runs.ui.name = rune::TextEdit::new("sweep");
+        s.runs.ui.seeds = rune::TextEdit::new("4, 5, 6");
+        s.runs.ui.preset = 1;
+        s.runs.ui.preset_pop = true;
     }),
     ("summary", |_| {}),
     ("summary-synth-complete", |s| {
@@ -336,6 +359,49 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
             s.wave.clamp_to_grid();
         }
     }),
+    ("wave-decoders", |s| {
+        s.center = state::CenterPane::Wave;
+        views::wave_demo::seed_protocol_fixture(s);
+        let hdl = views::wave_demo::PROTOCOL_FIXTURE_HDL;
+        use views::wave_decode::DecoderKind;
+        for kind in [DecoderKind::Spi, DecoderKind::Uart, DecoderKind::Fsm, DecoderKind::AxiLite] {
+            s.wave.add_decoder(kind, hdl);
+        }
+        scene_lanes(s, &["sclk", "mosi", "miso", "cs_n", "uart_tx", "state"]);
+        s.wave.live_selected = s.wave.lanes().last().copied();
+        s.wave.zoom = 0.4;
+        s.wave.cursor = 44;
+    }),
+    ("wave-analog", |s| {
+        use views::wave_style::{Analog, Density, TraceDisplay};
+        s.center = state::CenterPane::Wave;
+        views::wave_demo::seed_protocol_fixture(s);
+        scene_lanes(s, &["dac", "saw", "cnt_0", "cnt_1", "cnt_2", "cnt_3"]);
+        let lanes = s.wave.lanes();
+        s.wave.live_selected = Some(lanes[2]);
+        s.wave.style.multi = lanes[3..6].to_vec();
+        let _ = s.wave.create_virtual_bus();
+        s.wave.style.display.insert(
+            "bus_tb.dac".into(),
+            TraceDisplay {
+                fixed: helion_verif::wave::FixedPoint::parse("Q.6"),
+                analog: Some(Analog::Linear),
+            },
+        );
+        s.wave.style.display.insert(
+            "bus_tb.saw".into(),
+            TraceDisplay {
+                fixed: None,
+                analog: Some(Analog::Step),
+            },
+        );
+        s.wave.style.density = Density::Compact;
+        s.wave.live_selected = Some(lanes[0]);
+        s.wave.zoom = 0.4;
+        s.wave.cursor = 30;
+        s.wave.cursor_a = Some(30);
+        s.wave.cursor_b = Some(90);
+    }),
     ("sim", |s| {
         s.center = state::CenterPane::Sim;
         views::tb::seed_examples_fixture(s);
@@ -539,6 +605,7 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
                 wns_ps: Some(3120),
                 lut_ff: Some(2310),
                 duration_ms: 1840,
+                ..Default::default()
             },
             runs::RunRecord {
                 seq: 2,
@@ -547,6 +614,7 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
                 wns_ps: None,
                 lut_ff: None,
                 duration_ms: 950,
+                ..Default::default()
             },
             runs::RunRecord {
                 seq: 3,
@@ -555,6 +623,7 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
                 wns_ps: Some(2061),
                 lut_ff: Some(2415),
                 duration_ms: 64_300,
+                ..Default::default()
             },
         ];
     }),
@@ -573,6 +642,62 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
 /// Representative timing report output the timing scenes share (single
 /// 10ns clock, one intra group, worst path first with UG903 pin rows),
 /// shaped like real `TimingState` so snapshots render tables.
+/// Design Runs fixture (scenes only): finished records with real-shaped
+/// metrics, created runs (one never launched), and impl_1 active. Nothing
+/// is queued: an idle worker would start a queued run at once.
+fn seed_runs_fixture(s: &mut AppState) {
+    use runs::{RunKind, RunOutcome, RunRecord, RunSpec};
+    s.console.tab = views::console::ConsoleTab::DesignRuns;
+    s.layout.console_h = 300.0;
+    s.flow.synth = state::RunStatus::Complete;
+    s.flow.impl_run = state::RunStatus::Complete;
+    let strat = |p: &str, seed: u64| {
+        let mut st = helion_proj::RunStrategy::preset(p).expect("preset");
+        st.placer_seed = seed;
+        st
+    };
+    for (name, st) in [
+        ("impl_2", strat("TimingExplore", 0)),
+        ("sweep_s1", strat("Default", 1)),
+        ("sweep_s2", strat("Default", 2)),
+        ("sweep_s3", strat("Default", 3)),
+    ] {
+        s.runs.defs.push(RunSpec {
+            name: name.into(),
+            kind: RunKind::Impl,
+            strategy: st,
+            incremental: None,
+        });
+    }
+    let rec = |seq, name: &str, kind, outcome, wns: Option<i64>, tns, luts: Option<u32>, ms| RunRecord {
+        seq,
+        kind,
+        outcome,
+        wns_ps: wns,
+        tns_ps: tns,
+        luts,
+        ffs: luts.map(|l| l / 2 + 7),
+        bram: luts.map(|_| 2),
+        dsp: luts.map(|_| 1),
+        lut_ff: luts.map(|l| l + l / 2 + 7),
+        duration_ms: ms,
+        name: name.into(),
+        artifacts: (outcome == RunOutcome::Complete)
+            .then(|| Box::new(runs::RunArtifacts::default())),
+        ..Default::default()
+    };
+    s.runs.history = vec![
+        rec(1, "synth_1", RunKind::Synth, RunOutcome::Complete, Some(3120), Some(0), Some(398), 1840),
+        rec(2, "impl_1", RunKind::Impl, RunOutcome::Complete, Some(2061), Some(0), Some(412), 6400),
+        rec(3, "impl_2", RunKind::Impl, RunOutcome::Complete, Some(-120), Some(-480), Some(415), 9100),
+        rec(4, "sweep_s1", RunKind::Impl, RunOutcome::Complete, Some(1874), Some(0), Some(412), 6900),
+        rec(5, "sweep_s2", RunKind::Impl, RunOutcome::Failed, None, None, None, 2100),
+    ];
+    s.runs.active_result = Some("impl_1".into());
+    s.runs.ui.selected = Some("impl_2".into());
+    s.runs.ui.sort = Some((views::runs_table::RunCol::Wns, true));
+}
+
 fn seed_timing_fixture(s: &mut AppState) {
     s.timing.clocks = vec![state::TimingClock {
         name: "clk".into(),
@@ -966,6 +1091,8 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
     let mut layer = Vec::new();
     views::dialogs::push_dialogs(&mut layer, s, &t);
     views::device::push_device_pops(&mut layer, s, &t);
+    views::wave_decode::push_wave_pops(&mut layer, s, &t);
+    views::runs_table::push_runs_pops(&mut layer, s, &t);
     views::status::push_toasts(&mut layer, s, &t);
     views::palette::push_palette(&mut layer, s, &t);
     views::palette::push_cheatsheet(&mut layer, s, &t);

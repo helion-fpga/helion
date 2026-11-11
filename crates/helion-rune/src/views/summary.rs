@@ -1095,6 +1095,7 @@ mod tests {
                 wns_ps: Some(1200),
                 lut_ff: Some(24),
                 duration_ms: 1500,
+                ..Default::default()
             });
         }
         let mut rt = harness_with(s);
