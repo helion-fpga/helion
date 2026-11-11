@@ -272,6 +272,8 @@ pub fn load_from_prj(s: &mut AppState, prj_path: &Path, prj: &helion_proj::Proje
     }
     s.project_files = files;
     s.sources.selected = crate::views::sources::SourceFileId::Demo;
+    // Pblocks load with the project, not on the next poll.
+    crate::views::device_floor::sync_from_project(s);
     let top = s.project.top.clone();
     if let Some(i) = s.project_files.top_index(top.as_deref()) {
         if s.project.top.is_none() {

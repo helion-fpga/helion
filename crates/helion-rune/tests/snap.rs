@@ -770,6 +770,7 @@ fn flow_rail_reports_navigate_to_timing_and_reports() {
     );
     assert!(rt.find("timing-pane").is_some());
     let mut rt = rt_for("summary");
+    rail_to_bottom(&mut rt);
     tap(&mut rt, "flow-implementation-report-utilization");
     assert_eq!(
         rt.state.center,
