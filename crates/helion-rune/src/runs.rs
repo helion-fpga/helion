@@ -452,7 +452,7 @@ impl RunsState {
         *self = RunsState::default();
     }
 
-    fn log_for(&self, kind: RunKind) -> &Vec<ConsoleLine> {
+    pub fn log_for(&self, kind: RunKind) -> &Vec<ConsoleLine> {
         match kind {
             RunKind::Synth => &self.synth_log,
             RunKind::Impl => &self.impl_log,
@@ -752,21 +752,61 @@ pub fn deliver(s: &mut AppState, kind: RunKind, event: RunEvent) {
                         RunKind::Impl => {
                             if builtin {
                                 s.flow.impl_run = RunStatus::Complete;
+                                // The implementation run synthesizes the
+                                // sources itself when synth_1 has not run.
+                                if s.flow.synth != RunStatus::Complete {
+                                    s.flow.synth = RunStatus::Complete;
+                                }
                             }
                             StatusVerb::ImplementationComplete
                         }
                     };
                     s.status = verb;
+                    // A run can finish with nets left unrouted: say so as a
+                    // critical warning (bitstream generation refuses it)
+                    // instead of reporting a clean run.
+                    let route_issue = (kind == RunKind::Impl
+                        && (s.drc.unrouted > 0 || s.drc.overused > 0))
+                        .then(|| {
+                            format!(
+                                "{} unrouted net{}, {} overused routing node{}",
+                                s.drc.unrouted,
+                                if s.drc.unrouted == 1 { "" } else { "s" },
+                                s.drc.overused,
+                                if s.drc.overused == 1 { "" } else { "s" },
+                            )
+                        });
+                    if let Some(issue) = &route_issue {
+                        let line = format!(
+                            "CRITICAL WARNING: [Route 35-1] Design is not fully routed: {issue}. \
+                             Bitstream generation is blocked until routing completes."
+                        );
+                        s.console.lines.push(ConsoleLine {
+                            text: line.clone(),
+                            sev: MsgSev::Critical,
+                        });
+                        s.runs.log_for_mut(kind).push(ConsoleLine {
+                            text: line,
+                            sev: MsgSev::Critical,
+                        });
+                    }
                     let detail = if art.summary.is_empty() {
                         format!("{name} finished with {errors} Errors")
                     } else {
                         format!("{name} finished with {errors} Errors · {}", art.summary)
                     };
-                    s.toasts.push(
-                        ToastKind::Success,
-                        &format!("{} complete", kind.title()),
-                        &detail,
-                    );
+                    match &route_issue {
+                        Some(issue) => s.toasts.push(
+                            ToastKind::Warning,
+                            "Routing incomplete",
+                            &format!("{name}: {issue}"),
+                        ),
+                        None => s.toasts.push(
+                            ToastKind::Success,
+                            &format!("{} complete", kind.title()),
+                            &detail,
+                        ),
+                    }
                 }
                 Err(e) => {
                     s.runs.record(kind, RunOutcome::Failed, None);
@@ -1347,8 +1387,20 @@ fn run_worker(
         return;
     }
     // Bitstream stage (`ide.rs::run_step_inner` Bitstream): frames/bytes from
-    // the packet stream, configured frames, and the session hash.
-    match session.write_bitstream(&dev) {
+    // the packet stream, configured frames, and the session hash. Like
+    // Vivado's RTSTAT DRCs, an incomplete route (unrouted nets or overused
+    // routing) blocks it: that bitstream would program a broken design.
+    // Pin/IOSTANDARD checks (UCIO/NSTD) stay reported DRCs, since Helion
+    // parts give unconstrained ports HAD defaults.
+    let bitgen = if signoff.unrouted_nets == 0 && signoff.overused_tiles == 0 {
+        session.write_bitstream(&dev)
+    } else {
+        Err(format!(
+            "routing incomplete ({} unrouted net(s), {} overused routing node(s))",
+            signoff.unrouted_nets, signoff.overused_tiles
+        ))
+    };
+    match bitgen {
         Ok(b) => {
             // Keep the real frames + packets (FAR table, Program Device);
             // cloned before `blinky_hash` reborrows `session`.
@@ -2465,6 +2517,53 @@ mod tests {
         );
     }
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn incomplete_route_is_a_critical_warning_not_a_clean_run() {
+        let mut s = AppState::demo();
+        s.flow.synth = RunStatus::NotStarted;
+        let art = RunArtifacts {
+            signoff: Some(RunSignoff {
+                bitgen_allowed: false,
+                summary: "bitgen_signoff allowed=false".into(),
+                unrouted: 3,
+                overused: 7,
+            }),
+            ..RunArtifacts::default()
+        };
+        deliver(&mut s, RunKind::Impl, RunEvent::Finished(Ok(art)));
+        assert_eq!(s.flow.impl_run, RunStatus::Complete);
+        assert_eq!(
+            s.flow.synth,
+            RunStatus::Complete,
+            "the impl run synthesized the design"
+        );
+        let crit: Vec<_> = s
+            .console
+            .lines
+            .iter()
+            .filter(|l| l.sev == MsgSev::Critical)
+            .collect();
+        assert_eq!(crit.len(), 1, "{crit:?}");
+        assert!(crit[0].text.contains("3 unrouted nets, 7 overused routing nodes"));
+        assert!(s.runs.log_for(RunKind::Impl).iter().any(|l| l.sev == MsgSev::Critical));
+    }
+
+    #[test]
+    fn clean_route_raises_no_routing_warning() {
+        let mut s = AppState::demo();
+        let art = RunArtifacts {
+            signoff: Some(RunSignoff {
+                bitgen_allowed: true,
+                summary: "bitgen_signoff allowed=true".into(),
+                unrouted: 0,
+                overused: 0,
+            }),
+            ..RunArtifacts::default()
+        };
+        deliver(&mut s, RunKind::Impl, RunEvent::Finished(Ok(art)));
+        assert!(!s.console.lines.iter().any(|l| l.sev == MsgSev::Critical));
+    }
 
     fn counter_source() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter.sv")

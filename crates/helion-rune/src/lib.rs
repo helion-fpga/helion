@@ -17,6 +17,7 @@
 pub mod analysis;
 pub mod bg;
 pub mod cli;
+pub mod showcase;
 pub mod doctor;
 pub mod ext_verbs;
 pub mod eco_tcl;
@@ -1484,7 +1485,7 @@ pub fn poll_all(s: &mut AppState, t: f64, tx: &mut rune::Tx) -> bool {
 
 pub fn app_spec() -> AppSpec<AppState> {
     AppSpec::<AppState> {
-        scenes: SCENES,
+        scenes: showcase::scenes(),
         min_size: Some((900.0, 600.0)),
         poll: Some(poll_all),
         on_key: Some(views::palette::app_key),

@@ -2762,21 +2762,7 @@ fn dispatch_host(
                 .unwrap_or(0);
             Ctl::Value(format!("route_design hops {hops}"))
         }
-        "write_bitstream" => {
-            if let Err(e) = impl_if_needed(s) {
-                return Ctl::err(line, e);
-            }
-            let n = s
-                .tcl
-                .session
-                .bitstream
-                .as_ref()
-                .map(|b| b.packets.len())
-                .unwrap_or(0);
-            // The Bitstream surface shows the console artifact too.
-            crate::views::bitstream::adopt_session_bitstream(s);
-            Ctl::Value(format!("write_bitstream {n} bytes"))
-        }
+        "write_bitstream" => cmd_write_bitstream(s, argv, line),
         "write_checkpoint" => {
             let ck = s.tcl.session.checkpoint();
             Ctl::Value(format!(
@@ -4503,6 +4489,64 @@ fn cmd_select_objects(s: &mut AppState, argv: &[String], line: usize, highlighte
 /// Run the implementation flow if needed, then STA with the console's
 /// `create_clock` state (empty = the 10 ns `clk` fallback, exactly like
 /// `Session::report_timing`). Mirrors `ensure_timing` (`design.rs:622`).
+/// `write_bitstream ?-force? ?file?`: implementation if needed, then the
+/// routing DRCs (unrouted/overused routing block it, as Vivado's RTSTAT
+/// checks do), then the packet stream, written to `file` when one
+/// is given (`-force` overwrites an existing file).
+fn cmd_write_bitstream(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
+    if let Err(e) = impl_if_needed(s) {
+        return Ctl::err(line, e);
+    }
+    let force = argv.iter().skip(1).any(|a| a == "-force");
+    let file = argv.iter().skip(1).find(|a| !a.starts_with('-')).cloned();
+    let dev = match helion_device::Device::load_part(&s.project.part) {
+        Ok(d) => d,
+        Err(e) => return Ctl::err(line, e),
+    };
+    if let (Some(design), Some(routed)) = (s.tcl.design.as_ref(), s.tcl.session.routed.as_ref()) {
+        let signoff = helion_drc::check_bitstream_signoff(
+            design,
+            routed,
+            &dev,
+            &helion_drc::SignoffConfig::default(),
+        );
+        if signoff.unrouted_nets > 0 || signoff.overused_tiles > 0 {
+            return Ctl::err(
+                line,
+                format!(
+                    "write_bitstream: [DRC RTSTAT] routing incomplete: {} unrouted net(s), \
+                     {} overused routing node(s) ({})",
+                    signoff.unrouted_nets,
+                    signoff.overused_tiles,
+                    signoff.summary_line()
+                ),
+            );
+        }
+    }
+    let Some(bits) = s.tcl.session.bitstream.clone() else {
+        return Ctl::err(line, "write_bitstream: no bitstream (implementation produced none)");
+    };
+    // The Bitstream surface shows the console artifact too.
+    crate::views::bitstream::adopt_session_bitstream(s);
+    let n = bits.packets.len();
+    match file {
+        Some(f) => {
+            let path = std::path::Path::new(&f);
+            if path.exists() && !force {
+                return Ctl::err(
+                    line,
+                    format!("write_bitstream: {f} exists (use -force to overwrite)"),
+                );
+            }
+            match std::fs::write(path, &bits.packets) {
+                Ok(()) => Ctl::Value(format!("write_bitstream {n} bytes -> {f}")),
+                Err(e) => Ctl::err(line, format!("write_bitstream: {f}: {e}")),
+            }
+        }
+        None => Ctl::Value(format!("write_bitstream {n} bytes")),
+    }
+}
+
 fn ensure_timing(
     s: &mut AppState,
     line: usize,
@@ -5281,7 +5325,10 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
         "opt_design" => ("opt_design", "dead-code sweep on the netlist"),
         "place_design" => ("place_design", "pack + PathFinder place"),
         "route_design" => ("route_design", "route the placed design"),
-        "write_bitstream" => ("write_bitstream", "generate the bitstream"),
+        "write_bitstream" => (
+            "write_bitstream ?-force? ?file.hbits?",
+            "signoff DRCs, then the bitstream (written to file when given)",
+        ),
         "write_checkpoint" => ("write_checkpoint", "snapshot the session (size + hash)"),
         "open_checkpoint" | "read_checkpoint" => (
             "open_checkpoint file.hck2|file.hckp",
@@ -6370,6 +6417,25 @@ fn xfunc(name: &str, args: &[XVal]) -> Result<XVal, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_bitstream_writes_the_file_and_refuses_to_clobber() {
+        let mut s = AppState::demo();
+        let sv = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter.sv");
+        let dir = std::env::temp_dir().join(format!("helion-rune-wbit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("counter.hbits");
+        let _ = std::fs::remove_file(&out);
+        eval_batch(&mut s, &format!("read_verilog {{{}}}", sv.display())).unwrap();
+        let v = eval_batch(&mut s, &format!("write_bitstream {{{}}}", out.display())).unwrap();
+        assert!(v.contains("->"), "{v}");
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(!bytes.is_empty());
+        let again = eval_batch(&mut s, &format!("write_bitstream {{{}}}", out.display()));
+        assert!(again.unwrap_err().contains("-force"));
+        eval_batch(&mut s, &format!("write_bitstream -force {{{}}}", out.display())).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use crate::state::RunStatus;
 
     fn lines(s: &AppState) -> Vec<&str> {
