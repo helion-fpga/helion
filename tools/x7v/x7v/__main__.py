@@ -6,13 +6,15 @@
   python3 -m x7v extract   <bit> -o netlist.v
   python3 -m x7v verify    <bit> --design N [--rtl a.vhd ...] [--top T] [--xdc X] [--golden G]
   python3 -m x7v corpus    <corpus.json> [--bit-key bit|golden] [--only a,b]
+  python3 -m x7v synthcheck <corpus.json> [--only a,b]  # Helion synthesis vs RTL
 """
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
-from . import bit, decode, encode, fasmio, netlist, verify
+from . import bit, decode, encode, fasmio, netlist, synthcheck, verify
 from .db import Db
 
 
@@ -26,6 +28,10 @@ def main(argv=None) -> int:
     p = sub.add_parser("verify"); p.add_argument("bit"); p.add_argument("--design", default="design")
     p.add_argument("--rtl", nargs="*"); p.add_argument("--top"); p.add_argument("--xdc"); p.add_argument("--golden")
     p.add_argument("--cycles", type=int, default=3000); p.add_argument("--workdir")
+    p = sub.add_parser("micro"); p.add_argument("files", nargs="+"); p.add_argument("--top", default="top")
+    p.add_argument("--cycles", type=int, default=1000); p.add_argument("--workdir", default="/tmp/x7v_micro")
+    p = sub.add_parser("synthcheck"); p.add_argument("corpus"); p.add_argument("--only")
+    p.add_argument("--cycles", type=int, default=3000); p.add_argument("--workdir", default="/tmp/x7v_synthcheck")
     p = sub.add_parser("corpus"); p.add_argument("corpus"); p.add_argument("--bit-key", default="bit")
     p.add_argument("--only"); p.add_argument("--cycles", type=int, default=3000); p.add_argument("--workdir")
     a = ap.parse_args(argv)
@@ -68,6 +74,26 @@ def main(argv=None) -> int:
         r = verify.verify(db, a.design, a.bit, a.rtl, a.top, a.xdc, a.golden, a.workdir, a.cycles)
         print(r.summary())
         return 0 if r.ok else 1
+    if a.cmd == "micro":
+        bad = 0
+        for f in a.files:
+            r = synthcheck.run_micro(f, a.top, f"{a.workdir}/{os.path.basename(f)}", a.cycles)
+            print(r.summary())
+            bad += not r.ok
+        print(f"micro: {len(a.files) - bad} pass, {bad} fail")
+        return 1 if bad else 0
+    if a.cmd == "synthcheck":
+        items = verify.load_corpus(a.corpus)
+        only = set(a.only.split(",")) if a.only else None
+        bad = 0
+        for it in items:
+            if only and it["name"] not in only:
+                continue
+            r = synthcheck.run(it["name"], it["rtl"], it["top"], it["xdc"], f"{a.workdir}/{it['name']}", a.cycles)
+            print(r.summary())
+            bad += not r.ok
+        print(f"synthcheck: {sum(1 for it in items if not only or it['name'] in only) - bad} pass, {bad} fail")
+        return 1 if bad else 0
     if a.cmd == "corpus":
         items = verify.load_corpus(a.corpus)
         only = set(a.only.split(",")) if a.only else None

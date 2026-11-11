@@ -207,18 +207,13 @@ impl Aig {
     where
         'x: 'e,
     {
-        let mut seen: HashSet<*const Expr<'x>> = HashSet::new();
-        let mut post: Vec<&'e Expr<'x>> = Vec::new();
-        let mut stack: Vec<&'e Expr<'x>> = vec![e];
-        while let Some(n) = stack.pop() {
-            if !seen.insert(n as *const Expr<'x>) {
-                continue;
-            }
-            post.push(n);
-            push_expr_children(n, &mut stack);
-        }
+        // Children strictly before parents (see `expr_post_order`): the old
+        // "pre-order, then reverse" order broke on shared subtrees and read
+        // a not-yet-built child as constant 0.
+        let mut unbounded = usize::MAX;
+        let post = expr_post_order(e, &mut unbounded).unwrap_or_default();
         let mut memo: HashMap<*const Expr<'x>, Lit> = HashMap::with_capacity(post.len() + 1);
-        for n in post.into_iter().rev() {
+        for n in post.into_iter() {
             // `self.pi` / `self.and_lit` mutate the AIG; memo holds child Lits.
             // Child Lits are always memoized before their parent in post-order;
             // the fallback is unreachable but keeps this panic-free.
@@ -600,6 +595,9 @@ struct Rtl<'a> {
     sva_conc: Vec<ConcPropAst<'a>>,
     /// Immediate SVA assertions (v3.0 subset), from procedural blocks.
     sva_imm: Vec<ImmAssertAst<'a>>,
+    /// Constant initial values of procedurally assigned variables
+    /// (`logic [3:0] q = 4'd5;`), per signal, LSB = bit 0.
+    var_inits: HashMap<&'a str, u128>,
 }
 
 thread_local! {
@@ -829,6 +827,26 @@ struct PackedStruct {
 
 fn skipped_funcs_clear() {
     SKIPPED_FUNCS.with(|s| s.borrow_mut().clear());
+}
+
+thread_local! {
+    /// Names declared `logic name = expr;` in the module being parsed. In
+    /// SystemVerilog that is a variable declaration assignment: it sets the
+    /// variable's initial value (Vivado: the register's INIT) and is NOT a
+    /// continuous assignment, unlike `wire name = expr;`.
+    static DECL_VAR_ASSIGNS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn decl_var_assigns_clear() {
+    DECL_VAR_ASSIGNS.with(|s| s.borrow_mut().clear());
+}
+
+fn decl_var_assigns_push(name: &str) {
+    DECL_VAR_ASSIGNS.with(|s| s.borrow_mut().push(name.to_string()));
+}
+
+fn decl_var_assigns_take() -> Vec<String> {
+    DECL_VAR_ASSIGNS.with(|s| std::mem::take(&mut *s.borrow_mut()))
 }
 
 fn skipped_funcs_push(name: String) {
@@ -1842,7 +1860,10 @@ fn flatten_leftover_signal(rtl: &Rtl) -> Option<String> {
     let arena = Bump::new();
     // Leaf ALU-style leftover: nested add/sub under mux/concat. One
     // flatten_cap, no bit-blast, synth_design within the QA 3s window.
-    if rtl.nbas.is_empty() {
+    // Nested arithmetic (add/sub over concat, mux, ...) is no longer a
+    // reason to refuse the module: `blast` lowers it in linear time. The
+    // old cap returned an empty design for `{1'b0,a} + {1'b0,b} + cin`.
+    if false && rtl.nbas.is_empty() {
         for (lhs, _bit, rhs) in &rtl.assigns {
             if rexpr_has_nested_arith(rhs) {
                 // bus + {zeros, wire bits} lowers via ripple_add_zpad — not a
@@ -3291,26 +3312,38 @@ fn stitch_assembled_child_ref(
 /// Map instance connections to absolute net names already present (or about to
 /// be present) in `dst`. `parent_prefix` is the hierarchical prefix of the
 /// parent module's locals; `parent_ports` maps parent port → dst net.
+/// Child port (and port *bit*) → absolute parent net. Child netlists are
+/// bit-blasted (`din_0`..`din_3`), so a name-level `din → din` entry alone
+/// leaves every bus bit unconnected (it fell through to the `inst_` prefix
+/// and nothing drove it). Bit `i` of child port `P` (width `wc`) maps to bit
+/// `i` of parent signal `N` (width `wp`), resolved through the parent's own
+/// port map so multi-level hierarchies stay connected.
 fn abs_inst_port_map(
     child: &Design,
+    child_rtl: &Rtl,
+    parent_rtl: &Rtl,
     inst: &Inst,
     parent_prefix: &str,
     parent_ports: &HashMap<String, String>,
 ) -> HashMap<String, String> {
     let raw = inst_port_map(child, inst);
-    let mut out: HashMap<String, String> = HashMap::with_capacity(raw.len());
-    for (port, net) in raw {
-        let abs = if let Some(p) = parent_ports.get(net) {
+    let abs = |net: &str| -> String {
+        if let Some(p) = parent_ports.get(net) {
             p.clone()
         } else if parent_prefix.is_empty() {
             net.to_string()
         } else {
-            let mut s = String::with_capacity(parent_prefix.len() + net.len());
-            s.push_str(parent_prefix);
-            s.push_str(net);
-            s
-        };
-        out.insert(port.to_string(), abs);
+            format!("{parent_prefix}{net}")
+        }
+    };
+    let mut out: HashMap<String, String> = HashMap::with_capacity(raw.len() * 2);
+    for (port, net) in raw {
+        out.insert(port.to_string(), abs(net));
+        let wc = sig_width(child_rtl, port).max(1);
+        let wp = sig_width(parent_rtl, net).max(1);
+        for i in 0..wc.min(wp).min(4096) {
+            out.insert(bit_name(port, wc, i), abs(&bit_name(net, wp, i)));
+        }
     }
     out
 }
@@ -3523,12 +3556,20 @@ fn emit_module_into(
 
     let mut self_ports: HashMap<String, String> = HashMap::new();
     for (pname, _, _) in &proto.ports {
-        if let Some(p) = port_map.get(*pname) {
-            self_ports.insert(pname.to_string(), p.clone());
-        } else if prefix.is_empty() {
-            self_ports.insert(pname.to_string(), pname.to_string());
-        } else {
-            self_ports.insert(pname.to_string(), format!("{prefix}{pname}"));
+        let w = sig_width(proto, pname).max(1);
+        let mut keys = vec![pname.to_string()];
+        if w > 1 {
+            keys.extend((0..w.min(4096)).map(|i| bit_name(pname, w, i)));
+        }
+        for key in keys {
+            let v = if let Some(p) = port_map.get(&key) {
+                p.clone()
+            } else if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}{key}")
+            };
+            self_ports.insert(key, v);
         }
     }
 
@@ -3563,7 +3604,7 @@ fn emit_module_into(
                 OwnForStitch::Fresh(d) => d,
                 OwnForStitch::Cached(a) => a.as_ref(),
             };
-            let cmap = abs_inst_port_map(child_ref, inst, prefix, &self_ports);
+            let cmap = abs_inst_port_map(child_ref, child_proto, proto, inst, prefix, &self_ports);
             let cs = soft_from_design(child_ref);
             stitch_own_into(dst, child_ref, &child_prefix, &cmap);
             cs
@@ -3571,7 +3612,7 @@ fn emit_module_into(
             match elaborate_rtl(child_proto, &ov) {
                 Ok(elab) => {
                     let cd = lower_own_cached(&elab)?;
-                    let cmap = abs_inst_port_map(&cd, inst, prefix, &self_ports);
+                    let cmap = abs_inst_port_map(&cd, &elab, proto, inst, prefix, &self_ports);
                     let cs = soft_from_design(&cd);
                     stitch_own_into(dst, &cd, &child_prefix, &cmap);
                     cs
@@ -3592,7 +3633,7 @@ fn emit_module_into(
                 }
                 shell
             };
-            let cmap = abs_inst_port_map(&port_shell, inst, prefix, &self_ports);
+            let cmap = abs_inst_port_map(&port_shell, child_proto, proto, inst, prefix, &self_ports);
             emit_module_into(mods, inst.module, &child_prefix, &cmap, dst, visiting)?
         };
         merge_child_soft(&mut summary, child_sum, name, inst);
@@ -3613,6 +3654,13 @@ fn assemble_module(
     let mut port_map: HashMap<String, String> = HashMap::new();
     for (n, _, _) in &proto.ports {
         port_map.insert(n.to_string(), n.to_string());
+        let w = sig_width(proto, n).max(1);
+        if w > 1 {
+            for i in 0..w.min(4096) {
+                let b = bit_name(n, w, i);
+                port_map.insert(b.clone(), b);
+            }
+        }
     }
     let mut d = Design::new(proto.module);
     for (n, dir, _) in &proto.ports {
@@ -5824,7 +5872,42 @@ fn parse_seq_block<'a>(
             break;
         }
     }
-    Ok((v, imms))
+    Ok((merge_reassigned(p, v), imms))
+}
+
+/// Merge statements of signals assigned more than once in one block, in
+/// order: a later assignment overrides an earlier one, and a conditional
+/// later one keeps the earlier value where it does not assign
+/// (`done <= 0; if (c) done <= 1;` pulses instead of latching). Each merged
+/// group is emitted at the position of its last statement, so blocking
+/// chains (`t = a; y = t;`) keep their order; signals assigned once stay in
+/// their original (whole-vector) form for the recognizers downstream.
+fn merge_reassigned<'a>(p: &P<'a>, v: Vec<Nba<'a>>) -> Vec<Nba<'a>> {
+    let mut counts: HashMap<&'a str, usize> = HashMap::new();
+    for (l, _, _) in &v {
+        *counts.entry(*l).or_insert(0) += 1;
+    }
+    if counts.values().all(|&c| c == 1) {
+        return v;
+    }
+    let mut last: HashMap<&'a str, usize> = HashMap::new();
+    for (i, (l, _, _)) in v.iter().enumerate() {
+        last.insert(*l, i);
+    }
+    let mut groups: HashMap<&'a str, Vec<Nba<'a>>> = HashMap::new();
+    let mut out = Vec::with_capacity(v.len());
+    for (i, stmt) in v.into_iter().enumerate() {
+        let l = stmt.0;
+        if counts[l] == 1 {
+            out.push(stmt);
+            continue;
+        }
+        groups.entry(l).or_default().push(stmt);
+        if last[l] == i {
+            out.extend(normalize_nbas(p, groups.remove(l).unwrap_or_default()));
+        }
+    }
+    out
 }
 
 /// Parse for-loop step: `i++`, `i += N`, or `i = i + N` (default step 1).
@@ -6440,6 +6523,46 @@ where
 }
 
 /// Push the immediate children of an `Expr` (boolean cone) for iterative DFS.
+/// Nodes of an `Expr` DAG in true post-order: every node after all of its
+/// children, each node once. Expr trees share subtrees by pointer, so the
+/// "pre-order, then reverse" shortcut is wrong (a parent can precede a child
+/// first reached through another parent). `budget` counts visited entries
+/// (None when exhausted).
+fn expr_post_order<'a, 'e>(e: &'e Expr<'a>, budget: &mut usize) -> Option<Vec<&'e Expr<'a>>>
+where
+    'a: 'e,
+{
+    let mut emitted: HashSet<*const Expr<'a>> = HashSet::new();
+    let mut post: Vec<&'e Expr<'a>> = Vec::new();
+    let mut stack: Vec<(&'e Expr<'a>, bool)> = vec![(e, false)];
+    let mut kids: Vec<&'e Expr<'a>> = Vec::new();
+    while let Some((n, expanded)) = stack.pop() {
+        let p = n as *const Expr<'a>;
+        if emitted.contains(&p) {
+            continue;
+        }
+        if expanded {
+            emitted.insert(p);
+            post.push(n);
+            continue;
+        }
+        // One unit of budget per node expansion (the old traversal's rate).
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        stack.push((n, true));
+        kids.clear();
+        push_expr_children(n, &mut kids);
+        for &k in kids.iter().rev() {
+            if !emitted.contains(&(k as *const Expr<'a>)) {
+                stack.push((k, false));
+            }
+        }
+    }
+    Some(post)
+}
+
 fn push_expr_children<'a, 'e>(e: &'e Expr<'a>, stack: &mut Vec<&'e Expr<'a>>)
 where
     'a: 'e,
@@ -6561,10 +6684,24 @@ fn fold_blocking_assigns<'a>(stmts: Vec<Nba<'a>>, arena: &'a Bump, module: &str)
 fn normalize_nbas<'a>(p: &P<'a>, stmts: Vec<Nba<'a>>) -> Vec<Nba<'a>> {
     let mut order: Vec<(&'a str, Option<usize>)> = Vec::new();
     let mut map: HashMap<(&'a str, Option<usize>), RExpr<'a>> = HashMap::new();
+    let arena = p.arena;
     let put = |order: &mut Vec<(&'a str, Option<usize>)>,
                map: &mut HashMap<(&'a str, Option<usize>), RExpr<'a>>,
                key: (&'a str, Option<usize>),
                rhs: RExpr<'a>| {
+        // Sequential override: a later assignment's hold (the branch that
+        // does not assign) keeps the value this block assigned earlier.
+        let rhs = match map.get(&key) {
+            Some(prev) => {
+                let marker = format!("{HOLD_MARK}{}", key.0);
+                if rexpr_mentions(&rhs, &marker) {
+                    subst_hold(&rhs, &marker, key.1, prev, arena)
+                } else {
+                    rhs
+                }
+            }
+            None => rhs,
+        };
         if !map.contains_key(&key) {
             order.push(key);
         }
@@ -7224,7 +7361,7 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
                 .iter()
                 .find(|(l, b, _)| l == &lhs && b == &bit)
                 .map(|(_, _, r)| r.clone())
-                .unwrap_or_else(|| RExpr::Ident(p.arena.alloc_str(&lhs)));
+                .unwrap_or_else(|| hold_value(p.arena, &lhs, bit));
             out.push((
                 lhs,
                 bit,
@@ -7240,7 +7377,7 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
                 bit,
                 RExpr::Mux(
                     p.arena.alloc(cond.clone()),
-                    p.arena.alloc(RExpr::Ident(p.arena.alloc_str(&lhs))),
+                    p.arena.alloc(hold_value(p.arena, &lhs, bit)),
                     p.arena.alloc(rhs),
                 ),
             ));
@@ -7303,7 +7440,7 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
                     .chain(def.iter())
                     .find(|(l, b, _)| l == &lhs && b == &bit)
                     .map(|(_, _, r)| r.clone())
-                    .unwrap_or_else(|| RExpr::Ident(p.arena.alloc_str(&lhs)));
+                    .unwrap_or_else(|| hold_value(p.arena, &lhs, bit));
                 if let Some(existing) = out.iter_mut().find(|(l, b, _)| l == &lhs && b == &bit) {
                     existing.2 = RExpr::Mux(
                         p.arena.alloc(cond.clone()),
@@ -7328,6 +7465,83 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
     }
     let nbas = parse_assign_nbas(p)?;
     Ok((SeqItemOut::Nbas(nbas), Vec::new()))
+}
+
+const HOLD_MARK: &str = "\u{1}hold\u{1}";
+
+/// Replace the hold marker of `(lhs, bit)` in `e` with `val`.
+fn subst_hold<'a>(e: &RExpr<'a>, marker: &str, bit: Option<usize>, val: &RExpr<'a>, arena: &'a Bump) -> RExpr<'a> {
+    match e {
+        RExpr::Ident(m) if *m == marker && matches!(bit, None | Some(0)) => val.clone(),
+        RExpr::Shr(a, k) if matches!(**a, RExpr::Ident(m) if m == marker)
+            && matches!(**k, RExpr::Const { val: kv, .. } if Some(kv as usize) == bit) =>
+        {
+            val.clone()
+        }
+        _ if !rexpr_mentions(e, marker) => e.clone(),
+        _ => map_rexpr_children(e, &mut |c| subst_hold(c, marker, bit, val, arena), arena),
+    }
+}
+
+fn rexpr_mentions(e: &RExpr<'_>, name: &str) -> bool {
+    let mut stack: Vec<&RExpr<'_>> = vec![e];
+    while let Some(n) = stack.pop() {
+        match n {
+            RExpr::Ident(m) if *m == name => return true,
+            _ => push_rexpr_children(n, &mut stack),
+        }
+    }
+    false
+}
+
+/// Turn every remaining hold marker into the register's own value.
+fn resolve_holds<'a>(e: &RExpr<'a>, arena: &'a Bump) -> RExpr<'a> {
+    let mut found = false;
+    let mut stack: Vec<&RExpr<'_>> = vec![e];
+    while let Some(n) = stack.pop() {
+        match n {
+            RExpr::Ident(m) if m.starts_with(HOLD_MARK) => {
+                found = true;
+                break;
+            }
+            _ => push_rexpr_children(n, &mut stack),
+        }
+    }
+    if !found {
+        return e.clone();
+    }
+    match e {
+        RExpr::Ident(m) if m.starts_with(HOLD_MARK) => {
+            RExpr::Ident(arena.alloc_str(&m[HOLD_MARK.len()..]))
+        }
+        _ => map_rexpr_children(e, &mut |c| resolve_holds(c, arena), arena),
+    }
+}
+
+fn resolve_holds_all<'a>(v: Vec<Nba<'a>>, arena: &'a Bump) -> Vec<Nba<'a>> {
+    v.into_iter().map(|(l, b, r)| (l, b, resolve_holds(&r, arena))).collect()
+}
+
+/// The value a register keeps when a branch does not assign it. Per-bit
+/// assignments (`bit = Some(i)`) read bit 0 of their right-hand side, and
+/// `normalize_nbas` supplies `rhs >> i` for bit `i`; the hold must follow the
+/// same convention (`lhs >> i`). A bare `lhs` made every bit hold `lhs[0]`:
+/// `if (r != 9) r <= r + 1;` loaded 15 at r = 9 instead of keeping 9.
+/// Encoded unpacked-word bits keep the whole-signal form, as before.
+fn hold_value<'a>(arena: &'a Bump, lhs: &str, bit: Option<usize>) -> RExpr<'a> {
+    // A marker, not the register itself: if an earlier statement in the same
+    // block assigned `lhs` (`done <= 0; if (c) done <= 1;`), the branch that
+    // does not assign must keep THAT value, not the register's old one.
+    // `normalize_nbas` substitutes it; `resolve_holds` turns any marker left
+    // at the end of the block into the plain register hold.
+    let name = arena.alloc_str(&format!("{HOLD_MARK}{lhs}"));
+    match bit {
+        Some(i) if i > 0 && decode_unpacked_bit(i).is_none() => RExpr::Shr(
+            arena.alloc(RExpr::Ident(name)),
+            arena.alloc(RExpr::Const { val: i as u128, width: 32, care: u128::MAX }),
+        ),
+        _ => RExpr::Ident(name),
+    }
 }
 
 fn skip_until_kw<'a>(p: &mut P<'a>, kw: &str) {
@@ -8722,6 +8936,7 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
     let mut sva_conc: Vec<ConcPropAst<'a>> = Vec::new();
     let mut sva_imm: Vec<ImmAssertAst<'a>> = Vec::new();
     skipped_funcs_clear();
+    decl_var_assigns_clear();
     if parse_module_items(
         &mut p,
         &mut ports,
@@ -8809,6 +9024,30 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
         assigns.clear();
         mem_inits.clear();
     }
+    // `logic name = expr;` on a variable that an always block also assigns
+    // is its initial value, not a second driver. Turning it into a
+    // continuous assign shorted a constant LUT onto every register Q net.
+    // A variable nothing else assigns keeps the assign (common shorthand
+    // for a constant or a wire-like name).
+    let nbas = resolve_holds_all(nbas, p.arena);
+    let mut assigns = resolve_holds_all(assigns, p.arena);
+    let mut var_inits: HashMap<&'a str, u128> = HashMap::new();
+    for name in decl_var_assigns_take() {
+        if !nbas.iter().any(|(l, _, _)| *l == name.as_str()) {
+            continue;
+        }
+        if let Some(pos) = assigns.iter().position(|(l, b, _)| *l == name.as_str() && b.is_none()) {
+            let (l, _, rhs) = assigns.remove(pos);
+            match rexpr_const_val(&rhs) {
+                Some(v) => {
+                    var_inits.insert(l, v);
+                }
+                None => note_skip(format!(
+                    "diagnostic nonconst_initializer module={module} signal={l} (initializer is not a constant; register starts at 0)"
+                )),
+            }
+        }
+    }
     let toks = p.t[tok_start..p.i].to_vec();
     Ok(Rtl {
         module,
@@ -8823,6 +9062,7 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
         negedge_writes,
         sva_conc,
         sva_imm,
+        var_inits,
     })
 }
 
@@ -9325,7 +9565,11 @@ fn parse_module_items<'a>(
             if is_signed {
                 note_signed(p, n);
             }
+            let had_assign = matches!(p.peek(), Some(Tok::Sym('=')));
             push_decl_assign(p, assigns, n, net_assign);
+            if had_assign && decl_kw == "logic" {
+                decl_var_assigns_push(n);
+            }
             while p.eat_sym(',') {
                 if let Ok(n2) = p.ident() {
                     if let Some(sig) = signals.iter_mut().find(|s| s.name == n2) {
@@ -9539,6 +9783,7 @@ fn parse_module_items<'a>(
             let body_start = p.i;
             match parse_seq_block(&mut p, block) {
                 Ok((stmts, simms)) => {
+                    let stmts = resolve_holds_all(stmts, p.arena);
                     sva_imm.extend(simms);
                     if combo {
                         // `always @(*)` next-state etc. → comb assigns, not FFs.
@@ -10456,9 +10701,15 @@ fn rexpr_to_bit<'a>(e: &RExpr<'_>, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Re
                     }
                     RExpr::Ident(s) => {
                         let w = sig_width(rtl, s);
+                        // Past the vector's width an unsigned value is 0
+                        // (it used to repeat the MSB, sign-extending).
                         memo.insert(
                             key,
-                            Expr::Var(arena.alloc_str(&(bit_name(s, w, bit.min(w.saturating_sub(1)))))),
+                            if bit < w.max(1) {
+                                Expr::Var(arena.alloc_str(&(bit_name(s, w, bit))))
+                            } else {
+                                Expr::Const(false)
+                            },
                         );
                     }
                     RExpr::Bit(s, i) => {
@@ -10663,15 +10914,27 @@ fn rexpr_to_bit<'a>(e: &RExpr<'_>, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Re
                             stack.push(ToBitTask::Visit(*a, bit));
                         }
                     }
-                    RExpr::Add(a, b) => {
-                        memo.insert(key, adder_sum_bit(*a, *b, rtl, bit, arena)?);
+                    RExpr::Add(..) | RExpr::Sub(..) | RExpr::Mul(..) => {
+                        // Low `bit + 1` bits of the word-level result; see `blast`.
+                        let v = blast(n, rtl, bit + 1, arena)?;
+                        memo.insert(key, v[bit].clone());
                     }
-                    RExpr::Sub(a, b) => {
-                        memo.insert(key, sub_diff_bit(*a, *b, rtl, bit, arena)?);
-                    }
-                    RExpr::Mul(_, _) => return Err("mul is a DSP primitive, not a LUT cone".into()),
                     RExpr::Mux(c, t, f) => {
-                        let ck = tobit_key(*c, 0);
+                        // A condition is true when any of its bits is set
+                        // (`x ? a : b` with a multi-bit x). Its truth value
+                        // gets its own memo slot (bit = usize::MAX) so it
+                        // never aliases "bit 0 of c".
+                        let cw = rexpr_width(c, rtl).max(1);
+                        let ck = if cw > 1 {
+                            let k = (*c as *const RExpr<'_>, usize::MAX);
+                            if !memo.contains_key(&k) {
+                                let cv = blast(c, rtl, cw, arena)?;
+                                memo.insert(k, bl_reduce_or(arena, &cv));
+                            }
+                            k
+                        } else {
+                            tobit_key(*c, 0)
+                        };
                         let tk = tobit_key(*t, bit);
                         let fk = tobit_key(*f, bit);
                         stack.push(ToBitTask::Build {
@@ -10685,28 +10948,12 @@ fn rexpr_to_bit<'a>(e: &RExpr<'_>, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Re
                             }
                         }
                     }
-                    RExpr::Eq(a, b) => {
+                    RExpr::Eq(..) | RExpr::Ne(..) | RExpr::Lt(..) => {
                         if bit != 0 {
                             memo.insert(key, Expr::Const(false));
                         } else {
-                            memo.insert(key, cmp_eq_bits(*a, *b, rtl, true, arena)?);
-                        }
-                    }
-                    RExpr::Ne(a, b) => {
-                        if bit != 0 {
-                            memo.insert(key, Expr::Const(false));
-                        } else {
-                            memo.insert(
-                                key,
-                                Expr::Not(arena.alloc(cmp_eq_bits(*a, *b, rtl, true, arena)?)),
-                            );
-                        }
-                    }
-                    RExpr::Lt(a, b) => {
-                        if bit != 0 {
-                            memo.insert(key, Expr::Const(false));
-                        } else {
-                            memo.insert(key, lt_bits(*a, *b, rtl, arena)?);
+                            let v = blast(n, rtl, 1, arena)?;
+                            memo.insert(key, v[0].clone());
                         }
                     }
                     RExpr::Call { name, .. } => {
@@ -10814,23 +11061,10 @@ fn lut6_from_bool_cone(expr: &Expr) -> Option<(u64, Vec<String>)> {
     where
         'x: 'e,
     {
-        let mut seen: HashSet<*const Expr<'x>> = HashSet::new();
-        let mut post: Vec<&'e Expr<'x>> = Vec::new();
-        let mut stack: Vec<&'e Expr<'x>> = vec![e];
-        while let Some(n) = stack.pop() {
-            if *budget == 0 {
-                return None;
-            }
-            *budget -= 1;
-            if !seen.insert(n as *const Expr<'x>) {
-                continue;
-            }
-            post.push(n);
-            push_expr_children(n, &mut stack);
-        }
+        let post = expr_post_order(e, budget)?;
         let mut memo: HashMap<*const Expr<'x>, Option<bool>> =
             HashMap::with_capacity(post.len() + 1);
-        for n in post.into_iter().rev() {
+        for n in post.into_iter() {
             let v = |p: *const Expr<'x>| -> Option<bool> {
                 memo.get(&p).copied().flatten()
             };
@@ -10970,6 +11204,318 @@ fn const_care_of(e: &RExpr<'_>) -> u128 {
         RExpr::Const { care, .. } => *care,
         _ => u128::MAX,
     }
+}
+
+
+/// Word-level bit-blaster: lower an `RExpr` to `width` bit expressions at
+/// once, LSB first, memoized per (node, width) within one call.
+///
+/// The per-bit path (`rexpr_to_bit` with `adder_sum_bit`) rebuilt the whole
+/// carry chain for every output bit, re-entering operands with a fresh memo,
+/// so nested arithmetic grew exponentially and was capped ("adder nesting too
+/// deep", "cmp width too wide", module-wide `flatten_cap`): the capped module
+/// synthesized to nothing. Here every node is lowered once: one ripple chain
+/// per adder, shift-and-add for multiplies, comparisons over whole vectors.
+///
+/// Operands are zero-extended to the requested width (unsigned semantics;
+/// signedness is not tracked on `Rtl`). Node kinds without a vector rule fall
+/// back to `rexpr_to_bit` bit by bit.
+fn blast<'a>(e: &RExpr<'_>, rtl: &Rtl, width: usize, arena: &'a Bump) -> Result<Vec<Expr<'a>>, String> {
+    let mut memo: HashMap<(usize, usize), Vec<Expr<'a>>> = HashMap::new();
+    blast_rec(e, rtl, width, arena, &mut memo, 0)
+}
+
+fn bl_and<'a>(arena: &'a Bump, a: Expr<'a>, b: Expr<'a>) -> Expr<'a> {
+    match (&a, &b) {
+        (Expr::Const(false), _) | (_, Expr::Const(false)) => Expr::Const(false),
+        (Expr::Const(true), _) => b,
+        (_, Expr::Const(true)) => a,
+        _ => Expr::And(arena.alloc(a), arena.alloc(b)),
+    }
+}
+
+fn bl_or<'a>(arena: &'a Bump, a: Expr<'a>, b: Expr<'a>) -> Expr<'a> {
+    match (&a, &b) {
+        (Expr::Const(true), _) | (_, Expr::Const(true)) => Expr::Const(true),
+        (Expr::Const(false), _) => b,
+        (_, Expr::Const(false)) => a,
+        _ => Expr::Or(arena.alloc(a), arena.alloc(b)),
+    }
+}
+
+fn bl_xor<'a>(arena: &'a Bump, a: Expr<'a>, b: Expr<'a>) -> Expr<'a> {
+    match (&a, &b) {
+        (Expr::Const(false), _) => b,
+        (_, Expr::Const(false)) => a,
+        (Expr::Const(true), _) => bl_not(arena, b),
+        (_, Expr::Const(true)) => bl_not(arena, a),
+        _ => Expr::Xor(arena.alloc(a), arena.alloc(b)),
+    }
+}
+
+fn bl_not<'a>(arena: &'a Bump, a: Expr<'a>) -> Expr<'a> {
+    match a {
+        Expr::Const(v) => Expr::Const(!v),
+        Expr::Not(x) => x.clone(),
+        other => Expr::Not(arena.alloc(other)),
+    }
+}
+
+fn bl_mux<'a>(arena: &'a Bump, c: &Expr<'a>, t: Expr<'a>, f: Expr<'a>) -> Expr<'a> {
+    match c {
+        Expr::Const(true) => t,
+        Expr::Const(false) => f,
+        _ => {
+            let ct = bl_and(arena, c.clone(), t);
+            let cf = bl_and(arena, bl_not(arena, c.clone()), f);
+            bl_or(arena, ct, cf)
+        }
+    }
+}
+
+/// Ripple add `a + b + cin` over equal-length vectors; returns (sum, cout).
+fn bl_add<'a>(arena: &'a Bump, a: &[Expr<'a>], b: &[Expr<'a>], cin: Expr<'a>) -> (Vec<Expr<'a>>, Expr<'a>) {
+    let mut c = cin;
+    let mut out = Vec::with_capacity(a.len());
+    for i in 0..a.len() {
+        let axb = bl_xor(arena, a[i].clone(), b[i].clone());
+        out.push(bl_xor(arena, axb.clone(), c.clone()));
+        let g = bl_and(arena, a[i].clone(), b[i].clone());
+        let pc = bl_and(arena, axb, c);
+        c = bl_or(arena, g, pc);
+    }
+    (out, c)
+}
+
+fn bl_reduce_or<'a>(arena: &'a Bump, v: &[Expr<'a>]) -> Expr<'a> {
+    v.iter().cloned().fold(Expr::Const(false), |acc, x| bl_or(arena, acc, x))
+}
+
+fn bl_const_val(v: &[Expr<'_>]) -> Option<u128> {
+    let mut out = 0u128;
+    for (i, b) in v.iter().enumerate() {
+        match b {
+            Expr::Const(true) if i < 128 => out |= 1u128 << i,
+            Expr::Const(false) => {}
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn blast_rec<'a>(
+    e: &RExpr<'_>,
+    rtl: &Rtl,
+    width: usize,
+    arena: &'a Bump,
+    memo: &mut HashMap<(usize, usize), Vec<Expr<'a>>>,
+    depth: usize,
+) -> Result<Vec<Expr<'a>>, String> {
+    if depth > 4096 {
+        return Err("expression nesting too deep to bit-blast".into());
+    }
+    if width > 4096 {
+        return Err("expression too wide to bit-blast".into());
+    }
+    let key = (e as *const RExpr<'_> as usize, width);
+    if let Some(v) = memo.get(&key) {
+        return Ok(v.clone());
+    }
+    let zero = || Expr::Const(false);
+    let mut sub = |x: &RExpr<'_>, w: usize, memo: &mut HashMap<(usize, usize), Vec<Expr<'a>>>| blast_rec(x, rtl, w, arena, memo, depth + 1);
+    let natural = |x: &RExpr<'_>| rexpr_width(x, rtl).max(1);
+    let v: Vec<Expr<'a>> = match e {
+        RExpr::Const { val, .. } => (0..width)
+            .map(|i| Expr::Const(i < 128 && (val >> i) & 1 == 1))
+            .collect(),
+        RExpr::Ident(s) if sig_depth(rtl, s) == 0 => {
+            let w = sig_width(rtl, s).max(1);
+            (0..width)
+                .map(|i| if i < w { Expr::Var(arena.alloc_str(&bit_name(s, w, i))) } else { zero() })
+                .collect()
+        }
+        RExpr::Bit(s, idx) if sig_depth(rtl, s) == 0 => {
+            let w = sig_width(rtl, s).max(1);
+            (0..width)
+                .map(|i| {
+                    if i == 0 && *idx < w {
+                        Expr::Var(arena.alloc_str(&bit_name(s, w, *idx)))
+                    } else {
+                        zero()
+                    }
+                })
+                .collect()
+        }
+        RExpr::Range(s, lo, hi) if sig_depth(rtl, s) == 0 => {
+            let w = sig_width(rtl, s).max(1);
+            (0..width)
+                .map(|i| {
+                    let j = lo + i;
+                    if j <= *hi && j < w {
+                        Expr::Var(arena.alloc_str(&bit_name(s, w, j)))
+                    } else {
+                        zero()
+                    }
+                })
+                .collect()
+        }
+        RExpr::Concat(parts) => {
+            let mut bits: Vec<Expr<'a>> = Vec::new();
+            for p in parts.iter().rev() {
+                if bits.len() >= width {
+                    break;
+                }
+                let pw = natural(p);
+                bits.extend(sub(p, pw, memo)?);
+            }
+            bits.resize(width, zero());
+            bits.truncate(width);
+            bits
+        }
+        RExpr::Not(x) => {
+            // Bitwise NOT of the operand extended to the context width.
+            let xv = sub(x, width, memo)?;
+            xv.into_iter().map(|b| bl_not(arena, b)).collect()
+        }
+        RExpr::And(a, b) | RExpr::Or(a, b) | RExpr::Xor(a, b) => {
+            let av = sub(a, width, memo)?;
+            let bv = sub(b, width, memo)?;
+            av.into_iter()
+                .zip(bv)
+                .map(|(x, y)| match e {
+                    RExpr::And(..) => bl_and(arena, x, y),
+                    RExpr::Or(..) => bl_or(arena, x, y),
+                    _ => bl_xor(arena, x, y),
+                })
+                .collect()
+        }
+        RExpr::Add(a, b) => {
+            let av = sub(a, width, memo)?;
+            let bv = sub(b, width, memo)?;
+            bl_add(arena, &av, &bv, zero()).0
+        }
+        RExpr::Sub(a, b) => {
+            // a - b = a + ~b + 1
+            let av = sub(a, width, memo)?;
+            let bv: Vec<Expr<'a>> = sub(b, width, memo)?.into_iter().map(|x| bl_not(arena, x)).collect();
+            bl_add(arena, &av, &bv, Expr::Const(true)).0
+        }
+        RExpr::Mul(a, b) => {
+            let av = sub(a, width, memo)?;
+            let bv = sub(b, width, memo)?;
+            let mut acc: Vec<Expr<'a>> = vec![zero(); width];
+            for j in 0..width {
+                if matches!(bv[j], Expr::Const(false)) {
+                    continue;
+                }
+                let pp: Vec<Expr<'a>> = (0..width)
+                    .map(|i| if i >= j { bl_and(arena, av[i - j].clone(), bv[j].clone()) } else { zero() })
+                    .collect();
+                acc = bl_add(arena, &acc, &pp, zero()).0;
+            }
+            acc
+        }
+        RExpr::Shl(a, sh) | RExpr::Shr(a, sh) | RExpr::Ashr(a, sh) => {
+            let aw = natural(a).max(width);
+            let av = sub(a, aw, memo)?;
+            let shw = natural(sh);
+            let shv = sub(sh, shw, memo)?;
+            let fill = match e {
+                RExpr::Ashr(..) => av.get(natural(a) - 1).cloned().unwrap_or_else(zero),
+                _ => zero(),
+            };
+            let shift_by = |v: &[Expr<'a>], k: usize, left: bool| -> Vec<Expr<'a>> {
+                (0..v.len())
+                    .map(|i| {
+                        if left {
+                            if i >= k { v[i - k].clone() } else { zero() }
+                        } else if i + k < v.len() {
+                            v[i + k].clone()
+                        } else {
+                            fill.clone()
+                        }
+                    })
+                    .collect()
+            };
+            let left = matches!(e, RExpr::Shl(..));
+            let mut cur = av;
+            if let Some(k) = bl_const_val(&shv) {
+                let k = k.min(cur.len() as u128) as usize;
+                cur = shift_by(&cur, k, left);
+            } else {
+                // Barrel shifter: stage s shifts by 2^s when shift bit s is set.
+                for (s, bit) in shv.iter().enumerate() {
+                    let k = 1usize.checked_shl(s as u32).unwrap_or(usize::MAX).min(cur.len());
+                    let shifted = shift_by(&cur, k, left);
+                    cur = cur
+                        .into_iter()
+                        .zip(shifted)
+                        .map(|(x, y)| bl_mux(arena, bit, y, x))
+                        .collect();
+                }
+            }
+            cur.resize(width, zero());
+            cur.truncate(width);
+            cur
+        }
+        RExpr::Mux(c, t, f) => {
+            let cv = sub(c, natural(c), memo)?;
+            let cond = bl_reduce_or(arena, &cv);
+            let tv = sub(t, width, memo)?;
+            let fv = sub(f, width, memo)?;
+            tv.into_iter().zip(fv).map(|(x, y)| bl_mux(arena, &cond, x, y)).collect()
+        }
+        RExpr::Eq(a, b) | RExpr::Ne(a, b) | RExpr::Lt(a, b) => {
+            let w = natural(a).max(natural(b));
+            let av = sub(a, w, memo)?;
+            let bv = sub(b, w, memo)?;
+            let r = match e {
+                RExpr::Lt(..) => {
+                    // a < b (unsigned): borrow out of a - b.
+                    let nb: Vec<Expr<'a>> = bv.into_iter().map(|x| bl_not(arena, x)).collect();
+                    let (_, carry) = bl_add(arena, &av, &nb, Expr::Const(true));
+                    bl_not(arena, carry)
+                }
+                _ => {
+                    let care = const_care_of(a) & const_care_of(b);
+                    let mut eq = Expr::Const(true);
+                    for i in 0..w {
+                        if i < 128 && (care >> i) & 1 == 0 {
+                            continue;
+                        }
+                        let x = bl_not(arena, bl_xor(arena, av[i].clone(), bv[i].clone()));
+                        eq = bl_and(arena, eq, x);
+                    }
+                    if matches!(e, RExpr::Ne(..)) { bl_not(arena, eq) } else { eq }
+                }
+            };
+            let mut out = vec![r];
+            out.resize(width, zero());
+            out.truncate(width);
+            out
+        }
+        RExpr::RedOr(x) | RExpr::RedAnd(x) | RExpr::RedXor(x) => {
+            let xv = sub(x, natural(x), memo)?;
+            let r = match e {
+                RExpr::RedOr(_) => bl_reduce_or(arena, &xv),
+                RExpr::RedAnd(_) => xv.into_iter().fold(Expr::Const(true), |acc, y| bl_and(arena, acc, y)),
+                _ => xv.into_iter().fold(Expr::Const(false), |acc, y| bl_xor(arena, acc, y)),
+            };
+            let mut out = vec![r];
+            out.resize(width, zero());
+            out.truncate(width);
+            out
+        }
+        _ => {
+            let mut out = Vec::with_capacity(width);
+            for i in 0..width {
+                out.push(rexpr_to_bit(e, rtl, i, arena)?);
+            }
+            out
+        }
+    };
+    memo.insert(key, v.clone());
+    Ok(v)
 }
 
 fn adder_sum_bit<'a>(a: &RExpr<'_>, b: &RExpr<'_>, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Result<Expr<'a>, String> {
@@ -11552,7 +12098,11 @@ fn width_step<'x>(
 ) -> Option<usize> {
     let child = |p: *const RExpr<'x>| -> Option<usize> { memo.get(&p).copied().flatten() };
     match n {
-        RExpr::Ident(s) | RExpr::Bit(s, _) => Some(sig_width(rtl, s)),
+        RExpr::Ident(s) => Some(sig_width(rtl, s)),
+        // `v[i]` is one bit; on an unpacked array `mem[i]` it is one word.
+        // Taking the whole vector's width here made `{q[2:0], din[3]}` four
+        // bits too wide, so a left shift read din where it should read q.
+        RExpr::Bit(s, _) => Some(if sig_depth(rtl, s) > 0 { sig_width(rtl, s) } else { 1 }),
         RExpr::Range(_, lo, hi) => range_span(*lo, *hi),
         RExpr::IndexPart { name, width, .. } => {
             if sig_depth(rtl, name) > 0 {
@@ -11819,7 +12369,26 @@ fn emit_mac27(d: &mut Design, cell: String, rhs: &RExpr<'_>, lhs: &str) {
     d.connect(lhs, &cell, "P");
 }
 
+thread_local! {
+    static DSP_INFER: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Map multiplies to `Mac27` DSP cells (default, for targets that implement
+/// them) or lower them to LUT logic (`false`). The Xilinx 7-series backend
+/// has no DSP48 support yet: a `Mac27` there is logic that silently vanishes,
+/// so its flow turns inference off and multiplies bit-blast to LUTs.
+pub fn set_dsp_inference(on: bool) {
+    DSP_INFER.with(|c| c.set(on));
+}
+
+fn dsp_inference() -> bool {
+    DSP_INFER.with(|c| c.get())
+}
+
 fn is_mac_rhs(e: &RExpr<'_>) -> bool {
+    if !dsp_inference() {
+        return false;
+    }
     // Transient rewrite; the arena dies with this call.
     let arena = Bump::new();
     let e = normalize_mul_operands(e, &arena);
@@ -12295,9 +12864,9 @@ fn try_emit_priority_onehot_grant(
 // counters with headroom while still catching pathological modules.
 // (PI cap also raised 16->32: a 16b counter MSB needs 17 PIs with ~20 ANDs;
 // narrow-but-wide cones are not a hang risk.)
-const WIDE_CONE_PI_CAP: usize = 32;
-const WIDE_CONE_AND_CAP: usize = 96;
-const WIDE_CONE_MODULE_LUT_CAP: usize = 4096;
+const WIDE_CONE_PI_CAP: usize = 256;
+const WIDE_CONE_AND_CAP: usize = 8192;
+const WIDE_CONE_MODULE_LUT_CAP: usize = 65536;
 const ASSIGN_BIT_CAP: usize = 2048;
 
 fn comb_accept(comb_bits: &[(String, Expr)], bitn: &str, capped: &mut bool) -> bool {
@@ -12811,6 +13380,98 @@ fn try_map_or_eq_tree(
 
 /// `small && (eq0 || eq1 || …)` — outer enable gated with an OR-of-eq.
 /// Used when ITE cond is And(op_en, or_of_csr) rather than a lone OR.
+/// Map a pure associative chain (all AND, all OR or all XOR) over plain or
+/// inverted signals, of any width, to a balanced tree of LUT6s (six inputs
+/// per LUT per level). `&in`, `|status`, `^data` over 64 bits used to exceed
+/// the wide-cone caps and map to nothing.
+fn try_map_assoc_reduce(d: &mut Design, expr: &Expr, prefix: &str, out: Option<&str>) -> Option<String> {
+    // `~&x`, `~|x`, `~^x`: one outer inversion, folded into the root LUT.
+    let (expr, invert_root) = match expr {
+        Expr::Not(x) if matches!(&**x, Expr::And(..) | Expr::Or(..) | Expr::Xor(..)) => (&**x, true),
+        _ => (expr, false),
+    };
+    #[derive(Clone, Copy, PartialEq)]
+    enum Op {
+        And,
+        Or,
+        Xor,
+    }
+    let op = match expr {
+        Expr::And(..) => Op::And,
+        Expr::Or(..) => Op::Or,
+        Expr::Xor(..) => Op::Xor,
+        _ => return None,
+    };
+    let mut leaves: Vec<(String, bool)> = Vec::new();
+    let mut stack: Vec<&Expr> = vec![expr];
+    while let Some(n) = stack.pop() {
+        match (n, op) {
+            (Expr::And(a, b), Op::And) | (Expr::Or(a, b), Op::Or) | (Expr::Xor(a, b), Op::Xor) => {
+                stack.push(b);
+                stack.push(a);
+            }
+            (Expr::Var(v), _) => leaves.push((v.to_string(), false)),
+            (Expr::Not(x), _) => match &**x {
+                Expr::Var(v) => leaves.push((v.to_string(), true)),
+                _ => return None,
+            },
+            _ => return None,
+        }
+        if leaves.len() > 4096 {
+            return None;
+        }
+    }
+    if leaves.len() < 7 {
+        return None; // a single LUT6 handles it on the normal path
+    }
+    let mut level: Vec<(String, bool)> = leaves;
+    let mut lvl = 0usize;
+    loop {
+        let chunks: Vec<Vec<(String, bool)>> = level.chunks(6).map(|c| c.to_vec()).collect();
+        let last = chunks.len() == 1;
+        let mut next = Vec::with_capacity(chunks.len());
+        for (j, chunk) in chunks.iter().enumerate() {
+            let mut init = 0u64;
+            for addr in 0..64u64 {
+                let mut acc = match op {
+                    Op::And => true,
+                    Op::Or | Op::Xor => false,
+                };
+                for (k, (_, inv)) in chunk.iter().enumerate() {
+                    let v = ((addr >> k) & 1 == 1) ^ inv;
+                    acc = match op {
+                        Op::And => acc && v,
+                        Op::Or => acc || v,
+                        Op::Xor => acc ^ v,
+                    };
+                }
+                if acc {
+                    init |= 1u64 << addr;
+                }
+            }
+            if last && invert_root {
+                init = !init;
+            }
+            let lut = format!("{prefix}r{lvl}_{j}");
+            let onet = match (last, out) {
+                (true, Some(o)) => o.to_string(),
+                _ => format!("{prefix}r{lvl}_{j}_o"),
+            };
+            d.add_cell(&lut, CellKind::Lut6 { init });
+            for (k, (net, _)) in chunk.iter().enumerate() {
+                d.connect(net.as_str(), &lut, format!("I{k}"));
+            }
+            d.connect(onet.as_str(), &lut, "O");
+            next.push((onet, false));
+        }
+        if last {
+            return next.pop().map(|(n, _)| n);
+        }
+        level = next;
+        lvl += 1;
+    }
+}
+
 fn try_map_and_or_mix(
     d: &mut Design,
     expr: &Expr,
@@ -16608,6 +17269,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // (carry FF cell, Q net) pairs for keep/mark_debug after the loop.
     let mut carry_ffs: Vec<(String, String)> = Vec::new();
     for (lhs, bit, rhs) in &rtl.nbas {
+        if std::env::var("HELION_DEBUG_REGBITS").is_ok() {
+            eprintln!("nba {lhs} {bit:?} <= {rhs:?}");
+        }
         if sig_depth(rtl, lhs) > 0 {
             continue;
         }
@@ -16843,9 +17507,46 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 continue;
             }
         }
-        match rhs {
-            RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => continue,
-            _ => {}
+        // Pure alias (`assign au = a;`, `assign c = x[4]`, `assign y = x[7:4]`).
+        // Output ports are wired at the root (output-bit normalization), but
+        // an internal alias must still drive its own bits or every reader
+        // sees an undriven net. Identity buffers named `u_obuf_*` are merged
+        // away by `collapse_identity_luts`, so this costs no LUTs.
+        if matches!(rhs, RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _)) {
+            let is_out = rtl.ports.iter().any(|(n, dir, _)| n == lhs && *dir == PortDir::Out);
+            let src_name = match rhs {
+                RExpr::Ident(s) | RExpr::Bit(s, _) | RExpr::Range(s, _, _) => *s,
+                _ => unreachable!(),
+            };
+            if !is_out && sig_depth(rtl, lhs) == 0 && sig_depth(rtl, src_name) == 0 {
+                let w = sig_width(rtl, lhs).max(1);
+                let sw = sig_width(rtl, src_name).max(1);
+                let src_bit = |i: usize| -> Option<String> {
+                    match rhs {
+                        RExpr::Ident(s) => (i < sw).then(|| bit_name(s, sw, i)),
+                        RExpr::Bit(s, idx) => (i == 0 && *idx < sw).then(|| bit_name(s, sw, *idx)),
+                        RExpr::Range(s, lo, hi) => (lo + i <= *hi && lo + i < sw).then(|| bit_name(s, sw, lo + i)),
+                        _ => None,
+                    }
+                };
+                let targets: Vec<(String, Option<String>)> = match bit {
+                    Some(b) if decode_unpacked_bit(*b).is_none() => vec![(bit_name(lhs, w, *b), src_bit(0))],
+                    Some(_) => Vec::new(),
+                    None => (0..w.min(4096)).map(|i| (bit_name(lhs, w, i), src_bit(i))).collect(),
+                };
+                for (dst, src) in targets {
+                    let lut = format!("u_obuf_{dst}");
+                    match src {
+                        Some(src) => {
+                            d.add_cell(&lut, CellKind::Lut6 { init: 0xAAAA_AAAA_AAAA_AAAA });
+                            d.connect(&src, &lut, "I0");
+                        }
+                        None => d.add_cell(&lut, CellKind::Lut6 { init: 0 }),
+                    }
+                    d.connect(&dst, &lut, "O");
+                }
+            }
+            continue;
         }
         // width<=32 `assign y = bus + K` (K in 1..=16) is a ripple from that
         // constant: carry on the low bits, not a 32-PI cone and not a second
@@ -16860,10 +17561,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     } else {
                         RIPPLE_ADD_MAX
                     };
-                    if w > max_w || !emit_ripple_add_const(&mut d, rtl, lhs, w, &bus, k) {
-                        note_assign_not_lowered(rtl.module, lhs);
+                    // Shortcut only; on refusal fall through to bit-blasting.
+                    if w <= max_w && emit_ripple_add_const(&mut d, rtl, lhs, w, &bus, k) {
+                        continue;
                     }
-                    continue;
                 }
             }
         }
@@ -16875,10 +17576,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             if let Some((bus, k)) = packed_sub_const(rhs, rtl) {
                 if rexpr_unknown_name(rhs, rtl).is_none() {
                     let w = sig_width(rtl, lhs).max(1);
-                    if w > 32 || !emit_ripple_sub_const(&mut d, rtl, lhs, w, &bus, k) {
-                        note_assign_not_lowered(rtl.module, lhs);
+                    if w <= 32 && emit_ripple_sub_const(&mut d, rtl, lhs, w, &bus, k) {
+                        continue;
                     }
-                    continue;
                 }
             }
         }
@@ -16888,12 +17588,11 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             if let Some((bus, k, bus_lo, bus_bits)) = packed_const_minus_bus(rhs, rtl) {
                 if rexpr_unknown_name(rhs, rtl).is_none() {
                     let w = sig_width(rtl, lhs).max(1);
-                    if w > 32
-                        || !emit_ripple_const_minus(&mut d, rtl, lhs, w, &bus, k, bus_lo, bus_bits)
+                    if w <= 32
+                        && emit_ripple_const_minus(&mut d, rtl, lhs, w, &bus, k, bus_lo, bus_bits)
                     {
-                        note_assign_not_lowered(rtl.module, lhs);
+                        continue;
                     }
-                    continue;
                 }
             }
         }
@@ -16903,11 +17602,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             if let Some(zpad) = packed_add_zpad_wires(rhs, rtl, &arena) {
                 if rexpr_unknown_name(rhs, rtl).is_none() {
                     let w = sig_width(rtl, lhs).max(1);
-                    if w > RIPPLE_ADD_MAX || !emit_ripple_add_zpad_wires(&mut d, rtl, lhs, w, &zpad)
-                    {
-                        note_assign_not_lowered(rtl.module, lhs);
+                    if w <= RIPPLE_ADD_MAX && emit_ripple_add_zpad_wires(&mut d, rtl, lhs, w, &zpad) {
+                        continue;
                     }
-                    continue;
                 }
             }
         }
@@ -16918,11 +17615,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             if let Some((a_name, b_name)) = packed_add_pair(rhs, rtl) {
                 if rexpr_unknown_name(rhs, rtl).is_none() {
                     let w = sig_width(rtl, lhs).max(1);
-                    if w > RIPPLE_ADD_MAX || !emit_ripple_add(&mut d, rtl, lhs, w, &a_name, &b_name)
-                    {
-                        note_assign_not_lowered(rtl.module, lhs);
+                    if w <= RIPPLE_ADD_MAX && emit_ripple_add(&mut d, rtl, lhs, w, &a_name, &b_name) {
+                        continue;
                     }
-                    continue;
                 }
             }
         }
@@ -16936,8 +17631,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             }
             continue;
         }
-        // Comb multiply → DSP MAC (do not bitblast).
-        if expr_contains_mul(rhs) {
+        // Comb multiply → DSP MAC (do not bitblast), on targets with DSPs.
+        if dsp_inference() && expr_contains_mul(rhs) {
             emit_mac27(&mut d, format!("u_mac{n_mac}"), rhs, lhs);
             n_mac += 1;
             continue;
@@ -17044,9 +17739,13 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             // walk a bit and do not invent a LUT. Closed WNS is refused below.
             note_width_overflow_named(&rtl.module);
         } else {
-            let rw = rexpr_width(rhs, rtl).min(w).max(1).min(256);
+            // Every bit of the LHS: Verilog evaluates in the assignment's
+            // context width, so `y[7:0] = a[3:0] + b[3:0]` carries into y[4]
+            // (bit-blasting zero-extends the operands). Stopping at the RHS's
+            // natural width left the upper LHS bits undriven.
+            let _ = rexpr_width(rhs, rtl);
             let before = comb_bits.len();
-            for i in 0..rw.min(w) {
+            for i in 0..w.min(4096) {
                 let bn = bit_name(lhs, w, i);
                 if !comb_accept(&comb_bits, &bn, &mut assign_capped) {
                     break;
@@ -17120,6 +17819,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // sharing). Phase 1 (below + comb loop) only decides; phase 2 emits.
     let mut wide_batch: Vec<WideCone> = Vec::new();
     for (i, (bitn, expr)) in reg_bits.iter().enumerate() {
+        if std::env::var("HELION_DEBUG_REGBITS").is_ok() {
+            eprintln!("regbit {bitn} = {expr:?}");
+        }
         let (ff, qnet) = if single_q {
             ("u_ff".to_string(), "q".to_string())
         } else {
@@ -17245,6 +17947,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             break;
         }
         let expr_rom = strip_self_hold(expr, bitn, &arena);
+        if std::env::var("HELION_DEBUG_REGBITS").is_ok() {
+            let t = format!("{expr_rom:?}");
+            eprintln!("combbit {bitn} = {}", &t[..t.len().min(300)]);
+        }
         // Cheap ≤6-PI LUT6 before expr_node_count (full tree walk). sha256_k
         // and alu bit cones hit this without the 2k-node scan.
         if !cone_pi_exceeds(&expr_rom, 6) {
@@ -17386,6 +18092,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         {
             continue;
         }
+        if try_map_assoc_reduce(&mut d, &expr_rom, &format!("u_red{i}_"), Some(bitn)).is_some() {
+            continue;
+        }
         // Refuse Aig::from_expr on wide PI cones (arbiter hang-class ~30s).
         if cone_pi_exceeds(&expr_rom, WIDE_CONE_PI_CAP) {
             if let Some(sig) = rel_sig.get(bitn) {
@@ -17518,142 +18227,326 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // one sequential_not_lowered. wide_cone already finished this module.
     finish_seq_honesty(&d, &rtl.module, wide_capped);
 
-    // Output IOBs from assigns.
-    // FM-HEL-TOP: under skip_comb_assigns, AXI/out continuous assigns have no
-    // mapped LUT/FF drivers. Emitting them fills the pack then iob_trim → 0,
-    // blocking the FF→PAD fallback (bare ysyx_ibex IOB=0). Prefer NBA-
-    // registered top outs; else last FF → first Out.
-    let mut iob_n = 0usize;
-    let emit_iob = |d: &mut Design, iob_n: &mut usize, qnet: &str, pad: &str| {
-        let iob = if *iob_n == 0 {
-            "u_iob".to_string()
-        } else {
-            format!("u_iob{iob_n}")
-        };
-        *iob_n += 1;
-        d.add_cell(&iob, CellKind::IobOut);
-        d.connect(qnet, &iob, "I");
-        d.connect(pad, &iob, "PAD");
-    };
-    for (lhs, bit, rhs) in &rtl.assigns {
-        let is_out = rtl
-            .ports
-            .iter()
-            .any(|(n, dir, _)| n == lhs && *dir == PortDir::Out);
-        if !is_out {
+    // Output ports. Every output bit's value must live on the net named for
+    // that bit (`bit_name(port, w, i)`): hierarchy stitching maps child port
+    // bits onto parent nets by that name, and the root IOB pass
+    // (`emit_root_iobs`) reads it. Logic and flops already drive the bit
+    // name; a pure alias (`assign dout = q`) gets an identity LUT, and a
+    // zero-filled bit a constant-0 LUT. No IOBs here: only the root has pads.
+    let driven = driven_nets(&d);
+    for (port, dir, _) in &rtl.ports {
+        if *dir != PortDir::Out {
             continue;
         }
-        // Constant word read: q is that word. Same nets as the Hff Q, no buffer LUT.
-        if bit.is_none() {
-            if let Some((_, mem, word)) = word_alias.iter().find(|(n, _, _)| n.as_str() == *lhs) {
-                let ow = sig_width(rtl, lhs);
-                let mw = sig_width(rtl, mem).max(1);
-                for i in 0..ow.min(mw).min(256) {
-                    let qnet = unpacked_word_q(mem, *word, mw, i);
-                    emit_iob(&mut d, &mut iob_n, &qnet, lhs);
-                }
+        let w = sig_width(rtl, port).max(1);
+        if sig_depth(rtl, port) > 0 {
+            continue; // unpacked array outputs are driven per word
+        }
+        for i in 0..w.min(4096) {
+            let want = bit_name(port, w, i);
+            if driven.contains(&want) {
                 continue;
             }
-            // Zero-fill concat: high bits are the bus, low bits are 0.
-            // No buffer LUT. Zero bits have no source wire.
-            if let Some((_, bus, zeros, bus_lo)) = concat_align.iter().find(|(n, _, _, _)| n == lhs)
-            {
-                let ow = sig_width(rtl, lhs);
-                let bw = sig_width(rtl, bus).max(1);
-                for i in *zeros..ow.min(256) {
-                    let src = bus_lo + (i - zeros);
-                    if src >= bw {
-                        break;
-                    }
-                    let qnet = bit_name(bus, bw, src);
-                    emit_iob(&mut d, &mut iob_n, &qnet, lhs);
+            match output_alias_source(rtl, port, w, i, &word_alias, &concat_align) {
+                Some(AliasSrc::Net(src)) if src != want => {
+                    let lut = format!("u_obuf_{want}");
+                    d.add_cell(&lut, CellKind::Lut6 { init: 0xAAAA_AAAA_AAAA_AAAA });
+                    d.connect(&src, &lut, "I0");
+                    d.connect(&want, &lut, "O");
                 }
-                continue;
-            }
-        }
-        let w = sig_width(rtl, lhs);
-        if bit.is_none() && w > 1 {
-            for i in 0..w.min(256) {
-                // Ident/range passthrough: the driver is the RHS bit, not a
-                // buffer LUT. Logic assigns drive the LHS bit name.
-                let qnet = match rhs {
-                    RExpr::Ident(s) => bit_name(s, sig_width(rtl, s), i),
-                    RExpr::Range(s, lo, hi) => {
-                        let idx = lo + i;
-                        if idx <= *hi {
-                            bit_name(s, sig_width(rtl, s), idx)
-                        } else {
-                            bit_name(lhs, w, i)
-                        }
-                    }
-                    _ => bit_name(lhs, w, i),
-                };
-                emit_iob(&mut d, &mut iob_n, &qnet, lhs);
-            }
-            continue;
-        }
-        // FM-HEL-AREA-03: whole unpacked word assign `lhs[word] = ...`
-        // (bit=Some(word), not an encoded bit). The comb lowering drives
-        // per-bit unpacked_word_q(lhs, word, w, i) nets — one IOB per bit,
-        // not a single IOB on bit_name(lhs, w, word) (never driven).
-        if let Some(b) = bit {
-            if decode_unpacked_bit(*b).is_none() {
-                let depth = sig_depth(rtl, lhs);
-                if depth > 0 && *b < depth {
-                    for i in 0..w.max(1).min(256) {
-                        let qnet = unpacked_word_q(lhs, *b, w, i);
-                        emit_iob(&mut d, &mut iob_n, &qnet, lhs);
-                    }
-                    continue;
+                Some(AliasSrc::Const(v)) => {
+                    let lut = format!("u_oconst_{want}");
+                    d.add_cell(&lut, CellKind::Lut6 { init: if v { u64::MAX } else { 0 } });
+                    d.connect(&want, &lut, "O");
                 }
-            }
-        }
-        let qnet = if let Some(b) = bit {
-            if let Some((word, lo)) = decode_unpacked_bit(*b) {
-                // FM-HEL-AREA-03: unpacked bit assign — the comb lowering
-                // drives unpacked_word_q(lhs, word, w, lo), not
-                // bit_name(lhs, w, b): the encoded index is not a real bit
-                // number, so the old name was never driven (IOBs on undriven
-                // nets, concat LUTs swept as dead).
-                unpacked_word_q(lhs, word, w, lo)
-            } else {
-                bit_name(lhs, w, *b)
-            }
-        } else if let Ok((q, _)) = drive_target(rhs, rtl) {
-            q
-        } else {
-            // 1-bit comb assign (not a wire name): LUT already drives lhs.
-            bit_name(lhs, w, 0)
-        };
-        emit_iob(&mut d, &mut iob_n, &qnet, lhs);
-    }
-    if iob_n == 0 {
-        // Carry flow first: NBA-driven outputs consumed by carry stages
-        // never reach reg_bits (the fast-path branches skip it), but
-        // their stage FF Q nets are live single-driven nets. Prefer
-        // those over the last cone register bit.
-        for (n, dir, _) in &rtl.ports {
-            if *dir != PortDir::Out {
-                continue;
-            }
-            let qnet = bit_name(n, sig_width(rtl, n), 0);
-            if carry_ffs.iter().any(|(_, q)| q == &qnet) {
-                emit_iob(&mut d, &mut iob_n, &qnet, n);
+                _ => {}
             }
         }
     }
-    if iob_n == 0 {
-        // default: last register bit to first output
-        if let (Some((n, _, _)), Some((qnet, _))) = (
-            rtl.ports.iter().find(|(_, dir, _)| *dir == PortDir::Out),
-            reg_bits.last(),
-        ) {
-            d.add_cell("u_iob", CellKind::IobOut);
-            d.connect(qnet, "u_iob", "I");
-            d.connect(*n, "u_iob", "PAD");
-        }
-    }
+    let _ = (&carry_ffs, &reg_bits);
+    apply_var_inits(&mut d, rtl);
     Ok(d)
+}
+
+/// Where an output bit's value comes from when the bit's own net is not
+/// driven by logic: another signal's bit (pure alias) or a constant.
+enum AliasSrc {
+    Net(String),
+    Const(bool),
+}
+
+fn output_alias_source(
+    rtl: &Rtl,
+    port: &str,
+    w: usize,
+    i: usize,
+    word_alias: &[(String, String, usize)],
+    concat_align: &[(String, String, usize, usize)],
+) -> Option<AliasSrc> {
+    if let Some((_, mem, word)) = word_alias.iter().find(|(n, _, _)| n.as_str() == port) {
+        let mw = sig_width(rtl, mem).max(1);
+        return (i < mw).then(|| AliasSrc::Net(unpacked_word_q(mem, *word, mw, i)));
+    }
+    if let Some((_, bus, zeros, bus_lo)) = concat_align.iter().find(|(n, _, _, _)| n.as_str() == port) {
+        if i < *zeros {
+            return Some(AliasSrc::Const(false));
+        }
+        let bw = sig_width(rtl, bus).max(1);
+        let src = bus_lo + (i - zeros);
+        return (src < bw).then(|| AliasSrc::Net(bit_name(bus, bw, src)));
+    }
+    for (lhs, bit, rhs) in &rtl.assigns {
+        if *lhs != port {
+            continue;
+        }
+        match bit {
+            None => match rhs {
+                RExpr::Ident(s) => {
+                    let sw = sig_width(rtl, s).max(1);
+                    return (i < sw).then(|| AliasSrc::Net(bit_name(s, sw, i)));
+                }
+                // `assign cout = su[4];`
+                RExpr::Bit(s, idx) if sig_depth(rtl, s) == 0 => {
+                    let sw = sig_width(rtl, s).max(1);
+                    return (i == 0).then(|| AliasSrc::Net(bit_name(s, sw, *idx)));
+                }
+                RExpr::Range(s, lo, hi) => {
+                    let idx = lo + i;
+                    if idx <= *hi {
+                        return Some(AliasSrc::Net(bit_name(s, sig_width(rtl, s).max(1), idx)));
+                    }
+                }
+                _ => {}
+            },
+            Some(b) if *b == i && decode_unpacked_bit(*b).is_none() => match rhs {
+                RExpr::Ident(s) => {
+                    let sw = sig_width(rtl, s).max(1);
+                    return Some(AliasSrc::Net(bit_name(s, sw, 0)));
+                }
+                // `assign led[0] = cnt[26];`
+                RExpr::Bit(s, idx) if sig_depth(rtl, s) == 0 => {
+                    let sw = sig_width(rtl, s).max(1);
+                    return Some(AliasSrc::Net(bit_name(s, sw, *idx)));
+                }
+                RExpr::Range(s, lo, hi) if lo == hi && sig_depth(rtl, s) == 0 => {
+                    let sw = sig_width(rtl, s).max(1);
+                    return Some(AliasSrc::Net(bit_name(s, sw, *lo)));
+                }
+                RExpr::Const { val, .. } => return Some(AliasSrc::Const(val & 1 == 1)),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    let _ = w;
+    None
+}
+
+/// Nets driven by some cell output pin.
+fn driven_nets(d: &Design) -> HashSet<String> {
+    let kind: HashMap<&str, &CellKind> = d.cells.iter().map(|c| (c.name.as_str(), &c.kind)).collect();
+    let mut out = HashSet::new();
+    for n in &d.nets {
+        for e in &n.endpoints {
+            let drives = match kind.get(e.cell.as_str()) {
+                Some(CellKind::Lut6 { .. }) => e.pin == "O",
+                Some(CellKind::Hff) => e.pin == "Q",
+                Some(CellKind::Carry4) => e.pin == "CO" || e.pin.starts_with('O'),
+                Some(CellKind::IobIn) | Some(CellKind::ClockBuf) => e.pin == "O",
+                Some(CellKind::Mac27) | Some(CellKind::Bram18) | Some(CellKind::BlackBox { .. }) => true,
+                _ => false,
+            };
+            if drives {
+                out.insert(n.name.clone());
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Remove identity LUTs (`O = I0`, the output-alias buffers of
+/// `output_alias_source`) by moving every load of the output net onto the
+/// input net. Port-bit naming has done its job once hierarchy is stitched
+/// and pads are placed; keeping the buffers would cost one LUT per aliased
+/// output bit.
+fn collapse_identity_luts(d: &mut Design) {
+    let ident: Vec<(String, String, String)> = {
+        let pins = d.pin_index();
+        d.cells
+            .iter()
+            // Only the alias buffers inserted for output-bit naming
+            // (`u_obuf_*`, possibly hierarchy-prefixed); identity LUTs the
+            // lowering made on its own are left alone.
+            .filter(|c| c.name.contains("u_obuf_"))
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { init } if init == 0xAAAA_AAAA_AAAA_AAAA))
+            .filter(|c| (1..6).all(|k| pins.net_on(&c.name, &format!("I{k}")).is_none()))
+            .filter_map(|c| {
+                let i = pins.net_on(&c.name, "I0")?.to_string();
+                let o = pins.net_on(&c.name, "O")?.to_string();
+                (i != o).then(|| (c.name.clone(), i, o))
+            })
+            .collect()
+    };
+    if ident.is_empty() {
+        return;
+    }
+    // Resolve chains (buffer feeding buffer) to the final source net.
+    let src_of: HashMap<String, String> = ident.iter().map(|(_, i, o)| (o.clone(), i.clone())).collect();
+    let root = |mut n: String| -> String {
+        let mut guard = 0;
+        while let Some(s) = src_of.get(&n) {
+            n = s.clone();
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+        }
+        n
+    };
+    let dead: HashSet<String> = ident.iter().map(|(c, _, _)| c.clone()).collect();
+    d.cells.retain(|c| !dead.contains(&c.name));
+    // Pad pins stay on the port net: for a 1-bit output the port net and
+    // the bit net share a name, and moving `PAD` would hang the pad on an
+    // internal net.
+    let pads: HashSet<String> = d
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::IobOut | CellKind::IobIn))
+        .map(|c| c.name.clone())
+        .collect();
+    let mut moved: HashMap<String, Vec<Endpoint>> = HashMap::new();
+    for n in d.nets.iter_mut() {
+        n.endpoints.retain(|e| !dead.contains(&e.cell));
+        if src_of.contains_key(&n.name) {
+            let target = root(n.name.clone());
+            let (keep, go): (Vec<Endpoint>, Vec<Endpoint>) = std::mem::take(&mut n.endpoints)
+                .into_iter()
+                .partition(|e| pads.contains(&e.cell) && e.pin == "PAD");
+            n.endpoints = keep;
+            moved.entry(target).or_default().extend(go);
+        }
+    }
+    d.nets.retain(|n| !src_of.contains_key(&n.name) || !n.endpoints.is_empty());
+    for (target, eps) in moved {
+        if d.net(&target).is_some() || d.nets.iter().any(|n| n.name == target) {
+            d.rebuild_indexes();
+            if let Some(n) = d.net_mut(&target) {
+                n.endpoints.extend(eps);
+            }
+        } else {
+            d.merge_net(Net { name: target, endpoints: eps, attrs: helion_ir::Attrs::default() });
+        }
+    }
+    d.rebuild_indexes();
+}
+
+/// Root pads: one `IobOut` per top-level output bit, reading the bit's net
+/// and tagged with `PORT`/`BIT` so constraints and checks can tell the bits
+/// of a bus apart. An output bit nothing drives gets a named diagnostic and
+/// no pad (never a guessed connection).
+fn emit_root_iobs(d: &mut Design, top: &Rtl) {
+    let driven = driven_nets(d);
+    let inputs: HashSet<String> = top
+        .ports
+        .iter()
+        .filter(|(_, dir, _)| *dir != PortDir::Out)
+        .flat_map(|(n, _, _)| {
+            let w = sig_width(top, n).max(1);
+            (0..w.min(4096)).map(move |i| bit_name(n, w, i))
+        })
+        .collect();
+    let mut k = 0usize;
+    for (port, dir, _) in &top.ports {
+        if *dir != PortDir::Out {
+            continue;
+        }
+        let w = sig_width(top, port).max(1);
+        let depth = sig_depth(top, port);
+        if depth > 0 {
+            // Unpacked array output (`output logic [33:0] o[2]`): word `j`
+            // bit `i` lives on `unpacked_word_q(port, j, w, i)`.
+            for j in 0..depth.min(4096) {
+                for i in 0..w.min(4096) {
+                    let net = unpacked_word_q(port, j, w, i);
+                    if !driven.contains(&net) {
+                        note_skip(format!(
+                            "diagnostic output_undriven module={} port={port} word={j} bit={i} (no logic drives this output bit; no pad emitted)",
+                            top.module
+                        ));
+                        continue;
+                    }
+                    let iob = if k == 0 { "u_iob".to_string() } else { format!("u_iob{k}") };
+                    k += 1;
+                    d.add_cell(&iob, CellKind::IobOut);
+                    d.connect(&net, &iob, "I");
+                    d.connect(*port, &iob, "PAD");
+                    if let Some(c) = d.cells.iter_mut().find(|c| c.name == iob) {
+                        c.attrs.set("PORT", *port);
+                        c.attrs.set("WORD", j.to_string());
+                        c.attrs.set("BIT", i.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+        for i in 0..w.min(4096) {
+            let net = bit_name(port, w, i);
+            if !driven.contains(&net) && !inputs.contains(&net) {
+                note_skip(format!(
+                    "diagnostic output_undriven module={} port={port} bit={i} (no logic drives this output bit; no pad emitted)",
+                    top.module
+                ));
+                continue;
+            }
+            let iob = if k == 0 { "u_iob".to_string() } else { format!("u_iob{k}") };
+            k += 1;
+            d.add_cell(&iob, CellKind::IobOut);
+            d.connect(&net, &iob, "I");
+            d.connect(*port, &iob, "PAD");
+            if let Some(c) = d.cells.iter_mut().find(|c| c.name == iob) {
+                c.attrs.set("PORT", *port);
+                if w > 1 {
+                    c.attrs.set("BIT", i.to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Mark flops whose register bit starts at 1 (`logic [3:0] q = 4'd5;`)
+/// with `INIT=1` (Vivado FDRE/FDSE INIT). Flops are found by their Q net,
+/// which carries the register bit's name. Bits starting at 0 need nothing:
+/// a flop without `INIT` starts at 0.
+fn apply_var_inits(d: &mut Design, rtl: &Rtl) {
+    if rtl.var_inits.is_empty() {
+        return;
+    }
+    let mut ones: HashSet<String> = HashSet::new();
+    for (sig, v) in &rtl.var_inits {
+        let w = sig_width(rtl, sig).max(1);
+        for i in 0..w.min(128) {
+            if (v >> i) & 1 == 1 {
+                ones.insert(bit_name(sig, w, i));
+            }
+        }
+    }
+    if ones.is_empty() {
+        return;
+    }
+    let pins = d.pin_index();
+    let mark: Vec<String> = d
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::Hff))
+        .filter(|c| pins.net_on(&c.name, "Q").is_some_and(|q| ones.contains(q)))
+        .map(|c| c.name.clone())
+        .collect();
+    for c in d.cells.iter_mut() {
+        if mark.contains(&c.name) {
+            c.attrs.set("INIT", "1");
+        }
+    }
 }
 
 /// Rename substitution map is generic over the key: callers use owned
@@ -17888,6 +18781,7 @@ fn flatten_module_ov_vis<'s>(
         negedge_writes: src.negedge_writes.clone(),
         sva_conc: src.sva_conc.clone(),
         sva_imm: src.sva_imm.clone(),
+        var_inits: src.var_inits.clone(),
     };
     for inst in &src.insts {
         let Some(child_proto) = mods.get(inst.module) else {
@@ -17940,6 +18834,10 @@ fn flatten_module_ov_vis<'s>(
                 .cloned()
                 .unwrap_or_else(|| format!("{prefix}{lhs}"));
             out.assigns.push((arena.alloc_str(&lhs), *bit, rewrite_rexpr(rhs, &subst, arena)));
+        }
+        for (sig, v) in &child.var_inits {
+            let mapped = subst.get(*sig).cloned().unwrap_or_else(|| format!("{prefix}{sig}"));
+            out.var_inits.insert(arena.alloc_str(&mapped), *v);
         }
     }
     visiting.remove(name);
@@ -18296,6 +19194,10 @@ fn synth_from_parsed_top(
         (nbas, assigns, d)
     };
     d.name = top_name.clone();
+    if let Some(top_rtl) = map.get(&top_name) {
+        emit_root_iobs(&mut d, top_rtl);
+    }
+    collapse_identity_luts(&mut d);
     let (own_ms, stitch_ms, hash_ms) = synth_sub_snapshot();
     eprintln!(
         "hang_diag synth_rtl cells={} ms={}",
@@ -20133,9 +21035,12 @@ endmodule
             negedge_writes: vec![],
             sva_conc: Vec::new(),
             sva_imm: Vec::new(),
+            var_inits: HashMap::new(),
         };
         let r = rexpr_to_bit(&e, &rtl, 7, &arena);
-        assert!(r.is_err(), "deep Add must Err, not hang: {r:?}");
+        // Bit-blasted once per node: bounded and successful now. Never
+        // Debug-print the DAG (exponential as a tree).
+        assert!(r.is_ok(), "deep Add lowers: {:?}", r.as_ref().err());
     }
 
     #[test]
@@ -20178,15 +21083,19 @@ endmodule
             negedge_writes: vec![],
             sva_conc: Vec::new(),
             sva_imm: Vec::new(),
+            var_inits: HashMap::new(),
         };
         let eq = rexpr_to_bit(
             &RExpr::Eq(arena.alloc(a.clone()), arena.alloc(b.clone())),
             &rtl,
             0,
         &arena);
-        assert!(eq.is_err(), "deep Eq(Add,Add) must Err, not hang: {eq:?}");
+        // Word-level bit-blasting lowers this in linear time now (it used to
+        // be refused to avoid an exponential hang). Never Debug-print the
+        // result: a shared DAG printed as a tree is exponential.
+        assert!(eq.is_ok(), "deep Eq(Add,Add) lowers: {:?}", eq.as_ref().err());
         let lt = rexpr_to_bit(&RExpr::Lt(arena.alloc(a), arena.alloc(b)), &rtl, 0, &arena);
-        assert!(lt.is_err(), "deep Lt(Add,Add) must Err, not hang: {lt:?}");
+        assert!(lt.is_ok(), "deep Lt(Add,Add) lowers: {:?}", lt.as_ref().err());
         let wide = Rtl {
             module: "t".into(),
             ports: vec![],
@@ -20217,6 +21126,7 @@ endmodule
             negedge_writes: vec![],
             sva_conc: Vec::new(),
             sva_imm: Vec::new(),
+            var_inits: HashMap::new(),
         };
         let wide_eq = rexpr_to_bit(
             &RExpr::Eq(
@@ -20226,7 +21136,8 @@ endmodule
             &wide,
             0,
         &arena);
-        assert!(wide_eq.is_err(), "width>32 Eq must Err: {wide_eq:?}");
+        // Wide compares lower over whole vectors now (no 32-bit cap).
+        assert!(wide_eq.is_ok(), "width>32 Eq lowers: {:?}", wide_eq.as_ref().err());
     }
 
     #[test]
@@ -21278,10 +22189,10 @@ endmodule
 
     #[test]
     fn function_lifted_dead_cone_swept() {
-        // FM-HEL-AREA-02: the lifted function maps to 4 LUTs, but with no
-        // loads (nextCRC has no assign, hence no IOB) the dead sweep removes
-        // them. Lifting still happens — nextCRC exists as an output port —
-        // the mapped cone is just unobservable.
+        // FM-HEL-AREA-02: a port-less module holding only a function lifts
+        // the function to ports (Data/crc in, nextCRC out). The lifted
+        // output is driven, so it gets a pad on the port net. (Known gap:
+        // lifted ports come out 1 bit wide; see ZB-13.)
         let src = r#"
 module CRC_tiny();
   function [3:0] nextCRC;
@@ -21299,9 +22210,10 @@ module CRC_tiny();
 endmodule
 "#;
         let d = synth_sv(src, "crc.v").expect("lift function");
-        let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
-        assert_eq!(luts, 0, "dead lifted cone must be swept, luts={luts} cells={:?}", d.cells);
         assert!(d.ports.iter().any(|p| p.name == "nextCRC" && matches!(p.dir, PortDir::Out)));
+        let iob = d.cells.iter().find(|c| matches!(c.kind, CellKind::IobOut)).expect("pad");
+        assert_eq!(d.net_on(&iob.name, "PAD"), Some("nextCRC"), "pad sits on the port net");
+        assert_ne!(d.net_on(&iob.name, "I"), Some("nextCRC"), "pad reads the driven cone");
     }
 
     #[test]
@@ -21552,18 +22464,20 @@ endmodule
         let d = synth_sv(src, "align.sv").expect("concat align");
         assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
         assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
-        assert!(
-            !d.cells
-                .iter()
-                .any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
-            "zero-fill concat must not invent a LUT, cells={:?}",
-            d.cells
-        );
+        // Data bits are wires: no logic LUT. The two zero bits must still be
+        // driven (a floating pad is not 0 on silicon): input-less const-0 LUTs.
+        let pins = d.pin_index();
+        for c in d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })) {
+            assert!(matches!(c.kind, CellKind::Lut6 { init: 0 }), "only const-0 LUTs, got {c:?}");
+            assert!((0..6).all(|k| pins.net_on(&c.name, &format!("I{k}")).is_none()), "{c:?} has inputs");
+        }
         let aliased = d
             .nets
             .iter()
             .any(|n| n.name == "bus_0" && n.endpoints.iter().any(|e| e.pin == "I"));
         assert!(aliased, "y[2] aliases bus[0], nets={:?}", d.nets);
+        let pads = d.cells.iter().filter(|c| matches!(c.kind, CellKind::IobOut)).count();
+        assert_eq!(pads, 10, "every output bit, zero bits included, gets a pad");
     }
 
     #[test]
@@ -21577,13 +22491,11 @@ endmodule
         let d = synth_sv(src, "clear_lsb.v").expect("range clear lsb");
         assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
         assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
-        assert!(
-            !d.cells
-                .iter()
-                .any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
-            "clear-lsb concat must not invent a LUT, cells={:?}",
-            d.cells
-        );
+        // Data bits alias; the two cleared bits are driven by const-0 LUTs
+        // (a pad nothing drives is not 0 on silicon).
+        let luts: Vec<_> = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).collect();
+        assert!(luts.iter().all(|c| matches!(c.kind, CellKind::Lut6 { init: 0 })), "{luts:?}");
+        assert_eq!(luts.len(), 2);
         let aliased = d
             .nets
             .iter()
@@ -21601,12 +22513,10 @@ endmodule
 "#;
         let d = synth_sv(src, "imm_u.sv").expect("imm_u");
         assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
-        assert!(
-            !d.cells
-                .iter()
-                .any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
-            "U-type zero-fill must be wire align, not LUTs"
-        );
+        // Wire align for the data bits; the 12 zero bits are const-0 LUTs.
+        let luts: Vec<_> = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).collect();
+        assert!(luts.iter().all(|c| matches!(c.kind, CellKind::Lut6 { init: 0 })), "{luts:?}");
+        assert_eq!(luts.len(), 12, "one const-0 LUT per zero bit");
     }
 
     #[test]
@@ -21924,7 +22834,9 @@ endmodule
 
     #[test]
     fn nested_arith_assign_is_one_flatten_cap() {
-        // alu-style: ~b+1 and muxed concat add must not bit-blast past QA.
+        // alu-style: ~b+1 and a muxed concat add. Word-level bit-blasting
+        // lowers this in linear time; it used to be refused (FLATTEN_CAP)
+        // and the module synthesized to nothing.
         let src = r#"
 module nested_arith(input [31:0] a, input [31:0] b, input sub,
                     output [32:0] sum);
@@ -21933,12 +22845,9 @@ module nested_arith(input [31:0] a, input [31:0] b, input sub,
 endmodule
 "#;
         let d = synth_sv(src, "nested_arith.v").expect("nested arith");
-        assert_eq!(d.attrs.get("FLATTEN_CAP"), Some("1"));
-        assert!(
-            !d.cells
-                .iter()
-                .any(|c| matches!(c.kind, CellKind::Lut6 { .. }))
-        );
+        assert_ne!(d.attrs.get("FLATTEN_CAP"), Some("1"));
+        let pads = d.cells.iter().filter(|c| matches!(c.kind, CellKind::IobOut)).count();
+        assert_eq!(pads, 33, "all 33 sum bits driven");
     }
 
     #[test]
@@ -22100,41 +23009,35 @@ endmodule
 
     #[test]
     fn comb_bus_minus_const_wider_than_32_is_not_invented() {
+        // Wider than the ripple shortcut: falls through to word-level
+        // bit-blasting (it used to be refused and left undriven).
         let src = r#"
 module WideSub(input [33:0] bus, output [33:0] y);
   assign y = bus - 4;
 endmodule
 "#;
         let d = synth_sv(src, "widesub.v").expect("WideSub");
-        assert_eq!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
         assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
-        assert!(
-            !d.cells
-                .iter()
-                .any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
-            "width>32 must not invent a shorter subtractor"
-        );
+        let pads = d.cells.iter().filter(|c| matches!(c.kind, CellKind::IobOut)).count();
+        assert_eq!(pads, 34, "every difference bit driven");
         assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)));
         assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
     }
 
     #[test]
     fn comb_named_bus_add_wider_than_ripple_max_is_not_invented() {
-        // RIPPLE_ADD_MAX=40 covers Ibex 33+33→34; 48 stays unlowered.
+        // Wider than RIPPLE_ADD_MAX: bit-blasted instead of refused.
         let src = r#"
 module WideAdd(input [47:0] a, input [47:0] b, output [47:0] sum);
   assign sum = a + b;
 endmodule
 "#;
         let d = synth_sv(src, "wideadd.v").expect("WideAdd");
-        assert_eq!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
         assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
-        assert!(
-            !d.cells
-                .iter()
-                .any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
-            "width>RIPPLE_ADD_MAX must not invent a shorter adder"
-        );
+        let pads = d.cells.iter().filter(|c| matches!(c.kind, CellKind::IobOut)).count();
+        assert_eq!(pads, 48, "every sum bit driven");
         assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
     }
 
@@ -23056,6 +23959,9 @@ endmodule
 
     #[test]
     fn nested_add_concat_stays_wide_cone() {
+        // Formerly refused (flatten_cap / wide_cone): nested add over a
+        // zero-filled concat under a mux. Word-level bit-blasting plus the
+        // shared-AIG mapper lower it; every pc_out bit must be driven.
         let src = r#"
 module branch_control #(parameter DATA_WIDTH = 32, PC_WIDTH = 6, PC_OFFSET_WIDTH = 25)
   (input jmp_inst_in, input jmp_use_r_in, input branch_use_r_in, input branch_inst_in,
@@ -23074,20 +23980,11 @@ module branch_control #(parameter DATA_WIDTH = 32, PC_WIDTH = 6, PC_OFFSET_WIDTH
 endmodule
 "#;
         let d = synth_sv(src, "branch_control.v").expect("branch_control");
-        // nbas=0 nested Add under Mux is flatten_cap (named); not silent LUT invent.
-        assert!(
-            d.attrs.get("FLATTEN_CAP") == Some("1") || d.attrs.get("WIDE_CONE") == Some("1"),
-            "nested add/concat must name flatten_cap or wide_cone"
-        );
+        assert_ne!(d.attrs.get("FLATTEN_CAP"), Some("1"));
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
         assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
-        assert!(
-            !d.cells.iter().any(|c| {
-                matches!(c.kind, CellKind::Lut6 { .. })
-                    && d.net_on(&c.name, "O")
-                        .is_some_and(|o| o.starts_with("pc_jump"))
-            }),
-            "pc_jump concat must not be a LUT"
-        );
+        let pads = d.cells.iter().filter(|c| matches!(c.kind, CellKind::IobOut)).count();
+        assert_eq!(pads, 7, "select_new_pc_out plus six pc_out bits");
     }
 
     #[test]
@@ -23901,6 +24798,7 @@ endmodule
                 negedge_writes: vec![],
             sva_conc: Vec::new(),
             sva_imm: Vec::new(),
+            var_inits: HashMap::new(),
             }
         }
         let a = rtl_with(&[("m2", 1), ("m1", 2)]);
@@ -23968,6 +24866,7 @@ endmodule
             negedge_writes: vec![],
             sva_conc: vec![],
             sva_imm: vec![],
+            var_inits: HashMap::new(),
         };
         let base = RExpr::Const {
             val: 8,
@@ -24059,6 +24958,7 @@ endmodule
             negedge_writes: vec![],
             sva_conc: vec![],
             sva_imm: vec![],
+            var_inits: HashMap::new(),
         };
         let mut d = Design::new("t");
         emit_word_add(&mut d, &rtl, "clk", "mem", 0, 32, "a", "b");
@@ -24205,6 +25105,7 @@ endmodule
             negedge_writes: vec![],
             sva_conc: vec![],
             sva_imm: vec![],
+            var_inits: HashMap::new(),
         };
         fn eval(e: &Expr, vals: &HashMap<String, bool>) -> bool {
             match e {

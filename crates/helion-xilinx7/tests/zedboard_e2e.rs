@@ -163,33 +163,17 @@ fn zedboard_e2e_bitstream() {
         }
     }
 
-    // Workaround for a synth gap: bit-select assigns to output ports
-    // (`assign led[0] = cnt[26]`) name the IOB input net `led_<n>`, but the
-    // real driver (FF Q) stays on `cnt_<26-n>` with no connection between
-    // them. Move each led IOB's I-pin endpoint onto the driver net before
-    // pack. (pack rebuilds its pin index from net endpoints, so this is
-    // the authoritative fixup point.)
+    // Bit-select assigns to output ports (`assign led[0] = cnt[26]`) must
+    // leave each led IOB reading the counter flop's Q net directly.
     for n in 0..8 {
         let cell = if n == 0 { "u_iob".to_string() } else { format!("u_iob{n}") };
-        let from_net = format!("led_{n}");
-        let to_net = format!("cnt_{}", 26 - n);
-        let from = design
+        let want = format!("cnt_{}", 26 - n);
+        let on = design
             .nets
-            .iter_mut()
-            .find(|x| x.name == from_net)
-            .unwrap_or_else(|| panic!("net {from_net} not found"));
-        let removed = from.endpoints.len();
-        from.endpoints.retain(|e| !(e.cell == cell && e.pin == "I"));
-        assert!(from.endpoints.len() < removed, "no I pin moved for {cell}");
-        let to = design
-            .nets
-            .iter_mut()
-            .find(|x| x.name == to_net)
-            .unwrap_or_else(|| panic!("net {to_net} not found"));
-        to.endpoints.push(helion_ir::Endpoint {
-            cell,
-            pin: "I".to_string(),
-        });
+            .iter()
+            .find(|x| x.endpoints.iter().any(|e| e.cell == cell && e.pin == "I"))
+            .map(|x| x.name.clone());
+        assert_eq!(on.as_deref(), Some(want.as_str()), "{cell} I pin net");
     }
 
     let mut packed = pack(&design).expect("pack");
@@ -208,7 +192,7 @@ fn zedboard_e2e_bitstream() {
         );
     }
 
-    // Per-bit LOCs for the led IOBs. After the endpoint fixup above, each
+    // Per-bit LOCs for the led IOBs. Each
     // IOB's driver net is `cnt_<m>` with led[bit] = cnt[26 - bit].
     let mut led_count = 0;
     for iob in &mut packed.iobs {
