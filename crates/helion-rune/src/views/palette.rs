@@ -133,7 +133,7 @@ const TCL_RECIPES: [(&str, &str); 16] = [
     ),
 ];
 
-fn pane_label(pane: CenterPane) -> &'static str {
+pub(crate) fn pane_label(pane: CenterPane) -> &'static str {
     match pane {
         CenterPane::Summary => "Summary",
         CenterPane::Editor => "Editor",

@@ -1111,6 +1111,9 @@ mod tests {
     #[test]
     fn spi_mode_and_uart_period_controls_change_the_decode() {
         let mut s = fixture();
+        // Maximized like a small-screen user would, so the decoder card's
+        // mode and period rows sit inside the 900pt test window.
+        s.layout.focus = true;
         s.wave.add_decoder(DecoderKind::Spi, "");
         let mut r = rt(s);
         tap(&mut r, "wave-dec-0-mode-1");

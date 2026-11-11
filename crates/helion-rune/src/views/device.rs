@@ -464,6 +464,7 @@ fn layers_panel(s: &AppState, t: &VivadoTheme) -> El {
         .label("Die layers")
         .w(LAYERS_W)
         .h_full()
+        .min_h(0.0)
         .fill(t.panel_bg)
         .border(1.0, t.border)
         .child(
@@ -476,7 +477,15 @@ fn layers_panel(s: &AppState, t: &VivadoTheme) -> El {
                 .child(text("Layers").font(VivadoTheme::FONT_TITLE).color(t.text)),
         );
     let geom = live_geom(s);
-    let mut rows = col().w_full();
+    // The toggle list scrolls so the die row can shrink on short windows
+    // instead of pushing the pane past the window edge.
+    let mut rows = col()
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .scroll(rune::ScrollSpec {
+            stick_bottom: false,
+        });
     for layer in LayerId::ALL {
         let why = layer.unavailable(s, &geom);
         let check = Checkbox::new(layer.get(&s.device.layers) && why.is_none())
