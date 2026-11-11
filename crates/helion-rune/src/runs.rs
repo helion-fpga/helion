@@ -174,6 +174,8 @@ pub struct RunRecord {
     pub dsp: Option<u32>,
     /// Routed `.hck2` design checkpoint the worker wrote (impl runs).
     pub checkpoint: Option<PathBuf>,
+    /// Incremental reuse report of the run (`None` = full place).
+    pub reuse: Option<String>,
     /// The completed run's artifacts, kept so `Make active` can re-apply
     /// them to the report views (`None` for failed/cancelled runs).
     pub artifacts: Option<Box<RunArtifacts>>,
@@ -196,6 +198,7 @@ impl Default for RunRecord {
             bram: None,
             dsp: None,
             checkpoint: None,
+            reuse: None,
             artifacts: None,
         }
     }
@@ -208,6 +211,9 @@ pub struct RunSpec {
     pub name: String,
     pub kind: RunKind,
     pub strategy: helion_proj::RunStrategy,
+    /// Reference checkpoint for an incremental implementation
+    /// (`read_checkpoint -incremental`); `None` = a full place.
+    pub incremental: Option<PathBuf>,
 }
 
 impl RunSpec {
@@ -217,6 +223,7 @@ impl RunSpec {
             name: kind.run_name().to_string(),
             kind,
             strategy: impl_strategy_for(&s.flow.impl_strategy),
+            incremental: None,
         }
     }
 
@@ -250,6 +257,9 @@ pub struct RunArtifacts {
     pub analysis: Option<AnalysisCtx>,
     /// Routed checkpoint written after the bitstream (impl runs only).
     pub checkpoint: Option<PathBuf>,
+    /// Incremental reuse report (`ReuseReport::text`) when the run placed
+    /// against a reference checkpoint.
+    pub reuse: Option<String>,
 }
 
 /// The live worker handle: its event channel plus the cancel flag the
@@ -418,6 +428,7 @@ impl RunsState {
             bram: util.map(|u| u.bram_used),
             dsp: util.map(|u| u.dsp_used),
             checkpoint: art.and_then(|a| a.checkpoint.clone()),
+            reuse: art.and_then(|a| a.reuse.clone()),
             artifacts: art.map(|a| Box::new(a.clone())),
         });
     }
@@ -551,6 +562,7 @@ pub fn start_run_spec(
     let pins = snapshot_pin_constraints(s);
     let kind = spec.kind;
     let strategy = spec.strategy.clone();
+    let incremental = spec.incremental.clone();
     let ckpt = (kind == RunKind::Impl).then(|| {
         checkpoint_root(s)
             .join(&spec.name)
@@ -561,7 +573,21 @@ pub fn start_run_spec(
     let worker_cancel = cancel.clone();
     std::thread::Builder::new()
         .name(format!("helion-run-{}", spec.name))
-        .spawn(move || run_worker(kind, source, part, pins, strategy, ckpt, tx, worker_cancel))
+        .spawn(move || {
+            run_worker(
+                kind,
+                source,
+                part,
+                pins,
+                strategy,
+                RunFiles {
+                    checkpoint: ckpt,
+                    incremental,
+                },
+                tx,
+                worker_cancel,
+            )
+        })
         .map_err(|e| format!("failed to spawn run thread: {e}"))?;
     let builtin = spec.is_builtin();
     s.runs.set_active(spec, rx, cancel);
@@ -909,16 +935,28 @@ pub fn impl_strategy_for(label: &str) -> helion_proj::RunStrategy {
         .unwrap_or_else(|_| helion_proj::RunStrategy::fallback())
 }
 
+/// Checkpoint paths one run reads/writes.
+struct RunFiles {
+    /// Where to write the routed design checkpoint.
+    checkpoint: Option<PathBuf>,
+    /// Reference checkpoint for incremental placement.
+    incremental: Option<PathBuf>,
+}
+
 fn run_worker(
     kind: RunKind,
     source: PathBuf,
     part_req: String,
     pins: Vec<(String, String, String)>,
     strategy: helion_proj::RunStrategy,
-    checkpoint: Option<PathBuf>,
+    files: RunFiles,
     tx: mpsc::Sender<RunEvent>,
     cancel: Arc<AtomicBool>,
 ) {
+    let RunFiles {
+        checkpoint,
+        incremental,
+    } = files;
     let send = |text: String, sev: MsgSev| {
         let _ = tx.send(RunEvent::Line { text, sev });
     };
@@ -1032,9 +1070,32 @@ fn run_worker(
             return;
         }
     }
-    if let Err(e) = session.place_design_with(&dev, strategy.place_opts()) {
-        finish(Err(format!("place_design failed: {e}")));
-        return;
+    match &incremental {
+        // UG904 `read_checkpoint -incremental`: reuse the reference
+        // placement for matching cells (the backend places the rest).
+        Some(reference) => match session.read_checkpoint_incremental(reference, &dev) {
+            Ok(rep) => {
+                send(
+                    format!(
+                        "read_checkpoint -incremental {} {}",
+                        reference.display(),
+                        rep.text()
+                    ),
+                    MsgSev::Info,
+                );
+                art.reuse = Some(rep.text());
+            }
+            Err(e) => {
+                finish(Err(format!("read_checkpoint -incremental failed: {e}")));
+                return;
+            }
+        },
+        None => {
+            if let Err(e) = session.place_design_with(&dev, strategy.place_opts()) {
+                finish(Err(format!("place_design failed: {e}")));
+                return;
+            }
+        }
     }
     if let Some(p) = session.placed.as_ref() {
         send(
@@ -2365,6 +2426,7 @@ mod tests {
             part: String::new(),
             analysis: None,
             checkpoint: None,
+            reuse: None,
         };
         deliver(&mut s, RunKind::Synth, RunEvent::Finished(Ok(art)));
         assert_eq!(s.flow.synth, RunStatus::Complete);

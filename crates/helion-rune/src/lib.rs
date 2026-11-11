@@ -666,6 +666,7 @@ fn seed_runs_fixture(s: &mut AppState) {
             name: name.into(),
             kind: RunKind::Impl,
             strategy: st,
+            incremental: None,
         });
     }
     let rec = |seq, name: &str, kind, outcome, wns: Option<i64>, tns, luts: Option<u32>, ms| RunRecord {
