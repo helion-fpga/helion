@@ -263,12 +263,13 @@ struct RowCx {
     markers: Option<crate::views::debug::GutterMarkers>,
     rtl: bool,
     line_h: f32,
+    /// Caret line, counted once per frame (not once per row).
+    caret: usize,
 }
 
 fn row_el(s: &AppState, i: usize, cx: &RowCx) -> El {
     let t = &cx.t;
-    let caret = caret_line(s);
-    let current = i == caret;
+    let current = i == cx.caret;
     let mono = VivadoTheme::FONT_MONO.mono().lh(cx.line_h);
     let r = cx.idx.range(i);
     let line = s.editor.edit.text.get(r).unwrap_or("");
@@ -352,6 +353,7 @@ pub fn large_body(s: &AppState, t: &VivadoTheme, line_h: f32) -> El {
         markers: crate::views::debug::gutter_markers(s),
         rtl: !crate::views::editor::active_is_xdc(s),
         line_h,
+        caret: caret_line(s),
     };
     col()
         .key("editor-scroll")
@@ -490,6 +492,30 @@ mod tests {
         };
         assert!(line_key_event(&mut s, &down, &mut tx));
         assert_eq!(s.editor.line_at, Some(6));
+    }
+
+    #[test]
+    fn pressing_a_row_moves_the_live_field_there() {
+        let mut rt = rt(big_state(3_000));
+        for k in 1..20 {
+            rt.frame(k as f64 * 0.05);
+        }
+        let (x, y) = rt.find("editor-text-12").expect("row 12 is built");
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for k in 20..40 {
+            rt.frame(k as f64 * 0.05);
+        }
+        assert_eq!(rt.state.editor.line_at, Some(12));
+        assert_eq!(rt.state.editor.cursor_line, 12);
+        let field = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("editor-line-field"))
+            .expect("caret row is a field");
+        assert!(field.focused, "the moved field takes focus");
+        assert!(rt.find("editor-text-12").is_none(), "row 12 is now the field");
     }
 
     #[test]
