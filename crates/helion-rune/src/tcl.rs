@@ -350,6 +350,11 @@ pub fn eval_command(s: &mut AppState, verb: &str) {
     if !self_echo {
         push_lines(s, verb, MsgSev::Info);
     }
+    // Engine-heavy verbs typed or clicked as one plain command run on a
+    // worker; their value (or error) lands when it finishes.
+    if crate::jobs::submit_tcl(s, verb) {
+        return;
+    }
     let mut puts_out: Vec<String> = Vec::new();
     let mut values: Vec<String> = Vec::new();
     match eval_script(s, verb, &mut puts_out, 0, &mut values) {
@@ -382,6 +387,20 @@ pub fn eval_command(s: &mut AppState, verb: &str) {
             echo_puts(s, &puts_out);
             push_lines(s, &format!("ERROR: {}", fmt_error(&e)), MsgSev::Error);
         }
+    }
+}
+
+/// Print a top-level command's outcome exactly as [`eval_command`] does for
+/// a one-line command (worker completions of deferred verbs).
+pub(crate) fn push_result(s: &mut AppState, result: Result<String, String>) {
+    match result {
+        Ok(v) if !v.is_empty() => push_lines(s, &v, MsgSev::Info),
+        Ok(_) => {}
+        Err(msg) => push_lines(
+            s,
+            &format!("ERROR: {}", fmt_error(&TclError { msg, line: 1 })),
+            MsgSev::Error,
+        ),
     }
 }
 
@@ -432,6 +451,17 @@ struct ParsedCmd {
 /// (the console echoes the last, mirroring `tcl_eval`); the first error or
 /// non-local control aborts the rest (Tcl semantics). Returns the final
 /// control state so bodies propagate `return`/`break`/`continue`.
+/// The scripted interpreter path for one line (job-parity tests).
+#[cfg(test)]
+pub(crate) fn eval_script_for_test(
+    s: &mut AppState,
+    script: &str,
+    puts_out: &mut Vec<String>,
+    values: &mut Vec<String>,
+) -> bool {
+    !matches!(eval_script(s, script, puts_out, 0, values), Ctl::Error(_))
+}
+
 fn eval_script(
     s: &mut AppState,
     script: &str,
@@ -2694,29 +2724,19 @@ fn dispatch_host(
             Ctl::Value("open_hw_manager sim".into())
         }
         "program_hw" | "program_hw_devices" => {
-            let dev = match helion_device::Device::load_part(&s.project.part) {
-                Ok(d) => d,
-                Err(e) => return Ctl::err(line, e),
-            };
-            if s.tcl.session.bitstream.is_none() {
-                if let Err(e) = impl_if_needed(s) {
-                    return Ctl::err(line, e);
-                }
-            }
-            if !s.tcl.session.hw_open {
-                s.tcl.session.open_hw_manager();
-            }
-            let cable = argv
-                .iter()
-                .skip(1)
-                .find_map(|a| a.strip_prefix("cable="))
-                .unwrap_or("auto");
-            let result = s.tcl.session.program_hw_cable(&dev, cable);
-            // The Hardware Manager pane mirrors the console program result.
-            crate::views::program::note_tcl_program(s, &result);
-            match result {
-                Ok(v) => Ctl::Value(v),
+            let cable = program_cable(argv);
+            let design = s.tcl.design.clone();
+            let part = s.project.part.clone();
+            match program_hw_session(&mut s.tcl.session, design.as_ref(), &part, cable) {
                 Err(e) => Ctl::err(line, e),
+                Ok(result) => {
+                    // The Hardware Manager pane mirrors the console program result.
+                    crate::views::program::note_tcl_program(s, &result);
+                    match result {
+                        Ok(v) => Ctl::Value(v),
+                        Err(e) => Ctl::err(line, e),
+                    }
+                }
             }
         }
         "report_die" | "report_hw_targets" => {
@@ -2837,6 +2857,38 @@ fn sync_session_design(s: &mut AppState) {
 
 /// Run the implementation flow unless a bitstream already exists. Mirrors
 /// `impl_if_needed` (`helion-gui/src/lib.rs:228`).
+/// `cable=ID` of a `program_hw` command line (`auto` when absent).
+pub(crate) fn program_cable(argv: &[String]) -> &str {
+    argv.iter()
+        .skip(1)
+        .find_map(|a| a.strip_prefix("cable="))
+        .unwrap_or("auto")
+}
+
+/// The `program_hw` body over a session (the console thread or a
+/// [`crate::jobs`] worker): load the part, implement when no bitstream
+/// exists yet, open the hardware manager, program. The outer `Err` is a
+/// failure before programming; the inner result is the program outcome
+/// the Hardware Manager pane mirrors.
+pub(crate) fn program_hw_session(
+    session: &mut helion_proj::Session,
+    design: Option<&helion_ir::Design>,
+    part: &str,
+    cable: &str,
+) -> Result<Result<String, String>, String> {
+    let dev = helion_device::Device::load_part(part)?;
+    if session.bitstream.is_none() {
+        let d = design
+            .cloned()
+            .ok_or("no design (read_sv / synth_design first)")?;
+        session.impl_design(d, &dev)?;
+    }
+    if !session.hw_open {
+        session.open_hw_manager();
+    }
+    Ok(session.program_hw_cable(&dev, cable))
+}
+
 fn impl_if_needed(s: &mut AppState) -> Result<(), String> {
     if s.tcl.session.bitstream.is_some() {
         return Ok(());
@@ -4427,111 +4479,91 @@ fn cmd_open_report(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
 /// the engine where the last run left its inputs (STA for the timing
 /// summary and methodology, the DRC deck, `report_power`), and return the
 /// text dump of the resulting state. Missing results are honest errors
-/// naming the run that produces them.
+/// naming the run that produces them. Interactive calls of the re-running
+/// verbs take the same three steps with the engine on a worker
+/// ([`crate::jobs`]).
 fn cmd_report_analysis(s: &mut AppState, name: &str, argv: &[String], line: usize) -> Ctl {
     use crate::analysis as an;
-    use crate::state::CenterPane;
-    use crate::views::reports::ReportNav;
-    use crate::views::timing::TimingNav;
     if argv.len() != 1 {
         return Ctl::err(line, wrong_args(name));
     }
-    let no_timing = || {
-        Ctl::err(
-            line,
-            format!("{name}: no timing results (launch_runs synth_1 or impl_1 first)"),
-        )
+    report_navigate(s, name);
+    let rerun = match name {
+        "report_timing_summary" if an::timing_unavailable(s).is_none() => {
+            Some(an::rerun_timing(s))
+        }
+        "report_power" if an::timing_unavailable(s).is_none() => Some(an::rerun_power(s)),
+        "report_methodology" if an::timing_unavailable(s).is_none() => {
+            Some(an::rerun_methodology(s))
+        }
+        "report_drc" if an::drc_unavailable(s).is_none() => Some(an::rerun_drc(s)),
+        _ => None,
     };
-    let goto_timing = |s: &mut AppState, nav: TimingNav| {
+    if let Some(Err(e)) = rerun {
+        return Ctl::err(line, format!("{name}: {e}"));
+    }
+    match report_value(s, name) {
+        Ok(v) => Ctl::Value(v),
+        Err(e) => Ctl::err(line, e),
+    }
+}
+
+/// Show the surface a report verb dumps (Timing or Reports page).
+pub(crate) fn report_navigate(s: &mut AppState, name: &str) {
+    use crate::state::CenterPane;
+    use crate::views::reports::ReportNav;
+    use crate::views::timing::TimingNav;
+    let timing = |s: &mut AppState, nav: TimingNav| {
         s.navigate(CenterPane::Timing);
         s.timing_view.selected = nav;
     };
-    let goto_report = |s: &mut AppState, nav: ReportNav| {
+    let report = |s: &mut AppState, nav: ReportNav| {
         s.navigate(CenterPane::Reports);
         s.reports_view.selected = nav;
     };
     match name {
-        "report_timing_summary" => {
-            goto_timing(s, TimingNav::Summary);
-            if an::timing_unavailable(s).is_none() {
-                if let Err(e) = an::rerun_timing(s) {
-                    return Ctl::err(line, format!("{name}: {e}"));
-                }
-            }
-            if !s.timing.has_run {
-                return no_timing();
-            }
-            Ctl::Value(an::timing_summary_text(&s.timing))
+        "report_timing_summary" => timing(s, TimingNav::Summary),
+        "report_clock_interaction" => timing(s, TimingNav::ClockInteraction),
+        "report_cdc" => timing(s, TimingNav::InterClock),
+        "report_clock_networks" => timing(s, TimingNav::ClockSummary),
+        "report_power" => report(s, ReportNav::Power),
+        "report_methodology" => report(s, ReportNav::Methodology),
+        "report_drc" => report(s, ReportNav::Drc),
+        _ => s.navigate(CenterPane::Constraints),
+    }
+}
+
+/// The text a report verb returns for the current (already re-run) state.
+pub(crate) fn report_value(s: &AppState, name: &str) -> Result<String, String> {
+    use crate::analysis as an;
+    let no_timing =
+        || format!("{name}: no timing results (launch_runs synth_1 or impl_1 first)");
+    match name {
+        "report_timing_summary" if s.timing.has_run => Ok(an::timing_summary_text(&s.timing)),
+        "report_clock_interaction" if s.timing.has_run => {
+            Ok(an::clock_interaction_text(&s.timing))
         }
-        "report_clock_interaction" => {
-            goto_timing(s, TimingNav::ClockInteraction);
-            if !s.timing.has_run {
-                return no_timing();
-            }
-            Ctl::Value(an::clock_interaction_text(&s.timing))
-        }
-        "report_cdc" => {
-            goto_timing(s, TimingNav::InterClock);
-            if !s.timing.has_run {
-                return no_timing();
-            }
-            Ctl::Value(an::cdc_text(&s.timing))
-        }
-        "report_clock_networks" => {
-            goto_timing(s, TimingNav::ClockSummary);
-            if !s.timing.has_run {
-                return no_timing();
-            }
-            Ctl::Value(an::clock_networks_text(&s.timing))
-        }
-        "report_power" => {
-            goto_report(s, ReportNav::Power);
-            if an::timing_unavailable(s).is_none() {
-                if let Err(e) = an::rerun_power(s) {
-                    return Ctl::err(line, format!("{name}: {e}"));
-                }
-            }
-            if !an::power_ready(s) {
-                return Ctl::err(
-                    line,
-                    format!("{name}: no power results (launch_runs synth_1 or impl_1 first)"),
-                );
-            }
-            Ctl::Value(an::power_text(&s.power))
-        }
-        "report_methodology" => {
-            goto_report(s, ReportNav::Methodology);
-            if an::timing_unavailable(s).is_none() {
-                if let Err(e) = an::rerun_methodology(s) {
-                    return Ctl::err(line, format!("{name}: {e}"));
-                }
-            }
-            if !s.timing.has_run {
-                return no_timing();
-            }
-            Ctl::Value(an::methodology_text(&s.timing))
-        }
-        "report_drc" => {
-            goto_report(s, ReportNav::Drc);
-            if an::drc_unavailable(s).is_none() {
-                if let Err(e) = an::rerun_drc(s) {
-                    return Ctl::err(line, format!("{name}: {e}"));
-                }
-            }
-            if !s.drc.has_run {
-                return Ctl::err(
-                    line,
-                    format!("{name}: no placed design (launch_runs impl_1 or place_design first)"),
-                );
-            }
-            Ctl::Value(an::drc_text(&s.drc))
-        }
+        "report_cdc" if s.timing.has_run => Ok(an::cdc_text(&s.timing)),
+        "report_clock_networks" if s.timing.has_run => Ok(an::clock_networks_text(&s.timing)),
+        "report_methodology" if s.timing.has_run => Ok(an::methodology_text(&s.timing)),
+        "report_timing_summary"
+        | "report_clock_interaction"
+        | "report_cdc"
+        | "report_clock_networks"
+        | "report_methodology" => Err(no_timing()),
+        "report_power" if an::power_ready(s) => Ok(an::power_text(&s.power)),
+        "report_power" => Err(format!(
+            "{name}: no power results (launch_runs synth_1 or impl_1 first)"
+        )),
+        "report_drc" if s.drc.has_run => Ok(an::drc_text(&s.drc)),
+        "report_drc" => Err(format!(
+            "{name}: no placed design (launch_runs impl_1 or place_design first)"
+        )),
         _ => {
-            s.navigate(CenterPane::Constraints);
             let parsed = crate::views::constraints::parse_constraints(
                 &crate::views::constraints::xdc_lines(s),
             );
-            Ctl::Value(crate::views::constraints::constraints_text(&parsed))
+            Ok(crate::views::constraints::constraints_text(&parsed))
         }
     }
 }
@@ -7540,6 +7572,7 @@ mod tests {
         eval_command(&mut s, "open_hw_manager");
         assert!(has_line(&s, "open_hw_manager sim"), "got: {:?}", lines(&s));
         eval_command(&mut s, "program_hw cable=sim");
+        crate::jobs::wait_idle(&mut s);
         assert!(has_line(&s, "backend=sim"), "got: {:?}", lines(&s));
         assert!(has_line(&s, "DONE="), "got: {:?}", lines(&s));
         let before = s.console.lines.len();
@@ -7585,6 +7618,7 @@ mod tests {
             lines(&s)
         );
         eval_command(&mut s, "program_hw_devices cable=sim");
+        crate::jobs::wait_idle(&mut s);
         assert!(has_line(&s, "backend=sim"), "got: {:?}", lines(&s));
         eval_command(&mut s, "report_hw_targets");
         assert!(has_line(&s, "HL10T-C32-1"), "got: {:?}", lines(&s));

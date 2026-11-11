@@ -14,7 +14,7 @@ use rune::{El, col, el, row, text};
 
 use super::{QorSnapshot, ReportNav};
 use crate::analysis;
-use crate::state::{AppState, ConsoleLine, MsgSev, RunStatus};
+use crate::state::{AppState, RunStatus};
 use crate::theme::VivadoTheme;
 use crate::views::report_kit::{self as kit, header_row, num_cell, plain_row, table};
 use crate::views::summary::pct;
@@ -48,32 +48,10 @@ pub fn report_ready(s: &AppState, nav: ReportNav) -> bool {
     }
 }
 
-fn console_line(s: &mut AppState, text: String, sev: MsgSev) {
-    s.console.lines.push(ConsoleLine { text, sev });
-}
-
-/// Report Utilization: recount from the last run and log the result.
+/// Report Utilization: recount from the last run on a worker and log the
+/// result (`crate::jobs::util_line`).
 fn report_util(s: &mut AppState) {
-    match analysis::rerun_util(s) {
-        Ok(()) => {
-            let u = &s.util;
-            let line = format!(
-                "report_utilization refreshed: LUT {}/{} FF {}/{} IOB {}/{} BRAM {}/{} DSP {}/{}",
-                u.luts_used,
-                u.luts_avail,
-                u.regs_used,
-                u.regs_avail,
-                u.io_used,
-                u.io_avail,
-                u.bram_used,
-                u.bram_avail,
-                u.dsp_used,
-                u.dsp_avail
-            );
-            console_line(s, line, MsgSev::Info);
-        }
-        Err(e) => console_line(s, format!("ERROR: report_utilization: {e}"), MsgSev::Error),
-    }
+    crate::jobs::submit_util(s);
 }
 
 /// Action bar for the selected report: what produced it plus the one real
@@ -118,6 +96,13 @@ pub fn action_bar(s: &AppState, nav: ReportNav, t: &VivadoTheme) -> El {
             "Evaluated on the elaborated design".to_string(),
         ),
     };
+    // Engine re-runs are worker jobs: every re-run action waits for the
+    // one in flight (QoR evaluates on the spot and never waits).
+    let busy = (nav != ReportNav::Qor)
+        .then(|| crate::jobs::analysis_busy(s))
+        .flatten();
+    let label = if busy.is_some() { "Running…" } else { label };
+    let reason = busy.or(reason);
     let button = kit::action_button(key, label, reason, t, move |s: &mut AppState| match nav {
         ReportNav::Utilization => report_util(s),
         ReportNav::Power => crate::tcl::eval_command(s, "report_power"),

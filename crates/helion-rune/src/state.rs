@@ -1082,6 +1082,8 @@ pub struct AppState {
     pub toasts: ToastState,
     /// Real engine runs: source override, per-run log buffers, live worker.
     pub runs: crate::runs::RunsState,
+    /// Off-UI-thread engine jobs (report re-runs, Tcl `program_hw`).
+    pub jobs: crate::jobs::JobsState,
     /// Persistent Tcl session behind the `tcl>` input (vars, history, design).
     pub tcl: crate::tcl::TclSession,
     /// Theme choice: follow the OS (`cx.system_dark`) or a manual View-menu
@@ -1283,6 +1285,7 @@ impl AppState {
             nav_forward: Vec::new(),
             toasts: ToastState::default(),
             runs: crate::runs::RunsState::default(),
+            jobs: crate::jobs::JobsState::default(),
             tcl: crate::tcl::TclSession::default(),
             theme: crate::theme::ThemeMode::default(),
             palette: crate::views::palette::PaletteState::default(),

@@ -873,7 +873,8 @@ fn inter_paths_note(t: &VivadoTheme) -> El {
         )
 }
 
-/// Re-run STA through the real `report_timing_summary` verb.
+/// Re-run STA through the real `report_timing_summary` verb (a worker job;
+/// the button stays busy until it lands).
 fn rerun_summary(s: &mut AppState) {
     crate::tcl::eval_command(s, "report_timing_summary");
 }
@@ -905,8 +906,12 @@ fn action_bar(s: &AppState, t: &VivadoTheme) -> El {
         .child(el().grow(1.0))
         .child(kit::action_button(
             "timing-rerun",
-            "Report Timing Summary",
-            crate::analysis::timing_unavailable(s),
+            if s.jobs.pending(crate::jobs::JobKind::Timing) {
+                "Analyzing…"
+            } else {
+                "Report Timing Summary"
+            },
+            crate::jobs::analysis_busy(s).or(crate::analysis::timing_unavailable(s)),
             t,
             rerun_summary,
         ))
