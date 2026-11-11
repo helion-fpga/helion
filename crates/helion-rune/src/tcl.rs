@@ -245,6 +245,9 @@ pub const COMMANDS: &[&str] = &[
     "bd_hdl",
     "report_bitstream",
     "select_bitstream_frame",
+    "find",
+    "sheet_find",
+    "select_find",
 ];
 
 /// Max nested `[...]` evaluation depth (mirrors the real interp's cap idea;
@@ -2747,6 +2750,18 @@ fn dispatch_host(
             let spec = argv.get(1..).unwrap_or_default().join(" ");
             ctl_result(crate::views::bitstream::select_frame(s, &spec), line)
         }
+        "find" | "find_results" => {
+            let query = argv.get(1..).unwrap_or_default().join(" ");
+            ctl_result(crate::views::find::find(s, &query), line)
+        }
+        "sheet_find" => {
+            let kind = argv.get(1..).unwrap_or_default().join(" ");
+            ctl_result(crate::views::find::sheet_find(s, &kind), line)
+        }
+        "select_find" => {
+            let spec = argv.get(1..).unwrap_or_default().join(" ");
+            ctl_result(crate::views::find::select_find(s, &spec), line)
+        }
         _ => unknown_command(s, name, line),
     }
 }
@@ -4933,6 +4948,15 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
             "select_bitstream_frame index|FAR|block ?major minor?",
             "select one configuration frame",
         ),
+        "find" => ("find ?query?", "search live cells, ports, and nets"),
+        "sheet_find" => (
+            "sheet_find cells|ports|nets",
+            "find every object of one type",
+        ),
+        "select_find" => (
+            "select_find name|index|kind:name",
+            "select a find hit and cross-probe it",
+        ),
         _ => return None,
     })
 }
@@ -4952,6 +4976,8 @@ fn help_overview() -> String {
         "  create_clock report_timing report_utilization mark_debug eco open_hw_manager program_hw report_die report_featuremap",
         "More: unset list_properties read_verilog read_vhdl add_probe program_hw_devices report_hw_targets write_hnf",
         "  hds::synth hds::impl hds::flow hds::tree | history launch_runs cancel_runs open_report",
+        "Hardware/IP: report_hw_stat select_hw_stat | ip_catalog select_ip generate_ip create_bd create_bd_cell bd_drawing bd_hdl",
+        "  report_bitstream select_bitstream_frame | find sheet_find select_find",
         "help <command> for usage. See docs/tcl-subset.md for the supported subset.",
     ]
     .join("\n")
