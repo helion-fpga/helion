@@ -8,6 +8,7 @@
 //! modules flatten to empty stubs (missing source, not an unknown construct).
 
 mod preprocess;
+mod line_cov;
 pub use preprocess::{expand_includes, preprocess_sv};
 mod aig_opt;
 pub mod equiv;
@@ -4970,7 +4971,13 @@ fn leak_preprocessed(pre: String) -> &'static str {
 fn parse_file_modules(path: &Path) -> Result<Vec<Rtl<'static>>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let dir = path.parent().unwrap_or(path);
-    let expanded = expand_includes(&text, dir);
+    let expanded = if line_cov::enabled() {
+        let (text, segs) = preprocess::expand_includes_mapped(&text, dir, &path.display().to_string());
+        line_cov::set_pending_segs(segs);
+        text
+    } else {
+        expand_includes(&text, dir)
+    };
     let pre = preprocess_sv(&strip_comments(&expanded));
     push_readmem_base(&path.display().to_string());
     parse_preprocessed(pre)
@@ -5005,6 +5012,7 @@ fn sibling_modules(dir: &Path, missing: &HashSet<String>, skip: &Path) -> Result
 }
 
 fn strip_comments(s: &str) -> String {
+    let keep_lines = line_cov::enabled();
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(s.len());
     let mut i = 0;
@@ -5018,6 +5026,11 @@ fn strip_comments(s: &str) -> String {
         if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'*' {
             i += 2;
             while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                // Line coverage keeps line structure so later tokens keep
+                // their source line (plain synthesis is unchanged).
+                if keep_lines && b[i] == b'\n' {
+                    out.push(b'\n');
+                }
                 i += 1;
             }
             i = (i + 2).min(b.len());
@@ -5086,6 +5099,19 @@ fn parse_based_digits(digits: &str, base: u32) -> u128 {
 }
 
 fn tokenize(s: &str) -> Result<Vec<Tok<'_>>, String> {
+    tokenize_impl(s, None)
+}
+
+/// [`tokenize`] plus each token's start byte offset in `s` (line coverage
+/// maps tokens back to source lines with it).
+fn tokenize_with_offsets(s: &str) -> Result<(Vec<Tok<'_>>, Vec<u32>), String> {
+    let mut offs = Vec::new();
+    let toks = tokenize_impl(s, Some(&mut offs))?;
+    Ok((toks, offs))
+}
+
+fn tokenize_impl<'s>(s: &'s str, mut offs: Option<&mut Vec<u32>>) -> Result<Vec<Tok<'s>>, String> {
+    let mut tok_start = 0u32;
     let b = s.as_bytes();
     let mut i = 0;
     let mut out = Vec::new();
@@ -5176,6 +5202,11 @@ fn tokenize(s: &str) -> Result<Vec<Tok<'_>>, String> {
         if c.is_ascii_whitespace() {
             i += 1;
             continue;
+        }
+        // Tokens pushed by the previous iteration started at `tok_start`.
+        if let Some(o) = offs.as_deref_mut() {
+            o.resize(out.len(), tok_start);
+            tok_start = i as u32;
         }
         if c == '"' {
             i += 1;
@@ -5454,6 +5485,9 @@ fn tokenize(s: &str) -> Result<Vec<Tok<'_>>, String> {
         // Nothing unknown: leftover glyphs become symbols the parser can eat.
         out.push(Tok::Sym(c));
         i += 1;
+    }
+    if let Some(o) = offs.as_deref_mut() {
+        o.resize(out.len(), tok_start);
     }
     Ok(out)
 }
@@ -10400,7 +10434,9 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
         let _ = p.eat_sym(';');
         return Ok((SeqItemOut::Nbas(vec![("return", None, rhs)]), Vec::new()));
     }
+    let stmt_at = p.i;
     if p.eat_kw("for") {
+        line_cov::stmt(line_cov::tok_loc(p.t, stmt_at), p.arena);
         let (nbas, imms) = parse_for_unroll(p)?;
         return Ok((SeqItemOut::Nbas(nbas), imms));
     }
@@ -10425,12 +10461,32 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
         if !p.eat_sym(')') {
             return Err("if )".into());
         }
+        // Line coverage: the `if` is a statement with a true and a false arm
+        // (also without `else`); elaboration-constant conditions are not
+        // branches, and the arm they remove is not hardware.
+        let known = cond_const.or_else(|| if_cond_known(p, &cond));
+        let cov_cond = if line_cov::enabled() && known.is_none() {
+            Some(line_cov::truth(&cond, p.arena))
+        } else {
+            None
+        };
+        let if_loc = line_cov::tok_loc(p.t, stmt_at);
+        line_cov::stmt(if_loc.clone(), p.arena);
+        if let Some(c) = &cov_cond {
+            let branch = line_cov::new_branch();
+            let at = |index, label| line_cov::ArmAt { branch, construct: "if", index, label, site: None };
+            line_cov::arm(if_loc.clone(), at(0, "true"), c.clone(), p.arena);
+            line_cov::arm(if_loc, at(1, "false"), line_cov::not(c.clone(), p.arena), p.arena);
+        }
         let _ = parse_attrs(p);
         let then_b = p.eat_kw("begin");
         if then_b && p.eat_sym(':') {
             let _ = p.ident();
         }
-        let (then_raw, then_imms) = parse_seq_block(p, then_b)?;
+        let (then_raw, then_imms) = {
+            let _g = line_cov::GuardScope::branch(known, cov_cond.as_ref(), true, p.arena);
+            parse_seq_block(p, then_b)?
+        };
         let then_s = normalize_nbas(p, then_raw);
         let (else_s, nested_imms) = if p.eat_kw("else") {
             let _ = parse_attrs(p);
@@ -10438,7 +10494,10 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
             if eb && p.eat_sym(':') {
                 let _ = p.ident();
             }
-            let (else_raw, else_imms) = parse_seq_block(p, eb)?;
+            let (else_raw, else_imms) = {
+                let _g = line_cov::GuardScope::branch(known, cov_cond.as_ref(), false, p.arena);
+                parse_seq_block(p, eb)?
+            };
             (normalize_nbas(p, else_raw), else_imms)
         } else {
             (Vec::new(), Vec::new())
@@ -10534,6 +10593,17 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
         if !p.eat_sym(')') {
             return Err("case )".into());
         }
+        // Line coverage: the `case` is a statement; each item is an arm
+        // selected when it matches and no earlier item did, `default` when
+        // none matches.
+        let case_loc = line_cov::tok_loc(p.t, stmt_at);
+        line_cov::stmt(case_loc.clone(), p.arena);
+        let cov = line_cov::enabled();
+        let case_br = if cov { line_cov::new_branch() } else { 0 };
+        let mut cov_prev: Option<RExpr<'a>> = None;
+        let mut cov_arm = 0u32;
+        let mut cov_default: Option<(usize, usize)> = None;
+        let mut cov_default_not_last = false;
         let mut arms: Vec<(Option<RExpr<'a>>, Vec<Nba<'a>>)> = Vec::new();
         let mut def: Vec<Nba<'a>> = Vec::new();
         // Immediates nested in arms bubble to the enclosing block.
@@ -10543,6 +10613,7 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
                 return Err("unterminated case".into());
             }
             let _ = parse_attrs(p);
+            let item_at = p.i;
             if p.eat_kw("default") {
                 let _ = p.eat_sym(':');
                 let _ = parse_attrs(p);
@@ -10550,7 +10621,31 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
                 if b && p.eat_sym(':') {
                     let _ = p.ident();
                 }
-                let (def_raw, def_imms) = parse_seq_block(p, b)?;
+                let (def_raw, def_imms) = {
+                    let m0 = line_cov::mark();
+                    let _g = if cov {
+                        let none = match cov_prev.clone() {
+                            Some(prev) => line_cov::not(prev, p.arena),
+                            None => RExpr::Const { val: 1, width: 1, care: 1 },
+                        };
+                        let loc = line_cov::tok_loc(p.t, item_at);
+                        let at = line_cov::ArmAt {
+                            branch: case_br,
+                            construct: "case",
+                            index: cov_arm,
+                            label: "default",
+                            site: case_loc.as_ref(),
+                        };
+                        line_cov::arm(loc, at, none.clone(), p.arena);
+                        cov_arm += 1;
+                        line_cov::GuardScope::push(none)
+                    } else {
+                        line_cov::GuardScope::none()
+                    };
+                    let r = parse_seq_block(p, b)?;
+                    cov_default = Some((m0, line_cov::mark()));
+                    r
+                };
                 def = normalize_nbas(p, def_raw);
                 nested.extend(def_imms);
                 continue;
@@ -10569,9 +10664,6 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
             if b && p.eat_sym(':') {
                 let _ = p.ident();
             }
-            let (body_raw, body_imms) = parse_seq_block(p, b)?;
-            let body = normalize_nbas(p, body_raw);
-            nested.extend(body_imms);
             // One Or-of-Eq cond shared by the arm (not N duplicate arms).
             let mut cond = RExpr::Eq(p.arena.alloc(sel.clone()), p.arena.alloc(items[0].clone()));
             for it in items.into_iter().skip(1) {
@@ -10580,7 +10672,41 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
                     p.arena.alloc(RExpr::Eq(p.arena.alloc(sel.clone()), p.arena.alloc(it))),
                 );
             }
+            let (body_raw, body_imms) = {
+                let _g = if cov {
+                    let hit = line_cov::truth(&cond, p.arena);
+                    let pick = match cov_prev.clone() {
+                        Some(prev) => line_cov::and(hit.clone(), line_cov::not(prev, p.arena), p.arena),
+                        None => hit.clone(),
+                    };
+                    let loc = line_cov::tok_loc(p.t, item_at);
+                    let label = line_cov::arm_label(p.t, item_at);
+                    let at = line_cov::ArmAt {
+                        branch: case_br,
+                        construct: "case",
+                        index: cov_arm,
+                        label: &label,
+                        site: case_loc.as_ref(),
+                    };
+                    line_cov::arm(loc, at, pick.clone(), p.arena);
+                    cov_arm += 1;
+                    cov_prev = Some(match cov_prev.take() {
+                        Some(prev) => line_cov::or(prev, hit, p.arena),
+                        None => hit,
+                    });
+                    cov_default_not_last |= cov_default.is_some();
+                    line_cov::GuardScope::push(pick)
+                } else {
+                    line_cov::GuardScope::none()
+                };
+                parse_seq_block(p, b)?
+            };
+            let body = normalize_nbas(p, body_raw);
+            nested.extend(body_imms);
             arms.push((Some(cond), body));
+        }
+        if let (Some((from, to)), true) = (cov_default, cov_default_not_last) {
+            line_cov::drop_range(from, to, "case default is not the last item");
         }
         let mut out = Vec::new();
         for (item, body) in arms.into_iter().rev() {
@@ -10615,7 +10741,24 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
         return Ok((SeqItemOut::Nbas(out), nested));
     }
     let nbas = parse_assign_nbas(p)?;
+    line_cov::stmt(line_cov::tok_loc(p.t, stmt_at), p.arena);
     Ok((SeqItemOut::Nbas(nbas), Vec::new()))
+}
+
+/// Elaboration-time value of an `if` condition comparing parameters /
+/// constants (`MODE == "FAST"`), as the `if` lowering folds it.
+fn if_cond_known(p: &P<'_>, cond: &RExpr<'_>) -> Option<bool> {
+    let side = |e: &RExpr<'_>| match e {
+        RExpr::Const { val, .. } => Some(*val),
+        RExpr::Ident(name) => p.params.get(*name).copied(),
+        _ => None,
+    };
+    match cond {
+        RExpr::Const { val, care, .. } if *care & 1 == 1 => Some(*val != 0),
+        RExpr::Eq(a, b) => Some(side(a)? == side(b)?),
+        RExpr::Ne(a, b) => Some(side(a)? != side(b)?),
+        _ => None,
+    }
 }
 
 fn skip_until_kw<'a>(p: &mut P<'a>, kw: &str) {
@@ -10647,7 +10790,14 @@ fn parse_preprocessed(pre: String) -> Result<Vec<Rtl<'static>>, String> {
     // The token slice is leaked alongside the source: one bounded allocation
     // per parsed file (same rationale as `leak_preprocessed`), so the
     // returned `Rtl<'static>` modules stay valid without cloning every token.
-    let toks: &'static [Tok<'static>] = Box::leak(tokenize(s)?.into_boxed_slice());
+    let toks: &'static [Tok<'static>] = if line_cov::enabled() {
+        let (toks, offs) = tokenize_with_offsets(s)?;
+        let toks: &'static [Tok<'static>] = Box::leak(toks.into_boxed_slice());
+        line_cov::register_source(s, toks, offs);
+        toks
+    } else {
+        Box::leak(tokenize(s)?.into_boxed_slice())
+    };
     // One arena per parsed file, leaked alongside the tokens: every RExpr node
     // the parser builds lives here instead of a per-node malloc. Bounded (one
     // per file) and freed at process exit — same rationale as `leak_preprocessed`.
@@ -12717,6 +12867,94 @@ fn push_decl_assign<'a>(
     }
 }
 
+/// Line coverage: a probe may only read module ports / signals, and an
+/// `always_comb` probe must not read a variable the same block assigns (it
+/// would see the block's final value, not the one the statement saw).
+fn lcov_check<'a>(
+    e: &RExpr<'a>,
+    ports: &[(&'a str, PortDir, usize)],
+    signals: &[Signal<'a>],
+    written: Option<&HashSet<&'a str>>,
+) -> Result<(), &'static str> {
+    let mut ids = Vec::new();
+    line_cov::idents(e, &mut ids);
+    for id in ids {
+        if !ports.iter().any(|(n, _, _)| *n == id) && !signals.iter().any(|s| s.name == id) {
+            return Err("condition reads a name that is not a module signal");
+        }
+        if written.is_some_and(|w| w.contains(id)) {
+            return Err("condition reads a value assigned in the same always_comb");
+        }
+    }
+    Ok(())
+}
+
+/// Line coverage: declare each probe as a kept 1..32-bit signal driven by a
+/// continuous assign of its expression.
+fn lcov_push<'a>(
+    p: &mut P<'a>,
+    probes: Vec<line_cov::Probe<'a>>,
+    signals: &mut Vec<Signal<'a>>,
+    assigns: &mut Vec<Nba<'a>>,
+) {
+    for pr in probes {
+        let name: &'a str = pr.signal_name(p.arena);
+        signals.push(Signal {
+            name,
+            width: pr.width,
+            depth: 0,
+            keep: true,
+            mark_debug: true,
+            force_bram: false,
+        });
+        note_width(p, name, pr.width);
+        assigns.push((name, None, pr.rhs));
+    }
+}
+
+/// Line coverage for `assign <lhs> = ...;` at token `at`: a probe copying
+/// (up to 32 bits of) the assigned target.
+fn lcov_assign_probe<'a>(
+    p: &mut P<'a>,
+    at: usize,
+    kind: &LhsKind<'a>,
+    ports: &[(&'a str, PortDir, usize)],
+    signals: &mut Vec<Signal<'a>>,
+    assigns: &mut Vec<Nba<'a>>,
+) {
+    let width_of = |n: &str| {
+        signals
+            .iter()
+            .find(|s| s.name == n)
+            .map(|s| s.width)
+            .or_else(|| ports.iter().find(|(pn, _, _)| *pn == n).map(|(_, _, w)| *w))
+    };
+    let (target, w) = match kind {
+        LhsKind::Whole(n) => {
+            let Some(w) = width_of(n) else { return };
+            if w <= 32 {
+                (RExpr::Ident(n), w)
+            } else {
+                (RExpr::Range(n, 31, 0), 32)
+            }
+        }
+        LhsKind::Bit(n, b) => (RExpr::Bit(n, *b), 1),
+        LhsKind::Slice { name, lo, width } => {
+            let w = (*width).clamp(1, 32);
+            (RExpr::Range(name, lo + w - 1, *lo), w)
+        }
+        _ => return,
+    };
+    // A one-item concat, so the copy lowers to its own net instead of being
+    // aliased onto the target's.
+    let target = RExpr::Concat(vec![target]);
+    let loc = line_cov::tok_loc(p.t, at);
+    let sigs: &[Signal<'a>] = signals;
+    if let Some(pr) = line_cov::assign_probe(loc, target, w, |e| lcov_check(e, ports, sigs, None)) {
+        lcov_push(p, vec![pr], signals, assigns);
+    }
+}
+
 fn parse_module_items<'a>(
     mut p: &mut P<'a>,
     ports: &mut Vec<(&'a str, PortDir, usize)>,
@@ -13282,6 +13520,7 @@ fn parse_module_items<'a>(
             }
             continue;
         }
+        let assign_at = p.i;
         if p.eat_kw("assign") {
             if p.eat_sym('{') {
                 let mut parts: Vec<(&'a str, Option<usize>)> = Vec::new();
@@ -13372,6 +13611,9 @@ fn parse_module_items<'a>(
                 match (parse_lhs(&mut p), p.eat_sym('='), parse_rexpr(&mut p)) {
                     (Ok(kind), true, Ok(rhs)) => {
                         let _ = p.eat_sym(';');
+                        if line_cov::enabled() {
+                            lcov_assign_probe(p, assign_at, &kind, ports, signals, assigns);
+                        }
                         assigns.extend(lhs_kind_assigns(kind, rhs, p.arena));
                     }
                     _ => {
@@ -13398,12 +13640,19 @@ fn parse_module_items<'a>(
             if p.eat_sym(':') {
                 let _ = p.ident();
             }
+            line_cov::begin_proc(false);
             match parse_seq_block(&mut p, block) {
                 Ok((stmts, simms)) => {
+                    if line_cov::enabled() {
+                        let written: HashSet<&'a str> = stmts.iter().map(|(l, _, _)| *l).collect();
+                        let probes = line_cov::end_proc(|e| lcov_check(e, ports, signals, Some(&written)));
+                        lcov_push(p, probes, signals, assigns);
+                    }
                     assigns.extend(fold_blocking_assigns(stmts, &p.widths, p.arena, &cur_mod()));
                     sva_imm.extend(simms);
                 }
                 Err(_) => {
+                    line_cov::abort_proc();
                     note_skip(format!(
                         "diagnostic skip_always module={} (always_comb body not parsed; not a LUT)",
                         cur_mod()
@@ -13432,8 +13681,19 @@ fn parse_module_items<'a>(
                 let _ = p.ident();
             }
             let body_start = p.i;
+            line_cov::begin_proc(!combo);
             match parse_seq_block(&mut p, block) {
                 Ok((stmts, simms)) => {
+                    if line_cov::enabled() {
+                        let written: HashSet<&'a str> = stmts.iter().map(|(l, _, _)| *l).collect();
+                        let probes = line_cov::end_proc(|e| {
+                            if negedge_only {
+                                return Err("falling-edge block (the simulator steps rising edges)");
+                            }
+                            lcov_check(e, ports, signals, combo.then_some(&written))
+                        });
+                        lcov_push(p, probes, signals, assigns);
+                    }
                     sva_imm.extend(simms);
                     if combo {
                         // `always @(*)` next-state etc. → comb assigns, not FFs.
@@ -13479,6 +13739,7 @@ fn parse_module_items<'a>(
                     }
                 }
                 Err(_) => {
+                    line_cov::abort_proc();
                     if negedge_only {
                         let clk = edge_clk.unwrap_or_else(|| "clk".into());
                         let end = p.i.min(p.t.len());
@@ -22416,6 +22677,15 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
     let prop_arena_owned = Bump::new();
     let prop_arena: &Bump = &prop_arena_owned;
     let mut rtl_owned = rtl.clone();
+    if line_cov::enabled() {
+        // Line-coverage probes lower last: they never take the per-module
+        // assign / bit budgets from the design's own logic.
+        let (mut probes, rest): (Vec<Nba>, Vec<Nba>) = std::mem::take(&mut rtl_owned.assigns)
+            .into_iter()
+            .partition(|(l, _, _)| l.starts_with(line_cov::PROBE_PREFIX));
+        rtl_owned.assigns = rest;
+        rtl_owned.assigns.append(&mut probes);
+    }
     let mut d = Design::new(rtl_owned.module);
     let ug_attrs = ug901::extract_ug901_attrs(&rtl_owned);
     let modified_fsms =
@@ -22813,6 +23083,10 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
     let mut net_alias: HashMap<String, String> = HashMap::new();
     for (lhs, bit, rhs) in &rtl.assigns {
         if sig_depth(rtl, lhs) > 0 || out_ports.contains(*lhs) || nba_lhs.contains(*lhs) {
+            continue;
+        }
+        // Line-coverage probes must keep their own named net.
+        if lhs.starts_with(line_cov::PROBE_PREFIX) {
             continue;
         }
         if bit.is_none() {
@@ -24616,6 +24890,8 @@ fn synth_from_parsed_top(
             *cell.borrow_mut() = Some(d.clone());
         });
     }
+    // Line coverage: tag probe nets (kept as mark_debug) before the sweep.
+    line_cov::mark_probe_nets(&mut d);
     let opt = d.peephole_opt_luts();
     if opt.total() + opt.consts_folded + opt.inverters_absorbed > 0 {
         eprintln!(
@@ -24917,6 +25193,16 @@ pub fn synth_sv_files(paths: &[&Path]) -> Result<Design, String> {
 pub fn synth_sv_path(path: &Path) -> Result<Design, String> {
     let src = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     synth_sv(&src, &path.display().to_string())
+}
+
+/// [`synth_sv_path`] instrumented for RTL line / branch coverage: the
+/// netlist additionally carries one probe net per procedural statement,
+/// `if` / `case` arm and continuous `assign` (see the `line_cov` module
+/// docs), tagged with [`helion_ir::LineProbe`] attributes and `src`
+/// (`file:line`). Use it only for simulation: probes add LUTs.
+pub fn synth_sv_path_line_cov(path: &Path) -> Result<Design, String> {
+    let _on = line_cov::Enable::new();
+    synth_sv_path(path)
 }
 
 /// Same-directory wrapper: parent file instantiates a child whose body is
