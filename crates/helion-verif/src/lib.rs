@@ -9,6 +9,9 @@
 //!   `tb_*.sv`), the stimulus-subset parser, DUT lookup, the interpreter that
 //!   drives `helion-sim` (`$display`/`assert`/`$error`/`$fatal`), VCD/log
 //!   writing, and the persisted run history.
+//! - [`classtb`]: class-based / UVM testbenches on the `helion-svtb` engine
+//!   (routed from [`tb::run_testbench`]), UVM test discovery and UVM
+//!   message parsing for the IDE.
 //! - [`wave`]: waveform display math (fixed-point `Qm.n`, analog Y
 //!   mapping, LSB-first virtual-bus packing) and the SPI / UART / AXI-Lite /
 //!   FSM protocol decoders behind the viewer's decoded lanes. The display
@@ -24,6 +27,7 @@
 //! here, and do not add new callers of the `helion-gui` copies. The Rune IDE
 //! (`helion-rune`) depends on this crate, never on `helion-gui`.
 
+pub mod classtb;
 pub mod ila;
 pub mod tb;
 pub mod wave;

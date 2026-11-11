@@ -15,6 +15,7 @@
 //! of named blocks, no interface tasks, no DPI.
 
 pub mod ast;
+pub mod cov;
 pub mod interp;
 pub mod lex;
 pub mod parse;
