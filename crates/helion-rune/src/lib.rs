@@ -14,6 +14,7 @@
 //! - `crates/rune-kit/src/palette.rs`: `Kit::from_palette(PaletteSeed)`.
 //! - `crates/rune/src/color.rs`: `color::hex` (used ONLY in [`theme`]).
 
+pub mod analysis;
 pub mod doctor;
 pub mod layout;
 pub mod live;
@@ -152,6 +153,19 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
     }),
     ("timing-no-run", |s| {
         s.center = state::CenterPane::Timing;
+    }),
+    ("timing-interaction", |s| {
+        seed_two_clock_fixture(s);
+        s.timing_view.selected = views::timing::TimingNav::ClockInteraction;
+        s.timing_view.selected_interaction = Some(1);
+    }),
+    ("timing-inter", |s| {
+        seed_two_clock_fixture(s);
+        s.timing_view.selected = views::timing::TimingNav::InterClock;
+    }),
+    ("timing-clocks", |s| {
+        seed_two_clock_fixture(s);
+        s.timing_view.selected = views::timing::TimingNav::ClockSummary;
     }),
     ("settings", |s| {
         s.dialogs.open(views::dialogs::DialogId::Settings);
@@ -447,6 +461,7 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         s.center = state::CenterPane::Reports;
         views::reports::demo_impl_complete(s);
         s.reports_view.selected = views::reports::ReportNav::Drc;
+        s.reports_view.selected_drc = Some(0);
         s.drc.items = vec![
             state::DrcItem {
                 id: "PDRC-190".into(),
@@ -464,6 +479,84 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
     }),
     ("reports-no-run", |s| {
         s.center = state::CenterPane::Reports;
+    }),
+    ("reports-methodology", |s| {
+        s.center = state::CenterPane::Reports;
+        views::reports::demo_impl_complete(s);
+        s.reports_view.selected = views::reports::ReportNav::Methodology;
+        s.timing.methodology = vec![
+            state::MethodRow {
+                id: "TIMING-6".into(),
+                severity: "CriticalWarning".into(),
+                category: "Timing".into(),
+                objects: "clk uart_clk".into(),
+                message: "No common primary clock between related clocks clk and uart_clk; the crossing is timed without an exception and the requirement is derived from the closest edges.".into(),
+            },
+            state::MethodRow {
+                id: "XDC-1".into(),
+                severity: "Warning".into(),
+                category: "Constraints".into(),
+                objects: "led[0] led[1] led[2] led[3]".into(),
+                message: "Output ports have no set_output_delay.".into(),
+            },
+        ];
+        s.reports_view.selected_method = Some(0);
+    }),
+    ("constraints", |s| {
+        s.center = state::CenterPane::Constraints;
+        s.editor.xdc_lines = [
+            "# Clocks",
+            "create_clock -period 10.000 -name clk [get_ports clk]",
+            "create_generated_clock -name clk_div -source [get_ports clk] -divide_by 4 [get_pins divclk_reg/Q]",
+            "",
+            "# I/O delays",
+            "set_input_delay -clock clk 2.000 [get_ports btn]",
+            "set_output_delay -clock clk 1.500 [get_ports {led[0]}]",
+            "",
+            "# Exceptions",
+            "set_false_path -from [get_ports btn] -to [get_cells sync_reg]",
+            "set_max_delay -datapath_only 4.000 -from [get_cells cnt_reg] -to [get_cells led_reg]",
+            "",
+            "# Pins",
+            "set_property PACKAGE_PIN E3 [get_ports clk]",
+            "set_property IOSTANDARD LVCMOS33 [get_ports clk]",
+            "set_property PACKAGE_PIN H6 [get_ports {led[0]}]",
+            "set_property IOSTANDARD LVCMOS33 [get_ports {led[0]}]",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        s.constraints_view.selected = Some(1);
+    }),
+    ("summary-runs", |s| {
+        views::reports::demo_impl_complete(s);
+        seed_timing_fixture(s);
+        s.runs.history = vec![
+            runs::RunRecord {
+                seq: 1,
+                kind: runs::RunKind::Synth,
+                outcome: runs::RunOutcome::Complete,
+                wns_ps: Some(3120),
+                lut_ff: Some(2310),
+                duration_ms: 1840,
+            },
+            runs::RunRecord {
+                seq: 2,
+                kind: runs::RunKind::Impl,
+                outcome: runs::RunOutcome::Failed,
+                wns_ps: None,
+                lut_ff: None,
+                duration_ms: 950,
+            },
+            runs::RunRecord {
+                seq: 3,
+                kind: runs::RunKind::Impl,
+                outcome: runs::RunOutcome::Complete,
+                wns_ps: Some(2061),
+                lut_ff: Some(2415),
+                duration_ms: 64_300,
+            },
+        ];
     }),
     ("palette-files", |s| {
         views::palette::open_palette(s, views::palette::PaletteMode::Files);
@@ -495,6 +588,8 @@ fn seed_timing_fixture(s: &mut AppState) {
         kind: state::TimingGroupKind::Intra,
         wns_ps: s.timing.wns_ps,
         tns_ps: s.timing.tns_ps,
+        whs_ps: s.timing.whs_ps,
+        ths_ps: s.timing.ths_ps,
         endpoints: s.timing.endpoints,
     }];
     s.timing.paths = vec![state::TimingPathRow {
@@ -504,6 +599,8 @@ fn seed_timing_fixture(s: &mut AppState) {
         slack_ps: s.timing.wns_ps.unwrap_or(0),
         delay_ps: 7939,
         group: state::TimingPathGroup::Register,
+        launch_clock: "clk".into(),
+        capture_clock: "clk".into(),
         pins: vec![
             state::TimingPinRow {
                 cell: "cnt_3".into(),
@@ -540,14 +637,188 @@ fn seed_timing_fixture(s: &mut AppState) {
     s.timing.clock_networks = vec![state::ClockNetRow {
         name: "clk".into(),
         period_ps: 10_000,
+        source: "clk".into(),
         net: "clk".into(),
         loads: 8,
         buffers: 1,
+        fanout: 8,
         insertion_ps: 120,
     }];
     s.timing.design = "project1_demo".into();
     s.timing.voltage_mv = 1000;
     s.timing.temp_c = 25;
+}
+
+/// Two-clock timing fixture for the clock-interaction / CDC / clock
+/// scenes: `clk` (10 ns) and an unrelated `uart_clk` (20 ns) with one
+/// unsafe crossing, shaped like real `TimingState` output.
+fn seed_two_clock_fixture(s: &mut AppState) {
+    use state::{
+        CdcRow, ClockInteractionRow, ClockNetRow, ClockRel, TimingClock, TimingGroupKind,
+        TimingGroupRow,
+    };
+    s.center = state::CenterPane::Timing;
+    s.flow.synth = state::RunStatus::Complete;
+    s.flow.impl_run = state::RunStatus::Complete;
+    s.status = state::StatusVerb::ImplementationComplete;
+    s.timing = state::TimingState {
+        wns_ps: Some(-312),
+        tns_ps: -936,
+        whs_ps: Some(96),
+        ths_ps: 0,
+        failing_endpoints: 3,
+        failing_setup: 3,
+        failing_hold: 0,
+        endpoints: 136,
+        has_run: true,
+        ..state::TimingState::default()
+    };
+    seed_timing_fixture(s);
+    let clock = |name: &str, period_ps: u64| TimingClock {
+        name: name.into(),
+        period_ps,
+        source: name.into(),
+        generated: false,
+        master: None,
+    };
+    s.timing.clocks = vec![clock("clk", 10_000), clock("uart_clk", 20_000)];
+    let cell = |from: &str,
+                to: &str,
+                relation: ClockRel,
+                common: u64,
+                req: i64,
+                wns: Option<i64>,
+                paths: usize| {
+        ClockInteractionRow {
+            from: from.into(),
+            to: to.into(),
+            relation,
+            common_period_ps: common,
+            requirement_ps: req,
+            wns_ps: wns,
+            path_count: paths,
+        }
+    };
+    s.timing.clock_interaction = vec![
+        cell(
+            "clk",
+            "clk",
+            ClockRel::Timed,
+            10_000,
+            10_000,
+            Some(2061),
+            112,
+        ),
+        cell(
+            "clk",
+            "uart_clk",
+            ClockRel::TimedUnsafe,
+            20_000,
+            10_000,
+            Some(-312),
+            3,
+        ),
+        cell(
+            "uart_clk",
+            "clk",
+            ClockRel::Asynchronous,
+            20_000,
+            10_000,
+            None,
+            0,
+        ),
+        cell(
+            "uart_clk",
+            "uart_clk",
+            ClockRel::Timed,
+            20_000,
+            20_000,
+            Some(12_408),
+            24,
+        ),
+    ];
+    s.timing.cdc = vec![
+        CdcRow {
+            from: "clk".into(),
+            to: "uart_clk".into(),
+            severity: "Critical".into(),
+            check: "CDC-1".into(),
+            endpoints: 3,
+            sync: false,
+            wns_ps: Some(-312),
+            relation: "Timed (unsafe)".into(),
+        },
+        CdcRow {
+            from: "uart_clk".into(),
+            to: "clk".into(),
+            severity: "Info".into(),
+            check: "CDC-15".into(),
+            endpoints: 2,
+            sync: true,
+            wns_ps: None,
+            relation: "Asynchronous".into(),
+        },
+    ];
+    let group = |name: &str,
+                 from: &str,
+                 to: &str,
+                 kind: TimingGroupKind,
+                 wns: i64,
+                 tns: i64,
+                 endpoints: usize| TimingGroupRow {
+        name: name.into(),
+        from: from.into(),
+        to: to.into(),
+        kind,
+        wns_ps: Some(wns),
+        tns_ps: tns,
+        whs_ps: Some(96),
+        ths_ps: 0,
+        endpoints,
+    };
+    s.timing.groups = vec![
+        group("clk", "clk", "clk", TimingGroupKind::Intra, 2061, 0, 112),
+        group(
+            "uart_clk",
+            "uart_clk",
+            "uart_clk",
+            TimingGroupKind::Intra,
+            12_408,
+            0,
+            24,
+        ),
+        group(
+            "clk to uart_clk",
+            "clk",
+            "uart_clk",
+            TimingGroupKind::Inter,
+            -312,
+            -936,
+            3,
+        ),
+    ];
+    s.timing.clock_networks = vec![
+        ClockNetRow {
+            name: "clk".into(),
+            period_ps: 10_000,
+            source: "clk".into(),
+            net: "clk_IBUF_BUFG".into(),
+            loads: 112,
+            buffers: 1,
+            fanout: 112,
+            insertion_ps: 1_240,
+        },
+        ClockNetRow {
+            name: "uart_clk".into(),
+            period_ps: 20_000,
+            source: "uart_clk".into(),
+            net: "uart_clk_IBUF_BUFG".into(),
+            loads: 24,
+            buffers: 1,
+            fanout: 24,
+            insertion_ps: 980,
+        },
+    ];
 }
 
 /// Initial state for tests and headless scenes: the in-memory demo project,
@@ -614,6 +885,7 @@ fn center_pane(s: &AppState, t: &VivadoTheme) -> El {
         state::CenterPane::Ip => views::ip::ip_pane(s, t),
         state::CenterPane::Bitstream => views::bitstream::bitstream_pane(s, t),
         state::CenterPane::Find => views::find::find_pane(s, t),
+        state::CenterPane::Constraints => views::constraints::constraints_pane(s, t),
     }
 }
 

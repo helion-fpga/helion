@@ -209,7 +209,8 @@ fn echo(s: &mut AppState, tcl: &str) {
 }
 
 /// Open a catalog report: Timing Summary navigates to Timing, the rest to
-/// the Reports pane with the matching Utilization/Power/DRC tab selected.
+/// the Reports pane with the matching Utilization/Power/DRC/Methodology/QoR
+/// tab selected (index order of [`REPORTS`]).
 /// Shared with the `open_report` Tcl command (hence `pub(crate)` + `&str`).
 pub(crate) fn open_report(s: &mut AppState, i: usize, tcl: &str) {
     use crate::state::CenterPane;
@@ -227,6 +228,19 @@ pub(crate) fn open_report(s: &mut AppState, i: usize, tcl: &str) {
         3 => {
             s.navigate(CenterPane::Reports);
             s.reports_view.selected = ReportNav::Drc;
+        }
+        4 => {
+            s.navigate(CenterPane::Reports);
+            s.reports_view.selected = ReportNav::Methodology;
+        }
+        5 => {
+            s.navigate(CenterPane::Reports);
+            s.reports_view.selected = ReportNav::Qor;
+            echo(s, tcl);
+            // Opening QoR evaluates it against the live design, exactly like
+            // selecting it in the report tree.
+            crate::views::reports::refresh_qor(s);
+            return;
         }
         _ => {
             s.navigate(CenterPane::Reports);
@@ -817,6 +831,7 @@ const REPORTS: &[(&str, &str)] = &[
     ("Power", "open_report power"),
     ("DRC", "open_report drc"),
     ("Methodology", "open_report methodology"),
+    ("QoR Suggestions", "open_report qor"),
 ];
 
 /// Reports body: catalog of report links navigating to Timing/Reports.

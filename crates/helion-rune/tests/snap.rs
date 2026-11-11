@@ -218,6 +218,7 @@ fn menus_toggle_on_every_center_surface() {
         ("ip", CenterPane::Ip),
         ("bitstream-empty", CenterPane::Bitstream),
         ("find-empty", CenterPane::Find),
+        ("constraints", CenterPane::Constraints),
     ] {
         let mut rt = rt_for(scene);
         assert_eq!(rt.state.center, center, "[{scene}] wrong center pane");
@@ -301,24 +302,70 @@ fn reports_nav_switches_detail_bodies_and_prompt_arms_impl() {
         rt.find("reports-drc-row-1").is_some(),
         "seeded rows must mount"
     );
-    tap(&mut rt, "reports-drc-rule-1");
+    tap(&mut rt, "reports-drc-row-1");
+    assert_eq!(
+        rt.state.reports_view.selected_drc,
+        Some(1),
+        "row tap selects the violation"
+    );
     assert!(
-        rt.state
-            .console
-            .lines
-            .iter()
-            .any(|l| l.text == "report_drc -rule REQP-144"),
-        "rule link must echo its Tcl verb"
+        rt.find("reports-drc-detail").is_some(),
+        "selection opens the detail panel"
     );
     let mut rt = rt_for("reports-no-run");
-    tap(&mut rt, "reports-run-impl");
-    assert_eq!(rt.state.flow.impl_run, RunStatus::Running);
+    tap(&mut rt, "reports-run-synth");
+    assert_eq!(rt.state.flow.synth, RunStatus::Running);
     assert!(
         rt.state
             .console
             .lines
             .iter()
-            .any(|l| l.text == "launch_runs impl_1")
+            .any(|l| l.text == "launch_runs synth_1")
+    );
+    runs::cancel_run(&mut rt.state);
+    let start = Instant::now();
+    while rt.state.runs.is_active() {
+        runs::poll_runs(&mut rt.state);
+        assert!(start.elapsed() < Duration::from_secs(60), "run timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn constraints_scene_opens_editor_and_wizard() {
+    let mut rt = rt_for("constraints");
+    assert_eq!(rt.state.center, CenterPane::Constraints);
+    tap(&mut rt, "constraints-wizard");
+    assert_eq!(rt.state.dialogs.open, Some(DialogId::Constraints));
+    let mut rt = rt_for("constraints");
+    tap(&mut rt, "constraints-open-editor");
+    assert_eq!(rt.state.center, CenterPane::Editor);
+}
+
+#[test]
+fn report_verbs_navigate_and_dump() {
+    let mut rt = rt_for("summary-impl-complete");
+    helion_rune::tcl::eval_command(&mut rt.state, "report_clock_interaction");
+    assert_eq!(rt.state.center, CenterPane::Timing);
+    helion_rune::tcl::eval_command(&mut rt.state, "report_power");
+    assert_eq!(rt.state.center, CenterPane::Reports);
+    assert!(
+        rt.state
+            .console
+            .lines
+            .iter()
+            .any(|l| l.text.starts_with("report_power part=")),
+        "report_power dumps the power state"
+    );
+    helion_rune::tcl::eval_command(&mut rt.state, "report_constraints");
+    assert_eq!(rt.state.center, CenterPane::Constraints);
+    assert!(
+        rt.state
+            .console
+            .lines
+            .iter()
+            .any(|l| l.text.starts_with("report_constraints rows=")),
+        "report_constraints dumps the parsed XDC"
     );
 }
 
@@ -1145,6 +1192,44 @@ fn impl_run_executes_counter_end_to_end_with_real_artifacts() {
     assert!(
         s.toasts.items.iter().any(|t| t.kind == ToastKind::Success),
         "completion must toast success"
+    );
+    // The finished run is recorded and leaves a routed re-analysis context.
+    assert_eq!(s.runs.history.len(), 1, "run history records the run");
+    assert_eq!(s.runs.history[0].wns_ps, s.timing.wns_ps);
+    assert!(
+        s.runs.analysis.as_ref().is_some_and(|a| a.routed.is_some()),
+        "impl runs keep the routed result for re-analysis"
+    );
+    assert!(
+        !s.timing.clock_interaction.is_empty(),
+        "report_clock_interaction runs with the summary"
+    );
+    // Report verbs re-run the real engines over the stored routed design.
+    let wns = s.timing.wns_ps;
+    s.timing = Default::default();
+    helion_rune::tcl::eval_command(&mut s, "report_timing_summary");
+    assert_eq!(s.center, CenterPane::Timing);
+    assert!(s.timing.has_run, "re-analysis refills timing");
+    assert_eq!(
+        s.timing.wns_ps, wns,
+        "same design and constraints, same WNS"
+    );
+    s.drc = Default::default();
+    helion_rune::tcl::eval_command(&mut s, "report_drc");
+    assert!(s.drc.has_run && !s.drc.pre_route, "routed DRC re-runs");
+    assert!(s.drc.bitgen_allowed.is_some(), "signoff re-evaluates");
+    s.power = Default::default();
+    helion_rune::tcl::eval_command(&mut s, "report_power");
+    assert!(s.power.total_uw > 0, "power re-runs with exact rails");
+    helion_rune::tcl::eval_command(&mut s, "report_methodology");
+    assert_eq!(s.center, CenterPane::Reports);
+    assert!(
+        !s.console
+            .lines
+            .iter()
+            .any(|l| l.text.starts_with("ERROR: report_")),
+        "no report verb may fail on a routed run: {:?}",
+        s.console.lines.iter().rev().take(6).collect::<Vec<_>>()
     );
 }
 
