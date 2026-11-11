@@ -88,6 +88,7 @@ pub enum PaletteCommand {
     ConstraintsWizard,
     About,
     HwNode(crate::views::hw_tree::HwNode),
+    Templates,
 }
 
 /// Center panes in palette display order.
@@ -186,6 +187,7 @@ impl PaletteCommand {
         cmds.push(PaletteCommand::AddSources);
         cmds.push(PaletteCommand::ConstraintsWizard);
         cmds.push(PaletteCommand::About);
+        cmds.push(PaletteCommand::Templates);
         use crate::views::hw_tree::HwNode;
         use helion_debug::DebugCoreKind;
         for node in [
@@ -225,6 +227,7 @@ impl PaletteCommand {
             PaletteCommand::AddSources => "Add sources…".into(),
             PaletteCommand::ConstraintsWizard => "Constraints wizard…".into(),
             PaletteCommand::About => "About Helion".into(),
+            PaletteCommand::Templates => "Language templates…".into(),
             PaletteCommand::HwNode(node) => {
                 use crate::views::hw_tree::HwNode;
                 use helion_debug::DebugCoreKind;
@@ -556,6 +559,7 @@ pub fn run_command(s: &mut AppState, cmd: PaletteCommand, tx: &mut Tx) {
             s.dialogs.open(crate::views::dialogs::DialogId::Constraints)
         }
         PaletteCommand::About => s.chrome.about_open = true,
+        PaletteCommand::Templates => crate::views::templates::open(s),
         PaletteCommand::HwNode(node) => {
             s.navigate(CenterPane::Program);
             s.program.node = node;

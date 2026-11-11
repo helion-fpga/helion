@@ -922,6 +922,21 @@ fn find_text_btn(
     b
 }
 
+/// Insert `text` at the active tab's caret as one undo step (language
+/// templates, snippets). No-op without an open tab.
+pub fn insert_text(s: &mut AppState, text: &str) {
+    if s.editor.tabs.is_empty() {
+        return;
+    }
+    sync_edit(s);
+    flush_edit(s);
+    s.editor.push_undo_active(active_is_xdc(s));
+    s.editor.edit.insert(text);
+    s.editor.dirty = true;
+    flush_edit(s);
+    s.editor.cursor_line = caret_line(s);
+}
+
 /// Replace the next match at/after the caret (wrapping), or every match.
 /// One undo step either way. Returns how many occurrences changed.
 pub fn replace_matches(s: &mut AppState, all: bool) -> usize {

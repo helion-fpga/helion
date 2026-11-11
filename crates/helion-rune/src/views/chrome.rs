@@ -102,6 +102,7 @@ enum MenuAct {
     ToggleBookmark,
     NextBookmark,
     ToggleOutline,
+    Templates,
 }
 
 /// One dropdown row: a dispatchable item, a caps section caption, or a rule.
@@ -349,6 +350,7 @@ fn menu_rows(id: MenuId, s: &AppState) -> Vec<MenuRow> {
                 ),
                 no_project,
             ),
+            item("Language Templates…", "show_templates", A::Templates),
             Sep,
             item("IP Catalog", "ip_catalog", A::Nav(CenterPane::Ip)),
             item("Logic Analyzer", "ila", A::Nav(CenterPane::Ila)),
@@ -673,6 +675,10 @@ fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
                 None,
                 None,
             ),
+            FlowEntry {
+                act: Some(crate::views::templates::open),
+                ..link(section, "Language Templates", "show_templates", None, None, None)
+            },
         ],
         FlowSection::IpIntegrator => vec![
             goto(
@@ -1243,6 +1249,7 @@ fn dispatch_menu(s: &mut AppState, tcl: &'static str, act: MenuAct, tx: &mut Tx)
             s.navigate(CenterPane::Editor);
             crate::views::editor::goto_next_bookmark(s, tx);
         }
+        MenuAct::Templates => crate::views::templates::open(s),
         MenuAct::ToggleOutline => {
             s.navigate(CenterPane::Editor);
             s.editor.outline_open = !s.editor.outline_open;
