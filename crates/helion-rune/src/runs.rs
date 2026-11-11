@@ -564,6 +564,9 @@ pub fn start_run_spec(
         return Err(format!("{busy} is already running"));
     }
     let pins = snapshot_pin_constraints(s);
+    // Floorplan: the open project's ranged pblocks steer placement.
+    let pblocks: Vec<helion_proj::PrjPblock> =
+        s.device.pblocks.iter().filter(|p| p.ranged).cloned().collect();
     let kind = spec.kind;
     let strategy = spec.strategy.clone();
     let incremental = spec.incremental.clone();
@@ -587,6 +590,7 @@ pub fn start_run_spec(
                 RunFiles {
                     checkpoint: ckpt,
                     incremental,
+                    pblocks,
                 },
                 tx,
                 worker_cancel,
@@ -962,6 +966,8 @@ struct RunFiles {
     checkpoint: Option<PathBuf>,
     /// Reference checkpoint for incremental placement.
     incremental: Option<PathBuf>,
+    /// Ranged `.prj` pblocks the placer must honor.
+    pblocks: Vec<helion_proj::PrjPblock>,
 }
 
 fn run_worker(
@@ -977,6 +983,7 @@ fn run_worker(
     let RunFiles {
         checkpoint,
         incremental,
+        pblocks,
     } = files;
     let send = |text: String, sev: MsgSev| {
         let _ = tx.send(RunEvent::Line { text, sev });
@@ -1112,6 +1119,25 @@ fn run_worker(
                 return;
             }
         },
+        None if !pblocks.is_empty() => {
+            match session.place_design_with_pblocks(&dev, strategy.place_opts(), &pblocks) {
+                Ok(stats) => {
+                    for st in stats {
+                        send(
+                            format!(
+                                "place_design pblock {} clusters={} capacity={} moved={} evicted={}",
+                                st.name, st.lutffs, st.capacity, st.moved, st.evicted
+                            ),
+                            MsgSev::Info,
+                        );
+                    }
+                }
+                Err(e) => {
+                    finish(Err(format!("place_design failed: {e}")));
+                    return;
+                }
+            }
+        }
         None => {
             if let Err(e) = session.place_design_with(&dev, strategy.place_opts()) {
                 finish(Err(format!("place_design failed: {e}")));
@@ -1243,7 +1269,18 @@ fn run_worker(
         MsgSev::Info,
     );
     art.power = Some(power_state_from(&pr, &xdc.operating_conditions));
-    let drc = helion_drc::check_routed(design, routed, &dev);
+    let mut drc = helion_drc::check_routed(design, routed, &dev);
+    if !pblocks.is_empty() {
+        // Floorplan check: every pblock member inside its pblock (`PBLK-1`).
+        let regions = helion_proj::pblock_regions(design, &pblocks);
+        let pb = helion_drc::check_pblocks(&routed.placed, &regions);
+        send(
+            format!("report_drc pblocks={} PBLK-1={}", regions.len(), pb.items.len()),
+            MsgSev::Info,
+        );
+        drc.items.extend(pb.items);
+        drc.violations.extend(pb.violations);
+    }
     send(
         format!("report_drc violations={}", drc.items.len()),
         MsgSev::Info,
@@ -2700,6 +2737,40 @@ mod tests {
                 .iter()
                 .any(|l| l.text.starts_with("write_bitstream")),
             "log must carry the real bitstream stage line"
+        );
+    }
+
+    #[test]
+    fn impl_run_places_every_cell_inside_the_project_pblock() {
+        let src = counter_source();
+        let mut s = AppState::demo();
+        s.device.pblocks = vec![helion_proj::PrjPblock {
+            name: "pb_core".into(),
+            x0: 5,
+            y0: 5,
+            x1: 8,
+            y1: 8,
+            ranged: true,
+            cells: Vec::new(),
+        }];
+        start_run(&mut s, RunKind::Impl, src, "HL10T-C32-1".into()).expect("start");
+        pump_until_idle(&mut s, Duration::from_secs(180));
+        assert_eq!(s.flow.impl_run, RunStatus::Complete);
+        let placed = s.runs.live_placed.as_ref().expect("placement");
+        assert!(!placed.lutff_sites.is_empty());
+        for (site, _) in &placed.lutff_sites {
+            assert!(
+                (5..=8).contains(&site.x) && (5..=8).contains(&site.y),
+                "cell outside pb_core at {site:?}"
+            );
+        }
+        assert!(
+            s.runs.impl_log.iter().any(|l| l.text.starts_with("place_design pblock pb_core")),
+            "the log names the pblock the placer honored"
+        );
+        assert!(
+            !s.drc.items.iter().any(|d| d.id == "PBLK-1"),
+            "a legal floorplan has no PBLK-1 rows"
         );
     }
 
