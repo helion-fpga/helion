@@ -39,3 +39,5 @@ helion-ipxact = { path = "../helion-ipxact" }
 # Bitstream frames/packets kept in state (FAR table) and STAT bit names.
 helion-bits = { path = "../helion-bits" }
 helion-fabric = { path = "../helion-fabric" }
+# Hardware debug cores (Set Up Debug, hw ILA/VIO/JTAG-to-AXI over the sim TAP).
+helion-debug = { path = "../helion-debug" }

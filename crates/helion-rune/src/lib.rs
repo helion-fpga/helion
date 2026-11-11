@@ -559,6 +559,54 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
             }
         }
     }),
+    ("hw-setup", |s| {
+        // Real fixture design with ILA / VIO / AXI probes picked.
+        s.center = state::CenterPane::Program;
+        s.program.node = views::hw_tree::HwNode::SetupDebug;
+        let _ = views::hw_debug::seed_debug_fixture(s, views::hw_debug::FixtureStage::Picked);
+    }),
+    ("hw-ila", |s| {
+        // Real Set Up Debug build programmed on the sim cable, one value-
+        // triggered hardware window uploaded.
+        s.center = state::CenterPane::Program;
+        if views::hw_debug::seed_debug_fixture(s, views::hw_debug::FixtureStage::Live).is_ok() {
+            s.program.node = views::hw_tree::HwNode::Core(helion_debug::DebugCoreKind::Ila);
+        }
+    }),
+    ("hw-ila-wave", |s| {
+        if views::hw_debug::seed_debug_fixture(s, views::hw_debug::FixtureStage::Live).is_ok() {
+            let _ = views::hw_debug::show_in_viewer(s);
+        }
+        s.center = state::CenterPane::Ila;
+    }),
+    ("hw-vio", |s| {
+        s.center = state::CenterPane::Program;
+        if views::hw_debug::seed_debug_fixture(s, views::hw_debug::FixtureStage::Live).is_ok() {
+            s.program.node = views::hw_tree::HwNode::Core(helion_debug::DebugCoreKind::Vio);
+        }
+    }),
+    ("hw-axi", |s| {
+        s.center = state::CenterPane::Program;
+        if views::hw_debug::seed_debug_fixture(s, views::hw_debug::FixtureStage::Live).is_ok() {
+            s.program.node = views::hw_tree::HwNode::Core(helion_debug::DebugCoreKind::JtagAxi);
+        }
+    }),
+    ("hw-cfgmem", |s| {
+        // Real fixture bitstream → write_cfgmem → program/verify on the
+        // sim cable's SPI flash model.
+        s.center = state::CenterPane::Program;
+        s.program.cable = views::program::CableChoice::Sim;
+        if views::bitstream::seed_bitstream_fixture(s).is_ok() {
+            let _ = views::hw_cfgmem::tcl_verb(s, "create_hw_cfgmem", &["mt25ql128".into()]);
+            let _ = views::hw_cfgmem::tcl_verb(s, "write_cfgmem", &[]);
+            let _ = views::hw_cfgmem::tcl_verb(s, "program_hw_cfgmem", &[]);
+        }
+        s.toasts = Default::default();
+    }),
+    ("hw-cfgmem-add", |s| {
+        s.center = state::CenterPane::Program;
+        s.program.node = views::hw_tree::HwNode::CfgMem;
+    }),
     ("ip", |s| {
         s.center = state::CenterPane::Ip;
         let _ = views::ip::select_ip(s, "h_uart");

@@ -1993,6 +1993,7 @@ version = "3.0.0"
 dependencies = [
  "helion-bd",
  "helion-bits",
+ "helion-debug",
  "helion-device",
  "helion-drc",
  "helion-fabric",
