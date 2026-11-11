@@ -756,6 +756,10 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         views::palette::open_palette(s, views::palette::PaletteMode::Commands);
         s.palette.query = rune::TextEdit::new("run");
     }),
+    ("templates", |s| {
+        s.center = state::CenterPane::Editor;
+        views::templates::open(s);
+    }),
     ("cheatsheet", |s| {
         views::palette::open_cheatsheet(s);
     }),
@@ -1233,6 +1237,7 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
     views::palette::push_palette(&mut layer, s, &t);
     views::palette::push_cheatsheet(&mut layer, s, &t);
     views::chrome::push_about(&mut layer, s, &t);
+    views::templates::push_templates(&mut layer, s, &t);
     if layer.is_empty() {
         shell
     } else {

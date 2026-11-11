@@ -43,6 +43,7 @@ pub mod sources;
 pub mod start;
 pub mod status;
 pub mod summary;
+pub mod templates;
 pub mod tb;
 pub mod tb_view;
 pub mod timing;

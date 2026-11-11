@@ -1774,6 +1774,12 @@ pub const ALL: &[SceneExpect] = &[
         absent: &["cheat-panel", "menu-file-menu", "settings-dialog"],
     },
     SceneExpect {
+        name: "templates",
+        surface: "editor",
+        keys: &["templates-dialog", "tpl-search", "tpl-list", "tpl-preview", "tpl-insert"],
+        absent: &["summary"],
+    },
+    SceneExpect {
         name: "cheatsheet",
         surface: "palette",
         keys: &["cheat-panel", "cheat-filter", "cheat-rows", "cheat-close"],

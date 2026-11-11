@@ -1110,6 +1110,8 @@ pub struct AppState {
     pub recent: Vec<String>,
     /// Files of the open project (Sources tree, compile order, palette).
     pub project_files: crate::project::ProjectFiles,
+    /// Language Templates dialog.
+    pub templates: crate::views::templates::TemplatesState,
 }
 
 /// Center pane selector. Typed so scenes flip surfaces without strings.
@@ -1306,6 +1308,7 @@ impl AppState {
             layout: crate::layout::LayoutState::default(),
             recent: Vec::new(),
             project_files: crate::project::ProjectFiles::default(),
+            templates: crate::views::templates::TemplatesState::default(),
         };
         out.project_files = crate::project::demo_files(&out);
         // Mirror the active demo buffer into the live edit field so the
