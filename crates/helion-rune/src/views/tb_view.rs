@@ -89,7 +89,7 @@ fn btn(key: &str, label: &str, t: &VivadoTheme, enabled: bool, why: &str) -> El 
 }
 
 /// Section title row (`Failures (2)`, `Log`, ...).
-fn section_head(key: &str, title: &str, t: &VivadoTheme) -> El {
+pub(crate) fn section_head(key: &str, title: &str, t: &VivadoTheme) -> El {
     row()
         .key(key.to_string())
         .w_full()
@@ -488,7 +488,8 @@ fn log_block(s: &AppState, i: usize, item: &TbItem, t: &VivadoTheme) -> El {
     col()
         .w_full()
         .grow(1.0)
-        .min_h(0.0)
+        // Keep the head plus the log body's minimum when space is tight.
+        .min_h(ROW_H + 80.0)
         .child(section_head("sim-log-head", &title, t))
         .child(body)
 }
@@ -595,6 +596,22 @@ fn tb_detail(s: &AppState, t: &VivadoTheme) -> El {
             t,
         ));
     match &item.info {
+        Ok(info) if info.class.is_some() => {
+            let c = info.class.as_ref().unwrap();
+            let dut = if c.duts.is_empty() {
+                "-".to_string()
+            } else {
+                c.duts.iter().map(|(m, i)| format!("{m} {i}")).collect::<Vec<_>>().join(", ")
+            };
+            let engine = format!(
+                "class-based{} · {} class(es)",
+                if c.uses_uvm { " · Helion UVM" } else { "" },
+                c.classes
+            );
+            facts = facts
+                .child(fact_row("sim-detail-dut", "DUT", &dut, t))
+                .child(fact_row("sim-detail-engine", "Testbench", &engine, t));
+        }
         Ok(info) => {
             facts = facts
                 .child(fact_row(
@@ -688,8 +705,19 @@ fn tb_detail(s: &AppState, t: &VivadoTheme) -> El {
         .fill(t.panel_bg)
         .border(1.0, t.border)
         .child(head)
-        .child(facts)
-        .child(failures_block(s, i, item, t))
+        .child(
+            // Facts, UVM and failures shrink and scroll when space is tight
+            // so the log keeps its minimum height.
+            col()
+                .key("sim-detail-upper")
+                .w_full()
+                .shrink()
+                .min_h(0.0)
+                .scroll(ScrollSpec { stick_bottom: false })
+                .child(facts)
+                .children(crate::views::tb_uvm::uvm_section(s, i, item, t))
+                .child(failures_block(s, i, item, t)),
+        )
         .child(log_block(s, i, item, t))
 }
 

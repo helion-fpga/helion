@@ -493,6 +493,18 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         // The fixture's run toasts would cover the history table.
         s.toasts = state::ToastState::default();
     }),
+    ("sim-uvm", |s| {
+        s.center = state::CenterPane::Sim;
+        // examples/uvm_counter against examples/counter.sv (passes).
+        let _ = views::tb_uvm::seed_uvm_fixture(s, false);
+        s.toasts = state::ToastState::default();
+    }),
+    ("sim-uvm-fail", |s| {
+        s.center = state::CenterPane::Sim;
+        // Same environment against a broken counter (scoreboard errors).
+        let _ = views::tb_uvm::seed_uvm_fixture(s, true);
+        s.toasts = state::ToastState::default();
+    }),
     ("ila", |s| {
         s.center = state::CenterPane::Ila;
         let _ = views::ila::seed_ila_fixture(s);
