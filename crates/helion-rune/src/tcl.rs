@@ -4284,7 +4284,7 @@ fn cmd_open_report(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
     if argv.len() != 2 {
         return Ctl::err(
             line,
-            wrong_args("open_report timing|utilization|power|drc|methodology"),
+            wrong_args("open_report timing|utilization|power|drc|methodology|qor"),
         );
     }
     let i = match argv[1].as_str() {
@@ -4293,11 +4293,12 @@ fn cmd_open_report(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
         "power" => 2,
         "drc" => 3,
         "methodology" => 4,
+        "qor" => 5,
         other => {
             return Ctl::err(
                 line,
                 format!(
-                    "unknown report \"{other}\" (try \"timing\", \"utilization\", \"power\", \"drc\", \"methodology\")"
+                    "unknown report \"{other}\" (try \"timing\", \"utilization\", \"power\", \"drc\", \"methodology\", \"qor\")"
                 ),
             );
         }
@@ -4957,7 +4958,7 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
         ),
         "cancel_runs" => ("cancel_runs ?run?", "stop the active run"),
         "open_report" => (
-            "open_report timing|utilization|power|drc|methodology",
+            "open_report timing|utilization|power|drc|methodology|qor",
             "open a report surface",
         ),
         "launch_simulation" => ("launch_simulation", "start a real testbench simulation run"),

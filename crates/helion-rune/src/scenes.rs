@@ -1168,6 +1168,18 @@ pub const ALL: &[SceneExpect] = &[
         ],
     },
     SceneExpect {
+        name: "summary-runs",
+        surface: "summary",
+        keys: &[
+            "summary",
+            "summary-scroll",
+            "summary-timing",
+            "summary-worst",
+            "summary-worst-row-0",
+        ],
+        absent: &["editor", "timing-pane", "summary-history-empty"],
+    },
+    SceneExpect {
         name: "palette-files",
         surface: "palette",
         keys: &[
