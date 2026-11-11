@@ -294,7 +294,7 @@ impl LineCoverageCollector {
         let counts = |p: &LineProbe| if p.clocked { edge } else { state };
         let mut lines_hit: BTreeSet<(String, u32)> = BTreeSet::new();
         let mut arms_hit: BTreeSet<(u64, u32)> = BTreeSet::new();
-        let mut hit = |p: &LineProbe, lines_hit: &mut BTreeSet<(String, u32)>, arms_hit: &mut BTreeSet<(u64, u32)>| match &p.kind {
+        let hit = |p: &LineProbe, lines_hit: &mut BTreeSet<(String, u32)>, arms_hit: &mut BTreeSet<(u64, u32)>| match &p.kind {
             LineProbeKind::Arm { branch, index, .. } => {
                 arms_hit.insert((*branch, *index));
             }
