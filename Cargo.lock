@@ -1991,8 +1991,13 @@ dependencies = [
 name = "helion-rune"
 version = "3.0.0"
 dependencies = [
+ "helion-bd",
+ "helion-bits",
  "helion-device",
  "helion-drc",
+ "helion-fabric",
+ "helion-hw",
+ "helion-ipxact",
  "helion-ir",
  "helion-pack",
  "helion-place",

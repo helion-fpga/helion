@@ -1,5 +1,7 @@
 //! New Rune views for the Helion Vivado-style shell (rune-02 onward).
 
+pub mod bitstream;
+pub mod cad;
 pub mod chrome;
 pub mod console;
 pub mod debug;

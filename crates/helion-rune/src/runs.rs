@@ -859,23 +859,19 @@ fn run_worker(
     // the packet stream, configured frames, and the session hash.
     match session.write_bitstream(&dev) {
         Ok(b) => {
-            let (idcode, frames, bytes) = (b.idcode, b.frames.len(), b.packets.len());
-            let configured = b.frames.values().filter(|w| **w != 0).count();
+            // Keep the real frames + packets (FAR table, Program Device);
+            // cloned before `blinky_hash` reborrows `session`.
+            let bits = b.clone();
             let hash = session.blinky_hash().unwrap_or(0);
+            let state = BitstreamState::from_bits(&bits, hash, &dev.part, "impl_1");
             send(
                 format!(
-                    "write_bitstream frames={frames} bytes={bytes} hash={hash:#010x} configured={configured}"
+                    "write_bitstream frames={} bytes={} hash={hash:#010x} configured={}",
+                    state.frames, state.bytes, state.configured
                 ),
                 MsgSev::Info,
             );
-            art.bitstream = Some(BitstreamState {
-                idcode,
-                hash,
-                bytes,
-                frames,
-                configured,
-                has_run: true,
-            });
+            art.bitstream = Some(state);
         }
         Err(e) => send(format!("WARN: write_bitstream skipped: {e}"), MsgSev::Warn),
     }
@@ -1926,6 +1922,7 @@ mod tests {
                 frames: 4,
                 configured: 3,
                 has_run: true,
+                ..BitstreamState::default()
             }),
             summary: "12 cells, 5 endpoints".into(),
             cells: 12,

@@ -310,6 +310,7 @@ pub fn demo_impl_complete(s: &mut AppState) {
         frames: 32,
         configured: 28,
         has_run: true,
+        ..BitstreamState::default()
     };
 }
 
@@ -2297,6 +2298,7 @@ mod tests {
             frames: 4,
             configured: 3,
             has_run: true,
+            ..crate::state::BitstreamState::default()
         };
         let mut rt = harness_with(s);
         rt.frame(0.0);

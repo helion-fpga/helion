@@ -215,6 +215,7 @@ fn menus_toggle_on_every_center_surface() {
         ("sim", CenterPane::Sim),
         ("program", CenterPane::Program),
         ("reports-no-run", CenterPane::Reports),
+        ("bitstream-empty", CenterPane::Bitstream),
     ] {
         let mut rt = rt_for(scene);
         assert_eq!(rt.state.center, center, "[{scene}] wrong center pane");

@@ -622,8 +622,66 @@ pub struct DrcState {
     pub has_run: bool,
 }
 
+/// One configured frame of the bitstream, mirroring the old
+/// `ide.rs::BitstreamFrame` (FAR-addressed 128-bit `helion_bits` frame).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FarRow {
+    /// Encoded frame address ([`helion_device::Far::encode`]).
+    pub far: u32,
+    pub block: u8,
+    pub die: u8,
+    pub major: u16,
+    pub minor: u8,
+    pub word: u128,
+}
+
+impl FarRow {
+    pub fn from_key(block: u8, major: u16, minor: u8, word: u128) -> Self {
+        let far = helion_device::Far {
+            block_type: block,
+            die: 0,
+            major,
+            minor,
+        };
+        Self {
+            far: far.encode(),
+            block,
+            die: far.die,
+            major,
+            minor,
+            word,
+        }
+    }
+
+    /// Block-type name (`helion_device::Far` block constants).
+    pub fn block_name(&self) -> &'static str {
+        match self.block {
+            helion_device::Far::CLB_IO_CLK => "CLB_IO_CLK",
+            helion_device::Far::DSP => "DSP",
+            helion_device::Far::BRAM => "BRAM",
+            helion_device::Far::IOB => "IOB",
+            _ => "UNKNOWN",
+        }
+    }
+
+    /// Set bits in the 128-bit frame word.
+    pub fn ones(&self) -> u32 {
+        self.word.count_ones()
+    }
+
+    pub fn far_hex(&self) -> String {
+        format!("{:#010x}", self.far)
+    }
+
+    pub fn word_hex(&self) -> String {
+        format!("{:#034x}", self.word)
+    }
+}
+
 /// Bitstream result, mirroring the `write_bitstream` log line
-/// (`ide.rs::run_step_inner`: frames/bytes/hash/configured).
+/// (`ide.rs::run_step_inner`: frames/bytes/hash/configured) plus the real
+/// `helion_bits::Bitstream` (frames + packets) behind it, so the Bitstream
+/// FAR table and Program Device read the same artifact.
 #[derive(Clone, Debug, Default)]
 pub struct BitstreamState {
     pub idcode: u32,
@@ -633,6 +691,47 @@ pub struct BitstreamState {
     pub configured: usize,
     /// True once a run wrote a bitstream.
     pub has_run: bool,
+    /// Part the bitstream was generated for (`""` when unknown).
+    pub part: String,
+    /// Where the bitstream came from (`impl_1`, `Tcl session`).
+    pub source: String,
+    /// The real frames + packet stream (`None` until a run writes one).
+    pub bits: Option<std::sync::Arc<helion_bits::Bitstream>>,
+    /// Configured (non-zero) frames in FAR order, for the FAR table.
+    pub rows: Vec<FarRow>,
+    /// Selected FAR row (encoded FAR), if any.
+    pub selected: Option<u32>,
+}
+
+impl BitstreamState {
+    /// Fill every field from a real `helion_bits::Bitstream`.
+    pub fn from_bits(bits: &helion_bits::Bitstream, hash: u32, part: &str, source: &str) -> Self {
+        let rows: Vec<FarRow> = bits
+            .frames
+            .iter()
+            .filter(|(_, w)| **w != 0)
+            .map(|((block, major, minor), word)| FarRow::from_key(*block, *major, *minor, *word))
+            .collect();
+        Self {
+            idcode: bits.idcode,
+            hash,
+            bytes: bits.packets.len(),
+            frames: bits.frames.len(),
+            configured: rows.len(),
+            has_run: true,
+            part: part.to_string(),
+            source: source.to_string(),
+            bits: Some(std::sync::Arc::new(bits.clone())),
+            rows,
+            selected: None,
+        }
+    }
+
+    /// The selected FAR row, if it still exists.
+    pub fn selected_row(&self) -> Option<&FarRow> {
+        let far = self.selected?;
+        self.rows.iter().find(|r| r.far == far)
+    }
 }
 
 /// Waveform/VCD slice, mirroring `vcd.rs::VcdActivity` dimensions only.
@@ -769,6 +868,8 @@ pub enum CenterPane {
     Program,
     /// Implementation reports: Utilization / Power / DRC detail bodies.
     Reports,
+    /// Bitstream: KPIs plus the FAR-addressed configuration frame table.
+    Bitstream,
 }
 
 /// Status-bar verb. Typed, with the exact Helion wording in one place.
