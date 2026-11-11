@@ -29,3 +29,11 @@ helion-vhdl = { path = "../helion-vhdl" }
 helion-sim = { path = "../helion-sim" }
 # ILA capture + testbench runner engines (UI-free; extracted from helion-gui).
 helion-verif = { path = "../helion-verif" }
+# Hardware Manager (cable resolve / detect / program / STAT), IP catalog and
+# block design (same crates IdeModel drives).
+helion-hw = { path = "../helion-hw" }
+helion-bd = { path = "../helion-bd" }
+helion-ipxact = { path = "../helion-ipxact" }
+# Bitstream frames/packets kept in state (FAR table) and STAT bit names.
+helion-bits = { path = "../helion-bits" }
+helion-fabric = { path = "../helion-fabric" }

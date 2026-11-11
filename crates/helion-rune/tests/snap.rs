@@ -215,6 +215,9 @@ fn menus_toggle_on_every_center_surface() {
         ("sim", CenterPane::Sim),
         ("program", CenterPane::Program),
         ("reports-no-run", CenterPane::Reports),
+        ("ip", CenterPane::Ip),
+        ("bitstream-empty", CenterPane::Bitstream),
+        ("find-empty", CenterPane::Find),
     ] {
         let mut rt = rt_for(scene);
         assert_eq!(rt.state.center, center, "[{scene}] wrong center pane");
@@ -554,48 +557,59 @@ fn sim_run_arms_flow_and_opens_the_waveform() {
 }
 
 #[test]
-fn program_flow_opens_target_and_reports_done() {
-    use helion_rune::views::program::{CableId, ProgramPhase, TargetId};
-    let mut rt = rt_for("program");
-    assert!(!rt.state.program.connected);
-    tap(&mut rt, "program-cable-opt-1");
-    assert_eq!(rt.state.program.cable, CableId::PlatformCable);
-    tap(&mut rt, "program-open-target");
-    assert!(rt.state.program.connected);
+fn program_flow_sim_cable_programs_the_real_bitstream() {
+    use helion_rune::views::program::{self, CableChoice, ProgramPhase, StatSource};
+    let mut rt = rt_for("program-nousb");
+    assert_eq!(rt.state.program.cable, CableChoice::Auto);
     assert!(
-        rt.state
-            .console
-            .lines
-            .iter()
-            .any(|l| l.text == "open_hw_target")
+        rt.find("program-blocked").is_some(),
+        "no USB programmer must explain why Program is refused"
     );
-    assert!(
-        rt.find("program-device-row-0").is_some(),
-        "devices must mount"
-    );
-    tap(&mut rt, "program-target-opt-0");
-    assert_eq!(rt.state.program.target, TargetId::Fpga0);
     tap(&mut rt, "program-program");
+    assert_eq!(
+        rt.state.program.phase,
+        ProgramPhase::Idle,
+        "board cable without USB never programs"
+    );
+    tap(&mut rt, "program-cable-opt-1");
+    assert_eq!(rt.state.program.cable, CableChoice::Sim);
+    assert!(rt.find("program-blocked").is_none());
+    tap(&mut rt, "program-program");
+    assert_eq!(rt.state.program.phase, ProgramPhase::Programming);
+    assert!(program::wait_idle(&mut rt.state, Duration::from_secs(60)));
+    rt.invalidate();
+    rt.frame(1.0 / 60.0);
     assert_eq!(rt.state.program.phase, ProgramPhase::Done);
-    assert_eq!(rt.state.program.progress, 100);
-    assert!(
-        rt.state
-            .console
-            .lines
-            .iter()
-            .any(|l| l.text == "program_hw_devices [get_hw_devices xc7z007s_0]"),
-        "program must echo its Tcl verb"
+    let res = rt.state.program.result.clone().expect("result");
+    assert!(res.ok && res.backend == "sim", "{}", res.line);
+    assert_eq!(
+        rt.state.program.stat.as_ref().map(|s| s.source),
+        Some(StatSource::SimProgrammed)
     );
     assert!(rt.find("program-results").is_some(), "results must mount");
     assert!(rt.find("program-verdict").is_some(), "verdict must mount");
+    assert!(rt.find("program-stat-done").is_some(), "STAT cards mount");
     assert!(
         rt.find("toast-0").is_some(),
         "completion must raise a toast"
     );
-    assert_eq!(
-        rt.state.program.device_status(TargetId::Fpga0),
-        "Programmed"
-    );
+}
+
+#[test]
+fn new_surfaces_navigate_from_tcl() {
+    let mut rt = rt_for("summary");
+    rt.update(|s, _| helion_rune::tcl::eval_command(s, "ip_catalog"));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.center, CenterPane::Ip);
+    assert!(rt.find("ip").is_some());
+    rt.update(|s, _| helion_rune::tcl::eval_command(s, "report_bitstream"));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.center, CenterPane::Bitstream);
+    assert!(rt.find("bitstream-empty").is_some());
+    rt.update(|s, _| helion_rune::tcl::eval_command(s, "find clk"));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.center, CenterPane::Find);
+    assert!(rt.find("find-empty").is_some());
 }
 
 #[test]

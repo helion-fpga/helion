@@ -378,19 +378,61 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
     }),
     ("program", |s| {
         s.center = state::CenterPane::Program;
-        s.flow.impl_run = state::RunStatus::Complete;
-        s.status = state::StatusVerb::ImplementationComplete;
+    }),
+    ("program-nousb", |s| {
+        // A real implementation-run bitstream plus a scan with no USB
+        // programmer: Automatic cable refuses board DONE with the reason.
+        s.center = state::CenterPane::Program;
+        let _ = views::bitstream::seed_bitstream_fixture(s);
+        s.program.detect = Some(views::program::no_usb_fixture());
     }),
     ("program-done", |s| {
+        // Real sim-cable program (Session::program_hw_cable) of a real
+        // fixture bitstream, applied synchronously for the snapshot.
         s.center = state::CenterPane::Program;
-        s.flow.impl_run = state::RunStatus::Complete;
-        s.status = state::StatusVerb::ImplementationComplete;
-        s.program.connected = true;
-        s.program.phase = views::program::ProgramPhase::Done;
-        s.program.progress = 100;
-        let detail = s.program.done_detail();
-        s.toasts
-            .push(state::ToastKind::Success, "Device programmed", &detail);
+        if views::bitstream::seed_bitstream_fixture(s).is_ok() {
+            s.program.detect = Some(views::program::no_usb_fixture());
+            s.program.cable = views::program::CableChoice::Sim;
+            if let Some((bits, _)) = views::program::bits_source(s) {
+                let job = views::program::ProgramJob {
+                    cable: "sim".into(),
+                    part: s.bitstream.part.clone(),
+                    bits,
+                };
+                let done = views::program::program_blocking(&job, &|_| {});
+                views::program::deliver(s, done);
+                s.program.stat_selected = Some("DONE");
+            }
+        }
+    }),
+    ("ip", |s| {
+        s.center = state::CenterPane::Ip;
+        let _ = views::ip::select_ip(s, "h_uart");
+    }),
+    ("ip-bd", |s| {
+        s.center = state::CenterPane::Ip;
+        for core in ["h_uart", "h_gpio", "h_timer"] {
+            let _ = views::ip::create_bd_cell(s, core);
+        }
+        let _ = views::ip::select_ip(s, "h_gpio");
+    }),
+    ("bitstream", |s| {
+        s.center = state::CenterPane::Bitstream;
+        if views::bitstream::seed_bitstream_fixture(s).is_ok() {
+            let _ = views::bitstream::select_frame(s, "2");
+        }
+    }),
+    ("bitstream-empty", |s| {
+        s.center = state::CenterPane::Bitstream;
+    }),
+    ("find", |s| {
+        s.center = state::CenterPane::Find;
+        if live::seed_live_fixture(s).is_ok() {
+            let _ = views::find::select_find(s, "cell:u_div_u_luts2");
+        }
+    }),
+    ("find-empty", |s| {
+        s.center = state::CenterPane::Find;
     }),
     ("reports", |s| {
         s.center = state::CenterPane::Reports;
@@ -569,6 +611,9 @@ fn center_pane(s: &AppState, t: &VivadoTheme) -> El {
         state::CenterPane::Ila => views::ila_view::ila_pane(s, t),
         state::CenterPane::Program => views::program::program_pane(s, t),
         state::CenterPane::Reports => views::reports::reports_pane(s, t),
+        state::CenterPane::Ip => views::ip::ip_pane(s, t),
+        state::CenterPane::Bitstream => views::bitstream::bitstream_pane(s, t),
+        state::CenterPane::Find => views::find::find_pane(s, t),
     }
 }
 
@@ -674,7 +719,8 @@ pub fn poll_all(s: &mut AppState, t: f64, tx: &mut rune::Tx) -> bool {
     // Safety net: out-of-band buffer swaps (project reseed clears tabs)
     // re-mirror the live edit field; a no-op when already synced.
     views::editor::sync_edit(s);
-    runs_dirty || sim_dirty || ila_dirty || toasts_dirty
+    let hw_dirty = views::program::poll(s);
+    runs_dirty || sim_dirty || ila_dirty || hw_dirty || toasts_dirty
 }
 
 pub fn app_spec() -> AppSpec<AppState> {
