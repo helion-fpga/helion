@@ -42,7 +42,9 @@ for f in "$ROOT/examples"/*; do
   [ -e "$f" ] || continue
   cp -R "$f" "$STAGE/examples/"
 done
-cp "$ROOT/LICENSE-APACHE" "$ROOT/LICENSE-MIT" "$ROOT/README.md" "$STAGE/"
+cp "$ROOT/LICENSE" "$ROOT/LICENSE-APACHE" "$ROOT/LICENSE-MIT" "$ROOT/README.md" "$STAGE/"
+# helion-ide links the vendored Rune UI framework (MIT): ship its notice.
+cp "$ROOT/third_party/rune/LICENSE" "$STAGE/LICENSE-RUNE"
 printf '%s\n' "$VER" "$TRIPLE" > "$STAGE/VERSION"
 
 mkdir -p "$OUT_DIR"
