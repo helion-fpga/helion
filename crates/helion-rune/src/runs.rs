@@ -1090,6 +1090,25 @@ fn run_worker(
         return;
     }
 
+    // Parts of another family (iCE40/ECP5/7-series) run that backend.
+    if crate::runs_family::foreign_family(&part_req).is_some() {
+        let mut pkg: Vec<(String, String)> = xdc
+            .package_pins
+            .iter()
+            .map(|(p, v)| (p.clone(), v.clone()))
+            .collect();
+        for (port, key, value) in &pins {
+            if (key == "LOC" || key == "PACKAGE_PIN") && !pkg.iter().any(|(p, _)| p == port) {
+                pkg.push((port.clone(), value.clone()));
+            }
+        }
+        let out_dir = checkpoint
+            .as_ref()
+            .and_then(|c| c.parent().map(std::path::Path::to_path_buf))
+            .unwrap_or_else(|| std::env::temp_dir().join("helion-rune-runs"));
+        finish(crate::runs_family::run_family(design, &part_req, &pkg, &out_dir, &send));
+        return;
+    }
     let dev = match resolve_device(&part_req, &send) {
         Ok(dev) => dev,
         Err(e) => {

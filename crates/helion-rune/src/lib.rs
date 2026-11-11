@@ -18,12 +18,14 @@ pub mod analysis;
 pub mod bg;
 pub mod doctor;
 pub mod ext_verbs;
+pub mod eco_tcl;
 pub mod jobs;
 pub mod layout;
 pub mod live;
 pub mod pickers;
 pub mod project;
 pub mod runs;
+pub mod runs_family;
 pub mod scenes;
 pub mod state;
 pub mod tcl;
@@ -220,7 +222,7 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         s.dialogs.open(views::dialogs::DialogId::NewProject);
         s.dialogs.create.name = rune::TextEdit::new("project_2");
         s.dialogs.create.step = views::dialogs::CreateStep::Part;
-        s.dialogs.pop = Some(views::dialogs::PopId::CreatePart);
+        views::part_picker::pick_board(s, Some("HB1".into()));
     }),
     ("constraints-wizard", |s| {
         s.dialogs.open(views::dialogs::DialogId::Constraints);
@@ -615,10 +617,59 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
     }),
     ("ip-bd", |s| {
         s.center = state::CenterPane::Ip;
-        for core in ["h_uart", "h_gpio", "h_timer"] {
+        for core in ["h_rv32_hb1", "h_uart", "h_gpio", "h_timer"] {
             let _ = views::ip::create_bd_cell(s, core);
         }
-        let _ = views::ip::select_ip(s, "h_gpio");
+        let _ = views::ip::apply_automation(s);
+        let _ = views::ip::select_cell(s, "h_gpio_0");
+    }),
+    ("hls", |s| {
+        s.hls.source = rune::TextEdit::new(
+            "// Running sum over a 4-tap window (scene fixture).\nint sum4(int a[4]) {\n  int s = 0;\n  for (int i = 0; i < 4; i++) {\n    #pragma HLS PIPELINE II=1\n    s += a[i];\n  }\n  return s;\n}\n",
+        );
+        let _ = views::hls::start_synth(s);
+        views::hls::wait(s);
+        s.toasts = Default::default();
+        s.center = state::CenterPane::Hls;
+    }),
+    ("hls-cosim", |s| {
+        s.hls.source = rune::TextEdit::new(views::hls::NEW_KERNEL);
+        s.hls.vectors = rune::TextEdit::new("a=1 b=2 c=3\na=-5 b=7 c=100\na=40 b=2 c=0\n");
+        let _ = views::hls::start_synth(s);
+        views::hls::wait(s);
+        let _ = views::hls::start_cosim(s);
+        views::hls::wait(s);
+        s.toasts = Default::default();
+        s.center = state::CenterPane::Hls;
+    }),
+    ("export-hardware", |s| {
+        s.center = state::CenterPane::Ip;
+        for core in ["h_rv32_hb1", "h_uart", "h_gpio"] {
+            let _ = views::ip::create_bd_cell(s, core);
+        }
+        let _ = views::ip::apply_automation(s);
+        s.handoff.hw_path = rune::TextEdit::new("/projects/project_1/design_1.hwp");
+        views::handoff::open_export(s);
+    }),
+    ("archive-project", |s| {
+        s.handoff.ar_path = rune::TextEdit::new("/projects/project_1_archive.zip");
+        views::handoff::open_archive(s);
+    }),
+    ("ip-automation", |s| {
+        s.center = state::CenterPane::Ip;
+        for core in ["h_rv32_hb1", "h_uart", "h_gpio", "h_sync_fifo"] {
+            let _ = views::ip::create_bd_cell(s, core);
+        }
+        s.dialogs.open(views::dialogs::DialogId::IpAutomation);
+    }),
+    ("ip-customize", |s| {
+        s.center = state::CenterPane::Ip;
+        for core in ["h_rv32_hb1", "h_uart"] {
+            let _ = views::ip::create_bd_cell(s, core);
+        }
+        let _ = views::ip::apply_automation(s);
+        let _ = views::ip::set_cell_param(s, "h_rv32_hb1_0", "ENABLE_MUL", "1");
+        let _ = views::ip::open_customize(s, "h_rv32_hb1_0");
     }),
     ("bitstream", |s| {
         s.center = state::CenterPane::Bitstream;
@@ -1209,6 +1260,7 @@ fn center_pane(s: &AppState, t: &VivadoTheme) -> El {
         state::CenterPane::Eco => views::eco::eco_pane(s, t),
         state::CenterPane::Dfx => views::dfx::dfx_pane(s, t),
         state::CenterPane::Coverage => views::coverage::coverage_pane(s, t),
+        state::CenterPane::Hls => views::hls_view::hls_pane(s, t),
     }
 }
 
@@ -1334,7 +1386,7 @@ pub fn poll_all(s: &mut AppState, t: f64, tx: &mut rune::Tx) -> bool {
     let hw_dirty = views::program::poll(s);
     let pblocks_dirty = views::device_floor::sync_from_project(s);
     let tabs_dirty = layout::sync_tabs(s);
-    let jobs_dirty = jobs::poll(s, tx);
+    let jobs_dirty = jobs::poll(s, tx) | views::hls::poll(s, tx);
     let diag_dirty = views::editor_diag::poll(s, t, tx);
     let bg_dirty = bg::poll(s, Some(tx));
     runs_dirty

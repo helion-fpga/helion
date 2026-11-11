@@ -92,7 +92,7 @@ pub enum PaletteCommand {
 }
 
 /// Center panes in palette display order.
-const PANES: [CenterPane; 16] = [
+const PANES: [CenterPane; 20] = [
     CenterPane::Summary,
     CenterPane::Editor,
     CenterPane::Timing,
@@ -106,9 +106,13 @@ const PANES: [CenterPane; 16] = [
     CenterPane::Debug,
     CenterPane::Ila,
     CenterPane::Ip,
+    CenterPane::Hls,
     CenterPane::Bitstream,
     CenterPane::Program,
     CenterPane::Reports,
+    CenterPane::Eco,
+    CenterPane::Dfx,
+    CenterPane::Coverage,
 ];
 
 /// Tcl recipes shared by the registry (old `menu_tcl_recipes`).
@@ -155,6 +159,7 @@ pub(crate) fn pane_label(pane: CenterPane) -> &'static str {
         CenterPane::Eco => "ECO",
         CenterPane::Dfx => "Partial Reconfiguration",
         CenterPane::Coverage => "Code Coverage",
+        CenterPane::Hls => "High-Level Synthesis",
     }
 }
 

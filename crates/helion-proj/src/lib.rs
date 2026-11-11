@@ -21,6 +21,9 @@ pub mod ooc;
 pub mod tcl;
 
 pub mod ip_packager;
+pub mod archive;
+pub mod hw_platform;
+pub mod zip;
 pub use checkpoint2::{
     CheckpointDiff, CheckpointMeta, CheckpointStage, CheckpointSummary, RestoredCheckpoint,
     cell_fingerprints, delete_checkpoint, diff_metas, list_checkpoints, load_checkpoint,

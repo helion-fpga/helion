@@ -1735,6 +1735,7 @@ dependencies = [
  "helion-bits",
  "helion-device",
  "helion-ipxact",
+ "helion-sv",
 ]
 
 [[package]]
@@ -1874,6 +1875,7 @@ name = "helion-hls"
 version = "3.0.0"
 dependencies = [
  "helion-ir",
+ "helion-sim",
  "helion-sv",
 ]
 
@@ -1998,6 +2000,7 @@ dependencies = [
  "helion-device",
  "helion-drc",
  "helion-fabric",
+ "helion-hls",
  "helion-hw",
  "helion-ipxact",
  "helion-ir",
@@ -2008,6 +2011,7 @@ dependencies = [
  "helion-sim",
  "helion-sta",
  "helion-sv",
+ "helion-targets",
  "helion-verif",
  "helion-vhdl",
  "rune",
@@ -2064,6 +2068,19 @@ dependencies = [
  "rayon",
  "sv-parser",
  "varisat",
+]
+
+[[package]]
+name = "helion-targets"
+version = "3.0.0"
+dependencies = [
+ "helion-backend",
+ "helion-device",
+ "helion-ecp5",
+ "helion-ice40",
+ "helion-ir",
+ "helion-sv",
+ "helion-xilinx7",
 ]
 
 [[package]]

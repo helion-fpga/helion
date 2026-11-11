@@ -28,6 +28,7 @@ members = [
     "crates/helion-hl10t",
     "crates/helion-ice40",
     "crates/helion-ecp5",
+    "crates/helion-targets",
     "crates/helion-rune",
     "crates/helion-verif",
 ]
@@ -68,6 +69,7 @@ helion-backend = { path = "crates/helion-backend" }
 helion-xilinx7 = { path = "crates/helion-xilinx7" }
 helion-ice40 = { path = "crates/helion-ice40" }
 helion-ecp5 = { path = "crates/helion-ecp5" }
+helion-targets = { path = "crates/helion-targets" }
 criterion = "0.5"
 rayon = "1.8"
 
