@@ -266,6 +266,8 @@ pub struct RunArtifacts {
     pub reuse: Option<String>,
     /// Out-of-context modules the run synthesized or restored.
     pub ooc: Vec<crate::views::ooc::OocRow>,
+    /// iCE40/ECP5 die (and placement after implementation).
+    pub family_die: Option<crate::runs_family::FamilyDie>,
 }
 
 /// The live worker handle: its event channel plus the cancel flag the
@@ -311,6 +313,9 @@ pub struct RunsState {
     /// Die geometry cached when the placement lands (views read this; they
     /// only load a HAD model on the no-run-yet path).
     pub live_geom: Option<crate::live::LiveDieGeom>,
+    /// Die + placement of the last iCE40/ECP5 run (the Device view draws it
+    /// for family parts instead of the HL10T canvas).
+    pub family_die: Option<crate::runs_family::FamilyDie>,
     /// Re-analysis context of the last successful run (`None` until one).
     pub analysis: Option<AnalysisCtx>,
     /// Finished runs, oldest first (Summary Run History card).
@@ -866,6 +871,9 @@ pub fn apply_artifacts(s: &mut AppState, art: RunArtifacts) {
     if let Some(p) = art.placed {
         s.runs.live_placed = Some(p);
     }
+    if let Some(f) = art.family_die {
+        s.runs.family_die = Some(f);
+    }
     if !art.part.is_empty() {
         if let Ok(dev) = helion_device::Device::load_part(&art.part) {
             s.runs.live_geom = Some(crate::live::LiveDieGeom::from_device(&dev));
@@ -1106,7 +1114,7 @@ fn run_worker(
             .as_ref()
             .and_then(|c| c.parent().map(std::path::Path::to_path_buf))
             .unwrap_or_else(|| std::env::temp_dir().join("helion-rune-runs"));
-        finish(crate::runs_family::run_family(design, &part_req, &pkg, &out_dir, &send));
+        finish(crate::runs_family::run_family(design, &part_req, &pkg, &out_dir, &xdc, &clks, &send));
         return;
     }
     let dev = match resolve_device(&part_req, &send) {
@@ -1415,6 +1423,12 @@ fn run_synth_reports(
     art: &mut RunArtifacts,
     emit: &impl Fn(String, MsgSev),
 ) {
+    if crate::runs_family::foreign_family(part_req).is_some() {
+        // iCE40/ECP5: family packer counts and the family delay model, never
+        // the HL10T device.
+        crate::runs_family::family_synth_reports(design, xdc, clks, part_req, art, emit);
+        return;
+    }
     let mut timing_opt: Option<helion_sta::TimingResult> = None;
     match helion_sta::report_timing(design, clks) {
         Ok(t) => {
@@ -1804,6 +1818,7 @@ pub(crate) fn timing_state_from(
         design: helion_ir::resolve(design.name).to_string(),
         voltage_mv: xdc.operating_conditions.voltage_mv,
         temp_c: xdc.operating_conditions.temperature_c,
+        model: String::new(),
     }
 }
 
@@ -2340,6 +2355,8 @@ pub(crate) fn util_state_from(
         bufg_avail: 0,
         hier: hierarchical_occupancy(design),
         design: helion_ir::resolve(design.name).to_string(),
+        family: String::new(),
+        family_labels: Vec::new(),
     }
 }
 
@@ -2663,6 +2680,7 @@ mod tests {
             checkpoint: None,
             reuse: None,
             ooc: Vec::new(),
+            family_die: None,
         };
         deliver(&mut s, RunKind::Synth, RunEvent::Finished(Ok(art)));
         assert_eq!(s.flow.synth, RunStatus::Complete);

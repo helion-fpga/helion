@@ -1233,6 +1233,11 @@ fn bottom_panel(s: &AppState, t: &VivadoTheme) -> El {
 }
 
 pub fn device_pane(s: &AppState, t: &VivadoTheme) -> El {
+    // iCE40 / ECP5 parts draw their own die (family device model), never
+    // the HL10T canvas.
+    if crate::views::device_family::is_family_part(&s.project.part) {
+        return crate::views::device_family::family_device_pane(s, t);
+    }
     let geom = live_geom(s);
     let live = live_netlist(s);
     let placed = live_placed(s);

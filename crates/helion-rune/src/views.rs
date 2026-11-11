@@ -8,6 +8,7 @@ pub mod constraints;
 pub mod coverage;
 pub mod debug;
 pub mod device;
+pub mod device_family;
 pub mod dfx;
 pub mod device_floor;
 pub mod device_io;
