@@ -7,13 +7,16 @@
 //! DRC and `bitgen_rm` partial bitstreams). The static design is the
 //! run's source (the open `.prj`'s SystemVerilog sources, else the active
 //! RTL file); each module lists the HDL files defining the partition's
-//! module. Partitions live in the session (the `.prj` format has no DFX
-//! commands); the `create_partition` / `add_reconfig_module` /
-//! `launch_dfx` verbs script them.
+//! module. With a `.prj` open every edit is appended to it as the matching
+//! `helion_proj::prj_dfx` line (`create_partition` / `set_partition` /
+//! `add_reconfig_module` / `delete_reconfig_module` / `delete_partition`),
+//! and [`load_from_project`] restores the partitions when the project
+//! opens. Without a project they live in the session only.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use helion_proj::dfx::{DfxModule, DfxPartition, DfxResult};
+use helion_proj::prj_dfx::{PrjPartition, PrjReconfigModule, quote};
 use rune::{El, Tx, col, el, row, text};
 
 use crate::state::{AppState, CenterPane, ConsoleLine, MsgSev};
@@ -38,10 +41,88 @@ pub struct DfxState {
     pub partitions: Vec<PartitionDraft>,
     pub selected: usize,
     pub result: Option<Result<DfxResult, String>>,
+    /// `.prj` the partitions were restored from / are saved to.
+    pub saved_to: Option<PathBuf>,
+}
+
+/// Restore the project's `.prj` partitions (called once per project open
+/// by [`crate::views::device_floor::sync_from_project`]). Relative module
+/// sources resolve against the `.prj` like `read_sv`.
+pub fn load_from_project(s: &mut AppState, parts: Vec<PrjPartition>, prj: &Path) {
+    let partitions = parts
+        .into_iter()
+        .map(|p| PartitionDraft {
+            modules: p
+                .modules
+                .iter()
+                .map(|m| DfxModule {
+                    name: m.name.clone(),
+                    sources: m.sources.iter().map(|f| helion_proj::resolve_prj_path(prj, f)).collect(),
+                })
+                .collect(),
+            name: p.name,
+            pblock: p.pblock,
+            instance: p.instance,
+        })
+        .collect();
+    s.dfx = DfxState {
+        partitions,
+        selected: 0,
+        result: None,
+        saved_to: Some(prj.to_path_buf()),
+    };
+}
+
+/// A deleted pblock no longer backs any partition (mirrors the `.prj`
+/// replay of `delete_pblocks`).
+pub fn release_pblock(s: &mut AppState, pblock: &str) {
+    for p in &mut s.dfx.partitions {
+        if p.pblock.as_deref() == Some(pblock) {
+            p.pblock = None;
+        }
+    }
+}
+
+/// `.prj` spelling of a module source: relative to the project directory
+/// when inside it, else absolute.
+fn prj_source(s: &AppState, f: &Path) -> String {
+    let dir = s.dfx.saved_to.as_deref().and_then(Path::parent);
+    match dir.and_then(|d| f.strip_prefix(d).ok()) {
+        Some(rel) => rel.display().to_string(),
+        None => f.display().to_string(),
+    }
+}
+
+/// Persist one `.prj` line for a DFX edit; returns the console text.
+fn persist(s: &mut AppState, line: String) -> Result<String, String> {
+    match crate::views::device_floor::persist_line(s, &line)? {
+        Some(path) => {
+            s.dfx.saved_to = Some(path.clone());
+            Ok(format!("{line} (saved to {})", path.display()))
+        }
+        None => Ok(line),
+    }
+}
+
+fn draft_line(p: &PartitionDraft) -> String {
+    PrjPartition {
+        name: p.name.clone(),
+        pblock: p.pblock.clone(),
+        instance: p.instance.clone(),
+        modules: Vec::new(),
+    }
+    .line()
 }
 
 fn log(s: &mut AppState, text: String, sev: MsgSev) {
     s.console.lines.push(ConsoleLine { text, sev });
+}
+
+fn note(s: &mut AppState, r: Result<String, String>) {
+    match r {
+        Ok(v) => log(s, v, MsgSev::Info),
+        Err(e) => log(s, format!("ERROR: {e}"), MsgSev::Error),
+    }
 }
 
 /// Static RTL files: the open `.prj`'s SV/V sources, else the run source.
@@ -85,14 +166,65 @@ pub fn create_partition(s: &mut AppState, name: Option<String>, pblock: Option<S
             return Err(format!("create_partition: no ranged pblock {pb}"));
         }
     }
-    s.dfx.partitions.push(PartitionDraft {
+    if let Some(i) = &instance {
+        if i.chars().any(char::is_whitespace) {
+            return Err(format!("create_partition: bad instance name {i:?}"));
+        }
+    }
+    let draft = PartitionDraft {
         name: name.clone(),
         pblock: pblock.or_else(|| ranged_pblocks(s).first().cloned()),
         instance: instance.or_else(|| instances(s).first().cloned()),
         modules: Vec::new(),
-    });
+    };
+    let line = draft_line(&draft);
+    s.dfx.partitions.push(draft);
     s.dfx.selected = s.dfx.partitions.len() - 1;
-    Ok(format!("create_partition {name}"))
+    persist(s, line)
+}
+
+/// `set_partition name ?-pblock pb? ?-instance inst?`: rebind a partition.
+pub fn set_partition(s: &mut AppState, name: &str, pblock: Option<String>, instance: Option<String>) -> Result<String, String> {
+    let i = s.dfx.partitions.iter().position(|p| p.name == name).ok_or_else(|| format!("set_partition: no partition {name}"))?;
+    if let Some(pb) = &pblock {
+        if !ranged_pblocks(s).contains(pb) {
+            return Err(format!("set_partition: no ranged pblock {pb}"));
+        }
+    }
+    if pblock.is_none() && instance.is_none() {
+        return Err("set_partition: give -pblock and/or -instance".into());
+    }
+    let mut line = format!("set_partition {}", quote(name));
+    let p = &mut s.dfx.partitions[i];
+    if let Some(pb) = pblock {
+        line.push_str(&format!(" -pblock {}", quote(&pb)));
+        p.pblock = Some(pb);
+    }
+    if let Some(inst) = instance {
+        line.push_str(&format!(" -instance {}", quote(&inst)));
+        p.instance = Some(inst);
+    }
+    s.dfx.selected = i;
+    s.dfx.result = None;
+    persist(s, line)
+}
+
+/// `delete_partition name`.
+pub fn delete_partition(s: &mut AppState, name: &str) -> Result<String, String> {
+    let i = s.dfx.partitions.iter().position(|p| p.name == name).ok_or_else(|| format!("delete_partition: no partition {name}"))?;
+    s.dfx.partitions.remove(i);
+    s.dfx.selected = s.dfx.selected.min(s.dfx.partitions.len().saturating_sub(1));
+    s.dfx.result = None;
+    persist(s, format!("delete_partition {}", quote(name)))
+}
+
+/// `delete_reconfig_module partition module`.
+pub fn delete_module(s: &mut AppState, partition: &str, module: &str) -> Result<String, String> {
+    let p = s.dfx.partitions.iter_mut().find(|p| p.name == partition).ok_or_else(|| format!("delete_reconfig_module: no partition {partition}"))?;
+    let i = p.modules.iter().position(|m| m.name == module).ok_or_else(|| format!("delete_reconfig_module: no module {module} in {partition}"))?;
+    p.modules.remove(i);
+    s.dfx.result = None;
+    persist(s, format!("delete_reconfig_module {} {}", quote(partition), quote(module)))
 }
 
 /// Add a module with `files` to the selected partition.
@@ -111,9 +243,11 @@ pub fn add_module(s: &mut AppState, partition: Option<&str>, name: Option<String
         return Err(format!("add_reconfig_module: {name} exists in {}", part.name));
     }
     let pn = part.name.clone();
-    part.modules.push(DfxModule { name: name.clone(), sources: files });
+    part.modules.push(DfxModule { name: name.clone(), sources: files.clone() });
     s.dfx.result = None;
-    Ok(format!("add_reconfig_module {pn} {name}"))
+    let module = PrjReconfigModule { name, sources: files.iter().map(|f| prj_source(s, f)).collect() };
+    let owner = PrjPartition { name: pn, ..Default::default() };
+    persist(s, owner.module_line(&module))
 }
 
 /// Why the run is unavailable (`None` = ready).
@@ -125,8 +259,12 @@ pub fn run_unavailable(s: &AppState) -> Option<String> {
         return Some("A run is in progress".into());
     }
     let p = current(s)?;
-    if p.pblock.is_none() {
-        return Some("Pick a ranged pblock (Device ▸ Pblocks)".into());
+    match &p.pblock {
+        None => return Some("Pick a ranged pblock (Device ▸ Pblocks)".into()),
+        Some(pb) if !ranged_pblocks(s).contains(pb) => {
+            return Some(format!("Pblock {pb} no longer exists — pick another"));
+        }
+        _ => {}
     }
     if p.instance.is_none() {
         return Some("Pick the reconfigurable instance".into());
@@ -236,10 +374,10 @@ fn partition_card(s: &AppState, p: &PartitionDraft, t: &VivadoTheme) -> El {
         .into_iter()
         .map(|n| {
             let n2 = n.clone();
+            let pn = p.name.clone();
             chip(format!("dfx-pblock-{n}"), n.clone(), p.pblock.as_ref() == Some(&n), t, move |s: &mut AppState| {
-                if let Some(p) = current_mut(s) {
-                    p.pblock = Some(n2.clone());
-                }
+                let r = set_partition(s, &pn, Some(n2.clone()), None);
+                note(s, r);
             })
         })
         .collect();
@@ -253,10 +391,10 @@ fn partition_card(s: &AppState, p: &PartitionDraft, t: &VivadoTheme) -> El {
         .into_iter()
         .map(|n| {
             let n2 = n.clone();
+            let pn = p.name.clone();
             chip(format!("dfx-inst-{n}"), n.clone(), p.instance.as_ref() == Some(&n), t, move |s: &mut AppState| {
-                if let Some(p) = current_mut(s) {
-                    p.instance = Some(n2.clone());
-                }
+                let r = set_partition(s, &pn, None, Some(n2.clone()));
+                note(s, r);
             })
         })
         .collect();
@@ -270,17 +408,14 @@ fn partition_card(s: &AppState, p: &PartitionDraft, t: &VivadoTheme) -> El {
     }
     for (i, m) in p.modules.iter().enumerate() {
         let srcs = m.sources.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(", ");
+        let (pn, mn) = (p.name.clone(), m.name.clone());
         mods = mods.child(
             plain_row(format!("dfx-module-{i}"))
                 .child(kit::fixed_cell(m.name.clone(), 140.0, t.text))
                 .child(kit::text_cell(srcs, 1.0, t.text_dim))
                 .child(el().w(64.0).child(kit::link(format!("dfx-module-remove-{i}"), "Remove", t, move |s: &mut AppState| {
-                    if let Some(p) = current_mut(s) {
-                        if i < p.modules.len() {
-                            p.modules.remove(i);
-                        }
-                    }
-                    s.dfx.result = None;
+                    let r = delete_module(s, &pn, &mn);
+                    note(s, r);
                 }))),
         );
     }
@@ -393,9 +528,31 @@ pub fn dfx_pane(s: &AppState, t: &VivadoTheme) -> El {
             Err(e) => log(s, format!("ERROR: {e}"), MsgSev::Error),
         }
     });
+    let del_reason = if crate::bg::busy(s, TASK) {
+        Some("Running…")
+    } else {
+        current(s).is_none().then_some("No partition selected")
+    };
+    let del_name = current(s).map(|p| p.name.clone());
+    let del_btn = kit::action_button("dfx-delete", "Delete Partition", del_reason, t, move |s: &mut AppState| {
+        if let Some(n) = &del_name {
+            let r = delete_partition(s, n);
+            note(s, r);
+        }
+    });
+    let (saved, saved_color) = match crate::views::device_floor::project_prj(s) {
+        Some(p) => (
+            format!("Saved to {}", p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()),
+            t.text_dim,
+        ),
+        None => ("Session only — open a project to keep partitions".to_string(), t.text_faint),
+    };
+    let saved_full = crate::views::device_floor::project_prj(s).map(|p| p.display().to_string()).unwrap_or_else(|| saved.clone());
     let mut body = col().w_full().gap(10.0).padding(8.0).child(
         row().w_full().h(28.0).items_center().gap(8.0)
             .child(cad::cut("Reconfigurable partitions are pblocks whose instance swaps between module variants.", VivadoTheme::FONT_UI, t.text_dim).grow(1.0).min_w(0.0))
+            .child(cad::cut(saved, VivadoTheme::FONT_UI, saved_color).key("dfx-saved").max_w(260.0).help_when_truncated(saved_full))
+            .child(del_btn)
             .child(new_btn),
     );
     match current(s) {
@@ -413,12 +570,23 @@ pub fn dfx_pane(s: &AppState, t: &VivadoTheme) -> El {
         .child(col().key("dfx-scroll").grow(1.0).min_h(0.0).scroll(rune::ScrollSpec { stick_bottom: false }).child(body))
 }
 
-pub const VERBS: &[&str] = &["create_partition", "add_reconfig_module", "launch_dfx", "report_partitions"];
+pub const VERBS: &[&str] = &[
+    "create_partition",
+    "set_partition",
+    "delete_partition",
+    "add_reconfig_module",
+    "delete_reconfig_module",
+    "launch_dfx",
+    "report_partitions",
+];
 
 pub fn help(name: &str) -> Option<(&'static str, &'static str)> {
     Some(match name {
         "create_partition" => ("create_partition ?name? ?pblock? ?instance?", "make a pblock + instance a reconfigurable partition"),
+        "set_partition" => ("set_partition name ?-pblock pb? ?-instance inst?", "rebind a partition's pblock or instance"),
+        "delete_partition" => ("delete_partition name", "remove a reconfigurable partition"),
         "add_reconfig_module" => ("add_reconfig_module partition name files…", "add a reconfigurable module variant (its HDL files)"),
+        "delete_reconfig_module" => ("delete_reconfig_module partition name", "remove a module variant from a partition"),
         "launch_dfx" => ("launch_dfx ?partition?", "implement every module and write partial bitstreams"),
         "report_partitions" => ("report_partitions", "list partitions, pblocks, instances and modules"),
         _ => return None,
@@ -429,6 +597,28 @@ pub fn tcl_verb(s: &mut AppState, name: &str, args: &[String]) -> Result<String,
     s.navigate(CenterPane::Dfx);
     match name {
         "create_partition" => create_partition(s, args.first().cloned(), args.get(1).cloned(), args.get(2).cloned()),
+        "set_partition" => {
+            let n = args.first().ok_or("set_partition: need a partition name")?.clone();
+            let mut pb = None;
+            let mut inst = None;
+            let mut i = 1;
+            while i < args.len() {
+                let v = args.get(i + 1).cloned().ok_or_else(|| format!("set_partition: {} needs a value", args[i]))?;
+                match args[i].as_str() {
+                    "-pblock" => pb = Some(v),
+                    "-instance" => inst = Some(v),
+                    o => return Err(format!("set_partition: unknown option {o}")),
+                }
+                i += 2;
+            }
+            set_partition(s, &n, pb, inst)
+        }
+        "delete_partition" => delete_partition(s, args.first().ok_or("delete_partition: need a partition name")?),
+        "delete_reconfig_module" => {
+            let p = args.first().ok_or("delete_reconfig_module: need partition module")?;
+            let m = args.get(1).ok_or("delete_reconfig_module: need a module name")?;
+            delete_module(s, p, m)
+        }
         "add_reconfig_module" => {
             let p = args.first().ok_or("add_reconfig_module: need partition name files…")?.clone();
             let n = args.get(1).ok_or("add_reconfig_module: need a module name")?.clone();
@@ -504,5 +694,53 @@ mod tests {
         assert_eq!(r.modules.len(), 2);
         assert!(r.modules.iter().all(|m| m.frames > 0));
         assert_eq!(s.center, CenterPane::Dfx);
+    }
+
+    #[test]
+    fn partitions_persist_in_the_prj_and_reload_on_open() {
+        let dir = std::env::temp_dir().join(format!("helion-dfx-prj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("rtl")).unwrap();
+        let prj = dir.join("p.prj");
+        std::fs::write(&prj, "part HL10T-C32-1\nread_sv top.v\ncreate_pblock pb_a\nresize_pblock pb_a -add {CLB_X6Y5:CLB_X8Y8}\ncreate_pblock pb_b\nresize_pblock pb_b -add {CLB_X2Y2:CLB_X3Y3}\n").unwrap();
+        let inv = dir.join("rtl").join("rm inv.v");
+        std::fs::write(&inv, "module rm(input a, output y); assign y = ~a; endmodule\n").unwrap();
+        let mut s = AppState::demo();
+        s.runs.source = Some(prj.clone());
+        assert!(crate::views::device_floor::sync_from_project(&mut s));
+        assert!(s.dfx.partitions.is_empty());
+        tcl_verb(&mut s, "create_partition", &["rp0".into(), "pb_a".into(), "u_rm".into()]).unwrap();
+        tcl_verb(&mut s, "create_partition", &["rp1".into()]).unwrap();
+        let out = tcl_verb(&mut s, "add_reconfig_module", &["rp0".into(), "inv".into(), inv.display().to_string()]).unwrap();
+        assert!(out.contains("saved to"), "{out}");
+        tcl_verb(&mut s, "add_reconfig_module", &["rp0".into(), "buf".into(), "/elsewhere/buf.v".into()]).unwrap();
+        tcl_verb(&mut s, "set_partition", &["rp0".into(), "-pblock".into(), "pb_b".into()]).unwrap();
+        assert!(tcl_verb(&mut s, "set_partition", &["rp0".into(), "-pblock".into(), "nope".into()]).is_err());
+        tcl_verb(&mut s, "delete_reconfig_module", &["rp0".into(), "buf".into()]).unwrap();
+        tcl_verb(&mut s, "delete_partition", &["rp1".into()]).unwrap();
+        let text = std::fs::read_to_string(&prj).unwrap();
+        assert!(text.contains("add_reconfig_module rp0 inv {rtl/rm inv.v}"), "relative, brace-quoted: {text}");
+        let reopened = helion_proj::load_prj(&text).unwrap();
+        assert_eq!(reopened.partitions.len(), 1);
+
+        // Restart: a fresh app state opening the project sees the partition.
+        let mut s2 = AppState::demo();
+        s2.runs.source = Some(prj.clone());
+        assert!(crate::views::device_floor::sync_from_project(&mut s2));
+        assert_eq!(s2.dfx.partitions.len(), 1);
+        let p = &s2.dfx.partitions[0];
+        assert_eq!((p.name.as_str(), p.pblock.as_deref(), p.instance.as_deref()), ("rp0", Some("pb_b"), Some("u_rm")));
+        assert_eq!(p.modules.len(), 1);
+        assert_eq!(p.modules[0].sources, vec![inv.clone()], "relative source resolves against the .prj");
+        assert_eq!(s2.dfx.saved_to.as_deref(), Some(prj.as_path()));
+        // Deleting the partition's pblock unbinds it, in memory and on reload.
+        crate::tcl::eval_command(&mut s2, "delete_pblocks pb_b");
+        assert_eq!(s2.dfx.partitions[0].pblock, None);
+        assert!(run_unavailable(&s2).unwrap().contains("Pick a ranged pblock"));
+        let mut s3 = AppState::demo();
+        s3.runs.source = Some(prj);
+        crate::views::device_floor::sync_from_project(&mut s3);
+        assert_eq!(s3.dfx.partitions[0].pblock, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
