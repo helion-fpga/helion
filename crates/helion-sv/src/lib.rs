@@ -17560,8 +17560,28 @@ fn mac_ab_c_from_rhs(e: &RExpr<'_>) -> (Option<String>, Option<String>, Option<S
     }
 }
 
+/// True when `rhs` is exactly `a * b` or `a * b + c` over plain signal
+/// names, i.e. when the A/B/C/P bus wiring below is the whole function.
+fn mac_shape_exact(rhs: &RExpr<'_>) -> bool {
+    let arena = Bump::new();
+    let e = normalize_mul_operands(rhs, &arena);
+    fn mul_ok(x: &RExpr<'_>) -> bool {
+        matches!(x, RExpr::Mul(a, b) if rexpr_ident(a).is_some() && rexpr_ident(b).is_some())
+    }
+    match &e {
+        RExpr::Mul(..) => mul_ok(&e),
+        RExpr::Add(l, r) => (mul_ok(l) && rexpr_ident(r).is_some()) || (mul_ok(r) && rexpr_ident(l).is_some()),
+        _ => false,
+    }
+}
+
 /// Infer Mac27 and wire A/B/(C)/P so schematic/HNF are not pin-NC islands.
-fn emit_mac27(d: &mut Design, cell: String, rhs: &RExpr<'_>, lhs: &str) {
+///
+/// When the multiply is exactly `a * b [+ c]` over signal names the cell
+/// also gets `sim_mul` (`preg` for a clocked `lhs <= ...`, `comb` for an
+/// `assign`) so helion-sim models it as `P = A*B + C` on the bus bits;
+/// any other shape stays an opaque, unsimulated DSP.
+fn emit_mac27(d: &mut Design, cell: String, rhs: &RExpr<'_>, lhs: &str, registered: bool) {
     // Use Dsp48e1 with OPMODE=0b0000101 (P = A*B + C), ALUMODE=0b0000 (add).
     d.add_cell(
         &cell,
@@ -17581,6 +17601,9 @@ fn emit_mac27(d: &mut Design, cell: String, rhs: &RExpr<'_>, lhs: &str) {
         d.connect(&c, &cell, "C");
     }
     d.connect(lhs, &cell, "P");
+    if mac_shape_exact(rhs) {
+        let _ = d.set_cell_attr(&cell, "sim_mul", if registered { "preg" } else { "comb" });
+    }
 }
 fn extract_arith_operand_nets(
     d: &mut Design,
@@ -22778,7 +22801,7 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
             continue;
         }
         if is_mac_rhs(rhs) {
-            emit_mac27(&mut d, format!("u_mac{n_mac}"), rhs, lhs);
+            emit_mac27(&mut d, format!("u_mac{n_mac}"), rhs, lhs, true);
             n_mac += 1;
             continue;
         }
@@ -23315,7 +23338,7 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
         }
         // Comb multiply → DSP MAC (do not bitblast).
         if expr_contains_mul(rhs) {
-            emit_mac27(&mut d, format!("u_mac{n_mac}"), rhs, lhs);
+            emit_mac27(&mut d, format!("u_mac{n_mac}"), rhs, lhs, false);
             n_mac += 1;
             continue;
         }

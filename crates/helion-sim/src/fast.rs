@@ -243,6 +243,33 @@ pub enum ConeNodeKind {
         s_net: u32,
         o_net: u32,
     },
+    /// Multiplier / MAC (`P = A * B + C`, LSB-first bit nets, wrapping at
+    /// the width of `P`). Built for `Mac27`/`DSP48E1` cells that helion-sv
+    /// marks with a `sim_mul` attribute; a registered (`preg`) multiplier
+    /// adds one compiled FF per `P` bit behind this node.
+    Mul {
+        a: Vec<u32>,
+        b: Vec<u32>,
+        c: Vec<u32>,
+        p: Vec<u32>,
+    },
+}
+
+/// Unsigned value of LSB-first bit nets (2-state), `None` past 128 bits.
+fn bus_value(words: &[u64], nets: &[u32]) -> u128 {
+    let mut v = 0u128;
+    for (i, &n) in nets.iter().enumerate().take(128) {
+        if get_bit(words, n) {
+            v |= 1u128 << i;
+        }
+    }
+    v
+}
+
+fn mul_result(words: &[u64], a: &[u32], b: &[u32], c: &[u32]) -> u128 {
+    bus_value(words, a)
+        .wrapping_mul(bus_value(words, b))
+        .wrapping_add(bus_value(words, c))
 }
 
 /// One compiled combinational evaluation node in the topological schedule.
@@ -300,6 +327,13 @@ impl CompiledNode {
                     }
                 }
             }
+            ConeNodeKind::Mul { a, b, c, .. } => {
+                for &n in a.iter().chain(b).chain(c) {
+                    if n >= 2 && n != NET_UNCONNECTED && !out.contains(&n) {
+                        out.push(n);
+                    }
+                }
+            }
         }
         out
     }
@@ -329,6 +363,7 @@ impl CompiledNode {
                     vec![]
                 }
             }
+            ConeNodeKind::Mul { p, .. } => p.iter().copied().filter(|&n| n != NET_UNCONNECTED).collect(),
         }
     }
 }
@@ -515,6 +550,49 @@ impl LevelizedSchedule {
                             o_nets,
                             co_nets,
                         },
+                    });
+                }
+                CellKind::Mac27 | CellKind::Dsp48e1 { .. } if c.attrs.get("sim_mul").is_some() => {
+                    // Operand/product pins name whole buses (`a`); their bits
+                    // are the `a_0, a_1, ...` nets (or `a` itself for 1 bit).
+                    let bus = |pin: &str, names: &mut Vec<String>, ids: &mut HashMap<String, u32>| -> Vec<u32> {
+                        let Some(base) = pin_ix.net_on(cname, pin).map(|s| resolve(s).to_string()) else {
+                            return Vec::new();
+                        };
+                        let mut bits = Vec::new();
+                        while let Some(&id) = ids.get(&format!("{base}_{}", bits.len())) {
+                            bits.push(id);
+                        }
+                        if bits.is_empty() {
+                            bits.push(intern_net(&base, names, ids));
+                        }
+                        bits
+                    };
+                    let a = bus("A", &mut net_names, &mut net_ids);
+                    let b = bus("B", &mut net_names, &mut net_ids);
+                    let cc = bus("C", &mut net_names, &mut net_ids);
+                    let p = bus("P", &mut net_names, &mut net_ids);
+                    if a.is_empty() || b.is_empty() || p.is_empty() {
+                        continue;
+                    }
+                    let registered = c.attrs.get("sim_mul").is_some_and(|v| v == "preg");
+                    let p_nodes = if registered {
+                        let mut internal = Vec::with_capacity(p.len());
+                        for (i, &q_net) in p.iter().enumerate() {
+                            let d_net = intern_net(&format!("{cname}$p{i}"), &mut net_names, &mut net_ids);
+                            internal.push(d_net);
+                            let name = format!("{cname}$preg{i}");
+                            ff_ids.insert(name.clone(), ffs.len());
+                            ffs.push(CompiledFf { name, d_net, q_net, ce_net: NET_ONE, rst_net: NET_ZERO });
+                        }
+                        internal
+                    } else {
+                        p
+                    };
+                    raw_nodes.push(CompiledNode {
+                        cell_name: cname.to_string(),
+                        level: 0,
+                        kind: ConeNodeKind::Mul { a, b, c: cc, p: p_nodes },
                     });
                 }
                 _ => {
@@ -952,6 +1030,15 @@ impl CompiledSim {
                     set_bit(&mut self.net_val, *o_net, out);
                     set_bit(&mut self.net_xz, *o_net, false);
                 }
+                ConeNodeKind::Mul { a, b, c, p } => {
+                    let v = mul_result(&self.net_val, a, b, c);
+                    for (i, &n) in p.iter().enumerate() {
+                        if n != NET_UNCONNECTED {
+                            set_bit(&mut self.net_val, n, i < 128 && (v >> i) & 1 == 1);
+                            set_bit(&mut self.net_xz, n, false);
+                        }
+                    }
+                }
             }
         }
         self.apply_force_words();
@@ -1026,6 +1113,16 @@ impl CompiledSim {
                     let s = get_logic4(&self.net_val, &self.net_xz, *s_net);
                     let out = Logic4::mux(s, i0, i1);
                     set_logic4(&mut self.net_val, &mut self.net_xz, *o_net, out);
+                }
+                ConeNodeKind::Mul { a, b, c, p } => {
+                    let unknown = a.iter().chain(b).chain(c).any(|&n| get_logic4(&self.net_val, &self.net_xz, n).is_unknown());
+                    let v = mul_result(&self.net_val, a, b, c);
+                    for (i, &n) in p.iter().enumerate() {
+                        if n != NET_UNCONNECTED {
+                            let bit = if unknown { Logic4::X } else { Logic4::from_bool(i < 128 && (v >> i) & 1 == 1) };
+                            set_logic4(&mut self.net_val, &mut self.net_xz, n, bit);
+                        }
+                    }
                 }
             }
         }

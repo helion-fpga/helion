@@ -128,11 +128,62 @@ fn bit_blast_ports(d: &mut helion_ir::Design) {
     d.ports = out;
 }
 
-struct Mem {
+/// One `ap_memory` bank: registered address/enable in, one-cycle `q0` out,
+/// `we0`/`d0` writes committed at the clock edge.
+struct Bank {
     addr: RtlPort,
     ce: RtlPort,
     q: RtlPort,
+    we: Option<RtlPort>,
+    d: Option<RtlPort>,
     data: Vec<i64>,
+}
+
+/// An array argument split over its partition banks.
+struct ArrMem {
+    name: String,
+    cfg: crate::schedule::ArrayBankConfig,
+    banks: Vec<Bank>,
+}
+
+fn coords(mut flat: usize, dims: &[usize]) -> Vec<usize> {
+    let mut out = vec![0usize; dims.len()];
+    for i in (0..dims.len()).rev() {
+        let d = dims[i].max(1);
+        out[i] = flat % d;
+        flat /= d;
+    }
+    out
+}
+
+impl ArrMem {
+    fn total(&self) -> usize {
+        self.cfg.dims.iter().product::<usize>().max(1)
+    }
+
+    fn load(&mut self, vals: &[i64]) {
+        for b in &mut self.banks {
+            b.data = vec![0; self.cfg.bank_depth.max(1)];
+        }
+        for e in 0..self.total() {
+            let (b, o) = self.cfg.map_indices(&coords(e, &self.cfg.dims));
+            if let Some(bank) = self.banks.get_mut(b) {
+                if o >= bank.data.len() {
+                    bank.data.resize(o + 1, 0);
+                }
+                bank.data[o] = vals.get(e).copied().unwrap_or(0);
+            }
+        }
+    }
+
+    fn contents(&self) -> Vec<i64> {
+        (0..self.total())
+            .map(|e| {
+                let (b, o) = self.cfg.map_indices(&coords(e, &self.cfg.dims));
+                self.banks.get(b).and_then(|bk| bk.data.get(o)).copied().unwrap_or(0)
+            })
+            .collect()
+    }
 }
 
 /// Run C/RTL co-simulation of `source` on `vectors` (see the module docs).
@@ -147,6 +198,13 @@ pub fn run_rtl_cosim_with(
     vectors: &[CosimTestVector],
 ) -> Result<CosimReport, String> {
     let hls = crate::hls_compile_with_config(source, config)?;
+    if let crate::RtlKind::InterfaceShell { reason } = &hls.rtl {
+        return Err(format!(
+            "cosim: the RTL for `{}` is an interface shell, not a datapath ({reason} is not supported by the FSMD emitter); \
+             co-simulating it would not check the C function",
+            hls.cdfg.function_name
+        ));
+    }
     let (top, ports) = header_ports(&hls.sv)?;
     let mut netlist = hls.design.clone();
     bit_blast_ports(&mut netlist);
@@ -157,6 +215,25 @@ pub fn run_rtl_cosim_with(
     let rst_n = port("ap_rst_n");
     // Return value port: `ap_return` with handshake, `y` without.
     let ret_port = port("ap_return").or_else(|| port("y"));
+    // Array arguments on ap_memory banks.
+    let mut arr_template: Vec<ArrMem> = Vec::new();
+    for cfg in hls.cdfg.array_configs.values().filter(|c| c.is_arg) {
+        let n = cfg.num_banks.max(1);
+        let mut banks = Vec::new();
+        for b in 0..n {
+            let p = if n <= 1 { cfg.name.clone() } else { format!("{}_{b}", cfg.name) };
+            let (Some(addr), Some(ce), Some(q)) =
+                (port(&format!("{p}_address0")), port(&format!("{p}_ce0")), port(&format!("{p}_q0")))
+            else {
+                return Err(format!(
+                    "cosim: argument `{}` has no ap_memory port `{p}_address0` in module {top} (interface not supported by the RTL harness)",
+                    cfg.name
+                ));
+            };
+            banks.push(Bank { addr, ce, q, we: port(&format!("{p}_we0")), d: port(&format!("{p}_d0")), data: Vec::new() });
+        }
+        arr_template.push(ArrMem { name: cfg.name.clone(), cfg: cfg.clone(), banks });
+    }
     let mut vector_results = Vec::with_capacity(vectors.len());
     let mut c_expected_all = Vec::with_capacity(vectors.len());
     let mut passed = 0usize;
@@ -165,35 +242,34 @@ pub fn run_rtl_cosim_with(
         let c_outputs = crate::evaluate_c_kernel_reference(source, &vec_in.inputs)?;
         c_expected_all.push(c_outputs.clone());
         let mut sim = Sim::new(&netlist);
-        // Bind inputs: scalars to same-named ports, arrays to ap_memory banks.
-        let mut mems: Vec<Mem> = Vec::new();
+        let mut mems: Vec<ArrMem> = arr_template
+            .iter()
+            .map(|m| ArrMem {
+                name: m.name.clone(),
+                cfg: m.cfg.clone(),
+                banks: m
+                    .banks
+                    .iter()
+                    .map(|b| Bank { addr: b.addr.clone(), ce: b.ce.clone(), q: b.q.clone(), we: b.we.clone(), d: b.d.clone(), data: Vec::new() })
+                    .collect(),
+            })
+            .collect();
+        for m in &mut mems {
+            let vals = vec_in.inputs.get(&m.name).cloned().unwrap_or_default();
+            m.load(&vals);
+        }
+        // Scalars to same-named input ports.
         for (name, vals) in &vec_in.inputs {
-            if let Some(p) = port(name).filter(|p| p.input) {
-                drive(&mut sim, &p, vals.first().copied().unwrap_or(0))?;
+            if mems.iter().any(|m| &m.name == name) {
                 continue;
             }
-            let single = (port(&format!("{name}_address0")), port(&format!("{name}_ce0")), port(&format!("{name}_q0")));
-            if let (Some(addr), Some(ce), Some(q)) = single {
-                mems.push(Mem { addr, ce, q, data: vals.clone() });
-                continue;
-            }
-            // Completely partitioned: one bank per element (`a_0_q0`, ...).
-            let mut found = false;
-            for (k, v) in vals.iter().enumerate() {
-                let bank = (
-                    port(&format!("{name}_{k}_address0")),
-                    port(&format!("{name}_{k}_ce0")),
-                    port(&format!("{name}_{k}_q0")),
-                );
-                if let (Some(addr), Some(ce), Some(q)) = bank {
-                    mems.push(Mem { addr, ce, q, data: vec![*v] });
-                    found = true;
+            match port(name) {
+                Some(p) if p.input => drive(&mut sim, &p, vals.first().copied().unwrap_or(0))?,
+                _ => {
+                    return Err(format!(
+                        "cosim: argument `{name}` has no RTL port in module {top} (interface not supported by the RTL harness)"
+                    ));
                 }
-            }
-            if !found {
-                return Err(format!(
-                    "cosim: argument `{name}` has no RTL port in module {top} (interface not supported by the RTL harness)"
-                ));
             }
         }
         // Reset.
@@ -213,7 +289,11 @@ pub fn run_rtl_cosim_with(
             drive(&mut sim, r, 1)?;
         }
         let mut rtl_outputs: BTreeMap<String, Vec<i64>> = BTreeMap::new();
-        let ptr_outs: Vec<String> = c_outputs.keys().filter(|k| k.as_str() != "return").cloned().collect();
+        let ptr_outs: Vec<String> = c_outputs
+            .keys()
+            .filter(|k| k.as_str() != "return" && !mems.iter().any(|m| &m.name == *k))
+            .cloned()
+            .collect();
         let capture = |sim: &Sim, outs: &mut BTreeMap<String, Vec<i64>>, only_vld: bool| {
             for name in &ptr_outs {
                 let Some(p) = port(name).filter(|p| !p.input) else { continue };
@@ -222,37 +302,65 @@ pub fn run_rtl_cosim_with(
                 if only_vld && strobe != Some(true) {
                     continue;
                 }
+                if !only_vld && vld.is_some() && outs.contains_key(name) {
+                    // A strobed output keeps the value it was written with.
+                    continue;
+                }
                 if let Some(v) = sample(sim, &p) {
                     outs.insert(name.clone(), vec![v]);
                 }
             }
         };
+        // One clock: sample the memory requests, step, then commit writes
+        // and return read data (one-cycle BRAM latency).
+        let clock = |sim: &mut Sim, mems: &mut Vec<ArrMem>| -> Result<(), String> {
+            let mut reads: Vec<(usize, usize, usize)> = Vec::new();
+            let mut writes: Vec<(usize, usize, usize, i64)> = Vec::new();
+            for (mi, m) in mems.iter().enumerate() {
+                for (bi, b) in m.banks.iter().enumerate() {
+                    if !sample(sim, &b.ce).is_some_and(|v| v != 0) {
+                        continue;
+                    }
+                    let a = sample(sim, &b.addr).map(|a| (a as u64 & ((1u64 << b.addr.width.min(63)) - 1)) as usize).unwrap_or(0);
+                    let we = b.we.as_ref().and_then(|w| sample(sim, w)).is_some_and(|v| v != 0);
+                    if we {
+                        let d = b.d.as_ref().and_then(|d| sample(sim, d)).unwrap_or(0);
+                        writes.push((mi, bi, a, d));
+                    } else {
+                        reads.push((mi, bi, a));
+                    }
+                }
+            }
+            sim.step_posedge(10_000);
+            for (mi, bi, a, d) in writes {
+                let data = &mut mems[mi].banks[bi].data;
+                if a >= data.len() {
+                    data.resize(a + 1, 0);
+                }
+                data[a] = d;
+            }
+            for (mi, bi, a) in reads {
+                let b = &mems[mi].banks[bi];
+                let v = b.data.get(a).copied().unwrap_or(0);
+                let q = b.q.clone();
+                drive(sim, &q, v)?;
+            }
+            Ok(())
+        };
         let mut cycles = 0u32;
         let mut done = false;
         let latency;
+        // An FSMD has a known worst-case latency: past twice that, ap_done
+        // is not coming (fail fast instead of burning the global cap).
+        let cap = match &hls.rtl {
+            crate::RtlKind::Fsmd { cycle_bound, .. } => (cycle_bound.saturating_mul(2) + 64).min(COSIM_MAX_CYCLES as u64) as u32,
+            _ => COSIM_MAX_CYCLES,
+        };
         if let (Some(start), Some(done_p)) = (&ap_start, &ap_done) {
             drive(&mut sim, start, 1)?;
-            while cycles < COSIM_MAX_CYCLES {
-                // BRAM model: sample address/enable before the edge.
-                let reads: Vec<(usize, Option<i64>)> = mems
-                    .iter()
-                    .enumerate()
-                    .map(|(i, m)| {
-                        let en = sample(&sim, &m.ce).is_some_and(|v| v != 0);
-                        let a = sample(&sim, &m.addr).map(|a| a & ((1i64 << m.addr.width) - 1));
-                        (i, if en { a } else { None })
-                    })
-                    .collect();
-                sim.step_posedge(10_000);
+            while cycles < cap {
+                clock(&mut sim, &mut mems)?;
                 cycles += 1;
-                for (i, a) in reads {
-                    if let Some(a) = a {
-                        let m = &mems[i];
-                        let v = m.data.get(a as usize).copied().unwrap_or(0);
-                        let q = m.q.clone();
-                        drive(&mut sim, &q, v)?;
-                    }
-                }
                 if cycles == 1 {
                     drive(&mut sim, start, 0)?;
                 }
@@ -264,10 +372,16 @@ pub fn run_rtl_cosim_with(
             }
             latency = cycles;
         } else {
-            // No block-level handshake: registered datapath, scheduled latency.
-            let lat = hls.schedule.max_latency_cycles.max(1);
+            // No block-level handshake: run the RTL's worst-case latency
+            // (the FSMD bound, or the direct datapath's scheduled latency).
+            let lat = match &hls.rtl {
+                crate::RtlKind::Fsmd { cycle_bound, .. } => (*cycle_bound).min(COSIM_MAX_CYCLES as u64) as u32,
+                crate::RtlKind::DirectDatapath { depth } => (*depth).max(hls.schedule.max_latency_cycles).max(1),
+                _ => hls.schedule.max_latency_cycles.max(1),
+            };
             for _ in 0..lat {
-                sim.step_posedge(10_000);
+                clock(&mut sim, &mut mems)?;
+                capture(&sim, &mut rtl_outputs, true);
             }
             cycles = lat;
             done = true;
@@ -277,6 +391,11 @@ pub fn run_rtl_cosim_with(
         if c_outputs.contains_key("return") {
             if let Some(v) = ret_port.as_ref().and_then(|p| sample(&sim, p)) {
                 rtl_outputs.insert("return".into(), vec![v]);
+            }
+        }
+        for m in &mems {
+            if c_outputs.contains_key(&m.name) {
+                rtl_outputs.insert(m.name.clone(), m.contents());
             }
         }
         if vec_in.inject_rtl_fault_delta != 0 {
@@ -291,14 +410,16 @@ pub fn run_rtl_cosim_with(
         for (name, cv) in &c_outputs {
             let w = if name == "return" {
                 ret_port.as_ref().map(|p| p.width)
+            } else if let Some(m) = mems.iter().find(|m| &m.name == name) {
+                m.banks.first().and_then(|b| b.d.as_ref().or(Some(&b.q))).map(|p| p.width)
             } else {
                 port(name).map(|p| p.width)
             }
             .unwrap_or(64);
-            let c = sign_extend(cv.first().copied().unwrap_or(0), w);
-            match rtl_outputs.get(name).and_then(|v| v.first()) {
-                Some(r) if *r == c => {}
-                _ => matched = false,
+            let want: Vec<i64> = cv.iter().map(|v| sign_extend(*v, w)).collect();
+            let got: Option<Vec<i64>> = rtl_outputs.get(name).map(|v| v.iter().map(|x| sign_extend(*x, w)).collect());
+            if got.as_deref() != Some(want.as_slice()) {
+                matched = false;
             }
         }
         if matched {
@@ -403,13 +524,30 @@ mod tests {
             }
             assert_eq!(run_rtl_cosim(src, &[t]).unwrap().status, CosimStatus::Pass, "{src}");
         }
-        // The emitted RTL for this kernel drops the branches (`y <= x`
-        // unconditionally); simulating it must expose that, not copy C.
-        let clamp = "int clampv(int x, int lo, int hi) { if (x < lo) return lo; if (x > hi) return hi; return x; }";
-        let v = CosimTestVector::new().with_scalar("x", 50).with_scalar("lo", 0).with_scalar("hi", 10);
-        let r = run_rtl_cosim(clamp, &[v]).unwrap();
+        // A deliberately corrupted RTL output must be flagged, not copied
+        // from C.
+        let mut bad = CosimTestVector::new().with_scalar("a", 6).with_scalar("b", 7).with_scalar("c", 1);
+        bad.inject_rtl_fault_delta = 3;
+        let r = run_rtl_cosim(ok[0], &[bad]).unwrap();
         assert_eq!(r.status, CosimStatus::Fail);
         assert!(r.report_text.contains("MISMATCH"));
+    }
+
+    /// Regression: the clamp kernel's `if (...) return ...;` branches used to
+    /// be dropped by the flat datapath emitter (`y <= x` unconditionally).
+    #[test]
+    fn clamp_branches_are_if_converted_into_the_fsm() {
+        let clamp = "int clampv(int x, int lo, int hi) { if (x < lo) return lo; if (x > hi) return hi; return x; }";
+        let hls = crate::hls_compile(clamp).unwrap();
+        assert!(matches!(hls.rtl, crate::RtlKind::Fsmd { .. }), "{:?}", hls.rtl);
+        let v: Vec<CosimTestVector> = [(50, 0, 10, 10), (-5, 0, 10, 0), (7, 0, 10, 7), (-20, -30, -10, -20), (-40, -30, -10, -30)]
+            .iter()
+            .map(|&(x, lo, hi, _)| CosimTestVector::new().with_scalar("x", x).with_scalar("lo", lo).with_scalar("hi", hi))
+            .collect();
+        let r = run_rtl_cosim(clamp, &v).unwrap();
+        assert_eq!(r.status, CosimStatus::Pass, "{}\n{}", r.report_text, hls.sv);
+        assert_eq!(r.vector_results[0].rtl_outputs["return"], vec![10]);
+        assert_eq!(r.vector_results[4].rtl_outputs["return"], vec![-30]);
     }
 
     #[test]
@@ -432,6 +570,10 @@ void fir_mac_cosim(int a[4], int b[4], int bias, int *out) {
             .with_scalar("bias", 5);
         let r = run_rtl_cosim(src, &[v]).unwrap();
         assert_eq!(r.vector_results[0].c_outputs["out"], vec![305]);
+        // Regression: this FIR MAC used to read back 0 (the shell datapath
+        // never multiplied the banks); the netlist must now compute it.
+        assert_eq!(r.vector_results[0].rtl_outputs["out"], vec![305], "{}", r.report_text);
+        assert_eq!(r.status, CosimStatus::Pass);
         // Latency is measured from ap_start to ap_done in the simulator.
         assert!(r.vector_results[0].latency_cycles > 0, "{}", r.report_text);
     }

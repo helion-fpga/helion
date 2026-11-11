@@ -500,12 +500,9 @@ impl Sim {
             if self.compiled.schedule.input_ports.contains_key(net) {
                 return None;
             }
-            if self
-                .compiled
-                .schedule
-                .ops
-                .iter()
-                .any(|op| op.output_nets().iter().any(|&id| self.compiled.schedule.net_names.get(id as usize).map(String::as_str) == Some(net)))
+            let named = |id: u32| self.compiled.schedule.net_names.get(id as usize).map(String::as_str) == Some(net);
+            if self.compiled.schedule.ops.iter().any(|op| op.output_nets().into_iter().any(named))
+                || self.compiled.schedule.ffs.iter().any(|f| named(f.q_net))
             {
                 return self.compiled.sample(net);
             }
@@ -618,25 +615,28 @@ impl Sim {
         }
 
         let mut next_q = HashMap::new();
+        // The compiled engine sampled every FF's D cone before the edge, with
+        // LUT, CARRY4, MUXF7/8 and multiplier nodes alike, so its committed Qs
+        // are the next state. The live-LUT walk below only resolves LUT/FF/
+        // input nets (a CARRY4 or DSP output reads as 0 there), so it is kept
+        // for FFs the compiled schedule does not know.
+        for ff_desc in &self.compiled.schedule.ffs {
+            if let Some(v) = self.compiled.get_ff_4state(&ff_desc.name) {
+                next_q.insert(ff_desc.name.clone(), v == Logic4::One);
+            }
+        }
         // One memo per step: net values are stable across this edge.
         let mut memo: HashMap<String, bool> = HashMap::new();
         let mut stack: Vec<String> = Vec::new();
         let luts: Vec<(String, String)> = self
             .ff_d_lut
             .iter()
+            .filter(|(f, _)| !next_q.contains_key(*f))
             .map(|(f, l)| (f.clone(), l.clone()))
             .collect();
         for (ff, lut) in &luts {
             let o = self.lut_output_live(lut, &mut memo, &mut stack);
             next_q.insert(ff.clone(), o);
-        }
-        // Also propagate FFs driven by Carry4 / Muxf7 / Muxf8 from the compiled schedule.
-        for ff_desc in &self.compiled.schedule.ffs {
-            if !self.ff_d_lut.contains_key(&ff_desc.name) {
-                if let Some(v) = self.compiled.get_ff_4state(&ff_desc.name) {
-                    next_q.insert(ff_desc.name.clone(), v == Logic4::One);
-                }
-            }
         }
         for (k, v) in next_q {
             self.ff_q.insert(k, v);

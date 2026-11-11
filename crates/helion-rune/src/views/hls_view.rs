@@ -266,6 +266,29 @@ fn kpis(r: &helion_hls::HlsResult, t: &VivadoTheme) -> El {
         )
 }
 
+/// What the emitted RTL is: a datapath that computes the C function, or an
+/// interface shell (co-simulation then refuses to run it).
+fn rtl_kind(r: &helion_hls::HlsResult, t: &VivadoTheme) -> El {
+    let (badge, ink, line) = match &r.rtl {
+        helion_hls::RtlKind::Fsmd { states, mul_units, cycle_bound } => (
+            "FSMD",
+            t.pass,
+            format!("{states} states · {mul_units} mult unit(s) · ≤{cycle_bound} cycles"),
+        ),
+        helion_hls::RtlKind::DirectDatapath { depth } => ("Datapath", t.pass, format!("registered direct datapath, {depth} clock(s) deep")),
+        helion_hls::RtlKind::InterfaceShell { reason } => ("Shell", t.warn, format!("interface shell only: {reason} unsupported")),
+    };
+    row()
+        .key("hls-kpi-rtl")
+        .w_full()
+        .h(cad::ROW_H)
+        .gap(6.0)
+        .items_center()
+        .child(cad::caps("RTL", t))
+        .child(cad::badge(badge, ink, t))
+        .child(cad::ui(line.clone(), t).grow(1.0).min_w(0.0).truncate().help_when_truncated(line))
+}
+
 fn report_tab(r: &helion_hls::HlsResult, t: &VivadoTheme) -> El {
     let rep = &r.report;
     let mut loops = col().w_full();
@@ -461,7 +484,7 @@ fn results_column(s: &AppState, t: &VivadoTheme) -> El {
         (Some(Ok(r)), HlsTab::Rtl) => rtl_tab(r, t),
     };
     if let Some(r) = s.hls.result() {
-        c = c.child(kpis(r, t));
+        c = c.child(kpis(r, t)).child(rtl_kind(r, t));
     }
     let mut tabs = row().key("hls-tabs").role("tablist").w_full().h(26.0).items_end().gap(2.0).px(4.0).fill(t.header_bg);
     for (tab, key, label) in [

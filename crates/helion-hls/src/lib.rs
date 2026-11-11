@@ -14,6 +14,7 @@ pub mod ap_math_stream;
 pub mod cosim;
 pub mod emit;
 pub mod flopoco_fp;
+pub mod fsmd;
 pub mod parser;
 pub mod pragma;
 pub mod rtl_cosim;
@@ -32,6 +33,7 @@ pub use cosim::{
     run_cosim_verification,
 };
 pub use rtl_cosim::{COSIM_MAX_CYCLES, run_rtl_cosim, run_rtl_cosim_with};
+pub use fsmd::FsmdRtl;
 pub use emit::{generate_hls_report, resolve_interfaces, HlsSynthesisReport, InterfacePort};
 pub use flopoco_fp::{
     FpEvalOutput, FpExceptionFlags, FpFormat, FpOpKind, FpOperatorHwResult, FpOperatorSpec,
@@ -80,6 +82,32 @@ pub struct BindOp {
     pub cycle: u32,
 }
 
+/// How the emitted RTL realizes the kernel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RtlKind {
+    /// Pragma-free scalar kernel: one registered datapath, no handshake;
+    /// outputs settle `depth` clocks after the inputs.
+    DirectDatapath { depth: u32 },
+    /// Statement-level FSM with datapath (`fsmd`): computes the C function.
+    Fsmd {
+        states: usize,
+        mul_units: usize,
+        /// Worst-case cycles from start to done.
+        cycle_bound: u64,
+    },
+    /// Interface/resource shell only: the ports, FSM enables and bound
+    /// DSP/BRAM structure exist, but the datapath does not implement the C
+    /// function (`reason` names the construct the FSMD emitter lacks).
+    InterfaceShell { reason: String },
+}
+
+impl RtlKind {
+    /// True when simulating the RTL is a meaningful check of the C kernel.
+    pub fn is_functional(&self) -> bool {
+        !matches!(self, RtlKind::InterfaceShell { .. })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HlsResult {
     pub design: Design,
@@ -92,6 +120,7 @@ pub struct HlsResult {
     pub interfaces: Vec<InterfacePort>,
     pub report: HlsSynthesisReport,
     pub report_text: String,
+    pub rtl: RtlKind,
 }
 
 /// Compile C/C++ HLS source with default configuration (`10.0ns` target clock).
@@ -126,17 +155,36 @@ pub fn hls_compile_with_config(source: &str, config: &HlsConfig) -> Result<HlsRe
     let binding = bind_resources(&cdfg, &schedule, &top_fn, &all_directives);
     let interfaces = resolve_interfaces(&top_fn, &cdfg, &all_directives);
 
-    let sv = emit::emit_rtl(
-        &top_fn,
-        &cdfg,
-        &schedule,
-        &binding,
-        &interfaces,
-        &all_directives,
-    )?;
+    let (sv, rtl) = if emit::is_simple_scalar_kernel(&top_fn, &cdfg, &all_directives) {
+        let (sv, depth) = emit::emit_direct_datapath_sv_depth(&top_fn)?;
+        (sv, RtlKind::DirectDatapath { depth })
+    } else {
+        match fsmd::emit_fsmd_sv(&top_fn, &cdfg, &binding, &interfaces, &all_directives) {
+            Ok(f) => (
+                f.sv,
+                RtlKind::Fsmd { states: f.states, mul_units: f.mul_units, cycle_bound: f.cycle_bound },
+            ),
+            Err(reason) => (
+                emit::emit_vivado_hls_sv(&top_fn, &cdfg, &schedule, &binding, &interfaces, &all_directives)?,
+                RtlKind::InterfaceShell { reason },
+            ),
+        }
+    };
 
-    let design =
-        helion_sv::synth_sv(&sv, "hls.sv").map_err(|e| format!("sv synth: {e} :: {sv}"))?;
+    // helion-sv recurses over the statement tree; a large FSMD needs more
+    // stack than a worker thread's default, so synthesize on a thread that
+    // has it.
+    let design = {
+        let text = sv.clone();
+        std::thread::Builder::new()
+            .name("hls-synth".into())
+            .stack_size(256 << 20)
+            .spawn(move || helion_sv::synth_sv(&text, "hls.sv"))
+            .map_err(|e| format!("sv synth: cannot start synthesis thread: {e}"))?
+            .join()
+            .map_err(|_| "sv synth: synthesis thread panicked".to_string())?
+    }
+    .map_err(|e| format!("sv synth: {e} :: {sv}"))?;
 
     let actual_dsp = design
         .cells
@@ -183,6 +231,7 @@ pub fn hls_compile_with_config(source: &str, config: &HlsConfig) -> Result<HlsRe
         interfaces,
         report,
         report_text,
+        rtl,
     })
 }
 
@@ -457,14 +506,14 @@ void matmul(int A[4][4], int B[4][4], int C[4][4]) {
         assert_eq!(r_part.cdfg.array_configs["A"].num_banks, 4);
         assert_eq!(r_part.cdfg.array_configs["B"].num_banks, 4);
         assert_eq!(r_part.cdfg.array_configs["C"].num_banks, 1);
-        // 4 banks for A + 4 banks for B + 1 bank for C = 9 BRAM18 banks inferred in netlist
-        let bram_cells = r_part
-            .design
-            .cells
-            .iter()
-            .filter(|c| matches!(c.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. }))
-            .count();
-        assert_eq!(bram_cells, 9, "Expected 9 BRAM18E1 cells for 4+4+1 banks");
+        // Array arguments are ap_memory interfaces: the 4 + 4 + 1 banks are
+        // separate memory ports of the kernel (the RAMs live outside it, as
+        // in Vivado HLS), not BRAM cells inside its netlist.
+        for p in ["A_0", "A_1", "A_2", "A_3", "B_0", "B_1", "B_2", "B_3"] {
+            assert!(r_part.sv.contains(&format!("{p}_address0")), "missing bank port {p}: {}", r_part.sv);
+        }
+        assert!(r_part.sv.contains("output logic [5:0] C_address0"));
+        assert!(!r_part.sv.contains("A_4_address0"));
         assert!(
             r_part.report.max_latency_cycles < r_unpart.report.max_latency_cycles,
             "Partitioned II=1 matmul must have lower latency than unpartitioned II=2"

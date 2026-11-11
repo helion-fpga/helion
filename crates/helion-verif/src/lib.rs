@@ -12,6 +12,9 @@
 //! - [`classtb`]: class-based / UVM testbenches on the `helion-svtb` engine
 //!   (routed from [`tb::run_testbench`]), UVM test discovery and UVM
 //!   message parsing for the IDE.
+//! - [`vhdl_tb`]: the behavioral VHDL simulator behind `*_tb.vhd`
+//!   testbenches (event-driven kernel with delta cycles; DUTs run
+//!   behaviorally or as helion-sim netlists) producing the same outcome.
 //! - [`wave`]: waveform display math (fixed-point `Qm.n`, analog Y
 //!   mapping, LSB-first virtual-bus packing) and the SPI / UART / AXI-Lite /
 //!   FSM protocol decoders behind the viewer's decoded lanes. The display
@@ -30,4 +33,5 @@
 pub mod classtb;
 pub mod ila;
 pub mod tb;
+pub mod vhdl_tb;
 pub mod wave;

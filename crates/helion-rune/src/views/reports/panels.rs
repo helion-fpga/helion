@@ -217,7 +217,7 @@ fn synth_link(t: &VivadoTheme) -> El {
 }
 
 /// Four utilization KPI cards (first four site rows) with occupancy bars.
-pub fn kpi_cards(rows: &[(&'static str, u32, u32)], t: &VivadoTheme) -> El {
+pub fn kpi_cards(rows: &[(String, u32, u32)], t: &VivadoTheme) -> El {
     let mut cards = row().key("reports-util-kpis").w_full().gap(8.0);
     for (i, (name, used, avail)) in rows.iter().take(4).enumerate() {
         let frac = if *avail == 0 {
@@ -240,12 +240,13 @@ pub fn kpi_cards(rows: &[(&'static str, u32, u32)], t: &VivadoTheme) -> El {
                         .items_center()
                         .gap(4.0)
                         .child(
-                            text(*name)
+                            text(name.clone())
                                 .font(VivadoTheme::FONT_UI)
                                 .color(t.text_dim)
                                 .grow(1.0)
                                 .min_w(0.0)
-                                .truncate(),
+                                .truncate()
+                                .help_when_truncated(name.clone()),
                         )
                         .child(
                             text(format!("{}%", pct(*used, *avail)))
@@ -332,13 +333,14 @@ pub fn rails_table(s: &AppState, t: &VivadoTheme) -> El {
 pub fn blocks_table(s: &AppState, t: &VivadoTheme) -> El {
     let u = &s.util;
     let p = &s.power;
+    let r = u.rows();
     let blocks: [(&str, u32, u32, Option<u32>); 6] = [
-        ("Slice LUTs", u.luts_used, u.luts_avail, Some(p.logic_uw)),
-        ("Slice Registers", u.regs_used, u.regs_avail, None),
-        ("Bonded IOB", u.io_used, u.io_avail, Some(p.io_uw)),
-        ("Block RAM Tile", u.bram_used, u.bram_avail, Some(p.bram_uw)),
-        ("DSPs", u.dsp_used, u.dsp_avail, Some(p.dsp_uw)),
-        ("BUFGCTRL", u.bufg_used, u.bufg_avail, Some(p.clocks_uw)),
+        (r[0].0.as_str(), u.luts_used, u.luts_avail, Some(p.logic_uw)),
+        (r[1].0.as_str(), u.regs_used, u.regs_avail, None),
+        (r[3].0.as_str(), u.io_used, u.io_avail, Some(p.io_uw)),
+        (r[2].0.as_str(), u.bram_used, u.bram_avail, Some(p.bram_uw)),
+        (r[4].0.as_str(), u.dsp_used, u.dsp_avail, Some(p.dsp_uw)),
+        (r[5].0.as_str(), u.bufg_used, u.bufg_avail, Some(p.clocks_uw)),
     ];
     let head = header_row(t)
         .child(kit::header_cell("Block", t).grow(1.0).min_w(0.0))

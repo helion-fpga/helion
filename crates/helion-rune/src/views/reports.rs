@@ -319,6 +319,7 @@ pub fn demo_impl_complete(s: &mut AppState) {
             },
         ],
         design: "project1_demo".into(),
+        ..crate::state::UtilState::default()
     };
     s.power = crate::state::PowerState {
         total_mw: 142,
@@ -570,7 +571,7 @@ fn kv(label_text: &'static str, value: El, t: &VivadoTheme) -> El {
 /// One histogram row: label, `w_frac` bar, and value text.
 fn hist_row(
     key: String,
-    label_text: &'static str,
+    label_text: impl Into<String>,
     frac: f32,
     value_text: String,
     bar_color: rune::Color,
@@ -584,7 +585,10 @@ fn hist_row(
         .gap(8.0)
         .child(
             el().w(HIST_LABEL_W)
-                .child(dim_label(label_text, t).truncate()),
+                .child({
+                    let l: String = label_text.into();
+                    dim_label(&l, t).truncate().help_when_truncated(l.clone())
+                }),
         )
         .child(
             el().grow(1.0)
@@ -604,17 +608,10 @@ fn hist_row(
         )
 }
 
-/// Occupancy rows from the typed [`crate::state::UtilState`].
-fn occupancy(s: &AppState) -> [(&'static str, u32, u32); 6] {
-    let u = &s.util;
-    [
-        ("Slice LUTs", u.luts_used, u.luts_avail),
-        ("Slice Registers", u.regs_used, u.regs_avail),
-        ("Block RAM Tile", u.bram_used, u.bram_avail),
-        ("Bonded IOB", u.io_used, u.io_avail),
-        ("DSPs", u.dsp_used, u.dsp_avail),
-        ("BUFGCTRL", u.bufg_used, u.bufg_avail),
-    ]
+/// Occupancy rows from the typed [`crate::state::UtilState`] (family
+/// primitive names for iCE40/ECP5 parts).
+fn occupancy(s: &AppState) -> Vec<(String, u32, u32)> {
+    s.util.rows()
 }
 
 /// Utilization occupancy table: `Resource | Used | Available | Util (%)`.
@@ -635,7 +632,7 @@ fn util_table(s: &AppState, t: &VivadoTheme) -> El {
                 .items_center()
                 .gap(8.0)
                 .px(8.0)
-                .child(ui_label(name.into(), t).grow(2.0).min_w(0.0).truncate())
+                .child(ui_label(name.clone(), t).grow(2.0).min_w(0.0).truncate().help_when_truncated(name.clone()))
                 .child(
                     el().w(COUNT_W).child(
                         text(used.to_string())
