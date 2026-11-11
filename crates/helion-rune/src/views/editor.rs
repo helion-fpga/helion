@@ -386,6 +386,46 @@ pub fn reload_active(s: &mut AppState) -> Result<(), String> {
     Ok(())
 }
 
+/// Text of tab `i`'s buffer (flushing the live field first), whether it
+/// owns a primary buffer or is parked.
+pub fn tab_text(s: &mut AppState, i: usize) -> String {
+    flush_edit(s);
+    let Some(name) = s.editor.tabs.get(i).cloned() else {
+        return String::new();
+    };
+    let kind = buffer_kind_for_tab(s, i);
+    if s.editor.owners[slot(kind)].as_deref() == Some(name.as_str()) {
+        let lines = match kind {
+            BufferKind::Xdc => &s.editor.xdc_lines,
+            BufferKind::Tb => &s.editor.tb_lines,
+            BufferKind::Rtl => &s.editor.lines,
+        };
+        return lines.join("\n");
+    }
+    s.editor
+        .parked
+        .get(&name)
+        .map(|b| b.lines.join("\n"))
+        .unwrap_or_default()
+}
+
+/// Replace tab `i`'s lines (one undo step) after an out-of-editor write of
+/// its file, keeping the active tab where it was.
+pub fn replace_tab_lines(s: &mut AppState, i: usize, lines: Vec<String>) {
+    if i >= s.editor.tabs.len() {
+        return;
+    }
+    let back = s.editor.active;
+    select_tab(s, i);
+    flush_edit(s);
+    s.editor.push_undo_active(active_is_xdc(s));
+    *active_lines_mut(s) = lines;
+    reload_edit(s);
+    if back != i {
+        select_tab(s, back);
+    }
+}
+
 /// Open a natively picked file as an editor tab: add/activate the tab, load
 /// its real contents into the routed buffer (undoable, like a reload),
 /// record its disk path so Save writes back to it, and park the cursor.
@@ -1719,8 +1759,11 @@ mod tests {
 
     #[test]
     fn xdc_review_content_round_trips_through_disk() {
-        use crate::views::dialogs::{DialogId, XdcStep};
+        use crate::views::dialogs::DialogId;
+        use crate::views::xdc_wizard::XdcStep;
         let mut s = editor_state();
+        crate::scenes::xdc_wizard_design(&mut s);
+        crate::scenes::xdc_wizard_rows(&mut s);
         s.dialogs.open(DialogId::Constraints);
         s.dialogs.xdc.step = XdcStep::Review;
         let path =
@@ -1735,7 +1778,7 @@ mod tests {
                 .editor
                 .xdc_lines
                 .iter()
-                .any(|l| l.starts_with("create_clock -name clk")),
+                .any(|l| l.starts_with("create_clock -period 8.000 -name clk_sys")),
             "finish must append the SDC: {:?}",
             rt.state.editor.xdc_lines
         );
@@ -1746,7 +1789,7 @@ mod tests {
         tap(&mut rt, "editor-tool-save");
         let disk = std::fs::read_to_string(&path).expect("save must write the xdc file");
         assert!(
-            disk.contains("create_clock -name clk -period 10.000"),
+            disk.contains("create_clock -period 8.000 -name clk_sys"),
             "disk must hold the review content: {disk:?}"
         );
         rt.state.editor.xdc_lines.clear();
@@ -1756,7 +1799,7 @@ mod tests {
                 .editor
                 .xdc_lines
                 .iter()
-                .any(|l| l.starts_with("create_clock -name clk")),
+                .any(|l| l.starts_with("create_clock -period 8.000 -name clk_sys")),
             "reload must restore the review content"
         );
         let _ = std::fs::remove_file(&path);

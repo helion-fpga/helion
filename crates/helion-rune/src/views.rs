@@ -31,3 +31,4 @@ pub mod tb_view;
 pub mod timing;
 pub mod wave;
 pub mod wave_demo;
+pub mod xdc_wizard;

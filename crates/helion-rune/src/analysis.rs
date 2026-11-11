@@ -3,7 +3,8 @@
 //! A finished run leaves its design ([`crate::runs::RunsState::live_design`])
 //! and an [`AnalysisCtx`] (staged source, part, routed result). The report
 //! actions re-run the real engines over exactly that data, re-reading the
-//! run's sibling `.sdc`/`.xdc` so on-disk constraint edits take effect:
+//! run's sibling `.sdc`/`.xdc` (or the file the Constraints Wizard wrote) so
+//! on-disk constraint edits take effect:
 //! - STA: `helion_sta::report_timing_routed_xdc` (implementation) or
 //!   `report_timing` (synthesis estimate) folded through
 //!   [`crate::runs::timing_state_from`] (summary, clocks, groups, paths,
@@ -14,6 +15,12 @@
 //! - power: `helion_sta::report_power`;
 //! - utilization: the routed packing, else `helion_pack::pack`.
 //!
+//! Every engine step is split into owned inputs (cloned on the UI thread),
+//! a `compute_*` body that only reads them (so [`crate::jobs`] runs it on a
+//! worker), and an `apply_*` that folds the result into [`AppState`]. The
+//! synchronous `rerun_*` entry points are exactly inputs + compute + apply,
+//! so the worker path and the scripted Tcl path produce identical state.
+//!
 //! The text dumps format the stored report state the same way the old IDE's
 //! `report_*` verbs print (`ide.rs` report `text()` helpers), so the console
 //! and the views always agree. Nothing here invents numbers: missing inputs
@@ -22,7 +29,9 @@
 use std::cell::RefCell;
 
 use crate::runs::{AnalysisCtx, RunKind};
-use crate::state::{AppState, ConsoleLine, DrcState, MsgSev, PowerState, TimingState};
+use crate::state::{
+    AppState, ConsoleLine, DrcState, MsgSev, PowerState, TimingState, UtilState,
+};
 use crate::views::report_kit::ns3;
 
 /// Engine lines collected while re-analyzing, flushed to the console after.
@@ -36,9 +45,17 @@ fn flush(s: &mut AppState, lines: Emitted) {
     s.console.lines.extend(lines.into_inner());
 }
 
+/// Owned inputs of a timing/power/utilization re-analysis: the last
+/// successful run's context plus its design (both `Send`).
+#[derive(Clone)]
+pub struct RunInputs {
+    pub ctx: AnalysisCtx,
+    pub design: helion_ir::Design,
+}
+
 /// The last successful run's context plus its design, or why re-analysis
 /// cannot run.
-fn run_inputs(s: &AppState) -> Result<(AnalysisCtx, helion_ir::Design), String> {
+pub fn run_inputs(s: &AppState) -> Result<RunInputs, String> {
     let ctx = s
         .runs
         .analysis
@@ -49,7 +66,7 @@ fn run_inputs(s: &AppState) -> Result<(AnalysisCtx, helion_ir::Design), String> 
         .live_design
         .clone()
         .ok_or_else(|| "the last run kept no design (launch_runs synth_1 first)".to_string())?;
-    Ok((ctx, design))
+    Ok(RunInputs { ctx, design })
 }
 
 /// Why on-demand timing re-analysis is unavailable (`None` = available).
@@ -78,29 +95,34 @@ pub fn drc_unavailable(s: &AppState) -> Option<&'static str> {
     }
 }
 
-/// Fresh STA over the last run's design with its reloaded constraints.
-fn analyze_timing(s: &AppState, emit: &impl Fn(String, MsgSev)) -> Result<TimingState, String> {
-    let (ctx, design) = run_inputs(s)?;
-    let (xdc, clks) = crate::runs::load_run_constraints(&ctx.source, emit);
+// ---- timing + methodology ----
+
+/// Fresh STA over the run's design with its reloaded constraints.
+pub fn compute_timing(
+    inp: &RunInputs,
+    emit: &impl Fn(String, MsgSev),
+) -> Result<TimingState, String> {
+    let RunInputs { ctx, design } = inp;
+    let (xdc, clks) = crate::runs::load_ctx_constraints(ctx, emit);
     match &ctx.routed {
         Some(routed) => {
-            let t = helion_sta::report_timing_routed_xdc(&design, routed, &clks, &xdc)?;
+            let t = helion_sta::report_timing_routed_xdc(design, routed, &clks, &xdc)?;
             let summary = helion_sta::report_timing_summary(&clks, &xdc, Some(&t));
             Ok(crate::runs::timing_state_from(
                 &summary,
                 Some(&t),
-                &design,
+                design,
                 Some(&routed.placed),
                 &xdc,
             ))
         }
         None => {
-            let t = helion_sta::report_timing(&design, &clks).ok();
+            let t = helion_sta::report_timing(design, &clks).ok();
             let summary = helion_sta::report_timing_summary(&clks, &xdc, t.as_ref());
             Ok(crate::runs::timing_state_from(
                 &summary,
                 t.as_ref(),
-                &design,
+                design,
                 None,
                 &xdc,
             ))
@@ -108,13 +130,8 @@ fn analyze_timing(s: &AppState, emit: &impl Fn(String, MsgSev)) -> Result<Timing
     }
 }
 
-/// Re-run STA (report_timing_summary) and replace the timing state.
-pub fn rerun_timing(s: &mut AppState) -> Result<(), String> {
-    let lines = Emitted::default();
-    let result = analyze_timing(s, &emitter(&lines));
-    flush(s, lines);
-    let fresh = result?;
-    // Keep the selected path when it still exists in the fresh analysis.
+/// Replace the timing state, keeping the selected path when it survives.
+pub fn apply_timing(s: &mut AppState, fresh: TimingState) {
     if s.timing_view
         .selected_path
         .is_some_and(|i| i >= fresh.paths.len())
@@ -122,6 +139,24 @@ pub fn rerun_timing(s: &mut AppState) -> Result<(), String> {
         s.timing_view.selected_path = None;
     }
     s.timing = fresh;
+}
+
+/// Replace only the methodology rows (or everything when no STA ran yet).
+pub fn apply_methodology(s: &mut AppState, fresh: TimingState) {
+    if s.timing.has_run {
+        s.timing.methodology = fresh.methodology;
+    } else {
+        s.timing = fresh;
+    }
+    s.reports_view.selected_method = None;
+}
+
+/// Re-run STA (report_timing_summary) and replace the timing state.
+pub fn rerun_timing(s: &mut AppState) -> Result<(), String> {
+    let lines = Emitted::default();
+    let result = run_inputs(s).and_then(|inp| compute_timing(&inp, &emitter(&lines)));
+    flush(s, lines);
+    apply_timing(s, result?);
     Ok(())
 }
 
@@ -129,32 +164,64 @@ pub fn rerun_timing(s: &mut AppState) -> Result<(), String> {
 /// replace only the methodology rows.
 pub fn rerun_methodology(s: &mut AppState) -> Result<(), String> {
     let lines = Emitted::default();
-    let result = analyze_timing(s, &emitter(&lines));
+    let result = run_inputs(s).and_then(|inp| compute_timing(&inp, &emitter(&lines)));
     flush(s, lines);
-    let fresh = result?;
-    if s.timing.has_run {
-        s.timing.methodology = fresh.methodology;
-    } else {
-        s.timing = fresh;
-    }
-    s.reports_view.selected_method = None;
+    apply_methodology(s, result?);
     Ok(())
 }
 
-/// Re-run DRC: the routed deck plus bitstream signoff on an implemented
-/// run, else the pre-route deck on the Tcl session's placed design.
-pub fn rerun_drc(s: &mut AppState) -> Result<(), String> {
-    let lines = Emitted::default();
-    let emit = emitter(&lines);
+// ---- DRC ----
+
+/// Owned DRC inputs: the routed run, else the Tcl session's placement.
+#[derive(Clone)]
+pub enum DrcInputs {
+    Routed {
+        part: String,
+        routed: helion_route::Routed,
+        design: helion_ir::Design,
+    },
+    Placed {
+        part: String,
+        design: helion_ir::Design,
+        placed: helion_place::Placed,
+    },
+}
+
+/// DRC inputs for the current state, or why DRC cannot run.
+pub fn drc_inputs(s: &AppState) -> Result<DrcInputs, String> {
     let routed_inputs = run_inputs(s)
         .ok()
-        .and_then(|(ctx, design)| ctx.routed.map(|r| (ctx.part, r, design)));
-    let result = if let Some((part, routed, design)) = routed_inputs {
-        crate::runs::resolve_device(&part, &emit).map(|dev| {
-            let routed = &routed;
-            let drc = helion_drc::check_routed(&design, routed, &dev);
+        .and_then(|RunInputs { ctx, design }| ctx.routed.map(|r| (ctx.part, r, design)));
+    if let Some((part, routed, design)) = routed_inputs {
+        Ok(DrcInputs::Routed {
+            part,
+            routed,
+            design,
+        })
+    } else if let (Some(design), Some(placed)) =
+        (s.tcl.session.design.as_ref(), s.tcl.session.placed.as_ref())
+    {
+        Ok(DrcInputs::Placed {
+            part: s.project.part.clone(),
+            design: design.clone(),
+            placed: placed.clone(),
+        })
+    } else {
+        Err("no placed design (launch_runs impl_1 or place_design first)".into())
+    }
+}
+
+/// The routed deck plus bitstream signoff, or the pre-route deck.
+pub fn compute_drc(inp: &DrcInputs, emit: &impl Fn(String, MsgSev)) -> Result<DrcState, String> {
+    match inp {
+        DrcInputs::Routed {
+            part,
+            routed,
+            design,
+        } => crate::runs::resolve_device(part, emit).map(|dev| {
+            let drc = helion_drc::check_routed(design, routed, &dev);
             let signoff = helion_drc::check_bitstream_signoff(
-                &design,
+                design,
                 routed,
                 &dev,
                 &helion_drc::SignoffConfig::default(),
@@ -168,11 +235,12 @@ pub fn rerun_drc(s: &mut AppState) -> Result<(), String> {
                 has_run: true,
                 pre_route: false,
             }
-        })
-    } else if let (Some(design), Some(placed)) =
-        (s.tcl.session.design.as_ref(), s.tcl.session.placed.as_ref())
-    {
-        crate::runs::resolve_device(&s.project.part, &emit).map(|dev| {
+        }),
+        DrcInputs::Placed {
+            part,
+            design,
+            placed,
+        } => crate::runs::resolve_device(part, emit).map(|dev| {
             let drc = helion_drc::check_placed(design, placed, &dev);
             DrcState {
                 items: drc.items.iter().map(crate::runs::drc_item_from).collect(),
@@ -180,64 +248,78 @@ pub fn rerun_drc(s: &mut AppState) -> Result<(), String> {
                 pre_route: true,
                 ..DrcState::default()
             }
-        })
-    } else {
-        Err("no placed design (launch_runs impl_1 or place_design first)".into())
-    };
-    drop(emit);
-    flush(s, lines);
-    s.drc = result?;
+        }),
+    }
+}
+
+pub fn apply_drc(s: &mut AppState, fresh: DrcState) {
+    s.drc = fresh;
     s.reports_view.selected_drc = None;
+}
+
+/// Re-run DRC: the routed deck plus bitstream signoff on an implemented
+/// run, else the pre-route deck on the Tcl session's placed design.
+pub fn rerun_drc(s: &mut AppState) -> Result<(), String> {
+    let lines = Emitted::default();
+    let result = drc_inputs(s).and_then(|inp| compute_drc(&inp, &emitter(&lines)));
+    flush(s, lines);
+    apply_drc(s, result?);
     Ok(())
+}
+
+// ---- power + utilization ----
+
+/// `report_power` over the run's design (placed when the run implemented it).
+pub fn compute_power(
+    inp: &RunInputs,
+    emit: &impl Fn(String, MsgSev),
+) -> Result<PowerState, String> {
+    let RunInputs { ctx, design } = inp;
+    let dev = crate::runs::resolve_device(&ctx.part, emit)?;
+    let (xdc, clks) = crate::runs::load_ctx_constraints(ctx, emit);
+    let placed = ctx.routed.as_ref().map(|r| &r.placed);
+    let pr = helion_sta::report_power(
+        &dev,
+        Some(design),
+        placed,
+        &clks,
+        &xdc.operating_conditions,
+    );
+    Ok(crate::runs::power_state_from(&pr, &xdc.operating_conditions))
 }
 
 /// Re-run `report_power` over the last run's design (placed when the run
 /// implemented it).
 pub fn rerun_power(s: &mut AppState) -> Result<(), String> {
     let lines = Emitted::default();
-    let emit = emitter(&lines);
-    let result = run_inputs(s).and_then(|(ctx, design)| {
-        let dev = crate::runs::resolve_device(&ctx.part, &emit)?;
-        let (xdc, clks) = crate::runs::load_run_constraints(&ctx.source, &emit);
-        let placed = ctx.routed.as_ref().map(|r| &r.placed);
-        let pr = helion_sta::report_power(
-            &dev,
-            Some(&design),
-            placed,
-            &clks,
-            &xdc.operating_conditions,
-        );
-        Ok(crate::runs::power_state_from(
-            &pr,
-            &xdc.operating_conditions,
-        ))
-    });
-    drop(emit);
+    let result = run_inputs(s).and_then(|inp| compute_power(&inp, &emitter(&lines)));
     flush(s, lines);
     s.power = result?;
     Ok(())
 }
 
-/// Re-count utilization: the routed packing on an implemented run, else a
-/// fresh `helion_pack::pack` of the synthesized design.
+/// Utilization: the routed packing on an implemented run, else a fresh
+/// `helion_pack::pack` of the synthesized design.
+pub fn compute_util(inp: &RunInputs, emit: &impl Fn(String, MsgSev)) -> Result<UtilState, String> {
+    let RunInputs { ctx, design } = inp;
+    let dev = crate::runs::resolve_device(&ctx.part, emit)?;
+    match (&ctx.routed, ctx.kind) {
+        (Some(routed), _) => Ok(crate::runs::util_state_from(
+            &routed.placed.packed,
+            design,
+            &dev,
+        )),
+        (None, RunKind::Synth | RunKind::Impl) => {
+            let packed = helion_pack::pack(design, &dev)?;
+            Ok(crate::runs::util_state_from(&packed, design, &dev))
+        }
+    }
+}
+
+/// Re-count utilization from the last run.
 pub fn rerun_util(s: &mut AppState) -> Result<(), String> {
     let lines = Emitted::default();
-    let emit = emitter(&lines);
-    let result = run_inputs(s).and_then(|(ctx, design)| {
-        let dev = crate::runs::resolve_device(&ctx.part, &emit)?;
-        match (&ctx.routed, ctx.kind) {
-            (Some(routed), _) => Ok(crate::runs::util_state_from(
-                &routed.placed.packed,
-                &design,
-                &dev,
-            )),
-            (None, RunKind::Synth | RunKind::Impl) => {
-                let packed = helion_pack::pack(&design, &dev)?;
-                Ok(crate::runs::util_state_from(&packed, &design, &dev))
-            }
-        }
-    });
-    drop(emit);
+    let result = run_inputs(s).and_then(|inp| compute_util(&inp, &emitter(&lines)));
     flush(s, lines);
     s.util = result?;
     Ok(())
@@ -493,6 +575,7 @@ mod tests {
             source: path,
             part: s.project.part.clone(),
             routed: None,
+            constraints: None,
         });
         assert!(timing_unavailable(&s).is_none());
         rerun_timing(&mut s).expect("sta");
