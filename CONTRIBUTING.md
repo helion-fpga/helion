@@ -19,7 +19,7 @@ Site (LMMS-style on-ramp): [docs](https://helion-fpga.github.io/helion/) · [get
 
    ```bash
    cargo test --workspace
-   cargo run -p helion-gui --bin helion-ide -- --headless examples/counter.sv
+   cargo run -p helion-rune --bin helion-ide -- --headless examples/counter.sv
    ```
 
    Empty-XDC counter must print **`WNS_PS=9640`**.
@@ -36,8 +36,9 @@ Do not attach vendor bitstreams to a GitHub Release.
 | SV ingest | `crates/helion-sv` |
 | STA / XDC | `crates/helion-sta` |
 | Place / route / bits | `crates/helion-place`, `helion-route`, `helion-bits` |
-| IDE model + tests | `crates/helion-gui/src/ide.rs` |
-| IDE paint | `crates/helion-gui/src/bin/helion-ide.rs` |
+| IDE (`helion-ide`, Rune UI) | `crates/helion-rune` — views in `src/views`, Tcl in `src/tcl.rs`, flows in `src/runs.rs` |
+| UI framework (vendored) | `third_party/rune` — never edit; update with `scripts/sync-rune.sh` |
+| Legacy egui IDE (`helion-ide-egui`, removed on master) | `crates/helion-gui` |
 | Roadmap (2.0 shipped; 2.0.x) | [`ROADMAP.md`](ROADMAP.md), Pages `docs/roadmap.html` |
 | Changelog | [`CHANGELOG.md`](CHANGELOG.md) (Keep a Changelog / Unreleased) |
 | Parts | `devices/helion/` |

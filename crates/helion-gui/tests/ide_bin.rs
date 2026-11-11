@@ -4,7 +4,7 @@ use std::process::Command;
 
 #[test]
 fn helion_ide_version_and_doctor_are_headless() {
-    let bin = env!("CARGO_BIN_EXE_helion-ide");
+    let bin = env!("CARGO_BIN_EXE_helion-ide-egui");
     let v = Command::new(bin)
         .arg("--version")
         .output()
@@ -55,7 +55,7 @@ fn helion_ide_stdin_flow_refuses_route_before_place() {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let bin = env!("CARGO_BIN_EXE_helion-ide");
+    let bin = env!("CARGO_BIN_EXE_helion-ide-egui");
     let sv = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter.sv");
     let mut child = Command::new(bin)
         .arg("--stdin")
@@ -93,7 +93,7 @@ fn helion_ide_stdin_flow_refuses_route_before_place() {
 
 #[test]
 fn helion_ide_headless_prints_real_wns() {
-    let bin = env!("CARGO_BIN_EXE_helion-ide");
+    let bin = env!("CARGO_BIN_EXE_helion-ide-egui");
     let sv = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter.sv");
     let out = Command::new(bin)
         .args(["--headless", sv.to_str().unwrap()])
@@ -125,7 +125,7 @@ fn helion_ide_headless_prints_real_wns() {
 
 #[test]
 fn helion_ide_help_links_the_binary() {
-    let bin = env!("CARGO_BIN_EXE_helion-ide");
+    let bin = env!("CARGO_BIN_EXE_helion-ide-egui");
     let out = Command::new(bin)
         .arg("--help")
         .output()

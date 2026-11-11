@@ -16,6 +16,7 @@
 
 pub mod analysis;
 pub mod bg;
+pub mod cli;
 pub mod doctor;
 pub mod ext_verbs;
 pub mod eco_tcl;
