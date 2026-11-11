@@ -9,12 +9,16 @@ pub fn is_verb(name: &str) -> bool {
     crate::views::reports::io::VERBS.contains(&name)
         || name == "report_power_vcd"
         || crate::views::eco::VERBS.contains(&name)
+        || crate::views::dfx::VERBS.contains(&name)
 }
 
 /// Run one verb (`args` without the verb name).
 pub fn tcl_verb(s: &mut AppState, name: &str, args: &[String]) -> Result<String, String> {
     if crate::views::reports::io::VERBS.contains(&name) {
         return crate::views::reports::io::tcl_verb(s, name, args);
+    }
+    if crate::views::dfx::VERBS.contains(&name) {
+        return crate::views::dfx::tcl_verb(s, name, args);
     }
     if crate::views::eco::VERBS.contains(&name) {
         return crate::views::eco::tcl_verb(s, name, args);
@@ -46,6 +50,7 @@ pub fn help(name: &str) -> Option<(&'static str, &'static str)> {
             "vectored power from simulation activity (default: the last testbench VCD)",
         ),
         n if crate::views::eco::VERBS.contains(&n) => return crate::views::eco::help(n),
+        n if crate::views::dfx::VERBS.contains(&n) => return crate::views::dfx::help(n),
         _ => return None,
     })
 }

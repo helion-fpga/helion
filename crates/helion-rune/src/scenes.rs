@@ -1668,6 +1668,23 @@ pub const ALL: &[SceneExpect] = &[
         absent: &["summary", "eco-empty"],
     },
     SceneExpect {
+        name: "dfx",
+        surface: "dfx",
+        keys: &[
+            "dfx-pane",
+            "dfx-new",
+            "dfx-tab-0",
+            "dfx-partition",
+            "dfx-pblock-pblock_rp0",
+            "dfx-add-module",
+            "dfx-module-0",
+            "dfx-module-1",
+            "dfx-run",
+            "dfx-kpi-modules",
+        ],
+        absent: &["summary", "dfx-empty"],
+    },
+    SceneExpect {
         name: "eco-empty",
         surface: "eco",
         keys: &["eco-pane", "eco-empty", "eco-open"],

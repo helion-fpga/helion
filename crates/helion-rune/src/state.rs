@@ -1101,6 +1101,8 @@ pub struct AppState {
     pub bg: crate::bg::BgState,
     /// ECO session over the last implementation run.
     pub eco: crate::views::eco::EcoState,
+    /// Reconfigurable partitions and the last DFX run.
+    pub dfx: crate::views::dfx::DfxState,
     /// Persistent Tcl session behind the `tcl>` input (vars, history, design).
     pub tcl: crate::tcl::TclSession,
     /// Theme choice: follow the OS (`cx.system_dark`) or a manual View-menu
@@ -1152,6 +1154,8 @@ pub enum CenterPane {
     Constraints,
     /// ECO: edit the implemented netlist, incremental bitstream.
     Eco,
+    /// Partial reconfiguration: partitions, modules, partial bitstreams.
+    Dfx,
 }
 
 /// Status-bar verb. Typed, with the exact Helion wording in one place.
@@ -1308,6 +1312,7 @@ impl AppState {
             jobs: crate::jobs::JobsState::default(),
             bg: crate::bg::BgState::default(),
             eco: crate::views::eco::EcoState::default(),
+            dfx: crate::views::dfx::DfxState::default(),
             tcl: crate::tcl::TclSession::default(),
             theme: crate::theme::ThemeMode::default(),
             palette: crate::views::palette::PaletteState::default(),
