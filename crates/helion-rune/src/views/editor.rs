@@ -37,8 +37,8 @@ const PATH_H: f32 = 20.0;
 const TOOLBAR_H: f32 = 28.0;
 /// Code line height (compact CAD density).
 const LINE_H: f32 = 18.0;
-/// Gutter width: fits 4-digit line numbers in the 12px mono face.
-const GUTTER_W: f32 = 44.0;
+/// Gutter width: breakpoint slot plus 4-digit line numbers in the 12px mono face.
+const GUTTER_W: f32 = 58.0;
 /// Directory shown in the breadcrumb (matches the `rd-*.png` brief).
 const EDITOR_DIR: &str = "C:/EE214/project_1/project_1.srcs/sources_1/new";
 
@@ -845,27 +845,68 @@ fn breadcrumb(s: &AppState, t: &VivadoTheme) -> El {
         )
 }
 
-/// One code line: right-aligned gutter number plus highlighted mono code.
-/// The cursor line gets the pale-yellow [`VivadoTheme::current_line`] wash;
-/// pressing a line moves the cursor there.
-/// Gutter row: debugger breakpoint/PC markers plus the right-aligned line
-/// number, bright on the caret line; click parks the caret at the line
-/// start. Markers paint only when the viewed tab is the classified debug
-/// source (matching name and line count), so stale rows never mislead.
-fn gutter_row(s: &AppState, n: usize, current: bool, t: &VivadoTheme) -> El {
+/// Width of the breakpoint slot left of the line numbers.
+const BP_SLOT_W: f32 = 16.0;
+
+/// Gutter row: a breakpoint slot (UG900 Source gutter) beside the
+/// right-aligned line number. The slot paints the PC arrow, an armed (filled)
+/// or disabled (hollow) line breakpoint, and taps toggle a line breakpoint
+/// through the debugger; the number parks the caret. Markers only paint when
+/// the viewed tab is the classified debug source (see
+/// [`crate::views::debug::gutter_markers`]), so stale rows never mislead.
+fn gutter_row(
+    n: usize,
+    current: bool,
+    markers: Option<&crate::views::debug::GutterMarkers>,
+    rtl: bool,
+    t: &VivadoTheme,
+) -> El {
     let line = n + 1;
-    let armed = crate::views::debug::gutter_markers(s)
-        .map(|m| m.armed.contains(&line))
-        .unwrap_or(false);
-    let pc = crate::views::debug::gutter_markers(s)
-        .map(|m| m.pc == Some(line))
-        .unwrap_or(false);
-    let mut cell = row()
+    let mono = VivadoTheme::FONT_MONO.mono().lh(LINE_H);
+    let pc = markers.is_some_and(|m| m.pc == Some(line));
+    let armed = markers.is_some_and(|m| m.is_armed(line));
+    let disabled = markers.is_some_and(|m| m.is_disabled(line));
+    let executable = markers.is_some_and(|m| m.is_executable(line));
+    let mut slot = row()
+        .key(format!("editor-bp-slot-{n}"))
+        .w(BP_SLOT_W)
+        .h(LINE_H)
+        .center();
+    if rtl {
+        let help = if armed || disabled {
+            "Remove breakpoint"
+        } else if markers.is_some() && !executable {
+            "Not an executable line"
+        } else {
+            "Toggle breakpoint"
+        };
+        slot = slot
+            .role("button")
+            .label(format!("Breakpoint line {line}"))
+            .help(help)
+            .hover(t.selection)
+            .on_press(move |s: &mut AppState| {
+                crate::views::debug::gutter_toggle(s, n);
+            });
+    }
+    if armed {
+        slot = slot.child(text("●").key(format!("editor-bp-{n}")).font(mono).color(t.fail));
+    } else if disabled {
+        slot = slot.child(
+            text("○")
+                .key(format!("editor-bp-off-{n}"))
+                .font(mono)
+                .color(t.fail),
+        );
+    } else if pc {
+        slot = slot.child(text("▶").key(format!("editor-pc-{n}")).font(mono).color(t.pass));
+    }
+    let number = row()
         .key(format!("editor-gutter-{n}"))
         .role("button")
         .label(format!("Line {line}"))
         .focusable(true)
-        .w(GUTTER_W)
+        .grow(1.0)
         .h(LINE_H)
         .items_center()
         .justify_end()
@@ -873,28 +914,19 @@ fn gutter_row(s: &AppState, n: usize, current: bool, t: &VivadoTheme) -> El {
         .hover(t.selection)
         .on_press(move |s: &mut AppState| {
             move_cursor_to(s, n);
-        });
-    if pc {
-        cell = cell.child(
-            text("▶")
-                .key(format!("editor-pc-{n}"))
-                .font(VivadoTheme::FONT_MONO.mono().lh(LINE_H))
-                .color(t.pass),
+        })
+        .child(
+            text(format!("{line}"))
+                .font(mono)
+                .color(if pc && (armed || disabled) {
+                    t.pass
+                } else if current {
+                    t.text
+                } else {
+                    t.text_faint
+                }),
         );
-    }
-    if armed {
-        cell = cell.child(
-            text("●")
-                .key(format!("editor-bp-{n}"))
-                .font(VivadoTheme::FONT_MONO.mono().lh(LINE_H))
-                .color(t.fail),
-        );
-    }
-    cell.child(
-        text(format!("{line}"))
-            .font(VivadoTheme::FONT_MONO.mono().lh(LINE_H))
-            .color(if current { t.text } else { t.text_faint }),
-    )
+    row().w(GUTTER_W).h(LINE_H).child(slot).child(number)
 }
 
 /// Whole-buffer spans for the live field: syntax colors plus a wash over
@@ -949,9 +981,11 @@ pub fn editor_pane(s: &AppState, t: &VivadoTheme) -> El {
     let mono = VivadoTheme::FONT_MONO.mono().lh(LINE_H);
     let count = line_count(s);
     let caret = caret_line(s);
+    let markers = crate::views::debug::gutter_markers(s);
+    let rtl = !is_xdc;
     let mut gutter = col().w(GUTTER_W);
     for n in 0..count {
-        gutter = gutter.child(gutter_row(s, n, n == caret, t));
+        gutter = gutter.child(gutter_row(n, n == caret, markers.as_ref(), rtl, t));
     }
     let field: &TextEdit = &s.editor.edit;
     // One scroll container over gutter + field (the OG's single-ScrollArea

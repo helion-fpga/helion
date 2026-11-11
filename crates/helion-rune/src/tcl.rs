@@ -189,6 +189,10 @@ pub const COMMANDS: &[&str] = &[
     "deposit",
     "remove_force",
     "select_force",
+    "source_window",
+    "select_source_line",
+    "toggle_bp_line",
+    "add_bp_line",
     "report_property",
     "list_property",
     "list_properties",
@@ -1942,6 +1946,10 @@ fn cmd_source(
     depth: usize,
     line: usize,
 ) -> Ctl {
+    if argv.len() == 1 {
+        // Old IDE: bare `source` opens the UG900 Source window.
+        return cmd_source_window(s, argv, line);
+    }
     if argv.len() != 2 {
         return Ctl::err(line, wrong_args("source fileName"));
     }
@@ -2447,6 +2455,9 @@ fn dispatch_host(
         "deposit" => cmd_deposit(s, argv, line),
         "remove_force" => cmd_remove_force(s, argv, line),
         "select_force" => cmd_select_force(s, argv, line),
+        "source_window" => cmd_source_window(s, argv, line),
+        "select_source_line" => cmd_select_source_line(s, argv, line),
+        "toggle_bp_line" | "add_bp_line" => cmd_toggle_bp_line(s, argv, line),
         "report_property" => cmd_report_property(s, argv, line),
         "list_property" | "list_properties" => cmd_list_property(s, argv, line),
         "select_objects" => cmd_select_objects(s, argv, line, false),
@@ -3638,6 +3649,38 @@ fn cmd_breakpoints(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
     Ctl::Value(crate::views::debug::breakpoints_text(s))
 }
 
+/// Open the Source tab over the debugged RTL (old `source` / `source_window`).
+fn cmd_source_window(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
+    if argv.len() != 1 {
+        return Ctl::err(line, wrong_args("source_window"));
+    }
+    s.center = crate::state::CenterPane::Debug;
+    s.debug.tab = crate::views::debug::DebugTab::Source;
+    match crate::views::debug::open_source_window(s) {
+        Ok(out) => Ctl::Value(out),
+        Err(e) => Ctl::err(line, e),
+    }
+}
+
+fn cmd_select_source_line(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
+    let spec = argv.get(1..).unwrap_or_default().join(" ");
+    s.center = crate::state::CenterPane::Debug;
+    s.debug.tab = crate::views::debug::DebugTab::Source;
+    match crate::views::debug::select_source_line(s, &spec) {
+        Ok(out) => Ctl::Value(out),
+        Err(e) => Ctl::err(line, e),
+    }
+}
+
+/// `toggle_bp_line` / `add_bp_line` (both toggle, like the old IDE).
+fn cmd_toggle_bp_line(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
+    let spec = argv.get(1..).unwrap_or_default().join(" ");
+    match crate::views::debug::toggle_source_breakpoint(s, &spec) {
+        Ok(out) => Ctl::Value(out),
+        Err(e) => Ctl::err(line, e),
+    }
+}
+
 /// Open the Memory tab and dump its table (old `memory` / `memories`).
 fn cmd_memory(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
     if argv.len() != 1 {
@@ -4675,6 +4718,12 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
         "deposit" => ("deposit signal value", "one-shot poke a signal"),
         "remove_force" => ("remove_force ?signal|index?", "drop a force row"),
         "select_force" => ("select_force signal|index", "select one force row"),
+        "source_window" => ("source_window", "open the debugger Source window"),
+        "select_source_line" => ("select_source_line line", "select a Source line"),
+        "toggle_bp_line" | "add_bp_line" => (
+            "toggle_bp_line ?file:?line",
+            "arm or clear a line breakpoint",
+        ),
         "report_property" => (
             "report_property object",
             "all properties of an object as a table",

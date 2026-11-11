@@ -100,10 +100,12 @@ pub enum DebugTab {
     Memory,
     Locals,
     Forces,
+    Source,
 }
 
 impl DebugTab {
-    pub const ALL: [DebugTab; 4] = [
+    pub const ALL: [DebugTab; 5] = [
+        DebugTab::Source,
         DebugTab::Breakpoints,
         DebugTab::Memory,
         DebugTab::Locals,
@@ -116,6 +118,7 @@ impl DebugTab {
             DebugTab::Memory => "Memory",
             DebugTab::Locals => "Locals",
             DebugTab::Forces => "Forces",
+            DebugTab::Source => "Source",
         }
     }
 
@@ -125,6 +128,7 @@ impl DebugTab {
             DebugTab::Memory => "debug-tab-memory",
             DebugTab::Locals => "debug-tab-locals",
             DebugTab::Forces => "debug-tab-forces",
+            DebugTab::Source => "debug-tab-source",
         }
     }
 
@@ -135,6 +139,7 @@ impl DebugTab {
             DebugTab::Memory => "memory",
             DebugTab::Locals => "locals",
             DebugTab::Forces => "forces",
+            DebugTab::Source => "source_window",
         }
     }
 }
@@ -1632,6 +1637,81 @@ pub fn toggle_source_breakpoint(s: &mut AppState, spec: &str) -> Result<String, 
         .row_text())
 }
 
+/// Debugger markers for the editor gutter (1-based lines).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GutterMarkers {
+    /// Lines carrying an enabled line breakpoint.
+    pub armed: Vec<usize>,
+    /// Lines carrying a disabled line breakpoint (hollow marker).
+    pub disabled: Vec<usize>,
+    /// Executable lines (where a gutter tap may arm a breakpoint).
+    pub executable: Vec<usize>,
+    /// Current helion-sim PC line.
+    pub pc: Option<usize>,
+}
+
+impl GutterMarkers {
+    pub fn is_armed(&self, line: usize) -> bool {
+        self.armed.contains(&line)
+    }
+    pub fn is_disabled(&self, line: usize) -> bool {
+        self.disabled.contains(&line)
+    }
+    pub fn is_executable(&self, line: usize) -> bool {
+        self.executable.contains(&line)
+    }
+}
+
+/// Gutter markers for the viewed editor tab, or `None` when that tab is not
+/// the classified Source file (or its line count drifted since
+/// classification), so stale breakpoint/PC markers never paint.
+pub fn gutter_markers(s: &AppState) -> Option<GutterMarkers> {
+    let (file, lines) = s.debug.source_stamp.as_ref()?;
+    let tab = s.editor.tabs.get(s.editor.active)?;
+    if tab != file {
+        return None;
+    }
+    let viewed = s.editor.edit.text.lines().count();
+    if s.editor.edit_tab == Some(s.editor.active) && viewed != *lines {
+        return None;
+    }
+    let mut m = GutterMarkers {
+        pc: s.debug.pc_line,
+        ..GutterMarkers::default()
+    };
+    for b in &s.debug.breakpoints {
+        let Some(line) = b.line else { continue };
+        if b.kind_cell() != "line" {
+            continue;
+        }
+        if b.enabled {
+            m.armed.push(line);
+        } else {
+            m.disabled.push(line);
+        }
+    }
+    m.executable = s
+        .debug
+        .source_lines
+        .iter()
+        .filter(|l| l.executable)
+        .map(|l| l.line)
+        .collect();
+    Some(m)
+}
+
+/// Gutter breakpoint tap on 0-based editor line `n`: classifies the viewed
+/// RTL when needed, then toggles the line breakpoint through the same path
+/// as the `toggle_bp_line` verb (errors land in the console, not silently).
+pub fn gutter_toggle(s: &mut AppState, n: usize) {
+    let line = n + 1;
+    let res = toggle_source_breakpoint(s, &line.to_string());
+    match res {
+        Ok(text) => debug_log(s, &text, MsgSev::Info),
+        Err(e) => debug_log(s, &e, MsgSev::Warn),
+    }
+}
+
 /// Park the sim PC on the first executable `seq` line (old
 /// `advance_source_pc`): the helion-sim posedge all sequential lines share.
 pub fn advance_source_pc(s: &mut AppState) {
@@ -2202,7 +2282,9 @@ fn debug_row(s: &AppState, t: &VivadoTheme, b: &Breakpoint) -> El {
         })
         .child(el().w(56.0).px(8.0).child(mono_cell(&id.to_string(), t)))
         .child(el().w(72.0).px(8.0).child(mono_cell(b.enabled_cell(), t)))
-        .child(el().w(220.0).px(8.0).child(mono_cell(&b.signal, t)))
+        .child(el().w(64.0).px(8.0).child(mono_cell(b.kind_cell(), t)))
+        .child(el().w(64.0).px(8.0).child(mono_cell(&b.line_cell(), t)))
+        .child(el().w(220.0).px(8.0).child(mono_cell(b.signal_cell(), t)))
         .child(el().w(120.0).px(8.0).child(mono_cell(&b.condition, t)))
         .child(
             el().w(64.0)
@@ -2254,6 +2336,8 @@ fn debug_breakpoints_body(s: &AppState, t: &VivadoTheme) -> El {
             .fill(t.header_bg)
             .child(el().w(56.0).px(8.0).child(ui_label("Id", t)))
             .child(el().w(72.0).px(8.0).child(ui_label("Enabled", t)))
+            .child(el().w(64.0).px(8.0).child(ui_label("Type", t)))
+            .child(el().w(64.0).px(8.0).child(ui_label("Line", t)))
             .child(el().w(220.0).px(8.0).child(ui_label("Signal", t)))
             .child(el().w(120.0).px(8.0).child(ui_label("Condition", t)))
             .child(el().w(64.0).px(8.0).child(ui_label("Hits", t))),
@@ -2630,6 +2714,201 @@ fn debug_forces_body(s: &AppState, t: &VivadoTheme) -> El {
     body.child(list)
 }
 
+/// One Source row: line number, a BP slot (tap toggles a line breakpoint
+/// on executable lines), the PC arrow, kind, and the RTL text. Selecting
+/// evaluates `select_source_line`.
+fn debug_source_row(s: &AppState, t: &VivadoTheme, l: &SourceLine) -> El {
+    let line = l.line;
+    let selected = s.debug.selected_source_line == Some(line);
+    let armed = source_bp_armed(s, line);
+    let has_disabled = !armed
+        && s.debug
+            .breakpoints
+            .iter()
+            .any(|b| b.line == Some(line) && b.kind_cell() == "line");
+    let pc = s.debug.pc_line == Some(line);
+    let mut bp = el()
+        .key(format!("debug-source-bp-{line}"))
+        .w(28.0)
+        .h(ROW_H)
+        .center();
+    if l.executable {
+        bp = bp
+            .role("button")
+            .label(format!("Toggle breakpoint line {line}"))
+            .help("Toggle line breakpoint")
+            .focusable(true)
+            .hover(t.selection)
+            .on_press(move |s: &mut AppState| {
+                crate::tcl::eval_command(s, &format!("toggle_bp_line {line}"));
+            });
+    }
+    let mono = VivadoTheme::FONT_MONO.mono();
+    if armed {
+        bp = bp.child(text("●").font(mono).color(t.fail));
+    } else if has_disabled {
+        bp = bp.child(text("○").font(mono).color(t.fail));
+    } else if l.executable {
+        bp = bp.child(text("·").font(mono).color(t.text_faint));
+    }
+    let code_color = if l.executable { t.text } else { t.text_dim };
+    row()
+        .key(format!("debug-source-row-{line}"))
+        .w_full()
+        .h(ROW_H)
+        .items_center()
+        .fill(if selected {
+            t.selection
+        } else if pc {
+            t.current_line
+        } else {
+            t.panel_bg
+        })
+        .child(bp)
+        .child(
+            row()
+                .role("button")
+                .label(l.row_text(armed, s.debug.pc_line))
+                .focus_selected(selected)
+                .focusable(true)
+                .grow(1.0)
+                .min_w(0.0)
+                .h(ROW_H)
+                .items_center()
+                .hover(t.selection)
+                .on_press(move |s: &mut AppState| {
+                    crate::tcl::eval_command(s, &format!("select_source_line {line}"));
+                })
+                .child(
+                    el().w(48.0).pr(8.0).child(
+                        text(line.to_string())
+                            .font(mono)
+                            .color(if pc { t.pass } else { t.text_faint }),
+                    ),
+                )
+                .child(
+                    el().w(24.0)
+                        .child(text(if pc { "▶" } else { "" }).font(mono).color(t.pass)),
+                )
+                .child(el().w(64.0).px(4.0).child(dim_label(l.type_cell(), t)))
+                .child(
+                    el().grow(1.0).min_w(0.0).px(4.0).child(
+                        text(l.text.trim_end())
+                            .font(mono)
+                            .color(code_color)
+                            .truncate(),
+                    ),
+                ),
+        )
+}
+
+/// Source tab: the UG900 Source window over the debugged RTL with line
+/// breakpoints and the helion-sim PC, plus a jump into the editor.
+fn debug_source_body(s: &AppState, t: &VivadoTheme) -> El {
+    if s.debug.source_lines.is_empty() {
+        return col()
+            .key("debug-source-empty")
+            .w_full()
+            .gap(6.0)
+            .px(8.0)
+            .py(8.0)
+            .child(dim_label(
+                "No RTL loaded for debugging. Open a Verilog/SystemVerilog/VHDL source, then reopen this tab.",
+                t,
+            ))
+            .child(row().w_full().items_center().child(
+                debug_btn("debug-source-load", "Load Source", t, true).on_press(
+                    |s: &mut AppState| {
+                        crate::tcl::eval_command(s, "source_window");
+                    },
+                ),
+            ));
+    }
+    let file = s.debug.source_file.clone().unwrap_or_default();
+    let exec = s.debug.source_lines.iter().filter(|l| l.executable).count();
+    let line_bps = s
+        .debug
+        .breakpoints
+        .iter()
+        .filter(|b| b.kind_cell() == "line")
+        .count();
+    let pc = s
+        .debug
+        .pc_line
+        .map(|n| format!("PC line {n}"))
+        .unwrap_or_else(|| "PC not started".into());
+    let summary = format!(
+        "{file}  ·  {} lines  ·  {exec} executable  ·  {line_bps} line breakpoint{}  ·  {pc}",
+        s.debug.source_lines.len(),
+        if line_bps == 1 { "" } else { "s" }
+    );
+    let open_file = file.clone();
+    let bar = row()
+        .key("debug-source-bar")
+        .w_full()
+        .h(28.0)
+        .items_center()
+        .gap(4.0)
+        .px(8.0)
+        .child(
+            el().grow(1.0)
+                .min_w(0.0)
+                .child(dim_label(&summary, t).truncate()),
+        )
+        .child(
+            debug_btn("debug-source-open", "Open in Editor", t, true).on_press(
+                move |s: &mut AppState| {
+                    let line = s.debug.selected_source_line.or(s.debug.pc_line);
+                    if let Some(i) = s.editor.tabs.iter().position(|t| *t == open_file) {
+                        crate::views::editor::select_tab(s, i);
+                        s.center = crate::state::CenterPane::Editor;
+                        if let Some(line) = line {
+                            crate::views::editor::move_cursor_to(s, line.saturating_sub(1));
+                        }
+                    } else if let Some(path) = s.runs.source.clone()
+                        && source_basename(&path.to_string_lossy()) == open_file
+                        && let Ok(text) = std::fs::read_to_string(&path)
+                    {
+                        crate::views::editor::open_file_tab(s, open_file.clone(), text, path);
+                        s.center = crate::state::CenterPane::Editor;
+                        if let Some(line) = line {
+                            crate::views::editor::move_cursor_to(s, line.saturating_sub(1));
+                        }
+                    }
+                },
+            ),
+        );
+    let mut list = col()
+        .key("debug-source-table")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .scroll(rune::ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(
+            row()
+                .w_full()
+                .h(ROW_H)
+                .items_center()
+                .fill(t.header_bg)
+                .child(el().w(28.0).center().child(ui_label("BP", t)))
+                .child(el().w(48.0).pr(8.0).child(ui_label("Line", t)))
+                .child(el().w(24.0).child(ui_label("PC", t)))
+                .child(el().w(64.0).px(4.0).child(ui_label("Kind", t)))
+                .child(el().grow(1.0).px(4.0).child(ui_label("Code", t))),
+        );
+    for l in &s.debug.source_lines {
+        list = list.child(debug_source_row(s, t, l));
+    }
+    col()
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(bar)
+        .child(list)
+}
+
 /// Debug surface: tab strip plus shared transport plus the active UG900
 /// pane (Breakpoints, Memory, Locals, or Force Constants).
 pub fn debug_pane(s: &AppState, t: &VivadoTheme) -> El {
@@ -2638,6 +2917,7 @@ pub fn debug_pane(s: &AppState, t: &VivadoTheme) -> El {
         DebugTab::Memory => debug_memory_body(s, t),
         DebugTab::Locals => debug_locals_body(s, t),
         DebugTab::Forces => debug_forces_body(s, t),
+        DebugTab::Source => debug_source_body(s, t),
     };
     col()
         .key("debug")
