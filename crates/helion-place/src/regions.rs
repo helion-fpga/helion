@@ -35,6 +35,9 @@ pub struct RegionConstraint {
     /// Hierarchical prefixes (`u_core_`, `u_core/`): every cell whose name
     /// starts with one is owned by the region.
     pub prefixes: Vec<String>,
+    /// UG909 strict partition: no cell outside the region's membership may
+    /// sit inside it (non-members are evicted).
+    pub exclusive: bool,
 }
 
 impl RegionConstraint {
@@ -47,7 +50,14 @@ impl RegionConstraint {
             y1: y0.max(y1),
             cells: Vec::new(),
             prefixes: Vec::new(),
+            exclusive: false,
         }
+    }
+
+    /// Mark the region exclusive (UG909 strict reconfigurable partition).
+    pub fn exclusive(mut self) -> Self {
+        self.exclusive = true;
+        self
     }
 
     pub fn with_cells(mut self, cells: impl IntoIterator<Item = impl Into<String>>) -> Self {
@@ -219,6 +229,35 @@ pub fn legalize_into_regions(
             }
             Some(r) if regions[r].contains(slot.0.x, slot.0.y) && occupied.insert(key(slot)) => {}
             Some(_) => pending.push(i),
+        }
+    }
+    // Exclusive regions: clusters not owned by the region leave it first.
+    for (ri, r) in regions.iter().enumerate().filter(|(_, r)| r.exclusive) {
+        let squatters: Vec<usize> = (0..placed.lutff_sites.len())
+            .filter(|&j| owner[j] != Some(ri))
+            .filter(|&j| r.contains(placed.lutff_sites[j].0.x, placed.lutff_sites[j].0.y))
+            .collect();
+        for j in squatters {
+            let taken = placed.lutff_sites[j];
+            let from = (taken.0.x, taken.0.y);
+            let refuge = clbs
+                .iter()
+                .filter(|s| !regions.iter().any(|x| x.exclusive && x.contains(s.x, s.y)))
+                .filter(|s| owner[j].is_none_or(|o| regions[o].contains(s.x, s.y)))
+                .flat_map(|s| (0..n_ble).map(move |b| (*s, b)))
+                .filter(|s| !occupied.contains(&key(s)))
+                .min_by_key(|s| (dist(from, (s.0.x, s.0.y)), s.0.x, s.0.y, s.1))
+                .ok_or_else(|| {
+                    format!(
+                        "pblock {}: no free BLE slot outside it for {}",
+                        r.name, placed.packed.lutffs[j].lut_cell
+                    )
+                })?;
+            if occupied.remove(&key(&taken)) {
+                occupied.insert(key(&refuge));
+            }
+            placed.lutff_sites[j] = refuge;
+            stats[ri].evicted += 1;
         }
     }
     // Owned clusters move to the nearest free slot of their region,
@@ -493,6 +532,23 @@ mod tests {
         let v = region_violations(&pl, &[r]);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].region, "pb_far");
+    }
+
+    #[test]
+    fn exclusive_region_evicts_non_members() {
+        let dev = dev();
+        let p = pack(&Design::structural_counter(), &dev).unwrap();
+        let free = place_with_guide(&p, &dev, opts(), &TimingGuide::default()).unwrap();
+        // Cover where the placer put the first cluster, but own a different cell.
+        let s0 = free.lutff_sites[0].0;
+        let other = free.packed.lutffs[1].lut_cell.clone();
+        let r = RegionConstraint::new("rp", s0.x, s0.y, s0.x, s0.y).with_cells([other]).exclusive();
+        let (pl, st) = place_with_regions(&p, &dev, opts(), &[r.clone()], &TimingGuide::default()).unwrap();
+        for (i, (s, _)) in pl.lutff_sites.iter().enumerate() {
+            let owned = i == 1;
+            assert_eq!(r.contains(s.x, s.y), owned, "cluster {i} at {s:?}");
+        }
+        assert!(st[0].evicted >= 1);
     }
 
     #[test]
