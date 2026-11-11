@@ -38,6 +38,7 @@ use rune_kit::glyphs;
 use crate::live::{LiveNetlist, live_netlist, slug};
 use crate::state::{AppState, ConsoleLine, MsgSev};
 use crate::theme::VivadoTheme;
+use crate::views::schematic_cone::{self as cone, ConeTrace, SheetFind};
 use crate::views::sources::pane_header;
 
 /// Sheet width in points at 100% (columns are fixed; height grows with the
@@ -58,9 +59,9 @@ const GRID: f32 = 20.0;
 /// Zoom step per in/out press.
 const ZOOM_STEP: f32 = 1.25;
 /// Zoom limits.
-const ZOOM_MIN: f32 = 0.25;
+pub const ZOOM_MIN: f32 = 0.25;
 /// Zoom limits.
-const ZOOM_MAX: f32 = 4.0;
+pub const ZOOM_MAX: f32 = 4.0;
 /// Input-port column.
 const PORT_IN_X: f32 = 8.0;
 /// Port node width.
@@ -94,17 +95,22 @@ pub enum SchemSel {
     Cell(String),
     Port(String),
     Hier(String),
+    /// A logical net (find, cone rows); nets have no canvas block.
+    Net(String),
 }
 
 impl SchemSel {
     pub fn name(&self) -> &str {
         match self {
-            SchemSel::Cell(n) | SchemSel::Port(n) | SchemSel::Hier(n) => n,
+            SchemSel::Cell(n) | SchemSel::Port(n) | SchemSel::Hier(n) | SchemSel::Net(n) => n,
         }
     }
 
     pub fn key(&self) -> String {
-        format!("schematic-cell-{}", slug(self.name()))
+        match self {
+            SchemSel::Net(n) => format!("schematic-net-{}", slug(n)),
+            _ => format!("schematic-cell-{}", slug(self.name())),
+        }
     }
 
     pub fn hier_key(&self) -> String {
@@ -117,6 +123,7 @@ impl SchemSel {
             SchemSel::Cell(n) => format!("select_objects [get_cells {n}]"),
             SchemSel::Port(n) => format!("select_objects [get_ports {n}]"),
             SchemSel::Hier(n) => format!("select_objects [get_cells {n}]"),
+            SchemSel::Net(n) => format!("select_objects [get_nets {n}]"),
         }
     }
 }
@@ -351,13 +358,31 @@ impl Lod {
     }
 }
 
-/// Schematic-owned UI state: zoom, shared cross-probe selection, and the
-/// collapsed real instance names (empty = all expanded).
+/// Schematic-owned UI state: zoom, shared cross-probe selection, the
+/// collapsed real instance names (empty = all expanded), the active cone,
+/// selection history, the measured canvas viewport, and sheet find.
 #[derive(Clone, Debug)]
 pub struct SchematicState {
     pub zoom: f32,
     pub selected: Option<SchemSel>,
     pub collapsed: HashSet<String>,
+    /// Last traced fan-in/fan-out cone (`None` = no cone highlight).
+    pub cone: Option<ConeTrace>,
+    /// Hop count the next cone traces with.
+    pub cone_hops: usize,
+    /// Stop cone traversal at FF boundaries.
+    pub stop_at_ff: bool,
+    /// Selection history (Previous/Next) and the current entry.
+    pub history: Vec<SchemSel>,
+    pub history_ix: usize,
+    /// Canvas viewport size in points (from `on_layout`; Fit reads it).
+    pub viewport: [f32; 2],
+    /// Sheet find query, scope, and the next hit index.
+    pub find: rune::TextEdit,
+    pub find_kind: SheetFind,
+    pub find_ix: usize,
+    /// Query `find_ix` belongs to (a new query restarts at the first hit).
+    pub find_last: String,
 }
 
 impl Default for SchematicState {
@@ -372,6 +397,16 @@ impl SchematicState {
             zoom: 1.0,
             selected: None,
             collapsed: HashSet::new(),
+            cone: None,
+            cone_hops: 2,
+            stop_at_ff: false,
+            history: Vec::new(),
+            history_ix: 0,
+            viewport: [0.0, 0.0],
+            find: rune::TextEdit::new(""),
+            find_kind: SheetFind::Cells,
+            find_ix: 0,
+            find_last: String::new(),
         }
     }
 
@@ -385,10 +420,6 @@ impl SchematicState {
 
     pub fn zoom_out(&mut self) {
         self.zoom = (self.zoom / ZOOM_STEP).max(ZOOM_MIN);
-    }
-
-    pub fn zoom_fit(&mut self) {
-        self.zoom = 1.0;
     }
 
     pub fn zoom_label(&self) -> String {
@@ -453,9 +484,11 @@ fn echo(s: &mut AppState, tcl: String) {
     });
 }
 
-/// Select a live object and cross-probe it to the console like the timing links do.
-fn select(s: &mut AppState, sel: SchemSel) {
+/// Select a live object, record it in the selection history, and
+/// cross-probe it to the console like the timing links do.
+pub(crate) fn select(s: &mut AppState, sel: SchemSel) {
     let verb = sel.tcl();
+    s.schematic.push_history(&sel);
     s.schematic.selected = Some(sel);
     echo(s, verb);
 }
@@ -498,7 +531,7 @@ fn tool_btn(
 }
 
 /// Zoom/LOD/expand toolbar over the canvas.
-fn schematic_toolbar(s: &AppState, t: &VivadoTheme) -> El {
+fn schematic_toolbar(s: &AppState, t: &VivadoTheme, live: Option<&LiveNetlist>) -> El {
     row()
         .key("schematic-toolbar")
         .role("toolbar")
@@ -533,7 +566,10 @@ fn schematic_toolbar(s: &AppState, t: &VivadoTheme) -> El {
                 .px(6.0)
                 .center()
                 .hover(t.selection)
-                .on_press(|s: &mut AppState| s.schematic.zoom_fit())
+                .on_press_tx(|s: &mut AppState, tx: &mut rune::Tx| {
+                    crate::tcl::eval_command(s, "schematic_zoom_fit");
+                    tx.scroll_to_instant("schematic-canvas", 0.0, 0.0);
+                })
                 .child(ui_label("Fit", t)),
         )
         .child(
@@ -583,6 +619,9 @@ fn schematic_toolbar(s: &AppState, t: &VivadoTheme) -> El {
                         .a11y_hidden(),
                 ),
         )
+        .child(cone::history_buttons(s, t))
+        .child(el().w(6.0))
+        .child(cone::find_box(s, t, live))
         .child(el().grow(1.0))
         .child(
             el().key("schematic-locate")
@@ -641,7 +680,13 @@ fn hier_row(s: &AppState, t: &VivadoTheme, sel: SchemSel, detail: &str, depth: u
                 },
                 9.0,
             )
-            .color(if is_hier { t.text_dim } else { t.panel_bg })
+            .color(if is_hier {
+                t.text_dim
+            } else if selected {
+                t.selection
+            } else {
+                t.panel_bg
+            })
             .a11y_hidden(),
         );
     if is_hier {
@@ -744,9 +789,11 @@ fn wires_shape(s: &AppState, t: &VivadoTheme, live: &LiveNetlist, layout: &Schem
         if !s.schematic.wire_visible(live, layout, wire) {
             continue;
         }
+        let in_cone = s.schematic.cone.as_ref().map(|c| c.has_net(&wire.name));
         let hot = s.schematic.selected.as_ref().is_some_and(|sel| {
-            wire.ends.0 == *sel.name()
-                || wire.ends.1 == *sel.name()
+            matches!(sel, SchemSel::Net(n) if *n == wire.name)
+                || (!matches!(sel, SchemSel::Net(_))
+                    && (wire.ends.0 == *sel.name() || wire.ends.1 == *sel.name()))
                 || matches!(sel, SchemSel::Hier(h) if live.owner_of(&wire.ends.0).as_deref() == Some(h.as_str()) || live.owner_of(&wire.ends.1).as_deref() == Some(h.as_str()))
         });
         let (Some(a), Some(b)) = (
@@ -772,11 +819,13 @@ fn wires_shape(s: &AppState, t: &VivadoTheme, live: &LiveNetlist, layout: &Schem
             }
         }
         let pts = vec![px(x0, y0), px(mx, y0), px(mx, y1), px(x1, y1)];
-        shape = shape.stroke(
-            pts.clone(),
-            if hot { 2.0 } else { 1.5 },
-            if hot { t.fail } else { t.pass },
-        );
+        let (width, ink) = match (hot, in_cone) {
+            (true, _) => (2.0, t.fail),
+            (false, Some(true)) => (2.5, t.accent),
+            (false, Some(false)) => (1.0, t.pass.alpha(0.3)),
+            (false, None) => (1.5, t.pass),
+        };
+        shape = shape.stroke(pts.clone(), width, ink);
         if s.schematic.lod() == Lod::Full {
             for [ex, ey] in [pts[0], pts[pts.len() - 1]] {
                 shape = shape.fill(
@@ -823,7 +872,14 @@ fn cell_node(
             }
         }
         SchemSel::Hier(_) => "Hierarchy",
+        SchemSel::Net(_) => "Net",
     };
+    // Cone membership: members get the accent outline, the rest recede.
+    let cone_state = s.schematic.cone.as_ref().and_then(|c| match &sel {
+        SchemSel::Cell(n) => Some((c.has_cell(n), c.root == *n)),
+        SchemSel::Port(n) => Some((c.has_net(n), c.root == *n)),
+        _ => None,
+    });
     let fill = if expanded_block || is_port {
         t.panel_bg
     } else if is_hier {
@@ -841,9 +897,21 @@ fn cell_node(
         .size(w * z, h * z)
         .fill(fill)
         .border(
-            if selected { 2.0 } else { 1.0 },
-            if selected { t.fail } else { t.text_dim },
+            match (selected, cone_state) {
+                (true, _) => 2.0,
+                (false, Some((true, true))) => 2.5,
+                (false, Some((true, false))) => 2.0,
+                _ => 1.0,
+            },
+            match (selected, cone_state) {
+                (true, _) => t.fail,
+                (false, Some((true, _))) => t.accent,
+                _ => t.text_dim,
+            },
         );
+    if matches!(cone_state, Some((false, _))) && !selected {
+        node = node.layer_opacity(0.45);
+    }
     if expanded_block {
         node = node.border_dash(4.0, 3.0);
     }
@@ -938,6 +1006,13 @@ fn schematic_canvas(s: &AppState, t: &VivadoTheme, live: &LiveNetlist, layout: &
         .fill(t.panel_bg)
         .border(1.0, t.border)
         .scroll_xy()
+        .on_layout(|s: &mut AppState, r: [f32; 4]| {
+            let v = [r[2], r[3]];
+            let old = s.schematic.viewport;
+            if (v[0] - old[0]).abs() > 0.5 || (v[1] - old[1]).abs() > 0.5 {
+                s.schematic.viewport = v;
+            }
+        })
         .child(sheet)
 }
 
@@ -1010,6 +1085,15 @@ fn schematic_props(s: &AppState, t: &VivadoTheme, live: Option<&LiveNetlist>) ->
                         .map(|h| h.module.clone())
                         .unwrap_or_else(|| live.design.clone()),
                 ),
+                SchemSel::Net(n) => (
+                    "Net".to_string(),
+                    live.net(n)
+                        .map(|w| format!("{} endpoints", w.loads))
+                        .unwrap_or_else(|| "stale selection (design changed)".into()),
+                    live.owner_of(n)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| live.design.clone()),
+                ),
             };
             strip = strip
                 .child(
@@ -1034,22 +1118,24 @@ fn schematic_props(s: &AppState, t: &VivadoTheme, live: Option<&LiveNetlist>) ->
             ));
         }
     }
-    strip
+    strip.child(el().grow(1.0)).child(cone::debug_actions(s, t, live))
 }
 
 /// The center Schematic pane wired into the shell.
 pub fn schematic_pane(s: &AppState, t: &VivadoTheme) -> El {
     let live = live_netlist(s);
     let mut body = row().w_full().grow(1.0).min_h(0.0).gap(6.0).padding(6.0);
+    let mut results = None;
     if let Some(live) = &live {
         let layout = SchemLayout::of(live, &s.schematic);
         body = body
             .child(hierarchy_tree(s, t, live))
             .child(schematic_canvas(s, t, live, &layout));
+        results = cone::cone_results(s, t, live);
     } else {
         body = body.child(schematic_empty(t));
     }
-    col()
+    let mut pane = col()
         .key("schematic")
         .grow(1.0)
         .h_full()
@@ -1057,9 +1143,13 @@ pub fn schematic_pane(s: &AppState, t: &VivadoTheme) -> El {
         .fill(t.panel_bg)
         .border(1.0, t.border)
         .child(pane_header("Schematic", "schematic-pane", t))
-        .child(schematic_toolbar(s, t))
-        .child(body)
-        .child(schematic_props(s, t, live.as_ref()))
+        .child(schematic_toolbar(s, t, live.as_ref()))
+        .child(cone::cone_toolbar(s, t, live.as_ref()))
+        .child(body);
+    if let Some(r) = results {
+        pane = pane.child(el().w_full().px(6.0).pb(6.0).child(r));
+    }
+    pane.child(schematic_props(s, t, live.as_ref()))
 }
 
 #[cfg(test)]
@@ -1309,14 +1399,12 @@ mod tests {
     }
 
     #[test]
-    fn zoom_steps_change_lod_and_fit_restores_full() {
+    fn zoom_steps_change_lod() {
         let mut rt = harness_with(schem_state());
         rt.frame(0.0);
         tap(&mut rt, "schematic-zoom-in");
         assert!(rt.state.schematic.zoom > 1.0);
-        tap(&mut rt, "schematic-zoom-fit");
-        assert_eq!(rt.state.schematic.zoom, 1.0);
-        for _ in 0..4 {
+        for _ in 0..6 {
             tap(&mut rt, "schematic-zoom-out");
         }
         assert_eq!(rt.state.schematic.lod(), Lod::Blocks);
@@ -1332,7 +1420,9 @@ mod tests {
             rt.find("schematic-cell-clk").is_some(),
             "Blocks keeps ports"
         );
-        tap(&mut rt, "schematic-zoom-fit");
+        for _ in 0..6 {
+            tap(&mut rt, "schematic-zoom-in");
+        }
         assert_eq!(rt.state.schematic.lod(), Lod::Full);
         assert!(rt.find("schematic-cell-u-div-u-ff0").is_some());
     }

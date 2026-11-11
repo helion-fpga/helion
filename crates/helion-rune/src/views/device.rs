@@ -55,10 +55,19 @@ use crate::state::{AppState, ConsoleLine, MsgSev};
 use crate::theme::VivadoTheme;
 use crate::views::sources::pane_header;
 
+pub use crate::views::device_io::{IoPortRow, io_port_rows, push_device_pops};
+pub use crate::views::device_package::{
+    PackageGrid, PackagePin, package_grid_text, package_pin, package_pins,
+};
+pub use crate::views::device_floor::DeviceBottom;
+pub use crate::views::device_layers::{DeviceLayers, LayerId};
+use crate::views::device_io::io_ports_table;
+use crate::views::device_package::{package_pane, package_pin_key};
+
 /// Tile width in world points.
-const TILE_W: f32 = 40.0;
+pub(crate) const TILE_W: f32 = 40.0;
 /// Tile height in world points.
-const TILE_H: f32 = 42.0;
+pub(crate) const TILE_H: f32 = 42.0;
 /// Layers panel width.
 const LAYERS_W: f32 = 158.0;
 /// Find + inspector column width.
@@ -72,9 +81,9 @@ const TOOL_H: f32 = 26.0;
 /// Zoom step per in/out press.
 const ZOOM_STEP: f32 = 1.25;
 /// Zoom limits.
-const ZOOM_MIN: f32 = 0.25;
+pub(crate) const ZOOM_MIN: f32 = 0.1;
 /// Zoom limits.
-const ZOOM_MAX: f32 = 4.0;
+pub(crate) const ZOOM_MAX: f32 = 4.0;
 
 /// Canvas label type: smaller than CAD body text.
 const FONT_PIN: TextStyle = TextStyle::new(10.0, 400.0);
@@ -174,97 +183,6 @@ impl DeviceView {
     }
 }
 
-/// Die canvas layer visibility. Typed flags behind the layers panel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeviceLayers {
-    pub sites: bool,
-    pub cells: bool,
-    pub nets: bool,
-    /// Requested regions visibility; always renders off (no region model).
-    pub regions: bool,
-}
-
-impl Default for DeviceLayers {
-    fn default() -> Self {
-        Self {
-            sites: true,
-            cells: true,
-            nets: false,
-            regions: false,
-        }
-    }
-}
-
-/// Layer panel rows. Typed so toggles are never strings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LayerId {
-    Sites,
-    Cells,
-    Nets,
-    Regions,
-}
-
-impl LayerId {
-    pub const ALL: [LayerId; 4] = [
-        LayerId::Sites,
-        LayerId::Cells,
-        LayerId::Nets,
-        LayerId::Regions,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            LayerId::Sites => "Site tiles",
-            LayerId::Cells => "Placed cells",
-            LayerId::Nets => "Net spans",
-            LayerId::Regions => "Clock regions",
-        }
-    }
-
-    pub fn key(self) -> &'static str {
-        match self {
-            LayerId::Sites => "device-layer-sites",
-            LayerId::Cells => "device-layer-cells",
-            LayerId::Nets => "device-layer-nets",
-            LayerId::Regions => "device-layer-regions",
-        }
-    }
-
-    /// The regions layer is unwirable: the HAD model exposes sites but no
-    /// clock-region table, so it stays visibly disabled with a reason.
-    pub fn enabled(self) -> bool {
-        !matches!(self, LayerId::Regions)
-    }
-
-    pub fn disabled_reason(self) -> Option<&'static str> {
-        match self {
-            LayerId::Regions => Some("No HAD region table"),
-            _ => None,
-        }
-    }
-
-    pub fn get(self, layers: &DeviceLayers) -> bool {
-        match self {
-            LayerId::Sites => layers.sites,
-            LayerId::Cells => layers.cells,
-            LayerId::Nets => layers.nets,
-            LayerId::Regions => layers.regions,
-        }
-    }
-
-    pub fn toggle(self, layers: &mut DeviceLayers) {
-        if !self.enabled() {
-            return;
-        }
-        match self {
-            LayerId::Sites => layers.sites = !layers.sites,
-            LayerId::Cells => layers.cells = !layers.cells,
-            LayerId::Nets => layers.nets = !layers.nets,
-            LayerId::Regions => {}
-        }
-    }
-}
-
 /// Device-owned UI state: die/package view, zoom, shared cross-probe
 /// selection, layer flags, find palette visibility, and the find filter edit.
 #[derive(Clone, Debug)]
@@ -278,6 +196,17 @@ pub struct DeviceState {
     /// Port whose Package Pin popover is open (`None` closed; exclusive —
     /// see [`push_device_pops`]).
     pub io_pin_pop: Option<String>,
+    /// Port the I/O quick-set rows act on.
+    pub io_selected: Option<String>,
+    /// Die canvas viewport size in points (from `on_layout`; Fit reads it).
+    pub viewport: [f32; 2],
+    /// Floorplan pblocks (helion-proj `PrjPblock`s) and the selected one.
+    pub pblocks: Vec<helion_proj::PrjPblock>,
+    pub pblock_sel: Option<String>,
+    /// Project `.prj` the pblocks were loaded from.
+    pub pblocks_from: Option<std::path::PathBuf>,
+    /// Bottom panel tab (I/O Ports or Pblocks).
+    pub bottom: DeviceBottom,
 }
 
 impl Default for DeviceState {
@@ -290,6 +219,12 @@ impl Default for DeviceState {
             find_open: true,
             find: rune::TextEdit::new(""),
             io_pin_pop: None,
+            io_selected: None,
+            viewport: [0.0, 0.0],
+            pblocks: Vec::new(),
+            pblock_sel: None,
+            pblocks_from: None,
+            bottom: DeviceBottom::IoPorts,
         }
     }
 }
@@ -301,10 +236,6 @@ impl DeviceState {
 
     pub fn zoom_out(&mut self) {
         self.zoom = (self.zoom / ZOOM_STEP).max(ZOOM_MIN);
-    }
-
-    pub fn zoom_fit(&mut self) {
-        self.zoom = 1.0;
     }
 
     pub fn zoom_label(&self) -> String {
@@ -353,160 +284,6 @@ impl DeviceState {
     }
 }
 
-/// Package pin key: one stable button per HAD site id.
-fn package_pin_key(pin: &str) -> String {
-    format!("device-package-pin-{}", slug(pin))
-}
-
-/// One HAD IOB package pin: engine site plus the owning top-level port, if
-/// any. Derived per frame from the live device and I/O rows (old
-/// `PackagePin`, refreshed by `refresh_package`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PackagePin {
-    pub pin: String,
-    pub x: u32,
-    pub y: u32,
-    pub port: Option<String>,
-    pub bank: u32,
-}
-
-/// HAD IOB bounding box behind the package grid (old `PackageDrawing`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PackageGrid {
-    pub part: String,
-    pub x0: u32,
-    pub y0: u32,
-    pub cols: u32,
-    pub rows: u32,
-}
-
-/// Package pins plus their bounding box: every HAD IOB site, with placed
-/// sites first and LOC constraints filling unplaced ports (old
-/// `refresh_package` uses each port's site, else its package pin). Banks
-/// group eight consecutive IOBs along the grid's long axis.
-pub fn package_pins(s: &AppState) -> (PackageGrid, Vec<PackagePin>) {
-    let (dev, part) = crate::live::live_device(s);
-    let assigned: Vec<(String, String)> = io_port_rows(s)
-        .into_iter()
-        .filter_map(|r| r.site.or(r.package_pin).map(|site| (site, r.name)))
-        .collect();
-    let mut pins: Vec<PackagePin> = dev
-        .iob_sites()
-        .map(|site| {
-            let pin = site.id();
-            let port = assigned
-                .iter()
-                .find(|(site, _)| site == &pin)
-                .map(|(_, name)| name.clone());
-            PackagePin {
-                pin,
-                x: site.x,
-                y: site.y,
-                port,
-                bank: 0,
-            }
-        })
-        .collect();
-    let (x0, y0, cols, rows) = match (
-        pins.iter().map(|p| p.x).min(),
-        pins.iter().map(|p| p.x).max(),
-        pins.iter().map(|p| p.y).min(),
-        pins.iter().map(|p| p.y).max(),
-    ) {
-        (Some(xmin), Some(xmax), Some(ymin), Some(ymax)) => {
-            (xmin, ymin, xmax - xmin + 1, ymax - ymin + 1)
-        }
-        _ => (0, 0, 0, 0),
-    };
-    const BANK_PINS: u32 = 8;
-    for p in &mut pins {
-        let dx = p.x.saturating_sub(x0);
-        let dy = p.y.saturating_sub(y0);
-        p.bank = if cols >= rows {
-            dx / BANK_PINS
-        } else {
-            dy / BANK_PINS
-        };
-    }
-    (
-        PackageGrid {
-            part,
-            x0,
-            y0,
-            cols,
-            rows,
-        },
-        pins,
-    )
-}
-
-/// One package pin by exact engine id.
-pub fn package_pin(s: &AppState, pin: &str) -> Option<PackagePin> {
-    package_pins(s).1.into_iter().find(|p| p.pin == pin)
-}
-
-/// Package drawing dump: HAD bounding box plus the occupancy map, exactly
-/// like old `package_drawing_text` (including its `L`/`P`/`.` marks).
-pub fn package_grid_text(s: &AppState) -> String {
-    let (grid, pins) = package_pins(s);
-    let assigned = pins.iter().filter(|p| p.port.is_some()).count();
-    let banks = {
-        let mut seen = std::collections::BTreeSet::new();
-        for p in &pins {
-            seen.insert(p.bank);
-        }
-        seen.len()
-    };
-    let mut out = format!(
-        "package drawing part={} cols={} rows={} pins={} assigned={} x0={} y0={} banks={}",
-        grid.part,
-        grid.cols,
-        grid.rows,
-        pins.len(),
-        assigned,
-        grid.x0,
-        grid.y0,
-        banks
-    );
-    if grid.cols == 0 || grid.rows == 0 {
-        return out;
-    }
-    for dy in 0..grid.rows {
-        let y = grid.y0 + dy;
-        let mut row = format!(" row y={y}");
-        let mut map = String::new();
-        for dx in 0..grid.cols {
-            let x = grid.x0 + dx;
-            if let Some(p) = pins.iter().find(|p| p.x == x && p.y == y) {
-                row.push_str(&format!(
-                    " {}={}:bank={}",
-                    p.pin,
-                    p.port.as_deref().unwrap_or("-"),
-                    p.bank
-                ));
-                map.push(match p.port.as_deref() {
-                    Some("led") => 'L',
-                    Some(_) => 'P',
-                    None => '.',
-                });
-            } else {
-                map.push(' ');
-            }
-        }
-        out.push_str(&format!("{row} map={map}"));
-    }
-    out
-}
-
-/// Bank ink from theme tokens (no hardcoded package palette).
-fn package_bank_color(t: &VivadoTheme, bank: u32) -> rune::Color {
-    match bank % 4 {
-        0 => t.die_region,
-        1 => t.link,
-        2 => t.pass,
-        _ => t.warn,
-    }
-}
 
 /// Echo a Tcl verb to the console without flipping run state.
 fn echo(s: &mut AppState, tcl: String) {
@@ -620,9 +397,34 @@ fn device_toolbar(s: &AppState, t: &VivadoTheme) -> El {
                     .px(6.0)
                     .center()
                     .hover(t.selection)
-                    .on_press(|s: &mut AppState| s.device.zoom_fit())
+                    .on_press_tx(|s: &mut AppState, tx: &mut Tx| {
+                        crate::tcl::eval_command(s, "device_zoom_fit");
+                        tx.scroll_to_instant("device-canvas", 0.0, 0.0);
+                    })
                     .child(ui_label("Fit", t)),
-            );
+            )
+            .child({
+                let why = crate::views::device_layers::zoom_selection_unavailable(s);
+                let mut b = el()
+                    .key("device-zoom-selection")
+                    .role("button")
+                    .label("Zoom to selection")
+                    .h(22.0)
+                    .px(6.0)
+                    .center()
+                    .child(ui_label("Zoom to Selection", t));
+                match why {
+                    None => {
+                        b = b.focusable(true).hover(t.selection).on_press_tx(
+                            |s: &mut AppState, tx: &mut Tx| {
+                                crate::views::device_layers::zoom_to_selection(s, tx)
+                            },
+                        )
+                    }
+                    Some(r) => b = b.disabled(true).description(r).help(r).layer_opacity(0.45),
+                }
+                b
+            });
     }
     bar.child(view_toggle(DeviceView::Die, s, t))
         .child(view_toggle(DeviceView::Package, s, t))
@@ -656,7 +458,7 @@ fn device_toolbar(s: &AppState, t: &VivadoTheme) -> El {
 /// with their reason.
 fn layers_panel(s: &AppState, t: &VivadoTheme) -> El {
     let kit = t.kit();
-    let mut body = col()
+    let body = col()
         .key("device-layers")
         .role("group")
         .label("Die layers")
@@ -673,23 +475,45 @@ fn layers_panel(s: &AppState, t: &VivadoTheme) -> El {
                 .fill(t.header_bg)
                 .child(text("Layers").font(VivadoTheme::FONT_TITLE).color(t.text)),
         );
+    let geom = live_geom(s);
+    let mut rows = col().w_full();
     for layer in LayerId::ALL {
-        let mut check = Checkbox::new(layer.get(&s.device.layers))
+        let why = layer.unavailable(s, &geom);
+        let check = Checkbox::new(layer.get(&s.device.layers) && why.is_none())
             .label(layer.label())
-            .disabled(!layer.enabled())
-            .on_toggle::<AppState>(move |s: &mut AppState| layer.toggle(&mut s.device.layers));
-        if let Some(reason) = layer.disabled_reason() {
-            check = check.description(reason);
+            .disabled(why.is_some())
+            .on_toggle::<AppState>(move |s: &mut AppState| {
+                crate::views::device_layers::toggle_layer(s, layer);
+            });
+        let mut built = check.build(&kit).key(layer.key()).grow(1.0).min_w(0.0);
+        if let Some(r) = why {
+            built = built.description(r).help(r);
         }
-        body = body.child(check.build(&kit).key(layer.key()));
+        let mut line = row().w_full().items_center().pr(8.0).child(built);
+        if let Some(k) = layer.shortcut() {
+            line = line.child(
+                text(k.to_string())
+                    .font(crate::views::cad::FONT_PIN.mono())
+                    .color(t.text_faint)
+                    .a11y_hidden(),
+            );
+        }
+        rows = rows.child(line);
     }
-    body = body.child(
+    rows = rows.child(
         el().w_full()
             .px(8.0)
             .py(4.0)
-            .child(dim_label("Toggle die layers", t)),
+            .child(dim_label("Keys 1–9 · 0 heat · F fit · R rulers", t).truncate()),
     );
-    body
+    body.child(
+        col()
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .scroll(rune::ScrollSpec { stick_bottom: false })
+            .child(rows),
+    )
 }
 
 /// One real site tile rect at 100%: `[x, y, 1, 1]` in site units.
@@ -714,7 +538,8 @@ fn die_shape(
     let mut shape = Shape::new();
     // Site tiles from the real part geometry (mirrors the Device iterators:
     // CLB grid, bottom IOB row, CLK spine, DSP/BRAM columns).
-    if s.device.layers.sites {
+    let lay = s.device.layers;
+    if lay.clb {
         for dy in 0..geom.interior_rows {
             for dx in 0..geom.interior_cols {
                 let [ox, oy, w, h] = tile_rect(geom, geom.clb_x0 + dx, geom.clb_y0 + dy);
@@ -735,12 +560,16 @@ fn die_shape(
                 );
             }
         }
-        // Bottom IOB row under each CLB column.
+    }
+    // Bottom IOB row under each CLB column.
+    if lay.iob {
         let iob_y = geom.clb_y0.saturating_sub(1);
         for dx in 0..geom.interior_cols {
             shape = special_tile(shape, geom, z, geom.clb_x0 + dx, iob_y, t.die_tile, t.pass);
         }
-        // CLK spine, DSP and BRAM columns (outlines over the CLB grid).
+    }
+    // CLK spine, DSP and BRAM columns (outlines over the CLB grid).
+    if lay.clk {
         for dy in 0..geom.interior_rows {
             shape = outline_tile(
                 shape,
@@ -751,13 +580,19 @@ fn die_shape(
                 t.die_region,
             );
         }
+    }
+    if lay.dsp {
         for i in 0..geom.n_dsp {
             shape = outline_tile(shape, geom, z, geom.dsp_x, geom.dsp_y0 + i * 2, t.link);
         }
+    }
+    if lay.bram {
         for i in 0..geom.n_bram {
             shape = outline_tile(shape, geom, z, geom.bram_x, geom.bram_y0 + i * 2, t.warn);
         }
     }
+    // Congestion / criticality heat over the tiles, under cells and spans.
+    shape = crate::views::device_layers::heat_shape(shape, s, t, geom, placed);
     // Die frame.
     shape = shape.stroke(
         vec![
@@ -917,7 +752,11 @@ fn cell_node(
         .focusable(true)
         .absolute(x * z, y * z)
         .size(w * z, h * z)
-        .fill(t.die_cell)
+        .fill(if crate::views::device_layers::heat_on(s, geom) {
+            t.die_cell.alpha(0.12)
+        } else {
+            t.die_cell
+        })
         .border(
             if selected { 2.0 } else { 1.0 },
             if selected { t.fail } else { t.text },
@@ -960,6 +799,9 @@ fn device_canvas(
                 .w_full()
                 .h_full(),
         );
+    for node in crate::views::device_layers::pblock_nodes(s, t, geom) {
+        sheet = sheet.child(node);
+    }
     match (live, placed) {
         (Some(live), Some(placed)) if s.device.cell_visible() => {
             for cell in &live.cells {
@@ -1008,6 +850,9 @@ fn device_canvas(
         }
         _ => {}
     }
+    for node in crate::views::device_layers::ruler_nodes(s, t, geom) {
+        sheet = sheet.child(node);
+    }
     sheet = sheet.child(
         text(format!("{} · Device", geom.part))
             .font(FONT_PIN)
@@ -1027,6 +872,15 @@ fn device_canvas(
         .fill(t.die_bg)
         .border(1.0, t.border)
         .scroll_xy()
+        .focusable(true)
+        .on_key(crate::views::device_layers::canvas_key)
+        .on_layout(|s: &mut AppState, r: [f32; 4]| {
+            let v = [r[2], r[3]];
+            let old = s.device.viewport;
+            if (v[0] - old[0]).abs() > 0.5 || (v[1] - old[1]).abs() > 0.5 {
+                s.device.viewport = v;
+            }
+        })
         .child(sheet)
 }
 
@@ -1092,6 +946,9 @@ fn find_palette(
         .role("search")
         .label("Find die elements")
         .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .max_h(FIND_H + 48.0)
         .fill(t.panel_bg)
         .border(1.0, t.border)
         .child(
@@ -1119,7 +976,7 @@ fn find_palette(
                 .on_edit(|s: &mut AppState| &mut s.device.find)
                 .on_submit(|s: &mut AppState, _tx: &mut Tx| select_first_match(s)),
         );
-    let mut list = col().w_full().h(FIND_H).scroll_xy();
+    let mut list = col().w_full().grow(1.0).min_h(0.0).max_h(FIND_H).scroll_xy();
     if hits.is_empty() {
         list = list.child(
             row().w_full().h(ROW_H).items_center().px(8.0).child(
@@ -1153,8 +1010,6 @@ fn device_inspector(
         .key("device-inspector")
         .role("status")
         .w_full()
-        .grow(1.0)
-        .min_h(0.0)
         .fill(t.panel_bg)
         .border(1.0, t.border)
         .child(
@@ -1326,556 +1181,54 @@ fn device_status(
         .gap(8.0)
         .px(8.0)
         .fill(t.header_bg)
-        .child(dim_label(&text, t))
+        .child(dim_label(&text, t).truncate().grow(1.0).min_w(0.0))
+        .children(crate::views::device_layers::heat_legend(s, t, geom))
 }
 
-/// Package pin cell size: site id plus owner, dense enough to wrap the
-/// HAD strip into a filled grid.
-const PACKAGE_PIN_W: f32 = 104.0;
-const PACKAGE_PIN_H: f32 = 64.0;
-const PACKAGE_BALL: f32 = 18.0;
 
-/// Package pin tap: an empty pin binds the selected I/O port through real
-/// `set_property PACKAGE_PIN`; any other tap routes through real
-/// `select_package_pin` (old paint's click branch).
-fn package_pick(s: &mut AppState, pin: &str) {
-    let Some(found) = package_pin(s, pin) else {
-        return;
-    };
-    if found.port.is_none()
-        && let Some(DeviceSel::Net(port)) = s.device.selected.clone()
-        && io_port_rows(s).iter().any(|r| r.name == port)
-    {
-        let before = s.console.lines.len();
-        crate::tcl::eval_command(
-            s,
-            &format!("set_property PACKAGE_PIN {pin} [get_ports {port}]"),
-        );
-        let failed = s.console.lines[before..]
-            .iter()
-            .any(|l| l.sev == MsgSev::Error);
-        if !failed {
-            s.device.selected = Some(DeviceSel::Net(port));
-        }
-        return;
-    }
-    crate::tcl::eval_command(s, &format!("select_package_pin {pin}"));
-}
 
-/// One tappable package ball: bank wash, assigned ink, selected ring, site
-/// id plus owner (no hover-only state).
-fn package_pin_cell(s: &AppState, t: &VivadoTheme, pin: &PackagePin) -> El {
-    let assigned = pin.port.is_some();
-    let selected = match &s.device.selected {
-        Some(DeviceSel::Pin(n)) => n == &pin.pin,
-        Some(DeviceSel::Net(n)) => pin.port.as_deref() == Some(n.as_str()),
-        _ => false,
-    };
-    let owned = pin.pin.clone();
-    let status = pin.port.clone().unwrap_or_else(|| "Unassigned".into());
-    el().key(package_pin_key(&pin.pin))
-        .role("button")
-        .label(format!("{} ({}, BANK{})", pin.pin, status, pin.bank))
-        .description(format!("X{}Y{}", pin.x, pin.y))
-        .focus_selected(selected)
-        .focusable(true)
-        .size(PACKAGE_PIN_W, PACKAGE_PIN_H)
-        .fill(package_bank_color(t, pin.bank).alpha(0.16))
-        .border(
-            if selected { 2.0 } else { 1.0 },
-            if selected { t.warn } else { t.border },
-        )
-        .radius(8.0)
-        .hover(t.selection)
-        .on_press(move |s: &mut AppState| package_pick(s, &owned))
-        .child(
-            col()
-                .w_full()
-                .h_full()
-                .center()
-                .gap(2.0)
-                .child(
-                    el().size(PACKAGE_BALL, PACKAGE_BALL)
-                        .radius(PACKAGE_BALL / 2.0)
-                        .fill(if assigned { t.link } else { t.text_faint })
-                        .a11y_hidden(),
-                )
-                .child(
-                    text(&pin.pin)
-                        .font(FONT_PIN)
-                        .color(t.text)
-                        .truncate()
-                        .a11y_hidden(),
-                )
-                .child(
-                    text(&status)
-                        .font(FONT_PIN)
-                        .color(if assigned { t.text } else { t.text_dim })
-                        .truncate()
-                        .a11y_hidden(),
-                ),
-        )
-}
-
-/// Package header: part/grid/pin counts plus the live assignment target.
-fn package_summary(s: &AppState, t: &VivadoTheme, grid: &PackageGrid, pins: &[PackagePin]) -> El {
-    let assigned = pins.iter().filter(|p| p.port.is_some()).count();
-    let mut head = col().key("device-package-summary").w_full().gap(2.0).child(
-        row()
-            .w_full()
-            .items_center()
-            .gap(8.0)
-            .px(8.0)
-            .py(4.0)
-            .child(dim_label(
-                &format!(
-                    "Part {} · {}×{} grid · {} pins ({} assigned)",
-                    grid.part,
-                    grid.cols,
-                    grid.rows,
-                    pins.len(),
-                    assigned
-                ),
-                t,
-            )),
-    );
-    if let Some(DeviceSel::Net(port)) = &s.device.selected
-        && io_port_rows(s).iter().any(|r| &r.name == port)
-    {
-        head = head.child(
-            dim_label(&format!("Assigning {port} — tap an empty pin"), t)
-                .key("device-package-assigning")
-                .px(8.0),
-        );
-    }
-    head
-}
-
-/// Package legend: occupancy inks plus every bank present on this part.
-fn package_legend(t: &VivadoTheme, pins: &[PackagePin]) -> El {
-    let mut legend = row()
-        .key("device-package-legend")
+/// Bottom panel under the die: I/O Ports (with quick-set) or Pblocks.
+fn bottom_panel(s: &AppState, t: &VivadoTheme) -> El {
+    let ports = io_port_rows(s).len();
+    let tabs = row()
+        .key("device-bottom-tabs")
+        .role("tablist")
         .w_full()
         .items_center()
-        .gap(8.0)
-        .px(8.0)
-        .py(2.0);
-    for (label, ink) in [("Unassigned", t.text_faint), ("Assigned port", t.link)] {
-        legend = legend.child(
-            row()
-                .items_center()
-                .gap(4.0)
-                .child(el().size(10.0, 10.0).radius(5.0).fill(ink).a11y_hidden())
-                .child(dim_label(label, t)),
-        );
-    }
-    let mut banks = std::collections::BTreeSet::new();
-    for p in pins {
-        banks.insert(p.bank);
-    }
-    for bank in banks {
-        legend = legend.child(
-            row()
-                .key(format!("device-package-legend-bank-{bank}"))
-                .items_center()
-                .gap(4.0)
-                .child(
-                    el().size(12.0, 12.0)
-                        .radius(2.0)
-                        .fill(package_bank_color(t, bank))
-                        .a11y_hidden(),
-                )
-                .child(dim_label(&format!("BANK{bank}"), t)),
-        );
-    }
-    legend
-}
-
-/// Package view: old HAD IOB drawing as tappable bank-colored balls over a
-/// scroll viewport. Empty only if the part exposes no IOB sites.
-fn package_pane(s: &AppState, t: &VivadoTheme) -> El {
-    let (grid, pins) = package_pins(s);
-    let pane = col()
-        .key("device-package")
-        .role("application")
-        .label("Package pin grid")
-        .grow(1.0)
-        .h_full()
-        .min_w(0.0)
-        .min_h(0.0)
-        .fill(t.panel_bg)
-        .border(1.0, t.border)
-        .child(pane_header("Package", "device-package-pane", t))
-        .child(package_summary(s, t, &grid, &pins))
-        .child(package_legend(t, &pins));
-    if pins.is_empty() {
-        return pane.child(
-            dim_label("This part exposes no IOB sites.", t)
-                .key("device-package-empty")
-                .px(8.0),
-        );
-    }
-    let mut balls = row()
-        .key("device-package-grid")
-        .w_full()
-        .flex_wrap()
-        .gap(6.0)
-        .padding(8.0);
-    for pin in &pins {
-        balls = balls.child(package_pin_cell(s, t, pin));
-    }
-    pane.child(
-        col()
-            .w_full()
-            .grow(1.0)
-            .min_w(0.0)
-            .min_h(0.0)
-            .scroll(rune::ScrollSpec {
-                stick_bottom: false,
-            })
-            .child(balls),
-    )
-}
-
-/// One I/O Planning row: a top-level port, its placed IOB site (once
-/// implementation runs), and its `set_property` pin constraints (old
-/// `IoPortView`; the Package Pin cell edits LOC through a popover).
-#[derive(Clone, Debug)]
-pub struct IoPortRow {
-    pub name: String,
-    pub dir: &'static str,
-    pub site: Option<String>,
-    pub iob_cell: Option<String>,
-    pub package_pin: Option<String>,
-    pub iostandard: Option<String>,
-    pub drive: Option<String>,
-    pub slew: Option<String>,
-    pub pulltype: Option<String>,
-    pub diff_term: Option<String>,
-    pub in_term: Option<String>,
-}
-
-impl IoPortRow {
-    fn cell(v: &Option<String>) -> &str {
-        v.as_deref().unwrap_or("-")
-    }
-}
-
-/// I/O port rows from the live design: top-level ports, the placed IOB
-/// site on each port's net, and the port's pin-constraint attrs. Empty
-/// until a design is synthesized.
-///
-/// The site match finds the placed IOB-kind cell on the port's net (old
-/// `refresh_io_ports` matched packed-cell names by substring, with a
-/// first-IOB fallback for outputs that could attribute a wrong site;
-/// unmapped ports honestly show `-`).
-pub fn io_port_rows(s: &AppState) -> Vec<IoPortRow> {
-    let Some(design) = crate::live::live_design(s) else {
-        return Vec::new();
-    };
-    let nets = crate::live::live_netlist(s)
-        .map(|n| n.nets)
-        .unwrap_or_default();
-    let placed = crate::live::live_placed(s)
-        .map(|p| p.cells)
-        .unwrap_or_default();
-    design
-        .ports
-        .iter()
-        .map(|p| {
-            let name = helion_ir::resolve(p.name).to_string();
-            let dir = match p.dir {
-                helion_ir::PortDir::In => "IN",
-                helion_ir::PortDir::Out => "OUT",
-                helion_ir::PortDir::Inout => "INOUT",
-            };
-            let on_net: &[String] = nets
-                .iter()
-                .find(|n| n.name == name)
-                .map(|n| n.cells.as_slice())
-                .unwrap_or(&[]);
-            let iob = placed
-                .iter()
-                .find(|c| c.site_kind == "IOB" && on_net.iter().any(|n| n == &c.cell));
-            let attr = |k: &str| p.attrs.get(k).map(str::to_string);
-            IoPortRow {
-                name,
-                dir,
-                site: iob.map(|c| c.site.clone()),
-                iob_cell: iob.map(|c| c.cell.clone()),
-                package_pin: attr("LOC"),
-                iostandard: attr("IOSTANDARD"),
-                drive: attr("DRIVE"),
-                slew: attr("SLEW"),
-                pulltype: attr("PULLTYPE"),
-                diff_term: attr("DIFF_TERM"),
-                in_term: attr("IN_TERM"),
-            }
-        })
-        .collect()
-}
-
-/// I/O Ports planning table under the die canvas (old Package tab's port
-/// grid, read-only): name/dir/site/pin + pin constraints. Row taps
-/// cross-probe the die (placed IOB cell, else the port net).
-fn io_ports_table(s: &AppState, t: &VivadoTheme) -> El {
-    let rows = io_port_rows(s);
-    let mut body = col().w_full();
-    body = body.child(
-        row()
-            .key("device-io-head")
-            .w_full()
-            .items_center()
-            .px(8.0)
-            .child(el().grow(1.0).min_w(0.0).child(dim_label("Name", t)))
-            .child(el().w(44.0).child(dim_label("Dir", t)))
-            .child(el().w(96.0).child(dim_label("Site", t)))
-            .child(el().w(128.0).child(dim_label("Package Pin", t)))
-            .child(el().w(96.0).child(dim_label("IOSTANDARD", t)))
-            .child(el().w(56.0).child(dim_label("Drive", t)))
-            .child(el().w(56.0).child(dim_label("Slew", t)))
-            .child(el().w(72.0).child(dim_label("Pull Type", t)))
-            .child(el().w(64.0).child(dim_label("Diff Term", t)))
-            .child(el().w(96.0).child(dim_label("In Term", t))),
-    );
-    if rows.is_empty() {
-        body = body.child(
-            dim_label("Synth a design to list ports.", t)
-                .key("device-io-empty")
-                .px(8.0),
-        );
-    }
-    for (i, r) in rows.iter().enumerate() {
-        let sel = match (&r.iob_cell, s.device.selected.as_ref()) {
-            (Some(cell), Some(DeviceSel::Cell(n))) => n == cell,
-            (None, Some(DeviceSel::Net(n))) => n == &r.name,
-            _ => false,
-        };
-        let pick = match r.iob_cell.clone() {
-            Some(cell) => DeviceSel::Cell(cell),
-            None => DeviceSel::Net(r.name.clone()),
-        };
-        let mut line = row()
-            .key(format!("device-io-row-{i}"))
-            .role("row")
-            .w_full()
-            .h(22.0)
-            .items_center()
-            .px(8.0)
-            .hover(t.selection)
-            .on_press(move |s: &mut AppState| {
-                s.device.selected = Some(pick.clone());
-            })
-            .child(
-                el().grow(1.0)
-                    .min_w(0.0)
-                    .child(ui_label(&r.name, t).truncate()),
-            )
-            .child(el().w(44.0).child(ui_label(r.dir, t)))
-            .child(el().w(96.0).child(mono_cell(IoPortRow::cell(&r.site), t)))
-            .child(
-                el().w(128.0)
-                    .child(pin_trigger(&r.name, IoPortRow::cell(&r.package_pin), t)),
-            )
-            .child(
-                el().w(96.0)
-                    .child(mono_cell(IoPortRow::cell(&r.iostandard), t)),
-            )
-            .child(el().w(56.0).child(mono_cell(IoPortRow::cell(&r.drive), t)))
-            .child(el().w(56.0).child(mono_cell(IoPortRow::cell(&r.slew), t)))
-            .child(
-                el().w(72.0)
-                    .child(mono_cell(IoPortRow::cell(&r.pulltype), t)),
-            )
-            .child(
-                el().w(64.0)
-                    .child(mono_cell(IoPortRow::cell(&r.diff_term), t)),
-            )
-            .child(
-                el().w(96.0)
-                    .child(mono_cell(IoPortRow::cell(&r.in_term), t)),
-            );
-        if sel {
-            line = line.fill(t.selection);
-        }
-        body = body.child(line);
-    }
+        .fill(t.header_bg)
+        .child(crate::views::cad::tab(
+            "device-tab-io",
+            &format!("I/O Ports ({ports})"),
+            s.device.bottom == DeviceBottom::IoPorts,
+            t,
+            |s: &mut AppState| s.device.bottom = DeviceBottom::IoPorts,
+        ))
+        .child(crate::views::cad::tab(
+            "device-tab-pblocks",
+            &format!("Pblocks ({})", s.device.pblocks.len()),
+            s.device.bottom == DeviceBottom::Pblocks,
+            t,
+            |s: &mut AppState| s.device.bottom = DeviceBottom::Pblocks,
+        ));
     col()
-        .key("device-io-ports")
+        .key("device-bottom")
         .w_full()
-        .max_h(190.0)
+        .min_w(0.0)
         .fill(t.panel_bg)
         .border(1.0, t.border)
-        .child(
-            row()
-                .w_full()
-                .items_center()
-                .gap(8.0)
-                .px(8.0)
-                .py(4.0)
-                .child(ui_label("I/O Ports", t))
-                .child(dim_label(&format!("{} ports", rows.len()), t)),
-        )
-        .child(
-            col()
-                .w_full()
-                .max_h(156.0)
-                .scroll(rune::ScrollSpec {
-                    stick_bottom: false,
-                })
-                .child(body),
-        )
-}
-
-fn mono_cell(content: &str, t: &VivadoTheme) -> El {
-    text(content)
-        .font(VivadoTheme::FONT_MONO.mono())
-        .color(t.text)
-        .truncate()
-}
-
-/// Package Pin options: every IOB die site `(id, label)`, annotated with
-/// the owning port when one is assigned (old combo's `{pin} ({port})`).
-fn pin_options(s: &AppState) -> Vec<(String, String)> {
-    let (dev, _) = crate::live::live_device(s);
-    let rows = io_port_rows(s);
-    dev.iob_sites()
-        .map(|site| {
-            let id = site.id();
-            let owner = rows.iter().find_map(|r| {
-                if r.package_pin.as_deref() == Some(id.as_str())
-                    || r.site.as_deref() == Some(id.as_str())
-                {
-                    Some(r.name.clone())
-                } else {
-                    None
-                }
-            });
-            let label = owner
-                .map(|port| format!("{id} ({port})"))
-                .unwrap_or_else(|| id.clone());
-            (id, label)
+        .child(tabs)
+        .child(match s.device.bottom {
+            DeviceBottom::IoPorts => io_ports_table(s, t),
+            DeviceBottom::Pblocks => crate::views::device_floor::pblocks_table(s, t),
         })
-        .collect()
-}
-
-/// Apply a Package Pin pick: the same `set_property LOC` the old combo
-/// execs, then close the popover.
-fn choose_pin(s: &mut AppState, port: &str, site: &str) {
-    crate::tcl::eval_command(s, &format!("set_property LOC {site} {port}"));
-    s.device.io_pin_pop = None;
-    s.device.selected = Some(DeviceSel::Net(port.to_string()));
-}
-
-/// Package Pin combo trigger cell (built identically in the table and in
-/// [`push_device_pops`]; the popover anchors to its key).
-fn pin_trigger(port: &str, current: &str, t: &VivadoTheme) -> El {
-    let name = port.to_string();
-    el().key(format!("device-io-pin-{}", slug(port)))
-        .role("button")
-        .label(format!("Package pin for {port}, current {current}"))
-        .focusable(true)
-        .w_full()
-        .h(22.0)
-        .px(6.0)
-        .center_y()
-        .fill(t.panel_bg)
-        .border(1.0, t.border)
-        .radius(4.0)
-        .hover(t.selection)
-        .on_press(move |s: &mut AppState| {
-            s.device.io_pin_pop = if s.device.io_pin_pop.as_deref() == Some(&name) {
-                None
-            } else {
-                Some(name.clone())
-            };
-        })
-        .child(
-            row()
-                .w_full()
-                .items_center()
-                .justify_between()
-                .gap(4.0)
-                .child(mono_cell(current, t).grow(1.0).min_w(0.0))
-                .child(
-                    icon(&glyphs::CHEVRON_DOWN, 12.0)
-                        .color(t.text_dim)
-                        .a11y_hidden(),
-                ),
-        )
-}
-
-/// Push the open Package Pin popover (called with the overlay layer from
-/// the root view; the trigger cell lives in [`io_ports_table`]).
-pub fn push_device_pops(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme) {
-    let Some(port) = s.device.io_pin_pop.clone() else {
-        return;
-    };
-    let kit = t.kit();
-    let options = pin_options(s);
-    let current = io_port_rows(s)
-        .iter()
-        .find(|r| r.name == port)
-        .and_then(|r| r.package_pin.clone())
-        .unwrap_or_else(|| "- set site -".to_string());
-    let mut opts = col().w_full().gap(0.0);
-    for (j, (id, label)) in options.iter().enumerate() {
-        let site = id.clone();
-        let name = port.clone();
-        let mut opt_row = el()
-            .key(format!("device-io-pin-opt-{j}"))
-            .role("button")
-            .label(format!("Choose {label}"))
-            .focusable(true)
-            .w_full()
-            .h(24.0)
-            .px(8.0)
-            .center_y()
-            .hover(t.selection)
-            .on_press(move |s: &mut AppState| choose_pin(s, &name, &site))
-            .child(mono_cell(label, t));
-        if label == &current || id == &current {
-            opt_row = opt_row.fill(t.selection);
-        }
-        opts = opts.child(opt_row);
-    }
-    // Anchor to the trigger already mounted in the table. A second trigger
-    // built here would never mount (its keyed anchor wrapper is dropped),
-    // leaving the list unanchored at the window corner.
-    let pop = format!("device-io-pin-pop-{}", slug(&port));
-    let anchor = format!("device-io-pin-{}", slug(&port));
-    let content = col()
-        .key(format!("{pop}-content"))
-        .role("dialog")
-        .label(format!("Package pin for {port}"))
-        .focus_return(&anchor)
-        .min_w(220.0)
-        .max_w(320.0)
-        .child(
-            col()
-                .key("body")
-                .padding(4.0)
-                .shrink()
-                .min_h(0.0)
-                .child(rune_kit::popover::fit_scroll(opts)),
-        );
-    layer.push(rune_kit::scrim(
-        format!("{pop}-scrim"),
-        |s: &mut AppState| s.device.io_pin_pop = None,
-    ));
-    layer.push(rune_kit::popover::anchored(
-        &kit,
-        rune_kit::popover::raised(&kit, content, kit.radius.md),
-        &anchor,
-        rune_kit::Placement::BottomStart,
-        4.0,
-    ));
 }
 
 pub fn device_pane(s: &AppState, t: &VivadoTheme) -> El {
     let geom = live_geom(s);
     let live = live_netlist(s);
     let placed = live_placed(s);
+    // The find list gives up height first, so the inspector (and its
+    // Locate link) always fits when the bottom tabs take space.
     let mut right = col().w(RIGHT_W).h_full().gap(6.0).min_h(0.0);
     if s.device.find_open {
         right = right.child(find_palette(s, t, live.as_ref(), placed.as_ref()));
@@ -1886,6 +1239,7 @@ pub fn device_pane(s: &AppState, t: &VivadoTheme) -> El {
         .grow(1.0)
         .h_full()
         .min_h(0.0)
+        .min_w(0.0)
         .fill(t.panel_bg)
         .border(1.0, t.border)
         .child(pane_header("Device", "device-pane", t))
@@ -1909,7 +1263,7 @@ pub fn device_pane(s: &AppState, t: &VivadoTheme) -> El {
                 .child(package_pane(s, t))
                 .child(right),
         })
-        .child(io_ports_table(s, t))
+        .child(bottom_panel(s, t))
         .child(device_status(s, t, &geom, live.as_ref(), placed.as_ref()))
 }
 
@@ -1947,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn layers_gate_cells_and_nets_but_never_regions() {
+    fn layers_gate_cells_and_nets() {
         let mut st = DeviceState::default();
         assert!(st.cell_visible());
         assert!(!st.net_visible());
@@ -1957,12 +1311,9 @@ mod tests {
         assert!(!st.cell_visible());
         assert!(st.net_visible());
         assert!(
-            !LayerId::Regions.enabled(),
-            "regions stay disabled: no HAD region table"
+            LayerId::ALL.iter().all(|l| !l.label().contains("region")),
+            "no clock-region layer: the HAD model has no region table"
         );
-        assert!(LayerId::Regions.disabled_reason().is_some());
-        LayerId::Regions.toggle(&mut st.layers);
-        assert!(!st.layers.regions, "disabled toggle must be a no-op");
     }
 
     #[test]
@@ -1971,7 +1322,7 @@ mod tests {
         assert_eq!(st.zoom_label(), "100%");
         st.zoom_in();
         assert_eq!(st.zoom_label(), "125%");
-        st.zoom_fit();
+        st.zoom_out();
         assert_eq!(st.zoom_label(), "100%");
     }
 
@@ -2018,314 +1369,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn io_port_rows_empty_without_design() {
-        let s = init();
-        assert!(io_port_rows(&s).is_empty(), "no design means no port rows");
-    }
-
-    #[test]
-    fn io_port_rows_map_ports_sites_and_props() {
-        let mut s = device_state();
-        let rows = io_port_rows(&s);
-        assert_eq!(rows.len(), 4, "fixture has 4 top ports: {rows:?}");
-        assert_eq!(rows[0].name, "clk");
-        assert_eq!(rows[0].dir, "IN");
-        assert_eq!(rows[3].name, "divclk");
-        assert_eq!(rows[3].dir, "OUT");
-        for r in &rows {
-            if let Some(site) = r.site.as_deref() {
-                assert!(
-                    site.starts_with("IOB_"),
-                    "placed ports map to IOB sites: {r:?}"
-                );
-                assert!(r.iob_cell.is_some(), "sites keep the IOB cell: {r:?}");
-            }
-            assert_eq!(r.package_pin, None, "no LOC yet: {r:?}");
-        }
-        assert!(
-            rows.iter().any(|r| r.site.is_some()),
-            "outputs must map to placed IOBs: {rows:?}"
-        );
-        let seg = rows.iter().find(|r| r.name == "seg").unwrap();
-        assert_eq!(seg.site.as_deref(), Some("IOB_X2Y0"));
-        assert_eq!(seg.iob_cell.as_deref(), Some("u_iob"));
-        let div = rows.iter().find(|r| r.name == "divclk").unwrap();
-        assert_eq!(div.site.as_deref(), Some("IOB_X3Y0"));
-        assert_eq!(div.iob_cell.as_deref(), Some("u_div_u_iob"));
-        for name in ["clk", "rst"] {
-            let r = rows.iter().find(|r| r.name == name).unwrap();
-            assert_eq!(r.site, None, "unmapped inputs stay honest: {r:?}");
-        }
-        s.runs
-            .live_design
-            .as_mut()
-            .unwrap()
-            .set_loc("clk", "IOB_X0Y0")
-            .unwrap();
-        s.runs
-            .live_design
-            .as_mut()
-            .unwrap()
-            .set_iostandard("clk", "LVCMOS33")
-            .unwrap();
-        let rows = io_port_rows(&s);
-        assert_eq!(rows[0].package_pin.as_deref(), Some("IOB_X0Y0"));
-        assert_eq!(rows[0].iostandard.as_deref(), Some("LVCMOS33"));
-    }
-
-    #[test]
-    fn io_row_tap_cross_probes_the_placed_iob() {
-        let mut rt = harness_with(device_state());
-        rt.frame(0.0);
-        assert!(rt.find("device-io-ports").is_some());
-        assert!(rt.find("device-io-head").is_some());
-        assert!(rt.find("device-io-row-3").is_some());
-        tap(&mut rt, "device-io-row-3");
-        assert!(
-            matches!(rt.state.device.selected, Some(DeviceSel::Cell(_))),
-            "tap must select the placed IOB cell: {:?}",
-            rt.state.device.selected
-        );
-    }
-
-    #[test]
-    fn pin_popover_anchors_to_its_table_trigger() {
-        let mut rt = harness_with(device_state());
-        rt.frame(0.0);
-        tap(&mut rt, "device-io-pin-clk");
-        for _ in 0..8 {
-            rt.frame(1.0 / 60.0);
-        }
-        let (trigger, _) = rt.presented("device-io-pin-clk").expect("trigger rect");
-        let (content, _) = rt
-            .presented("device-io-pin-pop-clk-content")
-            .expect("content rect");
-        // The I/O table sits near the window bottom, so the long site list
-        // flips above its trigger; either fitted side must stay adjacent.
-        let below = content[1] >= trigger[1] + trigger[3] - 1.0;
-        let above = content[1] + content[3] <= trigger[1] + 1.0;
-        assert!(
-            below || above,
-            "content must hug its trigger: trigger {trigger:?} content {content:?}"
-        );
-        assert!(
-            (content[0] - trigger[0]).abs() < 2.0,
-            "content must align to the trigger start: trigger {trigger:?} content {content:?}"
-        );
-    }
-
-    #[test]
-    fn pin_combo_pick_sets_loc_and_shows_it() {
-        let mut rt = harness_with(device_state());
-        rt.frame(0.0);
-        tap(&mut rt, "device-io-pin-clk");
-        assert_eq!(rt.state.device.io_pin_pop.as_deref(), Some("clk"));
-        assert!(
-            rt.find("device-io-pin-opt-0").is_some(),
-            "pin options must pop over"
-        );
-        tap(&mut rt, "device-io-pin-opt-0");
-        assert_eq!(rt.state.device.io_pin_pop, None, "pick closes the pop");
-        assert_eq!(
-            rt.state.device.selected,
-            Some(DeviceSel::Net("clk".into())),
-            "a pin pick cross-probes the assigned port"
-        );
-        let rows = io_port_rows(&rt.state);
-        let clk = rows.iter().find(|r| r.name == "clk").unwrap();
-        assert!(
-            clk.package_pin
-                .as_deref()
-                .is_some_and(|p| p.starts_with("IOB_")),
-            "pick must set LOC on the port: {clk:?}"
-        );
-        assert!(
-            rt.state
-                .console
-                .lines
-                .iter()
-                .any(|l| l.text.starts_with("set_property LOC IOB_")),
-            "pick must echo its Tcl verb"
-        );
-        assert!(
-            rt.state
-                .console
-                .lines
-                .iter()
-                .any(|l| l.text.starts_with("set_property PACKAGE_PIN IOB_")
-                    && l.text.contains(" replaced=")),
-            "PACKAGE_PIN must report its placement outcome, not repeat the verb: {:?}",
-            rt.state
-                .console
-                .lines
-                .iter()
-                .map(|l| &l.text)
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn package_pins_cover_every_had_iob_with_bank_occupancy() {
-        let mut s = device_state();
-        let (dev, part) = crate::live::live_device(&s);
-        let (grid, pins) = package_pins(&s);
-        let n = dev.iob_sites().count();
-        assert!(n > 1, "HAD must list real IOB sites");
-        assert_eq!(pins.len(), n, "drawing pins are HAD IOB sites");
-        assert_eq!(grid.part, part);
-        assert_eq!(grid.cols * grid.rows, n as u32, "cells are the IOB box");
-        for p in &pins {
-            assert!(
-                dev.iob_major(p.x, p.y).is_some(),
-                "{} is not a HAD IOB site",
-                p.pin
-            );
-            assert_eq!(p.pin, format!("IOB_X{}Y{}", p.x, p.y));
-            assert_eq!(p.bank, p.x.saturating_sub(grid.x0) / 8, "8 pins/bank");
-        }
-        let owner = |pin: &str| {
-            pins.iter()
-                .find(|p| p.pin == pin)
-                .and_then(|p| p.port.clone())
-        };
-        assert_eq!(owner("IOB_X2Y0").as_deref(), Some("seg"));
-        assert_eq!(owner("IOB_X3Y0").as_deref(), Some("divclk"));
-        let free = pins
-            .iter()
-            .find(|p| p.port.is_none())
-            .expect("fixture leaves unassigned pins")
-            .pin
-            .clone();
-        crate::tcl::eval_command(&mut s, &format!("set_property LOC {free} rst"));
-        let pins = package_pins(&s).1;
-        assert_eq!(
-            pins.iter()
-                .find(|p| p.pin == free)
-                .and_then(|p| p.port.as_deref()),
-            Some("rst"),
-            "LOC constraints join the occupancy map"
-        );
-        assert!(
-            s.console.lines.iter().any(|l| l.text
-                == format!("set_property PACKAGE_PIN {free} rst loc={free} replaced=1 rerouted=0")),
-            "loc= must name this port's site/constraint: {:?}",
-            s.console.lines.iter().map(|l| &l.text).collect::<Vec<_>>()
-        );
-        let dump = package_grid_text(&s);
-        assert!(dump.contains(&format!("pins={n} assigned=3")), "{dump}");
-        assert!(dump.contains(&format!("{free}=rst")), "{dump}");
-        assert!(dump.contains("map="), "{dump}");
-    }
-
-    #[test]
-    fn package_view_toggle_mounts_grid_and_selects_ports() {
-        let mut rt = harness_with(device_state());
-        rt.frame(0.0);
-        assert!(rt.find("device-canvas").is_some());
-        assert!(rt.find("device-package").is_none());
-        tap(&mut rt, "device-view-package");
-        assert_eq!(rt.state.device.view, DeviceView::Package);
-        for key in [
-            "device-package",
-            "device-package-summary",
-            "device-package-legend",
-            "device-package-legend-bank-0",
-            "device-package-grid",
-            "device-package-pin-iob-x2y0",
-        ] {
-            assert!(rt.find(key).is_some(), "missing key: {key}");
-        }
-        assert!(rt.find("device-canvas").is_none(), "package replaces die");
-        assert!(rt.find("device-layers").is_none(), "no die layers here");
-        assert!(
-            rt.find("device-zoom-label").is_none(),
-            "package needs no die zoom"
-        );
-        tap(&mut rt, "device-package-pin-iob-x2y0");
-        assert_eq!(
-            rt.state.device.selected,
-            Some(DeviceSel::Net("seg".into())),
-            "assigned pins cross-select the port"
-        );
-        assert!(
-            rt.state
-                .console
-                .lines
-                .iter()
-                .any(|l| l.text.contains("package_pin IOB_X2Y0 port=seg")),
-            "pin taps route through select_package_pin: {:?}",
-            rt.state
-                .console
-                .lines
-                .iter()
-                .map(|l| &l.text)
-                .collect::<Vec<_>>()
-        );
-        tap(&mut rt, "device-view-die");
-        assert_eq!(rt.state.device.view, DeviceView::Die);
-        assert!(rt.find("device-canvas").is_some());
-        assert!(rt.find("device-zoom-label").is_some());
-        assert!(rt.find("device-package").is_none());
-    }
-
-    #[test]
-    fn package_empty_pin_assigns_the_selected_port() {
-        let mut rt = harness_with(device_state());
-        rt.frame(0.0);
-        tap(&mut rt, "device-view-package");
-        tap(&mut rt, "device-io-row-0");
-        assert_eq!(
-            rt.state.device.selected,
-            Some(DeviceSel::Net("clk".into())),
-            "row tap chooses the assignment target"
-        );
-        assert!(rt.find("device-package-assigning").is_some());
-        let free = package_pins(&rt.state)
-            .1
-            .into_iter()
-            .find(|p| p.port.is_none())
-            .expect("fixture leaves unassigned pins")
-            .pin;
-        let key = package_pin_key(&free);
-        tap(&mut rt, &key);
-        assert_eq!(
-            package_pin(&rt.state, &free).and_then(|p| p.port),
-            Some("clk".to_string()),
-            "empty package taps bind the selected port: pin={free} key={key} selected={:?} console={:?}",
-            rt.state.device.selected,
-            rt.state
-                .console
-                .lines
-                .iter()
-                .map(|l| &l.text)
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            rt.state
-                .console
-                .lines
-                .iter()
-                .any(|l| l.text == format!("set_property PACKAGE_PIN {free} [get_ports clk]")),
-            "assignment must use the real verb: {:?}",
-            rt.state
-                .console
-                .lines
-                .iter()
-                .map(|l| &l.text)
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn io_table_is_honestly_empty_without_design() {
-        let mut s = init();
-        s.center = crate::state::CenterPane::Device;
-        let mut rt = harness_with(s);
-        rt.frame(0.0);
-        assert!(rt.find("device-io-empty").is_some());
-        assert!(rt.find("device-io-row-0").is_none());
-    }
 
     #[test]
     fn device_tree_exposes_toolbar_layers_canvas_find_and_inspector() {
@@ -2342,11 +1385,10 @@ mod tests {
             "device-view-package",
             "device-find-toggle",
             "device-layers",
-            "device-layer-sites",
+            "device-layer-clb",
             "device-layer-cells",
             "device-layer-nets",
-            "device-layer-regions",
-            "device-canvas",
+                        "device-canvas",
             "device-cell-u-div-u-ff0",
             "device-cell-u-ff0",
             "device-die-label",
@@ -2512,6 +1554,13 @@ mod tests {
         tap(&mut rt, "device-zoom-in");
         assert!(rt.state.device.zoom > 1.5);
         tap(&mut rt, "device-zoom-fit");
-        assert_eq!(rt.state.device.zoom, 1.0);
+        let geom = live_geom(&rt.state);
+        let [vw, vh] = rt.state.device.viewport;
+        let z = rt.state.device.zoom;
+        assert!(vw > 100.0 && vh > 100.0, "canvas reports its viewport");
+        assert!(
+            world_w(&geom) * z <= vw + 0.5 && world_h(&geom) * z <= vh + 0.5,
+            "fit shows the whole die"
+        );
     }
 }

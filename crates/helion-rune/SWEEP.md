@@ -14,8 +14,8 @@ with tests, keep `cargo test -p helion-rune` green, rebuild + relaunch.
 | `welcome.rs` | `views/start.rs` | DONE — launcher, recents, bundled example; boot lands here |
 | `dashboard.rs` | `views/summary.rs` | DONE — run history, worst endpoints, real Run Implementation |
 | `constraints_wizard*` | `views/dialogs.rs`, `views/constraints.rs` | PARTIAL — Constraints pane DONE; wizard still single-row per kind |
-| `physview*` | `views/device.rs` | PARTIAL — die/package/I-O/find; no heat maps, pblocks, ruler |
-| `schem_lod.rs` / schematic | `views/schematic.rs` | PARTIAL — no fan-in/out cones, no expand-cone |
+| `physview*` | `views/device*.rs` | DONE — site-kind layers, congestion/criticality heat, pblocks overlay + table, rulers, canvas keys, I/O quick-set; no clock regions (HAD has no region table) |
+| `schem_lod.rs` / schematic | `views/schematic*.rs` | DONE — fan-in/out cones (hops, stop-at-FF), expand/collapse cone + inside, selection history, Fit, sheet find, Mark Debug/Add Probe |
 | `power.rs` | `views/reports.rs`, `analysis.rs` | PARTIAL — vectorless rails/blocks DONE; VCD power not ported |
 | `qor.rs` | `views/reports.rs` | DONE (helion-proj QoR engine) |
 | `ila.rs` | `helion-verif`, `views/ila*.rs` | DONE |
@@ -29,9 +29,8 @@ with tests, keep `cargo test -p helion-rune` green, rebuild + relaunch.
 
 ## Remaining gaps
 
-- Schematic: fan-in/fan-out cones (stop-at-FF, hops), expand/collapse cone.
-- Device: congestion/criticality heat maps, pblock and clock-region tables,
-  ruler; I/O quick-set rows (IOSTANDARD/DRIVE/SLEW...).
+- Device: pblocks are floorplan constraints only (runs do not place into
+  them yet); no clock-region layer/table (no HAD region model).
 - Design Runs: ECO changes table (runs keep no persistent session; the
   console `eco` verb covers the backend's single ECO).
 - Constraints wizard: multi-row steps, generated clocks, write-to-disk +
@@ -129,3 +128,13 @@ with tests, keep `cargo test -p helion-rune` green, rebuild + relaunch.
   Find Results) and verification (helion-verif ILA + testbench runner, sim
   settings, honest wave pane). Implementation strategy presets drive the
   run worker. 401 lib + 41 snap + 32 helion-verif green.
+- Pass 10 (physical): Schematic cones (`expand_fanin_cone`,
+  `expand_fanout_cone`, `expand_cone`, `collapse_cone`, `expand_inside`,
+  `collapse_inside`, `schematic_previous/next`, `schematic_zoom_fit`) with a
+  Name/Type/Hops results strip, find, history, Mark Debug/Add Probe. Device
+  layers split by site kind, routed congestion + STA criticality heat maps,
+  pblocks (`create_pblock`, `resize_pblock`, `add_cells_to_pblock`,
+  `get_pblocks`, `report_pblocks`, `select_pblock`; persisted to the open
+  `.prj`), rulers, canvas keys, Zoom to Selection, real Fit, I/O quick-set
+  and Placed/Objects columns. Scenes `schematic-cone`, `device-heat`,
+  `device-pblocks`, `device-io-quickset`.
