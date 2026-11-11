@@ -2,3 +2,8 @@
 board = "HB1"
 part = "HL10T-C32-1"
 cables = "sim,ofl,native,usb,mpsse-sim"
+description = "Helion HB1 bring-up board (HL10T-C32-1)"
+# Board-wired pins: the 100 MHz oscillator and the user LED, at the sites the
+# bundled examples (blinky/pico/ibex/serv) constrain.
+pin.clk = "IOB_X3Y0 LVCMOS33 100MHz"
+pin.led = "IOB_X2Y0 LVCMOS33"
