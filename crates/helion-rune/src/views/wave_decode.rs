@@ -14,10 +14,10 @@
 //! per-trace "Protocol:" menu).
 
 use helion_verif::wave::{
-    AxiLiteSignals, DecodedLane, SpanKind, SpiConfig, best_name_group, decode_axi_lite,
-    decode_fsm, decode_spi, decode_uart, estimate_bit_period, fsm_name_groups,
+    AxiLiteSignals, DecodedLane, SpanKind, SpiConfig, best_name_group, decode_axi_lite, decode_fsm,
+    decode_spi, decode_uart, estimate_bit_period, fsm_name_groups,
 };
-use rune::{El, Shape, ScrollSpec, canvas, col, el, icon, row, text};
+use rune::{El, ScrollSpec, Shape, canvas, col, el, icon, row, text};
 use rune_kit::glyphs;
 
 use crate::state::{AppState, ConsoleLine, MsgSev};
@@ -102,8 +102,16 @@ const SPI_ROLES: &[Role] = &[
     r("MISO", true, &["miso", "cipo", "sdo"]),
     r("CS_N", true, &["cs_n", "csn", "cs", "ss_n", "ss", "ssn"]),
 ];
-const UART_ROLES: &[Role] = &[r("LINE", true, &["tx", "rx", "txd", "rxd", "uart_tx", "uart_rx"])];
-const FSM_ROLES: &[Role] = &[r("STATE", false, &["state", "fsm", "state_q", "cur_state", "st"])];
+const UART_ROLES: &[Role] = &[r(
+    "LINE",
+    true,
+    &["tx", "rx", "txd", "rxd", "uart_tx", "uart_rx"],
+)];
+const FSM_ROLES: &[Role] = &[r(
+    "STATE",
+    false,
+    &["state", "fsm", "state_q", "cur_state", "st"],
+)];
 const AXI_ROLES: &[Role] = &[
     r("ACLK", true, &["aclk"]),
     r("AWVALID", true, &["awvalid"]),
@@ -285,7 +293,9 @@ impl WaveState {
             }
             DecoderKind::Fsm => {
                 let name = d.inputs[0].as_deref().ok_or("Map STATE to decode")?;
-                let t = self.trace_named(name).ok_or("STATE trace is not in this run")?;
+                let t = self
+                    .trace_named(name)
+                    .ok_or("STATE trace is not in this run")?;
                 Ok(vec![decode_fsm(&t.samples, t.width, &d.fsm_names)])
             }
             DecoderKind::AxiLite => {
@@ -387,7 +397,13 @@ fn span_color(kind: SpanKind, t: &VivadoTheme) -> rune::Color {
 }
 
 /// Name-column row of a decoded lane (`SPI #1 · MOSI`, span count).
-pub fn decoded_name_row(key: String, title: &str, lane: &DecodedLane, h: f32, t: &VivadoTheme) -> El {
+pub fn decoded_name_row(
+    key: String,
+    title: &str,
+    lane: &DecodedLane,
+    h: f32,
+    t: &VivadoTheme,
+) -> El {
     let count = lane.spans.len().to_string();
     row()
         .key(key)
@@ -418,22 +434,16 @@ pub fn decoded_name_row(key: String, title: &str, lane: &DecodedLane, h: f32, t:
                 } else {
                     format!("{count} spans")
                 })
-                    .font(crate::views::cad::FONT_PIN)
-                    .color(t.text_faint)
-                    .truncate(),
+                .font(crate::views::cad::FONT_PIN)
+                .color(t.text_faint)
+                .truncate(),
             ),
         )
 }
 
 /// Decoded lane on the sheet: hexagon spans (one canvas) plus labels on
 /// spans wide enough to hold them; narrow spans carry no label element.
-pub fn decoded_lane(
-    s: &AppState,
-    key: String,
-    lane: &DecodedLane,
-    h: f32,
-    t: &VivadoTheme,
-) -> El {
+pub fn decoded_lane(s: &AppState, key: String, lane: &DecodedLane, h: f32, t: &VivadoTheme) -> El {
     let pps = s.wave.pps();
     let mut shape = Shape::new();
     let (top, bot, mid) = (3.0, h - 3.0, h / 2.0);
@@ -473,7 +483,11 @@ pub fn decoded_lane(
     let mut l = el()
         .key(key)
         .role("img")
-        .label(format!("{} decoded lane, {} spans", lane.name, lane.spans.len()))
+        .label(format!(
+            "{} decoded lane, {} spans",
+            lane.name,
+            lane.spans.len()
+        ))
         .w(s.wave.sheet_w())
         .h(h)
         .fill(t.panel_bg)
@@ -518,8 +532,16 @@ fn edit(s: &mut AppState, id: usize, f: impl Fn(&mut Decoder)) {
     }
 }
 
-fn small_btn(key: String, label: &str, t: &VivadoTheme, reason: Option<&str>, f: impl Fn(&mut AppState) + 'static) -> El {
-    crate::views::cad::btn(key, label, t, reason, f).h(20.0).px(6.0)
+fn small_btn(
+    key: String,
+    label: &str,
+    t: &VivadoTheme,
+    reason: Option<&str>,
+    f: impl Fn(&mut AppState) + 'static,
+) -> El {
+    crate::views::cad::btn(key, label, t, reason, f)
+        .h(20.0)
+        .px(6.0)
 }
 
 fn role_trigger(d: &Decoder, k: usize, role: &Role, t: &VivadoTheme) -> El {
@@ -557,13 +579,21 @@ fn role_trigger(d: &Decoder, k: usize, role: &Role, t: &VivadoTheme) -> El {
                 .child(
                     text(current.clone())
                         .font(VivadoTheme::FONT_MONO)
-                        .color(if d.inputs[k].is_some() { t.text } else { t.text_faint })
+                        .color(if d.inputs[k].is_some() {
+                            t.text
+                        } else {
+                            t.text_faint
+                        })
                         .grow(1.0)
                         .min_w(0.0)
                         .truncate()
                         .help_when_truncated(full),
                 )
-                .child(icon(&glyphs::CHEVRON_DOWN, 10.0).color(t.text_dim).a11y_hidden()),
+                .child(
+                    icon(&glyphs::CHEVRON_DOWN, 10.0)
+                        .color(t.text_dim)
+                        .a11y_hidden(),
+                ),
         )
 }
 
@@ -591,7 +621,11 @@ fn decoder_card(s: &AppState, k: usize, d: &Decoder, t: &VivadoTheme) -> El {
         Ok(lanes) => {
             let n: usize = lanes.iter().map(|l| l.spans.len()).sum();
             (
-                if n == 1 { "1 span".into() } else { format!("{n} spans") },
+                if n == 1 {
+                    "1 span".into()
+                } else {
+                    format!("{n} spans")
+                },
                 t.pass,
             )
         }
@@ -633,11 +667,19 @@ fn decoder_card(s: &AppState, k: usize, d: &Decoder, t: &VivadoTheme) -> El {
                 ),
         );
     for (r, role) in d.kind.roles().iter().enumerate() {
-        card = card.child(opt_row(&format!("wave-dec-{id}-row-{r}"), role.label, t).child(role_trigger(d, r, role, t)));
+        card = card.child(
+            opt_row(&format!("wave-dec-{id}-row-{r}"), role.label, t)
+                .child(role_trigger(d, r, role, t)),
+        );
     }
     match d.kind {
         DecoderKind::Spi => {
-            let mut modes = row().key(format!("wave-dec-{id}-mode")).role("radiogroup").label("SPI mode").h(20.0).border(1.0, t.border);
+            let mut modes = row()
+                .key(format!("wave-dec-{id}-mode"))
+                .role("radiogroup")
+                .label("SPI mode")
+                .h(20.0)
+                .border(1.0, t.border);
             for m in 0..4u8 {
                 let on = d.spi_mode == m;
                 modes = modes.child(
@@ -660,9 +702,29 @@ fn decoder_card(s: &AppState, k: usize, d: &Decoder, t: &VivadoTheme) -> El {
                 .child(opt_row(&format!("wave-dec-{id}-opt-mode"), "Mode", t).child(modes))
                 .child(
                     opt_row(&format!("wave-dec-{id}-opt-bits"), "Bits", t)
-                        .child(small_btn(format!("wave-dec-{id}-bits-dec"), "−", t, (bits <= 1).then_some("At least 1 bit"), move |s| edit(s, id, |d| d.spi_bits = d.spi_bits.saturating_sub(1).max(1))))
-                        .child(el().w(28.0).center().child(text(bits.to_string()).font(VivadoTheme::FONT_MONO).color(t.text)))
-                        .child(small_btn(format!("wave-dec-{id}-bits-inc"), "+", t, (bits >= 32).then_some("At most 32 bits"), move |s| edit(s, id, |d| d.spi_bits = (d.spi_bits + 1).min(32)))),
+                        .child(small_btn(
+                            format!("wave-dec-{id}-bits-dec"),
+                            "−",
+                            t,
+                            (bits <= 1).then_some("At least 1 bit"),
+                            move |s| {
+                                edit(s, id, |d| d.spi_bits = d.spi_bits.saturating_sub(1).max(1))
+                            },
+                        ))
+                        .child(
+                            el().w(28.0).center().child(
+                                text(bits.to_string())
+                                    .font(VivadoTheme::FONT_MONO)
+                                    .color(t.text),
+                            ),
+                        )
+                        .child(small_btn(
+                            format!("wave-dec-{id}-bits-inc"),
+                            "+",
+                            t,
+                            (bits >= 32).then_some("At most 32 bits"),
+                            move |s| edit(s, id, |d| d.spi_bits = (d.spi_bits + 1).min(32)),
+                        )),
                 );
         }
         DecoderKind::Uart => {
@@ -678,10 +740,43 @@ fn decoder_card(s: &AppState, k: usize, d: &Decoder, t: &VivadoTheme) -> El {
             let cur = d.uart_period.or(auto);
             card = card.child(
                 opt_row(&format!("wave-dec-{id}-opt-period"), "Bit period", t)
-                    .child(small_btn(format!("wave-dec-{id}-period-dec"), "−", t, cur.is_none_or(|p| p <= 1).then_some("No shorter bit period"), move |s| edit(s, id, move |d| d.uart_period = cur.map(|p| p.saturating_sub(1).max(1)))))
-                    .child(el().key(format!("wave-dec-{id}-period")).w(72.0).center().child(text(shown).font(VivadoTheme::FONT_MONO).color(t.text).truncate()))
-                    .child(small_btn(format!("wave-dec-{id}-period-inc"), "+", t, cur.is_none().then_some("Map LINE first"), move |s| edit(s, id, move |d| d.uart_period = cur.map(|p| p + 1))))
-                    .child(small_btn(format!("wave-dec-{id}-period-auto"), "Auto", t, d.uart_period.is_none().then_some("Already auto-baud"), move |s| edit(s, id, |d| d.uart_period = None))),
+                    .child(small_btn(
+                        format!("wave-dec-{id}-period-dec"),
+                        "−",
+                        t,
+                        cur.is_none_or(|p| p <= 1)
+                            .then_some("No shorter bit period"),
+                        move |s| {
+                            edit(s, id, move |d| {
+                                d.uart_period = cur.map(|p| p.saturating_sub(1).max(1))
+                            })
+                        },
+                    ))
+                    .child(
+                        el().key(format!("wave-dec-{id}-period"))
+                            .w(72.0)
+                            .center()
+                            .child(
+                                text(shown)
+                                    .font(VivadoTheme::FONT_MONO)
+                                    .color(t.text)
+                                    .truncate(),
+                            ),
+                    )
+                    .child(small_btn(
+                        format!("wave-dec-{id}-period-inc"),
+                        "+",
+                        t,
+                        cur.is_none().then_some("Map LINE first"),
+                        move |s| edit(s, id, move |d| d.uart_period = cur.map(|p| p + 1)),
+                    ))
+                    .child(small_btn(
+                        format!("wave-dec-{id}-period-auto"),
+                        "Auto",
+                        t,
+                        d.uart_period.is_none().then_some("Already auto-baud"),
+                        move |s| edit(s, id, |d| d.uart_period = None),
+                    )),
             );
         }
         DecoderKind::Fsm => {
@@ -741,7 +836,11 @@ pub fn decoder_panel(s: &AppState, t: &VivadoTheme) -> El {
                 .px(6.0)
                 .items_center()
                 .fill(t.header_bg)
-                .child(text("Protocol Decoders").font(VivadoTheme::FONT_TITLE).color(t.text))
+                .child(
+                    text("Protocol Decoders")
+                        .font(VivadoTheme::FONT_TITLE)
+                        .color(t.text),
+                )
                 .child(el().grow(1.0))
                 .child(
                     el().key("wave-dec-close")
@@ -827,7 +926,13 @@ pub fn push_wave_pops(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme) {
                     s.wave.assign_role(id, k, pick.clone(), &hdl);
                     s.wave.decode.pick = None;
                     let sig = pick.clone().unwrap_or_else(|| "{}".into());
-                    echo(s, format!("set_wave_decoder_role {id} {} {sig}", role.label.to_lowercase()));
+                    echo(
+                        s,
+                        format!(
+                            "set_wave_decoder_role {id} {} {sig}",
+                            role.label.to_lowercase()
+                        ),
+                    );
                 })
                 .child(
                     text(label.clone())
@@ -854,9 +959,10 @@ pub fn push_wave_pops(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme) {
                 .min_h(0.0)
                 .child(rune_kit::popover::fit_scroll(opts)),
         );
-    layer.push(rune_kit::scrim("wave-dec-pick-scrim", |s: &mut AppState| {
-        s.wave.decode.pick = None
-    }));
+    layer.push(rune_kit::scrim(
+        "wave-dec-pick-scrim",
+        |s: &mut AppState| s.wave.decode.pick = None,
+    ));
     layer.push(rune_kit::popover::anchored(
         &kit,
         rune_kit::popover::raised(&kit, content, kit.radius.md),
@@ -924,7 +1030,10 @@ mod tests {
                 vec!["RD 0x0014 → 0x00001234".to_string()]
             ]
         );
-        assert_eq!(labels(&w, &d[1]), vec![vec!["0xA5", "0x3C"], vec!["0x5A", "0xC3"]]);
+        assert_eq!(
+            labels(&w, &d[1]),
+            vec![vec!["0xA5", "0x3C"], vec!["0x5A", "0xC3"]]
+        );
         assert_eq!(labels(&w, &d[2]), vec![vec!["0x4F 'O'", "0x4B 'K'"]]);
         assert_eq!(
             labels(&w, &d[3]),
@@ -947,7 +1056,13 @@ mod tests {
         let d = w.decode.decoders[0].clone();
         assert_eq!(w.run_decoder(&d), Err("Map SCLK to decode".into()));
         let id = w.add_decoder(DecoderKind::Fsm, "");
-        let d = w.decode.decoders.iter().find(|d| d.id == id).unwrap().clone();
+        let d = w
+            .decode
+            .decoders
+            .iter()
+            .find(|d| d.id == id)
+            .unwrap()
+            .clone();
         assert!(d.fsm_names.is_empty());
         assert_eq!(labels(&w, &d)[0][1], "INC 0x1");
     }
