@@ -333,6 +333,16 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         // The fixture's run toasts would cover the history table.
         s.toasts = state::ToastState::default();
     }),
+    ("ila", |s| {
+        s.center = state::CenterPane::Ila;
+        let _ = views::ila::seed_ila_fixture(s);
+    }),
+    ("ila-captured", |s| {
+        s.center = state::CenterPane::Ila;
+        if views::ila::seed_ila_fixture(s).is_ok() {
+            let _ = views::ila::capture_now(s);
+        }
+    }),
     ("debug", |s| {
         s.center = state::CenterPane::Debug;
         let _ = views::debug::seed_debug_fixture(s);
@@ -523,6 +533,7 @@ fn center_pane(s: &AppState, t: &VivadoTheme) -> El {
         state::CenterPane::Wave => views::wave::wave_pane(s, t),
         state::CenterPane::Sim => views::tb_view::sim_pane(s, t),
         state::CenterPane::Debug => views::debug::debug_pane(s, t),
+        state::CenterPane::Ila => views::ila_view::ila_pane(s, t),
         state::CenterPane::Program => views::program::program_pane(s, t),
         state::CenterPane::Reports => views::reports::reports_pane(s, t),
     }
@@ -602,10 +613,11 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
 pub fn poll_all(s: &mut AppState, t: f64, tx: &mut rune::Tx) -> bool {
     let runs_dirty = runs::poll(s, t, tx);
     let sim_dirty = views::tb::poll(s, t, tx);
+    let ila_dirty = views::ila::poll(s);
     // Safety net: out-of-band buffer swaps (project reseed clears tabs)
     // re-mirror the live edit field; a no-op when already synced.
     views::editor::sync_edit(s);
-    runs_dirty || sim_dirty
+    runs_dirty || sim_dirty || ila_dirty
 }
 
 pub fn app_spec() -> AppSpec<AppState> {

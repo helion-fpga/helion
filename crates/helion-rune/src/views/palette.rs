@@ -116,6 +116,7 @@ fn pane_label(pane: CenterPane) -> &'static str {
         CenterPane::Wave => "Waveform",
         CenterPane::Sim => "Simulation",
         CenterPane::Debug => "Debug",
+        CenterPane::Ila => "Logic Analyzer",
         CenterPane::Program => "Hardware Manager",
         CenterPane::Reports => "Reports",
     }
