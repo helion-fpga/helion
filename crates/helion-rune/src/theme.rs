@@ -97,6 +97,10 @@ pub struct VivadoTheme {
     pub code_comment: Color,
     /// Editor numeric-literal ink.
     pub code_number: Color,
+    /// Editor string-literal ink.
+    pub code_string: Color,
+    /// Editor type / system-task ink (`logic`, `std_logic`, `$display`).
+    pub code_type: Color,
     /// Start page "Quick Start" banner fill (Helion green).
     pub banner_quick: Color,
     /// Start page "Tasks" / "Learning Center" banner fill (Helion teal).
@@ -160,6 +164,8 @@ impl VivadoTheme {
             code_keyword: c("#569CD6"),
             code_comment: c("#6A9955"),
             code_number: c("#B5CEA8"),
+            code_string: c("#CE9178"),
+            code_type: c("#4EC9B0"),
             banner_quick: c("#2E7D32"),
             banner_teal: c("#14707F"),
             banner_ink: c("#FFFFFF"),
@@ -212,6 +218,8 @@ impl VivadoTheme {
             code_keyword: c("#7F0055"),
             code_comment: c("#6E6E6E"),
             code_number: c("#AF00DB"),
+            code_string: c("#A31515"),
+            code_type: c("#267F99"),
             banner_quick: c("#2E7D32"),
             banner_teal: c("#14707F"),
             banner_ink: c("#FFFFFF"),
@@ -293,6 +301,8 @@ mod tests {
             ("code_keyword", t.code_keyword),
             ("code_comment", t.code_comment),
             ("code_number", t.code_number),
+            ("code_string", t.code_string),
+            ("code_type", t.code_type),
             ("banner_quick", t.banner_quick),
             ("banner_teal", t.banner_teal),
             ("banner_ink", t.banner_ink),
@@ -384,6 +394,8 @@ mod tests {
             ("code_keyword", t.code_keyword),
             ("code_comment", t.code_comment),
             ("code_number", t.code_number),
+            ("code_string", t.code_string),
+            ("code_type", t.code_type),
             ("banner_quick", t.banner_quick),
             ("banner_teal", t.banner_teal),
             ("banner_ink", t.banner_ink),

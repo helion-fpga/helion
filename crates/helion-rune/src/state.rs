@@ -170,6 +170,8 @@ pub struct EditorState {
     pub find_open: bool,
     /// Find bar query (match stepping reads the active buffer).
     pub find_query: rune::TextEdit,
+    /// Find bar replacement text (Replace / Replace All).
+    pub replace_query: rune::TextEdit,
     /// Live text of the mirrored buffer: typing lands here, and tab
     /// switches/saves flush it back into the routed line buffer.
     pub edit: rune::TextEdit,
@@ -952,6 +954,7 @@ impl AppState {
                 paths: std::collections::HashMap::new(),
                 find_open: false,
                 find_query: rune::TextEdit::new(""),
+                replace_query: rune::TextEdit::new(""),
                 edit: rune::TextEdit::new(""),
                 edit_tab: None,
                 owners: [None, None, None],

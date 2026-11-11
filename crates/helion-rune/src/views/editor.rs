@@ -40,129 +40,31 @@ const LINE_H: f32 = 18.0;
 /// Gutter width: breakpoint slot plus 4-digit line numbers in the 12px mono face.
 const GUTTER_W: f32 = 58.0;
 
-/// Verilog keywords painted in the theme keyword color.
-const VERILOG_KEYWORDS: &[&str] = &[
-    "module",
-    "endmodule",
-    "input",
-    "output",
-    "inout",
-    "reg",
-    "wire",
-    "always",
-    "begin",
-    "end",
-    "if",
-    "else",
-    "posedge",
-    "negedge",
-    "parameter",
-    "localparam",
-    "assign",
-    "initial",
-    "forever",
-    "for",
-    "while",
-    "case",
-    "endcase",
-    "default",
-    "function",
-    "endfunction",
-    "task",
-    "endtask",
-    "generate",
-    "endgenerate",
-];
-
-/// XDC/Tcl command words painted as keywords on `.xdc` tabs.
-const XDC_KEYWORDS: &[&str] = &[
-    "set_property",
-    "create_clock",
-    "get_ports",
-    "get_cells",
-    "get_nets",
-    "set_input_delay",
-    "set_output_delay",
-    "current_design",
-];
-
-fn is_word_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_'
-}
-
-fn is_word_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
-}
-
-fn is_number_char(b: u8) -> bool {
-    matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' | b'x' | b'X' | b'z' | b'Z' | b'_' | b'\'')
-}
-
-/// Byte-range syntax spans for one code line.
-///
-/// `hash_comments` selects the `.xdc` dialect (`#` comments, Tcl keywords);
-/// otherwise Verilog (`//` comments, backtick directives, keywords). All
-/// boundaries sit on ASCII bytes, so multi-byte text can never split a span.
+/// Single-line spans (`hash_comments` = XDC/Tcl, else Verilog/SV). Kept for
+/// line-oriented callers; the editor field lexes the whole buffer with
+/// [`crate::views::highlight::highlight`].
 pub fn highlight_spans(line: &str, hash_comments: bool, t: &VivadoTheme) -> Vec<Span> {
-    let keywords = if hash_comments {
-        XDC_KEYWORDS
-    } else {
-        VERILOG_KEYWORDS
-    };
-    let bytes = line.as_bytes();
-    let mut spans = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        // Line comments run to end of line.
-        if !hash_comments && b == b'/' && bytes.get(i + 1) == Some(&b'/') {
-            spans.push(Span::new(i, bytes.len()).color(t.code_comment).italic());
-            break;
-        }
-        if hash_comments && b == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
-            spans.push(Span::new(i, bytes.len()).color(t.code_comment).italic());
-            break;
-        }
-        // Verilog compiler directives: `` `timescale `` etc.
-        if !hash_comments && b == b'`' {
-            let mut j = i + 1;
-            while j < bytes.len() && is_word_char(bytes[j]) {
-                j += 1;
-            }
-            if j > i + 1 {
-                spans.push(Span::new(i, j).color(t.code_keyword));
-                i = j;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-        // Keywords and identifiers.
-        if is_word_start(b) {
-            let mut j = i + 1;
-            while j < bytes.len() && is_word_char(bytes[j]) {
-                j += 1;
-            }
-            if keywords.contains(&&line[i..j]) {
-                spans.push(Span::new(i, j).color(t.code_keyword));
-            }
-            i = j;
-            continue;
-        }
-        // Numeric literals: sized (`24'd499999`) or plain, never identifiers
-        // that merely contain digits (must start with a digit or quote one).
-        if b.is_ascii_digit() {
-            let mut j = i + 1;
-            while j < bytes.len() && is_number_char(bytes[j]) {
-                j += 1;
-            }
-            spans.push(Span::new(i, j).color(t.code_number));
-            i = j;
-            continue;
-        }
-        i += 1;
-    }
-    spans
+    use crate::views::highlight::{Dialect, highlight_line};
+    highlight_line(
+        line,
+        if hash_comments {
+            Dialect::Tcl
+        } else {
+            Dialect::Verilog
+        },
+        t,
+    )
+}
+
+/// Dialect of the active tab.
+fn active_dialect(s: &AppState) -> crate::views::highlight::Dialect {
+    crate::views::highlight::Dialect::for_name(
+        s.editor
+            .tabs
+            .get(s.editor.active)
+            .map(String::as_str)
+            .unwrap_or(""),
+    )
 }
 
 /// Echo a Tcl verb to the console without flipping run state.
@@ -515,8 +417,7 @@ fn cursor(ed: &EditorState) -> usize {
 /// Toggle the line-comment prefix on the cursor line (`//` for Verilog,
 /// `#` for XDC), preserving leading indentation. Acts on the active buffer.
 fn toggle_comment(s: &mut AppState) {
-    let kind = active_buffer(s);
-    let marker = if kind == BufferKind::Xdc { "#" } else { "//" };
+    let marker = active_dialect(s).line_comment();
     flush_edit(s);
     let len = active_lines(s).len();
     if len == 0 {
@@ -841,12 +742,112 @@ fn find_bar(s: &AppState, t: &VivadoTheme) -> El {
                 .a11y_hidden(),
             |s| find_step(s, true),
         ))
+        .child(el().w(1.0).h(16.0).mx(4.0).fill(t.border).a11y_hidden())
+        .child(
+            TextInput::new(&s.editor.replace_query)
+                .placeholder("Replace with")
+                .on_edit(|s: &mut AppState| &mut s.editor.replace_query)
+                .build(&kit)
+                .key("editor-replace-input")
+                .w(180.0),
+        )
+        .child(find_text_btn(
+            "editor-replace-one",
+            "Replace",
+            !hits.is_empty(),
+            t,
+            |s| {
+                replace_matches(s, false);
+            },
+        ))
+        .child(find_text_btn(
+            "editor-replace-all",
+            "Replace All",
+            !hits.is_empty(),
+            t,
+            |s| {
+                replace_matches(s, true);
+            },
+        ))
+        .child(el().grow(1.0))
         .child(tool_btn(
             "editor-find-close".into(),
             "Close find",
             icon(&glyphs::CLOSE, 10.0).color(t.text_dim).a11y_hidden(),
             |s| s.editor.find_open = false,
         ))
+}
+
+/// Small text button in the find bar; disabled (with a reason) when there
+/// is nothing to replace.
+fn find_text_btn(
+    key: &'static str,
+    label: &'static str,
+    enabled: bool,
+    t: &VivadoTheme,
+    on: impl Fn(&mut AppState) + 'static,
+) -> El {
+    let mut b = el()
+        .key(key)
+        .role("button")
+        .label(label)
+        .focusable(enabled)
+        .disabled(!enabled)
+        .h(22.0)
+        .px(8.0)
+        .radius(3.0)
+        .center()
+        .border(1.0, t.border)
+        .child(text(label).font(VivadoTheme::FONT_UI).color(t.text));
+    if enabled {
+        b = b.hover(t.selection).on_press(on);
+    } else {
+        b = b.description("No matches").layer_opacity(0.4);
+    }
+    b
+}
+
+/// Replace the next match at/after the caret (wrapping), or every match.
+/// One undo step either way. Returns how many occurrences changed.
+pub fn replace_matches(s: &mut AppState, all: bool) -> usize {
+    let q = s.editor.find_query.text.clone();
+    if q.is_empty() || s.editor.tabs.is_empty() {
+        return 0;
+    }
+    let r = s.editor.replace_query.text.clone();
+    flush_edit(s);
+    let text = active_lines(s).join("\n");
+    let caret = s.editor.edit.focus.min(text.len());
+    let (new_text, count, new_caret) = if all {
+        let n = text.matches(q.as_str()).count();
+        (text.replace(q.as_str(), &r), n, caret.min(text.len()))
+    } else {
+        let at = text[caret..]
+            .find(q.as_str())
+            .map(|i| caret + i)
+            .or_else(|| text.find(q.as_str()));
+        match at {
+            Some(i) => {
+                let mut out = String::with_capacity(text.len());
+                out.push_str(&text[..i]);
+                out.push_str(&r);
+                out.push_str(&text[i + q.len()..]);
+                (out, 1, i + r.len())
+            }
+            None => return 0,
+        }
+    };
+    if count == 0 {
+        return 0;
+    }
+    s.editor.push_undo_active(active_is_xdc(s));
+    *active_lines_mut(s) = new_text.lines().map(str::to_string).collect();
+    s.editor.dirty = true;
+    reload_edit(s);
+    let len = s.editor.edit.text.len();
+    s.editor.edit.set_caret(new_caret.min(len));
+    s.editor.cursor_line = caret_line(s);
+    count
 }
 
 /// File tab strip: active tab bold on panel white, inactive on header gray.
@@ -905,8 +906,10 @@ fn tab_strip(s: &AppState, t: &VivadoTheme) -> El {
     strip
 }
 
-/// Full-path breadcrumb under the tabs, middle-truncated like Vivado.
+/// Path breadcrumb under the tabs (middle-truncated) with the caret's
+/// `Ln, Col`, the buffer language and an unsaved marker on the right.
 fn breadcrumb(s: &AppState, t: &VivadoTheme) -> El {
+    use crate::views::highlight::Dialect;
     // The real disk path when the tab has one; unsaved buffers say so
     // rather than inventing a location.
     let path = s
@@ -918,21 +921,64 @@ fn breadcrumb(s: &AppState, t: &VivadoTheme) -> El {
             None => format!("{name} — not saved to disk"),
         })
         .unwrap_or_else(|| "(no open file)".into());
-    row()
+    let mut bar = row()
         .key("editor-path")
         .w_full()
         .h(PATH_H)
         .items_center()
+        .gap(12.0)
         .px(8.0)
         .fill(t.panel_bg)
         .child(
-            text(path)
+            text(path.clone())
                 .font(VivadoTheme::FONT_UI)
                 .color(t.text_dim)
                 .grow(1.0)
                 .shrink()
-                .truncate_middle(),
-        )
+                .min_w(0.0)
+                .truncate_middle()
+                .help_when_truncated(path),
+        );
+    if !s.editor.tabs.is_empty() {
+        let edit = &s.editor.edit;
+        let caret = edit.focus.min(edit.text.len());
+        let line = edit.line_of_byte(caret);
+        let col = edit.text[edit.line_range(line).start..caret].chars().count() + 1;
+        let lang = match active_dialect(s) {
+            Dialect::Verilog => {
+                let name = s.editor.tabs.get(s.editor.active).map(String::as_str).unwrap_or("");
+                if name.ends_with(".sv") || name.ends_with(".svh") {
+                    "SystemVerilog"
+                } else {
+                    "Verilog"
+                }
+            }
+            Dialect::Vhdl => "VHDL",
+            Dialect::Tcl => "Tcl / XDC",
+        };
+        if s.editor.dirty {
+            bar = bar.child(
+                text("● unsaved")
+                    .key("editor-dirty")
+                    .font(VivadoTheme::FONT_UI)
+                    .color(t.warn),
+            );
+        }
+        bar = bar
+            .child(
+                text(format!("Ln {}, Col {col}", line + 1))
+                    .key("editor-caret-pos")
+                    .font(VivadoTheme::FONT_UI)
+                    .color(t.text_dim),
+            )
+            .child(
+                text(lang)
+                    .key("editor-lang")
+                    .font(VivadoTheme::FONT_UI)
+                    .color(t.text_faint),
+            );
+    }
+    bar
 }
 
 /// Width of the breakpoint slot left of the line numbers.
@@ -1019,20 +1065,12 @@ fn gutter_row(
     row().w(GUTTER_W).h(LINE_H).child(slot).child(number)
 }
 
-/// Whole-buffer spans for the live field: syntax colors plus a wash over
-/// every find match. Byte offsets are relative to the field text.
-fn field_spans(s: &AppState, is_xdc: bool, t: &VivadoTheme) -> Vec<Span> {
+/// Whole-buffer spans for the live field: syntax colors (lexed over the
+/// whole buffer so block comments span lines) plus a wash over every find
+/// match. Byte offsets are relative to the field text.
+fn field_spans(s: &AppState, t: &VivadoTheme) -> Vec<Span> {
     let text = &s.editor.edit.text;
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    for line in text.split('\n') {
-        for mut sp in highlight_spans(line, is_xdc, t) {
-            sp.start += start as u32;
-            sp.end += start as u32;
-            out.push(sp);
-        }
-        start += line.len() + 1;
-    }
+    let mut out = crate::views::highlight::highlight(text, active_dialect(s), t);
     let q = &s.editor.find_query.text;
     if !q.is_empty() {
         for (i, _) in text.match_indices(q) {
@@ -1092,7 +1130,7 @@ pub fn editor_pane(s: &AppState, t: &VivadoTheme) -> El {
                     .key("editor-field")
                     .label("Source editor")
                     .color(t.text)
-                    .spans(field_spans(s, is_xdc, t))
+                    .spans(field_spans(s, t))
                     .caret(t.text, t.selection)
                     .on_edit(|s: &mut AppState| &mut s.editor.edit)
                     .on_submit(|s: &mut AppState, _tx: &mut Tx| {
@@ -1104,6 +1142,10 @@ pub fn editor_pane(s: &AppState, t: &VivadoTheme) -> El {
                             Key::Text(ch) if key.mods.cmd && (ch == "s" || ch == "S") => {
                                 let _ = save_active(s);
                                 s.editor.cursor_line = caret_line(s);
+                                true
+                            }
+                            Key::Text(ch) if key.mods.cmd && (ch == "f" || ch == "F") => {
+                                s.editor.find_open = true;
                                 true
                             }
                             Key::Text(_) | Key::Enter | Key::Backspace | Key::Delete | Key::Tab => {
@@ -1225,6 +1267,48 @@ mod tests {
         let spans = highlight_spans("# 100MHz clock", true, &t);
         assert_eq!(spans.len(), 1);
         assert!(spans[0].italic);
+    }
+
+    #[test]
+    fn replace_next_then_all_are_single_undo_steps() {
+        let mut s = editor_state();
+        s.editor.find_query = TextEdit::new("counter");
+        s.editor.replace_query = TextEdit::new("cnt");
+        let before = s.editor.lines.join("\n");
+        let total = before.matches("counter").count();
+        assert!(total >= 2, "fixture needs repeated matches");
+        assert_eq!(replace_matches(&mut s, false), 1);
+        let after_one = s.editor.lines.join("\n");
+        assert_eq!(after_one.matches("counter").count(), total - 1);
+        assert!(s.editor.dirty);
+        assert!(undo_synced(&mut s));
+        assert_eq!(s.editor.lines.join("\n"), before, "one undo restores");
+        assert_eq!(replace_matches(&mut s, true), total);
+        assert_eq!(s.editor.lines.join("\n").matches("counter").count(), 0);
+        s.editor.find_query = TextEdit::new("");
+        assert_eq!(replace_matches(&mut s, true), 0, "empty query is a no-op");
+    }
+
+    #[test]
+    fn breadcrumb_shows_caret_position_and_language() {
+        let mut rt = harness_with(editor_state());
+        rt.frame(0.0);
+        assert!(rt.find("editor-caret-pos").is_some());
+        assert!(rt.find("editor-lang").is_some());
+    }
+
+    #[test]
+    fn comment_toggle_uses_the_tab_language() {
+        let mut s = editor_state();
+        s.editor.tabs.push("alu.vhd".into());
+        let i = s.editor.tabs.len() - 1;
+        select_tab(&mut s, i);
+        s.editor.edit = TextEdit::new("signal a : std_logic;");
+        s.editor.edit_tab = Some(i);
+        flush_edit(&mut s);
+        reload_edit(&mut s);
+        toggle_comment(&mut s);
+        assert_eq!(active_lines(&s)[0], "-- signal a : std_logic;");
     }
 
     #[test]

@@ -239,6 +239,11 @@ fn menus_toggle_on_every_center_surface() {
 fn create_wizard_walks_to_summary_and_finish_applies_the_project() {
     let mut rt = rt_for("create-project");
     assert_eq!(rt.state.dialogs.create.step, CreateStep::Info);
+    // Never write into the real projects folder from a test.
+    let root = std::env::temp_dir().join(format!("helion-snap-create-{}", std::process::id()));
+    rt.state.dialogs.create.location = rune::TextEdit::new(root.display().to_string());
+    rt.invalidate();
+    rt.frame(0.05);
     for _ in 0..4 {
         tap(&mut rt, "create-next");
     }
@@ -258,6 +263,8 @@ fn create_wizard_walks_to_summary_and_finish_applies_the_project() {
         rt.find("summary-name").is_some(),
         "summary must show the new project"
     );
+    assert!(root.join("project_2/project_2.prj").is_file());
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
