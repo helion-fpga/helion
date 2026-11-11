@@ -47,6 +47,9 @@ fn routed_ff(ce: Option<&str>, sr: Option<&str>) -> Routed7 {
             clk_net: "clk".into(),
             ce_net: ce.map(str::to_string),
             sr_net: sr.map(str::to_string),
+            init: false,
+            srval: false,
+            sr_async: false,
         }],
         ..Default::default()
     };

@@ -8,7 +8,7 @@
 use crate::pack::IobDir;
 use crate::place::Placed7;
 use crate::route::{RouteKind, Routed7};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// What the emitter needs from the device model.
 pub trait EmitDevice {
@@ -31,6 +31,11 @@ pub trait EmitDevice {
     /// IOI tile paired with an IOB tile (same bank side, same row),
     /// for OLOGIC/ILOGIC features. Defaults to none; the XDevice impl
     /// finds it in the DB.
+    /// STEPDOWN lines for the banks of these IOB tiles (banks running a
+    /// <=1.8V standard). Defaults to none.
+    fn bank_stepdown(&self, _iob_tiles: &[String]) -> Vec<String> {
+        Vec::new()
+    }
     fn ioi_tile(&self, _iob_tile: &str) -> Option<String> {
         None
     }
@@ -156,15 +161,26 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     use std::collections::HashSet;
     let mut ce_slices: HashSet<(String, String)> = HashSet::new();
     let mut sr_slices: HashSet<(String, String)> = HashSet::new();
+    // Slices whose SR acts asynchronously (FDCE/FDPE): no FFSYNC.
+    let mut async_slices: HashSet<(String, String)> = HashSet::new();
     for ff in &placed.ffs {
         let site_rel = device
             .site_rel(&ff.tile, &ff.site)
             .ok_or_else(|| format!("emit: no rel site for {} {}", ff.tile, ff.site))?;
         let bel = ff_bel(&ff.bel)?; // "AFF" -> "AFF"
-        // D from LUT O: the AFFMUX selects AX when the paired LUT drives D.
-        // (Pack pairs FF.D == LUT.O on the same BEL letter.)
-        let mux_src = mux_for_ff(ff, packed, placed);
-        lines.push(format!("{}.{}.{}.ZINI", ff.tile, site_rel, bel));
+        // D source (shared rule with the router): same-letter LUT O6 or
+        // carry sum inside the slice, else the routed bypass pin.
+        let letter = ff.bel.chars().next().unwrap_or('A');
+        let mux_src = match crate::place::ff_d_source(ff, placed) {
+            crate::place::FfDSource::LutO6 => "O6".to_string(),
+            crate::place::FfDSource::CarryXor => "XOR".to_string(),
+            crate::place::FfDSource::Bypass => format!("{letter}X"),
+        };
+        let pff = packed.ffs.iter().find(|p| p.name == ff.name);
+        // ZINI: power-on value 0 (absent: INIT=1).
+        if !pff.map(|p| p.init).unwrap_or(false) {
+            lines.push(format!("{}.{}.{}.ZINI", ff.tile, site_rel, bel));
+        }
         lines.push(format!("{}.{}.{}MUX.{}", ff.tile, site_rel, bel, mux_src));
         // Control signals: look up the packed FF for CE/SR nets.
         if let Some(p) = packed.ffs.iter().find(|p| p.name == ff.name) {
@@ -174,12 +190,15 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
             if p.sr_net.is_some() {
                 sr_slices.insert((ff.tile.clone(), site_rel.clone()));
             }
-            // SR as RESET (the common case; Helion IR does not
-            // distinguish set vs reset, and reset is the standard use).
-            // With no SR net Vivado ties the reset pin low and still
-            // programs ZRST: the ZB-10 oracle carries ZRST on every
-            // chain FF.
-            lines.push(format!("{}.{}.{}.ZRST", ff.tile, site_rel, bel));
+            // ZRST: SR loads 0 (reset); absent, SR loads 1 (set). With
+            // no SR net Vivado ties the reset pin low and still programs
+            // ZRST: the ZB-10 oracle carries ZRST on every chain FF.
+            if !p.srval {
+                lines.push(format!("{}.{}.{}.ZRST", ff.tile, site_rel, bel));
+            }
+            if p.sr_async && p.sr_net.is_some() {
+                async_slices.insert((ff.tile.clone(), site_rel.clone()));
+            }
         }
     }
     // Emit slice-level CE/SR mux enables (deduplicated).
@@ -255,7 +274,9 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     // Serving INT tile per FF slice, with the CLK letters it needs.
     let mut int_arrival: std::collections::BTreeMap<String, (bool, bool)> = std::collections::BTreeMap::new();
     for (tile, slice) in &ff_slices {
-        lines.push(format!("{tile}.{slice}.FFSYNC"));
+        if !async_slices.contains(&(tile.clone(), slice.clone())) {
+            lines.push(format!("{tile}.{slice}.FFSYNC"));
+        }
         let mut parts = tile.split('_');
         let (_family, side, xypart) = match (parts.next(), parts.next(), parts.next()) {
             (Some(fam), Some(side), Some(xy)) if parts.next().is_none() => (fam, side, xy),
@@ -418,6 +439,23 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         lines.push(format!("{}.{}.PULLTYPE.NONE", iob.tile, site_rel));
         lines.push(format!("{}.{}.IN_TERM.NONE", iob.tile, site_rel));
         let _ = p;
+    }
+
+    // Banks running a low-voltage standard: STEPDOWN on every IOB of the
+    // bank plus the bank's HCLK_IOI3 (Vivado ground truth, fa4b golden).
+    let low_v: Vec<String> = placed
+        .iobs
+        .iter()
+        .filter(|i| {
+            packed.iobs.iter().find(|p| p.name == i.name).map(|p| {
+                let s = p.iostandard.to_ascii_uppercase();
+                matches!(s.as_str(), "LVCMOS18" | "LVCMOS15" | "LVCMOS12" | "SSTL135" | "SSTL15" | "HSTL_I" | "HSTL_II" | "HSTL_I_18" | "HSTL_II_18")
+            }).unwrap_or(false)
+        })
+        .map(|i| i.tile.clone())
+        .collect();
+    if !low_v.is_empty() {
+        lines.extend(device.bank_stepdown(&low_v));
     }
 
     // BUFGCTRLs. Static configuration for an I0 -> O clock buffer (BUFG).
@@ -742,7 +780,7 @@ mod tests {
                 q_net: "q".into(),
                 clk_net: "clk_bufg".into(),
                 ce_net: None,
-                sr_net: None,
+                sr_net: None, init: false, srval: false, sr_async: false,
             }],
             iobs: vec![PackedIob {
                 name: "u_obuf".into(), port: "led".into(), dir: IobDir::Out,
@@ -777,7 +815,9 @@ mod tests {
         let text = bs.fasm.join("\n");
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.ALUT.INIT[63:0] = 64'h5555555555555555"), "got:\n{text}");
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZINI"), "got:\n{text}");
-        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFFMUX.AX"), "got:\n{text}");
+        // Paired inverter LUT drives the FF inside the slice (O6), not
+        // through the unrouted AX bypass.
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFFMUX.O6"), "got:\n{text}");
         // Vivado default drive for LVCMOS33 outputs is 12mA (ZB-10).
         assert!(text.contains("RIOB33_X0Y0.IOB_Y1.LVCMOS33_LVTTL.DRIVE.I12_I16"), "got:\n{text}");
         assert!(text.contains("RIOB33_X0Y0.IOB_Y1.PULLTYPE.NONE"), "got:\n{text}");
@@ -929,7 +969,7 @@ mod tests {
         // One chain FF per group to pin the FFMUX.XOR rule.
         r.placed.packed.ffs.push(PackedFf {
             name: "u_ff0".into(), d_net: "o0".into(), q_net: "q0".into(),
-            clk_net: "clk_bufg".into(), ce_net: None, sr_net: None,
+            clk_net: "clk_bufg".into(), ce_net: None, sr_net: None, init: false, srval: false, sr_async: false,
         });
         r.placed.ffs.push(PlacedFf {
             name: "u_ff0".into(), tile: "CLBLL_L_X0Y0".into(), site: "SLICE_X0Y0".into(), bel: "AFF".into(),

@@ -12,3 +12,4 @@ serde_json = { version = "1" }
 
 [dev-dependencies]
 helion-sv = { workspace = true }
+helion-vhdl = { workspace = true }

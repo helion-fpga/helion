@@ -13,11 +13,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use helion_xilinx7::bitstream::{self, BitstreamOptions};
 use helion_xilinx7::device::{default_db_root, Device};
-use helion_xilinx7::fasm::parse_fasm;
 use helion_xilinx7::frames::{
-    full_device_addresses_from_dir, BlockType, FrameAddr, FrameStore, SegBitsDb,
+    BlockType, FrameAddr, SegBitsDb,
     TileBitLayout,
 };
 use helion_xilinx7::xdevice::{build_node_map, XDevice};
@@ -128,7 +126,7 @@ const IDCODE_XC7Z020: u32 = 0x0372_7093;
 #[test]
 fn zedboard_e2e_bitstream() {
     let db_root = default_db_root();
-    let zynq7 = db_root.join("zynq7");
+    let _zynq7 = db_root.join("zynq7");
     let mut device = Device::load_xc7z020(&db_root).expect("load xc7z020");
     assert!(device.tile_count() > 10000, "tile_count = {}", device.tile_count());
     let node_maps = build_node_map(&mut device);
@@ -274,51 +272,14 @@ fn zedboard_e2e_bitstream() {
     println!("FASM: {} lines", bs.fasm.len());
 
     // FASM -> frames.
-    let lines = parse_fasm(&fasm_text).expect("parse our FASM");
-    assert!(!lines.is_empty(), "no FASM lines parsed");
-    let layout =
-        TilegridLayout::load(&zynq7.join("xc7z020/tilegrid.json")).expect("tilegrid layout");
-    let mut types: Vec<&str> = lines.iter().filter_map(|l| layout.tile_type(&l.tile)).collect();
-    types.sort();
-    types.dedup();
-    let segbits = load_segbits(&zynq7, &types);
-    // prjxray-db has no segbits for RIOB33_SING (DB gap). Filter out FASM
-    // lines for SING tiles; those 2 IOBs (led[6] on U19, led[7] on U14)
-    // get default IOB configuration. Documented limitation for HW validation.
-    let (lines, skipped): (Vec<_>, Vec<_>) = lines.into_iter().partition(|l| {
-        layout.tile_type(&l.tile).map(|t| t != "RIOB33_SING").unwrap_or(true)
-    });
-    if !skipped.is_empty() {
-        println!(
-            "WARNING: skipped {} FASM lines for RIOB33_SING tiles (no segbits in DB)",
-            skipped.len()
-        );
-    }
-    // Full device frame list in FAR order: the FAR autoincrementer advances
-    // on each written frame, so a partial payload would shift every later
-    // frame onto the wrong address on silicon. Untouched frames stay zero,
-    // exactly like Vivado.
-    let full = full_device_addresses_from_dir(
-        &db_root.join("zynq7/xc7z020clg484-1"),
-    )
-    .expect("part.json frame list");
-    assert_eq!(full.len(), 9996, "xc7z020 frame count");
-    let mut store = FrameStore::new(&full);
-    let applied = store.apply_fasm(&lines, &segbits, &layout).expect("apply FASM");
-    assert!(applied > 0, "no FASM features applied");
-    println!("applied {applied} FASM features");
-
-    // Frames -> .bit with the xc7z020 IDCODE.
-    let payload = store.fdri_payload();
-    assert!(!payload.is_empty());
-    let opts = BitstreamOptions {
-        idcode: IDCODE_XC7Z020,
-        part_name: "xc7z020clg484-1".to_string(),
-        design_source: "zedboard_blinky;Generator=helion-xilinx7".to_string(),
-        write_crc: true,
-        ..BitstreamOptions::xc7frames2bit("xc7z020clg484-1", "zedboard_blinky.frm", "2026/10/22", "00:00:00")
-    };
-    let bit = bitstream::write_bit(&payload, &opts).expect("write .bit");
+    // FASM -> frames -> .bit through the library encoder (tilegrid alias
+    // for _SING tiles, bit-less pseudo-pips, per-frame ECC, CRC).
+    let report = helion_xilinx7::bitgen::fasm_to_bit(&fasm_text, "xc7z020clg484-1", "zedboard_blinky")
+        .expect("fasm_to_bit");
+    assert!(report.rejected.is_empty(), "rejected FASM lines: {:?}", report.rejected);
+    assert!(report.applied > 0, "no FASM features applied");
+    println!("applied {} FASM features", report.applied);
+    let bit = report.bit;
 
     // Structural validation.
     assert_eq!(

@@ -179,6 +179,8 @@ impl UnionFind {
 pub struct Device {
     tiles: Vec<Tile>,
     tile_by_name: HashMap<String, usize>,
+    /// Site name -> (tile index, site index within the tile).
+    site_by_name: HashMap<String, (usize, usize)>,
     grid: HashMap<(i32, i32), usize>,
     type_ids: HashMap<String, u32>,
     types: Vec<TileTypeData>,
@@ -255,6 +257,7 @@ impl Device {
         let mut dev = Self {
             tiles: Vec::new(),
             tile_by_name: HashMap::new(),
+            site_by_name: HashMap::new(),
             grid: HashMap::new(),
             type_ids: HashMap::new(),
             types: Vec::new(),
@@ -321,6 +324,9 @@ impl Device {
             let idx = dev.tiles.len();
             dev.grid.insert((e.grid_x, e.grid_y), idx);
             dev.tile_by_name.insert(tname.clone(), idx);
+            for (si, site) in sites.iter().enumerate() {
+                dev.site_by_name.insert(site.name.clone(), (idx, si));
+            }
             dev.tiles_by_type[type_id as usize].push(idx);
             dev.tiles.push(Tile {
                 name: tname.clone(),
@@ -687,6 +693,9 @@ impl Device {
 
     /// Find a site by full name: `(tile_idx, site_idx)`.
     pub fn site_by_name(&self, site_name: &str) -> Option<(usize, usize)> {
+        if let Some(&x) = self.site_by_name.get(site_name) {
+            return Some(x);
+        }
         for (ti, t) in self.tiles.iter().enumerate() {
             for (si, s) in t.sites.iter().enumerate() {
                 if s.name == site_name {
@@ -697,12 +706,25 @@ impl Device {
         None
     }
 
+    /// Pips driven by wire index `wire_idx` of a tile (index form).
+    pub fn pips_from_idx(&self, tile_idx: usize, wire_idx: u32) -> impl Iterator<Item = &Pip> {
+        let td = self.tiles.get(tile_idx).map(|t| &self.types[t.type_id as usize]);
+        td.and_then(|td| td.pips_from.get(&wire_idx).map(move |v| v.iter().map(move |&i| &td.pips[i as usize])))
+            .into_iter()
+            .flatten()
+    }
+
     /// `(pin_name, tile_wire)` pairs of a site, if its template matched.
     pub fn site_pins(&self, tile_idx: usize, site_idx: usize) -> Option<&[SitePin]> {
         let t = self.tiles.get(tile_idx)?;
         let s = t.sites.get(site_idx)?;
         let tmpl = s.template?;
         Some(self.types[t.type_id as usize].site_templates[tmpl as usize].pins.as_slice())
+    }
+
+    /// Every package pin of the part.
+    pub fn package_pins(&self) -> impl Iterator<Item = &PackagePin> {
+        self.package_pins.values()
     }
 
     /// Look up a package pin, e.g. `package_pin("E3")`.

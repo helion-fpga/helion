@@ -69,7 +69,8 @@ def run(design: str, rtl: list[str], top: str, xdc: str, workdir: str,
     src = _combined_source(rtl, workdir, top)
     v = os.path.join(workdir, "helion_netlist.v")
     j = os.path.join(workdir, "helion_netlist.json")
-    r = subprocess.run([SYNTH2V, src, v, j], capture_output=True, text=True, timeout=1800)
+    cmd = [SYNTH2V, src, v, j] + ([top] if top and not cosim.is_verilog(rtl) else [])
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     if r.returncode != 0 or not os.path.exists(j):
         rep.synth_error = (r.stderr.strip().splitlines() or ["synth2v failed"])[-1]
         return rep
@@ -79,7 +80,8 @@ def run(design: str, rtl: list[str], top: str, xdc: str, workdir: str,
         return rep
     rep.cells = info.get("cells", {})
     for k in ("SIM_ONLY", "NO_BODY", "WIDE_CONE", "ASSIGN_NOT_LOWERED", "GENERATE_NOT_LOWERED",
-              "WIDTH_OVERFLOW", "FLATTEN_CAP", "CLOCK_MUX", "CLOCK_GATE", "INOUT_ENABLE_NOT_LOWERED"):
+              "WIDTH_OVERFLOW", "FLATTEN_CAP", "CLOCK_MUX", "CLOCK_GATE", "INOUT_ENABLE_NOT_LOWERED",
+              "ASYNC_RESET_NOT_LOWERED"):
         if k in info.get("attrs", {}):
             rep.problems.append(f"design flagged {k}: synthesis did not lower part of the RTL")
     for s in info.get("unsupported", []):
@@ -162,7 +164,7 @@ def run(design: str, rtl: list[str], top: str, xdc: str, workdir: str,
     return rep
 
 
-def run_micro(path: str, top: str, workdir: str, cycles: int = 1000, seed: int = 1) -> SynthReport:
+def run_micro(path: str, top: str, workdir: str, cycles: int = 1000, seed: int = 1, translate_only: bool = False) -> SynthReport:
     """Check one small SV/VHDL file with auto-generated pin constraints (every
     port bit gets a unique pseudo pin; the first 1-bit input named clk/clock
     is the clock)."""
@@ -177,4 +179,57 @@ def run_micro(path: str, top: str, workdir: str, cycles: int = 1000, seed: int =
                 lines.append(f"create_clock -period 10 [get_ports {p.name}]")
     xdc = os.path.join(workdir, "auto.xdc")
     open(xdc, "w").write("\n".join(lines) + "\n")
+    if translate_only:
+        return run_sv(os.path.basename(path), [path], top, xdc, workdir, cycles, seed)
     return run(os.path.basename(path), [path], top, xdc, workdir, cycles, seed)
+
+
+VHDL2SV = os.environ.get("X7V_VHDL2SV", os.path.expanduser("~/helion-zed-verify/target/release/examples/vhdl2sv"))
+
+
+def run_sv(design: str, rtl: list[str], top: str, xdc: str, workdir: str,
+           cycles: int = 3000, seed: int = 1) -> SynthReport:
+    """Translator-only check: co-simulate the SystemVerilog that Helion's
+    VHDL front end emits against the VHDL itself (no synthesis). A failure
+    here is a VHDL translation bug; a pass here with a synthcheck failure
+    points at helion-sv."""
+    os.makedirs(workdir, exist_ok=True)
+    rep = SynthReport(design)
+    src = _combined_source(rtl, workdir, top)
+    r = subprocess.run([VHDL2SV, src, top], capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        rep.synth_error = (r.stderr.strip().splitlines() or ["vhdl2sv failed"])[-1]
+        return rep
+    sv = r.stdout
+    renames = dict(re.findall(r"^// port-rename (\S+) (\S+)$", sv, re.M))
+    m = re.search(r"^module\s+(\w+)", sv, re.M)
+    mod = m.group(1)
+    pin_of, _ = cosim.parse_xdc(xdc)
+    ports = cosim.vhdl_ports(rtl, top)
+    wrapper_ports, conns = [], []
+    for p in ports:
+        pins = []
+        for b in p.bits():
+            pin = pin_of.get(b)
+            if pin is None:
+                rep.problems.append(f"{b} has no PACKAGE_PIN in the XDC")
+                pin = None
+            pins.append(pin)
+        if any(x is None for x in pins):
+            continue
+        for pin in pins:
+            wrapper_ports.append(f"{'input' if p.direction == 'in' else 'output'} wire {pin}")
+        conns.append(f".{renames.get(p.name, p.name)}({{{', '.join(pins)}}})")
+    wrapper = (f"module extracted({', '.join(wrapper_ports)});\n"
+               f"{mod} u({', '.join(conns)});\nendmodule\n")
+    full = os.path.join(workdir, "translated.v")
+    open(full, "w").write(sv + "\n" + wrapper)
+    pins_in = {w.split()[-1] for w in wrapper_ports if w.startswith("input")}
+    pins_out = {w.split()[-1] for w in wrapper_ports if w.startswith("output")}
+    try:
+        rep.cosim = cosim.run(os.path.join(workdir, "cosim"), rtl, top, xdc, full, pins_in, pins_out, cycles, seed)
+    except Exception as e:
+        rep.problems.append(f"simulation failed: {str(e)[:300]}")
+        return rep
+    rep.ok = not rep.problems and rep.cosim.ok and rep.cosim.net_unknown == 0
+    return rep

@@ -20,6 +20,22 @@ pub trait RouteQuery {
     fn node_wires(&self, tile: &str, wire: &str) -> Vec<(String, String)>;
     /// The wire driven by a site output pin, e.g. `("IOB_X1Y76", "O")`.
     fn site_pin_wire(&self, site: &str, pin: &str) -> Option<(String, String)>;
+    /// Optional fast path for [`bfs_route`] with the same contract (same
+    /// wire restrictions, same returned pips). `None`: not implemented, the
+    /// caller runs the generic BFS. `Some(None)`: unroutable.
+    #[allow(clippy::too_many_arguments)]
+    fn route_fast(
+        &self,
+        _src: (&str, &str),
+        _tree: &[(String, String)],
+        _sinks: &[(String, String)],
+        _allow_power: bool,
+        _allow_byp: bool,
+        _net: &str,
+        _claimed: &HashMap<(String, String), String>,
+    ) -> Option<Option<Vec<RoutedPip>>> {
+        None
+    }
     /// All `(tile, wire)` that can drive a site input pin.
     fn wire_for_site_pin(&self, site: &str, pin: &str) -> Vec<(String, String)>;
     /// Is this net on the dedicated global clock network (BUFG output)?
@@ -145,16 +161,31 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
                 add_ep(n.clone(), site.to_string(), &format!("{bel_letter}{}", i + 1), false);
             }
         }
-        add_ep(lut.output_net.clone(), site.to_string(), &format!("{bel_letter}MUX"), true);
+        // O6 leaves the slice on the letter's direct output pin (A..D), which
+        // needs no OUTMUX configuration.
+        add_ep(lut.output_net.clone(), site.to_string(), &bel_letter.to_string(), true);
     }
+    let placed_ff: HashMap<&str, &crate::place::PlacedFf> = placed.ffs.iter().map(|f| (f.name.as_str(), f)).collect();
     for ff in &packed.ffs {
         let site = ff_site.get(ff.name.as_str()).copied().unwrap_or("");
         let bel = ff_bel.get(ff.name.as_str()).copied().unwrap_or("AFF");
-        // Q is per-BEL (AQ/BQ/CQ/DQ); D and CLK are slice-shared.
+        // Q is per-BEL (AQ/BQ/CQ/DQ); CLK/CE/SR are slice-shared.
         let bel_letter = bel.chars().next().unwrap_or('A');
-        add_ep(ff.d_net.clone(), site.to_string(), "D", false);
+        // D: the same-letter LUT O6 or carry sum stays inside the slice;
+        // anything else arrives through the letter's bypass pin.
+        let d_pin = match placed_ff.get(ff.name.as_str()).map(|p| crate::place::ff_d_source(p, placed)) {
+            Some(crate::place::FfDSource::LutO6) | Some(crate::place::FfDSource::CarryXor) => format!("{bel_letter}FF_D"),
+            _ => format!("{bel_letter}X"),
+        };
+        add_ep(ff.d_net.clone(), site.to_string(), &d_pin, false);
         add_ep(ff.q_net.clone(), site.to_string(), &format!("{bel_letter}Q"), true);
         add_ep(ff.clk_net.clone(), site.to_string(), "CLK", false);
+        if let Some(ce) = &ff.ce_net {
+            add_ep(ce.clone(), site.to_string(), "CE", false);
+        }
+        if let Some(sr) = &ff.sr_net {
+            add_ep(sr.clone(), site.to_string(), "SR", false);
+        }
     }
     for iob in &packed.iobs {
         let site = iob_site.get(iob.name.as_str()).copied().unwrap_or("");
@@ -222,6 +253,10 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         }
     }
 
+    for eps in net_eps.values_mut() {
+        let mut seen: HashSet<(String, String, bool)> = HashSet::new();
+        eps.retain(|e| seen.insert((e.site.clone(), e.pin.clone(), e.is_driver)));
+    }
     let mut nets = Vec::new();
     // Wire ownership across nets in this run: (tile, wire) -> net.
     // A net that enters another net's wire would short against it or
@@ -317,6 +352,20 @@ fn route_bufg_tieoffs(placed: &Placed7, device: &dyn RouteQuery) -> Result<(), S
     Ok(())
 }
 
+/// Loads reached inside the slice with no routing: the FF D input from
+/// its same-letter LUT or carry sum (`AFF_D`..`DFF_D`), and carry S inputs
+/// from the same-letter LUT O6. Every other load, even in the driver's own
+/// slice, arrives through the fabric.
+fn is_site_internal_pin(pin: &str) -> bool {
+    pin.ends_with("FF_D") || matches!(pin, "S0" | "S1" | "S2" | "S3")
+}
+
+/// Slice bypass inputs (`AX`..`DX`): reached through the INT tile's
+/// `BYP_ALT` muxes, which only these loads may use.
+fn is_bypass_pin(pin: &str) -> bool {
+    matches!(pin, "AX" | "BX" | "CX" | "DX")
+}
+
 /// Slice LUT input pins (`A1`-`A6` through `D1`-`D6`): loads here
 /// always route through fabric, never site-internal.
 fn is_lut_input_pin(pin: &str) -> bool {
@@ -343,7 +392,7 @@ fn route_net(
     // site-internal shortcut would silently unconnect it on silicon.
     let (internal, external): (Vec<&&Endpoint>, Vec<&&Endpoint>) = loads
         .iter()
-        .partition(|l| l.site == driver.site && !is_lut_input_pin(&l.pin));
+        .partition(|l| l.site == driver.site && is_site_internal_pin(&l.pin));
     // If all loads are site-internal, no pips needed.
     if external.is_empty() {
         return Ok(RouteKind::SiteInternal);
@@ -372,6 +421,10 @@ fn route_net(
         || external_loads
             .iter()
             .any(|l| matches!(l.pin.as_str(), "I0" | "I1" | "CLK"));
+    // Wires this net already reaches: later loads branch off the tree
+    // instead of re-entering one of its wires from a second source (which
+    // would double-drive that wire's mux).
+    let mut tree: Vec<(String, String)> = vec![(src_tile.clone(), src_wire.clone())];
     for load in &external_loads {
         let sinks = device.wire_for_site_pin(&load.site, &load.pin);
         if sinks.is_empty() {
@@ -380,8 +433,17 @@ fn route_net(
                 load.site, load.pin
             ));
         }
-        let pips = bfs_route(&src_tile, &src_wire, &sinks, device, allow_power, net, claimed)
+        let allow_byp = is_bypass_pin(&load.pin);
+        let fast = device.route_fast((&src_tile, &src_wire), &tree, &sinks, allow_power, allow_byp, net, claimed);
+        let pips = match fast {
+            Some(r) => r,
+            None => bfs_route(&src_tile, &src_wire, &sinks, device, allow_power, allow_byp, net, claimed),
+        }
             .ok_or_else(|| format!("route: net `{net}` unroutable to {}.{} (src {src_tile}.{src_wire})", load.site, load.pin))?;
+        for p in &pips {
+            tree.push((p.tile.clone(), p.dst_wire.clone()));
+            tree.push((p.tile.clone(), p.src_wire.clone()));
+        }
         all_pips.extend(pips);
     }
     // Dedup shared pips.
@@ -435,6 +497,7 @@ fn bfs_route(
     sinks: &[(String, String)],
     device: &dyn RouteQuery,
     allow_power: bool,
+    allow_byp: bool,
     net: &str,
     claimed: &HashMap<(String, String), String>,
 ) -> Option<Vec<RoutedPip>> {
@@ -457,10 +520,16 @@ fn bfs_route(
         // connections like the OLOGIC bypass, traversed but not emitted).
         for (dst_wire, src_w, is_pseudo) in device.pips_from(&tile, &wire) {
             debug_assert_eq!(src_w, wire);
+            // CLB pseudo-pips are slice configuration (e.g. `A->>AMUX` is
+            // AOUTMUX=O6), not wiring: the router never programs them, so a
+            // path through one would leave the mux unset on silicon.
+            if is_pseudo && tile.starts_with("CLB") {
+                continue;
+            }
             if !allow_power && is_power_wire(&dst_wire) {
                 continue;
             }
-            if !allow_power && is_byp_wire(&dst_wire) {
+            if !allow_power && !allow_byp && is_byp_wire(&dst_wire) {
                 continue;
             }
             if owned_elsewhere(claimed, net, &tile, &dst_wire) {
@@ -483,7 +552,7 @@ fn bfs_route(
             if !allow_power && is_power_wire(&nwire) {
                 continue;
             }
-            if !allow_power && is_byp_wire(&nwire) {
+            if !allow_power && !allow_byp && is_byp_wire(&nwire) {
                 continue;
             }
             if owned_elsewhere(claimed, net, &ntile, &nwire) {
@@ -559,8 +628,8 @@ mod tests {
         }
         fn site_pin_wire(&self, site: &str, pin: &str) -> Option<(String, String)> {
             match (site, pin) {
-                ("SLICE_X0", "AMUX") => Some(("INT_X0".into(), "B".into())),
-                ("SLICE_X1", "AMUX") => Some(("INT_X1".into(), "C".into())),
+                ("SLICE_X0", "A") => Some(("INT_X0".into(), "B".into())),
+                ("SLICE_X1", "A") => Some(("INT_X1".into(), "C".into())),
                 ("SLICE_X0", "AQ") => Some(("INT_X0".into(), "A".into())),
                 _ => None,
             }
@@ -687,16 +756,21 @@ mod tests {
                 },
             ],
             ffs: vec![
+                // Clocked from a clock-network net (an input pad drives it).
                 PackedFf {
                     name: "u_ff0".into(), d_net: "o0".into(), q_net: "q0".into(),
-                    clk_net: "o0".into(), ce_net: None, sr_net: None,
+                    clk_net: "clk_bufg".into(), ce_net: None, sr_net: None, init: false, srval: false, sr_async: false,
                 },
                 PackedFf {
                     name: "u_ff1".into(), d_net: "o1".into(), q_net: "q1".into(),
-                    clk_net: "o1".into(), ce_net: None, sr_net: None,
+                    clk_net: "clk_bufg".into(), ce_net: None, sr_net: None, init: false, srval: false, sr_async: false,
                 },
             ],
-            iobs: vec![],
+            iobs: vec![PackedIob {
+                name: "ibuf_clk".into(), port: "clk".into(), dir: IobDir::In,
+                net: "clk_bufg".into(), loc: None, iostandard: "LVCMOS33".into(),
+                drive: None, slew: None,
+            }],
             bufgs: vec![],
             brams: vec![],
             dsps: vec![],
@@ -727,7 +801,10 @@ mod tests {
                 PlacedFf { name: "u_ff0".into(), tile: "CLB_X0".into(), site: "SLICE_X0".into(), bel: "AFF".into() },
                 PlacedFf { name: "u_ff1".into(), tile: "CLB_X1".into(), site: "SLICE_X1".into(), bel: "AFF".into() },
             ],
-            iobs: vec![],
+            iobs: vec![PlacedIob {
+                name: "ibuf_clk".into(), port: "clk".into(), dir: IobDir::In,
+                tile: "IOB_T".into(), site: "IOB_CLK".into(),
+            }],
             bufgs: vec![],
             brams: vec![],
             dsps: vec![],
@@ -759,7 +836,7 @@ mod tests {
         assert_eq!(kind_of(&routed, "one"), "pips1");
         // No fabric pips anywhere on carry-internal nets.
         for n in &routed.nets {
-            if matches!(n.kind, RouteKind::Cascade | RouteKind::SiteInternal) {
+            if matches!(n.kind, RouteKind::Cascade | RouteKind::SiteInternal | RouteKind::ClockSpine) {
                 continue;
             }
             assert_eq!(n.net, "one", "only the head CI routes, got {}", n.net);
@@ -772,14 +849,14 @@ mod tests {
         let empty: HashMap<(String, String), String> = HashMap::new();
         // Restricted: the GFAN0 shortcut is skipped despite coming
         // first; the signal path A -> B -> C -> D goes out.
-        let clean = bfs_route("INT_X0", "A", &sinks, &FakeRouter, false, "n", &empty).unwrap();
+        let clean = bfs_route("INT_X0", "A", &sinks, &FakeRouter, false, false, "n", &empty).unwrap();
         assert_eq!(clean.len(), 3, "got {clean:?}");
         assert!(
             clean.iter().all(|p| !is_power_wire(&p.dst_wire) && !is_power_wire(&p.src_wire)),
             "power wire used, got {clean:?}"
         );
         // Exempted (tieoff and clock-path nets): the shortcut is taken.
-        let exempt = bfs_route("INT_X0", "A", &sinks, &FakeRouter, true, "n", &empty).unwrap();
+        let exempt = bfs_route("INT_X0", "A", &sinks, &FakeRouter, true, false, "n", &empty).unwrap();
         assert!(
             exempt.iter().any(|p| p.dst_wire == "GFAN0" || p.src_wire == "GFAN0"),
             "shortcut not taken, got {exempt:?}"
@@ -831,14 +908,14 @@ mod tests {
         let empty: HashMap<(String, String), String> = HashMap::new();
         // Restricted: the BYP_ALT0 shortcut is skipped despite coming
         // first; the signal path A -> B -> C -> D goes out.
-        let clean = bfs_route("INT_X0", "A", &sinks, &BypTrap, false, "n", &empty).unwrap();
+        let clean = bfs_route("INT_X0", "A", &sinks, &BypTrap, false, false, "n", &empty).unwrap();
         assert_eq!(clean.len(), 3, "got {clean:?}");
         assert!(
             clean.iter().all(|p| !is_byp_wire(&p.dst_wire) && !is_byp_wire(&p.src_wire)),
             "BYP wire used, got {clean:?}"
         );
         // Exempted (tieoff and clock-path nets): the shortcut is taken.
-        let exempt = bfs_route("INT_X0", "A", &sinks, &BypTrap, true, "n", &empty).unwrap();
+        let exempt = bfs_route("INT_X0", "A", &sinks, &BypTrap, true, false, "n", &empty).unwrap();
         assert!(
             exempt.iter().any(|p| p.dst_wire == "BYP_ALT0" || p.src_wire == "BYP_ALT0"),
             "shortcut not taken, got {exempt:?}"
@@ -945,6 +1022,7 @@ mod tests {
             &sinks,
             &xdev,
             false,
+            false,
             "probe",
             &claimed,
         )
@@ -971,12 +1049,12 @@ mod tests {
         // Foreign-owned B blocks the only signal path: no route, so
         // the caller fails loudly instead of shorting two nets.
         assert!(
-            bfs_route("INT_X0", "A", &sinks, &FakeRouter, false, "mine", &claimed).is_none(),
+            bfs_route("INT_X0", "A", &sinks, &FakeRouter, false, false, "mine", &claimed).is_none(),
             "routed through foreign wire"
         );
         // Same-net ownership stays legal across loads of one net.
         claimed.insert(("INT_X0".into(), "B".into()), "mine".into());
-        let pips = bfs_route("INT_X0", "A", &sinks, &FakeRouter, false, "mine", &claimed).unwrap();
+        let pips = bfs_route("INT_X0", "A", &sinks, &FakeRouter, false, false, "mine", &claimed).unwrap();
         assert_eq!(pips.len(), 3, "got {pips:?}");
     }
 
@@ -1002,7 +1080,7 @@ mod tests {
         assert!(!is_lut_input_pin("CE"));
         assert!(!is_lut_input_pin("SR"));
         assert!(!is_lut_input_pin("AX"));
-        assert!(!is_lut_input_pin("AMUX"));
+        assert!(!is_lut_input_pin("A"));
         assert!(!is_lut_input_pin("S0"));
     }
 

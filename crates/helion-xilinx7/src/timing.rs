@@ -280,7 +280,7 @@ mod tests {
                 q_net: "q".into(),
                 clk_net: "clk".into(),
                 ce_net: None,
-                sr_net: None,
+                sr_net: None, init: false, srval: false, sr_async: false,
             }],
             iobs: vec![],
             bufgs: vec![],

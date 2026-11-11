@@ -1,8 +1,8 @@
 """Co-simulate RTL against a netlist extracted from a bitstream.
 
-Both simulators read the same stimulus file and write one output vector per
-cycle. Cycle k: inputs change and clock falls at t=10k, clock rises at
-t=10k+5, outputs are sampled at t=10k+9. RTL 'U'/'X' outputs (no reset yet,
+Both simulators read the same stimulus file and write two output vectors per
+cycle. Cycle k: inputs change and clock falls at t=10k, outputs are sampled
+at t=10k+4, clock rises at t=10k+5, outputs are sampled again at t=10k+9. RTL 'U'/'X' outputs (no reset yet,
 no initialiser) are don't-care for that cycle and are counted separately.
 """
 from __future__ import annotations
@@ -169,7 +169,10 @@ begin
       read(li, l);
 {clk_low}
 {chr(10).join(assign_in)}
-      wait for 5 ns;
+      wait for 4 ns;
+{chr(10).join(outs)}
+      write(o, character'(' '));
+      wait for 1 ns;
 {clk_high}
       wait for 4 ns;
 {chr(10).join(outs)}
@@ -224,7 +227,10 @@ initial begin
     rc = $fscanf(fi, "%b", vec);
 {clk_lo}
 {chr(10).join(drive)}
-    #5;
+    #4;
+{chr(10).join(sample)}
+    $fwrite(fo, " ");
+    #1;
 {clk_hi}
     #4;
 {chr(10).join(sample)}
@@ -271,7 +277,10 @@ initial begin
     rc = $fscanf(fi, "%b", vec);
 {clk_lo}
 {chr(10).join(drive)}
-    #5;
+    #4;
+{chr(10).join(sample)}
+    $fwrite(fo, " ");
+    #1;
 {clk_hi}
     #4;
 {chr(10).join(sample)}
@@ -389,8 +398,13 @@ def run(workdir: str, rtl_files: list[str], top: str, xdc: str, netlist_v: str,
     res.log = "\n".join(logs)
     a = open(rtl_trace).read().split()
     b = open(net_trace).read().split()
-    for k, (ra, nb) in enumerate(zip(a, b)):
-        for i, bitname in enumerate(out_bits):
+    # Two samples per cycle: just before the rising edge (inputs settled;
+    # catches combinational paths and asynchronous set/reset) and after it.
+    for t, (ra, nb) in enumerate(zip(a, b)):
+        k = t // 2
+        pre = t % 2 == 0
+        for i, bitname0 in enumerate(out_bits):
+            bitname = f"{bitname0} (before edge)" if pre else bitname0
             rv, nv = ra[i], nb[i]
             if nv == "-":
                 continue

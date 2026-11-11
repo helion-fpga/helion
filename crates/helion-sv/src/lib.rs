@@ -575,7 +575,14 @@ struct Inst<'a> {
     /// child port → parent net (ident)
     conns: Vec<(&'a str, &'a str)>,
     params: Vec<(String, u128)>,
+    /// Port actuals that are expressions (bit/part selects, concatenations,
+    /// operators, constants): (child port or `#pos`, value, and the bit-level
+    /// lvalue when the actual can be assigned). Lowered through a fresh wire
+    /// once the child's port direction is known (`lower_inst_exprs`).
+    exprs: Vec<InstExpr<'a>>,
 }
+
+type InstExpr<'a> = (&'a str, RExpr<'a>, Option<Vec<(&'a str, Option<usize>)>>);
 
 #[derive(Clone, Debug)]
 struct Rtl<'a> {
@@ -738,6 +745,10 @@ thread_local! {
     /// Posedge always writes that still need an Hff on the always edge.
     static SEQ_WRITES: std::cell::RefCell<Vec<(String, String, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Asynchronous set/reset per module, peeled off the clocked logic at
+    /// parse time and attached to the flops' SR pins after mapping.
+    static ASYNC_RESETS: std::cell::RefCell<HashMap<String, Vec<AsyncReset>>> =
+        std::cell::RefCell::new(HashMap::new());
     /// Clock net from the first posedge/negedge of each module.
     static EDGE_CLK: std::cell::RefCell<HashMap<String, String>> =
         std::cell::RefCell::new(HashMap::new());
@@ -1520,6 +1531,60 @@ fn range_span(lo: usize, hi: usize) -> Option<usize> {
 fn clear_seq_notes() {
     SEQ_WRITES.with(|s| s.borrow_mut().clear());
     EDGE_CLK.with(|m| m.borrow_mut().clear());
+}
+
+/// One register (or register bit) with an asynchronous set/reset:
+/// `always @(posedge clk or posedge rst) if (rst) q <= VAL; else ...`.
+#[derive(Clone, Debug)]
+struct AsyncReset {
+    reg: String,
+    bit: Option<usize>,
+    rst: String,
+    active_high: bool,
+    /// Value loaded while the reset is active; `None` when the reset branch
+    /// is not a constant (asynchronous load), which is not lowered.
+    val: Option<u128>,
+}
+
+/// `cond` tests `rst` for its active level: `(active_high)`.
+fn async_cond_level(cond: &RExpr<'_>, rst: &str) -> Option<bool> {
+    let is_rst = |e: &RExpr<'_>| matches!(e, RExpr::Ident(n) if *n == rst);
+    let cval = |e: &RExpr<'_>| match e {
+        RExpr::Const { val, .. } => Some(*val & 1 == 1),
+        _ => None,
+    };
+    match cond {
+        e if is_rst(e) => Some(true),
+        RExpr::Not(x) if is_rst(x) => Some(false),
+        RExpr::Not(x) => async_cond_level(x, rst).map(|h| !h),
+        RExpr::Eq(a, b) if is_rst(a) => cval(b),
+        RExpr::Eq(a, b) if is_rst(b) => cval(a),
+        RExpr::Ne(a, b) if is_rst(a) => cval(b).map(|v| !v),
+        RExpr::Ne(a, b) if is_rst(b) => cval(a).map(|v| !v),
+        _ => None,
+    }
+}
+
+/// Fold a constant expression (bit extraction of a literal and friends).
+fn fold_const_rexpr(e: &RExpr<'_>) -> Option<u128> {
+    Some(match e {
+        RExpr::Const { val, .. } => *val,
+        RExpr::Shr(a, b) => fold_const_rexpr(a)?.checked_shr(fold_const_rexpr(b)? as u32).unwrap_or(0),
+        RExpr::Shl(a, b) => fold_const_rexpr(a)?.checked_shl(fold_const_rexpr(b)? as u32).unwrap_or(0),
+        RExpr::And(a, b) => fold_const_rexpr(a)? & fold_const_rexpr(b)?,
+        RExpr::Or(a, b) => fold_const_rexpr(a)? | fold_const_rexpr(b)?,
+        RExpr::Xor(a, b) => fold_const_rexpr(a)? ^ fold_const_rexpr(b)?,
+        _ => return None,
+    })
+}
+
+/// Peel `rst ? VAL : rest` (or `!rst ? rest : VAL`) off a register's next
+/// state. Returns (constant reset value, the clocked remainder).
+fn peel_async_reset<'a, 'e>(rhs: &'e RExpr<'a>, rst: &str, active_high: bool) -> Option<(Option<u128>, &'e RExpr<'a>)> {
+    let RExpr::Mux(c, t, e) = rhs else { return None };
+    let lvl = async_cond_level(c, rst)?;
+    let (reset_branch, rest) = if lvl == active_high { (*t, *e) } else { (*e, *t) };
+    Some((fold_const_rexpr(reset_branch), rest))
 }
 
 fn note_seq_write(module: &str, clk: &str, signal: &str) {
@@ -7644,6 +7709,7 @@ fn parse_preprocessed(pre: String) -> Result<Vec<Rtl<'static>>, String> {
     if mods.is_empty() {
         return Err("no module".into());
     }
+    lower_inst_exprs(&mut mods, arena);
     Ok(mods)
 }
 
@@ -7921,16 +7987,17 @@ fn skip_until_arg_end<'a>(p: &mut P<'a>) {
 /// Combo is `@*` / `@(*)` (no edge). Async `posedge clk or negedge nreset`
 /// is treated like sync; the first edge name is the user's clock.
 /// `negedge_only` is a lone falling edge — not mixed with posedge.
-fn skip_event_control<'a>(p: &mut P<'a>) -> (bool, Option<String>, bool) {
+fn skip_event_control<'a>(p: &mut P<'a>) -> (bool, Option<String>, bool, Vec<(String, bool)>) {
     let _ = p.eat_sym('@');
     if p.eat_sym('*') {
-        return (true, None, false);
+        return (true, None, false, Vec::new());
     }
+    let mut edges: Vec<(String, bool)> = Vec::new();
     if p.eat_sym('(') {
         let start = p.i;
         if p.eat_sym('*') && matches!(p.peek(), Some(Tok::Sym(')'))) {
             p.bump();
-            return (true, None, false);
+            return (true, None, false, Vec::new());
         }
         p.i = start;
         let mut d = 1i32;
@@ -7940,6 +8007,9 @@ fn skip_event_control<'a>(p: &mut P<'a>) -> (bool, Option<String>, bool) {
         while d > 0 && p.peek().is_some() {
             if p.eat_kw("posedge") {
                 has_posedge = true;
+                if let Some(Tok::Ident(name)) = p.peek() {
+                    edges.push((name.to_string(), true));
+                }
                 if clk.is_none() {
                     if let Some(Tok::Ident(name)) = p.peek() {
                         clk = Some(name.to_string());
@@ -7950,6 +8020,9 @@ fn skip_event_control<'a>(p: &mut P<'a>) -> (bool, Option<String>, bool) {
             }
             if p.eat_kw("negedge") {
                 has_negedge = true;
+                if let Some(Tok::Ident(name)) = p.peek() {
+                    edges.push((name.to_string(), false));
+                }
                 if clk.is_none() {
                     if let Some(Tok::Ident(name)) = p.peek() {
                         clk = Some(name.to_string());
@@ -7966,9 +8039,9 @@ fn skip_event_control<'a>(p: &mut P<'a>) -> (bool, Option<String>, bool) {
             }
         }
         let has_edge = has_posedge || has_negedge;
-        return (!has_edge, clk, has_negedge && !has_posedge);
+        return (!has_edge, clk, has_negedge && !has_posedge, edges);
     }
-    (false, None, false)
+    (false, None, false, edges)
 }
 
 fn skip_for_rest<'a>(p: &mut P<'a>) {
@@ -9770,7 +9843,7 @@ fn parse_module_items<'a>(
             continue;
         }
         if p.eat_kw("always_ff") || p.eat_kw("always") || p.eat_kw("always_latch") {
-            let (combo, edge_clk, negedge_only) = skip_event_control(p);
+            let (combo, edge_clk, negedge_only, edges) = skip_event_control(p);
             if sim_only_for(&cur_mod()) {
                 let _ = (combo, edge_clk, negedge_only);
                 skip_procedural_body(p);
@@ -9812,7 +9885,29 @@ fn parse_module_items<'a>(
                             }
                         }
                     } else {
-                        // Includes async `posedge clk or negedge rst` (sync-reset mux).
+                        // Async `posedge clk or posedge/negedge rst`: peel the
+                        // reset mux off each register's next state; the SR pin
+                        // carries it (apply_async_resets).
+                        let mut stmts = stmts;
+                        if edges.len() > 1 {
+                            let (rst, posedge) = edges[1].clone();
+                            let mut recs = Vec::new();
+                            for (lhs, bit, rhs) in stmts.iter_mut() {
+                                match peel_async_reset(rhs, &rst, posedge) {
+                                    Some((val, rest)) => {
+                                        recs.push(AsyncReset { reg: lhs.to_string(), bit: *bit, rst: rst.clone(), active_high: posedge, val });
+                                        *rhs = rest.clone();
+                                    }
+                                    None => recs.push(AsyncReset { reg: lhs.to_string(), bit: *bit, rst: rst.clone(), active_high: posedge, val: None }),
+                                }
+                            }
+                            if edges.len() > 2 {
+                                for r in recs.iter_mut() {
+                                    r.val = None; // set and reset on one flop: one SR pin
+                                }
+                            }
+                            ASYNC_RESETS.with(|m| m.borrow_mut().entry(cur_mod()).or_default().extend(recs));
+                        }
                         let clk = edge_clk.unwrap_or_else(|| "clk".into());
                         if stmts.is_empty() {
                             let sig = seq_lhs_from_toks(&p.t[body_start..p.i]);
@@ -10178,6 +10273,16 @@ fn parse_for_unroll_module<'a>(
                     *net = n;
                 }
             }
+            for (_, e, lv) in inst.exprs.iter_mut() {
+                *e = rewrite_rexpr(e, &subst, sp.arena);
+                if let Some(parts) = lv.as_mut() {
+                    for (n, _) in parts.iter_mut() {
+                        if let Some(&x) = subst.get(*n) {
+                            *n = x;
+                        }
+                    }
+                }
+            }
             insts.push(inst);
         }
         for (lhs, bit, rhs) in local_nbas {
@@ -10375,6 +10480,7 @@ fn parse_inst<'a>(p: &mut P<'a>) -> Result<Inst<'a>, String> {
         return Err("inst (".into());
     }
     let mut conns = Vec::new();
+    let mut exprs: Vec<InstExpr<'a>> = Vec::new();
     let mut pos = 0usize;
     loop {
         let i0 = p.i;
@@ -10394,16 +10500,23 @@ fn parse_inst<'a>(p: &mut P<'a>) -> Result<Inst<'a>, String> {
                 }
             };
             if p.eat_sym('(') {
-                if let Some(net) = parse_inst_net(p) {
-                    conns.push((port, net));
+                match parse_inst_actual(p) {
+                    InstActual::Net(net) => conns.push((port, net)),
+                    InstActual::Expr(e, lv) => exprs.push((port, e, lv)),
+                    InstActual::None => {}
                 }
                 let _ = p.eat_sym(')');
             } else {
                 conns.push((port, port));
             }
-        } else if let Some(net) = parse_inst_net(p) {
+        } else {
             // Positional port marker: arena-borrowed, not an owned String per port.
-            conns.push((p.arena.alloc_str(&format!("#{pos}")), net));
+            let marker = p.arena.alloc_str(&format!("#{pos}"));
+            match parse_inst_actual(p) {
+                InstActual::Net(net) => conns.push((marker, net)),
+                InstActual::Expr(e, lv) => exprs.push((marker, e, lv)),
+                InstActual::None => {}
+            }
             pos += 1;
         }
         let _ = p.eat_sym(',');
@@ -10417,7 +10530,150 @@ fn parse_inst<'a>(p: &mut P<'a>) -> Result<Inst<'a>, String> {
         name,
         conns,
         params,
+        exprs,
     })
+}
+
+enum InstActual<'a> {
+    None,
+    Net(&'a str),
+    Expr(RExpr<'a>, Option<Vec<(&'a str, Option<usize>)>>),
+}
+
+/// One port actual. A plain identifier stays a net; anything else (bit or
+/// part select, concatenation, operator, constant) is parsed as an
+/// expression, with its bit-level lvalue when it has one.
+fn parse_inst_actual<'a>(p: &mut P<'a>) -> InstActual<'a> {
+    if matches!(p.peek(), Some(Tok::Sym(')'))) {
+        return InstActual::None;
+    }
+    let start = p.i;
+    if let Some(Tok::Ident(n)) = p.peek() {
+        let n = *n;
+        p.bump();
+        if matches!(p.peek(), Some(Tok::Sym(')')) | Some(Tok::Sym(','))) {
+            return InstActual::Net(n);
+        }
+        p.i = start;
+    }
+    // Lvalue shape: `x[i]`, `x[h:l]`, `{a, b[3], c[2:0]}`.
+    let lv = {
+        let save = p.i;
+        let mut parts: Vec<(&'a str, Option<usize>)> = Vec::new();
+        let mut ok = true;
+        let mut one = |p: &mut P<'a>, parts: &mut Vec<(&'a str, Option<usize>)>| -> bool {
+            match parse_lhs(p) {
+                Ok(LhsKind::Whole(n)) => parts.push((n, None)),
+                Ok(LhsKind::Bit(n, b)) => parts.push((n, Some(b))),
+                Ok(LhsKind::Slice { name, lo, width }) => {
+                    for i in (0..width.max(1)).rev() {
+                        parts.push((name, Some(lo + i)));
+                    }
+                }
+                _ => return false,
+            }
+            true
+        };
+        if p.eat_sym('{') {
+            loop {
+                if !one(p, &mut parts) {
+                    ok = false;
+                    break;
+                }
+                if p.eat_sym(',') {
+                    continue;
+                }
+                if !p.eat_sym('}') {
+                    ok = false;
+                }
+                break;
+            }
+        } else {
+            ok = one(p, &mut parts);
+        }
+        let end_ok = matches!(p.peek(), Some(Tok::Sym(')')) | Some(Tok::Sym(',')));
+        p.i = save;
+        (ok && end_ok).then_some(parts)
+    };
+    match parse_rexpr(p) {
+        Ok(e) => {
+            skip_until_arg_end(p);
+            InstActual::Expr(e, lv)
+        }
+        Err(_) => {
+            p.i = start;
+            skip_until_arg_end(p);
+            note_skip(format!("diagnostic inst_actual_not_parsed module={} (port actual expression not parsed; port left unconnected)", cur_mod()));
+            InstActual::None
+        }
+    }
+}
+
+/// Lower expression port actuals through fresh parent wires, now that every
+/// module's port directions and widths are known: an input gets
+/// `assign wire = expr`, an output assigns its lvalue bits from the wire.
+fn lower_inst_exprs(mods: &mut [Rtl<'static>], arena: &'static Bump) {
+    let ports: HashMap<&str, Vec<(&str, PortDir, usize)>> = mods.iter().map(|m| (m.module, m.ports.clone())).collect();
+    for m in mods.iter_mut() {
+        let mut plan: Vec<(usize, &'static str, &'static str, PortDir, usize, RExpr<'static>, Option<Vec<(&'static str, Option<usize>)>>)> = Vec::new();
+        for (ii, inst) in m.insts.iter().enumerate() {
+            for (port, e, lv) in &inst.exprs {
+                let child = ports.get(inst.module);
+                let found = child.and_then(|cp| match port.strip_prefix('#').and_then(|k| k.parse::<usize>().ok()) {
+                    Some(k) => cp.get(k).copied(),
+                    None => cp.iter().find(|(n, _, _)| n == port).copied(),
+                });
+                let (dir, w) = match found {
+                    Some((_, d, w)) => (d, w.max(1)),
+                    None => (PortDir::In, rexpr_width(e, m).max(1)),
+                };
+                let temp: &'static str = arena.alloc_str(&format!("hv_ix_{}_{}", inst.name, port.trim_start_matches('#')));
+                plan.push((ii, port, temp, dir, w, e.clone(), lv.clone()));
+            }
+        }
+        for (ii, port, temp, dir, w, e, lv) in plan {
+            m.insts[ii].conns.push((port, temp));
+            m.signals.push(Signal { name: temp, width: w, depth: 0, keep: false, mark_debug: false, force_bram: false });
+            if dir == PortDir::In {
+                m.assigns.push((temp, None, e));
+                continue;
+            }
+            let Some(parts) = lv else {
+                note_skip(format!(
+                    "diagnostic inst_output_expr_not_lowered module={} inst={} port={port} (output port connected to a non-assignable expression)",
+                    m.module, m.insts[ii].name
+                ));
+                continue;
+            };
+            // Parts are MSB first; expand whole signals to their bits.
+            let mut bits: Vec<(&'static str, Option<usize>)> = Vec::new();
+            for (n, b) in parts {
+                match b {
+                    Some(_) => bits.push((n, b)),
+                    None => {
+                        let sw = sig_width(m, n).max(1);
+                        if sw == 1 {
+                            bits.push((n, None));
+                        } else {
+                            for i in (0..sw).rev() {
+                                bits.push((n, Some(i)));
+                            }
+                        }
+                    }
+                }
+            }
+            for (k, (n, b)) in bits.iter().rev().enumerate() {
+                if k >= w {
+                    break;
+                }
+                let src = if w == 1 { RExpr::Ident(temp) } else { RExpr::Bit(temp, k) };
+                m.assigns.push((*n, *b, src));
+            }
+        }
+        for inst in m.insts.iter_mut() {
+            inst.exprs.clear();
+        }
+    }
 }
 
 fn sig_width(rtl: &Rtl, name: &str) -> usize {
@@ -17488,6 +17744,29 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                         eprintln!(
                             "synth_rtl concat_align signal={lhs} zeros={zeros} bus_lo={bus_lo}"
                         );
+                        // Drive every bit now: internal wires read through
+                        // these nets too (outputs used to be the only
+                        // consumers). Buffers are `u_obuf_*` so they are
+                        // collapsed once hierarchy is stitched.
+                        let w = sig_width(rtl, lhs).max(1);
+                        let bw = sig_width(rtl, &bus).max(1);
+                        for i in 0..w.min(4096) {
+                            let want = bit_name(lhs, w, i);
+                            let src = (i >= zeros).then(|| bus_lo + (i - zeros)).filter(|s| *s < bw);
+                            match src {
+                                Some(s) => {
+                                    let lut = format!("u_obuf_{want}");
+                                    d.add_cell(&lut, CellKind::Lut6 { init: 0xAAAA_AAAA_AAAA_AAAA });
+                                    d.connect(&bit_name(&bus, bw, s), &lut, "I0");
+                                    d.connect(&want, &lut, "O");
+                                }
+                                None => {
+                                    let lut = format!("u_oconst_{want}");
+                                    d.add_cell(&lut, CellKind::Lut6 { init: 0 });
+                                    d.connect(&want, &lut, "O");
+                                }
+                            }
+                        }
                         concat_align.push((lhs.to_string(), bus, zeros, bus_lo));
                     }
                     Err(()) => {
@@ -17895,13 +18174,15 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             continue;
         }
         let init = aig.flowmap_lut6();
+        // D nets carry a reserved prefix: `d`/`d0` are ordinary user names
+        // (a port called `d` once merged with this net in hierarchy).
         let (lut, ff, dnet, qnet) = if single_q {
-            ("u_lut".into(), "u_ff".into(), "d".into(), "q".into())
+            ("u_lut".into(), "u_ff".into(), "hv_d_q".into(), "q".into())
         } else {
             (
                 format!("u_lut{i}"),
                 format!("u_ff{i}"),
-                format!("d{i}"),
+                format!("hv_d_{bitn}"),
                 bitn.clone(),
             )
         };
@@ -18265,6 +18546,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     }
     let _ = (&carry_ffs, &reg_bits);
     apply_var_inits(&mut d, rtl);
+    apply_async_resets(&mut d, rtl);
     Ok(d)
 }
 
@@ -18518,6 +18800,78 @@ fn emit_root_iobs(d: &mut Design, top: &Rtl) {
 /// with `INIT=1` (Vivado FDRE/FDSE INIT). Flops are found by their Q net,
 /// which carries the register bit's name. Bits starting at 0 need nothing:
 /// a flop without `INIT` starts at 0.
+/// Connect asynchronous set/reset (recorded at parse time) to the flops'
+/// SR pins: `SR_ASYNC=1`, `SRVAL` = the constant loaded while active. An
+/// active-low reset goes through an inverter (the slice SR is active high).
+/// A register whose reset could not be lowered (non-constant value, set and
+/// reset on one flop, flop not found) flags `ASYNC_RESET_NOT_LOWERED`.
+fn apply_async_resets(d: &mut Design, rtl: &Rtl) {
+    let recs = ASYNC_RESETS.with(|m| m.borrow_mut().remove(rtl.module).unwrap_or_default());
+    if recs.is_empty() {
+        return;
+    }
+    let pins = d.pin_index();
+    let mut ff_of_q: HashMap<String, String> = HashMap::new();
+    for c in &d.cells {
+        if matches!(c.kind, CellKind::Hff) {
+            if let Some(q) = pins.net_on(&c.name, "Q") {
+                ff_of_q.insert(q.to_string(), c.name.clone());
+            }
+        }
+    }
+    drop(pins);
+    let mut failed: Vec<String> = Vec::new();
+    let mut inverters: HashSet<String> = HashSet::new();
+    let mut work: Vec<(String, String, bool)> = Vec::new(); // (ff, sr net, srval)
+    for r in &recs {
+        let Some(val) = r.val else {
+            failed.push(r.reg.clone());
+            continue;
+        };
+        let w = sig_width(rtl, &r.reg).max(1);
+        let bits: Vec<(usize, bool)> = match r.bit {
+            Some(b) => vec![(b, val & 1 == 1)],
+            None => (0..w.min(128)).map(|i| (i, (val >> i) & 1 == 1)).collect(),
+        };
+        let rst_net = bit_name(&r.rst, sig_width(rtl, &r.rst).max(1), 0);
+        let sr_net = if r.active_high {
+            rst_net.clone()
+        } else {
+            let n = format!("hv_arst_n_{rst_net}");
+            if inverters.insert(n.clone()) {
+                let cell = format!("u_arst_inv_{rst_net}");
+                d.add_cell(&cell, CellKind::Lut6 { init: 0x5555_5555_5555_5555 });
+                d.connect(&rst_net, &cell, "I0");
+                d.connect(&n, &cell, "O");
+            }
+            n
+        };
+        for (i, v) in bits {
+            let q = bit_name(&r.reg, w, i);
+            match ff_of_q.get(&q) {
+                Some(ff) => work.push((ff.clone(), sr_net.clone(), v)),
+                None => failed.push(q),
+            }
+        }
+    }
+    for (ff, sr, v) in &work {
+        d.connect(sr, ff, "SR");
+        if let Some(c) = d.cells.iter_mut().find(|c| &c.name == ff) {
+            c.attrs.set("SR_ASYNC", "1");
+            c.attrs.set("SRVAL", if *v { "1" } else { "0" });
+        }
+    }
+    if !failed.is_empty() {
+        note_skip(format!(
+            "diagnostic async_reset_not_lowered module={} regs={} (asynchronous set/reset not mapped to the flop SR pin)",
+            rtl.module,
+            failed.iter().take(8).cloned().collect::<Vec<_>>().join(",")
+        ));
+        d.attrs.set("ASYNC_RESET_NOT_LOWERED", "1");
+    }
+    d.rebuild_indexes();
+}
+
 fn apply_var_inits(d: &mut Design, rtl: &Rtl) {
     if rtl.var_inits.is_empty() {
         return;
@@ -19761,13 +20115,15 @@ mod tests {
     #[test]
     fn inverter_and_buffer_and_zero_differ() {
         let inv = lut_init_of(&wrap("~q")).expect("inv");
-        let buf = lut_init_of(&wrap("q")).expect("buf");
         let z = lut_init_of(&wrap("1'b0")).expect("zero");
         assert_eq!(inv, 0x5555_5555_5555_5555);
-        assert_eq!(buf, 0xAAAA_AAAA_AAAA_AAAA);
         assert_eq!(z, 0);
-        assert_ne!(inv, buf);
-        assert_ne!(buf, z);
+        // `q <= q`: the identity LUT is bypassed by the netlist peephole and
+        // the flop's D reads its own Q.
+        let d = synth_sv(&wrap("q"), "t.sv").unwrap();
+        assert!(d.cell("u_lut").is_none(), "buffer LUT kept: {:?}", d.cells);
+        let ff = d.cells.iter().find(|c| matches!(c.kind, CellKind::Hff)).expect("ff");
+        assert_eq!(d.net_on(&ff.name, "D"), d.net_on(&ff.name, "Q"));
     }
 
     #[test]
@@ -19970,6 +20326,7 @@ endmodule
             name: "u_n".into(),
             conns: vec![("a".into(), "pa".into()), ("q".into(), "pq".into())],
             params: vec![],
+            exprs: vec![],
         };
         let mut dst = Design::new("top");
         super::stitch_child(&mut dst, &child, &named);
@@ -19980,6 +20337,7 @@ endmodule
             name: "u_p".into(),
             conns: vec![("#0".into(), "xa".into()), ("#1".into(), "xq".into())],
             params: vec![],
+            exprs: vec![],
         };
         super::stitch_child(&mut dst, &child, &pos);
         assert_eq!(dst.net_on("u_p_ff", "D"), Some("xa"));
@@ -20000,6 +20358,7 @@ endmodule
                 name: Box::leak(format!("u{i}").into_boxed_str()),
                 conns: vec![],
                 params: vec![],
+                exprs: vec![],
             };
             super::stitch_child(&mut dst, &child, &inst);
         }
