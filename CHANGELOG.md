@@ -3,8 +3,142 @@
 All notable Helion releases are listed here. Version numbers match
 `workspace.package.version` in `Cargo.toml` and Git tags `vMAJOR.MINOR.PATCH`.
 Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/helion/releases).
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [4.0.0] — Unreleased
+
+Helion 4.0 replaces the desktop IDE. The new `helion-ide` is built from
+scratch on the [Rune](https://github.com/anomalyco/rune) UI framework and
+covers the whole design flow, from sources to a programmed board, in one
+Vivado-style window. Rune is vendored, so a plain clone builds. The native
+JTAG engine now talks to real hardware. The empty-XDC `examples/counter.sv`
+gold is unchanged: `WNS_PS=9640`, `LED[16]=0000000111111110`.
+
+### Added
+
+- **New IDE (`crates/helion-rune`, binary `helion-ide`).** Shipped in
+  `Helion.app`, the release tarballs and `helion gui`.
+  - Shell: Flow Navigator, menus, command palette, resizable and hideable
+    docks with layout presets, Start page with recent projects and bundled
+    examples, background jobs with status-bar progress, light and dark
+    themes.
+  - Project: New Project wizard with a board picker and a family-grouped part
+    picker (every part a backend can implement), `.prj` sources and
+    constraint files, Design Runs table with strategies, seed sweeps, a run
+    queue, checkpoints and incremental runs, out-of-context module runs,
+    project archive and hardware-platform hand-off.
+  - Editor: SystemVerilog, VHDL and Tcl highlighting, find and replace,
+    outline, parse diagnostics, bookmarks, go to definition, large-file mode,
+    and a Language Templates library that inserts at the caret.
+  - Device: die view with site-kind layers, congestion and timing-criticality
+    heat maps, rulers and zoom to selection; I/O planning with an I/O ports
+    table and a package-pin grid; pblocks that steer placement.
+  - Schematic: fan-in and fan-out cones, expand and collapse, selection
+    history, sheet find, Fit, Mark Debug.
+  - Timing: summary, path table and path detail, clocks, clock interaction
+    matrix, CDC, endpoint-slack histogram, Timing Constraints pane and a
+    five-step Constraints Wizard.
+  - Reports: utilization, power (vectorless and VCD-driven), DRC,
+    methodology, clock utilization, control sets, SSN, IBIS, QoR
+    suggestions, bitstream frames.
+  - Simulation and verification: testbench runner, simulation settings,
+    waveform viewer with cursors, radix, fixed-point and analog display,
+    virtual buses and SPI/UART/AXI-Lite/FSM decoder lanes, saved wave
+    layouts (`.wcfg`), simulation debugger (breakpoints, memory, locals,
+    forces), code coverage with an editor gutter overlay.
+  - Hardware: Hardware Manager tree, Set Up Debug, hardware ILA, VIO
+    dashboard, JTAG-to-AXI console, configuration memory (erase, blank
+    check, program, verify, read back, boot), JTAG chain card with TCK
+    picker and raw IR/DR scans.
+  - Design: IP Catalog and IP Integrator block design with connection
+    automation, customize and package IP; High-Level Synthesis pane with
+    kernel editor, directives, C synthesis and C/RTL co-simulation; ECO
+    view; partial reconfiguration (DFX) view.
+  - Tcl console on the same engines as the GUI: the full verb set of the
+    previous IDE plus run, report, hardware, DFX and ECO verbs.
+- **Windowless IDE modes**, all on the IDE's own Tcl interpreter:
+  `helion-ide --headless <file>` (full flow plus `report_timing`; prints
+  `WNS_PS`), `--source script.tcl` (batch, exit 1 on the first error),
+  `--stdin` (line-by-line console), `--version`, `--doctor`, `--help`.
+- **Native JTAG engine** (`helion-hw`): IEEE 1149.1 over FTDI MPSSE through
+  libusb, with a mock FTDI device for tests. Verified read-only against a
+  real ZedBoard (on-board Digilent FT232H): the chain `xc7z020` plus ARM DAP
+  enumerates and matches openFPGALoader, stable at 1, 6, 15 and 30 MHz.
+  - Digilent cables get their own pin profile, picked from the USB
+    descriptor (the generic AN_129 pins left TDO floating).
+  - Above 15 MHz TDO is sampled on the falling edge;
+    `HELION_JTAG_READ_EDGE=rising|falling` overrides.
+  - `open_hw_target -cable auto|sim|usb|native` reaches the native chain
+    from Tcl; `examples/native_scan.rs` is a read-only engine check.
+  - Programming over the native cable is implemented but not yet verified
+    on a board; the IDE says so wherever it offers it.
+- ILA, VIO and JTAG-to-AXI run over any JTAG cable (simulated TAP or the
+  native FTDI engine) through `helion-debug`.
+- Engines added for the IDE: implementable-part registry and family
+  dispatch (`helion-targets`: HL10, iCE40, ECP5, and 7-series when the
+  Project X-Ray database is present), out-of-context synthesis with a
+  checkpoint cache, testbench code coverage, ECO operations with
+  incremental implement and ECO bitstream diff, DFX partitions with
+  per-module partial bitstreams, pblock placement regions with a `PBLK-1`
+  DRC, configuration-memory parts and `write_cfgmem`, `report_control_sets`,
+  an IBIS writer, SSN over placed ports, VCD-driven power in `helion-sta`,
+  `$urandom`, `$urandom_range` and `randcase` in testbenches, SystemVerilog
+  testbenches driving VHDL DUTs, and C/RTL co-simulation in the gate
+  simulator.
+- `helion-verif`: the ILA and testbench engines, extracted so the IDE and
+  CLI share them. `examples/counter_tb.sv` is a self-checking testbench.
+- `helion equiv` and `helion synth --verify`: SAT-based equivalence between
+  pre- and post-optimization netlists.
+- Synthesis and implementation: `Dsp48e1` and `Bram18e1` IR cells with
+  pins, DSP48E1 FASM emission for 7-series, NPN-based AIG cut rewriting,
+  AIG balancing, timing-driven placement ordered by net criticality, CDC
+  2-FF synchronizer and handshake detection, parallel module elaboration.
+- A 77-PR engineering campaign (October 2026) added library-level engines
+  across synthesis, packing, placement, routing, STA, DRC, simulation,
+  formal verification, HLS, hardware debug and the IP catalog. Many of these
+  passes are not yet wired into the default `synth → place → route` flow;
+  [`notes/reports/CAMPAIGN_REPORT_AND_ROADMAP.md`](notes/reports/CAMPAIGN_REPORT_AND_ROADMAP.md)
+  lists them and what remains.
+
+### Changed
+
+- **Rune is vendored** in `third_party/rune` (MIT, upstream commit
+  `a7f276c`), with its license. A fresh clone, a CI runner or a source
+  tarball builds without a sibling checkout. `scripts/sync-rune.sh`
+  re-vendors any upstream commit and records it in
+  `third_party/rune/VENDORED.md`.
+- **Rust 1.99.1.** `rust-toolchain.toml` pins it and rustup installs it on
+  first build. Rust 1.85 can no longer build the workspace.
+- Building on Linux needs `pkg-config`, `libxkbcommon-dev`,
+  `libwayland-dev` and `libusb-1.0-0-dev`. The Linux `helion-ide` needs
+  `libxkbcommon0`, `libwayland-client0` and `libusb-1.0-0` at run time.
+- CI installs those packages, builds with `--locked` everywhere, requires
+  the `helion-rune` and `helion-hw` tests, and checks the counter gold with
+  `helion-ide --headless`. The full workspace test run is informational.
+- Release builds use Rust 1.99.1; the Linux tarball now includes
+  `helion-ide`, and the release notes list its runtime libraries. The macOS
+  `.app` bundle test moved to `helion-rune`.
+- **License: AGPL-3.0-or-later** (previously MIT OR Apache-2.0).
+  [`TRADEMARKS.md`](TRADEMARKS.md) covers the Helion name and logo.
+- Interned net and cell names (`Spur`) across the IR and backends.
+- Test builds hide real FTDI devices; `HELION_TEST_REAL_USB=1` opts in.
+
+### Deprecated
+
+- The egui IDE (`crates/helion-gui`) is now `helion-ide-egui`. It still
+  builds on this branch and is removed when 4.0 lands on `master`.
+
+### Fixed
+
+- Hardware ILA lists the debug core's probes instead of the simulation
+  probe list.
+- JTAG-to-AXI reads that return DECERR no longer report data.
+- BSCAN USER2 and USER4 no longer collide on the TAP.
+- One test shelled a real openFPGALoader and another sent configuration
+  opcodes to a connected cable; both are now impossible in test builds, and
+  a poisoned openFPGALoader environment lock no longer fails unrelated tests.
+
+[4.0.0]: https://github.com/helion-fpga/helion/compare/v3.0.0...HEAD
 
 ## [3.0.0] — 2026-10-12
 
@@ -62,6 +196,8 @@ Two new product tracks plus a reliability sweep and a major IDE upgrade.
   `RExpr::Shl`), placer seed/site-index invariant, VCD truncation flag,
   generated-clock constraint target port, Tcl `set_property KEEP`, and Tcl
   `string range` out-of-range handling.
+
+[3.0.0]: https://github.com/helion-fpga/helion/compare/v2.5.0...v3.0.0
 
 ## [2.5.0] — 2026-10-12
 
