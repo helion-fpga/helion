@@ -7,11 +7,16 @@
 pub mod address_drc;
 pub mod codegen;
 pub mod graph;
+pub mod system;
 pub mod tcl;
 
 pub use address_drc::*;
 pub use codegen::*;
 pub use graph::*;
+pub use system::{
+    AutomationPlan, BdSystem, DecodedSlave, InterconnectInfo, MM_APERTURE, MM_PERIPH_BASE,
+    PlannedConnection, SysCell, SysDiagnostic, SystemEmit, TopPort, emit_system,
+};
 pub use helion_ipxact::{
     AddressBlock, BusInterface, BusInterfaceType, InterfaceMode, IpComponent, IpCore, IpParameter,
     IpPort, MemoryMap, ParamValue, PortDirection, PortMapEntry, RegisterDef as IpxactRegisterDef,
@@ -166,6 +171,13 @@ pub fn emit_sv(bd: &BlockDesign) -> Result<String, String> {
     let v = validate(bd);
     if !v.ok {
         return Err(v.errors.join("; "));
+    }
+    // Every core packaged with RTL: emit the real system (cells wired to a
+    // Helion-MM interconnect at the same apertures `build_memory_map` reports).
+    if !bd.cores.is_empty() {
+        if let Some(sys) = BdSystem::from_block_design(bd) {
+            return emit_system(&sys).map(|e| e.sv);
+        }
     }
     let mut s = format!(
         "module {} (\n  input logic clk,\n  input logic resetn\n);\n",

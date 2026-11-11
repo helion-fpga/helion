@@ -1,10 +1,17 @@
 //! IEEE 1685-style pack/reimport (minimal XML). Helion-MM/ST, not AXI.
 
 use std::path::Path;
+pub mod core_model;
 pub mod generators;
 pub mod model;
 pub mod rtl;
 
+pub use core_model::{
+    CoreModel, CoreParam, InferredBus, MmRole, PackageRequest, ParamKind, RtlModule, RtlPort,
+    component_xml, ip_repo_dir, is_clock_or_reset, is_mm_signal, load_core_model,
+    load_core_model_at, load_core_model_in, package_user_ip, parse_param_number,
+    parse_rtl_module, scan_repository,
+};
 pub use generators::*;
 pub use model::*;
 pub use rtl::*;
@@ -2550,6 +2557,8 @@ pub struct HelionPackage {
     pub constraints: Vec<String>,
     /// Absolute path of the loaded manifest (empty when parsed from a string).
     pub manifest_path: std::path::PathBuf,
+    /// Configurable parameters (`param NAME TYPE DEFAULT ...` lines).
+    pub params: Vec<CoreParam>,
 }
 
 impl HelionPackage {
@@ -2637,6 +2646,7 @@ pub fn parse_helion(text: &str) -> Result<HelionPackage, String> {
         files: Vec::new(),
         constraints: Vec::new(),
         manifest_path: std::path::PathBuf::new(),
+        params: Vec::new(),
     };
     let mut saw_format = false;
     for raw in text.lines() {
@@ -2706,6 +2716,10 @@ pub fn parse_helion(text: &str) -> Result<HelionPackage, String> {
                 if let Some(v) = toks.next() {
                     pkg.files.push(v.to_string());
                 }
+            }
+            "param" => {
+                let body = line["param".len()..].trim();
+                pkg.params.push(CoreParam::parse_decl(body)?);
             }
             "xdc" | "sdc" | "read_xdc" | "read_sdc" | "constraint" => {
                 if let Some(v) = toks.next() {
