@@ -545,12 +545,12 @@ pub fn dfx_pane(s: &AppState, t: &VivadoTheme) -> El {
             format!("Saved to {}", p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()),
             t.text_dim,
         ),
-        None => ("Session only — open a project to keep partitions".to_string(), t.text_faint),
+        None => ("Not saved: no project open".to_string(), t.text_faint),
     };
     let saved_full = crate::views::device_floor::project_prj(s).map(|p| p.display().to_string()).unwrap_or_else(|| saved.clone());
     let mut body = col().w_full().gap(10.0).padding(8.0).child(
         row().w_full().h(28.0).items_center().gap(8.0)
-            .child(cad::cut("Reconfigurable partitions are pblocks whose instance swaps between module variants.", VivadoTheme::FONT_UI, t.text_dim).grow(1.0).min_w(0.0))
+            .child(cad::cut("Partitions are pblocks whose instance swaps between module variants.", VivadoTheme::FONT_UI, t.text_dim).grow(1.0).min_w(0.0))
             .child(cad::cut(saved, VivadoTheme::FONT_UI, saved_color).key("dfx-saved").max_w(260.0).help_when_truncated(saved_full))
             .child(del_btn)
             .child(new_btn),
