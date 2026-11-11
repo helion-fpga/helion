@@ -213,7 +213,41 @@ fn status_value(key: &'static str, status: RunStatus, t: &VivadoTheme) -> El {
 }
 
 /// Messages row derived from the typed run state (never parsed back).
-fn flow_messages(key: &'static str, status: RunStatus, t: &VivadoTheme) -> El {
+fn flow_messages(
+    s: &AppState,
+    kind: crate::runs::RunKind,
+    key: &'static str,
+    status: RunStatus,
+    t: &VivadoTheme,
+) -> El {
+    if status == RunStatus::Complete {
+        let (mut err, mut crit, mut warn) = (0usize, 0usize, 0usize);
+        for l in s.runs.log_for(kind) {
+            match l.sev {
+                MsgSev::Error => err += 1,
+                MsgSev::Critical => crit += 1,
+                MsgSev::Warn => warn += 1,
+                MsgSev::Info => {}
+            }
+        }
+        if err + crit + warn > 0 {
+            let n = |c: usize, one: &str| format!("{c} {one}{}", if c == 1 { "" } else { "s" });
+            let mut parts = Vec::new();
+            if err > 0 {
+                parts.push(n(err, "error"));
+            }
+            if crit > 0 {
+                parts.push(n(crit, "critical warning"));
+            }
+            if warn > 0 {
+                parts.push(n(warn, "warning"));
+            }
+            return text(parts.join(", "))
+                .font(VivadoTheme::FONT_UI)
+                .color(if err + crit > 0 { t.fail } else { t.warn })
+                .key(key);
+        }
+    }
     match status {
         RunStatus::Failed => text("Failed - see Messages")
             .font(VivadoTheme::FONT_UI)
@@ -223,6 +257,18 @@ fn flow_messages(key: &'static str, status: RunStatus, t: &VivadoTheme) -> El {
         RunStatus::NotStarted | RunStatus::Complete => {
             ui_label("No errors or warnings", t).key(key)
         }
+    }
+}
+
+/// Paths under the user's home folder display as `~/…` (shorter, and keeps
+/// the account name out of screenshots and screen shares).
+pub fn home_relative(path: &str) -> String {
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return path.to_string();
+    };
+    match std::path::Path::new(path).strip_prefix(&home) {
+        Ok(rest) if !home.as_os_str().is_empty() => format!("~/{}", rest.display()),
+        _ => path.to_string(),
     }
 }
 
@@ -275,7 +321,7 @@ fn settings_card(s: &AppState, t: &VivadoTheme) -> El {
         ))
         .child(kv(
             "Project location:",
-            text(p.location.clone())
+            text(home_relative(&p.location))
                 .font(VivadoTheme::FONT_UI)
                 .color(t.text)
                 .grow(1.0)
@@ -353,7 +399,7 @@ fn synth_card(s: &AppState, t: &VivadoTheme) -> El {
         ))
         .child(kv(
             "Messages:",
-            flow_messages("summary-synth-messages", s.flow.synth, t),
+            flow_messages(s, crate::runs::RunKind::Synth, "summary-synth-messages", s.flow.synth, t),
             t,
         ))
         .child(kv(
@@ -400,7 +446,7 @@ fn impl_card(s: &AppState, t: &VivadoTheme) -> El {
         ))
         .child(kv(
             "Messages:",
-            flow_messages("summary-impl-messages", s.flow.impl_run, t),
+            flow_messages(s, crate::runs::RunKind::Impl, "summary-impl-messages", s.flow.impl_run, t),
             t,
         ))
         .child(kv(
