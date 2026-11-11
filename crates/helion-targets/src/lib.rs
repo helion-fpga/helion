@@ -16,6 +16,8 @@
 //!   backend falls back to a two-pin synthetic model that cannot produce a
 //!   usable bitstream, so the part is listed only when the database exists.
 
+pub mod reports;
+
 use helion_backend::Backend;
 use helion_ir::Design;
 
