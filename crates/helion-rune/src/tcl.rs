@@ -209,6 +209,9 @@ pub const COMMANDS: &[&str] = &[
     "route_design",
     "write_bitstream",
     "write_checkpoint",
+    "open_checkpoint",
+    "read_checkpoint",
+    "create_run",
     "create_clock",
     "report_timing",
     "report_utilization",
@@ -2101,6 +2104,13 @@ fn cmd_launch(s: &mut AppState, argv: &[String], line: usize) -> Ctl {
     let kind = match argv[1].as_str() {
         "synth_1" => crate::runs::RunKind::Synth,
         "impl_1" => crate::runs::RunKind::Impl,
+        other if s.runs.defs.iter().any(|d| d.name == other) => {
+            // Created runs go through the queue (one worker at a time).
+            return match crate::views::runs_table::enqueue(s, other) {
+                Ok(()) => Ctl::Value(String::new()),
+                Err(e) => Ctl::err(line, e),
+            };
+        }
         other => {
             return Ctl::err(
                 line,
@@ -2618,6 +2628,66 @@ fn dispatch_host(
                 ck.len(),
                 s.tcl.session.blinky_hash().unwrap_or(0)
             ))
+        }
+        "open_checkpoint" | "read_checkpoint" => {
+            let Some(path) = argv.get(1) else {
+                return Ctl::err(line, wrong_args("open_checkpoint file.hck2|file.hckp"));
+            };
+            let dev = match helion_device::Device::load_part(&s.project.part) {
+                Ok(d) => d,
+                Err(e) => return Ctl::err(line, e),
+            };
+            match helion_proj::Session::open_checkpoint(path, &dev) {
+                Ok(sess) => {
+                    let cells = sess.design.as_ref().map(|d| d.cells.len()).unwrap_or(0);
+                    let placed = sess.placed.as_ref().map(|p| p.lutff_sites.len()).unwrap_or(0);
+                    s.tcl.design = sess.design.clone();
+                    s.tcl.session = sess;
+                    Ctl::Value(format!("open_checkpoint {path} cells={cells} lutff_sites={placed}"))
+                }
+                Err(e) => Ctl::err(line, e),
+            }
+        }
+        "create_run" => {
+            let mut name = None;
+            let mut preset = "Default".to_string();
+            let mut seeds = Vec::new();
+            let mut it = argv[1..].iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "-strategy" => match it.next() {
+                        Some(p) => preset = p.clone(),
+                        None => return Ctl::err(line, "create_run: -strategy needs a preset"),
+                    },
+                    "-seed" => match it.next().and_then(|v| v.parse::<u64>().ok()) {
+                        Some(v) => seeds.push(v),
+                        None => return Ctl::err(line, "create_run: -seed needs a whole number"),
+                    },
+                    "-flow" => {
+                        it.next();
+                    }
+                    other if name.is_none() && !other.starts_with('-') => name = Some(other.to_string()),
+                    other => return Ctl::err(line, format!("create_run: unexpected {other}")),
+                }
+            }
+            let Some(name) = name else {
+                return Ctl::err(line, wrong_args("create_run name ?-strategy preset? ?-seed n?"));
+            };
+            // One -seed sets the run's seed; several make a sweep.
+            let made = if seeds.len() == 1 {
+                crate::views::runs_table::create_runs(s, &name, &preset, &[]).map(|names| {
+                    if let Some(def) = s.runs.defs.iter_mut().find(|d| d.name == names[0]) {
+                        def.strategy.placer_seed = seeds[0];
+                    }
+                    names
+                })
+            } else {
+                crate::views::runs_table::create_runs(s, &name, &preset, &seeds)
+            };
+            match made {
+                Ok(names) => Ctl::Value(names.join(" ")),
+                Err(e) => Ctl::err(line, e),
+            }
         }
         "create_clock" => cmd_create_clock(s, argv, line),
         "report_timing" => match ensure_timing(s, line) {
@@ -5005,6 +5075,14 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
         "route_design" => ("route_design", "route the placed design"),
         "write_bitstream" => ("write_bitstream", "generate the bitstream"),
         "write_checkpoint" => ("write_checkpoint", "snapshot the session (size + hash)"),
+        "open_checkpoint" | "read_checkpoint" => (
+            "open_checkpoint file.hck2|file.hckp",
+            "reopen a run checkpoint as the Tcl session",
+        ),
+        "create_run" => (
+            "create_run name ?-strategy preset? ?-seed n?",
+            "add an implementation design run (Design Runs tab)",
+        ),
         "create_clock" => (
             "create_clock -period <ns> ?-name n? ?-waveform {r f}? objects",
             "define a clock for STA (period in ns)",

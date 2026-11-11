@@ -9,6 +9,13 @@
 //!   `tb_*.sv`), the stimulus-subset parser, DUT lookup, the interpreter that
 //!   drives `helion-sim` (`$display`/`assert`/`$error`/`$fatal`), VCD/log
 //!   writing, and the persisted run history.
+//! - [`wave`]: waveform display math (fixed-point `Qm.n`, analog Y
+//!   mapping, LSB-first virtual-bus packing) and the SPI / UART / AXI-Lite /
+//!   FSM protocol decoders behind the viewer's decoded lanes. The display
+//!   math and the FSM fallback wording were extracted from
+//!   `helion-gui/src/ide.rs` (`WaveformDisplayMode`,
+//!   `compute_analog_samples_y`, `WaveTrace::decode_transactions`); the
+//!   multi-signal decoders are new here.
 //!
 //! **Duplication note.** Both modules were extracted verbatim (plus the
 //! UI-free net-list helpers in [`ila`]) from `helion-gui/src/ila.rs` and
@@ -19,3 +26,4 @@
 
 pub mod ila;
 pub mod tb;
+pub mod wave;

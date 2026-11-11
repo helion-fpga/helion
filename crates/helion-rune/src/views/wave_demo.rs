@@ -341,3 +341,140 @@ pub fn objects(scope: SimScope) -> &'static [SimObject] {
         ],
     }
 }
+
+/// Fixture state-name source for the FSM decoder scenes/tests (the scan
+/// reads `localparam` groups exactly as it would from a real buffer).
+pub const PROTOCOL_FIXTURE_HDL: &str = "module bus_ctrl;\n\
+    localparam [1:0] IDLE = 2'd0, LOAD = 2'd1, SHIFT = 2'd2, DONE = 2'd3;\n\
+    endmodule\n";
+
+/// Protocol fixture for the decoder/analog scenes and tests: a VCD (run
+/// through the real [`crate::views::wave::import_vcd_text`] parser) with
+/// SPI, UART, AXI-Lite, an FSM state register, bit-blasted counter bits,
+/// and a sampled sine on a signed bus. Never mounted in production.
+pub fn protocol_fixture() -> crate::views::wave::LiveWave {
+    const N: usize = 240;
+    let mut sig: Vec<(&str, u8, Vec<u64>)> = Vec::new();
+    let mut push = |name: &'static str, w: u8, v: Vec<u64>| sig.push((name, w, v));
+    let clk: Vec<u64> = (0..N).map(|i| (i % 2) as u64).collect();
+    // SPI mode 0, 4-sample SCLK period, two frames.
+    let (mut sclk, mut mosi, mut miso, mut csn) =
+        (vec![0u64; N], vec![0u64; N], vec![0u64; N], vec![1u64; N]);
+    for (f, (tx, rx)) in [(0xA5u8, 0x5Au8), (0x3C, 0xC3)].iter().enumerate() {
+        let base = 8 + f * 48;
+        for i in base - 2..base + 34 {
+            csn[i] = 0;
+        }
+        for b in 0..8 {
+            let s0 = base + b * 4;
+            let (mo, mi) = (u64::from((tx >> (7 - b)) & 1), u64::from((rx >> (7 - b)) & 1));
+            for k in 0..4 {
+                mosi[s0 + k] = mo;
+                miso[s0 + k] = mi;
+                sclk[s0 + k] = u64::from(k >= 2);
+            }
+        }
+    }
+    // UART 8N1, 6 samples per bit: "OK".
+    let mut tx = vec![1u64; N];
+    let mut at = 110;
+    for byte in *b"OK" {
+        let bits = std::iter::once(0)
+            .chain((0..8).map(|i| u64::from((byte >> i) & 1)))
+            .chain(std::iter::once(1));
+        for b in bits {
+            for k in 0..6 {
+                tx[at + k] = b;
+            }
+            at += 6;
+        }
+        at += 6;
+    }
+    // AXI-Lite: write 0x10 <- 0xBEEF at 20 (B at 38), read 0x14 -> 0x1234
+    // at 60 (R at 80).
+    let pulse = |i: usize, len: usize| -> Vec<u64> {
+        (0..N).map(|k| u64::from(k >= i && k < i + len)).collect()
+    };
+    let hold = |from: usize, v: u64| -> Vec<u64> {
+        (0..N).map(|k| if k >= from { v } else { 0 }).collect()
+    };
+    // FSM: IDLE, LOAD, SHIFT, DONE, IDLE ...
+    let state: Vec<u64> = (0..N)
+        .map(|i| match i {
+            0..=19 => 0,
+            20..=39 => 1,
+            40..=139 => 2,
+            140..=169 => 3,
+            _ => 0,
+        })
+        .collect();
+    let cnt: Vec<u64> = (0..N).map(|i| ((i / 8) % 16) as u64).collect();
+    let dac: Vec<u64> = (0..N)
+        .map(|i| {
+            let v = (64.0 * (i as f64 * std::f64::consts::TAU / 120.0).sin()).round() as i64;
+            (v as u64) & 0xFF
+        })
+        .collect();
+    let saw: Vec<u64> = (0..N).map(|i| ((i / 6) % 16) as u64).collect();
+    push("clk", 1, clk);
+    push("sclk", 1, sclk);
+    push("mosi", 1, mosi);
+    push("miso", 1, miso);
+    push("cs_n", 1, csn);
+    push("uart_tx", 1, tx);
+    push("state", 2, state);
+    push("s_axi_awvalid", 1, pulse(20, 2));
+    push("s_axi_awready", 1, pulse(20, 2));
+    push("s_axi_awaddr", 8, hold(20, 0x10));
+    push("s_axi_wvalid", 1, pulse(20, 2));
+    push("s_axi_wready", 1, pulse(20, 2));
+    push("s_axi_wdata", 16, hold(20, 0xBEEF));
+    push("s_axi_bvalid", 1, pulse(38, 2));
+    push("s_axi_bready", 1, pulse(38, 2));
+    push("s_axi_bresp", 2, vec![0; N]);
+    push("s_axi_arvalid", 1, pulse(60, 2));
+    push("s_axi_arready", 1, pulse(60, 2));
+    push("s_axi_araddr", 8, hold(60, 0x14));
+    push("s_axi_rvalid", 1, pulse(80, 2));
+    push("s_axi_rready", 1, pulse(80, 2));
+    push("s_axi_rdata", 16, hold(80, 0x1234));
+    for b in 0..4 {
+        let name: &'static str = ["cnt_0", "cnt_1", "cnt_2", "cnt_3"][b];
+        push(name, 1, cnt.iter().map(|v| (v >> b) & 1).collect());
+    }
+    push("dac", 8, dac);
+    push("saw", 4, saw);
+    let mut vcd = String::from("$timescale 1ns $end\n$scope module bus_tb $end\n");
+    for (k, (name, w, _)) in sig.iter().enumerate() {
+        vcd.push_str(&format!("$var wire {w} s{k} {name} $end\n"));
+    }
+    vcd.push_str("$upscope $end\n$enddefinitions $end\n");
+    for i in 0..N {
+        let mut changes = String::new();
+        for (k, (_, w, v)) in sig.iter().enumerate() {
+            if i == 0 || v[i] != v[i - 1] {
+                if *w == 1 {
+                    changes.push_str(&format!("{}s{k}\n", v[i]));
+                } else {
+                    changes.push_str(&format!("b{:b} s{k}\n", v[i]));
+                }
+            }
+        }
+        if !changes.is_empty() {
+            vcd.push_str(&format!("#{i}\n{changes}"));
+        }
+    }
+    vcd.push_str(&format!("#{N}\n"));
+    let mut live = crate::views::wave::import_vcd_text(&vcd).expect("fixture VCD parses");
+    live.source = "bus_tb protocol fixture".into();
+    live
+}
+
+/// Mount [`protocol_fixture`] the way a finished sim run does.
+pub fn seed_protocol_fixture(s: &mut AppState) {
+    let live = protocol_fixture();
+    s.vcd.timescale_ps = live.timescale_ps.max(1);
+    s.vcd.duration_ps = live.duration_ps;
+    s.vcd.signals = live.traces.iter().map(|t| t.name.clone()).collect();
+    s.wave.mount_live(live);
+}
