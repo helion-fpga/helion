@@ -69,8 +69,8 @@ pub const ALL: &[SceneExpect] = &[
     SceneExpect {
         name: "chrome-synth-running",
         surface: "chrome",
-        keys: &["flow-synthesis-open"],
-        absent: &["flow-synthesis-run", "menu-file-menu"],
+        keys: &["flow-synthesis-run", "flow-synthesis-open-synthesized-design"],
+        absent: &["menu-file-menu"],
     },
     SceneExpect {
         name: "sources",

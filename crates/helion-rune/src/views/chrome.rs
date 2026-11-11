@@ -517,6 +517,10 @@ struct FlowEntry {
     nav: Option<CenterPane>,
     dialog: Option<DialogId>,
     report: Option<ReportNav>,
+    /// Live state of the run this entry starts (status mark on the right).
+    status: Option<RunStatus>,
+    /// `Some(reason)` disables the entry with that tooltip.
+    blocked: Option<&'static str>,
 }
 
 #[derive(Clone, Copy)]
@@ -527,11 +531,10 @@ enum RunTarget {
     Sim,
 }
 
-/// Rail entries for a section; run entries reflect live [`RunStatus`] so the
-/// rail reads "Open Synthesized Design" once synthesis has started.
-/// Open design entries navigate to Schematic, simulation to Sim, program
-/// entries to Program, report entries to Timing/Reports, manager entries
-/// to dialogs.
+/// Rail entries for a section. Run entries always stay "Run …" (so a run
+/// can be repeated from the rail) and carry a live status mark; Open/Report
+/// entries navigate to the surface that shows the result (each surface has
+/// its own honest empty state before a run).
 fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
     let link = |section: FlowSection,
                 label: &'static str,
@@ -551,24 +554,28 @@ fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
         nav,
         dialog,
         report,
+        status: None,
+        blocked: None,
     };
-    let plain = |section: FlowSection, label: &'static str, tcl: &'static str| {
-        link(section, label, tcl, None, None, None)
+    let blocked = run_blocked(s);
+    let run = |section: FlowSection,
+               label: &'static str,
+               tcl: &'static str,
+               target: RunTarget,
+               status: RunStatus,
+               nav: Option<CenterPane>| FlowEntry {
+        key: format!("{}-run", section.key()),
+        label: label.into(),
+        run_icon: true,
+        tcl,
+        starts: Some(target),
+        nav,
+        dialog: None,
+        report: None,
+        status: Some(status),
+        blocked,
     };
-    let run =
-        |section: FlowSection, label: String, tcl: &'static str, target: RunTarget, armed: bool| {
-            FlowEntry {
-                key: format!("{}-{}", section.key(), if armed { "run" } else { "open" }),
-                label,
-                run_icon: armed,
-                tcl,
-                starts: armed.then_some(target),
-                // The relabeled Open entry navigates; the armed Run entry stays.
-                nav: (!armed).then_some(CenterPane::Schematic),
-                dialog: None,
-                report: None,
-            }
-        };
+    let no_project = s.project.name.is_empty().then_some("Open or create a project first");
     match section {
         FlowSection::ProjectManager => vec![
             link(
@@ -579,60 +586,68 @@ fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
                 Some(DialogId::Settings),
                 None,
             ),
+            FlowEntry {
+                blocked: no_project,
+                ..link(
+                    section,
+                    "Add Sources",
+                    "add_sources",
+                    None,
+                    Some(DialogId::AddSources),
+                    None,
+                )
+            },
+            FlowEntry {
+                blocked: no_project,
+                ..link(
+                    section,
+                    "Constraints Wizard",
+                    "constraints_wizard",
+                    None,
+                    Some(DialogId::Constraints),
+                    None,
+                )
+            },
+        ],
+        // Block-design entries arrive with the IP surface.
+        FlowSection::IpIntegrator => Vec::new(),
+        FlowSection::Simulation => vec![
             link(
                 section,
-                "Add Sources",
-                "add_sources",
+                "Simulation Settings",
+                "sim_settings",
+                Some(CenterPane::Sim),
                 None,
-                Some(DialogId::AddSources),
                 None,
             ),
-            plain(section, "Language Templates", "show_templates"),
-            plain(section, "IP Catalog", "show_ip_catalog"),
-        ],
-        FlowSection::IpIntegrator => vec![
-            plain(section, "Create Block Design", "create_bd_design"),
-            plain(section, "Open Block Design", "open_bd_design"),
-            plain(section, "Generate Block Design", "generate_target"),
-        ],
-        FlowSection::Simulation => {
-            let armed = s.flow.sim == RunStatus::NotStarted;
-            let mut entries = vec![
-                link(
+            FlowEntry {
+                blocked: no_project,
+                ..run(
                     section,
-                    "Simulation Settings",
-                    "show_sim_settings",
-                    None,
-                    Some(DialogId::Settings),
-                    None,
-                ),
-                // Unlike synth/impl the sim entry always navigates: the run's
-                // progress and logs live on the Sim surface it opens.
-                FlowEntry {
-                    key: format!("{}-{}", section.key(), if armed { "run" } else { "open" }),
-                    label: if armed {
-                        "Run Simulation".into()
-                    } else {
-                        "Open Simulation".into()
-                    },
-                    run_icon: armed,
-                    tcl: "launch_simulation",
-                    starts: armed.then_some(RunTarget::Sim),
-                    nav: Some(CenterPane::Sim),
-                    dialog: None,
-                    report: None,
-                },
-            ];
-            entries.push(link(
+                    "Run Simulation",
+                    "launch_simulation",
+                    RunTarget::Sim,
+                    s.flow.sim,
+                    Some(CenterPane::Sim),
+                )
+            },
+            link(
+                section,
+                "Open Waveform",
+                "show_view Wave",
+                Some(CenterPane::Wave),
+                None,
+                None,
+            ),
+            link(
                 section,
                 "Open Debug",
                 "breakpoints",
                 Some(CenterPane::Debug),
                 None,
                 None,
-            ));
-            entries
-        }
+            ),
+        ],
         FlowSection::RtlAnalysis => vec![link(
             section,
             "Open Elaborated Design",
@@ -641,84 +656,89 @@ fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
             None,
             None,
         )],
-        FlowSection::Synthesis => {
-            let armed = s.flow.synth == RunStatus::NotStarted;
-            let mut entries = vec![run(
+        FlowSection::Synthesis => vec![
+            run(
                 section,
-                if armed {
-                    "Run Synthesis".into()
-                } else {
-                    "Open Synthesized Design".into()
-                },
+                "Run Synthesis",
                 "launch_runs synth_1",
                 RunTarget::Synth,
-                armed,
-            )];
-            // Once started the run entry itself becomes the Open entry; a
-            // second static Open row would duplicate its label.
-            if armed {
-                entries.push(link(
-                    section,
-                    "Open Synthesized Design",
-                    "open_run synth_1",
-                    Some(CenterPane::Schematic),
-                    None,
-                    None,
-                ));
-            }
-            entries.push(link(
+                s.flow.synth,
+                None,
+            ),
+            link(
+                section,
+                "Open Synthesized Design",
+                "open_run synth_1",
+                Some(CenterPane::Schematic),
+                None,
+                None,
+            ),
+            link(
                 section,
                 "Report Timing Summary",
                 "report_timing_summary",
                 Some(CenterPane::Timing),
                 None,
                 None,
-            ));
-            entries
-        }
-        FlowSection::Implementation => {
-            let armed = s.flow.impl_run == RunStatus::NotStarted;
-            let mut entries = vec![run(
+            ),
+        ],
+        FlowSection::Implementation => vec![
+            run(
                 section,
-                if armed {
-                    "Run Implementation".into()
-                } else {
-                    "Open Implemented Design".into()
-                },
+                "Run Implementation",
                 "launch_runs impl_1",
                 RunTarget::Impl,
-                armed,
-            )];
-            if armed {
-                entries.push(link(
-                    section,
-                    "Open Implemented Design",
-                    "open_run impl_1",
-                    Some(CenterPane::Schematic),
-                    None,
-                    None,
-                ));
-            }
-            entries.push(link(
+                s.flow.impl_run,
+                None,
+            ),
+            link(
+                section,
+                "Open Implemented Design",
+                "open_run impl_1",
+                Some(CenterPane::Device),
+                None,
+                None,
+            ),
+            link(
                 section,
                 "Report Utilization",
                 "report_utilization",
                 Some(CenterPane::Reports),
                 None,
                 Some(ReportNav::Utilization),
-            ));
-            entries
-        }
+            ),
+            link(
+                section,
+                "Report Power",
+                "report_power",
+                Some(CenterPane::Reports),
+                None,
+                Some(ReportNav::Power),
+            ),
+            link(
+                section,
+                "Report DRC",
+                "report_drc",
+                Some(CenterPane::Reports),
+                None,
+                Some(ReportNav::Drc),
+            ),
+        ],
         FlowSection::ProgramDebug => vec![
             FlowEntry {
-                key: format!("{}-{}", section.key(), "generate-bitstream".to_string()),
-                label: "Generate Bitstream".into(),
-                run_icon: true,
-                tcl: "launch_runs -to_step write_bitstream",
-                starts: Some(RunTarget::Bitstream),
-                nav: Some(CenterPane::Program),
-                dialog: None,
-                report: None,
+                key: format!("{}-generate-bitstream", section.key()),
+                ..run(
+                    section,
+                    "Generate Bitstream",
+                    "launch_runs -to_step write_bitstream",
+                    RunTarget::Bitstream,
+                    if s.bitstream.has_run {
+                        RunStatus::Complete
+                    } else {
+                        RunStatus::NotStarted
+                    },
+                    Some(CenterPane::Program),
+                )
             },
             link(
                 section,
@@ -730,6 +750,22 @@ fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
             ),
         ],
     }
+}
+
+/// Trailing status mark for a run entry.
+fn run_mark(status: RunStatus, t: &VivadoTheme) -> Option<El> {
+    let (glyph, ink, help) = match status {
+        RunStatus::NotStarted => return None,
+        RunStatus::Running => ("running…", t.link, "Running"),
+        RunStatus::Complete => ("✓", t.pass, "Complete"),
+        RunStatus::Failed => ("✗", t.fail, "Failed — see Messages"),
+    };
+    Some(
+        text(glyph)
+            .font(VivadoTheme::FONT_UI)
+            .color(ink)
+            .help(help),
+    )
 }
 
 /// Toolbar tools: tooltip, Tcl verb, geometric icon, run-state flip,
@@ -1353,6 +1389,10 @@ pub fn flow_rail(s: &AppState, t: &VivadoTheme) -> El {
             stick_bottom: false,
         });
     for section in FlowSection::ALL {
+        let entries = flow_entries(section, s);
+        if entries.is_empty() {
+            continue;
+        }
         let collapsed = s.chrome.collapsed[section.index()];
         list = list.child(
             row()
@@ -1387,7 +1427,7 @@ pub fn flow_rail(s: &AppState, t: &VivadoTheme) -> El {
                 ),
         );
         if !collapsed {
-            for entry in flow_entries(section, s) {
+            for entry in entries {
                 let (tcl, starts, nav, dialog, report) = (
                     entry.tcl,
                     entry.starts,
@@ -1395,32 +1435,52 @@ pub fn flow_rail(s: &AppState, t: &VivadoTheme) -> El {
                     entry.dialog,
                     entry.report,
                 );
+                let enabled = entry.blocked.is_none();
                 let mut row_el = row()
                     .key(entry.key)
                     .role("button")
                     .label(entry.label.clone())
-                    .focusable(true)
+                    .focusable(enabled)
+                    .disabled(!enabled)
                     .w_full()
                     .h(20.0)
                     .items_center()
                     .gap(5.0)
                     .pl(20.0)
-                    .hover(t.selection)
-                    .on_press(move |s: &mut AppState| {
+                    .pr(8.0);
+                if let Some(reason) = entry.blocked {
+                    row_el = row_el.description(reason).help(reason);
+                } else {
+                    row_el = row_el.hover(t.selection).on_press(move |s: &mut AppState| {
                         dispatch_full(s, tcl, starts, nav, dialog, report)
                     });
+                }
                 if entry.run_icon {
                     row_el = row_el.child(
                         canvas(
                             Shape::new()
-                                .fill(vec![[1.0, 0.5], [9.0, 5.0], [1.0, 9.5]], t.pass)
+                                .fill(
+                                    vec![[1.0, 0.5], [9.0, 5.0], [1.0, 9.5]],
+                                    if enabled { t.pass } else { t.text_faint },
+                                )
                                 .view_box(10.0, 10.0),
                         )
                         .size(10.0, 10.0)
                         .a11y_hidden(),
                     );
                 }
-                list = list.child(row_el.child(ui_label(&entry.label, t)));
+                row_el = row_el.child(
+                    text(entry.label.clone())
+                        .font(VivadoTheme::FONT_UI)
+                        .color(if enabled { t.text } else { t.text_faint })
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate(),
+                );
+                if let Some(mark) = entry.status.and_then(|st| run_mark(st, t)) {
+                    row_el = row_el.child(mark);
+                }
+                list = list.child(row_el);
             }
         }
     }
@@ -1706,8 +1766,17 @@ mod tests {
                 .any(|l| l.text == "launch_runs synth_1")
         );
         assert!(
-            rt.find("flow-synthesis-open").is_some(),
-            "rail relabels to Open Synthesized Design once started"
+            rt.find("flow-synthesis-run").is_some(),
+            "the rail keeps Run Synthesis so a run can be repeated"
+        );
+        assert!(
+            rt.state.flow.synth == RunStatus::Running
+                && rt.find("flow-synthesis-run").is_some(),
+            "the run entry carries the live status"
+        );
+        assert!(
+            rt.find("flow-synthesis-open-synthesized-design").is_some(),
+            "Open Synthesized Design stays listed"
         );
     }
 
@@ -1819,10 +1888,13 @@ mod tests {
                 == 1,
             "the verb must echo exactly once"
         );
+        rt.invalidate();
+        rt.frame(2.0);
         assert!(
-            rt.find("flow-simulation-open").is_some(),
-            "rail relabels to Open Simulation once started"
+            rt.find("flow-simulation-run").is_some(),
+            "Run Simulation stays available to re-run"
         );
+        assert!(rt.find("flow-simulation-open-waveform").is_some());
     }
 
     #[test]

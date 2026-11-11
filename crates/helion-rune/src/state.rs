@@ -87,6 +87,11 @@ pub struct ConsoleState {
     /// The dock collapses to its tab strip so short windows give the
     /// center pane room; the toggle restores the transcript height.
     pub collapsed: bool,
+    /// Text filter over the transcript / messages (toolbar search).
+    pub filter: rune::TextEdit,
+    pub filter_open: bool,
+    /// Messages tab severity filter (`None` = every warning and error).
+    pub msg_sev: Option<MsgSev>,
 }
 
 /// Demo constraints shown on `.xdc` tabs (seeded into
@@ -904,6 +909,9 @@ impl AppState {
                 input: rune::TextEdit::new(""),
                 tab: crate::views::console::ConsoleTab::Tcl,
                 collapsed: false,
+                filter: rune::TextEdit::new(""),
+                filter_open: false,
+                msg_sev: None,
                 log_run: crate::views::console::LogRun::Synthesis,
                 hist_pos: None,
             },
