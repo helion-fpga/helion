@@ -1436,8 +1436,8 @@ pub const ALL: &[SceneExpect] = &[
     SceneExpect {
         name: "hw-ila-wave",
         surface: "ila",
-        keys: &["ila", "ila-strip", "ila-strip-source"],
-        absent: &["program", "summary"],
+        keys: &["ila-hw-probes", "ila-hw-setup", "ila", "ila-strip", "ila-strip-source"],
+        absent: &["ila-nets", "program", "summary"],
     },
     SceneExpect {
         name: "hw-vio",

@@ -435,6 +435,75 @@ fn probes_panel(s: &AppState, t: &VivadoTheme) -> El {
         .fill(t.panel_bg)
         .border(1.0, t.border)
         .child(section_head("ila-probes-head", "Probes", t));
+    // A hardware capture's probes belong to the inserted debug core, not to
+    // the simulation probe list: show them read-only and point to where
+    // they are changed (Set Up Debug re-implements the core).
+    if let (Some(label), Some(cap)) = (s.ila.hardware_label(), s.ila.capture.as_ref()) {
+        let mut rows = col()
+            .key("ila-hw-probes")
+            .role("list")
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .scroll(rune::ScrollSpec {
+                stick_bottom: false,
+            });
+        for (i, p) in cap.probes.iter().enumerate() {
+            let width = p.nets.len();
+            rows = rows.child(
+                row()
+                    .key(format!("ila-hw-probe-{i}"))
+                    .w_full()
+                    .h(22.0)
+                    .px(10.0)
+                    .gap(8.0)
+                    .items_center()
+                    .child(
+                        text(p.name.clone())
+                            .font(VivadoTheme::FONT_MONO.mono())
+                            .color(t.text)
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .truncate()
+                            .help_when_truncated(p.nets.join(", ")),
+                    )
+                    .child(
+                        text(format!("[{width}]"))
+                            .font(VivadoTheme::FONT_MONO.mono())
+                            .color(t.text_faint),
+                    ),
+            );
+        }
+        return body
+            .child(
+                col()
+                    .w_full()
+                    .px(10.0)
+                    .py(8.0)
+                    .gap(4.0)
+                    .child(
+                        text(format!("Debug core probes ({})", cap.probes.len()))
+                            .font(VivadoTheme::FONT_TITLE)
+                            .color(t.text),
+                    )
+                    .child(
+                        text(format!("From {label}. Change them in Set Up Debug, which re-implements the core."))
+                            .font(VivadoTheme::FONT_UI)
+                            .color(t.text_dim)
+                            .wrap(),
+                    ),
+            )
+            .child(rows)
+            .child(
+                row().w_full().padding(10.0).child(
+                    btn("ila-hw-setup", "Set Up Debug…", t, true, "")
+                        .on_press(|s: &mut AppState| {
+                            s.navigate(crate::state::CenterPane::Program);
+                            s.program.node = crate::views::hw_tree::HwNode::SetupDebug;
+                        }),
+                ),
+            );
+    }
     if !has_design {
         return body.child(
             col()
