@@ -246,6 +246,7 @@ pub const COMMANDS: &[&str] = &[
     "sim_settings",
     "compile_sim",
     "elaborate_sim",
+    "ila",
 ];
 
 /// Max nested `[...]` evaluation depth (mirrors the real interp's cap idea;
@@ -2506,6 +2507,7 @@ fn dispatch_host(
                 line,
             )
         }
+        "ila" => ctl_of(crate::views::ila::exec_ila(s, &argv[1..]), line),
         "opt_design" => {
             if s.tcl.design.is_none() {
                 return Ctl::err(line, "opt_design: no design");
@@ -4894,6 +4896,10 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
             "elaborate_sim",
             "elaborate SIM_TOP with PARAM into helion-sim",
         ),
+        "ila" => (
+            "ila add|bus|remove|trigger|trigger_at|depth|preratio|clock|radix|capture|arm|disarm|status|save|load|export_vcd ...",
+            "simulation logic analyzer (opens the Logic Analyzer pane)",
+        ),
         _ => return None,
     })
 }
@@ -4914,7 +4920,7 @@ fn help_overview() -> String {
         "More: unset list_properties read_verilog read_vhdl add_probe program_hw_devices report_hw_targets write_hnf",
         "  hds::synth hds::impl hds::flow hds::tree | history launch_runs cancel_runs open_report",
         "Verify: launch_simulation tb_rescan tb_select tb_run tb_run_all tb_stop tb_vcd tb_wave tb_jump",
-        "  set_timescale set_runtime sim_settings compile_sim elaborate_sim",
+        "  set_timescale set_runtime sim_settings compile_sim elaborate_sim | ila <subcommand>",
         "help <command> for usage. See docs/tcl-subset.md for the supported subset.",
     ]
     .join("\n")

@@ -724,6 +724,8 @@ pub struct AppState {
     pub sim: crate::views::tb::SimState,
     /// Simulation Settings knobs + Compile/Elaborate results.
     pub sim_settings: crate::views::sim_settings::SimSettingsState,
+    /// Logic Analyzer (simulation ILA): probes, trigger, capture, viewer.
+    pub ila: crate::views::ila::IlaState,
     /// Interactive debugger UI state (persistent event engine, breakpoints).
     pub debug: crate::views::debug::DebugState,
     /// Hardware Manager UI state (connection, cable/target picks, program run).
@@ -767,6 +769,8 @@ pub enum CenterPane {
     Sim,
     /// Interactive debugger: breakpoints over the persistent event engine.
     Debug,
+    /// Logic Analyzer: simulation ILA probes, trigger, capture viewer.
+    Ila,
     /// Hardware Manager: open target, cable/target pickers, program + results.
     Program,
     /// Implementation reports: Utilization / Power / DRC detail bodies.
@@ -906,6 +910,7 @@ impl AppState {
             sim: crate::views::tb::SimState::default(),
             sim_settings: crate::views::sim_settings::SimSettingsState::default(),
             debug: crate::views::debug::DebugState::default(),
+            ila: crate::views::ila::IlaState::default(),
             program: crate::views::program::ProgramState::default(),
             dialogs: crate::views::dialogs::DialogState::default(),
             center: CenterPane::Summary,
@@ -999,6 +1004,8 @@ impl AppState {
         self.debug = crate::views::debug::DebugState::default();
         self.debug.runtime_cycles = cycles;
         self.debug.timescale_ps = ts;
+        // The old design's probes and capture do not carry over.
+        self.ila = crate::views::ila::IlaState::default();
         self.wave.live = None;
         self.wave.live_selected = None;
         self.wave.live_lanes.clear();
