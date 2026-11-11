@@ -95,7 +95,9 @@ impl WaveState {
     pub fn trace_value(&self, trace: &LiveTrace, i: usize) -> String {
         match self.display_of(&trace.name).fixed {
             Some(fp) if trace.is_bus() => fp.format(trace.value_at(i), trace.width),
-            _ => self.radix_for(&trace.name).format(trace.value_at(i), trace.width),
+            _ => self
+                .radix_for(&trace.name)
+                .format(trace.value_at(i), trace.width),
         }
     }
 
@@ -254,7 +256,12 @@ fn bus_name(live: &LiveWave, members: &[String], n: usize) -> String {
             .zip(l.chars())
             .take_while(|(a, b)| a == b)
             .count();
-        stem.truncate(stem.char_indices().nth(k).map(|(i, _)| i).unwrap_or(stem.len()));
+        stem.truncate(
+            stem.char_indices()
+                .nth(k)
+                .map(|(i, _)| i)
+                .unwrap_or(stem.len()),
+        );
     }
     let stem = stem.trim_end_matches(['_', '[']).to_string();
     let mut leaf = if stem.is_empty() {
@@ -305,7 +312,10 @@ pub fn press_name(s: &mut AppState, idx: usize, tx: &Tx) {
         if s.wave.live_selected == Some(idx) {
             // Demote the primary: the next multi pick (if any) leads.
             s.wave.live_selected = s.wave.style.multi.first().copied();
-            s.wave.style.multi.retain(|&i| Some(i) != s.wave.live_selected);
+            s.wave
+                .style
+                .multi
+                .retain(|&i| Some(i) != s.wave.live_selected);
         } else if s.wave.style.multi.contains(&idx) {
             s.wave.style.multi.retain(|&i| i != idx);
         } else if s.wave.live_selected.is_none() {
@@ -425,7 +435,11 @@ fn bar_btn(
         .items_center()
         .fill(t.panel_bg)
         .border(1.0, t.border)
-        .child(text(label.to_string()).font(VivadoTheme::FONT_UI).color(t.text));
+        .child(
+            text(label.to_string())
+                .font(VivadoTheme::FONT_UI)
+                .color(t.text),
+        );
     match reason {
         None => b.focusable(true).hover(t.selection).on_press(f),
         Some(why) => b
@@ -455,7 +469,11 @@ fn seg(
         .px(6.0)
         .center()
         .fill(if on { t.selection } else { t.panel_bg })
-        .child(text(label.to_string()).font(VivadoTheme::FONT_UI).color(t.text));
+        .child(
+            text(label.to_string())
+                .font(VivadoTheme::FONT_UI)
+                .color(t.text),
+        );
     match reason {
         None => e.focusable(true).hover(t.selection).on_press(f),
         Some(why) => e
@@ -516,8 +534,8 @@ pub fn trace_bar(s: &AppState, t: &VivadoTheme) -> El {
         None
     });
     let up_why = lane_why.or((pos == Some(0)).then_some("Already the top lane"));
-    let down_why =
-        lane_why.or((pos == Some(lanes.len().saturating_sub(1))).then_some("Already the bottom lane"));
+    let down_why = lane_why
+        .or((pos == Some(lanes.len().saturating_sub(1))).then_some("Already the bottom lane"));
     let bus_why = no_live.or(s.wave.bus_blocker());
     let bus_sel = sel.filter(|t| t.is_bus());
     let fmt_why = no_live.or(match sel {
@@ -525,7 +543,9 @@ pub fn trace_bar(s: &AppState, t: &VivadoTheme) -> El {
         Some(t) if !t.is_bus() => Some("Fixed point and analog apply to multi-bit traces"),
         _ => None,
     });
-    let disp = bus_sel.map(|t| s.wave.display_of(&t.name)).unwrap_or_default();
+    let disp = bus_sel
+        .map(|t| s.wave.display_of(&t.name))
+        .unwrap_or_default();
     let n_sel = s.wave.selection().len();
     let target = match (sel, n_sel) {
         (_, n) if n > 1 => format!("{n} traces selected"),
@@ -542,7 +562,10 @@ pub fn trace_bar(s: &AppState, t: &VivadoTheme) -> El {
             fmt_why,
             |s: &mut AppState| {
                 if let Some(n) = edit_display(s, |d| d.fixed = None) {
-                    echo(s, format!("set_property display_mode default [get_waves {{{n}}}]"));
+                    echo(
+                        s,
+                        format!("set_property display_mode default [get_waves {{{n}}}]"),
+                    );
                 }
             },
         ))
@@ -578,12 +601,20 @@ pub fn trace_bar(s: &AppState, t: &VivadoTheme) -> El {
         .gap(2.0)
         .items_center()
         .child(fixed)
-        .child(bar_btn("wave-frac-dec", "−", t, frac_why, |s: &mut AppState| {
-            set_fixed(s, None, -1)
-        }))
-        .child(bar_btn("wave-frac-inc", "+", t, frac_why, |s: &mut AppState| {
-            set_fixed(s, None, 1)
-        }));
+        .child(bar_btn(
+            "wave-frac-dec",
+            "−",
+            t,
+            frac_why,
+            |s: &mut AppState| set_fixed(s, None, -1),
+        ))
+        .child(bar_btn(
+            "wave-frac-inc",
+            "+",
+            t,
+            frac_why,
+            |s: &mut AppState| set_fixed(s, None, 1),
+        ));
 
     let mut analog = seg_group("wave-analog", "Trace style", t);
     for (key, label, mode) in [
@@ -598,7 +629,10 @@ pub fn trace_bar(s: &AppState, t: &VivadoTheme) -> El {
                     Some(Analog::Step) => "analog_step",
                     Some(Analog::Linear) => "analog_linear",
                 };
-                echo(s, format!("set_property wave_style {m} [get_waves {{{n}}}]"));
+                echo(
+                    s,
+                    format!("set_property wave_style {m} [get_waves {{{n}}}]"),
+                );
             }
         }));
     }
@@ -621,9 +655,13 @@ pub fn trace_bar(s: &AppState, t: &VivadoTheme) -> El {
     } else {
         format!("Decoders ({n_dec})")
     };
-    let dec_btn = bar_btn("wave-decoders-toggle", &dec_label, t, no_live, |s: &mut AppState| {
-        s.wave.decode.panel_open = !s.wave.decode.panel_open
-    })
+    let dec_btn = bar_btn(
+        "wave-decoders-toggle",
+        &dec_label,
+        t,
+        no_live,
+        |s: &mut AppState| s.wave.decode.panel_open = !s.wave.decode.panel_open,
+    )
     .fill(if s.wave.decode.panel_open {
         t.selection
     } else {
@@ -650,19 +688,31 @@ pub fn trace_bar(s: &AppState, t: &VivadoTheme) -> El {
             ),
         )
         .child(bar_btn("wave-trace-up", "▲", t, up_why, move_selected(-1)).label("Move trace up"))
-        .child(bar_btn("wave-trace-down", "▼", t, down_why, move_selected(1)).label("Move trace down"))
-        .child(bar_btn("wave-trace-remove", "Remove", t, lane_why, |s: &mut AppState| {
-            if let Some(idx) = s.wave.live_selected {
-                let name = s.wave.selected_trace().map(|t| t.name.clone());
-                if s.wave.remove_lane(idx) {
-                    if let Some(n) = name {
-                        echo(s, format!("remove_wave [get_waves {{{n}}}]"));
+        .child(
+            bar_btn("wave-trace-down", "▼", t, down_why, move_selected(1)).label("Move trace down"),
+        )
+        .child(bar_btn(
+            "wave-trace-remove",
+            "Remove",
+            t,
+            lane_why,
+            |s: &mut AppState| {
+                if let Some(idx) = s.wave.live_selected {
+                    let name = s.wave.selected_trace().map(|t| t.name.clone());
+                    if s.wave.remove_lane(idx) {
+                        if let Some(n) = name {
+                            echo(s, format!("remove_wave [get_waves {{{n}}}]"));
+                        }
                     }
                 }
-            }
-        }))
-        .child(bar_btn("wave-make-bus", "Make Bus", t, bus_why, |s: &mut AppState| {
-            match s.wave.create_virtual_bus() {
+            },
+        ))
+        .child(bar_btn(
+            "wave-make-bus",
+            "Make Bus",
+            t,
+            bus_why,
+            |s: &mut AppState| match s.wave.create_virtual_bus() {
                 Ok(name) => {
                     let members = s
                         .wave
@@ -678,8 +728,8 @@ pub fn trace_bar(s: &AppState, t: &VivadoTheme) -> El {
                     "Cannot create virtual bus",
                     &e,
                 ),
-            }
-        }))
+            },
+        ))
         .child(sep(t))
         .child(fixed)
         .child(analog)
@@ -692,8 +742,18 @@ fn move_selected(delta: i32) -> impl Fn(&mut AppState) + 'static {
     move |s: &mut AppState| {
         if let Some(idx) = s.wave.live_selected {
             if s.wave.move_lane(idx, delta) {
-                let name = s.wave.selected_trace().map(|t| t.name.clone()).unwrap_or_default();
-                echo(s, format!("move_wave {} [get_waves {{{name}}}]", if delta < 0 { "up" } else { "down" }));
+                let name = s
+                    .wave
+                    .selected_trace()
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default();
+                echo(
+                    s,
+                    format!(
+                        "move_wave {} [get_waves {{{name}}}]",
+                        if delta < 0 { "up" } else { "down" }
+                    ),
+                );
             }
         }
     }
@@ -798,7 +858,10 @@ mod tests {
         for l in first.clone() {
             assert!(w.remove_lane(l));
         }
-        assert!(w.lanes().is_empty(), "removing every lane must not restore defaults");
+        assert!(
+            w.lanes().is_empty(),
+            "removing every lane must not restore defaults"
+        );
         assert_eq!(w.live_selected, None);
         assert!(w.add_live_lane(first[3]));
         assert_eq!(w.lanes(), vec![first[3]]);
@@ -843,7 +906,12 @@ mod tests {
         // sample 30 is the sine peak: 64 / 2^6 = 1.0.
         assert_eq!(s.wave.trace_value(&tr, 30), "1.0");
         assert_eq!(s.wave.trace_value(&tr, 90), "-1.0");
-        assert!(s.console.lines.iter().any(|l| l.text.contains("display_mode q1.6")));
+        assert!(
+            s.console
+                .lines
+                .iter()
+                .any(|l| l.text.contains("display_mode q1.6"))
+        );
         s.wave.set_radix(WaveRadix::Signed);
         assert_eq!(s.wave.trace_value(&tr, 90), "-64");
         assert_eq!(s.wave.display_of(&tr.name).fixed, None);
@@ -870,7 +938,10 @@ mod tests {
         };
         assert_eq!(h(&r, &key), 24.0);
         step(&mut r, "wave-style-step");
-        assert_eq!(r.state.wave.display_of("bus_tb.dac").analog, Some(Analog::Step));
+        assert_eq!(
+            r.state.wave.display_of("bus_tb.dac").analog,
+            Some(Analog::Step)
+        );
         assert_eq!(h(&r, &key), 48.0);
         step(&mut r, "wave-density-compact");
         assert_eq!(h(&r, &key), 36.0);
@@ -885,14 +956,26 @@ mod tests {
         let pps = r.state.wave.pps();
         let x = sheet[0] + 40.0 * pps;
         let y = sheet[1] + 30.0;
-        mods(&mut r, Mods { shift: true, ..Mods::default() });
+        mods(
+            &mut r,
+            Mods {
+                shift: true,
+                ..Mods::default()
+            },
+        );
         r.pointer_move(x, y);
         r.pointer_down(x, y);
         r.pointer_up(x, y);
         r.frame(1.0 / 60.0);
         assert_eq!(r.state.wave.cursor_a, Some(40));
         let x2 = sheet[0] + 70.0 * pps;
-        mods(&mut r, Mods { alt: true, ..Mods::default() });
+        mods(
+            &mut r,
+            Mods {
+                alt: true,
+                ..Mods::default()
+            },
+        );
         r.pointer_move(x2, y);
         r.pointer_down(x2, y);
         r.pointer_up(x2, y);
@@ -907,7 +990,13 @@ mod tests {
         assert_eq!(r.state.wave.cursor, 10);
         // y = 30 sits in the second lane (24pt rows).
         assert_eq!(r.state.wave.live_selected, Some(r.state.wave.lanes()[1]));
-        assert!(r.state.console.lines.iter().any(|l| l.text.starts_with("set_cursor A")));
+        assert!(
+            r.state
+                .console
+                .lines
+                .iter()
+                .any(|l| l.text.starts_with("set_cursor A"))
+        );
     }
 
     #[test]
@@ -918,7 +1007,13 @@ mod tests {
         s.wave.lanes_custom = true;
         let mut r = rt(s);
         tap(&mut r, &format!("wave-live-name-{}", bits[0]));
-        mods(&mut r, Mods { cmd: true, ..Mods::default() });
+        mods(
+            &mut r,
+            Mods {
+                cmd: true,
+                ..Mods::default()
+            },
+        );
         for b in &bits[1..] {
             tap(&mut r, &format!("wave-live-name-{b}"));
         }
@@ -949,7 +1044,13 @@ mod tests {
         s.center = crate::state::CenterPane::Wave;
         crate::views::wave_demo::seed_demo_wave(&mut s);
         let r = rt(s);
-        for key in ["wave-trace-up", "wave-trace-remove", "wave-make-bus", "wave-fixed-q", "wave-decoders-toggle"] {
+        for key in [
+            "wave-trace-up",
+            "wave-trace-remove",
+            "wave-make-bus",
+            "wave-fixed-q",
+            "wave-decoders-toggle",
+        ] {
             let e = r
                 .elements()
                 .into_iter()

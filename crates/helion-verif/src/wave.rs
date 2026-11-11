@@ -283,7 +283,11 @@ pub fn decode_spi(
         last_edge = e;
         if count == bits {
             // The frame ends one bit-period after its last sampling edge.
-            let period = if bits > 1 { (e - first) / (bits as usize - 1) } else { 1 };
+            let period = if bits > 1 {
+                (e - first) / (bits as usize - 1)
+            } else {
+                1
+            };
             let end = (e + period.max(1)).min(grid_len(&[Some(sclk)]).max(e + 1));
             for (k, lane) in out.iter_mut().enumerate() {
                 lane.spans.push(DecodedSpan {
@@ -359,7 +363,11 @@ pub fn decode_uart(line: &[u64], bit_period: Option<usize>) -> DecodedLane {
                 } else {
                     format!("0x{v:02X} FRAME ERR")
                 },
-                kind: if stop_ok { SpanKind::Data } else { SpanKind::Error },
+                kind: if stop_ok {
+                    SpanKind::Data
+                } else {
+                    SpanKind::Error
+                },
             });
             i = sample(9.5).max(i + 1);
         } else {
@@ -398,7 +406,9 @@ fn handshakes(valid: &[u64], ready: &[u64], aclk: Option<&[u64]>, n: usize) -> V
     let hs = |i: usize| bit(valid, i) && bit(ready, i);
     match aclk {
         Some(c) => edges(c, true).into_iter().filter(|&i| hs(i)).collect(),
-        None => (0..n).filter(|&i| hs(i) && (i == 0 || !hs(i - 1))).collect(),
+        None => (0..n)
+            .filter(|&i| hs(i) && (i == 0 || !hs(i - 1)))
+            .collect(),
     }
 }
 
@@ -583,7 +593,8 @@ pub fn parse_int_literal(text: &str) -> Option<u64> {
 
 fn is_ident(s: &str) -> bool {
     let mut c = s.chars();
-    c.next().is_some_and(|f| f.is_ascii_alphabetic() || f == '_')
+    c.next()
+        .is_some_and(|f| f.is_ascii_alphabetic() || f == '_')
         && c.all(|x| x.is_ascii_alphanumeric() || x == '_' || x == '$')
 }
 
@@ -879,7 +890,10 @@ mod tests {
         let groups = fsm_name_groups(src);
         assert_eq!(groups.len(), 3, "{groups:?}");
         assert_eq!(groups[0][2], (2, "S_DONE".to_string()));
-        assert_eq!(groups[2], vec![(0, "A".into()), (2, "B".into()), (3, "C".into())]);
+        assert_eq!(
+            groups[2],
+            vec![(0, "A".into()), (2, "B".into()), (3, "C".into())]
+        );
         let best = best_name_group(&groups, &[0, 1, 2]).unwrap();
         assert_eq!(best[1].1, "S_RUN");
         assert!(best_name_group(&groups, &[77]).is_none());
