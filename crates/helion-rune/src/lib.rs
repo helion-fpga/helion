@@ -411,6 +411,7 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         s.center = state::CenterPane::Reports;
         views::reports::demo_impl_complete(s);
         s.reports_view.selected = views::reports::ReportNav::Drc;
+        s.reports_view.selected_drc = Some(0);
         s.drc.items = vec![
             state::DrcItem {
                 id: "PDRC-190".into(),
@@ -428,6 +429,28 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
     }),
     ("reports-no-run", |s| {
         s.center = state::CenterPane::Reports;
+    }),
+    ("reports-methodology", |s| {
+        s.center = state::CenterPane::Reports;
+        views::reports::demo_impl_complete(s);
+        s.reports_view.selected = views::reports::ReportNav::Methodology;
+        s.timing.methodology = vec![
+            state::MethodRow {
+                id: "TIMING-6".into(),
+                severity: "CriticalWarning".into(),
+                category: "Timing".into(),
+                objects: "clk uart_clk".into(),
+                message: "No common primary clock between related clocks clk and uart_clk; the crossing is timed without an exception and the requirement is derived from the closest edges.".into(),
+            },
+            state::MethodRow {
+                id: "XDC-1".into(),
+                severity: "Warning".into(),
+                category: "Constraints".into(),
+                objects: "led[0] led[1] led[2] led[3]".into(),
+                message: "Output ports have no set_output_delay.".into(),
+            },
+        ];
+        s.reports_view.selected_method = Some(0);
     }),
     ("palette-files", |s| {
         views::palette::open_palette(s, views::palette::PaletteMode::Files);
