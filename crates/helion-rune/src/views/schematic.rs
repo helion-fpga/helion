@@ -38,7 +38,7 @@ use rune_kit::glyphs;
 use crate::live::{LiveNetlist, live_netlist, slug};
 use crate::state::{AppState, ConsoleLine, MsgSev};
 use crate::theme::VivadoTheme;
-use crate::views::sources::{SourceFileId, pane_header};
+use crate::views::sources::pane_header;
 
 /// Sheet width in points at 100% (columns are fixed; height grows with the
 /// live netlist).
@@ -594,8 +594,7 @@ fn schematic_toolbar(s: &AppState, t: &VivadoTheme) -> El {
                 .center_y()
                 .hover(t.selection)
                 .on_press(|s: &mut AppState| {
-                    s.sources.selected = SourceFileId::Demo;
-                    echo(s, "select_objects [get_files project1_demo.v]".into());
+                    crate::views::sources::locate_design_top(s);
                 })
                 .child(
                     text("Locate in Sources")
@@ -1339,19 +1338,36 @@ mod tests {
     }
 
     #[test]
-    fn locate_cross_probes_the_sources_tree() {
-        let mut rt = harness_with(schem_state());
+    fn locate_selects_the_file_declaring_the_design_top() {
+        use crate::project::{FileSet, ProjectFile};
+        let mut s = schem_state();
+        s.project_files.add(ProjectFile::in_memory(
+            "divclk_gen.sv",
+            FileSet::Design,
+            crate::live::FIXTURE_SRC,
+        ));
+        let mut rt = harness_with(s);
         rt.frame(0.0);
         tap(&mut rt, "schematic-cell-u-div-u-ff0");
         tap(&mut rt, "schematic-locate");
-        assert_eq!(rt.state.sources.selected, SourceFileId::Demo);
+        let want = rt.state.project_files.defining("counter_top");
+        assert!(want.is_some());
+        assert_eq!(rt.state.sources.selected.resolve(&rt.state), want);
+        assert!(rt.state.layout.show_sources, "locate reveals Sources");
+    }
+
+    #[test]
+    fn locate_says_so_when_no_project_file_declares_the_top() {
+        let mut rt = harness_with(schem_state());
+        rt.frame(0.0);
+        tap(&mut rt, "schematic-locate");
         assert!(
             rt.state
-                .console
-                .lines
+                .toasts
+                .items
                 .iter()
-                .any(|l| l.text == "select_objects [get_files project1_demo.v]"),
-            "locate echoes its Tcl verb"
+                .any(|t| t.title == "Not in project sources"),
+            "never pretend a different file is the source"
         );
     }
 

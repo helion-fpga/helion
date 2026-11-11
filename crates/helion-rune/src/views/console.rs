@@ -30,8 +30,7 @@ use rune_kit::glyphs;
 use crate::state::{AppState, ConsoleLine, MsgSev, RunStatus};
 use crate::theme::VivadoTheme;
 
-/// Bottom dock height (the brief shows ~25% of the 900px window).
-const CONSOLE_H: f32 = 216.0;
+
 /// Tab strip height.
 const TAB_H: f32 = 26.0;
 /// Console toolbar height.
@@ -906,7 +905,7 @@ pub fn console_pane(s: &AppState, t: &VivadoTheme) -> El {
         .h(if s.console.collapsed {
             TAB_H
         } else {
-            CONSOLE_H
+            s.layout.console_h
         })
         .fill(t.panel_bg)
         .border(1.0, t.border)

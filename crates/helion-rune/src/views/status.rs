@@ -46,81 +46,166 @@ fn toast_ink(kind: ToastKind, t: &VivadoTheme) -> rune::Color {
     }
 }
 
-/// `2 Infos, 1 Warning, 0 Critical Warnings, 1 Error` from typed severities.
+/// Diagnostics summary from typed severities. Info lines are the Tcl
+/// journal, not diagnostics, so the bar counts what needs attention:
+/// `No issues`, or `1 Error · 2 Warnings` (critical warnings called out).
 fn message_counts(s: &AppState) -> String {
-    let (mut info, mut warn, mut crit, mut err) = (0, 0, 0, 0);
+    let (mut warn, mut crit, mut err) = (0, 0, 0);
     for line in &s.console.lines {
         match line.sev {
-            MsgSev::Info => info += 1,
+            MsgSev::Info => {}
             MsgSev::Warn => warn += 1,
             MsgSev::Critical => crit += 1,
             MsgSev::Error => err += 1,
         }
     }
-    format!("{info} Infos, {warn} Warnings, {crit} Critical Warnings, {err} Errors")
+    let plural = |n: usize, one: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {one}s")
+        }
+    };
+    let mut parts = Vec::new();
+    if err > 0 {
+        parts.push(plural(err, "Error"));
+    }
+    if crit > 0 {
+        parts.push(plural(crit, "Critical Warning"));
+    }
+    if warn > 0 {
+        parts.push(plural(warn, "Warning"));
+    }
+    if parts.is_empty() {
+        "No issues".into()
+    } else {
+        parts.join(" · ")
+    }
 }
 
-/// The 24px chrome status bar: verb, part, WNS, message counts, layout label.
+/// Worst severity present, for the messages segment ink.
+fn worst(s: &AppState) -> Option<MsgSev> {
+    let mut worst = None;
+    for line in &s.console.lines {
+        worst = match (worst, line.sev) {
+            (_, MsgSev::Error) | (Some(MsgSev::Error), _) => Some(MsgSev::Error),
+            (_, MsgSev::Critical) | (Some(MsgSev::Critical), _) => Some(MsgSev::Critical),
+            (_, MsgSev::Warn) | (Some(MsgSev::Warn), _) => Some(MsgSev::Warn),
+            (w, MsgSev::Info) => w,
+        };
+    }
+    worst
+}
+
+/// A clickable status segment: hover wash, tooltip, one action.
+fn segment(
+    key: &'static str,
+    content: String,
+    ink: rune::Color,
+    help: &'static str,
+    t: &VivadoTheme,
+    on: impl Fn(&mut AppState) + 'static,
+) -> El {
+    row()
+        .key(key)
+        .role("button")
+        .label(content.clone())
+        .help(help)
+        .focusable(true)
+        .h(BAR_H - 4.0)
+        .px(6.0)
+        .radius(3.0)
+        .items_center()
+        .hover(t.selection)
+        .on_press(on)
+        .child(text(content).font(VivadoTheme::FONT_UI).color(ink))
+}
+
+/// The 24px chrome status bar: run verb, then clickable part (Device), WNS
+/// (Timing) and diagnostics (Messages) segments; the layout segment on the
+/// right opens the Layout menu.
 pub fn status_bar(s: &AppState, t: &VivadoTheme) -> El {
+    use crate::state::CenterPane;
     let wns = match s.timing.wns_ps {
-        Some(ps) => format!("WNS: {}", format_ns(ps)),
-        None => "WNS: --".into(),
+        Some(ps) => format!("WNS {}", format_ns(ps)),
+        None => "WNS --".into(),
     };
     let wns_ink = match s.timing.wns_ps {
         Some(ps) if ps < 0 => t.fail,
-        _ => t.text,
+        Some(_) => t.pass,
+        None => t.text_dim,
     };
-    let mut left = row().gap(16.0).items_center().child(
-        row().key("status-verb").gap(4.0).items_center().child(
-            text(s.status.label())
-                .font(VivadoTheme::FONT_UI)
-                .color(verb_ink(s.status, t)),
-        ),
+    let msg_ink = match worst(s) {
+        Some(MsgSev::Error) | Some(MsgSev::Critical) => t.fail,
+        Some(MsgSev::Warn) => t.warn,
+        _ => t.text_dim,
+    };
+    let mut verb = row().key("status-verb").gap(4.0).items_center().pr(6.0).child(
+        text(s.status.label())
+            .font(VivadoTheme::FONT_UI)
+            .color(verb_ink(s.status, t)),
     );
     match s.status {
         StatusVerb::SynthesisComplete | StatusVerb::ImplementationComplete => {
-            left = left.child(text("✓").font(VivadoTheme::FONT_UI).color(t.pass));
+            verb = verb.child(text("✓").font(VivadoTheme::FONT_UI).color(t.pass));
         }
         StatusVerb::Failed => {
-            left = left.child(text("✗").font(VivadoTheme::FONT_UI).color(t.fail));
+            verb = verb.child(text("✗").font(VivadoTheme::FONT_UI).color(t.fail));
         }
         StatusVerb::Ready | StatusVerb::SynthesisRunning | StatusVerb::ImplementationRunning => {}
     }
+    let sep = || el().w(1.0).h(12.0).fill(t.border).a11y_hidden();
+    let mut left = row().gap(4.0).items_center().child(verb);
+    if !s.project.part.is_empty() {
+        left = left.child(sep()).child(segment(
+            "status-part",
+            s.project.part.clone(),
+            t.text_dim,
+            "Target part — open the Device view",
+            t,
+            |s: &mut AppState| s.navigate(CenterPane::Device),
+        ));
+    }
+    left = left
+        .child(sep())
+        .child(segment(
+            "status-wns",
+            wns,
+            wns_ink,
+            "Worst negative slack — open Timing",
+            t,
+            |s: &mut AppState| s.navigate(CenterPane::Timing),
+        ))
+        .child(sep())
+        .child(segment(
+            "status-msgs",
+            message_counts(s),
+            msg_ink,
+            "Show Messages",
+            t,
+            |s: &mut AppState| {
+                crate::layout::set_console_visible(s, true);
+                s.console.tab = crate::views::console::ConsoleTab::Messages;
+            },
+        ));
     row()
         .key("statusbar")
         .w_full()
         .h(BAR_H)
-        .px(10.0)
+        .px(6.0)
         .items_center()
         .justify_between()
         .fill(t.chrome_bg)
         .border_sides([1.0, 0.0, 0.0, 0.0], t.border)
-        .child(
-            left.child(
-                text(s.project.part.clone())
-                    .key("status-part")
-                    .font(VivadoTheme::FONT_UI)
-                    .color(t.text_dim),
-            )
-            .child(
-                text(wns)
-                    .key("status-wns")
-                    .font(VivadoTheme::FONT_UI)
-                    .color(wns_ink),
-            )
-            .child(
-                text(message_counts(s))
-                    .key("status-msgs")
-                    .font(VivadoTheme::FONT_UI)
-                    .color(t.text_dim),
-            ),
-        )
-        .child(
-            text("Default Layout")
-                .key("status-layout")
-                .font(VivadoTheme::FONT_UI)
-                .color(t.text_dim),
-        )
+        .child(left)
+        .child(segment(
+            "status-layout",
+            s.layout.label(),
+            t.text_dim,
+            "Layout presets",
+            t,
+            |s: &mut AppState| s.chrome.open_menu = Some(crate::views::chrome::MenuId::Layout),
+        ))
 }
 
 /// Push the toast stack overlay when there are notifications to show.
@@ -211,8 +296,18 @@ mod tests {
         let s = init();
         assert_eq!(
             message_counts(&s),
-            "2 Infos, 0 Warnings, 0 Critical Warnings, 0 Errors"
+            "No issues",
+            "info lines are the Tcl journal, not diagnostics"
         );
+        let mut s = init();
+        for sev in [MsgSev::Warn, MsgSev::Warn, MsgSev::Error] {
+            s.console.lines.push(crate::state::ConsoleLine {
+                text: "x".into(),
+                sev,
+            });
+        }
+        assert_eq!(message_counts(&s), "1 Error · 2 Warnings");
+        assert_eq!(worst(&s), Some(MsgSev::Error));
     }
 
     #[test]

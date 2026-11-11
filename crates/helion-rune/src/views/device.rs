@@ -53,7 +53,7 @@ use crate::live::{
 };
 use crate::state::{AppState, ConsoleLine, MsgSev};
 use crate::theme::VivadoTheme;
-use crate::views::sources::{SourceFileId, pane_header};
+use crate::views::sources::pane_header;
 
 /// Tile width in world points.
 const TILE_W: f32 = 40.0;
@@ -1274,8 +1274,7 @@ fn device_inspector(
             .center_y()
             .hover(t.selection)
             .on_press(|s: &mut AppState| {
-                s.sources.selected = SourceFileId::Demo;
-                echo(s, "select_objects [get_files project1_demo.v]".into());
+                crate::views::sources::locate_design_top(s);
             })
             .child(
                 text("Locate in Sources")

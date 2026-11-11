@@ -66,139 +66,301 @@ impl MenuId {
     }
 }
 
-/// Real menu action behind a dropdown row (beyond the Tcl echo).
+/// Real menu action behind a dropdown row. Every row does work; the Tcl
+/// text is only the console journal of what ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MenuAct {
-    Echo,
     OpenProject,
+    OpenExample,
+    OpenRecent(usize),
+    ClearRecent,
+    CloseProject,
+    Exit,
     OpenDialog(DialogId),
     Nav(CenterPane),
     Console(ConsoleTab),
     Undo,
     Redo,
     Save,
+    Find,
     RunSynth,
     RunImpl,
     RunBitstream,
+    RunSim,
+    CancelRun,
     Palette(crate::views::palette::PaletteMode),
+    Cheatsheet,
     SetTheme(crate::theme::ThemeMode),
+    Layout(crate::layout::LayoutPreset),
+    ToggleFlow,
+    ToggleSources,
+    ToggleConsole,
+    ToggleFocus,
+    Docs,
+    About,
 }
 
-/// One dropdown row: either a dispatchable item or a separator.
+/// One dropdown row: a dispatchable item, a caps section caption, or a rule.
 enum MenuRow {
     Item {
-        label: &'static str,
+        label: String,
         tcl: &'static str,
         shortcut: Option<&'static str>,
         act: MenuAct,
         checked: bool,
+        /// `Some(reason)` renders the row disabled with that tooltip.
+        blocked: Option<&'static str>,
     },
+    Caption(&'static str),
     Sep,
 }
 
-/// Dropdown contents per menu (labels/sentences from the Vivado brief).
-/// View lists center panes plus the radio-style theme pin, Window lists
-/// console tabs, Flow arms runs.
+/// Why a flow run cannot start right now (`None` = it can).
+pub(crate) fn run_blocked(s: &AppState) -> Option<&'static str> {
+    if s.project.name.is_empty() {
+        Some("Open or create a project first")
+    } else if s.flow.synth == RunStatus::Running || s.flow.impl_run == RunStatus::Running {
+        Some("A run is already in progress")
+    } else {
+        None
+    }
+}
+
+/// The bundled example project (`examples/counter.prj`), when present.
+pub(crate) fn example_project() -> Option<std::path::PathBuf> {
+    let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter.prj");
+    p.is_file().then(|| p.canonicalize().unwrap_or(p))
+}
+
+/// Dropdown contents per menu.
 fn menu_rows(id: MenuId, s: &AppState) -> Vec<MenuRow> {
+    use crate::layout::LayoutPreset;
     use crate::theme::ThemeMode;
     use MenuAct as A;
-    use MenuRow::{Item, Sep};
-    let item = |label: &'static str, tcl: &'static str, act: A| Item {
-        label,
+    use MenuRow::{Caption, Item, Sep};
+    let item = |label: &str, tcl: &'static str, act: A| Item {
+        label: label.to_string(),
         tcl,
         shortcut: None,
         act,
         checked: false,
+        blocked: None,
     };
-    let hot = |label: &'static str, tcl: &'static str, shortcut: &'static str, act: A| Item {
-        label,
+    let hot = |label: &str, tcl: &'static str, shortcut: &'static str, act: A| Item {
+        label: label.to_string(),
         tcl,
         shortcut: Some(shortcut),
         act,
         checked: false,
+        blocked: None,
     };
-    let check = |label: &'static str, tcl: &'static str, act: A, checked: bool| Item {
-        label,
+    let check = |label: &str, tcl: &'static str, act: A, checked: bool| Item {
+        label: label.to_string(),
         tcl,
         shortcut: None,
         act,
         checked,
+        blocked: None,
     };
+    let gate = |row: MenuRow, reason: Option<&'static str>| match row {
+        Item {
+            label,
+            tcl,
+            shortcut,
+            act,
+            checked,
+            ..
+        } => Item {
+            label,
+            tcl,
+            shortcut,
+            act,
+            checked,
+            blocked: reason,
+        },
+        other => other,
+    };
+    let no_project = s.project.name.is_empty().then_some("No project is open");
+    let run_gate = run_blocked(s);
+    let running = s.flow.synth == RunStatus::Running || s.flow.impl_run == RunStatus::Running;
     match id {
-        MenuId::File => vec![
-            hot(
-                "New Project...",
-                "create_project",
-                "Ctrl+N",
-                A::OpenDialog(DialogId::NewProject),
-            ),
-            hot("Open Project...", "open_project", "Ctrl+O", A::OpenProject),
-            hot("Save", "save_project", "Ctrl+S", A::Save),
-            Sep,
-            item("Recent Projects", "recent_projects", A::Echo),
-            Sep,
-            item("Exit", "exit", A::Echo),
-        ],
+        MenuId::File => {
+            let mut rows = vec![
+                hot(
+                    "New Project…",
+                    "create_project",
+                    "⌘N",
+                    A::OpenDialog(DialogId::NewProject),
+                ),
+                hot("Open Project…", "open_project", "⌘O", A::OpenProject),
+                gate(
+                    item("Open Example Project", "open_example counter", A::OpenExample),
+                    example_project()
+                        .is_none()
+                        .then_some("The bundled examples are not installed"),
+                ),
+                Sep,
+                Caption("RECENT PROJECTS"),
+            ];
+            if s.recent.is_empty() {
+                rows.push(gate(
+                    item("No recent projects", "recent_projects", A::ClearRecent),
+                    Some("Projects you open appear here"),
+                ));
+            } else {
+                for (i, path) in s.recent.iter().take(6).enumerate() {
+                    let name = std::path::Path::new(path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.clone());
+                    rows.push(item(&name, "open_recent", A::OpenRecent(i)));
+                }
+                rows.push(item("Clear Recent Projects", "clear_recent", A::ClearRecent));
+            }
+            rows.extend([
+                Sep,
+                hot("Save", "save_file", "⌘S", A::Save),
+                gate(
+                    item("Close Project", "close_project", A::CloseProject),
+                    no_project,
+                ),
+                Sep,
+                hot("Exit", "exit", "⌘Q", A::Exit),
+            ]);
+            rows
+        }
         MenuId::Edit => vec![
-            hot("Undo", "undo", "Ctrl+Z", A::Undo),
-            hot("Redo", "redo", "Ctrl+Y", A::Redo),
+            hot("Undo", "undo", "⌘Z", A::Undo),
+            hot("Redo", "redo", "⇧⌘Z", A::Redo),
             Sep,
-            hot("Find in Files...", "find_in_files", "Ctrl+Shift+F", A::Echo),
-        ],
-        MenuId::Flow => vec![
-            item("Run Synthesis", "launch_runs synth_1", A::RunSynth),
-            item("Run Implementation", "launch_runs impl_1", A::RunImpl),
-            item(
-                "Generate Bitstream",
-                "launch_runs -to_step write_bitstream",
-                A::RunBitstream,
-            ),
-            Sep,
-            item(
-                "Open Elaborated Design",
-                "open_run -elaborated",
-                A::Nav(CenterPane::Schematic),
-            ),
-            item(
-                "Open Synthesized Design",
-                "open_run synth_1",
-                A::Nav(CenterPane::Schematic),
-            ),
-            item(
-                "Open Implemented Design",
-                "open_run impl_1",
-                A::Nav(CenterPane::Schematic),
-            ),
-        ],
-        MenuId::Tools => vec![
-            item(
-                "Settings...",
-                "show_settings",
-                A::OpenDialog(DialogId::Settings),
-            ),
-            item("Language Templates", "show_templates", A::Echo),
-            item("Manage IP", "manage_ip", A::Echo),
-            item("Helion Tcl Store", "tcl_store", A::Echo),
-            Sep,
+            hot("Find in File…", "find", "⌘F", A::Find),
             hot(
-                "Palette: go to file",
+                "Go to File…",
                 "palette_files",
                 "⌘P",
                 A::Palette(crate::views::palette::PaletteMode::Files),
             ),
             hot(
-                "Palette: commands",
+                "Command Palette…",
                 "palette_commands",
                 "⇧⌘P",
                 A::Palette(crate::views::palette::PaletteMode::Commands),
             ),
         ],
-        MenuId::Window => vec![
-            item(
-                "Tcl Console",
-                "show_view TclConsole",
-                A::Console(ConsoleTab::Tcl),
+        MenuId::Flow => {
+            let mut rows = vec![
+                gate(
+                    item("Run Synthesis", "launch_runs synth_1", A::RunSynth),
+                    run_gate,
+                ),
+                gate(
+                    item("Run Implementation", "launch_runs impl_1", A::RunImpl),
+                    run_gate,
+                ),
+                gate(
+                    item(
+                        "Generate Bitstream",
+                        "launch_runs -to_step write_bitstream",
+                        A::RunBitstream,
+                    ),
+                    run_gate,
+                ),
+            ];
+            if running {
+                rows.push(item("Cancel Run", "cancel_run", A::CancelRun));
+            }
+            rows.extend([
+                Sep,
+                gate(
+                    item("Run Simulation", "launch_simulation", A::RunSim),
+                    no_project,
+                ),
+                Sep,
+                item(
+                    "Open Elaborated Design",
+                    "open_run -elaborated",
+                    A::Nav(CenterPane::Schematic),
+                ),
+                item(
+                    "Open Synthesized Design",
+                    "open_run synth_1",
+                    A::Nav(CenterPane::Schematic),
+                ),
+                item(
+                    "Open Implemented Design",
+                    "open_run impl_1",
+                    A::Nav(CenterPane::Device),
+                ),
+                Sep,
+                item(
+                    "Report Timing Summary",
+                    "report_timing_summary",
+                    A::Nav(CenterPane::Timing),
+                ),
+                item("Open Reports", "show_view Reports", A::Nav(CenterPane::Reports)),
+            ]);
+            rows
+        }
+        MenuId::Tools => vec![
+            hot(
+                "Settings…",
+                "show_settings",
+                "⌘,",
+                A::OpenDialog(DialogId::Settings),
             ),
+            gate(
+                item(
+                    "Constraints Wizard…",
+                    "constraints_wizard",
+                    A::OpenDialog(DialogId::Constraints),
+                ),
+                no_project,
+            ),
+            gate(
+                item(
+                    "Add Sources…",
+                    "add_files",
+                    A::OpenDialog(DialogId::AddSources),
+                ),
+                no_project,
+            ),
+            Sep,
+            item("Keyboard Shortcuts", "shortcuts", A::Cheatsheet),
+        ],
+        MenuId::Window => vec![
+            check(
+                "Flow Navigator",
+                "toggle_flow_navigator",
+                A::ToggleFlow,
+                s.layout.show_flow,
+            ),
+            check(
+                "Sources",
+                "toggle_sources",
+                A::ToggleSources,
+                s.layout.show_sources,
+            ),
+            check(
+                "Console",
+                "toggle_console",
+                A::ToggleConsole,
+                s.layout.show_console,
+            ),
+            Item {
+                label: if s.layout.focus {
+                    "Restore Layout".into()
+                } else {
+                    "Maximize Center Pane".into()
+                },
+                tcl: "maximize_view",
+                shortcut: Some("⇧⌘M"),
+                act: A::ToggleFocus,
+                checked: false,
+                blocked: None,
+            },
+            Sep,
+            Caption("CONSOLE"),
+            item("Tcl Console", "show_view TclConsole", A::Console(ConsoleTab::Tcl)),
             item(
                 "Messages",
                 "show_view Messages",
@@ -216,56 +378,78 @@ fn menu_rows(id: MenuId, s: &AppState) -> Vec<MenuRow> {
                 A::Console(ConsoleTab::DesignRuns),
             ),
         ],
-        MenuId::Layout => vec![
-            item("Default Layout", "layout default", A::Echo),
-            item("Save Layout As...", "layout save", A::Echo),
-        ],
+        MenuId::Layout => {
+            let mut rows: Vec<MenuRow> = LayoutPreset::ALL
+                .into_iter()
+                .map(|p| {
+                    check(
+                        p.label(),
+                        "layout",
+                        A::Layout(p),
+                        s.layout.preset == p && !s.layout.customized,
+                    )
+                })
+                .collect();
+            rows.push(Sep);
+            rows.push(item(
+                "Reset Current Layout",
+                "layout reset",
+                A::Layout(s.layout.preset),
+            ));
+            rows
+        }
         MenuId::View => vec![
+            item("Start Page", "show_view Start", A::Nav(CenterPane::Start)),
             item(
                 "Project Summary",
                 "show_view Summary",
                 A::Nav(CenterPane::Summary),
             ),
-            item("Editor", "show_view Editor", A::Nav(CenterPane::Editor)),
-            item("Timing", "show_view Timing", A::Nav(CenterPane::Timing)),
+            Sep,
+            hot("Editor", "show_view Editor", "⌘1", A::Nav(CenterPane::Editor)),
             item(
                 "Schematic",
                 "show_view Schematic",
                 A::Nav(CenterPane::Schematic),
             ),
-            item("Device", "show_view Device", A::Nav(CenterPane::Device)),
-            item("Waveform", "show_view Wave", A::Nav(CenterPane::Wave)),
+            hot("Device", "show_view Device", "⌘2", A::Nav(CenterPane::Device)),
+            hot("Timing", "show_view Timing", "⌘3", A::Nav(CenterPane::Timing)),
+            item("Reports", "show_view Reports", A::Nav(CenterPane::Reports)),
+            Sep,
             item("Simulation", "show_view Sim", A::Nav(CenterPane::Sim)),
+            item("Waveform", "show_view Wave", A::Nav(CenterPane::Wave)),
             item("Debug", "show_view Debug", A::Nav(CenterPane::Debug)),
             item(
                 "Hardware Manager",
                 "show_view Program",
                 A::Nav(CenterPane::Program),
             ),
-            item("Reports", "show_view Reports", A::Nav(CenterPane::Reports)),
             Sep,
+            Caption("THEME"),
             check(
-                "Light Theme",
+                "Light",
                 "set_theme light",
                 A::SetTheme(ThemeMode::Light),
                 s.theme == ThemeMode::Light,
             ),
             check(
-                "Dark Theme",
+                "Dark",
                 "set_theme dark",
                 A::SetTheme(ThemeMode::Dark),
                 s.theme == ThemeMode::Dark,
             ),
             check(
-                "Follow System Theme",
+                "Follow System",
                 "set_theme system",
                 A::SetTheme(ThemeMode::System),
                 s.theme == ThemeMode::System,
             ),
         ],
         MenuId::Help => vec![
-            item("Documentation", "help docs", A::Echo),
-            item("About", "help about", A::Echo),
+            item("Keyboard Shortcuts", "shortcuts", A::Cheatsheet),
+            item("Documentation", "help docs", A::Docs),
+            Sep,
+            item("About Helion", "help about", A::About),
         ],
     }
 }
@@ -679,6 +863,8 @@ const TOOLS_RUN: &[Tool] = &[
 pub struct ChromeState {
     pub open_menu: Option<MenuId>,
     pub collapsed: [bool; 7],
+    /// Help ▸ About dialog is showing.
+    pub about_open: bool,
 }
 
 impl ChromeState {
@@ -742,54 +928,56 @@ fn dispatch_full(
     }
 }
 
-/// Dispatch a menu row's real action plus its Tcl echo.
+/// Journal a menu action's Tcl spelling to the console.
+fn journal(s: &mut AppState, tcl: &str) {
+    s.console.lines.push(ConsoleLine {
+        text: tcl.into(),
+        sev: MsgSev::Info,
+    });
+}
+
+/// Dispatch a menu row's real action (then journal its Tcl spelling).
 fn dispatch_menu(s: &mut AppState, tcl: &'static str, act: MenuAct, tx: &mut Tx) {
+    use crate::layout;
+    s.chrome.open_menu = None;
     match act {
-        MenuAct::Echo => dispatch(s, tcl, None),
-        MenuAct::OpenProject => {
-            s.chrome.open_menu = None;
-            crate::pickers::open_project(tx);
+        MenuAct::OpenProject => crate::pickers::open_project(tx),
+        MenuAct::OpenExample => {
+            if let Some(path) = example_project() {
+                crate::pickers::open_path(s, &path);
+            }
         }
+        MenuAct::OpenRecent(i) => {
+            if let Some(path) = s.recent.get(i).cloned() {
+                crate::pickers::open_path(s, std::path::Path::new(&path));
+            }
+        }
+        MenuAct::ClearRecent => {
+            s.recent.clear();
+            layout::save(s);
+        }
+        MenuAct::CloseProject => crate::pickers::close_project(s),
+        MenuAct::Exit => tx.quit(),
         MenuAct::OpenDialog(id) => dispatch_full(s, tcl, None, None, Some(id), None),
         MenuAct::Nav(pane) => dispatch_full(s, tcl, None, Some(pane), None, None),
         MenuAct::Console(tab) => {
-            s.chrome.open_menu = None;
+            layout::set_console_visible(s, true);
             s.console.tab = tab;
-            s.console.lines.push(ConsoleLine {
-                text: tcl.into(),
-                sev: MsgSev::Info,
-            });
         }
         MenuAct::Undo => {
-            s.chrome.open_menu = None;
             if crate::views::editor::undo_synced(s) {
-                s.console.lines.push(ConsoleLine {
-                    text: tcl.into(),
-                    sev: MsgSev::Info,
-                });
+                journal(s, tcl);
             }
         }
         MenuAct::Redo => {
-            s.chrome.open_menu = None;
             if crate::views::editor::redo_synced(s) {
-                s.console.lines.push(ConsoleLine {
-                    text: tcl.into(),
-                    sev: MsgSev::Info,
-                });
+                journal(s, tcl);
             }
         }
-        MenuAct::Save => {
-            s.chrome.open_menu = None;
-            match crate::views::editor::save_active(s) {
-                Ok(path) => s.console.lines.push(ConsoleLine {
-                    text: format!("save_file {}", path.display()),
-                    sev: MsgSev::Info,
-                }),
-                Err(e) => s.console.lines.push(ConsoleLine {
-                    text: format!("ERROR: save_file: {e}"),
-                    sev: MsgSev::Error,
-                }),
-            }
+        MenuAct::Save => save_active_file(s),
+        MenuAct::Find => {
+            s.navigate(CenterPane::Editor);
+            s.editor.find_open = true;
         }
         MenuAct::RunSynth => dispatch(s, tcl, Some(RunTarget::Synth)),
         MenuAct::RunImpl => dispatch(s, tcl, Some(RunTarget::Impl)),
@@ -801,17 +989,61 @@ fn dispatch_menu(s: &mut AppState, tcl: &'static str, act: MenuAct, tx: &mut Tx)
             None,
             None,
         ),
-        MenuAct::Palette(mode) => {
-            s.chrome.open_menu = None;
-            crate::views::palette::open_palette(s, mode);
+        MenuAct::RunSim => dispatch_full(
+            s,
+            tcl,
+            Some(RunTarget::Sim),
+            Some(CenterPane::Wave),
+            None,
+            None,
+        ),
+        MenuAct::CancelRun => {
+            crate::runs::cancel_run(s);
+            journal(s, tcl);
         }
+        MenuAct::Palette(mode) => crate::views::palette::open_palette(s, mode),
+        MenuAct::Cheatsheet => crate::views::palette::open_cheatsheet(s),
         MenuAct::SetTheme(mode) => {
-            s.chrome.open_menu = None;
             s.theme = mode;
+            layout::save(s);
+            journal(s, tcl);
+        }
+        MenuAct::Layout(preset) => {
+            layout::apply_preset(s, preset);
+            journal(s, &format!("layout {}", preset.id()));
+        }
+        MenuAct::ToggleFlow => layout::set_flow_visible(s, !s.layout.show_flow),
+        MenuAct::ToggleSources => layout::set_sources_visible(s, !s.layout.show_sources),
+        MenuAct::ToggleConsole => layout::set_console_visible(s, !s.layout.show_console),
+        MenuAct::ToggleFocus => layout::toggle_focus(s),
+        MenuAct::Docs => {
+            if tx.open_url(DOCS_URL).is_err() {
+                s.toasts.push(
+                    crate::state::ToastKind::Error,
+                    "Couldn't open the documentation",
+                    DOCS_URL,
+                );
+            }
+        }
+        MenuAct::About => s.chrome.about_open = true,
+    }
+}
+
+/// Project documentation (README + docs/ on the public repository).
+pub const DOCS_URL: &str = "https://github.com/helion-fpga/helion#readme";
+
+/// Save the active editor tab to disk, journaling the result. Shared by
+/// File ▸ Save, the toolbar Save button and ⌘S.
+pub(crate) fn save_active_file(s: &mut AppState) {
+    match crate::views::editor::save_active(s) {
+        Ok(path) => journal(s, &format!("save_file {}", path.display())),
+        Err(e) => {
             s.console.lines.push(ConsoleLine {
-                text: tcl.into(),
-                sev: MsgSev::Info,
+                text: format!("ERROR: save_file: {e}"),
+                sev: MsgSev::Error,
             });
+            s.toasts
+                .push(crate::state::ToastKind::Error, "Save failed", &e.to_string());
         }
     }
 }
@@ -944,15 +1176,26 @@ pub fn menu_bar(s: &AppState, t: &VivadoTheme) -> El {
     bar.child(el().grow(1.0)).child(
         row()
             .key("quick-access")
-            .role("search")
-            .label("Quick Access")
-            .w(190.0)
+            .role("button")
+            .label("Quick Access: search commands, views and files")
+            .help("Search commands, views and files")
+            .focusable(true)
+            .w(220.0)
             .h(20.0)
             .items_center()
             .gap(6.0)
             .px(6.0)
+            .radius(4.0)
             .fill(t.panel_bg)
             .border(1.0, t.border)
+            .hover(t.selection)
+            .on_press(|s: &mut AppState| {
+                s.chrome.open_menu = None;
+                crate::views::palette::open_palette(
+                    s,
+                    crate::views::palette::PaletteMode::Commands,
+                );
+            })
             .child(
                 icon(&glyphs::SEARCH, 12.0)
                     .color(t.text_faint)
@@ -960,6 +1203,12 @@ pub fn menu_bar(s: &AppState, t: &VivadoTheme) -> El {
             )
             .child(
                 text("Quick Access")
+                    .font(VivadoTheme::FONT_UI)
+                    .color(t.text_faint)
+                    .grow(1.0),
+            )
+            .child(
+                text("⇧⌘P")
                     .font(VivadoTheme::FONT_UI)
                     .color(t.text_faint),
             ),
@@ -982,15 +1231,21 @@ fn toolbar_group(s: &AppState, tools: &[Tool], t: &VivadoTheme, first: bool) -> 
             "save" => (s.editor.dirty, "No unsaved changes"),
             "undo" => (s.editor.can_undo_active(is_xdc), "Nothing to undo"),
             "redo" => (s.editor.can_redo_active(is_xdc), "Nothing to redo"),
+            "run-synth" | "run-impl" | "gen-bitstream" => match run_blocked(s) {
+                Some(why) => (false, why),
+                None => (true, ""),
+            },
             _ => (true, ""),
         };
         let mut btn = el()
             .key(format!("tool-{}", tool.id))
             .role("button")
             .label(tool.tip)
+            .help(if enabled { tool.tip } else { reason })
             .focusable(enabled)
             .disabled(!enabled)
             .size(24.0, 24.0)
+            .radius(4.0)
             .center()
             .hover(t.selection)
             .child(tool_glyph(tool.icon, t));
@@ -1005,27 +1260,17 @@ fn toolbar_group(s: &AppState, tools: &[Tool], t: &VivadoTheme, first: bool) -> 
                 "nav-forward" => {
                     s.go_forward();
                 }
-                "save" => {
-                    s.editor.mark_saved();
-                    s.console.lines.push(ConsoleLine {
-                        text: tcl.into(),
-                        sev: MsgSev::Info,
-                    });
-                }
+                // Same paths as File ▸ Save / Edit ▸ Undo: write to disk and
+                // keep the live edit field in step with the buffer.
+                "save" => save_active_file(s),
                 "undo" => {
-                    if s.editor.undo_active(crate::views::editor::active_is_xdc(s)) {
-                        s.console.lines.push(ConsoleLine {
-                            text: tcl.into(),
-                            sev: MsgSev::Info,
-                        });
+                    if crate::views::editor::undo_synced(s) {
+                        journal(s, tcl);
                     }
                 }
                 "redo" => {
-                    if s.editor.redo_active(crate::views::editor::active_is_xdc(s)) {
-                        s.console.lines.push(ConsoleLine {
-                            text: tcl.into(),
-                            sev: MsgSev::Info,
-                        });
+                    if crate::views::editor::redo_synced(s) {
+                        journal(s, tcl);
                     }
                 }
                 "new-project" => {
@@ -1197,34 +1442,63 @@ pub fn menu_overlay(s: &AppState, t: &VivadoTheme) -> Option<El> {
                 .my(4.0)
                 .fill(t.border_light)
                 .a11y_hidden(),
+            MenuRow::Caption(caption) => row()
+                .key(format!("{}-cap{i}", id.key()))
+                .w_full()
+                .h(20.0)
+                .px(12.0)
+                .items_center()
+                .child(
+                    text(caption)
+                        .font(VivadoTheme::FONT_CAPS)
+                        .color(t.text_faint),
+                ),
             MenuRow::Item {
                 label,
                 tcl,
                 shortcut,
                 act,
                 checked,
+                blocked,
             } => {
-                let shown = if checked {
-                    format!("✓ {label}")
-                } else {
-                    label.to_string()
-                };
+                // A fixed check column keeps labels aligned whether or not
+                // the row is a toggle.
+                let mark = text(if checked { "✓" } else { "" })
+                    .font(VivadoTheme::FONT_UI)
+                    .color(t.accent);
                 let mut item_row = row()
                     .key(format!("{}-item{i}", id.key()))
                     .role("menuitem")
-                    .label(label)
-                    .focusable(true)
+                    .label(label.clone())
+                    .checked(checked)
+                    .focusable(blocked.is_none())
+                    .disabled(blocked.is_some())
                     .w_full()
                     .h(24.0)
                     .items_center()
                     .gap(24.0)
-                    .px(12.0)
+                    .pl(6.0)
+                    .pr(12.0)
                     .justify_between()
-                    .hover(t.selection)
-                    .on_press_tx(move |s: &mut AppState, tx: &mut Tx| {
-                        dispatch_menu(s, tcl, act, tx)
-                    })
-                    .child(ui_label(&shown, t));
+                    .child(
+                        row()
+                            .items_center()
+                            .min_w(0.0)
+                            .child(el().w(16.0).center().child(mark))
+                            .child(
+                                text(label)
+                                    .font(VivadoTheme::FONT_UI)
+                                    .color(if blocked.is_some() { t.text_faint } else { t.text })
+                                    .truncate(),
+                            ),
+                    );
+                if let Some(reason) = blocked {
+                    item_row = item_row.description(reason).help(reason);
+                } else {
+                    item_row = item_row.hover(t.selection).on_press_tx(
+                        move |s: &mut AppState, tx: &mut Tx| dispatch_menu(s, tcl, act, tx),
+                    );
+                }
                 if let Some(hot) = shortcut {
                     item_row =
                         item_row.child(text(hot).font(VivadoTheme::FONT_UI).color(t.text_dim));
@@ -1245,6 +1519,96 @@ pub fn menu_overlay(s: &AppState, t: &VivadoTheme) -> Option<El> {
             .modal(true, |s: &mut AppState| s.chrome.open_menu = None)
             .child(list),
     )
+}
+
+/// Help ▸ About: product, version, build target and license, with the one
+/// useful action (documentation).
+pub fn push_about(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme) {
+    use rune_kit::{Button, ButtonVariant, Dialog};
+    if !s.chrome.about_open {
+        return;
+    }
+    let kit = t.kit();
+    let line = |label: &str, value: String| {
+        row()
+            .w_full()
+            .h(20.0)
+            .items_center()
+            .child(
+                el().w(88.0).child(
+                    text(label.to_string())
+                        .font(VivadoTheme::FONT_UI)
+                        .color(t.text_dim),
+                ),
+            )
+            .child(
+                text(value)
+                    .font(VivadoTheme::FONT_MONO.mono())
+                    .color(t.text)
+                    .truncate(),
+            )
+    };
+    let body = col()
+        .key("about-body")
+        .w_full()
+        .gap(10.0)
+        .padding(16.0)
+        .child(
+            text("Helion")
+                .font(VivadoTheme::FONT_DISPLAY)
+                .color(t.text),
+        )
+        .child(
+            text("Open FPGA toolchain: synthesis, place and route, timing, simulation, debug and programming.")
+                .font(VivadoTheme::FONT_UI)
+                .color(t.text_dim)
+                .max_lines(3),
+        )
+        .child(
+            col()
+                .w_full()
+                .gap(2.0)
+                .child(line("Version", env!("CARGO_PKG_VERSION").to_string()))
+                .child(line("Target", crate::doctor::target_triple().to_string()))
+                .child(line("Device", s.project.part.clone()))
+                .child(line("License", "AGPL-3.0-or-later".to_string())),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .pt(4.0)
+                .child(el().grow(1.0))
+                .child(
+                    Button::new("Documentation")
+                        .variant(ButtonVariant::Neutral)
+                        .on_press_tx::<AppState>(|s: &mut AppState, tx: &mut Tx| {
+                            if tx.open_url(DOCS_URL).is_err() {
+                                s.toasts.push(
+                                    crate::state::ToastKind::Error,
+                                    "Couldn't open the documentation",
+                                    DOCS_URL,
+                                );
+                            }
+                        })
+                        .build(&kit)
+                        .key("about-docs"),
+                )
+                .child(
+                    Button::new("Close")
+                        .variant(ButtonVariant::Submit)
+                        .on_press::<AppState>(|s: &mut AppState| s.chrome.about_open = false)
+                        .build(&kit)
+                        .key("about-close"),
+                ),
+        );
+    Dialog::new("about-dialog", "About Helion")
+        .open(true)
+        .width(440.0)
+        .fit()
+        .on_close(|s: &mut AppState| s.chrome.about_open = false)
+        .child(body)
+        .build(&kit, layer);
 }
 
 #[cfg(test)]
@@ -1499,8 +1863,9 @@ mod tests {
             rt.find("menu-view-menu").is_some(),
             "View dropdown must mount"
         );
-        // 10 nav rows + separator at index 10, theme rows at 11, 12, 13.
-        tap(&mut rt, "menu-view-item12");
+        // Start, Summary, rule, 5 design views, rule, 4 sim/hw views, rule,
+        // THEME caption: Light 15, Dark 16, Follow System 17.
+        tap(&mut rt, "menu-view-item16");
         assert_eq!(rt.state.theme, ThemeMode::Dark, "Dark Theme pins dark");
         assert_eq!(rt.state.chrome.open_menu, None);
         assert!(
@@ -1512,10 +1877,10 @@ mod tests {
             "theme pin must echo its Tcl verb"
         );
         tap(&mut rt, "menu-view");
-        tap(&mut rt, "menu-view-item11");
+        tap(&mut rt, "menu-view-item15");
         assert_eq!(rt.state.theme, ThemeMode::Light, "Light Theme pins light");
         tap(&mut rt, "menu-view");
-        tap(&mut rt, "menu-view-item13");
+        tap(&mut rt, "menu-view-item17");
         assert_eq!(
             rt.state.theme,
             ThemeMode::System,

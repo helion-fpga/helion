@@ -78,6 +78,15 @@ pub enum PaletteCommand {
     ToggleConsole,
     PaletteFiles,
     PaletteCommands,
+    Layout(crate::layout::LayoutPreset),
+    ToggleSidebar,
+    ToggleFocus,
+    OpenExample,
+    CloseProject,
+    Settings,
+    AddSources,
+    ConstraintsWizard,
+    About,
 }
 
 /// Center panes in palette display order.
@@ -142,6 +151,17 @@ impl PaletteCommand {
         cmds.push(PaletteCommand::PaletteCommands);
         cmds.push(PaletteCommand::ToggleConsole);
         cmds.push(PaletteCommand::ToggleTheme);
+        cmds.push(PaletteCommand::ToggleSidebar);
+        cmds.push(PaletteCommand::ToggleFocus);
+        for preset in crate::layout::LayoutPreset::ALL {
+            cmds.push(PaletteCommand::Layout(preset));
+        }
+        cmds.push(PaletteCommand::OpenExample);
+        cmds.push(PaletteCommand::CloseProject);
+        cmds.push(PaletteCommand::Settings);
+        cmds.push(PaletteCommand::AddSources);
+        cmds.push(PaletteCommand::ConstraintsWizard);
+        cmds.push(PaletteCommand::About);
         cmds
     }
 
@@ -161,6 +181,15 @@ impl PaletteCommand {
             PaletteCommand::ToggleConsole => "Toggle Tcl console".into(),
             PaletteCommand::PaletteFiles => "Palette: go to file".into(),
             PaletteCommand::PaletteCommands => "Palette: commands".into(),
+            PaletteCommand::Layout(p) => format!("Layout: {}", p.label()),
+            PaletteCommand::ToggleSidebar => "Show/hide Flow Navigator and Sources".into(),
+            PaletteCommand::ToggleFocus => "Maximize/restore center pane".into(),
+            PaletteCommand::OpenExample => "Open example project".into(),
+            PaletteCommand::CloseProject => "Close project".into(),
+            PaletteCommand::Settings => "Settings…".into(),
+            PaletteCommand::AddSources => "Add sources…".into(),
+            PaletteCommand::ConstraintsWizard => "Constraints wizard…".into(),
+            PaletteCommand::About => "About Helion".into(),
         }
     }
 
@@ -176,6 +205,10 @@ impl PaletteCommand {
             PaletteCommand::ToggleConsole => "⌘`",
             PaletteCommand::PaletteFiles => "⌘P",
             PaletteCommand::PaletteCommands => "⇧⌘P",
+            PaletteCommand::ToggleSidebar => "⌘J",
+            PaletteCommand::ToggleFocus => "⇧⌘M",
+            PaletteCommand::Settings => "⌘,",
+            PaletteCommand::NewProject => "⌘N",
             _ => "",
         }
     }
@@ -244,6 +277,8 @@ pub fn fuzzy_score(query: &str, target: &str) -> Option<i64> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PalettePick {
     File(usize),
+    /// A project file not open in a tab yet (index into `project_files`).
+    Project(usize),
     Cmd(PaletteCommand),
 }
 
@@ -298,6 +333,24 @@ pub fn file_rows(s: &AppState, query: &str) -> Vec<PaletteRow> {
             label,
             hint: hint.into(),
             score,
+        });
+    }
+    // Project files not open yet: match on the full path so directory
+    // names narrow the list too.
+    for (i, f) in s.project_files.files.iter().enumerate() {
+        if s.editor.tabs.contains(&f.name) {
+            continue;
+        }
+        let haystack = f.location();
+        let Some(score) = fuzzy_score(query, &haystack).or_else(|| fuzzy_score(query, &f.name))
+        else {
+            continue;
+        };
+        rows.push(PaletteRow {
+            pick: PalettePick::Project(i),
+            label: f.name.clone(),
+            hint: f.set.label().into(),
+            score: score - 1,
         });
     }
     rows.sort_by(|a, b| b.score.cmp(&a.score));
@@ -401,6 +454,11 @@ fn activate_pick(s: &mut AppState, pick: PalettePick, tx: &mut Tx) {
     close_palette(s);
     match pick {
         PalettePick::File(i) => crate::views::editor::select_tab(s, i),
+        PalettePick::Project(i) => {
+            if crate::project::open_index(s, i) {
+                s.navigate(CenterPane::Editor);
+            }
+        }
         PalettePick::Cmd(cmd) => run_command(s, cmd, tx),
     }
 }
@@ -426,10 +484,31 @@ pub fn run_command(s: &mut AppState, cmd: PaletteCommand, tx: &mut Tx) {
         PaletteCommand::Cheatsheet => open_cheatsheet(s),
         PaletteCommand::ToggleTheme => toggle_theme(s),
         PaletteCommand::ToggleConsole => {
-            s.console.collapsed = !s.console.collapsed;
+            if s.layout.console_visible() {
+                s.console.collapsed = !s.console.collapsed;
+            } else {
+                crate::layout::set_console_visible(s, true);
+            }
         }
         PaletteCommand::PaletteFiles => open_palette(s, PaletteMode::Files),
         PaletteCommand::PaletteCommands => open_palette(s, PaletteMode::Commands),
+        PaletteCommand::Layout(p) => crate::layout::apply_preset(s, p),
+        PaletteCommand::ToggleSidebar => crate::layout::toggle_sidebar(s),
+        PaletteCommand::ToggleFocus => crate::layout::toggle_focus(s),
+        PaletteCommand::OpenExample => {
+            if let Some(p) = crate::views::chrome::example_project() {
+                crate::pickers::open_path(s, &p);
+            }
+        }
+        PaletteCommand::CloseProject => crate::pickers::close_project(s),
+        PaletteCommand::Settings => s.dialogs.open(crate::views::dialogs::DialogId::Settings),
+        PaletteCommand::AddSources => {
+            s.dialogs.open(crate::views::dialogs::DialogId::AddSources)
+        }
+        PaletteCommand::ConstraintsWizard => {
+            s.dialogs.open(crate::views::dialogs::DialogId::Constraints)
+        }
+        PaletteCommand::About => s.chrome.about_open = true,
     }
 }
 
@@ -476,6 +555,11 @@ pub enum ChordAction {
     GoTo(CenterPane),
     ToggleConsole,
     LaunchImpl,
+    ToggleSidebar,
+    ToggleFocus,
+    Find,
+    Settings,
+    NewProject,
 }
 
 /// Match a key event against the true global bindings (old `SHORTCUTS`,
@@ -490,6 +574,21 @@ pub fn match_chord(key: &KeyEvent) -> Option<ChordAction> {
     }
     if key.is_command('k') {
         return Some(ChordAction::Cheatsheet);
+    }
+    if key.is_command('m') && key.mods.shift {
+        return Some(ChordAction::ToggleFocus);
+    }
+    if key.is_command('j') {
+        return Some(ChordAction::ToggleSidebar);
+    }
+    if key.is_command('f') {
+        return Some(ChordAction::Find);
+    }
+    if key.is_command(',') {
+        return Some(ChordAction::Settings);
+    }
+    if key.is_command('n') {
+        return Some(ChordAction::NewProject);
     }
     if key.is_command('o') {
         return Some(ChordAction::OpenFile);
@@ -541,9 +640,25 @@ pub fn run_chord(s: &mut AppState, action: ChordAction, tx: &mut Tx) {
         ChordAction::Save => save_open_file(s),
         ChordAction::GoTo(pane) => s.navigate(pane),
         ChordAction::ToggleConsole => {
-            s.console.collapsed = !s.console.collapsed;
+            if s.layout.console_visible() {
+                s.console.collapsed = !s.console.collapsed;
+            } else {
+                crate::layout::set_console_visible(s, true);
+            }
         }
-        ChordAction::LaunchImpl => crate::runs::launch(s, crate::runs::RunKind::Impl),
+        ChordAction::LaunchImpl => {
+            if crate::views::chrome::run_blocked(s).is_none() {
+                crate::runs::launch(s, crate::runs::RunKind::Impl);
+            }
+        }
+        ChordAction::ToggleSidebar => crate::layout::toggle_sidebar(s),
+        ChordAction::ToggleFocus => crate::layout::toggle_focus(s),
+        ChordAction::Find => {
+            s.navigate(CenterPane::Editor);
+            s.editor.find_open = true;
+        }
+        ChordAction::Settings => s.dialogs.open(crate::views::dialogs::DialogId::Settings),
+        ChordAction::NewProject => s.dialogs.open(crate::views::dialogs::DialogId::NewProject),
         ChordAction::Cheatsheet | ChordAction::Palette(_) => unreachable!(),
     }
 }
@@ -568,13 +683,18 @@ pub fn app_key(s: &mut AppState, key: &KeyEvent, tx: &mut Tx) -> bool {
 /// The true global keybindings (old `SHORTCUTS`, cut to what this build
 /// binds: no sidebar, density, or wrap chords exist to list).
 pub const SHORTCUTS: &[(&str, &str)] = &[
-    ("⌘O", "Open file…"),
-    ("⌘S", "Save open file (Editor canvas)"),
+    ("⌘N", "New project…"),
+    ("⌘O", "Open project or file…"),
+    ("⌘S", "Save open file"),
+    ("⌘F", "Find in the open file"),
     ("⌘↩", "Implement: synthesis → opt → place → route"),
     ("⌘1", "Go to Editor"),
     ("⌘2", "Go to Device"),
     ("⌘3", "Go to Timing"),
-    ("⌘`", "Toggle Tcl console"),
+    ("⌘J", "Show/hide Flow Navigator and Sources"),
+    ("⇧⌘M", "Maximize/restore the center pane"),
+    ("⌘`", "Show/collapse the console"),
+    ("⌘,", "Settings"),
     ("⌘P", "Command palette: go to file"),
     ("⇧⌘P", "Command palette: commands"),
     ("⌘K", "Toggle this cheatsheet"),
@@ -1143,17 +1263,18 @@ mod tests {
     }
 
     #[test]
-    fn tools_menu_opens_both_palette_modes() {
+    fn edit_menu_opens_both_palette_modes() {
         // One runtime per mode: the open palette's modal scrim covers the
         // menubar, so a second menu tap in the same runtime cannot land.
+        // Edit: Undo, Redo, rule, Find, Go to File (4), Command Palette (5).
         let mut rt = rt_with(|_| {});
-        tap(&mut rt, "menu-tools");
-        tap(&mut rt, "menu-tools-item5");
+        tap(&mut rt, "menu-edit");
+        tap(&mut rt, "menu-edit-item4");
         assert!(rt.state.palette.open);
         assert_eq!(rt.state.palette.mode, PaletteMode::Files);
         let mut rt = rt_with(|_| {});
-        tap(&mut rt, "menu-tools");
-        tap(&mut rt, "menu-tools-item6");
+        tap(&mut rt, "menu-edit");
+        tap(&mut rt, "menu-edit-item5");
         assert!(rt.state.palette.open);
         assert_eq!(rt.state.palette.mode, PaletteMode::Commands);
     }

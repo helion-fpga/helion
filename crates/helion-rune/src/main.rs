@@ -18,5 +18,12 @@ fn main() {
         }
         _ => {}
     }
-    rune::run(helion_rune::app_spec());
+    let mut spec = helion_rune::app_spec();
+    // Headless tooling (`--snap`, `--scene`, `--tree`, scripts) renders the
+    // deterministic demo state; a real launch boots the Start page or the
+    // project named on the command line, with saved prefs.
+    if !std::env::args().skip(1).any(|a| a.starts_with("--")) {
+        spec.init = helion_rune::boot;
+    }
+    rune::run(spec);
 }

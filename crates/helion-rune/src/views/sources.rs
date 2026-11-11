@@ -1,123 +1,81 @@
-//! Sources tree + Source File Properties card.
+//! Sources tree + Source File Properties card over the real project files
+//! ([`crate::project::ProjectFiles`]).
 //!
-//! New Rune `El` code written from scratch for the Vivado brief
-//! (`/tmp/vivado-ref/rd-f58667ba*.png`): the "Sources" pane with its Design
-//! Sources / Constraints / Simulation Sources tree and Hierarchy / Libraries /
-//! Compile Order tabs, stacked over the "Source File Properties" card (Enabled
-//! checkbox, Location / Type / Library / Size rows, General / Properties
-//! tabs). All colors come from [`VivadoTheme`]; rows use framework layout only
-//! (no manual geometry, no hardcoded hex, no stringly selection).
+//! The Sources pane groups files the Vivado way (Design Sources /
+//! Constraints › constrs_1 / Simulation Sources › sim_1) with Hierarchy /
+//! Libraries / Compile Order tabs, a name filter, expand/collapse all and Add
+//! Sources. The Source File Properties card below shows the selected file's
+//! real location, language, fileset, size and declared module, with working
+//! previous/next stepping. Single click selects; double click opens the file
+//! in the editor.
 //!
-//! Data shapes mirror `helion-gui` read-only: [`PropRow`] mirrors
-//! `ide.rs::PropertyRow` (`NAME`/`VALUE` rows for the Properties tab); file
-//! extensions follow `open_dialog::HDL_EXTENSIONS` (`.v`/`.xdc` demo files).
-//!
-//! Rune API citations (rev `a7f276c3630f85a06a0230295da4d2bd172d8d3b`):
-//! - `crates/rune/src/el.rs`: `row()/col()/el()/text()/icon()`.
-//! - `crates/rune/src/el/text.rs`: `.truncate_middle()` for long paths.
-//! - `crates/rune-kit/src/glyphs.rs`: `TRIANGLE_RIGHT/DOWN`, `FOLDER(_OPEN)`,
-//!   `FILE(_CODE)`, `SEARCH`, `CHEVRON_UP/DOWN`.
-//! - `crates/rune-kit/src/checkbox.rs`: `Checkbox::new().label().on_toggle()`.
+//! Selection is a [`SourceFileId`]: the three roles the rest of the shell
+//! cross-probes to (design top, first constraints file, first testbench) or
+//! any file by index.
 
-use rune::{El, ScrollSpec, col, el, icon, row, text};
-use rune_kit::Checkbox;
+use rune::{El, ScrollSpec, TextEdit, col, el, icon, row, text, text_input};
 use rune_kit::glyphs;
 
-use crate::state::{AppState, ConsoleLine, MsgSev};
+use crate::project::{FileSet, ProjectFile};
+use crate::state::AppState;
 use crate::theme::VivadoTheme;
 
-/// Width of the Sources + Properties column in the shell.
-pub const SOURCES_W: f32 = 300.0;
+/// Default width of the Sources + Properties column (see `layout`).
+pub const SOURCES_W: f32 = crate::layout::SOURCES_W;
 /// Tree indent per depth level.
 const INDENT: f32 = 14.0;
 /// Tree/file row height (compact CAD density).
 const ROW_H: f32 = 20.0;
 /// Pane header height.
 const HEADER_H: f32 = 24.0;
+/// HDL libraries are not modeled per file: everything compiles into `work`.
+const LIBRARY: &str = "work";
 
-/// Demo file kind, shown in the Type box. Typed, never a bare string.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FileKind {
-    Verilog,
-    Xdc,
-}
-
-impl FileKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            FileKind::Verilog => "Verilog",
-            FileKind::Xdc => "XDC",
-        }
-    }
-}
-
-/// One demo source file. Static data; per-file UI state lives in
-/// [`SourcesState::enabled`] indexed by [`SourceFileId`].
-#[derive(Clone, Copy, Debug)]
-pub struct SourceFile {
-    pub name: &'static str,
-    /// Design-top module name (`None` for plain files).
-    pub module: Option<&'static str>,
-    pub path: &'static str,
-    pub kind: FileKind,
-    pub library: &'static str,
-    pub size_bytes: u64,
-}
-
-/// Selectable files. Typed so selection is never a string.
+/// A source selection: a cross-probe role or a file index.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SourceFileId {
+    /// The design top (file declaring the project top, else the first
+    /// design source).
     #[default]
     Demo,
+    /// The first constraints file.
     Xdc,
+    /// The first simulation source.
     Tb,
+    /// Any project file by index.
+    Index(usize),
 }
 
 impl SourceFileId {
-    pub const ALL: [SourceFileId; 3] = [SourceFileId::Demo, SourceFileId::Xdc, SourceFileId::Tb];
-
-    pub fn index(self) -> usize {
+    /// The project file this selection points at, if it exists.
+    pub fn resolve(self, s: &AppState) -> Option<usize> {
+        let files = &s.project_files;
         match self {
-            SourceFileId::Demo => 0,
-            SourceFileId::Xdc => 1,
-            SourceFileId::Tb => 2,
+            SourceFileId::Demo => files.top_index(s.project.top.as_deref()),
+            SourceFileId::Xdc => files.in_set(FileSet::Constraints).map(|(i, _)| i).next(),
+            SourceFileId::Tb => files.in_set(FileSet::Simulation).map(|(i, _)| i).next(),
+            SourceFileId::Index(i) => (i < files.files.len()).then_some(i),
         }
     }
 
-    pub fn key(self) -> &'static str {
-        match self {
-            SourceFileId::Demo => "src-design-top",
-            SourceFileId::Xdc => "src-xdc",
-            SourceFileId::Tb => "src-tb",
+    /// The role (if any) file `i` plays, so rows keep stable keys and the
+    /// selection compares equal to what cross-probes set.
+    pub fn for_index(s: &AppState, i: usize) -> SourceFileId {
+        for role in [SourceFileId::Demo, SourceFileId::Xdc, SourceFileId::Tb] {
+            if role.resolve(s) == Some(i) {
+                return role;
+            }
         }
+        SourceFileId::Index(i)
     }
 
-    pub fn file(self) -> SourceFile {
+    /// Stable tree-row key.
+    pub fn key(self) -> String {
         match self {
-            SourceFileId::Demo => SourceFile {
-                name: "project1_demo.v",
-                module: Some("project1_demo"),
-                path: "C:/EE214/project_1/project_1.srcs/sources_1/new/project1_demo.v",
-                kind: FileKind::Verilog,
-                library: "xil_defaultlib",
-                size_bytes: 1126,
-            },
-            SourceFileId::Xdc => SourceFile {
-                name: "project1.xdc",
-                module: None,
-                path: "C:/EE214/project_1/project_1.srcs/constrs_1/new/project1.xdc",
-                kind: FileKind::Xdc,
-                library: "xil_defaultlib",
-                size_bytes: 512,
-            },
-            SourceFileId::Tb => SourceFile {
-                name: "project1_tb.v",
-                module: Some("project1_tb"),
-                path: "C:/EE214/project_1/project_1.srcs/sim_1/new/project1_tb.v",
-                kind: FileKind::Verilog,
-                library: "xil_defaultlib",
-                size_bytes: 640,
-            },
+            SourceFileId::Demo => "src-design-top".into(),
+            SourceFileId::Xdc => "src-xdc".into(),
+            SourceFileId::Tb => "src-tb".into(),
+            SourceFileId::Index(i) => format!("src-file-{i}"),
         }
     }
 }
@@ -236,15 +194,17 @@ impl PropsTab {
     }
 }
 
-/// Sources-owned UI state: collapsed parents, file selection, both tab strips,
-/// and the per-file Enabled flags.
+/// Sources-owned UI state: collapsed parents, selection, tabs, filter.
 #[derive(Clone, Debug)]
 pub struct SourcesState {
     pub collapsed: [bool; 5],
     pub selected: SourceFileId,
     pub tab: SourcesTab,
     pub props_tab: PropsTab,
-    pub enabled: [bool; 3],
+    /// Name filter field is showing.
+    pub filter_open: bool,
+    /// Case-insensitive name filter over every tab.
+    pub filter: TextEdit,
 }
 
 impl Default for SourcesState {
@@ -257,7 +217,8 @@ impl Default for SourcesState {
             selected: SourceFileId::Demo,
             tab: SourcesTab::Hierarchy,
             props_tab: PropsTab::General,
-            enabled: [true; 3],
+            filter_open: false,
+            filter: TextEdit::new(""),
         }
     }
 }
@@ -272,80 +233,147 @@ impl SourcesState {
         self.collapsed = [collapsed; 5];
     }
 
-    pub fn toggle_enabled(&mut self, id: SourceFileId) {
-        let i = id.index();
-        self.enabled[i] = !self.enabled[i];
+    /// Whether a file name passes the filter.
+    fn shows(&self, f: &ProjectFile) -> bool {
+        let q = self.filter.text.trim();
+        q.is_empty()
+            || f.name.to_lowercase().contains(&q.to_lowercase())
+            || f
+                .module
+                .as_deref()
+                .is_some_and(|m| m.to_lowercase().contains(&q.to_lowercase()))
     }
 }
 
-/// A Properties-tab row, mirroring `helion-gui` `ide::PropertyRow`.
+/// A Properties-tab row (`NAME`/`VALUE`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PropRow {
     pub name: &'static str,
     pub value: String,
 }
 
-/// Vivado-style size text: one decimal in KB (`1126 B` -> `"1.1 KB"`).
+/// Size text: bytes under 1 KB, else one decimal in KB/MB.
 pub fn format_size(bytes: u64) -> String {
-    format!("{:.1} KB", bytes as f64 / 1024.0)
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
 }
 
-/// `NAME`/`VALUE` rows for the Properties tab of one file.
-pub fn property_rows(id: SourceFileId) -> Vec<PropRow> {
-    let f = id.file();
-    vec![
+/// `NAME`/`VALUE` rows for the Properties tab of the selected file.
+pub fn property_rows(s: &AppState, id: SourceFileId) -> Vec<PropRow> {
+    let Some(f) = id.resolve(s).and_then(|i| s.project_files.files.get(i)) else {
+        return Vec::new();
+    };
+    let is_top = f.set == FileSet::Design
+        && f.module.is_some()
+        && f.module.as_deref() == s.project.top.as_deref();
+    let mut rows = vec![
         PropRow {
             name: "NAME",
-            value: f.name.into(),
-        },
-        PropRow {
-            name: "LIBRARY",
-            value: f.library.into(),
+            value: f.name.clone(),
         },
         PropRow {
             name: "FILE_TYPE",
-            value: f.kind.label().into(),
+            value: f.lang().into(),
+        },
+        PropRow {
+            name: "FILESET",
+            value: f.set.label().into(),
+        },
+        PropRow {
+            name: "LIBRARY",
+            value: LIBRARY.into(),
         },
         PropRow {
             name: "SIZE",
-            value: format_size(f.size_bytes),
+            value: format_size(f.size),
         },
         PropRow {
             name: "LOCATION",
-            value: f.path.into(),
+            value: f.location(),
         },
-    ]
-}
-
-/// Echo a Tcl verb to the console (chrome-style dispatch without run flips).
-fn echo(s: &mut AppState, tcl: &'static str) {
-    s.console.lines.push(ConsoleLine {
-        text: tcl.into(),
-        sev: MsgSev::Info,
+    ];
+    if let Some(m) = &f.module {
+        rows.push(PropRow {
+            name: "MODULE",
+            value: m.clone(),
+        });
+    }
+    rows.push(PropRow {
+        name: "IS_TOP",
+        value: if is_top { "true" } else { "false" }.into(),
     });
+    rows
 }
 
-/// Select a source file and ensure its editor tab exists (active, no navigation).
+/// Select a source file and bring its editor tab forward (no navigation).
 pub fn select_source(s: &mut AppState, id: SourceFileId) {
     s.sources.selected = id;
-    let name = id.file().name.to_string();
-    if let Some(i) = s.editor.tabs.iter().position(|t| *t == name) {
-        s.editor.active = i;
-    } else {
-        s.editor.tabs.push(name);
-        s.editor.active = s.editor.tabs.len() - 1;
+    if let Some(i) = id.resolve(s) {
+        crate::project::open_index(s, i);
     }
-    s.editor.cursor_line = s
-        .editor
-        .cursor_line
-        .min(s.editor.lines.len().saturating_sub(1));
-    crate::views::editor::sync_edit(s);
 }
 
 /// Open a source file in the editor: select + navigate to the Editor pane.
 pub fn open_source(s: &mut AppState, id: SourceFileId) {
     select_source(s, id);
     s.navigate(crate::state::CenterPane::Editor);
+}
+
+/// Locate the file declaring `module` (schematic/device "Locate in
+/// Sources"): select it and reveal the Sources column. Returns false when no
+/// project file declares that module.
+pub fn locate_module(s: &mut AppState, module: &str) -> bool {
+    let Some(i) = s.project_files.defining(module) else {
+        return false;
+    };
+    s.sources.selected = SourceFileId::for_index(s, i);
+    s.sources.tab = SourcesTab::Hierarchy;
+    s.sources.set_all(false);
+    crate::layout::set_sources_visible(s, true);
+    true
+}
+
+/// "Locate in Sources" from the schematic/device: select the file that
+/// declares the elaborated design's top module (else the project top), and
+/// say so plainly when no project file declares it.
+pub fn locate_design_top(s: &mut AppState) {
+    let module = s
+        .runs
+        .live_design
+        .as_ref()
+        .map(|d| helion_ir::resolve(d.name).to_string())
+        .or_else(|| s.project.top.clone());
+    let Some(module) = module else {
+        s.toasts.push(
+            crate::state::ToastKind::Info,
+            "Nothing to locate",
+            "Run synthesis to elaborate a design first",
+        );
+        return;
+    };
+    if !locate_module(s, &module) {
+        s.toasts.push(
+            crate::state::ToastKind::Info,
+            "Not in project sources",
+            &format!("No project file declares module {module}"),
+        );
+    }
+}
+
+/// Step the selection to the previous/next file in compile order.
+fn step_selection(s: &mut AppState, delta: isize) {
+    let n = s.project_files.files.len();
+    if n == 0 {
+        return;
+    }
+    let cur = s.sources.selected.resolve(s).unwrap_or(0) as isize;
+    let next = (cur + delta).rem_euclid(n as isize) as usize;
+    s.sources.selected = SourceFileId::for_index(s, next);
 }
 
 fn ui_label(content: &str, t: &VivadoTheme) -> El {
@@ -356,15 +384,36 @@ fn dim_label(content: &str, t: &VivadoTheme) -> El {
     text(content).font(VivadoTheme::FONT_UI).color(t.text_dim)
 }
 
-/// Pane header: title plus Vivado window controls (help/min/max/float/close).
+/// One pane-header window control (small square glyph button with a
+/// tooltip). Every control changes the layout; none only prints a verb.
+fn header_ctl(
+    key: String,
+    label: &str,
+    help: &'static str,
+    glyph: &'static str,
+    t: &VivadoTheme,
+    on: impl Fn(&mut AppState) + 'static,
+) -> El {
+    el().key(key)
+        .role("button")
+        .label(label.to_string())
+        .help(help)
+        .focusable(true)
+        .size(20.0, 18.0)
+        .radius(3.0)
+        .center()
+        .hover(t.selection)
+        .on_press(on)
+        .child(dim_label(glyph, t))
+}
+
+/// Pane header: title plus working window controls.
+///
+/// - Sources / Source File Properties: collapse the card to its header, and
+///   hide the whole Sources column (View ▸ Sources or ⌘J brings it back).
+/// - Center panes: maximize/restore (hides every dock) and close (back to
+///   the previous surface, else the Project Summary).
 pub fn pane_header(title: &'static str, key_prefix: &'static str, t: &VivadoTheme) -> El {
-    let controls = [
-        ("?", "help"),
-        ("_", "min"),
-        ("□", "max"),
-        ("⤢", "float"),
-        ("×", "close"),
-    ];
     let header = row()
         .w_full()
         .h(HEADER_H)
@@ -372,47 +421,93 @@ pub fn pane_header(title: &'static str, key_prefix: &'static str, t: &VivadoThem
         .items_center()
         .justify_between()
         .fill(t.header_bg)
-        .child(text(title).font(VivadoTheme::FONT_TITLE).color(t.text));
-    let mut right = row().items_center();
-    for (_i, (glyph, what)) in controls.into_iter().enumerate() {
-        let tcl: &'static str = match what {
-            "help" => "help",
-            "min" => "minimize_view",
-            "max" => "maximize_view",
-            "float" => "float_view",
-            _ => "close_view",
-        };
-        let key = format!("{key_prefix}-{what}");
-        right = right.child(
-            el().key(key)
-                .role("button")
-                .label(format!("{title}: {what}"))
-                .focusable(true)
-                .size(20.0, 18.0)
-                .center()
-                .hover(t.selection)
-                .on_press(move |s: &mut AppState| echo(s, tcl))
-                .child(dim_label(glyph, t)),
+        .child(
+            text(title)
+                .font(VivadoTheme::FONT_TITLE)
+                .color(t.text)
+                .truncate()
+                .help_when_truncated(title),
         );
+    let mut right = row().items_center().gap(2.0);
+    match key_prefix {
+        "src-pane" | "props-pane" => {
+            let tree = key_prefix == "src-pane";
+            right = right
+                .child(header_ctl(
+                    format!("{key_prefix}-min"),
+                    &format!("{title}: collapse"),
+                    "Collapse or expand this panel",
+                    "–",
+                    t,
+                    move |s: &mut AppState| {
+                        if tree {
+                            s.layout.sources_tree_collapsed = !s.layout.sources_tree_collapsed;
+                        } else {
+                            s.layout.props_collapsed = !s.layout.props_collapsed;
+                        }
+                    },
+                ))
+                .child(header_ctl(
+                    format!("{key_prefix}-close"),
+                    &format!("{title}: hide"),
+                    "Hide the Sources column (View ▸ Sources, ⌘J)",
+                    "×",
+                    t,
+                    |s: &mut AppState| crate::layout::set_sources_visible(s, false),
+                ));
+        }
+        _ => {
+            right = right
+                .child(header_ctl(
+                    format!("{key_prefix}-max"),
+                    &format!("{title}: maximize"),
+                    "Maximize or restore this pane (⇧⌘M)",
+                    "⤢",
+                    t,
+                    crate::layout::toggle_focus,
+                ))
+                .child(header_ctl(
+                    format!("{key_prefix}-close"),
+                    &format!("{title}: close"),
+                    "Close this view",
+                    "×",
+                    t,
+                    |s: &mut AppState| {
+                        s.layout.focus = false;
+                        if !s.go_back() {
+                            s.navigate(crate::state::CenterPane::Summary);
+                        }
+                    },
+                ));
+        }
     }
     header.child(right)
 }
 
-/// Small toolbar icon button echoing a Tcl verb.
-fn tool_btn(key: String, label: String, tcl: &'static str, t: &VivadoTheme, glyph: El) -> El {
+/// Small square toolbar button with a tooltip.
+fn tool_btn(
+    key: &'static str,
+    label: &'static str,
+    t: &VivadoTheme,
+    glyph: El,
+    on: impl Fn(&mut AppState) + 'static,
+) -> El {
     el().key(key)
         .role("button")
         .label(label)
+        .help(label)
         .focusable(true)
         .size(22.0, 22.0)
+        .radius(3.0)
         .center()
         .hover(t.selection)
-        .on_press(move |s: &mut AppState| echo(s, tcl))
+        .on_press(on)
         .child(glyph)
 }
 
-/// Sources toolbar: search, expand/collapse all, add, warnings badge, options.
-fn sources_toolbar(t: &VivadoTheme) -> El {
+/// Sources toolbar: filter, expand/collapse all, add sources, file count.
+fn sources_toolbar(s: &AppState, t: &VivadoTheme) -> El {
+    let n = s.project_files.files.len();
     row()
         .key("sources-toolbar")
         .role("toolbar")
@@ -423,96 +518,82 @@ fn sources_toolbar(t: &VivadoTheme) -> El {
         .px(6.0)
         .fill(t.panel_bg)
         .child(tool_btn(
-            "src-search".into(),
-            "Search sources".into(),
-            "search_sources",
+            "src-search",
+            "Filter sources by name",
             t,
-            icon(&glyphs::SEARCH, 13.0).color(t.text_dim).a11y_hidden(),
+            icon(&glyphs::SEARCH, 13.0)
+                .color(if s.sources.filter_open { t.accent } else { t.text_dim })
+                .a11y_hidden(),
+            |s: &mut AppState| {
+                s.sources.filter_open = !s.sources.filter_open;
+                if !s.sources.filter_open {
+                    s.sources.filter.clear();
+                }
+            },
         ))
-        .child(
-            el().key("src-expand-all")
-                .role("button")
-                .label("Expand all")
-                .focusable(true)
-                .size(22.0, 22.0)
-                .center()
-                .hover(t.selection)
-                .on_press(|s: &mut AppState| s.sources.set_all(false))
-                .child(
-                    icon(&glyphs::CHEVRON_DOWN, 13.0)
-                        .color(t.text_dim)
-                        .a11y_hidden(),
-                ),
-        )
-        .child(
-            el().key("src-collapse-all")
-                .role("button")
-                .label("Collapse all")
-                .focusable(true)
-                .size(22.0, 22.0)
-                .center()
-                .hover(t.selection)
-                .on_press(|s: &mut AppState| s.sources.set_all(true))
-                .child(
-                    icon(&glyphs::CHEVRON_UP, 13.0)
-                        .color(t.text_dim)
-                        .a11y_hidden(),
-                ),
-        )
-        .child(
-            el().key("src-add")
-                .role("button")
-                .label("Add sources")
-                .focusable(true)
-                .size(22.0, 22.0)
-                .center()
-                .hover(t.selection)
-                .on_press(|s: &mut AppState| {
-                    echo(s, "add_sources");
-                    s.dialogs.open(crate::views::dialogs::DialogId::AddSources);
-                })
-                .child(
-                    text("+")
-                        .font(VivadoTheme::FONT_TITLE)
-                        .color(t.text_dim)
-                        .a11y_hidden(),
-                ),
-        )
         .child(tool_btn(
-            "src-help".into(),
-            "Sources help".into(),
-            "help sources",
+            "src-expand-all",
+            "Expand all",
             t,
-            text("?")
-                .font(VivadoTheme::FONT_UI)
+            icon(&glyphs::CHEVRON_DOWN, 13.0)
                 .color(t.text_dim)
                 .a11y_hidden(),
+            |s: &mut AppState| s.sources.set_all(false),
         ))
-        .child(
-            row()
-                .key("src-warnings")
-                .role("status")
-                .label("2 warnings")
-                .h(18.0)
-                .items_center()
-                .gap(3.0)
-                .px(5.0)
-                .radius(9.0)
-                .fill(t.panel_bg)
-                .border(1.0, t.warn)
-                .child(text("2").font(VivadoTheme::FONT_UI).color(t.warn)),
-        )
+        .child(tool_btn(
+            "src-collapse-all",
+            "Collapse all",
+            t,
+            icon(&glyphs::CHEVRON_UP, 13.0)
+                .color(t.text_dim)
+                .a11y_hidden(),
+            |s: &mut AppState| s.sources.set_all(true),
+        ))
+        .child(tool_btn(
+            "src-add",
+            "Add sources…",
+            t,
+            text("+")
+                .font(VivadoTheme::FONT_TITLE)
+                .color(t.text_dim)
+                .a11y_hidden(),
+            |s: &mut AppState| s.dialogs.open(crate::views::dialogs::DialogId::AddSources),
+        ))
         .child(el().grow(1.0))
-        .child(tool_btn(
-            "src-options".into(),
-            "View options".into(),
-            "show_view_options Sources",
-            t,
-            text("⚙")
+        .child(
+            text(format!("{n} file{}", if n == 1 { "" } else { "s" }))
+                .key("src-count")
                 .font(VivadoTheme::FONT_UI)
-                .color(t.text_dim)
-                .a11y_hidden(),
-        ))
+                .color(t.text_faint),
+        )
+}
+
+/// Filter field under the toolbar (shown while the search toggle is on).
+fn filter_row(s: &AppState, t: &VivadoTheme) -> El {
+    row()
+        .key("src-filter-row")
+        .w_full()
+        .h(28.0)
+        .items_center()
+        .px(6.0)
+        .pb(4.0)
+        .fill(t.panel_bg)
+        .child(
+            text_input(&s.sources.filter, VivadoTheme::FONT_UI)
+                .single_line()
+                .key("src-filter")
+                .label("Filter sources")
+                .w_full()
+                .px(6.0)
+                .py(3.0)
+                .fill(t.chrome_bg)
+                .border(1.0, t.border_light)
+                .radius(4.0)
+                .color(t.text)
+                .placeholder("Filter by file or module name", t.text_faint)
+                .caret(t.text, t.selection)
+                .on_edit(|s: &mut AppState| &mut s.sources.filter),
+        )
 }
 
 /// One tree parent row: twisty, folder icon for filesets, `name (n)` label.
@@ -564,29 +645,30 @@ fn parent_row(
             .a11y_hidden(),
         );
     }
-    r.child(ui_label(&format!("{} ({})", parent.name(), children), t))
+    r.child(ui_label(parent.name(), t)).child(
+        text(format!("({children})"))
+            .font(VivadoTheme::FONT_UI)
+            .color(t.text_faint),
+    )
 }
 
-/// One file row: file glyph, module + file label, selection wash on select.
-fn file_row(
-    s: &AppState,
-    t: &VivadoTheme,
-    id: SourceFileId,
-    depth: u32,
-    key_override: Option<String>,
-) -> El {
-    let f = id.file();
-    let selected = s.sources.selected == id;
-    let label = match f.module {
-        Some(m) => format!("{m} ({})", f.name),
-        None => f.name.into(),
+/// One file row: glyph, `module (file)` label, a `top` tag on the design
+/// top. Click selects; double click opens it in the editor.
+fn file_row(s: &AppState, t: &VivadoTheme, i: usize, depth: u32, key_prefix: &str) -> El {
+    let f = &s.project_files.files[i];
+    let id = SourceFileId::for_index(s, i);
+    let selected = s.sources.selected.resolve(s) == Some(i);
+    let label = f.tree_label();
+    let is_top = f.set == FileSet::Design
+        && f.module.is_some()
+        && f.module.as_deref() == s.project.top.as_deref();
+    let glyph = if f.set == FileSet::Constraints {
+        &glyphs::FILE
+    } else {
+        &glyphs::FILE_CODE
     };
-    let glyph = match f.kind {
-        FileKind::Verilog => &glyphs::FILE_CODE,
-        FileKind::Xdc => &glyphs::FILE,
-    };
-    row()
-        .key(key_override.unwrap_or_else(|| id.key().into()))
+    let mut r = row()
+        .key(format!("{key_prefix}{}", id.key()))
         .role("treeitem")
         .label(label.clone())
         .level(depth + 1)
@@ -597,12 +679,49 @@ fn file_row(
         .items_center()
         .gap(4.0)
         .pl(6.0 + depth as f32 * INDENT + 13.0)
+        .pr(6.0)
         .fill(if selected { t.selection } else { t.panel_bg })
         .hover(t.selection)
         .on_press(move |s: &mut AppState| select_source(s, id))
         .on_double_press(move |s: &mut AppState| open_source(s, id))
         .child(icon(glyph, 13.0).color(t.text_dim).a11y_hidden())
-        .child(ui_label(&label, t))
+        .child(
+            text(label.clone())
+                .font(if is_top {
+                    VivadoTheme::FONT_TITLE
+                } else {
+                    VivadoTheme::FONT_UI
+                })
+                .color(t.text)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate()
+                .help_when_truncated(label),
+        );
+    if is_top {
+        r = r.child(
+            el().px(5.0)
+                .h(14.0)
+                .center()
+                .radius(7.0)
+                .border(1.0, t.accent)
+                .child(
+                    text("top")
+                        .font(VivadoTheme::FONT_CAPS)
+                        .color(t.accent),
+                ),
+        );
+    }
+    r
+}
+
+/// Files of a fileset that pass the filter.
+fn visible(s: &AppState, set: FileSet) -> Vec<usize> {
+    s.project_files
+        .in_set(set)
+        .filter(|(_, f)| s.sources.shows(f))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Hierarchy tree body: category roots, filesets, and files.
@@ -616,28 +735,48 @@ fn hierarchy_body(s: &AppState, t: &VivadoTheme) -> El {
         .scroll(ScrollSpec {
             stick_bottom: false,
         });
-    body = body.child(parent_row(s, t, SourceParent::Design, 0, 1));
+    let design = visible(s, FileSet::Design);
+    let constr = visible(s, FileSet::Constraints);
+    let sim = visible(s, FileSet::Simulation);
+    body = body.child(parent_row(s, t, SourceParent::Design, 0, design.len()));
     if !s.sources.collapsed[SourceParent::Design.index()] {
-        body = body.child(file_row(s, t, SourceFileId::Demo, 1, None));
+        for &i in &design {
+            body = body.child(file_row(s, t, i, 1, ""));
+        }
     }
     body = body.child(parent_row(s, t, SourceParent::Constr, 0, 1));
     if !s.sources.collapsed[SourceParent::Constr.index()] {
-        body = body.child(parent_row(s, t, SourceParent::ConstrSet, 1, 1));
+        body = body.child(parent_row(s, t, SourceParent::ConstrSet, 1, constr.len()));
         if !s.sources.collapsed[SourceParent::ConstrSet.index()] {
-            body = body.child(file_row(s, t, SourceFileId::Xdc, 2, None));
+            for &i in &constr {
+                body = body.child(file_row(s, t, i, 2, ""));
+            }
         }
     }
     body = body.child(parent_row(s, t, SourceParent::Sim, 0, 1));
     if !s.sources.collapsed[SourceParent::Sim.index()] {
-        body = body.child(parent_row(s, t, SourceParent::SimSet, 1, 1));
+        body = body.child(parent_row(s, t, SourceParent::SimSet, 1, sim.len()));
         if !s.sources.collapsed[SourceParent::SimSet.index()] {
-            body = body.child(file_row(s, t, SourceFileId::Tb, 2, None));
+            for &i in &sim {
+                body = body.child(file_row(s, t, i, 2, ""));
+            }
         }
+    }
+    if !s.sources.filter.text.trim().is_empty() && design.is_empty() && constr.is_empty() && sim.is_empty() {
+        body = body.child(
+            row()
+                .key("src-filter-empty")
+                .w_full()
+                .h(ROW_H + 4.0)
+                .px(8.0)
+                .items_center()
+                .child(dim_label("No files match the filter.", t)),
+        );
     }
     body
 }
 
-/// Libraries tab: the one demo library with its files.
+/// Libraries tab: every HDL file compiles into the one `work` library.
 fn libraries_body(s: &AppState, t: &VivadoTheme) -> El {
     let mut body = col()
         .key("sources-libraries")
@@ -648,11 +787,19 @@ fn libraries_body(s: &AppState, t: &VivadoTheme) -> El {
         .scroll(ScrollSpec {
             stick_bottom: false,
         });
+    let hdl: Vec<usize> = s
+        .project_files
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.set != FileSet::Constraints && s.sources.shows(f))
+        .map(|(i, _)| i)
+        .collect();
     body = body.child(
         row()
             .key("src-lib-row")
             .role("treeitem")
-            .label("xil_defaultlib (3 files)")
+            .label(format!("{LIBRARY} ({} files)", hdl.len()))
             .level(1)
             .expanded(true)
             .w_full()
@@ -670,15 +817,20 @@ fn libraries_body(s: &AppState, t: &VivadoTheme) -> El {
                     .color(t.text_dim)
                     .a11y_hidden(),
             )
-            .child(ui_label("xil_defaultlib (3)", t)),
+            .child(ui_label(LIBRARY, t))
+            .child(
+                text(format!("({})", hdl.len()))
+                    .font(VivadoTheme::FONT_UI)
+                    .color(t.text_faint),
+            ),
     );
-    for id in SourceFileId::ALL {
-        body = body.child(file_row(s, t, id, 1, Some(format!("src-lib-{}", id.key()))));
+    for i in hdl {
+        body = body.child(file_row(s, t, i, 1, "src-lib-"));
     }
     body
 }
 
-/// Compile Order tab: files in compile sequence with index badges.
+/// Compile Order tab: design sources in the order the flow elaborates them.
 fn compile_order_body(s: &AppState, t: &VivadoTheme) -> El {
     let mut body = col()
         .key("sources-compile-order")
@@ -688,35 +840,52 @@ fn compile_order_body(s: &AppState, t: &VivadoTheme) -> El {
         .scroll(ScrollSpec {
             stick_bottom: false,
         });
-    for (i, id) in SourceFileId::ALL.into_iter().enumerate() {
-        let f = id.file();
-        let selected = s.sources.selected == id;
+    let order: Vec<usize> = s
+        .project_files
+        .in_set(FileSet::Design)
+        .chain(s.project_files.in_set(FileSet::Simulation))
+        .filter(|(_, f)| s.sources.shows(f))
+        .map(|(i, _)| i)
+        .collect();
+    for (n, i) in order.into_iter().enumerate() {
+        let f = &s.project_files.files[i];
+        let id = SourceFileId::for_index(s, i);
+        let selected = s.sources.selected.resolve(s) == Some(i);
         body = body.child(
             row()
-                .key(format!("src-order-{i}"))
+                .key(format!("src-order-{n}"))
                 .role("button")
-                .label(format!("{}: {}", i + 1, f.name))
+                .label(format!("{}: {}", n + 1, f.name))
                 .focusable(true)
                 .w_full()
                 .h(ROW_H)
                 .items_center()
                 .gap(6.0)
-                .pl(6.0)
+                .px(6.0)
                 .fill(if selected { t.selection } else { t.panel_bg })
                 .hover(t.selection)
                 .on_press(move |s: &mut AppState| select_source(s, id))
                 .on_double_press(move |s: &mut AppState| open_source(s, id))
                 .child(
-                    el().w(16.0)
-                        .h(16.0)
-                        .center()
-                        .radius(8.0)
-                        .fill(t.header_bg)
-                        .border(1.0, t.border)
-                        .child(dim_label(&format!("{}", i + 1), t))
+                    el().w(18.0)
+                        .child(
+                            text(format!("{}", n + 1))
+                                .font(VivadoTheme::FONT_MONO.mono())
+                                .color(t.text_faint),
+                        )
                         .a11y_hidden(),
                 )
-                .child(ui_label(f.name, t)),
+                .child(
+                    ui_label(&f.name, t)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate(),
+                )
+                .child(
+                    text(f.set.label())
+                        .font(VivadoTheme::FONT_UI)
+                        .color(t.text_faint),
+                ),
         );
     }
     body
@@ -768,8 +937,16 @@ fn tab_strip(
     strip
 }
 
-/// The Sources pane: header, toolbar, tabbed tree body, tab strip.
+/// The Sources pane: header, toolbar, optional filter, tabbed body, tabs.
 pub fn sources_pane(s: &AppState, t: &VivadoTheme) -> El {
+    if s.layout.sources_tree_collapsed {
+        return col()
+            .key("sources-pane")
+            .w_full()
+            .fill(t.panel_bg)
+            .border(1.0, t.border)
+            .child(pane_header("Sources", "src-pane", t));
+    }
     let body = match s.sources.tab {
         SourcesTab::Hierarchy => hierarchy_body(s, t),
         SourcesTab::Libraries => libraries_body(s, t),
@@ -779,7 +956,7 @@ pub fn sources_pane(s: &AppState, t: &VivadoTheme) -> El {
         .iter()
         .map(|tab| (tab.key().into(), tab.label().into(), *tab == s.sources.tab))
         .collect();
-    col()
+    let mut pane = col()
         .key("sources-pane")
         .w_full()
         .grow(1.2)
@@ -787,77 +964,14 @@ pub fn sources_pane(s: &AppState, t: &VivadoTheme) -> El {
         .fill(t.panel_bg)
         .border(1.0, t.border)
         .child(pane_header("Sources", "src-pane", t))
-        .child(sources_toolbar(t))
-        .child(body)
-        .child(tab_strip(&tabs, t, |i| {
-            let tab = SourcesTab::ALL[i];
-            Box::new(move |s: &mut AppState| s.sources.tab = tab)
-        }))
-}
-
-/// General tab: Enabled checkbox plus Location / Type / Library / Size rows.
-fn props_general(s: &AppState, t: &VivadoTheme) -> El {
-    let id = s.sources.selected;
-    let f = id.file();
-    let kit = t.kit();
-    let mut body = col()
-        .key("props-general")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .gap(4.0)
-        .padding(8.0);
-    body = body.child(
-        Checkbox::new(s.sources.enabled[id.index()])
-            .label("Enabled")
-            .on_toggle::<AppState>(move |s: &mut AppState| s.sources.toggle_enabled(id))
-            .build(&kit)
-            .key("props-enabled"),
-    );
-    body = body.child(prop_row(
-        "Location:",
-        text(f.path)
-            .font(VivadoTheme::FONT_UI)
-            .color(t.text)
-            .grow(1.0)
-            .shrink()
-            .truncate_middle(),
-        t,
-    ));
-    body = body.child(prop_row(
-        "Type:",
-        row()
-            .gap(4.0)
-            .items_center()
-            .child(value_box(f.kind.label(), t))
-            .child(more_btn(
-                "props-type-more",
-                "Change file type",
-                "set_property file_type",
-                t,
-            )),
-        t,
-    ));
-    body = body.child(prop_row(
-        "Library:",
-        row()
-            .gap(4.0)
-            .items_center()
-            .child(value_box(f.library, t))
-            .child(more_btn(
-                "props-lib-more",
-                "Change library",
-                "set_property library",
-                t,
-            )),
-        t,
-    ));
-    body = body.child(prop_row(
-        "Size:",
-        ui_label(&format_size(f.size_bytes), t).key("props-size"),
-        t,
-    ));
-    body
+        .child(sources_toolbar(s, t));
+    if s.sources.filter_open {
+        pane = pane.child(filter_row(s, t));
+    }
+    pane.child(body).child(tab_strip(&tabs, t, |i| {
+        let tab = SourcesTab::ALL[i];
+        Box::new(move |s: &mut AppState| s.sources.tab = tab)
+    }))
 }
 
 /// One `label: value` row in the General tab.
@@ -868,43 +982,69 @@ fn prop_row(label: &'static str, value: El, t: &VivadoTheme) -> El {
         .items_center()
         .gap(6.0)
         .child(el().w(64.0).child(dim_label(label, t)))
-        .child(value)
+        .child(el().grow(1.0).min_w(0.0).child(value))
 }
 
-/// Vivado value box (Type / Library): bordered field with the value.
-fn value_box(value: &str, t: &VivadoTheme) -> El {
-    el().h(20.0)
-        .px(6.0)
-        .center_y()
-        .fill(t.panel_bg)
-        .border(1.0, t.border)
-        .child(ui_label(value, t))
+/// General tab: real location, type, fileset, library, size, module.
+fn props_general(s: &AppState, t: &VivadoTheme, f: &ProjectFile) -> El {
+    let location = f.location();
+    let mut body = col()
+        .key("props-general")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .gap(2.0)
+        .px(8.0)
+        .py(6.0)
+        .child(prop_row(
+            "Location:",
+            text(location.clone())
+                .key("props-location")
+                .font(VivadoTheme::FONT_UI)
+                .color(if f.path.is_some() { t.text } else { t.text_dim })
+                .truncate_middle()
+                .help_when_truncated(location),
+            t,
+        ))
+        .child(prop_row("Type:", ui_label(f.lang(), t).key("props-type"), t))
+        .child(prop_row("Fileset:", ui_label(f.set.label(), t), t))
+        .child(prop_row("Library:", ui_label(LIBRARY, t), t))
+        .child(prop_row(
+            "Size:",
+            ui_label(&format_size(f.size), t).key("props-size"),
+            t,
+        ));
+    if let Some(m) = &f.module {
+        let is_top = f.set == FileSet::Design && Some(m.as_str()) == s.project.top.as_deref();
+        body = body.child(prop_row(
+            "Module:",
+            ui_label(
+                &if is_top {
+                    format!("{m}  (top)")
+                } else {
+                    m.clone()
+                },
+                t,
+            )
+            .key("props-module"),
+            t,
+        ));
+    }
+    body
 }
 
-/// The "..." picker button beside Type / Library.
-fn more_btn(key: &'static str, label: &'static str, tcl: &'static str, t: &VivadoTheme) -> El {
-    el().key(key)
-        .role("button")
-        .label(label)
-        .focusable(true)
-        .w(24.0)
-        .h(20.0)
-        .center()
-        .border(1.0, t.border)
-        .hover(t.selection)
-        .on_press(move |s: &mut AppState| echo(s, tcl))
-        .child(dim_label("...", t))
-}
-
-/// Properties tab: `NAME`/`VALUE` table mirroring `ide::PropertyRow` rows.
+/// Properties tab: `NAME`/`VALUE` table.
 fn props_table(s: &AppState, t: &VivadoTheme) -> El {
     let mut body = col()
         .key("props-table")
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .padding(8.0)
-        .gap(2.0);
+        .px(8.0)
+        .py(6.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        });
     body = body.child(
         row()
             .w_full()
@@ -914,7 +1054,7 @@ fn props_table(s: &AppState, t: &VivadoTheme) -> El {
             .child(el().w(96.0).px(6.0).child(dim_label("Name", t)))
             .child(dim_label("Value", t)),
     );
-    for row_data in property_rows(s.sources.selected) {
+    for row_data in property_rows(s, s.sources.selected) {
         let name = row_data.name;
         body = body.child(
             row()
@@ -922,26 +1062,62 @@ fn props_table(s: &AppState, t: &VivadoTheme) -> El {
                 .w_full()
                 .h(20.0)
                 .items_center()
-                .child(el().w(96.0).px(6.0).child(dim_label(name, t)))
                 .child(
-                    text(row_data.value)
+                    el().w(96.0).px(6.0).child(
+                        text(name)
+                            .font(VivadoTheme::FONT_MONO.mono())
+                            .color(t.text_dim),
+                    ),
+                )
+                .child(
+                    text(row_data.value.clone())
                         .font(VivadoTheme::FONT_UI)
                         .color(t.text)
                         .grow(1.0)
-                        .shrink()
-                        .truncate_middle(),
+                        .min_w(0.0)
+                        .truncate_middle()
+                        .help_when_truncated(row_data.value),
                 ),
         );
     }
     body
 }
 
-/// The Source File Properties card: header, file row, tabbed body, tab strip.
+/// The Source File Properties card: header, file row, tabbed body, tabs.
 pub fn props_card(s: &AppState, t: &VivadoTheme) -> El {
-    let id = s.sources.selected;
-    let f = id.file();
+    if s.layout.props_collapsed {
+        return col()
+            .key("source-props")
+            .w_full()
+            .fill(t.panel_bg)
+            .border(1.0, t.border)
+            .child(pane_header("Source File Properties", "props-pane", t));
+    }
+    let card = col()
+        .key("source-props")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .fill(t.panel_bg)
+        .border(1.0, t.border)
+        .child(pane_header("Source File Properties", "props-pane", t));
+    let Some(f) = s
+        .sources
+        .selected
+        .resolve(s)
+        .and_then(|i| s.project_files.files.get(i))
+    else {
+        return card.child(
+            col()
+                .key("props-empty")
+                .w_full()
+                .grow(1.0)
+                .center()
+                .child(dim_label("Select a file to see its properties.", t)),
+        );
+    };
     let body = match s.sources.props_tab {
-        PropsTab::General => props_general(s, t),
+        PropsTab::General => props_general(s, t, f),
         PropsTab::Properties => props_table(s, t),
     };
     let tabs: Vec<(String, String, bool)> = PropsTab::ALL
@@ -954,58 +1130,70 @@ pub fn props_card(s: &AppState, t: &VivadoTheme) -> El {
             )
         })
         .collect();
-    col()
-        .key("source-props")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .fill(t.panel_bg)
-        .border(1.0, t.border)
-        .child(pane_header("Source File Properties", "props-pane", t))
-        .child(
-            row()
-                .w_full()
-                .h(24.0)
-                .items_center()
-                .gap(4.0)
-                .px(8.0)
-                .child(
-                    icon(&glyphs::FILE_CODE, 13.0)
-                        .color(t.text_dim)
-                        .a11y_hidden(),
+    let many = s.project_files.files.len() > 1;
+    let step = |key: &'static str, label: &'static str, glyph: &'static str, delta: isize| {
+        let mut b = el()
+            .key(key)
+            .role("button")
+            .label(label)
+            .help(label)
+            .focusable(many)
+            .disabled(!many)
+            .size(22.0, 22.0)
+            .radius(3.0)
+            .center()
+            .child(dim_label(glyph, t));
+        if many {
+            b = b
+                .hover(t.selection)
+                .on_press(move |s: &mut AppState| step_selection(s, delta));
+        } else {
+            b = b.layer_opacity(0.4);
+        }
+        b
+    };
+    let name = f.name.clone();
+    card.child(
+        row()
+            .w_full()
+            .h(24.0)
+            .items_center()
+            .gap(4.0)
+            .px(8.0)
+            .child(
+                icon(
+                    if f.set == FileSet::Constraints {
+                        &glyphs::FILE
+                    } else {
+                        &glyphs::FILE_CODE
+                    },
+                    13.0,
                 )
-                .child(
-                    ui_label(f.name, t)
-                        .key("props-file")
-                        .grow(1.0)
-                        .shrink()
-                        .truncate(),
-                )
-                .child(tool_btn(
-                    "props-prev".into(),
-                    "Previous file".into(),
-                    "prev_file",
-                    t,
-                    dim_label("<", t),
-                ))
-                .child(tool_btn(
-                    "props-next".into(),
-                    "Next file".into(),
-                    "next_file",
-                    t,
-                    dim_label(">", t),
-                )),
-        )
-        .child(body)
-        .child(tab_strip(&tabs, t, |i| {
-            let tab = PropsTab::ALL[i];
-            Box::new(move |s: &mut AppState| s.sources.props_tab = tab)
-        }))
+                .color(t.text_dim)
+                .a11y_hidden(),
+            )
+            .child(
+                text(name.clone())
+                    .key("props-file")
+                    .font(VivadoTheme::FONT_TITLE)
+                    .color(t.text)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .truncate()
+                    .help_when_truncated(name),
+            )
+            .child(step("props-prev", "Previous file", "‹", -1))
+            .child(step("props-next", "Next file", "›", 1)),
+    )
+    .child(body)
+    .child(tab_strip(&tabs, t, |i| {
+        let tab = PropsTab::ALL[i];
+        Box::new(move |s: &mut AppState| s.sources.props_tab = tab)
+    }))
 }
 
-/// Empty-project Sources pane: header over a "no project" placeholder. Mounts
-/// when no project is open (the start page) so the column keeps its chrome
-/// slot without showing populated demo sources.
+/// Empty-project Sources pane: header over a "no project" placeholder with
+/// the one action that fixes it.
 fn empty_sources_pane(t: &VivadoTheme) -> El {
     col()
         .key("sources-pane")
@@ -1023,26 +1211,42 @@ fn empty_sources_pane(t: &VivadoTheme) -> El {
                 .min_h(0.0)
                 .items_center()
                 .justify_center()
-                .gap(4.0)
+                .gap(8.0)
                 .padding(12.0)
                 .child(dim_label("No project open", t))
-                .child(dim_label("Create or open a project to see sources.", t)),
+                .child(
+                    el().key("sources-empty-open")
+                        .role("button")
+                        .label("Open Project…")
+                        .focusable(true)
+                        .h(24.0)
+                        .px(10.0)
+                        .center()
+                        .radius(4.0)
+                        .border(1.0, t.border)
+                        .hover(t.selection)
+                        .on_press_tx(|_s: &mut AppState, tx: &mut rune::Tx| {
+                            crate::pickers::open_project(tx)
+                        })
+                        .child(text("Open Project…").font(VivadoTheme::FONT_UI).color(t.link)),
+                ),
         )
 }
 
 /// The stacked Sources + Properties column wired into the shell.
 pub fn sources_column(s: &AppState, t: &VivadoTheme) -> El {
+    let width = s.layout.sources_w;
     if s.project.name.is_empty() {
         return col()
             .key("sources-column")
-            .w(SOURCES_W)
+            .w(width)
             .h_full()
             .gap(6.0)
             .child(empty_sources_pane(t));
     }
     col()
         .key("sources-column")
-        .w(SOURCES_W)
+        .w(width)
         .h_full()
         .gap(6.0)
         .child(sources_pane(s, t))
@@ -1098,7 +1302,7 @@ mod tests {
             "sources-tab-hierarchy",
             "source-props",
             "props-file",
-            "props-enabled",
+            "props-location",
             "props-size",
             "props-tab-general",
         ] {
@@ -1168,18 +1372,49 @@ mod tests {
     }
 
     #[test]
-    fn enabled_toggle_flips_per_file() {
+    fn prev_next_step_through_project_files() {
         let mut rt = harness();
         rt.frame(0.0);
-        tap(&mut rt, "props-enabled");
-        assert!(!rt.state.sources.enabled[SourceFileId::Demo.index()]);
-        tap(&mut rt, "src-xdc");
-        assert!(
-            rt.state.sources.enabled[SourceFileId::Xdc.index()],
-            "other files keep their own flag"
-        );
-        tap(&mut rt, "props-enabled");
-        assert!(!rt.state.sources.enabled[SourceFileId::Xdc.index()]);
+        assert_eq!(rt.state.sources.selected, SourceFileId::Demo);
+        tap(&mut rt, "props-next");
+        assert_eq!(rt.state.sources.selected, SourceFileId::Xdc);
+        tap(&mut rt, "props-next");
+        assert_eq!(rt.state.sources.selected, SourceFileId::Tb);
+        tap(&mut rt, "props-next");
+        assert_eq!(rt.state.sources.selected, SourceFileId::Demo, "wraps");
+        tap(&mut rt, "props-prev");
+        assert_eq!(rt.state.sources.selected, SourceFileId::Tb);
+    }
+
+    #[test]
+    fn filter_narrows_the_tree_and_reports_no_match() {
+        let mut rt = harness();
+        rt.frame(0.0);
+        tap(&mut rt, "src-search");
+        assert!(rt.find("src-filter").is_some());
+        rt.state.sources.filter = TextEdit::new("xdc");
+        rt.invalidate();
+        rt.frame(0.1);
+        assert!(rt.find("src-xdc").is_some());
+        assert!(rt.find("src-design-top").is_none());
+        rt.state.sources.filter = TextEdit::new("zzz");
+        rt.invalidate();
+        rt.frame(0.2);
+        assert!(rt.find("src-filter-empty").is_some());
+        tap(&mut rt, "src-search");
+        assert!(rt.state.sources.filter.text.is_empty(), "closing clears");
+        assert!(rt.find("src-design-top").is_some());
+    }
+
+    #[test]
+    fn demo_files_are_marked_in_memory_not_given_fake_paths() {
+        let s = init();
+        let rows = property_rows(&s, SourceFileId::Demo);
+        let loc = rows.iter().find(|r| r.name == "LOCATION").unwrap();
+        assert!(loc.value.starts_with("In memory"), "{}", loc.value);
+        assert!(!loc.value.contains("C:/"));
+        let top = rows.iter().find(|r| r.name == "IS_TOP").unwrap();
+        assert_eq!(top.value, "false", "demo project declares no top yet");
     }
 
     #[test]
@@ -1206,14 +1441,15 @@ mod tests {
         assert!(rt.find("props-row-NAME").is_some());
         assert!(rt.find("props-row-LOCATION").is_some());
         tap(&mut rt, "props-tab-general");
-        assert!(rt.find("props-enabled").is_some(), "general returns");
+        assert!(rt.find("props-location").is_some(), "general returns");
     }
 
     #[test]
     fn format_size_matches_vivado() {
         assert_eq!(format_size(1126), "1.1 KB");
-        assert_eq!(format_size(512), "0.5 KB");
-        assert_eq!(format_size(0), "0.0 KB");
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(3 * 1024 * 1024), "3.0 MB");
     }
 
     #[test]

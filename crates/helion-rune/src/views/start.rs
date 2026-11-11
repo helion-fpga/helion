@@ -1,248 +1,321 @@
-//! Start page: vendor header plus Quick Start / Tasks / Learning banners.
+//! Start page: the launcher shown when no project is open.
 //!
-//! New Rune `El` code written from scratch for the Vivado brief
-//! (`/tmp/vivado-ref/rd-96269aa3a*.png` start page): a white vendor header
-//! ("HELION" over "FPGA DESIGN SUITE") over three
-//! full-width banners — green "Quick Start", teal "Tasks", teal "Learning
-//! Center" — each with a large light title and `label >` link rows. Banners
-//! reflow: full width, padded content, no fixed-size cards. All colors come
-//! from [`VivadoTheme`]; dispatch is typed dialog opens plus Tcl-verb console
-//! echoes (no stringly status, no hardcoded hex, no manual geometry).
-//!
-//! Rune API citations (rev `a7f276c3630f85a06a0230295da4d2bd172d8d3b`):
-//! - `crates/rune/src/el.rs`: `row()/col()/el()/text()`.
-//! - `crate::theme::VivadoTheme::banner_hover`: translucent hover wash shared
-//!   by both themes (banners are constant across modes).
+//! Three cards on a quiet background: **Start** (create, open, the bundled
+//! example), **Recent Projects** (real paths from prefs; a missing file is
+//! shown as missing, not hidden), and **Tasks / Learn** (Hardware Manager,
+//! Settings, Keyboard Shortcuts, Documentation). Every row performs its
+//! action; nothing only prints a Tcl verb.
 
-use rune::{Color, El, ScrollSpec, Tx, col, el, row, text};
+use rune::{El, ScrollSpec, Tx, col, el, row, text};
 
-use crate::state::{AppState, ConsoleLine, MsgSev};
+use crate::state::{AppState, CenterPane};
 use crate::theme::VivadoTheme;
 use crate::views::dialogs::DialogId;
 
-/// Echo a Tcl verb to the console without flipping run state.
-fn echo(s: &mut AppState, tcl: &'static str) {
-    s.console.lines.push(ConsoleLine {
-        text: tcl.into(),
-        sev: MsgSev::Info,
-    });
-}
+/// Card max width so lines stay readable on wide windows.
+const CARD_W: f32 = 360.0;
 
-/// One `label >` banner link row dispatching a Tcl verb.
-fn banner_link(key: String, label_text: String, tcl: &'static str, t: &VivadoTheme) -> El {
-    el().key(key)
-        .role("button")
-        .label(label_text.clone())
-        .focusable(true)
-        .w_full()
-        .h(24.0)
-        .px(4.0)
-        .center_y()
-        .hover(t.banner_hover())
-        .on_press(move |s: &mut AppState| echo(s, tcl))
-        .child(
-            row()
-                .gap(6.0)
-                .items_center()
-                .child(
-                    text(label_text)
-                        .font(VivadoTheme::FONT_BANNER_LINK)
-                        .color(t.banner_ink),
-                )
-                .child(
-                    text(">")
-                        .font(VivadoTheme::FONT_BANNER_LINK)
-                        .color(t.banner_ink),
-                ),
-        )
-}
-
-/// One full-width banner: light display title over `label >` link rows.
-fn banner(
+/// One launcher row: title (link ink) over a one-line description.
+fn action_row(
     key: &'static str,
     title: &'static str,
-    fill: Color,
-    links: Vec<El>,
+    detail: &str,
     t: &VivadoTheme,
+    enabled: bool,
 ) -> El {
-    col()
+    let mut r = col()
         .key(key)
+        .role("button")
+        .label(title)
+        .focusable(enabled)
+        .disabled(!enabled)
         .w_full()
-        .fill(fill)
-        .padding(18.0)
-        .gap(4.0)
+        .py(6.0)
+        .px(10.0)
+        .gap(2.0)
+        .radius(4.0)
         .child(
             text(title)
-                .font(VivadoTheme::FONT_DISPLAY)
-                .color(t.banner_ink),
+                .font(VivadoTheme::FONT_TITLE)
+                .color(if enabled { t.link } else { t.text_faint }),
         )
-        .child(col().gap(0.0).children(links))
-}
-
-/// "Create Project >" opens the New Project wizard instead of echoing Tcl.
-fn create_project_link(t: &VivadoTheme) -> El {
-    el().key("start-create-project")
-        .role("button")
-        .label("Create Project")
-        .focusable(true)
-        .w_full()
-        .h(24.0)
-        .px(4.0)
-        .center_y()
-        .hover(t.banner_hover())
-        .on_press(|s: &mut AppState| s.dialogs.open(DialogId::NewProject))
         .child(
-            row()
-                .gap(6.0)
-                .items_center()
-                .child(
-                    text("Create Project")
-                        .font(VivadoTheme::FONT_BANNER_LINK)
-                        .color(t.banner_ink),
-                )
-                .child(
-                    text(">")
-                        .font(VivadoTheme::FONT_BANNER_LINK)
-                        .color(t.banner_ink),
-                ),
-        )
+            text(detail.to_string())
+                .font(VivadoTheme::FONT_UI)
+                .color(t.text_dim)
+                .truncate(),
+        );
+    if enabled {
+        r = r.hover(t.selection);
+    } else {
+        r = r.layer_opacity(0.6);
+    }
+    r
 }
 
-/// "Open Project >" raises the native Open dialog instead of echoing Tcl.
-fn open_project_link(t: &VivadoTheme) -> El {
-    el().key("start-open-project")
-        .role("button")
-        .label("Open Project")
-        .focusable(true)
-        .w_full()
-        .h(24.0)
-        .px(4.0)
-        .center_y()
-        .hover(t.banner_hover())
-        .on_press_tx(|_: &mut AppState, tx: &mut Tx| crate::pickers::open_project(tx))
+/// A titled card with caps heading.
+fn card(key: &'static str, title: &'static str, body: El, t: &VivadoTheme) -> El {
+    col()
+        .key(key)
+        .w(CARD_W)
+        .max_w(CARD_W)
+        .shrink()
+        .min_w(0.0)
+        .fill(t.panel_bg)
+        .border(1.0, t.border)
+        .radius(6.0)
+        .padding(8.0)
+        .gap(4.0)
         .child(
-            row()
-                .gap(6.0)
-                .items_center()
-                .child(
-                    text("Open Project")
-                        .font(VivadoTheme::FONT_BANNER_LINK)
-                        .color(t.banner_ink),
-                )
-                .child(
-                    text(">")
-                        .font(VivadoTheme::FONT_BANNER_LINK)
-                        .color(t.banner_ink),
-                ),
+            el().px(10.0).pt(4.0).pb(2.0).child(
+                text(title)
+                    .font(VivadoTheme::FONT_CAPS)
+                    .color(t.text_faint),
+            ),
         )
+        .child(body)
 }
 
-/// White vendor header: HELION mark over the FPGA DESIGN SUITE subline.
+/// Start card: create, open, example.
+fn start_card(t: &VivadoTheme) -> El {
+    let example = crate::views::chrome::example_project();
+    let body = col()
+        .w_full()
+        .child(
+            action_row(
+                "start-create-project",
+                "Create Project…",
+                "New project from sources, a part and constraints",
+                t,
+                true,
+            )
+            .on_press(|s: &mut AppState| s.dialogs.open(DialogId::NewProject)),
+        )
+        .child(
+            action_row(
+                "start-open-project",
+                "Open Project…",
+                "Open a .prj project or a single HDL file",
+                t,
+                true,
+            )
+            .on_press_tx(|_: &mut AppState, tx: &mut Tx| crate::pickers::open_project(tx)),
+        )
+        .child({
+            let r = action_row(
+                "start-open-example",
+                "Open Example Project",
+                if example.is_some() {
+                    "counter.prj — a 4-bit counter with an SDC clock"
+                } else {
+                    "Examples are not installed with this build"
+                },
+                t,
+                example.is_some(),
+            );
+            match example {
+                Some(path) => {
+                    r.on_press(move |s: &mut AppState| crate::pickers::open_path(s, &path))
+                }
+                None => r,
+            }
+        });
+    card("start-quick", "START", body, t)
+}
+
+/// Recent projects card: newest first; missing files say so.
+fn recent_card(s: &AppState, t: &VivadoTheme) -> El {
+    let mut body = col().key("start-recent-list").w_full();
+    if s.recent.is_empty() {
+        body = body.child(
+            el().key("start-recent-empty").px(10.0).py(8.0).child(
+                text("Projects you open appear here.")
+                    .font(VivadoTheme::FONT_UI)
+                    .color(t.text_dim),
+            ),
+        );
+    }
+    for (i, path) in s.recent.iter().enumerate() {
+        let p = std::path::PathBuf::from(path);
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        let dir = p
+            .parent()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
+        let exists = p.exists();
+        let mut r = col()
+            .key(format!("start-recent-{i}"))
+            .role("button")
+            .label(format!("Open {name}"))
+            .help(path.clone())
+            .focusable(exists)
+            .disabled(!exists)
+            .w_full()
+            .py(5.0)
+            .px(10.0)
+            .gap(1.0)
+            .radius(4.0)
+            .child(
+                row()
+                    .gap(6.0)
+                    .items_center()
+                    .child(
+                        text(name)
+                            .font(VivadoTheme::FONT_TITLE)
+                            .color(if exists { t.text } else { t.text_faint }),
+                    )
+                    .child(if exists {
+                        el()
+                    } else {
+                        text("missing")
+                            .font(VivadoTheme::FONT_CAPS)
+                            .color(t.warn)
+                    }),
+            )
+            .child(
+                text(dir)
+                    .font(VivadoTheme::FONT_UI)
+                    .color(t.text_faint)
+                    .truncate_middle(),
+            );
+        if exists {
+            r = r
+                .hover(t.selection)
+                .on_press(move |s: &mut AppState| crate::pickers::open_path(s, &p));
+        }
+        body = body.child(r);
+    }
+    card("start-recent", "RECENT PROJECTS", body, t)
+}
+
+/// Tasks + learning card.
+fn tasks_card(t: &VivadoTheme) -> El {
+    let body = col()
+        .w_full()
+        .child(
+            action_row(
+                "start-hw-manager",
+                "Open Hardware Manager",
+                "Detect a board, program a bitstream, read STAT",
+                t,
+                true,
+            )
+            .on_press(|s: &mut AppState| s.navigate(CenterPane::Program)),
+        )
+        .child(
+            action_row(
+                "start-settings",
+                "Settings…",
+                "Synthesis and implementation strategies, editor, theme",
+                t,
+                true,
+            )
+            .on_press(|s: &mut AppState| s.dialogs.open(DialogId::Settings)),
+        )
+        .child(
+            action_row(
+                "start-shortcuts",
+                "Keyboard Shortcuts",
+                "⌘P files · ⇧⌘P commands · ⌘1/2/3 views",
+                t,
+                true,
+            )
+            .on_press(crate::views::palette::open_cheatsheet),
+        );
+    let learn = col().key("start-learning").w_full().child(
+        action_row(
+            "start-docs",
+            "Documentation",
+            "Guides and reference on the Helion repository",
+            t,
+            true,
+        )
+        .on_press_tx(|s: &mut AppState, tx: &mut Tx| {
+            let url = crate::views::chrome::DOCS_URL;
+            if tx.open_url(url).is_err() {
+                s.toasts.push(
+                    crate::state::ToastKind::Error,
+                    "Couldn't open the documentation",
+                    url,
+                );
+            }
+        }),
+    );
+    card(
+        "start-tasks",
+        "TASKS",
+        col().w_full().child(body).child(
+            el().w_full().px(10.0).pt(8.0).pb(2.0).child(
+                text("LEARN")
+                    .font(VivadoTheme::FONT_CAPS)
+                    .color(t.text_faint),
+            ),
+        )
+        .child(learn),
+        t,
+    )
+}
+
+/// Product header: wordmark, tagline and version.
 fn vendor_header(t: &VivadoTheme) -> El {
     row()
         .key("start-header")
         .w_full()
-        .h(64.0)
-        .px(18.0)
-        .items_center()
-        .justify_start()
-        .fill(t.panel_bg)
+        .items_end()
+        .justify_between()
+        .px(4.0)
         .child(
             col()
-                .gap(0.0)
-                .child(text("HELION").font(VivadoTheme::FONT_DISPLAY).color(t.text))
+                .gap(2.0)
+                .child(text("Helion").font(VivadoTheme::FONT_DISPLAY).color(t.text))
                 .child(
-                    text("FPGA DESIGN SUITE")
+                    text("FPGA design suite — synthesis to bitstream")
                         .font(VivadoTheme::FONT_UI)
                         .color(t.text_dim),
                 ),
         )
+        .child(
+            text(format!("v{}", env!("CARGO_PKG_VERSION")))
+                .font(VivadoTheme::FONT_UI)
+                .color(t.text_faint),
+        )
 }
 
-/// The start page center surface: vendor header over three reflowing banners.
-pub fn start_pane(_s: &AppState, t: &VivadoTheme) -> El {
+/// The start page center surface.
+pub fn start_pane(s: &AppState, t: &VivadoTheme) -> El {
     col()
         .key("start-page")
-        .w_full()
         .grow(1.0)
+        .h_full()
+        .min_w(0.0)
         .min_h(0.0)
         .fill(t.chrome_bg)
-        .gap(10.0)
-        .padding(12.0)
-        .child(vendor_header(t))
+        .border(1.0, t.border)
         .child(
             col()
                 .key("start-scroll")
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)
-                .gap(10.0)
+                .padding(28.0)
+                .gap(20.0)
                 .scroll(ScrollSpec {
                     stick_bottom: false,
                 })
-                .child(banner(
-                    "start-quick",
-                    "Quick Start",
-                    t.banner_quick,
-                    vec![
-                        create_project_link(t),
-                        open_project_link(t),
-                        banner_link(
-                            "start-open-example".into(),
-                            "Open Example Project".into(),
-                            "open_example_project",
-                            t,
-                        ),
-                    ],
-                    t,
-                ))
-                .child(banner(
-                    "start-tasks",
-                    "Tasks",
-                    t.banner_teal,
-                    vec![
-                        banner_link("start-manage-ip".into(), "Manage IP".into(), "manage_ip", t),
-                        banner_link(
-                            "start-hw-manager".into(),
-                            "Open Hardware Manager".into(),
-                            "open_hw_manager",
-                            t,
-                        ),
-                        banner_link(
-                            "start-tcl-store".into(),
-                            "Helion Tcl Store".into(),
-                            "tcl_store",
-                            t,
-                        ),
-                    ],
-                    t,
-                ))
-                .child(banner(
-                    "start-learning",
-                    "Learning Center",
-                    t.banner_teal,
-                    vec![
-                        banner_link(
-                            "start-docs".into(),
-                            "Documentation and Tutorials".into(),
-                            "show_help",
-                            t,
-                        ),
-                        banner_link(
-                            "start-videos".into(),
-                            "Quick Take Videos".into(),
-                            "show_videos",
-                            t,
-                        ),
-                        banner_link(
-                            "start-release-notes".into(),
-                            "Release Notes Guide".into(),
-                            "show_release_notes",
-                            t,
-                        ),
-                    ],
-                    t,
-                )),
+                .child(vendor_header(t))
+                .child(
+                    row()
+                        .w_full()
+                        .gap(16.0)
+                        .items_start()
+                        .flex_wrap()
+                        .child(start_card(t))
+                        .child(recent_card(s, t))
+                        .child(tasks_card(t)),
+                ),
         )
 }
 
@@ -285,14 +358,14 @@ mod tests {
             "start-create-project",
             "start-open-project",
             "start-open-example",
+            "start-recent",
+            "start-recent-empty",
             "start-tasks",
-            "start-manage-ip",
             "start-hw-manager",
-            "start-tcl-store",
+            "start-settings",
+            "start-shortcuts",
             "start-learning",
             "start-docs",
-            "start-videos",
-            "start-release-notes",
         ] {
             assert!(rt.find(key).is_some(), "missing keyed region: {key}");
         }
@@ -307,18 +380,40 @@ mod tests {
     }
 
     #[test]
-    fn banner_links_echo_tcl_verbs() {
+    fn hardware_manager_link_navigates() {
         let mut rt = harness_with(start_state());
         rt.frame(0.0);
         tap(&mut rt, "start-hw-manager");
+        assert_eq!(rt.state.center, crate::state::CenterPane::Program);
+    }
+
+    #[test]
+    fn example_project_opens_real_files_and_lands_in_recents() {
+        let mut rt = harness_with(start_state());
+        rt.frame(0.0);
+        tap(&mut rt, "start-open-example");
+        assert_eq!(rt.state.project.name, "counter");
         assert!(
             rt.state
-                .console
-                .lines
-                .iter()
-                .any(|l| l.text == "open_hw_manager"),
-            "banner link must echo its Tcl verb"
+                .runs
+                .source
+                .as_ref()
+                .is_some_and(|p| p.ends_with("counter.prj")),
+            "the .prj becomes the run input"
         );
+        assert!(rt.state.recent[0].ends_with("counter.prj"));
+        assert!(rt.state.project_files.files.iter().all(|f| f.path.is_some()));
+    }
+
+    #[test]
+    fn recent_rows_open_and_missing_files_are_inert() {
+        let mut s = start_state();
+        s.recent = vec!["/definitely/missing/x.prj".into()];
+        let mut rt = harness_with(s);
+        rt.frame(0.0);
+        assert!(rt.find("start-recent-0").is_some());
+        tap(&mut rt, "start-recent-0");
+        assert_eq!(rt.state.center, crate::state::CenterPane::Start, "missing file does nothing");
     }
 
     #[test]

@@ -175,6 +175,26 @@ pub struct EditorState {
     pub edit: rune::TextEdit,
     /// Which tab `edit` mirrors (`None` = needs a load).
     pub edit_tab: Option<usize>,
+    /// Which tab name currently owns each primary buffer (RTL, XDC/SDC,
+    /// testbench). Other open files of the same kind are parked below, so
+    /// two RTL tabs never share (and clobber) one buffer.
+    pub owners: [Option<String>; 3],
+    /// Lines + undo history of open tabs that don't own their buffer.
+    pub parked: std::collections::HashMap<String, ParkedBuffer>,
+}
+
+/// A non-active file's buffer and undo history (see [`EditorState::owners`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParkedBuffer {
+    pub lines: Vec<String>,
+    pub undo: Vec<Vec<String>>,
+    pub redo: Vec<Vec<String>>,
+}
+
+/// Testbench tabs route to the testbench buffer: simulation-fileset names
+/// (`*_tb.v`, `tb_*.sv`, ...) that aren't constraints.
+pub fn is_tb_name(name: &str) -> bool {
+    crate::project::classify(name) == crate::project::FileSet::Simulation
 }
 
 impl EditorState {
@@ -288,7 +308,7 @@ impl EditorState {
     pub fn active_is_tb(&self) -> bool {
         self.tabs
             .get(self.active)
-            .is_some_and(|t| *t == "project1_tb.v")
+            .is_some_and(|t| is_tb_name(t))
     }
 
     /// Snapshot the active buffer (`true` = XDC, `false` = Verilog; the TB
@@ -661,6 +681,8 @@ pub struct ToastItem {
     pub kind: ToastKind,
     pub title: String,
     pub detail: String,
+    /// Poll-clock second the toast first showed (stamped by [`ToastState::tick`]).
+    pub born: Option<f64>,
 }
 
 /// Toast stack state: append-only ids, dismiss-by-id, newest last.
@@ -670,8 +692,15 @@ pub struct ToastState {
     next: u32,
 }
 
+/// Most toasts stacked at once (oldest drop first).
+pub const TOAST_MAX: usize = 4;
+
 impl ToastState {
+    /// Show a notice. A repeat of a showing toast replaces it (fresh
+    /// timer, no duplicate), and the stack keeps the newest [`TOAST_MAX`].
     pub fn push(&mut self, kind: ToastKind, title: &str, detail: &str) {
+        self.items
+            .retain(|t| !(t.kind == kind && t.title == title && t.detail == detail));
         let id = self.next;
         self.next += 1;
         self.items.push(ToastItem {
@@ -679,7 +708,42 @@ impl ToastState {
             kind,
             title: title.into(),
             detail: detail.into(),
+            born: None,
         });
+        if self.items.len() > TOAST_MAX {
+            let drop = self.items.len() - TOAST_MAX;
+            self.items.drain(..drop);
+        }
+    }
+
+    /// Seconds a toast stays up: errors linger so they can be read.
+    pub fn lifetime(kind: ToastKind) -> f64 {
+        match kind {
+            ToastKind::Error => 8.0,
+            _ => 5.0,
+        }
+    }
+
+    /// Stamp new toasts with the poll clock and drop expired ones. Returns
+    /// (changed, seconds until the next expiry) so the poll can sleep
+    /// instead of drawing every frame while idle.
+    pub fn tick(&mut self, now: f64) -> (bool, Option<f64>) {
+        let mut changed = false;
+        for t in &mut self.items {
+            if t.born.is_none() {
+                t.born = Some(now);
+            }
+        }
+        let before = self.items.len();
+        self.items
+            .retain(|t| now - t.born.unwrap_or(now) < Self::lifetime(t.kind));
+        changed |= self.items.len() != before;
+        let next = self
+            .items
+            .iter()
+            .map(|t| Self::lifetime(t.kind) - (now - t.born.unwrap_or(now)))
+            .fold(None, |acc: Option<f64>, d| Some(acc.map_or(d, |a| a.min(d))));
+        (changed, next)
     }
 
     pub fn dismiss(&mut self, id: u32) {
@@ -744,6 +808,12 @@ pub struct AppState {
     pub theme: crate::theme::ThemeMode,
     /// Fuzzy command palette + shortcut cheatsheet overlay state.
     pub palette: crate::views::palette::PaletteState,
+    /// Dock visibility/sizes and the active layout preset (session chrome).
+    pub layout: crate::layout::LayoutState,
+    /// Recently opened project/HDL paths, newest first (persisted).
+    pub recent: Vec<String>,
+    /// Files of the open project (Sources tree, compile order, palette).
+    pub project_files: crate::project::ProjectFiles,
 }
 
 /// Center pane selector. Typed so scenes flip surfaces without strings.
@@ -802,7 +872,7 @@ impl AppState {
         let mut out = Self {
             project: ProjectState {
                 name: "project_1".into(),
-                location: "C:/EE214/project_1".into(),
+                location: "In memory (built-in demo)".into(),
                 family: "Helion".into(),
                 part: "HL10T-C32-1".into(),
                 top: None,
@@ -825,7 +895,7 @@ impl AppState {
                         sev: MsgSev::Info,
                     },
                     ConsoleLine {
-                        text: "open_project C:/EE214/project_1/project_1.xpr".into(),
+                        text: "INFO: Loaded the built-in demo project (in memory).".into(),
                         sev: MsgSev::Info,
                     },
                 ],
@@ -884,6 +954,8 @@ impl AppState {
                 find_query: rune::TextEdit::new(""),
                 edit: rune::TextEdit::new(""),
                 edit_tab: None,
+                owners: [None, None, None],
+                parked: std::collections::HashMap::new(),
             },
             timing: TimingState::default(),
             util: UtilState::default(),
@@ -923,7 +995,11 @@ impl AppState {
             tcl: crate::tcl::TclSession::default(),
             theme: crate::theme::ThemeMode::default(),
             palette: crate::views::palette::PaletteState::default(),
+            layout: crate::layout::LayoutState::default(),
+            recent: Vec::new(),
+            project_files: crate::project::ProjectFiles::default(),
         };
+        out.project_files = crate::project::demo_files(&out);
         // Mirror the active demo buffer into the live edit field so the
         // first frame already types; caret parks on the cursor line.
         crate::views::editor::sync_edit(&mut out);
@@ -1027,6 +1103,9 @@ impl AppState {
         self.editor.tb_undo_stack.clear();
         self.editor.tb_redo_stack.clear();
         self.editor.paths.clear();
+        self.editor.owners = [None, None, None];
+        self.project_files = crate::project::ProjectFiles::default();
+        self.editor.parked.clear();
         self.editor.find_open = false;
         self.tcl.vars.clear();
         self.tcl.reset_design_state();
