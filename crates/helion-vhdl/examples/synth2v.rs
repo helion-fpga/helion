@@ -7,7 +7,7 @@
 //! are caught before placement, routing or bitgen are involved.
 //!
 //! ```text
-//! cargo run --release -p helion-vhdl --example synth2v -- design.vhd out.v out.json
+//! cargo run --release -p helion-vhdl --example synth2v -- design.vhd out.v out.json [top]
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,13 +15,22 @@ use std::fmt::Write as _;
 
 use helion_ir::{CellKind, Design, PortDir};
 
-fn synth(path: &str) -> Result<Design, String> {
+fn synth(path: &str, top: Option<&str>) -> Result<Design, String> {
     // Target: Xilinx 7-series, which has no DSP48 support yet. Multiplies
     // must lower to LUTs or they vanish.
     helion_sv::set_dsp_inference(false);
     let p = std::path::Path::new(path);
-    match p.extension().and_then(|e| e.to_str()).unwrap_or("sv").to_ascii_lowercase().as_str() {
-        "vhd" | "vhdl" => helion_vhdl::synth_vhdl_path(p),
+    match p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("sv")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "vhd" | "vhdl" => {
+            let src = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
+            helion_vhdl::synth_vhdl_top(&src, top)
+        }
         _ => {
             let src = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
             helion_sv::synth_sv(&src, path)
@@ -32,7 +41,11 @@ fn synth(path: &str) -> Result<Design, String> {
 fn id(net: &str) -> String {
     let mut s = String::from("n_");
     for c in net.chars() {
-        s.push(if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' });
+        s.push(if c.is_ascii_alphanumeric() || c == '_' {
+            c
+        } else {
+            '_'
+        });
     }
     s
 }
@@ -64,10 +77,10 @@ fn json_str(s: &str) -> String {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
-        eprintln!("usage: synth2v <design.vhd|.sv> <out.v> <out.json>");
+        eprintln!("usage: synth2v <design.vhd|.sv> <out.v> <out.json> [top]");
         std::process::exit(2);
     }
-    let d = match synth(&args[1]) {
+    let d = match synth(&args[1], args.get(4).map(|s| s.as_str())) {
         Ok(d) => d,
         Err(e) => {
             std::fs::write(&args[3], format!("{{\"error\": {}}}\n", json_str(&e))).unwrap();
@@ -76,7 +89,8 @@ fn main() {
         }
     };
     let pins = d.pin_index();
-    let kind_of: BTreeMap<&str, &CellKind> = d.cells.iter().map(|c| (c.name.as_str(), &c.kind)).collect();
+    let kind_of: BTreeMap<&str, &CellKind> =
+        d.cells.iter().map(|c| (c.name.as_str(), &c.kind)).collect();
 
     // Driver of every net (by output pin), and every referenced net.
     let mut driven: BTreeMap<&str, Vec<String>> = BTreeMap::new();
@@ -86,23 +100,33 @@ fn main() {
             referenced.insert(n.name.as_str());
             if let Some(k) = kind_of.get(e.cell.as_str()) {
                 if is_output_pin(k, &e.pin) {
-                    driven.entry(n.name.as_str()).or_default().push(format!("{}.{}", e.cell, e.pin));
+                    driven
+                        .entry(n.name.as_str())
+                        .or_default()
+                        .push(format!("{}.{}", e.cell, e.pin));
                 }
             }
         }
     }
-    let multi: Vec<(&str, &Vec<String>)> = driven.iter().filter(|(_, v)| v.len() > 1).map(|(k, v)| (*k, v)).collect();
+    let multi: Vec<(&str, &Vec<String>)> = driven
+        .iter()
+        .filter(|(_, v)| v.len() > 1)
+        .map(|(k, v)| (*k, v))
+        .collect();
     // Undriven nets that some cell input reads (port inputs or real bugs).
     let mut undriven: BTreeSet<&str> = BTreeSet::new();
     for n in &d.nets {
         if driven.contains_key(n.name.as_str()) {
             continue;
         }
-        let read = n.endpoints.iter().any(|e| match kind_of.get(e.cell.as_str()) {
-            Some(CellKind::IobOut) => e.pin == "I",
-            Some(k) => !is_output_pin(k, &e.pin),
-            None => false,
-        });
+        let read = n
+            .endpoints
+            .iter()
+            .any(|e| match kind_of.get(e.cell.as_str()) {
+                Some(CellKind::IobOut) => e.pin == "I",
+                Some(k) => !is_output_pin(k, &e.pin),
+                None => false,
+            });
         if read {
             undriven.insert(n.name.as_str());
         }
@@ -110,12 +134,24 @@ fn main() {
 
     let mut v = String::new();
     let mut unsupported: Vec<String> = Vec::new();
-    let iobs: Vec<&helion_ir::Cell> = d.cells.iter().filter(|c| matches!(c.kind, CellKind::IobOut)).collect();
-    let mut ports: Vec<String> = undriven.iter().map(|n| format!("input wire {}", id(n))).collect();
+    let iobs: Vec<&helion_ir::Cell> = d
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::IobOut))
+        .collect();
+    let mut ports: Vec<String> = undriven
+        .iter()
+        .map(|n| format!("input wire {}", id(n)))
+        .collect();
     for c in &iobs {
         ports.push(format!("output wire o_{}", id(&c.name)));
     }
-    writeln!(v, "// Helion netlist IR for `{}`, written by synth2v", d.name).unwrap();
+    writeln!(
+        v,
+        "// Helion netlist IR for `{}`, written by synth2v",
+        d.name
+    )
+    .unwrap();
     writeln!(v, "`timescale 1ns/1ps").unwrap();
     writeln!(v, "module helion_netlist({});", ports.join(", ")).unwrap();
     for n in &d.nets {
@@ -134,34 +170,61 @@ fn main() {
     for c in &d.cells {
         if matches!(c.kind, CellKind::Hff) {
             if let Some(q) = pins.net_on(&c.name, "Q") {
-                let init = if c.attrs.get("INIT") == Some("1") { 1 } else { 0 };
+                let init = if c.attrs.get("INIT") == Some("1") {
+                    1
+                } else {
+                    0
+                };
                 writeln!(v, "reg {} = 1'b{init};", id(q)).unwrap();
             }
         }
     }
     let net = |cell: &str, pin: &str| -> String {
-        pins.net_on(cell, pin).map(id).unwrap_or_else(|| "1'b0".to_string())
+        pins.net_on(cell, pin)
+            .map(id)
+            .unwrap_or_else(|| "1'b0".to_string())
     };
     for c in &d.cells {
         match &c.kind {
             CellKind::Lut6 { init } => {
-                let ins: Vec<String> = (0..6).rev().map(|i| net(&c.name, &format!("I{i}"))).collect();
+                let ins: Vec<String> = (0..6)
+                    .rev()
+                    .map(|i| net(&c.name, &format!("I{i}")))
+                    .collect();
                 if let Some(o) = pins.net_on(&c.name, "O") {
-                    writeln!(v, "assign {} = 64'h{init:016x} >> {{{}}};", id(o), ins.join(", ")).unwrap();
+                    writeln!(
+                        v,
+                        "assign {} = 64'h{init:016x} >> {{{}}};",
+                        id(o),
+                        ins.join(", ")
+                    )
+                    .unwrap();
                 }
             }
             CellKind::Hff => {
-                let (Some(q), Some(clk)) = (pins.net_on(&c.name, "Q"), pins.net_on(&c.name, "CLK")) else {
+                let (Some(q), Some(clk)) = (pins.net_on(&c.name, "Q"), pins.net_on(&c.name, "CLK"))
+                else {
                     unsupported.push(format!("{}: Hff without Q or CLK", c.name));
                     continue;
                 };
                 let dn = net(&c.name, "D");
-                for extra in ["CE", "SR", "RST"] {
-                    if pins.net_on(&c.name, extra).is_some() {
-                        unsupported.push(format!("{}: Hff pin {extra} connected (not modelled by synth2v)", c.name));
-                    }
+                if pins.net_on(&c.name, "RST").is_some() {
+                    unsupported.push(format!("{}: Hff pin RST connected (not modelled by synth2v)", c.name));
                 }
-                writeln!(v, "always @(posedge {}) {} <= {dn};", id(clk), id(q)).unwrap();
+                // SR (sync or async, loads SRVAL) has priority over CE.
+                let ce = pins.net_on(&c.name, "CE").map(id);
+                let load = match &ce {
+                    Some(ce) => format!("if ({ce}) {} <= {dn};", id(q)),
+                    None => format!("{} <= {dn};", id(q)),
+                };
+                match pins.net_on(&c.name, "SR") {
+                    Some(sr) => {
+                        let srval = if c.attrs.get("SRVAL") == Some("1") { "1'b1" } else { "1'b0" };
+                        let edge = if c.attrs.get("SR_ASYNC") == Some("1") { format!(" or posedge {}", id(sr)) } else { String::new() };
+                        writeln!(v, "always @(posedge {}{edge}) if ({}) {} <= {srval}; else {load}", id(clk), id(sr), id(q)).unwrap();
+                    }
+                    None => writeln!(v, "always @(posedge {}) {load}", id(clk)).unwrap(),
+                }
             }
             CellKind::Carry4 => {
                 let ci = match pins.net_on(&c.name, "CI") {
@@ -190,7 +253,14 @@ fn main() {
                 writeln!(v, "assign o_{} = {};", id(&c.name), net(&c.name, "I")).unwrap();
             }
             CellKind::IobIn | CellKind::ClockBuf => {
-                let i = net(&c.name, if matches!(c.kind, CellKind::IobIn) { "PAD" } else { "I" });
+                let i = net(
+                    &c.name,
+                    if matches!(c.kind, CellKind::IobIn) {
+                        "PAD"
+                    } else {
+                        "I"
+                    },
+                );
                 if let Some(o) = pins.net_on(&c.name, "O") {
                     writeln!(v, "assign {} = {i};", id(o)).unwrap();
                 }
@@ -204,22 +274,45 @@ fn main() {
     // Sidecar.
     let mut j = String::from("{\n");
     writeln!(j, "  \"design\": {},", json_str(&d.name)).unwrap();
-    let attrs: Vec<String> = d.attrs.map.iter().map(|(k, val)| format!("{}: {}", json_str(k), json_str(val))).collect();
+    let attrs: Vec<String> = d
+        .attrs
+        .map
+        .iter()
+        .map(|(k, val)| format!("{}: {}", json_str(k), json_str(val)))
+        .collect();
     writeln!(j, "  \"attrs\": {{{}}},", attrs.join(", ")).unwrap();
     let ps: Vec<String> = d
         .ports
         .iter()
         .map(|p| {
-            let dir = match p.dir { PortDir::In => "in", PortDir::Out => "out", PortDir::Inout => "inout" };
-            let a: Vec<String> = p.attrs.map.iter().map(|(k, val)| format!("{}: {}", json_str(k), json_str(val))).collect();
-            format!("{{\"name\": {}, \"dir\": \"{dir}\", \"attrs\": {{{}}}}}", json_str(&p.name), a.join(", "))
+            let dir = match p.dir {
+                PortDir::In => "in",
+                PortDir::Out => "out",
+                PortDir::Inout => "inout",
+            };
+            let a: Vec<String> = p
+                .attrs
+                .map
+                .iter()
+                .map(|(k, val)| format!("{}: {}", json_str(k), json_str(val)))
+                .collect();
+            format!(
+                "{{\"name\": {}, \"dir\": \"{dir}\", \"attrs\": {{{}}}}}",
+                json_str(&p.name),
+                a.join(", ")
+            )
         })
         .collect();
     writeln!(j, "  \"ports\": [{}],", ps.join(", ")).unwrap();
     let io: Vec<String> = iobs
         .iter()
         .map(|c| {
-            let a: Vec<String> = c.attrs.map.iter().map(|(k, val)| format!("{}: {}", json_str(k), json_str(val))).collect();
+            let a: Vec<String> = c
+                .attrs
+                .map
+                .iter()
+                .map(|(k, val)| format!("{}: {}", json_str(k), json_str(val)))
+                .collect();
             format!(
                 "{{\"cell\": {}, \"verilog\": {}, \"pad\": {}, \"attrs\": {{{}}}}}",
                 json_str(&c.name),
@@ -230,9 +323,21 @@ fn main() {
         })
         .collect();
     writeln!(j, "  \"iobs_out\": [{}],", io.join(", ")).unwrap();
-    let und: Vec<String> = undriven.iter().map(|n| format!("{{\"net\": {}, \"verilog\": {}}}", json_str(n), json_str(&id(n)))).collect();
+    let und: Vec<String> = undriven
+        .iter()
+        .map(|n| {
+            format!(
+                "{{\"net\": {}, \"verilog\": {}}}",
+                json_str(n),
+                json_str(&id(n))
+            )
+        })
+        .collect();
     writeln!(j, "  \"undriven\": [{}],", und.join(", ")).unwrap();
-    let mu: Vec<String> = multi.iter().map(|(n, v)| format!("{}: {}", json_str(n), json_str(&v.join(" ")))).collect();
+    let mu: Vec<String> = multi
+        .iter()
+        .map(|(n, v)| format!("{}: {}", json_str(n), json_str(&v.join(" "))))
+        .collect();
     writeln!(j, "  \"multiply_driven\": {{{}}},", mu.join(", ")).unwrap();
     let un: Vec<String> = unsupported.iter().map(|s| json_str(s)).collect();
     writeln!(j, "  \"unsupported\": [{}],", un.join(", ")).unwrap();
@@ -242,7 +347,10 @@ fn main() {
         let k = k.split([' ', '{', '(']).next().unwrap_or("").to_string();
         *counts.entry(k).or_default() += 1;
     }
-    let cs: Vec<String> = counts.iter().map(|(k, n)| format!("{}: {n}", json_str(k))).collect();
+    let cs: Vec<String> = counts
+        .iter()
+        .map(|(k, n)| format!("{}: {n}", json_str(k)))
+        .collect();
     writeln!(j, "  \"cells\": {{{}}}", cs.join(", ")).unwrap();
     j.push_str("}\n");
     std::fs::write(&args[3], j).unwrap();

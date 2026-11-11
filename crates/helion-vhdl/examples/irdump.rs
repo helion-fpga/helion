@@ -7,8 +7,27 @@ fn main() {
         let src = std::fs::read_to_string(&p).unwrap();
         helion_sv::synth_sv(&src, &p).unwrap()
     };
-    println!("design {} ports={} cells={} nets={}", d.name, d.ports.len(), d.cells.len(), d.nets.len());
-    for pt in &d.ports { println!("port {:?} {} attrs={:?}", pt.dir, pt.name, pt.attrs); }
-    for c in d.cells.iter().take(40) { println!("cell {} {:?} attrs={:?}", c.name, c.kind, c.attrs); }
-    for n in d.nets.iter().take(60) { println!("net {} {:?}", n.name, n.endpoints.iter().map(|e| format!("{}.{}", e.cell, e.pin)).collect::<Vec<_>>()); }
+    println!(
+        "design {} ports={} cells={} nets={}",
+        d.name,
+        d.ports.len(),
+        d.cells.len(),
+        d.nets.len()
+    );
+    for pt in &d.ports {
+        println!("port {:?} {} attrs={:?}", pt.dir, pt.name, pt.attrs);
+    }
+    for c in d.cells.iter().take(40) {
+        println!("cell {} {:?} attrs={:?}", c.name, c.kind, c.attrs);
+    }
+    for n in d.nets.iter().take(60) {
+        println!(
+            "net {} {:?}",
+            n.name,
+            n.endpoints
+                .iter()
+                .map(|e| format!("{}.{}", e.cell, e.pin))
+                .collect::<Vec<_>>()
+        );
+    }
 }

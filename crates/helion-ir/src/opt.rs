@@ -37,6 +37,7 @@ use crate::{CellKind, Design, PortDir};
 
 /// `Lut6` INIT for `~I0` (I0 is the LSB of the LUT address).
 const INV_INIT: u64 = 0x5555_5555_5555_5555;
+const BUF_INIT: u64 = 0xAAAA_AAAA_AAAA_AAAA;
 
 /// Push a constant driver value into a LUT INIT: output bit at `addr` becomes
 /// the old output with `input` fixed to `val`.
@@ -74,6 +75,8 @@ pub struct LutOptStats {
     pub consts_folded: usize,
     /// Inverter LUTs absorbed into fanout INITs.
     pub inverters_absorbed: usize,
+    /// Buffer LUTs bypassed.
+    pub buffers_collapsed: usize,
     /// Fixpoint rounds executed.
     pub rounds: usize,
 }
@@ -90,7 +93,8 @@ type FanoutPin = (usize, usize);
 /// A pending const fold: (const cell idx, const net idx, const value, fanouts).
 type ConstFold = (usize, usize, bool, Vec<FanoutPin>);
 /// A pending inverter absorption: (inverter cell idx, inverter net idx, fanouts).
-type InvFold = (usize, usize, Vec<FanoutPin>);
+/// (inverter cell, inverter output net, inverter input net, fanout pins)
+type InvFold = (usize, usize, usize, Vec<FanoutPin>);
 
 impl Design {
     /// Net names observed by ILA cores (referenced by name, not by endpoint).
@@ -109,8 +113,26 @@ impl Design {
     /// `{port}_{bit}` convention and are covered by their IOB loads in real
     /// flows, so only the exact name is guarded here.
     fn is_output_port_net(&self, net_name: &str) -> bool {
+        self.ports
+            .iter()
+            .any(|p| matches!(p.dir, PortDir::Out | PortDir::Inout) && p.name == net_name)
+    }
+
+    /// `port` or `port_<bit>` of a top-level output: the per-bit names that
+    /// constraints, checks and hierarchy stitching refer to.
+    fn is_output_port_bit_net(&self, net_name: &str) -> bool {
         self.ports.iter().any(|p| {
-            matches!(p.dir, PortDir::Out | PortDir::Inout) && p.name == net_name
+            let digits = |r: &str| !r.is_empty() && r.chars().all(|c| c.is_ascii_digit());
+            matches!(p.dir, PortDir::Out | PortDir::Inout)
+                && (p.name == net_name
+                    || net_name
+                        .strip_prefix(p.name.as_str())
+                        .and_then(|r| r.strip_prefix('_'))
+                        .map(|r| {
+                            // `port_<bit>`, or an unpacked word bit `port_w<word>_<bit>`
+                            digits(r) || r.strip_prefix('w').and_then(|w| w.split_once('_')).map(|(a, b)| digits(a) && digits(b)).unwrap_or(false)
+                        })
+                        .unwrap_or(false))
         })
     }
 
@@ -194,10 +216,10 @@ impl Design {
         if dead.is_empty() {
             return;
         }
-        let dead_names: HashSet<&str> =
-            dead.iter().map(|&i| self.cells[i].name.as_str()).collect();
+        let dead_names: HashSet<&str> = dead.iter().map(|&i| self.cells[i].name.as_str()).collect();
         for net in self.nets.iter_mut() {
-            net.endpoints.retain(|e| !dead_names.contains(e.cell.as_str()));
+            net.endpoints
+                .retain(|e| !dead_names.contains(e.cell.as_str()));
         }
         self.nets.retain(|n| !n.endpoints.is_empty());
         let dead_set: HashSet<usize> = dead.iter().copied().collect();
@@ -254,7 +276,11 @@ impl Design {
                                 && !self.cells[fi].attrs.flag("DONT_TOUCH")
                                 && fi != ci =>
                         {
-                            match e.pin.strip_prefix('I').and_then(|s| s.parse::<usize>().ok()) {
+                            match e
+                                .pin
+                                .strip_prefix('I')
+                                .and_then(|s| s.parse::<usize>().ok())
+                            {
                                 Some(i) if i < 6 => (fi, i),
                                 _ => {
                                     ok = false;
@@ -329,9 +355,9 @@ impl Design {
                 if !is_inv {
                     continue;
                 }
-                if !i0_net.contains_key(c.name.as_str()) {
+                let Some(&in_net) = i0_net.get(c.name.as_str()) else {
                     continue; // undriven inverter: output undefined, do not touch
-                }
+                };
                 let Some(&ni) = out_net.get(c.name.as_str()) else {
                     continue;
                 };
@@ -350,7 +376,11 @@ impl Design {
                                 && !self.cells[fi].attrs.flag("DONT_TOUCH")
                                 && fi != ci =>
                         {
-                            match e.pin.strip_prefix('I').and_then(|s| s.parse::<usize>().ok()) {
+                            match e
+                                .pin
+                                .strip_prefix('I')
+                                .and_then(|s| s.parse::<usize>().ok())
+                            {
                                 Some(i) if i < 6 => (fi, i),
                                 _ => {
                                     ok = false;
@@ -365,13 +395,15 @@ impl Design {
                     };
                     fanouts.push((fi, ii));
                 }
-                if ok && !fanouts.is_empty() {
-                    folds.push((ci, ni, fanouts));
+                if ok && !fanouts.is_empty() && in_net != ni {
+                    folds.push((ci, ni, in_net, fanouts));
                 }
             }
         }
         let mut absorbed = 0usize;
-        for (ci, ni, fanouts) in folds {
+        // An inverter may feed another absorbed inverter; resolve each fold
+        // against the current netlist one at a time.
+        for (ci, ni, in_net, fanouts) in folds {
             let _ = ci;
             for (fi, ii) in &fanouts {
                 if let CellKind::Lut6 { init } = &mut self.cells[*fi].kind {
@@ -382,9 +414,19 @@ impl Design {
                 .iter()
                 .map(|(fi, ii)| (self.cells[*fi].name.clone(), format!("I{ii}")))
                 .collect();
+            // Each fanout now reads the inverter's input with that address
+            // bit flipped in its INIT.
             if let Some(net) = self.nets.get_mut(ni) {
                 net.endpoints
                     .retain(|e| !pins.contains(&(e.cell.clone(), e.pin.clone())));
+            }
+            if let Some(net) = self.nets.get_mut(in_net) {
+                for (cell, pin) in &pins {
+                    net.endpoints.push(crate::Endpoint {
+                        cell: cell.clone(),
+                        pin: pin.clone(),
+                    });
+                }
             }
             absorbed += 1;
         }
@@ -392,6 +434,77 @@ impl Design {
             self.rebuild_indexes();
         }
         absorbed
+    }
+
+    /// Remove `O = I0` buffer LUTs: every load of the buffer's output moves
+    /// to its input net (chains resolve to the first source). Observable
+    /// nets (ports, mark_debug, ILA, DONT_TOUCH) keep their buffers.
+    /// Returns the number of buffers bypassed; the sweep removes them.
+    pub fn collapse_lut_buffers(&mut self) -> usize {
+        self.rebuild_indexes();
+        let out_net = self.lut_output_nets();
+        let ila = self.ila_nets();
+        let mut i0: HashMap<&str, usize> = HashMap::new();
+        let mut other_in: HashSet<&str> = HashSet::new();
+        for (ni, n) in self.nets.iter().enumerate() {
+            for e in &n.endpoints {
+                if e.pin == "I0" {
+                    i0.insert(e.cell.as_str(), ni);
+                } else if matches!(e.pin.as_str(), "I1" | "I2" | "I3" | "I4" | "I5") {
+                    other_in.insert(e.cell.as_str());
+                }
+            }
+        }
+        let mut map: HashMap<usize, usize> = HashMap::new();
+        let mut buf_cells: HashSet<String> = HashSet::new();
+        for (ci, c) in self.cells.iter().enumerate() {
+            if !matches!(c.kind, CellKind::Lut6 { init } if init == BUF_INIT)
+                || other_in.contains(c.name.as_str())
+            {
+                continue;
+            }
+            let (Some(&inn), Some(&outn)) = (i0.get(c.name.as_str()), out_net.get(c.name.as_str()))
+            else {
+                continue;
+            };
+            if inn == outn || self.driver_guarded(ci, outn, &ila) || self.is_output_port_bit_net(&self.nets[outn].name) {
+                continue;
+            }
+            map.insert(outn, inn);
+            buf_cells.insert(c.name.clone());
+        }
+        if map.is_empty() {
+            return 0;
+        }
+        let root = |mut n: usize| -> Option<usize> {
+            for _ in 0..=map.len() {
+                match map.get(&n) {
+                    Some(&m) => n = m,
+                    None => return Some(n),
+                }
+            }
+            None // buffer loop
+        };
+        let mut moves: Vec<(usize, usize)> = Vec::new();
+        for &o in map.keys() {
+            if let Some(r) = root(o) {
+                moves.push((o, r));
+            }
+        }
+        let n = moves.len();
+        for (o, r) in moves {
+            let eps: Vec<crate::Endpoint> = {
+                let net = &mut self.nets[o];
+                let (keep, go): (Vec<_>, Vec<_>) = std::mem::take(&mut net.endpoints)
+                    .into_iter()
+                    .partition(|e| buf_cells.contains(&e.cell) && e.pin == "O");
+                net.endpoints = keep;
+                go
+            };
+            self.nets[r].endpoints.extend(eps);
+        }
+        self.rebuild_indexes();
+        n
     }
 
     /// Run the LUT peephole passes to fixpoint: const fold and inverter
@@ -404,12 +517,14 @@ impl Design {
         for _ in 0..16 {
             let f = self.fold_lut_consts();
             let a = self.absorb_lut_inverters();
+            let b = self.collapse_lut_buffers();
             let s = self.sweep_dead_luts();
             st.consts_folded += f;
             st.inverters_absorbed += a;
+            st.buffers_collapsed += b;
             st.dead_swept += s;
             st.rounds += 1;
-            if f + a + s == 0 {
+            if f + a + b + s == 0 {
                 break;
             }
         }
@@ -428,7 +543,12 @@ mod tests {
         d.add_port("y", PortDir::Out);
         d.add_cell("c_const", CellKind::Lut6 { init: 0 });
         d.add_cell("c_inv", CellKind::Lut6 { init: INV_INIT });
-        d.add_cell("c_and", CellKind::Lut6 { init: 0x8888_8888_8888_8888 });
+        d.add_cell(
+            "c_and",
+            CellKind::Lut6 {
+                init: 0x8888_8888_8888_8888,
+            },
+        );
         d.add_cell("c_dead", CellKind::Lut6 { init: 0x1234 });
         d.add_cell("c_obuf", CellKind::IobOut);
         d.connect("nc", "c_const", "O");
@@ -484,10 +604,34 @@ mod tests {
             _ => panic!(),
         };
         assert_eq!(init, absorb_init_invert(0x8888_8888_8888_8888, 2));
-        assert!(d.net_on("c_and", "I2").is_none());
+        // The fanout reads the inverter's input `a` (with the bit flipped).
+        assert_eq!(d.net_on("c_and", "I2"), Some("a"));
         assert_eq!(d.sweep_dead_luts(), 2);
         assert!(d.cell("c_inv").is_none());
         assert!(d.cell("c_dead").is_none());
+    }
+
+    #[test]
+    fn buffer_chain_collapses_to_source() {
+        let mut d = Design::new("b");
+        d.add_port("y", PortDir::Out);
+        d.add_cell("b1", CellKind::Lut6 { init: BUF_INIT });
+        d.add_cell("b2", CellKind::Lut6 { init: BUF_INIT });
+        d.add_cell("g", CellKind::Lut6 { init: 0x6 });
+        d.add_cell("ff", CellKind::Hff);
+        d.connect("src", "b1", "I0");
+        d.connect("m1", "b1", "O");
+        d.connect("m1", "b2", "I0");
+        d.connect("m2", "b2", "O");
+        d.connect("m2", "g", "I0");
+        d.connect("m1", "ff", "D");
+        d.connect("x", "g", "I1");
+        d.connect("y", "g", "O");
+        assert_eq!(d.collapse_lut_buffers(), 2);
+        assert_eq!(d.net_on("g", "I0"), Some("src"));
+        assert_eq!(d.net_on("ff", "D"), Some("src"));
+        assert_eq!(d.sweep_dead_luts(), 2);
+        assert!(d.cell("b1").is_none() && d.cell("b2").is_none());
     }
 
     #[test]

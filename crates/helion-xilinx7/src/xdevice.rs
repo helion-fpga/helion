@@ -43,6 +43,8 @@ pub struct XDevice<'a> {
     node_members: HashMap<u32, Vec<u32>>,
     /// wire_id -> (tile_idx, wire_idx).
     wire_to_tile: Vec<(usize, u32)>,
+    /// Router claims by wire id, rebuilt when the claim map grows.
+    claim_cache: std::cell::RefCell<(usize, HashMap<u32, String>)>,
 }
 
 impl<'a> XDevice<'a> {
@@ -54,7 +56,153 @@ impl<'a> XDevice<'a> {
             wire_to_node,
             node_members,
             wire_to_tile,
+            claim_cache: std::cell::RefCell::new((usize::MAX, HashMap::new())),
         }
+    }
+
+    fn wire_name_ref(&self, wid: u32) -> Option<&str> {
+        let (ti, wi) = self.wire_to_tile.get(wid as usize).copied()?;
+        self.device.wires(ti)?.get(wi as usize).map(|s| s.as_str())
+    }
+
+    fn wire_xy(&self, wid: u32) -> (i32, i32) {
+        self.wire_to_tile
+            .get(wid as usize)
+            .and_then(|&(ti, _)| self.device.tile(ti))
+            .map(|t| (t.grid_x, t.grid_y))
+            .unwrap_or((0, 0))
+    }
+
+    /// A* over integer wire ids: same wire rules as `route::bfs_route`
+    /// (power/clock and BYP_ALT wires, foreign claims, CLB pseudo-pips).
+    fn astar(
+        &self,
+        src: (&str, &str),
+        tree: &[(String, String)],
+        sinks: &[(String, String)],
+        allow_power: bool,
+        allow_byp: bool,
+        net: &str,
+        claimed: &HashMap<(String, String), String>,
+    ) -> Option<Option<Vec<RoutedPip>>> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let start = self.wire_id_of(src.0, src.1)?;
+        let targets: HashSet<u32> = sinks.iter().filter_map(|(t, w)| self.wire_id_of(t, w)).collect();
+        if targets.is_empty() {
+            return None;
+        }
+        {
+            let mut cache = self.claim_cache.borrow_mut();
+            if cache.0 != claimed.len() {
+                let mut m = HashMap::with_capacity(claimed.len());
+                for ((t, w), n) in claimed {
+                    if let Some(id) = self.wire_id_of(t, w) {
+                        m.insert(id, n.clone());
+                    }
+                }
+                *cache = (claimed.len(), m);
+            }
+        }
+        let cache = self.claim_cache.borrow();
+        let foreign = |id: u32| cache.1.get(&id).map(|n| n != net).unwrap_or(false);
+        let power = |w: &str| w == "GND_WIRE" || w == "VCC_WIRE" || w.starts_with("GFAN") || w.starts_with("GCLK_");
+        let allowed = |id: u32| -> bool {
+            let Some(w) = self.wire_name_ref(id) else { return false };
+            if !allow_power && power(w) {
+                return false;
+            }
+            if !allow_power && !allow_byp && w.starts_with("BYP_ALT") {
+                return false;
+            }
+            !foreign(id)
+        };
+        let tgt_xy: Vec<(i32, i32)> = targets.iter().map(|&t| self.wire_xy(t)).collect();
+        let h = |id: u32| -> u32 {
+            let (x, y) = self.wire_xy(id);
+            let d = tgt_xy.iter().map(|(tx, ty)| (x - tx).abs() + (y - ty).abs()).min().unwrap_or(0);
+            (d as u32) / 4
+        };
+        // parent: wire -> (previous wire, pip (tile, src idx, dst idx, pseudo) or a node hop)
+        let mut parent: HashMap<u32, (u32, Option<(usize, u32, u32, bool)>)> = HashMap::new();
+        let mut best: HashMap<u32, u32> = HashMap::new();
+        let mut heap: BinaryHeap<Reverse<(u32, u32, u32)>> = BinaryHeap::new();
+        best.insert(start, 0);
+        heap.push(Reverse((h(start), 0, start)));
+        // The net's existing route tree (and its node siblings) are free
+        // starting points; reconstruction stops at the first tree wire.
+        for (t, w) in tree {
+            if let Some(id) = self.wire_id_of(t, w) {
+                if best.insert(id, 0).is_none() {
+                    heap.push(Reverse((h(id), 0, id)));
+                }
+            }
+        }
+        let mut found = None;
+        let mut expanded = 0usize;
+        while let Some(Reverse((_, g, id))) = heap.pop() {
+            if best.get(&id).map(|&b| g > b).unwrap_or(false) {
+                continue;
+            }
+            if targets.contains(&id) {
+                found = Some(id);
+                break;
+            }
+            expanded += 1;
+            if expanded > 4_000_000 {
+                break;
+            }
+            let mut relax = |nid: u32, ng: u32, via: Option<(usize, u32, u32, bool)>, heap: &mut BinaryHeap<Reverse<(u32, u32, u32)>>| {
+                if best.get(&nid).map(|&b| ng >= b).unwrap_or(false) {
+                    return;
+                }
+                best.insert(nid, ng);
+                parent.insert(nid, (id, via));
+                heap.push(Reverse((ng + h(nid), ng, nid)));
+            };
+            // Node siblings (tileconn stitching): free.
+            if let Some(&nid) = self.wire_to_node.get(id as usize) {
+                if nid != u32::MAX {
+                    if let Some(members) = self.node_members.get(&nid) {
+                        for &m in members {
+                            if m != id && allowed(m) {
+                                relax(m, g, None, &mut heap);
+                            }
+                        }
+                    }
+                }
+            }
+            // Pips in this tile.
+            let (ti, wi) = self.wire_to_tile[id as usize];
+            let clb = self.device.tile(ti).map(|t| t.name.starts_with("CLB")).unwrap_or(false);
+            for pip in self.device.pips_from_idx(ti, wi) {
+                if pip.is_pseudo && clb {
+                    continue;
+                }
+                let Some(dst) = self.device.wire_id(ti, pip.dst) else { continue };
+                if !allowed(dst) {
+                    continue;
+                }
+                relax(dst, g + 1, Some((ti, wi, pip.dst, pip.is_pseudo)), &mut heap);
+            }
+        }
+        let Some(end) = found else { return Some(None) };
+        let mut pips = Vec::new();
+        let mut cur = end;
+        while let Some(&(prev, via)) = parent.get(&cur) {
+            if let Some((ti, s, d, pseudo)) = via {
+                let wires = self.device.wires(ti)?;
+                pips.push(RoutedPip {
+                    tile: self.tile_name(ti)?.to_string(),
+                    dst_wire: wires.get(d as usize)?.clone(),
+                    src_wire: wires.get(s as usize)?.clone(),
+                    is_pseudo: pseudo,
+                });
+            }
+            cur = prev;
+        }
+        pips.reverse();
+        Some(Some(pips))
     }
 
     fn tile_idx(&self, tile: &str) -> Option<usize> {
@@ -299,6 +447,22 @@ impl<'a> DeviceQuery for XDevice<'a> {
 }
 
 impl<'a> RouteQuery for XDevice<'a> {
+    fn route_fast(
+        &self,
+        src: (&str, &str),
+        tree: &[(String, String)],
+        sinks: &[(String, String)],
+        allow_power: bool,
+        allow_byp: bool,
+        net: &str,
+        claimed: &HashMap<(String, String), String>,
+    ) -> Option<Option<Vec<RoutedPip>>> {
+        if std::env::var("HELION_ROUTE_BFS").is_ok() {
+            return None;
+        }
+        self.astar(src, tree, sinks, allow_power, allow_byp, net, claimed)
+    }
+
     fn pips_from(&self, tile: &str, wire: &str) -> Vec<(String, String, bool)> {
         let idx = match self.tile_idx(tile) {
             Some(i) => i,
@@ -967,6 +1131,56 @@ impl<'a> EmitDevice for XDevice<'a> {
         self.device.required_features().to_vec()
     }
 
+    fn bank_stepdown(&self, iob_tiles: &[String]) -> Vec<String> {
+        // Vivado: a bank running a <=1.8V standard gets STEPDOWN on every
+        // IOB site of the bank and on the bank's HCLK_IOI3 tile.
+        let pins: Vec<&crate::db::parse::PackagePin> = self.device.package_pins().collect();
+        let mut banks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for t in iob_tiles {
+            if let Some(p) = pins.iter().find(|p| &p.tile == t) {
+                banks.insert(p.bank.clone());
+            }
+        }
+        let mut out = Vec::new();
+        for bank in banks {
+            let mut ys: Vec<i32> = Vec::new();
+            let mut xs: Vec<i32> = Vec::new();
+            for p in pins.iter().filter(|p| p.bank == bank) {
+                if let Some(rel) = crate::emit::EmitDevice::site_rel(self, &p.tile, &p.site) {
+                    if rel.starts_with("IOB_") {
+                        out.push(format!("{}.{rel}.LVCMOS12_LVCMOS15_LVCMOS18_SSTL135_SSTL15.STEPDOWN", p.tile));
+                    }
+                }
+                if let Some(t) = self.tile_idx(&p.tile).and_then(|i| self.device.tile(i)) {
+                    ys.push(t.grid_y);
+                    xs.push(t.grid_x);
+                }
+            }
+            let (Some(&y0), Some(&y1)) = (ys.iter().min(), ys.iter().max()) else { continue };
+            let x = xs.first().copied().unwrap_or(0);
+            let mut best: Option<(i32, String)> = None;
+            for ti in 0..self.device.tile_count() {
+                if self.device.tile_type_name(ti) != Some("HCLK_IOI3") {
+                    continue;
+                }
+                let Some(t) = self.device.tile(ti) else { continue };
+                if t.grid_y < y0 || t.grid_y > y1 {
+                    continue;
+                }
+                let dx = (t.grid_x - x).abs();
+                if best.as_ref().map(|(b, _)| dx < *b).unwrap_or(true) {
+                    best = Some((dx, t.name.clone()));
+                }
+            }
+            if let Some((_, h)) = best {
+                out.push(format!("{h}.STEPDOWN"));
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     fn ioi_tile(&self, iob_tile: &str) -> Option<String> {
         // Same bank side (L/R), same row (grid_y), nearest column: the
         // IOI tile sits one over from its IOB tile (e.g. RIOB33_X73Y45
@@ -975,6 +1189,9 @@ impl<'a> EmitDevice for XDevice<'a> {
         // there (the IOB-tile lines still flow to the SING filter).
         let side = iob_tile.chars().next()?;
         let want = format!("{side}IOI3");
+        // A SING IOB pairs with the SING IOI tile of its row (its logic
+        // features encode through the tilegrid alias to the full IOI type).
+        let sing = iob_tile.contains("_SING_");
         let anchor = self.tile_idx(iob_tile)?;
         let anchor_tile = self.device.tile(anchor)?;
         let (ax, ay) = (anchor_tile.grid_x, anchor_tile.grid_y);
@@ -984,7 +1201,7 @@ impl<'a> EmitDevice for XDevice<'a> {
             if !ttype.starts_with(&want) {
                 continue;
             }
-            if ttype.contains("SING") {
+            if ttype.contains("SING") != sing {
                 continue;
             }
             let t = self.device.tile(ti)?;
@@ -1318,7 +1535,7 @@ mod tests {
             xdev.ioi_tile("LIOB33_X0Y25").as_deref(),
             Some("LIOI3_X0Y25")
         );
-        // SING pairs are a known DB gap (ZB-09): no logic lines there.
-        assert_eq!(xdev.ioi_tile("RIOB33_SING_X73Y49"), None);
+        // SING IOBs pair with the SING IOI tile of the same row.
+        assert_eq!(xdev.ioi_tile("RIOB33_SING_X73Y49").as_deref(), Some("RIOI3_SING_X73Y49"));
     }
 }

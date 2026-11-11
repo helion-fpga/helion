@@ -30,6 +30,14 @@ pub struct PackedFf {
     pub clk_net: String,
     pub ce_net: Option<String>,
     pub sr_net: Option<String>,
+    /// Power-on value (IR attr `INIT`, default 0).
+    pub init: bool,
+    /// Value loaded when SR is asserted (IR attr `SRVAL`, default 0:
+    /// reset; 1: set).
+    pub srval: bool,
+    /// SR acts asynchronously (FDCE/FDPE) rather than on the clock edge
+    /// (FDRE/FDSE). IR attr `SR_ASYNC=1`.
+    pub sr_async: bool,
 }
 
 /// A packed I/O buffer (IBUF or OBUF in an IOB33 site).
@@ -188,6 +196,9 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                         .net_on(&cell.name, "SR")
                         .or_else(|| pins.net_on(&cell.name, "RST"))
                         .map(|s| s.to_string()),
+                    init: cell.attrs.get("INIT") == Some("1"),
+                    srval: cell.attrs.get("SRVAL") == Some("1"),
+                    sr_async: cell.attrs.get("SR_ASYNC") == Some("1"),
                 });
             }
             CellKind::IobOut => {
@@ -322,8 +333,129 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
     }
 
     insert_clock_spine(netlist, &mut out)?;
+    insert_input_buffers(netlist, &mut out)?;
 
     Ok(out)
+}
+
+/// Every net that some cell reads but nothing drives must be a top-level
+/// input bit (`port` or `port_<bit>`): give it an IBUF. A clock port read
+/// as data reads its existing IBUF output. Any other undriven net is
+/// rejected by the router, never silently left floating.
+fn insert_input_buffers(netlist: &Design, packed: &mut Packed7) -> Result<(), String> {
+    use std::collections::{BTreeSet, HashMap, HashSet};
+    let mut driven: HashSet<String> = HashSet::new();
+    for l in &packed.luts {
+        driven.insert(l.output_net.clone());
+    }
+    for f in &packed.ffs {
+        driven.insert(f.q_net.clone());
+    }
+    for i in &packed.iobs {
+        if i.dir == IobDir::In {
+            driven.insert(i.net.clone());
+        }
+    }
+    for b in &packed.bufgs {
+        driven.insert(b.out_net.clone());
+    }
+    for c in &packed.carries {
+        for o in c.o_nets.iter().flatten() {
+            driven.insert(o.clone());
+        }
+        if let Some(co) = &c.co_net {
+            driven.insert(co.clone());
+        }
+    }
+    let mut read: BTreeSet<String> = BTreeSet::new();
+    for l in &packed.luts {
+        read.extend(l.input_nets.iter().flatten().cloned());
+    }
+    for f in &packed.ffs {
+        read.insert(f.d_net.clone());
+        read.extend(f.ce_net.iter().cloned());
+        read.extend(f.sr_net.iter().cloned());
+    }
+    for i in &packed.iobs {
+        if i.dir == IobDir::Out {
+            read.insert(i.net.clone());
+        }
+    }
+    for c in &packed.carries {
+        // DI nets are not wired by the router (see route.rs carry notes).
+        read.extend(c.s_nets.iter().flatten().cloned());
+        if c.cyinit.is_none() && !c.ci_net.is_empty() {
+            read.insert(c.ci_net.clone());
+        }
+    }
+    // Clock ports already have an IBUF; data loads of the raw port net read
+    // its output instead.
+    let clock_ibuf: HashMap<String, String> = packed
+        .bufgs
+        .iter()
+        .filter_map(|b| b.in_net.strip_suffix("_ibuf").map(|p| (p.to_string(), b.in_net.clone())))
+        .collect();
+    let mut rename: HashMap<String, String> = HashMap::new();
+    let mut new_iobs = Vec::new();
+    for net in read {
+        if driven.contains(&net) {
+            continue;
+        }
+        if let Some(ib) = clock_ibuf.get(&net) {
+            rename.insert(net.clone(), ib.clone());
+            continue;
+        }
+        let port = netlist.ports.iter().filter(|p| p.dir == PortDir::In).find(|p| {
+            p.name == net
+                || net
+                    .strip_prefix(p.name.as_str())
+                    .and_then(|r| r.strip_prefix('_'))
+                    .map(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_digit()))
+                    .unwrap_or(false)
+        });
+        // Not an input bit: left for the router, which rejects an undriven
+        // net loudly (pack also runs on fragments in unit tests).
+        let Some(port) = port else { continue };
+        let scalar = port.name == net;
+        new_iobs.push(PackedIob {
+            name: format!("ibuf_{net}"),
+            loc: if scalar { port.attrs.get("LOC").map(|s| s.to_string()) } else { None },
+            iostandard: port.attrs.get("IOSTANDARD").map(|s| s.to_string()).unwrap_or_else(|| "LVCMOS33".to_string()),
+            drive: None,
+            slew: None,
+            port: port.name.clone(),
+            dir: IobDir::In,
+            net: net.clone(),
+        });
+    }
+    packed.iobs.extend(new_iobs);
+    if !rename.is_empty() {
+        let r = |n: &mut String| {
+            if let Some(x) = rename.get(n) {
+                *n = x.clone();
+            }
+        };
+        for l in packed.luts.iter_mut() {
+            for n in l.input_nets.iter_mut().flatten() {
+                r(n);
+            }
+        }
+        for f in packed.ffs.iter_mut() {
+            r(&mut f.d_net);
+            if let Some(n) = f.ce_net.as_mut() {
+                r(n);
+            }
+            if let Some(n) = f.sr_net.as_mut() {
+                r(n);
+            }
+        }
+        for i in packed.iobs.iter_mut() {
+            if i.dir == IobDir::Out {
+                r(&mut i.net);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Insert IBUF + BUFGCTRL for clock inputs.

@@ -1941,6 +1941,7 @@ dependencies = [
  "helion-backend",
  "helion-ir",
  "helion-sv",
+ "helion-vhdl",
  "serde",
  "serde_json",
 ]

@@ -114,6 +114,63 @@ pub struct Placed7 {
     pub carries: Vec<PlacedCarry>,
 }
 
+/// FF control set: CLK, CE, SR nets and SR mode. Slice-wide in 7-series.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CtrlSet {
+    pub clk: String,
+    pub ce: Option<String>,
+    pub sr: Option<String>,
+    pub sr_async: bool,
+}
+
+impl CtrlSet {
+    pub fn of(ff: &crate::pack::PackedFf) -> Self {
+        CtrlSet { clk: ff.clk_net.clone(), ce: ff.ce_net.clone(), sr: ff.sr_net.clone(), sr_async: ff.sr_async && ff.sr_net.is_some() }
+    }
+}
+
+/// Where a placed FF's D input comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfDSource {
+    /// The same-letter LUT of the same slice (`xFFMUX.O6`, site-internal).
+    LutO6,
+    /// The same-letter carry sum bit of the same slice (`xFFMUX.XOR`).
+    CarryXor,
+    /// Anything else: routed through the fabric into the letter's bypass
+    /// pin (`AX`..`DX`, `xFFMUX.xX`).
+    Bypass,
+}
+
+/// Decide the D source of a placed FF. Route and emit both use this, so
+/// the routed pin and the programmed FF mux always agree.
+pub fn ff_d_source(ff: &PlacedFf, placed: &Placed7) -> FfDSource {
+    let letter = ff.bel.chars().next().unwrap_or('A');
+    let Some(pff) = placed.packed.ffs.iter().find(|f| f.name == ff.name) else {
+        return FfDSource::Bypass;
+    };
+    let li = BEL_LETTERS.iter().position(|c| *c == letter).unwrap_or(0);
+    for pc in &placed.carries {
+        if pc.site != ff.site {
+            continue;
+        }
+        if let Some(c) = placed.packed.carries.iter().find(|c| c.name == pc.name) {
+            if c.o_nets[li].as_deref() == Some(pff.d_net.as_str()) {
+                return FfDSource::CarryXor;
+            }
+        }
+    }
+    for lut in &placed.luts {
+        if lut.site == ff.site && lut.bel.starts_with(letter) {
+            if let Some(pl) = placed.packed.luts.iter().find(|l| l.name == lut.name) {
+                if pl.output_net == pff.d_net {
+                    return FfDSource::LutO6;
+                }
+            }
+        }
+    }
+    FfDSource::Bypass
+}
+
 /// Order packed carries into chains by CO-to-CI net linkage (ZB-08).
 ///
 /// Each chain runs head to tail: the head is the group whose CI net is not
@@ -338,22 +395,35 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         .first()
         .and_then(|c| device.tile_xy(&c.tile))
         .unwrap_or((ax, ay));
+    // Control set per slice: every FF in a slice shares CLK, CE, SR and
+    // the SR mode (FFSYNC is slice-wide), so an FF only joins a slice whose
+    // FFs have the same set. LUT-only slices have none yet.
+    let mut site_ctrl: HashMap<String, CtrlSet> = HashMap::new();
     let alloc = |used: &mut HashSet<String>,
                      site_bels: &mut HashMap<String, HashSet<char>>,
                      site_tile: &mut HashMap<String, String>,
+                     site_ctrl: &mut HashMap<String, CtrlSet>,
+                     ctrl: Option<&CtrlSet>,
                      device: &dyn DeviceQuery|
      -> Result<(String, String, char), String> {
         let mut sites: Vec<&String> = site_bels.keys().collect();
         sites.sort();
+        let fits = |site: &str| match (ctrl, site_ctrl.get(site)) {
+            (Some(c), Some(have)) => c == have,
+            _ => true,
+        };
         // Pass 1: open slices without carry cells, in sorted order.
         for site in sites.iter() {
-            if carry_sites.contains(*site) {
+            if carry_sites.contains(*site) || !fits(site) {
                 continue;
             }
             let bels = &site_bels[*site];
             if bels.len() < 4 {
                 if let Some(letter) = BEL_LETTERS.iter().find(|c| !bels.contains(c)) {
                     let tile = site_tile.get(*site).cloned().unwrap_or_default();
+                    if let Some(c) = ctrl {
+                        site_ctrl.insert((*site).clone(), c.clone());
+                    }
                     return Ok((tile, (*site).clone(), *letter));
                 }
             }
@@ -364,15 +434,24 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
             used.insert(site.clone());
             site_tile.insert(site.clone(), tile.clone());
             site_bels.entry(site.clone()).or_default();
+            if let Some(c) = ctrl {
+                site_ctrl.insert(site.clone(), c.clone());
+            }
             return Ok((tile, site, 'A'));
         }
         // Pass 3 (last resort, dense packing with no fresh slice): reuse
         // a carry-slice gap in sorted order.
         for site in sites.iter() {
+            if !fits(site) {
+                continue;
+            }
             let bels = &site_bels[*site];
             if bels.len() < 4 {
                 if let Some(letter) = BEL_LETTERS.iter().find(|c| !bels.contains(c)) {
                     let tile = site_tile.get(*site).cloned().unwrap_or_default();
+                    if let Some(c) = ctrl {
+                        site_ctrl.insert((*site).clone(), c.clone());
+                    }
                     return Ok((tile, (*site).clone(), *letter));
                 }
             }
@@ -383,12 +462,21 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         let _ = fi;
         // Carry-driven FF: same slice and letter as its carry bit, so the
         // O-to-D path stays site-internal. A double-booked slot fails loud.
+        let ctrl = CtrlSet::of(ff);
         if let Some((tile, site, letter)) = o_slot.get(ff.d_net.as_str()) {
             if !carry_ff_slots.insert((site.clone(), *letter)) {
                 return Err(format!(
                     "place: FF {} collides on {site}.{letter}FF in carry slice",
                     ff.name
                 ));
+            }
+            match site_ctrl.get(site) {
+                Some(have) if *have != ctrl => {
+                    return Err(format!("place: FF {} needs a different clock/CE/SR than the other FFs of carry slice {site}", ff.name));
+                }
+                _ => {
+                    site_ctrl.insert(site.clone(), ctrl.clone());
+                }
             }
             out.ffs.push(PlacedFf {
                 name: ff.name.clone(),
@@ -400,7 +488,7 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         }
         // Find driving LUT, if any, and not yet placed.
         let lut_idx = lut_by_output.get(ff.d_net.as_str()).copied().filter(|i| !lut_placed.contains(i));
-        let (tile, site, letter) = alloc(&mut used_sites, &mut site_bels, &mut site_tile, device)?;
+        let (tile, site, letter) = alloc(&mut used_sites, &mut site_bels, &mut site_tile, &mut site_ctrl, Some(&ctrl), device)?;
         site_bels.get_mut(&site).unwrap().insert(letter);
         if let Some(li) = lut_idx {
             // Pair: LUT takes the same letter's LUT BEL, FF takes the FF BEL.
@@ -446,7 +534,7 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
             });
             continue;
         }
-        let (tile, site, letter) = alloc(&mut used_sites, &mut site_bels, &mut site_tile, device)?;
+        let (tile, site, letter) = alloc(&mut used_sites, &mut site_bels, &mut site_tile, &mut site_ctrl, None, device)?;
         site_bels.get_mut(&site).unwrap().insert(letter);
         out.luts.push(PlacedLut {
             name: lut.name.clone(),
@@ -532,7 +620,7 @@ mod tests {
                 q_net: "q".into(),
                 clk_net: "clk_bufg".into(),
                 ce_net: None,
-                sr_net: None,
+                sr_net: None, init: false, srval: false, sr_async: false,
             }],
             iobs: vec![
                 PackedIob {
@@ -648,7 +736,7 @@ mod tests {
                 q_net: format!("q{j}"),
                 clk_net: "clk_bufg".into(),
                 ce_net: None,
-                sr_net: None,
+                sr_net: None, init: false, srval: false, sr_async: false,
             });
             p.luts.push(PackedLut {
                 name: format!("u_s{j}"),
