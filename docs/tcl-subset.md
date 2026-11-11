@@ -1,11 +1,18 @@
-# Helion Tcl Subset — honestly supported
+# Helion Tcl reference
 
-The IDE console (`helion-ide` → Tcl Console tab) runs a **real interpreter**
-(`crates/helion-gui/src/tcl/`), not pattern matching: `parse.rs` implements
-Tcl word rules (`{}`, `""`, `[...]`, `$var`, backslash escapes, `#` comments),
-`interp.rs` evaluates with real variables, scopes, procedures, loops, `expr`,
-lists and `catch`, and `design.rs` implements the object model against the
-live design database.
+The Tcl console in `helion-ide`, and its windowless modes (`--source`,
+`--stdin`, `--headless`), run a **real interpreter**
+(`crates/helion-rune/src/tcl.rs`), not pattern matching. It follows Tcl word
+rules (`{}`, `""`, `[...]`, `$var` and `$arr(i)`, backslash escapes, `#`
+comments, `;` separators), evaluates with real variables, scopes,
+procedures, loops, `expr`, lists and `catch`, and implements the object
+model and flow commands against the live design database. Unknown commands
+and missing designs are errors with usage hints, never silent no-ops.
+
+The legacy egui IDE (`crates/helion-gui/src/tcl/`) implements the same
+language; the Rune IDE adds run, report, hardware, ECO and DFX verbs on top.
+`help` in the console lists every command and prints usage for any one of
+them; `info commands` lists them all.
 
 Everything is a string, like Tcl. Errors are `ERROR: <msg> (line <n>)`.
 
@@ -62,6 +69,31 @@ Select a console row to read the full report in the properties pane.
 `write_checkpoint`, `create_clock`, `report_timing`, `report_utilization`,
 `mark_debug`, `eco`, `open_hw_manager`, `program_hw`, `report_die`,
 `report_featuremap`, `write_hnf`, `hds::impl`, `hds::flow`, `hds::tree`.
+
+## Runs, reports, hardware and more (IDE)
+
+These run in `helion-ide` (console, `--source`, `--stdin`):
+
+- **Runs and simulation:** `launch_runs`, `cancel_runs`, `launch_simulation`,
+  `tb_run`, `tb_run_all`, `tb_uvm_test`, `history`.
+- **Reports:** `report_timing_summary`, `report_clock_interaction`,
+  `report_clock_networks`, `report_clock_utilization`, `report_cdc`,
+  `report_control_sets`, `report_drc`, `report_methodology`, `report_power`,
+  `report_power_vcd`, `report_ssn`, `report_constraints`, `report_pblocks`,
+  `report_coverage`, `report_bitstream`, `open_report`, `write_ibis`.
+- **Floorplanning:** `create_pblock`, `resize_pblock`, `add_cells_to_pblock`,
+  `get_pblocks`.
+- **Hardware:** `open_hw_manager`, `open_hw_target ?-cable auto|sim|usb|native?`,
+  `get_hw_devices`, `refresh_hw_target`, `scan_ir_hw_jtag`, `scan_dr_hw_jtag`,
+  `close_hw_target`, `program_hw`, `run_hw_ila`, `display_hw_ila_data`,
+  `write_debug_probes`, configuration memory (`write_cfgmem`,
+  `create_hw_cfgmem`, `erase_hw_cfgmem`, `blank_check_hw_cfgmem`,
+  `program_hw_cfgmem`, `verify_hw_cfgmem`, `readback_hw_cfgmem`).
+- **Project:** `get_parts`, `get_boards`, `archive_project`,
+  `write_hw_platform`, `open_checkpoint`, `launch_dfx`,
+  `write_eco_bitstream`.
+
+`help <command>` prints the usage of each.
 
 ## Deliberately NOT supported
 
