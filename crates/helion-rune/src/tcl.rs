@@ -296,6 +296,23 @@ pub const COMMANDS: &[&str] = &[
     "report_pblocks",
     "select_pblock",
     "device_zoom_fit",
+    // Clocking / I/O reports.
+    "report_clock_utilization",
+    "report_control_sets",
+    "report_ssn",
+    "write_ibis",
+    "report_power_vcd",
+    // ECO.
+    "eco_open",
+    "eco_set_lut_init",
+    "eco_connect_pin",
+    "eco_insert_buffer",
+    "eco_add_lut",
+    "eco_add_ff",
+    "eco_remove_cell",
+    "eco_place_route",
+    "eco_route",
+    "write_eco_bitstream",
 ];
 
 /// Max nested `[...]` evaluation depth (mirrors the real interp's cap idea;
@@ -2930,6 +2947,10 @@ fn dispatch_host(
             crate::views::device_floor::tcl_verb(s, n, argv.get(1..).unwrap_or_default()),
             line,
         ),
+        n if crate::ext_verbs::is_verb(n) => ctl_result(
+            crate::ext_verbs::tcl_verb(s, n, argv.get(1..).unwrap_or_default()),
+            line,
+        ),
         _ => unknown_command(s, name, line),
     }
 }
@@ -5356,7 +5377,7 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
             "list, report, or select floorplan pblocks",
         ),
         "device_zoom_fit" => ("device_zoom_fit", "fit the die to the Device viewport"),
-        _ => return None,
+        _ => return crate::ext_verbs::help(name),
     })
 }
 
@@ -5384,6 +5405,9 @@ fn help_overview() -> String {
         "Schematic: expand_fanin_cone expand_fanout_cone expand_cone collapse_cone expand_inside collapse_inside",
         "  schematic_previous schematic_next schematic_zoom_fit",
         "Floorplan: create_pblock resize_pblock add_cells_to_pblock get_pblocks report_pblocks select_pblock device_zoom_fit",
+        "I/O & clocking: report_clock_utilization report_control_sets report_ssn write_ibis report_power_vcd",
+        "ECO: eco_open eco_set_lut_init eco_connect_pin eco_insert_buffer eco_add_lut eco_add_ff eco_remove_cell",
+        "  eco_place_route eco_route write_eco_bitstream",
         "help <command> for usage. See docs/tcl-subset.md for the supported subset.",
     ]
     .join("\n")

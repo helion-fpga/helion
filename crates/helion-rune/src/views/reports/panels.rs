@@ -45,6 +45,8 @@ pub fn report_ready(s: &AppState, nav: ReportNav) -> bool {
         ReportNav::Qor => {
             s.reports_view.qor.is_some() || s.tcl.design.is_some() || s.runs.live_design.is_some()
         }
+        // I/O pages always mount: they show their own result or reason.
+        ReportNav::ClockUtil | ReportNav::ControlSets | ReportNav::Ssn | ReportNav::Ibis => true,
     }
 }
 
@@ -57,6 +59,29 @@ fn report_util(s: &mut AppState) {
 /// Action bar for the selected report: what produced it plus the one real
 /// re-run action (disabled with the reason when its inputs are missing).
 pub fn action_bar(s: &AppState, nav: ReportNav, t: &VivadoTheme) -> El {
+    if nav.is_io() {
+        let (label, key, stage) = super::io::action_meta(nav);
+        let reason = super::io::unavailable(s, nav);
+        let label = if reason == Some("Running…") { "Running…" } else { label };
+        let button = kit::action_button(key, label, reason, t, move |s: &mut AppState| {
+            let _ = super::io::run(s, nav, None);
+        });
+        return row()
+            .key("reports-actions")
+            .w_full()
+            .h(28.0)
+            .items_center()
+            .gap(8.0)
+            .child(
+                text(format!("{} · {stage}", stage_label(s)))
+                    .font(VivadoTheme::FONT_UI)
+                    .color(t.text_dim)
+                    .truncate()
+                    .key("reports-stage"),
+            )
+            .child(el().grow(1.0))
+            .child(button);
+    }
     let design_missing =
         (s.tcl.design.is_none() && s.runs.live_design.is_none()).then_some("Run Synthesis first");
     let (label, key, reason, stage): (&'static str, &'static str, Option<&str>, String) = match nav
@@ -95,6 +120,10 @@ pub fn action_bar(s: &AppState, nav: ReportNav, t: &VivadoTheme) -> El {
             design_missing,
             "Evaluated on the elaborated design".to_string(),
         ),
+        // Handled by the early return above.
+        ReportNav::ClockUtil | ReportNav::ControlSets | ReportNav::Ssn | ReportNav::Ibis => {
+            ("", "reports-action-io", None, String::new())
+        }
     };
     // Engine re-runs are worker jobs: every re-run action waits for the
     // one in flight (QoR evaluates on the spot and never waits).
@@ -109,6 +138,9 @@ pub fn action_bar(s: &AppState, nav: ReportNav, t: &VivadoTheme) -> El {
         ReportNav::Drc => crate::tcl::eval_command(s, "report_drc"),
         ReportNav::Methodology => crate::tcl::eval_command(s, "report_methodology"),
         ReportNav::Qor => super::refresh_qor(s),
+        io => {
+            let _ = super::io::run(s, io, None);
+        }
     });
     row()
         .key("reports-actions")
@@ -162,6 +194,9 @@ pub fn not_ready(s: &AppState, nav: ReportNav, t: &VivadoTheme) -> El {
                 synth_link(t),
             ),
             ReportNav::Qor => ("QoR needs a synthesized design.", synth_link(t)),
+            ReportNav::ClockUtil | ReportNav::ControlSets | ReportNav::Ssn | ReportNav::Ibis => {
+                ("This report needs an implemented design.", synth_link(t))
+            }
         };
         kit::empty_state("reports-cta", sentence, Some(cta), t)
     };

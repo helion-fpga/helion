@@ -44,6 +44,8 @@
 //! - `crates/rune/src/el/text.rs`: `.truncate()` for long labels.
 //! - `crates/rune-kit/src/glyphs.rs`: `TRIANGLE_DOWN`, `CIRCLE_X`.
 
+pub mod io;
+pub mod vec_power;
 mod panels;
 
 use rune::{Align, El, ScrollSpec, col, el, icon, row, text};
@@ -90,16 +92,32 @@ pub enum ReportNav {
     Drc,
     Methodology,
     Qor,
+    ClockUtil,
+    ControlSets,
+    Ssn,
+    Ibis,
 }
 
 impl ReportNav {
-    pub const ALL: [ReportNav; 5] = [
+    pub const ALL: [ReportNav; 9] = [
         ReportNav::Utilization,
         ReportNav::Power,
         ReportNav::Drc,
         ReportNav::Methodology,
         ReportNav::Qor,
+        ReportNav::ClockUtil,
+        ReportNav::ControlSets,
+        ReportNav::Ssn,
+        ReportNav::Ibis,
     ];
+
+    /// Pages computed by [`io`] engines on a background worker.
+    pub fn is_io(self) -> bool {
+        matches!(
+            self,
+            ReportNav::ClockUtil | ReportNav::ControlSets | ReportNav::Ssn | ReportNav::Ibis
+        )
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -108,6 +126,10 @@ impl ReportNav {
             ReportNav::Drc => "DRC",
             ReportNav::Methodology => "Methodology",
             ReportNav::Qor => "QoR",
+            ReportNav::ClockUtil => "Clock Utilization",
+            ReportNav::ControlSets => "Control Sets",
+            ReportNav::Ssn => "SSN",
+            ReportNav::Ibis => "IBIS Model",
         }
     }
 
@@ -118,6 +140,10 @@ impl ReportNav {
             ReportNav::Drc => "reports-nav-drc",
             ReportNav::Methodology => "reports-nav-methodology",
             ReportNav::Qor => "reports-nav-qor",
+            ReportNav::ClockUtil => "reports-nav-clockutil",
+            ReportNav::ControlSets => "reports-nav-ctrlsets",
+            ReportNav::Ssn => "reports-nav-ssn",
+            ReportNav::Ibis => "reports-nav-ibis",
         }
     }
 
@@ -129,6 +155,10 @@ impl ReportNav {
             ReportNav::Drc => "DRC - drc_1",
             ReportNav::Methodology => "Methodology - methodology_1",
             ReportNav::Qor => "QoR Suggestions - qor_suggestions_1",
+            ReportNav::ClockUtil => "Clock Utilization - clock_utilization_1",
+            ReportNav::ControlSets => "Control Sets - control_sets_1",
+            ReportNav::Ssn => "SSN - ssn_1",
+            ReportNav::Ibis => "IBIS - write_ibis_1",
         }
     }
 }
@@ -208,6 +238,10 @@ pub struct ReportsView {
     pub selected_drc: Option<usize>,
     /// Selected methodology row (index into `TimingState::methodology`).
     pub selected_method: Option<usize>,
+    /// Clock utilization / control sets / SSN / IBIS pages.
+    pub io: io::IoReports,
+    /// Vectored (VCD-driven) power under the Power report.
+    pub vpower: vec_power::VecPower,
 }
 
 /// Fill the typed post-implementation fixture state the report scenes
@@ -344,6 +378,9 @@ fn select_report(s: &mut AppState, nav: ReportNav) {
     s.reports_view.selected = nav;
     if nav == ReportNav::Qor {
         refresh_qor(s);
+    }
+    if nav.is_io() {
+        io::on_select(s, nav);
     }
 }
 
@@ -946,17 +983,52 @@ fn power_split(s: &AppState, t: &VivadoTheme) -> El {
 /// Power detail body: summary, split bar, rails table, block power and
 /// utilization.
 fn power_body(s: &AppState, t: &VivadoTheme) -> El {
-    col()
+    let vectored = s.reports_view.vpower.show;
+    let tabs = row()
+        .key("reports-power-tabs")
+        .w_full()
+        .gap(1.0)
+        .fill(t.border)
+        .child(crate::views::cad::tab(
+            "reports-power-tab-vectorless",
+            "Vectorless (STA)",
+            !vectored,
+            t,
+            |s: &mut AppState| s.reports_view.vpower.show = false,
+        ))
+        .child(crate::views::cad::tab(
+            "reports-power-tab-vectored",
+            "Simulation activity (VCD)",
+            vectored,
+            t,
+            |s: &mut AppState| s.reports_view.vpower.show = true,
+        ))
+        .child(
+            row()
+                .grow(1.0)
+                .min_w(0.0)
+                .h(24.0)
+                .px(8.0)
+                .items_center()
+                .fill(t.header_bg)
+                .child(el().grow(1.0))
+                .child(
+                    text(format!("Power ({})", s.project.part))
+                        .font(VivadoTheme::FONT_TITLE)
+                        .color(t.text)
+                        .truncate()
+                        .key("reports-power-title"),
+                ),
+        );
+    let body = col()
         .key("reports-power")
         .w_full()
         .gap(10.0)
-        .child(
-            text(format!("Power ({})", s.project.part))
-                .font(VivadoTheme::FONT_TITLE)
-                .color(t.text)
-                .key("reports-power-title"),
-        )
-        .child(power_summary(s, t))
+        .child(tabs);
+    if vectored {
+        return body.child(vec_power::section(s, t));
+    }
+    body.child(power_summary(s, t))
         .child(power_split(s, t))
         .child(panels::rails_table(s, t))
         .child(panels::blocks_table(s, t))
@@ -1666,6 +1738,10 @@ fn report_content(s: &AppState, t: &VivadoTheme) -> El {
             ReportNav::Drc => drc_body(s, t),
             ReportNav::Methodology => method_body(s, t),
             ReportNav::Qor => qor_body(s, t),
+            ReportNav::ClockUtil => io::clock_body(s, t),
+            ReportNav::ControlSets => io::control_body(s, t),
+            ReportNav::Ssn => io::ssn_body(s, t),
+            ReportNav::Ibis => io::ibis_body(s, t),
         })
 }
 
