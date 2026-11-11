@@ -33,6 +33,9 @@ pub struct DebugInsertConfig {
     pub trigger_stages: usize,
     /// Initial hardware match unit mode (default `IlaTriggerKind::Rising`).
     pub default_trigger: IlaTriggerKind,
+    /// Probe net the edge match unit watches (`None` = first probed net).
+    /// Must be one of the probed nets.
+    pub trigger_net: Option<String>,
     /// Optional clock net name (auto-detected from design ports if `None`).
     pub clock_net: Option<String>,
     /// Optional VIO input probe nets (`PROBE_IN*`) to stitch into a `u_vio_0` core.
@@ -53,6 +56,7 @@ impl Default for DebugInsertConfig {
             sample_depth: 64,
             trigger_stages: 4,
             default_trigger: IlaTriggerKind::Rising,
+            trigger_net: None,
             clock_net: None,
             vio_probes_in: Vec::new(),
             vio_probes_out: Vec::new(),
@@ -78,6 +82,8 @@ pub struct DebugCoreInsertionReport {
     pub bscan_cell_name: String,
     pub bscan_chain: u8,
     pub clock_net: String,
+    /// Probe net wired to the edge match unit.
+    pub trigger_net: String,
     /// Ordered physical net names probed by the ILA core.
     pub probed_nets: Vec<String>,
     /// Logical probe channels (`PROBE0`, `PROBE1`, ...) with bus widths.
@@ -90,8 +96,8 @@ pub struct DebugCoreInsertionReport {
     pub ltx: DebugProbesLtx,
 }
 
-const CMP_LUT_CELL: &str = "ila_trig_cmp_lut";
-const CMP_HIT_NET: &str = "ila_trig_cmp_hit";
+pub(crate) const CMP_LUT_CELL: &str = "ila_trig_cmp_lut";
+pub(crate) const CMP_HIT_NET: &str = "ila_trig_cmp_hit";
 
 /// Collect all net names in `design` carrying `mark_debug` / `MARK_DEBUG` truthy attributes.
 pub fn collect_marked_debug_nets(design: &Design) -> Vec<String> {
@@ -211,6 +217,15 @@ pub fn insert_debug_cores(
             return Err(format!("insert_debug_cores: net '{net}' not found in design"));
         }
     }
+    let trigger_net = match &cfg.trigger_net {
+        Some(t) if probed_nets.iter().any(|n| n == t) => t.clone(),
+        Some(t) => {
+            return Err(format!(
+                "insert_debug_cores: trigger net '{t}' is not one of the probed nets"
+            ));
+        }
+        None => probed_nets[0].clone(),
+    };
     for net in cfg.vio_probes_in.iter().chain(cfg.vio_probes_out.iter()) {
         if design.net(net).is_none() {
             return Err(format!(
@@ -235,8 +250,7 @@ pub fn insert_debug_cores(
 
     // 3. Stitch synthesizable multi-probe trigger comparator LUT6 (up to 6 inputs I0..I5)
     //    plus the match-unit delay LUT+FF + match LUT + `h_ila_trig` FSM IP cell.
-    let first_probe = &probed_nets[0];
-    insert_match_unit(design, first_probe, cfg.default_trigger)?;
+    insert_match_unit(design, &trigger_net, cfg.default_trigger)?;
     inserted_cells.push("ila_match_delay_lut".to_string());
     inserted_cells.push("ila_match_delay_ff".to_string());
     inserted_cells.push("ila_match_lut".to_string());
@@ -478,6 +492,7 @@ pub fn insert_debug_cores(
         bscan_cell_name,
         bscan_chain: chain.index(),
         clock_net,
+        trigger_net,
         probed_nets,
         probe_channels: ila_channels,
         inserted_cells,

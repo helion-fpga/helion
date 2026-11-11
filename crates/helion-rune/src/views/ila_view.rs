@@ -199,8 +199,12 @@ fn header(s: &AppState, t: &VivadoTheme) -> El {
                 "ila-save",
                 "Save session",
                 t,
-                !capturing,
-                "Wait for the capture to finish",
+                !capturing && s.ila.hardware_label().is_none(),
+                if capturing {
+                    "Wait for the capture to finish"
+                } else {
+                    "Hardware captures are not simulation sessions; use Export VCD"
+                },
             )
             .on_press_tx(|s: &mut AppState, tx: &mut Tx| {
                 ila::pick_save_session(tx, ila::default_session_path(s))
@@ -274,6 +278,10 @@ fn status_strip(s: &AppState, t: &VivadoTheme) -> El {
         .gap(18.0)
         .items_center()
         .fill(t.panel_bg)
+        .child(match ila.hardware_label() {
+            Some(l) => item("ila-strip-source", "Source", format!("Hardware · {l}"), t.accent),
+            None => item("ila-strip-source", "Source", "Simulation".into(), t.text),
+        })
         .child(item(
             "ila-strip-status",
             "Status",
@@ -283,23 +291,33 @@ fn status_strip(s: &AppState, t: &VivadoTheme) -> El {
         .child(item(
             "ila-strip-probes",
             "Probes",
-            ila.config.probes.len().to_string(),
+            match (ila.hardware_label(), &ila.capture) {
+                (Some(_), Some(c)) => c.probes.len().to_string(),
+                _ => ila.config.probes.len().to_string(),
+            },
             t.text,
         ))
         .child(item(
             "ila-strip-trigger",
             "Trigger",
-            format!(
-                "{} @ {}",
-                ila.config.trigger.kind.label(),
-                ila.trigger_probe_name()
-            ),
+            if ila.hardware_label().is_some() {
+                ila.hardware_trigger.clone()
+            } else {
+                format!(
+                    "{} @ {}",
+                    ila.config.trigger.kind.label(),
+                    ila.trigger_probe_name()
+                )
+            },
             t.text,
         ))
         .child(item(
             "ila-strip-depth",
             "Depth",
-            format!("{} samples", ila.config.depth),
+            match (ila.hardware_label(), &ila.capture) {
+                (Some(_), Some(c)) => format!("{} samples", c.len()),
+                _ => format!("{} samples", ila.config.depth),
+            },
             t.text,
         ))
 }
@@ -979,7 +997,17 @@ fn viewer_toolbar(s: &AppState, t: &VivadoTheme, cap: &IlaCapture) -> El {
             }),
         )
         .child(
-            btn("ila-trigger-here", "Trigger here", t, has_cursor, no_cursor)
+            btn(
+                "ila-trigger-here",
+                "Trigger here",
+                t,
+                has_cursor && s.ila.hardware_label().is_none(),
+                if s.ila.hardware_label().is_some() {
+                    "Hardware triggers are set in the Hardware Manager ILA panel"
+                } else {
+                    no_cursor
+                },
+            )
                 .help("Set the trigger from the edge or value at the cursor (selected probe first)")
                 .on_press(|s: &mut AppState| {
                     let Some(c) = s.ila.viewer.cursor else { return };
