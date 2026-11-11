@@ -14,6 +14,7 @@ use helion_sta::{Constraints, apply_xdc, create_clock, load_xdc, report_timing_r
 mod checkpoint2;
 pub mod qor;
 pub mod reports;
+pub mod io_reports;
 pub mod tcl;
 
 pub mod ip_packager;

@@ -353,6 +353,13 @@ impl BgaPackageGrid {
         }
     }
 
+    /// The user I/O ball bound to HAD IOB `site`, if any.
+    pub fn ball_for_site(&self, site: Site) -> Option<&BgaBall> {
+        self.balls
+            .iter()
+            .find(|b| b.site.map(|s| (s.x, s.y)) == Some((site.x, site.y)))
+    }
+
     /// Look up a ball by its coordinate name (e.g. `"A1"`, case-insensitive).
     pub fn pin(&self, ball_name: &str) -> Option<&BgaBall> {
         let key = ball_name.trim().to_ascii_uppercase();
