@@ -11,8 +11,10 @@ Helion 4.0 replaces the desktop IDE. The new `helion-ide` is built from
 scratch on the [Rune](https://github.com/anomalyco/rune) UI framework and
 covers the whole design flow, from sources to a programmed board, in one
 Vivado-style window. Rune is vendored, so a plain clone builds. The native
-JTAG engine now talks to real hardware. The empty-XDC `examples/counter.sv`
-gold is unchanged: `WNS_PS=9640`, `LED[16]=0000000111111110`.
+JTAG engine now talks to real hardware, and two Lattice backends (iCE40 and
+ECP5) join the HL10 and Xilinx 7-series flows. The empty-XDC
+`examples/counter.sv` gold is unchanged: `WNS_PS=9640`,
+`LED[16]=0000000111111110`.
 
 ### Added
 
@@ -56,6 +58,14 @@ gold is unchanged: `WNS_PS=9640`, `LED[16]=0000000111111110`.
     view; partial reconfiguration (DFX) view.
   - Tcl console on the same engines as the GUI: the full verb set of the
     previous IDE plus run, report, hardware, DFX and ECO verbs.
+- **Lattice iCE40 backend** (`helion-ice40`): iCE40-HX8K from the Project
+  IceStorm database; pack (LUT6 to LUT4 decomposition), place, A* route,
+  global clocks, `SB_CARRY`, `SB_RAM40_4K` with INIT, `SB_PLL40`, and IceStorm
+  `.asc` output that round-trips through icepack/iceunpack.
+- **Lattice ECP5 backend** (`helion-ecp5`): LFE5U-85F from the Project
+  Trellis database; pack, place, A* route over the Trellis mux graph, CCU2
+  carry chains, DP16KD block RAM, MULT18X18D, PLL and DCC clocks, and Trellis
+  text-config output accepted by `ecppack`.
 - **Windowless IDE modes**, all on the IDE's own Tcl interpreter:
   `helion-ide --headless <file>` (full flow plus `report_timing`; prints
   `WNS_PS`), `--source script.tcl` (batch, exit 1 on the first error),
