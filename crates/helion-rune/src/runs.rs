@@ -118,6 +118,9 @@ pub struct AnalysisCtx {
     pub part: String,
     /// Routed result (implementation runs only).
     pub routed: Option<helion_route::Routed>,
+    /// Constraints file written since the run (Constraints Wizard "Write
+    /// to"); re-analysis reads it before the source's `.sdc`/`.xdc` sibling.
+    pub constraints: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for AnalysisCtx {
@@ -127,6 +130,7 @@ impl std::fmt::Debug for AnalysisCtx {
             .field("source", &self.source)
             .field("part", &self.part)
             .field("routed", &self.routed.is_some())
+            .field("constraints", &self.constraints)
             .finish()
     }
 }
@@ -903,15 +907,32 @@ pub(crate) fn resolve_source(s: &AppState) -> Result<PathBuf, String> {
 /// falling back to the implicit clock. Best-effort: a missing SDC or a failed
 /// copy keeps the old behavior (the worker announces the implicit clock).
 fn stage_sibling_constraints(s: &AppState, tab: &str, staged: &PathBuf) {
-    let Some(real) = s.editor.paths.get(tab) else {
-        return;
-    };
-    for ext in ["sdc", "xdc"] {
-        let src = real.with_extension(ext);
-        if src.is_file() {
-            let _ = std::fs::copy(&src, staged.with_extension(ext));
-            return;
+    if let Some(real) = s.editor.paths.get(tab) {
+        for ext in ["sdc", "xdc"] {
+            let src = real.with_extension(ext);
+            if src.is_file() {
+                let _ = std::fs::copy(&src, staged.with_extension(ext));
+                return;
+            }
         }
+    }
+    // No sibling: the project's first on-disk constraints file (Add Sources
+    // or the Constraints Wizard put it in `constrs_1`).
+    let project = s
+        .project_files
+        .in_set(crate::project::FileSet::Constraints)
+        .filter_map(|(_, f)| f.path.clone())
+        .find(|p| p.is_file());
+    if let Some(src) = project {
+        let ext = if src
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("sdc"))
+        {
+            "sdc"
+        } else {
+            "xdc"
+        };
+        let _ = std::fs::copy(&src, staged.with_extension(ext));
     }
 }
 
@@ -1030,6 +1051,7 @@ fn run_worker(
             source: source.clone(),
             part: part_req.clone(),
             routed: None,
+            constraints: None,
         });
         art.design = Some(design);
         art.summary = summarize(&art);
@@ -1295,6 +1317,7 @@ fn run_worker(
         source,
         part: dev.part.clone(),
         routed: Some(live_routed),
+        constraints: None,
     });
     art.summary = summarize(&art);
     finish(Ok(art));
@@ -1384,6 +1407,38 @@ fn run_synth_reports(
 
 /// Sibling `.sdc`/`.xdc` first (mirroring `ide.rs:22753 load_sibling_sdc`),
 /// else an implicit 10 ns clock (mirroring `clocks_for_sta`'s fallback).
+/// Constraints for re-analysis of `ctx`: the explicitly written file
+/// ([`AnalysisCtx::constraints`]) when it loads, else the run's siblings.
+pub(crate) fn load_ctx_constraints(
+    ctx: &AnalysisCtx,
+    emit: &impl Fn(String, MsgSev),
+) -> (helion_sta::Constraints, Vec<helion_sta::Clock>) {
+    if let Some(path) = &ctx.constraints {
+        match std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| helion_sta::load_xdc(&text))
+        {
+            Ok(xdc) if !xdc.clocks.is_empty() => {
+                emit(
+                    format!("read_xdc {} clocks={}", path.display(), xdc.clocks.len()),
+                    MsgSev::Info,
+                );
+                let clks = xdc.clocks.clone();
+                return (xdc, clks);
+            }
+            Ok(_) => emit(
+                format!("WARN: read_xdc {} defines no clocks", path.display()),
+                MsgSev::Warn,
+            ),
+            Err(e) => emit(
+                format!("WARN: read_xdc {} skipped: {e}", path.display()),
+                MsgSev::Warn,
+            ),
+        }
+    }
+    load_run_constraints(&ctx.source, emit)
+}
+
 pub(crate) fn load_run_constraints(
     source: &PathBuf,
     emit: &impl Fn(String, MsgSev),

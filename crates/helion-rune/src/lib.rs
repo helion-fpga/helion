@@ -16,6 +16,7 @@
 
 pub mod analysis;
 pub mod doctor;
+pub mod jobs;
 pub mod layout;
 pub mod live;
 pub mod pickers;
@@ -82,6 +83,14 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         s.editor.tabs.push("project1_tb.v".into());
         s.editor.active = 2;
     }),
+    ("editor-outline", |s| {
+        s.center = state::CenterPane::Editor;
+        s.editor.outline_open = true;
+        views::editor::sync_edit(s);
+        views::editor::move_cursor_to(s, 26);
+    }),
+    ("editor-diagnostics", |s| scenes::editor_diagnostics(s)),
+    ("editor-large", |s| scenes::editor_large(s)),
     ("console", |_| {}),
     ("console-tcl", |s| {
         crate::tcl::eval_command(s, "set part xc7z007s");
@@ -215,9 +224,37 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         s.dialogs.open(views::dialogs::DialogId::Constraints);
     }),
     ("constraints-review", |s| {
+        scenes::xdc_wizard_design(s);
+        scenes::xdc_wizard_rows(s);
         s.dialogs.open(views::dialogs::DialogId::Constraints);
-        s.dialogs.xdc.step = views::dialogs::XdcStep::Review;
+        s.dialogs.xdc.step = views::xdc_wizard::XdcStep::Review;
+        s.dialogs.xdc.visited = 4;
     }),
+    ("xdc-wizard-clocks", |s| {
+        scenes::xdc_wizard_design(s);
+        scenes::xdc_wizard_rows(s);
+        s.dialogs.open(views::dialogs::DialogId::Constraints);
+    }),
+    ("xdc-wizard-delays", |s| {
+        scenes::xdc_wizard_design(s);
+        scenes::xdc_wizard_rows(s);
+        // One row with a real problem renders its error under the row.
+        let id = s.dialogs.xdc.inputs[0].id;
+        *s.dialogs
+            .xdc
+            .edit_mut(views::xdc_wizard::Field::InMin, id) = rune::TextEdit::new("3.0");
+        s.dialogs.open(views::dialogs::DialogId::Constraints);
+        s.dialogs.xdc.step = views::xdc_wizard::XdcStep::InputDelays;
+        s.dialogs.xdc.visited = 1;
+    }),
+    ("xdc-wizard-exceptions", |s| {
+        scenes::xdc_wizard_design(s);
+        scenes::xdc_wizard_rows(s);
+        s.dialogs.open(views::dialogs::DialogId::Constraints);
+        s.dialogs.xdc.step = views::xdc_wizard::XdcStep::Exceptions;
+        s.dialogs.xdc.visited = 3;
+    }),
+    ("xdc-wizard-review", |s| scenes::xdc_wizard_review(s)),
     ("add-sources", |s| {
         s.dialogs.open(views::dialogs::DialogId::AddSources);
     }),
@@ -1157,7 +1194,16 @@ pub fn poll_all(s: &mut AppState, t: f64, tx: &mut rune::Tx) -> bool {
     views::editor::sync_edit(s);
     let hw_dirty = views::program::poll(s);
     let pblocks_dirty = views::device_floor::sync_from_project(s);
-    runs_dirty || sim_dirty || ila_dirty || hw_dirty || toasts_dirty || pblocks_dirty
+    let jobs_dirty = jobs::poll(s, tx);
+    let diag_dirty = views::editor_diag::poll(s, t, tx);
+    runs_dirty
+        || sim_dirty
+        || ila_dirty
+        || hw_dirty
+        || toasts_dirty
+        || pblocks_dirty
+        || jobs_dirty
+        || diag_dirty
 }
 
 pub fn app_spec() -> AppSpec<AppState> {

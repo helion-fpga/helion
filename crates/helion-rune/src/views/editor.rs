@@ -32,13 +32,13 @@ use crate::theme::VivadoTheme;
 /// Tab strip height.
 const TAB_H: f32 = 26.0;
 /// Breadcrumb row height.
-const PATH_H: f32 = 20.0;
+pub(crate) const PATH_H: f32 = 20.0;
 /// Editor toolbar height.
 const TOOLBAR_H: f32 = 28.0;
 /// Code line height (compact CAD density).
-const LINE_H: f32 = 18.0;
-/// Gutter width: breakpoint slot plus 4-digit line numbers in the 12px mono face.
-const GUTTER_W: f32 = 58.0;
+pub(crate) const LINE_H: f32 = 18.0;
+/// Gutter width: tick column, breakpoint slot and 5-digit line numbers.
+pub(crate) const GUTTER_W: f32 = 66.0;
 
 /// Single-line spans (`hash_comments` = XDC/Tcl, else Verilog/SV). Kept for
 /// line-oriented callers; the editor field lexes the whole buffer with
@@ -57,7 +57,7 @@ pub fn highlight_spans(line: &str, hash_comments: bool, t: &VivadoTheme) -> Vec<
 }
 
 /// Dialect of the active tab.
-fn active_dialect(s: &AppState) -> crate::views::highlight::Dialect {
+pub(crate) fn active_dialect(s: &AppState) -> crate::views::highlight::Dialect {
     crate::views::highlight::Dialect::for_name(
         s.editor
             .tabs
@@ -291,7 +291,7 @@ fn reload_edit(s: &mut AppState) {
 }
 
 /// Caret's line in the live field (0 when the field is empty).
-fn caret_line(s: &AppState) -> usize {
+pub(crate) fn caret_line(s: &AppState) -> usize {
     s.editor.edit.line_of_byte(s.editor.edit.focus)
 }
 
@@ -386,6 +386,46 @@ pub fn reload_active(s: &mut AppState) -> Result<(), String> {
     Ok(())
 }
 
+/// Text of tab `i`'s buffer (flushing the live field first), whether it
+/// owns a primary buffer or is parked.
+pub fn tab_text(s: &mut AppState, i: usize) -> String {
+    flush_edit(s);
+    let Some(name) = s.editor.tabs.get(i).cloned() else {
+        return String::new();
+    };
+    let kind = buffer_kind_for_tab(s, i);
+    if s.editor.owners[slot(kind)].as_deref() == Some(name.as_str()) {
+        let lines = match kind {
+            BufferKind::Xdc => &s.editor.xdc_lines,
+            BufferKind::Tb => &s.editor.tb_lines,
+            BufferKind::Rtl => &s.editor.lines,
+        };
+        return lines.join("\n");
+    }
+    s.editor
+        .parked
+        .get(&name)
+        .map(|b| b.lines.join("\n"))
+        .unwrap_or_default()
+}
+
+/// Replace tab `i`'s lines (one undo step) after an out-of-editor write of
+/// its file, keeping the active tab where it was.
+pub fn replace_tab_lines(s: &mut AppState, i: usize, lines: Vec<String>) {
+    if i >= s.editor.tabs.len() {
+        return;
+    }
+    let back = s.editor.active;
+    select_tab(s, i);
+    flush_edit(s);
+    s.editor.push_undo_active(active_is_xdc(s));
+    *active_lines_mut(s) = lines;
+    reload_edit(s);
+    if back != i {
+        select_tab(s, back);
+    }
+}
+
 /// Open a natively picked file as an editor tab: add/activate the tab, load
 /// its real contents into the routed buffer (undoable, like a reload),
 /// record its disk path so Save writes back to it, and park the cursor.
@@ -462,15 +502,30 @@ fn active_lines(s: &AppState) -> &[String] {
     }
 }
 
-/// Line indices containing `query` (case-sensitive; blank query matches nothing).
-fn find_matches(lines: &[String], query: &str) -> Vec<usize> {
+/// Byte offsets of `query` in `hay` (ASCII case folding when `ignore_case`,
+/// so offsets stay valid in the original text; blank query matches nothing).
+pub(crate) fn match_offsets(hay: &str, query: &str, ignore_case: bool) -> Vec<usize> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    if ignore_case {
+        let h = hay.to_ascii_lowercase();
+        let q = query.to_ascii_lowercase();
+        h.match_indices(&q).map(|(i, _)| i).collect()
+    } else {
+        hay.match_indices(query).map(|(i, _)| i).collect()
+    }
+}
+
+/// Line indices containing `query` (Match case unless `ignore_case`).
+fn find_matches(lines: &[String], query: &str, ignore_case: bool) -> Vec<usize> {
     if query.is_empty() {
         return Vec::new();
     }
     lines
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.contains(query))
+        .filter(|(_, l)| !match_offsets(l, query, ignore_case).is_empty())
         .map(|(n, _)| n)
         .collect()
 }
@@ -480,7 +535,8 @@ fn find_step(s: &mut AppState, forward: bool) {
     sync_edit(s);
     let query = s.editor.find_query.text.clone();
     let lines: Vec<String> = s.editor.edit.text.lines().map(str::to_string).collect();
-    let hits = find_matches(&lines, &query);
+    let ic = s.editor.find_ignore_case;
+    let hits = find_matches(&lines, &query, ic);
     if hits.is_empty() {
         return;
     }
@@ -496,9 +552,13 @@ fn find_step(s: &mut AppState, forward: bool) {
     };
     // Park the caret on the match start so the viewport follows it.
     let byte = s.editor.edit.line_range(line).start;
-    let off = lines[line].find(&query).unwrap_or(0);
+    let off = match_offsets(&lines[line], &query, ic)
+        .first()
+        .copied()
+        .unwrap_or(0);
     s.editor.edit.set_caret(byte + off);
     s.editor.cursor_line = line;
+    crate::views::editor_scale::park_line_edit(s);
 }
 
 /// Close tab `i`, keeping the active tab and cursor on real lines.
@@ -612,7 +672,7 @@ const EDITOR_TOOLS: &[(EditorTool, &str, &'static str)] = &[
 ];
 
 /// Editor icon toolbar: find/save/undo/redo/cut/copy/comment, as in the brief.
-fn editor_toolbar(t: &VivadoTheme) -> El {
+fn editor_toolbar(s: &AppState, t: &VivadoTheme) -> El {
     let mut bar = row()
         .key("editor-toolbar")
         .role("toolbar")
@@ -695,7 +755,7 @@ fn editor_toolbar(t: &VivadoTheme) -> El {
             );
         }
     }
-    bar
+    bar.child(el().grow(1.0)).child(crate::views::editor_gutter::nav_tools(s, t))
 }
 
 /// Copy (or cut) the selection — or the caret line when nothing is
@@ -742,7 +802,7 @@ fn find_bar(s: &AppState, t: &VivadoTheme) -> El {
     let kit = t.kit();
     let query = s.editor.find_query.text.clone();
     let live: Vec<String> = s.editor.edit.text.lines().map(str::to_string).collect();
-    let hits = find_matches(&live, &query);
+    let hits = find_matches(&live, &query, s.editor.find_ignore_case);
     let count = if query.is_empty() {
         "Find in file".to_string()
     } else {
@@ -774,6 +834,7 @@ fn find_bar(s: &AppState, t: &VivadoTheme) -> El {
                 .key("editor-find-input")
                 .w(220.0),
         )
+        .child(crate::views::editor_gutter::match_case_toggle(s, t))
         .child(
             text(count)
                 .font(VivadoTheme::FONT_UI)
@@ -872,14 +933,26 @@ pub fn replace_matches(s: &mut AppState, all: bool) -> usize {
     flush_edit(s);
     let text = active_lines(s).join("\n");
     let caret = s.editor.edit.focus.min(text.len());
+    let hits = match_offsets(&text, &q, s.editor.find_ignore_case);
     let (new_text, count, new_caret) = if all {
-        let n = text.matches(q.as_str()).count();
-        (text.replace(q.as_str(), &r), n, caret.min(text.len()))
+        let mut out = String::with_capacity(text.len());
+        let mut from = 0;
+        for &i in &hits {
+            if i < from {
+                continue;
+            }
+            out.push_str(&text[from..i]);
+            out.push_str(&r);
+            from = i + q.len();
+        }
+        out.push_str(&text[from..]);
+        (out, hits.len(), caret.min(text.len()))
     } else {
-        let at = text[caret..]
-            .find(q.as_str())
-            .map(|i| caret + i)
-            .or_else(|| text.find(q.as_str()));
+        let at = hits
+            .iter()
+            .copied()
+            .find(|i| *i >= caret)
+            .or_else(|| hits.first().copied());
         match at {
             Some(i) => {
                 let mut out = String::with_capacity(text.len());
@@ -1010,6 +1083,7 @@ fn breadcrumb(s: &AppState, t: &VivadoTheme) -> El {
             Dialect::Vhdl => "VHDL",
             Dialect::Tcl => "Tcl / XDC",
         };
+        bar = bar.child(crate::views::editor_gutter::diag_summary(s, t));
         if s.editor.dirty {
             bar = bar.child(
                 text("● unsaved")
@@ -1035,90 +1109,6 @@ fn breadcrumb(s: &AppState, t: &VivadoTheme) -> El {
     bar
 }
 
-/// Width of the breakpoint slot left of the line numbers.
-const BP_SLOT_W: f32 = 16.0;
-
-/// Gutter row: a breakpoint slot (UG900 Source gutter) beside the
-/// right-aligned line number. The slot paints the PC arrow, an armed (filled)
-/// or disabled (hollow) line breakpoint, and taps toggle a line breakpoint
-/// through the debugger; the number parks the caret. Markers only paint when
-/// the viewed tab is the classified debug source (see
-/// [`crate::views::debug::gutter_markers`]), so stale rows never mislead.
-fn gutter_row(
-    n: usize,
-    current: bool,
-    markers: Option<&crate::views::debug::GutterMarkers>,
-    rtl: bool,
-    t: &VivadoTheme,
-) -> El {
-    let line = n + 1;
-    let mono = VivadoTheme::FONT_MONO.mono().lh(LINE_H);
-    let pc = markers.is_some_and(|m| m.pc == Some(line));
-    let armed = markers.is_some_and(|m| m.is_armed(line));
-    let disabled = markers.is_some_and(|m| m.is_disabled(line));
-    let executable = markers.is_some_and(|m| m.is_executable(line));
-    let mut slot = row()
-        .key(format!("editor-bp-slot-{n}"))
-        .w(BP_SLOT_W)
-        .h(LINE_H)
-        .center();
-    if rtl {
-        let help = if armed || disabled {
-            "Remove breakpoint"
-        } else if markers.is_some() && !executable {
-            "Not an executable line"
-        } else {
-            "Toggle breakpoint"
-        };
-        slot = slot
-            .role("button")
-            .label(format!("Breakpoint line {line}"))
-            .help(help)
-            .hover(t.selection)
-            .on_press(move |s: &mut AppState| {
-                crate::views::debug::gutter_toggle(s, n);
-            });
-    }
-    if armed {
-        slot = slot.child(text("●").key(format!("editor-bp-{n}")).font(mono).color(t.fail));
-    } else if disabled {
-        slot = slot.child(
-            text("○")
-                .key(format!("editor-bp-off-{n}"))
-                .font(mono)
-                .color(t.fail),
-        );
-    } else if pc {
-        slot = slot.child(text("▶").key(format!("editor-pc-{n}")).font(mono).color(t.pass));
-    }
-    let number = row()
-        .key(format!("editor-gutter-{n}"))
-        .role("button")
-        .label(format!("Line {line}"))
-        .focusable(true)
-        .grow(1.0)
-        .h(LINE_H)
-        .items_center()
-        .justify_end()
-        .pr(8.0)
-        .hover(t.selection)
-        .on_press(move |s: &mut AppState| {
-            move_cursor_to(s, n);
-        })
-        .child(
-            text(format!("{line}"))
-                .font(mono)
-                .color(if pc && (armed || disabled) {
-                    t.pass
-                } else if current {
-                    t.text
-                } else {
-                    t.text_faint
-                }),
-        );
-    row().w(GUTTER_W).h(LINE_H).child(slot).child(number)
-}
-
 /// Whole-buffer spans for the live field: syntax colors (lexed over the
 /// whole buffer so block comments span lines) plus a wash over every find
 /// match. Byte offsets are relative to the field text.
@@ -1126,10 +1116,8 @@ fn field_spans(s: &AppState, t: &VivadoTheme) -> Vec<Span> {
     let text = &s.editor.edit.text;
     let mut out = crate::views::highlight::highlight(text, active_dialect(s), t);
     let q = &s.editor.find_query.text;
-    if !q.is_empty() {
-        for (i, _) in text.match_indices(q) {
-            out.push(Span::new(i, i + q.len()).bg(t.selection, 1.0));
-        }
+    for i in match_offsets(text, q, s.editor.find_ignore_case) {
+        out.push(Span::new(i, i + q.len()).bg(t.selection, 1.0));
     }
     out
 }
@@ -1145,7 +1133,7 @@ pub fn editor_pane(s: &AppState, t: &VivadoTheme) -> El {
         .border(1.0, t.border)
         .child(tab_strip(s, t))
         .child(breadcrumb(s, t))
-        .child(editor_toolbar(t));
+        .child(editor_toolbar(s, t));
     if s.editor.find_open && !s.editor.tabs.is_empty() {
         pane = pane.child(find_bar(s, t));
     }
@@ -1159,6 +1147,67 @@ pub fn editor_pane(s: &AppState, t: &VivadoTheme) -> El {
             ),
         );
     }
+    // Large files render as virtual rows (bounded gutter + highlighting).
+    let code = if crate::views::editor_scale::is_large(s) {
+        crate::views::editor_scale::large_body(s, t, LINE_H)
+    } else {
+        field_body(s, t)
+    };
+    let mut body = row()
+        .key("editor-body")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(col().grow(1.0).min_w(0.0).h_full().child(code));
+    if s.editor.outline_open {
+        body = body.child(crate::views::editor_outline::outline_strip(s, t));
+    }
+    pane.child(body)
+}
+
+/// Keys the editor handles in either body: save, find, Go to Definition
+/// (F12), next bookmark (F2). True = consumed.
+pub(crate) fn editor_key(s: &mut AppState, key: &rune::KeyEvent, tx: &mut Tx) -> bool {
+    let cmd_char = |c: &str| match &key.key {
+        Key::Text(ch) => key.mods.cmd && ch.eq_ignore_ascii_case(c),
+        Key::Command(ch) => ch.to_string().eq_ignore_ascii_case(c),
+        _ => false,
+    };
+    if cmd_char("s") {
+        let _ = save_active(s);
+        s.editor.cursor_line = caret_line(s);
+        return true;
+    }
+    if cmd_char("f") {
+        s.editor.find_open = true;
+        return true;
+    }
+    match &key.key {
+        Key::Function(12) => {
+            crate::views::editor_outline::goto_definition_ui(s, tx);
+            true
+        }
+        Key::Function(2) => {
+            goto_next_bookmark(s, tx);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Jump to the next bookmark of the active tab (wrapping).
+pub(crate) fn goto_next_bookmark(s: &mut AppState, tx: &mut Tx) {
+    sync_edit(s);
+    match crate::views::editor_diag::next_bookmark(s, caret_line(s)) {
+        Some(line) => crate::views::editor_outline::jump(s, line, Some(tx)),
+        None => s
+            .toasts
+            .push(ToastKind::Info, "No bookmarks", "Toggle one in the gutter or with the toolbar."),
+    }
+}
+
+/// Small-file body: one multi-line field beside the full gutter.
+fn field_body(s: &AppState, t: &VivadoTheme) -> El {
     let is_xdc = active_buffer(s) == BufferKind::Xdc;
     let mono = VivadoTheme::FONT_MONO.mono().lh(LINE_H);
     let count = line_count(s);
@@ -1167,12 +1216,19 @@ pub fn editor_pane(s: &AppState, t: &VivadoTheme) -> El {
     let rtl = !is_xdc;
     let mut gutter = col().w(GUTTER_W);
     for n in 0..count {
-        gutter = gutter.child(gutter_row(n, n == caret, markers.as_ref(), rtl, t));
+        gutter = gutter.child(crate::views::editor_gutter::gutter_row(
+            n,
+            n == caret,
+            markers.as_ref(),
+            rtl,
+            t,
+            s,
+        ));
     }
     let field: &TextEdit = &s.editor.edit;
     // One scroll container over gutter + field (the OG's single-ScrollArea
     // architecture): both ride the same offsets, so rows stay aligned.
-    let code = col()
+    col()
         .key("editor-scroll")
         .w_full()
         .grow(1.0)
@@ -1191,31 +1247,24 @@ pub fn editor_pane(s: &AppState, t: &VivadoTheme) -> El {
                         s.editor.edit.insert("\n");
                         s.editor.dirty = true;
                     })
-                    .on_input_key(
-                        |s: &mut AppState, key: &rune::KeyEvent, _tx: &mut Tx| match &key.key {
-                            Key::Text(ch) if key.mods.cmd && (ch == "s" || ch == "S") => {
-                                let _ = save_active(s);
-                                s.editor.cursor_line = caret_line(s);
-                                true
-                            }
-                            Key::Text(ch) if key.mods.cmd && (ch == "f" || ch == "F") => {
-                                s.editor.find_open = true;
-                                true
-                            }
-                            Key::Text(_) | Key::Enter | Key::Backspace | Key::Delete | Key::Tab => {
-                                s.editor.dirty = true;
-                                false
-                            }
-                            _ => false,
-                        },
-                    )
+                    .on_input_key(|s: &mut AppState, key: &rune::KeyEvent, tx: &mut Tx| {
+                        if editor_key(s, key, tx) {
+                            return true;
+                        }
+                        if matches!(
+                            key.key,
+                            Key::Text(_) | Key::Enter | Key::Backspace | Key::Delete | Key::Tab
+                        ) {
+                            s.editor.dirty = true;
+                        }
+                        false
+                    })
                     .on_input_paste(|s: &mut AppState, _, _| {
                         s.editor.dirty = true;
                         false
                     }),
             ),
-        );
-    pane.child(code)
+        )
 }
 
 #[cfg(test)]
@@ -1719,8 +1768,11 @@ mod tests {
 
     #[test]
     fn xdc_review_content_round_trips_through_disk() {
-        use crate::views::dialogs::{DialogId, XdcStep};
+        use crate::views::dialogs::DialogId;
+        use crate::views::xdc_wizard::XdcStep;
         let mut s = editor_state();
+        crate::scenes::xdc_wizard_design(&mut s);
+        crate::scenes::xdc_wizard_rows(&mut s);
         s.dialogs.open(DialogId::Constraints);
         s.dialogs.xdc.step = XdcStep::Review;
         let path =
@@ -1735,7 +1787,7 @@ mod tests {
                 .editor
                 .xdc_lines
                 .iter()
-                .any(|l| l.starts_with("create_clock -name clk")),
+                .any(|l| l.starts_with("create_clock -period 8.000 -name clk_sys")),
             "finish must append the SDC: {:?}",
             rt.state.editor.xdc_lines
         );
@@ -1746,7 +1798,7 @@ mod tests {
         tap(&mut rt, "editor-tool-save");
         let disk = std::fs::read_to_string(&path).expect("save must write the xdc file");
         assert!(
-            disk.contains("create_clock -name clk -period 10.000"),
+            disk.contains("create_clock -period 8.000 -name clk_sys"),
             "disk must hold the review content: {disk:?}"
         );
         rt.state.editor.xdc_lines.clear();
@@ -1756,7 +1808,7 @@ mod tests {
                 .editor
                 .xdc_lines
                 .iter()
-                .any(|l| l.starts_with("create_clock -name clk")),
+                .any(|l| l.starts_with("create_clock -period 8.000 -name clk_sys")),
             "reload must restore the review content"
         );
         let _ = std::fs::remove_file(&path);

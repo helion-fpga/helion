@@ -348,6 +348,7 @@ fn report_verbs_navigate_and_dump() {
     helion_rune::tcl::eval_command(&mut rt.state, "report_clock_interaction");
     assert_eq!(rt.state.center, CenterPane::Timing);
     helion_rune::tcl::eval_command(&mut rt.state, "report_power");
+    helion_rune::jobs::wait_idle(&mut rt.state);
     assert_eq!(rt.state.center, CenterPane::Reports);
     assert!(
         rt.state
@@ -1096,7 +1097,7 @@ fn xdc_wizard_finish_opens_generated_constraints_in_editor() {
             .editor
             .xdc_lines
             .iter()
-            .any(|l| l.starts_with("create_clock -name clk ")),
+            .any(|l| l.starts_with("create_clock -period 8.000 -name clk_sys")),
         "buffer must hold the generated clock"
     );
     assert!(
@@ -1227,6 +1228,7 @@ fn impl_run_executes_counter_end_to_end_with_real_artifacts() {
     let wns = s.timing.wns_ps;
     s.timing = Default::default();
     helion_rune::tcl::eval_command(&mut s, "report_timing_summary");
+    helion_rune::jobs::wait_idle(&mut s);
     assert_eq!(s.center, CenterPane::Timing);
     assert!(s.timing.has_run, "re-analysis refills timing");
     assert_eq!(
@@ -1235,12 +1237,15 @@ fn impl_run_executes_counter_end_to_end_with_real_artifacts() {
     );
     s.drc = Default::default();
     helion_rune::tcl::eval_command(&mut s, "report_drc");
+    helion_rune::jobs::wait_idle(&mut s);
     assert!(s.drc.has_run && !s.drc.pre_route, "routed DRC re-runs");
     assert!(s.drc.bitgen_allowed.is_some(), "signoff re-evaluates");
     s.power = Default::default();
     helion_rune::tcl::eval_command(&mut s, "report_power");
+    helion_rune::jobs::wait_idle(&mut s);
     assert!(s.power.total_uw > 0, "power re-runs with exact rails");
     helion_rune::tcl::eval_command(&mut s, "report_methodology");
+    helion_rune::jobs::wait_idle(&mut s);
     assert_eq!(s.center, CenterPane::Reports);
     assert!(
         !s.console
@@ -1346,7 +1351,7 @@ fn xdc_wizard_finish_round_trips_review_content_to_disk() {
     tap(&mut rt, "editor-tool-save");
     let disk = std::fs::read_to_string(&path).expect("save must write the xdc file");
     assert!(
-        disk.contains("create_clock -name clk -period 10.000"),
+        disk.contains("create_clock -period 8.000 -name clk_sys"),
         "disk must hold the review content: {disk:?}"
     );
     let _ = std::fs::remove_file(&path);

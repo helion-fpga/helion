@@ -9,21 +9,15 @@
 //! `-flatten_hierarchy*` tooltip), and an `OK/Cancel/Apply/Restore...` footer.
 //! The New Project wizard follows the Vivado page order (name/location, RTL
 //! sources, constraints, default part, summary) and finishes with a real
-//! `create_project` Tcl verb; the Constraints wizard mirrors the
-//! `constraints_wizard::WizardStep` page order (Clocks, Input delays, Output
-//! delays, Exceptions, Review) and generates loadable `create_clock` /
-//! `set_*_delay` / `set_false_path` SDC text.
+//! `create_project` Tcl verb; the Constraints Wizard lives in
+//! [`crate::views::xdc_wizard`] and only mounts through [`push_dialogs`].
 //!
 //! Modals are kit `Dialog` surfaces and every dropdown is a kit `Popover`
 //! anchored to its value box; dismissal, scrim, and focus return belong to
 //! Rune/kit (critique do-not-repeat: no hand-rolled wizard `Area` backdrop,
 //! no `unwrap()` on UI option state, no stringly steps, no hardcoded hex).
 //!
-//! Data shapes mirror `helion-gui` read-only: [`XdcStep`] mirrors
-//! `constraints_wizard::WizardStep`, [`ClockDraft`] mirrors
-//! `constraints_wizard::WizardClock` (`name/port/period_ns/duty_pct`), and the
-//! delay drafts mirror its input/output-delay entries; no `helion-gui` paint
-//! code is copied.
+//! No `helion-gui` paint code is copied.
 //!
 //! Rune API citations (rev `a7f276c3630f85a06a0230295da4d2bd172d8d3b`):
 //! - `crates/rune-kit/src/dialog.rs`: `Dialog::new/open/width/fit/on_close/
@@ -72,7 +66,7 @@ pub enum DialogId {
 }
 
 impl DialogId {
-    fn key(self) -> &'static str {
+    pub(crate) fn key(self) -> &'static str {
         match self {
             DialogId::Settings => "settings",
             DialogId::NewProject => "create",
@@ -163,7 +157,6 @@ pub enum PopId {
     LayoutPreset,
     CreateConstrSet,
     CreatePart,
-    XdcClock,
 }
 
 /// New Project wizard pages, in Vivado order.
@@ -217,63 +210,6 @@ impl CreateStep {
     }
 }
 
-/// Constraints wizard pages, mirroring `constraints_wizard::WizardStep`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum XdcStep {
-    #[default]
-    Clocks,
-    InputDelays,
-    OutputDelays,
-    Exceptions,
-    Review,
-}
-
-impl XdcStep {
-    const ALL: [XdcStep; 5] = [
-        XdcStep::Clocks,
-        XdcStep::InputDelays,
-        XdcStep::OutputDelays,
-        XdcStep::Exceptions,
-        XdcStep::Review,
-    ];
-
-    fn title(self) -> &'static str {
-        match self {
-            XdcStep::Clocks => "Clocks",
-            XdcStep::InputDelays => "Input delays",
-            XdcStep::OutputDelays => "Output delays",
-            XdcStep::Exceptions => "Exceptions",
-            XdcStep::Review => "Review & generate",
-        }
-    }
-
-    fn hint(self) -> &'static str {
-        match self {
-            XdcStep::Clocks => {
-                "Define each clock: the port it enters on, its period, and duty cycle."
-            }
-            XdcStep::InputDelays => {
-                "Constrain input ports relative to a clock (-max for setup, -min for hold)."
-            }
-            XdcStep::OutputDelays => {
-                "Constrain output ports relative to a clock (-max for setup, -min for hold)."
-            }
-            XdcStep::Exceptions => "False paths for nets the clocks do not cover.",
-            XdcStep::Review => "Check the generated SDC, write it, then re-run timing.",
-        }
-    }
-
-    fn next(self) -> Option<XdcStep> {
-        let i = Self::ALL.iter().position(|s| *s == self)?;
-        Self::ALL.get(i + 1).copied()
-    }
-
-    fn prev(self) -> Option<XdcStep> {
-        let i = Self::ALL.iter().position(|s| *s == self)?;
-        i.checked_sub(1).and_then(|p| Self::ALL.get(p).copied())
-    }
-}
-
 const CONSTR_SETS: &[&str] = &["constrs_1 (active)", "constrs_2"];
 const SYNTH_REPORTS: &[&str] = &[
     "Helion Synthesis Default Reports (Helion Synthesis 2021)",
@@ -322,14 +258,6 @@ const PARTS: &[&str] = &["HL10T-C32-1", "HL10M-C128-1", "HL10S-C64-1"];
 /// Index into an option list that can never panic on UI state.
 fn pick<'a>(opts: &[&'a str], i: usize) -> &'a str {
     opts.get(i).copied().unwrap_or("None")
-}
-
-/// Positive finite decimal from a text field, or `None` when unparseable.
-fn positive_num(raw: &str) -> Option<f64> {
-    raw.trim()
-        .parse::<f64>()
-        .ok()
-        .filter(|v| v.is_finite() && *v > 0.0)
 }
 
 /// Settings dialog state: tree selection plus one index per dropdown.
@@ -425,89 +353,6 @@ impl Default for CreateState {
     }
 }
 
-/// One clock draft, mirroring `constraints_wizard::WizardClock` fields.
-#[derive(Clone, Debug)]
-pub struct ClockDraft {
-    pub name: TextEdit,
-    pub port: TextEdit,
-    pub period_ns: TextEdit,
-    pub duty_pct: TextEdit,
-}
-
-impl Default for ClockDraft {
-    fn default() -> Self {
-        Self {
-            name: TextEdit::new("clk"),
-            port: TextEdit::new("clk_pin"),
-            period_ns: TextEdit::new("10.000"),
-            duty_pct: TextEdit::new("50"),
-        }
-    }
-}
-
-/// One port-delay draft (input or output): port, clock, setup/hold ns.
-#[derive(Clone, Debug)]
-pub struct DelayDraft {
-    pub port: TextEdit,
-    pub clock: usize,
-    pub max_ns: TextEdit,
-    pub min_ns: TextEdit,
-}
-
-impl DelayDraft {
-    fn input() -> Self {
-        Self {
-            port: TextEdit::new("rst"),
-            clock: 0,
-            max_ns: TextEdit::new("2.000"),
-            min_ns: TextEdit::new("0.500"),
-        }
-    }
-
-    fn output() -> Self {
-        Self {
-            port: TextEdit::new("led_pins[5]"),
-            clock: 0,
-            max_ns: TextEdit::new("2.000"),
-            min_ns: TextEdit::new("0.500"),
-        }
-    }
-}
-
-/// One false-path draft.
-#[derive(Clone, Debug, Default)]
-pub struct FalsePathDraft {
-    pub from: TextEdit,
-    pub to: TextEdit,
-}
-
-/// Constraints wizard state.
-#[derive(Clone, Debug)]
-pub struct XdcState {
-    pub step: XdcStep,
-    pub clock: ClockDraft,
-    pub input: DelayDraft,
-    pub output: DelayDraft,
-    pub false_path: FalsePathDraft,
-    pub error: Option<String>,
-}
-
-impl Default for XdcState {
-    fn default() -> Self {
-        Self {
-            step: XdcStep::Clocks,
-            clock: ClockDraft::default(),
-            input: DelayDraft::input(),
-            output: DelayDraft::output(),
-            false_path: FalsePathDraft {
-                from: TextEdit::new("sw[0]"),
-                to: TextEdit::new("sw[1]"),
-            },
-            error: None,
-        }
-    }
-}
-
 /// All dialog/wizard UI state. Composed into [`AppState`], never a god-model.
 #[derive(Clone, Debug, Default)]
 pub struct DialogState {
@@ -518,7 +363,8 @@ pub struct DialogState {
     /// `FlowState`/project); Cancel and scrim-dismiss revert the draft back.
     pub committed: SettingsState,
     pub create: CreateState,
-    pub xdc: XdcState,
+    /// Constraints Wizard drafts, validation and write/re-run outcome.
+    pub xdc: crate::views::xdc_wizard::XdcWizard,
     pub add_sources: AddSourcesState,
 }
 
@@ -542,11 +388,11 @@ impl DialogState {
     }
 }
 
-fn ui_label(content: String, t: &VivadoTheme) -> El {
+pub(crate) fn ui_label(content: String, t: &VivadoTheme) -> El {
     text(content).font(VivadoTheme::FONT_UI).color(t.text)
 }
 
-fn dim_label(content: &str, t: &VivadoTheme) -> El {
+pub(crate) fn dim_label(content: &str, t: &VivadoTheme) -> El {
     text(content).font(VivadoTheme::FONT_UI).color(t.text_dim)
 }
 
@@ -618,7 +464,7 @@ fn dots_btn(
         .child(ui_label("...".into(), t))
 }
 
-fn dlg_button(
+pub(crate) fn dlg_button(
     key: impl Into<String>,
     label: &'static str,
     primary: bool,
@@ -638,7 +484,7 @@ fn dlg_button(
 }
 
 /// A dialog footer button that raises a native dialog (Save pickers, ...).
-fn dlg_button_tx(
+pub(crate) fn dlg_button_tx(
     key: impl Into<String>,
     label: &'static str,
     primary: bool,
@@ -1614,7 +1460,7 @@ fn wizard_files(
 }
 
 /// One wizard-rail row: step number, title, current highlight.
-fn wiz_rail_row(
+pub(crate) fn wiz_rail_row(
     key: String,
     index: usize,
     title: &'static str,
@@ -1652,7 +1498,7 @@ fn wiz_rail_row(
 }
 
 /// Wizard footer: Back / Next (or Finish) / Cancel plus the error line.
-fn wiz_footer(
+pub(crate) fn wiz_footer(
     key_prefix: &'static str,
     has_prev: bool,
     is_last: bool,
@@ -1968,455 +1814,6 @@ fn create_dialog(
         .build(kit, layer);
 }
 
-/// Clock choices for the delay pages: the draft clock plus the raw pin.
-fn xdc_clock_opts(x: &XdcState) -> Vec<(usize, String)> {
-    let mut opts = vec![(0usize, "clk_pin".to_string())];
-    let name = x.clock.name.text.trim();
-    if !name.is_empty() && name != "clk_pin" {
-        opts.push((1, name.to_string()));
-    }
-    opts
-}
-
-fn xdc_clock_name(x: &XdcState, clock: usize) -> String {
-    xdc_clock_opts(x)
-        .iter()
-        .find(|(i, _)| *i == clock)
-        .map(|(_, n)| n.clone())
-        .unwrap_or_else(|| "clk_pin".into())
-}
-
-/// Constraints validation: names/ports non-empty, numerics parse, duty sane.
-fn xdc_error(x: &XdcState) -> Option<String> {
-    if x.clock.name.text.trim().is_empty() {
-        return Some("Clock name is required.".into());
-    }
-    if x.clock.port.text.trim().is_empty() {
-        return Some("Clock port is required.".into());
-    }
-    let period = positive_num(&x.clock.period_ns.text);
-    if period.is_none() {
-        return Some("Clock period must be a positive number of ns.".into());
-    }
-    match x.clock.duty_pct.text.trim().parse::<f64>().ok() {
-        Some(d) if d.is_finite() && d > 0.0 && d < 100.0 => {}
-        _ => return Some("Duty cycle must be between 0 and 100.".into()),
-    }
-    for (port, max, min, what) in [
-        (&x.input.port, &x.input.max_ns, &x.input.min_ns, "Input"),
-        (&x.output.port, &x.output.max_ns, &x.output.min_ns, "Output"),
-    ] {
-        if port.text.trim().is_empty() {
-            return Some(format!("{what} port is required."));
-        }
-        if positive_num(&max.text).is_none() {
-            return Some(format!(
-                "{what} -max delay must be a positive number of ns."
-            ));
-        }
-        if positive_num(&min.text).is_none() {
-            return Some(format!(
-                "{what} -min delay must be a positive number of ns."
-            ));
-        }
-    }
-    if x.false_path.from.text.trim().is_empty() || x.false_path.to.text.trim().is_empty() {
-        return Some("False path endpoints are required.".into());
-    }
-    None
-}
-
-/// The SDC text the wizard writes. Called after [`xdc_error`] passes, so
-/// unparseable numbers fall back to `0.000` instead of panicking.
-fn sdc_lines(x: &XdcState) -> Vec<String> {
-    let period = positive_num(&x.clock.period_ns.text).unwrap_or(0.0);
-    let duty = x.clock.duty_pct.text.trim().parse::<f64>().unwrap_or(0.0);
-    let edge = period * duty / 100.0;
-    vec![
-        format!(
-            "create_clock -name {} -period {:.3} -waveform {{0 {:.3}}} [get_ports {}]",
-            x.clock.name.text.trim(),
-            period,
-            edge,
-            x.clock.port.text.trim()
-        ),
-        format!(
-            "set_input_delay -clock [get_clocks {}] -max {} [get_ports {}]",
-            xdc_clock_name(x, x.input.clock),
-            x.input.max_ns.text.trim(),
-            x.input.port.text.trim()
-        ),
-        format!(
-            "set_input_delay -clock [get_clocks {}] -min {} -add_delay [get_ports {}]",
-            xdc_clock_name(x, x.input.clock),
-            x.input.min_ns.text.trim(),
-            x.input.port.text.trim()
-        ),
-        format!(
-            "set_output_delay -clock [get_clocks {}] -max {} [get_ports {}]",
-            xdc_clock_name(x, x.output.clock),
-            x.output.max_ns.text.trim(),
-            x.output.port.text.trim()
-        ),
-        format!(
-            "set_output_delay -clock [get_clocks {}] -min {} -add_delay [get_ports {}]",
-            xdc_clock_name(x, x.output.clock),
-            x.output.min_ns.text.trim(),
-            x.output.port.text.trim()
-        ),
-        format!(
-            "set_false_path -from [get_ports {}] -to [get_ports {}]",
-            x.false_path.from.text.trim(),
-            x.false_path.to.text.trim()
-        ),
-    ]
-}
-
-/// Finish the Constraints wizard: append the generated SDC to the XDC editor
-/// buffer (undoable, marks it dirty) and open the constraints file on it.
-fn finish_xdc(s: &mut AppState) {
-    if let Some(msg) = xdc_error(&s.dialogs.xdc) {
-        s.dialogs.xdc.error = Some(msg);
-        return;
-    }
-    let sdc = sdc_lines(&s.dialogs.xdc);
-    s.editor.push_undo_xdc();
-    if !s.editor.xdc_lines.is_empty() {
-        s.editor.xdc_lines.push(String::new());
-    }
-    s.editor
-        .xdc_lines
-        .push("# Generated by Constraints Wizard".into());
-    s.editor.xdc_lines.extend(sdc.iter().cloned());
-    if let Some(i) = s.editor.tabs.iter().position(|t| t.ends_with(".xdc")) {
-        s.editor.active = i;
-    } else {
-        s.editor.tabs.push("project1.xdc".into());
-        s.editor.active = s.editor.tabs.len() - 1;
-    }
-    s.editor.cursor_line = s.editor.xdc_lines.len().saturating_sub(1);
-    s.navigate(crate::state::CenterPane::Editor);
-    for line in sdc {
-        echo(s, line);
-    }
-    echo(s, "write_xdc constrs_1/project1.xdc".into());
-    s.dialogs.close();
-}
-
-fn delay_fields(
-    prefix: &'static str,
-    port_key: &'static str,
-    draft: &DelayDraft,
-    x: &XdcState,
-    pop: Option<PopId>,
-    layer: &mut Vec<El>,
-    t: &VivadoTheme,
-    kit: &Kit,
-    port_edit: impl for<'a> Fn(&'a mut AppState) -> &'a mut TextEdit + 'static,
-    max_edit: impl for<'a> Fn(&'a mut AppState) -> &'a mut TextEdit + 'static,
-    min_edit: impl for<'a> Fn(&'a mut AppState) -> &'a mut TextEdit + 'static,
-    clock_pick: impl Fn(&mut AppState, usize) + Clone + 'static,
-) -> Vec<El> {
-    let opts = xdc_clock_opts(x);
-    vec![
-        field_row(
-            "Port:",
-            WIZ_LABEL_W,
-            text_field(port_key, &draft.port, "rst", kit, port_edit),
-            t,
-        ),
-        field_row(
-            "Clock:",
-            WIZ_LABEL_W,
-            pop_select(
-                layer,
-                kit,
-                t,
-                prefix,
-                "Delay clock",
-                PopId::XdcClock,
-                &xdc_clock_name(x, draft.clock),
-                &opts,
-                pop == Some(PopId::XdcClock),
-                clock_pick,
-            )
-            .grow(1.0)
-            .min_w(0.0),
-            t,
-        ),
-        field_row(
-            "-max (ns):",
-            WIZ_LABEL_W,
-            text_field(
-                format!("{prefix}-max"),
-                &draft.max_ns,
-                "2.000",
-                kit,
-                max_edit,
-            ),
-            t,
-        ),
-        field_row(
-            "-min (ns):",
-            WIZ_LABEL_W,
-            text_field(
-                format!("{prefix}-min"),
-                &draft.min_ns,
-                "0.500",
-                kit,
-                min_edit,
-            ),
-            t,
-        ),
-    ]
-}
-
-fn xdc_page(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme, kit: &Kit) -> El {
-    let x = &s.dialogs.xdc;
-    let pop = s.dialogs.pop;
-    let mut page = col()
-        .key("xdc-body")
-        .w_full()
-        .gap(4.0)
-        .child(
-            text(x.step.title())
-                .font(VivadoTheme::FONT_TITLE)
-                .color(t.text),
-        )
-        .child(dim_label(x.step.hint(), t));
-    match x.step {
-        XdcStep::Clocks => {
-            page = page
-                .child(field_row(
-                    "Clock name:",
-                    WIZ_LABEL_W,
-                    text_field(
-                        "xdc-clock-name",
-                        &x.clock.name,
-                        "clk",
-                        kit,
-                        |s: &mut AppState| &mut s.dialogs.xdc.clock.name,
-                    ),
-                    t,
-                ))
-                .child(field_row(
-                    "Port:",
-                    WIZ_LABEL_W,
-                    text_field(
-                        "xdc-clock-port",
-                        &x.clock.port,
-                        "clk_pin",
-                        kit,
-                        |s: &mut AppState| &mut s.dialogs.xdc.clock.port,
-                    ),
-                    t,
-                ))
-                .child(field_row(
-                    "Period (ns):",
-                    WIZ_LABEL_W,
-                    text_field(
-                        "xdc-clock-period",
-                        &x.clock.period_ns,
-                        "10.000",
-                        kit,
-                        |s: &mut AppState| &mut s.dialogs.xdc.clock.period_ns,
-                    ),
-                    t,
-                ))
-                .child(field_row(
-                    "Duty (%):",
-                    WIZ_LABEL_W,
-                    text_field(
-                        "xdc-clock-duty",
-                        &x.clock.duty_pct,
-                        "50",
-                        kit,
-                        |s: &mut AppState| &mut s.dialogs.xdc.clock.duty_pct,
-                    ),
-                    t,
-                ));
-        }
-        XdcStep::InputDelays => {
-            for f in delay_fields(
-                "xdc-in",
-                "xdc-in-port",
-                &x.input,
-                x,
-                pop,
-                layer,
-                t,
-                kit,
-                |s: &mut AppState| &mut s.dialogs.xdc.input.port,
-                |s: &mut AppState| &mut s.dialogs.xdc.input.max_ns,
-                |s: &mut AppState| &mut s.dialogs.xdc.input.min_ns,
-                |s: &mut AppState, i| s.dialogs.xdc.input.clock = i,
-            ) {
-                page = page.child(f);
-            }
-        }
-        XdcStep::OutputDelays => {
-            for f in delay_fields(
-                "xdc-out",
-                "xdc-out-port",
-                &x.output,
-                x,
-                pop,
-                layer,
-                t,
-                kit,
-                |s: &mut AppState| &mut s.dialogs.xdc.output.port,
-                |s: &mut AppState| &mut s.dialogs.xdc.output.max_ns,
-                |s: &mut AppState| &mut s.dialogs.xdc.output.min_ns,
-                |s: &mut AppState, i| s.dialogs.xdc.output.clock = i,
-            ) {
-                page = page.child(f);
-            }
-        }
-        XdcStep::Exceptions => {
-            page = page
-                .child(field_row(
-                    "From:",
-                    WIZ_LABEL_W,
-                    text_field(
-                        "xdc-fp-from",
-                        &x.false_path.from,
-                        "sw[0]",
-                        kit,
-                        |s: &mut AppState| &mut s.dialogs.xdc.false_path.from,
-                    ),
-                    t,
-                ))
-                .child(field_row(
-                    "To:",
-                    WIZ_LABEL_W,
-                    text_field(
-                        "xdc-fp-to",
-                        &x.false_path.to,
-                        "sw[1]",
-                        kit,
-                        |s: &mut AppState| &mut s.dialogs.xdc.false_path.to,
-                    ),
-                    t,
-                ));
-        }
-        XdcStep::Review => {
-            let mut lines = col().gap(0.0);
-            for (i, line) in sdc_lines(x).iter().enumerate() {
-                lines = lines.child(
-                    text(line.clone())
-                        .key(format!("xdc-sdc-{i}"))
-                        .font(VivadoTheme::FONT_MONO.mono())
-                        .color(t.text),
-                );
-            }
-            page = page.child(
-                row()
-                    .key("xdc-export-row")
-                    .w_full()
-                    .h(28.0)
-                    .items_center()
-                    .gap(8.0)
-                    .child(
-                        dim_label(
-                            "Write the SDC to disk, or Finish to load it into the editor.",
-                            t,
-                        )
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .truncate(),
-                    )
-                    .child(dlg_button_tx(
-                        "xdc-export",
-                        "Export XDC...",
-                        false,
-                        kit,
-                        |s: &mut AppState, tx: &mut Tx| {
-                            let lines = sdc_lines(&s.dialogs.xdc);
-                            crate::pickers::export_xdc(tx, lines);
-                        },
-                    )),
-            );
-            page = page.child(
-                el().key("xdc-sdc")
-                    .w_full()
-                    .padding(8.0)
-                    .fill(t.panel_bg)
-                    .border(1.0, t.border)
-                    .scroll_x()
-                    .child(lines),
-            );
-        }
-    }
-    page
-}
-
-fn xdc_dialog(layer: &mut Vec<El>, pops: &mut Vec<El>, s: &AppState, t: &VivadoTheme, kit: &Kit) {
-    let step = s.dialogs.xdc.step;
-    let at = XdcStep::ALL.iter().position(|x| *x == step).unwrap_or(0);
-    let mut rail = col()
-        .key("xdc-rail")
-        .w(RAIL_W)
-        .gap(2.0)
-        .py(8.0)
-        .fill(t.rail_bg);
-    for (i, st) in XdcStep::ALL.iter().enumerate() {
-        rail = rail.child(wiz_rail_row(
-            format!("xdc-rail-{i}"),
-            i,
-            st.title(),
-            *st == step,
-            i < at,
-            t,
-            move |s: &mut AppState| s.dialogs.xdc.step = *st,
-        ));
-    }
-    let err = s.dialogs.xdc.error.clone();
-    let body = col()
-        .w_full()
-        .child(
-            row()
-                .key("xdc-split")
-                .w_full()
-                .child(rail)
-                .child(el().w(1.0).a11y_hidden().fill(t.border))
-                .child(
-                    el().grow(1.0)
-                        .min_w(0.0)
-                        .padding(8.0)
-                        .child(xdc_page(pops, s, t, kit)),
-                ),
-        )
-        .child(el().w_full().h(1.0).fill(t.border_light).a11y_hidden())
-        .child(wiz_footer(
-            "xdc",
-            step.prev().is_some(),
-            step.next().is_none(),
-            err.as_deref(),
-            t,
-            kit,
-            |s: &mut AppState| {
-                if let Some(p) = s.dialogs.xdc.step.prev() {
-                    s.dialogs.xdc.step = p;
-                    s.dialogs.xdc.error = None;
-                }
-            },
-            |s: &mut AppState| {
-                if let Some(n) = s.dialogs.xdc.step.next() {
-                    s.dialogs.xdc.step = n;
-                    s.dialogs.xdc.error = None;
-                }
-            },
-            finish_xdc,
-        ));
-    Dialog::new(DialogId::Constraints.key(), "Constraints Wizard")
-        .open(true)
-        .width(680.0)
-        .fit()
-        .on_close(|s: &mut AppState| s.dialogs.close())
-        .child(body)
-        .build(kit, layer);
-}
-
 /// Add Sources dialog: the Vivado file-type picker (RTL, constraints,
 /// simulation). The kind rows select the picker's filter; Add Files raises a
 /// REAL native dialog and lists each chosen path; the Add footer echoes the
@@ -2564,7 +1961,9 @@ pub fn push_dialogs(layer: &mut Vec<El>, s: &AppState, t: &VivadoTheme) {
     match id {
         DialogId::Settings => settings_dialog(layer, &mut pops, s, t, &kit),
         DialogId::NewProject => create_dialog(layer, &mut pops, s, t, &kit),
-        DialogId::Constraints => xdc_dialog(layer, &mut pops, s, t, &kit),
+        DialogId::Constraints => {
+            crate::views::xdc_wizard::xdc_dialog(layer, &mut pops, s, t, &kit)
+        }
         DialogId::AddSources => add_sources_dialog(s, t, &kit, layer),
     }
     layer.extend(pops);
@@ -2716,47 +2115,6 @@ mod tests {
     }
 
     #[test]
-    fn xdc_review_shows_sdc_and_finish_writes_xdc() {
-        let mut rt = rt_with(|s| {
-            s.dialogs.open(DialogId::Constraints);
-            s.dialogs.xdc.step = XdcStep::Review;
-        });
-        assert!(rt.find("xdc-sdc").is_some());
-        assert!(rt.find("xdc-sdc-0").is_some());
-        tap(&mut rt, "xdc-finish");
-        assert_eq!(rt.state.dialogs.open, None);
-        let lines: Vec<&str> = rt
-            .state
-            .console
-            .lines
-            .iter()
-            .map(|l| l.text.as_str())
-            .collect();
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.starts_with("create_clock -name clk -period 10.000")),
-            "sdc: {lines:?}"
-        );
-        assert!(
-            lines.iter().any(|l| l.starts_with("write_xdc ")),
-            "sdc: {lines:?}"
-        );
-    }
-
-    #[test]
-    fn xdc_rejects_a_bad_period_without_panicking() {
-        let mut rt = rt_with(|s| {
-            s.dialogs.open(DialogId::Constraints);
-            s.dialogs.xdc.clock.period_ns = TextEdit::new("nope");
-            s.dialogs.xdc.step = XdcStep::Review;
-        });
-        tap(&mut rt, "xdc-finish");
-        assert_eq!(rt.state.dialogs.open, Some(DialogId::Constraints));
-        assert!(rt.find("xdc-error").is_some());
-    }
-
-    #[test]
     fn settings_apply_persists_strategies_and_stays_open() {
         let mut rt = open(DialogId::Settings);
         tap(&mut rt, "settings-strategy-box");
@@ -2858,47 +2216,6 @@ mod tests {
         assert!(
             rt.state.nav_back.is_empty(),
             "new project clears nav history"
-        );
-    }
-
-    #[test]
-    fn xdc_finish_appends_sdc_to_the_editor_buffer_and_opens_it() {
-        use crate::state::CenterPane;
-        let mut rt = rt_with(|s| {
-            s.dialogs.open(DialogId::Constraints);
-            s.dialogs.xdc.step = XdcStep::Review;
-        });
-        let before = rt.state.editor.xdc_lines.len();
-        tap(&mut rt, "xdc-finish");
-        assert_eq!(rt.state.dialogs.open, None);
-        let after = &rt.state.editor.xdc_lines;
-        assert!(after.len() > before, "finish must grow the XDC buffer");
-        assert!(
-            after
-                .iter()
-                .any(|l| l.starts_with("create_clock -name clk -period 10.000")),
-            "buffer must hold the generated clock: {after:?}"
-        );
-        assert!(
-            after.iter().any(|l| l.starts_with("set_false_path ")),
-            "buffer must hold the exception"
-        );
-        assert_eq!(
-            rt.state.center,
-            CenterPane::Editor,
-            "finish opens the constraints file"
-        );
-        assert!(
-            rt.state
-                .editor
-                .tabs
-                .get(rt.state.editor.active)
-                .is_some_and(|t| t.ends_with(".xdc")),
-            "the XDC tab must be active"
-        );
-        assert!(
-            rt.state.editor.dirty,
-            "generated text marks the buffer dirty"
         );
     }
 
@@ -3071,67 +2388,6 @@ mod tests {
                 .iter()
                 .any(|l| l.text.contains("add_files") && l.text.contains("uart_rx.v")),
             "Add must echo the picked files"
-        );
-    }
-
-    #[test]
-    fn xdc_export_writes_the_generated_sdc_to_the_chosen_path() {
-        use rune::FileDialogKind;
-        let mut rt = rt_with(|s| {
-            s.dialogs.open(DialogId::Constraints);
-            s.dialogs.xdc.step = XdcStep::Review;
-        });
-        tap(&mut rt, "xdc-export");
-        let (kind, opts) = rt.file_dialog().expect("Export must raise a save dialog");
-        assert_eq!(kind, FileDialogKind::Save);
-        assert!(
-            opts.filters
-                .iter()
-                .any(|(_, exts)| exts.contains(&"xdc".to_string())),
-            "save must filter XDC: {:?}",
-            opts.filters
-        );
-        let path = std::env::temp_dir().join(format!("helion-pick-{}-gen.xdc", std::process::id()));
-        rt.resolve_file_dialog(Some(path.clone()))
-            .expect("answer the dialog");
-        rt.frame(1.0 / 60.0);
-        let disk = std::fs::read_to_string(&path).expect("export must write the file");
-        assert!(
-            disk.contains("create_clock"),
-            "exported XDC must hold the SDC: {disk}"
-        );
-        assert!(
-            rt.state
-                .console
-                .lines
-                .iter()
-                .any(|l| l.text.starts_with("write_xdc ")),
-            "export must echo write_xdc"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn xdc_export_cancel_writes_nothing() {
-        let path =
-            std::env::temp_dir().join(format!("helion-pick-{}-cancelled.xdc", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let mut rt = rt_with(|s| {
-            s.dialogs.open(DialogId::Constraints);
-            s.dialogs.xdc.step = XdcStep::Review;
-        });
-        tap(&mut rt, "xdc-export");
-        assert!(rt.file_dialog().is_some(), "dialog must be open to cancel");
-        rt.resolve_file_dialog(None).expect("cancel the dialog");
-        rt.frame(1.0 / 60.0);
-        assert!(!path.exists(), "cancel must not create the file");
-        assert!(
-            !rt.state
-                .console
-                .lines
-                .iter()
-                .any(|l| l.text.starts_with("write_xdc ")),
-            "cancel must not echo write_xdc"
         );
     }
 
