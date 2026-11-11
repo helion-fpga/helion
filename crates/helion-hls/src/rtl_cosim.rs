@@ -137,7 +137,16 @@ struct Mem {
 
 /// Run C/RTL co-simulation of `source` on `vectors` (see the module docs).
 pub fn run_rtl_cosim(source: &str, vectors: &[CosimTestVector]) -> Result<CosimReport, String> {
-    let hls = crate::hls_compile(source)?;
+    run_rtl_cosim_with(source, &crate::HlsConfig::default(), vectors)
+}
+
+/// [`run_rtl_cosim`] with an explicit synthesis configuration (clock, part).
+pub fn run_rtl_cosim_with(
+    source: &str,
+    config: &crate::HlsConfig,
+    vectors: &[CosimTestVector],
+) -> Result<CosimReport, String> {
+    let hls = crate::hls_compile_with_config(source, config)?;
     let (top, ports) = header_ports(&hls.sv)?;
     let mut netlist = hls.design.clone();
     bit_blast_ports(&mut netlist);
