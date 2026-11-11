@@ -1,6 +1,6 @@
 //! Device floorplanning: the Pblocks table (old `paint_pblocks_table`,
 //! `helion-ide.rs:5742`) and the `create_pblock` / `resize_pblock` /
-//! `add_cells_to_pblock` / `get_pblocks` verbs.
+//! `add_cells_to_pblock` / `delete_pblocks` / `get_pblocks` verbs.
 //!
 //! Pblocks are helion-proj [`helion_proj::PrjPblock`]s, parsed by the real
 //! `.prj` parser (`helion_proj::load_prj`, the same round trip helion-proj's
@@ -24,6 +24,7 @@ pub const VERBS: &[&str] = &[
     "create_pblock",
     "resize_pblock",
     "add_cells_to_pblock",
+    "delete_pblocks",
     "get_pblocks",
     "report_pblocks",
     "select_pblock",
@@ -31,15 +32,18 @@ pub const VERBS: &[&str] = &[
 ];
 
 /// Open project `.prj` the pblocks persist to, if a project file is open.
-fn project_prj(s: &AppState) -> Option<&Path> {
+pub fn project_prj(s: &AppState) -> Option<&Path> {
     s.runs
         .source
         .as_deref()
         .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("prj")) && p.is_file())
 }
 
-/// Load the open project's pblocks once per project (wired into the app
-/// poll). Returns whether state changed.
+/// Load the open project's floorplan state once per project (wired into
+/// the app poll): its pblocks, its DFX partitions
+/// ([`crate::views::dfx::load_from_project`]) and any saved ECO session
+/// ([`crate::views::eco::restore_for_project`]). Returns whether state
+/// changed.
 pub fn sync_from_project(s: &mut AppState) -> bool {
     let cur: Option<PathBuf> = project_prj(s).map(Path::to_path_buf);
     if cur == s.device.pblocks_from {
@@ -49,6 +53,7 @@ pub fn sync_from_project(s: &mut AppState) -> bool {
     let Some(path) = cur else {
         return false;
     };
+    let restored = crate::views::eco::restore_for_project(s, &path);
     match std::fs::read_to_string(&path)
         .map_err(|e| e.to_string())
         .and_then(|t| crate::pickers::load_prj_lenient(&t))
@@ -56,10 +61,73 @@ pub fn sync_from_project(s: &mut AppState) -> bool {
         Ok(prj) => {
             s.device.pblocks = prj.pblocks;
             s.device.pblock_sel = None;
+            crate::views::dfx::load_from_project(s, prj.partitions, &path);
             true
         }
-        Err(_) => false,
+        Err(_) => restored,
     }
+}
+
+/// Append one verb line to the open project's `.prj` (when one is open).
+/// `Ok(Some(path))` when saved.
+pub fn persist_line(s: &AppState, line: &str) -> Result<Option<PathBuf>, String> {
+    let Some(path) = project_prj(s).map(Path::to_path_buf) else {
+        return Ok(None);
+    };
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| writeln!(f, "{line}"))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Some(path))
+}
+
+/// Pblock names a `delete_pblocks` argument list names
+/// (`[get_pblocks a]`, `{a b}`, `-hier` skipped).
+fn named_pblocks(args: &[String]) -> Vec<String> {
+    args.iter()
+        .flat_map(|a| a.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+        .map(|a| a.trim_matches(|c: char| "{}[]".contains(c)).to_string())
+        .filter(|a| !a.is_empty() && !a.starts_with('-') && a != "get_pblocks")
+        .collect()
+}
+
+/// `delete_pblocks name…`: drop the pblocks (their members are released,
+/// so placement and `PBLK-1` stop constraining them), unbind DFX
+/// partitions on them, and persist the line to the open `.prj`.
+fn delete_pblocks(s: &mut AppState, args: &[String]) -> Result<String, String> {
+    let names = named_pblocks(args);
+    if names.is_empty() {
+        return Err("delete_pblocks: need a pblock name".into());
+    }
+    if let Some(n) = names.iter().find(|n| !s.device.pblocks.iter().any(|p| &p.name == *n)) {
+        return Err(format!("delete_pblocks: no pblock {n}"));
+    }
+    let line = format!("delete_pblocks {}", names.join(" "));
+    let next = apply_line(&s.device.pblocks, &line)?;
+    let released: usize = s
+        .device
+        .pblocks
+        .iter()
+        .filter(|p| names.contains(&p.name))
+        .map(|p| p.cells.len())
+        .sum();
+    s.device.pblocks = next;
+    if s.device.pblock_sel.as_ref().is_some_and(|n| names.contains(n)) {
+        s.device.pblock_sel = None;
+    }
+    for n in &names {
+        crate::views::dfx::release_pblock(s, n);
+    }
+    s.device.bottom = DeviceBottom::Pblocks;
+    let mut out = format!("{line} released={released}");
+    match persist_line(s, &line) {
+        Ok(Some(path)) => out.push_str(&format!(" (saved to {})", path.display())),
+        Ok(None) => {}
+        Err(e) => return Err(format!("delete_pblocks: applied but not saved: {e}")),
+    }
+    Ok(out)
 }
 
 /// Apply one pblock verb line through the real `.prj` parser.
@@ -159,13 +227,17 @@ pub fn tcl_verb(s: &mut AppState, name: &str, args: &[String]) -> Result<String,
         .collect::<Vec<_>>()
         .join(" ");
     match name {
-        "get_pblocks" => Ok(s
-            .device
-            .pblocks
-            .iter()
-            .map(|p| p.name.clone())
-            .collect::<Vec<_>>()
-            .join(" ")),
+        "get_pblocks" => {
+            // Patterns (`get_pblocks pb*`) filter; none lists every pblock.
+            let pats = named_pblocks(args);
+            Ok(s.device
+                .pblocks
+                .iter()
+                .filter(|p| pats.is_empty() || pats.iter().any(|g| helion_proj::tcl_glob_match(g, &p.name)))
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>()
+                .join(" "))
+        }
         "report_pblocks" => {
             s.device.bottom = DeviceBottom::Pblocks;
             s.navigate(CenterPane::Device);
@@ -185,6 +257,7 @@ pub fn tcl_verb(s: &mut AppState, name: &str, args: &[String]) -> Result<String,
             s.navigate(CenterPane::Device);
             Ok(crate::views::device_layers::fit(s))
         }
+        "delete_pblocks" => delete_pblocks(s, args),
         "create_pblock" | "resize_pblock" | "add_cells_to_pblock" => {
             if name != "create_pblock" {
                 let target = args
@@ -227,16 +300,10 @@ pub fn tcl_verb(s: &mut AppState, name: &str, args: &[String]) -> Result<String,
             }
             s.device.bottom = DeviceBottom::Pblocks;
             let mut out = line.clone();
-            if let Some(path) = project_prj(s).map(Path::to_path_buf) {
-                use std::io::Write;
-                let res = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&path)
-                    .and_then(|mut f| writeln!(f, "{line}"));
-                match res {
-                    Ok(()) => out.push_str(&format!(" (saved to {})", path.display())),
-                    Err(e) => return Err(format!("{name}: applied but not saved: {e}")),
-                }
+            match persist_line(s, &line) {
+                Ok(Some(path)) => out.push_str(&format!(" (saved to {})", path.display())),
+                Ok(None) => {}
+                Err(e) => return Err(format!("{name}: applied but not saved: {e}")),
             }
             if let Some(pb) = touched.and_then(|n| s.device.pblocks.iter().find(|p| p.name == n)) {
                 out.push_str(&format!(
@@ -267,6 +334,11 @@ const COLS: [ColSpec; 5] = [
     ColSpec::num("Placed in", 64.0),
 ];
 
+/// Why Delete is unavailable (`None` = enabled).
+pub fn delete_reason(s: &AppState) -> Option<&'static str> {
+    s.device.pblock_sel.is_none().then_some("Select a pblock row to delete")
+}
+
 /// Next free `pblock_N` name.
 fn next_name(s: &AppState) -> String {
     (0..)
@@ -275,7 +347,7 @@ fn next_name(s: &AppState) -> String {
         .unwrap_or_else(|| "pblock".into())
 }
 
-/// Pblocks table: toolbar (Create, Add Selected Cell, Fit to Cells) over
+/// Pblocks table: toolbar (Create, Add Selected Cell, Fit to Cells, Delete) over
 /// Name / Range / Cells / Sites / Placed-in rows.
 pub fn pblocks_table(s: &AppState, t: &VivadoTheme) -> El {
     let (dev, _) = crate::live::live_device(s);
@@ -308,6 +380,8 @@ pub fn pblocks_table(s: &AppState, t: &VivadoTheme) -> El {
         (_, None) => Some("No member cell is placed on a CLB"),
         _ => None,
     };
+    let del_reason = delete_reason(s);
+    let d_pb = sel_pb.clone();
     let name = next_name(s);
     let seed = sel_cell.clone();
     let (a_pb, a_cell) = (sel_pb.clone(), sel_cell.clone());
@@ -360,6 +434,17 @@ pub fn pblocks_table(s: &AppState, t: &VivadoTheme) -> El {
             move |s: &mut AppState| {
                 if let (Some(pb), Some(r)) = (&f_pb, &f_range) {
                     crate::tcl::eval_command(s, &format!("resize_pblock {pb} -add {r}"));
+                }
+            },
+        ))
+        .child(cad::btn(
+            "device-pblock-delete",
+            "Delete",
+            t,
+            del_reason,
+            move |s: &mut AppState| {
+                if let Some(pb) = &d_pb {
+                    crate::tcl::eval_command(s, &format!("delete_pblocks {pb}"));
                 }
             },
         ));
@@ -510,6 +595,95 @@ mod tests {
             crate::views::device_floor::tcl_verb(&mut s, "get_pblocks", &[]).unwrap(),
             "pb2"
         );
+    }
+
+    /// PBLK-1 rows for the current pblocks over the fixture placement
+    /// (the same check `analysis::compute_drc` runs).
+    fn pblk1(s: &AppState) -> usize {
+        let ranged: Vec<PrjPblock> = s.device.pblocks.iter().filter(|p| p.ranged).cloned().collect();
+        let regions = helion_proj::pblock_regions(crate::live::live_design(s).unwrap(), &ranged);
+        helion_drc::check_pblocks(s.runs.live_placed.as_ref().unwrap(), &regions).items.len()
+    }
+
+    #[test]
+    fn delete_pblocks_releases_members_persists_and_clears_drc() {
+        let dir = std::env::temp_dir().join(format!("helion-pblock-del-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prj = dir.join("p.prj");
+        std::fs::write(&prj, "part HL10T-C32-1\nread_sv top.sv\n").unwrap();
+        let mut s = fixture();
+        s.runs.source = Some(prj.clone());
+        sync_from_project(&mut s);
+        let clbs: Vec<(String, u32, u32)> = crate::live::live_placed(&s)
+            .unwrap()
+            .cells
+            .iter()
+            .filter(|c| c.site_kind == "CLB")
+            .map(|c| (c.cell.clone(), c.site_x, c.site_y))
+            .collect();
+        let (cell, cx, cy) = clbs[0].clone();
+        let (_, ox, oy) = clbs
+            .iter()
+            .find(|(_, x, y)| (*x, *y) != (cx, cy))
+            .cloned()
+            .expect("two CLB sites");
+        // A pblock around another site that claims `cell`: PBLK-1 fires.
+        crate::tcl::eval_command(&mut s, &format!("create_pblock pa -add CLB_X{ox}Y{oy}:CLB_X{ox}Y{oy}"));
+        crate::tcl::eval_command(&mut s, &format!("add_cells_to_pblock pa {cell}"));
+        crate::tcl::eval_command(&mut s, "create_pblock pb");
+        assert_eq!(pblk1(&s), 1, "member outside its pblock");
+        crate::views::dfx::create_partition(&mut s, Some("rp0".into()), Some("pa".into()), None).unwrap();
+        assert_eq!(tcl_verb(&mut s, "get_pblocks", &["p*".into()]).unwrap(), "pa pb");
+        assert_eq!(tcl_verb(&mut s, "get_pblocks", &["pa".into()]).unwrap(), "pa");
+        s.device.pblock_sel = Some("pa".into());
+        let out = tcl_verb(&mut s, "delete_pblocks", &["[get_pblocks".into(), "pa]".into()]).unwrap();
+        assert!(out.contains("released=1") && out.contains("saved to"), "{out}");
+        assert_eq!(tcl_verb(&mut s, "get_pblocks", &[]).unwrap(), "pb");
+        assert_eq!(s.device.pblock_sel, None);
+        assert_eq!(pblk1(&s), 0, "no PBLK-1 once the pblock is gone");
+        assert_eq!(s.dfx.partitions[0].pblock, None, "the partition is unbound");
+        assert!(tcl_verb(&mut s, "delete_pblocks", &["nope".into()]).unwrap_err().contains("no pblock nope"));
+        assert!(tcl_verb(&mut s, "delete_pblocks", &[]).is_err());
+        // A restart reloads the project without the deleted pblock.
+        let mut s2 = fixture();
+        s2.runs.source = Some(prj.clone());
+        assert!(sync_from_project(&mut s2));
+        let names: Vec<&str> = s2.device.pblocks.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["pb"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_button_needs_a_selection_and_deletes_on_tap() {
+        let mut s = fixture();
+        crate::tcl::eval_command(&mut s, "create_pblock pz");
+        s.device.pblock_sel = None;
+        assert_eq!(delete_reason(&s), Some("Select a pblock row to delete"));
+        s.center = CenterPane::Device;
+        s.device.bottom = DeviceBottom::Pblocks;
+        let spec = crate::app_spec();
+        let env = rune::Env { system_dark: true, scale: 2.0 };
+        let mut rt = rune::Runtime::new(s, crate::view, spec.size, env);
+        let mut now = 0.1;
+        let mut tap = |rt: &mut rune::Runtime<AppState>, key: &str| {
+            for _ in 0..4 {
+                now += 1.0 / 60.0;
+                rt.frame(now);
+            }
+            let (x, y) = rt.find(key).unwrap_or_else(|| panic!("missing {key}"));
+            rt.pointer_move(x, y);
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+            now += 1.0 / 60.0;
+            rt.frame(now);
+        };
+        tap(&mut rt, "device-pblock-delete");
+        assert_eq!(rt.state.device.pblocks.len(), 1, "disabled Delete does nothing");
+        rt.state.device.pblock_sel = Some("pz".into());
+        rt.invalidate();
+        assert_eq!(delete_reason(&rt.state), None);
+        tap(&mut rt, "device-pblock-delete");
+        assert!(rt.state.device.pblocks.is_empty(), "Delete removed the selected pblock");
     }
 
     #[test]
