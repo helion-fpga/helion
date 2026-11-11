@@ -305,6 +305,10 @@ pub const COMMANDS: &[&str] = &[
     "delete_bd_objs",
     "generate_bd",
     "package_ip",
+    "csynth_design",
+    "cosim_design",
+    "open_hls",
+    "add_hls_rtl",
 ];
 
 /// Max nested `[...]` evaluation depth (mirrors the real interp's cap idea;
@@ -5392,6 +5396,7 @@ fn help_overview() -> String {
         "  set_timescale set_runtime sim_settings compile_sim elaborate_sim | ila <subcommand>",
         "Hardware/IP: report_hw_stat select_hw_stat | ip_catalog select_ip generate_ip create_bd create_bd_cell bd_drawing bd_hdl",
         "  apply_bd_automation assign_bd_address validate_bd_design set_bd_cell_property select_bd_cell delete_bd_objs generate_bd package_ip",
+        "HLS: open_hls csynth_design cosim_design add_hls_rtl",
         "  report_bitstream select_bitstream_frame | find sheet_find select_find",
         "Reports: report_timing_summary report_clock_interaction report_cdc report_clock_networks",
         "  report_power report_methodology report_drc report_constraints",

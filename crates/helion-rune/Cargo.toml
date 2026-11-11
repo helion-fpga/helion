@@ -39,3 +39,7 @@ helion-ipxact = { path = "../helion-ipxact" }
 # Bitstream frames/packets kept in state (FAR table) and STAT bit names.
 helion-bits = { path = "../helion-bits" }
 helion-fabric = { path = "../helion-fabric" }
+# HLS (C synthesis + gate-level C/RTL co-simulation) and the implementable
+# part registry / family flow dispatch (iCE40, ECP5, 7-series).
+helion-hls = { path = "../helion-hls" }
+helion-targets = { path = "../helion-targets" }
