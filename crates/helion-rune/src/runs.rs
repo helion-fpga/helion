@@ -725,6 +725,7 @@ pub fn deliver(s: &mut AppState, kind: RunKind, event: RunEvent) {
             s.runs.log_for_mut(kind).push(ConsoleLine { text, sev });
         }
         RunEvent::Finished(result) => {
+            let ok = result.is_ok();
             let errors = s
                 .runs
                 .log_for(kind)
@@ -795,6 +796,7 @@ pub fn deliver(s: &mut AppState, kind: RunKind, event: RunEvent) {
                 }
             }
             s.runs.clear_active();
+            crate::views::xdc_wizard::on_run_finished(s, ok);
         }
         RunEvent::Cancelled => {
             s.runs.record(kind, RunOutcome::Cancelled, None);
@@ -824,6 +826,7 @@ pub fn deliver(s: &mut AppState, kind: RunKind, event: RunEvent) {
                 &format!("{} stopped", kind.run_name()),
             );
             s.runs.clear_active();
+            crate::views::xdc_wizard::on_run_finished(s, false);
         }
     }
 }
