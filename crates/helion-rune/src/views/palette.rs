@@ -131,6 +131,7 @@ fn pane_label(pane: CenterPane) -> &'static str {
         CenterPane::Ip => "IP Integrator",
         CenterPane::Bitstream => "Bitstream",
         CenterPane::Find => "Find Results",
+        CenterPane::Constraints => "Constraints",
     }
 }
 

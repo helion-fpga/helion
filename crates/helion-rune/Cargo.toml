@@ -23,6 +23,8 @@ helion-ir = { path = "../helion-ir" }
 helion-pack = { path = "../helion-pack" }
 helion-place = { path = "../helion-place" }
 helion-proj = { path = "../helion-proj" }
+# Routed result kept for on-demand STA/DRC re-analysis (analysis.rs).
+helion-route = { path = "../helion-route" }
 helion-sta = { path = "../helion-sta" }
 helion-sv = { path = "../helion-sv" }
 helion-vhdl = { path = "../helion-vhdl" }

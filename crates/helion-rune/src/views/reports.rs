@@ -44,6 +44,8 @@
 //! - `crates/rune/src/el/text.rs`: `.truncate()` for long labels.
 //! - `crates/rune-kit/src/glyphs.rs`: `TRIANGLE_DOWN`, `CIRCLE_X`.
 
+mod panels;
+
 use rune::{Align, El, ScrollSpec, col, el, icon, row, text};
 use rune_kit::glyphs;
 
@@ -70,8 +72,6 @@ const COUNT_W: f32 = 90.0;
 const PCT_W: f32 = 70.0;
 /// Hierarchy metric column width (right-aligned counts).
 const METRIC_W: f32 = 64.0;
-/// Power value column width (right-aligned milliwatts).
-const MW_W: f32 = 100.0;
 /// DRC rule-id column width.
 const RULE_W: f32 = 110.0;
 /// DRC severity column width.
@@ -204,6 +204,10 @@ pub struct ReportsView {
     pub qor: Option<QorSnapshot>,
     pub qor_error: Option<String>,
     pub selected_qor: Option<String>,
+    /// Selected DRC row (index into [`crate::state::DrcState::items`]).
+    pub selected_drc: Option<usize>,
+    /// Selected methodology row (index into `TimingState::methodology`).
+    pub selected_method: Option<usize>,
 }
 
 /// Fill the typed post-implementation fixture state the report scenes
@@ -286,6 +290,9 @@ pub fn demo_impl_complete(s: &mut AppState) {
         total_mw: 142,
         dynamic_mw: 38,
         static_mw: 104,
+        total_uw: 142_000,
+        dynamic_uw: 38_000,
+        static_uw: 104_000,
         clocks_uw: 12500,
         logic_uw: 8600,
         signals_uw: 9800,
@@ -554,6 +561,7 @@ fn hist_row(
                 text(value_text)
                     .font(VivadoTheme::FONT_UI)
                     .color(t.text)
+                    .w_full()
                     .align(Align::End),
             ),
         )
@@ -596,6 +604,7 @@ fn util_table(s: &AppState, t: &VivadoTheme) -> El {
                         text(used.to_string())
                             .font(VivadoTheme::FONT_UI)
                             .color(t.text)
+                            .w_full()
                             .align(Align::End),
                     ),
                 )
@@ -604,6 +613,7 @@ fn util_table(s: &AppState, t: &VivadoTheme) -> El {
                         text(avail.to_string())
                             .font(VivadoTheme::FONT_UI)
                             .color(t.text)
+                            .w_full()
                             .align(Align::End),
                     ),
                 )
@@ -612,6 +622,7 @@ fn util_table(s: &AppState, t: &VivadoTheme) -> El {
                         text(format!("{}%", pct(used, avail)))
                             .font(VivadoTheme::FONT_UI)
                             .color(t.text)
+                            .w_full()
                             .align(Align::End),
                     ),
                 ),
@@ -640,9 +651,13 @@ fn util_table(s: &AppState, t: &VivadoTheme) -> El {
                         .px(8.0)
                         .fill(t.header_bg)
                         .child(header_cell("Resource").grow(2.0).min_w(0.0))
-                        .child(el().w(COUNT_W).child(header_cell("Used")))
-                        .child(el().w(COUNT_W).child(header_cell("Available")))
-                        .child(el().w(PCT_W).child(header_cell("Util (%)"))),
+                        .child(crate::views::report_kit::header_num("Used", COUNT_W, t))
+                        .child(crate::views::report_kit::header_num(
+                            "Available",
+                            COUNT_W,
+                            t,
+                        ))
+                        .child(crate::views::report_kit::header_num("Util (%)", PCT_W, t)),
                 )
                 .child(body),
         )
@@ -710,6 +725,7 @@ fn hier_table(s: &AppState, t: &VivadoTheme) -> El {
             text(value.to_string())
                 .font(VivadoTheme::FONT_UI)
                 .color(t.text)
+                .w_full()
                 .align(Align::End),
         )
     };
@@ -765,11 +781,11 @@ fn hier_table(s: &AppState, t: &VivadoTheme) -> El {
                         .px(8.0)
                         .fill(t.header_bg)
                         .child(header_cell("Name").grow(3.0).min_w(0.0))
-                        .child(el().w(METRIC_W).child(header_cell("LUT")))
-                        .child(el().w(METRIC_W).child(header_cell("FF")))
-                        .child(el().w(METRIC_W).child(header_cell("IO")))
-                        .child(el().w(METRIC_W).child(header_cell("BRAM")))
-                        .child(el().w(METRIC_W).child(header_cell("DSP"))),
+                        .child(crate::views::report_kit::header_num("LUT", METRIC_W, t))
+                        .child(crate::views::report_kit::header_num("FF", METRIC_W, t))
+                        .child(crate::views::report_kit::header_num("IO", METRIC_W, t))
+                        .child(crate::views::report_kit::header_num("BRAM", METRIC_W, t))
+                        .child(crate::views::report_kit::header_num("DSP", METRIC_W, t)),
                 )
                 .child(body),
         )
@@ -787,23 +803,10 @@ fn util_body(s: &AppState, t: &VivadoTheme) -> El {
                 .color(t.text)
                 .key("reports-util-title"),
         )
+        .child(panels::kpi_cards(&occupancy(s), t))
         .child(util_table(s, t))
         .child(util_hist(s, t))
         .child(hier_table(s, t))
-}
-
-/// Power block rows from the typed [`crate::state::PowerState`], in
-/// Vivado on-chip breakdown order.
-fn power_blocks(s: &AppState) -> [(&'static str, u32); 6] {
-    let p = &s.power;
-    [
-        ("Clocks", p.clocks_uw),
-        ("Signals", p.signals_uw),
-        ("Logic", p.logic_uw),
-        ("I/O", p.io_uw),
-        ("BRAM", p.bram_uw),
-        ("DSP", p.dsp_uw),
-    ]
 }
 
 /// Power summary card: `report_power` part/PVT header, on-chip split,
@@ -940,97 +943,8 @@ fn power_split(s: &AppState, t: &VivadoTheme) -> El {
         )
 }
 
-/// Power breakdown table: `Block | Power (mW) | Share of dynamic`.
-fn power_table(s: &AppState, t: &VivadoTheme) -> El {
-    let header_cell = |content: &'static str| -> El {
-        text(content)
-            .font(VivadoTheme::FONT_UI)
-            .color(t.text_dim)
-            .truncate()
-    };
-    let dynamic_uw = s.power.dynamic_mw * 1000;
-    let mut body = col().w_full();
-    for (index, (name, uw)) in power_blocks(s).into_iter().enumerate() {
-        body = body.child(
-            row()
-                .key(format!("reports-power-row-{index}"))
-                .w_full()
-                .h(TABLE_ROW_H)
-                .items_center()
-                .gap(8.0)
-                .px(8.0)
-                .child(ui_label(name.into(), t).grow(2.0).min_w(0.0).truncate())
-                .child(
-                    el().w(MW_W).child(
-                        text(format_mw(uw))
-                            .font(VivadoTheme::FONT_UI)
-                            .color(t.text)
-                            .align(Align::End),
-                    ),
-                )
-                .child(
-                    el().w(PCT_W).child(
-                        text(format!("{}%", pct(uw, dynamic_uw)))
-                            .font(VivadoTheme::FONT_UI)
-                            .color(t.text)
-                            .align(Align::End),
-                    ),
-                ),
-        );
-    }
-    col()
-        .key("reports-power-table")
-        .w_full()
-        .gap(2.0)
-        .child(
-            text("Dynamic Breakdown")
-                .font(VivadoTheme::FONT_TITLE)
-                .color(t.text),
-        )
-        .child(
-            col()
-                .w_full()
-                .fill(t.panel_bg)
-                .border(1.0, t.border)
-                .child(
-                    row()
-                        .w_full()
-                        .h(TABLE_HEADER_H)
-                        .items_center()
-                        .gap(8.0)
-                        .px(8.0)
-                        .fill(t.header_bg)
-                        .child(header_cell("Block").grow(2.0).min_w(0.0))
-                        .child(el().w(MW_W).child(header_cell("Power (mW)")))
-                        .child(el().w(PCT_W).child(header_cell("Share"))),
-                )
-                .child(body),
-        )
-}
-
-/// Power histogram: per-block bars normalized to the largest block.
-fn power_hist(s: &AppState, t: &VivadoTheme) -> El {
-    let blocks = power_blocks(s);
-    let max = blocks.iter().map(|(_, uw)| *uw).max().unwrap_or(0).max(1) as f32;
-    let mut hist = col().key("reports-power-hist").w_full().gap(2.0).child(
-        text("Power by Block")
-            .font(VivadoTheme::FONT_TITLE)
-            .color(t.text),
-    );
-    for (index, (name, uw)) in blocks.into_iter().enumerate() {
-        hist = hist.child(hist_row(
-            format!("reports-power-bar-{index}"),
-            name,
-            uw as f32 / max,
-            format_mw(uw),
-            t.accent,
-            t,
-        ));
-    }
-    hist
-}
-
-/// Power detail body: summary, split bar, breakdown table, histogram.
+/// Power detail body: summary, split bar, rails table, block power and
+/// utilization.
 fn power_body(s: &AppState, t: &VivadoTheme) -> El {
     col()
         .key("reports-power")
@@ -1044,8 +958,8 @@ fn power_body(s: &AppState, t: &VivadoTheme) -> El {
         )
         .child(power_summary(s, t))
         .child(power_split(s, t))
-        .child(power_table(s, t))
-        .child(power_hist(s, t))
+        .child(panels::rails_table(s, t))
+        .child(panels::blocks_table(s, t))
 }
 
 /// Counts of `(errors, warnings, advisories)` folded from typed severities.
@@ -1102,94 +1016,42 @@ fn drc_hist(s: &AppState, t: &VivadoTheme) -> El {
     hist
 }
 
-/// DRC violations table: `Rule | Severity | Objects | Message`. The rule
-/// cell is a blue link echoing its `report_drc` Tcl verb.
+/// DRC violations table: `Rule | Severity | Objects | Message`. Rows
+/// select; the detail panel below shows the full message and fix hint.
 fn drc_table(s: &AppState, t: &VivadoTheme) -> El {
-    let header_cell = |content: &'static str| -> El {
-        text(content)
-            .font(VivadoTheme::FONT_UI)
-            .color(t.text_dim)
-            .truncate()
-    };
+    use crate::views::report_kit as kit;
+    let head = kit::header_row(t)
+        .child(el().w(RULE_W).child(kit::header_cell("Rule", t)))
+        .child(el().w(SEV_W).child(kit::header_cell("Severity", t)))
+        .child(kit::header_cell("Objects", t).grow(2.0).min_w(0.0))
+        .child(kit::header_cell("Message", t).grow(3.0).min_w(0.0));
     let mut body = col().w_full();
     for (index, item) in s.drc.items.iter().enumerate() {
-        let tcl = format!("report_drc -rule {}", item.id);
         body = body.child(
-            row()
-                .key(format!("reports-drc-row-{index}"))
-                .w_full()
-                .h(TABLE_ROW_H)
-                .items_center()
-                .gap(8.0)
-                .px(8.0)
-                .child(
-                    el().w(RULE_W).h(TABLE_ROW_H).center_y().child(
-                        el().key(format!("reports-drc-rule-{index}"))
-                            .role("button")
-                            .label(format!("Report DRC rule {}", item.id))
-                            .focusable(true)
-                            .h(TABLE_ROW_H)
-                            .center_y()
-                            .hover(t.selection)
-                            .on_press(move |s: &mut AppState| echo(s, tcl.clone()))
-                            .child(
-                                text(item.id.clone())
-                                    .font(VivadoTheme::FONT_UI)
-                                    .color(t.link)
-                                    .truncate(),
-                            ),
-                    ),
-                )
-                .child(
-                    el().w(SEV_W).child(
-                        text(item.severity.label())
-                            .font(VivadoTheme::FONT_UI)
-                            .color(sev_color(item.severity, t)),
-                    ),
-                )
-                .child(
-                    ui_label(item.objects.clone(), t)
-                        .grow(2.0)
-                        .min_w(0.0)
-                        .truncate(),
-                )
-                .child(
-                    ui_label(item.message.clone(), t)
-                        .grow(3.0)
-                        .min_w(0.0)
-                        .truncate(),
-                ),
+            kit::select_row(
+                format!("reports-drc-row-{index}"),
+                format!("DRC {} {}", item.id, item.severity.label()),
+                s.reports_view.selected_drc == Some(index),
+                t,
+                move |s: &mut AppState| s.reports_view.selected_drc = Some(index),
+            )
+            .child(kit::fixed_cell(item.id.clone(), RULE_W, t.link))
+            .child(kit::fixed_cell(
+                item.severity.label(),
+                SEV_W,
+                sev_color(item.severity, t),
+            ))
+            .child(kit::text_cell(item.objects.clone(), 2.0, t.text))
+            .child(kit::text_cell(item.message.clone(), 3.0, t.text)),
         );
     }
     col()
         .key("reports-drc-table")
         .w_full()
         .gap(2.0)
-        .child(
-            text("Violations")
-                .font(VivadoTheme::FONT_TITLE)
-                .color(t.text),
-        )
-        .child(
-            col()
-                .w_full()
-                .fill(t.panel_bg)
-                .border(1.0, t.border)
-                .child(
-                    row()
-                        .w_full()
-                        .h(TABLE_HEADER_H)
-                        .items_center()
-                        .gap(8.0)
-                        .px(8.0)
-                        .fill(t.header_bg)
-                        .child(el().w(RULE_W).child(header_cell("Rule")))
-                        .child(el().w(SEV_W).child(header_cell("Severity")))
-                        .child(header_cell("Objects").grow(2.0).min_w(0.0))
-                        .child(header_cell("Message").grow(3.0).min_w(0.0)),
-                )
-                .child(body),
-        )
+        .child(kit::section_title("Violations", t))
+        .child(kit::table(head, body, t))
+        .child(el().w_full().pt(6.0).child(panels::drc_detail(s, t)))
 }
 
 /// DRC detail body: verdict, severity histogram, violations table.
@@ -1414,77 +1276,44 @@ fn method_hist(s: &AppState, t: &VivadoTheme) -> El {
 }
 
 /// Methodology checks table: `Check | Severity | Category | Objects |
-/// Message` from the real run rows.
+/// Message` from the real run rows. Rows select; the detail panel below
+/// shows the full message, objects, and the catalog fix hint.
 fn method_table(s: &AppState, t: &VivadoTheme) -> El {
-    let header_cell = |content: &'static str| -> El {
-        text(content)
-            .font(VivadoTheme::FONT_UI)
-            .color(t.text_dim)
-            .truncate()
-    };
+    use crate::views::report_kit as kit;
+    let head = kit::header_row(t)
+        .child(el().w(RULE_W).child(kit::header_cell("Check", t)))
+        .child(el().w(SEV_W).child(kit::header_cell("Severity", t)))
+        .child(el().w(SEV_W).child(kit::header_cell("Category", t)))
+        .child(kit::header_cell("Objects", t).grow(2.0).min_w(0.0))
+        .child(kit::header_cell("Message", t).grow(3.0).min_w(0.0));
     let mut body = col().w_full();
     for (index, v) in s.timing.methodology.iter().enumerate() {
         body = body.child(
-            row()
-                .key(format!("reports-method-row-{index}"))
-                .w_full()
-                .h(TABLE_ROW_H)
-                .items_center()
-                .gap(8.0)
-                .px(8.0)
-                .child(el().w(RULE_W).child(ui_label(v.id.clone(), t).truncate()))
-                .child(
-                    el().w(SEV_W).child(
-                        text(v.severity.clone())
-                            .font(VivadoTheme::FONT_UI)
-                            .color(method_sev_color(&v.severity, t))
-                            .truncate(),
-                    ),
-                )
-                .child(
-                    el().w(SEV_W)
-                        .child(ui_label(v.category.clone(), t).truncate()),
-                )
-                .child(
-                    ui_label(v.objects.clone(), t)
-                        .grow(2.0)
-                        .min_w(0.0)
-                        .truncate(),
-                )
-                .child(
-                    ui_label(v.message.clone(), t)
-                        .grow(3.0)
-                        .min_w(0.0)
-                        .truncate(),
-                ),
+            kit::select_row(
+                format!("reports-method-row-{index}"),
+                format!("Methodology {} {}", v.id, v.severity),
+                s.reports_view.selected_method == Some(index),
+                t,
+                move |s: &mut AppState| s.reports_view.selected_method = Some(index),
+            )
+            .child(kit::fixed_cell(v.id.clone(), RULE_W, t.text))
+            .child(kit::fixed_cell(
+                v.severity.clone(),
+                SEV_W,
+                method_sev_color(&v.severity, t),
+            ))
+            .child(kit::fixed_cell(v.category.clone(), SEV_W, t.text))
+            .child(kit::text_cell(v.objects.clone(), 2.0, t.text))
+            .child(kit::text_cell(v.message.clone(), 3.0, t.text)),
         );
     }
     col()
         .key("reports-method-table")
         .w_full()
         .gap(2.0)
-        .child(text("Checks").font(VivadoTheme::FONT_TITLE).color(t.text))
-        .child(
-            col()
-                .w_full()
-                .fill(t.panel_bg)
-                .border(1.0, t.border)
-                .child(
-                    row()
-                        .w_full()
-                        .h(TABLE_HEADER_H)
-                        .items_center()
-                        .gap(8.0)
-                        .px(8.0)
-                        .fill(t.header_bg)
-                        .child(el().w(RULE_W).child(header_cell("Check")))
-                        .child(el().w(SEV_W).child(header_cell("Severity")))
-                        .child(el().w(SEV_W).child(header_cell("Category")))
-                        .child(header_cell("Objects").grow(2.0).min_w(0.0))
-                        .child(header_cell("Message").grow(3.0).min_w(0.0)),
-                )
-                .child(body),
-        )
+        .child(kit::section_title("Checks", t))
+        .child(kit::table(head, body, t))
+        .child(el().w_full().pt(6.0).child(panels::method_detail(s, t)))
 }
 
 /// Methodology detail body: verdict, severity histogram, checks table.
@@ -1716,138 +1545,52 @@ fn qor_hist(snap: &QorSnapshot, t: &VivadoTheme) -> El {
 }
 
 /// QoR suggestions table: `ID | Severity | Category | Target | Gain |
-/// Description`. The ID cell selects the row and echoes the suggestion's
-/// executable Tcl command (GUI `select_qor` behavior).
+/// Description`. Rows select (GUI `select_qor`); the detail panel below
+/// shows the full description and the suggestion's Tcl fix.
 fn qor_table(s: &AppState, snap: &QorSnapshot, t: &VivadoTheme) -> El {
-    let header_cell = |content: &'static str| -> El {
-        text(content)
-            .font(VivadoTheme::FONT_UI)
-            .color(t.text_dim)
-            .truncate()
-    };
+    use crate::views::report_kit as kit;
+    let head = kit::header_row(t)
+        .child(el().w(RULE_W).child(kit::header_cell("ID", t)))
+        .child(el().w(SEV_W).child(kit::header_cell("Severity", t)))
+        .child(el().w(SEV_W).child(kit::header_cell("Category", t)))
+        .child(kit::header_cell("Target", t).grow(1.0).min_w(0.0))
+        .child(kit::header_num("Gain", PCT_W, t))
+        .child(kit::header_cell("Description", t).grow(3.0).min_w(0.0));
     let mut body = col().w_full();
     for (index, sugg) in snap.suggestions.iter().enumerate() {
         let id = sugg.id.clone();
-        let tcl = sugg.tcl_command.clone();
         let selected = s.reports_view.selected_qor.as_deref() == Some(sugg.id.as_str());
-        let mut crow = row()
-            .key(format!("reports-qor-row-{index}"))
-            .w_full()
-            .h(TABLE_ROW_H)
-            .items_center()
-            .gap(8.0)
-            .px(8.0)
-            .child(
-                el().w(RULE_W).h(TABLE_ROW_H).center_y().child(
-                    el().key(format!("reports-qor-select-{index}"))
-                        .role("button")
-                        .label(format!("Select QoR suggestion {}", sugg.id))
-                        .focusable(true)
-                        .h(TABLE_ROW_H)
-                        .center_y()
-                        .hover(t.selection)
-                        .on_press(move |s: &mut AppState| {
-                            s.reports_view.selected_qor = Some(id.clone());
-                            echo(s, tcl.clone());
-                        })
-                        .child(
-                            text(sugg.id.clone())
-                                .font(VivadoTheme::FONT_UI)
-                                .color(t.link)
-                                .truncate(),
-                        ),
-                ),
+        body = body.child(
+            kit::select_row(
+                format!("reports-qor-row-{index}"),
+                format!("QoR suggestion {}", sugg.id),
+                selected,
+                t,
+                move |s: &mut AppState| s.reports_view.selected_qor = Some(id.clone()),
             )
-            .child(
-                el().w(SEV_W).child(
-                    text(sugg.severity.clone())
-                        .font(VivadoTheme::FONT_UI)
-                        .color(qor_sev_color(&sugg.severity, t))
-                        .truncate(),
-                ),
-            )
-            .child(
-                el().w(SEV_W).child(
-                    text(sugg.category.clone())
-                        .font(VivadoTheme::FONT_UI)
-                        .color(t.text)
-                        .truncate(),
-                ),
-            )
-            .child(
-                ui_label(sugg.target.clone(), t)
-                    .grow(1.0)
-                    .min_w(0.0)
-                    .truncate(),
-            )
-            .child(
-                el().w(PCT_W).child(
-                    text(format!("+{}ps", sugg.expected_gain_ps))
-                        .font(VivadoTheme::FONT_UI)
-                        .color(t.text)
-                        .align(Align::End),
-                ),
-            )
-            .child(
-                ui_label(sugg.description.clone(), t)
-                    .grow(3.0)
-                    .min_w(0.0)
-                    .truncate(),
-            );
-        if selected {
-            crow = crow.fill(t.selection);
-        }
-        body = body.child(crow);
+            .child(kit::fixed_cell(sugg.id.clone(), RULE_W, t.link))
+            .child(kit::fixed_cell(
+                sugg.severity.clone(),
+                SEV_W,
+                qor_sev_color(&sugg.severity, t),
+            ))
+            .child(kit::fixed_cell(sugg.category.clone(), SEV_W, t.text))
+            .child(kit::text_cell(sugg.target.clone(), 1.0, t.text))
+            .child(kit::num_cell(
+                format!("+{}ps", sugg.expected_gain_ps),
+                PCT_W,
+                t.text,
+            ))
+            .child(kit::text_cell(sugg.description.clone(), 3.0, t.text)),
+        );
     }
     col()
         .key("reports-qor-table")
         .w_full()
         .gap(2.0)
-        .child(
-            text("Suggestions")
-                .font(VivadoTheme::FONT_TITLE)
-                .color(t.text),
-        )
-        .child(
-            col()
-                .w_full()
-                .fill(t.panel_bg)
-                .border(1.0, t.border)
-                .child(
-                    row()
-                        .w_full()
-                        .h(TABLE_HEADER_H)
-                        .items_center()
-                        .gap(8.0)
-                        .px(8.0)
-                        .fill(t.header_bg)
-                        .child(el().w(RULE_W).child(header_cell("ID")))
-                        .child(el().w(SEV_W).child(header_cell("Severity")))
-                        .child(el().w(SEV_W).child(header_cell("Category")))
-                        .child(header_cell("Target").grow(1.0).min_w(0.0))
-                        .child(el().w(PCT_W).child(header_cell("Gain")))
-                        .child(header_cell("Description").grow(3.0).min_w(0.0)),
-                )
-                .child(body),
-        )
-}
-
-/// Blue link re-running the QoR assessment on demand.
-fn qor_refresh_link(t: &VivadoTheme) -> El {
-    el().key("reports-qor-refresh")
-        .role("button")
-        .label("Re-run QoR Analysis")
-        .focusable(true)
-        .h(ROW_H)
-        .px(2.0)
-        .center_y()
-        .hover(t.selection)
-        .on_press(refresh_qor)
-        .child(
-            text("Re-run QoR Analysis")
-                .font(VivadoTheme::FONT_UI)
-                .color(t.link),
-        )
+        .child(kit::section_title("Suggestions", t))
+        .child(kit::table(head, body, t))
+        .child(el().w_full().pt(6.0).child(panels::qor_detail(s, snap, t)))
 }
 
 /// QoR detail body: assessment summary, severity histogram, suggestions
@@ -1862,7 +1605,7 @@ fn qor_body(s: &AppState, t: &VivadoTheme) -> El {
     );
     match (&s.reports_view.qor, &s.reports_view.qor_error) {
         (Some(snap), _) => {
-            body = body.child(qor_summary(snap, t)).child(qor_refresh_link(t));
+            body = body.child(qor_summary(snap, t));
             if snap.suggestions.is_empty() {
                 body = body.child(
                     text("No QoR suggestions — the design meets all checks.")
@@ -1903,61 +1646,27 @@ fn qor_body(s: &AppState, t: &VivadoTheme) -> El {
     body
 }
 
-/// Right-hand report content for the selected tree entry.
+/// Right-hand report content for the selected tree entry: each report
+/// opens as soon as its data exists (Methodology/QoR/Utilization/Power
+/// after synthesis, DRC after placement), headed by its re-run action;
+/// otherwise one sentence plus the run that produces it.
 fn report_content(s: &AppState, t: &VivadoTheme) -> El {
-    if s.flow.impl_run != RunStatus::Complete {
-        if s.flow.impl_run == RunStatus::Running {
-            return col().w_full().padding(8.0).child(
-                row()
-                    .key("reports-run-status")
-                    .w_full()
-                    .h(40.0)
-                    .items_center()
-                    .justify_center()
-                    .gap(4.0)
-                    .child(dim_label(
-                        "Implementation is running — follow progress in the Tcl Console",
-                        t,
-                    )),
-            );
-        }
-        return col().w_full().padding(8.0).child(
-            row()
-                .key("reports-no-run")
-                .w_full()
-                .h(40.0)
-                .items_center()
-                .justify_center()
-                .gap(4.0)
-                .child(
-                    el().key("reports-run-impl")
-                        .role("button")
-                        .label("Run Implementation")
-                        .focusable(true)
-                        .h(ROW_H)
-                        .px(2.0)
-                        .center_y()
-                        .hover(t.selection)
-                        .on_press(|s: &mut AppState| {
-                            crate::runs::launch(s, crate::runs::RunKind::Impl);
-                        })
-                        .child(
-                            text("Run Implementation")
-                                .font(VivadoTheme::FONT_UI)
-                                .color(t.link),
-                        ),
-                )
-                .child(dim_label("to see report results", t)),
-        );
-    }
     let selected = s.reports_view.selected;
-    col().w_full().gap(10.0).padding(8.0).child(match selected {
-        ReportNav::Utilization => util_body(s, t),
-        ReportNav::Power => power_body(s, t),
-        ReportNav::Drc => drc_body(s, t),
-        ReportNav::Methodology => method_body(s, t),
-        ReportNav::Qor => qor_body(s, t),
-    })
+    if !panels::report_ready(s, selected) {
+        return panels::not_ready(s, selected, t);
+    }
+    col()
+        .w_full()
+        .gap(6.0)
+        .padding(8.0)
+        .child(panels::action_bar(s, selected, t))
+        .child(match selected {
+            ReportNav::Utilization => util_body(s, t),
+            ReportNav::Power => power_body(s, t),
+            ReportNav::Drc => drc_body(s, t),
+            ReportNav::Methodology => method_body(s, t),
+            ReportNav::Qor => qor_body(s, t),
+        })
 }
 
 /// The center Reports pane wired into the shell.
@@ -2094,9 +1803,11 @@ mod tests {
             "reports-power-split-label",
             "reports-power-table",
             "reports-power-row-0",
-            "reports-power-row-5",
-            "reports-power-hist",
-            "reports-power-bar-0",
+            "reports-power-row-8",
+            "reports-power-blocks",
+            "reports-power-block-0",
+            "reports-power-block-5",
+            "reports-action-power",
             "reports-footer",
         ] {
             assert!(rt.find(key).is_some(), "missing power key: {key}");
@@ -2108,16 +1819,16 @@ mod tests {
     }
 
     #[test]
-    fn wheel_over_power_report_scrolls_hist_into_view() {
+    fn wheel_over_power_report_scrolls_blocks_into_view() {
         let mut s = reports_state();
         s.reports_view.selected = ReportNav::Power;
         let mut rt = harness_with(s);
         rt.frame(0.0);
         let vp = rt.presented("reports-scroll").unwrap().0;
-        let y_before = rt.presented("reports-power-hist").unwrap().0[1];
+        let y_before = rt.presented("reports-power-blocks").unwrap().0[1];
         assert!(
             y_before > vp[1] + vp[3],
-            "hist must start below the fold (y={y_before}, fold={})",
+            "blocks must start below the fold (y={y_before}, fold={})",
             vp[1] + vp[3]
         );
         let (wx, wy) = (vp[0] + vp[2] / 2.0, vp[1] + vp[3] / 2.0);
@@ -2125,7 +1836,7 @@ mod tests {
             rt.wheel(wx, wy, -140.0);
             rt.frame(0.1 + i as f64 * (1.0 / 60.0));
         }
-        let y_after = rt.presented("reports-power-hist").unwrap().0[1];
+        let y_after = rt.presented("reports-power-blocks").unwrap().0[1];
         assert!(
             y_after < y_before - 100.0,
             "wheel must move content up (before={y_before}, after={y_after})"
@@ -2170,18 +1881,16 @@ mod tests {
         assert!(rt.find("reports-drc-row-0").is_some(), "rows must mount");
         assert!(rt.find("reports-drc-row-1").is_some(), "rows must mount");
         assert!(
-            rt.find("reports-drc-rule-0").is_some(),
-            "rule link must mount"
+            rt.find("reports-drc-hint").is_some(),
+            "hint before selection"
         );
-        tap(&mut rt, "reports-drc-rule-0");
+        tap(&mut rt, "reports-drc-row-0");
+        assert_eq!(rt.state.reports_view.selected_drc, Some(0));
         assert!(
-            rt.state
-                .console
-                .lines
-                .iter()
-                .any(|l| l.text == "report_drc -rule PDRC-190"),
-            "rule link echoes its Tcl verb"
+            rt.find("reports-drc-detail").is_some(),
+            "detail panel must mount"
         );
+        assert!(rt.find("reports-drc-hint").is_none());
     }
 
     #[test]
@@ -2207,24 +1916,73 @@ mod tests {
     }
 
     #[test]
-    fn fresh_project_prompts_to_run_implementation() {
+    fn fresh_project_prompts_for_the_run_each_report_needs() {
         let mut s = init();
         s.center = crate::state::CenterPane::Reports;
         let mut rt = harness_with(s);
         rt.frame(0.0);
         assert!(
-            rt.find("reports-run-impl").is_some(),
-            "run prompt must show"
+            rt.find("reports-run-synth").is_some(),
+            "utilization needs synthesis"
         );
-        for key in ["reports-util", "reports-power", "reports-drc-table"] {
+        assert!(rt.find("reports-run-impl").is_none(), "one CTA only");
+        for key in [
+            "reports-util",
+            "reports-power",
+            "reports-drc-table",
+            "reports-actions",
+        ] {
             assert!(rt.find(key).is_none(), "result {key} must wait for a run");
         }
+        tap(&mut rt, "reports-nav-drc");
+        assert!(rt.find("reports-run-impl").is_some(), "DRC needs placement");
+        assert!(rt.find("reports-run-synth").is_none(), "one CTA only");
+        for nav in [
+            "reports-nav-power",
+            "reports-nav-methodology",
+            "reports-nav-qor",
+        ] {
+            tap(&mut rt, nav);
+            assert!(
+                rt.find("reports-run-synth").is_some(),
+                "{nav} needs synthesis"
+            );
+        }
+    }
+
+    #[test]
+    fn methodology_and_util_open_after_synthesis_without_implementation() {
+        let mut s = init();
+        s.center = crate::state::CenterPane::Reports;
+        s.flow.synth = RunStatus::Complete;
+        s.timing.has_run = true;
+        s.util.luts_used = 12;
+        s.util.luts_avail = 8192;
+        s.reports_view.selected = ReportNav::Methodology;
+        let mut rt = harness_with(s);
+        rt.frame(0.0);
+        assert!(
+            rt.find("reports-method").is_some(),
+            "methodology shows post-synth"
+        );
+        assert!(rt.find("reports-stage").is_some());
+        tap(&mut rt, "reports-nav-utilization");
+        assert!(
+            rt.find("reports-util-kpis").is_some(),
+            "utilization shows post-synth"
+        );
+        tap(&mut rt, "reports-nav-drc");
+        assert!(
+            rt.find("reports-run-impl").is_some(),
+            "DRC still needs placement"
+        );
     }
 
     #[test]
     fn run_prompt_starts_implementation_and_echoes_tcl() {
         let mut s = init();
         s.center = crate::state::CenterPane::Reports;
+        s.reports_view.selected = ReportNav::Drc;
         let mut rt = harness_with(s);
         rt.frame(0.0);
         tap(&mut rt, "reports-run-impl");
@@ -2338,7 +2096,8 @@ mod tests {
     fn demo_blocks_sum_to_the_dynamic_total() {
         let mut s = init();
         demo_impl_complete(&mut s);
-        let blocks: u32 = power_blocks(&s).iter().map(|(_, uw)| uw).sum();
+        let p = &s.power;
+        let blocks: u32 = p.clocks_uw + p.signals_uw + p.logic_uw + p.io_uw + p.bram_uw + p.dsp_uw;
         assert_eq!(
             blocks,
             s.power.dynamic_mw * 1000,
@@ -2355,6 +2114,7 @@ mod tests {
     fn no_run_prompt_launches_a_real_run() {
         let mut s = init();
         s.center = crate::state::CenterPane::Reports;
+        s.reports_view.selected = ReportNav::Drc;
         let mut rt = harness_with(s);
         rt.frame(0.0);
         tap(&mut rt, "reports-run-impl");
@@ -2448,7 +2208,8 @@ mod tests {
             rt.state.reports_view.qor_error.is_some(),
             "reason must be stored"
         );
-        assert!(rt.find("reports-qor-empty").is_some(), "reason must show");
+        assert!(rt.find("reports-no-run").is_some(), "reason must show");
+        assert!(rt.find("reports-run-synth").is_some(), "one real CTA");
         assert!(
             rt.find("reports-qor-table").is_none(),
             "no table without data"
@@ -2456,9 +2217,9 @@ mod tests {
     }
 
     #[test]
-    fn qor_table_renders_snapshot_rows_and_select_echoes_tcl() {
-        // deep-05: suggestion rows render the snapshot; selecting one
-        // echoes its executable Tcl command (GUI select_qor behavior).
+    fn qor_table_renders_snapshot_rows_and_selection_shows_detail() {
+        // deep-05: suggestion rows render the snapshot; selecting one shows
+        // its description and executable Tcl fix (GUI select_qor behavior).
         let mut s = reports_state();
         s.reports_view.selected = ReportNav::Qor;
         s.reports_view.qor = Some(QorSnapshot {
@@ -2509,23 +2270,19 @@ mod tests {
             "reports-qor-hist",
             "reports-qor-row-0",
             "reports-qor-row-1",
-            "reports-qor-select-0",
+            "reports-qor-hint",
         ] {
             assert!(rt.find(key).is_some(), "missing QoR key: {key}");
         }
         assert!(rt.find("reports-qor-clean").is_none(), "suggestions exist");
-        tap(&mut rt, "reports-qor-select-0");
+        tap(&mut rt, "reports-qor-row-0");
         assert_eq!(
             rt.state.reports_view.selected_qor.as_deref(),
             Some("RQS_STRAT-1")
         );
         assert!(
-            rt.state
-                .console
-                .lines
-                .iter()
-                .any(|l| l.text == "set_property STRATEGY Performance_Explore [get_runs impl_1]"),
-            "select echoes the suggestion Tcl command"
+            rt.find("reports-qor-detail").is_some(),
+            "detail shows the fix"
         );
     }
 
@@ -2561,9 +2318,16 @@ mod tests {
             "reports-method-table",
             "reports-method-row-0",
             "reports-method-row-1",
+            "reports-method-hint",
         ] {
             assert!(rt.find(key).is_some(), "missing methodology key: {key}");
         }
+        tap(&mut rt, "reports-method-row-0");
+        assert_eq!(rt.state.reports_view.selected_method, Some(0));
+        assert!(
+            rt.find("reports-method-detail").is_some(),
+            "selection opens the detail with the full message"
+        );
 
         let mut s = reports_state();
         s.reports_view.selected = ReportNav::Methodology;

@@ -49,10 +49,11 @@ fn echo(s: &mut AppState, tcl: &'static str) {
     });
 }
 
-/// Start Implementation: flip the typed run state and echo the Tcl verb.
+/// Start Implementation: launch the real implementation run (the run
+/// echoes its own `launch_runs impl_1` verb and flips the typed status once
+/// the worker starts).
 fn start_impl(s: &mut AppState) {
-    s.flow.impl_run = RunStatus::Running;
-    echo(s, "launch_runs impl_1");
+    crate::runs::launch(s, crate::runs::RunKind::Impl);
 }
 
 fn ui_label(content: &str, t: &VivadoTheme) -> El {
@@ -524,10 +525,117 @@ fn timing_card(s: &AppState, t: &VivadoTheme) -> El {
                 .color(if met { t.pass } else { t.fail })
                 .key("summary-timing-verdict"),
             )
+            .child(worst_endpoints(s, t))
     } else {
         run_prompt("summary-run-impl-timing", "timing", prompt_status(s), t)
     };
     card("summary-timing", "Timing", None, t, body)
+}
+
+/// Top-5 worst endpoints (`# | Endpoint | Slack`); a row opens that path
+/// in the Timing summary detail.
+fn worst_endpoints(s: &AppState, t: &VivadoTheme) -> El {
+    use crate::views::report_kit as kit;
+    let mut worst: Vec<(usize, &crate::state::TimingPathRow)> =
+        s.timing.paths.iter().enumerate().collect();
+    worst.sort_by_key(|(_, p)| p.slack_ps);
+    if worst.is_empty() {
+        return dim_label("Endpoint paths appear after placement.", t).key("summary-worst-empty");
+    }
+    let head = kit::header_row(t)
+        .child(kit::header_num("#", 20.0, t))
+        .child(kit::header_cell("Worst endpoints", t).grow(1.0).min_w(0.0))
+        .child(kit::header_num("Slack (ns)", 72.0, t));
+    let mut body = col().w_full();
+    for (n, (idx, p)) in worst.into_iter().take(5).enumerate() {
+        body = body.child(
+            kit::select_row(
+                format!("summary-worst-row-{n}"),
+                format!("Open path to {} in Timing", p.to),
+                false,
+                t,
+                move |s: &mut AppState| {
+                    s.timing_view.selected = crate::views::timing::TimingNav::Summary;
+                    s.timing_view.selected_path = Some(idx);
+                    s.navigate(crate::state::CenterPane::Timing);
+                },
+            )
+            .child(kit::num_cell((n + 1).to_string(), 20.0, t.text_faint))
+            .child(kit::text_cell(p.to.clone(), 1.0, t.text))
+            .child(kit::num_cell(
+                kit::ns3(p.slack_ps),
+                72.0,
+                kit::slack_color(Some(p.slack_ps), t),
+            )),
+        );
+    }
+    el().key("summary-worst")
+        .w_full()
+        .pt(4.0)
+        .child(kit::table(head, body, t))
+}
+
+/// Run duration as `350 ms`, `4.2 s`, or `1m 05s`.
+pub fn format_duration(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else if ms < 60_000 {
+        format!("{:.1} s", ms as f64 / 1000.0)
+    } else {
+        format!("{}m {:02}s", ms / 60_000, (ms % 60_000) / 1000)
+    }
+}
+
+/// Run History card: the newest five finished runs of this session
+/// (`# | Run | Stage | Status | WNS | LUT+FF | Duration`).
+fn history_card(s: &AppState, t: &VivadoTheme) -> El {
+    use crate::runs::RunOutcome;
+    use crate::views::report_kit as kit;
+    let hist = &s.runs.history;
+    let body = if hist.is_empty() {
+        col().w_full().padding(8.0).child(
+            dim_label("No runs have finished in this session.", t).key("summary-history-empty"),
+        )
+    } else {
+        let head = kit::header_row(t)
+            .child(kit::header_num("#", 24.0, t))
+            .child(el().w(64.0).child(kit::header_cell("Run", t)))
+            .child(kit::header_cell("Stage", t).grow(1.0).min_w(0.0))
+            .child(el().w(80.0).child(kit::header_cell("Status", t)))
+            .child(kit::header_num("WNS (ns)", 72.0, t))
+            .child(kit::header_num("LUT+FF", 64.0, t))
+            .child(kit::header_num("Duration", 72.0, t));
+        let mut rows = col().w_full();
+        for (n, r) in hist.iter().rev().take(5).enumerate() {
+            let status_ink = match r.outcome {
+                RunOutcome::Complete => t.pass,
+                RunOutcome::Failed => t.fail,
+                RunOutcome::Cancelled => t.warn,
+            };
+            rows = rows.child(
+                kit::plain_row(format!("summary-history-row-{n}"))
+                    .child(kit::num_cell(r.seq.to_string(), 24.0, t.text_faint))
+                    .child(kit::fixed_cell(r.kind.run_name(), 64.0, t.text))
+                    .child(kit::text_cell(r.kind.title(), 1.0, t.text_dim))
+                    .child(kit::fixed_cell(r.outcome.label(), 80.0, status_ink))
+                    .child(kit::num_cell(
+                        kit::ns_opt(r.wns_ps),
+                        72.0,
+                        kit::slack_color(r.wns_ps, t),
+                    ))
+                    .child(kit::num_cell(
+                        r.lut_ff
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "–".into()),
+                        64.0,
+                        t.text,
+                    ))
+                    .child(kit::num_cell(format_duration(r.duration_ms), 72.0, t.text)),
+            );
+        }
+        col().w_full().padding(8.0).child(kit::table(head, rows, t))
+    };
+    card("summary-history", "Run History", None, t, body).w_full()
 }
 
 /// Utilization card: resource rows once Implementation completes.
@@ -786,7 +894,8 @@ pub fn summary_pane(s: &AppState, t: &VivadoTheme) -> El {
                         .child(half_row(synth_card(s, t), impl_card(s, t)))
                         .child(half_row(drc_card(s, t), timing_card(s, t)))
                         .child(half_row(util_card(s, t), power_card(s, t)))
-                        .child(half_row(qor_card(s, t), bitstream_card(s, t))),
+                        .child(half_row(qor_card(s, t), bitstream_card(s, t)))
+                        .child(history_card(s, t)),
                 ),
         )
 }
@@ -942,6 +1051,10 @@ mod tests {
         tap(&mut rt, "summary-run-impl-drc");
         assert_eq!(rt.state.flow.impl_run, RunStatus::Running);
         assert!(
+            rt.state.runs.is_active(),
+            "the prompt must launch a real worker, not just flip the status"
+        );
+        assert!(
             rt.state
                 .console
                 .lines
@@ -949,6 +1062,51 @@ mod tests {
                 .any(|l| l.text == "launch_runs impl_1"),
             "prompt echoes its Tcl verb"
         );
+        crate::runs::cancel_run(&mut rt.state);
+        let start = std::time::Instant::now();
+        while rt.state.runs.is_active() {
+            crate::runs::poll_runs(&mut rt.state);
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(60),
+                "run timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            rt.state.runs.history.len(),
+            1,
+            "the finished run is recorded in the history"
+        );
+    }
+
+    #[test]
+    fn history_card_lists_newest_runs_first() {
+        use crate::runs::{RunKind, RunOutcome, RunRecord};
+        let mut s = init();
+        for seq in 1..=7 {
+            s.runs.history.push(RunRecord {
+                seq,
+                kind: if seq % 2 == 0 {
+                    RunKind::Impl
+                } else {
+                    RunKind::Synth
+                },
+                outcome: RunOutcome::Complete,
+                wns_ps: Some(1200),
+                lut_ff: Some(24),
+                duration_ms: 1500,
+            });
+        }
+        let mut rt = harness_with(s);
+        rt.frame(0.0);
+        assert!(
+            rt.find("summary-history-row-4").is_some(),
+            "five newest rows"
+        );
+        assert!(rt.find("summary-history-row-5").is_none(), "capped at five");
+        assert_eq!(format_duration(350), "350 ms");
+        assert_eq!(format_duration(4200), "4.2 s");
+        assert_eq!(format_duration(65_000), "1m 05s");
     }
 
     #[test]

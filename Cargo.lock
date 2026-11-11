@@ -2002,6 +2002,7 @@ dependencies = [
  "helion-pack",
  "helion-place",
  "helion-proj",
+ "helion-route",
  "helion-sim",
  "helion-sta",
  "helion-sv",
