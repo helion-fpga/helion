@@ -30,6 +30,7 @@ pub mod ip_canvas;
 pub mod ip_dialogs;
 pub mod ip_model;
 pub mod palette;
+pub mod part_picker;
 pub mod program;
 pub mod report_kit;
 pub mod reports;
