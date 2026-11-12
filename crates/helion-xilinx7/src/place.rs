@@ -300,7 +300,39 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
     // the CO nets unroutable.
     let (ax, ay) = anchor.unwrap_or((0, 0));
     let mut carry_anchor = packed.carry_anchor.clone();
+    // Slice grid by site-name coordinates, for adder columns.
+    let slice_grid: HashMap<(i32, i32), (String, String, i32, i32)> = device
+        .all_slices()
+        .into_iter()
+        .filter_map(|(tile, site, gx, gy)| crate::xdevice::parse_slice_xy(&site).map(|xy| (xy, (tile, site, gx, gy))))
+        .collect();
     for chain in order_carry_chains(&packed.carries)? {
+        // An adder chain is a plain cascade: COUT of SLICE_XxYy feeds CIN
+        // of SLICE_XxY(y+1). It takes the free column run nearest the
+        // anchor.
+        if packed.adder_carries.contains(&chain[0].name) && !slice_grid.is_empty() {
+            let len = chain.len() as i32;
+            let mut best: Option<(i32, (i32, i32))> = None;
+            for (&(x, y), (_, _, gx, gy)) in &slice_grid {
+                let d = (gx - ax).abs() + (gy - ay).abs();
+                if best.map(|(bd, bxy)| (d, (x, y)) >= (bd, bxy)).unwrap_or(false) {
+                    continue;
+                }
+                let free = (0..len).all(|k| slice_grid.get(&(x, y + k)).map(|s| !used_sites.contains(&s.1)).unwrap_or(false));
+                if free {
+                    best = Some((d, (x, y)));
+                }
+            }
+            let Some((_, (x, y))) = best else {
+                return Err(format!("place: no free column of {len} slices for the carry chain of {}", chain[0].name));
+            };
+            for (k, carry) in chain.iter().enumerate() {
+                let (tile, site, _, _) = slice_grid[&(x, y + k as i32)].clone();
+                used_sites.insert(site.clone());
+                out.carries.push(PlacedCarry { name: carry.name.clone(), tile, site });
+            }
+            continue;
+        }
         let mut prev_site: Option<String> = None;
         for carry in chain {
             let (tile, site) = match &prev_site {
@@ -370,6 +402,7 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
     }
     let mut carry_lut_slots: HashSet<(String, char)> = HashSet::new();
     let mut carry_ff_slots: HashSet<(String, char)> = HashSet::new();
+    let adder_sites: HashSet<String> = out.carries.iter().filter(|c| packed.adder_carries.contains(&c.name)).map(|c| c.site.clone()).collect();
 
     // 3. Pair FFs with their driving LUTs (FF.D == LUT.O) into one slice.
     let lut_by_output: HashMap<&str, usize> = packed
@@ -468,7 +501,15 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         // Carry-driven FF: same slice and letter as its carry bit, so the
         // O-to-D path stays site-internal. A double-booked slot fails loud.
         let ctrl = CtrlSet::of(ff);
-        if let Some((tile, site, letter)) = o_slot.get(ff.d_net.as_str()) {
+        // A sum bit of an adder may also be registered by a flop that
+        // cannot share the slice (another control set, or a second flop on
+        // the same bit): that flop is placed like any other and takes the
+        // sum through the fabric.
+        let adder_clash = o_slot.get(ff.d_net.as_str()).is_some_and(|(_, site, letter)| {
+            adder_sites.contains(site.as_str())
+                && (carry_ff_slots.contains(&(site.clone(), *letter)) || site_ctrl.get(site).is_some_and(|have| *have != ctrl))
+        });
+        if let Some((tile, site, letter)) = o_slot.get(ff.d_net.as_str()).filter(|_| !adder_clash) {
             if !carry_ff_slots.insert((site.clone(), *letter)) {
                 return Err(format!(
                     "place: FF {} collides on {site}.{letter}FF in carry slice",
@@ -658,7 +699,7 @@ mod tests {
             brams: vec![],
             dsps: vec![],
             carries: vec![],
-            carry_anchor: None,
+            carry_anchor: None, ..Default::default()
         }
     }
 

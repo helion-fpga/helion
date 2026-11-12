@@ -130,7 +130,9 @@ impl Design {
                     _ => {
                         root[ni] = true;
                         fanout[ni] += 1;
-                        if matches!(self.cells[ci].kind, CellKind::Carry4) {
+                        // The LUT on a carry propagate pin shares its
+                        // site with the carry: it keeps its shape.
+                        if matches!(self.cells[ci].kind, CellKind::Carry4) && e.pin.starts_with('S') {
                             to_carry[ni] = true;
                         }
                     }

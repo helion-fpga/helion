@@ -35,6 +35,13 @@ fn map_vhdl_origin(source: &str, origin: &str) -> Result<MapResult, String> {
     map_vhdl_top(source, origin, None)
 }
 
+/// Map adders, subtractors and comparators to dedicated carry chains
+/// (7-series `CARRY4`) instead of LUT logic. Off by default.
+pub fn set_carry_arith(on: bool) {
+    v2::set_carry_arith(on);
+    helion_sv::set_carry_adders(on);
+}
+
 /// Synthesize with an explicit top-level entity (`None`: the last entity no
 /// other entity instantiates).
 pub fn synth_vhdl_top(source: &str, top: Option<&str>) -> Result<Design, String> {

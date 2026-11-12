@@ -606,6 +606,25 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
             .iter()
             .find(|c| c.name == carry.name)
             .ok_or_else(|| format!("emit: placed CARRY4 {} has no packed cell", carry.name))?;
+        if packed.adder_carries.contains(&carry.name) {
+            // General adder: carry in from config (head) or the cascade,
+            // generate from O5 where the bit has one, sum out on XOR.
+            let src = match packed_c.cyinit {
+                Some(true) => "C1",
+                Some(false) => "C0",
+                None => "CIN",
+            };
+            lines.push(format!("{}.{}.PRECYINIT.{}", carry.tile, site_rel, src));
+            for (j, letter) in ['A', 'B', 'C', 'D'].into_iter().enumerate() {
+                if packed_c.di_nets[j].is_some() && packed_c.s_nets[j].is_some() {
+                    lines.push(format!("{}.{}.CARRY4.{letter}CY0", carry.tile, site_rel));
+                }
+                if packed_c.o_nets[j].is_some() {
+                    lines.push(format!("{}.{}.{letter}OUTMUX.XOR", carry.tile, site_rel));
+                }
+            }
+            continue;
+        }
         // ACY0 accompanies AX exactly (golden: head-AX and transit-AX
         // carry it; C0 and CIN never do).
         let mut use_ax = false;
@@ -815,7 +834,7 @@ mod tests {
             brams: vec![],
             dsps: vec![],
             carries: vec![],
-            carry_anchor: None,
+            carry_anchor: None, ..Default::default()
         };
         let placed = Placed7 {
             packed: packed.clone(),
@@ -1275,7 +1294,7 @@ mod tests {
             brams: vec![PackedBram { name: "u_bram".into(), init: vec![] }],
             dsps: vec![],
             carries: vec![],
-            carry_anchor: None,
+            carry_anchor: None, ..Default::default()
         };
         let placed = Placed7 {
             packed: packed.clone(),

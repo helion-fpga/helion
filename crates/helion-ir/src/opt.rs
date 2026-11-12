@@ -455,6 +455,16 @@ impl Design {
                 }
             }
         }
+        // A LUT on a carry propagate pin shares the carry's site and must
+        // stay a LUT, even as a buffer.
+        let carry_cells: HashSet<&str> = self.cells.iter().filter(|c| matches!(c.kind, CellKind::Carry4)).map(|c| c.name.as_str()).collect();
+        let feeds_carry_s: HashSet<usize> = self
+            .nets
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.endpoints.iter().any(|e| e.pin.starts_with('S') && carry_cells.contains(e.cell.as_str())))
+            .map(|(i, _)| i)
+            .collect();
         let mut map: HashMap<usize, usize> = HashMap::new();
         let mut buf_cells: HashSet<String> = HashSet::new();
         for (ci, c) in self.cells.iter().enumerate() {
@@ -467,7 +477,7 @@ impl Design {
             else {
                 continue;
             };
-            if inn == outn || self.driver_guarded(ci, outn, &ila) || self.is_output_port_bit_net(&self.nets[outn].name) {
+            if inn == outn || feeds_carry_s.contains(&outn) || self.driver_guarded(ci, outn, &ila) || self.is_output_port_bit_net(&self.nets[outn].name) {
                 continue;
             }
             map.insert(outn, inn);
