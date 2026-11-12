@@ -21,11 +21,11 @@ updates the QoR tests and says why.
 | 2.1 | shipped | Performance and area campaigns, IDE rebuild |
 | 2.5 | shipped | IDE features: cross-probing, Tcl console, runs, checkpoints, ILA |
 | 3.0 | shipped | Xilinx 7-series backend; SAT equivalence, SVA, CDC |
-| **4.0** | **in preparation** | **Rune IDE, iCE40 and ECP5 backends, self-contained build, native JTAG on real hardware** |
+| 4.0 | shipped | Rune IDE, iCE40 and ECP5 backends, self-contained build, native JTAG on real hardware |
 
 ## 4.0: what it delivers
 
-The details are in the [changelog](CHANGELOG.md#400--unreleased).
+Released 2026-11-12. The details are in the [changelog](CHANGELOG.md#400--2026-11-12).
 
 - **A new IDE.** `helion-ide` is rebuilt on the Rune UI framework: a
   Vivado-style shell with Flow Navigator, Sources, Summary, device view with
@@ -50,8 +50,6 @@ The details are in the [changelog](CHANGELOG.md#400--unreleased).
   falling-edge TDO sampling above 15 MHz.
 - **The egui IDE is removed.** `helion-ide` is the Rune IDE.
 
-Release checklist for 4.0: set the release date in the changelog and tag
-`v4.0.0` per [RELEASING.md](RELEASING.md).
 
 ## After 4.0
 

@@ -242,7 +242,7 @@ nextpnr's; calibrating it is on the roadmap.
 
 ## Project status and roadmap
 
-The next release is **4.0**: the new Rune-based IDE replaces the egui IDE,
+The current release is **4.0**: the new Rune-based IDE replaces the egui IDE,
 iCE40 and ECP5 backends join HL10 and Xilinx 7-series, the native JTAG
 engine reaches real hardware, and the build is self-contained. See the [changelog](CHANGELOG.md) for the details.
 
