@@ -494,10 +494,7 @@ impl Fabric {
             if sel < tracks::SB_WIRE {
                 return WireSrc::LutO(x, y, (sel - tracks::SB_LUT_O) as u8);
             }
-            let (side, t) = ((sel - tracks::SB_WIRE) / tracks::TRACKS, (sel - tracks::SB_WIRE) % tracks::TRACKS);
-            if side >= 4 {
-                return WireSrc::Zero;
-            }
+            let Some((side, t)) = tracks::sb_wire_src(dir, sel) else { return WireSrc::Zero };
             let Some((nx, ny)) = tracks::step(x, y, side) else { return WireSrc::Zero };
             (x, y, dir, track) = (nx, ny, tracks::opposite(side), t);
         }
@@ -761,7 +758,7 @@ impl Fabric {
                 for pin in 0..6u32 {
                     let mux = ble * 8 + pin;
                     out.push(self.clb_abs_bit(x, y, tracks::ABS_IMUXT + mux).then(|| {
-                        let s = self.imux_sel(x, y, mux) as u32 & 63;
+                        let s = self.imux_sel(x, y, mux) as u32 & 127;
                         self.arriving_src(x, y, s / tracks::TRACKS, s % tracks::TRACKS)
                     }));
                 }
@@ -835,7 +832,7 @@ impl Fabric {
             let ix = self.clb_x0 + dx;
             let w = self.iob_word(ix, iy);
             if w & 1 == 1 && (w >> tracks::IOB_TRACK_OUT) & 1 == 1 {
-                let t = ((w >> tracks::IOB_TRACK_SHIFT) & (tracks::TRACKS as u128 - 1)) as u32;
+                let t = ((w >> tracks::IOB_TRACK_SHIFT) & ((1u128 << tracks::IOB_TRACK_BITS) - 1)) as u32;
                 let v = self.wire_val(ix, iy + 1, tracks::S, t);
                 self.iobs.insert((ix, iy), v);
             }

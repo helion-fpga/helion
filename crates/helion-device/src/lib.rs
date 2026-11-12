@@ -1895,7 +1895,7 @@ mod tests {
 /// | 0 | off (the wire reads 0) |
 /// | 1..=8 | output of local BLE `select - 1` (flop Q when the flop is used, else LUT O) |
 /// | 9..=16 | LUT O of local BLE `select - 9` |
-/// | 17 + side*TRACKS + track | the wire arriving from the neighbour on `side` |
+/// | 17 + rel*TRACKS + track | the wire arriving from another side (`sb_wire_sel`; a wire never turns back) |
 ///
 /// A LUT input reads a wire when its `IMUXT` flag is set: its IMUX select
 /// is then `side*TRACKS + track` of an arriving wire. Without the flag the IMUX
@@ -1907,7 +1907,9 @@ mod tests {
 /// arriving in that CLB from the south.
 pub mod tracks {
     /// Wires per direction per tile.
-    pub const TRACKS: u32 = 16;
+    /// As many as the CLB frame has room for: 4 * 31 switch-box selects
+    /// of 7 bits end just below the frame's 2048 bits.
+    pub const TRACKS: u32 = 31;
     pub const SB_SEL_BITS: u32 = 7;
     /// Directions: north is y + 1, east is x + 1.
     pub const N: u32 = 0;
@@ -1924,13 +1926,35 @@ pub mod tracks {
     pub const ABS_SB: u32 = ABS_IMUXT + 64;
     /// IOB word (minor 0): output pad reads a track.
     pub const IOB_TRACK_OUT: u32 = 40;
-    /// IOB word: track index, 4 bits from here.
+    /// IOB word: track index, `IOB_TRACK_BITS` bits from here.
     pub const IOB_TRACK_SHIFT: u32 = 41;
+    pub const IOB_TRACK_BITS: u32 = 5;
     /// IOB word: the pad is an input.
-    pub const IOB_INPUT: u32 = 45;
+    pub const IOB_INPUT: u32 = 46;
 
     pub const fn sb_abs(dir: u32, track: u32, bit: u32) -> u32 {
         ABS_SB + (dir * TRACKS + track) * SB_SEL_BITS + bit
+    }
+
+    /// Switch-box select that feeds the wire leaving towards `dir` from
+    /// the wire arriving from the neighbour on `side`, track `track`. A
+    /// wire never turns back, so `side != dir` and three sides are encoded.
+    pub const fn sb_wire_sel(dir: u32, side: u32, track: u32) -> u32 {
+        let rel = if side < dir { side } else { side - 1 };
+        SB_WIRE + rel * TRACKS + track
+    }
+
+    /// Inverse of [`sb_wire_sel`]: (side, track).
+    pub const fn sb_wire_src(dir: u32, sel: u32) -> Option<(u32, u32)> {
+        if sel < SB_WIRE {
+            return None;
+        }
+        let rel = (sel - SB_WIRE) / TRACKS;
+        if rel >= 3 {
+            return None;
+        }
+        let side = if rel < dir { rel } else { rel + 1 };
+        Some((side, (sel - SB_WIRE) % TRACKS))
     }
 
     pub const fn opposite(dir: u32) -> u32 {

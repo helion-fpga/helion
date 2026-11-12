@@ -433,6 +433,11 @@ pub fn check_routed(design: &Design, routed: &Routed, dev: &Device) -> Drc {
     for u in &conn.undriven {
         d.add_warn("ROUTE-4", u, format!("LUT input {u} has no driver and reads 0"));
     }
+    // A clocking scheme the fabric cannot realise is not a warning: the
+    // bitstream would run every flop from the one global clock.
+    for p in &conn.clock_problems {
+        d.add("CLK-1", "clock", p.clone());
+    }
     d
 }
 

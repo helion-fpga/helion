@@ -245,9 +245,13 @@ fn program_clb_frames(
             return Err(format!("bad wire-fed IMUX[{}] select {}", m.mux, m.sel));
         }
         or_clb_bit(frames, major, tk::ABS_IMUXT + m.mux, fb);
-        for b in 0..6u32 {
+        for b in 0..7u32 {
             if (m.sel >> b) & 1 == 1 {
-                let abs = if b < 5 { feat.imux0_abs + m.mux * 5 + b } else { feat.imux5_abs + m.mux };
+                let abs = match b {
+                    0..=4 => feat.imux0_abs + m.mux * 5 + b,
+                    5 => feat.imux5_abs + m.mux,
+                    _ => feat.imux6_abs + m.mux,
+                };
                 or_clb_bit(frames, major, abs, fb);
             }
         }

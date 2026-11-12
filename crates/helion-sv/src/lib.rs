@@ -25114,6 +25114,49 @@ pub fn synth_sv_v2_path(path: &Path, top: Option<&str>) -> Result<v2::Synth, Str
     synth_sv_v2_files(&[path], top)
 }
 
+/// Synthesize files as one design with the v2 front end, falling back to
+/// the first-generation one only when v2 reports that the design uses
+/// something it does not support. The fallback is announced on stderr: its
+/// netlists are not held to the same standard (see `tools/svcheck`).
+///
+/// `HELION_SV_FRONTEND=v2` forbids the fallback; `=legacy` skips v2.
+pub fn synth_sv_auto_files(paths: &[&Path], top: Option<&str>) -> Result<Design, String> {
+    let mode = std::env::var("HELION_SV_FRONTEND").unwrap_or_default();
+    let legacy = |paths: &[&Path]| -> Result<Design, String> {
+        if paths.len() == 1 && top.is_none() {
+            synth_sv_path(paths[0])
+        } else {
+            let mut owned: Vec<(String, String)> = Vec::new();
+            for p in paths {
+                owned.push((p.display().to_string(), std::fs::read_to_string(p).map_err(|e| e.to_string())?));
+            }
+            let refs: Vec<(&str, &str)> = owned.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+            match top {
+                Some(t) => elaborate_sv_sources(&refs, Some(t), &Default::default(), &Default::default()).map(|r| r.0),
+                None => synth_sv_sources(&refs),
+            }
+        }
+    };
+    if mode == "legacy" {
+        return legacy(paths);
+    }
+    match synth_sv_v2_files(paths, top) {
+        Ok(s) => {
+            for w in &s.warnings {
+                eprintln!("warning: {w}");
+            }
+            eprintln!("synth: {} LUTs, {} flops, {} LUT levels", s.luts, s.ffs, s.depth);
+            Ok(s.design)
+        }
+        Err(e) if mode == "v2" => Err(e),
+        Err(e) => {
+            eprintln!("note: {e}");
+            eprintln!("note: falling back to the first-generation front end for this design");
+            legacy(paths)
+        }
+    }
+}
+
 /// Module names in one SV file (helion-sv parse). UG900 SIM_TOP candidates.
 pub fn list_sv_modules(source: &str) -> Result<Vec<String>, String> {
     list_sv_modules_origin(source, "t.sv")
