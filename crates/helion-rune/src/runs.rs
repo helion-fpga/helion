@@ -748,6 +748,14 @@ pub fn deliver(s: &mut AppState, kind: RunKind, event: RunEvent) {
                         .to_string();
                     apply_artifacts(s, art.clone());
                     s.runs.active_result = Some(name.clone());
+                    // Open the finished run for the Tcl console (Vivado's
+                    // "Open Implemented Design"), so reports work at once.
+                    if let Ok(line) = crate::tcl::open_run(s) {
+                        s.console.lines.push(ConsoleLine {
+                            text: line,
+                            sev: MsgSev::Info,
+                        });
+                    }
                     let verb = match kind {
                         RunKind::Synth => {
                             if builtin {
@@ -2537,6 +2545,33 @@ mod tests {
         );
     }
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_finished_run_is_open_for_tcl_reports() {
+        let mut s = AppState::demo();
+        s.tcl.reset_design_state();
+        start_run(&mut s, RunKind::Impl, counter_source(), "HL10T-C32-1".into()).expect("start");
+        pump_until_idle(&mut s, Duration::from_secs(180));
+        assert_eq!(s.flow.impl_run, RunStatus::Complete);
+        assert!(
+            s.console.lines.iter().any(|l| l.text.starts_with("open_run impl_1:")),
+            "the finished run opens for the console"
+        );
+        let util = crate::tcl::eval_batch(&mut s, "report_utilization").expect("utilization");
+        assert!(util.contains("LUTFF"), "{util}");
+        let timing = crate::tcl::eval_batch(&mut s, "report_timing").expect("timing");
+        assert!(timing.contains("WNS"), "{timing}");
+        assert!(crate::tcl::eval_batch(&mut s, "open_run impl_1").is_ok());
+        assert!(crate::tcl::eval_batch(&mut s, "open_run synth_9").is_err());
+    }
+
+    #[test]
+    fn open_run_without_a_finished_run_says_so() {
+        let mut s = AppState::demo();
+        s.runs.live_design = None;
+        let e = crate::tcl::eval_batch(&mut s, "open_run").unwrap_err();
+        assert!(e.contains("no finished run"), "{e}");
+    }
 
     #[test]
     fn incomplete_route_is_a_critical_warning_not_a_clean_run() {

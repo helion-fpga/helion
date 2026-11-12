@@ -212,8 +212,8 @@ pub fn paths_table(
                 move |s: &mut AppState| s.timing_view.selected_path = Some(idx),
             )
             .child(num_cell((n + 1).to_string(), IDX_W, t.text_faint))
-            .child(kit::text_cell(p.from.clone(), 2.0, t.text))
-            .child(kit::text_cell(p.to.clone(), 2.0, t.text))
+            .child(kit::name_cell(p.from.clone(), 2.0, t.text))
+            .child(kit::name_cell(p.to.clone(), 2.0, t.text))
             .child(kit::fixed_cell(dash(&p.launch_clock), CLK_W, t.text_dim))
             .child(kit::fixed_cell(dash(&p.capture_clock), CLK_W, t.text_dim))
             .child(num_cell(

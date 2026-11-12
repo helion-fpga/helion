@@ -924,13 +924,19 @@ fn cell_node(
         node = node.on_press(move |s: &mut AppState| select(s, tap.clone()));
     }
     // Label density follows the LOD; small child cells only ever show a name.
+    // Labels stay inside the box (long hierarchical names truncate in the
+    // middle, full name on hover).
     let small = w < 100.0;
+    let label_w = (w * z - 8.0).max(0.0);
     if expanded_block {
         node = node.child(
             text(name.as_str())
                 .font(VivadoTheme::FONT_UI)
                 .color(t.text_dim)
-                .absolute(5.0 * z, 2.0 * z),
+                .absolute(5.0 * z, 2.0 * z)
+                .max_w(label_w)
+                .truncate_middle()
+                .help_when_truncated(name.clone()),
         );
     } else if small || lod != Lod::Full {
         node = node.child(
@@ -941,7 +947,10 @@ fn cell_node(
                     } else {
                         VivadoTheme::FONT_UI
                     })
-                    .color(t.text),
+                    .color(t.text)
+                    .max_w(label_w)
+                    .truncate_middle()
+                    .help_when_truncated(name.clone()),
             ),
         );
     } else {
@@ -953,7 +962,10 @@ fn cell_node(
                 .child(
                     text(name.as_str())
                         .font(VivadoTheme::FONT_TITLE)
-                        .color(t.text),
+                        .color(t.text)
+                        .max_w(label_w)
+                        .truncate_middle()
+                        .help_when_truncated(name.clone()),
                 )
                 .child(text(kind_label).font(FONT_PIN).color(t.text_dim)),
         );
