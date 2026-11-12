@@ -123,6 +123,10 @@ pub struct Reg {
     pub clk: N,
     pub negedge: bool,
     pub mask: Vec<bool>,
+    /// Asynchronous control: (one-bit node, active level). While it is at
+    /// that level every flop with `arst_mask` holds its power-up value.
+    pub arst: Option<(N, bool)>,
+    pub arst_mask: Vec<bool>,
 }
 
 pub struct Port {
@@ -604,6 +608,7 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
         d: Lit,
         clk: Lit,
         negedge: bool,
+        arst: Option<(Lit, bool)>,
     }
     let mut reg_bits: Vec<RegBit> = Vec::new();
     let mut done = 0usize;
@@ -628,7 +633,15 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
             d = bl.aig.mux(en, d, q);
         }
         let clk = bl.bit(cn, cb)?;
-        reg_bits.push(RegBit { sig, bit, d, clk, negedge: r.negedge });
+        let arst = match r.arst {
+            Some((n, level)) if r.arst_mask[bit as usize] => {
+                let l = bl.bit(n, 0)?;
+                // An inverted literal is the same signal with the other level.
+                Some((l & !1, level ^ (l & 1 == 1)))
+            }
+            _ => None,
+        };
+        reg_bits.push(RegBit { sig, bit, d, clk, negedge: r.negedge, arst });
     }
     let Blaster { aig, pi_name, hints, undriven, .. } = bl;
     let map = Mapper::run(&aig);
@@ -799,6 +812,16 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
         d.connect(&dnet, &cell, "D");
         d.connect(&q, &cell, "Q");
         d.connect(&cnet, &cell, "CLK");
+        if let Some((l, level)) = rb.arst {
+            // The stored bit is the register XOR its power-up value, and
+            // the reset value is that power-up value: the flop resets to 0.
+            let rnet = emit(l, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut);
+            d.connect(&rnet, &cell, "ARST");
+            if let Some(c) = d.cells.iter_mut().rev().find(|c| helion_ir::resolve(c.name) == cell) {
+                c.attrs.set("ARST_LEVEL", if level { "1" } else { "0" });
+                c.attrs.set("ARST_VAL", "0");
+            }
+        }
     }
     // Output pads: one per bit, in bit order.
     let mut n_iob = 0usize;

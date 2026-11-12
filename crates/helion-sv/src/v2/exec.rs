@@ -1841,10 +1841,6 @@ impl Elab {
             if free.len() != 1 {
                 return self.err("cannot tell the clock from the asynchronous controls in this sensitivity list");
             }
-            let note = "asynchronous set/reset is built as synchronous (the reset takes effect at the next clock edge)";
-            if !self.warnings.iter().any(|w| w.ends_with(note)) {
-                self.warnings.push(format!("line {line}: {note}"));
-            }
             free[0]
         };
         // Asynchronous controls that are plain one-bit signals, with their active level.
@@ -1869,6 +1865,7 @@ impl Elab {
         let mut ids: Vec<u32> = env.sig.keys().chain(env.nba.keys()).copied().collect();
         ids.sort_unstable();
         ids.dedup();
+        let mut any_sync_reset = false;
         for id in ids {
             if env.sig.contains_key(&id) && env.nba.contains_key(&id) {
                 let name = self.sigs[id as usize].name.clone();
@@ -1902,7 +1899,55 @@ impl Elab {
                     }
                 }
             }
-            self.regs.push(Reg { sig: id, d, clk, negedge: !*pos, mask });
+            // One plain asynchronous control with constant reset values is
+            // a real asynchronous reset: the flop is forced while the
+            // control is active, and its data input is the rest of the
+            // block (the control at its inactive level).
+            let mut arst = None;
+            let mut arst_mask = vec![false; mask.len()];
+            let mut d = d;
+            if active.len() == 1 && edges.len() == 2 {
+                let (sig, level) = active[0];
+                let mut memo: HashMap<N, N> = HashMap::new();
+                let mut fix = |g: &mut super::dag::Dag, n: N| -> Option<N> {
+                    let Op::Read(s) = *g.op(n) else { return None };
+                    (s == sig).then(|| g.konst(vec![level; g.w(n) as usize]))
+                };
+                let at_reset = self.dag.subst(d, &mut fix, &mut memo);
+                let mut all = true;
+                for (b, m) in mask.iter().enumerate() {
+                    if *m {
+                        let bit = self.dag.slice(at_reset, b as u32, 1);
+                        if self.dag.as_const(bit).is_some() {
+                            arst_mask[b] = true;
+                        } else {
+                            all = false;
+                        }
+                    }
+                }
+                if arst_mask.iter().any(|m| *m) {
+                    arst = Some((self.dag.read(sig, 1), level));
+                }
+                if all {
+                    let mut memo: HashMap<N, N> = HashMap::new();
+                    let mut off = |g: &mut super::dag::Dag, n: N| -> Option<N> {
+                        let Op::Read(s) = *g.op(n) else { return None };
+                        (s == sig).then(|| g.konst(vec![!level; g.w(n) as usize]))
+                    };
+                    d = self.dag.subst(d, &mut off, &mut memo);
+                } else {
+                    any_sync_reset = true;
+                }
+            } else if !active.is_empty() || edges.len() > 1 {
+                any_sync_reset = true;
+            }
+            self.regs.push(Reg { sig: id, d, clk, negedge: !*pos, mask, arst, arst_mask });
+        }
+        if any_sync_reset {
+            let note = "an asynchronous control here is built as synchronous (it is not one plain signal with constant reset values); it takes effect at the next clock edge";
+            if !self.warnings.iter().any(|w| w.ends_with(note)) {
+                self.warnings.push(format!("line {line}: {note}"));
+            }
         }
         Ok(())
     }

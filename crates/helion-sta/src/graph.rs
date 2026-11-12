@@ -36,6 +36,12 @@ pub fn analyze_hl10t(routed: &Routed, period_ps: i64) -> Option<GraphTiming> {
 /// Analyse `routed` against a clock period. `None` when the design was not
 /// routed from its full connection list.
 pub fn analyze(routed: &Routed, tm: &TimingModel, period_ps: i64) -> Option<GraphTiming> {
+    analyze_with_pad(routed, tm, period_ps, tm.iob_ps)
+}
+
+/// [`analyze`] with the output pad delay given (it depends on the I/O
+/// standard, drive and termination of the design's pads).
+pub fn analyze_with_pad(routed: &Routed, tm: &TimingModel, period_ps: i64, pad_ps: i64) -> Option<GraphTiming> {
     if !routed.tracks.active {
         return None;
     }
@@ -155,7 +161,7 @@ pub fn analyze(routed: &Routed, tm: &TimingModel, period_ps: i64) -> Option<Grap
                 _ => 0,
             },
         };
-        let t = a + hops * tm.hop_ps + tm.iob_ps;
+        let t = a + hops * tm.hop_ps + pad_ps;
         out.out_ps = out.out_ps.max(t);
         note(t, format!("pad {}", io.cell), src, &mut out, &mut worst);
     }

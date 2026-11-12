@@ -273,6 +273,8 @@ pub struct Fabric {
     clb_line: BTreeMap<(u32, u32), u8>,
     /// Some flop on the implicit clock captures on the falling edge.
     implicit_falling: bool,
+    /// CLBs with an asynchronous reset: (line, active level).
+    clb_rst: BTreeMap<(u32, u32), (u8, bool)>,
     pub stat: Stat,
     cfg_steps: u32,
     /// Runtime BRAM data plane (capture RAM / dual-port writes). Seeded empty on program;
@@ -316,6 +318,7 @@ impl Fabric {
             clk_prev: [None; 4],
             clb_line: BTreeMap::new(),
             implicit_falling: false,
+            clb_rst: BTreeMap::new(),
             stat: Stat::reset(),
             cfg_steps: 0,
             bram_data: BTreeMap::new(),
@@ -842,9 +845,14 @@ impl Fabric {
         for &(x, y) in &self.used {
             let line = self.clb_line.get(&(x, y)).copied().unwrap_or(0) as usize;
             let Some(rising) = edges[line] else { continue };
+            let held = self.reset_active(x, y);
             for ble in 0..self.n_ble {
                 let ff_base = 512 + 40 + ble * 5;
                 if !self.clb_abs_bit(x, y, ff_base) {
+                    continue;
+                }
+                // A flop held in reset ignores the clock.
+                if held && !self.clb_abs_bit(x, y, ff_base + 3) {
                     continue;
                 }
                 let falling_ff = self.clb_abs_bit(x, y, ff_base + 4);
@@ -856,6 +864,42 @@ impl Fabric {
         for (xy, ble, d) in captured {
             self.clbs.get_mut(&xy).unwrap().q[ble] = d;
         }
+    }
+
+    /// Whether the CLB's asynchronous reset line is at its active level.
+    fn reset_active(&self, x: u32, y: u32) -> bool {
+        match self.clb_rst.get(&(x, y)) {
+            Some(&(line, level)) => match self.clk_src[line as usize] {
+                Some(src) => self.clk_value(src) == level,
+                None => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Force the flops of every CLB whose reset is active to their reset
+    /// values. Returns whether any flop changed.
+    fn apply_resets(&mut self) -> bool {
+        if !self.stat.gwe || self.stat.gsr {
+            return false;
+        }
+        let mut changed = false;
+        let held: Vec<(u32, u32)> = self.clb_rst.keys().copied().filter(|&(x, y)| self.reset_active(x, y)).collect();
+        for (x, y) in held {
+            for ble in 0..self.n_ble {
+                let ff_base = 512 + 40 + ble * 5;
+                if !self.clb_abs_bit(x, y, ff_base) || self.clb_abs_bit(x, y, ff_base + 3) {
+                    continue;
+                }
+                let val = self.clb_abs_bit(x, y, ff_base + 2);
+                let c = self.clbs.get_mut(&(x, y)).unwrap();
+                if c.q[ble as usize] != val {
+                    c.q[ble as usize] = val;
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     fn clk_value(&self, src: ClkSrc) -> bool {
@@ -874,6 +918,10 @@ impl Fabric {
         }
         for _ in 0..1024 {
             self.eval_comb();
+            // Asynchronous resets act first and at once.
+            if self.apply_resets() {
+                continue;
+            }
             let mut edges = [None; 4];
             let mut any = false;
             for n in 0..4 {
@@ -899,6 +947,7 @@ impl Fabric {
         self.clk_src = [None; 4];
         self.clk_prev = [None; 4];
         self.clb_line.clear();
+        self.clb_rst.clear();
         self.implicit_falling = false;
         let line_mask = (1u32 << clocks::LINE_BITS) - 1;
         let iy = self.clb_y0.saturating_sub(1);
@@ -914,6 +963,10 @@ impl Fabric {
             let line = bits(self, clocks::ABS_CLKSEL, clocks::LINE_BITS);
             if line != 0 {
                 self.clb_line.insert((x, y), line as u8);
+            }
+            if self.clb_abs_bit(x, y, clocks::ABS_RST_EN) {
+                let rl = bits(self, clocks::ABS_RST_LINE, clocks::LINE_BITS) as u8;
+                self.clb_rst.insert((x, y), (rl, !self.clb_abs_bit(x, y, clocks::ABS_RST_LOW)));
             }
             if self.clb_abs_bit(x, y, clocks::ABS_GDRV_EN) {
                 let drv_line = bits(self, clocks::ABS_GDRV_LINE, clocks::LINE_BITS) as usize;

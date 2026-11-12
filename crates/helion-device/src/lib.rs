@@ -1311,7 +1311,12 @@ impl FeatureMap {
         for b in 0..3 {
             bits.insert(format!("GDRV.BLE[{b}]"), clocks::ABS_GDRV_BLE + b);
         }
-        cursor = clocks::ABS_GDRV_BLE + 3;
+        bits.insert("RST.EN".to_string(), clocks::ABS_RST_EN);
+        for b in 0..clocks::LINE_BITS {
+            bits.insert(format!("RST.LINE[{b}]"), clocks::ABS_RST_LINE + b);
+        }
+        bits.insert("RST.LOW".to_string(), clocks::ABS_RST_LOW);
+        cursor = clocks::ABS_RST_LOW + 1;
         debug_assert!(cursor <= n_minors * frame_bits);
         Self {
             bits,
@@ -1994,6 +1999,10 @@ pub mod tracks {
 /// `GDRV.LINE` from the output of its BLE `GDRV.BLE` (a divided or gated
 /// clock). Line 0 with no driver is the implicit user clock that the
 /// configuration port steps, which is how a single-clock design runs.
+///
+/// The same lines carry asynchronous set/reset signals: a CLB with
+/// `RST.EN` holds its flops at their reset values while its reset line is
+/// at its active level, whatever the clock does.
 pub mod clocks {
     pub const LINES: u32 = 4;
     pub const LINE_BITS: u32 = 2;
@@ -2002,6 +2011,11 @@ pub mod clocks {
     pub const ABS_GDRV_EN: u32 = ABS_CLKSEL + LINE_BITS;
     pub const ABS_GDRV_LINE: u32 = ABS_GDRV_EN + 1;
     pub const ABS_GDRV_BLE: u32 = ABS_GDRV_LINE + LINE_BITS;
+    /// The CLB's flops (those without `FF.SYNC`) are asynchronously forced
+    /// to their `FF.SRVAL` while line `RST.LINE` is high (low with `RST.LOW`).
+    pub const ABS_RST_EN: u32 = ABS_GDRV_BLE + 3;
+    pub const ABS_RST_LINE: u32 = ABS_RST_EN + 1;
+    pub const ABS_RST_LOW: u32 = ABS_RST_LINE + LINE_BITS;
     /// IOB word (minor 0): the input pad drives a clock line.
     pub const IOB_CLOCK: u32 = 47;
     /// IOB word: the line, `LINE_BITS` bits from here.

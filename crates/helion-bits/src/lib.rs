@@ -182,6 +182,10 @@ fn program_clb_frames(
     let full = routed.tracks.active;
     use helion_device::clocks as ck;
     let mut clb_line: std::collections::HashMap<(u32, u32), u8> = std::collections::HashMap::new();
+    let mut clb_rst: std::collections::HashMap<(u32, u32), (u8, bool)> = std::collections::HashMap::new();
+    if !packed.conn.clock_problems.is_empty() && packed.conn.ff_reset.iter().any(|r| r.is_some()) {
+        return Err(format!("bitgen: {}", packed.conn.clock_problems[0]));
+    }
     for (i, lutff) in packed.lutffs.iter().enumerate() {
         let mut norm;
         let lutff = if full {
@@ -233,11 +237,41 @@ fn program_clb_frames(
                     or_clb_bit(frames, major, feat.ff_used_abs[bi] + 4, fb);
                 }
             }
+            // Asynchronous reset: the block's reset line and level, the
+            // flop's value while reset (FF.SRVAL); a flop without one is
+            // marked FF.SYNC and ignores the block's reset.
+            match packed.conn.ff_reset.get(i).copied().flatten() {
+                Some((line, level, val)) => {
+                    match clb_rst.insert((site.x, site.y), (line, level)) {
+                        Some(other) if other != (line, level) => {
+                            return Err(format!("bitgen: CLB_X{}Y{} holds flops of two asynchronous resets; a block has one", site.x, site.y))
+                        }
+                        _ => {}
+                    }
+                    or_clb_bit(frames, major, ck::ABS_RST_EN, fb);
+                    for b in 0..ck::LINE_BITS {
+                        if (line >> b) & 1 == 1 {
+                            or_clb_bit(frames, major, ck::ABS_RST_LINE + b, fb);
+                        }
+                    }
+                    if !level {
+                        or_clb_bit(frames, major, ck::ABS_RST_LOW, fb);
+                    }
+                    if val {
+                        or_clb_bit(frames, major, feat.ff_used_abs[bi] + 2, fb);
+                    }
+                }
+                None => {
+                    if !packed.conn.ff_reset.is_empty() && packed.conn.ff_reset.iter().any(|r| r.is_some()) {
+                        or_clb_bit(frames, major, feat.ff_used_abs[bi] + 3, fb);
+                    }
+                }
+            }
         }
     }
     // Clocks made by logic: the block of the source drives the line.
     let mut drivers: std::collections::HashMap<(u32, u32), u8> = std::collections::HashMap::new();
-    for dom in &packed.conn.clocks {
+    for dom in packed.conn.clocks.iter().chain(packed.conn.resets.iter()) {
         let helion_pack::ClockSrc::Gen(src) = dom.src else { continue };
         let idx = match src {
             helion_pack::NetSrc::BleQ(i) | helion_pack::NetSrc::BleO(i) => i as usize,
