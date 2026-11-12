@@ -45,6 +45,9 @@ pub fn map_vhdl_sources(files: &[(&str, &str)]) -> Result<MapResult, String> {
         if looks_like_sv_file(origin, source) {
             continue;
         }
+        if let Some(name) = behavioral_testbench_module(source) {
+            return Ok(sim_only_testbench(source, origin, name));
+        }
         if let Some(name) = osvvm_harness_module(source) {
             eprintln!(
                 "diagnostic sim_only module={name} (OSVVM test harness; external entity not ingested; not a LUT; not a closed WNS)"
@@ -228,6 +231,9 @@ pub fn synth_vhdl_path_with_siblings(path: &Path) -> Result<Design, String> {
 }
 
 fn map_vhdl_origin(source: &str, origin: &str) -> Result<MapResult, String> {
+    if let Some(name) = behavioral_testbench_module(source) {
+        return Ok(sim_only_testbench(source, origin, name));
+    }
     if let Some(name) = osvvm_harness_module(source) {
         // OSVVM / PoC test harness (CreateClock, library.entity). The
         // body is a simulator model, not a netlist. Do not elaborate it.
@@ -430,6 +436,54 @@ fn first_entity_is(source: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// A behavioral testbench: `wait for <time>` or a bare `wait;` (comments
+/// ignored). Neither is synthesizable (Vivado synthesis rejects them too);
+/// such files are simulated by the VHDL testbench runner, not mapped. Mapping
+/// one used to send the SV front end into an unbounded loop.
+fn behavioral_testbench_module(source: &str) -> Option<String> {
+    let mut code = String::with_capacity(source.len());
+    for line in source.lines() {
+        let line = line.split("--").next().unwrap_or("");
+        code.push_str(&line.to_ascii_lowercase());
+        code.push('\n');
+    }
+    let bytes = code.as_bytes();
+    let word_at = |i: usize| i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+    let mut search = 0usize;
+    let mut found = false;
+    while let Some(rel) = code[search..].find("wait") {
+        let at = search + rel;
+        search = at + 4;
+        let end_ok = code[at + 4..]
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+        if !word_at(at) || !end_ok {
+            continue;
+        }
+        let rest = code[at + 4..].trim_start();
+        if rest.starts_with(';') || rest.starts_with("for ") || rest.starts_with("for\t") || rest.starts_with("for\n") {
+            found = true;
+            break;
+        }
+    }
+    found.then(|| last_entity_is(source).unwrap_or_else(|| "vhdl_tb".into()))
+}
+
+fn sim_only_testbench(source: &str, origin: &str, name: String) -> MapResult {
+    eprintln!(
+        "diagnostic sim_only module={name} (VHDL testbench: wait for / wait; is simulation-only; run it as a testbench; not a LUT; not a closed WNS)"
+    );
+    let soft = SoftDiag::new("sim_only", &name)
+        .with_detail("VHDL testbench (wait for / wait;): simulation-only, not synthesizable")
+        .with_span(span_best_effort(source, origin, &[&name]));
+    emit_diag(&soft.table_line());
+    MapResult {
+        design: empty_named(name),
+        softs: vec![soft],
+    }
 }
 
 fn osvvm_harness_module(source: &str) -> Option<String> {
@@ -6385,6 +6439,22 @@ fn normalize_bitstr(s: &str, base: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn behavioral_vhdl_testbenches_are_sim_only_not_mapped() {
+        let tb = "entity tb is end entity;\narchitecture a of tb is\n signal clk : bit := '0';\nbegin\n clk <= not clk after 5 ns;\n process begin\n  wait for 100 ns;\n  wait;\n end process;\nend architecture;\n";
+        let m = map_vhdl(tb).unwrap();
+        assert_eq!(m.softs.len(), 1);
+        assert_eq!(helion_ir::resolve(m.softs[0].name), "sim_only");
+        assert!(m.design.cells.is_empty());
+        // `wait until rising_edge(clk)` is synthesizable style, and comments
+        // mentioning `wait for` don't count.
+        let rtl = "library ieee; use ieee.std_logic_1164.all;\nentity r is port(clk : in std_logic; d : in std_logic; q : out std_logic); end;\narchitecture a of r is begin\n -- no wait for here\n process begin\n  wait until rising_edge(clk);\n  q <= d;\n end process;\nend;\n";
+        assert!(behavioral_testbench_module(rtl).is_none());
+        let counter_tb = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter_tb.vhd");
+        let src = std::fs::read_to_string(counter_tb).unwrap();
+        assert!(behavioral_testbench_module(&src).is_some(), "the shipped VHDL testbench is sim-only");
+    }
     use helion_ir::{resolve, CellKind, INC4_INIT};
 
     #[test]
