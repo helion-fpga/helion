@@ -274,7 +274,8 @@ mod tests {
     fn lut_init_eco_patches_bitstream_without_reimplementation() {
         let (dev, mut s, base) = implemented();
         let placed_before = s.placed.clone().unwrap().lutff_sites;
-        s.apply_eco(&dev, &EcoOp::SetLutInit { cell: "u_lut0".into(), init: 0x1 }).unwrap();
+        // u_lut0 inverts its one input; make it a buffer instead.
+        s.apply_eco(&dev, &EcoOp::SetLutInit { cell: "u_lut0".into(), init: 0x2 }).unwrap();
         assert!(s.routed.is_some(), "INIT ECO keeps the implementation");
         assert_eq!(s.placed.as_ref().unwrap().lutff_sites, placed_before);
         let out = s.write_eco_bitstream(&dev, &base).unwrap();

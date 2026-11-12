@@ -155,34 +155,15 @@ fn compile_design_xdc(
     );
     let t0 = std::time::Instant::now();
     let mut packed = pack(&design, &dev)?;
-    let iob_budget = dev.iob_sites().count();
-    // Prefer IOBs driven by a packed LUTFF q_net (DRC ROUTE-3), then cap to
-    // device budget. Full Ibex emits ~250 AXI outs; HL10T-C32-1 has 32 IOBs.
-    let q_nets: std::collections::HashSet<&str> =
-        packed.lutffs.iter().map(|l| l.q_net.as_str()).collect();
-    let driven: Vec<_> = packed
-        .iobs
-        .iter()
-        .filter(|io| q_nets.contains(io.from_net.as_str()))
-        .cloned()
-        .collect();
-    let undriven = packed.iobs.len().saturating_sub(driven.len());
-    if packed.iobs.len() > iob_budget || undriven > 0 {
-        let keep = driven.len().min(iob_budget);
-        let keep = if packed.lutffs.len() > 2000 {
-            keep.min(4)
-        } else {
-            keep
-        };
+    let fit = packed.fit_pads(dev.iob_sites().count());
+    if !fit.undriven.is_empty() || !fit.over_budget.is_empty() {
         eprintln!(
-            "hang_diag iob_trim {} -> {} (driven={} undriven={} budget={})",
-            packed.iobs.len(),
-            keep,
-            driven.len(),
-            undriven,
-            iob_budget
+            "warning: {} output pad(s) left out: {} with no driver, {} beyond the {} pads of this part",
+            fit.undriven.len() + fit.over_budget.len(),
+            fit.undriven.len(),
+            fit.over_budget.len(),
+            dev.iob_sites().count()
         );
-        packed.iobs = driven.into_iter().take(keep).collect();
     }
     eprintln!(
         "hang_diag pack lutffs={} iobs={} ms={}",

@@ -870,7 +870,7 @@ mod tests {
             .find(|c| matches!(c.kind, helion_ir::CellKind::Lut6 { .. }))
             .map(|c| helion_ir::resolve(c.name).to_string())
             .unwrap();
-        tcl_verb(&mut s, "eco_set_lut_init", &[lut.clone(), "64'h1".into()]).unwrap();
+        tcl_verb(&mut s, "eco_set_lut_init", &[lut.clone(), "64'h2".into()]).unwrap();
         crate::bg::wait_all(&mut s);
         assert!(s.eco.ops[0].result.is_ok(), "{:?}", s.eco.ops[0].result);
         assert!(!s.eco.pending, "INIT changes need no re-implementation");

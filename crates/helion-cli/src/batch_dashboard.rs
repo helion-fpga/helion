@@ -239,25 +239,7 @@ pub fn compile_design_into_snapshot(
 
     let t_pack = Instant::now();
     let mut packed = pack(design, &dev)?;
-    let iob_budget = dev.iob_sites().count();
-    let q_nets: std::collections::HashSet<&str> =
-        packed.lutffs.iter().map(|l| l.q_net.as_str()).collect();
-    let driven: Vec<_> = packed
-        .iobs
-        .iter()
-        .filter(|io| q_nets.contains(io.from_net.as_str()))
-        .cloned()
-        .collect();
-    let undriven = packed.iobs.len().saturating_sub(driven.len());
-    if packed.iobs.len() > iob_budget || undriven > 0 {
-        let keep = driven.len().min(iob_budget);
-        let keep = if packed.lutffs.len() > 2000 {
-            keep.min(4)
-        } else {
-            keep
-        };
-        packed.iobs = driven.into_iter().take(keep).collect();
-    }
+    let _ = packed.fit_pads(dev.iob_sites().count());
     let pack_ms = t_pack.elapsed().as_millis();
 
     let t_place = Instant::now();

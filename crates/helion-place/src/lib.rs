@@ -12,6 +12,7 @@ use std::collections::HashSet;
 pub use helion_pack::PackingSummary;
 
 pub mod regions;
+pub mod wl;
 pub use regions::{
     RegionConstraint, RegionStats, RegionViolation, legalize_into_regions, owning_region,
     place_with_regions, region_violations,
@@ -1432,7 +1433,7 @@ pub fn place_with_guide(
     packed.iobs.truncate(iob_sites.len());
     packed.macs.truncate(mac_sites.len());
     packed.brams.truncate(bram_sites.len());
-    Ok(Placed {
+    let mut placed = Placed {
         packed,
         lutff_sites,
         iob_sites,
@@ -1440,7 +1441,14 @@ pub fn place_with_guide(
         bram_sites,
         timing_weight: opts.timing_weight,
         cost,
-    })
+    };
+    // A large design's nets travel on the general interconnect: shorten them.
+    if placed.lutff_sites.len() >= wl::MIN_CLUSTERS && !placed.packed.conn.pins.is_empty() {
+        let t = std::time::Instant::now();
+        let (before, after) = wl::refine(&mut placed, dev);
+        eprintln!("hang_diag place wirelength {before} -> {after} tiles ms={}", t.elapsed().as_millis());
+    }
+    Ok(placed)
 }
 
 /// UG893 floorplanning: place into a Pblock rectangle (CLB_XxYy:CLB_XxYy).

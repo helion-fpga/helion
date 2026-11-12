@@ -10,6 +10,8 @@ use helion_place::Placed;
 use rayon::prelude::*;
 
 pub use helion_place::TimingGuide;
+pub mod tracks;
+pub use tracks::{IobInput, IobTrack, SbRoute, TrackRoutes};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -35,6 +37,10 @@ pub struct Routed {
     pub congestion_y0: u32,
     pub congestion_cols: u32,
     pub congestion_rows: u32,
+    /// General-interconnect routes (switch boxes, wire-fed LUT inputs and
+    /// pads). `active` when the design was routed from its full connection
+    /// list; then `imux` holds only the direct connections.
+    pub tracks: TrackRoutes,
 }
 
 #[derive(Clone, Debug)]
@@ -610,6 +616,18 @@ pub fn route_with_guide(
         }
     }
 
+    // A design packed with its full connection list is routed completely:
+    // direct IMUX connections where the fabric has them, wires elsewhere.
+    let conn = &placed.packed.conn;
+    let full = if conn.pins.is_empty() && conn.iob_src.is_empty() && conn.undriven.is_empty() {
+        None
+    } else {
+        Some(tracks::route(placed, dev)?)
+    };
+    if let Some(r) = &full {
+        imux = r.direct_imux.clone();
+        imux_skip = 0;
+    }
     // IOB→LUTFF by q_net once (was O(iobs×lutffs) .position per IOB).
     let mut q_net_lutff: HashMap<&str, usize> = HashMap::with_capacity(placed.packed.lutffs.len());
     for (i, lutff) in placed.packed.lutffs.iter().enumerate() {
@@ -617,7 +635,16 @@ pub fn route_with_guide(
     }
     // (src, dst, ble, packed_iob_idx) — idx must survive y-skip filtering.
     let mut nets: Vec<((u32, u32), (u32, u32), u8, usize)> = Vec::new();
-    if !placed.packed.lutffs.is_empty() {
+    if let Some(r) = &full {
+        // Only pads fed by their own column's source select take the
+        // column path; the others were routed over wires.
+        for (ii, plan) in r.pads.iter().enumerate() {
+            if let Some(tracks::PadPlan::Direct { clb, ble, .. }) = plan {
+                let s = placed.iob_sites[ii];
+                nets.push((*clb, (s.x, s.y), *ble, ii));
+            }
+        }
+    } else if !placed.packed.lutffs.is_empty() {
         for (ii, iob_site) in placed.iob_sites.iter().enumerate() {
             let packed_iob = placed.packed.iobs.get(ii);
             let idx = packed_iob
@@ -639,7 +666,7 @@ pub fn route_with_guide(
     let mut iters = 0u32;
     let (cong_x0, cong_y0, cong_cols, cong_rows) =
         (grid.x0, grid.y0, grid.cols, grid.rows);
-    if nets.is_empty() {
+    if nets.is_empty() && full.is_none() {
         return Ok(Routed {
             placed: placed.clone(),
             iob_src,
@@ -652,6 +679,7 @@ pub fn route_with_guide(
             congestion_y0: cong_y0,
             congestion_cols: cong_cols,
             congestion_rows: cong_rows,
+            tracks: Default::default(),
         });
     }
     let max_iters = opts.max_iters.max(1);
@@ -666,47 +694,68 @@ pub fn route_with_guide(
     // present/hist/overused so PathFinder negotiates real channel conflicts.
     // (Per-net skip — not a global endpoint mask — so one net's src still
     // congests when another net traverses it as an intermediate.)
-    for iter in 0..max_iters {
-        iters = iter + 1;
-        pres.fill(0);
-        let pres_fac = 1i64 + iter as i64;
-        let mut paths = Vec::with_capacity(nets.len());
-        for (src, dst, _, _) in &nets {
-            let path = astar(
-                dev,
-                &grid,
-                &mut scratch,
-                *src,
-                *dst,
-                &hist,
-                &pres,
-                pres_fac,
-                detour_cols,
-            )?;
-            for &(tx, ty) in &path {
-                if (tx, ty) == *src || (tx, ty) == *dst {
-                    continue;
-                }
-                if let Some(ti) = grid.index(tx, ty) {
-                    pres[ti] = pres[ti].saturating_add(1);
-                }
+    // Tile occupancy of a path: its intermediate tiles.
+    let mark = |pres: &mut [u32], path: &[(u32, u32)], src: (u32, u32), dst: (u32, u32), add: bool| {
+        for &(tx, ty) in path {
+            if (tx, ty) == src || (tx, ty) == dst {
+                continue;
             }
-            paths.push(path);
+            if let Some(ti) = grid.index(tx, ty) {
+                pres[ti] = if add { pres[ti].saturating_add(1) } else { pres[ti].saturating_sub(1) };
+            }
         }
-        let ou = pres.iter().filter(|c| **c > 1).count() as u32;
-        let hops_sum: u32 = paths.iter().map(|p| p.len().saturating_sub(1) as u32).sum();
+    };
+    // First pass: every net takes its shortest path, seeing only the nets
+    // routed before it (a design without congestion is done here, with the
+    // same paths as ever).
+    iters = 1;
+    let mut paths: Vec<Vec<(u32, u32)>> = Vec::with_capacity(nets.len());
+    for (src, dst, _, _) in &nets {
+        let path = astar(dev, &grid, &mut scratch, *src, *dst, &hist, &pres, 1, detour_cols)?;
+        mark(&mut pres, &path, *src, *dst, true);
+        paths.push(path);
+    }
+    let overuse = |pres: &[u32]| pres.iter().filter(|c| **c > 1).count() as u32;
+    let hop_sum = |paths: &[Vec<(u32, u32)>]| paths.iter().map(|p| p.len().saturating_sub(1) as u32).sum::<u32>();
+    best_overused = overuse(&pres);
+    best_hops = hop_sum(&paths);
+    best_paths = paths.clone();
+    // Negotiation: nets crossing an overused tile are ripped up one at a
+    // time and rerouted against everyone else's current paths. Sharing a
+    // tile costs more every round (present cost), and tiles that keep
+    // being fought over stay expensive (history cost), until every tile
+    // carries one net. Costs are in hop delays, so a detour is taken as
+    // soon as it is cheaper than the sharing it avoids.
+    let rounds = max_iters.saturating_mul(16);
+    for round in 1..rounds {
+        if best_overused == 0 || overuse(&pres) == 0 {
+            break;
+        }
+        iters = round + 1;
+        for (ti, &c) in pres.iter().enumerate() {
+            if c > 1 {
+                hist[ti] = hist[ti].saturating_add((c - 1) * (HOP_DELAY_PS as u32 / 2));
+            }
+        }
+        let pres_fac = (HOP_DELAY_PS / 2) << round.min(8);
+        for (i, (src, dst, _, _)) in nets.iter().enumerate() {
+            let congested = paths[i].iter().any(|&(tx, ty)| {
+                (tx, ty) != *src && (tx, ty) != *dst && grid.index(tx, ty).map(|ti| pres[ti] > 1).unwrap_or(false)
+            });
+            if !congested {
+                continue;
+            }
+            mark(&mut pres, &paths[i], *src, *dst, false);
+            let path = astar(dev, &grid, &mut scratch, *src, *dst, &hist, &pres, pres_fac, detour_cols)?;
+            mark(&mut pres, &path, *src, *dst, true);
+            paths[i] = path;
+        }
+        let ou = overuse(&pres);
+        let hops_sum = hop_sum(&paths);
         if ou < best_overused || (ou == best_overused && hops_sum < best_hops) {
             best_overused = ou;
             best_hops = hops_sum;
             best_paths = paths.clone();
-        }
-        if ou == 0 {
-            break;
-        }
-        for (ti, &c) in pres.iter().enumerate() {
-            if c > 1 {
-                hist[ti] = hist[ti].saturating_add(1);
-            }
         }
     }
     for (i, (src, dst, ble, packed_ii)) in nets.iter().enumerate() {
@@ -732,6 +781,35 @@ pub fn route_with_guide(
             net,
             from_ff,
         });
+    }
+    if let Some(r) = &full {
+        // Column-fed pads: the flop/LUT choice comes from the connection.
+        for route in iob_src.iter_mut() {
+            for (ii, plan) in r.pads.iter().enumerate() {
+                if let Some(tracks::PadPlan::Direct { from_ff, .. }) = plan {
+                    let s = placed.iob_sites[ii];
+                    if (s.x, s.y) == route.iob {
+                        route.from_ff = *from_ff;
+                    }
+                }
+            }
+        }
+        for (ii, plan) in r.pads.iter().enumerate() {
+            if let Some(tracks::PadPlan::Track { clb, ble, from_ff, path }) = plan {
+                let s = placed.iob_sites[ii];
+                let hops = path.len().saturating_sub(1) as u32 + opts.extra_hops;
+                iob_src.push(IobRoute {
+                    iob: (s.x, s.y),
+                    clb: *clb,
+                    ble: *ble,
+                    hops,
+                    delay_ps: hops as i64 * HOP_DELAY_PS,
+                    path: path.clone(),
+                    net: placed.packed.iobs.get(ii).map(|io| io.from_net.clone()).unwrap_or_default(),
+                    from_ff: *from_ff,
+                });
+            }
+        }
     }
     if imux_skip > 0 {
         eprintln!(
@@ -766,6 +844,7 @@ pub fn route_with_guide(
         congestion_y0: cong_y0,
         congestion_cols: cong_cols,
         congestion_rows: cong_rows,
+        tracks: full.map(|r| r.tracks).unwrap_or_default(),
     })
 }
 
@@ -1381,6 +1460,7 @@ pub fn route_timing_driven(
             congestion_y0: grid.y0,
             congestion_cols: grid.cols,
             congestion_rows: grid.rows,
+            tracks: Default::default(),
         });
     }
 
@@ -1589,7 +1669,7 @@ pub fn route_timing_driven(
         });
     }
 
-    Ok(Routed {
+    let mut out = Routed {
         placed: placed.clone(),
         iob_src,
         imux,
@@ -1601,7 +1681,20 @@ pub fn route_timing_driven(
         congestion_y0: grid.y0,
         congestion_cols: grid.cols,
         congestion_rows: grid.rows,
-    })
+        tracks: Default::default(),
+    };
+    // The connections themselves come from the wire router; this pass only
+    // shapes the modelled paths of pads fed from their own column.
+    let base = route_with(placed, dev, RouteOpts::default())?;
+    if base.tracks.active {
+        let on_wire: std::collections::HashSet<(u32, u32)> = base.tracks.iob_out.iter().map(|o| (o.x, o.y)).collect();
+        out.iob_src.retain(|r| !on_wire.contains(&r.iob));
+        out.iob_src.extend(base.iob_src.iter().filter(|r| on_wire.contains(&r.iob)).cloned());
+        out.imux = base.imux;
+        out.imux_skip = base.imux_skip;
+        out.tracks = base.tracks;
+    }
+    Ok(out)
 }
 
 /// Count the number of 90-degree turns (vias / switchbox direction changes) along a tile path.
@@ -2240,6 +2333,7 @@ mod tests {
             congestion_y0: r.congestion_y0,
             congestion_cols: r.congestion_cols,
             congestion_rows: r.congestion_rows,
+            tracks: Default::default(),
         };
         assert!(r2.congestion.iter().all(|&c| c == 0));
     }

@@ -17,6 +17,52 @@ pub struct Packed {
     pub iobs: Vec<PackedIob>,
     pub macs: Vec<PackedMac>,
     pub brams: Vec<PackedBram>,
+    /// Every signal connection of the packed design (see [`Connectivity`]).
+    pub conn: Connectivity,
+}
+
+/// What drives a net of the packed design.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NetSrc {
+    /// Flop output of cluster `lutffs[i]`.
+    BleQ(u32),
+    /// LUT output of cluster `lutffs[i]` (also of a registered cluster,
+    /// when the LUT output is used beside the flop).
+    BleO(u32),
+    /// Input pad `conn.inputs[i]`.
+    Input(u32),
+}
+
+/// One LUT input pin and its driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PinConn {
+    pub lutff: u32,
+    pub pin: u8,
+    pub src: NetSrc,
+}
+
+/// A top-level input bit that needs a pad.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackedInput {
+    /// Net name (`port` or `port_<bit>`).
+    pub net: String,
+    pub port: String,
+    /// Optional `IOB_XxYy` from the port's LOC.
+    pub loc: Option<String>,
+}
+
+/// The complete connection list the router has to realise: every connected
+/// LUT input pin, the source of every output pad, and the input pads.
+/// (`PackedLutFf::lut_pins` only names flop drivers, for placement.)
+#[derive(Clone, Debug, Default)]
+pub struct Connectivity {
+    pub pins: Vec<PinConn>,
+    pub inputs: Vec<PackedInput>,
+    /// Source of each output pad, by IOB cell name (pads may be reordered
+    /// or dropped after packing). A pad with no entry has no packable driver.
+    pub iob_src: BTreeMap<String, NetSrc>,
+    /// LUT pins whose net has no packable driver, as `cell.pin <- net`.
+    pub undriven: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -181,10 +227,90 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
     } else {
         lut_jobs.iter().map(build_lutff).collect()
     };
+    let mut lutffs = lutffs;
+    // Pin nets per cluster, in cluster order.
+    let mut pin_nets: Vec<Vec<(u8, Spur)>> = lut_jobs
+        .iter()
+        .map(|job| {
+            ipins
+                .iter()
+                .enumerate()
+                .filter_map(|(pin, &key)| pin_to_net.get(&(job.0, key)).map(|&n| (pin as u8, n)))
+                .collect()
+        })
+        .collect();
+    // A flop whose D is not the output of a LUT of its own (another flop, an
+    // input, or a LUT already paired with a different flop) gets a buffer LUT.
+    const BUF_INIT: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+    for c in &design.cells {
+        if !matches!(c.kind, CellKind::Hff) || used_ff.contains(&c.name) {
+            continue;
+        }
+        let (Some(&d), Some(&q)) = (pin_to_net.get(&(c.name, pin_d)), ff_q_net.get(&c.name)) else {
+            continue;
+        };
+        let lut_pins = q_driver.get(&d).map(|&src| vec![(0u8, resolve(src).to_string())]).unwrap_or_default();
+        lutffs.push(PackedLutFf {
+            lut_cell: format!("{}$dbuf", resolve(c.name)),
+            ff_cell: resolve(c.name).to_string(),
+            init: BUF_INIT,
+            lut_pins,
+            q_net: resolve(q).to_string(),
+        });
+        pin_nets.push(vec![(0, d)]);
+    }
+    // Net sources.
+    let mut net_src: HashMap<Spur, NetSrc> = HashMap::with_capacity(lutffs.len() * 2);
+    for (i, job) in lut_jobs.iter().enumerate() {
+        net_src.insert(job.2, NetSrc::BleO(i as u32));
+        if let Some(q) = job.3.and_then(|ff| ff_q_net.get(&ff).copied()) {
+            net_src.insert(q, NetSrc::BleQ(i as u32));
+        }
+    }
+    for i in lut_jobs.len()..lutffs.len() {
+        net_src.insert(intern(&lutffs[i].q_net), NetSrc::BleQ(i as u32));
+    }
+    // Input pads: nets no cell drives that carry an input port's name
+    // (`port` or `port_<bit>`).
+    let in_ports: Vec<&helion_ir::Port> = design.ports.iter().filter(|p| matches!(p.dir, helion_ir::PortDir::In)).collect();
+    let mut conn = Connectivity::default();
+    let mut input_of: HashMap<Spur, u32> = HashMap::new();
+    let mut input_src = |net: Spur, conn: &mut Connectivity| -> Option<NetSrc> {
+        if let Some(&i) = input_of.get(&net) {
+            return Some(NetSrc::Input(i));
+        }
+        let name = resolve(net);
+        let port = in_ports.iter().find(|p| {
+            let pn = resolve(p.name);
+            name == pn
+                || name
+                    .strip_prefix(pn)
+                    .and_then(|r| r.strip_prefix('_'))
+                    .map(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_digit()))
+                    .unwrap_or(false)
+        })?;
+        let i = conn.inputs.len() as u32;
+        conn.inputs.push(PackedInput {
+            net: name.to_string(),
+            port: resolve(port.name).to_string(),
+            loc: port.attrs.get("LOC").map(|s| s.to_string()),
+        });
+        input_of.insert(net, i);
+        Some(NetSrc::Input(i))
+    };
+    for (i, nets) in pin_nets.iter().enumerate() {
+        for &(pin, net) in nets {
+            match net_src.get(&net).copied().or_else(|| input_src(net, &mut conn)) {
+                Some(src) => conn.pins.push(PinConn { lutff: i as u32, pin, src }),
+                None => conn.undriven.push(format!("{}.I{pin} <- {}", lutffs[i].lut_cell, resolve(net))),
+            }
+        }
+    }
     let port_by_name: HashMap<Spur, &helion_ir::Port> =
         design.ports.iter().map(|p| (p.name, p)).collect();
     let empty_spur = intern("");
     let mut iobs = Vec::new();
+    let mut seen_pads: HashSet<(Spur, Spur)> = HashSet::new();
     for c in &design.cells {
         if matches!(c.kind, CellKind::IobOut) {
             let net = pin_to_net
@@ -195,11 +321,46 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
                 .get(&(c.name, pin_pad))
                 .copied()
                 .unwrap_or(empty_spur);
+            // The same port bit emitted more than once (one output buffer
+            // per part-select assignment of the port) is one pad. Only a
+            // net named after the port bit identifies it: two bits fed by
+            // one ordinary net stay two pads.
+            let (net_s, pad_s) = (resolve(net), resolve(pad));
+            let is_port_bit = !pad_s.is_empty()
+                && (net_s == pad_s
+                    || net_s
+                        .strip_prefix(pad_s)
+                        .and_then(|r| r.strip_prefix('_'))
+                        .map(|r| !r.is_empty() && r.chars().all(|ch| ch.is_ascii_digit()))
+                        .unwrap_or(false));
+            if is_port_bit && !seen_pads.insert((net, pad)) {
+                continue;
+            }
             let port = port_by_name.get(&pad).copied();
             let loc = port.and_then(|p| p.attrs.get("LOC").map(|s| s.to_string()));
+            // An output fed straight from an input pad goes through a
+            // buffer LUT (pads connect to logic, not to each other).
+            let mut from_net = resolve(net).to_string();
+            let mut src = net_src.get(&net).copied().or_else(|| input_src(net, &mut conn));
+            if let Some(NetSrc::Input(_)) = src {
+                let i = lutffs.len() as u32;
+                from_net = format!("{from_net}$obuf");
+                lutffs.push(PackedLutFf {
+                    lut_cell: format!("{}$obuf", resolve(c.name)),
+                    ff_cell: String::new(),
+                    init: BUF_INIT,
+                    lut_pins: Vec::new(),
+                    q_net: from_net.clone(),
+                });
+                conn.pins.push(PinConn { lutff: i, pin: 0, src: src.unwrap() });
+                src = Some(NetSrc::BleO(i));
+            }
+            if let Some(src) = src {
+                conn.iob_src.insert(resolve(c.name).to_string(), src);
+            }
             iobs.push(PackedIob {
                 cell: resolve(c.name).to_string(),
-                from_net: resolve(net).to_string(),
+                from_net,
                 loc,
                 drive: port.and_then(|p| p.attrs.get("DRIVE").map(|s| s.to_string())),
                 slew: port.and_then(|p| p.attrs.get("SLEW").map(|s| s.to_string())),
@@ -239,6 +400,7 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
         iobs,
         macs,
         brams,
+        conn,
     })
 }
 
@@ -1670,6 +1832,44 @@ pub fn balance_lut_pin_delays(
 
     design.rebuild_indexes();
     report
+}
+
+/// Result of [`Packed::fit_pads`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PadFit {
+    /// Output pads removed because nothing in the packed design drives them.
+    pub undriven: Vec<String>,
+    /// Driven output pads removed because the part has no pad left for them.
+    pub over_budget: Vec<String>,
+}
+
+impl Packed {
+    /// Whether output pad `io` has a driver in the packed design.
+    pub fn pad_driven(&self, io: &PackedIob) -> bool {
+        self.conn.iob_src.contains_key(&io.cell) || self.lutffs.iter().any(|l| l.q_net == io.from_net)
+    }
+
+    /// Make the output pads fit a part with `budget` pads. Input pads cannot
+    /// be dropped without changing the logic, so they are counted first;
+    /// outputs with no driver go, then outputs beyond what is left. Every
+    /// removed pad is named in the result.
+    pub fn fit_pads(&mut self, budget: usize) -> PadFit {
+        let q_nets: std::collections::HashSet<&str> = self.lutffs.iter().map(|l| l.q_net.as_str()).collect();
+        let room = budget.saturating_sub(self.conn.inputs.len());
+        let mut fit = PadFit::default();
+        let mut keep = Vec::with_capacity(self.iobs.len());
+        for io in &self.iobs {
+            if !(self.conn.iob_src.contains_key(&io.cell) || q_nets.contains(io.from_net.as_str())) {
+                fit.undriven.push(io.cell.clone());
+            } else if keep.len() >= room {
+                fit.over_budget.push(io.cell.clone());
+            } else {
+                keep.push(io.clone());
+            }
+        }
+        self.iobs = keep;
+        fit
+    }
 }
 
 #[cfg(test)]
