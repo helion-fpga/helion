@@ -1442,6 +1442,8 @@ pub fn place_with_guide(
         timing_weight: opts.timing_weight,
         cost,
     };
+    // Several clocks: each CLB holds flops of one of them.
+    wl::legalize_clocks(&mut placed, dev)?;
     // A large design's nets travel on the general interconnect: shorten them.
     if placed.lutff_sites.len() >= wl::MIN_CLUSTERS && !placed.packed.conn.pins.is_empty() {
         let t = std::time::Instant::now();

@@ -670,6 +670,13 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
             hint.entry(l).or_insert(bit_name(&p.name, p.w, bit));
         }
     }
+    // The logic in front of a flop is named for the register it feeds.
+    for rb in &reg_bits {
+        let s = &flat.sigs[rb.sig as usize];
+        if rb.d > TRUE && !net_of.contains_key(&rb.d) {
+            hint.entry(rb.d).or_insert(format!("{}_d", bit_name(&s.name, s.w, rb.bit)));
+        }
+    }
     for (l, sig, bit) in hints {
         let s = &flat.sigs[sig as usize];
         let name = bit_name(&s.name, s.w, bit);

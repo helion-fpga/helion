@@ -13,11 +13,15 @@ use helion_place::place;
 use helion_route::route;
 use std::collections::HashMap;
 
-/// Reference simulation of the mapped netlist: LUTs, flops, output pads.
+/// Reference simulation of the mapped netlist: LUTs, flops with their
+/// clock nets and edges, output pads.
 struct NetSim {
     luts: Vec<(u64, [Option<Spur>; 6], Spur)>,
-    ffs: Vec<(Spur, Spur)>,
+    /// (D, Q, clock net, falling edge)
+    ffs: Vec<(Spur, Spur, Option<Spur>, bool)>,
     val: HashMap<Spur, bool>,
+    /// Clock net values when last looked at.
+    prev: HashMap<Spur, bool>,
 }
 
 impl NetSim {
@@ -39,13 +43,13 @@ impl NetSim {
                 }
                 CellKind::Hff => {
                     if let (Some(dn), Some(q)) = (pins.net_on(name, "D"), pins.net_on(name, "Q")) {
-                        ffs.push((dn, q));
+                        ffs.push((dn, q, pins.net_on(name, "CLK"), c.attrs.get("CLK_INV") == Some("1")));
                     }
                 }
                 _ => {}
             }
         }
-        Self { luts, ffs, val: HashMap::new() }
+        Self { luts, ffs, val: HashMap::new(), prev: HashMap::new() }
     }
     fn get(&self, n: Spur) -> bool {
         self.val.get(&n).copied().unwrap_or(false)
@@ -71,11 +75,37 @@ impl NetSim {
         }
         panic!("netlist has a combinational loop");
     }
-    fn clock(&mut self) {
-        let next: Vec<(Spur, bool)> = self.ffs.iter().map(|(d, q)| (*q, self.get(*d))).collect();
-        for (q, v) in next {
-            self.val.insert(q, v);
+    /// Settle, and let every flop whose clock net moved in its direction
+    /// capture; repeat while that moves another clock (a divided clock).
+    fn advance(&mut self) {
+        for _ in 0..1024 {
+            self.settle();
+            let mut next: Vec<(Spur, bool)> = Vec::new();
+            let mut moved = false;
+            for (d, q, clk, falling) in &self.ffs {
+                let Some(clk) = clk else { continue };
+                let cur = self.get(*clk);
+                let was = self.prev.get(clk).copied().unwrap_or(cur);
+                if cur != was {
+                    moved = true;
+                    if cur != *falling {
+                        next.push((*q, self.get(*d)));
+                    }
+                }
+            }
+            let clocks: Vec<Spur> = self.ffs.iter().filter_map(|f| f.2).collect();
+            for c in clocks {
+                let v = self.get(c);
+                self.prev.insert(c, v);
+            }
+            if !moved {
+                return;
+            }
+            for (q, v) in next {
+                self.val.insert(q, v);
+            }
         }
+        panic!("clocks do not settle");
     }
 }
 
@@ -139,25 +169,53 @@ fn check_design(design: &Design, part: &str, cycles: usize, tamper: impl Fn(&mut
         .collect();
     let have: std::collections::HashSet<Spur> = outs.iter().map(|o| o.1).collect();
     assert_eq!(have, want, "an output pad was dropped");
-    let ins: Vec<(Spur, (u32, u32))> = routed.tracks.iob_in.iter().map(|i| (helion_ir::intern(&i.net), (i.x, i.y))).collect();
-    assert_eq!(ins.len(), packed.conn.inputs.len(), "an input pad was dropped");
+    assert!(packed.conn.clock_problems.is_empty(), "clocking: {:?}", packed.conn.clock_problems);
+    // Data pads, and the clock pads with the net they drive.
+    let conn = &routed.placed.packed.conn;
+    let mut ins: Vec<(Spur, (u32, u32))> = Vec::new();
+    let mut clock_pads: Vec<(Spur, (u32, u32))> = Vec::new();
+    for i in &routed.tracks.iob_in {
+        let entry = (helion_ir::intern(&i.net), (i.x, i.y));
+        if conn.inputs[i.input as usize].clock.is_some() {
+            clock_pads.push(entry);
+        } else {
+            ins.push(entry);
+        }
+    }
+    assert_eq!(routed.tracks.iob_in.len(), conn.inputs.len(), "an input pad was dropped");
+    let implicit: Option<Spur> = conn.clocks.iter().find(|c| c.src == helion_pack::ClockSrc::Implicit).map(|c| helion_ir::intern(&c.net));
 
     let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    let mut clock_level = vec![false; clock_pads.len()];
     for cycle in 0..cycles {
         for (net, (x, y)) in &ins {
             let v = rng.bit();
             sim.val.insert(*net, v);
             fab.set_pad_in(*x, *y, v);
         }
-        sim.settle();
+        sim.advance();
         fab.settle();
         for (cell, net, (x, y)) in &outs {
             if fab.led_at(*x, *y) != sim.get(*net) {
                 return Err(format!("cycle {cycle}: pad {cell} (net {}) differs", resolve(*net)));
             }
         }
-        sim.clock();
-        fab.step_user();
+        if let Some(clk) = implicit {
+            // One cycle of the implicit clock.
+            sim.val.insert(clk, true);
+            sim.advance();
+            sim.val.insert(clk, false);
+            sim.advance();
+            fab.step_user();
+        }
+        if !clock_pads.is_empty() {
+            // One edge on one clock pad, chosen at random.
+            let k = (0..4).fold(0usize, |a, _| a * 2 + rng.bit() as usize) % clock_pads.len();
+            clock_level[k] = !clock_level[k];
+            let (net, (x, y)) = clock_pads[k];
+            sim.val.insert(net, clock_level[k]);
+            fab.set_pad_in(x, y, clock_level[k]);
+        }
     }
     Ok((routed.tracks.nets, routed.tracks.sb.len()))
 }
@@ -289,4 +347,102 @@ endmodule
     assert!(packed.lutffs.len() >= helion_place::wl::MIN_CLUSTERS, "only {} clusters", packed.lutffs.len());
     let (nets, wires) = check(src, PART, 150);
     assert!(nets > 50 && wires > 100);
+}
+
+const TWO_CLOCKS: &str = r#"
+module top(input logic clk_a, input logic clk_b, input logic [3:0] d, output logic [3:0] qa, output logic [3:0] qb, output logic [5:0] cnt);
+  logic [3:0] a, s1, s2;
+  logic [5:0] c;
+  always_ff @(posedge clk_a) a <= a + d;
+  always_ff @(posedge clk_b) begin
+    s1 <= a;
+    s2 <= s1;
+    c <= c + {5'd0, ^s2};
+  end
+  assign qa = a; assign qb = s2; assign cnt = c;
+endmodule
+"#;
+
+/// Two clock pins with a register crossing between them: each clock is its
+/// own line with its own pad, and each CLB holds flops of one clock.
+#[test]
+fn two_clock_domains() {
+    check(TWO_CLOCKS, PART, 600);
+}
+
+const DIVIDED: &str = r#"
+
+module top(input logic clk, input logic [2:0] d, output logic [3:0] slow, output logic [2:0] fall, output logic [2:0] rise);
+  logic [1:0] div;
+  logic [3:0] s;
+  logic [2:0] r, f;
+  always_ff @(posedge clk) begin
+    div <= div + 2'd1;
+    r <= d;
+  end
+  always_ff @(negedge clk) f <= r ^ d;
+  always_ff @(posedge div[1]) s <= s + {1'b0, d};
+  assign slow = s; assign fall = f; assign rise = r;
+endmodule
+"#;
+
+/// A clock divided by logic drives its own line; falling-edge flops sit on
+/// the same line as rising-edge ones.
+#[test]
+fn divided_clock_and_falling_edge() {
+    check(DIVIDED, PART, 800);
+}
+
+/// The clock tests are not vacuous: flops put on the wrong clock line, or
+/// on the wrong edge, no longer match the netlist.
+#[test]
+fn wrong_clocking_is_detected() {
+    let one_line = |r: &mut helion_route::Routed| {
+        for f in r.placed.packed.conn.ff_clock.iter_mut().flatten() {
+            f.0 = 0;
+        }
+    };
+    assert!(check_with(TWO_CLOCKS, PART, 600, one_line).is_err(), "all flops on one clock went unnoticed");
+    assert!(check_with(DIVIDED, PART, 800, one_line).is_err(), "the divided clock's flops on the main clock went unnoticed");
+    let wrong_edge = |r: &mut helion_route::Routed| {
+        for f in r.placed.packed.conn.ff_clock.iter_mut().flatten() {
+            f.1 = false;
+        }
+    };
+    assert!(check_with(DIVIDED, PART, 800, wrong_edge).is_err(), "falling-edge flops built as rising went unnoticed");
+}
+
+/// Falling-edge flops on the design's only clock: no pad is spent on it.
+#[test]
+fn falling_edge_on_the_implicit_clock() {
+    let src = r#"
+module top(input logic clk, input logic [3:0] d, output logic [3:0] p, output logic [3:0] n);
+  logic [3:0] a, b;
+  always_ff @(posedge clk) a <= a + d;
+  always_ff @(negedge clk) b <= a ^ d;
+  assign p = a; assign n = b;
+endmodule
+"#;
+    let design = helion_sv::synth_sv_v2(src, "t.sv", None).expect("synth").design;
+    let dev = Device::load_part(PART).expect("part");
+    let packed = pack(&design, &dev).expect("pack");
+    assert_eq!(packed.conn.clocks.len(), 1);
+    assert!(packed.conn.inputs.iter().all(|i| i.net != "clk"), "the implicit clock needs no pad");
+    check(src, PART, 400);
+}
+
+/// More clocks than the fabric has lines is refused, by name.
+#[test]
+fn too_many_clocks_is_an_error() {
+    let src = r#"
+module top(input logic [4:0] ck, input logic d, output logic [4:0] q);
+  for (genvar i = 0; i < 5; i++) begin : g
+    always_ff @(posedge ck[i]) q[i] <= d ^ q[i];
+  end
+endmodule
+"#;
+    let design = helion_sv::synth_sv_v2(src, "t.sv", None).expect("synth").design;
+    let dev = Device::load_part(PART).expect("part");
+    let packed = pack(&design, &dev).expect("pack");
+    assert!(packed.conn.clock_problems.iter().any(|p| p.contains("5 clocks")), "{:?}", packed.conn.clock_problems);
 }

@@ -287,6 +287,17 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
         });
         want.push((input, loc, mean));
     }
+    // A clock pin that feeds no logic still needs its pad.
+    for (i, inp) in conn.inputs.iter().enumerate() {
+        if inp.clock.is_some() && !want.iter().any(|w| w.0 == i as u32) {
+            let loc = inp.loc.as_deref().and_then(|l| {
+                let rest = l.strip_prefix("IOB_X")?;
+                let (x, y) = rest.split_once('Y')?;
+                (y.parse::<u32>().ok()? == pad_row).then_some(x.parse::<u32>().ok()?)
+            });
+            want.push((i as u32, loc, grid.x0 + grid.cols / 2));
+        }
+    }
     want.sort_by_key(|w| (w.1.is_none(), w.0));
     for (input, loc, mean) in want {
         let x = match loc {

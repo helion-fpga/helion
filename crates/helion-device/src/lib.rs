@@ -1301,7 +1301,18 @@ impl FeatureMap {
             }
         }
         cursor = tracks::sb_abs(3, tracks::TRACKS - 1, tracks::SB_SEL_BITS - 1) + 1;
-        let _ = cursor;
+        // 6. Clocking (see [`clocks`]).
+        debug_assert_eq!(cursor, clocks::ABS_CLKSEL);
+        for b in 0..clocks::LINE_BITS {
+            bits.insert(format!("CLKSEL[{b}]"), clocks::ABS_CLKSEL + b);
+            bits.insert(format!("GDRV.LINE[{b}]"), clocks::ABS_GDRV_LINE + b);
+        }
+        bits.insert("GDRV.EN".to_string(), clocks::ABS_GDRV_EN);
+        for b in 0..3 {
+            bits.insert(format!("GDRV.BLE[{b}]"), clocks::ABS_GDRV_BLE + b);
+        }
+        cursor = clocks::ABS_GDRV_BLE + 3;
+        debug_assert!(cursor <= n_minors * frame_bits);
         Self {
             bits,
             n_minors,
@@ -1970,4 +1981,29 @@ pub mod tracks {
             _ => x.checked_sub(1).map(|x| (x, y)),
         }
     }
+}
+
+/// Clocking of the HL10T fabric.
+///
+/// There are `LINES` global clock lines. Each CLB picks one of them for
+/// all of its flops (`CLKSEL`); a flop with `FF.CLKINV` captures on the
+/// falling edge instead of the rising one.
+///
+/// A line is driven by a clock pad (an input pad with `IOB_CLOCK`, on the
+/// line in its word) or by logic: a CLB with `GDRV.EN` drives line
+/// `GDRV.LINE` from the output of its BLE `GDRV.BLE` (a divided or gated
+/// clock). Line 0 with no driver is the implicit user clock that the
+/// configuration port steps, which is how a single-clock design runs.
+pub mod clocks {
+    pub const LINES: u32 = 4;
+    pub const LINE_BITS: u32 = 2;
+    /// Absolute CLB feature bits, after the switch boxes.
+    pub const ABS_CLKSEL: u32 = super::tracks::ABS_SB + 4 * super::tracks::TRACKS * super::tracks::SB_SEL_BITS;
+    pub const ABS_GDRV_EN: u32 = ABS_CLKSEL + LINE_BITS;
+    pub const ABS_GDRV_LINE: u32 = ABS_GDRV_EN + 1;
+    pub const ABS_GDRV_BLE: u32 = ABS_GDRV_LINE + LINE_BITS;
+    /// IOB word (minor 0): the input pad drives a clock line.
+    pub const IOB_CLOCK: u32 = 47;
+    /// IOB word: the line, `LINE_BITS` bits from here.
+    pub const IOB_CLOCK_LINE: u32 = 48;
 }

@@ -6,7 +6,7 @@ pub use helion_bits::{
     diff_partial_bitstream, encode_imux_hop, encode_pbits, patch_imux_sel, patch_lut_init,
     patch_lut_init_cell, readback_imux_sel, reroute_probe_eco,
 };
-use helion_device::{tracks, Device, Far};
+use helion_device::{clocks, tracks, Device, Far};
 use helion_route::Routed;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -230,6 +230,13 @@ impl IlaTriggerFsm {
     }
 }
 
+/// Driver of a clock line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClkSrc {
+    Pad(u32, u32),
+    Ble(u32, u32, u32),
+}
+
 /// Driver of an interconnect wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WireSrc {
@@ -258,6 +265,14 @@ pub struct Fabric {
     iob_src: BTreeMap<(u32, u32), (u32, u32, u8)>,
     /// Input pad values, set by the test bench.
     pad_in: BTreeMap<(u32, u32), bool>,
+    /// Driver of each clock line; `None` on line 0 is the implicit user clock.
+    clk_src: [Option<ClkSrc>; 4],
+    /// Value of each driven clock line when it was last looked at.
+    clk_prev: [Option<bool>; 4],
+    /// Clock line of each used CLB that is not on line 0.
+    clb_line: BTreeMap<(u32, u32), u8>,
+    /// Some flop on the implicit clock captures on the falling edge.
+    implicit_falling: bool,
     pub stat: Stat,
     cfg_steps: u32,
     /// Runtime BRAM data plane (capture RAM / dual-port writes). Seeded empty on program;
@@ -297,6 +312,10 @@ impl Fabric {
             iobs,
             iob_src: BTreeMap::new(),
             pad_in: BTreeMap::new(),
+            clk_src: [None; 4],
+            clk_prev: [None; 4],
+            clb_line: BTreeMap::new(),
+            implicit_falling: false,
             stat: Stat::reset(),
             cfg_steps: 0,
             bram_data: BTreeMap::new(),
@@ -356,6 +375,7 @@ impl Fabric {
                 }
             }
         }
+        self.refresh_clocking();
         Ok(())
     }
 
@@ -531,6 +551,7 @@ impl Fabric {
     /// input values, without a clock edge.
     pub fn settle(&mut self) {
         self.eval_comb();
+        self.propagate_clocks();
         self.eval_iob();
     }
 
@@ -803,18 +824,109 @@ impl Fabric {
         self.ila_fsm = IlaTriggerFsm::arm(kind, window, pre_trigger);
     }
 
+    /// Rising edge of the implicit user clock.
     fn tick_ff(&mut self) {
+        if self.clk_src[0].is_none() {
+            self.tick_edges([Some(true), None, None, None]);
+        }
+    }
+
+    /// Clock edges on the lines given (`Some(true)` rising, `Some(false)`
+    /// falling): every flop whose CLB is on such a line and whose edge it
+    /// is captures its data input, all at once.
+    fn tick_edges(&mut self, edges: [Option<bool>; 4]) {
         if !self.stat.gwe || self.stat.gsr {
             return;
         }
-        let coords = self.used.clone();
-        for (x, y) in coords {
+        let mut captured: Vec<((u32, u32), usize, bool)> = Vec::new();
+        for &(x, y) in &self.used {
+            let line = self.clb_line.get(&(x, y)).copied().unwrap_or(0) as usize;
+            let Some(rising) = edges[line] else { continue };
             for ble in 0..self.n_ble {
-                if !self.clb_feature_bit(x, y, &format!("BLE{ble}.FF.USED")) {
+                let ff_base = 512 + 40 + ble * 5;
+                if !self.clb_abs_bit(x, y, ff_base) {
                     continue;
                 }
-                let d = self.clbs[&(x, y)].lut_o[ble as usize];
-                self.clbs.get_mut(&(x, y)).unwrap().q[ble as usize] = d;
+                let falling_ff = self.clb_abs_bit(x, y, ff_base + 4);
+                if rising != falling_ff {
+                    captured.push(((x, y), ble as usize, self.clbs[&(x, y)].lut_o[ble as usize]));
+                }
+            }
+        }
+        for (xy, ble, d) in captured {
+            self.clbs.get_mut(&xy).unwrap().q[ble] = d;
+        }
+    }
+
+    fn clk_value(&self, src: ClkSrc) -> bool {
+        match src {
+            ClkSrc::Pad(x, y) => self.pad_in.get(&(x, y)).copied().unwrap_or(false),
+            ClkSrc::Ble(x, y, b) => self.ble_out(x, y, b),
+        }
+    }
+
+    /// Follow the driven clock lines: whenever one changes, its flops
+    /// capture, which may move another line (a divided clock), until
+    /// nothing changes. Leaves the logic settled.
+    fn propagate_clocks(&mut self) {
+        if self.clk_src.iter().all(|s| s.is_none()) {
+            return;
+        }
+        for _ in 0..1024 {
+            self.eval_comb();
+            let mut edges = [None; 4];
+            let mut any = false;
+            for n in 0..4 {
+                let Some(src) = self.clk_src[n] else { continue };
+                let v = self.clk_value(src);
+                if let Some(p) = self.clk_prev[n] {
+                    if p != v {
+                        edges[n] = Some(v);
+                        any = true;
+                    }
+                }
+                self.clk_prev[n] = Some(v);
+            }
+            if !any {
+                return;
+            }
+            self.tick_edges(edges);
+        }
+    }
+
+    /// Read the clock configuration out of the frames.
+    fn refresh_clocking(&mut self) {
+        self.clk_src = [None; 4];
+        self.clk_prev = [None; 4];
+        self.clb_line.clear();
+        self.implicit_falling = false;
+        let line_mask = (1u32 << clocks::LINE_BITS) - 1;
+        let iy = self.clb_y0.saturating_sub(1);
+        for dx in 0..self.interior_cols {
+            let w = self.iob_word(self.clb_x0 + dx, iy);
+            if w & 1 == 1 && (w >> tracks::IOB_INPUT) & 1 == 1 && (w >> clocks::IOB_CLOCK) & 1 == 1 {
+                let line = ((w >> clocks::IOB_CLOCK_LINE) as u32 & line_mask) as usize;
+                self.clk_src[line] = Some(ClkSrc::Pad(self.clb_x0 + dx, iy));
+            }
+        }
+        for &(x, y) in &self.used.clone() {
+            let bits = |s: &Self, abs: u32, n: u32| (0..n).fold(0u32, |a, b| a | ((s.clb_abs_bit(x, y, abs + b) as u32) << b));
+            let line = bits(self, clocks::ABS_CLKSEL, clocks::LINE_BITS);
+            if line != 0 {
+                self.clb_line.insert((x, y), line as u8);
+            }
+            if self.clb_abs_bit(x, y, clocks::ABS_GDRV_EN) {
+                let drv_line = bits(self, clocks::ABS_GDRV_LINE, clocks::LINE_BITS) as usize;
+                let ble = bits(self, clocks::ABS_GDRV_BLE, 3);
+                self.clk_src[drv_line] = Some(ClkSrc::Ble(x, y, ble));
+            }
+            if line == 0 {
+                for ble in 0..self.n_ble {
+                    let ff_base = 512 + 40 + ble * 5;
+                    if self.clb_abs_bit(x, y, ff_base) && self.clb_abs_bit(x, y, ff_base + 4) {
+                        self.implicit_falling = true;
+                    }
+                }
             }
         }
     }
@@ -853,6 +965,14 @@ impl Fabric {
     pub fn step_user(&mut self) {
         self.eval_comb();
         self.tick_ff();
+        // A whole cycle of the implicit clock: clocks made by logic follow
+        // the rising edge, then falling-edge flops capture.
+        self.propagate_clocks();
+        if self.implicit_falling && self.clk_src[0].is_none() {
+            self.eval_comb();
+            self.tick_edges([Some(false), None, None, None]);
+            self.propagate_clocks();
+        }
         self.eval_iob();
     }
 
@@ -964,6 +1084,7 @@ impl Fabric {
                 })
             })
             .collect();
+        self.refresh_clocking();
         Ok(())
     }
 
