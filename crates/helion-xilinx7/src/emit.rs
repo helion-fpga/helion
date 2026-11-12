@@ -10,13 +10,46 @@ use crate::pack::{
 };
 use crate::place::Placed7;
 use crate::route::{RouteKind, Routed7};
+use std::collections::HashMap;
 
 /// What the emitter needs from the device model.
 pub trait EmitDevice {
     /// Tile type for a tile name, e.g. `"CLBLL_L_X14Y100"` → `"CLBLL_L"`.
     fn tile_type(&self, tile: &str) -> Option<String>;
-    /// Site name relative to its tile for FASM.
+    /// Site name relative to its tile for FASM, e.g.
+    /// `("RIOB33_X43Y75", "IOB_X1Y76")` → `"IOB_Y0"` for a master site
+    /// (`IOB_Y1` for slave),
+    /// `("CLBLL_L_X14Y100", "SLICE_X28Y100")` → `"SLICEL_X0"`.
+    /// Returns the site-type-qualified relative name.
     fn site_rel(&self, tile: &str, site: &str) -> Option<String>;
+    /// Static clock-spine lines for a BUFGCTRL site: `(tile, feature)`
+    /// rebuffer enables, emitted as bare `TILE.FEATURE` FASM lines.
+    /// Defaults to none; the XDevice impl derives them from the DB.
+    fn bufg_spine_static(&self, _tile: &str, _site: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    /// IOI tile paired with an IOB tile (same bank side, same row),
+    /// for OLOGIC/ILOGIC features. Defaults to none; the XDevice impl
+    /// finds it in the DB.
+    /// Static clock-network features implied by routed pips. Defaults to
+    /// none (unit-test fakes).
+    fn clock_statics(&self, _pips: &[&crate::route::RoutedPip]) -> Vec<String> {
+        Vec::new()
+    }
+    /// STEPDOWN lines for the banks of these IOB tiles (banks running a
+    /// <=1.8V standard). Defaults to none.
+    fn bank_stepdown(&self, _iob_tiles: &[String]) -> Vec<String> {
+        Vec::new()
+    }
+    fn ioi_tile(&self, _iob_tile: &str) -> Option<String> {
+        None
+    }
+    /// Static always-on housekeeping features for this part, from the
+    /// DB's `required_features.fasm`. Defaults to none; the XDevice
+    /// impl reads the part directory at load.
+    fn required_features(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// IBUF `.IN` feature prefix for an IOSTANDARD, from `segbits_liob33.db`.
@@ -61,6 +94,18 @@ fn obuf_drive_prefix(iostandard: &str, drive: &str) -> Result<&'static str, Stri
     Ok(prefix)
 }
 
+/// FASM drive value for an (IOSTANDARD, DRIVE) pair. Usually the drive
+/// string itself, but the LVCMOS33 12mA selection lives in the shared
+/// LVCMOS33_LVTTL family as I12_I16 (Vivado ground truth, ZB-10).
+fn obuf_drive_value(iostandard: &str, drive: &str) -> String {
+    let std = iostandard.to_ascii_uppercase();
+    let drv = drive.to_ascii_uppercase();
+    match (std.as_str(), drv.as_str()) {
+        ("LVCMOS33", "I12") => "I12_I16".to_string(),
+        _ => drv,
+    }
+}
+
 /// Backend-owned bitstream: FASM text plus assembled configuration frames.
 #[derive(Clone, Debug, Default)]
 pub struct Bitstream7 {
@@ -88,7 +133,13 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     let packed = &placed.packed;
     let mut lines: Vec<String> = Vec::new();
 
-    // 1. LUTs: INIT vector per occupied ALUT..DLUT.
+    // Features every bitstream for this part must contain, straight from
+    // the DB's `required_features.fasm`. These static always-on bits are
+    // referenced by nothing in the design, so they cannot be derived from
+    // routing: emit them first and unconditionally.
+    lines.extend(device.required_features());
+
+    // LUTs: INIT vector per occupied ALUT..DLUT.
     for lut in &placed.luts {
         let site_rel = device
             .site_rel(&lut.tile, &lut.site)
@@ -165,15 +216,239 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         }
     }
 
-    // 4. FFs: ZINI + D-mux select.
+    // FFs: ZINI + D-mux select + control signals (CE, SR).
+    //
+    // Control signal configuration (per X-Ray DB segbits_clbll_l.db):
+    // - {bel}.ZRST: SR pin acts as RESET (vs SET). Always emitted:
+    //   with an SR net it configures reset polarity, without one it
+    //   records the tied-off reset (the oracle has it on every FF).
+    //   prjxray's Z prefix names the zero-state option (ZRST =
+    //   reset-to-zero, like ZINI = init-to-zero); the FASM feature sets the
+    //   documented config bit (bit = 1), it does not clear it.
+    // - {slice}.CEUSEDMUX: slice-level, enables the CE input mux. Needed
+    //   when any FF in the slice has a CE net.
+    // - {slice}.SRUSEDMUX: slice-level, enables the SR input mux. Needed
+    //   when any FF in the slice has an SR net.
+    // Without CEUSEDMUX/SRUSEDMUX, the FF silently ignores CE/SR pins.
+    use std::collections::HashSet;
+    let mut ce_slices: HashSet<(String, String)> = HashSet::new();
+    let mut sr_slices: HashSet<(String, String)> = HashSet::new();
+    // Slices whose SR acts asynchronously (FDCE/FDPE): no FFSYNC.
+    let mut async_slices: HashSet<(String, String)> = HashSet::new();
     for ff in &placed.ffs {
         let site_rel = device
             .site_rel(&ff.tile, &ff.site)
             .ok_or_else(|| format!("emit: no rel site for {} {}", ff.tile, ff.site))?;
-        let bel = ff_bel(&ff.bel)?;
-        let mux_src = mux_for_ff(ff, packed, placed);
-        lines.push(format!("{}.{}.{}.ZINI", ff.tile, site_rel, bel));
+        let bel = ff_bel(&ff.bel)?; // "AFF" -> "AFF"
+        // D source (shared rule with the router): same-letter LUT O6 or
+        // carry sum inside the slice, else the routed bypass pin.
+        let letter = ff.bel.chars().next().unwrap_or('A');
+        let mux_src = match crate::place::ff_d_source(ff, placed) {
+            crate::place::FfDSource::LutO6 => "O6".to_string(),
+            crate::place::FfDSource::CarryXor => "XOR".to_string(),
+            crate::place::FfDSource::Bypass => format!("{letter}X"),
+        };
+        let pff = packed.ffs.iter().find(|p| p.name == ff.name);
+        // ZINI: power-on value 0 (absent: INIT=1).
+        if !pff.map(|p| p.init).unwrap_or(false) {
+            lines.push(format!("{}.{}.{}.ZINI", ff.tile, site_rel, bel));
+        }
         lines.push(format!("{}.{}.{}MUX.{}", ff.tile, site_rel, bel, mux_src));
+        // Control signals: look up the packed FF for CE/SR nets.
+        if let Some(p) = packed.ffs.iter().find(|p| p.name == ff.name) {
+            if p.ce_net.is_some() {
+                ce_slices.insert((ff.tile.clone(), site_rel.clone()));
+            }
+            if p.sr_net.is_some() {
+                sr_slices.insert((ff.tile.clone(), site_rel.clone()));
+            }
+            // ZRST: SR loads 0 (reset); absent, SR loads 1 (set). With
+            // no SR net Vivado ties the reset pin low and still programs
+            // ZRST: the ZB-10 oracle carries ZRST on every chain FF.
+            if !p.srval {
+                lines.push(format!("{}.{}.{}.ZRST", ff.tile, site_rel, bel));
+            }
+            if p.sr_async && p.sr_net.is_some() {
+                async_slices.insert((ff.tile.clone(), site_rel.clone()));
+            }
+        }
+    }
+    // Emit slice-level CE/SR mux enables (deduplicated).
+    for (tile, slice) in &ce_slices {
+        lines.push(format!("{}.{}.CEUSEDMUX", tile, slice));
+    }
+    for (tile, slice) in &sr_slices {
+        lines.push(format!("{}.{}.SRUSEDMUX", tile, slice));
+    }
+
+    // FF clock arrival (ZB-10): every placed FF slice gets FFSYNC
+    // (without it the FFs cannot clock), and its serving INT tile
+    // gets the arrival set. Every used slice also gets NOCLKINV
+    // (clock not inverted): the oracle programs it on all chain
+    // slices, so the zero-initialized frame does not match Vivado.
+    // The serving tile is the same-X INT tile
+    // on the slice's side (proven for the X71 column; anything else
+    // fails loudly at the existence check). Clock wire by slice
+    // letter: SLICE_X0 takes CLK1, SLICE_X1 takes CLK0 (ZB-10 oracle
+    // mapping; any other slice name fails loudly). BYP_ALT lines are
+    // skipped on tiles where the router already drives BYP_ALT (the
+    // head tile's input corridor): emitting the uniform GFAN
+    // selection there would double-drive the mux.
+    let mut ff_slices: HashSet<(String, String)> = HashSet::new();
+    for ff in &placed.ffs {
+        let site_rel = device
+            .site_rel(&ff.tile, &ff.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", ff.tile, ff.site))?;
+        ff_slices.insert((ff.tile.clone(), site_rel));
+    }
+    // Every slice with placed content (LUT, FF, or carry), in
+    // deterministic order. Slices are identified by device rel site.
+    let mut used_slices: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    for lut in &placed.luts {
+        let site_rel = device
+            .site_rel(&lut.tile, &lut.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", lut.tile, lut.site))?;
+        used_slices.insert((lut.tile.clone(), site_rel));
+    }
+    for ff in &placed.ffs {
+        let site_rel = device
+            .site_rel(&ff.tile, &ff.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", ff.tile, ff.site))?;
+        used_slices.insert((ff.tile.clone(), site_rel));
+    }
+    for c in &placed.carries {
+        let site_rel = device
+            .site_rel(&c.tile, &c.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", c.tile, c.site))?;
+        used_slices.insert((c.tile.clone(), site_rel));
+    }
+    // Slices whose flops clock on the falling edge take the slice clock
+    // inverter (the placer keeps both edges out of one slice).
+    let mut negedge_slices: HashSet<(String, String)> = HashSet::new();
+    for ff in &placed.ffs {
+        if packed.negedge_ffs.contains(&ff.name) {
+            if let Some(site_rel) = device.site_rel(&ff.tile, &ff.site) {
+                negedge_slices.insert((ff.tile.clone(), site_rel));
+            }
+        }
+    }
+    for (tile, slice) in &used_slices {
+        if negedge_slices.contains(&(tile.clone(), slice.clone())) {
+            lines.push(format!("{tile}.{slice}.CLKINV"));
+        } else {
+            lines.push(format!("{tile}.{slice}.NOCLKINV"));
+        }
+    }
+    // SLICEM address-input defaults (ZB-10): a used SLICEM slice runs
+    // its A/B/C LUTs in logic mode with the DI1 address mux parked
+    // on the cascade input, even for unused letters (the oracle shows
+    // all three on slices using only ALUT). SLICEL has no DI muxes
+    // and the D LUT has no default in the oracle.
+    const DI1_DEFAULTS: [(&str, &str); 3] = [
+        ("ALUT", "BDI1_BMC31"),
+        ("BLUT", "DI_CMC31"),
+        ("CLUT", "DI_DMC31"),
+    ];
+    for (tile, slice) in &used_slices {
+        if !slice.starts_with("SLICEM") {
+            continue;
+        }
+        for (bel, src) in DI1_DEFAULTS {
+            lines.push(format!("{tile}.{slice}.{bel}.DI1MUX.{src}"));
+        }
+    }
+    // Serving INT tile per FF slice, with the CLK letters it needs.
+    let mut int_arrival: std::collections::BTreeMap<String, (bool, bool)> = std::collections::BTreeMap::new();
+    for (tile, slice) in &ff_slices {
+        if !async_slices.contains(&(tile.clone(), slice.clone())) {
+            lines.push(format!("{tile}.{slice}.FFSYNC"));
+        }
+        let mut parts = tile.split('_');
+        let (_family, side, xypart) = match (parts.next(), parts.next(), parts.next()) {
+            (Some(fam), Some(side), Some(xy)) if parts.next().is_none() => (fam, side, xy),
+            _ => return Err(format!("emit: cannot parse slice tile `{tile}`")),
+        };
+        let xy = xypart.strip_prefix('X').ok_or_else(|| format!("emit: cannot parse slice tile `{tile}`"))?;
+        let (x, y) = xy.split_once('Y').ok_or_else(|| format!("emit: cannot parse slice tile `{tile}`"))?;
+        let serving = format!("INT_{side}_X{x}Y{y}");
+        device.tile_type(&serving).ok_or_else(|| format!("emit: no serving INT tile `{serving}` for `{tile}`"))?;
+        let clk1 = if slice.ends_with("_X0") {
+            true
+        } else if slice.ends_with("_X1") {
+            false
+        } else {
+            return Err(format!("emit: unknown slice `{slice}` for clock mapping"));
+        };
+        let entry = int_arrival.entry(serving).or_insert((false, false));
+        if clk1 {
+            entry.1 = true;
+        } else {
+            entry.0 = true;
+        }
+    }
+    // Tiles where the router already drives BYP_ALT (input corridor).
+    let mut byp_owned: HashSet<String> = HashSet::new();
+    for net in &routed.nets {
+        if let RouteKind::Pips(pips) = &net.kind {
+            for p in pips {
+                if p.dst_wire.contains("BYP_ALT") || p.src_wire.contains("BYP_ALT") {
+                    byp_owned.insert(p.tile.clone());
+                }
+            }
+        }
+    }
+    const BYP_FROM_GFAN: [(u8, u8); 8] = [(0, 0), (1, 0), (2, 1), (3, 1), (4, 0), (5, 0), (6, 1), (7, 1)];
+    // Bypass inputs that must read 1, never ground. A PRECYINIT.C0 carry
+    // head (`cyinit == Some(false)`) computes bit 0 as S0 = !Q0 with its
+    // carry generate DI0 taken from the AX bypass pin, which must read 1
+    // (an unprogrammed BYP_ALT reads VCC by default, X-Ray ppip
+    // `INT_*.BYP_ALT*.VCC_WIRE default`). Grounding it through GFAN froze
+    // the counter at bit 0: the extracted netlist toggled only bit 0, and
+    // removing exactly this one tie made it match the RTL for 2^25 cycles.
+    // AX reaches the INT tile on BYP_ALT1 for slice X0 and BYP_ALT0 for
+    // slice X1, identically on CLBLL_L/R and CLBLM_L/R (tileconn + ppips).
+    let mut keep_high: HashSet<(String, u8)> = HashSet::new();
+    for carry in &placed.carries {
+        let Some(pc) = packed.carries.iter().find(|p| p.name == carry.name) else {
+            continue;
+        };
+        if pc.cyinit != Some(false) {
+            continue;
+        }
+        let site_rel = device
+            .site_rel(&carry.tile, &carry.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", carry.tile, carry.site))?;
+        let ax_alt = if site_rel.ends_with("_X0") {
+            1
+        } else if site_rel.ends_with("_X1") {
+            0
+        } else {
+            return Err(format!("emit: unknown slice `{site_rel}` for carry head AX"));
+        };
+        let mut parts = carry.tile.split('_');
+        if let (Some(_), Some(side), Some(xy), None) = (parts.next(), parts.next(), parts.next(), parts.next()) {
+            keep_high.insert((format!("INT_{side}_{xy}"), ax_alt));
+        }
+    }
+    for (int, (need_clk0, need_clk1)) in &int_arrival {
+        lines.push(format!("{int}.GFAN0.GND_WIRE"));
+        lines.push(format!("{int}.GFAN1.GND_WIRE"));
+        // Fixed-recipe clock arrival; graph-routed clocks carry their own
+        // INT clock-input pips.
+        if *need_clk0 && !routed.graph_clocks {
+            lines.push(format!("{int}.CLK0.GCLK_B11"));
+        }
+        if *need_clk1 && !routed.graph_clocks {
+            lines.push(format!("{int}.CLK1.GCLK_B11"));
+        }
+        if !byp_owned.contains(int) {
+            for (alt, gfan) in BYP_FROM_GFAN {
+                if keep_high.contains(&(int.clone(), alt)) {
+                    continue;
+                }
+                lines.push(format!("{int}.BYP_ALT{alt}.GFAN{gfan}"));
+            }
+        }
     }
 
     // 5. IOBs.
@@ -194,16 +469,38 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                     "{}.{}.LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVDS_25_LVTTL_SSTL135_SSTL15_TMDS_33.IN_ONLY",
                     iob.tile, site_rel
                 ));
+                // Vivado default input slew is FAST (ground truth:
+                // LIOB33_X0Y25 IOB_Y0 SLEW.FAST on the GCLK input).
+                // Only LVCMOS33 has DB evidence; other standards keep
+                // the old behavior (no slew line).
+                if p.iostandard.eq_ignore_ascii_case("LVCMOS33") {
+                    let slew = p.slew.as_deref().unwrap_or("FAST");
+                    lines.push(format!(
+                        "{}.{}.LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVTTL.SLEW.{}",
+                        iob.tile,
+                        site_rel,
+                        slew.to_ascii_uppercase()
+                    ));
+                }
+                // Input path: no inversion on D (Vivado ILOGIC_Y0.ZINV_D).
+                if let Some(logic_tile) = device.ioi_tile(&iob.tile) {
+                    let logic = site_rel.replace("IOB_", "ILOGIC_");
+                    lines.push(format!("{logic_tile}.{logic}.ZINV_D"));
+                }
             }
             IobDir::Out => {
-                let drive = p.drive.as_deref().unwrap_or("I16");
+                // OBUF: output driver enabled by DRIVE select (no IN_ONLY).
+                // The DRIVE feature prefix depends on the (standard, drive)
+                // pair (see obuf_drive_prefix); the FASM value additionally
+                // depends on the pair (see obuf_drive_value). Vivado
+                // default drive for LVCMOS33 is 12mA (ground truth:
+                // LVCMOS33_LVTTL.DRIVE.I12_I16 on the LD0 output).
+                let drive = p.drive.as_deref().unwrap_or("I12");
                 let prefix = obuf_drive_prefix(&p.iostandard, drive)?;
+                let value = obuf_drive_value(&p.iostandard, drive);
                 lines.push(format!(
                     "{}.{}.{}.DRIVE.{}",
-                    iob.tile,
-                    site_rel,
-                    prefix,
-                    drive.to_ascii_uppercase()
+                    iob.tile, site_rel, prefix, value
                 ));
                 let slew = p.slew.as_deref().unwrap_or("SLOW");
                 lines.push(format!(
@@ -212,11 +509,89 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                     site_rel,
                     slew.to_ascii_uppercase()
                 ));
+                // Output path: OLOGIC used, D1 mux, single-data-rate
+                // bypass (Vivado ground truth on the LD0 output).
+                if let Some(logic_tile) = device.ioi_tile(&iob.tile) {
+                    let logic = site_rel.replace("IOB_", "OLOGIC_");
+                    lines.push(format!("{logic_tile}.{logic}.OQUSED"));
+                    lines.push(format!("{logic_tile}.{logic}.OMUX.D1"));
+                    lines.push(format!(
+                        "{logic_tile}.{logic}.OSERDES.DATA_RATE_TQ.BUF"
+                    ));
+                }
+            }
+        }
+        // Vivado defaults on every IOB: no pull, no input termination.
+        lines.push(format!("{}.{}.PULLTYPE.NONE", iob.tile, site_rel));
+        lines.push(format!("{}.{}.IN_TERM.NONE", iob.tile, site_rel));
+        let _ = p;
+    }
+
+    // Banks running a low-voltage standard: STEPDOWN on every IOB of the
+    // bank plus the bank's HCLK_IOI3 (Vivado ground truth, fa4b golden).
+    let low_v: Vec<String> = placed
+        .iobs
+        .iter()
+        .filter(|i| {
+            packed.iobs.iter().find(|p| p.name == i.name).map(|p| {
+                let s = p.iostandard.to_ascii_uppercase();
+                matches!(s.as_str(), "LVCMOS18" | "LVCMOS15" | "LVCMOS12" | "SSTL135" | "SSTL15" | "HSTL_I" | "HSTL_II" | "HSTL_I_18" | "HSTL_II_18")
+            }).unwrap_or(false)
+        })
+        .map(|i| i.tile.clone())
+        .collect();
+    if !low_v.is_empty() {
+        lines.extend(device.bank_stepdown(&low_v));
+    }
+
+    // BUFGCTRLs. Static configuration for an I0 -> O clock buffer (BUFG).
+    //
+    // Xilinx UG472 Fig. 2-5 "BUFG as BUFGCTRL" builds a BUFG from a
+    // BUFGCTRL by DRIVING the control pins: S0=VDD, CE0=VDD, IGNORE0=GND,
+    // S1=GND, CE1=GND, IGNORE1=VDD. UG472 Table 2-3: (CE0,S0,CE1,S1) =
+    // (1,1,0,X) or (1,1,X,0) selects I0; any other select state holds O at
+    // INIT_OUT with no toggle.
+    //
+    // Bit meanings below are from prjxray fuzzer 042-clk-bufg-config
+    // (generate.py): a `Z` prefix means the FASM feature is the INVERSE of
+    // the Vivado attribute (feature present <=> attribute is 0/FALSE); a
+    // non-Z feature is present <=> attribute is 1/TRUE.
+    //   ZINV_S0/ZINV_CE0 present <=> pin NOT inverted.
+    //   IS_IGNORE1_INVERTED present <=> IGNORE1 inverted (Vivado sets it).
+    //   INIT_OUT, IS_IGNORE0_INVERTED absent <=> defaults (0, not inverted).
+    //
+    // Feature set is Vivado ground truth from the ZB-10 same-RTL diff
+    // (GT-blinky.bit): IN_USE, ZINV_CE0, ZINV_S0, IS_IGNORE1_INVERTED.
+    // ZINV_S1/ZINV_CE1 belong to the I1 path and Vivado does not set
+    // them here; neither does it set ZPRESELECT_I0. The old advice to
+    // keep ZINV_S1/ZINV_CE1 is overruled, and there is no fabric
+    // drive at all: the ZB-10 oracle programs zero tie-offs
+    // device-wide (IGNORE1 masks S1/CE1, HIGH pins match IMUX
+    // defaults), so polarity bits only select inversion.
+    // BUFGCTRL inputs the router drives (tile, index 0-15, I0/I1):
+    // parked lines must never double-drive these muxes.
+    let mut bufg_used: HashSet<(String, u8, u8)> = HashSet::new();
+    for net in &routed.nets {
+        if let RouteKind::Pips(pips) = &net.kind {
+            for p in pips {
+                if let Some(rest) = p.dst_wire.strip_prefix("CLK_BUFG_BUFGCTRL") {
+                    let mut parts = rest.split('_');
+                    if let (Some(ns), Some(inp), None) = (parts.next(), parts.next(), parts.next()) {
+                        let input = match inp {
+                            "I0" => 0,
+                            "I1" => 1,
+                            _ => continue,
+                        };
+                        if let Ok(n) = ns.parse::<u8>() {
+                            if n < 16 {
+                                bufg_used.insert((p.tile.clone(), n, input));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
-
-    // 6. Clock buffers (BUFG, BUFGCE, BUFGCTRL, BUFIO, BUFR).
     for bufg in &placed.bufgs {
         let pbufg = packed.bufgs.iter().find(|b| b.name == bufg.name);
         let kind = pbufg.map(|b| b.kind).unwrap_or(ClockBufKind::Bufg);
@@ -250,10 +625,17 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                     .site_rel(&bufg.tile, &bufg.site)
                     .ok_or_else(|| format!("emit: no rel site for {} {}", bufg.tile, bufg.site))?;
                 lines.push(format!("{}.BUFGCTRL.{}.IN_USE", bufg.tile, site_rel));
-                lines.push(format!(
-                    "{}.BUFGCTRL.{}.IS_IGNORE0_INVERTED",
-                    bufg.tile, site_rel
-                ));
+                // No inversion on the driven I0-path pins: values pass through.
+                lines.push(format!("{}.BUFGCTRL.{}.ZINV_CE0", bufg.tile, site_rel));
+                lines.push(format!("{}.BUFGCTRL.{}.ZINV_S0", bufg.tile, site_rel));
+                // IGNORE1 inverted, exactly as Vivado emits it.
+                lines.push(format!("{}.BUFGCTRL.{}.IS_IGNORE1_INVERTED", bufg.tile, site_rel));
+                // Rebuffer enables for this BUFG's global line (bare features).
+                if !routed.graph_clocks {
+                    for (tile, feat) in device.bufg_spine_static(&bufg.tile, &bufg.site) {
+                        lines.push(format!("{tile}.{feat}"));
+                    }
+                }
                 if let Some(pb) = pbufg {
                     if pb.init_out == 1 {
                         lines.push(format!("{}.BUFGCTRL.{}.ZINIT_OUT", bufg.tile, site_rel));
@@ -265,6 +647,31 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                         lines.push(format!("{}.BUFGCTRL.{}.PRESELECT_I1", bufg.tile, site_rel));
                     }
                 }
+            }
+        }
+    }
+    // Park every unused BUFGCTRL I0/I1 input on its fixed IMUX
+    // (ZB-10 oracle: BUFGCTRLn takes IMUX{28+n%4}_{n/4} on both
+    // inputs; only the live input keeps the router's source).
+    // One tile holds 16 BUFGCTRLs; deduplicate shared tiles.
+    let mut bufg_tiles: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for bufg in &placed.bufgs {
+        let kind = packed.bufgs.iter().find(|b| b.name == bufg.name).map(|b| b.kind).unwrap_or(ClockBufKind::Bufg);
+        if !matches!(kind, ClockBufKind::Bufio | ClockBufKind::Bufr) {
+            bufg_tiles.insert(bufg.tile.as_str());
+        }
+    }
+    for tile in bufg_tiles {
+        for n in 0..16u8 {
+            for input in [0u8, 1u8] {
+                if bufg_used.contains(&(tile.to_string(), n, input)) {
+                    continue;
+                }
+                let m = 28 + (n % 4);
+                let s = n / 4;
+                lines.push(format!(
+                    "{tile}.CLK_BUFG_BUFGCTRL{n}_I{input}.CLK_BUFG_IMUX{m}_{s}"
+                ));
             }
         }
     }
@@ -509,36 +916,162 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         }
     }
 
-    // 10. CARRY4s.
+    // CARRY4s (ZB-04). Feature paths: TILE.SLICEL_<X>.CARRY4.<bit> and
+    // TILE.SLICEL_<X>.PRECYINIT.<src>. Derived from the blinky golden
+    // chain (GT-blinky.bit decodes): a chained group takes PRECYINIT.CIN
+    // (carry in from the slice below through the dedicated cascade),
+    // except a group chained directly on the head, which takes
+    // PRECYINIT.AX (golden Y39X1 transit); a CYINIT-config head takes
+    // PRECYINIT.C0 for CYINIT=0 or C1 for CYINIT=1. C0 is const-0
+    // (the oracle synth netlist ties head CYINIT to const0); mapping a
+    // CYINIT=1 intent to C0 freezes bit 0 on silicon. CARRY4.ACY0
+    // accompanies AX exactly (head-AX and transit-AX show it; C0, C1
+    // and CIN never do).
+    let co_nets: HashSet<&str> = packed
+        .carries
+        .iter()
+        .filter_map(|c| c.co_net.as_deref())
+        .collect();
+    // Chain heads (CI not chained): a group chained directly on a head
+    // selects the head-driven cascade variant.
+    let head_names: HashSet<&str> = packed
+        .carries
+        .iter()
+        .filter(|c| !co_nets.contains(c.ci_net.as_str()))
+        .map(|c| c.name.as_str())
+        .collect();
+    let co_driver: HashMap<&str, &str> = packed
+        .carries
+        .iter()
+        .filter_map(|c| c.co_net.as_deref().map(|co| (co, c.name.as_str())))
+        .collect();
+    // Chains built from directly instantiated CARRY4 primitives: the head
+    // wires its CYINIT pin.
+    let prim_style: HashSet<&str> = packed
+        .carries
+        .iter()
+        .filter(|c| {
+            let mut cur = *c;
+            let mut hops = 0;
+            while let Some(d) = co_driver.get(cur.ci_net.as_str()).and_then(|n| packed.carries.iter().find(|x| x.name == *n)) {
+                cur = d;
+                hops += 1;
+                if hops > packed.carries.len() {
+                    break;
+                }
+            }
+            cur.cyinit_net.is_some()
+        })
+        .map(|c| c.name.as_str())
+        .collect();
     for carry in &placed.carries {
         let site_rel = device
             .site_rel(&carry.tile, &carry.site)
             .ok_or_else(|| format!("emit: no rel site for {} {}", carry.tile, carry.site))?;
-        lines.push(format!("{}.{}.CARRY4.IN_USE", carry.tile, site_rel));
-        if let Some(pcarry) = packed.carries.iter().find(|c| c.name == carry.name) {
-            if pcarry.ci_net.is_some() {
+        let packed_c = packed
+            .carries
+            .iter()
+            .find(|c| c.name == carry.name)
+            .ok_or_else(|| format!("emit: placed CARRY4 {} has no packed cell", carry.name))?;
+        if prim_style.contains(carry.name.as_str()) {
+            // A directly instantiated CARRY4 chain: carry in from the cascade,
+            // or from the constant or fabric net on the head's CYINIT pin;
+            // each wired DI selects the bypass generate.
+            if co_nets.contains(packed_c.ci_net.as_str()) {
                 lines.push(format!("{}.{}.PRECYINIT.CIN", carry.tile, site_rel));
-            } else if let Some(cy) = &pcarry.cyinit_net {
-                match cy.as_str() {
-                    "1" | "vcc" | "VCC" | "$true" => {
-                        lines.push(format!("{}.{}.PRECYINIT.C1", carry.tile, site_rel));
-                    }
-                    "0" | "gnd" | "GND" | "$false" => {
-                        lines.push(format!("{}.{}.PRECYINIT.C0", carry.tile, site_rel));
-                    }
-                    _ => {
-                        lines.push(format!("{}.{}.PRECYINIT.AX", carry.tile, site_rel));
-                    }
-                }
             } else {
-                lines.push(format!("{}.{}.PRECYINIT.C0", carry.tile, site_rel));
+                let src = match packed_c.cyinit_net.as_deref() {
+                    Some("1" | "vcc" | "VCC" | "$true") => "C1",
+                    Some("0" | "gnd" | "GND" | "$false") | None => "C0",
+                    Some(_) => "AX",
+                };
+                lines.push(format!("{}.{}.PRECYINIT.{}", carry.tile, site_rel, src));
             }
             for (i, letter) in ['A', 'B', 'C', 'D'].iter().enumerate() {
-                if pcarry.di_nets[i].is_some() {
+                if packed_c.di_nets[i].is_some() {
                     lines.push(format!("{}.{}.CARRY4.{}CY0", carry.tile, site_rel, letter));
                 }
             }
+            continue;
         }
+        if packed.adder_carries.contains(&carry.name) {
+            // General adder: carry in from config (head) or the cascade,
+            // generate from O5 where the bit has one, sum out on XOR.
+            let src = match packed_c.cyinit {
+                Some(true) => "C1",
+                Some(false) => "C0",
+                None => "CIN",
+            };
+            lines.push(format!("{}.{}.PRECYINIT.{}", carry.tile, site_rel, src));
+            for (j, letter) in ['A', 'B', 'C', 'D'].into_iter().enumerate() {
+                if packed_c.di_nets[j].is_some() && packed_c.s_nets[j].is_some() {
+                    lines.push(format!("{}.{}.CARRY4.{letter}CY0", carry.tile, site_rel));
+                }
+                if packed_c.o_nets[j].is_some() {
+                    lines.push(format!("{}.{}.{letter}OUTMUX.XOR", carry.tile, site_rel));
+                }
+            }
+            continue;
+        }
+        // ACY0 accompanies AX exactly (golden: head-AX and transit-AX
+        // carry it; C0 and CIN never do).
+        let mut use_ax = false;
+        if let Some(high) = packed_c.cyinit {
+            // CYINIT from config: the value selects the source. C0 is
+            // const-0, C1 is const-1; crossing them freezes silicon.
+            let src = if high { "C1" } else { "C0" };
+            lines.push(format!("{}.{}.PRECYINIT.{}", carry.tile, site_rel, src));
+        } else if co_nets.contains(packed_c.ci_net.as_str()) {
+            let head_driven = co_driver
+                .get(packed_c.ci_net.as_str())
+                .is_some_and(|d| head_names.contains(*d));
+            if head_driven {
+                lines.push(format!("{}.{}.PRECYINIT.AX", carry.tile, site_rel));
+                use_ax = true;
+            } else {
+                lines.push(format!("{}.{}.PRECYINIT.CIN", carry.tile, site_rel));
+            }
+        } else {
+            // Legacy const-LUT head: CYINIT source is the CI net driver.
+            let driver_init = packed
+                .luts
+                .iter()
+                .find(|l| l.output_net == packed_c.ci_net)
+                .map(|l| l.init);
+            match driver_init {
+                Some(u64::MAX) => {
+                    lines.push(format!("{}.{}.PRECYINIT.AX", carry.tile, site_rel));
+                    use_ax = true;
+                }
+                Some(0) => {
+                    lines.push(format!("{}.{}.PRECYINIT.C0", carry.tile, site_rel));
+                }
+                other => {
+                    return Err(format!(
+                        "emit: CARRY4 {} head CI net `{}` needs a const-1 (AX) or const-0 (C0) LUT driver, got {other:?}",
+                        carry.name, packed_c.ci_net
+                    ));
+                }
+            }
+        }
+        if use_ax {
+            lines.push(format!("{}.{}.CARRY4.ACY0", carry.tile, site_rel));
+        }
+    }
+
+    // Clock-network enables implied by the routed pips (rebuffers, HROW
+    // taps, BUFHCE, HCLK leaf buffers, CMT markers).
+    {
+        let all: Vec<&crate::route::RoutedPip> = routed
+            .nets
+            .iter()
+            .filter_map(|n| match &n.kind {
+                RouteKind::Pips(p) => Some(p.iter()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        lines.extend(device.clock_statics(&all));
     }
 
     // 11. IDDR / ODDR in ILOGICE2 / OLOGICE2.
@@ -1005,13 +1538,39 @@ fn ff_bel(bel: &str) -> Result<String, String> {
     Ok(format!("{letter}FF"))
 }
 
+/// Which FFMUX input feeds this FF's D. When the FF is paired with a LUT
+/// on the same BEL letter (pack's pairing invariant), D comes from the
+/// LUT's O via the letter-matched mux input (`AX` for AFF, `BX` for BFF,
+/// `CX` for CFF, `DX` for DFF). The X-Ray DB only documents the
+/// letter-matched option per BEL; the bare `AX` default is invalid for
+/// B/C/D (no `BFFMUX.AX` in segbits).
 fn mux_for_ff(
     ff: &crate::place::PlacedFf,
     packed: &crate::pack::Packed7,
     placed: &Placed7,
 ) -> &'static str {
     let letter = ff.bel.chars().next().unwrap_or('A');
+    let mux_in: &'static str = match letter {
+        'B' => "BX",
+        'C' => "CX",
+        'D' => "DX",
+        _ => "AX",
+    };
+    // D from carry O: the FFMUX selects XOR (the carry sum bit), never a
+    // letter input. The golden chain shows FFMUX.XOR on every chain FF.
+    // Without this the FF would sample AX instead of the sum: wrong
+    // silicon with no loud failure, so this check comes first.
     if let Some(pff) = packed.ffs.iter().find(|f| f.name == ff.name) {
+        let from_carry = packed.carries.iter().any(|c| {
+            c.o_nets
+                .iter()
+                .any(|o| o.as_deref() == Some(pff.d_net.as_str()))
+        });
+        if from_carry {
+            return "XOR";
+        }
+        // Otherwise the D net driver, when it is a LUT on the same
+        // site+letter, selects the letter-matched mux input.
         for lut in &placed.luts {
             if lut.site == ff.site
                 && lut.bel.starts_with(letter)
@@ -1022,19 +1581,20 @@ fn mux_for_ff(
                     .map(|l| l.output_net == pff.d_net)
                     .unwrap_or(false)
             {
-                return "AX";
+                return mux_in;
             }
         }
     }
-    "AX"
+    // Default: letter-matched input (most common); the router/emitter can refine.
+    mux_in
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pack::{IobDir, Packed7, PackedFf, PackedIob, PackedLut};
-    use crate::place::{Placed7, PlacedFf, PlacedIob, PlacedLut};
-    use crate::route::{RouteKind, Routed7, RoutedNet7};
+    use crate::pack::{IobDir, Packed7, PackedCarry, PackedFf, PackedIob, PackedLut};
+    use crate::place::{Placed7, PlacedCarry, PlacedFf, PlacedIob, PlacedLut};
+    use crate::route::{Routed7, RoutedNet7, RouteKind};
 
     struct FakeEmit;
     impl EmitDevice for FakeEmit {
@@ -1042,12 +1602,10 @@ mod tests {
             Some("CLBLL_L".into())
         }
         fn site_rel(&self, tile: &str, site: &str) -> Option<String> {
-            if tile.starts_with("CLB") {
-                Some(if site.ends_with("Y0") {
-                    "SLICEL_X0".into()
-                } else {
-                    "SLICEL_X1".into()
-                })
+            if tile.starts_with("CLBLM") {
+                Some("SLICEM_X0".into())
+            } else if tile.starts_with("CLB") {
+                Some(if site.ends_with("Y0") { "SLICEL_X0".into() } else { "SLICEL_X1".into() })
             } else if tile.starts_with("RIOB") {
                 Some("IOB_Y1".into())
             } else if tile.starts_with("BRAM") {
@@ -1072,7 +1630,7 @@ mod tests {
                 q_net: "q".into(),
                 clk_net: "clk_bufg".into(),
                 ce_net: None,
-                sr_net: None,
+                sr_net: None, init: false, srval: false, sr_async: false,
             }],
             iobs: vec![PackedIob {
                 name: "u_obuf".into(),
@@ -1112,10 +1670,8 @@ mod tests {
         };
         Routed7 {
             placed,
-            nets: vec![RoutedNet7 {
-                net: "q".into(),
-                kind: RouteKind::SiteInternal,
-            }],
+            nets: vec![RoutedNet7 { net: "q".into(), kind: RouteKind::SiteInternal }],
+            ..Default::default()
         }
     }
 
@@ -1123,21 +1679,440 @@ mod tests {
     fn emit_blinky_fasm() {
         let bs = emit_fasm(&routed_blinky(), &FakeEmit).unwrap();
         let text = bs.fasm.join("\n");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.ALUT.INIT[63:0] = 64'h5555555555555555"), "got:\n{text}");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZINI"), "got:\n{text}");
+        // Paired inverter LUT drives the FF inside the slice (O6), not
+        // through the unrouted AX bypass.
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFFMUX.O6"), "got:\n{text}");
+        // Vivado default drive for LVCMOS33 outputs is 12mA (ZB-10).
+        assert!(text.contains("RIOB33_X0Y0.IOB_Y1.LVCMOS33_LVTTL.DRIVE.I12_I16"), "got:\n{text}");
+        assert!(text.contains("RIOB33_X0Y0.IOB_Y1.PULLTYPE.NONE"), "got:\n{text}");
+        assert!(text.contains("RIOB33_X0Y0.IOB_Y1.IN_TERM.NONE"), "got:\n{text}");
+    }
+
+    #[test]
+    fn emit_ff_clock_arrival() {
+        // Every placed FF slice gets FFSYNC (its FFs cannot clock
+        // without it), and its serving INT tile gets the clock arrival
+        // set: grounded GFANs, GCLK_B11 into the slice's CLK wire
+        // (X0 takes CLK1, X1 takes CLK0, the ZB-10 oracle mapping),
+        // and the uniform BYP_ALT from GFAN selection.
+        let bs = emit_fasm(&routed_blinky(), &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.FFSYNC"), "got:\n{text}");
+        assert!(text.contains("INT_L_X0Y0.GFAN0.GND_WIRE"), "got:\n{text}");
+        assert!(text.contains("INT_L_X0Y0.GFAN1.GND_WIRE"), "got:\n{text}");
+        assert!(text.contains("INT_L_X0Y0.CLK1.GCLK_B11"), "got:\n{text}");
+        assert!(text.contains("INT_L_X0Y0.BYP_ALT0.GFAN0"), "got:\n{text}");
+        assert!(text.contains("INT_L_X0Y0.BYP_ALT7.GFAN1"), "got:\n{text}");
+    }
+
+    #[test]
+    fn emit_ff_without_sr_net_gets_zrst() {
+        // ZB-10 oracle: every chain FF has ZRST (reset, tied off) even
+        // with no SR net. The blinky fixture FF has sr_net None.
+        let bs = emit_fasm(&routed_blinky(), &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZRST"), "got:\n{text}");
+    }
+
+    #[test]
+    fn emit_used_slice_gets_noclockinv() {
+        // ZB-10 oracle: every used slice programs NOCLKINV (the
+        // zero-initialized frame does not match Vivado here).
+        let bs = emit_fasm(&routed_blinky(), &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.NOCLKINV"), "got:\n{text}");
+    }
+
+    /// A slice of falling-edge flops takes the clock inverter instead.
+    #[test]
+    fn emit_falling_edge_slice_gets_clkinv() {
+        let mut r = routed_blinky();
+        let ff = r.placed.packed.ffs[0].name.clone();
+        r.placed.packed.negedge_ffs.insert(ff);
+        let bs = emit_fasm(&r, &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.CLKINV"), "got:\n{text}");
+        assert!(!text.contains("CLBLL_L_X0Y0.SLICEL_X0.NOCLKINV"), "got:\n{text}");
+    }
+
+    #[test]
+    fn emit_slicem_slice_gets_di1mux_defaults() {
+        // ZB-10 oracle: every used SLICEM slice programs the DI1MUX
+        // address defaults on A/B/C (even with no B/C LUTs); the D
+        // LUT and SLICEL slices never carry them.
+        let mut r = routed_blinky();
+        r.placed.packed.luts[0].output_net = "dm".into();
+        r.placed.luts[0].tile = "CLBLM_R_X0Y0".into();
+        r.placed.luts[0].site = "SLICE_X0Y0".into();
+        r.placed.packed.ffs[0].d_net = "dm".into();
+        r.placed.ffs[0].tile = "CLBLM_R_X0Y0".into();
+        r.placed.ffs[0].site = "SLICE_X0Y0".into();
+        let bs = emit_fasm(&r, &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        assert!(text.contains("CLBLM_R_X0Y0.SLICEM_X0.ALUT.DI1MUX.BDI1_BMC31"), "got:\n{text}");
+        assert!(text.contains("CLBLM_R_X0Y0.SLICEM_X0.BLUT.DI1MUX.DI_CMC31"), "got:\n{text}");
+        assert!(text.contains("CLBLM_R_X0Y0.SLICEM_X0.CLUT.DI1MUX.DI_DMC31"), "got:\n{text}");
+        assert!(!text.contains("DLUT.DI1MUX"), "got:\n{text}");
+        // The L-type blinky slice must stay clean.
+        let base = emit_fasm(&routed_blinky(), &FakeEmit).unwrap().fasm.join("\n");
+        assert!(!base.contains("DI1MUX"), "got:\n{base}");
+    }
+
+    #[test]
+    fn emit_arrival_skips_router_owned_byp() {
+        // The head tile's BYP_ALT0 carries the clock input corridor
+        // (router-owned): arrival must not double-drive it, but GFAN,
+        // CLK, and FFSYNC still go out.
+        use crate::route::RoutedPip;
+        let mut routed = routed_blinky();
+        routed.nets.push(RoutedNet7 {
+            net: "clk_in".into(),
+            kind: RouteKind::Pips(vec![RoutedPip {
+                tile: "INT_L_X0Y0".into(),
+                dst_wire: "BYP_ALT0".into(),
+                src_wire: "NR1END0".into(),
+                is_pseudo: false,
+            }]),
+        });
+        let bs = emit_fasm(&routed, &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        // The only BYP_ALT line is the router's own pip, never a
+        // GFAN selection from arrival.
+        assert_eq!(text.matches("BYP_ALT").count(), 1, "got:\n{text}");
+        assert!(text.contains("INT_L_X0Y0.GFAN0.GND_WIRE"), "got:\n{text}");
+        assert!(text.contains("INT_L_X0Y0.CLK1.GCLK_B11"), "got:\n{text}");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.FFSYNC"), "got:\n{text}");
+    }
+
+    #[test]
+    fn emit_ff_control_signals() {
+        // FF with CE and SR nets must emit CEUSEDMUX, SRUSEDMUX, and ZRST.
+        // Without these, the FF silently ignores its CE/SR pins.
+        let mut routed = routed_blinky();
+        routed.placed.packed.ffs[0].ce_net = Some("ce".into());
+        routed.placed.packed.ffs[0].sr_net = Some("rst".into());
+        let bs = emit_fasm(&routed, &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
         assert!(
-            text.contains("CLBLL_L_X0Y0.SLICEL_X0.ALUT.INIT[63:0] = 64'h5555555555555555"),
-            "got:\n{text}"
+            text.contains("CLBLL_L_X0Y0.SLICEL_X0.CEUSEDMUX"),
+            "missing CEUSEDMUX, got:\n{text}"
         );
         assert!(
-            text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZINI"),
-            "got:\n{text}"
+            text.contains("CLBLL_L_X0Y0.SLICEL_X0.SRUSEDMUX"),
+            "missing SRUSEDMUX, got:\n{text}"
         );
         assert!(
-            text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFFMUX.AX"),
-            "got:\n{text}"
+            text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZRST"),
+            "missing ZRST, got:\n{text}"
+        );
+    }
+
+    /// Golden shapes: TILE.SLICEL_X*.PRECYINIT.{AX,CIN} with ACY0
+    /// accompanying AX exactly (head-driven cascade variant), and no
+    /// BCY0/CCY0/DCY0 anywhere in the chain.
+    fn routed_carry_chain() -> Routed7 {
+        let mut r = routed_blinky();
+        r.placed.packed.luts.push(PackedLut {
+            name: "u_one".into(), init: u64::MAX,
+            input_nets: [None, None, None, None, None, None],
+            output_net: "one".into(),
+        });
+        r.placed.packed.carries = vec![
+            PackedCarry {
+                name: "u_c0".into(), ci_net: "one".into(), cyinit: None, co_net: Some("co0".into()),
+                s_nets: [Some("s0".into()), None, None, None],
+                di_nets: [None, None, None, None],
+                o_nets: [Some("o0".into()), None, None, None],
+                ..Default::default()
+            },
+            PackedCarry {
+                name: "u_c1".into(), ci_net: "co0".into(), cyinit: None, co_net: Some("co1".into()),
+                s_nets: [Some("s1".into()), None, None, None],
+                di_nets: [None, None, None, None],
+                o_nets: [Some("o1".into()), None, None, None],
+                ..Default::default()
+            },
+            PackedCarry {
+                name: "u_c2".into(), ci_net: "co1".into(), cyinit: None, co_net: None,
+                s_nets: [Some("s2".into()), None, None, None],
+                di_nets: [None, None, None, None],
+                o_nets: [Some("o2".into()), None, None, None],
+                ..Default::default()
+            },
+        ];
+        r.placed.carries = vec![
+            PlacedCarry { name: "u_c0".into(), tile: "CLBLL_L_X0Y0".into(), site: "SLICE_X0Y0".into() },
+            PlacedCarry { name: "u_c1".into(), tile: "CLBLL_L_X0Y1".into(), site: "SLICE_X0Y1".into() },
+            PlacedCarry { name: "u_c2".into(), tile: "CLBLL_L_X0Y2".into(), site: "SLICE_X0Y2".into() },
+        ];
+        // One chain FF per group to pin the FFMUX.XOR rule.
+        r.placed.packed.ffs.push(PackedFf {
+            name: "u_ff0".into(), d_net: "o0".into(), q_net: "q0".into(),
+            clk_net: "clk_bufg".into(), ce_net: None, sr_net: None, init: false, srval: false, sr_async: false,
+        });
+        r.placed.ffs.push(PlacedFf {
+            name: "u_ff0".into(), tile: "CLBLL_L_X0Y0".into(), site: "SLICE_X0Y0".into(), bel: "AFF".into(),
+        });
+        r
+    }
+
+    #[test]
+    fn emit_carry_chain_precyinit_matches_golden() {
+        let bs = emit_fasm(&routed_carry_chain(), &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        // Legacy const-1 head: AX plus ACY0.
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.PRECYINIT.AX"), "got:\n{text}");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.CARRY4.ACY0"), "got:\n{text}");
+        // Group chained directly on the head (transit variant): AX plus ACY0.
+        assert!(text.contains("CLBLL_L_X0Y1.SLICEL_X1.PRECYINIT.AX"), "got:\n{text}");
+        assert!(text.contains("CLBLL_L_X0Y1.SLICEL_X1.CARRY4.ACY0"), "got:\n{text}");
+        // Group chained on a mid group: CIN with no ACY0.
+        assert!(text.contains("CLBLL_L_X0Y2.SLICEL_X1.PRECYINIT.CIN"), "got:\n{text}");
+        assert_eq!(text.matches("CARRY4.ACY0").count(), 2, "got:\n{text}");
+        assert!(!text.contains("BCY0") && !text.contains("CCY0") && !text.contains("DCY0"), "got:\n{text}");
+        // Chain FF samples the sum through FFMUX.XOR, never a letter input.
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFFMUX.XOR"), "got:\n{text}");
+    }
+
+    /// Required part features (from `required_features.fasm`) emit first
+    /// and unconditionally: nothing in the design references them.
+    #[test]
+    fn emit_required_features_come_first() {
+        struct ReqEmit;
+        impl EmitDevice for ReqEmit {
+            fn tile_type(&self, _tile: &str) -> Option<String> {
+                Some("CLBLL_L".into())
+            }
+            fn site_rel(&self, _tile: &str, _site: &str) -> Option<String> {
+                Some("SLICEL_X0".into())
+            }
+            fn required_features(&self) -> Vec<String> {
+                vec!["CFG_CENTER_MID_X123Y84.ALWAYS_ON_PROP1".into()]
+            }
+        }
+        let r = routed_blinky();
+        let text = emit_fasm(&r, &ReqEmit).unwrap().fasm.join("\n");
+        let first = text.lines().next().unwrap_or("");
+        assert_eq!(first, "CFG_CENTER_MID_X123Y84.ALWAYS_ON_PROP1");
+    }
+
+    /// CYINIT value selects the PRECYINIT source: 0 to C0, 1 to C1.
+    /// C0 is const-0 (oracle synth netlist ties head CYINIT to const0),
+    /// so a CYINIT=1 intent mapped to C0 would freeze bit 0 on silicon.
+    #[test]
+    fn emit_carry_config_head_selects_c0_or_c1_by_value() {
+        use crate::pack::PackedCarry;
+        use crate::place::PlacedCarry;
+        for (high, want) in [(false, "PRECYINIT.C0"), (true, "PRECYINIT.C1")] {
+            let mut r = routed_blinky();
+            r.placed.packed.carries = vec![PackedCarry {
+                name: "u_h".into(), ci_net: String::new(), cyinit: Some(high),
+                co_net: Some("coh".into()),
+                s_nets: [Some("s0".into()), None, None, None],
+                di_nets: [None, None, None, None],
+                o_nets: [Some("o0".into()), None, None, None],
+                ..Default::default()
+            }];
+            r.placed.carries = vec![PlacedCarry {
+                name: "u_h".into(), tile: "CLBLL_L_X0Y0".into(), site: "SLICE_X0Y0".into(),
+            }];
+            let text = emit_fasm(&r, &FakeEmit).unwrap().fasm.join("\n");
+            assert!(text.contains(&format!("CLBLL_L_X0Y0.SLICEL_X0.{want}")), "got:\n{text}");
+            let other = if high { "PRECYINIT.C0" } else { "PRECYINIT.C1" };
+            assert!(!text.contains(other), "crossed CYINIT source, got:\n{text}");
+        }
+    }
+
+    /// A PRECYINIT.C0 head computes bit 0 from DI0 = AX, which must read 1.
+    /// The FF-slice arrival program grounds the serving tile's BYP_ALT
+    /// muxes through GFAN; it must leave the head's AX bypass alone
+    /// (BYP_ALT1 for slice X0), or bit 0 never carries and the counter
+    /// freezes. Every other BYP_ALT stays grounded (carry DI = 0).
+    #[test]
+    fn emit_c0_carry_head_keeps_ax_bypass_high() {
+        use crate::pack::PackedCarry;
+        use crate::place::PlacedCarry;
+        let mut r = routed_blinky();
+        r.placed.packed.carries = vec![PackedCarry {
+            name: "u_h".into(), ci_net: String::new(), cyinit: Some(false),
+            co_net: Some("coh".into()),
+            s_nets: [Some("s0".into()), None, None, None],
+            di_nets: [None, None, None, None],
+            o_nets: [Some("o0".into()), None, None, None],
+            ..Default::default()
+        }];
+        r.placed.carries = vec![PlacedCarry {
+            name: "u_h".into(), tile: "CLBLL_L_X0Y0".into(), site: "SLICE_X0Y0".into(),
+        }];
+        let text = emit_fasm(&r, &FakeEmit).unwrap().fasm.join("\n");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.PRECYINIT.C0"), "got:\n{text}");
+        assert!(!text.contains("INT_L_X0Y0.BYP_ALT1."), "head AX bypass grounded, got:\n{text}");
+        for alt in [0, 2, 3, 4, 5, 6, 7] {
+            assert!(text.contains(&format!("INT_L_X0Y0.BYP_ALT{alt}.GFAN")), "BYP_ALT{alt} lost its tie, got:\n{text}");
+        }
+    }
+
+    #[test]
+    fn emit_carry_head_without_const_driver_fails_loudly() {
+        let mut r = routed_carry_chain();
+        // Non-const driver on the head CI: no valid CYINIT source.
+        r.placed.packed.luts.iter_mut().find(|l| l.name == "u_one").unwrap().init = 1;
+        let err = emit_fasm(&r, &FakeEmit).unwrap_err();
+        assert!(err.contains("one") && err.contains("const-1"), "got: {err}");
+    }
+
+    #[test]
+    fn emit_bufg_i0_config_matches_vivado() {
+        // Vivado ground truth from the ZB-10 same-RTL diff
+        // (GT-blinky.bit): a BUFG on the I0 path emits exactly IN_USE,
+        // ZINV_CE0, ZINV_S0, IS_IGNORE1_INVERTED. ZINV_CE1/ZINV_S1
+        // select the I1 path and ZPRESELECT_I0 is absent in Vivado.
+        use crate::pack::PackedBufg;
+        use crate::place::PlacedBufg;
+        let mut routed = routed_blinky();
+        routed.placed.packed.bufgs.push(PackedBufg {
+            name: "bufg_clk".into(),
+            in_net: "clk".into(),
+            out_net: "clk_bufg".into(),
+            ..Default::default()
+        });
+        routed.placed.bufgs.push(PlacedBufg {
+            name: "bufg_clk".into(),
+            tile: "CLK_BUFG_BOT_R_X0Y0".into(),
+            site: "BUFGCTRL_X0Y0".into(),
+        });
+        let bs = emit_fasm(&routed, &FakeEmit).unwrap();
+        let got: Vec<&str> = bs
+            .fasm
+            .iter()
+            .map(String::as_str)
+            .filter(|l| l.contains("BUFGCTRL_X0Y0"))
+            .collect();
+        // NOTE: emit_fasm sorts lines; IS_IGNORE1_INVERTED < ZINV_*.
+        let want = [
+            "CLK_BUFG_BOT_R_X0Y0.BUFGCTRL.BUFGCTRL_X0Y0.IN_USE",
+            "CLK_BUFG_BOT_R_X0Y0.BUFGCTRL.BUFGCTRL_X0Y0.IS_IGNORE1_INVERTED",
+            "CLK_BUFG_BOT_R_X0Y0.BUFGCTRL.BUFGCTRL_X0Y0.ZINV_CE0",
+            "CLK_BUFG_BOT_R_X0Y0.BUFGCTRL.BUFGCTRL_X0Y0.ZINV_S0",
+        ];
+        assert_eq!(got, want, "BUFGCTRL I0 feature set");
+    }
+
+    #[test]
+    fn emit_bufg_unused_inputs_parked() {
+        // ZB-10 oracle: every unused BUFGCTRL I0/I1 input is parked on
+        // a fixed IMUX (BUFGCTRLn -> IMUX{28+n%4}_{n/4}); only the
+        // router-driven input keeps its live source.
+        use crate::pack::PackedBufg;
+        use crate::place::PlacedBufg;
+        use crate::route::RoutedPip;
+        let mut routed = routed_blinky();
+        routed.placed.packed.bufgs.push(PackedBufg {
+            name: "bufg_clk".into(),
+            in_net: "clk".into(),
+            out_net: "clk_bufg".into(),
+            ..Default::default()
+        });
+        routed.placed.bufgs.push(PlacedBufg {
+            name: "bufg_clk".into(),
+            tile: "CLK_BUFG_BOT_R_X0Y0".into(),
+            site: "BUFGCTRL_X0Y0".into(),
+        });
+        routed.nets.push(RoutedNet7 {
+            net: "clk".into(),
+            kind: RouteKind::Pips(vec![RoutedPip {
+                tile: "CLK_BUFG_BOT_R_X0Y0".into(),
+                dst_wire: "CLK_BUFG_BUFGCTRL0_I0".into(),
+                src_wire: "CLK_BUFG_BOT_R_CK_MUXED0".into(),
+                is_pseudo: false,
+            }]),
+        });
+        let bs = emit_fasm(&routed, &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        assert!(
+            text.contains("CLK_BUFG_BOT_R_X0Y0.CLK_BUFG_BUFGCTRL0_I1.CLK_BUFG_IMUX28_0"),
+            "missing I1 park, got:\n{text}"
         );
         assert!(
-            text.contains("RIOB33_X0Y0.IOB_Y1.LVCMOS33.DRIVE.I16"),
-            "got:\n{text}"
+            text.contains("CLK_BUFG_BOT_R_X0Y0.CLK_BUFG_BUFGCTRL15_I1.CLK_BUFG_IMUX31_3"),
+            "missing last park, got:\n{text}"
+        );
+        assert!(
+            text.contains("CLK_BUFG_BOT_R_X0Y0.CLK_BUFG_BUFGCTRL0_I0.CLK_BUFG_BOT_R_CK_MUXED0"),
+            "used input lost live source, got:\n{text}"
+        );
+        let parked = text.matches("CLK_BUFG_IMUX2").count()
+            + text.matches("CLK_BUFG_IMUX3").count();
+        assert_eq!(parked, 31, "want 32 inputs minus 1 used, got:\n{text}");
+    }
+
+    #[test]
+    fn emit_iob_vivado_defaults() {
+        // Vivado ground truth (ZB-10 same-RTL diff, GT-blinky.bit):
+        // LVCMOS33 outputs use DRIVE I12 (I12_I16 feature) with SLOW
+        // slew; inputs use FAST slew; both use PULLTYPE/IN_TERM NONE.
+        // (FakeEmit has no IOI tile, so no OLOGIC/ILOGIC lines here;
+        // the e2e diff verifies those.)
+        let mut routed = routed_blinky();
+        routed.placed.packed.iobs.push(PackedIob {
+            name: "u_ibuf".into(), port: "clk".into(), dir: IobDir::In,
+            net: "clk".into(), loc: Some("H6".into()), iostandard: "LVCMOS33".into(),
+            drive: None, slew: None,
+        });
+        routed.placed.iobs.push(PlacedIob {
+            name: "u_ibuf".into(), port: "clk".into(), dir: IobDir::In,
+            tile: "LIOB33_X0Y0".into(), site: "IOB_X0Y0".into(),
+        });
+        let bs = emit_fasm(&routed, &FakeEmit).unwrap();
+        let iob: Vec<&str> = bs
+            .fasm
+            .iter()
+            .map(String::as_str)
+            .filter(|l| l.contains("IOB_Y1.PULLTYPE") || l.contains("IN_TERM") || l.contains("SLEW.FAST") || l.contains("DRIVE.I12"))
+            .collect();
+        assert!(
+            iob.iter().any(|l| l.ends_with("IOB_Y1.LVCMOS33_LVTTL.DRIVE.I12_I16")),
+            "missing I12 drive, got:\n{}",
+            bs.fasm.join("\n")
+        );
+        assert!(
+            iob.iter().any(|l| l.ends_with("IOB_Y1.PULLTYPE.NONE")),
+            "missing PULLTYPE.NONE, got:\n{}",
+            bs.fasm.join("\n")
+        );
+        assert!(
+            iob.iter().any(|l| l.ends_with("IOB_Y1.IN_TERM.NONE")),
+            "missing IN_TERM.NONE, got:\n{}",
+            bs.fasm.join("\n")
+        );
+        assert!(
+            iob.iter().any(|l| l.contains("SLEW.FAST")),
+            "missing input FAST slew, got:\n{}",
+            bs.fasm.join("\n")
+        );
+    }
+
+    #[test]
+    fn emit_ff_no_control_signals() {
+        // FF without CE/SR must NOT emit the mux enables (the oracle
+        // has neither), but MUST emit ZRST: the ZB-10 oracle carries
+        // ZRST on every chain FF, which have no SR nets (tied-off
+        // reset). Minimalism is not the goal; oracle identity is.
+        let bs = emit_fasm(&routed_blinky(), &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        assert!(
+            !text.contains("CEUSEDMUX"),
+            "unexpected CEUSEDMUX, got:\n{text}"
+        );
+        assert!(
+            !text.contains("SRUSEDMUX"),
+            "unexpected SRUSEDMUX, got:\n{text}"
+        );
+        assert!(
+            text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZRST"),
+            "missing tied-off ZRST, got:\n{text}"
         );
     }
 
@@ -1179,6 +2154,7 @@ mod tests {
         let routed = Routed7 {
             placed,
             nets: vec![],
+            ..Default::default()
         };
         let bs = emit_fasm(&routed, &FakeEmit).unwrap();
         let text = bs.fasm.join("\n");

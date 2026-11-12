@@ -14,6 +14,8 @@
 //! currently hold placeholder stage types and will grow the real flow logic.
 
 pub mod backend;
+pub mod bitgen;
+pub mod clkdist;
 pub mod bitstream;
 pub mod db;
 pub mod device;
@@ -23,6 +25,7 @@ pub mod flow;
 pub mod frames;
 pub mod pack;
 pub mod place;
+pub mod place_sa;
 pub mod route;
 pub mod timing;
 pub mod xdevice;

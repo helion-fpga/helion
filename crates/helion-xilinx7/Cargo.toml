@@ -12,3 +12,5 @@ serde_json = { version = "1" }
 
 [dev-dependencies]
 helion-sv = { workspace = true }
+helion-vhdl = { workspace = true }
+helion-zb-front = { workspace = true }

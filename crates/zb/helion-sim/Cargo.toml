@@ -1,0 +1,15 @@
+[package]
+name = "helion-sim-zb"
+description = "Frozen copy of helion-sim with the carry-chain model used on the ZedBoard (see crates/zb/README.md)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "helion_sim"
+test = false
+doctest = false
+
+[dependencies]
+helion-ir = { package = "helion-ir-zb", path = "../helion-ir" }
+helion-sv = { package = "helion-sv-zb", path = "../helion-sv" }

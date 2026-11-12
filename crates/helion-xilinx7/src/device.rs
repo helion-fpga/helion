@@ -22,15 +22,29 @@ use crate::db::parse::{PackagePin, Ppip, SegBit, parse_mask_line, parse_package_
 
 /// Root of the raw X-Ray database.
 ///
-/// `HELION_XILINX_DB` wins; otherwise `~/workspace/xilinx-dbsrc`.
+/// `HELION_XILINX_DB` wins; otherwise the first of these that exists:
+/// `~/workspace/xilinx-dbsrc` (Linux VM), then
+/// `~/Documents/zedboard-helion-debug/work/prjxray-db` (MacBook).
+/// When none exists, the VM path is returned so the error names it.
 pub fn default_db_root() -> PathBuf {
     if let Ok(p) = std::env::var("HELION_XILINX_DB") {
         return PathBuf::from(p);
     }
-    match std::env::var("HOME") {
-        Ok(home) => PathBuf::from(home).join("workspace/xilinx-dbsrc"),
-        Err(_) => PathBuf::from("xilinx-dbsrc"),
+    let mut candidates = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join("workspace/xilinx-dbsrc"));
+        candidates.push(home.join("Documents/zedboard-helion-debug/work/prjxray-db"));
     }
+    candidates.push(PathBuf::from("xilinx-dbsrc"));
+    first_existing_dir(&candidates).unwrap_or_else(|| {
+        candidates.into_iter().next().unwrap_or_else(|| PathBuf::from("xilinx-dbsrc"))
+    })
+}
+
+/// First candidate that is an existing directory, if any.
+fn first_existing_dir(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates.iter().find(|p| p.is_dir()).cloned()
 }
 
 /// Pip classification used by the router and bitstream emitter.
@@ -54,6 +68,12 @@ pub struct Pip {
     pub class: PipClass,
     pub is_pseudo: bool,
     pub can_invert: bool,
+    /// Slow-corner maximum delay through the pip (ps), from the DB.
+    pub delay_ps: u16,
+    /// The router may use this pip: it has configuration bits (segbits) or
+    /// is an always-on / default pseudo-pip. A pip with neither cannot be
+    /// encoded, and a `hint` pseudo-pip is a LUT route-through.
+    pub usable: bool,
 }
 
 /// One site pin: (pin name, tile wire).
@@ -165,12 +185,19 @@ impl UnionFind {
 pub struct Device {
     tiles: Vec<Tile>,
     tile_by_name: HashMap<String, usize>,
+    /// Site name -> (tile index, site index within the tile).
+    site_by_name: HashMap<String, (usize, usize)>,
     grid: HashMap<(i32, i32), usize>,
     type_ids: HashMap<String, u32>,
     types: Vec<TileTypeData>,
     tiles_by_type: Vec<Vec<usize>>,
     package_pins: HashMap<String, PackagePin>,
     part: PartInfo,
+    /// Static always-on housekeeping features from the part directory's
+    /// `required_features.fasm` (e.g. `CFG_CENTER_MID.ALWAYS_ON_PROP*`):
+    /// nothing in the design references them, so they cannot be derived
+    /// from routing and are emitted unconditionally.
+    required: Vec<String>,
     nodes: UnionFind,
     /// Tile types present in the grid with no DB files (e.g. `NULL`, `VBRK`).
     pub missing_db_types: Vec<String>,
@@ -190,21 +217,63 @@ impl Device {
         if !fabric.join("tilegrid.json").is_file() {
             return Self::synthetic_xc7a35t();
         }
+        Self::load_from_dirs(&artix7, &fabric, &partdir)
+    }
+
+    /// Load the full `xc7z020` device model from the raw X-Ray DB.
+    ///
+    /// `db_root` is the directory holding `zynq7/` (see [`default_db_root`]).
+    /// Unlike Artix-7, prjxray-db stores the zynq7 family DB files
+    /// (`tile_type_*.json`, `segbits_*.db`, `mask_*.db`, `ppips_*.db`)
+    /// directly under `zynq7/` (shared by all zynq7 parts); only
+    /// `tilegrid.json` / `tileconn.json` live in the part-specific
+    /// `zynq7/xc7z020/` dir, with part files in `zynq7/xc7z020clg484-1/`.
+    pub fn load_xc7z020(db_root: &Path) -> Result<Self, String> {
+        let zynq7 = db_root.join("zynq7");
+        let fabric = zynq7.join("xc7z020");
+        let partdir = zynq7.join("xc7z020clg484-1");
+        Self::load_from_dirs(&zynq7, &fabric, &partdir)
+    }
+
+    /// Shared loader core: `family` holds the per-tile-type DB files,
+    /// `fabric` holds `tilegrid.json` and `tileconn.json`, and `partdir`
+    /// holds `part.json` and `package_pins.csv`.
+    fn load_from_dirs(family: &Path, fabric: &Path, partdir: &Path) -> Result<Self, String> {
         let grid = load_tilegrid(&fabric.join("tilegrid.json"))?;
         let conn = load_tileconn(&fabric.join("tileconn.json"))?;
         let part = load_part(&partdir.join("part.json"))?;
         let pins_text = read_text(&partdir.join("package_pins.csv"))?;
         let pins = parse_package_pins(&pins_text)?;
+        // The part's static always-on features. A missing file warns
+        // rather than errors: plenty of part directories ship without
+        // one, but then the bitstream quietly omits mandatory bits.
+        let required = match std::fs::read_to_string(partdir.join("required_features.fasm")) {
+            Ok(text) => text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+                .collect(),
+            Err(_) => {
+                eprintln!(
+                    "device: warning: no required_features.fasm for this part, \
+                     always-on configuration bits will not be emitted"
+                );
+                Vec::new()
+            }
+        };
 
         let mut dev = Self {
             tiles: Vec::new(),
             tile_by_name: HashMap::new(),
+            site_by_name: HashMap::new(),
             grid: HashMap::new(),
             type_ids: HashMap::new(),
             types: Vec::new(),
             tiles_by_type: Vec::new(),
             package_pins: HashMap::new(),
             part,
+            required,
             nodes: UnionFind::default(),
             missing_db_types: Vec::new(),
         };
@@ -230,7 +299,7 @@ impl Device {
 
         // Load per-type DB files.
         for (id, name) in type_names.iter().enumerate() {
-            Self::load_tile_type_db(&artix7, name, &mut dev.types[id], &mut dev.missing_db_types)?;
+            Self::load_tile_type_db(family, name, &mut dev.types[id], &mut dev.missing_db_types)?;
         }
 
         // Instantiate tiles.
@@ -264,6 +333,9 @@ impl Device {
             let idx = dev.tiles.len();
             dev.grid.insert((e.grid_x, e.grid_y), idx);
             dev.tile_by_name.insert(tname.clone(), idx);
+            for (si, site) in sites.iter().enumerate() {
+                dev.site_by_name.insert(site.name.clone(), (idx, si));
+            }
             dev.tiles_by_type[type_id as usize].push(idx);
             dev.tiles.push(Tile {
                 name: tname.clone(),
@@ -280,6 +352,7 @@ impl Device {
             usize::try_from(wire_total).map_err(|_| "wire count overflow".to_string())?,
         )?;
         dev.stitch_nodes(&conn)?;
+        dev.mark_usable_pips();
 
         Ok(dev)
     }
@@ -443,7 +516,9 @@ impl Device {
             let is_pseudo = loose_bool(&p.is_pseudo);
             let can_invert = loose_bool(&p.can_invert);
             let directional = loose_bool(&p.is_directional);
-            let push = |tdata: &mut TileTypeData, s: u32, d: u32| {
+            let fwd = crate::db::load::pip_delay_ps(&p.src_to_dst);
+            let rev = crate::db::load::pip_delay_ps(&p.dst_to_src);
+            let push = |tdata: &mut TileTypeData, s: u32, d: u32, delay_ps: u16| {
                 let idx = tdata.pips.len() as u32;
                 tdata.pips.push(Pip {
                     src: s,
@@ -451,13 +526,15 @@ impl Device {
                     class: classify(&tdata.wires[s as usize], &tdata.wires[d as usize]),
                     is_pseudo,
                     can_invert,
+                    delay_ps,
+                    usable: true,
                 });
                 tdata.pips_from.entry(s).or_default().push(idx);
             };
-            push(tdata, src, dst);
+            push(tdata, src, dst, fwd);
             if !directional {
                 // Bidirectional (`<<->>`) pips are traversable both ways.
-                push(tdata, dst, src);
+                push(tdata, dst, src, rev);
             }
         }
 
@@ -493,6 +570,48 @@ impl Device {
             }
         }
         Ok(())
+    }
+
+    /// Decide, for every pip, whether the router may use it (see
+    /// [`Pip::usable`]). `_SING` tile types share their base type's bits.
+    fn mark_usable_pips(&mut self) {
+        use crate::db::parse::PpipKind;
+        let names: Vec<String> = self.types.iter().map(|t| t.name.clone()).collect();
+        for ti in 0..self.types.len() {
+            let name = names[ti].clone();
+            let base = name.strip_suffix("_SING").map(str::to_string);
+            let base_id = base.as_ref().and_then(|b| self.type_ids.get(b).copied());
+            let mut flags = Vec::with_capacity(self.types[ti].pips.len());
+            for p in &self.types[ti].pips {
+                let td = &self.types[ti];
+                let (d, s) = (&td.wires[p.dst as usize], &td.wires[p.src as usize]);
+                let key = format!("{name}.{d}.{s}");
+                let listed = td.ppips.iter().find(|pp| pp.name == key).map(|pp| pp.kind);
+                let ok = match listed {
+                    // LUT route-through hints are not connections.
+                    Some(PpipKind::Hint) => false,
+                    // Bit-less always-on / default-selected connections.
+                    Some(_) => true,
+                    None => {
+                        p.is_pseudo
+                            || td.segbits.is_empty()
+                            || td.segbits.contains_key(&key)
+                            || match (&base, base_id) {
+                                (Some(b), Some(bid)) => {
+                                    let bt = &self.types[bid as usize];
+                                    let bk = format!("{b}.{d}.{s}");
+                                    bt.segbits.contains_key(&bk) || bt.ppips.iter().any(|pp| pp.name == bk && !matches!(pp.kind, PpipKind::Hint))
+                                }
+                                _ => false,
+                            }
+                    }
+                };
+                flags.push(ok);
+            }
+            for (p, ok) in self.types[ti].pips.iter_mut().zip(flags) {
+                p.usable = ok;
+            }
+        }
     }
 
     /// Stitch cross-tile nodes from `tileconn.json`.
@@ -630,6 +749,9 @@ impl Device {
 
     /// Find a site by full name: `(tile_idx, site_idx)`.
     pub fn site_by_name(&self, site_name: &str) -> Option<(usize, usize)> {
+        if let Some(&x) = self.site_by_name.get(site_name) {
+            return Some(x);
+        }
         for (ti, t) in self.tiles.iter().enumerate() {
             for (si, s) in t.sites.iter().enumerate() {
                 if s.name == site_name {
@@ -640,12 +762,25 @@ impl Device {
         None
     }
 
+    /// Pips driven by wire index `wire_idx` of a tile (index form).
+    pub fn pips_from_idx(&self, tile_idx: usize, wire_idx: u32) -> impl Iterator<Item = &Pip> {
+        let td = self.tiles.get(tile_idx).map(|t| &self.types[t.type_id as usize]);
+        td.and_then(|td| td.pips_from.get(&wire_idx).map(move |v| v.iter().map(move |&i| &td.pips[i as usize])))
+            .into_iter()
+            .flatten()
+    }
+
     /// `(pin_name, tile_wire)` pairs of a site, if its template matched.
     pub fn site_pins(&self, tile_idx: usize, site_idx: usize) -> Option<&[SitePin]> {
         let t = self.tiles.get(tile_idx)?;
         let s = t.sites.get(site_idx)?;
         let tmpl = s.template?;
         Some(self.types[t.type_id as usize].site_templates[tmpl as usize].pins.as_slice())
+    }
+
+    /// Every package pin of the part.
+    pub fn package_pins(&self) -> impl Iterator<Item = &PackagePin> {
+        self.package_pins.values()
     }
 
     /// Look up a package pin, e.g. `package_pin("E3")`.
@@ -657,6 +792,13 @@ impl Device {
     pub fn segbits(&self, tile_type: &str, feature: &str) -> Option<&[SegBit]> {
         let &id = self.type_ids.get(tile_type)?;
         self.types[id as usize].segbits.get(feature).map(Vec::as_slice)
+    }
+
+    /// Pseudo-pips for a tile type, from `ppips_<type>.db`
+    /// (e.g. `INT_R.IMUX4.VCC_WIRE default`, `CLK_BUFG_BOT_R....S0.... always`).
+    pub fn ppips(&self, tile_type: &str) -> Option<&[Ppip]> {
+        let &id = self.type_ids.get(tile_type)?;
+        Some(self.types[id as usize].ppips.as_slice())
     }
 
     /// Global wire id for `(tile, wire index)`.
@@ -671,6 +813,12 @@ impl Device {
         } else {
             None
         }
+    }
+
+    /// Static always-on features from `required_features.fasm`, emitted
+    /// unconditionally (they cannot be derived from routing).
+    pub fn required_features(&self) -> &[String] {
+        &self.required
     }
 
     /// Number of distinct electrical nodes after stitching.
@@ -753,6 +901,8 @@ impl Device {
             part,
             nodes: UnionFind::default(),
             missing_db_types: vec!["NULL".to_string()],
+            site_by_name: HashMap::new(),
+            required: Vec::new(),
         };
 
         let pin_defs = [
@@ -820,6 +970,8 @@ impl Device {
                 class: PipClass::TileRouting,
                 is_pseudo: false,
                 can_invert: false,
+                delay_ps: 0,
+                usable: true,
             });
             td.pips.push(Pip {
                 src: 5,
@@ -827,6 +979,8 @@ impl Device {
                 class: PipClass::TileRouting,
                 is_pseudo: false,
                 can_invert: false,
+                delay_ps: 0,
+                usable: true,
             });
             td.pips_from.insert(0, vec![0]);
             td.pips_from.insert(5, vec![1]);
@@ -887,6 +1041,8 @@ impl Device {
                 class: PipClass::SiteEntry,
                 is_pseudo: true,
                 can_invert: false,
+                delay_ps: 0,
+                usable: true,
             });
             td.pips_from.insert(0, vec![0]);
             for sidx in 0..2 {
@@ -1231,6 +1387,25 @@ mod tests {
     }
 
     #[test]
+    fn first_existing_dir_picks_first_present() {
+        // Hermetic: scratch dirs under temp, no env mutation.
+        let base =
+            std::env::temp_dir().join(format!("helion_db_probe_{}", std::process::id()));
+        let missing = base.join("a-missing");
+        let first = base.join("b-present");
+        let second = base.join("c-present");
+        std::fs::create_dir_all(&first).expect("mkdir first");
+        std::fs::create_dir_all(&second).expect("mkdir second");
+        assert_eq!(
+            first_existing_dir(&[missing.clone(), first.clone(), second]),
+            Some(first)
+        );
+        assert_eq!(first_existing_dir(&[missing]), None);
+        assert_eq!(first_existing_dir(&[]), None);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
     fn device_loads_and_counts() {
         let dev = test_device();
         assert_eq!(dev.tile_count(), 18055);
@@ -1362,5 +1537,32 @@ mod tests {
         let dev = test_device();
         assert_eq!(dev.part().idcode, 0x0362_D093);
         assert_eq!(dev.part().frame_count().unwrap(), 5408);
+    }
+
+    /// xc7z020 device, loaded once and shared by the z020 tests.
+    fn test_z020_device() -> &'static Device {
+        static DEV: OnceLock<Device> = OnceLock::new();
+        DEV.get_or_init(|| Device::load_xc7z020(&default_db_root()).expect("load xc7z020"))
+    }
+
+    #[test]
+    fn z020_loads_and_counts() {
+        let dev = test_z020_device();
+        assert_eq!(dev.tile_count(), 29359);
+        let clb_tiles: usize = dev
+            .tiles
+            .iter()
+            .filter(|t| dev.types[t.type_id as usize].name.starts_with("CLB"))
+            .count();
+        assert!(clb_tiles > 0, "xc7z020 must have CLB tiles");
+    }
+
+    #[test]
+    fn z020_part_info() {
+        let dev = test_z020_device();
+        assert_eq!(dev.part().idcode, 0x0372_7093);
+        assert_eq!(dev.part().frame_count().unwrap(), 9996);
+        // The ZedBoard package must resolve.
+        assert!(!dev.package_pins.is_empty());
     }
 }
