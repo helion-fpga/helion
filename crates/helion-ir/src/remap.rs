@@ -8,9 +8,9 @@
 //! disappear.
 //!
 //! Unchanged by construction: LUTs marked `DONT_TOUCH`, LUTs whose output is
-//! `mark_debug`, ILA-observed or a top-level port net, LUTs feeding a
-//! `Carry4` (their pins carry carry-chain meaning), and LUTs in a
-//! combinational loop. Cell and net names of surviving LUTs are kept.
+//! `mark_debug`, ILA-observed or a top-level port net, and LUTs in a
+//! combinational loop. A LUT on a `Carry4` propagate pin stays a LUT of at
+//! most four inputs (its second output carries the generate). Cell and net names of surviving LUTs are kept.
 //! An unconnected LUT input reads 0, as everywhere in this IR.
 
 use std::collections::HashMap;
@@ -27,6 +27,7 @@ pub struct RemapStats {
 }
 
 const K: usize = 6;
+const CARRY_K: usize = 4;
 /// Cuts kept per LUT.
 const KEEP: usize = 10;
 /// Partial leaf sets kept while merging one LUT's inputs.
@@ -53,6 +54,8 @@ struct Node {
     init: u64,
     ins: [Option<u32>; 6],
     fixed: bool,
+    /// Most inputs this LUT may have after re-mapping.
+    k: usize,
 }
 
 /// `init` applied bitwise to six input words.
@@ -146,9 +149,13 @@ impl Design {
         for (ci, c) in self.cells.iter().enumerate() {
             let CellKind::Lut6 { init } = c.kind else { continue };
             let Some(&out) = out_of.get(&ci) else { continue };
-            let fixed = c.attrs.flag("DONT_TOUCH") || to_carry[out as usize];
+            let fixed = c.attrs.flag("DONT_TOUCH");
+            // A carry propagate LUT also produces the generate on its
+            // second output: four inputs for the propagate leave the fifth
+            // for a generate that is not among them.
+            let k = if to_carry[out as usize] { CARRY_K } else { K };
             node_of_net[out as usize] = nodes.len() as u32;
-            nodes.push(Node { cell: ci, out, init, ins: ins_of.get(&ci).copied().unwrap_or([None; 6]), fixed });
+            nodes.push(Node { cell: ci, out, init, ins: ins_of.get(&ci).copied().unwrap_or([None; 6]), fixed, k });
         }
         stats.luts_before = nodes.len();
         stats.luts_after = nodes.len();
@@ -239,7 +246,7 @@ impl Design {
                                     m.insert(pos, *l);
                                 }
                             }
-                            if m.len() <= K {
+                            if m.len() <= nd.k {
                                 next.push(m);
                             }
                         }
@@ -472,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn carry_feeding_lut_is_left_alone() {
+    fn carry_propagate_lut_stays_a_lut() {
         let mut d = Design::new("t");
         d.add_port("a", PortDir::In);
         d.add_cell("l_inv", CellKind::Lut6 { init: 0x5555_5555_5555_5555 });
@@ -483,8 +490,9 @@ mod tests {
         d.connect("n", "l_s", "I0");
         d.connect("s", "l_s", "O");
         d.connect("s", "c4", "S0");
-        let st = d.remap_luts();
-        assert_eq!(st.luts_after, 2);
-        assert_eq!(d.net_on("l_s", "I0"), Some("n"));
+        d.remap_luts();
+        // The inverter may be absorbed, but the propagate LUT still drives S0.
+        assert_eq!(d.net_on("c4", "S0"), Some("s"));
+        assert!(matches!(d.cell("l_s").map(|c| &c.kind), Some(CellKind::Lut6 { .. })));
     }
 }
