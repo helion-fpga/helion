@@ -724,18 +724,55 @@ impl Device {
         Some((dy * self.interior_cols + dx) as u16)
     }
 
+    /// Configuration column of the pad at `(x, y)`: the bottom row first
+    /// (one per CLB column, as it always was), then the top row, the left
+    /// column and the right column.
     pub fn iob_major(&self, x: u32, y: u32) -> Option<u16> {
-        if y != self.clb_y0.saturating_sub(1) {
-            return None;
+        let (cols, rows) = (self.interior_cols, self.interior_rows);
+        let in_cols = x >= self.clb_x0 && x - self.clb_x0 < cols;
+        let in_rows = y >= self.clb_y0 && y - self.clb_y0 < rows;
+        if in_cols && y + 1 == self.clb_y0 {
+            Some((x - self.clb_x0) as u16)
+        } else if in_cols && y == self.clb_y0 + rows {
+            Some((cols + x - self.clb_x0) as u16)
+        } else if in_rows && x + 1 == self.clb_x0 {
+            Some((2 * cols + y - self.clb_y0) as u16)
+        } else if in_rows && x == self.clb_x0 + cols {
+            Some((2 * cols + rows + y - self.clb_y0) as u16)
+        } else {
+            None
         }
-        if x < self.clb_x0 {
-            return None;
+    }
+
+    /// Every pad of the part: the bottom row (the same sites as
+    /// [`Device::iob_sites`]), then the top row, the left column and the
+    /// right column. Pads off the bottom row connect to the fabric through
+    /// the interconnect only.
+    pub fn iob_sites_all(&self) -> Vec<Site> {
+        let (x0, y0, cols, rows) = (self.clb_x0, self.clb_y0, self.interior_cols, self.interior_rows);
+        let mut v: Vec<Site> = self.iob_sites().collect();
+        v.extend((0..cols).map(|dx| Site { x: x0 + dx, y: y0 + rows, kind: SiteKind::Iob }));
+        if x0 >= 1 {
+            v.extend((0..rows).map(|dy| Site { x: x0 - 1, y: y0 + dy, kind: SiteKind::Iob }));
         }
-        let dx = x - self.clb_x0;
-        if dx >= self.interior_cols {
-            return None;
-        }
-        Some(dx as u16)
+        v.extend((0..rows).map(|dy| Site { x: x0 + cols, y: y0 + dy, kind: SiteKind::Iob }));
+        v.retain(|s| self.iob_major(s.x, s.y).is_some());
+        v
+    }
+
+    /// The CLB a pad connects to, and the direction from the pad into the
+    /// fabric (see [`tracks`]).
+    pub fn iob_inward(&self, x: u32, y: u32) -> Option<((u32, u32), u32)> {
+        self.iob_major(x, y)?;
+        Some(if y + 1 == self.clb_y0 {
+            ((x, y + 1), tracks::N)
+        } else if y == self.clb_y0 + self.interior_rows {
+            ((x, y - 1), tracks::S)
+        } else if x + 1 == self.clb_x0 {
+            ((x + 1, y), tracks::E)
+        } else {
+            ((x - 1, y), tracks::W)
+        })
     }
 
     /// HAD I/O bank: 8 consecutive IOB sites (Fig. 53 / UG893 I/O Planning).
