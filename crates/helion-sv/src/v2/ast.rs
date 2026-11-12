@@ -183,6 +183,8 @@ pub enum Item {
     Import { pkg: String, name: Option<String> },
     /// Non-ANSI port direction declaration in the body.
     PortDir(PortDecl),
+    /// Signals declared just before with `(* mark_debug *)` or `(* keep *)`.
+    Debug(Vec<String>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

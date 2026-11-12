@@ -1758,7 +1758,7 @@ fn synth_source(source: &PathBuf) -> Result<helion_ir::Design, String> {
     match ext.as_str() {
         "prj" => synth_prj_source(source),
         "vhd" | "vhdl" => helion_vhdl::synth_vhdl_path(source),
-        _ => helion_sv::synth_sv_path(source),
+        _ => helion_sv::synth_sv_auto_path(source),
     }
 }
 
@@ -1789,7 +1789,7 @@ fn synth_prj_source(path: &PathBuf) -> Result<helion_ir::Design, String> {
         return Err("project has no SystemVerilog sources".into());
     }
     if rtl.len() == 1 && prj.top.is_none() {
-        return helion_sv::synth_sv_path(&rtl[0]);
+        return helion_sv::synth_sv_auto_path(&rtl[0]);
     }
     let mut owned: Vec<(String, String)> = Vec::new();
     for p in &rtl {
@@ -1802,6 +1802,15 @@ fn synth_prj_source(path: &PathBuf) -> Result<helion_ir::Design, String> {
         .collect();
     let params: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
     let opts = helion_sv::SvCompileOpts::default();
+    // The v2 front end first; the first-generation one for what it does
+    // not support.
+    let paths: Vec<&std::path::Path> = rtl.iter().map(|p| p.as_path()).collect();
+    if std::env::var("HELION_SV_FRONTEND").as_deref() != Ok("legacy") {
+        match helion_sv::synth_sv_v2_files(&paths, prj.top.as_deref()) {
+            Ok(s) => return Ok(s.design),
+            Err(e) => eprintln!("note: {e}\nnote: falling back to the first-generation front end for this design"),
+        }
+    }
     let (d, _) = helion_sv::elaborate_sv_sources(&refs, prj.top.as_deref(), &params, &opts)?;
     Ok(d)
 }
