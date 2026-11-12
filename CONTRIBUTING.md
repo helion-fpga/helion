@@ -114,7 +114,6 @@ Every change must stay inside it:
 | CLI (`helion`) | `crates/helion-cli` |
 | IDE (`helion-ide`) | `crates/helion-rune`: views in `src/views`, Tcl in `src/tcl.rs`, runs in `src/runs.rs`; status in `SWEEP.md` |
 | UI framework (vendored) | `third_party/rune` |
-| Legacy egui IDE (`helion-ide-egui`, removed with 4.0) | `crates/helion-gui` |
 | HL10 device data (HAD) | `devices/helion/` |
 | Examples | `examples/` |
 | Website | `docs/` (static HTML, published by `.github/workflows/pages.yml`) |

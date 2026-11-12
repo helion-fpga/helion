@@ -48,11 +48,9 @@ The details are in the [changelog](CHANGELOG.md#400--unreleased).
 - **Native JTAG on real hardware.** The FTDI MPSSE engine scans a real
   ZedBoard chain at 1 to 30 MHz, with a Digilent pin profile and
   falling-edge TDO sampling above 15 MHz.
-- **The egui IDE is retired.** It stays buildable as `helion-ide-egui`
-  until 4.0 merges to `master`, then `crates/helion-gui` is removed.
+- **The egui IDE is removed.** `helion-ide` is the Rune IDE.
 
-Release checklist for 4.0: merge `wip/ide-integration` to `master`, remove
-the egui IDE, refresh screenshots, run the full workspace tests, tag
+Release checklist for 4.0: set the release date in the changelog and tag
 `v4.0.0` per [RELEASING.md](RELEASING.md).
 
 ## After 4.0

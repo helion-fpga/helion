@@ -17,7 +17,6 @@ members = [
     "crates/helion-ipxact",
     "crates/helion-bd",
     "crates/helion-proj",
-    "crates/helion-gui",
     "crates/helion-lab",
     "crates/helion-lib",
     "crates/helion-drc",
@@ -62,7 +61,6 @@ helion-ipxact = { path = "crates/helion-ipxact" }
 helion-bd = { path = "crates/helion-bd" }
 helion-proj = { path = "crates/helion-proj" }
 helion-svtb = { path = "crates/helion-svtb" }
-helion-gui = { path = "crates/helion-gui" }
 helion-lab = { path = "crates/helion-lab" }
 helion-verif = { path = "crates/helion-verif" }
 helion-lib = { path = "crates/helion-lib" }
