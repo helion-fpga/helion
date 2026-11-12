@@ -156,10 +156,11 @@ ECP5) join the HL10 and Xilinx 7-series flows. The empty-XDC
   Tcl `write_bitstream` applies the same gate (`-force` to overwrite an
   existing file).
 
-### Deprecated
+### Removed
 
-- The egui IDE (`crates/helion-gui`) is now `helion-ide-egui`. It still
-  builds on this branch and is removed when 4.0 lands on `master`.
+- The egui IDE (`crates/helion-gui`). `helion-ide` is the Rune IDE; its
+  windowless modes (`--headless`, `--source`, `--stdin`) replace the old
+  binary's, and the `.app` bundle test moved to `helion-rune`.
 
 ### Fixed
 
