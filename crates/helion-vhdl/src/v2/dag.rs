@@ -494,7 +494,7 @@ impl Dag {
         } else {
             (a, b)
         };
-        let mut acc = self.zero(w);
+        let mut terms: Vec<N> = Vec::new();
         for j in 0..w {
             let bj = self.slice(b, j, 1);
             if self.as_const(bj) == Some(&[false]) {
@@ -503,10 +503,18 @@ impl Dag {
             let sh = self.kval(j as u128, bits_for_u(j as u128).max(1));
             let a_sh = self.shl(a, sh);
             let rep = self.concat(vec![bj; w as usize]);
-            let pp = self.and(a_sh, rep);
-            acc = self.add(acc, pp);
+            terms.push(self.and(a_sh, rep));
         }
-        acc
+        // Sum the partial products as a balanced tree: the depth is the
+        // logarithm of their number, not their number.
+        while terms.len() > 1 {
+            let mut next = Vec::with_capacity(terms.len().div_ceil(2));
+            for pair in terms.chunks(2) {
+                next.push(if pair.len() == 2 { self.add(pair[0], pair[1]) } else { pair[0] });
+            }
+            terms = next;
+        }
+        terms.pop().unwrap_or_else(|| self.zero(w))
     }
     pub fn udiv(&mut self, a: N, b: N) -> N {
         let w = self.w(a);
