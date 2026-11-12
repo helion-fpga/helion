@@ -173,9 +173,22 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                     .net_on(&cell.name, "O")
                     .ok_or_else(|| format!("pack: LUT {} has no O net", cell.name))?
                     .to_string();
+                // An unconnected LUT pin reads 1 on silicon, while the IR
+                // defines it as 0: copy the pin=0 half of the table over the
+                // pin=1 half so the output never depends on that pin.
+                let mut init = *init;
+                for (i, net) in input_nets.iter().enumerate() {
+                    if net.is_none() {
+                        let mut t = 0u64;
+                        for addr in 0..64u64 {
+                            t |= ((init >> (addr & !(1 << i))) & 1) << addr;
+                        }
+                        init = t;
+                    }
+                }
                 out.luts.push(PackedLut {
                     name: cell.name.clone(),
-                    init: *init,
+                    init,
                     input_nets,
                     output_net,
                 });

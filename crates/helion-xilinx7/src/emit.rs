@@ -31,6 +31,11 @@ pub trait EmitDevice {
     /// IOI tile paired with an IOB tile (same bank side, same row),
     /// for OLOGIC/ILOGIC features. Defaults to none; the XDevice impl
     /// finds it in the DB.
+    /// Static clock-network features implied by routed pips. Defaults to
+    /// none (unit-test fakes).
+    fn clock_statics(&self, _pips: &[&crate::route::RoutedPip]) -> Vec<String> {
+        Vec::new()
+    }
     /// STEPDOWN lines for the banks of these IOB tiles (banks running a
     /// <=1.8V standard). Defaults to none.
     fn bank_stepdown(&self, _iob_tiles: &[String]) -> Vec<String> {
@@ -347,10 +352,12 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     for (int, (need_clk0, need_clk1)) in &int_arrival {
         lines.push(format!("{int}.GFAN0.GND_WIRE"));
         lines.push(format!("{int}.GFAN1.GND_WIRE"));
-        if *need_clk0 {
+        // Fixed-recipe clock arrival; graph-routed clocks carry their own
+        // INT clock-input pips.
+        if *need_clk0 && !routed.graph_clocks {
             lines.push(format!("{int}.CLK0.GCLK_B11"));
         }
-        if *need_clk1 {
+        if *need_clk1 && !routed.graph_clocks {
             lines.push(format!("{int}.CLK1.GCLK_B11"));
         }
         if !byp_owned.contains(int) {
@@ -517,8 +524,10 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         // IGNORE1 inverted, exactly as Vivado emits it.
         lines.push(format!("{}.BUFGCTRL.{}.IS_IGNORE1_INVERTED", bufg.tile, site_rel));
         // Rebuffer enables for this BUFG's global line (bare features).
-        for (tile, feat) in device.bufg_spine_static(&bufg.tile, &bufg.site) {
-            lines.push(format!("{tile}.{feat}"));
+        if !routed.graph_clocks {
+            for (tile, feat) in device.bufg_spine_static(&bufg.tile, &bufg.site) {
+                lines.push(format!("{tile}.{feat}"));
+            }
         }
     }
     // Park every unused BUFGCTRL I0/I1 input on its fixed IMUX
@@ -641,6 +650,21 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         if use_ax {
             lines.push(format!("{}.{}.CARRY4.ACY0", carry.tile, site_rel));
         }
+    }
+
+    // Clock-network enables implied by the routed pips (rebuffers, HROW
+    // taps, BUFHCE, HCLK leaf buffers, CMT markers).
+    {
+        let all: Vec<&crate::route::RoutedPip> = routed
+            .nets
+            .iter()
+            .filter_map(|n| match &n.kind {
+                RouteKind::Pips(p) => Some(p.iter()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        lines.extend(device.clock_statics(&all));
     }
 
     // Routing pips: TILE.DST.SRC. Pseudo-pips are always-on hard
@@ -806,6 +830,7 @@ mod tests {
         Routed7 {
             placed,
             nets: vec![RoutedNet7 { net: "q".into(), kind: RouteKind::SiteInternal }],
+            ..Default::default()
         }
     }
 
@@ -1262,7 +1287,7 @@ mod tests {
             dsps: vec![],
             carries: vec![],
         };
-        let routed = Routed7 { placed, nets: vec![] };
+        let routed = Routed7 { placed, nets: vec![], ..Default::default() };
         let bs = emit_fasm(&routed, &FakeEmit).unwrap();
         let text = bs.fasm.join("\n");
         assert!(text.contains("BRAM_L_X0Y0.RAMB18.RAMB18_X0Y0.IN_USE"), "got:\n{text}");

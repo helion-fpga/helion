@@ -97,6 +97,21 @@ pub struct PipInfo {
     pub is_pseudo: serde_json::Value,
     #[serde(default)]
     pub can_invert: serde_json::Value,
+    /// Timing: `{"delay": [fast_min, fast_max, slow_min, slow_max], ...}` (ns).
+    #[serde(default)]
+    pub src_to_dst: serde_json::Value,
+    #[serde(default)]
+    pub dst_to_src: serde_json::Value,
+}
+
+/// Slow-corner maximum delay (ps) of a pip timing record.
+pub fn pip_delay_ps(t: &serde_json::Value) -> u16 {
+    t.get("delay")
+        .and_then(|d| d.as_array())
+        .and_then(|a| a.last())
+        .and_then(|x| x.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| x.as_f64()))
+        .map(|ns| (ns * 1000.0).round().clamp(0.0, 65535.0) as u16)
+        .unwrap_or(0)
 }
 
 /// Interpret the DB's loose `"1"`/`1`/`"0"`/`0` booleans.

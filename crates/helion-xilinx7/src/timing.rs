@@ -211,6 +211,217 @@ pub fn report_timing(
     })
 }
 
+/// Slow-corner cell delays (ps), from Project X-Ray's zynq7/artix7 SDF
+/// (`timings/CLBLL_L.sdf`): LUT A*->O6, FF CLK->Q, FF setup, carry paths.
+pub const LUT_PS: u32 = 124;
+pub const FF_CKQ_PS: u32 = 303;
+pub const FF_SETUP_PS: u32 = 109;
+/// O6 -> FFMUX -> D and O6 -> carry S inside the slice.
+pub const SITE_INTERNAL_PS: u32 = 60;
+/// S -> O (sum) through one CARRY4 and CI -> CO through one CARRY4.
+pub const CARRY_S_TO_O_PS: u32 = 520;
+pub const CARRY_CI_TO_CO_PS: u32 = 293;
+/// Route delay assumed for a fabric load the router left no delay for.
+pub const UNKNOWN_ROUTE_PS: u32 = 1200;
+/// Margin for clock skew/uncertainty and model error.
+pub const MARGIN_PS: u32 = 400;
+
+/// One step of a timing path.
+#[derive(Clone, Debug)]
+pub struct PathStep {
+    pub what: String,
+    pub arrival_ps: u32,
+}
+
+/// Register-to-register timing of a routed design.
+#[derive(Clone, Debug)]
+pub struct Analysis {
+    pub period_ps: u32,
+    /// Worst slack (ps); positive when every path meets the period.
+    pub wns_ps: i64,
+    pub failing_endpoints: usize,
+    pub endpoints: usize,
+    /// Worst path, launch first.
+    pub worst_path: Vec<PathStep>,
+}
+
+impl Analysis {
+    pub fn fmax_mhz(&self) -> f64 {
+        let crit = self.period_ps as i64 - self.wns_ps;
+        if crit <= 0 {
+            return f64::INFINITY;
+        }
+        1.0e6 / crit as f64
+    }
+}
+
+/// Static timing of every flip-flop D/CE/SR input against `period_ps`
+/// using routed interconnect delays (`Routed7::load_delays`) and SDF cell
+/// delays. Paths start at flip-flop outputs (I/O is unconstrained, as in
+/// Vivado without set_input_delay/set_output_delay). A combinational loop
+/// is an error.
+pub fn analyze(routed: &Routed7, period_ps: u32) -> Result<Analysis, String> {
+    let placed = &routed.placed;
+    let packed = &placed.packed;
+    let site_of: HashMap<&str, &str> = placed
+        .luts
+        .iter()
+        .map(|l| (l.name.as_str(), l.site.as_str()))
+        .chain(placed.ffs.iter().map(|f| (f.name.as_str(), f.site.as_str())))
+        .chain(placed.carries.iter().map(|c| (c.name.as_str(), c.site.as_str())))
+        .collect();
+    let lut_by_out: HashMap<&str, &crate::pack::PackedLut> = packed.luts.iter().map(|l| (l.output_net.as_str(), l)).collect();
+    let ff_by_q: HashMap<&str, &crate::pack::PackedFf> = packed.ffs.iter().map(|f| (f.q_net.as_str(), f)).collect();
+    let mut carry_by_net: HashMap<&str, (&crate::pack::PackedCarry, Option<usize>)> = HashMap::new();
+    for c in &packed.carries {
+        for (j, o) in c.o_nets.iter().enumerate() {
+            if let Some(o) = o {
+                carry_by_net.insert(o.as_str(), (c, Some(j)));
+            }
+        }
+        if let Some(co) = &c.co_net {
+            carry_by_net.insert(co.as_str(), (c, None));
+        }
+    }
+    // Pins as the router named them: LUT inputs A1..D6 (letter from BEL).
+    let lut_letter: HashMap<&str, char> = placed.luts.iter().map(|l| (l.name.as_str(), l.bel.chars().next().unwrap_or('A'))).collect();
+    let route = |net: &str, site: &str, pin: &str, internal: bool| -> u32 {
+        if internal {
+            return SITE_INTERNAL_PS;
+        }
+        routed
+            .load_delays
+            .get(&(net.to_string(), site.to_string(), pin.to_string()))
+            .copied()
+            .unwrap_or(UNKNOWN_ROUTE_PS)
+    };
+    // Arrival at a net's driver output, with the path that produced it.
+    let mut memo: HashMap<String, (u32, Vec<PathStep>)> = HashMap::new();
+    fn arrival<'a>(
+        net: &str,
+        depth: usize,
+        memo: &mut HashMap<String, (u32, Vec<PathStep>)>,
+        visiting: &mut HashSet<String>,
+        lut_by_out: &HashMap<&'a str, &'a crate::pack::PackedLut>,
+        ff_by_q: &HashMap<&'a str, &'a crate::pack::PackedFf>,
+        carry_by_net: &HashMap<&'a str, (&'a crate::pack::PackedCarry, Option<usize>)>,
+        site_of: &HashMap<&'a str, &'a str>,
+        lut_letter: &HashMap<&'a str, char>,
+        route: &dyn Fn(&str, &str, &str, bool) -> u32,
+    ) -> Result<(u32, Vec<PathStep>), String> {
+        if let Some(x) = memo.get(net) {
+            return Ok(x.clone());
+        }
+        if depth > 10_000 || !visiting.insert(net.to_string()) {
+            return Err(format!("timing: combinational loop through net `{net}`"));
+        }
+        let r = if ff_by_q.contains_key(net) {
+            (FF_CKQ_PS, vec![PathStep { what: format!("{} (flop Q)", ff_by_q[net].name), arrival_ps: FF_CKQ_PS }])
+        } else if let Some(l) = lut_by_out.get(net) {
+            let site = site_of.get(l.name.as_str()).copied().unwrap_or("");
+            let letter = lut_letter.get(l.name.as_str()).copied().unwrap_or('A');
+            let mut best = (0u32, Vec::new());
+            for (k, inn) in l.input_nets.iter().enumerate() {
+                let Some(inn) = inn else { continue };
+                let (a, p) = arrival(inn, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route)?;
+                if p.is_empty() {
+                    continue; // launched by a pad or constant: unconstrained
+                }
+                let t = a + route(inn, site, &format!("{letter}{}", k + 1), false);
+                if t > best.0 || best.1.is_empty() {
+                    best = (t, p);
+                }
+            }
+            if best.1.is_empty() {
+                (0, Vec::new())
+            } else {
+                let t = best.0 + LUT_PS;
+                let mut p = best.1;
+                p.push(PathStep { what: format!("{} (LUT)", l.name), arrival_ps: t });
+                (t, p)
+            }
+        } else if let Some((c, j)) = carry_by_net.get(net) {
+            let site = site_of.get(c.name.as_str()).copied().unwrap_or("");
+            let mut best = (0u32, Vec::new());
+            let upto = j.map(|j| j + 1).unwrap_or(4);
+            for s in c.s_nets.iter().take(upto).flatten() {
+                let (a, p) = arrival(s, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route)?;
+                if p.is_empty() {
+                    continue;
+                }
+                let t = a + route(s, site, "S", true);
+                if t > best.0 || best.1.is_empty() {
+                    best = (t, p);
+                }
+            }
+            if c.cyinit.is_none() && !c.ci_net.is_empty() {
+                let (a, p) = arrival(&c.ci_net, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route)?;
+                let cascade = carry_by_net.get(c.ci_net.as_str()).map(|(_, j)| j.is_none()).unwrap_or(false);
+                let t = a + if cascade { 0 } else { route(&c.ci_net, site, "AX", false) };
+                if !p.is_empty() && (t > best.0 || best.1.is_empty()) {
+                    best = (t, p);
+                }
+            }
+            if best.1.is_empty() {
+                (0, Vec::new())
+            } else {
+                let add = if j.is_some() { CARRY_S_TO_O_PS } else { CARRY_CI_TO_CO_PS };
+                let t = best.0 + add;
+                let mut p = best.1;
+                p.push(PathStep { what: format!("{} (CARRY4)", c.name), arrival_ps: t });
+                (t, p)
+            }
+        } else {
+            // Input pads, constants, clock buffers: not timed (unconstrained).
+            (0, Vec::new())
+        };
+        visiting.remove(net);
+        memo.insert(net.to_string(), r.clone());
+        Ok(r)
+    }
+    let mut visiting = HashSet::new();
+    let mut wns = i64::MAX;
+    let mut worst_path = Vec::new();
+    let mut failing = 0usize;
+    let mut endpoints = 0usize;
+    for pff in &placed.ffs {
+        let Some(ff) = packed.ffs.iter().find(|f| f.name == pff.name) else { continue };
+        let internal_d = matches!(crate::place::ff_d_source(pff, placed), crate::place::FfDSource::LutO6 | crate::place::FfDSource::CarryXor);
+        let letter = pff.bel.chars().next().unwrap_or('A');
+        let d_pin = if internal_d { format!("{letter}FF_D") } else { format!("{letter}X") };
+        let mut inputs: Vec<(&str, String, bool)> = vec![(ff.d_net.as_str(), d_pin, internal_d)];
+        if let Some(ce) = &ff.ce_net {
+            inputs.push((ce.as_str(), "CE".into(), false));
+        }
+        if let Some(sr) = &ff.sr_net {
+            if !ff.sr_async {
+                inputs.push((sr.as_str(), "SR".into(), false));
+            }
+        }
+        for (net, pin, internal) in inputs {
+            let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route)?;
+            if p.is_empty() {
+                continue; // driven by an input pad or a constant: unconstrained
+            }
+            let t = a + route(net, &pff.site, &pin, internal);
+            endpoints += 1;
+            let slack = period_ps as i64 - FF_SETUP_PS as i64 - MARGIN_PS as i64 - t as i64;
+            if slack < 0 {
+                failing += 1;
+            }
+            if slack < wns {
+                wns = slack;
+                p.push(PathStep { what: format!("{} {pin} (flop input)", ff.name), arrival_ps: t });
+                worst_path = p;
+            }
+        }
+    }
+    if endpoints == 0 {
+        wns = period_ps as i64;
+    }
+    Ok(Analysis { period_ps, wns_ps: wns, failing_endpoints: failing, endpoints, worst_path })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,7 +517,7 @@ mod tests {
             carries: vec![],
             },
             nets: vec![],
-        };
+         load_delays: Default::default(), graph_clocks: false };
         let err = report_timing(&routed, &tm, 10_000).expect_err("cycle must fail");
         assert!(err.contains("cycle"), "{err}");
         let _ = &mut packed;

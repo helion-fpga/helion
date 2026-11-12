@@ -100,8 +100,11 @@ def verify(db: Db, design: str, bitfile: str, rtl: list[str] | None = None, top:
             r = cosim.run(wd, rtl, top, xdc, nv, set(nl.ports_in), set(nl.ports_out), cycles=cycles, seed=seed)
             items = [f"cycle {k}: {b} rtl={x} bitstream={y}" for k, b, x, y in r.mismatches[:20]]
             items += [f"output {b} has no pad in the bitstream" for b in r.unmapped_outputs]
-            items += [f"input {b} has no pad in the bitstream" for b in r.unmapped_inputs]
-            rep.checks.append(Check("cosim", r.ok and not r.unmapped_inputs,
+            # An input with no pad is one the design never reads (the RTL
+            # simulation still drives it, so a real dependency would show
+            # up as output mismatches): reported, not a failure.
+            items += [f"note: input {b} is unused (no pad in the bitstream)" for b in r.unmapped_inputs]
+            rep.checks.append(Check("cosim", r.ok,
                                     f"{r.compared} output samples over {cycles} cycles, {len(r.mismatches)} mismatches, "
                                     f"{r.net_unknown} X/Z from bitstream, {r.rtl_unknown} RTL don't-care", items))
         except Exception as e:  # simulator failures are reported, not hidden
