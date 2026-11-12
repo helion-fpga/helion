@@ -239,7 +239,7 @@ pub fn compile_design_into_snapshot(
 
     let t_pack = Instant::now();
     let mut packed = pack(design, &dev)?;
-    let _ = packed.fit_pads(dev.iob_sites().count());
+    let _ = packed.fit_pads(dev.iob_sites_all().len());
     let pack_ms = t_pack.elapsed().as_millis();
 
     let t_place = Instant::now();

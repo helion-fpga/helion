@@ -700,7 +700,7 @@ fn evaluate_case(case: &CorpusCase) -> StageMetrics {
             return Err("cannot pack/place empty NO_BODY design (0 cells)".to_string());
         }
         let mut packed = pack(&design, dev)?;
-        let _ = packed.fit_pads(dev.iob_sites().count());
+        let _ = packed.fit_pads(dev.iob_sites_all().len());
         let placed = place_with_guide(
             &packed,
             dev,

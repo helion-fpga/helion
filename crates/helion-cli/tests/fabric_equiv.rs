@@ -163,7 +163,7 @@ fn check_with(src: &str, part: &str, cycles: usize, tamper: impl Fn(&mut helion_
 fn check_design(design: &Design, part: &str, cycles: usize, tamper: impl Fn(&mut helion_route::Routed)) -> Result<(u32, usize), String> {
     let dev = Device::load_part(part).expect("part");
     let mut packed = pack(design, &dev).expect("pack");
-    let fit = packed.fit_pads(dev.iob_sites().count());
+    let fit = packed.fit_pads(dev.iob_sites_all().len());
     assert!(fit.undriven.is_empty() && fit.over_budget.is_empty(), "pads do not fit: {fit:?}");
     assert!(packed.conn.undriven.is_empty(), "undriven LUT inputs: {:?}", packed.conn.undriven);
     let placed = place(&packed, &dev).expect("place");
@@ -504,4 +504,30 @@ endmodule
         }
     };
     assert!(check_with(src, PART, 800, no_reset).is_err(), "a missing asynchronous reset went unnoticed");
+}
+
+/// More pins than the bottom row has pads: outputs and inputs spill onto
+/// the top, left and right edges, which connect through the interconnect.
+#[test]
+fn pads_on_all_four_sides() {
+    let src = r#"
+module top(input logic clk, input logic [39:0] a, output logic [47:0] o);
+  logic [47:0] r;
+  always_ff @(posedge clk) r <= {r[46:0], ^a} ^ {8'd0, a} ^ {a[7:0], 40'd0};
+  assign o = r ^ {a, a[7:0]};
+endmodule
+"#;
+    let design = helion_sv::synth_sv_v2(src, "t.sv", None).expect("synth").design;
+    let dev = Device::load_part(PART).expect("part");
+    let bottom = dev.iob_sites().count();
+    assert!(dev.iob_sites_all().len() > bottom, "the part has pads off the bottom row");
+    let mut packed = pack(&design, &dev).expect("pack");
+    let fit = packed.fit_pads(dev.iob_sites_all().len());
+    assert!(fit.over_budget.is_empty() && fit.undriven.is_empty(), "88 pins fit: {fit:?}");
+    let routed = route(&place(&packed, &dev).expect("place"), &dev).expect("route");
+    let pad_row = dev.clb_y0 - 1;
+    let outs_off = routed.placed.iob_sites.iter().filter(|s| s.y != pad_row).count();
+    let ins_off = routed.tracks.iob_in.iter().filter(|i| i.y != pad_row).count();
+    assert!(outs_off > 0 && ins_off > 0, "{outs_off} outputs and {ins_off} inputs off the bottom row");
+    check(src, PART, 300);
 }
