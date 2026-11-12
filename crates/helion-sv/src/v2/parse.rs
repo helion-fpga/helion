@@ -22,6 +22,14 @@ const TYPE_KW: &[&str] = &[
     "uwire", "var", "enum", "struct", "union", "signed", "unsigned", "string", "real", "shortreal", "realtime", "event",
 ];
 
+/// Words that start a statement or item and therefore never name a type.
+const KEYWORDS: &[&str] = &[
+    "return", "if", "else", "case", "casez", "casex", "for", "while", "do", "repeat", "begin", "end", "assign", "always", "always_ff", "always_comb",
+    "always_latch", "initial", "final", "function", "task", "generate", "endgenerate", "module", "endmodule", "break", "continue", "unique", "unique0",
+    "priority", "assert", "assume", "cover", "import", "export", "genvar", "default", "endcase", "endfunction", "endtask", "forever", "wait", "disable",
+    "posedge", "negedge", "or", "and", "not", "inside", "input", "output", "inout", "interface", "endinterface", "package", "endpackage", "modport",
+];
+
 fn int_num(v: u32) -> Expr {
     let bits: Vec<bool> = (0..32).map(|i| (v >> i) & 1 == 1).collect();
     Expr::Num(Num { bits, xz: vec![false; 32], sized: false, signed: true, fill: false })
@@ -323,7 +331,11 @@ impl P {
                 let dims = self.dims()?;
                 Ok(DataType::Struct { fields, dims, signed, union })
             }
-            "string" | "real" | "shortreal" | "realtime" | "event" => self.err(format!("type '{k}' is not synthesizable")),
+            "string" => {
+                self.bump();
+                Ok(DataType::Str)
+            }
+            "real" | "shortreal" | "realtime" | "event" => self.err(format!("type '{k}' is not synthesizable")),
             _ => {
                 let mut path = vec![self.ident()?];
                 while self.eat_op("::") {
@@ -653,7 +665,7 @@ impl P {
         let line = self.line();
         self.skip_delay()?;
         // label: statement
-        if matches!(self.peek(), T::Id(_)) && self.op_at(1, ":") && !self.is_kw("default") {
+        if matches!(self.peek(), T::Id(s) if !KEYWORDS.contains(&s.as_str())) && self.op_at(1, ":") {
             self.bump();
             self.bump();
         }
@@ -678,7 +690,11 @@ impl P {
                 if self.at_decl() {
                     decls.push(self.decl_item()?);
                 } else {
-                    stmts.push(self.stmt()?);
+                    let st = self.stmt()?;
+                    // Dropped simulation statements leave nothing behind.
+                    if !matches!(st, Stmt::Null) {
+                        stmts.push(st);
+                    }
                 }
             }
             self.bump();
@@ -909,8 +925,8 @@ impl P {
                 if self.op_at(1, "::") {
                     return matches!(self.peek_at(2), T::Id(_)) && matches!(self.peek_at(3), T::Id(_));
                 }
-                // `name name ;|=|,|[`
-                matches!(self.peek_at(1), T::Id(_)) && matches!(self.peek_at(2), T::Op(";") | T::Op("=") | T::Op(",") | T::Op("["))
+                // `name name ;|=|,|[` with a first name that is not a keyword
+                !KEYWORDS.contains(&s.as_str()) && matches!(self.peek_at(1), T::Id(_)) && matches!(self.peek_at(2), T::Op(";") | T::Op("=") | T::Op(",") | T::Op("["))
             }
             _ => false,
         }
@@ -1565,13 +1581,32 @@ impl P {
                     self.bump();
                 }
                 T::Id(k) => match k.as_str() {
-                    "module" | "macromodule" => {
+                    "module" | "macromodule" | "interface" => {
                         self.bump();
-                        src.modules.push(self.module(false)?);
-                    }
-                    "interface" => {
-                        self.bump();
-                        src.modules.push(self.module(true)?);
+                        let start = self.i;
+                        match self.module(k == "interface") {
+                            Ok(m) => src.modules.push(m),
+                            Err(e) => {
+                                // A module that does not parse is an error
+                                // only if the design uses it (files often
+                                // carry test benches and simulation models).
+                                self.i = start;
+                                while self.is_kw("automatic") || self.is_kw("static") {
+                                    self.bump();
+                                }
+                                let name = self.ident().unwrap_or_default();
+                                let end = if k == "interface" { "endinterface" } else { "endmodule" };
+                                loop {
+                                    match self.bump() {
+                                        T::Id(s) if s == end => break,
+                                        T::Eof => return Err(e),
+                                        _ => {}
+                                    }
+                                }
+                                self.skip_label();
+                                src.broken.push((name, e));
+                            }
+                        }
                     }
                     "package" => {
                         self.bump();
@@ -1684,7 +1719,10 @@ endmodule
 
     #[test]
     fn errors_name_the_line() {
-        let e = parse("module m;\n  real x;\nendmodule").unwrap_err();
-        assert!(e.starts_with("line 2:"), "{e}");
+        // A module that does not parse is kept as broken, with its reason.
+        let s = parse("module m;\n  real x;\nendmodule").unwrap();
+        assert!(s.broken[0].0 == "m" && s.broken[0].1.starts_with("line 2:"), "{:?}", s.broken);
+        let e = parse("module m;\n  wire x\n").unwrap_err();
+        assert!(e.starts_with("line 3:"), "{e}");
     }
 }

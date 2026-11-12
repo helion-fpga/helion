@@ -11,7 +11,7 @@ use super::ast::*;
 use super::dag::{bits_for_u, Op, N};
 use super::elab::{Elab, Sym, Ty, R};
 use super::lex::Num;
-use super::lower::{Drv, Reg};
+use super::lower::{Drv, Latch, Reg};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -215,9 +215,13 @@ impl Elab {
                 Sym::Var(v) => Some(self.vars[v as usize].ty.clone()),
                 Sym::Const { ty, .. } => Some(ty),
                 Sym::Func(..) => None,
+                Sym::Inst(_) => return self.err(format!("'{}' is an instance, not a value", path.join("::"))),
                 Sym::Type(_) => return self.err(format!("'{}' is a type, not a value", path.join("::"))),
             },
             Expr::Member(b, f) => {
+                if let Some((hs, name)) = self.hier_member(e, sc)? {
+                    return self.ref_ty(&Expr::Id(vec![name]), hs);
+                }
                 let Some(bt) = self.ref_ty(b, sc)? else { return self.err("member of something that is not a struct") };
                 match &*bt {
                     Ty::Struct { fields, .. } => match fields.iter().find(|x| &x.0 == f) {
@@ -247,6 +251,62 @@ impl Elab {
             }
             _ => None,
         })
+    }
+
+    /// Scope named by a hierarchical prefix (`inst`, `inst.sub`, `gen[3]`).
+    fn hier_scope(&mut self, e: &Expr, sc: usize) -> R<Option<usize>> {
+        Ok(match e {
+            Expr::Id(path) if path.len() == 1 => match self.lookup(sc, &path[0]) {
+                Some(Sym::Inst(s)) => Some(s),
+                _ => None,
+            },
+            Expr::Member(b, name) => match self.hier_scope(b, sc)? {
+                Some(s) => match self.scopes[s].syms.get(name) {
+                    Some(Sym::Inst(s2)) => Some(*s2),
+                    _ => None,
+                },
+                None => None,
+            },
+            Expr::Index(b, i) => {
+                let name = match &**b {
+                    Expr::Id(path) if path.len() == 1 => path[0].clone(),
+                    Expr::Member(_, n) => n.clone(),
+                    _ => return Ok(None),
+                };
+                let from = match &**b {
+                    Expr::Member(bb, _) => match self.hier_scope(bb, sc)? {
+                        Some(s) => s,
+                        None => return Ok(None),
+                    },
+                    _ => sc,
+                };
+                // Only a generate label can be indexed like this.
+                let is_label = self.scopes.iter().any(|s| s.syms.keys().any(|k| k.starts_with(&format!("{name}["))));
+                if !is_label {
+                    return Ok(None);
+                }
+                let k = self.const_int(i, sc)?;
+                match self.lookup(from, &format!("{name}[{k}]")) {
+                    Some(Sym::Inst(s)) => Some(s),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+    }
+
+    /// `prefix.name` where `prefix` names an instance: the scope and the name.
+    fn hier_member(&mut self, e: &Expr, sc: usize) -> R<Option<(usize, String)>> {
+        let Expr::Member(b, f) = e else { return Ok(None) };
+        match self.hier_scope(b, sc)? {
+            Some(s) => {
+                if !matches!(self.scopes[s].syms.get(f), Some(Sym::Sig(_)) | Some(Sym::Const { .. })) {
+                    return self.err(format!("'{f}' is not a signal of the instance it is looked up in"));
+                }
+                Ok(Some((s, f.clone())))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Self-determined width and signedness.
@@ -370,9 +430,13 @@ impl Elab {
                 }
                 Sym::Const { n, ty } => V { n, ty },
                 Sym::Func(..) => return Ok(None),
+                Sym::Inst(_) => return self.err(format!("'{}' is an instance, not a value", path.join("::"))),
                 Sym::Type(_) => return self.err(format!("'{}' is a type, not a value", path.join("::"))),
             },
             Expr::Member(b, f) => {
+                if let Some((hs, name)) = self.hier_member(e, sc)? {
+                    return self.eval_ref(&Expr::Id(vec![name]), hs, env);
+                }
                 let Some(bv) = self.eval_ref(b, sc, env)? else { return self.err("member of something that is not a struct") };
                 match &*bv.ty {
                     Ty::Struct { fields, .. } => match fields.iter().find(|x| &x.0 == f) {
@@ -1015,6 +1079,9 @@ impl Elab {
                 _ => self.err(format!("'{}' cannot be assigned", path.join("::"))),
             },
             Expr::Member(b, f) => {
+                if let Some((hs, name)) = self.hier_member(e, sc)? {
+                    return self.lvalue(&Expr::Id(vec![name]), hs, env);
+                }
                 let mut lv = self.lvalue(b, sc, env)?;
                 let Ty::Struct { fields, .. } = &*lv.ty.clone() else { return self.err(format!("'.{f}' used on something that is not a struct")) };
                 let Some((_, fty, off)) = fields.iter().find(|x| &x.0 == f) else { return self.err(format!("no member '{f}'")) };
@@ -1569,7 +1636,42 @@ impl Elab {
             _ => &[],
         };
         if kind == AlwaysKind::Latch {
-            return self.err("latches (always_latch) are not supported");
+            // `if (gate) q = d;` — recorded as a latch; the back end accepts
+            // it where it is a clock gate.
+            let mut first = body;
+            while let Stmt::Block { stmts, decls } = first {
+                if decls.is_empty() && stmts.len() == 1 {
+                    first = &stmts[0];
+                } else {
+                    break;
+                }
+            }
+            let Stmt::If { cond, then, els: None, .. } = first else {
+                return self.err("only latches of the form 'if (enable) q = d;' are supported");
+            };
+            let cv = self.eval_self(cond, sc, &mut Env::default())?;
+            let gate = self.truth(cv.n);
+            self.ps = ProcState::default();
+            let mut env = Env { mode: Mode::Comb, ..Default::default() };
+            self.exec(then, sc, &mut env)?;
+            self.line = line;
+            let mut ids: Vec<u32> = env.sig.keys().chain(env.nba.keys()).copied().collect();
+            ids.sort_unstable();
+            ids.dedup();
+            for id in ids {
+                let d = env.sig.get(&id).or(env.nba.get(&id)).copied().unwrap();
+                let mask = self.ps.blk.get(&id).or(self.ps.nba.get(&id)).cloned().unwrap();
+                let taint = self.dag.tainted_bits(d, &|op| matches!(op, Op::Hold(_)), &mut HashMap::new());
+                if taint.iter().any(|t| *t) || !mask.iter().all(|m| *m) {
+                    return self.err("a latch must assign the whole signal");
+                }
+                let k = self.latches.len() as u32;
+                for b in 0..mask.len() {
+                    self.drive(id, b as u32, Drv::Latch(k))?;
+                }
+                self.latches.push(Latch { sig: id, d, gate });
+            }
+            return Ok(());
         }
         if kind == AlwaysKind::Ff && edges.is_empty() {
             return self.err("always_ff needs a clock edge");
@@ -1647,11 +1749,10 @@ impl Elab {
             0
         } else {
             let mut first = body;
-            while let Stmt::Block { stmts, decls } = first {
-                if decls.is_empty() && stmts.len() == 1 {
-                    first = &stmts[0];
-                } else {
-                    break;
+            while let Stmt::Block { stmts, .. } = first {
+                match stmts.first() {
+                    Some(s) => first = s,
+                    None => break,
                 }
             }
             let Stmt::If { cond, .. } = first else {
@@ -1672,6 +1773,28 @@ impl Elab {
             let note = "asynchronous set/reset is built as synchronous (the reset takes effect at the next clock edge)";
             if !self.warnings.iter().any(|w| w.ends_with(note)) {
                 self.warnings.push(format!("line {line}: {note}"));
+            }
+            // The flops power up in their reset state, as they would be
+            // after an asynchronous reset at time zero.
+            if let Stmt::If { then, .. } = first {
+                let saved = std::mem::take(&mut self.ps);
+                let mut scratch = Env { mode: Mode::Seq, ..Default::default() };
+                self.exec(then, sc, &mut scratch)?;
+                let assigned = std::mem::replace(&mut self.ps, saved);
+                for (map, masks) in [(&scratch.nba, &assigned.nba), (&scratch.sig, &assigned.blk)] {
+                    for (id, v) in map {
+                        let Some(mask) = masks.get(id) else { continue };
+                        for (b, m) in mask.iter().enumerate() {
+                            if !*m {
+                                continue;
+                            }
+                            let bit = self.dag.slice(*v, b as u32, 1);
+                            if let Some(k) = self.dag.as_const(bit).map(|k| k[0]) {
+                                self.sigs[*id as usize].init[b] = k;
+                            }
+                        }
+                    }
+                }
             }
             free[0]
         };

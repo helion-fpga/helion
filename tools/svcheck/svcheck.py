@@ -244,7 +244,7 @@ def build(nl: Netlist, widths: dict[str, int]):
 RESET_RE = re.compile(r"(rst|reset|clr|clear)", re.I)
 
 
-def bench(nl: Netlist, clocks: set[str], cycles: int, seed: int, with_netlist: bool) -> str:
+def bench(nl: Netlist, clocks: set[str], cycles: int, seed: int, with_netlist: bool, regs=None, pulses=True) -> str:
     ins = [p for p, d in nl.ports if d in ("in", "inout")]
     outs = [p for p, d in nl.ports if d == "out"]
     for p in ins:
@@ -252,6 +252,8 @@ def bench(nl: Netlist, clocks: set[str], cycles: int, seed: int, with_netlist: b
             clocks = clocks | {p}
     data = [p for p in ins if p not in clocks]
     t = ["`timescale 1ns/1ps", "module svcheck_tb;", "integer k, j;"]
+    if regs:
+        t.append(f"reg [{len(regs) - 1}:0] seen = 0;")
     for p in ins:
         t.append(f"reg [{W - 1}:0] in_{p} = 0;")
     for p in outs:
@@ -273,6 +275,8 @@ def bench(nl: Netlist, clocks: set[str], cycles: int, seed: int, with_netlist: b
             if RESET_RE.search(p):
                 low = bool(re.search(r"(_n|_ni|n|_b|_l)$", p, re.I))
                 t.append(f"  in_{p} = {0 if low else 1};")
+        # Let the reset values settle before the first clock edge.
+        t.append("  #5;")
         t.append(f"  for (k = 0; k < {cycles}; k = k + 1) begin")
         for c in sorted(clocks):
             t.append(f"    in_{c} = 1;")
@@ -280,6 +284,9 @@ def bench(nl: Netlist, clocks: set[str], cycles: int, seed: int, with_netlist: b
         fmt = " ".join(["%0d"] + ["%h %h %h"] * len(outs))
         args = ", ".join(["k"] + [f"r_{p}, o_{p}, k_{p}" for p in outs])
         t.append(f'    $display("S {fmt}", {args});')
+        for i, (net, hier, idx, inv) in enumerate(regs or []):
+            ref = f"dut.{hier}" if idx == "s" else f"dut.{hier}[{idx}]"
+            t.append(f'    if (!seen[{i}] && ({ref} !== (net.{vid(net)} ^ 1\'b{inv}))) begin seen[{i}] = 1; $display("R %0d {hier}{"" if idx == "s" else "[" + idx + "]"}", k); end')
         t.append("    #4;")
         for c in sorted(clocks):
             t.append(f"    in_{c} = 0;")
@@ -287,7 +294,8 @@ def bench(nl: Netlist, clocks: set[str], cycles: int, seed: int, with_netlist: b
             if RESET_RE.search(p):
                 low = bool(re.search(r"(_n|_ni|n|_b|_l)$", p, re.I))
                 on, off = (0, 1) if low else (1, 0)
-                t.append(f"    in_{p} = (k < 3 || ($urandom % 61) == 0) ? {on} : {off};")
+                again = " || ($urandom % 61) == 0" if pulses else ""
+                t.append(f"    in_{p} = (k < 3{again}) ? {on} : {off};")
             else:
                 t.append(f"    for (j = 0; j < {W}; j = j + 32) in_{p}[j +: 32] = $urandom;")
         t.append("    #5;")
@@ -302,7 +310,7 @@ def verilate(work: str, files: list[str], tag: str):
     obj = os.path.join(work, "obj_" + tag)
     shutil.rmtree(obj, ignore_errors=True)
     cmd = ["verilator", "--binary", "--timing", "-O0", "--x-initial", "0", "--x-assign", "0", "-Wno-fatal", "-Wno-lint",
-           "-Wno-WIDTH", "-Wno-PINMISSING", "--top-module", "svcheck_tb", "--Mdir", obj, "-o", "sim"] + files
+           "-Wno-WIDTH", "-Wno-PINMISSING", "-Wno-MULTIDRIVEN", "-Wno-LATCH", "-Wno-UNOPTFLAT", "--top-module", "svcheck_tb", "--Mdir", obj, "-o", "sim"] + files
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     if r.returncode != 0:
         err = [l for l in r.stderr.splitlines() if "%Error" in l]
@@ -311,7 +319,7 @@ def verilate(work: str, files: list[str], tag: str):
     return r.stdout, ""
 
 
-def check(files: list[str], top: str | None, cycles: int, seed: int, work: str) -> tuple[bool, list[str]]:
+def check(files: list[str], top: str | None, cycles: int, seed: int, work: str, regs: bool = False) -> tuple[bool, list[str]]:
     os.makedirs(work, exist_ok=True)
     src = files[0]
     if len(files) > 1:
@@ -319,12 +327,19 @@ def check(files: list[str], top: str | None, cycles: int, seed: int, work: str) 
         with open(src, "w") as f:
             for p in files:
                 f.write(open(p).read() + "\n")
-    r = subprocess.run([HNF] + (['--legacy'] if os.environ.get('SVCHECK_LEGACY') else []) + [src] + ([top] if top else []), capture_output=True, text=True, timeout=1800)
+    regmap = os.path.join(work, "regmap.txt")
+    r = subprocess.run([HNF] + (['--legacy'] if os.environ.get('SVCHECK_LEGACY') else []) + [src] + (['--top', top] if top else [])
+                       + (['--regmap', regmap] if regs else []), capture_output=True, text=True, timeout=1800)
     if r.returncode != 0:
         tail = [l for l in r.stderr.splitlines() if l.strip()][-1:] or ["synthesis failed"]
         return False, [f"synthesis: {tail[0][:300]}"]
     nl = Netlist(r.stdout)
     notes = []
+    # Asynchronous resets are built as synchronous ones (the fabric's flops
+    # have no asynchronous input). The two agree when reset is applied at
+    # start-up, which is what is checked; a reset pulsed between clock edges
+    # of a running design reaches non-reset registers one edge apart.
+    async_as_sync = "asynchronous set/reset is built as synchronous" in r.stderr
     soft = [k for k in ("SIM_ONLY", "NO_BODY", "WIDE_CONE", "ASSIGN_NOT_LOWERED", "GENERATE_NOT_LOWERED", "FLATTEN_CAP",
                         "WIDTH_OVERFLOW", "WORD_PIPELINE_CAP", "GATE_PRIMITIVE") if nl.dattrs.get(k) == "1"]
     if soft:
@@ -341,7 +356,11 @@ def check(files: list[str], top: str | None, cycles: int, seed: int, work: str) 
     nv = os.path.join(work, "helion_netlist.v")
     open(nv, "w").write(vtext)
     tb = os.path.join(work, "tb.sv")
-    open(tb, "w").write(bench(nl, clocks, cycles, seed, True))
+    reg_list = None
+    if regs and os.path.exists(regmap):
+        # Flops whose source register is a scalar or a bit of a plain vector.
+        reg_list = [tuple(l.split()) for l in open(regmap) if l.split()[2] != "-"]
+    open(tb, "w").write(bench(nl, clocks, cycles, seed, True, reg_list, pulses=not async_as_sync))
     out, err = verilate(work, [src, nv, tb], "c")
     if out is None:
         return False, notes + [f"co-simulation did not build: {err[:300]}"]
@@ -366,6 +385,12 @@ def check(files: list[str], top: str | None, cycles: int, seed: int, work: str) 
                     bad[key] = (first, n + 1)
                 diff >>= 1
                 b += 1
+    if reg_list is not None:
+        firsts = sorted((int(l.split()[1]), l.split()[2]) for l in out.splitlines() if l.startswith("R "))
+        for cyc, name in firsts[:20]:
+            notes.append(f"register {name} first differs from the RTL at cycle {cyc}")
+        if len(firsts) > 20:
+            notes.append(f"... and {len(firsts) - 20} more register bits differ")
     for key, (first, n) in sorted(bad.items(), key=lambda kv: kv[1][0])[:12]:
         notes.append(f"{key} differs from the RTL in {n} of {cycles} cycles (first at cycle {first})")
     if len(bad) > 12:
@@ -373,7 +398,8 @@ def check(files: list[str], top: str | None, cycles: int, seed: int, work: str) 
     if compared == 0 and outs:
         notes.append("no output bit could be compared")
     ok = not notes
-    return ok, notes + ([] if not ok else [f"{compared} output samples equal over {cycles} cycles"])
+    tail = " (reset held at start-up only: asynchronous resets are built as synchronous)" if async_as_sync else ""
+    return ok, notes + ([] if not ok else [f"{compared} output samples equal over {cycles} cycles{tail}"])
 
 
 def main():
@@ -385,6 +411,7 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--work", default=os.path.join(ROOT, "target", "svcheck"))
     ap.add_argument("-j", type=int, default=6)
+    ap.add_argument("--regs", action="store_true", help="also compare every flop with its source register, each cycle")
     a = ap.parse_args()
     if not os.path.exists(HNF):
         sys.exit(f"missing {HNF}: cargo build --release -p helion-cli --example hnf")
@@ -402,7 +429,7 @@ def main():
         files, top = job
         name = os.path.splitext(os.path.basename(files[0]))[0]
         try:
-            return name, check(files, top, a.cycles, a.seed, os.path.join(a.work, name))
+            return name, check(files, top, a.cycles, a.seed, os.path.join(a.work, name), a.regs)
         except subprocess.TimeoutExpired:
             return name, (False, ["timed out"])
 
