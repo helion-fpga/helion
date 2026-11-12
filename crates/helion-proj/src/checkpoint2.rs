@@ -577,6 +577,29 @@ fn enc_conn(w: &mut Writer, c: &Connectivity) {
     for p in &c.clock_problems {
         w.str(p);
     }
+    w.u32(c.resets.len() as u32);
+    for d in &c.resets {
+        w.str(&d.net);
+        w.u8(d.line);
+        match d.src {
+            ClockSrc::Implicit => w.u8(0),
+            ClockSrc::Pin(i) => {
+                w.u8(1);
+                w.u32(i);
+            }
+            ClockSrc::Gen(s) => {
+                w.u8(2);
+                enc_src(w, s);
+            }
+        }
+    }
+    w.u32(c.ff_reset.len() as u32);
+    for f in &c.ff_reset {
+        w.u8(match f {
+            None => 255,
+            Some((line, level, val)) => *line | ((*level as u8) << 6) | ((*val as u8) << 7),
+        });
+    }
 }
 
 fn dec_conn(r: &mut Reader) -> Result<Connectivity, String> {
@@ -621,6 +644,24 @@ fn dec_conn(r: &mut Reader) -> Result<Connectivity, String> {
     }
     for _ in 0..r.u32()? {
         c.clock_problems.push(r.str()?);
+    }
+    if r.pos >= r.buf.len() {
+        return Ok(c);
+    }
+    for _ in 0..r.u32()? {
+        let net = r.str()?;
+        let line = r.u8()?;
+        let src = match r.u8()? {
+            0 => ClockSrc::Implicit,
+            1 => ClockSrc::Pin(r.u32()?),
+            2 => ClockSrc::Gen(dec_src(r)?),
+            k => return Err(format!("checkpoint: bad reset source kind {k}")),
+        };
+        c.resets.push(ClockDom { net, line, src });
+    }
+    for _ in 0..r.u32()? {
+        let v = r.u8()?;
+        c.ff_reset.push((v != 255).then_some((v & 0x3f, v & 0x40 != 0, v & 0x80 != 0)));
     }
     Ok(c)
 }

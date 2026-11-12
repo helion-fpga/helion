@@ -104,6 +104,8 @@ fn net_len(net: &Net, pos: &[(i32, i32)]) -> i32 {
 struct ClockInfo {
     line: Vec<i8>,
     source: Vec<bool>,
+    /// Asynchronous reset of the cluster's flop: line * 2 + level, or -1.
+    rst: Vec<i16>,
 }
 
 impl ClockInfo {
@@ -111,7 +113,9 @@ impl ClockInfo {
     fn of(placed: &Placed) -> Option<Self> {
         let conn = &placed.packed.conn;
         let any_gen = conn.clocks.iter().any(|c| matches!(c.src, helion_pack::ClockSrc::Gen(_)));
-        if conn.clocks.len() <= 1 && !any_gen {
+        let lines: std::collections::HashSet<u8> = conn.ff_clock.iter().flatten().map(|f| f.0).collect();
+        let any_rst = conn.ff_reset.iter().any(|r| r.is_some());
+        if conn.clocks.len() <= 1 && !any_gen && lines.len() <= 1 && !any_rst {
             return None;
         }
         let n = placed.lutff_sites.len();
@@ -122,24 +126,38 @@ impl ClockInfo {
             }
         }
         let mut source = vec![false; n];
-        for c in &conn.clocks {
+        for c in conn.clocks.iter().chain(conn.resets.iter()) {
             if let helion_pack::ClockSrc::Gen(helion_pack::NetSrc::BleQ(i) | helion_pack::NetSrc::BleO(i)) = c.src {
                 if (i as usize) < n {
                     source[i as usize] = true;
                 }
             }
         }
-        Some(ClockInfo { line, source })
+        let mut rst = vec![-1i16; n];
+        for (i, r) in conn.ff_reset.iter().enumerate().take(n) {
+            if let Some((l, level, _)) = r {
+                rst[i] = *l as i16 * 2 + *level as i16;
+            }
+        }
+        Some(ClockInfo { line, source, rst })
     }
 
     /// Whether the clusters in `occ` (one CLB) may share it: flops of one
     /// clock line, and at most one clock source.
     fn tile_ok(&self, occ: &[u32]) -> bool {
         let mut seen: i8 = -1;
+        let mut seen_rst: i16 = -1;
         let mut gens = 0;
         for &c in occ {
             if c == u32::MAX {
                 continue;
+            }
+            let r = self.rst[c as usize];
+            if r >= 0 {
+                if seen_rst >= 0 && seen_rst != r {
+                    return false;
+                }
+                seen_rst = r;
             }
             let l = self.line[c as usize];
             if l >= 0 {
@@ -181,7 +199,9 @@ pub fn legalize_clocks(placed: &mut Placed, dev: &Device) -> Result<u32, String>
             let keep = (0..8).max_by_key(|&l| counts[l]).unwrap_or(0) as i8;
             let off_clock = (0..n_ble).find(|&b| tile[b] != u32::MAX && ck.line[tile[b] as usize] >= 0 && ck.line[tile[b] as usize] != keep);
             let extra_gen = (0..n_ble).filter(|&b| tile[b] != u32::MAX && ck.source[tile[b] as usize]).nth(1);
-            let slot = t * n_ble + off_clock.or(extra_gen).ok_or("cannot separate the clocks of a CLB")?;
+            let first_rst = tile.iter().filter(|c| **c != u32::MAX).map(|c| ck.rst[*c as usize]).find(|r| *r >= 0).unwrap_or(-1);
+            let off_reset = (0..n_ble).find(|&b| tile[b] != u32::MAX && ck.rst[tile[b] as usize] >= 0 && ck.rst[tile[b] as usize] != first_rst);
+            let slot = t * n_ble + off_clock.or(extra_gen).or(off_reset).ok_or("cannot separate the clocks of a CLB")?;
             let c = occ[slot];
             let (sx, sy) = (sites[t].x as i64, sites[t].y as i64);
             let mut order: Vec<usize> = (0..sites.len()).filter(|&u| u != t).collect();

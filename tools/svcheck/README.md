@@ -36,9 +36,11 @@ Ibex needs one edit to its copy for Verilator to accept it as a reference
 
 ## Reset
 
-The fabric's flops have no asynchronous input, so an asynchronous reset is
-built as a synchronous one and the flops power up in their reset state. For
-such designs the bench holds reset at start-up only: a reset pulsed between
-clock edges of a running design reaches registers without a reset one edge
-later than in the RTL. Designs with synchronous resets get random reset
-pulses throughout.
+An asynchronous reset or set that is one plain signal with constant reset
+values is built as a real asynchronous control, and the bench pulses resets
+at random throughout. A block whose asynchronous control is anything else
+(an expression, several controls, a reset value that depends on state) is
+built as synchronous, with a warning; for such a design the bench holds
+reset at start-up only, because a reset pulsed between clock edges would
+reach those flops one edge later than in the RTL. `SVCHECK_PULSES=1` pulses
+anyway.

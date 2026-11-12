@@ -89,6 +89,11 @@ pub struct Connectivity {
     /// Clock line and falling-edge flag of each cluster's flop (by
     /// `lutffs` index; `None` for a cluster without a flop).
     pub ff_clock: Vec<Option<(u8, bool)>>,
+    /// Asynchronous set/reset signals, on clock lines of their own.
+    pub resets: Vec<ClockDom>,
+    /// Asynchronous reset of each cluster's flop: (line, active level,
+    /// value while reset). `None` for no flop or no asynchronous reset.
+    pub ff_reset: Vec<Option<(u8, bool, bool)>>,
     /// Ways the design's clocking does not fit the fabric. Empty when it fits.
     pub clock_problems: Vec<String>,
 }
@@ -405,11 +410,20 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
         let cpins = design.pin_index();
         let mut of_ff: HashMap<&str, (Option<Spur>, bool)> = HashMap::new();
         let mut order: Vec<Spur> = Vec::new();
+        // Asynchronous resets: (net, active level, value) per flop.
+        let mut rst_of: HashMap<&str, (Spur, bool, bool)> = HashMap::new();
+        let mut rorder: Vec<Spur> = Vec::new();
         for c in &design.cells {
             if !matches!(c.kind, CellKind::Hff) {
                 continue;
             }
             let name = resolve(c.name);
+            if let Some(r) = cpins.net_on(name, "ARST") {
+                if !rorder.contains(&r) {
+                    rorder.push(r);
+                }
+                rst_of.insert(name, (r, c.attrs.get("ARST_LEVEL") != Some("0"), c.attrs.get("ARST_VAL") == Some("1")));
+            }
             let clk = cpins.net_on(name, "CLK").or_else(|| cpins.net_on(name, "C"));
             if let Some(n) = clk {
                 if !order.contains(&n) {
@@ -419,6 +433,13 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
             of_ff.insert(name, (clk, c.attrs.get("CLK_INV") == Some("1")));
         }
         let lines = helion_device::clocks::LINES as usize;
+        if order.len() + rorder.len() > lines && !rorder.is_empty() && order.len() <= lines {
+            conn.clock_problems.push(format!(
+                "the design has {} clock(s) and {} asynchronous reset signal(s); this fabric has {lines} lines for both",
+                order.len(),
+                rorder.len()
+            ));
+        }
         if order.len() > lines {
             let names: Vec<&str> = order.iter().take(6).map(|n| resolve(*n)).collect();
             conn.clock_problems.push(format!(
@@ -457,6 +478,36 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
                 }
             }
         }
+        // Reset signals take the lines after the clocks.
+        for (k, net) in rorder.iter().enumerate() {
+            let line = order.len() + k;
+            if line >= lines {
+                break;
+            }
+            let name = resolve(*net).to_string();
+            let src = match net_src.get(net).copied() {
+                Some(s) => Some(ClockSrc::Gen(s)),
+                None => match input_src(*net, &mut conn) {
+                    Some(NetSrc::Input(i)) => {
+                        conn.inputs[i as usize].clock = Some(line as u8);
+                        Some(ClockSrc::Pin(i))
+                    }
+                    _ => None,
+                },
+            };
+            match src {
+                Some(src) => conn.resets.push(ClockDom { net: name, line: line as u8, src }),
+                None => conn.clock_problems.push(format!("asynchronous reset net {name} has no driver")),
+            }
+        }
+        conn.ff_reset = lutffs
+            .iter()
+            .map(|l| {
+                let (net, level, val) = rst_of.get(l.ff_cell.as_str()).copied()?;
+                let line = order.len() + rorder.iter().position(|r| *r == net)?;
+                (line < lines).then_some((line as u8, level, val))
+            })
+            .collect();
         conn.ff_clock = lutffs
             .iter()
             .map(|l| {
@@ -471,6 +522,19 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
         let unclocked = of_ff.values().filter(|v| v.0.is_none()).count();
         if unclocked > 0 {
             conn.clock_problems.push(format!("{unclocked} flop(s) have no clock"));
+        }
+        // A clocking scheme that cannot be realised is reported (it is a
+        // design-rule error). So that the rest of the flow stays
+        // consistent, such a design is laid out on the implicit clock
+        // alone, as every design was before the fabric had clock lines.
+        if !conn.clock_problems.is_empty() {
+            conn.clocks.clear();
+            for f in conn.ff_clock.iter_mut().flatten() {
+                *f = (0, false);
+            }
+            for i in conn.inputs.iter_mut() {
+                i.clock = None;
+            }
         }
     }
     let mut macs = Vec::new();

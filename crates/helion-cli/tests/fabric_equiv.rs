@@ -17,8 +17,8 @@ use std::collections::HashMap;
 /// clock nets and edges, output pads.
 struct NetSim {
     luts: Vec<(u64, [Option<Spur>; 6], Spur)>,
-    /// (D, Q, clock net, falling edge)
-    ffs: Vec<(Spur, Spur, Option<Spur>, bool)>,
+    /// (D, Q, clock net, falling edge, asynchronous reset: net and level)
+    ffs: Vec<(Spur, Spur, Option<Spur>, bool, Option<(Spur, bool)>)>,
     val: HashMap<Spur, bool>,
     /// Clock net values when last looked at.
     prev: HashMap<Spur, bool>,
@@ -43,7 +43,8 @@ impl NetSim {
                 }
                 CellKind::Hff => {
                     if let (Some(dn), Some(q)) = (pins.net_on(name, "D"), pins.net_on(name, "Q")) {
-                        ffs.push((dn, q, pins.net_on(name, "CLK"), c.attrs.get("CLK_INV") == Some("1")));
+                        let arst = pins.net_on(name, "ARST").map(|n| (n, c.attrs.get("ARST_LEVEL") != Some("0")));
+                        ffs.push((dn, q, pins.net_on(name, "CLK"), c.attrs.get("CLK_INV") == Some("1"), arst));
                     }
                 }
                 _ => {}
@@ -80,10 +81,35 @@ impl NetSim {
     fn advance(&mut self) {
         for _ in 0..1024 {
             self.settle();
+            // Asynchronous resets act first: a flop held in reset is 0
+            // (the netlist stores every register relative to its reset
+            // value) and ignores its clock.
+            let held: Vec<bool> = self.ffs.iter().map(|f| f.4.map(|(n, level)| self.get(n) == level).unwrap_or(false)).collect();
+            let mut reset_changed = false;
+            for (f, h) in self.ffs.iter().zip(&held) {
+                if *h && self.val.get(&f.1).copied().unwrap_or(false) {
+                    reset_changed = true;
+                }
+            }
+            if reset_changed {
+                let qs: Vec<Spur> = self.ffs.iter().zip(&held).filter(|(_, h)| **h).map(|(f, _)| f.1).collect();
+                for q in qs {
+                    self.val.insert(q, false);
+                }
+                continue;
+            }
             let mut next: Vec<(Spur, bool)> = Vec::new();
             let mut moved = false;
-            for (d, q, clk, falling) in &self.ffs {
+            for ((d, q, clk, falling, _), h) in self.ffs.iter().zip(&held) {
                 let Some(clk) = clk else { continue };
+                if *h {
+                    // Still note the clock's movement below.
+                    let cur = self.get(*clk);
+                    if cur != self.prev.get(clk).copied().unwrap_or(cur) {
+                        moved = true;
+                    }
+                    continue;
+                }
                 let cur = self.get(*clk);
                 let was = self.prev.get(clk).copied().unwrap_or(cur);
                 if cur != was {
@@ -445,4 +471,37 @@ endmodule
     let dev = Device::load_part(PART).expect("part");
     let packed = pack(&design, &dev).expect("pack");
     assert!(packed.conn.clock_problems.iter().any(|p| p.contains("5 clocks")), "{:?}", packed.conn.clock_problems);
+}
+
+/// An asynchronous reset is a real one: asserted between clock edges it
+/// clears the flops at once, in the fabric as in the netlist, and flops
+/// without a reset in the same design are left alone.
+#[test]
+fn asynchronous_reset() {
+    let src = r#"
+module top(input logic clk, input logic rst_n, input logic [3:0] d, output logic [3:0] q, output logic [3:0] free, output logic [3:0] pre);
+  logic [3:0] a, f, p;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      a <= 4'd0;
+      p <= 4'hA;
+    end else begin
+      a <= a + d;
+      p <= p ^ d;
+    end
+  end
+  always_ff @(posedge clk) f <= f + a;
+  assign q = a; assign free = f; assign pre = p;
+endmodule
+"#;
+    let design = helion_sv::synth_sv_v2(src, "t.sv", None).expect("synth").design;
+    assert!(design.cells.iter().any(|c| c.attrs.get("ARST_LEVEL") == Some("0")), "the reset is asynchronous in the netlist");
+    check(src, PART, 800);
+    // Flops that ignore the reset no longer match.
+    let no_reset = |r: &mut helion_route::Routed| {
+        for f in r.placed.packed.conn.ff_reset.iter_mut() {
+            *f = None;
+        }
+    };
+    assert!(check_with(src, PART, 800, no_reset).is_err(), "a missing asynchronous reset went unnoticed");
 }

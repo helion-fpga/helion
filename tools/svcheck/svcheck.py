@@ -175,7 +175,7 @@ def build(nl: Netlist, widths: dict[str, int]):
             if root is not None:
                 clocks.add(root)
             edge = "negedge" if nl.attrs.get(cell, {}).get("CLK_INV") == "1" else "posedge"
-            known = {"D", "Q", "CLK", "C", "CE", "SR", "RST", "R", "S"}
+            known = {"D", "Q", "CLK", "C", "CE", "SR", "RST", "R", "S", "ARST"}
             extra = [p for (c, p) in nl.pin_net if c == cell and p not in known]
             if extra:
                 problems.append(f"flop {cell}: pins {extra} are not modelled")
@@ -188,7 +188,15 @@ def build(nl: Netlist, widths: dict[str, int]):
                 stmt = f"if ({ref(rst)}) {vid(q)} <= 1'b0; else {stmt}"
             if pin("S"):
                 stmt = f"if ({ref(pin('S'))}) {vid(q)} <= 1'b1; else {stmt}"
-            logic.append(f"always @({edge} {ref(ck)}) {stmt}")
+            if pin("ARST"):
+                # Asynchronous set/reset: level ARST_LEVEL forces ARST_VAL.
+                at = nl.attrs.get(cell, {})
+                level = at.get("ARST_LEVEL", "1")
+                aedge = "posedge" if level == "1" else "negedge"
+                a = ref(pin("ARST"))
+                logic.append(f"always @({edge} {ref(ck)} or {aedge} {a}) if ({a} == 1'b{level}) {vid(q)} <= 1'b{at.get('ARST_VAL', '0')}; else begin {stmt} end")
+            else:
+                logic.append(f"always @({edge} {ref(ck)}) {stmt}")
         elif kind == "IobOut":
             i, pad = pin("I"), pin("PAD")
             if i and pad and i != pad and pad not in out_ports:
@@ -344,7 +352,7 @@ def check(files: list[str], top: str | None, cycles: int, seed: int, work: str, 
     # have no asynchronous input). The two agree when reset is applied at
     # start-up, which is what is checked; a reset pulsed between clock edges
     # of a running design reaches non-reset registers one edge apart.
-    async_as_sync = "asynchronous set/reset is built as synchronous" in r.stderr
+    async_as_sync = "is built as synchronous" in r.stderr and not os.environ.get("SVCHECK_PULSES")
     soft = [k for k in ("SIM_ONLY", "NO_BODY", "WIDE_CONE", "ASSIGN_NOT_LOWERED", "GENERATE_NOT_LOWERED", "FLATTEN_CAP",
                         "WIDTH_OVERFLOW", "WORD_PIPELINE_CAP", "GATE_PRIMITIVE") if nl.dattrs.get(k) == "1"]
     if soft:
