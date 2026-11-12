@@ -1287,6 +1287,20 @@ impl FeatureMap {
             bits.insert(format!("IMUX[{m}][7]"), cursor);
             cursor += 1;
         }
+        // 5. General interconnect (see [`tracks`]): one track-mode flag per
+        // IMUX, then the switch-box select of every outgoing wire.
+        debug_assert_eq!(cursor, tracks::ABS_IMUXT);
+        for m in 0..64u32 {
+            bits.insert(format!("IMUXT[{m}]"), tracks::ABS_IMUXT + m);
+        }
+        for d in 0..4u32 {
+            for t in 0..tracks::TRACKS {
+                for b in 0..tracks::SB_SEL_BITS {
+                    bits.insert(format!("SB[{d}][{t}][{b}]"), tracks::sb_abs(d, t, b));
+                }
+            }
+        }
+        cursor = tracks::sb_abs(3, tracks::TRACKS - 1, tracks::SB_SEL_BITS - 1) + 1;
         let _ = cursor;
         Self {
             bits,
@@ -1866,5 +1880,70 @@ mod tests {
         );
         assert!(d.resolve_cell_site("ghost", fake).is_err());
         assert!(d.resolve_cell_site("", s0).is_err());
+    }
+}
+
+/// General interconnect of the HL10T fabric.
+///
+/// Every CLB tile drives `TRACKS` single-length wires towards each of its
+/// four neighbours. The wire leaving tile `(x, y)` in direction `d` on
+/// track `t` arrives in the neighbour on that side. Its driver is a mux in
+/// the sending tile (the switch box), selected by `SB[d][t]`:
+///
+/// | select | source |
+/// |---|---|
+/// | 0 | off (the wire reads 0) |
+/// | 1..=8 | output of local BLE `select - 1` (flop Q when the flop is used, else LUT O) |
+/// | 9..=16 | LUT O of local BLE `select - 9` |
+/// | 17 + side*TRACKS + track | the wire arriving from the neighbour on `side` |
+///
+/// A LUT input reads a wire when its `IMUXT` flag is set: its IMUX select
+/// is then `side*TRACKS + track` of an arriving wire. Without the flag the IMUX
+/// keeps its direct-neighbour meaning.
+///
+/// The pad under a column connects to the bottom CLB of that column: an
+/// output pad (`IOB_TRACK_OUT`) reads that CLB's south-going wire on the
+/// track in its word; an input pad (`IOB_INPUT`) drives all the wires
+/// arriving in that CLB from the south.
+pub mod tracks {
+    /// Wires per direction per tile.
+    pub const TRACKS: u32 = 16;
+    pub const SB_SEL_BITS: u32 = 7;
+    /// Directions: north is y + 1, east is x + 1.
+    pub const N: u32 = 0;
+    pub const E: u32 = 1;
+    pub const S: u32 = 2;
+    pub const W: u32 = 3;
+    pub const SB_OFF: u32 = 0;
+    pub const SB_BLE_OUT: u32 = 1;
+    pub const SB_LUT_O: u32 = 9;
+    pub const SB_WIRE: u32 = 17;
+    /// Absolute CLB feature bit of `IMUXT[0]`.
+    pub const ABS_IMUXT: u32 = 1104;
+    /// Absolute CLB feature bit of `SB[0][0][0]`.
+    pub const ABS_SB: u32 = ABS_IMUXT + 64;
+    /// IOB word (minor 0): output pad reads a track.
+    pub const IOB_TRACK_OUT: u32 = 40;
+    /// IOB word: track index, 4 bits from here.
+    pub const IOB_TRACK_SHIFT: u32 = 41;
+    /// IOB word: the pad is an input.
+    pub const IOB_INPUT: u32 = 45;
+
+    pub const fn sb_abs(dir: u32, track: u32, bit: u32) -> u32 {
+        ABS_SB + (dir * TRACKS + track) * SB_SEL_BITS + bit
+    }
+
+    pub const fn opposite(dir: u32) -> u32 {
+        (dir + 2) % 4
+    }
+
+    /// Neighbour of `(x, y)` on side `dir`; `None` below zero.
+    pub fn step(x: u32, y: u32, dir: u32) -> Option<(u32, u32)> {
+        match dir {
+            N => Some((x, y + 1)),
+            E => Some((x + 1, y)),
+            S => y.checked_sub(1).map(|y| (x, y)),
+            _ => x.checked_sub(1).map(|x| (x, y)),
+        }
     }
 }

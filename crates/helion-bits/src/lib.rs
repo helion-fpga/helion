@@ -177,7 +177,18 @@ fn program_clb_frames(
     let feat = clb_feat(dev)?;
     let fb = feat.frame_bits;
     let packed = &routed.placed.packed;
+    // With the full connection list, a LUT input nothing drives must not
+    // matter: the table is made independent of it (the IR reads it as 0).
+    let full = routed.tracks.active;
     for (i, lutff) in packed.lutffs.iter().enumerate() {
+        let mut norm;
+        let lutff = if full {
+            norm = lutff.clone();
+            norm.init = effective_init(routed, i, lutff.init);
+            &norm
+        } else {
+            lutff
+        };
         let (site, ble) = routed.placed.lutff_sites[i];
         let major = dev
             .clb_major(site.x, site.y)
@@ -223,6 +234,34 @@ fn program_clb_frames(
             or_clb_bit(frames, major, abs, fb);
         }
     }
+    // General interconnect: LUT inputs reading a wire (track-mode flag plus
+    // the wire index in the select), and the switch-box select of each wire.
+    use helion_device::tracks as tk;
+    for m in &routed.tracks.imux {
+        let major = dev
+            .clb_major(m.x, m.y)
+            .ok_or_else(|| format!("not a CLB site CLB_X{}Y{}", m.x, m.y))?;
+        if m.mux >= 64 || m.sel as u32 >= 4 * tk::TRACKS {
+            return Err(format!("bad wire-fed IMUX[{}] select {}", m.mux, m.sel));
+        }
+        or_clb_bit(frames, major, tk::ABS_IMUXT + m.mux, fb);
+        for b in 0..6u32 {
+            if (m.sel >> b) & 1 == 1 {
+                let abs = if b < 5 { feat.imux0_abs + m.mux * 5 + b } else { feat.imux5_abs + m.mux };
+                or_clb_bit(frames, major, abs, fb);
+            }
+        }
+    }
+    for w in &routed.tracks.sb {
+        let major = dev
+            .clb_major(w.x, w.y)
+            .ok_or_else(|| format!("switch box outside the CLB array at X{}Y{}", w.x, w.y))?;
+        for b in 0..tk::SB_SEL_BITS {
+            if (w.sel as u32 >> b) & 1 == 1 {
+                or_clb_bit(frames, major, tk::sb_abs(w.dir as u32, w.track as u32, b), fb);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -264,14 +303,33 @@ pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
             )
         });
     }
+    use helion_device::tracks as tk;
     for r in &routed.iob_src {
         let major = dev
             .iob_major(r.iob.0, r.iob.1)
             .ok_or_else(|| format!("IOB_X{}Y{} has no major", r.iob.0, r.iob.1))?;
         // bit0 USED, [3:1] BLE, [15:4] CLB y; [24:16] DRIVE/SLEW/PULLTYPE/DIFF_TERM/IN_TERM (0 = default)
         let elec = iob_elec_by_net.get(r.net.as_str()).copied().unwrap_or(0);
-        let word = 1u128 | ((r.ble as u128) << 1) | ((r.clb.1 as u128) << 4) | elec;
+        let word = match routed.tracks.iob_out.iter().find(|t| (t.x, t.y) == r.iob) {
+            // The pad reads a track of the CLB above it.
+            Some(t) => 1u128 | (1u128 << tk::IOB_TRACK_OUT) | ((t.track as u128) << tk::IOB_TRACK_SHIFT) | elec,
+            None => {
+                if routed.tracks.active && r.clb.0 != r.iob.0 {
+                    return Err(format!(
+                        "bitgen: pad IOB_X{}Y{} is driven from column {} but has no wire route",
+                        r.iob.0, r.iob.1, r.clb.0
+                    ));
+                }
+                1u128 | ((r.ble as u128) << 1) | ((r.clb.1 as u128) << 4) | elec
+            }
+        };
         acc.insert((Far::IOB, major, 0), word);
+    }
+    for i in &routed.tracks.iob_in {
+        let major = dev
+            .iob_major(i.x, i.y)
+            .ok_or_else(|| format!("IOB_X{}Y{} has no major", i.x, i.y))?;
+        acc.insert((Far::IOB, major, 0), 1u128 | (1u128 << tk::IOB_INPUT));
     }
     for (i, _m) in packed.macs.iter().enumerate() {
         let site = routed.placed.mac_sites[i];
@@ -1182,6 +1240,32 @@ pub fn diff_partial_bitstream(
     })
 }
 
+/// The table actually programmed for LUT `idx` holding `init`. With the
+/// full connection list, an input nothing drives must not matter, so the
+/// table is made independent of it (the netlist reads such a pin as 0).
+pub fn effective_init(routed: &Routed, idx: usize, init: u64) -> u64 {
+    if !routed.tracks.active {
+        return init;
+    }
+    let mut connected = 0u8;
+    for pc in &routed.placed.packed.conn.pins {
+        if pc.lutff as usize == idx {
+            connected |= 1 << pc.pin;
+        }
+    }
+    let mut init = init;
+    for pin in 0..6u32 {
+        if (connected >> pin) & 1 == 0 {
+            let mut t = 0u64;
+            for addr in 0..64u64 {
+                t |= ((init >> (addr & !(1 << pin))) & 1) << addr;
+            }
+            init = t;
+        }
+    }
+    init
+}
+
 /// Sub-millisecond in-place LUT6 `INIT` ECO patcher (`< 1 ms`, O(1) frame lookup).
 ///
 /// Directly updates the 64-bit truth table for `CLB_X{x}Y{y}.BLE{ble}` in `bits.frames`
@@ -1242,7 +1326,7 @@ pub fn patch_lut_init_cell(
         .position(|l| l.lut_cell == cell || l.ff_cell == cell)
         .ok_or_else(|| format!("eco: no LUT/FF cell {cell}"))?;
     let (site, ble) = routed.placed.lutff_sites[idx];
-    patch_lut_init(dev, bits, site.x, site.y, ble as u32, new_init)?;
+    patch_lut_init(dev, bits, site.x, site.y, ble as u32, effective_init(routed, idx, new_init))?;
     Ok((site.x, site.y, ble))
 }
 
@@ -3178,6 +3262,7 @@ mod tests {
                     iobs: vec![],
                     macs: vec![],
                     brams: vec![],
+                    conn: Default::default(),
                 },
                 lutff_sites: vec![],
                 iob_sites: vec![],
@@ -3196,6 +3281,7 @@ mod tests {
             congestion_y0: 0,
             congestion_cols: 0,
             congestion_rows: 0,
+            tracks: Default::default(),
         };
         let err = bitgen(&dev, &empty).unwrap_err();
         assert!(

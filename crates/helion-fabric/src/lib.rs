@@ -6,7 +6,7 @@ pub use helion_bits::{
     diff_partial_bitstream, encode_imux_hop, encode_pbits, patch_imux_sel, patch_lut_init,
     patch_lut_init_cell, readback_imux_sel, reroute_probe_eco,
 };
-use helion_device::{Device, Far};
+use helion_device::{tracks, Device, Far};
 use helion_route::Routed;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -230,6 +230,15 @@ impl IlaTriggerFsm {
     }
 }
 
+/// Driver of an interconnect wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WireSrc {
+    Zero,
+    Pad(u32, u32),
+    BleOut(u32, u32, u32),
+    LutO(u32, u32, u8),
+}
+
 #[derive(Clone, Debug)]
 pub struct Fabric {
     pub idcode: u32,
@@ -247,6 +256,8 @@ pub struct Fabric {
     iobs: BTreeMap<(u32, u32), bool>,
     /// IOB (x,y) → (clb_x, clb_y, ble)
     iob_src: BTreeMap<(u32, u32), (u32, u32, u8)>,
+    /// Input pad values, set by the test bench.
+    pad_in: BTreeMap<(u32, u32), bool>,
     pub stat: Stat,
     cfg_steps: u32,
     /// Runtime BRAM data plane (capture RAM / dual-port writes). Seeded empty on program;
@@ -285,6 +296,7 @@ impl Fabric {
             used: Vec::new(),
             iobs,
             iob_src: BTreeMap::new(),
+            pad_in: BTreeMap::new(),
             stat: Stat::reset(),
             cfg_steps: 0,
             bram_data: BTreeMap::new(),
@@ -323,7 +335,7 @@ impl Fabric {
             })
             .collect();
         for ((block, major, minor), word) in &self.frames {
-            if *block == Far::IOB && *minor == 0 && (word & 1) == 1 {
+            if *block == Far::IOB && *minor == 0 && (word & 1) == 1 && (word >> tracks::IOB_TRACK_OUT) & 1 == 0 && (word >> tracks::IOB_INPUT) & 1 == 0 {
                 let ble = ((*word >> 1) & 7) as u8;
                 let cy = ((*word >> 4) & 0xfff) as u32;
                 let dx = *major as u32;
@@ -427,7 +439,102 @@ impl Fabric {
             }
             return None;
         }
+        if let Some(rest) = feature.strip_prefix("IMUXT[") {
+            let m: u32 = rest.strip_suffix(']')?.parse().ok()?;
+            return (m < 64).then_some(tracks::ABS_IMUXT + m);
+        }
+        if let Some(rest) = feature.strip_prefix("SB[") {
+            let mut it = rest.strip_suffix(']')?.split("][");
+            let d: u32 = it.next()?.parse().ok()?;
+            let t: u32 = it.next()?.parse().ok()?;
+            let b: u32 = it.next()?.parse().ok()?;
+            return (d < 4 && t < tracks::TRACKS && b < tracks::SB_SEL_BITS).then_some(tracks::sb_abs(d, t, b));
+        }
         None
+    }
+
+    /// CLB configuration bit by absolute feature index.
+    fn clb_abs_bit(&self, x: u32, y: u32, abs: u32) -> bool {
+        match self.clb_major(x, y) {
+            Some(major) => self.frame_bit(Far::CLB_IO_CLK, major, (abs / 128) as u8, (abs % 128) as u8),
+            None => false,
+        }
+    }
+
+    /// Switch-box select of the wire leaving `(x, y)` towards `dir` on `track`.
+    fn sb_sel(&self, x: u32, y: u32, dir: u32, track: u32) -> u32 {
+        (0..tracks::SB_SEL_BITS).fold(0, |s, b| s | ((self.clb_abs_bit(x, y, tracks::sb_abs(dir, track, b)) as u32) << b))
+    }
+
+    fn iob_word(&self, x: u32, y: u32) -> u128 {
+        if y != self.clb_y0.saturating_sub(1) || x < self.clb_x0 || x - self.clb_x0 >= self.interior_cols {
+            return 0;
+        }
+        self.frames.get(&(Far::IOB, (x - self.clb_x0) as u16, 0)).copied().unwrap_or(0)
+    }
+
+    /// What drives the wire leaving `(x, y)` towards `dir` on `track`:
+    /// follow the switch boxes back to a BLE output or an input pad.
+    fn wire_src(&self, x: u32, y: u32, dir: u32, track: u32) -> WireSrc {
+        let (mut x, mut y, mut dir, mut track) = (x, y, dir, track);
+        // A configured route is a tree; the bound only stops a bad loop.
+        for _ in 0..(4 * tracks::TRACKS * (self.interior_cols + 2) * (self.interior_rows + 2)) {
+            if self.clb_major(x, y).is_none() {
+                // The pad row: an input pad drives its north-going wires.
+                let w = self.iob_word(x, y);
+                return if dir == tracks::N && w & 1 == 1 && (w >> tracks::IOB_INPUT) & 1 == 1 { WireSrc::Pad(x, y) } else { WireSrc::Zero };
+            }
+            let sel = self.sb_sel(x, y, dir, track);
+            if sel == tracks::SB_OFF {
+                return WireSrc::Zero;
+            }
+            if sel < tracks::SB_LUT_O {
+                return WireSrc::BleOut(x, y, sel - tracks::SB_BLE_OUT);
+            }
+            if sel < tracks::SB_WIRE {
+                return WireSrc::LutO(x, y, (sel - tracks::SB_LUT_O) as u8);
+            }
+            let (side, t) = ((sel - tracks::SB_WIRE) / tracks::TRACKS, (sel - tracks::SB_WIRE) % tracks::TRACKS);
+            if side >= 4 {
+                return WireSrc::Zero;
+            }
+            let Some((nx, ny)) = tracks::step(x, y, side) else { return WireSrc::Zero };
+            (x, y, dir, track) = (nx, ny, tracks::opposite(side), t);
+        }
+        WireSrc::Zero
+    }
+
+    fn src_val(&self, src: WireSrc) -> bool {
+        match src {
+            WireSrc::Zero => false,
+            WireSrc::Pad(x, y) => self.pad_in.get(&(x, y)).copied().unwrap_or(false),
+            WireSrc::BleOut(x, y, b) => self.ble_out(x, y, b),
+            WireSrc::LutO(x, y, b) => self.lut_o_at(x, y, b),
+        }
+    }
+
+    fn wire_val(&self, x: u32, y: u32, dir: u32, track: u32) -> bool {
+        self.src_val(self.wire_src(x, y, dir, track))
+    }
+
+    /// Driver of the wire arriving in `(x, y)` from the neighbour on `side`.
+    fn arriving_src(&self, x: u32, y: u32, side: u32, track: u32) -> WireSrc {
+        match tracks::step(x, y, side) {
+            Some((nx, ny)) => self.wire_src(nx, ny, tracks::opposite(side), track),
+            None => WireSrc::Zero,
+        }
+    }
+
+    /// Drive an input pad (takes effect at the next evaluation).
+    pub fn set_pad_in(&mut self, x: u32, y: u32, v: bool) {
+        self.pad_in.insert((x, y), v);
+    }
+
+    /// Settle the combinational logic and the pads on the current flop and
+    /// input values, without a clock edge.
+    pub fn settle(&mut self) {
+        self.eval_comb();
+        self.eval_iob();
     }
 
     pub fn frame_bit(&self, block: u8, major: u16, minor: u8, bit: u8) -> bool {
@@ -452,13 +559,11 @@ impl Fabric {
     }
 
     pub fn lut_init(&self, x: u32, y: u32, ble: u32) -> u64 {
-        let mut init = 0u64;
-        for i in 0..64u32 {
-            if self.clb_feature_bit(x, y, &format!("BLE{ble}.LUT.INIT[{i}]")) {
-                init |= 1u64 << i;
-            }
-        }
-        init
+        // INIT of BLE n is absolute bits n*64 .. n*64+63: half a frame word.
+        let Some(major) = self.clb_major(x, y) else { return 0 };
+        let abs = ble * 64;
+        let word = self.frames.get(&(Far::CLB_IO_CLK, major, (abs / 128) as u8)).copied().unwrap_or(0);
+        (word >> (abs % 128)) as u64
     }
 
     /// Evaluate LUT6 with given 6-bit address (I0 = LSB).
@@ -468,9 +573,13 @@ impl Fabric {
     }
 
     fn imux_sel(&self, x: u32, y: u32, mux: u32) -> u8 {
+        // Same layout as `abs_feature`: sel[4:0] packed per mux, then one
+        // bank each for bits 5, 6 and 7.
+        const BASE: u32 = 512 + 40 + 40;
         let mut s = 0u8;
         for b in 0..8u32 {
-            if self.clb_feature_bit(x, y, &format!("IMUX[{mux}][{b}]")) {
+            let abs = if b < 5 { BASE + mux * 5 + b } else { BASE + 64 * 5 + (b - 5) * 64 + mux };
+            if self.clb_abs_bit(x, y, abs) {
                 s |= 1 << b;
             }
         }
@@ -630,21 +739,58 @@ impl Fabric {
 
     fn eval_comb(&mut self) {
         let coords = self.used.clone();
-        // Multi-pass so local LUT-O feedback (sel 24+k) settles.
-        for _ in 0..8 {
-            for (x, y) in &coords {
-                let (x, y) = (*x, *y);
-                for ble in 0..self.n_ble {
-                    let mut addr = 0u8;
-                    for pin in 0..6u32 {
-                        let sel = self.imux_sel(x, y, ble * 8 + pin);
-                        if self.decode_imux(x, y, sel) {
-                            addr |= 1 << pin;
-                        }
-                    }
-                    let o = self.eval_lut(x, y, ble, addr);
-                    self.clbs.get_mut(&(x, y)).unwrap().lut_o[ble as usize] = o;
+        // Passes until nothing changes: LUT outputs feed other LUTs, in
+        // the same tile (sel 24+k) and across tiles (wires). The bound only
+        // stops a combinational loop.
+        let traced = self.traced_inputs(&coords);
+        for pass in 0..4096 {
+            let before: Vec<[bool; 8]> = if pass >= 8 { coords.iter().map(|c| self.clbs[c].lut_o).collect() } else { Vec::new() };
+            self.eval_comb_pass(&coords, &traced);
+            if pass >= 8 && coords.iter().zip(&before).all(|(c, b)| self.clbs[c].lut_o == *b) {
+                break;
+            }
+        }
+    }
+
+    /// Source of every LUT input that reads a wire, traced once: the
+    /// configuration does not change while the logic settles.
+    fn traced_inputs(&self, coords: &[(u32, u32)]) -> Vec<Option<WireSrc>> {
+        let mut out = Vec::with_capacity(coords.len() * self.n_ble as usize * 6);
+        for &(x, y) in coords {
+            for ble in 0..self.n_ble {
+                for pin in 0..6u32 {
+                    let mux = ble * 8 + pin;
+                    out.push(self.clb_abs_bit(x, y, tracks::ABS_IMUXT + mux).then(|| {
+                        let s = self.imux_sel(x, y, mux) as u32 & 63;
+                        self.arriving_src(x, y, s / tracks::TRACKS, s % tracks::TRACKS)
+                    }));
                 }
+            }
+        }
+        out
+    }
+
+    fn eval_comb_pass(&mut self, coords: &[(u32, u32)], traced: &[Option<WireSrc>]) {
+        let mut k = 0usize;
+        for (x, y) in coords {
+            let (x, y) = (*x, *y);
+            for ble in 0..self.n_ble {
+                let mut addr = 0u8;
+                for pin in 0..6u32 {
+                    let v = match traced[k] {
+                        Some(src) => self.src_val(src),
+                        None => {
+                            let sel = self.imux_sel(x, y, ble * 8 + pin);
+                            self.decode_imux(x, y, sel)
+                        }
+                    };
+                    k += 1;
+                    if v {
+                        addr |= 1 << pin;
+                    }
+                }
+                let o = self.eval_lut(x, y, ble, addr);
+                self.clbs.get_mut(&(x, y)).unwrap().lut_o[ble as usize] = o;
             }
         }
     }
@@ -682,6 +828,17 @@ impl Fabric {
                 *v = false;
             }
             return;
+        }
+        // Pads reading a track: the south-going wire of the CLB above.
+        let iy = self.clb_y0.saturating_sub(1);
+        for dx in 0..self.interior_cols {
+            let ix = self.clb_x0 + dx;
+            let w = self.iob_word(ix, iy);
+            if w & 1 == 1 && (w >> tracks::IOB_TRACK_OUT) & 1 == 1 {
+                let t = ((w >> tracks::IOB_TRACK_SHIFT) & (tracks::TRACKS as u128 - 1)) as u32;
+                let v = self.wire_val(ix, iy + 1, tracks::S, t);
+                self.iobs.insert((ix, iy), v);
+            }
         }
         let srcs = self.iob_src.clone();
         for ((ix, iy), (cx, cy, ble)) in srcs {
@@ -859,7 +1016,7 @@ impl Fabric {
                 let dx = major as u32;
                 let ix = self.clb_x0 + dx;
                 let iy = self.clb_y0.saturating_sub(1);
-                if (word & 1) == 1 {
+                if (word & 1) == 1 && (word >> tracks::IOB_TRACK_OUT) & 1 == 0 && (word >> tracks::IOB_INPUT) & 1 == 0 {
                     let ble = ((word >> 1) & 7) as u8;
                     let cy = ((word >> 4) & 0xfff) as u32;
                     let cx = ix;

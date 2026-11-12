@@ -35,9 +35,9 @@ use super::{ImplStrategy, Mode, PrjPblock, Session};
 use helion_bits::Bitstream;
 use helion_device::{Device, Site, SiteKind};
 use helion_ir::Design;
-use helion_pack::{Packed, PackedBram, PackedIob, PackedLutFf, PackedMac};
+use helion_pack::{Connectivity, NetSrc, Packed, PackedBram, PackedInput, PackedIob, PackedLutFf, PackedMac, PinConn};
 use helion_place::Placed;
-use helion_route::{ImuxRoute, IobRoute, Routed};
+use helion_route::{ImuxRoute, IobInput, IobRoute, IobTrack, Routed, SbRoute, TrackRoutes};
 use helion_sta::Constraints;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -498,6 +498,134 @@ fn enc_packed(w: &mut Writer, p: &Packed) {
             w.u64(*word);
         }
     }
+    enc_conn(w, &p.conn);
+}
+
+fn enc_src(w: &mut Writer, s: NetSrc) {
+    let (k, v) = match s {
+        NetSrc::BleQ(i) => (0, i),
+        NetSrc::BleO(i) => (1, i),
+        NetSrc::Input(i) => (2, i),
+    };
+    w.u8(k);
+    w.u32(v);
+}
+
+fn dec_src(r: &mut Reader) -> Result<NetSrc, String> {
+    let k = r.u8()?;
+    let v = r.u32()?;
+    match k {
+        0 => Ok(NetSrc::BleQ(v)),
+        1 => Ok(NetSrc::BleO(v)),
+        2 => Ok(NetSrc::Input(v)),
+        _ => Err(format!("checkpoint: bad net source kind {k}")),
+    }
+}
+
+/// The connection list follows the packed design. Checkpoints written
+/// before it existed simply end there and load with an empty list.
+fn enc_conn(w: &mut Writer, c: &Connectivity) {
+    w.u32(c.pins.len() as u32);
+    for p in &c.pins {
+        w.u32(p.lutff);
+        w.u8(p.pin);
+        enc_src(w, p.src);
+    }
+    w.u32(c.inputs.len() as u32);
+    for i in &c.inputs {
+        w.str(&i.net);
+        w.str(&i.port);
+        w.opt_str(&i.loc);
+    }
+    w.u32(c.iob_src.len() as u32);
+    for (cell, src) in &c.iob_src {
+        w.str(cell);
+        enc_src(w, *src);
+    }
+    w.u32(c.undriven.len() as u32);
+    for u in &c.undriven {
+        w.str(u);
+    }
+}
+
+fn dec_conn(r: &mut Reader) -> Result<Connectivity, String> {
+    let mut c = Connectivity::default();
+    if r.pos >= r.buf.len() {
+        return Ok(c);
+    }
+    for _ in 0..r.u32()? {
+        c.pins.push(PinConn { lutff: r.u32()?, pin: r.u8()?, src: dec_src(r)? });
+    }
+    for _ in 0..r.u32()? {
+        c.inputs.push(PackedInput { net: r.str()?, port: r.str()?, loc: r.opt_str()? });
+    }
+    for _ in 0..r.u32()? {
+        let cell = r.str()?;
+        c.iob_src.insert(cell, dec_src(r)?);
+    }
+    for _ in 0..r.u32()? {
+        c.undriven.push(r.str()?);
+    }
+    Ok(c)
+}
+
+fn enc_tracks(w: &mut Writer, t: &TrackRoutes) {
+    w.u8(t.active as u8);
+    w.u32(t.sb.len() as u32);
+    for s in &t.sb {
+        w.u32(s.x);
+        w.u32(s.y);
+        w.u8(s.dir);
+        w.u8(s.track);
+        w.u8(s.sel);
+    }
+    w.u32(t.imux.len() as u32);
+    for im in &t.imux {
+        w.u32(im.x);
+        w.u32(im.y);
+        w.u32(im.mux);
+        w.u8(im.sel);
+    }
+    w.u32(t.iob_out.len() as u32);
+    for o in &t.iob_out {
+        w.u32(o.x);
+        w.u32(o.y);
+        w.u8(o.track);
+    }
+    w.u32(t.iob_in.len() as u32);
+    for i in &t.iob_in {
+        w.u32(i.x);
+        w.u32(i.y);
+        w.u32(i.input);
+        w.str(&i.net);
+    }
+    w.u32(t.nets);
+    w.u32(t.iters);
+    w.u32(t.undriven);
+}
+
+fn dec_tracks(r: &mut Reader) -> Result<TrackRoutes, String> {
+    let mut t = TrackRoutes::default();
+    if r.pos >= r.buf.len() {
+        return Ok(t);
+    }
+    t.active = r.u8()? != 0;
+    for _ in 0..r.u32()? {
+        t.sb.push(SbRoute { x: r.u32()?, y: r.u32()?, dir: r.u8()?, track: r.u8()?, sel: r.u8()? });
+    }
+    for _ in 0..r.u32()? {
+        t.imux.push(ImuxRoute { x: r.u32()?, y: r.u32()?, mux: r.u32()?, sel: r.u8()? });
+    }
+    for _ in 0..r.u32()? {
+        t.iob_out.push(IobTrack { x: r.u32()?, y: r.u32()?, track: r.u8()? });
+    }
+    for _ in 0..r.u32()? {
+        t.iob_in.push(IobInput { x: r.u32()?, y: r.u32()?, input: r.u32()?, net: r.str()? });
+    }
+    t.nets = r.u32()?;
+    t.iters = r.u32()?;
+    t.undriven = r.u32()?;
+    Ok(t)
 }
 
 fn dec_packed(r: &mut Reader) -> Result<Packed, String> {
@@ -556,6 +684,7 @@ fn dec_packed(r: &mut Reader) -> Result<Packed, String> {
         iobs,
         macs,
         brams,
+        conn: dec_conn(r)?,
     })
 }
 
@@ -686,6 +815,7 @@ fn enc_routed(w: &mut Writer, rt: &Routed) {
     w.u32(rt.pathfinder_iters);
     w.u32(rt.overused);
     w.u32(rt.imux_skip);
+    enc_tracks(w, &rt.tracks);
 }
 
 fn dec_routed(r: &mut Reader) -> Result<Routed, String> {
@@ -711,6 +841,7 @@ fn dec_routed(r: &mut Reader) -> Result<Routed, String> {
     let pathfinder_iters = r.u32()?;
     let overused = r.u32()?;
     let imux_skip = r.u32()?;
+    let tracks = dec_tracks(r)?;
     Ok(Routed {
         placed,
         iob_src,
@@ -725,6 +856,7 @@ fn dec_routed(r: &mut Reader) -> Result<Routed, String> {
         congestion_y0: 0,
         congestion_cols: 0,
         congestion_rows: 0,
+        tracks,
     })
 }
 
@@ -1404,6 +1536,11 @@ mod tests {
         let b1 = rc.session.bitstream.as_ref().unwrap();
         assert_eq!(b0.frames, b1.frames);
         assert_eq!(b0.idcode, b1.idcode);
+        // The restored design still knows its wiring: generating the
+        // bitstream again from it gives the same frames.
+        assert!(r1.tracks.active && r1.tracks.sb == r0.tracks.sb);
+        assert_eq!(r1.placed.packed.conn.pins, r0.placed.packed.conn.pins);
+        assert_eq!(helion_bits::bitgen(&dev, &r1).expect("bitgen restored").frames, b0.frames);
 
         // Diff of identical metas is zero.
         let d = diff_metas(&metas[0], &rc.meta);

@@ -420,14 +420,18 @@ pub fn check_routed(design: &Design, routed: &Routed, dev: &Device) -> Drc {
         .iter()
         .map(|l| l.q_net.as_str())
         .collect();
+    let conn = &routed.placed.packed.conn;
     for iob in &routed.placed.packed.iobs {
-        if !driver_nets.contains(iob.from_net.as_str()) {
+        if !driver_nets.contains(iob.from_net.as_str()) && !conn.iob_src.contains_key(&iob.cell) {
             d.add_warn(
                 "ROUTE-3",
                 &iob.cell,
                 format!("IOB {} net {} has no LUT/FF driver", iob.cell, iob.from_net),
             );
         }
+    }
+    for u in &conn.undriven {
+        d.add_warn("ROUTE-4", u, format!("LUT input {u} has no driver and reads 0"));
     }
     d
 }

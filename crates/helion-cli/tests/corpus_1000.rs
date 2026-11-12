@@ -700,24 +700,7 @@ fn evaluate_case(case: &CorpusCase) -> StageMetrics {
             return Err("cannot pack/place empty NO_BODY design (0 cells)".to_string());
         }
         let mut packed = pack(&design, dev)?;
-        let iob_budget = dev.iob_sites().count();
-        let q_nets: HashSet<&str> = packed.lutffs.iter().map(|l| l.q_net.as_str()).collect();
-        let driven: Vec<_> = packed
-            .iobs
-            .iter()
-            .filter(|io| q_nets.contains(io.from_net.as_str()))
-            .cloned()
-            .collect();
-        let undriven = packed.iobs.len().saturating_sub(driven.len());
-        if packed.iobs.len() > iob_budget || undriven > 0 {
-            let keep = driven.len().min(iob_budget);
-            let keep = if packed.lutffs.len() > 2000 {
-                keep.min(4)
-            } else {
-                keep
-            };
-            packed.iobs = driven.into_iter().take(keep).collect();
-        }
+        let _ = packed.fit_pads(dev.iob_sites().count());
         let placed = place_with_guide(
             &packed,
             dev,
