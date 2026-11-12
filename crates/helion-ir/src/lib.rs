@@ -1,6 +1,8 @@
 //! Helion netlist IR (HNF). Structural cells, attributes, hierarchy, round-trip.
 
 mod opt;
+mod remap;
+pub use remap::RemapStats;
 
 pub use opt::LutOptStats;
 
