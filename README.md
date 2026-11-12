@@ -24,8 +24,8 @@
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/ide-summary.png" alt="Helion IDE Project Summary after implementing the full Ibex RV32 core" width="900"><br>
-  <em>The Project Summary after running implementation on the full ysyx Ibex RV32 core (HL10S-C64-1).</em>
+  <img src="docs/screenshots/ide-summary.png" alt="Helion IDE Project Summary after a complete implementation run of the counter example" width="900"><br>
+  <em>The Project Summary after a full run of <code>examples/counter.prj</code>: synthesized, placed, routed and timed (WNS 9.640 ns, the CI gold number).</em>
 </p>
 
 ## What is Helion
@@ -52,11 +52,15 @@ documentation projects. No vendor tools, libraries or databases are needed.
 
 ## Screenshots
 
-Every screenshot is the IDE on a real run of the full Ibex RV32 core, not a mock-up.
+The views below are the IDE on a real run of the full ysyx Ibex RV32 core
+(`examples/ibex_core.prj`, ~19k cells on HL10S-C64-1), not mock-ups. A core
+this size does not yet place and route completely: the IDE reports the
+unrouted nets as a critical warning and refuses the bitstream, and you can
+see that in the console and status bar.
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/ide-device.png" alt="Device view of the Ibex design on the die"><br><sub><b>Device.</b> Ibex placed on the die, with nets drawn.</sub></td>
+    <td width="50%"><img src="docs/screenshots/ide-device.png" alt="Device view of the Ibex design on the die"><br><sub><b>Device.</b> Ibex on the HL10S die: placed cells, net spans, I/O ports, find and inspector.</sub></td>
     <td width="50%"><img src="docs/screenshots/ide-timing.png" alt="Timing analysis view"><br><sub><b>Timing.</b> Intra-clock paths from static timing analysis.</sub></td>
   </tr>
   <tr>
