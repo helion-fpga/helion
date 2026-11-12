@@ -303,7 +303,7 @@ pub fn resolve_interfaces(
 
 /// Check if the kernel is a bare, pragma-free scalar kernel (e.g. `blinky`, `counter`, `mac1`, `mac2`)
 /// that should use the direct datapath emitter for 100% LUT INIT backward compatibility.
-fn is_simple_scalar_kernel(
+pub(crate) fn is_simple_scalar_kernel(
     func: &CFunction,
     cdfg: &Cdfg,
     all_directives: &[HlsDirective],
@@ -320,7 +320,34 @@ fn is_simple_scalar_kernel(
     if func.vars.iter().any(|v| v.is_stream || !v.dims.is_empty()) {
         return false;
     }
-    !has_complex_control(&func.body)
+    !has_complex_control(&func.body) && direct_safe_stmts(&func.body)
+}
+
+/// The flat datapath only renders `+ - * & | ^ << >> ~` faithfully
+/// (`expr_to_sv` has no divider, comparator or intrinsic lowering); any
+/// other operator goes to the FSMD emitter.
+fn direct_safe_stmts(stmts: &[CStmt]) -> bool {
+    fn expr_ok(e: &CExpr) -> bool {
+        match e {
+            CExpr::Num(_) | CExpr::Var(_) | CExpr::Deref(_) | CExpr::Slice(..) => true,
+            CExpr::Bit(_, i) => expr_ok(i),
+            CExpr::Index { indices, .. } => indices.iter().all(expr_ok),
+            CExpr::Unary { op, expr } => matches!(op, UnaryOp::BitNot | UnaryOp::Not | UnaryOp::Neg) && expr_ok(expr),
+            CExpr::Binary { op, lhs, rhs } => {
+                matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Shl | BinOp::Shr)
+                    && expr_ok(lhs)
+                    && expr_ok(rhs)
+            }
+            _ => false,
+        }
+    }
+    stmts.iter().all(|s| match s {
+        CStmt::Assign { rhs, .. } => expr_ok(rhs),
+        CStmt::Return(Some(e)) => expr_ok(e),
+        CStmt::For { body, .. } => direct_safe_stmts(body),
+        CStmt::If { .. } => false,
+        _ => true,
+    })
 }
 
 fn has_complex_control(stmts: &[CStmt]) -> bool {
@@ -343,14 +370,18 @@ fn has_complex_control(stmts: &[CStmt]) -> bool {
                 else_body,
                 ..
             } => {
-                if has_complex_control(then_body) || has_complex_control(else_body) {
+                // An `if` that returns is control flow the flat datapath
+                // cannot express (it would keep only the last `return`).
+                let returns = |b: &[CStmt]| b.iter().any(|s| matches!(s, CStmt::Return(_)));
+                if returns(then_body) || returns(else_body) || has_complex_control(then_body) || has_complex_control(else_body) {
                     return true;
                 }
             }
             _ => {}
         }
     }
-    false
+    // Several top-level returns: only the first one runs in C.
+    stmts.iter().filter(|s| matches!(s, CStmt::Return(_))).count() > 1
 }
 
 /// Emit synthesizable SystemVerilog for the compiled HLS kernel.
@@ -370,7 +401,13 @@ pub fn emit_rtl(
 
 /// Direct datapath emitter for simple pragma-free scalar kernels.
 /// Preserves exact LUT6 INITs on `blinky`, `counter(3)`, `counter(4)`, `mac1`, `mac2`.
-fn emit_direct_datapath_sv(func: &CFunction) -> Result<String, String> {
+pub(crate) fn emit_direct_datapath_sv(func: &CFunction) -> Result<String, String> {
+    emit_direct_datapath_sv_depth(func).map(|(sv, _)| sv)
+}
+
+/// [`emit_direct_datapath_sv`] plus the register depth from inputs to the
+/// outputs (each multiply adds an operand and a product register).
+pub(crate) fn emit_direct_datapath_sv_depth(func: &CFunction) -> Result<(String, u32), String> {
     let flat = unroll_stmts_flat(&func.body);
     if flat.is_empty() && func.vars.is_empty() {
         return Err("hls: empty body".into());
@@ -457,6 +494,18 @@ fn emit_direct_datapath_sv(func: &CFunction) -> Result<String, String> {
     for (n, w) in &extra_regs {
         sv.push_str(&format!("  logic [{}:0] {n};\n", w - 1));
     }
+    // Multiplies become a combinational DSP (`tmulNw = a * b`) registered
+    // into `tmulN`, so the DSP pass cannot absorb the operand registers as
+    // AREG/BREG (helion-sim then evaluates the product).
+    let mut nbas = nbas;
+    for l in nbas.iter_mut() {
+        if let Some((lhs, rhs)) = l.trim_end_matches(';').split_once(" <= ") {
+            if lhs.starts_with("tmul") && !lhs.starts_with("tmul_op") && rhs.contains(" * ") {
+                sv.push_str(&format!("  logic [26:0] {lhs}w;\n  assign {lhs}w = {rhs};\n"));
+                *l = format!("{lhs} <= {lhs}w;");
+            }
+        }
+    }
     if !nbas.is_empty() {
         sv.push_str("  always_ff @(posedge clk) begin\n");
         for l in &nbas {
@@ -497,7 +546,7 @@ fn emit_direct_datapath_sv(func: &CFunction) -> Result<String, String> {
         }
     }
     sv.push_str("endmodule\n");
-    Ok(sv)
+    Ok((sv, 1 + 2 * mul_i as u32))
 }
 
 fn unroll_stmts_flat(stmts: &[CStmt]) -> Vec<CStmt> {
@@ -677,15 +726,14 @@ fn ensure_ident_operand(
     mul_i: &mut usize,
     tag: &str,
 ) -> String {
-    match e {
-        CExpr::Var(s) | CExpr::Deref(s) => s.clone(),
-        other => {
-            let tmp = format!("tmul_op_{tag}_{mul_i}");
-            extra_regs.push((tmp.clone(), 16));
-            nbas.push(format!("{tmp} <= {};", expr_to_sv(other)));
-            tmp
-        }
-    }
+    // Every operand is latched into a full-width register: a DSP pin on a
+    // bare port names the port's bus with no per-bit nets, which the gate
+    // simulator cannot evaluate, and a 16-bit temporary truncated operands.
+    let _ = e;
+    let tmp = format!("tmul_op_{tag}_{mul_i}");
+    extra_regs.push((tmp.clone(), 27));
+    nbas.push(format!("{tmp} <= {};", expr_to_sv(e)));
+    tmp
 }
 
 fn expr_to_sv(e: &CExpr) -> String {
@@ -788,7 +836,7 @@ fn expr_to_sv(e: &CExpr) -> String {
 /// - Multi-bank BRAMs (`(* ram_style = "block" *)`) or completely partitioned register files
 /// - DSP48E1 multiplier / MAC pipelines
 /// - Dataflow stage FIFO channels
-fn emit_vivado_hls_sv(
+pub(crate) fn emit_vivado_hls_sv(
     func: &CFunction,
     cdfg: &Cdfg,
     schedule: &ScheduleResult,

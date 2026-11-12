@@ -101,8 +101,8 @@ on Apple Silicon:
         die "error: rustup target $TARGET is not installed"
     fi
     printf 'cargo build --release --target %s\n' "$TARGET"
-    cargo build --release --target "$TARGET" --manifest-path "$ROOT/Cargo.toml" \
-        -p helion-cli -p helion-gui \
+    cargo build --locked --release --target "$TARGET" --manifest-path "$ROOT/Cargo.toml" \
+        -p helion-cli -p helion-rune \
         || die "error: cargo --target $TARGET failed (Apple linker / SDK required). this host is $uname_s/$uname_m."
     BIN_DIR="$ROOT/target/$TARGET/release"
     [ -f "$BIN_DIR/helion-ide" ] || die "missing $BIN_DIR/helion-ide"
@@ -172,6 +172,10 @@ else
     die "missing $ROOT/devices/helion"
 fi
 [ -f "$RES/devices/helion/parts/HL10T-C32-1.toml" ] || die "HAD missing in bundle"
+
+# Licenses: Helion's own, plus the vendored Rune UI framework (MIT) the IDE links.
+cp "$ROOT/LICENSE" "$RES/LICENSE"
+cp "$ROOT/third_party/rune/LICENSE" "$RES/LICENSE-RUNE"
 
 if [ -d "$ROOT/examples" ]; then
     for f in "$ROOT/examples"/*; do

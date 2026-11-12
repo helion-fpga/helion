@@ -1119,7 +1119,14 @@ pub fn synth_sv_with_sva(source: &str, origin: &str) -> Result<SvaSynthOut, Stri
     let base = origin_path
         .parent()
         .filter(|d| !d.as_os_str().is_empty() && d.exists());
-    let expanded = if let Some(dir) = base {
+    let expanded = if crate::line_cov::enabled() {
+        let (text, segs) = match base {
+            Some(dir) => crate::preprocess::expand_includes_mapped(source, dir, origin),
+            None => (source.to_string(), crate::line_cov::single_file(origin)),
+        };
+        crate::line_cov::set_pending_segs(segs);
+        text
+    } else if let Some(dir) = base {
         expand_includes(source, dir)
     } else {
         source.to_string()

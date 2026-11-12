@@ -18,6 +18,7 @@ helion-sv = { workspace = true }
 helion-pack = { workspace = true }
 helion-bits = { workspace = true }
 helion-drc = { workspace = true }
+helion-sim = { workspace = true }
 [[bench]]
 name = "sta"
 harness = false

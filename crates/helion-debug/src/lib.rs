@@ -17,6 +17,7 @@ use helion_route::route;
 pub mod bscan;
 pub mod insert;
 pub mod ltx;
+pub mod target;
 pub mod trigger;
 pub mod vio_axi;
 
@@ -36,6 +37,11 @@ pub use trigger::{
     ComparatorOp, IlaCapturedSegment, IlaSequencerCaptureResult, IlaSequencerConfig,
     IlaTriggerSequencer, MAX_TRIGGER_STATES, ProbeComparator, StateTransition, TriggerBoolOp,
     TriggerCondition, TriggerStateSpec, TriggerWindowPosition, run_sequencer_capture,
+};
+pub use target::{
+    AXI_BRAM_BASE, AXI_BRAM_STRIDE, AXI_BRAM_WORDS, DebugBuild, HwDebugTarget, HwIlaCapture,
+    NO_BOARD_MODEL,
+    HwIlaRun, HwTrigger, HwVioProbe, VALUE_COMPARE_BITS, implement_debug, value_compare_init,
 };
 pub use vio_axi::{
     AxiRegion, AxiResp, AxiTxnKind, HwAxiTxn, JtagAxiMaster, VioActivityKind, VioCore, VioProbeIn,

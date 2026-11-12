@@ -1,0 +1,53 @@
+[package]
+name = "helion-rune"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Helion Vivado-style IDE shell on Rune (from-scratch views, no egui)"
+
+[[bin]]
+# The shipped IDE binary (Helion.app, release tarballs, `helion gui`).
+name = "helion-ide"
+path = "src/main.rs"
+
+[dependencies]
+# Rune is vendored at one exact upstream commit (third_party/rune/VENDORED.md),
+# so a plain Helion clone or source tarball builds offline with no sibling
+# checkout. Update with scripts/sync-rune.sh.
+rune = { path = "../../third_party/rune/crates/rune", features = ["native-file-dialog"] }
+rune-kit = { path = "../../third_party/rune/crates/rune-kit" }
+# Real engine flows for runs.rs (same crates helion-ide --headless drives via
+# IdeModel; helion-rune never depends on the helion-gui lib itself).
+helion-device = { path = "../helion-device" }
+helion-drc = { path = "../helion-drc" }
+helion-ir = { path = "../helion-ir" }
+helion-pack = { path = "../helion-pack" }
+helion-place = { path = "../helion-place" }
+helion-proj = { path = "../helion-proj" }
+# Routed result kept for on-demand STA/DRC re-analysis (analysis.rs).
+helion-route = { path = "../helion-route" }
+helion-sta = { path = "../helion-sta" }
+helion-sv = { path = "../helion-sv" }
+helion-vhdl = { path = "../helion-vhdl" }
+helion-sim = { path = "../helion-sim" }
+# ILA capture + testbench runner engines (UI-free; extracted from helion-gui).
+helion-verif = { path = "../helion-verif" }
+# Hardware Manager (cable resolve / detect / program / STAT), IP catalog and
+# block design (same crates IdeModel drives).
+# usb-native: the native FTDI JTAG engine opens real cables through rusb.
+helion-hw = { path = "../helion-hw", features = ["usb-native"] }
+helion-bd = { path = "../helion-bd" }
+helion-ipxact = { path = "../helion-ipxact" }
+# Bitstream frames/packets kept in state (FAR table) and STAT bit names.
+helion-bits = { path = "../helion-bits" }
+helion-fabric = { path = "../helion-fabric" }
+# Hardware debug cores (Set Up Debug, hw ILA/VIO/JTAG-to-AXI over the sim TAP).
+helion-debug = { path = "../helion-debug" }
+# Saved waveform configurations (`.wcfg` JSON).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# HLS (C synthesis + gate-level C/RTL co-simulation) and the implementable
+# part registry / family flow dispatch (iCE40, ECP5, 7-series).
+helion-hls = { path = "../helion-hls" }
+helion-targets = { path = "../helion-targets" }

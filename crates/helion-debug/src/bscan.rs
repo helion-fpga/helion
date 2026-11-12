@@ -4,7 +4,7 @@
 //! cores (ILA, VIO, JTAG-to-AXI4-Lite Master, System Monitor bridge) using
 //! 64-bit hub-framed DR words.
 
-use helion_hw::{IR_USR1, Tap};
+use helion_hw::{IR_USR1, IR_USR2, IR_USR3, IR_USR4, JtagCable, Tap};
 
 /// Maximum number of debug cores attached to a single BSCAN Debug Hub.
 pub const MAX_BSCAN_SLOTS: usize = 16;
@@ -56,13 +56,13 @@ impl BscanUserChain {
         self as u8
     }
 
-    /// Corresponding 6-bit Helion TAP IR opcode (`USER1` = `0b000010`, etc.).
+    /// Corresponding 6-bit Helion TAP IR opcode (`helion_hw::IR_USR1..4`).
     pub fn tap_ir(self) -> u8 {
         match self {
             Self::User1 => IR_USR1,
-            Self::User2 => 0b000011 ^ 0b100000, // distinct user2 opcode
-            Self::User3 => 0b100010,
-            Self::User4 => 0b100011,
+            Self::User2 => IR_USR2,
+            Self::User3 => IR_USR3,
+            Self::User4 => IR_USR4,
         }
     }
 }
@@ -339,10 +339,22 @@ impl BscanDebugHub {
         opcode: u8,
         payload: u64,
     ) -> Result<BscanFrame, String> {
+        self.transact_via_cable(tap, slot_id, opcode, payload)
+    }
+
+    /// Shift the framed request as a real `IR_USR1` 64-bit DR scan on any
+    /// cable (sim TAP or native FTDI engine), then apply the hub model.
+    pub fn transact_via_cable(
+        &mut self,
+        cable: &mut dyn JtagCable,
+        slot_id: u8,
+        opcode: u8,
+        payload: u64,
+    ) -> Result<BscanFrame, String> {
         let req = BscanFrame::new(slot_id, opcode, payload);
-        tap.shift_ir(IR_USR1);
-        // Shift framed request word through the TAP 64-bit DR register (bit63=0 so USR1 does not treat as ptr reset).
-        let _tdo = tap.shift_dr_u64(req.encode() & !(1u64 << 63));
+        cable.shift_ir(IR_USR1)?;
+        // bit63=0 so USR1 does not treat the frame as a pointer reset.
+        let _tdo = cable.shift_dr_u64(req.encode() & !(1u64 << 63))?;
         self.transact(slot_id, opcode, payload)
     }
 

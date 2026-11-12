@@ -1,0 +1,6 @@
+# Helion project — the full ysyx Ibex RV32 core with every port kept, on the
+# mid-size HL10S part (the 32-pin HL10T cannot hold its ~10k LUTs or I/O).
+part HL10S-C64-1
+read_sv examples/ysyx_ibex.sv
+top ysyx_ibex
+read_xdc examples/ibex_core.sdc

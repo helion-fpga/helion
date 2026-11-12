@@ -1,147 +1,193 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="theme-color" content="#fbfbfa" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Start: download and build Helion</title>
-  <meta name="description" content="Install Helion 3.0.0 from GitHub Releases or build from source. Rust 1.85, cargo test, headless gold counter WNS_PS=9640." />
-  <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
-  <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=v4" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Get started with Helion</title>
+  <meta name="description" content="Install Helion from a release or build it from source with Rust 1.99.1, then check the gold: helion-ide --headless examples/counter.sv prints WNS_PS=9640.">
+  <meta name="theme-color" content="#fbfaf8" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0f1013" media="(prefers-color-scheme: dark)">
+  <link rel="canonical" href="https://helion-fpga.github.io/helion/start.html">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="favicon.png" type="image/png" sizes="32x32">
+  <link rel="apple-touch-icon" href="brand/apple-touch-icon.png">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Helion">
+  <meta property="og:title" content="Get started with Helion">
+  <meta property="og:description" content="Install Helion from a release or build it from source with Rust 1.99.1, then check the gold: helion-ide --headless examples/counter.sv prints WNS_PS=9640.">
+  <meta property="og:image" content="https://helion-fpga.github.io/helion/brand/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=5">
+  <script>try{var t=localStorage.getItem("helion-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
 </head>
 <body>
-  <a class="skip" href="#main">Skip to main content</a>
-  <header class="pill-nav" id="pillNav">
-    <a class="brand" href="index.html"><img src="brand/mark.png" alt="" width="30" height="30" /><span>Helion</span></a>
-    <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu"><span></span><span></span></button>
-    <nav id="site-nav">
-      <span class="limelight" aria-hidden="true"></span>
-      <a href="index.html">Home</a>
-      <a href="use.html">Use</a>
-      <a href="start.html" class="active">Start</a>
-      <a href="architecture.html">Architecture</a>
-      <a href="wiki.html">Wiki</a>
-      <a href="benchmarks.html">Benchmarks</a>
-      <a href="get-involved.html">Get involved</a>
-      <a href="https://github.com/helion-fpga/helion">GitHub</a>
-    </nav>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="wrap header-inner">
+      <a class="brand" href="index.html"><img src="brand/mark-48.png" alt="" width="30" height="30"><span>Helion</span></a>
+      <nav class="site-nav" id="site-nav" aria-label="Main">
+        <a href="start.html">Get started</a>
+        <a href="use.html">User guide</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="benchmarks.html">Benchmarks</a>
+        <a href="roadmap.html">Roadmap</a>
+        <a href="wiki.html">Docs</a>
+        <a href="get-involved.html">Community</a>
+      </nav>
+      <div class="header-actions">
+        <button type="button" class="icon-btn theme-toggle" aria-label="Switch theme"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+        <a class="icon-btn" href="https://github.com/helion-fpga/helion" aria-label="Helion on GitHub"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="gh-label">GitHub</span></a>
+        <button type="button" class="icon-btn nav-toggle" aria-controls="site-nav" aria-expanded="false" aria-label="Open menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+      </div>
+    </div>
   </header>
 
-  <main id="main" class="page">
-    <div class="prose">
-      <h1>Getting started</h1>
-      <p class="lede">
-        Install from a GitHub Release, or clone and run the gold. Native desktop
-        target is Apple Silicon (<code>aarch64-apple-darwin</code>). CI is Linux
-        (<code>x86_64-unknown-linux-gnu</code>). rustc 1.85.0.
-      </p>
+  <main id="main">
+    <div class="wrap page-head">
+      <h1>Get started</h1>
+      <p class="lede">Install a release or build from source, then check your install against the gold numbers. Helion runs on macOS (Apple Silicon) and Linux (x86_64).</p>
+    </div>
+    <div class="wrap doc">
+      <nav class="doc-nav" aria-label="On this page">
+        <p>On this page</p>
+        <ul>
+          <li><a href="#download">Download a release</a></li>
+          <li><a href="#requirements">Requirements for building</a></li>
+          <li><a href="#build">Build from source</a></li>
+          <li><a href="#first-run">First run</a></li>
+          <li><a href="#macos-app">The macOS app</a></li>
+          <li><a href="#device-data">Where device data comes from</a></li>
+          <li><a href="#next">Next steps</a></li>
+        </ul>
+      </nav>
+      <article class="prose">
+        <h2 id="download">Download a release</h2>
+        <p>Every tagged release on <a href="https://github.com/helion-fpga/helion/releases/latest">GitHub Releases</a> publishes the same set of files. The 4.0 release is in preparation; until it is tagged, the latest release is the 3.x line with the previous IDE.</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>File</th><th>Contents</th></tr></thead>
+          <tbody>
+            <tr><td><code>Helion-X.Y.Z-macos-arm64.zip</code></td><td><code>Helion.app</code> for Apple Silicon (ad-hoc signed, not notarized)</td></tr>
+            <tr><td><code>helion-X.Y.Z-aarch64-apple-darwin.tar.gz</code></td><td><code>helion</code>, <code>helion-ide</code>, <code>helion-prog</code>, device data (HAD), examples</td></tr>
+            <tr><td><code>helion-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz</code></td><td>The same for Linux x86_64</td></tr>
+            <tr><td><code>SHA256SUMS.txt</code></td><td>Checksums for every file</td></tr>
+          </tbody>
+        </table></div>
+        <p>On macOS, clear the quarantine flag once after moving the app to Applications:</p>
+        <pre><code>xattr -cr /Applications/Helion.app</code></pre>
+        <p>On Linux, the IDE needs <code>libxkbcommon0</code>, <code>libwayland-client0</code> and <code>libusb-1.0-0</code>, which desktop distributions already ship.</p>
 
-      <h2>Download (v3.0.0)</h2>
-      <p>
-        Each <code>vX.Y.Z</code> tag publishes these files. Current release is
-        <a href="https://github.com/helion-fpga/helion/releases/tag/v3.0.0">v3.0.0</a>
-        (Xilinx 7-series backend, verification track with SAT equivalence /
-        SVA / CDC, Physical View 2.0, 12 review criticals fixed, stack-overflow
-        fix; same counter gold WNS_PS=9640).
-      </p>
-      <div class="table-wrap"><table>
-        <thead><tr><th>File</th><th>What</th></tr></thead>
-        <tbody>
-          <tr><td><code>Helion-3.0.0-macos-arm64.zip</code></td><td><code>Helion.app</code> for Apple Silicon. Unsigned. Gatekeeper will warn.</td></tr>
-          <tr><td><code>helion-3.0.0-aarch64-apple-darwin.tar.gz</code></td><td>CLI + IDE + HAD + examples</td></tr>
-          <tr><td><code>helion-3.0.0-x86_64-unknown-linux-gnu.tar.gz</code></td><td>Linux CLI + headless IDE</td></tr>
-          <tr><td><code>SHA256SUMS.txt</code></td><td>hashes</td></tr>
-        </tbody>
-      </table></div>
-      <p class="cta">
-        <a class="btn" href="https://github.com/helion-fpga/helion/releases/latest">Latest release</a>
-        <a class="btn ghost" href="https://github.com/helion-fpga/helion/blob/master/CHANGELOG.md">Changelog</a>
-        <a class="btn ghost" href="roadmap.html">Roadmap</a>
-      </p>
+        <h2 id="requirements">Requirements for building</h2>
+        <ul>
+          <li><a href="https://rustup.rs">rustup</a> and Git. The repository pins Rust <strong>1.99.1</strong> in <code>rust-toolchain.toml</code>; rustup installs it on the first build. Older compilers cannot build the workspace.</li>
+          <li>Nothing else from outside the clone: the Rune UI framework is vendored in <code>third_party/rune</code> (MIT) and <code>Cargo.lock</code> pins every crates.io dependency.</li>
+          <li>Linux: the system libraries the IDE and the native JTAG driver link against.</li>
+          <li>macOS: Xcode Command Line Tools, to assemble <code>Helion.app</code>.</li>
+        </ul>
+        <pre><code>sudo apt-get install pkg-config libxkbcommon-dev libwayland-dev libusb-1.0-0-dev   <span class="c"># Debian/Ubuntu</span>
+sudo dnf install pkgconf libxkbcommon-devel wayland-devel libusb1-devel            <span class="c"># Fedora</span></code></pre>
 
-      <h2>Needs</h2>
-      <ul>
-        <li>Rust 1.85+ (<code>rustup toolchain install 1.85.0</code> then <code>rustup default 1.85.0</code>)</li>
-        <li>Git</li>
-        <li>On macOS: Xcode Command Line Tools for <code>Helion.app</code>, and <code>rustup target add aarch64-apple-darwin</code></li>
-      </ul>
-      <p>Native arm64 only. No Rosetta, no vendor bitstream, no Docker.</p>
-
-      <h2>Build and gold</h2>
-      <pre><code>git clone https://github.com/helion-fpga/helion.git
+        <h2 id="build">Build from source</h2>
+        <pre><code>git clone https://github.com/helion-fpga/helion.git
 cd helion
-cargo test --workspace
-cargo run -p helion-cli -- doctor
-cargo run -p helion-cli -- run examples/counter.sv --cycles 16
-cargo run -p helion-gui --bin helion-ide -- --headless examples/counter.sv</code></pre>
-      <p>
-        Empty-XDC counter gold is <span class="gold">WNS_PS=9640</span> and LED waveform
-        <code>LED[16]=0000000111111110</code> (LED = cnt[3]).
-        <code>helion doctor</code> must print the HAD path, <code>sites_clb=1024</code>,
-        <code>sites_iob=32</code>, and FeatureMap lines for <code>HL10T-C32-1</code>.
-      </p>
+cargo build --release --locked -p helion-cli -p helion-rune
+./target/release/helion --version        <span class="c"># CLI</span>
+./target/release/helion-ide --help       <span class="c"># IDE, and its windowless modes</span></code></pre>
+        <p>The first build compiles the whole workspace and takes a while. Later builds are incremental.</p>
 
-      <h2>Desktop IDE (macOS)</h2>
-      <pre><code>./scripts/build-macos-app.sh
-open dist/Helion.app
-dist/Helion.app/Contents/MacOS/Helion --version
-dist/Helion.app/Contents/MacOS/Helion --doctor
-dist/Helion.app/Contents/MacOS/helion-cli doctor
-dist/Helion.app/Contents/MacOS/helion-cli run \
-    dist/Helion.app/Contents/Resources/examples/counter.sv --cycles 16</code></pre>
-      <div class="table-wrap"><table>
-        <thead><tr><th>Path in Helion.app</th><th>What</th></tr></thead>
-        <tbody>
-          <tr><td><code>Contents/MacOS/Helion</code></td><td>windowed IDE (<code>helion-ide</code>)</td></tr>
-          <tr><td><code>Contents/MacOS/helion-cli</code></td><td>CLI (APFS-safe name beside <code>Helion</code>)</td></tr>
-          <tr><td><code>Contents/Resources/devices/helion</code></td><td>HAD (FeatureMap / parts)</td></tr>
-          <tr><td><code>Contents/Resources/examples</code></td><td><code>counter.sv</code>, <code>blinky.sv</code>, …</td></tr>
-          <tr><td><code>Contents/Info.plist</code></td><td><code>fpga.helion.ide</code>, arm64-only</td></tr>
-        </tbody>
-      </table></div>
-      <p>
-        The windowed binary is <code>Contents/MacOS/Helion</code>. Do not launch the CLI
-        as the app. Without the bundle:
-      </p>
-      <pre><code>cargo run -p helion-gui --release --target aarch64-apple-darwin --bin helion-ide
-cargo run -p helion-cli --release --target aarch64-apple-darwin -- doctor
-cargo run -p helion-cli --release --target aarch64-apple-darwin -- run examples/counter.sv --cycles 16</code></pre>
-      <p>
-        <code>HELION_HAD</code> overrides the part database. Otherwise the binary searches
-        <code>Helion.app/Contents/Resources/devices/helion</code>, then cwd, then the
-        compile-time tree.
-      </p>
+        <h2 id="first-run">First run</h2>
+        <p>Check the install against the gold numbers. Both must match exactly:</p>
+        <pre><code>helion-ide --headless examples/counter.sv
+<span class="c"># WNS_PS=9640</span>
+helion run examples/counter.sv --cycles 16
+<span class="c"># LED[16]=0000000111111110</span>
+helion-ide --doctor        <span class="c"># target triple, bundled device data, self-check</span></code></pre>
+        <p>Then open the IDE. With no arguments it shows the Start page with recent projects and the bundled examples; with a path it opens that project or source.</p>
+        <pre><code>helion-ide
+helion-ide examples/counter.prj</code></pre>
+        <p>From a checkout without installing, prefix the commands with <code>cargo run --release -p helion-cli --</code> or <code>cargo run --release -p helion-rune --bin helion-ide --</code>.</p>
 
-      <h2>Linux CI vs a Mac</h2>
-      <p>Verified on Linux CI: workspace tests, headless <code>IdeModel</code>, <code>helion-ide --headless</code>, <code>helion doctor</code>, app layout assembly with <code>scripts/build-macos-app.sh --layout-only</code>.</p>
-      <p>Not verified on Linux: <code>cargo build --release --target aarch64-apple-darwin</code>, launching <code>dist/Helion.app</code>, codesign / notarization.</p>
+        <h2 id="macos-app">The macOS app</h2>
+        <pre><code>./scripts/build-macos-app.sh
+open dist/Helion.app</code></pre>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Path in Helion.app</th><th>What</th></tr></thead>
+          <tbody>
+            <tr><td><code>Contents/MacOS/Helion</code></td><td>The IDE (<code>helion-ide</code>), launched by Finder</td></tr>
+            <tr><td><code>Contents/MacOS/helion-ide</code></td><td>The same binary under its usual name, for the windowless modes</td></tr>
+            <tr><td><code>Contents/MacOS/helion-cli</code></td><td>The CLI (named so it does not collide with <code>Helion</code> on case-insensitive disks)</td></tr>
+            <tr><td><code>Contents/Resources/devices/helion</code></td><td>Device data (HAD)</td></tr>
+            <tr><td><code>Contents/Resources/examples</code></td><td>Bundled example designs and projects</td></tr>
+          </tbody>
+        </table></div>
+        <p>The build script ad-hoc signs the bundle and stamps the version from <code>Cargo.toml</code>.</p>
 
-      <h2>While you iterate</h2>
-      <p>Run one test name, not the world:</p>
-      <pre><code>cargo test -p helion-sv --lib TESTNAME</code></pre>
+        <h2 id="device-data">Where device data comes from</h2>
+        <p>The HL10 part database (HAD) is looked up in this order: the <code>HELION_HAD</code> environment variable, next to the executable, <code>Helion.app/Contents/Resources</code>, the working directory, then the source tree the binary was built from. The iCE40 and ECP5 databases are built into their backends. The Xilinx 7-series backend reads the Project X-Ray database from <code>$HELION_XILINX_DB</code>; the part appears in the New Project picker only when that database is present.</p>
 
-      <h2>Large SystemVerilog</h2>
-      <p>
-        <code>examples/ysyx_ibex.sv</code> is in the tree (Open rail in the IDE). Ingest
-        is helion-sv preprocess + parse. Fitting a full SoC on HL10T-C32-1 is not the
-        synth bar. Do not abort the run because sv-parser is unhappy. Leftover
-        Helion-legal constructs still map.
-      </p>
+        <h2 id="next">Next steps</h2>
+        <ul>
+          <li><a href="use.html">User guide</a>: the IDE view by view, the CLI, the Tcl console, hardware.</li>
+          <li><a href="architecture.html">Architecture</a>: how the flow is built and what each crate does.</li>
+          <li><a href="contribute.html">Contribute</a>: run the tests and land a change.</li>
+        </ul>
 
-      <p><a class="btn" href="use.html">Next: use the IDE and CLI</a></p>
+      </article>
     </div>
   </main>
 
-  <footer class="site-foot">
-    <div class="foot-inner">
-      <span>AGPL-3.0 &middot; <a href="https://github.com/saksham-45">@saksham-45</a> &middot; <a href="https://github.com/helion-fpga">helion-fpga</a></span>
-      <span><a href="legal.html">Legal</a> &middot; <a href="start.html">Start</a> &middot; <a href="https://github.com/helion-fpga/helion">GitHub</a></span>
+  <footer class="site-footer">
+    <div class="wrap">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <a class="brand" href="index.html"><img src="brand/mark-48.png" alt="" width="30" height="30"><span>Helion</span></a>
+          <p>Open-source FPGA CAD and an original FPGA family, written in Rust.</p>
+        </div>
+        <div>
+          <h4>Product</h4>
+          <ul>
+            <li><a href="https://github.com/helion-fpga/helion/releases/latest">Download</a></li>
+            <li><a href="start.html">Get started</a></li>
+            <li><a href="use.html">User guide</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/CHANGELOG.md">Changelog</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Docs</h4>
+          <ul>
+            <li><a href="architecture.html">Architecture</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/docs/tcl-subset.md">Tcl reference</a></li>
+            <li><a href="benchmarks.html">Benchmarks</a></li>
+            <li><a href="roadmap.html">Roadmap</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Community</h4>
+          <ul>
+            <li><a href="get-involved.html">Get involved</a></li>
+            <li><a href="contribute.html">Contribute code</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/discussions">Discussions</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/CODE_OF_CONDUCT.md">Code of conduct</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Project</h4>
+          <ul>
+            <li><a href="legal.html">License and legal</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/SECURITY.md">Security</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/GOVERNANCE.md">Governance</a></li>
+            <li><a href="https://github.com/helion-fpga/helion">GitHub</a></li>
+          </ul>
+        </div>
+      </div>
+      <div class="footer-legal">
+        <span>Helion is licensed under <a href="https://github.com/helion-fpga/helion/blob/master/LICENSE">AGPL-3.0-or-later</a>.</span>
+        <span>"Helion" and the Helion logo are trademarks of Saksham Srivastava. <a href="https://github.com/helion-fpga/helion/blob/master/TRADEMARKS.md">Trademark policy</a></span>
+      </div>
     </div>
   </footer>
-  <script src="site.js?v=v4"></script>
+  <script src="site.js?v=5"></script>
 </body>
 </html>

@@ -11,6 +11,12 @@ use std::collections::HashSet;
 
 pub use helion_pack::PackingSummary;
 
+pub mod regions;
+pub use regions::{
+    RegionConstraint, RegionStats, RegionViolation, legalize_into_regions, owning_region,
+    place_with_regions, region_violations,
+};
+
 #[derive(Clone, Debug)]
 pub struct Placed {
     pub packed: Packed,
