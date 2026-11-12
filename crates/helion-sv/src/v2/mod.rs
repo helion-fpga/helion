@@ -69,6 +69,14 @@ fn run(sources: &[(String, String)], top: Option<&str>, defines: &[(String, Stri
         ));
     }
     design.attrs.set("FRONTEND", "v2");
+    for (name, module, conns) in &flat.instances {
+        design.instances.push(helion_ir::Instance {
+            name: helion_ir::intern(name),
+            module: helion_ir::intern(module),
+            conns: conns.iter().map(|(p, n)| (helion_ir::intern(p), helion_ir::intern(n))).collect(),
+            attrs: helion_ir::Attrs::default(),
+        });
+    }
     Ok(Synth { design, luts: st.luts, ffs: st.ffs, depth: st.depth, warnings, regmap: st.regmap })
 }
 

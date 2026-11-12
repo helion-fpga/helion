@@ -160,6 +160,10 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 if text.contains("full_case") {
                     out.push(Tok { t: T::Id("$full_case".into()), line: at });
                 }
+                // A signal marked for debugging keeps a net of its own name.
+                if text.contains("mark_debug") || text.contains("keep") {
+                    out.push(Tok { t: T::Id("$mark_debug".into()), line: at });
+                }
                 i += 2;
                 continue;
             }

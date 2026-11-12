@@ -662,6 +662,9 @@ impl P {
     // ------------------------------------------------------------ statements
 
     fn stmt(&mut self) -> R<Stmt> {
+        while self.is_kw("$mark_debug") {
+            self.bump();
+        }
         let line = self.line();
         self.skip_delay()?;
         // label: statement
@@ -1240,8 +1243,25 @@ impl P {
 
     /// One module-level item (may add several entries to `out`).
     fn item(&mut self, out: &mut Vec<Item>) -> R<()> {
-        while self.is_kw("$full_case") {
+        let mut debug = false;
+        while self.is_kw("$full_case") || self.is_kw("$mark_debug") {
+            debug |= self.is_kw("$mark_debug");
             self.bump();
+        }
+        if debug && self.at_decl() {
+            let it = self.decl_item()?;
+            let mut names = Vec::new();
+            fn collect(it: &Item, names: &mut Vec<String>) {
+                match it {
+                    Item::Decl { names: ds, .. } => names.extend(ds.iter().map(|d| d.name.clone())),
+                    Item::Block(b) => b.items.iter().for_each(|i| collect(i, names)),
+                    _ => {}
+                }
+            }
+            collect(&it, &mut names);
+            out.push(it);
+            out.push(Item::Debug(names));
+            return Ok(());
         }
         let line = self.line();
         if self.eat_op(";") {
@@ -1528,6 +1548,9 @@ impl P {
             let mut ty = DataType::Vec { signed: false, dims: vec![] };
             let mut ansi = false;
             while !self.is_op(")") {
+                while self.is_kw("$mark_debug") || self.is_kw("$full_case") {
+                    self.bump();
+                }
                 let l = self.line();
                 if self.eat_op(".") {
                     return self.err("explicit port expressions are not supported");
@@ -1582,6 +1605,9 @@ impl P {
     fn source(&mut self) -> R<Source> {
         let mut src = Source::default();
         loop {
+            while self.is_kw("$mark_debug") || self.is_kw("$full_case") {
+                self.bump();
+            }
             match self.peek().clone() {
                 T::Eof => break,
                 T::Op(";") => {

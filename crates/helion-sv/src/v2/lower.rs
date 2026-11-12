@@ -113,6 +113,8 @@ pub struct SigInfo {
     pub drv: Vec<Drv>,
     /// Power-up value of register bits.
     pub init: Vec<bool>,
+    /// Keep a net of this signal's name (`mark_debug`).
+    pub debug: bool,
 }
 
 /// The flops of one clocked process for one signal: bit `i` is a flop when
@@ -146,6 +148,7 @@ pub struct Flat {
     pub ports: Vec<Port>,
     pub regs: Vec<Reg>,
     pub latches: Vec<Latch>,
+    pub instances: Vec<(String, String, Vec<(String, String)>)>,
 }
 
 pub fn bit_name(sig: &str, w: u32, bit: u32) -> String {
@@ -602,6 +605,18 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
             }
         }
     }
+    // Signals marked for debugging are roots too: each bit keeps a net.
+    let mut debug_bits: Vec<(u32, u32, Lit)> = Vec::new();
+    for (si, sg) in flat.sigs.iter().enumerate() {
+        if sg.debug {
+            for b in 0..sg.w {
+                if !matches!(sg.drv[b as usize], Drv::None | Drv::Latch(_)) {
+                    let l = bl.read_bit(si as u32, b)?;
+                    debug_bits.push((si as u32, b, l));
+                }
+            }
+        }
+    }
     struct RegBit {
         sig: u32,
         bit: u32,
@@ -675,6 +690,13 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
         }
     }
     let mut hint: HashMap<Lit, String> = HashMap::new();
+    // A debug signal names its net before anything else may.
+    for &(sig, bit, l) in &debug_bits {
+        let sg = &flat.sigs[sig as usize];
+        if l > TRUE && !net_of.contains_key(&l) {
+            hint.entry(l).or_insert(bit_name(&sg.name, sg.w, bit));
+        }
+    }
     // Output port bits name the net of the literal they show, when free;
     // other signal bits name theirs after that.
     for &(pi, bit, l) in &out_bits {
@@ -823,6 +845,11 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
             }
         }
     }
+    // Debug signals: their nets exist and carry the mark.
+    for &(_, _, l) in &debug_bits {
+        let net = emit(l, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut);
+        let _ = d.mark_debug(&net);
+    }
     // Output pads: one per bit, in bit order.
     let mut n_iob = 0usize;
     for &(pi, bit, l) in &out_bits {
@@ -876,8 +903,8 @@ mod tests {
             top: "t".into(),
             dag,
             sigs: vec![
-                SigInfo { name: "a".into(), hier: "a".into(), index: None, w: 3, drv: vec![Drv::Input; 3], init: vec![false; 3] },
-                SigInfo { name: "b".into(), hier: "b".into(), index: None, w: 3, drv: vec![Drv::Input; 3], init: vec![false; 3] },
+                SigInfo { name: "a".into(), hier: "a".into(), index: None, w: 3, drv: vec![Drv::Input; 3], init: vec![false; 3], debug: false },
+                SigInfo { name: "b".into(), hier: "b".into(), index: None, w: 3, drv: vec![Drv::Input; 3], init: vec![false; 3], debug: false },
             ],
             ports: vec![
                 Port { name: "a".into(), dir: PortDir::In, w: 3, node: None, sig: Some(0) },
@@ -886,6 +913,7 @@ mod tests {
             ],
             regs: vec![],
             latches: vec![],
+            instances: vec![],
         };
         let (d, st, _) = lower(&flat).unwrap();
         assert!(st.luts <= 3, "3-bit add is 3 LUTs of at most 6 inputs, got {}", st.luts);

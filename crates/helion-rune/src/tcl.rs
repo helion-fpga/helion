@@ -2539,7 +2539,7 @@ fn synth_hdl_path(path: &std::path::Path) -> Result<helion_ir::Design, String> {
     match ext.as_str() {
         "prj" => synth_prj_path(path),
         "vhd" | "vhdl" => helion_vhdl::synth_vhdl_path(path),
-        _ => helion_sv::synth_sv_path(path),
+        _ => helion_sv::synth_sv_auto_path(path),
     }
 }
 
@@ -2580,7 +2580,7 @@ fn synth_prj_path(path: &std::path::Path) -> Result<helion_ir::Design, String> {
         return Err("project has no SystemVerilog sources".into());
     }
     if rtl.len() == 1 && prj.top.is_none() {
-        return helion_sv::synth_sv_path(&rtl[0]);
+        return helion_sv::synth_sv_auto_path(&rtl[0]);
     }
     let mut owned: Vec<(String, String)> = Vec::new();
     for p in &rtl {
@@ -2593,6 +2593,15 @@ fn synth_prj_path(path: &std::path::Path) -> Result<helion_ir::Design, String> {
         .collect();
     let params: HashMap<String, u128> = HashMap::new();
     let opts = Default::default();
+    // The v2 front end first; the first-generation one for what it does
+    // not support.
+    let paths: Vec<&std::path::Path> = rtl.iter().map(|p| p.as_path()).collect();
+    if std::env::var("HELION_SV_FRONTEND").as_deref() != Ok("legacy") {
+        match helion_sv::synth_sv_v2_files(&paths, prj.top.as_deref()) {
+            Ok(s) => return Ok(s.design),
+            Err(e) => eprintln!("note: {e}\nnote: falling back to the first-generation front end for this design"),
+        }
+    }
     let (d, _) = helion_sv::elaborate_sv_sources(&refs, prj.top.as_deref(), &params, &opts)?;
     Ok(d)
 }
@@ -5288,7 +5297,7 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
         "clear" => ("clear", "clear the console transcript"),
         "get_cells" => (
             "get_cells ?-hierarchical? ?-filter expr? ?-of_objects objs? ?-quiet? ?patterns...?",
-            "cells in the netlist (u_luts0, u_ff3…); -filter {TYPE == lut}",
+            "cells in the netlist (cnt_0_d_lut, cnt_3_reg…); -filter {TYPE == lut}",
         ),
         "get_nets" => (
             "get_nets ?-filter expr? ?-of_objects objs? ?patterns...?",
@@ -5296,7 +5305,7 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
         ),
         "get_pins" => (
             "get_pins ?-of_objects cells? ?patterns...?",
-            "pins as cell/pin (u_luts0/A)",
+            "pins as cell/pin (cnt_0_d_lut/A)",
         ),
         "get_ports" => ("get_ports ?patterns...?", "top-level ports"),
         "get_clocks" => (
@@ -6640,7 +6649,7 @@ mod tests {
         );
         eval_command(&mut s, "get_cells");
         assert!(
-            lines(&s).iter().any(|l| l.contains("u_lut")),
+            lines(&s).iter().any(|l| l.contains("cnt_0_d_lut") && l.contains("cnt_0_reg")),
             "get_cells must name real cells: {:?}",
             lines(&s)
         );
@@ -7849,22 +7858,22 @@ mod tests {
     fn object_queries_with_filter_of_objects() {
         let mut s = AppState::demo();
         with_counter(&mut s);
-        eval_command(&mut s, "get_pins -of_objects u_luts0");
-        assert!(has_line(&s, "u_luts0/"), "pins of cell: {:?}", lines(&s));
+        eval_command(&mut s, "get_pins -of_objects cnt_0_d_lut");
+        assert!(has_line(&s, "cnt_0_d_lut/"), "pins of cell: {:?}", lines(&s));
         eval_command(&mut s, "get_cells -filter {TYPE == lut}");
-        assert!(has_line(&s, "u_lut"), "filter: {:?}", lines(&s));
+        assert!(has_line(&s, "_d_lut"), "filter: {:?}", lines(&s));
         eval_command(&mut s, "get_cells -filter {TYPE == lut && FANOUT >= 0}");
-        assert!(has_line(&s, "u_lut"), "and-filter: {:?}", lines(&s));
+        assert!(has_line(&s, "_d_lut"), "and-filter: {:?}", lines(&s));
         let before = s.console.lines.len();
         eval_command(&mut s, "get_cells -filter {BOGUSPROP == x}");
         assert!(
             s.console.lines[before..]
                 .iter()
-                .all(|l| !l.text.contains("u_lut")),
+                .all(|l| !l.text.contains("_d_lut")),
             "empty filter must match nothing: {:?}",
             lines(&s)
         );
-        eval_command(&mut s, "get_nets -of_objects u_luts0");
+        eval_command(&mut s, "get_nets -of_objects cnt_0_d_lut");
         assert!(
             !last_error(&s).contains("no such object"),
             "got: {:?}",
@@ -7926,43 +7935,43 @@ mod tests {
     fn properties_select_current_design_hnf() {
         let mut s = AppState::demo();
         with_counter(&mut s);
-        eval_command(&mut s, "get_property TYPE u_luts0");
+        eval_command(&mut s, "get_property TYPE cnt_0_d_lut");
         assert!(has_line(&s, "lut"), "vivado order: {:?}", lines(&s));
-        eval_command(&mut s, "get_property u_luts0 TYPE");
+        eval_command(&mut s, "get_property cnt_0_d_lut TYPE");
         assert!(has_line(&s, "lut"), "obj-prop order: {:?}", lines(&s));
-        eval_command(&mut s, "get_property BOGUS u_luts0");
+        eval_command(&mut s, "get_property BOGUS cnt_0_d_lut");
         assert!(
-            last_error(&s).contains("no such object \"u_luts0\" (or unknown property \"BOGUS\")"),
+            last_error(&s).contains("no such object \"cnt_0_d_lut\" (or unknown property \"BOGUS\")"),
             "got: {:?}",
             lines(&s)
         );
-        eval_command(&mut s, "get_property -quiet BOGUS u_luts0");
+        eval_command(&mut s, "get_property -quiet BOGUS cnt_0_d_lut");
         let quiet_err = last_error(&s);
-        eval_command(&mut s, "set_property KEEP TRUE u_luts0");
+        eval_command(&mut s, "set_property KEEP TRUE cnt_0_d_lut");
         assert!(has_line(&s, "KEEP"), "got: {:?}", lines(&s));
-        eval_command(&mut s, "get_property KEEP u_luts0");
+        eval_command(&mut s, "get_property KEEP cnt_0_d_lut");
         assert!(has_line(&s, "TRUE"), "keep sticks: {:?}", lines(&s));
-        eval_command(&mut s, "get_property DONT_TOUCH u_luts0");
+        eval_command(&mut s, "get_property DONT_TOUCH cnt_0_d_lut");
         assert!(
             last_error(&s).contains("unknown property"),
             "got: {:?}",
             lines(&s)
         );
-        eval_command(&mut s, "set_property BOGUSPROP 1 u_luts0");
+        eval_command(&mut s, "set_property BOGUSPROP 1 cnt_0_d_lut");
         assert!(
             last_error(&s).contains("unsupported property \"BOGUSPROP\""),
             "got: {:?}",
             lines(&s)
         );
-        eval_command(&mut s, "report_property u_luts0");
+        eval_command(&mut s, "report_property cnt_0_d_lut");
         assert!(has_line(&s, "TYPE = lut"), "got: {:?}", lines(&s));
-        eval_command(&mut s, "list_properties u_luts0");
+        eval_command(&mut s, "list_properties cnt_0_d_lut");
         assert!(has_line(&s, "TYPE"), "got: {:?}", lines(&s));
-        eval_command(&mut s, "select_objects u_luts0");
-        assert!(has_line(&s, "u_luts0"), "got: {:?}", lines(&s));
+        eval_command(&mut s, "select_objects cnt_0_d_lut");
+        assert!(has_line(&s, "cnt_0_d_lut"), "got: {:?}", lines(&s));
         eval_command(&mut s, "get_selected_objects");
-        assert!(has_line(&s, "u_luts0"), "got: {:?}", lines(&s));
-        eval_command(&mut s, "highlight_objects u_luts0");
+        assert!(has_line(&s, "cnt_0_d_lut"), "got: {:?}", lines(&s));
+        eval_command(&mut s, "highlight_objects cnt_0_d_lut");
         assert!(
             s.tcl.selected.iter().any(|o| o.highlighted),
             "highlight flag"
@@ -8059,9 +8068,9 @@ mod tests {
         with_counter(&mut s);
         eval_command(&mut s, "add_probe clk");
         assert!(has_line(&s, "add_probe clk"), "got: {:?}", lines(&s));
-        eval_command(&mut s, "eco u_luts0 0xAAAAAAAAAAAAAAAA");
+        eval_command(&mut s, "eco cnt_0_d_lut 0xAAAAAAAAAAAAAAAA");
         assert!(
-            has_line(&s, "eco u_luts0 0xaaaaaaaaaaaaaaaa"),
+            has_line(&s, "eco cnt_0_d_lut 0xaaaaaaaaaaaaaaaa"),
             "got: {:?}",
             lines(&s)
         );
@@ -8070,9 +8079,9 @@ mod tests {
         assert!(has_line(&s, "backend=sim"), "got: {:?}", lines(&s));
         eval_command(&mut s, "report_hw_targets");
         assert!(has_line(&s, "HL10T-C32-1"), "got: {:?}", lines(&s));
-        eval_command(&mut s, "list_property u_luts0");
+        eval_command(&mut s, "list_property cnt_0_d_lut");
         assert!(has_line(&s, "TYPE"), "got: {:?}", lines(&s));
-        eval_command(&mut s, "report_property u_luts0 TYPE");
+        eval_command(&mut s, "report_property cnt_0_d_lut TYPE");
         assert!(has_line(&s, "TYPE = lut"), "pattern form: {:?}", lines(&s));
         let before = s.console.lines.len();
         eval_command(&mut s, "get_property -quiet BOGUS nosuchobj");
@@ -8084,7 +8093,7 @@ mod tests {
             lines(&s)
         );
         let before = s.console.lines.len();
-        eval_command(&mut s, "set_property -quiet BOGUSPROP 1 u_luts0");
+        eval_command(&mut s, "set_property -quiet BOGUSPROP 1 cnt_0_d_lut");
         assert!(
             s.console.lines[before..]
                 .iter()
@@ -8122,7 +8131,7 @@ mod tests {
             "got: {:?}",
             lines(&s)
         );
-        eval_command(&mut s, "set_property KEEP TRUE u_luts0");
+        eval_command(&mut s, "set_property KEEP TRUE cnt_0_d_lut");
         assert!(
             last_error(&s).contains("set_property: no design"),
             "got: {:?}",

@@ -94,6 +94,8 @@ pub struct Scope {
 }
 
 pub struct Sig {
+    /// Keep a net of this name in the netlist (`mark_debug`, `keep`).
+    pub debug: bool,
     pub name: String,
     /// Dotted hierarchical name.
     pub hier: String,
@@ -115,6 +117,8 @@ pub struct Elab {
     pub vars: Vec<VarInfo>,
     pub regs: Vec<Reg>,
     pub latches: Vec<Latch>,
+    /// Instances of the hierarchy: (flattened name, module, port connections).
+    pub instances: Vec<(String, String, Vec<(String, String)>)>,
     modules: HashMap<String, Rc<Module>>,
     order: Vec<String>,
     packages: HashMap<String, Rc<Package>>,
@@ -139,6 +143,7 @@ impl Elab {
             vars: Vec::new(),
             regs: Vec::new(),
             latches: Vec::new(),
+            instances: Vec::new(),
             modules: HashMap::new(),
             order: Vec::new(),
             packages: HashMap::new(),
@@ -243,7 +248,7 @@ impl Elab {
         let w = ty.w() as usize;
         let full = format!("{}{}", self.prefix(sc), name);
         let hier = format!("{}{}", self.scopes[sc].hier, name);
-        self.sigs.push(Sig { name: full, hier, ty, drv: vec![Drv::None; w], init: vec![false; w], line: self.line });
+        self.sigs.push(Sig { debug: false, name: full, hier, ty, drv: vec![Drv::None; w], init: vec![false; w], line: self.line });
         let id = self.sigs.len() as u32 - 1;
         self.scopes[sc].syms.insert(name.to_string(), Sym::Sig(id));
         id
@@ -443,7 +448,7 @@ impl Elab {
         for phase in 0..3 {
             for it in &flat {
                 let p = match it {
-                    Item::Decl { .. } | Item::Param(_) | Item::Typedef { .. } | Item::Func(_) | Item::Import { .. } | Item::Genvar(_) | Item::PortDir(_) => 0,
+                    Item::Decl { .. } | Item::Param(_) | Item::Typedef { .. } | Item::Func(_) | Item::Import { .. } | Item::Genvar(_) | Item::PortDir(_) | Item::Debug(_) => 0,
                     Item::Inst(_) | Item::GenFor { .. } | Item::GenIf { .. } | Item::GenCase { .. } | Item::Block(_) => 1,
                     Item::Assign { .. } | Item::Always { .. } => 2,
                 };
@@ -541,6 +546,14 @@ impl Elab {
                 self.instance(d, sc)
             }
             Item::Genvar(_) | Item::Func(_) => Ok(()),
+            Item::Debug(names) => {
+                for n in names {
+                    if let Some(Sym::Sig(id)) = self.scopes[sc].syms.get(n) {
+                        self.sigs[*id as usize].debug = true;
+                    }
+                }
+                Ok(())
+            }
             Item::Import { pkg, name } => {
                 let ps = self.package_scope(pkg)?;
                 match name {
@@ -682,6 +695,26 @@ impl Elab {
         let child = self.new_scope(self.unit_scope, prefix);
         self.scopes[sc].syms.insert(d.name.clone(), Sym::Inst(child));
         self.scopes[child].hier = format!("{}{}.", self.scopes[sc].hier, d.name);
+        let conns: Vec<(String, String)> = d
+            .conns
+            .iter()
+            .filter_map(|c| match (&c.port, &c.expr) {
+                (Some(p), Some(Expr::Id(path))) => {
+                    // The connected signal by its flattened name.
+                    let net = match path.len() == 1 {
+                        true => match self.lookup(sc, &path[0]) {
+                            Some(Sym::Sig(id)) => self.sigs[id as usize].name.clone(),
+                            _ => String::new(),
+                        },
+                        false => String::new(),
+                    };
+                    Some((p.clone(), net))
+                }
+                (Some(p), _) => Some((p.clone(), String::new())),
+                _ => None,
+            })
+            .collect();
+        self.instances.push((format!("{}{}", self.prefix(sc), d.name), d.module.clone(), conns));
         // Parameters: overrides are evaluated in the parent's scope.
         let mut over: HashMap<String, ParamArg> = HashMap::new();
         let settable: Vec<&ParamDecl> = m.params.iter().filter(|p| !p.local).collect();
@@ -993,9 +1026,9 @@ impl Elab {
                     Ty::Bits { w, lo, asc, .. } => Some((0..*w as i64).map(|b| if *asc { lo + *w as i64 - 1 - b } else { lo + b }).collect()),
                     _ => None,
                 };
-                SigInfo { name: s.name, hier: s.hier, index, w: s.drv.len() as u32, drv: s.drv, init: s.init }
+                SigInfo { name: s.name, hier: s.hier, index, w: s.drv.len() as u32, drv: s.drv, init: s.init, debug: s.debug }
             })
             .collect();
-        Ok((Flat { top: m.name.clone(), dag: self.dag, sigs, ports: fp, regs: self.regs, latches: self.latches }, self.warnings))
+        Ok((Flat { top: m.name.clone(), dag: self.dag, sigs, ports: fp, regs: self.regs, latches: self.latches, instances: self.instances }, self.warnings))
     }
 }

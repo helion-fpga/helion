@@ -25157,6 +25157,34 @@ pub fn synth_sv_auto_files(paths: &[&Path], top: Option<&str>) -> Result<Design,
     }
 }
 
+/// [`synth_sv_auto_files`] on one file.
+pub fn synth_sv_auto_path(path: &Path) -> Result<Design, String> {
+    synth_sv_auto_files(&[path], None)
+}
+
+/// [`synth_sv_auto_files`] on source text: v2 first, the first-generation
+/// front end only for what v2 does not support.
+pub fn synth_sv_auto(source: &str, origin: &str) -> Result<Design, String> {
+    let mode = std::env::var("HELION_SV_FRONTEND").unwrap_or_default();
+    if mode == "legacy" {
+        return synth_sv(source, origin);
+    }
+    match synth_sv_v2(source, origin, None) {
+        Ok(s) => {
+            for w in &s.warnings {
+                eprintln!("warning: {w}");
+            }
+            Ok(s.design)
+        }
+        Err(e) if mode == "v2" => Err(e),
+        Err(e) => {
+            eprintln!("note: {e}");
+            eprintln!("note: falling back to the first-generation front end for this design");
+            synth_sv(source, origin)
+        }
+    }
+}
+
 /// Module names in one SV file (helion-sv parse). UG900 SIM_TOP candidates.
 pub fn list_sv_modules(source: &str) -> Result<Vec<String>, String> {
     list_sv_modules_origin(source, "t.sv")
