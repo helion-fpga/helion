@@ -216,7 +216,14 @@ pub fn run_family(
 pub fn seed_family_fixture(s: &mut crate::state::AppState, part: &str) -> Result<(), String> {
     let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter.sv");
     let design = helion_sv::synth_sv_path(&src)?;
-    let dir = std::env::temp_dir().join(format!("helion-rune-family-{}-{part}", std::process::id()));
+    // One scratch dir per call: scenes for the same part render in parallel
+    // in the snapshot tests, and a shared dir was deleted under a live run.
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "helion-rune-family-{}-{part}-{seq}",
+        std::process::id()
+    ));
     let clk = helion_sta::Clock {
         name: "clk".into(),
         period_ps: 10_000,
