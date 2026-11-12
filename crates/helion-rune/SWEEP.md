@@ -50,10 +50,12 @@ with tests, keep `cargo test -p helion-rune` green, rebuild + relaunch.
   testbench interpreter (helion-sim's CRV solver is a Rust API only).
   `$urandom`, `$urandom_range` and `randcase` are supported. helion-proj bug: reopening a seeded `.hckp` resets
   the seed to 0 and fails its hash check.
-- Waveform tools (decoders, analog, virtual bus) need real simulation
-  traces; they are disabled on the demo fixture.
-- Editor large-file mode (>1500 lines): long lines truncate instead of
-  scrolling sideways; a row click restores the previous column.
+- Waveform tools are verified on real runs (`examples/wave_tools`
+  bus_periph_tb: SPI/UART/FSM/AXI-Lite decode; counter.sv netlist bits as a
+  virtual bus); on the demo waveform they stay disabled with a reason.
+  helion-sv (observed, not root-caused): a later nonblocking assignment in a nested `if` did not
+  override an earlier one to the same register (bus_periph is written
+  with if/else to avoid it).
 - VHDL diagnostics are rare (the VHDL frontend reports few errors).
 - Program over openFPGALoader/FTDI is wired but untested on a board; no
   STAT readback over openFPGALoader.

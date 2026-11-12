@@ -11,14 +11,24 @@
 //! The caret line is the one live field (`EditorState::line_edit`): typing
 //! splices it back into the buffer as it happens, Enter splits the line,
 //! Backspace at column 0 joins it to the line above, and arrows/Page keys
-//! move between rows. Every other row is read-only text that parks the
-//! caret on its line when pressed.
+//! move between rows. Every other row is read-only text; a click parks the
+//! caret on its line at the clicked column ([`col_at_x`]).
+//!
+//! Long lines scroll sideways rather than truncate: the body is a
+//! [`rune::El::scroll_xy`] viewport whose row list is as wide as the
+//! longest line (measured once per buffer fingerprint, so the width does
+//! not jump as rows are built), and each row's gutter holds to the left
+//! edge with [`rune::El::sticky_left`], as rune-kit's diff view does. Only
+//! the rows around the viewport exist, so this costs nothing per line.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use rune::{El, GrowthSpec, Key, ScrollSpec, TextEdit, Tx, col, row, text, text_input};
+use rune::{
+    Drag, El, GrowthSpec, Key, Phase, ScrollSpec, TextEdit, TextStyle, Tx, col, row, text,
+    text_input,
+};
 
 use crate::state::AppState;
 use crate::theme::VivadoTheme;
@@ -28,6 +38,10 @@ use crate::views::highlight::{Dialect, block_open_after, highlight_line_from};
 pub const LARGE_LINES: usize = 1500;
 /// Lines Page Up / Page Down move in large-file mode.
 const PAGE_LINES: usize = 40;
+/// Columns a tab may take (widest case, for the content width).
+const TAB_COLS: usize = 4;
+/// Room after the longest line so its last character clears the edge.
+const END_PAD: f32 = 24.0;
 
 /// Cheap 64-bit fingerprint of a buffer (FNV-1a over 8-byte words), used
 /// as the cache key for the line index, symbols and diagnostics.
@@ -50,6 +64,12 @@ pub struct LineIndex {
     starts: Vec<usize>,
     in_block: Vec<bool>,
     len: usize,
+    /// Display columns of the widest line (tabs as [`TAB_COLS`]).
+    max_cols: usize,
+    /// That line's index.
+    widest: usize,
+    /// Its drawn width, measured once per index (see [`content_width`]).
+    widest_w: std::cell::OnceCell<f32>,
 }
 
 impl LineIndex {
@@ -57,8 +77,22 @@ impl LineIndex {
         let mut starts = vec![0];
         let mut in_block = Vec::new();
         let mut open = false;
+        let mut max_cols = 0;
+        let mut widest = 0;
         for line in text.split('\n') {
             in_block.push(open);
+            // Bytes x TAB_COLS bounds the columns: count chars only for
+            // lines that could beat the current widest.
+            if line.len() * TAB_COLS > max_cols {
+                let cols = line
+                    .chars()
+                    .map(|c| if c == '\t' { TAB_COLS } else { 1 })
+                    .sum::<usize>();
+                if cols > max_cols {
+                    max_cols = cols;
+                    widest = in_block.len() - 1;
+                }
+            }
             open = block_open_after(line, dialect, open);
             starts.push(starts.last().copied().unwrap_or(0) + line.len() + 1);
         }
@@ -67,6 +101,9 @@ impl LineIndex {
             starts,
             in_block,
             len: text.len(),
+            max_cols,
+            widest,
+            widest_w: std::cell::OnceCell::new(),
         }
     }
 
@@ -74,11 +111,21 @@ impl LineIndex {
         self.starts.len()
     }
 
+    /// Display columns of the widest line.
+    pub fn max_cols(&self) -> usize {
+        self.max_cols
+    }
+
     /// Byte range of 0-based line `i` (without its `\n`).
     pub fn range(&self, i: usize) -> std::ops::Range<usize> {
         let start = self.starts.get(i).copied().unwrap_or(self.len);
         let end = self.starts.get(i + 1).map(|n| n - 1).unwrap_or(self.len);
         start.min(self.len)..end.min(self.len)
+    }
+
+    /// 0-based line holding byte `at` (binary search over line starts).
+    pub fn line_of(&self, at: usize) -> usize {
+        self.starts.partition_point(|&st| st <= at).saturating_sub(1)
     }
 
     fn in_block(&self, i: usize) -> bool {
@@ -111,7 +158,15 @@ pub fn index(s: &AppState) -> Rc<LineIndex> {
 
 /// Whether the active buffer renders as virtual rows.
 pub fn is_large(s: &AppState) -> bool {
-    s.editor.edit.text.bytes().filter(|&b| b == b'\n').count() + 1 > LARGE_LINES
+    // Stops at the LARGE_LINES-th newline: O(threshold) per frame, not
+    // O(file), on a 20k-line buffer.
+    s.editor
+        .edit
+        .text
+        .bytes()
+        .filter(|&b| b == b'\n')
+        .nth(LARGE_LINES - 1)
+        .is_some()
 }
 
 /// Key of the element that shows 0-based `line` (scroll-into-view target).
@@ -236,6 +291,41 @@ fn line_key_event(s: &mut AppState, key: &rune::KeyEvent, tx: &mut Tx) -> bool {
     }
 }
 
+/// Byte offset in `line` of the caret position nearest to `x` points from
+/// the start of the text as drawn in `style`: a binary search over char
+/// boundaries on measured prefix advances (exact for any font, tabs and
+/// wide characters; ~log2(len) measurements per click).
+pub fn col_at_x(line: &str, x: f32, style: TextStyle) -> usize {
+    if x <= 0.0 || line.is_empty() {
+        return 0;
+    }
+    let bounds: Vec<usize> = line
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(line.len()))
+        .collect();
+    let adv = |k: usize| rune::text::advance(&line[..bounds[k]], style);
+    // Last boundary whose advance is <= x.
+    let (mut lo, mut hi) = (0usize, bounds.len() - 1);
+    if adv(hi) <= x {
+        return line.len();
+    }
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if adv(mid) <= x {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    // Round to the nearer edge of the character under x.
+    if x - adv(lo) <= adv(hi) - x {
+        bounds[lo]
+    } else {
+        bounds[hi]
+    }
+}
+
 // ---- view ----
 
 /// Find-match washes inside one line (respecting Match case).
@@ -267,14 +357,22 @@ struct RowCx {
     caret: usize,
 }
 
+fn mono(line_h: f32) -> TextStyle {
+    VivadoTheme::FONT_MONO.mono().lh(line_h)
+}
+
 fn row_el(s: &AppState, i: usize, cx: &RowCx) -> El {
     let t = &cx.t;
     let current = i == cx.caret;
-    let mono = VivadoTheme::FONT_MONO.mono().lh(cx.line_h);
+    let mono = mono(cx.line_h);
     let r = cx.idx.range(i);
     let line = s.editor.edit.text.get(r).unwrap_or("");
+    // The gutter holds to the viewport's left edge while long lines scroll
+    // sideways under it, on its own opaque fill.
     let gutter =
-        crate::views::editor_gutter::gutter_row(i, current, cx.markers.as_ref(), cx.rtl, t, s);
+        crate::views::editor_gutter::gutter_row(i, current, cx.markers.as_ref(), cx.rtl, t, s)
+            .fill(if current { t.current_line } else { t.panel_bg })
+            .sticky_left(0.0);
     let mut spans = highlight_line_from(line, cx.dialect, cx.idx.in_block(i), t);
     let q = &s.editor.find_query.text;
     let content = if current {
@@ -305,21 +403,28 @@ fn row_el(s: &AppState, i: usize, cx: &RowCx) -> El {
             })
     } else {
         spans.extend(match_spans(line, q, s.editor.find_ignore_case, t));
-        let full = line.to_string();
-        text(full.clone())
+        // Whole line, unclipped: the viewport scrolls sideways to it.
+        text(line.to_string())
             .key(format!("editor-text-{i}"))
             .font(mono)
             .color(t.text)
             .spans(spans)
             .grow(1.0)
-            .min_w(0.0)
-            .truncate()
-            .help_when_truncated(full)
             .role("button")
             .label(format!("Edit line {}", i + 1))
+            // A click lands on the clicked column (its Up runs before the
+            // press, which then re-seats the same column).
+            .on_drag(move |s: &mut AppState, d: &mut Drag, _tx: &mut Tx| {
+                if d.phase == Phase::Up && !d.cancelled() {
+                    click_line(s, i, d.x, mono);
+                }
+            })
+            // Keyboard activation keeps the caret column.
             .on_press(move |s: &mut AppState| {
-                let col = s.editor.line_edit.focus;
-                goto_line_col(s, i, col);
+                if s.editor.line_at != Some(i) {
+                    let col = s.editor.line_edit.focus;
+                    goto_line_col(s, i, col);
+                }
             })
     };
     let mut r = row()
@@ -342,10 +447,34 @@ fn row_el(s: &AppState, i: usize, cx: &RowCx) -> El {
     r
 }
 
+/// Park the caret on `line` at the column under `x` (text-local points).
+fn click_line(s: &mut AppState, line: usize, x: f32, style: TextStyle) {
+    let r = s.editor.edit.line_range(line);
+    let col = col_at_x(&s.editor.edit.text[r], x, style);
+    goto_line_col(s, line, col);
+}
+
+/// Width of the row list: gutter, text inset, the widest line, end room.
+/// The widest line is shaped once per buffer version (the index is cached
+/// by fingerprint), so scrolling never re-measures it.
+fn content_width(s: &AppState, idx: &LineIndex, line_h: f32) -> f32 {
+    let style = mono(line_h);
+    let text_w = *idx.widest_w.get_or_init(|| {
+        let line = s.editor.edit.text.get(idx.range(idx.widest)).unwrap_or("");
+        // Tabs: at least TAB_COLS digit widths each.
+        let cols = idx.max_cols as f32 * rune::text::advance("0", style);
+        rune::text::advance(line, style).max(cols)
+    });
+    crate::views::editor::GUTTER_W + 4.0 + text_w + END_PAD
+}
+
 /// The virtualized code body for a large buffer.
 pub fn large_body(s: &AppState, t: &VivadoTheme, line_h: f32) -> El {
     let idx = index(s);
     let count = idx.count();
+    let width = content_width(s, &idx, line_h);
+    // From the index: a binary search, not a scan to the caret.
+    let caret = idx.line_of(s.editor.edit.focus);
     let cx = RowCx {
         idx,
         dialect: crate::views::editor::active_dialect(s),
@@ -353,20 +482,23 @@ pub fn large_body(s: &AppState, t: &VivadoTheme, line_h: f32) -> El {
         markers: crate::views::debug::gutter_markers(s),
         rtl: !crate::views::editor::active_is_xdc(s),
         line_h,
-        caret: caret_line(s),
+        caret,
     };
     col()
         .key("editor-scroll")
         .w_full()
+        .min_w(0.0)
         .grow(1.0)
         .min_h(0.0)
         .scroll(ScrollSpec {
             stick_bottom: false,
         })
+        .scroll_xy()
         .child(
             col()
                 .key("editor-rows")
                 .w_full()
+                .min_w(width)
                 .growth(GrowthSpec::default())
                 .virtual_rows(
                     count,
@@ -518,6 +650,204 @@ mod tests {
         assert!(rt.find("editor-text-12").is_none(), "row 12 is now the field");
     }
 
+    /// `big_state` with line `at` replaced by a `cols`-character line.
+    fn with_long_line(mut s: AppState, at: usize, cols: usize) -> AppState {
+        let r = s.editor.edit.line_range(at);
+        let long: String = (0..cols)
+            .map(|k| char::from(b'a' + (k % 26) as u8))
+            .collect();
+        s.editor.edit.text.replace_range(r, &long);
+        let text = s.editor.edit.text.clone();
+        s.editor.lines = text.lines().map(str::to_string).collect();
+        s.editor.edit = TextEdit::new(text);
+        s
+    }
+
+    fn settle(rt: &mut Runtime<AppState>, from: usize) -> usize {
+        for k in from..from + 20 {
+            rt.frame(k as f64 * 0.05);
+        }
+        from + 20
+    }
+
+    fn click(rt: &mut Runtime<AppState>, x: f32, y: f32) {
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+    }
+
+    #[test]
+    fn line_index_measures_the_widest_line_with_tabs() {
+        let idx = LineIndex::build("ab\n\t\tx\nabcdefg\n", Dialect::Verilog);
+        assert_eq!(idx.max_cols(), 2 * TAB_COLS + 1);
+        let idx = LineIndex::build("ab\nabcdefghij\n\t", Dialect::Verilog);
+        assert_eq!(idx.max_cols(), 10);
+    }
+
+    #[test]
+    fn col_at_x_maps_points_to_the_nearest_column() {
+        let style = mono(crate::views::editor::LINE_H);
+        let line = "assign q = d;";
+        // x within the 6th character (between the advances of 5 and 6
+        // chars), nearer its left or right edge.
+        let at = |k: usize| rune::text::advance(&line[..k], style);
+        let (l, r) = (at(5), at(6));
+        assert!(r > l, "measured: {l} {r}");
+        assert_eq!(col_at_x(line, -3.0, style), 0);
+        assert_eq!(col_at_x(line, l + 0.3 * (r - l), style), 5);
+        assert_eq!(col_at_x(line, l + 0.7 * (r - l), style), 6);
+        assert_eq!(col_at_x(line, at(line.len()) + 50.0, style), line.len());
+        // Multi-byte text lands on char boundaries.
+        let wide = "é = ü;";
+        let x = rune::text::advance("é ", style) + 0.1;
+        let c = col_at_x(wide, x, style);
+        assert!(wide.is_char_boundary(c), "{c}");
+        assert_eq!(c, "é ".len());
+    }
+
+    #[test]
+    fn clicking_a_row_lands_on_the_clicked_column() {
+        let mut s = big_state(3_000);
+        // The caret sits at column 0 of line 5 first: the click must not
+        // restore that column.
+        crate::views::editor::move_cursor_to(&mut s, 5);
+        park_line_edit(&mut s);
+        let mut rt = rt(s);
+        let t = settle(&mut rt, 1);
+        let (r, _) = rt.presented("editor-text-12").expect("row 12 is built");
+        let line12 = {
+            let st = &rt.state.editor.edit;
+            st.text[st.line_range(12)].to_string()
+        };
+        let style = mono(crate::views::editor::LINE_H);
+        let x = rune::text::advance(&line12[..10], style) + 0.5;
+        click(&mut rt, r[0] + x, r[1] + r[3] * 0.5);
+        settle(&mut rt, t);
+        assert_eq!(rt.state.editor.line_at, Some(12));
+        assert_eq!(rt.state.editor.line_edit.focus, 10, "the clicked column");
+        let line = rt.state.editor.edit.line_range(12);
+        assert_eq!(rt.state.editor.edit.focus, line.start + 10);
+    }
+
+    #[test]
+    fn long_lines_scroll_sideways_under_a_sticky_gutter() {
+        let mut rt = rt(with_long_line(big_state(3_000), 12, 900));
+        let mut t = settle(&mut rt, 1);
+        let view = rt.presented("editor-scroll").unwrap().0;
+        let rows = rt.presented("editor-rows").unwrap().0;
+        let style = mono(crate::views::editor::LINE_H);
+        let long: String = {
+            let st = &rt.state.editor.edit;
+            st.text[st.line_range(12)].to_string()
+        };
+        let long_w = rune::text::advance(&long, style);
+        assert!(
+            rows[2] >= long_w,
+            "the list is as wide as the longest line: {} vs view {}",
+            rows[2],
+            view[2]
+        );
+        let text0 = rt.presented("editor-text-12").unwrap().0;
+        assert!(text0[2] >= long_w - 1.0, "the line is not truncated: {}", text0[2]);
+        let gutter0 = rt.presented("editor-gutter-12").unwrap().0;
+        // A horizontal gesture scrolls the code; the gutter stays put.
+        let (cx, cy) = (view[0] + view[2] * 0.6, text0[1] + text0[3] * 0.5);
+        for _ in 0..10 {
+            rt.wheel_xy(cx, cy, -120.0, 0.0);
+            t = settle(&mut rt, t);
+        }
+        let text1 = rt.presented("editor-text-12").unwrap().0;
+        let gutter1 = rt.presented("editor-gutter-12").unwrap().0;
+        assert!(text1[0] < text0[0] - 200.0, "code moved left: {} -> {}", text0[0], text1[0]);
+        assert_eq!(gutter1[0], gutter0[0], "gutter held to the left edge");
+        // A click on the scrolled line still lands on the column under it.
+        let col = col_at_x(&long, cx - text1[0], style);
+        click(&mut rt, cx, cy);
+        t = settle(&mut rt, t);
+        assert_eq!(rt.state.editor.line_at, Some(12));
+        assert!(rt.state.editor.line_edit.focus.abs_diff(col) <= 1, "{} vs {col}", rt.state.editor.line_edit.focus);
+        // End moves the caret off-screen right; the viewport follows it.
+        rt.key(rune::KeyEvent {
+            key: Key::End,
+            mods: rune::Mods::default(),
+        });
+        settle(&mut rt, t);
+        assert_eq!(rt.state.editor.line_edit.focus, 900);
+        let crumb = rt
+            .elements()
+            .into_iter()
+            .filter_map(|e| e.label.clone().or(e.text.clone()))
+            .any(|l| l.contains("Ln 13, Col 901"));
+        assert!(crumb, "the breadcrumb follows the caret-line field");
+        let field = rt.presented("editor-line-field").unwrap().0;
+        let caret_x = field[0] + long_w;
+        assert!(
+            caret_x <= view[0] + view[2] + 1.0 && caret_x >= view[0],
+            "caret at {caret_x} inside view {view:?}"
+        );
+    }
+
+    /// A real 27k-line source and a generated 20k-line netlist with long
+    /// lines stay responsive: bounded elements, quick frames while
+    /// scrolling both ways.
+    #[test]
+    fn large_real_and_netlist_files_stay_responsive() {
+        let ibex = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/ysyx_ibex.sv"
+        ))
+        .expect("examples/ysyx_ibex.sv");
+        let mut netlist = String::from("module top_netlist (input clk);\n");
+        for i in 0..20_000 {
+            netlist.push_str(&format!(
+                "  LUT6 #(.INIT(64'h{:016X})) u_lut_{i} (.O(n{i}), .I0(n{}), .I1(n{}), .I2(n{}), .I3(n{}), .I4(n{}), .I5(n{})); // {}\n",
+                (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                i + 1, i + 2, i + 3, i + 4, i + 5, i + 6,
+                "src/very/long/hierarchy/path/".repeat(4)
+            ));
+        }
+        netlist.push_str("endmodule");
+        for (name, text) in [("ysyx_ibex.sv", ibex), ("netlist.v", netlist)] {
+            let mut s = init();
+            s.center = CenterPane::Editor;
+            crate::views::editor::sync_edit(&mut s);
+            s.editor.lines = text.lines().map(str::to_string).collect();
+            s.editor.edit = TextEdit::new(text);
+            assert!(is_large(&s), "{name}");
+            let started = std::time::Instant::now();
+            let mut rt = rt(s);
+            let first = started.elapsed();
+            assert!(rt.elements().len() < 4_000, "{name}: {}", rt.elements().len());
+            let view = rt.presented("editor-scroll").unwrap().0;
+            let (cx, cy) = (view[0] + view[2] * 0.5, view[1] + view[3] * 0.5);
+            // Worst frame per axis: a vertical page builds fresh rows, a
+            // sideways step only moves the ones already built.
+            let mut worst = [std::time::Duration::ZERO; 2];
+            let mut t = 1.0;
+            for k in 0..40 {
+                let axis = (k / 4) % 2;
+                if axis == 0 {
+                    rt.wheel_xy(cx, cy, 0.0, -400.0);
+                } else {
+                    rt.wheel_xy(cx, cy, -80.0, 0.0);
+                }
+                let f = std::time::Instant::now();
+                rt.frame(t);
+                t += 0.2;
+                worst[axis] = worst[axis].max(f.elapsed());
+            }
+            assert!(rt.elements().len() < 4_000, "{name}: {}", rt.elements().len());
+            eprintln!(
+                "{name}: first frame {first:?}, worst vertical {:?}, worst sideways {:?}",
+                worst[0], worst[1]
+            );
+            let worst = worst[0].max(worst[1]);
+            // Debug build on a shared machine: a generous bound that still
+            // catches building or shaping every line per frame.
+            assert!(worst < std::time::Duration::from_secs(3), "{name}: {worst:?}");
+        }
+    }
+
     #[test]
     fn line_index_matches_text_lines() {
         let text = "a\n/* b\nc */ d\n\ne";
@@ -532,5 +862,11 @@ mod tests {
             vec![false, false, true, false, false]
         );
         assert_ne!(fingerprint("abc"), fingerprint("abd"));
+        // line_of agrees with the byte ranges, newline bytes included.
+        for (i, _) in lines.iter().enumerate() {
+            let r = idx.range(i);
+            assert_eq!(idx.line_of(r.start), i);
+            assert_eq!(idx.line_of(r.end), i, "the newline belongs to its line");
+        }
     }
 }

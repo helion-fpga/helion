@@ -2458,7 +2458,19 @@ impl<'a> Interp<'a> {
     fn sample_all(&mut self) {
         for idx in 0..self.trace_names.len() {
             let (dotted, width) = self.trace_names[idx].clone();
-            let (val, has_x) = if let Some(reg) = dotted.strip_prefix("tb.") {
+            // A TB signal bound to a DUT output carries the output's live
+            // value (as `resolve` reads it), not its never-written reg.
+            let bound_out = dotted
+                .strip_prefix("tb.")
+                .and_then(|reg| self.tb_to_dut.get(reg))
+                .filter(|port| self.dut_outputs.contains(*port))
+                .cloned();
+            let (val, has_x) = if let Some(port) = bound_out {
+                match self.sample_dut_port(&port, width) {
+                    Ok((v, _, x)) => (v, x),
+                    Err(_) => (0, true),
+                }
+            } else if let Some(reg) = dotted.strip_prefix("tb.") {
                 (self.regs.get(reg).copied().unwrap_or(0), false)
             } else if let Some(port) = dotted.strip_prefix("dut.") {
                 match self.sample_dut_port(port, width) {
@@ -3549,6 +3561,43 @@ endmodule
         assert_eq!(out.displays, 2, "{:?}", out.log);
         assert!(out.vcd_path.is_some_and(|p| p.is_file()));
         assert_eq!(out.dut_module, "counter");
+    }
+
+    /// A TB signal bound to a DUT output traces the output in the VCD (it
+    /// used to stay at its never-written placeholder 0).
+    #[test]
+    fn vcd_tb_signals_bound_to_dut_outputs_follow_the_output() {
+        let ex = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let d = tmp_dir("bound_out_vcd");
+        for f in ["counter.sv", "counter_tb.sv"] {
+            std::fs::copy(ex.join(f), d.join(f)).unwrap();
+        }
+        let mut cfg = TbRunConfig::new(d.join("counter_tb.sv"));
+        cfg.vcd = true;
+        let out = run_testbench(&cfg, None).unwrap();
+        let vcd = std::fs::read_to_string(out.vcd_path.unwrap()).unwrap();
+        let id = |name: &str| -> String {
+            vcd.lines()
+                .find(|l| l.starts_with("$var") && l.split_whitespace().nth(4) == Some(name))
+                .and_then(|l| l.split_whitespace().nth(3))
+                .unwrap_or_else(|| panic!("{name} in {vcd}"))
+                .to_string()
+        };
+        let changes = |id: &str| -> Vec<String> {
+            let mut t = String::new();
+            let mut out = Vec::new();
+            for l in vcd.lines().skip_while(|l| !l.starts_with("$enddefinitions")) {
+                if let Some(ts) = l.strip_prefix('#') {
+                    t = ts.to_string();
+                } else if l.len() > 1 && &l[1..] == id {
+                    out.push(format!("{t}:{}", &l[..1]));
+                }
+            }
+            out
+        };
+        let (tb, dut) = (changes(&id("tb.led")), changes(&id("dut.led")));
+        assert!(dut.iter().any(|c| c.ends_with(":1")), "led rises: {dut:?}");
+        assert_eq!(tb, dut, "tb.led mirrors dut.led");
     }
 
     #[test]
