@@ -204,10 +204,14 @@ def build(nl: Netlist, widths: dict[str, int]):
     for p in out_ports:
         w = max(widths.get(p, 1), 1)
         pads = [nl.pin_net.get((c, "I")) for c in nl.order if nl.cells[c][0] == "IobOut" and nl.pin_net.get((c, "PAD")) == p]
+        by_attr = {int(nl.attrs[c]["BIT"]): nl.pin_net.get((c, "I")) for c in nl.order
+                   if nl.cells[c][0] == "IobOut" and nl.attrs.get(c, {}).get("PORT") == p and nl.attrs[c].get("BIT", "").isdigit()}
         bits: list[str | None] = []
         for i in range(w):
             name = p if w == 1 else f"{p}_{i}"
-            if name in drivers:
+            if by_attr.get(i) is not None:
+                bits.append(by_attr[i])
+            elif name in drivers:
                 bits.append(name)
             elif len(pads) == w and pads[i] is not None:
                 bits.append(pads[i])
@@ -315,7 +319,7 @@ def check(files: list[str], top: str | None, cycles: int, seed: int, work: str) 
         with open(src, "w") as f:
             for p in files:
                 f.write(open(p).read() + "\n")
-    r = subprocess.run([HNF, src] + ([top] if top else []), capture_output=True, text=True, timeout=1800)
+    r = subprocess.run([HNF] + (['--legacy'] if os.environ.get('SVCHECK_LEGACY') else []) + [src] + ([top] if top else []), capture_output=True, text=True, timeout=1800)
     if r.returncode != 0:
         tail = [l for l in r.stderr.splitlines() if l.strip()][-1:] or ["synthesis failed"]
         return False, [f"synthesis: {tail[0][:300]}"]

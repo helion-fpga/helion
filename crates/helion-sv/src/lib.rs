@@ -9,6 +9,7 @@
 
 mod preprocess;
 mod line_cov;
+pub mod v2;
 pub use preprocess::{expand_includes, preprocess_sv};
 mod aig_opt;
 pub mod equiv;
@@ -25058,6 +25059,21 @@ pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
     // out-of-subset rejections raised) uniformly; elaboration only acts when
     // the top module actually carries assertions.
     sva::synth_sv_with_sva(source, origin).map(|o| o.design)
+}
+
+/// Synthesize with the second-generation front end (see [`v2`]): exact
+/// SystemVerilog width and sign rules, full hierarchy, no silent caps. An
+/// unsupported construct is an error naming it and its line.
+pub fn synth_sv_v2(source: &str, origin: &str, top: Option<&str>) -> Result<v2::Synth, String> {
+    let dir = Path::new(origin).parent().unwrap_or(Path::new("."));
+    let pre = preprocess_sv(&expand_includes(source, dir));
+    v2::synth(&pre, top).map_err(|e| format!("{origin}: {e}"))
+}
+
+/// [`synth_sv_v2`] on a file.
+pub fn synth_sv_v2_path(path: &Path, top: Option<&str>) -> Result<v2::Synth, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    synth_sv_v2(&text, &path.display().to_string(), top)
 }
 
 /// Module names in one SV file (helion-sv parse). UG900 SIM_TOP candidates.
