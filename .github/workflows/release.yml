@@ -128,7 +128,7 @@ jobs:
             echo
             echo "Original FPGA family + CAD. Native Apple Silicon app; Linux tarball (helion CLI + helion-ide)."
             echo "Linux helion-ide needs libxkbcommon0, libwayland-client0 and libusb-1.0-0 (present on desktop distros)."
-            echo "Unsigned macOS build — Gatekeeper will warn. Apache-2.0 OR MIT."
+            echo "Unsigned macOS build — Gatekeeper will warn. AGPL-3.0."
             echo
             sh scripts/changelog-excerpt.sh "$TAG"
             echo
