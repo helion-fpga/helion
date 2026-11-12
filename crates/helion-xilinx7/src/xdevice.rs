@@ -51,6 +51,8 @@ pub struct XDevice<'a> {
     flags: std::cell::RefCell<Vec<u8>>,
     /// Reusable A* state.
     search: std::cell::RefCell<SearchBuf>,
+    /// Congestion history per wire id (times a wire was fought over).
+    history: std::cell::RefCell<Vec<u16>>,
 }
 
 #[derive(Default)]
@@ -74,6 +76,7 @@ impl<'a> XDevice<'a> {
             owner: std::cell::RefCell::new((Vec::new(), HashMap::new())),
             flags: std::cell::RefCell::new(Vec::new()),
             search: std::cell::RefCell::new(SearchBuf::default()),
+            history: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -195,6 +198,8 @@ impl<'a> XDevice<'a> {
         }
         let own = self.owner.borrow();
         let my = own.1.get(net).copied().unwrap_or(u32::MAX);
+        // Clock nets keep their wires: they are never displaced.
+        let locked: Vec<u32> = self.clock_nets.iter().filter_map(|c| own.1.get(c).copied()).collect();
         let flags = self.wire_flags();
         let allowed = |id: u32| -> bool {
             let f = flags[id as usize];
@@ -215,7 +220,22 @@ impl<'a> XDevice<'a> {
                 return false;
             }
             let o = own.0.get(id as usize).copied().unwrap_or(0);
-            o == 0 || o == my
+            o == 0 || o == my || (opts.negotiate && !locked.contains(&o))
+        };
+        // Extra cost of taking `id`: congestion history, plus the price of
+        // displacing another net when negotiating.
+        const PRESENT_PS: u32 = 4000;
+        const HISTORY_PS: u32 = 250;
+        let hist = self.history.borrow();
+        let extra = |id: u32| -> u32 {
+            let mut c = hist.get(id as usize).copied().unwrap_or(0) as u32 * HISTORY_PS;
+            if opts.negotiate {
+                let o = own.0.get(id as usize).copied().unwrap_or(0);
+                if o != 0 && o != my {
+                    c += PRESENT_PS;
+                }
+            }
+            c
         };
         let is_target = |id: u32| targets.contains(&id);
         let tgt_xy: Vec<(i32, i32)> = targets.iter().map(|&t| self.wire_xy(t)).collect();
@@ -294,11 +314,12 @@ impl<'a> XDevice<'a> {
                         if seen!(m) && sb.parent[m as usize] == u32::MAX {
                             continue;
                         }
-                        if !seen!(m) || g < sb.best[m as usize] {
+                        let gm = g + extra(m);
+                        if !seen!(m) || gm < sb.best[m as usize] {
                             sb.stamp[m as usize] = stampv;
-                            sb.best[m as usize] = g;
+                            sb.best[m as usize] = gm;
                             sb.parent[m as usize] = id;
-                            heap.push(Reverse((g + h(m), g, m)));
+                            heap.push(Reverse((gm + h(m), gm, m)));
                         }
                     }
                 }
@@ -314,7 +335,7 @@ impl<'a> XDevice<'a> {
                 if !allowed(dst) {
                     continue;
                 }
-                let ng = g + pip.delay_ps as u32 + PIP_BASE;
+                let ng = g + pip.delay_ps as u32 + PIP_BASE + extra(dst);
                 if seen!(dst) && sb.parent[dst as usize] == u32::MAX {
                     continue;
                 }
@@ -627,6 +648,33 @@ impl<'a> RouteQuery for XDevice<'a> {
             }
         }
         cache.0 = claimed_len;
+    }
+
+    fn contested(&self, net: &str, pips: &[RoutedPip]) -> Vec<String> {
+        let own = self.owner.borrow();
+        let my = own.1.get(net).copied().unwrap_or(u32::MAX);
+        let mut hist = self.history.borrow_mut();
+        if hist.len() != self.wire_to_tile.len() {
+            hist.resize(self.wire_to_tile.len(), 0);
+        }
+        let mut oids: Vec<u32> = Vec::new();
+        for p in pips {
+            for w in [&p.src_wire, &p.dst_wire] {
+                let Some(id) = self.wire_id_of(&p.tile, w) else { continue };
+                let o = own.0.get(id as usize).copied().unwrap_or(0);
+                if o != 0 && o != my {
+                    hist[id as usize] = hist[id as usize].saturating_add(1);
+                    if !oids.contains(&o) {
+                        oids.push(o);
+                    }
+                }
+            }
+        }
+        own.1.iter().filter(|(_, v)| oids.contains(v)).map(|(k, _)| k.clone()).collect()
+    }
+
+    fn release_claims(&self) {
+        self.claim_cache.borrow_mut().0 = usize::MAX;
     }
 
     fn route_fast(

@@ -10794,11 +10794,13 @@ fn index_part_bit<'a>(
             // 32-way OR-of-eq LUT tree, not a 16-arm truncated cone. Wide
             // selects stay at 16 so a 32-bit address compare does not explode.
             let sel_w = rexpr_width(other, rtl).max(1);
-            let n = if sel_w <= 6 {
-                wsrc.min(32).max(1)
-            } else {
-                wsrc.min(16).max(1)
-            };
+            // Every index the select can reach is muxed; a cone too large
+            // to build is refused, never truncated.
+            let reach = if sel_w >= 20 { usize::MAX } else { 1usize << sel_w };
+            let n = wsrc.min(reach).max(1);
+            if n > 256 {
+                return Err("dynamic bit select too wide".into());
+            }
             let mut acc: Option<Expr> = None;
             for k in 0..n {
                 let eq = cmp_eq_bits(
@@ -17624,18 +17626,18 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     ));
                 }
             } else {
-                let bw = w.min(32);
-                for i in 0..bw {
-                    if let Ok(e) = rexpr_to_bit(rhs, rtl, i, &arena) {
-                        reg_bits.push((bit_name(lhs, w, i), e));
+                for i in 0..w {
+                    match rexpr_to_bit(rhs, rtl, i, &arena) {
+                        Ok(e) => reg_bits.push((bit_name(lhs, w, i), e)),
+                        Err(_) => note_assign_not_lowered(&rtl.module, &bit_name(lhs, w, i)),
                     }
                 }
             }
         } else {
-            let bw = w.min(32);
-            for i in 0..bw {
-                if let Ok(e) = rexpr_to_bit(rhs, rtl, i, &arena) {
-                    reg_bits.push((bit_name(lhs, w, i), e));
+            for i in 0..w {
+                match rexpr_to_bit(rhs, rtl, i, &arena) {
+                    Ok(e) => reg_bits.push((bit_name(lhs, w, i), e)),
+                    Err(_) => note_assign_not_lowered(&rtl.module, &bit_name(lhs, w, i)),
                 }
             }
         }

@@ -26,6 +26,9 @@ pub struct RouteOpts {
     /// Last resort for parts with an incomplete database: also use pips
     /// the database gives no configuration bits for.
     pub any_pip: bool,
+    /// Congestion negotiation: wires held by other nets are legal at a
+    /// cost; the caller rips up the nets the path displaces.
+    pub negotiate: bool,
 }
 
 /// What the router needs from the device model.
@@ -46,6 +49,13 @@ pub trait RouteQuery {
     /// Wires just claimed by `net` (`claimed_len` = size of the claim map
     /// afterwards), so a fast router can keep its own index current.
     fn note_claims(&self, _net: &str, _wires: &[(String, String)], _claimed_len: usize) {}
+    /// Nets other than `net` holding a wire of `pips` (a negotiated path);
+    /// the contested wires gain history cost so later searches avoid them.
+    fn contested(&self, _net: &str, _pips: &[RoutedPip]) -> Vec<String> {
+        Vec::new()
+    }
+    /// Claims were removed from the claim map: drop any derived index.
+    fn release_claims(&self) {}
     /// Returns the pips and, per pip, the arrival delay (ps) at its source
     /// and destination wires; `_tree` holds this net's wires with their
     /// known arrival delays.
@@ -300,7 +310,13 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     let mut graph_clocks = false;
     let mut net_names: Vec<String> = net_eps.keys().cloned().collect();
     net_names.sort();
-    for net in net_names {
+    // Negotiated congestion: a net with no free path takes the cheapest
+    // path through other nets' wires; those nets are ripped up and queued
+    // again. History cost on contested wires steers later searches away.
+    let max_rips = 40 * net_names.len() + 2000;
+    let mut rips = 0usize;
+    let mut queue: std::collections::VecDeque<String> = net_names.into();
+    while let Some(net) = queue.pop_front() {
         let eps = &net_eps[&net];
         if co_nets.contains(net.as_str()) {
             // Dedicated cascade: exactly one CO driver plus one CI load.
@@ -328,7 +344,34 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
             continue; // undriven net: nothing to route
         }
         let mut delays: Vec<(String, String, u32)> = Vec::new();
-        let kind = route_net(&net, drivers[0], &loads, device, &claimed, &mut delays)?;
+        let kind = match route_net(&net, drivers[0], &loads, device, &claimed, &mut delays, false) {
+            Ok(k) => k,
+            Err(e) if e.contains("unroutable") => {
+                delays.clear();
+                let k = route_net(&net, drivers[0], &loads, device, &claimed, &mut delays, true).map_err(|_| e.clone())?;
+                let victims = match &k {
+                    RouteKind::Pips(p) => device.contested(&net, p),
+                    _ => Vec::new(),
+                };
+                if victims.is_empty() {
+                    return Err(e);
+                }
+                rips += victims.len();
+                if rips > max_rips {
+                    return Err(format!("{e}; congestion not resolved after {rips} rip-ups"));
+                }
+                let vset: HashSet<&str> = victims.iter().map(|v| v.as_str()).collect();
+                nets.retain(|n: &RoutedNet7| !vset.contains(n.net.as_str()));
+                claimed.retain(|_, o| !vset.contains(o.as_str()));
+                load_delays.retain(|k, _| !vset.contains(k.0.as_str()));
+                device.release_claims();
+                for v in &victims {
+                    queue.push_back(v.clone());
+                }
+                k
+            }
+            Err(e) => return Err(e),
+        };
         if device.is_clock_net(&net) && matches!(kind, RouteKind::Pips(_)) {
             graph_clocks = true;
         }
@@ -375,6 +418,9 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         }
     }
 
+    if rips > 0 {
+        eprintln!("route: congestion resolved with {rips} rip-ups");
+    }
     Ok(Routed7 {
         placed: placed.clone(),
         nets,
@@ -434,6 +480,7 @@ fn route_net(
     device: &dyn RouteQuery,
     claimed: &HashMap<(String, String), String>,
     delays: &mut Vec<(String, String, u32)>,
+    negotiate: bool,
 ) -> Result<RouteKind, String> {
     // Split loads into site-internal (same site as driver and not a
     // LUT input) and external. Slice LUT inputs (A1-A6 and friends)
@@ -513,7 +560,7 @@ fn route_net(
             ));
         }
         let allow_byp = is_bypass_pin(&load.pin);
-        let opts = RouteOpts { allow_power, allow_byp, no_int: false, clock: false, any_pip: false };
+        let opts = RouteOpts { allow_power, allow_byp, no_int: false, clock: false, any_pip: false, negotiate };
         // A BUFG input takes the dedicated clock path (clock-capable pad ->
         // CMT/HROW -> BUFG) when one exists, else general interconnect.
         let mut fast = None;
