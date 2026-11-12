@@ -304,7 +304,7 @@ fn select_first_match(s: &mut AppState) {
     let query = s.device.find.text.clone();
     if let Some(live) = live_netlist(s) {
         let placed = live_placed(s);
-        let hits = s.device.matches(&query, &live, placed.as_ref());
+        let hits = s.device.matches(&query, &live, placed.as_deref());
         if let Some(sel) = hits.first() {
             select(s, sel.clone());
         }
@@ -1245,9 +1245,9 @@ pub fn device_pane(s: &AppState, t: &VivadoTheme) -> El {
     // Locate link) always fits when the bottom tabs take space.
     let mut right = col().w(RIGHT_W).h_full().gap(6.0).min_h(0.0);
     if s.device.find_open {
-        right = right.child(find_palette(s, t, live.as_ref(), placed.as_ref()));
+        right = right.child(find_palette(s, t, live.as_deref(), placed.as_deref()));
     }
-    right = right.child(device_inspector(s, t, live.as_ref(), placed.as_ref()));
+    right = right.child(device_inspector(s, t, live.as_deref(), placed.as_deref()));
     col()
         .key("device")
         .grow(1.0)
@@ -1266,7 +1266,7 @@ pub fn device_pane(s: &AppState, t: &VivadoTheme) -> El {
                 .gap(6.0)
                 .padding(6.0)
                 .child(layers_panel(s, t))
-                .child(device_canvas(s, t, &geom, live.as_ref(), placed.as_ref()))
+                .child(device_canvas(s, t, &geom, live.as_deref(), placed.as_deref()))
                 .child(right),
             DeviceView::Package => row()
                 .w_full()
@@ -1278,7 +1278,7 @@ pub fn device_pane(s: &AppState, t: &VivadoTheme) -> El {
                 .child(right),
         })
         .child(bottom_panel(s, t))
-        .child(device_status(s, t, &geom, live.as_ref(), placed.as_ref()))
+        .child(device_status(s, t, &geom, live.as_deref(), placed.as_deref()))
 }
 
 #[cfg(test)]

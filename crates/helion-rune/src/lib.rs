@@ -1473,6 +1473,7 @@ fn workspace(s: &AppState, t: &VivadoTheme) -> El {
 /// Root view: Vivado shell skeleton (titlebar, menu, rail, summary, status).
 /// Full surfaces arrive per batch; this proves theme + state + scenes render.
 pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
+    live::begin_frame();
     let t = s.theme.resolve(cx.system_dark());
     let title = if s.project.name.is_empty() {
         "Helion".to_string()
