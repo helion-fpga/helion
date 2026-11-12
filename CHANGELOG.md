@@ -9,8 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 Helion 4.0 replaces the desktop IDE. The new `helion-ide` is built from
 scratch on the [Rune](https://github.com/anomalyco/rune) UI framework and
-covers the whole design flow, from sources to a programmed board, in one
-Vivado-style window. Rune is vendored, so a plain clone builds. The native
+covers the whole design flow, from sources to a bitstream and the Hardware
+Manager, in one Vivado-style window. Rune is vendored, so a plain clone builds. The native
 JTAG engine now talks to real hardware, and two Lattice backends (iCE40 and
 ECP5) join the HL10 and Xilinx 7-series flows. The empty-XDC
 `examples/counter.sv` gold is unchanged: `WNS_PS=9640`,
