@@ -20,7 +20,7 @@ use helion_sta::{
     Constraints, OperatingConditions, PowerReport, TimingResult, apply_xdc, create_clock, load_sdc,
     load_xdc, report_power, report_timing_routed, report_timing_routed_xdc,
 };
-use helion_sv::{elaborate_sv_sources, synth_sv_files, synth_sv_path};
+use helion_sv::synth_sv_auto_files;
 use helion_vhdl::synth_vhdl_path;
 use std::path::Path;
 
@@ -124,7 +124,7 @@ fn synth_any(path: &str) -> Result<helion_ir::Design, String> {
         }
         "vhd" | "vhdl" => synth_vhdl_path(p),
         "c" | "cc" | "cpp" => synth_c_path(p),
-        _ => synth_sv_path(p),
+        _ => synth_sv_auto_files(&[p], None),
     }?;
     sweep_parallel_iob_identity_luts(&mut d);
     Ok(d)
@@ -282,33 +282,10 @@ fn synth_project_sources(
             "multi-file / top= projects currently require SystemVerilog (.sv/.v) sources".into(),
         );
     }
-    if let Some(t) = top {
-        // Read source files in parallel (I/O bound, safe to parallelize)
-        let owned: Vec<(String, String)> = {
-            use rayon::prelude::*;
-            paths
-                .par_iter()
-                .map(|p| {
-                    let src = std::fs::read_to_string(p)
-                        .map_err(|e| format!("{}: {e}", p.display()))?;
-                    Ok::<(String, String), String>((p.display().to_string(), src))
-                })
-                .collect::<Result<Vec<_>, String>>()?
-        };
-        let refs: Vec<(&str, &str)> = owned
-            .iter()
-            .map(|(a, b)| (a.as_str(), b.as_str()))
-            .collect();
-        let (mut d, _) =
-            elaborate_sv_sources(&refs, Some(t), &Default::default(), &Default::default())?;
-        sweep_parallel_iob_identity_luts(&mut d);
-        Ok(d)
-    } else {
-        let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
-        let mut d = synth_sv_files(&refs)?;
-        sweep_parallel_iob_identity_luts(&mut d);
-        Ok(d)
-    }
+    let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
+    let mut d = synth_sv_auto_files(&refs, top)?;
+    sweep_parallel_iob_identity_luts(&mut d);
+    Ok(d)
 }
 
 fn main() {

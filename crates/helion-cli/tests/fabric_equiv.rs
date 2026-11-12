@@ -98,9 +98,17 @@ fn check(src: &str, part: &str, cycles: usize) -> (u32, usize) {
 /// As [`check`], with a hook to alter the routed design before bitgen. A
 /// pad that differs from the netlist is returned as an error.
 fn check_with(src: &str, part: &str, cycles: usize, tamper: impl Fn(&mut helion_route::Routed)) -> Result<(u32, usize), String> {
-    let design = helion_sv::synth_sv(src, "t.sv").expect("synth");
+    let design = helion_sv::synth_sv_v2(src, "t.sv", None).expect("synth").design;
+    check_design(&design, part, cycles, tamper)
+}
+
+/// Pack, place, route and bitgen `design`, program the fabric model with
+/// the bitstream and compare it with a simulation of the netlist.
+fn check_design(design: &Design, part: &str, cycles: usize, tamper: impl Fn(&mut helion_route::Routed)) -> Result<(u32, usize), String> {
     let dev = Device::load_part(part).expect("part");
-    let packed = pack(&design, &dev).expect("pack");
+    let mut packed = pack(design, &dev).expect("pack");
+    let fit = packed.fit_pads(dev.iob_sites().count());
+    assert!(fit.undriven.is_empty() && fit.over_budget.is_empty(), "pads do not fit: {fit:?}");
     assert!(packed.conn.undriven.is_empty(), "undriven LUT inputs: {:?}", packed.conn.undriven);
     let placed = place(&packed, &dev).expect("place");
     let mut routed = route(&placed, &dev).expect("route");
@@ -111,7 +119,7 @@ fn check_with(src: &str, part: &str, cycles: usize, tamper: impl Fn(&mut helion_
     fab.program(&bits).expect("program");
     fab.finish_startup();
 
-    let mut sim = NetSim::new(&design);
+    let mut sim = NetSim::new(design);
     let pins = design.pin_index();
     // Output pads: the netlist net on each IOB's I pin, and its site.
     let outs: Vec<(String, Spur, (u32, u32))> = routed
@@ -232,22 +240,28 @@ endmodule
     assert!(nets > 4 && wires > 8);
 }
 
-/// `examples/complex.sv` connects instance ports to bit-selects of a bus.
-/// The front end leaves those LUT inputs without a driver; the back end
-/// reports them instead of wiring something up.
+/// `examples/complex.sv` connects instance ports to bit-selects of a bus,
+/// which the first-generation front end left without drivers.
 #[test]
-fn incomplete_netlist_is_reported() {
+fn hierarchy_through_bus_bit_selects() {
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/complex.sv")).expect("examples/complex.sv");
-    let design = helion_sv::synth_sv(&src, "complex.sv").expect("synth");
-    let dev = Device::load_part(PART).expect("part");
-    let packed = pack(&design, &dev).expect("pack");
-    if packed.conn.undriven.is_empty() {
-        // The front end has been fixed: the design must then be equivalent.
-        check(&src, PART, 300);
-        return;
-    }
-    let routed = route(&place(&packed, &dev).expect("place"), &dev).expect("route");
-    assert_eq!(routed.tracks.undriven as usize, packed.conn.undriven.len());
+    check(&src, PART, 300);
+}
+
+/// The whole Ibex core behind `examples/ibex_obs_wrap.sv`: 11.5k LUTs and
+/// 2.2k flops on HL10S-C64-1, every connection routed, the bitstream run in
+/// the fabric model against the netlist. (`tools/svcheck` shows that this
+/// netlist equals the RTL.) Takes a few minutes: run with `--ignored`.
+#[test]
+#[ignore]
+fn ibex_bitstream_equals_its_netlist() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/");
+    helion_sv::set_sv_defines(&["VERILATOR"]);
+    let files = [format!("{root}ysyx_ibex.sv"), format!("{root}ibex_obs_wrap.sv")];
+    let paths: Vec<&std::path::Path> = files.iter().map(|f| std::path::Path::new(f.as_str())).collect();
+    let design = helion_sv::synth_sv_v2_files(&paths, Some("ibex_obs_wrap")).expect("synth").design;
+    let (nets, wires) = check_design(&design, "HL10S-C64-1", 60, |_| {}).expect("fabric matches the netlist");
+    assert!(nets > 5000 && wires > 20000, "{nets} nets on {wires} wires");
 }
 
 /// Large enough for the placer's wirelength refinement and for real
@@ -269,7 +283,7 @@ module top(input logic clk, input logic [7:0] a, input logic [3:0] k, output log
   assign o = r[15:0] ^ s[31:16] ^ t[23:8] ^ u[15:0] ^ v[31:16] ^ w[20:5] ^ {4{k}};
 endmodule
 "#;
-    let design = helion_sv::synth_sv(src, "t.sv").expect("synth");
+    let design = helion_sv::synth_sv_v2(src, "t.sv", None).expect("synth").design;
     let dev = Device::load_part(PART).expect("part");
     let packed = pack(&design, &dev).expect("pack");
     assert!(packed.lutffs.len() >= helion_place::wl::MIN_CLUSTERS, "only {} clusters", packed.lutffs.len());

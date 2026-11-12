@@ -1,0 +1,8 @@
+# Helion project — the ysyx Ibex core behind a 27-pin wrapper that keeps the
+# whole core observable (see ibex_obs_wrap.sv). Build with
+# HELION_DEFINES=VERILATOR so the core takes its clock from the pin.
+part HL10S-C64-1
+read_sv examples/ysyx_ibex.sv
+read_sv examples/ibex_obs_wrap.sv
+top ibex_obs_wrap
+read_xdc examples/ibex_core.sdc

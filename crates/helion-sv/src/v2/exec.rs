@@ -1359,7 +1359,7 @@ impl Elab {
             }
         }
         let f = self.dag.bit(false);
-        let mut flag = |s: &mut Self, x: Option<N>, y: Option<N>| -> Option<N> {
+        let flag = |s: &mut Self, x: Option<N>, y: Option<N>| -> Option<N> {
             if x.is_none() && y.is_none() {
                 return None;
             }
@@ -1652,9 +1652,16 @@ impl Elab {
             if self.is_dead(env) {
                 break;
             }
+            // The step runs unconditionally: after a `return` or `break`
+            // under a condition, the loop is still unrolled to its bound
+            // (with everything visible masked), so its index must stay a
+            // constant.
+            let saved = (env.ret, env.brk, env.cont, env.outer);
+            (env.ret, env.brk, env.cont, env.outer) = (None, None, None, None);
             for st in step {
                 self.exec(st, sc, env)?;
             }
+            (env.ret, env.brk, env.cont, env.outer) = saved;
             iters += 1;
             if iters > 1 << 16 {
                 self.line = line;

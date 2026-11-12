@@ -143,7 +143,7 @@ impl Grid {
 }
 
 const BASE_COST: u32 = 10;
-const MAX_ROUNDS: u32 = 80;
+const MAX_ROUNDS: u32 = 400;
 /// Tree wires this many tiles farther from a sink than the nearest one are
 /// not considered as branch points.
 const SEED_SLACK: u32 = 3;
@@ -505,16 +505,41 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
             break;
         }
         if rounds >= MAX_ROUNDS {
+            if std::env::var("HELION_TRK_DBG").is_ok() {
+                for (w, &c) in occ.iter().enumerate() {
+                    if c > 1 {
+                        let (x, y, d, t) = grid.parts(w as u32);
+                        let users: Vec<String> = (0..nets.len())
+                            .filter(|&i| tree[i].iter().any(|&(tw, _)| tw as usize == w))
+                            .map(|i| format!("net{i}(sinks {}, src {:?})", nets[i].sinks.len(), match nets[i].src { Src::Ble { x, y, .. } => (x, y), Src::Pad { input } => (input_x[&input], pad_row) }))
+                            .collect();
+                        let chan_used = (0..TRACKS).filter(|&tt| grid.wire(x, y, d, tt).map(|ww| occ[ww as usize] > 0).unwrap_or(false)).count();
+                        let (dx, dy) = grid.dest(w as u32);
+                        let mut inbound = 0;
+                        for dd in 0..4 {
+                            if let Some((nx, ny)) = tk::step(dx, dy, dd) {
+                                for tt in 0..TRACKS {
+                                    if let Some(ww) = grid.wire(nx, ny, tk::opposite(dd), tt) {
+                                        if occ[ww as usize] > 0 { inbound += 1; }
+                                    }
+                                }
+                            }
+                        }
+                        let sinks_here: usize = nets.iter().map(|n| n.sinks.iter().filter(|s| sink_tile(s) == (dx, dy)).count()).sum();
+                        eprintln!("DBG shared ({x},{y}) dir {d} t {t} occ {c} hist {} chan_used {chan_used}/{TRACKS} dest {:?} inbound_used {inbound} sinks_in_dest {sinks_here} pres {pres_fac}: {}", hist[w], (dx, dy), users.join(" "));
+                    }
+                }
+            }
             return Err(format!(
                 "route: congestion not resolved after {rounds} rounds: {n_shared} wires still carry more than one net"
             ));
         }
         for (w, &c) in occ.iter().enumerate() {
             if c > 1 {
-                hist[w] += (c as u32 - 1) * (BASE_COST / 2);
+                hist[w] += (c as u32 - 1) * BASE_COST;
             }
         }
-        pres_fac = (pres_fac * 1.7).min(1000.0);
+        pres_fac = (pres_fac * 1.5).min(400.0);
         todo = (0..nets.len()).filter(|&i| tree[i].iter().any(|&(w, _)| shared[w as usize])).collect();
     }
 
@@ -531,7 +556,7 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
                 }
             } else {
                 let (_, _, pdir, ptrack) = grid.parts(p);
-                tk::SB_WIRE + tk::opposite(pdir) * TRACKS + ptrack
+                tk::sb_wire_sel(dir, tk::opposite(pdir), ptrack)
             };
             out.sb.push(SbRoute { x, y, dir: dir as u8, track: track as u8, sel: sel as u8 });
         }
