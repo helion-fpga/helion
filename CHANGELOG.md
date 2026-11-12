@@ -5,7 +5,11 @@ All notable Helion releases are listed here. Version numbers match
 Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/helion/releases).
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [4.0.0] — Unreleased
+## [Unreleased]
+
+[Unreleased]: https://github.com/helion-fpga/helion/compare/v4.0.0...HEAD
+
+## [4.0.0] — 2026-11-12
 
 Helion 4.0 replaces the desktop IDE. The new `helion-ide` is built from
 scratch on the [Rune](https://github.com/anomalyco/rune) UI framework and
@@ -171,8 +175,22 @@ ECP5) join the HL10 and Xilinx 7-series flows. The empty-XDC
 - One test shelled a real openFPGALoader and another sent configuration
   opcodes to a connected cable; both are now impossible in test builds, and
   a poisoned openFPGALoader environment lock no longer fails unrelated tests.
+- After an implementation run, Tcl reports in the console failed with "no
+  design". Finished runs now open for Tcl (`open_run ?run?`, like Vivado's
+  Open Implemented Design) with the run's constraints, so console
+  `report_timing` matches the run.
+- The Device view never finished drawing large designs: every I/O port row
+  rebuilt the live netlist each frame. It is now built once per frame
+  (full Ibex: from over 30 minutes to about 75 seconds).
+- Mapping a VHDL testbench (`wait for`, bare `wait;`) hung the SystemVerilog
+  front end. Such files are now a `sim_only` diagnostic with an empty
+  design; they still run in the VHDL testbench simulator.
+- Timing path names truncate in the middle and schematic labels stay inside
+  their boxes; Sources shows a multi-module file as the project top.
+- iCE40/ECP5 scenes no longer share a scratch directory, which raced in
+  parallel snapshot tests.
 
-[4.0.0]: https://github.com/helion-fpga/helion/compare/v3.0.0...HEAD
+[4.0.0]: https://github.com/helion-fpga/helion/compare/v3.0.0...v4.0.0
 
 ## [3.0.0] — 2026-10-12
 
