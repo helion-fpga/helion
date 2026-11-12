@@ -275,7 +275,7 @@ mod tests {
     const CHILD: &str = "module child(input clk, input [1:0] sel, output reg [3:0] q);\n  always @(posedge clk) q <= q + {2'b0, sel};\nendmodule\n";
 
     fn setup(name: &str) -> (PathBuf, Vec<PathBuf>) {
-        let dir = std::env::temp_dir().join(format!("helion-ooc-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("helion-ooc-unit-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let top = dir.join("top.v");

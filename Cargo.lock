@@ -1529,6 +1529,7 @@ name = "helion-place"
 version = "4.0.0"
 dependencies = [
  "criterion",
+ "helion-backend",
  "helion-device",
  "helion-ir",
  "helion-pack",

@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 mod cdc;
 mod constraints_codec;
+pub mod graph;
 pub mod signoff;
 pub use signoff::*;
 pub mod ug903;
@@ -1093,6 +1094,16 @@ pub fn report_timing_routed_with_model(
     r.wns_ps = clocks[0].period_ps as i64 - r.setup_ps;
     r.tns_ps = r.wns_ps.min(0);
     r.hold_slack_ps = r.hold_ps - tm.hold_req_ps;
+    // With the full connection list the paths are known exactly: as many
+    // LUTs as the netlist has, each connection as it was routed.
+    if let Some(g) = graph::analyze(routed, tm, clocks[0].period_ps as i64) {
+        r.r2r_ps = g.reg_ps;
+        r.iob_ps = g.out_ps;
+        r.setup_ps = g.reg_ps.max(g.out_ps);
+        r.wns_ps = clocks[0].period_ps as i64 - r.setup_ps;
+        r.tns_ps = g.tns_ps;
+        r.endpoints = g.endpoints;
+    }
     Ok(r)
 }
 

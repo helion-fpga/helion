@@ -658,6 +658,19 @@ fn enc_tracks(w: &mut Writer, t: &TrackRoutes) {
     w.u32(t.nets);
     w.u32(t.iters);
     w.u32(t.undriven);
+    w.u32(t.pin_hops.len() as u32);
+    for h in &t.pin_hops {
+        w.u32(h.0);
+        w.u32(h.1);
+        w.u32(h.2);
+        w.u32(h.3);
+    }
+    w.u32(t.pad_hops.len() as u32);
+    for h in &t.pad_hops {
+        w.u32(h.0);
+        w.u32(h.1);
+        w.u32(h.2);
+    }
 }
 
 fn dec_tracks(r: &mut Reader) -> Result<TrackRoutes, String> {
@@ -681,6 +694,14 @@ fn dec_tracks(r: &mut Reader) -> Result<TrackRoutes, String> {
     t.nets = r.u32()?;
     t.iters = r.u32()?;
     t.undriven = r.u32()?;
+    if r.pos < r.buf.len() {
+        for _ in 0..r.u32()? {
+            t.pin_hops.push((r.u32()?, r.u32()?, r.u32()?, r.u32()?));
+        }
+        for _ in 0..r.u32()? {
+            t.pad_hops.push((r.u32()?, r.u32()?, r.u32()?));
+        }
+    }
     Ok(t)
 }
 

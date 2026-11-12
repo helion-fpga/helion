@@ -248,6 +248,25 @@ fn compile_design_xdc(
             timing.iob_ps,
             t4.elapsed().as_millis()
         );
+        // The slowest path, as routed.
+        let period = clks[0].period_ps as i64;
+        if let Some(g) = helion_sta::graph::analyze_hl10t(&routed, period) {
+            let worst = g.reg_ps.max(g.out_ps);
+            eprintln!(
+                "timing: slowest path {:.2} ns through {} LUT level(s) against a {:.2} ns clock ({:.0} MHz possible); {} of {} endpoints fail",
+                worst as f64 / 1000.0,
+                g.levels,
+                period as f64 / 1000.0,
+                1.0e6 / worst.max(1) as f64,
+                g.failing,
+                g.endpoints
+            );
+            if g.failing > 0 {
+                let shown: Vec<String> = g.worst_path.iter().map(|(n, t)| format!("{n} @{:.2}", *t as f64 / 1000.0)).collect();
+                let cut = if shown.len() > 8 { format!("{} ... {}", shown[..3].join(" -> "), shown[shown.len() - 3..].join(" -> ")) } else { shown.join(" -> ") };
+                eprintln!("timing: {cut}");
+            }
+        }
     }
     Ok(Compiled {
         dev,
