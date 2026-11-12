@@ -6,7 +6,7 @@
 
 use super::ast::*;
 use super::dag::{Dag, N};
-use super::lower::{Drv, Flat, Port, Reg, SigInfo};
+use super::lower::{Drv, Flat, Latch, Port, Reg, SigInfo};
 use helion_ir::PortDir;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -76,6 +76,8 @@ pub enum Sym {
     Type(Rc<Ty>),
     Func(Rc<FuncDecl>, usize),
     Var(u32),
+    /// An instance or a labelled generate block: its scope.
+    Inst(usize),
 }
 
 pub struct Scope {
@@ -84,10 +86,17 @@ pub struct Scope {
     /// Scopes of wildcard-imported packages.
     pub imports: Vec<usize>,
     pub prefix: String,
+    /// Dotted hierarchical path of this scope (for register maps).
+    pub hier: String,
+    /// Generate constructs seen in this scope: an unnamed block of the
+    /// n-th one is called `genblk<n>` (IEEE 1800, 27.6).
+    pub gen_count: u32,
 }
 
 pub struct Sig {
     pub name: String,
+    /// Dotted hierarchical name.
+    pub hier: String,
     pub ty: Rc<Ty>,
     pub drv: Vec<Drv>,
     pub init: Vec<bool>,
@@ -105,17 +114,18 @@ pub struct Elab {
     pub sigs: Vec<Sig>,
     pub vars: Vec<VarInfo>,
     pub regs: Vec<Reg>,
+    pub latches: Vec<Latch>,
     modules: HashMap<String, Rc<Module>>,
     order: Vec<String>,
     packages: HashMap<String, Rc<Package>>,
     pkg_scope: HashMap<String, usize>,
     unit_scope: usize,
+    broken: Vec<(String, String)>,
     pub warnings: Vec<String>,
     pub call_depth: u32,
     pub ret_stack: Vec<Option<u32>>,
     pub ps: super::exec::ProcState,
     inst_depth: u32,
-    genblk: u32,
     /// Line of the item being elaborated, for messages.
     pub line: u32,
 }
@@ -124,21 +134,22 @@ impl Elab {
     pub fn new(src: Source) -> R<Self> {
         let mut e = Elab {
             dag: Dag::default(),
-            scopes: vec![Scope { parent: None, syms: HashMap::new(), imports: Vec::new(), prefix: String::new() }],
+            scopes: vec![Scope { parent: None, syms: HashMap::new(), imports: Vec::new(), prefix: String::new(), hier: String::new(), gen_count: 0 }],
             sigs: Vec::new(),
             vars: Vec::new(),
             regs: Vec::new(),
+            latches: Vec::new(),
             modules: HashMap::new(),
             order: Vec::new(),
             packages: HashMap::new(),
             pkg_scope: HashMap::new(),
             unit_scope: 0,
+            broken: src.broken.clone(),
             warnings: Vec::new(),
             call_depth: 0,
             ret_stack: Vec::new(),
             ps: Default::default(),
             inst_depth: 0,
-            genblk: 0,
             line: 0,
         };
         for m in src.modules {
@@ -163,7 +174,8 @@ impl Elab {
     }
 
     pub fn new_scope(&mut self, parent: usize, prefix: String) -> usize {
-        self.scopes.push(Scope { parent: Some(parent), syms: HashMap::new(), imports: Vec::new(), prefix });
+        let hier = self.scopes[parent].hier.clone();
+        self.scopes.push(Scope { parent: Some(parent), syms: HashMap::new(), imports: Vec::new(), prefix, hier, gen_count: 0 });
         self.scopes.len() - 1
     }
 
@@ -230,7 +242,8 @@ impl Elab {
     fn new_sig(&mut self, sc: usize, name: &str, ty: Rc<Ty>) -> u32 {
         let w = ty.w() as usize;
         let full = format!("{}{}", self.prefix(sc), name);
-        self.sigs.push(Sig { name: full, ty, drv: vec![Drv::None; w], init: vec![false; w], line: self.line });
+        let hier = format!("{}{}", self.scopes[sc].hier, name);
+        self.sigs.push(Sig { name: full, hier, ty, drv: vec![Drv::None; w], init: vec![false; w], line: self.line });
         let id = self.sigs.len() as u32 - 1;
         self.scopes[sc].syms.insert(name.to_string(), Sym::Sig(id));
         id
@@ -270,6 +283,7 @@ impl Elab {
                 self.with_dims(base, &dims[..dims.len() - 1], sc)
             }
             DataType::Int { width, signed } => Ok(Ty::bits(*width, *signed)),
+            DataType::Str => self.err("'string' can only be the type of a parameter"),
             DataType::Named { path, dims } => {
                 let base = match self.lookup_path(sc, path)? {
                     Sym::Type(t) => t,
@@ -367,6 +381,8 @@ impl Elab {
             return Ok(());
         }
         let declared = match &p.ty {
+            // A string parameter is as wide as its value.
+            Some(DataType::Str) => None,
             Some(t) => {
                 let base = self.resolve_type(t, sc)?;
                 Some(self.with_unpacked(base, &p.unpacked, sc)?)
@@ -400,30 +416,82 @@ impl Elab {
 
     /// Elaborate module-level items in scope `sc`.
     pub fn items(&mut self, items: &[Item], sc: usize) -> R<()> {
-        // Functions and types may be used before their declaration.
+        let refs: Vec<&Item> = items.iter().collect();
+        self.items_ref(&refs, sc)
+    }
+
+    /// Declarations first, then instances and generate blocks, then
+    /// assignments and processes: a name may be used before the item that
+    /// declares it, and a hierarchical reference may reach into an
+    /// instance that appears later in the source.
+    pub fn items_ref(&mut self, items: &[&Item], sc: usize) -> R<()> {
+        // Groups the parser made from one statement are part of this list.
+        let mut flat: Vec<&Item> = Vec::with_capacity(items.len());
         for it in items {
+            match it {
+                Item::Block(b) if b.label.is_none() && b.items.iter().all(|i| matches!(i, Item::Param(_) | Item::Assign { .. } | Item::Decl { .. })) && b.items.iter().any(|i| matches!(i, Item::Param(_) | Item::Assign { .. })) => {
+                    flat.extend(b.items.iter())
+                }
+                other => flat.push(other),
+            }
+        }
+        for it in &flat {
             if let Item::Func(f) = it {
                 self.scopes[sc].syms.insert(f.name.clone(), Sym::Func(f.clone(), sc));
             }
         }
-        for it in items {
-            self.item(it, sc)?;
+        for phase in 0..3 {
+            for it in &flat {
+                let p = match it {
+                    Item::Decl { .. } | Item::Param(_) | Item::Typedef { .. } | Item::Func(_) | Item::Import { .. } | Item::Genvar(_) | Item::PortDir(_) => 0,
+                    Item::Inst(_) | Item::GenFor { .. } | Item::GenIf { .. } | Item::GenCase { .. } | Item::Block(_) => 1,
+                    Item::Assign { .. } | Item::Always { .. } => 2,
+                };
+                if p == phase {
+                    self.item(it, sc)?;
+                }
+            }
         }
         Ok(())
     }
 
-    fn gen_scope(&mut self, b: &GenBlock, sc: usize, suffix: Option<i64>) -> usize {
-        let label = match (&b.label, suffix) {
-            (Some(l), Some(i)) => format!("{l}_{i}_"),
-            (Some(l), None) => format!("{l}_"),
-            (None, Some(i)) => {
-                self.genblk += 1;
-                format!("genblk{}_{i}_", self.genblk)
-            }
-            (None, None) => String::new(),
+    /// Scope of a generate block: `n` is the number of its generate
+    /// construct in `sc`, which names the block when it has no label.
+    fn gen_scope(&mut self, b: &GenBlock, sc: usize, suffix: Option<i64>, n: u32) -> usize {
+        let name = match &b.label {
+            Some(l) => l.clone(),
+            None => format!("genblk{n}"),
         };
-        let prefix = format!("{}{}", self.prefix(sc), label);
-        self.new_scope(sc, prefix)
+        let (flat, hier, key) = match suffix {
+            Some(i) => (format!("{name}_{i}_"), format!("{name}[{i}]."), format!("{name}[{i}]")),
+            None => (format!("{name}_"), format!("{name}."), name.clone()),
+        };
+        let prefix = format!("{}{}", self.prefix(sc), flat);
+        let s = self.new_scope(sc, prefix);
+        self.scopes[s].hier = format!("{}{}", self.scopes[sc].hier, hier);
+        self.scopes[sc].syms.insert(key, Sym::Inst(s));
+        s
+    }
+
+    fn next_gen(&mut self, sc: usize) -> u32 {
+        self.scopes[sc].gen_count += 1;
+        self.scopes[sc].gen_count
+    }
+
+    /// The taken branch of a conditional generate. An `else if` directly
+    /// nested in an unnamed `else` is the same construct, not a new level.
+    fn gen_if(&mut self, cond: &Expr, then: &GenBlock, els: Option<&GenBlock>, sc: usize, n: u32) -> R<()> {
+        let c = self.const_int(cond, sc)? != 0;
+        let b = if c { Some(then) } else { els };
+        let Some(b) = b else { return Ok(()) };
+        if !c && b.label.is_none() && b.items.len() == 1 {
+            if let Item::GenIf { cond, then, els, line } = &b.items[0] {
+                self.line = *line;
+                return self.gen_if(cond, then, els.as_ref(), sc, n);
+            }
+        }
+        let s = self.gen_scope(b, sc, None, n);
+        self.items(&b.items, s)
     }
 
     fn item(&mut self, it: &Item, sc: usize) -> R<()> {
@@ -447,7 +515,14 @@ impl Elab {
                         let n = self.eval_to_type(init, &t, sc, &mut super::exec::Env::default())?;
                         match self.dag.as_const(n) {
                             Some(b) => self.sigs[id as usize].init = b.to_vec(),
-                            None => return self.err(format!("the initial value of '{}' is not constant", d.name)),
+                            None => {
+                                // By the language this applies once, at time
+                                // zero; it is not a continuous assignment.
+                                self.warnings.push(format!(
+                                    "line {}: the initializer of '{}' is not constant, so it only applies at time zero and is ignored; write 'assign' (or declare a 'wire') for a continuous assignment",
+                                    line, d.name
+                                ));
+                            }
                         }
                     }
                 }
@@ -480,23 +555,14 @@ impl Elab {
                 Ok(())
             }
             Item::Block(b) => {
-                if b.label.is_none() && b.items.iter().all(|i| matches!(i, Item::Param(_) | Item::Assign { .. } | Item::Decl { .. })) && b.items.iter().any(|i| matches!(i, Item::Param(_) | Item::Assign { .. })) {
-                    // A group the parser made from one statement (several
-                    // parameters, a net with an initializer): same scope.
-                    return self.items(&b.items, sc);
-                }
-                let s = self.gen_scope(b, sc, None);
+                let n = self.next_gen(sc);
+                let s = self.gen_scope(b, sc, None, n);
                 self.items(&b.items, s)
             }
             Item::GenIf { cond, then, els, line } => {
                 self.line = *line;
-                let c = self.const_int(cond, sc)? != 0;
-                let b = if c { Some(then) } else { els.as_ref() };
-                if let Some(b) = b {
-                    let s = self.gen_scope(b, sc, None);
-                    self.items(&b.items, s)?;
-                }
-                Ok(())
+                let n = self.next_gen(sc);
+                self.gen_if(cond, then, els.as_ref(), sc, n)
             }
             Item::GenCase { expr, arms, line } => {
                 self.line = *line;
@@ -520,8 +586,9 @@ impl Elab {
                         break;
                     }
                 }
+                let n = self.next_gen(sc);
                 if let Some(b) = chosen {
-                    let s = self.gen_scope(b, sc, None);
+                    let s = self.gen_scope(b, sc, None, n);
                     self.items(&b.items, s)?;
                 }
                 Ok(())
@@ -532,17 +599,10 @@ impl Elab {
                 let Stmt::Assign { rhs: step_rhs, .. } = step else {
                     return self.err("generate loop step must be an assignment");
                 };
-                self.genblk += 1;
-                let blk = self.genblk;
+                let blk = self.next_gen(sc);
                 let mut count = 0;
                 loop {
-                    let s = match &body.label {
-                        Some(_) => self.gen_scope(body, sc, Some(i)),
-                        None => {
-                            let prefix = format!("{}genblk{blk}_{i}_", self.prefix(sc));
-                            self.new_scope(sc, prefix)
-                        }
-                    };
+                    let s = self.gen_scope(body, sc, Some(i), blk);
                     let n = self.kint(i, 32);
                     self.scopes[s].syms.insert(var.clone(), Sym::Const { n, ty: Ty::bits(32, true) });
                     self.line = *line;
@@ -606,6 +666,9 @@ impl Elab {
 
     fn instance(&mut self, d: &InstDecl, sc: usize) -> R<()> {
         let Some(m) = self.modules.get(&d.module).cloned() else {
+            if let Some((_, why)) = self.broken.iter().find(|b| b.0 == d.module) {
+                return self.err(format!("module '{}' (instance '{}') cannot be synthesized: {why}", d.module, d.name));
+            }
             return self.err(format!("module '{}' is not defined (instance '{}')", d.module, d.name));
         };
         if m.is_interface {
@@ -617,6 +680,8 @@ impl Elab {
         }
         let prefix = format!("{}{}_", self.prefix(sc), d.name);
         let child = self.new_scope(self.unit_scope, prefix);
+        self.scopes[sc].syms.insert(d.name.clone(), Sym::Inst(child));
+        self.scopes[child].hier = format!("{}{}.", self.scopes[sc].hier, d.name);
         // Parameters: overrides are evaluated in the parent's scope.
         let mut over: HashMap<String, ParamArg> = HashMap::new();
         let settable: Vec<&ParamDecl> = m.params.iter().filter(|p| !p.local).collect();
@@ -813,27 +878,36 @@ impl Elab {
         }
         // The body; a non-ANSI redeclaration of a port is not a new signal.
         let port_set: std::collections::HashSet<&str> = if m.port_names.is_empty() { Default::default() } else { m.port_names.iter().map(|s| s.as_str()).collect() };
+        let mut extra: Vec<Item> = Vec::new();
+        let mut keep: Vec<&Item> = Vec::new();
         for it in &body {
-            if let Item::Func(_) = it {
-                continue;
-            }
             if let Item::Decl { ty, names, line } = it {
                 if names.iter().any(|n| port_set.contains(n.name.as_str())) {
                     let rest: Vec<Declarator> = names.iter().filter(|n| !port_set.contains(n.name.as_str())).cloned().collect();
                     if !rest.is_empty() {
-                        self.item(&Item::Decl { ty: ty.clone(), names: rest, line: *line }, sc)?;
+                        extra.push(Item::Decl { ty: ty.clone(), names: rest, line: *line });
                     }
                     continue;
                 }
             }
-            self.item(it, sc)?;
+            keep.push(it);
         }
+        keep.extend(extra.iter());
+        self.items_ref(&keep, sc)?;
         Ok(ports)
     }
 
     fn pick_top(&self, top: Option<&str>) -> R<Rc<Module>> {
         if let Some(t) = top {
-            return self.modules.get(t).cloned().ok_or_else(|| format!("top module '{t}' is not defined"));
+            return self.modules.get(t).cloned().ok_or_else(|| match self.broken.iter().find(|b| b.0 == t) {
+                Some((_, why)) => format!("top module '{t}' cannot be synthesized: {why}"),
+                None => format!("top module '{t}' is not defined"),
+            });
+        }
+        if self.modules.is_empty() {
+            if let Some((name, why)) = self.broken.last() {
+                return Err(format!("module '{name}' cannot be synthesized: {why}"));
+            }
         }
         fn insts(items: &[Item], out: &mut Vec<String>) {
             for it in items {
@@ -856,15 +930,38 @@ impl Elab {
                 }
             }
         }
+        let mut children: HashMap<&str, Vec<String>> = HashMap::new();
         let mut used = Vec::new();
-        for m in self.modules.values() {
-            insts(&m.items, &mut used);
+        for (name, m) in &self.modules {
+            let mut v = Vec::new();
+            insts(&m.items, &mut v);
+            used.extend(v.iter().cloned());
+            children.insert(name.as_str(), v);
         }
-        self.order
-            .iter()
-            .rev()
-            .filter(|n| !self.modules[*n].is_interface)
-            .find(|n| !used.contains(n))
+        // The uninstantiated module with the most modules below it; the
+        // last one in the source on a tie.
+        fn reach<'a>(n: &'a str, children: &'a HashMap<&str, Vec<String>>, seen: &mut std::collections::HashSet<&'a str>) {
+            if !seen.insert(n) {
+                return;
+            }
+            if let Some(c) = children.get(n) {
+                for x in c {
+                    reach(x.as_str(), children, seen);
+                }
+            }
+        }
+        let mut best: Option<(usize, &String)> = None;
+        for n in &self.order {
+            if self.modules[n].is_interface || used.contains(n) {
+                continue;
+            }
+            let mut seen = Default::default();
+            reach(n.as_str(), &children, &mut seen);
+            if best.map(|b| seen.len() >= b.0).unwrap_or(true) {
+                best = Some((seen.len(), n));
+            }
+        }
+        best.map(|b| b.1)
             .or(self.order.last())
             .map(|n| self.modules[n].clone())
             .ok_or_else(|| "no module in the source".to_string())
@@ -887,7 +984,18 @@ impl Elab {
                 Dir::Inout => return Err(format!("inout port '{name}' on the top module is not supported")),
             }
         }
-        let sigs = self.sigs.into_iter().map(|s| SigInfo { name: s.name, w: s.drv.len() as u32, drv: s.drv, init: s.init }).collect();
-        Ok((Flat { top: m.name.clone(), dag: self.dag, sigs, ports: fp, regs: self.regs }, self.warnings))
+        let sigs = self
+            .sigs
+            .into_iter()
+            .map(|s| {
+                // HDL index of each bit, for plain vectors.
+                let index = match &*s.ty {
+                    Ty::Bits { w, lo, asc, .. } => Some((0..*w as i64).map(|b| if *asc { lo + *w as i64 - 1 - b } else { lo + b }).collect()),
+                    _ => None,
+                };
+                SigInfo { name: s.name, hier: s.hier, index, w: s.drv.len() as u32, drv: s.drv, init: s.init }
+            })
+            .collect();
+        Ok((Flat { top: m.name.clone(), dag: self.dag, sigs, ports: fp, regs: self.regs, latches: self.latches }, self.warnings))
     }
 }

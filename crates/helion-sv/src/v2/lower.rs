@@ -91,10 +91,24 @@ pub enum Drv {
     Reg(u32),
     /// Top-level input.
     Input,
+    /// Output of latch `.0`.
+    Latch(u32),
+}
+
+/// A level-sensitive latch: `sig` follows `d` while `gate` is 1. Only a
+/// latch used as a clock gate is implemented (see [`clock_shape`]).
+pub struct Latch {
+    pub sig: u32,
+    pub d: N,
+    pub gate: N,
 }
 
 pub struct SigInfo {
     pub name: String,
+    /// Dotted hierarchical name in the source.
+    pub hier: String,
+    /// Source index of each bit when the signal is a plain vector.
+    pub index: Option<Vec<i64>>,
     pub w: u32,
     pub drv: Vec<Drv>,
     /// Power-up value of register bits.
@@ -127,6 +141,7 @@ pub struct Flat {
     pub sigs: Vec<SigInfo>,
     pub ports: Vec<Port>,
     pub regs: Vec<Reg>,
+    pub latches: Vec<Latch>,
 }
 
 pub fn bit_name(sig: &str, w: u32, bit: u32) -> String {
@@ -135,6 +150,73 @@ pub fn bit_name(sig: &str, w: u32, bit: u32) -> String {
     } else {
         format!("{sig}_{bit}")
     }
+}
+
+/// Follow wires: slices, concatenations and combinationally driven signal
+/// bits, down to the node that computes or stores the bit.
+fn wire(flat: &Flat, mut n: N, mut bit: u32) -> (N, u32) {
+    loop {
+        match flat.dag.op(n) {
+            Op::Slice(a, lo) => {
+                bit += lo;
+                n = *a;
+            }
+            Op::Concat(parts) => {
+                let mut off = 0;
+                let mut next = None;
+                for p in parts.iter().rev() {
+                    let pw = flat.dag.w(*p);
+                    if bit < off + pw {
+                        next = Some((*p, bit - off));
+                        break;
+                    }
+                    off += pw;
+                }
+                match next {
+                    Some((p, b)) => {
+                        n = p;
+                        bit = b;
+                    }
+                    None => return (n, bit),
+                }
+            }
+            Op::Read(sig) => match flat.sigs[*sig as usize].drv[bit as usize] {
+                Drv::Comb(m, b) => {
+                    n = m;
+                    bit = b;
+                }
+                _ => return (n, bit),
+            },
+            _ => return (n, bit),
+        }
+    }
+}
+
+/// The clock of a flop as (root clock bit, enables). A clock of the form
+/// `latch & clk`, where the latch is transparent while `clk` is low, is a
+/// gated clock: the flop is clocked by `clk` and loads only when the
+/// latch's data input is 1, which is what the gate does.
+fn clock_shape(flat: &Flat, clk: N) -> ((N, u32), Vec<(N, u32)>) {
+    let (n, b) = wire(flat, clk, 0);
+    if let Op::And(x, y) = flat.dag.op(n) {
+        if flat.dag.w(n) == 1 {
+            for (l, c) in [(*x, *y), (*y, *x)] {
+                let (ln, lb) = wire(flat, l, 0);
+                let Op::Read(sig) = flat.dag.op(ln) else { continue };
+                let Drv::Latch(k) = flat.sigs[*sig as usize].drv[lb as usize] else { continue };
+                let latch = &flat.latches[k as usize];
+                let (gn, _) = wire(flat, latch.gate, 0);
+                let Op::Not(g) = flat.dag.op(gn) else { continue };
+                if wire(flat, *g, 0) != wire(flat, c, 0) {
+                    continue;
+                }
+                let (root, mut ens) = clock_shape(flat, c);
+                ens.push((latch.d, lb));
+                return (root, ens);
+            }
+        }
+    }
+    ((n, b), Vec::new())
 }
 
 /// Bit-blasts on demand: a bit of a node is built only when something
@@ -182,6 +264,12 @@ impl<'a> Blaster<'a> {
             Drv::None => {
                 self.undriven.push(bit_name(&s.name, s.w, bit));
                 FALSE
+            }
+            Drv::Latch(_) => {
+                return Err(format!(
+                    "'{}' is a latch; a latch is only supported as a clock gate (enabled while the clock is low and ANDed with that clock)",
+                    bit_name(&s.name, s.w, bit)
+                ))
             }
             Drv::Comb(n, b) => {
                 if !self.visiting.insert((sig, bit)) {
@@ -462,7 +550,20 @@ impl Mapper {
     }
 }
 
+/// One flop of the netlist and the source register bit it holds.
+pub struct RegMap {
+    /// Net on the flop's Q pin.
+    pub net: String,
+    pub hier: String,
+    /// Bit index in the source; `None` for a scalar or a bit of a struct or array.
+    pub index: Option<i64>,
+    pub scalar: bool,
+    /// The flop stores the complement (the register powers up at 1).
+    pub inverted: bool,
+}
+
 pub struct Stats {
+    pub regmap: Vec<RegMap>,
     pub luts: usize,
     pub ffs: usize,
     pub depth: u32,
@@ -515,7 +616,18 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
         if flat.sigs[sig as usize].init[bit as usize] {
             d ^= 1;
         }
-        let clk = bl.bit(r.clk, 0)?;
+        let ((cn, cb), enables) = clock_shape(flat, r.clk);
+        if !enables.is_empty() {
+            // Gated clock: keep the stored value unless every gate is open.
+            let q = bl.sig_bit[&(sig, bit)] ^ (flat.sigs[sig as usize].init[bit as usize] as u32);
+            let mut en = TRUE;
+            for (en_n, en_b) in enables {
+                let e = bl.bit(en_n, en_b)?;
+                en = bl.aig.and(en, e);
+            }
+            d = bl.aig.mux(en, d, q);
+        }
+        let clk = bl.bit(cn, cb)?;
         reg_bits.push(RegBit { sig, bit, d, clk, negedge: r.negedge });
     }
     let Blaster { aig, pi_name, hints, undriven, .. } = bl;
@@ -530,7 +642,11 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
     let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
     for &(l, sig, bit) in &pi_name {
         let s = &flat.sigs[sig as usize];
-        let n = bit_name(&s.name, s.w, bit);
+        let mut n = bit_name(&s.name, s.w, bit);
+        if matches!(s.drv[bit as usize], Drv::Reg(_)) && s.init[bit as usize] {
+            // This flop stores the complement; do not call that net by the signal's name.
+            n.push_str("_n");
+        }
         taken.insert(n.clone());
         net_of.insert(l, n);
     }
@@ -651,10 +767,19 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
     }
 
     // Registers.
+    let mut regmap = Vec::with_capacity(reg_bits.len());
     for rb in &reg_bits {
         let s = &flat.sigs[rb.sig as usize];
-        let q = bit_name(&s.name, s.w, rb.bit);
-        let cell = format!("{q}_reg");
+        let inverted = s.init[rb.bit as usize];
+        let q = format!("{}{}", bit_name(&s.name, s.w, rb.bit), if inverted { "_n" } else { "" });
+        let cell = format!("{}_reg", bit_name(&s.name, s.w, rb.bit));
+        regmap.push(RegMap {
+            net: q.clone(),
+            hier: s.hier.clone(),
+            index: s.index.as_ref().map(|ix| ix[rb.bit as usize]),
+            scalar: s.w == 1,
+            inverted,
+        });
         depth = depth.max(map.depth[(rb.d / 2) as usize]);
         let dnet = emit(rb.d, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut);
         let cnet = emit(rb.clk, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut);
@@ -684,7 +809,7 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
         d.connect(&src, &cell, "I");
         d.connect(&p.name, &cell, "PAD");
     }
-    let stats = Stats { luts: n_lut, ffs: reg_bits.len(), depth, ands: aig.nodes.iter().filter(|n| n.0 != u32::MAX).count() };
+    let stats = Stats { regmap, luts: n_lut, ffs: reg_bits.len(), depth, ands: aig.nodes.iter().filter(|n| n.0 != u32::MAX).count() };
     Ok((d, stats, undriven))
 }
 
@@ -721,8 +846,8 @@ mod tests {
             top: "t".into(),
             dag,
             sigs: vec![
-                SigInfo { name: "a".into(), w: 3, drv: vec![Drv::Input; 3], init: vec![false; 3] },
-                SigInfo { name: "b".into(), w: 3, drv: vec![Drv::Input; 3], init: vec![false; 3] },
+                SigInfo { name: "a".into(), hier: "a".into(), index: None, w: 3, drv: vec![Drv::Input; 3], init: vec![false; 3] },
+                SigInfo { name: "b".into(), hier: "b".into(), index: None, w: 3, drv: vec![Drv::Input; 3], init: vec![false; 3] },
             ],
             ports: vec![
                 Port { name: "a".into(), dir: PortDir::In, w: 3, node: None, sig: Some(0) },
@@ -730,6 +855,7 @@ mod tests {
                 Port { name: "s".into(), dir: PortDir::Out, w: 3, node: Some(s), sig: None },
             ],
             regs: vec![],
+            latches: vec![],
         };
         let (d, st, _) = lower(&flat).unwrap();
         assert!(st.luts <= 3, "3-bit add is 3 LUTs of at most 6 inputs, got {}", st.luts);

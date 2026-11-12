@@ -68,6 +68,8 @@ pub enum DataType {
     Named { path: Vec<String>, dims: Vec<Dim> },
     Enum { base: Option<Box<DataType>>, items: Vec<(String, Option<Expr>)>, dims: Vec<Dim> },
     Struct { fields: Vec<(DataType, String)>, dims: Vec<Dim>, signed: bool, union: bool },
+    /// `string`: only as the type of a constant.
+    Str,
 }
 
 #[derive(Clone, Debug)]
@@ -233,4 +235,6 @@ pub struct Source {
     pub packages: Vec<Package>,
     /// Items in the compilation-unit scope (`$unit`).
     pub unit: Vec<Item>,
+    /// Modules that could not be parsed: (name, message). Using one is an error.
+    pub broken: Vec<(String, String)>,
 }

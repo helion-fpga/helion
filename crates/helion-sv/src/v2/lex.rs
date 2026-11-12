@@ -157,9 +157,17 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
             }
         }
         if ch == '`' {
-            // A directive the preprocessor left behind (`timescale, `default_nettype ...): skip the line.
+            // `line N F` from the preprocessor: the next line is line N of file F.
+            let st = i;
             while i < c.len() && c[i] != '\n' {
                 i += 1;
+            }
+            let text: String = c[st..i].iter().collect();
+            let mut f = text.split_whitespace();
+            if f.next() == Some("`line") {
+                if let (Some(n), Some(file)) = (f.next().and_then(|x| x.parse::<u32>().ok()), f.next().and_then(|x| x.parse::<u32>().ok())) {
+                    line = file * super::pre::FILE_STRIDE + n.saturating_sub(1);
+                }
             }
             continue;
         }

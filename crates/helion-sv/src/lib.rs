@@ -25061,19 +25061,57 @@ pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
     sva::synth_sv_with_sva(source, origin).map(|o| o.design)
 }
 
+thread_local! {
+    static V2_DEFINES: std::cell::RefCell<Vec<(String, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Macros defined before the first source file (`NAME` or `NAME=value`),
+/// in addition to `SYNTHESIS` and those in the `HELION_DEFINES`
+/// environment variable (comma separated).
+pub fn set_sv_defines(defs: &[&str]) {
+    V2_DEFINES.with(|d| {
+        *d.borrow_mut() = defs
+            .iter()
+            .map(|s| match s.split_once('=') {
+                Some((k, v)) => (k.to_string(), v.to_string()),
+                None => (s.to_string(), String::new()),
+            })
+            .collect()
+    });
+}
+
+fn v2_defines() -> Vec<(String, String)> {
+    let mut d = V2_DEFINES.with(|d| d.borrow().clone());
+    if let Ok(env) = std::env::var("HELION_DEFINES") {
+        for s in env.split(',').filter(|s| !s.is_empty()) {
+            match s.split_once('=') {
+                Some((k, v)) => d.push((k.to_string(), v.to_string())),
+                None => d.push((s.to_string(), String::new())),
+            }
+        }
+    }
+    d
+}
+
 /// Synthesize with the second-generation front end (see [`v2`]): exact
 /// SystemVerilog width and sign rules, full hierarchy, no silent caps. An
-/// unsupported construct is an error naming it and its line.
+/// unsupported construct is an error naming it, its file and its line.
 pub fn synth_sv_v2(source: &str, origin: &str, top: Option<&str>) -> Result<v2::Synth, String> {
-    let dir = Path::new(origin).parent().unwrap_or(Path::new("."));
-    let pre = preprocess_sv(&expand_includes(source, dir));
-    v2::synth(&pre, top).map_err(|e| format!("{origin}: {e}"))
+    v2::synth(&[(origin.to_string(), source.to_string())], top, &v2_defines(), Vec::new()).map_err(|e| format!("{origin}: {e}"))
+}
+
+/// [`synth_sv_v2`] on files: all of them form one design.
+pub fn synth_sv_v2_files(paths: &[&Path], top: Option<&str>) -> Result<v2::Synth, String> {
+    let mut sources = Vec::new();
+    for p in paths {
+        sources.push((p.display().to_string(), std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?));
+    }
+    v2::synth(&sources, top, &v2_defines(), Vec::new())
 }
 
 /// [`synth_sv_v2`] on a file.
 pub fn synth_sv_v2_path(path: &Path, top: Option<&str>) -> Result<v2::Synth, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    synth_sv_v2(&text, &path.display().to_string(), top)
+    synth_sv_v2_files(&[path], top)
 }
 
 /// Module names in one SV file (helion-sv parse). UG900 SIM_TOP candidates.
