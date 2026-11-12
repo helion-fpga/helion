@@ -106,11 +106,10 @@ struct Net {
 }
 
 struct Grid {
+    /// The CLB array with a ring of pad tiles around it.
     x0: u32,
-    /// Row of the pads.
     y0: u32,
     cols: u32,
-    /// CLB rows plus the pad row.
     rows: u32,
 }
 
@@ -121,12 +120,31 @@ impl Grid {
     fn xy(&self, tile: u32) -> (u32, u32) {
         (self.x0 + tile % self.cols, self.y0 + tile / self.cols)
     }
+    /// Direction from a pad tile into the fabric; `None` for a CLB tile,
+    /// a corner, or a tile off the grid.
+    fn pad_inward(&self, x: u32, y: u32) -> Option<u32> {
+        self.tile(x, y)?;
+        let (left, right) = (x == self.x0, x == self.x0 + self.cols - 1);
+        let (bottom, top) = (y == self.y0, y == self.y0 + self.rows - 1);
+        match (left, right, bottom, top) {
+            (false, false, true, false) => Some(tk::N),
+            (false, false, false, true) => Some(tk::S),
+            (true, false, false, false) => Some(tk::E),
+            (false, true, false, false) => Some(tk::W),
+            _ => None,
+        }
+    }
+    fn is_clb(&self, x: u32, y: u32) -> bool {
+        self.tile(x, y).is_some() && x > self.x0 && x < self.x0 + self.cols - 1 && y > self.y0 && y < self.y0 + self.rows - 1
+    }
     fn wire(&self, x: u32, y: u32, dir: u32, track: u32) -> Option<u32> {
-        // A wire exists when both ends are on the grid; the pad row sends
-        // north only and is entered from the north only.
+        // A wire exists between two CLBs, from a pad into the CLB beside
+        // it, and from that CLB into the pad. Corners have none.
         let (nx, ny) = tk::step(x, y, dir)?;
         self.tile(nx, ny)?;
-        if (y == self.y0 && dir != tk::N) || (ny == self.y0 && dir != tk::S) {
+        let from_ok = self.is_clb(x, y) || self.pad_inward(x, y) == Some(dir);
+        let to_ok = self.is_clb(nx, ny) || self.pad_inward(nx, ny) == Some(tk::opposite(dir));
+        if !from_ok || !to_ok || (!self.is_clb(x, y) && !self.is_clb(nx, ny)) {
             return None;
         }
         Some((self.tile(x, y)? * 4 + dir) * TRACKS + track)
@@ -184,7 +202,7 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
             conn.undriven[0]
         );
     }
-    let grid = Grid { x0: dev.clb_x0, y0: dev.clb_y0.saturating_sub(1), cols: dev.interior_cols, rows: dev.interior_rows + 1 };
+    let grid = Grid { x0: dev.clb_x0.saturating_sub(1), y0: dev.clb_y0.saturating_sub(1), cols: dev.interior_cols + 2, rows: dev.interior_rows + 2 };
     let site_of = |i: u32| -> Result<(Site, u8), String> {
         placed.lutff_sites.get(i as usize).copied().ok_or_else(|| format!("route: cluster {i} is not placed"))
     };
@@ -258,7 +276,7 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
         let (px, py) = pad_xy(dev, site);
         // The pad's own source select reaches the BLE output (flop when the
         // flop is used, else the LUT) of any CLB in its column.
-        let column_local = csite.x == px && csite.y > py && (is_q || !registered(i));
+        let column_local = py + 1 == dev.clb_y0 && csite.x == px && csite.y > py && (is_q || !registered(i));
         if column_local {
             pads.push(Some(PadPlan::Direct { clb: (csite.x, csite.y), ble, from_ff: is_q }));
         } else {
@@ -271,50 +289,51 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
 
     // Input pads: a free pad, the one asked for by LOC or else the one
     // nearest the middle of the loads.
-    let pad_row = grid.y0;
-    let mut taken: HashSet<u32> = placed.iob_sites.iter().map(|s| s.x).collect();
-    let all_pads: Vec<u32> = dev.iob_sites().filter(|s| s.kind == SiteKind::Iob).map(|s| s.x).collect();
-    let mut input_x: HashMap<u32, u32> = HashMap::new();
+    let pad_row = dev.clb_y0.saturating_sub(1);
+    let mut taken: HashSet<(u32, u32)> = placed.iob_sites.iter().map(|s| (s.x, s.y)).collect();
+    let all_pads: Vec<(u32, u32)> = dev.iob_sites_all().iter().map(|s| (s.x, s.y)).collect();
+    let mut input_xy: HashMap<u32, (u32, u32)> = HashMap::new();
     let mut iob_in: Vec<IobInput> = Vec::new();
-    let mut want: Vec<(u32, Option<u32>, u32)> = Vec::new(); // (input, LOC x, mean sink x)
+    // (input, LOC, middle of the loads)
+    let mut want: Vec<(u32, Option<(u32, u32)>, (u32, u32))> = Vec::new();
+    let parse_loc = |l: &str| -> Option<(u32, u32)> {
+        let rest = l.strip_prefix("IOB_X")?;
+        let (x, y) = rest.split_once('Y')?;
+        Some((x.parse::<u32>().ok()?, y.parse::<u32>().ok()?))
+    };
     for net in &nets {
         let Src::Pad { input } = net.src else { continue };
-        let xs: Vec<u32> = net
+        let pts: Vec<(u32, u32)> = net
             .sinks
             .iter()
             .map(|s| match s {
-                Sink::Pin { x, .. } => *x,
-                Sink::Pad { iob } => placed.iob_sites[*iob].x,
+                Sink::Pin { x, y, .. } => (*x, *y),
+                Sink::Pad { iob } => (placed.iob_sites[*iob].x, placed.iob_sites[*iob].y),
             })
             .collect();
-        let mean = xs.iter().sum::<u32>() / xs.len().max(1) as u32;
-        let loc = conn.inputs.get(input as usize).and_then(|i| i.loc.as_deref()).and_then(|l| {
-            let rest = l.strip_prefix("IOB_X")?;
-            let (x, y) = rest.split_once('Y')?;
-            (y.parse::<u32>().ok()? == pad_row).then_some(x.parse::<u32>().ok()?)
-        });
+        let n = pts.len().max(1) as u32;
+        let mean = (pts.iter().map(|p| p.0).sum::<u32>() / n, pts.iter().map(|p| p.1).sum::<u32>() / n);
+        let loc = conn.inputs.get(input as usize).and_then(|i| i.loc.as_deref()).and_then(parse_loc);
         want.push((input, loc, mean));
     }
-    // A clock pin that feeds no logic still needs its pad.
+    // A clock or reset pin that feeds no logic still needs its pad.
     for (i, inp) in conn.inputs.iter().enumerate() {
         if inp.clock.is_some() && !want.iter().any(|w| w.0 == i as u32) {
-            let loc = inp.loc.as_deref().and_then(|l| {
-                let rest = l.strip_prefix("IOB_X")?;
-                let (x, y) = rest.split_once('Y')?;
-                (y.parse::<u32>().ok()? == pad_row).then_some(x.parse::<u32>().ok()?)
-            });
-            want.push((i as u32, loc, grid.x0 + grid.cols / 2));
+            want.push((i as u32, inp.loc.as_deref().and_then(parse_loc), (grid.x0 + grid.cols / 2, pad_row)));
         }
     }
     want.sort_by_key(|w| (w.1.is_none(), w.0));
     for (input, loc, mean) in want {
-        let x = match loc {
-            Some(x) if all_pads.contains(&x) && !taken.contains(&x) => x,
-            Some(x) => return Err(format!("route: input {} asks for pad IOB_X{x}Y{pad_row}, which is taken or not on this part", conn.inputs[input as usize].net)),
+        let at = match loc {
+            Some(p) if all_pads.contains(&p) && !taken.contains(&p) => p,
+            Some(p) => return Err(format!("route: input {} asks for pad IOB_X{}Y{}, which is taken or not on this part", conn.inputs[input as usize].net, p.0, p.1)),
+            // The free pad nearest the loads; the bottom row wins ties.
             None => *all_pads
                 .iter()
-                .filter(|x| !taken.contains(x))
-                .min_by_key(|x| (x.abs_diff(mean), **x))
+                .enumerate()
+                .filter(|(_, p)| !taken.contains(p))
+                .min_by_key(|(k, p)| (p.0.abs_diff(mean.0) + p.1.abs_diff(mean.1), *k))
+                .map(|(_, p)| p)
                 .ok_or_else(|| {
                     format!(
                         "route: the design needs {} pads ({} outputs, {} inputs) and the part has {}",
@@ -325,18 +344,16 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
                     )
                 })?,
         };
-        taken.insert(x);
-        input_x.insert(input, x);
-        iob_in.push(IobInput { x, y: pad_row, input, net: conn.inputs[input as usize].net.clone() });
+        taken.insert(at);
+        input_xy.insert(input, at);
+        iob_in.push(IobInput { x: at.0, y: at.1, input, net: conn.inputs[input as usize].net.clone() });
     }
-
-    // Start wires and sink tiles.
     let starts: Vec<Vec<u32>> = nets
         .iter()
         .map(|net| {
             let (x, y) = match net.src {
                 Src::Ble { x, y, .. } => (x, y),
-                Src::Pad { input } => (input_x[&input], pad_row),
+                Src::Pad { input } => input_xy[&input],
             };
             let mut v = Vec::new();
             for d in 0..4 {
@@ -408,7 +425,7 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
             // Near sinks first, so far ones branch off the tree.
             let src_xy = match nets[ni].src {
                 Src::Ble { x, y, .. } => (x, y),
-                Src::Pad { input } => (input_x[&input], pad_row),
+                Src::Pad { input } => input_xy[&input],
             };
             let mut order: Vec<usize> = (0..nets[ni].sinks.len()).filter(|&k| sink_wire[ni][k] == u32::MAX || gone.contains(&sink_wire[ni][k])).collect();
             order.sort_by_key(|&k| {
@@ -484,7 +501,7 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
                         found = Some(w);
                         break;
                     }
-                    if dy == pad_row {
+                    if !grid.is_clb(dx, dy) {
                         continue; // a pad is an end, not a way through
                     }
                     if bounded && (dx < bx0 || dx > bx1 || dy < by0 || dy > by1) {
@@ -566,7 +583,7 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
                         let (x, y, d, t) = grid.parts(w as u32);
                         let users: Vec<String> = (0..nets.len())
                             .filter(|&i| tree[i].iter().any(|&(tw, _)| tw as usize == w))
-                            .map(|i| format!("net{i}(sinks {}, src {:?})", nets[i].sinks.len(), match nets[i].src { Src::Ble { x, y, .. } => (x, y), Src::Pad { input } => (input_x[&input], pad_row) }))
+                            .map(|i| format!("net{i}(sinks {}, src {:?})", nets[i].sinks.len(), match nets[i].src { Src::Ble { x, y, .. } => (x, y), Src::Pad { input } => input_xy[&input] }))
                             .collect();
                         let chan_used = (0..TRACKS).filter(|&tt| grid.wire(x, y, d, tt).map(|ww| occ[ww as usize] > 0).unwrap_or(false)).count();
                         let (dx, dy) = grid.dest(w as u32);

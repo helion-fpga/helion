@@ -155,14 +155,14 @@ fn compile_design_xdc(
     );
     let t0 = std::time::Instant::now();
     let mut packed = pack(&design, &dev)?;
-    let fit = packed.fit_pads(dev.iob_sites().count());
+    let fit = packed.fit_pads(dev.iob_sites_all().len());
     if !fit.undriven.is_empty() || !fit.over_budget.is_empty() {
         eprintln!(
             "warning: {} output pad(s) left out: {} with no driver, {} beyond the {} pads of this part",
             fit.undriven.len() + fit.over_budget.len(),
             fit.undriven.len(),
             fit.over_budget.len(),
-            dev.iob_sites().count()
+            dev.iob_sites_all().len()
         );
     }
     eprintln!(
