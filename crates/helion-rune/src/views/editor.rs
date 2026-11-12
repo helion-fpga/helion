@@ -1085,7 +1085,15 @@ fn breadcrumb(s: &AppState, t: &VivadoTheme) -> El {
         let edit = &s.editor.edit;
         let caret = edit.focus.min(edit.text.len());
         let line = edit.line_of_byte(caret);
-        let col = edit.text[edit.line_range(line).start..caret].chars().count() + 1;
+        let range = edit.line_range(line);
+        // Large-file mode moves the caret inside the caret-line field
+        // (Home/End, arrows, clicks) before any edit reaches the buffer.
+        let le = &s.editor.line_edit;
+        let col = if s.editor.line_at == Some(line) && le.text == edit.text[range.clone()] {
+            le.text[..le.focus.min(le.text.len())].chars().count() + 1
+        } else {
+            edit.text[range.start..caret].chars().count() + 1
+        };
         let lang = match active_dialect(s) {
             Dialect::Verilog => {
                 let name = s.editor.tabs.get(s.editor.active).map(String::as_str).unwrap_or("");
@@ -1139,11 +1147,14 @@ fn field_spans(s: &AppState, t: &VivadoTheme) -> Vec<Span> {
 
 /// The center editor pane wired into the shell.
 pub fn editor_pane(s: &AppState, t: &VivadoTheme) -> El {
+    // min_w(0): wide content (a long line in large-file mode) scrolls
+    // inside the code viewport instead of widening the pane.
     let mut pane = col()
         .key("editor")
         .grow(1.0)
         .h_full()
         .min_h(0.0)
+        .min_w(0.0)
         .fill(t.panel_bg)
         .border(1.0, t.border)
         .child(tab_strip(s, t))
