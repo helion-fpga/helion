@@ -1,26 +1,31 @@
-name: Feature
-description: A Helion-legal capability (not a vendor clone)
+name: Feature request
+description: A new capability for Helion
 labels: ["enhancement"]
 body:
   - type: markdown
     attributes:
       value: |
-        Public vendor user guides are a **capability checklist**, not source to copy. No UNISIM, no vendor Tcl, no AXI interconnect as a Helion product (Helion-MM/ST).
+        Public vendor user guides are a capability checklist, not source to copy. Helion does not ingest vendor libraries or databases, and its buses are Helion-MM and Helion-ST.
   - type: textarea
     id: want
     attributes:
       label: What should Helion do
+      description: The problem you are trying to solve, and what you would like to happen.
     validations:
       required: true
   - type: textarea
     id: engine
     attributes:
-      label: Which engine
-      placeholder: helion-sv / sta / place / route / gui IdeModel / …
+      label: Which part of Helion
+      placeholder: helion-sv / helion-sta / helion-place / helion-route / helion-rune (IDE) / helion-hw / ...
     validations:
       required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and workarounds
   - type: textarea
     id: test
     attributes:
       label: How we will know it works
-      placeholder: cargo test -p … --lib TESTNAME, headless WNS, …
+      placeholder: A test name, a headless run, a report that changes, ...

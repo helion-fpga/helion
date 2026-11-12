@@ -261,6 +261,16 @@ pub fn evaluate_c_kernel_reference(
     let mut scalars: BTreeMap<String, i64> = BTreeMap::new();
     let mut arrays: BTreeMap<String, Vec<i64>> = BTreeMap::new();
     let mut streams: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+    ARRAY_DIMS.with(|d| {
+        let mut d = d.borrow_mut();
+        d.clear();
+        for a in &func.args {
+            d.insert(a.name.clone(), a.dims.clone());
+        }
+        for v in &func.vars {
+            d.insert(v.name.clone(), v.dims.clone());
+        }
+    });
 
     for v in &func.vars {
         if !v.dims.is_empty() {
@@ -331,6 +341,11 @@ pub fn evaluate_c_kernel_reference(
     Ok(outputs)
 }
 
+thread_local! {
+    /// Declared dimensions of the kernel's arrays (for multi-index reads).
+    static ARRAY_DIMS: std::cell::RefCell<BTreeMap<String, Vec<usize>>> = std::cell::RefCell::new(BTreeMap::new());
+}
+
 fn exec_sim_stmts(
     stmts: &[CStmt],
     func: &CFunction,
@@ -344,7 +359,30 @@ fn exec_sim_stmts(
             break;
         }
         match st {
-            CStmt::Pragma(_) | CStmt::Decl(_) => {}
+            CStmt::Pragma(_) => {}
+            // A block-scoped declaration re-initializes every time it runs
+            // (`int sum = 0;` inside a loop body).
+            CStmt::Decl(v) => {
+                if v.dims.is_empty() {
+                    let init = match &v.init {
+                        Some(e) => eval_sim_expr(e, scalars, arrays, streams)?,
+                        None => 0,
+                    };
+                    if !v.is_static {
+                        scalars.insert(v.name.clone(), init);
+                    }
+                } else if !v.is_static {
+                    let total: usize = v.dims.iter().product::<usize>().max(1);
+                    let mut init_vec = vec![0i64; total];
+                    for (i, &iv) in v.init_list.iter().enumerate().take(total) {
+                        init_vec[i] = iv as i64;
+                    }
+                    arrays.insert(v.name.clone(), init_vec);
+                }
+                ARRAY_DIMS.with(|d| {
+                    d.borrow_mut().insert(v.name.clone(), v.dims.clone());
+                });
+            }
             CStmt::Assign { lhs, rhs } => {
                 let v = eval_sim_expr(rhs, scalars, arrays, streams)?;
                 match lhs {
@@ -489,13 +527,13 @@ fn eval_sim_expr(
         }
         CExpr::Index { array, indices } => {
             if let Some(arr) = arrays.get(array) {
+                // Row-major flat index over the declared dimensions.
+                let dims = ARRAY_DIMS.with(|d| d.borrow().get(array).cloned()).unwrap_or_default();
                 let mut idx = 0usize;
-                for ie in indices {
+                for (k, ie) in indices.iter().enumerate() {
                     let c = eval_sim_expr(ie, scalars, arrays, streams)?.max(0) as usize;
-                    idx = idx * 4 + c;
-                }
-                if indices.len() == 1 {
-                    idx = eval_sim_expr(&indices[0], scalars, arrays, streams)?.max(0) as usize;
+                    let d = dims.get(k).copied().unwrap_or(1).max(1);
+                    idx = idx * d + c;
                 }
                 Ok(arr.get(idx).copied().unwrap_or(0))
             } else {
@@ -588,6 +626,10 @@ fn eval_sim_expr(
     }
 }
 
+/// Schedule-model co-simulation report. **Does not simulate the RTL**: the
+/// RTL outputs are the C outputs (plus `inject_rtl_fault_delta`). Use
+/// [`crate::run_rtl_cosim`] for a real gate-level C/RTL co-simulation.
+///
 /// Run Vivado HLS C/RTL Co-Simulation (`cosim_design`):
 /// 1. Synthesizes `source` into SystemVerilog RTL and netlist (`hls_compile`).
 /// 2. Extracts coalesced `m_axi` burst descriptors (`AWLEN`/`ARLEN` beat packing & 4 KiB splitting).

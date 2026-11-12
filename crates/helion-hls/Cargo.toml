@@ -7,3 +7,5 @@ license.workspace = true
 [dependencies]
 helion-ir = { workspace = true }
 helion-sv = { workspace = true }
+# Real C/RTL co-simulation: the synthesized netlist runs in the gate simulator.
+helion-sim = { workspace = true }

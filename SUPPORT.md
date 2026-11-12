@@ -1,13 +1,25 @@
-# Support
+# Getting help
 
-- **Docs / wiki:** https://helion-fpga.github.io/helion/wiki.html
-- **User guide:** https://helion-fpga.github.io/helion/use.html
-- **Questions:** [GitHub Discussions](https://github.com/helion-fpga/helion/discussions)
-- **Bugs / features:** [Issues](https://github.com/helion-fpga/helion/issues)
-- **Build:** `cargo test --workspace` then `helion-ide --headless examples/counter.sv` (expect `WNS_PS=9640`)
+| You want to | Go to |
+|---|---|
+| Install or build Helion | [Getting started](https://helion-fpga.github.io/helion/start.html) |
+| Learn the IDE and the CLI | [User guide](https://helion-fpga.github.io/helion/use.html) |
+| Find a page in the docs | [Documentation index](https://helion-fpga.github.io/helion/wiki.html) |
+| Ask a question or share an idea | [GitHub Discussions](https://github.com/helion-fpga/helion/discussions) |
+| Report a bug or request a feature | [Issues](https://github.com/helion-fpga/helion/issues/new/choose) |
+| Report a security issue | [SECURITY.md](SECURITY.md) (privately, please) |
 
-We do not provide vendor-tool support (Vivado, Quartus, …).
+## Before you ask
 
-## Roadmap
+- Run `helion-ide --doctor` (or `helion doctor`) and include its output.
+- Check that the gold still holds on your machine:
+  `helion-ide --headless examples/counter.sv` should print `WNS_PS=9640`.
+- Search existing issues and discussions.
 
-**2.0** shipped; current **[v2.0.4](https://github.com/helion-fpga/helion/releases/tag/v2.0.4)**. Roadmap (incl. 2.0.x grind): [`ROADMAP.md`](ROADMAP.md) and [milestones](https://github.com/helion-fpga/helion/milestones).
+## Scope
+
+Helion is a community project; help is best effort. We support Helion
+itself, not vendor tools (Vivado, Quartus, Radiant and so on).
+
+Where the project is going: [ROADMAP.md](ROADMAP.md) and the
+[milestones](https://github.com/helion-fpga/helion/milestones).

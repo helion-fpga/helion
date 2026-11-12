@@ -1552,7 +1552,7 @@ fn cmd_gui() {
     let candidates = [dir.join("Helion"), dir.join("helion-ide")];
     let Some(gui) = candidates.into_iter().find(|p| p.is_file()) else {
         eprintln!(
-            "helion-ide not found next to {}; build it with `cargo build -p helion-gui --bin helion-ide`",
+            "helion-ide not found next to {}; build it with `cargo build --release -p helion-rune --bin helion-ide`",
             exe.display()
         );
         std::process::exit(2);

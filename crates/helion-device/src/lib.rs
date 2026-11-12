@@ -21,6 +21,9 @@ pub use io_plan::{
     SsnReport, analyze_ssn, check_io_drc, report_ssn,
 };
 
+pub mod ibis;
+pub use ibis::{IbisModel, IbisPin, write_ibis};
+
 pub mod ultrascale;
 pub use ultrascale::{
     Carry8Chain, Carry8Mode, Dsp48e2Config, Dsp48e2Output, Dsp48e2WideXorMode, LagunaCrossingMode,
@@ -109,6 +112,51 @@ pub struct Board {
     pub board: String,
     pub part: String,
     pub cables: Vec<String>,
+    /// Board-wired pins (`pin.<port> = "IOB_XnYm [IOSTANDARD] [<f>MHz]"`).
+    pub pins: Vec<BoardPin>,
+    /// One-line description (`description = "..."`).
+    pub description: String,
+}
+
+/// One pin the board wires to a part I/O site.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoardPin {
+    /// Conventional top-level port name (`clk`, `led`).
+    pub port: String,
+    /// Part I/O site (`IOB_X3Y0`), validated against the part's IOBs.
+    pub site: String,
+    pub iostandard: Option<String>,
+    /// Oscillator frequency (kHz) when the pin is a board clock.
+    pub clock_khz: Option<u32>,
+}
+
+impl Board {
+    /// The board's pin constraints as XDC (`PACKAGE_PIN`, `IOSTANDARD`,
+    /// `create_clock` for oscillator pins), ready to add to a project.
+    pub fn constraints_xdc(&self) -> String {
+        let mut x = format!(
+            "# Board {} ({}) pin constraints, generated from devices/helion/boards/{}.toml\n",
+            self.board, self.part, self.board
+        );
+        for p in &self.pins {
+            x.push_str(&format!(
+                "set_property PACKAGE_PIN {} [get_ports {}]\n",
+                p.site, p.port
+            ));
+            if let Some(io) = &p.iostandard {
+                x.push_str(&format!("set_property IOSTANDARD {io} [get_ports {}]\n", p.port));
+            }
+            if let Some(khz) = p.clock_khz {
+                x.push_str(&format!(
+                    "create_clock -period {:.3} -name {} [get_ports {}]\n",
+                    1_000_000.0 / khz as f64,
+                    p.port,
+                    p.port
+                ));
+            }
+        }
+        x
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -457,6 +505,8 @@ impl Device {
         let mut board = String::new();
         let mut part = String::new();
         let mut cables = Vec::new();
+        let mut pins = Vec::new();
+        let mut description = String::new();
         for raw in text.lines() {
             let line = raw.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -470,6 +520,35 @@ impl Device {
             match k {
                 "board" => board = v.to_string(),
                 "part" => part = v.to_string(),
+                "description" => description = v.to_string(),
+                k if k.starts_with("pin.") => {
+                    let port = k["pin.".len()..].trim().to_string();
+                    let mut toks = v.split_whitespace();
+                    let site = toks
+                        .next()
+                        .ok_or_else(|| format!("board pin {port}: missing site"))?
+                        .to_string();
+                    let mut iostandard = None;
+                    let mut clock_khz = None;
+                    for t in toks {
+                        if let Some(f) = t.strip_suffix("MHz") {
+                            let mhz = f
+                                .parse::<f64>()
+                                .ok()
+                                .filter(|m| *m > 0.0)
+                                .ok_or_else(|| format!("board pin {port}: bad frequency {t}"))?;
+                            clock_khz = Some((mhz * 1000.0).round() as u32);
+                        } else {
+                            iostandard = Some(t.to_string());
+                        }
+                    }
+                    pins.push(BoardPin {
+                        port,
+                        site,
+                        iostandard,
+                        clock_khz,
+                    });
+                }
                 "cables" => {
                     cables = v
                         .split(',')
@@ -503,10 +582,33 @@ impl Device {
                 ));
             }
         }
+        if !pins.is_empty() {
+            let dev = Self::load_part_path(
+                &path
+                    .parent()
+                    .and_then(|b| b.parent())
+                    .unwrap_or(Path::new("."))
+                    .join("parts")
+                    .join(format!("{part}.toml")),
+            )?;
+            let iobs: Vec<Site> = dev.iob_sites().collect();
+            for p in &pins {
+                let ok = Site::parse_id(&p.site)
+                    .is_some_and(|s| s.kind == SiteKind::Iob && iobs.contains(&s));
+                if !ok {
+                    return Err(format!(
+                        "Helion board {board}: pin {} site {} is not an I/O site of {part}",
+                        p.port, p.site
+                    ));
+                }
+            }
+        }
         Ok(Board {
             board,
             part,
             cables,
+            pins,
+            description,
         })
     }
 
@@ -1096,6 +1198,27 @@ impl Device {
         BgaPackageGrid::new(kind, Some(self))
     }
 
+    /// Smallest modeled BGA package whose user I/O balls bind every HAD IOB
+    /// site of this part (the package `report_ssn` / `write_ibis` use when
+    /// the part names none).
+    pub fn default_package_kind(&self) -> PackageKind {
+        let need = self.iob_sites().count();
+        let mut kinds = [
+            PackageKind::Cpg236,
+            PackageKind::Csg324,
+            PackageKind::Cabga381,
+            PackageKind::Fgg484,
+        ];
+        kinds.sort_by_key(|k| k.ball_count());
+        kinds
+            .into_iter()
+            .find(|k| {
+                let g = self.bga_package(*k);
+                self.iob_sites().all(|s| g.ball_for_site(s).is_some()) && need > 0
+            })
+            .unwrap_or(PackageKind::Fgg484)
+    }
+
     /// Run Vivado UG899 I/O and Clock Planning DRC (`BIVC-1`, `PLIO-1`..`PLIO-8`) on this device.
     pub fn check_io_drc(&self, kind: PackageKind, plan: &IoPlan) -> IoDrcReport {
         let grid = self.bga_package(kind);
@@ -1579,6 +1702,32 @@ mod tests {
         let mut sorted_b = boards.clone();
         sorted_b.sort();
         assert_eq!(boards, sorted_b, "list_boards must be sorted");
+    }
+
+    #[test]
+    fn board_pins_validate_against_the_part_and_render_xdc() {
+        let b = Device::load_board("HB1").expect("HB1");
+        assert_eq!(b.part, "HL10T-C32-1");
+        let clk = b.pins.iter().find(|p| p.port == "clk").expect("clk pin");
+        assert_eq!(clk.site, "IOB_X3Y0");
+        assert_eq!(clk.clock_khz, Some(100_000));
+        let xdc = b.constraints_xdc();
+        assert!(xdc.contains("set_property PACKAGE_PIN IOB_X3Y0 [get_ports clk]"));
+        assert!(xdc.contains("create_clock -period 10.000 -name clk [get_ports clk]"));
+        assert!(xdc.contains("set_property IOSTANDARD LVCMOS33 [get_ports led]"));
+        let tmp = std::env::temp_dir().join(format!("helion-board-{}", std::process::id()));
+        let boards = tmp.join("boards");
+        std::fs::create_dir_all(&boards).unwrap();
+        std::fs::create_dir_all(tmp.join("parts")).unwrap();
+        std::fs::copy(
+            Device::devices_dir().join("parts/HL10T-C32-1.toml"),
+            tmp.join("parts/HL10T-C32-1.toml"),
+        )
+        .unwrap();
+        let bad = boards.join("BAD.toml");
+        std::fs::write(&bad, "board = \"BAD\"\npart = \"HL10T-C32-1\"\ncables = \"sim\"\npin.x = \"CLB_X5Y5\"\n").unwrap();
+        assert!(Device::load_board_path(&bad).unwrap_err().contains("not an I/O site"));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

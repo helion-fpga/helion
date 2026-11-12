@@ -11,27 +11,9 @@ Do not repeat what the codebase already shows; point to the authoritative file o
 Prefer rewriting or pruning existing entries over appending new ones.
 When updating this file, preserve this bar for all agents and keep entries concise.
 
-## Nested scrolling (egui)
+## Rune IDE (`helion-rune`)
 
-`data_scroll(id)` (`bin/helion-ide.rs`) is the only sanctioned constructor for a
-table/list ScrollArea nested inside another scrollable region (e.g. report
-tables inside the `timing_canvas_v6` page scroll). It pins
-`auto_shrink([false, true])` + `max_height(TABLE_MAX_HEIGHT)`: with egui's
-default `auto_shrink([true, true])` the inner area shrinks to its content width
-so the wheel-hover rect is only as wide as the text, and wheeling the empty
-part of the list scrolls the outer page instead; without `max_height` the area
-is content-sized and never traps the wheel at all. Every nested ScrollArea
-needs a unique `id_salt` (salt-less areas share one persistent id and leak
-scroll offsets between views). Page flow content (wizard, dashboard sections)
-must NOT get an inner scroll - the outer page owns scrolling.
-
-## Helion IDE chrome
-
-`helion-ide` is three canvases (Editor / Device / Timing) plus a 6-item activity rail and More ⋯ for the other `WorkspaceTab`s. Routing lives in `crates/helion-gui/src/chrome.rs` (`pane_for_workspace`) and `crates/helion-gui/src/surface.rs` (`central_pane` / `ChromeDriver`). The binary paint path must follow `central_pane`. More destinations never fall through to Timing. Open HDL uses `open_hdl_dialog` (rfd). Linux rfd/xdg-portal is pinned to zbus 5.13.2 / zvariant 5.9.2 so rustc 1.85 CI can compile (zbus ≥5.14 needs 1.87). Implement/synth/place/route/sim_run run on a `helion-engine` thread (`spawn_job`); do not call them inside an egui frame. Debug: `HELION_UI_LOG`, `HELION_DEBUG_OVERLAY=1`. `egui::Context::set_debug_on_hover` is `#[cfg(debug_assertions)]` only — never call it on a release paint path. CI `release helion-ide` is `cargo check --release -p helion-gui --bin helion-ide`. Launch shots: `HELION_OPEN`, `HELION_FLOW=implement|synth|sim`, `HELION_WORKSPACE=<tab label>`.
-
-## Toasts
-
-`bin/helion-ide/toasts.rs`: small auto-dismissing notices, bottom-right above the status bar. Wall-clock expiry (5s) via `Instant` + `request_repaint_after` — never frame counts (the UI is reactive; frame-based timers linger while idle). Max 360px wide with wrapping, max 4 stacked, deduped. Job *progress* lives in the status bar; toasts are completions/errors only. No "Started" toasts.
+`crates/helion-rune` builds the shipped `helion-ide` binary (Helion.app, release tarballs, `helion gui`). Rune itself is vendored at one upstream commit in `third_party/rune` (its own workspace, excluded from ours): never edit it in place; change Rune upstream and run `scripts/sync-rune.sh <rune-checkout> <commit>`. Windowless modes: `helion-ide --headless <file>` (gold: counter.sv → `WNS_PS=9640`), `--source script.tcl`, `--stdin`, `--version`, `--doctor`; all go through `tcl::eval_batch`. `init()` is the in-memory demo project used by every test and headless `--snap/--scene`; only an interactive launch uses `boot()` (Start page or `HELION_OPEN`/path arg, prefs via `rune::prefs`, `RUNE_PREFS_DIR` redirects them). Tests must never write outside the temp dir: `pickers::default_projects_dir()` is temp only under `cfg(test)`, so integration tests set the wizard location explicitly. In `Runtime` tests, `rt.frame(1.0/60.0)` repeats one instant, so animations (toast entrance) never settle; advance time or `invalidate()` after mutating `rt.state`, and move the pointer before a tap. UI rule: no echo-only controls; a control does real work or renders disabled with a reason. Port status and remaining gaps: `crates/helion-rune/SWEEP.md`.
 
 ## macOS release signing
 

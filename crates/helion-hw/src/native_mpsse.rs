@@ -336,22 +336,17 @@ pub const STAT_CAPTURE_TDO_LEN: usize = 5; // 3 bytes + 7-bit + 1-bit TMS
 
 /// Pack a Helion STAT word into the MPSSE TDO response layout (mock / unit tests).
 ///
-/// Mirrors FTDI AN_108 bit-mode packing: clocked bits land MSB-first in each
-/// returned byte (first TDO bit → bit7). Byte clocks are LSB-first LE bytes.
+/// Mirrors FTDI bit-mode packing: an n-bit read is left-aligned in its byte
+/// (first TDO bit at bit 8-n). Byte clocks are LSB-first LE bytes.
 pub fn pack_mock_stat_tdo(word: u32) -> [u8; STAT_CAPTURE_TDO_LEN] {
     let le = word.to_le_bytes();
     let mut out = [0u8; STAT_CAPTURE_TDO_LEN];
     out[0] = le[0];
     out[1] = le[1];
     out[2] = le[2];
-    // bits 24..30 → one response byte, first bit in bit7
-    let mut b7 = 0u8;
-    for i in 0..7 {
-        if (word >> (24 + i)) & 1 != 0 {
-            b7 |= 1 << (7 - i);
-        }
-    }
-    out[3] = b7;
+    // bits 24..30 → one response byte, left-aligned: an n-bit LSB-first
+    // read shifts in at bit 7, so the first bit lands at bit 8-n = 1.
+    out[3] = (((word >> 24) & 0x7f) as u8) << 1;
     // bit 31 → TMS-INOUT response, first (only) bit in bit7
     out[4] = if (word >> 31) & 1 != 0 { 0x80 } else { 0x00 };
     out
@@ -371,13 +366,9 @@ pub fn parse_stat_tdo_mpsse(tdo: &[u8]) -> Result<u32, String> {
     let b1 = tdo[1];
     let b2 = tdo[2];
     let mut word = u32::from(b0) | (u32::from(b1) << 8) | (u32::from(b2) << 16);
-    // 7-bit response: bit7 = TDO bit24 … bit1 = TDO bit30
-    let bits7 = tdo[3];
-    for i in 0..7 {
-        if (bits7 >> (7 - i)) & 1 != 0 {
-            word |= 1u32 << (24 + i);
-        }
-    }
+    // 7-bit response, left-aligned: bit1 = TDO bit24 … bit7 = TDO bit30
+    // (OpenOCD mpsse.c `buffer_add_read(…, 8 - this_bits)`).
+    word |= u32::from(tdo[3] >> 1) << 24;
     // 1-bit TMS response: bit7 = TDO bit31
     if (tdo[4] >> 7) & 1 != 0 {
         word |= 1u32 << 31;
@@ -1056,6 +1047,20 @@ mod tests {
         let reset = pack_mock_stat_tdo(helion_fabric::Stat::RESET_WORD);
         let r = parse_stat_tdo_mpsse(&reset).unwrap();
         assert!(!stat_word_done(r), "RESET_WORD must not set DONE");
+    }
+
+    #[test]
+    fn legacy_stat_stream_parses_on_the_mock_ftdi() {
+        use crate::jtag_engine::MpssePort;
+        let d = helion_device::Device::load_part("HL10T-C32-1").unwrap();
+        let mut m = crate::MockFtdi::helion(&d);
+        m.set_bitmode(0x0B, 0x02).unwrap();
+        // The legacy encoder's STAT capture, executed by the mock chip.
+        m.write(&NativeFtdiMpsse::encode_read_stat()).unwrap();
+        let tdo = m.read(STAT_CAPTURE_TDO_LEN).unwrap();
+        assert_eq!(parse_stat_tdo_mpsse(&tdo).unwrap(), helion_fabric::Stat::RESET_WORD);
+        let packed = pack_mock_stat_tdo(0x7F00_0000);
+        assert_eq!(packed[3], 0xFE, "7 bits left-aligned at bit 1");
     }
 
     #[test]

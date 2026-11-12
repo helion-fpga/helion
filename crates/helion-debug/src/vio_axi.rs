@@ -11,7 +11,7 @@
 use crate::bscan::{BscanDebugHub, hub_opcode};
 use crate::probe_site;
 use helion_fabric::Fabric;
-use helion_hw::Tap;
+use helion_hw::{JtagCable, Tap};
 use helion_ir::Design;
 use helion_place::Placed;
 use std::collections::BTreeMap;
@@ -489,6 +489,18 @@ impl JtagAxiMaster {
         }
     }
 
+    /// A master with no address map: every access answers `DECERR` until
+    /// [`JtagAxiMaster::map_region`] adds a real aperture (no modelled slaves).
+    pub fn bare(core_name: impl Into<String>, slot_id: u8) -> Self {
+        Self {
+            core_name: core_name.into(),
+            slot_id,
+            regions: Vec::new(),
+            mem: BTreeMap::new(),
+            txn_count: 0,
+        }
+    }
+
     pub fn map_region(&mut self, region: AxiRegion) {
         self.regions.push(region);
     }
@@ -514,14 +526,26 @@ impl JtagAxiMaster {
         hub: &mut BscanDebugHub,
         tap: &mut Tap,
     ) -> Result<AxiResp, String> {
-        self.run_hw_axi_inner(txn, hub, Some(tap))
+        self.run_hw_axi_inner(txn, hub, Some(tap as &mut dyn JtagCable))
+    }
+
+    /// Execute `txn` over any cable: hub frames are real USER1 DR scans on
+    /// that cable; BRAM apertures are served by the board model behind it
+    /// (a cable without one refuses instead of inventing data).
+    pub fn run_hw_axi_on_cable(
+        &mut self,
+        txn: &mut HwAxiTxn,
+        hub: &mut BscanDebugHub,
+        cable: &mut dyn JtagCable,
+    ) -> Result<AxiResp, String> {
+        self.run_hw_axi_inner(txn, hub, Some(cable))
     }
 
     fn run_hw_axi_inner(
         &mut self,
         txn: &mut HwAxiTxn,
         hub: &mut BscanDebugHub,
-        mut tap: Option<&mut Tap>,
+        mut tap: Option<&mut dyn JtagCable>,
     ) -> Result<AxiResp, String> {
         txn.read_data.clear();
         txn.dr_scans = 0;
@@ -534,17 +558,15 @@ impl JtagAxiMaster {
                 | (u64::from(beat_addr) << 8)
                 | (beat as u64 & 0xFF);
             if let Some(t) = tap.as_deref_mut() {
-                hub.transact_via_tap(t, self.slot_id, hub_opcode::AXI_TXN, cmd_payload)?;
+                hub.transact_via_cable(t, self.slot_id, hub_opcode::AXI_TXN, cmd_payload)?;
             } else {
                 hub.transact(self.slot_id, hub_opcode::AXI_TXN, cmd_payload)?;
             }
             txn.dr_scans += 1;
 
             let Some(region) = self.find_region(beat_addr).cloned() else {
+                // No slave answers: report DECERR without inventing read data.
                 overall_resp = AxiResp::DecErr;
-                if txn.kind == AxiTxnKind::Read {
-                    txn.read_data.push(0xDEAD_BEEF);
-                }
                 break;
             };
 
@@ -553,7 +575,7 @@ impl JtagAxiMaster {
                     let word = txn.write_data[beat];
                     // 2. Write data phase DR scan on BSCAN hub.
                     if let Some(t) = tap.as_deref_mut() {
-                        hub.transact_via_tap(
+                        hub.transact_via_cable(
                             t,
                             self.slot_id,
                             hub_opcode::AXI_TXN,
@@ -568,13 +590,21 @@ impl JtagAxiMaster {
                         overall_resp = AxiResp::SlvErr;
                         break;
                     }
-                    self.mem.insert(beat_addr, word);
-                    if let (Some(major), Some(t)) = (region.bram_aperture_major, tap.as_deref_mut())
-                    {
-                        let word_idx = ((beat_addr - region.base_addr) / 4) as usize;
-                        if word_idx < 255 {
-                            t.fabric_mut()
-                                .bram_write_word(major, word_idx, u64::from(word));
+                    match (region.bram_aperture_major, tap.as_deref_mut()) {
+                        // Live fabric aperture: the BRAM data plane is the only
+                        // copy, so later reads see fabric-side updates too.
+                        (Some(major), Some(t)) => {
+                            let word_idx = ((beat_addr - region.base_addr) / 4) as usize;
+                            if word_idx < 255 {
+                                t.board()
+                                    .ok_or(crate::target::NO_BOARD_MODEL)?
+                                    .fabric_mut()
+                                    .bram_write_word(major, word_idx, u64::from(word));
+                            }
+                            self.mem.remove(&beat_addr);
+                        }
+                        _ => {
+                            self.mem.insert(beat_addr, word);
                         }
                     }
                 }
@@ -583,13 +613,18 @@ impl JtagAxiMaster {
                     if let (Some(major), Some(t)) = (region.bram_aperture_major, tap.as_deref_mut())
                     {
                         let word_idx = ((beat_addr - region.base_addr) / 4) as usize;
-                        if word_idx < 255 && !self.mem.contains_key(&beat_addr) {
-                            val = t.fabric().bram_read_word(major, word_idx) as u32;
+                        if word_idx < 255 {
+                            val = t
+                                .board()
+                                .ok_or(crate::target::NO_BOARD_MODEL)?
+                                .fabric()
+                                .bram_read_word(major, word_idx)
+                                as u32;
                         }
                     }
                     // 2. Read data phase DR scan on BSCAN hub.
                     if let Some(t) = tap.as_deref_mut() {
-                        hub.transact_via_tap(
+                        hub.transact_via_cable(
                             t,
                             self.slot_id,
                             hub_opcode::AXI_TXN,

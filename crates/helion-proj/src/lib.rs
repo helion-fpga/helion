@@ -14,9 +14,18 @@ use helion_sta::{Constraints, apply_xdc, create_clock, load_xdc, report_timing_r
 mod checkpoint2;
 pub mod qor;
 pub mod reports;
+pub mod io_reports;
+pub mod eco;
+pub mod eco_store;
+pub mod dfx;
+pub mod prj_dfx;
+pub mod ooc;
 pub mod tcl;
 
 pub mod ip_packager;
+pub mod archive;
+pub mod hw_platform;
+pub mod zip;
 pub use checkpoint2::{
     CheckpointDiff, CheckpointMeta, CheckpointStage, CheckpointSummary, RestoredCheckpoint,
     cell_fingerprints, delete_checkpoint, diff_metas, list_checkpoints, load_checkpoint,
@@ -484,6 +493,9 @@ pub struct CheckpointIr {
     pub strategy: ImplStrategy,
     pub pblock: Option<PrjPblock>,
     pub timing_weight: f64,
+    /// Placer perturbation seed (0 for checkpoints written before seeds
+    /// were persisted).
+    pub placer_seed: u64,
     pub route_max_iters: u32,
     pub route_extra_hops: u32,
 }
@@ -796,6 +808,40 @@ impl Session {
         self.place_opts = opts;
         self.pblock = Some(pb.clone());
         Ok(())
+    }
+
+    /// Place the design honoring every ranged `.prj` pblock at once
+    /// ([`helion_place::place_with_regions`]): each pblock owns its
+    /// `add_cells_to_pblock` cells (an instance name owns every cell of that
+    /// instance), and a pblock with no cells owns the whole design.
+    /// Unranged pblocks are ignored (they have no rectangle yet).
+    pub fn place_design_with_pblocks(
+        &mut self,
+        dev: &Device,
+        opts: PlaceOpts,
+        pblocks: &[PrjPblock],
+    ) -> Result<Vec<helion_place::RegionStats>, String> {
+        let d = self.design.as_ref().ok_or("place_design: no design")?;
+        let regions = pblock_regions(d, pblocks);
+        if regions.is_empty() {
+            self.place_design_with(dev, opts)?;
+            return Ok(Vec::new());
+        }
+        let packed = pack(d, dev)?;
+        let (placed, stats) = helion_place::place_with_regions(
+            &packed,
+            dev,
+            opts,
+            &regions,
+            &helion_place::TimingGuide::default(),
+        )?;
+        self.packed = Some(packed);
+        self.placed = Some(placed);
+        self.routed = None;
+        self.bitstream = None;
+        self.place_opts = opts;
+        self.pblock = pblocks.iter().find(|p| p.ranged).cloned();
+        Ok(stats)
     }
 
     /// Partial bitstream for Pblock sites (`helion-bits::bitgen_pblock`).
@@ -1270,7 +1316,9 @@ impl Session {
         s.strategy = ck.strategy;
         s.pblock = ck.pblock.clone();
         s.place_opts = PlaceOpts {
-            timing_weight: ck.timing_weight, seed: 0 };
+            timing_weight: ck.timing_weight,
+            seed: ck.placer_seed,
+        };
         s.route_opts = RouteOpts {
             max_iters: ck.route_max_iters,
             extra_hops: ck.route_extra_hops,
@@ -1403,6 +1451,7 @@ impl Session {
             strategy,
             pblock,
             timing_weight: place_opts.timing_weight,
+            placer_seed: place_opts.seed,
             route_max_iters: route_opts.max_iters,
             route_extra_hops: route_opts.extra_hops,
         })
@@ -1411,6 +1460,18 @@ impl Session {
 
 const HKNB: &[u8; 4] = b"HKNB";
 const HKNB_VER: u8 = 1;
+/// Knobs flag: a `u64` placer seed follows the (optional) pblock section.
+const KNB_SEED: u8 = 2;
+
+fn read_seed(bytes: &[u8], i: usize, flags: u8) -> Result<u64, String> {
+    if flags & KNB_SEED == 0 {
+        return Ok(0);
+    }
+    bytes
+        .get(i..i + 8)
+        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        .ok_or_else(|| "truncated hckp placer seed".to_string())
+}
 
 fn write_u16_str(v: &mut Vec<u8>, s: &str) {
     let b = s.as_bytes();
@@ -1444,7 +1505,9 @@ fn encode_impl_knobs(
     v.push(HKNB_VER);
     v.push(strategy.as_u8());
     let pb = pblock.filter(|p| p.ranged);
-    v.push(if pb.is_some() { 1 } else { 0 });
+    // flags: bit 0 = pblock section, bit 1 = placer seed trailer (u64).
+    let seeded = place_opts.seed != 0;
+    v.push(u8::from(pb.is_some()) | if seeded { KNB_SEED } else { 0 });
     v.push(0);
     let milli = (place_opts.timing_weight * 1000.0).round() as u32;
     v.extend_from_slice(&milli.to_le_bytes());
@@ -1462,6 +1525,9 @@ fn encode_impl_knobs(
         for c in &pb.cells {
             write_u16_str(&mut v, c);
         }
+    }
+    if seeded {
+        v.extend_from_slice(&place_opts.seed.to_le_bytes());
     }
     v
 }
@@ -1487,13 +1553,16 @@ fn decode_impl_knobs(
     let milli = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
     let max_iters = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
     let extra_hops = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
-    let place_opts = PlaceOpts {
-        timing_weight: milli as f64 / 1000.0, seed: 0 };
+    let mut place_opts = PlaceOpts {
+        timing_weight: milli as f64 / 1000.0,
+        seed: 0,
+    };
     let route_opts = RouteOpts {
         max_iters,
         extra_hops,
     };
     if flags & 1 == 0 {
+        place_opts.seed = read_seed(bytes, 20, flags)?;
         return Ok((strategy, None, place_opts, route_opts));
     }
     let mut i = 20;
@@ -1517,6 +1586,7 @@ fn decode_impl_knobs(
     for _ in 0..n {
         cells.push(read_u16_str(bytes, &mut i)?);
     }
+    place_opts.seed = read_seed(bytes, i, flags)?;
     Ok((
         strategy,
         Some(PrjPblock {
@@ -1531,6 +1601,34 @@ fn decode_impl_knobs(
         place_opts,
         route_opts,
     ))
+}
+
+/// Placer region constraints for the ranged `.prj` pblocks of `design`.
+/// A pblock member naming a hierarchy instance owns every cell flattened
+/// under it (`inst_*`, `inst.*`, `inst/*`).
+pub fn pblock_regions(design: &Design, pblocks: &[PrjPblock]) -> Vec<helion_place::RegionConstraint> {
+    let instances: std::collections::HashSet<String> = design
+        .instances
+        .iter()
+        .map(|i| resolve(i.name).to_string())
+        .collect();
+    pblocks
+        .iter()
+        .filter(|p| p.ranged)
+        .map(|p| {
+            let mut r = helion_place::RegionConstraint::new(p.name.clone(), p.x0, p.y0, p.x1, p.y1);
+            for c in &p.cells {
+                if instances.contains(c) {
+                    for sep in ["_", ".", "/"] {
+                        r.prefixes.push(format!("{c}{sep}"));
+                    }
+                } else {
+                    r.cells.push(c.clone());
+                }
+            }
+            r
+        })
+        .collect()
 }
 
 fn cell_listed_in_pblock(cells: &[String], names: &[&str]) -> bool {
@@ -1760,8 +1858,12 @@ pub struct ProjectFile {
     pub pulltypes: Vec<(String, String)>,
     pub diff_terms: Vec<(String, String)>,
     pub in_terms: Vec<(String, String)>,
-    /// Floorplan pblocks (`create_pblock` / `resize_pblock` / `add_cells_to_pblock`).
+    /// Floorplan pblocks (`create_pblock` / `resize_pblock` /
+    /// `add_cells_to_pblock` / `delete_pblocks`).
     pub pblocks: Vec<PrjPblock>,
+    /// UG909 reconfigurable partitions (`create_partition` /
+    /// `add_reconfig_module` …, see [`prj_dfx`]).
+    pub partitions: Vec<prj_dfx::PrjPartition>,
     /// Implementation runs (`create_run impl_1 -strategy Default`).
     pub impl_runs: Vec<PrjImplRun>,
     /// Debug nets (`mark_debug <net>` / `set_property MARK_DEBUG`): ILA probes
@@ -2118,6 +2220,21 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
                     }
                 }
             }
+            "delete_pblocks" => {
+                // `delete_pblocks [get_pblocks a] b -hier`: drop each named
+                // pblock (its members are released) and unbind partitions.
+                for tok in toks {
+                    let t = tok.trim_matches(|c: char| "{}[]".contains(c));
+                    if t.is_empty() || t.starts_with('-') || prj_token_is_helper(t) {
+                        continue;
+                    }
+                    p.pblocks.retain(|b| b.name != t);
+                    prj_dfx::release_pblock(&mut p.partitions, t);
+                }
+            }
+            c if prj_dfx::VERBS.contains(&c) => {
+                prj_dfx::apply(&mut p.partitions, line)?;
+            }
             "create_run" => {
                 let rest: Vec<&str> = toks.collect();
                 let mut name = String::new();
@@ -2319,6 +2436,7 @@ pub fn format_prj(prj: &ProjectFile) -> String {
             out.push_str(&format!("add_cells_to_pblock {} {c}\n", pb.name));
         }
     }
+    out.push_str(&prj_dfx::format(&prj.partitions));
     for r in &prj.impl_runs {
         let strat = if r.strategy.is_empty() {
             "Default"
@@ -2852,6 +2970,70 @@ write_checkpoint counter.hckp
     }
 
     #[test]
+    fn delete_pblocks_releases_members_and_round_trips() {
+        let text = "part HL10T-C32-1\nread_sv top.sv\n\
+create_pblock pa\nresize_pblock pa -add {CLB_X1Y1:CLB_X2Y2}\nadd_cells_to_pblock pa u_lut0\n\
+create_pblock pb\nresize_pblock pb -add {CLB_X4Y4:CLB_X5Y5}\n\
+create_partition rp0 -pblock pa -instance u_rm\n\
+delete_pblocks [get_pblocks pa]\n";
+        let prj = load_prj(text).unwrap();
+        assert_eq!(prj.pblocks.len(), 1);
+        assert_eq!(prj.pblocks[0].name, "pb");
+        assert_eq!(prj.partitions[0].pblock, None, "the partition lost its pblock");
+        let design = Design::structural_counter();
+        assert!(
+            pblock_regions(&design, &prj.pblocks)
+                .iter()
+                .all(|r| !r.cells.iter().any(|c| c == "u_lut0")),
+            "deleted pblock's members are no longer constrained"
+        );
+        let saved = format_prj(&prj);
+        assert!(!saved.contains("create_pblock pa\n"), "{saved}");
+        let again = load_prj(&saved).unwrap();
+        assert_eq!(again.pblocks, prj.pblocks);
+        assert_eq!(again.partitions, prj.partitions);
+        // Recreating after delete starts from scratch (no stale members).
+        let re = load_prj(&format!("{text}create_pblock pa\n")).unwrap();
+        assert!(re.pblocks.iter().any(|p| p.name == "pa" && p.cells.is_empty() && !p.ranged));
+        // Tcl session verb.
+        let mut t = VivadoTclSession::new(Mode::Project);
+        t.eval("create_pblock pq").unwrap();
+        t.eval("create_pblock pr").unwrap();
+        t.eval("delete_pblocks pq").unwrap();
+        assert_eq!(t.eval("get_pblocks").unwrap(), "pr");
+    }
+
+    #[test]
+    fn format_prj_round_trips_dfx_partitions() {
+        let text = "part HL10T-C32-1\nread_sv top.v\n\
+create_pblock pblock_rp0\nresize_pblock pblock_rp0 -add {CLB_X6Y5:CLB_X8Y8}\n\
+create_partition rp0 -pblock pblock_rp0 -instance u_rm\n\
+add_reconfig_module rp0 rm_inv rtl/rm_inv.v\n\
+add_reconfig_module rp0 rm_buf {rtl/rm buf.v} rtl/extra.v\n\
+add_reconfig_module rp0 rm_old old.v\ndelete_reconfig_module rp0 rm_old\n\
+create_partition rp1\ndelete_partition rp1\n";
+        let prj = load_prj(text).unwrap();
+        assert_eq!(prj.partitions.len(), 1);
+        let rp = &prj.partitions[0];
+        assert_eq!(rp.pblock.as_deref(), Some("pblock_rp0"));
+        assert_eq!(rp.instance.as_deref(), Some("u_rm"));
+        let names: Vec<&str> = rp.modules.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["rm_inv", "rm_buf"]);
+        assert_eq!(rp.modules[1].sources, ["rtl/rm buf.v", "rtl/extra.v"]);
+        let saved = format_prj(&prj);
+        assert!(saved.contains("add_reconfig_module rp0 rm_buf {rtl/rm buf.v} rtl/extra.v"), "{saved}");
+        let again = load_prj(&saved).unwrap();
+        assert_eq!(again.partitions, prj.partitions);
+        let dfx = again.partitions[0]
+            .to_dfx(&again.pblocks, Some(std::path::Path::new("/proj/p.prj")))
+            .unwrap();
+        assert_eq!((dfx.pblock.x0, dfx.pblock.y1), (6, 8));
+        assert_eq!(dfx.instance, "u_rm");
+        // Unknown verbs from newer files are still ignored; bad DFX lines are errors.
+        assert!(load_prj("read_sv a.v\nadd_reconfig_module rp0 m\n").is_err());
+    }
+
+    #[test]
     fn format_prj_round_trips_io_props_and_mark_debug() {
         let prj = load_prj(
             r#"
@@ -3164,6 +3346,41 @@ create_pblock pblock_0
         assert!(meta.pblock.is_none());
     }
 
+    /// Implement the counter with placer `seed` (Default timing weight).
+    fn seeded_counter(dev: &Device, seed: u64) -> Session {
+        let mut s = Session::new(Mode::Project);
+        s.synth_design(Design::structural_counter());
+        let opts = PlaceOpts { seed, ..ImplStrategy::Default.place_opts() };
+        s.place_design_with(dev, opts).unwrap();
+        s.route_design_with(dev, ImplStrategy::Default.route_opts()).unwrap();
+        s.write_bitstream(dev).unwrap();
+        s
+    }
+
+    #[test]
+    fn seeded_hckp_reopens_with_its_seed_and_hash() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let h0 = seeded_counter(&dev, 0).blinky_hash().unwrap();
+        // A seed whose placement (hence bitstream) differs from seed 0.
+        let (seed, s) = (1..=16u64)
+            .map(|k| (k, seeded_counter(&dev, k)))
+            .find(|(_, s)| s.blinky_hash() != Some(h0))
+            .expect("some placer seed must move the counter");
+        let h = s.blinky_hash().unwrap();
+        let dir = std::env::temp_dir().join(format!("helion-hckp-seed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seeded.hckp");
+        let mut s = s;
+        s.write_checkpoint_to(&path).unwrap();
+        let meta = Session::restore_with_ir(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(meta.placer_seed, seed, "the knobs carry the seed");
+        let reopened = Session::open_checkpoint(&path, &dev)
+            .unwrap_or_else(|e| panic!("seed {seed} checkpoint must reopen: {e}"));
+        assert_eq!(reopened.place_opts.seed, seed);
+        assert_eq!(reopened.blinky_hash(), Some(h));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn impl_project_honors_create_run_strategy() {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
@@ -3184,6 +3401,39 @@ create_pblock pblock_0
             def.blinky_hash(),
             "create_run RuntimeOpt must change the bitstream vs Default"
         );
+    }
+
+    #[test]
+    fn place_design_with_pblocks_honors_every_ranged_pblock() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let pb = |name: &str, x0, y0, x1, y1, cells: &[&str]| PrjPblock {
+            name: name.into(),
+            x0,
+            y0,
+            x1,
+            y1,
+            ranged: true,
+            cells: cells.iter().map(|c| c.to_string()).collect(),
+        };
+        let pblocks = vec![
+            pb("pb_lo", 1, 1, 2, 2, &["u_lut0", "u_lut1"]),
+            pb("pb_hi", 7, 7, 8, 8, &["u_lut3"]),
+            PrjPblock {
+                ranged: false,
+                ..pb("pb_unranged", 0, 0, 0, 0, &["u_lut2"])
+            },
+        ];
+        let mut s = Session::new(Mode::Project);
+        s.synth_design(Design::structural_counter());
+        let stats = s
+            .place_design_with_pblocks(&dev, ImplStrategy::Default.place_opts(), &pblocks)
+            .unwrap();
+        assert_eq!(stats.len(), 2, "unranged pblocks are skipped");
+        let regions = pblock_regions(s.design.as_ref().unwrap(), &pblocks);
+        let placed = s.placed.as_ref().unwrap();
+        assert!(helion_place::region_violations(placed, &regions).is_empty());
+        s.route_design(&dev).unwrap();
+        s.write_bitstream(&dev).unwrap();
     }
 
     #[test]

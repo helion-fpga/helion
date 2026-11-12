@@ -17,22 +17,57 @@ use std::path::{Path, PathBuf};
 /// Missing files are left in place so the preprocessor can still drop the
 /// directive; a named diagnostic is printed.
 pub fn expand_includes(source: &str, base: &Path) -> String {
-    expand_includes_depth(source, base, &mut Vec::new(), 0)
+    let mut out = String::new();
+    expand_includes_into(source, base, "", &mut Vec::new(), 0, &mut out, &mut None);
+    out
 }
 
-fn expand_includes_depth(
+/// [`expand_includes`] plus a line map of the result: which file (and
+/// 1-based line) each output line came from. `origin` names `source`.
+pub(crate) fn expand_includes_mapped(
     source: &str,
     base: &Path,
+    origin: &str,
+) -> (String, Vec<crate::line_cov::Seg>) {
+    let mut out = String::new();
+    let mut segs = Some(Vec::new());
+    expand_includes_into(source, base, origin, &mut Vec::new(), 0, &mut out, &mut segs);
+    (out, segs.unwrap_or_default())
+}
+
+/// Record that the current output line continues `file` at `line`.
+fn seg_here(out: &str, segs: &mut Option<Vec<crate::line_cov::Seg>>, file: &str, line: u32) {
+    if let Some(v) = segs {
+        let out_line = newlines(out);
+        v.retain(|s| s.out_line != out_line);
+        v.push(crate::line_cov::Seg { out_line, file: file.to_string(), file_line: line });
+    }
+}
+
+fn newlines(s: &str) -> u32 {
+    s.bytes().filter(|b| *b == b'\n').count() as u32
+}
+
+fn expand_includes_into(
+    source: &str,
+    base: &Path,
+    file: &str,
     seen: &mut Vec<PathBuf>,
     depth: usize,
-) -> String {
+    out: &mut String,
+    segs: &mut Option<Vec<crate::line_cov::Seg>>,
+) {
+    seg_here(out, segs, file, 1);
     if depth > 8 {
-        return source.to_string();
+        out.push_str(source);
+        return;
     }
-    let mut out = String::new();
     let mut rest = source;
+    // 1-based line in `file` at the start of `rest`.
+    let mut line = 1u32;
     while let Some(idx) = rest.find("`include") {
         out.push_str(&rest[..idx]);
+        line += newlines(&rest[..idx]);
         let after = &rest[idx + "`include".len()..];
         let trimmed = after.trim_start();
         let ws = after.len() - trimmed.len();
@@ -57,6 +92,7 @@ fn expand_includes_depth(
             rest = after;
             continue;
         };
+        line += newlines(&after[..consumed]);
         rest = &after[consumed..];
         if let Some(nl) = rest.find('\n') {
             // keep newline for line structure; drop the rest of the include line
@@ -73,8 +109,11 @@ fn expand_includes_depth(
                     seen.push(found.clone());
                     let text = std::fs::read_to_string(&found).unwrap_or_default();
                     let child_base = found.parent().unwrap_or(base);
-                    out.push_str(&expand_includes_depth(&text, child_base, seen, depth + 1));
+                    let child = found.display().to_string();
+                    expand_includes_into(&text, child_base, &child, seen, depth + 1, out, segs);
                     out.push('\n');
+                    // The rest of the directive's line (its newline) resumes `file`.
+                    seg_here(out, segs, file, line);
                 }
             }
             None => {
@@ -87,7 +126,6 @@ fn expand_includes_depth(
         }
     }
     out.push_str(rest);
-    out
 }
 
 fn resolve_include(base: &Path, spec: &str) -> Option<PathBuf> {
@@ -395,6 +433,26 @@ fn expand_macro(m: &Macro, b: &[u8], i: &mut usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mapped_include_expansion_matches_plain_and_maps_lines() {
+        let dir = std::env::temp_dir().join(format!("helion-sv-linecov-inc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("inc.svh"), "wire i1;\nwire i2;\n").unwrap();
+        let top = "module m;\n`include \"inc.svh\"\nwire t3;\nendmodule\n";
+        let plain = expand_includes(top, &dir);
+        let (mapped, segs) = expand_includes_mapped(top, &dir, "top.sv");
+        assert_eq!(plain, mapped);
+        let at = |needle: &str| {
+            let l = mapped.lines().position(|l| l.contains(needle)).unwrap() as u32;
+            crate::line_cov::map_line(&segs, l).unwrap()
+        };
+        assert_eq!(at("module m"), helion_ir::SrcLoc::new("top.sv", 1));
+        assert_eq!(at("wire i2"), helion_ir::SrcLoc::new(dir.join("inc.svh").display().to_string(), 2));
+        assert_eq!(at("wire t3"), helion_ir::SrcLoc::new("top.sv", 3));
+        assert_eq!(at("endmodule"), helion_ir::SrcLoc::new("top.sv", 4));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn ifdef_keeps_defined_branch() {

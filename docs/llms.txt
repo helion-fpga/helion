@@ -1,17 +1,19 @@
-# Helion documentation
+# Helion
 
-Helion is an original FPGA device family plus the in-repo CAD (synth, pack, place, PathFinder route, STA, bitstream) and desktop IDE that target that family. Not a vendor-tool wrapper.
+> Helion is an original FPGA family (HL10) and the open-source CAD suite that targets it, written in Rust: synthesis, packing, placement, PathFinder routing, static timing, bitstreams, simulation and hardware debug, in one CLI (`helion`) and one desktop IDE (`helion-ide`). It also targets Lattice iCE40, Lattice ECP5 and Xilinx 7-series parts through backends built on open bitstream documentation. It is not a vendor-tool wrapper.
 
-- Home: index.html
-- Using Helion (IDE + CLI): use.html
-- Getting started (download / build): start.html
-- Architecture (crates, HAD, HNF, load_xdc): architecture.html
-- Roadmap (1.4 to 2.0): roadmap.html (canonical ROADMAP.md; milestones https://github.com/helion-fpga/helion/milestones)
-- Wiki index: wiki.html
-- Get involved: get-involved.html
-- Contributing (code): contribute.html
-- Legal fence: legal.html
+- Home: https://helion-fpga.github.io/helion/index.html
+- Get started (install, build): https://helion-fpga.github.io/helion/start.html
+- User guide (IDE, CLI, Tcl, hardware): https://helion-fpga.github.io/helion/use.html
+- Architecture (pipeline, crates, HAD parts, constraints): https://helion-fpga.github.io/helion/architecture.html
+- Tcl reference: https://github.com/helion-fpga/helion/blob/master/docs/tcl-subset.md
+- Benchmarks: https://helion-fpga.github.io/helion/benchmarks.html
+- Roadmap: https://helion-fpga.github.io/helion/roadmap.html
+- Documentation index: https://helion-fpga.github.io/helion/wiki.html
+- Contributing: https://helion-fpga.github.io/helion/contribute.html
+- License and legal: https://helion-fpga.github.io/helion/legal.html
 - Repository: https://github.com/helion-fpga/helion
-- License: Apache-2.0 OR MIT
-- Gold: empty-XDC examples/counter.sv WNS_PS=9640, LED[16]=0000000111111110
-- Part: HL10T-C32-1 (HAD)
+- License: AGPL-3.0-or-later
+- Build: Rust 1.99.1 (pinned in rust-toolchain.toml); `cargo build --release --locked -p helion-cli -p helion-rune`
+- Gold: `helion-ide --headless examples/counter.sv` prints WNS_PS=9640; `helion run examples/counter.sv --cycles 16` prints LED[16]=0000000111111110
+- Parts: HL10T-C32-1, HL10T-DSP1, HL10S-C64-1, HL10M-C128-1 (HAD, devices/helion/); ice40-hx8k; LFE5U-85F; xc7a35t (needs the Project X-Ray database)

@@ -17,7 +17,6 @@ members = [
     "crates/helion-ipxact",
     "crates/helion-bd",
     "crates/helion-proj",
-    "crates/helion-gui",
     "crates/helion-lab",
     "crates/helion-lib",
     "crates/helion-drc",
@@ -28,14 +27,22 @@ members = [
     "crates/helion-hl10t",
     "crates/helion-ice40",
     "crates/helion-ecp5",
+    "crates/helion-targets",
+    "crates/helion-rune",
+    "crates/helion-verif",
+    "crates/helion-svtb",
 ]
+# Vendored Rune UI framework (its own workspace; see scripts/sync-rune.sh).
+exclude = ["third_party"]
 
 [workspace.package]
-version = "3.0.0"
+version = "4.0.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/helion-fpga/helion"
-rust-version = "1.85.0"
+# Mirrors Rune's pinned toolchain (rust-toolchain.toml upstream): Rune declares no
+# rust-version but uses let-chains, which rustc 1.85 cannot parse.
+rust-version = "1.99.1"
 
 [workspace.dependencies]
 helion-ir = { path = "crates/helion-ir" }
@@ -53,8 +60,9 @@ helion-sim = { path = "crates/helion-sim" }
 helion-ipxact = { path = "crates/helion-ipxact" }
 helion-bd = { path = "crates/helion-bd" }
 helion-proj = { path = "crates/helion-proj" }
-helion-gui = { path = "crates/helion-gui" }
+helion-svtb = { path = "crates/helion-svtb" }
 helion-lab = { path = "crates/helion-lab" }
+helion-verif = { path = "crates/helion-verif" }
 helion-lib = { path = "crates/helion-lib" }
 helion-drc = { path = "crates/helion-drc" }
 helion-vhdl = { path = "crates/helion-vhdl" }
@@ -63,6 +71,7 @@ helion-backend = { path = "crates/helion-backend" }
 helion-xilinx7 = { path = "crates/helion-xilinx7" }
 helion-ice40 = { path = "crates/helion-ice40" }
 helion-ecp5 = { path = "crates/helion-ecp5" }
+helion-targets = { path = "crates/helion-targets" }
 criterion = "0.5"
 rayon = "1.8"
 

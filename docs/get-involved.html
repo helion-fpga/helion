@@ -1,89 +1,147 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="theme-color" content="#fbfbfa" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Get involved with Helion</title>
-  <meta name="description" content="How to help Helion: discussions, good first issues, sponsoring, and the coding path." />
-  <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
-  <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=v4" />
+  <meta name="description" content="How to join Helion: where to ask, what to work on, how to build your own copy, and ways to help besides code.">
+  <meta name="theme-color" content="#fbfaf8" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0f1013" media="(prefers-color-scheme: dark)">
+  <link rel="canonical" href="https://helion-fpga.github.io/helion/get-involved.html">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="favicon.png" type="image/png" sizes="32x32">
+  <link rel="apple-touch-icon" href="brand/apple-touch-icon.png">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Helion">
+  <meta property="og:title" content="Get involved with Helion">
+  <meta property="og:description" content="How to join Helion: where to ask, what to work on, how to build your own copy, and ways to help besides code.">
+  <meta property="og:image" content="https://helion-fpga.github.io/helion/brand/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=5">
+  <script>try{var t=localStorage.getItem("helion-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
 </head>
 <body>
-  <a class="skip" href="#main">Skip to main content</a>
-  
-  <header class="pill-nav" id="pillNav">
-    <a class="brand" href="index.html"><img src="brand/mark.png" alt="" width="30" height="30" /><span>Helion</span></a>
-    <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu"><span></span><span></span></button>
-    <nav id="site-nav">
-      <span class="limelight" aria-hidden="true"></span>
-      <a href="index.html">Home</a>
-      <a href="use.html">Use</a>
-      <a href="start.html">Start</a>
-      <a href="architecture.html">Architecture</a>
-      <a href="wiki.html">Wiki</a>
-      <a href="benchmarks.html">Benchmarks</a>
-      <a href="get-involved.html" class="active">Get involved</a>
-      <a href="https://github.com/helion-fpga/helion">GitHub</a>
-    </nav>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="wrap header-inner">
+      <a class="brand" href="index.html"><img src="brand/mark-48.png" alt="" width="30" height="30"><span>Helion</span></a>
+      <nav class="site-nav" id="site-nav" aria-label="Main">
+        <a href="start.html">Get started</a>
+        <a href="use.html">User guide</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="benchmarks.html">Benchmarks</a>
+        <a href="roadmap.html">Roadmap</a>
+        <a href="wiki.html">Docs</a>
+        <a href="get-involved.html">Community</a>
+      </nav>
+      <div class="header-actions">
+        <button type="button" class="icon-btn theme-toggle" aria-label="Switch theme"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+        <a class="icon-btn" href="https://github.com/helion-fpga/helion" aria-label="Helion on GitHub"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="gh-label">GitHub</span></a>
+        <button type="button" class="icon-btn nav-toggle" aria-controls="site-nav" aria-expanded="false" aria-label="Open menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+      </div>
+    </div>
   </header>
 
-  <main id="main" class="page">
-    <div class="prose">
+  <main id="main">
+    <div class="wrap page-head">
       <h1>Get involved</h1>
-      <p class="lede">Helion is AGPL-3.0. One owner today. That only changes if people show up.</p>
+      <p class="lede">Helion is developed in the open under AGPL-3.0-or-later. Here is how to join in.</p>
+    </div>
+    <div class="wrap doc">
+      <nav class="doc-nav" aria-label="On this page">
+        <p>On this page</p>
+        <ul>
+          <li><a href="#connect">Get connected</a></li>
+          <li><a href="#pick">Pick something to work on</a></li>
+          <li><a href="#build">Build your own copy</a></li>
+          <li><a href="#other">Ways to help besides code</a></li>
+          <li><a href="#governance">How the project is run</a></li>
+        </ul>
+      </nav>
+      <article class="prose">
+        <h2 id="connect">Get connected</h2>
+        <p>Ask questions and share ideas in <a href="https://github.com/helion-fpga/helion/discussions">GitHub Discussions</a>. Bugs and feature requests go to <a href="https://github.com/helion-fpga/helion/issues/new/choose">Issues</a>. Everyone in project spaces follows the <a href="https://github.com/helion-fpga/helion/blob/master/CODE_OF_CONDUCT.md">Code of Conduct</a>.</p>
 
-      <ol class="steps">
-        <li>
-          <h3>Get connected</h3>
-          <p>Ask in <a href="https://github.com/helion-fpga/helion/discussions">GitHub Discussions</a>. Bugs and features go in <a href="https://github.com/helion-fpga/helion/issues">Issues</a>. There is no Discord yet. Do not wait for one.</p>
-        </li>
-        <li>
-          <h3>Decide what to work on</h3>
-          <p>Pick a <a href="https://github.com/helion-fpga/helion/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22">good first issue</a>, or say what you want to own (SV ingest, STA, IDE tests, docs, CI). Current release is <a href="https://github.com/helion-fpga/helion/releases/tag/v3.0.0">v3.0.0</a>. Shipped 1.4 to 3.0 are on the <a href="roadmap.html">roadmap</a> and <a href="https://github.com/helion-fpga/helion/milestones">milestones</a>. The crate map is on <a href="architecture.html">Architecture</a>.</p>
-        </li>
-        <li>
-          <h3>Build your own copy</h3>
-          <p>Follow <a href="start.html">Start</a>. Empty-XDC <code>examples/counter.sv</code> must print <span class="gold">WNS_PS=9640</span>. Work on <code>master</code>.</p>
-        </li>
-        <li>
-          <h3>Find the code</h3>
-          <p>See the crate map on <a href="architecture.html">Architecture</a> and the table in <a href="contribute.html">Contribute</a>. GUI paint is not the engine. <code>IdeModel</code> is.</p>
-        </li>
-        <li>
-          <h3>Ship a patch</h3>
-          <p>One crate when you can. One test name while iterating: <code>cargo test -p CRATE --lib TESTNAME</code>. Open a PR and fill the template. Read the <a href="legal.html">legal fence</a> first.</p>
-        </li>
-      </ol>
+        <h2 id="pick">Pick something to work on</h2>
+        <div class="grid two">
+          <div class="card"><h3>Engines</h3><p>SystemVerilog and VHDL constructs that do not lower yet, timing-model calibration, bringing the campaign's optimization passes into the default flow.</p></div>
+          <div class="card"><h3>The IDE</h3><p>The open gaps in <code>crates/helion-rune/SWEEP.md</code>, and tests for engine-backed views.</p></div>
+          <div class="card"><h3>Hardware</h3><p>Have an FTDI cable, an iCE40, ECP5 or 7-series board? Help verify programming on real hardware.</p></div>
+          <div class="card"><h3>Docs and testing</h3><p>This website, the user guide, and trying builds on macOS and Linux.</p></div>
+        </div>
+        <p>Start from the <a href="https://github.com/helion-fpga/helion/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22">good first issues</a> or the <a href="https://github.com/helion-fpga/helion/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22">help wanted</a> list, or say in Discussions what you would like to own. The plan is on the <a href="roadmap.html">roadmap</a>.</p>
 
-      <h2>Ways to help that are not CAD</h2>
-      <ul>
-        <li>Review PRs and test them on macOS / Linux.</li>
-        <li>Improve this documentation site (<code>docs/</code>).</li>
-        <li>Triage issues; turn “it broke” into a command + log.</li>
-        <li><a href="https://github.com/sponsors/saksham-45">Sponsor</a> hosting, domain, and time until a treasurer is named.</li>
-      </ul>
+        <h2 id="build">Build your own copy</h2>
+        <p>Follow <a href="start.html">Get started</a>. Your build is good when <code>helion-ide --headless examples/counter.sv</code> prints <span class="gold">WNS_PS=9640</span>. Then read <a href="contribute.html">Contribute code</a> for the code map and the checks.</p>
 
-      <h2>Code of conduct</h2>
-      <p>Helion follows the Contributor Covenant. Disagreement about CAD is expected. Personal attacks and vendor-IP dumps are not. Enforcement: <a href="https://github.com/saksham-45">@saksham-45</a>.</p>
+        <h2 id="other">Ways to help besides code</h2>
+        <ul>
+          <li>Review pull requests and test them on your platform.</li>
+          <li>Triage issues: turn "it broke" into a command, a log and a minimal design.</li>
+          <li>Improve the docs and this site (<code>docs/</code>).</li>
+          <li><a href="https://github.com/sponsors/saksham-45">Sponsor</a> hosting, the domain and development time.</li>
+        </ul>
 
-      <p class="cta">
-        <a class="btn" href="https://github.com/helion-fpga/helion/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22">Help wanted</a>
-        <a class="btn ghost" href="contribute.html">Coding guide</a>
-      </p>
+        <h2 id="governance">How the project is run</h2>
+        <p>Helion has one owner today, who has the final say on merges and releases, and is looking for maintainers. People who land engine-backed changes and review others' work are invited to join. See <a href="https://github.com/helion-fpga/helion/blob/master/GOVERNANCE.md">GOVERNANCE.md</a> and <a href="https://github.com/helion-fpga/helion/blob/master/MAINTAINERS.md">MAINTAINERS.md</a>.</p>
+
+      </article>
     </div>
   </main>
 
-  <footer class="site-foot">
-    <div class="foot-inner">
-      <span>AGPL-3.0 &middot; <a href="https://github.com/saksham-45">@saksham-45</a> &middot; <a href="https://github.com/helion-fpga">helion-fpga</a></span>
-      <span><a href="legal.html">Legal</a> &middot; <a href="start.html">Start</a> &middot; <a href="https://github.com/helion-fpga/helion">GitHub</a></span>
+  <footer class="site-footer">
+    <div class="wrap">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <a class="brand" href="index.html"><img src="brand/mark-48.png" alt="" width="30" height="30"><span>Helion</span></a>
+          <p>Open-source FPGA CAD and an original FPGA family, written in Rust.</p>
+        </div>
+        <div>
+          <h4>Product</h4>
+          <ul>
+            <li><a href="https://github.com/helion-fpga/helion/releases/latest">Download</a></li>
+            <li><a href="start.html">Get started</a></li>
+            <li><a href="use.html">User guide</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/CHANGELOG.md">Changelog</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Docs</h4>
+          <ul>
+            <li><a href="architecture.html">Architecture</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/docs/tcl-subset.md">Tcl reference</a></li>
+            <li><a href="benchmarks.html">Benchmarks</a></li>
+            <li><a href="roadmap.html">Roadmap</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Community</h4>
+          <ul>
+            <li><a href="get-involved.html">Get involved</a></li>
+            <li><a href="contribute.html">Contribute code</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/discussions">Discussions</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/CODE_OF_CONDUCT.md">Code of conduct</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Project</h4>
+          <ul>
+            <li><a href="legal.html">License and legal</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/SECURITY.md">Security</a></li>
+            <li><a href="https://github.com/helion-fpga/helion/blob/master/GOVERNANCE.md">Governance</a></li>
+            <li><a href="https://github.com/helion-fpga/helion">GitHub</a></li>
+          </ul>
+        </div>
+      </div>
+      <div class="footer-legal">
+        <span>Helion is licensed under <a href="https://github.com/helion-fpga/helion/blob/master/LICENSE">AGPL-3.0-or-later</a>.</span>
+        <span>"Helion" and the Helion logo are trademarks of Saksham Srivastava. <a href="https://github.com/helion-fpga/helion/blob/master/TRADEMARKS.md">Trademark policy</a></span>
+      </div>
     </div>
   </footer>
-  <script src="site.js?v=v4"></script>
+  <script src="site.js?v=5"></script>
 </body>
 </html>

@@ -1,8 +1,11 @@
 blank_issues_enabled: true
 contact_links:
-  - name: Discussions
+  - name: Questions and ideas
     url: https://github.com/helion-fpga/helion/discussions
-    about: Questions, ideas, and “how do I build this” — not bug reports.
+    about: Ask how to build or use Helion, or float an idea before filing it.
   - name: Documentation
     url: https://helion-fpga.github.io/helion/
-    about: Getting started, architecture, and how to contribute.
+    about: Getting started, the user guide, architecture and contributing.
+  - name: Security issue
+    url: https://github.com/helion-fpga/helion/security/advisories/new
+    about: Report vulnerabilities privately, not as a public issue.

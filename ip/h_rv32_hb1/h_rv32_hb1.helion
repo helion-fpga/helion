@@ -4,3 +4,13 @@ vlnv community:helion:h_rv32_hb1:1.0
 bus Helion-MM
 top h_rv32_hb1
 file h_rv32_hb1.v
+file ../../third_party/picorv32/picorv32.v
+param ENABLE_COUNTERS bool 0 RDCYCLE/RDTIME/RDINSTRET counter instructions
+param BARREL_SHIFTER bool 0 Single-cycle barrel shifter (more LUTs)
+param COMPRESSED_ISA bool 0 RV32C compressed instructions
+param CATCH_MISALIGN bool 0 Trap on misaligned memory access
+param CATCH_ILLINSN bool 0 Trap on illegal instructions
+param ENABLE_MUL bool 0 RV32M multiply (MUL/MULH*)
+param ENABLE_DIV bool 0 RV32M divide (DIV/REM)
+param PROGADDR_RESET hex32 0x00000000 Reset vector (first fetch address)
+param STACKADDR hex32 0xFFFFFFFF Initial stack pointer (0xFFFFFFFF leaves x2 unset)

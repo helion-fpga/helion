@@ -130,6 +130,9 @@ pub enum IlaMatchKind {
     Immediate = 0,
     Rising = 1,
     Falling = 2,
+    /// Fire while the comparator LUT (`ila_trig_cmp_lut`, a runtime-programmed
+    /// value/mask compare over up to six probe bits) drives its hit net high.
+    Value = 3,
 }
 
 impl IlaMatchKind {
@@ -138,6 +141,7 @@ impl IlaMatchKind {
             Self::Immediate => "immediate",
             Self::Rising => "rising",
             Self::Falling => "falling",
+            Self::Value => "value",
         }
     }
 }
@@ -205,7 +209,7 @@ impl IlaTriggerFsm {
         if !self.fired {
             let fire = match self.kind {
                 IlaMatchKind::Immediate => self.first,
-                IlaMatchKind::Rising | IlaMatchKind::Falling => match_hit,
+                IlaMatchKind::Rising | IlaMatchKind::Falling | IlaMatchKind::Value => match_hit,
             };
             if fire {
                 self.fired = true;
@@ -748,7 +752,11 @@ impl Fabric {
 
     /// Read programmed BRAM INIT word `addr` of BRAM major `idx` (not pack-only).
     pub fn bram_init_word(&self, idx: u16, addr: usize) -> u64 {
-        let minor = 1u8 + addr as u8;
+        // INIT minors are 1..=255; past that the word does not exist (the
+        // USR1 read pointer can walk off the end of a bank).
+        let Ok(minor) = u8::try_from(addr + 1) else {
+            return 0;
+        };
         self.frames
             .get(&(Far::BRAM, idx, minor))
             .copied()
