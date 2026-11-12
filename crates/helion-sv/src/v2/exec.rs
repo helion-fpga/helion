@@ -1428,7 +1428,7 @@ impl Elab {
                 self.merge(c, a, b, env);
                 Ok(())
             }
-            Stmt::Case { kind, expr, arms, line } => {
+            Stmt::Case { kind, expr, arms, full, line } => {
                 self.line = *line;
                 let (mut w, mut sg) = self.size(expr, sc)?;
                 for (items, _) in arms {
@@ -1492,8 +1492,45 @@ impl Elab {
                 if conds.len() == 1 && self.dag.as_const(conds[0]).is_some() {
                     return self.exec(bodies[0], sc, env);
                 }
+                // Without a default, a case whose constant labels enumerate
+                // every value of the selector ends in its last arm. The
+                // selector's own width bounds the values it can take
+                // (labels are often wider, unsized integers).
+                let mut covered = false;
+                let (own_w, own_s) = self.size(expr, sc)?;
+                if default.is_none() && own_w <= 16 && (own_w == w || !own_s) {
+                    let mut seen = std::collections::HashSet::new();
+                    let mut all_const = true;
+                    'arms: for (items, _) in arms {
+                        for it in items {
+                            let InsideItem::Value(e) = it else {
+                                all_const = false;
+                                break 'arms;
+                            };
+                            let v = self.eval(e, w, sg, sc, env)?;
+                            match self.dag.const_u128(v) {
+                                Some(k) if !matches!(e, Expr::Num(n) if n.xz.iter().any(|x| *x)) => {
+                                    if k < 1u128 << own_w {
+                                        seen.insert(k);
+                                    }
+                                }
+                                _ => {
+                                    all_const = false;
+                                    break 'arms;
+                                }
+                            }
+                        }
+                    }
+                    covered = all_const && seen.len() as u128 == 1u128 << own_w;
+                }
                 // A trailing always-true arm is the default.
                 let mut else_body = default;
+                if else_body.is_none() && covered && conds.len() > 1 {
+                    conds.pop();
+                    else_body = bodies.pop();
+                } else if else_body.is_none() && covered && conds.len() == 1 {
+                    return self.exec(bodies[0], sc, env);
+                }
                 if let Some(&last) = conds.last() {
                     if self.dag.as_const(last).map(|k| k[0]) == Some(true) {
                         conds.pop();
@@ -1503,8 +1540,35 @@ impl Elab {
                 let base = env.clone();
                 let (any, hit) = self.case_tree(&conds, &bodies, sc, &base)?;
                 let mut miss = base;
+                let no_else = else_body.is_none();
                 if let Some(d) = else_body {
                     self.exec(d, sc, &mut miss)?;
+                }
+                // The author says some arm always matches (`unique`,
+                // `priority`, `full_case`). Where "no arm matched" would
+                // keep an old value in combinational logic (a latch), that
+                // case cannot occur, so the arms decide alone. Everywhere
+                // else the simulation meaning (nothing is assigned) stands.
+                if *full && no_else && env.mode == Mode::Comb {
+                    let mut memo = HashMap::new();
+                    for which in 0..2 {
+                        let keys: Vec<u32> = if which == 0 { hit.sig.keys().copied().collect() } else { hit.nba.keys().copied().collect() };
+                        for k in keys {
+                            let hv = if which == 0 { hit.sig[&k] } else { hit.nba[&k] };
+                            let mv = match if which == 0 { miss.sig.get(&k) } else { miss.nba.get(&k) } {
+                                Some(&v) => v,
+                                None => self.base_of(k, Mode::Comb),
+                            };
+                            let taint = self.dag.tainted_bits(mv, &|op| matches!(op, Op::Hold(_)), &mut memo);
+                            if taint.iter().any(|t| *t) {
+                                if which == 0 {
+                                    miss.sig.insert(k, hv);
+                                } else {
+                                    miss.nba.insert(k, hv);
+                                }
+                            }
+                        }
+                    }
                 }
                 self.merge(any, hit, miss, env);
                 Ok(())
@@ -1774,30 +1838,21 @@ impl Elab {
             if !self.warnings.iter().any(|w| w.ends_with(note)) {
                 self.warnings.push(format!("line {line}: {note}"));
             }
-            // The flops power up in their reset state, as they would be
-            // after an asynchronous reset at time zero.
-            if let Stmt::If { then, .. } = first {
-                let saved = std::mem::take(&mut self.ps);
-                let mut scratch = Env { mode: Mode::Seq, ..Default::default() };
-                self.exec(then, sc, &mut scratch)?;
-                let assigned = std::mem::replace(&mut self.ps, saved);
-                for (map, masks) in [(&scratch.nba, &assigned.nba), (&scratch.sig, &assigned.blk)] {
-                    for (id, v) in map {
-                        let Some(mask) = masks.get(id) else { continue };
-                        for (b, m) in mask.iter().enumerate() {
-                            if !*m {
-                                continue;
-                            }
-                            let bit = self.dag.slice(*v, b as u32, 1);
-                            if let Some(k) = self.dag.as_const(bit).map(|k| k[0]) {
-                                self.sigs[*id as usize].init[b] = k;
-                            }
-                        }
-                    }
-                }
-            }
             free[0]
         };
+        // Asynchronous controls that are plain one-bit signals, with their active level.
+        let mut active: Vec<(u32, bool)> = Vec::new();
+        for (i, (pos, e)) in edges.iter().enumerate() {
+            if i == clk_ix {
+                continue;
+            }
+            let v = self.eval_self(e, sc, &mut Env::default())?;
+            if let Op::Read(sig) = *self.dag.op(v.n) {
+                if self.dag.w(v.n) == 1 {
+                    active.push((sig, *pos));
+                }
+            }
+        }
         let (pos, clk_e) = &edges[clk_ix];
         let cv = self.eval_self(clk_e, sc, &mut Env::default())?;
         let clk = self.dag.slice(cv.n, 0, 1);
@@ -1818,6 +1873,26 @@ impl Elab {
             for (b, m) in mask.iter().enumerate() {
                 if *m {
                     self.drive(id, b as u32, Drv::Reg(reg))?;
+                }
+            }
+            // With asynchronous controls, the flops power up in the state
+            // those controls put them in, as after a reset at time zero:
+            // the data input with every control at its active level.
+            if !active.is_empty() {
+                let mut memo: HashMap<N, N> = HashMap::new();
+                let act = &active;
+                let mut fix = |g: &mut super::dag::Dag, n: N| -> Option<N> {
+                    let Op::Read(sig) = *g.op(n) else { return None };
+                    act.iter().find(|a| a.0 == sig).map(|a| g.konst(vec![a.1; g.w(n) as usize]))
+                };
+                let at_reset = self.dag.subst(d, &mut fix, &mut memo);
+                for (b, m) in mask.iter().enumerate() {
+                    if *m {
+                        let bit = self.dag.slice(at_reset, b as u32, 1);
+                        if let Some(k) = self.dag.as_const(bit).map(|k| k[0]) {
+                            self.sigs[id as usize].init[b] = k;
+                        }
+                    }
                 }
             }
             self.regs.push(Reg { sig: id, d, clk, negedge: !*pos, mask });

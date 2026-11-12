@@ -258,17 +258,18 @@ def bench(nl: Netlist, clocks: set[str], cycles: int, seed: int, with_netlist: b
         t.append(f"reg [{W - 1}:0] in_{p} = 0;")
     for p in outs:
         t.append(f"wire [{W - 1}:0] r_{p};")
-        t.append(f"assign r_{p} = dut.{p};")
+        t.append(f"assign r_{p} = dut.\\{p} ;")
         if with_netlist:
             t.append(f"wire [{W - 1}:0] o_{p}; wire [{W - 1}:0] k_{p};")
-    conn = ", ".join(f".{p}(in_{p}[$bits(dut.{p})-1:0])" for p in ins)
+    # Escaped identifiers: a Verilog port may be named with an SV keyword.
+    conn = ", ".join(f".\\{p} (in_{p}[$bits(dut.\\{p} )-1:0])" for p in ins)
     t.append(f"{nl.top} dut({conn});")
     if with_netlist:
         conn = ", ".join([f".in_{p}(in_{p})" for p in ins] + [f".o_{p}(o_{p})" for p in outs] + [f".k_{p}(k_{p})" for p in outs])
         t.append(f"helion_netlist net({conn});")
     t.append("initial begin")
     for p in ins + outs:
-        t.append(f'  $display("W {p} %0d", $bits(dut.{p}));')
+        t.append(f'  $display("W {p} %0d", $bits(dut.\\{p} ));')
     if with_netlist:
         t.append(f"  j = $urandom({seed});")
         for p in data:
@@ -310,7 +311,7 @@ def verilate(work: str, files: list[str], tag: str):
     obj = os.path.join(work, "obj_" + tag)
     shutil.rmtree(obj, ignore_errors=True)
     cmd = ["verilator", "--binary", "--timing", "-O0", "--x-initial", "0", "--x-assign", "0", "-Wno-fatal", "-Wno-lint",
-           "-Wno-WIDTH", "-Wno-PINMISSING", "-Wno-MULTIDRIVEN", "-Wno-LATCH", "-Wno-UNOPTFLAT", "--top-module", "svcheck_tb", "--Mdir", obj, "-o", "sim"] + files
+           "-Wno-WIDTH", "-Wno-PINMISSING", "-Wno-MULTIDRIVEN", "-Wno-LATCH", "-Wno-UNOPTFLAT", "+1364-2005ext+v", "--top-module", "svcheck_tb", "--Mdir", obj, "-o", "sim"] + files
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     if r.returncode != 0:
         err = [l for l in r.stderr.splitlines() if "%Error" in l]

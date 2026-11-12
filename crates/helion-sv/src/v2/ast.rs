@@ -198,7 +198,9 @@ pub enum Stmt {
     Block { decls: Vec<Item>, stmts: Vec<Stmt> },
     Assign { lhs: Expr, rhs: Expr, nonblocking: bool, line: u32 },
     If { cond: Expr, then: Box<Stmt>, els: Option<Box<Stmt>>, line: u32 },
-    Case { kind: CaseKind, expr: Expr, arms: Vec<(Vec<InsideItem>, Stmt)>, line: u32 },
+    /// `full`: the author states that one arm always matches (`unique`,
+    /// `priority`, `full_case`), so no value falls through.
+    Case { kind: CaseKind, expr: Expr, arms: Vec<(Vec<InsideItem>, Stmt)>, full: bool, line: u32 },
     For { init: Vec<Stmt>, decls: Vec<Item>, cond: Expr, step: Vec<Stmt>, body: Box<Stmt>, line: u32 },
     While { cond: Expr, body: Box<Stmt>, line: u32 },
     DoWhile { cond: Expr, body: Box<Stmt>, line: u32 },
