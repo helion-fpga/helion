@@ -19,6 +19,8 @@ use helion_backend::Backend;
 
 fn synth(path: &str, top: Option<&str>) -> Result<Design, String> {
     helion_sv::set_dsp_inference(false);
+    // Adders, subtractors and comparators go on the dedicated carry chains.
+    helion_vhdl::set_carry_arith(std::env::var("HELION_NO_CARRY").is_err());
     let src = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     if path.ends_with(".vhd") || path.ends_with(".vhdl") {
         helion_vhdl::synth_vhdl_top(&src, top)

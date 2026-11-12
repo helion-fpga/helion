@@ -61,6 +61,10 @@ struct SearchBuf {
     stamp: Vec<u32>,
     best: Vec<u32>,
     parent: Vec<u32>,
+    /// Stamp of the search that expanded the wire: a wire is expanded once
+    /// (the distance estimate is not exact on long wires, and reopening
+    /// wires made failing searches visit each one many times).
+    closed: Vec<u32>,
 }
 
 impl<'a> XDevice<'a> {
@@ -239,9 +243,69 @@ impl<'a> XDevice<'a> {
         };
         let is_target = |id: u32| targets.contains(&id);
         let tgt_xy: Vec<(i32, i32)> = targets.iter().map(|&t| self.wire_xy(t)).collect();
-        // Search region.
+
+        const PIP_BASE: u32 = 15;
+        let h = |id: u32| -> u32 {
+            let (x, y) = self.wire_xy(id);
+            let d = tgt_xy.iter().map(|(tx, ty)| (x - tx).abs() + (y - ty).abs()).min().unwrap_or(0);
+            // Negotiating adds penalties near the sinks; a steeper
+            // estimate keeps that search aimed at them instead of flooding
+            // everything within the penalty's reach.
+            (d as u32) * if opts.negotiate { 220 } else { 90 }
+        };
+        let mut sb = self.search.borrow_mut();
+        if sb.stamp.len() != n {
+            sb.stamp = vec![0; n];
+            sb.best = vec![0; n];
+            sb.parent = vec![u32::MAX; n];
+            sb.closed = vec![0; n];
+            sb.generation = 0;
+        }
+        sb.generation = sb.generation.wrapping_add(1);
+        if sb.generation == 0 {
+            sb.stamp.iter_mut().for_each(|x| *x = 0);
+            sb.closed.iter_mut().for_each(|x| *x = 0);
+            sb.generation = 1;
+        }
+        let stampv = sb.generation;
+        let mut heap: BinaryHeap<Reverse<(u32, u32, u32)>> = BinaryHeap::new();
+        macro_rules! seen {
+            ($id:expr) => {
+                sb.stamp[$id as usize] == stampv
+            };
+        }
+        sb.stamp[start as usize] = stampv;
+        sb.best[start as usize] = 0;
+        sb.parent[start as usize] = u32::MAX;
+        heap.push(Reverse((h(start), 0, start)));
+        let mut near = (h(start), start);
+        for (t, w, d) in tree {
+            if let Some(id) = self.wire_id_of(t, w) {
+                // Branch only from general interconnect: wires past a site
+                // pin (IOI/OLOGIC route-throughs, CLB pins) are not fanout
+                // points.
+                if !clock && flags[id as usize] & 8 == 0 {
+                    continue;
+                }
+                if clock && flags[id as usize] & 4 != 0 {
+                    continue;
+                }
+                if !seen!(id) || *d < sb.best[id as usize] {
+                    sb.stamp[id as usize] = stampv;
+                    sb.best[id as usize] = *d;
+                    sb.parent[id as usize] = u32::MAX;
+                    heap.push(Reverse((d + h(id), *d, id)));
+                }
+                let dist = h(id);
+                if dist < near.0 {
+                    near = (dist, id);
+                }
+            }
+        }
+        // Search region: the box spanned by the sinks and the nearest wire
+        // the net already has (its source, or a branch of its tree).
         let region = (opts.bbox > 0).then(|| {
-            let (sx, sy) = self.wire_xy(start);
+            let (sx, sy) = self.wire_xy(near.1);
             let (mut x0, mut x1, mut y0, mut y1) = (sx, sx, sy, sy);
             for &(x, y) in &tgt_xy {
                 x0 = x0.min(x);
@@ -260,54 +324,6 @@ impl<'a> XDevice<'a> {
                 }
             }
         };
-        const PIP_BASE: u32 = 15;
-        let h = |id: u32| -> u32 {
-            let (x, y) = self.wire_xy(id);
-            let d = tgt_xy.iter().map(|(tx, ty)| (x - tx).abs() + (y - ty).abs()).min().unwrap_or(0);
-            (d as u32) * 90
-        };
-        let mut sb = self.search.borrow_mut();
-        if sb.stamp.len() != n {
-            sb.stamp = vec![0; n];
-            sb.best = vec![0; n];
-            sb.parent = vec![u32::MAX; n];
-            sb.generation = 0;
-        }
-        sb.generation = sb.generation.wrapping_add(1);
-        if sb.generation == 0 {
-            sb.stamp.iter_mut().for_each(|x| *x = 0);
-            sb.generation = 1;
-        }
-        let stampv = sb.generation;
-        let mut heap: BinaryHeap<Reverse<(u32, u32, u32)>> = BinaryHeap::new();
-        macro_rules! seen {
-            ($id:expr) => {
-                sb.stamp[$id as usize] == stampv
-            };
-        }
-        sb.stamp[start as usize] = stampv;
-        sb.best[start as usize] = 0;
-        sb.parent[start as usize] = u32::MAX;
-        heap.push(Reverse((h(start), 0, start)));
-        for (t, w, d) in tree {
-            if let Some(id) = self.wire_id_of(t, w) {
-                // Branch only from general interconnect: wires past a site
-                // pin (IOI/OLOGIC route-throughs, CLB pins) are not fanout
-                // points.
-                if !clock && flags[id as usize] & 8 == 0 {
-                    continue;
-                }
-                if clock && flags[id as usize] & 4 != 0 {
-                    continue;
-                }
-                if !seen!(id) || *d < sb.best[id as usize] {
-                    sb.stamp[id as usize] = stampv;
-                    sb.best[id as usize] = *d;
-                    sb.parent[id as usize] = u32::MAX;
-                    heap.push(Reverse((d + h(id), *d, id)));
-                }
-            }
-        }
         let mut found = None;
         let mut expanded = 0usize;
         let limit = match (opts.cap_detour, heap.peek()) {
@@ -318,15 +334,16 @@ impl<'a> XDevice<'a> {
             if f > limit {
                 break;
             }
-            if g > sb.best[id as usize] {
+            if g > sb.best[id as usize] || sb.closed[id as usize] == stampv {
                 continue;
             }
+            sb.closed[id as usize] = stampv;
             if is_target(id) {
                 found = Some(id);
                 break;
             }
             expanded += 1;
-            if expanded > 30_000_000 {
+            if expanded > if opts.negotiate { 6_000_000 } else { 30_000_000 } {
                 break;
             }
             // Node siblings (tileconn stitching): free.
@@ -343,6 +360,9 @@ impl<'a> XDevice<'a> {
                             continue;
                         }
                         let gm = g + extra(m);
+                        if sb.closed[m as usize] == stampv {
+                            continue;
+                        }
                         if !seen!(m) || gm < sb.best[m as usize] {
                             sb.stamp[m as usize] = stampv;
                             sb.best[m as usize] = gm;
@@ -367,6 +387,9 @@ impl<'a> XDevice<'a> {
                 if seen!(dst) && sb.parent[dst as usize] == u32::MAX {
                     continue;
                 }
+                if sb.closed[dst as usize] == stampv {
+                    continue;
+                }
                 if !seen!(dst) || ng < sb.best[dst as usize] {
                     sb.stamp[dst as usize] = stampv;
                     sb.best[dst as usize] = ng;
@@ -375,10 +398,13 @@ impl<'a> XDevice<'a> {
                 }
             }
         }
+        if std::env::var("HELION_ROUTE_STATS").is_ok() {
+            eprintln!("route_stat net={net} expanded={expanded} found={} negotiate={} bbox={}", found.is_some(), opts.negotiate, opts.bbox);
+        }
         let Some(end) = found else {
             if std::env::var("HELION_ROUTE_DEBUG").is_ok() {
                 let blocked: Vec<String> = targets.iter().map(|&t| format!("{:?} owner={} flags={}", self.wire_name_of(t), own.0.get(t as usize).copied().unwrap_or(0), flags[t as usize])).collect();
-                eprintln!("route_debug net={net} expanded={expanded} my={my} targets={blocked:?}");
+                eprintln!("route_debug net={net} expanded={expanded} my={my} negotiate={} bbox={} cap={} limit={limit} targets={blocked:?}", opts.negotiate, opts.bbox, opts.cap_detour);
             }
             return Some(None);
         };

@@ -281,7 +281,14 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         let site = carry_site.get(carry.name.as_str()).copied().unwrap_or("");
         for j in 0..4 {
             if let Some(o) = &carry.o_nets[j] {
-                add_ep(o.clone(), site.to_string(), &format!("O{j}"), true);
+                // An adder's sum bit leaves the slice on the letter's
+                // multiplexed output (`AMUX`..`DMUX`, set to XOR).
+                let pin = if packed.adder_carries.contains(&carry.name) {
+                    format!("{}MUX", ['A', 'B', 'C', 'D'][j])
+                } else {
+                    format!("O{j}")
+                };
+                add_ep(o.clone(), site.to_string(), &pin, true);
             }
             if let Some(s) = &carry.s_nets[j] {
                 add_ep(s.clone(), site.to_string(), &format!("S{j}"), false);
@@ -351,44 +358,27 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
             continue; // undriven net: nothing to route
         }
         let mut delays: Vec<(String, String, u32)> = Vec::new();
-        // Local strict search first; then let the net displace others
-        // locally; only then search the whole device.
-        let mut kind = None;
-        let mut first_err = None;
-        for (negotiate, bbox, cap) in [(false, 8, true), (true, 8, false), (true, 0, false)] {
-            delays.clear();
-            match route_net(&net, drivers[0], &loads, device, &claimed, &mut delays, negotiate, bbox, cap) {
-                Ok(k) => {
-                    let victims = match (&k, negotiate) {
-                        (RouteKind::Pips(p), true) => device.contested(&net, p),
-                        _ => Vec::new(),
-                    };
-                    if !victims.is_empty() {
-                        rips += victims.len();
-                        if rips > max_rips {
-                            return Err(format!("route: congestion around net `{net}` not resolved after {rips} rip-ups"));
-                        }
-                        let vset: HashSet<&str> = victims.iter().map(|v| v.as_str()).collect();
-                        nets.retain(|n: &RoutedNet7| !vset.contains(n.net.as_str()));
-                        claimed.retain(|_, o| !vset.contains(o.as_str()));
-                        load_delays.retain(|k, _| !vset.contains(k.0.as_str()));
-                        device.release_claims(&victims, claimed.len());
-                        for v in &victims {
-                            queue.push_back(v.clone());
-                        }
-                    }
-                    kind = Some(k);
-                    break;
-                }
-                Err(e) if e.contains("unroutable") => {
-                    first_err.get_or_insert(e);
-                }
-                Err(e) => return Err(e),
+        let kind = route_net(&net, drivers[0], &loads, device, &claimed, &mut delays)?;
+        // Loads that found no free path took one through other nets'
+        // wires: those nets are ripped up and queued again.
+        let victims = match &kind {
+            RouteKind::Pips(p) => device.contested(&net, p),
+            _ => Vec::new(),
+        };
+        if !victims.is_empty() {
+            rips += victims.len();
+            if rips > max_rips {
+                return Err(format!("route: congestion around net `{net}` not resolved after {rips} rip-ups"));
+            }
+            let vset: HashSet<&str> = victims.iter().map(|v| v.as_str()).collect();
+            nets.retain(|n: &RoutedNet7| !vset.contains(n.net.as_str()));
+            claimed.retain(|_, o| !vset.contains(o.as_str()));
+            load_delays.retain(|k, _| !vset.contains(k.0.as_str()));
+            device.release_claims(&victims, claimed.len());
+            for v in &victims {
+                queue.push_back(v.clone());
             }
         }
-        let Some(kind) = kind else {
-            return Err(first_err.unwrap_or_else(|| format!("route: net `{net}` unroutable")));
-        };
         if device.is_clock_net(&net) && matches!(kind, RouteKind::Pips(_)) {
             graph_clocks = true;
         }
@@ -497,9 +487,6 @@ fn route_net(
     device: &dyn RouteQuery,
     claimed: &HashMap<(String, String), String>,
     delays: &mut Vec<(String, String, u32)>,
-    negotiate: bool,
-    bbox: i32,
-    cap_detour: bool,
 ) -> Result<RouteKind, String> {
     // Split loads into site-internal (same site as driver and not a
     // LUT input) and external. Slice LUT inputs (A1-A6 and friends)
@@ -579,7 +566,7 @@ fn route_net(
             ));
         }
         let allow_byp = is_bypass_pin(&load.pin);
-        let opts = RouteOpts { allow_power, allow_byp, no_int: false, clock: false, any_pip: false, negotiate, bbox, cap_detour };
+        let opts = RouteOpts { allow_power, allow_byp, ..Default::default() };
         // A BUFG input takes the dedicated clock path (clock-capable pad ->
         // CMT/HROW -> BUFG) when one exists, else general interconnect.
         let mut fast = None;
@@ -589,7 +576,15 @@ fn route_net(
             }
         }
         if fast.is_none() {
-            fast = device.route_fast((&src_tile, &src_wire), &tree, &sinks, opts, net, claimed);
+            // A free path near the net first (giving up on long detours);
+            // else the cheapest path through other nets' wires, near the
+            // net and then anywhere. The caller rips up the displaced nets.
+            for (negotiate, bbox, cap_detour) in [(false, 8, true), (true, 8, false), (true, 0, false)] {
+                fast = device.route_fast((&src_tile, &src_wire), &tree, &sinks, RouteOpts { negotiate, bbox, cap_detour, ..opts }, net, claimed);
+                if !matches!(fast, Some(None)) {
+                    break;
+                }
+            }
         }
         if matches!(fast, Some(None)) && matches!(load.pin.as_str(), "I0" | "I1") {
             // Parts whose database lacks the clock-input wiring: the old
@@ -851,7 +846,7 @@ mod tests {
             brams: vec![],
             dsps: vec![],
             carries: vec![],
-            carry_anchor: None,
+            carry_anchor: None, ..Default::default()
         };
         Placed7 {
             packed,
@@ -965,7 +960,7 @@ mod tests {
                     o_nets: [Some("o1".into()), None, None, None],
                 },
             ],
-            carry_anchor: None,
+            carry_anchor: None, ..Default::default()
         };
         Placed7 {
             packed,

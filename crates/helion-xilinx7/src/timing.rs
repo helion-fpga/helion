@@ -498,7 +498,7 @@ mod tests {
             brams: vec![],
             dsps: vec![],
             carries: vec![],
-            carry_anchor: None,
+            carry_anchor: None, ..Default::default()
         };
         let routed = Routed7 {
             placed: Placed7 {

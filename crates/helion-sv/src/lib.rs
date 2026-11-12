@@ -15603,7 +15603,85 @@ const RIPPLE_INC_MAX: usize = 64;
 /// Unsigned bus-vs-bus `<` / `>=` ripple. Ibex timer interrupt_d is 64.
 const RIPPLE_CMP_MAX: usize = 64;
 
+thread_local! {
+    static CARRY_ADDERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Lower `sum = a + b` of two named buses to dedicated carry chains
+/// (`Carry4` cells, one LUT per bit) instead of LUT logic. For targets
+/// with a fast carry (7-series); off by default.
+pub fn set_carry_adders(on: bool) {
+    CARRY_ADDERS.with(|c| c.set(on));
+}
+
+fn carry_adders() -> bool {
+    CARRY_ADDERS.with(|c| c.get())
+}
+
+/// Adders narrower than this stay in LUTs (no carry chain is worth it).
+const CARRY_ADD_MIN: usize = 5;
+const CARRY_ADD_MAX: usize = 4096;
+
+/// `sum = a + b` on a carry chain. Bit `i`: the LUT gives the propagate
+/// `a ^ b` (pin `S`), one operand is the generate (pin `DI`), and the sum
+/// leaves on `O`. Bits past an operand's width read 0.
+fn emit_carry_add(d: &mut Design, rtl: &Rtl, sum: &str, width: usize, a: &str, b: &str) -> bool {
+    let aw = sig_width(rtl, a);
+    let bw = sig_width(rtl, b);
+    let op_w = aw.max(bw);
+    if op_w == 0 || width < op_w || width > op_w + 1 {
+        return false;
+    }
+    let groups = width.div_ceil(4);
+    for g in 0..groups {
+        let cname = format!("u_ca_{sum}_c{g}");
+        d.add_cell(&cname, CellKind::Carry4);
+        let _ = d.set_cell_attr(&cname, "ADDER", "1");
+        if g == 0 {
+            let _ = d.set_cell_attr(&cname, "CYINIT", "0");
+        } else {
+            d.connect(format!("u_ca_{sum}_co{}", g - 1), &cname, "CI");
+        }
+        if g + 1 < groups {
+            d.connect(format!("u_ca_{sum}_co{g}"), &cname, "CO");
+        }
+        for j in 0..4 {
+            let bit = g * 4 + j;
+            if bit >= width {
+                break;
+            }
+            let an = if bit < aw { op_bit_net(rtl, a, bit) } else { None };
+            let bn = if bit < bw { op_bit_net(rtl, b, bit) } else { None };
+            let s_net = format!("u_ca_{sum}_s{bit}");
+            let s_cell = format!("u_ca_{sum}_{bit}s");
+            match (&an, &bn) {
+                (Some(x), Some(y)) => emit_lut_pins(d, &s_cell, &s_net, lut6_xor2(), &[(x, "I0"), (y, "I1")]),
+                (Some(x), None) | (None, Some(x)) => emit_lut_pins(d, &s_cell, &s_net, lut6_buf(), &[(x, "I0")]),
+                (None, None) => emit_lut_pins(d, &s_cell, &s_net, lut6_const(false), &[]),
+            }
+            d.connect(&s_net, &cname, format!("S{j}"));
+            // Generate: with propagate 0 the operands are equal, so either
+            // one is the carry out.
+            if let Some(x) = an.as_ref().or(bn.as_ref()) {
+                d.connect(x, &cname, format!("DI{j}"));
+            }
+            d.connect(bit_name(sum, width, bit), &cname, format!("O{j}"));
+        }
+    }
+    eprintln!("synth_rtl carry_add signal={sum} bits={width}");
+    true
+}
+
 fn emit_ripple_add(d: &mut Design, rtl: &Rtl, sum: &str, width: usize, a: &str, b: &str) -> bool {
+    if carry_adders() && (CARRY_ADD_MIN..=CARRY_ADD_MAX).contains(&width) {
+        let (aw, bw) = (sig_width(rtl, a), sig_width(rtl, b));
+        let known = (0..aw.max(bw)).all(|bit| {
+            (bit >= aw || op_bit_net(rtl, a, bit).is_some()) && (bit >= bw || op_bit_net(rtl, b, bit).is_some())
+        });
+        if known && emit_carry_add(d, rtl, sum, width, a, b) {
+            return true;
+        }
+    }
     if width == 0 || width > RIPPLE_ADD_MAX {
         return false;
     }
@@ -17896,7 +17974,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             if let Some((a_name, b_name)) = packed_add_pair(rhs, rtl) {
                 if rexpr_unknown_name(rhs, rtl).is_none() {
                     let w = sig_width(rtl, lhs).max(1);
-                    if w <= RIPPLE_ADD_MAX && emit_ripple_add(&mut d, rtl, lhs, w, &a_name, &b_name) {
+                    if (w <= RIPPLE_ADD_MAX || carry_adders()) && emit_ripple_add(&mut d, rtl, lhs, w, &a_name, &b_name) {
                         continue;
                     }
                 }

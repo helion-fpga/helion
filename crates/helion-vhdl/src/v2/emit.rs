@@ -680,6 +680,8 @@ impl Elab {
             .filter(|d| {
                 uses.get(d) == Some(&1)
                     && !matches!(self.dag.op(*d), Op::Read(_) | Op::Const(_) | Op::Slice(..))
+                    // A carry-chain adder is a named wire of its own.
+                    && !(super::dag::carry_arith() && matches!(self.dag.op(*d), Op::Add(..)))
             })
             .collect();
         let render = |dag: &Dag, n: N| -> Result<String, String> {
@@ -727,6 +729,22 @@ impl Elab {
                 continue;
             }
             if matches!(self.dag.op(n), Op::Const(_) | Op::Read(_)) {
+                continue;
+            }
+            // A carry-chain adder takes two named buses: a constant
+            // operand gets a name.
+            if let (true, Op::Add(a, b)) = (super::dag::carry_arith(), self.dag.op(n)) {
+                let (a, b) = (*a, *b);
+                let mut names = Vec::new();
+                for (i, k) in [a, b].into_iter().enumerate() {
+                    if matches!(self.dag.op(k), Op::Const(_)) {
+                        writeln!(v, "  wire {}hv_k{n}_{i} = {};", range(w), opnd(&self.dag, k)).unwrap();
+                        names.push(format!("hv_k{n}_{i}"));
+                    } else {
+                        names.push(opnd(&self.dag, k));
+                    }
+                }
+                writeln!(v, "  wire {}hv_t{n} = {} + {};", range(w), names[0], names[1]).unwrap();
                 continue;
             }
             let rhs = render(&self.dag, n)?;

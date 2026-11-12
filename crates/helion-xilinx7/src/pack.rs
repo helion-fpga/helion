@@ -150,6 +150,13 @@ pub struct Packed7 {
     /// caller pins a golden column, the placer never invents one.
     /// `None` (the default) places the head near the anchor instead.
     pub carry_anchor: Option<String>,
+    /// Carry cells of general adders (IR attribute `ADDER`): a plain
+    /// vertical cascade, generate inputs from the propagate LUT's O5, sum
+    /// bits leaving through the slice's XOR output.
+    pub adder_carries: std::collections::HashSet<String>,
+    /// LUTs used with both outputs: INIT bits 63..32 are O6 and bits 31..0
+    /// are O5, both over inputs I0..I4. I5 stays unconnected and reads 1.
+    pub dual_luts: std::collections::HashSet<String>,
 }
 
 /// Pack a [`Design`] into 7-series packable units.
@@ -326,6 +333,9 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                         return Err(format!("pack: CARRY4 {} has no CI net", cell.name));
                     }
                 };
+                if cell.attrs.flag("ADDER") {
+                    out.adder_carries.insert(cell.name.clone());
+                }
                 out.carries.push(PackedCarry {
                     name: cell.name.clone(),
                     ci_net,
@@ -345,10 +355,140 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
         }
     }
 
+    fracture_adder_luts(&mut out)?;
     insert_clock_spine(netlist, &mut out)?;
     insert_input_buffers(netlist, &mut out)?;
 
     Ok(out)
+}
+
+/// Give every adder carry bit its generate input from the O5 output of its
+/// propagate LUT: the LUT is rebuilt with the propagate function in the
+/// upper INIT half (O6) and the generate function in the lower half (O5).
+/// A generate driven by a small LUT is absorbed; any other generate net
+/// becomes one more LUT input.
+fn fracture_adder_luts(packed: &mut Packed7) -> Result<(), String> {
+    use std::collections::{HashMap, HashSet};
+    if packed.adder_carries.is_empty() {
+        return Ok(());
+    }
+    let lut_by_out: HashMap<String, usize> = packed.luts.iter().enumerate().map(|(i, l)| (l.output_net.clone(), i)).collect();
+    // Truth table of `lut` over `vars` (5 at most), unconnected pins at 0.
+    let table = |lut: &PackedLut, vars: &[String]| -> u32 {
+        let mut tt = 0u32;
+        for a in 0..32u32 {
+            let mut addr = 0u64;
+            for (i, n) in lut.input_nets.iter().enumerate() {
+                if let Some(n) = n {
+                    if let Some(k) = vars.iter().position(|v| v == n) {
+                        addr |= (((a >> k) & 1) as u64) << i;
+                    }
+                }
+            }
+            tt |= (((lut.init >> addr) & 1) as u32) << a;
+        }
+        tt
+    };
+    const VAR5: [u32; 5] = [0xAAAA_AAAA, 0xCCCC_CCCC, 0xF0F0_F0F0, 0xFF00_FF00, 0xFFFF_0000];
+    let mut absorbed: HashSet<usize> = HashSet::new();
+    let mut updates: Vec<(usize, u64, [Option<String>; 6])> = Vec::new();
+    for c in &packed.carries {
+        if !packed.adder_carries.contains(&c.name) {
+            continue;
+        }
+        for j in 0..4 {
+            let (Some(s), Some(di)) = (&c.s_nets[j], &c.di_nets[j]) else { continue };
+            let Some(&si) = lut_by_out.get(s) else {
+                return Err(format!("pack: carry {} S{j} net `{s}` is not driven by a LUT", c.name));
+            };
+            let slut = &packed.luts[si];
+            let mut vars: Vec<String> = Vec::new();
+            for n in slut.input_nets.iter().flatten() {
+                if !vars.contains(n) {
+                    vars.push(n.clone());
+                }
+            }
+            if vars.len() > 5 {
+                return Err(format!("pack: carry {} S{j} LUT {} has more than 5 inputs", c.name, slut.name));
+            }
+            let s_tt = table(slut, &vars);
+            let di_tt = if let Some(k) = vars.iter().position(|v| v == di) {
+                VAR5[k]
+            } else {
+                // A LUT-driven generate whose inputs fit is absorbed.
+                let merged = lut_by_out.get(di).and_then(|&li| {
+                    let dl = &packed.luts[li];
+                    let mut v = vars.clone();
+                    for n in dl.input_nets.iter().flatten() {
+                        if !v.contains(n) {
+                            v.push(n.clone());
+                        }
+                    }
+                    (v.len() <= 5).then_some((li, v))
+                });
+                match merged {
+                    Some((li, v)) => {
+                        vars = v;
+                        absorbed.insert(li);
+                        table(&packed.luts[li], &vars)
+                    }
+                    None if vars.len() < 5 => {
+                        vars.push(di.clone());
+                        VAR5[vars.len() - 1]
+                    }
+                    None => {
+                        return Err(format!("pack: carry {} DI{j} net `{di}` does not fit the S{j} LUT", c.name));
+                    }
+                }
+            };
+            // Recompute the propagate over the final variable order.
+            let s_tt = if vars.len() == slut.input_nets.iter().flatten().count() { s_tt } else { table(slut, &vars) };
+            let mut ins: [Option<String>; 6] = Default::default();
+            for (k, v) in vars.into_iter().enumerate() {
+                ins[k] = Some(v);
+            }
+            updates.push((si, ((s_tt as u64) << 32) | di_tt as u64, ins));
+        }
+    }
+    for (si, init, ins) in updates {
+        let l = &mut packed.luts[si];
+        l.init = init;
+        l.input_nets = ins;
+        packed.dual_luts.insert(l.name.clone());
+    }
+    // Absorbed generate LUTs with no reader left are gone.
+    let mut read: HashSet<&str> = HashSet::new();
+    for l in &packed.luts {
+        read.extend(l.input_nets.iter().flatten().map(|s| s.as_str()));
+    }
+    for f in &packed.ffs {
+        read.insert(f.d_net.as_str());
+        read.extend(f.ce_net.iter().map(|s| s.as_str()));
+        read.extend(f.sr_net.iter().map(|s| s.as_str()));
+    }
+    for i in &packed.iobs {
+        read.insert(i.net.as_str());
+    }
+    for b in &packed.bufgs {
+        read.insert(b.in_net.as_str());
+    }
+    for c in &packed.carries {
+        read.extend(c.s_nets.iter().flatten().map(|s| s.as_str()));
+        read.insert(c.ci_net.as_str());
+        if !packed.adder_carries.contains(&c.name) {
+            read.extend(c.di_nets.iter().flatten().map(|s| s.as_str()));
+        }
+    }
+    let dead: HashSet<usize> = absorbed.into_iter().filter(|&li| !read.contains(packed.luts[li].output_net.as_str())).collect();
+    if !dead.is_empty() {
+        let mut i = 0usize;
+        packed.luts.retain(|_| {
+            let keep = !dead.contains(&i);
+            i += 1;
+            keep
+        });
+    }
+    Ok(())
 }
 
 /// Every net that some cell reads but nothing drives must be a top-level

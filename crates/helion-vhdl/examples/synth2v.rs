@@ -19,6 +19,7 @@ fn synth(path: &str, top: Option<&str>) -> Result<Design, String> {
     // Target: Xilinx 7-series, which has no DSP48 support yet. Multiplies
     // must lower to LUTs or they vanish.
     helion_sv::set_dsp_inference(false);
+    helion_vhdl::set_carry_arith(std::env::var("HELION_NO_CARRY").is_err());
     let p = std::path::Path::new(path);
     match p
         .extension()

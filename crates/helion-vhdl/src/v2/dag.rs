@@ -379,10 +379,23 @@ impl Dag {
             return b;
         }
         let (a, b) = if a <= b { (a, b) } else { (b, a) };
-        if w > PREFIX_MIN_W {
+        if w > PREFIX_MIN_W && !carry_arith() {
             return self.prefix_add(a, b, false).0;
         }
         self.intern(Op::Add(a, b), w)
+    }
+
+    /// `a + b + 1` on a carry chain, as (sum, carry out): one extra low
+    /// bit of `1 + 1` produces the carry in, one extra high bit of `0 + 0`
+    /// receives the carry out.
+    fn carry_add_plus_one(&mut self, a: N, b: N) -> (N, N) {
+        let w = self.w(a);
+        let one = self.bit(true);
+        let zero = self.bit(false);
+        let x = self.concat(vec![zero, a, one]);
+        let y = self.concat(vec![zero, b, one]);
+        let s = self.add(x, y);
+        (self.slice(s, 1, w), self.slice(s, w + 1, 1))
     }
 
     /// Parallel-prefix (Kogge-Stone) adder over 1-bit gates: logarithmic
@@ -445,6 +458,9 @@ impl Dag {
         if w > PREFIX_MIN_W {
             // a - b = a + ~b + 1
             let nb = self.not(b);
+            if carry_arith() {
+                return self.carry_add_plus_one(a, nb).0;
+            }
             return self.prefix_add(a, nb, true).0;
         }
         self.intern(Op::Sub(a, b), w)
@@ -591,7 +607,7 @@ impl Dag {
         if w > PREFIX_MIN_W {
             // a < b  <=>  no carry out of a + ~b + 1
             let nb = self.not(b);
-            let (_, co) = self.prefix_add(a, nb, true);
+            let (_, co) = if carry_arith() { self.carry_add_plus_one(a, nb) } else { self.prefix_add(a, nb, true) };
             return self.not(co);
         }
         self.intern(Op::Ult(a, b), 1)
@@ -892,6 +908,21 @@ impl Dag {
 
 /// Adders/comparators wider than this become parallel-prefix gate logic.
 const PREFIX_MIN_W: u32 = 4;
+
+thread_local! {
+    static CARRY_ARITH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Keep wide adders, subtractors and comparators as `+` on named buses, for
+/// a back end that maps them to dedicated carry chains, instead of
+/// lowering them to parallel-prefix gates.
+pub fn set_carry_arith(on: bool) {
+    CARRY_ARITH.with(|c| c.set(on));
+}
+
+pub fn carry_arith() -> bool {
+    CARRY_ARITH.with(|c| c.get())
+}
 
 pub fn bits_for_u(v: u128) -> u32 {
     128 - v.leading_zeros()
