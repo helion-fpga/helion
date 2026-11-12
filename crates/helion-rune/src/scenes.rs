@@ -166,7 +166,10 @@ pub const ALL: &[SceneExpect] = &[
     SceneExpect {
         name: "editor-large",
         surface: "editor",
-        keys: &["editor-scroll", "editor-row-0", "editor-gutter-0", "editor-outline"],
+        // Rows are as wide as the widest line and scroll sideways inside
+        // editor-scroll, so only the (sticky) gutter is checked in-shell;
+        // the rows themselves are covered by editor_scale's tests.
+        keys: &["editor-scroll", "editor-gutter-0", "editor-outline"],
         absent: &["editor-field", "summary"],
     },
     SceneExpect {
@@ -1002,6 +1005,37 @@ pub const ALL: &[SceneExpect] = &[
             "wave-sheet",
             "wave-cursor-a",
             "wave-cursor-b",
+        ],
+        absent: &["wave-decoders", "wave-empty", "summary"],
+    },
+    SceneExpect {
+        name: "wave-real-tools",
+        surface: "wave",
+        keys: &[
+            "wave",
+            "wave-trace-bar",
+            "wave-decoders",
+            "wave-dec-add-spi",
+            "wave-dec-lane-0-mosi",
+            "wave-dec-lane-0-miso",
+            "wave-dec-lane-1-uart",
+            "wave-dec-lane-2-state",
+            "wave-dec-lane-3-write",
+            "wave-dec-lane-3-read",
+            "wave-style-linear",
+            "wave-sheet",
+        ],
+        absent: &["wave-dec-empty", "wave-empty", "summary"],
+    },
+    SceneExpect {
+        name: "wave-real-bus",
+        surface: "wave",
+        keys: &[
+            "wave",
+            "wave-trace-bar",
+            "wave-make-bus",
+            "wave-style-step",
+            "wave-sheet",
         ],
         absent: &["wave-decoders", "wave-empty", "summary"],
     },

@@ -482,6 +482,10 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         s.wave.cursor_a = Some(30);
         s.wave.cursor_b = Some(90);
     }),
+    // Real traces: bus_periph_tb through the testbench runner (decoders,
+    // analog), counter.sv through the design run (virtual bus of its bits).
+    ("wave-real-tools", views::wave_real::seed_real_tools),
+    ("wave-real-bus", views::wave_real::seed_real_bus),
     ("sim", |s| {
         s.center = state::CenterPane::Sim;
         views::tb::seed_examples_fixture(s);

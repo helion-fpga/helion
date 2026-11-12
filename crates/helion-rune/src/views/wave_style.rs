@@ -195,7 +195,7 @@ impl WaveState {
     /// virtual bus lane. Returns the bus name.
     pub fn create_virtual_bus(&mut self) -> Result<String, String> {
         if self.live.as_ref().is_none_or(|l| l.is_empty()) {
-            return Err("Run a simulation first".into());
+            return Err(NO_TRACE_WHY.into());
         }
         if let Some(why) = self.bus_blocker() {
             return Err(why.into());
@@ -365,9 +365,11 @@ pub fn press_sheet(s: &mut AppState, d: &mut Drag, tx: &mut Tx) {
     }
 }
 
-/// Analog trace shape (`h` tall): staircase or linear segments between
-/// value changes, scaled over the trace's own min..max.
-pub fn analog_shape(s: &AppState, t: &VivadoTheme, trace: &LiveTrace, h: f32, n: usize) -> Shape {
+/// The analog polyline of `trace` over `n` samples in a lane `h` tall
+/// (x in sheet points, y down): the trace's own min..max spans the lane
+/// with 3pt insets; Step holds each value to the next change, Linear joins
+/// the change points.
+pub fn analog_points(s: &AppState, trace: &LiveTrace, h: f32, n: usize) -> Vec<[f32; 2]> {
     let pps = s.wave.pps();
     let disp = s.wave.display_of(&trace.name);
     let radix = s.wave.radix_for(&trace.name);
@@ -407,12 +409,20 @@ pub fn analog_shape(s: &AppState, t: &VivadoTheme, trace: &LiveTrace, h: f32, n:
             pts.push([w, *ys.last().unwrap_or(&h)]);
         }
     }
+    pts
+}
+
+/// Analog trace shape (`h` tall): staircase or linear segments between
+/// value changes, scaled over the trace's own min..max.
+pub fn analog_shape(s: &AppState, t: &VivadoTheme, trace: &LiveTrace, h: f32, n: usize) -> Shape {
+    let pps = s.wave.pps();
+    let pts = analog_points(s, trace, h, n);
     let mut shape = Shape::new();
     let mut g = 0;
     while g <= n {
         let x = g as f32 * pps;
         shape = shape.line([x, 0.0], [x, h], 1.0, LineCap::Butt, t.wave_grid);
-        g += 16;
+        g += crate::views::wave::grid_step(pps);
     }
     shape.stroke(pts, 1.5, t.wave_trace)
 }
@@ -516,6 +526,12 @@ fn edit_display(s: &mut AppState, f: impl Fn(&mut TraceDisplay)) -> Option<Strin
     Some(name)
 }
 
+/// Why the trace tools (lane edits, virtual buses, fixed point, analog,
+/// decoders) are unavailable: they read real simulation samples only, and
+/// the demo waveform is a built-in sample, not a run.
+pub const NO_TRACE_WHY: &str =
+    "Needs a real simulation trace: run a testbench or the design, or open a VCD";
+
 /// Trace strip under the sim toolbar: lane order/removal, virtual bus,
 /// fixed-point and analog display of the selected bus, decoder panel
 /// toggle, and lane density. Unavailable actions say why.
@@ -527,7 +543,7 @@ pub fn trace_bar(s: &AppState, t: &VivadoTheme) -> El {
         .wave
         .live_selected
         .and_then(|i| lanes.iter().position(|&l| l == i));
-    let no_live = (!live).then_some("Run a simulation first — demo traces are read-only");
+    let no_live = (!live).then_some(NO_TRACE_WHY);
     let lane_why = no_live.or(if pos.is_none() {
         Some("Select a trace lane first")
     } else {

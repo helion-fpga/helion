@@ -194,10 +194,19 @@ impl WaveState {
             .iter()
             .map(|role| {
                 role.aliases.iter().find_map(|a| {
-                    traces
+                    // A real dump can carry one signal in several scopes
+                    // (a testbench net and the DUT port it drives) or a
+                    // tied-off copy: prefer a match that actually toggles.
+                    let mut hits = traces
                         .iter()
-                        .find(|t| fits(role, t) && alias_match(t.leaf(), a))
-                        .map(|t| t.name.clone())
+                        .filter(|t| fits(role, t) && alias_match(t.leaf(), a));
+                    let first = hits.next()?;
+                    let active = |t: &&LiveTrace| t.samples.windows(2).any(|w| w[0] != w[1]);
+                    Some(if active(&first) {
+                        first.name.clone()
+                    } else {
+                        hits.find(active).unwrap_or(first).name.clone()
+                    })
                 })
             })
             .collect();
@@ -507,6 +516,23 @@ pub fn hdl_text(s: &AppState) -> String {
         out.push('\n');
         out.push_str(&b.lines.join("\n"));
     }
+    // The sources behind the trace, open or not: the design a design run
+    // simulates and the DUT of every finished testbench run, so a real
+    // trace's state register names its states without opening the file.
+    let mut files: Vec<std::path::PathBuf> = s.runs.source.iter().cloned().collect();
+    for tb in &s.sim.tbs {
+        if let Some(Ok(o)) = &tb.last {
+            files.push(o.coverage.dut_file.clone());
+        }
+    }
+    files.sort();
+    files.dedup();
+    for f in files {
+        if let Ok(text) = std::fs::read_to_string(&f) {
+            out.push('\n');
+            out.push_str(&text);
+        }
+    }
     out
 }
 
@@ -809,7 +835,7 @@ fn decoder_card(s: &AppState, k: usize, d: &Decoder, t: &VivadoTheme) -> El {
 
 /// Decoder panel (left column): add buttons plus one card per decoder.
 pub fn decoder_panel(s: &AppState, t: &VivadoTheme) -> El {
-    let no_live = (!s.wave.has_live()).then_some("Run a simulation first");
+    let no_live = (!s.wave.has_live()).then_some(crate::views::wave_style::NO_TRACE_WHY);
     let mut adds = row().key("wave-dec-add").w_full().gap(4.0).items_center();
     for kind in DecoderKind::ALL {
         adds = adds.child(small_btn(
