@@ -209,6 +209,7 @@ pub const COMMANDS: &[&str] = &[
     "route_design",
     "write_bitstream",
     "write_checkpoint",
+    "open_run",
     "open_checkpoint",
     "read_checkpoint",
     "create_run",
@@ -2769,6 +2770,20 @@ fn dispatch_host(
             Ctl::Value(format!("route_design hops {hops}"))
         }
         "write_bitstream" => cmd_write_bitstream(s, argv, line),
+        "open_run" => {
+            if let (Some(want), Some(have)) = (argv.get(1), s.runs.active_result.as_deref())
+                && want != have
+            {
+                return Ctl::err(
+                    line,
+                    format!("open_run: {want} has not finished (last finished run: {have})"),
+                );
+            }
+            match open_run(s) {
+                Ok(v) => Ctl::Value(v),
+                Err(e) => Ctl::err(line, e),
+            }
+        }
         "write_checkpoint" => {
             let ck = s.tcl.session.checkpoint();
             Ctl::Value(format!(
@@ -3108,14 +3123,14 @@ pub(crate) fn program_hw_session(
 }
 
 fn impl_if_needed(s: &mut AppState) -> Result<(), String> {
-    if s.tcl.session.bitstream.is_some() {
+    // A bitstream, or a route opened from a finished run (whose bitstream
+    // signoff may have refused it), is already implemented.
+    if s.tcl.session.bitstream.is_some() || s.tcl.session.routed.is_some() {
         return Ok(());
     }
-    let d = s
-        .tcl
-        .design
-        .clone()
-        .ok_or("no design (read_sv / synth_design first)")?;
+    let d = s.tcl.design.clone().ok_or(
+        "no design open (read_verilog / synth_design, or open_run after a run finishes)",
+    )?;
     let dev = helion_device::Device::load_part(&s.project.part)?;
     s.tcl.session.impl_design(d, &dev)
 }
@@ -4495,6 +4510,42 @@ fn cmd_select_objects(s: &mut AppState, argv: &[String], line: usize, highlighte
 /// Run the implementation flow if needed, then STA with the console's
 /// `create_clock` state (empty = the 10 ns `clk` fallback, exactly like
 /// `Session::report_timing`). Mirrors `ensure_timing` (`design.rs:622`).
+/// Vivado `open_run`: load the last finished run's design into the Tcl
+/// session (with its placement, route and bitstream for implementation
+/// runs), so console reports and edits act on what the run produced. The
+/// IDE calls this when a run finishes, as Vivado's "Open Implemented
+/// Design" does.
+pub fn open_run(s: &mut AppState) -> Result<String, String> {
+    let design = s
+        .runs
+        .live_design
+        .clone()
+        .ok_or("open_run: no finished run (launch_runs synth_1 or impl_1 first)")?;
+    let name = s
+        .runs
+        .active_result
+        .clone()
+        .unwrap_or_else(|| "synth_1".into());
+    let cells = design.cells.len();
+    s.tcl.design_name = Some(helion_ir::resolve(design.name).to_string());
+    s.tcl.session.synth_design(design.clone());
+    s.tcl.design = Some(design);
+    let placed = s.runs.live_placed.clone();
+    let routed = s.runs.analysis.as_ref().and_then(|a| a.routed.clone());
+    s.tcl.session.packed = placed.as_ref().map(|p| p.packed.clone());
+    s.tcl.session.placed = placed;
+    let has_route = routed.is_some();
+    s.tcl.session.routed = routed;
+    s.tcl.session.bitstream = s.bitstream.bits.as_deref().cloned();
+    let stage = match (has_route, s.tcl.session.bitstream.is_some()) {
+        (true, true) => "routed, bitstream",
+        (true, false) => "routed, no bitstream",
+        (false, _) if s.tcl.session.placed.is_some() => "placed",
+        _ => "synthesized",
+    };
+    Ok(format!("open_run {name}: {cells} cells ({stage})"))
+}
+
 /// `write_bitstream ?-force? ?file?`: implementation if needed, then the
 /// routing DRCs (unrouted/overused routing block it, as Vivado's RTSTAT
 /// checks do), then the packet stream, written to `file` when one
@@ -5336,6 +5387,10 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
             "signoff DRCs, then the bitstream (written to file when given)",
         ),
         "write_checkpoint" => ("write_checkpoint", "snapshot the session (size + hash)"),
+        "open_run" => (
+            "open_run ?synth_1|impl_1?",
+            "open the last finished run's design (placement, routing, bitstream) for Tcl reports",
+        ),
         "open_checkpoint" | "read_checkpoint" => (
             "open_checkpoint file.hck2|file.hckp",
             "reopen a run checkpoint as the Tcl session",

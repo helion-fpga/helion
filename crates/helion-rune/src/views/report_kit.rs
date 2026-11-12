@@ -87,6 +87,20 @@ pub fn text_cell(content: impl Into<String>, grow: f32, color: Color) -> El {
         .help_when_truncated(content)
 }
 
+/// Growing cell for hierarchical object names (`u_top_u_core_u_alu_q3`):
+/// truncates in the middle, since names in one design share long prefixes
+/// and differ at the end.
+pub fn name_cell(content: impl Into<String>, grow: f32, color: Color) -> El {
+    let content = content.into();
+    text(content.clone())
+        .font(VivadoTheme::FONT_UI)
+        .color(color)
+        .grow(grow)
+        .min_w(0.0)
+        .truncate_middle()
+        .help_when_truncated(content)
+}
+
 /// Fixed-width text cell (left aligned, truncating with tooltip).
 pub fn fixed_cell(content: impl Into<String>, w: f32, color: Color) -> El {
     let content = content.into();
