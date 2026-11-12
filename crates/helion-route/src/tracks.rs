@@ -65,6 +65,10 @@ pub struct TrackRoutes {
     pub iters: u32,
     /// LUT inputs the netlist leaves without a driver (they read 0).
     pub undriven: u32,
+    /// Wires between the driver and each wire-fed LUT input: (x, y, mux, wires).
+    pub pin_hops: Vec<(u32, u32, u32, u32)>,
+    /// The same for wire-fed output pads: (x, y, wires).
+    pub pad_hops: Vec<(u32, u32, u32)>,
 }
 
 /// How an output pad gets its signal.
@@ -149,6 +153,10 @@ const MAX_ROUNDS: u32 = 400;
 const SEED_SLACK: u32 = 3;
 /// Tiles a bounded search may leave the box around its seeds and sink.
 const BOX_MARGIN: u32 = 4;
+/// Price of a wire of delay already behind a branch point, against
+/// `BASE_COST` for a new wire: sinks stay close to their driver without
+/// giving up much sharing.
+const DEPTH_COST: u32 = 4;
 
 fn pad_xy(dev: &Device, site: &Site) -> (u32, u32) {
     let _ = dev;
@@ -360,26 +368,49 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
     let mut closed: Vec<u32> = vec![0; n_wires];
     let mut chan_closed: Vec<u32> = vec![0; n_wires / TRACKS as usize];
     let mut in_tree: Vec<u32> = vec![0; n_wires];
+    let mut wdepth: Vec<u32> = vec![0; n_wires];
     let mut epoch = 0u32;
     let mut tree_epoch = 0u32;
     let mut pres_fac = 0.5f32;
     let mut rounds = 0u32;
     let mut todo: Vec<usize> = (0..nets.len()).filter(|&i| !nets[i].sinks.is_empty()).collect();
+    // Wires that carried more than one net after the previous round.
+    let mut shared_prev: Vec<bool> = Vec::new();
     let routed_nets = todo.len() as u32;
     loop {
         rounds += 1;
         for &ni in &todo {
-            for &(w, _) in &tree[ni] {
+            // Rip up only what is contested: the shared wires of this net
+            // and everything fed through them. The rest of the tree stays,
+            // so settled parts of the design are not stirred up again.
+            tree_epoch += 1;
+            let mut gone: HashSet<u32> = tree[ni].iter().filter(|(w, _)| shared_prev.get(*w as usize).copied().unwrap_or(true)).map(|(w, _)| *w).collect();
+            if !shared_prev.is_empty() {
+                loop {
+                    let before = gone.len();
+                    for &(w, p) in &tree[ni] {
+                        if p != u32::MAX && gone.contains(&p) {
+                            gone.insert(w);
+                        }
+                    }
+                    if gone.len() == before {
+                        break;
+                    }
+                }
+            }
+            for &w in &gone {
                 occ[w as usize] -= 1;
             }
-            tree[ni].clear();
-            tree_epoch += 1;
+            tree[ni].retain(|(w, _)| !gone.contains(w));
+            for &(w, _) in &tree[ni] {
+                in_tree[w as usize] = tree_epoch;
+            }
             // Near sinks first, so far ones branch off the tree.
             let src_xy = match nets[ni].src {
                 Src::Ble { x, y, .. } => (x, y),
                 Src::Pad { input } => (input_x[&input], pad_row),
             };
-            let mut order: Vec<usize> = (0..nets[ni].sinks.len()).collect();
+            let mut order: Vec<usize> = (0..nets[ni].sinks.len()).filter(|&k| sink_wire[ni][k] == u32::MAX || gone.contains(&sink_wire[ni][k])).collect();
             order.sort_by_key(|&k| {
                 let (x, y) = sink_tile(&nets[ni].sinks[k]);
                 (x.abs_diff(src_xy.0) + y.abs_diff(src_xy.1), k)
@@ -416,10 +447,13 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
                         if bounded && reach.is_some_and(|r| h(w) > r) {
                             continue;
                         }
+                        // Branching far down the tree costs delay: a seed
+                        // starts at a price for the wires already behind it.
+                        let behind = wdepth[w as usize] * DEPTH_COST;
                         seen[w as usize] = epoch;
-                        g[w as usize] = 0;
+                        g[w as usize] = behind;
                         parent[w as usize] = u32::MAX - 1; // already in the tree
-                        heap.push(Reverse((h(w), w)));
+                        heap.push(Reverse((behind + h(w), w)));
                         let (x, y) = grid.dest(w);
                         grow(x, y);
                     }
@@ -498,6 +532,8 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
                 };
                 sink_wire[ni][k] = end;
                 let mut w = end;
+                let first_new = tree[ni].len();
+                let mut base = 0u32;
                 while parent[w as usize] != u32::MAX - 1 {
                     let p = parent[w as usize];
                     tree[ni].push((w, p));
@@ -507,6 +543,14 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
                         break;
                     }
                     w = p;
+                }
+                // Wires between the driver and each new tree wire.
+                if parent[w as usize] == u32::MAX - 1 {
+                    base = wdepth[w as usize];
+                }
+                let added = tree[ni].len() - first_new;
+                for (i, &(nw, _)) in tree[ni][first_new..].iter().enumerate() {
+                    wdepth[nw as usize] = base + (added - i) as u32;
                 }
             }
         }
@@ -550,8 +594,25 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
                 hist[w] += (c as u32 - 1) * BASE_COST;
             }
         }
+        // A contested wire sits in a full channel: its neighbours must be
+        // able to give way too. Every wire of such a channel gets dearer
+        // and every net crossing it is asked again, so nets that have
+        // another way round take it and leave room for those that do not.
+        let mut hot = vec![false; n_wires / TRACKS as usize];
+        for (w, &c) in occ.iter().enumerate() {
+            if c > 1 {
+                hot[w / TRACKS as usize] = true;
+            }
+        }
+        for (w, h) in hist.iter_mut().enumerate() {
+            if hot[w / TRACKS as usize] {
+                *h += BASE_COST / 5;
+            }
+        }
+        let shared: Vec<bool> = (0..n_wires).map(|w| hot[w / TRACKS as usize] && occ[w] > 0).collect();
         pres_fac = (pres_fac * 1.5).min(400.0);
         todo = (0..nets.len()).filter(|&i| tree[i].iter().any(|&(w, _)| shared[w as usize])).collect();
+        shared_prev = shared;
     }
 
     // Results.
@@ -571,13 +632,29 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
             };
             out.sb.push(SbRoute { x, y, dir: dir as u8, track: track as u8, sel: sel as u8 });
         }
+        let parent_of: HashMap<u32, u32> = tree[ni].iter().copied().collect();
+        let wires_to = |mut w: u32| -> u32 {
+            let mut n = 1;
+            while let Some(&p) = parent_of.get(&w) {
+                if p == u32::MAX || n > 100_000 {
+                    break;
+                }
+                w = p;
+                n += 1;
+            }
+            n
+        };
         for (k, sink) in net.sinks.iter().enumerate() {
             let w = sink_wire[ni][k];
             let (_, _, dir, track) = grid.parts(w);
             match *sink {
-                Sink::Pin { x, y, mux } => out.imux.push(ImuxRoute { x, y, mux, sel: (tk::opposite(dir) * TRACKS + track) as u8 }),
+                Sink::Pin { x, y, mux } => {
+                    out.imux.push(ImuxRoute { x, y, mux, sel: (tk::opposite(dir) * TRACKS + track) as u8 });
+                    out.pin_hops.push((x, y, mux, wires_to(w)));
+                }
                 Sink::Pad { iob } => {
                     let s = &placed.iob_sites[iob];
+                    out.pad_hops.push((s.x, s.y, wires_to(w)));
                     out.iob_out.push(IobTrack { x: s.x, y: s.y, track: track as u8 });
                     // Tiles from the driver to the pad, for delay and display.
                     let by_wire: HashMap<u32, u32> = tree[ni].iter().copied().collect();

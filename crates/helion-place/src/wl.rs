@@ -208,6 +208,101 @@ pub fn legalize_clocks(placed: &mut Placed, dev: &Device) -> Result<u32, String>
     Ok(moved)
 }
 
+/// Timing-driven passes after the wirelength pass.
+const TIMING_PASSES: usize = 2;
+
+/// Weight of each cluster-to-cluster connection from a timing estimate of
+/// the placement: delay per tile of distance, a LUT per level. A
+/// connection on the slowest path gets the full weight, one with slack to
+/// spare gets none.
+fn criticality_weights(conns: &[(u32, u32, bool)], pos: &[(i32, i32)], has_ff: &[bool], n: usize) -> Vec<f32> {
+    let tm = helion_backend::TimingModel::hl10t();
+    let (lut, hop, pin, ckq, setup) = (tm.lut_ps as f32, tm.hop_ps as f32, tm.pin_ps as f32, tm.ff_ckq_ps as f32, tm.setup_ps as f32);
+    let delay = |k: usize| -> f32 {
+        let (s, d, _) = conns[k];
+        let (a, b) = (pos[s as usize], pos[d as usize]);
+        ((a.0 - b.0).abs() + (a.1 - b.1).abs()) as f32 * hop + pin
+    };
+    // Fan-in connections of each cluster, and a topological order over
+    // LUT-to-LUT connections (flop outputs start paths).
+    let mut fanin: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for (k, &(_, d, _)) in conns.iter().enumerate() {
+        fanin[d as usize].push(k as u32);
+    }
+    let mut order: Vec<u32> = Vec::with_capacity(n);
+    let mut state = vec![0u8; n];
+    for root in 0..n {
+        if state[root] != 0 {
+            continue;
+        }
+        let mut stack = vec![root as u32];
+        while let Some(&i) = stack.last() {
+            let iu = i as usize;
+            if state[iu] == 2 {
+                stack.pop();
+                continue;
+            }
+            state[iu] = 1;
+            let mut ready = true;
+            for &k in &fanin[iu] {
+                let (s, _, from_q) = conns[k as usize];
+                if !from_q && state[s as usize] == 0 {
+                    stack.push(s);
+                    ready = false;
+                }
+            }
+            if ready {
+                state[iu] = 2;
+                order.push(i);
+                stack.pop();
+            }
+        }
+    }
+    // Arrival at each LUT output.
+    let mut arr = vec![0.0f32; n];
+    for &i in &order {
+        let iu = i as usize;
+        let mut a = ckq;
+        for &k in &fanin[iu] {
+            let (s, _, from_q) = conns[k as usize];
+            let src = if from_q { ckq } else { arr[s as usize] };
+            a = a.max(src + delay(k as usize));
+        }
+        arr[iu] = a + lut;
+    }
+    let worst = (0..n).map(|i| arr[i] + if has_ff[i] { setup } else { 0.0 }).fold(1.0f32, f32::max);
+    // Required time at each LUT output: the slowest path has no slack.
+    let mut req = vec![worst; n];
+    for i in 0..n {
+        if has_ff[i] {
+            req[i] = worst - setup;
+        }
+    }
+    for &i in order.iter().rev() {
+        let iu = i as usize;
+        for &k in &fanin[iu] {
+            let (s, _, from_q) = conns[k as usize];
+            if !from_q {
+                let r = req[iu] - lut - delay(k as usize);
+                if r < req[s as usize] {
+                    req[s as usize] = r;
+                }
+            }
+        }
+    }
+    conns
+        .iter()
+        .enumerate()
+        .map(|(k, &(s, d, from_q))| {
+            let src = if from_q { ckq } else { arr[s as usize] };
+            let slack = req[d as usize] - lut - delay(k) - src;
+            let crit = (1.0 - slack / worst).clamp(0.0, 1.0);
+            // Steep: only connections near the slowest path are pulled.
+            4.0 * crit.powi(8)
+        })
+        .collect()
+}
+
 /// Anneal the placement of `placed` in place. Returns (before, after) HPWL.
 pub fn refine(placed: &mut Placed, dev: &Device) -> (u64, u64) {
     let n = placed.lutff_sites.len();
@@ -253,11 +348,46 @@ pub fn refine(placed: &mut Placed, dev: &Device) -> (u64, u64) {
     let mut stamp: Vec<u32> = vec![0; nets.len()];
     let mut tick = 0u32;
     let moves_per_temp = (n * 12).max(2000);
-    let mut window = gw.max(gh) as f64;
+    let site_xy = |t: u32| (sites[t as usize].x as i32, sites[t as usize].y as i32);
+    // Cluster-to-cluster connections, for the timing passes.
+    let tconns: Vec<(u32, u32, bool)> = placed
+        .packed
+        .conn
+        .pins
+        .iter()
+        .filter_map(|p| match p.src {
+            helion_pack::NetSrc::BleQ(j) if (j as usize) < n && (p.lutff as usize) < n => Some((j, p.lutff, true)),
+            helion_pack::NetSrc::BleO(j) if (j as usize) < n && (p.lutff as usize) < n => Some((j, p.lutff, false)),
+            _ => None,
+        })
+        .collect();
+    let mut conn_of: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for (k, &(s, d, _)) in tconns.iter().enumerate() {
+        conn_of[s as usize].push(k as u32);
+        if s != d {
+            conn_of[d as usize].push(k as u32);
+        }
+    }
+    let dist = |k: usize, pos: &[(i32, i32)]| -> i32 {
+        let (s, d, _) = tconns[k];
+        let (a, b) = (pos[s as usize], pos[d as usize]);
+        (a.0 - b.0).abs() + (a.1 - b.1).abs()
+    };
+    let mut cw: Vec<f32> = vec![0.0; tconns.len()];
+    let has_ff: Vec<bool> = placed.packed.lutffs.iter().take(n).map(|l| !l.ff_cell.is_empty()).collect();
+    // Pass 0 minimises wirelength; the later passes also pull together the
+    // connections that the timing estimate finds on slow paths.
+    for pass in 0..=TIMING_PASSES {
+    let mut window = if pass == 0 { gw.max(gh) as f64 } else { 6.0 };
     // Start warm enough to accept most single-tile moves, not hot enough to
     // undo what the constructive placer already got right.
-    let mut temp = 2.0f64;
-    let site_xy = |t: u32| (sites[t as usize].x as i32, sites[t as usize].y as i32);
+    let mut temp = if pass == 0 { 2.0f64 } else { 0.15 };
+    if pass > 0 {
+        if tconns.is_empty() {
+            break;
+        }
+        cw = criticality_weights(&tconns, &pos, &has_ff, n);
+    }
     while temp > 0.02 {
         let mut accepted = 0usize;
         for _ in 0..moves_per_temp {
@@ -318,7 +448,44 @@ pub fn refine(placed: &mut Placed, dev: &Device) -> (u64, u64) {
             for &k in &touched {
                 delta += net_len(&nets[k as usize], &pos) - len[k as usize];
             }
-            if delta <= 0 || rng.unit() < (-(delta as f64) / temp).exp() {
+            let mut delta = delta as f64;
+            if pass > 0 {
+                // Weighted length of the connections of the moved clusters.
+                let (old_a, old_b) = (pa, pb);
+                let mut before = 0.0f64;
+                let mut after = 0.0f64;
+                let movers: [u32; 2] = [a as u32, b];
+                for (mi, &c) in movers.iter().enumerate() {
+                    if c == u32::MAX {
+                        continue;
+                    }
+                    for &k in &conn_of[c as usize] {
+                        let (s, d, _) = tconns[k as usize];
+                        // A connection between the two movers is counted once.
+                        if mi == 1 && (s == a as u32 || d == a as u32) {
+                            continue;
+                        }
+                        let w = cw[k as usize] as f64;
+                        if w == 0.0 {
+                            continue;
+                        }
+                        after += w * dist(k as usize, &pos) as f64;
+                        let at = |c: u32| -> (i32, i32) {
+                            if c == a as u32 {
+                                old_a
+                            } else if c == b {
+                                old_b
+                            } else {
+                                pos[c as usize]
+                            }
+                        };
+                        let (p, q) = (at(s), at(d));
+                        before += w * ((p.0 - q.0).abs() + (p.1 - q.1).abs()) as f64;
+                    }
+                }
+                delta += after - before;
+            }
+            if delta <= 0.0 || rng.unit() < (-delta / temp).exp() {
                 for &k in &touched {
                     len[k as usize] = net_len(&nets[k as usize], &pos);
                 }
@@ -340,6 +507,7 @@ pub fn refine(placed: &mut Placed, dev: &Device) -> (u64, u64) {
         let rate = accepted as f64 / moves_per_temp as f64;
         window = (window * (0.56 + rate)).clamp(1.0, gw.max(gh) as f64);
         temp *= 0.9;
+    }
     }
     for c in 0..n {
         let (t, ble) = (slot[c] / n_ble as u32, slot[c] % n_ble as u32);
