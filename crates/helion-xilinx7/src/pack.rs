@@ -30,6 +30,14 @@ pub struct PackedFf {
     pub clk_net: String,
     pub ce_net: Option<String>,
     pub sr_net: Option<String>,
+    /// Power-on value (IR attr `INIT`, default 0).
+    pub init: bool,
+    /// Value loaded when SR is asserted (IR attr `SRVAL`, default 0:
+    /// reset; 1: set).
+    pub srval: bool,
+    /// SR acts asynchronously (FDCE/FDPE) rather than on the clock edge
+    /// (FDRE/FDSE). IR attr `SR_ASYNC=1`.
+    pub sr_async: bool,
 }
 
 /// A packed I/O buffer (IBUF or OBUF in an IOB33 site).
@@ -238,22 +246,42 @@ pub struct PackedDsp {
     pub clk_net: Option<String>,
 }
 
-/// A packed carry chain (`CARRY4`).
+/// A packed carry chain (CARRY4).
+///
+/// The IR's [`helion_ir::CellKind::Carry4`] marks a 4-bit fast carry
+/// chain; the 7-series backend places it in a SLICE and emits the CARRY4
+/// configuration. Pin nets are captured here so place can keep chained
+/// groups adjacent, route can treat the CO-to-CI cascade as a dedicated
+/// wire, and emit can select the CYINIT source. Per-bit entries are
+/// `None` for unused bits (partial top group); CI is required, CO is
+/// optional (chain end may leave it unconnected).
 #[derive(Clone, Debug, Default)]
 pub struct PackedCarry {
     /// Source IR cell name.
     pub name: String,
-    /// `CI` cascade input net (driven by previous `CARRY4.CO[3]`).
-    pub ci_net: Option<String>,
-    /// `CYINIT` initialization net (`"0"`, `"1"`, or fabric net).
-    pub cyinit_net: Option<String>,
-    /// `DI[3:0]` carry-generate input nets.
-    pub di_nets: [Option<String>; 4],
-    /// `S[3:0]` carry-propagate (LUT O6) input nets.
+    /// Net on CI (carry in: prior group CO, or the CYINIT source net).
+    /// Empty for a CYINIT-config head (`cyinit` is `Some`): the CI pin
+    /// stays unconnected and no net routes to it.
+    pub ci_net: String,
+    /// Chain head with CYINIT from config: `Some(v)` selects the
+    /// PRECYINIT source (`Some(true)` to C1, `Some(false)` to C0).
+    /// `None` is a chained or legacy const-LUT head. C0 is const-0
+    /// (the oracle synth netlist ties head CYINIT to const0); a
+    /// CYINIT=1 intent must map to C1, never C0.
+    pub cyinit: Option<bool>,
+    /// Net on CO (carry out to the next group CI).
+    pub co_net: Option<String>,
+    /// Nets on S0..S3.
     pub s_nets: [Option<String>; 4],
-    /// `O[3:0]` sum outputs.
+    /// Nets on DI0..DI3.
+    pub di_nets: [Option<String>; 4],
+    /// Nets on O0..O3 (sum bits).
     pub o_nets: [Option<String>; 4],
-    /// `CO[3:0]` carry outputs (`CO[3]` feeds next slice's `CI`).
+    /// Net on a `CYINIT` pin, for a directly instantiated `CARRY4`
+    /// primitive that wires it (`"0"`, `"1"`, or a fabric net).
+    pub cyinit_net: Option<String>,
+    /// `CO[3:0]` taps of a directly instantiated `CARRY4` (`CO[3]` is also
+    /// `co_net`).
     pub co_nets: [Option<String>; 4],
 }
 
@@ -614,6 +642,21 @@ pub struct Packed7 {
     pub pcies: Vec<PackedPcie>,
     pub xadcs: Vec<PackedXadc>,
     pub cfg_prims: Vec<PackedCfgPrim>,
+    /// Optional pinned site for the first carry-chain head (e.g.
+    /// `SLICE_X113Y39`). General mechanism for convergence runs: the
+    /// caller pins a golden column, the placer never invents one.
+    /// `None` (the default) places the head near the anchor instead.
+    pub carry_anchor: Option<String>,
+    /// Carry cells of general adders (IR attribute `ADDER`): a plain
+    /// vertical cascade, generate inputs from the propagate LUT's O5, sum
+    /// bits leaving through the slice's XOR output.
+    pub adder_carries: std::collections::HashSet<String>,
+    /// Flops clocked on the falling edge (IR attribute `CLK_INV`). The clock
+    /// inverter is per slice, so it is part of the control set.
+    pub negedge_ffs: std::collections::HashSet<String>,
+    /// LUTs used with both outputs: INIT bits 63..32 are O6 and bits 31..0
+    /// are O5, both over inputs I0..I4. I5 stays unconnected and reads 1.
+    pub dual_luts: std::collections::HashSet<String>,
 }
 /// Pack a [`Design`] into 7-series packable units.
 ///
@@ -624,6 +667,8 @@ pub struct Packed7 {
 pub fn pack(netlist: &Design) -> Result<Packed7, String> {
     let pins = netlist.pin_index();
     let mut out = Packed7::default();
+    // Reset nets that already have their active-low inverter.
+    let mut arst_inverters: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for cell in &netlist.cells {
         let cell_name = resolve(cell.name);
@@ -639,9 +684,22 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                         .ok_or_else(|| format!("pack: LUT {cell_name} has no O net"))?,
                 )
                 .to_string();
+                // An unconnected LUT pin reads 1 on silicon, while the IR
+                // defines it as 0: copy the pin=0 half of the table over the
+                // pin=1 half so the output never depends on that pin.
+                let mut init = *init;
+                for (i, net) in input_nets.iter().enumerate() {
+                    if net.is_none() {
+                        let mut t = 0u64;
+                        for addr in 0..64u64 {
+                            t |= ((init >> (addr & !(1 << i))) & 1) << addr;
+                        }
+                        init = t;
+                    }
+                }
                 out.luts.push(PackedLut {
                     name: cell_name.to_string(),
-                    init: *init,
+                    init,
                     input_nets,
                     output_net,
                 });
@@ -652,16 +710,59 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                         .map(|s| resolve(s).to_string())
                         .ok_or_else(|| format!("pack: FF {cell_name} has no {pin} net"))
                 };
+                let mut sr_net = pins
+                    .net_on(cell_name, "SR")
+                    .or_else(|| pins.net_on(cell_name, "RST"))
+                    .map(|s| resolve(s).to_string());
+                let mut srval = cell.attrs.get("SRVAL") == Some("1");
+                let mut sr_async = cell.attrs.get("SR_ASYNC") == Some("1");
+                // Asynchronous reset as its own pin (`ARST`, with the active
+                // level in `ARST_LEVEL` and the loaded value in `ARST_VAL`):
+                // the slice's SR input in asynchronous mode (FDCE/FDPE). SR
+                // has no inverter in the slice, so an active-low reset goes
+                // through one inverter LUT per reset net.
+                if let Some(arst) = pins.net_on(cell_name, "ARST").map(|s| resolve(s).to_string()) {
+                    if sr_net.is_some() {
+                        return Err(format!("pack: FF {cell_name} has both a synchronous and an asynchronous reset"));
+                    }
+                    let active_high = match cell.attrs.get("ARST_LEVEL") {
+                        Some("0") => false,
+                        Some("1") | None => true,
+                        Some(v) => return Err(format!("pack: FF {cell_name} has bad ARST_LEVEL `{v}`")),
+                    };
+                    sr_net = Some(if active_high {
+                        arst
+                    } else {
+                        let inv = format!("hl_arst_n_{arst}");
+                        if arst_inverters.insert(arst.clone()) {
+                            let mut input_nets: [Option<String>; 6] = Default::default();
+                            input_nets[0] = Some(arst);
+                            out.luts.push(PackedLut {
+                                name: format!("u_{inv}"),
+                                // ~I0, with the unconnected pins reading 1.
+                                init: 0x5555_5555_5555_5555,
+                                input_nets,
+                                output_net: inv.clone(),
+                            });
+                        }
+                        inv
+                    });
+                    srval = cell.attrs.get("ARST_VAL") == Some("1");
+                    sr_async = true;
+                }
+                if cell.attrs.flag("CLK_INV") {
+                    out.negedge_ffs.insert(cell_name.to_string());
+                }
                 out.ffs.push(PackedFf {
                     name: cell_name.to_string(),
                     d_net: need("D")?,
                     q_net: need("Q")?,
                     clk_net: need("CLK")?,
                     ce_net: pins.net_on(cell_name, "CE").map(|s| resolve(s).to_string()),
-                    sr_net: pins
-                        .net_on(cell_name, "SR")
-                        .or_else(|| pins.net_on(cell_name, "RST"))
-                        .map(|s| resolve(s).to_string()),
+                    sr_net,
+                    init: cell.attrs.get("INIT") == Some("1"),
+                    srval,
+                    sr_async,
                 });
             }
             CellKind::IobOut => {
@@ -757,7 +858,11 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                 )?);
             }
             CellKind::Carry4 => {
-                out.carries.push(pack_carry4(cell_name, &pins)?);
+                let c = pack_carry4(cell_name, &pins, &cell.attrs)?;
+                if cell.attrs.flag("ADDER") {
+                    out.adder_carries.insert(c.name.clone());
+                }
+                out.carries.push(c);
             }
             CellKind::BlackBox { module } => {
                 let m = resolve(*module);
@@ -772,7 +877,9 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
     }
 
     validate_iodelay_groups(&out)?;
+    fracture_adder_luts(&mut out)?;
     insert_clock_spine(netlist, &mut out)?;
+    insert_input_buffers(netlist, &mut out)?;
 
     Ok(out)
 }
@@ -807,7 +914,7 @@ fn pack_blackbox_primitive(
             out.dsps.push(pack_dsp(cell_name, None, pins, attrs)?);
         }
         "CARRY4" => {
-            out.carries.push(pack_carry4(cell_name, pins)?);
+            out.carries.push(pack_carry4(cell_name, pins, attrs)?);
         }
         "IDDR" => {
             out.ioddrs
@@ -2097,38 +2204,51 @@ fn pack_dsp(
     })
 }
 
-fn pack_carry4(cell_name: &str, pins: &PinIndex) -> Result<PackedCarry, String> {
+/// Pack one `CARRY4`. Pin nets are captured so place can keep chained
+/// groups adjacent, route can treat the CO-to-CI cascade as a dedicated
+/// wire, and emit can select the CYINIT source.
+///
+/// Two conventions are accepted: the IR's own (`CI`, `CO`, `S0`..`O3`,
+/// attribute `CYINIT`), and the primitive's when it is instantiated by name
+/// (`S[0]`, `CO[3]`, a net on the `CYINIT` pin). A chain head needs a carry
+/// in from one of them; a cell with none is an error.
+fn pack_carry4(cell_name: &str, pins: &PinIndex, attrs: &Attrs) -> Result<PackedCarry, String> {
+    let pin = |p: &str| pins.net_on(cell_name, p).map(|s| resolve(s).to_string());
     let mut di_nets: [Option<String>; 4] = Default::default();
     let mut s_nets: [Option<String>; 4] = Default::default();
     let mut o_nets: [Option<String>; 4] = Default::default();
     let mut co_nets: [Option<String>; 4] = Default::default();
     for i in 0..4 {
-        di_nets[i] = pins
-            .net_on(cell_name, &format!("DI{i}"))
-            .or_else(|| pins.net_on(cell_name, &format!("DI[{i}]")))
-            .map(|s| resolve(s).to_string());
-        s_nets[i] = pins
-            .net_on(cell_name, &format!("S{i}"))
-            .or_else(|| pins.net_on(cell_name, &format!("S[{i}]")))
-            .map(|s| resolve(s).to_string());
-        o_nets[i] = pins
-            .net_on(cell_name, &format!("O{i}"))
-            .or_else(|| pins.net_on(cell_name, &format!("O[{i}]")))
-            .map(|s| resolve(s).to_string());
-        co_nets[i] = pins
-            .net_on(cell_name, &format!("CO{i}"))
-            .or_else(|| pins.net_on(cell_name, &format!("CO[{i}]")))
-            .map(|s| resolve(s).to_string());
+        di_nets[i] = pin(&format!("DI{i}")).or_else(|| pin(&format!("DI[{i}]")));
+        s_nets[i] = pin(&format!("S{i}")).or_else(|| pin(&format!("S[{i}]")));
+        o_nets[i] = pin(&format!("O{i}")).or_else(|| pin(&format!("O[{i}]")));
+        co_nets[i] = pin(&format!("CO{i}")).or_else(|| pin(&format!("CO[{i}]")));
+    }
+    let cyinit = match attrs.get("CYINIT") {
+        None => None,
+        Some(v) if ["1", "true", "TRUE", "yes"].contains(&v) => Some(true),
+        Some(v) if ["0", "false", "FALSE", "no"].contains(&v) => Some(false),
+        Some(v) => return Err(format!("pack: CARRY4 {cell_name} has bad CYINIT value `{v}`")),
+    };
+    let cyinit_net = pin("CYINIT");
+    let ci_net = match pin("CI") {
+        Some(n) => n,
+        None if cyinit.is_some() || cyinit_net.is_some() => String::new(),
+        None => return Err(format!("pack: CARRY4 {cell_name} has no CI net")),
+    };
+    let co_net = pin("CO").or_else(|| co_nets[3].clone());
+    if co_nets[3].is_none() {
+        co_nets[3] = co_net.clone();
     }
     Ok(PackedCarry {
         name: cell_name.to_string(),
-        ci_net: pins.net_on(cell_name, "CI").map(|s| resolve(s).to_string()),
-        cyinit_net: pins
-            .net_on(cell_name, "CYINIT")
-            .map(|s| resolve(s).to_string()),
-        di_nets,
+        ci_net,
+        cyinit,
+        co_net,
         s_nets,
+        di_nets,
         o_nets,
+        cyinit_net,
         co_nets,
     })
 }
@@ -2688,6 +2808,255 @@ fn pack_muxf(cell_name: &str, kind: MuxfKind, pins: &PinIndex) -> Result<PackedM
     })
 }
 
+/// Give every adder carry bit its generate input from the O5 output of its
+/// propagate LUT: the LUT is rebuilt with the propagate function in the
+/// upper INIT half (O6) and the generate function in the lower half (O5).
+/// A generate driven by a small LUT is absorbed; any other generate net
+/// becomes one more LUT input.
+fn fracture_adder_luts(packed: &mut Packed7) -> Result<(), String> {
+    use std::collections::{HashMap, HashSet};
+    if packed.adder_carries.is_empty() {
+        return Ok(());
+    }
+    let lut_by_out: HashMap<String, usize> = packed.luts.iter().enumerate().map(|(i, l)| (l.output_net.clone(), i)).collect();
+    // Truth table of `lut` over `vars` (5 at most), unconnected pins at 0.
+    let table = |lut: &PackedLut, vars: &[String]| -> u32 {
+        let mut tt = 0u32;
+        for a in 0..32u32 {
+            let mut addr = 0u64;
+            for (i, n) in lut.input_nets.iter().enumerate() {
+                if let Some(n) = n {
+                    if let Some(k) = vars.iter().position(|v| v == n) {
+                        addr |= (((a >> k) & 1) as u64) << i;
+                    }
+                }
+            }
+            tt |= (((lut.init >> addr) & 1) as u32) << a;
+        }
+        tt
+    };
+    const VAR5: [u32; 5] = [0xAAAA_AAAA, 0xCCCC_CCCC, 0xF0F0_F0F0, 0xFF00_FF00, 0xFFFF_0000];
+    let mut absorbed: HashSet<usize> = HashSet::new();
+    let mut updates: Vec<(usize, u64, [Option<String>; 6])> = Vec::new();
+    for c in &packed.carries {
+        if !packed.adder_carries.contains(&c.name) {
+            continue;
+        }
+        for j in 0..4 {
+            let (Some(s), Some(di)) = (&c.s_nets[j], &c.di_nets[j]) else { continue };
+            let Some(&si) = lut_by_out.get(s) else {
+                return Err(format!("pack: carry {} S{j} net `{s}` is not driven by a LUT", c.name));
+            };
+            let slut = &packed.luts[si];
+            let mut vars: Vec<String> = Vec::new();
+            for n in slut.input_nets.iter().flatten() {
+                if !vars.contains(n) {
+                    vars.push(n.clone());
+                }
+            }
+            if vars.len() > 5 {
+                return Err(format!("pack: carry {} S{j} LUT {} has more than 5 inputs", c.name, slut.name));
+            }
+            let s_tt = table(slut, &vars);
+            let di_tt = if let Some(k) = vars.iter().position(|v| v == di) {
+                VAR5[k]
+            } else {
+                // A LUT-driven generate whose inputs fit is absorbed.
+                let merged = lut_by_out.get(di).and_then(|&li| {
+                    let dl = &packed.luts[li];
+                    let mut v = vars.clone();
+                    for n in dl.input_nets.iter().flatten() {
+                        if !v.contains(n) {
+                            v.push(n.clone());
+                        }
+                    }
+                    (v.len() <= 5).then_some((li, v))
+                });
+                match merged {
+                    Some((li, v)) => {
+                        vars = v;
+                        absorbed.insert(li);
+                        table(&packed.luts[li], &vars)
+                    }
+                    None if vars.len() < 5 => {
+                        vars.push(di.clone());
+                        VAR5[vars.len() - 1]
+                    }
+                    None => {
+                        return Err(format!("pack: carry {} DI{j} net `{di}` does not fit the S{j} LUT", c.name));
+                    }
+                }
+            };
+            // Recompute the propagate over the final variable order.
+            let s_tt = if vars.len() == slut.input_nets.iter().flatten().count() { s_tt } else { table(slut, &vars) };
+            let mut ins: [Option<String>; 6] = Default::default();
+            for (k, v) in vars.into_iter().enumerate() {
+                ins[k] = Some(v);
+            }
+            updates.push((si, ((s_tt as u64) << 32) | di_tt as u64, ins));
+        }
+    }
+    for (si, init, ins) in updates {
+        let l = &mut packed.luts[si];
+        l.init = init;
+        l.input_nets = ins;
+        packed.dual_luts.insert(l.name.clone());
+    }
+    // Absorbed generate LUTs with no reader left are gone.
+    let mut read: HashSet<&str> = HashSet::new();
+    for l in &packed.luts {
+        read.extend(l.input_nets.iter().flatten().map(|s| s.as_str()));
+    }
+    for f in &packed.ffs {
+        read.insert(f.d_net.as_str());
+        read.extend(f.ce_net.iter().map(|s| s.as_str()));
+        read.extend(f.sr_net.iter().map(|s| s.as_str()));
+    }
+    for i in &packed.iobs {
+        read.insert(i.net.as_str());
+    }
+    for b in &packed.bufgs {
+        read.insert(b.in_net.as_str());
+    }
+    for c in &packed.carries {
+        read.extend(c.s_nets.iter().flatten().map(|s| s.as_str()));
+        read.insert(c.ci_net.as_str());
+        if !packed.adder_carries.contains(&c.name) {
+            read.extend(c.di_nets.iter().flatten().map(|s| s.as_str()));
+        }
+    }
+    let dead: HashSet<usize> = absorbed.into_iter().filter(|&li| !read.contains(packed.luts[li].output_net.as_str())).collect();
+    if !dead.is_empty() {
+        let mut i = 0usize;
+        packed.luts.retain(|_| {
+            let keep = !dead.contains(&i);
+            i += 1;
+            keep
+        });
+    }
+    Ok(())
+}
+
+/// Every net that some cell reads but nothing drives must be a top-level
+/// input bit (`port` or `port_<bit>`): give it an IBUF. A clock port read
+/// as data reads its existing IBUF output. Any other undriven net is
+/// rejected by the router, never silently left floating.
+fn insert_input_buffers(netlist: &Design, packed: &mut Packed7) -> Result<(), String> {
+    use std::collections::{BTreeSet, HashMap, HashSet};
+    let mut driven: HashSet<String> = HashSet::new();
+    for l in &packed.luts {
+        driven.insert(l.output_net.clone());
+    }
+    for f in &packed.ffs {
+        driven.insert(f.q_net.clone());
+    }
+    for i in &packed.iobs {
+        if i.dir == IobDir::In {
+            driven.insert(i.net.clone());
+        }
+    }
+    for b in &packed.bufgs {
+        driven.insert(b.out_net.clone());
+    }
+    for c in &packed.carries {
+        for o in c.o_nets.iter().flatten() {
+            driven.insert(o.clone());
+        }
+        if let Some(co) = &c.co_net {
+            driven.insert(co.clone());
+        }
+    }
+    let mut read: BTreeSet<String> = BTreeSet::new();
+    for l in &packed.luts {
+        read.extend(l.input_nets.iter().flatten().cloned());
+    }
+    for f in &packed.ffs {
+        read.insert(f.d_net.clone());
+        read.extend(f.ce_net.iter().cloned());
+        read.extend(f.sr_net.iter().cloned());
+    }
+    for i in &packed.iobs {
+        if i.dir == IobDir::Out {
+            read.insert(i.net.clone());
+        }
+    }
+    for c in &packed.carries {
+        // DI nets are not wired by the router (see route.rs carry notes).
+        read.extend(c.s_nets.iter().flatten().cloned());
+        if c.cyinit.is_none() && !c.ci_net.is_empty() {
+            read.insert(c.ci_net.clone());
+        }
+    }
+    // Clock ports already have an IBUF; data loads of the raw port net read
+    // its output instead.
+    let clock_ibuf: HashMap<String, String> = packed
+        .bufgs
+        .iter()
+        .filter_map(|b| b.in_net.strip_suffix("_ibuf").map(|p| (p.to_string(), b.in_net.clone())))
+        .collect();
+    let mut rename: HashMap<String, String> = HashMap::new();
+    let mut new_iobs = Vec::new();
+    for net in read {
+        if driven.contains(&net) {
+            continue;
+        }
+        if let Some(ib) = clock_ibuf.get(&net) {
+            rename.insert(net.clone(), ib.clone());
+            continue;
+        }
+        let port = netlist.ports.iter().filter(|p| p.dir == PortDir::In).find(|p| {
+            resolve(p.name) == net
+                || net
+                    .strip_prefix(resolve(p.name))
+                    .and_then(|r| r.strip_prefix('_'))
+                    .map(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_digit()))
+                    .unwrap_or(false)
+        });
+        // Not an input bit: left for the router, which rejects an undriven
+        // net loudly (pack also runs on fragments in unit tests).
+        let Some(port) = port else { continue };
+        let scalar = resolve(port.name) == net;
+        new_iobs.push(PackedIob {
+            name: format!("ibuf_{net}"),
+            loc: if scalar { port.attrs.get("LOC").map(|s| s.to_string()) } else { None },
+            iostandard: port.attrs.get("IOSTANDARD").map(|s| s.to_string()).unwrap_or_else(|| "LVCMOS33".to_string()),
+            drive: None,
+            slew: None,
+            port: resolve(port.name).to_string(),
+            dir: IobDir::In,
+            net: net.clone(),
+        });
+    }
+    packed.iobs.extend(new_iobs);
+    if !rename.is_empty() {
+        let r = |n: &mut String| {
+            if let Some(x) = rename.get(n) {
+                *n = x.clone();
+            }
+        };
+        for l in packed.luts.iter_mut() {
+            for n in l.input_nets.iter_mut().flatten() {
+                r(n);
+            }
+        }
+        for f in packed.ffs.iter_mut() {
+            r(&mut f.d_net);
+            if let Some(n) = f.ce_net.as_mut() {
+                r(n);
+            }
+            if let Some(n) = f.sr_net.as_mut() {
+                r(n);
+            }
+        }
+        for i in packed.iobs.iter_mut() {
+            if i.dir == IobDir::Out {
+                r(&mut i.net);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Insert IBUF + BUFGCTRL for clock inputs.
 ///
 /// For every net that drives at least one FF `CLK` pin and is not already
@@ -2834,5 +3203,125 @@ mod tests {
         d.set_cell_attr("u_mmcm", "CLKFBOUT_MULT_F", "2.0").unwrap();
         let err = pack(&d).unwrap_err();
         assert!(err.contains("VCO frequency"), "got: {err}");
+    }
+
+    /// Two chained Carry4 groups (second partial, no CO): pack must capture
+    /// every pin net so place/route/emit can follow the chain, and fail
+    /// loudly on a missing CI.
+    fn carry_chain_design() -> Design {
+        let mut d = Design::new("carry2");
+        d.add_port("clk", PortDir::In);
+        d.add_cell("u_c0", CellKind::Carry4);
+        d.connect("one", "u_c0", "CI");
+        d.connect("co0", "u_c0", "CO");
+        for j in 0..4 {
+            d.connect(&format!("s{j}"), "u_c0", &format!("S{j}"));
+            d.connect("zero", "u_c0", &format!("DI{j}"));
+            d.connect(&format!("o{j}"), "u_c0", &format!("O{j}"));
+        }
+        // Partial top group: bits 0-1 only, chain end (no CO endpoint).
+        d.add_cell("u_c1", CellKind::Carry4);
+        d.connect("co0", "u_c1", "CI");
+        for j in 0..2 {
+            d.connect(&format!("s{}", 4 + j), "u_c1", &format!("S{j}"));
+            d.connect("zero", "u_c1", &format!("DI{j}"));
+            d.connect(&format!("o{}", 4 + j), "u_c1", &format!("O{j}"));
+        }
+        d
+    }
+
+    #[test]
+    fn pack_carry_captures_chain_pin_nets() {
+        let packed = pack(&carry_chain_design()).unwrap();
+        assert_eq!(packed.carries.len(), 2);
+        let c0 = &packed.carries[0];
+        assert_eq!(c0.ci_net, "one");
+        assert_eq!(c0.co_net.as_deref(), Some("co0"));
+        assert_eq!(c0.s_nets[0].as_deref(), Some("s0"));
+        assert_eq!(c0.di_nets[3].as_deref(), Some("zero"));
+        assert_eq!(c0.o_nets[2].as_deref(), Some("o2"));
+        let c1 = &packed.carries[1];
+        // Cascade linkage by net name, not cell naming.
+        assert_eq!(c1.ci_net, "co0");
+        assert_eq!(c1.co_net, None);
+        assert_eq!(c1.s_nets[1].as_deref(), Some("s5"));
+        assert_eq!(c1.s_nets[2], None);
+        assert_eq!(c1.di_nets[3], None);
+        assert_eq!(c1.o_nets[0].as_deref(), Some("o4"));
+        assert_eq!(c1.o_nets[3], None);
+    }
+
+    #[test]
+    fn pack_carry_without_ci_fails_loudly() {
+        let mut d = Design::new("noci");
+        d.add_cell("u_c", CellKind::Carry4);
+        d.connect("co", "u_c", "CO");
+        let err = pack(&d).unwrap_err();
+        assert!(err.contains("no CI net"), "got: {err}");
+    }
+
+    /// A flop with its own asynchronous reset pin (the v2 front end's
+    /// form): active high goes straight to SR in asynchronous mode.
+    fn arst_design(level: &str) -> Design {
+        let mut d = Design::new("arst");
+        d.add_port("clk", PortDir::In);
+        d.add_port("rst", PortDir::In);
+        for i in 0..2 {
+            let ff = format!("r{i}_reg");
+            d.add_cell(&ff, CellKind::Hff);
+            d.connect(&format!("d{i}"), &ff, "D");
+            d.connect(&format!("r{i}"), &ff, "Q");
+            d.connect("clk", &ff, "CLK");
+            d.connect("rst", &ff, "ARST");
+            d.set_cell_attr(&ff, "ARST_LEVEL", level).unwrap();
+            d.set_cell_attr(&ff, "ARST_VAL", "0").unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn pack_async_reset_pin_becomes_async_sr() {
+        let packed = pack(&arst_design("1")).unwrap();
+        assert_eq!(packed.ffs.len(), 2);
+        for ff in &packed.ffs {
+            assert_eq!(ff.sr_net.as_deref(), Some("rst"));
+            assert!(ff.sr_async && !ff.srval && !ff.init);
+        }
+        assert!(packed.luts.is_empty());
+    }
+
+    /// An active-low reset reaches SR through one inverter LUT per reset
+    /// net, shared by every flop on that net.
+    #[test]
+    fn pack_active_low_async_reset_gets_one_inverter() {
+        let packed = pack(&arst_design("0")).unwrap();
+        assert_eq!(packed.luts.len(), 1);
+        let inv = &packed.luts[0];
+        assert_eq!(inv.input_nets[0].as_deref(), Some("rst"));
+        // Output is the complement of I0 whatever the unused pins read.
+        for addr in 0..64u64 {
+            assert_eq!((inv.init >> addr) & 1, 1 - (addr & 1));
+        }
+        for ff in &packed.ffs {
+            assert_eq!(ff.sr_net.as_deref(), Some(inv.output_net.as_str()));
+            assert!(ff.sr_async);
+        }
+    }
+
+    #[test]
+    fn pack_rejects_sync_and_async_reset_on_one_flop() {
+        let mut d = arst_design("1");
+        d.connect("srst", "r0_reg", "SR");
+        let err = pack(&d).unwrap_err();
+        assert!(err.contains("both a synchronous and an asynchronous reset"), "got: {err}");
+    }
+
+    #[test]
+    fn pack_records_falling_edge_flops() {
+        let mut d = arst_design("1");
+        d.set_cell_attr("r1_reg", "CLK_INV", "1").unwrap();
+        let packed = pack(&d).unwrap();
+        assert!(packed.negedge_ffs.contains("r1_reg"));
+        assert!(!packed.negedge_ffs.contains("r0_reg"));
     }
 }

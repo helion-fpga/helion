@@ -1,0 +1,19 @@
+[package]
+name = "helion-sv-zb"
+description = "Frozen copy of the first SystemVerilog front end as proven on the ZedBoard (see crates/zb/README.md)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "helion_sv"
+# The unit tests place and route on the HL10T fabric crates of their own
+# time; they run in the branch this copy was taken from.
+test = false
+doctest = false
+
+[dependencies]
+helion-ir = { package = "helion-ir-zb", path = "../helion-ir" }
+sv-parser = "0.13"
+bumpalo = "=3.20.3"
+varisat = "=0.2.1"

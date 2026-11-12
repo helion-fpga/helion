@@ -1,0 +1,12 @@
+[package]
+name = "helion-zb-front"
+description = "The front ends proven on the ZedBoard, producing the current netlist IR (see crates/zb/README.md)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+helion-ir = { workspace = true }
+zb-ir = { package = "helion-ir-zb", path = "../helion-ir" }
+zb-sv = { package = "helion-sv-zb", path = "../helion-sv" }
+zb-vhdl = { package = "helion-vhdl-zb", path = "../helion-vhdl" }

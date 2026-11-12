@@ -1,0 +1,452 @@
+//! Verilog/SV preprocessor: `` `define `` / `` `ifdef `` / macro expansion.
+//! Unknown `` `FOO `` and `` `FOO(...) `` are dropped so Helion can ingest
+//! large cores (Ibex, PicoRV32) that ship with assertion macros.
+
+use std::collections::HashMap;
+
+#[derive(Clone, Debug, Default)]
+struct Macro {
+    args: Vec<String>,
+    body: String,
+}
+
+use std::path::{Path, PathBuf};
+
+/// Expand `` `include "file" `` from the including file's directory and
+/// obvious include dirs (`include/`, parent `include/`). Quoted form only.
+/// Missing files are left in place so the preprocessor can still drop the
+/// directive; a named diagnostic is printed.
+pub fn expand_includes(source: &str, base: &Path) -> String {
+    expand_includes_depth(source, base, &mut Vec::new(), 0)
+}
+
+fn expand_includes_depth(
+    source: &str,
+    base: &Path,
+    seen: &mut Vec<PathBuf>,
+    depth: usize,
+) -> String {
+    if depth > 8 {
+        return source.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = source;
+    while let Some(idx) = rest.find("`include") {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + "`include".len()..];
+        let trimmed = after.trim_start();
+        let ws = after.len() - trimmed.len();
+        let (path_s, consumed) = if let Some(q) = trimmed.strip_prefix('"') {
+            if let Some(end) = q.find('"') {
+                (q[..end].to_string(), ws + 1 + end + 1)
+            } else {
+                out.push_str("`include");
+                rest = after;
+                continue;
+            }
+        } else if let Some(q) = trimmed.strip_prefix('<') {
+            if let Some(end) = q.find('>') {
+                (q[..end].to_string(), ws + 1 + end + 1)
+            } else {
+                out.push_str("`include");
+                rest = after;
+                continue;
+            }
+        } else {
+            out.push_str("`include");
+            rest = after;
+            continue;
+        };
+        rest = &after[consumed..];
+        if let Some(nl) = rest.find('\n') {
+            // keep newline for line structure; drop the rest of the include line
+            rest = &rest[nl..];
+        }
+        match resolve_include(base, &path_s) {
+            Some(found) => {
+                if seen.iter().any(|p| p == &found) {
+                    eprintln!(
+                        "diagnostic skip_include file={} why=include cycle; not a LUT",
+                        found.display()
+                    );
+                } else {
+                    seen.push(found.clone());
+                    let text = std::fs::read_to_string(&found).unwrap_or_default();
+                    let child_base = found.parent().unwrap_or(base);
+                    out.push_str(&expand_includes_depth(&text, child_base, seen, depth + 1));
+                    out.push('\n');
+                }
+            }
+            None => {
+                eprintln!(
+                    "diagnostic skip_include file={} base={} why=include not found in same dir or include path; not a LUT",
+                    path_s,
+                    base.display()
+                );
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn resolve_include(base: &Path, spec: &str) -> Option<PathBuf> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let mut cands = Vec::new();
+    cands.push(base.join(spec));
+    if let Some(name) = Path::new(spec).file_name() {
+        cands.push(base.join(name));
+        cands.push(base.join("include").join(name));
+        if let Some(parent) = base.parent() {
+            cands.push(parent.join("include").join(name));
+            cands.push(parent.join(spec));
+        }
+    }
+    cands.push(base.join("include").join(spec));
+    cands.into_iter().find(|p| p.is_file())
+}
+
+/// Expand `` `define `` / `` `ifdef `` and strip leftover backticks.
+///
+/// Walks UTF-8 bytes (Verilog tokens are ASCII). Avoids a `Vec<char>` of the
+/// whole source — Ibex-scale files paid that 4× copy on every preprocess.
+/// A second pass runs only when the first expansion still contains `` ` ``
+/// (nested object-like macros); callers must not preprocess twice.
+pub fn preprocess_sv(source: &str) -> String {
+    let once = preprocess_sv_once(source);
+    if once.as_bytes().contains(&b'`') {
+        preprocess_sv_once(&once)
+    } else {
+        once
+    }
+}
+
+fn preprocess_sv_once(source: &str) -> String {
+    let b = source.as_bytes();
+    let mut i = 0;
+    let mut defines: HashMap<String, Macro> = HashMap::new();
+    // (parent_emitting, this_branch_on)
+    let mut stack: Vec<(bool, bool)> = vec![(true, true)];
+    let mut out: Vec<u8> = Vec::with_capacity(source.len());
+
+    fn emitting(stack: &[(bool, bool)]) -> bool {
+        stack.last().map(|(p, t)| *p && *t).unwrap_or(true)
+    }
+
+    while i < b.len() {
+        if b[i] == b'`' {
+            let start = i;
+            i += 1;
+            let name = read_ident(b, &mut i);
+            if name.is_empty() {
+                continue;
+            }
+            skip_ws_not_nl(b, &mut i);
+            match name.as_str() {
+                "define" => {
+                    let dname = read_ident(b, &mut i);
+                    let (args, body) = read_define_body(b, &mut i);
+                    if emitting(&stack) && !dname.is_empty() {
+                        defines.insert(dname, Macro { args, body });
+                    }
+                }
+                "undef" => {
+                    let dname = read_ident(b, &mut i);
+                    skip_to_eol(b, &mut i);
+                    if emitting(&stack) {
+                        defines.remove(&dname);
+                    }
+                }
+                "ifdef" | "ifndef" => {
+                    let dname = read_ident(b, &mut i);
+                    skip_to_eol(b, &mut i);
+                    let parent = emitting(&stack);
+                    let present = defines.contains_key(&dname);
+                    let take = if name == "ifdef" { present } else { !present };
+                    stack.push((parent, parent && take));
+                }
+                "elsif" | "elif" => {
+                    let dname = read_ident(b, &mut i);
+                    skip_to_eol(b, &mut i);
+                    if let Some((parent, was)) = stack.pop() {
+                        let present = defines.contains_key(&dname);
+                        stack.push((parent, parent && !was && present));
+                    }
+                }
+                "else" => {
+                    skip_to_eol(b, &mut i);
+                    if let Some((parent, was)) = stack.pop() {
+                        stack.push((parent, parent && !was));
+                    }
+                }
+                "endif" => {
+                    skip_to_eol(b, &mut i);
+                    if stack.len() > 1 {
+                        stack.pop();
+                    }
+                }
+                "include"
+                | "timescale"
+                | "resetall"
+                | "default_nettype"
+                | "line"
+                | "unconnected_drive"
+                | "nounconnected_drive"
+                | "celldefine"
+                | "endcelldefine"
+                | "pragma"
+                | "begin_keywords"
+                | "end_keywords" => {
+                    skip_to_eol(b, &mut i);
+                }
+                _ => {
+                    i = start + 1; // after backtick
+                    let _ = read_ident(b, &mut i);
+                    if emitting(&stack) {
+                        if let Some(m) = defines.get(&name).cloned() {
+                            let text = expand_macro(&m, b, &mut i);
+                            out.extend_from_slice(text.as_bytes());
+                        } else {
+                            skip_opt_args(b, &mut i);
+                        }
+                    } else {
+                        skip_opt_args(b, &mut i);
+                    }
+                }
+            }
+            continue;
+        }
+        if emitting(&stack) {
+            let start = i;
+            while i < b.len() && b[i] != b'`' {
+                i += 1;
+            }
+            out.extend_from_slice(&b[start..i]);
+            continue;
+        }
+        while i < b.len() && b[i] != b'`' {
+            if b[i] == b'\n' {
+                out.push(b'\n');
+            }
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+fn read_ident(b: &[u8], i: &mut usize) -> String {
+    let start = *i;
+    while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'_') {
+        *i += 1;
+    }
+    String::from_utf8_lossy(&b[start..*i]).into_owned()
+}
+
+fn skip_ws_not_nl(b: &[u8], i: &mut usize) {
+    while *i < b.len() && b[*i].is_ascii_whitespace() && b[*i] != b'\n' {
+        *i += 1;
+    }
+}
+
+fn skip_to_eol(b: &[u8], i: &mut usize) {
+    while *i < b.len() && b[*i] != b'\n' {
+        *i += 1;
+    }
+}
+
+fn read_define_body(b: &[u8], i: &mut usize) -> (Vec<String>, String) {
+    let mut args = Vec::new();
+    if *i < b.len() && b[*i] == b'(' {
+        *i += 1;
+        loop {
+            let start = *i;
+            skip_ws_not_nl(b, i);
+            if *i >= b.len() || b[*i] == b'\n' {
+                break;
+            }
+            if b[*i] == b')' {
+                *i += 1;
+                break;
+            }
+            let a = read_ident(b, i);
+            if a.is_empty() {
+                // Non-ident in the arg list (`define FOO(1+2)`). Consume to the
+                // matching ')' so i never stalls.
+                let mut depth = 1i32;
+                while *i < b.len() && b[*i] != b'\n' && depth > 0 {
+                    match b[*i] {
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    *i += 1;
+                }
+                break;
+            }
+            args.push(a);
+            skip_ws_not_nl(b, i);
+            if *i < b.len() && b[*i] == b'=' {
+                *i += 1;
+                let mut d = 0i32;
+                while *i < b.len() && b[*i] != b'\n' {
+                    match b[*i] {
+                        b'(' => d += 1,
+                        b')' if d == 0 => break,
+                        b')' => d -= 1,
+                        b',' if d == 0 => break,
+                        _ => {}
+                    }
+                    *i += 1;
+                }
+            }
+            skip_ws_not_nl(b, i);
+            if *i < b.len() && b[*i] == b',' {
+                *i += 1;
+                continue;
+            }
+            if *i < b.len() && b[*i] == b')' {
+                *i += 1;
+                break;
+            }
+            if *i == start {
+                *i += 1;
+            }
+        }
+    }
+    skip_ws_not_nl(b, i);
+    let mut body = String::new();
+    while *i < b.len() && b[*i] != b'\n' {
+        if b[*i] == b'\\' && b.get(*i + 1) == Some(&b'\n') {
+            *i += 2;
+            body.push(' ');
+            continue;
+        }
+        body.push(b[*i] as char);
+        *i += 1;
+    }
+    (args, body.trim().to_string())
+}
+
+fn skip_opt_args(b: &[u8], i: &mut usize) {
+    skip_ws_not_nl(b, i);
+    if *i < b.len() && b[*i] == b'(' {
+        let mut depth = 0i32;
+        while *i < b.len() {
+            match b[*i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    *i += 1;
+                    if depth <= 0 {
+                        break;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            *i += 1;
+        }
+    }
+}
+
+fn expand_macro(m: &Macro, b: &[u8], i: &mut usize) -> String {
+    if m.args.is_empty() {
+        return m.body.clone();
+    }
+    skip_ws_not_nl(b, i);
+    let mut vals: Vec<String> = Vec::new();
+    if *i < b.len() && b[*i] == b'(' {
+        *i += 1;
+        let mut cur = String::new();
+        let mut depth = 1i32;
+        while *i < b.len() && depth > 0 {
+            let c = b[*i] as char;
+            *i += 1;
+            if c == '(' {
+                depth += 1;
+                cur.push(c);
+            } else if c == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    if !cur.is_empty() {
+                        vals.push(cur.trim().to_string());
+                    }
+                    break;
+                }
+                cur.push(c);
+            } else if c == ',' && depth == 1 {
+                vals.push(cur.trim().to_string());
+                cur.clear();
+            } else {
+                cur.push(c);
+            }
+        }
+    }
+    let mut body = m.body.clone();
+    for (a, v) in m.args.iter().zip(vals.iter()) {
+        body = body.replace(a, v);
+    }
+    body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ifdef_keeps_defined_branch() {
+        let s = preprocess_sv("`define FOO\n`ifdef FOO\nwire a;\n`else\nwire b;\n`endif\n");
+        assert!(s.contains("wire a;"), "{s}");
+        assert!(!s.contains("wire b;"), "{s}");
+    }
+
+    #[test]
+    fn unknown_macro_invocation_dropped() {
+        let s = preprocess_sv("`ASSERT(foo, bar)\nassign led = q;\n");
+        assert!(s.contains("assign led = q;"), "{s}");
+        assert!(!s.contains("ASSERT"), "{s}");
+    }
+
+    #[test]
+    fn object_like_define_expands() {
+        let s = preprocess_sv("`define N 4\nlogic [`N:0] q;\n");
+        assert!(s.contains("logic [4:0] q;"), "{s}");
+    }
+
+    #[test]
+    fn function_like_non_ident_args_do_not_hang() {
+        let s = preprocess_sv("`define FOO(1+2)\nlogic x;\n");
+        assert!(s.contains("logic x;"), "{s}");
+        assert!(!s.contains('`'), "{s}");
+    }
+
+    #[test]
+    fn object_like_paren_body_not_args() {
+        let s = preprocess_sv("`define BAR (4)\nlogic [3:0] q;\nassign q = `BAR;\n");
+        assert!(
+            s.contains("assign q = (4);") || s.contains("assign q = (4)"),
+            "{s}"
+        );
+        assert!(!s.contains('`'), "{s}");
+    }
+
+    #[test]
+    fn leftover_backtick_in_expansion_stripped() {
+        // Expansion may inject `` `INNER ``; a second pass (empty define set)
+        // drops leftover backticks the same way parse_source used to.
+        let s = preprocess_sv("`define OUTER `INNER\nlogic [`OUTER:0] q;\n");
+        assert!(!s.contains('`'), "{s}");
+        assert!(s.contains("logic ["), "{s}");
+    }
+
+    #[test]
+    fn ifdef_off_branch_keeps_newlines_only() {
+        let s = preprocess_sv("`ifdef NOPE\nwire a;\nwire b;\n`endif\nwire c;\n");
+        assert!(!s.contains("wire a;"), "{s}");
+        assert!(s.contains("wire c;"), "{s}");
+        assert!(s.contains('\n'), "{s}");
+    }
+}

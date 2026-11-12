@@ -138,6 +138,23 @@ pub trait DeviceQuery {
     fn pin_bank(&self, _pin: &str) -> Option<String> {
         Some("35".to_string())
     }
+    /// Claim one caller-pinned slice site (chain-head anchor). Returns the
+    /// `(tile, site)` when the name is a real free slice site, else `None`;
+    /// the caller fails loudly. General mechanism: tests and flows pin
+    /// golden columns with it, never the placer itself.
+    fn anchor_slice(&self, site: &str, used: &HashSet<String>) -> Option<(String, String)>;
+    /// The free slice directly above `site` up the carry column: the slice
+    /// whose CIN is driven by `site`'s COUT through the dedicated cascade
+    /// wire. 7-series order, proven by the blinky golden chain (X71Y39 to
+    /// Y45): ascending slice name Y, X0 before X1 within a tile. Returns
+    /// `None` when the neighbor is taken or the column ends; the caller
+    /// must fail loudly, since a non-adjacent cascade is unroutable.
+    fn slice_above(&self, site: &str, used: &HashSet<String>) -> Option<(String, String)>;
+    /// Every slice site as `(tile, site, grid x, grid y)`. Empty (the
+    /// default) disables placement refinement.
+    fn all_slices(&self) -> Vec<(String, String, i32, i32)> {
+        Vec::new()
+    }
 }
 
 /// A placed LUT: tile + slice site + BEL.
@@ -347,6 +364,113 @@ pub struct Placed7 {
     pub xadcs: Vec<PlacedXadc>,
     pub cfg_prims: Vec<PlacedCfgPrim>,
 }
+
+/// FF control set: CLK, CE, SR nets and SR mode. Slice-wide in 7-series.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CtrlSet {
+    pub clk: String,
+    pub ce: Option<String>,
+    pub sr: Option<String>,
+    pub sr_async: bool,
+    /// Falling-edge clock (the slice's clock inverter).
+    pub clk_inv: bool,
+}
+
+impl CtrlSet {
+    pub fn of(ff: &crate::pack::PackedFf, packed: &Packed7) -> Self {
+        CtrlSet {
+            clk: ff.clk_net.clone(),
+            ce: ff.ce_net.clone(),
+            sr: ff.sr_net.clone(),
+            sr_async: ff.sr_async && ff.sr_net.is_some(),
+            clk_inv: packed.negedge_ffs.contains(&ff.name),
+        }
+    }
+}
+
+/// Where a placed FF's D input comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfDSource {
+    /// The same-letter LUT of the same slice (`xFFMUX.O6`, site-internal).
+    LutO6,
+    /// The same-letter carry sum bit of the same slice (`xFFMUX.XOR`).
+    CarryXor,
+    /// Anything else: routed through the fabric into the letter's bypass
+    /// pin (`AX`..`DX`, `xFFMUX.xX`).
+    Bypass,
+}
+
+/// Decide the D source of a placed FF. Route and emit both use this, so
+/// the routed pin and the programmed FF mux always agree.
+pub fn ff_d_source(ff: &PlacedFf, placed: &Placed7) -> FfDSource {
+    let letter = ff.bel.chars().next().unwrap_or('A');
+    let Some(pff) = placed.packed.ffs.iter().find(|f| f.name == ff.name) else {
+        return FfDSource::Bypass;
+    };
+    let li = BEL_LETTERS.iter().position(|c| *c == letter).unwrap_or(0);
+    for pc in &placed.carries {
+        if pc.site != ff.site {
+            continue;
+        }
+        if let Some(c) = placed.packed.carries.iter().find(|c| c.name == pc.name) {
+            if c.o_nets[li].as_deref() == Some(pff.d_net.as_str()) {
+                return FfDSource::CarryXor;
+            }
+        }
+    }
+    for lut in &placed.luts {
+        if lut.site == ff.site && lut.bel.starts_with(letter) {
+            if let Some(pl) = placed.packed.luts.iter().find(|l| l.name == lut.name) {
+                if pl.output_net == pff.d_net {
+                    return FfDSource::LutO6;
+                }
+            }
+        }
+    }
+    FfDSource::Bypass
+}
+
+/// Order packed carries into chains by CO-to-CI net linkage (ZB-08).
+///
+/// Each chain runs head to tail: the head is the group whose CI net is not
+/// driven by any other group CO in this design. Linkage is by net name,
+/// never by cell naming. Two chains may share one CI net (one const source
+/// feeding two CYINITs); a mid-chain fork or a cycle leaves a group
+/// unreachable from any head and fails loudly.
+fn order_carry_chains(carries: &[PackedCarry]) -> Result<Vec<Vec<&PackedCarry>>, String> {
+    let by_ci: HashMap<&str, &PackedCarry> =
+        carries.iter().map(|c| (c.ci_net.as_str(), c)).collect();
+    let co_nets: HashSet<&str> = carries
+        .iter()
+        .filter_map(|c| c.co_net.as_deref())
+        .collect();
+    let mut chains = Vec::new();
+    let mut placed: HashSet<&str> = HashSet::new();
+    for head in carries.iter().filter(|c| !co_nets.contains(c.ci_net.as_str())) {
+        let mut chain = Vec::new();
+        let mut cur: Option<&PackedCarry> = Some(head);
+        while let Some(c) = cur {
+            if !placed.insert(c.name.as_str()) {
+                return Err(format!("place: CARRY4 chain cycles at {}", c.name));
+            }
+            chain.push(c);
+            cur = c.co_net.as_deref().and_then(|co| by_ci.get(co).copied());
+        }
+        chains.push(chain);
+    }
+    if placed.len() != carries.len() {
+        let missing = carries
+            .iter()
+            .find(|c| !placed.contains(c.name.as_str()))
+            .map(|c| c.name.as_str())
+            .unwrap_or("?");
+        return Err(format!(
+            "place: CARRY4 {missing} is not reachable from any chain head (cycle?)"
+        ));
+    }
+    Ok(chains)
+}
+
 /// BEL letters within a slice: A, B, C, D.
 const BEL_LETTERS: [char; 4] = ['A', 'B', 'C', 'D'];
 
@@ -467,22 +591,120 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
     // 2c. DSP48E1s with column-aligned PCOUT->PCIN / ACOUT->ACIN / BCOUT->BCIN cascade placement.
     place_dsps(&packed.dsps, device, &mut used_sites, &mut out.dsps)?;
 
-    // 2d. CARRY4s with column-aligned vertical CO[3]->CI chain placement.
+    // 2d. CARRY4s, ordered into chains by CO-to-CI net linkage (ZB-08).
+    // The first chain head honors `packed.carry_anchor` when set (a pinned
+    // site for convergence measurements); every other head goes on a free
+    // slice near the anchor. Every next group goes directly above its
+    // predecessor so the dedicated COUT to CIN cascade wire reaches. A
+    // broken column fails loudly: scattering chained groups would leave
+    // the CO nets unroutable.
     let (ax, ay) = anchor.unwrap_or((0, 0));
-    place_carries(
-        &packed.carries,
-        device,
-        (ax, ay),
-        &mut used_sites,
-        &mut out.carries,
-    )?;
+    let mut carry_anchor = packed.carry_anchor.clone();
+    // Slice grid by site-name coordinates, for adder columns.
+    let slice_grid: HashMap<(i32, i32), (String, String, i32, i32)> = device
+        .all_slices()
+        .into_iter()
+        .filter_map(|(tile, site, gx, gy)| crate::xdevice::parse_slice_xy(&site).map(|xy| (xy, (tile, site, gx, gy))))
+        .collect();
+    for chain in order_carry_chains(&packed.carries)? {
+        // An adder chain is a plain cascade: COUT of SLICE_XxYy feeds CIN
+        // of SLICE_XxY(y+1). It takes the free column run nearest the
+        // anchor.
+        if packed.adder_carries.contains(&chain[0].name) && !slice_grid.is_empty() {
+            let len = chain.len() as i32;
+            let mut best: Option<(i32, (i32, i32))> = None;
+            for (&(x, y), (_, _, gx, gy)) in &slice_grid {
+                let d = (gx - ax).abs() + (gy - ay).abs();
+                if best.map(|(bd, bxy)| (d, (x, y)) >= (bd, bxy)).unwrap_or(false) {
+                    continue;
+                }
+                let free = (0..len).all(|k| slice_grid.get(&(x, y + k)).map(|s| !used_sites.contains(&s.1)).unwrap_or(false));
+                if free {
+                    best = Some((d, (x, y)));
+                }
+            }
+            let Some((_, (x, y))) = best else {
+                return Err(format!("place: no free column of {len} slices for the carry chain of {}", chain[0].name));
+            };
+            for (k, carry) in chain.iter().enumerate() {
+                let (tile, site, _, _) = slice_grid[&(x, y + k as i32)].clone();
+                used_sites.insert(site.clone());
+                out.carries.push(PlacedCarry { name: carry.name.clone(), tile, site });
+            }
+            continue;
+        }
+        let mut prev_site: Option<String> = None;
+        for carry in chain {
+            let (tile, site) = match &prev_site {
+                None => match carry_anchor.take() {
+                    Some(pinned) => device.anchor_slice(&pinned, &used_sites).ok_or_else(|| {
+                        format!(
+                            "place: carry anchor site {pinned} is not a free slice (CARRY4 {})",
+                            carry.name
+                        )
+                    })?,
+                    None => device.slice_near(ax, ay, &used_sites).ok_or_else(|| {
+                        format!("place: no SLICE site for CARRY4 {}", carry.name)
+                    })?,
+                },
+                Some(prev) => device.slice_above(prev, &used_sites).ok_or_else(|| {
+                    format!(
+                        "place: no free slice above {} for chained CARRY4 {}",
+                        prev, carry.name
+                    )
+                })?,
+            };
+            used_sites.insert(site.clone());
+            prev_site = Some(site.clone());
+            out.carries.push(PlacedCarry {
+                name: carry.name.clone(),
+                tile,
+                site,
+            });
+        }
+    }
+
+    // 2d2. Carry co-placement slots (ZB-04): each used carry bit reserves
+    // its BEL letter in its slice; the O-driven FF and the S-driving LUT
+    // of bit j take letter j in the carry slice, so S/DI/O stay
+    // site-internal. Unused letters of partial groups stay open for
+    // generic fill. LUT and FF BELs are distinct, so slots track by class.
+    let packed_carry_by_name: HashMap<&str, &PackedCarry> = packed
+        .carries
+        .iter()
+        .map(|c| (c.name.as_str(), c))
+        .collect();
+    // BEL occupancy per site: site -> letters used.
+    let mut site_bels: HashMap<String, HashSet<char>> = HashMap::new();
+    // Allocate a (tile, site, BEL-letter), reusing a slice with free BELs
+    // before opening a new one.
+    let mut site_tile: HashMap<String, String> = HashMap::new();
+    let mut o_slot: HashMap<&str, (String, String, char)> = HashMap::new();
+    let mut s_slot: HashMap<&str, (String, String, char)> = HashMap::new();
+    for pc in &out.carries {
+        let Some(packed_c) = packed_carry_by_name.get(pc.name.as_str()) else {
+            continue;
+        };
+        site_bels.entry(pc.site.clone()).or_default();
+        site_tile.insert(pc.site.clone(), pc.tile.clone());
+        for j in 0..4 {
+            let letter = BEL_LETTERS[j];
+            if packed_c.o_nets[j].is_some() || packed_c.s_nets[j].is_some() {
+                site_bels.get_mut(&pc.site).unwrap().insert(letter);
+            }
+            if let Some(o) = &packed_c.o_nets[j] {
+                o_slot.insert(o.as_str(), (pc.tile.clone(), pc.site.clone(), letter));
+            }
+            if let Some(s) = &packed_c.s_nets[j] {
+                s_slot.insert(s.as_str(), (pc.tile.clone(), pc.site.clone(), letter));
+            }
+        }
+    }
 
     // 2e. I/O logic primitives: IDELAYE2 / ODELAYE2 / IDELAYCTRL, IDDR / ODDR, ISERDESE2 / OSERDESE2.
     place_io_primitives(packed, device, &net_to_iob, &mut used_sites, &mut out)?;
 
     // 2f. SRL16E / SRLC32E in SLICEM sites (with Q31->D cascade co-location).
-    let mut site_bels: HashMap<String, HashSet<char>> = HashMap::new();
-    let mut site_tile: HashMap<String, String> = HashMap::new();
     place_srls(
         packed,
         device,
@@ -575,6 +797,9 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
             site,
         });
     }
+    let mut carry_lut_slots: HashSet<(String, char)> = HashSet::new();
+    let mut carry_ff_slots: HashSet<(String, char)> = HashSet::new();
+    let adder_sites: HashSet<String> = out.carries.iter().filter(|c| packed.adder_carries.contains(&c.name)).map(|c| c.site.clone()).collect();
 
     // 3. Pair FFs with their driving LUTs (FF.D == LUT.O) into one slice.
     let lut_by_output: HashMap<&str, usize> = packed
@@ -585,26 +810,88 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         .collect();
     let mut lut_placed: HashSet<usize> = HashSet::new();
 
+    // Allocate a (tile, site, BEL-letter), reusing a slice with free BELs
+    // before opening a new one. (site_bels/site_tile were declared with
+    // the carry slots above so carry slices join the same occupancy map.)
+    // Foreign logic stays out of chain slices: the oracle chain tiles
+    // hold chain logic only, and packing strays into transit gaps crowded
+    // the head INT until the const-1 route failed loudly. Reuse passes run
+    // in sorted site order (HashMap iteration is per-process random, and
+    // unsorted reuse made bitstreams nondeterministic run to run).
+    let carry_sites: HashSet<String> =
+        out.carries.iter().map(|c| c.site.clone()).collect();
+    // Fresh-slice search center: the chain head tile when carries exist
+    // (foreign logic in a carry design is carry support, e.g. the CYINIT
+    // const-1, and colocating it keeps its route short; the IOB anchor
+    // once flung it 70 columns west past sparse fabric until its head-CI
+    // route failed loudly), else the IOB anchor as before.
+    let (fx, fy) = out
+        .carries
+        .first()
+        .and_then(|c| device.tile_xy(&c.tile))
+        .unwrap_or((ax, ay));
+    // Control set per slice: every FF in a slice shares CLK, CE, SR and
+    // the SR mode (FFSYNC is slice-wide), so an FF only joins a slice whose
+    // FFs have the same set. LUT-only slices have none yet.
+    let mut site_ctrl: HashMap<String, CtrlSet> = HashMap::new();
     let alloc = |used: &mut HashSet<String>,
-                 site_bels: &mut HashMap<String, HashSet<char>>,
-                 site_tile: &mut HashMap<String, String>,
-                 device: &dyn DeviceQuery|
+                     site_bels: &mut HashMap<String, HashSet<char>>,
+                     site_tile: &mut HashMap<String, String>,
+                     site_ctrl: &mut HashMap<String, CtrlSet>,
+                     ctrl: Option<&CtrlSet>,
+                     device: &dyn DeviceQuery|
      -> Result<(String, String, char), String> {
-        for (site, bels) in site_bels.iter() {
+        let mut sites: Vec<&String> = site_bels.keys().collect();
+        sites.sort();
+        let fits = |site: &str| match (ctrl, site_ctrl.get(site)) {
+            (Some(c), Some(have)) => c == have,
+            _ => true,
+        };
+        // Pass 1: open slices without carry cells, in sorted order.
+        for site in sites.iter() {
+            if carry_sites.contains(*site) || !fits(site) {
+                continue;
+            }
+            let bels = &site_bels[*site];
             if bels.len() < 4 {
                 if let Some(letter) = BEL_LETTERS.iter().find(|c| !bels.contains(c)) {
-                    let tile = site_tile.get(site).cloned().unwrap_or_default();
-                    return Ok((tile, site.clone(), *letter));
+                    let tile = site_tile.get(*site).cloned().unwrap_or_default();
+                    if let Some(c) = ctrl {
+                        site_ctrl.insert((*site).clone(), c.clone());
+                    }
+                    return Ok((tile, (*site).clone(), *letter));
                 }
             }
         }
-        let (tile, site) = device
-            .slice_near(ax, ay, used)
-            .ok_or_else(|| "place: no free SLICEL site".to_string())?;
-        used.insert(site.clone());
-        site_tile.insert(site.clone(), tile.clone());
-        site_bels.entry(site.clone()).or_default();
-        Ok((tile, site, 'A'))
+        // Pass 2: a fresh slice near the search center, rather than
+        // spilling foreign logic into carry-slice gaps.
+        if let Some((tile, site)) = device.slice_near(fx, fy, used) {
+            used.insert(site.clone());
+            site_tile.insert(site.clone(), tile.clone());
+            site_bels.entry(site.clone()).or_default();
+            if let Some(c) = ctrl {
+                site_ctrl.insert(site.clone(), c.clone());
+            }
+            return Ok((tile, site, 'A'));
+        }
+        // Pass 3 (last resort, dense packing with no fresh slice): reuse
+        // a carry-slice gap in sorted order.
+        for site in sites.iter() {
+            if !fits(site) {
+                continue;
+            }
+            let bels = &site_bels[*site];
+            if bels.len() < 4 {
+                if let Some(letter) = BEL_LETTERS.iter().find(|c| !bels.contains(c)) {
+                    let tile = site_tile.get(*site).cloned().unwrap_or_default();
+                    if let Some(c) = ctrl {
+                        site_ctrl.insert((*site).clone(), c.clone());
+                    }
+                    return Ok((tile, (*site).clone(), *letter));
+                }
+            }
+        }
+        Err("place: no free SLICEL site".to_string())
     };
 
     // Place LUTs feeding MUXF7 / MUXF8 first so wide muxes share one slice.
@@ -621,12 +908,45 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         &mut out.muxfs,
     )?;
 
-    for ff in &packed.ffs {
-        let lut_idx = lut_by_output
-            .get(ff.d_net.as_str())
-            .copied()
-            .filter(|i| !lut_placed.contains(i));
-        let (tile, site, letter) = alloc(&mut used_sites, &mut site_bels, &mut site_tile, device)?;
+    for (fi, ff) in packed.ffs.iter().enumerate() {
+        let _ = fi;
+        // Carry-driven FF: same slice and letter as its carry bit, so the
+        // O-to-D path stays site-internal. A double-booked slot fails loud.
+        let ctrl = CtrlSet::of(ff, packed);
+        // A sum bit of an adder may also be registered by a flop that
+        // cannot share the slice (another control set, or a second flop on
+        // the same bit): that flop is placed like any other and takes the
+        // sum through the fabric.
+        let adder_clash = o_slot.get(ff.d_net.as_str()).is_some_and(|(_, site, letter)| {
+            adder_sites.contains(site.as_str())
+                && (carry_ff_slots.contains(&(site.clone(), *letter)) || site_ctrl.get(site).is_some_and(|have| *have != ctrl))
+        });
+        if let Some((tile, site, letter)) = o_slot.get(ff.d_net.as_str()).filter(|_| !adder_clash) {
+            if !carry_ff_slots.insert((site.clone(), *letter)) {
+                return Err(format!(
+                    "place: FF {} collides on {site}.{letter}FF in carry slice",
+                    ff.name
+                ));
+            }
+            match site_ctrl.get(site) {
+                Some(have) if *have != ctrl => {
+                    return Err(format!("place: FF {} needs a different clock/CE/SR than the other FFs of carry slice {site}", ff.name));
+                }
+                _ => {
+                    site_ctrl.insert(site.clone(), ctrl.clone());
+                }
+            }
+            out.ffs.push(PlacedFf {
+                name: ff.name.clone(),
+                tile: tile.clone(),
+                site: site.clone(),
+                bel: format!("{letter}FF"),
+            });
+            continue;
+        }
+        // Find driving LUT, if any, and not yet placed.
+        let lut_idx = lut_by_output.get(ff.d_net.as_str()).copied().filter(|i| !lut_placed.contains(i));
+        let (tile, site, letter) = alloc(&mut used_sites, &mut site_bels, &mut site_tile, &mut site_ctrl, Some(&ctrl), device)?;
         site_bels.get_mut(&site).unwrap().insert(letter);
         if let Some(li) = lut_idx {
             lut_placed.insert(li);
@@ -652,7 +972,26 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         if lut_placed.contains(&li) {
             continue;
         }
-        let (tile, site, letter) = alloc(&mut used_sites, &mut site_bels, &mut site_tile, device)?;
+        // S-driving LUT: same slice and letter as its carry bit, so the
+        // LUT-O-to-S path stays site-internal. Shares the letter with the
+        // bit FF (LUT and FF BELs are distinct); two LUTs on one slot fail.
+        if let Some((tile, site, letter)) = s_slot.get(lut.output_net.as_str()) {
+            if !carry_lut_slots.insert((site.clone(), *letter)) {
+                return Err(format!(
+                    "place: LUT {} collides on {site}.{letter}6LUT in carry slice",
+                    lut.name
+                ));
+            }
+            out.luts.push(PlacedLut {
+                name: lut.name.clone(),
+                init: lut.init,
+                tile: tile.clone(),
+                site: site.clone(),
+                bel: format!("{letter}6LUT"),
+            });
+            continue;
+        }
+        let (tile, site, letter) = alloc(&mut used_sites, &mut site_bels, &mut site_tile, &mut site_ctrl, None, device)?;
         site_bels.get_mut(&site).unwrap().insert(letter);
         out.luts.push(PlacedLut {
             name: lut.name.clone(),
@@ -663,6 +1002,7 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         });
     }
 
+    crate::place_sa::refine(&mut out, device);
     Ok(out)
 }
 
@@ -862,87 +1202,6 @@ fn place_dsps(
     for i in 0..dsps.len() {
         if let Some(pd) = placed_idx.remove(&i) {
             out_dsps.push(pd);
-        }
-    }
-    Ok(())
-}
-
-fn place_carries(
-    carries: &[PackedCarry],
-    device: &dyn DeviceQuery,
-    anchor: (i32, i32),
-    used_sites: &mut HashSet<String>,
-    out_carries: &mut Vec<PlacedCarry>,
-) -> Result<(), String> {
-    if carries.is_empty() {
-        return Ok(());
-    }
-    let mut co3_map: HashMap<&str, usize> = HashMap::new();
-    for (i, c) in carries.iter().enumerate() {
-        if let Some(co3) = &c.co_nets[3] {
-            co3_map.insert(co3.as_str(), i);
-        }
-    }
-    let mut prev_of = vec![None; carries.len()];
-    let mut next_of = vec![None; carries.len()];
-    for (i, c) in carries.iter().enumerate() {
-        if let Some(ci) = &c.ci_net {
-            if let Some(&p) = co3_map.get(ci.as_str()) {
-                prev_of[i] = Some(p);
-                next_of[p] = Some(i);
-            }
-        }
-    }
-
-    let mut placed_idx: HashMap<usize, PlacedCarry> = HashMap::new();
-    for start in 0..carries.len() {
-        if prev_of[start].is_some() || placed_idx.contains_key(&start) {
-            continue;
-        }
-        let mut chain = vec![start];
-        let mut cur = start;
-        while let Some(nxt) = next_of[cur] {
-            if chain.contains(&nxt) {
-                return Err(format!(
-                    "place: cyclic CARRY4 chain involving {}",
-                    carries[nxt].name
-                ));
-            }
-            chain.push(nxt);
-            cur = nxt;
-        }
-        let sites = if chain.len() == 1 {
-            let (t, s) = device
-                .slice_near(anchor.0, anchor.1, used_sites)
-                .ok_or_else(|| format!("place: no SLICE site for CARRY4 {}", carries[start].name))?;
-            vec![(t, s)]
-        } else {
-            device
-                .slice_column(chain.len(), used_sites)
-                .ok_or_else(|| {
-                    format!(
-                        "place: no vertical SLICE column of length {} for CARRY4 chain {}",
-                        chain.len(),
-                        carries[start].name
-                    )
-                })?
-        };
-        for (&ci, (tile, site)) in chain.iter().zip(sites.into_iter()) {
-            used_sites.insert(site.clone());
-            placed_idx.insert(
-                ci,
-                PlacedCarry {
-                    name: carries[ci].name.clone(),
-                    tile,
-                    site,
-                },
-            );
-        }
-    }
-
-    for i in 0..carries.len() {
-        if let Some(pc) = placed_idx.remove(&i) {
-            out_carries.push(pc);
         }
     }
     Ok(())
@@ -1504,6 +1763,27 @@ mod tests {
             }
             None
         }
+        // Same parity rule as the real device: X1 of the same tile after
+        // X0, else X0 of the tile one row higher. Tile name follows site.
+        fn slice_above(&self, site: &str, used: &HashSet<String>) -> Option<(String, String)> {
+            let (x, y) = crate::xdevice::parse_slice_xy(site)?;
+            let (tx, ty) = if x % 2 == 0 { (x + 1, y) } else { (x - 1, y + 1) };
+            if !(0..100).contains(&ty) {
+                return None;
+            }
+            let want = format!("SLICE_X{tx}Y{ty}");
+            if used.contains(&want) {
+                return None;
+            }
+            Some((format!("CLB_X{tx}Y{ty}"), want))
+        }
+        fn anchor_slice(&self, site: &str, used: &HashSet<String>) -> Option<(String, String)> {
+            let (x, y) = crate::xdevice::parse_slice_xy(site)?;
+            if !(0..100).contains(&y) || used.contains(site) {
+                return None;
+            }
+            Some((format!("CLB_X{x}Y{y}"), site.to_string()))
+        }
     }
 
     fn packed_blinky() -> Packed7 {
@@ -1520,7 +1800,7 @@ mod tests {
                 q_net: "q".into(),
                 clk_net: "clk_bufg".into(),
                 ce_net: None,
-                sr_net: None,
+                sr_net: None, init: false, srval: false, sr_async: false,
             }],
             iobs: vec![
                 PackedIob {
@@ -1581,12 +1861,13 @@ mod tests {
         let mut p = Packed7::default();
         p.carries.push(PackedCarry {
             name: "c0".into(),
-            co_nets: [None, None, None, Some("c0_co3".into())],
+            cyinit: Some(false),
+            co_net: Some("c0_co3".into()),
             ..Default::default()
         });
         p.carries.push(PackedCarry {
             name: "c1".into(),
-            ci_net: Some("c0_co3".into()),
+            ci_net: "c0_co3".into(),
             ..Default::default()
         });
         p.dsps.push(PackedDsp {
@@ -1600,9 +1881,195 @@ mod tests {
             ..Default::default()
         });
         let placed = place(&p, &FakeDevice).unwrap();
+        // The second group sits on the slice the first one's COUT cascades
+        // into (the fake column runs X0Y0, X1Y0, X0Y1, ...).
         assert_eq!(placed.carries[0].site, "SLICE_X0Y0");
-        assert_eq!(placed.carries[1].site, "SLICE_X0Y1");
+        assert_eq!(
+            Some(placed.carries[1].site.clone()),
+            FakeDevice.slice_above("SLICE_X0Y0", &HashSet::new()).map(|s| s.1)
+        );
         assert_eq!(placed.dsps[0].site, "DSP48_X0Y0");
         assert_eq!(placed.dsps[1].site, "DSP48_X0Y1");
+    }
+
+    /// The clock inverter is per slice: a falling-edge flop never shares a
+    /// slice with a rising-edge one, and two of the same edge do share.
+    #[test]
+    fn place_keeps_clock_edges_in_separate_slices() {
+        let mut p = packed_blinky();
+        for (i, name) in ["u_ff_n", "u_ff_p"].iter().enumerate() {
+            p.ffs.push(PackedFf {
+                name: (*name).into(),
+                d_net: format!("x{i}"),
+                q_net: format!("y{i}"),
+                clk_net: "clk_bufg".into(),
+                ce_net: None,
+                sr_net: None,
+                init: false,
+                srval: false,
+                sr_async: false,
+            });
+        }
+        p.negedge_ffs.insert("u_ff_n".into());
+        let placed = place(&p, &FakeDevice).unwrap();
+        let site = |n: &str| placed.ffs.iter().find(|f| f.name == n).unwrap().site.clone();
+        assert_ne!(site("u_ff_n"), site("u_ff"));
+        assert_ne!(site("u_ff_n"), site("u_ff_p"));
+        assert_eq!(site("u_ff_p"), site("u_ff"));
+    }
+
+    fn packed_carry(name: &str, ci: &str, co: Option<&str>) -> PackedCarry {
+        PackedCarry {
+            name: name.into(),
+            ci_net: ci.into(),
+            cyinit: None,
+            co_net: co.map(|s| s.into()),
+            s_nets: Default::default(),
+            di_nets: Default::default(),
+            o_nets: Default::default(),
+            ..Default::default()
+        }
+    }
+
+    /// A 3-group chain (listed tail-first to prove ordering is by net
+    /// linkage, not input order) must land on consecutive column slices:
+    /// X0Y0, X1Y0, X0Y1.
+    #[test]
+    fn place_chained_carries_stack_up_the_column() {
+        let mut p = packed_blinky();
+        p.carries = vec![
+            packed_carry("u_c2", "co1", None),
+            packed_carry("u_c0", "one", Some("co0")),
+            packed_carry("u_c1", "co0", Some("co1")),
+        ];
+        let placed = place(&p, &FakeDevice).unwrap();
+        let sites: Vec<&str> = placed.carries.iter().map(|c| c.site.as_str()).collect();
+        assert_eq!(sites, vec!["SLICE_X0Y0", "SLICE_X1Y0", "SLICE_X0Y1"]);
+        let names: Vec<&str> = placed.carries.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["u_c0", "u_c1", "u_c2"]);
+    }
+
+    /// Carry co-placement: each bit FF (D from carry O) and each S-LUT (O
+    /// to carry S) take their bit letter in the carry slice. The head
+    /// CYINIT one-LUT places generically.
+    #[test]
+    fn place_carry_ff_and_slut_share_carry_slice() {
+        let mut p = packed_blinky();
+        p.carries = vec![
+            packed_carry("u_c0", "one", Some("co0")),
+            packed_carry("u_c1", "co0", None),
+        ];
+        // Full group 0 (bits 0-3) + partial group 1 (bits 0-1).
+        for j in 0..4 {
+            p.carries[0].o_nets[j] = Some(format!("o{j}"));
+            p.carries[0].s_nets[j] = Some(format!("s{j}"));
+        }
+        for j in 0..2 {
+            p.carries[1].o_nets[j] = Some(format!("o{}", 4 + j));
+            p.carries[1].s_nets[j] = Some(format!("s{}", 4 + j));
+        }
+        for j in 0..6 {
+            p.ffs.push(PackedFf {
+                name: format!("u_ff{j}"),
+                d_net: format!("o{j}"),
+                q_net: format!("q{j}"),
+                clk_net: "clk_bufg".into(),
+                ce_net: None,
+                sr_net: None, init: false, srval: false, sr_async: false,
+            });
+            p.luts.push(PackedLut {
+                name: format!("u_s{j}"),
+                init: 0xFFFF_FFFF_0000_0000,
+                input_nets: [None, None, None, None, None, Some(format!("q{j}"))],
+                output_net: format!("s{j}"),
+            });
+        }
+        p.luts.push(PackedLut {
+            name: "u_one".into(),
+            init: u64::MAX,
+            input_nets: [None, None, None, None, None, None],
+            output_net: "one".into(),
+        });
+        let placed = place(&p, &FakeDevice).unwrap();
+        let ff = |n: &str| placed.ffs.iter().find(|f| f.name == n).unwrap();
+        let lut = |n: &str| placed.luts.iter().find(|l| l.name == n).unwrap();
+        // Bit j takes BEL letter j in the group slice.
+        assert_eq!((ff("u_ff0").site.as_str(), ff("u_ff0").bel.as_str()), ("SLICE_X0Y0", "AFF"));
+        assert_eq!((ff("u_ff3").site.as_str(), ff("u_ff3").bel.as_str()), ("SLICE_X0Y0", "DFF"));
+        assert_eq!((ff("u_ff4").site.as_str(), ff("u_ff4").bel.as_str()), ("SLICE_X1Y0", "AFF"));
+        assert_eq!((ff("u_ff5").site.as_str(), ff("u_ff5").bel.as_str()), ("SLICE_X1Y0", "BFF"));
+        assert_eq!((lut("u_s0").site.as_str(), lut("u_s0").bel.as_str()), ("SLICE_X0Y0", "A6LUT"));
+        assert_eq!((lut("u_s2").site.as_str(), lut("u_s2").bel.as_str()), ("SLICE_X0Y0", "C6LUT"));
+        assert_eq!((lut("u_s4").site.as_str(), lut("u_s4").bel.as_str()), ("SLICE_X1Y0", "A6LUT"));
+        // Carry-bit FFs stay co-placed in carry slices; the generic
+        // LUT+FF pair opens a fresh slice instead of a carry gap.
+        for f in &placed.ffs {
+            if f.name == "u_ff" {
+                assert_ne!(f.site, "SLICE_X0Y0");
+                assert_ne!(f.site, "SLICE_X1Y0");
+            } else if f.name.starts_with("u_ff") {
+                assert!(f.site == "SLICE_X0Y0" || f.site == "SLICE_X1Y0", "{}", f.site);
+            }
+        }
+        // The generic LUT+FF pair above already proves foreign logic
+        // opens a fresh slice instead of a carry gap (chain tiles hold
+        // chain logic only, as in the oracle).
+    }
+
+    /// A pinned chain-head anchor is honored: the head lands on the pinned
+    /// site and the chain walks up from there. The mechanism is general;
+    /// convergence runs pin golden columns with it.
+    #[test]
+    fn place_carry_anchor_pins_chain_head() {
+        let mut p = packed_blinky();
+        p.carry_anchor = Some("SLICE_X0Y5".into());
+        p.carries = vec![
+            packed_carry("u_c0", "one", Some("co0")),
+            packed_carry("u_c1", "co0", None),
+        ];
+        let placed = place(&p, &FakeDevice).unwrap();
+        let sites: Vec<&str> = placed.carries.iter().map(|c| c.site.as_str()).collect();
+        assert_eq!(sites, vec!["SLICE_X0Y5", "SLICE_X1Y5"]);
+    }
+
+    /// A garbage anchor fails loudly, never silently near.
+    #[test]
+    fn place_carry_bad_anchor_fails_loudly() {
+        let mut p = packed_blinky();
+        p.carry_anchor = Some("NOPE".into());
+        p.carries = vec![packed_carry("u_c0", "one", None)];
+        let err = place(&p, &FakeDevice).unwrap_err();
+        assert!(err.contains("NOPE") && err.contains("anchor"), "got: {err}");
+    }
+
+    /// A carry cycle has no head: fail loudly instead of scattering.
+    #[test]
+    fn place_carry_cycle_fails_loudly() {
+        let mut p = packed_blinky();
+        p.carries = vec![
+            packed_carry("u_c0", "b", Some("a")),
+            packed_carry("u_c1", "a", Some("b")),
+        ];
+        let err = place(&p, &FakeDevice).unwrap_err();
+        assert!(err.contains("chain head"), "got: {err}");
+    }
+
+    /// Fake column rule mirrors the device: X1 of the same tile after X0,
+    /// X0 of the next row after X1; taken neighbor yields None.
+    #[test]
+    fn fake_slice_above_follows_column_rule() {
+        let dev = FakeDevice;
+        let used = HashSet::new();
+        assert_eq!(
+            dev.slice_above("SLICE_X0Y0", &used),
+            Some(("CLB_X1Y0".into(), "SLICE_X1Y0".into()))
+        );
+        assert_eq!(
+            dev.slice_above("SLICE_X1Y0", &used),
+            Some(("CLB_X0Y1".into(), "SLICE_X0Y1".into()))
+        );
+        let mut taken = HashSet::new();
+        taken.insert("SLICE_X1Y0".into());
+        assert_eq!(dev.slice_above("SLICE_X0Y0", &taken), None);
     }
 }

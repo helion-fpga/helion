@@ -31,6 +31,13 @@ members = [
     "crates/helion-rune",
     "crates/helion-verif",
     "crates/helion-svtb",
+    "crates/helion-update",
+    # The front ends as proven on the ZedBoard, frozen (crates/zb/README.md).
+    "crates/zb/helion-ir",
+    "crates/zb/helion-sv",
+    "crates/zb/helion-vhdl",
+    "crates/zb/helion-sim",
+    "crates/zb/helion-zb-front",
 ]
 # Vendored Rune UI framework (its own workspace; see scripts/sync-rune.sh).
 exclude = ["third_party"]
@@ -72,6 +79,8 @@ helion-xilinx7 = { path = "crates/helion-xilinx7" }
 helion-ice40 = { path = "crates/helion-ice40" }
 helion-ecp5 = { path = "crates/helion-ecp5" }
 helion-targets = { path = "crates/helion-targets" }
+helion-update = { path = "crates/helion-update" }
+helion-zb-front = { path = "crates/zb/helion-zb-front" }
 criterion = "0.5"
 rayon = "1.8"
 

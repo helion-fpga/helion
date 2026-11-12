@@ -159,6 +159,11 @@ pub struct BitstreamOptions {
     pub date: String,
     /// Build time for the `.bit` `d` tag (`HH:MM:SS`, UTC).
     pub time: String,
+    /// Write the configuration CRC (Vivado) instead of resetting it with
+    /// `CMD=RCRC` (`xc7frames2bit`). The device checks a written CRC and
+    /// refuses to start on a corrupted transfer; [`icap_crc`] reproduces
+    /// every CRC Vivado wrote in eight reference ZedBoard bitstreams.
+    pub write_crc: bool,
 }
 
 impl Default for BitstreamOptions {
@@ -171,6 +176,7 @@ impl Default for BitstreamOptions {
             design_source: ";Generator=helion-xilinx7".to_string(),
             date,
             time,
+            write_crc: true,
         }
     }
 }
@@ -186,6 +192,7 @@ impl BitstreamOptions {
             design_source: format!("{frm_file};Generator=xc7frames2bit"),
             date: date.to_string(),
             time: time.to_string(),
+            write_crc: false,
         }
     }
 }
@@ -217,6 +224,23 @@ fn utc_now_strings() -> (String, String) {
     )
 }
 
+/// One step of the 7-series configuration CRC: CRC-32C (Castagnoli,
+/// reflected) over the 37-bit `{register address[4:0], data[31:0]}` of
+/// each register write, LSB first. Same as Project X-Ray's `icap_crc`.
+pub fn icap_crc(addr: u32, data: u32, prev: u32) -> u32 {
+    const POLY: u64 = (0x82F6_3B78u64) << 1;
+    let mut val = (u64::from(addr & 0x1F) << 32) | u64::from(data);
+    let mut crc = u64::from(prev);
+    for _ in 0..37 {
+        if (val & 1) != (crc & 1) {
+            crc ^= POLY;
+        }
+        crc >>= 1;
+        val >>= 1;
+    }
+    crc as u32
+}
+
 /// Build the full Series-7 packet stream (preamble + configuration packets)
 /// as 32-bit words, replicating `xc7frames2bit`.
 ///
@@ -227,6 +251,9 @@ pub fn build_packet_stream(
     opts: &BitstreamOptions,
 ) -> Result<Vec<u32>, BitstreamError> {
     let mut w = Vec::with_capacity(payload_words.len() + 600);
+    // Running configuration CRC: every register write folds in, RCRC and
+    // a CRC check reset it (matches the device and Vivado's values).
+    let mut crc: u32 = 0;
 
     // Preamble: UG470 bus-width auto-detect + sync word.
     w.extend_from_slice(&[0xFFFF_FFFF; 8]);
@@ -246,8 +273,25 @@ pub fn build_packet_stream(
     }
     macro_rules! write_reg {
         ($reg:expr, $val:expr) => {
-            w.push(type1_header(Op::Write, $reg, 1)?);
-            w.push($val);
+            let (r, v): (u32, u32) = ($reg, $val);
+            w.push(type1_header(Op::Write, r, 1)?);
+            w.push(v);
+            if r == reg::CMD && v == cmd::RCRC {
+                crc = 0;
+            } else if r != reg::CRC {
+                crc = icap_crc(r, v, crc);
+            }
+        };
+    }
+    macro_rules! check_crc {
+        () => {
+            if opts.write_crc {
+                let v = crc;
+                write_reg!(reg::CRC, v);
+                crc = 0;
+            } else {
+                write_cmd!(cmd::RCRC);
+            }
         };
     }
     macro_rules! write_cmd {
@@ -291,9 +335,12 @@ pub fn build_packet_stream(
     w.push(type1_header(Op::Write, reg::FDRI, 0)?);
     w.push(type2_header(Op::Write, payload_words.len() as u32)?);
     w.extend_from_slice(payload_words);
+    for &v in payload_words {
+        crc = icap_crc(reg::FDRI, v, crc);
+    }
 
     // Finalization sequence.
-    write_cmd!(cmd::RCRC);
+    check_crc!();
     nops!(2);
     write_cmd!(cmd::GRESTORE);
     nop!();
@@ -304,7 +351,7 @@ pub fn build_packet_stream(
     write_reg!(reg::FAR, 0x03BE_0000);
     write_reg!(reg::MASK, 0x501);
     write_reg!(reg::CTL0, 0x501);
-    write_cmd!(cmd::RCRC);
+    check_crc!();
     nops!(2);
     write_cmd!(cmd::DESYNC);
     nops!(400);
@@ -447,7 +494,9 @@ mod tests {
             payload.as_slice()
         );
 
-        // Trailer: RCRC, GRESTORE, LFRM, START, FAR=0x03BE0000, RCRC, DESYNC.
+        // Trailer (Vivado): CRC check, GRESTORE, LFRM, START,
+        // FAR=0x03BE0000, CRC check, DESYNC. The default options write the
+        // CRC (`write_crc`); `xc7frames2bit` options reset it with RCRC.
         let tail = &words[fdri1 + 2 + payload.len()..];
         let cmds: Vec<u32> = tail
             .windows(2)
@@ -456,14 +505,20 @@ mod tests {
             .collect();
         assert_eq!(
             cmds,
-            vec![
-                cmd::RCRC,
-                cmd::GRESTORE,
-                cmd::LFRM,
-                cmd::START,
-                cmd::RCRC,
-                cmd::DESYNC
-            ]
+            vec![cmd::GRESTORE, cmd::LFRM, cmd::START, cmd::DESYNC]
+        );
+        let crc_writes = tail.windows(2).filter(|w| w[0] == 0x3000_0001).count();
+        assert_eq!(crc_writes, 2, "CRC written after FDRI and before DESYNC");
+        let legacy = BitstreamOptions { write_crc: false, ..BitstreamOptions::default() };
+        let legacy_words = build_packet_stream(&payload, &legacy).unwrap();
+        let legacy_cmds: Vec<u32> = legacy_words[fdri1 + 2 + payload.len()..]
+            .windows(2)
+            .filter(|w| w[0] == 0x3000_8001)
+            .map(|w| w[1])
+            .collect();
+        assert_eq!(
+            legacy_cmds,
+            vec![cmd::RCRC, cmd::GRESTORE, cmd::LFRM, cmd::START, cmd::RCRC, cmd::DESYNC]
         );
         // FAR=0x03BE0000 shutdown write is present.
         assert!(tail
@@ -538,5 +593,35 @@ mod tests {
         assert_eq!(d.len(), 10);
         assert_eq!(t.len(), 8);
         assert!(d.starts_with("2026/"));
+    }
+}
+
+#[cfg(test)]
+mod crc_tests {
+    use super::*;
+
+    /// The CRC Vivado writes after the FDRI payload of an all-zero
+    /// xc7z020 image is reproduced by the same running CRC, and a written
+    /// CRC replaces both RCRC commands in the finalization sequence.
+    #[test]
+    fn written_crc_replaces_rcrc_and_tail_crc_is_vivados_constant() {
+        // Vivado writes this CRC after START/FAR/MASK/CTL0 in every one of
+        // eight reference ZedBoard bitstreams (the running CRC restarts
+        // after the post-FDRI check, so it never depends on the design).
+        const VIVADO_TAIL_CRC: u32 = 0xe3ad_7ea5;
+        let payload = vec![0u32; 101 * 3];
+        let opts = BitstreamOptions {
+            idcode: 0x0372_7093,
+            cor0: 0x0200_3fe5,
+            ..BitstreamOptions::default()
+        };
+        let w = build_packet_stream(&payload, &opts).unwrap();
+        let crc_hdr = type1_header(Op::Write, reg::CRC, 1).unwrap();
+        let rcrc_hdr = type1_header(Op::Write, reg::CMD, 1).unwrap();
+        let crcs: Vec<u32> = w.windows(2).filter(|p| p[0] == crc_hdr).map(|p| p[1]).collect();
+        assert_eq!(crcs.len(), 2, "two CRC checks expected");
+        assert_eq!(crcs[1], VIVADO_TAIL_CRC);
+        let rcrcs = w.windows(2).filter(|p| p[0] == rcrc_hdr && p[1] == cmd::RCRC).count();
+        assert_eq!(rcrcs, 1, "only the leading RCRC remains");
     }
 }
