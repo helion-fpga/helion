@@ -80,6 +80,9 @@ fn real(s: &mut AppState) {
     s.console
         .lines
         .retain(|l| !l.text.contains(tmp.trim_end_matches('/')));
+    // Toasts would cover the pane being shown; the run's outcome stays in
+    // the console and status bar.
+    s.toasts = crate::state::ToastState::default();
 }
 
 /// The scene list `app_spec` uses: the test catalog, plus these when
