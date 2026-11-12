@@ -488,7 +488,11 @@ pub fn place_with_guide(
     opts: PlaceOpts,
     guide: &TimingGuide,
 ) -> Result<Placed, String> {
-    let iob_all: Vec<Site> = dev.iob_sites().collect();
+    // Bottom row first (as ever), then the pads on the other three sides.
+    // Input pads are assigned at routing and need their share of those.
+    let mut iob_all: Vec<Site> = dev.iob_sites_all();
+    let extra = iob_all.len() - dev.iob_sites().count();
+    iob_all.truncate(iob_all.len() - packed.conn.inputs.len().min(extra));
     let iob_take = packed.iobs.len().min(iob_all.len());
     if packed.iobs.len() > iob_all.len() {
         eprintln!(
@@ -3593,7 +3597,8 @@ mod tests {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let mut p = pack(&Design::structural_blinky(), &dev).unwrap();
         let proto = p.iobs[0].clone();
-        let n_dev = dev.iob_sites().count();
+        // Every pad of the part, on all four sides.
+        let n_dev = dev.iob_sites_all().len();
         while p.iobs.len() < n_dev + 8 {
             let mut io = proto.clone();
             io.cell = format!("u_iob{}", p.iobs.len());

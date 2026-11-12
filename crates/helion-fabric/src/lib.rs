@@ -297,7 +297,7 @@ impl Fabric {
             );
         }
         let mut iobs = BTreeMap::new();
-        for s in dev.iob_sites() {
+        for s in dev.iob_sites_all() {
             iobs.insert((s.x, s.y), false);
         }
         Self {
@@ -357,7 +357,7 @@ impl Fabric {
             })
             .collect();
         for ((block, major, minor), word) in &self.frames {
-            if *block == Far::IOB && *minor == 0 && (word & 1) == 1 && (word >> tracks::IOB_TRACK_OUT) & 1 == 0 && (word >> tracks::IOB_INPUT) & 1 == 0 {
+            if *block == Far::IOB && (*major as u32) < self.interior_cols && *minor == 0 && (word & 1) == 1 && (word >> tracks::IOB_TRACK_OUT) & 1 == 0 && (word >> tracks::IOB_INPUT) & 1 == 0 {
                 let ble = ((*word >> 1) & 7) as u8;
                 let cy = ((*word >> 4) & 0xfff) as u32;
                 let dx = *major as u32;
@@ -489,11 +489,48 @@ impl Fabric {
         (0..tracks::SB_SEL_BITS).fold(0, |s, b| s | ((self.clb_abs_bit(x, y, tracks::sb_abs(dir, track, b)) as u32) << b))
     }
 
-    fn iob_word(&self, x: u32, y: u32) -> u128 {
-        if y != self.clb_y0.saturating_sub(1) || x < self.clb_x0 || x - self.clb_x0 >= self.interior_cols {
-            return 0;
+    /// Configuration column of a pad (same numbering as `Device::iob_major`).
+    fn iob_major(&self, x: u32, y: u32) -> Option<u16> {
+        let (cols, rows) = (self.interior_cols, self.interior_rows);
+        let in_cols = x >= self.clb_x0 && x - self.clb_x0 < cols;
+        let in_rows = y >= self.clb_y0 && y - self.clb_y0 < rows;
+        if in_cols && y + 1 == self.clb_y0 {
+            Some((x - self.clb_x0) as u16)
+        } else if in_cols && y == self.clb_y0 + rows {
+            Some((cols + x - self.clb_x0) as u16)
+        } else if in_rows && x + 1 == self.clb_x0 {
+            Some((2 * cols + y - self.clb_y0) as u16)
+        } else if in_rows && x == self.clb_x0 + cols {
+            Some((2 * cols + rows + y - self.clb_y0) as u16)
+        } else {
+            None
         }
-        self.frames.get(&(Far::IOB, (x - self.clb_x0) as u16, 0)).copied().unwrap_or(0)
+    }
+
+    /// The CLB beside a pad and the direction from the pad into the fabric.
+    fn iob_inward(&self, x: u32, y: u32) -> Option<((u32, u32), u32)> {
+        self.iob_major(x, y)?;
+        Some(if y + 1 == self.clb_y0 {
+            ((x, y + 1), tracks::N)
+        } else if y == self.clb_y0 + self.interior_rows {
+            ((x, y - 1), tracks::S)
+        } else if x + 1 == self.clb_x0 {
+            ((x + 1, y), tracks::E)
+        } else {
+            ((x - 1, y), tracks::W)
+        })
+    }
+
+    /// Every pad position.
+    fn pad_sites(&self) -> Vec<(u32, u32)> {
+        self.iobs.keys().copied().collect()
+    }
+
+    fn iob_word(&self, x: u32, y: u32) -> u128 {
+        match self.iob_major(x, y) {
+            Some(major) => self.frames.get(&(Far::IOB, major, 0)).copied().unwrap_or(0),
+            None => 0,
+        }
     }
 
     /// What drives the wire leaving `(x, y)` towards `dir` on `track`:
@@ -503,9 +540,10 @@ impl Fabric {
         // A configured route is a tree; the bound only stops a bad loop.
         for _ in 0..(4 * tracks::TRACKS * (self.interior_cols + 2) * (self.interior_rows + 2)) {
             if self.clb_major(x, y).is_none() {
-                // The pad row: an input pad drives its north-going wires.
+                // A pad tile: an input pad drives its wires into the fabric.
                 let w = self.iob_word(x, y);
-                return if dir == tracks::N && w & 1 == 1 && (w >> tracks::IOB_INPUT) & 1 == 1 { WireSrc::Pad(x, y) } else { WireSrc::Zero };
+                let inward = self.iob_inward(x, y).map(|i| i.1);
+                return if inward == Some(dir) && w & 1 == 1 && (w >> tracks::IOB_INPUT) & 1 == 1 { WireSrc::Pad(x, y) } else { WireSrc::Zero };
             }
             let sel = self.sb_sel(x, y, dir, track);
             if sel == tracks::SB_OFF {
@@ -950,12 +988,11 @@ impl Fabric {
         self.clb_rst.clear();
         self.implicit_falling = false;
         let line_mask = (1u32 << clocks::LINE_BITS) - 1;
-        let iy = self.clb_y0.saturating_sub(1);
-        for dx in 0..self.interior_cols {
-            let w = self.iob_word(self.clb_x0 + dx, iy);
+        for (px, py) in self.pad_sites() {
+            let w = self.iob_word(px, py);
             if w & 1 == 1 && (w >> tracks::IOB_INPUT) & 1 == 1 && (w >> clocks::IOB_CLOCK) & 1 == 1 {
                 let line = ((w >> clocks::IOB_CLOCK_LINE) as u32 & line_mask) as usize;
-                self.clk_src[line] = Some(ClkSrc::Pad(self.clb_x0 + dx, iy));
+                self.clk_src[line] = Some(ClkSrc::Pad(px, py));
             }
         }
         for &(x, y) in &self.used.clone() {
@@ -991,14 +1028,13 @@ impl Fabric {
             }
             return;
         }
-        // Pads reading a track: the south-going wire of the CLB above.
-        let iy = self.clb_y0.saturating_sub(1);
-        for dx in 0..self.interior_cols {
-            let ix = self.clb_x0 + dx;
+        // Pads reading a track: the wire the CLB beside them sends their way.
+        for (ix, iy) in self.pad_sites() {
             let w = self.iob_word(ix, iy);
             if w & 1 == 1 && (w >> tracks::IOB_TRACK_OUT) & 1 == 1 {
+                let Some(((ax, ay), inward)) = self.iob_inward(ix, iy) else { continue };
                 let t = ((w >> tracks::IOB_TRACK_SHIFT) & ((1u128 << tracks::IOB_TRACK_BITS) - 1)) as u32;
-                let v = self.wire_val(ix, iy + 1, tracks::S, t);
+                let v = self.wire_val(ax, ay, tracks::opposite(inward), t);
                 self.iobs.insert((ix, iy), v);
             }
         }
