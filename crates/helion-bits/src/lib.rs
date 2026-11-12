@@ -180,6 +180,8 @@ fn program_clb_frames(
     // With the full connection list, a LUT input nothing drives must not
     // matter: the table is made independent of it (the IR reads it as 0).
     let full = routed.tracks.active;
+    use helion_device::clocks as ck;
+    let mut clb_line: std::collections::HashMap<(u32, u32), u8> = std::collections::HashMap::new();
     for (i, lutff) in packed.lutffs.iter().enumerate() {
         let mut norm;
         let lutff = if full {
@@ -210,6 +212,54 @@ fn program_clb_frames(
         }
         if !lutff.ff_cell.is_empty() {
             or_clb_bit(frames, major, feat.ff_used_abs[bi], fb);
+            // Clock line of the block, and the edge of this flop.
+            if let Some(Some((line, falling))) = packed.conn.ff_clock.get(i) {
+                match clb_line.insert((site.x, site.y), *line) {
+                    Some(other) if other != *line => {
+                        return Err(format!(
+                            "bitgen: CLB_X{}Y{} holds flops of clock lines {other} and {line}; a block has one clock",
+                            site.x, site.y
+                        ))
+                    }
+                    _ => {}
+                }
+                for b in 0..ck::LINE_BITS {
+                    if (*line >> b) & 1 == 1 {
+                        or_clb_bit(frames, major, ck::ABS_CLKSEL + b, fb);
+                    }
+                }
+                if *falling {
+                    // FF.CLKINV sits four bits after FF.USED.
+                    or_clb_bit(frames, major, feat.ff_used_abs[bi] + 4, fb);
+                }
+            }
+        }
+    }
+    // Clocks made by logic: the block of the source drives the line.
+    let mut drivers: std::collections::HashMap<(u32, u32), u8> = std::collections::HashMap::new();
+    for dom in &packed.conn.clocks {
+        let helion_pack::ClockSrc::Gen(src) = dom.src else { continue };
+        let idx = match src {
+            helion_pack::NetSrc::BleQ(i) | helion_pack::NetSrc::BleO(i) => i as usize,
+            helion_pack::NetSrc::Input(_) => continue,
+        };
+        let Some(&(site, ble)) = routed.placed.lutff_sites.get(idx) else {
+            return Err(format!("bitgen: the source of clock {} is not placed", dom.net));
+        };
+        if drivers.insert((site.x, site.y), dom.line).is_some() {
+            return Err(format!("bitgen: CLB_X{}Y{} would drive two clock lines; a block drives one", site.x, site.y));
+        }
+        let major = dev.clb_major(site.x, site.y).ok_or_else(|| format!("not a CLB site CLB_X{}Y{}", site.x, site.y))?;
+        or_clb_bit(frames, major, ck::ABS_GDRV_EN, fb);
+        for b in 0..ck::LINE_BITS {
+            if (dom.line >> b) & 1 == 1 {
+                or_clb_bit(frames, major, ck::ABS_GDRV_LINE + b, fb);
+            }
+        }
+        for b in 0..3 {
+            if (ble >> b) & 1 == 1 {
+                or_clb_bit(frames, major, ck::ABS_GDRV_BLE + b, fb);
+            }
         }
     }
     for m in &routed.imux {
@@ -333,7 +383,11 @@ pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
         let major = dev
             .iob_major(i.x, i.y)
             .ok_or_else(|| format!("IOB_X{}Y{} has no major", i.x, i.y))?;
-        acc.insert((Far::IOB, major, 0), 1u128 | (1u128 << tk::IOB_INPUT));
+        let mut word = 1u128 | (1u128 << tk::IOB_INPUT);
+        if let Some(line) = packed.conn.inputs.get(i.input as usize).and_then(|p| p.clock) {
+            word |= (1u128 << helion_device::clocks::IOB_CLOCK) | ((line as u128) << helion_device::clocks::IOB_CLOCK_LINE);
+        }
+        acc.insert((Far::IOB, major, 0), word);
     }
     for (i, _m) in packed.macs.iter().enumerate() {
         let site = routed.placed.mac_sites[i];

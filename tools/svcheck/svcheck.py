@@ -166,11 +166,15 @@ def build(nl: Netlist, widths: dict[str, int]):
             if q is None:
                 continue
             ck = pin("CLK") or pin("C")
-            root = clock_root(ck)
-            if root is None:
-                problems.append(f"flop {cell}: clock net {ck} does not come from an input port")
+            if ck is None:
+                problems.append(f"flop {cell} has no clock")
                 continue
-            clocks.add(root)
+            # A clock straight from a pin is toggled by the bench; a clock
+            # made by logic is whatever the netlist computes.
+            root = clock_root(ck)
+            if root is not None:
+                clocks.add(root)
+            edge = "negedge" if nl.attrs.get(cell, {}).get("CLK_INV") == "1" else "posedge"
             known = {"D", "Q", "CLK", "C", "CE", "SR", "RST", "R", "S"}
             extra = [p for (c, p) in nl.pin_net if c == cell and p not in known]
             if extra:
@@ -184,7 +188,7 @@ def build(nl: Netlist, widths: dict[str, int]):
                 stmt = f"if ({ref(rst)}) {vid(q)} <= 1'b0; else {stmt}"
             if pin("S"):
                 stmt = f"if ({ref(pin('S'))}) {vid(q)} <= 1'b1; else {stmt}"
-            logic.append(f"always @(posedge in_{root}[0]) {stmt}")
+            logic.append(f"always @({edge} {ref(ck)}) {stmt}")
         elif kind == "IobOut":
             i, pad = pin("I"), pin("PAD")
             if i and pad and i != pad and pad not in out_ports:

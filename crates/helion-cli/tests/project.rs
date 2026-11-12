@@ -452,7 +452,7 @@ fn project_checkpoint_read_and_eco_from_hckp_changes_hash() {
             "eco",
             hckp.to_str().unwrap(),
             "--cell",
-            "u_lut0",
+            "cnt_0_d_lut",
             "--init",
             "0xAAAAAAAAAAAAAAAA",
             "-o",

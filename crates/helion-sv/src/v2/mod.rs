@@ -45,6 +45,17 @@ fn run(sources: &[(String, String)], top: Option<&str>, defines: &[(String, Stri
     let src = parse::parse(&text).map_err(fix)?;
     let (flat, mut warnings) = elab::Elab::new(src).and_then(|e| e.elaborate(top)).map_err(fix)?;
     let (mut design, st, undriven) = lower::lower(&flat)?;
+    // A module whose outputs are all left undriven has no logic: that is
+    // a mistake in the source, not a design to build.
+    let out_bits: Vec<String> = flat
+        .ports
+        .iter()
+        .filter(|p| p.dir == helion_ir::PortDir::Out)
+        .flat_map(|p| (0..p.w).map(move |i| lower::bit_name(&p.name, p.w, i)))
+        .collect();
+    if !out_bits.is_empty() && out_bits.iter().all(|b| undriven.contains(b)) {
+        return Err(format!("module '{}' drives none of its outputs: there is no logic to build", flat.top));
+    }
     for w in warnings.iter_mut() {
         *w = fix(std::mem::take(w));
     }

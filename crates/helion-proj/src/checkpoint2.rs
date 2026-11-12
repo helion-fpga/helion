@@ -35,7 +35,7 @@ use super::{ImplStrategy, Mode, PrjPblock, Session};
 use helion_bits::Bitstream;
 use helion_device::{Device, Site, SiteKind};
 use helion_ir::Design;
-use helion_pack::{Connectivity, NetSrc, Packed, PackedBram, PackedInput, PackedIob, PackedLutFf, PackedMac, PinConn};
+use helion_pack::{ClockDom, ClockSrc, Connectivity, NetSrc, Packed, PackedBram, PackedInput, PackedIob, PackedLutFf, PackedMac, PinConn};
 use helion_place::Placed;
 use helion_route::{ImuxRoute, IobInput, IobRoute, IobTrack, Routed, SbRoute, TrackRoutes};
 use helion_sta::Constraints;
@@ -546,6 +546,37 @@ fn enc_conn(w: &mut Writer, c: &Connectivity) {
     for u in &c.undriven {
         w.str(u);
     }
+    // Clocking (added later: older checkpoints end before this).
+    for i in &c.inputs {
+        w.u8(i.clock.unwrap_or(255));
+    }
+    w.u32(c.clocks.len() as u32);
+    for d in &c.clocks {
+        w.str(&d.net);
+        w.u8(d.line);
+        match d.src {
+            ClockSrc::Implicit => w.u8(0),
+            ClockSrc::Pin(i) => {
+                w.u8(1);
+                w.u32(i);
+            }
+            ClockSrc::Gen(s) => {
+                w.u8(2);
+                enc_src(w, s);
+            }
+        }
+    }
+    w.u32(c.ff_clock.len() as u32);
+    for f in &c.ff_clock {
+        w.u8(match f {
+            None => 255,
+            Some((line, falling)) => *line | ((*falling as u8) << 7),
+        });
+    }
+    w.u32(c.clock_problems.len() as u32);
+    for p in &c.clock_problems {
+        w.str(p);
+    }
 }
 
 fn dec_conn(r: &mut Reader) -> Result<Connectivity, String> {
@@ -557,7 +588,7 @@ fn dec_conn(r: &mut Reader) -> Result<Connectivity, String> {
         c.pins.push(PinConn { lutff: r.u32()?, pin: r.u8()?, src: dec_src(r)? });
     }
     for _ in 0..r.u32()? {
-        c.inputs.push(PackedInput { net: r.str()?, port: r.str()?, loc: r.opt_str()? });
+        c.inputs.push(PackedInput { net: r.str()?, port: r.str()?, loc: r.opt_str()?, clock: None });
     }
     for _ in 0..r.u32()? {
         let cell = r.str()?;
@@ -565,6 +596,31 @@ fn dec_conn(r: &mut Reader) -> Result<Connectivity, String> {
     }
     for _ in 0..r.u32()? {
         c.undriven.push(r.str()?);
+    }
+    if r.pos >= r.buf.len() {
+        return Ok(c);
+    }
+    for i in c.inputs.iter_mut() {
+        let v = r.u8()?;
+        i.clock = (v != 255).then_some(v);
+    }
+    for _ in 0..r.u32()? {
+        let net = r.str()?;
+        let line = r.u8()?;
+        let src = match r.u8()? {
+            0 => ClockSrc::Implicit,
+            1 => ClockSrc::Pin(r.u32()?),
+            2 => ClockSrc::Gen(dec_src(r)?),
+            k => return Err(format!("checkpoint: bad clock source kind {k}")),
+        };
+        c.clocks.push(ClockDom { net, line, src });
+    }
+    for _ in 0..r.u32()? {
+        let v = r.u8()?;
+        c.ff_clock.push((v != 255).then_some((v & 0x7f, v & 0x80 != 0)));
+    }
+    for _ in 0..r.u32()? {
+        c.clock_problems.push(r.str()?);
     }
     Ok(c)
 }

@@ -174,5 +174,6 @@ fn version_and_doctor() {
     );
     let hs = String::from_utf8_lossy(&hnf.stdout);
     assert!(hs.contains("HNF 1"), "{hs}");
-    assert!(hs.contains("cell u_lut"), "{hs}");
+    // The netlist has LUT and flop cells (their names are the front end's business).
+    assert!(hs.contains(" Lut6 ") && hs.contains(" Hff"), "{hs}");
 }
