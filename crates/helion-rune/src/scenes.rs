@@ -166,7 +166,10 @@ pub const ALL: &[SceneExpect] = &[
     SceneExpect {
         name: "editor-large",
         surface: "editor",
-        keys: &["editor-scroll", "editor-row-0", "editor-gutter-0", "editor-outline"],
+        // Rows are as wide as the widest line and scroll sideways inside
+        // editor-scroll, so only the (sticky) gutter is checked in-shell;
+        // the rows themselves are covered by editor_scale's tests.
+        keys: &["editor-scroll", "editor-gutter-0", "editor-outline"],
         absent: &["editor-field", "summary"],
     },
     SceneExpect {
