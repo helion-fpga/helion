@@ -54,13 +54,28 @@
       <nav class="doc-nav" aria-label="On this page">
         <p>On this page</p>
         <ul>
-          <li><a href="#results">Results</a></li>
+          <li><a href="#synthesis">Synthesis vs Yosys (v3.0.0)</a></li>
+          <li><a href="#results">Full flow (v2.0.5)</a></li>
           <li><a href="#caveats">How to read these numbers</a></li>
           <li><a href="#campaigns">Measured improvements</a></li>
         </ul>
       </nav>
       <article class="prose">
-        <h2 id="results">Results</h2>
+        <h2 id="synthesis">Synthesis against Yosys 0.33 (v3.0.0)</h2>
+        <p>Helion v3.0.0 vs Yosys 0.33, synthesis only, generic 6-LUT mapping, measured 2026-10-14 with GNU time (3 runs, median). Same RTL, same target, same stage. Every number below is measured, and the caveats are printed next to the numbers.</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Design</th><th class="num">Helion time</th><th class="num">Yosys time</th><th class="num">Speedup</th><th class="num">Helion mem</th><th class="num">Yosys mem</th><th class="num">Helion LUTs</th><th class="num">Yosys LUTs</th></tr></thead>
+          <tbody>
+            <tr><td>PicoRV32</td><td class="num">1.02 s</td><td class="num">9.12 s</td><td class="num"><strong>8.9x</strong></td><td class="num">31 MB</td><td class="num">63 MB</td><td class="num">1,697</td><td class="num">1,932</td></tr>
+            <tr><td>SERV</td><td class="num">0.06 s</td><td class="num">2.73 s</td><td class="num"><strong>45x</strong></td><td class="num">16 MB</td><td class="num">37 MB</td><td class="num">323</td><td class="num">217</td></tr>
+            <tr><td>Ibex</td><td class="num">0.01 s</td><td class="num">0.60 s</td><td class="num"><strong>60x</strong></td><td class="num">7 MB</td><td class="num">37 MB</td><td class="num">1,112</td><td class="num">1,110</td></tr>
+          </tbody>
+        </table></div>
+        <p>Method: <code>/usr/bin/time -v</code>, 3 runs each, median. Helion: <code>helion synth &lt;design&gt;.v</code> (commit 072b2ce). Yosys: <code>yosys -p "read_verilog &lt;d&gt;.v; synth -top &lt;top&gt;; abc -lut 6; stat"</code>. Full report: <a href="https://github.com/helion-fpga/helion/blob/master/docs/benchmarks/benchmark-report-2026-10-14.md">benchmark-report-2026-10-14.md</a>.</p>
+        <p><strong>Honesty check:</strong> on SERV, Yosys produces 33% fewer LUTs than Helion; that QoR gap is the next optimization target. On PicoRV32 Helion uses 12% fewer LUTs. Speed and memory wins are consistent; area is mixed.</p>
+        <p><img src="screenshots/benchmark-v3.png" alt="Helion v3.0.0 vs Yosys 0.33: synthesis time, peak memory, and LUT counts across PicoRV32, SERV, and Ibex" style="max-width:100%;height:auto;border-radius:8px"></p>
+
+        <h2 id="results">Full flow against Yosys and nextpnr (v2.0.5)</h2>
         <p>Ten real designs with identical RTL: Helion 2.0.5 against Yosys 0.69 with nextpnr-ecp5, measured on 2026-10-10 on Linux x86_64. Helion targeted its HL10T die (8,192 LUT6); the baseline targeted a Lattice LFE5U-25F (24k LUT4) at 100 MHz. Every number below is measured; the caveats follow the table.</p>
         <div class="table-wrap"><table>
           <thead><tr><th>Design</th><th class="num">Helion LUT6</th><th class="num">Helion WNS (ps)</th><th class="num">Helion wall</th><th class="num">Baseline LUT4</th><th class="num">Baseline wall</th><th>Result</th></tr></thead>
