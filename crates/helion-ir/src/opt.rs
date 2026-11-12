@@ -120,7 +120,7 @@ impl Design {
 
     /// `port` or `port_<bit>` of a top-level output: the per-bit names that
     /// constraints, checks and hierarchy stitching refer to.
-    fn is_output_port_bit_net(&self, net_name: &str) -> bool {
+    pub(crate) fn is_output_port_bit_net(&self, net_name: &str) -> bool {
         self.ports.iter().any(|p| {
             let digits = |r: &str| !r.is_empty() && r.chars().all(|c| c.is_ascii_digit());
             matches!(p.dir, PortDir::Out | PortDir::Inout)

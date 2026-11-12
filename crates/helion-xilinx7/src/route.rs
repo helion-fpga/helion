@@ -29,6 +29,13 @@ pub struct RouteOpts {
     /// Congestion negotiation: wires held by other nets are legal at a
     /// cost; the caller rips up the nets the path displaces.
     pub negotiate: bool,
+    /// Keep the search within this many tiles of the box spanned by the
+    /// source and the sinks (0: whole device). A search that cannot succeed
+    /// then fails after a small region instead of the whole device.
+    pub bbox: i32,
+    /// Give up rather than accept a path much longer than the direct one
+    /// (the caller then negotiates for a better one).
+    pub cap_detour: bool,
 }
 
 /// What the router needs from the device model.
@@ -55,7 +62,7 @@ pub trait RouteQuery {
         Vec::new()
     }
     /// Claims were removed from the claim map: drop any derived index.
-    fn release_claims(&self) {}
+    fn release_claims(&self, _nets: &[String], _claimed_len: usize) {}
     /// Returns the pips and, per pip, the arrival delay (ps) at its source
     /// and destination wires; `_tree` holds this net's wires with their
     /// known arrival delays.
@@ -344,33 +351,43 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
             continue; // undriven net: nothing to route
         }
         let mut delays: Vec<(String, String, u32)> = Vec::new();
-        let kind = match route_net(&net, drivers[0], &loads, device, &claimed, &mut delays, false) {
-            Ok(k) => k,
-            Err(e) if e.contains("unroutable") => {
-                delays.clear();
-                let k = route_net(&net, drivers[0], &loads, device, &claimed, &mut delays, true).map_err(|_| e.clone())?;
-                let victims = match &k {
-                    RouteKind::Pips(p) => device.contested(&net, p),
-                    _ => Vec::new(),
-                };
-                if victims.is_empty() {
-                    return Err(e);
+        // Local strict search first; then let the net displace others
+        // locally; only then search the whole device.
+        let mut kind = None;
+        let mut first_err = None;
+        for (negotiate, bbox, cap) in [(false, 8, true), (true, 8, false), (true, 0, false)] {
+            delays.clear();
+            match route_net(&net, drivers[0], &loads, device, &claimed, &mut delays, negotiate, bbox, cap) {
+                Ok(k) => {
+                    let victims = match (&k, negotiate) {
+                        (RouteKind::Pips(p), true) => device.contested(&net, p),
+                        _ => Vec::new(),
+                    };
+                    if !victims.is_empty() {
+                        rips += victims.len();
+                        if rips > max_rips {
+                            return Err(format!("route: congestion around net `{net}` not resolved after {rips} rip-ups"));
+                        }
+                        let vset: HashSet<&str> = victims.iter().map(|v| v.as_str()).collect();
+                        nets.retain(|n: &RoutedNet7| !vset.contains(n.net.as_str()));
+                        claimed.retain(|_, o| !vset.contains(o.as_str()));
+                        load_delays.retain(|k, _| !vset.contains(k.0.as_str()));
+                        device.release_claims(&victims, claimed.len());
+                        for v in &victims {
+                            queue.push_back(v.clone());
+                        }
+                    }
+                    kind = Some(k);
+                    break;
                 }
-                rips += victims.len();
-                if rips > max_rips {
-                    return Err(format!("{e}; congestion not resolved after {rips} rip-ups"));
+                Err(e) if e.contains("unroutable") => {
+                    first_err.get_or_insert(e);
                 }
-                let vset: HashSet<&str> = victims.iter().map(|v| v.as_str()).collect();
-                nets.retain(|n: &RoutedNet7| !vset.contains(n.net.as_str()));
-                claimed.retain(|_, o| !vset.contains(o.as_str()));
-                load_delays.retain(|k, _| !vset.contains(k.0.as_str()));
-                device.release_claims();
-                for v in &victims {
-                    queue.push_back(v.clone());
-                }
-                k
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
+        }
+        let Some(kind) = kind else {
+            return Err(first_err.unwrap_or_else(|| format!("route: net `{net}` unroutable")));
         };
         if device.is_clock_net(&net) && matches!(kind, RouteKind::Pips(_)) {
             graph_clocks = true;
@@ -481,6 +498,8 @@ fn route_net(
     claimed: &HashMap<(String, String), String>,
     delays: &mut Vec<(String, String, u32)>,
     negotiate: bool,
+    bbox: i32,
+    cap_detour: bool,
 ) -> Result<RouteKind, String> {
     // Split loads into site-internal (same site as driver and not a
     // LUT input) and external. Slice LUT inputs (A1-A6 and friends)
@@ -560,7 +579,7 @@ fn route_net(
             ));
         }
         let allow_byp = is_bypass_pin(&load.pin);
-        let opts = RouteOpts { allow_power, allow_byp, no_int: false, clock: false, any_pip: false, negotiate };
+        let opts = RouteOpts { allow_power, allow_byp, no_int: false, clock: false, any_pip: false, negotiate, bbox, cap_detour };
         // A BUFG input takes the dedicated clock path (clock-capable pad ->
         // CMT/HROW -> BUFG) when one exists, else general interconnect.
         let mut fast = None;

@@ -224,8 +224,8 @@ impl<'a> XDevice<'a> {
         };
         // Extra cost of taking `id`: congestion history, plus the price of
         // displacing another net when negotiating.
-        const PRESENT_PS: u32 = 4000;
-        const HISTORY_PS: u32 = 250;
+        const PRESENT_PS: u32 = 1500;
+        const HISTORY_PS: u32 = 300;
         let hist = self.history.borrow();
         let extra = |id: u32| -> u32 {
             let mut c = hist.get(id as usize).copied().unwrap_or(0) as u32 * HISTORY_PS;
@@ -239,6 +239,27 @@ impl<'a> XDevice<'a> {
         };
         let is_target = |id: u32| targets.contains(&id);
         let tgt_xy: Vec<(i32, i32)> = targets.iter().map(|&t| self.wire_xy(t)).collect();
+        // Search region.
+        let region = (opts.bbox > 0).then(|| {
+            let (sx, sy) = self.wire_xy(start);
+            let (mut x0, mut x1, mut y0, mut y1) = (sx, sx, sy, sy);
+            for &(x, y) in &tgt_xy {
+                x0 = x0.min(x);
+                x1 = x1.max(x);
+                y0 = y0.min(y);
+                y1 = y1.max(y);
+            }
+            (x0 - opts.bbox, x1 + opts.bbox, y0 - opts.bbox, y1 + opts.bbox)
+        });
+        let inside = |id: u32| -> bool {
+            match region {
+                None => true,
+                Some((x0, x1, y0, y1)) => {
+                    let (x, y) = self.wire_xy(id);
+                    x >= x0 && x <= x1 && y >= y0 && y <= y1
+                }
+            }
+        };
         const PIP_BASE: u32 = 15;
         let h = |id: u32| -> u32 {
             let (x, y) = self.wire_xy(id);
@@ -289,7 +310,14 @@ impl<'a> XDevice<'a> {
         }
         let mut found = None;
         let mut expanded = 0usize;
-        while let Some(Reverse((_, g, id))) = heap.pop() {
+        let limit = match (opts.cap_detour, heap.peek()) {
+            (true, Some(Reverse((f0, _, _)))) => f0.saturating_mul(2).saturating_add(1500),
+            _ => u32::MAX,
+        };
+        while let Some(Reverse((f, g, id))) = heap.pop() {
+            if f > limit {
+                break;
+            }
             if g > sb.best[id as usize] {
                 continue;
             }
@@ -306,7 +334,7 @@ impl<'a> XDevice<'a> {
             if nid != u32::MAX {
                 if let Some(members) = self.node_members.get(&nid) {
                     for &m in members {
-                        if m == id || !allowed(m) {
+                        if m == id || !allowed(m) || !inside(m) {
                             continue;
                         }
                         // Tree wires (seeds) are fixed: a cheaper second
@@ -332,7 +360,7 @@ impl<'a> XDevice<'a> {
                     continue;
                 }
                 let dst = base + pip.dst;
-                if !allowed(dst) {
+                if !allowed(dst) || !inside(dst) {
                     continue;
                 }
                 let ng = g + pip.delay_ps as u32 + PIP_BASE + extra(dst);
@@ -354,11 +382,20 @@ impl<'a> XDevice<'a> {
             }
             return Some(None);
         };
-        let mut pips = Vec::new();
-        let mut arr = Vec::new();
+        // Walk back to the seed, then forward again adding up real delay
+        // (search cost also carries congestion penalties).
+        let mut chain = vec![end];
         let mut cur = end;
         while sb.parent[cur as usize] != u32::MAX {
-            let prev = sb.parent[cur as usize];
+            cur = sb.parent[cur as usize];
+            chain.push(cur);
+        }
+        chain.reverse();
+        let mut delay = sb.best[chain[0] as usize];
+        let mut pips = Vec::new();
+        let mut arr = Vec::new();
+        for pair in chain.windows(2) {
+            let (prev, cur) = (pair[0], pair[1]);
             let (pt, pw) = self.wire_to_tile[prev as usize];
             let (ct, cw) = self.wire_to_tile[cur as usize];
             if pt == ct {
@@ -371,16 +408,14 @@ impl<'a> XDevice<'a> {
                         src_wire: wires.get(pw as usize)?.clone(),
                         is_pseudo: pip.is_pseudo,
                     });
-                    arr.push((sb.best[prev as usize], sb.best[cur as usize]));
+                    let next = delay + pip.delay_ps as u32 + PIP_BASE;
+                    arr.push((delay, next));
+                    delay = next;
                 }
             }
-            cur = prev;
         }
-        pips.reverse();
-        arr.reverse();
         if pips.is_empty() {
-            let d = sb.best[end as usize];
-            return Some(Some((pips, vec![(d, d)])));
+            return Some(Some((pips, vec![(delay, delay)])));
         }
         Some(Some((pips, arr)))
     }
@@ -684,8 +719,20 @@ impl<'a> RouteQuery for XDevice<'a> {
         own.1.iter().filter(|(_, v)| oids.contains(v)).map(|(k, _)| k.clone()).collect()
     }
 
-    fn release_claims(&self) {
-        self.claim_cache.borrow_mut().0 = usize::MAX;
+    fn release_claims(&self, nets: &[String], claimed_len: usize) {
+        let mut cache = self.claim_cache.borrow_mut();
+        if cache.0 == usize::MAX {
+            return;
+        }
+        let mut own = self.owner.borrow_mut();
+        let oids: Vec<u32> = nets.iter().filter_map(|n| own.1.get(n).copied()).collect();
+        for slot in own.0.iter_mut() {
+            if *slot != 0 && oids.contains(slot) {
+                *slot = 0;
+            }
+        }
+        cache.1.retain(|_, n| !nets.contains(n));
+        cache.0 = claimed_len;
     }
 
     fn route_fast(
