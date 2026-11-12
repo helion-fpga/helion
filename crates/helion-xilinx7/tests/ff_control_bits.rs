@@ -69,6 +69,7 @@ fn routed_ff(ce: Option<&str>, sr: Option<&str>) -> Routed7 {
             net: "d".into(),
             kind: RouteKind::SiteInternal,
         }],
+        ..Default::default()
     }
 }
 
@@ -143,8 +144,12 @@ fn emitted_fasm_sets_documented_bits() {
         "missing ZRST:\n{text}"
     );
 
-    let lines = parse_fasm(&text).expect("parse emitted FASM");
-    let mut store = FrameStore::new(&[0x01, 0x1E, 0x1F]);
+    let lines: Vec<_> = parse_fasm(&text)
+        .expect("parse emitted FASM")
+        .into_iter()
+        .filter(|l| l.tile.starts_with("CLBLL_L"))
+        .collect();
+    let mut store = FrameStore::new(&[0x00, 0x01, 0x1E, 0x1F]);
     let applied = store
         .apply_fasm(&lines, &db, &StubLayout)
         .expect("apply FASM");
@@ -175,16 +180,22 @@ fn emitted_fasm_sets_documented_bits() {
 fn default_ff_leaves_control_bits_clear() {
     // The blinky case: no CE/SR nets. The mux enables must stay clear, which
     // is the correct default: CE tied high (FF always clock-enabled), SR
-    // inactive. ZRST is don't-care with SRUSEDMUX clear; it must be untouched.
+    // inactive. ZRST (reset value 0) and FFSYNC are still emitted, as Vivado
+    // does for an FDRE whose reset pin is unused.
     let db = load_clbll_segbits();
     let bs = emit_fasm(&routed_ff(None, None), &StubEmit).unwrap();
     let text = bs.fasm.join("\n");
     assert!(!text.contains("CEUSEDMUX"), "unexpected CEUSEDMUX:\n{text}");
     assert!(!text.contains("SRUSEDMUX"), "unexpected SRUSEDMUX:\n{text}");
-    assert!(!text.contains("ZRST"), "unexpected ZRST:\n{text}");
+    assert!(text.contains("AFF.ZRST"), "missing ZRST:\n{text}");
+    assert!(text.contains("FFSYNC"), "missing FFSYNC:\n{text}");
 
-    let lines = parse_fasm(&text).expect("parse emitted FASM");
-    let mut store = FrameStore::new(&[0x01, 0x1E, 0x1F]);
+    let lines: Vec<_> = parse_fasm(&text)
+        .expect("parse emitted FASM")
+        .into_iter()
+        .filter(|l| l.tile.starts_with("CLBLL_L"))
+        .collect();
+    let mut store = FrameStore::new(&[0x00, 0x01, 0x1E, 0x1F]);
     store
         .apply_fasm(&lines, &db, &StubLayout)
         .expect("apply FASM");
@@ -193,9 +204,10 @@ fn default_ff_leaves_control_bits_clear() {
         0,
         "mux enable bits set without CE/SR"
     );
+    // FFSYNC 00_48 -> frame 0x00, word 1, bit 16.
     assert_eq!(
-        store.frame_words(0x1E).unwrap()[0] & (1 << 12),
-        0,
-        "ZRST set without SR"
+        store.frame_words(0x00).unwrap()[1],
+        1 << 16,
+        "FFSYNC bit"
     );
 }

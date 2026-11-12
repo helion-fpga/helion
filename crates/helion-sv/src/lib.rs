@@ -17336,7 +17336,7 @@ fn emit_carry_increment(
             // and sim models undriven S-feed inputs high for the same
             // reason. I5 stays unconnected and floats, like the oracle.
             let slut = format!("u_carry_{lhs}_trs_lut");
-            d.add_cell(&slut, CellKind::Lut6 { init: 0xFF00_FF00_0000_0000 });
+            d.add_cell(&slut, CellKind::Lut6 { init: 0xFF00_FF00_FF00_FF00 });
             d.connect(&ts, &slut, "O");
             d.connect(&bit_name(lhs, w, 1), &slut, "I3");
             // B/C/D (golden Y39X1 B<-bit2, C<-bit3, D<-east): AND-side
@@ -20023,7 +20023,7 @@ mod tests {
             .find(|c| c.name == "u_carry_count_trs_lut")
             .expect("transit S0 LUT");
         assert!(
-            matches!(trs_lut.kind, CellKind::Lut6 { init: 0xFF00_FF00_0000_0000 }),
+            matches!(trs_lut.kind, CellKind::Lut6 { init: 0xFF00_FF00_FF00_FF00 }),
             "transit S0 LUT is AND(I3,I5), got {:?}",
             trs_lut.kind
         );

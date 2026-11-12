@@ -9,6 +9,25 @@
 use crate::place::Placed7;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Wire classes one route search may use.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RouteOpts {
+    /// Tie-off nets only: power wires (`VCC_WIRE`, `GND_WIRE`, `GFAN*`,
+    /// `GCLK_*`) are legal carriers.
+    pub allow_power: bool,
+    /// The load is a slice bypass pin (`AX`..`DX`): `BYP_ALT` muxes are legal.
+    pub allow_byp: bool,
+    /// Stay off general interconnect (INT tiles): the dedicated clock path
+    /// from a clock-capable pad to a BUFG input.
+    pub no_int: bool,
+    /// A BUFG output on its way to slice CLK pins: global/row clock wires
+    /// are legal, general interconnect is not.
+    pub clock: bool,
+    /// Last resort for parts with an incomplete database: also use pips
+    /// the database gives no configuration bits for.
+    pub any_pip: bool,
+}
+
 /// What the router needs from the device model.
 pub trait RouteQuery {
     /// Pips with `src_wire == wire` in `tile`: `(dst_wire, src_wire, is_pseudo)`.
@@ -24,16 +43,21 @@ pub trait RouteQuery {
     /// wire restrictions, same returned pips). `None`: not implemented, the
     /// caller runs the generic BFS. `Some(None)`: unroutable.
     #[allow(clippy::too_many_arguments)]
+    /// Wires just claimed by `net` (`claimed_len` = size of the claim map
+    /// afterwards), so a fast router can keep its own index current.
+    fn note_claims(&self, _net: &str, _wires: &[(String, String)], _claimed_len: usize) {}
+    /// Returns the pips and, per pip, the arrival delay (ps) at its source
+    /// and destination wires; `_tree` holds this net's wires with their
+    /// known arrival delays.
     fn route_fast(
         &self,
         _src: (&str, &str),
-        _tree: &[(String, String)],
+        _tree: &[(String, String, u32)],
         _sinks: &[(String, String)],
-        _allow_power: bool,
-        _allow_byp: bool,
+        _opts: RouteOpts,
         _net: &str,
         _claimed: &HashMap<(String, String), String>,
-    ) -> Option<Option<Vec<RoutedPip>>> {
+    ) -> Option<Option<(Vec<RoutedPip>, Vec<(u32, u32)>)>> {
         None
     }
     /// All `(tile, wire)` that can drive a site input pin.
@@ -117,6 +141,14 @@ pub struct RoutedNet7 {
 pub struct Routed7 {
     pub placed: Placed7,
     pub nets: Vec<RoutedNet7>,
+    /// Routed interconnect delay (ps, slow corner) from each net's driver
+    /// pin to each fabric load: `(net, load site, load pin) -> ps`. Filled
+    /// by the delay-aware router; absent for site-internal loads.
+    pub load_delays: HashMap<(String, String, String), u32>,
+    /// Clock nets were routed pip by pip on the device graph (global
+    /// line, HROW, BUFHCE, HCLK leaf, INT clock input); emit derives the
+    /// static enables from those pips instead of the fixed spine recipe.
+    pub graph_clocks: bool,
 }
 
 /// A routing endpoint: site + pin + whether it's a driver.
@@ -264,6 +296,8 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     // loudly when no path remains. Power rails stay shareable (they
     // are excluded from claims at commit time).
     let mut claimed: HashMap<(String, String), String> = HashMap::new();
+    let mut load_delays: HashMap<(String, String, String), u32> = HashMap::new();
+    let mut graph_clocks = false;
     let mut net_names: Vec<String> = net_eps.keys().cloned().collect();
     net_names.sort();
     for net in net_names {
@@ -293,18 +327,29 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         if loads.is_empty() {
             continue; // undriven net: nothing to route
         }
-        let kind = route_net(&net, drivers[0], &loads, device, &claimed)?;
+        let mut delays: Vec<(String, String, u32)> = Vec::new();
+        let kind = route_net(&net, drivers[0], &loads, device, &claimed, &mut delays)?;
+        if device.is_clock_net(&net) && matches!(kind, RouteKind::Pips(_)) {
+            graph_clocks = true;
+        }
+        for (site, pin, d) in delays {
+            load_delays.insert((net.clone(), site, pin), d);
+        }
         if let RouteKind::Pips(pips) = &kind {
+            let mut new_wires = Vec::new();
             for p in pips {
                 for w in [&p.src_wire, &p.dst_wire] {
                     if is_power_wire(w) {
                         continue;
                     }
-                    claimed
-                        .entry((p.tile.clone(), w.clone()))
-                        .or_insert_with(|| net.clone());
+                    let key = (p.tile.clone(), w.clone());
+                    if !claimed.contains_key(&key) {
+                        new_wires.push(key.clone());
+                        claimed.insert(key, net.clone());
+                    }
                 }
             }
+            device.note_claims(&net, &new_wires, claimed.len());
         }
         nets.push(RoutedNet7 { net, kind });
     }
@@ -318,6 +363,9 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     // Clock spine stitching per BUFGCTRL: O exit to the global line plus
     // REBUF stitches. Without these the clock never leaves the BUFG site.
     for bufg in &placed.bufgs {
+        if graph_clocks {
+            break;
+        }
         let spine = device.bufg_spine(&bufg.site)?;
         if !spine.pips.is_empty() {
             nets.push(RoutedNet7 {
@@ -330,6 +378,8 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     Ok(Routed7 {
         placed: placed.clone(),
         nets,
+        load_delays,
+        graph_clocks,
     })
 }
 
@@ -383,6 +433,7 @@ fn route_net(
     loads: &[&Endpoint],
     device: &dyn RouteQuery,
     claimed: &HashMap<(String, String), String>,
+    delays: &mut Vec<(String, String, u32)>,
 ) -> Result<RouteKind, String> {
     // Split loads into site-internal (same site as driver and not a
     // LUT input) and external. Slice LUT inputs (A1-A6 and friends)
@@ -403,7 +454,37 @@ fn route_net(
     // pips on purpose: Vivado drives it through CLK_BUFG input-mux
     // pips, and a bitless special case could never match that.)
     if device.is_clock_net(net) {
-        return Ok(RouteKind::ClockSpine);
+        // A device model without the driver's wire has no clock graph
+        // (unit-test fakes): the fixed spine recipe applies.
+        let Some((src_tile, src_wire)) = device.site_pin_wire(&driver.site, &driver.pin) else {
+            return Ok(RouteKind::ClockSpine);
+        };
+        let opts = RouteOpts { clock: true, ..Default::default() };
+        let mut tree: Vec<(String, String, u32)> = vec![(src_tile.clone(), src_wire.clone(), 0)];
+        let mut all: Vec<RoutedPip> = Vec::new();
+        for load in &external {
+            let sinks = device.wire_for_site_pin(&load.site, &load.pin);
+            match device.route_fast((&src_tile, &src_wire), &tree, &sinks, opts, net, claimed) {
+                // No graph router (unit-test fakes): the fixed spine recipe.
+                None => return Ok(RouteKind::ClockSpine),
+                Some(None) => {
+                    // The device graph has no clock path to this pin (an
+                    // incomplete database for the part): fixed recipe.
+                    eprintln!("route: clock `{net}` has no graph path to {}.{}; using the fixed spine recipe", load.site, load.pin);
+                    return Ok(RouteKind::ClockSpine);
+                }
+                Some(Some((pips, arr))) => {
+                    for (p, (sa, da)) in pips.iter().zip(&arr) {
+                        tree.push((p.tile.clone(), p.src_wire.clone(), *sa));
+                        tree.push((p.tile.clone(), p.dst_wire.clone(), *da));
+                    }
+                    all.extend(pips);
+                }
+            }
+        }
+        all.sort_by(|a, b| (&a.tile, &a.dst_wire, &a.src_wire).cmp(&(&b.tile, &b.dst_wire, &b.src_wire)));
+        all.dedup_by(|a, b| a.tile == b.tile && a.dst_wire == b.dst_wire && a.src_wire == b.src_wire);
+        return Ok(RouteKind::Pips(all));
     }
     // Route to external loads via pips. (Internal loads are site-local.)
     let external_loads: Vec<&Endpoint> = external.into_iter().copied().collect();
@@ -414,17 +495,15 @@ fn route_net(
         .ok_or_else(|| format!("route: no wire for driver {}.{} (net `{net}`)", driver.site, driver.pin))?;
 
     let mut all_pips: Vec<RoutedPip> = Vec::new();
-    // Tieoff nets (driven by power) and clock-path nets (into BUFG I
-    // pins or slice CLK pins) may use power and clock wires; every
-    // other net stays on signal wires.
-    let allow_power = is_power_wire(&src_wire)
-        || external_loads
-            .iter()
-            .any(|l| matches!(l.pin.as_str(), "I0" | "I1" | "CLK"));
+    // Only tie-off nets (driven by a power wire) may travel on power and
+    // clock-distribution wires. A signal let onto `GFAN`/`VCC_WIRE` shorts
+    // against the tie-offs of the tile it crosses (a pad-to-BUFG net routed
+    // that way killed the BUFG's control pins).
+    let allow_power = is_power_wire(&src_wire);
     // Wires this net already reaches: later loads branch off the tree
     // instead of re-entering one of its wires from a second source (which
     // would double-drive that wire's mux).
-    let mut tree: Vec<(String, String)> = vec![(src_tile.clone(), src_wire.clone())];
+    let mut tree: Vec<(String, String, u32)> = vec![(src_tile.clone(), src_wire.clone(), 0)];
     for load in &external_loads {
         let sinks = device.wire_for_site_pin(&load.site, &load.pin);
         if sinks.is_empty() {
@@ -434,15 +513,47 @@ fn route_net(
             ));
         }
         let allow_byp = is_bypass_pin(&load.pin);
-        let fast = device.route_fast((&src_tile, &src_wire), &tree, &sinks, allow_power, allow_byp, net, claimed);
-        let pips = match fast {
-            Some(r) => r,
-            None => bfs_route(&src_tile, &src_wire, &sinks, device, allow_power, allow_byp, net, claimed),
+        let opts = RouteOpts { allow_power, allow_byp, no_int: false, clock: false, any_pip: false };
+        // A BUFG input takes the dedicated clock path (clock-capable pad ->
+        // CMT/HROW -> BUFG) when one exists, else general interconnect.
+        let mut fast = None;
+        if matches!(load.pin.as_str(), "I0" | "I1") {
+            if let Some(Some(r)) = device.route_fast((&src_tile, &src_wire), &tree, &sinks, RouteOpts { no_int: true, ..opts }, net, claimed) {
+                fast = Some(Some(r));
+            }
         }
+        if fast.is_none() {
+            fast = device.route_fast((&src_tile, &src_wire), &tree, &sinks, opts, net, claimed);
+        }
+        if matches!(fast, Some(None)) && matches!(load.pin.as_str(), "I0" | "I1") {
+            // Parts whose database lacks the clock-input wiring: the old
+            // permissive search (clock wires allowed) as a last resort.
+            eprintln!("route: `{net}` has no clean path to {}.{}; retrying with clock wires allowed", load.site, load.pin);
+            fast = device.route_fast((&src_tile, &src_wire), &tree, &sinks, RouteOpts { allow_power: true, any_pip: true, ..opts }, net, claimed);
+        }
+        let (pips, arr) = match fast {
+            Some(Some((p, a))) => (Some(p), Some(a)),
+            Some(None) => (None, None),
+            None => (bfs_route(&src_tile, &src_wire, &sinks, device, allow_power, allow_byp, net, claimed), None),
+        };
+        let pips = pips
             .ok_or_else(|| format!("route: net `{net}` unroutable to {}.{} (src {src_tile}.{src_wire})", load.site, load.pin))?;
-        for p in &pips {
-            tree.push((p.tile.clone(), p.dst_wire.clone()));
-            tree.push((p.tile.clone(), p.src_wire.clone()));
+        match &arr {
+            Some(a) => {
+                for (p, (sa, da)) in pips.iter().zip(a) {
+                    tree.push((p.tile.clone(), p.src_wire.clone(), *sa));
+                    tree.push((p.tile.clone(), p.dst_wire.clone(), *da));
+                }
+                // Loads with no new pips sit on the tree already.
+                let d = a.last().map(|x| x.1).unwrap_or(0);
+                delays.push((load.site.clone(), load.pin.clone(), d));
+            }
+            None => {
+                for p in &pips {
+                    tree.push((p.tile.clone(), p.src_wire.clone(), 0));
+                    tree.push((p.tile.clone(), p.dst_wire.clone(), 0));
+                }
+            }
         }
         all_pips.extend(pips);
     }

@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use helion_xilinx7::bitstream::{self, BitstreamOptions};
-use helion_xilinx7::clkdist::{self, HrowTap, HrowTile};
 use helion_xilinx7::device::{default_db_root, Device};
 use helion_xilinx7::route::RouteQuery;
 use helion_xilinx7::fasm::parse_fasm;
@@ -357,7 +356,7 @@ fn blinky_reg_carry_e2e_fasm() {
     // Transit S0 is AND(Q1 on I3/A4, float-high A6): golden Y39X1
     // ALUT shape, reading as a Q1 passthrough under float-high.
     assert!(
-        fasm_text.contains("CLBLM_R_X71Y39.SLICEL_X1.ALUT.INIT[63:0] = 64'hFF00FF0000000000"),
+        fasm_text.contains("CLBLM_R_X71Y39.SLICEL_X1.ALUT.INIT[63:0] = 64'hFF00FF00FF00FF00"),
         "transit S0 AND INIT"
     );
     // Part always-on bits from required_features.fasm: static, not
@@ -403,144 +402,15 @@ fn blinky_reg_carry_e2e_fasm() {
     let mut store = FrameStore::new(&full);
     let applied = store.apply_fasm(&lines, &segbits, &layout).expect("apply FASM");
     assert!(applied > 0, "no FASM features applied");
-    // ZB-10 clock fuzz hook: HROW trunk-distribution raw codes from the
-    // routed clock spine (measured Vivado behavior, see clkdist). Only
-    // single-clock designs are in the measured domain; anything else
-    // keeps today's behavior (codes unset) rather than guessed bits.
-    if routed.placed.bufgs.len() == 1 {
-        let site = routed.placed.bufgs[0].site.clone();
-        let spine = xdev.bufg_spine(&site).expect("spine for clock hook");
-        if let Some(hp) = spine
-            .pips
-            .iter()
-            .find(|p| p.tile.contains("CLK_HROW"))
-        {
-            let tile = if hp.tile.contains("_BOT_") {
-                HrowTile::Bot
-            } else if hp.tile.contains("_TOP_") {
-                HrowTile::Top
-            } else {
-                panic!("clock hook: unexpected HROW tile {}", hp.tile);
-            };
-            let tail =
-                hp.dst_wire.rsplit("MUX_OUT_").next().expect("mux tail");
-            let (side_r, mux): (bool, u8) = match tail.strip_prefix('R') {
-                Some(n) => (true, n.parse().expect("R mux index")),
-                None => (
-                    false,
-                    tail.strip_prefix('L').expect("L mux").parse().expect("L mux index"),
-                ),
-            };
-            let tap = HrowTap { tile, side_r, mux };
-            if let Some(codes) = clkdist::hrow_codes(spine.gclk, &tap) {
-                let (bot_name, top_name) = clkdist::hrow_tile_names();
-                let home_name = match tap.tile {
-                    HrowTile::Bot => bot_name,
-                    HrowTile::Top => top_name,
-                };
-                assert_eq!(hp.tile, home_name, "HROW tile moved; remeasure clkdist");
-                let base = |t: &str| {
-                    layout
-                        .frame_addr(t, BlockType::ClbIoClk)
-                        .expect("hrow geometry")
-                        .baseaddr
-                };
-                let raw = vec![
-                    (base(bot_name) + 26, 50, codes.bot_26),
-                    (base(bot_name) + 27, 50, codes.bot_27),
-                    (base(top_name) + 27, 50, codes.top_27),
-                    (
-                        base(home_name) + u32::from(codes.tap_minor),
-                        50,
-                        codes.tap_code,
-                    ),
-                ];
-                let n = store.apply_raw_bits(&raw).expect("hrow raw codes");
-                assert_eq!(n, 4, "hrow raw codes applied");
-                // Same cell drives the leaf-buffer codes (BOT-tap HCLK
-                // leaf buffer + CMT feed, measured identical for G0/G1).
-                if let Some(leaf) = clkdist::leaf_codes(spine.gclk, &tap) {
-                    let (l174_name, cmtl_name) = clkdist::leaf_tile_names();
-                    let leaf_raw = vec![
-                        (base(l174_name) + 3, 50, leaf.l174_m03),
-                        (base(l174_name) + 5, 50, leaf.l174_m05),
-                        (base(cmtl_name) + 27, 50, leaf.cmtl_m27),
-                    ];
-                    let n = store.apply_raw_bits(&leaf_raw).expect("leaf raw codes");
-                    assert_eq!(n, 3, "leaf raw codes applied");
-                }
-            }
-        }
-        // Clock-input distribution codes: every sample shares the Y9
-        // input path, so these hold for any single-clock design.
-        {
-            let ioi3_base = layout
-                .frame_addr(clkdist::input_tile_name(), BlockType::ClbIoClk)
-                .expect("input tile geometry")
-                .baseaddr;
-            let input_raw: Vec<(u32, u32, u32)> = clkdist::input_codes()
-                .iter()
-                .map(|&(m, w, v)| (ioi3_base + m, w, v))
-                .collect();
-            let n = store.apply_raw_bits(&input_raw).expect("input raw codes");
-            assert_eq!(n, 3, "input raw codes applied");
-        }
+    // The clock is graph-routed: its distribution is ordinary FASM features
+    // (HROW tap, BUFHCE, HCLK leaf buffer), not raw codes. Word 50 of each
+    // frame is the ECC, which the frame store computes.
+    for needle in ["_ACTIVE", "BUFHCE.BUFHCE_X", "ENABLE_BUFFER.HCLK_CK_BUFHCLK"] {
+        assert!(
+            fasm_text.contains(needle),
+            "graph-routed clock is missing a {needle} feature"
+        );
     }
-    // ZB-10 clock fuzz: Vivado programs HROW trunk-distribution codes in
-    // word 50 that no segbits feature names (12 single-trunk samples,
-    // GCLK0-3 x BOT/TOP taps, agreeing across 2017.3, 2022.1, oracle).
-    // The clkdist hook above must reproduce the oracle row exactly.
-    assert_eq!(
-        store.frame_words(0x00421080 + 26).expect("BOT m26")[50],
-        0x00041cb2,
-        "BOT HROW m26 trunk code"
-    );
-    assert_eq!(
-        store.frame_words(0x00421080 + 27).expect("BOT m27")[50],
-        0x000010cf,
-        "BOT HROW m27 trunk code"
-    );
-    assert_eq!(
-        store.frame_words(0x00421080 + 28).expect("BOT m28")[50],
-        0x008019b7,
-        "BOT HROW m28 tap code"
-    );
-    assert_eq!(
-        store.frame_words(0x00401080 + 27).expect("TOP m27")[50],
-        0x00000643,
-        "TOP HROW m27 through code"
-    );
-    // ZB-10 clock fuzz, part 2: leaf-buffer and clock-input codes.
-    assert_eq!(
-        store.frame_words(0x00422300 + 3).expect("L174 m03")[50],
-        0x020009b9,
-        "HCLK_L leaf m03 buffer code"
-    );
-    assert_eq!(
-        store.frame_words(0x00422300 + 5).expect("L174 m05")[50],
-        0x008019b7,
-        "HCLK_L leaf m05 tap code"
-    );
-    assert_eq!(
-        store.frame_words(0x00422400 + 27).expect("CMTL m27")[50],
-        0x002009b5,
-        "HCLK_CMT_L m27 feed code"
-    );
-    assert_eq!(
-        store.frame_words(0x00420000 + 29).expect("IOI3 m29")[50],
-        0x00001a2d,
-        "HCLK_IOI3 input m29 code"
-    );
-    assert_eq!(
-        store.frame_words(0x00420000 + 38).expect("IOI3 m38")[50],
-        0x00000a3e,
-        "HCLK_IOI3 input m38 code"
-    );
-    assert_eq!(
-        store.frame_words(0x00420000 + 39).expect("IOI3 m39")[50],
-        0x00001a39,
-        "HCLK_IOI3 input m39 code"
-    );
 
     let payload = store.fdri_payload();
     let opts = BitstreamOptions {

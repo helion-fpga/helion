@@ -45,6 +45,20 @@ pub struct XDevice<'a> {
     wire_to_tile: Vec<(usize, u32)>,
     /// Router claims by wire id, rebuilt when the claim map grows.
     claim_cache: std::cell::RefCell<(usize, HashMap<u32, String>)>,
+    /// Claim owner per wire id (0 free) and interned net ids.
+    owner: std::cell::RefCell<(Vec<u32>, HashMap<String, u32>)>,
+    /// Per-wire routing flags (see `wire_flags`).
+    flags: std::cell::RefCell<Vec<u8>>,
+    /// Reusable A* state.
+    search: std::cell::RefCell<SearchBuf>,
+}
+
+#[derive(Default)]
+struct SearchBuf {
+    generation: u32,
+    stamp: Vec<u32>,
+    best: Vec<u32>,
+    parent: Vec<u32>,
 }
 
 impl<'a> XDevice<'a> {
@@ -57,6 +71,9 @@ impl<'a> XDevice<'a> {
             node_members,
             wire_to_tile,
             claim_cache: std::cell::RefCell::new((usize::MAX, HashMap::new())),
+            owner: std::cell::RefCell::new((Vec::new(), HashMap::new())),
+            flags: std::cell::RefCell::new(Vec::new()),
+            search: std::cell::RefCell::new(SearchBuf::default()),
         }
     }
 
@@ -73,136 +90,278 @@ impl<'a> XDevice<'a> {
             .unwrap_or((0, 0))
     }
 
+    /// Mark `id` and every wire of its node as owned by `oid` (a node is one
+    /// electrical net: two nets on different wires of it short together).
+    fn mark_owner(&self, owner: &mut [u32], id: u32, oid: u32) {
+        let nid = self.wire_to_node.get(id as usize).copied().unwrap_or(u32::MAX);
+        if nid != u32::MAX {
+            if let Some(members) = self.node_members.get(&nid) {
+                for &m in members {
+                    if let Some(slot) = owner.get_mut(m as usize) {
+                        if *slot == 0 {
+                            *slot = oid;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(slot) = owner.get_mut(id as usize) {
+            *slot = oid;
+        }
+    }
+
+    /// Per-wire flags: bit 0 power/clock wire, bit 1 BYP_ALT, bit 2 in a CLB
+    /// tile (pseudo-pips there are slice configuration), computed once.
+    fn wire_flags(&self) -> std::cell::Ref<'_, Vec<u8>> {
+        {
+            let mut f = self.flags.borrow_mut();
+            if f.is_empty() {
+                let n = self.wire_to_tile.len();
+                f.resize(n, 0);
+                for id in 0..n {
+                    let (ti, wi) = self.wire_to_tile[id];
+                    let Some(w) = self.device.wires(ti).and_then(|ws| ws.get(wi as usize)) else { continue };
+                    let mut b = 0u8;
+                    if w == "GND_WIRE" || w == "VCC_WIRE" || w.starts_with("GFAN") {
+                        b |= 1;
+                    }
+                    if w.starts_with("GCLK_") {
+                        b |= 16;
+                    }
+                    if w.starts_with("GCLK") || w.starts_with("CLK") {
+                        b |= 32;
+                    }
+                    if w.starts_with("BYP_ALT") {
+                        b |= 2;
+                    }
+                    if self.device.tile(ti).map(|t| t.name.starts_with("CLB")).unwrap_or(false) {
+                        b |= 4;
+                    }
+                    if matches!(self.device.tile_type_name(ti), Some("INT_L") | Some("INT_R")) {
+                        b |= 8;
+                    }
+                    f[id] = b;
+                }
+            }
+        }
+        self.flags.borrow()
+    }
+
     /// A* over integer wire ids: same wire rules as `route::bfs_route`
     /// (power/clock and BYP_ALT wires, foreign claims, CLB pseudo-pips).
+    /// Search state lives in flat per-wire arrays stamped per search.
     fn astar(
         &self,
         src: (&str, &str),
-        tree: &[(String, String)],
+        tree: &[(String, String, u32)],
         sinks: &[(String, String)],
-        allow_power: bool,
-        allow_byp: bool,
+        opts: crate::route::RouteOpts,
         net: &str,
         claimed: &HashMap<(String, String), String>,
-    ) -> Option<Option<Vec<RoutedPip>>> {
+    ) -> Option<Option<(Vec<RoutedPip>, Vec<(u32, u32)>)>> {
         use std::cmp::Reverse;
+        let (allow_power, allow_byp, no_int, clock) = (opts.allow_power, opts.allow_byp, opts.no_int, opts.clock);
         use std::collections::BinaryHeap;
         let start = self.wire_id_of(src.0, src.1)?;
-        let targets: HashSet<u32> = sinks.iter().filter_map(|(t, w)| self.wire_id_of(t, w)).collect();
+        let targets: Vec<u32> = sinks.iter().filter_map(|(t, w)| self.wire_id_of(t, w)).collect();
         if targets.is_empty() {
             return None;
         }
+        let n = self.wire_to_tile.len();
+        // Claims: owner id per wire (0 = free), nets interned.
         {
             let mut cache = self.claim_cache.borrow_mut();
             if cache.0 != claimed.len() {
                 let mut m = HashMap::with_capacity(claimed.len());
-                for ((t, w), n) in claimed {
+                for ((t, w), nn) in claimed {
                     if let Some(id) = self.wire_id_of(t, w) {
-                        m.insert(id, n.clone());
+                        m.insert(id, nn.clone());
                     }
                 }
                 *cache = (claimed.len(), m);
+                let mut own = self.owner.borrow_mut();
+                own.0.clear();
+                own.0.resize(n, 0);
+                own.1.clear();
+                own.1.insert(String::new(), 0);
+                let entries: Vec<(u32, String)> = cache.1.iter().map(|(k, v)| (*k, v.clone())).collect();
+                for (id, nn) in entries {
+                    let len = own.1.len() as u32;
+                    let oid = *own.1.entry(nn).or_insert(len);
+                    let (vec, _) = &mut *own;
+                    self.mark_owner(vec, id, oid);
+                }
             }
         }
-        let cache = self.claim_cache.borrow();
-        let foreign = |id: u32| cache.1.get(&id).map(|n| n != net).unwrap_or(false);
-        let power = |w: &str| w == "GND_WIRE" || w == "VCC_WIRE" || w.starts_with("GFAN") || w.starts_with("GCLK_");
+        let own = self.owner.borrow();
+        let my = own.1.get(net).copied().unwrap_or(u32::MAX);
+        let flags = self.wire_flags();
         let allowed = |id: u32| -> bool {
-            let Some(w) = self.wire_name_ref(id) else { return false };
-            if !allow_power && power(w) {
+            let f = flags[id as usize];
+            if !allow_power && f & 1 != 0 {
                 return false;
             }
-            if !allow_power && !allow_byp && w.starts_with("BYP_ALT") {
+            if !allow_power && !clock && f & 16 != 0 {
                 return false;
             }
-            !foreign(id)
+            // A clock stays on clock wires inside INT tiles.
+            if clock && f & 8 != 0 && f & 32 == 0 {
+                return false;
+            }
+            if !allow_power && !allow_byp && f & 2 != 0 {
+                return false;
+            }
+            if no_int && f & 8 != 0 {
+                return false;
+            }
+            let o = own.0.get(id as usize).copied().unwrap_or(0);
+            o == 0 || o == my
         };
+        let is_target = |id: u32| targets.contains(&id);
         let tgt_xy: Vec<(i32, i32)> = targets.iter().map(|&t| self.wire_xy(t)).collect();
+        const PIP_BASE: u32 = 15;
         let h = |id: u32| -> u32 {
             let (x, y) = self.wire_xy(id);
             let d = tgt_xy.iter().map(|(tx, ty)| (x - tx).abs() + (y - ty).abs()).min().unwrap_or(0);
-            (d as u32) / 4
+            (d as u32) * 90
         };
-        // parent: wire -> (previous wire, pip (tile, src idx, dst idx, pseudo) or a node hop)
-        let mut parent: HashMap<u32, (u32, Option<(usize, u32, u32, bool)>)> = HashMap::new();
-        let mut best: HashMap<u32, u32> = HashMap::new();
+        let mut sb = self.search.borrow_mut();
+        if sb.stamp.len() != n {
+            sb.stamp = vec![0; n];
+            sb.best = vec![0; n];
+            sb.parent = vec![u32::MAX; n];
+            sb.generation = 0;
+        }
+        sb.generation = sb.generation.wrapping_add(1);
+        if sb.generation == 0 {
+            sb.stamp.iter_mut().for_each(|x| *x = 0);
+            sb.generation = 1;
+        }
+        let stampv = sb.generation;
         let mut heap: BinaryHeap<Reverse<(u32, u32, u32)>> = BinaryHeap::new();
-        best.insert(start, 0);
+        macro_rules! seen {
+            ($id:expr) => {
+                sb.stamp[$id as usize] == stampv
+            };
+        }
+        sb.stamp[start as usize] = stampv;
+        sb.best[start as usize] = 0;
+        sb.parent[start as usize] = u32::MAX;
         heap.push(Reverse((h(start), 0, start)));
-        // The net's existing route tree (and its node siblings) are free
-        // starting points; reconstruction stops at the first tree wire.
-        for (t, w) in tree {
+        for (t, w, d) in tree {
             if let Some(id) = self.wire_id_of(t, w) {
-                if best.insert(id, 0).is_none() {
-                    heap.push(Reverse((h(id), 0, id)));
+                // Branch only from general interconnect: wires past a site
+                // pin (IOI/OLOGIC route-throughs, CLB pins) are not fanout
+                // points.
+                if !clock && flags[id as usize] & 8 == 0 {
+                    continue;
+                }
+                if clock && flags[id as usize] & 4 != 0 {
+                    continue;
+                }
+                if !seen!(id) || *d < sb.best[id as usize] {
+                    sb.stamp[id as usize] = stampv;
+                    sb.best[id as usize] = *d;
+                    sb.parent[id as usize] = u32::MAX;
+                    heap.push(Reverse((d + h(id), *d, id)));
                 }
             }
         }
         let mut found = None;
         let mut expanded = 0usize;
         while let Some(Reverse((_, g, id))) = heap.pop() {
-            if best.get(&id).map(|&b| g > b).unwrap_or(false) {
+            if g > sb.best[id as usize] {
                 continue;
             }
-            if targets.contains(&id) {
+            if is_target(id) {
                 found = Some(id);
                 break;
             }
             expanded += 1;
-            if expanded > 4_000_000 {
+            if expanded > 30_000_000 {
                 break;
             }
-            let mut relax = |nid: u32, ng: u32, via: Option<(usize, u32, u32, bool)>, heap: &mut BinaryHeap<Reverse<(u32, u32, u32)>>| {
-                if best.get(&nid).map(|&b| ng >= b).unwrap_or(false) {
-                    return;
-                }
-                best.insert(nid, ng);
-                parent.insert(nid, (id, via));
-                heap.push(Reverse((ng + h(nid), ng, nid)));
-            };
             // Node siblings (tileconn stitching): free.
-            if let Some(&nid) = self.wire_to_node.get(id as usize) {
-                if nid != u32::MAX {
-                    if let Some(members) = self.node_members.get(&nid) {
-                        for &m in members {
-                            if m != id && allowed(m) {
-                                relax(m, g, None, &mut heap);
-                            }
+            let nid = self.wire_to_node[id as usize];
+            if nid != u32::MAX {
+                if let Some(members) = self.node_members.get(&nid) {
+                    for &m in members {
+                        if m == id || !allowed(m) {
+                            continue;
+                        }
+                        // Tree wires (seeds) are fixed: a cheaper second
+                        // path into one would give that wire two drivers.
+                        if seen!(m) && sb.parent[m as usize] == u32::MAX {
+                            continue;
+                        }
+                        if !seen!(m) || g < sb.best[m as usize] {
+                            sb.stamp[m as usize] = stampv;
+                            sb.best[m as usize] = g;
+                            sb.parent[m as usize] = id;
+                            heap.push(Reverse((g + h(m), g, m)));
                         }
                     }
                 }
             }
-            // Pips in this tile.
             let (ti, wi) = self.wire_to_tile[id as usize];
-            let clb = self.device.tile(ti).map(|t| t.name.starts_with("CLB")).unwrap_or(false);
+            let clb = flags[id as usize] & 4 != 0;
+            let base = self.device.wire_id(ti, 0).unwrap_or(0);
             for pip in self.device.pips_from_idx(ti, wi) {
-                if pip.is_pseudo && clb {
+                if (!pip.usable && !opts.any_pip) || (pip.is_pseudo && clb) {
                     continue;
                 }
-                let Some(dst) = self.device.wire_id(ti, pip.dst) else { continue };
+                let dst = base + pip.dst;
                 if !allowed(dst) {
                     continue;
                 }
-                relax(dst, g + 1, Some((ti, wi, pip.dst, pip.is_pseudo)), &mut heap);
+                let ng = g + pip.delay_ps as u32 + PIP_BASE;
+                if seen!(dst) && sb.parent[dst as usize] == u32::MAX {
+                    continue;
+                }
+                if !seen!(dst) || ng < sb.best[dst as usize] {
+                    sb.stamp[dst as usize] = stampv;
+                    sb.best[dst as usize] = ng;
+                    sb.parent[dst as usize] = id;
+                    heap.push(Reverse((ng + h(dst), ng, dst)));
+                }
             }
         }
-        let Some(end) = found else { return Some(None) };
+        let Some(end) = found else {
+            if std::env::var("HELION_ROUTE_DEBUG").is_ok() {
+                let blocked: Vec<String> = targets.iter().map(|&t| format!("{:?} owner={} flags={}", self.wire_name_of(t), own.0.get(t as usize).copied().unwrap_or(0), flags[t as usize])).collect();
+                eprintln!("route_debug net={net} expanded={expanded} my={my} targets={blocked:?}");
+            }
+            return Some(None);
+        };
         let mut pips = Vec::new();
+        let mut arr = Vec::new();
         let mut cur = end;
-        while let Some(&(prev, via)) = parent.get(&cur) {
-            if let Some((ti, s, d, pseudo)) = via {
-                let wires = self.device.wires(ti)?;
-                pips.push(RoutedPip {
-                    tile: self.tile_name(ti)?.to_string(),
-                    dst_wire: wires.get(d as usize)?.clone(),
-                    src_wire: wires.get(s as usize)?.clone(),
-                    is_pseudo: pseudo,
-                });
+        while sb.parent[cur as usize] != u32::MAX {
+            let prev = sb.parent[cur as usize];
+            let (pt, pw) = self.wire_to_tile[prev as usize];
+            let (ct, cw) = self.wire_to_tile[cur as usize];
+            if pt == ct {
+                // A pip inside the tile (else a node hop).
+                if let Some(pip) = self.device.pips_from_idx(pt, pw).find(|p| p.dst == cw) {
+                    let wires = self.device.wires(pt)?;
+                    pips.push(RoutedPip {
+                        tile: self.tile_name(pt)?.to_string(),
+                        dst_wire: wires.get(cw as usize)?.clone(),
+                        src_wire: wires.get(pw as usize)?.clone(),
+                        is_pseudo: pip.is_pseudo,
+                    });
+                    arr.push((sb.best[prev as usize], sb.best[cur as usize]));
+                }
             }
             cur = prev;
         }
         pips.reverse();
-        Some(Some(pips))
+        arr.reverse();
+        if pips.is_empty() {
+            let d = sb.best[end as usize];
+            return Some(Some((pips, vec![(d, d)])));
+        }
+        Some(Some((pips, arr)))
     }
 
     fn tile_idx(&self, tile: &str) -> Option<usize> {
@@ -447,20 +606,42 @@ impl<'a> DeviceQuery for XDevice<'a> {
 }
 
 impl<'a> RouteQuery for XDevice<'a> {
+    fn note_claims(&self, net: &str, wires: &[(String, String)], claimed_len: usize) {
+        let mut cache = self.claim_cache.borrow_mut();
+        if cache.0 + wires.len() != claimed_len && cache.0 != usize::MAX {
+            // Out of step: let the next search rebuild from the full map.
+            cache.0 = usize::MAX;
+            return;
+        }
+        if cache.0 == usize::MAX {
+            return;
+        }
+        let mut own = self.owner.borrow_mut();
+        let len = own.1.len() as u32;
+        let oid = *own.1.entry(net.to_string()).or_insert(len);
+        for (t, w) in wires {
+            if let Some(id) = self.wire_id_of(t, w) {
+                cache.1.insert(id, net.to_string());
+                let (vec, _) = &mut *own;
+                self.mark_owner(vec, id, oid);
+            }
+        }
+        cache.0 = claimed_len;
+    }
+
     fn route_fast(
         &self,
         src: (&str, &str),
-        tree: &[(String, String)],
+        tree: &[(String, String, u32)],
         sinks: &[(String, String)],
-        allow_power: bool,
-        allow_byp: bool,
+        opts: crate::route::RouteOpts,
         net: &str,
         claimed: &HashMap<(String, String), String>,
-    ) -> Option<Option<Vec<RoutedPip>>> {
+    ) -> Option<Option<(Vec<RoutedPip>, Vec<(u32, u32)>)>> {
         if std::env::var("HELION_ROUTE_BFS").is_ok() {
             return None;
         }
-        self.astar(src, tree, sinks, allow_power, allow_byp, net, claimed)
+        self.astar(src, tree, sinks, opts, net, claimed)
     }
 
     fn pips_from(&self, tile: &str, wire: &str) -> Vec<(String, String, bool)> {
@@ -1129,6 +1310,102 @@ impl<'a> EmitDevice for XDevice<'a> {
 
     fn required_features(&self) -> Vec<String> {
         self.device.required_features().to_vec()
+    }
+
+    fn clock_statics(&self, pips: &[&RoutedPip]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let has = |ttype: &str, feat: &str| self.device.segbits(ttype, &format!("{ttype}.{feat}")).is_some();
+        let num_after = |w: &str, prefix: &str| -> Option<String> {
+            let r = w.strip_prefix(prefix)?;
+            let d: String = r.chars().take_while(|c| c.is_ascii_digit()).collect();
+            (!d.is_empty()).then_some(d)
+        };
+        let mut node_done: HashSet<u32> = HashSet::new();
+        for p in pips {
+            let Some(ti) = self.tile_idx(&p.tile) else { continue };
+            let ttype = self.device.tile_type_name(ti).unwrap_or("").to_string();
+            if ttype.starts_with("CLK_HROW") {
+                if p.src_wire.starts_with("CLK_HROW_R_CK_GCLK") || p.src_wire.starts_with("CLK_HROW_CK_IN_") {
+                    let f = format!("{}_ACTIVE", p.src_wire);
+                    if has(&ttype, &f) {
+                        out.push(format!("{}.{f}", p.tile));
+                    }
+                }
+                if p.dst_wire.starts_with("CLK_HROW_CK_MUX_OUT_") {
+                    // The BUFHCE whose I pin is this mux output.
+                    if let Some(t) = self.device.tile(ti) {
+                        for (si, site) in t.sites.iter().enumerate() {
+                            if !site.site_type.starts_with("BUFHCE") {
+                                continue;
+                            }
+                            let fed = self.device.site_pins(ti, si).map(|ps| ps.iter().any(|(pn, w)| pn == "I" && *w == p.dst_wire)).unwrap_or(false);
+                            if fed {
+                                // Features name the site relative to its
+                                // tile: 12 BUFHCEs per side per clock row.
+                                let rel = match site.name.strip_prefix("BUFHCE_X").and_then(|r| r.split_once('Y')) {
+                                    Some((x, y)) => format!("BUFHCE_X{}Y{}", x, y.parse::<u32>().unwrap_or(0) % 12),
+                                    None => site.name.clone(),
+                                };
+                                out.push(format!("{}.BUFHCE.{rel}.IN_USE", p.tile));
+                                out.push(format!("{}.BUFHCE.{rel}.ZINV_CE", p.tile));
+                            }
+                        }
+                    }
+                }
+            }
+            if (ttype == "HCLK_L" || ttype == "HCLK_R") && p.dst_wire.starts_with("HCLK_LEAF_CLK_B_") {
+                let f = format!("ENABLE_BUFFER.{}", p.src_wire);
+                if has(&ttype, &f) {
+                    out.push(format!("{}.{f}", p.tile));
+                }
+            }
+            if ttype == "HCLK_CMT" || ttype == "HCLK_CMT_L" {
+                if let Some(n) = num_after(&p.src_wire, "HCLK_CMT_CCIO") {
+                    for suffix in ["ACTIVE", "USED"] {
+                        let f = format!("HCLK_CMT_CCIO{n}_{suffix}");
+                        if has(&ttype, &f) {
+                            out.push(format!("{}.{f}", p.tile));
+                        }
+                    }
+                }
+            }
+            // Node-level markers: rebuffers at the ends of a global-line
+            // segment, CMT tiles a row clock passes.
+            for w in [&p.dst_wire, &p.src_wire] {
+                let Some(wid) = self.wire_id_of(&p.tile, w) else { continue };
+                let nid = self.wire_to_node.get(wid as usize).copied().unwrap_or(u32::MAX);
+                if nid == u32::MAX || !node_done.insert(nid) {
+                    continue;
+                }
+                let Some(members) = self.node_members.get(&nid) else { continue };
+                for &m in members {
+                    let Some((mt, mw)) = self.wire_name_of(m) else { continue };
+                    let Some(mti) = self.tile_idx(&mt) else { continue };
+                    let mtype = self.device.tile_type_name(mti).unwrap_or("");
+                    if mtype == "CLK_BUFG_REBUF" {
+                        if let Some(g) = num_after(&mw, "CLK_BUFG_REBUF_R_CK_GCLK") {
+                            // A segment's top-end rebuffer holds its _BOT
+                            // wire, the bottom-end one its _TOP wire.
+                            let f = if mw.ends_with("_BOT") { format!("GCLK{g}_ENABLE_ABOVE") } else { format!("GCLK{g}_ENABLE_BELOW") };
+                            if has(mtype, &f) {
+                                out.push(format!("{mt}.{f}"));
+                            }
+                        }
+                    }
+                    if mtype == "HCLK_CMT_L" || mtype == "HCLK_CMT" {
+                        if let Some(k) = num_after(&mw, "HCLK_CMT_CK_BUFHCLK") {
+                            let f = format!("HCLK_CMT_CK_BUFHCLK{k}_USED");
+                            if has(mtype, &f) {
+                                out.push(format!("{mt}.{f}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     fn bank_stepdown(&self, iob_tiles: &[String]) -> Vec<String> {

@@ -103,18 +103,37 @@ fn glob(pat: &str, s: &str) -> bool {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let all: Vec<String> = std::env::args().collect();
+    let ignore_timing = all.iter().any(|a| a == "--ignore-timing");
+    let args: Vec<String> = all.into_iter().filter(|a| !a.starts_with("--")).collect();
     if args.len() < 4 {
-        eprintln!("usage: zedbit <design.vhd|.sv> <board.xdc> <out.bit> [top]");
+        eprintln!("usage: zedbit <design.vhd|.sv> <board.xdc> <out.bit> [top] [--ignore-timing]");
         std::process::exit(2);
     }
-    if let Err(e) = run(&args[1], &args[2], &args[3], args.get(4).map(|s| s.as_str())) {
+    if let Err(e) = run(&args[1], &args[2], &args[3], args.get(4).map(|s| s.as_str()), ignore_timing) {
         eprintln!("zedbit: {e}");
         std::process::exit(1);
     }
 }
 
-fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>) -> Result<(), String> {
+/// Clock period (ps) from the first `create_clock -period <ns>`; 10 ns default.
+fn xdc_period_ps(text: &str) -> u32 {
+    for line in text.lines() {
+        let l = line.split('#').next().unwrap_or("");
+        if !l.trim_start().starts_with("create_clock") {
+            continue;
+        }
+        let toks: Vec<&str> = l.split_whitespace().collect();
+        if let Some(i) = toks.iter().position(|t| *t == "-period") {
+            if let Some(ns) = toks.get(i + 1).and_then(|v| v.parse::<f64>().ok()) {
+                return (ns * 1000.0).round() as u32;
+            }
+        }
+    }
+    10_000
+}
+
+fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_timing: bool) -> Result<(), String> {
     let t0 = std::time::Instant::now();
     let mut design = synth(design_path, top)?;
     let t_synth = t0.elapsed();
@@ -181,6 +200,28 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>) -> Resul
     let t_place = t0.elapsed();
     let routed = be.route(&placed)?;
     let t_route = t0.elapsed();
+    let period = xdc_period_ps(&xdc);
+    let ta = helion_xilinx7::timing::analyze(&routed, period)?;
+    eprintln!(
+        "zedbit timing: period {:.3} ns, worst slack {:.3} ns ({} of {} endpoints failing), est. fmax {:.0} MHz",
+        period as f64 / 1000.0,
+        ta.wns_ps as f64 / 1000.0,
+        ta.failing_endpoints,
+        ta.endpoints,
+        ta.fmax_mhz()
+    );
+    if ta.wns_ps < 0 {
+        for st in &ta.worst_path {
+            eprintln!("  {:>8.3} ns  {}", st.arrival_ps as f64 / 1000.0, st.what);
+        }
+        if !ignore_timing {
+            return Err(format!(
+                "timing not met: worst path {:.3} ns exceeds the {:.3} ns clock period (with setup and margin); no bitstream written (pass --ignore-timing to override)",
+                ta.worst_path.last().map(|p| p.arrival_ps).unwrap_or(0) as f64 / 1000.0,
+                period as f64 / 1000.0
+            ));
+        }
+    }
     let bs = be.bitstream(&routed)?;
     let fasm_text = bs.fasm.join("\n") + "\n";
     let fasm_path = std::path::Path::new(out).with_extension("fasm");

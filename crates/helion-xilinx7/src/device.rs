@@ -68,6 +68,12 @@ pub struct Pip {
     pub class: PipClass,
     pub is_pseudo: bool,
     pub can_invert: bool,
+    /// Slow-corner maximum delay through the pip (ps), from the DB.
+    pub delay_ps: u16,
+    /// The router may use this pip: it has configuration bits (segbits) or
+    /// is an always-on / default pseudo-pip. A pip with neither cannot be
+    /// encoded, and a `hint` pseudo-pip is a LUT route-through.
+    pub usable: bool,
 }
 
 /// One site pin: (pin name, tile wire).
@@ -343,6 +349,7 @@ impl Device {
             usize::try_from(wire_total).map_err(|_| "wire count overflow".to_string())?,
         )?;
         dev.stitch_nodes(&conn)?;
+        dev.mark_usable_pips();
 
         Ok(dev)
     }
@@ -506,7 +513,9 @@ impl Device {
             let is_pseudo = loose_bool(&p.is_pseudo);
             let can_invert = loose_bool(&p.can_invert);
             let directional = loose_bool(&p.is_directional);
-            let push = |tdata: &mut TileTypeData, s: u32, d: u32| {
+            let fwd = crate::db::load::pip_delay_ps(&p.src_to_dst);
+            let rev = crate::db::load::pip_delay_ps(&p.dst_to_src);
+            let push = |tdata: &mut TileTypeData, s: u32, d: u32, delay_ps: u16| {
                 let idx = tdata.pips.len() as u32;
                 tdata.pips.push(Pip {
                     src: s,
@@ -514,13 +523,15 @@ impl Device {
                     class: classify(&tdata.wires[s as usize], &tdata.wires[d as usize]),
                     is_pseudo,
                     can_invert,
+                    delay_ps,
+                    usable: true,
                 });
                 tdata.pips_from.entry(s).or_default().push(idx);
             };
-            push(tdata, src, dst);
+            push(tdata, src, dst, fwd);
             if !directional {
                 // Bidirectional (`<<->>`) pips are traversable both ways.
-                push(tdata, dst, src);
+                push(tdata, dst, src, rev);
             }
         }
 
@@ -556,6 +567,48 @@ impl Device {
             }
         }
         Ok(())
+    }
+
+    /// Decide, for every pip, whether the router may use it (see
+    /// [`Pip::usable`]). `_SING` tile types share their base type's bits.
+    fn mark_usable_pips(&mut self) {
+        use crate::db::parse::PpipKind;
+        let names: Vec<String> = self.types.iter().map(|t| t.name.clone()).collect();
+        for ti in 0..self.types.len() {
+            let name = names[ti].clone();
+            let base = name.strip_suffix("_SING").map(str::to_string);
+            let base_id = base.as_ref().and_then(|b| self.type_ids.get(b).copied());
+            let mut flags = Vec::with_capacity(self.types[ti].pips.len());
+            for p in &self.types[ti].pips {
+                let td = &self.types[ti];
+                let (d, s) = (&td.wires[p.dst as usize], &td.wires[p.src as usize]);
+                let key = format!("{name}.{d}.{s}");
+                let listed = td.ppips.iter().find(|pp| pp.name == key).map(|pp| pp.kind);
+                let ok = match listed {
+                    // LUT route-through hints are not connections.
+                    Some(PpipKind::Hint) => false,
+                    // Bit-less always-on / default-selected connections.
+                    Some(_) => true,
+                    None => {
+                        p.is_pseudo
+                            || td.segbits.is_empty()
+                            || td.segbits.contains_key(&key)
+                            || match (&base, base_id) {
+                                (Some(b), Some(bid)) => {
+                                    let bt = &self.types[bid as usize];
+                                    let bk = format!("{b}.{d}.{s}");
+                                    bt.segbits.contains_key(&bk) || bt.ppips.iter().any(|pp| pp.name == bk && !matches!(pp.kind, PpipKind::Hint))
+                                }
+                                _ => false,
+                            }
+                    }
+                };
+                flags.push(ok);
+            }
+            for (p, ok) in self.types[ti].pips.iter_mut().zip(flags) {
+                p.usable = ok;
+            }
+        }
     }
 
     /// Stitch cross-tile nodes from `tileconn.json`.
