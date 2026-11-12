@@ -669,8 +669,12 @@ impl P {
             self.bump();
             self.bump();
         }
+        let mut full = false;
         loop {
-            if self.is_kw("unique") || self.is_kw("unique0") || self.is_kw("priority") {
+            if self.is_kw("unique") || self.is_kw("priority") || self.is_kw("$full_case") {
+                full = true;
+                self.bump();
+            } else if self.is_kw("unique0") {
                 self.bump();
             } else {
                 break;
@@ -734,7 +738,7 @@ impl P {
                 let items = self.inside_items(":")?;
                 arms.push((items, self.stmt()?));
             }
-            return Ok(Stmt::Case { kind, expr, arms, line });
+            return Ok(Stmt::Case { kind, expr, arms, full, line });
         }
         if self.eat_kw("for") {
             self.expect_op("(")?;
@@ -1236,6 +1240,9 @@ impl P {
 
     /// One module-level item (may add several entries to `out`).
     fn item(&mut self, out: &mut Vec<Item>) -> R<()> {
+        while self.is_kw("$full_case") {
+            self.bump();
+        }
         let line = self.line();
         if self.eat_op(";") {
             return Ok(());

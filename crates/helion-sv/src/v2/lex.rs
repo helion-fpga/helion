@@ -146,11 +146,19 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
             }
             if j < c.len() && c[j] != ')' {
                 i += 2;
+                let st = i;
+                let at = line;
                 while i + 1 < c.len() && !(c[i] == '*' && c[i + 1] == ')') {
                     if c[i] == '\n' {
                         line += 1;
                     }
                     i += 1;
+                }
+                // The one attribute that changes the logic: a case that
+                // covers every value that can occur.
+                let text: String = c[st..i.min(c.len())].iter().collect();
+                if text.contains("full_case") {
+                    out.push(Tok { t: T::Id("$full_case".into()), line: at });
                 }
                 i += 2;
                 continue;
