@@ -2275,19 +2275,36 @@ mod tests {
         assert!(!bitstream_is_empty(&bits), "counter must be non-empty");
         let bits_path = dir.join("counter.hbits");
         std::fs::write(&bits_path, &bits.packets).unwrap();
-        unsafe {
-            std::env::remove_var("HELION_OPENFPGALOADER");
+        // Hermetic USB=0: a fixture openFPGALoader whose --scan-usb lists no
+        // probe (real ones depend on the host: absent on CI, a cable on a
+        // bench). Test builds also hide native FTDI enumeration.
+        #[cfg(not(unix))]
+        {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let fake = dir.join("fake-ofl-usb0");
+            std::fs::write(
+                &fake,
+                "#!/bin/sh\nif [ \"$1\" = \"--scan-usb\" ]; then echo 'empty'; exit 0; fi\necho should-not-run; exit 3\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            unsafe {
+                std::env::set_var("HELION_OPENFPGALOADER", &fake);
+            }
         }
         unsafe {
             std::env::remove_var("HELION_OFL_DRY_RUN");
         }
-        if !scan_usb_probes().probes.is_empty() {
-            eprintln!("skip: a real JTAG cable is attached (this test needs USB=0)");
-            return;
-        }
         let cable = resolve_cable("auto").unwrap();
         assert_eq!(cable.backend, CableBackend::OpenFpgaLoader);
         let err = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
+        unsafe {
+            std::env::remove_var("HELION_OPENFPGALOADER");
+        }
         assert!(
             err.contains(ERR_CODE_USB_0),
             "non-empty + USB=0 must refuse USB_0 only, got: {err}"
