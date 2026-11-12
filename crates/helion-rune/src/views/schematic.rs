@@ -1143,13 +1143,13 @@ pub fn schematic_pane(s: &AppState, t: &VivadoTheme) -> El {
         .fill(t.panel_bg)
         .border(1.0, t.border)
         .child(pane_header("Schematic", "schematic-pane", t))
-        .child(schematic_toolbar(s, t, live.as_ref()))
-        .child(cone::cone_toolbar(s, t, live.as_ref()))
+        .child(schematic_toolbar(s, t, live.as_deref()))
+        .child(cone::cone_toolbar(s, t, live.as_deref()))
         .child(body);
     if let Some(r) = results {
         pane = pane.child(el().w_full().px(6.0).pb(6.0).child(r));
     }
-    pane.child(schematic_props(s, t, live.as_ref()))
+    pane.child(schematic_props(s, t, live.as_deref()))
 }
 
 #[cfg(test)]

@@ -228,15 +228,25 @@ impl LiveNetlist {
     }
 
     pub fn cell(&self, name: &str) -> Option<&LiveCell> {
-        self.cells.iter().find(|c| c.name == name)
+        self.cells
+            .binary_search_by(|c| c.name.as_str().cmp(name))
+            .ok()
+            .map(|i| &self.cells[i])
     }
 
+    // `nets`, `cells` and `hier` are sorted by name in `from_design`.
     pub fn net(&self, name: &str) -> Option<&LiveNet> {
-        self.nets.iter().find(|n| n.name == name)
+        self.nets
+            .binary_search_by(|n| n.name.as_str().cmp(name))
+            .ok()
+            .map(|i| &self.nets[i])
     }
 
     pub fn hier_of(&self, name: &str) -> Option<&LiveHier> {
-        self.hier.iter().find(|h| h.name == name)
+        self.hier
+            .binary_search_by(|h| h.name.as_str().cmp(name))
+            .ok()
+            .map(|i| &self.hier[i])
     }
 
     /// Owning real instance of a cell/net name, if any.
@@ -391,17 +401,74 @@ pub fn live_design(s: &AppState) -> Option<&helion_ir::Design> {
     s.runs.live_design.as_ref().or(s.tcl.design.as_ref())
 }
 
-/// Sorted live netlist of the session design, if any.
-pub fn live_netlist(s: &AppState) -> Option<LiveNetlist> {
-    live_design(s).map(LiveNetlist::from_design)
+/// Identity of the design (and placement) a cached view model was built
+/// from. Cheap to compute; the per-frame reset in [`begin_frame`] covers
+/// in-place edits that keep the same allocation and sizes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BuiltFrom {
+    design: usize,
+    cells: usize,
+    nets: usize,
+    placed: usize,
 }
 
-/// Sorted live placement of the last implementation run, if any.
-pub fn live_placed(s: &AppState) -> Option<LivePlaced> {
+fn built_from(d: &helion_ir::Design, placed: Option<&helion_place::Placed>) -> BuiltFrom {
+    BuiltFrom {
+        design: std::ptr::from_ref(d) as usize,
+        cells: d.cells.len(),
+        nets: d.nets.len(),
+        placed: placed.map_or(0, |p| std::ptr::from_ref(p) as usize),
+    }
+}
+
+thread_local! {
+    static NETLIST: std::cell::RefCell<Option<(BuiltFrom, std::rc::Rc<LiveNetlist>)>> =
+        const { std::cell::RefCell::new(None) };
+    static PLACED: std::cell::RefCell<Option<(BuiltFrom, std::rc::Rc<LivePlaced>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Drop the cached view models. `view()` calls this once per frame, so every
+/// pane and table row in a frame shares one build (a 19k-cell design used to
+/// be rebuilt once per I/O port row, every frame).
+pub fn begin_frame() {
+    NETLIST.with(|c| c.borrow_mut().take());
+    PLACED.with(|c| c.borrow_mut().take());
+}
+
+/// Sorted live netlist of the session design, if any (shared within a frame).
+pub fn live_netlist(s: &AppState) -> Option<std::rc::Rc<LiveNetlist>> {
+    let d = live_design(s)?;
+    let key = built_from(d, None);
+    NETLIST.with(|c| {
+        if let Some((k, l)) = c.borrow().as_ref()
+            && *k == key
+        {
+            return Some(l.clone());
+        }
+        let l = std::rc::Rc::new(LiveNetlist::from_design(d));
+        *c.borrow_mut() = Some((key, l.clone()));
+        Some(l)
+    })
+}
+
+/// Sorted live placement of the last implementation run, if any (shared
+/// within a frame).
+pub fn live_placed(s: &AppState) -> Option<std::rc::Rc<LivePlaced>> {
     let placed = s.runs.live_placed.as_ref()?;
     let design = live_design(s)?;
-    let geom = live_geom(s);
-    Some(LivePlaced::from_placed(placed, design, &geom))
+    let key = built_from(design, Some(placed));
+    PLACED.with(|c| {
+        if let Some((k, l)) = c.borrow().as_ref()
+            && *k == key
+        {
+            return Some(l.clone());
+        }
+        let geom = live_geom(s);
+        let l = std::rc::Rc::new(LivePlaced::from_placed(placed, design, &geom));
+        *c.borrow_mut() = Some((key, l.clone()));
+        Some(l)
+    })
 }
 
 /// Cached run geometry when an impl run finished, else the project part's

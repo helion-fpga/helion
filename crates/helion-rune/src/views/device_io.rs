@@ -55,11 +55,18 @@ pub fn io_port_rows(s: &AppState) -> Vec<IoPortRow> {
     let Some(design) = crate::live::live_design(s) else {
         return Vec::new();
     };
-    let nets = crate::live::live_netlist(s)
-        .map(|n| n.nets)
-        .unwrap_or_default();
-    let placed = crate::live::live_placed(s)
-        .map(|p| p.cells)
+    let netlist = crate::live::live_netlist(s);
+    let placed = crate::live::live_placed(s);
+    // Placed IOB cells by name: one pass, not one scan per port.
+    let iobs: std::collections::HashMap<&str, &crate::live::LivePlacedCell> = placed
+        .as_deref()
+        .map(|p| {
+            p.cells
+                .iter()
+                .filter(|c| c.site_kind == "IOB")
+                .map(|c| (c.cell.as_str(), c))
+                .collect()
+        })
         .unwrap_or_default();
     design
         .ports
@@ -71,14 +78,12 @@ pub fn io_port_rows(s: &AppState) -> Vec<IoPortRow> {
                 helion_ir::PortDir::Out => "OUT",
                 helion_ir::PortDir::Inout => "INOUT",
             };
-            let on_net: &[String] = nets
-                .iter()
-                .find(|n| n.name == name)
+            let on_net: &[String] = netlist
+                .as_deref()
+                .and_then(|l| l.net(&name))
                 .map(|n| n.cells.as_slice())
                 .unwrap_or(&[]);
-            let iob = placed
-                .iter()
-                .find(|c| c.site_kind == "IOB" && on_net.iter().any(|n| n == &c.cell));
+            let iob = on_net.iter().find_map(|c| iobs.get(c.as_str()).copied());
             let attr = |k: &str| p.attrs.get(k).map(str::to_string);
             IoPortRow {
                 name,
