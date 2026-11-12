@@ -595,6 +595,17 @@ impl<'a> DeviceQuery for XDevice<'a> {
             .map(|(_, tile, site)| (tile, site))
     }
 
+    fn all_slices(&self) -> Vec<(String, String, i32, i32)> {
+        self.device
+            .slices()
+            .into_iter()
+            .filter_map(|(tile, site)| {
+                let (x, y) = self.tile_xy(&tile)?;
+                Some((tile, site, x, y))
+            })
+            .collect()
+    }
+
     fn anchor_slice(&self, site: &str, used: &HashSet<String>) -> Option<(String, String)> {
         // A caller-pinned chain-head site: validate the name parses, the
         // slice exists on the device, and it is still free.

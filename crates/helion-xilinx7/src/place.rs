@@ -36,6 +36,11 @@ pub trait DeviceQuery {
     /// `None` when the neighbor is taken or the column ends; the caller
     /// must fail loudly, since a non-adjacent cascade is unroutable.
     fn slice_above(&self, site: &str, used: &HashSet<String>) -> Option<(String, String)>;
+    /// Every slice site as `(tile, site, grid x, grid y)`. Empty (the
+    /// default) disables placement refinement.
+    fn all_slices(&self) -> Vec<(String, String, i32, i32)> {
+        Vec::new()
+    }
 }
 
 /// A placed LUT: tile + slice site + BEL.
@@ -545,6 +550,7 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         });
     }
 
+    crate::place_sa::refine(&mut out, device);
     Ok(out)
 }
 

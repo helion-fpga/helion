@@ -25,6 +25,7 @@ pub mod flow;
 pub mod frames;
 pub mod pack;
 pub mod place;
+pub mod place_sa;
 pub mod route;
 pub mod timing;
 pub mod xdevice;
