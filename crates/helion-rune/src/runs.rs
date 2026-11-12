@@ -2561,6 +2561,11 @@ mod tests {
         assert!(util.contains("LUTFF"), "{util}");
         let timing = crate::tcl::eval_batch(&mut s, "report_timing").expect("timing");
         assert!(timing.contains("WNS"), "{timing}");
+        assert_eq!(
+            crate::tcl::wns_ps(&mut s).ok(),
+            s.timing.wns_ps,
+            "Tcl timing uses the run's constraints"
+        );
         assert!(crate::tcl::eval_batch(&mut s, "open_run impl_1").is_ok());
         assert!(crate::tcl::eval_batch(&mut s, "open_run synth_9").is_err());
     }

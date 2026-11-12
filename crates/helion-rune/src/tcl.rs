@@ -4530,6 +4530,15 @@ pub fn open_run(s: &mut AppState) -> Result<String, String> {
     s.tcl.design_name = Some(helion_ir::resolve(design.name).to_string());
     s.tcl.session.synth_design(design.clone());
     s.tcl.design = Some(design);
+    // The run's constraints (project .xdc/.sdc, or a wizard-written file),
+    // so Tcl timing matches the run instead of a default 10 ns clock.
+    if let Some(ctx) = s.runs.analysis.clone() {
+        let (mut xdc, clks) = crate::runs::load_ctx_constraints(&ctx, &|_, _| {});
+        if !clks.is_empty() {
+            xdc.clocks = clks;
+            s.tcl.clocks = xdc;
+        }
+    }
     let placed = s.runs.live_placed.clone();
     let routed = s.runs.analysis.as_ref().and_then(|a| a.routed.clone());
     s.tcl.session.packed = placed.as_ref().map(|p| p.packed.clone());
