@@ -378,6 +378,39 @@ pub struct CompiledFf {
     pub rst_net: u32,
 }
 
+/// A Helion block RAM (`Bram18` with per-bit pins), as helion-ir defines
+/// it: 1024 x 16, read-first, read latency 1, `DO` starting at 0, an
+/// unconnected input reading 0 and an unconnected `RE` 1. `DO` bit `i` is
+/// the compiled FF `ffs[do_ff + i]` (enabled by `RE`), whose D is the
+/// internal net `rd[i]`, set on each edge to the word at `RADDR` before
+/// the edge's write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompiledRam {
+    pub name: String,
+    pub di: [u32; 16],
+    pub waddr: [u32; 10],
+    pub raddr: [u32; 10],
+    pub we: u32,
+    pub rd: [u32; 16],
+    pub do_ff: usize,
+    /// Initial contents (`INIT`), 1024 words.
+    pub init: Vec<u16>,
+}
+
+/// `INIT` of a `Bram18`: word `w` holds addresses `4w..4w+3`, address
+/// `4w+k` in bits `16k..16k+15`.
+fn bram_init(cell: &Cell) -> Vec<u16> {
+    let mut mem = vec![0u16; 1024];
+    let words = cell.attrs.get("INIT").unwrap_or("");
+    for (w, t) in words.split(',').map(str::trim).filter(|t| !t.is_empty()).enumerate().take(256) {
+        let v = u64::from_str_radix(t.trim_start_matches("0x").trim_start_matches("0X"), 16).unwrap_or(0);
+        for k in 0..4 {
+            mem[4 * w + k] = (v >> (16 * k)) as u16;
+        }
+    }
+    mem
+}
+
 /// Topologically levelized schedule for a [`Design`].
 #[derive(Clone, Debug)]
 pub struct LevelizedSchedule {
@@ -401,6 +434,8 @@ pub struct LevelizedSchedule {
     pub led_net: Option<u32>,
     /// True if a combinational cycle was detected and broken during levelization.
     pub has_combinational_loop: bool,
+    /// Block RAMs (`Bram18` with pins).
+    pub rams: Vec<CompiledRam>,
 }
 
 /// Classify whether a cell is a `MUXF7` or `MUXF8` primitive (either via `BlackBox` module name
@@ -475,6 +510,7 @@ impl LevelizedSchedule {
         let mut ffs = Vec::new();
         let mut ff_ids = HashMap::new();
         let mut raw_nodes: Vec<CompiledNode> = Vec::new();
+        let mut rams: Vec<CompiledRam> = Vec::new();
 
         for c in &design.cells {
             let cname = resolve(c.name);
@@ -594,6 +630,79 @@ impl LevelizedSchedule {
                         level: 0,
                         kind: ConeNodeKind::Mul { a, b, c: cc, p: p_nodes },
                     });
+                }
+                CellKind::Mac27 if c.attrs.get("sim_mul").is_none() => {
+                    // Per-bit pins (helion-ir): A0..15, B0..15, C0..31, P0..31.
+                    let p: Vec<u32> = (0..32).map(|i| resolve_out_pin(cname, &format!("P{i}"), &mut net_names, &mut net_ids)).collect();
+                    if p.iter().all(|&n| n == NET_UNCONNECTED) {
+                        continue;
+                    }
+                    let mut a: Vec<u32> = (0..16).map(|i| resolve_in_pin(cname, &format!("A{i}"), &mut net_names, &mut net_ids)).collect();
+                    let mut b: Vec<u32> = (0..16).map(|i| resolve_in_pin(cname, &format!("B{i}"), &mut net_names, &mut net_ids)).collect();
+                    let cc: Vec<u32> = (0..32).map(|i| resolve_in_pin(cname, &format!("C{i}"), &mut net_names, &mut net_ids)).collect();
+                    if c.attrs.get("SIGNED") == Some("1") {
+                        // Sign-extended to 32 bits, the product modulo 2^32
+                        // is the two's-complement one.
+                        let (sa, sb) = (a[15], b[15]);
+                        a.resize(32, sa);
+                        b.resize(32, sb);
+                    }
+                    let p_nodes = if c.attrs.get("PREG") == Some("1") {
+                        let ce_net = match pin_ix.net_on(cname, "CE") {
+                            Some(s) => intern_net(resolve(s), &mut net_names, &mut net_ids),
+                            None => NET_ONE,
+                        };
+                        let rst_net = resolve_in_pin(cname, "RST", &mut net_names, &mut net_ids);
+                        let mut internal = Vec::with_capacity(32);
+                        for (i, &q_net) in p.iter().enumerate() {
+                            let d_net = intern_net(&format!("{cname}$p{i}"), &mut net_names, &mut net_ids);
+                            internal.push(d_net);
+                            let name = format!("{cname}$preg{i}");
+                            ff_ids.insert(name.clone(), ffs.len());
+                            ffs.push(CompiledFf { name, d_net, q_net, ce_net, rst_net });
+                        }
+                        internal
+                    } else {
+                        p
+                    };
+                    raw_nodes.push(CompiledNode {
+                        cell_name: cname.to_string(),
+                        level: 0,
+                        kind: ConeNodeKind::Mul { a, b, c: cc, p: p_nodes },
+                    });
+                }
+                CellKind::Bram18 => {
+                    let do_nets: Vec<u32> = (0..16).map(|i| resolve_out_pin(cname, &format!("DO{i}"), &mut net_names, &mut net_ids)).collect();
+                    // A Bram18 with no pin is the host-access aperture.
+                    let pins = (0..16).map(|i| format!("DI{i}")).chain((0..10).flat_map(|i| [format!("WADDR{i}"), format!("RADDR{i}")])).chain(["WE".into(), "RE".into()]);
+                    let connected = do_nets.iter().any(|&n| n != NET_UNCONNECTED) || pins.into_iter().any(|p| pin_ix.net_on(cname, &p).is_some());
+                    if !connected {
+                        continue;
+                    }
+                    let mut di = [NET_ZERO; 16];
+                    let mut rd = [NET_ZERO; 16];
+                    for i in 0..16 {
+                        di[i] = resolve_in_pin(cname, &format!("DI{i}"), &mut net_names, &mut net_ids);
+                        rd[i] = intern_net(&format!("{cname}$rd{i}"), &mut net_names, &mut net_ids);
+                    }
+                    let mut waddr = [NET_ZERO; 10];
+                    let mut raddr = [NET_ZERO; 10];
+                    for i in 0..10 {
+                        waddr[i] = resolve_in_pin(cname, &format!("WADDR{i}"), &mut net_names, &mut net_ids);
+                        raddr[i] = resolve_in_pin(cname, &format!("RADDR{i}"), &mut net_names, &mut net_ids);
+                    }
+                    let we = resolve_in_pin(cname, "WE", &mut net_names, &mut net_ids);
+                    let re = match pin_ix.net_on(cname, "RE") {
+                        Some(s) => intern_net(resolve(s), &mut net_names, &mut net_ids),
+                        None => NET_ONE,
+                    };
+                    let do_ff = ffs.len();
+                    for (i, &q_net) in do_nets.iter().enumerate() {
+                        let name = format!("{cname}$do{i}");
+                        ff_ids.insert(name.clone(), ffs.len());
+                        ffs.push(CompiledFf { name, d_net: rd[i], q_net, ce_net: re, rst_net: NET_ZERO });
+                    }
+                    rams.push(CompiledRam { name: cname.to_string(), di, waddr, raddr, we, rd, do_ff, init: bram_init(c) });
                 }
                 _ => {
                     if let Some(is_f8) = classify_muxf_cell(c) {
@@ -799,6 +908,7 @@ impl LevelizedSchedule {
             output_ports,
             led_net,
             has_combinational_loop,
+            rams,
         }
     }
 
@@ -846,6 +956,8 @@ pub struct CompiledSim {
     force_mask: Vec<u64>,
     /// Active continuous force value per net.
     force_val: Vec<u64>,
+    /// Contents of each block RAM (`schedule.rams`).
+    ram_mem: Vec<Vec<u16>>,
 }
 
 #[inline]
@@ -925,7 +1037,9 @@ impl CompiledSim {
             next_ff_xz: vec![0u64; ff_words.max(1)],
             force_mask: vec![0u64; net_words.max(1)],
             force_val: vec![0u64; net_words.max(1)],
+            ram_mem: Vec::new(),
         };
+        sim.ram_mem = sim.schedule.rams.iter().map(|r| r.init.clone()).collect();
         if init_ffs_x {
             sim.eval_comb_4state();
         } else {
@@ -1140,6 +1254,35 @@ impl CompiledSim {
         }
     }
 
+    /// Block RAMs at a rising edge, from the settled pre-edge values: put
+    /// the word at RADDR (before this edge's write) on each RAM's read
+    /// nets, for its DO flops to take, and do the writes. In 4-state an
+    /// unknown read address reads X, and a write with an unknown WE or
+    /// write address is not done.
+    fn ram_edge(&mut self, four_state: bool) {
+        for (k, r) in self.schedule.rams.iter().enumerate() {
+            let known = |xz: &[u64], nets: &[u32]| nets.iter().all(|&n| !get_bit(xz, n));
+            let raddr = bus_value(&self.net_val, &r.raddr) as usize;
+            let word = self.ram_mem[k][raddr];
+            let read_x = four_state && !known(&self.net_xz, &r.raddr);
+            for (i, &n) in r.rd.iter().enumerate() {
+                let v = if read_x { Logic4::X } else { Logic4::from_bool((word >> i) & 1 == 1) };
+                set_logic4(&mut self.net_val, &mut self.net_xz, n, v);
+            }
+            let we = get_bit(&self.net_val, r.we) && (!four_state || known(&self.net_xz, &[r.we]));
+            if we && (!four_state || known(&self.net_xz, &r.waddr)) {
+                let waddr = bus_value(&self.net_val, &r.waddr) as usize;
+                self.ram_mem[k][waddr] = bus_value(&self.net_val, &r.di) as u16;
+            }
+        }
+    }
+
+    /// Word `addr` of the block RAM `cell` (`None`: no such RAM).
+    pub fn ram_word(&self, cell: &str, addr: usize) -> Option<u16> {
+        let k = self.schedule.rams.iter().position(|r| r.name == cell)?;
+        self.ram_mem[k].get(addr).copied()
+    }
+
     /// Execute one clock posedge on the 2-state compiled fast path (zero heap allocation).
     #[inline]
     pub fn step_2state(&mut self, delay_ps: u64) {
@@ -1148,6 +1291,7 @@ impl CompiledSim {
 
         // 1. Evaluate combinational cones from current FF Q + input state.
         self.eval_comb_2state();
+        self.ram_edge(false);
 
         // 2. Sample FF D inputs into scratch next_ff_val.
         for (idx, ff) in self.schedule.ffs.iter().enumerate() {
@@ -1200,6 +1344,7 @@ impl CompiledSim {
 
         // 1. Evaluate 4-state combinational cones before clock edge.
         self.eval_comb_4state();
+        self.ram_edge(true);
 
         // 2. Sample FF D inputs with 4-state reset / clock-enable semantics.
         for (idx, ff) in self.schedule.ffs.iter().enumerate() {
