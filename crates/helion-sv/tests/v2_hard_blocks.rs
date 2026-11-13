@@ -163,3 +163,108 @@ fn wide_deep_and_two_port_memories_take_several_block_rams() {
     let d = synth(&mem(20, 2048, true), true);
     assert_eq!((rams(&d), flops(&d)), (8, 2));
 }
+
+#[test]
+fn products_through_wires_go_on_the_p_register() {
+    let src = |body: &str| format!("module t(input logic clk, input logic [15:0] a, input logic [15:0] b, input logic [31:0] c, output logic [31:0] p);\n  logic [31:0] m;\n  logic [31:0] n;\n  assign m = a * b;\n  assign n = m;\n{body}\nendmodule\n");
+    let flops = |d: &Design| count(d, |k| matches!(k, CellKind::Hff));
+    let preg = |d: &Design| d.cells.iter().filter(|c| matches!(c.kind, CellKind::Mac27) && c.attrs.get("PREG") == Some("1")).count();
+    // Through one, two and three wires.
+    for body in ["  always_ff @(posedge clk) p <= m;", "  always_ff @(posedge clk) p <= n;", "  logic [31:0] k;\n  assign k = n;\n  always_ff @(posedge clk) p <= k;"] {
+        let d = synth(&src(body), true);
+        assert_eq!((macs(&d), preg(&d), flops(&d)), (1, 1, 0), "{body}");
+    }
+    // Off, nothing changes.
+    let d = synth(&src("  always_ff @(posedge clk) p <= m;"), false);
+    assert_eq!((macs(&d), flops(&d)), (0, 32));
+}
+
+#[test]
+fn memories_wider_than_64_bits_keep_every_init_bit() {
+    let src = "module t(input logic clk, input logic we, input logic [7:0] wa, input logic [7:0] ra, input logic [71:0] d, output logic [71:0] q);
+  logic [71:0] mem [0:255] = '{0: 72'hA5_0123456789ABCDEF, 1: 72'h80_0000000000000000, 7: 72'hFF_FFFF0000FFFF0000, 255: 72'h3C_DEADBEEFCAFEF00D, default: 72'h12_3456789ABCDEF012};
+  always_ff @(posedge clk) begin
+    if (we) mem[wa] <= d;
+    q <= mem[ra];
+  end
+endmodule
+";
+    let word = |a: usize| -> u128 {
+        match a {
+            0 => 0xA5_0123456789ABCDEF,
+            1 => 0x80_0000000000000000,
+            7 => 0xFF_FFFF0000FFFF0000,
+            255 => 0x3C_DEADBEEFCAFEF00D,
+            _ => 0x12_3456789ABCDEF012,
+        }
+    };
+    let d = synth(src, true);
+    assert_eq!(rams(&d), 5);
+    for s in 0..5 {
+        let mut init: Vec<u64> = (0..64).map(|w| (0..4).fold(0u64, |v, k| v | (((word(4 * w + k) >> (16 * s)) & 0xffff) as u64) << (16 * k))).collect();
+        while init.last() == Some(&0) {
+            init.pop();
+        }
+        let want = init.iter().map(|w| format!("{w:x}")).collect::<Vec<_>>().join(",");
+        let name = format!("mem_ram_r0_b0_s{s}");
+        let c = d.cells.iter().find(|c| helion_ir::resolve(c.name) == name).unwrap_or_else(|| panic!("{name}"));
+        assert_eq!(c.attrs.get("INIT"), Some(want.as_str()), "slice {s}");
+    }
+}
+
+/// Every net has at most one driver and every cell name is used once.
+fn one_driver_each(d: &Design) {
+    let mut cells = std::collections::HashSet::new();
+    for c in &d.cells {
+        assert!(cells.insert(c.name), "cell {} twice", helion_ir::resolve(c.name));
+    }
+    let kind: std::collections::HashMap<_, _> = d.cells.iter().map(|c| (c.name, c.kind.clone())).collect();
+    for n in &d.nets {
+        let drivers: Vec<String> = n
+            .endpoints
+            .iter()
+            .filter(|e| {
+                let pin = helion_ir::resolve(e.pin);
+                let num = |p: &str| pin.strip_prefix(p).is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()));
+                match kind.get(&e.cell) {
+                    Some(CellKind::Hff) => pin == "Q",
+                    Some(CellKind::Lut6 { .. }) => pin == "O",
+                    Some(CellKind::Bram18) => num("DO"),
+                    Some(CellKind::Mac27) => num("P"),
+                    _ => false,
+                }
+            })
+            .map(|e| format!("{}.{}", helion_ir::resolve(e.cell), helion_ir::resolve(e.pin)))
+            .collect();
+        assert!(drivers.len() <= 1, "net {} has drivers {drivers:?}", helion_ir::resolve(n.name));
+    }
+}
+
+#[test]
+fn nets_made_up_for_blocks_take_no_name_of_the_design() {
+    let deep = |extra_ports: &str, extra: &str| {
+        format!(
+            "module t(input logic clk, input logic we, input logic t, input logic [10:0] wa, input logic [10:0] ra, input logic [7:0] d, output logic [7:0] q{extra_ports});\n  logic [7:0] mem [0:2047];\n  always_ff @(posedge clk) begin\n    if (we) mem[wa] <= d;\n    q <= mem[ra];\n{extra}  end\nendmodule\n"
+        )
+    };
+    let cases = [
+        // A register named like the bank select.
+        deep(", output logic q_bank0", "    q_bank0 <= t;\n"),
+        // ... powering up at 1 (its net is q_bank0_n, its cell q_bank0_reg).
+        deep(", output logic q_bank0", "    q_bank0 <= t;\n").replace("output logic q_bank0);", "output logic q_bank0 = 1'b1);"),
+        // A register named like a bank's data out, and a port.
+        deep(", output logic q_bank1_do3, output logic q_bank0_do0", "    q_bank1_do3 <= t;\n").replace("endmodule", "  assign q_bank0_do0 = ~t;\nendmodule"),
+        // A register that is not read, named like the bank select.
+        deep("", "    q_bank0 <= t;\n").replace("logic [7:0] mem", "logic q_bank0;\n  logic [7:0] mem"),
+    ];
+    for (i, src) in cases.iter().enumerate() {
+        let d = synth(src, true);
+        assert_eq!(rams(&d), 2, "case {i}");
+        one_driver_each(&d);
+    }
+    // A register named like a multiplier's product.
+    let mul = "module t(input logic clk, input logic t, input logic [15:0] a, input logic [15:0] b, output logic [31:0] p, output logic u_mul0_p3);\n  assign p = a * b;\n  always_ff @(posedge clk) u_mul0_p3 <= t;\nendmodule\n";
+    let d = synth(mul, true);
+    assert_eq!(macs(&d), 1);
+    one_driver_each(&d);
+}

@@ -426,10 +426,13 @@ fn infer_mac_regs(flat: &Flat) -> HashMap<u32, MacRegCand> {
         let loads: Vec<N> = leaves.iter().copied().filter(|&l| !is_zero(flat, l) && !is_whole_read(flat, l, r.sig)).collect();
         let [load] = loads.as_slice() else { continue };
         let is_mul = |m: N| matches!(flat.dag.op(m), Op::Mul(..)) && flat.dag.w(m) == s.w;
-        let cand = match flat.dag.op(*load) {
-            Op::Mul(..) if is_mul(*load) => MacRegCand { load: *load, mul: *load, c: None },
-            Op::Add(x, y) if flat.dag.w(*load) == s.w => {
-                let (x, y) = (*x, *y);
+        // (`load` stays the leaf the register's input names; the product
+        // may come through wires: `assign m = a * b; r <= m;`.)
+        let value = whole_wire(flat, *load);
+        let cand = match flat.dag.op(value) {
+            Op::Mul(..) if is_mul(value) => MacRegCand { load: *load, mul: value, c: None },
+            Op::Add(x, y) if flat.dag.w(value) == s.w => {
+                let (x, y) = (whole_wire(flat, *x), whole_wire(flat, *y));
                 if is_mul(x) {
                     MacRegCand { load: *load, mul: x, c: Some(y) }
                 } else if is_mul(y) {
@@ -443,6 +446,24 @@ fn infer_mac_regs(flat: &Flat) -> HashMap<u32, MacRegCand> {
         out.insert(r.sig, cand);
     }
     out
+}
+
+/// Follow whole reads of combinationally driven signals (every bit `i`
+/// of the signal bit `i` of one node as wide) down to that node.
+fn whole_wire(flat: &Flat, mut n: N) -> N {
+    for _ in 0..64 {
+        let Op::Read(sig) = flat.dag.op(n) else { break };
+        let s = &flat.sigs[*sig as usize];
+        if flat.dag.w(n) != s.w {
+            break;
+        }
+        let Some(Drv::Comb(m, 0)) = s.drv.first().copied() else { break };
+        if flat.dag.w(m) != s.w || s.drv.iter().enumerate().any(|(i, d)| *d != Drv::Comb(m, i as u32)) {
+            break;
+        }
+        n = m;
+    }
+    n
 }
 
 /// Error prefix asking `lower` to build memory signal `n` from flops.
@@ -1275,6 +1296,33 @@ fn lower_with(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Result<
         taken.insert(n.clone());
         net_of.insert(l, n);
     }
+    // Names the design itself gives nets and flops: registers (read or
+    // not, with and without the complement's `_n`) and ports. A net made
+    // up for a hard block takes none of them (nor, for a flop, a cell
+    // name `<name>_reg` of a register).
+    let mut fixed: std::collections::HashSet<String> = taken.clone();
+    for rb in &reg_bits {
+        let s = &flat.sigs[rb.sig as usize];
+        let n = bit_name(&s.name, s.w, rb.bit);
+        fixed.insert(format!("{n}_n"));
+        fixed.insert(n);
+    }
+    for p in &flat.ports {
+        fixed.insert(p.name.clone());
+        for i in 0..p.w {
+            fixed.insert(bit_name(&p.name, p.w, i));
+        }
+    }
+    let made_up = |base: String, taken: &mut std::collections::HashSet<String>| -> String {
+        let mut n = base.clone();
+        let mut k = 1;
+        while fixed.contains(&n) || taken.contains(&n) {
+            n = format!("{base}_{k}");
+            k += 1;
+        }
+        taken.insert(n.clone());
+        n
+    };
     // Outputs of hard blocks: a RAM's data out carries the name of the
     // register it replaces (with several depth banks, each bank's has the
     // bank's number, and the register is the bank chosen by the select).
@@ -1285,8 +1333,14 @@ fn lower_with(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Result<
             let s = &flat.sigs[port.q as usize];
             for (bk, bank) in port.bank_do.iter().enumerate() {
                 for (b, &l) in bank.iter().enumerate() {
-                    let n = if port.bank_do.len() == 1 { bit_name(&s.name, s.w, b as u32) } else { format!("{}_bank{bk}_do{b}", s.name) };
-                    taken.insert(n.clone());
+                    let n = if port.bank_do.len() == 1 {
+                        // The register's own name: it is not a flop any more.
+                        let n = bit_name(&s.name, s.w, b as u32);
+                        taken.insert(n.clone());
+                        n
+                    } else {
+                        made_up(format!("{}_bank{bk}_do{b}", s.name), &mut taken)
+                    };
                     net_of.insert(l, n);
                 }
             }
@@ -1297,8 +1351,9 @@ fn lower_with(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Result<
             }
         }
     }
-    for (q, _, _, name) in &extra_ffs {
-        taken.insert(name.clone());
+    let mut extra_ffs = extra_ffs;
+    for (q, _, _, name) in extra_ffs.iter_mut() {
+        *name = made_up(std::mem::take(name), &mut taken);
         net_of.insert(*q, name.clone());
     }
     for (k, m) in macs.iter().enumerate() {
@@ -1307,8 +1362,7 @@ fn lower_with(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Result<
             continue;
         }
         for (b, &l) in m.p.iter().enumerate() {
-            let n = format!("u_mul{k}_p{b}");
-            taken.insert(n.clone());
+            let n = made_up(format!("u_mul{k}_p{b}"), &mut taken);
             net_of.insert(l, n);
         }
     }
@@ -1526,9 +1580,11 @@ fn lower_with(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Result<
         let g = r.geo;
         let total = r.ports.iter().filter(|p| p.dout.is_some()).count() as u32 * r.banks() * r.slices();
         // Contents: word `a` sits at position `hi - a` when declared ascending.
-        let word = |a: u32| -> u64 {
+        // Bits `16 * slice ..` of word `a`, built bit by bit (a word may be
+        // wider than any integer).
+        let slice_bits = |a: u32, slice: u32| -> u64 {
             let pos = if g.asc { g.hi as u32 - a } else { a };
-            (0..g.ew).fold(0u64, |v, b| v | ((sm.init[(pos * g.ew + b) as usize] as u64) << b))
+            (0..16u32).filter(|k| 16 * slice + k < g.ew).fold(0u64, |v, k| v | ((sm.init[(pos * g.ew + 16 * slice + k) as usize] as u64) << k))
         };
         let words = g.count.min(1024);
         for (pi, port) in r.ports.iter().enumerate() {
@@ -1558,7 +1614,7 @@ fn lower_with(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Result<
                     pin(*clk, "CLK".into(), u32::MAX, &mut d);
                     d.add_cell(&cell, CellKind::Bram18);
                     let base = bank * 1024;
-                    let slice_word = |a: u32| (word(base + a) >> (16 * slice)) & 0xffff;
+                    let slice_word = |a: u32| slice_bits(base + a, slice);
                     let mut init: Vec<u64> = (0..words.div_ceil(4)).map(|w| (0..4).fold(0u64, |v, k| if 4 * w + k < words { v | slice_word(4 * w + k) << (16 * k) } else { v })).collect();
                     while init.last() == Some(&0) {
                         init.pop();
