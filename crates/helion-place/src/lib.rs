@@ -2713,7 +2713,10 @@ pub fn electrostatic_bipartition_spread_1d(
         // bounded by physical site capacity on each side.
         let total_cap = ((span + 1.0) * cap as f64).max(slice.len() as f64);
         let min_left_frac = ((slice.len() - mid) as f64 / total_cap).clamp(0.15, 0.85);
-        let target_frac = (mid as f64 / slice.len() as f64).clamp(min_left_frac, 1.0 - min_left_frac);
+        // Past capacity with an odd count each side needs more than half:
+        // cut in the middle.
+        let (lo_frac, hi_frac) = (min_left_frac, 1.0 - min_left_frac);
+        let target_frac = if lo_frac <= hi_frac { (mid as f64 / slice.len() as f64).clamp(lo_frac, hi_frac) } else { 0.5 };
         let cut = l + span * target_frac;
         recurse(&slice[..mid], pos, l, cut, cap, out);
         recurse(&slice[mid..], pos, cut, r, cap, out);
@@ -4486,6 +4489,20 @@ mod tests {
         assert!((x[0] - 1.0).abs() < 1e-6, "x[0]={}", x[0]);
         assert!((x[1] - 2.0).abs() < 1e-6, "x[1]={}", x[1]);
         assert!((x[2] - 3.0).abs() < 1e-6, "x[2]={}", x[2]);
+    }
+
+    /// More cells than a span holds, an odd count: each half of the cut
+    /// would need more than half the span. The cut falls in the middle
+    /// (the bounds used to cross and `clamp` panicked).
+    #[test]
+    fn spreading_past_capacity_with_an_odd_count_cuts_in_the_middle() {
+        let out = electrostatic_bipartition_spread_1d(&[0.2, 0.7, 1.1], 0.0, 1.5, 1);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|v| (0.0..=1.5).contains(v)), "{out:?}");
+        assert!(out[0] <= out[1] && out[1] <= out[2], "order kept: {out:?}");
+        let pos: Vec<f64> = (0..101).map(|i| i as f64 * 0.01).collect();
+        let out = electrostatic_bipartition_spread_1d(&pos, 0.0, 4.0, 8);
+        assert!(out.iter().all(|v| (0.0..=4.0).contains(v)), "{out:?}");
     }
 
     #[test]
