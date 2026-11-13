@@ -26,15 +26,29 @@ thread_local! {
 /// `None` goes back to the default, which is `HELION_V2_HARD=1` in the
 /// environment, else off. With it on:
 ///
-/// - a multiplication whose result is at most 32 bits and whose operands
-///   are 16-bit values (zero-extended, or both sign-extended) becomes a
-///   `Mac27` (`P = A * B`, combinational, `SIGNED` for signed operands);
-/// - a memory of at most 1024 words of at most 16 bits, indexed from 0
-///   with addresses as wide as its depth (a power of two), written by one
-///   nonblocking `mem[waddr] <= data` (under any condition) and read only
-///   by one register `q <= mem[raddr]` (under any condition), in one
-///   rising-edge process without reset, becomes a `Bram18` whose `DO` is
-///   that register.
+/// - a multiplication whose operands are 16-bit values (zero-extended, or
+///   both sign-extended) becomes a `Mac27` (`P = A * B`, `SIGNED` for
+///   signed operands; a result wider than 32 bits is P extended);
+///   a product of wider (or mixed-sign) variables becomes one unsigned
+///   `Mac27` per 16 x 16 partial product that reaches the result (at most
+///   16), summed with adders;
+/// - `a * b + c` (a one-block product and an addend of its width, at most
+///   32 bits) puts `c` on the block's `C`;
+/// - a register of at most 32 bits, powering up at 0, without
+///   asynchronous reset, whose next value is a one-block product (or
+///   product plus addend), 0 or itself, becomes the block's `P` register
+///   (`PREG=1`; the conditions for the product are `CE`, those for 0
+///   `RST`);
+/// - a memory of a power of two words, indexed from 0 with addresses as
+///   wide as its depth, written by one nonblocking `mem[waddr] <= data`
+///   (under any condition) and read only by registers `q <= mem[raddr]`
+///   (under any condition), all in one rising-edge process family without
+///   reset, becomes `Bram18`s: per read register one set of blocks (all
+///   written alike), each set one block per 1024 words deep (the high
+///   address bits enable the write, and the read's high bits, registered
+///   with it, choose the output) and per 16 bits wide; at most 64 blocks.
+///   With one register, 1024 words and 16 bits it is one block whose `DO`
+///   is the register.
 ///
 /// Anything else is built from LUTs and flops as before. The cells need a
 /// part with BRAM / DSP sites; v2 does not know the part, hence the opt-in.

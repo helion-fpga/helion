@@ -379,6 +379,11 @@ impl Dag {
             return b;
         }
         let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        // A product plus an addend, kept whole for the netlist to put on a
+        // multiplier block with its C input.
+        if w <= 32 && super::hard_blocks() && [a, b].iter().any(|&m| matches!(self.op(m), Op::Mul(..)) && self.w(m) == w) {
+            return self.intern(Op::Add(a, b), w);
+        }
         if w > PREFIX_MIN_W && !carry_arith() {
             return self.prefix_add(a, b, false).0;
         }
@@ -488,8 +493,9 @@ impl Dag {
                 }
             }
         }
-        // Kept whole for the netlist to put on a multiplier block.
-        if w <= 32 && super::hard_blocks() {
+        // Kept whole for the netlist to put on multiplier blocks (a wider
+        // product of two variables, on several).
+        if super::hard_blocks() && (w <= 32 || (w <= 128 && self.as_const(a).is_none() && self.as_const(b).is_none())) {
             return self.intern(Op::Mul(a, b), w);
         }
         // Shift-and-add over named partial sums (no `*` in the emitted SV).

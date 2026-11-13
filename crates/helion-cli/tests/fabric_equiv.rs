@@ -1209,3 +1209,61 @@ fn phys_opt_pin_permutation_keeps_the_logic() {
     )
     .expect("phys_opt");
 }
+
+/// From RTL to the fabric, the second round of inference: registered
+/// products (PREG with CE and RST), products plus an addend (C), products
+/// wider than one block (several blocks and adders), memories wider than
+/// 16 bits or deeper than 1024 words (several RAMs, a registered bank
+/// select) and with two read ports (a RAM per port, both written).
+/// `tools/svcheck` (HELION_V2_HARD=1 on `tools/svcheck/hard`) shows these
+/// netlists equal their RTL; here their bitstreams equal the netlists.
+#[test]
+fn inferred_wide_deep_registered_and_two_port_blocks_on_the_fabric() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/svcheck/hard/");
+    helion_sv::v2::set_hard_blocks(Some(true));
+    let synth_src = |src: &str| helion_sv::synth_sv_v2(src, "t.sv", None).expect("synth").design;
+    let synth = |f: &str| synth_src(&std::fs::read_to_string(format!("{root}{f}")).expect("source"));
+    // mac.sv without its combinational output (the part has too few pads
+    // for all four); `+ C` on its own is in w32x below.
+    let mac_src = std::fs::read_to_string(format!("{root}mac.sv")).expect("source").replace(" output logic [31:0] p3,", "").replace("  assign p3 = a * b + c;\n", "");
+    let mac = synth_src(&mac_src);
+    let rams: Vec<(&str, Design, usize)> = ["ram_wide.sv", "ram_deep.sv", "ram_2r.sv", "ram_2r_deep_wide.sv"].iter().map(|f| (*f, synth(f), 0)).collect();
+    // Wide products that fit HL10S's four multiplier sites.
+    let w40 = synth_src("module w40(input logic [19:0] a, input logic [19:0] b, output logic [39:0] p);\n  assign p = a * b;\nendmodule\n");
+    let w32 = synth_src("module w32(input logic clk, input logic [31:0] x, input logic [31:0] y, output logic [31:0] p);\n  always_ff @(posedge clk) p <= x * y;\nendmodule\n");
+    let addc = synth_src("module addc(input logic [15:0] a, input logic [15:0] b, input logic [31:0] c, output logic [31:0] p);\n  assign p = a * b + c;\nendmodule\n");
+    helion_sv::v2::set_hard_blocks(None);
+    let count = |d: &Design, k: fn(&CellKind) -> bool| d.cells.iter().filter(|c| k(&c.kind)).count();
+    let is_mac = |k: &CellKind| matches!(k, CellKind::Mac27);
+    let is_ram = |k: &CellKind| matches!(k, CellKind::Bram18);
+    assert_eq!(count(&mac, is_mac), 3);
+    assert_eq!(mac.cells.iter().filter(|c| c.attrs.get("PREG") == Some("1")).count(), 3);
+    assert_eq!((count(&addc, is_mac), count(&addc, |k| matches!(k, CellKind::Lut6 { .. }))), (1, 0));
+    assert_eq!((count(&w40, is_mac), count(&w32, is_mac)), (4, 3));
+    let want = [2, 4, 2, 8];
+    for ((f, d, _), n) in rams.iter().zip(want) {
+        assert_eq!(count(d, is_ram), n, "{f}");
+    }
+    let part = "HL10S-C64-1";
+    check_design(&mac, part, 400, |_| {}).expect("mac");
+    check_design(&w40, part, 200, |_| {}).expect("w40");
+    check_design(&w32, part, 200, |_| {}).expect("w32");
+    check_design(&addc, part, 200, |_| {}).expect("addc");
+    for (f, d, _) in &rams {
+        check_design(d, part, 500, |_| {}).unwrap_or_else(|e| panic!("{f}: {e}"));
+    }
+    // Not vacuous: the registered multipliers made combinational, one INIT
+    // word of the deep RAM's second bank, and the read ports' RAMs given
+    // each other's read addresses are each caught.
+    let comb = |r: &mut helion_route::Routed| r.placed.packed.macs.iter_mut().for_each(|m| m.preg = false);
+    assert!(check_design(&mac, part, 400, comb).is_err(), "PREG off went unnoticed");
+    let deep = &rams[1].1;
+    let bank1 = |r: &mut helion_route::Routed| {
+        let b = r.placed.packed.brams.iter_mut().find(|b| b.cell.contains("_b1_")).expect("bank 1");
+        b.init.resize(256, 0x5a5a_5a5a_5a5a_5a5a);
+        for w in b.init.iter_mut() {
+            *w ^= 0x0101_0101_0101_0101;
+        }
+    };
+    assert!(check_design(deep, part, 500, bank1).is_err(), "a wrong bank-1 INIT went unnoticed");
+}

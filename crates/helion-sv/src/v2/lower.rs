@@ -289,41 +289,160 @@ struct Blaster<'a> {
     hard: bool,
     /// Multipliers put on `Mac27` blocks.
     macs: Vec<MacInf>,
-    /// Memories put on `Bram18` blocks, and the signals they replace.
+    /// Memories put on `Bram18` blocks, and the signals they replace:
+    /// a read register is port `.1` of RAM `.0`.
     rams: Vec<RamInf>,
-    ram_of_q: HashMap<u32, usize>,
+    ram_of_q: HashMap<u32, (usize, usize)>,
     ram_of_mem: HashMap<u32, usize>,
+    /// Registers that may be a multiplier's `P` register, and those
+    /// decided (`true`: on the block).
+    mac_regs: HashMap<u32, MacRegCand>,
+    mac_reg_done: HashMap<u32, bool>,
+    /// Additions tried as a multiplier's `+ C`.
+    fused_tried: std::collections::HashSet<N>,
+    /// Flops the blocks need besides the design's registers (a deep RAM's
+    /// registered bank select): Q literal (an input of the logic), D, clock
+    /// and net name.
+    extra_ffs: Vec<(Lit, Lit, Lit, String)>,
 }
 
 /// A multiplication on a `Mac27`: operand and result literals.
 struct MacInf {
     a: Vec<Lit>,
     b: Vec<Lit>,
+    /// The addend on `C` (`FALSE` bits are left unconnected).
+    c: Vec<Lit>,
     signed: bool,
     p: Vec<Lit>,
+    /// `PREG=1`: the register's clock, load enable (`CE`) and synchronous
+    /// reset (`RST`); `p` are then the register's own bits.
+    reg: Option<(Lit, Lit, Lit)>,
 }
 
-/// A memory on a `Bram18`: the memory signal, the register that reads it,
-/// the accesses, and (once its output is used) its pin literals.
+/// A register that may be a multiplier's `P` register: its data input is
+/// a multiplexer tree over one `load` (the product `mul`, or `mul + c`),
+/// the constant 0 and its own value.
+struct MacRegCand {
+    load: N,
+    mul: N,
+    c: Option<N>,
+}
+
+/// Most multiplier blocks one product is built from.
+const MAX_MAC_PARTS: usize = 16;
+/// Most block RAMs one memory is built from (read ports x depth banks of
+/// 1024 words x width slices of 16 bits).
+const MAX_RAM_BLOCKS: u32 = 64;
+
+/// A memory on `Bram18` blocks: the memory signal, its geometry, the
+/// writes (one write port), and one read port per register that reads it.
+/// Every port has its own blocks; all of them take every write.
 struct RamInf {
     mem: u32,
-    q: u32,
     reg_mem: u32,
-    reg_q: u32,
-    read: MemRead,
+    geo: MemGeo,
     /// The writes, all at one address (one write port).
     writes: Vec<MemWrite>,
-    dout: Option<Vec<Lit>>,
-    pins: Option<RamPins>,
+    ports: Vec<RamPort>,
+    /// Write pins, built with the first used port's pins: low address
+    /// bits, data, the enable of each depth bank, clock.
+    wpins: Option<(Vec<Lit>, Vec<Lit>, Vec<Lit>, Lit)>,
 }
 
-struct RamPins {
-    waddr: Vec<Lit>,
-    raddr: Vec<Lit>,
-    di: Vec<Lit>,
-    we: Lit,
-    re: Lit,
-    clk: Lit,
+struct RamPort {
+    q: u32,
+    reg_q: u32,
+    read: MemRead,
+    /// Once the register is read: its value, the `DO` of each depth bank
+    /// (all slices, `ew` bits) and the registered bank select.
+    dout: Option<Vec<Lit>>,
+    bank_do: Vec<Vec<Lit>>,
+    sel: Vec<Lit>,
+    /// Low read address bits and read enable.
+    pins: Option<(Vec<Lit>, Lit)>,
+}
+
+impl RamInf {
+    fn abits(&self) -> u32 {
+        self.geo.count.trailing_zeros()
+    }
+    /// Address bits each block takes, and bank-select bits.
+    fn split(&self) -> (u32, u32) {
+        let lo = self.abits().min(10);
+        (lo, self.abits() - lo)
+    }
+    fn banks(&self) -> u32 {
+        1 << self.split().1
+    }
+    fn slices(&self) -> u32 {
+        self.geo.ew.div_ceil(16)
+    }
+}
+
+/// Whether node `n` is the constant 0.
+fn is_zero(flat: &Flat, n: N) -> bool {
+    matches!(flat.dag.op(n), Op::Const(b) if b.iter().all(|x| !x))
+}
+
+/// Whether the operands of a product of `w` bits fit one multiplier: at
+/// most 32 bits of result, 16-bit values (both zero-extended: unsigned,
+/// both sign-extended: signed) with two or more varying bits each.
+/// Returns the sign mode.
+fn fit16(x: &[Lit], y: &[Lit], w: usize) -> Option<bool> {
+    let lo = w.min(16);
+    let zext = |v: &[Lit]| v[lo..].iter().all(|&l| l == FALSE);
+    let sext = |v: &[Lit]| w > 16 && v[15..].iter().all(|&l| l == v[15]);
+    let varying = |v: &[Lit]| v[..lo].iter().filter(|&&l| l > TRUE).count() >= 2;
+    if !(varying(x) && varying(y)) {
+        return None;
+    }
+    if zext(x) && zext(y) {
+        Some(false)
+    } else if sext(x) && sext(y) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Registers whose value may live in a multiplier's `P` register.
+fn infer_mac_regs(flat: &Flat) -> HashMap<u32, MacRegCand> {
+    let mut out = HashMap::new();
+    for (ri, r) in flat.regs.iter().enumerate() {
+        let s = &flat.sigs[r.sig as usize];
+        if s.w > 32
+            || flat.dag.w(r.d) != s.w
+            || r.negedge
+            || r.arst.is_some()
+            || !r.mask.iter().all(|b| *b)
+            || !clock_shape(flat, r.clk).1.is_empty()
+            || s.init.iter().any(|b| *b)
+            || s.drv.iter().any(|d| *d != Drv::Reg(ri as u32))
+        {
+            continue;
+        }
+        let mut leaves = Vec::new();
+        mux_leaves(&flat.dag, r.d, N::MAX, &mut leaves);
+        let loads: Vec<N> = leaves.iter().copied().filter(|&l| !is_zero(flat, l) && !is_whole_read(flat, l, r.sig)).collect();
+        let [load] = loads.as_slice() else { continue };
+        let is_mul = |m: N| matches!(flat.dag.op(m), Op::Mul(..)) && flat.dag.w(m) == s.w;
+        let cand = match flat.dag.op(*load) {
+            Op::Mul(..) if is_mul(*load) => MacRegCand { load: *load, mul: *load, c: None },
+            Op::Add(x, y) if flat.dag.w(*load) == s.w => {
+                let (x, y) = (*x, *y);
+                if is_mul(x) {
+                    MacRegCand { load: *load, mul: x, c: Some(y) }
+                } else if is_mul(y) {
+                    MacRegCand { load: *load, mul: y, c: Some(x) }
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+        out.insert(r.sig, cand);
+    }
+    out
 }
 
 /// Error prefix asking `lower` to build memory signal `n` from flops.
@@ -363,17 +482,18 @@ fn infer_rams(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Vec<Ram
         }
         let writes: Vec<&MemWrite> = flat.mem_writes.iter().filter(|w| w.sig == m).collect();
         let mut reads: Vec<&MemRead> = flat.mem_reads.iter().filter(|r| r.sig == m).collect();
+        reads.sort_by_key(|r| r.node);
         reads.dedup_by_key(|r| r.node);
-        if writes.is_empty() || reads.len() != 1 || writes.iter().any(|x| x.addr != writes[0].addr || x.geo != writes[0].geo) {
+        if writes.is_empty() || reads.is_empty() || writes.iter().any(|x| x.addr != writes[0].addr || x.geo != writes[0].geo) {
             continue;
         }
-        let (w, r) = (writes[0], reads[0]);
+        let w = writes[0];
         let g = w.geo;
         let abits = g.count.trailing_zeros();
-        if r.geo != g || g.lo != 0 || !g.count.is_power_of_two() || g.count < 2 || g.count as usize > 1024 || g.ew > 16 || g.hi != g.count as i64 - 1 {
+        if reads.iter().any(|r| r.geo != g) || g.lo != 0 || !g.count.is_power_of_two() || g.count < 2 || g.ew == 0 || g.hi != g.count as i64 - 1 {
             continue;
         }
-        if flat.dag.w(w.addr) != abits || flat.dag.w(r.addr) != abits || writes.iter().any(|x| flat.dag.w(x.val) != g.ew) {
+        if flat.dag.w(w.addr) != abits || reads.iter().any(|r| flat.dag.w(r.addr) != abits) || writes.iter().any(|x| flat.dag.w(x.val) != g.ew) {
             continue;
         }
         let sm = &flat.sigs[m as usize];
@@ -391,16 +511,19 @@ fn infer_rams(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Vec<Ram
         if !leaves.iter().any(|&l| is_write(l)) || leaves.iter().any(|&l| !is_write(l) && !is_whole_read(flat, l, m)) {
             continue;
         }
-        // The register that reads the memory.
+        // The registers that read the memory, one read port each.
         let root = clock_shape(flat, reg.clk).0;
+        let mut ports: Vec<RamPort> = Vec::new();
         for (ri, rq) in flat.regs.iter().enumerate() {
             let q = rq.sig;
             let sq = &flat.sigs[q as usize];
-            let mut leaves = Vec::new();
-            mux_leaves(&flat.dag, rq.d, r.node, &mut leaves);
-            if !leaves.contains(&r.node) {
-                continue;
-            }
+            // (A read is itself a multiplexer tree over the words: a leaf.)
+            let found = reads.iter().find_map(|r| {
+                let mut leaves = Vec::new();
+                mux_leaves(&flat.dag, rq.d, r.node, &mut leaves);
+                leaves.contains(&r.node).then_some((r, leaves))
+            });
+            let Some((r, leaves)) = found else { continue };
             let ok = leaves.iter().all(|&l| l == r.node || is_whole_read(flat, l, q))
                 && sq.w == g.ew
                 && sq.drv.iter().all(|d| *d == Drv::Reg(ri as u32))
@@ -409,11 +532,20 @@ fn infer_rams(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Vec<Ram
                 && rq.arst.is_none()
                 && rq.mask.iter().all(|b| *b)
                 && clock_shape(flat, rq.clk) == (root, Vec::new());
-            if ok {
-                out.push(RamInf { mem: m, q, reg_mem: rm, reg_q: ri as u32, read: r.clone(), writes: writes.iter().map(|x| (*x).clone()).collect(), dout: None, pins: None });
+            if !ok {
+                continue 'mem;
             }
-            continue 'mem;
+            ports.push(RamPort { q, reg_q: ri as u32, read: (*r).clone(), dout: None, bank_do: Vec::new(), sel: Vec::new(), pins: None });
         }
+        // Every read is some register's.
+        if reads.iter().any(|r| !ports.iter().any(|p| p.read.node == r.node)) {
+            continue;
+        }
+        let ram = RamInf { mem: m, reg_mem: rm, geo: g, writes: writes.iter().map(|x| (*x).clone()).collect(), ports, wpins: None };
+        if ram.ports.len() as u32 * ram.banks() * ram.slices() > MAX_RAM_BLOCKS {
+            continue;
+        }
+        out.push(ram);
     }
     out
 }
@@ -455,24 +587,203 @@ impl<'a> Blaster<'a> {
         })
     }
 
-    /// Build the pins of RAM `k` (its output is used).
-    fn ram_pins(&mut self, k: usize) -> Result<(), String> {
-        let (ws, r, mem, q, rm, rq) = {
-            let ri = &self.rams[k];
-            (ri.writes.clone(), ri.read.clone(), ri.mem, ri.q, ri.reg_mem, ri.reg_q)
-        };
-        let waddr = self.all(ws[0].addr)?;
-        let raddr = self.all(r.addr)?;
+    /// The value of read port `p` of RAM `k`: with one depth bank the
+    /// blocks' `DO`; with several, every bank's `DO` (inputs of the logic)
+    /// chosen by the bank select registered with the read.
+    fn ram_port_out(&mut self, k: usize, p: usize) -> Vec<Lit> {
+        if let Some(v) = &self.rams[k].ports[p].dout {
+            return v.clone();
+        }
+        let (ew, banks, hb) = (self.rams[k].geo.ew, self.rams[k].banks(), self.rams[k].split().1);
+        let bank_do: Vec<Vec<Lit>> = (0..banks).map(|_| (0..ew).map(|_| self.aig.input()).collect()).collect();
+        let sel: Vec<Lit> = (0..hb).map(|_| self.aig.input()).collect();
+        let mut v = bank_do[0].clone();
+        if banks > 1 {
+            for bit in 0..ew as usize {
+                // A multiplexer tree on the select bits, LSB first.
+                let mut level: Vec<Lit> = bank_do.iter().map(|d| d[bit]).collect();
+                for &s in &sel {
+                    level = level.chunks(2).map(|c| self.aig.mux(s, c[1], c[0])).collect();
+                }
+                v[bit] = level[0];
+            }
+        }
+        let port = &mut self.rams[k].ports[p];
+        port.bank_do = bank_do;
+        port.sel = sel;
+        port.dout = Some(v.clone());
+        v
+    }
+
+    /// Build the pins of read port `p` of RAM `k` (its output is used), and
+    /// the RAM's write pins if not yet built.
+    fn ram_pins(&mut self, k: usize, p: usize) -> Result<(), String> {
         let flat = self.flat;
-        let d = flat.regs[rm as usize].d;
-        let di = self.write_data(d, &ws, mem)?.ok_or("internal: a RAM without a write")?;
-        let we = self.chosen(d, &|l| ws.iter().any(|w| w.node == l), &|l| is_whole_read(flat, l, mem))?;
-        let rnode = r.node;
-        let re = self.chosen(flat.regs[rq as usize].d, &|l| l == rnode, &|l| is_whole_read(flat, l, q))?;
+        let (ws, mem, rm, (lo, hb)) = {
+            let ri = &self.rams[k];
+            (ri.writes.clone(), ri.mem, ri.reg_mem, ri.split())
+        };
         let ((cn, cb), _) = clock_shape(flat, flat.regs[rm as usize].clk);
         let clk = self.bit(cn, cb)?;
-        self.rams[k].pins = Some(RamPins { waddr, raddr, di, we, re, clk });
+        if self.rams[k].wpins.is_none() {
+            let waddr = self.all(ws[0].addr)?;
+            let d = flat.regs[rm as usize].d;
+            let di = self.write_data(d, &ws, mem)?.ok_or("internal: a RAM without a write")?;
+            let we = self.chosen(d, &|l| ws.iter().any(|w| w.node == l), &|l| is_whole_read(flat, l, mem))?;
+            // Each depth bank writes when the high address bits are its own.
+            let mut bank_we = Vec::new();
+            for b in 0..1u32 << hb {
+                let mut e = we;
+                for h in 0..hb {
+                    let a = waddr[(lo + h) as usize];
+                    e = self.aig.and(e, if (b >> h) & 1 == 1 { a } else { a ^ 1 });
+                }
+                bank_we.push(e);
+            }
+            self.rams[k].wpins = Some((waddr[..lo as usize].to_vec(), di, bank_we, clk));
+        }
+        let (r, q, rq) = {
+            let port = &self.rams[k].ports[p];
+            (port.read.clone(), port.q, port.reg_q)
+        };
+        let raddr = self.all(r.addr)?;
+        let rnode = r.node;
+        let re = self.chosen(flat.regs[rq as usize].d, &|l| l == rnode, &|l| is_whole_read(flat, l, q))?;
+        // The bank select: the high read address bits, registered with
+        // the read (held while RE is low).
+        let sel = self.rams[k].ports[p].sel.clone();
+        let qname = flat.sigs[q as usize].name.clone();
+        for (h, &sq) in sel.iter().enumerate() {
+            let d = self.aig.mux(re, raddr[lo as usize + h], sq);
+            self.extra_ffs.push((sq, d, clk, format!("{qname}_bank{h}")));
+        }
+        self.rams[k].ports[p].pins = Some((raddr[..lo as usize].to_vec(), re));
         Ok(())
+    }
+
+    /// Operands of `mul` on one multiplier block ([`fit16`]), and the sign
+    /// mode.
+    fn mac_operands(&mut self, mul: N) -> Result<Option<(Vec<Lit>, Vec<Lit>, bool)>, String> {
+        let Op::Mul(a, b) = self.flat.dag.op(mul).clone() else { return Ok(None) };
+        let w = self.flat.dag.w(mul) as usize;
+        if w > 32 {
+            return Ok(None);
+        }
+        let (x, y) = (self.all(a)?, self.all(b)?);
+        let lo = w.min(16);
+        Ok(fit16(&x, &y, w).map(|s| (x[..lo].to_vec(), y[..lo].to_vec(), s)))
+    }
+
+    /// `a * b + c` (one operand of addition `n` a product of the same
+    /// width that fits one multiplier) on a multiplier with `C`.
+    fn fused_add(&mut self, n: N) -> Result<Option<Vec<Lit>>, String> {
+        if let Some(v) = self.whole.get(&n) {
+            return Ok(Some(v.clone()));
+        }
+        if !self.fused_tried.insert(n) {
+            return Ok(None);
+        }
+        let Op::Add(a, b) = self.flat.dag.op(n).clone() else { return Ok(None) };
+        let w = self.flat.dag.w(n);
+        if w > 32 {
+            return Ok(None);
+        }
+        for (m, c) in [(a, b), (b, a)] {
+            if !matches!(self.flat.dag.op(m), Op::Mul(..)) || self.flat.dag.w(m) != w {
+                continue;
+            }
+            if let Some((x, y, signed)) = self.mac_operands(m)? {
+                let c = self.all(c)?;
+                let p: Vec<Lit> = (0..w).map(|_| self.aig.input()).collect();
+                self.macs.push(MacInf { a: x, b: y, c, signed, p: p.clone(), reg: None });
+                self.whole.insert(n, p.clone());
+                return Ok(Some(p));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The product of `x` and `y` (`w` bits) on multiplier blocks: one
+    /// block when both fit 16 bits ([`fit16`]; a result wider than 32 bits
+    /// is then P zero- or sign-extended); else 16 x 16 partial products of
+    /// the operands' 16-bit pieces, each on a block, summed with adders.
+    /// `None`: a constant operand, or more than [`MAX_MAC_PARTS`] blocks.
+    fn mul_on_blocks(&mut self, x: &[Lit], y: &[Lit], w: usize) -> Option<Vec<Lit>> {
+        if let Some(signed) = fit16(x, y, w) {
+            let lo = w.min(16);
+            let np = w.min(32);
+            let p: Vec<Lit> = (0..np).map(|_| self.aig.input()).collect();
+            self.macs.push(MacInf { a: x[..lo].to_vec(), b: y[..lo].to_vec(), c: Vec::new(), signed, p: p.clone(), reg: None });
+            let ext = if signed { p[31.min(np - 1)] } else { FALSE };
+            return Some((0..w).map(|i| if i < np { p[i] } else { ext }).collect());
+        }
+        let varying = |v: &[Lit]| v.iter().filter(|&&l| l > TRUE).count() >= 2;
+        if !(varying(x) && varying(y)) {
+            return None;
+        }
+        // Unsigned pieces: the product modulo 2^w of the w-bit operands
+        // (signed operands are sign-extended to w bits, which is the same).
+        let used = |v: &[Lit]| v.iter().take(w).rposition(|&l| l != FALSE).map_or(0, |i| i + 1);
+        let (ux, uy) = (used(x), used(y));
+        let piece = |v: &[Lit], u: usize, i: usize| -> Vec<Lit> { (16 * i..16 * i + 16).map(|k| if k < u { v[k] } else { FALSE }).collect() };
+        let mut parts: Vec<(usize, Vec<Lit>, Vec<Lit>)> = Vec::new();
+        for i in 0..ux.div_ceil(16) {
+            for j in 0..uy.div_ceil(16) {
+                let sh = 16 * (i + j);
+                let (a, b) = (piece(x, ux, i), piece(y, uy, j));
+                if sh < w && a.iter().any(|&l| l != FALSE) && b.iter().any(|&l| l != FALSE) {
+                    parts.push((sh, a, b));
+                }
+            }
+        }
+        if parts.len() > MAX_MAC_PARTS {
+            return None;
+        }
+        let mut acc = vec![FALSE; w];
+        for (sh, a, b) in parts {
+            let p: Vec<Lit> = (0..(w - sh).min(32)).map(|_| self.aig.input()).collect();
+            self.macs.push(MacInf { a, b, c: Vec::new(), signed: false, p: p.clone(), reg: None });
+            let mut c = FALSE;
+            for j in sh..w {
+                let t = p.get(j - sh).copied().unwrap_or(FALSE);
+                let s1 = self.aig.xor(acc[j], t);
+                let s2 = self.aig.xor(s1, c);
+                let g = self.aig.and(acc[j], t);
+                let h = self.aig.and(s1, c);
+                c = self.aig.or(g, h);
+                acc[j] = s2;
+            }
+        }
+        Some(acc)
+    }
+
+    /// Put register `sig` (a [`MacRegCand`]) on a multiplier's `P`
+    /// register if its product fits one block. Called before any of its
+    /// bits is built as a flop.
+    fn decide_mac_reg(&mut self, sig: u32) -> Result<bool, String> {
+        if let Some(&d) = self.mac_reg_done.get(&sig) {
+            return Ok(d);
+        }
+        self.mac_reg_done.insert(sig, false);
+        let flat = self.flat;
+        let Some(cand) = self.mac_regs.get(&sig) else { return Ok(false) };
+        let (load, mul, c) = (cand.load, cand.mul, cand.c);
+        let Some((a, b, signed)) = self.mac_operands(mul)? else { return Ok(false) };
+        let c = match c {
+            Some(c) => self.all(c)?,
+            None => Vec::new(),
+        };
+        let Drv::Reg(ri) = flat.sigs[sig as usize].drv[0] else { return Ok(false) };
+        let r = &flat.regs[ri as usize];
+        let ce = self.chosen(r.d, &|l| l == load, &|l| is_zero(flat, l) || is_whole_read(flat, l, sig))?;
+        let rst = self.chosen(r.d, &|l| is_zero(flat, l) && l != load, &|l| l == load || is_whole_read(flat, l, sig))?;
+        let ((cn, cb), _) = clock_shape(flat, r.clk);
+        let clk = self.bit(cn, cb)?;
+        // P is the register: its bits are the register's own literals.
+        let p: Vec<Lit> = (0..flat.sigs[sig as usize].w).map(|i| self.read_bit(sig, i)).collect::<Result<_, _>>()?;
+        self.macs.push(MacInf { a, b, c, signed, p, reg: Some((clk, ce, rst)) });
+        self.mac_reg_done.insert(sig, true);
+        Ok(true)
     }
 
     fn read_bit(&mut self, sig: u32, bit: u32) -> Result<Lit, String> {
@@ -487,13 +798,9 @@ impl<'a> Blaster<'a> {
                 l
             }
             Drv::Reg(_) if self.ram_of_q.contains_key(&sig) => {
-                // The register is the RAM's output.
-                let k = self.ram_of_q[&sig];
-                if self.rams[k].dout.is_none() {
-                    let v: Vec<Lit> = (0..s.w).map(|_| self.aig.input()).collect();
-                    self.rams[k].dout = Some(v);
-                }
-                self.rams[k].dout.as_ref().unwrap()[bit as usize]
+                // The register is a read port of a RAM.
+                let (k, p) = self.ram_of_q[&sig];
+                self.ram_port_out(k, p)[bit as usize]
             }
             Drv::Reg(_) if self.ram_of_mem.contains_key(&sig) => {
                 // Something besides the RAM's read port reads the memory.
@@ -559,6 +866,12 @@ impl<'a> Blaster<'a> {
         if let Some(&l) = self.memo.get(&(n, i)) {
             return Ok(l);
         }
+        if self.hard && matches!(self.flat.dag.op(n), Op::Add(..)) {
+            if let Some(v) = self.fused_add(n)? {
+                self.memo.insert((n, i), v[i as usize]);
+                return Ok(v[i as usize]);
+            }
+        }
         let dag = &self.flat.dag;
         let w = dag.w(n);
         debug_assert!(i < w);
@@ -608,24 +921,14 @@ impl<'a> Blaster<'a> {
                 if !self.whole.contains_key(&n) {
                     let (x, y) = (self.all(a)?, self.all(b)?);
                     let w = w as usize;
-                    // On a multiplier block: 16-bit operands, zero- or
-                    // (both) sign-extended, a result of at most 32 bits.
-                    let lo = w.min(16);
-                    let zext = |v: &[Lit]| v[lo..].iter().all(|&l| l == FALSE);
-                    let sext = |v: &[Lit]| w > 16 && v[15..].iter().all(|&l| l == v[15]);
-                    let varying = |v: &[Lit]| v[..lo].iter().filter(|&&l| l > TRUE).count() >= 2;
-                    let signed = if zext(&x) && zext(&y) {
-                        Some(false)
-                    } else if sext(&x) && sext(&y) {
-                        Some(true)
-                    } else {
-                        None
-                    };
-                    if let (true, true, Some(signed)) = (self.hard && w <= 32, varying(&x) && varying(&y), signed) {
-                        let p: Vec<Lit> = (0..w).map(|_| self.aig.input()).collect();
-                        self.macs.push(MacInf { a: x[..lo].to_vec(), b: y[..lo].to_vec(), signed, p: p.clone() });
-                        self.whole.insert(n, p);
-                        return Ok(self.whole[&n][i as usize]);
+                    // On multiplier blocks.
+                    if self.hard {
+                        if let Some(p) = self.mul_on_blocks(&x, &y, w) {
+                            let l = p[i as usize];
+                            self.whole.insert(n, p);
+                            self.memo.insert((n, i), l);
+                            return Ok(l);
+                        }
                     }
                     let mut acc = vec![FALSE; w];
                     for (k, &yk) in y.iter().enumerate() {
@@ -867,9 +1170,13 @@ fn lower_with(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Result<
         undriven: Vec::new(),
         hard,
         macs: Vec::new(),
-        ram_of_q: rams.iter().enumerate().map(|(k, r)| (r.q, k)).collect(),
+        ram_of_q: rams.iter().enumerate().flat_map(|(k, r)| r.ports.iter().enumerate().map(move |(p, port)| (port.q, (k, p)))).collect(),
         ram_of_mem: rams.iter().enumerate().map(|(k, r)| (r.mem, k)).collect(),
         rams,
+        mac_regs: if hard { infer_mac_regs(flat) } else { HashMap::new() },
+        mac_reg_done: HashMap::new(),
+        fused_tried: Default::default(),
+        extra_ffs: Vec::new(),
     };
     // Roots: output bits, then the data and clock of every flop whose
     // output something uses.
@@ -909,12 +1216,17 @@ fn lower_with(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Result<
         // RAMs whose output is used need their pins, which may use more
         // registers.
         if done >= bl.live_regs.len() {
-            let Some(k) = (0..bl.rams.len()).find(|&k| bl.rams[k].dout.is_some() && bl.rams[k].pins.is_none()) else { break };
-            bl.ram_pins(k)?;
+            let pending = (0..bl.rams.len()).flat_map(|k| (0..bl.rams[k].ports.len()).map(move |p| (k, p))).find(|&(k, p)| bl.rams[k].ports[p].dout.is_some() && bl.rams[k].ports[p].pins.is_none());
+            let Some((k, p)) = pending else { break };
+            bl.ram_pins(k, p)?;
             continue;
         }
         let (sig, bit) = bl.live_regs[done];
         done += 1;
+        // A register on a multiplier's P register is no flop.
+        if bl.mac_regs.contains_key(&sig) && bl.decide_mac_reg(sig)? {
+            continue;
+        }
         let Drv::Reg(ri) = flat.sigs[sig as usize].drv[bit as usize] else { unreachable!() };
         let r = &flat.regs[ri as usize];
         let mut d = bl.bit(r.d, bit)?;
@@ -943,7 +1255,7 @@ fn lower_with(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Result<
         };
         reg_bits.push(RegBit { sig, bit, d, clk, negedge: r.negedge, arst });
     }
-    let Blaster { aig, pi_name, hints, undriven, macs, rams, .. } = bl;
+    let Blaster { aig, pi_name, hints, undriven, macs, rams, extra_ffs, .. } = bl;
     let map = Mapper::run(&aig);
 
     let mut d = Design::new(&flat.top);
@@ -964,17 +1276,36 @@ fn lower_with(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Result<
         net_of.insert(l, n);
     }
     // Outputs of hard blocks: a RAM's data out carries the name of the
-    // register it replaces.
+    // register it replaces (with several depth banks, each bank's has the
+    // bank's number, and the register is the bank chosen by the select).
+    let mut ram_hint: Vec<(Lit, String)> = Vec::new();
     for r in &rams {
-        let Some(dout) = &r.dout else { continue };
-        let s = &flat.sigs[r.q as usize];
-        for (b, &l) in dout.iter().enumerate() {
-            let n = bit_name(&s.name, s.w, b as u32);
-            taken.insert(n.clone());
-            net_of.insert(l, n);
+        for port in &r.ports {
+            let Some(dout) = &port.dout else { continue };
+            let s = &flat.sigs[port.q as usize];
+            for (bk, bank) in port.bank_do.iter().enumerate() {
+                for (b, &l) in bank.iter().enumerate() {
+                    let n = if port.bank_do.len() == 1 { bit_name(&s.name, s.w, b as u32) } else { format!("{}_bank{bk}_do{b}", s.name) };
+                    taken.insert(n.clone());
+                    net_of.insert(l, n);
+                }
+            }
+            if port.bank_do.len() > 1 {
+                for (b, &l) in dout.iter().enumerate() {
+                    ram_hint.push((l, bit_name(&s.name, s.w, b as u32)));
+                }
+            }
         }
     }
+    for (q, _, _, name) in &extra_ffs {
+        taken.insert(name.clone());
+        net_of.insert(*q, name.clone());
+    }
     for (k, m) in macs.iter().enumerate() {
+        if m.reg.is_some() {
+            // P is the register, already named.
+            continue;
+        }
         for (b, &l) in m.p.iter().enumerate() {
             let n = format!("u_mul{k}_p{b}");
             taken.insert(n.clone());
@@ -993,6 +1324,11 @@ fn lower_with(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Result<
         }
     }
     let mut hint: HashMap<Lit, String> = HashMap::new();
+    for (l, n) in ram_hint {
+        if l > TRUE && !net_of.contains_key(&l) {
+            hint.entry(l).or_insert(n);
+        }
+    }
     // A debug signal names its net before anything else may.
     for &(sig, bit, l) in &debug_bits {
         let sg = &flat.sigs[sig as usize];
@@ -1152,16 +1488,29 @@ fn lower_with(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Result<
     for (k, m) in macs.iter().enumerate() {
         let cell = format!("u_mul{k}");
         let mut pins: Vec<(String, String)> = Vec::new();
-        for (name, lits) in [("A", &m.a), ("B", &m.b)] {
+        for (name, lits) in [("A", &m.a), ("B", &m.b), ("C", &m.c)] {
             for (i, &l) in lits.iter().enumerate() {
                 if l != FALSE {
                     pins.push((emit(l, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut), format!("{name}{i}")));
                 }
             }
         }
+        if let Some((clk, ce, rst)) = m.reg {
+            // An unconnected CE reads 1, an unconnected RST 0.
+            pins.push((emit(clk, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut), "CLK".into()));
+            if ce != TRUE {
+                pins.push((emit(ce, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut), "CE".into()));
+            }
+            if rst != FALSE {
+                pins.push((emit(rst, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut), "RST".into()));
+            }
+        }
         d.add_cell(&cell, CellKind::Mac27);
         if m.signed {
             d.set_cell_attr(&cell, "SIGNED", "1")?;
+        }
+        if m.reg.is_some() {
+            d.set_cell_attr(&cell, "PREG", "1")?;
         }
         for (net, pin) in pins {
             d.connect(&net, &cell, &pin);
@@ -1170,50 +1519,72 @@ fn lower_with(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Result<
             d.connect(&net_of[l], &cell, &format!("P{i}"));
         }
     }
-    // Block RAMs.
+    // Block RAMs: per read port, per depth bank, per 16-bit slice.
     for r in &rams {
-        let (Some(dout), Some(p)) = (&r.dout, &r.pins) else { continue };
+        let Some((waddr, di, bank_we, clk)) = &r.wpins else { continue };
         let sm = &flat.sigs[r.mem as usize];
-        let cell = format!("{}_ram", sm.name);
-        let mut pins: Vec<(String, String)> = Vec::new();
-        let pin = |l: Lit, name: String, skip: Lit, pins: &mut Vec<(String, String)>, d: &mut Design, net_of: &mut HashMap<Lit, String>, taken: &mut std::collections::HashSet<String>, n_lut: &mut usize| {
-            if l != skip {
-                pins.push((emit(l, &aig, &map, d, net_of, &hint, taken, n_lut), name));
-            }
-        };
-        for (i, &l) in p.waddr.iter().enumerate() {
-            pin(l, format!("WADDR{i}"), FALSE, &mut pins, &mut d, &mut net_of, &mut taken, &mut n_lut);
-        }
-        for (i, &l) in p.raddr.iter().enumerate() {
-            pin(l, format!("RADDR{i}"), FALSE, &mut pins, &mut d, &mut net_of, &mut taken, &mut n_lut);
-        }
-        for (i, &l) in p.di.iter().enumerate() {
-            pin(l, format!("DI{i}"), FALSE, &mut pins, &mut d, &mut net_of, &mut taken, &mut n_lut);
-        }
-        // An unconnected WE reads 0, an unconnected RE reads 1.
-        pin(p.we, "WE".into(), FALSE, &mut pins, &mut d, &mut net_of, &mut taken, &mut n_lut);
-        pin(p.re, "RE".into(), TRUE, &mut pins, &mut d, &mut net_of, &mut taken, &mut n_lut);
-        pin(p.clk, "CLK".into(), u32::MAX, &mut pins, &mut d, &mut net_of, &mut taken, &mut n_lut);
-        d.add_cell(&cell, CellKind::Bram18);
+        let g = r.geo;
+        let total = r.ports.iter().filter(|p| p.dout.is_some()).count() as u32 * r.banks() * r.slices();
         // Contents: word `a` sits at position `hi - a` when declared ascending.
-        let g = r.writes[0].geo;
         let word = |a: u32| -> u64 {
             let pos = if g.asc { g.hi as u32 - a } else { a };
             (0..g.ew).fold(0u64, |v, b| v | ((sm.init[(pos * g.ew + b) as usize] as u64) << b))
         };
-        let mut init: Vec<u64> = (0..g.count.div_ceil(4)).map(|w| (0..4).fold(0u64, |v, k| if 4 * w + k < g.count { v | word(4 * w + k) << (16 * k) } else { v })).collect();
-        while init.last() == Some(&0) {
-            init.pop();
+        let words = g.count.min(1024);
+        for (pi, port) in r.ports.iter().enumerate() {
+            let (Some(_), Some((raddr, re))) = (&port.dout, &port.pins) else { continue };
+            for bank in 0..r.banks() {
+                for slice in 0..r.slices() {
+                    let cell = if total == 1 { format!("{}_ram", sm.name) } else { format!("{}_ram_r{pi}_b{bank}_s{slice}", sm.name) };
+                    let mut pins: Vec<(String, String)> = Vec::new();
+                    let mut pin = |l: Lit, name: String, skip: Lit, d: &mut Design| {
+                        if l != skip {
+                            pins.push((emit(l, &aig, &map, d, &mut net_of, &hint, &mut taken, &mut n_lut), name));
+                        }
+                    };
+                    for (i, &l) in waddr.iter().enumerate() {
+                        pin(l, format!("WADDR{i}"), FALSE, &mut d);
+                    }
+                    for (i, &l) in raddr.iter().enumerate() {
+                        pin(l, format!("RADDR{i}"), FALSE, &mut d);
+                    }
+                    let bits = 16 * slice..(16 * slice + 16).min(g.ew);
+                    for (i, k) in bits.clone().enumerate() {
+                        pin(di[k as usize], format!("DI{i}"), FALSE, &mut d);
+                    }
+                    // An unconnected WE reads 0, an unconnected RE reads 1.
+                    pin(bank_we[bank as usize], "WE".into(), FALSE, &mut d);
+                    pin(*re, "RE".into(), TRUE, &mut d);
+                    pin(*clk, "CLK".into(), u32::MAX, &mut d);
+                    d.add_cell(&cell, CellKind::Bram18);
+                    let base = bank * 1024;
+                    let slice_word = |a: u32| (word(base + a) >> (16 * slice)) & 0xffff;
+                    let mut init: Vec<u64> = (0..words.div_ceil(4)).map(|w| (0..4).fold(0u64, |v, k| if 4 * w + k < words { v | slice_word(4 * w + k) << (16 * k) } else { v })).collect();
+                    while init.last() == Some(&0) {
+                        init.pop();
+                    }
+                    if !init.is_empty() {
+                        d.set_cell_attr(&cell, "INIT", init.iter().map(|w| format!("{w:x}")).collect::<Vec<_>>().join(","))?;
+                    }
+                    for (net, pin) in pins {
+                        d.connect(&net, &cell, &pin);
+                    }
+                    for (i, k) in bits.enumerate() {
+                        d.connect(&net_of[&port.bank_do[bank as usize][k as usize]], &cell, &format!("DO{i}"));
+                    }
+                }
+            }
         }
-        if !init.is_empty() {
-            d.set_cell_attr(&cell, "INIT", init.iter().map(|w| format!("{w:x}")).collect::<Vec<_>>().join(","))?;
-        }
-        for (net, pin) in pins {
-            d.connect(&net, &cell, &pin);
-        }
-        for (i, l) in dout.iter().enumerate() {
-            d.connect(&net_of[l], &cell, &format!("DO{i}"));
-        }
+    }
+    // Flops the blocks need (a deep RAM's bank select).
+    for (q, dl, clk, name) in &extra_ffs {
+        let dnet = emit(*dl, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut);
+        let cnet = emit(*clk, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut);
+        let cell = format!("{name}_reg");
+        d.add_cell(&cell, CellKind::Hff);
+        d.connect(&dnet, &cell, "D");
+        d.connect(&net_of[q], &cell, "Q");
+        d.connect(&cnet, &cell, "CLK");
     }
     // Debug signals: their nets exist and carry the mark.
     for &(_, _, l) in &debug_bits {
@@ -1236,7 +1607,7 @@ fn lower_with(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Result<
         d.connect(&src, &cell, "I");
         d.connect(&p.name, &cell, "PAD");
     }
-    let stats = Stats { regmap, luts: n_lut, ffs: reg_bits.len(), depth, ands: aig.nodes.iter().filter(|n| n.0 != u32::MAX).count() };
+    let stats = Stats { regmap, luts: n_lut, ffs: reg_bits.len() + extra_ffs.len(), depth, ands: aig.nodes.iter().filter(|n| n.0 != u32::MAX).count() };
     Ok((d, stats, undriven))
 }
 
@@ -1316,3 +1687,4 @@ mod tests {
         }
     }
 }
+

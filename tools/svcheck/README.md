@@ -47,7 +47,12 @@ HELION_V2_HARD=1 python3 tools/svcheck/svcheck.py --corpus tools/svcheck/hard --
 ```
 
 checks the RAM and multiply designs in `tools/svcheck/hard` against their
-RTL (all three equal it). Without the variable those designs are built
+RTL (all nine equal it): besides one-block RAMs and products, registered
+products and products plus an addend (`mac.sv`, the P register and C
+input), products wider than one block (`mul_wide.sv`, several blocks and
+adders), memories wider than 16 bits (`ram_wide.sv`), deeper than 1024
+words (`ram_deep.sv`), read at two addresses (`ram_2r.sv`) and all three
+(`ram_2r_deep_wide.sv`). Without the variable those designs are built
 from LUTs and flops, and every netlist is the same as before the option
 existed.
 
