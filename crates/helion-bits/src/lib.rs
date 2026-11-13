@@ -1833,7 +1833,8 @@ impl MemoryMapInfo {
             lanes.push(MmiBitLane {
                 cell_name: bram.cell.clone(),
                 placed_site: site.id(),
-                bram_major: i as u16,
+                // The site's index, which is the major bitgen writes.
+                bram_major: dev.bram_major(site.x, site.y).unwrap_or(i as u16),
                 msb: 63,
                 lsb: 0,
                 addr_begin: cur_addr,
@@ -3993,6 +3994,37 @@ mod hard_tests {
         assert!(e.contains("ram would lose its clock clk"), "{e}");
         let p = pack(&d, &dev).unwrap();
         assert!(p.conn.clock_problems.iter().any(|c| c.contains("ram2 would lose its clock clk2")), "{:?}", p.conn.clock_problems);
+    }
+
+    /// A `.mmi` lane names the major bitgen wrote its RAM at (the site's
+    /// index), also when a connected RAM placed away from site 0 comes
+    /// before a pinless one in the packed list.
+    #[test]
+    fn mmi_majors_are_the_placed_sites() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = ram_design();
+        for (i, port) in ["din", "o0", "o9"].into_iter().enumerate() {
+            d.set_loc(port, &format!("IOB_X{}Y33", 6 + i)).unwrap();
+        }
+        d.add_cell("aperture", CellKind::Bram18);
+        d.set_cell_attr("aperture", "INIT", "0x77").unwrap();
+        let routed = route(&place(&pack(&d, &dev).unwrap(), &dev).unwrap(), &dev).unwrap();
+        let bits = bitgen(&dev, &routed).unwrap();
+        let mmi = MemoryMapInfo::from_routed(&dev, &routed, "cpu", "imem", 0);
+        let lanes = &mmi.spaces[0].lanes;
+        let mut used: Vec<u16> = bits.frames.keys().filter(|k| k.0 == Far::BRAM && k.2 == 0).map(|k| k.1).collect();
+        used.sort();
+        let mut named: Vec<u16> = lanes.iter().map(|l| l.bram_major).collect();
+        named.sort();
+        assert_eq!(named, used);
+        for (i, l) in lanes.iter().enumerate() {
+            let s = routed.placed.bram_sites[i];
+            assert_eq!(l.cell_name, routed.placed.packed.brams[i].cell);
+            assert_eq!(Some(l.bram_major), dev.bram_major(s.x, s.y), "{}", l.cell_name);
+        }
+        let ap = lanes.iter().find(|l| l.cell_name == "aperture").unwrap();
+        assert_ne!(ap.bram_major, 1, "the test needs the aperture's site index to differ from its position");
+        assert_eq!(readback_bram_word(&bits, ap.bram_major, 0), 0x77);
     }
 
     #[test]

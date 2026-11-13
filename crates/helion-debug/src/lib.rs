@@ -457,11 +457,8 @@ pub fn insert_arm_capture_deep(
     }
     let bram_major = routed
         .placed
-        .packed
-        .brams
-        .iter()
-        .position(|b| b.cell == CAPTURE_BRAM)
-        .ok_or("ILA deep: capture BRAM not in packed list")? as u16;
+        .bram_major(dev, CAPTURE_BRAM)
+        .ok_or("ILA deep: capture BRAM not in packed list")?;
     let has_bram_frame = bits1
         .frames
         .keys()

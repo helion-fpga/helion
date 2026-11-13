@@ -112,11 +112,10 @@ pub fn implement_debug(
     let report = insert_debug_cores(&mut d, cfg)?;
     let (routed, bits) = compile(dev, &d)?;
     let packed = &routed.placed.packed;
-    let capture_major = packed
-        .brams
-        .iter()
-        .position(|b| b.cell == CAPTURE_BRAM)
-        .ok_or("set up debug: capture BRAM was not packed")? as u16;
+    let capture_major = routed
+        .placed
+        .bram_major(dev, CAPTURE_BRAM)
+        .ok_or("set up debug: capture BRAM was not packed")?;
     let has_frame = bits
         .frames
         .keys()
@@ -343,7 +342,7 @@ impl HwDebugTarget {
                         base_addr: AXI_BRAM_BASE + AXI_BRAM_STRIDE * i as u32,
                         size_bytes: AXI_BRAM_WORDS * 4,
                         read_only: false,
-                        bram_aperture_major: Some(i as u16),
+                        bram_aperture_major: Some(build.routed.placed.bram_major(dev, cell).unwrap_or(i as u16)),
                     });
                 }
                 m
@@ -847,6 +846,52 @@ mod tests {
         assert_eq!(t.cores().len(), 1);
         assert_eq!(t.cores()[0].2, DebugCoreKind::Ila);
         assert!(t.refresh_stat().unwrap().done);
+    }
+
+    /// The counter plus a RAM connected to the fabric, its pads at the top
+    /// so that it sits at the top site: the capture RAM, packed after it,
+    /// takes another site, and its frame major is that site's index.
+    fn counter_with_fabric_ram() -> Design {
+        let mut d = Design::structural_counter();
+        d.add_cell("uram", helion_ir::CellKind::Bram18);
+        d.connect("clk", "uram", "CLK");
+        for i in 0..4 {
+            d.connect(&format!("q{i}"), "uram", &format!("RADDR{i}"));
+        }
+        for i in 0..8 {
+            let port = format!("ro{i}");
+            d.add_port(&port, helion_ir::PortDir::Out);
+            d.connect(&format!("rd{i}"), "uram", &format!("DO{i}"));
+            d.add_cell(&format!("rio{i}"), helion_ir::CellKind::IobOut);
+            d.connect(&format!("rd{i}"), &format!("rio{i}"), "I");
+            d.connect(&port, &format!("rio{i}"), "PAD");
+            d.set_loc(&port, &format!("IOB_X{}Y33", 6 + i)).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn ila_beside_a_fabric_ram() {
+        let dev = dev();
+        let build = implement_debug(&dev, &counter_with_fabric_ram(), &cfg(&["q0", "q1", "q2", "q3"])).unwrap();
+        let p = &build.routed.placed;
+        let pos = p.packed.brams.iter().position(|b| b.cell == CAPTURE_BRAM).unwrap();
+        let site = p.bram_sites[pos];
+        assert_ne!(Some(pos as u16), dev.bram_major(site.x, site.y), "the test needs the capture RAM's site index to differ from its position");
+        assert_eq!(Some(build.capture_major), dev.bram_major(site.x, site.y));
+        let mut t = HwDebugTarget::program_sim(&dev, build).unwrap();
+        let cap = t
+            .run_hw_ila(&HwIlaRun {
+                trigger: HwTrigger::Immediate,
+                window: 16,
+                pre_trigger: 0,
+                max_cycles: 256,
+            })
+            .unwrap();
+        assert_eq!(cap.words.len(), 16);
+        for i in 1..16 {
+            assert_eq!(counter_value(&cap, i), (counter_value(&cap, i - 1) + 1) & 0xF, "{:?}", cap.words);
+        }
     }
 
     #[test]

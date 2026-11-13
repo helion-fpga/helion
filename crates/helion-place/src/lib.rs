@@ -89,6 +89,14 @@ impl Placed {
     pub fn reserved_tiles(&self, dev: &Device) -> HashSet<(u32, u32)> {
         (0..self.packed.conn.hard.len() as u32).filter_map(|b| self.hard_block_site(b)).flat_map(|s| dev.hard_tiles(s)).collect()
     }
+
+    /// `Far::BRAM` major of the RAM `cell`: the index of its placed site,
+    /// which is where bitgen writes it (not its position in `packed.brams`).
+    pub fn bram_major(&self, dev: &Device, cell: &str) -> Option<u16> {
+        let i = self.packed.brams.iter().position(|b| b.cell == cell)?;
+        let s = self.bram_sites.get(i)?;
+        dev.bram_major(s.x, s.y)
+    }
 }
 
 /// Sites for the multipliers and RAMs. A block connected to the fabric

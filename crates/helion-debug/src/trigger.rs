@@ -643,11 +643,8 @@ pub fn run_sequencer_capture(
     let (routed, bits) = compile(dev, &d)?;
     let bram_major = routed
         .placed
-        .packed
-        .brams
-        .iter()
-        .position(|b| b.cell == CAPTURE_BRAM)
-        .ok_or("run_sequencer_capture: capture BRAM not packed")? as u16;
+        .bram_major(dev, CAPTURE_BRAM)
+        .ok_or("run_sequencer_capture: capture BRAM not packed")?;
 
     let mut sites = Vec::with_capacity(probes.len());
     for p in probes {
