@@ -22,6 +22,9 @@ pub enum Mode {
     Const,
     Comb,
     Seq,
+    /// An `initial` block at elaboration: signals read their power-up
+    /// values and everything assigned must be constant.
+    Init,
 }
 
 #[derive(Clone, Default)]
@@ -427,6 +430,7 @@ impl Elab {
                     let ty = self.sigs[s as usize].ty.clone();
                     let n = match env.sig.get(&s) {
                         Some(&n) => n,
+                        None if env.mode == Mode::Init => self.power_up(s),
                         None => self.dag.read(s, ty.w()),
                     };
                     V { n, ty }
@@ -1276,7 +1280,11 @@ impl Elab {
                     return self.err(format!("'{name}' is assigned outside a process"));
                 }
                 let total = self.sigs[id as usize].ty.w();
-                let base = if env.mode == Mode::Comb { self.dag.hold(id, total) } else { self.dag.read(id, total) };
+                let base = match env.mode {
+                    Mode::Comb => self.dag.hold(id, total),
+                    Mode::Init => self.power_up(id),
+                    _ => self.dag.read(id, total),
+                };
                 let map = if nonblocking { &mut env.nba } else { &mut env.sig };
                 let cur = map.get(&id).copied().unwrap_or(base);
                 let mut new = self.write(cur, &lv.steps, v);
@@ -1288,6 +1296,12 @@ impl Elab {
                 }
                 if let Some(l) = live {
                     new = self.dag.mux(l, new, cur);
+                }
+                if env.mode == Mode::Init && self.dag.as_const(new).is_none() {
+                    let name = self.sigs[id as usize].name.clone();
+                    return self.err(format!(
+                        "the value an 'initial' block gives '{name}' is not constant at elaboration (it depends on a signal, a non-constant condition or index, or a system function); only constant power-up values are synthesizable"
+                    ));
                 }
                 let map = if nonblocking { &mut env.nba } else { &mut env.sig };
                 map.insert(id, new);
@@ -1349,7 +1363,11 @@ impl Elab {
 
     fn base_of(&mut self, id: u32, mode: Mode) -> N {
         let w = self.sigs[id as usize].ty.w();
-        if mode == Mode::Comb { self.dag.hold(id, w) } else { self.dag.read(id, w) }
+        match mode {
+            Mode::Comb => self.dag.hold(id, w),
+            Mode::Init => self.power_up(id),
+            _ => self.dag.read(id, w),
+        }
     }
 
     /// `env` becomes `c ? a : b`.
@@ -1429,6 +1447,16 @@ impl Elab {
             }
             Stmt::Assign { lhs, rhs, nonblocking, line } => {
                 self.line = *line;
+                if env.mode == Mode::Init {
+                    // A file handle or the simulation time is no power-up
+                    // value of the hardware: simulation only.
+                    if let Expr::SysCall(name, _) = rhs {
+                        if matches!(name.as_str(), "fopen" | "time" | "stime" | "realtime") {
+                            self.warnings.push(format!("line {line}: '${name}' in an 'initial' block is simulation only; the assignment is ignored"));
+                            return Ok(());
+                        }
+                    }
+                }
                 self.assign(lhs, rhs, *nonblocking, sc, env)
             }
             Stmt::If { cond, then, els, line } => {
@@ -1443,6 +1471,9 @@ impl Elab {
                         return self.exec(e, sc, env);
                     }
                     return Ok(());
+                }
+                if env.mode == Mode::Init {
+                    return self.err("this condition in an 'initial' block is not constant at elaboration");
                 }
                 let mut a = env.clone();
                 self.exec(then, sc, &mut a)?;
@@ -1516,6 +1547,9 @@ impl Elab {
                 }
                 if conds.len() == 1 && self.dag.as_const(conds[0]).is_some() {
                     return self.exec(bodies[0], sc, env);
+                }
+                if env.mode == Mode::Init {
+                    return self.err("this case selector in an 'initial' block is not constant at elaboration");
                 }
                 // Without a default, a case whose constant labels enumerate
                 // every value of the selector ends in its last arm. The
@@ -1646,6 +1680,9 @@ impl Elab {
             }
             Stmt::Call(e, line) => {
                 self.line = *line;
+                if let Expr::SysCall(name, args) = e {
+                    return self.readmem(name, args, sc, env);
+                }
                 let Expr::Call(path, args) = e else { return self.err("expected a call") };
                 self.call(path, args, sc, env)?;
                 Ok(())
@@ -1975,5 +2012,184 @@ impl Elab {
             }
         }
         Ok(())
+    }
+}
+
+// --------------------------------------------------------------- initial
+
+impl Elab {
+    /// Run one `initial` block at elaboration: the values it leaves in
+    /// signals are their power-up values (blocking assignments, then
+    /// nonblocking ones on top, as at the end of time step zero).
+    pub fn run_initial(&mut self, body: &Stmt, sc: usize, line: u32) -> R<()> {
+        self.line = line;
+        self.ps = ProcState::default();
+        let mut env = Env { mode: Mode::Init, ..Default::default() };
+        self.exec(body, sc, &mut env)?;
+        let ps = std::mem::take(&mut self.ps);
+        let mut ids: Vec<u32> = env.sig.keys().chain(env.nba.keys()).copied().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        for id in ids {
+            let name = self.sigs[id as usize].name.clone();
+            let not_const = |_: &Self| format!("line {line}: the value this 'initial' block gives '{name}' is not constant at elaboration (it depends on a signal or a condition that is not constant)");
+            let mut bits = match env.sig.get(&id) {
+                Some(&n) => self.dag.as_const(n).ok_or_else(|| not_const(self))?.to_vec(),
+                None => self.sigs[id as usize].init.clone(),
+            };
+            if let Some(&n) = env.nba.get(&id) {
+                let v = self.dag.as_const(n).ok_or_else(|| not_const(self))?.to_vec();
+                let mask = ps.nba.get(&id);
+                for (b, x) in bits.iter_mut().enumerate() {
+                    if mask.is_none_or(|m| m[b]) {
+                        *x = v[b];
+                    }
+                }
+            }
+            let s = &mut self.sigs[id as usize];
+            s.init = bits;
+            s.has_init = true;
+        }
+        Ok(())
+    }
+
+    /// The value of signal `id` at time zero, as an `initial` block reads
+    /// it: its power-up value when it is a variable (registers and what
+    /// nothing drives), else unknown (an input, a net, combinational logic).
+    fn power_up(&mut self, id: u32) -> N {
+        let s = &self.sigs[id as usize];
+        if s.drv.iter().all(|d| matches!(d, super::lower::Drv::Reg(_) | super::lower::Drv::None)) {
+            self.dag.konst(s.init.clone())
+        } else {
+            self.dag.read(id, s.ty.w())
+        }
+    }
+
+    /// Where `$readmemh` finds `file`: absolute as is, else next to the
+    /// source file of the statement, then in the include directories.
+    fn mem_path(&self, file: &str) -> R<std::path::PathBuf> {
+        let p = std::path::Path::new(file);
+        let mut cands = Vec::new();
+        if p.is_absolute() {
+            cands.push(p.to_path_buf());
+        } else {
+            let fi = (self.line / super::pre::FILE_STRIDE) as usize;
+            if let Some(src) = self.src_files.get(fi) {
+                let dir = std::path::Path::new(src).parent().unwrap_or(std::path::Path::new(""));
+                cands.push(if dir.as_os_str().is_empty() { p.to_path_buf() } else { dir.join(p) });
+            }
+            for d in &self.inc_dirs {
+                cands.push(d.join(p));
+            }
+            if cands.is_empty() {
+                cands.push(p.to_path_buf());
+            }
+        }
+        match cands.iter().find(|c| c.is_file()) {
+            Some(c) => Ok(c.clone()),
+            None => self.err(format!(
+                "cannot find the memory file '{file}' (looked for {})",
+                cands.iter().map(|c| format!("'{}'", c.display())).collect::<Vec<_>>().join(", ")
+            )),
+        }
+    }
+
+    /// `$readmemh(file, mem [, start [, end]])` / `$readmemb` in an
+    /// `initial` block (IEEE 1800, 21.4).
+    fn readmem(&mut self, name: &str, args: &[Expr], sc: usize, env: &mut Env) -> R<()> {
+        let bin = match name {
+            "readmemh" => false,
+            "readmemb" => true,
+            _ => return self.err(format!("system task '${name}' is not supported here")),
+        };
+        if env.mode != Mode::Init {
+            return self.err(format!("'${name}' is only synthesizable in an 'initial' block"));
+        }
+        if !(2..=4).contains(&args.len()) {
+            return self.err(format!("'${name}' takes a file name, a memory and optionally start and end addresses"));
+        }
+        let file = match &args[0] {
+            Expr::Str(s) => s.clone(),
+            e => {
+                let v = self.eval_self(e, sc, env)?;
+                let Some(b) = self.dag.as_const(v.n) else { return self.err(format!("the file name of '${name}' is not constant")) };
+                let bytes: Vec<u8> = b.chunks(8).map(|c| c.iter().enumerate().fold(0u8, |v, (i, x)| v | ((*x as u8) << i))).rev().filter(|c| *c != 0).collect();
+                String::from_utf8_lossy(&bytes).into_owned()
+            }
+        };
+        let lv = self.lvalue(&args[1], sc, env)?;
+        let id = match (lv.root, lv.steps.is_empty(), &*lv.ty) {
+            (Root::Sig(id), true, Ty::Array { packed: false, elem, .. }) if !matches!(&**elem, Ty::Array { packed: false, .. }) => id,
+            (Root::Sig(_), true, Ty::Array { packed: false, .. }) => return self.err(format!("'${name}' into a memory of more than one unpacked dimension is not supported")),
+            _ => return self.err(format!("the second argument of '${name}' must be a whole memory (a one-dimensional unpacked array)")),
+        };
+        let Ty::Array { elem, lo, hi, .. } = &*lv.ty else { unreachable!() };
+        let (ew, lo, hi) = (elem.w(), *lo, *hi);
+        let mname = self.sigs[id as usize].name.clone();
+        let mut bound = Vec::new();
+        for a in &args[2..] {
+            let v = self.const_int(a, sc)?;
+            if v < lo || v > hi {
+                return self.err(format!("address {v} of '${name}' is outside '{mname}' [{lo}:{hi}]"));
+            }
+            bound.push(v);
+        }
+        let (mut addr, last) = match bound.as_slice() {
+            [] => (lo, hi),
+            [s] => (*s, hi),
+            [s, e] => (*s, *e),
+            _ => unreachable!(),
+        };
+        let step: i64 = if last >= addr { 1 } else { -1 };
+        let (rlo, rhi) = (addr.min(last), addr.max(last));
+        let path = self.mem_path(&file)?;
+        let shown = path.display().to_string();
+        let text = std::fs::read_to_string(&path).or_else(|e| self.err(format!("cannot read '{shown}': {e}")))?;
+        let items = super::memfile::parse(&text, bin).or_else(|e| self.err(format!("{shown}:{e}")))?;
+        let mut cur: Vec<bool> = match env.sig.get(&id) {
+            Some(&n) => self.dag.as_const(n).map(|b| b.to_vec()).unwrap_or_else(|| self.sigs[id as usize].init.clone()),
+            None => self.sigs[id as usize].init.clone(),
+        };
+        let (mut warned_xz, mut warned_wide, mut over, mut reached_last) = (false, false, false, false);
+        let line = self.line;
+        for (it, fl) in items {
+            match it {
+                super::memfile::Item::Addr(a) => {
+                    let a = a as i64;
+                    if a < rlo || a > rhi {
+                        return self.err(format!("{shown}:{fl}: address @{a:x} is outside the words loaded into '{mname}' ({rlo} to {rhi})"));
+                    }
+                    addr = a;
+                }
+                super::memfile::Item::Word(bits, xz) => {
+                    if addr < rlo || addr > rhi {
+                        if !over {
+                            over = true;
+                            self.warnings.push(format!("line {line}: {shown} has more words than '{mname}' takes from address {}; the rest are ignored", if step > 0 { rlo } else { rhi }));
+                        }
+                        continue;
+                    }
+                    if xz && !warned_xz {
+                        warned_xz = true;
+                        self.warnings.push(format!("line {line}: {shown}:{fl}: x or z digits load as 0"));
+                    }
+                    if bits.iter().skip(ew as usize).any(|b| *b) && !warned_wide {
+                        warned_wide = true;
+                        self.warnings.push(format!("line {line}: {shown}:{fl}: a word is wider than the {ew} bits of '{mname}'; its high bits are dropped"));
+                    }
+                    let off = lv.ty.offset(addr).expect("address in range") as usize;
+                    for k in 0..ew as usize {
+                        cur[off + k] = bits.get(k).copied().unwrap_or(false);
+                    }
+                    reached_last |= addr == last;
+                    addr += step;
+                }
+            }
+        }
+        if bound.len() == 2 && !reached_last {
+            self.warnings.push(format!("line {line}: {shown} ends before address {last} of '{mname}'"));
+        }
+        let n = self.dag.konst(cur);
+        self.store_lv(&Lv { root: Root::Sig(id), steps: vec![], ty: lv.ty.clone() }, n, false, env)
     }
 }

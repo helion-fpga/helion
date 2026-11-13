@@ -102,6 +102,9 @@ pub struct Sig {
     pub ty: Rc<Ty>,
     pub drv: Vec<Drv>,
     pub init: Vec<bool>,
+    /// Given a power-up value by an initializer or an `initial` block: a
+    /// bit nothing else drives holds it (a ROM, a constant).
+    pub has_init: bool,
     pub line: u32,
 }
 
@@ -135,6 +138,13 @@ pub struct Elab {
     /// Memory accesses, recorded for block RAM inference.
     pub mem_reads: Vec<super::lower::MemRead>,
     pub mem_writes: Vec<super::lower::MemWrite>,
+    /// `initial` blocks, run after the whole design is elaborated:
+    /// (scope, body, line).
+    pub initials: Vec<(usize, Stmt, u32)>,
+    /// Source files by index (as in `line`) and include directories, for
+    /// `$readmemh` / `$readmemb` paths.
+    pub src_files: Vec<String>,
+    pub inc_dirs: Vec<std::path::PathBuf>,
 }
 
 impl Elab {
@@ -161,6 +171,9 @@ impl Elab {
             line: 0,
             mem_reads: Vec::new(),
             mem_writes: Vec::new(),
+            initials: Vec::new(),
+            src_files: Vec::new(),
+            inc_dirs: Vec::new(),
         };
         for m in src.modules {
             e.order.push(m.name.clone());
@@ -253,7 +266,7 @@ impl Elab {
         let w = ty.w() as usize;
         let full = format!("{}{}", self.prefix(sc), name);
         let hier = format!("{}{}", self.scopes[sc].hier, name);
-        self.sigs.push(Sig { debug: false, name: full, hier, ty, drv: vec![Drv::None; w], init: vec![false; w], line: self.line });
+        self.sigs.push(Sig { debug: false, name: full, hier, ty, drv: vec![Drv::None; w], init: vec![false; w], has_init: false, line: self.line });
         let id = self.sigs.len() as u32 - 1;
         self.scopes[sc].syms.insert(name.to_string(), Sym::Sig(id));
         id
@@ -455,7 +468,7 @@ impl Elab {
                 let p = match it {
                     Item::Decl { .. } | Item::Param(_) | Item::Typedef { .. } | Item::Func(_) | Item::Import { .. } | Item::Genvar(_) | Item::PortDir(_) | Item::Debug(_) => 0,
                     Item::Inst(_) | Item::GenFor { .. } | Item::GenIf { .. } | Item::GenCase { .. } | Item::Block(_) => 1,
-                    Item::Assign { .. } | Item::Always { .. } => 2,
+                    Item::Assign { .. } | Item::Always { .. } | Item::Initial { .. } => 2,
                 };
                 if p == phase {
                     self.item(it, sc)?;
@@ -524,7 +537,10 @@ impl Elab {
                         // A variable initializer is its power-up value.
                         let n = self.eval_to_type(init, &t, sc, &mut super::exec::Env::default())?;
                         match self.dag.as_const(n) {
-                            Some(b) => self.sigs[id as usize].init = b.to_vec(),
+                            Some(b) => {
+                                self.sigs[id as usize].init = b.to_vec();
+                                self.sigs[id as usize].has_init = true;
+                            }
                             None => {
                                 // By the language this applies once, at time
                                 // zero; it is not a continuous assignment.
@@ -545,6 +561,10 @@ impl Elab {
             Item::Always { kind, sens, body, line } => {
                 self.line = *line;
                 self.always(*kind, sens, body, sc)
+            }
+            Item::Initial { body, line } => {
+                self.initials.push((sc, body.clone(), *line));
+                Ok(())
             }
             Item::Inst(d) => {
                 self.line = d.line;
@@ -905,6 +925,8 @@ impl Elab {
                 let n = self.eval_to_type(init, &ty, sc, &mut super::exec::Env::default())?;
                 if let Some(b) = self.dag.as_const(n) {
                     self.sigs[id as usize].init = b.to_vec();
+                    // An input's initializer is its default when left open.
+                    self.sigs[id as usize].has_init = pd.dir != Dir::In;
                 }
             }
             if top && pd.dir == Dir::In {
@@ -1010,6 +1032,11 @@ impl Elab {
         let m = self.pick_top(top)?;
         let sc = self.new_scope(self.unit_scope, String::new());
         let ports = self.module_body(&m, sc, &HashMap::new(), true)?;
+        // Power-up values: every `initial` block, in order, once the
+        // whole design (and every declaration initializer) exists.
+        for (isc, body, line) in std::mem::take(&mut self.initials) {
+            self.run_initial(&body, isc, line)?;
+        }
         let mut fp = Vec::new();
         for (name, dir, sig) in ports {
             let w = self.sigs[sig as usize].ty.w();
@@ -1031,7 +1058,7 @@ impl Elab {
                     Ty::Bits { w, lo, asc, .. } => Some((0..*w as i64).map(|b| if *asc { lo + *w as i64 - 1 - b } else { lo + b }).collect()),
                     _ => None,
                 };
-                SigInfo { name: s.name, hier: s.hier, index, w: s.drv.len() as u32, drv: s.drv, init: s.init, debug: s.debug }
+                SigInfo { name: s.name, hier: s.hier, index, w: s.drv.len() as u32, drv: s.drv, init: s.init, has_init: s.has_init, debug: s.debug }
             })
             .collect();
         Ok((

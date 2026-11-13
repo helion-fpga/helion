@@ -185,6 +185,9 @@ pub enum Item {
     PortDir(PortDecl),
     /// Signals declared just before with `(* mark_debug *)` or `(* keep *)`.
     Debug(Vec<String>),
+    /// `initial`: run once at elaboration; what it assigns is the power-up
+    /// value of those variables.
+    Initial { body: Stmt, line: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

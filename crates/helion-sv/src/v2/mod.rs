@@ -4,6 +4,13 @@
 //! word-level graph with exact widths and signedness, then bit-blast and map
 //! to LUTs. Anything outside the subset is an error naming the construct and
 //! its line; nothing is dropped or approximated.
+//!
+//! `initial` blocks run at elaboration (`exec.rs`, `Mode::Init`): what they
+//! leave in a variable is its power-up value (flop INIT, LUT memory and
+//! block RAM contents, or a constant when nothing else drives it).
+//! `$readmemh` / `$readmemb` (`memfile.rs`) read files next to the source
+//! file, then in the include directories. A value that is not constant at
+//! elaboration is an error with its line.
 
 pub mod ast;
 pub mod dag;
@@ -11,6 +18,7 @@ pub mod elab;
 pub mod exec;
 pub mod lex;
 pub mod lower;
+pub mod memfile;
 pub mod parse;
 pub mod pre;
 
@@ -49,6 +57,9 @@ thread_local! {
 ///   with it, choose the output) and per 16 bits wide; at most 64 blocks.
 ///   With one register, 1024 words and 16 bits it is one block whose `DO`
 ///   is the register.
+///   A ROM (a memory nothing writes, its contents from an initializer,
+///   an `initial` loop or `$readmemh`) read the same way becomes blocks
+///   too, their write enable off.
 ///
 /// Anything else is built from LUTs and flops as before. The cells need a
 /// part with BRAM / DSP sites; v2 does not know the part, hence the opt-in.
@@ -78,6 +89,7 @@ pub struct Synth {
 }
 
 fn run(sources: &[(String, String)], top: Option<&str>, defines: &[(String, String)], dirs: Vec<std::path::PathBuf>) -> Result<Synth, String> {
+    let inc_dirs = dirs.clone();
     let mut pre = pre::Pre::new(dirs, defines);
     let mut text = String::new();
     for (name, src) in sources {
@@ -92,7 +104,13 @@ fn run(sources: &[(String, String)], top: Option<&str>, defines: &[(String, Stri
     let files = pre.files.clone();
     let fix = |e: String| pre::decode_lines(&e, &files);
     let src = parse::parse(&text).map_err(fix)?;
-    let (flat, mut warnings) = elab::Elab::new(src).and_then(|e| e.elaborate(top)).map_err(fix)?;
+    let (flat, mut warnings) = elab::Elab::new(src)
+        .and_then(|mut e| {
+            e.src_files = files.clone();
+            e.inc_dirs = inc_dirs;
+            e.elaborate(top)
+        })
+        .map_err(fix)?;
     let (mut design, st, undriven) = lower::lower(&flat)?;
     // A module whose outputs are all left undriven has no logic: that is
     // a mistake in the source, not a design to build.

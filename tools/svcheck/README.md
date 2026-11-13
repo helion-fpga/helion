@@ -24,7 +24,7 @@ All of these equal their RTL on every output and every compared flop:
 
 | design | size | cycles |
 |---|---|---|
-| `tools/svcheck/tests` (36 small designs) | up to a few hundred LUTs | 400 each |
+| `tools/svcheck/tests` (42 small designs) | up to a few hundred LUTs | 400 each |
 | `ip/` library (70 blocks) | | 400 each |
 | `examples/serv` (SERV, bit-serial RISC-V) | | 3,000 |
 | `corpus-pass/sha256` | | 2,000 |
@@ -33,6 +33,17 @@ All of these equal their RTL on every output and every compared flop:
 
 Ibex needs one edit to its copy for Verilator to accept it as a reference
 (`logic clk_sys = 1'b0` is also continuously assigned).
+
+## Power-up values
+
+`initial` blocks (assignments, loops, `$readmemh` / `$readmemb`) set the
+power-up value of registers and memories. The bench runs the reference
+simulation in the design's directory, so a relative memory-file path
+resolves there as it does for Helion (next to the source file).
+`init_readmemh.sv`, `init_readmemb_range.sv`, `init_regs_loop.sv` and
+`init_readmem_param.sv` in `tests/`, and `ram_readmem.sv`,
+`ram_init_deep.sv` and `rom_readmem.sv` (block RAM `INIT`, ROMs on block
+RAM) in `hard/` check them; their files are in each `data/` directory.
 
 ## Block RAMs and multipliers
 
@@ -47,7 +58,7 @@ HELION_V2_HARD=1 python3 tools/svcheck/svcheck.py --corpus tools/svcheck/hard --
 ```
 
 checks the RAM and multiply designs in `tools/svcheck/hard` against their
-RTL (all twelve equal it): besides one-block RAMs and products, registered
+RTL (all fifteen equal it): besides one-block RAMs and products, registered
 products and products plus an addend (`mac.sv`, the P register and C
 input), products wider than one block (`mul_wide.sv`, several blocks and
 adders), memories wider than 16 bits (`ram_wide.sv`), deeper than 1024

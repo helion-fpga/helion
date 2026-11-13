@@ -1452,3 +1452,36 @@ fn inferred_wide_deep_registered_and_two_port_blocks_on_the_fabric() {
     };
     assert!(check_design(deep, part, 500, bank1).is_err(), "a wrong bank-1 INIT went unnoticed");
 }
+
+/// Power-up values from `initial` blocks reach the bitstream: a block RAM
+/// whose contents come from `$readmemh` (its INIT), a LUT ROM from a
+/// file, and registers and a LUT-and-flop RAM set by `initial` loops and
+/// assignments. `tools/svcheck` shows the netlists equal their RTL.
+#[test]
+fn initial_contents_on_the_fabric() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/svcheck/");
+    let synth = |f: &str| {
+        let path = format!("{root}{f}");
+        let src = std::fs::read_to_string(&path).expect("source");
+        helion_sv::synth_sv_v2(&src, &path, None).expect("synth").design
+    };
+    helion_sv::v2::set_hard_blocks(Some(true));
+    let ram = synth("hard/ram_readmem.sv");
+    helion_sv::v2::set_hard_blocks(None);
+    let rom = synth("tests/init_readmemh.sv");
+    let regs = synth("tests/init_regs_loop.sv");
+    let ram_cell = ram.cells.iter().find(|c| matches!(c.kind, CellKind::Bram18)).expect("a block RAM");
+    assert!(ram_cell.attrs.get("INIT").is_some_and(|v| v.len() > 1000), "the file is the RAM's INIT");
+    let part = "HL10S-C64-1";
+    check_design(&ram, part, 500, |_| {}).expect("ram_readmem");
+    check_design(&rom, part, 300, |_| {}).expect("init_readmemh");
+    check_design(&regs, part, 300, |_| {}).expect("init_regs_loop");
+    // Not vacuous: one INIT word of the RAM changed is caught.
+    let word = |r: &mut helion_route::Routed| {
+        let b = &mut r.placed.packed.brams[0];
+        for w in b.init.iter_mut().take(64) {
+            *w ^= 0x0001_0000_0000_0000;
+        }
+    };
+    assert!(check_design(&ram, part, 500, word).is_err(), "a wrong INIT word went unnoticed");
+}

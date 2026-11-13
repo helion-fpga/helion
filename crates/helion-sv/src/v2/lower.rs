@@ -113,6 +113,9 @@ pub struct SigInfo {
     pub drv: Vec<Drv>,
     /// Power-up value of register bits.
     pub init: Vec<bool>,
+    /// The power-up value was given (initializer or `initial`): bits
+    /// nothing drives hold it.
+    pub has_init: bool,
     /// Keep a net of this signal's name (`mark_debug`).
     pub debug: bool,
 }
@@ -339,6 +342,8 @@ const MAX_RAM_BLOCKS: u32 = 64;
 /// Every port has its own blocks; all of them take every write.
 struct RamInf {
     mem: u32,
+    /// The register whose clock the blocks take: the memory's own, or for
+    /// a ROM (no writes) its first read register's.
     reg_mem: u32,
     geo: MemGeo,
     /// The writes, all at one address (one write port).
@@ -495,6 +500,13 @@ fn is_whole_read(flat: &Flat, n: N, sig: u32) -> bool {
 fn infer_rams(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Vec<RamInf> {
     let mut out = Vec::new();
     let mut mems: Vec<u32> = flat.mem_writes.iter().map(|w| w.sig).collect();
+    // ROMs: memories nothing drives, with contents from an initializer or
+    // an `initial` block, read by registers.
+    let is_rom = |m: u32| {
+        let s = &flat.sigs[m as usize];
+        s.has_init && s.drv.iter().all(|d| *d == Drv::None)
+    };
+    mems.extend(flat.mem_reads.iter().map(|r| r.sig).filter(|&m| is_rom(m)));
     mems.sort_unstable();
     mems.dedup();
     'mem: for m in mems {
@@ -505,35 +517,55 @@ fn infer_rams(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Vec<Ram
         let mut reads: Vec<&MemRead> = flat.mem_reads.iter().filter(|r| r.sig == m).collect();
         reads.sort_by_key(|r| r.node);
         reads.dedup_by_key(|r| r.node);
-        if writes.is_empty() || reads.is_empty() || writes.iter().any(|x| x.addr != writes[0].addr || x.geo != writes[0].geo) {
+        let rom = writes.is_empty();
+        if (rom && !is_rom(m)) || reads.is_empty() || writes.iter().any(|x| x.addr != writes[0].addr || x.geo != writes[0].geo) {
             continue;
         }
-        let w = writes[0];
-        let g = w.geo;
+        let g = if rom { reads[0].geo } else { writes[0].geo };
         let abits = g.count.trailing_zeros();
         if reads.iter().any(|r| r.geo != g) || g.lo != 0 || !g.count.is_power_of_two() || g.count < 2 || g.ew == 0 || g.hi != g.count as i64 - 1 {
             continue;
         }
-        if flat.dag.w(w.addr) != abits || reads.iter().any(|r| flat.dag.w(r.addr) != abits) || writes.iter().any(|x| flat.dag.w(x.val) != g.ew) {
+        if writes.iter().any(|x| flat.dag.w(x.addr) != abits) || reads.iter().any(|r| flat.dag.w(r.addr) != abits) || writes.iter().any(|x| flat.dag.w(x.val) != g.ew) {
             continue;
         }
         let sm = &flat.sigs[m as usize];
-        let Some(Drv::Reg(rm)) = sm.drv.first().copied() else { continue };
-        if sm.w != g.count * g.ew || sm.drv.iter().any(|d| *d != Drv::Reg(rm)) {
+        if sm.w != g.count * g.ew {
             continue;
         }
-        let reg = &flat.regs[rm as usize];
-        if reg.negedge || reg.arst.is_some() || !reg.mask.iter().all(|b| *b) || !clock_shape(flat, reg.clk).1.is_empty() {
-            continue;
-        }
-        let mut leaves = Vec::new();
-        mux_leaves(&flat.dag, reg.d, w.node, &mut leaves);
-        let is_write = |l: N| writes.iter().any(|x| x.node == l);
-        if !leaves.iter().any(|&l| is_write(l)) || leaves.iter().any(|&l| !is_write(l) && !is_whole_read(flat, l, m)) {
-            continue;
+        let root;
+        let rm;
+        if rom {
+            // The clock of the first register that reads it (every read
+            // port must share it).
+            let Some(ri) = flat.regs.iter().position(|rq| reads.iter().any(|r| {
+                let mut leaves = Vec::new();
+                mux_leaves(&flat.dag, rq.d, r.node, &mut leaves);
+                leaves.contains(&r.node)
+            })) else {
+                continue;
+            };
+            rm = ri as u32;
+            root = clock_shape(flat, flat.regs[ri].clk).0;
+        } else {
+            let Some(Drv::Reg(r0)) = sm.drv.first().copied() else { continue };
+            rm = r0;
+            if sm.drv.iter().any(|d| *d != Drv::Reg(rm)) {
+                continue;
+            }
+            let reg = &flat.regs[rm as usize];
+            if reg.negedge || reg.arst.is_some() || !reg.mask.iter().all(|b| *b) || !clock_shape(flat, reg.clk).1.is_empty() {
+                continue;
+            }
+            let mut leaves = Vec::new();
+            mux_leaves(&flat.dag, reg.d, writes[0].node, &mut leaves);
+            let is_write = |l: N| writes.iter().any(|x| x.node == l);
+            if !leaves.iter().any(|&l| is_write(l)) || leaves.iter().any(|&l| !is_write(l) && !is_whole_read(flat, l, m)) {
+                continue;
+            }
+            root = clock_shape(flat, reg.clk).0;
         }
         // The registers that read the memory, one read port each.
-        let root = clock_shape(flat, reg.clk).0;
         let mut ports: Vec<RamPort> = Vec::new();
         for (ri, rq) in flat.regs.iter().enumerate() {
             let q = rq.sig;
@@ -646,6 +678,10 @@ impl<'a> Blaster<'a> {
         };
         let ((cn, cb), _) = clock_shape(flat, flat.regs[rm as usize].clk);
         let clk = self.bit(cn, cb)?;
+        if self.rams[k].wpins.is_none() && ws.is_empty() {
+            // A ROM: no write pins, WE off.
+            self.rams[k].wpins = Some((Vec::new(), Vec::new(), vec![FALSE; 1 << hb], clk));
+        }
         if self.rams[k].wpins.is_none() {
             let waddr = self.all(ws[0].addr)?;
             let d = flat.regs[rm as usize].d;
@@ -833,6 +869,17 @@ impl<'a> Blaster<'a> {
                 self.live_regs.push((sig, bit));
                 // A flop that powers up at 1 stores the inverted value.
                 if s.init[bit as usize] { l ^ 1 } else { l }
+            }
+            Drv::None if self.ram_of_mem.contains_key(&sig) => {
+                // Something besides the ROM's read port reads the memory.
+                return Err(format!("{RETRY}{sig}"));
+            }
+            Drv::None if s.has_init => {
+                if s.init[bit as usize] {
+                    TRUE
+                } else {
+                    FALSE
+                }
             }
             Drv::None => {
                 self.undriven.push(bit_name(&s.name, s.w, bit));
@@ -1606,7 +1653,9 @@ fn lower_with(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Result<
                     }
                     let bits = 16 * slice..(16 * slice + 16).min(g.ew);
                     for (i, k) in bits.clone().enumerate() {
-                        pin(di[k as usize], format!("DI{i}"), FALSE, &mut d);
+                        if let Some(&l) = di.get(k as usize) {
+                            pin(l, format!("DI{i}"), FALSE, &mut d);
+                        }
                     }
                     // An unconnected WE reads 0, an unconnected RE reads 1.
                     pin(bank_we[bank as usize], "WE".into(), FALSE, &mut d);
@@ -1700,8 +1749,8 @@ mod tests {
             top: "t".into(),
             dag,
             sigs: vec![
-                SigInfo { name: "a".into(), hier: "a".into(), index: None, w: 3, drv: vec![Drv::Input; 3], init: vec![false; 3], debug: false },
-                SigInfo { name: "b".into(), hier: "b".into(), index: None, w: 3, drv: vec![Drv::Input; 3], init: vec![false; 3], debug: false },
+                SigInfo { name: "a".into(), hier: "a".into(), index: None, w: 3, drv: vec![Drv::Input; 3], init: vec![false; 3], has_init: false, debug: false },
+                SigInfo { name: "b".into(), hier: "b".into(), index: None, w: 3, drv: vec![Drv::Input; 3], init: vec![false; 3], has_init: false, debug: false },
             ],
             ports: vec![
                 Port { name: "a".into(), dir: PortDir::In, w: 3, node: None, sig: Some(0) },

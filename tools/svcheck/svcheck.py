@@ -376,8 +376,11 @@ def bench(nl: Netlist, clocks: set[str], cycles: int, seed: int, with_netlist: b
     return "\n".join(t) + "\n"
 
 
-def verilate(work: str, files: list[str], tag: str):
-    obj = os.path.join(work, "obj_" + tag)
+def verilate(work: str, files: list[str], tag: str, cwd: str | None = None):
+    """Build and run the bench. The simulation runs in `cwd` (the design's
+    directory), where the RTL's `$readmemh` / `$readmemb` resolve relative
+    paths as Helion does: next to the source file."""
+    obj = os.path.abspath(os.path.join(work, "obj_" + tag))
     shutil.rmtree(obj, ignore_errors=True)
     cmd = ["verilator", "--binary", "--timing", "-O0", "--x-initial", "0", "--x-assign", "0", "-Wno-fatal", "-Wno-lint",
            "-Wno-WIDTH", "-Wno-PINMISSING", "-Wno-MULTIDRIVEN", "-Wno-LATCH", "-Wno-UNOPTFLAT", "+1364-2005ext+v", "--top-module", "svcheck_tb", "--Mdir", obj, "-o", "sim"] + files
@@ -385,20 +388,24 @@ def verilate(work: str, files: list[str], tag: str):
     if r.returncode != 0:
         err = [l for l in r.stderr.splitlines() if "%Error" in l]
         return None, (err or r.stderr.splitlines() or ["verilator failed"])[0]
-    r = subprocess.run([os.path.join(obj, "sim")], capture_output=True, text=True, timeout=1800)
+    r = subprocess.run([os.path.join(obj, "sim")], capture_output=True, text=True, timeout=1800, cwd=cwd)
     return r.stdout, ""
 
 
 def check(files: list[str], top: str | None, cycles: int, seed: int, work: str, regs: bool = False) -> tuple[bool, list[str]]:
     os.makedirs(work, exist_ok=True)
     src = files[0]
+    here = os.path.dirname(os.path.abspath(files[0]))
     if len(files) > 1:
         src = os.path.join(work, "all.sv")
         with open(src, "w") as f:
             for p in files:
                 f.write(open(p).read() + "\n")
     regmap = os.path.join(work, "regmap.txt")
-    r = subprocess.run([HNF] + (['--legacy'] if os.environ.get('SVCHECK_LEGACY') else []) + [src] + (['--top', top] if top else [])
+    # Helion reads the files themselves, so a relative `$readmemh` path
+    # resolves next to the file that names it.
+    legacy = bool(os.environ.get('SVCHECK_LEGACY'))
+    r = subprocess.run([HNF] + (['--legacy'] if legacy else []) + ([src] if legacy else files) + (['--top', top] if top else [])
                        + (['--regmap', regmap] if regs else []), capture_output=True, text=True, timeout=1800)
     if r.returncode != 0:
         tail = [l for l in r.stderr.splitlines() if l.strip()][-1:] or ["synthesis failed"]
@@ -417,7 +424,7 @@ def check(files: list[str], top: str | None, cycles: int, seed: int, work: str, 
     # Pass 1: port widths from the RTL itself.
     tb0 = os.path.join(work, "tb_widths.sv")
     open(tb0, "w").write(bench(nl, set(), 0, seed, False))
-    out, err = verilate(work, [src, tb0], "w")
+    out, err = verilate(work, [src, tb0], "w", here)
     if out is None:
         return False, notes + [f"reference simulator rejects the RTL: {err[:300]}"]
     widths = {m.group(1): int(m.group(2)) for m in re.finditer(r"^W (\S+) (\d+)$", out, re.M)}
@@ -431,7 +438,7 @@ def check(files: list[str], top: str | None, cycles: int, seed: int, work: str, 
         # Flops whose source register is a scalar or a bit of a plain vector.
         reg_list = [tuple(l.split()) for l in open(regmap) if l.split()[2] != "-"]
     open(tb, "w").write(bench(nl, clocks, cycles, seed, True, reg_list, pulses=not async_as_sync))
-    out, err = verilate(work, [src, nv, tb], "c")
+    out, err = verilate(work, [src, nv, tb], "c", here)
     if out is None:
         return False, notes + [f"co-simulation did not build: {err[:300]}"]
     outs = [p for p, d in nl.ports if d == "out"]

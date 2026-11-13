@@ -1,8 +1,9 @@
 //! Recursive-descent parser for the synthesizable SystemVerilog subset.
 //!
 //! Simulation-only constructs that do not change the hardware (system task
-//! calls, assertions, `initial` blocks, delays, `specify` blocks) are parsed
-//! and skipped. Anything else outside the subset is an error with its line.
+//! calls, assertions, `final` blocks, delays outside `initial`, `specify`
+//! blocks) are parsed and skipped. An `initial` block is kept: it sets
+//! power-up values (with `$readmemh` / `$readmemb`). Anything else outside the subset is an error with its line.
 
 use super::ast::*;
 use super::lex::{lex, Num, Tok, T};
@@ -15,6 +16,8 @@ struct P {
     i: usize,
     /// Names known to be types in the current file (typedefs, type parameters).
     types: std::collections::HashSet<String>,
+    /// Inside an `initial` block: a delay is an error, `$readmem*` a call.
+    in_initial: bool,
 }
 
 const TYPE_KW: &[&str] = &[
@@ -168,6 +171,9 @@ impl P {
     }
     /// `#delay` in front of a statement or after an assignment operator.
     fn skip_delay(&mut self) -> R<()> {
+        if self.in_initial && self.is_op("#") {
+            return self.err("a delay in an 'initial' block is not synthesizable: what follows it is not known at elaboration");
+        }
         if self.eat_op("#") {
             if self.is_op("(") {
                 self.skip_parens()?;
@@ -846,7 +852,14 @@ impl P {
             }
             return Ok(Stmt::Null);
         }
-        if let T::Sys(_) = self.peek() {
+        if let T::Sys(name) = self.peek() {
+            if name == "readmemh" || name == "readmemb" {
+                let name = name.clone();
+                self.bump();
+                let args = self.call_args()?;
+                self.expect_op(";")?;
+                return Ok(Stmt::Call(Expr::SysCall(name, args), line));
+            }
             // System task ($display, $error, $fatal ...): no hardware.
             self.skip_to_semi()?;
             return Ok(Stmt::Null);
@@ -1303,7 +1316,14 @@ impl P {
                 let body = self.stmt()?;
                 out.push(Item::Always { kind, sens, body, line });
             }
-            "initial" | "final" => {
+            "initial" => {
+                self.bump();
+                self.in_initial = true;
+                let body = self.stmt();
+                self.in_initial = false;
+                out.push(Item::Initial { body: body?, line });
+            }
+            "final" => {
                 // Simulation only: parsed and dropped.
                 self.bump();
                 self.stmt()?;
@@ -1699,7 +1719,7 @@ pub fn parse(text: &str) -> R<Source> {
             }
         }
     }
-    let mut p = P { t, i: 0, types };
+    let mut p = P { t, i: 0, types, in_initial: false };
     p.source()
 }
 

@@ -1,0 +1,10 @@
+// 16 x 12 ROM image: comments, underscores, @addresses
+/* block
+   comment */
+0_12 3_45 6_78 9ab
+@8   // jump
+f_ff 000 abc
+@4
+111 222 333 444
+@c 5a5 a5a   7e7 // trailing words fill 12..15
+e1e
