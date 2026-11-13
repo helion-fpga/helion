@@ -778,18 +778,44 @@ impl<'a> Blaster<'a> {
         if !(varying(x) && varying(y)) {
             return None;
         }
-        // Unsigned pieces: the product modulo 2^w of the w-bit operands
-        // (signed operands are sign-extended to w bits, which is the same).
-        let used = |v: &[Lit]| v.iter().take(w).rposition(|&l| l != FALSE).map_or(0, |i| i + 1);
-        let (ux, uy) = (used(x), used(y));
-        let piece = |v: &[Lit], u: usize, i: usize| -> Vec<Lit> { (16 * i..16 * i + 16).map(|k| if k < u { v[k] } else { FALSE }).collect() };
-        let mut parts: Vec<(usize, Vec<Lit>, Vec<Lit>)> = Vec::new();
-        for i in 0..ux.div_ceil(16) {
-            for j in 0..uy.div_ceil(16) {
+        // Each operand as 16-bit pieces, fewest first: an operand
+        // zero-extended from u bits has ceil(u / 16) unsigned pieces; one
+        // sign-extended from s bits (s < w) has ceil(s / 16), all unsigned
+        // but the top one, which is signed (it holds the sign). A block
+        // multiplies two pieces: unsigned x unsigned unsigned, else signed
+        // (SIGNED=1), an unsigned piece u beside a signed one t read as
+        // signed, u - 2^16 u[15], so the block is short by u[15] * t * 2^16,
+        // added in logic. This takes ceil(n / 16) * ceil(m / 16) blocks for
+        // n- and m-bit operands (fewer when the result is narrower), the
+        // fewest 16 x 16 blocks that cover the n x m partial products.
+        let rep = |v: &[Lit]| -> (usize, bool) {
+            let used = v.iter().take(w).rposition(|&l| l != FALSE).map_or(0, |i| i + 1);
+            let top = v[w - 1];
+            if top == FALSE {
+                return (used, false);
+            }
+            let s = (0..w).rev().find(|&i| v[i] != top).map_or(1, |i| i + 2);
+            if s < w {
+                (s, true)
+            } else {
+                (w, false)
+            }
+        };
+        let ((ux, sx), (uy, sy)) = (rep(x), rep(y));
+        // Bits 16i.. of piece i: past the operand's u bits 0, or for a
+        // signed one its sign.
+        let piece = |v: &[Lit], u: usize, signed: bool, i: usize| -> Vec<Lit> {
+            (16 * i..16 * i + 16).map(|k| if k < u { v[k] } else if signed { v[u - 1] } else { FALSE }).collect()
+        };
+        let (kx, ky) = (ux.div_ceil(16), uy.div_ceil(16));
+        // (shift, x piece, y piece, x piece signed, y piece signed)
+        let mut parts: Vec<(usize, Vec<Lit>, Vec<Lit>, bool, bool)> = Vec::new();
+        for i in 0..kx {
+            for j in 0..ky {
                 let sh = 16 * (i + j);
-                let (a, b) = (piece(x, ux, i), piece(y, uy, j));
+                let (a, b) = (piece(x, ux, sx, i), piece(y, uy, sy, j));
                 if sh < w && a.iter().any(|&l| l != FALSE) && b.iter().any(|&l| l != FALSE) {
-                    parts.push((sh, a, b));
+                    parts.push((sh, a, b, sx && i == kx - 1, sy && j == ky - 1));
                 }
             }
         }
@@ -797,18 +823,33 @@ impl<'a> Blaster<'a> {
             return None;
         }
         let mut acc = vec![FALSE; w];
-        for (sh, a, b) in parts {
-            let p: Vec<Lit> = (0..(w - sh).min(32)).map(|_| self.aig.input()).collect();
-            self.macs.push(MacInf { a, b, c: Vec::new(), signed: false, p: p.clone(), reg: None });
+        // acc += v << sh (v extended by `ext` above its length).
+        let add_at = |bl: &mut Self, acc: &mut Vec<Lit>, sh: usize, v: &[Lit], ext: Lit| {
             let mut c = FALSE;
             for j in sh..w {
-                let t = p.get(j - sh).copied().unwrap_or(FALSE);
-                let s1 = self.aig.xor(acc[j], t);
-                let s2 = self.aig.xor(s1, c);
-                let g = self.aig.and(acc[j], t);
-                let h = self.aig.and(s1, c);
-                c = self.aig.or(g, h);
+                let t = v.get(j - sh).copied().unwrap_or(ext);
+                let s1 = bl.aig.xor(acc[j], t);
+                let s2 = bl.aig.xor(s1, c);
+                let g = bl.aig.and(acc[j], t);
+                let h = bl.aig.and(s1, c);
+                c = bl.aig.or(g, h);
                 acc[j] = s2;
+            }
+        };
+        for (sh, a, b, sa, sb) in parts {
+            let signed = sa || sb;
+            let p: Vec<Lit> = (0..(w - sh).min(32)).map(|_| self.aig.input()).collect();
+            self.macs.push(MacInf { a: a.clone(), b: b.clone(), c: Vec::new(), signed, p: p.clone(), reg: None });
+            let ext = if signed && p.len() == 32 { p[31] } else { FALSE };
+            add_at(self, &mut acc, sh, &p, ext);
+            // An unsigned piece read as signed: add its bit 15 times the
+            // signed piece, 16 bits up.
+            for (u, t, fix) in [(&a, &b, sb && !sa), (&b, &a, sa && !sb)] {
+                if fix && u[15] != FALSE && sh + 16 < w {
+                    let m: Vec<Lit> = t.iter().map(|&l| self.aig.and(l, u[15])).collect();
+                    let e = m[15];
+                    add_at(self, &mut acc, sh + 16, &m, e);
+                }
             }
         }
         Some(acc)

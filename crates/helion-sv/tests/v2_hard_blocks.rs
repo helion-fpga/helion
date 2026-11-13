@@ -98,9 +98,11 @@ fn products_become_multipliers_only_when_they_fit() {
     let d = synth(&src("[16:0]", "a * b"), true);
     assert_eq!(macs(&d), 3);
     assert!(d.cells.iter().all(|c| c.attrs.get("SIGNED").is_none()));
-    // Signed by unsigned: the signed operand sign-extended to 32 bits is
-    // two pieces.
-    assert_eq!(macs(&synth(&src("[15:0]", "$signed(a) * $signed({1'b0, b})"), true)), 2);
+    // Signed by unsigned: one signed block (the unsigned operand read as
+    // signed, its bit 15 times the other added in logic).
+    let d = synth(&src("[15:0]", "$signed(a) * $signed({1'b0, b})"), true);
+    assert_eq!(macs(&d), 1);
+    assert!(d.cells.iter().any(|c| c.attrs.get("SIGNED") == Some("1")));
     // 32 x 32 -> 64: four.
     let w64 = "module t(input logic [31:0] a, input logic [31:0] b, output logic [63:0] p);\n  assign p = {32'd0, a} * {32'd0, b};\nendmodule\n";
     assert_eq!(macs(&synth(w64, true)), 4);

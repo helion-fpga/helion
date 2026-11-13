@@ -494,9 +494,56 @@ impl Dag {
             }
         }
         // Kept whole for the netlist to put on multiplier blocks (a wider
-        // product of two variables, on several).
-        if super::hard_blocks() && (w <= 32 || (w <= 128 && self.as_const(a).is_none() && self.as_const(b).is_none())) {
+        // product of two variables, on several). A constant factor is
+        // shift-and-add in logic.
+        if super::hard_blocks() && w <= 128 && self.as_const(a).is_none() && self.as_const(b).is_none() {
             return self.intern(Op::Mul(a, b), w);
+        }
+        // By a constant: the shifted copies of the other factor for its
+        // canonical signed digits when they are fewer than its set bits (a
+        // run of ones is one addition and one subtraction), else for its
+        // set bits; two are one adder or subtractor, more are summed
+        // carry-save.
+        for (c, o) in [(b, a), (a, b)] {
+            let Some(k) = self.as_const(c).map(|k| k.to_vec()) else { continue };
+            let signed_digits = csd(&k);
+            let ones = k.iter().filter(|x| **x).count();
+            let digits = if signed_digits.iter().filter(|d| **d != 0).count() < ones {
+                signed_digits
+            } else if ones >= 3 {
+                k.iter().map(|x| *x as i8).collect()
+            } else {
+                // One or two set bits: the plain sum below.
+                break;
+            };
+            let mut pos = Vec::new();
+            let mut neg = Vec::new();
+            for (j, d) in digits.iter().enumerate() {
+                if *d == 0 {
+                    continue;
+                }
+                let sh = self.kval(j as u128, bits_for_u(j as u128).max(1));
+                let t = self.shl(o, sh);
+                if *d > 0 { pos.push(t) } else { neg.push(t) }
+            }
+            if pos.len() + neg.len() <= 2 {
+                let p = self.sum_tree_opt(pos).unwrap_or_else(|| self.zero(w));
+                return match self.sum_tree_opt(neg) {
+                    Some(n) => self.sub(p, n),
+                    None => p,
+                };
+            }
+            // More terms: carry-save. A negative term is its complement
+            // plus one; the ones are one constant row.
+            let mut rows = pos;
+            for t in &neg {
+                rows.push(self.not(*t));
+            }
+            let ones = neg.len() as u128;
+            if ones > 0 {
+                rows.push(self.kval(ones, w));
+            }
+            return self.csa_sum(rows);
         }
         // Shift-and-add over named partial sums (no `*` in the emitted SV).
         let (a, b) = if self.as_const(a).is_some() {
@@ -526,6 +573,49 @@ impl Dag {
         }
         terms.pop().unwrap_or_else(|| self.zero(w))
     }
+    /// The sum of `rows` (one width, at least one) modulo 2^w: 3:2
+    /// carry-save layers (bitwise, one logic level each) down to two rows,
+    /// then one adder.
+    fn csa_sum(&mut self, mut rows: Vec<N>) -> N {
+        let w = self.w(rows[0]);
+        let one = self.kval(1, 1);
+        while rows.len() > 2 {
+            let mut next = Vec::with_capacity(rows.len() * 2 / 3 + 2);
+            for g in rows.chunks(3) {
+                if g.len() < 3 {
+                    next.extend_from_slice(g);
+                    continue;
+                }
+                let (a, b, c) = (g[0], g[1], g[2]);
+                let ab = self.xor(a, b);
+                next.push(self.xor(ab, c));
+                let x = self.and(a, b);
+                let y = self.and(ab, c);
+                let carry = self.or(x, y);
+                next.push(self.shl(carry, one));
+            }
+            rows = next;
+        }
+        if rows.len() == 2 {
+            self.add(rows[0], rows[1])
+        } else {
+            let _ = w;
+            rows[0]
+        }
+    }
+
+    /// The sum of `terms` (one width) as a balanced tree; `None` when empty.
+    fn sum_tree_opt(&mut self, mut terms: Vec<N>) -> Option<N> {
+        while terms.len() > 1 {
+            let mut next = Vec::with_capacity(terms.len().div_ceil(2));
+            for pair in terms.chunks(2) {
+                next.push(if pair.len() == 2 { self.add(pair[0], pair[1]) } else { pair[0] });
+            }
+            terms = next;
+        }
+        terms.pop()
+    }
+
     pub fn udiv(&mut self, a: N, b: N) -> N {
         let w = self.w(a);
         if w <= 128 {
@@ -926,6 +1016,28 @@ impl Dag {
 
 /// Adders/comparators wider than this become parallel-prefix gate logic.
 const PREFIX_MIN_W: u32 = 4;
+
+/// Canonical signed digits (non-adjacent form) of the constant `k` (LSB
+/// first) modulo 2^w: digits in {-1, 0, 1}, no two adjacent nonzero, the
+/// fewest nonzero of any signed-digit form. A carry out of the top bit is
+/// dropped (it is a multiple of 2^w).
+pub fn csd(k: &[bool]) -> Vec<i8> {
+    let mut out = Vec::with_capacity(k.len());
+    let mut c = 0u8;
+    for i in 0..k.len() {
+        let t = k[i] as u8 + c;
+        let next = k.get(i + 1).copied().unwrap_or(false);
+        let (d, nc) = match t {
+            1 if next => (-1, 1),
+            1 => (1, 0),
+            2 => (0, 1),
+            _ => (0, 0),
+        };
+        out.push(d);
+        c = nc;
+    }
+    out
+}
 
 thread_local! {
     static CARRY_ARITH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

@@ -1557,3 +1557,31 @@ fn phys_opt_and_detailed_placement_keep_clocking_legal() {
         }
     }
 }
+
+/// Signed products on signed partial products (the fewest blocks: a
+/// signed 20 x 20 product on four, signed by unsigned 16 x 16 on one,
+/// each with its correction in logic) and products by constants (shift
+/// and add, no block) from RTL to the fabric. `tools/svcheck`
+/// (hard/mul_signed_wide.sv, tests/mul_const.sv) shows the netlists equal
+/// their RTL; here their bitstreams equal the netlists.
+#[test]
+fn signed_wide_and_constant_products_on_the_fabric() {
+    helion_sv::v2::set_hard_blocks(Some(true));
+    let synth = |src: &str| helion_sv::synth_sv_v2(src, "t.sv", None).expect("synth").design;
+    let s20 = synth("module s20(input logic signed [19:0] a, input logic signed [19:0] b, output logic signed [39:0] p);\n  assign p = a * b;\nendmodule\n");
+    let su = synth("module su(input logic signed [15:0] a, input logic [15:0] b, output logic signed [31:0] p);\n  assign p = a * $signed({1'b0, b});\nendmodule\n");
+    let k = synth("module k(input logic [11:0] a, input logic signed [9:0] s, output logic [23:0] p, output logic signed [15:0] q);\n  assign p = a * 24'd4095;\n  assign q = s * -16'sd1000;\nendmodule\n");
+    helion_sv::v2::set_hard_blocks(None);
+    let macs = |d: &Design| d.cells.iter().filter(|c| matches!(c.kind, CellKind::Mac27)).count();
+    let signed = |d: &Design| d.cells.iter().filter(|c| c.attrs.get("SIGNED") == Some("1")).count();
+    assert_eq!((macs(&s20), signed(&s20)), (4, 3), "aL*bL unsigned, the other three signed");
+    assert_eq!((macs(&su), signed(&su)), (1, 1));
+    assert_eq!(macs(&k), 0);
+    let part = "HL10S-C64-1";
+    check_design(&s20, part, 300, |_| {}).expect("s20");
+    check_design(&su, part, 300, |_| {}).expect("su");
+    check_design(&k, part, 300, |_| {}).expect("k");
+    // Not vacuous: the signed blocks made unsigned are caught.
+    let unsigned = |r: &mut helion_route::Routed| r.placed.packed.macs.iter_mut().for_each(|m| m.signed = false);
+    assert!(check_design(&s20, part, 300, unsigned).is_err(), "SIGNED off went unnoticed");
+}

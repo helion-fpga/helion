@@ -37,9 +37,16 @@ thread_local! {
 /// - a multiplication whose operands are 16-bit values (zero-extended, or
 ///   both sign-extended) becomes a `Mac27` (`P = A * B`, `SIGNED` for
 ///   signed operands; a result wider than 32 bits is P extended);
-///   a product of wider (or mixed-sign) variables becomes one unsigned
-///   `Mac27` per 16 x 16 partial product that reaches the result (at most
-///   16), summed with adders;
+///   a product of wider (or mixed-sign) variables takes one `Mac27` per
+///   pair of 16-bit operand pieces whose product reaches the result (at
+///   most 16), summed with adders: an operand zero-extended from n bits is
+///   ceil(n/16) unsigned pieces, one sign-extended from n bits ceil(n/16)
+///   pieces of which the top one is signed, so a signed n x m product
+///   takes ceil(n/16) * ceil(m/16) blocks; a block of an unsigned and a
+///   signed piece is `SIGNED` with the unsigned piece's bit 15 times the
+///   signed one added in logic;
+/// - a product by a constant is never a block: it is shift-and-add in
+///   logic (as without the option);
 /// - `a * b + c` (a one-block product and an addend of its width, at most
 ///   32 bits) puts `c` on the block's `C`;
 /// - a register of at most 32 bits, powering up at 0, without

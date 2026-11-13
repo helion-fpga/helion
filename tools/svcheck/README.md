@@ -24,7 +24,7 @@ All of these equal their RTL on every output and every compared flop:
 
 | design | size | cycles |
 |---|---|---|
-| `tools/svcheck/tests` (42 small designs) | up to a few hundred LUTs | 400 each |
+| `tools/svcheck/tests` (43 small designs) | up to a few hundred LUTs | 400 each |
 | `ip/` library (70 blocks) | | 400 each |
 | `examples/serv` (SERV, bit-serial RISC-V) | | 3,000 |
 | `corpus-pass/sha256` | | 2,000 |
@@ -33,6 +33,14 @@ All of these equal their RTL on every output and every compared flop:
 
 Ibex needs one edit to its copy for Verilator to accept it as a reference
 (`logic clk_sys = 1'b0` is also continuously assigned).
+
+## Products
+
+A product by a constant is shift-and-add over the constant's canonical
+signed digits, summed carry-save (`tests/mul_const.sv`; with
+`HELION_V2_HARD=1` it stays in logic, `hard/mul_const_hard.sv`). With
+`HELION_V2_HARD=1` a signed product wider than one Mac27 takes the fewest
+blocks, on signed partial products (`hard/mul_signed_wide.sv`).
 
 ## Power-up values
 
@@ -58,7 +66,7 @@ HELION_V2_HARD=1 python3 tools/svcheck/svcheck.py --corpus tools/svcheck/hard --
 ```
 
 checks the RAM and multiply designs in `tools/svcheck/hard` against their
-RTL (all fifteen equal it): besides one-block RAMs and products, registered
+RTL (all seventeen equal it): besides one-block RAMs and products, registered
 products and products plus an addend (`mac.sv`, the P register and C
 input), products wider than one block (`mul_wide.sv`, several blocks and
 adders), memories wider than 16 bits (`ram_wide.sv`), deeper than 1024
