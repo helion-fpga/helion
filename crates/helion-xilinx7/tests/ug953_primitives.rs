@@ -378,7 +378,12 @@ fn ug953_io_primitives_iddr_oddr_serdes_iodelay_clock_buffers() {
 fn ug953_srl16e_srlc32e_carry4_muxf7_muxf8_and_bitstream() {
     let mut d = Design::new("slice_prims");
 
-    // SRLC32E cascaded into SRL16E
+    // SRLC32E cascaded into SRL16E. Its data and enable come from pins: a
+    // net nothing drives would float on silicon and is refused by the router.
+    for (p, pin) in [("din", "J15"), ("ce", "L16"), ("s0", "M13"), ("s1", "R15")] {
+        d.add_port(p, PortDir::In);
+        d.set_loc(p, pin).unwrap();
+    }
     add_blackbox(&mut d, "u_srl32", "SRLC32E");
     d.set_cell_attr("u_srl32", "INIT", "32'hDEADBEEF").unwrap();
     d.connect("clk_g", "u_srl32", "CLK");

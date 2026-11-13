@@ -191,6 +191,60 @@ fn main() {
     }
 }
 
+/// Period of every flop clock after packing. A clock from a pad has the
+/// XDC period. A clock made by a flop has twice its source's period when
+/// that flop is a plain toggle (its input is its own output inverted, with
+/// no enable or reset); any other derived clock is refused, because its
+/// period cannot be known. (`pack` refuses flop-made clocks for now; this
+/// is ready for when the router can reach a global buffer from the fabric.)
+fn clock_periods(packed: &helion_xilinx7::pack::Packed7, pin_period: u32) -> Result<HashMap<String, u32>, String> {
+    let mut periods: HashMap<String, u32> = HashMap::new();
+    let mut doms: Vec<String> = packed.ffs.iter().map(|f| f.clk_net.clone()).collect();
+    doms.sort();
+    doms.dedup();
+    // Buffer input -> output, and which buffer inputs come from pads.
+    let pads: std::collections::HashSet<&str> = packed
+        .iobs
+        .iter()
+        .filter(|i| i.dir == helion_xilinx7::pack::IobDir::In)
+        .map(|i| i.net.as_str())
+        .collect();
+    let mut pending = doms.clone();
+    for _ in 0..8 {
+        pending.retain(|dom| {
+            let Some(b) = packed.bufgs.iter().find(|b| &b.out_net == dom) else { return true };
+            if pads.contains(b.in_net.as_str()) {
+                periods.insert(dom.clone(), pin_period);
+                return false;
+            }
+            let Some(f) = packed.ffs.iter().find(|f| f.q_net == b.in_net) else { return true };
+            let Some(&src) = periods.get(&f.clk_net) else { return true };
+            let toggles = f.ce_net.is_none()
+                && f.sr_net.is_none()
+                && !packed.negedge_ffs.contains(&f.name)
+                && packed.luts.iter().find(|l| l.output_net == f.d_net).is_some_and(|l| {
+                    let pins: Vec<usize> = (0..6).filter(|&k| l.input_nets[k].as_deref() == Some(f.q_net.as_str())).collect();
+                    let only_q = l.input_nets.iter().flatten().all(|n| *n == f.q_net);
+                    let at = |v: u64| -> u64 { pins.iter().fold(0u64, |a, &k| a | (v << k)) };
+                    only_q && !pins.is_empty() && (l.init >> at(0)) & 1 == 1 && (l.init >> at(1)) & 1 == 0
+                });
+            if toggles {
+                periods.insert(dom.clone(), src * 2);
+                false
+            } else {
+                true
+            }
+        });
+    }
+    if !pending.is_empty() {
+        return Err(format!(
+            "clock {} is not a pad clock or a divide-by-two of one; its period is unknown, so timing cannot be checked",
+            pending.join(", ")
+        ));
+    }
+    Ok(periods)
+}
+
 /// Clock period (ps) from the first `create_clock -period <ns>`; 10 ns default.
 fn xdc_period_ps(text: &str) -> u32 {
     for line in text.lines() {
@@ -298,7 +352,11 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
         );
         period /= 2;
     }
-    let ta = helion_xilinx7::timing::analyze(&routed, period)?;
+    let periods = clock_periods(&packed, period)?;
+    for (clk, p) in &periods {
+        eprintln!("zedbit timing: clock {clk}: period {:.3} ns", *p as f64 / 1000.0);
+    }
+    let ta = helion_xilinx7::timing::analyze_clocks(&routed, &|c| periods.get(c).copied())?;
     eprintln!(
         "zedbit timing: period {:.3} ns, worst slack {:.3} ns ({} of {} endpoints failing), est. fmax {:.0} MHz",
         period as f64 / 1000.0,
