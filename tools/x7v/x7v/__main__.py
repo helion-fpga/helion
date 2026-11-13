@@ -15,13 +15,15 @@ import argparse
 import os
 import sys
 
-from . import bit, decode, encode, fasmio, netlist, synthcheck, verify
+from . import bit, decode, encode, fasmio, netlist, pins, synthcheck, verify
 from .db import Db
 from .cosim import is_verilog as cosim_is_verilog
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="x7v")
+    ap.add_argument("--part", help="part the bitstream is for (default xc7z020clg484-1, the ZedBoard's)")
+    ap.add_argument("--board", help="board: sets the part and, for flow, the pin pools (zedboard, arty-a7-35, basys3, nexys-a7-100t)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("info"); p.add_argument("bit")
     p = sub.add_parser("decode"); p.add_argument("bit"); p.add_argument("-o")
@@ -46,7 +48,11 @@ def main(argv=None) -> int:
     p = sub.add_parser("corpus"); p.add_argument("corpus"); p.add_argument("--bit-key", default="bit")
     p.add_argument("--only"); p.add_argument("--cycles", type=int, default=3000); p.add_argument("--workdir")
     a = ap.parse_args(argv)
-    db = Db()
+    if a.part and a.board:
+        ap.error("give --part or --board, not both")
+    board = pins.board(a.board) if a.board else None
+    part = board["part"] if board else (a.part or "xc7z020clg484-1")
+    db = Db.for_part(part)
 
     if a.cmd == "info":
         bs = bit.parse(a.bit, db.part)
@@ -101,7 +107,7 @@ def main(argv=None) -> int:
         return 1 if bad else 0
     if a.cmd == "flow":
         import subprocess, time
-        from . import cosim, pins
+        from . import cosim
         zb = os.environ.get("X7V_ZEDBIT", os.path.join(synthcheck.REPO, "target/release/examples/zedbit"))
         bad = 0
         for f in map(os.path.abspath, a.files):
@@ -110,12 +116,12 @@ def main(argv=None) -> int:
             os.makedirs(wd, exist_ok=True)
             ports = cosim.sv_ports([f], a.top) if cosim.is_verilog([f]) else cosim.vhdl_ports([f], a.top)
             xdc = os.path.join(wd, "pins.xdc")
-            pins.write_xdc(ports, xdc)
+            pins.write_xdc(ports, xdc, db, a.board)
             bitf = os.path.join(wd, "helion.bit")
             if os.path.exists(bitf):
                 os.remove(bitf)
             t = time.time()
-            r = subprocess.run([zb, f, xdc, bitf, a.top], capture_output=True, text=True, timeout=7200)
+            r = subprocess.run([zb, f, xdc, bitf, a.top, f"--part={part}"], capture_output=True, text=True, timeout=7200)
             msg = [l for l in (r.stdout + r.stderr).splitlines() if l.startswith("zedbit")]
             if not os.path.exists(bitf):
                 print(f"{name}: FAIL build ({time.time() - t:.0f}s): {msg[-1] if msg else (r.stderr.strip().splitlines() or ['?'])[-1]}")

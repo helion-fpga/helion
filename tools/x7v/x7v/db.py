@@ -9,6 +9,48 @@ from functools import cached_property, lru_cache
 
 DEFAULT_ROOT = os.environ.get(
     "X7V_DB", os.path.expanduser("~/.cache/helion/prjxray-db/zynq7"))
+# Directory holding the database families (zynq7/, artix7/, ...).
+DB_PARENT = os.environ.get("X7V_DB_ROOT", os.path.dirname(DEFAULT_ROOT.rstrip("/")))
+DEFAULT_PART = "xc7z020clg484-1"
+
+
+def _yaml_map(path: str) -> dict[str, dict[str, str]]:
+    """The database's mapping/*.yaml: `key:` lines, indented `field: value`."""
+    out: dict[str, dict[str, str]] = {}
+    cur = None
+    for line in open(path):
+        body = line.split("#", 1)[0]
+        if not body.strip() or ":" not in body:
+            continue
+        k, v = body.split(":", 1)
+        unq = lambda x: x.strip().strip('"').strip("'")
+        if body[0] in " \t":
+            if cur is not None:
+                out[cur][unq(k)] = unq(v)
+        else:
+            cur = unq(k)
+            out.setdefault(cur, {})
+    return out
+
+
+def resolve_part(name: str, parent: str = DB_PARENT) -> tuple[str, str, str]:
+    """Part name -> (family directory, fabric, part), from the database's own
+    mapping/parts.yaml and mapping/devices.yaml (written independently of
+    Helion's resolver)."""
+    short = {"xc7z020": "xc7z020clg484-1", "xc7a35t": "xc7a35tcsg324-1"}
+    name = short.get(name, name)
+    fams = sorted(d for d in os.listdir(parent) if os.path.isfile(os.path.join(parent, d, "mapping", "parts.yaml")))
+    for fam in fams:
+        famdir = os.path.join(parent, fam)
+        parts = _yaml_map(os.path.join(famdir, "mapping", "parts.yaml"))
+        if name not in parts:
+            continue
+        device = parts[name]["device"]
+        fabric = _yaml_map(os.path.join(famdir, "mapping", "devices.yaml"))[device]["fabric"]
+        if not os.path.isfile(os.path.join(famdir, name, "part.json")):
+            raise ValueError(f"part {name}: {famdir}/{name}/part.json is missing")
+        return famdir, fabric, name
+    raise ValueError(f"unknown part {name} (database families under {parent}: {', '.join(fams) or 'none'})")
 
 
 @dataclass(frozen=True)
@@ -30,6 +72,13 @@ class Db:
         self.root = root
         self.fabric = fabric
         self.package = package
+
+    @classmethod
+    def for_part(cls, name: str) -> "Db":
+        """The database for any part X-Ray describes (`xc7a35tcsg324-1`)."""
+        if name == DEFAULT_PART and "X7V_DB" in os.environ:
+            return cls()
+        return cls(*resolve_part(name))
 
     # ---- part / grid -------------------------------------------------
     @cached_property

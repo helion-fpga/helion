@@ -69,9 +69,13 @@ def verify(db: Db, design: str, bitfile: str, rtl: list[str] | None = None, top:
     cmds = [c for c in bs.commands()]
     crcs = bit.crc_checks(bs)
     bad_crc = [f"written {w:#010x} expected {e:#010x}" for w, e in crcs if w != e]
+    # The device refuses a bitstream whose IDCODE is not its own.
+    idcode, want_id = bs.reg_value("IDCODE"), db.part["idcode"]
+    if idcode != want_id:
+        bad_crc.append(f"IDCODE {idcode if idcode is None else hex(idcode)} is not {db.package}'s {want_id:#010x}: the device would refuse it")
     rep.checks.append(Check("packets", cmds == VIVADO_COMMANDS and len(bs.frames) == len(bit.frame_addresses(db.part)) and not bad_crc and len(crcs) == 2,
-                            f"{len(bs.frames)} frames, commands {cmds}, {len(crcs)} CRC checks ({len(bad_crc)} wrong: device would refuse to start)" if bad_crc else
-                            f"{len(bs.frames)} frames, commands {cmds}, {len(crcs)} CRC checks all correct", bad_crc))
+                            f"{len(bs.frames)} frames, commands {cmds}, {len(crcs)} CRC checks, IDCODE: {len(bad_crc)} problems (device would refuse to start)" if bad_crc else
+                            f"{len(bs.frames)} frames, commands {cmds}, {len(crcs)} CRC checks all correct, IDCODE {want_id:#010x} ({db.package})", bad_crc))
 
     dec = decode.decode(db, bs.frames)
     rep.checks.append(Check("ecc", not dec.ecc_mismatch, f"{len(dec.ecc_mismatch)} frames with wrong ECC",
