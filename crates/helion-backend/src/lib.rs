@@ -43,6 +43,13 @@ pub struct TimingModel {
     pub hold_req_ps: i64,
     /// Carry chain arc (CI to CO through Carry4). Much faster than LUT.
     pub carry_ps: i64,
+    /// Hard multiplier arc, A/B/C in to P out (the whole 16x16 product and
+    /// the C add). A combinational multiplier (`PREG=0`) adds it to its
+    /// path; a registered one adds it before its register's setup.
+    pub mac_ps: i64,
+    /// Block RAM clock to DO (the read of the word at the latched address).
+    /// Its inputs are latched like a flop's D, with `setup_ps`.
+    pub bram_ckq_ps: i64,
 }
 
 impl TimingModel {
@@ -58,6 +65,14 @@ impl TimingModel {
             hop_ps: 40,
             hold_req_ps: 20,
             carry_ps: 50,
+            // Six 3:2 compressor stages take the 17 rows (16 partial
+            // products and C) down to two, one LUT delay each (6 x 150),
+            // then a 32-bit carry-propagate add at the carry arc per four
+            // bits (8 x 50).
+            mac_ps: 1300,
+            // Decoding the 10-bit latched address (two LUT delays, 2 x 150)
+            // and the output latch (one clock-to-Q, 80).
+            bram_ckq_ps: 380,
         }
     }
 
@@ -80,6 +95,10 @@ impl TimingModel {
             hop_ps: 70,
             hold_req_ps: 100,
             carry_ps: 60,
+            // DS181 (-1) order of magnitude: DSP48E1 A/B to P without
+            // M/P registers ~3 ns, RAMB18 clock to DO without DO_REG ~2 ns.
+            mac_ps: 3000,
+            bram_ckq_ps: 2100,
         }
     }
 
@@ -105,6 +124,9 @@ impl TimingModel {
             hop_ps: 200,
             hold_req_ps: 500,
             carry_ps: 300,
+            // Placeholders of the same order as the arcs above.
+            mac_ps: 6000,
+            bram_ckq_ps: 2500,
         }
     }
 
@@ -129,6 +151,9 @@ impl TimingModel {
             hop_ps: 100,
             hold_req_ps: 80,
             carry_ps: 120,
+            // Placeholders of the same order as the arcs above.
+            mac_ps: 3000,
+            bram_ckq_ps: 1500,
         }
     }
 }
