@@ -400,7 +400,12 @@ impl Design {
     /// Complexity: O(cells + nets + endpoints).
     pub fn sweep_dead_luts(&mut self) -> usize {
         self.rebuild_indexes();
-        self.sweep_dead_luts_inner()
+        let n = self.sweep_dead_luts_inner();
+        if n > 0 {
+            // `remove_cells_fast` leaves `net_ix`/`pin_ix` stale; callers expect valid indexes.
+            self.rebuild_net_ix();
+        }
+        n
     }
 
     fn sweep_dead_luts_inner(&mut self) -> usize {
