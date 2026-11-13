@@ -15,6 +15,41 @@ pub mod parse;
 pub mod pre;
 
 use helion_ir::Design;
+use std::cell::Cell;
+
+thread_local! {
+    static HARD: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Opt in to (`Some(true)`) or out of (`Some(false)`) block RAM and
+/// multiplier inference for synthesis started from the calling thread;
+/// `None` goes back to the default, which is `HELION_V2_HARD=1` in the
+/// environment, else off. With it on:
+///
+/// - a multiplication whose result is at most 32 bits and whose operands
+///   are 16-bit values (zero-extended, or both sign-extended) becomes a
+///   `Mac27` (`P = A * B`, combinational, `SIGNED` for signed operands);
+/// - a memory of at most 1024 words of at most 16 bits, indexed from 0
+///   with addresses as wide as its depth (a power of two), written by one
+///   nonblocking `mem[waddr] <= data` (under any condition) and read only
+///   by one register `q <= mem[raddr]` (under any condition), in one
+///   rising-edge process without reset, becomes a `Bram18` whose `DO` is
+///   that register.
+///
+/// Anything else is built from LUTs and flops as before. The cells need a
+/// part with BRAM / DSP sites; v2 does not know the part, hence the opt-in.
+pub fn set_hard_blocks(on: Option<bool>) {
+    HARD.with(|h| h.set(on));
+}
+
+/// Whether the synthesis running on this thread infers hard blocks.
+pub(crate) fn hard_blocks() -> bool {
+    HARD.with(|h| h.get()).unwrap_or(false)
+}
+
+fn hard_requested() -> bool {
+    HARD.with(|h| h.get()).unwrap_or_else(|| std::env::var("HELION_V2_HARD").is_ok_and(|v| v == "1"))
+}
 
 /// Result of a synthesis run.
 pub struct Synth {
@@ -91,13 +126,17 @@ fn run(sources: &[(String, String)], top: Option<&str>, defines: &[(String, Stri
 pub fn synth(sources: &[(String, String)], top: Option<&str>, defines: &[(String, String)], dirs: Vec<std::path::PathBuf>) -> Result<Synth, String> {
     let sources = sources.to_vec();
     let top = top.map(|s| s.to_string());
+    let hard = hard_requested();
     let mut defines = defines.to_vec();
     if !defines.iter().any(|d| d.0 == "SYNTHESIS") {
         defines.push(("SYNTHESIS".into(), String::new()));
     }
     std::thread::Builder::new()
         .stack_size(1 << 30)
-        .spawn(move || run(&sources, top.as_deref(), &defines, dirs))
+        .spawn(move || {
+            set_hard_blocks(Some(hard));
+            run(&sources, top.as_deref(), &defines, dirs)
+        })
         .map_err(|e| format!("cannot start the synthesis thread: {e}"))?
         .join()
         .map_err(|_| "internal error: synthesis panicked".to_string())?

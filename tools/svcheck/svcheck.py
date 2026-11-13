@@ -71,7 +71,19 @@ class Netlist:
                 self.nets.setdefault(f[1], []).extend(eps)
 
 
-OUT_PINS = {"Lut6": {"O"}, "Hff": {"Q"}, "IobIn": {"O"}, "ClockBuf": {"O"}}
+OUT_PINS = {"Lut6": {"O"}, "Hff": {"Q"}, "IobIn": {"O"}, "ClockBuf": {"O"},
+            "Bram18": {f"DO{i}" for i in range(16)}, "Mac27": {f"P{i}" for i in range(32)}}
+
+
+def bram_init(text: str) -> list[int]:
+    """Words of a Bram18 INIT attribute: 64-bit hex words, four 16-bit
+    words each, address 4w+k in bits 16k.."""
+    words = [0] * 1024
+    for w, t in enumerate(x.strip() for x in text.split(",") if x.strip()):
+        v = int(t, 16)
+        for k in range(4):
+            words[4 * w + k] = (v >> (16 * k)) & 0xFFFF
+    return words
 
 
 def build(nl: Netlist, widths: dict[str, int]):
@@ -206,6 +218,51 @@ def build(nl: Netlist, widths: dict[str, int]):
             src = pin("I") or pin("PAD")
             if o and src and o != src:
                 logic.append(f"assign {vid(o)} = {ref(src)};")
+        elif kind in ("Bram18", "Mac27"):
+            # Helion's block RAM and multiplier, as helion-ir defines them:
+            # an unconnected input reads 0, an unconnected RE / CE reads 1.
+            c = vid(cell)
+            at = nl.attrs.get(cell, {})
+            bus = lambda p, n: "{" + ", ".join(ref(pin(f"{p}{i}")) for i in range(n - 1, -1, -1)) + "}"
+            en = lambda p: ref(pin(p)) if pin(p) else "1'b1"
+            ck = pin("CLK")
+            if ck is not None:
+                root = clock_root(ck)
+                if root is not None:
+                    clocks.add(root)
+            if kind == "Bram18":
+                if ck is None:
+                    problems.append(f"block RAM {cell} has no clock")
+                    continue
+                logic.append(f"reg [15:0] {c}_mem [0:1023]; reg [15:0] {c}_q = 16'd0;")
+                init = bram_init(at.get("INIT", ""))
+                sets = " ".join(f"{c}_mem[{a}] = 16'h{v:04x};" for a, v in enumerate(init) if v)
+                logic.append(f"integer {c}_i; initial begin for ({c}_i = 0; {c}_i < 1024; {c}_i = {c}_i + 1) {c}_mem[{c}_i] = 16'd0; {sets} end")
+                # Read first: both nonblocking, the read sees the old word.
+                logic.append(f"always @(posedge {ref(ck)}) begin if ({en('RE')}) {c}_q <= {c}_mem[{bus('RADDR', 10)}]; "
+                             f"if ({ref(pin('WE'))}) {c}_mem[{bus('WADDR', 10)}] <= {bus('DI', 16)}; end")
+                out, n = f"{c}_q", 16
+                outp = "DO"
+            else:
+                a, b, cc = bus("A", 16), bus("B", 16), bus("C", 32)
+                sg = "signed " if at.get("SIGNED") == "1" else ""
+                # Operands of the declared signedness, widened by the 32-bit context.
+                logic.append(f"wire {sg}[15:0] {c}_a = {a}; wire {sg}[15:0] {c}_b = {b}; wire {sg}[31:0] {c}_m = {c}_a * {c}_b;")
+                logic.append(f"wire [31:0] {c}_f = {c}_m + {cc};")
+                if at.get("PREG") == "1":
+                    if ck is None:
+                        problems.append(f"multiplier {cell} has PREG and no clock")
+                        continue
+                    logic.append(f"reg [31:0] {c}_p = 32'd0;")
+                    logic.append(f"always @(posedge {ref(ck)}) if ({ref(pin('RST'))}) {c}_p <= 32'd0; else if ({en('CE')}) {c}_p <= {c}_f;")
+                    out = f"{c}_p"
+                else:
+                    out = f"{c}_f"
+                n, outp = 32, "P"
+            for i in range(n):
+                o = pin(f"{outp}{i}")
+                if o is not None:
+                    logic.append(f"assign {vid(o)} = {out}[{i}];")
         else:
             problems.append(f"cell {cell} of kind {kind} is not modelled")
 

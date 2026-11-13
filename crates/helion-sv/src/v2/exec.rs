@@ -63,8 +63,9 @@ enum Root {
 enum LStep {
     /// A fixed sub-range (member, constant index or slice).
     Fixed(u32, u32),
-    /// One of `count` elements of `ew` bits, chosen by position `idx`.
-    Elem { idx: N, count: u32, ew: u32 },
+    /// One of `count` elements of `ew` bits, chosen by position `idx`
+    /// (the source index is `addr`, into an array shaped `geo`).
+    Elem { idx: N, count: u32, ew: u32, addr: N, geo: Option<super::lower::MemGeo> },
     /// `w` bits starting at position `off`.
     Slide { off: N, w: u32 },
 }
@@ -182,6 +183,16 @@ impl Elab {
         let hi = self.select(&elems[half..], idx);
         let b = self.dag.slice(idx, bit, 1);
         self.dag.mux(b, hi, lo)
+    }
+
+    /// Shape of an unpacked array of plain words, for memory inference.
+    fn mem_geo(ty: &Ty) -> Option<super::lower::MemGeo> {
+        match ty {
+            Ty::Array { elem, lo, hi, asc, packed: false } if matches!(**elem, Ty::Bits { .. }) => {
+                Some(super::lower::MemGeo { count: (hi - lo + 1) as u32, ew: elem.w(), lo: *lo, hi: *hi, asc: *asc })
+            }
+            _ => None,
+        }
     }
 
     /// Position (0 at the LSB end) of index `i` in a vector or array.
@@ -460,7 +471,14 @@ impl Elab {
                 } else {
                     let pos = self.position(&iv, &bv.ty);
                     let elems: Vec<N> = (0..count).map(|k| self.dag.slice(bv.n, k * ew, ew)).collect();
-                    V { n: self.select(&elems, pos), ty: ety }
+                    let n = self.select(&elems, pos);
+                    // A whole memory read at a variable address.
+                    if let (true, Op::Read(sig), Some(geo)) = (super::hard_blocks(), self.dag.op(bv.n).clone(), Self::mem_geo(&bv.ty)) {
+                        if self.dag.w(bv.n) == self.sigs[sig as usize].ty.w() {
+                            self.mem_reads.push(super::lower::MemRead { node: n, sig, addr: iv.n, geo });
+                        }
+                    }
+                    V { n, ty: ety }
                 }
             }
             Expr::Range(b, hi, lo) => {
@@ -1098,7 +1116,8 @@ impl Elab {
                     lv.steps.push(LStep::Fixed(off, ety.w()));
                 } else {
                     let idx = self.position(&iv, &lv.ty);
-                    lv.steps.push(LStep::Elem { idx, count, ew: ety.w() });
+                    let geo = Self::mem_geo(&lv.ty);
+                    lv.steps.push(LStep::Elem { idx, count, ew: ety.w(), addr: iv.n, geo });
                 }
                 lv.ty = ety;
                 Ok(lv)
@@ -1175,7 +1194,7 @@ impl Elab {
                 let ns = self.write(sub, &steps[1..], val);
                 self.splice(cur, *lo, ns)
             }
-            LStep::Elem { idx, count, ew } => {
+            LStep::Elem { idx, count, ew, .. } => {
                 let iw = self.dag.w(*idx);
                 let mut parts = Vec::with_capacity(*count as usize);
                 for k in (0..*count).rev() {
@@ -1261,6 +1280,12 @@ impl Elab {
                 let map = if nonblocking { &mut env.nba } else { &mut env.sig };
                 let cur = map.get(&id).copied().unwrap_or(base);
                 let mut new = self.write(cur, &lv.steps, v);
+                // A nonblocking write of one word into the stored memory.
+                if let ([LStep::Elem { addr, geo: Some(geo), .. }], true, true) = (lv.steps.as_slice(), nonblocking, super::hard_blocks()) {
+                    if cur == base && matches!(self.dag.op(base), Op::Read(_)) {
+                        self.mem_writes.push(super::lower::MemWrite { node: new, sig: id, addr: *addr, val: v, geo: *geo });
+                    }
+                }
                 if let Some(l) = live {
                     new = self.dag.mux(l, new, cur);
                 }

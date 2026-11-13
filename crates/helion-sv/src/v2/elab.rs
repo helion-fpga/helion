@@ -132,6 +132,9 @@ pub struct Elab {
     inst_depth: u32,
     /// Line of the item being elaborated, for messages.
     pub line: u32,
+    /// Memory accesses, recorded for block RAM inference.
+    pub mem_reads: Vec<super::lower::MemRead>,
+    pub mem_writes: Vec<super::lower::MemWrite>,
 }
 
 impl Elab {
@@ -156,6 +159,8 @@ impl Elab {
             ps: Default::default(),
             inst_depth: 0,
             line: 0,
+            mem_reads: Vec::new(),
+            mem_writes: Vec::new(),
         };
         for m in src.modules {
             e.order.push(m.name.clone());
@@ -1029,6 +1034,19 @@ impl Elab {
                 SigInfo { name: s.name, hier: s.hier, index, w: s.drv.len() as u32, drv: s.drv, init: s.init, debug: s.debug }
             })
             .collect();
-        Ok((Flat { top: m.name.clone(), dag: self.dag, sigs, ports: fp, regs: self.regs, latches: self.latches, instances: self.instances }, self.warnings))
+        Ok((
+            Flat {
+                top: m.name.clone(),
+                dag: self.dag,
+                sigs,
+                ports: fp,
+                regs: self.regs,
+                latches: self.latches,
+                instances: self.instances,
+                mem_reads: self.mem_reads,
+                mem_writes: self.mem_writes,
+            },
+            self.warnings,
+        ))
     }
 }

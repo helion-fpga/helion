@@ -34,6 +34,23 @@ All of these equal their RTL on every output and every compared flop:
 Ibex needs one edit to its copy for Verilator to accept it as a reference
 (`logic clk_sys = 1'b0` is also continuously assigned).
 
+## Block RAMs and multipliers
+
+With `HELION_V2_HARD=1` the front end puts memories and products that a
+Helion `Bram18` (1024 x 16, read-first, registered read) or `Mac27`
+(16 x 16 -> 32) implements exactly on those blocks (see
+`helion_sv::v2::set_hard_blocks`). The script models both cells as
+`helion-ir` defines them, so
+
+```sh
+HELION_V2_HARD=1 python3 tools/svcheck/svcheck.py --corpus tools/svcheck/hard --regs --cycles 2000
+```
+
+checks the RAM and multiply designs in `tools/svcheck/hard` against their
+RTL (all three equal it). Without the variable those designs are built
+from LUTs and flops, and every netlist is the same as before the option
+existed.
+
 ## Reset
 
 An asynchronous reset or set that is one plain signal with constant reset

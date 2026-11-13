@@ -966,3 +966,35 @@ fn broken_hard_blocks_are_detected() {
     let sign = |r: &mut helion_route::Routed| r.placed.packed.macs[0].signed ^= true;
     assert!(check_design(&mul_design(true, false, false), part, 250, sign).is_err(), "a flipped SIGNED went unnoticed");
 }
+
+/// From RTL to the fabric: with hard-block inference on, the v2 front end
+/// puts a memory on a Bram18 and products on Mac27s (`tools/svcheck`, run
+/// with HELION_V2_HARD=1 on `tools/svcheck/hard`, shows those netlists
+/// equal their RTL), and their bitstreams equal those netlists.
+#[test]
+fn inferred_ram_and_multipliers_on_the_fabric() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/svcheck/hard/");
+    helion_sv::v2::set_hard_blocks(Some(true));
+    let synth = |f: &str| {
+        let src = std::fs::read_to_string(format!("{root}{f}")).expect("source");
+        helion_sv::synth_sv_v2(&src, f, None).expect("synth").design
+    };
+    let ram = synth("ram_1k.sv");
+    let small = synth("ram_small.sv");
+    let mul = synth("mul.sv");
+    helion_sv::v2::set_hard_blocks(None);
+    let count = |d: &Design, k: fn(&CellKind) -> bool| d.cells.iter().filter(|c| k(&c.kind)).count();
+    assert_eq!(count(&ram, |k| matches!(k, CellKind::Bram18)), 1);
+    assert_eq!(count(&ram, |k| matches!(k, CellKind::Hff)), 0, "the memory and its read register are the block RAM");
+    assert_eq!(count(&small, |k| matches!(k, CellKind::Bram18)), 1);
+    assert_eq!(count(&mul, |k| matches!(k, CellKind::Mac27)), 4);
+    check_design(&ram, "HL10S-C64-1", 500, |_| {}).expect("ram_1k");
+    check_design(&small, "HL10T-C32-1", 500, |_| {}).expect("ram_small");
+    check_design(&mul, "HL10S-C64-1", 200, |_| {}).expect("mul");
+    // Off (the default), the same sources are built from LUTs and flops.
+    let plain = {
+        let src = std::fs::read_to_string(format!("{root}ram_small.sv")).unwrap();
+        helion_sv::synth_sv_v2(&src, "ram_small.sv", None).unwrap().design
+    };
+    assert_eq!(count(&plain, |k| matches!(k, CellKind::Bram18 | CellKind::Mac27)), 0);
+}

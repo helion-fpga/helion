@@ -488,6 +488,10 @@ impl Dag {
                 }
             }
         }
+        // Kept whole for the netlist to put on a multiplier block.
+        if w <= 32 && super::hard_blocks() {
+            return self.intern(Op::Mul(a, b), w);
+        }
         // Shift-and-add over named partial sums (no `*` in the emitted SV).
         let (a, b) = if self.as_const(a).is_some() {
             (b, a)
