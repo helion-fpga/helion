@@ -31,10 +31,11 @@ the ad-hoc signature); Developer ID-signed bundles refuse in-place and fall
 back to download-only. Restart saves the editor, spawns the new binary with
 the same args, then closes. Menu: Help -> "Check for updates…".
 
-## ZedBoard (7-series) flow
+## 7-series flow (ZedBoard, Arty A7, Basys3, Nexys A7)
 
-`crates/helion-xilinx7/examples/zedbit.rs` builds a `.bit` for `xc7z020clg484-1`
-from HDL and an XDC; `tools/x7v` decodes any 7-series bitstream with the
+`crates/helion-xilinx7/examples/zedbit.rs` builds a `.bit` from HDL and an XDC
+for the ZedBoard's `xc7z020clg484-1`, or `--board`/`--part` (any part the X-Ray
+database describes; `helion_xilinx7::parts`, board pins in `boards/`); `tools/x7v` decodes any 7-series bitstream with the
 Project X-Ray database and co-simulates it against the RTL (`python3 -m x7v
 verify|flow`, see its README). A bitstream is not done until `x7v verify`
 passes on it, and timing is a separate gate (`zedbit` refuses a design that
@@ -42,7 +43,9 @@ misses its clock). `zedbit --front=v2` uses the v2 SystemVerilog front end;
 `--front=zb` uses the front ends frozen in `crates/zb` (read its README before
 touching them: they are copies, not to be edited), which are the only ones
 that infer carry chains. Database: `HELION_XILINX_DB` (directory holding
-`zynq7/`), `X7V_DB` for x7v. Never flash a board without the user watching.
+`zynq7/`, `artix7/`; default `~/.cache/helion/prjxray-db`), `X7V_DB_ROOT` for
+x7v. `tools/x7v/tests/boards.sh` builds and verifies a counter and PicoRV32 per
+board. Never flash a board without the user watching.
 
 ## macOS release signing
 

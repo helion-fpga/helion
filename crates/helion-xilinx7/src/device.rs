@@ -23,8 +23,9 @@ use crate::db::parse::{PackagePin, Ppip, SegBit, parse_mask_line, parse_package_
 /// Root of the raw X-Ray database.
 ///
 /// `HELION_XILINX_DB` wins; otherwise the first of these that exists:
-/// `~/workspace/xilinx-dbsrc` (Linux VM), then
-/// `~/Documents/zedboard-helion-debug/work/prjxray-db` (MacBook).
+/// `~/.cache/helion/prjxray-db`, `~/workspace/xilinx-dbsrc` (Linux VM), then
+/// `~/Documents/zedboard-helion-debug/work/prjxray-db` (MacBook; iCloud,
+/// slow to read).
 /// When none exists, the VM path is returned so the error names it.
 pub fn default_db_root() -> PathBuf {
     if let Ok(p) = std::env::var("HELION_XILINX_DB") {
@@ -33,6 +34,7 @@ pub fn default_db_root() -> PathBuf {
     let mut candidates = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
         let home = PathBuf::from(home);
+        candidates.push(home.join(".cache/helion/prjxray-db"));
         candidates.push(home.join("workspace/xilinx-dbsrc"));
         candidates.push(home.join("Documents/zedboard-helion-debug/work/prjxray-db"));
     }
@@ -232,6 +234,11 @@ impl Device {
     /// directly under `zynq7/` (shared by all zynq7 parts); only
     /// `tilegrid.json` / `tileconn.json` live in the part-specific
     /// `zynq7/xc7z020/` dir, with part files in `zynq7/xc7z020clg484-1/`.
+    /// Load any part the database describes (see [`crate::parts`]).
+    pub fn load_part(part: &crate::parts::Part) -> Result<Self, String> {
+        Self::load_from_dirs(&part.family_dir, &part.fabric_dir(), &part.part_dir())
+    }
+
     pub fn load_xc7z020(db_root: &Path) -> Result<Self, String> {
         let zynq7 = db_root.join("zynq7");
         let fabric = zynq7.join("xc7z020");

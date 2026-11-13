@@ -27,23 +27,22 @@ pub struct Xilinx7Backend {
 }
 
 impl Xilinx7Backend {
-    /// Open the backend for `part` (e.g. `"xc7a35t"` or `"xc7z020"`), loading
-    /// the X-Ray device database and precomputing the routing node maps.
+    /// Open the backend for `part`: a full part name the X-Ray database
+    /// describes (`"xc7a35tcsg324-1"`, `"xc7z020clg484-1"`, ...; see
+    /// [`crate::parts`]) or the short `"xc7a35t"` / `"xc7z020"`. Loads the
+    /// device database and precomputes the routing node maps.
     ///
-    /// Only parts with a wired-up database are accepted; anything else is a
-    /// clear error, not a silent fallback.
+    /// A part the database does not describe is a clear error, not a silent
+    /// fallback. (`"xc7a35t"` alone falls back to a small synthetic device
+    /// when no database is installed, for unit tests.)
     pub fn open(part: impl Into<String>) -> Result<Self, String> {
         let part = part.into();
-        let loader: fn(&std::path::Path) -> Result<Device, String> = match part.as_str() {
-            "xc7a35t" => Device::load_xc7a35t,
-            "xc7z020" => Device::load_xc7z020,
-            _ => {
-                return Err(format!(
-                    "unsupported part {part}: only xc7a35t and xc7z020 have X-Ray databases wired up"
-                ))
-            }
+        let root = default_db_root();
+        let mut device = match crate::parts::resolve(&root, &part) {
+            Ok(p) => Device::load_part(&p)?,
+            Err(_) if part == "xc7a35t" => Device::load_xc7a35t(&root)?,
+            Err(e) => return Err(e),
         };
-        let mut device = loader(&default_db_root())?;
         let node_maps = build_node_map(&mut device);
         Ok(Self {
             part,
