@@ -1004,7 +1004,7 @@ impl Elab {
     fn declare_locals(&mut self, decls: &[Item], sc: usize, env: &mut Env) -> R<()> {
         for d in decls {
             match d {
-                Item::Decl { ty, names, line } => {
+                Item::Decl { ty, names, line, .. } => {
                     self.line = *line;
                     let base = self.resolve_type(ty, sc)?;
                     for dn in names {
@@ -1278,6 +1278,12 @@ impl Elab {
                 if env.mode == Mode::Const {
                     let name = self.sigs[id as usize].name.clone();
                     return self.err(format!("'{name}' is assigned outside a process"));
+                }
+                if env.mode == Mode::Init && self.sigs[id as usize].net {
+                    let name = self.sigs[id as usize].name.clone();
+                    return self.err(format!(
+                        "'{name}' is a net; an 'initial' block cannot assign it (IEEE 1800, 6.5): declare it as a variable ('logic', 'reg') to give it a power-up value"
+                    ));
                 }
                 let total = self.sigs[id as usize].ty.w();
                 let base = match env.mode {
@@ -2047,6 +2053,18 @@ impl Elab {
                         *x = v[b];
                     }
                 }
+            }
+            // A bit something else drives (a continuous assignment, a
+            // combinational process, an input) has no power-up value.
+            let s = &self.sigs[id as usize];
+            let set = |b: usize| match (ps.blk.get(&id), ps.nba.get(&id)) {
+                (None, None) => true,
+                (x, y) => x.is_some_and(|m| m[b]) || y.is_some_and(|m| m[b]),
+            };
+            if (0..s.drv.len()).any(|b| set(b) && matches!(s.drv[b], super::lower::Drv::Comb(..) | super::lower::Drv::Input | super::lower::Drv::Latch(_))) {
+                self.warnings.push(format!(
+                    "line {line}: '{name}' is also driven by a continuous assignment or combinational logic, so the value this 'initial' block gives it is ignored"
+                ));
             }
             let s = &mut self.sigs[id as usize];
             s.init = bits;

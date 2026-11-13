@@ -193,3 +193,59 @@ fn initial_blocks_set_register_power_up_values() {
     let s = synth_in(&dir, src).unwrap();
     assert!(s.warnings.iter().any(|w| w.contains("'$fopen' in an 'initial' block is simulation only")), "{:?}", s.warnings);
 }
+
+/// Only a variable has a power-up value: an `initial` block assigning a
+/// net (a `wire`, an input, an output with no data type) is an error with
+/// its line, as the language has it (IEEE 1800, 6.5); one assigning a
+/// variable that a continuous assignment or combinational logic also
+/// drives warns that the value is ignored.
+#[test]
+fn initial_blocks_assign_variables_not_nets() {
+    let dir = Dir::new("nets");
+    let nets: &[&str] = &[
+        "module t(input logic [7:0] a, output logic [7:0] q);\n  wire [7:0] w;\n  initial w = 8'h5;\n  assign q = w;\nendmodule\n",
+        "module t(input logic [7:0] a, output [7:0] q);\n  initial\n    q = 8'h5;\nendmodule\n",
+        "module t(input logic [7:0] a, output wire logic [7:0] q);\n  initial q = 8'h5;\nendmodule\n",
+        "module t(input logic [7:0] a, output logic [7:0] q);\n  initial a = 8'h5;\n  assign q = a;\nendmodule\n",
+        "module t(a, q);\n  input [7:0] a;\n  output [7:0] q;\n  initial q = 8'h5;\nendmodule\n",
+        "module t(input logic [7:0] a, output logic [7:0] q);\n  wire [7:0] w = a;\n  initial begin\n    w[1] = 1'b1;\n  end\n  assign q = w;\nendmodule\n",
+    ];
+    for src in nets {
+        let e = synth_in(&dir, src).err().unwrap_or_else(|| panic!("accepted:\n{src}"));
+        assert!(e.contains("is a net; an 'initial' block cannot assign it"), "{e}\n{src}");
+        let line = src.lines().position(|l| l.contains(" = 8'h5") || l.contains("w[1] =")).unwrap() + 1;
+        assert!(e.contains(&format!("line {line}: ")), "expected line {line}: {e}\n{src}");
+    }
+    // Variables: an output with a data type, a non-ANSI port declared a
+    // reg, a plain variable. Nothing else drives them, so they are
+    // constants, without a warning.
+    let vars: &[&str] = &[
+        "module t(input logic [7:0] a, output logic [7:0] q);\n  initial q = 8'h5;\nendmodule\n",
+        "module t(a, q);\n  input [7:0] a;\n  output [7:0] q;\n  reg [7:0] q;\n  initial q = 8'h5;\nendmodule\n",
+        "module t(input logic [7:0] a, output reg [7:0] q);\n  initial q = 8'h5;\nendmodule\n",
+        "module t(input logic [7:0] a, output logic [7:0] q);\n  logic [7:0] v;\n  initial v = 8'h5;\n  assign q = v;\nendmodule\n",
+    ];
+    for src in vars {
+        let s = synth_in(&dir, src).unwrap_or_else(|e| panic!("{e}\n{src}"));
+        assert_eq!(out_after(&s.design, &[("a", 8, 0)], "q", 0), 5, "{src}");
+        assert!(s.warnings.is_empty(), "{:?}\n{src}", s.warnings);
+    }
+    // A variable something else drives: the initial value is ignored, with
+    // a warning naming the block's line.
+    let driven: &[&str] = &[
+        "module t(input logic [7:0] a, output logic [7:0] q);\n  initial q = 8'h3;\n  assign q = a;\nendmodule\n",
+        "module t(input logic [7:0] a, output logic [7:0] q);\n  logic [7:0] c;\n  initial c = 8'h3;\n  always_comb c = a + 8'd1;\n  assign q = c;\nendmodule\n",
+    ];
+    for src in driven {
+        let s = synth_in(&dir, src).unwrap_or_else(|e| panic!("{e}\n{src}"));
+        let line = src.lines().position(|l| l.contains("initial")).unwrap() + 1;
+        assert!(
+            s.warnings.iter().any(|w| w.starts_with(&format!("line {line}:")) && w.contains("also driven by a continuous assignment or combinational logic")),
+            "{:?}\n{src}",
+            s.warnings
+        );
+    }
+    // A register keeps its initial value without a warning.
+    let s = synth_in(&dir, "module t(input logic clk, input logic [7:0] a, output logic [7:0] q);\n  initial q = 8'h3;\n  always_ff @(posedge clk) q <= a;\nendmodule\n").unwrap();
+    assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+}

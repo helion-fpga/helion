@@ -106,6 +106,9 @@ pub struct Sig {
     /// bit nothing else drives holds it (a ROM, a constant).
     pub has_init: bool,
     pub line: u32,
+    /// Declared as a net (`wire`, an input, ...): no procedural
+    /// assignment, an `initial` block's included, may write it.
+    pub net: bool,
 }
 
 pub struct VarInfo {
@@ -266,7 +269,7 @@ impl Elab {
         let w = ty.w() as usize;
         let full = format!("{}{}", self.prefix(sc), name);
         let hier = format!("{}{}", self.scopes[sc].hier, name);
-        self.sigs.push(Sig { debug: false, name: full, hier, ty, drv: vec![Drv::None; w], init: vec![false; w], has_init: false, line: self.line });
+        self.sigs.push(Sig { debug: false, name: full, hier, ty, drv: vec![Drv::None; w], init: vec![false; w], has_init: false, line: self.line, net: false });
         let id = self.sigs.len() as u32 - 1;
         self.scopes[sc].syms.insert(name.to_string(), Sym::Sig(id));
         id
@@ -527,12 +530,13 @@ impl Elab {
                 self.scopes[sc].syms.insert(name.clone(), Sym::Type(t));
                 Ok(())
             }
-            Item::Decl { ty, names, line } => {
+            Item::Decl { ty, names, line, net } => {
                 self.line = *line;
                 let base = self.resolve_type(ty, sc)?;
                 for d in names {
                     let t = self.with_unpacked(base.clone(), &d.unpacked, sc)?;
                     let id = self.new_sig(sc, &d.name, t.clone());
+                    self.sigs[id as usize].net = *net;
                     if let Some(init) = &d.init {
                         // A variable initializer is its power-up value.
                         let n = self.eval_to_type(init, &t, sc, &mut super::exec::Env::default())?;
@@ -910,17 +914,20 @@ impl Elab {
         for pd in &decls {
             self.line = pd.line;
             let mut base = self.resolve_type(&pd.ty, sc)?;
+            let mut net = pd.net;
             // Non-ANSI: `output [7:0] q; reg [7:0] q;` declares the same signal twice.
             if !m.port_names.is_empty() {
-                if let Some(Item::Decl { ty, .. }) = m.items.iter().find(|i| matches!(i, Item::Decl { names, .. } if names.iter().any(|n| n.name == pd.decl.name))) {
+                if let Some(Item::Decl { ty, net: n2, .. }) = m.items.iter().find(|i| matches!(i, Item::Decl { names, .. } if names.iter().any(|n| n.name == pd.decl.name))) {
                     let t2 = self.resolve_type(ty, sc)?;
                     if t2.w() >= base.w() {
                         base = t2;
                     }
+                    net = *n2 || pd.dir != Dir::Out;
                 }
             }
             let ty = self.with_unpacked(base, &pd.decl.unpacked, sc)?;
             let id = self.new_sig(sc, &pd.decl.name, ty.clone());
+            self.sigs[id as usize].net = net;
             if let Some(init) = &pd.decl.init {
                 let n = self.eval_to_type(init, &ty, sc, &mut super::exec::Env::default())?;
                 if let Some(b) = self.dag.as_const(n) {
@@ -941,11 +948,11 @@ impl Elab {
         let mut extra: Vec<Item> = Vec::new();
         let mut keep: Vec<&Item> = Vec::new();
         for it in &body {
-            if let Item::Decl { ty, names, line } = it {
+            if let Item::Decl { ty, names, line, net } = it {
                 if names.iter().any(|n| port_set.contains(n.name.as_str())) {
                     let rest: Vec<Declarator> = names.iter().filter(|n| !port_set.contains(n.name.as_str())).cloned().collect();
                     if !rest.is_empty() {
-                        extra.push(Item::Decl { ty: ty.clone(), names: rest, line: *line });
+                        extra.push(Item::Decl { ty: ty.clone(), names: rest, line: *line, net: *net });
                     }
                     continue;
                 }

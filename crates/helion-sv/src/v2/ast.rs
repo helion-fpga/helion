@@ -93,6 +93,9 @@ pub struct PortDecl {
     pub ty: DataType,
     pub decl: Declarator,
     pub line: u32,
+    /// A net (`wire`, an input, an output with no data type), not a
+    /// variable; a procedural assignment cannot write it.
+    pub net: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -168,7 +171,8 @@ pub struct GenBlock {
 
 #[derive(Clone, Debug)]
 pub enum Item {
-    Decl { ty: DataType, names: Vec<Declarator>, line: u32 },
+    /// `net`: declared with a net type (`wire`, `tri`, ...), not a variable.
+    Decl { ty: DataType, names: Vec<Declarator>, line: u32, net: bool },
     Param(ParamDecl),
     Typedef { name: String, ty: DataType, unpacked: Vec<(Expr, Option<Expr>)>, line: u32 },
     Assign { lhs: Expr, rhs: Expr, line: u32 },

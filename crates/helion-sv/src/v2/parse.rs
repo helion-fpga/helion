@@ -355,6 +355,28 @@ impl P {
 
     /// A data type, or an implicit one when the next token is already the
     /// declarator name.
+    /// Whether the port declared from here on (after its direction) is a
+    /// net (IEEE 1800, 23.2.2.3): a net type keyword, an input or inout
+    /// without `var`, or an output with no data type (`output [7:0] q`).
+    fn port_is_net(&self, dir: Dir) -> bool {
+        if ["wire", "tri", "wand", "wor", "tri0", "tri1", "uwire", "supply0", "supply1"].iter().any(|k| self.is_kw(k)) {
+            return true;
+        }
+        if self.is_kw("var") {
+            return false;
+        }
+        if dir != Dir::Out {
+            return true;
+        }
+        match self.peek() {
+            T::Op("[") => true,
+            T::Id(s) if s == "signed" || s == "unsigned" => true,
+            // `output q` (the name itself): no data type.
+            T::Id(_) if !self.at_type() => matches!(self.peek_at(1), T::Op(_)),
+            _ => false,
+        }
+    }
+
     fn opt_data_type(&mut self) -> R<DataType> {
         if matches!(self.peek(), T::Id(_)) && !self.at_type() {
             // `name` alone: implicit 1-bit logic.
@@ -763,7 +785,7 @@ impl P {
                             break;
                         }
                     }
-                    decls.push(Item::Decl { ty, names, line });
+                    decls.push(Item::Decl { ty, names, line, net: false });
                 } else {
                     loop {
                         init.push(self.simple_assign()?);
@@ -1036,9 +1058,9 @@ impl P {
         }
         self.expect_op(";")?;
         if assigns.is_empty() {
-            return Ok(Item::Decl { ty, names, line });
+            return Ok(Item::Decl { ty, names, line, net: is_net });
         }
-        let mut items = vec![Item::Decl { ty, names, line }];
+        let mut items = vec![Item::Decl { ty, names, line, net: is_net }];
         items.extend(assigns);
         Ok(Item::Block(GenBlock { label: None, items }))
     }
@@ -1141,7 +1163,7 @@ impl P {
                     ty = DataType::Vec { signed: false, dims: vec![] };
                 }
                 let decl = self.declarator()?;
-                args.push(PortDecl { dir, ty: ty.clone(), decl, line: l });
+                args.push(PortDecl { dir, ty: ty.clone(), decl, line: l, net: false });
                 if !self.eat_op(",") {
                     break;
                 }
@@ -1164,7 +1186,7 @@ impl P {
                 let ty = self.opt_data_type()?;
                 loop {
                     let decl = self.declarator()?;
-                    args.push(PortDecl { dir, ty: ty.clone(), decl, line: l });
+                    args.push(PortDecl { dir, ty: ty.clone(), decl, line: l, net: false });
                     if !self.eat_op(",") {
                         break;
                     }
@@ -1457,10 +1479,11 @@ impl P {
                     _ => Dir::Inout,
                 };
                 self.bump();
+                let net = self.port_is_net(dir);
                 let ty = self.opt_data_type()?;
                 loop {
                     let decl = self.declarator()?;
-                    out.push(Item::PortDir(PortDecl { dir, ty: ty.clone(), decl, line }));
+                    out.push(Item::PortDir(PortDecl { dir, ty: ty.clone(), decl, line, net }));
                     if !self.eat_op(",") {
                         break;
                     }
@@ -1566,6 +1589,7 @@ impl P {
         if self.eat_op("(") {
             let mut dir = Dir::In;
             let mut ty = DataType::Vec { signed: false, dims: vec![] };
+            let mut net = true;
             let mut ansi = false;
             while !self.is_op(")") {
                 while self.is_kw("$mark_debug") || self.is_kw("$full_case") {
@@ -1595,13 +1619,15 @@ impl P {
                         if matches!(self.peek(), T::Id(_)) && self.op_at(1, ".") {
                             return self.err("interface ports are not supported");
                         }
+                        net = self.port_is_net(dir);
                         ty = self.data_type()?;
                         ansi = true;
                     } else if explicit_dir {
                         ty = DataType::Vec { signed: false, dims: vec![] };
+                        net = true;
                     }
                     let decl = self.declarator()?;
-                    ports.push(PortDecl { dir, ty: ty.clone(), decl, line: l });
+                    ports.push(PortDecl { dir, ty: ty.clone(), decl, line: l, net });
                 }
                 if !self.eat_op(",") {
                     break;

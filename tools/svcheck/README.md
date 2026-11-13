@@ -24,7 +24,7 @@ All of these equal their RTL on every output and every compared flop:
 
 | design | size | cycles |
 |---|---|---|
-| `tools/svcheck/tests` (44 small designs) | up to a few hundred LUTs | 400 each |
+| `tools/svcheck/tests` (45 small designs) | up to a few hundred LUTs | 400 each |
 | `ip/` library (70 blocks) | | 400 each |
 | `examples/serv` (SERV, bit-serial RISC-V) | | 3,000 |
 | `corpus-pass/sha256` | | 2,000 |
@@ -54,7 +54,10 @@ resolves there as it does for Helion (next to the source file).
 RAM) in `hard/` check them; their files are in each `data/` directory.
 A register with an asynchronous reset keeps its RTL reset value when an
 initial block gives it a different power-up value (`init_async_reset.sv`,
-active-low and active-high).
+active-low and active-high). Ports that are variables (non-ANSI outputs
+redeclared `reg`, `output reg`) take initial values (`init_port_vars.sv`);
+an initial block assigning a net is an error, as in the reference
+simulator.
 
 ## Block RAMs and multipliers
 
