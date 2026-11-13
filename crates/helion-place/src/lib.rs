@@ -101,22 +101,28 @@ impl Placed {
 
 /// Move every LUT/FF cluster on a tile in `reserved` (the tiles of the
 /// hard blocks connected to the fabric) to the nearest free BLE slot of a
-/// CLB tile outside it that `allowed(cluster, site)` accepts: nearest by
-/// tile distance, then x, then y, and the lowest free BLE there. Returns
-/// how many clusters moved.
+/// CLB tile outside it where it keeps the fabric's clocking (the CLB's
+/// flops on one clock line and one asynchronous reset, at most one clock
+/// source; see `wl::legalize_clocks`): nearest by tile distance, then x,
+/// then y, and the lowest free BLE there. `conn` is the clusters'
+/// connectivity. Returns how many clusters moved.
 fn evict_reserved(
     lutff_sites: &mut [(Site, u8)],
     dev: &Device,
     reserved: &HashSet<(u32, u32)>,
-    allowed: impl Fn(usize, Site) -> bool,
+    conn: &helion_pack::Connectivity,
 ) -> Result<usize, String> {
     if reserved.is_empty() || lutff_sites.iter().all(|(s, _)| !reserved.contains(&(s.x, s.y))) {
         return Ok(0);
     }
+    let ck = wl::ClockInfo::of_conn(conn, lutff_sites.len());
     let n_ble = dev.n_ble.clamp(1, 8) as usize;
     let mut used: std::collections::HashMap<(u32, u32), u8> = std::collections::HashMap::new();
-    for (s, b) in lutff_sites.iter() {
+    // The clusters on each tile, for the clocking check.
+    let mut on: std::collections::HashMap<(u32, u32), Vec<u32>> = std::collections::HashMap::new();
+    for (i, (s, b)) in lutff_sites.iter().enumerate() {
         *used.entry((s.x, s.y)).or_insert(0) |= 1 << b;
+        on.entry((s.x, s.y)).or_default().push(i as u32);
     }
     let clbs: Vec<Site> = dev.clb_sites().filter(|s| !reserved.contains(&(s.x, s.y))).collect();
     let mut moved = 0;
@@ -125,16 +131,24 @@ fn evict_reserved(
         if !reserved.contains(&(s.x, s.y)) {
             continue;
         }
+        let clock_ok = |c: &Site| {
+            ck.as_ref().is_none_or(|ck| {
+                let mut with = on.get(&(c.x, c.y)).cloned().unwrap_or_default();
+                with.push(i as u32);
+                ck.tile_ok(&with)
+            })
+        };
         let dest = clbs
             .iter()
             .filter(|c| used.get(&(c.x, c.y)).copied().unwrap_or(0).count_ones() < n_ble as u32)
-            .filter(|c| allowed(i, **c))
+            .filter(|c| clock_ok(c))
             .min_by_key(|c| (c.x.abs_diff(s.x) + c.y.abs_diff(s.y), c.x, c.y))
             .copied()
             .ok_or_else(|| "place: no room for the LUTs and flops beside the hard blocks; the design does not fit".to_string())?;
         let mask = used.entry((dest.x, dest.y)).or_insert(0);
         let ble = (0..n_ble as u8).find(|b| *mask & (1 << b) == 0).expect("free slot");
         *mask |= 1 << ble;
+        on.entry((dest.x, dest.y)).or_default().push(i as u32);
         *slot = (dest, ble);
         moved += 1;
     }
@@ -147,7 +161,7 @@ fn evict_reserved(
 /// it returns how many it moved (0 when the placement was legal).
 pub fn evict_from_hard_tiles(placed: &mut Placed, dev: &Device) -> Result<usize, String> {
     let reserved = placed.reserved_tiles(dev);
-    evict_reserved(&mut placed.lutff_sites, dev, &reserved, |_, _| true)
+    evict_reserved(&mut placed.lutff_sites, dev, &reserved, &placed.packed.conn)
 }
 
 /// CLB sites a LUT/FF cluster may take: all of them but the tiles in
@@ -228,7 +242,7 @@ fn place_hard(packed: &Packed, dev: &Device, lutff_sites: &mut [(Site, u8)], iob
     let bram_sites: Vec<Site> = bram_sites.into_iter().map_while(|s| s).collect();
     // Clear the tiles of the connected blocks.
     let reserved: HashSet<(u32, u32)> = taken.iter().flat_map(|s| dev.hard_tiles(*s)).collect();
-    evict_reserved(lutff_sites, dev, &reserved, |_, _| true)?;
+    evict_reserved(lutff_sites, dev, &reserved, &packed.conn)?;
     Ok((mac_sites, bram_sites))
 }
 
@@ -1913,7 +1927,7 @@ pub fn place_congestion_spread(
     // Off the tiles of the hard blocks connected to the fabric, and never
     // onto them.
     let reserved = out.reserved_tiles(dev);
-    let evicted = evict_reserved(&mut out.lutff_sites, dev, &reserved, |_, _| true)?;
+    let evicted = evict_reserved(&mut out.lutff_sites, dev, &reserved, &out.packed.conn)?;
     let n_ble = dev.n_ble.max(1) as u8;
     let cap = max_ble_per_site.clamp(1, n_ble);
     let mut clb_sites: Vec<Site> = free_clb_sites(dev, &reserved);
@@ -2106,7 +2120,7 @@ pub fn phys_opt_place_with_stats(
     // Off the tiles of the hard blocks connected to the fabric, and never
     // onto them.
     let reserved = out.reserved_tiles(dev);
-    let evicted = evict_reserved(&mut out.lutff_sites, dev, &reserved, |_, _| true)?;
+    let evicted = evict_reserved(&mut out.lutff_sites, dev, &reserved, &out.packed.conn)?;
     let n = out.lutff_sites.len().min(out.packed.lutffs.len());
     if n == 0 {
         return Ok((
@@ -3237,7 +3251,7 @@ pub fn legalize_macro_columns(
     fix_fabric_sites(&keep_mac, &mut out.mac_sites, dev.dsp_sites().collect(), dev)?;
     fix_fabric_sites(&keep_bram, &mut out.bram_sites, dev.bram_sites().collect(), dev)?;
     let reserved = out.reserved_tiles(dev);
-    evict_reserved(&mut out.lutff_sites, dev, &reserved, |_, _| true)?;
+    evict_reserved(&mut out.lutff_sites, dev, &reserved, &out.packed.conn)?;
 
     // 1. Contiguous vertical CARRY4 chain legalization across CLB columns.
     let chains = extract_packed_carry_chains(&out.packed, design);
@@ -3541,7 +3555,7 @@ pub fn detailed_place_optimize_with_stats(
     // Off the tiles of the hard blocks connected to the fabric, and never
     // onto them.
     let reserved = out.reserved_tiles(dev);
-    let evicted = evict_reserved(&mut out.lutff_sites, dev, &reserved, |_, _| true)?;
+    let evicted = evict_reserved(&mut out.lutff_sites, dev, &reserved, &out.packed.conn)?;
     let n = out.lutff_sites.len().min(out.packed.lutffs.len());
     if n == 0 {
         return Ok((

@@ -42,9 +42,12 @@ impl Nl {
         out
     }
     fn ff_to(&mut self, d: &str, q: &str) {
+        self.ff_on("clk", d, q);
+    }
+    fn ff_on(&mut self, clk: &str, d: &str, q: &str) {
         let cell = self.fresh("u_ff");
         self.d.add_cell(&cell, CellKind::Hff);
-        self.d.connect("clk", &cell, "CLK");
+        self.d.connect(clk, &cell, "CLK");
         self.d.connect(d, &cell, "D");
         self.d.connect(q, &cell, "Q");
     }
@@ -386,3 +389,114 @@ fn macro_column_legalizer() {
     assert_eq!(out.bram_sites[0], p.bram_sites[0]);
 }
 
+
+/// [`design`] and a second clock domain: a counter on `clk2` whose flops
+/// would fit on the blocks' tiles as well as the first domain's.
+fn two_clock_design() -> Design {
+    let mut n = Nl { d: design(), k: 10_000 };
+    n.d.add_port("clk2", helion_ir::PortDir::In);
+    let q: Vec<String> = (0..24).map(|_| n.fresh("cnt2_")).collect();
+    for i in 0..24 {
+        let next = if i == 0 { n.lut(&[&q[0]], |x| x & 1 == 0) } else { n.lut(&[&q[i], &q[i - 1]], |x| (x & 1) ^ (x >> 1) == 1) };
+        n.ff_on("clk2", &next, &q[i]);
+    }
+    for i in 0..4 {
+        n.output(&format!("c2_{i}"), &q[20 + i]);
+    }
+    n.d
+}
+
+/// CLBs holding flops of more than one clock line (bitgen refuses them).
+fn mixed_clock_clbs(p: &Placed) -> Vec<(u32, u32)> {
+    let mut lines: std::collections::HashMap<(u32, u32), HashSet<u8>> = Default::default();
+    for (i, (s, _)) in p.lutff_sites.iter().enumerate() {
+        if let Some(Some((l, _))) = p.packed.conn.ff_clock.get(i) {
+            lines.entry((s.x, s.y)).or_default().insert(*l);
+        }
+    }
+    let mut v: Vec<(u32, u32)> = lines.into_iter().filter(|(_, l)| l.len() > 1).map(|(t, _)| t).collect();
+    v.sort();
+    v
+}
+
+/// Moving clusters off the blocks' tiles puts them only where the CLB
+/// keeps one clock: the main placement with flops of one clock line on
+/// each block tile (alternating lines from tile to tile, several choices
+/// of flops) goes through each placer that does only that besides its
+/// own work. (phys_opt and the detailed placer swap clusters without
+/// regard to clocks, blocks or not; they are not checked here.)
+#[test]
+fn moving_off_the_blocks_keeps_one_clock_per_clb() {
+    let dev = Device::load_part("HL10S-C64-1").unwrap();
+    let packed = pack(&two_clock_design(), &dev).unwrap();
+    let base = place(&packed, &dev).unwrap();
+    assert!(on_block_tiles(&base, &dev).is_empty());
+    assert!(mixed_clock_clbs(&base).is_empty());
+    let lines: HashSet<u8> = packed.conn.ff_clock.iter().flatten().map(|c| c.0).collect();
+    assert_eq!(lines.len(), 2);
+    let reserved = base.reserved_tiles(&dev);
+    let mut tiles: Vec<(u32, u32)> = reserved.iter().copied().collect();
+    tiles.sort();
+    let line = |k: usize| packed.conn.ff_clock.get(k).copied().flatten().map(|c| c.0);
+    let clb = |t: (u32, u32)| Site { x: t.0, y: t.1, kind: helion_device::SiteKind::Clb };
+    let n_ble = dev.n_ble as usize;
+    for off in 0..2u8 {
+        for step in [1usize, 3] {
+            // Flops of line `off` on the blocks' tiles; one flop of the
+            // other line on BLE 0 of each tile beside them (the nearest
+            // free slots); everything else far away, a tile per clock.
+            let mut sq = base.clone();
+            let mut placed_k: HashSet<usize> = HashSet::new();
+            let of_line = |l: u8, n: usize, step: usize, placed_k: &mut HashSet<usize>| -> Vec<usize> {
+                let v: Vec<usize> = (0..sq.lutff_sites.len()).filter(|&k| !placed_k.contains(&k) && line(k) == Some(l)).step_by(step).take(n).collect();
+                placed_k.extend(v.iter().copied());
+                v
+            };
+            let mut moves: Vec<(usize, (u32, u32), u8)> = Vec::new();
+            for t in &tiles {
+                for (b, k) in of_line(off, 4, step, &mut placed_k).into_iter().enumerate() {
+                    moves.push((k, *t, b as u8));
+                }
+            }
+            let mut beside: Vec<(u32, u32)> = dev.clb_sites().map(|c| (c.x, c.y)).filter(|c| !reserved.contains(c) && tiles.iter().any(|t| t.0.abs_diff(c.0) + t.1.abs_diff(c.1) == 1)).collect();
+            beside.sort();
+            beside.dedup();
+            let others = of_line(1 - off, beside.len(), 1, &mut placed_k);
+            assert_eq!(others.len(), beside.len());
+            for (k, t) in others.into_iter().zip(&beside) {
+                moves.push((k, *t, 0));
+            }
+            let mut far: Vec<(u32, u32)> = dev.clb_sites().map(|c| (c.x, c.y)).filter(|c| !reserved.contains(c) && tiles.iter().all(|t| t.0.abs_diff(c.0) + t.1.abs_diff(c.1) > 3)).collect();
+            far.sort_by_key(|c| std::cmp::Reverse(c.0 + c.1));
+            let mut far = far.into_iter();
+            for group in [Some(0u8), Some(1), None] {
+                let rest: Vec<usize> = (0..sq.lutff_sites.len()).filter(|&k| !placed_k.contains(&k) && line(k) == group).collect();
+                for chunk in rest.chunks(n_ble) {
+                    let t = far.next().expect("room");
+                    for (b, &k) in chunk.iter().enumerate() {
+                        moves.push((k, t, b as u8));
+                    }
+                }
+            }
+            for (k, t, b) in moves {
+                sq.lutff_sites[k] = (clb(t), b);
+            }
+            distinct(&sq);
+            let case = format!("off {off} step {step}");
+            assert!(!on_block_tiles(&sq, &dev).is_empty(), "{case}");
+            assert!(mixed_clock_clbs(&sq).is_empty(), "{case}");
+            let mut outs: Vec<(&str, Placed)> = Vec::new();
+            let mut e = sq.clone();
+            evict_from_hard_tiles(&mut e, &dev).unwrap();
+            outs.push(("evict_from_hard_tiles", e));
+            outs.push(("place_congestion_spread", place_congestion_spread(&sq, &dev, 8).unwrap().0));
+            outs.push(("legalize_macro_columns", legalize_macro_columns(&sq, &dev, None).unwrap().0));
+            outs.push(("place_incremental", place_incremental(&packed, &dev, &sq, PlaceOpts::default()).unwrap().0));
+            for (name, out) in &outs {
+                assert!(on_block_tiles(out, &dev).is_empty(), "{name} {case}");
+                assert!(mixed_clock_clbs(out).is_empty(), "{name} {case}: {:?}", mixed_clock_clbs(out));
+                distinct(out);
+            }
+        }
+    }
+}

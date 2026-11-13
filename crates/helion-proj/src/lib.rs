@@ -1654,9 +1654,13 @@ fn place_named_cells_in_region(
     let (x0, x1) = (x0.min(x1), x0.max(x1));
     let (y0, y1) = (y0.min(y1), y0.max(y1));
     let mut placed = place_with(packed, dev, opts)?;
+    // The tiles of the hard blocks connected to the fabric take no LUT or
+    // flop (bitgen refuses them); the blocks keep the sites `place_with`
+    // gave them.
+    let reserved = placed.reserved_tiles(dev);
     let mut clbs: Vec<Site> = dev
         .clb_sites()
-        .filter(|s| s.x >= x0 && s.x <= x1 && s.y >= y0 && s.y <= y1)
+        .filter(|s| s.x >= x0 && s.x <= x1 && s.y >= y0 && s.y <= y1 && !reserved.contains(&(s.x, s.y)))
         .collect();
     if clbs.is_empty() {
         return Err(format!(

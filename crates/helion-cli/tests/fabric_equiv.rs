@@ -718,9 +718,13 @@ impl Nl {
     }
     /// A flop on `clk` with output net `q`.
     fn ff_to(&mut self, d: &str, q: &str) {
+        self.ff_on("clk", d, q);
+    }
+    /// A flop on clock `clk` with output net `q`.
+    fn ff_on(&mut self, clk: &str, d: &str, q: &str) {
         let cell = self.fresh("ff");
         self.d.add_cell(&cell, CellKind::Hff);
-        self.d.connect("clk", &cell, "CLK");
+        self.d.connect(clk, &cell, "CLK");
         self.d.connect(d, &cell, "D");
         self.d.connect(q, &cell, "Q");
     }
@@ -1187,6 +1191,121 @@ fn every_placer_keeps_off_hard_block_tiles() {
     for (name, placer) in &placers {
         for (what, design, cycles) in [("ram", ram_design(), 300), ("mul", mul_design(true, true, true), 150)] {
             check_placed_by(&design, part, cycles, placer, |_| {}).unwrap_or_else(|e| panic!("{name} {what}: {e}"));
+        }
+    }
+}
+
+/// helion-proj's pblock placement (`Session::place_pblock`, which
+/// `place_pblock_in` and a ranged pblock of `impl_project` go through)
+/// fills the rectangle around the first block without its tiles.
+#[test]
+fn proj_pblock_keeps_off_hard_block_tiles() {
+    let part = "HL10S-C64-1";
+    for (what, design, cycles) in [("ram", ram_design(), 300), ("mul", mul_design(true, true, true), 150)] {
+        let placer = |p: &helion_pack::Packed, d: &Device| {
+            // Where the session's own placement puts the block.
+            let s = helion_place::place_with(p, d, helion_proj::ImplStrategy::Default.place_opts()).expect("place").hard_block_site(0).expect("a block");
+            let mut ses = helion_proj::Session::new(helion_proj::Mode::NonProject);
+            ses.synth_design(design.clone());
+            ses.place_pblock(d, s.x, s.y, s.x + 2, s.y + 7).expect("place_pblock");
+            let pl = ses.placed.expect("placed");
+            let reserved = pl.reserved_tiles(d);
+            assert!(reserved.contains(&(s.x, s.y)), "the block moved");
+            assert!(pl.lutff_sites.iter().all(|(c, _)| c.x >= s.x && c.x <= s.x + 2 && c.y >= s.y && c.y <= s.y + 7), "outside the pblock");
+            pl
+        };
+        check_placed_by(&design, part, cycles, placer, |_| {}).unwrap_or_else(|e| panic!("pblock {what}: {e}"));
+    }
+}
+
+/// [`ram_design`] and a second clock domain: a counter on `clk2`.
+fn ram_and_second_clock_design() -> Design {
+    let mut n = Nl { d: ram_design(), k: 100_000 };
+    n.d.add_port("clk2", helion_ir::PortDir::In);
+    let q: Vec<String> = (0..12).map(|_| n.fresh("c2_")).collect();
+    for i in 0..12 {
+        let next = if i == 0 { n.lut(&[&q[0]], |x| x & 1 == 0) } else { n.lut(&[&q[i], &q[i - 1]], |x| (x & 1) ^ (x >> 1) == 1) };
+        n.ff_on("clk2", &next, &q[i]);
+    }
+    let x = n.lut(&[&q[8], &q[9], &q[10], &q[11]], |x| x.count_ones() % 2 == 1);
+    n.output("oc2", &x);
+    n.d
+}
+
+/// `place`, then flops of clock line `line` moved onto the blocks' tiles,
+/// a flop of the other line on BLE 0 of each tile beside them (the
+/// nearest free slots), and every other cluster far away, a tile per
+/// clock: a legal clocking whose naive eviction mixes two clocks in a
+/// CLB.
+fn blocks_squatted_beside_another_clock(p: &helion_pack::Packed, dev: &Device, line: u8) -> helion_place::Placed {
+    use helion_device::{Site, SiteKind};
+    let mut sq = place(p, dev).expect("place");
+    let reserved = sq.reserved_tiles(dev);
+    let mut tiles: Vec<(u32, u32)> = reserved.iter().copied().collect();
+    tiles.sort();
+    let line_of = |k: usize| p.conn.ff_clock.get(k).copied().flatten().map(|c| c.0);
+    let n = sq.lutff_sites.len();
+    let mut used: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut take = |l: Option<u8>, m: usize, used: &mut std::collections::HashSet<usize>| -> Vec<usize> {
+        let v: Vec<usize> = (0..n).filter(|&k| !used.contains(&k) && line_of(k) == l).take(m).collect();
+        used.extend(v.iter().copied());
+        v
+    };
+    let mut moves: Vec<(usize, (u32, u32), u8)> = Vec::new();
+    for t in &tiles {
+        for (b, k) in take(Some(line), 4, &mut used).into_iter().enumerate() {
+            moves.push((k, *t, b as u8));
+        }
+    }
+    let near = |c: &(u32, u32), d: u32| tiles.iter().any(|t| t.0.abs_diff(c.0) + t.1.abs_diff(c.1) <= d);
+    let mut beside: Vec<(u32, u32)> = dev.clb_sites().map(|c| (c.x, c.y)).filter(|c| !reserved.contains(c) && near(c, 1)).collect();
+    beside.sort();
+    let others = take(Some(1 - line), beside.len(), &mut used);
+    assert_eq!(others.len(), beside.len());
+    for (k, t) in others.into_iter().zip(&beside) {
+        moves.push((k, *t, 0));
+    }
+    let mut far: Vec<(u32, u32)> = dev.clb_sites().map(|c| (c.x, c.y)).filter(|c| !reserved.contains(c) && !near(c, 3)).collect();
+    far.sort_by_key(|c| std::cmp::Reverse(c.0 + c.1));
+    let mut far = far.into_iter();
+    for group in [Some(0u8), Some(1), None] {
+        let rest = take(group, n, &mut used);
+        for chunk in rest.chunks(dev.n_ble as usize) {
+            let t = far.next().expect("room");
+            for (b, &k) in chunk.iter().enumerate() {
+                moves.push((k, t, b as u8));
+            }
+        }
+    }
+    for (k, t, b) in moves {
+        sq.lutff_sites[k] = (Site { x: t.0, y: t.1, kind: SiteKind::Clb }, b);
+    }
+    sq
+}
+
+/// The placers that move clusters off the blocks' tiles keep each CLB on
+/// one clock (bitgen refuses two): a RAM design with a second clock
+/// domain, flops of one domain on the RAM's tile and of the other on the
+/// tiles beside it.
+#[test]
+fn moving_off_hard_block_tiles_keeps_one_clock_per_clb() {
+    use helion_place::*;
+    let part = "HL10S-C64-1";
+    let design = ram_and_second_clock_design();
+    type Placer = Box<dyn Fn(Placed, &helion_pack::Packed, &Device) -> Placed>;
+    let placers: Vec<(&str, Placer)> = vec![
+        ("evict_from_hard_tiles", Box::new(|mut pl: Placed, _: &helion_pack::Packed, d: &Device| {
+            evict_from_hard_tiles(&mut pl, d).expect("evict");
+            pl
+        })),
+        ("place_incremental", Box::new(|pl: Placed, p: &helion_pack::Packed, d: &Device| place_incremental(p, d, &pl, PlaceOpts::default()).expect("incremental").0)),
+        ("place_congestion_spread", Box::new(|pl: Placed, _: &helion_pack::Packed, d: &Device| place_congestion_spread(&pl, d, 8).expect("spread").0)),
+        ("legalize_macro_columns", Box::new(|pl: Placed, _: &helion_pack::Packed, d: &Device| legalize_macro_columns(&pl, d, None).expect("macro").0)),
+    ];
+    for (name, placer) in &placers {
+        for line in 0..2u8 {
+            check_placed_by(&design, part, 300, |p, d| placer(blocks_squatted_beside_another_clock(p, d, line), p, d), |_| {})
+                .unwrap_or_else(|e| panic!("{name} line {line}: {e}"));
         }
     }
 }

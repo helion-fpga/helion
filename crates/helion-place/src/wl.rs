@@ -109,7 +109,7 @@ fn net_len(net: &Net, pos: &[(i32, i32)]) -> i32 {
 
 /// Clocking of each cluster: the line of its flop (if it has one) and
 /// whether it is the source of a clock made by logic.
-struct ClockInfo {
+pub(crate) struct ClockInfo {
     line: Vec<i8>,
     source: Vec<bool>,
     /// Asynchronous reset of the cluster's flop: line * 2 + level, or -1.
@@ -119,14 +119,17 @@ struct ClockInfo {
 impl ClockInfo {
     /// `None` when the design has one clock from a pin: nothing to respect.
     fn of(placed: &Placed) -> Option<Self> {
-        let conn = &placed.packed.conn;
+        Self::of_conn(&placed.packed.conn, placed.lutff_sites.len())
+    }
+
+    /// [`ClockInfo::of`] for `n` clusters of connectivity `conn`.
+    pub(crate) fn of_conn(conn: &helion_pack::Connectivity, n: usize) -> Option<Self> {
         let any_gen = conn.clocks.iter().any(|c| matches!(c.src, helion_pack::ClockSrc::Gen(_)));
         let lines: std::collections::HashSet<u8> = conn.ff_clock.iter().flatten().map(|f| f.0).collect();
         let any_rst = conn.ff_reset.iter().any(|r| r.is_some());
         if conn.clocks.len() <= 1 && !any_gen && lines.len() <= 1 && !any_rst {
             return None;
         }
-        let n = placed.lutff_sites.len();
         let mut line = vec![-1i8; n];
         for (i, c) in conn.ff_clock.iter().enumerate().take(n) {
             if let Some((l, _)) = c {
@@ -152,7 +155,7 @@ impl ClockInfo {
 
     /// Whether the clusters in `occ` (one CLB) may share it: flops of one
     /// clock line, and at most one clock source.
-    fn tile_ok(&self, occ: &[u32]) -> bool {
+    pub(crate) fn tile_ok(&self, occ: &[u32]) -> bool {
         let mut seen: i8 = -1;
         let mut seen_rst: i16 = -1;
         let mut gens = 0;
