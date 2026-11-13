@@ -29,6 +29,9 @@ with the front end `zedbit` picks (`HELION_ZED_FRONT=auto|v2|zb`).
 * `--cycles N`, `--seed N`: length and seed of the random stimulus.
 * `--reset-rate P`: chance per cycle that a reset input flips (default 0.01).
   A processor needs long runs between resets to get anywhere in its program.
+* `--no-reset`: hold reset inputs at 0 for the whole run, with no start-up
+  pulse, to prove that a design brings itself out of power-up (a power-on
+  reset). Inputs count as reset when named `rst`, `reset`, `btnc` or `clr`.
 * `X7V_RTL_SIM=verilator`: simulate SystemVerilog RTL with Verilator instead of
   Icarus, for sources Icarus cannot read (macros in `X7V_DEFINES`). Verilator is
   two-state, so a register the RTL never initialises reads 0, not X.
