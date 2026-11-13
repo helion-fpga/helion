@@ -627,7 +627,20 @@ endmodule
 /// without a reset in the same design are left alone.
 #[test]
 fn asynchronous_reset() {
-    let src = r#"
+    let src = ASYNC_RESET;
+    let design = helion_sv::synth_sv_v2(src, "t.sv", None).expect("synth").design;
+    assert!(design.cells.iter().any(|c| c.attrs.get("ARST_LEVEL") == Some("0")), "the reset is asynchronous in the netlist");
+    check(src, PART, 800);
+    // Flops that ignore the reset no longer match.
+    let no_reset = |r: &mut helion_route::Routed| {
+        for f in r.placed.packed.conn.ff_reset.iter_mut() {
+            *f = None;
+        }
+    };
+    assert!(check_with(src, PART, 800, no_reset).is_err(), "a missing asynchronous reset went unnoticed");
+}
+
+const ASYNC_RESET: &str = r#"
 module top(input logic clk, input logic rst_n, input logic [3:0] d, output logic [3:0] q, output logic [3:0] free, output logic [3:0] pre);
   logic [3:0] a, f, p;
   always_ff @(posedge clk or negedge rst_n) begin
@@ -643,17 +656,6 @@ module top(input logic clk, input logic rst_n, input logic [3:0] d, output logic
   assign q = a; assign free = f; assign pre = p;
 endmodule
 "#;
-    let design = helion_sv::synth_sv_v2(src, "t.sv", None).expect("synth").design;
-    assert!(design.cells.iter().any(|c| c.attrs.get("ARST_LEVEL") == Some("0")), "the reset is asynchronous in the netlist");
-    check(src, PART, 800);
-    // Flops that ignore the reset no longer match.
-    let no_reset = |r: &mut helion_route::Routed| {
-        for f in r.placed.packed.conn.ff_reset.iter_mut() {
-            *f = None;
-        }
-    };
-    assert!(check_with(src, PART, 800, no_reset).is_err(), "a missing asynchronous reset went unnoticed");
-}
 
 /// More pins than the bottom row has pads: outputs and inputs spill onto
 /// the top, left and right edges, which connect through the interconnect.
@@ -1484,4 +1486,74 @@ fn initial_contents_on_the_fabric() {
         }
     };
     assert!(check_design(&ram, part, 500, word).is_err(), "a wrong INIT word went unnoticed");
+}
+
+/// Two asynchronous resets (and flops with none) in two clock domains.
+const TWO_RESETS: &str = r#"
+module top(input logic clk_a, input logic clk_b, input logic rst_a, input logic rst_bn, input logic [3:0] d,
+           output logic [3:0] qa, output logic [3:0] qb, output logic [3:0] qf, output logic [3:0] qc);
+  logic [3:0] a, b, f, c;
+  always_ff @(posedge clk_a or posedge rst_a) if (rst_a) a <= 4'd5; else a <= a + d;
+  always_ff @(posedge clk_a or negedge rst_bn) if (!rst_bn) b <= 4'd0; else b <= b ^ a ^ d;
+  always_ff @(posedge clk_a) f <= f + (a & b);
+  always_ff @(posedge clk_b or negedge rst_bn) if (!rst_bn) c <= 4'd9; else c <= c + (a ^ f);
+  assign qa = a; assign qb = b; assign qf = f; assign qc = c;
+endmodule
+"#;
+
+/// Every CLB of `pl` holds flops of one clock line and one asynchronous
+/// reset (what bitgen requires); the first that does not, by tile.
+fn clocking_problem(pl: &helion_place::Placed) -> Option<String> {
+    let conn = &pl.packed.conn;
+    let mut tiles: HashMap<(u32, u32), (Option<u8>, Option<(u8, bool)>)> = HashMap::new();
+    for (k, (s, _)) in pl.lutff_sites.iter().enumerate() {
+        let line = conn.ff_clock.get(k).copied().flatten().map(|c| c.0);
+        let rst = conn.ff_reset.get(k).copied().flatten().map(|r| (r.0, r.1));
+        let t = tiles.entry((s.x, s.y)).or_insert((None, None));
+        if let (Some(a), Some(b)) = (t.0, line) {
+            if a != b {
+                return Some(format!("CLB ({}, {}) holds flops of clock lines {a} and {b}", s.x, s.y));
+            }
+        }
+        if let (Some(a), Some(b)) = (t.1, rst) {
+            if a != b {
+                return Some(format!("CLB ({}, {}) holds flops of resets {a:?} and {b:?}", s.x, s.y));
+            }
+        }
+        t.0 = t.0.or(line);
+        t.1 = t.1.or(rst);
+    }
+    None
+}
+
+/// phys_opt and detailed placement move and swap clusters for wirelength;
+/// every move keeps each CLB on one clock line and one asynchronous reset.
+/// Two-clock, divided-clock and two-reset designs go through each, then
+/// route, bitgen and the fabric, which equals the netlist.
+#[test]
+fn phys_opt_and_detailed_placement_keep_clocking_legal() {
+    type Opt = fn(&helion_place::Placed, &Device) -> helion_place::Placed;
+    let opts: [(&str, Opt); 2] = [
+        ("phys_opt_place", |pl, d| helion_place::phys_opt_place(pl, d).expect("phys_opt")),
+        ("detailed_place_optimize", |pl, d| helion_place::detailed_place_optimize(pl, d, &helion_place::DetailedPlaceOpts::default()).expect("detailed")),
+    ];
+    for (dname, src) in [("two clocks", TWO_CLOCKS), ("divided clock", DIVIDED), ("two resets", TWO_RESETS), ("reset", ASYNC_RESET)] {
+        let design = helion_sv::synth_sv_v2(src, "t.sv", None).expect("synth").design;
+        for (oname, opt) in &opts {
+            check_placed_by(
+                &design,
+                PART,
+                600,
+                |p, d| {
+                    let pl = opt(&place(p, d).expect("place"), d);
+                    if let Some(e) = clocking_problem(&pl) {
+                        panic!("{oname} on {dname}: {e}");
+                    }
+                    pl
+                },
+                |_| {},
+            )
+            .unwrap_or_else(|e| panic!("{oname} on {dname}: {e}"));
+        }
+    }
 }

@@ -531,6 +531,22 @@ impl LegalizeGrid {
         let c = self.cell(x, y)?;
         self.ble[c * self.n_ble + ble as usize]
     }
+
+    /// Whether tile (x, y) keeps the fabric's clocking (one clock line,
+    /// one asynchronous reset, at most one clock source per CLB) with
+    /// cluster `add` on it in place of `out` (a swap partner leaving it).
+    fn clocking_ok(&self, ck: Option<&wl::ClockInfo>, x: u32, y: u32, out: Option<usize>, add: usize) -> bool {
+        let Some(ck) = ck else { return true };
+        let Some(c) = self.cell(x, y) else { return true };
+        let mut occ: Vec<u32> = self.ble[c * self.n_ble..(c + 1) * self.n_ble]
+            .iter()
+            .flatten()
+            .filter(|&&k| Some(k) != out && k != add)
+            .map(|&k| k as u32)
+            .collect();
+        occ.push(add as u32);
+        ck.tile_ok(&occ)
+    }
 }
 
 /// Hypothetical cluster site during a swap (FF location override). Empty-BLE
@@ -2228,6 +2244,8 @@ pub fn phys_opt_place_with_stats(
 
     let mut relocated_cells = evicted;
     let mut swapped_cells = 0usize;
+    // Every move and swap keeps each CLB on one clock line and reset.
+    let ck = wl::ClockInfo::of_conn(&out.packed.conn, out.lutff_sites.len());
 
     for _pass in 0..4 {
         let mut pass_changed = 0usize;
@@ -2302,6 +2320,9 @@ pub fn phys_opt_place_with_stats(
                 let Some(ble) = grid.first_free_ble(site.x, site.y, skip) else {
                     continue;
                 };
+                if !grid.clocking_ok(ck.as_ref(), site.x, site.y, None, ci) {
+                    continue;
+                }
                 let after = cluster_cost(ci, site, &out.lutff_sites, Some((ci, site)), None);
                 if after < before && best_move.as_ref().map(|b| after < b.2).unwrap_or(true) {
                     best_move = Some((site, ble, after));
@@ -2332,6 +2353,9 @@ pub fn phys_opt_place_with_stats(
                         continue;
                     };
                     if cj == ci {
+                        continue;
+                    }
+                    if !grid.clocking_ok(ck.as_ref(), site.x, site.y, Some(cj), ci) || !grid.clocking_ok(ck.as_ref(), cur_site.x, cur_site.y, Some(ci), cj) {
                         continue;
                     }
                     let before_j = cluster_cost(cj, site, &out.lutff_sites, None, None);
@@ -3683,6 +3707,8 @@ pub fn detailed_place_optimize_with_stats(
     let mut median_relocations = evicted;
     let mut local_swaps = 0usize;
     let rad = opts.swap_radius.max(1) as i32;
+    // Every relocation and swap keeps each CLB on one clock line and reset.
+    let ck = wl::ClockInfo::of_conn(&out.packed.conn, out.lutff_sites.len());
 
     for _pass in 0..opts.passes.max(1) {
         let mut pass_moves = 0usize;
@@ -3733,6 +3759,9 @@ pub fn detailed_place_optimize_with_stats(
                     let Some(ble) = grid.first_free_ble(site.x, site.y, skip) else {
                         continue;
                     };
+                    if !grid.clocking_ok(ck.as_ref(), site.x, site.y, None, ci) {
+                        continue;
+                    }
                     let after = eval_incident(ci, &out.lutff_sites, Some((ci, site)), None);
                     if after.0 <= before.0
                         && (after.0 < before.0 || after.1 + 1e-9 < before.1)
@@ -3778,6 +3807,9 @@ pub fn detailed_place_optimize_with_stats(
                             continue;
                         };
                         if cj == ci || opts.locked_clusters.contains(&cj) {
+                            continue;
+                        }
+                        if !grid.clocking_ok(ck.as_ref(), site.x, site.y, Some(cj), ci) || !grid.clocking_ok(ck.as_ref(), cur_site.x, cur_site.y, Some(ci), cj) {
                             continue;
                         }
                         let (ill_i0, _) = eval_incident(ci, &out.lutff_sites, None, None);
