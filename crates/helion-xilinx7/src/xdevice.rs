@@ -900,6 +900,22 @@ impl<'a> RouteQuery for XDevice<'a> {
         cache.0 = claimed_len;
     }
 
+    fn node_key(&self, tile: &str, wire: &str) -> Option<u64> {
+        let id = self.wire_id_of(tile, wire)?;
+        let nid = self.wire_to_node[id as usize];
+        // Wires with no node are their own conductor.
+        Some(if nid == u32::MAX { (1u64 << 32) | id as u64 } else { nid as u64 })
+    }
+
+    fn pip_cost(&self, tile: &str, src: &str, dst: &str) -> Option<u32> {
+        let s = self.wire_id_of(tile, src)?;
+        let d = self.wire_id_of(tile, dst)?;
+        let (ti, wi) = self.wire_to_tile[s as usize];
+        let (_, dwi) = self.wire_to_tile[d as usize];
+        // Same constant the search adds per pip (`astar`'s PIP_BASE).
+        self.device.pips_from_idx(ti, wi).find(|p| p.dst == dwi).map(|p| p.delay_ps as u32 + 15)
+    }
+
     fn contested(&self, net: &str, pips: &[RoutedPip]) -> Vec<String> {
         let own = self.owner.borrow();
         let my = own.1.get(net).copied().unwrap_or(u32::MAX);

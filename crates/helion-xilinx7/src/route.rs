@@ -68,6 +68,17 @@ pub trait RouteQuery {
     }
     /// Claims were removed from the claim map: drop any derived index.
     fn release_claims(&self, _nets: &[String], _claimed_len: usize) {}
+    /// The electrical node a tile wire belongs to (wires of one node are one
+    /// conductor). `None`: no node model, and a ripped-up net is rerouted
+    /// whole.
+    fn node_key(&self, _tile: &str, _wire: &str) -> Option<u64> {
+        None
+    }
+    /// Delay the search charges for a pip (its delay plus the fixed cost per
+    /// pip), the same value it adds up into arrival times.
+    fn pip_cost(&self, _tile: &str, _src: &str, _dst: &str) -> Option<u32> {
+        None
+    }
     /// Returns the pips and, per pip, the arrival delay (ps) at its source
     /// and destination wires; `_tree` holds this net's wires with their
     /// known arrival delays.
@@ -570,11 +581,19 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     let rip_stats = std::env::var("HELION_ROUTE_RIPSTATS").is_ok();
     let mut rip_count: HashMap<String, usize> = HashMap::new();
     let mut ripper_count: HashMap<String, usize> = HashMap::new();
+    let mut queued: HashSet<String> = net_names.iter().cloned().collect();
     let mut queue: std::collections::VecDeque<String> = net_names.into();
+    // Nets cut back by a rip-up: their remaining pips and the loads to route.
+    let mut partial: HashMap<String, (Vec<RoutedPip>, Vec<(String, String)>)> = HashMap::new();
     let t_start = std::time::Instant::now();
     let mut t_report = t_start;
     let mut routed_count = 0usize;
     while let Some(net) = queue.pop_front() {
+        queued.remove(&net);
+        // A net routed again replaces its previous (partial) entry.
+        if partial.contains_key(&net) {
+            nets.retain(|n: &RoutedNet7| n.net != net);
+        }
         routed_count += 1;
         if t_report.elapsed().as_secs() >= 30 {
             t_report = std::time::Instant::now();
@@ -660,7 +679,28 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
             continue; // undriven net: nothing to route
         }
         let mut delays: Vec<(String, String, u32)> = Vec::new();
-        let kind = route_net(&net, drivers[0], &loads, &clock_spine_nets, device, &claimed, &mut delays)?;
+        // A net cut back by an earlier rip-up keeps its remaining tree and
+        // routes only the loads that lost their connection.
+        let (kept, todo): (Vec<RoutedPip>, Vec<&Endpoint>) = match partial.remove(&net) {
+            Some((kept, lost)) => (kept, loads.iter().copied().filter(|l| lost.contains(&(l.site.clone(), l.pin.clone()))).collect()),
+            None => (Vec::new(), loads.clone()),
+        };
+        let seed = if kept.is_empty() { Vec::new() } else { tree_arrivals(device, drivers[0], &kept)?.1 };
+        let kind = if !kept.is_empty() && todo.is_empty() {
+            // The cut only dropped branches no load needed.
+            RouteKind::Pips(Vec::new())
+        } else {
+            route_net(&net, drivers[0], &todo, &clock_spine_nets, device, &claimed, &mut delays, &seed)?
+        };
+        let kind = match kind {
+            RouteKind::Pips(mut p) if !kept.is_empty() => {
+                p.extend(kept);
+                p.sort_by(|a, b| (&a.tile, &a.dst_wire, &a.src_wire).cmp(&(&b.tile, &b.dst_wire, &b.src_wire)));
+                p.dedup_by(|a, b| a.tile == b.tile && a.dst_wire == b.dst_wire && a.src_wire == b.src_wire && a.is_pseudo == b.is_pseudo);
+                RouteKind::Pips(p)
+            }
+            k => k,
+        };
         // Loads that found no free path took one through other nets'
         // wires: those nets are ripped up and queued again.
         let victims = match &kind {
@@ -672,13 +712,77 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
             if rips > max_rips {
                 return Err(format!("route: congestion around net `{net}` not resolved after {rips} rip-ups"));
             }
+            // Each displaced net loses only the branches through the nodes
+            // this path takes; the rest of its tree stays routed and claimed,
+            // and only the loads cut off are routed again.
+            let taken: Option<HashSet<u64>> = match &kind {
+                RouteKind::Pips(p) => p
+                    .iter()
+                    .flat_map(|x| [(&x.tile, &x.src_wire), (&x.tile, &x.dst_wire)])
+                    .map(|(t, w)| device.node_key(t, w))
+                    .collect(),
+                _ => None,
+            };
+            let mut kept_of: HashMap<String, Vec<RoutedPip>> = HashMap::new();
+            let mut lost_of: HashMap<String, Vec<(String, String)>> = HashMap::new();
+            for v in &victims {
+                let cut = taken.as_ref().and_then(|taken| {
+                    let RouteKind::Pips(vp) = &nets.iter().find(|n| &n.net == v)?.kind else { return None };
+                    let veps = &net_eps[v];
+                    let vdrv = veps.iter().find(|e| e.is_driver)?;
+                    cut_tree(device, vdrv, veps, vp, taken)
+                });
+                if let Some((kept, lost)) = cut {
+                    kept_of.insert(v.clone(), kept);
+                    lost_of.insert(v.clone(), lost);
+                }
+            }
             let vset: HashSet<&str> = victims.iter().map(|v| v.as_str()).collect();
             nets.retain(|n: &RoutedNet7| !vset.contains(n.net.as_str()));
             claimed.retain(|_, o| !vset.contains(o.as_str()));
-            load_delays.retain(|k, _| !vset.contains(k.0.as_str()));
+            load_delays.retain(|k, _| {
+                if !vset.contains(k.0.as_str()) {
+                    return true;
+                }
+                // Whole rip-up: every delay goes; partial: the lost loads'.
+                match lost_of.get(&k.0) {
+                    Some(lost) => !lost.contains(&(k.1.clone(), k.2.clone())),
+                    None => false,
+                }
+            });
             device.release_claims(&victims, claimed.len());
             for v in &victims {
-                queue.push_back(v.clone());
+                if let Some(kept) = kept_of.remove(v) {
+                    let mut wires = Vec::new();
+                    for p in &kept {
+                        for w in [&p.src_wire, &p.dst_wire] {
+                            if is_power_wire(w) {
+                                continue;
+                            }
+                            let key = (p.tile.clone(), w.clone());
+                            if !claimed.contains_key(&key) {
+                                wires.push(key.clone());
+                                claimed.insert(key, v.clone());
+                            }
+                        }
+                    }
+                    device.note_claims(v, &wires, claimed.len());
+                    // A net already waiting keeps the loads it waited for.
+                    let entry = partial.entry(v.clone()).or_insert_with(|| (Vec::new(), Vec::new()));
+                    entry.0 = kept.clone();
+                    for l in lost_of.remove(v).unwrap_or_default() {
+                        if !entry.1.contains(&l) {
+                            entry.1.push(l);
+                        }
+                    }
+                    nets.push(RoutedNet7 { net: v.clone(), kind: RouteKind::Pips(kept) });
+                } else {
+                    partial.remove(v);
+                }
+                if !queued.contains(v) {
+                    queued.insert(v.clone());
+                    queue.push_back(v.clone());
+                }
                 if rip_stats {
                     *rip_count.entry(v.clone()).or_insert(0usize) += 1;
                     *ripper_count.entry(net.clone()).or_insert(0usize) += 1;
@@ -866,6 +970,7 @@ fn route_net(
     device: &dyn RouteQuery,
     claimed: &HashMap<(String, String), String>,
     delays: &mut Vec<(String, String, u32)>,
+    seed: &[(String, String, u32)],
 ) -> Result<RouteKind, String> {
     if check_dedicated_cascade(net, driver, loads)? {
         return Ok(RouteKind::DedicatedCascade);
@@ -959,6 +1064,9 @@ fn route_net(
     // instead of re-entering one of its wires from a second source (which
     // would double-drive that wire's mux).
     let mut tree: Vec<(String, String, u32)> = vec![(src_tile.clone(), src_wire.clone(), 0)];
+    // A partly ripped-up net keeps the rest of its tree: new loads branch off
+    // it, with the arrival times it already has.
+    tree.extend(seed.iter().cloned());
     for load in &external_loads {
         let sinks = device.wire_for_site_pin(&load.site, &load.pin);
         if sinks.is_empty() {
@@ -1044,6 +1152,85 @@ fn route_net(
             && a.is_pseudo == b.is_pseudo
     });
     Ok(RouteKind::Pips(all_pips))
+}
+
+/// Arrival time (ps) at every node the pips reach from the driver, the same
+/// way the search adds them up, and the tree as search seeds
+/// `(tile, wire, arrival)`.
+fn tree_arrivals(
+    device: &dyn RouteQuery,
+    driver: &Endpoint,
+    pips: &[RoutedPip],
+) -> Result<(HashMap<u64, u32>, Vec<(String, String, u32)>), String> {
+    let (st, sw) = device
+        .site_pin_wire(&driver.site, &driver.pin)
+        .ok_or_else(|| format!("route: no wire for driver {}.{}", driver.site, driver.pin))?;
+    let key = |t: &str, w: &str| device.node_key(t, w).ok_or_else(|| format!("route: no node for {t}.{w}"));
+    let mut by_src: HashMap<u64, Vec<&RoutedPip>> = HashMap::new();
+    for p in pips {
+        by_src.entry(key(&p.tile, &p.src_wire)?).or_default().push(p);
+    }
+    let mut arr: HashMap<u64, u32> = HashMap::new();
+    let mut seeds = Vec::new();
+    let start = key(&st, &sw)?;
+    arr.insert(start, 0);
+    let mut work = vec![start];
+    while let Some(n) = work.pop() {
+        let a = arr[&n];
+        for p in by_src.get(&n).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let c = device
+                .pip_cost(&p.tile, &p.src_wire, &p.dst_wire)
+                .ok_or_else(|| format!("route: no pip {}.{}->{}", p.tile, p.src_wire, p.dst_wire))?;
+            let d = key(&p.tile, &p.dst_wire)?;
+            seeds.push((p.tile.clone(), p.src_wire.clone(), a));
+            seeds.push((p.tile.clone(), p.dst_wire.clone(), a + c));
+            if !arr.contains_key(&d) {
+                arr.insert(d, a + c);
+                work.push(d);
+            }
+        }
+    }
+    Ok((arr, seeds))
+}
+
+/// Cut a routed net back where another net's new path takes nodes from it.
+/// Returns the pips still connected to the driver and the loads
+/// `(site, pin)` they no longer reach; `None` when the device has no node
+/// model (the net is then rerouted whole).
+fn cut_tree(
+    device: &dyn RouteQuery,
+    driver: &Endpoint,
+    eps: &[Endpoint],
+    pips: &[RoutedPip],
+    taken: &HashSet<u64>,
+) -> Option<(Vec<RoutedPip>, Vec<(String, String)>)> {
+    let mut rest = Vec::new();
+    for p in pips {
+        let s = device.node_key(&p.tile, &p.src_wire)?;
+        let d = device.node_key(&p.tile, &p.dst_wire)?;
+        if !taken.contains(&s) && !taken.contains(&d) {
+            rest.push(p.clone());
+        }
+    }
+    let (arr, _) = tree_arrivals(device, driver, &rest).ok()?;
+    let mut kept = Vec::new();
+    for p in rest {
+        if arr.contains_key(&device.node_key(&p.tile, &p.src_wire)?) {
+            kept.push(p);
+        }
+    }
+    let mut lost = Vec::new();
+    for l in eps.iter().filter(|e| !e.is_driver) {
+        if l.site == driver.site && is_site_internal_pin(&l.pin) {
+            continue;
+        }
+        let sinks = device.wire_for_site_pin(&l.site, &l.pin);
+        let reached = sinks.iter().any(|(t, w)| device.node_key(t, w).is_some_and(|k| arr.contains_key(&k)));
+        if !reached {
+            lost.push((l.site.clone(), l.pin.clone()));
+        }
+    }
+    Some((kept, lost))
 }
 
 /// Power and clock-distribution wires (`GND_WIRE`, `VCC_WIRE`, `GFAN*`,
