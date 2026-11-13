@@ -1,6 +1,7 @@
 //! End-to-end blinky: synth a 4-bit counter in Rust, run the iCE40 flow,
 //! emit .asc, and validate with IceStorm's icepack/iceunpack round-trip.
 
+mod common;
 use helion_backend::Backend;
 use helion_ice40::Ice40Backend;
 use helion_ir::{CellKind, Design, PortDir};
@@ -86,8 +87,5 @@ fn blinky_end_to_end() {
     assert!(asc.starts_with(".device 8k\n"));
     assert!(asc.contains(".logic_tile"));
 
-    // Write the .asc for external validation (icepack/icebox_vlog).
-    let path = "/tmp/helion_blinky.asc";
-    std::fs::write(path, &asc).expect("write asc");
-    println!("wrote {path} ({} bytes)", asc.len());
+    common::round_trip(&asc, "blinky");
 }

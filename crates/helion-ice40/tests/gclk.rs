@@ -15,7 +15,8 @@ use helion_ice40::route::Router;
 use helion_ice40::Ice40Backend;
 use helion_ir::{intern, CellKind, Design, PortDir};
 use std::collections::HashMap;
-use std::process::Command;
+mod common;
+use common::round_trip;
 
 /// Parse `.asc` tile sections into `(kind, x, y) -> 16 bank strings`.
 fn asc_tiles(asc: &str) -> HashMap<(String, u8, u8), Vec<String>> {
@@ -51,29 +52,6 @@ fn bit(banks: &[String], bank: usize, bit: usize) -> bool {
     banks[bank].as_bytes()[bit] == b'1'
 }
 
-/// icepack -> iceunpack round-trip; returns the re-emitted text.
-fn round_trip(asc: &str, stem: &str) -> String {
-    if !std::path::Path::new("/usr/bin/icepack").exists() {
-        return asc.to_string();
-    }
-    let dir = "/tmp/helion_gclk";
-    std::fs::create_dir_all(dir).expect("mkdir");
-    let asc_path = format!("{dir}/{stem}.asc");
-    let bin_path = format!("{dir}/{stem}.bin");
-    let asc2_path = format!("{dir}/{stem}.rt.asc");
-    std::fs::write(&asc_path, asc).expect("write asc");
-    let st = Command::new("/usr/bin/icepack")
-        .args([&asc_path, &bin_path])
-        .status()
-        .expect("icepack runs");
-    assert!(st.success(), "icepack failed on {stem}");
-    let st = Command::new("/usr/bin/iceunpack")
-        .args([&bin_path, &asc2_path])
-        .status()
-        .expect("iceunpack runs");
-    assert!(st.success(), "iceunpack failed on {stem}");
-    std::fs::read_to_string(&asc2_path).expect("read round-tripped asc")
-}
 
 /// Column-buffer tile row covering logic-tile row `y` (colbuf_db "8k").
 fn colbuf_src_y(y: u8) -> u8 {

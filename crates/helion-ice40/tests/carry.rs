@@ -10,6 +10,7 @@
 //! increment, bit i uses `S[i] = q[i]`, `DI[i] = 0`, giving
 //! `O[i] = q[i] ^ carry[i]` and `CO[i] = q[i] & carry[i]`.
 
+mod common;
 use helion_backend::Backend;
 use helion_ice40::Ice40Backend;
 use helion_ir::{CellKind, Design, PortDir};
@@ -192,56 +193,10 @@ fn counter_8bit_carry_end_to_end() {
     // Write the .asc and round-trip through icepack/iceunpack. iceunpack
     // normalizes (drops all-zero tiles, adds .comment), so compare the SET
     // BITS semantically: no bit may be lost or gained.
-    if std::path::Path::new("/usr/bin/icepack").exists() {
-        let asc_path = "/tmp/helion_carry_counter.asc";
-        std::fs::write(asc_path, &asc).expect("write asc");
-        let bin_path = "/tmp/helion_carry_counter.bin";
-        let asc2_path = "/tmp/helion_carry_counter_rt.asc";
-        let st = std::process::Command::new("/usr/bin/icepack")
-            .args([asc_path, bin_path])
-            .status()
-            .expect("run icepack");
-        assert!(st.success(), "icepack failed");
-        let st = std::process::Command::new("/usr/bin/iceunpack")
-            .args([bin_path, asc2_path])
-            .status()
-            .expect("run iceunpack");
-        assert!(st.success(), "iceunpack failed");
-        let rt = std::fs::read_to_string(asc2_path).expect("read round-tripped asc");
-        assert_eq!(
-            set_bits(&asc),
-            set_bits(&rt),
-            "icepack/iceunpack round-trip must preserve every bit"
-        );
-    }
+    common::round_trip(&asc, "carry_counter");
     println!("carry counter: 8-bit chain at tile ({x0},{y0}), round-trip bit-perfect");
 }
 
-/// The set of `(tile_kind, x, y, bank, bit)` with bit set in .asc text.
-fn set_bits(asc: &str) -> std::collections::HashSet<(String, u32, u32, usize, usize)> {
-    let mut set = std::collections::HashSet::new();
-    let mut kind = String::new();
-    let mut x = 0u32;
-    let mut y = 0u32;
-    let mut bank = 0usize;
-    for line in asc.lines() {
-        if let Some(rest) = line.strip_prefix('.') {
-            let mut it = rest.split_whitespace();
-            kind = it.next().unwrap_or("").to_string();
-            x = it.next().unwrap_or("0").parse().unwrap_or(0);
-            y = it.next().unwrap_or("0").parse().unwrap_or(0);
-            bank = 0;
-        } else if line.chars().all(|c| c == '0' || c == '1') && !line.is_empty() {
-            for (i, c) in line.chars().enumerate() {
-                if c == '1' {
-                    set.insert((kind.clone(), x, y, bank, i));
-                }
-            }
-            bank += 1;
-        }
-    }
-    set
-}
 
 /// 12-bit chain (3 Carry4s) spans two tiles; the upper tile's
 /// carry_in_mux must select the tile-below carry (B1[49]).
@@ -336,24 +291,7 @@ fn counter_12bit_carry_spans_tiles() {
         );
     }
     // Round-trip preserves bits.
-    if std::path::Path::new("/usr/bin/icepack").exists() {
-        let asc_path = "/tmp/helion_carry_counter12.asc";
-        std::fs::write(asc_path, &asc).expect("write asc");
-        let bin_path = "/tmp/helion_carry_counter12.bin";
-        let asc2_path = "/tmp/helion_carry_counter12_rt.asc";
-        assert!(std::process::Command::new("/usr/bin/icepack")
-            .args([asc_path, bin_path])
-            .status()
-            .expect("icepack")
-            .success());
-        assert!(std::process::Command::new("/usr/bin/iceunpack")
-            .args([bin_path, asc2_path])
-            .status()
-            .expect("iceunpack")
-            .success());
-        let rt = std::fs::read_to_string(asc2_path).expect("read rt asc");
-        assert_eq!(set_bits(&asc), set_bits(&rt), "round-trip preserves bits");
-    }
+    common::round_trip(&asc, "carry_counter12");
     println!("12-bit chain spans tiles ({x0},{y0}) -> ({x1},{y1}), FromBelow set");
 }
 

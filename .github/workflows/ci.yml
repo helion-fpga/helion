@@ -15,11 +15,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.1
       # Rune (vendored in third_party/rune) links libxkbcommon and
       # libwayland-client; helion-hw's native FTDI path links libusb.
+      # fpga-icestorm: the helion-ice40 tests round-trip their .asc through icepack.
       - name: system packages
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libxkbcommon-dev libwayland-dev libusb-1.0-0-dev
+            pkg-config libxkbcommon-dev libwayland-dev libusb-1.0-0-dev fpga-icestorm
       - name: lockfile is current
         run: cargo metadata --locked --format-version 1 > /dev/null
       - name: IDE and hardware tests

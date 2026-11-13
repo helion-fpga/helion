@@ -13,7 +13,8 @@ use helion_backend::Backend;
 use helion_ice40::Ice40Backend;
 use helion_ir::{intern, CellKind, Design, PortDir};
 use std::collections::HashMap;
-use std::process::Command;
+mod common;
+use common::round_trip;
 
 fn set_attr(d: &mut Design, cell: &str, key: &str, val: &str) {
     d.set_cell_attr(cell, key, val).expect("cell exists");
@@ -77,29 +78,6 @@ fn bit(banks: &[String], bank: usize, bit: usize) -> bool {
     banks[bank].as_bytes()[bit] == b'1'
 }
 
-/// Run icepack -> iceunpack round-trip on an .asc; return the re-emitted text.
-fn round_trip(asc: &str, stem: &str) -> String {
-    if !std::path::Path::new("/usr/bin/icepack").exists() {
-        return asc.to_string();
-    }
-    let dir = "/tmp/helion_rampll";
-    std::fs::create_dir_all(dir).expect("mkdir");
-    let asc_path = format!("{dir}/{stem}.asc");
-    let bin_path = format!("{dir}/{stem}.bin");
-    let asc2_path = format!("{dir}/{stem}.rt.asc");
-    std::fs::write(&asc_path, asc).expect("write asc");
-    let st = Command::new("/usr/bin/icepack")
-        .args([&asc_path, &bin_path])
-        .status()
-        .expect("icepack runs");
-    assert!(st.success(), "icepack failed on {stem}");
-    let st = Command::new("/usr/bin/iceunpack")
-        .args([&bin_path, &asc2_path])
-        .status()
-        .expect("iceunpack runs");
-    assert!(st.success(), "iceunpack failed on {stem}");
-    std::fs::read_to_string(&asc2_path).expect("read round-tripped asc")
-}
 
 /// Build a small RAM design: clk -> Bram18 -> led0.
 fn ram_design() -> Design {
