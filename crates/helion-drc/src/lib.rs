@@ -206,6 +206,7 @@ pub fn check_placed(design: &Design, placed: &Placed, dev: &Device) -> Drc {
             d.add("PLACE-4", &clb, format!("overused {clb} BLE{ble}"));
         }
     }
+    check_hard_sites(placed, dev, &mut d);
     if placed.mac_sites.len() != placed.packed.macs.len() {
         d.add("DSP-1", "", "DSP placement mismatch");
     }
@@ -229,6 +230,43 @@ pub fn check_placed(design: &Design, placed: &Placed, dev: &Device) -> Drc {
     check_iostandard(design, placed, dev, &mut d);
     check_io_electrical(design, &mut d);
     d
+}
+
+/// Hard-block sites: one block per site (PLACE-5); a block connected to
+/// the fabric on a site of its kind whose tiles are all fabric tiles
+/// (PLACE-6); no LUT or flop on a tile of such a block (PLACE-7).
+fn check_hard_sites(placed: &Placed, dev: &Device, d: &mut Drc) {
+    use helion_device::hard::Kind;
+    let macs = placed.packed.macs.iter().map(|m| (m.cell.as_str(), m.fabric, Kind::Mac)).zip(&placed.mac_sites);
+    let brams = placed.packed.brams.iter().map(|b| (b.cell.as_str(), b.fabric, Kind::Bram)).zip(&placed.bram_sites);
+    let mut at: BTreeMap<(u32, u32), &str> = BTreeMap::new();
+    for ((cell, fabric, kind), site) in macs.chain(brams) {
+        if let Some(other) = at.insert((site.x, site.y), cell) {
+            d.add("PLACE-5", site.id(), format!("{other} and {cell} are both placed on {}", site.id()));
+        }
+        if !fabric {
+            continue;
+        }
+        match dev.hard_site(*site) {
+            Some((k, _)) if k == kind => {
+                if dev.hard_tiles(*site).len() != kind.tiles() as usize {
+                    d.add("PLACE-6", site.id(), format!("{cell} on {}: a tile of the block is not a fabric tile", site.id()));
+                }
+            }
+            _ => d.add("PLACE-6", site.id(), format!("{cell} is placed on {}, not a site for it", site.id())),
+        }
+    }
+    let reserved = placed.reserved_tiles(dev);
+    if reserved.is_empty() {
+        return;
+    }
+    for (i, (site, ble)) in placed.lutff_sites.iter().enumerate() {
+        if reserved.contains(&(site.x, site.y)) {
+            let clb = format!("CLB_X{}Y{}", site.x, site.y);
+            let cell = placed.packed.lutffs.get(i).map(|l| l.lut_cell.as_str()).unwrap_or("?");
+            d.add("PLACE-7", &clb, format!("{cell} is placed on {clb} BLE{ble}, a tile of a hard block"));
+        }
+    }
 }
 
 fn parse_iob_xy(spec: &str) -> Option<(u32, u32)> {
@@ -484,6 +522,37 @@ mod tests {
         )
         .unwrap();
         assert!(check_pblocks(&legal, &[far]).ok());
+    }
+
+    /// A RAM connected to the fabric: a cluster moved onto its tile, a
+    /// second block on its site, or the RAM on a site that is not a RAM
+    /// site, are placement errors (bitgen would refuse or misconfigure).
+    #[test]
+    fn hard_block_tiles_and_sites() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_counter();
+        d.add_cell("ram", helion_ir::CellKind::Bram18);
+        d.connect("clk", "ram", "CLK");
+        d.connect("q0", "ram", "RADDR0");
+        d.add_port("o", helion_ir::PortDir::Out);
+        d.connect("r0", "ram", "DO0");
+        d.add_cell("io", helion_ir::CellKind::IobOut);
+        d.connect("r0", "io", "I");
+        d.connect("o", "io", "PAD");
+        d.add_cell("aperture", helion_ir::CellKind::Bram18);
+        let pl = place(&pack(&d, &dev).unwrap(), &dev).unwrap();
+        let ids = |pl: &Placed| check_placed(&d, pl, &dev).items.iter().map(|v| v.id.clone()).collect::<Vec<_>>();
+        assert!(check_placed(&d, &pl, &dev).ok(), "{:?}", check_placed(&d, &pl, &dev).violations);
+        let site = pl.bram_sites[0];
+        let mut on_tile = pl.clone();
+        on_tile.lutff_sites[0].0 = helion_device::Site { x: site.x, y: site.y, kind: on_tile.lutff_sites[0].0.kind };
+        assert!(ids(&on_tile).contains(&"PLACE-7".to_string()), "{:?}", ids(&on_tile));
+        let mut shared = pl.clone();
+        shared.bram_sites[1] = site;
+        assert!(ids(&shared).contains(&"PLACE-5".to_string()), "{:?}", ids(&shared));
+        let mut off = pl.clone();
+        off.bram_sites[0] = helion_device::Site { y: site.y + 1, ..site };
+        assert!(ids(&off).contains(&"PLACE-6".to_string()), "{:?}", ids(&off));
     }
 
     #[test]
