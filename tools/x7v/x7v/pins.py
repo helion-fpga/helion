@@ -1,51 +1,65 @@
-"""Zedboard pin assignment for designs without a board XDC (micro tests,
-generated designs). Board-meaningful pins first, so a design built this way
-can also go on the real board: clock on the 100 MHz oscillator (Y9), inputs
-on slide switches / push buttons / PMOD JA-JB, outputs on the LEDs /
-PMOD JC-JD; remaining bits take any other PL pin of banks 13/33/34/35.
+"""Pin assignment for designs without a board XDC (micro tests, generated
+designs), for any board in boards/boards.json (ZedBoard by default).
+Board-meaningful pins first, so a design built this way can also go on the
+real board: clock on the board oscillator, inputs on slide switches, push
+buttons and the input Pmods, outputs on the LEDs and the output Pmods;
+remaining bits take any other pin of the board's 3.3 V user banks.
 """
 from __future__ import annotations
 
 import csv
+import json
 import os
 
-CLOCK = "Y9"
-SWITCHES = ["F22", "G22", "H22", "F21", "H19", "H18", "H17", "M15"]
-BUTTONS = ["P16", "R16", "N15", "R18", "T18"]           # BTNC, BTND, BTNL, BTNR, BTNU
-LEDS = ["T22", "T21", "U22", "U21", "V22", "W22", "U19", "U14"]
-PMOD_JA = ["Y11", "AA11", "Y10", "AA9", "AB11", "AB10", "AB9", "AA8"]
-PMOD_JB = ["W12", "W11", "V10", "W8", "V12", "W10", "V9", "V8"]
-PMOD_JC = ["AB7", "AB6", "Y4", "AA4", "R6", "T6", "T4", "U4"]
-PMOD_JD = ["V7", "W7", "V5", "V4", "W6", "W5", "U6", "U5"]
-
-DB = os.path.expanduser(os.environ.get("X7V_DB", "~/.cache/helion/prjxray-db/zynq7"))
+BOARDS_JSON = os.environ.get(
+    "X7V_BOARDS", os.path.join(os.path.dirname(__file__), "..", "..", "..", "boards", "boards.json"))
+DEFAULT_BOARD = "zedboard"
 
 
-def _pl_pins() -> list[str]:
-    path = os.path.join(DB, "xc7z020clg484-1", "package_pins.csv")
+def boards() -> dict:
+    return json.load(open(BOARDS_JSON))
+
+
+def board(name: str | None) -> dict:
+    all_ = boards()
+    key = (name or DEFAULT_BOARD).lower()
+    aliases = {"zed": "zedboard", "arty": "arty-a7-35", "arty-a7": "arty-a7-35", "basys-3": "basys3",
+               "nexys-a7": "nexys-a7-100t", "nexys4-ddr": "nexys-a7-100t"}
+    key = aliases.get(key, key)
+    if key not in all_:
+        raise ValueError(f"unknown board {name} (known: {', '.join(all_)})")
+    b = dict(all_[key])
+    b["name"] = key
+    return b
+
+
+def _spare_pins(db, b: dict) -> list[str]:
     out = []
-    with open(path) as f:
+    with open(os.path.join(db.root, db.package, "package_pins.csv")) as f:
         for row in csv.DictReader(f):
-            if row["bank"] in ("13", "33", "34", "35") and row["site"].startswith("IOB"):
+            if row["bank"] in b["spare_banks"] and row["site"].startswith("IOB"):
                 out.append(row["pin"])
     return out
 
 
-def assign(ports) -> tuple[dict[str, str], str | None]:
+def assign(ports, db=None, board_name: str | None = None) -> tuple[dict[str, str], str | None]:
     """ports: cosim.Port list. Returns ({bit name: package pin}, clock port)."""
     import re
+    from .db import Db
+    b = board(board_name)
+    db = db or Db.for_part(b["part"])
     used: set[str] = set()
     pins: dict[str, str] = {}
     clock = None
     for p in ports:
         if p.direction == "in" and p.width is None and re.fullmatch(r"(clk|clock|gclk|sysclk|clk_i)", p.name, re.I):
             clock = p.name
-            pins[p.name] = CLOCK
-            used.add(CLOCK)
+            pins[p.name] = b["clock"]
+            used.add(b["clock"])
             break
-    rest = [x for x in _pl_pins() if x not in used]
-    in_pool = SWITCHES + BUTTONS + PMOD_JA + PMOD_JB
-    out_pool = LEDS + PMOD_JC + PMOD_JD
+    rest = [x for x in _spare_pins(db, b) if x not in used]
+    in_pool = b["switches"] + b["buttons"] + [x for v in b["in_pmods"].values() for x in v]
+    out_pool = b["leds"] + b.get("rgb_leds", []) + [x for v in b["out_pmods"].values() for x in v]
     in_pool = [x for x in in_pool if x not in used]
     out_pool = [x for x in out_pool if x not in used]
 
@@ -57,18 +71,18 @@ def assign(ports) -> tuple[dict[str, str], str | None]:
         raise RuntimeError("out of package pins")
 
     for p in ports:
-        for b in p.bits():
-            if b in pins:
+        for bit in p.bits():
+            if bit in pins:
                 continue
-            pins[b] = take(in_pool if p.direction == "in" else out_pool)
+            pins[bit] = take(in_pool if p.direction == "in" else out_pool)
     return pins, clock
 
 
-def write_xdc(ports, path: str) -> dict[str, str]:
-    pins, clock = assign(ports)
+def write_xdc(ports, path: str, db=None, board_name: str | None = None) -> dict[str, str]:
+    pins, clock = assign(ports, db, board_name)
     with open(path, "w") as f:
-        for b, pin in pins.items():
-            f.write(f"set_property -dict {{ PACKAGE_PIN {pin} IOSTANDARD LVCMOS33 }} [get_ports {{{b}}}]\n")
+        for bit, pin in pins.items():
+            f.write(f"set_property -dict {{ PACKAGE_PIN {pin} IOSTANDARD LVCMOS33 }} [get_ports {{{bit}}}]\n")
         if clock:
             f.write(f"create_clock -period 10.000 -name sys_clk [get_ports {clock}]\n")
     return pins

@@ -24,6 +24,33 @@ release build (`cargo build --release -p helion-xilinx7 --example zedbit`,
 `X7V_ZEDBIT`, `X7V_SYNTH2V` and `X7V_VHDL2SV` point elsewhere. `flow` builds
 with the front end `zedbit` picks (`HELION_ZED_FRONT=auto|v2|zb`).
 
+## Parts and boards
+
+`--part PART` (before the command) checks a bitstream for any part the
+Project X-Ray database describes; the family, fabric and package come from
+the database's own `mapping/parts.yaml` and `devices.yaml` under
+`X7V_DB_ROOT` (default `~/.cache/helion/prjxray-db`). `--board NAME` sets the
+part from `boards/boards.json` and, for `flow`, takes pins from that board's
+pools (clock on the oscillator, inputs on switches, buttons and input Pmods,
+outputs on LEDs and output Pmods, then spare pins of its 3.3 V banks).
+Without either, the part is the ZedBoard's (`xc7z020clg484-1`).
+
+```sh
+python3 -m x7v --board arty-a7-35 flow design.sv --top top
+python3 -m x7v --part xc7a100tcsg324-1 verify design.bit --rtl design.sv --top top --xdc pins.xdc
+tests/boards.sh [board ...]    # counter + PicoRV32 SoC per board, built and verified
+```
+
+Boards: `zedboard`, `arty-a7-35` (Arty A7-35T), `basys3`, `nexys-a7-100t`.
+`verify` also checks that the bitstream's IDCODE is the part's: a device
+refuses a bitstream written for another part.
+
+What the Artix-7 checks rest on is weaker than the ZedBoard's: x7v decodes
+and round-trips Vivado's Artix-7 harness bitstreams from the database
+(mostly empty designs) with no unexplained bit, but there is no Vivado build
+of real Artix-7 logic to compare against yet, and no Artix-7 board has been
+tried.
+
 `verify` options for larger designs:
 
 * `--cycles N`, `--seed N`: length and seed of the random stimulus.
