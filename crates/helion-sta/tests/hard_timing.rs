@@ -257,3 +257,73 @@ fn designs_whose_only_registers_are_blocks_have_timing() {
         assert!(helion_sta::report_timing(d, &clks).unwrap().endpoints > 0, "{what}");
     }
 }
+
+/// The placer's timing passes see the multiplier: flops -> a
+/// combinational multiplier -> LUT -> flop, beside enough other logic for
+/// the annealer to run. Weighing the connections around the multiplier's
+/// 1300 ps pulls them in, so the path through it is no longer the slowest
+/// (it was, at 2940 ps, when those passes left the multiplier out).
+#[test]
+fn placer_pulls_the_path_through_a_multiplier_in() {
+    let mut n = Nl::new();
+    let x = n.inputs("x", 16);
+    let y = n.inputs("y", 16);
+    let a: Vec<String> = x.iter().map(|v| n.ff(v)).collect();
+    let b: Vec<String> = y.iter().map(|v| n.ff(v)).collect();
+    n.d.add_cell("mul", CellKind::Mac27);
+    n.d.set_cell_attr("mul", "PREG", "0").unwrap();
+    for i in 0..16 {
+        n.d.connect(&a[i], "mul", &format!("A{i}"));
+        n.d.connect(&b[i], "mul", &format!("B{i}"));
+    }
+    for i in 0..32 {
+        n.d.connect(&format!("p{i}"), "mul", &format!("P{i}"));
+        let l = n.lut(&[&format!("p{i}"), &a[i % 16]], |v| (v & 1) ^ (v >> 1) == 1);
+        let q = n.ff(&l);
+        n.output(&format!("o{i}"), &q);
+    }
+    // Unrelated logic, so the placer's annealing runs (200 clusters).
+    let mut cur = x[0].clone();
+    for k in 0..180 {
+        let l = n.lut(&[&cur, &y[k % 16]], |v| v == 1);
+        cur = n.ff(&l);
+    }
+    n.output("tail", &cur);
+    let g = timing(&n.d);
+    assert!(!names(&g).iter().any(|p| p.contains("(multiplier,")), "{g:?}");
+    assert!(g.reg_ps < 2600, "{g:?}");
+}
+
+/// The placer's timing passes start paths at a RAM's clock-to-DO: its
+/// DO bits each run through six LUTs into a flop (the slowest paths of
+/// the design), beside enough other logic for the annealer to run. With
+/// the RAM's outputs left out of those passes the slowest is 1810 ps.
+#[test]
+fn placer_weighs_paths_from_a_ram_output() {
+    let mut n = Nl::new();
+    let pads = n.inputs("a", 12);
+    let a: Vec<String> = pads.iter().map(|p| n.ff(p)).collect();
+    n.d.add_cell("ram", CellKind::Bram18);
+    n.d.connect("clk", "ram", "CLK");
+    for i in 0..10 {
+        n.d.connect(&a[i], "ram", &format!("RADDR{i}"));
+        n.d.connect(&a[9 - i], "ram", &format!("WADDR{i}"));
+    }
+    n.d.connect(&a[10], "ram", "WE");
+    for i in 0..16 {
+        n.d.connect(&a[(i + 3) % 12], "ram", &format!("DI{i}"));
+        n.d.connect(&format!("do{i}"), "ram", &format!("DO{i}"));
+        let c = n.chain(&format!("do{i}"), &a[i % 12], 6);
+        let q = n.ff(&c);
+        n.output(&format!("o{i}"), &q);
+    }
+    let mut cur = a[0].clone();
+    for k in 0..180 {
+        let l = n.lut(&[&cur, &a[k % 12]], |v| v == 1);
+        cur = n.ff(&l);
+    }
+    n.output("tail", &cur);
+    let g = timing(&n.d);
+    assert!(names(&g)[0].starts_with("ram (clock to DO"), "{g:?}");
+    assert!(g.reg_ps < 1800, "{g:?}");
+}

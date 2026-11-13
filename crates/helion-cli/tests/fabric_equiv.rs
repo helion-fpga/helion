@@ -1310,6 +1310,72 @@ fn moving_off_hard_block_tiles_keeps_one_clock_per_clb() {
     }
 }
 
+/// Flops -> a combinational multiplier -> LUTs -> flops, and a RAM whose
+/// DO runs through LUTs into flops, beside about 200 clusters of other
+/// logic: large enough that the placer anneals, with the hard blocks in
+/// its timing passes (their arcs, endpoints and path starts). The
+/// bitstream equals the netlist.
+#[test]
+fn annealed_placement_around_hard_blocks() {
+    let mut n = Nl::new();
+    let x = n.inputs("x", 8);
+    let a: Vec<String> = x.iter().map(|v| n.ff(v)).collect();
+    let b: Vec<String> = x.iter().rev().map(|v| n.ff(v)).collect();
+    n.d.add_cell("mul", CellKind::Mac27);
+    n.d.set_cell_attr("mul", "PREG", "0").unwrap();
+    for i in 0..8 {
+        n.d.connect(&a[i], "mul", &format!("A{i}"));
+        n.d.connect(&b[i], "mul", &format!("B{i}"));
+    }
+    let mut outs = Vec::new();
+    for i in 0..16 {
+        n.d.connect(&format!("p{i}"), "mul", &format!("P{i}"));
+        let l = n.lut(&[&format!("p{i}"), &a[i % 8]], |v| (v & 1) ^ (v >> 1) == 1);
+        outs.push(n.ff(&l));
+    }
+    let cnt = n.counter(10);
+    n.d.add_cell("ram", CellKind::Bram18);
+    n.d.set_cell_attr("ram", "INIT", ram_init(0x1234_5678)).unwrap();
+    n.d.connect("clk", "ram", "CLK");
+    for i in 0..10 {
+        n.d.connect(&cnt[i], "ram", &format!("WADDR{i}"));
+        n.d.connect(&cnt[9 - i], "ram", &format!("RADDR{i}"));
+    }
+    n.d.connect(&a[0], "ram", "WE");
+    for i in 0..8 {
+        n.d.connect(&b[i], "ram", &format!("DI{i}"));
+        n.d.connect(&format!("do{i}"), "ram", &format!("DO{i}"));
+        let mut c = format!("do{i}");
+        for k in 0..3 {
+            c = n.lut(&[&c, &a[(i + k) % 8]], |v| (v & 1) ^ (v >> 1) == 1);
+        }
+        outs.push(n.ff(&c));
+    }
+    let mut cur = a[1].clone();
+    for k in 0..180 {
+        let l = n.lut(&[&cur, &b[k % 8]], |v| v == 1);
+        cur = n.ff(&l);
+    }
+    outs.push(cur);
+    // Fold the outputs to pads, eight at a time.
+    for (k, group) in outs.chunks(8).enumerate() {
+        let refs: Vec<&str> = group.iter().take(6).map(|s| s.as_str()).collect();
+        let f = n.lut(&refs, |v| v.count_ones() % 2 == 1);
+        n.output(&format!("o{k}"), &f);
+        if group.len() > 6 {
+            for (j, extra) in group[6..].iter().enumerate() {
+                n.output(&format!("o{k}_{j}"), extra);
+            }
+        }
+    }
+    let dev = Device::load_part("HL10S-C64-1").unwrap();
+    assert!(pack(&n.d, &dev).unwrap().lutffs.len() >= helion_place::wl::MIN_CLUSTERS);
+    check_design(&n.d, "HL10S-C64-1", 400, |_| {}).expect("annealed with hard blocks");
+    // Not vacuous: the multiplier made registered is caught.
+    let preg = |r: &mut helion_route::Routed| r.placed.packed.macs.iter_mut().for_each(|m| m.preg = true);
+    assert!(check_design(&n.d, "HL10S-C64-1", 400, preg).is_err(), "PREG on went unnoticed");
+}
+
 /// phys_opt permutes LUT pins for timing: the routed connections move
 /// with the truth table. (Before, only the truth table moved, and on this
 /// design the RAM's write enable LUT read the wrong inputs.)

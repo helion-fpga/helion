@@ -8,6 +8,8 @@
 
 use helion_backend::TimingModel;
 use helion_pack::{HardKind, NetSrc};
+// How a hard block's outputs are timed (shared with the placer).
+use helion_pack::HardTiming as HardOut;
 use helion_route::Routed;
 use std::collections::HashMap;
 
@@ -59,15 +61,7 @@ pub fn analyze_with_pad(routed: &Routed, tm: &TimingModel, period_ps: i64, pad_p
     // Hard blocks connected to the fabric: how each one's outputs are
     // timed, its cell, its site, and its connected inputs (dy, m, driver).
     let nh = conn.hard.len();
-    let hout: Vec<HardOut> = conn
-        .hard
-        .iter()
-        .map(|r| match r.kind {
-            HardKind::Bram => HardOut::Ram,
-            HardKind::Mac if packed.macs.get(r.idx as usize).is_some_and(|m| m.preg) => HardOut::Reg,
-            HardKind::Mac => HardOut::Comb,
-        })
-        .collect();
+    let hout: Vec<HardOut> = (0..nh).map(|b| packed.hard_timing(b)).collect();
     let hcell = |b: usize| -> &str {
         let r = conn.hard[b];
         match r.kind {
@@ -139,7 +133,7 @@ pub fn analyze_with_pad(routed: &Routed, tm: &TimingModel, period_ps: i64, pad_p
         }
     };
     // Inputs of a multiplier that go through its product (not CE / RST).
-    let through_product = |dy: u8, m: u8| dy > 0 || u32::from(m) < 2 * helion_device::hard::MAC_IN_BITS;
+    let through_product = helion_pack::mac_through_product;
     let deps = |u: usize| -> Vec<NetSrc> {
         if u < n {
             pins[u].iter().map(|p| p.1).collect()
@@ -316,15 +310,4 @@ pub fn analyze_with_pad(routed: &Routed, tm: &TimingModel, period_ps: i64, pad_p
         out.worst_path = path;
     }
     Some(out)
-}
-
-/// How a hard block's outputs are timed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HardOut {
-    /// A RAM: clock to DO.
-    Ram,
-    /// A registered multiplier: clock to P.
-    Reg,
-    /// A combinational multiplier: its inputs through the product.
-    Comb,
 }

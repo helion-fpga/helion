@@ -37,6 +37,26 @@ pub enum NetSrc {
 
 pub use helion_device::hard::Kind as HardKind;
 
+/// How a hard block's outputs are timed. The timing analysis
+/// (`helion_sta::graph`) and the timing-driven placer both go by this, so
+/// they agree on which paths a block ends and which run through it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HardTiming {
+    /// A RAM: its inputs are setup endpoints; DO starts at clock to DO.
+    Ram,
+    /// A registered multiplier (PREG=1): its inputs are endpoints (A/B/C
+    /// through the product); P starts at clock to Q.
+    Reg,
+    /// A combinational multiplier: A/B/C to P is an arc, the product's delay.
+    Comb,
+}
+
+/// Whether input (`dy`, IMUX `m`) of a multiplier goes through its
+/// product (A, B, C), rather than being CE or RST.
+pub fn mac_through_product(dy: u8, m: u8) -> bool {
+    dy > 0 || u32::from(m) < 2 * helion_device::hard::MAC_IN_BITS
+}
+
 /// A hard block connected to the fabric: `packed.macs[idx]` or
 /// `packed.brams[idx]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2190,6 +2210,16 @@ pub struct PadFit {
 }
 
 impl Packed {
+    /// How hard block `conn.hard[blk]` is timed.
+    pub fn hard_timing(&self, blk: usize) -> HardTiming {
+        let r = self.conn.hard[blk];
+        match r.kind {
+            HardKind::Bram => HardTiming::Ram,
+            HardKind::Mac if self.macs.get(r.idx as usize).is_some_and(|m| m.preg) => HardTiming::Reg,
+            HardKind::Mac => HardTiming::Comb,
+        }
+    }
+
     /// Whether output pad `io` has a driver in the packed design.
     pub fn pad_driven(&self, io: &PackedIob) -> bool {
         self.conn.iob_src.contains_key(&io.cell) || self.lutffs.iter().any(|l| l.q_net == io.from_net)

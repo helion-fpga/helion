@@ -243,27 +243,58 @@ pub fn legalize_clocks(placed: &mut Placed, dev: &Device) -> Result<u32, String>
 /// Timing-driven passes after the wirelength pass.
 const TIMING_PASSES: usize = 2;
 
-/// Weight of each cluster-to-cluster connection from a timing estimate of
-/// the placement: delay per tile of distance, a LUT per level. A
-/// connection on the slowest path gets the full weight, one with slack to
-/// spare gets none.
-fn criticality_weights(conns: &[(u32, u32, bool)], pos: &[(i32, i32)], has_ff: &[bool], n: usize) -> Vec<f32> {
+/// A connection the timing passes weigh. Nodes `0..n` are the clusters,
+/// `n..` the hard blocks connected to the fabric (fixed while annealing).
+#[derive(Clone, Copy, Debug)]
+struct TConn {
+    s: u32,
+    d: u32,
+    /// Arrival at the source when it is a register (a flop's Q, a RAM's DO,
+    /// a registered multiplier's P); `None`: the source node's arrival.
+    start: Option<f32>,
+    /// Tile rows above the node's position the source leaves from and the
+    /// destination pin is on (a multiplier takes two tiles).
+    sdy: i32,
+    ddy: i32,
+    /// Loading at the destination pin (a LUT's per-pin delay; 0 at a block).
+    pin: f32,
+    /// When the destination is a block input a clock edge latches: what
+    /// comes between the pin and the register's setup (the product for a
+    /// registered multiplier's A/B/C, else 0).
+    end: Option<f32>,
+}
+
+/// Weight of each connection from a timing estimate of the placement:
+/// delay per tile of distance, a LUT per level, a combinational
+/// multiplier's product as an arc, a RAM's or registered multiplier's
+/// inputs as endpoints and their outputs as path starts (the same model
+/// as `helion_sta::graph`, see [`helion_pack::HardTiming`]). A connection
+/// on the slowest path gets the full weight, one with slack to spare gets
+/// none. `pos` covers every node; `has_ff` the clusters (`0..n`).
+fn criticality_weights(conns: &[TConn], pos: &[(i32, i32)], has_ff: &[bool], n: usize) -> Vec<f32> {
     let tm = helion_backend::TimingModel::hl10t();
-    let (lut, hop, pin, ckq, setup) = (tm.lut_ps as f32, tm.hop_ps as f32, tm.pin_ps as f32, tm.ff_ckq_ps as f32, tm.setup_ps as f32);
+    let (lut, hop, ckq, setup, mac) = (tm.lut_ps as f32, tm.hop_ps as f32, tm.ff_ckq_ps as f32, tm.setup_ps as f32, tm.mac_ps as f32);
+    let nodes = pos.len();
     let delay = |k: usize| -> f32 {
-        let (s, d, _) = conns[k];
-        let (a, b) = (pos[s as usize], pos[d as usize]);
-        ((a.0 - b.0).abs() + (a.1 - b.1).abs()) as f32 * hop + pin
+        let c = conns[k];
+        let (a, b) = (pos[c.s as usize], pos[c.d as usize]);
+        ((a.0 - b.0).abs() + ((a.1 + c.sdy) - (b.1 + c.ddy)).abs()) as f32 * hop + c.pin
     };
-    // Fan-in connections of each cluster, and a topological order over
-    // LUT-to-LUT connections (flop outputs start paths).
-    let mut fanin: Vec<Vec<u32>> = vec![Vec::new(); n];
-    for (k, &(_, d, _)) in conns.iter().enumerate() {
-        fanin[d as usize].push(k as u32);
+    // Delay of a node from its inputs to its output: a LUT, or a
+    // combinational multiplier's product.
+    let through = |i: usize| if i < n { lut } else { mac };
+    // Fan-in connections of each node (block inputs that end a path are
+    // not fan-in), and a topological order over the connections whose
+    // source is a node (registers start paths).
+    let mut fanin: Vec<Vec<u32>> = vec![Vec::new(); nodes];
+    for (k, c) in conns.iter().enumerate() {
+        if c.end.is_none() {
+            fanin[c.d as usize].push(k as u32);
+        }
     }
-    let mut order: Vec<u32> = Vec::with_capacity(n);
-    let mut state = vec![0u8; n];
-    for root in 0..n {
+    let mut order: Vec<u32> = Vec::with_capacity(nodes);
+    let mut state = vec![0u8; nodes];
+    for root in 0..nodes {
         if state[root] != 0 {
             continue;
         }
@@ -277,9 +308,9 @@ fn criticality_weights(conns: &[(u32, u32, bool)], pos: &[(i32, i32)], has_ff: &
             state[iu] = 1;
             let mut ready = true;
             for &k in &fanin[iu] {
-                let (s, _, from_q) = conns[k as usize];
-                if !from_q && state[s as usize] == 0 {
-                    stack.push(s);
+                let c = conns[k as usize];
+                if c.start.is_none() && state[c.s as usize] == 0 {
+                    stack.push(c.s);
                     ready = false;
                 }
             }
@@ -290,34 +321,46 @@ fn criticality_weights(conns: &[(u32, u32, bool)], pos: &[(i32, i32)], has_ff: &
             }
         }
     }
-    // Arrival at each LUT output.
-    let mut arr = vec![0.0f32; n];
+    // Arrival at each node's output.
+    let mut arr = vec![0.0f32; nodes];
+    let src_at = |c: &TConn, arr: &[f32]| c.start.unwrap_or(arr[c.s as usize]);
     for &i in &order {
         let iu = i as usize;
-        let mut a = ckq;
+        let mut a = if iu < n { ckq } else { 0.0 };
         for &k in &fanin[iu] {
-            let (s, _, from_q) = conns[k as usize];
-            let src = if from_q { ckq } else { arr[s as usize] };
-            a = a.max(src + delay(k as usize));
+            a = a.max(src_at(&conns[k as usize], &arr) + delay(k as usize));
         }
-        arr[iu] = a + lut;
+        arr[iu] = a + through(iu);
     }
-    let worst = (0..n).map(|i| arr[i] + if has_ff[i] { setup } else { 0.0 }).fold(1.0f32, f32::max);
-    // Required time at each LUT output: the slowest path has no slack.
-    let mut req = vec![worst; n];
+    let mut worst = (0..n).map(|i| arr[i] + if has_ff[i] { setup } else { 0.0 }).fold(1.0f32, f32::max);
+    for (k, c) in conns.iter().enumerate() {
+        if let Some(e) = c.end {
+            worst = worst.max(src_at(c, &arr) + delay(k) + e + setup);
+        }
+    }
+    // Required time at each node's output: the slowest path has no slack.
+    let mut req = vec![worst; nodes];
     for i in 0..n {
         if has_ff[i] {
             req[i] = worst - setup;
         }
     }
+    for (k, c) in conns.iter().enumerate() {
+        if let (Some(e), None) = (c.end, c.start) {
+            let r = worst - setup - e - delay(k);
+            if r < req[c.s as usize] {
+                req[c.s as usize] = r;
+            }
+        }
+    }
     for &i in order.iter().rev() {
         let iu = i as usize;
         for &k in &fanin[iu] {
-            let (s, _, from_q) = conns[k as usize];
-            if !from_q {
-                let r = req[iu] - lut - delay(k as usize);
-                if r < req[s as usize] {
-                    req[s as usize] = r;
+            let c = conns[k as usize];
+            if c.start.is_none() {
+                let r = req[iu] - through(iu) - delay(k as usize);
+                if r < req[c.s as usize] {
+                    req[c.s as usize] = r;
                 }
             }
         }
@@ -325,14 +368,72 @@ fn criticality_weights(conns: &[(u32, u32, bool)], pos: &[(i32, i32)], has_ff: &
     conns
         .iter()
         .enumerate()
-        .map(|(k, &(s, d, from_q))| {
-            let src = if from_q { ckq } else { arr[s as usize] };
-            let slack = req[d as usize] - lut - delay(k) - src;
+        .map(|(k, c)| {
+            let src = src_at(c, &arr);
+            let slack = match c.end {
+                Some(e) => worst - setup - e - delay(k) - src,
+                None => req[c.d as usize] - through(c.d as usize) - delay(k) - src,
+            };
             let crit = (1.0 - slack / worst).clamp(0.0, 1.0);
             // Steep: only connections near the slowest path are pulled.
             4.0 * crit.powi(8)
         })
         .collect()
+}
+
+/// The connections the timing passes weigh (see [`TConn`]): LUT inputs
+/// from clusters and from hard blocks, and hard-block inputs from
+/// clusters and other blocks. Input pads are left out (they do not move).
+fn timing_conns(placed: &Placed, n: usize) -> Vec<TConn> {
+    use helion_pack::{HardTiming, NetSrc};
+    let tm = helion_backend::TimingModel::hl10t();
+    let (ckq, pin) = (tm.ff_ckq_ps as f32, tm.pin_ps as f32);
+    let conn = &placed.packed.conn;
+    let nh = conn.hard.len();
+    let placed_blk = |b: usize| b < nh && placed.hard_block_site(b as u32).is_some();
+    // (node, start arrival, rows above the node's position) of a source.
+    let source = |src: NetSrc| -> Option<(u32, Option<f32>, i32)> {
+        match src {
+            NetSrc::BleQ(j) if (j as usize) < n => Some((j, Some(ckq), 0)),
+            NetSrc::BleO(j) if (j as usize) < n => Some((j, None, 0)),
+            NetSrc::Hard { blk, bit } if placed_blk(blk as usize) => {
+                let start = match placed.packed.hard_timing(blk as usize) {
+                    HardTiming::Ram => Some(tm.bram_ckq_ps as f32),
+                    HardTiming::Reg => Some(ckq),
+                    HardTiming::Comb => None,
+                };
+                let dy = helion_device::hard::output(conn.hard[blk as usize].kind, bit as u32).map(|o| o.0).unwrap_or(0);
+                Some((n as u32 + blk, start, dy as i32))
+            }
+            _ => None,
+        }
+    };
+    let mut out: Vec<TConn> = Vec::new();
+    for p in &conn.pins {
+        if (p.lutff as usize) >= n {
+            continue;
+        }
+        if let Some((s, start, sdy)) = source(p.src) {
+            out.push(TConn { s, d: p.lutff, start, sdy, ddy: 0, pin, end: None });
+        }
+    }
+    for h in &conn.hard_pins {
+        let b = h.blk as usize;
+        if !placed_blk(b) {
+            continue;
+        }
+        let Some((s, start, sdy)) = source(h.src) else { continue };
+        let product = conn.hard[b].kind == helion_pack::HardKind::Mac && helion_pack::mac_through_product(h.dy, h.m);
+        let end = match placed.packed.hard_timing(b) {
+            // CE and RST of a combinational multiplier time nothing.
+            HardTiming::Comb if !product => continue,
+            HardTiming::Comb => None,
+            HardTiming::Reg if product => Some(tm.mac_ps as f32),
+            HardTiming::Reg | HardTiming::Ram => Some(0.0),
+        };
+        out.push(TConn { s, d: (n + b) as u32, start, sdy, ddy: h.dy as i32, pin: 0.0, end });
+    }
+    out
 }
 
 /// Anneal the placement of `placed` in place. Returns (before, after) HPWL.
@@ -382,29 +483,26 @@ pub fn refine(placed: &mut Placed, dev: &Device) -> (u64, u64) {
     let mut tick = 0u32;
     let moves_per_temp = (n * 12).max(2000);
     let site_xy = |t: u32| (sites[t as usize].x as i32, sites[t as usize].y as i32);
-    // Cluster-to-cluster connections, for the timing passes.
-    let tconns: Vec<(u32, u32, bool)> = placed
-        .packed
-        .conn
-        .pins
-        .iter()
-        .filter_map(|p| match p.src {
-            helion_pack::NetSrc::BleQ(j) if (j as usize) < n && (p.lutff as usize) < n => Some((j, p.lutff, true)),
-            helion_pack::NetSrc::BleO(j) if (j as usize) < n && (p.lutff as usize) < n => Some((j, p.lutff, false)),
-            _ => None,
-        })
-        .collect();
-    let mut conn_of: Vec<Vec<u32>> = vec![Vec::new(); n];
-    for (k, &(s, d, _)) in tconns.iter().enumerate() {
-        conn_of[s as usize].push(k as u32);
-        if s != d {
-            conn_of[d as usize].push(k as u32);
+    // Connections for the timing passes (clusters and hard blocks).
+    let tconns: Vec<TConn> = timing_conns(placed, n);
+    // Positions of every node: the clusters (moved below), then the hard
+    // blocks (fixed).
+    let nh = placed.packed.conn.hard.len();
+    for b in 0..nh {
+        let s = placed.hard_block_site(b as u32).map(|s| (s.x as i32, s.y as i32)).unwrap_or((0, 0));
+        pos.push(s);
+    }
+    let mut conn_of: Vec<Vec<u32>> = vec![Vec::new(); n + nh];
+    for (k, c) in tconns.iter().enumerate() {
+        conn_of[c.s as usize].push(k as u32);
+        if c.s != c.d {
+            conn_of[c.d as usize].push(k as u32);
         }
     }
     let dist = |k: usize, pos: &[(i32, i32)]| -> i32 {
-        let (s, d, _) = tconns[k];
-        let (a, b) = (pos[s as usize], pos[d as usize]);
-        (a.0 - b.0).abs() + (a.1 - b.1).abs()
+        let c = tconns[k];
+        let (a, b) = (pos[c.s as usize], pos[c.d as usize]);
+        (a.0 - b.0).abs() + ((a.1 + c.sdy) - (b.1 + c.ddy)).abs()
     };
     let mut cw: Vec<f32> = vec![0.0; tconns.len()];
     let has_ff: Vec<bool> = placed.packed.lutffs.iter().take(n).map(|l| !l.ff_cell.is_empty()).collect();
@@ -493,7 +591,7 @@ pub fn refine(placed: &mut Placed, dev: &Device) -> (u64, u64) {
                         continue;
                     }
                     for &k in &conn_of[c as usize] {
-                        let (s, d, _) = tconns[k as usize];
+                        let (s, d) = (tconns[k as usize].s, tconns[k as usize].d);
                         // A connection between the two movers is counted once.
                         if mi == 1 && (s == a as u32 || d == a as u32) {
                             continue;
@@ -513,7 +611,8 @@ pub fn refine(placed: &mut Placed, dev: &Device) -> (u64, u64) {
                             }
                         };
                         let (p, q) = (at(s), at(d));
-                        before += w * ((p.0 - q.0).abs() + (p.1 - q.1).abs()) as f64;
+                        let (sdy, ddy) = (tconns[k as usize].sdy, tconns[k as usize].ddy);
+                        before += w * ((p.0 - q.0).abs() + ((p.1 + sdy) - (q.1 + ddy)).abs()) as f64;
                     }
                 }
                 delta += after - before;
