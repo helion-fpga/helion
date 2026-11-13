@@ -289,6 +289,11 @@ fn pack_hard(design: &Design) -> Result<(Vec<PackedMac>, Vec<PackedBram>, Vec<(H
     Ok((macs, brams, hard_cells))
 }
 
+/// Prefix of the `clock_problems` entries that concern a hard block's own
+/// clock (none, or one the fallback to the implicit clock would change).
+/// The other problems are tolerated by bitgen; these are not.
+pub const HARD_BLOCK_CLOCK: &str = "hard block ";
+
 pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
     // Multi-backend cell kinds never reach the HL10T packer: reject loudly
     // instead of silently dropping them (which would miscompile).
@@ -593,7 +598,7 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
                 HardKind::Mac => macs[r.idx as usize].preg,
             };
             if needs && clk.is_none() {
-                conn.clock_problems.push(format!("{} has no clock", resolve(*cell)));
+                conn.clock_problems.push(format!("{HARD_BLOCK_CLOCK}{} has no clock", resolve(*cell)));
             }
             let clk = clk.filter(|_| needs);
             if let Some(n) = clk {
@@ -711,6 +716,19 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
         // consistent, such a design is laid out on the implicit clock
         // alone, as every design was before the fabric had clock lines.
         if !conn.clock_problems.is_empty() {
+            // Flops moved to the implicit clock are tolerated (reported);
+            // a hard block is only kept when its clock already was the
+            // implicit one, else bitgen refuses the design.
+            for ((_, cell), clk) in hard_cells.iter().zip(&hard_clk) {
+                let Some(net) = clk else { continue };
+                let name = resolve(*net);
+                if !conn.clocks.iter().any(|c| c.line == 0 && c.src == ClockSrc::Implicit && c.net == name) {
+                    conn.clock_problems.push(format!(
+                        "{HARD_BLOCK_CLOCK}{} would lose its clock {name}: the design's clocking does not fit, so it is laid out on the implicit clock",
+                        resolve(*cell)
+                    ));
+                }
+            }
             conn.clocks.clear();
             for f in conn.ff_clock.iter_mut().flatten() {
                 *f = (0, false);

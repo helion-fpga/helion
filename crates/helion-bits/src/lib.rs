@@ -192,9 +192,9 @@ fn program_clb_frames(
         if let Some((i, (s, _))) = routed.placed.lutff_sites.iter().enumerate().find(|(_, (s, _))| reserved.contains(&(s.x, s.y))) {
             return Err(format!("bitgen: {} is placed on CLB_X{}Y{}, a tile of a hard block", packed.lutffs[i].lut_cell, s.x, s.y));
         }
-        if !packed.conn.clock_problems.is_empty() {
-            return Err(format!("bitgen: {}", packed.conn.clock_problems[0]));
-        }
+    }
+    if let Some(p) = packed.conn.clock_problems.iter().find(|p| p.starts_with(helion_pack::HARD_BLOCK_CLOCK)) {
+        return Err(format!("bitgen: {p}"));
     }
     for (i, lutff) in packed.lutffs.iter().enumerate() {
         let mut norm;
@@ -3956,6 +3956,43 @@ mod hard_tests {
         d.connect("n9", "io9", "I");
         d.connect("o9", "io9", "PAD");
         d
+    }
+
+    /// A flop without a clock is reported and laid out on the implicit
+    /// clock, as before hard blocks; bitgen goes on when the RAM keeps its
+    /// own clock, and refuses when the fallback would take it away.
+    #[test]
+    fn unclocked_flops_beside_a_ram() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = ram_design();
+        d.add_cell("loose", CellKind::Hff);
+        d.connect("din", "loose", "D");
+        d.connect("lq", "loose", "Q");
+        d.add_port("ol", PortDir::Out);
+        d.add_cell("iol", CellKind::IobOut);
+        d.connect("lq", "iol", "I");
+        d.connect("ol", "iol", "PAD");
+        let build = |d: &Design| {
+            let p = pack(d, &dev).unwrap();
+            assert!(p.conn.clock_problems.iter().any(|c| c.contains("have no clock")), "{:?}", p.conn.clock_problems);
+            bitgen(&dev, &route(&place(&p, &dev).unwrap(), &dev).unwrap())
+        };
+        build(&d).unwrap();
+        // A second RAM on a second clock pad: with two clocks neither is the
+        // implicit one, and the fallback would move both RAMs to it.
+        d.add_port("clk2", PortDir::In);
+        d.add_port("o2", PortDir::Out);
+        d.add_cell("ram2", CellKind::Bram18);
+        d.connect("clk2", "ram2", "CLK");
+        d.connect("din", "ram2", "RADDR0");
+        d.connect("r2", "ram2", "DO0");
+        d.add_cell("io2", CellKind::IobOut);
+        d.connect("r2", "io2", "I");
+        d.connect("o2", "io2", "PAD");
+        let e = build(&d).unwrap_err();
+        assert!(e.contains("ram would lose its clock clk"), "{e}");
+        let p = pack(&d, &dev).unwrap();
+        assert!(p.conn.clock_problems.iter().any(|c| c.contains("ram2 would lose its clock clk2")), "{:?}", p.conn.clock_problems);
     }
 
     #[test]
