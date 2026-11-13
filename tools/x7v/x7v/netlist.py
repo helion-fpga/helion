@@ -4,8 +4,10 @@ Electrical model, all from the Project X-Ray database:
 
 * Nodes: tile wires joined by `tileconn.json` stitching rules.
 * Edges: active pip features (`DST.SRC`), pseudo-pips marked `always`, and
-  pseudo-pips marked `default` (taken only when nothing else drives the
-  node, e.g. an unselected IMUX reads VCC).
+  defaults, taken only when nothing else drives the node: pseudo-pips marked
+  `default` (an unselected IMUX reads VCC) and mux selections encoded with
+  every bit clear (a global buffer input on its fixed IMUX), which the
+  decoder cannot see because they set no bit.
 * Sites: per-site-type behavioural models driven by the site's features.
   `ZINV_*` features mean "inversion disabled"; their absence inverts.
 
@@ -33,6 +35,7 @@ class TT:
     pips_into: dict          # dst -> [(src, bidirectional)]
     pip_pairs: set           # {(src, dst)} including both dirs of bidir pips
     ppips: dict              # "DST.SRC" -> kind
+    zero_pips: set           # "DST.SRC" pips encoded as all bits clear
     site_pin_wire: dict      # wire -> (site_index, pin)
     sites: list              # tile_type sites entries
 
@@ -62,12 +65,23 @@ class Fabric:
             ppips = {}
             for k, v in self.db.ppips(ttype).items():
                 ppips[k.split(".", 1)[1]] = v
+            # A mux selection encoded with every bit clear is in effect
+            # whenever none of the mux's other selections is (it sets no
+            # bit, so the decoder cannot report it). Global buffer inputs
+            # are the routing muxes that have them (BUFGCTRLn_Ix <- IMUX).
+            zero = set()
+            for name, bits in self.db.segbits(ttype).items():
+                feat = name.split(".", 1)[1] if "." in name else name
+                if bits and all(not b.value for b in bits) and feat.count(".") == 1:
+                    d, sw = feat.split(".")
+                    if (sw, d) in pairs:
+                        zero.add(feat)
             spw = {}
             for i, s in enumerate(j.get("sites", [])):
                 for pin, info in s["site_pins"].items():
                     if info and info.get("wire"):
                         spw[info["wire"]] = (i, pin)
-            self._tt[ttype] = TT(set(j.get("wires", {})), pips_into, pairs, ppips, spw, j.get("sites", []))
+            self._tt[ttype] = TT(set(j.get("wires", {})), pips_into, pairs, ppips, zero, spw, j.get("sites", []))
         return self._tt[ttype]
 
     def site_pin_dir(self, site_type: str, pin: str) -> str:
@@ -271,7 +285,7 @@ class Extractor:
                     sources.append(("pip", tile, src))
                 elif kind == "always":
                     sources.append(("always", tile, src))
-                elif kind == "default":
+                elif kind == "default" or feat in tt.zero_pips:
                     defaults.append(("default", tile, src))
         if not sources:
             sources = defaults
@@ -571,8 +585,12 @@ def model_bufg(x: Extractor, s: Site, nl: Netlist):
         return f"(~{v})" if inv else v
     s0 = pinv("S0", zinv="ZINV_S0"); ce0 = pinv("CE0", zinv="ZINV_CE0")
     s1 = pinv("S1", zinv="ZINV_S1"); ce1 = pinv("CE1", zinv="ZINV_CE1")
-    i0 = x.inp(s, "I0", "clock in 0", matters=False)
-    i1 = x.inp(s, "I1", "clock in 1", matters=False)
+    # An input this buffer selects must be driven: an undriven clock leaves
+    # every flop on the buffer stuck.
+    uses0 = "IN_USE" in F and ("ZINV_S0" in F or "ZINV_CE0" in F)
+    uses1 = "IN_USE" in F and ("ZINV_S1" in F or "ZINV_CE1" in F)
+    i0 = x.inp(s, "I0", "clock in 0", matters=uses0)
+    i1 = x.inp(s, "I1", "clock in 1", matters=uses1)
     nl.lines.append(f"wire {n('O')} = (({s0}) & ({ce0})) === 1'b1 ? {i0} : ((({s1}) & ({ce1})) === 1'b1 ? {i1} : 1'b0);")
 
 
