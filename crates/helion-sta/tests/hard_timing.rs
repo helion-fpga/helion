@@ -213,3 +213,47 @@ fn combinational_multiplier_is_an_arc() {
     assert!(g.reg_ps >= p + tm.lut_ps + tm.setup_ps, "{g:?}");
     assert_eq!(g.levels, 1);
 }
+
+/// The reports on a design whose only registers are blocks: a registered
+/// multiplier between pads, and a RAM between pads. They have timing (it
+/// used to be "no timing", WNS 0 and no endpoints, as for an empty
+/// shell), it is the graph's, and so is the endpoint count TNS sums over.
+#[test]
+fn designs_whose_only_registers_are_blocks_have_timing() {
+    let dev = Device::load_part("HL10S-C64-1").unwrap();
+    let mut m = Nl::new();
+    let a = m.inputs("a", 4);
+    let b = m.inputs("b", 4);
+    mul(&mut m, true, &a, &b);
+    for i in 0..4 {
+        m.output(&format!("o{i}"), &format!("p{i}"));
+    }
+    let mut r = Nl::new();
+    let a = r.inputs("a", 10);
+    r.d.add_cell("ram", CellKind::Bram18);
+    r.d.connect("clk", "ram", "CLK");
+    for i in 0..10 {
+        r.d.connect(&a[i], "ram", &format!("RADDR{i}"));
+        r.d.connect(&a[9 - i], "ram", &format!("WADDR{i}"));
+    }
+    r.d.connect(&a[0], "ram", "WE");
+    r.d.connect(&a[1], "ram", "DI0");
+    r.d.connect("do0", "ram", "DO0");
+    r.output("o", "do0");
+    for (what, d) in [("mul", &m.d), ("ram", &r.d)] {
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)));
+        let packed = helion_pack::pack(d, &dev).unwrap();
+        let placed = helion_place::place(&packed, &dev).unwrap();
+        let routed = helion_route::route(&placed, &dev).unwrap();
+        let mut clks = Vec::new();
+        helion_sta::create_clock(&mut clks, "clk", 500, "clk");
+        let g = helion_sta::graph::analyze_hl10t(&routed, 500).unwrap();
+        assert!(g.failing > 0, "{what}: {g:?}");
+        let t = helion_sta::report_timing_routed(d, &routed, &clks).unwrap();
+        assert_eq!(t.endpoints, g.endpoints, "{what}");
+        assert!(t.wns_ps < 0 && t.tns_ps < 0, "{what}: {t:?}");
+        assert!(t.setup_ps >= g.reg_ps.min(g.out_ps), "{what}: {t:?} {g:?}");
+        // Without placement too: the blocks are endpoints.
+        assert!(helion_sta::report_timing(d, &clks).unwrap().endpoints > 0, "{what}");
+    }
+}

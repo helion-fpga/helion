@@ -963,16 +963,28 @@ pub fn report_timing_with_model(
         return Err("no clocks".into());
     }
     let clk = &clocks[0];
+    // Clocked endpoints: flops, and the hard blocks connected to the
+    // fabric that register (a RAM's write and read, a multiplier's P
+    // register). A design whose only registers are blocks has timing too.
+    // (A block with no pin connected is a name-only primitive.)
+    let blocks: HashSet<Spur> = design.cells.iter().filter(|c| matches!(c.kind, CellKind::Bram18 | CellKind::Mac27)).map(|c| c.name).collect();
+    let wired: HashSet<Spur> = if blocks.is_empty() {
+        HashSet::new()
+    } else {
+        design.nets.iter().flat_map(|n| n.endpoints.iter().map(|e| e.cell)).filter(|c| blocks.contains(c)).collect()
+    };
     let ffs = design
         .cells
         .iter()
-        .filter(|c| matches!(c.kind, CellKind::Hff))
+        .filter(|c| match c.kind {
+            CellKind::Hff => true,
+            CellKind::Bram18 => wired.contains(&c.name),
+            CellKind::Mac27 => wired.contains(&c.name) && c.attrs.get("PREG") == Some("1"),
+            _ => false,
+        })
         .count();
     let has_logic = design.cells.iter().any(|c| {
-        matches!(
-            c.kind,
-            CellKind::Hff | CellKind::Lut6 { .. } | CellKind::IobOut
-        )
+        matches!(c.kind, CellKind::Hff | CellKind::Lut6 { .. } | CellKind::IobOut) || wired.contains(&c.name)
     });
     if ffs == 0 || !has_logic {
         // Empty / no_body shells must not close a fake WNS.
@@ -1102,6 +1114,9 @@ pub fn report_timing_routed_with_model(
         r.setup_ps = g.reg_ps.max(g.out_ps);
         r.wns_ps = clocks[0].period_ps as i64 - r.setup_ps;
         r.tns_ps = g.tns_ps;
+        // The endpoints TNS sums over: flop inputs, output pads and the
+        // blocks' inputs.
+        r.endpoints = g.endpoints;
     }
     Ok(r)
 }
@@ -6321,7 +6336,9 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         let (_, _, b) = close_guided(&d, 0.75, &xdc);
         assert_eq!(a.wns_ps, 9640, "empty-XDC counter gold WNS_PS");
         assert_eq!(b.wns_ps, 9640, "gold must hold on a second close");
-        assert_eq!(a.endpoints, 4);
+        // Four flops and the output pad (the graph's endpoints, which TNS
+        // sums over).
+        assert_eq!(a.endpoints, 4 + 1);
     }
 
     #[test]
@@ -6341,8 +6358,9 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
             r_td.iob_src[0].hops, r_wl.iob_src[0].hops,
             "TD vs WL must change routed hops"
         );
-        assert_eq!(t_td.endpoints, 8);
-        assert_eq!(t_wl.endpoints, 8);
+        // Eight flops and the output pad.
+        assert_eq!(t_td.endpoints, 8 + 1);
+        assert_eq!(t_wl.endpoints, 8 + 1);
         assert_ne!(t_td.wns_ps, 0);
         assert_ne!(t_wl.wns_ps, 0);
     }

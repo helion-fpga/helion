@@ -662,7 +662,8 @@ fn cmd_timing(args: &[String]) {
             std::process::exit(1);
         });
     }
-    if c.routed.placed.packed.lutffs.is_empty() || timing.endpoints == 0 {
+    let packed = &c.routed.placed.packed;
+    if (packed.lutffs.is_empty() && packed.macs.is_empty() && packed.brams.is_empty()) || timing.endpoints == 0 {
         println!(
             "report_timing {} no_body cells={} (no timing: empty shell or no logic; not a closed WNS)",
             resolve(c.design.name),
