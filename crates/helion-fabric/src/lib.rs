@@ -6,7 +6,7 @@ pub use helion_bits::{
     diff_partial_bitstream, encode_imux_hop, encode_pbits, patch_imux_sel, patch_lut_init,
     patch_lut_init_cell, readback_imux_sel, reroute_probe_eco,
 };
-use helion_device::{clocks, tracks, Device, Far};
+use helion_device::{clocks, hard, tracks, Device, Far};
 use helion_route::Routed;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -237,6 +237,30 @@ enum ClkSrc {
     Ble(u32, u32, u32),
 }
 
+/// A block RAM or multiplier connected to the fabric (see
+/// `helion_device::hard`), read from its `Far::BRAM` / `Far::DSP` word.
+#[derive(Clone, Debug)]
+struct HardBlk {
+    kind: hard::Kind,
+    major: u16,
+    x: u32,
+    y: u32,
+    /// `PIN_EN` of the base tile and of the tile above.
+    pin_en: [u64; 2],
+    signed: bool,
+    preg: bool,
+    use_c: bool,
+    /// Output register: a RAM's `DO`, a multiplier's `P` register.
+    out: u32,
+}
+
+/// Source of one enabled hard-block input, traced once per settle.
+#[derive(Clone, Copy, Debug)]
+enum HardIn {
+    Wire(WireSrc),
+    Direct(u8),
+}
+
 /// Driver of an interconnect wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WireSrc {
@@ -282,6 +306,14 @@ pub struct Fabric {
     bram_data: BTreeMap<u16, Vec<u64>>,
     /// Optional ILA trigger FSM (armed by deep capture path).
     pub ila_fsm: IlaTriggerFsm,
+    /// Hard blocks connected to the fabric.
+    hard: Vec<HardBlk>,
+    /// Tile -> (block, row within the block).
+    hard_tiles: BTreeMap<(u32, u32), (usize, u32)>,
+    /// Clock line of each block (its base tile's `CLKSEL`).
+    hard_line: Vec<u8>,
+    /// Contents of the RAMs connected to the fabric, by `Far::BRAM` major.
+    ram: BTreeMap<u16, Vec<u16>>,
 }
 
 impl Fabric {
@@ -323,7 +355,197 @@ impl Fabric {
             cfg_steps: 0,
             bram_data: BTreeMap::new(),
             ila_fsm: IlaTriggerFsm::default(),
+            hard: Vec::new(),
+            hard_tiles: BTreeMap::new(),
+            hard_line: Vec::new(),
+            ram: BTreeMap::new(),
         }
+    }
+
+    /// Read the hard blocks out of the frames. RAMs whose major is in
+    /// `reload` (all of them for `None`) start again from their `INIT`.
+    fn load_hard(&mut self, reload: Option<&BTreeSet<u16>>) {
+        let mut blocks = Vec::new();
+        for (&(block, major, minor), &w) in &self.frames {
+            if minor != 0 || (block != Far::BRAM && block != Far::DSP) || (w >> hard::USED) & 1 == 0 || (w >> hard::FABRIC) & 1 == 0 {
+                continue;
+            }
+            let kind = if block == Far::BRAM { hard::Kind::Bram } else { hard::Kind::Mac };
+            let bit = |b: u32| (w >> b) & 1 == 1;
+            let pin_en = match kind {
+                hard::Kind::Bram => [(w >> hard::PIN_EN_RAM) as u64, 0],
+                hard::Kind::Mac => [(w >> hard::PIN_EN_MAC) as u64, self.frame_word(Far::DSP, major, 1) as u64],
+            };
+            blocks.push(HardBlk {
+                kind,
+                major,
+                x: ((w >> hard::X_SHIFT) & 0xff) as u32,
+                y: ((w >> hard::Y_SHIFT) & 0xff) as u32,
+                pin_en,
+                signed: kind == hard::Kind::Mac && bit(hard::SIGNED),
+                preg: kind == hard::Kind::Mac && bit(hard::PREG),
+                use_c: kind == hard::Kind::Mac && bit(hard::USE_C),
+                out: 0,
+            });
+        }
+        // A block keeps its output register across a partial reload.
+        for b in blocks.iter_mut() {
+            if let Some(old) = self.hard.iter().find(|o| o.kind == b.kind && o.major == b.major) {
+                if reload.is_some() {
+                    b.out = old.out;
+                }
+            }
+        }
+        self.hard = blocks;
+        self.hard_tiles.clear();
+        for (i, b) in self.hard.iter().enumerate() {
+            for dy in 0..b.kind.tiles() {
+                self.hard_tiles.insert((b.x, b.y + dy), (i, dy));
+            }
+        }
+        let rams: Vec<u16> = self.hard.iter().filter(|b| b.kind == hard::Kind::Bram).map(|b| b.major).collect();
+        if reload.is_none() {
+            self.ram.clear();
+        }
+        for major in rams {
+            if reload.is_none_or(|r| r.contains(&major)) || !self.ram.contains_key(&major) {
+                let words = (0..hard::RAM_WORDS as u32)
+                    .map(|a| {
+                        let (minor, bit) = hard::init_loc(a);
+                        (self.frame_word(Far::BRAM, major, minor) >> bit) as u16
+                    })
+                    .collect();
+                self.ram.insert(major, words);
+            }
+        }
+        for i in 0..self.hard.len() {
+            self.put_hard_out(i);
+        }
+    }
+
+    /// CLB tiles with configured logic, without the hard blocks' tiles.
+    fn compute_used(&self) -> Vec<(u32, u32)> {
+        self.clbs
+            .keys()
+            .copied()
+            .filter(|&(x, y)| {
+                if self.hard_tiles.contains_key(&(x, y)) {
+                    return false;
+                }
+                let Some(major) = self.clb_major(x, y) else {
+                    return false;
+                };
+                (0..self.clb_minors).any(|minor| self.frames.get(&(Far::CLB_IO_CLK, major, minor as u8)).copied().unwrap_or(0) != 0)
+            })
+            .collect()
+    }
+
+    /// Show block `i`'s output on its tiles: bit `k` of a tile in `q[k]`
+    /// (switch-box selects 1..8) or `lut_o[k - 8]` (selects 9..16).
+    fn put_hard_out(&mut self, i: usize) {
+        let (kind, x, y, out) = {
+            let b = &self.hard[i];
+            (b.kind, b.x, b.y, b.out)
+        };
+        for bit in 0..hard::n_outputs(kind) {
+            let Some((dy, sel)) = hard::output(kind, bit) else { continue };
+            let k = (sel - 1) as usize;
+            if let Some(c) = self.clbs.get_mut(&(x, y + dy)) {
+                let v = (out >> bit) & 1 == 1;
+                if k < 8 {
+                    c.q[k] = v;
+                } else {
+                    c.lut_o[k - 8] = v;
+                }
+            }
+        }
+    }
+
+    /// Value of IMUX `m` of the tile at `(x, y)`, as a LUT input sees it.
+    fn imux_src(&self, x: u32, y: u32, m: u32) -> HardIn {
+        let sel = self.imux_sel(x, y, m);
+        if self.clb_abs_bit(x, y, tracks::ABS_IMUXT + m) {
+            let s = sel as u32 & 127;
+            HardIn::Wire(self.arriving_src(x, y, s / tracks::TRACKS, s % tracks::TRACKS))
+        } else {
+            HardIn::Direct(sel)
+        }
+    }
+
+    /// Sources of the enabled inputs of every hard block: (row, IMUX, source).
+    fn hard_traced(&self) -> Vec<Vec<(u32, u32, HardIn)>> {
+        self.hard
+            .iter()
+            .map(|b| {
+                let mut v = Vec::new();
+                for dy in 0..b.kind.tiles() {
+                    for m in 0..64u32 {
+                        if (b.pin_en[dy as usize] >> m) & 1 == 1 {
+                            v.push((dy, m, self.imux_src(b.x, b.y + dy, m)));
+                        }
+                    }
+                }
+                v
+            })
+            .collect()
+    }
+
+    /// Input words of block `i` (one per tile): a disabled input reads 0,
+    /// a disabled enable reads 1.
+    fn hard_inputs(&self, i: usize, traced: &[(u32, u32, HardIn)]) -> [u64; 2] {
+        let b = &self.hard[i];
+        let mut w = [0u64; 2];
+        for &(dy, m, src) in traced {
+            let v = match src {
+                HardIn::Wire(s) => self.src_val(s),
+                HardIn::Direct(sel) => self.decode_imux(b.x, b.y + dy, sel),
+            };
+            if v {
+                w[dy as usize] |= 1 << m;
+            }
+        }
+        let en = hard::enable_m(b.kind);
+        if (b.pin_en[0] >> en) & 1 == 0 {
+            w[0] |= 1 << en;
+        }
+        w
+    }
+
+    /// A multiplier's result for its inputs.
+    fn mac_value(b: &HardBlk, w: [u64; 2]) -> u32 {
+        let (a, bb) = ((w[0] & 0xffff) as u32, ((w[0] >> 16) & 0xffff) as u32);
+        let prod = if b.signed { (a as u16 as i16 as i32).wrapping_mul(bb as u16 as i16 as i32) as u32 } else { a.wrapping_mul(bb) };
+        let c = if b.use_c { w[1] as u32 } else { 0 };
+        prod.wrapping_add(c)
+    }
+
+    /// Combinational multipliers follow their inputs. Returns whether an
+    /// output changed.
+    fn eval_hard_comb(&mut self, traced: &[Vec<(u32, u32, HardIn)>]) -> bool {
+        let mut changed = false;
+        for i in 0..self.hard.len() {
+            if self.hard[i].kind != hard::Kind::Mac || self.hard[i].preg {
+                continue;
+            }
+            let v = Self::mac_value(&self.hard[i], self.hard_inputs(i, &traced[i]));
+            if v != self.hard[i].out {
+                self.hard[i].out = v;
+                changed = true;
+            }
+            self.put_hard_out(i);
+        }
+        changed
+    }
+
+    /// 16-bit word `addr` of the fabric RAM at `Far::BRAM` major `major`.
+    pub fn ram_word(&self, major: u16, addr: usize) -> Option<u16> {
+        self.ram.get(&major).and_then(|m| m.get(addr)).copied()
+    }
+
+    /// Output register of the hard block at site `(x, y)` (a RAM's `DO`,
+    /// a multiplier's `P`).
+    pub fn hard_out(&self, x: u32, y: u32) -> Option<u32> {
+        self.hard.iter().find(|b| (b.x, b.y) == (x, y)).map(|b| b.out)
     }
 
     pub fn program(&mut self, bits: &Bitstream) -> Result<(), String> {
@@ -339,23 +561,9 @@ impl Fabric {
         self.bram_data.clear();
         self.ila_fsm = IlaTriggerFsm::default();
         self.iob_src.clear();
-        self.used = self
-            .clbs
-            .keys()
-            .copied()
-            .filter(|&(x, y)| {
-                let Some(major) = self.clb_major(x, y) else {
-                    return false;
-                };
-                (0..self.clb_minors).any(|minor| {
-                    self.frames
-                        .get(&(Far::CLB_IO_CLK, major, minor as u8))
-                        .copied()
-                        .unwrap_or(0)
-                        != 0
-                })
-            })
-            .collect();
+        self.hard.clear();
+        self.load_hard(None);
+        self.used = self.compute_used();
         for ((block, major, minor), word) in &self.frames {
             if *block == Far::IOB && (*major as u32) < self.interior_cols && *minor == 0 && (word & 1) == 1 && (word >> tracks::IOB_TRACK_OUT) & 1 == 0 && (word >> tracks::IOB_INPUT) & 1 == 0 {
                 let ble = ((*word >> 1) & 7) as u8;
@@ -369,7 +577,7 @@ impl Fabric {
             }
         }
         // FF INIT from config
-        let keys: Vec<(u32, u32)> = self.clbs.keys().copied().collect();
+        let keys: Vec<(u32, u32)> = self.clbs.keys().copied().filter(|t| !self.hard_tiles.contains_key(t)).collect();
         for (x, y) in keys {
             for ble in 0..self.n_ble {
                 let init = self.clb_feature_bit(x, y, &format!("BLE{ble}.FF.INIT"));
@@ -797,15 +1005,27 @@ impl Fabric {
     }
 
     fn eval_comb(&mut self) {
-        let coords = self.used.clone();
+        // Tiles that only pass wires through have all-zero LUTs, whose
+        // outputs stay 0: only tiles with a table (or an output still set)
+        // need evaluating.
+        let coords: Vec<(u32, u32)> = self
+            .used
+            .iter()
+            .copied()
+            .filter(|&(x, y)| self.clbs[&(x, y)].lut_o.iter().any(|v| *v) || (0..self.n_ble).any(|b| self.lut_init(x, y, b) != 0))
+            .collect();
         // Passes until nothing changes: LUT outputs feed other LUTs, in
         // the same tile (sel 24+k) and across tiles (wires). The bound only
         // stops a combinational loop.
         let traced = self.traced_inputs(&coords);
+        let hard_comb = self.hard.iter().any(|b| b.kind == hard::Kind::Mac && !b.preg);
+        let hard_traced = if hard_comb { self.hard_traced() } else { Vec::new() };
         for pass in 0..4096 {
             let before: Vec<[bool; 8]> = if pass >= 8 { coords.iter().map(|c| self.clbs[c].lut_o).collect() } else { Vec::new() };
             self.eval_comb_pass(&coords, &traced);
-            if pass >= 8 && coords.iter().zip(&before).all(|(c, b)| self.clbs[c].lut_o == *b) {
+            // Combinational multipliers settle with the LUTs.
+            let hard_moved = hard_comb && self.eval_hard_comb(&hard_traced);
+            if pass >= 8 && !hard_moved && coords.iter().zip(&before).all(|(c, b)| self.clbs[c].lut_o == *b) {
                 break;
             }
         }
@@ -899,8 +1119,54 @@ impl Fabric {
                 }
             }
         }
+        // Hard blocks capture on the rising edge of their line, from the
+        // same settled values: (block, new output, RAM write).
+        let mut hard_next: Vec<(usize, u32, Option<(u16, usize, u16)>)> = Vec::new();
+        if !self.hard.is_empty() {
+            let traced = self.hard_traced();
+            for (i, b) in self.hard.iter().enumerate() {
+                if b.kind == hard::Kind::Mac && !b.preg {
+                    continue;
+                }
+                let line = self.hard_line.get(i).copied().unwrap_or(0) as usize;
+                if edges[line] != Some(true) {
+                    continue;
+                }
+                let w = self.hard_inputs(i, &traced[i]);
+                match b.kind {
+                    hard::Kind::Bram => {
+                        let bits = |lo: u32, n: u32| ((w[0] >> lo) & ((1 << n) - 1)) as usize;
+                        let (di, waddr, raddr) = (bits(0, 16) as u16, bits(16, 10), bits(32, 10));
+                        let (we, re) = ((w[0] >> 42) & 1 == 1, (w[0] >> 43) & 1 == 1);
+                        // Read first: the word as it was before this edge.
+                        let out = if re { self.ram.get(&b.major).and_then(|m| m.get(raddr)).copied().unwrap_or(0) as u32 } else { b.out };
+                        hard_next.push((i, out, we.then_some((b.major, waddr, di))));
+                    }
+                    hard::Kind::Mac => {
+                        let (ce, rst) = ((w[0] >> 32) & 1 == 1, (w[0] >> 33) & 1 == 1);
+                        let out = if rst {
+                            0
+                        } else if ce {
+                            Self::mac_value(b, w)
+                        } else {
+                            b.out
+                        };
+                        hard_next.push((i, out, None));
+                    }
+                }
+            }
+        }
         for (xy, ble, d) in captured {
             self.clbs.get_mut(&xy).unwrap().q[ble] = d;
+        }
+        for (i, out, write) in hard_next {
+            self.hard[i].out = out;
+            self.put_hard_out(i);
+            if let Some((major, addr, v)) = write {
+                if let Some(m) = self.ram.get_mut(&major) {
+                    m[addr] = v;
+                }
+            }
         }
     }
 
@@ -987,6 +1253,11 @@ impl Fabric {
         self.clb_line.clear();
         self.clb_rst.clear();
         self.implicit_falling = false;
+        self.hard_line = self
+            .hard
+            .iter()
+            .map(|b| (0..clocks::LINE_BITS).fold(0u8, |a, k| a | (self.clb_abs_bit(b.x, b.y, clocks::ABS_CLKSEL + k) as u8) << k))
+            .collect();
         let line_mask = (1u32 << clocks::LINE_BITS) - 1;
         for (px, py) in self.pad_sites() {
             let w = self.iob_word(px, py);
@@ -1083,6 +1354,10 @@ impl Fabric {
 
     /// Registered BLE → FF Q; comb-only BLE (FF.USED=0) → LUT O (same rule as IOB pads).
     pub fn ble_out(&self, x: u32, y: u32, ble: u32) -> bool {
+        // A hard block's tile: switch-box selects 1..8 carry its outputs.
+        if !self.hard_tiles.is_empty() && self.hard_tiles.contains_key(&(x, y)) {
+            return self.ble_q(x, y, ble);
+        }
         if self.clb_feature_bit(x, y, &format!("BLE{ble}.FF.USED")) {
             self.ble_q(x, y, ble)
         } else {
@@ -1128,11 +1403,16 @@ impl Fabric {
 
     /// Runtime write into BRAM major `idx` (fabric capture RAM / sample buffer).
     pub fn bram_write_word(&mut self, idx: u16, addr: usize, val: u64) {
+        // Words below `addr` not written before keep their INIT value.
+        let have = self.bram_data.get(&idx).map_or(0, |b| b.len());
+        let fill: Vec<u64> = (have..addr).map(|a| self.bram_init_word(idx, a)).collect();
         let bank = self.bram_data.entry(idx).or_default();
+        bank.extend(fill);
         if bank.len() <= addr {
-            bank.resize(addr + 1, 0);
+            bank.push(val);
+        } else {
+            bank[addr] = val;
         }
-        bank[addr] = val;
     }
 
     /// Runtime read: prefers `bram_write_word` data, else programmed INIT.
@@ -1156,23 +1436,9 @@ impl Fabric {
         for (k, w) in &bits.frames {
             self.frames.insert(*k, *w);
         }
-        self.used = self
-            .clbs
-            .keys()
-            .copied()
-            .filter(|&(x, y)| {
-                let Some(major) = self.clb_major(x, y) else {
-                    return false;
-                };
-                (0..self.clb_minors).any(|minor| {
-                    self.frames
-                        .get(&(Far::CLB_IO_CLK, major, minor as u8))
-                        .copied()
-                        .unwrap_or(0)
-                        != 0
-                })
-            })
-            .collect();
+        let reload: BTreeSet<u16> = bits.frames.keys().filter(|k| k.0 == Far::BRAM).map(|k| k.1).collect();
+        self.load_hard(Some(&reload));
+        self.used = self.compute_used();
         self.refresh_clocking();
         Ok(())
     }
@@ -1234,23 +1500,9 @@ impl Fabric {
                 }
             }
         }
-        self.used = self
-            .clbs
-            .keys()
-            .copied()
-            .filter(|&(x, y)| {
-                let Some(major) = self.clb_major(x, y) else {
-                    return false;
-                };
-                (0..self.clb_minors).any(|minor| {
-                    self.frames
-                        .get(&(Far::CLB_IO_CLK, major, minor as u8))
-                        .copied()
-                        .unwrap_or(0)
-                        != 0
-                })
-            })
-            .collect();
+        let reload: BTreeSet<u16> = pbits.frames.keys().filter(|k| k.0 == Far::BRAM).map(|k| k.1).collect();
+        self.load_hard(Some(&reload));
+        self.used = self.compute_used();
 
         if pbits.reset_after_reconfig {
             let clb_keys: Vec<(u32, u32)> = self.clbs.keys().copied().collect();
@@ -2213,6 +2465,24 @@ mod tests {
             0,
             "unwritten addr stays init/zero"
         );
+    }
+
+    /// A write past the words written so far leaves the words in between
+    /// at their INIT value (they read 0 before).
+    #[test]
+    fn bram_write_keeps_init_below_it() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut bits = Bitstream::empty(&dev);
+        bits.frames.insert((Far::BRAM, 0, 1), 0x11);
+        bits.frames.insert((Far::BRAM, 0, 2), 0x22);
+        bits.frames.insert((Far::BRAM, 0, 5), 0x55);
+        let mut fab = Fabric::new(&dev);
+        fab.program(&bits).unwrap();
+        fab.bram_write_word(0, 2, 7);
+        assert_eq!((fab.bram_read_word(0, 0), fab.bram_read_word(0, 1), fab.bram_read_word(0, 2)), (0x11, 0x22, 7));
+        assert_eq!(fab.bram_read_word(0, 4), 0x55);
+        fab.bram_write_word(0, 6, 9);
+        assert_eq!((fab.bram_read_word(0, 4), fab.bram_read_word(0, 5), fab.bram_read_word(0, 6)), (0x55, 0, 9));
     }
 
     #[test]

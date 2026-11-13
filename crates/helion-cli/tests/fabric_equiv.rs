@@ -14,14 +14,44 @@ use helion_route::route;
 use std::collections::HashMap;
 
 /// Reference simulation of the mapped netlist: LUTs, flops with their
-/// clock nets and edges, output pads.
+/// clock nets and edges, block RAMs and multipliers, output pads.
 struct NetSim {
     luts: Vec<(u64, [Option<Spur>; 6], Spur)>,
     /// (D, Q, clock net, falling edge, asynchronous reset: net and level)
     ffs: Vec<(Spur, Spur, Option<Spur>, bool, Option<(Spur, bool)>)>,
+    rams: Vec<Ram>,
+    muls: Vec<Mul>,
     val: HashMap<Spur, bool>,
     /// Clock net values when last looked at.
     prev: HashMap<Spur, bool>,
+}
+
+/// A `Bram18` as `helion_ir::CellKind::Bram18` defines it: 1024 x 16,
+/// read-first, read latency 1, rising edge of CLK.
+struct Ram {
+    clk: Option<Spur>,
+    di: Vec<Option<Spur>>,
+    waddr: Vec<Option<Spur>>,
+    raddr: Vec<Option<Spur>>,
+    we: Option<Spur>,
+    re: Option<Spur>,
+    dout: Vec<Option<Spur>>,
+    mem: Vec<u16>,
+    q: u16,
+}
+
+/// A `Mac27`: P = A*B (+C), optionally registered.
+struct Mul {
+    a: Vec<Option<Spur>>,
+    b: Vec<Option<Spur>>,
+    c: Vec<Option<Spur>>,
+    ce: Option<Spur>,
+    rst: Option<Spur>,
+    clk: Option<Spur>,
+    p: Vec<Option<Spur>>,
+    signed: bool,
+    preg: bool,
+    reg: u32,
 }
 
 impl NetSim {
@@ -29,6 +59,8 @@ impl NetSim {
         let pins = d.pin_index();
         let mut luts = Vec::new();
         let mut ffs = Vec::new();
+        let mut rams = Vec::new();
+        let mut muls = Vec::new();
         for c in &d.cells {
             let name = resolve(c.name);
             match c.kind {
@@ -47,10 +79,67 @@ impl NetSim {
                         ffs.push((dn, q, pins.net_on(name, "CLK"), c.attrs.get("CLK_INV") == Some("1"), arst));
                     }
                 }
+                CellKind::Bram18 => {
+                    let bus = |p: &str, n: usize| -> Vec<Option<Spur>> { (0..n).map(|i| pins.net_on(name, &format!("{p}{i}"))).collect() };
+                    let mut mem = vec![0u16; 1024];
+                    let init = c.attrs.get("INIT").unwrap_or("");
+                    for (w, t) in init.split(',').map(str::trim).filter(|t| !t.is_empty()).enumerate() {
+                        let v = u64::from_str_radix(t.trim_start_matches("0x"), 16).expect("INIT word");
+                        for k in 0..4 {
+                            mem[4 * w + k] = (v >> (16 * k)) as u16;
+                        }
+                    }
+                    rams.push(Ram {
+                        clk: pins.net_on(name, "CLK"),
+                        di: bus("DI", 16),
+                        waddr: bus("WADDR", 10),
+                        raddr: bus("RADDR", 10),
+                        we: pins.net_on(name, "WE"),
+                        re: pins.net_on(name, "RE"),
+                        dout: bus("DO", 16),
+                        mem,
+                        q: 0,
+                    });
+                }
+                CellKind::Mac27 => {
+                    let bus = |p: &str, n: usize| -> Vec<Option<Spur>> { (0..n).map(|i| pins.net_on(name, &format!("{p}{i}"))).collect() };
+                    muls.push(Mul {
+                        a: bus("A", 16),
+                        b: bus("B", 16),
+                        c: bus("C", 32),
+                        ce: pins.net_on(name, "CE"),
+                        rst: pins.net_on(name, "RST"),
+                        clk: pins.net_on(name, "CLK"),
+                        p: bus("P", 32),
+                        signed: c.attrs.get("SIGNED") == Some("1"),
+                        preg: c.attrs.get("PREG") == Some("1"),
+                        reg: 0,
+                    });
+                }
                 _ => {}
             }
         }
-        Self { luts, ffs, val: HashMap::new(), prev: HashMap::new() }
+        Self { luts, ffs, rams, muls, val: HashMap::new(), prev: HashMap::new() }
+    }
+    /// Value of a bus; an unconnected bit reads 0.
+    fn word(&self, nets: &[Option<Spur>]) -> u64 {
+        nets.iter().enumerate().fold(0, |a, (i, n)| a | ((n.map(|n| self.get(n)).unwrap_or(false) as u64) << i))
+    }
+    /// Drive a bus; returns whether a net changed.
+    fn drive(val: &mut HashMap<Spur, bool>, nets: &[Option<Spur>], v: u64) -> bool {
+        let mut changed = false;
+        for (i, n) in nets.iter().enumerate() {
+            if let Some(n) = n {
+                let b = (v >> i) & 1 == 1;
+                changed |= val.insert(*n, b) != Some(b);
+            }
+        }
+        changed
+    }
+    fn product(&self, m: &Mul) -> u32 {
+        let (a, b, c) = (self.word(&m.a) as u32, self.word(&m.b) as u32, self.word(&m.c) as u32);
+        let p = if m.signed { (a as u16 as i16 as i32 * b as u16 as i16 as i32) as u32 } else { a * b };
+        p.wrapping_add(c)
     }
     fn get(&self, n: Spur) -> bool {
         self.val.get(&n).copied().unwrap_or(false)
@@ -58,6 +147,14 @@ impl NetSim {
     fn settle(&mut self) {
         for _ in 0..10_000 {
             let mut changed = false;
+            for r in &self.rams {
+                changed |= Self::drive(&mut self.val, &r.dout, r.q as u64);
+            }
+            for i in 0..self.muls.len() {
+                let m = &self.muls[i];
+                let v = if m.preg { m.reg } else { self.product(m) };
+                changed |= Self::drive(&mut self.val, &self.muls[i].p, v as u64);
+            }
             for (init, ins, o) in &self.luts {
                 let mut addr = 0u64;
                 for (i, n) in ins.iter().enumerate() {
@@ -119,7 +216,39 @@ impl NetSim {
                     }
                 }
             }
-            let clocks: Vec<Spur> = self.ffs.iter().filter_map(|f| f.2).collect();
+            // Block RAMs and registered multipliers: rising edge of CLK.
+            let edge = |s: &Self, clk: Option<Spur>, moved: &mut bool| -> bool {
+                let Some(clk) = clk else { return false };
+                let cur = s.get(clk);
+                let was = s.prev.get(&clk).copied().unwrap_or(cur);
+                *moved |= cur != was;
+                cur && !was
+            };
+            let mut ram_next: Vec<(usize, u16, Option<(usize, u16)>)> = Vec::new();
+            for (i, r) in self.rams.iter().enumerate() {
+                if !edge(self, r.clk, &mut moved) {
+                    continue;
+                }
+                let re = r.re.map(|n| self.get(n)).unwrap_or(true);
+                let we = r.we.map(|n| self.get(n)).unwrap_or(false);
+                let q = if re { r.mem[self.word(&r.raddr) as usize] } else { r.q };
+                ram_next.push((i, q, we.then(|| (self.word(&r.waddr) as usize, self.word(&r.di) as u16))));
+            }
+            let mut mul_next: Vec<(usize, u32)> = Vec::new();
+            for (i, m) in self.muls.iter().enumerate() {
+                if !m.preg || !edge(self, m.clk, &mut moved) {
+                    continue;
+                }
+                let v = if m.rst.map(|n| self.get(n)).unwrap_or(false) {
+                    0
+                } else if m.ce.map(|n| self.get(n)).unwrap_or(true) {
+                    self.product(m)
+                } else {
+                    m.reg
+                };
+                mul_next.push((i, v));
+            }
+            let clocks: Vec<Spur> = self.ffs.iter().filter_map(|f| f.2).chain(self.rams.iter().filter_map(|r| r.clk)).chain(self.muls.iter().filter_map(|m| m.clk)).collect();
             for c in clocks {
                 let v = self.get(c);
                 self.prev.insert(c, v);
@@ -129,6 +258,15 @@ impl NetSim {
             }
             for (q, v) in next {
                 self.val.insert(q, v);
+            }
+            for (i, q, w) in ram_next {
+                self.rams[i].q = q;
+                if let Some((a, d)) = w {
+                    self.rams[i].mem[a] = d;
+                }
+            }
+            for (i, v) in mul_next {
+                self.muls[i].reg = v;
             }
         }
         panic!("clocks do not settle");
@@ -530,4 +668,301 @@ endmodule
     let ins_off = routed.tracks.iob_in.iter().filter(|i| i.y != pad_row).count();
     assert!(outs_off > 0 && ins_off > 0, "{outs_off} outputs and {ins_off} inputs off the bottom row");
     check(src, PART, 300);
+}
+
+/// A netlist built by hand, for designs the front end does not make yet
+/// (block RAMs and multipliers): one clock `clk`, LUTs from truth
+/// functions, flops, pads.
+struct Nl {
+    d: Design,
+    k: usize,
+}
+
+impl Nl {
+    fn new() -> Self {
+        let mut d = Design::new("top");
+        d.add_port("clk", helion_ir::PortDir::In);
+        Nl { d, k: 0 }
+    }
+    fn fresh(&mut self, p: &str) -> String {
+        self.k += 1;
+        format!("{p}{}", self.k)
+    }
+    /// Input bus `name`: nets `name_0` .. (pads).
+    fn inputs(&mut self, name: &str, n: usize) -> Vec<String> {
+        self.d.add_port(name, helion_ir::PortDir::In);
+        (0..n).map(|i| format!("{name}_{i}")).collect()
+    }
+    /// A LUT computing `f` of its inputs (bit i of the argument = input i).
+    fn lut(&mut self, ins: &[&str], f: impl Fn(u32) -> bool) -> String {
+        let mask = (1u32 << ins.len()) - 1;
+        let init = (0..64u32).fold(0u64, |a, x| a | ((f(x & mask) as u64) << x));
+        let (cell, out) = (self.fresh("lut"), self.fresh("n"));
+        self.d.add_cell(&cell, CellKind::Lut6 { init });
+        for (i, n) in ins.iter().enumerate() {
+            self.d.connect(n, &cell, &format!("I{i}"));
+        }
+        self.d.connect(&out, &cell, "O");
+        out
+    }
+    /// A flop on `clk` with output net `q`.
+    fn ff_to(&mut self, d: &str, q: &str) {
+        let cell = self.fresh("ff");
+        self.d.add_cell(&cell, CellKind::Hff);
+        self.d.connect("clk", &cell, "CLK");
+        self.d.connect(d, &cell, "D");
+        self.d.connect(q, &cell, "Q");
+    }
+    fn ff(&mut self, d: &str) -> String {
+        let q = self.fresh("q");
+        self.ff_to(d, &q);
+        q
+    }
+    /// An `n`-bit up counter.
+    fn counter(&mut self, n: usize) -> Vec<String> {
+        let q: Vec<String> = (0..n).map(|_| self.fresh("cnt")).collect();
+        let mut carry: Option<String> = None;
+        for i in 0..n {
+            let next = match &carry {
+                None => self.lut(&[&q[i]], |x| x & 1 == 0),
+                Some(c) => self.lut(&[&q[i], c], |x| (x & 1) ^ (x >> 1) == 1),
+            };
+            let c2 = match &carry {
+                None => q[i].clone(),
+                Some(c) => self.lut(&[&q[i], c], |x| x == 3),
+            };
+            self.ff_to(&next, &q[i]);
+            carry = Some(c2);
+        }
+        q
+    }
+    /// An output pad `name` reading `net`.
+    fn output(&mut self, name: &str, net: &str) {
+        self.d.add_port(name, helion_ir::PortDir::Out);
+        let cell = format!("pad_{name}");
+        self.d.add_cell(&cell, CellKind::IobOut);
+        self.d.connect(net, &cell, "I");
+        self.d.connect(name, &cell, "PAD");
+    }
+}
+
+/// Deterministic INIT words for a RAM.
+fn ram_init(seed: u64) -> String {
+    let mut x = seed | 1;
+    (0..256)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            format!("{x:x}")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// A RAM written at a counter's address with random data and a write
+/// enable mixing an input with the counter; read at random addresses
+/// near the writes (same-address collisions included) and in the
+/// unwritten upper half (INIT contents), with a random read enable. DO0..7
+/// go to pads directly, DO8..15 through flops, and a LUT mixes two of them.
+fn ram_design() -> Design {
+    let mut n = Nl::new();
+    let d = n.inputs("d", 16);
+    let rsel = n.inputs("rsel", 4);
+    let ctl = n.inputs("ctl", 3);
+    let cnt = n.counter(10);
+    n.d.add_cell("ram", CellKind::Bram18);
+    n.d.set_cell_attr("ram", "INIT", ram_init(0x9E37_79B9)).unwrap();
+    n.d.connect("clk", "ram", "CLK");
+    for i in 0..16 {
+        n.d.connect(&d[i], "ram", &format!("DI{i}"));
+    }
+    for i in 0..10 {
+        n.d.connect(&cnt[i], "ram", &format!("WADDR{i}"));
+    }
+    for i in 0..4 {
+        n.d.connect(&rsel[i], "ram", &format!("RADDR{i}"));
+    }
+    for i in 4..9 {
+        n.d.connect(&cnt[i], "ram", &format!("RADDR{i}"));
+    }
+    let hi = n.lut(&[&cnt[9], &ctl[2]], |x| (x & 1) ^ (x >> 1) == 1);
+    n.d.connect(&hi, "ram", "RADDR9");
+    let we = n.lut(&[&ctl[0], &cnt[1], &cnt[2]], |x| (x & 1) ^ ((x >> 1) & (x >> 2) & 1) == 1);
+    n.d.connect(&we, "ram", "WE");
+    n.d.connect(&ctl[1], "ram", "RE");
+    for i in 0..16 {
+        n.d.connect(&format!("do{i}"), "ram", &format!("DO{i}"));
+    }
+    for i in 0..8 {
+        n.output(&format!("o{i}"), &format!("do{i}"));
+    }
+    for i in 8..16 {
+        let q = n.ff(&format!("do{i}"));
+        n.output(&format!("o{i}"), &q);
+    }
+    let mix = n.lut(&["do3", "do15", &d[0]], |x| x.count_ones() % 2 == 1);
+    n.output("mix", &mix);
+    n.d
+}
+
+/// A RAM read and written at the same address, every cycle: what is read
+/// is the word before the write.
+fn collision_design() -> Design {
+    let mut n = Nl::new();
+    let d = n.inputs("d", 16);
+    let ctl = n.inputs("we", 1);
+    let cnt = n.counter(4);
+    n.d.add_cell("ram", CellKind::Bram18);
+    n.d.connect("clk", "ram", "CLK");
+    for i in 0..16 {
+        n.d.connect(&d[i], "ram", &format!("DI{i}"));
+        n.d.connect(&format!("do{i}"), "ram", &format!("DO{i}"));
+        n.output(&format!("o{i}"), &format!("do{i}"));
+    }
+    for i in 0..4 {
+        n.d.connect(&cnt[i], "ram", &format!("WADDR{i}"));
+        n.d.connect(&cnt[i], "ram", &format!("RADDR{i}"));
+    }
+    n.d.connect(&ctl[0], "ram", "WE");
+    n.d
+}
+
+/// A ROM: no write port, a counter on the low address bits and an input
+/// on bit 4; every one of the first 32 INIT words is read again and again.
+fn rom_design() -> Design {
+    let mut n = Nl::new();
+    let a = n.inputs("a", 1);
+    let cnt = n.counter(4);
+    n.d.add_cell("rom", CellKind::Bram18);
+    n.d.set_cell_attr("rom", "INIT", ram_init(77)).unwrap();
+    n.d.connect("clk", "rom", "CLK");
+    for i in 0..4 {
+        n.d.connect(&cnt[i], "rom", &format!("RADDR{i}"));
+    }
+    n.d.connect(&a[0], "rom", "RADDR4");
+    for i in 0..16 {
+        n.d.connect(&format!("do{i}"), "rom", &format!("DO{i}"));
+        n.output(&format!("o{i}"), &format!("do{i}"));
+    }
+    n.d
+}
+
+#[test]
+fn block_ram_equals_its_netlist() {
+    for part in ["HL10S-C64-1", "HL10T-C32-1"] {
+        let (nets, _) = check_design(&ram_design(), part, 700, |_| {}).unwrap_or_else(|e| panic!("{part}: {e}"));
+        assert!(nets > 30, "{part}: {nets} nets");
+        check_design(&collision_design(), part, 400, |_| {}).unwrap_or_else(|e| panic!("{part} collision: {e}"));
+        check_design(&rom_design(), part, 300, |_| {}).unwrap_or_else(|e| panic!("{part} rom: {e}"));
+    }
+}
+
+/// The netlist simulation is read-first, the same as the fabric: on the
+/// collision design some cycle reads a word that the same edge overwrote
+/// with something else.
+#[test]
+fn collision_design_exercises_read_first() {
+    let design = collision_design();
+    let mut sim = NetSim::new(&design);
+    let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+    let mut differs = 0;
+    for _ in 0..200 {
+        for i in 0..16 {
+            sim.val.insert(helion_ir::intern(&format!("d_{i}")), rng.bit());
+        }
+        sim.val.insert(helion_ir::intern("we_0"), rng.bit());
+        sim.advance();
+        let (we, di) = (sim.get(helion_ir::intern("we_0")), sim.word(&sim.rams[0].di));
+        let clk = helion_ir::intern("clk");
+        sim.val.insert(clk, true);
+        sim.advance();
+        sim.val.insert(clk, false);
+        sim.advance();
+        if we && sim.rams[0].q as u64 != di {
+            differs += 1;
+        }
+    }
+    assert!(differs > 20, "{differs}");
+}
+
+/// A multiplier with A and B (and C) from pads, P to pads directly and
+/// through flops.
+fn mul_design(signed: bool, preg: bool, with_c: bool) -> Design {
+    let mut n = Nl::new();
+    let a = n.inputs("a", 16);
+    let b = n.inputs("b", 16);
+    n.d.add_cell("mul", CellKind::Mac27);
+    n.d.set_cell_attr("mul", "SIGNED", if signed { "1" } else { "0" }).unwrap();
+    n.d.set_cell_attr("mul", "PREG", if preg { "1" } else { "0" }).unwrap();
+    for i in 0..16 {
+        n.d.connect(&a[i], "mul", &format!("A{i}"));
+        n.d.connect(&b[i], "mul", &format!("B{i}"));
+    }
+    if with_c {
+        let c = n.inputs("c", 32);
+        for i in 0..32 {
+            n.d.connect(&c[i], "mul", &format!("C{i}"));
+        }
+    }
+    if preg {
+        let ctl = n.inputs("ctl", 2);
+        n.d.connect("clk", "mul", "CLK");
+        // Enabled most of the time, reset now and then.
+        let ce = n.lut(&[&ctl[0], &ctl[1]], |x| x != 0);
+        let rst = n.lut(&[&ctl[0], &ctl[1], &a[0]], |x| x == 0b100);
+        n.d.connect(&ce, "mul", "CE");
+        n.d.connect(&rst, "mul", "RST");
+    }
+    for i in 0..32 {
+        let p = format!("p{i}");
+        n.d.connect(&p, "mul", &format!("P{i}"));
+        if i % 2 == 0 {
+            n.output(&format!("o{i}"), &p);
+        } else {
+            let q = n.ff(&p);
+            n.output(&format!("o{i}"), &q);
+        }
+    }
+    n.d
+}
+
+#[test]
+fn multiplier_equals_its_netlist() {
+    for part in ["HL10S-C64-1", "HL10T-DSP1"] {
+        for signed in [false, true] {
+            for preg in [false, true] {
+                for with_c in [false, true] {
+                    check_design(&mul_design(signed, preg, with_c), part, 250, |_| {})
+                        .unwrap_or_else(|e| panic!("{part} signed={signed} preg={preg} c={with_c}: {e}"));
+                }
+            }
+        }
+    }
+}
+
+/// The hard-block comparisons are not vacuous: a RAM input switched off
+/// in PIN_EN, two address bits swapped, one INIT word changed or the
+/// multiplier's sign mode flipped no longer match the netlist.
+#[test]
+fn broken_hard_blocks_are_detected() {
+    let part = "HL10S-C64-1";
+    let no_we = |r: &mut helion_route::Routed| r.placed.packed.conn.hard_pins.retain(|h| h.m != 42);
+    assert!(check_design(&ram_design(), part, 700, no_we).is_err(), "WE off in PIN_EN went unnoticed");
+    let swap_addr = |r: &mut helion_route::Routed| {
+        let s = r.placed.bram_sites[0];
+        for m in r.tracks.imux.iter_mut().filter(|m| (m.x, m.y) == (s.x, s.y)) {
+            m.mux = match m.mux {
+                32 => 33,
+                33 => 32,
+                k => k,
+            };
+        }
+    };
+    assert!(check_design(&ram_design(), part, 700, swap_addr).is_err(), "swapped RADDR0/RADDR1 went unnoticed");
+    let init = |r: &mut helion_route::Routed| r.placed.packed.brams[0].init[5] ^= 1 << 20;
+    assert!(check_design(&rom_design(), part, 300, init).is_err(), "a wrong INIT word went unnoticed");
+    assert!(check_design(&rom_design(), part, 300, |_| {}).is_ok());
+    let sign = |r: &mut helion_route::Routed| r.placed.packed.macs[0].signed ^= true;
+    assert!(check_design(&mul_design(true, false, false), part, 250, sign).is_err(), "a flipped SIGNED went unnoticed");
 }
