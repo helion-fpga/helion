@@ -1,11 +1,17 @@
 // PicoRV32 running a program on the ZedBoard.
 //
 // The core executes five instructions from a ROM: it counts in register x1
-// and stores the count to a 32-bit output port on every pass of the loop.
-// The eight LEDs show an eight-bit window of that port; the slide switches
-// SW4..SW0 give the window's lowest bit. With the switches at 20 the LEDs
-// count at a few hertz; lower settings count faster.
-// BTNC (rst) restarts the program.
+// and stores the count to a 32-bit output port on every pass of the loop
+// (about 3.2 million times a second).
+//
+// The eight LEDs show an eight-bit window of that port. With every switch
+// down the window starts at bit 22, so the LEDs step about once every 1.3 s;
+// SW4..SW0, read as a number, move the window down by that many bits (each
+// step doubles the speed; 22 or more shows the lowest bits, too fast to see).
+//
+// The program starts by itself when the board is configured: a power-on
+// counter holds the processor in reset for its first 15 clock cycles.
+// BTNC (rst) restarts it.
 //
 // The processor runs at 50 MHz: a flop halves the board's 100 MHz clock, and
 // the halved clock reaches the logic through a global clock buffer. Every
@@ -34,10 +40,15 @@ module zedboard_pico_soc (
     logic clk_half = 1'b0;
     always_ff @(posedge clk) clk_half <= ~clk_half;
 
+    // Power-on reset: every flop starts at zero when the board is configured,
+    // so this counter holds the processor in reset until it reaches 15.
+    logic [3:0] por = 4'd0;
+    always_ff @(posedge clk_half) if (por != 4'd15) por <= por + 4'd1;
+
     // Two flops bring the button into the clock domain.
-    logic [1:0] rst_sync;
+    logic [1:0] rst_sync = 2'b00;
     always_ff @(posedge clk_half) rst_sync <= {rst_sync[0], rst};
-    assign resetn = ~rst_sync[1];
+    assign resetn = (por == 4'd15) & ~rst_sync[1];
 
     // Program ROM, addressed by word.
     logic [31:0] rom;
@@ -71,9 +82,12 @@ module zedboard_pico_soc (
         end
     end
 
+    // LED window: bits shift..shift+7 of the port, shift = 22 - switches.
+    logic [4:0]  shift;
     logic [38:0] window;
-    assign window = {7'b0, gpio} >> sw;
-    assign led = window[7:0];
+    assign shift  = (sw >= 5'd22) ? 5'd0 : 5'd22 - sw;
+    assign window = {7'b0, gpio} >> shift;
+    assign led    = window[7:0];
 
     picorv32 #(
         .ENABLE_COUNTERS      (0),
