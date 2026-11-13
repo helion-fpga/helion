@@ -2958,6 +2958,13 @@ fn insert_input_buffers(netlist: &Design, packed: &mut Packed7) -> Result<(), St
     for b in &packed.bufgs {
         driven.insert(b.out_net.clone());
     }
+    for s in &packed.srls {
+        driven.insert(s.q_net.clone());
+        driven.extend(s.q31_net.iter().cloned());
+    }
+    for m in &packed.muxfs {
+        driven.insert(m.o_net.clone());
+    }
     for c in &packed.carries {
         for o in c.o_nets.iter().flatten() {
             driven.insert(o.clone());
@@ -2979,6 +2986,14 @@ fn insert_input_buffers(netlist: &Design, packed: &mut Packed7) -> Result<(), St
         if i.dir == IobDir::Out {
             read.insert(i.net.clone());
         }
+    }
+    for s in &packed.srls {
+        read.insert(s.d_net.clone());
+        read.extend(s.ce_net.iter().cloned());
+        read.extend(s.addr_nets.iter().flatten().cloned());
+    }
+    for m in &packed.muxfs {
+        read.insert(m.s_net.clone());
     }
     for c in &packed.carries {
         // DI nets are not wired by the router (see route.rs carry notes).
@@ -3088,6 +3103,14 @@ fn insert_clock_spine(netlist: &Design, packed: &mut Packed7) -> Result<(), Stri
     for clk_net in clk_nets {
         if buffered.contains(clk_net.as_str()) {
             continue;
+        }
+        // A clock made in the fabric (a flop's output, such as a divider)
+        // would need a route from the fabric into a global buffer, which
+        // the router does not find cleanly yet: refuse it by name.
+        if packed.ffs.iter().any(|f| f.q_net == clk_net) {
+            return Err(format!(
+                "pack: clock net `{clk_net}` is driven by a flop; clocks made in the fabric are not supported yet (use a clock pin)"
+            ));
         }
         let port = netlist
             .ports
@@ -3314,6 +3337,26 @@ mod tests {
         d.connect("srst", "r0_reg", "SR");
         let err = pack(&d).unwrap_err();
         assert!(err.contains("both a synchronous and an asynchronous reset"), "got: {err}");
+    }
+
+    /// A clock driven by a flop (a divider) is refused by name.
+    #[test]
+    fn pack_refuses_a_flop_driven_clock() {
+        let mut d = Design::new("div");
+        d.add_port("clk", PortDir::In);
+        d.add_cell("div_reg", CellKind::Hff);
+        d.connect("div_n", "div_reg", "D");
+        d.connect("div", "div_reg", "Q");
+        d.connect("clk", "div_reg", "CLK");
+        d.add_cell("u_inv", CellKind::Lut6 { init: 0x5555_5555_5555_5555 });
+        d.connect("div", "u_inv", "I0");
+        d.connect("div_n", "u_inv", "O");
+        d.add_cell("r_reg", CellKind::Hff);
+        d.connect("x", "r_reg", "D");
+        d.connect("r", "r_reg", "Q");
+        d.connect("div", "r_reg", "CLK");
+        let err = pack(&d).unwrap_err();
+        assert!(err.contains("driven by a flop"), "got: {err}");
     }
 
     #[test]

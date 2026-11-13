@@ -431,13 +431,30 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         if let Some(q31) = &srl.q31_net {
             add_ep(q31.clone(), site.to_string(), "MC31", true);
         }
-        add_ep(srl.d_net.clone(), site.to_string(), "DI1", false);
+        // The SRL's data enters on its LUT letter's site pin (AI..DI);
+        // `DI1` is the BEL pin, which has no routing wire.
+        let letter = placed
+            .srls
+            .iter()
+            .find(|p| p.name == srl.name)
+            .and_then(|p| p.bel.chars().next())
+            .unwrap_or('D');
+        add_ep(srl.d_net.clone(), site.to_string(), &format!("{letter}I"), false);
     }
     for muxf in &packed.muxfs {
         let site = muxf_site.get(muxf.name.as_str()).copied().unwrap_or("");
-        add_ep(muxf.i0_net.clone(), site.to_string(), "I0", false);
-        add_ep(muxf.i1_net.clone(), site.to_string(), "I1", false);
-        add_ep(muxf.o_net.clone(), site.to_string(), "O", true);
+        // Inputs come from the slice's own LUTs or F7 muxes (inside the
+        // slice). The output leaves on the slice pin emit selects for it:
+        // F7AMUX on AMUX, F7BMUX on CMUX, F8MUX on BMUX.
+        add_ep(muxf.i0_net.clone(), site.to_string(), "F7F8_I0", false);
+        add_ep(muxf.i1_net.clone(), site.to_string(), "F7F8_I1", false);
+        let bel = placed.muxfs.iter().find(|p| p.name == muxf.name).map(|p| p.bel.as_str()).unwrap_or("");
+        let out_pin = match bel {
+            "F7BMUX" => "CMUX",
+            "F8MUX" => "BMUX",
+            _ => "AMUX",
+        };
+        add_ep(muxf.o_net.clone(), site.to_string(), out_pin, true);
     }
     for ibuf in &packed.ibufds_gte2s {
         clock_spine_nets.insert(ibuf.o_net.clone());
@@ -671,6 +688,11 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         if graph_clocks {
             break;
         }
+        // Regional buffers (BUFIO, BUFR) drive their own clock region, not
+        // the global spine.
+        if !bufg.site.starts_with("BUFGCTRL") {
+            continue;
+        }
         let spine = device.bufg_spine(&bufg.site)?;
         if !spine.pips.is_empty() {
             nets.push(RoutedNet7 {
@@ -764,6 +786,11 @@ fn check_dedicated_cascade(net: &str, driver: &Endpoint, loads: &[&Endpoint]) ->
 /// here instead of silently under-driving the clock mux.
 fn route_bufg_tieoffs(placed: &Placed7, device: &dyn RouteQuery) -> Result<(), String> {
     for bufg in &placed.bufgs {
+        // Only BUFGCTRL sites have the S/CE/IGNORE control pins; regional
+        // buffers (BUFIO, BUFR) have none to tie off.
+        if !bufg.site.starts_with("BUFGCTRL") {
+            continue;
+        }
         // Validation only: an unknown site (or a DB without a tie-off
         // path) still fails loudly. The paths themselves stay off
         // fabric (see fn docs).
@@ -777,7 +804,7 @@ fn route_bufg_tieoffs(placed: &Placed7, device: &dyn RouteQuery) -> Result<(), S
 /// from the same-letter LUT O6. Every other load, even in the driver's own
 /// slice, arrives through the fabric.
 fn is_site_internal_pin(pin: &str) -> bool {
-    pin.ends_with("FF_D") || matches!(pin, "S0" | "S1" | "S2" | "S3")
+    pin.ends_with("FF_D") || matches!(pin, "S0" | "S1" | "S2" | "S3" | "F7F8_I0" | "F7F8_I1")
 }
 
 /// Slice bypass inputs (`AX`..`DX`): reached through the INT tile's

@@ -261,6 +261,120 @@ impl Analysis {
 /// Vivado without set_input_delay/set_output_delay). A combinational loop
 /// is an error.
 pub fn analyze(routed: &Routed7, period_ps: u32) -> Result<Analysis, String> {
+    let mut a = analyze_clocks(routed, &|_| Some(period_ps))?;
+    a.period_ps = period_ps;
+    Ok(a)
+}
+
+/// Like [`analyze`], with a period per clock domain. A domain is a flop
+/// clock net (after packing, e.g. `clk_bufg`); `period_of` gives its period,
+/// or `None` when it is not known, which is an error. Paths are timed
+/// within one domain. A data path from a flop of one domain to a flop of
+/// another is an error too: the clocks' arrival times are not modelled, so
+/// such a path cannot be called safe.
+///
+/// The returned `period_ps` is the period of the domain with the worst
+/// slack.
+pub fn analyze_clocks(routed: &Routed7, period_of: &dyn Fn(&str) -> Option<u32>) -> Result<Analysis, String> {
+    let mut domains: Vec<&str> = routed.placed.packed.ffs.iter().map(|f| f.clk_net.as_str()).collect();
+    domains.sort();
+    domains.dedup();
+    if domains.len() > 1 {
+        check_no_crossings(&routed.placed.packed)?;
+    }
+    let mut worst: Option<Analysis> = None;
+    let (mut endpoints, mut failing) = (0usize, 0usize);
+    for dom in &domains {
+        let period = period_of(dom).ok_or_else(|| format!("timing: no period known for clock `{dom}`"))?;
+        let a = analyze_domain(routed, dom, period)?;
+        endpoints += a.endpoints;
+        failing += a.failing_endpoints;
+        if worst.as_ref().map(|w| a.wns_ps < w.wns_ps).unwrap_or(true) {
+            worst = Some(a);
+        }
+    }
+    let mut w = worst.unwrap_or(Analysis { period_ps: 0, wns_ps: 0, failing_endpoints: 0, endpoints: 0, worst_path: Vec::new() });
+    if domains.is_empty() {
+        w.period_ps = period_of("").unwrap_or(0);
+        w.wns_ps = w.period_ps as i64;
+    }
+    w.endpoints = endpoints;
+    w.failing_endpoints = failing;
+    Ok(w)
+}
+
+/// Every flop input's combinational fan-in reaches flops of its own clock
+/// only.
+fn check_no_crossings(packed: &crate::pack::Packed7) -> Result<(), String> {
+    let lut_by_out: HashMap<&str, &crate::pack::PackedLut> = packed.luts.iter().map(|l| (l.output_net.as_str(), l)).collect();
+    let ff_by_q: HashMap<&str, &crate::pack::PackedFf> = packed.ffs.iter().map(|f| (f.q_net.as_str(), f)).collect();
+    let mut carry_ins: HashMap<&str, Vec<&str>> = HashMap::new();
+    for c in &packed.carries {
+        let mut ins: Vec<&str> = c.s_nets.iter().chain(c.di_nets.iter()).flatten().map(|n| n.as_str()).collect();
+        if !c.ci_net.is_empty() {
+            ins.push(c.ci_net.as_str());
+        }
+        for o in c.o_nets.iter().flatten().chain(c.co_net.iter()) {
+            carry_ins.insert(o.as_str(), ins.clone());
+        }
+    }
+    // Clock of the flops that launch into each net (memoized walk).
+    let mut memo: HashMap<&str, Vec<&str>> = HashMap::new();
+    fn launches<'a>(
+        net: &'a str,
+        memo: &mut HashMap<&'a str, Vec<&'a str>>,
+        lut_by_out: &HashMap<&'a str, &'a crate::pack::PackedLut>,
+        ff_by_q: &HashMap<&'a str, &'a crate::pack::PackedFf>,
+        carry_ins: &HashMap<&'a str, Vec<&'a str>>,
+        depth: usize,
+    ) -> Vec<&'a str> {
+        if let Some(v) = memo.get(net) {
+            return v.clone();
+        }
+        memo.insert(net, Vec::new()); // a loop is reported by the timing pass
+        let mut out: Vec<&str> = if let Some(f) = ff_by_q.get(net) {
+            vec![f.clk_net.as_str()]
+        } else if depth > 10_000 {
+            Vec::new()
+        } else {
+            let ins: Vec<&str> = if let Some(l) = lut_by_out.get(net) {
+                l.input_nets.iter().flatten().map(|n| n.as_str()).collect()
+            } else {
+                carry_ins.get(net).cloned().unwrap_or_default()
+            };
+            let mut v = Vec::new();
+            for i in ins {
+                v.extend(launches(i, memo, lut_by_out, ff_by_q, carry_ins, depth + 1));
+            }
+            v
+        };
+        out.sort();
+        out.dedup();
+        memo.insert(net, out.clone());
+        out
+    }
+    for ff in &packed.ffs {
+        let mut ins: Vec<&str> = vec![ff.d_net.as_str()];
+        ins.extend(ff.ce_net.iter().map(|s| s.as_str()));
+        if !ff.sr_async {
+            ins.extend(ff.sr_net.iter().map(|s| s.as_str()));
+        }
+        for i in ins {
+            for c in launches(i, &mut memo, &lut_by_out, &ff_by_q, &carry_ins, 0) {
+                if c != ff.clk_net {
+                    return Err(format!(
+                        "timing: data path from clock `{c}` into flop {} on clock `{}`; paths between clock domains are not supported",
+                        ff.name, ff.clk_net
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Paths launched by the flops of clock `domain`, timed against `period_ps`.
+fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Analysis, String> {
     let placed = &routed.placed;
     let packed = &placed.packed;
     let site_of: HashMap<&str, &str> = placed
@@ -271,6 +385,8 @@ pub fn analyze(routed: &Routed7, period_ps: u32) -> Result<Analysis, String> {
         .chain(placed.carries.iter().map(|c| (c.name.as_str(), c.site.as_str())))
         .collect();
     let lut_by_out: HashMap<&str, &crate::pack::PackedLut> = packed.luts.iter().map(|l| (l.output_net.as_str(), l)).collect();
+    // Only this domain's flops launch paths; another domain's flop output is
+    // a path start too, tagged so that reaching an endpoint is reported.
     let ff_by_q: HashMap<&str, &crate::pack::PackedFf> = packed.ffs.iter().map(|f| (f.q_net.as_str(), f)).collect();
     let mut carry_by_net: HashMap<&str, (&crate::pack::PackedCarry, Option<usize>)> = HashMap::new();
     for c in &packed.carries {
@@ -316,7 +432,8 @@ pub fn analyze(routed: &Routed7, period_ps: u32) -> Result<Analysis, String> {
             return Err(format!("timing: combinational loop through net `{net}`"));
         }
         let r = if ff_by_q.contains_key(net) {
-            (FF_CKQ_PS, vec![PathStep { what: format!("{} (flop Q)", ff_by_q[net].name), arrival_ps: FF_CKQ_PS }])
+            let f = ff_by_q[net];
+            (FF_CKQ_PS, vec![PathStep { what: format!("{} (flop Q, clock {})", f.name, f.clk_net), arrival_ps: FF_CKQ_PS }])
         } else if let Some(l) = lut_by_out.get(net) {
             let site = site_of.get(l.name.as_str()).copied().unwrap_or("");
             let letter = lut_letter.get(l.name.as_str()).copied().unwrap_or('A');
@@ -386,6 +503,9 @@ pub fn analyze(routed: &Routed7, period_ps: u32) -> Result<Analysis, String> {
     let mut endpoints = 0usize;
     for pff in &placed.ffs {
         let Some(ff) = packed.ffs.iter().find(|f| f.name == pff.name) else { continue };
+        if ff.clk_net != domain {
+            continue;
+        }
         let internal_d = matches!(crate::place::ff_d_source(pff, placed), crate::place::FfDSource::LutO6 | crate::place::FfDSource::CarryXor);
         let letter = pff.bel.chars().next().unwrap_or('A');
         let d_pin = if internal_d { format!("{letter}FF_D") } else { format!("{letter}X") };
@@ -465,6 +585,38 @@ mod tests {
             r.worst_arrival_ps
         );
         assert_eq!(r.wns_ps, 10_000 - tm.setup_ps - r.worst_arrival_ps);
+    }
+
+    /// A data path from a flop on one clock into a flop on another is
+    /// refused; paths within one clock are fine.
+    #[test]
+    fn clock_domain_crossing_is_refused() {
+        use crate::pack::{Packed7, PackedFf, PackedLut};
+        let ff = |name: &str, d: &str, q: &str, clk: &str| PackedFf {
+            name: name.into(),
+            d_net: d.into(),
+            q_net: q.into(),
+            clk_net: clk.into(),
+            ce_net: None,
+            sr_net: None,
+            init: false,
+            srval: false,
+            sr_async: false,
+        };
+        let mut p = Packed7 {
+            luts: vec![PackedLut {
+                name: "u_inv".into(),
+                init: 0x5555_5555_5555_5555,
+                input_nets: [Some("qa".into()), None, None, None, None, None],
+                output_net: "x".into(),
+            }],
+            ffs: vec![ff("a", "pa", "qa", "clk_a"), ff("b", "x", "qb", "clk_a")],
+            ..Default::default()
+        };
+        assert!(check_no_crossings(&p).is_ok());
+        p.ffs[1].clk_net = "clk_b".into();
+        let err = check_no_crossings(&p).unwrap_err();
+        assert!(err.contains("from clock `clk_a`") && err.contains("flop b"), "got: {err}");
     }
 
     #[test]
