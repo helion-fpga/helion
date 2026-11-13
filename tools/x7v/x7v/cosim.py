@@ -98,6 +98,12 @@ RTL_SIM = os.environ.get("X7V_RTL_SIM", "iverilog")
 # a processor needs to get anywhere in its program.
 RESET_RATE = 0.01
 
+# Pulse reset-like inputs at start-up (`verify --no-reset` turns this off and
+# holds them at 0 for the whole run: a design must then start by itself).
+RESET_PULSE = True
+# Cycles a design gets to define its outputs when no reset is applied.
+NO_RESET_SETTLE = 64
+
 
 def make_stimulus(bits: list[str], cycles: int, seed: int, hold: dict[str, float] | None = None) -> list[str]:
     """Random walk: each input bit flips with a per-bit probability per cycle.
@@ -112,10 +118,10 @@ def make_stimulus(bits: list[str], cycles: int, seed: int, hold: dict[str, float
             for b in bits:
                 p = (hold or {}).get(b, 0.15)
                 if b in resets:
-                    p = RESET_RATE
+                    p = RESET_RATE if RESET_PULSE else 0.0
                 if rng.random() < p:
                     cur[b] ^= 1
-        if 4 <= k < 7:
+        if 4 <= k < 7 and RESET_PULSE:
             for b in resets:
                 cur[b] = 1
         if k == 7:
@@ -439,6 +445,11 @@ def run(workdir: str, rtl_files: list[str], top: str, xdc: str, netlist_v: str,
                 continue
             if rv in "xu":
                 res.rtl_unknown += 1
+                # Without a reset an output the RTL still leaves undefined
+                # after start-up is a failure, not a don't-care: otherwise a
+                # design that never leaves power-up would pass vacuously.
+                if not RESET_PULSE and k >= NO_RESET_SETTLE:
+                    res.mismatches.append((k, bitname, "x (no reset)", nv))
                 continue
             if nv in "xz":
                 res.net_unknown += 1
