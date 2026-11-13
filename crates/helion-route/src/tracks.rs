@@ -208,6 +208,13 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
     };
     let registered = |i: u32| packed.lutffs.get(i as usize).map(|l| !l.ff_cell.is_empty()).unwrap_or(false);
 
+    // Tile and switch-box select of a hard block's output bit.
+    let hard_out = |blk: u32, bit: u8| -> Result<(u32, u32, u8), String> {
+        let site = placed.hard_block_site(blk).ok_or_else(|| format!("route: hard block {blk} is not placed"))?;
+        let kind = conn.hard[blk as usize].kind;
+        let (dy, sel) = helion_device::hard::output(kind, bit as u32).ok_or_else(|| format!("route: hard block {blk} has no output {bit}"))?;
+        Ok((site.x, site.y + dy, sel as u8))
+    };
     let mut direct_imux: Vec<ImuxRoute> = Vec::new();
     let mut nets: Vec<Net> = Vec::new();
     let mut net_of: HashMap<NetSrc, usize> = HashMap::new();
@@ -225,7 +232,10 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
                 Src::Ble { x: site.x, y: site.y, sel: (tk::SB_LUT_O + ble as u32) as u8 }
             }
             NetSrc::Input(i) => Src::Pad { input: i },
-            NetSrc::Hard { .. } => return Err("route: hard blocks are not routed yet".into()),
+            NetSrc::Hard { blk, bit } => {
+                let (x, y, sel) = hard_out(blk, bit)?;
+                Src::Ble { x, y, sel }
+            }
         };
         nets.push(Net { src: s, sinks: Vec::new() });
         net_of.insert(src, nets.len() - 1);
@@ -257,6 +267,13 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
         }
     }
 
+    // Hard-block inputs: always over wires, into the IMUX of the block's tile.
+    for h in &conn.hard_pins {
+        let site = placed.hard_block_site(h.blk).ok_or_else(|| format!("route: hard block {} is not placed", h.blk))?;
+        let n = net_for(h.src, &mut nets)?;
+        nets[n].sinks.push(Sink::Pin { x: site.x, y: site.y + h.dy as u32, mux: h.m as u32 });
+    }
+
     // Output pads.
     let mut pads: Vec<Option<PadPlan>> = Vec::with_capacity(placed.iob_sites.len());
     let mut pad_net: Vec<Option<usize>> = vec![None; placed.iob_sites.len()];
@@ -272,7 +289,16 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
             NetSrc::BleQ(i) => (i, true),
             NetSrc::BleO(i) => (i, false),
             NetSrc::Input(_) => return Err(format!("route: output pad {} is fed straight from an input pad", io.cell)),
-            NetSrc::Hard { .. } => return Err("route: hard blocks are not routed yet".into()),
+            NetSrc::Hard { blk, bit } => {
+                // A hard block's output reaches a pad over wires only.
+                let (x, y, sel) = hard_out(blk, bit)?;
+                let n = net_for(src, &mut nets)?;
+                nets[n].sinks.push(Sink::Pad { iob: ii });
+                pad_net[ii] = Some(n);
+                let k = sel - tk::SB_BLE_OUT as u8;
+                pads.push(Some(PadPlan::Track { clb: (x, y), ble: k % 8, from_ff: k < 8, path: Vec::new() }));
+                continue;
+            }
         };
         let (csite, ble) = site_of(i)?;
         let (px, py) = pad_xy(dev, site);

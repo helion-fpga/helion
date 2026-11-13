@@ -619,7 +619,7 @@ pub fn route_with_guide(
     // A design packed with its full connection list is routed completely:
     // direct IMUX connections where the fabric has them, wires elsewhere.
     let conn = &placed.packed.conn;
-    let full = if conn.pins.is_empty() && conn.iob_src.is_empty() && conn.undriven.is_empty() {
+    let full = if conn.pins.is_empty() && conn.iob_src.is_empty() && conn.undriven.is_empty() && conn.hard_pins.is_empty() {
         None
     } else {
         Some(tracks::route(placed, dev)?)

@@ -74,6 +74,123 @@ impl Placed {
     }
 }
 
+impl Placed {
+    /// Site of hard block `conn.hard[blk]`.
+    pub fn hard_block_site(&self, blk: u32) -> Option<Site> {
+        let r = self.packed.conn.hard.get(blk as usize)?;
+        match r.kind {
+            helion_pack::HardKind::Mac => self.mac_sites.get(r.idx as usize).copied(),
+            helion_pack::HardKind::Bram => self.bram_sites.get(r.idx as usize).copied(),
+        }
+    }
+
+    /// CLB tiles taken by the hard blocks connected to the fabric: no
+    /// LUT or flop may sit there.
+    pub fn reserved_tiles(&self, dev: &Device) -> HashSet<(u32, u32)> {
+        (0..self.packed.conn.hard.len() as u32).filter_map(|b| self.hard_block_site(b)).flat_map(|s| dev.hard_tiles(s)).collect()
+    }
+}
+
+/// Sites for the multipliers and RAMs. A block connected to the fabric
+/// takes the free site nearest its LUTs and pads (by total distance), its
+/// tiles are taken from the LUTs and flops, and clusters already placed
+/// there move to the nearest free slot. A name-only block takes the first
+/// free site, and is dropped (as ever) when the part has none left.
+fn place_hard(packed: &Packed, dev: &Device, lutff_sites: &mut [(Site, u8)], iob_sites: &[Site]) -> Result<(Vec<Site>, Vec<Site>), String> {
+    use helion_pack::{HardKind, NetSrc};
+    let conn = &packed.conn;
+    let mut mac_sites: Vec<Option<Site>> = vec![None; packed.macs.len()];
+    let mut bram_sites: Vec<Option<Site>> = vec![None; packed.brams.len()];
+    let mut taken: HashSet<Site> = HashSet::new();
+    // Points each connected block talks to.
+    let mut pts: Vec<Vec<(u32, u32)>> = vec![Vec::new(); conn.hard.len()];
+    let at = |src: NetSrc| -> Option<(u32, u32)> {
+        match src {
+            NetSrc::BleQ(i) | NetSrc::BleO(i) => lutff_sites.get(i as usize).map(|(s, _)| (s.x, s.y)),
+            _ => None,
+        }
+    };
+    for h in &conn.hard_pins {
+        if let Some(p) = at(h.src) {
+            pts[h.blk as usize].push(p);
+        }
+    }
+    for pc in &conn.pins {
+        if let (NetSrc::Hard { blk, .. }, Some((s, _))) = (pc.src, lutff_sites.get(pc.lutff as usize)) {
+            pts[blk as usize].push((s.x, s.y));
+        }
+    }
+    for (ii, io) in packed.iobs.iter().enumerate() {
+        if let (Some(NetSrc::Hard { blk, .. }), Some(s)) = (conn.iob_src.get(&io.cell), iob_sites.get(ii)) {
+            pts[*blk as usize].push((s.x, s.y));
+        }
+    }
+    for (blk, r) in conn.hard.iter().enumerate() {
+        let (pool, name): (Vec<Site>, &str) = match r.kind {
+            HardKind::Mac => (dev.dsp_sites().collect(), "multiplier"),
+            HardKind::Bram => (dev.bram_sites().collect(), "block RAM"),
+        };
+        let free: Vec<Site> = pool.iter().copied().filter(|s| !taken.contains(s) && dev.hard_tiles(*s).len() == r.kind.tiles() as usize).collect();
+        let cost = |s: &Site| -> u64 { pts[blk].iter().map(|p| (p.0.abs_diff(s.x) + p.1.abs_diff(s.y)) as u64).sum() };
+        let Some(site) = free.iter().copied().enumerate().min_by_key(|(k, s)| (cost(s), *k)).map(|(_, s)| s) else {
+            let n = conn.hard.iter().filter(|h| h.kind == r.kind).count();
+            return Err(format!("place: the design has {n} {name} block(s) connected to the fabric and {} has {} site(s)", dev.part, pool.len()));
+        };
+        taken.insert(site);
+        match r.kind {
+            HardKind::Mac => mac_sites[r.idx as usize] = Some(site),
+            HardKind::Bram => bram_sites[r.idx as usize] = Some(site),
+        }
+    }
+    for (sites, pool, what) in [(&mut mac_sites, dev.dsp_sites().collect::<Vec<_>>(), "dsp"), (&mut bram_sites, dev.bram_sites().collect::<Vec<_>>(), "bram")] {
+        let mut free = pool.iter().copied().filter(|s| !taken.contains(s));
+        let mut dropped = 0;
+        for slot in sites.iter_mut().filter(|s| s.is_none()) {
+            match free.next() {
+                Some(s) => *slot = Some(s),
+                None => dropped += 1,
+            }
+        }
+        if dropped > 0 {
+            if !taken.is_empty() {
+                return Err(format!("place: no {what} site left for a name-only block beside the connected ones"));
+            }
+            eprintln!("hang_diag place_{what}_cap {} -> {}", sites.len(), sites.len() - dropped);
+        }
+    }
+    // Name-only blocks past the part's sites are dropped from the end.
+    let mac_sites: Vec<Site> = mac_sites.into_iter().map_while(|s| s).collect();
+    let bram_sites: Vec<Site> = bram_sites.into_iter().map_while(|s| s).collect();
+    // Clear the tiles of the connected blocks.
+    let reserved: HashSet<(u32, u32)> = taken.iter().flat_map(|s| dev.hard_tiles(*s)).collect();
+    if reserved.is_empty() || lutff_sites.iter().all(|(s, _)| !reserved.contains(&(s.x, s.y))) {
+        return Ok((mac_sites, bram_sites));
+    }
+    let n_ble = dev.n_ble.clamp(1, 8) as usize;
+    let mut used: std::collections::HashMap<(u32, u32), u8> = std::collections::HashMap::new();
+    for (s, b) in lutff_sites.iter() {
+        *used.entry((s.x, s.y)).or_insert(0) |= 1 << b;
+    }
+    let clbs: Vec<Site> = dev.clb_sites().filter(|s| !reserved.contains(&(s.x, s.y))).collect();
+    for slot in lutff_sites.iter_mut() {
+        let (s, _) = *slot;
+        if !reserved.contains(&(s.x, s.y)) {
+            continue;
+        }
+        let dest = clbs
+            .iter()
+            .filter(|c| used.get(&(c.x, c.y)).copied().unwrap_or(0).count_ones() < n_ble as u32)
+            .min_by_key(|c| (c.x.abs_diff(s.x) + c.y.abs_diff(s.y), c.x, c.y))
+            .copied()
+            .ok_or_else(|| "place: no room for the LUTs and flops beside the hard blocks; the design does not fit".to_string())?;
+        let mask = used.entry((dest.x, dest.y)).or_insert(0);
+        let ble = (0..n_ble as u8).find(|b| *mask & (1 << b) == 0).expect("free slot");
+        *mask |= 1 << ble;
+        *slot = (dest, ble);
+    }
+    Ok((mac_sites, bram_sites))
+}
+
 /// LUTFF counts per HAD CLB site ID, derived from placement.
 pub fn packing_summary_from_placed(placed: &Placed) -> PackingSummary {
     PackingSummary::from_lutff_sites(&placed.lutff_sites)
@@ -1397,31 +1514,7 @@ pub fn place_with_guide(
         );
     }
 
-    let mut mac_sites = Vec::new();
-    let dsps: Vec<_> = dev.dsp_sites().collect();
-    if packed.macs.len() > dsps.len() {
-        eprintln!(
-            "hang_diag place_dsp_cap {} -> {}",
-            packed.macs.len(),
-            dsps.len()
-        );
-    }
-    for (i, _) in packed.macs.iter().enumerate().take(dsps.len()) {
-        mac_sites.push(dsps[i]);
-    }
-
-    let mut bram_sites = Vec::new();
-    let brams: Vec<_> = dev.bram_sites().collect();
-    if packed.brams.len() > brams.len() {
-        eprintln!(
-            "hang_diag place_bram_cap {} -> {}",
-            packed.brams.len(),
-            brams.len()
-        );
-    }
-    for (i, _) in packed.brams.iter().enumerate().take(brams.len()) {
-        bram_sites.push(brams[i]);
-    }
+    let (mac_sites, bram_sites) = place_hard(&packed, dev, &mut lutff_sites, &iob_sites)?;
 
     let cost = if opts.timing_weight > 0.0 {
         lutff_sites

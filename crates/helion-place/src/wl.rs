@@ -58,6 +58,8 @@ fn build_nets(placed: &Placed) -> (Vec<Net>, Vec<Vec<u32>>) {
             let mut net = Net { cells: Vec::new(), fixed: Vec::new() };
             match src {
                 NetSrc::BleQ(i) | NetSrc::BleO(i) if (i as usize) < n => net.cells.push(i),
+                // A hard block does not move: its site is a fixed point.
+                NetSrc::Hard { blk, .. } => net.fixed.extend(placed.hard_block_site(blk).map(|s| (s.x as i32, s.y as i32))),
                 _ => {}
             }
             nets.push(net);
@@ -68,6 +70,12 @@ fn build_nets(placed: &Placed) -> (Vec<Net>, Vec<Vec<u32>>) {
         if (pc.lutff as usize) < n {
             let k = get(pc.src, &mut nets);
             nets[k].cells.push(pc.lutff);
+        }
+    }
+    for h in &conn.hard_pins {
+        if let Some(s) = placed.hard_block_site(h.blk) {
+            let k = get(h.src, &mut nets);
+            nets[k].fixed.push((s.x as i32, s.y as i32));
         }
     }
     for (ii, io) in placed.packed.iobs.iter().enumerate() {
@@ -177,7 +185,8 @@ impl ClockInfo {
 /// break this move to the nearest CLB where they fit. Returns how many moved.
 pub fn legalize_clocks(placed: &mut Placed, dev: &Device) -> Result<u32, String> {
     let Some(ck) = ClockInfo::of(placed) else { return Ok(0) };
-    let sites: Vec<Site> = dev.clb_sites().collect();
+    let reserved = placed.reserved_tiles(dev);
+    let sites: Vec<Site> = dev.clb_sites().filter(|s| !reserved.contains(&(s.x, s.y))).collect();
     let n_ble = dev.n_ble.min(8) as usize;
     let index: HashMap<(u32, u32), usize> = sites.iter().enumerate().map(|(i, s)| ((s.x, s.y), i)).collect();
     let mut occ: Vec<u32> = vec![u32::MAX; sites.len() * n_ble];
@@ -327,7 +336,8 @@ fn criticality_weights(conns: &[(u32, u32, bool)], pos: &[(i32, i32)], has_ff: &
 pub fn refine(placed: &mut Placed, dev: &Device) -> (u64, u64) {
     let n = placed.lutff_sites.len();
     let (nets, of_cell) = build_nets(placed);
-    let sites: Vec<Site> = dev.clb_sites().collect();
+    let reserved = placed.reserved_tiles(dev);
+    let sites: Vec<Site> = dev.clb_sites().filter(|s| !reserved.contains(&(s.x, s.y))).collect();
     let n_ble = dev.n_ble.min(8) as usize;
     if n == 0 || nets.is_empty() || sites.is_empty() || n_ble == 0 {
         return (0, 0);

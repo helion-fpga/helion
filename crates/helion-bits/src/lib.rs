@@ -186,6 +186,16 @@ fn program_clb_frames(
     if !packed.conn.clock_problems.is_empty() && packed.conn.ff_reset.iter().any(|r| r.is_some()) {
         return Err(format!("bitgen: {}", packed.conn.clock_problems[0]));
     }
+    // The tiles of a hard block have no LUTs or flops of their own.
+    let reserved = routed.placed.reserved_tiles(dev);
+    if !reserved.is_empty() {
+        if let Some((i, (s, _))) = routed.placed.lutff_sites.iter().enumerate().find(|(_, (s, _))| reserved.contains(&(s.x, s.y))) {
+            return Err(format!("bitgen: {} is placed on CLB_X{}Y{}, a tile of a hard block", packed.lutffs[i].lut_cell, s.x, s.y));
+        }
+        if !packed.conn.clock_problems.is_empty() {
+            return Err(format!("bitgen: {}", packed.conn.clock_problems[0]));
+        }
+    }
     for (i, lutff) in packed.lutffs.iter().enumerate() {
         let mut norm;
         let lutff = if full {
@@ -296,6 +306,17 @@ fn program_clb_frames(
             }
         }
     }
+    // A hard block's clock: the clock select of its base tile.
+    for (blk, line) in packed.conn.hard_clock.iter().enumerate() {
+        let Some(line) = line else { continue };
+        let site = routed.placed.hard_block_site(blk as u32).ok_or_else(|| format!("bitgen: hard block {blk} is not placed"))?;
+        let major = dev.clb_major(site.x, site.y).ok_or_else(|| format!("bitgen: hard block {blk} is not on a CLB tile"))?;
+        for b in 0..ck::LINE_BITS {
+            if (*line >> b) & 1 == 1 {
+                or_clb_bit(frames, major, ck::ABS_CLKSEL + b, fb);
+            }
+        }
+    }
     for m in &routed.imux {
         let major = dev
             .clb_major(m.x, m.y)
@@ -350,7 +371,93 @@ fn program_clb_frames(
             }
         }
     }
+    // DRC: nothing configured a LUT, a BLE mode or a flop of a hard tile.
+    for &(x, y) in &reserved {
+        let major = dev.clb_major(x, y).ok_or_else(|| format!("bitgen: hard tile X{x}Y{y} is not a CLB tile"))?;
+        let logic_end = feat.imux0_abs;
+        for abs in (0..logic_end).step_by(fb as usize) {
+            let minor = (abs / fb) as u8;
+            let n = (logic_end - abs).min(fb);
+            let mask = if n >= 128 { u128::MAX } else { (1u128 << n) - 1 };
+            if frames.get(&(Far::CLB_IO_CLK, major, minor)).copied().unwrap_or(0) & mask != 0 {
+                return Err(format!("bitgen: CLB_X{x}Y{y} is a hard-block tile but has LUT or flop bits set"));
+            }
+        }
+    }
     Ok(())
+}
+
+/// Minor-0..1 words and contents of the hard blocks: `(block type, major,
+/// minor) -> word`. A block connected to the fabric gets `FABRIC`, its
+/// modes and its `PIN_EN` mask, and a RAM its contents in minors 1..=128;
+/// a name-only block keeps the older layout (one 64-bit `INIT` word per
+/// minor 1..=255). Majors are site indices.
+pub fn hard_block_frames(dev: &Device, routed: &Routed) -> Result<Vec<((u8, u16, u8), u128)>, String> {
+    use helion_device::hard as hd;
+    let placed = &routed.placed;
+    let packed = &placed.packed;
+    let conn = &packed.conn;
+    let mut out: Vec<((u8, u16, u8), u128)> = Vec::new();
+    let mut pin_en: HashMap<u32, [u64; 2]> = HashMap::new();
+    for h in &conn.hard_pins {
+        if h.m >= 64 || h.dy >= 2 {
+            return Err(format!("bitgen: hard block {} has a pin on IMUX {} of tile {}", h.blk, h.m, h.dy));
+        }
+        pin_en.entry(h.blk).or_default()[h.dy as usize] |= 1u64 << h.m;
+    }
+    let blk_of = |kind: hd::Kind, idx: usize| conn.hard.iter().position(|r| r.kind == kind && r.idx as usize == idx);
+    let base = |site: helion_device::Site, kind: hd::Kind| -> Result<(u16, u128), String> {
+        let (k, major) = dev.hard_site(site).ok_or_else(|| format!("bitgen: {} is not a hard-block site of {}", site.id(), dev.part))?;
+        if k != kind {
+            return Err(format!("bitgen: {} is the wrong kind of site", site.id()));
+        }
+        Ok((major, 1u128 << hd::USED | (site.x as u128) << hd::X_SHIFT | (site.y as u128) << hd::Y_SHIFT))
+    };
+    for (i, m) in packed.macs.iter().enumerate() {
+        let site = *placed.mac_sites.get(i).ok_or_else(|| format!("bitgen: {} is not placed", m.cell))?;
+        let (major, mut word) = base(site, hd::Kind::Mac)?;
+        let mut word1 = 0u128;
+        if let Some(blk) = blk_of(hd::Kind::Mac, i) {
+            let en = pin_en.get(&(blk as u32)).copied().unwrap_or_default();
+            word |= 1 << hd::FABRIC | (m.signed as u128) << hd::SIGNED | (m.preg as u128) << hd::PREG | (m.use_c as u128) << hd::USE_C;
+            word |= (en[0] as u128) << hd::PIN_EN_MAC;
+            word1 = en[1] as u128;
+        }
+        out.push(((Far::DSP, major, 0), word));
+        out.push(((Far::DSP, major, 1), word1));
+    }
+    for (i, b) in packed.brams.iter().enumerate() {
+        let site = *placed.bram_sites.get(i).ok_or_else(|| format!("bitgen: {} is not placed", b.cell))?;
+        let (major, mut word) = base(site, hd::Kind::Bram)?;
+        match blk_of(hd::Kind::Bram, i) {
+            Some(blk) => {
+                let en = pin_en.get(&(blk as u32)).copied().unwrap_or_default();
+                word |= 1 << hd::FABRIC | 1 << hd::READ_FIRST | (en[0] as u128) << hd::PIN_EN_RAM;
+                if b.init.len() > hd::RAM_INIT_WORDS {
+                    return Err(format!("bitgen: {} has {} INIT words, at most {}", b.cell, b.init.len(), hd::RAM_INIT_WORDS));
+                }
+                let mut minors = vec![0u128; hd::RAM_WORDS / 8];
+                for (w, v) in b.init.iter().enumerate() {
+                    // 64-bit word w holds addresses 4w..4w+3; a minor holds eight.
+                    minors[w / 2] |= (*v as u128) << (64 * (w % 2));
+                }
+                for (k, v) in minors.into_iter().enumerate() {
+                    debug_assert_eq!(hd::init_loc(8 * k as u32), ((k + 1) as u8, 0));
+                    out.push(((Far::BRAM, major, (k + 1) as u8), v));
+                }
+            }
+            None => {
+                if b.init.len() > 255 {
+                    return Err(format!("bitgen: {} has {} INIT words, at most 255", b.cell, b.init.len()));
+                }
+                for (wi, w) in b.init.iter().enumerate() {
+                    out.push(((Far::BRAM, major, (wi + 1) as u8), *w as u128));
+                }
+            }
+        }
+        out.push(((Far::BRAM, major, 0), word));
+    }
+    Ok(out)
 }
 
 /// Bitgen a routed design: every LUTFF INIT/FF, IMUX from PathFinder, IOB src, DSP/BRAM USED.
@@ -423,19 +530,8 @@ pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
         }
         acc.insert((Far::IOB, major, 0), word);
     }
-    for (i, _m) in packed.macs.iter().enumerate() {
-        let site = routed.placed.mac_sites[i];
-        let word = 1u128 | ((site.x as u128) << 8) | ((site.y as u128) << 16);
-        acc.insert((Far::DSP, i as u16, 0), word);
-    }
-    for (i, b) in packed.brams.iter().enumerate() {
-        let site = routed.placed.bram_sites[i];
-        let word = 1u128 | ((site.x as u128) << 8) | ((site.y as u128) << 16);
-        acc.insert((Far::BRAM, i as u16, 0), word);
-        for (wi, w) in b.init.iter().enumerate() {
-            let minor = 1u8 + (wi as u8);
-            acc.insert((Far::BRAM, i as u16, minor), *w as u128);
-        }
+    for (k, w) in hard_block_frames(dev, routed)? {
+        acc.insert(k, w);
     }
     acc.retain(|_, w| *w != 0);
     if acc.is_empty() {
@@ -742,6 +838,12 @@ pub fn bitgen_pblock(
             majors.contains(maj)
         } else if *b == Far::IOB {
             iob_x.iter().any(|x| dev.iob_major(*x, 0) == Some(*maj))
+        } else if *b == Far::BRAM || *b == Far::DSP {
+            // A hard block whose site is in the region.
+            sites.iter().any(|&(x, y)| match dev.hard_tile(x, y) {
+                Some((k, i, 0)) => i == *maj && (k == helion_device::hard::Kind::Bram) == (*b == Far::BRAM),
+                _ => false,
+            })
         } else {
             false
         };
@@ -3814,5 +3916,144 @@ mod tests {
         let decomp = decompress_bitstream(&comp).unwrap();
         assert_eq!(decomp.frames, uncomp.frames);
         assert_eq!(decomp.packets, uncomp.packets);
+    }
+}
+
+#[cfg(test)]
+mod hard_tests {
+    use super::*;
+    use helion_device::hard;
+    use helion_ir::{CellKind, Design, PortDir};
+    use helion_pack::pack;
+    use helion_place::place;
+    use helion_route::route;
+
+    /// A 4-bit counter on the RAM's addresses, an input on DI0 and WE, DO0
+    /// to a pad and DO9 through a LUT to a pad.
+    fn ram_design() -> Design {
+        let mut d = Design::structural_counter();
+        d.add_port("din", PortDir::In);
+        d.add_port("o0", PortDir::Out);
+        d.add_port("o9", PortDir::Out);
+        d.add_cell("ram", CellKind::Bram18);
+        d.set_cell_attr("ram", "INIT", "0x0004000300020001,0,0x00000000000000ff").unwrap();
+        d.connect("clk", "ram", "CLK");
+        d.connect("din", "ram", "DI0");
+        d.connect("din", "ram", "WE");
+        for i in 0..4 {
+            d.connect(&format!("q{i}"), "ram", &format!("RADDR{i}"));
+            d.connect(&format!("q{i}"), "ram", &format!("WADDR{i}"));
+        }
+        d.connect("do0", "ram", "DO0");
+        d.add_cell("io0", CellKind::IobOut);
+        d.connect("do0", "io0", "I");
+        d.connect("o0", "io0", "PAD");
+        d.connect("do9", "ram", "DO9");
+        d.add_cell("inv", CellKind::Lut6 { init: 0x5555_5555_5555_5555 });
+        d.connect("do9", "inv", "I0");
+        d.connect("n9", "inv", "O");
+        d.add_cell("io9", CellKind::IobOut);
+        d.connect("n9", "io9", "I");
+        d.connect("o9", "io9", "PAD");
+        d
+    }
+
+    #[test]
+    fn ram_is_placed_routed_and_configured() {
+        for part in ["HL10T-C32-1", "HL10S-C64-1"] {
+            let dev = Device::load_part(part).unwrap();
+            let routed = route(&place(&pack(&ram_design(), &dev).unwrap(), &dev).unwrap(), &dev).unwrap();
+            let site = routed.placed.bram_sites[0];
+            let reserved = routed.placed.reserved_tiles(&dev);
+            assert_eq!(reserved, [(site.x, site.y)].into_iter().collect());
+            assert!(routed.placed.lutff_sites.iter().all(|(s, _)| (s.x, s.y) != (site.x, site.y)));
+            let bits = bitgen(&dev, &routed).unwrap();
+            let major = dev.bram_major(site.x, site.y).unwrap();
+            let w0 = bits.frames[&(Far::BRAM, major, 0)];
+            assert_eq!(w0 & 1, 1);
+            assert_eq!((w0 >> hard::X_SHIFT) & 0xff, site.x as u128);
+            assert_eq!((w0 >> hard::Y_SHIFT) & 0xff, site.y as u128);
+            assert_eq!((w0 >> hard::FABRIC) & 1, 1);
+            assert_eq!((w0 >> hard::READ_FIRST) & 1, 1);
+            // PIN_EN: DI0, WADDR0..3, RADDR0..3, WE.
+            let en = (w0 >> hard::PIN_EN_RAM) as u64;
+            let want: u64 = 1 | (0xf << 16) | (0xf << 32) | (1 << 42);
+            assert_eq!(en, want, "{part}: PIN_EN {en:#x}");
+            // INIT: address 1 is 2, address 3 is 4, address 8 is 0xff.
+            let at = |a: u32| -> u16 {
+                let (minor, bit) = hard::init_loc(a);
+                (bits.frames.get(&(Far::BRAM, major, minor)).copied().unwrap_or(0) >> bit) as u16
+            };
+            assert_eq!((at(0), at(1), at(3), at(4), at(8), at(1023)), (1, 2, 4, 0, 0xff, 0));
+            assert_eq!(dev.locate(&format!("{}.INIT[8][7]", site.id())).map(|l| (bits.frames[&(l.far.block_type, l.far.major, l.far.minor)] >> l.bit) & 1).unwrap(), 1);
+            // Every connected input reads a wire in the block's tile.
+            let cmajor = dev.clb_major(site.x, site.y).unwrap();
+            let clb_bit = |abs: u32| (bits.frames.get(&(Far::CLB_IO_CLK, cmajor, (abs / 128) as u8)).copied().unwrap_or(0) >> (abs % 128)) & 1 == 1;
+            for m in 0..64 {
+                assert_eq!(clb_bit(helion_device::tracks::ABS_IMUXT + m), (want >> m) & 1 == 1, "{part}: IMUXT[{m}]");
+            }
+            // No LUT, mode or flop bit in the tile.
+            assert!((0..592).all(|a| !clb_bit(a)));
+            // Both outputs leave the tile on a wire.
+            assert!(routed.tracks.sb.iter().any(|w| (w.x, w.y) == (site.x, site.y) && w.sel == 1));
+            assert!(routed.tracks.sb.iter().any(|w| (w.x, w.y) == (site.x, site.y) && w.sel == 10));
+        }
+    }
+
+    #[test]
+    fn multiplier_takes_two_tiles_and_its_modes() {
+        let dev = Device::load_part("HL10T-DSP1").unwrap();
+        let mut d = Design::new("mul");
+        for p in ["a", "c"] {
+            d.add_port(p, PortDir::In);
+        }
+        d.add_cell("mul", CellKind::Mac27);
+        d.set_cell_attr("mul", "SIGNED", "1").unwrap();
+        d.connect("a", "mul", "A3");
+        d.connect("a", "mul", "B0");
+        d.connect("c", "mul", "C31");
+        for (i, b) in [(0, 4), (1, 20)] {
+            d.add_port(&format!("p{i}"), PortDir::Out);
+            d.connect(&format!("pn{i}"), "mul", &format!("P{b}"));
+            d.add_cell(&format!("io{i}"), CellKind::IobOut);
+            d.connect(&format!("pn{i}"), &format!("io{i}"), "I");
+            d.connect(&format!("p{i}"), &format!("io{i}"), "PAD");
+        }
+        let routed = route(&place(&pack(&d, &dev).unwrap(), &dev).unwrap(), &dev).unwrap();
+        let site = routed.placed.mac_sites[0];
+        assert_eq!(routed.placed.reserved_tiles(&dev).len(), 2);
+        let bits = bitgen(&dev, &routed).unwrap();
+        let w0 = bits.frames[&(Far::DSP, 0, 0)];
+        assert_eq!((w0 >> hard::SIGNED) & 1, 1);
+        assert_eq!((w0 >> hard::PREG) & 1, 0);
+        assert_eq!((w0 >> hard::USE_C) & 1, 1);
+        assert_eq!((w0 >> hard::PIN_EN_MAC) as u64, (1 << 3) | (1 << 16));
+        assert_eq!(bits.frames[&(Far::DSP, 0, 1)], 1 << 31);
+        // P4 leaves the base tile, P20 the tile above.
+        assert!(routed.tracks.sb.iter().any(|w| (w.x, w.y) == (site.x, site.y) && w.sel == 5));
+        assert!(routed.tracks.sb.iter().any(|w| (w.x, w.y) == (site.x, site.y + 1) && w.sel == 5));
+        // A second connected multiplier does not fit the one site.
+        d.add_cell("mul2", CellKind::Mac27);
+        d.connect("a", "mul2", "A0");
+        let e = place(&pack(&d, &dev).unwrap(), &dev).unwrap_err();
+        assert!(e.contains("2 multiplier block(s)"), "{e}");
+        // HL10T-C32-1 has no multiplier site.
+        let t = Device::load_part("HL10T-C32-1").unwrap();
+        assert!(place(&pack(&d, &t).unwrap(), &t).is_err());
+    }
+
+    /// The RAM takes the site nearest its logic, and LUTs move off it.
+    #[test]
+    fn ram_site_by_cost_and_tile_cleared() {
+        let dev = Device::load_part("HL10S-C64-1").unwrap();
+        let mut d = ram_design();
+        // Pull the logic up: pads on the top edge near the RAM column.
+        for (p, loc) in [("led", "IOB_X10Y65"), ("o0", "IOB_X11Y65"), ("o9", "IOB_X9Y65")] {
+            d.set_loc(p, loc).unwrap();
+        }
+        let placed = place(&pack(&d, &dev).unwrap(), &dev).unwrap();
+        assert!(placed.bram_sites[0].y > 16, "site {:?} is not near the top", placed.bram_sites[0]);
+        let reserved = placed.reserved_tiles(&dev);
+        assert!(placed.lutff_sites.iter().all(|(s, _)| !reserved.contains(&(s.x, s.y))));
     }
 }
