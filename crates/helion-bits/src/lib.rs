@@ -832,6 +832,38 @@ pub fn bitgen_pblock(
         .filter_map(|(x, y)| dev.clb_major(*x, *y))
         .collect();
     let iob_x: std::collections::HashSet<u32> = sites.iter().map(|(x, _)| *x).collect();
+    // Hard blocks whose frames go in: one connected to the fabric only
+    // with all of its tiles (its frames enable pins whose routing is in
+    // the CLB frames of every tile), and refused if it straddles the
+    // region's edge; a pinless one by its base tile.
+    let in_region: std::collections::HashSet<(u32, u32)> = sites.iter().copied().collect();
+    let mut hard_keep: std::collections::HashSet<(u8, u16)> = std::collections::HashSet::new();
+    let placed = &routed.placed;
+    let blocks = placed
+        .packed
+        .macs
+        .iter()
+        .map(|m| (&m.cell, m.fabric))
+        .zip(placed.mac_sites.iter())
+        .chain(placed.packed.brams.iter().map(|b| (&b.cell, b.fabric)).zip(placed.bram_sites.iter()));
+    for ((cell, fabric), site) in blocks {
+        let Some((kind, major)) = dev.hard_site(*site) else { continue };
+        let block = if kind == helion_device::hard::Kind::Bram { Far::BRAM } else { Far::DSP };
+        if fabric {
+            let tiles = dev.hard_tiles(*site);
+            let n = tiles.iter().filter(|t| in_region.contains(t)).count();
+            if n == tiles.len() && n > 0 {
+                hard_keep.insert((block, major));
+            } else if n > 0 {
+                return Err(format!(
+                    "bitgen_pblock: {cell} at {} has tiles inside and outside the region; a hard block is reconfigured whole",
+                    site.id()
+                ));
+            }
+        } else if in_region.contains(&(site.x, site.y)) {
+            hard_keep.insert((block, major));
+        }
+    }
     let mut frames = BTreeMap::new();
     for ((b, maj, min), w) in &full.frames {
         let keep = if *b == Far::CLB_IO_CLK {
@@ -839,11 +871,7 @@ pub fn bitgen_pblock(
         } else if *b == Far::IOB {
             iob_x.iter().any(|x| dev.iob_major(*x, 0) == Some(*maj))
         } else if *b == Far::BRAM || *b == Far::DSP {
-            // A hard block whose site is in the region.
-            sites.iter().any(|&(x, y)| match dev.hard_tile(x, y) {
-                Some((k, i, 0)) => i == *maj && (k == helion_device::hard::Kind::Bram) == (*b == Far::BRAM),
-                _ => false,
-            })
+            hard_keep.contains(&(*b, *maj))
         } else {
             false
         };
@@ -3957,6 +3985,48 @@ mod hard_tests {
         d.connect("n9", "io9", "I");
         d.connect("o9", "io9", "PAD");
         d
+    }
+
+    /// A partial bitstream carries a multiplier connected to the fabric
+    /// with both of its tiles, or refuses a region that holds only one:
+    /// its second frame enables C pins routed in the upper tile.
+    #[test]
+    fn pblock_takes_a_multiplier_whole() {
+        let dev = Device::load_part("HL10T-DSP1").unwrap();
+        let mut d = Design::new("m");
+        for p in ["a", "b", "c"] {
+            d.add_port(p, PortDir::In);
+        }
+        d.add_cell("mul", CellKind::Mac27);
+        d.connect("a", "mul", "A3");
+        d.connect("b", "mul", "B0");
+        d.connect("c", "mul", "C31");
+        for i in [4, 20] {
+            d.add_port(&format!("o{i}"), PortDir::Out);
+            d.connect(&format!("p{i}"), "mul", &format!("P{i}"));
+            d.add_cell(&format!("io{i}"), CellKind::IobOut);
+            d.connect(&format!("p{i}"), &format!("io{i}"), "I");
+            d.connect(&format!("o{i}"), &format!("io{i}"), "PAD");
+        }
+        let routed = route(&place(&pack(&d, &dev).unwrap(), &dev).unwrap(), &dev).unwrap();
+        let site = routed.placed.mac_sites[0];
+        let tiles = dev.hard_tiles(site);
+        assert_eq!(tiles.len(), 2);
+        let full = bitgen(&dev, &routed).unwrap();
+        let upper = dev.clb_major(tiles[1].0, tiles[1].1).unwrap();
+        assert!(full.frames.keys().any(|k| k.0 == Far::CLB_IO_CLK && k.1 == upper), "the upper tile carries routing");
+        for part in [&tiles[..1], &tiles[1..]] {
+            let e = bitgen_pblock(&dev, &routed, part).unwrap_err();
+            assert!(e.contains("mul") && e.contains("inside and outside"), "{e}");
+        }
+        let pb = bitgen_pblock(&dev, &routed, &tiles).unwrap();
+        let major = dev.dsp_major(site.x, site.y).unwrap();
+        for (k, w) in &full.frames {
+            let ours = (k.0 == Far::DSP && k.1 == major) || (k.0 == Far::CLB_IO_CLK && tiles.iter().any(|t| dev.clb_major(t.0, t.1) == Some(k.1)));
+            if ours {
+                assert_eq!(pb.frames.get(k), Some(w), "{k:?}");
+            }
+        }
     }
 
     /// A flop without a clock is reported and laid out on the implicit
