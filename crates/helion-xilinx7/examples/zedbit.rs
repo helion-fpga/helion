@@ -195,8 +195,7 @@ fn main() {
 /// XDC period. A clock made by a flop has twice its source's period when
 /// that flop is a plain toggle (its input is its own output inverted, with
 /// no enable or reset); any other derived clock is refused, because its
-/// period cannot be known. (`pack` refuses flop-made clocks for now; this
-/// is ready for when the router can reach a global buffer from the fabric.)
+/// period cannot be known.
 fn clock_periods(packed: &helion_xilinx7::pack::Packed7, pin_period: u32) -> Result<HashMap<String, u32>, String> {
     let mut periods: HashMap<String, u32> = HashMap::new();
     let mut doms: Vec<String> = packed.ffs.iter().map(|f| f.clk_net.clone()).collect();

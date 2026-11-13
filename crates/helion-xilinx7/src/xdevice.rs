@@ -141,6 +141,12 @@ impl<'a> XDevice<'a> {
                     if w.starts_with("BYP_ALT") {
                         b |= 2;
                     }
+                    // A global buffer's input (CLK_BUFG_BUFGCTRL<n>_I0/I1):
+                    // a route ends there. Leaving it means passing through
+                    // the buffer, which only works when that buffer is used.
+                    if w.starts_with("CLK_BUFG_BUFGCTRL") && (w.ends_with("_I0") || w.ends_with("_I1")) {
+                        b |= 64;
+                    }
                     if self.device.tile(ti).map(|t| t.name.starts_with("CLB")).unwrap_or(false) {
                         b |= 4;
                     }
@@ -210,7 +216,7 @@ impl<'a> XDevice<'a> {
             if !allow_power && f & 1 != 0 {
                 return false;
             }
-            if !allow_power && !clock && f & 16 != 0 {
+            if !allow_power && !clock && !opts.allow_gclk && f & 16 != 0 {
                 return false;
             }
             // A clock stays on clock wires inside INT tiles.
@@ -371,6 +377,10 @@ impl<'a> XDevice<'a> {
                         }
                     }
                 }
+            }
+            // Never through a global buffer (see wire_flags).
+            if flags[id as usize] & 64 != 0 {
+                continue;
             }
             let (ti, wi) = self.wire_to_tile[id as usize];
             let clb = flags[id as usize] & 4 != 0;

@@ -3105,12 +3105,27 @@ fn insert_clock_spine(netlist: &Design, packed: &mut Packed7) -> Result<(), Stri
             continue;
         }
         // A clock made in the fabric (a flop's output, such as a divider)
-        // would need a route from the fabric into a global buffer, which
-        // the router does not find cleanly yet: refuse it by name.
+        // reaches the flops it clocks through a global buffer, as Vivado
+        // builds it. Any other non-port clock is an error.
         if packed.ffs.iter().any(|f| f.q_net == clk_net) {
-            return Err(format!(
-                "pack: clock net `{clk_net}` is driven by a flop; clocks made in the fabric are not supported yet (use a clock pin)"
-            ));
+            let bufg_out = format!("{clk_net}_bufg");
+            for ff in &mut packed.ffs {
+                if ff.clk_net == clk_net {
+                    ff.clk_net = bufg_out.clone();
+                }
+            }
+            for srl in &mut packed.srls {
+                if srl.clk_net == clk_net {
+                    srl.clk_net = bufg_out.clone();
+                }
+            }
+            packed.bufgs.push(PackedBufg {
+                name: format!("bufg_{clk_net}"),
+                in_net: clk_net.clone(),
+                out_net: bufg_out,
+                ..Default::default()
+            });
+            continue;
         }
         let port = netlist
             .ports
@@ -3339,9 +3354,9 @@ mod tests {
         assert!(err.contains("both a synchronous and an asynchronous reset"), "got: {err}");
     }
 
-    /// A clock driven by a flop (a divider) is refused by name.
+    /// A clock driven by a flop (a divider) gets its own global buffer.
     #[test]
-    fn pack_refuses_a_flop_driven_clock() {
+    fn pack_buffers_a_flop_driven_clock() {
         let mut d = Design::new("div");
         d.add_port("clk", PortDir::In);
         d.add_cell("div_reg", CellKind::Hff);
@@ -3355,8 +3370,12 @@ mod tests {
         d.connect("x", "r_reg", "D");
         d.connect("r", "r_reg", "Q");
         d.connect("div", "r_reg", "CLK");
-        let err = pack(&d).unwrap_err();
-        assert!(err.contains("driven by a flop"), "got: {err}");
+        let packed = pack(&d).unwrap();
+        assert!(packed.bufgs.iter().any(|b| b.in_net == "div" && b.out_net == "div_bufg"));
+        let r = packed.ffs.iter().find(|f| f.name == "r_reg").unwrap();
+        assert_eq!(r.clk_net, "div_bufg");
+        let dv = packed.ffs.iter().find(|f| f.name == "div_reg").unwrap();
+        assert_eq!(dv.clk_net, "clk_bufg");
     }
 
     #[test]

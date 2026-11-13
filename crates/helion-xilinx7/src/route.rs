@@ -30,6 +30,9 @@ pub struct RouteOpts {
     /// Last resort for parts with an incomplete database: also use pips
     /// the database gives no configuration bits for.
     pub any_pip: bool,
+    /// A fabric signal on its way into a global buffer input: `GCLK_*`
+    /// wires are legal (power wires and pips without bits still are not).
+    pub allow_gclk: bool,
     /// Congestion negotiation: wires held by other nets are legal at a
     /// cost; the caller rips up the nets the path displaces.
     pub negotiate: bool,
@@ -954,9 +957,23 @@ fn route_net(
                 }
             }
         }
-        if matches!(fast, Some(None)) && matches!(load.pin.as_str(), "I0" | "I1") {
+        let bufg_input = matches!(load.pin.as_str(), "I0" | "I1") && load.site.starts_with("BUFGCTRL");
+        let from_pad = driver.site.starts_with("IOB");
+        if matches!(fast, Some(None)) && bufg_input && !from_pad {
+            // A clock made in the fabric: global clock wires lead from the
+            // interconnect to the buffer inputs.
+            for negotiate in [false, true] {
+                fast = device.route_fast((&src_tile, &src_wire), &tree, &sinks, RouteOpts { allow_gclk: true, negotiate, ..opts }, net, claimed);
+                if !matches!(fast, Some(None)) {
+                    break;
+                }
+            }
+        }
+        if matches!(fast, Some(None)) && matches!(load.pin.as_str(), "I0" | "I1") && from_pad {
             // Parts whose database lacks the clock-input wiring: the old
             // permissive search (clock wires allowed) as a last resort.
+            // Only from a pad: from the fabric it took pips with no
+            // configuration bits through unused buffers (x7v rejects that).
             eprintln!("route: `{net}` has no clean path to {}.{}; retrying with clock wires allowed", load.site, load.pin);
             fast = device.route_fast((&src_tile, &src_wire), &tree, &sinks, RouteOpts { allow_power: true, any_pip: true, ..opts }, net, claimed);
         }
