@@ -564,8 +564,35 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     // again. History cost on contested wires steers later searches away.
     let max_rips = 40 * net_names.len() + 2000;
     let mut rips = 0usize;
+    let total_nets = net_names.len();
+    // HELION_ROUTE_RIPSTATS: with the progress line, the nets ripped up most
+    // and the nets that ripped up others most.
+    let rip_stats = std::env::var("HELION_ROUTE_RIPSTATS").is_ok();
+    let mut rip_count: HashMap<String, usize> = HashMap::new();
+    let mut ripper_count: HashMap<String, usize> = HashMap::new();
     let mut queue: std::collections::VecDeque<String> = net_names.into();
+    let t_start = std::time::Instant::now();
+    let mut t_report = t_start;
+    let mut routed_count = 0usize;
     while let Some(net) = queue.pop_front() {
+        routed_count += 1;
+        if t_report.elapsed().as_secs() >= 30 {
+            t_report = std::time::Instant::now();
+            eprintln!(
+                "route: {:.0}s, {routed_count} net routes for {total_nets} nets, {} queued, {rips} rip-ups",
+                t_start.elapsed().as_secs_f64(),
+                queue.len() + 1
+            );
+            if rip_stats {
+                let top = |m: &HashMap<String, usize>| {
+                    let mut v: Vec<(&String, &usize)> = m.iter().collect();
+                    v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                    v.iter().take(8).map(|(k, c)| format!("{k}:{c}")).collect::<Vec<_>>().join(" ")
+                };
+                eprintln!("route: most ripped {}", top(&rip_count));
+                eprintln!("route: most ripping {}", top(&ripper_count));
+            }
+        }
         let eps = &net_eps[&net];
         if co_nets.contains(net.as_str()) {
             // Dedicated cascade: exactly one CO driver plus one CI load.
@@ -652,6 +679,10 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
             device.release_claims(&victims, claimed.len());
             for v in &victims {
                 queue.push_back(v.clone());
+                if rip_stats {
+                    *rip_count.entry(v.clone()).or_insert(0usize) += 1;
+                    *ripper_count.entry(net.clone()).or_insert(0usize) += 1;
+                }
             }
         }
         if device.is_clock_net(&net) && matches!(kind, RouteKind::Pips(_)) {
