@@ -41,6 +41,10 @@ pub struct XDevice<'a> {
     wire_to_node: Vec<u32>,
     /// node_id -> member wire_ids.
     node_members: HashMap<u32, Vec<u32>>,
+    /// The same, flat for the router's inner loop: node `n`'s members are
+    /// `node_list[node_off[n]..node_off[n + 1]]`.
+    node_off: Vec<u32>,
+    node_list: Vec<u32>,
     /// wire_id -> (tile_idx, wire_idx).
     wire_to_tile: Vec<(usize, u32)>,
     /// Router claims by wire id, rebuilt when the claim map grows.
@@ -53,6 +57,9 @@ pub struct XDevice<'a> {
     search: std::cell::RefCell<SearchBuf>,
     /// Congestion history per wire id (times a wire was fought over).
     history: std::cell::RefCell<Vec<u16>>,
+    /// Per search, by node: whether a dead-end node leads into the target
+    /// (stamp of the search that computed it, and the answer).
+    approach: std::cell::RefCell<(Vec<u32>, Vec<u8>)>,
 }
 
 #[derive(Default)]
@@ -70,17 +77,45 @@ struct SearchBuf {
 impl<'a> XDevice<'a> {
     pub fn new(device: &'a Device, maps: NodeMaps) -> Self {
         let (wire_to_node, node_members, wire_to_tile) = maps;
+        let n = wire_to_tile.len();
+        let mut node_off = vec![0u32; n + 1];
+        for (&nid, m) in &node_members {
+            if (nid as usize) < n {
+                node_off[nid as usize + 1] = m.len() as u32;
+            }
+        }
+        for i in 0..n {
+            node_off[i + 1] += node_off[i];
+        }
+        let mut node_list = vec![0u32; node_off[n] as usize];
+        for (&nid, m) in &node_members {
+            if (nid as usize) < n {
+                let o = node_off[nid as usize] as usize;
+                node_list[o..o + m.len()].copy_from_slice(m);
+            }
+        }
         Self {
             device,
             clock_nets: HashSet::new(),
             wire_to_node,
             node_members,
+            node_off,
+            node_list,
             wire_to_tile,
             claim_cache: std::cell::RefCell::new((usize::MAX, HashMap::new())),
             owner: std::cell::RefCell::new((Vec::new(), HashMap::new())),
             flags: std::cell::RefCell::new(Vec::new()),
             search: std::cell::RefCell::new(SearchBuf::default()),
             history: std::cell::RefCell::new(Vec::new()),
+            approach: std::cell::RefCell::new((Vec::new(), Vec::new())),
+        }
+    }
+
+    /// Members of node `nid` (empty for a wire with no node).
+    fn node_wires(&self, nid: u32) -> &[u32] {
+        match (self.node_off.get(nid as usize), self.node_off.get(nid as usize + 1)) {
+            (Some(&a), Some(&b)) => &self.node_list[a as usize..b as usize],
+            _ => &[],
         }
     }
 
@@ -118,7 +153,10 @@ impl<'a> XDevice<'a> {
     }
 
     /// Per-wire flags: bit 0 power/clock wire, bit 1 BYP_ALT, bit 2 in a CLB
-    /// tile (pseudo-pips there are slice configuration), computed once.
+    /// tile (pseudo-pips there are slice configuration), bit 3 INT tile,
+    /// bit 4 GCLK_ wire, bit 5 clock wire, bit 6 global buffer input, bit 7
+    /// dead end (no member of the wire's node has an outgoing pip, so a
+    /// route can only end there), computed once.
     fn wire_flags(&self) -> std::cell::Ref<'_, Vec<u8>> {
         {
             let mut f = self.flags.borrow_mut();
@@ -154,6 +192,64 @@ impl<'a> XDevice<'a> {
                         b |= 8;
                     }
                     f[id] = b;
+                }
+                // Dead ends, per node: every pip the search could take out of
+                // the node leads only to dead nodes (a LUT pin has none; the
+                // interconnect input feeding it has one, to that pin).
+                // Only pips the search takes count: ones with configuration
+                // bits, and no pseudo-pip inside a CLB tile (those are LUT
+                // route-throughs, slice configuration).
+                let has_out: Vec<bool> = (0..n)
+                    .map(|id| {
+                        let (ti, wi) = self.wire_to_tile[id];
+                        let clb = f[id] & 4 != 0;
+                        self.device.pips_from_idx(ti, wi).any(|p| p.usable && !(p.is_pseudo && clb))
+                    })
+                    .collect();
+                for id in 0..n {
+                    let nid = self.wire_to_node[id];
+                    let out = if nid == u32::MAX {
+                        has_out[id]
+                    } else {
+                        self.node_wires(nid).iter().any(|&m| has_out[m as usize])
+                    };
+                    if !out {
+                        f[id] |= 128;
+                    }
+                }
+                // Then nodes whose every exit is dead, until nothing changes
+                // (chains are short: interconnect input, LUT pin).
+                for _round in 0..6 {
+                    let mut changed = 0usize;
+                    for id in 0..n {
+                        if f[id] & 128 != 0 {
+                            continue;
+                        }
+                        let nid = self.wire_to_node[id];
+                        let one = [id as u32];
+                        let members: &[u32] = if nid == u32::MAX { &one } else { self.node_wires(nid) };
+                        let alive = members.iter().any(|&m| {
+                            let (ti, wi) = self.wire_to_tile[m as usize];
+                            let clb = f[m as usize] & 4 != 0;
+                            let base = self.device.wire_id(ti, 0).unwrap_or(0);
+                            self.device
+                                .pips_from_idx(ti, wi)
+                                .any(|p| p.usable && !(p.is_pseudo && clb) && f[(base + p.dst) as usize] & 128 == 0)
+                        });
+                        if !alive {
+                            for &m in members {
+                                f[m as usize] |= 128;
+                            }
+                            changed += 1;
+                        }
+                    }
+                    if changed == 0 {
+                        break;
+                    }
+                }
+                if debug_env("HELION_ROUTE_STATS") {
+                    let dead = f.iter().filter(|&&b| b & 128 != 0).count();
+                    eprintln!("route_stat dead-end wires {dead} of {n}");
                 }
             }
         }
@@ -248,6 +344,31 @@ impl<'a> XDevice<'a> {
             c
         };
         let is_target = |id: u32| targets.contains(&id);
+        // A dead-end wire is worth visiting only on the way into a target:
+        // the target itself or a wire of the target's node.
+        let target_nodes: Vec<u32> = targets.iter().map(|&t| self.wire_to_node[t as usize]).filter(|&n| n != u32::MAX).collect();
+        let in_target = |w: u32| is_target(w) || target_nodes.contains(&self.wire_to_node[w as usize]);
+        // Whether a dead-end wire's node leads into a target within a few
+        // pips (memoized per node for this search).
+        fn reaches(x: &XDevice<'_>, w: u32, depth: u32, flags: &[u8], in_target: &dyn Fn(u32) -> bool) -> bool {
+            let nid = x.wire_to_node[w as usize];
+            let one = [w];
+            let members: &[u32] = if nid == u32::MAX { &one } else { x.node_wires(nid) };
+            if members.iter().any(|&m| in_target(m)) {
+                return true;
+            }
+            if depth == 0 {
+                return false;
+            }
+            members.iter().any(|&m| {
+                let (ti, wi) = x.wire_to_tile[m as usize];
+                let clb = flags[m as usize] & 4 != 0;
+                let base = x.device.wire_id(ti, 0).unwrap_or(0);
+                x.device
+                    .pips_from_idx(ti, wi)
+                    .any(|p| p.usable && !(p.is_pseudo && clb) && reaches(x, base + p.dst, depth - 1, flags, in_target))
+            })
+        }
         let tgt_xy: Vec<(i32, i32)> = targets.iter().map(|&t| self.wire_xy(t)).collect();
 
         const PIP_BASE: u32 = 15;
@@ -274,6 +395,27 @@ impl<'a> XDevice<'a> {
             sb.generation = 1;
         }
         let stampv = sb.generation;
+        // (The permissive search takes pips without bits too: no pruning.)
+        let mut ap = self.approach.borrow_mut();
+        if ap.0.len() != n || stampv == 1 {
+            // New buffer, or the stamps wrapped around: forget old answers.
+            ap.0 = vec![0; n];
+            ap.1 = vec![0; n];
+        }
+        let mut leads_to_target = |id: u32| -> bool {
+            if opts.any_pip || flags[id as usize] & 128 == 0 {
+                return true;
+            }
+            let nid = self.wire_to_node[id as usize];
+            let key = if nid == u32::MAX { id } else { nid } as usize;
+            if ap.0[key] == stampv {
+                return ap.1[key] != 0;
+            }
+            let b = reaches(self, id, 3, &flags, &in_target);
+            ap.0[key] = stampv;
+            ap.1[key] = b as u8;
+            b
+        };
         let mut heap: BinaryHeap<Reverse<(u32, u32, u32)>> = BinaryHeap::new();
         macro_rules! seen {
             ($id:expr) => {
@@ -355,9 +497,9 @@ impl<'a> XDevice<'a> {
             // Node siblings (tileconn stitching): free.
             let nid = self.wire_to_node[id as usize];
             if nid != u32::MAX {
-                if let Some(members) = self.node_members.get(&nid) {
-                    for &m in members {
-                        if m == id || !allowed(m) || !inside(m) {
+                {
+                    for &m in self.node_wires(nid) {
+                        if m == id || !allowed(m) || !inside(m) || !leads_to_target(m) {
                             continue;
                         }
                         // Tree wires (seeds) are fixed: a cheaper second
@@ -390,7 +532,7 @@ impl<'a> XDevice<'a> {
                     continue;
                 }
                 let dst = base + pip.dst;
-                if !allowed(dst) || !inside(dst) {
+                if !allowed(dst) || !inside(dst) || !leads_to_target(dst) {
                     continue;
                 }
                 let ng = g + pip.delay_ps as u32 + PIP_BASE + extra(dst);
@@ -408,11 +550,15 @@ impl<'a> XDevice<'a> {
                 }
             }
         }
-        if std::env::var("HELION_ROUTE_STATS").is_ok() {
-            eprintln!("route_stat net={net} expanded={expanded} found={} negotiate={} bbox={}", found.is_some(), opts.negotiate, opts.bbox);
+        if debug_env("HELION_ROUTE_STATS") {
+            let (cost, dist) = match found {
+                Some(e) => (sb.best[e as usize], h(start) / if opts.negotiate { 220 } else { 90 }),
+                None => (0, 0),
+            };
+            eprintln!("route_stat net={net} expanded={expanded} found={} negotiate={} bbox={} cost={cost} dist={dist}", found.is_some(), opts.negotiate, opts.bbox);
         }
         let Some(end) = found else {
-            if std::env::var("HELION_ROUTE_DEBUG").is_ok() {
+            if debug_env("HELION_ROUTE_DEBUG") {
                 let blocked: Vec<String> = targets.iter().map(|&t| format!("{:?} owner={} flags={}", self.wire_name_of(t), own.0.get(t as usize).copied().unwrap_or(0), flags[t as usize])).collect();
                 eprintln!("route_debug net={net} expanded={expanded} my={my} negotiate={} bbox={} cap={} limit={limit} targets={blocked:?}", opts.negotiate, opts.bbox, opts.cap_detour);
             }
@@ -593,6 +739,20 @@ impl<'a> XDevice<'a> {
 /// Build the node -> members map from a mutable Device.
 /// Returns (wire_id -> node_id, node_id -> wire_ids, wire_id -> (tile_idx, wire_idx)).
 /// Call once after loading; pass the result to [`XDevice::new`].
+/// Router debug switches, read once (a lookup per search showed up at 6% of
+/// routing time).
+fn debug_env(name: &'static str) -> bool {
+    use std::sync::OnceLock;
+    static STATS: OnceLock<bool> = OnceLock::new();
+    static DEBUG: OnceLock<bool> = OnceLock::new();
+    let cell = match name {
+        "HELION_ROUTE_STATS" => &STATS,
+        "HELION_ROUTE_DEBUG" => &DEBUG,
+        _ => return std::env::var(name).is_ok(),
+    };
+    *cell.get_or_init(|| std::env::var(name).is_ok())
+}
+
 pub fn build_node_map(device: &mut Device) -> NodeMaps {
     let n = device.tile_count();
     // First pass: find max wire_id.
@@ -770,9 +930,19 @@ impl<'a> RouteQuery for XDevice<'a> {
         }
         let mut own = self.owner.borrow_mut();
         let oids: Vec<u32> = nets.iter().filter_map(|n| own.1.get(n).copied()).collect();
-        for slot in own.0.iter_mut() {
-            if *slot != 0 && oids.contains(slot) {
-                *slot = 0;
+        // A net owns the wires it claimed and their node siblings (see
+        // `mark_owner`): clear those, not the whole device.
+        let mine: Vec<u32> = cache.1.iter().filter(|(_, n)| nets.contains(n)).map(|(&w, _)| w).collect();
+        for w in mine {
+            let nid = self.wire_to_node.get(w as usize).copied().unwrap_or(u32::MAX);
+            let one = [w];
+            let members: &[u32] = if nid == u32::MAX { &one } else { self.node_wires(nid) };
+            for &m in members.iter().chain(one.iter()) {
+                if let Some(slot) = own.0.get_mut(m as usize) {
+                    if *slot != 0 && oids.contains(slot) {
+                        *slot = 0;
+                    }
+                }
             }
         }
         cache.1.retain(|_, n| !nets.contains(n));

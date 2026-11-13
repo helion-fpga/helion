@@ -96,6 +96,10 @@ struct TileTypeData {
     pips: Vec<Pip>,
     /// src wire idx -> pip indices with that source.
     pips_from: HashMap<u32, Vec<u32>>,
+    /// The same, flat (built on first use): wire `w`'s pips are
+    /// `pips_from_flat.1[pips_from_flat.0[w]..pips_from_flat.0[w + 1]]`.
+    /// The router asks once per wire it expands.
+    pips_from_flat: std::sync::OnceLock<(Vec<u32>, Vec<u32>)>,
     site_templates: Vec<SiteTemplateData>,
     segbits: HashMap<String, Vec<SegBit>>,
     mask: Vec<(u32, u32)>,
@@ -765,9 +769,32 @@ impl Device {
     /// Pips driven by wire index `wire_idx` of a tile (index form).
     pub fn pips_from_idx(&self, tile_idx: usize, wire_idx: u32) -> impl Iterator<Item = &Pip> {
         let td = self.tiles.get(tile_idx).map(|t| &self.types[t.type_id as usize]);
-        td.and_then(|td| td.pips_from.get(&wire_idx).map(move |v| v.iter().map(move |&i| &td.pips[i as usize])))
-            .into_iter()
-            .flatten()
+        td.map(|td| {
+            let (off, list) = td.pips_from_flat.get_or_init(|| {
+                let n = td.wires.len().max(td.pips_from.keys().map(|&k| k as usize + 1).max().unwrap_or(0));
+                let mut off = vec![0u32; n + 1];
+                for (&w, v) in &td.pips_from {
+                    off[w as usize + 1] = v.len() as u32;
+                }
+                for i in 0..n {
+                    off[i + 1] += off[i];
+                }
+                let mut list = vec![0u32; off[n] as usize];
+                for (&w, v) in &td.pips_from {
+                    let o = off[w as usize] as usize;
+                    list[o..o + v.len()].copy_from_slice(v);
+                }
+                (off, list)
+            });
+            let w = wire_idx as usize;
+            let (a, b) = match (off.get(w), off.get(w + 1)) {
+                (Some(&a), Some(&b)) => (a as usize, b as usize),
+                _ => (0, 0),
+            };
+            list[a..b].iter().map(move |&i| &td.pips[i as usize])
+        })
+        .into_iter()
+        .flatten()
     }
 
     /// `(pin_name, tile_wire)` pairs of a site, if its template matched.
