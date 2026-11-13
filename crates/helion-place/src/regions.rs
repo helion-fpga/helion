@@ -170,7 +170,30 @@ pub fn legalize_into_regions(
     if regions.is_empty() {
         return Ok(stats);
     }
-    let clbs: Vec<Site> = dev.clb_sites().collect();
+    // Hard blocks (DSP / BRAM) first: owned blocks move onto a free site of
+    // their kind inside their region when the region covers one. The tiles
+    // of the blocks connected to the fabric are then off limits to LUTs
+    // and flops.
+    legalize_hard(
+        &placed.packed.macs.iter().map(|m| (m.cell.clone(), m.fabric)).collect::<Vec<_>>(),
+        &mut placed.mac_sites,
+        dev.dsp_sites().collect(),
+        SiteKind::Dsp,
+        regions,
+        &mut stats,
+        dev,
+    )?;
+    legalize_hard(
+        &placed.packed.brams.iter().map(|b| (b.cell.clone(), b.fabric)).collect::<Vec<_>>(),
+        &mut placed.bram_sites,
+        dev.bram_sites().collect(),
+        SiteKind::Bram,
+        regions,
+        &mut stats,
+        dev,
+    )?;
+    let reserved = placed.reserved_tiles(dev);
+    let clbs: Vec<Site> = dev.clb_sites().filter(|s| !reserved.contains(&(s.x, s.y))).collect();
     let region_slots: Vec<Vec<(Site, u8)>> = regions
         .iter()
         .map(|r| {
@@ -220,14 +243,18 @@ pub fn legalize_into_regions(
     let in_any_region = |x: u32, y: u32| regions.iter().any(|r| r.contains(x, y));
     let mut occupied: HashSet<(u32, u32, u8)> = HashSet::new();
     // Unconstrained clusters hold their slots; owned clusters already
-    // inside their region keep theirs.
+    // inside their region keep theirs. A cluster on a hard block's tile
+    // moves (`displaced` if unconstrained, else with the pending ones).
     let mut pending: Vec<usize> = Vec::new();
+    let mut displaced: Vec<usize> = Vec::new();
     for (i, slot) in placed.lutff_sites.iter().enumerate() {
+        let on_block = reserved.contains(&(slot.0.x, slot.0.y));
         match owner[i] {
+            None if on_block => displaced.push(i),
             None => {
                 occupied.insert(key(slot));
             }
-            Some(r) if regions[r].contains(slot.0.x, slot.0.y) && occupied.insert(key(slot)) => {}
+            Some(r) if !on_block && regions[r].contains(slot.0.x, slot.0.y) && occupied.insert(key(slot)) => {}
             Some(_) => pending.push(i),
         }
     }
@@ -259,6 +286,21 @@ pub fn legalize_into_regions(
             placed.lutff_sites[j] = refuge;
             stats[ri].evicted += 1;
         }
+    }
+    // Unconstrained clusters off the hard blocks' tiles: the nearest free
+    // slot outside the exclusive regions.
+    for j in displaced {
+        let taken = placed.lutff_sites[j];
+        let from = (taken.0.x, taken.0.y);
+        let refuge = clbs
+            .iter()
+            .filter(|s| !regions.iter().any(|x| x.exclusive && x.contains(s.x, s.y)))
+            .flat_map(|s| (0..n_ble).map(move |b| (*s, b)))
+            .filter(|s| !occupied.contains(&key(s)))
+            .min_by_key(|s| (dist(from, (s.0.x, s.0.y)), s.0.x, s.0.y, s.1))
+            .ok_or_else(|| format!("place: no free BLE slot for {} off the hard blocks", placed.packed.lutffs[j].lut_cell))?;
+        occupied.insert(key(&refuge));
+        placed.lutff_sites[j] = refuge;
     }
     // Owned clusters move to the nearest free slot of their region,
     // evicting an unconstrained squatter when the region is otherwise full.
@@ -314,48 +356,36 @@ pub fn legalize_into_regions(
         placed.lutff_sites[i] = slot;
         stats[r].moved += 1;
     }
-
-    // Hard blocks (DSP / BRAM): move owned cells onto a free site of the
-    // matching kind inside the region when the region covers one.
-    legalize_hard(
-        &placed.packed.macs.iter().map(|m| m.cell.clone()).collect::<Vec<_>>(),
-        &mut placed.mac_sites,
-        dev.dsp_sites().collect(),
-        SiteKind::Dsp,
-        regions,
-        &mut stats,
-    )?;
-    legalize_hard(
-        &placed.packed.brams.iter().map(|b| b.cell.clone()).collect::<Vec<_>>(),
-        &mut placed.bram_sites,
-        dev.bram_sites().collect(),
-        SiteKind::Bram,
-        regions,
-        &mut stats,
-    )?;
     Ok(stats)
 }
 
+/// `cells`: each block's cell and whether it is connected to the fabric.
+/// A connected block only takes a site with all of its tiles, all inside
+/// the region.
 fn legalize_hard(
-    cells: &[String],
+    cells: &[(String, bool)],
     sites: &mut [Site],
     all: Vec<Site>,
     kind: SiteKind,
     regions: &[RegionConstraint],
     stats: &mut [RegionStats],
+    dev: &Device,
 ) -> Result<(), String> {
     let mut used: HashSet<(u32, u32)> = sites.iter().map(|s| (s.x, s.y)).collect();
-    for (i, cell) in cells.iter().enumerate() {
+    for (i, (cell, fabric)) in cells.iter().enumerate() {
         let Some(r) = owning_region(regions, &[cell.as_str()]) else {
             continue;
         };
+        let fits = |s: &Site| {
+            if !*fabric {
+                return regions[r].contains(s.x, s.y);
+            }
+            let tiles = dev.hard_tiles(*s);
+            dev.hard_site(*s).is_some_and(|(k, _)| tiles.len() == k.tiles() as usize) && tiles.iter().all(|t| regions[r].contains(t.0, t.1))
+        };
         // A catch-all region only binds hard blocks when it covers a site
         // of their kind (fabric pblocks need not span a DSP/BRAM column).
-        let in_region: Vec<Site> = all
-            .iter()
-            .filter(|s| s.kind == kind && regions[r].contains(s.x, s.y))
-            .copied()
-            .collect();
+        let in_region: Vec<Site> = all.iter().filter(|s| s.kind == kind && fits(s)).copied().collect();
         if in_region.is_empty() {
             if regions[r].is_catch_all() {
                 continue;
@@ -371,7 +401,7 @@ fn legalize_hard(
         let Some(cur) = sites.get(i).copied() else {
             continue;
         };
-        if regions[r].contains(cur.x, cur.y) {
+        if fits(&cur) {
             continue;
         }
         let pick = in_region

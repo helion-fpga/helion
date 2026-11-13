@@ -99,6 +99,63 @@ impl Placed {
     }
 }
 
+/// Move every LUT/FF cluster on a tile in `reserved` (the tiles of the
+/// hard blocks connected to the fabric) to the nearest free BLE slot of a
+/// CLB tile outside it that `allowed(cluster, site)` accepts: nearest by
+/// tile distance, then x, then y, and the lowest free BLE there. Returns
+/// how many clusters moved.
+fn evict_reserved(
+    lutff_sites: &mut [(Site, u8)],
+    dev: &Device,
+    reserved: &HashSet<(u32, u32)>,
+    allowed: impl Fn(usize, Site) -> bool,
+) -> Result<usize, String> {
+    if reserved.is_empty() || lutff_sites.iter().all(|(s, _)| !reserved.contains(&(s.x, s.y))) {
+        return Ok(0);
+    }
+    let n_ble = dev.n_ble.clamp(1, 8) as usize;
+    let mut used: std::collections::HashMap<(u32, u32), u8> = std::collections::HashMap::new();
+    for (s, b) in lutff_sites.iter() {
+        *used.entry((s.x, s.y)).or_insert(0) |= 1 << b;
+    }
+    let clbs: Vec<Site> = dev.clb_sites().filter(|s| !reserved.contains(&(s.x, s.y))).collect();
+    let mut moved = 0;
+    for (i, slot) in lutff_sites.iter_mut().enumerate() {
+        let (s, _) = *slot;
+        if !reserved.contains(&(s.x, s.y)) {
+            continue;
+        }
+        let dest = clbs
+            .iter()
+            .filter(|c| used.get(&(c.x, c.y)).copied().unwrap_or(0).count_ones() < n_ble as u32)
+            .filter(|c| allowed(i, **c))
+            .min_by_key(|c| (c.x.abs_diff(s.x) + c.y.abs_diff(s.y), c.x, c.y))
+            .copied()
+            .ok_or_else(|| "place: no room for the LUTs and flops beside the hard blocks; the design does not fit".to_string())?;
+        let mask = used.entry((dest.x, dest.y)).or_insert(0);
+        let ble = (0..n_ble as u8).find(|b| *mask & (1 << b) == 0).expect("free slot");
+        *mask |= 1 << ble;
+        *slot = (dest, ble);
+        moved += 1;
+    }
+    Ok(moved)
+}
+
+/// Move every LUT/FF cluster that sits on a tile of a hard block
+/// connected to the fabric to the nearest free BLE slot (bitgen refuses a
+/// LUT or flop there). Every placer that moves clusters ends with this;
+/// it returns how many it moved (0 when the placement was legal).
+pub fn evict_from_hard_tiles(placed: &mut Placed, dev: &Device) -> Result<usize, String> {
+    let reserved = placed.reserved_tiles(dev);
+    evict_reserved(&mut placed.lutff_sites, dev, &reserved, |_, _| true)
+}
+
+/// CLB sites a LUT/FF cluster may take: all of them but the tiles in
+/// `reserved`.
+fn free_clb_sites(dev: &Device, reserved: &HashSet<(u32, u32)>) -> Vec<Site> {
+    dev.clb_sites().filter(|s| !reserved.contains(&(s.x, s.y))).collect()
+}
+
 /// Sites for the multipliers and RAMs. A block connected to the fabric
 /// takes the free site nearest its LUTs and pads (by total distance), its
 /// tiles are taken from the LUTs and flops, and clusters already placed
@@ -171,31 +228,7 @@ fn place_hard(packed: &Packed, dev: &Device, lutff_sites: &mut [(Site, u8)], iob
     let bram_sites: Vec<Site> = bram_sites.into_iter().map_while(|s| s).collect();
     // Clear the tiles of the connected blocks.
     let reserved: HashSet<(u32, u32)> = taken.iter().flat_map(|s| dev.hard_tiles(*s)).collect();
-    if reserved.is_empty() || lutff_sites.iter().all(|(s, _)| !reserved.contains(&(s.x, s.y))) {
-        return Ok((mac_sites, bram_sites));
-    }
-    let n_ble = dev.n_ble.clamp(1, 8) as usize;
-    let mut used: std::collections::HashMap<(u32, u32), u8> = std::collections::HashMap::new();
-    for (s, b) in lutff_sites.iter() {
-        *used.entry((s.x, s.y)).or_insert(0) |= 1 << b;
-    }
-    let clbs: Vec<Site> = dev.clb_sites().filter(|s| !reserved.contains(&(s.x, s.y))).collect();
-    for slot in lutff_sites.iter_mut() {
-        let (s, _) = *slot;
-        if !reserved.contains(&(s.x, s.y)) {
-            continue;
-        }
-        let dest = clbs
-            .iter()
-            .filter(|c| used.get(&(c.x, c.y)).copied().unwrap_or(0).count_ones() < n_ble as u32)
-            .min_by_key(|c| (c.x.abs_diff(s.x) + c.y.abs_diff(s.y), c.x, c.y))
-            .copied()
-            .ok_or_else(|| "place: no room for the LUTs and flops beside the hard blocks; the design does not fit".to_string())?;
-        let mask = used.entry((dest.x, dest.y)).or_insert(0);
-        let ble = (0..n_ble as u8).find(|b| *mask & (1 << b) == 0).expect("free slot");
-        *mask |= 1 << ble;
-        *slot = (dest, ble);
-    }
+    evict_reserved(lutff_sites, dev, &reserved, |_, _| true)?;
     Ok((mac_sites, bram_sites))
 }
 
@@ -1589,8 +1622,10 @@ pub fn place_in_region_with_guide(
     let (x0, x1) = (x0.min(x1), x0.max(x1));
     let (y0, y1) = (y0.min(y1), y0.max(y1));
     let mut placed = place_with_guide(packed, dev, opts, guide)?;
-    let mut clbs: Vec<Site> = dev
-        .clb_sites()
+    // Not on the tiles of the hard blocks connected to the fabric.
+    let reserved = placed.reserved_tiles(dev);
+    let mut clbs: Vec<Site> = free_clb_sites(dev, &reserved)
+        .into_iter()
         .filter(|s| s.x >= x0 && s.x <= x1 && s.y >= y0 && s.y <= y1)
         .collect();
     if clbs.is_empty() {
@@ -1685,7 +1720,59 @@ pub fn place_incremental_with_guide(
             placed.iob_sites[i] = prev.iob_sites[j];
         }
     }
+    // Hard blocks keep their previous sites too (trading sites with
+    // whichever block of the kind the fresh placement put there), and a
+    // reused cluster that lands on a tile of a block connected to the
+    // fabric moves off it: it no longer counts as reused.
+    if !placed.packed.conn.hard.is_empty() {
+        let names = |v: &Vec<String>| -> std::collections::HashMap<String, usize> { v.iter().cloned().enumerate().map(|(i, c)| (c, i)).collect() };
+        let prev_macs = names(&prev.packed.macs.iter().map(|m| m.cell.clone()).collect());
+        let prev_brams = names(&prev.packed.brams.iter().map(|m| m.cell.clone()).collect());
+        let cur_macs: Vec<String> = placed.packed.macs.iter().map(|m| m.cell.clone()).collect();
+        let cur_brams: Vec<String> = placed.packed.brams.iter().map(|m| m.cell.clone()).collect();
+        let fabric_mac: Vec<bool> = placed.packed.macs.iter().map(|m| m.fabric).collect();
+        let fabric_bram: Vec<bool> = placed.packed.brams.iter().map(|m| m.fabric).collect();
+        reuse_hard_sites(&cur_macs, &fabric_mac, &mut placed.mac_sites, &prev_macs, &prev.mac_sites, dev);
+        reuse_hard_sites(&cur_brams, &fabric_bram, &mut placed.bram_sites, &prev_brams, &prev.bram_sites, dev);
+        evict_from_hard_tiles(&mut placed, dev)?;
+        reused = packed
+            .lutffs
+            .iter()
+            .enumerate()
+            .filter(|(i, lf)| prev_lutff.get(lf.lut_cell.as_str()).is_some_and(|&j| placed.lutff_sites.get(*i) == prev.lutff_sites.get(j)))
+            .count();
+    }
     Ok((placed, reused))
+}
+
+/// Give each block of `cells` its site in a previous placement when that
+/// is one of `sites` (the sites of the kind this placement uses), trading
+/// with the block that has it; a block connected to the fabric only takes
+/// a site with all of its tiles.
+fn reuse_hard_sites(
+    cells: &[String],
+    fabric: &[bool],
+    sites: &mut [Site],
+    prev_idx: &std::collections::HashMap<String, usize>,
+    prev_sites: &[Site],
+    dev: &Device,
+) {
+    for i in 0..cells.len().min(sites.len()) {
+        let Some(&want) = prev_idx.get(&cells[i]).and_then(|&j| prev_sites.get(j)) else { continue };
+        if want == sites[i] {
+            continue;
+        }
+        let full = |k: usize, s: Site| !fabric.get(k).copied().unwrap_or(false) || dev.hard_site(s).is_some_and(|(kind, _)| dev.hard_tiles(s).len() == kind.tiles() as usize);
+        if !full(i, want) {
+            continue;
+        }
+        match sites.iter().position(|s| *s == want) {
+            Some(k) if !full(k, sites[i]) => {}
+            Some(k) => sites.swap(i, k),
+            None if dev.hard_site(want).is_some() && dev.hard_site(want).map(|h| h.0) == dev.hard_site(sites[i]).map(|h| h.0) => sites[i] = want,
+            None => {}
+        }
+    }
 }
 
 pub fn lutff_of(placed: &Placed, ff_cell: &str) -> Option<(Site, u8)> {
@@ -1795,6 +1882,13 @@ pub fn permute_lut_pins_for_timing(placed: &mut Placed) -> usize {
         }
         lf.init = permute_lut6_init(lf.init, &old_to_new);
         lf.lut_pins = new_pins;
+        // The router connects the pins of the full connection list: they
+        // move with the truth table.
+        for pc in placed.packed.conn.pins.iter_mut().filter(|pc| pc.lutff as usize == i) {
+            if let Some(&np) = old_to_new.get(pc.pin as usize) {
+                pc.pin = np;
+            }
+        }
         permuted += 1;
     }
     permuted
@@ -1816,9 +1910,13 @@ pub fn place_congestion_spread(
     if n == 0 {
         return Ok((out, 0));
     }
+    // Off the tiles of the hard blocks connected to the fabric, and never
+    // onto them.
+    let reserved = out.reserved_tiles(dev);
+    let evicted = evict_reserved(&mut out.lutff_sites, dev, &reserved, |_, _| true)?;
     let n_ble = dev.n_ble.max(1) as u8;
     let cap = max_ble_per_site.clamp(1, n_ble);
-    let mut clb_sites: Vec<Site> = dev.clb_sites().collect();
+    let mut clb_sites: Vec<Site> = free_clb_sites(dev, &reserved);
     if clb_sites.is_empty() {
         return Err("device has no CLB sites for congestion spreading".into());
     }
@@ -1943,7 +2041,7 @@ pub fn place_congestion_spread(
             }
         }
     }
-    Ok((out, moved))
+    Ok((out, moved + evicted))
 }
 
 /// Summary metrics from post-placement physical optimization ([`phys_opt_place_with_stats`]).
@@ -2005,6 +2103,10 @@ pub fn phys_opt_place_with_stats(
 ) -> Result<(Placed, PhysOptPlaceStats), String> {
     let mut out = placed.clone();
     let wl_before = total_wirelength(&out);
+    // Off the tiles of the hard blocks connected to the fabric, and never
+    // onto them.
+    let reserved = out.reserved_tiles(dev);
+    let evicted = evict_reserved(&mut out.lutff_sites, dev, &reserved, |_, _| true)?;
     let n = out.lutff_sites.len().min(out.packed.lutffs.len());
     if n == 0 {
         return Ok((
@@ -2017,7 +2119,7 @@ pub fn phys_opt_place_with_stats(
         ));
     }
     let n_ble = dev.n_ble.max(1) as usize;
-    let mut clb_sites: Vec<Site> = dev.clb_sites().collect();
+    let mut clb_sites: Vec<Site> = free_clb_sites(dev, &reserved);
     clb_sites.sort_by_key(|s| (s.x, s.y));
     let (mut max_x, mut max_y) = (0u32, 0u32);
     for &s in &clb_sites {
@@ -2110,7 +2212,7 @@ pub fn phys_opt_place_with_stats(
         (ill, wl)
     };
 
-    let mut relocated_cells = 0usize;
+    let mut relocated_cells = evicted;
     let mut swapped_cells = 0usize;
 
     for _pass in 0..4 {
@@ -2616,13 +2718,14 @@ fn ripple_legalize(
     x: &[f64],
     y: &[f64],
     iob_sites: &[Site],
+    reserved: &HashSet<(u32, u32)>,
 ) -> Result<(Vec<(Site, u8)>, usize), String> {
     let n = x.len().min(packed.lutffs.len());
     if n == 0 {
         return Ok((Vec::new(), 0));
     }
     let n_ble = dev.n_ble.max(1) as usize;
-    let mut clb_sites: Vec<Site> = dev.clb_sites().collect();
+    let mut clb_sites: Vec<Site> = free_clb_sites(dev, reserved);
     if clb_sites.is_empty() {
         return Err("device has no CLB sites".into());
     }
@@ -2930,7 +3033,7 @@ pub fn place_analytical_with_stats(
     }
 
     let (legal_sites, ripple_moves) =
-        ripple_legalize(&base.packed, dev, &x, &y, &base.iob_sites)?;
+        ripple_legalize(&base.packed, dev, &x, &y, &base.iob_sites, &base.reserved_tiles(dev))?;
     base.lutff_sites = legal_sites;
     let final_x: Vec<f64> = base.lutff_sites.iter().map(|(s, _)| s.x as f64).collect();
     let final_y: Vec<f64> = base.lutff_sites.iter().map(|(s, _)| s.y as f64).collect();
@@ -3125,12 +3228,23 @@ pub fn legalize_macro_columns(
     let n = out.lutff_sites.len().min(out.packed.lutffs.len());
     let n_ble = dev.n_ble.max(1) as u8;
 
+    // 0. Blocks connected to the fabric were placed by their connections:
+    // they keep their sites (one that is not a whole site of their kind
+    // moves to the free one nearest it), and no cluster goes on their
+    // tiles. The column snapping below is for name-only blocks.
+    let keep_mac: Vec<bool> = out.packed.macs.iter().map(|m| m.fabric).collect();
+    let keep_bram: Vec<bool> = out.packed.brams.iter().map(|b| b.fabric).collect();
+    fix_fabric_sites(&keep_mac, &mut out.mac_sites, dev.dsp_sites().collect(), dev)?;
+    fix_fabric_sites(&keep_bram, &mut out.bram_sites, dev.bram_sites().collect(), dev)?;
+    let reserved = out.reserved_tiles(dev);
+    evict_reserved(&mut out.lutff_sites, dev, &reserved, |_, _| true)?;
+
     // 1. Contiguous vertical CARRY4 chain legalization across CLB columns.
     let chains = extract_packed_carry_chains(&out.packed, design);
     if !chains.is_empty() && n > 0 {
         let mut cols: std::collections::BTreeMap<u32, Vec<Site>> =
             std::collections::BTreeMap::new();
-        for s in dev.clb_sites() {
+        for s in free_clb_sites(dev, &reserved) {
             cols.entry(s.x).or_default().push(s);
         }
         for v in cols.values_mut() {
@@ -3201,7 +3315,7 @@ pub fn legalize_macro_columns(
             let (s, ble) = out.lutff_sites[ci];
             used.insert((s.x, s.y, ble));
         }
-        let all_clbs: Vec<Site> = dev.clb_sites().collect();
+        let all_clbs: Vec<Site> = free_clb_sites(dev, &reserved);
         for i in 0..n {
             if chain_member_set.contains(&i) {
                 continue;
@@ -3240,11 +3354,7 @@ pub fn legalize_macro_columns(
             .unwrap_or(dev.dsp_y0);
         let mut avail: Vec<Site> = dsp_pool;
         avail.sort_by_key(|s| (s.y.abs_diff(anchor_y), s.x, s.y));
-        out.mac_sites.clear();
-        for (_, site) in out.packed.macs.iter().zip(avail.into_iter()) {
-            out.mac_sites.push(site);
-            stats.dsp_macros_legalized += 1;
-        }
+        stats.dsp_macros_legalized += snap_name_only(&keep_mac, &mut out.mac_sites, avail)?;
     }
 
     // 3. Snap Bram18 / RAMB36 macros to dedicated hard-block BRAM column sites.
@@ -3257,14 +3367,53 @@ pub fn legalize_macro_columns(
             .unwrap_or(dev.bram_y0);
         let mut avail: Vec<Site> = bram_pool;
         avail.sort_by_key(|s| (s.y.abs_diff(anchor_y), s.x, s.y));
-        out.bram_sites.clear();
-        for (_, site) in out.packed.brams.iter().zip(avail.into_iter()) {
-            out.bram_sites.push(site);
-            stats.bram_macros_legalized += 1;
-        }
+        stats.bram_macros_legalized += snap_name_only(&keep_bram, &mut out.bram_sites, avail)?;
     }
 
     Ok((out, stats))
+}
+
+/// A block connected to the fabric (`keep[i]`) on a site that is not a
+/// whole site of its kind (in `pool`, with all its tiles) moves to the
+/// free whole site nearest it.
+fn fix_fabric_sites(keep: &[bool], sites: &mut [Site], pool: Vec<Site>, dev: &Device) -> Result<(), String> {
+    let whole = |s: &Site| pool.contains(s) && dev.hard_site(*s).is_some_and(|(k, _)| dev.hard_tiles(*s).len() == k.tiles() as usize);
+    for i in 0..sites.len().min(keep.len()) {
+        if !keep[i] || (whole(&sites[i]) && !sites[..i].contains(&sites[i])) {
+            continue;
+        }
+        let cur = sites[i];
+        let taken: HashSet<Site> = sites.iter().enumerate().filter(|(k, _)| *k != i && keep.get(*k).copied().unwrap_or(false)).map(|(_, s)| *s).collect();
+        sites[i] = pool
+            .iter()
+            .filter(|s| whole(s) && !taken.contains(s))
+            .min_by_key(|s| (s.x.abs_diff(cur.x) + s.y.abs_diff(cur.y), s.x, s.y))
+            .copied()
+            .ok_or_else(|| "legalize_macro_columns: no free site for a hard block connected to the fabric".to_string())?;
+    }
+    Ok(())
+}
+
+/// Snap the name-only blocks (`!keep[i]`) to the sites of `avail` in order,
+/// skipping the sites of the blocks kept. Without kept blocks the ones
+/// past the last site are dropped, as before; beside kept blocks running
+/// out of sites is an error (as in `place`). Returns how many blocks have
+/// a site.
+fn snap_name_only(keep: &[bool], sites: &mut Vec<Site>, avail: Vec<Site>) -> Result<usize, String> {
+    if !keep.iter().any(|&k| k) {
+        sites.clear();
+        sites.extend(avail.into_iter().take(keep.len()));
+        return Ok(sites.len());
+    }
+    let kept: HashSet<Site> = sites.iter().zip(keep).filter(|(_, k)| **k).map(|(s, _)| *s).collect();
+    let mut free = avail.into_iter().filter(|s| !kept.contains(s));
+    let n = sites.len();
+    for i in 0..n {
+        if !keep.get(i).copied().unwrap_or(false) {
+            sites[i] = free.next().ok_or_else(|| "legalize_macro_columns: no site left for a name-only block beside the connected ones".to_string())?;
+        }
+    }
+    Ok(n)
 }
 
 /// Options for post-legalization timing-driven detailed placement ([`detailed_place_optimize`]).
@@ -3389,6 +3538,10 @@ pub fn detailed_place_optimize_with_stats(
 ) -> Result<(Placed, DetailedPlaceStats), String> {
     let mut out = placed.clone();
     let before_hpwl = weighted_hpwl(&out, opts);
+    // Off the tiles of the hard blocks connected to the fabric, and never
+    // onto them.
+    let reserved = out.reserved_tiles(dev);
+    let evicted = evict_reserved(&mut out.lutff_sites, dev, &reserved, |_, _| true)?;
     let n = out.lutff_sites.len().min(out.packed.lutffs.len());
     if n == 0 {
         return Ok((
@@ -3401,7 +3554,7 @@ pub fn detailed_place_optimize_with_stats(
         ));
     }
     let n_ble = dev.n_ble.max(1) as usize;
-    let mut clb_sites: Vec<Site> = dev.clb_sites().collect();
+    let mut clb_sites: Vec<Site> = free_clb_sites(dev, &reserved);
     clb_sites.sort_by_key(|s| (s.x, s.y));
     let (mut max_x, mut max_y) = (0u32, 0u32);
     for &s in &clb_sites {
@@ -3513,7 +3666,7 @@ pub fn detailed_place_optimize_with_stats(
         (ill, hpwl)
     };
 
-    let mut median_relocations = 0usize;
+    let mut median_relocations = evicted;
     let mut local_swaps = 0usize;
     let rad = opts.swap_radius.max(1) as i32;
 

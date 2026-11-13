@@ -299,12 +299,23 @@ fn check_with(src: &str, part: &str, cycles: usize, tamper: impl Fn(&mut helion_
 /// Pack, place, route and bitgen `design`, program the fabric model with
 /// the bitstream and compare it with a simulation of the netlist.
 fn check_design(design: &Design, part: &str, cycles: usize, tamper: impl Fn(&mut helion_route::Routed)) -> Result<(u32, usize), String> {
+    check_placed_by(design, part, cycles, |p, d| place(p, d).expect("place"), tamper)
+}
+
+/// As [`check_design`], placed by `placer`.
+fn check_placed_by(
+    design: &Design,
+    part: &str,
+    cycles: usize,
+    placer: impl Fn(&helion_pack::Packed, &Device) -> helion_place::Placed,
+    tamper: impl Fn(&mut helion_route::Routed),
+) -> Result<(u32, usize), String> {
     let dev = Device::load_part(part).expect("part");
     let mut packed = pack(design, &dev).expect("pack");
     let fit = packed.fit_pads(dev.iob_sites_all().len());
     assert!(fit.undriven.is_empty() && fit.over_budget.is_empty(), "pads do not fit: {fit:?}");
     assert!(packed.conn.undriven.is_empty(), "undriven LUT inputs: {:?}", packed.conn.undriven);
-    let placed = place(&packed, &dev).expect("place");
+    let placed = placer(&packed, &dev);
     let mut routed = route(&placed, &dev).expect("route");
     assert!(routed.tracks.active, "design was not routed from its connection list");
     tamper(&mut routed);
@@ -1127,4 +1138,74 @@ fn hard_block_on_the_wrong_clock_line_is_detected() {
         }
     };
     assert!(check_design(&d, part, 600, wrong).is_err(), "a hard block on the wrong clock line went unnoticed");
+}
+
+/// Every placer, from its own entry point, on a RAM design and a
+/// registered multiplier: the result routes, bitgen takes it (it refuses
+/// a LUT or flop on a block's tile) and the fabric equals the netlist.
+/// The placers that improve a placement start from one with clusters on
+/// every tile of the blocks.
+#[test]
+fn every_placer_keeps_off_hard_block_tiles() {
+    use helion_place::*;
+    use helion_pack::Packed;
+    let part = "HL10S-C64-1";
+    // `place`, then a cluster moved onto every tile of every connected block.
+    let squatted = |p: &Packed, d: &Device| -> Placed {
+        let mut pl = place(p, d).expect("place");
+        let tiles: Vec<(u32, u32)> = pl.reserved_tiles(d).into_iter().collect();
+        for (k, t) in tiles.iter().enumerate() {
+            pl.lutff_sites[k] = (helion_device::Site { x: t.0, y: t.1, kind: helion_device::SiteKind::Clb }, 0);
+        }
+        pl
+    };
+    // The first block's base tile (a region around it).
+    let base = |p: &Packed, d: &Device| -> (u32, u32) {
+        let pl = place(p, d).expect("place");
+        let s = pl.hard_block_site(0).expect("a block");
+        (s.x, s.y)
+    };
+    type Placer = Box<dyn Fn(&Packed, &Device) -> Placed>;
+    let placers: Vec<(&str, Placer)> = vec![
+        ("place_in_region", Box::new(move |p: &Packed, d: &Device| {
+            let (x, y) = base(p, d);
+            place_in_region(p, d, PlaceOpts::default(), x, y, x + 2, y + 7).expect("place_in_region")
+        })),
+        ("place_with_regions", Box::new(move |p: &Packed, d: &Device| {
+            let (x, y) = base(p, d);
+            let cells: Vec<String> = p.lutffs.iter().flat_map(|l| [l.lut_cell.clone(), l.ff_cell.clone()]).filter(|c| !c.is_empty()).collect();
+            let r = regions::RegionConstraint::new("pb", x.saturating_sub(1), y, x + 1, y + 7).with_cells(cells);
+            regions::place_with_regions(p, d, PlaceOpts::default(), &[r], &TimingGuide::default()).expect("regions").0
+        })),
+        ("place_incremental", Box::new(move |p: &Packed, d: &Device| place_incremental(p, d, &squatted(p, d), PlaceOpts::default()).expect("incremental").0)),
+        ("place_analytical", Box::new(|p: &Packed, d: &Device| place_analytical(p, d).expect("analytical"))),
+        ("place_congestion_spread", Box::new(move |p: &Packed, d: &Device| place_congestion_spread(&squatted(p, d), d, 4).expect("spread").0)),
+        ("phys_opt_place", Box::new(move |p: &Packed, d: &Device| phys_opt_place(&squatted(p, d), d).expect("phys_opt"))),
+        ("detailed_place_optimize", Box::new(move |p: &Packed, d: &Device| detailed_place_optimize(&squatted(p, d), d, &DetailedPlaceOpts::default()).expect("detailed"))),
+        ("legalize_macro_columns", Box::new(move |p: &Packed, d: &Device| legalize_macro_columns(&squatted(p, d), d, None).expect("macro").0)),
+    ];
+    for (name, placer) in &placers {
+        for (what, design, cycles) in [("ram", ram_design(), 300), ("mul", mul_design(true, true, true), 150)] {
+            check_placed_by(&design, part, cycles, placer, |_| {}).unwrap_or_else(|e| panic!("{name} {what}: {e}"));
+        }
+    }
+}
+
+/// phys_opt permutes LUT pins for timing: the routed connections move
+/// with the truth table. (Before, only the truth table moved, and on this
+/// design the RAM's write enable LUT read the wrong inputs.)
+#[test]
+fn phys_opt_pin_permutation_keeps_the_logic() {
+    check_placed_by(
+        &ram_design(),
+        "HL10S-C64-1",
+        300,
+        |p, d| {
+            let (pl, st) = helion_place::phys_opt_place_with_stats(&helion_place::place(p, d).unwrap(), d).unwrap();
+            assert!(st.permuted_luts > 0);
+            pl
+        },
+        |_| {},
+    )
+    .expect("phys_opt");
 }
