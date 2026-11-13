@@ -1665,11 +1665,38 @@ pub fn place_in_region_with_guide(
     }
     clbs.sort_by_key(|s| (s.x, s.y));
     let n_ble = dev.n_ble.max(1) as usize;
-    for i in 0..placed.lutff_sites.len() {
-        let clb_off = i / n_ble;
-        let ble = (i % n_ble) as u8;
-        let idx = clb_off.min(clbs.len() - 1);
-        placed.lutff_sites[i] = (clbs[idx], ble);
+    match wl::ClockInfo::of_conn(&placed.packed.conn, placed.lutff_sites.len()) {
+        None => {
+            for i in 0..placed.lutff_sites.len() {
+                let clb_off = i / n_ble;
+                let ble = (i % n_ble) as u8;
+                let idx = clb_off.min(clbs.len() - 1);
+                placed.lutff_sites[i] = (clbs[idx], ble);
+            }
+        }
+        Some(ck) => {
+            // In order, each cluster takes the first CLB with a free BLE
+            // whose flops it shares a clock line and reset with (the same
+            // fill as above while they all agree).
+            let mut on: Vec<Vec<u32>> = vec![Vec::new(); clbs.len()];
+            let mut first_free = 0;
+            for i in 0..placed.lutff_sites.len() {
+                while first_free < clbs.len() && on[first_free].len() >= n_ble {
+                    first_free += 1;
+                }
+                let t = (first_free..clbs.len())
+                    .find(|&t| {
+                        on[t].len() < n_ble && {
+                            let mut with = on[t].clone();
+                            with.push(i as u32);
+                            ck.tile_ok(&with)
+                        }
+                    })
+                    .ok_or_else(|| format!("pblock CLB_X{x0}Y{y0}:CLB_X{x1}Y{y1} has no room for the LUT/FF clusters with each CLB on one clock and reset"))?;
+                placed.lutff_sites[i] = (clbs[t], on[t].len() as u8);
+                on[t].push(i as u32);
+            }
+        }
     }
     let mut iobs: Vec<Site> = dev
         .iob_sites()
@@ -1765,6 +1792,16 @@ pub fn place_incremental_with_guide(
         reuse_hard_sites(&cur_macs, &fabric_mac, &mut placed.mac_sites, &prev_macs, &prev.mac_sites, dev);
         reuse_hard_sites(&cur_brams, &fabric_bram, &mut placed.bram_sites, &prev_brams, &prev.bram_sites, dev);
         evict_from_hard_tiles(&mut placed, dev)?;
+        reused = packed
+            .lutffs
+            .iter()
+            .enumerate()
+            .filter(|(i, lf)| prev_lutff.get(lf.lut_cell.as_str()).is_some_and(|&j| placed.lutff_sites.get(*i) == prev.lutff_sites.get(j)))
+            .count();
+    }
+    // The reused sites need not keep this design's clocking (each CLB on
+    // one clock and reset); a cluster moved for it is not reused.
+    if wl::legalize_clocks(&mut placed, dev)? > 0 {
         reused = packed
             .lutffs
             .iter()
@@ -2007,6 +2044,15 @@ pub fn place_congestion_spread(
         .map(|(&xy, v)| (xy, v.len() as u8))
         .collect();
     let mut moved = 0usize;
+    // Clusters on each tile as they move, so a target keeps each CLB on
+    // one clock line and reset.
+    let ck = wl::ClockInfo::of_conn(&out.packed.conn, out.lutff_sites.len());
+    let mut members_at: std::collections::HashMap<(u32, u32), Vec<u32>> = std::collections::HashMap::new();
+    if ck.is_some() {
+        for (i, (s, _)) in out.lutff_sites.iter().enumerate() {
+            members_at.entry((s.x, s.y)).or_default().push(i as u32);
+        }
+    }
 
     for (hx, hy) in hot_sites {
         let Some(mut members) = site_occ.get(&(hx, hy)).cloned() else {
@@ -2040,6 +2086,13 @@ pub fn place_congestion_spread(
                 else {
                     continue;
                 };
+                if let Some(ck) = &ck {
+                    let mut with = members_at.get(&(cand.x, cand.y)).cloned().unwrap_or_default();
+                    with.push(ci as u32);
+                    if !ck.tile_ok(&with) {
+                        continue;
+                    }
+                }
                 let mut illegal_arcs = 0u32;
                 for &di in pin_drv[ci].iter().flatten() {
                     let ds = if di == ci { cand } else { out.lutff_sites[di].0 };
@@ -2066,12 +2119,20 @@ pub fn place_congestion_spread(
                     *c = c.saturating_sub(1);
                 }
                 *occ_count.entry((target_site.x, target_site.y)).or_insert(0) += 1;
+                if ck.is_some() {
+                    if let Some(v) = members_at.get_mut(&(cur_site.x, cur_site.y)) {
+                        v.retain(|&c| c != ci as u32);
+                    }
+                    members_at.entry((target_site.x, target_site.y)).or_default().push(ci as u32);
+                }
                 out.lutff_sites[ci] = (target_site, target_ble);
                 moved += 1;
             }
         }
     }
-    Ok((out, moved + evicted))
+    // A placement given with CLBs that mix clocks or resets leaves legal.
+    let relocated = wl::legalize_clocks(&mut out, dev)? as usize;
+    Ok((out, moved + evicted + relocated))
 }
 
 /// Summary metrics from post-placement physical optimization ([`phys_opt_place_with_stats`]).
@@ -3076,6 +3137,9 @@ pub fn place_analytical_with_stats(
     let (legal_sites, ripple_moves) =
         ripple_legalize(&base.packed, dev, &x, &y, &base.iob_sites, &base.reserved_tiles(dev))?;
     base.lutff_sites = legal_sites;
+    let _ = q_idx;
+    // Each CLB on one clock line and one reset.
+    wl::legalize_clocks(&mut base, dev)?;
     let final_x: Vec<f64> = base.lutff_sites.iter().map(|(s, _)| s.x as f64).collect();
     let final_y: Vec<f64> = base.lutff_sites.iter().map(|(s, _)| s.y as f64).collect();
     let hpwl_final = continuous_hpwl(&final_x, &final_y, &nets_x, &net_fixed_y);
@@ -3090,7 +3154,6 @@ pub fn place_analytical_with_stats(
         base.lutff_sites.first().map(|(s, _)| s.y as f64).unwrap_or(0.0)
     };
 
-    let _ = q_idx;
     Ok((
         base,
         AnalyticalPlaceStats {

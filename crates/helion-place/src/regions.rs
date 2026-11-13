@@ -20,7 +20,8 @@
 use crate::{PlaceOpts, Placed, TimingGuide, place_with_guide};
 use helion_device::{Device, Site, SiteKind};
 use helion_pack::Packed;
-use std::collections::HashSet;
+use crate::wl::ClockInfo;
+use std::collections::{HashMap, HashSet};
 
 /// One floorplan rectangle (inclusive HAD site coordinates) and its members.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -242,6 +243,24 @@ pub fn legalize_into_regions(
     let key = |s: &(Site, u8)| (s.0.x, s.0.y, s.1);
     let in_any_region = |x: u32, y: u32| regions.iter().any(|r| r.contains(x, y));
     let mut occupied: HashSet<(u32, u32, u8)> = HashSet::new();
+    // Clocking: the clusters holding each tile (those in `occupied`), so
+    // that every slot a cluster takes keeps its CLB on one clock line and
+    // one asynchronous reset (bitgen refuses two).
+    let ck = ClockInfo::of_conn(&placed.packed.conn, placed.lutff_sites.len());
+    let mut on: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+    // Whether cluster `c` may join tile `t`, with cluster `minus` gone.
+    let fits = |on: &HashMap<(u32, u32), Vec<u32>>, c: usize, t: (u32, u32), minus: Option<usize>| -> bool {
+        ck.as_ref().is_none_or(|ck| {
+            let mut with: Vec<u32> = on.get(&t).map(|v| v.iter().copied().filter(|&k| Some(k as usize) != minus).collect()).unwrap_or_default();
+            with.push(c as u32);
+            ck.tile_ok(&with)
+        })
+    };
+    let leave = |on: &mut HashMap<(u32, u32), Vec<u32>>, c: usize, t: (u32, u32)| {
+        if let Some(v) = on.get_mut(&t) {
+            v.retain(|&k| k as usize != c);
+        }
+    };
     // Unconstrained clusters hold their slots; owned clusters already
     // inside their region keep theirs. A cluster on a hard block's tile
     // moves (`displaced` if unconstrained, else with the pending ones).
@@ -253,8 +272,11 @@ pub fn legalize_into_regions(
             None if on_block => displaced.push(i),
             None => {
                 occupied.insert(key(slot));
+                on.entry((slot.0.x, slot.0.y)).or_default().push(i as u32);
             }
-            Some(r) if !on_block && regions[r].contains(slot.0.x, slot.0.y) && occupied.insert(key(slot)) => {}
+            Some(r) if !on_block && regions[r].contains(slot.0.x, slot.0.y) && occupied.insert(key(slot)) => {
+                on.entry((slot.0.x, slot.0.y)).or_default().push(i as u32);
+            }
             Some(_) => pending.push(i),
         }
     }
@@ -273,6 +295,7 @@ pub fn legalize_into_regions(
                 .filter(|s| owner[j].is_none_or(|o| regions[o].contains(s.x, s.y)))
                 .flat_map(|s| (0..n_ble).map(move |b| (*s, b)))
                 .filter(|s| !occupied.contains(&key(s)))
+                .filter(|s| fits(&on, j, (s.0.x, s.0.y), None))
                 .min_by_key(|s| (dist(from, (s.0.x, s.0.y)), s.0.x, s.0.y, s.1))
                 .ok_or_else(|| {
                     format!(
@@ -282,6 +305,8 @@ pub fn legalize_into_regions(
                 })?;
             if occupied.remove(&key(&taken)) {
                 occupied.insert(key(&refuge));
+                leave(&mut on, j, from);
+                on.entry((refuge.0.x, refuge.0.y)).or_default().push(j as u32);
             }
             placed.lutff_sites[j] = refuge;
             stats[ri].evicted += 1;
@@ -297,9 +322,11 @@ pub fn legalize_into_regions(
             .filter(|s| !regions.iter().any(|x| x.exclusive && x.contains(s.x, s.y)))
             .flat_map(|s| (0..n_ble).map(move |b| (*s, b)))
             .filter(|s| !occupied.contains(&key(s)))
+            .filter(|s| fits(&on, j, (s.0.x, s.0.y), None))
             .min_by_key(|s| (dist(from, (s.0.x, s.0.y)), s.0.x, s.0.y, s.1))
             .ok_or_else(|| format!("place: no free BLE slot for {} off the hard blocks", placed.packed.lutffs[j].lut_cell))?;
         occupied.insert(key(&refuge));
+        on.entry((refuge.0.x, refuge.0.y)).or_default().push(j as u32);
         placed.lutff_sites[j] = refuge;
     }
     // Owned clusters move to the nearest free slot of their region,
@@ -310,6 +337,7 @@ pub fn legalize_into_regions(
         let free = region_slots[r]
             .iter()
             .filter(|s| !occupied.contains(&key(s)))
+            .filter(|s| fits(&on, i, (s.0.x, s.0.y), None))
             .min_by_key(|s| (dist(want, (s.0.x, s.0.y)), s.0.x, s.0.y, s.1))
             .copied();
         let slot = match free {
@@ -319,6 +347,13 @@ pub fn legalize_into_regions(
                 let victim = (0..placed.lutff_sites.len())
                     .filter(|&j| owner[j].is_none())
                     .filter(|&j| regions[r].contains(placed.lutff_sites[j].0.x, placed.lutff_sites[j].0.y))
+                    .filter(|&j| fits(&on, i, (placed.lutff_sites[j].0.x, placed.lutff_sites[j].0.y), Some(j)))
+                    .filter(|&j| {
+                        // The victim needs a refuge on its clock and reset.
+                        clbs.iter().filter(|s| !in_any_region(s.x, s.y)).any(|s| {
+                            (0..n_ble).any(|b| !occupied.contains(&(s.x, s.y, b))) && fits(&on, j, (s.x, s.y), None)
+                        })
+                    })
                     .min_by_key(|&j| {
                         let s = placed.lutff_sites[j];
                         dist(want, (s.0.x, s.0.y))
@@ -338,6 +373,7 @@ pub fn legalize_into_regions(
                     .filter(|s| !in_any_region(s.x, s.y))
                     .flat_map(|s| (0..n_ble).map(move |b| (*s, b)))
                     .filter(|s| !occupied.contains(&key(s)))
+                    .filter(|s| fits(&on, victim, (s.0.x, s.0.y), None))
                     .min_by_key(|s| (dist(from, (s.0.x, s.0.y)), s.0.x, s.0.y, s.1))
                     .ok_or_else(|| {
                         format!(
@@ -347,15 +383,26 @@ pub fn legalize_into_regions(
                     })?;
                 occupied.remove(&key(&taken));
                 occupied.insert(key(&refuge));
+                leave(&mut on, victim, from);
+                on.entry((refuge.0.x, refuge.0.y)).or_default().push(victim as u32);
                 placed.lutff_sites[victim] = refuge;
                 stats[r].evicted += 1;
                 taken
             }
         };
         occupied.insert(key(&slot));
+        on.entry((slot.0.x, slot.0.y)).or_default().push(i as u32);
         placed.lutff_sites[i] = slot;
         stats[r].moved += 1;
     }
+    // A placement given with CLBs that mix clocks or resets: each cluster
+    // that must move stays in its region (an unconstrained one out of the
+    // exclusive regions).
+    let allowed = |c: usize, s: Site| match owner.get(c).copied().flatten() {
+        Some(r) => regions[r].contains(s.x, s.y),
+        None => !regions.iter().any(|x| x.exclusive && x.contains(s.x, s.y)),
+    };
+    crate::wl::legalize_clocks_where(placed, dev, &allowed)?;
     Ok(stats)
 }
 

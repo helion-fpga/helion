@@ -1608,3 +1608,125 @@ fn reset_values_apart_from_initial_values_on_the_fabric() {
     };
     assert!(check_design(&design, PART, 600, zero).is_err(), "a wrong reset value went unnoticed");
 }
+
+/// Two clocks: a registered 16 x 16 product on `cb` (a Mac27 with
+/// HELION_V2_HARD, else about 1500 LUT/FF clusters) and a counter with an
+/// asynchronous reset on `ca`.
+const MAC_TWO_CLOCKS: &str = r#"
+module top(input logic ca, input logic cb, input logic arst_n, input logic [15:0] x, input logic [15:0] y,
+           output logic [31:0] p, output logic [7:0] cnt);
+  logic [7:0] c;
+  always_ff @(posedge cb) p <= x * y;
+  always_ff @(posedge ca or negedge arst_n) if (!arst_n) c <= 8'd0; else c <= c + 8'd1;
+  assign cnt = c;
+endmodule
+"#;
+
+/// Every placer, and pblock legalization (`place_with_regions`, which
+/// helion-proj's pblocks and DFX go through, and `legalize_into_regions`
+/// on a finished placement), leaves each CLB on one clock line and one
+/// asynchronous reset (bitgen refuses two): two clocks, a divided clock,
+/// two resets, one reset, and two clocks around a multiplier on a Mac27
+/// each route, bitgen takes them and the fabric equals the netlist. The
+/// multiplier in logic (about 1500 clusters) is placed by each and
+/// checked for the same clocking, without routing.
+#[test]
+fn every_placer_keeps_each_clb_on_one_clock_and_reset() {
+    use helion_pack::Packed;
+    use helion_place::*;
+    // The far corner of a near-square rectangle from the first CLB with
+    // room for `n` clusters twice over (at least 3 x 3 CLBs).
+    let rect = |n: usize, d: &Device| -> (u32, u32) {
+        let per = d.n_ble as usize;
+        let w = ((((2 * n).div_ceil(per)) as f64).sqrt().ceil() as u32).max(3);
+        let h = ((2 * n).div_ceil(per * w as usize) as u32).max(3);
+        (d.clb_x0 + w - 1, d.clb_y0 + h - 1)
+    };
+    let names = |p: &Packed, k: usize| -> Vec<String> { [p.lutffs[k].lut_cell.clone(), p.lutffs[k].ff_cell.clone()].into_iter().filter(|c| !c.is_empty()).collect() };
+    type Placer = Box<dyn Fn(&Packed, &Device) -> Placed>;
+    let placers: Vec<(&str, Placer)> = vec![
+        ("place_congestion_spread 2", Box::new(|p: &Packed, d: &Device| place_congestion_spread(&place(p, d).expect("place"), d, 2).expect("spread").0)),
+        ("place_congestion_spread 4", Box::new(|p: &Packed, d: &Device| place_congestion_spread(&place(p, d).expect("place"), d, 4).expect("spread").0)),
+        ("place_in_region", Box::new(move |p: &Packed, d: &Device| {
+            let (x1, y1) = rect(p.lutffs.len(), d);
+            place_in_region(p, d, PlaceOpts::default(), d.clb_x0, d.clb_y0, x1, y1).expect("place_in_region")
+        })),
+        ("place_analytical", Box::new(|p: &Packed, d: &Device| place_analytical(p, d).expect("analytical"))),
+        ("place_incremental", Box::new(|p: &Packed, d: &Device| {
+            // The previous placement: this design with its clusters' sites reversed.
+            let mut prev = place(p, d).expect("place");
+            prev.lutff_sites.reverse();
+            place_incremental(p, d, &prev, PlaceOpts::default()).expect("incremental").0
+        })),
+        ("place_with_regions, every other cluster", Box::new(move |p: &Packed, d: &Device| {
+            let (x1, y1) = rect(p.lutffs.len() / 2, d);
+            let cells: Vec<String> = (0..p.lutffs.len()).step_by(2).flat_map(|k| names(p, k)).collect();
+            let r = regions::RegionConstraint::new("pb", d.clb_x0, d.clb_y0, x1, y1).with_cells(cells);
+            regions::place_with_regions(p, d, PlaceOpts::default(), &[r], &TimingGuide::default()).expect("regions").0
+        })),
+        ("place_with_regions, exclusive third", Box::new(move |p: &Packed, d: &Device| {
+            let (x1, y1) = rect(p.lutffs.len() / 3, d);
+            let cells: Vec<String> = (0..p.lutffs.len()).step_by(3).flat_map(|k| names(p, k)).collect();
+            let r = regions::RegionConstraint::new("pb", d.clb_x0, d.clb_y0, x1, y1).with_cells(cells).exclusive();
+            regions::place_with_regions(p, d, PlaceOpts::default(), &[r], &TimingGuide::default()).expect("regions").0
+        })),
+        ("legalize_macro_columns", Box::new(|p: &Packed, d: &Device| legalize_macro_columns(&place(p, d).expect("place"), d, None).expect("macro").0)),
+        ("legalize_into_regions", Box::new(move |p: &Packed, d: &Device| {
+            let mut pl = place(p, d).expect("place");
+            let (x1, y1) = rect(p.lutffs.len(), d);
+            let r = regions::RegionConstraint::new("pb", d.clb_x0, d.clb_y0, x1, y1);
+            regions::legalize_into_regions(&mut pl, d, &[r]).expect("legalize");
+            pl
+        })),
+    ];
+    let synth = |src: &str, hard: bool| {
+        helion_sv::v2::set_hard_blocks(Some(hard));
+        let d = helion_sv::synth_sv_v2(src, "t.sv", None).expect("synth").design;
+        helion_sv::v2::set_hard_blocks(None);
+        d
+    };
+    // (name, design, part, cycles; 0: placement only)
+    let designs: Vec<(&str, Design, &str, usize)> = vec![
+        ("two clocks", synth(TWO_CLOCKS, false), PART, 400),
+        ("divided clock", synth(DIVIDED, false), PART, 400),
+        ("two resets", synth(TWO_RESETS, false), PART, 400),
+        ("reset", synth(ASYNC_RESET, false), PART, 400),
+        ("multiplier on a Mac27", synth(MAC_TWO_CLOCKS, true), "HL10S-C64-1", 300),
+        ("multiplier in logic", synth(MAC_TWO_CLOCKS, false), PART, 0),
+    ];
+    let mut failures = Vec::new();
+    for (dname, design, part, cycles) in &designs {
+        let placement_only = |placer: &Placer| -> Result<(u32, usize), String> {
+            let dev = Device::load_part(part).expect("part");
+            let packed = helion_pack::pack(design, &dev).expect("pack");
+            let pl = placer(&packed, &dev);
+            clocking_problem(&pl).map_or(Ok((0, 0)), Err)
+        };
+        for (pname, placer) in &placers {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if *cycles == 0 {
+                    return placement_only(placer);
+                }
+                check_placed_by(
+                    design,
+                    part,
+                    *cycles,
+                    |p, d| {
+                        let pl = placer(p, d);
+                        if let Some(e) = clocking_problem(&pl) {
+                            panic!("{e}");
+                        }
+                        pl
+                    },
+                    |_| {},
+                )
+            }));
+            match r {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => failures.push(format!("{pname} on {dname}: {e}")),
+                Err(e) => failures.push(format!("{pname} on {dname}: {}", e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default())),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

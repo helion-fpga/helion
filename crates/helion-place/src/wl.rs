@@ -187,6 +187,13 @@ impl ClockInfo {
 /// of one clock line and drives at most one clock line. Clusters that
 /// break this move to the nearest CLB where they fit. Returns how many moved.
 pub fn legalize_clocks(placed: &mut Placed, dev: &Device) -> Result<u32, String> {
+    legalize_clocks_where(placed, dev, &|_, _| true)
+}
+
+/// [`legalize_clocks`], moving cluster `c` only to a site `s` with
+/// `allowed(c, s)` (a pblock's rectangle). When the cluster the CLB would
+/// shed first has nowhere to go, the next one that would also help moves.
+pub(crate) fn legalize_clocks_where(placed: &mut Placed, dev: &Device, allowed: &dyn Fn(usize, Site) -> bool) -> Result<u32, String> {
     let Some(ck) = ClockInfo::of(placed) else { return Ok(0) };
     let reserved = placed.reserved_tiles(dev);
     let sites: Vec<Site> = dev.clb_sites().filter(|s| !reserved.contains(&(s.x, s.y))).collect();
@@ -209,27 +216,35 @@ pub fn legalize_clocks(placed: &mut Placed, dev: &Device) -> Result<u32, String>
                 }
             }
             let keep = (0..8).max_by_key(|&l| counts[l]).unwrap_or(0) as i8;
-            let off_clock = (0..n_ble).find(|&b| tile[b] != u32::MAX && ck.line[tile[b] as usize] >= 0 && ck.line[tile[b] as usize] != keep);
-            let extra_gen = (0..n_ble).filter(|&b| tile[b] != u32::MAX && ck.source[tile[b] as usize]).nth(1);
+            let off_clock = (0..n_ble).filter(|&b| tile[b] != u32::MAX && ck.line[tile[b] as usize] >= 0 && ck.line[tile[b] as usize] != keep);
+            let extra_gen = (0..n_ble).filter(|&b| tile[b] != u32::MAX && ck.source[tile[b] as usize]).skip(1);
             let first_rst = tile.iter().filter(|c| **c != u32::MAX).map(|c| ck.rst[*c as usize]).find(|r| *r >= 0).unwrap_or(-1);
-            let off_reset = (0..n_ble).find(|&b| tile[b] != u32::MAX && ck.rst[tile[b] as usize] >= 0 && ck.rst[tile[b] as usize] != first_rst);
-            let slot = t * n_ble + off_clock.or(extra_gen).or(off_reset).ok_or("cannot separate the clocks of a CLB")?;
-            let c = occ[slot];
+            let off_reset = (0..n_ble).filter(|&b| tile[b] != u32::MAX && ck.rst[tile[b] as usize] >= 0 && ck.rst[tile[b] as usize] != first_rst);
+            let shed: Vec<usize> = off_clock.chain(extra_gen).chain(off_reset).map(|b| t * n_ble + b).collect();
+            if shed.is_empty() {
+                return Err("cannot separate the clocks of a CLB".to_string());
+            }
             let (sx, sy) = (sites[t].x as i64, sites[t].y as i64);
             let mut order: Vec<usize> = (0..sites.len()).filter(|&u| u != t).collect();
             order.sort_by_key(|&u| (sites[u].x as i64 - sx).abs() + (sites[u].y as i64 - sy).abs());
             let mut done = false;
-            for u in order {
-                let Some(free) = (0..n_ble).find(|b| occ[u * n_ble + b] == u32::MAX) else { continue };
-                let mut with = occ[u * n_ble..(u + 1) * n_ble].to_vec();
-                with[free] = c;
-                if ck.tile_ok(&with) {
-                    occ[u * n_ble + free] = c;
-                    occ[slot] = u32::MAX;
-                    placed.lutff_sites[c as usize] = (sites[u], free as u8);
-                    moved += 1;
-                    done = true;
-                    break;
+            'shed: for slot in shed {
+                let c = occ[slot];
+                for &u in &order {
+                    if !allowed(c as usize, sites[u]) {
+                        continue;
+                    }
+                    let Some(free) = (0..n_ble).find(|b| occ[u * n_ble + b] == u32::MAX) else { continue };
+                    let mut with = occ[u * n_ble..(u + 1) * n_ble].to_vec();
+                    with[free] = c;
+                    if ck.tile_ok(&with) {
+                        occ[u * n_ble + free] = c;
+                        occ[slot] = u32::MAX;
+                        placed.lutff_sites[c as usize] = (sites[u], free as u8);
+                        moved += 1;
+                        done = true;
+                        break 'shed;
+                    }
                 }
             }
             if !done {
