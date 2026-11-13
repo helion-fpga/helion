@@ -67,7 +67,8 @@ pub fn analyze_with_pad(routed: &Routed, tm: &TimingModel, period_ps: i64, pad_p
     // Arrival of a source as seen at its output, and its depth.
     fn src_arrival(src: NetSrc, arr: &[Option<(i64, u32, Option<NetSrc>)>], tm: &TimingModel) -> (i64, u32) {
         match src {
-            NetSrc::BleQ(_) => (tm.ff_ckq_ps, 0),
+            // A hard block's output is timed as a register output.
+            NetSrc::BleQ(_) | NetSrc::Hard { .. } => (tm.ff_ckq_ps, 0),
             NetSrc::Input(_) => (tm.iob_ps, 0),
             NetSrc::BleO(j) => arr.get(j as usize).copied().flatten().map(|a| (a.0, a.1)).unwrap_or((0, 0)),
         }
@@ -176,6 +177,10 @@ pub fn analyze_with_pad(routed: &Routed, tm: &TimingModel, period_ps: i64, pad_p
                 }
                 NetSrc::Input(k) => {
                     path.push((format!("input {}", conn.inputs.get(k as usize).map(|i| i.net.as_str()).unwrap_or("?")), tm.iob_ps));
+                    break;
+                }
+                NetSrc::Hard { blk, bit } => {
+                    path.push((format!("hard block {blk} output {bit}"), tm.ff_ckq_ps));
                     break;
                 }
                 NetSrc::BleO(j) => {

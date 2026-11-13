@@ -225,6 +225,7 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
                 Src::Ble { x: site.x, y: site.y, sel: (tk::SB_LUT_O + ble as u32) as u8 }
             }
             NetSrc::Input(i) => Src::Pad { input: i },
+            NetSrc::Hard { .. } => return Err("route: hard blocks are not routed yet".into()),
         };
         nets.push(Net { src: s, sinks: Vec::new() });
         net_of.insert(src, nets.len() - 1);
@@ -245,7 +246,7 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
                 // The LUT output is visible to the IMUX in its own CLB only.
                 (dsite.x == site.x && dsite.y == site.y).then_some(24 + dble)
             }
-            NetSrc::Input(_) => None,
+            NetSrc::Input(_) | NetSrc::Hard { .. } => None,
         };
         match direct {
             Some(sel) => direct_imux.push(ImuxRoute { x: site.x, y: site.y, mux, sel }),
@@ -271,6 +272,7 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
             NetSrc::BleQ(i) => (i, true),
             NetSrc::BleO(i) => (i, false),
             NetSrc::Input(_) => return Err(format!("route: output pad {} is fed straight from an input pad", io.cell)),
+            NetSrc::Hard { .. } => return Err("route: hard blocks are not routed yet".into()),
         };
         let (csite, ble) = site_of(i)?;
         let (px, py) = pad_xy(dev, site);

@@ -35,7 +35,7 @@ use super::{ImplStrategy, Mode, PrjPblock, Session};
 use helion_bits::Bitstream;
 use helion_device::{Device, Site, SiteKind};
 use helion_ir::Design;
-use helion_pack::{ClockDom, ClockSrc, Connectivity, NetSrc, Packed, PackedBram, PackedInput, PackedIob, PackedLutFf, PackedMac, PinConn};
+use helion_pack::{ClockDom, ClockSrc, Connectivity, HardKind, HardPin, HardRef, NetSrc, Packed, PackedBram, PackedInput, PackedIob, PackedLutFf, PackedMac, PinConn};
 use helion_place::Placed;
 use helion_route::{ImuxRoute, IobInput, IobRoute, IobTrack, Routed, SbRoute, TrackRoutes};
 use helion_sta::Constraints;
@@ -499,6 +499,29 @@ fn enc_packed(w: &mut Writer, p: &Packed) {
         }
     }
     enc_conn(w, &p.conn);
+    // Hard blocks connected to the fabric (added later: older checkpoints
+    // end before this and load with none).
+    for m in &p.macs {
+        w.u8(m.fabric as u8 | (m.signed as u8) << 1 | (m.preg as u8) << 2 | (m.use_c as u8) << 3);
+    }
+    for b in &p.brams {
+        w.u8(b.fabric as u8);
+    }
+    w.u32(p.conn.hard.len() as u32);
+    for h in &p.conn.hard {
+        w.u8((h.kind == HardKind::Mac) as u8);
+        w.u32(h.idx);
+    }
+    w.u32(p.conn.hard_pins.len() as u32);
+    for h in &p.conn.hard_pins {
+        w.u32(h.blk);
+        w.u8(h.dy);
+        w.u8(h.m);
+        enc_src(w, h.src);
+    }
+    for c in &p.conn.hard_clock {
+        w.u8(c.unwrap_or(255));
+    }
 }
 
 fn enc_src(w: &mut Writer, s: NetSrc) {
@@ -506,6 +529,7 @@ fn enc_src(w: &mut Writer, s: NetSrc) {
         NetSrc::BleQ(i) => (0, i),
         NetSrc::BleO(i) => (1, i),
         NetSrc::Input(i) => (2, i),
+        NetSrc::Hard { blk, bit } => (3, (blk << 8) | bit as u32),
     };
     w.u8(k);
     w.u32(v);
@@ -518,6 +542,7 @@ fn dec_src(r: &mut Reader) -> Result<NetSrc, String> {
         0 => Ok(NetSrc::BleQ(v)),
         1 => Ok(NetSrc::BleO(v)),
         2 => Ok(NetSrc::Input(v)),
+        3 => Ok(NetSrc::Hard { blk: v >> 8, bit: (v & 0xff) as u8 }),
         _ => Err(format!("checkpoint: bad net source kind {k}")),
     }
 }
@@ -784,7 +809,7 @@ fn dec_packed(r: &mut Reader) -> Result<Packed, String> {
     let n = r.u32()? as usize;
     let mut macs = Vec::with_capacity(n.min(1 << 10));
     for _ in 0..n {
-        macs.push(PackedMac { cell: r.str()? });
+        macs.push(PackedMac { cell: r.str()?, fabric: false, signed: false, preg: false, use_c: false });
     }
     let n = r.u32()? as usize;
     let mut brams = Vec::with_capacity(n.min(1 << 10));
@@ -795,14 +820,35 @@ fn dec_packed(r: &mut Reader) -> Result<Packed, String> {
         for _ in 0..ni {
             init.push(r.u64()?);
         }
-        brams.push(PackedBram { cell, init });
+        brams.push(PackedBram { cell, init, fabric: false });
+    }
+    let mut conn = dec_conn(r)?;
+    if r.pos < r.buf.len() {
+        for m in macs.iter_mut() {
+            let f = r.u8()?;
+            (m.fabric, m.signed, m.preg, m.use_c) = (f & 1 != 0, f & 2 != 0, f & 4 != 0, f & 8 != 0);
+        }
+        for b in brams.iter_mut() {
+            b.fabric = r.u8()? != 0;
+        }
+        for _ in 0..r.u32()? {
+            let kind = if r.u8()? == 1 { HardKind::Mac } else { HardKind::Bram };
+            conn.hard.push(HardRef { kind, idx: r.u32()? });
+        }
+        for _ in 0..r.u32()? {
+            conn.hard_pins.push(HardPin { blk: r.u32()?, dy: r.u8()?, m: r.u8()?, src: dec_src(r)? });
+        }
+        for _ in 0..conn.hard.len() {
+            let v = r.u8()?;
+            conn.hard_clock.push((v != 255).then_some(v));
+        }
     }
     Ok(Packed {
         lutffs,
         iobs,
         macs,
         brams,
-        conn: dec_conn(r)?,
+        conn,
     })
 }
 
@@ -1492,6 +1538,27 @@ mod tests {
         let mut clks = Vec::new();
         helion_sta::create_clock(&mut clks, "clk", 10_000, "clk");
         clks
+    }
+
+    /// Hard blocks connected to the fabric survive a checkpoint.
+    #[test]
+    fn round_trip_hard_blocks() {
+        let mut p = helion_pack::pack(&Design::structural_counter(), &Device::load_part("HL10S-C64-1").unwrap()).unwrap();
+        p.macs.push(PackedMac { cell: "mul".into(), fabric: true, signed: true, preg: false, use_c: true });
+        p.brams.push(PackedBram { cell: "ram".into(), init: vec![7], fabric: true });
+        p.conn.hard = vec![HardRef { kind: HardKind::Mac, idx: 0 }, HardRef { kind: HardKind::Bram, idx: 0 }];
+        p.conn.hard_pins = vec![HardPin { blk: 1, dy: 0, m: 42, src: NetSrc::BleQ(2) }, HardPin { blk: 0, dy: 1, m: 3, src: NetSrc::Hard { blk: 1, bit: 15 } }];
+        p.conn.hard_clock = vec![None, Some(0)];
+        p.conn.iob_src.insert("x".into(), NetSrc::Hard { blk: 0, bit: 31 });
+        let mut w = Writer::new();
+        enc_packed(&mut w, &p);
+        let q = dec_packed(&mut Reader::new(&w.buf)).unwrap();
+        assert_eq!(q.conn.hard, p.conn.hard);
+        assert_eq!(q.conn.hard_pins, p.conn.hard_pins);
+        assert_eq!(q.conn.hard_clock, p.conn.hard_clock);
+        assert_eq!(q.conn.iob_src, p.conn.iob_src);
+        assert!(q.macs[0].fabric && q.macs[0].signed && !q.macs[0].preg && q.macs[0].use_c);
+        assert!(q.brams[0].fabric);
     }
 
     #[test]

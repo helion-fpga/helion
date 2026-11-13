@@ -279,8 +279,21 @@ pub enum CellKind {
     /// On the HL10T flow this is rejected at pack/route time with an
     /// "unsupported for HL10T" error; it is only legal for multi-backend flows.
     ClockBuf,
-    /// DSP MAC27 (pre-add * mul + acc). Site primitive.
-    /// Deprecated: use Dsp48e1 with explicit pins.
+    /// Helion multiplier (a DSP site of a Helion part): `P = A * B (+ C)`.
+    ///
+    /// Pins, one per bit, no brackets: `A0`..`A15`, `B0`..`B15` (16-bit
+    /// operands), `C0`..`C31` (32-bit addend), `CE`, `RST`, `CLK`, and
+    /// `P0`..`P31` (32-bit result, modulo 2^32). An input left unconnected
+    /// reads 0, except `CE`, which reads 1.
+    ///
+    /// Attributes: `SIGNED=1` multiplies A and B as two's-complement
+    /// numbers (else unsigned); `PREG=1` registers P on the rising edge of
+    /// `CLK` (`RST` high clears it, else `CE` high loads it; both are
+    /// synchronous), else P follows the inputs combinationally. P starts
+    /// at 0.
+    ///
+    /// A `Mac27` with no pin connected is the older name-only primitive
+    /// (a site is reserved, nothing is connected).
     Mac27,
     /// Xilinx 7-series DSP48E1 block.
     ///
@@ -301,8 +314,23 @@ pub enum CellKind {
     },
     /// Inserted ILA core capturing `net`.
     Ila { net: Spur },
-    /// Block RAM 18Kb (true dual-port primitive).
-    /// Deprecated: use Bram18e1 with explicit pins.
+    /// Helion block RAM (a BRAM site of a Helion part): 1024 x 16, simple
+    /// dual port, one clock, read-first, read latency 1.
+    ///
+    /// Pins, one per bit, no brackets: `DI0`..`DI15`, `WADDR0`..`WADDR9`,
+    /// `RADDR0`..`RADDR9`, `WE`, `RE`, `CLK`, `DO0`..`DO15`. On each rising
+    /// edge of `CLK`: if `RE`, `DO` takes the word at `RADDR` as it was
+    /// before the edge (a write to the same address shows on the next
+    /// read); if `WE`, the word at `WADDR` takes `DI`. `DO` starts at 0.
+    /// An input left unconnected reads 0, except `RE`, which reads 1.
+    ///
+    /// Attribute `INIT`: the initial contents as comma-separated hex 64-bit
+    /// words, at most 256; word `w` holds addresses `4w`..`4w+3`, address
+    /// `4w+k` in bits `16k`..`16k+15`. Missing words are 0.
+    ///
+    /// A `Bram18` with no pin connected is the older host-access aperture
+    /// (ILA capture RAM): its `INIT` words are 64-bit words of the
+    /// aperture, at most 255.
     Bram18,
     /// Xilinx 7-series RAMB18E1 block RAM.
     ///

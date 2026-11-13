@@ -31,6 +31,28 @@ pub enum NetSrc {
     BleO(u32),
     /// Input pad `conn.inputs[i]`.
     Input(u32),
+    /// Output bit `bit` (`DO{bit}` / `P{bit}`) of hard block `conn.hard[blk]`.
+    Hard { blk: u32, bit: u8 },
+}
+
+pub use helion_device::hard::Kind as HardKind;
+
+/// A hard block connected to the fabric: `packed.macs[idx]` or
+/// `packed.brams[idx]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HardRef {
+    pub kind: HardKind,
+    pub idx: u32,
+}
+
+/// One connected input of a hard block: tile `dy` above the block's site,
+/// IMUX `m` of that tile (see `helion_device::hard`), and its driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HardPin {
+    pub blk: u32,
+    pub dy: u8,
+    pub m: u8,
+    pub src: NetSrc,
 }
 
 /// One LUT input pin and its driver.
@@ -96,6 +118,13 @@ pub struct Connectivity {
     pub ff_reset: Vec<Option<(u8, bool, bool)>>,
     /// Ways the design's clocking does not fit the fabric. Empty when it fits.
     pub clock_problems: Vec<String>,
+    /// Hard blocks connected to the fabric (RAMs and multipliers with
+    /// pins), in netlist order; `NetSrc::Hard` and `hard_pins` index this.
+    pub hard: Vec<HardRef>,
+    /// Every connected input of those blocks.
+    pub hard_pins: Vec<HardPin>,
+    /// Clock line of each block in `hard` (`None`: no clock pin).
+    pub hard_clock: Vec<Option<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +132,9 @@ pub struct PackedBram {
     pub cell: String,
     /// INIT words from IR attr `INIT` (comma-separated hex).
     pub init: Vec<u64>,
+    /// Connected to the fabric (a 1024x16 RAM with pins, in `conn.hard`);
+    /// else the pinless host-access aperture.
+    pub fabric: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +169,14 @@ pub struct PackedIob {
 #[derive(Clone, Debug)]
 pub struct PackedMac {
     pub cell: String,
+    /// Connected to the fabric (a multiplier with pins, in `conn.hard`).
+    pub fabric: bool,
+    /// `SIGNED=1`: two's-complement operands.
+    pub signed: bool,
+    /// `PREG=1`: registered result.
+    pub preg: bool,
+    /// Some `C` pin is connected.
+    pub use_c: bool,
 }
 
 /// LUTFF occupancy per HAD CLB site ID (`CLB_X2Y1` → N). Derived from
@@ -159,6 +199,94 @@ impl PackingSummary {
     pub fn lutff_in(&self, site_id: &str) -> usize {
         self.sites.get(site_id).copied().unwrap_or(0)
     }
+}
+
+/// The design's multipliers and RAMs, in netlist order, and those of them
+/// connected to the fabric (a `Mac27` / `Bram18` with pins) with their
+/// cell names. The Xilinx `Dsp48e1` / `Bram18e1` keep a site only.
+#[allow(clippy::type_complexity)]
+fn pack_hard(design: &Design) -> Result<(Vec<PackedMac>, Vec<PackedBram>, Vec<(HardRef, Spur)>), String> {
+    use helion_device::hard;
+    let kind_of = |k: &CellKind| match k {
+        CellKind::Bram18 => Some(HardKind::Bram),
+        CellKind::Mac27 => Some(HardKind::Mac),
+        _ => None,
+    };
+    let mut pins_of: HashMap<Spur, Vec<Spur>> = HashMap::new();
+    if design.cells.iter().any(|c| kind_of(&c.kind).is_some()) {
+        let names: HashSet<Spur> = design.cells.iter().filter(|c| kind_of(&c.kind).is_some()).map(|c| c.name).collect();
+        for n in &design.nets {
+            for e in &n.endpoints {
+                if names.contains(&e.cell) {
+                    pins_of.entry(e.cell).or_default().push(e.pin);
+                }
+            }
+        }
+    }
+    let mut macs = Vec::new();
+    let mut brams = Vec::new();
+    let mut hard_cells = Vec::new();
+    for c in &design.cells {
+        let name = resolve(c.name);
+        let pins = pins_of.get(&c.name);
+        if let (Some(kind), Some(pins)) = (kind_of(&c.kind), pins) {
+            for p in pins {
+                let p = resolve(*p);
+                if p != "CLK" && hard::input(kind, p).is_none() && hard::output_bit(kind, p).is_none() {
+                    return Err(format!("cell {name}: {p} is not a pin of a Helion {}", if kind == HardKind::Bram { "Bram18" } else { "Mac27" }));
+                }
+            }
+            if c.attrs.get("CLK_INV") == Some("1") {
+                return Err(format!("cell {name}: a hard block captures on the rising edge only"));
+            }
+        }
+        let flag = |k: &str| -> Result<bool, String> {
+            match c.attrs.get(k) {
+                None | Some("0") => Ok(false),
+                Some("1") => Ok(true),
+                Some(v) => Err(format!("cell {name}: {k}={v} (expected 0 or 1)")),
+            }
+        };
+        match c.kind {
+            CellKind::Mac27 | CellKind::Dsp48e1 { .. } => {
+                let fabric = matches!(c.kind, CellKind::Mac27) && pins.is_some();
+                if fabric {
+                    hard_cells.push((HardRef { kind: HardKind::Mac, idx: macs.len() as u32 }, c.name));
+                }
+                let use_c = pins.is_some_and(|ps| ps.iter().any(|p| matches!(hard::input(HardKind::Mac, resolve(*p)), Some((1, _)))));
+                macs.push(PackedMac { cell: name.to_string(), fabric, signed: flag("SIGNED")?, preg: flag("PREG")?, use_c: fabric && use_c });
+            }
+            CellKind::Bram18 => {
+                let fabric = pins.is_some();
+                let mut init = Vec::new();
+                for t in c.attrs.get("INIT").unwrap_or("").split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                    let h = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+                    init.push(u64::from_str_radix(h, 16).map_err(|_| format!("cell {name}: INIT word {t} is not hexadecimal"))?);
+                }
+                let cap = if fabric { hard::RAM_INIT_WORDS } else { 255 };
+                if init.len() > cap {
+                    return Err(format!("cell {name}: {} INIT words, at most {cap}", init.len()));
+                }
+                if fabric {
+                    hard_cells.push((HardRef { kind: HardKind::Bram, idx: brams.len() as u32 }, c.name));
+                }
+                brams.push(PackedBram { cell: name.to_string(), init, fabric });
+            }
+            CellKind::Bram18e1 { .. } => {
+                let init = c
+                    .attrs
+                    .get("INIT")
+                    .unwrap_or("")
+                    .split(',')
+                    .filter(|t| !t.is_empty())
+                    .map(|t| u64::from_str_radix(t.trim(), 16).unwrap_or(0))
+                    .collect();
+                brams.push(PackedBram { cell: name.to_string(), init, fabric: false });
+            }
+            _ => {}
+        }
+    }
+    Ok((macs, brams, hard_cells))
 }
 
 pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
@@ -186,6 +314,7 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
             pin_to_net.insert((e.cell, e.pin), n.name);
         }
     }
+    let (macs, brams, hard_cells) = pack_hard(design)?;
     let pin_d = intern("D");
     let pin_q = intern("Q");
     let pin_o = intern("O");
@@ -303,6 +432,18 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
     for i in lut_jobs.len()..lutffs.len() {
         net_src.insert(intern(&lutffs[i].q_net), NetSrc::BleQ(i as u32));
     }
+    // Hard-block outputs.
+    for (blk, (r, cell)) in hard_cells.iter().enumerate() {
+        for b in 0..helion_device::hard::n_outputs(r.kind) {
+            let pin = match r.kind {
+                HardKind::Bram => format!("DO{b}"),
+                HardKind::Mac => format!("P{b}"),
+            };
+            if let Some(&net) = pin_to_net.get(&(*cell, intern(&pin))) {
+                net_src.insert(net, NetSrc::Hard { blk: blk as u32, bit: b as u8 });
+            }
+        }
+    }
     // Input pads: nets no cell drives that carry an input port's name
     // (`port` or `port_<bit>`).
     let in_ports: Vec<&helion_ir::Port> = design.ports.iter().filter(|p| matches!(p.dir, helion_ir::PortDir::In)).collect();
@@ -337,6 +478,16 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
             match net_src.get(&net).copied().or_else(|| input_src(net, &mut conn)) {
                 Some(src) => conn.pins.push(PinConn { lutff: i as u32, pin, src }),
                 None => conn.undriven.push(format!("{}.I{pin} <- {}", lutffs[i].lut_cell, resolve(net))),
+            }
+        }
+    }
+    conn.hard = hard_cells.iter().map(|(r, _)| *r).collect();
+    for (blk, (r, cell)) in hard_cells.iter().enumerate() {
+        for (pin, dy, m) in helion_device::hard::inputs(r.kind) {
+            let Some(&net) = pin_to_net.get(&(*cell, intern(&pin))) else { continue };
+            match net_src.get(&net).copied().or_else(|| input_src(net, &mut conn)) {
+                Some(src) => conn.hard_pins.push(HardPin { blk: blk as u32, dy: dy as u8, m: m as u8, src }),
+                None => conn.undriven.push(format!("{}.{pin} <- {}", resolve(*cell), resolve(net))),
             }
         }
     }
@@ -432,6 +583,26 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
             }
             of_ff.insert(name, (clk, c.attrs.get("CLK_INV") == Some("1")));
         }
+        // Hard blocks: a RAM, and a multiplier with its output register,
+        // capture on their clock pin.
+        let mut hard_clk: Vec<Option<Spur>> = Vec::with_capacity(hard_cells.len());
+        for (r, cell) in &hard_cells {
+            let clk = cpins.net_on(resolve(*cell), "CLK");
+            let needs = match r.kind {
+                HardKind::Bram => true,
+                HardKind::Mac => macs[r.idx as usize].preg,
+            };
+            if needs && clk.is_none() {
+                conn.clock_problems.push(format!("{} has no clock", resolve(*cell)));
+            }
+            let clk = clk.filter(|_| needs);
+            if let Some(n) = clk {
+                if !order.contains(&n) {
+                    order.push(n);
+                }
+            }
+            hard_clk.push(clk);
+        }
         let lines = helion_device::clocks::LINES as usize;
         if order.len() + rorder.len() > lines && !rorder.is_empty() && order.len() <= lines {
             conn.clock_problems.push(format!(
@@ -452,6 +623,10 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
         for (line, net) in order.iter().enumerate().take(lines) {
             let name = resolve(*net).to_string();
             let src = match net_src.get(net).copied() {
+                Some(NetSrc::Hard { .. }) => {
+                    conn.clock_problems.push(format!("clock net {name} is driven by a hard block"));
+                    continue;
+                }
                 Some(s) => Some(ClockSrc::Gen(s)),
                 None => match input_src(*net, &mut conn) {
                     Some(NetSrc::Input(_)) if order.len() == 1 => Some(ClockSrc::Implicit),
@@ -469,7 +644,7 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
         }
         // An implicit clock's pin is not an input pad unless logic reads it too.
         if let Some(ClockDom { src: ClockSrc::Implicit, net, .. }) = conn.clocks.first() {
-            let read = conn.pins.iter().any(|p| matches!(p.src, NetSrc::Input(i) if conn.inputs[i as usize].net == *net));
+            let read = conn.pins.iter().map(|p| p.src).chain(conn.hard_pins.iter().map(|p| p.src)).any(|s| matches!(s, NetSrc::Input(i) if conn.inputs[i as usize].net == *net));
             if !read {
                 if let Some(ix) = conn.inputs.iter().position(|i| i.net == *net) {
                     if ix + 1 == conn.inputs.len() {
@@ -486,6 +661,10 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
             }
             let name = resolve(*net).to_string();
             let src = match net_src.get(net).copied() {
+                Some(NetSrc::Hard { .. }) => {
+                    conn.clock_problems.push(format!("asynchronous reset net {name} is driven by a hard block"));
+                    continue;
+                }
                 Some(s) => Some(ClockSrc::Gen(s)),
                 None => match input_src(*net, &mut conn) {
                     Some(NetSrc::Input(i)) => {
@@ -519,6 +698,10 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
                 Some((line, inv))
             })
             .collect();
+        conn.hard_clock = hard_clk
+            .iter()
+            .map(|c| c.map(|n| order.iter().position(|o| *o == n).unwrap_or(0).min(lines - 1) as u8))
+            .collect();
         let unclocked = of_ff.values().filter(|v| v.0.is_none()).count();
         if unclocked > 0 {
             conn.clock_problems.push(format!("{unclocked} flop(s) have no clock"));
@@ -535,31 +718,9 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
             for i in conn.inputs.iter_mut() {
                 i.clock = None;
             }
-        }
-    }
-    let mut macs = Vec::new();
-    for c in &design.cells {
-        if matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. }) {
-            macs.push(PackedMac {
-                cell: resolve(c.name).to_string(),
-            });
-        }
-    }
-    let mut brams = Vec::new();
-    for c in &design.cells {
-        if matches!(c.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. }) {
-            let init = c
-                .attrs
-                .get("INIT")
-                .unwrap_or("")
-                .split(',')
-                .filter(|t| !t.is_empty())
-                .map(|t| u64::from_str_radix(t.trim(), 16).unwrap_or(0))
-                .collect();
-            brams.push(PackedBram {
-                cell: resolve(c.name).to_string(),
-                init,
-            });
+            for c in conn.hard_clock.iter_mut().flatten() {
+                *c = 0;
+            }
         }
     }
     Ok(Packed {
@@ -2719,5 +2880,99 @@ mod tests {
                 "Boolean mismatch after pin permutation for (crit={crit_v}, mid={mid_v}, early={early_v})"
             );
         }
+    }
+
+    /// A RAM read by a LUT and a pad, written from an input pad and a
+    /// flop, clocked by the design's only clock.
+    fn ram_design() -> Design {
+        let mut d = Design::new("ram");
+        d.add_port("clk", helion_ir::PortDir::In);
+        d.add_port("din", helion_ir::PortDir::In);
+        d.add_port("o", helion_ir::PortDir::Out);
+        d.add_port("p", helion_ir::PortDir::Out);
+        d.add_cell("ram", CellKind::Bram18);
+        d.set_cell_attr("ram", "INIT", "1234,0xffff").unwrap();
+        d.connect("clk", "ram", "CLK");
+        d.connect("din", "ram", "DI0");
+        d.add_cell("ff", CellKind::Hff);
+        d.add_cell("inv", CellKind::Lut6 { init: 0x5555_5555_5555_5555 });
+        d.connect("clk", "ff", "CLK");
+        d.connect("q", "ff", "Q");
+        d.connect("q", "inv", "I0");
+        d.connect("nq", "inv", "O");
+        d.connect("nq", "ff", "D");
+        d.connect("q", "ram", "WE");
+        d.connect("q", "ram", "WADDR3");
+        d.connect("do0", "ram", "DO0");
+        d.add_cell("buf", CellKind::Lut6 { init: 0xAAAA_AAAA_AAAA_AAAA });
+        d.connect("do0", "buf", "I0");
+        d.connect("b", "buf", "O");
+        d.add_cell("io", CellKind::IobOut);
+        d.connect("b", "io", "I");
+        d.connect("o", "io", "PAD");
+        d.connect("do1", "ram", "DO1");
+        d.add_cell("io2", CellKind::IobOut);
+        d.connect("do1", "io2", "I");
+        d.connect("p", "io2", "PAD");
+        d
+    }
+
+    #[test]
+    fn packs_ram_with_pins_onto_the_fabric() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&ram_design(), &dev).unwrap();
+        assert_eq!(p.brams.len(), 1);
+        assert!(p.brams[0].fabric);
+        assert_eq!(p.brams[0].init, vec![0x1234, 0xffff]);
+        assert_eq!(p.conn.hard, vec![HardRef { kind: HardKind::Bram, idx: 0 }]);
+        assert!(p.conn.undriven.is_empty(), "{:?}", p.conn.undriven);
+        // DI0 from the input pad, WE and WADDR3 from the flop.
+        let mut pins: Vec<(u8, u8)> = p.conn.hard_pins.iter().map(|h| (h.dy, h.m)).collect();
+        pins.sort();
+        assert_eq!(pins, vec![(0, 0), (0, 19), (0, 42)]);
+        assert!(matches!(p.conn.hard_pins.iter().find(|h| h.m == 0).unwrap().src, NetSrc::Input(_)));
+        // The LUT and the pad read RAM outputs.
+        assert!(p.conn.pins.iter().any(|pc| pc.src == NetSrc::Hard { blk: 0, bit: 0 }));
+        assert_eq!(p.conn.iob_src.get("io2"), Some(&NetSrc::Hard { blk: 0, bit: 1 }));
+        assert_eq!(p.conn.clocks.len(), 1);
+        assert_eq!(p.conn.hard_clock, vec![Some(0)]);
+        assert!(p.conn.clock_problems.is_empty());
+    }
+
+    #[test]
+    fn hard_block_errors() {
+        let dev = Device::load_part("HL10S-C64-1").unwrap();
+        let mut d = ram_design();
+        d.connect("q", "ram", "ADDR0");
+        assert!(pack(&d, &dev).unwrap_err().contains("ADDR0 is not a pin"));
+        let mut d = ram_design();
+        d.set_cell_attr("ram", "INIT", "12,zz").unwrap();
+        assert!(pack(&d, &dev).unwrap_err().contains("zz"));
+        let mut d = ram_design();
+        d.set_cell_attr("ram", "INIT", vec!["0"; 257].join(",")).unwrap();
+        assert!(pack(&d, &dev).unwrap_err().contains("at most 256"));
+        // A registered multiplier needs a clock; a combinational one does not.
+        let mut d = Design::new("m");
+        d.add_port("a", helion_ir::PortDir::In);
+        d.add_cell("mul", CellKind::Mac27);
+        d.connect("a", "mul", "A0");
+        d.set_cell_attr("mul", "PREG", "1").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        assert!(p.conn.clock_problems.iter().any(|c| c.contains("mul has no clock")), "{:?}", p.conn.clock_problems);
+        d.set_cell_attr("mul", "PREG", "0").unwrap();
+        d.set_cell_attr("mul", "SIGNED", "1").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        assert!(p.conn.clock_problems.is_empty());
+        assert!(p.macs[0].fabric && p.macs[0].signed && !p.macs[0].preg && !p.macs[0].use_c);
+        d.connect("a", "mul", "C5");
+        assert!(pack(&d, &dev).unwrap().macs[0].use_c);
+        d.set_cell_attr("mul", "SIGNED", "yes").unwrap();
+        assert!(pack(&d, &dev).is_err());
+        // Pinless blocks stay the older name-only primitives.
+        let mut d = Design::new("old");
+        d.add_cell("u_mac", CellKind::Mac27);
+        d.add_cell("u_bram", CellKind::Bram18);
+        let p = pack(&d, &dev).unwrap();
+        assert!(!p.macs[0].fabric && !p.brams[0].fabric && p.conn.hard.is_empty());
     }
 }

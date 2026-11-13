@@ -275,7 +275,7 @@ fn program_clb_frames(
         let helion_pack::ClockSrc::Gen(src) = dom.src else { continue };
         let idx = match src {
             helion_pack::NetSrc::BleQ(i) | helion_pack::NetSrc::BleO(i) => i as usize,
-            helion_pack::NetSrc::Input(_) => continue,
+            helion_pack::NetSrc::Input(_) | helion_pack::NetSrc::Hard { .. } => continue,
         };
         let Some(&(site, ble)) = routed.placed.lutff_sites.get(idx) else {
             return Err(format!("bitgen: the source of clock {} is not placed", dom.net));

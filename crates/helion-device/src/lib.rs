@@ -724,6 +724,50 @@ impl Device {
         Some((dy * self.interior_cols + dx) as u16)
     }
 
+    /// `Far::BRAM` major of the RAM site at `(x, y)`: its site index.
+    pub fn bram_major(&self, x: u32, y: u32) -> Option<u16> {
+        let d = y.checked_sub(self.bram_y0)?;
+        (x == self.bram_x && d % 2 == 0 && d / 2 < self.n_bram).then_some((d / 2) as u16)
+    }
+
+    /// `Far::DSP` major of the multiplier site at `(x, y)`: its site index.
+    pub fn dsp_major(&self, x: u32, y: u32) -> Option<u16> {
+        let d = y.checked_sub(self.dsp_y0)?;
+        (x == self.dsp_x && d % 2 == 0 && d / 2 < self.n_dsp).then_some((d / 2) as u16)
+    }
+
+    /// Kind and site index of a hard-block site.
+    pub fn hard_site(&self, site: Site) -> Option<(hard::Kind, u16)> {
+        match site.kind {
+            SiteKind::Bram => self.bram_major(site.x, site.y).map(|i| (hard::Kind::Bram, i)),
+            SiteKind::Dsp => self.dsp_major(site.x, site.y).map(|i| (hard::Kind::Mac, i)),
+            _ => None,
+        }
+    }
+
+    /// CLB tiles a hard block at `site` takes when it is used.
+    pub fn hard_tiles(&self, site: Site) -> Vec<(u32, u32)> {
+        match self.hard_site(site) {
+            Some((kind, _)) => (0..kind.tiles()).map(|dy| (site.x, site.y + dy)).filter(|&(x, y)| self.clb_major(x, y).is_some()).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The hard-block site whose tiles include the CLB tile `(x, y)`:
+    /// kind, site index and the tile's row within the block.
+    pub fn hard_tile(&self, x: u32, y: u32) -> Option<(hard::Kind, u16, u32)> {
+        if let Some(i) = self.bram_major(x, y) {
+            return Some((hard::Kind::Bram, i, 0));
+        }
+        if let Some(i) = self.dsp_major(x, y) {
+            return Some((hard::Kind::Mac, i, 0));
+        }
+        if let Some(i) = y.checked_sub(1).and_then(|y1| self.dsp_major(x, y1)) {
+            return Some((hard::Kind::Mac, i, 1));
+        }
+        None
+    }
+
     /// Configuration column of the pad at `(x, y)`: the bottom row first
     /// (one per CLB column, as it always was), then the top row, the left
     /// column and the right column.
@@ -1203,9 +1247,68 @@ impl Device {
             let x: u32 = xs.parse().map_err(|_| "bad x".to_string())?;
             let y: u32 = ys.parse().map_err(|_| "bad y".to_string())?;
             self.locate_clb(x, y, rest)
+        } else if let Some(s) = Site::parse_id(site).filter(|s| matches!(s.kind, SiteKind::Bram | SiteKind::Dsp)) {
+            self.locate_hard(s, rest)
         } else {
             Err(format!("unsupported site {site}"))
         }
+    }
+
+    /// Bit of a hard block's own configuration: `USED`, `FABRIC`, the mode
+    /// bits (`READ_FIRST`, `CLKINV`, `SIGNED`, `PREG`, `USE_C`),
+    /// `PIN_EN[m]` (RAM) or `PIN_EN[dy][m]` (multiplier), and the RAM's
+    /// `INIT[addr][bit]`.
+    pub fn locate_hard(&self, site: Site, feature: &str) -> Result<BitLoc, String> {
+        let (kind, major) = self.hard_site(site).ok_or_else(|| format!("not a hard-block site {}", site.id()))?;
+        let block_type = if kind == hard::Kind::Bram { Far::BRAM } else { Far::DSP };
+        let at = |minor: u8, bit: u32| BitLoc { far: Far { block_type, die: 0, major, minor }, bit: bit as u8 };
+        let index = |s: &str| -> Option<Vec<u32>> {
+            let mut v = Vec::new();
+            let mut rest = s;
+            while let Some(r) = rest.strip_prefix('[') {
+                let (n, r) = r.split_once(']')?;
+                v.push(n.parse().ok()?);
+                rest = r;
+            }
+            rest.is_empty().then_some(v)
+        };
+        let mode = match (kind, feature) {
+            (_, "USED") => Some(hard::USED),
+            (_, "FABRIC") => Some(hard::FABRIC),
+            (hard::Kind::Bram, "READ_FIRST") => Some(hard::READ_FIRST),
+            (hard::Kind::Bram, "CLKINV") => Some(hard::CLKINV),
+            (hard::Kind::Mac, "SIGNED") => Some(hard::SIGNED),
+            (hard::Kind::Mac, "PREG") => Some(hard::PREG),
+            (hard::Kind::Mac, "USE_C") => Some(hard::USE_C),
+            _ => None,
+        };
+        if let Some(b) = mode {
+            return Ok(at(0, b));
+        }
+        let bad = || format!("unknown feature {}.{feature}", site.id());
+        if let Some(r) = feature.strip_prefix("PIN_EN") {
+            let ix = index(r).ok_or_else(bad)?;
+            let (dy, m) = match (kind, ix.as_slice()) {
+                (hard::Kind::Bram, [m]) => (0, *m),
+                (hard::Kind::Mac, [dy, m]) if *dy < 2 => (*dy, *m),
+                _ => return Err(bad()),
+            };
+            if m >= 64 {
+                return Err(bad());
+            }
+            let (minor, bit) = hard::pin_en_loc(kind, dy, m);
+            return Ok(at(minor, bit));
+        }
+        if let (hard::Kind::Bram, Some(r)) = (kind, feature.strip_prefix("INIT")) {
+            return match index(r).ok_or_else(bad)?.as_slice() {
+                [a, b] if (*a as usize) < hard::RAM_WORDS && *b < hard::RAM_WIDTH => {
+                    let (minor, bit) = hard::init_loc(*a);
+                    Ok(at(minor, bit + b))
+                }
+                _ => Err(bad()),
+            };
+        }
+        Err(bad())
     }
 
     /// Run Vivado UG907 multi-rail power and junction-temperature analysis on this part.
@@ -2057,4 +2160,248 @@ pub mod clocks {
     pub const IOB_CLOCK: u32 = 47;
     /// IOB word: the line, `LINE_BITS` bits from here.
     pub const IOB_CLOCK_LINE: u32 = 48;
+}
+
+/// Hard blocks on Helion's own fabric: block RAM and multipliers.
+///
+/// A BRAM or DSP site is the CLB tile at the site (one tile for a RAM, the
+/// tile and the one above it for a multiplier). While the block is used its
+/// LUTs and flops are off; the tile's switch box, connection box (`IMUX` /
+/// `IMUXT`), clock select and reset bits stay where they are in the tile's
+/// `CLB_IO_CLK` major and connect the block to the general interconnect:
+///
+/// - Every block input is an IMUX of the tile (`m` = 0..63), read in track
+///   mode like a LUT input. Only the IMUX marked in the block's `PIN_EN`
+///   mask is read; an input whose bit is clear reads 0, except an enable
+///   (`RE`, `CE`), which reads 1.
+/// - Block outputs leave the tile on switch-box selects 1..16 (the codes a
+///   CLB uses for its BLE outputs and LUT outputs).
+/// - The block's clock is the tile's `CLKSEL` line (the base tile's).
+///
+/// The block's own configuration is in `Far::BRAM` / `Far::DSP`, major =
+/// site index (`(y - y0) / 2`): minor 0 holds `USED`, the site's x and y,
+/// mode bits and `PIN_EN`; a RAM's contents follow in minors 1..=128.
+/// Blocks without [`FABRIC`] are the older host-access apertures (capture
+/// RAM): no pins, one 64-bit `INIT` word per minor 1..=255, no tile.
+pub mod hard {
+    /// Words and width of the RAM: 1024 x 16, simple dual port, one clock,
+    /// read-first, read latency 1.
+    pub const RAM_WORDS: usize = 1024;
+    pub const RAM_WIDTH: u32 = 16;
+    pub const RAM_ADDR_BITS: u32 = 10;
+    /// 64-bit `INIT` words of a RAM (four 16-bit words each).
+    pub const RAM_INIT_WORDS: usize = RAM_WORDS / 4;
+    /// Multiplier operand and result widths.
+    pub const MAC_IN_BITS: u32 = 16;
+    pub const MAC_C_BITS: u32 = 32;
+    pub const MAC_P_BITS: u32 = 32;
+
+    /// Minor-0 word, both kinds.
+    pub const USED: u32 = 0;
+    pub const X_SHIFT: u32 = 8;
+    pub const Y_SHIFT: u32 = 16;
+    /// The block is connected to the tile's interconnect (not an aperture).
+    pub const FABRIC: u32 = 31;
+    /// RAM: read-first (always set).
+    pub const READ_FIRST: u32 = 24;
+    /// RAM: captures on the falling edge (reserved; never set by bitgen).
+    pub const CLKINV: u32 = 25;
+    /// RAM: `PIN_EN[m]` of the tile at bit `PIN_EN_RAM + m`.
+    pub const PIN_EN_RAM: u32 = 64;
+    /// Multiplier mode bits.
+    pub const SIGNED: u32 = 24;
+    pub const PREG: u32 = 25;
+    pub const USE_C: u32 = 26;
+    /// Multiplier: `PIN_EN[m]` of the base tile at bit `PIN_EN_MAC + m` of
+    /// minor 0; that of the tile above at bit `m` of minor 1.
+    pub const PIN_EN_MAC: u32 = 32;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    pub enum Kind {
+        Bram,
+        Mac,
+    }
+
+    impl Kind {
+        /// Tiles the block takes (the base tile and the ones above it).
+        pub const fn tiles(self) -> u32 {
+            match self {
+                Kind::Bram => 1,
+                Kind::Mac => 2,
+            }
+        }
+    }
+
+    /// Input pin of a block: the tile (rows above the base) and its IMUX.
+    pub fn input(kind: Kind, pin: &str) -> Option<(u32, u32)> {
+        let idx = |p: &str, n: u32| p.parse::<u32>().ok().filter(|&i| i < n && (i == 0 || !p.starts_with('0')));
+        match kind {
+            Kind::Bram => {
+                if let Some(i) = pin.strip_prefix("DI").and_then(|p| idx(p, RAM_WIDTH)) {
+                    return Some((0, i));
+                }
+                if let Some(i) = pin.strip_prefix("WADDR").and_then(|p| idx(p, RAM_ADDR_BITS)) {
+                    return Some((0, 16 + i));
+                }
+                if let Some(i) = pin.strip_prefix("RADDR").and_then(|p| idx(p, RAM_ADDR_BITS)) {
+                    return Some((0, 32 + i));
+                }
+                match pin {
+                    "WE" => Some((0, 42)),
+                    "RE" => Some((0, 43)),
+                    _ => None,
+                }
+            }
+            Kind::Mac => {
+                if let Some(i) = pin.strip_prefix('A').and_then(|p| idx(p, MAC_IN_BITS)) {
+                    return Some((0, i));
+                }
+                if let Some(i) = pin.strip_prefix('B').and_then(|p| idx(p, MAC_IN_BITS)) {
+                    return Some((0, 16 + i));
+                }
+                if let Some(i) = pin.strip_prefix('C').and_then(|p| idx(p, MAC_C_BITS)) {
+                    return Some((1, i));
+                }
+                match pin {
+                    "CE" => Some((0, 32)),
+                    "RST" => Some((0, 33)),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// Every input pin of a block kind, in IMUX order.
+    pub fn inputs(kind: Kind) -> Vec<(String, u32, u32)> {
+        let mut v: Vec<String> = Vec::new();
+        match kind {
+            Kind::Bram => {
+                v.extend((0..RAM_WIDTH).map(|i| format!("DI{i}")));
+                v.extend((0..RAM_ADDR_BITS).map(|i| format!("WADDR{i}")));
+                v.extend((0..RAM_ADDR_BITS).map(|i| format!("RADDR{i}")));
+                v.push("WE".into());
+                v.push("RE".into());
+            }
+            Kind::Mac => {
+                v.extend((0..MAC_IN_BITS).map(|i| format!("A{i}")));
+                v.extend((0..MAC_IN_BITS).map(|i| format!("B{i}")));
+                v.push("CE".into());
+                v.push("RST".into());
+                v.extend((0..MAC_C_BITS).map(|i| format!("C{i}")));
+            }
+        }
+        v.into_iter()
+            .map(|p| {
+                let (dy, m) = input(kind, &p).expect("pin table");
+                (p, dy, m)
+            })
+            .collect()
+    }
+
+    /// Number of output bits (`DO*` / `P*`).
+    pub const fn n_outputs(kind: Kind) -> u32 {
+        match kind {
+            Kind::Bram => RAM_WIDTH,
+            Kind::Mac => MAC_P_BITS,
+        }
+    }
+
+    /// Output bit `bit` of a block (`DO{bit}` / `P{bit}`): its tile (rows
+    /// above the base) and the switch-box select that puts it on a wire.
+    /// Selects 1..8 are the tile's flop outputs, 9..16 its LUT outputs, so
+    /// the fabric model keeps bit `k` of a tile in `q[k]` / `lut_o[k - 8]`.
+    pub const fn output(kind: Kind, bit: u32) -> Option<(u32, u32)> {
+        if bit >= n_outputs(kind) {
+            return None;
+        }
+        Some((bit / 16, 1 + bit % 16))
+    }
+
+    /// Output bit of a pin name (`DO3` -> 3, `P17` -> 17).
+    pub fn output_bit(kind: Kind, pin: &str) -> Option<u32> {
+        let rest = match kind {
+            Kind::Bram => pin.strip_prefix("DO")?,
+            Kind::Mac => pin.strip_prefix('P')?,
+        };
+        let i: u32 = rest.parse().ok()?;
+        (i < n_outputs(kind) && (i == 0 || !rest.starts_with('0'))).then_some(i)
+    }
+
+    /// The input of a block that reads 1 when its `PIN_EN` bit is clear.
+    pub const fn enable_m(kind: Kind) -> u32 {
+        match kind {
+            Kind::Bram => 43,
+            Kind::Mac => 32,
+        }
+    }
+
+    /// Minor and bit of the 16-bit RAM word at `addr` (its bit 0).
+    pub const fn init_loc(addr: u32) -> (u8, u32) {
+        ((1 + addr / 8) as u8, (addr % 8) * 16)
+    }
+
+    /// Minor and bit of `PIN_EN[m]` of tile `dy` of a block.
+    pub const fn pin_en_loc(kind: Kind, dy: u32, m: u32) -> (u8, u32) {
+        match (kind, dy) {
+            (Kind::Bram, _) => (0, PIN_EN_RAM + m),
+            (Kind::Mac, 0) => (0, PIN_EN_MAC + m),
+            (Kind::Mac, _) => (1, m),
+        }
+    }
+}
+
+#[cfg(test)]
+mod hard_tests {
+    use super::*;
+    use hard::Kind;
+
+    #[test]
+    fn pin_tables_fit_the_tiles() {
+        for kind in [Kind::Bram, Kind::Mac] {
+            let pins = hard::inputs(kind);
+            let mut seen = std::collections::HashSet::new();
+            for (name, dy, m) in &pins {
+                assert!(*dy < kind.tiles() && *m < 64, "{name}");
+                assert!(seen.insert((*dy, *m)), "{name} shares an IMUX");
+                assert_eq!(hard::input(kind, name), Some((*dy, *m)));
+            }
+            let mut outs = std::collections::HashSet::new();
+            for b in 0..hard::n_outputs(kind) {
+                let (dy, sel) = hard::output(kind, b).unwrap();
+                assert!(dy < kind.tiles() && (1..=16).contains(&sel));
+                assert!(outs.insert((dy, sel)));
+            }
+            assert_eq!(hard::output(kind, hard::n_outputs(kind)), None);
+        }
+        assert_eq!(hard::inputs(Kind::Bram).len(), 38);
+        assert_eq!(hard::inputs(Kind::Mac).len(), 66);
+        assert_eq!(hard::input(Kind::Bram, "DI01"), None);
+        assert_eq!(hard::input(Kind::Bram, "RADDR10"), None);
+        assert_eq!(hard::output_bit(Kind::Mac, "P31"), Some(31));
+        assert_eq!(hard::output_bit(Kind::Bram, "DO16"), None);
+    }
+
+    #[test]
+    fn hard_sites_majors_and_tiles() {
+        let s = Device::load_part("HL10S-C64-1").unwrap();
+        assert_eq!(s.bram_major(10, 1), Some(0));
+        assert_eq!(s.bram_major(10, 31), Some(15));
+        assert_eq!(s.bram_major(10, 33), None);
+        assert_eq!(s.bram_major(10, 2), None);
+        assert_eq!(s.dsp_major(8, 7), Some(3));
+        assert_eq!(s.hard_tile(8, 8), Some((Kind::Mac, 3, 1)));
+        assert_eq!(s.hard_tile(8, 9), None);
+        let site = s.dsp_sites().nth(1).unwrap();
+        assert_eq!(s.hard_tiles(site), vec![(8, 3), (8, 4)]);
+        let t = Device::load_part("HL10T-C32-1").unwrap();
+        assert_eq!(t.bram_sites().count(), 8);
+        assert!(t.bram_sites().all(|b| t.clb_major(b.x, b.y).is_some()));
+        let loc = s.locate("BRAM_X10Y3.INIT[9][2]").unwrap();
+        assert_eq!((loc.far.block_type, loc.far.major, loc.far.minor, loc.bit), (Far::BRAM, 1, 2, 18));
+        let loc = s.locate("DSP_X8Y1.PIN_EN[1][5]").unwrap();
+        assert_eq!((loc.far.block_type, loc.far.minor, loc.bit), (Far::DSP, 1, 5));
+        assert_eq!(s.locate("DSP_X8Y1.PREG").unwrap().bit as u32, hard::PREG);
+        assert!(s.locate("BRAM_X10Y1.INIT[1024][0]").is_err());
+        assert!(s.locate("BRAM_X10Y2.USED").is_err());
+    }
 }
