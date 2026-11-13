@@ -906,11 +906,13 @@ fn mul_design(signed: bool, preg: bool, with_c: bool) -> Design {
         }
     }
     if preg {
-        let ctl = n.inputs("ctl", 2);
+        let ctl = n.inputs("ctl", 3);
         n.d.connect("clk", "mul", "CLK");
-        // Enabled most of the time, reset now and then.
+        // Enabled most of the time, reset now and then. The two are
+        // independent, so RST also comes with CE high (RST wins) and
+        // with CE low (still a reset, not a hold).
         let ce = n.lut(&[&ctl[0], &ctl[1]], |x| x != 0);
-        let rst = n.lut(&[&ctl[0], &ctl[1], &a[0]], |x| x == 0b100);
+        let rst = n.lut(&[&ctl[2], &a[0]], |x| x == 0b11);
         n.d.connect(&ce, "mul", "CE");
         n.d.connect(&rst, "mul", "RST");
     }
@@ -927,8 +929,31 @@ fn mul_design(signed: bool, preg: bool, with_c: bool) -> Design {
     n.d
 }
 
+/// A registered multiplier with CE and RST left unconnected: the
+/// register loads on every rising edge (an unconnected CE reads 1, an
+/// unconnected RST 0).
+fn mul_free_running_design() -> Design {
+    let mut n = Nl::new();
+    let a = n.inputs("a", 16);
+    n.d.add_cell("mul", CellKind::Mac27);
+    n.d.set_cell_attr("mul", "PREG", "1").unwrap();
+    n.d.connect("clk", "mul", "CLK");
+    for i in 0..16 {
+        n.d.connect(&a[i], "mul", &format!("A{i}"));
+        n.d.connect(&a[15 - i], "mul", &format!("B{i}"));
+    }
+    for i in 0..32 {
+        n.d.connect(&format!("p{i}"), "mul", &format!("P{i}"));
+        n.output(&format!("o{i}"), &format!("p{i}"));
+    }
+    n.d
+}
+
 #[test]
 fn multiplier_equals_its_netlist() {
+    for part in ["HL10S-C64-1", "HL10T-DSP1"] {
+        check_design(&mul_free_running_design(), part, 250, |_| {}).unwrap_or_else(|e| panic!("{part} free-running: {e}"));
+    }
     for part in ["HL10S-C64-1", "HL10T-DSP1"] {
         for signed in [false, true] {
             for preg in [false, true] {
@@ -997,4 +1022,109 @@ fn inferred_ram_and_multipliers_on_the_fabric() {
         helion_sv::synth_sv_v2(&src, "ram_small.sv", None).unwrap().design
     };
     assert_eq!(count(&plain, |k| matches!(k, CellKind::Bram18 | CellKind::Mac27)), 0);
+}
+
+/// A RAM clocked by a second clock pad (line 1) or by `clk` (line 0),
+/// with a flop on `clk2` so that it is a clock of the design either way.
+fn ram_two_clocks_design(ram_on_second: bool) -> Design {
+    let mut n = Nl::new();
+    n.d.add_port("clk2", helion_ir::PortDir::In);
+    let d = n.inputs("d", 16);
+    let ctl = n.inputs("ctl", 2);
+    let cnt = n.counter(5);
+    n.d.add_cell("ram", CellKind::Bram18);
+    n.d.set_cell_attr("ram", "INIT", ram_init(0x5151)).unwrap();
+    n.d.connect(if ram_on_second { "clk2" } else { "clk" }, "ram", "CLK");
+    for i in 0..16 {
+        n.d.connect(&d[i], "ram", &format!("DI{i}"));
+    }
+    for i in 0..5 {
+        n.d.connect(&cnt[i], "ram", &format!("WADDR{i}"));
+        n.d.connect(&cnt[i], "ram", &format!("RADDR{i}"));
+    }
+    n.d.connect(&ctl[0], "ram", "WE");
+    n.d.connect(&ctl[1], "ram", "RADDR5");
+    for i in 0..16 {
+        n.d.connect(&format!("do{i}"), "ram", &format!("DO{i}"));
+        n.output(&format!("o{i}"), &format!("do{i}"));
+    }
+    n.d.add_cell("ff_c2", CellKind::Hff);
+    n.d.connect("clk2", "ff_c2", "CLK");
+    n.d.connect(&d[0], "ff_c2", "D");
+    n.d.connect("q_c2", "ff_c2", "Q");
+    n.output("oc2", "q_c2");
+    n.d
+}
+
+/// Hard blocks on a second clock: each clock pad toggles on its own, so a
+/// block on the wrong line, or one that also captured on falling edges,
+/// would read or load at the wrong time.
+#[test]
+fn hard_blocks_on_a_second_clock() {
+    for part in ["HL10S-C64-1", "HL10T-C32-1"] {
+        check_design(&ram_two_clocks_design(true), part, 600, |_| {}).unwrap_or_else(|e| panic!("{part} ram on clk2: {e}"));
+        check_design(&ram_two_clocks_design(false), part, 600, |_| {}).unwrap_or_else(|e| panic!("{part} ram on clk: {e}"));
+    }
+    let mut n = Nl::new();
+    n.d.add_port("clk2", helion_ir::PortDir::In);
+    let a = n.inputs("a", 16);
+    let b = n.inputs("b", 16);
+    n.d.add_cell("mul", CellKind::Mac27);
+    n.d.set_cell_attr("mul", "SIGNED", "1").unwrap();
+    n.d.set_cell_attr("mul", "PREG", "1").unwrap();
+    n.d.connect("clk2", "mul", "CLK");
+    for i in 0..16 {
+        n.d.connect(&a[i], "mul", &format!("A{i}"));
+        n.d.connect(&b[i], "mul", &format!("B{i}"));
+    }
+    for i in 0..32 {
+        n.d.connect(&format!("p{i}"), "mul", &format!("P{i}"));
+        let q = n.ff(&format!("p{i}"));
+        n.output(&format!("o{i}"), &q);
+    }
+    for part in ["HL10S-C64-1", "HL10T-DSP1"] {
+        check_design(&n.d, part, 400, |_| {}).unwrap_or_else(|e| panic!("{part} mac on clk2: {e}"));
+    }
+}
+
+/// A RAM clocked by a divided clock that a flop makes.
+#[test]
+fn block_ram_on_a_divided_clock() {
+    let mut n = Nl::new();
+    let d = n.inputs("d", 4);
+    let t = n.fresh("tog");
+    let nt = n.lut(&[&t], |x| x & 1 == 0);
+    n.ff_to(&nt, &t);
+    n.d.add_cell("ram", CellKind::Bram18);
+    n.d.connect(&t, "ram", "CLK");
+    for i in 0..4 {
+        n.d.connect(&d[i], "ram", &format!("DI{i}"));
+        n.d.connect(&d[i], "ram", &format!("RADDR{i}"));
+        n.d.connect(&d[(i + 1) % 4], "ram", &format!("WADDR{i}"));
+    }
+    n.d.connect(&d[0], "ram", "WE");
+    for i in 0..4 {
+        n.d.connect(&format!("do{i}"), "ram", &format!("DO{i}"));
+        n.output(&format!("o{i}"), &format!("do{i}"));
+    }
+    for part in ["HL10S-C64-1", "HL10T-C32-1"] {
+        check_design(&n.d, part, 400, |_| {}).unwrap_or_else(|e| panic!("{part}: {e}"));
+    }
+}
+
+/// The base tile's clock select is what the fabric reads: a RAM on
+/// `clk2` with its block clock moved to the other line no longer matches.
+#[test]
+fn hard_block_on_the_wrong_clock_line_is_detected() {
+    let part = "HL10S-C64-1";
+    let d = ram_two_clocks_design(true);
+    let dev = Device::load_part(part).unwrap();
+    let p = pack(&d, &dev).unwrap();
+    assert_eq!(p.conn.hard_clock.iter().flatten().count(), 1, "{:?}", p.conn.hard_clock);
+    let wrong = |r: &mut helion_route::Routed| {
+        for c in r.placed.packed.conn.hard_clock.iter_mut().flatten() {
+            *c ^= 1;
+        }
+    };
+    assert!(check_design(&d, part, 600, wrong).is_err(), "a hard block on the wrong clock line went unnoticed");
 }
