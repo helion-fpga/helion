@@ -1,0 +1,348 @@
+{
+ "zedboard": {
+  "part": "xc7z020clg484-1",
+  "title": "Avnet/Digilent ZedBoard",
+  "source": "Digilent ZedBoard master XDC (digilent-xdc, Zedboard-Master.xdc)",
+  "clock": "Y9",
+  "clock_period_ns": 10.0,
+  "switches": [
+   "F22",
+   "G22",
+   "H22",
+   "F21",
+   "H19",
+   "H18",
+   "H17",
+   "M15"
+  ],
+  "buttons": [
+   "P16",
+   "R16",
+   "N15",
+   "R18",
+   "T18"
+  ],
+  "button_names": [
+   "btnc",
+   "btnd",
+   "btnl",
+   "btnr",
+   "btnu"
+  ],
+  "leds": [
+   "T22",
+   "T21",
+   "U22",
+   "U21",
+   "V22",
+   "W22",
+   "U19",
+   "U14"
+  ],
+  "in_pmods": {
+   "ja": [
+    "Y11",
+    "AA11",
+    "Y10",
+    "AA9",
+    "AB11",
+    "AB10",
+    "AB9",
+    "AA8"
+   ],
+   "jb": [
+    "W12",
+    "W11",
+    "V10",
+    "W8",
+    "V12",
+    "W10",
+    "V9",
+    "V8"
+   ]
+  },
+  "out_pmods": {
+   "jc": [
+    "AB7",
+    "AB6",
+    "Y4",
+    "AA4",
+    "R6",
+    "T6",
+    "T4",
+    "U4"
+   ],
+   "jd": [
+    "V7",
+    "W7",
+    "V5",
+    "V4",
+    "W6",
+    "W5",
+    "U6",
+    "U5"
+   ]
+  },
+  "iostandard": {
+   "default": "LVCMOS33",
+   "switches": "LVCMOS18",
+   "buttons": "LVCMOS18"
+  },
+  "spare_banks": [
+   "13",
+   "33",
+   "34",
+   "35"
+  ],
+  "note": "Switches and buttons are on the Vadj banks (34, 35): LVCMOS18 matches the factory J18 setting (1.8 V)."
+ },
+ "arty-a7-35": {
+  "part": "xc7a35tcsg324-1",
+  "title": "Digilent Arty A7-35T",
+  "source": "Digilent Arty-A7-35-Master.xdc",
+  "clock": "E3",
+  "clock_period_ns": 10.0,
+  "switches": [
+   "A8",
+   "C11",
+   "C10",
+   "A10"
+  ],
+  "buttons": [
+   "D9",
+   "C9",
+   "B9",
+   "B8"
+  ],
+  "button_names": [
+   "btn0",
+   "btn1",
+   "btn2",
+   "btn3"
+  ],
+  "leds": [
+   "H5",
+   "J5",
+   "T9",
+   "T10"
+  ],
+  "rgb_leds": [
+   "G6",
+   "F6",
+   "E1",
+   "G3",
+   "J4",
+   "G4",
+   "J3",
+   "J2",
+   "H4",
+   "K1",
+   "H6",
+   "K2"
+  ],
+  "in_pmods": {
+   "ja": [
+    "G13",
+    "B11",
+    "A11",
+    "D12",
+    "D13",
+    "B18",
+    "A18",
+    "K16"
+   ],
+   "jb": [
+    "E15",
+    "E16",
+    "D15",
+    "C15",
+    "J17",
+    "J18",
+    "K15",
+    "J15"
+   ]
+  },
+  "out_pmods": {},
+  "iostandard": {
+   "default": "LVCMOS33"
+  },
+  "spare_banks": [
+   "14",
+   "15",
+   "16",
+   "35"
+  ],
+  "note": "Bank 34 is the DDR3 bank (1.35 V) and is not used. RGB LED order: led0_r, led0_g, led0_b, led1_r, ..."
+ },
+ "basys3": {
+  "part": "xc7a35tcpg236-1",
+  "title": "Digilent Basys 3",
+  "source": "Digilent Basys-3-Master.xdc",
+  "clock": "W5",
+  "clock_period_ns": 10.0,
+  "switches": [
+   "V17",
+   "V16",
+   "W16",
+   "W17",
+   "W15",
+   "V15",
+   "W14",
+   "W13",
+   "V2",
+   "T3",
+   "T2",
+   "R3",
+   "W2",
+   "U1",
+   "T1",
+   "R2"
+  ],
+  "buttons": [
+   "U18",
+   "T18",
+   "W19",
+   "T17",
+   "U17"
+  ],
+  "button_names": [
+   "btnc",
+   "btnu",
+   "btnl",
+   "btnr",
+   "btnd"
+  ],
+  "leds": [
+   "U16",
+   "E19",
+   "U19",
+   "V19",
+   "W18",
+   "U15",
+   "U14",
+   "V14",
+   "V13",
+   "V3",
+   "W3",
+   "U3",
+   "P3",
+   "N3",
+   "P1",
+   "L1"
+  ],
+  "in_pmods": {
+   "ja": [
+    "J1",
+    "L2",
+    "J2",
+    "G2",
+    "H1",
+    "K2",
+    "H2",
+    "G3"
+   ],
+   "jb": [
+    "A14",
+    "A16",
+    "B15",
+    "B16",
+    "A15",
+    "A17",
+    "C15",
+    "C16"
+   ]
+  },
+  "out_pmods": {},
+  "iostandard": {
+   "default": "LVCMOS33"
+  },
+  "spare_banks": [
+   "14",
+   "16",
+   "34",
+   "35"
+  ],
+  "note": "All banks are 3.3 V."
+ },
+ "nexys-a7-100t": {
+  "part": "xc7a100tcsg324-1",
+  "title": "Digilent Nexys A7-100T",
+  "source": "Digilent Nexys-A7-100T-Master.xdc",
+  "clock": "E3",
+  "clock_period_ns": 10.0,
+  "switches": [
+   "J15",
+   "L16",
+   "M13",
+   "R15",
+   "R17",
+   "T18",
+   "U18",
+   "R13"
+  ],
+  "buttons": [
+   "N17",
+   "M18",
+   "P17",
+   "M17",
+   "P18"
+  ],
+  "button_names": [
+   "btnc",
+   "btnu",
+   "btnl",
+   "btnr",
+   "btnd"
+  ],
+  "leds": [
+   "H17",
+   "K15",
+   "J13",
+   "N14",
+   "R18",
+   "V17",
+   "U17",
+   "U16",
+   "V16",
+   "T15",
+   "U14",
+   "T16",
+   "V15",
+   "V14",
+   "V12",
+   "V11"
+  ],
+  "in_pmods": {
+   "ja": [
+    "C17",
+    "D18",
+    "E18",
+    "G17",
+    "D17",
+    "E17",
+    "F18",
+    "G18"
+   ],
+   "jb": [
+    "D14",
+    "F16",
+    "G16",
+    "H14",
+    "E16",
+    "F13",
+    "G13",
+    "H16"
+   ]
+  },
+  "out_pmods": {},
+  "iostandard": {
+   "default": "LVCMOS33"
+  },
+  "spare_banks": [
+   "14",
+   "15",
+   "35"
+  ],
+  "note": "SW8 and SW9 are on bank 34 (1.8 V, shared with the DDR2) and are left out; bank 34 is not used."
+ }
+}

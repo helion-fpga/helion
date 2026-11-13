@@ -789,6 +789,27 @@ pub fn build_node_map(device: &mut Device) -> NodeMaps {
 }
 
 impl<'a> DeviceQuery for XDevice<'a> {
+    /// CMT sites of the loaded part, from the database (the trait's default
+    /// table names tiles no supported part has).
+    fn cmt_sites(&self, kind: crate::pack::CmtKind) -> Vec<(String, String)> {
+        let want = match kind {
+            crate::pack::CmtKind::MmcmE2Adv => "MMCME2_ADV",
+            crate::pack::CmtKind::PllE2Adv => "PLLE2_ADV",
+        };
+        let mut out = Vec::new();
+        for ti in 0..self.device.tile_count() {
+            if let Some(t) = self.device.tile(ti) {
+                for s in &t.sites {
+                    if s.site_type == want {
+                        out.push((t.name.clone(), s.name.clone()));
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| a.1.cmp(&b.1));
+        out
+    }
+
     fn iob_site_for_pin(&self, pin: &str) -> Option<(String, String)> {
         self.device
             .package_pin(pin)

@@ -24,6 +24,7 @@ pub mod fasm;
 pub mod flow;
 pub mod frames;
 pub mod pack;
+pub mod parts;
 pub mod place;
 pub mod place_sa;
 pub mod route;

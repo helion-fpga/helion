@@ -1,11 +1,16 @@
-//! Build a Zedboard (xc7z020clg484-1) bitstream from HDL with Helion's own
-//! flow: synthesis (SystemVerilog or VHDL) -> pack -> place -> route ->
-//! FASM -> `.bit`.
+//! Build a 7-series bitstream from HDL with Helion's own flow: synthesis
+//! (SystemVerilog or VHDL) -> pack -> place -> route -> FASM -> `.bit`.
 //!
 //! ```text
 //! cargo run --release -p helion-xilinx7 --example zedbit -- \
-//!     design.sv[,more.sv...] board.xdc out.bit [top] [--front=auto|v2|zb] [--ignore-timing]
+//!     design.sv[,more.sv...] pins.xdc out.bit [top] [--board=NAME | --part=PART]
+//!     [--front=auto|v2|zb] [--ignore-timing]
 //! ```
+//!
+//! The part is the ZedBoard's (`xc7z020clg484-1`) unless `--board` names a
+//! board (`zedboard`, `arty-a7-35`, `basys3`, `nexys-a7-100t`; its pins are in
+//! `boards/<name>.xdc`) or `--part` names any part the Project X-Ray database
+//! describes (see `helion_xilinx7::parts`).
 //!
 //! Front ends (`--front`, or `HELION_ZED_FRONT`):
 //!
@@ -180,12 +185,28 @@ fn main() {
         .find_map(|a| a.strip_prefix("--front=").map(str::to_string))
         .or_else(|| std::env::var("HELION_ZED_FRONT").ok())
         .unwrap_or_else(|| "auto".to_string());
+    let opt = |k: &str| all.iter().find_map(|a| a.strip_prefix(k).map(str::to_string));
+    let part = match (opt("--board="), opt("--part=")) {
+        (Some(_), Some(_)) => {
+            eprintln!("zedbit: give --board or --part, not both");
+            std::process::exit(2);
+        }
+        (Some(b), None) => match helion_xilinx7::parts::board(&b) {
+            Ok(b) => b.part.to_string(),
+            Err(e) => {
+                eprintln!("zedbit: {e}");
+                std::process::exit(2);
+            }
+        },
+        (None, Some(p)) => p,
+        (None, None) => "xc7z020clg484-1".to_string(),
+    };
     let args: Vec<String> = all.into_iter().filter(|a| !a.starts_with("--")).collect();
     if args.len() < 4 {
-        eprintln!("usage: zedbit <design.vhd|.sv[,more...]> <board.xdc> <out.bit> [top] [--front=auto|v2|zb] [--ignore-timing]");
+        eprintln!("usage: zedbit <design.vhd|.sv[,more...]> <pins.xdc> <out.bit> [top] [--board=NAME | --part=PART] [--front=auto|v2|zb] [--ignore-timing]");
         std::process::exit(2);
     }
-    if let Err(e) = run(&args[1], &args[2], &args[3], args.get(4).map(|s| s.as_str()), ignore_timing, &front) {
+    if let Err(e) = run(&args[1], &args[2], &args[3], args.get(4).map(|s| s.as_str()), ignore_timing, &front, &part) {
         eprintln!("zedbit: {e}");
         std::process::exit(1);
     }
@@ -261,7 +282,7 @@ fn xdc_period_ps(text: &str) -> u32 {
     10_000
 }
 
-fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_timing: bool, front: &str) -> Result<(), String> {
+fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_timing: bool, front: &str, part: &str) -> Result<(), String> {
     let t0 = std::time::Instant::now();
     let mut design = synth(design_path, top, front)?;
     let t_synth = t0.elapsed();
@@ -293,7 +314,8 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
         .collect();
 
     eprintln!("zedbit: synthesized in {:.1}s; loading the device", t_synth.as_secs_f64());
-    let be = Xilinx7Backend::open("xc7z020")?;
+    let be = Xilinx7Backend::open(part)?;
+    eprintln!("zedbit: part {part}");
     let t_dev = t0.elapsed();
     let mut packed = be.pack(&design)?;
     eprintln!(
@@ -381,7 +403,7 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
     let fasm_path = std::path::Path::new(out).with_extension("fasm");
     std::fs::write(&fasm_path, &fasm_text).map_err(|e| e.to_string())?;
     let name = std::path::Path::new(design_path).file_stem().and_then(|s| s.to_str()).unwrap_or("design");
-    let r = helion_xilinx7::bitgen::fasm_to_bit(&fasm_text, "xc7z020clg484-1", name)?;
+    let r = helion_xilinx7::bitgen::fasm_to_bit(&fasm_text, part, name)?;
     if !r.rejected.is_empty() {
         for e in r.rejected.iter().take(20) {
             eprintln!("REJECT {e}");

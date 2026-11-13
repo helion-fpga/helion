@@ -78,11 +78,14 @@ pub struct BitgenReport {
     pub rejected_by_tile_type: BTreeMap<String, usize>,
 }
 
-/// Assemble FASM text into a `.bit` for `part` (e.g. `xc7z020clg484-1`).
+/// Assemble FASM text into a `.bit` for `part` (a full part name such as
+/// `xc7z020clg484-1` or `xc7a35tcsg324-1`; see [`crate::parts`]). The
+/// family database, fabric, frame layout and IDCODE all come from the part.
 pub fn fasm_to_bit(text: &str, part: &str, design: &str) -> Result<BitgenReport, String> {
-    let fabric = part.split("clg").next().unwrap_or(part);
-    let root = default_db_root().join("zynq7");
-    let layout = TilegridLayout::load(&root.join(format!("{fabric}/tilegrid.json")));
+    let p = crate::parts::resolve(&default_db_root(), part)?;
+    let part = p.name.as_str();
+    let root = p.family_dir.clone();
+    let layout = TilegridLayout::load(&p.fabric_dir().join("tilegrid.json"));
     let lines = parse_fasm(text).map_err(|e| format!("{e:?}"))?;
     let types: BTreeSet<String> = lines
         .iter()
@@ -139,7 +142,7 @@ pub fn fasm_to_bit(text: &str, part: &str, design: &str) -> Result<BitgenReport,
     }
     let payload = store.fdri_payload();
     let opts = BitstreamOptions {
-        idcode: 0x0372_7093,
+        idcode: p.idcode,
         part_name: part.to_string(),
         design_source: format!("{design};Generator=helion-xilinx7"),
         write_crc: true,
