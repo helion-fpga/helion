@@ -357,8 +357,8 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
     }
     let ta = helion_xilinx7::timing::analyze_clocks(&routed, &|c| periods.get(c).copied())?;
     eprintln!(
-        "zedbit timing: period {:.3} ns, worst slack {:.3} ns ({} of {} endpoints failing), est. fmax {:.0} MHz",
-        period as f64 / 1000.0,
+        "zedbit timing: worst clock period {:.3} ns, worst slack {:.3} ns ({} of {} endpoints failing), est. fmax {:.0} MHz on that clock",
+        ta.period_ps as f64 / 1000.0,
         ta.wns_ps as f64 / 1000.0,
         ta.failing_endpoints,
         ta.endpoints,
@@ -372,7 +372,7 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
             return Err(format!(
                 "timing not met: worst path {:.3} ns exceeds the {:.3} ns clock period (with setup and margin); no bitstream written (pass --ignore-timing to override)",
                 ta.worst_path.last().map(|p| p.arrival_ps).unwrap_or(0) as f64 / 1000.0,
-                period as f64 / 1000.0
+                ta.period_ps as f64 / 1000.0
             ));
         }
     }
