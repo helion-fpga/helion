@@ -129,9 +129,12 @@ pub struct Reg {
     pub negedge: bool,
     pub mask: Vec<bool>,
     /// Asynchronous control: (one-bit node, active level). While it is at
-    /// that level every flop with `arst_mask` holds its power-up value.
+    /// that level every flop with `arst_mask` holds its reset value
+    /// `arst_val`. That is also its power-up value unless an `initial`
+    /// block gives it another.
     pub arst: Option<(N, bool)>,
     pub arst_mask: Vec<bool>,
+    pub arst_val: Vec<bool>,
 }
 
 pub struct Port {
@@ -1317,7 +1320,8 @@ fn lower_with(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Result<
         d: Lit,
         clk: Lit,
         negedge: bool,
-        arst: Option<(Lit, bool)>,
+        /// (control, active level, stored value while reset).
+        arst: Option<(Lit, bool, bool)>,
     }
     let mut reg_bits: Vec<RegBit> = Vec::new();
     let mut done = 0usize;
@@ -1358,7 +1362,9 @@ fn lower_with(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Result<
             Some((n, level)) if r.arst_mask[bit as usize] => {
                 let l = bl.bit(n, 0)?;
                 // An inverted literal is the same signal with the other level.
-                Some((l & !1, level ^ (l & 1 == 1)))
+                // The flop stores the register XOR its power-up value.
+                let val = r.arst_val[bit as usize] ^ flat.sigs[sig as usize].init[bit as usize];
+                Some((l & !1, level ^ (l & 1 == 1), val))
             }
             _ => None,
         };
@@ -1615,14 +1621,15 @@ fn lower_with(flat: &Flat, excluded: &std::collections::HashSet<u32>) -> Result<
         d.connect(&dnet, &cell, "D");
         d.connect(&q, &cell, "Q");
         d.connect(&cnet, &cell, "CLK");
-        if let Some((l, level)) = rb.arst {
-            // The stored bit is the register XOR its power-up value, and
-            // the reset value is that power-up value: the flop resets to 0.
+        if let Some((l, level, val)) = rb.arst {
+            // The stored bit is the register XOR its power-up value, so the
+            // flop resets to 0 unless an `initial` block gave the register a
+            // power-up value other than its reset value.
             let rnet = emit(l, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut);
             d.connect(&rnet, &cell, "ARST");
             if let Some(c) = d.cells.iter_mut().rev().find(|c| helion_ir::resolve(c.name) == cell) {
                 c.attrs.set("ARST_LEVEL", if level { "1" } else { "0" });
-                c.attrs.set("ARST_VAL", "0");
+                c.attrs.set("ARST_VAL", if val { "1" } else { "0" });
             }
         }
     }

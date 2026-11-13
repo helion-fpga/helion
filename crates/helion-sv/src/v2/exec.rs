@@ -1967,6 +1967,7 @@ impl Elab {
             // block (the control at its inactive level).
             let mut arst = None;
             let mut arst_mask = vec![false; mask.len()];
+            let mut arst_val = vec![false; mask.len()];
             let mut d = d;
             if active.len() == 1 && edges.len() == 2 {
                 let (sig, level) = active[0];
@@ -1980,8 +1981,9 @@ impl Elab {
                 for (b, m) in mask.iter().enumerate() {
                     if *m {
                         let bit = self.dag.slice(at_reset, b as u32, 1);
-                        if self.dag.as_const(bit).is_some() {
+                        if let Some(k) = self.dag.as_const(bit) {
                             arst_mask[b] = true;
+                            arst_val[b] = k[0];
                         } else {
                             all = false;
                         }
@@ -2003,7 +2005,7 @@ impl Elab {
             } else if !active.is_empty() || edges.len() > 1 {
                 any_sync_reset = true;
             }
-            self.regs.push(Reg { sig: id, d, clk, negedge: !*pos, mask, arst, arst_mask });
+            self.regs.push(Reg { sig: id, d, clk, negedge: !*pos, mask, arst, arst_mask, arst_val });
         }
         if any_sync_reset {
             let note = "an asynchronous control here is built as synchronous (it is not one plain signal with constant reset values); it takes effect at the next clock edge";

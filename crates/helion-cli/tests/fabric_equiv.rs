@@ -17,8 +17,9 @@ use std::collections::HashMap;
 /// clock nets and edges, block RAMs and multipliers, output pads.
 struct NetSim {
     luts: Vec<(u64, [Option<Spur>; 6], Spur)>,
-    /// (D, Q, clock net, falling edge, asynchronous reset: net and level)
-    ffs: Vec<(Spur, Spur, Option<Spur>, bool, Option<(Spur, bool)>)>,
+    /// (D, Q, clock net, falling edge, asynchronous reset: net, level and
+    /// the value held while reset)
+    ffs: Vec<(Spur, Spur, Option<Spur>, bool, Option<(Spur, bool, bool)>)>,
     rams: Vec<Ram>,
     muls: Vec<Mul>,
     val: HashMap<Spur, bool>,
@@ -75,7 +76,7 @@ impl NetSim {
                 }
                 CellKind::Hff => {
                     if let (Some(dn), Some(q)) = (pins.net_on(name, "D"), pins.net_on(name, "Q")) {
-                        let arst = pins.net_on(name, "ARST").map(|n| (n, c.attrs.get("ARST_LEVEL") != Some("0")));
+                        let arst = pins.net_on(name, "ARST").map(|n| (n, c.attrs.get("ARST_LEVEL") != Some("0"), c.attrs.get("ARST_VAL") == Some("1")));
                         ffs.push((dn, q, pins.net_on(name, "CLK"), c.attrs.get("CLK_INV") == Some("1"), arst));
                     }
                 }
@@ -178,20 +179,19 @@ impl NetSim {
     fn advance(&mut self) {
         for _ in 0..1024 {
             self.settle();
-            // Asynchronous resets act first: a flop held in reset is 0
-            // (the netlist stores every register relative to its reset
-            // value) and ignores its clock.
-            let held: Vec<bool> = self.ffs.iter().map(|f| f.4.map(|(n, level)| self.get(n) == level).unwrap_or(false)).collect();
+            // Asynchronous resets act first: a flop held in reset holds
+            // ARST_VAL and ignores its clock.
+            let held: Vec<bool> = self.ffs.iter().map(|f| f.4.map(|(n, level, _)| self.get(n) == level).unwrap_or(false)).collect();
             let mut reset_changed = false;
             for (f, h) in self.ffs.iter().zip(&held) {
-                if *h && self.val.get(&f.1).copied().unwrap_or(false) {
+                if *h && self.get(f.1) != f.4.is_some_and(|r| r.2) {
                     reset_changed = true;
                 }
             }
             if reset_changed {
-                let qs: Vec<Spur> = self.ffs.iter().zip(&held).filter(|(_, h)| **h).map(|(f, _)| f.1).collect();
-                for q in qs {
-                    self.val.insert(q, false);
+                let qs: Vec<(Spur, bool)> = self.ffs.iter().zip(&held).filter(|(_, h)| **h).map(|(f, _)| (f.1, f.4.is_some_and(|r| r.2))).collect();
+                for (q, v) in qs {
+                    self.val.insert(q, v);
                 }
                 continue;
             }
@@ -1584,4 +1584,27 @@ fn signed_wide_and_constant_products_on_the_fabric() {
     // Not vacuous: the signed blocks made unsigned are caught.
     let unsigned = |r: &mut helion_route::Routed| r.placed.packed.macs.iter_mut().for_each(|m| m.signed = false);
     assert!(check_design(&s20, part, 300, unsigned).is_err(), "SIGNED off went unnoticed");
+}
+
+/// Registers with an asynchronous reset that an initial block gives a
+/// power-up value other than the reset value: their flops store the
+/// register XOR that power-up value, so they reset to ARST_VAL 1 where the
+/// two differ. `tools/svcheck` (tests/init_async_reset.sv) shows the
+/// netlist equals its RTL; here the bitstream equals the netlist.
+#[test]
+fn reset_values_apart_from_initial_values_on_the_fabric() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/svcheck/tests/init_async_reset.sv");
+    let src = std::fs::read_to_string(path).expect("source");
+    let design = helion_sv::synth_sv_v2(&src, path, None).expect("synth").design;
+    let ones = design.cells.iter().filter(|c| c.attrs.get("ARST_VAL") == Some("1")).count();
+    // c3 ^ 02 and f0 ^ 0f differ in 3 and 8 bits.
+    assert_eq!(ones, 11, "the flops that reset to 1");
+    check_design(&design, PART, 600, |_| {}).expect("init_async_reset");
+    // Not vacuous: flops that reset to 0 regardless are caught.
+    let zero = |r: &mut helion_route::Routed| {
+        for f in r.placed.packed.conn.ff_reset.iter_mut().flatten() {
+            f.2 = false;
+        }
+    };
+    assert!(check_design(&design, PART, 600, zero).is_err(), "a wrong reset value went unnoticed");
 }

@@ -24,7 +24,7 @@ All of these equal their RTL on every output and every compared flop:
 
 | design | size | cycles |
 |---|---|---|
-| `tools/svcheck/tests` (43 small designs) | up to a few hundred LUTs | 400 each |
+| `tools/svcheck/tests` (44 small designs) | up to a few hundred LUTs | 400 each |
 | `ip/` library (70 blocks) | | 400 each |
 | `examples/serv` (SERV, bit-serial RISC-V) | | 3,000 |
 | `corpus-pass/sha256` | | 2,000 |
@@ -52,6 +52,9 @@ resolves there as it does for Helion (next to the source file).
 `init_readmem_param.sv` in `tests/`, and `ram_readmem.sv`,
 `ram_init_deep.sv` and `rom_readmem.sv` (block RAM `INIT`, ROMs on block
 RAM) in `hard/` check them; their files are in each `data/` directory.
+A register with an asynchronous reset keeps its RTL reset value when an
+initial block gives it a different power-up value (`init_async_reset.sv`,
+active-low and active-high).
 
 ## Block RAMs and multipliers
 
