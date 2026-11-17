@@ -75,6 +75,29 @@ impl Placed {
 }
 
 impl Placed {
+    /// `cell_bel` for every cell in one pass (same first-match rules).
+    pub fn cell_bels(&self) -> std::collections::HashMap<&str, Option<BelId>> {
+        let mut m = std::collections::HashMap::new();
+        for (i, lf) in self.packed.lutffs.iter().enumerate() {
+            let Some(&(site, ble)) = self.lutff_sites.get(i) else {
+                continue;
+            };
+            m.entry(lf.lut_cell.as_str()).or_insert_with(|| Some(BelId::new(site, format!("BLE{ble}.LUT"))));
+            m.entry(lf.ff_cell.as_str()).or_insert_with(|| Some(BelId::new(site, format!("BLE{ble}.FF"))));
+        }
+        for (i, iob) in self.packed.iobs.iter().enumerate() {
+            m.entry(iob.cell.as_str()).or_insert_with(|| self.iob_sites.get(i).copied().map(|s| BelId::new(s, "IOB")));
+        }
+        for (i, mac) in self.packed.macs.iter().enumerate() {
+            m.entry(mac.cell.as_str()).or_insert_with(|| self.mac_sites.get(i).copied().map(|s| BelId::new(s, "MAC")));
+        }
+        for (i, bram) in self.packed.brams.iter().enumerate() {
+            m.entry(bram.cell.as_str()).or_insert_with(|| self.bram_sites.get(i).copied().map(|s| BelId::new(s, "RAM18")));
+        }
+        m.remove("");
+        m
+    }
+
     /// Site of hard block `conn.hard[blk]`.
     pub fn hard_block_site(&self, blk: u32) -> Option<Site> {
         let r = self.packed.conn.hard.get(blk as usize)?;

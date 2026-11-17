@@ -500,3 +500,20 @@ fn moving_off_the_blocks_keeps_one_clock_per_clb() {
         }
     }
 }
+
+/// `cell_bels` answers `cell_bel` for every cell, with RAM, MAC, IOB and
+/// LUT/FF clusters all placed.
+#[test]
+fn cell_bels_matches_cell_bel() {
+    let (_, p) = the_main_placement();
+    let bels = p.cell_bels();
+    let mut names: Vec<&str> = p.packed.lutffs.iter().flat_map(|l| [l.lut_cell.as_str(), l.ff_cell.as_str()]).collect();
+    names.extend(p.packed.iobs.iter().map(|c| c.cell.as_str()));
+    names.extend(p.packed.macs.iter().map(|c| c.cell.as_str()));
+    names.extend(p.packed.brams.iter().map(|c| c.cell.as_str()));
+    names.push("no_such_cell");
+    assert!(!p.packed.brams.is_empty() && !p.packed.iobs.is_empty());
+    for n in names.into_iter().filter(|n| !n.is_empty()) {
+        assert_eq!(bels.get(n).cloned().flatten(), p.cell_bel(n), "{n}");
+    }
+}

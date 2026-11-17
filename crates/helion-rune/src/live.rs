@@ -245,6 +245,15 @@ impl LiveNetlist {
             .map(|i| &self.nets[i])
     }
 
+    // `ports_in` and `ports_out` are sorted in `from_design`.
+    pub fn is_in_port(&self, name: &str) -> bool {
+        self.ports_in.binary_search_by(|p| p.as_str().cmp(name)).is_ok()
+    }
+
+    pub fn is_out_port(&self, name: &str) -> bool {
+        self.ports_out.binary_search_by(|p| p.as_str().cmp(name)).is_ok()
+    }
+
     pub fn hier_of(&self, name: &str) -> Option<&LiveHier> {
         self.hier
             .binary_search_by(|h| h.name.as_str().cmp(name))
@@ -293,6 +302,8 @@ pub struct LivePlacedCell {
 #[derive(Clone, Debug, Default)]
 pub struct LivePlaced {
     pub cells: Vec<LivePlacedCell>,
+    /// Site (x, y) -> indices into `cells` placed there, in name order.
+    pub site_mates: HashMap<(u32, u32), Vec<usize>>,
     pub part: String,
     pub die_cols: u32,
     pub die_rows: u32,
@@ -361,12 +372,13 @@ impl LivePlaced {
         design: &helion_ir::Design,
         geom: &LiveDieGeom,
     ) -> Self {
+        let bels = p.cell_bels();
         let mut cells: Vec<LivePlacedCell> = design
             .cells
             .iter()
             .filter_map(|c| {
                 let name = helion_ir::resolve(c.name).to_string();
-                let bel = p.cell_bel(&name)?;
+                let bel = bels.get(name.as_str()).cloned().flatten()?;
                 let site = bel.site;
                 Some(LivePlacedCell {
                     cell: name,
@@ -379,8 +391,13 @@ impl LivePlaced {
             })
             .collect();
         cells.sort_by(|a, b| a.cell.cmp(&b.cell));
+        let mut site_mates: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        for (i, c) in cells.iter().enumerate() {
+            site_mates.entry((c.site_x, c.site_y)).or_default().push(i);
+        }
         LivePlaced {
             cells,
+            site_mates,
             part: geom.part.clone(),
             die_cols: geom.cols,
             die_rows: geom.rows,
@@ -388,7 +405,10 @@ impl LivePlaced {
     }
 
     pub fn site_of(&self, cell: &str) -> Option<&LivePlacedCell> {
-        self.cells.iter().find(|c| c.cell == cell)
+        self.cells
+            .binary_search_by(|c| c.cell.as_str().cmp(cell))
+            .ok()
+            .map(|i| &self.cells[i])
     }
 }
 
@@ -399,8 +419,7 @@ pub fn live_design(s: &AppState) -> Option<&helion_ir::Design> {
 }
 
 /// Identity of the design (and placement) a cached view model was built
-/// from. Cheap to compute; the per-frame reset in [`begin_frame`] covers
-/// in-place edits that keep the same allocation and sizes.
+/// from: where it lives and its sizes, checked on every call.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct BuiltFrom {
     design: usize,
@@ -418,54 +437,109 @@ fn built_from(d: &helion_ir::Design, placed: Option<&helion_place::Placed>) -> B
     }
 }
 
-thread_local! {
-    static NETLIST: std::cell::RefCell<Option<(BuiltFrom, std::rc::Rc<LiveNetlist>)>> =
-        const { std::cell::RefCell::new(None) };
-    static PLACED: std::cell::RefCell<Option<(BuiltFrom, std::rc::Rc<LivePlaced>)>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Drop the cached view models. `view()` calls this once per frame, so every
-/// pane and table row in a frame shares one build (a 19k-cell design used to
-/// be rebuilt once per I/O port row, every frame).
-pub fn begin_frame() {
-    NETLIST.with(|c| c.borrow_mut().take());
-    PLACED.with(|c| c.borrow_mut().take());
-}
-
-/// Sorted live netlist of the session design, if any (shared within a frame).
-pub fn live_netlist(s: &AppState) -> Option<std::rc::Rc<LiveNetlist>> {
-    let d = live_design(s)?;
-    let key = built_from(d, None);
-    NETLIST.with(|c| {
-        if let Some((k, l)) = c.borrow().as_ref()
-            && *k == key
-        {
-            return Some(l.clone());
+/// Everything `from_design` / `from_placed` read, hashed: an in-place edit
+/// (a Tcl rename, an ECO, a new run in the same slot) changes it.
+fn fingerprint(d: &helion_ir::Design, placed: Option<(&helion_place::Placed, &LiveDieGeom)>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    d.name.hash(&mut h);
+    for p in &d.ports {
+        (p.name, p.dir as u8).hash(&mut h);
+    }
+    for c in &d.cells {
+        c.name.hash(&mut h);
+        std::mem::discriminant(&c.kind).hash(&mut h);
+    }
+    for n in &d.nets {
+        n.name.hash(&mut h);
+        for e in &n.endpoints {
+            (e.cell, e.pin).hash(&mut h);
         }
-        let l = std::rc::Rc::new(LiveNetlist::from_design(d));
-        *c.borrow_mut() = Some((key, l.clone()));
-        Some(l)
+    }
+    for i in &d.instances {
+        (i.name, i.module, i.conns.len()).hash(&mut h);
+    }
+    if let Some((p, g)) = placed {
+        (&g.part, g.cols, g.rows).hash(&mut h);
+        (&p.lutff_sites, &p.iob_sites, &p.mac_sites, &p.bram_sites).hash(&mut h);
+        for l in &p.packed.lutffs {
+            (&l.lut_cell, &l.ff_cell).hash(&mut h);
+        }
+        for c in &p.packed.iobs {
+            c.cell.hash(&mut h);
+        }
+        for c in &p.packed.macs {
+            c.cell.hash(&mut h);
+        }
+        for c in &p.packed.brams {
+            c.cell.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// A cached view model: its key, content fingerprint, and whether the
+/// fingerprint was checked since the last [`begin_frame`].
+struct Cached<T> {
+    key: BuiltFrom,
+    fp: u64,
+    checked: bool,
+    val: std::rc::Rc<T>,
+}
+
+thread_local! {
+    static NETLIST: std::cell::RefCell<Option<Cached<LiveNetlist>>> =
+        const { std::cell::RefCell::new(None) };
+    static PLACED: std::cell::RefCell<Option<Cached<LivePlaced>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Re-check the cached view models' fingerprints on their next use. `view()`
+/// calls this once per frame: every pane and table row in a frame shares one
+/// check, and an unchanged design is not rebuilt across frames (Ibex took
+/// 0.1-0.4 s per view rebuild).
+pub fn begin_frame() {
+    NETLIST.with(|c| c.borrow_mut().as_mut().map(|e| e.checked = false));
+    PLACED.with(|c| c.borrow_mut().as_mut().map(|e| e.checked = false));
+}
+
+fn cached<T>(
+    cell: &'static std::thread::LocalKey<std::cell::RefCell<Option<Cached<T>>>>,
+    key: BuiltFrom,
+    fp: impl Fn() -> u64,
+    build: impl FnOnce() -> T,
+) -> std::rc::Rc<T> {
+    cell.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some(e) = c.as_mut()
+            && e.key == key
+            && (e.checked || e.fp == fp())
+        {
+            e.checked = true;
+            return e.val.clone();
+        }
+        let val = std::rc::Rc::new(build());
+        *c = Some(Cached { key, fp: fp(), checked: true, val: val.clone() });
+        val
     })
 }
 
-/// Sorted live placement of the last implementation run, if any (shared
-/// within a frame).
+/// Sorted live netlist of the session design, if any.
+pub fn live_netlist(s: &AppState) -> Option<std::rc::Rc<LiveNetlist>> {
+    let d = live_design(s)?;
+    Some(cached(&NETLIST, built_from(d, None), || fingerprint(d, None), || LiveNetlist::from_design(d)))
+}
+
+/// Sorted live placement of the last implementation run, if any.
 pub fn live_placed(s: &AppState) -> Option<std::rc::Rc<LivePlaced>> {
     let placed = s.runs.live_placed.as_ref()?;
     let design = live_design(s)?;
-    let key = built_from(design, Some(placed));
-    PLACED.with(|c| {
-        if let Some((k, l)) = c.borrow().as_ref()
-            && *k == key
-        {
-            return Some(l.clone());
-        }
-        let geom = live_geom(s);
-        let l = std::rc::Rc::new(LivePlaced::from_placed(placed, design, &geom));
-        *c.borrow_mut() = Some((key, l.clone()));
-        Some(l)
-    })
+    Some(cached(
+        &PLACED,
+        built_from(design, Some(placed)),
+        || fingerprint(design, Some((placed, &live_geom(s)))),
+        || LivePlaced::from_placed(placed, design, &live_geom(s)),
+    ))
 }
 
 /// Cached run geometry when an impl run finished, else the project part's

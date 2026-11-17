@@ -713,13 +713,11 @@ fn special_tile(
 /// 2x2 quads so every packed cell stays tappable.
 fn placed_rect(geom: &LiveDieGeom, placed: &LivePlaced, cell: &str) -> Option<[f32; 4]> {
     let here = placed.site_of(cell)?;
-    let mates: Vec<&str> = placed
-        .cells
-        .iter()
-        .filter(|c| c.site_x == here.site_x && c.site_y == here.site_y)
-        .map(|c| c.cell.as_str())
-        .collect();
-    let idx = mates.iter().position(|m| *m == cell).unwrap_or(0);
+    let mates: &[usize] = placed
+        .site_mates
+        .get(&(here.site_x, here.site_y))
+        .map_or(&[], Vec::as_slice);
+    let idx = mates.iter().position(|&m| placed.cells[m].cell == cell).unwrap_or(0);
     let [ox, oy] = site_xy(geom, here.site_x, here.site_y);
     if mates.len() <= 1 {
         return Some([ox + 3.0, oy + 3.0, TILE_W - 6.0, TILE_H - 6.0]);
@@ -942,12 +940,12 @@ fn find_row(
 fn find_palette(
     s: &AppState,
     t: &VivadoTheme,
-    live: Option<&LiveNetlist>,
-    placed: Option<&LivePlaced>,
+    live: Option<&std::rc::Rc<LiveNetlist>>,
+    placed: Option<&std::rc::Rc<LivePlaced>>,
 ) -> El {
     let query = s.device.find.text.clone();
     let hits: Vec<DeviceSel> = live
-        .map(|live| s.device.matches(&query, live, placed))
+        .map(|live| s.device.matches(&query, live, placed.map(|p| &**p)))
         .unwrap_or_default();
     let input: &rune::TextEdit = &s.device.find;
     let body = col()
@@ -985,7 +983,13 @@ fn find_palette(
                 .on_edit(|s: &mut AppState| &mut s.device.find)
                 .on_submit(|s: &mut AppState, _tx: &mut Tx| select_first_match(s)),
         );
-    let mut list = col().w_full().grow(1.0).min_h(0.0).max_h(FIND_H).scroll_xy();
+    let mut list = col()
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .max_h(FIND_H)
+        .scroll(rune::ScrollSpec { stick_bottom: false })
+        .scroll_xy();
     if hits.is_empty() {
         list = list.child(
             row().w_full().h(ROW_H).items_center().px(8.0).child(
@@ -1001,9 +1005,19 @@ fn find_palette(
             ),
         );
     } else if let Some(live) = live {
-        for (n, sel) in hits.iter().enumerate() {
-            list = list.child(find_row(s, t, n, sel.clone(), live, placed));
-        }
+        // Virtual: an empty query matches every cell and net (29k on Ibex).
+        let (t, live, placed) = (*t, live.clone(), placed.cloned());
+        list = list.child(
+            col()
+                .w_full()
+                .growth(rune::GrowthSpec::default())
+                .virtual_rows(
+                    hits.len(),
+                    ROW_H,
+                    |_: &AppState, i| std::borrow::Cow::Owned(format!("device-find-row-{i}")),
+                    move |s: &AppState, i| find_row(s, &t, i, hits[i].clone(), &live, placed.as_deref()),
+                ),
+        );
     }
     body.child(list)
 }
@@ -1245,7 +1259,7 @@ pub fn device_pane(s: &AppState, t: &VivadoTheme) -> El {
     // Locate link) always fits when the bottom tabs take space.
     let mut right = col().w(RIGHT_W).h_full().gap(6.0).min_h(0.0);
     if s.device.find_open {
-        right = right.child(find_palette(s, t, live.as_deref(), placed.as_deref()));
+        right = right.child(find_palette(s, t, live.as_ref(), placed.as_ref()));
     }
     right = right.child(device_inspector(s, t, live.as_deref(), placed.as_deref()));
     col()
