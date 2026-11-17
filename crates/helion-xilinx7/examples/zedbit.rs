@@ -56,20 +56,18 @@ fn synth_zb(paths: &[&str], top: Option<&str>) -> Result<Design, String> {
 }
 
 /// The current front end. VHDL goes through the VHDL-to-SystemVerilog
-/// translator first.
-fn synth_v2(paths: &[&str], top: Option<&str>) -> Result<Design, String> {
+/// translator first; the second value lists the VHDL port names it had to
+/// rename (SystemVerilog keywords), as `(VHDL name, netlist name)`.
+fn synth_v2(paths: &[&str], top: Option<&str>) -> Result<(Design, Vec<(String, String)>), String> {
+    let mut renames = Vec::new();
     let s = if is_vhdl(paths[0]) {
         let mut src = String::new();
         for p in paths {
             src.push_str(&std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?);
             src.push('\n');
         }
-        let (sv, renames) = helion_zb_front::vhdl_to_sv(&src, top).map_err(|e| format!("{}: {e}", paths[0]))?;
-        if !renames.is_empty() {
-            // Port names that are SystemVerilog keywords were renamed in
-            // the translation; only the zb path maps them back.
-            return Err(format!("top-level names {renames:?} are SystemVerilog keywords"));
-        }
+        let (sv, r) = helion_zb_front::vhdl_to_sv(&src, top).map_err(|e| format!("{}: {e}", paths[0]))?;
+        renames = r;
         helion_sv::synth_sv_v2(&sv, "vhdl.sv", None)?
     } else {
         let files: Vec<&Path> = paths.iter().map(|p| Path::new(*p)).collect();
@@ -79,23 +77,23 @@ fn synth_v2(paths: &[&str], top: Option<&str>) -> Result<Design, String> {
         eprintln!("zedbit: warning: {w}");
     }
     eprintln!("zedbit synth: v2 front end, {} LUTs, {} flops, {} LUT levels", s.luts, s.ffs, s.depth);
-    Ok(s.design)
+    Ok((s.design, renames))
 }
 
-fn synth(design_arg: &str, top: Option<&str>, front: &str) -> Result<Design, String> {
+fn synth(design_arg: &str, top: Option<&str>, front: &str) -> Result<(Design, Vec<(String, String)>), String> {
     let paths: Vec<&str> = design_arg.split(',').filter(|p| !p.is_empty()).collect();
     if paths.is_empty() {
         return Err("no design file".into());
     }
     match front {
-        "zb" => synth_zb(&paths, top),
+        "zb" => synth_zb(&paths, top).map(|d| (d, Vec::new())),
         "v2" => synth_v2(&paths, top),
         "auto" => match synth_v2(&paths, top) {
             Ok(d) => Ok(d),
             Err(e) => {
                 eprintln!("zedbit: v2 front end: {e}");
                 eprintln!("zedbit: using the zb front end for this design");
-                synth_zb(&paths, top)
+                synth_zb(&paths, top).map(|d| (d, Vec::new()))
             }
         },
         other => Err(format!("unknown front end `{other}` (auto, v2, zb)")),
@@ -284,7 +282,7 @@ fn xdc_period_ps(text: &str) -> u32 {
 
 fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_timing: bool, front: &str, part: &str) -> Result<(), String> {
     let t0 = std::time::Instant::now();
-    let mut design = synth(design_path, top, front)?;
+    let (mut design, renames) = synth(design_path, top, front)?;
     let t_synth = t0.elapsed();
     for k in ["SIM_ONLY", "NO_BODY", "WIDE_CONE", "ASSIGN_NOT_LOWERED", "GENERATE_NOT_LOWERED", "FLATTEN_CAP"] {
         if design.attrs.get(k).is_some() {
@@ -294,6 +292,9 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
     let xdc = std::fs::read_to_string(xdc_path).map_err(|e| format!("{xdc_path}: {e}"))?;
     let props = parse_xdc(&xdc);
     let lookup = |key: &str, prop: &str| -> Option<String> {
+        // The XDC uses the VHDL name of a port the translator renamed.
+        let vhdl = renames.iter().find_map(|(v, e)| key.strip_prefix(e.as_str()).filter(|r| r.is_empty() || r.starts_with('[')).map(|r| format!("{v}{r}")));
+        let key = vhdl.as_deref().unwrap_or(key);
         props.iter().rev().find(|(k, _, p)| k.eq_ignore_ascii_case(prop) && glob(p, key)).map(|(_, v, _)| v.clone())
     };
 
@@ -328,6 +329,8 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
     let mut missing = Vec::new();
     for iob in packed.iobs.iter_mut() {
         let key = match iob_attrs.get(&iob.name) {
+            // A scalar port is bit 0 of itself; its XDC names it bare.
+            Some((Some(port), Some(bit))) if bit == "0" && lookup(&format!("{port}[0]"), "PACKAGE_PIN").is_none() && lookup(port, "PACKAGE_PIN").is_some() => port.clone(),
             Some((Some(port), Some(bit))) => format!("{port}[{bit}]"),
             Some((Some(port), None)) => port.clone(),
             _ => {
