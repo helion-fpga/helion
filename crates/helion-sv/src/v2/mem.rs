@@ -27,34 +27,39 @@ use std::collections::{HashMap, HashSet};
 /// Marks an error that asks for a rerun with one memory built from flops.
 pub const RETRY: &str = "\u{1}flops:";
 
+/// Memories smaller than this are not block RAM (LUT RAM, see [`super::lutram`]).
+pub const MIN_BITS: u32 = 1024;
+
 /// Memories smaller than this stay in flops.
-const MIN_BITS: u32 = 1024;
+const MIN_LUTRAM_BITS: u32 = 64;
 
 pub struct WPort {
     proc: u32,
-    clk: N,
-    neg: bool,
-    addr: N,
+    pub(super) clk: N,
+    pub(super) neg: bool,
+    pub(super) addr: N,
     /// Hidden signals: write data (element wide) and byte enables.
-    wd: u32,
-    we: u32,
+    pub(super) wd: u32,
+    pub(super) we: u32,
 }
 
 pub struct RPort {
     /// Clocked process of a registered read; `None` outside one.
     proc: Option<(u32, N, bool)>,
-    addr: N,
+    pub(super) addr: N,
     /// Hidden signal standing for the value read.
-    r: u32,
+    pub(super) r: u32,
 }
 
 pub struct Mem {
-    sig: u32,
-    depth: u32,
-    ew: u32,
-    lo: i64,
-    w: Vec<WPort>,
-    r: Vec<RPort>,
+    pub(super) sig: u32,
+    pub(super) depth: u32,
+    pub(super) ew: u32,
+    pub(super) lo: i64,
+    pub(super) w: Vec<WPort>,
+    pub(super) r: Vec<RPort>,
+    /// Some write covers only part of an element (whole bytes).
+    pub(super) partial: bool,
 }
 
 #[derive(Default)]
@@ -62,7 +67,7 @@ pub struct MemState {
     pub on: bool,
     /// Memories to build from flops (flattened names).
     pub no_bram: HashSet<String>,
-    mems: Vec<Mem>,
+    pub(super) mems: Vec<Mem>,
     of_sig: HashMap<u32, usize>,
     hidden: HashSet<u32>,
     /// Hidden write data: its value where nothing is written does not matter.
@@ -143,27 +148,29 @@ impl Elab {
     }
 
     pub fn retry<X>(&self, m: usize, why: &str) -> R<X> {
-        Err(format!("{RETRY}{}\u{1}{why}", self.sigs[self.mem.mems[m].sig as usize].name))
+        // A memory too small for block RAM went to flops before LUT RAM existed: no warning for it.
+        let quiet = if self.sigs[self.mem.mems[m].sig as usize].ty.w() < MIN_BITS { "\u{2}" } else { "" };
+        Err(format!("{RETRY}{}\u{1}{quiet}{why}", self.sigs[self.mem.mems[m].sig as usize].name))
     }
 
-    fn hidden_sig(&mut self, name: String, w: u32) -> u32 {
+    pub(super) fn hidden_sig(&mut self, name: String, w: u32) -> u32 {
         self.sigs.push(Sig { debug: false, hier: name.clone(), name, ty: Ty::bits(w, false), drv: vec![Drv::None; w as usize], init: vec![false; w as usize], line: self.line });
         let id = self.sigs.len() as u32 - 1;
         self.mem.hidden.insert(id);
         id
     }
 
-    /// Called for every declared signal: a large one-dimensional unpacked
-    /// array becomes a memory candidate.
+    /// Called for every declared signal: a one-dimensional unpacked array of
+    /// at least `MIN_LUTRAM_BITS` becomes a memory candidate.
     pub fn mem_candidate(&mut self, sig: u32) {
         if !self.mem.on || self.mem.no_bram.contains(&self.sigs[sig as usize].name) {
             return;
         }
         let Ty::Array { elem, lo, hi, packed: false, .. } = &*self.sigs[sig as usize].ty else { return };
-        if matches!(&**elem, Ty::Array { packed: false, .. }) || self.sigs[sig as usize].ty.w() < MIN_BITS || hi == lo {
+        if matches!(&**elem, Ty::Array { packed: false, .. }) || self.sigs[sig as usize].ty.w() < MIN_LUTRAM_BITS || hi == lo {
             return;
         }
-        let m = Mem { sig, depth: (hi - lo + 1) as u32, ew: elem.w(), lo: *lo, w: Vec::new(), r: Vec::new() };
+        let m = Mem { sig, depth: (hi - lo + 1) as u32, ew: elem.w(), lo: *lo, w: Vec::new(), r: Vec::new(), partial: false };
         self.mem.of_sig.insert(sig, self.mem.mems.len());
         self.mem.mems.push(m);
     }
@@ -246,6 +253,7 @@ impl Elab {
         if !nonblocking {
             self.mem.blocking.insert((m, p));
         }
+        self.mem.mems[m].partial |= !(lo == 0 && w == ew);
         let nb = ew.div_ceil(8);
         let k = match self.mem.mems[m].w.iter().position(|x| x.proc == p && x.addr == addr) {
             Some(k) => k,
@@ -465,10 +473,13 @@ impl Elab {
             return Ok(()); // nothing reads it: no hardware
         }
         let (ew, depth) = (mem.ew, mem.depth);
+        if depth * ew < MIN_BITS {
+            return self.build_lutram(m, users, "it is too small for block RAM");
+        }
         let nw = mem.w.len();
         let mut ports: Vec<LPort> = mem.w.iter().enumerate().map(|(k, w)| LPort { clk: w.clk, addr: w.addr, write: Some(k), read: None, write_first: false }).collect();
         if mem.w.iter().any(|w| w.neg) {
-            return self.retry(m, "it is written on a falling clock edge");
+            return self.build_lutram(m, users, "it is written on a falling clock edge");
         }
         let rports: Vec<(Option<(u32, N, bool)>, N, u32)> = mem.r.iter().map(|r| (r.proc, r.addr, r.r)).collect();
         for (proc, addr, r) in rports {
@@ -478,13 +489,13 @@ impl Elab {
                     let (q, en) = match us.as_slice() {
                         [Some(ri)] => match self.load_of(*ri, r, ew) {
                             Some(x) => x,
-                            None => return self.retry(m, "a value read is not loaded straight into a whole register"),
+                            None => return self.build_lutram(m, users, "a value read is not loaded straight into a whole register"),
                         },
                         [] => continue,
-                        _ => return self.retry(m, "a value read is used other than by loading one register"),
+                        _ => return self.build_lutram(m, users, "a value read is used other than by loading one register"),
                     };
                     if neg {
-                        return self.retry(m, "it is read on a falling clock edge");
+                        return self.build_lutram(m, users, "it is read on a falling clock edge");
                     }
                     let one = self.dag.as_const(en) == Some(&[true]);
                     let shared = ports.iter().position(|p| p.write.is_some() && p.read.is_none() && one && p.clk == clk && p.addr == addr);
@@ -496,11 +507,11 @@ impl Elab {
                 None => {
                     // The address must be a register's output.
                     let Some((ri, s)) = self.addr_reg(addr) else {
-                        return self.retry(m, "a read has no register in front of it (asynchronous read)");
+                        return self.build_lutram(m, users, "a read has no register in front of it (asynchronous read)");
                     };
                     let (rd, clk, neg) = (self.regs[ri].d, self.regs[ri].clk, self.regs[ri].negedge);
                     if neg {
-                        return self.retry(m, "its read address register is clocked on the falling edge");
+                        return self.build_lutram(m, users, "its read address register is clocked on the falling edge");
                     }
                     let w = self.sigs[s as usize].ty.w();
                     let mut memo = HashMap::new();
@@ -522,16 +533,16 @@ impl Elab {
                             ports[k].read = Some(out);
                             ports[k].write_first = true;
                         }
-                        _ => return self.retry(m, "a read through an address register does not share the address of its only write"),
+                        _ => return self.build_lutram(m, users, "a read through an address register does not share the address of its only write"),
                     }
                 }
             }
         }
         if ports.iter().any(|p| p.write_first) && ports.len() > 1 {
-            return self.retry(m, "a write-first port and a second port would collide");
+            return self.build_lutram(m, users, "a write-first port and a second port would collide");
         }
         if ports.len() > 2 {
-            return self.retry(m, "it needs more than two ports");
+            return self.build_lutram(m, users, "it needs more than two ports");
         }
         if !ports.iter().any(|p| p.read.is_some()) {
             return Ok(());
@@ -882,6 +893,35 @@ pub fn prim_ports(module: &str) -> Option<&'static [(&'static str, bool, u32)]> 
         "SRL16E" => &[("A0", true, 1), ("A1", true, 1), ("A2", true, 1), ("A3", true, 1), ("CE", true, 1), ("CLK", true, 1), ("D", true, 1), ("Q", false, 1)],
         "SRLC32E" => &[("A", true, 5), ("CE", true, 1), ("CLK", true, 1), ("D", true, 1), ("Q", false, 1), ("Q31", false, 1)],
         "CARRY4" => &[("CI", true, 1), ("CYINIT", true, 1), ("DI", true, 4), ("S", true, 4), ("CO", false, 4), ("O", false, 4)],
+        // LUT RAM (see `super::lutram`).
+        "RAM32M" | "RAM64M" => {
+            const M32: &[(&str, bool, u32)] = &[
+                ("ADDRA", true, 5), ("ADDRB", true, 5), ("ADDRC", true, 5), ("ADDRD", true, 5), ("DIA", true, 2), ("DIB", true, 2), ("DIC", true, 2),
+                ("DID", true, 2), ("WCLK", true, 1), ("WE", true, 1), ("DOA", false, 2), ("DOB", false, 2), ("DOC", false, 2), ("DOD", false, 2),
+            ];
+            const M64: &[(&str, bool, u32)] = &[
+                ("ADDRA", true, 6), ("ADDRB", true, 6), ("ADDRC", true, 6), ("ADDRD", true, 6), ("DIA", true, 1), ("DIB", true, 1), ("DIC", true, 1),
+                ("DID", true, 1), ("WCLK", true, 1), ("WE", true, 1), ("DOA", false, 1), ("DOB", false, 1), ("DOC", false, 1), ("DOD", false, 1),
+            ];
+            if module == "RAM32M" { M32 } else { M64 }
+        }
+        "RAM32X1S" => &[("A0", true, 1), ("A1", true, 1), ("A2", true, 1), ("A3", true, 1), ("A4", true, 1), ("D", true, 1), ("WCLK", true, 1), ("WE", true, 1), ("O", false, 1)],
+        "RAM64X1S" => &[("A0", true, 1), ("A1", true, 1), ("A2", true, 1), ("A3", true, 1), ("A4", true, 1), ("A5", true, 1), ("D", true, 1), ("WCLK", true, 1), ("WE", true, 1), ("O", false, 1)],
+        "RAM128X1S" => &[
+            ("A0", true, 1), ("A1", true, 1), ("A2", true, 1), ("A3", true, 1), ("A4", true, 1), ("A5", true, 1), ("A6", true, 1), ("D", true, 1),
+            ("WCLK", true, 1), ("WE", true, 1), ("O", false, 1),
+        ],
+        "RAM256X1S" => &[("A", true, 8), ("D", true, 1), ("WCLK", true, 1), ("WE", true, 1), ("O", false, 1)],
+        "RAM32X1D" => &[
+            ("A0", true, 1), ("A1", true, 1), ("A2", true, 1), ("A3", true, 1), ("A4", true, 1), ("DPRA0", true, 1), ("DPRA1", true, 1), ("DPRA2", true, 1),
+            ("DPRA3", true, 1), ("DPRA4", true, 1), ("D", true, 1), ("WCLK", true, 1), ("WE", true, 1), ("SPO", false, 1), ("DPO", false, 1),
+        ],
+        "RAM64X1D" => &[
+            ("A0", true, 1), ("A1", true, 1), ("A2", true, 1), ("A3", true, 1), ("A4", true, 1), ("A5", true, 1), ("DPRA0", true, 1), ("DPRA1", true, 1),
+            ("DPRA2", true, 1), ("DPRA3", true, 1), ("DPRA4", true, 1), ("DPRA5", true, 1), ("D", true, 1), ("WCLK", true, 1), ("WE", true, 1),
+            ("SPO", false, 1), ("DPO", false, 1),
+        ],
+        "RAM128X1D" => &[("A", true, 7), ("DPRA", true, 7), ("D", true, 1), ("WCLK", true, 1), ("WE", true, 1), ("SPO", false, 1), ("DPO", false, 1)],
         _ => return None,
     })
 }

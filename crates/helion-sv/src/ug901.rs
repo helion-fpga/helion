@@ -1845,12 +1845,18 @@ fn detect_1d_srl<'a>(rtl: &Rtl<'a>, sr_name: &'a str, arena: &'a Bump) -> Option
         .nbas
         .iter()
         .find(|(lhs, b, _)| *lhs == sr_name && matches!(b, None | Some(0)))?;
-    let _ = bit;
+    // Hold arm: whole vector for a full-width NBA, or `sr[0]` when the front
+    // end has split the shift into per-bit NBAs (bit 0 row).
+    let is_hold = |e: &RExpr<'_>| match (e, bit) {
+        (RExpr::Ident(s), None) => *s == sr_name,
+        (RExpr::Bit(s, 0), Some(0)) => *s == sr_name,
+        _ => false,
+    };
     let (ce_expr, core) = match rhs {
         RExpr::Mux(c, t, f) => {
-            if matches!(*f, RExpr::Ident(s) if *s == sr_name) {
+            if is_hold(f) {
                 (Some((**c).clone()), *t)
-            } else if matches!(*t, RExpr::Ident(s) if *s == sr_name) {
+            } else if is_hold(t) {
                 (
                     Some(RExpr::Not(arena.alloc((**c).clone()))),
                     *f,
@@ -2154,6 +2160,13 @@ pub(crate) fn apply_ug901_srl_pass<'a>(
             RExpr::Ident(s) => Some((*s).to_string()),
             _ => None,
         });
+        // A dynamic tap across a cascade needs each stage's addressable `Q`
+        // plus an output mux on the address bits above A4. One LUT6 covers up
+        // to 4 stages (4 data + 2 select inputs); deeper chains stay as flops.
+        let tap_mux = srl.tap_addr.is_some() && n_cascade > 1;
+        if tap_mux && n_cascade > 4 {
+            continue;
+        }
 
         for bit in 0..srl.width {
             let raw_din = bit_name(srl.din_name, srl.width, bit);
@@ -2187,6 +2200,7 @@ pub(crate) fn apply_ug901_srl_pass<'a>(
             };
 
             let mut stage_in = srl_din;
+            let mut stage_qs: Vec<String> = Vec::with_capacity(n_cascade);
             for c_idx in 0..n_cascade {
                 let cname = if n_cascade == 1 {
                     format!(
@@ -2200,21 +2214,28 @@ pub(crate) fn apply_ug901_srl_pass<'a>(
                         srl.sr_name
                     )
                 };
-                let stage_out = if c_idx + 1 == n_cascade {
+                let last = c_idx + 1 == n_cascade;
+                // `Q31` (last bit of this stage) feeds the next stage's `D`.
+                let q31_net = format!("{}_{bit}_q31_{c_idx}", srl.sr_name);
+                // `Q` is the addressable tap of this stage.
+                let q_net = if tap_mux {
+                    format!("{}_{bit}_q_{c_idx}", srl.sr_name)
+                } else if last {
                     srl_q.clone()
                 } else {
-                    format!("{}_{bit}_q31_{c_idx}", srl.sr_name)
+                    q31_net.clone()
                 };
                 d.add_cell(&cname, CellKind::Lut6 { init: 0xAAAA_AAAA_AAAA_AAAA });
                 let _ = d.dont_touch(&cname);
                 d.connect(clk, &cname, "CLK");
                 d.connect(&stage_in, &cname, "D");
                 d.connect(&stage_in, &cname, "I0");
-                d.connect(&stage_out, &cname, "Q");
-                d.connect(&stage_out, &cname, "O");
-                if c_idx + 1 < n_cascade {
-                    d.connect(&stage_out, &cname, "Q31");
+                d.connect(&q_net, &cname, "Q");
+                d.connect(&q_net, &cname, "O");
+                if !last {
+                    d.connect(&q31_net, &cname, "Q31");
                 }
+                stage_qs.push(q_net);
                 if let Some(ce) = &ce_net {
                     d.connect(ce, &cname, "CE");
                 }
@@ -2234,7 +2255,29 @@ pub(crate) fn apply_ug901_srl_pass<'a>(
                 let _ = d.set_cell_attr(&cname, "SHREG_EXTRACT", "YES");
                 let _ = d.set_cell_attr(&cname, "SRL_STYLE", style_str);
                 let _ = d.set_cell_attr(&cname, "DEPTH", eff_depth.to_string());
-                stage_in = stage_out;
+                stage_in = q31_net;
+            }
+
+            if tap_mux {
+                // srl_q = stage_qs[addr[high:5]] (addr bits 5.. on I4, I5).
+                let addr_id = srl.tap_addr.unwrap_or_default();
+                let aw = sig_width(rtl, addr_id).max(1);
+                let mcell = format!("u_srl_tapmux_{}_{bit}", srl.sr_name);
+                let mut init = 0u64;
+                for idx in 0..64u64 {
+                    let sel = ((idx >> 4) & 3) as usize;
+                    if sel < n_cascade && (idx >> sel) & 1 == 1 {
+                        init |= 1 << idx;
+                    }
+                }
+                d.add_cell(&mcell, CellKind::Lut6 { init });
+                for (i, q) in stage_qs.iter().enumerate() {
+                    d.connect(q, &mcell, &format!("I{i}"));
+                }
+                for (k, a_i) in (5..aw.min(7)).enumerate() {
+                    d.connect(&bit_name(addr_id, aw, a_i), &mcell, &format!("I{}", 4 + k));
+                }
+                d.connect(&srl_q, &mcell, "O");
             }
 
             if use_tail_reg {
@@ -2634,7 +2677,10 @@ pub(crate) fn apply_ug901_ram_rom_pass<'a>(
         } else {
             base_w
         };
-        let is_asymmetric = read_port_w != write_total_w;
+        // A BRAM read is registered: only a clocked (NBA) read port may make
+        // an asymmetric Bram18e1. A comb `assign` read stays fabric.
+        let read_is_sync = dout_opt.map_or(false, |o| rtl.nbas.iter().any(|(l, _, _)| *l == o));
+        let is_asymmetric = read_is_sync && read_port_w != write_total_w;
         let has_byte_we = byte_we_nets.len() > 1 || (write_lanes > 1);
         let is_ultra = eff.ram_style == Some(RamStyleMode::Ultra);
         let is_block = eff.ram_style == Some(RamStyleMode::Block)

@@ -5174,6 +5174,7 @@ fn tokenize_impl<'s>(s: &'s str, mut offs: Option<&mut Vec<u32>>) -> Result<Vec<
         "unique",
         "unique0",
         "priority",
+        "automatic",
         "void",
         "const",
         "var",

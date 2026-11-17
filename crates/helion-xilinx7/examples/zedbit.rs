@@ -68,6 +68,9 @@ fn synth_zb(paths: &[&str], top: Option<&str>) -> Result<Design, String> {
 /// rename (SystemVerilog keywords), as `(VHDL name, netlist name)`.
 fn synth_v2(paths: &[&str], top: Option<&str>) -> Result<(Design, Vec<(String, String)>), String> {
     helion_sv::v2::set_hard(true);
+    // The router does not build SRL16E/SRLC32E pins yet (HELION_GAPS G53):
+    // shift registers stay flops unless HELION_V2_SRL=1.
+    helion_sv::v2::srl::set_off(true);
     let mut renames = Vec::new();
     helion_sv::v2::dag::set_carry_arith(std::env::var("HELION_NO_CARRY").is_err());
     let s = if is_vhdl(paths[0]) {
@@ -228,7 +231,7 @@ fn main() {
 /// period cannot be known.
 fn clock_periods(packed: &helion_xilinx7::pack::Packed7, pin_period: u32) -> Result<HashMap<String, u32>, String> {
     let mut periods: HashMap<String, u32> = HashMap::new();
-    let mut doms: Vec<String> = packed.ffs.iter().map(|f| f.clk_net.clone()).collect();
+    let mut doms: Vec<String> = packed.ffs.iter().map(|f| f.clk_net.clone()).chain(packed.lutrams.iter().map(|r| r.clk.clone())).collect();
     doms.sort();
     doms.dedup();
     // Buffer input -> output, and which buffer inputs come from pads.
@@ -244,6 +247,17 @@ fn clock_periods(packed: &helion_xilinx7::pack::Packed7, pin_period: u32) -> Res
             let Some(b) = packed.bufgs.iter().find(|b| &b.out_net == dom) else { return true };
             if pads.contains(b.in_net.as_str()) {
                 periods.insert(dom.clone(), pin_period);
+                return false;
+            }
+            // An MMCM/PLL output: T_in * D * O / M (UG472), from a pad clock
+            // or a clock already known.
+            if let Some((c, i)) = packed.cmts.iter().find_map(|c| c.clkout_nets.iter().position(|n| n.as_deref() == Some(b.in_net.as_str())).map(|i| (c, i))) {
+                let Some(inp) = c.clkin1_net.as_deref() else { return true };
+                let src = if pads.contains(inp) { pin_period } else if let Some(&p) = periods.get(inp) { p } else { return true };
+                let m = c.clkfbout_mult_f.round() as u64;
+                let o = if i == 0 { c.clkout0_divide_f.round() as u64 } else { c.clkout_divide[i] as u64 };
+                // Rounded down: a shorter period is the safe side.
+                periods.insert(dom.clone(), (src as u64 * c.divclk_divide as u64 * o / m) as u32);
                 return false;
             }
             let Some(f) = packed.ffs.iter().find(|f| f.q_net == b.in_net) else { return true };
@@ -265,13 +279,73 @@ fn clock_periods(packed: &helion_xilinx7::pack::Packed7, pin_period: u32) -> Res
             }
         });
     }
+    for c in &packed.cmts {
+        // The attribute the CMT was configured for must be the clock it gets.
+        if c.clkin1_net.as_deref().is_some_and(|n| pads.contains(n)) && (c.clkin1_period_ns * 1000.0 - pin_period as f64).abs() > pin_period as f64 * 0.01 {
+            return Err(format!(
+                "{}: CLKIN1_PERIOD is {} ns but its input clock has a {:.3} ns period (create_clock)",
+                c.name, c.clkin1_period_ns, pin_period as f64 / 1000.0
+            ));
+        }
+    }
     if !pending.is_empty() {
         return Err(format!(
-            "clock {} is not a pad clock or a divide-by-two of one; its period is unknown, so timing cannot be checked",
+            "clock {} is not a pad clock, an MMCM/PLL output or a divide-by-two of one; its period is unknown, so timing cannot be checked",
             pending.join(", ")
         ));
     }
     Ok(periods)
+}
+
+/// Clock domains (flop clock nets after packing) of each `-group` of every
+/// `set_clock_groups -asynchronous` in the XDC. A group names clocks as
+/// `[get_clocks -of_objects [get_pins CELL/CLKOUTn]]` (an MMCM/PLL output)
+/// or `[get_clocks NAME]` (a `create_clock -name`, the pad clock). Anything
+/// else is an error, never ignored.
+fn async_groups(xdc: &str, packed: &helion_xilinx7::pack::Packed7) -> Result<Vec<Vec<String>>, String> {
+    let bufg_of = |net: &str| packed.bufgs.iter().find(|b| b.in_net == net).map(|b| b.out_net.clone());
+    let mut out = Vec::new();
+    for line in xdc.lines() {
+        let l = line.split('#').next().unwrap_or("").trim();
+        if !l.starts_with("set_clock_groups") {
+            continue;
+        }
+        if !l.contains("-asynchronous") {
+            return Err(format!("XDC: only `set_clock_groups -asynchronous` is supported: {l}"));
+        }
+        for g in l.split("-group").skip(1) {
+            let mut doms = Vec::new();
+            for (i, _) in g.match_indices("get_pins") {
+                let rest = g[i + 8..].trim_start().trim_start_matches('{');
+                let pin: String = rest.chars().take_while(|c| !c.is_whitespace() && *c != ']' && *c != '}').collect();
+                let (cell, port) = pin.rsplit_once('/').ok_or_else(|| format!("XDC: bad pin `{pin}` in {l}"))?;
+                let c = packed.cmts.iter().find(|c| c.name == cell).ok_or_else(|| {
+                    format!("XDC: `{cell}` is not an MMCM/PLL (have: {})", packed.cmts.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", "))
+                })?;
+                let k: usize = port.strip_prefix("CLKOUT").and_then(|d| d.parse().ok()).ok_or_else(|| format!("XDC: `{pin}`: only CLKOUTn pins name clocks"))?;
+                let net = c.clkout_nets.get(k).cloned().flatten().ok_or_else(|| format!("XDC: `{pin}` is not connected"))?;
+                doms.push(bufg_of(&net).ok_or_else(|| format!("XDC: `{pin}` does not drive a BUFG"))?);
+            }
+            if !g.contains("get_pins") {
+                for (i, _) in g.match_indices("get_clocks") {
+                    let name: String = g[i + 10..].trim_start().trim_start_matches('{').chars().take_while(|c| !c.is_whitespace() && *c != ']' && *c != '}').collect();
+                    let port = xdc
+                        .lines()
+                        .find(|cl| cl.trim_start().starts_with("create_clock") && cl.contains(&format!("-name {name}")))
+                        .and_then(|cl| cl.split("get_ports").nth(1))
+                        .map(|p| p.trim_start().trim_start_matches(['{', ' ']).chars().take_while(|c| !c.is_whitespace() && *c != ']' && *c != '}').collect::<String>())
+                        .ok_or_else(|| format!("XDC: clock `{name}` has no create_clock on a port"))?;
+                    let pad = packed.iobs.iter().find(|i| i.port == port).ok_or_else(|| format!("XDC: no pad for clock port `{port}`"))?;
+                    doms.push(bufg_of(&pad.net).ok_or_else(|| format!("XDC: clock `{name}` does not drive a BUFG"))?);
+                }
+            }
+            if doms.is_empty() {
+                return Err(format!("XDC: a clock group names no clock zedbit understands: {l}"));
+            }
+            out.push(doms);
+        }
+    }
+    Ok(out)
 }
 
 /// Clock period (ps) from the first `create_clock -period <ns>`; 10 ns default.
@@ -333,13 +407,15 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
     let mut packed = be.pack(&design)?;
     let ramb36 = packed.brams.iter().filter(|b| b.kind == helion_xilinx7::pack::BramKind::Ramb36e1).count();
     eprintln!(
-        "zedbit: packed {} LUTs, {} flops, {} carry cells, {} RAMB36 + {} RAMB18, {} DSP48, {} pads; placing",
+        "zedbit: packed {} LUTs, {} flops, {} carry cells, {} RAMB36 + {} RAMB18, {} DSP48, {} LUT RAMs ({} LUT RAM LUTs), {} pads; placing",
         packed.luts.len(),
         packed.ffs.len(),
         packed.carries.len(),
         ramb36,
         packed.brams.len() - ramb36,
         packed.dsps.len(),
+        packed.lutrams.len(),
+        packed.lutrams.iter().map(|r| r.init.iter().flatten().count()).sum::<usize>(),
         packed.iobs.len()
     );
     let mut missing = Vec::new();
@@ -407,7 +483,14 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
         period /= 2;
     }
     let periods = clock_periods(&packed, period)?;
-    let ta = helion_xilinx7::timing::analyze_clocks(&routed, &|c| periods.get(c).copied())?;
+    let groups = async_groups(&xdc, &packed)?;
+    let group_of = |c: &str| groups.iter().position(|g| g.iter().any(|d| d == c));
+    if !groups.is_empty() {
+        eprintln!("zedbit timing: asynchronous clock groups {groups:?}: flop-to-flop crossings between them allowed (timed against the capturing clock)");
+    }
+    let ta = helion_xilinx7::timing::analyze_clocks_async(&routed, &|c| periods.get(c).copied(), &|a, b| {
+        matches!((group_of(a), group_of(b)), (Some(x), Some(y)) if x != y)
+    })?;
     for (clk, wns) in &ta.clocks {
         eprintln!("zedbit timing: clock {clk}: period {:.3} ns, worst slack {:.3} ns", periods[clk] as f64 / 1000.0, *wns as f64 / 1000.0);
     }

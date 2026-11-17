@@ -5,7 +5,7 @@
 //! deterministically.
 
 use crate::pack::{
-    BramKind, CascadeOrder, ClockBufKind, CmtKind, DdrClkEdge, IobDir, IodelayKind, MuxfKind,
+    BramKind, CascadeOrder, ClockBufKind, DdrClkEdge, IobDir, IodelayKind, MuxfKind,
     RamMode, RamWriteMode, SrlKind, SrType,
 };
 use crate::place::Placed7;
@@ -121,18 +121,6 @@ pub struct Bitstream7 {
     pub frames: Vec<u32>,
 }
 
-/// Encode an MMCM/PLL divider `div` and duty cycle `duty` into prjxray
-/// `(HIGH_TIME[5:0], LOW_TIME[5:0], NO_COUNT, EDGE)` DRP register fields.
-pub fn encode_cmt_divider(div: u32, duty: f64) -> (u8, u8, bool, bool) {
-    if div <= 1 {
-        return (1, 1, true, false);
-    }
-    let high = ((div as f64) * duty).round().clamp(1.0, (div - 1) as f64) as u32;
-    let low = (div - high).max(1);
-    let edge = high > low;
-    ((high & 0x3F) as u8, (low & 0x3F) as u8, false, edge)
-}
-
 /// Emit FASM for a routed design.
 pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7, String> {
     let placed = &routed.placed;
@@ -203,6 +191,9 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
             }
         }
     }
+
+    // 2b. LUT RAM.
+    lines.extend(crate::lutram::fasm(placed, device)?);
 
     // 3. MUXF7 / MUXF8 wide slice multiplexers.
     for muxf in &placed.muxfs {
@@ -685,95 +676,7 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     }
 
     // 7. CMTs (MMCME2_ADV / PLLE2_ADV).
-    for cmt in &placed.cmts {
-        let Some(pcmt) = packed.cmts.iter().find(|c| c.name == cmt.name) else {
-            continue;
-        };
-        let bel = match cmt.kind {
-            CmtKind::MmcmE2Adv => "MMCME2_ADV",
-            CmtKind::PllE2Adv => "PLLE2_ADV",
-        };
-        lines.push(format!("{}.{}.IN_USE", cmt.tile, bel));
-        lines.push(format!(
-            "{}.{}.BANDWIDTH.{}",
-            cmt.tile, bel, pcmt.bandwidth
-        ));
-        lines.push(format!(
-            "{}.{}.COMPENSATION.{}",
-            cmt.tile, bel, pcmt.compensation
-        ));
-
-        let (div_hi, div_lo, div_nc, div_edge) = encode_cmt_divider(pcmt.divclk_divide, 0.5);
-        lines.push(format!(
-            "{}.{}.DIVCLK_DIVCLK_HIGH_TIME[5:0] = 6'h{:02X}",
-            cmt.tile, bel, div_hi
-        ));
-        lines.push(format!(
-            "{}.{}.DIVCLK_DIVCLK_LOW_TIME[5:0] = 6'h{:02X}",
-            cmt.tile, bel, div_lo
-        ));
-        if div_nc {
-            lines.push(format!("{}.{}.DIVCLK_DIVCLK_NO_COUNT", cmt.tile, bel));
-        }
-        if div_edge {
-            lines.push(format!("{}.{}.DIVCLK_DIVCLK_EDGE", cmt.tile, bel));
-        }
-
-        let mult_int = pcmt.clkfbout_mult_f.floor() as u32;
-        let (fb_hi, fb_lo, fb_nc, fb_edge) = encode_cmt_divider(mult_int, 0.5);
-        lines.push(format!(
-            "{}.{}.CLKFBOUT_CLKOUT1_HIGH_TIME[5:0] = 6'h{:02X}",
-            cmt.tile, bel, fb_hi
-        ));
-        lines.push(format!(
-            "{}.{}.CLKFBOUT_CLKOUT1_LOW_TIME[5:0] = 6'h{:02X}",
-            cmt.tile, bel, fb_lo
-        ));
-        if fb_nc {
-            lines.push(format!("{}.{}.CLKFBOUT_CLKOUT2_NO_COUNT", cmt.tile, bel));
-        }
-        if fb_edge {
-            lines.push(format!("{}.{}.CLKFBOUT_CLKOUT2_EDGE", cmt.tile, bel));
-        }
-        if cmt.kind == CmtKind::MmcmE2Adv {
-            let frac = ((pcmt.clkfbout_mult_f.fract() * 8.0).round() as u8) & 0x7;
-            if frac != 0 {
-                lines.push(format!("{}.{}.CLKFBOUT_CLKOUT2_FRAC_EN", cmt.tile, bel));
-                lines.push(format!(
-                    "{}.{}.CLKFBOUT_CLKOUT2_FRAC[2:0] = 3'b{:03b}",
-                    cmt.tile, bel, frac
-                ));
-            }
-        }
-
-        for i in 0..7 {
-            if cmt.kind == CmtKind::PllE2Adv && i >= 6 {
-                break;
-            }
-            let (hi, lo, nc, edge) =
-                encode_cmt_divider(pcmt.clkout_divide[i], pcmt.clkout_duty[i]);
-            lines.push(format!(
-                "{}.{}.CLKOUT{i}_CLKOUT1_HIGH_TIME[5:0] = 6'h{:02X}",
-                cmt.tile, bel, hi
-            ));
-            lines.push(format!(
-                "{}.{}.CLKOUT{i}_CLKOUT1_LOW_TIME[5:0] = 6'h{:02X}",
-                cmt.tile, bel, lo
-            ));
-            if nc {
-                lines.push(format!("{}.{}.CLKOUT{i}_CLKOUT2_NO_COUNT", cmt.tile, bel));
-            }
-            if edge {
-                lines.push(format!("{}.{}.CLKOUT{i}_CLKOUT2_EDGE", cmt.tile, bel));
-            }
-            if pcmt.clkout_nets[i].is_some() {
-                lines.push(format!(
-                    "{}.{}.CLKOUT{i}_CLKOUT1_OUTPUT_ENABLE",
-                    cmt.tile, bel
-                ));
-            }
-        }
-    }
+    lines.extend(crate::cmt::emit_lines(placed)?);
 
     // 8. Block RAMs (RAMB18E1 and RAMB36E1).
     for bram in &placed.brams {

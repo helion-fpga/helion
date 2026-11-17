@@ -811,6 +811,10 @@ pub fn build_node_map(device: &mut Device) -> NodeMaps {
 }
 
 impl<'a> DeviceQuery for XDevice<'a> {
+    fn slicem_sites(&self) -> HashSet<String> {
+        (0..self.device.tile_count()).filter_map(|ti| self.device.tile(ti)).flat_map(|t| t.sites.iter().filter(|s| s.site_type == "SLICEM").map(|s| s.name.clone())).collect()
+    }
+
     /// CMT sites of the loaded part, from the database (the trait's default
     /// table names tiles no supported part has).
     fn cmt_sites(&self, kind: crate::pack::CmtKind) -> Vec<(String, String)> {

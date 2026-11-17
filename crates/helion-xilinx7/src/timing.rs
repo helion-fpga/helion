@@ -287,11 +287,25 @@ pub fn analyze(routed: &Routed7, period_ps: u32) -> Result<Analysis, String> {
 /// The returned `period_ps` is the period of the domain with the worst
 /// slack.
 pub fn analyze_clocks(routed: &Routed7, period_of: &dyn Fn(&str) -> Option<u32>) -> Result<Analysis, String> {
-    let mut domains: Vec<&str> = routed.placed.packed.ffs.iter().map(|f| f.clk_net.as_str()).collect();
+    analyze_clocks_async(routed, period_of, &|_, _| false)
+}
+
+/// Like [`analyze_clocks`], where `is_async(launch, capture)` names clock
+/// pairs declared asynchronous (`set_clock_groups -asynchronous`). Between
+/// those, a flop's D may come straight from another flop's Q (a
+/// synchronizer's first stage, or data held stable by a handshake); any
+/// logic on such a path is still an error. The path is still timed, against
+/// the capturing clock's period.
+pub fn analyze_clocks_async(
+    routed: &Routed7,
+    period_of: &dyn Fn(&str) -> Option<u32>,
+    is_async: &dyn Fn(&str, &str) -> bool,
+) -> Result<Analysis, String> {
+    let mut domains: Vec<&str> = routed.placed.packed.ffs.iter().map(|f| f.clk_net.as_str()).chain(routed.placed.packed.lutrams.iter().map(|r| r.clk.as_str())).collect();
     domains.sort();
     domains.dedup();
     if domains.len() > 1 {
-        check_no_crossings(&routed.placed.packed)?;
+        check_no_crossings(&routed.placed.packed, is_async)?;
     }
     let mut worst: Option<Analysis> = None;
     let (mut endpoints, mut failing) = (0usize, 0usize);
@@ -319,7 +333,7 @@ pub fn analyze_clocks(routed: &Routed7, period_of: &dyn Fn(&str) -> Option<u32>)
 
 /// Every flop input's combinational fan-in reaches flops of its own clock
 /// only.
-fn check_no_crossings(packed: &crate::pack::Packed7) -> Result<(), String> {
+fn check_no_crossings(packed: &crate::pack::Packed7, is_async: &dyn Fn(&str, &str) -> bool) -> Result<(), String> {
     let lut_by_out: HashMap<&str, &crate::pack::PackedLut> = packed.luts.iter().map(|l| (l.output_net.as_str(), l)).collect();
     let ff_by_q: HashMap<&str, &crate::pack::PackedFf> = packed.ffs.iter().map(|f| (f.q_net.as_str(), f)).collect();
     let mut carry_ins: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -373,7 +387,11 @@ fn check_no_crossings(packed: &crate::pack::Packed7) -> Result<(), String> {
         if !ff.sr_async {
             ins.extend(ff.sr_net.iter().map(|s| s.as_str()));
         }
-        for i in ins {
+        for (k, i) in ins.into_iter().enumerate() {
+            // A declared-asynchronous crossing straight from a flop into D.
+            if k == 0 && ff_by_q.get(i).is_some_and(|src| is_async(&src.clk_net, &ff.clk_net)) {
+                continue;
+            }
             for c in launches(i, &mut memo, &lut_by_out, &ff_by_q, &carry_ins, 0) {
                 if c != ff.clk_net {
                     return Err(format!(
@@ -448,6 +466,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         route: &dyn Fn(&str, &str, &str, bool) -> u32,
         bram_out: &HashMap<&'a str, &'a str>,
         xy_of: &HashMap<&'a str, (i32, i32)>,
+        lr: &HashMap<&'a str, crate::lutram::ReadArc<'a>>,
     ) -> Result<(u32, Vec<PathStep>), String> {
         if let Some(x) = memo.get(net) {
             return Ok(x.clone());
@@ -457,6 +476,19 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         }
         let r = if let Some(b) = bram_out.get(net) {
             (BRAM_CKO_PS, vec![PathStep { what: format!("{b} (block RAM DO)"), arrival_ps: BRAM_CKO_PS, wire_ps: 0, xy: None }])
+        } else if let Some(r) = lr.get(net) {
+            // LUT RAM: launched by its clock, or read from its address pins.
+            let mut best = (r.cko_ps, vec![PathStep { what: format!("{} (LUT RAM, clock {}, {})", r.name, r.clk, r.site), arrival_ps: r.cko_ps, wire_ps: 0, xy: None }]);
+            for (inn, pin) in &r.ins {
+                let (a, mut p) = arrival(inn, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, xy_of, lr)?;
+                let w = route(inn, r.site, pin, false);
+                let t = a + w + r.read_ps;
+                if !p.is_empty() && t > best.0 {
+                    p.push(PathStep { what: format!("{} (LUT RAM read)", r.name), arrival_ps: t, wire_ps: w, xy: None });
+                    best = (t, p);
+                }
+            }
+            best
         } else if ff_by_q.contains_key(net) {
             let f = ff_by_q[net];
             (FF_CKQ_PS, vec![PathStep { what: format!("{} (flop Q, clock {}, {})", f.name, f.clk_net, site_of.get(f.name.as_str()).copied().unwrap_or("?")), arrival_ps: FF_CKQ_PS, wire_ps: 0, xy: xy_of.get(f.name.as_str()).copied() }])
@@ -467,7 +499,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             let mut wire = 0;
             for (k, inn) in l.input_nets.iter().enumerate() {
                 let Some(inn) = inn else { continue };
-                let (a, p) = arrival(inn, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, xy_of)?;
+                let (a, p) = arrival(inn, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, xy_of, lr)?;
                 if p.is_empty() {
                     continue; // launched by a pad or constant: unconstrained
                 }
@@ -491,7 +523,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             let mut wire = 0;
             let upto = j.map(|j| j + 1).unwrap_or(4);
             for s in c.s_nets.iter().take(upto).flatten() {
-                let (a, p) = arrival(s, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, xy_of)?;
+                let (a, p) = arrival(s, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, xy_of, lr)?;
                 if p.is_empty() {
                     continue;
                 }
@@ -502,7 +534,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
                 }
             }
             if c.cyinit.is_none() && !c.ci_net.is_empty() {
-                let (a, p) = arrival(&c.ci_net, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, xy_of)?;
+                let (a, p) = arrival(&c.ci_net, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, xy_of, lr)?;
                 let cascade = carry_by_net.get(c.ci_net.as_str()).map(|(_, j)| j.is_none()).unwrap_or(false);
                 let w = if cascade { 0 } else { route(&c.ci_net, site, "AX", false) };
                 if !p.is_empty() && (a + w > best.0 || best.1.is_empty()) {
@@ -554,6 +586,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             }
         }
     }
+    let lr = crate::lutram::read_arcs(placed);
     let mut visiting = HashSet::new();
     let mut wns = i64::MAX;
     let mut worst_path = Vec::new();
@@ -577,7 +610,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             }
         }
         for (net, pin, internal) in inputs {
-            let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &&bram_out, &xy_of)?;
+            let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &&bram_out, &xy_of, &lr)?;
             if p.is_empty() {
                 continue; // driven by an input pad or a constant: unconstrained
             }
@@ -595,8 +628,29 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             }
         }
     }
+    // LUT RAM writes: data, write address and enable, against this clock.
+    for (net, site, pin, setup, clk) in crate::lutram::write_ends(placed) {
+        if clk != domain {
+            continue;
+        }
+        let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &bram_out, &xy_of, &lr)?;
+        if p.is_empty() {
+            continue;
+        }
+        let t = a + route(net, site, pin, false);
+        endpoints += 1;
+        let slack = period_ps as i64 - setup as i64 - MARGIN_PS as i64 - t as i64;
+        if slack < 0 {
+            failing += 1;
+        }
+        if slack < wns {
+            wns = slack;
+            p.push(PathStep { what: format!("{site}.{pin} (LUT RAM input)"), arrival_ps: t, wire_ps: t - a, xy: None });
+            worst_path = p;
+        }
+    }
     for (net, site, sp) in &bram_in {
-        let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &bram_out, &xy_of)?;
+        let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &bram_out, &xy_of, &lr)?;
         if p.is_empty() {
             continue;
         }
@@ -689,10 +743,17 @@ mod tests {
             ffs: vec![ff("a", "pa", "qa", "clk_a"), ff("b", "x", "qb", "clk_a")],
             ..Default::default()
         };
-        assert!(check_no_crossings(&p).is_ok());
+        assert!(check_no_crossings(&p, &|_, _| false).is_ok());
         p.ffs[1].clk_net = "clk_b".into();
-        let err = check_no_crossings(&p).unwrap_err();
+        let err = check_no_crossings(&p, &|_, _| false).unwrap_err();
         assert!(err.contains("from clock `clk_a`") && err.contains("flop b"), "got: {err}");
+        // Declared asynchronous: still refused through logic (the inverter),
+        // allowed straight from a flop (a synchronizer's first stage).
+        let asy = |a: &str, b: &str| a != b;
+        assert!(check_no_crossings(&p, &asy).is_err());
+        p.ffs[1].d_net = "qa".into();
+        assert!(check_no_crossings(&p, &asy).is_ok());
+        assert!(check_no_crossings(&p, &|_, _| false).is_err());
     }
 
     #[test]
