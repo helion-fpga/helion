@@ -193,25 +193,28 @@ impl LiveNetlist {
         }
         ports_in.sort();
         ports_out.sort();
-        let inst_names: Vec<String> = d
+        let mut inst_names: Vec<String> = d
             .instances
             .iter()
             .map(|i| helion_ir::resolve(i.name).to_string())
             .collect();
+        inst_names.sort();
+        let mut owned: HashMap<&str, usize> = HashMap::new();
+        for c in &cells {
+            if let Some(o) = owner_prefix(&c.name, |p| inst_names.binary_search_by(|n| n.as_str().cmp(p)).is_ok()) {
+                *owned.entry(o).or_insert(0) += 1;
+            }
+        }
         let hier: Vec<LiveHier> = d
             .instances
             .iter()
             .map(|i| {
                 let name = helion_ir::resolve(i.name).to_string();
-                let owned = cells
-                    .iter()
-                    .filter(|c| owner_of(&inst_names, &c.name).as_deref() == Some(&name))
-                    .count();
                 LiveHier {
+                    cells: owned.get(name.as_str()).copied().unwrap_or(0),
                     name,
                     module: helion_ir::resolve(i.module).to_string(),
                     conns: i.conns.len(),
-                    cells: owned,
                 }
             })
             .collect();
@@ -251,13 +254,9 @@ impl LiveNetlist {
 
     /// Owning real instance of a cell/net name, if any.
     pub fn owner_of(&self, name: &str) -> Option<&str> {
-        let names: Vec<String> = self.hier.iter().map(|h| h.name.clone()).collect();
-        owner_of(&names, name).and_then(|o| {
-            self.hier
-                .iter()
-                .find(|h| h.name == o)
-                .map(|h| h.name.as_str())
-        })
+        owner_prefix(name, |p| self.hier_of(p).is_some())
+            .and_then(|o| self.hier_of(o))
+            .map(|h| h.name.as_str())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -266,19 +265,17 @@ impl LiveNetlist {
 }
 
 /// Longest-match owner by the synth `{inst}_` prefix rule (`/` and `.`
-/// separators accepted for other front ends).
-fn owner_of(instances: &[String], name: &str) -> Option<String> {
-    let mut best: Option<&str> = None;
-    for inst in instances {
-        let owned = name == inst
-            || name.starts_with(&format!("{inst}_"))
-            || name.starts_with(&format!("{inst}/"))
-            || name.starts_with(&format!("{inst}."));
-        if owned && best.is_none_or(|b: &str| inst.len() > b.len()) {
-            best = Some(inst);
-        }
+/// separators accepted for other front ends): the name itself, then each
+/// prefix that ends before a separator, longest first.
+fn owner_prefix(name: &str, is_inst: impl Fn(&str) -> bool) -> Option<&str> {
+    if is_inst(name) {
+        return Some(name);
     }
-    best.map(str::to_string)
+    name.char_indices()
+        .rev()
+        .filter(|&(_, ch)| matches!(ch, '_' | '/' | '.'))
+        .map(|(i, _)| &name[..i])
+        .find(|p| is_inst(p))
 }
 
 /// One placed cell: engine name plus its real site/BEL from the placer.
@@ -593,6 +590,13 @@ mod tests {
             None,
             "top-level cells have no owner"
         );
+        let insts = ["u_a", "u_a_b", "u.c"];
+        let is = |p: &str| insts.contains(&p);
+        assert_eq!(owner_prefix("u_a_b_x", is), Some("u_a_b"), "longest instance wins");
+        assert_eq!(owner_prefix("u_a_bx", is), Some("u_a"));
+        assert_eq!(owner_prefix("u.c/x_y", is), Some("u.c"));
+        assert_eq!(owner_prefix("u_a", is), Some("u_a"));
+        assert_eq!(owner_prefix("u_ab", is), None);
         let owned: usize = live.hier.iter().map(|h| h.cells).sum();
         assert!(
             owned < live.cells.len(),
