@@ -132,9 +132,13 @@ pub fn synth(sources: &[(String, String)], top: Option<&str>, defines: &[(String
     if !defines.iter().any(|d| d.0 == "SYNTHESIS") {
         defines.push(("SYNTHESIS".into(), String::new()));
     }
+    let carry = dag::carry_arith();
     std::thread::Builder::new()
         .stack_size(1 << 30)
-        .spawn(move || run(&sources, top.as_deref(), &defines, dirs))
+        .spawn(move || {
+            dag::set_carry_arith(carry);
+            run(&sources, top.as_deref(), &defines, dirs)
+        })
         .map_err(|e| format!("cannot start the synthesis thread: {e}"))?
         .join()
         .map_err(|_| "internal error: synthesis panicked".to_string())?

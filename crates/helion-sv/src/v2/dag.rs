@@ -488,6 +488,10 @@ impl Dag {
                 }
             }
         }
+        if w > PREFIX_MIN_W && carry_arith() {
+            // The netlist builds a Wallace tree with one carry chain.
+            return self.intern(Op::Mul(a, b), w);
+        }
         // Shift-and-add over named partial sums (no `*` in the emitted SV).
         let (a, b) = if self.as_const(a).is_some() {
             (b, a)
@@ -915,7 +919,7 @@ impl Dag {
 }
 
 /// Adders/comparators wider than this become parallel-prefix gate logic.
-const PREFIX_MIN_W: u32 = 4;
+pub(super) const PREFIX_MIN_W: u32 = 4;
 
 thread_local! {
     static CARRY_ARITH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -923,7 +927,9 @@ thread_local! {
 
 /// Keep wide adders, subtractors and comparators as `+` on named buses, for
 /// a back end that maps them to dedicated carry chains, instead of
-/// lowering them to parallel-prefix gates.
+/// lowering them to parallel-prefix gates. The Xilinx flow sets it; it also
+/// selects the netlist's Wallace-tree multiplier and its deeper logic
+/// optimization (AND-tree balancing, two-level rules, more cuts).
 pub fn set_carry_arith(on: bool) {
     CARRY_ARITH.with(|c| c.set(on));
 }

@@ -20,11 +20,13 @@ pub struct Aig {
     /// Fan-ins of AND nodes; `(u32::MAX, _)` marks an input or the constant.
     nodes: Vec<(Lit, Lit)>,
     strash: HashMap<(Lit, Lit), u32>,
+    /// Two-level AND rules (the Xilinx flow's deeper optimization).
+    two_level: bool,
 }
 
 impl Aig {
     pub fn new() -> Self {
-        Aig { nodes: vec![(u32::MAX, 0)], strash: HashMap::new() }
+        Aig { nodes: vec![(u32::MAX, 0)], strash: HashMap::new(), two_level: super::dag::carry_arith() }
     }
     pub fn input(&mut self) -> Lit {
         self.nodes.push((u32::MAX, 0));
@@ -40,6 +42,30 @@ impl Aig {
         }
         if a == TRUE || a == b {
             return b;
+        }
+        // Two-level rules: an operand that is itself an AND of the other.
+        for (x, y) in if self.two_level { [(a, b), (b, a)] } else { [(0, 0); 2] } {
+            if y > TRUE && self.is_and(y / 2) {
+                let (p, q) = self.nodes[(y / 2) as usize];
+                if y & 1 == 0 {
+                    if p == x ^ 1 || q == x ^ 1 {
+                        return FALSE; // x & (!x & q)
+                    }
+                    if p == x || q == x {
+                        return y; // x & (x & q)
+                    }
+                } else {
+                    if p == x ^ 1 || q == x ^ 1 {
+                        return x; // x & !(!x & q)
+                    }
+                    if p == x {
+                        return self.and(x, q ^ 1); // x & !(x & q)
+                    }
+                    if q == x {
+                        return self.and(x, p ^ 1);
+                    }
+                }
+            }
         }
         if let Some(&n) = self.strash.get(&(a, b)) {
             return n * 2;
@@ -65,6 +91,72 @@ impl Aig {
         let q = self.and(s ^ 1, b);
         self.or(p, q)
     }
+    /// The logic of `roots` rebuilt with every AND tree balanced by arrival
+    /// level (case and if chains come out of elaboration as linear AND/OR
+    /// chains, which a cut cover cannot shorten). Returns the new graph and
+    /// old node -> new literal for every node built. An input listed in
+    /// `before` (a carry chain sum) is built after the nodes it is computed
+    /// from and arrives one level after them.
+    fn balance(&self, roots: &[Lit], before: &HashMap<u32, Vec<u32>>) -> (Aig, HashMap<u32, Lit>) {
+        let mut refs = vec![0u32; self.nodes.len()];
+        for &(a, b) in &self.nodes {
+            if a != u32::MAX {
+                refs[(a / 2) as usize] += 1;
+                refs[(b / 2) as usize] += 1;
+            }
+        }
+        for &r in roots {
+            refs[(r / 2) as usize] += 1;
+        }
+        let mut st = Bal { new: Aig::new(), lvl: vec![0], memo: HashMap::new() };
+        st.memo.insert(0, FALSE);
+        for &r in roots {
+            self.bal(r / 2, &refs, before, &mut st);
+        }
+        (st.new, st.memo)
+    }
+    fn bal(&self, node: u32, refs: &[u32], before: &HashMap<u32, Vec<u32>>, st: &mut Bal) -> Lit {
+        if let Some(&l) = st.memo.get(&node) {
+            return l;
+        }
+        let l = if !self.is_and(node) {
+            let mut lv = 0;
+            for &k in before.get(&node).map(|v| v.as_slice()).unwrap_or(&[]) {
+                let s = self.bal(k, refs, before, st);
+                lv = lv.max(st.lvl[(s / 2) as usize] + 1);
+            }
+            let l = st.new.input();
+            st.lvl.push(lv);
+            l
+        } else {
+            // The supergate: AND inputs through uninverted single-fanout ANDs.
+            let (a, b) = self.nodes[node as usize];
+            let (mut leaves, mut stack) = (Vec::new(), vec![a, b]);
+            while let Some(f) = stack.pop() {
+                let m = (f / 2) as usize;
+                if f & 1 == 0 && self.is_and(m as u32) && refs[m] == 1 {
+                    stack.extend([self.nodes[m].0, self.nodes[m].1]);
+                } else {
+                    leaves.push(f);
+                }
+            }
+            let mut items: Vec<Lit> = leaves.iter().map(|&f| self.bal(f / 2, refs, before, st) ^ (f & 1)).collect();
+            // Pair the two earliest arrivals until one is left.
+            while items.len() > 1 {
+                items.sort_by_key(|&x| std::cmp::Reverse(st.lvl[(x / 2) as usize]));
+                let (x, y) = (items.pop().unwrap(), items.pop().unwrap());
+                let z = st.new.and(x, y);
+                if (z / 2) as usize >= st.lvl.len() {
+                    let lv = 1 + st.lvl[(x / 2) as usize].max(st.lvl[(y / 2) as usize]);
+                    st.lvl.push(lv);
+                }
+                items.push(z);
+            }
+            items[0]
+        };
+        st.memo.insert(node, l);
+        l
+    }
     fn tree(&mut self, mut v: Vec<Lit>, f: fn(&mut Aig, Lit, Lit) -> Lit, empty: Lit) -> Lit {
         if v.is_empty() {
             return empty;
@@ -78,6 +170,13 @@ impl Aig {
         }
         v[0]
     }
+}
+
+struct Bal {
+    new: Aig,
+    /// Level of each node of `new`.
+    lvl: Vec<u32>,
+    memo: HashMap<u32, Lit>,
 }
 
 /// What drives one bit of a signal.
@@ -135,6 +234,19 @@ pub struct SigInfo {
 
 /// The flops of one clocked process for one signal: bit `i` is a flop when
 /// `mask[i]`, with data input bit `i` of `d`.
+/// The part of a concatenation (MSB first) holding bit `i`, and the bit in it.
+fn concat_part(dag: &Dag, parts: &[N], i: u32) -> Result<(N, u32), String> {
+    let mut off = 0;
+    for p in parts.iter().rev() {
+        let pw = dag.w(*p);
+        if i < off + pw {
+            return Ok((*p, i - off));
+        }
+        off += pw;
+    }
+    Err("internal: concat bit out of range".into())
+}
+
 pub struct Reg {
     pub sig: u32,
     pub d: N,
@@ -264,6 +376,18 @@ struct Blaster<'a> {
     live_regs: Vec<(u32, u32)>,
     hints: Vec<(Lit, u32, u32)>,
     undriven: Vec<String>,
+    /// Adders kept for a dedicated carry chain (see `dag::carry_arith`).
+    chains: Vec<Chain>,
+}
+
+/// An adder on a CARRY4 chain: bits `lo..` of `x + y + cin`, each sum bit
+/// an AIG input (the chain's O pin) so the cover treats it as a leaf.
+struct Chain {
+    lo: usize,
+    xs: Vec<Lit>,
+    ys: Vec<Lit>,
+    cin: bool,
+    sums: Vec<Lit>,
 }
 
 impl<'a> Blaster<'a> {
@@ -314,6 +438,55 @@ impl<'a> Blaster<'a> {
         Ok(l)
     }
 
+    /// `xs + ys + cin` on a carry chain. Constant low bits (the `1 + 1` of
+    /// `a + b + 1`) fold into the carry in; constant high bits (operands
+    /// widened to 32 bits) take only the chain's carry out. A short chain,
+    /// or one with a constant side, is plain logic the AIG simplifies (the
+    /// `31 - i` of an array index is `!i`).
+    fn chain(&mut self, xs: Vec<Lit>, ys: Vec<Lit>, cin: bool) -> Vec<Lit> {
+        let w = xs.len();
+        let (mut c, mut sums) = (cin, Vec::with_capacity(w));
+        while sums.len() < w && xs[sums.len()] <= TRUE && ys[sums.len()] <= TRUE {
+            let (x, y) = (xs[sums.len()] == TRUE, ys[sums.len()] == TRUE);
+            sums.push(if x ^ y ^ c { TRUE } else { FALSE });
+            c = (x && y) || (c && (x ^ y));
+        }
+        let lo = sums.len();
+        let konst = |l: Lit| l <= TRUE;
+        let hi = (lo..w).rev().find(|&k| !konst(xs[k]) || !konst(ys[k])).map_or(lo, |k| k + 1);
+        let one_side = (lo..hi).all(|k| konst(xs[k])) || (lo..hi).all(|k| konst(ys[k]));
+        let mut cl = if c { TRUE } else { FALSE };
+        let ripple = |bl: &mut Self, sums: &mut Vec<Lit>, cl: &mut Lit, k: usize| {
+            let p = bl.aig.xor(xs[k], ys[k]);
+            sums.push(bl.aig.xor(p, *cl));
+            let (g, t) = (bl.aig.and(xs[k], ys[k]), bl.aig.and(p, *cl));
+            *cl = bl.aig.or(g, t);
+        };
+        if hi - lo <= super::dag::PREFIX_MIN_W as usize || (one_side && hi - lo <= 8) {
+            for k in lo..w {
+                ripple(self, &mut sums, &mut cl, k);
+            }
+            return sums;
+        }
+        // The chain runs one bit past the varying part, so that bit's sum
+        // gives the carry out (both its operands are constants).
+        let top = (hi + 1).min(w);
+        while sums.len() < top {
+            let l = self.aig.input();
+            sums.push(l);
+        }
+        self.chains.push(Chain { lo, xs: xs[..top].to_vec(), ys: ys[..top].to_vec(), cin: c, sums: sums.clone() });
+        if top < w {
+            cl = sums[hi] ^ ((xs[hi] ^ ys[hi]) & 1);
+            let (g, t) = (self.aig.and(xs[hi], ys[hi]), self.aig.and(xs[hi] ^ ys[hi], cl));
+            cl = self.aig.or(g, t);
+            for k in top..w {
+                ripple(self, &mut sums, &mut cl, k);
+            }
+        }
+        sums
+    }
+
     fn all(&mut self, n: N) -> Result<Vec<Lit>, String> {
         (0..self.flat.dag.w(n)).map(|i| self.bit(n, i)).collect()
     }
@@ -339,6 +512,44 @@ impl<'a> Blaster<'a> {
         Ok(self.carries[&n][i as usize])
     }
 
+    /// Bit `i` of `n` as the next value of bit `rbit` of register `sig`:
+    /// `(enable, data)`, the flop loading `data` when `enable` is 1 and
+    /// keeping its value otherwise (`data` is `None` where it always keeps
+    /// it). Holds are found in the select tree only.
+    fn enable(&mut self, n: N, i: u32, sig: u32, rbit: u32, memo: &mut HashMap<(N, u32), (Lit, Option<Lit>)>) -> Result<(Lit, Option<Lit>), String> {
+        if let Some(&r) = memo.get(&(n, i)) {
+            return Ok(r);
+        }
+        let dag = &self.flat.dag;
+        let r = match dag.op(n).clone() {
+            Op::Read(s) if s == sig && i == rbit => (FALSE, None),
+            Op::Slice(a, lo) => self.enable(a, lo + i, sig, rbit, memo)?,
+            Op::Concat(parts) => {
+                let (p, k) = concat_part(dag, &parts, i)?;
+                self.enable(p, k, sig, rbit, memo)?
+            }
+            Op::Mux(s, a, b) => {
+                let (ea, da) = self.enable(a, i, sig, rbit, memo)?;
+                let (eb, db) = self.enable(b, i, sig, rbit, memo)?;
+                if ea == TRUE && eb == TRUE {
+                    (TRUE, Some(self.bit(n, i)?))
+                } else {
+                    let sel = self.bit(s, 0)?;
+                    let en = self.aig.mux(sel, ea, eb);
+                    // Where one side keeps the value, its data is never loaded.
+                    let data = match (da, db) {
+                        (Some(x), Some(y)) => Some(self.aig.mux(sel, x, y)),
+                        (x, None) | (None, x) => x,
+                    };
+                    (en, data)
+                }
+            }
+            _ => (TRUE, Some(self.bit(n, i)?)),
+        };
+        memo.insert((n, i), r);
+        Ok(r)
+    }
+
     fn bit(&mut self, n: N, i: u32) -> Result<Lit, String> {
         if let Some(&l) = self.memo.get(&(n, i)) {
             return Ok(l);
@@ -354,17 +565,7 @@ impl<'a> Blaster<'a> {
             Op::Hold(_) | Op::VHold(_) => return Err("internal: a hold value reached the netlist".into()),
             Op::Slice(a, lo) => self.bit(a, lo + i)?,
             Op::Concat(parts) => {
-                let mut off = 0;
-                let mut found = None;
-                for p in parts.iter().rev() {
-                    let pw = dag.w(*p);
-                    if i < off + pw {
-                        found = Some((*p, i - off));
-                        break;
-                    }
-                    off += pw;
-                }
-                let (p, k) = found.ok_or("internal: concat bit out of range")?;
+                let (p, k) = concat_part(dag, &parts, i)?;
                 self.bit(p, k)?
             }
             Op::Not(a) => self.bit(a, i)? ^ 1,
@@ -380,6 +581,16 @@ impl<'a> Blaster<'a> {
                 let (x, y) = (self.bit(a, i)?, self.bit(b, i)?);
                 self.aig.xor(x, y)
             }
+            Op::Add(a, b) | Op::Sub(a, b) if w > super::dag::PREFIX_MIN_W && super::dag::carry_arith() => {
+                if !self.whole.contains_key(&n) {
+                    let inv = matches!(dag.op(n), Op::Sub(..));
+                    let xs = self.all(a)?;
+                    let ys: Vec<Lit> = self.all(b)?.into_iter().map(|y| y ^ inv as u32).collect();
+                    let sums = self.chain(xs, ys, inv);
+                    self.whole.insert(n, sums);
+                }
+                self.whole[&n][i as usize]
+            }
             Op::Add(a, b) | Op::Sub(a, b) => {
                 let inv = matches!(dag.op(n), Op::Sub(..));
                 let c = self.carry(n, a, b, inv, i)?;
@@ -389,6 +600,61 @@ impl<'a> Blaster<'a> {
                 self.aig.xor(p, c)
             }
             Op::Mul(a, b) => {
+                if !self.whole.contains_key(&n) && w > super::dag::PREFIX_MIN_W && super::dag::carry_arith() {
+                    // Wallace tree: full adders cut every column to two rows
+                    // in log depth, then one carry chain adds the rows.
+                    let (mut x, mut y) = (self.all(a)?, self.all(b)?);
+                    let w = w as usize;
+                    // Top bits of y that repeat one literal (a sign extension) from k0 up.
+                    let run = |v: &[Lit]| w - 1 - v.iter().rev().skip(1).take_while(|&&l| l == v[w - 1]).count();
+                    if run(&x) < run(&y) {
+                        std::mem::swap(&mut x, &mut y);
+                    }
+                    let k0 = run(&y);
+                    let mut cols: Vec<Vec<Lit>> = vec![Vec::new(); w];
+                    for (k, &yk) in y.iter().enumerate().take(k0) {
+                        for j in k..w {
+                            let t = self.aig.and(x[j - k], yk);
+                            if t != FALSE {
+                                cols[j].push(t);
+                            }
+                        }
+                    }
+                    // Rows k0.. are ys & x << k, which sum to -(ys & x) << k0
+                    // modulo 2^w: ys & !x << k0, plus ys at bit k0.
+                    let ys = y[w - 1];
+                    if k0 < w && ys != FALSE {
+                        for j in k0..w {
+                            let t = self.aig.and(x[j - k0] ^ 1, ys);
+                            if t != FALSE {
+                                cols[j].push(t);
+                            }
+                        }
+                        cols[k0].push(ys);
+                    }
+                    while cols.iter().any(|c| c.len() > 2) {
+                        let mut next: Vec<Vec<Lit>> = vec![Vec::new(); w];
+                        for j in 0..w {
+                            let mut it = cols[j].chunks_exact(3);
+                            for t in &mut it {
+                                let p = self.aig.xor(t[0], t[1]);
+                                next[j].push(self.aig.xor(p, t[2]));
+                                if j + 1 < w {
+                                    let g = self.aig.and(t[0], t[1]);
+                                    let h = self.aig.and(p, t[2]);
+                                    let co = self.aig.or(g, h);
+                                    next[j + 1].push(co);
+                                }
+                            }
+                            next[j].extend_from_slice(it.remainder());
+                        }
+                        cols = next;
+                    }
+                    let row = |r: usize| cols.iter().map(|c| c.get(r).copied().unwrap_or(FALSE)).collect::<Vec<Lit>>();
+                    let (r0, r1) = (row(0), row(1));
+                    let sums = self.chain(r0, r1, false);
+                    self.whole.insert(n, sums);
+                }
                 if !self.whole.contains_key(&n) {
                     let (x, y) = (self.all(a)?, self.all(b)?);
                     let w = w as usize;
@@ -455,7 +721,10 @@ impl<'a> Blaster<'a> {
 }
 
 const K: usize = 6;
-const CUTS: usize = 8;
+/// Priority cuts kept per node: more for the Xilinx flow (fewer levels).
+fn cuts() -> usize {
+    if super::dag::carry_arith() { 24 } else { 8 }
+}
 const VAR: [u64; 6] = [
     0xAAAA_AAAA_AAAA_AAAA,
     0xCCCC_CCCC_CCCC_CCCC,
@@ -526,7 +795,9 @@ struct Mapper {
 }
 
 impl Mapper {
-    fn run(aig: &Aig) -> Self {
+    /// `arrive` gives an input node the nodes it is computed from (a carry
+    /// chain's sum bit); its depth is one more than theirs.
+    fn run(aig: &Aig, arrive: &HashMap<u32, Vec<u32>>) -> Self {
         let n = aig.nodes.len();
         let mut refs = vec![0u32; n];
         for &(a, b) in &aig.nodes {
@@ -539,6 +810,9 @@ impl Mapper {
         for i in 0..n {
             let (a, b) = aig.nodes[i];
             if a == u32::MAX {
+                if let Some(src) = arrive.get(&(i as u32)) {
+                    m.depth[i] = 1 + src.iter().map(|&k| m.depth[k as usize]).max().unwrap_or(0);
+                }
                 continue;
             }
             let (na, nb) = ((a / 2) as usize, (b / 2) as usize);
@@ -558,7 +832,7 @@ impl Mapper {
                 }
             }
             cand.sort_by(|p, q| p.3.cmp(&q.3).then(p.4.partial_cmp(&q.4).unwrap()).then(p.0.len().cmp(&q.0.len())));
-            cand.truncate(CUTS);
+            cand.truncate(cuts());
             let mut out = Vec::with_capacity(cand.len());
             for (leaves, ia, ib, depth, flow) in cand {
                 let mut ta = expand(ca[ia].tt, &ca[ia].leaves, &leaves);
@@ -614,6 +888,7 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
         live_regs: Vec::new(),
         hints: Vec::new(),
         undriven: Vec::new(),
+        chains: Vec::new(),
     };
     // Roots: output bits, then the data and clock of every flop whose
     // output something uses.
@@ -646,6 +921,8 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
         clk: Lit,
         negedge: bool,
         arst: Option<(Lit, bool)>,
+        /// Clock enable (Xilinx flow), else the hold is a mux in front of D.
+        ce: Option<Lit>,
     }
     let mut reg_bits: Vec<RegBit> = Vec::new();
     // Every hard cell is built; its inputs are roots.
@@ -659,11 +936,20 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
         done += 1;
         let Drv::Reg(ri) = flat.sigs[sig as usize].drv[bit as usize] else { unreachable!() };
         let r = &flat.regs[ri as usize];
-        let mut d = bl.bit(r.d, bit)?;
+        let ((cn, cb), enables) = clock_shape(flat, r.clk);
+        // Xilinx flow: holds in the next value's select tree and clock
+        // gates drive the flop's CE pin instead of a mux in front of D.
+        let xil = super::dag::carry_arith();
+        let (mut d, mut ce) = match xil {
+            true => match bl.enable(r.d, bit, sig, bit, &mut HashMap::new())? {
+                (en, Some(data)) if en != FALSE => (data, en),
+                _ => (bl.bit(r.d, bit)?, TRUE),
+            },
+            false => (bl.bit(r.d, bit)?, TRUE),
+        };
         if flat.sigs[sig as usize].init[bit as usize] {
             d ^= 1;
         }
-        let ((cn, cb), enables) = clock_shape(flat, r.clk);
         if !enables.is_empty() {
             // Gated clock: keep the stored value unless every gate is open.
             let q = bl.sig_bit[&(sig, bit)] ^ (flat.sigs[sig as usize].init[bit as usize] as u32);
@@ -672,8 +958,13 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
                 let e = bl.bit(en_n, en_b)?;
                 en = bl.aig.and(en, e);
             }
-            d = bl.aig.mux(en, d, q);
+            if xil {
+                ce = bl.aig.and(ce, en);
+            } else {
+                d = bl.aig.mux(en, d, q);
+            }
         }
+        let ce = (ce != TRUE).then_some(ce);
         let clk = bl.bit(cn, cb)?;
         let arst = match r.arst {
             Some((n, level)) if r.arst_mask[bit as usize] => {
@@ -683,10 +974,83 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
             }
             _ => None,
         };
-        reg_bits.push(RegBit { sig, bit, d, clk, negedge: r.negedge, arst });
+        reg_bits.push(RegBit { sig, bit, d, clk, negedge: r.negedge, arst, ce });
     }
-    let Blaster { aig, pi_name, hints, undriven, sig_bit, .. } = bl;
-    let map = Mapper::run(&aig);
+    // Each enable is a slice control set: one shared by only a few flops
+    // costs slice space for nothing, so those keep the mux in front of D.
+    const CE_MIN_FLOPS: usize = 4;
+    let mut ce_uses: HashMap<Lit, usize> = HashMap::new();
+    for c in reg_bits.iter().filter_map(|rb| rb.ce) {
+        *ce_uses.entry(c).or_default() += 1;
+    }
+    for rb in &mut reg_bits {
+        if let Some(c) = rb.ce.filter(|c| *c == FALSE || ce_uses[c] < CE_MIN_FLOPS) {
+            let q = bl.sig_bit[&(rb.sig, rb.bit)] ^ (flat.sigs[rb.sig as usize].init[rb.bit as usize] as u32);
+            rb.d = bl.aig.mux(c, rb.d, q);
+            rb.ce = None;
+        }
+    }
+    let Blaster { aig, pi_name, hints, undriven, mut chains, mut sig_bit, .. } = bl;
+    let (aig, pi_name, hints) = if !super::dag::carry_arith() {
+        (aig, pi_name, hints)
+    } else {
+        let mut roots: Vec<Lit> = out_bits.iter().map(|o| o.2).chain(debug_bits.iter().map(|o| o.2)).collect();
+        for rb in &reg_bits {
+            roots.extend([rb.d, rb.clk]);
+            roots.extend(rb.arst.map(|a| a.0));
+            roots.extend(rb.ce);
+        }
+        // Block RAM / DSP inputs are roots too (their outputs are inputs).
+        roots.extend(hard_ins.iter().flatten());
+        let mut before: HashMap<u32, Vec<u32>> = HashMap::new();
+        for ch in &chains {
+            roots.extend(ch.xs.iter().chain(&ch.ys).chain(&ch.sums[ch.lo..]));
+            for k in ch.lo..ch.sums.len() {
+                before.insert(ch.sums[k] / 2, ch.xs[ch.lo..=k].iter().chain(&ch.ys[ch.lo..=k]).map(|l| l / 2).collect());
+            }
+        }
+        let (new, memo) = aig.balance(&roots, &before);
+        let m = |l: Lit| memo.get(&(l / 2)).map(|&n| n ^ (l & 1));
+        for o in &mut out_bits {
+            o.2 = m(o.2).unwrap();
+        }
+        for o in &mut debug_bits {
+            o.2 = m(o.2).unwrap();
+        }
+        for rb in &mut reg_bits {
+            rb.d = m(rb.d).unwrap();
+            rb.clk = m(rb.clk).unwrap();
+            if let Some(a) = &mut rb.arst {
+                a.0 = m(a.0).unwrap();
+            }
+            rb.ce = rb.ce.map(|c| m(c).unwrap());
+        }
+        for ch in &mut chains {
+            for l in ch.xs.iter_mut().chain(ch.ys.iter_mut()).chain(ch.sums.iter_mut()) {
+                *l = m(*l).unwrap_or(*l);
+            }
+        }
+        for ins in &mut hard_ins {
+            for l in ins.iter_mut() {
+                *l = m(*l).unwrap();
+            }
+        }
+        // Hard-cell outputs are found by signal bit; an unread one is dropped
+        // here and stays open below, as before.
+        sig_bit = sig_bit.into_iter().filter_map(|(k, l)| m(l).map(|n| (k, n))).collect();
+        let pi: Vec<(Lit, u32, u32)> = pi_name.into_iter().filter_map(|(l, s, b)| m(l).map(|n| (n, s, b))).collect();
+        let hints: Vec<(Lit, u32, u32)> = hints.into_iter().filter_map(|(l, s, b)| m(l).map(|n| (n, s, b))).collect();
+        (new, pi, hints)
+    };
+    let mut arrive: HashMap<u32, Vec<u32>> = HashMap::new();
+    for ch in &chains {
+        let mut src = Vec::new();
+        for k in ch.lo..ch.sums.len() {
+            src.extend([ch.xs[k] / 2, ch.ys[k] / 2]);
+            arrive.insert(ch.sums[k] / 2, src.clone());
+        }
+    }
+    let map = Mapper::run(&aig, &arrive);
 
     let mut d = Design::new(&flat.top);
     for p in &flat.ports {
@@ -835,6 +1199,72 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
         }
     }
 
+    // Carry chains: name every sum bit first (chains and logic may feed
+    // each other), then write the CARRY4 cells in the IR convention pack
+    // reads: S from a LUT of its own, DI the generate, O the sum.
+    for ch in &chains {
+        for &l in &ch.sums[ch.lo..] {
+            let name = fresh(hint.get(&l), &mut taken, &n_lut);
+            net_of.insert(l, name);
+        }
+    }
+    for (ci, ch) in chains.iter().enumerate() {
+        let bits = ch.sums.len() - ch.lo;
+        for g in 0..bits.div_ceil(4) {
+            let cell = format!("u_cc{ci}_c{g}");
+            d.add_cell(&cell, CellKind::Carry4);
+            let _ = d.set_cell_attr(&cell, "ADDER", "1");
+            if g == 0 {
+                let _ = d.set_cell_attr(&cell, "CYINIT", if ch.cin { "1" } else { "0" });
+            } else {
+                d.connect(&format!("cc{ci}_co{}", g - 1), &cell, "CI");
+            }
+            if (g + 1) * 4 < bits {
+                taken.insert(format!("cc{ci}_co{g}"));
+                d.connect(&format!("cc{ci}_co{g}"), &cell, "CO");
+            }
+            for j in 0..4.min(bits - g * 4) {
+                let k = ch.lo + g * 4 + j;
+                let (x, y) = (ch.xs[k], ch.ys[k]);
+                // Propagate x ^ y over the true nets, the polarity in the table.
+                let mut ins: Vec<Lit> = Vec::new();
+                for v in [x & !1, y & !1] {
+                    if v > TRUE && !ins.contains(&v) {
+                        ins.push(v);
+                    }
+                }
+                let mut tt = 0u64;
+                for a in 0..64u32 {
+                    let val = |l: Lit| -> bool {
+                        let base = match ins.iter().position(|&v| v == l & !1) {
+                            Some(p) => (a >> p) & 1 == 1,
+                            None => false,
+                        };
+                        base ^ (l & 1 == 1)
+                    };
+                    if val(x) ^ val(y) {
+                        tt |= 1 << a;
+                    }
+                }
+                let s_net = fresh(Some(&format!("cc{ci}_s{k}")), &mut taken, &n_lut);
+                let s_cell = format!("{s_net}_lut");
+                let in_nets: Vec<String> = ins.iter().map(|&v| emit(v, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut)).collect();
+                d.add_cell(&s_cell, CellKind::Lut6 { init: tt });
+                for (p, net) in in_nets.iter().enumerate() {
+                    d.connect(net, &s_cell, &format!("I{p}"));
+                }
+                d.connect(&s_net, &s_cell, "O");
+                n_lut += 1;
+                d.connect(&s_net, &cell, &format!("S{j}"));
+                // With the propagate 0 the operands are equal: either is the generate.
+                let generate = if x & 1 == 0 || y & 1 == 1 { x } else { y };
+                let di = emit(generate, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut);
+                d.connect(&di, &cell, &format!("DI{j}"));
+                d.connect(&net_of[&ch.sums[k]], &cell, &format!("O{j}"));
+            }
+        }
+    }
+
     // Registers.
     let mut regmap = Vec::with_capacity(reg_bits.len());
     for rb in &reg_bits {
@@ -861,6 +1291,11 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
         d.connect(&dnet, &cell, "D");
         d.connect(&q, &cell, "Q");
         d.connect(&cnet, &cell, "CLK");
+        if let Some(c) = rb.ce {
+            depth = depth.max(map.depth[(c / 2) as usize]);
+            let enet = emit(c, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut);
+            d.connect(&enet, &cell, "CE");
+        }
         if let Some((l, level)) = rb.arst {
             // The stored bit is the register XOR its power-up value, and
             // the reset value is that power-up value: the flop resets to 0.
