@@ -4,7 +4,7 @@
 //! ```text
 //! cargo run --release -p helion-xilinx7 --example zedbit -- \
 //!     design.sv[,more.sv...] pins.xdc out.bit [top] [--board=NAME | --part=PART]
-//!     [--front=auto|v2|zb] [--ignore-timing]
+//!     [--front=auto|v2|zb] [--ignore-timing] [--vivado=PREFIX [--vivado-only]]
 //! ```
 //!
 //! The part is the ZedBoard's (`xc7z020clg484-1`) unless `--board` names a
@@ -26,6 +26,11 @@
 //! form and multi-port / wildcard `get_ports`). Every top-level port bit
 //! must have a pin; a missing pin is an error, never a silent default.
 //! The FASM is written next to the bitstream (`out.fasm`).
+//!
+//! `--vivado=PREFIX` also writes Helion's placed design for Vivado to time
+//! (`PREFIX.v`, `.xdc`, `.tcl`, `_noroute.tcl`; see
+//! `helion_xilinx7::vivado_export`); `--vivado-only` stops after that,
+//! before routing.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -199,12 +204,13 @@ fn main() {
         (None, Some(p)) => p,
         (None, None) => "xc7z020clg484-1".to_string(),
     };
+    let vivado = opt("--vivado=").map(|p| (p, all.iter().any(|a| a == "--vivado-only")));
     let args: Vec<String> = all.into_iter().filter(|a| !a.starts_with("--")).collect();
     if args.len() < 4 {
         eprintln!("usage: zedbit <design.vhd|.sv[,more...]> <pins.xdc> <out.bit> [top] [--board=NAME | --part=PART] [--front=auto|v2|zb] [--ignore-timing]");
         std::process::exit(2);
     }
-    if let Err(e) = run(&args[1], &args[2], &args[3], args.get(4).map(|s| s.as_str()), ignore_timing, &front, &part) {
+    if let Err(e) = run(&args[1], &args[2], &args[3], args.get(4).map(|s| s.as_str()), ignore_timing, &front, &part, vivado) {
         eprintln!("zedbit: {e}");
         std::process::exit(1);
     }
@@ -280,7 +286,8 @@ fn xdc_period_ps(text: &str) -> u32 {
     10_000
 }
 
-fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_timing: bool, front: &str, part: &str) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_timing: bool, front: &str, part: &str, vivado: Option<(String, bool)>) -> Result<(), String> {
     let t0 = std::time::Instant::now();
     let (mut design, renames) = synth(design_path, top, front)?;
     let t_synth = t0.elapsed();
@@ -327,6 +334,7 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
         packed.iobs.len()
     );
     let mut missing = Vec::new();
+    let mut iob_keys: HashMap<String, String> = HashMap::new();
     for iob in packed.iobs.iter_mut() {
         let key = match iob_attrs.get(&iob.name) {
             // A scalar port is bit 0 of itself; its XDC names it bare.
@@ -347,6 +355,7 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
                 }
             }
         };
+        iob_keys.insert(iob.name.clone(), key.clone());
         match lookup(&key, "PACKAGE_PIN") {
             Some(pin) => {
                 iob.loc = Some(pin);
@@ -360,7 +369,19 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
     }
     let placed = be.place(&packed)?;
     let t_place = t0.elapsed();
-    eprintln!("zedbit: placed in {:.1}s; routing", (t_place - t_dev).as_secs_f64());
+    eprintln!("zedbit: placed in {:.1}s", (t_place - t_dev).as_secs_f64());
+    if let Some((prefix, only)) = &vivado {
+        let base = Path::new(prefix).file_name().and_then(|s| s.to_str()).ok_or("bad --vivado prefix")?;
+        let f = helion_xilinx7::vivado_export::export(&design, &placed, &iob_keys, &xdc, resolve(design.name), part, base)?;
+        for (ext, text) in [(".v", &f.verilog), (".xdc", &f.xdc), (".tcl", &f.tcl), ("_noroute.tcl", &f.tcl_noroute)] {
+            std::fs::write(format!("{prefix}{ext}"), text).map_err(|e| format!("{prefix}{ext}: {e}"))?;
+        }
+        eprintln!("zedbit: Vivado export written to {prefix}.v/.xdc/.tcl/_noroute.tcl");
+        if *only {
+            return Ok(());
+        }
+    }
+    eprintln!("zedbit: routing");
     let routed = be.route(&placed)?;
     let t_route = t0.elapsed();
     eprintln!("zedbit: routed in {:.1}s", (t_route - t_place).as_secs_f64());
