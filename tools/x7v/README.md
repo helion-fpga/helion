@@ -101,10 +101,14 @@ tried.
   (`DOADO[2k]` lower half, `DOADO[2k+1]` upper) with a shared address, so
   the RAMB36 site itself drives nothing. FIFO, ECC, cascade, the RAMB36
   1-bit mode, per-byte write enables and WRITE_FIRST with unequal read and
-  write widths are reported as extraction errors, not guessed.
+  write widths are reported as extraction errors, not guessed. Address
+  buses routed through the tile cascade wires (`BRAM_CASCINBOT_*` pips)
+  need `CASCOUT_ARD/BWR_ACTIVE` in the driving tile below, as Vivado always
+  sets it. Block RAM content frames carry no ECC (Vivado writes word 50 as 0).
 * DSP (`dsp.py`): each DSP tile holds `DSP48.DSP_0` and `DSP48.DSP_1`,
   decoded from their bits (AREG/BREG with the inverted `ZAREG_2_ACASCREG_1`
-  cascade encoding, the `Z<reg>` register-off bits, A/B_INPUT, USE_DPORT,
+  cascade encoding; X-Ray lacks AREG_1/BREG_1, which Vivado writes as
+  AREG_0's/BREG_0's frame-27 bit alone, the `Z<reg>` register-off bits, A/B_INPUT, USE_DPORT,
   USE_SIMD, AUTORESET_PATDET, SEL_MASK, PATTERN, MASK, `ZIS_*_INVERTED`)
   and modelled by a behavioural Verilog DSP48E1 written from UG479
   (`x7v_dsp48e1`: A/B/C/D/AD/M/P and control registers with CE and reset,
@@ -115,7 +119,6 @@ tried.
   USE_MULT, USE_PATTERN_DETECT and SEL_PATTERN have no X-Ray bit, so
   AUTORESET, MACC extend (OPMODE Z = 100) and any read of PATTERNDETECT,
   PATTERNBDETECT, OVERFLOW, UNDERFLOW or MULTSIGNOUT are extraction errors.
-  Not yet run against a DSP bitstream.
 
 ## Validation (what has been proven, and on what)
 
@@ -133,12 +136,21 @@ shift register, up/down counter, pattern FSM, divider client/server.
   difference is in Vivado's bitstream itself: its state LUT never sees
   `prev_valid`, so the "valid fell -> S0" transition is missing.
 
+Block RAM and DSP against Vivado 2017.3 (`xc7z020clg484-1`) builds of
+examples/zedboard_bram_fill.sv (240 RAMB18, x18 READ_FIRST, address buses
+through the tile cascade) and examples/zedboard_dsp_fill_prims.sv (192
+DSP48E1, AREG = BREG = MREG = PREG = 1, P <= P + A*B): decode 0 unexplained
+bits, ECC equal to Vivado's on every frame, extraction clean, and cosim 0
+mismatches against the RTL (BRAM: 7,000 cycles, all three scans; DSP:
+2,500 cycles with Xilinx's own unisim DSP48E1 as the RTL's model, which
+shares nothing with `x7v_dsp48e1`). `tests/vivado_enc.py` checks the
+encodings these builds taught x7v (and, given `X7V_VIVADO_REF`, the builds).
+
 Not validated against Vivado (no reference design uses them yet): F7/F8 wide
-muxes (modelled, flagged as a warning), LUTRAM/SRL, DSP, MMCM/PLL,
+muxes (modelled, flagged as a warning), LUTRAM/SRL, MMCM/PLL,
 IDDR/ODDR/SERDES, tristate I/O. The extractor reports these as errors rather
 than guessing.
 
-Block RAM is modelled but has no Vivado (or Helion) reference bitstream yet.
 `tests/bram.py` composes its own: a zedbit-built base design plus one RAMB18
 half placed and routed by the test over the X-Ray graph, re-encoded with
 ECC and CRC. Four designs (x18 ROM with non-zero INIT_A, x18 READ_FIRST

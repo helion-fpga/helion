@@ -122,12 +122,12 @@ def decode(db: Db, frames_in: dict[int, list[int]]) -> DesignDecode:
     overlap in their bit windows, so a bit is "unknown" only when no active
     feature in ANY tile covers its absolute (frame, word, bit) position.
     """
-    from .ecc import ECC_MASK, ECC_WORD, frame_ecc
+    from .ecc import ECC_MASK, ECC_WORD, expected_ecc
     ecc_bad: dict[int, tuple[int, int]] = {}
     frames: dict[int, list[int]] = {}
     for far, fr in frames_in.items():
         stored = fr[ECC_WORD] & ECC_MASK
-        calc = frame_ecc(fr)
+        calc = expected_ecc(far, fr)
         if stored != calc:
             ecc_bad[far] = (stored, calc)
         if stored:

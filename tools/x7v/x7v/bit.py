@@ -264,7 +264,7 @@ def rewrite(path: str, out: str, frames: dict[int, list[int]], part: dict) -> No
             k, pos = index[far], start
             while pos + WORDS_PER_FRAME <= start + cnt and k < len(order):
                 addr, last_in_row = order[k]
-                words[pos:pos + WORDS_PER_FRAME] = with_ecc(frames.get(addr, [0] * WORDS_PER_FRAME))
+                words[pos:pos + WORDS_PER_FRAME] = with_ecc(frames.get(addr, [0] * WORDS_PER_FRAME), addr)
                 pos += WORDS_PER_FRAME * (3 if last_in_row else 1)  # two pad frames end a row
                 k += 1
     crc = 0

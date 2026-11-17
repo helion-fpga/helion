@@ -126,6 +126,13 @@ class Db:
             if not parts:
                 continue
             out[parts[0]] = tuple(_parse_bit(t) for t in parts[1:])
+        if tile_type in ("DSP_L", "DSP_R"):
+            # X-Ray has no AREG_1/BREG_1. Vivado 2017.3 writes AREG = 1 as
+            # AREG_0's frame-27 bit alone (all 384 slices of the two ZedBoard
+            # DSP fill builds), so AREG_1 is that bit with AREG_0's others clear.
+            for k, bits in list(out.items()):
+                if k.endswith((".AREG_0", ".BREG_0")):
+                    out[k[:-1] + "1"] = tuple(SegBit(b.minor, b.bit, b.minor == 27) for b in bits)
         return out
 
     @lru_cache(maxsize=None)

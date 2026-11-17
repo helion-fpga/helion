@@ -37,7 +37,9 @@ from dataclasses import dataclass
 HALVES = {"FIFO18E1": ("RAMB18_Y0", "BRAM_FIFO18_"), "RAMB18E1": ("RAMB18_Y1", "BRAM_RAMB18_")}
 WRITE_MODES = ("WRITE_FIRST", "READ_FIRST", "NO_CHANGE")
 # Tile features a plain RAM never sets: FIFO, cascade and ECC machinery.
-UNMODELLED_TILE = ("EN_SYN", "FIRST_WORD_FALL_THROUGH", "CASCOUT_ARD_ACTIVE", "CASCOUT_BWR_ACTIVE",
+# (CASCOUT_ARD/BWR_ACTIVE are not among them: they drive the address buses
+# to the tile above, which Vivado uses as routing; see model_ramb18.)
+UNMODELLED_TILE = ("EN_SYN", "FIRST_WORD_FALL_THROUGH",
                    "RAMB36.EN_ECC_READ", "RAMB36.EN_ECC_WRITE", "RAMB36.RAM_EXTENSION_A_LOWER",
                    "RAMB36.RAM_EXTENSION_B_LOWER", "RAMB36.BRAM36_READ_WIDTH_A_1",
                    "RAMB36.BRAM36_READ_WIDTH_B_1", "RAMB36.BRAM36_WRITE_WIDTH_A_1",
@@ -153,6 +155,14 @@ def model_ramb36(x, s, nl):
         x.errors.append(f"{s.name}: RAMB36 mode not modelled: {bad}")
 
 
+def _net(x, d: tuple) -> tuple:
+    """A slice's xMUX output set to O6 is the LUT's O6 net itself (Vivado
+    feeds one write enable to WEA0..3 from both pins)."""
+    if d[0] == "site" and d[2] in ("AMUX", "BMUX", "CMUX", "DMUX") and f"{d[2][0]}OUTMUX.O6" in x.sites[d[1]].features:
+        return ("site", d[1], d[2][0])
+    return d
+
+
 def model_ramb18(x, s, nl):
     from .netlist import sig  # netlist imports this module
     half, wp = HALVES[s.stype]
@@ -167,6 +177,15 @@ def model_ramb18(x, s, nl):
     if bad:
         err(f"FIFO/ECC/cascade/RAMB36 1-bit mode not modelled: {bad}")
     tt = x.fab.tt(x.db.tilegrid[s.tile]["type"])
+    # An address bus read from the tile below (BRAM_CASCINBOT_* pips) is
+    # driven only with CASCOUT_<bus>_ACTIVE set there: Vivado sets it in every
+    # such case (168 of 168 in the ZedBoard BRAM fill), so its absence is an error.
+    for bus, act in (("ADDRARDADDR", "CASCOUT_ARD_ACTIVE"), ("ADDRBWRADDR", "CASCOUT_BWR_ACTIVE")):
+        w = next((f.split(".")[1] for f in sorted(tile_f) if f".BRAM_CASCINBOT_{bus}" in f), None)
+        if w and not any(act in x.active.get(t, ()) for t, wn in x.fab.nodes[x.fab.node(s.tile, w)] if wn.startswith("BRAM_CASCOUT_")):
+            m = f"{s.tile}: reads {bus} from the tile below ({w}) but no {act} drives it"
+            if m not in x.errors:
+                x.errors.append(m)
 
     def inp(pin: str, what: str, inv_pin: bool = False) -> str:
         d = x.driver(x.fab.node(s.tile, wp + pin))
@@ -213,7 +232,7 @@ def model_ramb18(x, s, nl):
             c.update(CLK=clk, EN=en, RSTRAM=inp(rstram_p, "output latch reset", True))
             if writes:
                 wes = [inp(f"{we_p}{i}", "write enable") for i in range(8 if sdp_w else 4)]
-                if len(set(wes)) > 1:
+                if len({_net(x, x.driver(x.fab.node(s.tile, f"{wp}{we_p}{i}"))) for i in range(len(wes))}) > 1:
                     err(f"per-byte write enables not modelled ({we_p}0..{len(wes) - 1} = {wes})")
                 writes = wes[0] != "1'b0"
                 c["WE"] = wes[0] if writes else "1'b0"

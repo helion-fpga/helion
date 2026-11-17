@@ -426,6 +426,15 @@ def _depends(init: int, k: int, width: int = 6) -> bool:
     return False
 
 
+def _cout_read(x: Extractor, s: Site) -> bool:
+    """Does the slice above take its carry in from this slice's COUT? Then
+    this CARRY4 is modelled even with no carry feature of its own (all-clear:
+    carry in 0, DI from AX..DX), as in Vivado's ZedBoard BRAM fill."""
+    m = re.match(r"^SLICE_X(\d+)Y(\d+)$", s.name)
+    up = m and x.sites.get(f"SLICE_X{m[1]}Y{int(m[2]) + 1}")
+    return bool(up) and "PRECYINIT.CIN" in up.features and x.pin_driver(up, "CIN")[:2] == ("site", s.name)
+
+
 def model_slice(x: Extractor, s: Site, nl: Netlist):
     F = s.features
     n = lambda pin: sig(s.name, pin)
@@ -456,7 +465,8 @@ def model_slice(x: Extractor, s: Site, nl: Netlist):
 
     # carry
     carry_used = any(f.startswith(("PRECYINIT", "CARRY4")) or f.endswith((".XOR", ".CY")) for f in F) \
-        or any(f"{c}FFMUX.XOR" in F or f"{c}FFMUX.CY" in F or f"{c}OUTMUX.XOR" in F or f"{c}OUTMUX.CY" in F for c in LETTERS)
+        or any(f"{c}FFMUX.XOR" in F or f"{c}FFMUX.CY" in F or f"{c}OUTMUX.XOR" in F or f"{c}OUTMUX.CY" in F for c in LETTERS) \
+        or _cout_read(x, s)
     if carry_used:
         if "PRECYINIT.AX" in F:
             ci = X("A")
