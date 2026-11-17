@@ -15,7 +15,7 @@ import json
 import os
 from dataclasses import asdict, dataclass, field
 
-from . import bit, clockcheck, cosim, decode, netlist
+from . import bit, bram, clockcheck, cosim, decode, netlist
 from .db import Db
 
 VIVADO_COMMANDS = ["NULL", "RCRC", "SWITCH", "WCFG", "GRESTORE", "LFRM", "START", "DESYNC"]
@@ -91,8 +91,9 @@ def verify(db: Db, design: str, bitfile: str, rtl: list[str] | None = None, top:
                             cr.errors + [f"extra: {e}" for e in cr.extra]))
 
     nl = netlist.extract(db, dec)
+    halves = sum(h.in_use for hs in bram.tile_halves(dec).values() for h in hs.values())
     rep.checks.append(Check("extract", not nl.errors,
-                            f"{len(nl.regs)} flops, in {sorted(nl.ports_in)}, out {sorted(nl.ports_out)}, {len(nl.errors)} errors",
+                            f"{len(nl.regs)} flops, {halves} RAMB18 halves ({halves / 2:g} RAMB36), in {sorted(nl.ports_in)}, out {sorted(nl.ports_out)}, {len(nl.errors)} errors",
                             nl.errors))
 
     if rtl and top and xdc:

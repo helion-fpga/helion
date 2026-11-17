@@ -225,3 +225,58 @@ def assign_frames(bs: Bitstream, part: dict) -> None:
                         pos += WORDS_PER_FRAME
         bs.trailing_words += len(payload) - pos
         far = order[k][0] if k < len(order) else far
+
+
+def rewrite(path: str, out: str, frames: dict[int, list[int]], part: dict) -> None:
+    """Write `path` again with new frame contents: every frame's ECC and both
+    CRC words are recomputed, everything else (header, commands, pad
+    frames) is kept. Frames missing from `frames` are written as zeros."""
+    from .ecc import with_ecc
+    data = open(path, "rb").read()
+    _, off = parse_header(data)
+    n = (len(data) - off) // 4
+    words = list(struct.unpack(">%dI" % n, data[off:off + 4 * n]))
+    order = frame_addresses(part)
+    index = {far: k for k, (far, _) in enumerate(order)}
+    # Packet walk as in parse(), keeping each body's position.
+    pkts: list[tuple[int, int, int, int]] = []  # (reg, op, start, count)
+    i = words.index(SYNC) + 1
+    last_reg = 0
+    while i < len(words):
+        w = words[i]
+        typ, op = w >> 29, (w >> 27) & 3
+        if typ == 1:
+            last_reg, cnt = (w >> 13) & 0x1F, w & 0x7FF
+        elif typ == 2:
+            cnt = w & 0x7FFFFFF
+        else:
+            i += 1
+            continue
+        pkts.append((last_reg, op, i + 1, cnt))
+        i += 1 + cnt
+    far = 0
+    for reg, op, start, cnt in pkts:
+        if op != 2:
+            continue
+        if reg == 0x01:
+            far = words[start + cnt - 1]
+        elif reg == 0x02 and cnt:
+            k, pos = index[far], start
+            while pos + WORDS_PER_FRAME <= start + cnt and k < len(order):
+                addr, last_in_row = order[k]
+                words[pos:pos + WORDS_PER_FRAME] = with_ecc(frames.get(addr, [0] * WORDS_PER_FRAME))
+                pos += WORDS_PER_FRAME * (3 if last_in_row else 1)  # two pad frames end a row
+                k += 1
+    crc = 0
+    for reg, op, start, cnt in pkts:
+        if op != 2 or reg not in REG_NAMES:
+            continue
+        if reg == 0x00:
+            words[start + cnt - 1] = crc
+            crc = 0
+        elif reg == 0x04 and cnt and words[start + cnt - 1] == 7:
+            crc = 0
+        else:
+            for v in words[start:start + cnt]:
+                crc = icap_crc(reg, v, crc)
+    open(out, "wb").write(data[:off] + struct.pack(">%dI" % n, *words) + data[off + 4 * n:])
