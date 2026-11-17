@@ -637,6 +637,9 @@ pub struct PackedCfgPrim {
 /// Backend-owned packed netlist for xc7a35t.
 #[derive(Clone, Debug, Default)]
 pub struct Packed7 {
+    /// Flops and LUTs placed in a slice of their own: copies of a driver
+    /// shared by many block RAMs or DSPs, each to sit by its own group.
+    pub lone_cells: HashSet<String>,
     pub luts: Vec<PackedLut>,
     pub ffs: Vec<PackedFf>,
     pub iobs: Vec<PackedIob>,
@@ -894,7 +897,6 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
     fracture_adder_luts(&mut out)?;
     insert_clock_spine(netlist, &mut out)?;
     insert_input_buffers(netlist, &mut out)?;
-    replicate_hard_block_drivers(&mut out);
 
     Ok(out)
 }
@@ -3143,15 +3145,19 @@ fn insert_input_buffers(netlist: &Design, packed: &mut Packed7) -> Result<(), St
     Ok(())
 }
 
-/// Hard blocks one copy of a shared driver serves; placement keeps pack
-/// order column-major, so a run of them sits in a few BRAM/DSP tiles.
+/// Hard blocks one copy of a shared driver serves (4 BRAM or DSP tiles).
 const HARD_FANOUT_GROUP: usize = 8;
 
 /// A flop or LUT that drives a data or control pin of more than two groups
 /// of block RAMs or DSPs is copied, one copy per [`HARD_FANOUT_GROUP`]
 /// blocks, so placement can put each copy beside its blocks. One driver
 /// across 240 RAMs routes in tens of nanoseconds; Vivado replicates too.
-fn replicate_hard_block_drivers(packed: &mut Packed7) {
+/// The original keeps only its fabric loads: it shares a slice with the
+/// LUT before it, which the copies pull to their middle.
+///
+/// Placement runs this once the blocks have sites: `site_xy` gives a
+/// block's site `(X, Y)` by cell name, and a group never spans two columns.
+pub(crate) fn replicate_hard_block_drivers(packed: &mut Packed7, site_xy: &dyn Fn(&str) -> Option<(i32, i32)>) {
     let is_clk = |pin: &str| pin.starts_with("CLK") || pin.starts_with("REGCLK");
     let nb = packed.brams.len();
     // Net -> hard blocks reading it (BRAMs, then DSPs offset by `nb`).
@@ -3168,20 +3174,43 @@ fn replicate_hard_block_drivers(packed: &mut Packed7) {
             }
         }
     }
-    for (net, blocks) in users {
+    // Column-major by (DSP?, X, Y); a group ends at a full group or a new column.
+    let keys: Vec<(bool, i32, i32)> = packed
+        .brams
+        .iter()
+        .map(|b| &b.name)
+        .chain(packed.dsps.iter().map(|d| &d.name))
+        .enumerate()
+        .map(|(i, name)| {
+            let (x, y) = site_xy(name).unwrap_or((i32::MAX, i as i32));
+            (i >= nb, x, y)
+        })
+        .collect();
+    let key = |i: usize| keys[i];
+    for (net, mut blocks) in users {
         if blocks.len() <= 2 * HARD_FANOUT_GROUP {
             continue;
+        }
+        blocks.sort_by_key(|&i| key(i));
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for i in blocks {
+            match groups.last_mut() {
+                Some(g) if g.len() < HARD_FANOUT_GROUP && key(g[0]).0 == key(i).0 && key(g[0]).1 == key(i).1 => g.push(i),
+                _ => groups.push(vec![i]),
+            }
         }
         let ff = packed.ffs.iter().find(|f| f.q_net == net).cloned();
         let lut = packed.luts.iter().find(|l| l.output_net == net && l.input_nets.iter().any(|n| n.is_some())).cloned();
         if ff.is_none() && lut.is_none() {
             continue;
         }
-        for (k, chunk) in blocks.chunks(HARD_FANOUT_GROUP).enumerate().skip(1) {
+        for (k, chunk) in groups.iter().enumerate() {
             let copy = format!("{net}_rep{k}");
             if let Some(f) = &ff {
+                packed.lone_cells.insert(format!("{}_rep{k}", f.name));
                 packed.ffs.push(PackedFf { name: format!("{}_rep{k}", f.name), q_net: copy.clone(), ..f.clone() });
             } else if let Some(l) = &lut {
+                packed.lone_cells.insert(format!("{}_rep{k}", l.name));
                 packed.luts.push(PackedLut { name: format!("{}_rep{k}", l.name), output_net: copy.clone(), ..l.clone() });
             }
             for &i in chunk {
@@ -3340,11 +3369,15 @@ mod tests {
                 ..Default::default()
             });
         }
-        replicate_hard_block_drivers(&mut p);
-        assert_eq!(p.ffs.len(), 3, "20 RAMs in groups of 8: the original and two copies");
+        // ram0..11 in column 0, ram12..19 in column 1.
+        let xy = |name: &str| name[3..].parse::<i32>().ok().map(|i| if i < 12 { (0, i) } else { (1, i - 12) });
+        replicate_hard_block_drivers(&mut p, &xy);
+        assert_eq!(p.ffs.len(), 4, "groups of 8 per column (8 + 4 | 8): the original and three copies");
         assert!(p.ffs.iter().all(|f| f.d_net == "a_d"));
-        assert_eq!(p.brams[7].pins[0].1, "a");
+        assert_eq!(p.brams[7].pins[0].1, "a_rep0");
         assert_eq!(p.brams[8].pins[0].1, "a_rep1");
+        assert_eq!(p.brams[11].pins[0].1, "a_rep1");
+        assert_eq!(p.brams[12].pins[0].1, "a_rep2", "a new column starts a new group");
         assert_eq!(p.brams[19].pins[0].1, "a_rep2");
         assert_eq!(p.brams[19].pins[1].1, "a", "clock pins stay put");
     }

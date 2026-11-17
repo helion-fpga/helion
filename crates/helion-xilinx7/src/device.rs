@@ -766,24 +766,35 @@ impl Device {
         td.pips.iter().filter(|p| p.dst == w).collect()
     }
 
-    /// Every RAMB18 site (both halves: `FIFO18E1` and `RAMB18E1`), in
-    /// column-major order of the site's `(X, Y)`.
+    /// Every RAMB18 site (both halves: `FIFO18E1` and `RAMB18E1`), column
+    /// by column, in [`Self::serpentine`] order.
     pub fn bram18_sites(&self) -> Vec<(String, String)> {
-        Self::column_major(self.sites_of_types(&["FIFO18E1", "RAMB18E1"]))
+        Self::serpentine(self.sites_of_types(&["FIFO18E1", "RAMB18E1"]))
     }
 
-    /// Every RAMB36 site (`RAMBFIFO36E1`), in column-major `(X, Y)` order.
+    /// Every RAMB36 site (`RAMBFIFO36E1`), in [`Self::serpentine`] order.
     pub fn bram36_sites(&self) -> Vec<(String, String)> {
-        Self::column_major(self.sites_of_types(&["RAMBFIFO36E1"]))
+        Self::serpentine(self.sites_of_types(&["RAMBFIFO36E1"]))
     }
 
-    /// Every DSP48E1 site, in column-major `(X, Y)` order.
+    /// Every DSP48E1 site, in [`Self::serpentine`] order.
     pub fn dsp48_sites(&self) -> Vec<(String, String)> {
-        Self::column_major(self.sites_of_types(&["DSP48E1"]))
+        Self::serpentine(self.sites_of_types(&["DSP48E1"]))
     }
 
-    fn column_major(mut v: Vec<(String, String)>) -> Vec<(String, String)> {
-        v.sort_by_key(|(_, s)| crate::place::parse_site_xy(s).unwrap_or((i32::MAX, i32::MAX)));
+    /// Sites by column (site X), up the first column, down the next, and
+    /// so on: blocks placed in this order that work together stay close
+    /// where they cross into the next column (top to top, not top to bottom).
+    fn serpentine(mut v: Vec<(String, String)>) -> Vec<(String, String)> {
+        let xy = |s: &str| crate::place::parse_site_xy(s).unwrap_or((i32::MAX, i32::MAX));
+        let mut cols: Vec<i32> = v.iter().map(|(_, s)| xy(s).0).collect();
+        cols.sort();
+        cols.dedup();
+        v.sort_by_key(|(_, s)| {
+            let (x, y) = xy(s);
+            let rank = cols.binary_search(&x).unwrap_or(0);
+            (x, if rank % 2 == 0 { y } else { -y })
+        });
         v
     }
 
@@ -1441,6 +1452,16 @@ fn _use_tile_conn_fields(e: &TileConnEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hard_block_sites_snake_between_columns() {
+        let v = ["RAMB18_X1Y1", "RAMB18_X0Y1", "RAMB18_X1Y0", "RAMB18_X0Y0", "RAMB18_X2Y0", "RAMB18_X2Y1"]
+            .iter()
+            .map(|s| (String::new(), s.to_string()))
+            .collect();
+        let order: Vec<String> = Device::serpentine(v).into_iter().map(|(_, s)| s).collect();
+        assert_eq!(order, ["RAMB18_X0Y0", "RAMB18_X0Y1", "RAMB18_X1Y1", "RAMB18_X1Y0", "RAMB18_X2Y0", "RAMB18_X2Y1"]);
+    }
     use std::sync::OnceLock;
 
     /// Device loaded once and shared by all tests (full load takes ~30 s).

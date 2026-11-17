@@ -493,7 +493,7 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
 }
 
 /// [`place`] with the hard-block site pools given: `(RAMB18 sites, RAMB36
-/// sites, DSP48E1 sites)`, each `(tile, site)` in column-major order (the
+/// sites, DSP48E1 sites)`, each `(tile, site)` column by column (the
 /// backend passes the part's full lists from
 /// [`crate::device::Device::bram18_sites`] and friends).
 pub fn place_with_pools(
@@ -604,6 +604,21 @@ pub fn place_with_pools(
 
     // 2c. DSP48E1s with column-aligned PCOUT->PCIN / ACOUT->ACIN / BCOUT->BCIN cascade placement.
     place_dsps(&packed.dsps, &dsp_pool, &mut used_sites, &mut out.dsps)?;
+
+    // 2c2. Drivers shared by many block RAMs/DSPs are copied per group of
+    // blocks in a column (see `replicate_hard_block_drivers`); the logic
+    // below places the copies.
+    let site_xy: HashMap<String, (i32, i32)> = out
+        .brams
+        .iter()
+        .map(|b| (&b.name, &b.site))
+        .chain(out.dsps.iter().map(|d| (&d.name, &d.site)))
+        .filter_map(|(n, s)| parse_site_xy(s).map(|xy| (n.clone(), xy)))
+        .collect();
+    let mut replicated = packed.clone();
+    crate::pack::replicate_hard_block_drivers(&mut replicated, &|n| site_xy.get(n).copied());
+    out.packed = replicated.clone();
+    let packed = &replicated;
 
     // 2d. CARRY4s, ordered into chains by CO-to-CI net linkage (ZB-08).
     // The first chain head honors `packed.carry_anchor` when set (a pinned
@@ -908,6 +923,15 @@ pub fn place_with_pools(
         Err("place: no free SLICEL site".to_string())
     };
 
+    // A fresh slice that nothing else joins (all its BEL letters taken).
+    let lone = |used: &mut HashSet<String>, site_bels: &mut HashMap<String, HashSet<char>>, site_tile: &mut HashMap<String, String>| -> Result<(String, String, char), String> {
+        let (tile, site) = device.slice_near(fx, fy, used).ok_or("place: no free SLICEL site")?;
+        used.insert(site.clone());
+        site_tile.insert(site.clone(), tile.clone());
+        site_bels.insert(site.clone(), BEL_LETTERS.iter().copied().collect());
+        Ok((tile, site, 'A'))
+    };
+
     // Place LUTs feeding MUXF7 / MUXF8 first so wide muxes share one slice.
     place_muxf_trees(
         packed,
@@ -960,7 +984,11 @@ pub fn place_with_pools(
         }
         // Find driving LUT, if any, and not yet placed.
         let lut_idx = lut_by_output.get(ff.d_net.as_str()).copied().filter(|i| !lut_placed.contains(i));
-        let (tile, site, letter) = alloc(&mut used_sites, &mut site_bels, &mut site_tile, &mut site_ctrl, Some(&ctrl), device)?;
+        let (tile, site, letter) = if packed.lone_cells.contains(&ff.name) {
+            lone(&mut used_sites, &mut site_bels, &mut site_tile)?
+        } else {
+            alloc(&mut used_sites, &mut site_bels, &mut site_tile, &mut site_ctrl, Some(&ctrl), device)?
+        };
         site_bels.get_mut(&site).unwrap().insert(letter);
         if let Some(li) = lut_idx {
             lut_placed.insert(li);
@@ -1005,7 +1033,11 @@ pub fn place_with_pools(
             });
             continue;
         }
-        let (tile, site, letter) = alloc(&mut used_sites, &mut site_bels, &mut site_tile, &mut site_ctrl, None, device)?;
+        let (tile, site, letter) = if packed.lone_cells.contains(&lut.name) {
+            lone(&mut used_sites, &mut site_bels, &mut site_tile)?
+        } else {
+            alloc(&mut used_sites, &mut site_bels, &mut site_tile, &mut site_ctrl, None, device)?
+        };
         site_bels.get_mut(&site).unwrap().insert(letter);
         out.luts.push(PlacedLut {
             name: lut.name.clone(),
