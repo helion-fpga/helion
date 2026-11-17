@@ -22,6 +22,8 @@ pub enum Mode {
     Const,
     Comb,
     Seq,
+    /// An `initial` block: assignments set power-up values.
+    Init,
 }
 
 #[derive(Clone, Default)]
@@ -55,12 +57,12 @@ pub struct V {
 }
 
 #[derive(Clone, Copy)]
-enum Root {
+pub(super) enum Root {
     Sig(u32),
     Var(u32),
 }
 
-enum LStep {
+pub(super) enum LStep {
     /// A fixed sub-range (member, constant index or slice).
     Fixed(u32, u32),
     /// One of `count` elements of `ew` bits, chosen by position `idx`.
@@ -69,10 +71,10 @@ enum LStep {
     Slide { off: N, w: u32 },
 }
 
-struct Lv {
-    root: Root,
-    steps: Vec<LStep>,
-    ty: Rc<Ty>,
+pub(super) struct Lv {
+    pub root: Root,
+    pub steps: Vec<LStep>,
+    pub ty: Rc<Ty>,
 }
 
 fn num_i64(bits: &[bool], signed: bool) -> i64 {
@@ -168,7 +170,7 @@ impl Elab {
     }
 
     /// Binary select of one of `elems` by `idx` (element 0 for index 0).
-    fn select(&mut self, elems: &[N], idx: N) -> N {
+    pub(super) fn select(&mut self, elems: &[N], idx: N) -> N {
         if elems.len() == 1 {
             return elems[0];
         }
@@ -314,6 +316,7 @@ impl Elab {
         Ok(match e {
             Expr::Num(n) => (if n.fill { 1 } else { n.bits.len() as u32 }, n.signed),
             Expr::Str(s) => ((s.len() as u32 * 8).max(8), false),
+            Expr::Real(_) => return self.err("real number literals are not synthesizable"),
             Expr::Id(_) | Expr::Member(..) | Expr::Index(..) | Expr::Range(..) | Expr::PlusRange(..) => match self.ref_ty(e, sc)? {
                 Some(t) => {
                     let whole = matches!(e, Expr::Id(_) | Expr::Member(..)) || matches!(e, Expr::Index(b, _) if matches!(self.ref_ty(b, sc)?.as_deref(), Some(Ty::Array { .. })));
@@ -416,6 +419,7 @@ impl Elab {
                     let ty = self.sigs[s as usize].ty.clone();
                     let n = match env.sig.get(&s) {
                         Some(&n) => n,
+                        None if env.mode == Mode::Init => self.dag.konst(self.sigs[s as usize].init.clone()),
                         None => self.dag.read(s, ty.w()),
                     };
                     V { n, ty }
@@ -447,6 +451,10 @@ impl Elab {
                 }
             }
             Expr::Index(b, i) => {
+                if let Some(m) = self.mem_base(b, sc)? {
+                    let ety = self.sigs[self.mem_sig(m) as usize].ty.elem().0;
+                    return Ok(Some(V { n: self.mem_read(m, i, sc, env)?, ty: ety }));
+                }
                 let Some(bv) = self.eval_ref(b, sc, env)? else { return self.err("index of something that is not a signal") };
                 let (ety, count) = bv.ty.elem();
                 let ew = ety.w();
@@ -670,6 +678,7 @@ impl Elab {
         let one_bit = |s: &mut Self, b: N| s.dag.zext(b, w);
         Ok(match e {
             Expr::Num(n) => self.num_node(n, w, signed),
+            Expr::Real(_) => return self.err("real number literals are not synthesizable"),
             Expr::Str(st) => {
                 let mut bits = Vec::new();
                 for ch in st.bytes().rev() {
@@ -1093,6 +1102,14 @@ impl Elab {
                 let mut lv = self.lvalue(b, sc, env)?;
                 let (ety, count) = lv.ty.elem();
                 let iv = self.eval_self(i, sc, env)?;
+                if let (Root::Sig(s), true) = (lv.root, lv.steps.is_empty()) {
+                    if let Some(m) = self.mem_of(s) {
+                        let idx = self.mem_addr(m, iv.n, iv.ty.signed());
+                        lv.steps.push(LStep::Elem { idx, count, ew: ety.w() });
+                        lv.ty = ety;
+                        return Ok(lv);
+                    }
+                }
                 if let Some(k) = self.const_of(iv.n, iv.ty.signed()) {
                     let Some(off) = lv.ty.offset(k) else { return self.err(format!("index {k} is outside the declared range")) };
                     lv.steps.push(LStep::Fixed(off, ety.w()));
@@ -1237,7 +1254,7 @@ impl Elab {
         self.store_lv(&lv, v, nonblocking, env)
     }
 
-    fn store_lv(&mut self, lv: &Lv, v: N, nonblocking: bool, env: &mut Env) -> R<()> {
+    pub(super) fn store_lv(&mut self, lv: &Lv, v: N, nonblocking: bool, env: &mut Env) -> R<()> {
         let live = self.live(env);
         match lv.root {
             Root::Var(id) => {
@@ -1250,6 +1267,11 @@ impl Elab {
                     new = self.dag.mux(l, new, cur);
                 }
                 env.var.insert(id, new);
+            }
+            Root::Sig(id) if env.mode == Mode::Init => self.init_store(id, lv, v, env)?,
+            Root::Sig(id) if self.mem_of(id).is_some() => {
+                let m = self.mem_of(id).unwrap();
+                self.mem_write(m, lv, v, nonblocking, env)?
             }
             Root::Sig(id) => {
                 if env.mode == Mode::Const {
@@ -1310,6 +1332,9 @@ impl Elab {
         for p in parts {
             let lv = self.lvalue(p, sc, env)?;
             let Root::Sig(sig) = lv.root else { return self.err("a continuous assignment needs a signal on its left") };
+            if let Some(m) = self.mem_of(sig) {
+                return self.retry(m, "it is assigned continuously");
+            }
             let total = self.sigs[sig as usize].ty.w();
             if lv.steps.iter().any(|s| !matches!(s, LStep::Fixed(..))) {
                 return self.err("a continuous assignment to a variable index is not supported");
@@ -1330,6 +1355,9 @@ impl Elab {
     /// `env` becomes `c ? a : b`.
     fn merge(&mut self, c: N, a: Env, b: Env, env: &mut Env) {
         let mode = a.mode;
+        if mode == Mode::Init {
+            self.mem.init_branch = true;
+        }
         let mut out = Env { mode, outer: a.outer, ..Default::default() };
         for which in 0..3 {
             let (ma, mb) = match which {
@@ -1621,6 +1649,9 @@ impl Elab {
             }
             Stmt::Call(e, line) => {
                 self.line = *line;
+                if let Expr::SysCall(name, args) = e {
+                    return self.readmem(name == "readmemh", args, sc, env);
+                }
                 let Expr::Call(path, args) = e else { return self.err("expected a call") };
                 self.call(path, args, sc, env)?;
                 Ok(())
@@ -1723,6 +1754,7 @@ impl Elab {
             let cv = self.eval_self(cond, sc, &mut Env::default())?;
             let gate = self.truth(cv.n);
             self.ps = ProcState::default();
+            self.next_proc(None);
             let mut env = Env { mode: Mode::Comb, ..Default::default() };
             self.exec(then, sc, &mut env)?;
             self.line = line;
@@ -1750,6 +1782,7 @@ impl Elab {
         self.ps = ProcState::default();
         if edges.is_empty() {
             // Combinational.
+            self.next_proc(None);
             let mut env = Env { mode: Mode::Comb, ..Default::default() };
             self.exec(body, sc, &mut env)?;
             self.line = line;
@@ -1859,8 +1892,10 @@ impl Elab {
         let (pos, clk_e) = &edges[clk_ix];
         let cv = self.eval_self(clk_e, sc, &mut Env::default())?;
         let clk = self.dag.slice(cv.n, 0, 1);
+        self.next_proc(Some((clk, !*pos)));
         let mut env = Env { mode: Mode::Seq, ..Default::default() };
         self.exec(body, sc, &mut env)?;
+        self.mem.proc = None;
         self.line = line;
         let mut ids: Vec<u32> = env.sig.keys().chain(env.nba.keys()).copied().collect();
         ids.sort_unstable();
@@ -1872,6 +1907,10 @@ impl Elab {
                 return self.err(format!("'{name}' is assigned with both '=' and '<=' in one block"));
             }
             let d = env.sig.get(&id).or(env.nba.get(&id)).copied().unwrap();
+            if self.is_hidden(id) {
+                self.hidden_comb(id, d)?;
+                continue;
+            }
             let mask = self.ps.blk.get(&id).or(self.ps.nba.get(&id)).cloned().unwrap();
             let reg = self.regs.len() as u32;
             for (b, m) in mask.iter().enumerate() {

@@ -20,6 +20,8 @@ pub enum T {
     Sys(String),
     Num(Num),
     Str(String),
+    /// Real literal, as written (only primitive parameters take one).
+    Real(String),
     Op(&'static str),
     Eof,
 }
@@ -261,7 +263,16 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
                     i = j;
                 } else {
                     if i < c.len() && (c[i] == '.' && i + 1 < c.len() && c[i + 1].is_ascii_digit()) {
-                        return Err(format!("line {line}: real number literals are not synthesizable"));
+                        i += 1;
+                        while i < c.len() && (c[i].is_ascii_digit() || c[i] == '_') {
+                            i += 1;
+                        }
+                        let text: String = c[st..i].iter().filter(|&&ch| ch != '_').collect();
+                        out.push(Tok { t: T::Real(text), line });
+                        while i < c.len() && c[i].is_ascii_alphabetic() {
+                            i += 1; // time unit
+                        }
+                        continue;
                     }
                     // Time literal suffix (1ns, 10ps) only appears in delays, which are skipped.
                     let (mut bits, _) = based_bits(&digits, 10, line)?;

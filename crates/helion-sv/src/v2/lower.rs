@@ -93,6 +93,22 @@ pub enum Drv {
     Input,
     /// Output of latch `.0`.
     Latch(u32),
+    /// An output pin of hard cell `.0` (block RAM or primitive instance).
+    Hard(u32),
+}
+
+/// A cell built as is: an inferred block RAM or an instance of a device
+/// primitive. Its outputs drive signal bits marked [`Drv::Hard`].
+pub struct Hard {
+    pub name: String,
+    /// `RAMB18E1`, `RAMB36E1`, `DSP48E1`, ...
+    pub module: String,
+    /// Parameters, written the way the back end reads them.
+    pub attrs: Vec<(String, String)>,
+    /// Input pin bits: (pin, node, bit of node).
+    pub ins: Vec<(String, N, u32)>,
+    /// Output pin bits: (pin, signal, bit of signal).
+    pub outs: Vec<(String, u32, u32)>,
 }
 
 /// A level-sensitive latch: `sig` follows `d` while `gate` is 1. Only a
@@ -149,6 +165,7 @@ pub struct Flat {
     pub regs: Vec<Reg>,
     pub latches: Vec<Latch>,
     pub instances: Vec<(String, String, Vec<(String, String)>)>,
+    pub hard: Vec<Hard>,
 }
 
 pub fn bit_name(sig: &str, w: u32, bit: u32) -> String {
@@ -257,6 +274,11 @@ impl<'a> Blaster<'a> {
         let s = &self.flat.sigs[sig as usize];
         let l = match s.drv[bit as usize] {
             Drv::Input => {
+                let l = self.aig.input();
+                self.pi_name.push((l, sig, bit));
+                l
+            }
+            Drv::Hard(_) => {
                 let l = self.aig.input();
                 self.pi_name.push((l, sig, bit));
                 l
@@ -626,6 +648,11 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
         arst: Option<(Lit, bool)>,
     }
     let mut reg_bits: Vec<RegBit> = Vec::new();
+    // Every hard cell is built; its inputs are roots.
+    let mut hard_ins: Vec<Vec<Lit>> = Vec::with_capacity(flat.hard.len());
+    for h in &flat.hard {
+        hard_ins.push(h.ins.iter().map(|(_, n, b)| bl.bit(*n, *b)).collect::<Result<_, _>>()?);
+    }
     let mut done = 0usize;
     while done < bl.live_regs.len() {
         let (sig, bit) = bl.live_regs[done];
@@ -658,7 +685,7 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
         };
         reg_bits.push(RegBit { sig, bit, d, clk, negedge: r.negedge, arst });
     }
-    let Blaster { aig, pi_name, hints, undriven, .. } = bl;
+    let Blaster { aig, pi_name, hints, undriven, sig_bit, .. } = bl;
     let map = Mapper::run(&aig);
 
     let mut d = Design::new(&flat.top);
@@ -845,6 +872,25 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
             }
         }
     }
+    // Hard cells: inputs from the logic, outputs onto the nets of the
+    // signal bits they drive (an output nothing reads stays open).
+    for (h, ins) in flat.hard.iter().zip(&hard_ins) {
+        d.add_cell(&h.name, CellKind::BlackBox { module: helion_ir::intern(&h.module) });
+        if let Some(c) = d.cells.last_mut() {
+            for (k, v) in &h.attrs {
+                c.attrs.set(k, v);
+            }
+        }
+        for ((pin, _, _), &l) in h.ins.iter().zip(ins) {
+            let net = emit(l, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut);
+            d.connect(&net, &h.name, pin);
+        }
+        for (pin, sig, bit) in &h.outs {
+            if let Some(l) = sig_bit.get(&(*sig, *bit)) {
+                d.connect(&net_of[l], &h.name, pin);
+            }
+        }
+    }
     // Debug signals: their nets exist and carry the mark.
     for &(_, _, l) in &debug_bits {
         let net = emit(l, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut);
@@ -914,6 +960,7 @@ mod tests {
             regs: vec![],
             latches: vec![],
             instances: vec![],
+            hard: vec![],
         };
         let (d, st, _) = lower(&flat).unwrap();
         assert!(st.luts <= 3, "3-bit add is 3 LUTs of at most 6 inputs, got {}", st.luts);

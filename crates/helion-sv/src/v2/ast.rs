@@ -6,6 +6,8 @@ use super::lex::Num;
 pub enum Expr {
     Num(Num),
     Str(String),
+    /// Real literal as written: only a primitive's parameter takes one.
+    Real(String),
     /// `a`, `pkg::a`
     Id(Vec<String>),
     Member(Box<Expr>, String),
@@ -185,6 +187,8 @@ pub enum Item {
     PortDir(PortDecl),
     /// Signals declared just before with `(* mark_debug *)` or `(* keep *)`.
     Debug(Vec<String>),
+    /// `initial` block: run once for power-up values (memory contents).
+    Initial(Stmt, u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
