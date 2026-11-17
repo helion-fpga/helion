@@ -3,6 +3,7 @@
 ```sh
 HELION_XILINX_DB=~/.cache/helion/prjxray-db python3 tools/qor/run.py [--set quick|full] [--json out.json] [--timeout SECONDS] [--accept]
 python3 tools/qor/run.py --selftest     # parser and gate only, builds nothing
+python3 tools/qor/run.py --only pico     # one or more designs (comma-separated), any set
 ```
 
 It builds `zedbit` (release), builds every design of the set with
