@@ -5,7 +5,8 @@ What the model rests on (no Helion code):
 * Project X-Ray's DSP_L/DSP_R database. A DSP tile holds two DSP48E1 sites,
   FASM prefixes `DSP48.DSP_0` (site X0Y0, wires `DSP_0_*`) and `DSP48.DSP_1`.
   Their bits:
-    - `AREG_0`, `AREG_2` (neither: AREG = 1), same for B;
+    - `AREG_0`, `AREG_1`, `AREG_2`, same for B (`AREG_1` is x7v's: X-Ray
+      lacks it; Vivado writes AREG = 1 as AREG_0's frame-27 bit alone, see db.py);
       `ZAREG_2_ACASCREG_1` is stored inverted: clear means AREG = 2 with
       ACASCREG = 1, set means ACASCREG = AREG (same for B);
     - `Z<reg>REG[0]` set means that register is off (CREG, DREG, ADREG,
@@ -73,11 +74,12 @@ def _vec(F: set, name: str, n: int) -> int:
 
 
 def _inreg(F: set, base: str, z: str, name: str, problems: list) -> tuple[int, int]:
-    """(xREG, xCASCREG) from AREG_0 / AREG_2 / ZAREG_2_ACASCREG_1."""
-    r0, r2 = f"{base}_0" in F, f"{base}_2" in F
-    if r0 and r2:
-        problems.append(f"{base}_0 and {base}_2 both set")
-    reg = 0 if r0 else 2 if r2 else 1
+    """(xREG, xCASCREG) from AREG_0 / AREG_1 / AREG_2 / ZAREG_2_ACASCREG_1."""
+    set_ = [r for r in (0, 1, 2) if f"{base}_{r}" in F]
+    if len(set_) != 1:
+        # None set is no encoding Vivado writes (AREG = 1 sets AREG_1's bit).
+        problems.append(f"{base}_0/1/2: {'none' if not set_ else 'several'} set")
+    reg = set_[0] if set_ else 1
     one_casc = z not in F
     if one_casc and reg != 2:
         problems.append(f"{z} clear (AREG/BREG = 2, cascade 1) but {name} = {reg}")

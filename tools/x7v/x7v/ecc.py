@@ -39,7 +39,14 @@ def frame_ecc(words: list[int]) -> int:
     return ecc & ECC_MASK
 
 
-def with_ecc(words: list[int]) -> list[int]:
+def expected_ecc(far: int, words: list[int]) -> int:
+    """ECC bits Vivado writes: none in block RAM content frames (FAR block
+    type 1; word 50 is 0 in all 1,792 written by Vivado 2017.3 for
+    examples/zedboard_bram_fill.sv), the Hamming code everywhere else."""
+    return 0 if far >> 23 & 7 == 1 else frame_ecc(words)
+
+
+def with_ecc(words: list[int], far: int) -> list[int]:
     out = list(words)
-    out[ECC_WORD] = (out[ECC_WORD] & ~ECC_MASK & 0xFFFFFFFF) | frame_ecc(out)
+    out[ECC_WORD] = (out[ECC_WORD] & ~ECC_MASK & 0xFFFFFFFF) | expected_ecc(far, out)
     return out

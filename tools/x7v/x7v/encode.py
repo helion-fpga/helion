@@ -106,4 +106,4 @@ def encode(db: Db, features: list[str], frame_list: list[int] | None = None) -> 
             missing.append(feat)
     if missing:
         raise KeyError(f"{len(missing)} features have no segbits, e.g. {missing[:5]}")
-    return {far: with_ecc(fr) for far, fr in frames.items()}
+    return {far: with_ecc(fr, far) for far, fr in frames.items()}
