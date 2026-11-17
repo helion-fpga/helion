@@ -90,7 +90,7 @@ struct TGraph {
     drv: Vec<Option<Loc>>,
     /// Nets driven by a flop.
     ff_q: Vec<u32>,
-    /// Flop D inputs: (net, flop place).
+    /// Flop D, CE and synchronous SR inputs: (net, flop place).
     ends: Vec<(u32, Loc)>,
     /// Net names, to print the estimated critical path (`HELION_PLACE_DEBUG`).
     debug_names: Option<Vec<String>>,
@@ -178,7 +178,7 @@ impl TGraph {
     }
 
     /// Every timed driver-to-sink connection `(net, sink place)`: cell inputs
-    /// (not the dedicated carry cascade) in cell order, then flop D inputs.
+    /// (not the dedicated carry cascade) in cell order, then flop inputs.
     fn conns(&self) -> Vec<(u32, Loc)> {
         let cells = self.cells.iter().flat_map(|c| c.ins.iter().filter(|x| !x.1).map(move |&(i, _)| (i, c.loc)));
         cells.chain(self.ends.iter().copied()).collect()
@@ -534,6 +534,8 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
         dmax
     };
     let est0 = reweight(&nets, &pos);
+    let t0 = std::time::Instant::now();
+    let mut steps = 0usize;
     let mut cost: Vec<i64> = nets.iter().map(|nt| net_cost(nt, &pos)).collect();
     let mut total: i64 = cost.iter().sum();
     let initial = total;
@@ -726,6 +728,7 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
     };
     // Stop when the temperature is a small fraction of the average net cost.
     while temp > 0.005 * (total.max(1) as f64 / nets.len() as f64).max(1.0) {
+        steps += 1;
         let mut accepted = 0usize;
         for _ in 0..moves_per_t {
             let (d, ok) = try_move(&mut pos, &mut occ, &mut site_ctrl, &mut cost, &mut rng, window, temp);
@@ -767,7 +770,7 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
         ys.sort();
         let q = |v: &[i32], f: f64| v[((v.len() - 1) as f64 * f) as usize];
         eprintln!("place: units span x {}..{} (10-90% {}..{}), y {}..{} (10-90% {}..{})", xs[0], xs[xs.len() - 1], q(&xs, 0.1), q(&xs, 0.9), ys[0], ys[ys.len() - 1], q(&ys, 0.1), q(&ys, 0.9));
-        eprintln!("place: {n} slots, {} chain runs, {} nets, cost {initial} -> {total}, estimated critical path {est0} -> {est1} ps", runs.len(), nets.len());
+        eprintln!("place: {n} slots, {} chain runs, {} nets, cost {initial} -> {total}, estimated critical path {est0} -> {est1} ps, {steps} temperatures in {:.1} s", runs.len(), nets.len(), t0.elapsed().as_secs_f64());
     }
 
     // Write the new places back: chain slices first (by their old site;
@@ -853,6 +856,10 @@ fn timing_graph<'a>(out: &'a Placed7, site_idx: &HashMap<&str, usize>, unit_of_s
         ff_q.push(id(&f.q_net));
         ff_locs.push((id(&f.q_net), at));
         ends.push((id(&f.d_net), at));
+        // CE and synchronous SR are timed like D (timing.rs does the same).
+        for n in f.ce_net.iter().chain(f.sr_net.iter().filter(|_| !f.sr_async)) {
+            ends.push((id(n), at));
+        }
     }
     let n = ids.len();
     let mut drv: Vec<Option<Loc>> = vec![None; n];
@@ -903,4 +910,23 @@ fn timing_graph<'a>(out: &'a Placed7, site_idx: &HashMap<&str, usize>, unit_of_s
         v
     });
     Some(TGraph { cells, drv, ff_q, ends, debug_names })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pack::PackedFf;
+    use crate::place::PlacedFf;
+
+    #[test]
+    fn flop_ce_and_sync_sr_are_timing_endpoints() {
+        let mut p = Placed7::default();
+        p.packed.ffs.push(PackedFf { name: "f".into(), d_net: "d".into(), q_net: "q".into(), clk_net: "clk".into(), ce_net: Some("en".into()), sr_net: Some("rst".into()), init: false, srval: false, sr_async: false });
+        p.ffs.push(PlacedFf { name: "f".into(), tile: "CLB_X1Y1".into(), site: "SLICE_X1Y1".into(), bel: "AFF".into() });
+        let site_idx = HashMap::from([("SLICE_X1Y1", 0usize)]);
+        let ends = |p: &Placed7| timing_graph(p, &site_idx, &HashMap::new(), &HashMap::new(), &HashSet::new()).unwrap().ends.len();
+        assert_eq!(ends(&p), 3, "D, CE and SR");
+        p.packed.ffs[0].sr_async = true;
+        assert_eq!(ends(&p), 2, "an asynchronous reset has no setup check");
+    }
 }
