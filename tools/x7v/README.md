@@ -10,6 +10,7 @@ python3 -m x7v info      design.bit
 python3 -m x7v decode    design.bit -o design.fasm      # every set bit -> feature
 python3 -m x7v roundtrip design.bit                     # decode -> encode == input?
 python3 -m x7v bram      design.bit                     # every configured block RAM half
+python3 -m x7v dsp       design.bit                     # every configured DSP48E1
 python3 -m x7v extract   design.bit -o netlist.v        # bitstream -> gate netlist
 python3 -m x7v verify    design.bit --design blinky \
     --rtl blinky.vhd --top blinky --xdc blinky.xdc --golden vivado.bit
@@ -101,6 +102,20 @@ tried.
   the RAMB36 site itself drives nothing. FIFO, ECC, cascade, the RAMB36
   1-bit mode, per-byte write enables and WRITE_FIRST with unequal read and
   write widths are reported as extraction errors, not guessed.
+* DSP (`dsp.py`): each DSP tile holds `DSP48.DSP_0` and `DSP48.DSP_1`,
+  decoded from their bits (AREG/BREG with the inverted `ZAREG_2_ACASCREG_1`
+  cascade encoding, the `Z<reg>` register-off bits, A/B_INPUT, USE_DPORT,
+  USE_SIMD, AUTORESET_PATDET, SEL_MASK, PATTERN, MASK, `ZIS_*_INVERTED`)
+  and modelled by a behavioural Verilog DSP48E1 written from UG479
+  (`x7v_dsp48e1`: A/B/C/D/AD/M/P and control registers with CE and reset,
+  INMODE, pre-adder, 25x18 multiply, OPMODE X/Y/Z, ALUMODE add/subtract and
+  logic, CARRYINSEL, SIMD lanes, ACIN/BCIN/PCIN/CARRYCASCIN cascades over
+  the tile's dedicated wires). The tie-off pips on DSP pins (`D`, `INMODE`,
+  `CEAD`, ...) read their one bitless fabric source when neither is set.
+  USE_MULT, USE_PATTERN_DETECT and SEL_PATTERN have no X-Ray bit, so
+  AUTORESET, MACC extend (OPMODE Z = 100) and any read of PATTERNDETECT,
+  PATTERNBDETECT, OVERFLOW, UNDERFLOW or MULTSIGNOUT are extraction errors.
+  Not yet run against a DSP bitstream.
 
 ## Validation (what has been proven, and on what)
 

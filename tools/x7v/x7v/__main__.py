@@ -4,6 +4,7 @@
   python3 -m x7v decode    <bit> [-o out.fasm]
   python3 -m x7v roundtrip <bit>                       # decode -> encode == input?
   python3 -m x7v bram      <bit>                       # every configured block RAM half
+  python3 -m x7v dsp       <bit>                       # every configured DSP48E1
   python3 -m x7v extract   <bit> -o netlist.v
   python3 -m x7v verify    <bit> --design N [--rtl a.vhd ...] [--top T] [--xdc X] [--golden G]
   python3 -m x7v corpus    <corpus.json> [--bit-key bit|golden] [--only a,b]
@@ -16,7 +17,7 @@ import argparse
 import os
 import sys
 
-from . import bit, bram, decode, encode, fasmio, netlist, pins, synthcheck, verify
+from . import bit, bram, decode, dsp, encode, fasmio, netlist, pins, synthcheck, verify
 from .db import Db
 from .cosim import is_verilog as cosim_is_verilog
 
@@ -30,6 +31,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("decode"); p.add_argument("bit"); p.add_argument("-o")
     p = sub.add_parser("roundtrip"); p.add_argument("bit")
     p = sub.add_parser("bram"); p.add_argument("bit")
+    p = sub.add_parser("dsp"); p.add_argument("bit")
     p = sub.add_parser("extract"); p.add_argument("bit"); p.add_argument("-o", required=True)
     p = sub.add_parser("verify"); p.add_argument("bit"); p.add_argument("--design", default="design")
     p.add_argument("--rtl", nargs="*"); p.add_argument("--top"); p.add_argument("--xdc"); p.add_argument("--golden")
@@ -76,6 +78,10 @@ def main(argv=None) -> int:
     if a.cmd == "bram":
         lines = bram.summary(decode.decode(db, bit.parse(a.bit, db.part).frames))
         print("\n".join(lines) or "no block RAM configured")
+        return 0
+    if a.cmd == "dsp":
+        lines = dsp.summary(decode.decode(db, bit.parse(a.bit, db.part).frames))
+        print("\n".join(lines) or "no DSP48E1 configured")
         return 0
     if a.cmd == "roundtrip":
         bs = bit.parse(a.bit, db.part)
