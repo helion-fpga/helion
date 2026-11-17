@@ -2091,8 +2091,11 @@ fn pack_dsp(
         Ok(val)
     };
 
-    let areg = parse_reg("AREG", 0, 2)?;
-    let breg = parse_reg("BREG", 0, 2)?;
+    // A DSP48E1 instance defaults every register to 1, as the primitive
+    // does (UG953); the IR's inferred DSP cells give theirs explicitly.
+    let d = if modes_override.is_none() { 1 } else { 0 };
+    let areg = parse_reg("AREG", d, 2)?;
+    let breg = parse_reg("BREG", d, 2)?;
     let acascreg = parse_reg("ACASCREG", areg, 2)?;
     let bcascreg = parse_reg("BCASCREG", breg, 2)?;
     for (k, reg, casc) in [("A", areg, acascreg), ("B", breg, bcascreg)] {
@@ -2100,16 +2103,16 @@ fn pack_dsp(
             return Err(format!("pack: DSP48E1 {cell_name}: {k}CASCREG={casc} with {k}REG={reg} is not a legal pair"));
         }
     }
-        let creg = parse_reg("CREG", 0, 1)?;
-    let dreg = parse_reg("DREG", 0, 1)?;
-    let adreg = parse_reg("ADREG", 0, 1)?;
-    let mreg = parse_reg("MREG", 0, 1)?;
-    let preg = parse_reg("PREG", 0, 1)?;
-    let opmodereg = parse_reg("OPMODEREG", 0, 1)?;
-    let alumodereg = parse_reg("ALUMODEREG", 0, 1)?;
-    let inmodereg = parse_reg("INMODEREG", 0, 1)?;
-    let carryinreg = parse_reg("CARRYINREG", 0, 1)?;
-    let carryinselreg = parse_reg("CARRYINSELREG", 0, 1)?;
+    let creg = parse_reg("CREG", d, 1)?;
+    let dreg = parse_reg("DREG", d, 1)?;
+    let adreg = parse_reg("ADREG", d, 1)?;
+    let mreg = parse_reg("MREG", d, 1)?;
+    let preg = parse_reg("PREG", d, 1)?;
+    let opmodereg = parse_reg("OPMODEREG", d, 1)?;
+    let alumodereg = parse_reg("ALUMODEREG", d, 1)?;
+    let inmodereg = parse_reg("INMODEREG", d, 1)?;
+    let carryinreg = parse_reg("CARRYINREG", d, 1)?;
+    let carryinselreg = parse_reg("CARRYINSELREG", d, 1)?;
 
     let use_mult = attrs
         .get("USE_MULT")
@@ -3485,6 +3488,18 @@ mod tests {
         assert_eq!(p.brams[12].pins[0].1, "a_rep2", "a new column starts a new group");
         assert_eq!(p.brams[19].pins[0].1, "a_rep2");
         assert_eq!(p.brams[19].pins[1].1, "a", "clock pins stay put");
+    }
+
+    #[test]
+    fn dsp48e1_instance_registers_default_to_xilinx() {
+        let mut d = Design::new("dsp");
+        d.add_cell("u", CellKind::BlackBox { module: intern("DSP48E1") });
+        d.connect("p0", "u", "P0");
+        d.set_cell_attr("u", "CREG", "0").unwrap();
+        let p = pack(&d).unwrap();
+        let x = &p.dsps[0];
+        assert_eq!((x.areg, x.breg, x.acascreg, x.mreg, x.preg, x.dreg, x.adreg, x.opmodereg), (1, 1, 1, 1, 1, 1, 1, 1));
+        assert_eq!(x.creg, 0, "a given parameter wins");
     }
 
     #[test]
