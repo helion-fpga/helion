@@ -3175,8 +3175,9 @@ const WIDE_SINKS: usize = 64;
 ///   with [`WIDE_SINKS`] or more of them (a reset counter every lane reads).
 ///   Each copy takes over the sinks of its group; the rest stay on the
 ///   original.
-/// * A LUT that drives hard blocks of more than [`WIDE_GROUPS`] groups is
-///   copied only when every input is such a copied flop: each copy reads
+/// * A LUT that is wide by the same rule (on the DSP fill, `restart` on the
+///   DSP resets and its inverse on 2,500 lane flops) is copied only when
+///   every input is such a copied flop: each copy reads
 ///   its own group's copies, so no input crosses the chip. (Copying a LUT
 ///   whose inputs stay single makes one wide net per input: on the DSP fill
 ///   24 copies of `restart` did that and routing never settled.)
@@ -3259,16 +3260,20 @@ pub(crate) fn replicate_hard_block_drivers(packed: &mut Packed7, site_xy: &dyn F
             copy_ff.insert(f.q_net.clone(), (fi, hard.union(&fab_groups).copied().collect()));
         }
     }
-    // LUTs to copy: wide on hard blocks, every input a copied flop.
+    // LUTs to copy: wide by the same rule as flops, every input a copied flop.
     let mut copy_lut: Vec<(usize, BTreeSet<usize>)> = Vec::new();
     for (li, l) in packed.luts.iter().enumerate() {
-        let Some(hard) = hard_groups.get(&l.output_net) else { continue };
+        let hard: BTreeSet<usize> = hard_groups.get(&l.output_net).cloned().unwrap_or_default();
+        let fab = fabric.get(l.output_net.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+        let fab_groups: BTreeSet<usize> = fab.iter().copied().collect();
+        let wide = hard.len() > WIDE_GROUPS || (fab_groups.len() > WIDE_GROUPS && fab.len() >= WIDE_SINKS);
         let ins: Vec<&String> = l.input_nets.iter().flatten().collect();
-        if hard.len() > WIDE_GROUPS && !ins.is_empty() && ins.iter().all(|i| copy_ff.contains_key(i.as_str())) {
+        if wide && !ins.is_empty() && ins.iter().all(|i| copy_ff.contains_key(i.as_str())) {
+            let gs: BTreeSet<usize> = hard.union(&fab_groups).copied().collect();
             for i in ins {
-                copy_ff.get_mut(i.as_str()).unwrap().1.extend(hard.iter().copied());
+                copy_ff.get_mut(i.as_str()).unwrap().1.extend(gs.iter().copied());
             }
-            copy_lut.push((li, hard.clone()));
+            copy_lut.push((li, gs));
         }
     }
 
@@ -3598,13 +3603,14 @@ mod tests {
         let mut p = Packed7::default();
         p.ffs.push(ff("por_reg", "por_d", "por"));
         p.luts.push(lut("restart_lut", [Some("por"), None], "restart"));
+        p.luts.push(lut("run_lut", [Some("por"), None], "run"));
         p.luts.push(lut("por_next", [Some("por"), None], "por_d"));
         p.luts.push(lut("por_ce_lut", [Some("por"), None], "por_ce"));
         for i in 0..12 {
             for k in 0..7 {
                 // Seven LUT bits per lane read `por`, all feeding the lane's flops.
                 p.luts.push(lut(&format!("l{i}_{k}"), [Some("por"), Some(&format!("x{i}_{k}"))], &format!("d{i}_{k}")));
-                p.ffs.push(PackedFf { ce_net: None, ..ff(&format!("q{i}_{k}"), &format!("d{i}_{k}"), &format!("q{i}_{k}")) });
+                p.ffs.push(PackedFf { ce_net: Some("run".into()), ..ff(&format!("q{i}_{k}"), &format!("d{i}_{k}"), &format!("q{i}_{k}")) });
             }
             let mut pins: Vec<(String, String, bool)> = (0..7).map(|k| (format!("A{k}"), format!("q{i}_{k}"), false)).collect();
             pins.push(("RSTA".into(), "restart".into(), false));
@@ -3620,6 +3626,9 @@ mod tests {
         assert_eq!(rst.len(), 3);
         assert!(rst.iter().any(|l| l.output_net == "restart_rep1" && l.input_nets[0].as_deref() == Some("por_rep1")));
         assert_eq!(p.dsps[6].pins[7].1, "restart_rep1");
+        // `run` (a LUT of `por`) on 84 lane clock enables: copied the same way.
+        assert_eq!(p.ffs.iter().find(|f| f.name == "q5_0").unwrap().ce_net.as_deref(), Some("run_rep1"));
+        assert!(p.luts.iter().any(|l| l.output_net == "run_rep2" && l.input_nets[0].as_deref() == Some("por_rep2")));
         assert!(p.lone_cells.contains("por_reg_rep2") && p.lone_cells.contains("restart_lut_rep2"));
         // The counter's own clock enable and next state follow into each group.
         let por2 = p.ffs.iter().find(|f| f.name == "por_reg_rep2").unwrap();
