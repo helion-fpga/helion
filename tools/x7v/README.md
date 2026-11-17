@@ -105,6 +105,19 @@ tried.
   buses routed through the tile cascade wires (`BRAM_CASCINBOT_*` pips)
   need `CASCOUT_ARD/BWR_ACTIVE` in the driving tile below, as Vivado always
   sets it. Block RAM content frames carry no ECC (Vivado writes word 50 as 0).
+* LUT RAM (`lutram.py`): a SLICEM LUT with `xLUT.RAM` is a 64-bit memory
+  initialised from its INIT, read asynchronously on its own pins (O5 the
+  lower half), written on the clock edge at the D LUT's pins `D1..D6`
+  while the write enable (`CE` with `WEMUX.CE`, else `WE`) is 1. The data
+  is the LUT's `xI` pin with `xLUT.DI1MUX.xI`, else the data of the LUT
+  above (D always takes `DI`); `SMALL` LUTs write both 32-bit halves, the
+  upper from the `xX` pin. `WA7USED`/`WA8USED` take `WA7`/`WA8` from
+  `CX`/`BX`: C and A are written when `WA7` = 1, B and A when `WA8` = 1.
+  Frame ECC: Vivado computes it with the INIT bits of RAM-mode LUTs taken
+  as 0 (their contents change as the design runs).
+* A LUT output reads only the inputs it depends on (O5 and O6 separately),
+  so an X on an input one output ignores, such as a combinational loop the
+  other output closes, does not reach it. Vivado's PicoRV32 has such a loop.
 * DSP (`dsp.py`): each DSP tile holds `DSP48.DSP_0` and `DSP48.DSP_1`,
   decoded from their bits (AREG/BREG with the inverted `ZAREG_2_ACASCREG_1`
   cascade encoding; X-Ray lacks AREG_1/BREG_1, which Vivado writes as
@@ -146,8 +159,16 @@ mismatches against the RTL (BRAM: 7,000 cycles, all three scans; DSP:
 shares nothing with `x7v_dsp48e1`). `tests/vivado_enc.py` checks the
 encodings these builds taught x7v (and, given `X7V_VIVADO_REF`, the builds).
 
-Not validated against Vivado (no reference design uses them yet): F7/F8 wide
-muxes (modelled, flagged as a warning), LUTRAM/SRL, MMCM/PLL,
+LUT RAM against Vivado 2017.3 builds (`tests/lutram.py`, references in
+`X7V_LUTRAM_REF`): every LUT RAM primitive side by side
+(`tools/svcheck/tests_hard/lutram_prims.sv`, which also exercises F7/F8)
+verifies against Xilinx's unisim models, 220,000 output samples, 0
+mismatches, and fails with one RAM LUT's contents inverted; PicoRV32's
+register file (12 RAM32M) verifies over 20,000 cycles; all 7 Vivado
+LUT RAM builds decode with 0 unexplained bits and 0 ECC mismatches.
+
+Not validated against Vivado (no reference design uses them yet): F7/F8
+wide muxes outside LUT RAM (modelled, flagged as a warning), SRL, MMCM/PLL,
 IDDR/ODDR/SERDES, tristate I/O. The extractor reports these as errors rather
 than guessing.
 
