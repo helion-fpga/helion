@@ -20,8 +20,9 @@ fn z020_flow_smoke() {
     let bs = run_for_part(&netlist, "xc7z020").expect("xc7z020 flow run");
     assert!(!bs.fasm.is_empty(), "empty FASM");
     let text = bs.fasm.join("\n");
+    // Placement may use any of the four LUT letters.
     assert!(
-        text.contains(".ALUT.INIT[63:0]"),
+        ["A", "B", "C", "D"].iter().any(|k| text.contains(&format!(".{k}LUT.INIT[63:0]"))),
         "missing LUT INIT:\n{text}"
     );
     assert!(

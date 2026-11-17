@@ -34,6 +34,7 @@ COUNTS = [("lut", r"(\d+) LUTs"), ("ff", r"(\d+) flops"), ("carry", r"(\d+) carr
 TIMES = [("t_synth", r"synthesized in ([\d.]+)s"), ("t_pack_place", r"placed in ([\d.]+)s"),
          ("t_route", r"routed in ([\d.]+)s"), ("t_device", r"device ([\d.]+)s,"), ("t_bitgen", r"bitgen ([\d.]+)s")]
 
+COUNT_KEYS = ("lut", "ff", "carry", "ramb18", "ramb36", "dsp")
 # key, direction in which a change is worse (+1: higher is worse)
 GATES = [("lut", 1), ("ff", 1), ("carry", -1), ("ramb18", -1), ("ramb36", -1), ("dsp", -1),
          ("slack_ns", -1), ("wall_s", 1), ("t_route", 1)]
@@ -105,21 +106,19 @@ def compare(base, cur):
         if b is None:
             warns.append(f"{name}: not in the baseline (run --accept to add it)")
             continue
-        if not c["ok"]:
-            if b["ok"]:
-                fails.append(f"{name}: built before, now fails: {c.get('error')}")
-            continue
-        if not b["ok"]:
+        if b["ok"] and not c["ok"]:
+            fails.append(f"{name}: built before, now fails: {c.get('error')}")
+        if c["ok"] and not b["ok"]:
             warns.append(f"{name}: now builds (failed in the baseline); --accept records it")
-            continue
         if b.get("deterministic") and not c.get("deterministic", True):
             fails.append(f"{name}: two builds no longer give the same .bit (G22)")
         for k, worse in GATES:
             bv, cv = b.get(k), c.get(k)
-            if bv is None:
+            # Counts are gated even for a build that packed but did not finish (G49); timing only when both finished.
+            if bv is None or (k not in COUNT_KEYS and not (b["ok"] and c["ok"])):
                 continue
             if cv is None:
-                fails.append(f"{name}: {k} missing from zedbit's output (output changed? update parse())")
+                fails.append(f"{name}: {k} no longer reported (zedbit stopped earlier, or its output changed: update parse())")
                 continue
             d = (cv - bv) * worse
             msg = f"{name}: {k} {bv} -> {cv}"
@@ -185,6 +184,7 @@ def main():
     ap.add_argument("--accept", action="store_true", help="write this run's numbers into baseline.json")
     ap.add_argument("--json", help="write the results to this file")
     ap.add_argument("--timeout", type=float, help="seconds per build; a build killed by it counts as failed")
+    ap.add_argument("--only", help="comma-separated design names: build just these (any set)")
     ap.add_argument("--selftest", action="store_true", help="check the parser and the gate, build nothing")
     a = ap.parse_args()
     if a.selftest:
@@ -197,14 +197,14 @@ def main():
     zedbit = os.path.join(tdir, "release", "examples", "zedbit")
     out_dir = os.path.join(tdir, "qor")
     os.makedirs(out_dir, exist_ok=True)
-    commit = git("rev-parse", "--short", "HEAD") + ("+dirty" if git("status", "--porcelain", "--untracked-files=no") else "")
+    commit = git("rev-parse", "--short", "HEAD") + ("+dirty" if git("status", "--porcelain", "--untracked-files=no", "--", ".", ":!tools/qor") else "")
     date = time.strftime("%Y-%m-%d %H:%M")
     viv = load("vivado.json")
     print(f"qor: {a.set} set, Helion {commit}, {date}, load {os.getloadavg()[0]:.0f}, logs in {out_dir}", flush=True)
 
     cur = {}
     for d in DESIGNS:
-        if a.set == "quick" and d[1] != "quick":
+        if (a.only and d[0] not in a.only.split(",")) or (not a.only and a.set == "quick" and d[1] != "quick"):
             continue
         print(f"qor: {d[0]} ...", flush=True)
         r, bit = build(zedbit, d, out_dir, a.timeout)
@@ -281,6 +281,10 @@ zedbit timing: synth 0.1s, device 1.6s, pack+place 2.7s, route 17.0s, bitgen 1.4
     assert len(ok(deterministic=False)[0]) == 1
     assert len(ok(slack_ns=None)[0]) == 1             # parser lost a field
     assert compare({"d": dict(b, ok=False)}, {"d": dict(b, ok=False)}) == ([], [])
+    nb = dict(b, ok=False, slack_ns=None, t_route=None)  # packed, did not finish
+    assert compare({"d": nb}, {"d": dict(nb, dsp=0)})[0] != []          # counts still gated
+    assert compare({"d": nb}, {"d": dict(nb, wall_s=500.0)}) == ([], [])  # runtime not
+    assert len(compare({"d": nb}, {"d": dict(b)})[1]) == 1             # now builds: warning
     t = check_targets([{"gap": "G1", "design": "d", "metric": "lut", "max": 50, "goal": ""},
                        {"gap": "G9", "design": "d", "metric": "ok", "eq": True, "goal": ""},
                        {"gap": "G4", "design": "x", "metric": "t_route", "max": 1, "goal": ""}], {"d": b})

@@ -69,6 +69,7 @@ fn synth_zb(paths: &[&str], top: Option<&str>) -> Result<Design, String> {
 fn synth_v2(paths: &[&str], top: Option<&str>) -> Result<(Design, Vec<(String, String)>), String> {
     helion_sv::v2::set_hard(true);
     let mut renames = Vec::new();
+    helion_sv::v2::dag::set_carry_arith(std::env::var("HELION_NO_CARRY").is_err());
     let s = if is_vhdl(paths[0]) {
         let mut src = String::new();
         for p in paths {
@@ -408,10 +409,10 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
         period /= 2;
     }
     let periods = clock_periods(&packed, period)?;
-    for (clk, p) in &periods {
-        eprintln!("zedbit timing: clock {clk}: period {:.3} ns", *p as f64 / 1000.0);
-    }
     let ta = helion_xilinx7::timing::analyze_clocks(&routed, &|c| periods.get(c).copied())?;
+    for (clk, wns) in &ta.clocks {
+        eprintln!("zedbit timing: clock {clk}: period {:.3} ns, worst slack {:.3} ns", periods[clk] as f64 / 1000.0, *wns as f64 / 1000.0);
+    }
     eprintln!(
         "zedbit timing: worst clock period {:.3} ns, worst slack {:.3} ns ({} of {} endpoints failing), est. fmax {:.0} MHz on that clock",
         ta.period_ps as f64 / 1000.0,
@@ -420,10 +421,17 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
         ta.endpoints,
         ta.fmax_mhz()
     );
+    // Each hop's routed wire next to the placer's estimate (none for dedicated carry cascades).
+    let mut prev: Option<(i32, i32)> = None;
+    for st in &ta.worst_path {
+        let est = match (prev, st.xy) {
+            (Some(a), Some(b)) if a != b && st.wire_ps > 0 => format!("{:>6.3}", helion_xilinx7::place_sa::wire_ps((a.0 - b.0).abs() + (a.1 - b.1).abs()) as f64 / 1000.0),
+            _ => "     -".into(),
+        };
+        eprintln!("  {:>8.3} ns  wire {:>6.3} (placer est {est})  {}", st.arrival_ps as f64 / 1000.0, st.wire_ps as f64 / 1000.0, st.what);
+        prev = st.xy.or(prev);
+    }
     if ta.wns_ps < 0 {
-        for st in &ta.worst_path {
-            eprintln!("  {:>8.3} ns  {}", st.arrival_ps as f64 / 1000.0, st.what);
-        }
         if !ignore_timing {
             return Err(format!(
                 "timing not met: worst path {:.3} ns exceeds the {:.3} ns clock period (with setup and margin); no bitstream written (pass --ignore-timing to override)",

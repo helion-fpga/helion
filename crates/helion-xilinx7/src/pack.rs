@@ -2096,8 +2096,11 @@ fn pack_dsp(
         Ok(val)
     };
 
-    let areg = parse_reg("AREG", 0, 2)?;
-    let breg = parse_reg("BREG", 0, 2)?;
+    // A DSP48E1 instance defaults every register to 1, as the primitive
+    // does (UG953); the IR's inferred DSP cells give theirs explicitly.
+    let d = if modes_override.is_none() { 1 } else { 0 };
+    let areg = parse_reg("AREG", d, 2)?;
+    let breg = parse_reg("BREG", d, 2)?;
     let acascreg = parse_reg("ACASCREG", areg, 2)?;
     let bcascreg = parse_reg("BCASCREG", breg, 2)?;
     for (k, reg, casc) in [("A", areg, acascreg), ("B", breg, bcascreg)] {
@@ -2105,16 +2108,16 @@ fn pack_dsp(
             return Err(format!("pack: DSP48E1 {cell_name}: {k}CASCREG={casc} with {k}REG={reg} is not a legal pair"));
         }
     }
-        let creg = parse_reg("CREG", 0, 1)?;
-    let dreg = parse_reg("DREG", 0, 1)?;
-    let adreg = parse_reg("ADREG", 0, 1)?;
-    let mreg = parse_reg("MREG", 0, 1)?;
-    let preg = parse_reg("PREG", 0, 1)?;
-    let opmodereg = parse_reg("OPMODEREG", 0, 1)?;
-    let alumodereg = parse_reg("ALUMODEREG", 0, 1)?;
-    let inmodereg = parse_reg("INMODEREG", 0, 1)?;
-    let carryinreg = parse_reg("CARRYINREG", 0, 1)?;
-    let carryinselreg = parse_reg("CARRYINSELREG", 0, 1)?;
+    let creg = parse_reg("CREG", d, 1)?;
+    let dreg = parse_reg("DREG", d, 1)?;
+    let adreg = parse_reg("ADREG", d, 1)?;
+    let mreg = parse_reg("MREG", d, 1)?;
+    let preg = parse_reg("PREG", d, 1)?;
+    let opmodereg = parse_reg("OPMODEREG", d, 1)?;
+    let alumodereg = parse_reg("ALUMODEREG", d, 1)?;
+    let inmodereg = parse_reg("INMODEREG", d, 1)?;
+    let carryinreg = parse_reg("CARRYINREG", d, 1)?;
+    let carryinselreg = parse_reg("CARRYINSELREG", d, 1)?;
 
     let use_mult = attrs
         .get("USE_MULT")
@@ -3164,42 +3167,51 @@ fn insert_input_buffers(netlist: &Design, packed: &mut Packed7) -> Result<(), St
     Ok(())
 }
 
-/// Hard blocks one copy of a shared driver serves (4 BRAM or DSP tiles).
-const HARD_FANOUT_GROUP: usize = 8;
+/// Hard blocks per group, each group served by its own copy of a shared
+/// driver: 8 RAMB18 (4 BRAM tiles) or 4 DSP48E1 (2 DSP tiles; a DSP lane
+/// brings more fabric logic with it).
+fn hard_group_size(is_dsp: bool) -> usize {
+    if is_dsp { 4 } else { 8 }
+}
 
-/// A flop that drives a data or control pin of more than two groups of
-/// block RAMs or DSPs is copied, one copy per [`HARD_FANOUT_GROUP`] blocks,
-/// so placement can put each copy beside its blocks. One driver across 240
-/// RAMs routes in tens of nanoseconds; Vivado replicates too. The original
-/// keeps only its fabric loads: it shares a slice with the LUT before it,
-/// which the copies pull to their middle.
+/// A fabric flop counts as wide when its sinks span more than this many groups.
+const WIDE_GROUPS: usize = 2;
+/// ... and at least this many of its sinks belong to a group.
+const WIDE_SINKS: usize = 64;
+
+/// Copies of drivers shared by many block RAMs or DSPs, one per group of
+/// blocks (a run of [`hard_group_size`] blocks of one column), so each copy
+/// sits by its group. One driver across 240 RAMs routes in tens of
+/// nanoseconds; Vivado replicates too.
 ///
-/// LUTs are not copied: each copy would need every input brought across
-/// the chip, one wide net per input instead of one. On the DSP fill the 24
-/// copies of `restart` (5 inputs) left those 5 nets fighting for the same
-/// wires (29,000 rip-ups after 37 minutes, not converging).
+/// Each cell of the design belongs to at most one group: a hard block to
+/// its own; a flop to the one group whose blocks read its output; a LUT to
+/// the group of the blocks it drives, directly or through the one flop it
+/// feeds (a DSP lane's LFSR bit: LUT -> flop -> the DSP's A/B pin).
+///
+/// * A flop is copied when hard blocks of more than [`WIDE_GROUPS`] groups
+///   read it, or when its fabric sinks span more than [`WIDE_GROUPS`] groups
+///   with [`WIDE_SINKS`] or more of them (a reset counter every lane reads).
+///   Each copy takes over the sinks of its group; the rest stay on the
+///   original.
+/// * A LUT that drives hard blocks of more than [`WIDE_GROUPS`] groups is
+///   copied only when every input is such a copied flop: each copy reads
+///   its own group's copies, so no input crosses the chip. (Copying a LUT
+///   whose inputs stay single makes one wide net per input: on the DSP fill
+///   24 copies of `restart` did that and routing never settled.)
 ///
 /// Placement runs this once the blocks have sites: `site_xy` gives a
-/// block's site `(X, Y)` by cell name, and a group never spans two columns.
+/// block's site `(X, Y)` by cell name.
 pub(crate) fn replicate_hard_block_drivers(packed: &mut Packed7, site_xy: &dyn Fn(&str) -> Option<(i32, i32)>) {
+    use std::collections::{BTreeSet, HashMap};
     let is_clk = |pin: &str| pin.starts_with("CLK") || pin.starts_with("REGCLK");
     let nb = packed.brams.len();
-    // Net -> hard blocks reading it (BRAMs, then DSPs offset by `nb`).
-    let mut users: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    let hard_pins = packed.brams.iter().map(|b| &b.pins).chain(packed.dsps.iter().map(|d| &d.pins));
-    for (i, pins) in hard_pins.enumerate() {
-        for (pin, net, out) in pins {
-            if *out || is_clk(pin) {
-                continue;
-            }
-            let v = users.entry(net.clone()).or_default();
-            if v.last() != Some(&i) {
-                v.push(i);
-            }
-        }
+    let n = nb + packed.dsps.len();
+    if n == 0 {
+        return;
     }
-    // Column-major by (DSP?, X, Y); a group ends at a full group or a new column.
-    let keys: Vec<(bool, i32, i32)> = packed
+    // Groups: column-major per kind, a new group at a full group or a new column.
+    let mut order: Vec<(bool, i32, i32, usize)> = packed
         .brams
         .iter()
         .map(|b| &b.name)
@@ -3207,43 +3219,142 @@ pub(crate) fn replicate_hard_block_drivers(packed: &mut Packed7, site_xy: &dyn F
         .enumerate()
         .map(|(i, name)| {
             let (x, y) = site_xy(name).unwrap_or((i32::MAX, i as i32));
-            (i >= nb, x, y)
+            (i >= nb, x, y, i)
         })
         .collect();
-    let key = |i: usize| keys[i];
-    for (net, mut blocks) in users {
-        if blocks.len() <= 2 * HARD_FANOUT_GROUP {
-            continue;
+    order.sort();
+    let mut group_of = vec![0usize; n];
+    let (mut groups, mut cur, mut fill) = (0usize, None, 0usize);
+    for (dsp, x, _, i) in order {
+        if cur != Some((dsp, x)) || fill == hard_group_size(dsp) {
+            groups += 1;
+            fill = 0;
+            cur = Some((dsp, x));
         }
-        blocks.sort_by_key(|&i| key(i));
-        let mut groups: Vec<Vec<usize>> = Vec::new();
-        for i in blocks {
-            match groups.last_mut() {
-                Some(g) if g.len() < HARD_FANOUT_GROUP && key(g[0]).0 == key(i).0 && key(g[0]).1 == key(i).1 => g.push(i),
-                _ => groups.push(vec![i]),
+        group_of[i] = groups - 1;
+        fill += 1;
+    }
+    // Net -> groups of the hard blocks reading it on a data/control pin.
+    let mut hard_groups: HashMap<String, BTreeSet<usize>> = HashMap::new();
+    let hard_pins = packed.brams.iter().map(|b| &b.pins).chain(packed.dsps.iter().map(|d| &d.pins));
+    for (i, pins) in hard_pins.enumerate() {
+        for (pin, net, out) in pins {
+            if !*out && !is_clk(pin) {
+                hard_groups.entry(net.clone()).or_default().insert(group_of[i]);
             }
         }
-        let Some(f) = packed.ffs.iter().find(|f| f.q_net == net).cloned() else { continue };
-        for (k, chunk) in groups.iter().enumerate() {
-            let copy = format!("{net}_rep{k}");
-            packed.lone_cells.insert(format!("{}_rep{k}", f.name));
-            packed.ffs.push(PackedFf { name: format!("{}_rep{k}", f.name), q_net: copy.clone(), ..f.clone() });
-            for &i in chunk {
-                let pins = if i < nb { &mut packed.brams[i].pins } else { &mut packed.dsps[i - nb].pins };
-                for (pin, n, out) in pins.iter_mut() {
-                    if !*out && !is_clk(pin) && *n == net {
-                        *n = copy.clone();
+    }
+    let only = |net: &str| hard_groups.get(net).filter(|g| g.len() == 1).and_then(|g| g.iter().next().copied());
+    let ff_by_d: HashMap<&str, &PackedFf> = packed.ffs.iter().map(|f| (f.d_net.as_str(), f)).collect();
+    let lut_group: Vec<Option<usize>> = packed
+        .luts
+        .iter()
+        .map(|l| only(&l.output_net).or_else(|| ff_by_d.get(l.output_net.as_str()).and_then(|f| only(&f.q_net))))
+        .collect();
+    let ff_group: Vec<Option<usize>> = packed.ffs.iter().map(|f| only(&f.q_net)).collect();
+
+    // Flops to copy: net -> (flop index, groups needing a copy).
+    let mut fabric: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (li, l) in packed.luts.iter().enumerate() {
+        if let Some(g) = lut_group[li] {
+            for inp in l.input_nets.iter().flatten() {
+                fabric.entry(inp.as_str()).or_default().push(g);
+            }
+        }
+    }
+    for (fi, f) in packed.ffs.iter().enumerate() {
+        if let Some(g) = ff_group[fi] {
+            for inp in [Some(&f.d_net), f.ce_net.as_ref(), f.sr_net.as_ref()].into_iter().flatten() {
+                fabric.entry(inp.as_str()).or_default().push(g);
+            }
+        }
+    }
+    let mut copy_ff: BTreeMap<String, (usize, BTreeSet<usize>)> = BTreeMap::new();
+    for (fi, f) in packed.ffs.iter().enumerate() {
+        let hard: BTreeSet<usize> = hard_groups.get(&f.q_net).cloned().unwrap_or_default();
+        let fab = fabric.get(f.q_net.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+        let fab_groups: BTreeSet<usize> = fab.iter().copied().collect();
+        if hard.len() > WIDE_GROUPS || (fab_groups.len() > WIDE_GROUPS && fab.len() >= WIDE_SINKS) {
+            copy_ff.insert(f.q_net.clone(), (fi, hard.union(&fab_groups).copied().collect()));
+        }
+    }
+    // LUTs to copy: wide on hard blocks, every input a copied flop.
+    let mut copy_lut: Vec<(usize, BTreeSet<usize>)> = Vec::new();
+    for (li, l) in packed.luts.iter().enumerate() {
+        let Some(hard) = hard_groups.get(&l.output_net) else { continue };
+        let ins: Vec<&String> = l.input_nets.iter().flatten().collect();
+        if hard.len() > WIDE_GROUPS && !ins.is_empty() && ins.iter().all(|i| copy_ff.contains_key(i.as_str())) {
+            for i in ins {
+                copy_ff.get_mut(i.as_str()).unwrap().1.extend(hard.iter().copied());
+            }
+            copy_lut.push((li, hard.clone()));
+        }
+    }
+
+    let rep = |net: &str, g: usize| format!("{net}_rep{g}");
+    // Rewire every sink of `net` that belongs to group `g`.
+    let rewire = |packed: &mut Packed7, net: &str, g: usize, lut_group: &[Option<usize>], ff_group: &[Option<usize>]| {
+        let copy = rep(net, g);
+        for (i, b) in packed.brams.iter_mut().enumerate() {
+            if group_of[i] == g {
+                for (pin, nn, out) in b.pins.iter_mut() {
+                    if !*out && !is_clk(pin) && *nn == net {
+                        *nn = copy.clone();
                     }
                 }
-                if i < nb {
-                    let b = &mut packed.brams[i];
-                    for n in b.wea_nets.iter_mut().chain(b.web_nets.iter_mut()) {
-                        if *n == net {
-                            *n = copy.clone();
-                        }
+                for nn in b.wea_nets.iter_mut().chain(b.web_nets.iter_mut()) {
+                    if *nn == net {
+                        *nn = copy.clone();
                     }
                 }
             }
+        }
+        for (j, d) in packed.dsps.iter_mut().enumerate() {
+            if group_of[nb + j] == g {
+                for (pin, nn, out) in d.pins.iter_mut() {
+                    if !*out && !is_clk(pin) && *nn == net {
+                        *nn = copy.clone();
+                    }
+                }
+            }
+        }
+        for (li, l) in packed.luts.iter_mut().enumerate() {
+            if lut_group.get(li).copied().flatten() == Some(g) {
+                for nn in l.input_nets.iter_mut().flatten() {
+                    if *nn == net {
+                        *nn = copy.clone();
+                    }
+                }
+            }
+        }
+        for (fi, f) in packed.ffs.iter_mut().enumerate() {
+            if ff_group.get(fi).copied().flatten() == Some(g) {
+                for nn in [Some(&mut f.d_net), f.ce_net.as_mut(), f.sr_net.as_mut()].into_iter().flatten() {
+                    if *nn == net {
+                        *nn = copy.clone();
+                    }
+                }
+            }
+        }
+    };
+    for (net, (fi, gs)) in &copy_ff {
+        let f = packed.ffs[*fi].clone();
+        for &g in gs {
+            rewire(packed, net, g, &lut_group, &ff_group);
+            packed.lone_cells.insert(format!("{}_rep{g}", f.name));
+            packed.ffs.push(PackedFf { name: format!("{}_rep{g}", f.name), q_net: rep(net, g), ..f.clone() });
+        }
+    }
+    for (li, gs) in copy_lut {
+        let l = packed.luts[li].clone();
+        for g in gs {
+            rewire(packed, &l.output_net, g, &lut_group, &ff_group);
+            let mut c = PackedLut { name: format!("{}_rep{g}", l.name), output_net: rep(&l.output_net, g), ..l.clone() };
+            for nn in c.input_nets.iter_mut().flatten() {
+                *nn = rep(nn, g);
+            }
+            packed.lone_cells.insert(c.name.clone());
+            packed.luts.push(c);
         }
     }
 }
@@ -3377,11 +3488,12 @@ mod tests {
 
     #[test]
     fn hard_block_fanout_is_replicated_per_group() {
-        let mut p = Packed7::default();
-        p.ffs.push(PackedFf {
-            name: "a_reg".into(), d_net: "a_d".into(), q_net: "a".into(), clk_net: "clk".into(),
+        let ff = |name: &str, d: &str, q: &str| PackedFf {
+            name: name.into(), d_net: d.into(), q_net: q.into(), clk_net: "clk".into(),
             ce_net: None, sr_net: None, init: false, srval: false, sr_async: false,
-        });
+        };
+        let mut p = Packed7::default();
+        p.ffs.push(ff("a_reg", "a_d", "a"));
         for i in 0..20 {
             p.brams.push(PackedBram {
                 name: format!("ram{i}"),
@@ -3389,10 +3501,10 @@ mod tests {
                 ..Default::default()
             });
         }
-        // ram0..11 in column 0, ram12..19 in column 1.
+        // ram0..11 in column 0, ram12..19 in column 1: groups 0..7 | 8..11 | 12..19.
         let xy = |name: &str| name[3..].parse::<i32>().ok().map(|i| if i < 12 { (0, i) } else { (1, i - 12) });
         replicate_hard_block_drivers(&mut p, &xy);
-        assert_eq!(p.ffs.len(), 4, "groups of 8 per column (8 + 4 | 8): the original and three copies");
+        assert_eq!(p.ffs.len(), 4, "the original and three copies");
         assert!(p.ffs.iter().all(|f| f.d_net == "a_d"));
         assert_eq!(p.brams[7].pins[0].1, "a_rep0");
         assert_eq!(p.brams[8].pins[0].1, "a_rep1");
@@ -3400,6 +3512,60 @@ mod tests {
         assert_eq!(p.brams[12].pins[0].1, "a_rep2", "a new column starts a new group");
         assert_eq!(p.brams[19].pins[0].1, "a_rep2");
         assert_eq!(p.brams[19].pins[1].1, "a", "clock pins stay put");
+    }
+
+    #[test]
+    fn dsp48e1_instance_registers_default_to_xilinx() {
+        let mut d = Design::new("dsp");
+        d.add_cell("u", CellKind::BlackBox { module: intern("DSP48E1") });
+        d.connect("p0", "u", "P0");
+        d.set_cell_attr("u", "CREG", "0").unwrap();
+        let p = pack(&d).unwrap();
+        let x = &p.dsps[0];
+        assert_eq!((x.areg, x.breg, x.acascreg, x.mreg, x.preg, x.dreg, x.adreg, x.opmodereg), (1, 1, 1, 1, 1, 1, 1, 1));
+        assert_eq!(x.creg, 0, "a given parameter wins");
+    }
+
+    #[test]
+    fn reset_reaching_every_dsp_lane_is_copied_per_group() {
+        // 12 DSP lanes in one column (groups of 4): lane i is LUT l{i}
+        // (reads `por` and x{i}) -> flop q{i} -> DSP i's A0, and every DSP's
+        // RSTA is `restart`, a LUT of `por` alone. 80 sinks of `por`.
+        let ff = |name: &str, d: &str, q: &str| PackedFf {
+            name: name.into(), d_net: d.into(), q_net: q.into(), clk_net: "clk".into(),
+            ce_net: Some("por_ce".into()), sr_net: None, init: false, srval: false, sr_async: false,
+        };
+        let lut = |name: &str, ins: [Option<&str>; 2], out: &str| PackedLut {
+            name: name.into(),
+            init: 0x6,
+            input_nets: [ins[0].map(Into::into), ins[1].map(Into::into), None, None, None, None],
+            output_net: out.into(),
+        };
+        let mut p = Packed7::default();
+        p.ffs.push(ff("por_reg", "por_d", "por"));
+        p.luts.push(lut("restart_lut", [Some("por"), None], "restart"));
+        for i in 0..12 {
+            for k in 0..7 {
+                // Seven LUT bits per lane read `por`, all feeding the lane's flops.
+                p.luts.push(lut(&format!("l{i}_{k}"), [Some("por"), Some(&format!("x{i}_{k}"))], &format!("d{i}_{k}")));
+                p.ffs.push(PackedFf { ce_net: None, ..ff(&format!("q{i}_{k}"), &format!("d{i}_{k}"), &format!("q{i}_{k}")) });
+            }
+            let mut pins: Vec<(String, String, bool)> = (0..7).map(|k| (format!("A{k}"), format!("q{i}_{k}"), false)).collect();
+            pins.push(("RSTA".into(), "restart".into(), false));
+            p.dsps.push(PackedDsp { name: format!("dsp{i}"), pins, ..Default::default() });
+        }
+        let xy = |name: &str| name[3..].parse::<i32>().ok().map(|i| (0, i));
+        replicate_hard_block_drivers(&mut p, &xy);
+        // `por` (84 lane sinks over 3 groups) and `restart` get a copy per group.
+        assert_eq!(p.ffs.iter().filter(|f| f.d_net == "por_d").count(), 4);
+        assert!(p.ffs.iter().filter(|f| f.d_net == "por_d").all(|f| f.ce_net.as_deref() == Some("por_ce")));
+        let lane = |i: usize| p.luts.iter().find(|l| l.name == format!("l{i}_0")).unwrap().input_nets[0].clone().unwrap();
+        assert_eq!((lane(0).as_str(), lane(5).as_str(), lane(11).as_str()), ("por_rep0", "por_rep1", "por_rep2"));
+        let rst: Vec<&PackedLut> = p.luts.iter().filter(|l| l.name.starts_with("restart_lut_rep")).collect();
+        assert_eq!(rst.len(), 3);
+        assert!(rst.iter().any(|l| l.output_net == "restart_rep1" && l.input_nets[0].as_deref() == Some("por_rep1")));
+        assert_eq!(p.dsps[6].pins[7].1, "restart_rep1");
+        assert!(p.lone_cells.contains("por_reg_rep2") && p.lone_cells.contains("restart_lut_rep2"));
     }
 
     fn blinky_design() -> Design {

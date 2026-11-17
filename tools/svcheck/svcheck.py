@@ -142,7 +142,7 @@ class Netlist:
                 self.nets.setdefault(f[1], []).extend(eps)
 
 
-OUT_PINS = {"Lut6": {"O"}, "Hff": {"Q"}, "IobIn": {"O"}, "ClockBuf": {"O"}}
+OUT_PINS = {"Lut6": {"O"}, "Hff": {"Q"}, "IobIn": {"O"}, "ClockBuf": {"O"}, "Carry4": {"O0", "O1", "O2", "O3", "CO"}}
 
 
 def build(nl: Netlist, widths: dict[str, int]):
@@ -309,6 +309,22 @@ def build(nl: Netlist, widths: dict[str, int]):
                 conns.append(f".{port}({{{', '.join(parts)}}})")
             params = ", ".join(f".{k}({param(v)})" for k, v in sorted(nl.attrs.get(cell, {}).items()))
             logic.append(f"{arg} {'#(' + params + ') ' if params else ''}{vid(cell)} ({', '.join(conns)});")
+        elif kind == "Carry4":
+            # O = S ^ carry; carry out = S ? carry : DI. Carry in from CI or CYINIT.
+            ci = pin("CI")
+            c = ref(ci) if ci else f"1'b{1 if nl.attrs.get(cell, {}).get('CYINIT') in ('1', 'true', 'TRUE') else 0}"
+            for j in range(4):
+                s, o = pin(f"S{j}"), pin(f"O{j}")
+                if s is None:
+                    break
+                if o:
+                    logic.append(f"assign {vid(o)} = {ref(s)} ^ {c};")
+                nxt = f"{vid(cell)}_c{j}"
+                body.append(f"wire {nxt};")
+                logic.append(f"assign {nxt} = {ref(s)} ? {c} : {ref(pin(f'DI{j}'))};")
+                c = nxt
+            if pin("CO"):
+                logic.append(f"assign {vid(pin('CO'))} = {c};")
         else:
             problems.append(f"cell {cell} of kind {kind} is not modelled")
 
