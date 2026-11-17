@@ -73,8 +73,17 @@ PRIMS = {
     "SRL16E": _ports("A0 A1 A2 A3 CE CLK D", "Q"),
     "SRLC32E": _ports("A:5 CE CLK D", "Q Q31"),
     "CARRY4": _ports("CI CYINIT DI:4 S:4", "CO:4 O:4"),
+    "RAM32M": _ports("ADDRA:5 ADDRB:5 ADDRC:5 ADDRD:5 DIA:2 DIB:2 DIC:2 DID:2 WCLK WE", "DOA:2 DOB:2 DOC:2 DOD:2"),
+    "RAM64M": _ports("ADDRA:6 ADDRB:6 ADDRC:6 ADDRD:6 DIA DIB DIC DID WCLK WE", "DOA DOB DOC DOD"),
+    "RAM32X1S": _ports("A0 A1 A2 A3 A4 D WCLK WE", "O"),
+    "RAM64X1S": _ports("A0 A1 A2 A3 A4 A5 D WCLK WE", "O"),
+    "RAM128X1S": _ports("A0 A1 A2 A3 A4 A5 A6 D WCLK WE", "O"),
+    "RAM256X1S": _ports("A:8 D WCLK WE", "O"),
+    "RAM32X1D": _ports("A0 A1 A2 A3 A4 DPRA0 DPRA1 DPRA2 DPRA3 DPRA4 D WCLK WE", "SPO DPO"),
+    "RAM64X1D": _ports("A0 A1 A2 A3 A4 A5 DPRA0 DPRA1 DPRA2 DPRA3 DPRA4 DPRA5 D WCLK WE", "SPO DPO"),
+    "RAM128X1D": _ports("A:7 DPRA:7 D WCLK WE", "SPO DPO"),
 }
-CLOCK_PINS = {"CLK", "C", "CLKARDCLK", "CLKBWRCLK"}
+CLOCK_PINS = {"CLK", "C", "CLKARDCLK", "CLKBWRCLK", "WCLK"}
 
 
 def prim_pin(module: str, pin: str):

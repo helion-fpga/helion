@@ -11,6 +11,7 @@ pub mod elab;
 pub mod exec;
 pub mod lex;
 pub mod lower;
+pub mod lutram;
 pub mod mem;
 pub mod parse;
 pub mod pre;
@@ -75,7 +76,9 @@ fn run(sources: &[(String, String)], top: Option<&str>, defines: &[(String, Stri
             // A memory that cannot be block RAM: again, with it in flops.
             Err(m) if m.starts_with(mem::RETRY) => {
                 let (name, why) = m[mem::RETRY.len()..].split_once('\u{1}').unwrap_or((&m, ""));
-                flops.push(format!("memory '{name}' is built from flops, not block RAM: {why}"));
+                if !why.starts_with('\u{2}') {
+                    flops.push(format!("memory '{name}' is built from flops, not block RAM or LUT RAM: {why}"));
+                }
                 no_bram.insert(name.to_string());
             }
             r => break r.map_err(fix)?,

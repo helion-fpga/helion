@@ -21,14 +21,18 @@ Needs `verilator` 5.x. Macros for the design come from `HELION_DEFINES`
 ## Block RAM and device primitives
 
 With `HELION_V2_HARD=1` (what `zedbit` uses) the front end builds memories
-with registered reads as `RAMB18E1` / `RAMB36E1` cells and passes instances
+with registered reads as `RAMB18E1` / `RAMB36E1` cells, memories block RAM
+does not take (asynchronous reads, more than two ports, under 1 Kbit) with
+one write port as LUT RAM (`RAM32M`, `RAM64M`, `RAM32X1S/D`, `RAM64X1S/D`,
+`RAM128X1S/D`, `RAM256X1S`), and passes instances
 of device primitives (`DSP48E1`, `MMCME2_ADV`, `BUFG`, ...) through as
 cells. Both sides of the co-simulation then need Verilog models of those
 primitives, found by module name (`NAME.v`) in `--models DIR` (repeatable,
 searched first), `SVCHECK_MODELS` (colon separated), then `models/`.
 `models/` holds Helion's own behavioural models of `RAMB18E1`, `RAMB36E1`
-(true dual port, no ECC/cascade/output register), `BUFG`, `BUFGCE`,
-`CARRY4`, `SRL16E` and `SRLC32E`; Xilinx's simulation library is not
+(true dual port, no ECC/cascade/output register), the nine LUT RAM
+primitives, `BUFG`, `BUFGCE`, `CARRY4`, `SRL16E` and `SRLC32E`; Xilinx's
+simulation library is not
 bundled. `DSP48E1`, `MMCME2_*`, `PLLE2_ADV`, `IDDR` and `ODDR` need models
 from `--models`.
 
@@ -42,7 +46,10 @@ true dual port with byte enables, contents from `initial` loops and
 `$readmemh`, a memory split over rows of RAMB36, a ROM, an asynchronous
 read that stays in flops, hand-instantiated primitives, and shift registers
 built as `SRL16E` / `SRLC32E` (`srl_*`: fixed and variable taps, enables,
-cascades, and registers that must stay flops).
+cascades, and registers that must stay flops), and LUT RAM: a 32 x 8 register file with two reads
+(`lutram_rf32x8`), 64 x 1 single port, 128 x 1 with two reads, 256 x 1,
+64 x 8 with a registered read, a 128 x 16 asynchronous read
+(`async_rd`) and every LUT RAM primitive by hand (`lutram_prims`).
 
 ## What has been checked
 
