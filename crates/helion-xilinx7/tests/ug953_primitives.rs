@@ -219,18 +219,21 @@ fn ug953_dsp48e1_preadder_patdet_and_column_cascade() {
 
     let bs = backend.bitstream(&routed).unwrap();
     let text = bs.fasm.join("\n");
-    assert!(text.contains("DSP_0.USE_DPORT"), "got:\n{text}");
-    assert!(text.contains("DSP_0.AREG_2"), "got:\n{text}");
-    assert!(text.contains("DSP_0.MREG"), "got:\n{text}");
-    assert!(text.contains("DSP_0.PREG"), "got:\n{text}");
-    assert!(text.contains("DSP_1.A_INPUT.CASCADE"), "got:\n{text}");
-    assert!(text.contains("DSP_1.B_INPUT.CASCADE"), "got:\n{text}");
+    // Each DSP tile holds two DSP48s: even Y is slot DSP_0, odd Y is DSP_1; a
+    // cascade pair may straddle two tiles.
+    let (s0, s1) = (format!("DSP_{}.", y0 % 2), format!("DSP_{}.", y1 % 2));
+    assert!(text.contains(&format!("{s0}USE_DPORT")), "got:\n{text}");
+    assert!(text.contains(&format!("{s0}AREG_2")), "got:\n{text}");
+    assert!(text.contains(&format!("{s0}MREG")), "got:\n{text}");
+    assert!(text.contains(&format!("{s0}PREG")), "got:\n{text}");
+    assert!(text.contains(&format!("{s1}A_INPUT.CASCADE")), "got:\n{text}");
+    assert!(text.contains(&format!("{s1}B_INPUT.CASCADE")), "got:\n{text}");
     assert!(
-        text.contains("DSP_1.USE_PATTERN_DETECT.PATDET"),
+        text.contains(&format!("{s1}USE_PATTERN_DETECT.PATDET")),
         "got:\n{text}"
     );
     assert!(
-        text.contains("DSP_1.PATTERN[47:0] = 48'h123456789ABC"),
+        text.contains(&format!("{s1}PATTERN[47:0] = 48'h123456789ABC")),
         "got:\n{text}"
     );
     parse_fasm(&text).expect("valid DSP FASM");
