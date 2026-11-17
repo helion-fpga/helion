@@ -104,6 +104,7 @@ impl Backend for Xilinx7Backend {
         // emit's device trait does not offer.
         bs.fasm.extend(crate::bram::tie_lines(&routed.placed, &routed.nets, &self.device, &xdev)?);
         bs.fasm.extend(crate::dsp::tie_lines(&routed.placed, &routed.nets, &self.device, &xdev)?);
+        bs.fasm.extend(crate::cmt::tie_lines(&routed.placed, &routed.nets, &self.device, &xdev)?);
         let casc = crate::bram::cascade_out_lines(&bs.fasm);
         bs.fasm.extend(casc);
         bs.fasm.sort();
