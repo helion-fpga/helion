@@ -60,6 +60,7 @@ fn synth_zb(paths: &[&str], top: Option<&str>) -> Result<Design, String> {
 /// rename (SystemVerilog keywords), as `(VHDL name, netlist name)`.
 fn synth_v2(paths: &[&str], top: Option<&str>) -> Result<(Design, Vec<(String, String)>), String> {
     let mut renames = Vec::new();
+    helion_sv::v2::dag::set_carry_arith(std::env::var("HELION_NO_CARRY").is_err());
     let s = if is_vhdl(paths[0]) {
         let mut src = String::new();
         for p in paths {
