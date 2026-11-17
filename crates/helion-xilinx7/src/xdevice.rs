@@ -1765,6 +1765,24 @@ impl<'a> EmitDevice for XDevice<'a> {
         out
     }
 
+    fn pudc_b(&self, low_v_tiles: &[String], used: &[(String, String)]) -> Vec<String> {
+        // Vivado (the seven coursework builds using bank 34): when the bank holding
+        // the PUDC_B pin runs a <=1.8 V standard and the design leaves the pin
+        // unused, the pin is a pulled-up input of that bank's standard.
+        let pins: Vec<&crate::db::parse::PackagePin> = self.device.package_pins().collect();
+        let Some(p) = pins.iter().find(|p| p.pin_function.contains("PUDC_B")) else { return Vec::new() };
+        let bank_low_v = low_v_tiles.iter().any(|t| pins.iter().any(|q| &q.tile == t && q.bank == p.bank));
+        if !bank_low_v || used.iter().any(|(t, s)| t == &p.tile && s == &p.site) {
+            return Vec::new();
+        }
+        let Some(rel) = crate::emit::EmitDevice::site_rel(self, &p.tile, &p.site) else { return Vec::new() };
+        vec![
+            format!("{}.{rel}.LVCMOS12_LVCMOS15_LVCMOS18.IN", p.tile),
+            format!("{}.{rel}.LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVDS_25_LVTTL_SSTL135_SSTL15_TMDS_33.IN_ONLY", p.tile),
+            format!("{}.{rel}.PULLTYPE.PULLUP", p.tile),
+        ]
+    }
+
     fn bank_stepdown(&self, iob_tiles: &[String]) -> Vec<String> {
         // Vivado: a bank running a <=1.8V standard gets STEPDOWN on every
         // IOB site of the bank and on the bank's HCLK_IOI3 tile.
