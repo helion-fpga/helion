@@ -193,11 +193,11 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
     let site_idx: HashMap<&str, usize> = sites.iter().enumerate().map(|(i, s)| (s.1.as_str(), i)).collect();
     let letter = |bel: &str| LETTERS.iter().position(|c| bel.starts_with(*c));
 
-    // Slices that stay as they are: wide-mux, shift-register and LUT RAM
-    // slices, carry slices outside adder chains, and any slice whose LUTs or
-    // FFs are not one per letter.
+    // Slices that stay as they are: wide-mux and shift-register slices,
+    // carry slices outside adder chains, and any slice whose LUTs or FFs are
+    // not one per letter.
     let mut blocked: HashSet<usize> = HashSet::new();
-    for s in out.muxfs.iter().map(|m| m.site.as_str()).chain(out.srls.iter().map(|s| s.site.as_str())).chain(out.lutrams.iter().map(|r| r.site.as_str())) {
+    for s in out.muxfs.iter().map(|m| m.site.as_str()).chain(out.srls.iter().map(|s| s.site.as_str())) {
         if let Some(&si) = site_idx.get(s) {
             blocked.insert(si);
         }
@@ -233,6 +233,14 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
     let in_run: HashSet<usize> = chain.iter().map(|c| c.2).collect();
     if in_run.len() != chain.len() {
         return; // two carries in one slice: leave the placement as it is
+    }
+    // A LUT RAM slice moves whole, like a one-slice chain run, between SLICEMs only.
+    let slicem = device.slicem_sites();
+    let is_m: Vec<bool> = sites.iter().map(|s| slicem.contains(&s.1)).collect();
+    let lr_run0 = runs.len();
+    for r in &out.lutrams {
+        let Some(&si) = site_idx.get(r.site.as_str()) else { return };
+        runs.push(vec![si]);
     }
     let mut seen: HashSet<(usize, usize, bool)> = HashSet::new();
     for (site, bel, is_ff) in out.luts.iter().map(|l| (&l.site, &l.bel, false)).chain(out.ffs.iter().map(|f| (&f.site, &f.bel, true))) {
@@ -633,7 +641,7 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
             let (mut own, mut units) = (false, false);
             for i in 0..us.len() as i32 {
                 let Some(&t) = site_at.get(&(tx, ty - k0 + i)) else { return (0, false) };
-                if blocked.contains(&t) {
+                if blocked.contains(&t) || (r >= lr_run0 && !is_m[t]) {
                     return (0, false);
                 }
                 for &o in &occ[t * 4..t * 4 + 4] {
@@ -812,6 +820,9 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
     }
     for c in out.carries.iter_mut() {
         relocate(&mut c.tile, &mut c.site);
+    }
+    for r in out.lutrams.iter_mut() {
+        relocate(&mut r.tile, &mut r.site);
     }
     for (u, &slot) in pos.iter().enumerate().take(n) {
         let (tile, site) = (&sites[slot / 4].0, &sites[slot / 4].1);

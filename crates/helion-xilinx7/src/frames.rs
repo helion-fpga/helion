@@ -952,6 +952,22 @@ CLBLL_L.SLICEL_X0.AFF.ZINI 10_03 !10_04
     }
 
     #[test]
+    fn lut_ram_contents_stay_out_of_the_ecc() {
+        // One frame with a logic bit and a LUT RAM bit: the ECC is that of the logic bit alone.
+        let mut store = FrameStore::new(&[0x0000_0000]);
+        store.apply_raw_bits(&[(0x0000_0000, 3, 1), (0x0000_0000, 7, 4)]).unwrap();
+        let mut mask = FrameStore::new(&[0x0000_0000]);
+        mask.apply_raw_bits(&[(0x0000_0000, 7, 4)]).unwrap();
+        store.exclude_from_ecc(&mask);
+        let mut alone = vec![0u32; WORDS_PER_FRAME];
+        alone[3] = 1;
+        let payload = store.fdri_payload();
+        assert_eq!(payload[ECC_WORD] & ECC_MASK, frame_ecc(&alone));
+        assert_ne!(frame_ecc(&alone), frame_ecc(&payload[..WORDS_PER_FRAME]));
+        assert_eq!(payload[7], 4, "the LUT RAM bit itself is still written");
+    }
+
+    #[test]
     fn block_ram_content_frames_carry_no_ecc() {
         // A logic frame and a block RAM content frame (block type 1), each
         // with one data bit: only the logic frame gets an ECC (Vivado).
