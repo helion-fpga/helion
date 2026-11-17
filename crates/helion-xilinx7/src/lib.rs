@@ -25,6 +25,7 @@ pub mod emit;
 pub mod fasm;
 pub mod flow;
 pub mod frames;
+pub mod lutram;
 pub mod pack;
 pub mod parts;
 pub mod place;

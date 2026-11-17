@@ -424,6 +424,9 @@ pub struct FrameStore {
     words: Vec<u32>,
     /// Address -> frame index.
     index: HashMap<u32, usize>,
+    /// Bits left out of each frame's ECC (LUT RAM contents, which change
+    /// as the design runs): frame index -> word masks.
+    ecc_exclude: HashMap<usize, Vec<u32>>,
 }
 
 impl FrameStore {
@@ -439,6 +442,19 @@ impl FrameStore {
             addrs: sorted,
             words,
             index,
+            ecc_exclude: HashMap::new(),
+        }
+    }
+
+    /// Leave the bits set in `mask` (a store over the same frames) out of
+    /// every frame's ECC. Vivado computes the ECC of a frame holding LUT RAM
+    /// contents as if those bits were 0 (x7v on 7 Vivado 2017.3 builds).
+    pub fn exclude_from_ecc(&mut self, mask: &FrameStore) {
+        for (i, &addr) in mask.addrs.iter().enumerate() {
+            let m = &mask.words[i * WORDS_PER_FRAME..(i + 1) * WORDS_PER_FRAME];
+            if let (Some(&j), true) = (self.index.get(&addr), m.iter().any(|w| *w != 0)) {
+                self.ecc_exclude.insert(j, m.to_vec());
+            }
         }
     }
 
@@ -604,7 +620,14 @@ impl FrameStore {
             out.extend_from_slice(&self.words[base..base + WORDS_PER_FRAME]);
             // Block RAM content frames (block type 1) carry no ECC: Vivado
             // writes word 50 as 0 in every one (x7v, 1,792 frames).
-            let ecc = if far_group(addr).0 == 1 { 0 } else { frame_ecc(&out[start..start + WORDS_PER_FRAME]) };
+            let ecc = if far_group(addr).0 == 1 {
+                0
+            } else if let Some(m) = self.ecc_exclude.get(&n) {
+                let w: Vec<u32> = out[start..start + WORDS_PER_FRAME].iter().zip(m).map(|(w, m)| w & !m).collect();
+                frame_ecc(&w)
+            } else {
+                frame_ecc(&out[start..start + WORDS_PER_FRAME])
+            };
             out[start + ECC_WORD] = (out[start + ECC_WORD] & !ECC_MASK) | ecc;
             let boundary = match self.addrs.get(n + 1) {
                 Some(&next) => far_group(next) != far_group(addr),
