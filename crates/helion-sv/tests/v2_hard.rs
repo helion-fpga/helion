@@ -98,16 +98,97 @@ fn deep_memory_splits_into_rows_with_a_select_register() {
 }
 
 #[test]
-fn asynchronous_read_stays_in_flops() {
-    let (d, w) = synth(
+fn asynchronous_read_is_lut_ram() {
+    let (d, _) = synth(
         "module a (input clk, input we, input [6:0] x, input [15:0] di, output [15:0] q);
            logic [15:0] mem [0:127];
            always_ff @(posedge clk) if (we) mem[x] <= di;
            assign q = mem[x];
          endmodule",
     );
+    let b = boxes(&d);
+    assert_eq!(b.len(), 16, "{b:?}");
+    assert!(b.iter().all(|(_, m)| m == "RAM128X1S"), "{b:?}");
+    assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)));
+}
+
+/// G1 guard: a 2-read, 1-write register file is RAM32M (ports A-C read
+/// anywhere), with its contents, and no flops.
+#[test]
+fn register_file_is_ram32m() {
+    let (d, _) = synth(
+        "module rf (input clk, input we, input [4:0] wa, ra1, ra2, input [7:0] wd, output [7:0] rd1, rd2);
+           logic [7:0] r [0:31];
+           initial for (int i = 0; i < 32; i++) r[i] = 8'(i * 37 + 5);
+           always_ff @(posedge clk) if (we) r[wa] <= wd;
+           assign rd1 = r[ra1];
+           assign rd2 = r[ra2];
+         endmodule",
+    );
+    let b = boxes(&d);
+    assert_eq!(b.iter().filter(|(_, m)| m == "RAM32M").count(), 3, "16 read bits / 6 per RAM32M: {b:?}");
+    assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)));
+    // Port A of the first cell holds bits 1:0 of rd1: entry a at INIT_A[2a+1:2a].
+    let init: u64 = (0..32).map(|a| ((a * 37 + 5) as u64 & 3) << (2 * a)).sum();
+    assert_eq!(attr(&d, &b[0].0, "INIT_A"), Some(format!("64'h{init:016X}").as_str()));
+    assert_eq!(net(&d, &b[0].0, "ADDRD0").as_deref(), Some("wa_0"));
+}
+
+/// G1 guard: the cell kind follows depth and ports, as Vivado picks it.
+#[test]
+fn lut_ram_cell_by_depth() {
+    let one = |depth: u32, ports: &str, reads: &str| {
+        let a = 32 - (depth - 1).leading_zeros();
+        let (d, _) = synth(&format!(
+            "module m (input clk, input we, input [{h}:0] wa, ra, input di, output qw, qr);
+               logic mem [0:{top}];
+               initial for (int i = 0; i < {depth}; i++) mem[i] = 1'(i >> 2);
+               always_ff @(posedge clk) if (we) mem[wa] <= di;
+               assign qw = mem[wa];
+               assign qr = {reads};
+             endmodule",
+            h = a - 1,
+            top = depth - 1
+        ));
+        let b = boxes(&d);
+        assert_eq!(b.iter().map(|x| x.1.as_str()).collect::<Vec<_>>(), [ports], "depth {depth}");
+        b
+    };
+    let b = one(64, "RAM64X1S", "mem[wa]");
+    let init: u64 = (0..64).map(|i| ((i >> 2) as u64 & 1) << i).sum();
+    let d = synth("module m(input clk, input we, input [5:0] wa, input di, output q); logic mem [0:63]; initial for (int i = 0; i < 64; i++) mem[i] = 1'(i >> 2); always_ff @(posedge clk) if (we) mem[wa] <= di; assign q = mem[wa]; endmodule").0;
+    assert_eq!(attr(&d, &b[0].0, "INIT"), Some(format!("64'h{init:016X}").as_str()));
+    one(128, "RAM128X1D", "mem[ra]");
+    one(256, "RAM256X1S", "mem[wa]");
+}
+
+#[test]
+fn two_write_ports_stay_in_flops() {
+    let (d, w) = synth(
+        "module a (input clk, input we, input [5:0] x, y, input [15:0] di, output [15:0] q);
+           logic [15:0] mem [0:63];
+           always_ff @(posedge clk) if (we) begin mem[x] <= di; mem[y] <= ~di; end
+           assign q = mem[x ^ y];
+         endmodule",
+    );
     assert!(boxes(&d).is_empty());
-    assert!(w.iter().any(|w| w.contains("built from flops") && w.contains("asynchronous")), "{w:?}");
+    assert!(w.iter().any(|w| w.contains("built from flops") && w.contains("LUT RAM needs one write port")), "{w:?}");
+}
+
+/// G1 guard: PicoRV32's register file is 11 RAM32M, not ~1,000 flops
+/// (Vivado 2017.3: 829 LUTs + 48 LUT RAM, 488 flops).
+#[test]
+fn picorv32_register_file_is_lut_ram() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let files = ["examples/zedboard_pico_soc.sv", "third_party/picorv32/picorv32.v"];
+    let sources: Vec<(String, String)> = files.iter().map(|f| (f.to_string(), std::fs::read_to_string(root.join(f)).expect(f))).collect();
+    helion_sv::v2::set_hard(true);
+    helion_sv::v2::dag::set_carry_arith(true);
+    let s = helion_sv::v2::synth(&sources, Some("zedboard_pico_soc"), &[], vec![]).expect("pico");
+    let rams = boxes(&s.design).iter().filter(|(_, m)| m == "RAM32M").count();
+    assert_eq!(rams, 11);
+    assert!(s.ffs <= 600, "{} flops", s.ffs);
+    assert!(s.luts + 4 * rams <= 1600, "{} LUTs + {} LUT RAM LUTs", s.luts, 4 * rams);
 }
 
 #[test]
