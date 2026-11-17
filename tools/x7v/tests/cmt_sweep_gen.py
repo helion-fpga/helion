@@ -8,7 +8,7 @@ next to tests/cmt_sweep_jobs.sh: bash cmt_sweep_jobs.sh sweep_<name> ...
   multipliers m..m+3, D = 1 (lock/filter tables).
 * sweep_divs: two MMCMs x 7 and two PLLs x 6 outputs with assorted divides,
   duties and phases (counter encoding).
-* sweep_pwr, sweep_pwr2, sweep_pwr3: MMCMs differing only in which outputs
+* sweep_pwr, sweep_pwr2..4: MMCMs differing only in which outputs
   are used and their divides/phases (POWER_REG).
 """
 import sys, os
@@ -84,7 +84,7 @@ dx = [f"set_property -dict {{PACKAGE_PIN Y9 IOSTANDARD LVCMOS33}} [get_ports clk
 dx += [l for l in xdc if "led" in l]
 open(f"{out}/rtl/sweep_divs.xdc","w").write("\n".join(dx)+"\n")
 names.append("sweep_divs"); names.append("sweep_pwr")
-print(" ".join(names + ["sweep_pwr2", "sweep_pwr3"]))
+print(" ".join(names + ["sweep_pwr2", "sweep_pwr3", "sweep_pwr4"]))
 
 # POWER_REG probe: same M=10/D=1 CMTs, differing only in output use and phase.
 cfgs = [("none", None), ("p0", (8, 0.0)), ("pmux", (8, 22.5)), ("pdelay", (8, 45.0))]
@@ -153,3 +153,25 @@ v.append("  assign led[7:5] = 3'b0;")
 v.append("endmodule")
 open(f"{out}/rtl/sweep_pwr3.sv", "w").write("\n".join(v) + "\n")
 open(f"{out}/rtl/sweep_pwr3.xdc", "w").write(open(f"{out}/rtl/sweep_pwr.xdc").read())
+
+# ---- POWER_REG probe 4: phase interpolator use per output ----
+sets = [[(1, 8, 22.5)], [(0, 8, 11.25)], [(0, 8, 33.75)], [(1, 20, 2.25)]]
+v = ["module sweep_pwr4(input logic clk, output logic [7:0] led);", "  logic cb; BUFG ubin(.I(clk), .O(cb));"]
+tog = []; lks = []
+for c in range(4):
+    ps = [".BANDWIDTH(\"OPTIMIZED\")", ".CLKIN1_PERIOD(10.0)", ".DIVCLK_DIVIDE(1)", ".CLKFBOUT_MULT_F(10.0)"]
+    pins = []
+    for k, dv, ph in sets[c]:
+        ps.append(f".CLKOUT{k}_DIVIDE{'_F' if k == 0 else ''}({str(dv)+'.0' if k == 0 else dv})"); ps.append(f".CLKOUT{k}_PHASE({ph})")
+        v.append(f"  logic o{c}_{k}, g{c}_{k}; logic t{c}_{k} = 1'b0; BUFG ug{c}_{k}(.I(o{c}_{k}), .O(g{c}_{k})); always_ff @(posedge g{c}_{k}) t{c}_{k} <= ~t{c}_{k};")
+        pins.append(f".CLKOUT{k}(o{c}_{k})"); tog.append(f"t{c}_{k}")
+    v.append(f"  logic fb{c}, lk{c};"); lks.append(f"lk{c}")
+    v.append(f"  MMCME2_ADV #({', '.join(ps)}) uc{c}(.CLKIN1(cb), .CLKIN2(1'b0), .CLKINSEL(1'b1), .CLKFBIN(fb{c}), .CLKFBOUT(fb{c}), .LOCKED(lk{c}), .RST(1'b0), .PWRDWN(1'b0),")
+    v.append(f"     .DADDR(7'd0), .DCLK(1'b0), .DEN(1'b0), .DI(16'd0), .DWE(1'b0), .PSCLK(1'b0), .PSEN(1'b0), .PSINCDEC(1'b0), {', '.join(pins)});")
+v.append(f"  assign led[0] = {' ^ '.join(tog)};")
+v.append(f"  assign led[4:1] = {{{', '.join(lks)}}};")
+v.append("  assign led[7:5] = 3'b0;")
+v.append("endmodule")
+open(f"{out}/rtl/sweep_pwr4.sv", "w").write("\n".join(v) + "\n")
+open(f"{out}/rtl/sweep_pwr4.xdc", "w").write(open(f"{out}/rtl/sweep_pwr.xdc").read())
+

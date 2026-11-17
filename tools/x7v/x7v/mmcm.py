@@ -21,8 +21,8 @@ What the model rests on (no Helion code):
   lock and loop-filter words (`LKTABLE`, `TABLE`, `FILTREG*`, `LOCKREG*`,
   `POWER_REG`): their values are lookup tables in Vivado, not functions of
   anything UG472 states, so x7v holds Vivado's measured values
-  (`cmt_tables.json`, per primitive, BANDWIDTH and feedback multiplier) and
-  reports any other value as an error.
+  (`cmt_tables.json`, per primitive, BANDWIDTH and feedback multiplier;
+  `expected_power` for POWER_REG) and reports any other value as an error.
 
 The netlist model (`x7v_cmt`) measures the CLKIN1 period, asserts LOCKED
 after LOCK_CYCLES input clocks, and from that CLKIN1 edge drives each enabled
@@ -164,7 +164,7 @@ def decode_cmt(kind: str, F: set) -> Cmt:
             problems.append(f"{n}: RESERVED bit set")
         c.frac_en = _flag(F, r2 + "FRAC_EN", used)
         c.frac = _vec(F, r2 + "FRAC", 3, used)
-        for extra in ("FRAC_WF_R", "FRAC_WF_F", "PHASE_MUX_F"):
+        for extra in ("FRAC_WF_R", "FRAC_WF_F"):
             if _flag(F, r2 + extra, used) or _vec(F, r2 + extra, 3, used):
                 problems.append(f"{n}: {extra} set (fractional divide is not modelled)")
         if c.frac_en or c.frac:
@@ -172,6 +172,13 @@ def decode_cmt(kind: str, F: set) -> Cmt:
         if c.mx:
             problems.append(f"{n}: MX = {c.mx:02b} (must be 00)")
         cs[n] = c
+    if kind == "MMCME2_ADV":
+        # CLKOUT5's / CLKOUT6's PHASE_MUX_F is CLKOUT0's / CLKFBOUT's falling
+        # edge phase: Vivado writes it equal to PHASE_MUX for an integer divide.
+        for reg, owner in (("CLKOUT5", "CLKOUT0"), ("CLKOUT6", "CLKFBOUT")):
+            f = _vec(F, f"{reg}_CLKOUT2_FRACTIONAL_PHASE_MUX_F", 3, used)
+            if f != cs[owner].phase_mux:
+                problems.append(f"{owner}: PHASE_MUX_F = {f} differs from PHASE_MUX = {cs[owner].phase_mux} (fractional divide is not modelled)")
     comp = "none"
     for k in ("COMP.ZHOLD", "COMP.Z_ZHOLD", "COMPENSATION.ZHOLD_NO_CLKIN_BUF", "COMPENSATION.Z_ZHOLD_OR_CLKIN_BUF"):
         if _flag(F, k, used):
@@ -234,10 +241,18 @@ def check(c: Cmt, tables: dict | None = None) -> list[str]:
     if not table_match(c, tables):
         have = " ".join(f"{k}={v:#x}" for k, v in c.static.items())
         errs.append(f"lock/filter words for M={c.m} match no Vivado-measured BANDWIDTH ({have})")
-    want_pwr = tables.get("POWER_REG", {}).get(c.kind)
-    if want_pwr is not None and c.power not in want_pwr:
-        errs.append(f"POWER_REG = {c.power:#06x}, Vivado writes one of {[hex(v) for v in want_pwr]}")
+    if c.power != expected_power(c):
+        errs.append(f"POWER_REG = {c.power:#06x}, Vivado writes {expected_power(c):#06x} for these phases")
     return errs
+
+
+def expected_power(c: Cmt) -> int:
+    """POWER_REG as Vivado writes it (measured, tests/cmt_sweep.py): an MMCM
+    with some counter phase on an odd quarter VCO period (PHASE_MUX not 0 or
+    4) 0x9900, any other MMCM 0x0100, a PLL 0."""
+    if c.kind == "PLLE2_ADV":
+        return 0
+    return 0x9900 if any(o.phase_mux % 4 for o in c.counters.values()) else 0x0100
 
 
 def summary(dec, clkin_mhz: float | None = None) -> list[str]:
@@ -292,8 +307,13 @@ def model_cmt(x, s, nl):
     sel = const("CLKINSEL", "INV_CLKINSEL" in c.flags)
     if sel != 1:
         err(f"CLKINSEL is {sel if sel is not None else 'not constant'}; only CLKIN1 (CLKINSEL = 1) is modelled")
+    # CMT `ZINV_<pin>` set means the pin IS inverted (unlike BUFGCTRL's):
+    # Vivado leaves RST, PWRDWN, PSEN and PSINCDEC on the INT tile's default
+    # VCC (traced in its ZedBoard build) with these bits set, while its
+    # design holds them low; CLKINSEL likewise stays on VCC with
+    # INV_CLKINSEL clear, selecting CLKIN1.
     for p in ("PSEN", "DEN", "DWE") if kind == "MMCME2_ADV" else ("DEN", "DWE"):
-        inv = p == "PSEN" and "ZINV_PSEN" not in c.flags
+        inv = p == "PSEN" and "ZINV_PSEN" in c.flags
         v = const(p, inv)
         if v != 0:
             err(f"{p} is {v if v is not None else 'not constant'}: dynamic phase shift / DRP is not modelled")
@@ -306,18 +326,26 @@ def model_cmt(x, s, nl):
     if not ok:
         err(f"feedback loop not closed: CLKFBIN is driven by {fb}, not this CMT's CLKFBOUT (it would never lock)")
     clkin = pin("CLKIN1", "clock in")
-    rst = pin("RST", "reset", inv="ZINV_RST" not in c.flags)
-    pwrdwn = pin("PWRDWN", "power down", inv="ZINV_PWRDWN" not in c.flags)
+    rst = pin("RST", "reset", inv="ZINV_RST" in c.flags)
+    pwrdwn = pin("PWRDWN", "power down", inv="ZINV_PWRDWN" in c.flags)
     outs = c.outputs()
     o8 = [8 * o.divide for o in outs] + [8] * (7 - n)
     hh = [o.high_half for o in outs] + [1] * (7 - n)
     ph = [o.phase8 for o in outs] + [0] * (7 - n)
     en = sum(1 << i for i, o in enumerate(outs) if o.enabled)
     names = {f"CLKOUT{i}": sig(s.name, f"CLKOUT{i}") for i in range(7)}
+    model_out = {}
     for i in range(7):
-        nl.lines.append(f"wire {names[f'CLKOUT{i}']};")
+        w = names[f"CLKOUT{i}"]
         if i >= n or not outs[i].enabled:
-            x.x_outputs[names[f"CLKOUT{i}"]] = f"{s.name}.CLKOUT{i}: counter output not enabled"
+            # The model drives a dummy; the site pin reads X (an error if used).
+            nl.lines.append(f"wire {w} = 1'bx;")
+            x.x_outputs[w] = f"{s.name}.CLKOUT{i}: counter output not enabled"
+            model_out[i] = sig(s.name, f"CLKOUT{i}_off")
+            nl.lines.append(f"wire {model_out[i]};")
+        else:
+            nl.lines.append(f"wire {w};")
+            model_out[i] = w
     for o, why in (("CLKFBOUT", None), ("LOCKED", None)):
         nl.lines.append(f"wire {sig(s.name, o)};")
     for o in (["CLKOUT0B", "CLKOUT1B", "CLKOUT2B", "CLKOUT3B", "CLKFBOUTB", "PSDONE"] if kind == "MMCME2_ADV" else []) + \
@@ -328,7 +356,7 @@ def model_cmt(x, s, nl):
     params = dict(M8=8 * c.m, D=c.d, O8=_packed(o8), HH=_packed(hh), PH8=_packed(ph), EN=f"7'd{en}")
     ps = ", ".join(f".{k}({v})" for k, v in params.items())
     conn = dict(CLKIN=clkin, RST=rst, PWRDWN=pwrdwn, CLKFBOUT=sig(s.name, "CLKFBOUT"), LOCKED=sig(s.name, "LOCKED"),
-                CLKOUT="{" + ",".join(names[f"CLKOUT{i}"] for i in reversed(range(7))) + "}")
+                CLKOUT="{" + ",".join(model_out[i] for i in reversed(range(7))) + "}")
     cs = ", ".join(f".{k}({v})" for k, v in conn.items())
     nl.lines.append(f"// {s.name} ({s.tile}.{s.fprefix}) M={c.m} D={c.d} "
                     + " ".join(f"O{i}={o.divide}/{o.phase8}" for i, o in enumerate(outs) if o.enabled))
