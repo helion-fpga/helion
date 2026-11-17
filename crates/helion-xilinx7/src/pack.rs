@@ -637,8 +637,8 @@ pub struct PackedCfgPrim {
 /// Backend-owned packed netlist for xc7a35t.
 #[derive(Clone, Debug, Default)]
 pub struct Packed7 {
-    /// Flops and LUTs placed in a slice of their own: copies of a driver
-    /// shared by many block RAMs or DSPs, each to sit by its own group.
+    /// Cells placed in a slice of their own: copies of a flop shared by
+    /// many block RAMs or DSPs, each to sit by its own group.
     pub lone_cells: HashSet<String>,
     pub luts: Vec<PackedLut>,
     pub ffs: Vec<PackedFf>,
@@ -3148,12 +3148,17 @@ fn insert_input_buffers(netlist: &Design, packed: &mut Packed7) -> Result<(), St
 /// Hard blocks one copy of a shared driver serves (4 BRAM or DSP tiles).
 const HARD_FANOUT_GROUP: usize = 8;
 
-/// A flop or LUT that drives a data or control pin of more than two groups
-/// of block RAMs or DSPs is copied, one copy per [`HARD_FANOUT_GROUP`]
-/// blocks, so placement can put each copy beside its blocks. One driver
-/// across 240 RAMs routes in tens of nanoseconds; Vivado replicates too.
-/// The original keeps only its fabric loads: it shares a slice with the
-/// LUT before it, which the copies pull to their middle.
+/// A flop that drives a data or control pin of more than two groups of
+/// block RAMs or DSPs is copied, one copy per [`HARD_FANOUT_GROUP`] blocks,
+/// so placement can put each copy beside its blocks. One driver across 240
+/// RAMs routes in tens of nanoseconds; Vivado replicates too. The original
+/// keeps only its fabric loads: it shares a slice with the LUT before it,
+/// which the copies pull to their middle.
+///
+/// LUTs are not copied: each copy would need every input brought across
+/// the chip, one wide net per input instead of one. On the DSP fill the 24
+/// copies of `restart` (5 inputs) left those 5 nets fighting for the same
+/// wires (29,000 rip-ups after 37 minutes, not converging).
 ///
 /// Placement runs this once the blocks have sites: `site_xy` gives a
 /// block's site `(X, Y)` by cell name, and a group never spans two columns.
@@ -3199,20 +3204,11 @@ pub(crate) fn replicate_hard_block_drivers(packed: &mut Packed7, site_xy: &dyn F
                 _ => groups.push(vec![i]),
             }
         }
-        let ff = packed.ffs.iter().find(|f| f.q_net == net).cloned();
-        let lut = packed.luts.iter().find(|l| l.output_net == net && l.input_nets.iter().any(|n| n.is_some())).cloned();
-        if ff.is_none() && lut.is_none() {
-            continue;
-        }
+        let Some(f) = packed.ffs.iter().find(|f| f.q_net == net).cloned() else { continue };
         for (k, chunk) in groups.iter().enumerate() {
             let copy = format!("{net}_rep{k}");
-            if let Some(f) = &ff {
-                packed.lone_cells.insert(format!("{}_rep{k}", f.name));
-                packed.ffs.push(PackedFf { name: format!("{}_rep{k}", f.name), q_net: copy.clone(), ..f.clone() });
-            } else if let Some(l) = &lut {
-                packed.lone_cells.insert(format!("{}_rep{k}", l.name));
-                packed.luts.push(PackedLut { name: format!("{}_rep{k}", l.name), output_net: copy.clone(), ..l.clone() });
-            }
+            packed.lone_cells.insert(format!("{}_rep{k}", f.name));
+            packed.ffs.push(PackedFf { name: format!("{}_rep{k}", f.name), q_net: copy.clone(), ..f.clone() });
             for &i in chunk {
                 let pins = if i < nb { &mut packed.brams[i].pins } else { &mut packed.dsps[i - nb].pins };
                 for (pin, n, out) in pins.iter_mut() {
