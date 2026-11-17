@@ -122,6 +122,18 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
             }
         }
     }
+    // Block RAM and DSP pins pull the logic they talk to into their columns.
+    let hard = packed
+        .brams
+        .iter()
+        .filter_map(|b| out.brams.iter().find(|p| p.name == b.name).map(|p| (&p.tile, &b.pins)))
+        .chain(packed.dsps.iter().filter_map(|d| out.dsps.iter().find(|p| p.name == d.name).map(|p| (&p.tile, &d.pins))));
+    for (tile, hpins) in hard {
+        let Some((x, y)) = device.tile_xy(tile) else { continue };
+        for (_, net, _) in hpins {
+            pins.entry(net.as_str()).or_default().push(Pin::Fixed(x, y));
+        }
+    }
     for (iob, placed) in packed.iobs.iter().zip(&out.iobs) {
         if let Some((x, y)) = device.tile_xy(&placed.tile) {
             pins.entry(iob.net.as_str()).or_default().push(Pin::Pad(x, y));
