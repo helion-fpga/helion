@@ -588,8 +588,9 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     // path through other nets' wires; those nets are ripped up and queued
     // again. History cost on contested wires steers later searches away.
     // Past this many rip-ups (and once every net has been routed), the
-    // PathFinder phase takes the remaining congestion.
-    let pf_after = 2 * net_names.len() + 1000;
+    // PathFinder phase takes the remaining congestion: on Ibex rip-up spent
+    // 950 s at 2 x nets without shrinking its queue; PathFinder then took 250 s.
+    let pf_after = net_names.len() / 4 + 500;
     let mut rips = 0usize;
     let total_nets = net_names.len();
     // HELION_ROUTE_RIPSTATS: with the progress line, the nets ripped up most

@@ -136,5 +136,8 @@ fn fabric_clock_is_timed_per_domain() {
     let a = helion_xilinx7::timing::analyze_clocks(&routed, &period).expect("timing");
     assert_eq!(a.endpoints, 2);
     assert!(a.wns_ps > 0, "slack {}", a.wns_ps);
+    let doms: Vec<&str> = a.clocks.iter().map(|(c, _)| c.as_str()).collect();
+    assert_eq!(doms, ["clk_bufg", "half_bufg"]);
+    assert_eq!(a.clocks.iter().map(|c| c.1).min(), Some(a.wns_ps));
     assert!(helion_xilinx7::timing::analyze_clocks(&routed, &|c| (c == "clk_bufg").then_some(10_000)).is_err());
 }
