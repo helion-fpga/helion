@@ -146,8 +146,21 @@ mismatches against the RTL (BRAM: 7,000 cycles, all three scans; DSP:
 shares nothing with `x7v_dsp48e1`). `tests/vivado_enc.py` checks the
 encodings these builds taught x7v (and, given `X7V_VIVADO_REF`, the builds).
 
+MMCM/PLL (`mmcm.py`, `python3 -m x7v cmt <bit> [--clkin-mhz F]`) against
+Vivado 2017.3 builds of examples/zedboard_mmcm.sv and 51 generated sweep
+designs (`tests/cmt_sweep_gen.py`, `tests/cmt_sweep_jobs.sh`): every CMT
+decodes with 0 unexplained bits and no problem (counters, lock/filter words
+against `cmt_tables.json`, POWER_REG, PHASE_MUX_F); zedboard_mmcm extracts
+clean and co-simulates equal to its RTL (3,000 cycles; the RTL's MMCME2_BASE
+and BUFG run on x7v's shims of the same clock model). `tests/cmt.py` checks
+the decoder and, given `X7V_MMCM_REF` (the directory with Vivado's
+zedboard_mmcm.bit), that build plus four negative controls (wrong divider,
+MMCM held in reset, cut feedback loop, flipped lock-table bit), each of which
+fails. Only internal feedback, integer dividers and tied-low control pins
+are validated; the rest is refused.
+
 Not validated against Vivado (no reference design uses them yet): F7/F8 wide
-muxes (modelled, flagged as a warning), LUTRAM/SRL, MMCM/PLL,
+muxes (modelled, flagged as a warning), LUTRAM/SRL,
 IDDR/ODDR/SERDES, tristate I/O. The extractor reports these as errors rather
 than guessing.
 
