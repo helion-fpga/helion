@@ -72,6 +72,29 @@ impl Placed {
         }
         None
     }
+
+    /// `cell_bel` for every cell in one pass (same first-match rules).
+    pub fn cell_bels(&self) -> std::collections::HashMap<&str, Option<BelId>> {
+        let mut m = std::collections::HashMap::new();
+        for (i, lf) in self.packed.lutffs.iter().enumerate() {
+            let Some(&(site, ble)) = self.lutff_sites.get(i) else {
+                continue;
+            };
+            m.entry(lf.lut_cell.as_str()).or_insert_with(|| Some(BelId::new(site, format!("BLE{ble}.LUT"))));
+            m.entry(lf.ff_cell.as_str()).or_insert_with(|| Some(BelId::new(site, format!("BLE{ble}.FF"))));
+        }
+        for (i, iob) in self.packed.iobs.iter().enumerate() {
+            m.entry(iob.cell.as_str()).or_insert_with(|| self.iob_sites.get(i).copied().map(|s| BelId::new(s, "IOB")));
+        }
+        for (i, mac) in self.packed.macs.iter().enumerate() {
+            m.entry(mac.cell.as_str()).or_insert_with(|| self.mac_sites.get(i).copied().map(|s| BelId::new(s, "MAC")));
+        }
+        for (i, bram) in self.packed.brams.iter().enumerate() {
+            m.entry(bram.cell.as_str()).or_insert_with(|| self.bram_sites.get(i).copied().map(|s| BelId::new(s, "RAM18")));
+        }
+        m.remove("");
+        m
+    }
 }
 
 /// LUTFF counts per HAD CLB site ID, derived from placement.
@@ -3997,6 +4020,26 @@ mod tests {
         assert_eq!(dev.site_by_id(&iob.site.id()), Some(iob.site));
         assert!(pl.cell_bel("ghost").is_none());
         assert_eq!(pl.cell_site("u_ff3"), Some(site));
+    }
+
+    /// `cell_bels` answers `cell_bel` for every cell, with RAM, IOB and
+    /// LUT/FF clusters all placed.
+    #[test]
+    fn cell_bels_matches_cell_bel() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_counter();
+        d.add_cell("u_bram", CellKind::Bram18);
+        let p = place(&pack(&d, &dev).unwrap(), &dev).unwrap();
+        let bels = p.cell_bels();
+        let mut names: Vec<&str> = p.packed.lutffs.iter().flat_map(|l| [l.lut_cell.as_str(), l.ff_cell.as_str()]).collect();
+        names.extend(p.packed.iobs.iter().map(|c| c.cell.as_str()));
+        names.extend(p.packed.macs.iter().map(|c| c.cell.as_str()));
+        names.extend(p.packed.brams.iter().map(|c| c.cell.as_str()));
+        names.push("no_such_cell");
+        assert!(!p.packed.brams.is_empty() && !p.packed.iobs.is_empty());
+        for n in names.into_iter().filter(|n| !n.is_empty()) {
+            assert_eq!(bels.get(n).cloned().flatten(), p.cell_bel(n), "{n}");
+        }
     }
 
     /// FM-HEL-OPT-P0-1: device-full / n≥256 must not hard-skip legalize.
