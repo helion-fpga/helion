@@ -181,6 +181,12 @@ impl SchemLayout {
             );
         }
         // Hierarchy blocks, stacked; expanded children in a 2-wide mini-grid.
+        let mut kids_of: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+        for c in &live.cells {
+            if let Some(o) = live.owner_of(&c.name) {
+                kids_of.entry(o).or_default().push(c.name.as_str());
+            }
+        }
         let mut y = 24.0;
         for h in &live.hier {
             if !st.is_expanded(&h.name) {
@@ -189,12 +195,7 @@ impl SchemLayout {
                 y += BLOCK_HEAD + 12.0;
                 continue;
             }
-            let kids: Vec<&str> = live
-                .cells
-                .iter()
-                .map(|c| c.name.as_str())
-                .filter(|c| live.owner_of(c) == Some(h.name.as_str()))
-                .collect();
+            let kids: &[&str] = kids_of.get(h.name.as_str()).map_or(&[], Vec::as_slice);
             let rows = kids.len().div_ceil(2).max(1) as f32;
             let bh = BLOCK_HEAD + rows * (CHILD_H + 6.0) + 4.0;
             out.blocks.insert(h.name.clone(), [BLOCK_X, y, BLOCK_W, bh]);
@@ -238,8 +239,8 @@ impl SchemLayout {
         // One star leg per sink: the first sorted endpoint drives (ports
         // drive when they are inputs, sink when they are outputs).
         for net in &live.nets {
-            let in_port = live.ports_in.iter().find(|p| *p == &net.name).cloned();
-            let out_port = live.ports_out.iter().find(|p| *p == &net.name).cloned();
+            let in_port = live.is_in_port(&net.name).then(|| net.name.clone());
+            let out_port = live.is_out_port(&net.name).then(|| net.name.clone());
             let mut ends: Vec<String> = net.cells.clone();
             if in_port.is_some() {
                 ends.insert(0, net.name.clone());
@@ -257,7 +258,7 @@ impl SchemLayout {
                 if owners.len() == 1
                     && !ends
                         .iter()
-                        .any(|e| live.ports_in.contains(e) || live.ports_out.contains(e))
+                        .any(|e| live.is_in_port(e) || live.is_out_port(e))
                 {
                     NetLevel::Internal(owners.into_iter().next().unwrap().to_string())
                 } else {
@@ -377,6 +378,10 @@ pub struct SchematicState {
     pub history_ix: usize,
     /// Canvas viewport size in points (from `on_layout`; Fit reads it).
     pub viewport: [f32; 2],
+    /// Canvas top-left in window points, and the sheet point (world units)
+    /// at it when the cell nodes were last mounted around the view.
+    pub canvas_at: [f32; 2],
+    pub view_at: [f32; 2],
     /// Sheet find query, scope, and the next hit index.
     pub find: rune::TextEdit,
     pub find_kind: SheetFind,
@@ -403,11 +408,27 @@ impl SchematicState {
             history: Vec::new(),
             history_ix: 0,
             viewport: [0.0, 0.0],
+            canvas_at: [0.0, 0.0],
+            view_at: [0.0, 0.0],
             find: rune::TextEdit::new(""),
             find_kind: SheetFind::Cells,
             find_ix: 0,
             find_last: String::new(),
         }
+    }
+
+    /// Sheet window (world units) that mounts and paints: the view and one
+    /// view around it (Ibex has 16k cells on a sheet 375k units tall). The
+    /// whole sheet before the first layout.
+    pub fn near_window(&self) -> Option<[f32; 4]> {
+        let [vw, vh] = [self.viewport[0] / self.zoom, self.viewport[1] / self.zoom];
+        let [vx, vy] = self.view_at;
+        (vw > 0.0).then(|| [vx - vw, vy - vh, vx + 2.0 * vw, vy + 2.0 * vh])
+    }
+
+    pub fn near_view(&self, r: &[f32; 4]) -> bool {
+        self.near_window()
+            .is_none_or(|[x0, y0, x1, y1]| r[0] + r[2] >= x0 && r[0] <= x1 && r[1] + r[3] >= y0 && r[1] <= y1)
     }
 
     pub fn lod(&self) -> Lod {
@@ -705,43 +726,53 @@ fn hier_row(s: &AppState, t: &VivadoTheme, sel: SchemSel, detail: &str, depth: u
 /// Hierarchy navigator over the real instance tree: blocks with children,
 /// top-level cells, then ports.
 fn hierarchy_tree(s: &AppState, t: &VivadoTheme, live: &LiveNetlist) -> El {
-    let mut body = col()
+    // (selection, detail, depth) per row; rows mount virtually (Ibex has 16k cells).
+    let mut rows: Vec<(SchemSel, String, u32)> = Vec::new();
+    let mut kids_of: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    let mut top: Vec<&str> = Vec::new();
+    for c in &live.cells {
+        match live.owner_of(&c.name) {
+            Some(o) => kids_of.entry(o).or_default().push(c.name.as_str()),
+            None => top.push(c.name.as_str()),
+        }
+    }
+    for h in &live.hier {
+        rows.push((SchemSel::Hier(h.name.clone()), format!("{} · {}", h.module, h.cells), 0));
+        if s.schematic.is_expanded(&h.name) {
+            for c in kids_of.get(h.name.as_str()).into_iter().flatten() {
+                rows.push((SchemSel::Cell((*c).to_string()), String::new(), 1));
+            }
+        }
+    }
+    rows.extend(top.into_iter().map(|c| (SchemSel::Cell(c.to_string()), String::new(), 0)));
+    for p in live.ports_in.iter().chain(live.ports_out.iter()) {
+        rows.push((SchemSel::Port(p.clone()), String::new(), 0));
+    }
+    let (t, rows) = (*t, std::rc::Rc::new(rows));
+    let keys = rows.clone();
+    col()
         .key("schematic-hier")
         .role("tree")
         .w(HIER_W)
         .h_full()
         .fill(t.panel_bg)
         .border(1.0, t.border)
-        .scroll_xy();
-    for h in &live.hier {
-        body = body.child(hier_row(
-            s,
-            t,
-            SchemSel::Hier(h.name.clone()),
-            &format!("{} · {}", h.module, h.cells),
-            0,
-        ));
-        if s.schematic.is_expanded(&h.name) {
-            for cell in live
-                .cells
-                .iter()
-                .filter(|c| live.owner_of(&c.name).as_deref() == Some(h.name.as_str()))
-            {
-                body = body.child(hier_row(s, t, SchemSel::Cell(cell.name.clone()), "", 1));
-            }
-        }
-    }
-    for cell in live
-        .cells
-        .iter()
-        .filter(|c| live.owner_of(&c.name).is_none())
-    {
-        body = body.child(hier_row(s, t, SchemSel::Cell(cell.name.clone()), "", 0));
-    }
-    for p in live.ports_in.iter().chain(live.ports_out.iter()) {
-        body = body.child(hier_row(s, t, SchemSel::Port(p.clone()), "", 0));
-    }
-    body
+        .scroll(rune::ScrollSpec { stick_bottom: false })
+        .scroll_xy()
+        .child(
+            col()
+                .w_full()
+                .growth(rune::GrowthSpec::default())
+                .virtual_rows(
+                    rows.len(),
+                    ROW_H,
+                    move |_: &AppState, i| std::borrow::Cow::Owned(keys[i].0.hier_key()),
+                    move |s: &AppState, i| {
+                        let (sel, detail, depth) = &rows[i];
+                        hier_row(s, &t, sel.clone(), detail, *depth)
+                    },
+                ),
+        )
 }
 
 /// Wire/highlight shape for the canvas: dotted grid, sheet frame, net wires
@@ -751,11 +782,13 @@ fn wires_shape(s: &AppState, t: &VivadoTheme, live: &LiveNetlist, layout: &Schem
     let world_h = layout.world_h;
     let px = |x: f32, y: f32| [x * z, y * z];
     let mut shape = Shape::new();
-    // Dotted grid.
-    let mut gx = GRID;
-    while gx < WORLD_W {
-        let mut gy = GRID;
-        while gy < world_h {
+    // Dotted grid, in the near window only.
+    let [x0, y0, x1, y1] = s.schematic.near_window().unwrap_or([0.0, 0.0, WORLD_W, world_h]);
+    let first = |lo: f32| ((lo / GRID).floor() * GRID).max(GRID);
+    let mut gx = first(x0);
+    while gx < WORLD_W.min(x1) {
+        let mut gy = first(y0);
+        while gy < world_h.min(y1) {
             let [dx, dy] = px(gx, gy);
             shape = shape.fill(
                 vec![
@@ -818,6 +851,10 @@ fn wires_shape(s: &AppState, t: &VivadoTheme, live: &LiveNetlist, layout: &Schem
                 mx = r[0] + r[2] + 8.0;
             }
         }
+        let (lx, hx, ly, hy) = (x0.min(x1).min(mx), x0.max(x1).max(mx), y0.min(y1), y0.max(y1));
+        if !s.schematic.near_view(&[lx, ly, hx - lx, hy - ly]) {
+            continue;
+        }
         let pts = vec![px(x0, y0), px(mx, y0), px(mx, y1), px(x1, y1)];
         let (width, ink) = match (hot, in_cone) {
             (true, _) => (2.0, t.fail),
@@ -865,7 +902,7 @@ fn cell_node(
     let kind_label = match &sel {
         SchemSel::Cell(n) => live.cell(n).map(|c| c.kind.label()).unwrap_or("Cell"),
         SchemSel::Port(n) => {
-            if live.ports_in.contains(n) {
+            if live.is_in_port(n) {
                 "Input port"
             } else {
                 "Output port"
@@ -983,20 +1020,33 @@ fn schematic_canvas(s: &AppState, t: &VivadoTheme, live: &LiveNetlist, layout: &
         .h(layout.world_h * z)
         .fill(t.panel_bg)
         .on_press(|s: &mut AppState| s.schematic.selected = None)
+        .on_layout_tx(|s: &mut AppState, r: [f32; 4], tx: &mut rune::Tx| {
+            // Remount the cells only after scrolling half a view away.
+            let st = &mut s.schematic;
+            let at = [(st.canvas_at[0] - r[0]) / st.zoom, (st.canvas_at[1] - r[1]) / st.zoom];
+            let half = [st.viewport[0] / st.zoom / 2.0, st.viewport[1] / st.zoom / 2.0];
+            if (at[0] - st.view_at[0]).abs() > half[0] || (at[1] - st.view_at[1]).abs() > half[1] {
+                st.view_at = at;
+            } else {
+                tx.live_only();
+            }
+        })
         .child(canvas(wires_shape(s, t, live, layout)).w_full().h_full());
+    let near = |r: &[f32; 4]| s.schematic.near_view(r);
     // Blocks first (under their children), then ports, then mounted cells.
     for h in &live.hier {
         if let Some(rect) = layout.blocks.get(&h.name) {
             sheet = sheet.child(cell_node(s, t, live, SchemSel::Hier(h.name.clone()), *rect));
         }
     }
-    for (name, rect) in &layout.ports {
+    for (name, rect) in layout.ports.iter().filter(|(_, r)| near(r)) {
         sheet = sheet.child(cell_node(s, t, live, SchemSel::Port(name.clone()), *rect));
     }
     let mut names: Vec<&String> = layout.cells.keys().collect();
     names.sort();
     for name in names {
-        if s.schematic.cell_visible(live, name) {
+        let selected = matches!(&s.schematic.selected, Some(SchemSel::Cell(c)) if c == name);
+        if s.schematic.cell_visible(live, name) && (selected || near(&layout.cells[name])) {
             sheet = sheet.child(cell_node(
                 s,
                 t,
@@ -1023,6 +1073,9 @@ fn schematic_canvas(s: &AppState, t: &VivadoTheme, live: &LiveNetlist, layout: &
             let old = s.schematic.viewport;
             if (v[0] - old[0]).abs() > 0.5 || (v[1] - old[1]).abs() > 0.5 {
                 s.schematic.viewport = v;
+            }
+            if (r[0] - s.schematic.canvas_at[0]).abs() > 0.5 || (r[1] - s.schematic.canvas_at[1]).abs() > 0.5 {
+                s.schematic.canvas_at = [r[0], r[1]];
             }
         })
         .child(sheet)
@@ -1078,7 +1131,7 @@ fn schematic_props(s: &AppState, t: &VivadoTheme, live: Option<&LiveNetlist>) ->
                     live.design.clone(),
                 ),
                 SchemSel::Port(n) => (
-                    if live.ports_in.contains(n) {
+                    if live.is_in_port(n) {
                         "Input port".into()
                     } else {
                         "Output port".into()
@@ -1167,6 +1220,20 @@ pub fn schematic_pane(s: &AppState, t: &VivadoTheme) -> El {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn near_window_spans_a_view_around_the_visible_part() {
+        let mut st = SchematicState::new();
+        assert!(st.near_view(&[1e6, 1e6, 1.0, 1.0]), "everything before the first layout");
+        st.viewport = [400.0, 300.0];
+        st.zoom = 2.0;
+        st.view_at = [1000.0, 5000.0];
+        assert_eq!(st.near_window(), Some([800.0, 4850.0, 1400.0, 5300.0]));
+        assert!(st.near_view(&[1100.0, 5100.0, 10.0, 10.0]));
+        assert!(st.near_view(&[790.0, 4840.0, 20.0, 20.0]), "overlapping the edge");
+        assert!(!st.near_view(&[1000.0, 9000.0, 10.0, 10.0]));
+        assert!(!st.near_view(&[1500.0, 5000.0, 10.0, 10.0]));
+    }
     use crate::{app_spec, init};
     use rune::{Env, Runtime};
 

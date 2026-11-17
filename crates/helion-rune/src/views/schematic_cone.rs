@@ -97,7 +97,7 @@ impl ConeRow {
         match self.obj {
             ConeObj::Cell => SchemSel::Cell(self.name.clone()),
             ConeObj::Net
-                if live.ports_in.contains(&self.name) || live.ports_out.contains(&self.name) =>
+                if live.is_in_port(&self.name) || live.is_out_port(&self.name) =>
             {
                 SchemSel::Port(self.name.clone())
             }
