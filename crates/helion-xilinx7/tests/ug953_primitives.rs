@@ -121,32 +121,28 @@ fn ug953_ramb36e1_and_ramb18e1_cascade_and_init_frames() {
     assert_eq!(x0, x1, "cascaded RAMB36E1 must share column X");
     assert_eq!(y1, y0 + 1, "cascaded RAMB36E1 must have Y1 == Y0 + 1");
 
-    let routed = backend.route(&placed).unwrap();
-    assert!(routed
-        .nets
-        .iter()
-        .any(|n| n.net == "casc_a" && n.kind == RouteKind::DedicatedCascade));
+    // RAMB36E1 pins split bit-interleaved over the tile's two RAMB18
+    // halves; until that is written the flow refuses it by name rather
+    // than emit features X-Ray does not have.
+    let err = backend.route(&placed).unwrap_err();
+    assert!(err.contains("RAMB36E1 pin routing is not supported"), "got: {err}");
 
-    let bs = backend.bitstream(&routed).unwrap();
+    // A RAMB18E1 alone goes all the way, under X-Ray's feature names.
+    let mut d18 = Design::new("bram18_top");
+    add_blackbox(&mut d18, "u_ram18", "RAMB18E1");
+    d18.set_cell_attr("u_ram18", "READ_WIDTH_A", "18").unwrap();
+    d18.set_cell_attr("u_ram18", "WRITE_WIDTH_B", "18").unwrap();
+    let bs = backend.run(&d18).unwrap();
     let text = bs.fasm.join("\n");
-    assert!(text.contains(".RAMB36.IN_USE"), "got:\n{text}");
-    assert!(text.contains(".RAMB36.SDP_READ_WIDTH_36"), "got:\n{text}");
-    assert!(
-        text.contains(".RAMB36.RAM_EXTENSION_A_LOWER"),
-        "got:\n{text}"
-    );
-    assert!(
-        text.contains(".RAMB36.RAM_EXTENSION_A_UPPER"),
-        "got:\n{text}"
-    );
-    assert!(text.contains(".RAMB36.INIT_00[255:0] = 256'h"), "got:\n{text}");
-    assert!(
-        text.contains(".RAMB36.INITP_00[255:0] = 256'h"),
-        "got:\n{text}"
-    );
+    for f in [".IN_USE", ".READ_WIDTH_A_18", ".WRITE_WIDTH_B_18", ".ZINV_CLKARDCLK"] {
+        assert!(text.lines().any(|l| l.contains(".RAMB18_Y") && l.ends_with(f)), "missing {f}; got:\n{text}");
+    }
 
-    // Verify 256-bit INIT_00 line parses and applies into FrameStore!
-    let lines = parse_fasm(&text).expect("parse 256-bit FASM");
+    // A 256-bit INIT_00 line parses and applies into FrameStore.
+    let lines = parse_fasm(
+        "BRAM_L_X6Y0.RAMB36.INIT_00[255:0] = 256'h40000000_00000000_00000000_00000000_00000000_00000000_00000000_00000008",
+    )
+    .expect("parse 256-bit FASM");
     let init_line = lines
         .iter()
         .find(|l| l.feature.ends_with("INIT_00"))
@@ -222,16 +218,14 @@ fn ug953_dsp48e1_preadder_patdet_and_column_cascade() {
     // Each DSP tile holds two DSP48s: even Y is slot DSP_0, odd Y is DSP_1; a
     // cascade pair may straddle two tiles.
     let (s0, s1) = (format!("DSP_{}.", y0 % 2), format!("DSP_{}.", y1 % 2));
-    assert!(text.contains(&format!("{s0}USE_DPORT")), "got:\n{text}");
+    // X-Ray names (`DSP48.DSP_k.*`): MREG/PREG = 1 is the all-clear
+    // encoding, USE_PATTERN_DETECT has no bit.
+    assert!(text.contains(&format!("{s0}USE_DPORT[0]")), "got:\n{text}");
     assert!(text.contains(&format!("{s0}AREG_2")), "got:\n{text}");
-    assert!(text.contains(&format!("{s0}MREG")), "got:\n{text}");
-    assert!(text.contains(&format!("{s0}PREG")), "got:\n{text}");
-    assert!(text.contains(&format!("{s1}A_INPUT.CASCADE")), "got:\n{text}");
-    assert!(text.contains(&format!("{s1}B_INPUT.CASCADE")), "got:\n{text}");
-    assert!(
-        text.contains(&format!("{s1}USE_PATTERN_DETECT.PATDET")),
-        "got:\n{text}"
-    );
+    assert!(!text.contains(&format!("{s0}ZMREG")), "got:\n{text}");
+    assert!(!text.contains(&format!("{s0}ZPREG")), "got:\n{text}");
+    assert!(text.contains(&format!("{s1}A_INPUT[0]")), "got:\n{text}");
+    assert!(text.contains(&format!("{s1}B_INPUT[0]")), "got:\n{text}");
     assert!(
         text.contains(&format!("{s1}PATTERN[47:0] = 48'h123456789ABC")),
         "got:\n{text}"

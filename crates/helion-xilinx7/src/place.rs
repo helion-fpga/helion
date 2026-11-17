@@ -489,6 +489,20 @@ pub fn parse_site_xy(site: &str) -> Option<(i32, i32)> {
 /// `SLICEM`-only placement for `SRL16E`/`SRLC32E`, and I/O bank legality for
 /// `IDDR`/`ODDR`/`ISERDESE2`/`OSERDESE2`/`IDELAYE2`/`ODELAYE2`/`IDELAYCTRL`.
 pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, String> {
+    place_with_pools(packed, device, (device.ramb18_sites(), device.ramb36_sites(), device.dsp_sites()))
+}
+
+/// [`place`] with the hard-block site pools given: `(RAMB18 sites, RAMB36
+/// sites, DSP48E1 sites)`, each `(tile, site)` in column-major order (the
+/// backend passes the part's full lists from
+/// [`crate::device::Device::bram18_sites`] and friends).
+pub fn place_with_pools(
+    packed: &Packed7,
+    device: &dyn DeviceQuery,
+    pools: (Vec<(String, String)>, Vec<(String, String)>, Vec<(String, String)>),
+) -> Result<Placed7, String> {
+    let (b18, b36, dsp_pool) = pools;
+    let bram_pools = (b18, b36);
     let mut out = Placed7 {
         packed: packed.clone(),
         ..Default::default()
@@ -586,10 +600,10 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
     }
 
     // 2b. Block RAMs (RAMB18E1 and RAMB36E1) with column-aligned cascade placement.
-    place_brams(&packed.brams, device, &mut used_sites, &mut out.brams)?;
+    place_brams(&packed.brams, &bram_pools, &mut used_sites, &mut out.brams)?;
 
     // 2c. DSP48E1s with column-aligned PCOUT->PCIN / ACOUT->ACIN / BCOUT->BCIN cascade placement.
-    place_dsps(&packed.dsps, device, &mut used_sites, &mut out.dsps)?;
+    place_dsps(&packed.dsps, &dsp_pool, &mut used_sites, &mut out.dsps)?;
 
     // 2d. CARRY4s, ordered into chains by CO-to-CI net linkage (ZB-08).
     // The first chain head honors `packed.carry_anchor` when set (a pinned
@@ -1008,15 +1022,14 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
 
 fn place_brams(
     brams: &[PackedBram],
-    device: &dyn DeviceQuery,
+    pools: &(Vec<(String, String)>, Vec<(String, String)>),
     used_sites: &mut HashSet<String>,
     out_brams: &mut Vec<PlacedBram>,
 ) -> Result<(), String> {
     if brams.is_empty() {
         return Ok(());
     }
-    let ramb18_pool = device.ramb18_sites();
-    let ramb36_pool = device.ramb36_sites();
+    let (ramb18_pool, ramb36_pool) = pools;
 
     // Build cascade chains among BRAMs via CASCADEOUTA->CASCADEINA or CASCADEOUTB->CASCADEINB.
     let mut out_a_map: HashMap<&str, usize> = HashMap::new();
@@ -1066,7 +1079,7 @@ fn place_brams(
         }
 
         let is_36 = brams[start].kind == BramKind::Ramb36e1;
-        let pool = if is_36 { &ramb36_pool } else { &ramb18_pool };
+        let pool = if is_36 { ramb36_pool } else { ramb18_pool };
         let window = find_column_window(pool, chain.len(), used_sites).ok_or_else(|| {
             format!(
                 "place: no contiguous {:?} column of length {} for {}",
@@ -1112,14 +1125,13 @@ fn place_brams(
 
 fn place_dsps(
     dsps: &[PackedDsp],
-    device: &dyn DeviceQuery,
+    pool: &[(String, String)],
     used_sites: &mut HashSet<String>,
     out_dsps: &mut Vec<PlacedDsp>,
 ) -> Result<(), String> {
     if dsps.is_empty() {
         return Ok(());
     }
-    let pool = device.dsp_sites();
     let mut pcout_map: HashMap<&str, usize> = HashMap::new();
     let mut acout_map: HashMap<&str, usize> = HashMap::new();
     let mut bcout_map: HashMap<&str, usize> = HashMap::new();
@@ -1176,7 +1188,7 @@ fn place_dsps(
             chain.push(nxt);
             cur = nxt;
         }
-        let window = find_column_window(&pool, chain.len(), used_sites).ok_or_else(|| {
+        let window = find_column_window(pool, chain.len(), used_sites).ok_or_else(|| {
             format!(
                 "place: no contiguous DSP48E1 column of length {} for {}",
                 chain.len(),

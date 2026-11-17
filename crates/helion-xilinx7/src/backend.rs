@@ -87,7 +87,7 @@ impl Backend for Xilinx7Backend {
 
     fn place(&self, packed: &Self::Packed) -> Result<Self::Placed, String> {
         let xdev = self.xdevice(&packed.bufgs);
-        crate::place::place(packed, &xdev)
+        crate::place::place_with_pools(packed, &xdev, (self.device.bram18_sites(), self.device.bram36_sites(), self.device.dsp48_sites()))
     }
 
     fn route(&self, placed: &Self::Placed) -> Result<Self::Routed, String> {
@@ -97,7 +97,14 @@ impl Backend for Xilinx7Backend {
 
     fn bitstream(&self, routed: &Self::Routed) -> Result<Self::Bitstream, String> {
         let xdev = self.xdevice(&routed.placed.packed.bufgs);
-        crate::emit::emit_fasm(routed, &xdev)
+        let mut bs = crate::emit::emit_fasm(routed, &xdev)?;
+        // Constant BRAM and DSP inputs: ground ties need the device graph, which
+        // emit's device trait does not offer.
+        bs.fasm.extend(crate::bram::tie_lines(&routed.placed, &routed.nets, &self.device, &xdev)?);
+        bs.fasm.extend(crate::dsp::tie_lines(&routed.placed, &routed.nets, &self.device, &xdev)?);
+        bs.fasm.sort();
+        bs.fasm.dedup();
+        Ok(bs)
     }
 
     fn timing_model(&self) -> TimingModel {
