@@ -14,6 +14,7 @@ pub mod lower;
 pub mod mem;
 pub mod parse;
 pub mod pre;
+pub mod srl;
 
 use helion_ir::Design;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,8 +22,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static HARD: AtomicBool = AtomicBool::new(false);
 
 /// Build hard blocks for the Xilinx 7-series back end: block RAM from
-/// memories and device primitives (`RAMB36E1`, `DSP48E1`, ...) from their
-/// instances (see [`mem`]). Off by default (the own-fabric flow has none);
+/// memories, device primitives (`RAMB36E1`, `DSP48E1`, ...) from their
+/// instances (see [`mem`]) and shift registers as SRLs (see [`srl`]). Off by default (the own-fabric flow has none);
 /// `HELION_V2_HARD=1` turns it on too, `HELION_V2_HARD=0` keeps it off.
 pub fn set_hard(on: bool) {
     HARD.store(on, Ordering::Relaxed);
@@ -81,7 +82,10 @@ fn run(sources: &[(String, String)], top: Option<&str>, defines: &[(String, Stri
         }
     };
     warnings.extend(flops);
-    let (mut design, st, undriven) = lower::lower(&flat)?;
+    let (mut design, mut st, undriven) = lower::lower(&flat)?;
+    if hard() && srl::on() {
+        srl::infer(&mut design, &mut st);
+    }
     // A module whose outputs are all left undriven has no logic: that is
     // a mistake in the source, not a design to build.
     let out_bits: Vec<String> = flat

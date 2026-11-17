@@ -163,7 +163,11 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
                     out.push(Tok { t: T::Id("$full_case".into()), line: at });
                 }
                 // A signal marked for debugging keeps a net of its own name.
-                if text.contains("mark_debug") || text.contains("keep") {
+                // `shreg_extract = "no"` / `srl_style = "register"` / `ASYNC_REG`: kept the
+                // same way, so the shift register stays in flops (see `srl`).
+                let flat: String = text.chars().filter(|c| !c.is_whitespace() && *c != '"').collect::<String>().to_ascii_lowercase();
+                let no_srl = super::hard() && super::srl::on() && (flat.contains("shreg_extract=no") || flat.contains("srl_style=register") || flat.contains("async_reg"));
+                if text.contains("mark_debug") || text.contains("keep") || no_srl {
                     out.push(Tok { t: T::Id("$mark_debug".into()), line: at });
                 }
                 i += 2;
