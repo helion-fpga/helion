@@ -603,6 +603,7 @@ pub fn export(
         ("PCIE_2_1", packed.pcies.len()),
         ("XADC", packed.xadcs.len()),
         ("configuration primitives", packed.cfg_prims.len()),
+        ("LUT RAM", packed.lutrams.len()),
     ];
     if let Some((k, n)) = unsupported.iter().find(|(_, n)| *n > 0) {
         return Err(format!("export: {n} {k} cell(s): not supported by the Vivado export yet"));

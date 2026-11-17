@@ -143,6 +143,23 @@ pub fn fasm_to_bit(text: &str, part: &str, design: &str) -> Result<BitgenReport,
             }
         }
     }
+    // LUT RAM contents stay out of the ECC: the INIT bits of every LUT in RAM mode.
+    let ram: std::collections::HashSet<(&str, &str)> = lines.iter().filter(|l| l.feature.ends_with("LUT.RAM")).map(|l| (l.tile.as_str(), l.feature.as_str())).collect();
+    let ram_init: Vec<_> = lines
+        .iter()
+        .filter(|l| l.feature.ends_with("LUT.INIT") && ram.contains(&(l.tile.as_str(), format!("{}.RAM", &l.feature[..l.feature.len() - 5]).as_str())))
+        .map(|l| {
+            let mut all = l.clone();
+            all.bit_range = Some((63, 0));
+            all.value = crate::fasm::FasmValue::Bits { bits: u64::MAX, width: 64 };
+            all
+        })
+        .collect();
+    if !ram_init.is_empty() {
+        let mut mask = FrameStore::new(&full);
+        mask.apply_fasm(&ram_init, &segbits, &layout).map_err(|e| format!("{e:?}"))?;
+        store.exclude_from_ecc(&mask);
+    }
     let payload = store.fdri_payload();
     let opts = BitstreamOptions {
         idcode: p.idcode,
