@@ -148,7 +148,9 @@ impl Elab {
     }
 
     pub fn retry<X>(&self, m: usize, why: &str) -> R<X> {
-        Err(format!("{RETRY}{}\u{1}{why}", self.sigs[self.mem.mems[m].sig as usize].name))
+        // A memory too small for block RAM went to flops before LUT RAM existed: no warning for it.
+        let quiet = if self.sigs[self.mem.mems[m].sig as usize].ty.w() < MIN_BITS { "\u{2}" } else { "" };
+        Err(format!("{RETRY}{}\u{1}{quiet}{why}", self.sigs[self.mem.mems[m].sig as usize].name))
     }
 
     pub(super) fn hidden_sig(&mut self, name: String, w: u32) -> u32 {
