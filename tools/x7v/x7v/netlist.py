@@ -18,7 +18,7 @@ in `Netlist.errors` / `Netlist.warnings`.
 from __future__ import annotations
 
 import re
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from functools import lru_cache
 
@@ -76,6 +76,14 @@ class Fabric:
                     d, sw = feat.split(".")
                     if (sw, d) in pairs:
                         zero.add(feat)
+            if ttype.startswith("DSP_"):
+                # DSP pins with tie-off pips (D, INMODE, CEAD, ...): the one
+                # fabric source with no bits is the all-clear selection.
+                seg = self.db.segbits(ttype)
+                for d, srcs in pips_into.items():
+                    free = [sw for sw, _ in srcs if f"{ttype}.{d}.{sw}" not in seg and f"{d}.{sw}" not in ppips]
+                    if len(free) == 1 and len(srcs) > 1:
+                        zero.add(f"{d}.{free[0]}")
             spw = {}
             for i, s in enumerate(j.get("sites", [])):
                 for pin, info in s["site_pins"].items():
@@ -181,6 +189,8 @@ def _rel_names(db: Db, tile: str, fab: Fabric) -> dict[int, tuple[str, str]]:
             pre = f"RAMB18_Y{ry}"
         elif st == "RAMBFIFO36E1":
             pre = "RAMB36"
+        elif st == "DSP48E1":
+            pre = f"DSP48.DSP_{ry}"
         else:
             # Clock buffers (BUFGCTRL, BUFHCE, ...) are named by their
             # position inside the tile, not by absolute site name.
@@ -218,6 +228,9 @@ class Extractor:
         self.warnings: list[str] = []
         self._driver_memo: dict[int, tuple] = {}
         self.used_sites: set[str] = set()
+        # Model outputs tied to X because they are not modelled: signal -> why.
+        # Reading one anywhere is an error (checked after the build).
+        self.x_outputs: dict[str, str] = {}
         self._index_sites()
 
     # ---- site discovery ---------------------------------------------------
@@ -357,6 +370,11 @@ class Extractor:
                         self.warnings.append(f"{s.name} ({s.stype}) drives logic but has no model")
                     continue
                 model(self, s, nl)
+        if self.x_outputs:
+            refs = Counter(re.findall(r"\bs_\w+", "\n".join(nl.lines + list(nl.ports_out.values()))))
+            for o, why in sorted(self.x_outputs.items()):
+                if refs[o] > 1:  # its own declaration is the one reference
+                    self.errors.append(f"{why}, but logic reads it")
         known = set()
         for s in self.sites.values():
             if s.features:
@@ -613,11 +631,13 @@ def model_bufhce(x: Extractor, s: Site, nl: Netlist):
 
 
 from .bram import VERILOG_MODEL as _BRAM_VERILOG, model_ramb18, model_ramb36  # noqa: E402
+from .dsp import VERILOG_MODEL as _DSP_VERILOG, model_dsp48e1  # noqa: E402
 
 MODELS = {
     "FIFO18E1": model_ramb18,
     "RAMB18E1": model_ramb18,
     "RAMBFIFO36E1": model_ramb36,
+    "DSP48E1": model_dsp48e1,
     "SLICE": model_slice,
     "IOB33": model_iob,
     "ILOGICE3": model_ilogic,
@@ -674,4 +694,6 @@ def to_verilog(nl: Netlist, module: str = "extracted") -> str:
     out.append("endmodule")
     if any(l.startswith("x7v_ramb18 ") for l in nl.lines):
         out.append(_BRAM_VERILOG)
+    if any(l.startswith("x7v_dsp48e1 ") for l in nl.lines):
+        out.append(_DSP_VERILOG)
     return "\n".join(out) + "\n"
