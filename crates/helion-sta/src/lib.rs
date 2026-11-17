@@ -2237,6 +2237,10 @@ pub fn report_cdc(
         violations,
         crossings: match design {
             Some(d) => {
+                // Unconnected LUT inputs would each scan every net in `net_on`.
+                let mut d = d.clone_data();
+                d.freeze_pins();
+                let d = &d;
                 let domains = extract_domains(d, clocks, xdc);
                 classify_crossings(d, &domains, find_crossings(d, &domains))
             }

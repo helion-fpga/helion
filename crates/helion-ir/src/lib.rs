@@ -239,6 +239,9 @@ pub struct Design {
     pin_ix: HashMap<(Spur, Spur), usize>,
     /// Name → index in `cells`.
     cell_ix: HashMap<Spur, usize>,
+    /// Set by `freeze_pins`: `pin_ix` is complete, so a miss in `net_on` means
+    /// the pin is unconnected instead of a scan of every net.
+    pins_exact: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -422,6 +425,7 @@ impl Design {
             net_ix: HashMap::new(),
             pin_ix: HashMap::new(),
             cell_ix: HashMap::new(),
+            pins_exact: false,
         }
     }
 
@@ -465,6 +469,7 @@ impl Design {
             net_ix: HashMap::new(),
             pin_ix: HashMap::new(),
             cell_ix: HashMap::new(),
+            pins_exact: false,
         }
     }
 
@@ -574,9 +579,19 @@ impl Design {
         });
     }
 
+    /// Rebuild the pin index and trust it in `net_on` from now on. Only for a
+    /// read-only snapshot: editing `nets` directly afterwards would go unseen.
+    pub fn freeze_pins(&mut self) {
+        self.rebuild_indexes();
+        self.pins_exact = true;
+    }
+
     pub fn net_on(&self, cell: Spur, pin: Spur) -> Option<Spur> {
         if let Some(&i) = self.pin_ix.get(&(cell, pin)) {
             return self.nets.get(i).map(|n| n.name);
+        }
+        if self.pins_exact {
+            return None;
         }
         self.nets.iter().find_map(|n| {
             n.endpoints
@@ -599,7 +614,10 @@ impl Design {
     }
 
     pub fn cell(&self, name: &str) -> Option<&Cell> {
-        let key = intern(name);
+        self.cell_by_spur(intern(name))
+    }
+
+    pub fn cell_by_spur(&self, key: Spur) -> Option<&Cell> {
         if let Some(&i) = self.cell_ix.get(&key) {
             return self.cells.get(i).filter(|c| c.name == key);
         }
@@ -614,7 +632,10 @@ impl Design {
     }
 
     pub fn net(&self, name: &str) -> Option<&Net> {
-        let key = intern(name);
+        self.net_by_spur(intern(name))
+    }
+
+    pub fn net_by_spur(&self, key: Spur) -> Option<&Net> {
         if let Some(&i) = self.net_ix.get(&key) {
             return self.nets.get(i).filter(|n| n.name == key);
         }

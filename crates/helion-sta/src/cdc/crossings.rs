@@ -173,25 +173,27 @@ pub fn driver_infos(design: &Design, domains: &DomainMap, net: &str) -> Vec<Driv
         .map(|p| resolve(p.name))
         .collect();
     let mut by_source: HashMap<CrossingSource, Vec<String>> = HashMap::new();
-    let mut stack = vec![net.to_string()];
-    let mut done: HashSet<String> = HashSet::new();
+    let (pin_q, pin_o) = (intern("Q"), intern("O"));
+    let lut_ins = ["I0", "I1", "I2", "I3", "I4", "I5"].map(intern);
+    let mut stack = vec![intern(net)];
+    let mut done: HashSet<helion_ir::Spur> = HashSet::new();
     while let Some(n) = stack.pop() {
-        if !done.insert(n.clone()) {
+        if !done.insert(n) {
             continue;
         }
         if done.len() > 4096 {
             break;
         }
-        let Some(netobj) = design.net(&n) else {
+        let Some(netobj) = design.net_by_spur(n) else {
             continue;
         };
         let mut saw_driver = false;
         for e in &netobj.endpoints {
-            let Some(cell) = design.cell(resolve(e.cell)) else {
+            let Some(cell) = design.cell_by_spur(e.cell) else {
                 continue;
             };
-            match (&cell.kind, resolve(e.pin)) {
-                (helion_ir::CellKind::Hff, "Q") => {
+            match &cell.kind {
+                helion_ir::CellKind::Hff if e.pin == pin_q => {
                     saw_driver = true;
                     if let Some(d) = domains.domain_of_ff(resolve(e.cell)) {
                         by_source
@@ -200,22 +202,22 @@ pub fn driver_infos(design: &Design, domains: &DomainMap, net: &str) -> Vec<Driv
                             .push(resolve(e.cell).to_string());
                     }
                 }
-                (helion_ir::CellKind::Lut6 { .. }, "O") => {
+                helion_ir::CellKind::Lut6 { .. } if e.pin == pin_o => {
                     saw_driver = true;
-                    for p in ["I0", "I1", "I2", "I3", "I4", "I5"] {
-                        if let Some(pn) = design.net_on(e.cell, intern(p)) {
-                            stack.push(resolve(pn).to_string());
+                    for p in lut_ins {
+                        if let Some(pn) = design.net_on(e.cell, p) {
+                            stack.push(pn);
                         }
                     }
                 }
                 _ => {}
             }
         }
-        if !saw_driver && input_ports.contains(n.as_str()) {
+        if !saw_driver && input_ports.contains(resolve(n)) {
             by_source
                 .entry(CrossingSource::PortInput)
                 .or_default()
-                .push(n.clone());
+                .push(resolve(n).to_string());
         }
     }
     let mut out: Vec<DriverInfo> = by_source
