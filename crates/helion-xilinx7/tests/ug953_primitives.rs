@@ -35,40 +35,68 @@ fn ug953_mmcm_and_pll_pack_place_route_fasm() {
     let mut d = Design::new("cmt_top");
     add_blackbox(&mut d, "u_mmcm", "MMCME2_ADV");
     d.set_cell_attr("u_mmcm", "BANDWIDTH", "HIGH").unwrap();
-    d.set_cell_attr("u_mmcm", "COMPENSATION", "ZHOLD").unwrap();
     d.set_cell_attr("u_mmcm", "CLKIN1_PERIOD", "10.0").unwrap(); // 100 MHz
     d.set_cell_attr("u_mmcm", "DIVCLK_DIVIDE", "1").unwrap();
-    d.set_cell_attr("u_mmcm", "CLKFBOUT_MULT_F", "10.5")
-        .unwrap(); // 1050 MHz VCO
-    d.set_cell_attr("u_mmcm", "CLKOUT0_DIVIDE_F", "5.0")
-        .unwrap();
-    d.set_cell_attr("u_mmcm", "CLKOUT1_DIVIDE", "10").unwrap();
+    d.set_cell_attr("u_mmcm", "CLKFBOUT_MULT_F", "10.0").unwrap(); // 1000 MHz VCO
+    d.set_cell_attr("u_mmcm", "CLKOUT0_DIVIDE_F", "5.0").unwrap();
+    d.set_cell_attr("u_mmcm", "CLKOUT1_DIVIDE", "7").unwrap();
     d.connect("clk_in", "u_mmcm", "CLKIN1");
     d.connect("fb", "u_mmcm", "CLKFBOUT");
     d.connect("fb", "u_mmcm", "CLKFBIN");
-    d.connect("clk210", "u_mmcm", "CLKOUT0");
-    d.connect("clk105", "u_mmcm", "CLKOUT1");
+    d.connect("clk200", "u_mmcm", "CLKOUT0");
+    d.connect("clk143", "u_mmcm", "CLKOUT1");
 
     add_blackbox(&mut d, "u_pll", "PLLE2_ADV");
     d.set_cell_attr("u_pll", "CLKIN1_PERIOD", "10.0").unwrap();
     d.set_cell_attr("u_pll", "DIVCLK_DIVIDE", "1").unwrap();
     d.set_cell_attr("u_pll", "CLKFBOUT_MULT", "12").unwrap(); // 1200 MHz VCO
     d.set_cell_attr("u_pll", "CLKOUT0_DIVIDE", "6").unwrap();
-    d.connect("clk210", "u_pll", "CLKIN1");
-    d.connect("clk200", "u_pll", "CLKOUT0");
+    d.connect("clk_in", "u_pll", "CLKIN1");
+    d.connect("pfb", "u_pll", "CLKFBOUT");
+    d.connect("pfb", "u_pll", "CLKFBIN");
+    d.connect("clk200b", "u_pll", "CLKOUT0");
 
     let backend = Xilinx7Backend::open("xc7a35t").unwrap();
     let bs = backend.run(&d).unwrap();
     let text = bs.fasm.join("\n");
-    assert!(text.contains("MMCME2_ADV.IN_USE"), "got:\n{text}");
-    assert!(text.contains("MMCME2_ADV.BANDWIDTH.HIGH"), "got:\n{text}");
-    assert!(
-        text.contains("MMCME2_ADV.CLKFBOUT_CLKOUT2_FRAC_EN"),
-        "got:\n{text}"
-    );
-    assert!(text.contains("PLLE2_ADV.IN_USE"), "got:\n{text}");
+    // Vivado's words (tools/x7v/tests/cmt_sweep.py): M = 10 HIGH = OPTIMIZED.
+    for want in [
+        "MMCME2_ADV.IN_USE",
+        "MMCME2_ADV.COMP.Z_ZHOLD",
+        "MMCME2_ADV.ZINV_RST",
+        "MMCME2_ADV.CLKFBOUT_CLKOUT1_HIGH_TIME[5:0] = 6'd5",
+        "MMCME2_ADV.CLKOUT1_CLKOUT1_HIGH_TIME[5:0] = 6'd3",
+        "MMCME2_ADV.CLKOUT1_CLKOUT1_LOW_TIME[5:0] = 6'd4",
+        "MMCME2_ADV.CLKOUT1_CLKOUT2_EDGE[0]",
+        "MMCME2_ADV.CLKOUT6_CLKOUT2_FRACTIONAL_NO_COUNT[0]",
+        "MMCME2_ADV.LKTABLE[39:0] = 40'hE73E8FA401",
+        "MMCME2_ADV.TABLE[9:0] = 10'h3D4",
+        "MMCME2_ADV.POWER_REG_POWER_REG_POWER_REG[15:0] = 16'h9900",
+        "PLLE2_ADV.IN_USE",
+        "PLLE2_ADV.COMPENSATION.Z_ZHOLD_OR_CLKIN_BUF",
+    ] {
+        assert!(text.contains(want), "missing {want}:\n{text}");
+    }
+    assert!(!text.contains("BANDWIDTH"), "no BANDWIDTH feature exists:\n{text}");
     let parsed = parse_fasm(&text).expect("valid FASM");
     assert!(!parsed.is_empty());
+}
+
+/// Fractional dividers are not measured yet: refused, never guessed.
+#[test]
+fn ug953_fractional_mmcm_is_refused() {
+    let mut d = Design::new("cmt_frac");
+    add_blackbox(&mut d, "u_mmcm", "MMCME2_ADV");
+    d.set_cell_attr("u_mmcm", "CLKIN1_PERIOD", "10.0").unwrap();
+    d.set_cell_attr("u_mmcm", "CLKFBOUT_MULT_F", "10.5").unwrap();
+    d.set_cell_attr("u_mmcm", "CLKOUT0_DIVIDE_F", "5.0").unwrap();
+    d.connect("clk_in", "u_mmcm", "CLKIN1");
+    d.connect("fb", "u_mmcm", "CLKFBOUT");
+    d.connect("fb", "u_mmcm", "CLKFBIN");
+    d.connect("c0", "u_mmcm", "CLKOUT0");
+    let backend = Xilinx7Backend::open("xc7a35t").unwrap();
+    let err = backend.run(&d).unwrap_err();
+    assert!(err.contains("fractional"), "got: {err}");
 }
 
 #[test]

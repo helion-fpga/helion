@@ -3075,6 +3075,10 @@ fn insert_input_buffers(netlist: &Design, packed: &mut Packed7) -> Result<(), St
             read.insert(c.ci_net.clone());
         }
     }
+    // An MMCM/PLL clock input straight from a port gets its IBUF here too.
+    for c in &packed.cmts {
+        read.extend(c.clkin1_net.iter().chain(c.clkin2_net.iter()).filter(|n| !matches!(n.as_str(), "0" | "const0" | "$false" | "GND" | "gnd")).cloned());
+    }
     // Clock ports already have an IBUF; data loads of the raw port net read
     // its output instead.
     let clock_ibuf: HashMap<String, String> = packed
