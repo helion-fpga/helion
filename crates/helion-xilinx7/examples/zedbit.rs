@@ -68,6 +68,9 @@ fn synth_zb(paths: &[&str], top: Option<&str>) -> Result<Design, String> {
 /// rename (SystemVerilog keywords), as `(VHDL name, netlist name)`.
 fn synth_v2(paths: &[&str], top: Option<&str>) -> Result<(Design, Vec<(String, String)>), String> {
     helion_sv::v2::set_hard(true);
+    // The router does not build SRL16E/SRLC32E pins yet (HELION_GAPS G53):
+    // shift registers stay flops unless HELION_V2_SRL=1.
+    helion_sv::v2::srl::set_off(true);
     let mut renames = Vec::new();
     helion_sv::v2::dag::set_carry_arith(std::env::var("HELION_NO_CARRY").is_err());
     let s = if is_vhdl(paths[0]) {
