@@ -363,6 +363,9 @@ pub struct Placed7 {
     pub pcies: Vec<PlacedPcie>,
     pub xadcs: Vec<PlacedXadc>,
     pub cfg_prims: Vec<PlacedCfgPrim>,
+    /// Routed tie-offs of block RAM and DSP inputs held at 0:
+    /// `(net, site, site pin, is_driver)`, see [`crate::bram::tie0_endpoints`].
+    pub tie_eps: Vec<(String, String, String, bool)>,
 }
 
 /// FF control set: CLK, CE, SR nets and SR mode. Slice-wide in 7-series.
