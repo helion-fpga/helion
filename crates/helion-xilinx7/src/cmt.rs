@@ -15,8 +15,7 @@
 //! * `LKTABLE`, `TABLE`, `FILTREG*`, `LOCKREG*`: Vivado's lock and
 //!   loop-filter words per feedback multiplier and BANDWIDTH
 //!   ([`crate::cmt_tables`]; HIGH equals OPTIMIZED).
-//! * `POWER_REG`: MMCM 0x9900 when any of CLKOUT1..6 is used, else 0x0100;
-//!   PLL 0 (see [`power_reg`]).
+//! * `POWER_REG`: see [`power_reg`].
 //! * Internal feedback (CLKFBOUT wired straight to CLKFBIN, routed through
 //!   the tile's `CLKFBOUT2IN` pip): MMCM `COMP.Z_ZHOLD`, PLL
 //!   `COMPENSATION.Z_ZHOLD_OR_CLKIN_BUF`.
@@ -58,15 +57,21 @@ pub fn phase_eighths(phase: f64, div: u32) -> u32 {
     (p / 360.0 * div.max(1) as f64 * 8.0).round() as u32
 }
 
-/// Vivado's POWER_REG: 0x9900 for an MMCM driving any of CLKOUT1..6,
-/// 0x0100 otherwise; 0 for a PLL. Measured: MMCMs with CLKOUT0 alone (three
-/// phase variants) and with no output write 0x0100; with CLKOUT0..2 and
-/// with all seven, 0x9900; PLLs always 0.
+/// Vivado's POWER_REG: an MMCM writes 0x9900 when some counter's phase
+/// needs an odd quarter of a VCO period (PHASE_MUX not 0 or 4), else
+/// 0x0100; a PLL writes 0. Measured over 22 Vivado MMCMs (sweep_pwr*,
+/// sweep_divs, ref_mmcm): PHASE_MUX 1, 2, 5, 6, 7 on any output gave 0x9900;
+/// 0 and 4, any outputs and divides, gave 0x0100.
 pub fn power_reg(c: &PackedCmt) -> u32 {
-    match c.kind {
-        CmtKind::PllE2Adv => 0,
-        CmtKind::MmcmE2Adv if c.clkout_nets[1..].iter().any(|n| n.is_some()) => 0x9900,
-        CmtKind::MmcmE2Adv => 0x0100,
+    if c.kind == CmtKind::PllE2Adv {
+        return 0;
+    }
+    let n = 7;
+    let odd = (0..n).any(|i| phase_eighths(c.clkout_phase[i], c.clkout_divide[i]) % 4 != 0);
+    if odd {
+        0x9900
+    } else {
+        0x0100
     }
 }
 
