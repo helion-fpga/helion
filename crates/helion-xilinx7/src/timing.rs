@@ -378,10 +378,6 @@ fn check_no_crossings(packed: &crate::pack::Packed7) -> Result<(), String> {
     Ok(())
 }
 
-fn domains_of_ffs_contain(packed: &crate::pack::Packed7, domain: &str) -> bool {
-    packed.ffs.iter().any(|f| f.clk_net == domain)
-}
-
 /// Paths launched by the flops of clock `domain`, timed against `period_ps`.
 fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Analysis, String> {
     let placed = &routed.placed;
@@ -508,8 +504,9 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         memo.insert(net.to_string(), r.clone());
         Ok(r)
     }
-    // Block RAM ports: outputs launch paths, inputs end them. A port on
-    // another clock would be a crossing, which is not modelled.
+    // Block RAM ports, timed like flops: every RAM output launches paths
+    // (another clock's too, so a crossing is timed against the capturing
+    // clock, never skipped), and this clock's RAM inputs end them.
     let mut bram_out: HashMap<&str, &str> = HashMap::new();
     let mut bram_in: Vec<(&str, &str, String)> = Vec::new(); // (net, site, site pin)
     for b in &packed.brams {
@@ -522,15 +519,12 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
                 || pin.starts_with("ADDRA") || pin.starts_with("WEA") || pin.starts_with("ENA") || pin.ends_with("ARSTRAM")
                 || pin.ends_with("ARSTREG") || pin.starts_with("REGCEA");
             let clk = if port_a { &b.clka_net } else { &b.clkb_net };
-            if clk.as_deref() != Some(domain) {
-                if clk.is_some() && domains_of_ffs_contain(packed, domain) {
-                    return Err(format!("timing: block RAM {} pin {pin} is on clock {:?}, not `{domain}`; crossings are not supported", b.name, clk));
-                }
+            if clk.is_none() {
                 continue;
             }
             if *is_out {
                 bram_out.insert(net.as_str(), b.name.as_str());
-            } else {
+            } else if clk.as_deref() == Some(domain) {
                 for sp in crate::bram::site_pins(&pb.site, pin)? {
                     bram_in.push((net.as_str(), pb.site.as_str(), sp));
                 }
