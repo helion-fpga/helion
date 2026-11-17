@@ -20,6 +20,8 @@ fn main() {
         let top = all.iter().position(|x| x == "--top").and_then(|i| all.get(i + 1)).map(|s| s.as_str());
         let regmap_path = all.iter().position(|x| x == "--regmap").and_then(|i| all.get(i + 1)).map(|s| s.as_str());
         let files: Vec<&std::path::Path> = a.iter().filter(|x| Some(x.as_str()) != top && Some(x.as_str()) != regmap_path).map(|x| std::path::Path::new(x.as_str())).collect();
+        // Carry chains as in the ZedBoard flow (`zedbit`), so svcheck sees that netlist.
+        helion_sv::v2::dag::set_carry_arith(std::env::var("HELION_NO_CARRY").is_err());
         helion_sv::synth_sv_v2_files(&files, top).map(|s| {
             for w in &s.warnings {
                 eprintln!("warning: {w}");
