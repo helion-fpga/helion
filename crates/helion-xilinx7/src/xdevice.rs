@@ -57,6 +57,9 @@ pub struct XDevice<'a> {
     search: std::cell::RefCell<SearchBuf>,
     /// Congestion history per wire id (times a wire was fought over).
     history: std::cell::RefCell<Vec<u16>>,
+    /// PathFinder phase: nets on each wire's node (per wire id), and the
+    /// cost each of them adds to taking it.
+    pf: std::cell::RefCell<Option<(Vec<u16>, u32)>>,
     /// Per search, by node: whether a dead-end node leads into the target
     /// (stamp of the search that computed it, and the answer).
     approach: std::cell::RefCell<(Vec<u32>, Vec<u8>)>,
@@ -107,6 +110,7 @@ impl<'a> XDevice<'a> {
             flags: std::cell::RefCell::new(Vec::new()),
             search: std::cell::RefCell::new(SearchBuf::default()),
             history: std::cell::RefCell::new(Vec::new()),
+            pf: std::cell::RefCell::new(None),
             approach: std::cell::RefCell::new((Vec::new(), Vec::new())),
         }
     }
@@ -333,12 +337,20 @@ impl<'a> XDevice<'a> {
         const PRESENT_PS: u32 = 1500;
         const HISTORY_PS: u32 = 300;
         let hist = self.history.borrow();
+        let pf = self.pf.borrow();
         let extra = |id: u32| -> u32 {
-            let mut c = hist.get(id as usize).copied().unwrap_or(0) as u32 * HISTORY_PS;
+            let h = hist.get(id as usize).copied().unwrap_or(0) as u32;
+            let mut c = h * HISTORY_PS;
+            if let Some((occ, ps)) = pf.as_ref() {
+                // PathFinder's (base + history) x present: history scales with
+                // the sharing price, so a wire that stays contested ends up
+                // dearer than sharing two fresh ones.
+                c = c.saturating_add((occ[id as usize] as u32).saturating_mul(*ps).saturating_mul(1 + h)).min(1_000_000_000);
+            }
             if opts.negotiate {
                 let o = own.0.get(id as usize).copied().unwrap_or(0);
                 if o != 0 && o != my {
-                    c += PRESENT_PS;
+                    c = c.saturating_add(PRESENT_PS);
                 }
             }
             c
@@ -452,7 +464,10 @@ impl<'a> XDevice<'a> {
         }
         // Search region: the box spanned by the sinks and the nearest wire
         // the net already has (its source, or a branch of its tree).
-        let region = (opts.bbox > 0).then(|| {
+        // Late PathFinder iterations search the whole device: a net whose
+        // only free detour leaves the box would otherwise keep sharing.
+        let bbox = if pf.as_ref().is_some_and(|(_, ps)| *ps >= 20_000) { 0 } else { opts.bbox };
+        let region = (bbox > 0).then(|| {
             let (sx, sy) = self.wire_xy(near.1);
             let (mut x0, mut x1, mut y0, mut y1) = (sx, sx, sy, sy);
             for &(x, y) in &tgt_xy {
@@ -461,7 +476,7 @@ impl<'a> XDevice<'a> {
                 y0 = y0.min(y);
                 y1 = y1.max(y);
             }
-            (x0 - opts.bbox, x1 + opts.bbox, y0 - opts.bbox, y1 + opts.bbox)
+            (x0 - bbox, x1 + bbox, y0 - bbox, y1 + bbox)
         });
         let inside = |id: u32| -> bool {
             match region {
@@ -507,7 +522,7 @@ impl<'a> XDevice<'a> {
                         if seen!(m) && sb.parent[m as usize] == u32::MAX {
                             continue;
                         }
-                        let gm = g + extra(m);
+                        let gm = g.saturating_add(extra(m));
                         if sb.closed[m as usize] == stampv {
                             continue;
                         }
@@ -515,7 +530,7 @@ impl<'a> XDevice<'a> {
                             sb.stamp[m as usize] = stampv;
                             sb.best[m as usize] = gm;
                             sb.parent[m as usize] = id;
-                            heap.push(Reverse((gm + h(m), gm, m)));
+                            heap.push(Reverse((gm.saturating_add(h(m)), gm, m)));
                         }
                     }
                 }
@@ -535,7 +550,7 @@ impl<'a> XDevice<'a> {
                 if !allowed(dst) || !inside(dst) || !leads_to_target(dst) {
                     continue;
                 }
-                let ng = g + pip.delay_ps as u32 + PIP_BASE + extra(dst);
+                let ng = g.saturating_add(pip.delay_ps as u32 + PIP_BASE).saturating_add(extra(dst));
                 if seen!(dst) && sb.parent[dst as usize] == u32::MAX {
                     continue;
                 }
@@ -546,7 +561,7 @@ impl<'a> XDevice<'a> {
                     sb.stamp[dst as usize] = stampv;
                     sb.best[dst as usize] = ng;
                     sb.parent[dst as usize] = id;
-                    heap.push(Reverse((ng + h(dst), ng, dst)));
+                    heap.push(Reverse((ng.saturating_add(h(dst)), ng, dst)));
                 }
             }
         }
@@ -957,7 +972,64 @@ impl<'a> RouteQuery for XDevice<'a> {
                 }
             }
         }
-        own.1.iter().filter(|(_, v)| oids.contains(v)).map(|(k, _)| k.clone()).collect()
+        // Sorted: the rip-up queue follows this order, and hash order differs per run.
+        let mut v: Vec<String> = own.1.iter().filter(|(_, v)| oids.contains(v)).map(|(k, _)| k.clone()).collect();
+        v.sort();
+        v
+    }
+
+    fn pf_present(&self, ps: Option<u32>) {
+        let mut pf = self.pf.borrow_mut();
+        match ps {
+            None => *pf = None,
+            Some(ps) => match pf.as_mut() {
+                Some(st) => st.1 = ps,
+                None => *pf = Some((vec![0; self.wire_to_tile.len()], ps)),
+            },
+        }
+    }
+
+    fn pf_occupy(&self, wires: &[(String, String)], delta: i32) {
+        let mut pf = self.pf.borrow_mut();
+        let Some((occ, _)) = pf.as_mut() else { return };
+        // A net counts once per node, however many of its wires it uses.
+        let mut keys: Vec<u64> = wires.iter().filter_map(|(t, w)| self.node_key(t, w)).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        for k in keys {
+            let one = [k as u32];
+            let members: &[u32] = if k >> 32 != 0 { &one } else { self.node_wires(k as u32) };
+            for &m in members {
+                let slot = &mut occ[m as usize];
+                *slot = (*slot as i32 + delta).clamp(0, u16::MAX as i32) as u16;
+            }
+        }
+    }
+
+    fn pf_overused(&self, wires: &[(String, String)]) -> bool {
+        let pf = self.pf.borrow();
+        let Some((occ, _)) = pf.as_ref() else { return false };
+        wires.iter().filter_map(|(t, w)| self.wire_id_of(t, w)).any(|id| occ[id as usize] > 1)
+    }
+
+    fn pf_history(&self) -> usize {
+        let pf = self.pf.borrow();
+        let Some((occ, _)) = pf.as_ref() else { return 0 };
+        let mut hist = self.history.borrow_mut();
+        if hist.len() != occ.len() {
+            hist.resize(occ.len(), 0);
+        }
+        let mut over = 0;
+        for (i, (h, &o)) in hist.iter_mut().zip(occ).enumerate() {
+            if o > 1 {
+                *h = h.saturating_add(1);
+                over += 1;
+                if debug_env("HELION_ROUTE_DEBUG") {
+                    eprintln!("route_debug shared wire {:?} by {o} nets", self.wire_name_of(i as u32));
+                }
+            }
+        }
+        over
     }
 
     fn release_claims(&self, nets: &[String], claimed_len: usize) {
@@ -2189,5 +2261,28 @@ mod tests {
         );
         // SING IOBs pair with the SING IOI tile of the same row.
         assert_eq!(xdev.ioi_tile("RIOB33_SING_X73Y49").as_deref(), Some("RIOI3_SING_X73Y49"));
+    }
+
+    /// PathFinder bookkeeping: two nets on different wires of one node
+    /// share it; one leaving ends the overuse.
+    #[test]
+    fn pathfinder_occupancy_is_per_node() {
+        let (dev, maps) = test_z020();
+        let xdev = XDevice::new(dev, maps.clone());
+        let a = ("INT_L_X2Y10".to_string(), "NN6BEG0".to_string());
+        let members = RouteQuery::node_wires(&xdev, &a.0, &a.1); // the others
+        let b = members.iter().find(|m| **m != a).expect("multi-wire node").clone();
+        xdev.pf_present(Some(100));
+        xdev.pf_occupy(std::slice::from_ref(&a), 1);
+        assert!(!xdev.pf_overused(std::slice::from_ref(&b)));
+        // The same net twice on one node still counts once.
+        xdev.pf_occupy(&[b.clone()], 1);
+        xdev.pf_occupy(std::slice::from_ref(&a), -1);
+        xdev.pf_occupy(&[a.clone(), b.clone()], 1);
+        assert!(xdev.pf_overused(std::slice::from_ref(&a)));
+        assert_eq!(xdev.pf_history(), members.len() + 1, "every wire of the node");
+        xdev.pf_occupy(&[b.clone()], -1);
+        assert!(!xdev.pf_overused(&[a, b]));
+        xdev.pf_present(None);
     }
 }
