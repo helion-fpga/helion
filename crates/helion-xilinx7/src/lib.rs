@@ -18,6 +18,8 @@ pub mod bitgen;
 pub mod bram;
 pub mod dsp;
 pub mod clkdist;
+pub mod cmt;
+pub mod cmt_tables;
 pub mod bitstream;
 pub mod db;
 pub mod device;

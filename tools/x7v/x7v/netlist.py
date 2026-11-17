@@ -191,6 +191,8 @@ def _rel_names(db: Db, tile: str, fab: Fabric) -> dict[int, tuple[str, str]]:
             pre = "RAMB36"
         elif st == "DSP48E1":
             pre = f"DSP48.DSP_{ry}"
+        elif st in ("MMCME2_ADV", "PLLE2_ADV"):
+            pre = st  # one per CMT tile (mmcm.py)
         else:
             # Clock buffers (BUFGCTRL, BUFHCE, ...) are named by their
             # position inside the tile, not by absolute site name.
@@ -642,12 +644,15 @@ def model_bufhce(x: Extractor, s: Site, nl: Netlist):
 
 from .bram import VERILOG_MODEL as _BRAM_VERILOG, model_ramb18, model_ramb36  # noqa: E402
 from .dsp import VERILOG_MODEL as _DSP_VERILOG, model_dsp48e1  # noqa: E402
+from .mmcm import VERILOG_MODEL as _CMT_VERILOG, model_cmt  # noqa: E402
 
 MODELS = {
     "FIFO18E1": model_ramb18,
     "RAMB18E1": model_ramb18,
     "RAMBFIFO36E1": model_ramb36,
     "DSP48E1": model_dsp48e1,
+    "MMCME2_ADV": model_cmt,
+    "PLLE2_ADV": model_cmt,
     "SLICE": model_slice,
     "IOB33": model_iob,
     "ILOGICE3": model_ilogic,
@@ -706,4 +711,6 @@ def to_verilog(nl: Netlist, module: str = "extracted") -> str:
         out.append(_BRAM_VERILOG)
     if any(l.startswith("x7v_dsp48e1 ") for l in nl.lines):
         out.append(_DSP_VERILOG)
+    if any(l.startswith("x7v_cmt ") for l in nl.lines):
+        out.append(_CMT_VERILOG)
     return "\n".join(out) + "\n"

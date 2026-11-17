@@ -370,16 +370,19 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         if let Some(n) = &cmt.clkfbin_net {
             add_ep(n.clone(), site.to_string(), "CLKFBIN", false);
         }
+        // CMT clocks route over the device graph like a pad clock into a
+        // BUFG: dedicated CMT/HCLK/HROW wires (see the `no_int` loads below).
         if let Some(n) = &cmt.clkfbout_net {
             add_ep(n.clone(), site.to_string(), "CLKFBOUT", true);
-            clock_spine_nets.insert(n.clone());
         }
         for (i, n) in cmt.clkout_nets.iter().enumerate() {
             if let Some(net) = n {
                 add_ep(net.clone(), site.to_string(), &format!("CLKOUT{i}"), true);
-                clock_spine_nets.insert(net.clone());
             }
         }
+    }
+    for (net, site, pin, is_driver) in crate::cmt::endpoints(placed) {
+        add_ep(net, site, &pin, is_driver);
     }
     for bram in &packed.brams {
         let site = bram_site.get(bram.name.as_str()).copied().unwrap_or("");
@@ -1166,15 +1169,11 @@ fn route_net(
     if clock_spine_nets.contains(net) {
         return Ok(RouteKind::ClockSpine);
     }
-    // IBUF into a regional buffer or a CMT: dedicated clock input route.
+    // IBUF into a regional buffer: dedicated clock input route (a CMT input
+    // routes over the graph below).
     // (IBUF into a BUFG goes through general pips, see above.)
     let driver_is_ibuf = driver.pin == "I" && driver.site.starts_with("IOB_");
-    let loads_are_clk = loads.iter().all(|l| {
-        l.site.starts_with("BUFIO_")
-            || l.site.starts_with("BUFR_")
-            || l.site.starts_with("MMCME2_ADV_")
-            || l.site.starts_with("PLLE2_ADV_")
-    });
+    let loads_are_clk = loads.iter().all(|l| l.site.starts_with("BUFIO_") || l.site.starts_with("BUFR_"));
     if driver_is_ibuf && loads_are_clk {
         return Ok(RouteKind::ClockSpine);
     }
@@ -1212,10 +1211,17 @@ fn route_net(
         }
         let allow_byp = is_bypass_pin(&load.pin);
         let opts = RouteOpts { allow_power, allow_byp, ..Default::default() };
-        // A BUFG input takes the dedicated clock path (clock-capable pad ->
-        // CMT/HROW -> BUFG) when one exists, else general interconnect.
+        // A BUFG or CMT clock input takes the dedicated clock path
+        // (clock-capable pad or CMT -> HCLK_CMT/HROW -> BUFG, CMT feedback)
+        // when one exists, else general interconnect.
         let mut fast = None;
-        if matches!(load.pin.as_str(), "I0" | "I1") {
+        if matches!(load.pin.as_str(), "CLKIN1" | "CLKIN2") {
+            if let Some(p) = crate::cmt::dedicated_clock_route(device, (&src_tile, &src_wire), &sinks) {
+                let n = p.len();
+                fast = Some(Some((p, vec![(0, 0); n])));
+            }
+        }
+        if fast.is_none() && matches!(load.pin.as_str(), "I0" | "I1" | "CLKIN1" | "CLKIN2" | "CLKFBIN") {
             if let Some(Some(r)) = device.route_fast((&src_tile, &src_wire), &tree, &sinks, RouteOpts { no_int: true, ..opts }, net, claimed) {
                 fast = Some(Some(r));
             }
