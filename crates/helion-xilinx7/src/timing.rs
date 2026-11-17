@@ -287,11 +287,25 @@ pub fn analyze(routed: &Routed7, period_ps: u32) -> Result<Analysis, String> {
 /// The returned `period_ps` is the period of the domain with the worst
 /// slack.
 pub fn analyze_clocks(routed: &Routed7, period_of: &dyn Fn(&str) -> Option<u32>) -> Result<Analysis, String> {
+    analyze_clocks_async(routed, period_of, &|_, _| false)
+}
+
+/// Like [`analyze_clocks`], where `is_async(launch, capture)` names clock
+/// pairs declared asynchronous (`set_clock_groups -asynchronous`). Between
+/// those, a flop's D may come straight from another flop's Q (a
+/// synchronizer's first stage, or data held stable by a handshake); any
+/// logic on such a path is still an error. The path is still timed, against
+/// the capturing clock's period.
+pub fn analyze_clocks_async(
+    routed: &Routed7,
+    period_of: &dyn Fn(&str) -> Option<u32>,
+    is_async: &dyn Fn(&str, &str) -> bool,
+) -> Result<Analysis, String> {
     let mut domains: Vec<&str> = routed.placed.packed.ffs.iter().map(|f| f.clk_net.as_str()).collect();
     domains.sort();
     domains.dedup();
     if domains.len() > 1 {
-        check_no_crossings(&routed.placed.packed)?;
+        check_no_crossings(&routed.placed.packed, is_async)?;
     }
     let mut worst: Option<Analysis> = None;
     let (mut endpoints, mut failing) = (0usize, 0usize);
@@ -319,7 +333,7 @@ pub fn analyze_clocks(routed: &Routed7, period_of: &dyn Fn(&str) -> Option<u32>)
 
 /// Every flop input's combinational fan-in reaches flops of its own clock
 /// only.
-fn check_no_crossings(packed: &crate::pack::Packed7) -> Result<(), String> {
+fn check_no_crossings(packed: &crate::pack::Packed7, is_async: &dyn Fn(&str, &str) -> bool) -> Result<(), String> {
     let lut_by_out: HashMap<&str, &crate::pack::PackedLut> = packed.luts.iter().map(|l| (l.output_net.as_str(), l)).collect();
     let ff_by_q: HashMap<&str, &crate::pack::PackedFf> = packed.ffs.iter().map(|f| (f.q_net.as_str(), f)).collect();
     let mut carry_ins: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -373,7 +387,11 @@ fn check_no_crossings(packed: &crate::pack::Packed7) -> Result<(), String> {
         if !ff.sr_async {
             ins.extend(ff.sr_net.iter().map(|s| s.as_str()));
         }
-        for i in ins {
+        for (k, i) in ins.into_iter().enumerate() {
+            // A declared-asynchronous crossing straight from a flop into D.
+            if k == 0 && ff_by_q.get(i).is_some_and(|src| is_async(&src.clk_net, &ff.clk_net)) {
+                continue;
+            }
             for c in launches(i, &mut memo, &lut_by_out, &ff_by_q, &carry_ins, 0) {
                 if c != ff.clk_net {
                     return Err(format!(
@@ -689,10 +707,17 @@ mod tests {
             ffs: vec![ff("a", "pa", "qa", "clk_a"), ff("b", "x", "qb", "clk_a")],
             ..Default::default()
         };
-        assert!(check_no_crossings(&p).is_ok());
+        assert!(check_no_crossings(&p, &|_, _| false).is_ok());
         p.ffs[1].clk_net = "clk_b".into();
-        let err = check_no_crossings(&p).unwrap_err();
+        let err = check_no_crossings(&p, &|_, _| false).unwrap_err();
         assert!(err.contains("from clock `clk_a`") && err.contains("flop b"), "got: {err}");
+        // Declared asynchronous: still refused through logic (the inverter),
+        // allowed straight from a flop (a synchronizer's first stage).
+        let asy = |a: &str, b: &str| a != b;
+        assert!(check_no_crossings(&p, &asy).is_err());
+        p.ffs[1].d_net = "qa".into();
+        assert!(check_no_crossings(&p, &asy).is_ok());
+        assert!(check_no_crossings(&p, &|_, _| false).is_err());
     }
 
     #[test]
