@@ -439,11 +439,16 @@ def model_slice(x: Extractor, s: Site, nl: Netlist):
     F = s.features
     n = lambda pin: sig(s.name, pin)
     L = nl.lines
-    unsupported = [f for f in F if re.match(r"^[A-D]LUT\.(RAM|SRL|SMALL)$", f) or f in ("WA7USED", "WA8USED", "WEMUX.CE", "LATCH")]
+    unsupported = lutram.check_features(F) + (["LATCH"] if "LATCH" in F else [])
     if unsupported:
-        x.errors.append(f"{s.name}: LUTRAM/SRL/latch mode not modelled: {sorted(unsupported)}")
+        x.errors.append(f"{s.name}: SRL/latch mode not modelled: {unsupported}")
     L.append(f"// {s.name} ({s.stype}) @ {s.tile}")
+    ram = [c for c in LETTERS if f"{c}LUT.RAM" in F]
+    if ram:
+        lutram.model(x, s, nl, ram, lambda c: _lut_init(s, c))
     for i, c in enumerate(LETTERS):
+        if c in ram:
+            continue
         init = _lut_init(s, c)
         ins = []
         for k in range(6):
@@ -640,6 +645,7 @@ def model_bufhce(x: Extractor, s: Site, nl: Netlist):
     nl.lines.append(f"wire {n('O')} = ({ce}) === 1'b0 ? 1'b0 : {i};")
 
 
+from . import lutram  # noqa: E402
 from .bram import VERILOG_MODEL as _BRAM_VERILOG, model_ramb18, model_ramb36  # noqa: E402
 from .dsp import VERILOG_MODEL as _DSP_VERILOG, model_dsp48e1  # noqa: E402
 
