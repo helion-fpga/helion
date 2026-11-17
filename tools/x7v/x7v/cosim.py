@@ -372,6 +372,15 @@ def run(workdir: str, rtl_files: list[str], top: str, xdc: str, netlist_v: str,
     res = CosimResult(cycles, 0)
     res.unmapped_inputs = [b for b in in_bits if pin_of.get(b) not in ports_in]
     res.unmapped_outputs = [b for b in out_bits if pin_of.get(b) not in ports_out]
+    if is_verilog(rtl_files):
+        # Clocking primitives the RTL instantiates (MMCM/PLL/BUFG) and does
+        # not define: x7v's shims onto its own clock model (mmcm.py).
+        from . import mmcm
+        text = "\n".join(open(f).read() for f in rtl_files)
+        if any(re.search(rf"\b{p}\b", text) and not re.search(rf"\bmodule\s+{p}\b", text) for p in mmcm.PRIM_NAMES):
+            prims = os.path.join(workdir, "x7v_prims.v")
+            open(prims, "w").write(mmcm.RTL_PRIMS)
+            rtl_files = [prims, *rtl_files]
     stim = os.path.join(workdir, "stim.txt")
     open(stim, "w").write("\n".join(make_stimulus(in_bits, cycles, seed)) + "\n")
     rtl_trace = os.path.join(workdir, "rtl.trace")
