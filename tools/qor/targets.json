@@ -1,0 +1,17 @@
+[
+  {"gap": "G1", "design": "pico", "metric": "lut_ratio", "max": 1.5, "goal": "PicoRV32 LUTs at most 1.5x Vivado's 877"},
+  {"gap": "G2", "design": "pico", "metric": "carry", "min": 1, "goal": "adders on CARRY4 (carry cells above 0)"},
+  {"gap": "G2", "design": "ibex", "metric": "carry", "min": 1, "goal": "Ibex adders on CARRY4"},
+  {"gap": "G2", "design": "ibex", "metric": "lut_levels", "max": 24, "goal": "Ibex at most 24 LUT levels"},
+  {"gap": "G4", "design": "pico", "metric": "t_route", "max": 60, "goal": "PicoRV32 route under 60 s (Vivado: 23 s on Helion's placement)"},
+  {"gap": "G4", "design": "ibex", "metric": "t_route", "max": 600, "goal": "Ibex route under 10 min"},
+  {"gap": "G5", "design": "pico", "metric": "fmax_ratio", "min": 0.85, "goal": "Fmax at least 85% of Vivado's own (Helion STA as proxy; the ledger's guard is Vivado timing Helion's placement, hx_*)"},
+  {"gap": "G5", "design": "ibex", "metric": "fmax_ratio", "min": 0.85, "goal": "Ibex Fmax at least 85% of Vivado's own (Helion STA as proxy)"},
+  {"gap": "G6", "design": "ibex", "metric": "fmax_mhz", "min": 50, "goal": "Ibex meets 50 MHz in Helion STA"},
+  {"gap": "G7", "design": "pico", "metric": "slack_gap_hx", "min": 0, "max": 1.0, "goal": "Helion slack within 1 ns below Vivado's on Helion's placement (hx_pico, 354ff04), never optimistic"},
+  {"gap": "G7", "design": "blinky", "metric": "slack_gap_hx", "min": 0, "max": 1.0, "goal": "same for blinky (hx_blinky)"},
+  {"gap": "G8", "design": "ibex", "metric": "lut_ratio", "max": 1.5, "goal": "Ibex LUTs at most 1.5x Vivado's 3532"},
+  {"gap": "G9", "design": "bram_fill", "metric": "ok", "eq": true, "goal": "240-RAM fill builds a bitstream"},
+  {"gap": "G9", "design": "dsp_fill_prims", "metric": "ok", "eq": true, "goal": "192-DSP fill (primitives) builds a bitstream"},
+  {"gap": "G22", "design": "blinky", "metric": "deterministic", "eq": true, "goal": "two builds give a byte-identical .bit"}
+]

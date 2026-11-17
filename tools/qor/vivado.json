@@ -1,0 +1,30 @@
+{
+  "vivado": "2017.3",
+  "date": "2026-11-17",
+  "part": "xc7z020clg484-1",
+  "source": "~/helion-zed-builds/vivado_jobs/COMPARISON.md (USF cluster batch runs, 4 cores)",
+  "notes": [
+    "ref: Vivado's own synth + place + route + bitstream on the same RTL. lut includes LUTRAM. fmax_mhz = 1000 / (period_ns - wns_ns) on the clock named. runtime_s is Vivado's own step total.",
+    "hx: Vivado routing and timing Helion's placement (every cell LOC/BEL fixed) from fm/zedboard-l2 354ff04. Stale once Helion's placement changes; rerun tools/vivado_ref to refresh.",
+    "wns_all_ns is the whole-design WNS (all clocks); wns_ns is on the clock named."
+  ],
+  "designs": {
+    "blinky": {
+      "hx": {"job": "hx_blinky", "clock": "sys_clk", "period_ns": 10.0, "wns_ns": 6.326, "wns_all_ns": 6.326, "fmax_mhz": 272.2, "place_s": 53, "route_s": 19}
+    },
+    "pico": {
+      "ref": {"job": "ref_pico", "lut": 877, "lutram": 48, "ff": 488, "ramb36": 0, "ramb18": 0, "dsp": 0, "clock": "clk_half", "period_ns": 20.0, "wns_ns": 12.236, "wns_all_ns": 7.958, "fmax_mhz": 128.8, "runtime_s": 211.4},
+      "hx": {"job": "hx_pico", "clock": "clk_half_bufg", "period_ns": 20.0, "wns_ns": 8.710, "wns_all_ns": 8.422, "fmax_mhz": 88.6, "place_s": 52, "route_s": 23}
+    },
+    "ibex": {
+      "ref": {"job": "ref_ibex", "lut": 3532, "lutram": 0, "ff": 2162, "ramb36": 0, "ramb18": 0, "dsp": 1, "clock": "sys_clk", "period_ns": 50.0, "wns_ns": 24.269, "wns_all_ns": 24.269, "fmax_mhz": 38.9, "runtime_s": 450.1},
+      "hx": {"job": "hx_ibex", "clock": "sys_clk", "period_ns": 50.0, "wns_ns": 9.664, "wns_all_ns": 9.664, "fmax_mhz": 24.8, "place_s": 56, "route_s": 31}
+    },
+    "bram_fill": {
+      "ref": {"job": "ref_bram", "lut": 1367, "lutram": 0, "ff": 999, "ramb36": 0, "ramb18": 240, "dsp": 0, "clock": "sys_clk", "period_ns": 10.0, "wns_ns": 2.094, "wns_all_ns": 2.094, "fmax_mhz": 126.5, "runtime_s": 458.5}
+    },
+    "dsp_fill_prims": {
+      "ref": {"job": "ref_dsp_prims", "lut": 3273, "lutram": 0, "ff": 8097, "ramb36": 0, "ramb18": 0, "dsp": 192, "clock": "sys_clk", "period_ns": 10.0, "wns_ns": 3.339, "wns_all_ns": 3.339, "fmax_mhz": 150.1, "runtime_s": 284.5}
+    }
+  }
+}
