@@ -191,6 +191,8 @@ def _rel_names(db: Db, tile: str, fab: Fabric) -> dict[int, tuple[str, str]]:
             pre = "RAMB36"
         elif st == "DSP48E1":
             pre = f"DSP48.DSP_{ry}"
+        elif st in ("MMCME2_ADV", "PLLE2_ADV"):
+            pre = st  # one per CMT tile (mmcm.py)
         else:
             # Clock buffers (BUFGCTRL, BUFHCE, ...) are named by their
             # position inside the tile, not by absolute site name.
@@ -439,22 +441,31 @@ def model_slice(x: Extractor, s: Site, nl: Netlist):
     F = s.features
     n = lambda pin: sig(s.name, pin)
     L = nl.lines
-    unsupported = [f for f in F if re.match(r"^[A-D]LUT\.(RAM|SRL|SMALL)$", f) or f in ("WA7USED", "WA8USED", "WEMUX.CE", "LATCH")]
+    unsupported = lutram.check_features(F) + (["LATCH"] if "LATCH" in F else [])
     if unsupported:
-        x.errors.append(f"{s.name}: LUTRAM/SRL/latch mode not modelled: {sorted(unsupported)}")
+        x.errors.append(f"{s.name}: SRL/latch mode not modelled: {unsupported}")
     L.append(f"// {s.name} ({s.stype}) @ {s.tile}")
+    ram = [c for c in LETTERS if f"{c}LUT.RAM" in F]
+    if ram:
+        lutram.model(x, s, nl, ram, lambda c: _lut_init(s, c))
     for i, c in enumerate(LETTERS):
+        if c in ram:
+            continue
         init = _lut_init(s, c)
-        ins = []
+        ins6, ins5 = [], []
         for k in range(6):
             dep6 = _depends(init, k)
             dep5 = k < 5 and _depends(init & 0xFFFFFFFF, k, 5)
             used = (init != 0) and (dep6 or dep5)
-            ins.append(x.inp(s, f"{c}{k+1}", f"{c}LUT input", matters=used) if used else "1'b1")
-        idx = "{" + ",".join(reversed(ins)) + "}"
+            v = x.inp(s, f"{c}{k+1}", f"{c}LUT input", matters=used) if used else "1'b1"
+            # An output reads only the inputs it depends on: an X on another
+            # input (a loop O6 closes but O5 ignores) must not make it X.
+            ins6.append(v if dep6 else "1'b1")
+            ins5.append(v if dep5 else "1'b0")
+        idx = "{" + ",".join(reversed(ins6)) + "}"
         L.append(f"wire [63:0] {n(c+'_INIT')} = 64'h{init:016x};")
         L.append(f"wire {n(c)} = {n(c+'_INIT')}[{idx}];")
-        L.append(f"wire {n(c+'_O5')} = {n(c+'_INIT')}[{{1'b0,{','.join(reversed(ins[:5]))}}}];")
+        L.append(f"wire {n(c+'_O5')} = {n(c+'_INIT')}[{{1'b0,{','.join(reversed(ins5[:5]))}}}];")
     # bypass pins, only resolved when something uses them
     byp = {}
 
@@ -640,14 +651,18 @@ def model_bufhce(x: Extractor, s: Site, nl: Netlist):
     nl.lines.append(f"wire {n('O')} = ({ce}) === 1'b0 ? 1'b0 : {i};")
 
 
+from . import lutram  # noqa: E402
 from .bram import VERILOG_MODEL as _BRAM_VERILOG, model_ramb18, model_ramb36  # noqa: E402
 from .dsp import VERILOG_MODEL as _DSP_VERILOG, model_dsp48e1  # noqa: E402
+from .mmcm import VERILOG_MODEL as _CMT_VERILOG, model_cmt  # noqa: E402
 
 MODELS = {
     "FIFO18E1": model_ramb18,
     "RAMB18E1": model_ramb18,
     "RAMBFIFO36E1": model_ramb36,
     "DSP48E1": model_dsp48e1,
+    "MMCME2_ADV": model_cmt,
+    "PLLE2_ADV": model_cmt,
     "SLICE": model_slice,
     "IOB33": model_iob,
     "ILOGICE3": model_ilogic,
@@ -706,4 +721,6 @@ def to_verilog(nl: Netlist, module: str = "extracted") -> str:
         out.append(_BRAM_VERILOG)
     if any(l.startswith("x7v_dsp48e1 ") for l in nl.lines):
         out.append(_DSP_VERILOG)
+    if any(l.startswith("x7v_cmt ") for l in nl.lines):
+        out.append(_CMT_VERILOG)
     return "\n".join(out) + "\n"

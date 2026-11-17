@@ -127,9 +127,6 @@ def decode(db: Db, frames_in: dict[int, list[int]]) -> DesignDecode:
     frames: dict[int, list[int]] = {}
     for far, fr in frames_in.items():
         stored = fr[ECC_WORD] & ECC_MASK
-        calc = expected_ecc(far, fr)
-        if stored != calc:
-            ecc_bad[far] = (stored, calc)
         if stored:
             fr = list(fr)
             fr[ECC_WORD] &= ~ECC_MASK & 0xFFFFFFFF
@@ -186,6 +183,14 @@ def decode(db: Db, frames_in: dict[int, list[int]]) -> DesignDecode:
             in_window.add(a)
             if a not in covered:
                 tiles[tname].unknown_bits.append((m if block_is_clb else 1000 + m, b))
+    # ECC, once the features say which bits hold LUT RAM contents (left out).
+    from .lutram import ecc_exclude
+    skip = ecc_exclude(db, tiles)
+    for far, fr in frames_in.items():
+        stored = fr[ECC_WORD] & ECC_MASK
+        calc = expected_ecc(far, fr, skip.get(far))
+        if stored != calc:
+            ecc_bad[far] = (stored, calc)
     orphans = []
     for far, fr in frames.items():
         for w, v in enumerate(fr):

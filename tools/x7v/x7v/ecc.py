@@ -39,11 +39,19 @@ def frame_ecc(words: list[int]) -> int:
     return ecc & ECC_MASK
 
 
-def expected_ecc(far: int, words: list[int]) -> int:
+def expected_ecc(far: int, words: list[int], skip: dict[int, int] | None = None) -> int:
     """ECC bits Vivado writes: none in block RAM content frames (FAR block
     type 1; word 50 is 0 in all 1,792 written by Vivado 2017.3 for
-    examples/zedboard_bram_fill.sv), the Hamming code everywhere else."""
-    return 0 if far >> 23 & 7 == 1 else frame_ecc(words)
+    examples/zedboard_bram_fill.sv), the Hamming code everywhere else, over
+    the frame with the bits in `skip` ({word: mask}) taken as 0: Vivado
+    leaves LUT RAM contents out (lutram.ecc_exclude; 0 mismatches on 7
+    Vivado 2017.3 builds with LUT RAM, while the plain code mismatches 16
+    frames in 3 of them)."""
+    if far >> 23 & 7 == 1:
+        return 0
+    if skip:
+        words = [w & ~skip.get(i, 0) for i, w in enumerate(words)]
+    return frame_ecc(words)
 
 
 def with_ecc(words: list[int], far: int) -> list[int]:

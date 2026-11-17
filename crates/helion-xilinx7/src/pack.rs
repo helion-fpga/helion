@@ -652,6 +652,8 @@ pub struct Packed7 {
     pub serdes: Vec<PackedSerdes>,
     pub iodelays: Vec<PackedIodelay>,
     pub srls: Vec<PackedSrl>,
+    /// LUT RAM primitives, one SLICEM each (see [`crate::lutram`]).
+    pub lutrams: Vec<crate::lutram::PackedLutRam>,
     pub muxfs: Vec<PackedMuxf>,
     pub gtp_channels: Vec<PackedGtpChannel>,
     pub gtp_commons: Vec<PackedGtpCommon>,
@@ -979,6 +981,9 @@ fn pack_blackbox_primitive(
         "BUFG" | "BUFGCE" | "BUFGCTRL" | "BUFIO" | "BUFR" => {
             out.bufgs
                 .push(pack_clock_buf(cell_name, &up, pins, attrs)?);
+        }
+        m if crate::lutram::is_lutram(m) => {
+            out.lutrams.push(crate::lutram::pack(cell_name, m, pins, attrs)?);
         }
         "SRL16E" => {
             out.srls
@@ -2991,6 +2996,9 @@ fn fracture_adder_luts(packed: &mut Packed7) -> Result<(), String> {
     for i in &packed.iobs {
         read.insert(i.net.as_str());
     }
+    for r in &packed.lutrams {
+        read.extend(r.ins.iter().map(|x| x.1.as_str()));
+    }
     for b in &packed.bufgs {
         read.insert(b.in_net.as_str());
     }
@@ -3041,6 +3049,9 @@ fn insert_input_buffers(netlist: &Design, packed: &mut Packed7) -> Result<(), St
     for m in &packed.muxfs {
         driven.insert(m.o_net.clone());
     }
+    for r in &packed.lutrams {
+        driven.extend(r.outs.iter().map(|o| o.1.clone()));
+    }
     for c in &packed.carries {
         for o in c.o_nets.iter().flatten() {
             driven.insert(o.clone());
@@ -3071,12 +3082,19 @@ fn insert_input_buffers(netlist: &Design, packed: &mut Packed7) -> Result<(), St
     for m in &packed.muxfs {
         read.insert(m.s_net.clone());
     }
+    for r in &packed.lutrams {
+        read.extend(r.ins.iter().map(|x| x.1.clone()));
+    }
     for c in &packed.carries {
         // DI nets are not wired by the router (see route.rs carry notes).
         read.extend(c.s_nets.iter().flatten().cloned());
         if c.cyinit.is_none() && !c.ci_net.is_empty() {
             read.insert(c.ci_net.clone());
         }
+    }
+    // An MMCM/PLL clock input straight from a port gets its IBUF here too.
+    for c in &packed.cmts {
+        read.extend(c.clkin1_net.iter().chain(c.clkin2_net.iter()).filter(|n| !matches!(n.as_str(), "0" | "const0" | "$false" | "GND" | "gnd")).cloned());
     }
     // Clock ports already have an IBUF; data loads of the raw port net read
     // its output instead.
@@ -3142,6 +3160,11 @@ fn insert_input_buffers(netlist: &Design, packed: &mut Packed7) -> Result<(), St
         for i in packed.iobs.iter_mut() {
             if i.dir == IobDir::Out {
                 r(&mut i.net);
+            }
+        }
+        for x in packed.lutrams.iter_mut() {
+            for (_, n, _) in x.ins.iter_mut() {
+                r(n);
             }
         }
     }
@@ -3365,7 +3388,7 @@ fn insert_clock_spine(netlist: &Design, packed: &mut Packed7) -> Result<(), Stri
     // same global buffer as the flops).
     let mut clk_nets: Vec<String> = Vec::new();
     let hard_clks = packed.brams.iter().flat_map(|b| [&b.clka_net, &b.clkb_net]).chain(packed.dsps.iter().map(|d| &d.clk_net)).flatten();
-    for n in packed.ffs.iter().map(|f| &f.clk_net).chain(hard_clks) {
+    for n in packed.ffs.iter().map(|f| &f.clk_net).chain(hard_clks).chain(packed.lutrams.iter().map(|r| &r.clk)) {
         if !clk_nets.contains(n) {
             clk_nets.push(n.clone());
         }
@@ -3380,6 +3403,11 @@ fn insert_clock_spine(netlist: &Design, packed: &mut Packed7) -> Result<(), Stri
         for srl in &mut packed.srls {
             if srl.clk_net == from {
                 srl.clk_net = to.to_string();
+            }
+        }
+        for r in &mut packed.lutrams {
+            if r.clk == from {
+                r.clk = to.to_string();
             }
         }
         let is_clk = |pin: &str| pin.starts_with("CLK") || pin.starts_with("REGCLK");
