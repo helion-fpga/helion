@@ -758,6 +758,35 @@ impl Device {
         td.pips_from.get(&w).map(|v| v.iter().map(|&i| &td.pips[i as usize]).collect()).unwrap_or_default()
     }
 
+    /// Pips that drive `wire` in a tile (a scan of the tile type's pips).
+    pub fn pips_into(&self, tile_idx: usize, wire: &str) -> Vec<&Pip> {
+        let Some(t) = self.tiles.get(tile_idx) else { return Vec::new() };
+        let td = &self.types[t.type_id as usize];
+        let Some(&w) = td.wire_idx.get(wire) else { return Vec::new() };
+        td.pips.iter().filter(|p| p.dst == w).collect()
+    }
+
+    /// Every RAMB18 site (both halves: `FIFO18E1` and `RAMB18E1`), in
+    /// column-major order of the site's `(X, Y)`.
+    pub fn bram18_sites(&self) -> Vec<(String, String)> {
+        Self::column_major(self.sites_of_types(&["FIFO18E1", "RAMB18E1"]))
+    }
+
+    /// Every RAMB36 site (`RAMBFIFO36E1`), in column-major `(X, Y)` order.
+    pub fn bram36_sites(&self) -> Vec<(String, String)> {
+        Self::column_major(self.sites_of_types(&["RAMBFIFO36E1"]))
+    }
+
+    /// Every DSP48E1 site, in column-major `(X, Y)` order.
+    pub fn dsp48_sites(&self) -> Vec<(String, String)> {
+        Self::column_major(self.sites_of_types(&["DSP48E1"]))
+    }
+
+    fn column_major(mut v: Vec<(String, String)>) -> Vec<(String, String)> {
+        v.sort_by_key(|(_, s)| crate::place::parse_site_xy(s).unwrap_or((i32::MAX, i32::MAX)));
+        v
+    }
+
     /// Find a site by full name: `(tile_idx, site_idx)`.
     pub fn site_by_name(&self, site_name: &str) -> Option<(usize, usize)> {
         if let Some(&x) = self.site_by_name.get(site_name) {

@@ -192,6 +192,11 @@ pub struct PackedBram {
     /// Clock nets (`CLKARDCLK`, `CLKBWRCLK`).
     pub clka_net: Option<String>,
     pub clkb_net: Option<String>,
+    /// Every connected `RAMB18E1` data/control pin on a net:
+    /// `(primitive pin, net, is_output)`, e.g. `("ADDRARDADDR5", "a_5", false)`.
+    pub pins: Vec<(String, String, bool)>,
+    /// Input pins tied to a constant: `(primitive pin, value)`.
+    pub ties: Vec<(String, bool)>,
 }
 
 /// A packed DSP block (`DSP48E1`).
@@ -208,6 +213,9 @@ pub struct PackedDsp {
     /// Pipeline register stages (`AREG`: 0..=2, `BREG`: 0..=2, others 0..=1).
     pub areg: u8,
     pub breg: u8,
+    /// `ACASCREG` / `BCASCREG`: equal to `AREG`/`BREG`, or 1 with a 2.
+    pub acascreg: u8,
+    pub bcascreg: u8,
     pub creg: u8,
     pub dreg: u8,
     pub adreg: u8,
@@ -244,6 +252,12 @@ pub struct PackedDsp {
     pub carrycascout_net: Option<String>,
     /// Clock net (`CLK`).
     pub clk_net: Option<String>,
+    /// Every fabric pin on a net: `(primitive pin, net, is_output)`
+    /// (cascade pins are the fields above).
+    pub pins: Vec<(String, String, bool)>,
+    /// Input pins held at a constant: `(primitive pin, value)`, unconnected
+    /// pins included (see [`crate::dsp::unconnected_value`]).
+    pub ties: Vec<(String, bool)>,
 }
 
 /// A packed carry chain (CARRY4).
@@ -880,6 +894,7 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
     fracture_adder_luts(&mut out)?;
     insert_clock_spine(netlist, &mut out)?;
     insert_input_buffers(netlist, &mut out)?;
+    replicate_hard_block_drivers(&mut out);
 
     Ok(out)
 }
@@ -1966,8 +1981,28 @@ fn pack_bram(
         }
     }
 
+    let mut pin_nets = Vec::new();
+    let mut ties = Vec::new();
+    if kind == BramKind::Ramb18e1 {
+        use crate::bram::{pin_names, RAMB18_INPUTS, RAMB18_OUTPUTS};
+        for (list, is_out) in [(&RAMB18_INPUTS[..], false), (&RAMB18_OUTPUTS[..], true)] {
+            for pin in pin_names(list) {
+                let Some(n) = pins.net_on(cell_name, &pin) else { continue };
+                let n = resolve(n);
+                match n {
+                    // `const0`/`const1`: the v2 front end's constant-LUT nets.
+                    "0" | "gnd" | "GND" | "$false" | "const0" if !is_out => ties.push((pin, false)),
+                    "1" | "vcc" | "VCC" | "$true" | "const1" if !is_out => ties.push((pin, true)),
+                    _ => pin_nets.push((pin, n.to_string(), is_out)),
+                }
+            }
+        }
+    }
+
     Ok(PackedBram {
         name: cell_name.to_string(),
+        pins: pin_nets,
+        ties,
         init,
         read_width_a: ra,
         read_width_b: rb,
@@ -2056,7 +2091,14 @@ fn pack_dsp(
 
     let areg = parse_reg("AREG", 0, 2)?;
     let breg = parse_reg("BREG", 0, 2)?;
-    let creg = parse_reg("CREG", 0, 1)?;
+    let acascreg = parse_reg("ACASCREG", areg, 2)?;
+    let bcascreg = parse_reg("BCASCREG", breg, 2)?;
+    for (k, reg, casc) in [("A", areg, acascreg), ("B", breg, bcascreg)] {
+        if casc != reg && !(reg == 2 && casc == 1) {
+            return Err(format!("pack: DSP48E1 {cell_name}: {k}CASCREG={casc} with {k}REG={reg} is not a legal pair"));
+        }
+    }
+        let creg = parse_reg("CREG", 0, 1)?;
     let dreg = parse_reg("DREG", 0, 1)?;
     let adreg = parse_reg("ADREG", 0, 1)?;
     let mreg = parse_reg("MREG", 0, 1)?;
@@ -2155,13 +2197,52 @@ fn pack_dsp(
         other => return Err(format!("pack: DSP48E1 {cell_name}: invalid B_INPUT `{other}`")),
     };
 
+    if let Some(v) = attrs.get("AUTORESET_PATDET") {
+        if !v.trim().trim_matches('"').eq_ignore_ascii_case("NO_RESET") {
+            return Err(format!("pack: DSP48E1 {cell_name}: AUTORESET_PATDET `{v}` is not supported"));
+        }
+    }
+    let mut pin_nets = Vec::new();
+    let mut ties = Vec::new();
+    {
+        use crate::bram::pin_names;
+        use crate::dsp::{unconnected_value, INPUTS, OUTPUTS};
+        for (list, is_out) in [(&INPUTS[..], false), (&OUTPUTS[..], true)] {
+            for pin in pin_names(list) {
+                match pins.net_on(cell_name, &pin).map(resolve) {
+                    // `const0`/`const1`: the v2 front end's constant-LUT nets.
+                    Some("0" | "gnd" | "GND" | "$false" | "const0") if !is_out => ties.push((pin, false)),
+                    Some("1" | "vcc" | "VCC" | "$true" | "const1") if !is_out => ties.push((pin, true)),
+                    Some(n) => pin_nets.push((pin, n.to_string(), is_out)),
+                    None if !is_out => ties.extend(unconnected_value(&pin, opmode, alumode, inmode).map(|v| (pin, v))),
+                    None => {}
+                }
+            }
+        }
+    }
+    // A cell whose pins all go by other names would be tied off whole: refuse it.
+    let cascades = ["PCOUT", "PCOUT0", "ACOUT", "ACOUT0", "BCOUT", "BCOUT0", "CARRYCASCOUT", "PCIN", "PCIN0", "ACIN", "ACIN0", "BCIN", "BCIN0", "CARRYCASCIN"];
+    if pin_nets.is_empty() && cascades.iter().all(|p| pins.net_on(cell_name, p).is_none()) {
+        return Err(format!("pack: DSP48E1 {cell_name}: no pin on a net (fabric pins are A0.., P0.., CLK, ...)"));
+    }
+
+    // A cascade input tied to a constant is no cascade: leave it unconnected.
+    let casc = |pin: &str| {
+        pins.net_on(cell_name, pin)
+            .map(|s| resolve(s).to_string())
+            .filter(|n| !matches!(n.as_str(), "0" | "1" | "gnd" | "GND" | "vcc" | "VCC" | "$false" | "$true" | "const0" | "const1"))
+    };
     Ok(PackedDsp {
         name: cell_name.to_string(),
+        pins: pin_nets,
+        ties,
         opmode,
         alumode,
         inmode,
         areg,
         breg,
+        acascreg,
+        bcascreg,
         creg,
         dreg,
         adreg,
@@ -2182,24 +2263,14 @@ fn pack_dsp(
         sel_mask,
         a_input_cascade,
         b_input_cascade,
-        pcin_net: pins.net_on(cell_name, "PCIN").map(|s| resolve(s).to_string()),
-        pcout_net: pins
-            .net_on(cell_name, "PCOUT")
-            .map(|s| resolve(s).to_string()),
-        acin_net: pins.net_on(cell_name, "ACIN").map(|s| resolve(s).to_string()),
-        acout_net: pins
-            .net_on(cell_name, "ACOUT")
-            .map(|s| resolve(s).to_string()),
-        bcin_net: pins.net_on(cell_name, "BCIN").map(|s| resolve(s).to_string()),
-        bcout_net: pins
-            .net_on(cell_name, "BCOUT")
-            .map(|s| resolve(s).to_string()),
-        carrycascin_net: pins
-            .net_on(cell_name, "CARRYCASCIN")
-            .map(|s| resolve(s).to_string()),
-        carrycascout_net: pins
-            .net_on(cell_name, "CARRYCASCOUT")
-            .map(|s| resolve(s).to_string()),
+        pcin_net: casc("PCIN"),
+        pcout_net: casc("PCOUT"),
+        acin_net: casc("ACIN"),
+        acout_net: casc("ACOUT"),
+        bcin_net: casc("BCIN"),
+        bcout_net: casc("BCOUT"),
+        carrycascin_net: casc("CARRYCASCIN"),
+        carrycascout_net: casc("CARRYCASCOUT"),
         clk_net: pins.net_on(cell_name, "CLK").map(|s| resolve(s).to_string()),
     })
 }
@@ -3072,6 +3143,67 @@ fn insert_input_buffers(netlist: &Design, packed: &mut Packed7) -> Result<(), St
     Ok(())
 }
 
+/// Hard blocks one copy of a shared driver serves; placement keeps pack
+/// order column-major, so a run of them sits in a few BRAM/DSP tiles.
+const HARD_FANOUT_GROUP: usize = 8;
+
+/// A flop or LUT that drives a data or control pin of more than two groups
+/// of block RAMs or DSPs is copied, one copy per [`HARD_FANOUT_GROUP`]
+/// blocks, so placement can put each copy beside its blocks. One driver
+/// across 240 RAMs routes in tens of nanoseconds; Vivado replicates too.
+fn replicate_hard_block_drivers(packed: &mut Packed7) {
+    let is_clk = |pin: &str| pin.starts_with("CLK") || pin.starts_with("REGCLK");
+    let nb = packed.brams.len();
+    // Net -> hard blocks reading it (BRAMs, then DSPs offset by `nb`).
+    let mut users: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let hard_pins = packed.brams.iter().map(|b| &b.pins).chain(packed.dsps.iter().map(|d| &d.pins));
+    for (i, pins) in hard_pins.enumerate() {
+        for (pin, net, out) in pins {
+            if *out || is_clk(pin) {
+                continue;
+            }
+            let v = users.entry(net.clone()).or_default();
+            if v.last() != Some(&i) {
+                v.push(i);
+            }
+        }
+    }
+    for (net, blocks) in users {
+        if blocks.len() <= 2 * HARD_FANOUT_GROUP {
+            continue;
+        }
+        let ff = packed.ffs.iter().find(|f| f.q_net == net).cloned();
+        let lut = packed.luts.iter().find(|l| l.output_net == net && l.input_nets.iter().any(|n| n.is_some())).cloned();
+        if ff.is_none() && lut.is_none() {
+            continue;
+        }
+        for (k, chunk) in blocks.chunks(HARD_FANOUT_GROUP).enumerate().skip(1) {
+            let copy = format!("{net}_rep{k}");
+            if let Some(f) = &ff {
+                packed.ffs.push(PackedFf { name: format!("{}_rep{k}", f.name), q_net: copy.clone(), ..f.clone() });
+            } else if let Some(l) = &lut {
+                packed.luts.push(PackedLut { name: format!("{}_rep{k}", l.name), output_net: copy.clone(), ..l.clone() });
+            }
+            for &i in chunk {
+                let pins = if i < nb { &mut packed.brams[i].pins } else { &mut packed.dsps[i - nb].pins };
+                for (pin, n, out) in pins.iter_mut() {
+                    if !*out && !is_clk(pin) && *n == net {
+                        *n = copy.clone();
+                    }
+                }
+                if i < nb {
+                    let b = &mut packed.brams[i];
+                    for n in b.wea_nets.iter_mut().chain(b.web_nets.iter_mut()) {
+                        if *n == net {
+                            *n = copy.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Insert IBUF + BUFGCTRL for clock inputs.
 ///
 /// For every net that drives at least one FF `CLK` pin and is not already
@@ -3093,10 +3225,49 @@ fn insert_clock_spine(netlist: &Design, packed: &mut Packed7) -> Result<(), Stri
         }
     }
 
+    // Clocks of flops, block RAMs and DSPs (a RAM or DSP clocks from the
+    // same global buffer as the flops).
     let mut clk_nets: Vec<String> = Vec::new();
-    for ff in &packed.ffs {
-        if !clk_nets.iter().any(|n| n == &ff.clk_net) {
-            clk_nets.push(ff.clk_net.clone());
+    let hard_clks = packed.brams.iter().flat_map(|b| [&b.clka_net, &b.clkb_net]).chain(packed.dsps.iter().map(|d| &d.clk_net)).flatten();
+    for n in packed.ffs.iter().map(|f| &f.clk_net).chain(hard_clks) {
+        if !clk_nets.contains(n) {
+            clk_nets.push(n.clone());
+        }
+    }
+    // Every clock pin on `from` moves to `to`.
+    fn rewire(packed: &mut Packed7, from: &str, to: &str) {
+        for ff in &mut packed.ffs {
+            if ff.clk_net == from {
+                ff.clk_net = to.to_string();
+            }
+        }
+        for srl in &mut packed.srls {
+            if srl.clk_net == from {
+                srl.clk_net = to.to_string();
+            }
+        }
+        let is_clk = |pin: &str| pin.starts_with("CLK") || pin.starts_with("REGCLK");
+        for b in &mut packed.brams {
+            for n in [&mut b.clka_net, &mut b.clkb_net].into_iter().flatten() {
+                if n == from {
+                    *n = to.to_string();
+                }
+            }
+            for (pin, n, _) in &mut b.pins {
+                if is_clk(pin) && n == from {
+                    *n = to.to_string();
+                }
+            }
+        }
+        for d in &mut packed.dsps {
+            if d.clk_net.as_deref() == Some(from) {
+                d.clk_net = Some(to.to_string());
+            }
+            for (pin, n, _) in &mut d.pins {
+                if pin == "CLK" && n == from {
+                    *n = to.to_string();
+                }
+            }
         }
     }
 
@@ -3109,16 +3280,7 @@ fn insert_clock_spine(netlist: &Design, packed: &mut Packed7) -> Result<(), Stri
         // builds it. Any other non-port clock is an error.
         if packed.ffs.iter().any(|f| f.q_net == clk_net) {
             let bufg_out = format!("{clk_net}_bufg");
-            for ff in &mut packed.ffs {
-                if ff.clk_net == clk_net {
-                    ff.clk_net = bufg_out.clone();
-                }
-            }
-            for srl in &mut packed.srls {
-                if srl.clk_net == clk_net {
-                    srl.clk_net = bufg_out.clone();
-                }
-            }
+            rewire(packed, &clk_net, &bufg_out);
             packed.bufgs.push(PackedBufg {
                 name: format!("bufg_{clk_net}"),
                 in_net: clk_net.clone(),
@@ -3135,16 +3297,7 @@ fn insert_clock_spine(netlist: &Design, packed: &mut Packed7) -> Result<(), Stri
                 format!("pack: clock net `{clk_net}` has no matching top-level input port")
             })?;
         let bufg_out = format!("{}_bufg", resolve(port.name));
-        for ff in &mut packed.ffs {
-            if ff.clk_net == clk_net {
-                ff.clk_net = bufg_out.clone();
-            }
-        }
-        for srl in &mut packed.srls {
-            if srl.clk_net == clk_net {
-                srl.clk_net = bufg_out.clone();
-            }
-        }
+        rewire(packed, &clk_net, &bufg_out);
         packed.iobs.push(PackedIob {
             name: format!("ibuf_{}", resolve(port.name)),
             loc: port.attrs.get("LOC").map(|s| s.to_string()),
@@ -3172,6 +3325,29 @@ fn insert_clock_spine(netlist: &Design, packed: &mut Packed7) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hard_block_fanout_is_replicated_per_group() {
+        let mut p = Packed7::default();
+        p.ffs.push(PackedFf {
+            name: "a_reg".into(), d_net: "a_d".into(), q_net: "a".into(), clk_net: "clk".into(),
+            ce_net: None, sr_net: None, init: false, srval: false, sr_async: false,
+        });
+        for i in 0..20 {
+            p.brams.push(PackedBram {
+                name: format!("ram{i}"),
+                pins: vec![("ADDRARDADDR4".into(), "a".into(), false), ("CLKARDCLK".into(), "a".into(), false)],
+                ..Default::default()
+            });
+        }
+        replicate_hard_block_drivers(&mut p);
+        assert_eq!(p.ffs.len(), 3, "20 RAMs in groups of 8: the original and two copies");
+        assert!(p.ffs.iter().all(|f| f.d_net == "a_d"));
+        assert_eq!(p.brams[7].pins[0].1, "a");
+        assert_eq!(p.brams[8].pins[0].1, "a_rep1");
+        assert_eq!(p.brams[19].pins[0].1, "a_rep2");
+        assert_eq!(p.brams[19].pins[1].1, "a", "clock pins stay put");
+    }
 
     fn blinky_design() -> Design {
         let mut d = Design::new("blinky");

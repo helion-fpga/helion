@@ -781,25 +781,15 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         let kind = pbram.map(|b| b.kind).unwrap_or(BramKind::Ramb18e1);
         match kind {
             BramKind::Ramb18e1 => {
-                let site_rel = device
-                    .site_rel(&bram.tile, &bram.site)
-                    .unwrap_or_else(|| {
-                        if bram.site.ends_with("Y1") || bram.site.ends_with("Y3") {
-                            "RAMB18_Y1".to_string()
-                        } else {
-                            "RAMB18_Y0".to_string()
-                        }
-                    });
-                lines.push(format!("{}.RAMB18.{}.IN_USE", bram.tile, site_rel));
-                emit_bram_common_features(&mut lines, &bram.tile, &site_rel, bram, pbram);
+                // X-Ray names the halves by parity of the site Y, not by site.
+                let half = crate::bram::half(&bram.site)?;
+                lines.push(format!("{}.{half}.IN_USE", bram.tile));
+                emit_bram_common_features(&mut lines, &bram.tile, half, bram, pbram);
             }
             BramKind::Ramb36e1 => {
-                // In prjxray segbits_bram_l.db, RAMB36E1 activates both RAMB18_Y0 and RAMB18_Y1
-                // plus RAMB36 wrapper features.
-                lines.push(format!("{}.RAMB18_Y0.IN_USE", bram.tile));
-                lines.push(format!("{}.RAMB18_Y1.IN_USE", bram.tile));
-                lines.push(format!("{}.RAMB36.IN_USE", bram.tile));
-                emit_bram_common_features(&mut lines, &bram.tile, "RAMB36", bram, pbram);
+                // shortcut: a RAMB36 needs its INIT/INIT_A/SRVAL split bit-interleaved
+                // over both RAMB18 halves and its widths mapped per half; refuse until written.
+                return Err(format!("emit: {}: RAMB36E1 is not supported yet (use RAMB18E1)", bram.name));
             }
         }
     }
@@ -819,108 +809,66 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
             "DSP_0"
         };
 
-        let (adreg, alumodereg, opmodereg, carryinreg, carryinselreg, inmodereg) = match pdsp {
-            Some(p) => (
-                p.adreg,
-                p.alumodereg,
-                p.opmodereg,
-                p.carryinreg,
-                p.carryinselreg,
-                p.inmodereg,
-            ),
-            None => (0, 0, 0, 0, 0, 0),
-        };
-        if adreg == 0 {
-            lines.push(format!("{}.{}.ZADREG", dsp.tile, dsp_site));
-        }
-        if alumodereg == 0 {
-            lines.push(format!("{}.{}.ZALUMODEREG", dsp.tile, dsp_site));
-        }
-        if opmodereg == 0 {
-            lines.push(format!("{}.{}.ZOPMODEREG", dsp.tile, dsp_site));
-        }
-        if carryinreg == 0 {
-            lines.push(format!("{}.{}.ZCARRYINREG", dsp.tile, dsp_site));
-        }
-        if carryinselreg == 0 {
-            lines.push(format!("{}.{}.ZCARRYINSELREG", dsp.tile, dsp_site));
-        }
-        if inmodereg == 0 {
-            lines.push(format!("{}.{}.ZINMODEREG", dsp.tile, dsp_site));
-        }
-
-        if let Some(p) = pdsp {
-            if p.areg > 0 {
-                lines.push(format!("{}.{}.AREG_{}", dsp.tile, dsp_site, p.areg));
-            }
-            if p.breg > 0 {
-                lines.push(format!("{}.{}.BREG_{}", dsp.tile, dsp_site, p.breg));
-            }
-            if p.creg > 0 {
-                lines.push(format!("{}.{}.CREG", dsp.tile, dsp_site));
-            }
-            if p.dreg > 0 {
-                lines.push(format!("{}.{}.DREG", dsp.tile, dsp_site));
-            }
-            if p.mreg > 0 {
-                lines.push(format!("{}.{}.MREG", dsp.tile, dsp_site));
-            }
-            if p.preg > 0 {
-                lines.push(format!("{}.{}.PREG", dsp.tile, dsp_site));
-            }
-            if p.use_dport {
-                lines.push(format!("{}.{}.USE_DPORT", dsp.tile, dsp_site));
-            }
-            if p.use_mult != "MULTIPLY" {
-                lines.push(format!("{}.{}.USE_MULT.{}", dsp.tile, dsp_site, p.use_mult));
-            }
-            if p.use_simd != "ONE48" {
-                lines.push(format!("{}.{}.USE_SIMD.{}", dsp.tile, dsp_site, p.use_simd));
-            }
-            if p.a_input_cascade || p.acin_net.is_some() {
-                lines.push(format!("{}.{}.A_INPUT.CASCADE", dsp.tile, dsp_site));
-            }
-            if p.b_input_cascade || p.bcin_net.is_some() {
-                lines.push(format!("{}.{}.B_INPUT.CASCADE", dsp.tile, dsp_site));
-            }
-            if p.use_pattern_detect {
-                lines.push(format!("{}.{}.USE_PATTERN_DETECT.PATDET", dsp.tile, dsp_site));
-                lines.push(format!(
-                    "{}.{}.PATTERN[47:0] = 48'h{:012X}",
-                    dsp.tile, dsp_site, p.pattern
-                ));
-                lines.push(format!(
-                    "{}.{}.MASK[47:0] = 48'h{:012X}",
-                    dsp.tile, dsp_site, p.mask
-                ));
-                lines.push(format!(
-                    "{}.{}.SEL_PATTERN.{}",
-                    dsp.tile, dsp_site, p.sel_pattern
-                ));
-                lines.push(format!("{}.{}.SEL_MASK.{}", dsp.tile, dsp_site, p.sel_mask));
-            }
-            for i in 0..5 {
-                if ((p.inmode >> i) & 1) == 1 {
-                    lines.push(format!("{}.{}.INMODE[{}]", dsp.tile, dsp_site, i));
-                }
+        // X-Ray `DSP48.DSP_k` features (segbits_dsp_l.db); a DSP pack did
+        // not describe is refused rather than emitted half-configured.
+        let p = pdsp.ok_or_else(|| format!("emit: DSP {} was placed but not packed", dsp.name))?;
+        let pre = format!("{}.DSP48.{}", dsp.tile, dsp_site);
+        for (r, v) in [("AREG", p.areg), ("BREG", p.breg)] {
+            if v != 1 {
+                lines.push(format!("{pre}.{r}_{v}"));
             }
         }
-
-        for i in 0..7 {
-            if ((dsp.opmode >> i) & 1) == 0 {
-                lines.push(format!(
-                    "{}.{}.ZIS_OPMODE_INVERTED[{}]",
-                    dsp.tile, dsp_site, i
-                ));
+        // Clear only for xREG = 2 with xCASCREG = 1.
+        for (z, reg, casc) in [("ZAREG_2_ACASCREG_1", p.areg, p.acascreg), ("ZBREG_2_BCASCREG_1", p.breg, p.bcascreg)] {
+            if !(reg == 2 && casc == 1) {
+                lines.push(format!("{pre}.{z}"));
             }
         }
-        for i in 0..4 {
-            if ((dsp.alumode >> i) & 1) == 0 {
-                lines.push(format!(
-                    "{}.{}.ZIS_ALUMODE_INVERTED[{}]",
-                    dsp.tile, dsp_site, i
-                ));
+        for (r, v) in [
+            ("CREG", p.creg),
+            ("DREG", p.dreg),
+            ("ADREG", p.adreg),
+            ("MREG", p.mreg),
+            ("PREG", p.preg),
+            ("CARRYINREG", p.carryinreg),
+            ("CARRYINSELREG", p.carryinselreg),
+            ("INMODEREG", p.inmodereg),
+            ("OPMODEREG", p.opmodereg),
+            ("ALUMODEREG", p.alumodereg),
+        ] {
+            if v == 0 {
+                lines.push(format!("{pre}.Z{r}[0]"));
             }
+        }
+        if p.a_input_cascade || p.acin_net.is_some() {
+            lines.push(format!("{pre}.A_INPUT[0]"));
+        }
+        if p.b_input_cascade || p.bcin_net.is_some() {
+            lines.push(format!("{pre}.B_INPUT[0]"));
+        }
+        if p.use_dport {
+            lines.push(format!("{pre}.USE_DPORT[0]"));
+        }
+        match p.use_simd.as_str() {
+            "TWO24" => lines.push(format!("{pre}.USE_SIMD_FOUR12_TWO24")),
+            "FOUR12" => lines.extend([format!("{pre}.USE_SIMD_FOUR12_TWO24"), format!("{pre}.USE_SIMD_FOUR12")]),
+            _ => {}
+        }
+        match p.sel_mask.trim_matches('"') {
+            "MASK" => {}
+            "C" => lines.push(format!("{pre}.SEL_MASK_C")),
+            "ROUNDING_MODE1" => lines.push(format!("{pre}.SEL_MASK_ROUNDING_MODE1")),
+            "ROUNDING_MODE2" => lines.extend([format!("{pre}.SEL_MASK_ROUNDING_MODE1"), format!("{pre}.SEL_MASK_ROUNDING_MODE2")]),
+            o => return Err(format!("emit: DSP {}: SEL_MASK `{o}` is not supported", dsp.name)),
+        }
+        if p.pattern != 0 {
+            lines.push(format!("{pre}.PATTERN[47:0] = 48'h{:012X}", p.pattern));
+        }
+        if p.mask != 0 {
+            lines.push(format!("{pre}.MASK[47:0] = 48'h{:012X}", p.mask));
+        }
+        for f in crate::dsp::zis_features(p) {
+            lines.push(format!("{pre}.{f}"));
         }
     }
 
@@ -1442,29 +1390,16 @@ fn emit_bram_common_features(
     bram: &crate::place::PlacedBram,
     pbram: Option<&crate::pack::PackedBram>,
 ) {
-    if bram.read_width_a > 0 {
-        lines.push(format!(
-            "{}.{}.READ_WIDTH_A_{}",
-            tile, prefix, bram.read_width_a
-        ));
-    }
-    if bram.read_width_b > 0 {
-        lines.push(format!(
-            "{}.{}.READ_WIDTH_B_{}",
-            tile, prefix, bram.read_width_b
-        ));
-    }
-    if bram.write_width_a > 0 {
-        lines.push(format!(
-            "{}.{}.WRITE_WIDTH_A_{}",
-            tile, prefix, bram.write_width_a
-        ));
-    }
-    if bram.write_width_b > 0 {
-        lines.push(format!(
-            "{}.{}.WRITE_WIDTH_B_{}",
-            tile, prefix, bram.write_width_b
-        ));
+    // X-Ray has widths 1..18 per port; 36 is the SDP feature below.
+    for (port, w) in [
+        ("READ_WIDTH_A", bram.read_width_a),
+        ("READ_WIDTH_B", bram.read_width_b),
+        ("WRITE_WIDTH_A", bram.write_width_a),
+        ("WRITE_WIDTH_B", bram.write_width_b),
+    ] {
+        if matches!(w, 1 | 2 | 4 | 9 | 18) {
+            lines.push(format!("{tile}.{prefix}.{port}_{w}"));
+        }
     }
     let Some(pb) = pbram else {
         return;
@@ -1473,40 +1408,37 @@ fn emit_bram_common_features(
         lines.push(format!("{}.{}.SDP_READ_WIDTH_36", tile, prefix));
         lines.push(format!("{}.{}.SDP_WRITE_WIDTH_36", tile, prefix));
     }
-    let wm_str = |wm: RamWriteMode| match wm {
-        RamWriteMode::WriteFirst => "WRITE_FIRST",
-        RamWriteMode::ReadFirst => "READ_FIRST",
-        RamWriteMode::NoChange => "NO_CHANGE",
-    };
-    lines.push(format!(
-        "{}.{}.WRITE_MODE_A_{}",
-        tile,
-        prefix,
-        wm_str(pb.write_mode_a)
-    ));
-    lines.push(format!(
-        "{}.{}.WRITE_MODE_B_{}",
-        tile,
-        prefix,
-        wm_str(pb.write_mode_b)
-    ));
+    // WRITE_FIRST is the all-clear encoding: no feature.
+    for (port, wm) in [("A", pb.write_mode_a), ("B", pb.write_mode_b)] {
+        match wm {
+            RamWriteMode::WriteFirst => {}
+            RamWriteMode::ReadFirst => lines.push(format!("{tile}.{prefix}.WRITE_MODE_{port}_READ_FIRST")),
+            RamWriteMode::NoChange => lines.push(format!("{tile}.{prefix}.WRITE_MODE_{port}_NO_CHANGE")),
+        }
+    }
     if pb.doa_reg == 1 {
         lines.push(format!("{}.{}.DOA_REG", tile, prefix));
     }
     if pb.dob_reg == 1 {
         lines.push(format!("{}.{}.DOB_REG", tile, prefix));
     }
-    match pb.cascade_order_a {
-        CascadeOrder::None => {}
-        CascadeOrder::First => lines.push(format!("{}.{}.RAM_EXTENSION_A_LOWER", tile, prefix)),
-        CascadeOrder::Middle => lines.push(format!("{}.{}.RAM_EXTENSION_A_BOTH", tile, prefix)),
-        CascadeOrder::Last => lines.push(format!("{}.{}.RAM_EXTENSION_A_UPPER", tile, prefix)),
+    // Pins are never inverted: ZINV set means "not inverted".
+    for pin in crate::bram::RAMB18_ZINV {
+        lines.push(format!("{tile}.{prefix}.ZINV_{pin}"));
     }
-    match pb.cascade_order_b {
-        CascadeOrder::None => {}
-        CascadeOrder::First => lines.push(format!("{}.{}.RAM_EXTENSION_B_LOWER", tile, prefix)),
-        CascadeOrder::Middle => lines.push(format!("{}.{}.RAM_EXTENSION_B_BOTH", tile, prefix)),
-        CascadeOrder::Last => lines.push(format!("{}.{}.RAM_EXTENSION_B_UPPER", tile, prefix)),
+    // INIT_A/B and SRVAL_A/B are stored inverted (18 bits per half).
+    let m = (1u64 << 18) - 1;
+    for (f, v) in [("ZINIT_A", pb.init_a), ("ZINIT_B", pb.init_b), ("ZSRVAL_A", pb.srval_a), ("ZSRVAL_B", pb.srval_b)] {
+        let z = !v & m;
+        if z != 0 {
+            lines.push(format!("{tile}.{prefix}.{f}[17:0] = 18'h{z:05X}"));
+        }
+    }
+    // Only the lower RAMB36 of a cascade has a feature; NONE/UPPER is all-clear.
+    for (port, order) in [("A", pb.cascade_order_a), ("B", pb.cascade_order_b)] {
+        if order == CascadeOrder::First {
+            lines.push(format!("{tile}.RAMB36.RAM_EXTENSION_{port}_LOWER"));
+        }
     }
     for (&row, words) in &pb.init_rows {
         lines.push(format!(
@@ -2166,9 +2098,16 @@ mod tests {
         };
         let bs = emit_fasm(&routed, &FakeEmit).unwrap();
         let text = bs.fasm.join("\n");
-        assert!(
-            text.contains("BRAM_L_X0Y0.RAMB18.RAMB18_X0Y0.IN_USE"),
-            "got:\n{text}"
-        );
+        // X-Ray names: half by site-Y parity, never-inverted pins, WRITE_FIRST
+        // as all-clear, INIT_A stored inverted.
+        for f in [
+            "BRAM_L_X0Y0.RAMB18_Y0.IN_USE",
+            "BRAM_L_X0Y0.RAMB18_Y0.READ_WIDTH_A_18",
+            "BRAM_L_X0Y0.RAMB18_Y0.ZINV_CLKARDCLK",
+            "BRAM_L_X0Y0.RAMB18_Y0.ZINIT_A[17:0] = 18'h3FFFF",
+        ] {
+            assert!(text.lines().any(|l| l == f), "missing {f}; got:\n{text}");
+        }
+        assert!(!text.contains("WRITE_FIRST") && !text.contains(".RAMB18.RAMB18_"), "got:\n{text}");
     }
 }
