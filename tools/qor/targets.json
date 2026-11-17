@@ -13,5 +13,6 @@
   {"gap": "G8", "design": "ibex", "metric": "lut_ratio", "max": 1.5, "goal": "Ibex LUTs at most 1.5x Vivado's 3532"},
   {"gap": "G9", "design": "bram_fill", "metric": "ok", "eq": true, "goal": "240-RAM fill builds a bitstream"},
   {"gap": "G9", "design": "dsp_fill_prims", "metric": "ok", "eq": true, "goal": "192-DSP fill (primitives) builds a bitstream"},
+  {"gap": "G38", "design": "bram_fill", "metric": "slack_ns", "min": 0, "goal": "240-RAM fill meets 100 MHz in Helion STA (Vivado: +2.094 ns)"},
   {"gap": "G22", "design": "blinky", "metric": "deterministic", "eq": true, "goal": "two builds give a byte-identical .bit"}
 ]
