@@ -41,6 +41,12 @@ pub trait EmitDevice {
     fn bank_stepdown(&self, _iob_tiles: &[String]) -> Vec<String> {
         Vec::new()
     }
+    /// Vivado's setting for the unused PUDC_B configuration pin when its bank
+    /// runs a low-voltage standard (`low_v_tiles` are that standard's IOB
+    /// tiles, `used` every placed IOB as `(tile, site)`).
+    fn pudc_b(&self, _low_v_tiles: &[String], _used: &[(String, String)]) -> Vec<String> {
+        Vec::new()
+    }
     fn ioi_tile(&self, _iob_tile: &str) -> Option<String> {
         None
     }
@@ -542,6 +548,8 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         .collect();
     if !low_v.is_empty() {
         lines.extend(device.bank_stepdown(&low_v));
+        let used: Vec<(String, String)> = placed.iobs.iter().map(|i| (i.tile.clone(), i.site.clone())).collect();
+        lines.extend(device.pudc_b(&low_v, &used));
     }
 
     // BUFGCTRLs. Static configuration for an I0 -> O clock buffer (BUFG).
