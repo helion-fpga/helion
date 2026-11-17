@@ -40,7 +40,9 @@ HELION_V2_HARD=1 python3 tools/svcheck/svcheck.py --corpus tools/svcheck/tests_h
 by that path) covers single port read-first and write-first, simple and
 true dual port with byte enables, contents from `initial` loops and
 `$readmemh`, a memory split over rows of RAMB36, a ROM, an asynchronous
-read that stays in flops, and hand-instantiated primitives.
+read that stays in flops, hand-instantiated primitives, and shift registers
+built as `SRL16E` / `SRLC32E` (`srl_*`: fixed and variable taps, enables,
+cascades, and registers that must stay flops).
 
 ## What has been checked
 
