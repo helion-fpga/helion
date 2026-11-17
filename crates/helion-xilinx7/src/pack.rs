@@ -3338,6 +3338,84 @@ pub(crate) fn replicate_hard_block_drivers(packed: &mut Packed7, site_xy: &dyn F
             packed.luts.push(c);
         }
     }
+    close_copies(packed);
+}
+
+/// Pull the logic the copies read into their groups too. A copy in group
+/// `g` reads `x_rep{g}` wherever `x` has a copy there (copied flops hold
+/// the same values as their originals). A flop, or a LUT whose inputs all
+/// have copies in those groups, that copies of more than [`WIDE_GROUPS`]
+/// groups still read across the chip is copied as well: on the DSP fill
+/// the copies of `por_*` shared one clock enable and one next-state LUT
+/// per bit, wide nets that kept ripping each other up. Originals stay, so
+/// whatever else reads them is unchanged.
+fn close_copies(packed: &mut Packed7) {
+    use std::collections::{BTreeSet, HashMap};
+    let group = |name: &str| name.rsplit_once("_rep").and_then(|(_, g)| g.parse::<usize>().ok());
+    for _ in 0..8 {
+        let copied: HashMap<String, BTreeSet<usize>> = {
+            let mut m: HashMap<String, BTreeSet<usize>> = HashMap::new();
+            let outs = packed.ffs.iter().map(|f| &f.q_net).chain(packed.luts.iter().map(|l| &l.output_net));
+            for n in outs {
+                if let Some((base, g)) = n.rsplit_once("_rep").and_then(|(b, g)| g.parse::<usize>().ok().map(|g| (b, g))) {
+                    m.entry(base.to_string()).or_default().insert(g);
+                }
+            }
+            m
+        };
+        let local = |net: &str, g: usize| copied.get(net).is_some_and(|gs| gs.contains(&g));
+        // Inputs of copies onto their group's copies; what still crosses.
+        let mut wide: HashMap<String, BTreeSet<usize>> = HashMap::new();
+        for l in packed.luts.iter_mut().filter(|l| packed.lone_cells.contains(&l.name)) {
+            let Some(g) = group(&l.name) else { continue };
+            for n in l.input_nets.iter_mut().flatten() {
+                if local(n, g) {
+                    *n = format!("{n}_rep{g}");
+                } else if !n.contains("_rep") {
+                    wide.entry(n.clone()).or_default().insert(g);
+                }
+            }
+        }
+        for f in packed.ffs.iter_mut().filter(|f| packed.lone_cells.contains(&f.name)) {
+            let Some(g) = group(&f.name) else { continue };
+            for n in [Some(&mut f.d_net), f.ce_net.as_mut(), f.sr_net.as_mut()].into_iter().flatten() {
+                if local(n, g) {
+                    *n = format!("{n}_rep{g}");
+                } else if !n.contains("_rep") {
+                    wide.entry(n.clone()).or_default().insert(g);
+                }
+            }
+        }
+        let mut added = false;
+        let mut nets: Vec<(&String, &BTreeSet<usize>)> = wide.iter().filter(|(_, gs)| gs.len() > WIDE_GROUPS).collect();
+        nets.sort();
+        for (net, gs) in nets {
+            if let Some(f) = packed.ffs.iter().find(|f| f.q_net == *net).cloned() {
+                for &g in gs {
+                    packed.lone_cells.insert(format!("{}_rep{g}", f.name));
+                    packed.ffs.push(PackedFf { name: format!("{}_rep{g}", f.name), q_net: format!("{net}_rep{g}"), ..f.clone() });
+                }
+                added = true;
+            } else if let Some(l) = packed.luts.iter().find(|l| l.output_net == *net).cloned() {
+                let ins: Vec<&String> = l.input_nets.iter().flatten().collect();
+                if ins.is_empty() || !ins.iter().all(|i| gs.iter().all(|&g| local(i, g))) {
+                    continue;
+                }
+                for &g in gs {
+                    let mut c = PackedLut { name: format!("{}_rep{g}", l.name), output_net: format!("{net}_rep{g}"), ..l.clone() };
+                    for n in c.input_nets.iter_mut().flatten() {
+                        *n = format!("{n}_rep{g}");
+                    }
+                    packed.lone_cells.insert(c.name.clone());
+                    packed.luts.push(c);
+                }
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
 }
 
 /// Insert IBUF + BUFGCTRL for clock inputs.
@@ -3520,6 +3598,8 @@ mod tests {
         let mut p = Packed7::default();
         p.ffs.push(ff("por_reg", "por_d", "por"));
         p.luts.push(lut("restart_lut", [Some("por"), None], "restart"));
+        p.luts.push(lut("por_next", [Some("por"), None], "por_d"));
+        p.luts.push(lut("por_ce_lut", [Some("por"), None], "por_ce"));
         for i in 0..12 {
             for k in 0..7 {
                 // Seven LUT bits per lane read `por`, all feeding the lane's flops.
@@ -3533,8 +3613,7 @@ mod tests {
         let xy = |name: &str| name[3..].parse::<i32>().ok().map(|i| (0, i));
         replicate_hard_block_drivers(&mut p, &xy);
         // `por` (84 lane sinks over 3 groups) and `restart` get a copy per group.
-        assert_eq!(p.ffs.iter().filter(|f| f.d_net == "por_d").count(), 4);
-        assert!(p.ffs.iter().filter(|f| f.d_net == "por_d").all(|f| f.ce_net.as_deref() == Some("por_ce")));
+        assert_eq!(p.ffs.iter().filter(|f| f.name.starts_with("por_reg")).count(), 4);
         let lane = |i: usize| p.luts.iter().find(|l| l.name == format!("l{i}_0")).unwrap().input_nets[0].clone().unwrap();
         assert_eq!((lane(0).as_str(), lane(5).as_str(), lane(11).as_str()), ("por_rep0", "por_rep1", "por_rep2"));
         let rst: Vec<&PackedLut> = p.luts.iter().filter(|l| l.name.starts_with("restart_lut_rep")).collect();
@@ -3542,6 +3621,11 @@ mod tests {
         assert!(rst.iter().any(|l| l.output_net == "restart_rep1" && l.input_nets[0].as_deref() == Some("por_rep1")));
         assert_eq!(p.dsps[6].pins[7].1, "restart_rep1");
         assert!(p.lone_cells.contains("por_reg_rep2") && p.lone_cells.contains("restart_lut_rep2"));
+        // The counter's own clock enable and next state follow into each group.
+        let por2 = p.ffs.iter().find(|f| f.name == "por_reg_rep2").unwrap();
+        assert_eq!((por2.d_net.as_str(), por2.ce_net.as_deref()), ("por_d_rep2", Some("por_ce_rep2")));
+        let ce2 = p.luts.iter().find(|l| l.output_net == "por_ce_rep2").unwrap();
+        assert_eq!(ce2.input_nets[0].as_deref(), Some("por_rep2"));
     }
 
     fn blinky_design() -> Design {

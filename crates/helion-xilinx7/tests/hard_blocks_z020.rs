@@ -90,7 +90,7 @@ fn zedboard_fill_places_every_ramb18_and_dsp() {
         (t.grid_x, t.grid_y)
     };
     let mut copies = 0;
-    for f in placed.packed.ffs.iter().filter(|f| f.d_net == "a_d" && f.name != "a_reg") {
+    for f in placed.packed.ffs.iter().filter(|f| f.name.starts_with("a_reg_rep")) {
         let pf = placed.ffs.iter().find(|p| p.name == f.name).unwrap();
         let (fx, fy) = gxy(&pf.tile);
         let far = placed
