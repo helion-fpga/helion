@@ -110,3 +110,55 @@ fn zedboard_fill_places_every_ramb18_and_dsp() {
     // Groups of at most 8 RAMs, never spanning two columns.
     assert!(copies >= RAMS / 8 && copies <= RAMS / 8 + 8, "{copies} copies");
 }
+
+/// Inputs held at 0 are routed from the INT tile's TIEOFF, so no signal can
+/// pass through the wires that feed them (a signal on `FAN_ALT` once drove
+/// a RAM's write enable behind its always-on pip), and the design goes all
+/// the way to FASM.
+#[test]
+fn ramb18_and_dsp_inputs_tied_to_0_are_routed_tieoffs() {
+    let mut d = Design::new("ties");
+    d.add_port("clk", PortDir::In);
+    for port in d.ports.iter_mut() {
+        port.attrs.set("LOC", "Y9");
+    }
+    d.add_cell("a_reg", CellKind::Hff);
+    d.connect("a_d", "a_reg", "D");
+    d.connect("a", "a_reg", "Q");
+    d.connect("clk", "a_reg", "CLK");
+    d.add_cell("u_inv", CellKind::Lut6 { init: 0x5555_5555_5555_5555 });
+    d.connect("a", "u_inv", "I0");
+    d.connect("do0", "u_inv", "I1");
+    d.connect("p0", "u_inv", "I2");
+    d.connect("a_d", "u_inv", "O");
+    d.add_cell("ram", CellKind::BlackBox { module: intern("RAMB18E1") });
+    d.set_cell_attr("ram", "READ_WIDTH_A", "18").unwrap();
+    d.set_cell_attr("ram", "WRITE_WIDTH_B", "18").unwrap();
+    d.connect("clk", "ram", "CLKARDCLK");
+    d.connect("a", "ram", "ADDRARDADDR4");
+    d.connect("do0", "ram", "DOADO0");
+    for pin in ["WEBWE0", "WEBWE1", "DIADI0", "RSTRAMARSTRAM"] {
+        d.connect("const0", "ram", pin);
+    }
+    d.add_cell("dsp", CellKind::BlackBox { module: intern("DSP48E1") });
+    d.connect("clk", "dsp", "CLK");
+    d.connect("a", "dsp", "A0");
+    d.connect("p0", "dsp", "P0");
+
+    let backend = Xilinx7Backend::open("xc7z020").unwrap();
+    let placed = backend.place(&backend.pack(&d).unwrap()).unwrap();
+    let ram_site = &placed.brams[0].site;
+    let loads: Vec<&(String, String, String, bool)> = placed.tie_eps.iter().filter(|e| !e.3).collect();
+    // WEBWE0/1 cover four site lanes; DIADI0 and the reset one pin each.
+    assert_eq!(loads.iter().filter(|e| e.1 == *ram_site).count(), 6, "{:?}", placed.tie_eps);
+    // The DSP's unconnected C, D-less pins and resets held at 0 are tied too.
+    assert!(loads.iter().any(|e| e.1 == placed.dsps[0].site && e.2 == "C0"));
+    for e in placed.tie_eps.iter().filter(|e| e.3) {
+        assert!(e.0.starts_with("tie0_INT_") && e.1.starts_with("TIEOFF_") && e.2 == "HARD0", "{e:?}");
+    }
+    let routed = backend.route(&placed).unwrap();
+    let tie_nets: Vec<_> = routed.nets.iter().filter(|n| n.net.starts_with("tie0_")).collect();
+    assert!(!tie_nets.is_empty());
+    let bs = backend.bitstream(&routed).unwrap();
+    assert!(bs.fasm.iter().any(|l| l.contains(".GFAN") && l.ends_with("GND_WIRE")), "no ground in the FASM");
+}

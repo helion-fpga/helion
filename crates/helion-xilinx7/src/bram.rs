@@ -126,11 +126,13 @@ pub fn site_pins(site: &str, pin: &str) -> Result<Vec<String>, String> {
     }
 }
 
-/// Every routed endpoint of the placed BRAMs: `(net, site, site pin, is_driver)`.
+/// Every routed endpoint of the placed BRAMs, plus the tie-off nets of
+/// [`tie0_endpoints`]: `(net, site, site pin, is_driver)`.
 /// RAMB36E1 is refused: its pins split over the two halves (L/U) and no
 /// path for that is written or checked yet.
 pub fn endpoints(placed: &Placed7) -> Result<Vec<(String, String, String, bool)>, String> {
-    let mut out = Vec::new();
+    // The tie-off nets of BRAM and DSP inputs held at 0 ride along here.
+    let mut out = placed.tie_eps.clone();
     for b in &placed.packed.brams {
         let Some(pb) = placed.brams.iter().find(|p| p.name == b.name) else { continue };
         if b.kind == BramKind::Ramb36e1 {
@@ -165,6 +167,10 @@ pub fn tie_lines(placed: &Placed7, nets: &[crate::route::RoutedNet7], device: &D
                 continue;
             }
             for sp in site_pins(&pb.site, pin)? {
+                // Routed as a tie-off net (`tie0_endpoints`).
+                if !*value && placed.tie_eps.iter().any(|(_, s, p, drv)| !drv && *s == pb.site && *p == sp) {
+                    continue;
+                }
                 lines.extend(tie(device, rq, &routed, &pb.site, &sp, *value, pin)?);
             }
         }
@@ -178,7 +184,9 @@ pub fn tie_lines(placed: &Placed7, nets: &[crate::route::RoutedNet7], device: &D
 /// tile below's address, which drives it only with `CASCOUT_ARD_ACTIVE`
 /// (port A) or `CASCOUT_BWR_ACTIVE` (port B) set: Vivado sets it in every
 /// such pair (x7v, 168 of 168 in its ZedBoard block RAM builds).
-/// shortcut: `CASCINTOP` has no Vivado evidence yet; it gets nothing.
+/// `CASCINTOP` (the lower half taking the upper half's address, inside one
+/// tile) needs nothing more: in Vivado's build its pip bits are the whole
+/// encoding (90 tiles, 0 unexplained bits).
 pub fn cascade_out_lines(fasm: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for l in fasm {
@@ -197,6 +205,63 @@ pub fn cascade_out_lines(fasm: &[String]) -> Vec<String> {
     }
     out.sort();
     out.dedup();
+    out
+}
+
+/// Block RAM and DSP inputs held at 0 become loads of a tie-off net per INT
+/// tile, `tie0_<INT tile>`, driven by that tile's `TIEOFF` `HARD0`
+/// (`GND_WIRE`), so the router routes them through `GFAN` and claims the
+/// wires. Left to FASM alone, a signal the router sent through a `FAN_ALT`
+/// or `BYP_ALT` wire also drove the BRAM pin behind its always-on pip
+/// (`RAMB18_X4Y41.WEBWE0` on the 240-RAM fill). Pins held at 1 stay on the
+/// INT tile's default VCC (`tie` checks that nothing routed reaches them);
+/// DSP pins with their own tile mux use it. A pin with no INT path found is
+/// left to [`tie_lines`], which reports it.
+pub fn tie0_endpoints(placed: &Placed7, device: &Device, rq: &dyn RouteQuery) -> Vec<(String, String, String, bool)> {
+    let mut pins: Vec<(String, String)> = Vec::new();
+    for b in &placed.packed.brams {
+        let Some(pb) = placed.brams.iter().find(|p| p.name == b.name) else { continue };
+        if b.kind == BramKind::Ramb36e1 {
+            continue;
+        }
+        for (pin, value) in &b.ties {
+            if *value || pin.starts_with("CLK") || pin.starts_with("REGCLK") {
+                continue;
+            }
+            for sp in site_pins(&pb.site, pin).unwrap_or_default() {
+                pins.push((pb.site.clone(), sp));
+            }
+        }
+    }
+    for d in &placed.packed.dsps {
+        let Some(pd) = placed.dsps.iter().find(|p| p.name == d.name) else { continue };
+        for (pin, value) in &d.ties {
+            if crate::dsp::fabric_value(pin, *value) == Some(false) {
+                pins.push((pd.site.clone(), pin.clone()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut driven: HashSet<String> = HashSet::new();
+    for (site, sp) in pins {
+        let Some((ti, si)) = device.site_by_name(&site) else { continue };
+        let Some(tile) = device.tile(ti).map(|t| t.name.clone()) else { continue };
+        let Some(wire) = device.site_pins(ti, si).and_then(|ps| ps.iter().find(|(n, _)| *n == sp).map(|(_, w)| w.clone())) else { continue };
+        let Some((_, int, _)) = to_int(device, rq, &tile, &wire) else { continue };
+        let Some(tieoff) = device
+            .tile_by_name(&int)
+            .and_then(|i| device.tile(i))
+            .and_then(|t| t.sites.iter().find(|s| s.site_type == "TIEOFF"))
+            .map(|s| s.name.clone())
+        else {
+            continue;
+        };
+        let net = format!("tie0_{int}");
+        if driven.insert(net.clone()) {
+            out.push((net.clone(), tieoff, "HARD0".to_string(), true));
+        }
+        out.push((net, site, sp, false));
+    }
     out
 }
 

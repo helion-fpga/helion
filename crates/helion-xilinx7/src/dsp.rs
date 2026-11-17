@@ -127,6 +127,17 @@ pub fn endpoints(placed: &Placed7) -> Vec<(String, String, String, bool)> {
     out
 }
 
+/// The value a tied pin is held at in the fabric, or `None` when its tile
+/// mux holds it (`DSP_GND`/`DSP_VCC`). An inverter pin tied to 0 is held at
+/// VCC (see [`zis_features`]).
+pub(crate) fn fabric_value(pin: &str, value: bool) -> Option<bool> {
+    if has_tile_mux(pin) {
+        None
+    } else {
+        Some(value || invertible(pin))
+    }
+}
+
 /// FASM lines that give every constant DSP input its value.
 pub fn tie_lines(placed: &Placed7, nets: &[crate::route::RoutedNet7], device: &Device, rq: &dyn RouteQuery) -> Result<Vec<String>, String> {
     let routed = crate::bram::routed_wires(nets);
@@ -134,8 +145,11 @@ pub fn tie_lines(placed: &Placed7, nets: &[crate::route::RoutedNet7], device: &D
     for d in &placed.packed.dsps {
         let Some(pd) = placed.dsps.iter().find(|p| p.name == d.name) else { continue };
         for (pin, value) in &d.ties {
-            // An inverted pin is held at VCC (see `zis_features`).
-            let v = *value || (invertible(pin) && !has_tile_mux(pin));
+            let v = fabric_value(pin, *value).unwrap_or(*value);
+            // Routed as a tie-off net (`bram::tie0_endpoints`).
+            if !v && placed.tie_eps.iter().any(|(_, s, p, drv)| !drv && *s == pd.site && p == pin) {
+                continue;
+            }
             lines.extend(crate::bram::tie(device, rq, &routed, &pd.site, pin, v, pin)?);
         }
     }

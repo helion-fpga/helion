@@ -87,7 +87,9 @@ impl Backend for Xilinx7Backend {
 
     fn place(&self, packed: &Self::Packed) -> Result<Self::Placed, String> {
         let xdev = self.xdevice(&packed.bufgs);
-        crate::place::place_with_pools(packed, &xdev, (self.device.bram18_sites(), self.device.bram36_sites(), self.device.dsp48_sites()))
+        let mut placed = crate::place::place_with_pools(packed, &xdev, (self.device.bram18_sites(), self.device.bram36_sites(), self.device.dsp48_sites()))?;
+        placed.tie_eps = crate::bram::tie0_endpoints(&placed, &self.device, &xdev);
+        Ok(placed)
     }
 
     fn route(&self, placed: &Self::Placed) -> Result<Self::Routed, String> {
