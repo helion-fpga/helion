@@ -86,6 +86,7 @@ impl P {
             T::Op(o) => format!("'{o}'"),
             T::Num(_) => "a number".to_string(),
             T::Str(_) => "a string".to_string(),
+            T::Real(r) => r.clone(),
             T::Sys(s) => format!("'${s}'"),
             T::Eof => "end of file".to_string(),
         };
@@ -532,6 +533,10 @@ impl P {
                 self.bump();
                 Ok(Expr::Str(s))
             }
+            T::Real(r) => {
+                self.bump();
+                Ok(Expr::Real(r))
+            }
             T::Sys(name) => {
                 self.bump();
                 let args = if self.is_op("(") {
@@ -847,6 +852,12 @@ impl P {
             return Ok(Stmt::Null);
         }
         if let T::Sys(_) = self.peek() {
+            if matches!(self.peek(), T::Sys(n) if n == "readmemh" || n == "readmemb") {
+                let line = self.line();
+                let e = self.primary()?;
+                self.expect_op(";")?;
+                return Ok(Stmt::Call(e, line));
+            }
             // System task ($display, $error, $fatal ...): no hardware.
             self.skip_to_semi()?;
             return Ok(Stmt::Null);
@@ -1303,7 +1314,13 @@ impl P {
                 let body = self.stmt()?;
                 out.push(Item::Always { kind, sens, body, line });
             }
-            "initial" | "final" => {
+            "initial" => {
+                // Kept for power-up values; dropped unless hard blocks are on.
+                self.bump();
+                let body = self.stmt()?;
+                out.push(Item::Initial(body, line));
+            }
+            "final" => {
                 // Simulation only: parsed and dropped.
                 self.bump();
                 self.stmt()?;

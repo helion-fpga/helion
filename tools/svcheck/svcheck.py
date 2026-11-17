@@ -17,6 +17,11 @@ drivers is a failure, reported by name.
 
 Needs `verilator` (5.x) on PATH and a release build of the `hnf` example:
     cargo build --release -p helion-cli --example hnf
+
+Device primitives (block RAM Helion infers with HELION_V2_HARD=1, or ones the
+RTL instantiates) are simulated from Verilog models found by module name in
+`--models DIR` (repeatable; also SVCHECK_MODELS, colon separated), then in
+tools/svcheck/models, which holds Helion's own models of a few primitives.
 """
 from __future__ import annotations
 
@@ -31,6 +36,63 @@ from concurrent.futures import ThreadPoolExecutor
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 HNF = os.environ.get("SVCHECK_HNF", os.path.join(ROOT, "target/release/examples/hnf"))
 W = 1024  # width of every port vector in the bench
+MODELS = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")]
+
+# Device primitives a netlist may hold as BlackBox cells: port -> (output, width).
+def _ports(ins, outs):
+    d = {}
+    for spec, out in ((ins, False), (outs, True)):
+        for p in spec.split():
+            name, _, w = p.partition(":")
+            d[name] = (out, int(w or 1))
+    return d
+
+
+_RAMB18 = _ports("ADDRARDADDR:14 ADDRBWRADDR:14 CLKARDCLK CLKBWRCLK DIADI:16 DIBDI:16 DIPADIP:2 DIPBDIP:2 ENARDEN ENBWREN REGCEAREGCE REGCEB "
+                 "RSTRAMARSTRAM RSTRAMB RSTREGARSTREG RSTREGB WEA:2 WEBWE:4", "DOADO:16 DOBDO:16 DOPADOP:2 DOPBDOP:2")
+_RAMB36 = _ports("ADDRARDADDR:16 ADDRBWRADDR:16 CASCADEINA CASCADEINB CLKARDCLK CLKBWRCLK DIADI:32 DIBDI:32 DIPADIP:4 DIPBDIP:4 ENARDEN ENBWREN "
+                 "INJECTDBITERR INJECTSBITERR REGCEAREGCE REGCEB RSTRAMARSTRAM RSTRAMB RSTREGARSTREG RSTREGB WEA:4 WEBWE:8",
+                 "CASCADEOUTA CASCADEOUTB DBITERR DOADO:32 DOBDO:32 DOPADOP:4 DOPBDOP:4 ECCPARITY:8 RDADDRECC:9 SBITERR")
+PRIMS = {
+    "RAMB18E1": _RAMB18,
+    "RAMB36E1": _RAMB36,
+    "DSP48E1": _ports("A:30 ACIN:30 ALUMODE:4 B:18 BCIN:18 C:48 CARRYCASCIN CARRYIN CARRYINSEL:3 CEA1 CEA2 CEAD CEALUMODE CEB1 CEB2 CEC CECARRYIN "
+                      "CECTRL CED CEINMODE CEM CEP CLK D:25 INMODE:5 MULTSIGNIN OPMODE:7 PCIN:48 RSTA RSTALLCARRYIN RSTALUMODE RSTB RSTC RSTCTRL RSTD "
+                      "RSTINMODE RSTM RSTP", "ACOUT:30 BCOUT:18 CARRYCASCOUT CARRYOUT:4 MULTSIGNOUT OVERFLOW P:48 PATTERNBDETECT PATTERNDETECT PCOUT:48 UNDERFLOW"),
+    "MMCME2_ADV": _ports("CLKFBIN CLKIN1 CLKIN2 CLKINSEL DADDR:7 DCLK DEN DI:16 DWE PSCLK PSEN PSINCDEC PWRDWN RST",
+                         "CLKFBOUT CLKFBOUTB CLKFBSTOPPED CLKINSTOPPED CLKOUT0 CLKOUT0B CLKOUT1 CLKOUT1B CLKOUT2 CLKOUT2B CLKOUT3 CLKOUT3B CLKOUT4 "
+                         "CLKOUT5 CLKOUT6 DO:16 DRDY LOCKED PSDONE"),
+    "MMCME2_BASE": _ports("CLKFBIN CLKIN1 PWRDWN RST", "CLKFBOUT CLKFBOUTB CLKOUT0 CLKOUT0B CLKOUT1 CLKOUT1B CLKOUT2 CLKOUT2B CLKOUT3 CLKOUT3B "
+                          "CLKOUT4 CLKOUT5 CLKOUT6 LOCKED"),
+    "PLLE2_ADV": _ports("CLKFBIN CLKIN1 CLKIN2 CLKINSEL DADDR:7 DCLK DEN DI:16 DWE PWRDWN RST",
+                        "CLKFBOUT CLKOUT0 CLKOUT1 CLKOUT2 CLKOUT3 CLKOUT4 CLKOUT5 DO:16 DRDY LOCKED"),
+    "BUFG": _ports("I", "O"),
+    "BUFGCE": _ports("I CE", "O"),
+    "IDDR": _ports("C CE D R S", "Q1 Q2"),
+    "ODDR": _ports("C CE D1 D2 R S", "Q"),
+    "SRL16E": _ports("A0 A1 A2 A3 CE CLK D", "Q"),
+    "SRLC32E": _ports("A:5 CE CLK D", "Q Q31"),
+    "CARRY4": _ports("CI CYINIT DI:4 S:4", "CO:4 O:4"),
+}
+CLOCK_PINS = {"CLK", "C", "CLKARDCLK", "CLKBWRCLK"}
+
+
+def prim_pin(module: str, pin: str):
+    """(port, bit) of a primitive's pin `NAME` or `NAME<bit>`, or None."""
+    ports = PRIMS.get(module, {})
+    if pin in ports and ports[pin][1] == 1:
+        return pin, 0
+    m = re.match(r"^(.*?)(\d+)$", pin)
+    if m and m.group(1) in ports and int(m.group(2)) < ports[m.group(1)][1]:
+        return m.group(1), int(m.group(2))
+    return None
+
+
+def param(v: str) -> str:
+    """A parameter value as Verilog: numbers as they are, anything else a string."""
+    if re.fullmatch(r"-?\d+(\.\d+)?|\d+'[sS]?[hHbBdDoO][0-9a-fA-F_xXzZ]+", v):
+        return v
+    return '"' + v.replace('"', '\\"') + '"'
 
 
 def vid(name: str) -> str:
@@ -92,8 +154,9 @@ def build(nl: Netlist, widths: dict[str, int]):
     drivers: dict[str, list[str]] = {}
     for net, eps in nl.nets.items():
         for cell, pin in eps:
-            kind = nl.cells.get(cell, ("?", ""))[0]
-            if pin in OUT_PINS.get(kind, ()):
+            kind, arg = nl.cells.get(cell, ("?", ""))
+            pp = prim_pin(arg, pin) if kind == "BlackBox" else None
+            if pin in OUT_PINS.get(kind, ()) or (pp and PRIMS[arg][pp[0]][0]):
                 drivers.setdefault(net, []).append(f"{cell}.{pin}")
     # An IobOut inside the hierarchy passes its I net on to its PAD net.
     for cell in nl.order:
@@ -137,7 +200,7 @@ def build(nl: Netlist, widths: dict[str, int]):
         for d in drivers.get(net, []):
             cell = d.split(".")[0]
             kind = nl.cells[cell][0]
-            if kind in ("IobIn", "ClockBuf"):
+            if kind in ("IobIn", "ClockBuf") or (kind == "BlackBox" and nl.cells[cell][1] in ("BUFG", "BUFGCE")):
                 return clock_root(nl.pin_net.get((cell, "I")) or nl.pin_net.get((cell, "PAD")), depth + 1)
         return None
 
@@ -206,6 +269,37 @@ def build(nl: Netlist, widths: dict[str, int]):
             src = pin("I") or pin("PAD")
             if o and src and o != src:
                 logic.append(f"assign {vid(o)} = {ref(src)};")
+        elif kind == "BlackBox" and arg in PRIMS:
+            # An instance of the primitive's model, bit for bit.
+            buses: dict[str, dict[int, str]] = {}
+            for (c, p), net in nl.pin_net.items():
+                if c != cell:
+                    continue
+                pp = prim_pin(arg, p)
+                if pp is None:
+                    problems.append(f"cell {cell} ({arg}): pin {p} is not a port of the primitive")
+                    continue
+                buses.setdefault(pp[0], {})[pp[1]] = net
+            conns = []
+            for port, bits in sorted(buses.items()):
+                out, w = PRIMS[arg][port]
+                if port in CLOCK_PINS and not out:
+                    root = clock_root(bits.get(0))
+                    if root is not None:
+                        clocks.add(root)
+                parts = []
+                for i in range(w - 1, -1, -1):
+                    net = bits.get(i)
+                    if out:
+                        if net is None:
+                            net = f"{cell}__{port}_{i}"
+                            body.append(f"wire {vid(net)};")
+                        parts.append(vid(net))
+                    else:
+                        parts.append(ref(net) if net is not None else "1'b0")
+                conns.append(f".{port}({{{', '.join(parts)}}})")
+            params = ", ".join(f".{k}({param(v)})" for k, v in sorted(nl.attrs.get(cell, {}).items()))
+            logic.append(f"{arg} {'#(' + params + ') ' if params else ''}{vid(cell)} ({', '.join(conns)});")
         else:
             problems.append(f"cell {cell} of kind {kind} is not modelled")
 
@@ -323,7 +417,10 @@ def verilate(work: str, files: list[str], tag: str):
     obj = os.path.join(work, "obj_" + tag)
     shutil.rmtree(obj, ignore_errors=True)
     cmd = ["verilator", "--binary", "--timing", "-O0", "--x-initial", "0", "--x-assign", "0", "-Wno-fatal", "-Wno-lint",
-           "-Wno-WIDTH", "-Wno-PINMISSING", "-Wno-MULTIDRIVEN", "-Wno-LATCH", "-Wno-UNOPTFLAT", "+1364-2005ext+v", "--top-module", "svcheck_tb", "--Mdir", obj, "-o", "sim"] + files
+           "-Wno-WIDTH", "-Wno-PINMISSING", "-Wno-MULTIDRIVEN", "-Wno-LATCH", "-Wno-UNOPTFLAT", "+1364-2005ext+v", "--top-module", "svcheck_tb", "--Mdir", obj, "-o", "sim"]
+    for d in MODELS:
+        cmd += ["-y", d]
+    cmd += ["+libext+.v+.sv"] + files
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     if r.returncode != 0:
         err = [l for l in r.stderr.splitlines() if "%Error" in l]
@@ -425,7 +522,9 @@ def main():
     ap.add_argument("--work", default=os.path.join(ROOT, "target", "svcheck"))
     ap.add_argument("-j", type=int, default=6)
     ap.add_argument("--regs", action="store_true", help="also compare every flop with its source register, each cycle")
+    ap.add_argument("--models", action="append", default=[], help="directory of Verilog models of device primitives (module.v), searched first")
     a = ap.parse_args()
+    MODELS[:0] = a.models + [d for d in os.environ.get("SVCHECK_MODELS", "").split(":") if d]
     if not os.path.exists(HNF):
         sys.exit(f"missing {HNF}: cargo build --release -p helion-cli --example hnf")
     jobs = []

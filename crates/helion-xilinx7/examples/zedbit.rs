@@ -17,6 +17,9 @@
 //! * `v2`: Helion's current SystemVerilog front end
 //!   (`helion_sv::synth_sv_v2_files`). VHDL is translated to SystemVerilog
 //!   first. Arithmetic is LUT logic; there is no carry-chain inference yet.
+//!   Memories with registered reads become block RAM and instances of
+//!   device primitives (`RAMB36E1`, `DSP48E1`, `MMCME2_ADV`, ...) pass
+//!   through (`helion_sv::v2::set_hard`; `HELION_V2_HARD=0` turns it off).
 //! * `zb`: the front end this flow first ran on the board with
 //!   (`helion-zb-front`), which puts adders on `CARRY4` chains.
 //! * `auto` (default): `v2`, and `zb` only for a design `v2` refuses; the
@@ -64,6 +67,7 @@ fn synth_zb(paths: &[&str], top: Option<&str>) -> Result<Design, String> {
 /// translator first; the second value lists the VHDL port names it had to
 /// rename (SystemVerilog keywords), as `(VHDL name, netlist name)`.
 fn synth_v2(paths: &[&str], top: Option<&str>) -> Result<(Design, Vec<(String, String)>), String> {
+    helion_sv::v2::set_hard(true);
     let mut renames = Vec::new();
     let s = if is_vhdl(paths[0]) {
         let mut src = String::new();
@@ -326,11 +330,15 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
     eprintln!("zedbit: part {part}");
     let t_dev = t0.elapsed();
     let mut packed = be.pack(&design)?;
+    let ramb36 = packed.brams.iter().filter(|b| b.kind == helion_xilinx7::pack::BramKind::Ramb36e1).count();
     eprintln!(
-        "zedbit: packed {} LUTs, {} flops, {} carry cells, {} pads; placing",
+        "zedbit: packed {} LUTs, {} flops, {} carry cells, {} RAMB36 + {} RAMB18, {} DSP48, {} pads; placing",
         packed.luts.len(),
         packed.ffs.len(),
         packed.carries.len(),
+        ramb36,
+        packed.brams.len() - ramb36,
+        packed.dsps.len(),
         packed.iobs.len()
     );
     let mut missing = Vec::new();

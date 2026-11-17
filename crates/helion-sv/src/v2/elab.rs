@@ -132,6 +132,11 @@ pub struct Elab {
     inst_depth: u32,
     /// Line of the item being elaborated, for messages.
     pub line: u32,
+    /// Block RAM inference and primitive pass-through (see `mem.rs`).
+    pub mem: super::mem::MemState,
+    pub hard: Vec<super::lower::Hard>,
+    /// Directories of the source files (for `$readmemh`).
+    pub src_dirs: Vec<std::path::PathBuf>,
 }
 
 impl Elab {
@@ -156,6 +161,9 @@ impl Elab {
             ps: Default::default(),
             inst_depth: 0,
             line: 0,
+            mem: Default::default(),
+            hard: Vec::new(),
+            src_dirs: Vec::new(),
         };
         for m in src.modules {
             e.order.push(m.name.clone());
@@ -353,7 +361,7 @@ impl Elab {
             }
             ty = Rc::new(Ty::Array { elem: ty, lo, hi, asc, packed: false });
         }
-        if ty.w() as u64 > 1 << 22 {
+        if ty.w() as u64 > if self.mem.on { 1 << 25 } else { 1 << 22 } {
             return self.err("array is too large to build from flip-flops (block RAM inference is not available in this path)");
         }
         Ok(ty)
@@ -450,7 +458,7 @@ impl Elab {
                 let p = match it {
                     Item::Decl { .. } | Item::Param(_) | Item::Typedef { .. } | Item::Func(_) | Item::Import { .. } | Item::Genvar(_) | Item::PortDir(_) | Item::Debug(_) => 0,
                     Item::Inst(_) | Item::GenFor { .. } | Item::GenIf { .. } | Item::GenCase { .. } | Item::Block(_) => 1,
-                    Item::Assign { .. } | Item::Always { .. } => 2,
+                    Item::Assign { .. } | Item::Always { .. } | Item::Initial(..) => 2,
                 };
                 if p == phase {
                     self.item(it, sc)?;
@@ -515,6 +523,7 @@ impl Elab {
                 for d in names {
                     let t = self.with_unpacked(base.clone(), &d.unpacked, sc)?;
                     let id = self.new_sig(sc, &d.name, t.clone());
+                    self.mem_candidate(id);
                     if let Some(init) = &d.init {
                         // A variable initializer is its power-up value.
                         let n = self.eval_to_type(init, &t, sc, &mut super::exec::Env::default())?;
@@ -546,6 +555,20 @@ impl Elab {
                 self.instance(d, sc)
             }
             Item::Genvar(_) | Item::Func(_) => Ok(()),
+            Item::Initial(body, line) => {
+                if !self.mem.on {
+                    return Ok(()); // simulation only, as before
+                }
+                self.line = *line;
+                if let Err(e) = self.initial(body, sc) {
+                    if e.starts_with(super::mem::RETRY) {
+                        return Err(e);
+                    }
+                    // Not power-up values: simulation only, as before.
+                    self.warnings.push(format!("{e}; this initial block is ignored"));
+                }
+                Ok(())
+            }
             Item::Debug(names) => {
                 for n in names {
                     if let Some(Sym::Sig(id)) = self.scopes[sc].syms.get(n) {
@@ -679,6 +702,10 @@ impl Elab {
 
     fn instance(&mut self, d: &InstDecl, sc: usize) -> R<()> {
         let Some(m) = self.modules.get(&d.module).cloned() else {
+            if let Some(ports) = super::mem::prim_ports(&d.module).filter(|_| self.mem.on) {
+                let name = format!("{}{}", self.prefix(sc), d.name);
+                return self.prim_instance(d, ports, sc, name);
+            }
             if let Some((_, why)) = self.broken.iter().find(|b| b.0 == d.module) {
                 return self.err(format!("module '{}' (instance '{}') cannot be synthesized: {why}", d.module, d.name));
             }
@@ -1017,6 +1044,7 @@ impl Elab {
                 Dir::Inout => return Err(format!("inout port '{name}' on the top module is not supported")),
             }
         }
+        self.build_mems()?;
         let sigs = self
             .sigs
             .into_iter()
@@ -1029,6 +1057,6 @@ impl Elab {
                 SigInfo { name: s.name, hier: s.hier, index, w: s.drv.len() as u32, drv: s.drv, init: s.init, debug: s.debug }
             })
             .collect();
-        Ok((Flat { top: m.name.clone(), dag: self.dag, sigs, ports: fp, regs: self.regs, latches: self.latches, instances: self.instances }, self.warnings))
+        Ok((Flat { top: m.name.clone(), dag: self.dag, sigs, ports: fp, regs: self.regs, latches: self.latches, instances: self.instances, hard: self.hard }, self.warnings))
     }
 }

@@ -18,6 +18,30 @@ not model, or an output bit without a driver is a failure, by name.
 Needs `verilator` 5.x. Macros for the design come from `HELION_DEFINES`
 (comma separated); `SYNTHESIS` is always defined.
 
+## Block RAM and device primitives
+
+With `HELION_V2_HARD=1` (what `zedbit` uses) the front end builds memories
+with registered reads as `RAMB18E1` / `RAMB36E1` cells and passes instances
+of device primitives (`DSP48E1`, `MMCME2_ADV`, `BUFG`, ...) through as
+cells. Both sides of the co-simulation then need Verilog models of those
+primitives, found by module name (`NAME.v`) in `--models DIR` (repeatable,
+searched first), `SVCHECK_MODELS` (colon separated), then `models/`.
+`models/` holds Helion's own behavioural models of `RAMB18E1`, `RAMB36E1`
+(true dual port, no ECC/cascade/output register), `BUFG`, `BUFGCE`,
+`CARRY4`, `SRL16E` and `SRLC32E`; Xilinx's simulation library is not
+bundled. `DSP48E1`, `MMCME2_*`, `PLLE2_ADV`, `IDDR` and `ODDR` need models
+from `--models`.
+
+```sh
+HELION_V2_HARD=1 python3 tools/svcheck/svcheck.py --corpus tools/svcheck/tests_hard
+```
+
+`tests_hard` (run from the repository root: `rom_init` reads its hex file
+by that path) covers single port read-first and write-first, simple and
+true dual port with byte enables, contents from `initial` loops and
+`$readmemh`, a memory split over rows of RAMB36, a ROM, an asynchronous
+read that stays in flops, and hand-instantiated primitives.
+
 ## What has been checked
 
 All of these equal their RTL on every output and every compared flop:
