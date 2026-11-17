@@ -79,6 +79,20 @@ pub trait RouteQuery {
     fn pip_cost(&self, _tile: &str, _src: &str, _dst: &str) -> Option<u32> {
         None
     }
+    /// PathFinder phase. `Some(ps)`: wires held by signal nets may be shared,
+    /// and each net already on a wire's node adds `ps` to the cost of taking
+    /// it. `None`: the phase is over.
+    fn pf_present(&self, _ps: Option<u32>) {}
+    /// Add (`1`) or remove (`-1`) one net's use of the nodes of `wires`.
+    fn pf_occupy(&self, _wires: &[(String, String)], _delta: i32) {}
+    /// Whether a node of `wires` has more than one net on it.
+    fn pf_overused(&self, _wires: &[(String, String)]) -> bool {
+        false
+    }
+    /// Add history cost to every overused wire; returns how many there are.
+    fn pf_history(&self) -> usize {
+        0
+    }
     /// Returns the pips and, per pip, the arrival delay (ps) at its source
     /// and destination wires; `_tree` holds this net's wires with their
     /// known arrival delays.
@@ -573,7 +587,9 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     // Negotiated congestion: a net with no free path takes the cheapest
     // path through other nets' wires; those nets are ripped up and queued
     // again. History cost on contested wires steers later searches away.
-    let max_rips = 40 * net_names.len() + 2000;
+    // Past this many rip-ups (and once every net has been routed), the
+    // PathFinder phase takes the remaining congestion.
+    let pf_after = 2 * net_names.len() + 1000;
     let mut rips = 0usize;
     let total_nets = net_names.len();
     // HELION_ROUTE_RIPSTATS: with the progress line, the nets ripped up most
@@ -588,7 +604,11 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     let t_start = std::time::Instant::now();
     let mut t_report = t_start;
     let mut routed_count = 0usize;
-    while let Some(net) = queue.pop_front() {
+    loop {
+        if rips > pf_after && routed_count >= total_nets {
+            break;
+        }
+        let Some(net) = queue.pop_front() else { break };
         queued.remove(&net);
         // A net routed again replaces its previous (partial) entry.
         if partial.contains_key(&net) {
@@ -709,9 +729,6 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         };
         if !victims.is_empty() {
             rips += victims.len();
-            if rips > max_rips {
-                return Err(format!("route: congestion around net `{net}` not resolved after {rips} rip-ups"));
-            }
             // Each displaced net loses only the branches through the nodes
             // this path takes; the rest of its tree stays routed and claimed,
             // and only the loads cut off are routed again.
@@ -814,6 +831,11 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         nets.push(RoutedNet7 { net, kind });
     }
 
+    if !queue.is_empty() {
+        eprintln!("route: {} nets still queued after {rips} rip-ups; PathFinder", queue.len());
+        pathfinder(&net_eps, &clock_spine_nets, device, &mut nets, &mut claimed, &mut load_delays, queue.into_iter().collect())?;
+    }
+
     // BUFGCTRL control-pin tie-offs. The static config (emit.rs) sets pin
     // polarity, but S0/S1/CE0/CE1/IGNORE0/IGNORE1 are routing inputs: left
     // undriven, the BUFGCTRL output freezes at INIT_OUT with no toggle
@@ -849,6 +871,114 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         load_delays,
         graph_clocks,
     })
+}
+
+/// PathFinder (McMurchie and Ebeling, 1995) over the signal nets: they may
+/// share wires for a while; every iteration reroutes the nets on overused
+/// nodes, with sharing priced higher each time and history cost added to
+/// nodes that stay overused, until no node carries two nets. Clock nets
+/// keep their wires (they stay claimed, so no search may enter them).
+#[allow(clippy::too_many_arguments)]
+fn pathfinder(
+    net_eps: &HashMap<String, Vec<Endpoint>>,
+    clock_spine_nets: &HashSet<String>,
+    device: &dyn RouteQuery,
+    nets: &mut Vec<RoutedNet7>,
+    claimed: &mut HashMap<(String, String), String>,
+    load_delays: &mut HashMap<(String, String, String), u32>,
+    queued: Vec<String>,
+) -> Result<(), String> {
+    const MAX_ITERATIONS: usize = 100;
+    let wires_of = |pips: &[RoutedPip]| -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = pips
+            .iter()
+            .flat_map(|p| [(p.tile.clone(), p.src_wire.clone()), (p.tile.clone(), p.dst_wire.clone())])
+            .filter(|(_, w)| !is_power_wire(w))
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let mut pf: std::collections::BTreeMap<String, Vec<RoutedPip>> = std::collections::BTreeMap::new();
+    for n in nets.iter() {
+        if let RouteKind::Pips(p) = &n.kind {
+            if !device.is_clock_net(&n.net) {
+                pf.insert(n.net.clone(), p.clone());
+            }
+        }
+    }
+    let mut todo: std::collections::BTreeSet<String> = queued.into_iter().collect();
+    for n in &todo {
+        pf.entry(n.clone()).or_default();
+    }
+    let names: Vec<String> = pf.keys().cloned().collect();
+    claimed.retain(|_, o| !pf.contains_key(o));
+    device.release_claims(&names, claimed.len());
+    let mut present: u32 = 200;
+    device.pf_present(Some(present));
+    for p in pf.values() {
+        device.pf_occupy(&wires_of(p), 1);
+    }
+    let t0 = std::time::Instant::now();
+    let mut done = false;
+    for it in 1..=MAX_ITERATIONS {
+        for (n, p) in &pf {
+            if device.pf_overused(&wires_of(p)) {
+                todo.insert(n.clone());
+            }
+        }
+        let count = todo.len();
+        for net in std::mem::take(&mut todo) {
+            device.pf_occupy(&wires_of(&pf[&net]), -1);
+            let eps = &net_eps[&net];
+            let drv = eps.iter().find(|e| e.is_driver).ok_or_else(|| format!("route: PathFinder: net `{net}` has no driver"))?;
+            let loads: Vec<&Endpoint> = eps.iter().filter(|e| !e.is_driver).collect();
+            let mut delays = Vec::new();
+            let p = match route_net(&net, drv, &loads, clock_spine_nets, device, claimed, &mut delays, &[])? {
+                RouteKind::Pips(p) => p,
+                k => return Err(format!("route: PathFinder: net `{net}` routed as {k:?}, not pips")),
+            };
+            device.pf_occupy(&wires_of(&p), 1);
+            if count <= 4 && std::env::var("HELION_ROUTE_DEBUG").is_ok() {
+                let hot = |t: &str, w: &str| device.pf_overused(&[(t.to_string(), w.to_string())]);
+                let near: Vec<String> = p.iter().filter(|x| hot(&x.tile, &x.src_wire) || hot(&x.tile, &x.dst_wire)).map(|x| format!("{}.{}->{}", x.tile, x.src_wire, x.dst_wire)).collect();
+                let ls: Vec<String> = loads.iter().map(|l| format!("{}.{}", l.site, l.pin)).collect();
+                eprintln!("route_debug pf net={net} drv={}.{} loads={ls:?} shared pips={near:?}", drv.site, drv.pin);
+            }
+            for l in &loads {
+                load_delays.remove(&(net.clone(), l.site.clone(), l.pin.clone()));
+            }
+            for (site, pin, d) in delays {
+                load_delays.insert((net.clone(), site, pin), d);
+            }
+            pf.insert(net, p);
+        }
+        let over = device.pf_history();
+        eprintln!("route: PathFinder iteration {it}: {count} nets rerouted, {over} wires overused, {:.0}s", t0.elapsed().as_secs_f64());
+        if over == 0 {
+            done = true;
+            break;
+        }
+        present = present.saturating_mul(3).div_ceil(2).min(100_000);
+        device.pf_present(Some(present));
+    }
+    device.pf_present(None);
+    if !done {
+        return Err(format!("route: PathFinder: wires still shared after {MAX_ITERATIONS} iterations"));
+    }
+    nets.retain(|n| !pf.contains_key(&n.net));
+    for (net, p) in pf {
+        let mut new = Vec::new();
+        for k in wires_of(&p) {
+            if !claimed.contains_key(&k) {
+                claimed.insert(k.clone(), net.clone());
+                new.push(k);
+            }
+        }
+        device.note_claims(&net, &new, claimed.len());
+        nets.push(RoutedNet7 { net, kind: RouteKind::Pips(p) });
+    }
+    Ok(())
 }
 
 /// Check whether `driver -> load` is a dedicated hardware cascade wire and
