@@ -39,6 +39,7 @@ fn ug953_mmcm_and_pll_pack_place_route_fasm() {
     d.set_cell_attr("u_mmcm", "DIVCLK_DIVIDE", "1").unwrap();
     d.set_cell_attr("u_mmcm", "CLKFBOUT_MULT_F", "10.0").unwrap(); // 1000 MHz VCO
     d.set_cell_attr("u_mmcm", "CLKOUT0_DIVIDE_F", "5.0").unwrap();
+    d.set_cell_attr("u_mmcm", "CLKOUT0_PHASE", "9.0").unwrap(); // 1/8 VCO period
     d.set_cell_attr("u_mmcm", "CLKOUT1_DIVIDE", "7").unwrap();
     d.connect("clk_in", "u_mmcm", "CLKIN1");
     d.connect("fb", "u_mmcm", "CLKFBOUT");
@@ -71,6 +72,9 @@ fn ug953_mmcm_and_pll_pack_place_route_fasm() {
         "MMCME2_ADV.CLKOUT6_CLKOUT2_FRACTIONAL_NO_COUNT[0]",
         "MMCME2_ADV.LKTABLE[39:0] = 40'hE73E8FA401",
         "MMCME2_ADV.TABLE[9:0] = 10'h3D4",
+        "MMCME2_ADV.CLKOUT0_CLKOUT1_PHASE_MUX[2:0] = 3'd1",
+        "MMCME2_ADV.CLKOUT5_CLKOUT2_FRACTIONAL_PHASE_MUX_F[2:0] = 3'd1",
+        // An odd eighth of a VCO period powers the interpolator (sweep_pwr4).
         "MMCME2_ADV.POWER_REG_POWER_REG_POWER_REG[15:0] = 16'h9900",
         "PLLE2_ADV.IN_USE",
         "PLLE2_ADV.COMPENSATION.Z_ZHOLD_OR_CLKIN_BUF",
