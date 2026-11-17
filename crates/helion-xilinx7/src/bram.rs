@@ -174,6 +174,32 @@ pub fn tie_lines(placed: &Placed7, nets: &[crate::route::RoutedNet7], device: &D
     Ok(lines)
 }
 
+/// A BRAM tile that takes an address through `BRAM_CASCINBOT_*` reads the
+/// tile below's address, which drives it only with `CASCOUT_ARD_ACTIVE`
+/// (port A) or `CASCOUT_BWR_ACTIVE` (port B) set: Vivado sets it in every
+/// such pair (x7v, 168 of 168 in its ZedBoard block RAM builds).
+/// shortcut: `CASCINTOP` has no Vivado evidence yet; it gets nothing.
+pub fn cascade_out_lines(fasm: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for l in fasm {
+        let Some((tile, rest)) = l.split_once('.') else { continue };
+        let port = if rest.contains(".BRAM_CASCINBOT_ADDRARDADDR") {
+            "ARD"
+        } else if rest.contains(".BRAM_CASCINBOT_ADDRBWRADDR") {
+            "BWR"
+        } else {
+            continue;
+        };
+        // BRAM tiles are 5 rows apart: BRAM_L_X6Y45 sits on BRAM_L_X6Y40.
+        let Some(yi) = tile.rfind('Y') else { continue };
+        let Ok(y) = tile[yi + 1..].parse::<i32>() else { continue };
+        out.push(format!("{}Y{}.CASCOUT_{port}_ACTIVE", &tile[..yi], y - 5));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// `(tile, wire)` of every pip destination the router set.
 pub fn routed_wires(nets: &[crate::route::RoutedNet7]) -> HashSet<(String, String)> {
     let mut routed = HashSet::new();
@@ -298,6 +324,16 @@ mod tests {
         assert_eq!(site_pins("RAMB18_X0Y4", "ADDRARDADDR7").unwrap(), vec!["ADDRARDADDR7"]);
         assert_eq!(site_pins("RAMB18_X0Y5", "CLKARDCLK").unwrap(), vec!["CLKARDCLK"]);
         assert_eq!(site_pins("RAMB18_X0Y5", "DOBDO3").unwrap(), vec!["DOBDO3"]);
+    }
+
+    #[test]
+    fn cascade_in_from_below_enables_its_cascade_out() {
+        let fasm = vec![
+            "BRAM_L_X6Y45.BRAM_ADDRARDADDRL4.BRAM_CASCINBOT_ADDRARDADDRU4".to_string(),
+            "BRAM_L_X6Y45.BRAM_ADDRBWRADDRU7.BRAM_CASCINBOT_ADDRBWRADDRU7".to_string(),
+            "BRAM_L_X6Y45.BRAM_ADDRARDADDRL5.BRAM_IMUX_ADDRARDADDRL5".to_string(),
+        ];
+        assert_eq!(cascade_out_lines(&fasm), vec!["BRAM_L_X6Y40.CASCOUT_ARD_ACTIVE", "BRAM_L_X6Y40.CASCOUT_BWR_ACTIVE"]);
     }
 
     #[test]

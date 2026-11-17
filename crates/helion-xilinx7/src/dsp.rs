@@ -99,6 +99,22 @@ pub fn zis_features(d: &PackedDsp) -> Vec<String> {
     v
 }
 
+/// Bits X-Ray has no feature for, seen in Vivado's bitstreams: AREG = 1 and
+/// BREG = 1 set the one frame-27 bit of `AREG_0`/`BREG_0` alone (Vivado
+/// 2017.3 ZedBoard builds of the DSP fill, all 384 slices; read by x7v).
+/// bitgen adds them to the `DSP_L`/`DSP_R` segbits.
+pub fn extra_segbits(tile_type: &str) -> Option<String> {
+    if tile_type != "DSP_L" && tile_type != "DSP_R" {
+        return None;
+    }
+    Some(
+        [("DSP_0", "AREG_1", "27_111"), ("DSP_0", "BREG_1", "27_38"), ("DSP_1", "AREG_1", "27_271"), ("DSP_1", "BREG_1", "27_198")]
+            .iter()
+            .map(|(site, f, bit)| format!("{tile_type}.DSP48.{site}.{f} {bit}\n"))
+            .collect(),
+    )
+}
+
 /// Every routed endpoint of the placed DSPs: `(net, site, site pin, is_driver)`.
 pub fn endpoints(placed: &Placed7) -> Vec<(String, String, String, bool)> {
     let mut out = Vec::new();
@@ -148,5 +164,9 @@ mod tests {
         assert_eq!(unconnected_value("CEP", 0, 0, 0), Some(true));
         assert_eq!(unconnected_value("RSTP", 0, 0, 0), Some(false));
         assert!(has_tile_mux("D24") && !has_tile_mux("RSTD0") && !has_tile_mux("A3"));
+        // AREG/BREG = 1: the one frame-27 bit Vivado sets (not in X-Ray).
+        let x = extra_segbits("DSP_R").unwrap();
+        assert!(x.contains("DSP_R.DSP48.DSP_0.AREG_1 27_111\n") && x.contains("DSP_R.DSP48.DSP_1.BREG_1 27_198\n"));
+        assert!(extra_segbits("BRAM_L").is_none());
     }
 }

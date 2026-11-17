@@ -222,6 +222,7 @@ fn ug953_dsp48e1_preadder_patdet_and_column_cascade() {
     // encoding, USE_PATTERN_DETECT has no bit.
     assert!(text.contains(&format!("{s0}USE_DPORT[0]")), "got:\n{text}");
     assert!(text.contains(&format!("{s0}AREG_2")), "got:\n{text}");
+    assert!(text.contains(&format!("{s0}BREG_1")), "got:\n{text}");
     assert!(!text.contains(&format!("{s0}ZMREG")), "got:\n{text}");
     assert!(!text.contains(&format!("{s0}ZPREG")), "got:\n{text}");
     assert!(text.contains(&format!("{s1}A_INPUT[0]")), "got:\n{text}");

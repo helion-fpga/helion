@@ -100,6 +100,9 @@ pub fn fasm_to_bit(text: &str, part: &str, design: &str) -> Result<BitgenReport,
                 segbits.add_segbits(t, block, &std::fs::read_to_string(&p).map_err(|e| e.to_string())?).map_err(|e| format!("{e:?}"))?;
             }
         }
+        if let Some(extra) = crate::dsp::extra_segbits(t) {
+            segbits.add_segbits(t, BlockType::ClbIoClk, &extra).map_err(|e| format!("{e:?}"))?;
+        }
         let pp = root.join(format!("ppips_{lower}.db"));
         if pp.is_file() {
             segbits.add_ppips(t, &std::fs::read_to_string(&pp).map_err(|e| e.to_string())?).map_err(|e| format!("{e:?}"))?;
