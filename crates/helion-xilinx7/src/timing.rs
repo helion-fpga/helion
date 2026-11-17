@@ -231,6 +231,10 @@ pub const MARGIN_PS: u32 = 400;
 pub struct PathStep {
     pub what: String,
     pub arrival_ps: u32,
+    /// Routed delay of the wire into this step.
+    pub wire_ps: u32,
+    /// Tile of the cell, to set the route against the placer's estimate.
+    pub xy: Option<(i32, i32)>,
 }
 
 /// Register-to-register timing of a routed design.
@@ -243,6 +247,8 @@ pub struct Analysis {
     pub endpoints: usize,
     /// Worst path, launch first.
     pub worst_path: Vec<PathStep>,
+    /// Worst slack (ps) of each clock domain, by clock net.
+    pub clocks: Vec<(String, i64)>,
 }
 
 impl Analysis {
@@ -284,22 +290,25 @@ pub fn analyze_clocks(routed: &Routed7, period_of: &dyn Fn(&str) -> Option<u32>)
     }
     let mut worst: Option<Analysis> = None;
     let (mut endpoints, mut failing) = (0usize, 0usize);
+    let mut clocks = Vec::new();
     for dom in &domains {
         let period = period_of(dom).ok_or_else(|| format!("timing: no period known for clock `{dom}`"))?;
         let a = analyze_domain(routed, dom, period)?;
         endpoints += a.endpoints;
         failing += a.failing_endpoints;
+        clocks.push((dom.to_string(), a.wns_ps));
         if worst.as_ref().map(|w| a.wns_ps < w.wns_ps).unwrap_or(true) {
             worst = Some(a);
         }
     }
-    let mut w = worst.unwrap_or(Analysis { period_ps: 0, wns_ps: 0, failing_endpoints: 0, endpoints: 0, worst_path: Vec::new() });
+    let mut w = worst.unwrap_or(Analysis { period_ps: 0, wns_ps: 0, failing_endpoints: 0, endpoints: 0, worst_path: Vec::new(), clocks: Vec::new() });
     if domains.is_empty() {
         w.period_ps = period_of("").unwrap_or(0);
         w.wns_ps = w.period_ps as i64;
     }
     w.endpoints = endpoints;
     w.failing_endpoints = failing;
+    w.clocks = clocks;
     Ok(w)
 }
 
@@ -385,6 +394,14 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         .chain(placed.carries.iter().map(|c| (c.name.as_str(), c.site.as_str())))
         .collect();
     let lut_by_out: HashMap<&str, &crate::pack::PackedLut> = packed.luts.iter().map(|l| (l.output_net.as_str(), l)).collect();
+    let xy_of: HashMap<&str, (i32, i32)> = placed
+        .luts
+        .iter()
+        .map(|l| (l.name.as_str(), l.tile.as_str()))
+        .chain(placed.ffs.iter().map(|f| (f.name.as_str(), f.tile.as_str())))
+        .chain(placed.carries.iter().map(|c| (c.name.as_str(), c.tile.as_str())))
+        .filter_map(|(n, t)| Some((n, tile_xy(t)?)))
+        .collect();
     // Only this domain's flops launch paths; another domain's flop output is
     // a path start too, tagged so that reaching an endpoint is reported.
     let ff_by_q: HashMap<&str, &crate::pack::PackedFf> = packed.ffs.iter().map(|f| (f.q_net.as_str(), f)).collect();
@@ -424,6 +441,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         site_of: &HashMap<&'a str, &'a str>,
         lut_letter: &HashMap<&'a str, char>,
         route: &dyn Fn(&str, &str, &str, bool) -> u32,
+        xy_of: &HashMap<&'a str, (i32, i32)>,
     ) -> Result<(u32, Vec<PathStep>), String> {
         if let Some(x) = memo.get(net) {
             return Ok(x.clone());
@@ -433,20 +451,22 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         }
         let r = if ff_by_q.contains_key(net) {
             let f = ff_by_q[net];
-            (FF_CKQ_PS, vec![PathStep { what: format!("{} (flop Q, clock {})", f.name, f.clk_net), arrival_ps: FF_CKQ_PS }])
+            (FF_CKQ_PS, vec![PathStep { what: format!("{} (flop Q, clock {}, {})", f.name, f.clk_net, site_of.get(f.name.as_str()).copied().unwrap_or("?")), arrival_ps: FF_CKQ_PS, wire_ps: 0, xy: xy_of.get(f.name.as_str()).copied() }])
         } else if let Some(l) = lut_by_out.get(net) {
             let site = site_of.get(l.name.as_str()).copied().unwrap_or("");
             let letter = lut_letter.get(l.name.as_str()).copied().unwrap_or('A');
             let mut best = (0u32, Vec::new());
+            let mut wire = 0;
             for (k, inn) in l.input_nets.iter().enumerate() {
                 let Some(inn) = inn else { continue };
-                let (a, p) = arrival(inn, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route)?;
+                let (a, p) = arrival(inn, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, xy_of)?;
                 if p.is_empty() {
                     continue; // launched by a pad or constant: unconstrained
                 }
-                let t = a + route(inn, site, &format!("{letter}{}", k + 1), false);
-                if t > best.0 || best.1.is_empty() {
-                    best = (t, p);
+                let w = route(inn, site, &format!("{letter}{}", k + 1), false);
+                if a + w > best.0 || best.1.is_empty() {
+                    best = (a + w, p);
+                    wire = w;
                 }
             }
             if best.1.is_empty() {
@@ -454,29 +474,32 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             } else {
                 let t = best.0 + LUT_PS;
                 let mut p = best.1;
-                p.push(PathStep { what: format!("{} (LUT)", l.name), arrival_ps: t });
+                p.push(PathStep { what: format!("{} (LUT, {site})", l.name), arrival_ps: t, wire_ps: wire, xy: xy_of.get(l.name.as_str()).copied() });
                 (t, p)
             }
         } else if let Some((c, j)) = carry_by_net.get(net) {
             let site = site_of.get(c.name.as_str()).copied().unwrap_or("");
             let mut best = (0u32, Vec::new());
+            let mut wire = 0;
             let upto = j.map(|j| j + 1).unwrap_or(4);
             for s in c.s_nets.iter().take(upto).flatten() {
-                let (a, p) = arrival(s, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route)?;
+                let (a, p) = arrival(s, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, xy_of)?;
                 if p.is_empty() {
                     continue;
                 }
-                let t = a + route(s, site, "S", true);
-                if t > best.0 || best.1.is_empty() {
-                    best = (t, p);
+                let w = route(s, site, "S", true);
+                if a + w > best.0 || best.1.is_empty() {
+                    best = (a + w, p);
+                    wire = w;
                 }
             }
             if c.cyinit.is_none() && !c.ci_net.is_empty() {
-                let (a, p) = arrival(&c.ci_net, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route)?;
+                let (a, p) = arrival(&c.ci_net, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, xy_of)?;
                 let cascade = carry_by_net.get(c.ci_net.as_str()).map(|(_, j)| j.is_none()).unwrap_or(false);
-                let t = a + if cascade { 0 } else { route(&c.ci_net, site, "AX", false) };
-                if !p.is_empty() && (t > best.0 || best.1.is_empty()) {
-                    best = (t, p);
+                let w = if cascade { 0 } else { route(&c.ci_net, site, "AX", false) };
+                if !p.is_empty() && (a + w > best.0 || best.1.is_empty()) {
+                    best = (a + w, p);
+                    wire = w;
                 }
             }
             if best.1.is_empty() {
@@ -485,7 +508,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
                 let add = if j.is_some() { CARRY_S_TO_O_PS } else { CARRY_CI_TO_CO_PS };
                 let t = best.0 + add;
                 let mut p = best.1;
-                p.push(PathStep { what: format!("{} (CARRY4)", c.name), arrival_ps: t });
+                p.push(PathStep { what: format!("{} (CARRY4, {})", c.name, site_of.get(c.name.as_str()).copied().unwrap_or("?")), arrival_ps: t, wire_ps: wire, xy: xy_of.get(c.name.as_str()).copied() });
                 (t, p)
             }
         } else {
@@ -519,11 +542,12 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             }
         }
         for (net, pin, internal) in inputs {
-            let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route)?;
+            let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &xy_of)?;
             if p.is_empty() {
                 continue; // driven by an input pad or a constant: unconstrained
             }
-            let t = a + route(net, &pff.site, &pin, internal);
+            let w = route(net, &pff.site, &pin, internal);
+            let t = a + w;
             endpoints += 1;
             let slack = period_ps as i64 - FF_SETUP_PS as i64 - MARGIN_PS as i64 - t as i64;
             if slack < 0 {
@@ -531,7 +555,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             }
             if slack < wns {
                 wns = slack;
-                p.push(PathStep { what: format!("{} {pin} (flop input)", ff.name), arrival_ps: t });
+                p.push(PathStep { what: format!("{} {pin} (flop input, {})", ff.name, site_of.get(ff.name.as_str()).copied().unwrap_or("?")), arrival_ps: t, wire_ps: w, xy: xy_of.get(ff.name.as_str()).copied() });
                 worst_path = p;
             }
         }
@@ -539,7 +563,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
     if endpoints == 0 {
         wns = period_ps as i64;
     }
-    Ok(Analysis { period_ps, wns_ps: wns, failing_endpoints: failing, endpoints, worst_path })
+    Ok(Analysis { period_ps, wns_ps: wns, failing_endpoints: failing, endpoints, worst_path, clocks: vec![(domain.to_string(), wns)] })
 }
 
 #[cfg(test)]
