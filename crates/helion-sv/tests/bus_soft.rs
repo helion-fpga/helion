@@ -1,6 +1,7 @@
 use helion_ir::{resolve, CellKind};
 use helion_sv::synth_sv;
 use std::fs;
+use std::path::PathBuf;
 
 #[test]
 fn bus_arbiter_fold() {
@@ -65,7 +66,18 @@ endmodule
 
 #[test]
 fn bus_n3_soft_diag() {
-    let src = fs::read_to_string("/tmp/bus_n3.sv").expect("src");
+    // The bus decode RTL that this diagnostic was written against is the
+    // ysyx `bus` module in examples/ysyx_ibex.sv, instantiated with three
+    // devices (time / sim / ysyx). Extract it from the checked-in example
+    // instead of reading a scratch copy from /tmp.
+    let ibex = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/ysyx_ibex.sv");
+    let all = fs::read_to_string(&ibex).expect("read ysyx_ibex.sv");
+    let start = all.find("module bus #(").expect("bus module in ysyx_ibex.sv");
+    let rest = &all[start..];
+    let end = rest.find("endmodule").expect("endmodule for bus") + "endmodule".len();
+    let one = "parameter int NrDevices    = 1";
+    assert!(rest[..end].contains(one), "bus NrDevices default changed");
+    let src = rest[..end].replacen(one, "parameter int NrDevices    = 3", 1);
     let d = synth_sv(&src, "bus_n3.sv").expect("bus");
     eprintln!("BUS name={} cells={}", resolve(d.name), d.cells.len());
     for k in ["WIDE_CONE", "ASSIGN_NOT_LOWERED"] {
