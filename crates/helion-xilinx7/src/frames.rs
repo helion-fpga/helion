@@ -592,7 +592,8 @@ impl FrameStore {
     /// numeric order (which [`FrameStore::new`] guarantees).
     ///
     /// Every frame is written with its ECC recomputed (word 50, bits
-    /// [12:0]; see [`frame_ecc`]), whatever those bits held in the store.
+    /// [12:0]; see [`frame_ecc`]), whatever those bits held in the store,
+    /// except block RAM content frames, whose ECC bits are written as 0.
     pub fn fdri_payload(&self) -> Vec<u32> {
         let mut out = Vec::with_capacity(
             (self.addrs.len() + 2 * (ZERO_PAD_FRAMES + 1)) * WORDS_PER_FRAME,
@@ -601,7 +602,9 @@ impl FrameStore {
             let base = n * WORDS_PER_FRAME;
             let start = out.len();
             out.extend_from_slice(&self.words[base..base + WORDS_PER_FRAME]);
-            let ecc = frame_ecc(&out[start..start + WORDS_PER_FRAME]);
+            // Block RAM content frames (block type 1) carry no ECC: Vivado
+            // writes word 50 as 0 in every one (x7v, 1,792 frames).
+            let ecc = if far_group(addr).0 == 1 { 0 } else { frame_ecc(&out[start..start + WORDS_PER_FRAME]) };
             out[start + ECC_WORD] = (out[start + ECC_WORD] & !ECC_MASK) | ecc;
             let boundary = match self.addrs.get(n + 1) {
                 Some(&next) => far_group(next) != far_group(addr),
@@ -923,6 +926,19 @@ CLBLL_L.SLICEL_X0.AFF.ZINI 10_03 !10_04
         let store = FrameStore::new(&[0x0000_0000, 0x0000_0001]);
         let payload = store.fdri_payload();
         assert_eq!(payload.len(), 4 * WORDS_PER_FRAME);
+    }
+
+    #[test]
+    fn block_ram_content_frames_carry_no_ecc() {
+        // A logic frame and a block RAM content frame (block type 1), each
+        // with one data bit: only the logic frame gets an ECC (Vivado).
+        let mut store = FrameStore::new(&[0x0000_0000, 0x0080_0000]);
+        store.apply_raw_bits(&[(0x0000_0000, 3, 1), (0x0080_0000, 3, 1)]).unwrap();
+        let payload = store.fdri_payload();
+        assert_ne!(payload[ECC_WORD] & ECC_MASK, 0);
+        // Logic frame, two boundary pad frames, then the BRAM frame.
+        assert_eq!(payload[3 * WORDS_PER_FRAME + ECC_WORD], 0);
+        assert_eq!(payload[3 * WORDS_PER_FRAME + 3], 1);
     }
 
     #[test]

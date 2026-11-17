@@ -813,10 +813,9 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         // not describe is refused rather than emitted half-configured.
         let p = pdsp.ok_or_else(|| format!("emit: DSP {} was placed but not packed", dsp.name))?;
         let pre = format!("{}.DSP48.{}", dsp.tile, dsp_site);
+        // AREG_1/BREG_1 are Helion's names for a bit X-Ray lacks (`dsp::extra_segbits`).
         for (r, v) in [("AREG", p.areg), ("BREG", p.breg)] {
-            if v != 1 {
-                lines.push(format!("{pre}.{r}_{v}"));
-            }
+            lines.push(format!("{pre}.{r}_{v}"));
         }
         // Clear only for xREG = 2 with xCASCREG = 1.
         for (z, reg, casc) in [("ZAREG_2_ACASCREG_1", p.areg, p.acascreg), ("ZBREG_2_BCASCREG_1", p.breg, p.bcascreg)] {
