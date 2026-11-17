@@ -384,13 +384,18 @@ impl<'a> XDevice<'a> {
         let tgt_xy: Vec<(i32, i32)> = targets.iter().map(|&t| self.wire_xy(t)).collect();
 
         const PIP_BASE: u32 = 15;
+        // Estimated cost to go per tile. A hex costs about 27 ps per tile
+        // (pip delay + PIP_BASE over 6 tiles); at 90 the search was close to
+        // greedy and extended whichever tree wire lay nearest the load, so
+        // the loads of a chip-wide net were reached one after another (G38).
+        const EST_TILE_PS: u32 = 30;
         let h = |id: u32| -> u32 {
             let (x, y) = self.wire_xy(id);
             let d = tgt_xy.iter().map(|(tx, ty)| (x - tx).abs() + (y - ty).abs()).min().unwrap_or(0);
             // Negotiating adds penalties near the sinks; a steeper
             // estimate keeps that search aimed at them instead of flooding
             // everything within the penalty's reach.
-            (d as u32) * if opts.negotiate { 220 } else { 90 }
+            (d as u32) * if opts.negotiate { 220 } else { EST_TILE_PS }
         };
         let mut sb = self.search.borrow_mut();
         if sb.stamp.len() != n {
@@ -462,14 +467,16 @@ impl<'a> XDevice<'a> {
                 }
             }
         }
-        // Search region: the box spanned by the sinks and the nearest wire
-        // the net already has (its source, or a branch of its tree).
+        // Search region: the box spanned by the sinks, the net's source and
+        // the nearest wire of its tree. Without the source a far load could
+        // only branch off the tree near it.
         // Late PathFinder iterations search the whole device: a net whose
         // only free detour leaves the box would otherwise keep sharing.
         let bbox = if pf.as_ref().is_some_and(|(_, ps)| *ps >= 20_000) { 0 } else { opts.bbox };
         let region = (bbox > 0).then(|| {
             let (sx, sy) = self.wire_xy(near.1);
-            let (mut x0, mut x1, mut y0, mut y1) = (sx, sx, sy, sy);
+            let (qx, qy) = self.wire_xy(start);
+            let (mut x0, mut x1, mut y0, mut y1) = (sx.min(qx), sx.max(qx), sy.min(qy), sy.max(qy));
             for &(x, y) in &tgt_xy {
                 x0 = x0.min(x);
                 x1 = x1.max(x);
