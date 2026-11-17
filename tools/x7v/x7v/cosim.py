@@ -103,6 +103,9 @@ RESET_RATE = 0.01
 RESET_PULSE = True
 # Cycles a design gets to define its outputs when no reset is applied.
 NO_RESET_SETTLE = 64
+# (start, length): instead of random resets, pulse reset-like inputs once
+# at that cycle (`verify --reset-at`), so a long test is seen recovering.
+RESET_AT: tuple[int, int] | None = None
 
 
 def make_stimulus(bits: list[str], cycles: int, seed: int, hold: dict[str, float] | None = None) -> list[str]:
@@ -118,7 +121,7 @@ def make_stimulus(bits: list[str], cycles: int, seed: int, hold: dict[str, float
             for b in bits:
                 p = (hold or {}).get(b, 0.15)
                 if b in resets:
-                    p = RESET_RATE if RESET_PULSE else 0.0
+                    p = RESET_RATE if RESET_PULSE and RESET_AT is None else 0.0
                 if rng.random() < p:
                     cur[b] ^= 1
         if 4 <= k < 7 and RESET_PULSE:
@@ -127,6 +130,9 @@ def make_stimulus(bits: list[str], cycles: int, seed: int, hold: dict[str, float
         if k == 7:
             for b in resets:
                 cur[b] = 0
+        if RESET_AT is not None and k >= 7:
+            for b in resets:
+                cur[b] = int(RESET_AT[0] <= k < RESET_AT[0] + RESET_AT[1])
         # A design with no data inputs still gets one placeholder column so
         # every stimulus line is non-empty (VHDL READ rejects empty lines).
         out.append("".join(str(cur[b]) for b in bits) or "0")

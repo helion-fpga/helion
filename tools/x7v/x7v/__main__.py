@@ -41,6 +41,7 @@ def main(argv=None) -> int:
     p.add_argument("--seed", type=int, default=1, help="stimulus seed")
     p.add_argument("--reset-rate", type=float, default=None, help="chance per cycle that a reset input flips (default 0.01)")
     p.add_argument("--no-reset", action="store_true", help="hold reset inputs at 0 for the whole run (proves a power-on reset)")
+    p.add_argument("--reset-at", default=None, metavar="CYCLE[:LEN]", help="no random resets: pulse reset inputs once, at CYCLE for LEN cycles (default 3)")
     p = sub.add_parser("micro"); p.add_argument("files", nargs="+"); p.add_argument("--top", default="top")
     p.add_argument("--cycles", type=int, default=1000); p.add_argument("--workdir", default="/tmp/x7v_micro")
     p.add_argument("--translate-only", action="store_true", help="VHDL: check the emitted SV, not the synthesized netlist")
@@ -112,6 +113,10 @@ def main(argv=None) -> int:
         if a.no_reset:
             from . import cosim
             cosim.RESET_PULSE = False
+        if a.reset_at:
+            from . import cosim
+            start, _, length = a.reset_at.partition(":")
+            cosim.RESET_AT = (int(start), int(length or 3))
         r = verify.verify(db, a.design, a.bit, a.rtl, a.top, a.xdc, a.golden, a.workdir, a.cycles, a.seed)
         print(r.summary())
         return 0 if r.ok else 1
