@@ -55,7 +55,7 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
     // Movable units: slices holding LUTs/FFs but no carry.
     let mut unit_of_site: HashMap<usize, u32> = HashMap::new();
     let mut pos: Vec<usize> = Vec::new();
-    let mut cell_sites: Vec<&str> = out.luts.iter().map(|l| l.site.as_str()).chain(out.ffs.iter().map(|f| f.site.as_str())).collect();
+    let mut cell_sites: Vec<&str> = out.luts.iter().map(|l| l.site.as_str()).chain(out.ffs.iter().map(|f| f.site.as_str())).chain(out.lutrams.iter().map(|r| r.site.as_str())).collect();
     cell_sites.sort();
     cell_sites.dedup();
     for s in cell_sites {
@@ -69,6 +69,14 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
     let n = pos.len();
     if n < 2 {
         return;
+    }
+    // LUT RAM slices move between SLICEM sites only.
+    let slicem = device.slicem_sites();
+    let is_m: Vec<bool> = sites.iter().map(|s| slicem.contains(&s.1)).collect();
+    let lr_sites: HashSet<&str> = out.lutrams.iter().map(|r| r.site.as_str()).collect();
+    let mut need_m = vec![false; n];
+    for (&si, &u) in &unit_of_site {
+        need_m[u as usize] = lr_sites.contains(sites[si].1.as_str());
     }
 
     // Pins per net.
@@ -110,6 +118,15 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
         for net in [Some(&f.d_net), Some(&f.q_net), f.ce_net.as_ref(), f.sr_net.as_ref()].into_iter().flatten() {
             if let Some(p) = locate(site) {
                 pins.entry(net.as_str()).or_default().push(p);
+            }
+        }
+    }
+    let lr_site: HashMap<&str, &str> = out.lutrams.iter().map(|r| (r.name.as_str(), r.site.as_str())).collect();
+    for r in &packed.lutrams {
+        let Some(site) = lr_site.get(r.name.as_str()) else { continue };
+        for net in r.ins.iter().map(|x| x.1.as_str()).chain(r.outs.iter().map(|o| o.1.as_str())) {
+            if let Some(p) = locate(site) {
+                pins.entry(net).or_default().push(p);
             }
         }
     }
@@ -267,6 +284,9 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
             return (0, false);
         }
         let b = occ[to];
+        if (need_m[a] && !is_m[to]) || (b != FREE && need_m[b as usize] && !is_m[from]) {
+            return (0, false);
+        }
         stamp = stamp.wrapping_add(1);
         touched.clear();
         for &ni in &unit_nets[a] {
@@ -361,6 +381,7 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
         .iter()
         .map(|l| l.site.as_str())
         .chain(out.ffs.iter().map(|f| f.site.as_str()))
+        .chain(out.lutrams.iter().map(|r| r.site.as_str()))
         .filter_map(|s| {
             let si = *site_idx.get(s)?;
             let u = *unit_of_site.get(&si)?;
@@ -378,6 +399,12 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
         if let Some((t, s)) = new_site.get(&f.site) {
             f.tile = t.clone();
             f.site = s.clone();
+        }
+    }
+    for r in out.lutrams.iter_mut() {
+        if let Some((t, s)) = new_site.get(&r.site) {
+            r.tile = t.clone();
+            r.site = s.clone();
         }
     }
 }

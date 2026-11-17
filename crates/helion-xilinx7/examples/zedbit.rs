@@ -227,7 +227,7 @@ fn main() {
 /// period cannot be known.
 fn clock_periods(packed: &helion_xilinx7::pack::Packed7, pin_period: u32) -> Result<HashMap<String, u32>, String> {
     let mut periods: HashMap<String, u32> = HashMap::new();
-    let mut doms: Vec<String> = packed.ffs.iter().map(|f| f.clk_net.clone()).collect();
+    let mut doms: Vec<String> = packed.ffs.iter().map(|f| f.clk_net.clone()).chain(packed.lutrams.iter().map(|r| r.clk.clone())).collect();
     doms.sort();
     doms.dedup();
     // Buffer input -> output, and which buffer inputs come from pads.
@@ -332,13 +332,15 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
     let mut packed = be.pack(&design)?;
     let ramb36 = packed.brams.iter().filter(|b| b.kind == helion_xilinx7::pack::BramKind::Ramb36e1).count();
     eprintln!(
-        "zedbit: packed {} LUTs, {} flops, {} carry cells, {} RAMB36 + {} RAMB18, {} DSP48, {} pads; placing",
+        "zedbit: packed {} LUTs, {} flops, {} carry cells, {} RAMB36 + {} RAMB18, {} DSP48, {} LUT RAMs ({} LUT RAM LUTs), {} pads; placing",
         packed.luts.len(),
         packed.ffs.len(),
         packed.carries.len(),
         ramb36,
         packed.brams.len() - ramb36,
         packed.dsps.len(),
+        packed.lutrams.len(),
+        packed.lutrams.iter().map(|r| r.init.iter().flatten().count()).sum::<usize>(),
         packed.iobs.len()
     );
     let mut missing = Vec::new();

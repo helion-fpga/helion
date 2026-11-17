@@ -155,6 +155,10 @@ pub trait DeviceQuery {
     fn all_slices(&self) -> Vec<(String, String, i32, i32)> {
         Vec::new()
     }
+    /// Names of the SLICEM sites (LUT RAM goes only there).
+    fn slicem_sites(&self) -> HashSet<String> {
+        HashSet::new()
+    }
 }
 
 /// A placed LUT: tile + slice site + BEL.
@@ -356,6 +360,7 @@ pub struct Placed7 {
     pub serdes: Vec<PlacedSerdes>,
     pub iodelays: Vec<PlacedIodelay>,
     pub srls: Vec<PlacedSrl>,
+    pub lutrams: Vec<crate::lutram::PlacedLutRam>,
     pub muxfs: Vec<PlacedMuxf>,
     pub gtp_channels: Vec<PlacedGtpChannel>,
     pub gtp_commons: Vec<PlacedGtpCommon>,
@@ -746,6 +751,9 @@ pub fn place_with_pools(
         &mut site_tile,
         &mut out.srls,
     )?;
+
+    // 2f2. LUT RAM, a SLICEM each (refined with the logic below).
+    out.lutrams = crate::lutram::place(packed, device, (ax, ay), &mut used_sites)?;
 
     // 2g. GTPE2_COMMON, GTPE2_CHANNEL, IBUFDS_GTE2, PCIE_2_1, XADC, and CFG_CENTER_MID primitives.
     for (i, gtc) in packed.gtp_commons.iter().enumerate() {

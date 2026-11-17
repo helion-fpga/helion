@@ -204,6 +204,9 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         }
     }
 
+    // 2b. LUT RAM.
+    lines.extend(crate::lutram::fasm(placed, device)?);
+
     // 3. MUXF7 / MUXF8 wide slice multiplexers.
     for muxf in &placed.muxfs {
         let site_rel = device
