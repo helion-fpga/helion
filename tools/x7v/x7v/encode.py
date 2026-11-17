@@ -48,6 +48,20 @@ def _parse_value(v: str) -> int:
     return int(v, 0)
 
 
+def _segbits(seg: dict, name: str):
+    """`name`'s bits; vector indices match whatever zero-padding the database
+    uses (LUT INIT[05], BRAM INIT_00[005], ZINIT_A[5])."""
+    if name in seg:
+        return seg[name]
+    m = _VEC.match(name)
+    if m and m["lo"] is None:
+        for pad in (1, 2, 3):
+            alt = f"{m['name']}[{int(m['hi']):0{pad}d}]"
+            if alt in seg:
+                return seg[alt]
+    return None
+
+
 def encode(db: Db, features: list[str], frame_list: list[int] | None = None) -> dict[int, list[int]]:
     frames: dict[int, list[int]] = {}
     if frame_list is not None:
@@ -73,7 +87,7 @@ def encode(db: Db, features: list[str], frame_list: list[int] | None = None) -> 
                         lookup = site[:-1] + "1" + ("." + rest if rest else "")
             else:
                 ttype, shift, lookup = t["type"], 0, fname
-            seg = db.segbits(ttype, block).get(f"{ttype}.{lookup}")
+            seg = _segbits(db.segbits(ttype, block), f"{ttype}.{lookup}")
             if seg is None:
                 continue
             base = int(bits["baseaddr"], 16)

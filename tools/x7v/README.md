@@ -9,6 +9,7 @@ cd tools/x7v
 python3 -m x7v info      design.bit
 python3 -m x7v decode    design.bit -o design.fasm      # every set bit -> feature
 python3 -m x7v roundtrip design.bit                     # decode -> encode == input?
+python3 -m x7v bram      design.bit                     # every configured block RAM half
 python3 -m x7v extract   design.bit -o netlist.v        # bitstream -> gate netlist
 python3 -m x7v verify    design.bit --design blinky \
     --rtl blinky.vhd --top blinky --xdc blinky.xdc --golden vivado.bit
@@ -90,6 +91,16 @@ tried.
   site); clock buffers (`BUFGCTRL`, `BUFHCE`) are named by in-tile position.
 * `_SING` I/O tiles decode through their tilegrid alias (regular tile type,
   shifted by `start_offset` words, `_Y1` renamed `_Y0` when the offset is 0).
+* Block RAM (`bram.py`): each BRAM tile is two RAMB18 halves (`RAMB18_Y0`,
+  `RAMB18_Y1`), each modelled from its own bits (widths, SDP, write modes,
+  DO_REG, RSTREG priority, INIT_A/B, SRVAL_A/B, INIT_xx/INITP_xx contents,
+  `Z`-features stored inverted) by a behavioural Verilog RAM written from
+  UG473 (`x7v_ramb18`, emitted into the extracted netlist). A RAMB36 is
+  those two halves: the tile wires its RAMB36 pins to them bit-interleaved
+  (`DOADO[2k]` lower half, `DOADO[2k+1]` upper) with a shared address, so
+  the RAMB36 site itself drives nothing. FIFO, ECC, cascade, the RAMB36
+  1-bit mode, per-byte write enables and WRITE_FIRST with unequal read and
+  write widths are reported as extraction errors, not guessed.
 
 ## Validation (what has been proven, and on what)
 
@@ -108,6 +119,15 @@ shift register, up/down counter, pattern FSM, divider client/server.
   `prev_valid`, so the "valid fell -> S0" transition is missing.
 
 Not validated against Vivado (no reference design uses them yet): F7/F8 wide
-muxes (modelled, flagged as a warning), LUTRAM/SRL, block RAM, DSP, MMCM/PLL,
+muxes (modelled, flagged as a warning), LUTRAM/SRL, DSP, MMCM/PLL,
 IDDR/ODDR/SERDES, tristate I/O. The extractor reports these as errors rather
 than guessing.
+
+Block RAM is modelled but has no Vivado (or Helion) reference bitstream yet.
+`tests/bram.py` composes its own: a zedbit-built base design plus one RAMB18
+half placed and routed by the test over the X-Ray graph, re-encoded with
+ECC and CRC. Four designs (x18 ROM with non-zero INIT_A, x18 READ_FIRST
+writes, x9 WRITE_FIRST with DOA_REG, SDP 36) pass verify against plain
+behavioural RTL; one flipped INIT bit and a cleared READ_WIDTH_A_18 each
+fail in cosim. This proves decode, extraction and the model agree with
+UG473 as x7v reads it, not that x7v reads the hardware right.

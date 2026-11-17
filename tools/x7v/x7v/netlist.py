@@ -177,6 +177,10 @@ def _rel_names(db: Db, tile: str, fab: Fabric) -> dict[int, tuple[str, str]]:
             pre = f"IOB_Y{fy}"
         elif st.startswith(("ILOGIC", "OLOGIC", "IDELAY", "ODELAY")):
             pre = f"{s['prefix']}_Y{fy}"
+        elif st in ("FIFO18E1", "RAMB18E1"):
+            pre = f"RAMB18_Y{ry}"
+        elif st == "RAMBFIFO36E1":
+            pre = "RAMB36"
         else:
             # Clock buffers (BUFGCTRL, BUFHCE, ...) are named by their
             # position inside the tile, not by absolute site name.
@@ -269,7 +273,9 @@ class Extractor:
                 if self.fab.site_pin_dir(stype, pin) == "OUT":
                     site_out = True
                     s = self.site_at(tile, si)
-                    if stype == "TIEOFF":
+                    if stype == "RAMBFIFO36E1":
+                        pass  # a RAMB36's outputs are its RAMB18 halves' (bram.py)
+                    elif stype == "TIEOFF":
                         sources.append(("const", 0 if pin == "HARD0" else 1, f"{tile}/{pin}"))
                     else:
                         sources.append(("site", s.name, pin))
@@ -606,7 +612,12 @@ def model_bufhce(x: Extractor, s: Site, nl: Netlist):
     nl.lines.append(f"wire {n('O')} = ({ce}) === 1'b0 ? 1'b0 : {i};")
 
 
+from .bram import VERILOG_MODEL as _BRAM_VERILOG, model_ramb18, model_ramb36  # noqa: E402
+
 MODELS = {
+    "FIFO18E1": model_ramb18,
+    "RAMB18E1": model_ramb18,
+    "RAMBFIFO36E1": model_ramb36,
     "SLICE": model_slice,
     "IOB33": model_iob,
     "ILOGICE3": model_ilogic,
@@ -652,7 +663,7 @@ def to_verilog(nl: Netlist, module: str = "extracted") -> str:
             if m:
                 decls.append(f"wire {m.group(1) or ''}{m.group(2)};")
                 body.append(f"assign {m.group(2)} = {m.group(3)};")
-            elif stmt.startswith("reg "):
+            elif stmt.startswith(("reg ", "wire ")):
                 decls.append(stmt + ";")
             else:
                 body.append(stmt + ";")
@@ -661,4 +672,6 @@ def to_verilog(nl: Netlist, module: str = "extracted") -> str:
     for p in sorted(nl.ports_out):
         out.append(f"assign {p} = {nl.ports_out[p]};")
     out.append("endmodule")
+    if any(l.startswith("x7v_ramb18 ") for l in nl.lines):
+        out.append(_BRAM_VERILOG)
     return "\n".join(out) + "\n"
