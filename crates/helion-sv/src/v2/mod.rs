@@ -11,6 +11,7 @@ pub mod elab;
 pub mod exec;
 pub mod lex;
 pub mod lower;
+pub mod lutram;
 pub mod mem;
 pub mod parse;
 pub mod pre;
