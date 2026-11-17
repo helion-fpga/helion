@@ -225,6 +225,11 @@ pub const CARRY_CI_TO_CO_PS: u32 = 293;
 pub const UNKNOWN_ROUTE_PS: u32 = 1200;
 /// Margin for clock skew/uncertainty and model error.
 pub const MARGIN_PS: u32 = 400;
+/// Block RAM, slow corner from X-Ray's `timings/BRAM_L.sdf`: CLK -> DO
+/// without the output register, and the worst input setup (DI; address,
+/// WE, EN and reset are shorter).
+pub const BRAM_CKO_PS: u32 = 2454;
+pub const BRAM_SETUP_PS: u32 = 737;
 
 /// One step of a timing path.
 #[derive(Clone, Debug)]
@@ -373,6 +378,10 @@ fn check_no_crossings(packed: &crate::pack::Packed7) -> Result<(), String> {
     Ok(())
 }
 
+fn domains_of_ffs_contain(packed: &crate::pack::Packed7, domain: &str) -> bool {
+    packed.ffs.iter().any(|f| f.clk_net == domain)
+}
+
 /// Paths launched by the flops of clock `domain`, timed against `period_ps`.
 fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Analysis, String> {
     let placed = &routed.placed;
@@ -424,6 +433,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         site_of: &HashMap<&'a str, &'a str>,
         lut_letter: &HashMap<&'a str, char>,
         route: &dyn Fn(&str, &str, &str, bool) -> u32,
+        bram_out: &HashMap<&'a str, &'a str>,
     ) -> Result<(u32, Vec<PathStep>), String> {
         if let Some(x) = memo.get(net) {
             return Ok(x.clone());
@@ -431,7 +441,9 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         if depth > 10_000 || !visiting.insert(net.to_string()) {
             return Err(format!("timing: combinational loop through net `{net}`"));
         }
-        let r = if ff_by_q.contains_key(net) {
+        let r = if let Some(b) = bram_out.get(net) {
+            (BRAM_CKO_PS, vec![PathStep { what: format!("{b} (block RAM DO)"), arrival_ps: BRAM_CKO_PS }])
+        } else if ff_by_q.contains_key(net) {
             let f = ff_by_q[net];
             (FF_CKQ_PS, vec![PathStep { what: format!("{} (flop Q, clock {})", f.name, f.clk_net), arrival_ps: FF_CKQ_PS }])
         } else if let Some(l) = lut_by_out.get(net) {
@@ -440,7 +452,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             let mut best = (0u32, Vec::new());
             for (k, inn) in l.input_nets.iter().enumerate() {
                 let Some(inn) = inn else { continue };
-                let (a, p) = arrival(inn, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route)?;
+                let (a, p) = arrival(inn, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out)?;
                 if p.is_empty() {
                     continue; // launched by a pad or constant: unconstrained
                 }
@@ -462,7 +474,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             let mut best = (0u32, Vec::new());
             let upto = j.map(|j| j + 1).unwrap_or(4);
             for s in c.s_nets.iter().take(upto).flatten() {
-                let (a, p) = arrival(s, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route)?;
+                let (a, p) = arrival(s, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out)?;
                 if p.is_empty() {
                     continue;
                 }
@@ -472,7 +484,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
                 }
             }
             if c.cyinit.is_none() && !c.ci_net.is_empty() {
-                let (a, p) = arrival(&c.ci_net, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route)?;
+                let (a, p) = arrival(&c.ci_net, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out)?;
                 let cascade = carry_by_net.get(c.ci_net.as_str()).map(|(_, j)| j.is_none()).unwrap_or(false);
                 let t = a + if cascade { 0 } else { route(&c.ci_net, site, "AX", false) };
                 if !p.is_empty() && (t > best.0 || best.1.is_empty()) {
@@ -495,6 +507,35 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         visiting.remove(net);
         memo.insert(net.to_string(), r.clone());
         Ok(r)
+    }
+    // Block RAM ports: outputs launch paths, inputs end them. A port on
+    // another clock would be a crossing, which is not modelled.
+    let mut bram_out: HashMap<&str, &str> = HashMap::new();
+    let mut bram_in: Vec<(&str, &str, String)> = Vec::new(); // (net, site, site pin)
+    for b in &packed.brams {
+        let Some(pb) = placed.brams.iter().find(|p| p.name == b.name) else { continue };
+        for (pin, net, is_out) in &b.pins {
+            if pin.starts_with("CLK") || pin.starts_with("REGCLK") {
+                continue;
+            }
+            let port_a = pin.starts_with("DOA") || pin.starts_with("DOPA") || pin.starts_with("DIA") || pin.starts_with("DIPA")
+                || pin.starts_with("ADDRA") || pin.starts_with("WEA") || pin.starts_with("ENA") || pin.ends_with("ARSTRAM")
+                || pin.ends_with("ARSTREG") || pin.starts_with("REGCEA");
+            let clk = if port_a { &b.clka_net } else { &b.clkb_net };
+            if clk.as_deref() != Some(domain) {
+                if clk.is_some() && domains_of_ffs_contain(packed, domain) {
+                    return Err(format!("timing: block RAM {} pin {pin} is on clock {:?}, not `{domain}`; crossings are not supported", b.name, clk));
+                }
+                continue;
+            }
+            if *is_out {
+                bram_out.insert(net.as_str(), b.name.as_str());
+            } else {
+                for sp in crate::bram::site_pins(&pb.site, pin)? {
+                    bram_in.push((net.as_str(), pb.site.as_str(), sp));
+                }
+            }
+        }
     }
     let mut visiting = HashSet::new();
     let mut wns = i64::MAX;
@@ -519,7 +560,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             }
         }
         for (net, pin, internal) in inputs {
-            let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route)?;
+            let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &bram_out)?;
             if p.is_empty() {
                 continue; // driven by an input pad or a constant: unconstrained
             }
@@ -534,6 +575,23 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
                 p.push(PathStep { what: format!("{} {pin} (flop input)", ff.name), arrival_ps: t });
                 worst_path = p;
             }
+        }
+    }
+    for (net, site, sp) in &bram_in {
+        let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &bram_out)?;
+        if p.is_empty() {
+            continue;
+        }
+        let t = a + route(net, site, sp, false);
+        endpoints += 1;
+        let slack = period_ps as i64 - BRAM_SETUP_PS as i64 - MARGIN_PS as i64 - t as i64;
+        if slack < 0 {
+            failing += 1;
+        }
+        if slack < wns {
+            wns = slack;
+            p.push(PathStep { what: format!("{site}.{sp} (block RAM input)"), arrival_ps: t });
+            worst_path = p;
         }
     }
     if endpoints == 0 {
