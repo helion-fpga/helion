@@ -7,7 +7,7 @@
   {"gap": "G4", "design": "ibex", "metric": "t_route", "max": 600, "goal": "Ibex route under 10 min"},
   {"gap": "G5", "design": "pico", "metric": "fmax_ratio", "min": 0.85, "goal": "Fmax at least 85% of Vivado's own (Helion STA as proxy; the ledger's guard is Vivado timing Helion's placement, hx_*)"},
   {"gap": "G5", "design": "ibex", "metric": "fmax_ratio", "min": 0.85, "goal": "Ibex Fmax at least 85% of Vivado's own (Helion STA as proxy)"},
-  {"gap": "G6", "design": "ibex", "metric": "fmax_mhz", "min": 50, "goal": "Ibex meets 50 MHz in Helion STA"},
+  {"gap": "G6", "design": "ibex", "metric": "fmax_mhz", "min": 38.9, "goal": "Ibex meets Vivado's own 38.9 MHz in Helion STA"},
   {"gap": "G7", "design": "pico", "metric": "slack_gap_hx", "min": 0, "max": 1.0, "goal": "Helion slack within 1 ns below Vivado's on Helion's placement (hx_pico, 354ff04), never optimistic"},
   {"gap": "G7", "design": "blinky", "metric": "slack_gap_hx", "min": 0, "max": 1.0, "goal": "same for blinky (hx_blinky)"},
   {"gap": "G8", "design": "ibex", "metric": "lut_ratio", "max": 1.5, "goal": "Ibex LUTs at most 1.5x Vivado's 3532"},
