@@ -22755,6 +22755,28 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
     if let Some(sig) = flatten_leftover_signal(&rtl_owned) {
         note_flatten_cap(&rtl_owned.module, &sig);
         d.attrs.set("FLATTEN_CAP", "1");
+        // A capped module still gets its multipliers.
+        //
+        // The cap refuses the *bit-blast* of one leftover cone. Multiplier
+        // emission is not part of that bit-blast: `is_mac_rhs` classifies an
+        // NBA's right-hand side and `emit_mac27` writes a Dsp48e1 straight into
+        // `d`, with no cone walked. Returning before it meant every `*` in a
+        // capped module stayed a LUT multiplier — the 96x-LUT path behind
+        // G3/D1. Emitting here is the same call, same order, as the loop below
+        // makes for every other module; only the leftover cone stays unblasted.
+        let mut n_mac = 0usize;
+        for (lhs, _bit, rhs) in &rtl_owned.nbas {
+            if sig_depth(&rtl_owned, lhs) > 0 {
+                continue;
+            }
+            if is_mac_rhs(rhs) {
+                emit_mac27(&mut d, format!("u_mac{n_mac}"), rhs, lhs, true);
+                n_mac += 1;
+            }
+        }
+        if n_mac > 0 {
+            d.attrs.set("DSP_BEFORE_FLATTEN_CAP", &n_mac.to_string());
+        }
         return Ok(d);
     }
 
