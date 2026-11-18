@@ -2264,6 +2264,64 @@ mod tests {
     /// Fake column rule mirrors the device: X1 of the same tile after X0,
     /// X0 of the next row after X1; taken neighbor yields None.
     #[test]
+    /// G55: the cascade neighbour rule, checked on the real `xc7z020` grid
+    /// rather than a fake one.
+    ///
+    /// `slice_above` is "X1 of the same tile after X0, else X0 of the name-Y
+    /// above": X0 -> X1 within a tile, then X1 -> X0 of the next tile up. The
+    /// router accepts both that column form and the paired (same-tile) form.
+    /// What this pins is that the neighbour a legacy chain asks for always
+    /// exists on a real part and always walks one column without repeating a
+    /// site or leaving the grid - a chain that crosses into the next column
+    /// would not cascade in silicon at all. Whether the paired form is legal
+    /// is a bitstream question (needs the board, R9); if it turns out not to
+    /// be, the fix belongs in route.rs, not here, so this guard must keep
+    /// asserting the column rule.
+    #[test]
+    fn real_slice_above_walks_one_column() {
+        use crate::device::{default_db_root, Device};
+        use crate::xdevice::{build_node_map, XDevice};
+
+        let db_root = default_db_root();
+        let mut device = Device::load_xc7z020(&db_root).expect("load xc7z020");
+        let maps = build_node_map(&mut device);
+        let xdev = XDevice::new(&device, maps);
+        let used = HashSet::new();
+
+        // Start from an X0 in the middle of the die and walk 8 links up.
+        let mut site = "SLICE_X71Y44".to_string();
+        let mut seen: Vec<String> = vec![site.clone()];
+        for step in 0..8 {
+            let (tile, next) = xdev
+                .slice_above(&site, &used)
+                .unwrap_or_else(|| panic!("no neighbour above {site} at step {step}"));
+            assert!(!seen.contains(&next), "column walk revisited {next}");
+            // The rule is X0 -> X1 within a tile, then X1 -> X0 of the tile
+            // above, so X alternates within the CLB column and Y only moves
+            // on the X1 -> X0 step. Asserting "same X" would be wrong: the
+            // two halves of a CLB have different X names.
+            let (sx, sy) = crate::place::parse_site_xy(&site).unwrap();
+            let (nx, ny) = crate::place::parse_site_xy(&next).unwrap();
+            let (want_x, want_y) = if sx % 2 == 0 { (sx + 1, sy) } else { (sx - 1, sy + 1) };
+            assert_eq!((nx, ny), (want_x, want_y), "wrong neighbour: {site} -> {next}");
+            // Never a step down, and never more than one row: the chain only
+            // ever climbs.
+            assert!(ny >= sy, "cascade went down: {site} -> {next}");
+            assert!(ny - sy <= 1, "cascade skipped a row: {site} -> {next}");
+            // The neighbour is a real site, and in the CLB tile we reported.
+            assert!(
+                device.slices().iter().any(|(_, s)| s == &next),
+                "{next} is not a slice on the part"
+            );
+            assert!(
+                device.slices().iter().any(|(t, s)| s == &next && t == &tile),
+                "{next} is not in the tile we reported ({tile})"
+            );
+            seen.push(next.clone());
+            site = next;
+        }
+    }
+
     fn fake_slice_above_follows_column_rule() {
         let dev = FakeDevice;
         let used = HashSet::new();
