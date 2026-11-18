@@ -604,7 +604,11 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
     let mut total: i64 = cost.iter().sum();
     let initial = total;
 
-    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    // `HELION_PLACE_SEED=n` starts the anneal from another random stream, for
+    // a seed sweep on a design that misses timing by a little (the default
+    // stream stays fixed, so a build without it is reproducible).
+    let seed = std::env::var("HELION_PLACE_SEED").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed.wrapping_mul(0xD6E8_FEB8_6659_FD93));
     let max_rx = cols.len() as i32;
     let (ymin, ymax) = sites.iter().fold((i32::MAX, i32::MIN), |(a, b), s| (a.min(s.3), b.max(s.3)));
     let max_ry = ymax - ymin + 1;
