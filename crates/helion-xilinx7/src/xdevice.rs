@@ -361,7 +361,8 @@ impl<'a> XDevice<'a> {
                     c = c.saturating_add(PRESENT_PS);
                 }
             }
-            c
+            // A critical net pays down to a fifth of the congestion price.
+            (c as u64 * (320 - opts.crit as u64) / 320) as u32
         };
         let is_target = |id: u32| targets.contains(&id);
         // A dead-end wire is worth visiting only on the way into a target:

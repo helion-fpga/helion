@@ -43,6 +43,10 @@ pub struct RouteOpts {
     /// Give up rather than accept a path much longer than the direct one
     /// (the caller then negotiates for a better one).
     pub cap_detour: bool,
+    /// Timing criticality of the net, 0..=255 (255: on the estimated critical
+    /// path). A critical net pays less for congested wires, so it keeps a
+    /// short route and the less critical net moves (G71).
+    pub crit: u8,
 }
 
 /// What the router needs from the device model.
@@ -214,7 +218,28 @@ fn is_const_net(net: &str) -> bool {
 }
 
 /// Route all nets in the placed design.
+thread_local! {
+    /// Per-net criticality (0..=255) of the placement being routed, set by
+    /// [`route`]; read where a net's search options are built.
+    static NET_CRIT: std::cell::RefCell<HashMap<String, u8>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Criticality as the router uses it: only nets close to the critical path
+/// get relief (the cube; 8 left Ibex at 38.1 MHz, 3 gives 40.7), so most nets still negotiate at full price. `HELION_ROUTE_CRIT_EXP` overrides the power.
+/// `HELION_ROUTE_NO_TIMING` turns it off.
+fn route_crit(c: f32) -> u8 {
+    let exp = std::env::var("HELION_ROUTE_CRIT_EXP").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    (c.clamp(0.0, 1.0).powi(exp) * 255.0) as u8
+}
+
 pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, String> {
+    NET_CRIT.with(|m| {
+        let mut m = m.borrow_mut();
+        m.clear();
+        if std::env::var("HELION_ROUTE_NO_TIMING").is_err() {
+            m.extend(placed.net_crit.iter().map(|(n, &c)| (n.clone(), route_crit(c))));
+        }
+    });
     let packed = &placed.packed;
     let mut net_eps: HashMap<String, Vec<Endpoint>> = HashMap::new();
     let mut add_ep = |net: String, site: String, pin: &str, is_driver: bool| {
@@ -1274,7 +1299,8 @@ fn route_net(
         // bypass pin (G35). Keying on the pin name alone would not catch it:
         // `D0` is a DSP data bit, not a slice `D` input.
         let allow_byp = is_bypass_pin(&load.pin) || is_dsp_site(&load.site);
-        let opts = RouteOpts { allow_power, allow_byp, ..Default::default() };
+        let crit = NET_CRIT.with(|m| m.borrow().get(net).copied().unwrap_or(0));
+        let opts = RouteOpts { allow_power, allow_byp, crit, ..Default::default() };
         // A BUFG or CMT clock input takes the dedicated clock path
         // (clock-capable pad or CMT -> HCLK_CMT/HROW -> BUFG, CMT feedback)
         // when one exists, else general interconnect.
