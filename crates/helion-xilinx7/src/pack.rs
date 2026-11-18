@@ -3645,6 +3645,52 @@ mod tests {
         assert_eq!(p.brams[19].pins[1].1, "a", "clock pins stay put");
     }
 
+    /// G48 guard: replication really does grow `ffs`, which is why a utilization
+    /// count taken from the *pre-placement* `Packed7` understates the
+    /// bitstream. `zedbit`'s summary line read `packed.ffs.len()` and reported
+    /// 864 flops for bram_fill while `x7v extract` found 1,524 flop regs in the
+    /// same `.bit`; both numbers are right about different designs. If
+    /// replication ever stops adding flops, the summary would be honest by
+    /// accident and this test says so, because the reason for reading
+    /// `routed.placed.packed` in zedbit.rs would be gone.
+    #[test]
+    fn replication_adds_flops_so_utilization_must_come_from_the_placed_design() {
+        let ff = |name: &str, d: &str, q: &str| PackedFf {
+            name: name.into(), d_net: d.into(), q_net: q.into(), clk_net: "clk".into(),
+            ce_net: None, sr_net: None, init: false, srval: false, sr_async: false,
+        };
+        let mut p = Packed7::default();
+        p.ffs.push(ff("a_reg", "a_d", "a"));
+        let before = p.ffs.len();
+        // Three separate groups, one per column, each a full group of
+        // `hard_group_size` block RAMs -- more than WIDE_GROUPS (2), which is
+        // the fanout at which a driver is worth copying.
+        let gs = hard_group_size(false) as i32;
+        let xy = |name: &str| name[3..].parse::<i32>().ok().map(|i| (i / gs, i % gs));
+        for i in 0..(3 * gs) {
+            p.brams.push(PackedBram {
+                name: format!("ram{i}"),
+                pins: vec![("ADDRARDADDR4".into(), "a".into(), false)],
+                ..Default::default()
+            });
+        }
+        replicate_hard_block_drivers(&mut p, &xy);
+        assert!(
+            p.ffs.len() > before,
+            "replication must add flops: pre-placement {}, after {}",
+            before,
+            p.ffs.len()
+        );
+        // Every copy keeps the original's D net, so they are real flops in the
+        // bitstream and not an alias of one.
+        assert!(p.ffs.iter().all(|f| f.d_net == "a_d"));
+        assert_eq!(
+            p.ffs.iter().map(|f| f.q_net.clone()).collect::<std::collections::HashSet<_>>().len(),
+            p.ffs.len(),
+            "each copy drives its own net"
+        );
+    }
+
     #[test]
     fn dsp48e1_instance_registers_default_to_xilinx() {
         let mut d = Design::new("dsp");
