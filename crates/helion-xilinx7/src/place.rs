@@ -1951,6 +1951,17 @@ mod tests {
     use super::*;
     use crate::pack::{PackedBufg, PackedCarry, PackedDsp, PackedFf, PackedIob, PackedLut};
 
+    /// G47: two flops on one slice position must be refused, with both names.
+    #[test]
+    fn two_cells_on_one_slice_position_are_refused() {
+        let ff = |name: &str, bel: &str| PlacedFf { name: name.into(), tile: "CLBLM_L_X26Y32".into(), site: "SLICE_X37Y32".into(), bel: bel.into() };
+        let mut out = Placed7 { ffs: vec![ff("lfsr_31_reg", "DFF"), ff("por_reg_rep13", "CFF")], ..Default::default() };
+        assert!(check_one_cell_per_bel(&out).is_ok());
+        out.ffs[1].bel = "DFF".into();
+        let err = check_one_cell_per_bel(&out).unwrap_err();
+        assert!(err.contains("lfsr_31_reg") && err.contains("por_reg_rep13") && err.contains("SLICE_X37Y32.DFF"), "got: {err}");
+    }
+
     struct FakeDevice;
     impl DeviceQuery for FakeDevice {
         fn iob_site_for_pin(&self, pin: &str) -> Option<(String, String)> {
