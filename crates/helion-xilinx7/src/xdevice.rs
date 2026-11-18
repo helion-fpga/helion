@@ -68,6 +68,10 @@ pub struct XDevice<'a> {
     /// PathFinder phase: nets on each wire's node (per wire id), and the
     /// cost each of them adds to taking it.
     pf: std::cell::RefCell<Option<(Vec<u16>, u32)>>,
+    /// Signal nets on `BYP_ALT*` (the bounce into the same tile's inputs):
+    /// `None` keeps them off everywhere; `Some(closed)` opens them except in
+    /// the INT tiles listed (see `RouteQuery::open_bypass_bounce`).
+    byp_closed: std::cell::RefCell<Option<HashSet<usize>>>,
     /// Per search, by node: whether a dead-end node leads into the target
     /// (stamp of the search that computed it, and the answer).
     approach: std::cell::RefCell<(Vec<u32>, Vec<u8>)>,
@@ -108,6 +112,7 @@ impl<'a> XDevice<'a> {
         Self {
             device,
             clock_nets: HashSet::new(),
+            byp_closed: std::cell::RefCell::new(None),
             wire_to_node,
             node_members,
             node_off,
@@ -319,6 +324,7 @@ impl<'a> XDevice<'a> {
         // Clock nets keep their wires: they are never displaced.
         let locked: Vec<u32> = self.clock_nets.iter().filter_map(|c| own.1.get(c).copied()).collect();
         let flags = self.wire_flags();
+        let byp_closed = self.byp_closed.borrow();
         let allowed = |id: u32| -> bool {
             let f = flags[id as usize];
             if !allow_power && f & 1 != 0 {
@@ -332,7 +338,10 @@ impl<'a> XDevice<'a> {
                 return false;
             }
             if !allow_power && !allow_byp && f & 2 != 0 {
-                return false;
+                match byp_closed.as_ref() {
+                    Some(closed) if !closed.contains(&self.wire_to_tile[id as usize].0) => {}
+                    _ => return false,
+                }
             }
             if no_int && f & 8 != 0 {
                 return false;
@@ -1146,6 +1155,10 @@ impl<'a> RouteQuery for XDevice<'a> {
 
     fn wire_for_site_pin(&self, site: &str, pin: &str) -> Vec<(String, String)> {
         self.site_pin_wire(site, pin).into_iter().collect()
+    }
+
+    fn open_bypass_bounce(&self, closed_int_tiles: &[String]) {
+        *self.byp_closed.borrow_mut() = Some(closed_int_tiles.iter().filter_map(|t| self.tile_idx(t)).collect());
     }
 
     fn is_clock_net(&self, net: &str) -> bool {
