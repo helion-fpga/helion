@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use helion_ir::{resolve, CellKind, Design, Spur};
 
-use super::crossings::{bus_stem, driver_infos, CdcClass, CdcCrossing, CrossingSource, RawCrossing};
+use super::crossings::{bus_stem, driver_infos, driver_infos_indexed, CdcClass, CdcCrossing, CrossingSource, RawCrossing};
 use super::domains::{DomainKind, DomainMap};
 use super::synchronizers::{
     d_fanin_cells, mux_select_hazard, q_cone_hits_bram, q_fwd_cone, sync_chain, SyncChain,
@@ -414,6 +414,8 @@ pub fn classify_crossings(
     // cannot classify crossings into them: visible but unclassifiable, an
     // honest limitation. Aggregated per cell to avoid one record per bus bit.
     let mut bb_feeds: HashMap<Spur, (Vec<Spur>, Vec<String>)> = HashMap::new();
+    // Built once for the loop below; see `driver_infos_indexed` (G23).
+    let pins = design.pin_index();
     for net in &design.nets {
         let mut bb_cells: Vec<Spur> = Vec::new();
         for e in &net.endpoints {
@@ -432,7 +434,7 @@ pub fn classify_crossings(
             continue;
         }
         let mut from_names: Vec<String> = Vec::new();
-        for di in driver_infos(design, domains, resolve(net.name)) {
+        for di in driver_infos_indexed(design, domains, resolve(net.name), &pins) {
             if let CrossingSource::Domain(d) = di.source {
                 if domains.domains[d].kind != DomainKind::Unknown {
                     from_names.push(domain_name(domains, d).to_string());

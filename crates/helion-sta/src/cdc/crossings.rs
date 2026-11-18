@@ -165,6 +165,23 @@ pub struct DriverInfo {
 /// (cycle-safe), stopping at `Hff` `Q` boundaries. Nets with no `Q`/`O`
 /// driver whose name matches a top-level input port are `PortInput` drivers.
 pub fn driver_infos(design: &Design, domains: &DomainMap, net: &str) -> Vec<DriverInfo> {
+    driver_infos_indexed(design, domains, net, &design.pin_index())
+}
+
+/// [`driver_infos`] with a caller-owned pin index, for a loop that walks many
+/// nets (HELION_GAPS G23).
+///
+/// `driver_infos` used to probe each LUT input with `Design::net_on`, which
+/// falls back to a linear scan of every net whenever the pin is not indexed --
+/// and the v2 front end never calls `rebuild_indexes`, so *every* probe was a
+/// scan. Walking Ibex (2,246 flops, 9,490 nets, a 4,096-node cap per cone)
+/// took 14 s that way; with the index it is a hash lookup per pin.
+pub fn driver_infos_indexed(
+    design: &Design,
+    domains: &DomainMap,
+    net: &str,
+    pins: &helion_ir::PinIndex,
+) -> Vec<DriverInfo> {
     use std::collections::HashMap;
     let input_ports: HashSet<&str> = design
         .ports
@@ -203,7 +220,7 @@ pub fn driver_infos(design: &Design, domains: &DomainMap, net: &str) -> Vec<Driv
                 (helion_ir::CellKind::Lut6 { .. }, "O") => {
                     saw_driver = true;
                     for p in ["I0", "I1", "I2", "I3", "I4", "I5"] {
-                        if let Some(pn) = design.net_on(e.cell, intern(p)) {
+                        if let Some(pn) = pins.net_on(resolve(e.cell), p) {
                             stack.push(resolve(pn).to_string());
                         }
                     }
@@ -257,6 +274,9 @@ pub fn find_crossings(design: &Design, domains: &DomainMap) -> Vec<RawCrossing> 
     let mut out = Vec::new();
     let mut info_cache: std::collections::HashMap<helion_ir::Spur, Vec<DriverInfo>> =
         std::collections::HashMap::new();
+    // One pin index for the whole report (G23): without it each LUT-input
+    // probe below is a linear scan of every net.
+    let pins = design.pin_index();
     let pin_d = intern("D");
     for cell in &design.cells {
         if !matches!(cell.kind, helion_ir::CellKind::Hff) {
@@ -272,7 +292,7 @@ pub fn find_crossings(design: &Design, domains: &DomainMap) -> Vec<RawCrossing> 
         let d_net_str = resolve(d_net);
         let infos = info_cache
             .entry(d_net)
-            .or_insert_with(|| driver_infos(design, domains, d_net_str));
+            .or_insert_with(|| driver_infos_indexed(design, domains, d_net_str, &pins));
         for di in infos {
             match di.source {
                 CrossingSource::PortInput => out.push(RawCrossing {
@@ -306,7 +326,88 @@ pub fn find_crossings(design: &Design, domains: &DomainMap) -> Vec<RawCrossing> 
 }
 #[cfg(test)]
 mod tests {
-    use super::bus_stem;
+    use super::{bus_stem, driver_infos, driver_infos_indexed};
+    use crate::CdcSeverity;
+
+    /// G23 guard. The cone walk used `Design::net_on`, which falls back to a
+    /// linear scan of every net when the pin is not indexed -- and the v2 front
+    /// end never calls `rebuild_indexes`, so on a real netlist every LUT-input
+    /// probe scanned the whole netlist. On Ibex that made `find_crossings` take
+    /// 14 s; with `PinIndex` it takes 1.5 s.
+    ///
+    /// A wall-clock assertion would be flaky on a loaded machine, so this pins
+    /// the thing that actually regressed: the walk must find the same drivers
+    /// through the index as without it, on a design big enough that the two
+    /// paths differ, and the indexed walk must be the one `find_crossings`
+    /// uses. The scale half keeps a real cone walk honest: 200 flops each
+    /// behind a shared LUT fanout, which is the shape that made the scan
+    /// quadratic.
+    #[test]
+    fn cone_walk_uses_the_pin_index_and_agrees_with_it() {
+        use helion_ir::{intern, CellKind, Design};
+        // A chain of LUTs feeding 200 flops, all from one input port.
+        let mut d = Design::new("walk");
+        d.add_port("i", helion_ir::PortDir::In);
+        d.add_cell("l0", CellKind::Lut6 { init: 0x55 });
+        d.connect("i", "l0", "I0");
+        // Cell names and net names are separate: the output net of cell `lk`
+        // is `o{k}`, and the next cell's I0 reads it.
+        d.connect("o0", "l0", "O");
+        let mut prev = "o0".to_string();
+        for k in 1..8 {
+            let c = format!("l{k}");
+            let o = format!("o{k}");
+            d.add_cell(&c, CellKind::Lut6 { init: 0x55 });
+            d.connect(&prev, &c, "I0");
+            d.connect(&o, &c, "O");
+            prev = o;
+        }
+        for k in 0..200 {
+            let c = format!("ff{k}");
+            d.add_cell(&c, CellKind::Hff);
+            d.connect(&prev, &c, "D");
+            d.connect("clk", &c, "C");
+            d.add_port(&format!("q{k}"), helion_ir::PortDir::Out);
+            d.connect(&format!("q{k}"), &c, "Q");
+        }
+        let xdc = crate::Constraints::default();
+        let domains = crate::extract_domains(&d, &[], &xdc);
+        let pins = d.pin_index();
+        // Every LUT input the walk needs must be resolvable through the index;
+        // if a probe is not, the walk silently takes the linear-scan path.
+        for c in result_cells(&d) {
+            for p in ["I0", "I1", "I2", "I3", "I4", "I5"] {
+                assert_eq!(
+                    pins.net_on(&c, p).map(helion_ir::resolve),
+                    d.net_on(intern(&c), intern(p)).map(helion_ir::resolve),
+                    "PinIndex disagrees with net_on for {c}.{p}"
+                );
+            }
+        }
+        // Walk a net the LUT chain *reads*: that is the direction the cone walk
+        // goes, transitively through `Lut6` O -> I pins. Every one of the 200
+        // flops sits behind the same `l7`, so the cone from one flop's D pin
+        // crosses the whole chain -- the fanout shape that made the scan
+        // quadratic.
+        let fast = driver_infos_indexed(&d, &domains, "o7", &pins);
+        let slow = driver_infos(&d, &domains, "o7");
+        assert_eq!(
+            fast.len(),
+            slow.len(),
+            "indexed and plain cone walks disagree on driver count for o7"
+        );
+        // `i` is a top-level input with no Q/O driver, so it must surface as a
+        // PortInput driver: proof the walk actually traversed the chain.
+        assert!(
+            matches!(fast.first().map(|d| d.source), Some(super::CrossingSource::PortInput)),
+            "walking o7 did not reach the input port: got {:?}",
+            fast.iter().map(|d| d.source).collect::<Vec<_>>()
+        );
+    }
+
+    fn result_cells(d: &helion_ir::Design) -> Vec<String> {
+        d.cells.iter().map(|c| helion_ir::resolve(c.name).to_string()).collect()
+    }
 
     #[test]
     fn bus_stem_shapes() {
