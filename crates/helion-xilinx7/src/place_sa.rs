@@ -1147,13 +1147,34 @@ mod tests {
         );
     }
 
+    /// A DSP (or block RAM) output launches a path and an input ends one, at
+    /// the block's tile; a block the placer has no place for is left out.
+    #[test]
+    fn hard_block_pins_are_timing_sources_and_endpoints() {
+        let mut p = Placed7::default();
+        p.packed.dsps.push(crate::pack::PackedDsp {
+            name: "u_mac".into(),
+            pins: vec![("A0".into(), "a".into(), false), ("P0".into(), "p".into(), true)],
+            ..Default::default()
+        });
+        let none = HashMap::new();
+        let g = timing_graph(&p, &none, &HashMap::new(), &HashMap::new(), &HashSet::new(), &HashMap::new()).unwrap();
+        assert!(g.hard_q.is_empty() && g.ends.is_empty());
+        let at = HashMap::from([("u_mac", (147, 155))]);
+        let g = timing_graph(&p, &none, &HashMap::new(), &HashMap::new(), &HashSet::new(), &at).unwrap();
+        assert_eq!(g.hard_q.len(), 1, "P0 launches");
+        assert_eq!(g.ends.len(), 1, "A0 captures");
+        assert!(matches!(g.ends[0].1, Loc::At(147, 155)));
+        assert!(matches!(g.drv[g.hard_q[0].0 as usize], Some(Loc::At(147, 155))));
+    }
+
     #[test]
     fn flop_ce_and_sync_sr_are_timing_endpoints() {
         let mut p = Placed7::default();
         p.packed.ffs.push(PackedFf { name: "f".into(), d_net: "d".into(), q_net: "q".into(), clk_net: "clk".into(), ce_net: Some("en".into()), sr_net: Some("rst".into()), init: false, srval: false, sr_async: false });
         p.ffs.push(PlacedFf { name: "f".into(), tile: "CLB_X1Y1".into(), site: "SLICE_X1Y1".into(), bel: "AFF".into() });
         let site_idx = HashMap::from([("SLICE_X1Y1", 0usize)]);
-        let ends = |p: &Placed7| timing_graph(p, &site_idx, &HashMap::new(), &HashMap::new(), &HashSet::new()).unwrap().ends.len();
+        let ends = |p: &Placed7| timing_graph(p, &site_idx, &HashMap::new(), &HashMap::new(), &HashSet::new(), &HashMap::new()).unwrap().ends.len();
         assert_eq!(ends(&p), 3, "D, CE and SR");
         p.packed.ffs[0].sr_async = true;
         assert_eq!(ends(&p), 2, "an asynchronous reset has no setup check");
