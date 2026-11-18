@@ -608,18 +608,27 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
     // lines above with regexes and could silently record `null` for a number
     // when the wording changed; this line is the contract it reads instead.
     // Keep the keys in step with `COUNTS`/`TIMES` in tools/qor/run.py.
-    let ramb18 = packed.brams.len() - ramb36;
+    //
+    // The counts come from the *placed* design, not from `packed` (G48).
+    // Placement replicates a driver shared by many block RAMs/DSPs once per
+    // group (`replicate_hard_block_drivers`), so the bitstream holds those
+    // copies while `packed` never saw them: bram_fill read 864 flops here
+    // while x7v extracted 1,524 from the same `.bit`. The "packed ..." line
+    // above still reports `packed`, because that is genuinely the pre-
+    // placement count and it is printed before placement runs.
+    let built = &routed.placed.packed;
+    let ramb36 = built.brams.iter().filter(|b| b.kind == helion_xilinx7::pack::BramKind::Ramb36e1).count();
     println!(
         "zedbit: summary {}",
         json_object(&[
-            ("lut", packed.luts.len() as f64),
-            ("ff", packed.ffs.len() as f64),
-            ("carry", packed.carries.len() as f64),
+            ("lut", built.luts.len() as f64),
+            ("ff", built.ffs.len() as f64),
+            ("carry", built.carries.len() as f64),
             ("ramb36", ramb36 as f64),
-            ("ramb18", ramb18 as f64),
-            ("dsp", packed.dsps.len() as f64),
-            ("lutram", packed.lutrams.len() as f64),
-            ("pad", packed.iobs.len() as f64),
+            ("ramb18", (built.brams.len() - ramb36) as f64),
+            ("dsp", built.dsps.len() as f64),
+            ("lutram", built.lutrams.len() as f64),
+            ("pad", built.iobs.len() as f64),
             ("lut_levels", LUT_LEVELS.load(std::sync::atomic::Ordering::Relaxed) as f64),
             ("t_synth", t_synth.as_secs_f64()),
             ("t_device", (t_dev - t_synth).as_secs_f64()),
