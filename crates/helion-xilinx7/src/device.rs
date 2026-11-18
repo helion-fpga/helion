@@ -584,6 +584,27 @@ impl Device {
     }
 
     /// Decide, for every pip, whether the router may use it (see
+    /// A DSP tile's `DSP_BYP*`/`DSP_FAN*` -> site-pin pip (G35).
+    ///
+    /// In `tile_type_DSP_R.json` a DSP input other than `A` has exactly one
+    /// non-constant source, e.g. `DSP_BYP7_0 -> DSP_0_D0` or
+    /// `DSP_FAN0_1 -> DSP_0_CED`, and that pip carries no segbit and has no
+    /// `ppips` entry, so [`Self::mark_usable_pips`] marked it unusable and the
+    /// router's dead-end pass pruned the whole branch: the `A` input worked
+    /// (its `DSP_IMUX23_0 -> DSP_0_A0` is listed `always` in `ppips_dsp_l.db`)
+    /// while `B`/`C`/`D` and every control pin were unreachable.
+    ///
+    /// The connection is fixed in silicon: the `DSP_BYP`/`DSP_FAN` wire is
+    /// wired straight to the site input, so it needs no configuration and is
+    /// usable exactly like the `always` ppips. Only pips that end on a DSP site
+    /// pin are matched; the wires themselves still have to be reached over the
+    /// `tileconn` stitch from `INT_INTERFACE_*`, which is modelled.
+    fn dsp_bitless_input_pip(tile_type: &str, dst_wire: &str, src_wire: &str) -> bool {
+        (tile_type.starts_with("DSP_L") || tile_type.starts_with("DSP_R"))
+            && dst_wire.starts_with("DSP_")
+            && (src_wire.starts_with("DSP_BYP") || src_wire.starts_with("DSP_FAN"))
+    }
+
     /// [`Pip::usable`]). `_SING` tile types share their base type's bits.
     fn mark_usable_pips(&mut self) {
         use crate::db::parse::PpipKind;
@@ -606,6 +627,7 @@ impl Device {
                     None => {
                         p.is_pseudo
                             || td.segbits.is_empty()
+                            || Self::dsp_bitless_input_pip(&name, d, s)
                             || td.segbits.contains_key(&key)
                             || match (&base, base_id) {
                                 (Some(b), Some(bid)) => {

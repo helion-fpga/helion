@@ -1089,6 +1089,13 @@ fn is_bypass_pin(pin: &str) -> bool {
     matches!(pin, "AX" | "BX" | "CX" | "DX")
 }
 
+/// A DSP48E1 site (`DSP48_X0Y0`, ...): its non-`A` inputs are fed from
+/// `DSP_BYP*`/`DSP_FAN*` wires, which are reached through the INT tile's
+/// `BYP_ALT`/`FAN_ALT` muxes.
+fn is_dsp_site(site: &str) -> bool {
+    site.starts_with("DSP48")
+}
+
 /// Slice LUT input pins (`A1`-`A6` through `D1`-`D6`): loads here
 /// always route through fabric, never site-internal.
 fn is_lut_input_pin(pin: &str) -> bool {
@@ -1209,7 +1216,11 @@ fn route_net(
                 load.site, load.pin
             ));
         }
-        let allow_byp = is_bypass_pin(&load.pin);
+        // A DSP48E1 input reached over `DSP_BYP*` also comes in through an
+        // INT tile `BYP_ALT` mux, so it needs the same exemption as a slice
+        // bypass pin (G35). Keying on the pin name alone would not catch it:
+        // `D0` is a DSP data bit, not a slice `D` input.
+        let allow_byp = is_bypass_pin(&load.pin) || is_dsp_site(&load.site);
         let opts = RouteOpts { allow_power, allow_byp, ..Default::default() };
         // A BUFG or CMT clock input takes the dedicated clock path
         // (clock-capable pad or CMT -> HCLK_CMT/HROW -> BUFG, CMT feedback)
