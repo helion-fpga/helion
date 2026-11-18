@@ -21,6 +21,14 @@ pub(crate) fn parse_slice_xy(site: &str) -> Option<(i32, i32)> {
     Some((xs.parse().ok()?, ys.parse().ok()?))
 }
 
+/// The group id of a replicated hard-block driver copy, from its `_rep{g}`
+/// suffix written by `pack::replicate_hard_block_drivers`. `None` for any
+/// other cell. Used to place a copy near the RAMs/DSPs its group feeds (G60).
+pub(crate) fn rep_group(name: &str) -> Option<usize> {
+    let (_, g) = name.rsplit_once("_rep")?;
+    g.parse().ok()
+}
+
 /// Precomputed routing node maps, built once per [`Device`] by
 /// [`build_node_map`] and shared (cloned) across flow stages.
 ///

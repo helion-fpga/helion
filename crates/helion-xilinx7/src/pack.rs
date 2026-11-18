@@ -640,6 +640,10 @@ pub struct Packed7 {
     /// Cells placed in a slice of their own: copies of a flop shared by
     /// many block RAMs or DSPs, each to sit by its own group.
     pub lone_cells: HashSet<String>,
+    /// For each replicated-driver group id `g` (the `_rep{g}` suffix), the
+    /// names of the RAMs/DSPs that group serves. Placement uses it to put a
+    /// copy next to its blocks (G60).
+    pub copy_groups: std::collections::BTreeMap<usize, Vec<String>>,
     pub luts: Vec<PackedLut>,
     pub ffs: Vec<PackedFf>,
     pub iobs: Vec<PackedIob>,
@@ -3360,6 +3364,13 @@ pub(crate) fn replicate_hard_block_drivers(packed: &mut Packed7, site_xy: &dyn F
             packed.lone_cells.insert(c.name.clone());
             packed.luts.push(c);
         }
+    }
+
+    // Record which hard blocks each copy group serves, so placement can put a
+    // copy near its blocks (G60) without recomputing the grouping.
+    for (i, &g) in group_of.iter().enumerate() {
+        let name = if i < nb { packed.brams[i].name.clone() } else { packed.dsps[i - nb].name.clone() };
+        packed.copy_groups.entry(g).or_default().push(name);
     }
 }
 

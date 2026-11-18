@@ -935,12 +935,65 @@ pub fn place_with_pools(
     };
 
     // A fresh slice that nothing else joins (all its BEL letters taken).
-    let lone = |used: &mut HashSet<String>, site_bels: &mut HashMap<String, HashSet<char>>, site_tile: &mut HashMap<String, String>| -> Result<(String, String, char), String> {
-        let (tile, site) = device.slice_near(fx, fy, used).ok_or("place: no free SLICEL site")?;
+    //
+    // `pref` is the point to search from. Replicated hard-block drivers
+    // (`*_rep{g}`, from `pack::replicate_hard_block_drivers`) pass the
+    // centroid of the RAMs/DSPs their group feeds, so a copy lands next to the
+    // blocks it drives rather than at the global fresh-slice anchor (G60: a
+    // copy 128 tiles from its RAMs). Everything else keeps the old anchor.
+    let lone = |pref: Option<(i32, i32)>,
+                used: &mut HashSet<String>,
+                site_bels: &mut HashMap<String, HashSet<char>>,
+                site_tile: &mut HashMap<String, String>|
+     -> Result<(String, String, char), String> {
+        let (px, py) = pref.unwrap_or((fx, fy));
+        let (tile, site) = device.slice_near(px, py, used).ok_or("place: no free SLICEL site")?;
         used.insert(site.clone());
         site_tile.insert(site.clone(), tile.clone());
         site_bels.insert(site.clone(), BEL_LETTERS.iter().copied().collect());
         Ok((tile, site, 'A'))
+    };
+
+    // Where to put a replicated driver copy: next to the blocks of its group.
+    //
+    // A group is the RAMs/DSPs sharing one column that a single copy drives,
+    // so the target is one of its own blocks, not the group centroid: a
+    // centroid pulls a copy between two columns (G60 measured 137 tiles from
+    // the farthest RAM). We pick the group's block in the *median* row of its
+    // dominant column — the copy then sits inside the span it drives, which is
+    // what the <= 20 tiles guard measures. `slice_near` searches the whole die,
+    // so a wrong column is not corrected later.
+    let group_centre: HashMap<usize, (i32, i32)> = {
+        let site_of: HashMap<&str, (i32, i32)> = out
+            .brams
+            .iter()
+            .map(|b| (b.name.as_str(), &b.tile))
+            .chain(out.dsps.iter().map(|d| (d.name.as_str(), &d.tile)))
+            .filter_map(|(n, t)| device.tile_xy(t).map(|xy| (n, xy)))
+            .collect();
+        packed
+            .copy_groups
+            .iter()
+            .filter_map(|(g, members)| {
+                let mut pts: Vec<(i32, i32)> =
+                    members.iter().filter_map(|m| site_of.get(m.as_str()).copied()).collect();
+                if pts.is_empty() {
+                    return None;
+                }
+                // Dominant column = the one with the most members (ties: lower x).
+                let mut by_x: HashMap<i32, usize> = HashMap::new();
+                for (x, _) in &pts {
+                    *by_x.entry(*x).or_insert(0) += 1;
+                }
+                let col = *by_x.iter().max_by_key(|(x, n)| (**n, -*x)).map(|(x, _)| x)?;
+                pts.retain(|(x, _)| *x == col);
+                pts.sort_by_key(|(_, y)| *y);
+                // Median row of that column: a copy here bounds the worst
+                // distance to the group's ends.
+                let (x, y) = pts[pts.len() / 2];
+                Some((*g, (x, y)))
+            })
+            .collect()
     };
 
     // Place LUTs feeding MUXF7 / MUXF8 first so wide muxes share one slice.
@@ -996,7 +1049,8 @@ pub fn place_with_pools(
         // Find driving LUT, if any, and not yet placed.
         let lut_idx = lut_by_output.get(ff.d_net.as_str()).copied().filter(|i| !lut_placed.contains(i));
         let (tile, site, letter) = if packed.lone_cells.contains(&ff.name) {
-            lone(&mut used_sites, &mut site_bels, &mut site_tile)?
+            let pref = crate::xdevice::rep_group(&ff.name).and_then(|g| group_centre.get(&g).copied());
+            lone(pref, &mut used_sites, &mut site_bels, &mut site_tile)?
         } else {
             alloc(&mut used_sites, &mut site_bels, &mut site_tile, &mut site_ctrl, Some(&ctrl), device)?
         };
@@ -1045,7 +1099,8 @@ pub fn place_with_pools(
             continue;
         }
         let (tile, site, letter) = if packed.lone_cells.contains(&lut.name) {
-            lone(&mut used_sites, &mut site_bels, &mut site_tile)?
+            let pref = crate::xdevice::rep_group(&lut.name).and_then(|g| group_centre.get(&g).copied());
+            lone(pref, &mut used_sites, &mut site_bels, &mut site_tile)?
         } else {
             alloc(&mut used_sites, &mut site_bels, &mut site_tile, &mut site_ctrl, None, device)?
         };
@@ -1060,7 +1115,95 @@ pub fn place_with_pools(
     }
 
     crate::place_sa::refine(&mut out, device);
+    // Seat replicated hard-block driver copies back inside their own group's
+    // column. The annealer's cost is a per-net bounding box, and a copy plus a
+    // column of RAMs already spans ~20 rows, so the copy's own x has almost no
+    // gradient and it drifts (G60: 97-137 tiles out). A copy is a lone cell in
+    // a slice of its own, so moving it after annealing cannot displace anything.
+    reseat_hard_block_copies(&mut out, device);
     Ok(out)
+}
+
+/// Move each `*_rep{g}` lone cell to the free slice nearest its group's blocks,
+/// preferring the group's dominant column. Run after annealing.
+fn reseat_hard_block_copies(out: &mut Placed7, device: &dyn DeviceQuery) {
+    let groups = out.packed.copy_groups.clone();
+    if groups.is_empty() {
+        return;
+    }
+    // Group target: median row of the group's dominant column.
+    let ram_xy: HashMap<&str, (i32, i32)> = out
+        .brams
+        .iter()
+        .map(|b| (b.name.as_str(), &b.tile))
+        .chain(out.dsps.iter().map(|d| (d.name.as_str(), &d.tile)))
+        .filter_map(|(n, t)| device.tile_xy(t).map(|xy| (n, xy)))
+        .collect();
+    let mut target: HashMap<usize, (i32, i32)> = HashMap::new();
+    for (g, members) in &groups {
+        let mut pts: Vec<(i32, i32)> =
+            members.iter().filter_map(|m| ram_xy.get(m.as_str()).copied()).collect();
+        if pts.is_empty() {
+            continue;
+        }
+        let mut by_x: HashMap<i32, usize> = HashMap::new();
+        for (x, _) in &pts {
+            *by_x.entry(*x).or_insert(0) += 1;
+        }
+        let Some(col) = by_x.iter().max_by_key(|(x, n)| (**n, -*x)).map(|(x, _)| *x) else { continue };
+        pts.retain(|(x, _)| *x == col);
+        pts.sort_by_key(|(_, y)| *y);
+        target.insert(*g, pts[pts.len() / 2]);
+    }
+    if target.is_empty() {
+        return;
+    }
+    // Sites held by everything that must not move.
+    let mut taken: HashSet<String> = out
+        .luts
+        .iter()
+        .map(|l| l.site.clone())
+        .chain(out.ffs.iter().map(|f| f.site.clone()))
+        .chain(out.brams.iter().map(|b| b.site.clone()))
+        .chain(out.dsps.iter().map(|d| d.site.clone()))
+        .chain(out.carries.iter().map(|c| c.site.clone()))
+        .chain(out.srls.iter().map(|s| s.site.clone()))
+        .chain(out.lutrams.iter().map(|r| r.site.clone()))
+        .chain(out.muxfs.iter().map(|m| m.site.clone()))
+        .collect();
+    // Lone copies own a whole slice, so release their current sites first.
+    let lone: HashSet<String> = out.packed.lone_cells.clone();
+    for f in out.ffs.iter().filter(|f| lone.contains(&f.name)) {
+        taken.remove(&f.site);
+    }
+    for l in out.luts.iter().filter(|l| lone.contains(&l.name)) {
+        taken.remove(&l.site);
+    }
+    let seat = |name: &str, taken: &mut HashSet<String>| -> Option<(String, String)> {
+        let g = crate::xdevice::rep_group(name)?;
+        let (tx, ty) = *target.get(&g)?;
+        let (tile, site) = device.slice_near(tx, ty, taken)?;
+        taken.insert(site.clone());
+        Some((tile, site))
+    };
+    for f in out.ffs.iter_mut() {
+        if !lone.contains(&f.name) {
+            continue;
+        }
+        if let Some((tile, site)) = seat(&f.name, &mut taken) {
+            f.tile = tile;
+            f.site = site;
+        }
+    }
+    for l in out.luts.iter_mut() {
+        if !lone.contains(&l.name) {
+            continue;
+        }
+        if let Some((tile, site)) = seat(&l.name, &mut taken) {
+            l.tile = tile;
+            l.site = site;
+        }
+    }
 }
 
 fn place_brams(
