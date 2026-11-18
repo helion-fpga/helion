@@ -41,8 +41,10 @@ fn dsp_design(preg: &str, mreg: &str, areg: &str) -> Design {
     d.connect("a_q", "u_ff", "Q");
     d.connect("clk", "u_dsp", "CLK");
     d.connect("a_q", "u_dsp", "A");
-    // B is in the tile-mux group (G35) and cannot be routed in this version,
-    // so tie it: A alone still gives the DSP a clocked input endpoint.
+    // B is tied rather than driven: G35 was fixed (a DSP's non-A inputs now
+    // route, see tests/dsp_tile_mux_routing.rs), but this test is about the
+    // timing model, so it keeps the smallest design that has a clocked DSP
+    // input. Routing coverage for B/C/D lives in the G35 test.
     d.set_cell_attr("u_dsp", "B", "0").ok();
     d.connect("p", "u_dsp", "P");
     d
@@ -108,11 +110,11 @@ fn dsp_pin_setups_match_the_sdf() {
     assert_eq!(dsp_setup_ps("CLK"), None);
 }
 
-/// A bare DSP cannot be routed in this version: several of its pins are in the
-/// tile-mux group and have no segbit (G35), so a packed-and-routed DSP fill
-/// belongs to that gap, not this one. What G32 owns is the *model*, so test it
-/// at the model boundary: given a DSP on the clock, its clocked inputs must be
-/// classified as setup endpoints and its P must be an arrival source.
+/// What G32 owns is the *model*, so test it at the model boundary: given a DSP
+/// on the clock, its clocked inputs must be classified as setup endpoints and
+/// its P must be an arrival source. (G35, which used to block routing every DSP
+/// input but A, is fixed; see tests/dsp_tile_mux_routing.rs for routing and
+/// `a_dsp_multiplier_packs_places_routes_and_is_timed` for the end-to-end case.)
 #[test]
 fn dsp_pins_are_classified_for_timing() {
     // An input with a setup requirement must be recognised as an endpoint
