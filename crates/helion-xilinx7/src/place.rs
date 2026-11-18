@@ -1127,7 +1127,21 @@ pub fn place_with_pools(
     // gradient and it drifts (G60: 97-137 tiles out). A copy is a lone cell in
     // a slice of its own, so moving it after annealing cannot displace anything.
     reseat_hard_block_copies(&mut out, device);
+    check_one_cell_per_bel(&out)?;
     Ok(out)
+}
+
+/// Two LUTs or two flops on one slice position would drive one slice output
+/// with two nets; the router can never resolve that, so say so here.
+fn check_one_cell_per_bel(out: &Placed7) -> Result<(), String> {
+    let mut seen: HashMap<(&str, &str), &str> = HashMap::new();
+    let cells = out.luts.iter().map(|l| (&l.site, &l.bel, &l.name)).chain(out.ffs.iter().map(|f| (&f.site, &f.bel, &f.name)));
+    for (site, bel, name) in cells {
+        if let Some(other) = seen.insert((site.as_str(), bel.as_str()), name.as_str()) {
+            return Err(format!("place: `{other}` and `{name}` are both placed on {site}.{bel}"));
+        }
+    }
+    Ok(())
 }
 
 /// Move each `*_rep{g}` lone cell to the free slice nearest its group's blocks,
@@ -1164,12 +1178,18 @@ fn reseat_hard_block_copies(out: &mut Placed7, device: &dyn DeviceQuery) {
     if target.is_empty() {
         return;
     }
-    // Sites held by everything that must not move.
+    // Sites held by everything that must not move. A copy's own site is left
+    // out so it can be reused, but only by its own name: annealing may have put
+    // other cells into a copy's slice, and that slice is then still taken (G47:
+    // releasing it seated a second copy on a flop that was already there, and
+    // the two nets fought over one slice output for ever).
+    let lone: HashSet<String> = out.packed.lone_cells.clone();
     let mut taken: HashSet<String> = out
         .luts
         .iter()
+        .filter(|l| !lone.contains(&l.name))
         .map(|l| l.site.clone())
-        .chain(out.ffs.iter().map(|f| f.site.clone()))
+        .chain(out.ffs.iter().filter(|f| !lone.contains(&f.name)).map(|f| f.site.clone()))
         .chain(out.brams.iter().map(|b| b.site.clone()))
         .chain(out.dsps.iter().map(|d| d.site.clone()))
         .chain(out.carries.iter().map(|c| c.site.clone()))
@@ -1177,14 +1197,6 @@ fn reseat_hard_block_copies(out: &mut Placed7, device: &dyn DeviceQuery) {
         .chain(out.lutrams.iter().map(|r| r.site.clone()))
         .chain(out.muxfs.iter().map(|m| m.site.clone()))
         .collect();
-    // Lone copies own a whole slice, so release their current sites first.
-    let lone: HashSet<String> = out.packed.lone_cells.clone();
-    for f in out.ffs.iter().filter(|f| lone.contains(&f.name)) {
-        taken.remove(&f.site);
-    }
-    for l in out.luts.iter().filter(|l| lone.contains(&l.name)) {
-        taken.remove(&l.site);
-    }
     let seat = |name: &str, taken: &mut HashSet<String>| -> Option<(String, String)> {
         let g = crate::xdevice::rep_group(name)?;
         let (tx, ty) = *target.get(&g)?;

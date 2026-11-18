@@ -1007,7 +1007,11 @@ fn pathfinder(
     }
     let t0 = std::time::Instant::now();
     let mut done = false;
+    const STALL_ITERATIONS: usize = 30;
+    let (mut best_over, mut best_it) = (usize::MAX, 0usize);
+    let mut last_it = 0;
     for it in 1..=MAX_ITERATIONS {
+        last_it = it;
         for (n, p) in &pf {
             if device.pf_overused(&wires_of(p)) {
                 todo.insert(n.clone());
@@ -1045,13 +1049,40 @@ fn pathfinder(
             done = true;
             break;
         }
+        // No progress for a long stretch: the same nets are fighting over wires
+        // that have no alternative. More iterations do not help; stop and say which.
+        if over < best_over {
+            (best_over, best_it) = (over, it);
+        } else if it - best_it >= STALL_ITERATIONS {
+            break;
+        }
         present = present.saturating_mul(3).div_ceil(2).min(100_000);
         device.pf_present(Some(present));
     }
-    device.pf_present(None);
     if !done {
-        return Err(format!("route: PathFinder: wires still shared after {MAX_ITERATIONS} iterations"));
+        // Name the nets still sharing wires, with where they go and what they share.
+        let mut stuck = Vec::new();
+        for (n, p) in &pf {
+            let hot = |t: &str, w: &str| !is_power_wire(w) && device.pf_overused(&[(t.to_string(), w.to_string())]);
+            let shared: Vec<String> = p.iter().filter(|x| hot(&x.tile, &x.src_wire) || hot(&x.tile, &x.dst_wire)).map(|x| format!("{}.{}->{}", x.tile, x.src_wire, x.dst_wire)).collect();
+            if shared.is_empty() {
+                continue;
+            }
+            let eps = &net_eps[n];
+            let drv = eps.iter().find(|e| e.is_driver).map(|e| format!("{}.{}", e.site, e.pin)).unwrap_or_default();
+            let loads: Vec<String> = eps.iter().filter(|e| !e.is_driver).take(4).map(|l| format!("{}.{}", l.site, l.pin)).collect();
+            stuck.push(format!("  {n}: {drv} -> {loads:?} shares {:?}", &shared[..shared.len().min(4)]));
+        }
+        device.pf_present(None);
+        device.pf_present(None);
+        let shown = stuck.len().min(12);
+        return Err(format!(
+            "route: PathFinder: wires still shared after {last_it} iterations ({} nets, best {best_over} wires at iteration {best_it}):\n{}",
+            stuck.len(),
+            stuck[..shown].join("\n")
+        ));
     }
+    device.pf_present(None);
     nets.retain(|n| !pf.contains_key(&n.net));
     for (net, p) in pf {
         let mut new = Vec::new();
