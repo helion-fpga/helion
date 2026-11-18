@@ -213,7 +213,9 @@ impl TGraph {
 
 pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
     let sites = device.all_slices();
-    if sites.is_empty() {
+    // `HELION_PLACE_NO_ANNEAL`: keep the constructive placement (to tell its
+    // quality from the anneal's).
+    if sites.is_empty() || std::env::var("HELION_PLACE_NO_ANNEAL").is_ok() {
         return;
     }
     let site_idx: HashMap<&str, usize> = sites.iter().enumerate().map(|(i, s)| (s.1.as_str(), i)).collect();
@@ -639,6 +641,8 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
         moved.clear();
         let mut b = FREE;
         let to = ts * 4 + rng.below(4);
+        // Both slices trade all four positions (see the control-set rule below).
+        let mut slice_swap = false;
         if a < n {
             if to == from {
                 return (0, false);
@@ -659,14 +663,35 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
                     }
                 };
                 if !fits(ts, unit_ctrl[a], b) || (b != FREE && !fits(fs, unit_ctrl[b as usize], a as u32)) {
-                    return (0, false);
+                    // The flops of the two slices have different controls, so no
+                    // single unit may cross. Trading the slices whole is always
+                    // legal, and it is the only way slices full of flops ever
+                    // move: without it a register bank spread over the device
+                    // stayed spread, and its nets did not route (G75).
+                    if occ[ts * 4..ts * 4 + 4].iter().any(|&o| o != FREE && o as usize >= n) {
+                        return (0, false); // a chain slice
+                    }
+                    slice_swap = true;
                 }
             }
-            moved.push((a as u32, from));
-            pos[a] = to;
-            if b != FREE {
-                moved.push((b, to));
-                pos[b as usize] = from;
+            if slice_swap {
+                let (fs, ts) = (from / 4, to / 4);
+                for k in 0..4 {
+                    for (src, dst) in [(fs * 4 + k, ts * 4 + k), (ts * 4 + k, fs * 4 + k)] {
+                        let u = occ[src];
+                        if u != FREE {
+                            moved.push((u, src));
+                            pos[u as usize] = dst;
+                        }
+                    }
+                }
+            } else {
+                moved.push((a as u32, from));
+                pos[a] = to;
+                if b != FREE {
+                    moved.push((b, to));
+                    pos[b as usize] = from;
+                }
             }
         } else {
             let r = run_of[a - n];
@@ -735,7 +760,13 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
         for &ni in &touched {
             cost[ni as usize] = net_cost(&nets[ni as usize], pos);
         }
-        if a < n {
+        if slice_swap {
+            let (fs, ts) = (from / 4, to / 4);
+            for k in 0..4 {
+                occ.swap(fs * 4 + k, ts * 4 + k);
+            }
+            site_ctrl.swap(fs, ts);
+        } else if a < n {
             occ[to] = a as u32;
             occ[from] = b;
             let (fs, ts) = (from / 4, to / 4);

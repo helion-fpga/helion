@@ -115,6 +115,10 @@ pub trait RouteQuery {
     fn wire_for_site_pin(&self, site: &str, pin: &str) -> Vec<(String, String)>;
     /// Is this net on the dedicated global clock network (BUFG/CMT output)?
     fn is_clock_net(&self, net: &str) -> bool;
+    /// Let signal nets bounce through `BYP_ALT*` wires (a slice output back
+    /// into the same tile's inputs), except in the INT tiles named: there the
+    /// slice reads its bypass pins as constants (carry chains).
+    fn open_bypass_bounce(&self, _closed_int_tiles: &[String]) {}
     /// Tie-off pips driving a BUFGCTRL site's control pins to the constants
     /// required for I0 -> O (UG472 Fig. 2-5): S0=1, CE0=1, IGNORE1=1,
     /// S1=0, CE1=0, IGNORE0=0.
@@ -240,6 +244,25 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
             m.extend(placed.net_crit.iter().map(|(n, &c)| (n.clone(), route_crit(c))));
         }
     });
+    // A slice output reaches its own tile's LUT inputs only through a bounce
+    // (`FAN_ALT` or `BYP_ALT`). With the bypass bounce closed, dense local logic
+    // ran out of the other kind and did not route (G75). A bypass wire also
+    // drives the slice's AX..DX pin, which a carry chain reads as a constant
+    // (emit ties them), so tiles with a carry stay closed.
+    if std::env::var("HELION_ROUTE_NO_BYP_BOUNCE").is_err() {
+        let closed: Vec<String> = placed
+            .carries
+            .iter()
+            .filter_map(|c| {
+                let mut parts = c.tile.split('_');
+                match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                    (Some(_), Some(side), Some(xy), None) => Some(format!("INT_{side}_{xy}")),
+                    _ => None,
+                }
+            })
+            .collect();
+        device.open_bypass_bounce(&closed);
+    }
     let packed = &placed.packed;
     let mut net_eps: HashMap<String, Vec<Endpoint>> = HashMap::new();
     let mut add_ep = |net: String, site: String, pin: &str, is_driver: bool| {
