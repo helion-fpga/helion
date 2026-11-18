@@ -371,6 +371,10 @@ pub struct Placed7 {
     /// Routed tie-offs of block RAM and DSP inputs held at 0:
     /// `(net, site, site pin, is_driver)`, see [`crate::bram::tie0_endpoints`].
     pub tie_eps: Vec<(String, String, String, bool)>,
+    /// Estimated timing criticality of each timed net after placement (0..=1,
+    /// the worst of its connections; see `place_sa`). The router lets
+    /// critical nets pay less for congested wires (G71).
+    pub net_crit: HashMap<String, f32>,
 }
 
 /// FF control set: CLK, CE, SR nets and SR mode. Slice-wide in 7-series.

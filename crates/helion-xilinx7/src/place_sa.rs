@@ -103,6 +103,8 @@ struct TGraph {
     ends: Vec<(u32, Loc)>,
     /// Net names, to print the estimated critical path (`HELION_PLACE_DEBUG`).
     debug_names: Option<Vec<String>>,
+    /// Net names, for handing criticalities to the router.
+    names: Vec<String>,
 }
 
 impl TGraph {
@@ -810,6 +812,19 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
             total += d;
         }
     }
+    // Criticality of each net at the final places, for the router.
+    let mut net_crit: HashMap<String, f32> = HashMap::new();
+    if let (true, Some(g)) = (timed, &tg) {
+        let site_of = |l: Loc| match l {
+            Loc::Unit(u) => pos[u as usize] / 4,
+            Loc::Site(s) => s,
+        };
+        let (conn, _) = g.criticality(&site_of, &|s: usize| (sites[s].2, sites[s].3));
+        for ((net, _), c) in g.conns().iter().zip(&conn) {
+            let e = net_crit.entry(g.names[*net as usize].clone()).or_insert(0.0);
+            *e = e.max(*c as f32);
+        }
+    }
     if debug {
         let est1 = reweight(&nets, &pos);
         let (mut xs, mut ys): (Vec<i32>, Vec<i32>) = pos.iter().map(|&p| xy(p)).unzip();
@@ -820,6 +835,7 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
         eprintln!("place: {n} slots, {} chain runs, {} nets, cost {initial} -> {total}, estimated critical path {est0} -> {est1} ps, {steps} temperatures in {:.1} s", runs.len(), nets.len(), t0.elapsed().as_secs_f64());
     }
 
+    out.net_crit = net_crit;
     // Write the new places back: chain slices first (by their old site;
     // no unit started in one), then units.
     let moved_site: HashMap<String, (String, String)> = (n..n_all)
@@ -959,7 +975,11 @@ fn timing_graph<'a>(out: &'a Placed7, site_idx: &HashMap<&str, usize>, unit_of_s
         }
         v
     });
-    Some(TGraph { cells, drv, ff_q, ends, debug_names })
+    let mut names = vec![String::new(); ids.len()];
+    for (k, &i) in &ids {
+        names[i as usize] = k.to_string();
+    }
+    Some(TGraph { cells, drv, ff_q, ends, debug_names, names })
 }
 
 #[cfg(test)]
