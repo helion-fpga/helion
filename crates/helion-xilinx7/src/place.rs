@@ -1178,18 +1178,20 @@ fn reseat_hard_block_copies(out: &mut Placed7, device: &dyn DeviceQuery) {
     if target.is_empty() {
         return;
     }
-    // Sites held by everything that must not move. A copy's own site is left
-    // out so it can be reused, but only by its own name: annealing may have put
-    // other cells into a copy's slice, and that slice is then still taken (G47:
-    // releasing it seated a second copy on a flop that was already there, and
-    // the two nets fought over one slice output for ever).
+    // Every occupied site is taken. A copy gives up its own site first when it
+    // is alone there (so it may stay, or its neighbour copy may take it), and
+    // only then: annealing may have put other cells into a copy's slice, and a
+    // copy that is not moved keeps its place (G47: a freed slice that was not
+    // empty got a second copy on a flop that was already there, and the two
+    // nets fought over one slice output for ever).
     let lone: HashSet<String> = out.packed.lone_cells.clone();
-    let mut taken: HashSet<String> = out
-        .luts
-        .iter()
-        .filter(|l| !lone.contains(&l.name))
-        .map(|l| l.site.clone())
-        .chain(out.ffs.iter().filter(|f| !lone.contains(&f.name)).map(|f| f.site.clone()))
+    let mut occupants: HashMap<String, usize> = HashMap::new();
+    for site in out.luts.iter().map(|l| &l.site).chain(out.ffs.iter().map(|f| &f.site)) {
+        *occupants.entry(site.clone()).or_insert(0) += 1;
+    }
+    let mut taken: HashSet<String> = occupants
+        .keys()
+        .cloned()
         .chain(out.brams.iter().map(|b| b.site.clone()))
         .chain(out.dsps.iter().map(|d| d.site.clone()))
         .chain(out.carries.iter().map(|c| c.site.clone()))
@@ -1197,30 +1199,31 @@ fn reseat_hard_block_copies(out: &mut Placed7, device: &dyn DeviceQuery) {
         .chain(out.lutrams.iter().map(|r| r.site.clone()))
         .chain(out.muxfs.iter().map(|m| m.site.clone()))
         .collect();
-    let seat = |name: &str, taken: &mut HashSet<String>| -> Option<(String, String)> {
-        let g = crate::xdevice::rep_group(name)?;
-        let (tx, ty) = *target.get(&g)?;
-        let (tile, site) = device.slice_near(tx, ty, taken)?;
-        taken.insert(site.clone());
-        Some((tile, site))
+    let mut seat = |name: &str, tile: &mut String, site: &mut String| {
+        let Some(&(tx, ty)) = crate::xdevice::rep_group(name).and_then(|g| target.get(&g)) else { return };
+        let alone = occupants.get(site.as_str()) == Some(&1);
+        if alone {
+            taken.remove(site.as_str());
+        }
+        match device.slice_near(tx, ty, &taken) {
+            Some((t, s)) => {
+                if let Some(n) = occupants.get_mut(site.as_str()) {
+                    *n -= 1;
+                }
+                *occupants.entry(s.clone()).or_insert(0) += 1;
+                taken.insert(s.clone());
+                (*tile, *site) = (t, s);
+            }
+            None => {
+                taken.insert(site.clone());
+            }
+        }
     };
-    for f in out.ffs.iter_mut() {
-        if !lone.contains(&f.name) {
-            continue;
-        }
-        if let Some((tile, site)) = seat(&f.name, &mut taken) {
-            f.tile = tile;
-            f.site = site;
-        }
+    for f in out.ffs.iter_mut().filter(|f| lone.contains(&f.name)) {
+        seat(&f.name, &mut f.tile, &mut f.site);
     }
-    for l in out.luts.iter_mut() {
-        if !lone.contains(&l.name) {
-            continue;
-        }
-        if let Some((tile, site)) = seat(&l.name, &mut taken) {
-            l.tile = tile;
-            l.site = site;
-        }
+    for l in out.luts.iter_mut().filter(|l| lone.contains(&l.name)) {
+        seat(&l.name, &mut l.tile, &mut l.site);
     }
 }
 
