@@ -538,20 +538,43 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         .iter()
         .map(|c| (c.name.as_str(), c.site.as_str()))
         .collect();
-    let mut co_nets: HashSet<&str> = HashSet::new();
-    for carry in &packed.carries {
-        if let Some(co) = &carry.co_net {
-            co_nets.insert(co.as_str());
+    // Cascade nets: a CO3 that feeds the next CARRY4's CI. Any other CO3
+    // leaves for fabric on DMUX (emit sets DOUTMUX=CY).
+    let ci_nets: HashSet<&str> = packed.carries.iter().map(|c| c.ci_net.as_str()).collect();
+    let co_nets: HashSet<&str> = packed
+        .carries
+        .iter()
+        .filter_map(|c| c.co_net.as_deref())
+        .filter(|co| ci_nets.contains(co))
+        .collect();
+    let prim = crate::pack::prim_carries(packed);
+    // Nets with a driver in the packed design (the carry loop below may only
+    // route a wired `DI` to a net that is really driven).
+    let mut driven: HashSet<&str> = HashSet::new();
+    for l in &packed.luts {
+        driven.insert(l.output_net.as_str());
+    }
+    for f in &packed.ffs {
+        driven.insert(f.q_net.as_str());
+    }
+    for c in &packed.carries {
+        for o in c.o_nets.iter().flatten() {
+            driven.insert(o.as_str());
+        }
+        if let Some(co) = &c.co_net {
+            driven.insert(co.as_str());
         }
     }
     for carry in &packed.carries {
         let site = carry_site.get(carry.name.as_str()).copied().unwrap_or("");
+        let is_prim = prim.contains(carry.name.as_str());
         for j in 0..4 {
+            let letter = ['A', 'B', 'C', 'D'][j];
             if let Some(o) = &carry.o_nets[j] {
-                // An adder's sum bit leaves the slice on the letter's
-                // multiplexed output (`AMUX`..`DMUX`, set to XOR).
-                let pin = if packed.adder_carries.contains(&carry.name) {
-                    format!("{}MUX", ['A', 'B', 'C', 'D'][j])
+                // An adder's or primitive's sum bit leaves the slice on the
+                // letter's multiplexed output (`AMUX`..`DMUX`, set to XOR).
+                let pin = if is_prim || packed.adder_carries.contains(&carry.name) {
+                    format!("{letter}MUX")
                 } else {
                     format!("O{j}")
                 };
@@ -560,9 +583,38 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
             if let Some(s) = &carry.s_nets[j] {
                 add_ep(s.clone(), site.to_string(), &format!("S{j}"), false);
             }
+            if is_prim {
+                // A carry tap shares the letter's multiplexed output.
+                if let Some(co) = carry.co_nets[j].as_ref().filter(|_| j < 3) {
+                    if carry.o_nets[j].is_some() {
+                        return Err(format!("route: CARRY4 {} uses both O{j} and CO{j}; one xMUX carries one", carry.name));
+                    }
+                    add_ep(co.clone(), site.to_string(), &format!("{letter}MUX"), true);
+                }
+                // A wired DI is the bypass input (emit leaves CARRY4.xCY0 off).
+                //
+                // Only if the net is actually driven. A `DI` pin tied to a
+                // net that nothing drives is ignored, as it was before this
+                // primitive support existed: routing it would add an `AX`
+                // load to a net that had none, and the 0-driver check would
+                // then reject a design that packs and places fine.
+                if let Some(di) = carry.di_nets[j].as_ref().filter(|n| !is_const_net(n) && driven.contains(n.as_str())) {
+                    if j == 0 && carry.cyinit_net.as_deref().is_some_and(|n| !is_const_net(n)) {
+                        return Err(format!("route: CARRY4 {} needs AX for both DI0 and CYINIT (net `{}`)", carry.name, carry.cyinit_net.as_deref().unwrap_or("")));
+                    }
+                    add_ep(di.clone(), site.to_string(), &format!("{letter}X"), false);
+                }
+            }
         }
         if let Some(co) = &carry.co_net {
-            add_ep(co.clone(), site.to_string(), "CO", true);
+            if co_nets.contains(co.as_str()) {
+                add_ep(co.clone(), site.to_string(), "CO", true);
+            } else {
+                if carry.o_nets[3].is_some() {
+                    return Err(format!("route: CARRY4 {} uses both O3 and CO3 in fabric", carry.name));
+                }
+                add_ep(co.clone(), site.to_string(), "DMUX", true);
+            }
         }
         if carry.cyinit.is_some() {
             // Chain head with CYINIT from config (emit selects C0/C1 by
@@ -571,8 +623,9 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
             add_ep(carry.ci_net.clone(), site.to_string(), "CI", false);
         } else {
             // Chain head: CYINIT arrives at AX through fabric (legacy
-            // const-LUT heads; the carry flow now uses C0 instead).
-            add_ep(carry.ci_net.clone(), site.to_string(), "AX", false);
+            // const-LUT heads, or a primitive's fabric CYINIT pin).
+            let n = if carry.ci_net.is_empty() { carry.cyinit_net.clone().unwrap_or_default() } else { carry.ci_net.clone() };
+            add_ep(n, site.to_string(), "AX", false);
         }
     }
 

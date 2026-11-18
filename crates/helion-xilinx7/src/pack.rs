@@ -901,6 +901,7 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
 
     validate_iodelay_groups(&out)?;
     fracture_adder_luts(&mut out)?;
+    prepare_prim_carries(&mut out);
     insert_clock_spine(netlist, &mut out)?;
     insert_input_buffers(netlist, &mut out)?;
 
@@ -2304,6 +2305,93 @@ fn pack_dsp(
         carrycascout_net: casc("CARRYCASCOUT"),
         clk_net: pins.net_on(cell_name, "CLK").map(|s| resolve(s).to_string()),
     })
+}
+
+/// Carries of chains built from directly instantiated `CARRY4` primitives:
+/// the chain head wires its `CYINIT` pin.
+pub fn prim_carries(packed: &Packed7) -> HashSet<&str> {
+    let co_driver: std::collections::HashMap<&str, &PackedCarry> =
+        packed.carries.iter().filter_map(|c| c.co_net.as_deref().map(|co| (co, c))).collect();
+    packed
+        .carries
+        .iter()
+        .filter(|c| {
+            let mut cur = *c;
+            for _ in 0..packed.carries.len() {
+                match co_driver.get(cur.ci_net.as_str()) {
+                    Some(d) => cur = d,
+                    None => break,
+                }
+            }
+            cur.cyinit_net.is_some()
+        })
+        .map(|c| c.name.as_str())
+        .collect()
+}
+
+/// Directly instantiated `CARRY4`s (not the v2 adders) on silicon: S is fed
+/// only by its letter's LUT O6, so an S net no LUT drives gets a
+/// pass-through LUT; and a CO3 that leaves for fabric while O3 is used gets
+/// a one-bit tail `CARRY4` above it whose O0 (CI xor 0) carries it out, since
+/// the letter's one multiplexed output can carry only one of them (Vivado
+/// builds the same tail).
+fn prepare_prim_carries(out: &mut Packed7) {
+    let lut_outs: HashSet<String> = out.luts.iter().map(|l| l.output_net.clone()).collect();
+    // v2 ties constants through a LUT (`const0`/`const1`): CYINIT takes them from config.
+    let const_lut: std::collections::HashMap<String, bool> = out
+        .luts
+        .iter()
+        .filter(|l| l.input_nets.iter().all(Option::is_none) && (l.init == 0 || l.init == u64::MAX))
+        .map(|l| (l.output_net.clone(), l.init != 0))
+        .collect();
+    let ci_nets: HashSet<String> = out.carries.iter().map(|c| c.ci_net.clone()).collect();
+    let mut luts = Vec::new();
+    let mut tails = Vec::new();
+    for c in out.carries.iter_mut().filter(|c| !out.adder_carries.contains(&c.name)) {
+        if let Some(&v) = c.cyinit_net.as_ref().and_then(|n| const_lut.get(n)) {
+            c.cyinit_net = Some(if v { "1" } else { "0" }.to_string());
+        }
+        // A head whose carry in comes from CYINIT ignores a constant CI.
+        if c.cyinit_net.is_some() && const_lut.contains_key(&c.ci_net) {
+            c.ci_net.clear();
+        }
+        for j in 0..4 {
+            let Some(s) = c.s_nets[j].clone() else { continue };
+            if lut_outs.contains(&s) {
+                continue;
+            }
+            let rt = format!("{}_s{j}_rt", c.name);
+            let (init, input) = match s.as_str() {
+                "0" | "gnd" | "GND" | "$false" => (0, None),
+                "1" | "vcc" | "VCC" | "$true" => (u64::MAX, None),
+                _ => (0xAAAA_AAAA_AAAA_AAAA, Some(s)),
+            };
+            let mut input_nets: [Option<String>; 6] = Default::default();
+            input_nets[0] = input;
+            luts.push(PackedLut { name: rt.clone(), init, input_nets, output_net: rt.clone() });
+            c.s_nets[j] = Some(rt);
+        }
+        if let Some(co) = c.co_net.clone().filter(|co| c.o_nets[3].is_some() && !ci_nets.contains(co)) {
+            let casc = format!("{}_co3_casc", c.name);
+            c.co_net = Some(casc.clone());
+            c.co_nets[3] = Some(casc.clone());
+            let mut o_nets: [Option<String>; 4] = Default::default();
+            o_nets[0] = Some(co);
+            tails.push(PackedCarry {
+                name: format!("{}_cotail", c.name),
+                ci_net: casc,
+                cyinit: None,
+                co_net: None,
+                s_nets: Default::default(),
+                di_nets: Default::default(),
+                o_nets,
+                cyinit_net: None,
+                co_nets: Default::default(),
+            });
+        }
+    }
+    out.luts.extend(luts);
+    out.carries.extend(tails);
 }
 
 /// Pack one `CARRY4`. Pin nets are captured so place can keep chained
@@ -3728,14 +3816,17 @@ mod tests {
         let c0 = &packed.carries[0];
         assert_eq!(c0.ci_net, "one");
         assert_eq!(c0.co_net.as_deref(), Some("co0"));
-        assert_eq!(c0.s_nets[0].as_deref(), Some("s0"));
+        // S0 is not driven by a LUT: it reaches the carry through a pass-through LUT (G13).
+        assert_eq!(c0.s_nets[0].as_deref(), Some("u_c0_s0_rt"));
+        let rt = packed.luts.iter().find(|l| l.name == "u_c0_s0_rt").unwrap();
+        assert_eq!(rt.input_nets[0].as_deref(), Some("s0"));
         assert_eq!(c0.di_nets[3].as_deref(), Some("zero"));
         assert_eq!(c0.o_nets[2].as_deref(), Some("o2"));
         let c1 = &packed.carries[1];
         // Cascade linkage by net name, not cell naming.
         assert_eq!(c1.ci_net, "co0");
         assert_eq!(c1.co_net, None);
-        assert_eq!(c1.s_nets[1].as_deref(), Some("s5"));
+        assert_eq!(c1.s_nets[1].as_deref(), Some("u_c1_s1_rt"));
         assert_eq!(c1.s_nets[2], None);
         assert_eq!(c1.di_nets[3], None);
         assert_eq!(c1.o_nets[0].as_deref(), Some("o4"));

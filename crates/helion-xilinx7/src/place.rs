@@ -643,11 +643,13 @@ pub fn place_with_pools(
         .into_iter()
         .filter_map(|(tile, site, gx, gy)| crate::xdevice::parse_slice_xy(&site).map(|xy| (xy, (tile, site, gx, gy))))
         .collect();
+    let prim = crate::pack::prim_carries(packed);
     for chain in order_carry_chains(&packed.carries)? {
-        // An adder chain is a plain cascade: COUT of SLICE_XxYy feeds CIN
-        // of SLICE_XxY(y+1). It takes the free column run nearest the
-        // anchor.
-        if packed.adder_carries.contains(&chain[0].name) && !slice_grid.is_empty() {
+        // An adder or primitive chain is a plain cascade: COUT of
+        // SLICE_XxYy feeds CIN of SLICE_XxY(y+1) (x7v reads it so). It takes
+        // the free column run nearest the anchor.
+        let column = packed.adder_carries.contains(&chain[0].name) || prim.contains(chain[0].name.as_str());
+        if column && !slice_grid.is_empty() {
             let len = chain.len() as i32;
             let mut best: Option<(i32, (i32, i32))> = None;
             for (&(x, y), (_, _, gx, gy)) in &slice_grid {
