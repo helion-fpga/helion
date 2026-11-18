@@ -406,7 +406,7 @@ fn check_no_crossings(packed: &crate::pack::Packed7, is_async: &dyn Fn(&str, &st
         if !c.ci_net.is_empty() {
             ins.push(c.ci_net.as_str());
         }
-        for o in c.o_nets.iter().flatten().chain(c.co_net.iter()) {
+        for o in c.o_nets.iter().flatten().chain(c.co_net.iter()).chain(c.co_nets.iter().flatten()) {
             carry_ins.insert(o.as_str(), ins.clone());
         }
     }
@@ -499,7 +499,9 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
                 carry_by_net.insert(o.as_str(), (c, Some(j)));
             }
         }
-        if let Some(co) = &c.co_net {
+        // CO0-CO2 taps are timed like CO3 (shortcut: CO3's delay is the
+        // longest of the four, so this is pessimistic for the taps).
+        for co in c.co_net.iter().chain(c.co_nets.iter().flatten()) {
             carry_by_net.insert(co.as_str(), (c, None));
         }
     }

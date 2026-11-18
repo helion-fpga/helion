@@ -803,25 +803,8 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         .iter()
         .filter_map(|c| c.co_net.as_deref().map(|co| (co, c.name.as_str())))
         .collect();
-    // Chains built from directly instantiated CARRY4 primitives: the head
-    // wires its CYINIT pin.
-    let prim_style: HashSet<&str> = packed
-        .carries
-        .iter()
-        .filter(|c| {
-            let mut cur = *c;
-            let mut hops = 0;
-            while let Some(d) = co_driver.get(cur.ci_net.as_str()).and_then(|n| packed.carries.iter().find(|x| x.name == *n)) {
-                cur = d;
-                hops += 1;
-                if hops > packed.carries.len() {
-                    break;
-                }
-            }
-            cur.cyinit_net.is_some()
-        })
-        .map(|c| c.name.as_str())
-        .collect();
+    let prim_style = crate::pack::prim_carries(packed);
+    let ci_nets: HashSet<&str> = packed.carries.iter().map(|c| c.ci_net.as_str()).collect();
     for carry in &placed.carries {
         let site_rel = device
             .site_rel(&carry.tile, &carry.site)
@@ -846,9 +829,21 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
                 lines.push(format!("{}.{}.PRECYINIT.{}", carry.tile, site_rel, src));
             }
             for (i, letter) in ['A', 'B', 'C', 'D'].iter().enumerate() {
-                if packed_c.di_nets[i].is_some() {
+                // xCY0 selects O5 as DI (x7v): for a DI tied low, since the S
+                // LUT's O5 repeats its O6 (S), and S = 0 is the only case DI
+                // matters. A wired DI comes in on the bypass pin instead.
+                if packed_c.di_nets[i].as_deref().is_none_or(|n| matches!(n, "0" | "gnd" | "GND" | "$false")) {
                     lines.push(format!("{}.{}.CARRY4.{}CY0", carry.tile, site_rel, letter));
                 }
+                // Sum or carry tap leaving for fabric (route.rs drives it from xMUX).
+                if packed_c.o_nets[i].is_some() {
+                    lines.push(format!("{}.{}.{letter}OUTMUX.XOR", carry.tile, site_rel));
+                } else if i < 3 && packed_c.co_nets[i].is_some() {
+                    lines.push(format!("{}.{}.{letter}OUTMUX.CY", carry.tile, site_rel));
+                }
+            }
+            if packed_c.co_net.as_deref().is_some_and(|co| !ci_nets.contains(co)) {
+                lines.push(format!("{}.{}.DOUTMUX.CY", carry.tile, site_rel));
             }
             continue;
         }
