@@ -161,6 +161,19 @@ def compare(base, cur):
                     warns.append(msg + f" s ({ratio:.1f}x; runtime is noisy, fails over 2x)")
             elif d > 0.02 * bv:
                 fails.append(msg + (" (worse by more than 2%)" if worse > 0 else " (fewer hard blocks: logic fell back to LUTs)"))
+    # A baseline recorded on a different commit is history, not a measurement.
+    # Comparing against it can blame a real regression on whichever change
+    # happened to come later (G67: blinky was reported "worse by more than
+    # 0.3 ns" against a baseline 37 commits old, when in fact its LUT count had
+    # halved and nothing had regressed at all). Say so, so the message is not
+    # read as a code defect.
+    stale = sorted({b.get("commit") for b in base.values() if b.get("commit")} - {c.get("commit") for c in cur.values()})
+    if stale and fails:
+        warns.append(
+            "baseline.json was recorded at " + ", ".join(x[:9] for x in stale)
+            + " and this run is at " + ", ".join(sorted({c.get("commit") for c in cur.values() if c.get("commit")})[:1] or ["an unknown commit"])
+            + ": check the regression is not history drift across those commits before bisecting (run --accept to re-record)"
+        )
     return fails, warns
 
 
@@ -313,6 +326,18 @@ zedbit timing: synth 0.1s, device 1.6s, pack+place 2.7s, route 17.0s, bitgen 1.4
     assert compare({"d": nb}, {"d": dict(nb, dsp=0)})[0] != []          # counts still gated
     assert compare({"d": nb}, {"d": dict(nb, wall_s=500.0)}) == ([], [])  # runtime not
     assert len(compare({"d": nb}, {"d": dict(b)})[1]) == 1             # now builds: warning
+    # G67: a regression against a baseline from another commit must say the
+    # baseline is stale, so the message is not read as a code defect.
+    old_b = dict(b, commit="ae5deb8", slack_ns=b["slack_ns"] + 0.5)
+    f2, w2 = compare({"d": old_b}, {"d": dict(b, commit="eb67399")})
+    assert len(f2) == 1 and "slack_ns" in f2[0], f2
+    assert any("recorded at ae5deb8" in w for w in w2), w2
+    # Same commit, same numbers: no stale warning.
+    f3, w3 = compare({"d": dict(b, commit="eb67399")}, {"d": dict(b, commit="eb67399")})
+    assert (f3, w3) == ([], []), (f3, w3)
+    # A stale baseline with no regressions stays quiet: nothing to misread.
+    f4, w4 = compare({"d": dict(b, commit="ae5deb8")}, {"d": dict(b, commit="eb67399")})
+    assert (f4, w4) == ([], []), (f4, w4)
     t = check_targets([{"gap": "G1", "design": "d", "metric": "lut", "max": 50, "goal": ""},
                        {"gap": "G9", "design": "d", "metric": "ok", "eq": True, "goal": ""},
                        {"gap": "G4", "design": "x", "metric": "t_route", "max": 1, "goal": ""}], {"d": b})
