@@ -1,7 +1,7 @@
 // Rung 1 on the board: Ibex (ysyx_ibex, the same core as ibex_obs_wrap) running
-// a program from a small ROM at 40 MHz (Vivado's own Fmax for this core is
-// 38.9 MHz). The ZedBoard's 100 MHz oscillator goes through one MMCM
-// (VCO 1000 MHz / 25). The program counts and writes the count to the LEDs
+// a program from a small ROM at 38.9 MHz, Vivado's own Fmax for this core.
+// The ZedBoard's 100 MHz oscillator goes through one MMCM (VCO 700 MHz / 18
+// = 38.89 MHz). The program counts and writes the count to the LEDs
 // about four times a second:
 //
 //   30000080  lui  x1, 0x10000      ; LED register address
@@ -23,8 +23,8 @@ module zedboard_ibex_soc (
     logic clk_fb, clk_mmcm, clk_sys, locked;
     MMCME2_BASE #(
         .BANDWIDTH("OPTIMIZED"), .CLKIN1_PERIOD(10.0), .DIVCLK_DIVIDE(1),
-        .CLKFBOUT_MULT_F(10.0), .CLKFBOUT_PHASE(0.0),
-        .CLKOUT0_DIVIDE_F(25.0), .CLKOUT0_DUTY_CYCLE(0.5), .CLKOUT0_PHASE(0.0),
+        .CLKFBOUT_MULT_F(7.0), .CLKFBOUT_PHASE(0.0),
+        .CLKOUT0_DIVIDE_F(18.0), .CLKOUT0_DUTY_CYCLE(0.5), .CLKOUT0_PHASE(0.0),
         .REF_JITTER1(0.010), .STARTUP_WAIT("FALSE")
     ) u_mmcm (
         .CLKIN1(clk), .CLKFBIN(clk_fb), .CLKFBOUT(clk_fb), .CLKOUT0(clk_mmcm),
