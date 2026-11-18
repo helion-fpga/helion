@@ -35,14 +35,42 @@ TIMES = [("t_synth", r"synthesized in ([\d.]+)s"), ("t_pack_place", r"placed in 
          ("t_route", r"routed in ([\d.]+)s"), ("t_device", r"device ([\d.]+)s,"), ("t_bitgen", r"bitgen ([\d.]+)s")]
 
 COUNT_KEYS = ("lut", "ff", "carry", "ramb18", "ramb36", "dsp")
+# Keys the `zedbit: summary` JSON line must carry (G44). Keep in step with the
+# emitter in crates/helion-xilinx7/examples/zedbit.rs.
+SUMMARY_KEYS = COUNT_KEYS + ("lutram", "pad", "lut_levels", "t_synth", "t_device",
+                             "t_pack_place", "t_route", "t_bitgen", "period_ns",
+                             "slack_ns", "failing", "endpoints", "features", "fasm")
 # key, direction in which a change is worse (+1: higher is worse)
 GATES = [("lut", 1), ("ff", 1), ("carry", -1), ("ramb18", -1), ("ramb36", -1), ("dsp", -1),
          ("slack_ns", -1), ("wall_s", 1), ("t_route", 1)]
 
 
 def parse(text):
-    """Numbers from zedbit's output (stdout and stderr together)."""
+    """Numbers from zedbit's output (stdout and stderr together).
+
+    The `zedbit: summary {...}` line is the contract (G44) and is read first.
+    The regexes below stay as a fallback for logs written before it existed;
+    if the summary line is present but a gate key is missing from it, that is
+    an error rather than a silent `None`, so a renamed key cannot quietly
+    disable a regression gate.
+    """
     r = {}
+    m = re.search(r"^zedbit: summary (\{.*\})$", text, re.M)
+    if m:
+        summary = json.loads(m.group(1))
+        for k in SUMMARY_KEYS:
+            if k not in summary:
+                raise SystemExit(f"qor: zedbit summary line has no `{k}` (got {sorted(summary)})")
+        r.update({k: summary[k] for k in SUMMARY_KEYS})
+        # Integers where the value is a count, so reports stay readable.
+        for k in COUNT_KEYS + ("lut_levels", "failing", "endpoints", "features", "fasm"):
+            r[k] = int(r[k])
+        p, sl = r["period_ns"], r["slack_ns"]
+        r["fmax_mhz"] = round(1000 / (p - sl), 1) if p > sl else None
+        clocks = re.findall(r"zedbit timing: clock (\S+): period ([\d.]+) ns", text)
+        r["clock"] = "/".join(c for c, cp in clocks if float(cp) == p) or None
+        r["front"] = "zb" if "using the zb front end" in text else "v2"
+        return r
     packed = re.search(r"^zedbit: packed (.*)$", text, re.M)
     for k, pat in COUNTS:
         m = packed and re.search(pat, packed.group(1))

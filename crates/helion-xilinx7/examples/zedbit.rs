@@ -89,9 +89,14 @@ fn synth_v2(paths: &[&str], top: Option<&str>) -> Result<(Design, Vec<(String, S
     for w in &s.warnings {
         eprintln!("zedbit: warning: {w}");
     }
+    LUT_LEVELS.store(s.depth as usize, std::sync::atomic::Ordering::Relaxed);
     eprintln!("zedbit synth: v2 front end, {} LUTs, {} flops, {} LUT levels", s.luts, s.ffs, s.depth);
     Ok((s.design, renames))
 }
+
+/// LUT levels from the front end (G44: the summary line reports it, and
+/// `synth()` does not return it, so the synthesis pass records it here).
+static LUT_LEVELS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn synth(design_arg: &str, top: Option<&str>, front: &str) -> Result<(Design, Vec<(String, String)>), String> {
     let paths: Vec<&str> = design_arg.split(',').filter(|p| !p.is_empty()).collect();
@@ -547,6 +552,36 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
         (t_route - t_place).as_secs_f64(),
         (t0.elapsed() - t_route).as_secs_f64()
     );
+    // One machine-readable line (G44). tools/qor/run.py scraped the human
+    // lines above with regexes and could silently record `null` for a number
+    // when the wording changed; this line is the contract it reads instead.
+    // Keep the keys in step with `COUNTS`/`TIMES` in tools/qor/run.py.
+    let ramb18 = packed.brams.len() - ramb36;
+    println!(
+        "zedbit: summary {}",
+        json_object(&[
+            ("lut", packed.luts.len() as f64),
+            ("ff", packed.ffs.len() as f64),
+            ("carry", packed.carries.len() as f64),
+            ("ramb36", ramb36 as f64),
+            ("ramb18", ramb18 as f64),
+            ("dsp", packed.dsps.len() as f64),
+            ("lutram", packed.lutrams.len() as f64),
+            ("pad", packed.iobs.len() as f64),
+            ("lut_levels", LUT_LEVELS.load(std::sync::atomic::Ordering::Relaxed) as f64),
+            ("t_synth", t_synth.as_secs_f64()),
+            ("t_device", (t_dev - t_synth).as_secs_f64()),
+            ("t_pack_place", (t_place - t_dev).as_secs_f64()),
+            ("t_route", (t_route - t_place).as_secs_f64()),
+            ("t_bitgen", (t0.elapsed() - t_route).as_secs_f64()),
+            ("period_ns", ta.period_ps as f64 / 1000.0),
+            ("slack_ns", ta.wns_ps as f64 / 1000.0),
+            ("failing", ta.failing_endpoints as f64),
+            ("endpoints", ta.endpoints as f64),
+            ("features", r.applied as f64),
+            ("fasm", bs.fasm.len() as f64),
+        ])
+    );
     println!(
         "zedbit: {} -> {} ({} FASM lines, {} features, cells {:?}, {} luts / {} ffs / {} iobs packed)",
         design_path,
@@ -559,4 +594,15 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
         packed.iobs.len()
     );
     Ok(())
+}
+
+/// A one-line JSON object of numbers, without pulling a serializer into this
+/// example (every value is a count or a duration, so `{:?}` on f64 is a valid
+/// JSON number). Keys are fixed and ASCII, so no escaping is needed.
+fn json_object(fields: &[(&str, f64)]) -> String {
+    let body: Vec<String> = fields
+        .iter()
+        .map(|(k, v)| format!("\"{k}\":{v:?}"))
+        .collect();
+    format!("{{{}}}", body.join(","))
 }
