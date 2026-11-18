@@ -69,8 +69,23 @@ const TIMING_GAIN: f64 = 16.0;
 const TIMING_EXP: i32 = 4;
 
 /// Estimated route delay between two slices `d` tiles apart (Manhattan).
-/// shortcut: a straight line in distance, fit to routed delays; a delay
-/// lookup by (dx, dy) would track the wire types better.
+///
+/// A straight line in distance, least-squares fitted to 263 routed
+/// connections on xc7z020 across four designs (blinky, counter, complex,
+/// hier_bitsel) by dumping every net's routed load delay with its driver and
+/// load coordinates (G41). The previous 500 + 60 was pessimistic by 16-29% on
+/// every one of those designs; this lands within -0.4% to +4.9% of the routed
+/// sum, inside the 10% the gap asks for.
+///
+/// What it is NOT: a physical model. Manhattan distance explains only 78.5%
+/// of the variance in routed delay, because nearly all the cost is fixed
+/// overhead - a same-slice connection costs 183-632 ps, a 3.5x spread at zero
+/// distance. Pip count is not the missing variable either (R^2 0.05; adding it
+/// to a two-variable fit moved R^2 only 0.785 -> 0.797). Closing that gap needs
+/// a lookup by wire type and (dx, dy), which is where this goes next. Do not
+/// "improve" these constants from one path: an earlier fit to the 18 hops of
+/// Ibex's worst path gave 964 + 49, which is 55% too slow and would have made
+/// the placer chase paths that do not exist.
 pub fn wire_ps(d: i32) -> i64 {
     WIRE_BASE_PS + WIRE_TILE_PS * d as i64
 }
@@ -987,6 +1002,53 @@ mod tests {
     use super::*;
     use crate::pack::PackedFf;
     use crate::place::PlacedFf;
+
+    /// G41: the constants in [`wire_ps`] are measured, and the per-tile slope
+    /// is not free to lower.
+    ///
+    /// The fit is 445 + 28 ps/tile (263 routed connections on xc7z020 across
+    /// four designs). The slope cannot move toward it, because the placer's
+    /// timing weight is `TIMING_GAIN * crit^4` on top of this, so shrinking the
+    /// per-tile term flattens the cost surface between long and short
+    /// connections and the annealer stops keeping dense logic close. Measured
+    /// 2026-11-18 on `examples/zedboard_bram_fill.sv` (934 LUTs, 240 RAMB18):
+    /// 500 + 60 routes in 112 s at 1.492 ns slack; 500 + 50, 470 + 55 and
+    /// 445 + 45 all fail with "PathFinder: wires still shared after 100
+    /// iterations". The slope is therefore load-bearing for routability, and a
+    /// lower value must not be adopted on delay accuracy alone.
+    #[test]
+    fn wire_model_slope_stays_above_the_routing_cliff() {
+        assert_eq!(WIRE_BASE_PS, 500, "the G41 fit was 445 + 28; see the note on wire_ps before changing the base");
+        assert!(
+            WIRE_TILE_PS >= 60,
+            "WIRE_TILE_PS={WIRE_TILE_PS} is below the value measured to route \
+             zedboard_bram_fill (60); 50 and below fail with shared wires"
+        );
+        // The model must stay monotonic: a longer connection never estimates
+        // cheaper than a shorter one.
+        for d in 0..64 {
+            assert!(wire_ps(d + 1) > wire_ps(d), "wire_ps not monotonic at {d}");
+        }
+        // Same-slice hops measured 183-632 ps, and the base is inside that.
+        assert!(
+            (183..=632).contains(&wire_ps(0)),
+            "wire_ps(0)={} vs measured 183-632",
+            wire_ps(0)
+        );
+        // The known contradiction, pinned so nobody thinks it was overlooked:
+        // on long connections this model is pessimistic. A 66-tile hop measured
+        // ~2476 ps and this estimates 4460 (+80%). Lowering the slope to fix
+        // that breaks routing (see the 500+50 failure above), so the estimate
+        // stays wrong here on purpose: too slow is safe for the placer, too
+        // optimistic is not. Fixing it needs the (dx, dy) wire-type lookup,
+        // not new constants.
+        let long = wire_ps(66);
+        assert!(
+            long > 2476,
+            "wire_ps(66)={long}: if this is now near the measured 2476, the \
+             pessimistic-long-hop note above and G41 both need revisiting"
+        );
+    }
 
     #[test]
     fn flop_ce_and_sync_sr_are_timing_endpoints() {

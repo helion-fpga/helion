@@ -474,6 +474,58 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
     eprintln!("zedbit: routing");
     let routed = be.route(&placed)?;
     let t_route = t0.elapsed();
+    // G41 wire-model probe: `HELION_HOP_DUMP=<path>` writes
+    // `<dx> <dy> <lx> <ly> <routed_ps> <pips>` for every fabric load, so the
+    // placer's wire estimate can be fitted on all connections rather than on a
+    // single worst path (fitting one path is what produced the bad 964 + 49
+    // figure). Off unless the variable is set.
+    if let Some(dst) = std::env::var_os("HELION_HOP_DUMP") {
+        let mut xy: std::collections::HashMap<&str, (i32, i32)> = std::collections::HashMap::new();
+        for l in &routed.placed.luts {
+            if let Some(p) = helion_xilinx7::place::parse_site_xy(&l.site) { xy.insert(l.site.as_str(), p); }
+        }
+        for f in &routed.placed.ffs {
+            if let Some(p) = helion_xilinx7::place::parse_site_xy(&f.site) { xy.insert(f.site.as_str(), p); }
+        }
+        for c in &routed.placed.carries {
+            if let Some(p) = helion_xilinx7::place::parse_site_xy(&c.site) { xy.insert(c.site.as_str(), p); }
+        }
+        // Driver site per net: join the packed cells (which know their nets) to
+        // the placed cells (which know their sites) on the cell name.
+        let site_of = |name: &str| {
+            routed
+                .placed
+                .luts
+                .iter()
+                .map(|l| (l.name.as_str(), l.site.as_str()))
+                .chain(routed.placed.ffs.iter().map(|f| (f.name.as_str(), f.site.as_str())))
+                .find(|(n, _)| *n == name)
+                .and_then(|(_, s)| helion_xilinx7::place::parse_site_xy(s))
+        };
+        let mut drv_xy: std::collections::HashMap<&str, (i32, i32)> = std::collections::HashMap::new();
+        for l in &routed.placed.packed.luts {
+            if let Some(p) = site_of(&l.name) { drv_xy.insert(l.output_net.as_str(), p); }
+        }
+        for f in &routed.placed.packed.ffs {
+            if let Some(p) = site_of(&f.name) { drv_xy.insert(f.q_net.as_str(), p); }
+        }
+        let mut lines = format!("# {} hops, part {part}\n", routed.load_delays.len());
+        // Pips per net, to test whether the cost is driven by hop count
+        // (mux levels) rather than by Manhattan distance.
+        let mut pips_of: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for n in &routed.nets {
+            if let helion_xilinx7::route::RouteKind::Pips(ps) = &n.kind {
+                pips_of.insert(n.net.as_str(), ps.len());
+            }
+        }
+        for ((net, site, pin), &delay) in routed.load_delays.iter() {
+            let (lx, ly) = xy.get(site.as_str()).copied().unwrap_or((-1, -1));
+            let (dx, dy) = drv_xy.get(net.as_str()).copied().unwrap_or((-1, -1));
+            let np = pips_of.get(net.as_str()).copied().unwrap_or(0);
+            lines.push_str(&format!("{dx} {dy} {lx} {ly} {delay} {np}\n"));
+        }
+        let _ = std::fs::write(dst, lines);
+    }
     eprintln!("zedbit: routed in {:.1}s", (t_route - t_place).as_secs_f64());
     let mut period = xdc_period_ps(&xdc);
     // Flops on both clock edges: a path from one edge to the other has half
