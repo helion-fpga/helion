@@ -226,7 +226,14 @@ thread_local! {
     /// Per-net criticality (0..=255) of the placement being routed, set by
     /// [`route`]; read where a net's search options are built.
     static NET_CRIT: std::cell::RefCell<HashMap<String, u8>> = std::cell::RefCell::new(HashMap::new());
+    /// Set once the rip-up phase has displaced enough nets: a net then takes a
+    /// free path or none (see [`NO_FREE_PATH`]).
+    static FREE_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// What [`route_net`] returns, as its error, when [`FREE_ONLY`] is set and a
+/// load has no free path: the caller leaves the net for PathFinder.
+const NO_FREE_PATH: &str = "route: no free path (left for PathFinder)";
 
 /// Criticality as the router uses it: only nets close to the critical path
 /// get relief (the cube; 8 left Ibex at 38.1 MHz, 3 gives 40.7), so most nets still negotiate at full price. `HELION_ROUTE_CRIT_EXP` overrides the power.
@@ -702,9 +709,12 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     // every net that finds no free path searches through other nets' wires
     // and displaces them (the 108,000-net fill made 3 net routes a second
     // and had not finished its first pass after half an hour). So the
-    // threshold is capped, and reaching it ends the phase at once: nets not
-    // routed yet are simply routed by PathFinder's first iteration.
+    // threshold is capped, and past it no net displaces another: the rest of
+    // the pass routes what has a free path and leaves the others, with the
+    // nets already displaced, to PathFinder.
     let pf_after = (net_names.len() / 4 + 500).min(4000);
+    FREE_ONLY.with(|f| f.set(false));
+    let mut deferred: Vec<String> = Vec::new();
     let mut rips = 0usize;
     let total_nets = net_names.len();
     // HELION_ROUTE_RIPSTATS: with the progress line, the nets ripped up most
@@ -720,8 +730,9 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     let mut t_report = t_start;
     let mut routed_count = 0usize;
     loop {
-        if rips > pf_after {
-            break;
+        if rips > pf_after && !FREE_ONLY.with(|f| f.get()) {
+            FREE_ONLY.with(|f| f.set(true));
+            eprintln!("route: {rips} rip-ups; the rest of the pass takes free paths only");
         }
         let Some(net) = queue.pop_front() else { break };
         queued.remove(&net);
@@ -825,7 +836,13 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
             // The cut only dropped branches no load needed.
             RouteKind::Pips(Vec::new())
         } else {
-            route_net(&net, drivers[0], &todo, &clock_spine_nets, device, &claimed, &mut delays, &seed)?
+            match route_net(&net, drivers[0], &todo, &clock_spine_nets, device, &claimed, &mut delays, &seed) {
+                Err(e) if e == NO_FREE_PATH => {
+                    deferred.push(net);
+                    continue;
+                }
+                r => r?,
+            }
         };
         let kind = match kind {
             RouteKind::Pips(mut p) if !kept.is_empty() => {
@@ -946,9 +963,11 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         nets.push(RoutedNet7 { net, kind });
     }
 
-    if !queue.is_empty() {
-        eprintln!("route: {} nets still queued after {rips} rip-ups; PathFinder", queue.len());
-        pathfinder(&net_eps, &clock_spine_nets, device, &mut nets, &mut claimed, &mut load_delays, queue.into_iter().collect())?;
+    FREE_ONLY.with(|f| f.set(false));
+    let left: Vec<String> = queue.into_iter().chain(deferred).collect();
+    if !left.is_empty() {
+        eprintln!("route: {} nets still queued after {rips} rip-ups; PathFinder", left.len());
+        pathfinder(&net_eps, &clock_spine_nets, device, &mut nets, &mut claimed, &mut load_delays, left)?;
     }
 
     // BUFGCTRL control-pin tie-offs. The static config (emit.rs) sets pin
@@ -1381,6 +1400,9 @@ fn route_net(
             // else the cheapest path through other nets' wires, near the
             // net and then anywhere. The caller rips up the displaced nets.
             for (negotiate, bbox, cap_detour) in [(false, 8, true), (true, 8, false), (true, 0, false)] {
+                if negotiate && FREE_ONLY.with(|f| f.get()) {
+                    return Err(NO_FREE_PATH.to_string());
+                }
                 fast = device.route_fast((&src_tile, &src_wire), &tree, &sinks, RouteOpts { negotiate, bbox, cap_detour, ..opts }, net, claimed);
                 if !matches!(fast, Some(None)) {
                     break;
