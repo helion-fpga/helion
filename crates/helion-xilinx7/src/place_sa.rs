@@ -48,6 +48,15 @@ struct Net {
 /// only decide where the cluster sits.
 const INTERNAL_WEIGHT: i64 = 8;
 
+/// Extra weight per additional unit on a net that is anchored to fixed
+/// blocks (block RAMs / DSPs). A replicated driver copy drives the pins of a
+/// whole group of blocks, and at a flat weight it drifts away from them
+/// (G60: a copy 128 tiles from its RAMs). A group is 8 blocks, so fanout
+/// scaling makes the tie to its own blocks dominate the pull between groups,
+/// which is what places the copy inside its group. This also stands in for
+/// the fanout term the wire model lacks (G41).
+const ANCHOR_FANOUT_WEIGHT: i64 = 2;
+
 /// Nets above this many pins are left out of the cost (resets, enables):
 /// they reach everywhere whatever the placement, and cost time per move.
 const MAX_PINS: usize = 96;
@@ -470,7 +479,14 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
             nets.push(Net { fixed, units: units.clone(), weight: weight.into() });
             true
         };
-        if add(fixed, INTERNAL_WEIGHT, &mut nets) {
+        // A net anchored to fixed blocks (a block RAM / DSP group) gets extra
+        // weight per fixed pin, so a replicated driver copy stays with its own
+        // group instead of drifting between groups (G60).
+        let anchor_w = match fixed {
+            Some(_) => INTERNAL_WEIGHT + ANCHOR_FANOUT_WEIGHT * (ps.len() as i64 - units.len() as i64),
+            None => INTERNAL_WEIGHT,
+        };
+        if add(fixed, anchor_w, &mut nets) {
             net_names.push(name);
         }
         if has_pad && add(with_pads, 1, &mut nets) {
