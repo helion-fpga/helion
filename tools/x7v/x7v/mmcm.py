@@ -483,7 +483,7 @@ RTL_PRIMS = ("// x7v primitive shims for RTL simulation (see x7v/mmcm.py)\n`time
              + "".join(_shim(nm, mm, adv) for nm, mm, adv in (("MMCME2_BASE", True, False), ("MMCME2_ADV", True, True),
                                                              ("PLLE2_BASE", False, False), ("PLLE2_ADV", False, True)))
              + "\nmodule BUFG(input I, output O); assign O = I; endmodule\n"
-             + "module BUFGCE(input I, input CE, output O); assign O = I & CE; endmodule\n"
+             + 'module BUFGCE #(parameter SIM_DEVICE = "7SERIES") (input I, input CE, output O); assign O = I & CE; endmodule\n'
              + VERILOG_MODEL)
 
 PRIM_NAMES = ("MMCME2_BASE", "MMCME2_ADV", "PLLE2_BASE", "PLLE2_ADV", "BUFG", "BUFGCE")
