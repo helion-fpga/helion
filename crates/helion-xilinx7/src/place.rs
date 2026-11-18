@@ -1407,6 +1407,12 @@ fn place_dsps(
 
 /// Find a contiguous vertical sequence of `len` free sites in `pool` having the
 /// same `X` coordinate and consecutive `Y` coordinates (`y, y+1, ...`).
+///
+/// The search is in a fixed order — columns by ascending `X`, rows by ascending
+/// `Y` — so the same netlist always gets the same sites (contract R2). `len ==
+/// 1` used to return the first free entry in pool order with no column
+/// reasoning, which both ignored the column ordering the rest of this function
+/// defines and made the choice depend on pool construction order (G9/D2).
 fn find_column_window(
     pool: &[(String, String)],
     len: usize,
@@ -1415,28 +1421,23 @@ fn find_column_window(
     if len == 0 {
         return Some(Vec::new());
     }
-    if len == 1 {
-        return pool
-            .iter()
-            .find(|(_, s)| !used.contains(s))
-            .cloned()
-            .map(|p| vec![p]);
-    }
     let mut by_col: HashMap<i32, Vec<(i32, String, String)>> = HashMap::new();
+    // Sites whose name has no (X, Y): usable only by a length-1 request, and
+    // only after every addressable site, so they never displace real columns.
+    let mut unplaced: Vec<(String, String)> = Vec::new();
     for (tile, site) in pool {
-        if !used.contains(site) {
-            if let Some((x, y)) = parse_site_xy(site) {
-                by_col
-                    .entry(x)
-                    .or_default()
-                    .push((y, tile.clone(), site.clone()));
-            }
+        if used.contains(site) {
+            continue;
+        }
+        match parse_site_xy(site) {
+            Some((x, y)) => by_col.entry(x).or_default().push((y, tile.clone(), site.clone())),
+            None => unplaced.push((tile.clone(), site.clone())),
         }
     }
     let mut cols: Vec<i32> = by_col.keys().copied().collect();
     cols.sort();
     for col in cols {
-        let entries = by_col.get_mut(&col)?;
+        let Some(entries) = by_col.get_mut(&col) else { continue };
         entries.sort_by_key(|(y, _, _)| *y);
         if entries.len() < len {
             continue;
@@ -1450,6 +1451,12 @@ fn find_column_window(
                         .collect(),
                 );
             }
+        }
+    }
+    // Nothing addressable fit; a single request may still take a named site.
+    if len == 1 {
+        if let Some(p) = unplaced.into_iter().next() {
+            return Some(vec![p]);
         }
     }
     None
