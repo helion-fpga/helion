@@ -108,3 +108,65 @@ fn dsp_control_pins_route() {
     }
     assert!(failed.is_empty(), "DSP control pins failed to route:\n{}", failed.join("\n"));
 }
+
+/// The point of G35: a real multiplier. Two flops feed `A` and `B`, the DSP
+/// multiplies, and `P` leaves a third flop. Before the fix this could not be
+/// routed at all; now it packs, places, routes, and its DSP pins take part in
+/// timing (G32).
+#[test]
+fn a_dsp_multiplier_packs_places_routes_and_is_timed() {
+    let mut d = Design::new("mul");
+    d.add_port("clk", PortDir::In);
+    d.add_port("a", PortDir::In);
+    d.add_port("b", PortDir::In);
+    d.add_port("p", PortDir::Out);
+    let locs = [("clk", "Y9"), ("a", "V5"), ("b", "U14"), ("p", "R16")];
+    for port in d.ports.iter_mut() {
+        if let Some((_, loc)) = locs.iter().find(|(n, _)| port.name == intern(n)) {
+            port.attrs.set("LOC", *loc);
+        }
+    }
+    for (ff, pin, q) in [("u_ffa", "a", "qa"), ("u_ffb", "b", "qb")] {
+        d.add_cell(ff, CellKind::Hff);
+        d.connect("clk", ff, "CLK");
+        d.connect(pin, ff, "D");
+        d.connect(q, ff, "Q");
+    }
+    d.add_cell(
+        "u_dsp",
+        CellKind::BlackBox {
+            module: intern("DSP48E1"),
+        },
+    );
+    for (k, v) in [("PREG", "1"), ("AREG", "1"), ("BREG", "1")] {
+        d.set_cell_attr("u_dsp", k, v).unwrap();
+    }
+    d.connect("clk", "u_dsp", "CLK");
+    d.connect("qa", "u_dsp", "A0");
+    // `D`, not `B`: B0 is fed over DSP_IMUX22_0 like A and was never affected
+    // by G35. D0 goes through DSP_BYP, so it exercises the fix. Real usage
+    // reaches D via INMODE's pre-adder (D + A*B).
+    d.connect("qb", "u_dsp", "D0");
+    d.connect("p", "u_dsp", "P0");
+
+    let be = Xilinx7Backend::open("xc7z020").unwrap();
+    let packed = be.pack(&d).expect("pack");
+    assert_eq!(packed.dsps.len(), 1, "one DSP");
+    let b_pins: Vec<&str> = packed.dsps[0]
+        .pins
+        .iter()
+        .filter(|(_, n, _)| n == "qb")
+        .map(|(p, _, _)| p.as_str())
+        .collect();
+    assert!(!b_pins.is_empty(), "D0 must be driven by the second flop");
+    let placed = be.place(&packed).expect("place");
+    let routed = be.route(&placed).expect("a DSP multiplier must route");
+
+    // G32: the DSP's clocked inputs are setup endpoints, so the analysis sees
+    // the path into the DSP rather than skipping it.
+    let a = helion_xilinx7::timing::analyze_clocks(&routed, &|c: &str| {
+        c.contains("clk").then_some(10_000)
+    })
+    .expect("timing");
+    assert!(a.endpoints > 0, "the DSP's inputs were not counted as endpoints");
+}
