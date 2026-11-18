@@ -96,6 +96,8 @@ const WIRE_TILE_PS: i64 = 60;
 enum Loc {
     Unit(u32),
     Site(usize),
+    /// A fixed point that is not a slice: a block RAM or DSP pin.
+    At(i32, i32),
 }
 
 /// A LUT or CARRY4 for timing: input nets (and whether the input is the
@@ -114,6 +116,8 @@ struct TGraph {
     drv: Vec<Option<Loc>>,
     /// Nets driven by a flop.
     ff_q: Vec<u32>,
+    /// Nets launched by a block RAM or DSP output, with the clock-to-out delay.
+    hard_q: Vec<(u32, i64)>,
     /// Flop D, CE and synchronous SR inputs: (net, flop place).
     ends: Vec<(u32, Loc)>,
     /// Net names, to print the estimated critical path (`HELION_PLACE_DEBUG`).
@@ -129,16 +133,25 @@ impl TGraph {
     fn criticality(&self, site_of: &dyn Fn(Loc) -> usize, xy: &dyn Fn(usize) -> (i32, i32)) -> (Vec<f64>, i64) {
         use crate::timing::{CARRY_CI_TO_CO_PS, CARRY_S_TO_O_PS, FF_CKQ_PS, FF_SETUP_PS, SITE_INTERNAL_PS};
         let n = self.drv.len();
+        // Slice (if it is one) and coordinates of a place.
+        let pt = |l: Loc| -> (Option<usize>, (i32, i32)) {
+            match l {
+                Loc::At(x, y) => (None, (x, y)),
+                _ => {
+                    let s = site_of(l);
+                    (Some(s), xy(s))
+                }
+            }
+        };
         let wire = |net: u32, to: Loc, dedicated: bool| -> i64 {
             let Some(from) = self.drv[net as usize] else { return 0 };
-            let (a, b) = (site_of(from), site_of(to));
+            let ((a, (x0, y0)), (b, (x1, y1))) = (pt(from), pt(to));
             if dedicated {
                 // CI to CO is the whole stage: take back the S-to-O cell delay.
                 CARRY_CI_TO_CO_PS as i64 - CARRY_S_TO_O_PS as i64
-            } else if a == b {
+            } else if a.is_some() && a == b {
                 SITE_INTERNAL_PS as i64
             } else {
-                let ((x0, y0), (x1, y1)) = (xy(a), xy(b));
                 wire_ps((x0 - x1).abs() + (y0 - y1).abs())
             }
         };
@@ -146,6 +159,9 @@ impl TGraph {
         let mut arr = vec![NONE; n];
         for &q in &self.ff_q {
             arr[q as usize] = FF_CKQ_PS as i64;
+        }
+        for &(q, cko) in &self.hard_q {
+            arr[q as usize] = cko;
         }
         for c in &self.cells {
             let mut a = NONE;
@@ -174,7 +190,7 @@ impl TGraph {
         if let (Some(names), Some(mut net)) = (&self.debug_names, worst) {
             // The estimated critical path, endpoint first.
             loop {
-                let at = self.drv[net as usize].map(site_of).map(xy);
+                let at = self.drv[net as usize].map(|l| pt(l).1);
                 eprintln!("place: est {:>6} ps  {} at {at:?}", arr[net as usize], names[net as usize]);
                 let Some(c) = self.cells.iter().find(|c| c.outs.contains(&net)) else { break };
                 let Some(&(i, _)) = c.ins.iter().filter(|&&(i, _)| arr[i as usize] > NONE).max_by_key(|&&(i, ded)| arr[i as usize] + wire(i, c.loc, ded)) else { break };
@@ -517,7 +533,15 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
     }
     let timed = std::env::var("HELION_PLACE_NO_TIMING").is_err();
     let debug = std::env::var("HELION_PLACE_DEBUG").is_ok();
-    let tg = if timed || debug { timing_graph(out, &site_idx, &unit_of_slot, &site_unit, &blocked) } else { None };
+    // Block RAM and DSP pins take part in timing at their block's tile.
+    let hard_xy: HashMap<&str, (i32, i32)> = out
+        .brams
+        .iter()
+        .map(|b| (b.name.as_str(), &b.tile))
+        .chain(out.dsps.iter().map(|d| (d.name.as_str(), &d.tile)))
+        .filter_map(|(n, t)| device.tile_xy(t).map(|xy| (n, xy)))
+        .collect();
+    let tg = if timed || debug { timing_graph(out, &site_idx, &unit_of_slot, &site_unit, &blocked, &hard_xy) } else { None };
     // Timing acts per connection: each driver-to-sink pair is a two-pin net
     // weighted by its criticality, so a critical sink is pulled to its
     // driver without dragging the rest of a high-fanout net along.
@@ -526,6 +550,7 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
         let at = |l: Loc| match l {
             Loc::Unit(u) => (Some(u), None),
             Loc::Site(s) => (None, Some((sites[s].2, sites[s].3))),
+            Loc::At(x, y) => (None, Some((x, y))),
         };
         for (net, sink) in g.conns() {
             let Some(from) = g.drv[net as usize] else {
@@ -584,17 +609,23 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
         }
         ((x1 - x0) as i64 + (y1 - y0) as i64) * net.weight.get()
     };
+    // `HELION_PLACE_TGAIN` / `HELION_PLACE_TEXP` override the timing weight
+    // (for tuning; the defaults are the constants above).
+    let env_num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok());
+    let tgain = env_num("HELION_PLACE_TGAIN").unwrap_or(TIMING_GAIN);
+    let texp = env_num("HELION_PLACE_TEXP").map(|v| v as i32).unwrap_or(TIMING_EXP);
     // Timing weights from the current places; returns the estimated critical path.
     let reweight = |nets: &[Net], pos: &[usize]| -> i64 {
         let Some(g) = &tg else { return 0 };
         let site_of = |l: Loc| match l {
             Loc::Unit(u) => pos[u as usize] / 4,
             Loc::Site(s) => s,
+            Loc::At(..) => unreachable!("criticality resolves fixed points itself"),
         };
         let (conn, dmax) = g.criticality(&site_of, &|s: usize| (sites[s].2, sites[s].3));
         for (c, ni) in conn.iter().zip(&conn_net) {
             if let Some(ni) = ni {
-                nets[*ni].weight.set((INTERNAL_WEIGHT as f64 * TIMING_GAIN * c.powi(TIMING_EXP)) as i64);
+                nets[*ni].weight.set((INTERNAL_WEIGHT as f64 * tgain * c.powi(texp)) as i64);
             }
         }
         dmax
@@ -868,6 +899,7 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
         let site_of = |l: Loc| match l {
             Loc::Unit(u) => pos[u as usize] / 4,
             Loc::Site(s) => s,
+            Loc::At(..) => unreachable!("criticality resolves fixed points itself"),
         };
         let (conn, _) = g.criticality(&site_of, &|s: usize| (sites[s].2, sites[s].3));
         for ((net, _), c) in g.conns().iter().zip(&conn) {
@@ -925,7 +957,14 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
 
 /// The timing graph of the placed design. `None` when the logic has a
 /// combinational cycle (timing reports that).
-fn timing_graph<'a>(out: &'a Placed7, site_idx: &HashMap<&str, usize>, unit_of_slot: &HashMap<usize, u32>, site_unit: &HashMap<usize, u32>, blocked: &HashSet<usize>) -> Option<TGraph> {
+fn timing_graph<'a>(
+    out: &'a Placed7,
+    site_idx: &HashMap<&str, usize>,
+    unit_of_slot: &HashMap<usize, u32>,
+    site_unit: &HashMap<usize, u32>,
+    blocked: &HashSet<usize>,
+    hard_xy: &HashMap<&str, (i32, i32)>,
+) -> Option<TGraph> {
     use crate::timing::{CARRY_S_TO_O_PS, LUT_PS};
     let packed = &out.packed;
     let mut ids: HashMap<&str, u32> = HashMap::new();
@@ -977,6 +1016,29 @@ fn timing_graph<'a>(out: &'a Placed7, site_idx: &HashMap<&str, usize>, unit_of_s
             ends.push((id(n), at));
         }
     }
+    // Block RAM and DSP pins: an output launches a path (clock to out), an
+    // input ends one. Without them a LUT between two blocks was placed by
+    // wirelength alone, at one end of a chip-long connection (G75).
+    // shortcut: every block is taken as registered on both sides; a DSP used
+    // without its registers is a combinational cell and wants an edge here.
+    let mut hard_q: Vec<(u32, i64)> = Vec::new();
+    let mut hard_locs: Vec<(u32, Loc)> = Vec::new();
+    let hard = packed
+        .brams
+        .iter()
+        .map(|b| (b.name.as_str(), &b.pins, crate::timing::BRAM_CKO_PS as i64))
+        .chain(packed.dsps.iter().map(|d| (d.name.as_str(), &d.pins, crate::timing::dsp_cko_ps(d) as i64)));
+    for (name, pins, cko) in hard {
+        let Some(&(x, y)) = hard_xy.get(name) else { continue };
+        for (_, net, is_out) in pins {
+            if *is_out {
+                hard_q.push((id(net), cko));
+                hard_locs.push((id(net), Loc::At(x, y)));
+            } else {
+                ends.push((id(net), Loc::At(x, y)));
+            }
+        }
+    }
     let n = ids.len();
     let mut drv: Vec<Option<Loc>> = vec![None; n];
     let mut drv_cell: Vec<Option<usize>> = vec![None; n];
@@ -986,7 +1048,7 @@ fn timing_graph<'a>(out: &'a Placed7, site_idx: &HashMap<&str, usize>, unit_of_s
             drv_cell[o as usize] = Some(ci);
         }
     }
-    for (q, at) in ff_locs {
+    for (q, at) in ff_locs.into_iter().chain(hard_locs) {
         drv[q as usize] = Some(at);
     }
     // Topological order (Kahn) over cell-to-cell edges.
@@ -1029,7 +1091,7 @@ fn timing_graph<'a>(out: &'a Placed7, site_idx: &HashMap<&str, usize>, unit_of_s
     for (k, &i) in &ids {
         names[i as usize] = k.to_string();
     }
-    Some(TGraph { cells, drv, ff_q, ends, debug_names, names })
+    Some(TGraph { cells, drv, ff_q, hard_q, ends, debug_names, names })
 }
 
 #[cfg(test)]
