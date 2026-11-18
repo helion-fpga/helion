@@ -1666,16 +1666,33 @@ fn pack_cmt(
         .map_err(|_| format!("pack: {prim_name} {cell_name}: bad CLKFBOUT_PHASE"))?;
 
     // Validate VCO frequency: f_vco = (1000.0 / clkin1_period_ns) * clkfbout_mult_f / divclk_divide.
-    // 7-Series Artix-7 speed grade -1/-2/-3: MMCM VCO 600..=1600 MHz, PLL VCO 800..=2133 MHz.
+    //
+    // The legal range is speed-grade dependent (UG472, 7-Series CMT):
+    //
+    //            MMCM VCO (MHz)      PLL VCO (MHz)
+    //   -1       600 ..= 1200       800 ..= 1600
+    //   -2       600 ..= 1440       800 ..= 1866
+    //   -3       600 ..= 1600       800 ..= 2133
+    //
+    // This check used to apply only the -3 ceiling to every part, so on a -1
+    // part (the ZedBoard is xc7z020clg484-1) a design asking for, say, a
+    // 1400 MHz MMCM VCO packed clean and then had no legal configuration. G58.
+    //
+    // `pack` has no part/speed-grade in scope, so the safe ceiling is the
+    // slowest grade: anything accepted here is legal on every -1/-2/-3 part.
+    // A -2/-3 part loses some legal-but-fast configurations, which is a
+    // refusal rather than a wrong bitstream — the right side to be wrong on.
     let fin_mhz = 1000.0 / clkin1_period_ns;
     let vco_freq_mhz = fin_mhz * clkfbout_mult_f / (divclk_divide as f64);
     let (vco_min, vco_max) = match kind {
-        CmtKind::MmcmE2Adv => (600.0, 1600.0),
-        CmtKind::PllE2Adv => (800.0, 2133.0),
+        CmtKind::MmcmE2Adv => (600.0, 1200.0),
+        CmtKind::PllE2Adv => (800.0, 1600.0),
     };
     if !(vco_min..=vco_max).contains(&vco_freq_mhz) {
         return Err(format!(
-            "pack: {prim_name} {cell_name}: VCO frequency {vco_freq_mhz:.2} MHz out of legal range {vco_min}..={vco_max} MHz"
+            "pack: {prim_name} {cell_name}: VCO frequency {vco_freq_mhz:.2} MHz out of legal range \
+             {vco_min}..={vco_max} MHz (speed grade -1 ceiling; -2/-3 parts allow more, but pack has \
+             no part in scope)"
         ));
     }
 
