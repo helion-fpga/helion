@@ -20,6 +20,13 @@ R3 HROW taps: a CLK_HROW_CK_MUX_OUT_* <- CLK_HROW_*_CK_GCLKk pip needs
 R4 leaf buffers: an HCLK_L/R pip from HCLK_CK_BUFHCLKn needs
    ENABLE_BUFFER.HCLK_CK_BUFHCLKn, and the HCLK_CMT(_L) tile of the same
    clock row on the same side needs HCLK_CMT_CK_BUFHCLKn_USED.
+R5 leaves fed from the neighbouring HCLK tile: the row clock's buffer sits in
+   the tile it enters. An HCLK_L leaf from HCLK_CK_OUTIN_Ln takes BUFHCLKn
+   through the HCLK_R tile beside it (HCLK_CK_INOUT_Rn, a pip without bits),
+   so that HCLK_R tile needs ENABLE_BUFFER.HCLK_CK_BUFHCLKn; an HCLK_R leaf
+   from HCLK_CK_OUTIN_Rn (n = 0..3) needs ENABLE_BUFFER.HCLK_CK_BUFHCLK(8+n)
+   in the HCLK_L tile beside it. Without it the columns have no clock (the
+   2026-11-18 ZedBoard fault, HELION_GAPS.md G69/G73).
 """
 from __future__ import annotations
 
@@ -133,4 +140,21 @@ def check(db: Db, dec: DesignDecode) -> ClockReport:
             for c in cmts:
                 if not has(c, f"HCLK_CMT_CK_BUFHCLK{n}_USED"):
                     rep.errors.append(f"R4 {c}: row uses BUFHCLK{n} (via {t}) but lacks HCLK_CMT_CK_BUFHCLK{n}_USED")
+
+    # R5 leaves fed through the neighbouring HCLK tile.
+    hclk_at = {(tg[t]["grid_x"], tg[t]["grid_y"]): t for t in tg if tg[t]["type"] in ("HCLK_L", "HCLK_R")}
+    for t, fs in sorted(feats.items()):
+        ty = tg[t]["type"]
+        if ty not in ("HCLK_L", "HCLK_R"):
+            continue
+        side, other, dx = ("L", "HCLK_R", 1) if ty == "HCLK_L" else ("R", "HCLK_L", -1)
+        for n in sorted({int(m.group(1)) for f in fs if (m := re.match(rf"^HCLK_LEAF_CLK_B_\w+\.HCLK_CK_OUTIN_{side}(\d+)$", f))}):
+            buf = n if side == "L" else 8 + n
+            if buf > 11:
+                continue  # regional (BUFR) clocks: no buffer-enable feature
+            nb = hclk_at.get((tg[t]["grid_x"] + dx, tg[t]["grid_y"]))
+            if nb is None or tg[nb]["type"] != other:
+                rep.errors.append(f"R5 {t}: leaf from HCLK_CK_OUTIN_{side}{n} but no {other} tile beside it")
+            elif not has(nb, f"ENABLE_BUFFER.HCLK_CK_BUFHCLK{buf}"):
+                rep.errors.append(f"R5 {nb}: {t} takes BUFHCLK{buf} through it but it lacks ENABLE_BUFFER.HCLK_CK_BUFHCLK{buf}")
     return rep
