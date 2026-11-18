@@ -1802,7 +1802,11 @@ impl<'a> EmitDevice for XDevice<'a> {
                     }
                 }
             }
-            if (ttype == "HCLK_L" || ttype == "HCLK_R") && p.dst_wire.starts_with("HCLK_LEAF_CLK_B_") {
+            // The row clock's buffer sits in the tile it enters. A leaf in the
+            // neighbouring HCLK tile takes it through `HCLK_CK_INOUT_*`, and the
+            // buffer still has to be on (G69: without it every INT_L column's
+            // flops and block RAMs had no clock on silicon).
+            if (ttype == "HCLK_L" || ttype == "HCLK_R") && (p.dst_wire.starts_with("HCLK_LEAF_CLK_B_") || p.dst_wire.starts_with("HCLK_CK_INOUT_")) {
                 let f = format!("ENABLE_BUFFER.{}", p.src_wire);
                 if has(&ttype, &f) {
                     out.push(format!("{}.{f}", p.tile));
@@ -2214,6 +2218,18 @@ mod tests {
                 && f == "HCLK_CMT_CK_BUFHCLK8_USED"),
             "missing CMT USED, got {statics:?}"
         );
+    }
+
+    /// G69: a row clock taken into the neighbouring HCLK tile still needs
+    /// its buffer enabled in the tile it enters.
+    #[test]
+    fn row_clock_buffer_is_enabled_for_a_neighbour_tile_leaf() {
+        let (dev, maps) = test_z020();
+        let xdev = XDevice::new(dev, maps.clone());
+        let pip = |tile: &str, dst: &str, src: &str| RoutedPip { tile: tile.into(), src_wire: src.into(), dst_wire: dst.into(), is_pseudo: false };
+        let pips = [pip("HCLK_R_X22Y26", "HCLK_CK_INOUT_R0", "HCLK_CK_BUFHCLK0"), pip("HCLK_L_X21Y26", "HCLK_LEAF_CLK_B_BOTL0", "HCLK_CK_OUTIN_L0")];
+        let statics = xdev.clock_statics(&pips.iter().collect::<Vec<_>>());
+        assert!(statics.iter().any(|f| f == "HCLK_R_X22Y26.ENABLE_BUFFER.HCLK_CK_BUFHCLK0"), "got {statics:?}");
     }
 
     #[test]
