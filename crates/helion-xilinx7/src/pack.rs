@@ -3082,6 +3082,12 @@ fn insert_input_buffers(netlist: &Design, packed: &mut Packed7) -> Result<(), St
         }
     }
     let mut read: BTreeSet<String> = BTreeSet::new();
+    // Hard-block pins read and drive nets too (G70: a port feeding only a
+    // RAMB18E1/DSP48E1 pin got no pad and the pin silently read a constant).
+    let hard_pins = packed.brams.iter().flat_map(|b| b.pins.iter()).chain(packed.dsps.iter().flat_map(|d| d.pins.iter()));
+    for (_, net, is_out) in hard_pins {
+        if *is_out { driven.insert(net.clone()); } else { read.insert(net.clone()); }
+    }
     for l in &packed.luts {
         read.extend(l.input_nets.iter().flatten().cloned());
     }
@@ -3185,6 +3191,11 @@ fn insert_input_buffers(netlist: &Design, packed: &mut Packed7) -> Result<(), St
         }
         for x in packed.lutrams.iter_mut() {
             for (_, n, _) in x.ins.iter_mut() {
+                r(n);
+            }
+        }
+        for (_, n, is_out) in packed.brams.iter_mut().flat_map(|b| b.pins.iter_mut()).chain(packed.dsps.iter_mut().flat_map(|d| d.pins.iter_mut())) {
+            if !*is_out {
                 r(n);
             }
         }
@@ -3643,6 +3654,21 @@ mod tests {
         d.add_cell("u_ila", CellKind::Ila { net: intern("x") });
         let err = pack(&d).unwrap_err();
         assert!(err.contains("unsupported"), "got: {err}");
+    }
+
+    /// G70: an input port whose only load is a block RAM pin still gets its pad.
+    #[test]
+    fn pack_gives_a_port_read_only_by_a_block_ram_its_input_pad() {
+        let mut d = Design::new("ram_en");
+        d.add_port("clk", PortDir::In);
+        d.add_port("en", PortDir::In);
+        d.add_cell("u_ram", CellKind::BlackBox { module: intern("RAMB18E1") });
+        d.connect("clk", "u_ram", "CLKARDCLK");
+        d.connect("en", "u_ram", "ENARDEN");
+        d.connect("q0", "u_ram", "DOADO[0]");
+        let packed = pack(&d).unwrap();
+        assert!(packed.brams[0].pins.iter().any(|(p, n, _)| p == "ENARDEN" && n == "en"), "pins: {:?}", packed.brams[0].pins);
+        assert!(packed.iobs.iter().any(|i| i.dir == IobDir::In && i.net == "en"), "iobs: {:?}", packed.iobs.iter().map(|i| &i.net).collect::<Vec<_>>());
     }
 
     #[test]
