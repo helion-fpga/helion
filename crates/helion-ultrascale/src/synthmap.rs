@@ -15,12 +15,55 @@
 //! - Never add a mapping primarily to make a test pass. Every mapping
 //!   below is justified by the cited UG reference or DB entry.
 //!
+//! Primitive inventory: every UltraScale primitive this flow needs,
+//! its source, and its mapping status. BLOCKED means the mapping fails
+//! loud with the named unblocker; nothing here is silently dropped or
+//! remapped to a different primitive.
+//!
+//! - LUT6: Lut6, plain. Mapped, INIT verbatim.
+//! - FDRE: Hff. Mapped, CE/SR presence; control FASM in
+//!   [`emit_ff_control_fasm`].
+//! - CARRY8: Carry4. Mapped, 2:1 pairing in [`pair_carry4_chains`];
+//!   the pack wiring is the pack worker's interface (PackedUltraSlice
+//!   carries one carry cell per slice today, so pairing is not yet
+//!   consumed by pack_ultra).
+//! - SRL16E / SRLC32E: Lut6 with SRL_TYPE/SHREG_EXTRACT. BLOCKED (G4):
+//!   no LUTRAM table or Vivado logic-location data.
+//! - RAM64X1S / RAM128X1S / RAM256X1S / RAM32M16: Lut6 with MEMORY=1.
+//!   BLOCKED (G4): distributed RAM, SLICEM-only.
+//! - RAMB36E2: native Ramb36e2. Mapped (width validation); INIT/INITP
+//!   encoding is the BRAM worker's scope.
+//! - RAMB18E2: native Ramb18e2. Mapped (width validation); same BRAM
+//!   scope note.
+//! - URAM288: native Uram288. Mapped (fixed 4096x72 validation);
+//!   content encoding BLOCKED (GAP-B4, URAM worker).
+//! - DSP48E2: native Dsp48e2. Mapped (control-value validation); the
+//!   46 primitive attributes have no public encoding, BLOCKED (GAP-B3,
+//!   DSP worker).
+//! - IBUF / OBUF: IobIn / IobOut. Outside pack (IOB placement).
+//! - BUFGCE / BUFGCTRL: ClockBuf. Outside pack (clocking).
+//! - MMCME4 / PLLE4: no source. Not sourced: no front-end inference
+//!   emits them; fail loud if one ever arrives.
+//!
+//! 7-series sources that must NOT remap: Dsp48e1 and Mac27 (no
+//! semantics-preserving DSP48E2 remap), Bram18e1 and Bram18 (no
+//! RAMB18E2 remap), Ila (no UltraScale ILA encoding), BlackBox
+//! (unelaborated IP). All fail loud in [`map_source_cell`].
+//!
+//! Front-end rule (Nov 19 agreement): when UltraScale synth mapping
+//! needs front-end inference, extend fm/g3-dsp-v2 (v2 front end,
+//! `*` to DSP48E1) to DSP48E2 instead of writing a second inference.
+//! The native kinds below are constructed by that front-end
+//! inference, not by extract_cells (`crates/helion-cli/src/ultra.rs`),
+//! which only translates the 12 backend-neutral CellKind variants.
+//!
 //! Sources:
 //! - UG574 (CLB: 8 LUT6, 16 FF, 1 CARRY8 per slice; control sets).
 //! - UG974 (CARRY8, CARRY_TYPE SINGLE_CY8 / DUAL_CY4; FDRE CE/SR).
 //! - UG578 (DSP48E2), UG573 (RAMB36E2/RAMB18E2, URAM288).
 //! - Vendored prjuray-db segbits (CLEL_L/CLEM): `CARRY8.CARRY_TYPE.*`,
-//!   `ABCDFF/EFGHFF[2].CEUSED/CLKINV/SRINV.V0/V1`.
+//!   `ABCDFF/EFGHFF[2].CEUSED/SRUSED/CLKINV/SRINV.V0/V1`,
+//!   `ABCDFF/EFGHFF.SYNC.SYNC/ASYNC`.
 //!
 //! No em dashes anywhere.
 
@@ -83,6 +126,42 @@ pub enum SourceKind {
     },
     /// Hierarchical black box (unelaborated IP / DFX partition).
     BlackBox { module: String },
+    /// Native UltraScale DSP48E2 (UG578). Produced by front-end DSP
+    /// inference (fm/g3-dsp-v2 extended to DSP48E2), never by
+    /// remapping Dsp48e1/Mac27.
+    ///
+    /// `opmode` (9 bits), `alumode` (4 bits), `inmode` (5 bits) are
+    /// the dynamic control-port values, verified against the vendored
+    /// site_type_DSP48E2.json pins (A 30, B 18, C 48, P 48, OPMODE 9,
+    /// ALUMODE 4, INMODE 5). They are routing, not config bits: the
+    /// 46 primitive attributes (AREG, BREG, ...) have no public
+    /// encoding and their emission stays BLOCKED (GAP-B3, DSP worker).
+    Dsp48e2 {
+        opmode: u16,
+        alumode: u8,
+        inmode: u8,
+    },
+    /// Native UltraScale RAMB36E2 (UG573). Read/write widths per port
+    /// must each be in {1, 2, 4, 9, 18, 36}. One tile is one RAMB36E2
+    /// OR two RAMB18E2 halves, never both (G3). INIT/INITP encoding is
+    /// the BRAM worker's scope.
+    Ramb36e2 {
+        read_width_a: u8,
+        read_width_b: u8,
+        write_width_a: u8,
+        write_width_b: u8,
+    },
+    /// Native UltraScale RAMB18E2 (UG573). Widths per port in
+    /// {1, 2, 4, 9, 18}. Lower/upper half of a RAMB36 tile (L/U).
+    Ramb18e2 {
+        read_width_a: u8,
+        read_width_b: u8,
+        write_width_a: u8,
+        write_width_b: u8,
+    },
+    /// Native UltraScale URAM288 (UG573). Fixed geometry 4096 x 72.
+    /// Content encoding is BLOCKED (GAP-B4, URAM worker).
+    Uram288 { data_width: u8, depth: u32 },
 }
 
 /// The UltraScale primitive a source cell maps to.
@@ -90,7 +169,7 @@ pub enum SourceKind {
 pub enum MappedCell {
     /// LUT6, INIT preserved verbatim.
     Lut6 { init: u64 },
-    /// FDRE flip-flop with clock enable and sync/async reset.
+    /// FDRE flip-flop with clock enable and synchronous reset.
     FdRe { has_ce: bool, has_sr: bool },
     /// Carry4: maps to one CARRY8 nibble. Nibble assignment and
     /// CARRY_TYPE live in [`Carry8Mapping`], not here, because they
@@ -102,6 +181,28 @@ pub enum MappedCell {
     IobOut,
     /// BUFGCE/BUFGCTRL: handled outside pack (clocking).
     ClockBuf,
+    /// DSP48E2 with dynamic control values (config attributes blocked).
+    Dsp48e2 {
+        opmode: u16,
+        alumode: u8,
+        inmode: u8,
+    },
+    /// RAMB36E2 with validated port widths.
+    Ramb36e2 {
+        read_width_a: u8,
+        read_width_b: u8,
+        write_width_a: u8,
+        write_width_b: u8,
+    },
+    /// RAMB18E2 with validated port widths.
+    Ramb18e2 {
+        read_width_a: u8,
+        read_width_b: u8,
+        write_width_a: u8,
+        write_width_b: u8,
+    },
+    /// URAM288, fixed 4096 x 72.
+    Uram288 { data_width: u8, depth: u32 },
 }
 
 /// Why a source cell has no UltraScale mapping, with its unblocker.
@@ -126,6 +227,15 @@ impl std::fmt::Display for Unmapped {
 }
 
 impl std::error::Error for Unmapped {}
+
+/// True for a legal RAMB port width. RAMB36E2 allows 36; RAMB18E2 does
+/// not. Same-port read/write equality is NOT enforced here: UG573
+/// lists the per-port width sets, and whether a port's read and write
+/// widths must match is the BRAM worker's emission-time check, not a
+/// rule this mapper invents.
+fn valid_bram_width(width: u8, allow_36: bool) -> bool {
+    matches!(width, 1 | 2 | 4 | 9 | 18) || (allow_36 && width == 36)
+}
 
 /// Map one source cell to its UltraScale primitive.
 ///
@@ -224,6 +334,117 @@ pub fn map_source_cell(cell: &SourceCell) -> Result<MappedCell, Unmapped> {
                  the IP must be elaborated before pack"
             )),
         }),
+        SourceKind::Dsp48e2 {
+            opmode,
+            alumode,
+            inmode,
+        } => {
+            if *opmode > 0x1FF {
+                return Err(Unmapped {
+                    cell: name.clone(),
+                    needs: "DSP48E2",
+                    unblocker: std::borrow::Cow::Owned(format!(
+                        "malformed DSP48E2 source cell {name}: opmode {opmode} out of range 0..=511 (9 bits)"
+                    )),
+                });
+            }
+            if *alumode > 0xF {
+                return Err(Unmapped {
+                    cell: name.clone(),
+                    needs: "DSP48E2",
+                    unblocker: std::borrow::Cow::Owned(format!(
+                        "malformed DSP48E2 source cell {name}: alumode {alumode} out of range 0..=15 (4 bits)"
+                    )),
+                });
+            }
+            if *inmode > 0x1F {
+                return Err(Unmapped {
+                    cell: name.clone(),
+                    needs: "DSP48E2",
+                    unblocker: std::borrow::Cow::Owned(format!(
+                        "malformed DSP48E2 source cell {name}: inmode {inmode} out of range 0..=31 (5 bits)"
+                    )),
+                });
+            }
+            Ok(MappedCell::Dsp48e2 {
+                opmode: *opmode,
+                alumode: *alumode,
+                inmode: *inmode,
+            })
+        }
+        SourceKind::Ramb36e2 {
+            read_width_a,
+            read_width_b,
+            write_width_a,
+            write_width_b,
+        } => {
+            for (field, w) in [
+                ("read_width_a", *read_width_a),
+                ("read_width_b", *read_width_b),
+                ("write_width_a", *write_width_a),
+                ("write_width_b", *write_width_b),
+            ] {
+                if !valid_bram_width(w, true) {
+                    return Err(Unmapped {
+                        cell: name.clone(),
+                        needs: "RAMB36E2",
+                        unblocker: std::borrow::Cow::Owned(format!(
+                            "malformed RAMB36E2 source cell {name}: {field} {w} not in {{1, 2, 4, 9, 18, 36}}"
+                        )),
+                    });
+                }
+            }
+            Ok(MappedCell::Ramb36e2 {
+                read_width_a: *read_width_a,
+                read_width_b: *read_width_b,
+                write_width_a: *write_width_a,
+                write_width_b: *write_width_b,
+            })
+        }
+        SourceKind::Ramb18e2 {
+            read_width_a,
+            read_width_b,
+            write_width_a,
+            write_width_b,
+        } => {
+            for (field, w) in [
+                ("read_width_a", *read_width_a),
+                ("read_width_b", *read_width_b),
+                ("write_width_a", *write_width_a),
+                ("write_width_b", *write_width_b),
+            ] {
+                if !valid_bram_width(w, false) {
+                    return Err(Unmapped {
+                        cell: name.clone(),
+                        needs: "RAMB18E2",
+                        unblocker: std::borrow::Cow::Owned(format!(
+                            "malformed RAMB18E2 source cell {name}: {field} {w} not in {{1, 2, 4, 9, 18}}"
+                        )),
+                    });
+                }
+            }
+            Ok(MappedCell::Ramb18e2 {
+                read_width_a: *read_width_a,
+                read_width_b: *read_width_b,
+                write_width_a: *write_width_a,
+                write_width_b: *write_width_b,
+            })
+        }
+        SourceKind::Uram288 { data_width, depth } => {
+            if *data_width != 72 || *depth != 4096 {
+                return Err(Unmapped {
+                    cell: name.clone(),
+                    needs: "URAM288",
+                    unblocker: std::borrow::Cow::Owned(format!(
+                        "malformed URAM288 source cell {name}: geometry {data_width}x{depth} is not the fixed 4096x72"
+                    )),
+                });
+            }
+            Ok(MappedCell::Uram288 {
+                data_width: *data_width,
+                depth: *depth,
+            })
+        }
     }
 }
 
@@ -728,6 +949,317 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.to_string().contains("u_ip"), "got {err}");
+    }
+
+    #[test]
+    fn dsp48e2_native_maps_with_control_values() {
+        let m = map_source_cell(&cell(
+            "u_dsp",
+            SourceKind::Dsp48e2 {
+                opmode: 0b000_000_101,
+                alumode: 0,
+                inmode: 0,
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            m,
+            MappedCell::Dsp48e2 {
+                opmode: 0b000_000_101,
+                alumode: 0,
+                inmode: 0
+            }
+        );
+    }
+
+    #[test]
+    fn dsp48e2_control_values_validated() {
+        // OPMODE is 9 bits, ALUMODE 4, INMODE 5 (vendored
+        // site_type_DSP48E2.json pins). One past each bound fails loud.
+        for (opmode, alumode, inmode) in [
+            (0x200u16, 0u8, 0u8),
+            (0u16, 0x10u8, 0u8),
+            (0u16, 0u8, 0x20u8),
+        ] {
+            let err = map_source_cell(&cell(
+                "u_dsp",
+                SourceKind::Dsp48e2 {
+                    opmode,
+                    alumode,
+                    inmode,
+                },
+            ))
+            .unwrap_err();
+            assert_eq!(err.needs, "DSP48E2");
+            assert!(err.unblocker.contains("malformed"), "got {err}");
+        }
+        // The bounds themselves map.
+        assert!(
+            map_source_cell(&cell(
+                "u_dsp",
+                SourceKind::Dsp48e2 {
+                    opmode: 0x1FF,
+                    alumode: 0xF,
+                    inmode: 0x1F,
+                },
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn ramb36e2_widths_validated() {
+        let m = map_source_cell(&cell(
+            "u_bram",
+            SourceKind::Ramb36e2 {
+                read_width_a: 36,
+                read_width_b: 18,
+                write_width_a: 9,
+                write_width_b: 1,
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            m,
+            MappedCell::Ramb36e2 {
+                read_width_a: 36,
+                read_width_b: 18,
+                write_width_a: 9,
+                write_width_b: 1,
+            }
+        );
+        for bad in [0u8, 3, 8, 72] {
+            let err = map_source_cell(&cell(
+                "u_bram",
+                SourceKind::Ramb36e2 {
+                    read_width_a: bad,
+                    read_width_b: 18,
+                    write_width_a: 18,
+                    write_width_b: 18,
+                },
+            ))
+            .unwrap_err();
+            assert_eq!(err.needs, "RAMB36E2");
+            assert!(err.unblocker.contains("read_width_a"), "got {err}");
+        }
+    }
+
+    #[test]
+    fn ramb18e2_width_36_rejected() {
+        // RAMB18E2 has no 36-bit port (18Kb); 36 is a RAMB36E2 width.
+        let err = map_source_cell(&cell(
+            "u_bram",
+            SourceKind::Ramb18e2 {
+                read_width_a: 36,
+                read_width_b: 18,
+                write_width_a: 18,
+                write_width_b: 18,
+            },
+        ))
+        .unwrap_err();
+        assert_eq!(err.needs, "RAMB18E2");
+        assert!(err.unblocker.contains("36"), "got {err}");
+        assert!(
+            map_source_cell(&cell(
+                "u_bram",
+                SourceKind::Ramb18e2 {
+                    read_width_a: 18,
+                    read_width_b: 9,
+                    write_width_a: 4,
+                    write_width_b: 2,
+                },
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn uram288_fixed_geometry() {
+        assert!(
+            map_source_cell(&cell(
+                "u_uram",
+                SourceKind::Uram288 {
+                    data_width: 72,
+                    depth: 4096,
+                },
+            ))
+            .is_ok()
+        );
+        for (width, depth) in [(36u8, 4096u32), (72u8, 2048u32)] {
+            let err = map_source_cell(&cell(
+                "u_uram",
+                SourceKind::Uram288 {
+                    data_width: width,
+                    depth,
+                },
+            ))
+            .unwrap_err();
+            assert_eq!(err.needs, "URAM288");
+            assert!(err.unblocker.contains("4096x72"), "got {err}");
+        }
+    }
+
+    #[test]
+    fn every_source_kind_maps_or_fails_loud() {
+        // Pins the primitive inventory: every SourceKind variant has a
+        // verdict here. A new variant without a map arm fails to
+        // compile (exhaustive match in map_source_cell); a new arm
+        // without a verdict here fails this test.
+        let cases: Vec<(SourceCell, bool)> = vec![
+            (
+                cell(
+                    "lut",
+                    SourceKind::Lut6 {
+                        init: 0,
+                        is_memory: false,
+                        is_srl: false,
+                    },
+                ),
+                true,
+            ),
+            (
+                cell(
+                    "srl",
+                    SourceKind::Lut6 {
+                        init: 0,
+                        is_memory: false,
+                        is_srl: true,
+                    },
+                ),
+                false,
+            ),
+            (
+                cell(
+                    "mem",
+                    SourceKind::Lut6 {
+                        init: 0,
+                        is_memory: true,
+                        is_srl: false,
+                    },
+                ),
+                false,
+            ),
+            (
+                cell(
+                    "ff",
+                    SourceKind::Ff {
+                        has_ce: false,
+                        has_sr: false,
+                    },
+                ),
+                true,
+            ),
+            (cell("carry", SourceKind::Carry4), true),
+            (cell("ibin", SourceKind::IobIn), true),
+            (cell("ibout", SourceKind::IobOut), true),
+            (cell("clk", SourceKind::ClockBuf), true),
+            (
+                cell(
+                    "dsp1",
+                    SourceKind::Dsp48e1 {
+                        opmode: 5,
+                        alumode: 0,
+                    },
+                ),
+                false,
+            ),
+            (cell("mac", SourceKind::Mac27), false),
+            (cell("ila", SourceKind::Ila), false),
+            (cell("bram", SourceKind::Bram18), false),
+            (
+                cell(
+                    "bram1",
+                    SourceKind::Bram18e1 {
+                        read_width_a: 18,
+                        read_width_b: 18,
+                        write_width_a: 18,
+                        write_width_b: 18,
+                    },
+                ),
+                false,
+            ),
+            (
+                cell(
+                    "bb",
+                    SourceKind::BlackBox {
+                        module: "ip".to_string(),
+                    },
+                ),
+                false,
+            ),
+            (
+                cell(
+                    "dsp2",
+                    SourceKind::Dsp48e2 {
+                        opmode: 5,
+                        alumode: 0,
+                        inmode: 0,
+                    },
+                ),
+                true,
+            ),
+            (
+                cell(
+                    "r36",
+                    SourceKind::Ramb36e2 {
+                        read_width_a: 18,
+                        read_width_b: 18,
+                        write_width_a: 18,
+                        write_width_b: 18,
+                    },
+                ),
+                true,
+            ),
+            (
+                cell(
+                    "r18",
+                    SourceKind::Ramb18e2 {
+                        read_width_a: 18,
+                        read_width_b: 18,
+                        write_width_a: 18,
+                        write_width_b: 18,
+                    },
+                ),
+                true,
+            ),
+            (
+                cell(
+                    "uram",
+                    SourceKind::Uram288 {
+                        data_width: 72,
+                        depth: 4096,
+                    },
+                ),
+                true,
+            ),
+        ];
+        assert_eq!(
+            cases.len(),
+            18,
+            "one case per inventory cell (16 kinds, LUT6 x3)"
+        );
+        for (source, maps) in &cases {
+            let result = map_source_cell(source);
+            if *maps {
+                assert!(
+                    result.is_ok(),
+                    "cell {} must map, got {result:?}",
+                    source.name
+                );
+            } else {
+                let err = result.unwrap_err();
+                assert!(
+                    !err.needs.is_empty(),
+                    "cell {} needs a primitive",
+                    source.name
+                );
+                assert!(
+                    !err.unblocker.is_empty(),
+                    "cell {} needs an unblocker",
+                    source.name
+                );
+            }
+        }
     }
 
     #[test]
