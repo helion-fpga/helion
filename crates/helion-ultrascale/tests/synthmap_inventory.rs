@@ -263,8 +263,15 @@ endmodule
 
 #[test]
 fn enable_ff_inventory() {
-    // An FF with an enable must carry a CE pin net into pack, so the
-    // FF CEUSED mapping has real input to work on.
+    // An FF with an enable: the front end lowers `if (en) q <= d` to
+    // a 3-input mux LUT (en ? d : q) feeding D, NOT to a CE pin on the
+    // FF. The FF carries CLK/D/Q only, so CEUSED.V1 is unexercised by
+    // the front end today; the CEUSED emitter path is covered by the
+    // synthmap unit tests, which build packed slices with CE nets
+    // directly. Whether the front end should emit CE pins instead
+    // (saving the mux LUT) is a front-end/QoR decision, not a mapping
+    // question: the mapping here must describe what synth emits, not
+    // what it could emit.
     let sv = r#"
 module enff (
     input logic clk,
@@ -283,9 +290,19 @@ endmodule
         rows.iter().filter(|(c, _, _)| c.kind == "Hff").collect();
     assert_eq!(ffs.len(), 1, "enable FF design must synth to exactly 1 FF");
     assert!(
-        ffs[0].0.pins.contains_key("CE"),
-        "enabled FF must carry a CE pin, got pins {:?}",
+        !ffs[0].0.pins.contains_key("CE"),
+        "enable FF must NOT carry a CE pin (front end lowers the enable to a D-mux LUT), got pins {:?}",
         ffs[0].0.pins
+    );
+    let muxes: Vec<&(InventoriedCell, MapVerdict, &'static str)> = rows
+        .iter()
+        .filter(|(c, _, _)| c.kind.starts_with("Lut6"))
+        .collect();
+    assert_eq!(muxes.len(), 1, "enable must lower to exactly 1 mux LUT");
+    assert!(
+        muxes[0].0.pins.values().any(|n| n == "en"),
+        "mux LUT must take en as an input, got pins {:?}",
+        muxes[0].0.pins
     );
 }
 
