@@ -27,7 +27,9 @@ The ballpark source is an AMD community forum post giving roughly 0.3 ns
 per logic level (LUT plus route combined) for UltraScale+. The port splits
 that 300 ps into 120 ps LUT plus 180 ps one INT hop. The split itself is
 an assumption, not a measured value: the forum post never splits LUT
-from route. Every number STA reports from this DB is an ESTIMATE, and
+from route. The other ballpark fields (flip-flop, CARRY8, PIP) are
+likewise assumed allocations within that 0.3 ns level, and their source
+strings say so; no individual value is forum-stated. Every number STA reports from this DB is an ESTIMATE, and
 `TimingReport.is_estimate` plus the `estimate=1` token on the
 `hang_diag timing` line say so. Critic session 10 flag F3 is exactly
 this: `sta_on_placed` took no part argument and always used
