@@ -166,8 +166,7 @@ pub fn place_ultra(
         // X so the same seed always picks the same column (D1). Without
         // this, one seed could place the same chain on different columns
         // across runs.
-        let mut columns: Vec<(i32, Vec<(String, String, i32, i32)>)> =
-            by_x.into_iter().collect();
+        let mut columns: Vec<(i32, Vec<(String, String, i32, i32)>)> = by_x.into_iter().collect();
         columns.sort_by_key(|(x, _)| *x);
         for (_x, mut col) in columns {
             col.sort_by_key(|s| s.3);
@@ -261,10 +260,7 @@ pub fn place_ultra(
 /// that does not exist is rendered as `UNPLACED_INDEX`, never dropped
 /// silently. The caller is expected to run `check_legality` first; this
 /// renderer stays total so a bad placement is visible, not hidden.
-pub fn render_placed_netlist(
-    packed: &[PackedUltraSlice],
-    placed: &[PlacedUltraSlice],
-) -> String {
+pub fn render_placed_netlist(packed: &[PackedUltraSlice], placed: &[PlacedUltraSlice]) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!("# placed netlist: {} slices", placed.len()));
     let mut ordered: Vec<&PlacedUltraSlice> = placed.iter().collect();
