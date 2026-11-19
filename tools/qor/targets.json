@@ -21,5 +21,10 @@
   {"gap": "G76", "design": "dsp_fill_prims", "metric": "slack_ns", "min": 0, "goal": "192-DSP fill meets 100 MHz in Helion STA (it did on the board build, 07e3be2)"},
   {"gap": "G46", "design": "dsp_fill_prims", "metric": "lut_ratio", "max": 1.5, "goal": "192-DSP fill within 1.5x Vivado's 3,273 LUTs"},
   {"gap": "G78", "design": "mmcm", "metric": "lut_ratio", "max": 1.5, "goal": "rung 4 MMCM design within 1.5x Vivado's 37 LUTs (G59 took it from 8.6x to 1.57x; the rest is the 64-bit compare)"},
-  {"gap": "G4", "design": "ibex_soc", "metric": "t_route", "max": 600, "goal": "the board's Ibex SoC routes in under 10 min"}
+  {"gap": "G4", "design": "ibex_soc", "metric": "t_route", "max": 600, "goal": "the board's Ibex SoC routes in under 10 min"},
+  {"gap": "G3", "design": "ibex_soc", "metric": "dsp", "min": 1, "goal": "the board's Ibex multiplier (RV32MFast, 17x17 signed) on a DSP48E1, not LUTs"},
+  {"gap": "G3", "design": "ibex", "metric": "dsp", "min": 1, "goal": "Ibex's multiplier on a DSP48E1, not LUTs"},
+  {"gap": "G3", "design": "dsp_fill", "metric": "dsp", "min": 192, "goal": "the plain-SV 192-lane MAC infers a DSP48E1 per lane (1.2 million LUTs without inference)"},
+  {"gap": "G3", "design": "dsp_fill", "metric": "ff", "max": 8097, "goal": "every lane's A, B, M and P registers go into its DSP48E1: no more flops than dsp_fill_prims' 8,097"},
+  {"gap": "G3", "design": "dsp_fill", "metric": "slack_ns", "min": 0, "goal": "the plain-SV 192-lane MAC meets 100 MHz in Helion STA, like dsp_fill_prims"}
 ]
