@@ -18,6 +18,7 @@ pub mod bitloc;
 pub mod clk;
 pub mod device;
 pub mod device_file;
+pub mod device_grid;
 pub mod dsp;
 pub mod fabric;
 pub mod fasm_gen;
@@ -56,6 +57,7 @@ pub use device_file::{
     ArchSummary, BitLocator, BramResolution, DeviceFile, DeviceFileError, Far, FarBlockType,
     NUM_18K_BRAM_PER_COLUMN, ProvisionalNote,
 };
+pub use device_grid::{DeviceColumn, DeviceFileGrid};
 pub use fabric::{
     EmptyTimingDb, EmptyWireDb, FabricWithPlaceholders, TimingDb, UltraScaleFabric, UltraSite,
     WireDb, WireId, WireInfo,
@@ -68,7 +70,8 @@ pub use int_pip::{
 pub use legality::{LegalityViolation, check_legality};
 pub use pack::{ControlSetLimits, PackedUltraSlice, SliceKind, UltraBel, UltraPacked, pack_ultra};
 pub use place::{
-    PlacedUltraSlice, UltraGrid, UltraPlaceOpts, UltraPlaced, place_ultra, seeded_order,
+    PlacedUltraSlice, UltraGrid, UltraPlaceOpts, UltraPlaced, place_ultra, render_placed_netlist,
+    seeded_order,
 };
 pub use router::{
     RoutableNet, RouteError, RouteErrorKind, UltraRouteOpts, UltraRouted, route_ultra,

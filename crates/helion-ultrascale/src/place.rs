@@ -162,7 +162,13 @@ pub fn place_ultra(
                 by_x.entry(s.2).or_default().push(s.clone());
             }
         }
-        for (_x, mut col) in by_x {
+        // HashMap iteration order is not deterministic; sort columns by
+        // X so the same seed always picks the same column (D1). Without
+        // this, one seed could place the same chain on different columns
+        // across runs.
+        let mut columns: Vec<(i32, Vec<(String, String, i32, i32)>)> = by_x.into_iter().collect();
+        columns.sort_by_key(|(x, _)| *x);
+        for (_x, mut col) in columns {
             col.sort_by_key(|s| s.3);
             for window in col.windows(chain.len()) {
                 // Check Y contiguity.
@@ -244,6 +250,55 @@ pub fn place_ultra(
     }
 
     Ok(placed)
+}
+
+/// Render a deterministic placed-netlist text for the router handoff
+/// (GAP-F4, US-09). One line per BEL assignment, slices sorted by site,
+/// BELs sorted by index. BELs are numeric (`LUT0`, `FF3`) to avoid
+/// asserting a letter mapping this renderer does not own; the UG574
+/// letter names live in bel.rs. A placed entry naming a packed index
+/// that does not exist is rendered as `UNPLACED_INDEX`, never dropped
+/// silently. The caller is expected to run `check_legality` first; this
+/// renderer stays total so a bad placement is visible, not hidden.
+pub fn render_placed_netlist(packed: &[PackedUltraSlice], placed: &[PlacedUltraSlice]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("# placed netlist: {} slices", placed.len()));
+    let mut ordered: Vec<&PlacedUltraSlice> = placed.iter().collect();
+    ordered.sort_by_key(|p| p.site.clone());
+    for p in ordered {
+        let Some(slice) = packed.get(p.packed_idx) else {
+            lines.push(format!("{} UNPLACED_INDEX {}", p.site, p.packed_idx));
+            continue;
+        };
+        let mut luts: Vec<(&u8, &String)> = slice.luts.iter().collect();
+        luts.sort_by_key(|(bel, _)| **bel);
+        for (bel, cell) in luts {
+            let init = slice.lut_inits.get(bel).copied().unwrap_or(0);
+            let mem = slice.lut_is_memory.get(bel).copied().unwrap_or(false);
+            lines.push(format!(
+                "{} LUT{bel} {cell} INIT=0x{init:016X}{}",
+                p.site,
+                if mem { " MEM" } else { "" }
+            ));
+        }
+        let mut ffs: Vec<(&u8, &String)> = slice.ffs.iter().collect();
+        ffs.sort_by_key(|(bel, _)| **bel);
+        for (bel, cell) in ffs {
+            let clk = slice.ff_clk.get(bel).map(String::as_str).unwrap_or("?");
+            lines.push(format!("{} FF{bel} {cell} CLK={clk}", p.site));
+        }
+        if let Some(carry) = &slice.carry8 {
+            let mut line = format!("{} CARRY8 {carry}", p.site);
+            if let Some(prev) = &slice.carry_prev {
+                line.push_str(&format!(" PREV={prev}"));
+            }
+            if let Some(next) = &slice.carry_next {
+                line.push_str(&format!(" NEXT={next}"));
+            }
+            lines.push(line);
+        }
+    }
+    lines.join("\n") + "\n"
 }
 
 #[cfg(test)]
@@ -343,5 +398,72 @@ mod tests {
         let p1 = placed.slices.iter().find(|p| p.packed_idx == 1).unwrap();
         assert_eq!(p0.x, p1.x);
         assert!((p0.y - p1.y).abs() == 1);
+    }
+
+    #[test]
+    fn carry_chain_placement_is_deterministic() {
+        // D1: before the fix, chain column choice iterated a HashMap, so
+        // repeated placements of the same chain could land on different
+        // columns. Each HashMap gets a fresh random seed, so ten runs
+        // make a pre-fix failure near-certain and a post-fix pass
+        // meaningful.
+        let grid = test_grid();
+        let mut s0 = PackedUltraSlice::new("s0".to_string(), SliceKind::Logic);
+        s0.carry8 = Some("carry0".to_string());
+        s0.carry_next = Some("carry1".to_string());
+        let mut s1 = PackedUltraSlice::new("s1".to_string(), SliceKind::Logic);
+        s1.carry8 = Some("carry1".to_string());
+        s1.carry_prev = Some("carry0".to_string());
+        s1.carry_next = Some("carry2".to_string());
+        let mut s2 = PackedUltraSlice::new("s2".to_string(), SliceKind::Logic);
+        s2.carry8 = Some("carry2".to_string());
+        s2.carry_prev = Some("carry1".to_string());
+
+        let packed = vec![s0, s1, s2];
+        let opts = UltraPlaceOpts::default();
+        let first = place_ultra(&packed, &grid, &opts).unwrap();
+        let sites = |p: &UltraPlaced| {
+            p.slices
+                .iter()
+                .map(|s| (s.packed_idx, s.site.clone()))
+                .collect::<Vec<_>>()
+        };
+        let expected = sites(&first);
+        for _ in 0..9 {
+            let again = place_ultra(&packed, &grid, &opts).unwrap();
+            assert_eq!(sites(&again), expected);
+        }
+    }
+
+    #[test]
+    fn render_placed_netlist_lists_bels_by_site() {
+        let grid = test_grid();
+        let mut s0 = PackedUltraSlice::new("s0".to_string(), SliceKind::Logic);
+        s0.luts.insert(0, "lut0".to_string());
+        s0.lut_inits.insert(0, 0xAAAAAAAAAAAAAAAA);
+        s0.lut_is_memory.insert(0, false);
+        s0.ffs.insert(0, "ff0".to_string());
+        s0.ff_clk.insert(0, "clk".to_string());
+        s0.ff_ce.insert(0, None);
+        s0.ff_sr.insert(0, None);
+        s0.carry8 = Some("carry0".to_string());
+
+        let packed = vec![s0];
+        let placed = place_ultra(&packed, &grid, &UltraPlaceOpts::default()).unwrap();
+        let text = render_placed_netlist(&packed, &placed.slices);
+        let site = &placed.slices[0].site;
+        assert!(text.contains(&format!("{site} LUT0 lut0 INIT=0xAAAAAAAAAAAAAAAA")));
+        assert!(text.contains(&format!("{site} FF0 ff0 CLK=clk")));
+        assert!(text.contains(&format!("{site} CARRY8 carry0")));
+        // A placed entry with a bogus packed index is shown, not dropped.
+        let bogus = vec![PlacedUltraSlice {
+            packed_idx: 99,
+            site: "SLICE_X9Y9".to_string(),
+            tile: "CLB_X9Y9".to_string(),
+            x: 9,
+            y: 9,
+        }];
+        let text = render_placed_netlist(&packed, &bogus);
+        assert!(text.contains("SLICE_X9Y9 UNPLACED_INDEX 99"));
     }
 }
