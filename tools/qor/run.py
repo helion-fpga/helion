@@ -27,7 +27,14 @@ DESIGNS = [
     ("bram_fill", "full", "examples/zedboard_bram_fill.sv", "examples/zedboard_bram_fill.xdc", "zedboard_bram_fill", {}),
     ("dsp_fill_prims", "full", "examples/zedboard_dsp_fill_prims.sv", "examples/zedboard_dsp_fill.xdc", "zedboard_dsp_fill_prims", {}),
     ("ibex", "full", "examples/ysyx_ibex.sv,examples/ibex_obs_wrap.sv", "tools/qor/ibex_obs.xdc", "ibex_obs_wrap", {"HELION_DEFINES": "VERILATOR"}),
+    # Designs proven on the board (rungs 1 and 4), and RAMs on a derived clock (G33).
+    ("mmcm", "quick", "examples/zedboard_mmcm.sv", "examples/zedboard_mmcm.xdc", "zedboard_mmcm", {}),
+    ("ibex_soc", "full", "examples/ysyx_ibex.sv,examples/zedboard_ibex_soc.sv", "examples/zedboard_ibex_soc.xdc", "zedboard_ibex_soc", {"HELION_DEFINES": "VERILATOR"}),
+    ("bram_fill_25mhz", "full", "examples/zedboard_bram_fill_25mhz.sv,examples/zedboard_bram_fill.sv", "examples/zedboard_bram_fill.xdc", "zedboard_bram_fill_25mhz", {}),
 ]
+# Built twice; the .bit must be byte-identical (G22: PicoRV32 is where the old
+# router differed, blinky never did).
+TWICE = ("blinky", "pico")
 
 COUNTS = [("lut", r"(\d+) LUTs"), ("ff", r"(\d+) flops"), ("carry", r"(\d+) carry cells"),
           ("ramb36", r"(\d+) RAMB36"), ("ramb18", r"(\d+) RAMB18"), ("dsp", r"(\d+) DSP48")]
@@ -62,6 +69,7 @@ def parse(text):
             if k not in summary:
                 raise SystemExit(f"qor: zedbit summary line has no `{k}` (got {sorted(summary)})")
         r.update({k: summary[k] for k in SUMMARY_KEYS})
+        r["lut_rt"] = int(summary.get("lut_rt", 0))
         # Integers where the value is a count, so reports stay readable.
         for k in COUNT_KEYS + ("lut_levels", "failing", "endpoints", "features", "fasm"):
             r[k] = int(r[k])
@@ -114,10 +122,11 @@ def vs_vivado(name, r, viv):
     v = viv["designs"].get(name, {})
     ref, hx, m = v.get("ref"), v.get("hx"), {}
     if ref and r.get("lut") is not None:
-        m["lut_ratio"] = round(r["lut"] / ref["lut"], 2)
+        # Vivado's Slice LUTs leave out route-throughs into carry chains.
+        m["lut_ratio"] = round((r["lut"] - (r.get("lut_rt") or 0)) / ref["lut"], 2)
     if ref and r.get("fmax_mhz") and r.get("period_ns") == ref["period_ns"]:  # same clock only
         m["fmax_ratio"] = round(r["fmax_mhz"] / ref["fmax_mhz"], 2)
-    if ref and r["ok"]:
+    if ref and r["ok"] and ref.get("runtime_s"):
         m["wall_ratio"] = round(r["wall_s"] / ref["runtime_s"], 1)
     if hx and r.get("t_route") is not None:
         m["route_ratio_hx"] = round(r["t_route"] / hx["route_s"], 1)
@@ -249,7 +258,7 @@ def main():
             continue
         print(f"qor: {d[0]} ...", flush=True)
         r, bit = build(zedbit, d, out_dir, a.timeout)
-        if d[0] == "blinky":  # G22: same settings twice, byte-identical .bit
+        if d[0] in TWICE:  # G22: same settings twice, byte-identical .bit
             r2, bit2 = build(zedbit, d, out_dir, a.timeout, "_2")
             r["deterministic"] = r["ok"] and r2["ok"] and open(bit, "rb").read() == open(bit2, "rb").read()
         r.update(vs_vivado(d[0], r, viv), commit=commit, date=date)
@@ -258,8 +267,9 @@ def main():
 
     print()
     table(cur)
-    if "blinky" in cur:
-        print(f"\nG22 determinism: blinky built twice, .bit {'byte-identical' if cur['blinky']['deterministic'] else 'DIFFERS'}")
+    for n in TWICE:
+        if n in cur:
+            print(f"\nG22 determinism: {n} built twice, .bit {'byte-identical' if cur[n]['deterministic'] else 'DIFFERS'}")
     tres = check_targets(load("targets.json"), cur)
     print("\nTargets (goals; they do not fail the run):")
     for t in tres:

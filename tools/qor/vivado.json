@@ -25,6 +25,9 @@
     },
     "dsp_fill_prims": {
       "ref": {"job": "ref_dsp_prims", "lut": 3273, "lutram": 0, "ff": 8097, "ramb36": 0, "ramb18": 0, "dsp": 192, "clock": "sys_clk", "period_ns": 10.0, "wns_ns": 3.339, "wns_all_ns": 3.339, "fmax_mhz": 150.1, "runtime_s": 284.5}
+    },
+    "mmcm": {
+      "ref": {"job": "~/helion-zed-builds/mmcm/vivado_ref (util.txt, timing_summary.txt)", "lut": 37, "lutram": 0, "ff": 231, "ramb36": 0, "ramb18": 0, "dsp": 0, "clock": "clk_b_mmcm", "period_ns": 8.0, "wns_ns": 4.326, "wns_all_ns": 4.326, "fmax_mhz": 272.4, "runtime_s": null}
     }
   }
 }
