@@ -23,6 +23,10 @@ fn assert_ballpark(d: &SourcedDelay, ps: i64) {
             src.contains("0.3ns"),
             "ballpark source must name the forum 0.3 ns level: {src}"
         );
+        assert!(
+            src.contains("assumed allocation"),
+            "ballpark source must say the value is an assumed allocation, not a forum-stated value: {src}"
+        );
     }
 }
 

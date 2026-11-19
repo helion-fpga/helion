@@ -290,7 +290,7 @@ fn documented_db(part: &str, bram_source: &str) -> UltraScaleTimingDb {
 ///
 /// Do not use for signoff. Do not tune to make a number look better.
 pub fn preliminary_xcvu3p() -> UltraScaleTimingDb {
-    let ballpark_src = "AMD forum: ~0.3ns/logic-level incl route (UltraScale+)";
+    let ballpark_src = "AMD forum ~0.3ns/logic-level (UltraScale+): assumed allocation within the level, not a forum-stated value";
     UltraScaleTimingDb {
         part: "xcvu3p".to_string(),
         speed_grade: "-2".to_string(),
