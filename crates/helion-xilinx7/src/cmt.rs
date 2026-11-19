@@ -338,7 +338,9 @@ pub fn dedicated_clock_route(
     sinks: &[(String, String)],
 ) -> Option<Vec<crate::route::RoutedPip>> {
     use std::collections::{HashMap, VecDeque};
-    let ok = |t: &str, w: &str| !t.starts_with("INT_") && !w.contains("FREQ");
+    // Never through a global buffer: its I0 -> O pip is a site route-through
+    // that nothing configures (and a placed BUFG may own the site).
+    let ok = |t: &str, w: &str| !t.starts_with("INT_") && !w.contains("FREQ") && !(w.contains("BUFGCTRL") && w.ends_with("_O"));
     // (tile, wire) -> pip that reached it (None for the source node).
     let mut prev: HashMap<(String, String), Option<crate::route::RoutedPip>> = HashMap::new();
     let mut q = VecDeque::new();

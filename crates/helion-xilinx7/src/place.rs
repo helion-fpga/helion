@@ -552,6 +552,28 @@ pub fn place_with_pools(
         });
     }
 
+    // 1a. CMTs (MMCME2_ADV / PLLE2_ADV), before the clock buffers they drive.
+    for cmt in &packed.cmts {
+        let mut candidates = device.cmt_sites(cmt.kind);
+        // The CMT nearest the pad that clocks it (G58): a clock-capable pad
+        // reaches only the CMT of its own clock region over dedicated wires.
+        let pad_xy = cmt.clkin1_net.as_ref().and_then(|n| net_to_iob.get(n)).and_then(|(t, _, _)| device.tile_xy(t));
+        if let Some((px, py)) = pad_xy {
+            candidates.sort_by_key(|(t, _)| device.tile_xy(t).map_or(i32::MAX, |(x, y)| (x - px).abs() + (y - py).abs()));
+        }
+        let (tile, site) = candidates
+            .into_iter()
+            .find(|(_, s)| !used_sites.contains(s))
+            .ok_or_else(|| format!("place: no free {:?} site for {}", cmt.kind, cmt.name))?;
+        used_sites.insert(site.clone());
+        out.cmts.push(PlacedCmt {
+            name: cmt.name.clone(),
+            kind: cmt.kind,
+            tile,
+            site,
+        });
+    }
+
     // 2. Clock buffers (BUFG / BUFGCE / BUFGCTRL / BUFIO / BUFR).
     let bufg_candidates = device.bufg_sites();
     for (idx, bufg) in packed.bufgs.iter().enumerate() {
@@ -579,8 +601,20 @@ pub fn place_with_pools(
                 });
             }
             _ => {
-                let (tile, site) = bufg_candidates
+                // A buffer driven by a CMT goes in the CMT's half of the chip:
+                // a CMT output reaches only the buffers of its own half.
+                let cmt_xy = out
+                    .cmts
                     .iter()
+                    .zip(&packed.cmts)
+                    .find(|(_, c)| c.clkout_nets.iter().chain([&c.clkfbout_net]).flatten().any(|n| *n == bufg.in_net))
+                    .and_then(|(p, _)| device.tile_xy(&p.tile));
+                let mut order: Vec<&(String, String)> = bufg_candidates.iter().collect();
+                if let Some((cx, cy)) = cmt_xy {
+                    order.sort_by_key(|(t, _)| device.tile_xy(t).map_or(i32::MAX, |(x, y)| (x - cx).abs() + (y - cy).abs()));
+                }
+                let (tile, site) = order
+                    .into_iter()
                     .find(|(_, s)| !used_sites.contains(s))
                     .cloned()
                     .or_else(|| device.bufg_site())
@@ -593,22 +627,6 @@ pub fn place_with_pools(
                 });
             }
         }
-    }
-
-    // 2a. CMTs (MMCME2_ADV / PLLE2_ADV).
-    for cmt in &packed.cmts {
-        let candidates = device.cmt_sites(cmt.kind);
-        let (tile, site) = candidates
-            .into_iter()
-            .find(|(_, s)| !used_sites.contains(s))
-            .ok_or_else(|| format!("place: no free {:?} site for {}", cmt.kind, cmt.name))?;
-        used_sites.insert(site.clone());
-        out.cmts.push(PlacedCmt {
-            name: cmt.name.clone(),
-            kind: cmt.kind,
-            tile,
-            site,
-        });
     }
 
     // 2b. Block RAMs (RAMB18E1 and RAMB36E1) with column-aligned cascade placement.
