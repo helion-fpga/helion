@@ -17,11 +17,12 @@
 //!   IOBs have no placed site in this flow yet; both are recorded in the
 //!   gate, not hidden.
 
-use helion_ir::{intern, resolve, CellKind, Design};
+use helion_ir::{CellKind, Design, intern, resolve};
 use helion_ultrascale::{
-    check_legality, emit_ff_fasm, pack_ultra, place_ultra, preliminary_xcvu3p, route_ultra,
-    sta_routed, ControlSetLimits, FabricWithPlaceholders, RoutableNet, StaNetlist, TimingReport,
-    UltraPlaceOpts, UltraRouteOpts, UltraScaleDevice, UltraScaleFabric,
+    ControlSetLimits, FabricWithPlaceholders, RoutableNet, SourceCell, SourceKind, StaNetlist,
+    TimingReport, UltraPlaceOpts, UltraRouteOpts, UltraScaleDevice, UltraScaleFabric,
+    check_legality, emit_ff_control_fasm, emit_ff_fasm, map_source_cell, pack_ultra, place_ultra,
+    preliminary_xcvu3p, route_ultra, sta_routed,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -66,15 +67,62 @@ pub fn extract_cells(design: &Design) -> Result<ExtractedCells, String> {
 
     for cell in &design.cells {
         let name = resolve(cell.name).to_string();
+        // Every cell passes through the synthesis-mapping table first
+        // (helion-ultrascale::synthmap): a cell with no UltraScale
+        // mapping fails loud here with the missing primitive and its
+        // unblocker, never silently dropped. A LUT6 carrying SRL or
+        // distributed-RAM attributes fails the same way: it is not a
+        // plain LUT6 and packing it as one would miscompile.
+        let source_kind = match &cell.kind {
+            CellKind::Lut6 { init } => SourceKind::Lut6 {
+                init: *init,
+                is_memory: cell.attrs.get("MEMORY").map(|s| s == "1").unwrap_or(false),
+                is_srl: cell.attrs.contains_key("SRL_TYPE")
+                    || cell.attrs.contains_key("SHREG_EXTRACT"),
+            },
+            CellKind::Hff => SourceKind::Ff {
+                has_ce: net_of(cell.name, "CE").is_some(),
+                has_sr: net_of(cell.name, "SR").is_some(),
+            },
+            CellKind::Carry4 => SourceKind::Carry4,
+            CellKind::IobIn => SourceKind::IobIn,
+            CellKind::IobOut => SourceKind::IobOut,
+            CellKind::ClockBuf => SourceKind::ClockBuf,
+            CellKind::Mac27 => SourceKind::Mac27,
+            CellKind::Dsp48e1 { opmode, alumode } => SourceKind::Dsp48e1 {
+                opmode: *opmode,
+                alumode: *alumode,
+            },
+            CellKind::Ila { .. } => SourceKind::Ila,
+            CellKind::Bram18 => SourceKind::Bram18,
+            CellKind::Bram18e1 {
+                read_width_a,
+                read_width_b,
+                write_width_a,
+                write_width_b,
+            } => SourceKind::Bram18e1 {
+                read_width_a: *read_width_a,
+                read_width_b: *read_width_b,
+                write_width_a: *write_width_a,
+                write_width_b: *write_width_b,
+            },
+            CellKind::BlackBox { module } => SourceKind::BlackBox {
+                module: resolve(*module).to_string(),
+            },
+        };
+        map_source_cell(&SourceCell {
+            name: name.clone(),
+            kind: source_kind,
+        })
+        .map_err(|e| format!("ULTRA PACK: {e}"))?;
         match cell.kind {
             CellKind::Lut6 { init } => {
                 let is_mem = cell.attrs.get("MEMORY").map(|s| s == "1").unwrap_or(false);
                 luts.push((name, init, is_mem));
             }
             CellKind::Hff => {
-                let clk = net_of(cell.name, "CLK").ok_or_else(|| {
-                    format!("ULTRA PACK: FF {name} has no CLK pin net")
-                })?;
+                let clk = net_of(cell.name, "CLK")
+                    .ok_or_else(|| format!("ULTRA PACK: FF {name} has no CLK pin net"))?;
                 let ce = net_of(cell.name, "CE");
                 let sr = net_of(cell.name, "SR");
                 ffs.push((name, clk, ce, sr));
@@ -89,16 +137,12 @@ pub fn extract_cells(design: &Design) -> Result<ExtractedCells, String> {
                 }
             }
             CellKind::IobIn | CellKind::IobOut | CellKind::ClockBuf => {}
-            CellKind::BlackBox { module } => {
-                return Err(format!(
-                    "ULTRA PACK: black-box instance {} ({}) is not supported for UltraScale+",
-                    name,
-                    resolve(module)
-                ));
-            }
+            // Every other kind was rejected by map_source_cell above.
+            // This arm stays so a future CellKind variant fails loud
+            // here instead of silently dropping.
             _ => {
                 return Err(format!(
-                    "ULTRA PACK: cell {name} of kind {:?} is not supported for UltraScale+",
+                    "ULTRA PACK: cell {name} of kind {:?} reached pack without a mapping",
                     cell.kind
                 ));
             }
@@ -108,7 +152,10 @@ pub fn extract_cells(design: &Design) -> Result<ExtractedCells, String> {
     // Build CARRY8 chains from Carry4 CI/CO3 links. Chain heads are cells
     // whose CI net is not driven by another Carry4's CO3 (CYINIT or a
     // constant). One Carry4 occupies one CARRY8 slice in this flow (the
-    // upper 4 bits unused); the pack-place worker owns the 2:1 mapping.
+    // upper 4 bits unused); the 2:1 pairing (synthmap::pair_carry4_chains:
+    // chained pairs to SINGLE_CY8, independent pairs to DUAL_CY4) is not
+    // wired into pack yet because PackedUltraSlice carries one carry cell
+    // name per slice, so pairing needs a pack struct change first.
     let mut carry_chains: Vec<Vec<String>> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
     for cell in &carry_cells {
@@ -294,6 +341,17 @@ pub fn run_impl(path: &str, part: &str, seed: u64) -> Result<(), String> {
         .map_err(|e| format!("ULTRA FASM: {e}"))?;
     println!("hang_diag ultra fasm ff_lines={}", ff_fasm.len());
 
+    // FF control FASM (CEUSED/CLKINV/SRINV per group, synthmap): fails
+    // loud if two FFs in one CEUSED group have different CE nets. Like
+    // the INIT/SRVAL lines above, these are generated here and consumed
+    // by the BITGEN stage once ROUTE lands.
+    let ff_control_fasm =
+        emit_ff_control_fasm(&packed.slices, &placed).map_err(|e| format!("ULTRA FASM: {e}"))?;
+    println!(
+        "hang_diag ultra fasm ff_control_lines={}",
+        ff_control_fasm.len()
+    );
+
     // Preliminary STA on the placed netlist (Manhattan estimates, ballpark
     // delays; NOT signoff timing).
     let timing = sta_on_placed(&design, &packed, &placed)?;
@@ -440,7 +498,16 @@ fn build_routable_nets(
     let site_of = |cell: &str| -> Result<(UltraSite, String), String> {
         cell_site
             .get(cell)
-            .map(|(x, y, bel)| (UltraSite { x: *x, y: *y, kind: 0 }, bel.clone()))
+            .map(|(x, y, bel)| {
+                (
+                    UltraSite {
+                        x: *x,
+                        y: *y,
+                        kind: 0,
+                    },
+                    bel.clone(),
+                )
+            })
             .ok_or_else(|| format!("ULTRA ROUTE: cell {cell} has no placed site"))
     };
     // Pin -> net map.

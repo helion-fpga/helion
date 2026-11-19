@@ -27,6 +27,7 @@ pub mod place;
 pub mod router;
 pub mod segbits;
 pub mod sta;
+pub mod synthmap;
 pub mod timing_db;
 
 pub use bel::{Bel, BelKind, ClbBelInventory, TileId, TileKind};
@@ -63,4 +64,8 @@ pub use router::{
 };
 pub use segbits::{BitRef, FileSegbitsDb, SegbitsDb, SegbitsLoadError};
 pub use sta::{StaNetlist, TimingReport, sta_routed};
+pub use synthmap::{
+    AND6_INIT, Carry8Mapping, FfControlGroup, MappedCell, SourceCell, SourceKind, Unmapped,
+    emit_ff_control_fasm, map_source_cell, pair_carry4_chains,
+};
 pub use timing_db::{DelaySource, SourcedDelay, UltraScaleTimingDb, preliminary_xcvu3p};
