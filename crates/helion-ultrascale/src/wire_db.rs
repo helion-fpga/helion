@@ -277,9 +277,9 @@ impl IntTileWireDb {
         // Intra-tile PIP edges.
         for (i, _) in tiles.iter().enumerate() {
             for ((src, dst), bidir) in &pip_table {
-                fanout[node(i, *src as usize)].push(node(i, *dst as usize));
+                fanout[node(i, *src as usize) as usize].push(node(i, *dst as usize));
                 if *bidir {
-                    fanout[node(i, *dst as usize)].push(node(i, *src as usize));
+                    fanout[node(i, *dst as usize) as usize].push(node(i, *src as usize));
                 }
             }
         }
