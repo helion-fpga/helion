@@ -770,7 +770,10 @@ pub fn emit_ff_control_fasm(
                 FfControlGroup::Abcd.srinv_feature()
             ));
             if half_has_sr(FfControlGroup::Abcd, FfControlGroup::Abcd2) {
-                lines.push(format!("{site}.{}.SYNC", FfControlGroup::Abcd.sync_feature()));
+                lines.push(format!(
+                    "{site}.{}.SYNC",
+                    FfControlGroup::Abcd.sync_feature()
+                ));
             }
         }
         if efgh {
@@ -783,7 +786,10 @@ pub fn emit_ff_control_fasm(
                 FfControlGroup::Efgh.srinv_feature()
             ));
             if half_has_sr(FfControlGroup::Efgh, FfControlGroup::Efgh2) {
-                lines.push(format!("{site}.{}.SYNC", FfControlGroup::Efgh.sync_feature()));
+                lines.push(format!(
+                    "{site}.{}.SYNC",
+                    FfControlGroup::Efgh.sync_feature()
+                ));
             }
         }
     }
