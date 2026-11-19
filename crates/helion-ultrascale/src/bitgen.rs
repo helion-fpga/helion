@@ -243,6 +243,9 @@ pub enum BitgenError {
     UnknownTileType { tile: String },
     /// Feature has no segbits entry for the tile type.
     UnknownFeature { tile: String, feature: String },
+    /// DSP48E2 / DSP tile feature: no config-bit encoding exists in any
+    /// public source (see `crate::dsp`). Blocked on Vivado fuzzing job 2.
+    Dsp48e2Blocked { tile: String, feature: String },
     /// Duplicate (tile, feature) line in the FASM input.
     DuplicateFeature { tile: String, feature: String },
     /// A `!` bit reads 1 when the feature requires 0.
@@ -324,6 +327,15 @@ impl fmt::Display for BitgenError {
             }
             BitgenError::UnknownFeature { tile, feature } => {
                 write!(f, "tile {tile}: unknown feature {feature}")
+            }
+            BitgenError::Dsp48e2Blocked { tile, feature } => {
+                write!(
+                    f,
+                    "tile {tile} feature {feature}: DSP48E2 config-bit encoding is missing, \
+                     no public source documents DSP48E2 config bits (prjuray-db ships no segbits_dsp DB; \
+                     BitFiltrator ULTRASCALE_PLUS.json has no DSP table); blocked on Vivado fuzzing job 2 \
+                     (DSP48E2 attribute sweep); refusing to emit guessed bits"
+                )
             }
             BitgenError::DuplicateFeature { tile, feature } => {
                 write!(f, "tile {tile}: duplicate feature {feature}")
@@ -686,6 +698,18 @@ pub fn emit_frames(
     let mut frames: BTreeMap<u32, FrameWords> = BTreeMap::new();
     let mut written: HashMap<(u32, u16), bool> = HashMap::new();
     for entry in &entries {
+        // DSP first: a DSP48E2 / DSP tile entry has no encoding in any
+        // public source, so it must fail here with the specific error,
+        // not further down as UnknownTile / UnknownTileType /
+        // UnknownFeature. The check runs before any lookup so that even
+        // a segbits entry for the feature (which could only come from a
+        // non-public source) is never trusted.
+        if crate::dsp::is_dsp48e2_entry(&entry.tile, &entry.feature) {
+            return Err(BitgenError::Dsp48e2Blocked {
+                tile: entry.tile.clone(),
+                feature: entry.feature.clone(),
+            });
+        }
         let tile_type = device
             .tile_type(&entry.tile)
             .ok_or_else(|| BitgenError::UnknownTile {
