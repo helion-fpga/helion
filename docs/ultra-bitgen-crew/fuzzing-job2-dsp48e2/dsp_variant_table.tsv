@@ -1,0 +1,91 @@
+# DSP48E2 attribute table for Vivado fuzzing job 2
+#
+# One row per variant run. Columns (tab-separated):
+#   id, attribute, kind, default, variant
+#
+# - id: stable run id, `v<nnn>`. The baseline is `v000` (all defaults).
+# - attribute: DSP48E2 primitive attribute name, exactly as in the
+#   BitFiltrator dsp.v template (the job-2 baseline design).
+# - kind: string (Verilog string literal), int (bare integer), or
+#   bits<N> (sized Verilog literal, e.g. 48'h...).
+# - default: the dsp.v default value. Variant: the non-default value to
+#   fuzz. Both are rendered verbatim into the variant Verilog by
+#   gen_dsp_variants.py, except string values, which the generator
+#   quotes.
+#
+# Defaults and legal values are copied from the dsp.v comments in the
+# shipped Vivado fuzzing package (vivado-fuzzing-package.zip,
+# tcl/dsp.v), which documents each attribute's legal values. No bit
+# positions are claimed here: the whole point of job 2 is to measure
+# them.
+#
+# Variant values are chosen as minimal non-default changes: one enum
+# step, one register-stage step, one inversion bit, or a single-bit
+# change to a 48-bit constant. A variant whose .rbt diff against the
+# baseline is empty is a RESULT, not a failure: record it. (Example:
+# XORSIMD only takes effect when USE_WIDEXOR is TRUE, so the XORSIMD
+# variant alone may show no diff. Do not silently re-run it combined
+# with USE_WIDEXOR=TRUE as the primary run; log a follow-up run
+# instead, in runs.txt, with both attributes named.)
+#
+# Count: 46 attributes, 55 variants, 56 runs including the baseline.
+# The instructions estimate 60-100 runs; 56 is the single-attribute
+# sweep. Follow-up combined runs (see JOB2.md) are extra, and are
+# logged separately, never folded into the primary table.
+id	attribute	kind	default	variant
+v000	-	-	-	-
+v001	AMULTSEL	string	A	AD
+v002	A_INPUT	string	DIRECT	CASCADE
+v003	BMULTSEL	string	B	AD
+v004	B_INPUT	string	DIRECT	CASCADE
+v005	PREADDINSEL	string	A	B
+v006	RND	bits48	48'h000000000000	48'h000000000001
+v007	USE_MULT	string	MULTIPLY	NONE
+v008	USE_MULT	string	MULTIPLY	DYNAMIC
+v009	USE_SIMD	string	ONE48	TWO24
+v010	USE_SIMD	string	ONE48	FOUR12
+v011	USE_WIDEXOR	string	FALSE	TRUE
+v012	XORSIMD	string	XOR24_48_96	XOR12
+v013	AUTORESET_PATDET	string	NO_RESET	RESET_MATCH
+v014	AUTORESET_PATDET	string	NO_RESET	RESET_NOT_MATCH
+v015	AUTORESET_PRIORITY	string	RESET	CEP
+v016	MASK	bits48	48'h3fffffffffff	48'h000000000000
+v017	PATTERN	bits48	48'h000000000000	48'h000000000001
+v018	SEL_MASK	string	MASK	C
+v019	SEL_MASK	string	MASK	ROUNDING_MODE1
+v020	SEL_MASK	string	MASK	ROUNDING_MODE2
+v021	SEL_PATTERN	string	PATTERN	C
+v022	USE_PATTERN_DETECT	string	NO_PATDET	PATDET
+v023	IS_ALUMODE_INVERTED	bits4	4'b0000	4'b0001
+v024	IS_CARRYIN_INVERTED	bits1	1'b0	1'b1
+v025	IS_CLK_INVERTED	bits1	1'b0	1'b1
+v026	IS_INMODE_INVERTED	bits5	5'b00000	5'b00001
+v027	IS_OPMODE_INVERTED	bits9	9'b000000000	9'b000000001
+v028	IS_RSTALLCARRYIN_INVERTED	bits1	1'b0	1'b1
+v029	IS_RSTALUMODE_INVERTED	bits1	1'b0	1'b1
+v030	IS_RSTA_INVERTED	bits1	1'b0	1'b1
+v031	IS_RSTB_INVERTED	bits1	1'b0	1'b1
+v032	IS_RSTCTRL_INVERTED	bits1	1'b0	1'b1
+v033	IS_RSTC_INVERTED	bits1	1'b0	1'b1
+v034	IS_RSTD_INVERTED	bits1	1'b0	1'b1
+v035	IS_RSTINMODE_INVERTED	bits1	1'b0	1'b1
+v036	IS_RSTM_INVERTED	bits1	1'b0	1'b1
+v037	IS_RSTP_INVERTED	bits1	1'b0	1'b1
+v038	ACASCREG	int	2	0
+v039	ACASCREG	int	2	1
+v040	ADREG	int	0	1
+v041	ALUMODEREG	int	0	1
+v042	AREG	int	2	0
+v043	AREG	int	2	1
+v044	BCASCREG	int	2	0
+v045	BCASCREG	int	2	1
+v046	BREG	int	2	0
+v047	BREG	int	2	1
+v048	CARRYINREG	int	0	1
+v049	CARRYINSELREG	int	0	1
+v050	CREG	int	0	1
+v051	DREG	int	0	1
+v052	INMODEREG	int	0	1
+v053	MREG	int	1	0
+v054	OPMODEREG	int	0	1
+v055	PREG	int	0	1
