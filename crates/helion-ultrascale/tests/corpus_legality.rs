@@ -85,8 +85,8 @@ fn extract_cells(
                 // not a plain LUT6 (synthmap hazard): fail loud, never
                 // pack it as logic. Check here, not in a later guarded
                 // arm, because this arm matches every Lut6 first.
-                if cell.attrs.contains_key("SRL_TYPE")
-                    || cell.attrs.contains_key("SHREG_EXTRACT")
+                if cell.attrs.map.contains_key("SRL_TYPE")
+                    || cell.attrs.map.contains_key("SHREG_EXTRACT")
                     || cell.attrs.get("MEMORY").map(|s| s == "1").unwrap_or(false)
                 {
                     unmapped.push(format!("{name} (SRL/distributed-RAM LUT6)"));

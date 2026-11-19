@@ -77,8 +77,8 @@ pub fn extract_cells(design: &Design) -> Result<ExtractedCells, String> {
             CellKind::Lut6 { init } => SourceKind::Lut6 {
                 init: *init,
                 is_memory: cell.attrs.get("MEMORY").map(|s| s == "1").unwrap_or(false),
-                is_srl: cell.attrs.contains_key("SRL_TYPE")
-                    || cell.attrs.contains_key("SHREG_EXTRACT"),
+                is_srl: cell.attrs.map.contains_key("SRL_TYPE")
+                    || cell.attrs.map.contains_key("SHREG_EXTRACT"),
             },
             CellKind::Hff => SourceKind::Ff {
                 has_ce: net_of(cell.name, "CE").is_some(),
