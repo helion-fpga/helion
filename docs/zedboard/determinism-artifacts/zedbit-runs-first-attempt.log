@@ -1,0 +1,11 @@
+blinky started 2026-11-19T18:04:06Z
+zedbit synth: v2 front end, 27 LUTs, 27 flops, 1 LUT levels
+zedbit: synthesized in 0.0s; loading the device
+zedbit: unknown part xc7z020clg484-1: not in the Project X-Ray database at /home/hatch/workspace/xilinx-dbsrc (families artix7; 0 parts, e.g. )
+blinky exit=1 2026-11-19T18:04:06Z
+pico started 2026-11-19T18:04:06Z
+zedbit synth: v2 front end, 1464 LUTs, 516 flops, 6 LUT levels
+zedbit: synthesized in 0.9s; loading the device
+zedbit: unknown part xc7z020clg484-1: not in the Project X-Ray database at /home/hatch/workspace/xilinx-dbsrc (families artix7; 0 parts, e.g. )
+pico exit=1 2026-11-19T18:04:07Z
+runs done 2026-11-19T18:04:07Z
