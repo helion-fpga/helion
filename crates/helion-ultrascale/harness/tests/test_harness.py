@@ -413,6 +413,76 @@ class TestReference(unittest.TestCase):
             self.assertIn("absent", miss)
 
 
+class TestUram(unittest.TestCase):
+    def setUp(self):
+        self.ref = Tier1Reference()
+
+    def test_classify_uram_lines(self):
+        feats = parse_fasm(golden_fasm("uram", "xcku3p"))
+        got = {}
+        for feat in feats:
+            got[classify(feat)] = got.get(classify(feat), 0) + 1
+        self.assertEqual(got, {"URAM288": 6})
+
+    def test_uram_golden_matches_generator(self):
+        # The on-disk golden is exactly what build_fasm produces.
+        for part in ("xcku3p", "xcvu3p"):
+            self.assertEqual(
+                build_fasm("uram", part), golden_fasm("uram", part),
+                "uram/%s golden differs from build_fasm" % part)
+
+    def test_uram_golden_lines_match_ug974(self):
+        # The 6 non-comment lines must be exactly the six UG974
+        # URAM288 attributes at their defaults (see
+        # data/URAM288_SEARCH.md section 5). The spellings are the
+        # ones the Rust is_uram288_entry detector matches.
+        lines = [l for l in golden_fasm("uram", "xcku3p").splitlines()
+                 if l and not l.startswith("#")]
+        self.assertEqual(lines, [
+            'URAM_X0Y0.URAM288.CASCADE_ORDER_A = "NONE"',
+            'URAM_X0Y0.URAM288.CASCADE_ORDER_B = "NONE"',
+            'URAM_X0Y0.URAM288.OREG_A = "FALSE"',
+            'URAM_X0Y0.URAM288.OREG_B = "FALSE"',
+            'URAM_X0Y0.URAM288.EN_ECC_RD_A = "FALSE"',
+            'URAM_X0Y0.URAM288.EN_ECC_RD_B = "FALSE"',
+        ])
+
+    def test_uram_golden_has_no_init_line(self):
+        # URAM288 has no INIT attributes in UG974. No feature line
+        # in the golden may invent one. (The header comments discuss
+        # INIT to explain its absence; only feature lines are
+        # checked here.)
+        lines = [l for l in golden_fasm("uram", "xcku3p").splitlines()
+                 if l and not l.startswith("#")]
+        for line in lines:
+            self.assertNotIn("INIT", line)
+
+    def test_uram_resolves_blocked_naming_absence(self):
+        for feat in parse_fasm(golden_fasm("uram", "xcku3p")):
+            _, _, _, miss = resolve_feature(self.ref, "xcku3p", feat)
+            self.assertIsNotNone(miss, feat)
+            self.assertIn("absent", miss)
+            self.assertIn("URAM288", miss)
+
+    def test_diff_uram_blocked_with_fake_emitter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shim = _fake_emitter_shim(tmp)
+            emitter = Emitter(shim)
+            meta = golden_meta("uram", "xcku3p")
+            recs = diff_design(
+                self.ref, emitter, "uram", "xcku3p",
+                os.path.join(GOLDEN_DIR, "uram.xcku3p.fasm"),
+                meta["seed"], meta["placement_hash"], "tier1", tmp,
+            )
+            self.assertEqual(len(recs), 10)
+            by_block = {r["block"]: r for r in recs}
+            rec = by_block["URAM288"]
+            self.assertEqual(rec["status"], "blocked")
+            self.assertIsNone(rec["diff_bits"])
+            self.assertIn("URAM288", rec["missing"])
+            self.assertIn("absent", rec["missing"])
+
+
 class TestDiffEngine(unittest.TestCase):
     def setUp(self):
         self.ref = Tier1Reference()
@@ -769,7 +839,7 @@ class TestDiffEngine(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
-    def test_full_run_exits_zero_with_40_blocked_records(self):
+    def test_full_run_exits_zero_with_60_blocked_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "run")
             proc = subprocess.run(
@@ -779,16 +849,16 @@ class TestCli(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             recs = [json.loads(l) for l in open(os.path.join(out, "diff.jsonl"))]
-            self.assertEqual(len(recs), 40)
+            self.assertEqual(len(recs), 60)
             self.assertTrue(all(r["status"] == "blocked" for r in recs))
             self.assertTrue(all(r["diff_bits"] is None for r in recs))
             manifest = json.load(open(os.path.join(out, "manifest.json")))
             self.assertEqual(manifest["tier"], "tier1")
-            self.assertEqual(len(manifest["combos"]), 4)
+            self.assertEqual(len(manifest["combos"]), 6)
 
     def test_garbage_parse_emitter_full_run_writes_all_records(self):
         # Critic session 5, FLAG 2, end to end: a bad-parse emitter
-        # over all 4 combos must exit 0 with all 40 records and a
+        # over all 6 combos must exit 0 with all 60 records and a
         # manifest, never a traceback. Every combo's FRAMING record
         # is red with the error named.
         with tempfile.TemporaryDirectory() as tmp:
@@ -805,16 +875,16 @@ class TestCli(unittest.TestCase):
             self.assertNotIn("Traceback", proc.stderr)
             with open(os.path.join(out, "diff.jsonl")) as f:
                 recs = [json.loads(l) for l in f]
-            self.assertEqual(len(recs), 40)
+            self.assertEqual(len(recs), 60)
             framing = [r for r in recs if r["block"] == "FRAMING"]
-            self.assertEqual(len(framing), 4)
+            self.assertEqual(len(framing), 6)
             for r in framing:
                 self.assertEqual(r["status"], "red")
                 self.assertEqual(r["diff_bits"], 1)
                 self.assertIn("not valid FASM", r["detail"])
             with open(os.path.join(out, "manifest.json")) as f:
                 manifest = json.load(f)
-            self.assertEqual(len(manifest["combos"]), 4)
+            self.assertEqual(len(manifest["combos"]), 6)
 
     def test_tampered_golden_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -11,8 +11,8 @@ ordering IS the crew's work queue.
 python3 diff.py
 ```
 
-One command runs the full diff on blinky and counter for xcku3p and
-xcvu3p, prints the four greedy queues, and writes JSONL records plus
+One command runs the full diff on blinky, counter, and uram for xcku3p and
+xcvu3p, prints the six greedy queues, and writes JSONL records plus
 a run manifest to `runs/<UTC timestamp>/`. Every record carries the
 run seed and the placement hash. A run whose placement hash differs
 from the golden meta is rejected (exit 3), not compared.
@@ -67,9 +67,9 @@ the full diff after each fix. A fix that regresses a green block is
 reverted on the spot. A block goes green only on zero diff plus a
 critic re-run.
 
-## Current state (first run, 2026-11-07)
+## Current state (first run, 2026-11-07; uram golden added 2026-11-19)
 
-All 40 records blocked. No emitter exists yet (bitgen-core), so every
+All 60 records blocked (3 designs x 2 parts x 10 blocks). No emitter exists yet (bitgen-core), so every
 block that needs one reports blocked with the missing piece named.
 Reference totals on the control part xcku3p: blinky LUT_INIT 64,
 FF_INIT 1, INT_PIP 11, IO_CONFIG 55; counter LUT_INIT 256, FF_INIT 4,
