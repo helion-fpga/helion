@@ -93,6 +93,96 @@ license state UNKNOWN; nothing here runs Vivado or claims Tier 2.
 (Commands and outputs appended here as they are run. Nothing in
 this file is claimed without a shown run.)
 
+Binary: `target/debug/helion`, built 2026-11-19 with
+`cargo build -j1 -p helion-cli --bin helion --offline`
+(3m 00s, 2 pre-existing rustc warnings in `main.rs`: unused
+imports `place_with`, `route_with`, also present at e1c2e47).
+Tests: `cargo test -j1 -p helion-cli --offline --bin helion`
+(bin target holds only the 16 multiseed tests): 16 passed,
+0 failed, including the 4 new tests from d2db932a.
+
+### Run 1: 5-seed sweep, counter, HL10T (2026-11-19 ~17:29 UTC)
+
+Command: `./target/debug/helion multiseed examples/counter.sv
+--part HL10T-C32-1 --seeds 5 --seed-start 1 --jobs 2
+--out /tmp/ms2-repro.jsonl --threshold 0 --log-dir /tmp/ms2-logs
+--best-out /tmp/ms2-best.json --emit-best /tmp/ms2-best.hbits`
+
+Result: exit 0. All 5 seeds ok, WNS 9140 ps, TNS 0, every seed.
+BEST seed 1 (tie-break: lowest seed). Per-seed logs `seed-1.log`
+through `seed-5.log` written; `seed-1.log` reads
+`status=ok wns_ps=9140 tns_ps=0 endpoints=4 r2r_ps=360 iob_ps=860
+pathfinder_iters=1 imux_routes=10 imux_skip=0 overused=0`.
+Best-out JSON carries reproduce
+`helion impl examples/counter.sv --part HL10T-C32-1 --seed 1`.
+Emit-best wrote `/tmp/ms2-best.hbits`, 185 bytes.
+
+Reproduce check: `helion impl examples/counter.sv --part
+HL10T-C32-1 --seed 1` reports `hang_diag timing WNS_PS=9140
+TNS_PS=0 endpoints=4 r2r_ps=360 iob_ps=860`, identical to the
+sweep record. Seed 0 gives the same 9140. The counter is 4 LUTFFs;
+the seed shuffle has no timing effect at this size, so a flat
+sweep is expected here, not a defect.
+
+Note: the 9140 measured here differs from the 9640 "gold WNS on
+counter" comment in `compile_design_xdc`. The sweep, `helion
+impl`, seed 0, and seed 1 all agree on 9140, so the sweep is
+consistent with the current compile path; the 9640 comment looks
+stale. Not chased here.
+
+### Run 2: resume of run 1 (same command again)
+
+Result: exit 0. Header `(5 already done, 0 to run)`,
+`multiseed: nothing to run`, same BEST seed 1, JSONL still
+5 lines. Resume skips finished seeds and appends nothing.
+
+### Runs 3-4: --retry-failed, live
+
+Checkpoint seeded by hand: seed 1 ok (WNS 9140), seed 2 fail
+(reason "boom"). Without the flag (seeds 1..4): `(2 already
+done, 2 to run)`, seeds 3 and 4 ran, seed 2 stayed failed,
+report `3/4 ok, 1/4 fail`. With `--retry-failed`: `(3 already
+done, 1 to run)`, seed 2 re-ran to ok, a second seed-2 record
+was appended, report `4/4 ok, 0/4 fail`. Last record wins.
+
+### Run 5: --part xcku3p fails loud (GAP-F7, live)
+
+Command: `helion multiseed examples/counter.sv --part xcku3p
+--seeds 2`. Result: exit 1, `multiseed front end: HAD xcku3p:
+read .../devices/helion/parts/xcku3p.toml: No such file or
+directory (os error 2)`. No seed ran. The 100-seed xcku3p flow
+stays blocked on the device model (GAP-F7) plus pack/place/route/
+STA on that part (GAP-F2/F3/F4/F5). Nothing invented.
+
+### Run 6: garbage numeric flag fails loud
+
+Command: `--seeds abc`. Result: exit 1, `multiseed: --seeds
+must be a whole number, got "abc"`. No sweep ran.
+
+### Run 7: 10-seed sweep, blinky, HL10T
+
+Command: `./target/debug/helion multiseed examples/blinky.sv
+--part HL10T-C32-1 --seeds 10 --seed-start 1 --jobs 2
+--out /tmp/ms2-blinky.jsonl --threshold 0`. Result: exit 0,
+10/10 ok, every seed WNS 9140, TNS 0, BEST seed 1. Same flat
+sweep as the counter: tiny designs show no seed spread.
+
+### What is proven vs what is not
+
+- PROVEN on the generic part (HL10T): pack-once sweep,
+  per-seed place/route/STA, per-seed logs, JSONL checkpoint and
+  resume (including retry-failed), deterministic best-seed
+  selection with the documented tie-breaks, best-seed artifacts
+  plus a reproduce command that returns the same WNS, fail-loud
+  on unknown part and on garbage flags.
+- NOT PROVEN: the GOAL.md "10-seed, WNS 8460 to 8820" claim
+  still has no run log; both designs run here sweep flat at
+  9140, so that range is not reproduced and no number from it
+  is reused. Seed spread needs a bigger design than blinky or
+  counter; none was run here.
+- NOT PROVEN: the 100-seed flow on xcku3p. Blocked on GAP-F7
+  (device model) plus GAP-F2/F3/F4/F5, as recorded above.
+
 ## Verification by the second replacement (2026-11-19, branch tip 5b338d37)
 
 Read the driver from first principles against `compile_design_xdc`
@@ -192,15 +282,10 @@ The orchestrator record conflates them; the on-disk state is:
   `route_status` key its parser defaults to `"unknown"` when
   missing, and this driver ignores keys it does not know.
 - The predecessor's `cargo test -j2` (pid 54046, started 15:17 UTC,
-  log `/tmp/ms-test-ultra.log`) runs in the session-18 worktree,
-  not this one. Its lib suite passed 91 tests (including 9
-  multiseed port tests); its `helion-bitgen` bin tests are slow
-  under load (each full emit plus parse on the xcku3p golden) and
-  were still running at last check. This branch's own tests had
-  not been run yet at the time of writing; results go below once
-  that cargo run finishes and this worktree's suite runs.
-
-## Reproduction runs
-
-(Commands and outputs appended here as they are run. Nothing in
-this file is claimed without a shown run.)
+  log `/tmp/ms-test-ultra.log`) ran in the session-18 worktree,
+  not this one. It finished with all suites passing: 162 tests,
+  0 failed (lib 91 including 9 multiseed port tests, helion-bitgen
+  bin 7 in 1777 s, plus 13, 9, 2, 3, 3, 2, 1, 22, 4, 2, 3, 0
+  across the remaining targets). This branch's own suite then ran
+  green too: `cargo test -j1 -p helion-cli --offline --bin helion`,
+  16 passed, 0 failed (see the runs section above).
