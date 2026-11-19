@@ -25,7 +25,7 @@ module dsp_regs (
     output logic        [31:0] q_mo,    // M read elsewhere too: it is P, the next stage a flop
     output logic        [31:0] o_mo,
     output logic signed [63:0] q_wacc,  // accumulator wider than 48 bits: the add stays in the fabric
-    output logic        [31:0] q_ain,   // A register also read elsewhere: kept in the fabric as well
+    output logic        [31:0] q_ain,   // A register also read elsewhere: stays a flop
     output logic        [15:0] o_ain
 );
     function automatic logic signed [24:0] sa(input int k); return x[25*k +: 25]; endfunction

@@ -29,8 +29,7 @@
 //! - P: `p <= a * b`, or `p <= p + a * b` (OPMODE Z = P) with `p` at most
 //!   48 bits, the product used nowhere else;
 //! - M: `m <= a * b` read only by `p <= m` or `p <= p + m` (then P too);
-//! - A, B: an operand that is a register's output. A register something
-//!   else reads as well stays in the fabric too, with the same contents.
+//! - A, B: an operand that is the output of a register nothing else reads.
 
 use super::dag::{Dag, Op, N};
 use super::lower::{clock_shape, wire, Drv, Flat, Hard, SigInfo};
@@ -232,6 +231,7 @@ fn slice_reg(flat: &mut Flat, ri: u32) -> Option<SliceReg> {
 
 /// An operand: `e` and the driver of each of its bits.
 struct Operand {
+    n: N,
     e: u32,
     bits: Vec<(N, u32)>,
 }
@@ -248,7 +248,7 @@ fn operand(flat: &Flat, x: N) -> Operand {
     while sw > 1 && key(bits[sw as usize - 2]) == key(bits[w as usize - 1]) {
         sw -= 1;
     }
-    Operand { e: sw.min(zw + 1), bits }
+    Operand { n: x, e: sw.min(zw + 1), bits }
 }
 
 impl Operand {
@@ -278,6 +278,31 @@ impl Operand {
         }
         found
     }
+}
+
+/// Every read of signal `s` is inside operand `x` (through its slices and
+/// concatenations) and those are used by nothing else; the product refers
+/// to `x` `uses` times.
+fn private(flat: &Flat, refs: &[u32], reads: &[u32], x: N, uses: u32, s: u32) -> bool {
+    let mut seen: HashMap<N, u32> = HashMap::new();
+    let mut stack = vec![x; uses as usize];
+    while let Some(n) = stack.pop() {
+        let c = seen.entry(n).or_default();
+        *c += 1;
+        if *c == 1 && matches!(flat.dag.op(n), Op::Slice(..) | Op::Concat(..)) {
+            stack.extend(flat.dag.kids(n));
+        }
+    }
+    let mut r = 0;
+    for (&n, &c) in &seen {
+        match *flat.dag.op(n) {
+            Op::Read(t) if t != s => {}
+            Op::Read(_) | Op::Slice(..) | Op::Concat(..) if count(refs, n) != c => return false,
+            Op::Read(_) => r += c,
+            _ => {}
+        }
+    }
+    r == reads[s as usize]
 }
 
 const ATTRS: [(&str, &str); 7] = [
@@ -366,7 +391,8 @@ pub fn infer(flat: &mut Flat) {
         let own: Vec<u32> = [mreg, preg.map(|p| p.0)].into_iter().flatten().map(|k| cands[k].ri).collect();
         let port = |flat: &mut Flat, op: &Operand, clk: &mut Option<(N, u32)>| -> (Vec<(N, u32)>, Option<(N, N)>) {
             let pins: Vec<(N, u32)> = (0..op.e).map(|j| op.bits[j as usize]).collect();
-            let Some((ri, s)) = op.reg(flat).filter(|(ri, _)| !own.contains(ri)) else { return (pins, None) };
+            let uses = (x == op.n) as u32 + (y == op.n) as u32;
+            let Some((ri, s)) = op.reg(flat).filter(|&(ri, s)| !own.contains(&ri) && private(flat, &refs, &reads, op.n, uses, s)) else { return (pins, None) };
             let Some(sr) = slice_reg(flat, ri) else { return (pins, None) };
             if clk.is_some_and(|c| c != sr.clk) {
                 return (pins, None);
