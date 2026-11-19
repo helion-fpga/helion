@@ -27,12 +27,14 @@ pub mod int_pip;
 pub mod legality;
 pub mod pack;
 pub mod place;
+pub mod route_to_pip;
 pub mod router;
 pub mod segbits;
 pub mod sta;
 pub mod synthmap;
 pub mod timing_db;
 pub mod uram;
+pub mod wire_db;
 
 pub use bel::{Bel, BelKind, ClbBelInventory, TileId, TileKind};
 pub use bitgen::{
@@ -65,14 +67,18 @@ pub use fabric::{
 };
 pub use fasm_gen::{FfAttr, emit_ff_fasm, ff_init_fasm_line, ff_srval_fasm_line};
 pub use int_pip::{
-    EmittedPip, IntPip, IntPipError, MissingPip, PipResolution, emit_pips, emitted_to_fasm,
-    missing_pip_report, resolve_pips, verify_zero_bits,
+    BidirDir, EmittedPip, IntPip, IntPipError, MissingPip, PipResolution, emit_pips,
+    emitted_to_fasm, missing_pip_report, resolve_pips, verify_zero_bits,
 };
 pub use legality::{LegalityViolation, check_legality};
 pub use pack::{ControlSetLimits, PackedUltraSlice, SliceKind, UltraBel, UltraPacked, pack_ultra};
 pub use place::{
     PlacedUltraSlice, UltraGrid, UltraPlaceOpts, UltraPlaced, place_ultra, render_placed_netlist,
     seeded_order,
+};
+pub use route_to_pip::{
+    RouteToPipError, TranslatedRoute, translate_route, translate_route_with, translate_routes,
+    translate_routes_with, translated_to_fasm,
 };
 pub use router::{
     RoutableNet, RouteError, RouteErrorKind, UltraRouteOpts, UltraRouted, route_ultra,
@@ -87,3 +93,4 @@ pub use timing_db::{
     documented_xcku3p, documented_xcvu3p, sta_db_for_part, DelaySource, SourcedDelay,
     UltraScaleTimingDb, preliminary_xcku3p, preliminary_xcvu3p,
 };
+pub use wire_db::{IntTile, IntTileWireDb, WireDbError};

@@ -47,7 +47,7 @@ class Emitter:
     def __init__(self, cmd):
         self.cmd = cmd
 
-    def _run(self, args, timeout=300):
+    def _run(self, args, timeout=1800):
         try:
             proc = subprocess.run(
                 [self.cmd] + args,

@@ -26,6 +26,7 @@
 
 import json
 import os
+import re
 
 HARNESS_DIR = os.path.dirname(os.path.abspath(__file__))
 REF_DIR = os.path.join(HARNESS_DIR, "reference")
@@ -430,13 +431,62 @@ class Tier1Reference:
         return {(tile, frame, bit): val for frame, bit, val in db[key]}
 
     def resolve_cmt_pip(self, tile, feature):
-        """Reference bits for one CMT clock PIP, tile-relative."""
+        """Reference bits for one CMT clock PIP or WIRE line, tile-relative.
+
+        Only CMT_RIGHT resolves: it is the one CMT tile type with a
+        segbits file (segbits_cmt_right.db, 104 lines, HROUTE/HDISTR
+        PIPs and USED bits). CMT_LEFT has no segbits file at all in
+        prjuray-db, so a CMT_L line fails loud naming that gap instead
+        of misreading the CMT_RIGHT DB.
+        """
+        m = re.match(r"^(.*)_X\d+Y\d+$", tile)
+        tile_type = m.group(1) if m else tile
+        if tile_type != "CMT_RIGHT":
+            raise MissingReference(
+                "no segbits file for tile type %r in prjuray-db "
+                "(CMT_LEFT has none); CMT feature %r has no public "
+                "encoding" % (tile_type, feature)
+            )
         db = self.segbits("cmt_right")
         key = "CMT_RIGHT." + feature
         if key not in db:
             raise MissingReference(
                 "CMT feature %r not in prjuray-db segbits_cmt_right.db "
                 "(104 lines, CLK_HROUTE PIPs only)" % feature
+            )
+        return {(tile, frame, bit): val for frame, bit, val in db[key]}
+
+    def resolve_rclk(self, tile, feature):
+        """Reference bits for one RCLK clock feature, tile-relative.
+
+        Tile type is the tile name up to _X<num> (RCLK_INT_L_X0Y0 gives
+        RCLK_INT_L); the DB is segbits_<tile type lowercased>.db, one of
+        the fifteen segbits_rclk_*.db files vendored by the CLK worker
+        (prjuray-db, CC0). PIP, WIRE, and BUFCE_LEAF site config lines
+        all resolve the same way: the DB key is <tile type>.<feature>
+        in every case. Absolute FARs need the RCLK tile's column major,
+        which is unknown for xcku3p/xcvu3p (no tilegrid), so the bits
+        are tile-relative, like resolve_cmt_pip.
+        """
+        m = re.match(r"^(.*)_X\d+Y\d+$", tile)
+        if not m:
+            raise MissingReference(
+                "tile %r is not an RCLK tile (expected RCLK_<type>_X<num>Y<num>)"
+                % tile
+            )
+        tile_type = m.group(1)
+        if not tile_type.startswith("RCLK_"):
+            raise MissingReference(
+                "tile %r is not an RCLK tile (tile type %r)"
+                % (tile, tile_type)
+            )
+        db = self.segbits(tile_type.lower())
+        key = tile_type + "." + feature
+        if key not in db:
+            raise MissingReference(
+                "RCLK feature %r not in prjuray-db segbits_%s.db; "
+                "encoding of this clock feature is unverified"
+                % (feature, tile_type.lower())
             )
         return {(tile, frame, bit): val for frame, bit, val in db[key]}
 
