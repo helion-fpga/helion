@@ -171,10 +171,18 @@ The sibling worker on `fm/ultra-bitgen-synthmap` owns synthesis
 mapping to UltraScale primitives, including DSP48E2. The interface
 between that work and this block is:
 
-- Vocabulary: the mapper must use exactly the attribute names in
-  `crates/helion-ultrascale/src/dsp.rs` (`DSP48E2_ATTRIBUTES`, taken
-  from the `dsp.v` template). Job 2 fuzzes exactly that set. Any
-  attribute the mapper emits that job 2 did not fuzz stays blocked.
+- Vocabulary: the mapper must use exactly the 46 attribute names in
+  the job-2 table (`dsp_variant_table.tsv`, same list as
+  `gen_dsp_variants.py` `EXPECTED_ATTRIBUTES`, taken from the `dsp.v`
+  template). Job 2 fuzzes exactly that set. Any attribute the mapper
+  emits that job 2 did not fuzz stays blocked. Note the count differs
+  from `DSP48E2_ATTRIBUTES` in `crates/helion-ultrascale/src/dsp.rs`
+  on purpose: that list has 43 names, the bare-name detector subset.
+  `RND`, `MASK`, and `PATTERN` are excluded there because they are
+  generic words, and a bare feature of that name on a non-DSP tile
+  must stay `UnknownFeature`; they are still fuzzed by job 2, and
+  they still block whenever the tile or feature itself names DSP48E2
+  or a DSP tile.
 - FASM: the mapper emits DSP48E2 cells as FASM entries naming a
   DSP48E2 site/tile and its attributes. The emitter is the
   enforcement point: until the job-2 encoding lands, any such entry
