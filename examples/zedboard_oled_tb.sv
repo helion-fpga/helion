@@ -14,12 +14,14 @@
 // Pass prints PASS and finishes; any failure prints FAIL with the first
 // mismatch and finishes.
 //
-// Run with verilator:
-//   verilator --binary -j 1 --top-module zedboard_oled_tb \
+// Run with Verilator:
+//   $ verilator --binary -j 1 --top-module zedboard_oled_tb \
 //     examples/zedboard_oled_tb.sv examples/zedboard_oled.sv
 // or with iverilog:
-//   iverilog -g2012 -o oled_tb.vvp \
+//   $ iverilog -g2012 -o oled_tb.vvp \
 //     examples/zedboard_oled_tb.sv examples/zedboard_oled.sv && vvp oled_tb.vvp
+// (the $ keeps Verilator from reading a command line as a directive:
+// a comment starting with `verilator` after the // is a Verilator pragma.)
 // No simulator is installed on the Linux sandbox, so this is run on the Mac.
 `timescale 1ns / 1ps
 
@@ -82,7 +84,8 @@ module zedboard_oled_tb;
     time first_sclk_time = 0;
 
     always @(oled_sdin) last_sdin_change = $time;
-    always @(negedge oled_res) res_was_low = 1'b1;
+    // RES starts low, so its negedge never fires; sample the level instead.
+    always @(posedge clk) if (oled_res === 1'b0) res_was_low = 1'b1;
 
     // Power order: VDD on while VBAT is still off, RES high before VBAT on.
     initial begin

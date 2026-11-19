@@ -31,8 +31,10 @@ module zedboard_oled (
     output logic       oled_res,
     output logic       oled_sclk,
     output logic       oled_sdin,
-    output logic       oled_vbat,
-    output logic       oled_vdd,
+    // Active low: the initial 1 keeps both rails off from configuration
+    // until the first clock edge drives the power sequence.
+    output logic       oled_vbat = 1'b1,
+    output logic       oled_vdd = 1'b1,
     output logic       led
 );
     // Init command list, one byte per entry. D/C is low for every entry
@@ -93,7 +95,9 @@ module zedboard_oled (
         if (idx < 6'd18)
             rom_entry = INIT_ROM[idx[4:0]];
         else
-            rom_entry = INIT_TAIL[idx[4:0] - 5'd18];
+            // 3' cast: the tail index is 0..6, made explicit so Verilator
+            // does not warn WIDTHTRUNC on the 5-bit to 3-bit truncation.
+            rom_entry = INIT_TAIL[3'(idx[4:0] - 5'd18)];
     endfunction
 
     assign entry = rom_entry(rom_idx);
