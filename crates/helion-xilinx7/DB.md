@@ -15,6 +15,21 @@ The raw Project X-Ray database is **not** committed to git. It lives at
   (2.19 MB, matches 5408 frames x 101 words x 4 bytes) plus `blinky.v`,
   `blinky.xdc` (clk=E3, led=H5).
 
+## openXC7/prjxray-db 0c3504f (checked 2026-11-19)
+
+`openXC7/prjxray-db@0c3504f26f5cf77b6a7605c7bc83ebe1ac67b26f` (a fork of the
+above) adds spartan7, kintex7 and virtex7, and works as the only database
+root. Against f4pga master for artix7/zynq7: the xc7z020 tilegrid, tileconn,
+part.json and package pins are identical; 74 of the 80 differing files only
+add lines; the rest are zynq7's part list and a few ppips in HCLK_IOI3 and
+GTP_COMMON tiles. With the same zedbit (b1c2c92) both databases give
+byte-identical bitstreams for blinky, the PicoRV32 SoC, the MMCM design, the
+Ibex SoC, the 240-RAM fill and the 192-DSP fill (ZedBoard), and for a counter
+and PicoRV32 on all four boards (`tools/x7v/tests/boards.sh`); x7v verify
+passes all of them decoding with 0c3504f. Neither database ships
+`required_features.fasm` for xc7z020clg484-1; the loader takes the same die's
+xc7z020clg400-1 file (G79). openXC7's spartan7 has none for any part.
+
 ## Layout under `~/workspace/xilinx-dbsrc/`
 
 - `artix7/xc7a50t/tilegrid.json` (6.6 MB, 18055 tiles) and `tileconn.json`
