@@ -63,7 +63,7 @@ use helion_ultrascale::bitgen::{
 };
 use helion_ultrascale::device_file::DeviceFile;
 use helion_ultrascale::segbits::{FileSegbitsDb, SegbitsDb};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -726,6 +726,7 @@ mod tests {
     use super::*;
     use helion_ultrascale::bitgen::{emit_frames, far_encode};
     use std::collections::BTreeSet;
+    use std::collections::HashMap;
 
     fn data_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data")
