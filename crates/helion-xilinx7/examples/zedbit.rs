@@ -357,32 +357,6 @@ fn async_groups(xdc: &str, packed: &helion_xilinx7::pack::Packed7) -> Result<Vec
     Ok(out)
 }
 
-/// Period (ps) of each PS7 fabric clock on a net (`FCLKCLK<n>`), from the
-/// XDC's `create_clock -period <ns> ... [get_pins <cell>/FCLKCLK[<n>]]`: the
-/// PS programs the rate (ps7_init), so only the XDC can say what it is.
-fn fclk_periods(xdc: &str, packed: &helion_xilinx7::pack::Packed7) -> Result<HashMap<String, u32>, String> {
-    let mut out = HashMap::new();
-    for p in &packed.ps7s {
-        for (pin, net, _) in p.pins.iter().filter(|(pin, _, is_out)| *is_out && pin.starts_with("FCLKCLK")) {
-            let bit = &pin["FCLKCLK".len()..];
-            let line = xdc
-                .lines()
-                .map(|l| l.split('#').next().unwrap_or(""))
-                .find(|l| l.trim_start().starts_with("create_clock") && l.contains("get_pins") && l.contains(&format!("FCLKCLK[{bit}]")))
-                .ok_or_else(|| format!("XDC: PS7 {}/FCLKCLK[{bit}] drives net `{net}` but has no create_clock", p.name))?;
-            let toks: Vec<&str> = line.split_whitespace().collect();
-            let ns = toks
-                .iter()
-                .position(|t| *t == "-period")
-                .and_then(|i| toks.get(i + 1))
-                .and_then(|v| v.parse::<f64>().ok())
-                .ok_or_else(|| format!("XDC: create_clock for {}/FCLKCLK[{bit}] has no -period", p.name))?;
-            out.insert(net.clone(), (ns * 1000.0).round() as u32);
-        }
-    }
-    Ok(out)
-}
-
 /// Clock period (ps) from the first `create_clock -period <ns>`; 10 ns default.
 fn xdc_period_ps(text: &str) -> u32 {
     for line in text.lines() {
@@ -565,7 +539,7 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
     }
     eprintln!("zedbit: routed in {:.1}s", (t_route - t_place).as_secs_f64());
     let mut period = xdc_period_ps(&xdc);
-    let mut fclk = fclk_periods(&xdc, &packed)?;
+    let mut fclk = helion_xilinx7::ps7::fclk_periods(&xdc, &packed.ps7s)?;
     // Flops on both clock edges: a path from one edge to the other has half
     // a period. The analysis has one period for every path, so it is run
     // at half the clock period, which is safe for all of them.
