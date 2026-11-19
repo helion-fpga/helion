@@ -106,7 +106,59 @@ DESIGNS = {
         ],
         "ffs": ["AFF", "BFF", "CFF", "DFF"],
     },
+    # uram: one URAM288 on URAM_X0Y0, six UG974 attributes at their
+    # defaults. No FFs, no PIPs, no IO: the minimal URAM exercise.
+    # The "luts"/"ffs" shape is shared with the other designs so
+    # design_ff_locations works (ffs is empty); the attribute lines
+    # live in build_uram_fasm, not in the boolean-function table (a
+    # memory has no boolean function). There is deliberately NO
+    # content line: URAM288 has no INIT attributes in UG974, so no
+    # content value can be expressed in FASM until job 5 lands the
+    # encoding. Writing an INIT line would invent an attribute.
+    "uram": {
+        "luts": [],
+        "ffs": [],
+    },
 }
+
+# URAM golden placement and attributes. URAM_X0Y0 is PROVISIONAL:
+# no xcku3p tilegrid exists in any public DB, so no URAM tile
+# coordinate is verified; the device file gives only tile types
+# (URAM_URAM_FT / URAM_URAM_DELAY_FT, site type URAM288). The tile
+# spelling follows the harness's existing URAM tile convention
+# (test_dsp_uram_have_no_encoding uses URAM_X0Y0). Job 5 resolves
+# the real site with get_sites at run time and does not depend on
+# this spelling. The six attribute names and defaults are UG974
+# 2023.1, verified against the URAM288 page 2026-11-19; see
+# data/URAM288_SEARCH.md.
+URAM_TILE = "URAM_X0Y0"
+URAM_ATTRS = [
+    ("CASCADE_ORDER_A", '"NONE"'),
+    ("CASCADE_ORDER_B", '"NONE"'),
+    ("OREG_A", '"FALSE"'),
+    ("OREG_B", '"FALSE"'),
+    ("EN_ECC_RD_A", '"FALSE"'),
+    ("EN_ECC_RD_B", '"FALSE"'),
+]
+
+URAM_HEADER = """# golden FASM: uram on {part}
+# seed: {seed}
+# source: one URAM288 (288K-bit UltraRAM, 4096 words x 72 bits) on
+# URAM_X0Y0, six UG974 attributes at defaults.
+# placement: URAM_X0Y0 is PROVISIONAL (no xcku3p tilegrid in any
+# public DB; the device file names only tile types URAM_URAM_FT /
+# URAM_URAM_DELAY_FT with site type URAM288). One URAM288 only: no
+# FF, no route, no IO. The design is the minimal URAM exercise, not
+# a full system; routing of address/data/clock is the router
+# worker's scope, and the content sweep is job 5's scope.
+# content: NO content line is written. URAM288 has no INIT
+# attributes in UG974 (contrast RAMB36E2 INIT_00..INIT_7F), so the
+# 294912 content bits cannot be expressed in FASM until job 5 lands
+# the encoding. The six lines below are the whole golden; every one
+# resolves to blocked until then.
+# PROVISIONAL: the xcvu3p golden reuses the xcku3p placement verbatim
+# and is provisional until the xcvu3p device file lands.
+"""
 
 PIPS = {"blinky": BLINKY_PIPS, "counter": COUNTER_PIPS}
 
@@ -143,7 +195,24 @@ HEADER = """# golden FASM: {design} on {part}
 """
 
 
+def build_uram_fasm(design, part):
+    """FASM for the uram golden: one URAM288 on URAM_X0Y0.
+
+    The line spellings must match the Rust `is_uram288_entry`
+    detector's expectations (tile or feature names URAM); the
+    attribute names and defaults are UG974 2023.1, verified against
+    the URAM288 page. There is no content line by design: URAM288
+    has no INIT attribute to write.
+    """
+    lines = [URAM_HEADER.format(design=design, part=part, seed=SEED).rstrip()]
+    for name, value in URAM_ATTRS:
+        lines.append('%s.URAM288.%s = %s' % (URAM_TILE, name, value))
+    return "\n".join(lines) + "\n"
+
+
 def build_fasm(design, part):
+    if design == "uram":
+        return build_uram_fasm(design, part)
     spec = DESIGNS[design]
     lines = [HEADER.format(design=design, part=part, seed=SEED).rstrip()]
     for bel, fn in spec["luts"]:
@@ -162,6 +231,27 @@ def build_fasm(design, part):
 
 
 def placement_record(design, part):
+    if design == "uram":
+        return {
+            "design": design,
+            "part": part,
+            "seed": SEED,
+            "sites": [{"tile": URAM_TILE, "bel": "URAM288", "role": "uram"}],
+            "provisional_tiles": [URAM_TILE],
+            "notes": (
+                "One URAM288 on URAM_X0Y0 (provisional tile: no xcku3p "
+                "tilegrid in any public DB; tile types URAM_URAM_FT / "
+                "URAM_URAM_DELAY_FT per the BitFiltrator device file). "
+                "No INT/HPIO tiles. xcvu3p placement reuses the xcku3p "
+                "coordinates verbatim and is provisional until the "
+                "xcvu3p device file lands."
+                if part == "xcvu3p" else
+                "One URAM288 on URAM_X0Y0 (provisional tile: no xcku3p "
+                "tilegrid in any public DB; tile types URAM_URAM_FT / "
+                "URAM_URAM_DELAY_FT per the BitFiltrator device file). "
+                "No INT/HPIO tiles."
+            ),
+        }
     spec = DESIGNS[design]
     sites = []
     for bel, fn in spec["luts"]:
@@ -220,7 +310,7 @@ def main():
     ref = Tier1Reference()
     verify_features_exist(ref)
     os.makedirs(GOLDEN_DIR, exist_ok=True)
-    for design in ("blinky", "counter"):
+    for design in ("blinky", "counter", "uram"):
         for part in ("xcku3p", "xcvu3p"):
             fasm = build_fasm(design, part)
             record = placement_record(design, part)
