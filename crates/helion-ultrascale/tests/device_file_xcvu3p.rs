@@ -48,6 +48,48 @@ fn xcvu3p_is_provisional_with_header_counts() {
 }
 
 #[test]
+fn xcvu3p_license_note_states_webpack_is_unconfirmed() {
+    // GAP-F7 fix 2026-11-19: the license note used to claim
+    // "xcvu3p appears in parts_webpack.json". That is false:
+    // BitFiltrator resources/parts_webpack.json lists NO xcvu3p
+    // parts (Virtex UltraScale+ xcvu3p: []), while the license
+    // value comes from the Vivado LICENSE part property
+    // (create_device_summary.py), which is unknown for xcvu3p
+    // until the Vivado probe runs. The value stays "Webpack"
+    // (template copy) but the note must not present it as sourced.
+    let (device, _) = load();
+    let license = device
+        .provisional_notes()
+        .iter()
+        .find(|n| n.field == "license")
+        .expect("license provisional note must exist");
+    assert_eq!(license.value, "Webpack");
+    assert!(
+        !license.source.contains("appears in parts_webpack"),
+        "license note must not claim xcvu3p is in parts_webpack.json: {}",
+        license.source
+    );
+    assert!(
+        license.source.contains("lists NO xcvu3p parts"),
+        "license note must record the empty parts_webpack list: {}",
+        license.source
+    );
+    // The num_slices note must not frame 49,250 as a live
+    // discrepancy: 49,250 (394,000 / 8) is gone from the model.
+    let slices = device
+        .provisional_notes()
+        .iter()
+        .find(|n| n.field == "num_slices")
+        .expect("num_slices provisional note must exist");
+    assert_eq!(slices.value, "49260");
+    assert!(
+        !slices.source.contains("discrepancy"),
+        "num_slices note must not present 49,250 as a live discrepancy: {}",
+        slices.source
+    );
+}
+
+#[test]
 fn xcvu3p_structure_validates_and_frame_total_matches_generator() {
     let (device, _) = load();
     let checked = device
