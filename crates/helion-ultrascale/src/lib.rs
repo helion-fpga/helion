@@ -15,6 +15,7 @@ pub mod bel;
 pub mod bitgen;
 pub mod bitgen_device;
 pub mod bitloc;
+pub mod clk;
 pub mod device;
 pub mod device_file;
 pub mod fabric;
@@ -38,6 +39,14 @@ pub use bitloc::{
     BRAM_MEM_BITS, BRAM_PARITY_BITS, BitLoc, BitLocError, Block, BramHalf, BramHalfContent,
     BramTileUse, ClbTileType, FRAME_BITS, LUT_INIT_BITS, LutMode, NUM_BRAM18_PER_COLUMN,
     NUM_CLB_PER_COLUMN, PlacedBit,
+};
+pub use clk::{
+    BUFGCE_INVERSION_PIPS, BufceLeafConfig, BufgceHdioConfig, ClkError, ClkResolution,
+    MissingClkFeature, ResolvedClkFeature, bufce_row_site_config, bufgce_div_site_config,
+    bufgce_hdio_ce_blocked, bufgce_site_config, bufgctrl_site_config, clk_features_to_fasm,
+    cmt_hdistr_used_feature, cmt_hroute_used_feature, mmcm_site_config, pll_site_config,
+    require_no_clock_manager, resolve_bufce_leaf, resolve_bufgce_hdio, resolve_clk_feature,
+    resolve_clk_features, resolve_cmt_feature,
 };
 pub use device::{UltraScaleDevice, Xcku3pSpec, Xcvu3pSpec};
 pub use device_file::{
