@@ -37,8 +37,36 @@ the 4 header lines.
 | segbits_clel_r.db | 768 | f6564ea5b04f25dd77c22d41d45348af407243d84894689ecb4204df2ae52fa1 |
 | segbits_clem.db | 829 | c1d4c6c156df25d6dad6f2b62610e5733933222d7d046e935db90ed57bea2bb2 |
 | segbits_clem_r.db | 829 | b8b40c13498ffe89c9c79d27cb64200fa3e4db1e789ded8b0709dd4400468bc7 |
+| segbits_rclk_ams_cfgio.db | 144 | 12f72f844e6f1df38f993a82879ce826ca15385709268c78de502c8391fa98f1 |
+| segbits_rclk_bram_intf_l.db | 160 | 630a3b350c7f194e608ca1c583a4e5bc5904615ab33a7e0434ebd6f1dddcdbc9 |
+| segbits_rclk_bram_intf_td_l.db | 160 | 6d10f8e041f257af0a6434c9ac9dae8dda604ea2436b01a5c45f24c0fbfccd39 |
+| segbits_rclk_bram_intf_td_r.db | 160 | 8aeddf7e1db8339759645d383239bdf97598e0607ecc84bcf872c62724c51de0 |
+| segbits_rclk_clel_l_l.db | 40 | 1d2e97cd2af627b08647b815fe7639accf638718016b14bd837490e23cb4a704 |
+| segbits_rclk_clem_l.db | 40 | 0bd0c488d4dc8445ffb4687288d470f8671cb0fff7234eb3a84450e31278e109 |
+| segbits_rclk_clem_r.db | 40 | 1ac18a6e6c56ee92f9220229680cdafd8a10f41b13265eca1a53aa5d76fcd7ee |
+| segbits_rclk_dsp_intf_clkbuf_l.db | 288 | d57d1c375341d3271af12a37c72dbb5767a4e5ce653434b7956b30f3381b35c9 |
+| segbits_rclk_dsp_intf_l.db | 80 | 55d609eeeaa64a2c7fbb3c9263942813e06b27da8dd499533384dc03edaae3f3 |
+| segbits_rclk_dsp_intf_r.db | 80 | 1cba6fa3c1138ed9fc1fc3da5dbe9b7f6a58e8c9634e6e513a670c14570c7f23 |
+| segbits_rclk_hdio.db | 512 | 8751a63675994a435963ff76dbd1ced4c599e1b3fdcfa4ea1797679c8143bd42 |
+| segbits_rclk_int_l.db | 1576 | 3399543f2cbe0ceee71f70e07e561f193d3da312b6a00e6d99f305a546a38216 |
+| segbits_rclk_int_r.db | 1576 | 2d003f44af8b29179dcdcbe9c5e9e393f8a9fb82ae70c81e7fe9ea7521ace3b1 |
+| segbits_rclk_intf_left_term_alto.db | 456 | b290ed04243e9d2ce32146192416467c65623251ed6bd60b149855e35923b7a1 |
+| segbits_rclk_xiphy_outer_right.db | 48 | ee9156d2939e5e1a0b21defa58b8e53520738d19de26f0a82489a4a0c4b5432d |
 
-Total vendored segbits features: 10276.
+Total vendored segbits features: 15636.
+
+The fifteen `segbits_rclk_*.db` files were vendored 2026-11-19 by the
+clocking worker (branch `fm/ultra-bitgen-clk`), same source repo,
+commit, and license as the nine above. They are the row-clock (RCLK)
+tile encodings: the clock-distribution PIPs and USED bits for every
+RCLK tile type, plus the only site-config encodings clocking has in
+any public source, BUFCE_LEAF (in `segbits_rclk_int_l.db` and
+`segbits_rclk_int_r.db`, 416 config lines each) and BUFGCE_HDIO IINV
+(in `segbits_rclk_hdio.db`, 8 lines). `segbits_rclk_intf_left_term_alto.db`
+is Zynq-PS-only (BUFG_PS PIPs, no PS on xcku3p/xcvu3p); it is vendored
+for inventory completeness and must not be used for those parts. See
+`CLK_AUDIT.md` for the per-file inventory and what is still missing
+(BUFGCE/BUFGCTRL/MMCM/PLL site config: zero lines in any public source).
 
 The four CLB DBs (CLEL_L, CLEL_R, CLEM, CLEM_R) were vendored 2026-11-07
 by the emitter worker (branch `fm/ultra-bitgen-emitter`), same source
@@ -67,6 +95,21 @@ same verification rule.
 | segbits_clel_r.origin_info.db | 768 | 1571cef21927800cddc70100ab08e61209145736b619d7692001a3304d7be754 |
 | segbits_clem.origin_info.db | 829 | 27a0ccaa65895a667104e8ecb0efab7d91987a14a9af78880766276eeba4a3dc |
 | segbits_clem_r.origin_info.db | 829 | 41e75c70b73fa609aea24bed5e8778adb7aacf9a79a08cefcbe3583d058e054f |
+| segbits_rclk_ams_cfgio.origin_info.db | 144 | 923ffcd80d71fa3e1b2b568034af0a621c72b41e66a33d5e00c5fb865d75e721 |
+| segbits_rclk_bram_intf_l.origin_info.db | 160 | 5983f2bad5e544152003b352669311cca3f2160dfa286c19528a996b6b8f3226 |
+| segbits_rclk_bram_intf_td_l.origin_info.db | 160 | 95ff6003db007cc2e560c9e8dce60188277ead53e6029ecd0a8f123172d81b54 |
+| segbits_rclk_bram_intf_td_r.origin_info.db | 160 | aeb988995aaf5df2627c3d46d0dddefe6342d12b1cb510f9d1805b1a8fe4de06 |
+| segbits_rclk_clel_l_l.origin_info.db | 40 | 1c2cc6402d010fefcacf07e86331e43473c8b5b21de13da5f57e97d21cb3e7df |
+| segbits_rclk_clem_l.origin_info.db | 40 | eb742bd0489bda91f22ce1870b3a83fa5df741c3cc2d0859dc45cd1188eccd25 |
+| segbits_rclk_clem_r.origin_info.db | 40 | f3390bd2b0ee07eb56e2a2b120eb52b8610a228cb62305648dee68d39e5d7822 |
+| segbits_rclk_dsp_intf_clkbuf_l.origin_info.db | 288 | 28fa2dc1ffd80355cfb920339897bbaef4263879d21498ade3abbfb909dcc23c |
+| segbits_rclk_dsp_intf_l.origin_info.db | 80 | ece0593f83b7180587c95bd0e6e821e399723e9234dc6f751ea098cb7d01b7f9 |
+| segbits_rclk_dsp_intf_r.origin_info.db | 80 | 92771979efeb94cf602e975c53c5997d75014c118a81e14f4d72ed00920de63e |
+| segbits_rclk_hdio.origin_info.db | 512 | a890ee3da8537a44828c63072c76ac16c9f52039a096e21d480315902ad789e4 |
+| segbits_rclk_int_l.origin_info.db | 1576 | 9b8247bfb3a8ea7cacc9e0c258ae771383d54d5a320a07730bc1b8f12aec2101 |
+| segbits_rclk_int_r.origin_info.db | 1576 | c6e52c0cce8272c776414a41e470465da6577466da6f6d32615505967c918da7 |
+| segbits_rclk_intf_left_term_alto.origin_info.db | 456 | 394972d5a3dea429c2b654912d9f27d874f070e2bc63f7bdfbd7acb227d7a3dd |
+| segbits_rclk_xiphy_outer_right.origin_info.db | 48 | 5e17e3b76d1c9fd6a25a8a062051c396fe7867a46d697ab919479dcc145188b4 |
 
 ### Tile-type and site-type JSONs
 
@@ -90,6 +133,19 @@ values below are of the vendored file itself (identical to upstream).
 | site_type_HDIOLOGIC_S.json | zynqusp/site_types/site_type_HDIOLOGIC_S.json | ba6a1807335a7fc19c62bdd18eb76006ee0e2511c5a7694c27750d71a7d684e4 |
 | site_type_MMCM.json | zynqusp/site_types/site_type_MMCM.json | bf460d10a0e5f70762440777d5d9ac34afc10013fb138d26e9bf7b577cfabea4 |
 | site_type_PLL.json | zynqusp/site_types/site_type_PLL.json | 80daafa5813e1d93f76256907b2f34770503497dadbf33f0383a88bf49dc9231 |
+| site_type_BUFCE_LEAF.json | zynqusp/site_types/site_type_BUFCE_LEAF.json | 77f6f1e624659d460dca62d98a6b95f25aac7fccdc7158255618e15a316ea280 |
+| site_type_BUFCE_ROW.json | zynqusp/site_types/site_type_BUFCE_ROW.json | 7bc49f9cd70f16a904e1dc866593e660e86e660f7e34b15cbb55759f8517adcb |
+| site_type_BUFCE_ROW_FSR.json | zynqusp/site_types/site_type_BUFCE_ROW_FSR.json | d2083be72b26291ff750cc8935cd84ef215da140254d49fdc4e1c01f9e86a2f9 |
+| site_type_BUFGCE_DIV.json | zynqusp/site_types/site_type_BUFGCE_DIV.json | b856950327b69fe1147c8b0fef34c6f6cf25a264cffac7372872830ad75946e8 |
+| site_type_BUFGCE_HDIO.json | zynqusp/site_types/site_type_BUFGCE_HDIO.json | fded3a6a71b5fad20137c9d1b422067e47a24f44dabd5ab8dfd8b64c9321eaf5 |
+
+The five clock site-type JSONs were vendored 2026-11-19 by the
+clocking worker (branch `fm/ultra-bitgen-clk`), same source repo,
+commit, and license as the fourteen above. They are the pin/pip
+inventories for the clock sites the RCLK encodings configure
+(BUFCE_LEAF, BUFCE_ROW, BUFCE_ROW_FSR, BUFGCE_HDIO) and for
+BUFGCE_DIV, whose site inventory exists but whose config-bit encoding
+does not (see `CLK_AUDIT.md`).
 
 Why these JSONs: `tile_type_INT.json` is the enumeration source for the
 INT PIP completeness audit (`INT_PIP_AUDIT.md`). The site-type JSONs are
@@ -147,5 +203,17 @@ asserts the table counts and warns if the source hash changes.
   (site_type_DSP48E2.json documents pins only). Fuzzing plan is in the
   day-1 report; DSP48E2 lookups fail loud until it lands.
 - URAM288: MISSING in both public sources. Fail loud until it lands.
+- BUFGCE / BUFGCTRL / BUFGCE_DIV / MMCM / PLL site config-bit encoding:
+  MISSING in every public source checked 2026-11-19. Zero lines in
+  `segbits_cmt_right.db` (104 lines, HROUTE/HDISTR only), zero lines in
+  all fifteen vendored `segbits_rclk_*.db` files (5,360 lines), zero
+  entries in BitFiltrator `ULTRASCALE_PLUS.json` (top-level keys BRAM,
+  CLEL_L, CLEL_R, CLEM, CLEM_R only). The site-type JSONs document pins
+  and inversion pips only, no bits. Clocking designs using these sites
+  fail loud (`ClkError::MissingEncoding` in `src/clk.rs`) until the
+  Vivado fuzzing job in `CLK_FUZZ_JOB.md` lands. The encodable clocking
+  subset (CMT HROUTE/HDISTR, RCLK PIPs and USED bits, BUFCE_LEAF config,
+  BUFGCE_HDIO IINV) is vendored above and implemented in `src/clk.rs`;
+  see `CLK_AUDIT.md` for the exact inventory.
 - xcvu3p device file: MISSING (BitFiltrator ships xcku3p only).
   Device-file worker owns it; this crate vendors no device JSON.
