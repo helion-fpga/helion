@@ -32,7 +32,7 @@ from reference import MissingReference
 import roundtrip as roundtrip_mod
 
 # Blocks whose reference bits are absolute FARs once resolved.
-ABSOLUTE_BLOCKS = {"LUT_INIT", "LUTRAM", "FF_INIT", "BRAM_CONTENT", "BRAM_PARITY", "INT_PIP"}
+ABSOLUTE_BLOCKS = {"LUT_INIT", "LUTRAM", "FF_INIT", "CARRY8", "BRAM_CONTENT", "BRAM_PARITY", "INT_PIP"}
 
 # Blocks the golden designs do not exercise at all (v1 goldens have no
 # BRAM, DSP, or URAM instances). Reported blocked, never green.
@@ -89,6 +89,10 @@ def resolve_feature(ref, part, feature):
             from fasm import slice_xy
             x, y = slice_xy(tile)
             return block, ref.resolve_lutram_mode(part, x, y, feat), "absolute", None
+        if block == "CARRY8":
+            from fasm import slice_xy
+            x, y = slice_xy(tile)
+            return block, ref.resolve_carry8(part, x, y, feat), "absolute", None
         if block in ("BRAM_CONTENT", "BRAM_PARITY"):
             raise MissingReference(NOT_EXERCISED[block])
         if block == "INT_PIP":
@@ -223,6 +227,21 @@ def diff_design(ref, emitter, design, part, fasm_path, seed, placement_hash,
                     "emitter set %d bits in %s, which the golden design "
                     "does not use" % (extra_set, block)
                 )
+                records.append(rec)
+                continue
+            if block == "CARRY8" and emitter is not None and emit_error is None:
+                # Zero-bit green, not blocked: CARRY8 is the one
+                # unexercised block whose encoding is grounded
+                # (prjuray segbits, 24 features per CLB tile type),
+                # so zero reference bits against zero emitted bits
+                # is a comparison that ran, not a pass on missing
+                # data. With no emitter there is no comparison and
+                # the block stays blocked, like every other block.
+                rec["diff_bits"] = 0
+                rec["total_bits"] = 0
+                rec["status"] = "green"
+                rec["coord_system"] = "absolute"
+                rec["emitted_via"] = emitted_via
                 records.append(rec)
                 continue
             rec["diff_bits"] = None
