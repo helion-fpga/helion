@@ -699,6 +699,13 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     let mut graph_clocks = false;
     let mut net_names: Vec<String> = net_eps.keys().cloned().collect();
     net_names.sort();
+    // Most critical first (ties by name): a critical net routed into an
+    // empty device takes the direct wires; routed late, it detoured around
+    // everything else (G76: a 107-tile hop at 9.7 to 10.9 ns).
+    NET_CRIT.with(|m| {
+        let m = m.borrow();
+        net_names.sort_by_key(|n| std::cmp::Reverse(m.get(n).copied().unwrap_or(0)));
+    });
     // Negotiated congestion: a net with no free path takes the cheapest
     // path through other nets' wires; those nets are ripped up and queued
     // again. History cost on contested wires steers later searches away.
