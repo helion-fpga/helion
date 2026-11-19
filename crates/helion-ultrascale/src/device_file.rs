@@ -477,6 +477,11 @@ impl DeviceFile {
         Ok(self.row_major(slr, row)?.bram_content_col_majors.len())
     }
 
+    /// Number of DSP columns in a row.
+    pub fn num_dsp_columns(&self, slr: &str, row: u32) -> Result<usize, DeviceFileError> {
+        Ok(self.row_major(slr, row)?.dsp_col_majors.len())
+    }
+
     /// BRAM register column major for logical BRAM column x in a row.
     pub fn bram_reg_col_major(&self, slr: &str, row: u32, x: u32) -> Result<u32, DeviceFileError> {
         self.row_major(slr, row)?

@@ -4,8 +4,12 @@
 //! - BEL capacity: at most 8 LUTs, 16 FFs, 1 CARRY8 per slice.
 //! - SLICEM legality: distributed RAM and SRL LUTs only on Memory-kind slices.
 //! - Control sets: CLK/SR/CE sharing rules per slice.
-//! - CARRY8 chains: vertically contiguous, X constant, Y ascending.
+//! - CARRY8 chains: vertically contiguous, X constant, Y ascending,
+//!   in carry-link order.
 //! - No site used twice.
+//! - Every packed slice placed, every placed index valid, every placed
+//!   site known to the grid. Anything else fails loud here, never
+//!   passes silently.
 //!
 //! This checker runs as a test on every placed design. A placement that
 //! fails legality is a bug, not a QoR issue.
@@ -45,6 +49,12 @@ pub enum LegalityViolation {
         expected: SliceKind,
         actual: SliceKind,
     },
+    /// Placed entry names a packed index that does not exist.
+    UnknownPackedIndex { index: usize },
+    /// Placed entry names a site the grid does not know.
+    UnknownSite { site: String },
+    /// Packed slice was never placed.
+    UnplacedSlice { slice: String },
 }
 
 impl std::fmt::Display for LegalityViolation {
@@ -81,6 +91,15 @@ impl std::fmt::Display for LegalityViolation {
                     "{slice}: expected {expected:?} slice, placed on {actual:?}"
                 )
             }
+            Self::UnknownPackedIndex { index } => {
+                write!(f, "placed entry names unknown packed index {index}")
+            }
+            Self::UnknownSite { site } => {
+                write!(f, "placed on unknown site {site}")
+            }
+            Self::UnplacedSlice { slice } => {
+                write!(f, "packed slice {slice} was never placed")
+            }
         }
     }
 }
@@ -113,9 +132,32 @@ pub fn check_legality(
         }
     }
 
+    // Check for multiple CARRY8 on one site: each placed slice holds at
+    // most one CARRY8 by construction, so two at one site means two
+    // slices were placed on the same site, each carrying one.
+    let mut carry_per_site: HashMap<&str, usize> = HashMap::new();
+    for p in placed {
+        if let Some(slice) = packed.get(p.packed_idx) {
+            if slice.carry8.is_some() {
+                let count = carry_per_site.entry(p.site.as_str()).or_default();
+                *count += 1;
+                if *count > 1 {
+                    violations.push(LegalityViolation::MultipleCarry8 {
+                        slice: p.site.clone(),
+                    });
+                }
+            }
+        }
+    }
+
     // Check each placed slice.
     for p in placed {
+        // D2: an out-of-range packed index used to be skipped silently.
+        // It is a violation now.
         let Some(slice) = packed.get(p.packed_idx) else {
+            violations.push(LegalityViolation::UnknownPackedIndex {
+                index: p.packed_idx,
+            });
             continue;
         };
 
@@ -135,25 +177,40 @@ pub fn check_legality(
             });
         }
 
-        // SLICEM legality.
-        let actual_kind = site_kind.get(&p.site).copied().unwrap_or(SliceKind::Logic);
-        for (bel, lut_name) in &slice.luts {
-            let is_mem = slice.lut_is_memory.get(bel).copied().unwrap_or(false);
-            if is_mem && actual_kind != SliceKind::Memory {
-                violations.push(LegalityViolation::MemoryLutOnSlicel {
+        // D3: a site unknown to the grid used to default to Logic.
+        // SLICEM checks against an unknown site are meaningless, so
+        // report it and skip only the kind-dependent checks for this
+        // slice; capacity and control-set checks above still ran.
+        let actual_kind = match site_kind.get(&p.site) {
+            Some(kind) => Some(*kind),
+            None => {
+                violations.push(LegalityViolation::UnknownSite {
+                    site: p.site.clone(),
+                });
+                None
+            }
+        };
+
+        if let Some(actual_kind) = actual_kind {
+            // SLICEM legality.
+            for (bel, lut_name) in &slice.luts {
+                let is_mem = slice.lut_is_memory.get(bel).copied().unwrap_or(false);
+                if is_mem && actual_kind != SliceKind::Memory {
+                    violations.push(LegalityViolation::MemoryLutOnSlicel {
+                        slice: p.site.clone(),
+                        lut: lut_name.clone(),
+                    });
+                }
+            }
+
+            // If the packed slice requires Memory kind, verify placement.
+            if slice.kind == SliceKind::Memory && actual_kind != SliceKind::Memory {
+                violations.push(LegalityViolation::WrongSliceKind {
                     slice: p.site.clone(),
-                    lut: lut_name.clone(),
+                    expected: SliceKind::Memory,
+                    actual: actual_kind,
                 });
             }
-        }
-
-        // If the packed slice requires Memory kind, verify placement.
-        if slice.kind == SliceKind::Memory && actual_kind != SliceKind::Memory {
-            violations.push(LegalityViolation::WrongSliceKind {
-                slice: p.site.clone(),
-                expected: SliceKind::Memory,
-                actual: actual_kind,
-            });
         }
 
         // Control-set checks.
@@ -201,6 +258,17 @@ pub fn check_legality(
         }
     }
 
+    // D5: every packed slice must be placed. A slice dropped by the
+    // placer used to pass silently.
+    let placed_idx: HashSet<usize> = placed.iter().map(|p| p.packed_idx).collect();
+    for (idx, slice) in packed.iter().enumerate() {
+        if !placed_idx.contains(&idx) {
+            violations.push(LegalityViolation::UnplacedSlice {
+                slice: slice.name.clone(),
+            });
+        }
+    }
+
     // Check CARRY8 chain contiguity.
     // Group placed slices by chain via packed carry_prev/carry_next.
     let mut chain_groups: HashMap<String, Vec<&PlacedUltraSlice>> = HashMap::new();
@@ -237,6 +305,40 @@ pub fn check_legality(
         }
         // Sort by Y coordinate.
         group.sort_by_key(|p| p.y);
+        // D6: the Y-sorted order must match the carry-link order.
+        // Sorting alone would accept a chain placed in reverse Y order
+        // (Y still ascends by 1, X stays constant) while the chain
+        // links run the other way.
+        let expected: Vec<usize> = match packed
+            .iter()
+            .position(|s| s.carry8.as_deref() == Some(chain_name.as_str()))
+        {
+            Some(head_idx) => {
+                let mut order = vec![head_idx];
+                let mut cur = head_idx;
+                while let Some(next_name) = &packed[cur].carry_next {
+                    match packed
+                        .iter()
+                        .position(|s| s.carry8.as_ref() == Some(next_name))
+                    {
+                        Some(nidx) if !order.contains(&nidx) => {
+                            order.push(nidx);
+                            cur = nidx;
+                        }
+                        _ => break,
+                    }
+                }
+                order
+            }
+            None => Vec::new(),
+        };
+        let sorted_idx: Vec<usize> = group.iter().map(|p| p.packed_idx).collect();
+        if expected.len() != group.len() || expected != sorted_idx {
+            violations.push(LegalityViolation::CarryChainBroken {
+                chain: vec![chain_name.clone()],
+                detail: "placed order does not follow carry chain links".to_string(),
+            });
+        }
         for w in 1..group.len() {
             if group[w].x != group[w - 1].x {
                 violations.push(LegalityViolation::CarryChainBroken {
@@ -369,6 +471,137 @@ mod tests {
             violations
                 .iter()
                 .any(|v| matches!(v, LegalityViolation::ControlSet { .. }))
+        );
+    }
+
+    #[test]
+    fn unknown_packed_index_fails_loud() {
+        // D2: a placed entry naming a packed index that does not exist
+        // used to be skipped silently.
+        let grid = test_grid();
+        let limits = ControlSetLimits::default();
+        let s0 = PackedUltraSlice::new("s0".to_string(), SliceKind::Logic);
+        let placed = vec![crate::place::PlacedUltraSlice {
+            packed_idx: 7,
+            site: "SLICE_X0Y1".to_string(),
+            tile: "CLB_X0Y1".to_string(),
+            x: 0,
+            y: 1,
+        }];
+        let violations = check_legality(&vec![s0], &placed, &grid, &limits);
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, LegalityViolation::UnknownPackedIndex { index: 7 }))
+        );
+    }
+
+    #[test]
+    fn unknown_site_fails_loud() {
+        // D3: a placed site the grid does not know used to default to
+        // Logic and could pass SLICEM checks.
+        let grid = test_grid();
+        let limits = ControlSetLimits::default();
+        let s0 = PackedUltraSlice::new("s0".to_string(), SliceKind::Logic);
+        let placed = vec![crate::place::PlacedUltraSlice {
+            packed_idx: 0,
+            site: "SLICE_X99Y99".to_string(),
+            tile: "CLB_X99Y99".to_string(),
+            x: 99,
+            y: 99,
+        }];
+        let violations = check_legality(&vec![s0], &placed, &grid, &limits);
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, LegalityViolation::UnknownSite { .. }))
+        );
+    }
+
+    #[test]
+    fn multiple_carry8_at_one_site_fails_loud() {
+        // D4: the MultipleCarry8 variant was never produced.
+        let grid = test_grid();
+        let limits = ControlSetLimits::default();
+        let mut s0 = PackedUltraSlice::new("s0".to_string(), SliceKind::Logic);
+        s0.carry8 = Some("carry0".to_string());
+        let mut s1 = PackedUltraSlice::new("s1".to_string(), SliceKind::Logic);
+        s1.carry8 = Some("carry1".to_string());
+        let placed = vec![
+            crate::place::PlacedUltraSlice {
+                packed_idx: 0,
+                site: "SLICE_X0Y1".to_string(),
+                tile: "CLB_X0Y1".to_string(),
+                x: 0,
+                y: 1,
+            },
+            crate::place::PlacedUltraSlice {
+                packed_idx: 1,
+                site: "SLICE_X0Y1".to_string(),
+                tile: "CLB_X0Y1".to_string(),
+                x: 0,
+                y: 1,
+            },
+        ];
+        let violations = check_legality(&vec![s0, s1], &placed, &grid, &limits);
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, LegalityViolation::MultipleCarry8 { .. }))
+        );
+    }
+
+    #[test]
+    fn unplaced_slice_fails_loud() {
+        // D5: a packed slice dropped by the placer used to pass.
+        let grid = test_grid();
+        let limits = ControlSetLimits::default();
+        let s0 = PackedUltraSlice::new("s0".to_string(), SliceKind::Logic);
+        let s1 = PackedUltraSlice::new("s1".to_string(), SliceKind::Logic);
+        let placed = place_ultra(&vec![s0.clone()], &grid, &UltraPlaceOpts::default()).unwrap();
+        let violations = check_legality(&vec![s0, s1], &placed.slices, &grid, &limits);
+        assert!(violations.iter().any(|v| matches!(
+            v,
+            LegalityViolation::UnplacedSlice { slice } if slice == "s1"
+        )));
+    }
+
+    #[test]
+    fn reversed_chain_order_fails_loud() {
+        // D6: Y-sorted contiguity alone accepts a chain placed in
+        // reverse link order. Place carry1 below carry0 (same X, Y
+        // ascending by 1) and the checker must still flag it.
+        let grid = test_grid();
+        let limits = ControlSetLimits::default();
+        let mut s0 = PackedUltraSlice::new("s0".to_string(), SliceKind::Logic);
+        s0.carry8 = Some("carry0".to_string());
+        s0.carry_next = Some("carry1".to_string());
+        let mut s1 = PackedUltraSlice::new("s1".to_string(), SliceKind::Logic);
+        s1.carry8 = Some("carry1".to_string());
+        s1.carry_prev = Some("carry0".to_string());
+        // carry1 at Y1, carry0 at Y2: Y-sorted order is [s1, s0], but
+        // the chain links run [s0, s1].
+        let placed = vec![
+            crate::place::PlacedUltraSlice {
+                packed_idx: 1,
+                site: "SLICE_X0Y1".to_string(),
+                tile: "CLB_X0Y1".to_string(),
+                x: 0,
+                y: 1,
+            },
+            crate::place::PlacedUltraSlice {
+                packed_idx: 0,
+                site: "SLICE_X0Y2".to_string(),
+                tile: "CLB_X0Y2".to_string(),
+                x: 0,
+                y: 2,
+            },
+        ];
+        let violations = check_legality(&vec![s0, s1], &placed, &grid, &limits);
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, LegalityViolation::CarryChainBroken { .. }))
         );
     }
 }
