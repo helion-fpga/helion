@@ -97,24 +97,45 @@ Known cross-check, recorded not hidden: summing
 num_minors_per_std_colMajor plus num_minors_per_bram_content_colMajor
 over all rows gives 41,460 frames, while AMD UG570 Table 1 lists
 41,476 configuration frames for KU3P. The gap is 16 frames, exactly
-4 per FAR row, and it is systematic across every BitFiltrator device
-file checked (xcku5p, xcu200, xcu250, xcu280 all show 4 missing
-frames per row against UG570). The cause is unknown: either 4 frames
-per row exist that BitFiltrator's extraction does not cover, or UG570
-counts 4 frames per row outside the FAR-addressable array. Open
-question for the CTO, not a loader defect: the loader reports the
-file's own total and documents the UG570 delta.
+4 per FAR row. It is systematic: the same 4-per-row gap holds on
+every BitFiltrator device file whose UG570 Table 1 count was checked
+2026-11-19 (xcku3p, xcku5p, xcau20p, xcau25p: UG570 41,476 each, file
+41,460 each, 4 FAR rows each). The extraction source is a
+per-frame-CRC debug bitstream's FAR writes (BitFiltrator
+`extract_all_frame_addresses.py`, which drops FAR writes to a
+reserved address and deduplicates), so the 16 frames are either
+missing from that extraction or counted by UG570 outside the
+FAR-addressable minors; block type 2 is excluded as the cause
+(UG570 FAR table: a normal bitstream does not include block types
+010, 011, or 100). Open question for the CTO, not a loader defect:
+the loader reports the file's own total and documents the UG570
+delta. Unblocker: a fresh Vivado KU3P debug-bitstream FAR
+enumeration with an FDRI word-count cross-check, locating the 16
+FARs.
 
-Second cross-check, same status: the header says 162,720 LUTs and
+Second cross-check, resolved 2026-11-19 (see
+tests/device_model_counts.rs): the header says 162,720 LUTs and
 325,440 FFs for 27,120 slices, exactly 6 LUTs and 12 FFs per slice,
 3/4 of the 8-LUT / 16-FF arch geometry (LutLoc has 8 names, RegLoc
-16). Both header values come from Vivado part properties via
-create_device_summary.py and are reported as file truth, never
-derived from geometry; the loader does not assert num_luts ==
-num_slices * 8. Cause unknown (Vivado part-property counting vs
-physical sites). For xcvu3p, the XMP103-published 394,080 LUTs /
+16). The two counts measure different things and both are grounded:
+27,120 is the Vivado SLICES part property
+(`create_device_summary.py`: `summary["num_slices"] =
+part_properties["SLICES"]`) and equals the file geometry exactly
+(113 CLB columns x 4 FAR rows x 60 slices); in every BitFiltrator
+device file checked, header num_slices equals geometry slices.
+20,340 is the usable-slice count, LUT-derived from the AMD-published
+162,720 LUTs (DS890 Table 9, XMP103 163K); AMD publishes no slice
+count for KU3P. KU3P and KU5P share the identical file geometry
+and the identical UG570 Table 1 frame count (41,476), while KU3P
+usable LUTs, DSPs, and BRAMs are exactly 3/4 of KU5P (162,720 vs
+216,960; 1,368 vs 1,824; 360 vs 480): the file geometry is the
+shared-die geometry, and which sites are usable on KU3P is not in
+any public source. The loader does not assert num_luts ==
+num_slices * 8. For xcvu3p, the XMP103-published 394,080 LUTs /
 788,160 FFs over 49,260 slices follow 8/16, so the provisional file
-uses those; Vivado confirmation must re-check.
+uses those (49,260 = 394,080 / 8; the earlier 49,250 came from
+dividing the rounded 394,000 and is gone from the model); Vivado
+confirmation must re-check.
 
 ### ULTRASCALE_PLUS.json
 
@@ -139,7 +160,9 @@ inside the file) but it is NOT confirmed: confirmation needs Vivado
 (`create_device_summary.py`, ~4 runs), blocked on the license server
 since Oct 22, 2026. Nothing provisional in this file may be presented
 as confirmed. See the generator script and COORD.md for the full list
-of assumptions, including the 49,250 vs 49,260 CLB discrepancy and the
+of assumptions, including the resolved 49,250 vs 49,260 slice count
+(the model now uses 49,260 = 394,080 / 8; 49,250 came from dividing
+the rounded 394,000) and the
 frame-total gap against UG570: the generator computes 73,035 frames,
 which OVERSHOOTS the UG570 Table 1 count of 71,820 by 1,215 (1.7%).
 That is the opposite direction from xcku3p (16 under) and is recorded
