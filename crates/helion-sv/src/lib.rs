@@ -15319,7 +15319,7 @@ fn parse_for_unroll_module<'a>(
         return Err("for )".into());
     }
     let step = step_signed.unsigned_abs().max(1) as usize;
-    let step_down = descending || (!ne_cmp && step_signed < 0) || (ne_cmp && step_signed < 0);
+    let step_down = descending || step_signed < 0;
     let (lo, hi) = if step_down {
         let last = if inclusive {
             end_val
