@@ -15,7 +15,7 @@ use helion_ultrascale::bitloc::{
     bram_parity_locations, bram_parity_placed_bits, bram_tile_fasm, bram18_fasm,
     bram36_placed_bits, ff_fasm_name, ff_init_fasm, ff_location, ff_placed_bit, ff_srval_fasm,
     ff_srval_location, ff_srval_placed_bit, lut_fasm_name, lut_init_fasm, lut_locations,
-    lut_placed_bits,
+    lut_placed_bits, uram_content_locations,
 };
 use helion_ultrascale::segbits::{BitRef, FileSegbitsDb, SegbitsDb};
 use std::collections::HashSet;
@@ -827,5 +827,20 @@ fn bram_errors_fail_loud() {
             index: 2048,
             max: 2048
         })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// URAM288 (blocked: no public encoding)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn uram_blocked_fail_loud() {
+    // No URAM288 content table exists in any public source, and
+    // URAM288 has no INIT attributes to sweep. A URAM content request
+    // must error and emit no bits, never fall back to the BRAM table.
+    assert_eq!(
+        uram_content_locations(0),
+        Err(BitLocError::UramBlocked)
     );
 }
