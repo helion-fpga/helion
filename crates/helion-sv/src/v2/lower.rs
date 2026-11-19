@@ -303,7 +303,7 @@ pub fn bit_name(sig: &str, w: u32, bit: u32) -> String {
 
 /// Follow wires: slices, concatenations and combinationally driven signal
 /// bits, down to the node that computes or stores the bit.
-fn wire(flat: &Flat, mut n: N, mut bit: u32) -> (N, u32) {
+pub(super) fn wire(flat: &Flat, mut n: N, mut bit: u32) -> (N, u32) {
     loop {
         match flat.dag.op(n) {
             Op::Slice(a, lo) => {
@@ -345,7 +345,7 @@ fn wire(flat: &Flat, mut n: N, mut bit: u32) -> (N, u32) {
 /// `latch & clk`, where the latch is transparent while `clk` is low, is a
 /// gated clock: the flop is clocked by `clk` and loads only when the
 /// latch's data input is 1, which is what the gate does.
-fn clock_shape(flat: &Flat, clk: N) -> ((N, u32), Vec<(N, u32)>) {
+pub(super) fn clock_shape(flat: &Flat, clk: N) -> ((N, u32), Vec<(N, u32)>) {
     let (n, b) = wire(flat, clk, 0);
     if let Op::And(x, y) = flat.dag.op(n) {
         if flat.dag.w(n) == 1 {
