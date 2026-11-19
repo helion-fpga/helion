@@ -886,6 +886,15 @@ impl<'a> DeviceQuery for XDevice<'a> {
             .map(|t| (t.grid_x, t.grid_y))
     }
 
+    fn site_tile(&self, site: &str) -> Option<(String, String)> {
+        let (ti, _) = self.device.site_by_name(site)?;
+        Some((self.device.tile(ti)?.name.clone(), site.to_string()))
+    }
+
+    fn hard_pin_tile(&self, site: &str, pin: &str, output: bool) -> Option<String> {
+        crate::ps7::int_wire(self.device, self, site, pin, output).map(|(t, _)| t)
+    }
+
     fn slice_near(&self, x: i32, y: i32, used: &HashSet<String>) -> Option<(String, String)> {
         self.device
             .slices()

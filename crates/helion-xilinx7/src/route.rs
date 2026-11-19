@@ -454,8 +454,8 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
             add_ep(n.clone(), site.to_string(), "CASCADEOUTB", true);
         }
     }
-    // Block RAM and DSP data, address, clock, enable and reset pins, as site pins.
-    for (net, site, pin, is_driver) in crate::bram::endpoints(placed)?.into_iter().chain(crate::dsp::endpoints(placed)).chain(crate::lutram::endpoints(placed)) {
+    // Block RAM, DSP and PS7 data, address, clock, enable and reset pins, as site pins.
+    for (net, site, pin, is_driver) in crate::bram::endpoints(placed)?.into_iter().chain(crate::dsp::endpoints(placed)).chain(crate::lutram::endpoints(placed)).chain(crate::ps7::endpoints(placed)) {
         add_ep(net, site, &pin, is_driver);
     }
     for dsp in &packed.dsps {

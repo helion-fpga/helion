@@ -230,11 +230,11 @@ fn main() {
 }
 
 /// Period of every flop clock after packing. A clock from a pad has the
-/// XDC period. A clock made by a flop has twice its source's period when
+/// XDC period, a PS7 fabric clock its own (`fclk`, net -> ps). A clock made by a flop has twice its source's period when
 /// that flop is a plain toggle (its input is its own output inverted, with
 /// no enable or reset); any other derived clock is refused, because its
 /// period cannot be known.
-fn clock_periods(packed: &helion_xilinx7::pack::Packed7, pin_period: u32) -> Result<HashMap<String, u32>, String> {
+fn clock_periods(packed: &helion_xilinx7::pack::Packed7, pin_period: u32, fclk: &HashMap<String, u32>) -> Result<HashMap<String, u32>, String> {
     let mut periods: HashMap<String, u32> = HashMap::new();
     let mut doms: Vec<String> = packed.ffs.iter().map(|f| f.clk_net.clone()).chain(packed.lutrams.iter().map(|r| r.clk.clone())).collect();
     doms.sort();
@@ -252,6 +252,10 @@ fn clock_periods(packed: &helion_xilinx7::pack::Packed7, pin_period: u32) -> Res
             let Some(b) = packed.bufgs.iter().find(|b| &b.out_net == dom) else { return true };
             if pads.contains(b.in_net.as_str()) {
                 periods.insert(dom.clone(), pin_period);
+                return false;
+            }
+            if let Some(&p) = fclk.get(&b.in_net) {
+                periods.insert(dom.clone(), p);
                 return false;
             }
             // An MMCM/PLL output: T_in * D * O / M (UG472), from a pad clock
@@ -295,7 +299,7 @@ fn clock_periods(packed: &helion_xilinx7::pack::Packed7, pin_period: u32) -> Res
     }
     if !pending.is_empty() {
         return Err(format!(
-            "clock {} is not a pad clock, an MMCM/PLL output or a divide-by-two of one; its period is unknown, so timing cannot be checked",
+            "clock {} is not a pad clock, a PS7 FCLK, an MMCM/PLL output or a divide-by-two of one; its period is unknown, so timing cannot be checked",
             pending.join(", ")
         ));
     }
@@ -353,6 +357,32 @@ fn async_groups(xdc: &str, packed: &helion_xilinx7::pack::Packed7) -> Result<Vec
     Ok(out)
 }
 
+/// Period (ps) of each PS7 fabric clock on a net (`FCLKCLK<n>`), from the
+/// XDC's `create_clock -period <ns> ... [get_pins <cell>/FCLKCLK[<n>]]`: the
+/// PS programs the rate (ps7_init), so only the XDC can say what it is.
+fn fclk_periods(xdc: &str, packed: &helion_xilinx7::pack::Packed7) -> Result<HashMap<String, u32>, String> {
+    let mut out = HashMap::new();
+    for p in &packed.ps7s {
+        for (pin, net, _) in p.pins.iter().filter(|(pin, _, is_out)| *is_out && pin.starts_with("FCLKCLK")) {
+            let bit = &pin["FCLKCLK".len()..];
+            let line = xdc
+                .lines()
+                .map(|l| l.split('#').next().unwrap_or(""))
+                .find(|l| l.trim_start().starts_with("create_clock") && l.contains("get_pins") && l.contains(&format!("FCLKCLK[{bit}]")))
+                .ok_or_else(|| format!("XDC: PS7 {}/FCLKCLK[{bit}] drives net `{net}` but has no create_clock", p.name))?;
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            let ns = toks
+                .iter()
+                .position(|t| *t == "-period")
+                .and_then(|i| toks.get(i + 1))
+                .and_then(|v| v.parse::<f64>().ok())
+                .ok_or_else(|| format!("XDC: create_clock for {}/FCLKCLK[{bit}] has no -period", p.name))?;
+            out.insert(net.clone(), (ns * 1000.0).round() as u32);
+        }
+    }
+    Ok(out)
+}
+
 /// Clock period (ps) from the first `create_clock -period <ns>`; 10 ns default.
 fn xdc_period_ps(text: &str) -> u32 {
     for line in text.lines() {
@@ -373,6 +403,13 @@ fn xdc_period_ps(text: &str) -> u32 {
 #[allow(clippy::too_many_arguments)]
 fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_timing: bool, front: &str, part: &str, vivado: Option<(String, bool)>) -> Result<(), String> {
     let t0 = std::time::Instant::now();
+    // The Zynq PS7 cell, with its ports from the database.
+    if part.starts_with("xc7z") {
+        match helion_xilinx7::ps7::sv_ports() {
+            Ok(p) => helion_sv::v2::mem::register_prim("PS7", &p),
+            Err(e) => eprintln!("zedbit: no PS7 cell for this part: {e}"),
+        }
+    }
     let (mut design, renames) = synth(design_path, top, front)?;
     let t_synth = t0.elapsed();
     for k in ["SIM_ONLY", "NO_BODY", "WIDE_CONE", "ASSIGN_NOT_LOWERED", "GENERATE_NOT_LOWERED", "FLATTEN_CAP"] {
@@ -528,6 +565,7 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
     }
     eprintln!("zedbit: routed in {:.1}s", (t_route - t_place).as_secs_f64());
     let mut period = xdc_period_ps(&xdc);
+    let mut fclk = fclk_periods(&xdc, &packed)?;
     // Flops on both clock edges: a path from one edge to the other has half
     // a period. The analysis has one period for every path, so it is run
     // at half the clock period, which is safe for all of them.
@@ -538,8 +576,9 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
             packed.ffs.len()
         );
         period /= 2;
+        fclk.values_mut().for_each(|p| *p /= 2);
     }
-    let periods = clock_periods(&packed, period)?;
+    let periods = clock_periods(&packed, period, &fclk)?;
     let groups = async_groups(&xdc, &packed)?;
     let group_of = |c: &str| groups.iter().position(|g| g.iter().any(|d| d == c));
     if !groups.is_empty() {
