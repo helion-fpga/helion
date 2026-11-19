@@ -72,17 +72,21 @@ proc attr_table { primitive } {
       # No public source names the BUFCE_ROW primitive attributes, so
       # no list is asserted here. The driver enumerates the placed
       # cell's properties at runtime (see enumerate_attrs below) and
-      # fuzzes every boolean/enum property it finds. If the top's
-      # primitive name is rejected by Vivado, that is logged in
-      # runs.txt and the sub-pass is reported as not runnable, not
-      # faked.
+      # fuzzes its IS_*_INVERTED booleans, logging every other
+      # property as skipped-not-fuzzed. If the top's primitive name
+      # is rejected by Vivado, that is logged in runs.txt and the
+      # sub-pass is reported as not runnable, not faked.
       return {}
     }
     mmcm -
     pll {
-      # Dozens of attributes; the driver enumerates them at runtime
-      # (see enumerate_attrs below) instead of hardcoding a list that
-      # would go stale. The run log lists every property fuzzed.
+      # No attribute list is hardcoded here: the driver enumerates
+      # the placed cell's IS_*_INVERTED booleans at runtime (see
+      # enumerate_attrs below) and logs every other property as
+      # skipped-not-fuzzed. Integer/enum attributes (divide,
+      # multiply, phase, duty, bandwidth, compensation) need
+      # per-attribute value tables and are not fuzzed by this driver
+      # version; the run log lists every property considered.
       return {}
     }
     default {
@@ -104,11 +108,21 @@ proc top_info { primitive } {
   }
 }
 
-# Enumerate fuzzable properties of a placed cell: boolean (0/1) and
-# short enum properties only. Returns {attr {values...}} pairs. The
-# current value is read off the cell, so the variant is always the
-# non-default value actually present, never a guessed default.
-proc enumerate_attrs { cell } {
+# Enumerate fuzzable properties of a placed cell: IS_*_INVERTED
+# booleans only. Returns {attr {values...}} pairs. The current value
+# is read off the cell, so the variant is always the non-default value
+# actually present, never a guessed default.
+#
+# Only IS_*_INVERTED names are flipped, never a bare 0/1 value: a
+# value alone cannot tell a boolean from an integer attribute.
+# DIVCLK_DIVIDE reads back as "1" and flipping it to 0 would be an
+# invalid divide value (valid range 1..6), and integer, real, and
+# enum properties (CLKOUT divide/multiply, phase, duty, bandwidth,
+# compensation) have no safe flip by value. Every property that is
+# not fuzzed is logged to runs.txt as skipped, never silently
+# dropped; integer/enum attributes need per-attribute value tables
+# (future work, SPEC.md out of scope until a design needs MMCM/PLL).
+proc enumerate_attrs { cell log_fp } {
   set out {}
   foreach prop [list_property $cell] {
     # Skip read-only, structural, and location properties: fuzzing
@@ -119,10 +133,18 @@ proc enumerate_attrs { cell } {
     if { [catch { get_property $prop $cell } cur] } {
       continue
     }
+    if { ![regexp {^IS_.*_INVERTED$} $prop] } {
+      puts $log_fp "enumerated SKIP $prop: current value $cur (not an IS_*_INVERTED boolean; not fuzzed)"
+      flush $log_fp
+      continue
+    }
     if { $cur eq "0" } {
       lappend out [list $prop {1}]
     } elseif { $cur eq "1" } {
       lappend out [list $prop {0}]
+    } else {
+      puts $log_fp "enumerated SKIP $prop: current value $cur (unexpected for an IS_*_INVERTED boolean; not fuzzed)"
+      flush $log_fp
     }
   }
   return $out
@@ -176,7 +198,7 @@ proc main { primitive part dir_out } {
     read_verilog [file join $script_dir $top_file]
     read_xdc [file join $script_dir clk_fuzz.xdc]
     synth_design -top clk_fuzz_top -part $part
-    set table [enumerate_attrs [get_cells $cell]]
+    set table [enumerate_attrs [get_cells $cell] $log_fp]
     puts $log_fp "enumerated attributes for $primitive: $table"
     flush $log_fp
     close_project -quiet
