@@ -1,0 +1,37 @@
+# golden FASM: BUFGCE-driven blinky on xcku3p (CLK block)
+# seed: 20261107
+# source: blinky logic of the v1 golden (registered inverter, led = q)
+# plus the full clock path. Placement: all logic in SLICE_X0Y0.
+# PROVISIONAL: INT, HPIO, CMT, and RCLK tile coordinates below use the
+# logical column index as the tile X, NOT a verified Vivado tile X. No
+# xcku3p tilegrid exists in any public DB yet. The PIP and site feature
+# strings for the encodable lines are verified to exist in their
+# segbits DBs (tests/clk.rs fails loud otherwise). The route is the
+# frozen chosen target, not a Vivado-produced route.
+# CLK status on this golden (see data/CLK_AUDIT.md): 8 of 9 CLK lines
+# resolve tile-relative from public sources; the CMT BUFGCE site line
+# is BLOCKED (no public encoding) and every CMT/RCLK tile lacks an
+# absolute base FAR (no tilegrid), so emit fails loud on those tiles.
+SLICE_X0Y0.A6LUT.INIT[63:0] = 0x5555555555555555
+SLICE_X0Y0.AFF.INIT = 0
+SLICE_X0Y0.AFF.SRVAL = 0
+INT_X0Y0.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1
+INT_X0Y0.PIP.INT_NODE_GLOBAL_0_INT_OUT0.GCLK_B_0_0
+HPIO_RIGHT_X0Y0.IOB_X0Y0.IOSTANDARD_IN.LVCMOS12
+HPIO_RIGHT_X0Y0.IOB_X0Y1.IOSTANDARD_OUT.LVCMOS12_IDRIVE_I2_SLEW_SLEW_SLOW
+# CLK, BLOCKED: CMT BUFGCE site config has no public encoding. The
+# feature spelling below is the proposed DB-head spelling
+# (tile_type.site.bel.attr, as in the RCLK BUFGCE_HDIO lines), to be
+# confirmed by the Vivado clocking fuzz job (data/CLK_FUZZ_JOB.md).
+CMT_L_X0Y0.BUFGCE_X0Y0.BUFGCE.IINV.V0
+# CLK, encodable: CMT distribution USED bits.
+CMT_RIGHT_X0Y0.WIRE.CLK_HDISTR_0_0.USED.V1
+CMT_RIGHT_X0Y0.WIRE.CLK_HROUTE_1_0.USED.V1
+# CLK, encodable: BUFCE_LEAF config, synchronous CE, tap 0, in use.
+RCLK_INT_L_X0Y0.BUFCE_LEAF_X0Y0.BUFCE_LEAF.CE_TYPE.SYNC
+RCLK_INT_L_X0Y0.BUFCE_LEAF_X0Y0.BUFCE_LEAF.CEINV.V0
+RCLK_INT_L_X0Y0.BUFCE_LEAF_X0Y0.BUFCE_LEAF.DELAY_TAP.V0
+RCLK_INT_L_X0Y0.BUFCE_LEAF_X0Y0.BUFCE_LEAF.IINV.V0
+RCLK_INT_L_X0Y0.BUFCE_LEAF_X0Y0.BUFCE_LEAF.IN_USE.V1
+# CLK, encodable: RCLK leaf clock mux PIP, HDISTR feedthrough 0.
+RCLK_INT_L_X0Y0.PIP.CLK_LEAF_SITES_0_CLK_IN.CLK_HDISTR_FT0_0
