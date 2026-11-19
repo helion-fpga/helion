@@ -30,6 +30,7 @@ pub mod place;
 pub mod router;
 pub mod segbits;
 pub mod sta;
+pub mod synthmap;
 pub mod timing_db;
 pub mod uram;
 
@@ -78,6 +79,10 @@ pub use router::{
 };
 pub use segbits::{BitRef, FileSegbitsDb, SegbitsDb, SegbitsLoadError};
 pub use sta::{StaNetlist, TimingReport, sta_routed};
+pub use synthmap::{
+    AND6_INIT, Carry8Mapping, FfControlGroup, MappedCell, SourceCell, SourceKind, Unmapped,
+    emit_ff_control_fasm, map_source_cell, pair_carry4_chains,
+};
 pub use timing_db::{
     documented_xcku3p, documented_xcvu3p, sta_db_for_part, DelaySource, SourcedDelay,
     UltraScaleTimingDb, preliminary_xcku3p, preliminary_xcvu3p,

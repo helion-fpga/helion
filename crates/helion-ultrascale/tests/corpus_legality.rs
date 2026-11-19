@@ -70,13 +70,29 @@ fn extract_cells(
         }
     }
 
+    // Cells with no UltraScale mapping fail loud here, never silently
+    // dropped: the CLI copy (crates/helion-cli/src/ultra.rs) rejects
+    // them through synthmap::map_source_cell, and this copy must agree.
+    // IOBs and clock buffers are the only non-logic cells: they are
+    // handled outside pack, not dropped.
+    let mut unmapped: Vec<String> = Vec::new();
+
     for cell in &design.cells {
         let name = resolve(cell.name).to_string();
         match cell.kind {
             CellKind::Lut6 { init } => {
-                // Check if used as memory (SRL or dist RAM) via attributes.
-                let is_mem = cell.attrs.get("MEMORY").map(|s| s == "1").unwrap_or(false);
-                luts.push((name, init, is_mem));
+                // A LUT6 carrying SRL or distributed-RAM attributes is
+                // not a plain LUT6 (synthmap hazard): fail loud, never
+                // pack it as logic. Check here, not in a later guarded
+                // arm, because this arm matches every Lut6 first.
+                if cell.attrs.map.contains_key("SRL_TYPE")
+                    || cell.attrs.map.contains_key("SHREG_EXTRACT")
+                    || cell.attrs.get("MEMORY").map(|s| s == "1").unwrap_or(false)
+                {
+                    unmapped.push(format!("{name} (SRL/distributed-RAM LUT6)"));
+                    continue;
+                }
+                luts.push((name, init, false));
             }
             CellKind::Hff => {
                 let clk = pin_to_net
@@ -112,9 +128,16 @@ fn extract_cells(
                 let next = None; // Simplified: chains built from prev links.
                 carry_map.insert(name.clone(), (prev, next));
             }
-            _ => {}
+            CellKind::IobIn | CellKind::IobOut | CellKind::ClockBuf => {}
+            _ => {
+                unmapped.push(format!("{name} ({:?})", cell.kind));
+            }
         }
     }
+    assert!(
+        unmapped.is_empty(),
+        "cells with no UltraScale mapping (must fail loud, never drop): {unmapped:?}"
+    );
 
     // Build chains from carry_map.
     let mut visited = std::collections::HashSet::new();
