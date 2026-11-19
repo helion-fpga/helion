@@ -306,7 +306,7 @@ pub fn seeds_to_run(first: u64, end: u64, results: &[SeedResult], retry_failed: 
 /// and wns_ps >= threshold, pick the highest wns_ps (most timing
 /// margin); tie-break on lowest tns_ps, then lowest seed. Returns
 /// None when no seed passes the threshold. Same rule as the proof.
-pub fn select_best_seed<'a>(results: &'a [SeedResult], threshold: i64) -> Option<&'a SeedResult> {
+pub fn select_best_seed(results: &[SeedResult], threshold: i64) -> Option<&SeedResult> {
     results
         .iter()
         .filter(|r| r.status == "ok" && r.wns_ps >= threshold)
@@ -623,7 +623,7 @@ mod tests {
         // A tear after the seed field parses as a failed record for
         // that seed (no ok status, zero slack); it is skipped on
         // resume unless --retry-failed re-runs it.
-        let text = format!("{{\"seed\": 9, \"wns_ps\":\n");
+        let text = "{\"seed\": 9, \"wns_ps\":\n".to_string();
         let out = parse_results_text(&text);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].seed, 9);
