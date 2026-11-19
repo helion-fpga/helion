@@ -19,7 +19,7 @@
 
 use helion_ir::{intern, resolve, CellKind, Design};
 use helion_ultrascale::{
-    check_legality, emit_ff_fasm, pack_ultra, place_ultra, preliminary_xcvu3p, route_ultra,
+    check_legality, emit_ff_fasm, pack_ultra, place_ultra, route_ultra, sta_db_for_part,
     sta_routed, ControlSetLimits, FabricWithPlaceholders, RoutableNet, StaNetlist, TimingReport,
     UltraPlaceOpts, UltraRouteOpts, UltraScaleDevice, UltraScaleFabric,
 };
@@ -295,8 +295,10 @@ pub fn run_impl(path: &str, part: &str, seed: u64) -> Result<(), String> {
     println!("hang_diag ultra fasm ff_lines={}", ff_fasm.len());
 
     // Preliminary STA on the placed netlist (Manhattan estimates, ballpark
-    // delays; NOT signoff timing).
-    let timing = sta_on_placed(&design, &packed, &placed)?;
+    // delays; NOT signoff timing). The DB is selected by part (F3 fix:
+    // xcku3p no longer silently runs on the xcvu3p DB) and the report is
+    // labeled estimate=1 until a real delay DB exists.
+    let timing = sta_on_placed(&design, &packed, &placed, part)?;
     println!("{}", timing.hang_diag_line(0));
 
     // ROUTE: blocked until a real WireDb exists. Fail loud with the stage
@@ -335,6 +337,7 @@ fn sta_on_placed(
     design: &Design,
     packed: &helion_ultrascale::UltraPacked,
     placed: &helion_ultrascale::UltraPlaced,
+    part: &str,
 ) -> Result<TimingReport, String> {
     // Map cell name -> placed (x, y) via its packed slice.
     let mut sites: HashMap<String, (i32, i32)> = HashMap::new();
@@ -404,7 +407,7 @@ fn sta_on_placed(
         ff_q,
         ff_d,
     };
-    let db = preliminary_xcvu3p();
+    let db = sta_db_for_part(part).map_err(|e| format!("ULTRA STA: {e}"))?;
     sta_routed(&nl, &db, 10_000).map_err(|e| format!("ULTRA STA: {e}"))
 }
 

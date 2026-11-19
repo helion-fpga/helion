@@ -32,15 +32,25 @@ pub struct TimingReport {
     pub worst_endpoint: String,
     /// Worst path delay (ps).
     pub worst_delay_ps: i64,
+    /// True when any delay behind this report is a ballpark estimate
+    /// rather than a documented datasheet value. Such a report is an
+    /// estimate, never signoff timing.
+    pub is_estimate: bool,
 }
 
 impl TimingReport {
-    /// Format exactly like the existing hang_diag timing line.
+    /// Format exactly like the existing hang_diag timing line, plus an
+    /// `estimate=1` token when the report is an estimate.
     pub fn hang_diag_line(&self, ms: u128) -> String {
-        format!(
+        let base = format!(
             "hang_diag timing WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={} ms={}",
             self.wns_ps, self.tns_ps, self.endpoints, self.r2r_ps, self.iob_ps, ms
-        )
+        );
+        if self.is_estimate {
+            format!("{base} estimate=1")
+        } else {
+            base
+        }
     }
 }
 
@@ -219,5 +229,6 @@ pub fn sta_routed<N: StaNetlist>(
         worst_startpoint: worst_start,
         worst_endpoint: worst_end,
         worst_delay_ps: worst_delay,
+        is_estimate: db.is_estimate(),
     })
 }

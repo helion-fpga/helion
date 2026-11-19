@@ -63,4 +63,7 @@ pub use router::{
 };
 pub use segbits::{BitRef, FileSegbitsDb, SegbitsDb, SegbitsLoadError};
 pub use sta::{StaNetlist, TimingReport, sta_routed};
-pub use timing_db::{DelaySource, SourcedDelay, UltraScaleTimingDb, preliminary_xcvu3p};
+pub use timing_db::{
+    documented_xcku3p, documented_xcvu3p, sta_db_for_part, DelaySource, SourcedDelay,
+    UltraScaleTimingDb, preliminary_xcku3p, preliminary_xcvu3p,
+};
