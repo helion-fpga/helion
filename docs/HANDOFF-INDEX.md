@@ -7,6 +7,10 @@ new. The narrative handoff is docs/HANDOFF.md; this file is the index and
 the storage map. If anything disagrees with this file, this file wins on
 locations, and the sub-problem file wins on its own sub-problem.
 
+## SUPERSEDED NOTICE (Nov 19, 2026)
+
+The ZedBoard track below (ZB-00 to ZB-12) is SUPERSEDED by fm/zedboard-merge at 7ec3192, the current ZedBoard integration tip (verified on origin). Do not pick up any ZB sub-problem. ZedBoard work is owned by Claude Code now. This index keeps the ZB rows for history only. The UltraScale+ track below is still current, plus the session 18 gap log in the UltraScale+ goal.
+
 ## The goal, in one paragraph
 
 Build a non-Vivado tool that produces bitstreams identical to Vivado's, for
@@ -26,23 +30,23 @@ failed, what to do, the exact files and commands, its dependencies, and
 the rules. A sub-problem is done only when its "Done when" section is met
 and the proof is shown.
 
-### ZedBoard track (13 files, main focus: real hardware)
+### ZedBoard track (13 files) - SUPERSEDED by fm/zedboard-merge 7ec3192, do not pick up
 
 | ID | File | What it covers | Status |
 |----|------|----------------|--------|
-| ZB-00 | ZB-00-mac-access.md | Get Muse into the Mac: Tailscale SSH plus camera | Open, blocked, current blocker |
-| ZB-01 | ZB-01-flash-v3-blink.md | Flash the v3 tie-off bitstream, get LD0 blinking | Code done, hardware unproven |
-| ZB-02 | ZB-02-bufg-i0-config.md | BUFGCTRL I0 config, clock passes to the FFs | Code done, hardware unproven |
-| ZB-03 | ZB-03-ff-ce-sr.md | FF clock-enable and set/reset | Code done, hardware unproven |
-| ZB-04 | ZB-04-carry4-inference.md | CARRY4 inference in helion-sv | Not started |
-| ZB-05 | ZB-05-bram-port-config.md | BRAM port config + loud INIT failure | Not started |
-| ZB-06 | ZB-06-dsp-fail-loud.md | DSP fail loud or implement | Not started |
-| ZB-07 | ZB-07-site-allocators.md | Site allocators respect the used set | Not started |
-| ZB-08 | ZB-08-carry4-adjacency.md | CARRY4 vertical adjacency in placement | Not started |
-| ZB-09 | ZB-09-ld6-ld7-sing-gap.md | LD6/LD7 on RIOB33_SING tiles (DB gap) | Known gap, workaround in place |
-| ZB-10 | ZB-10-vivado-bitstream-diff.md | Vivado-vs-Helion bitstream diff on blinky | Never run |
-| ZB-11 | ZB-11-iob-driver.md | IOB output driver (t01, no clock) | Test written, never flashed |
-| ZB-12 | ZB-12-high-medium-cleanup.md | Remaining investigator findings (H/M/L) | Not started |
+| ZB-00 | ZB-00-mac-access.md | Get Muse into the Mac: Tailscale SSH plus camera | SUPERSEDED by fm/zedboard-merge 7ec3192, do not pick up |
+| ZB-01 | ZB-01-flash-v3-blink.md | Flash the v3 tie-off bitstream, get LD0 blinking | SUPERSEDED by fm/zedboard-merge 7ec3192, do not pick up |
+| ZB-02 | ZB-02-bufg-i0-config.md | BUFGCTRL I0 config, clock passes to the FFs | SUPERSEDED by fm/zedboard-merge 7ec3192, do not pick up |
+| ZB-03 | ZB-03-ff-ce-sr.md | FF clock-enable and set/reset | SUPERSEDED by fm/zedboard-merge 7ec3192, do not pick up |
+| ZB-04 | ZB-04-carry4-inference.md | CARRY4 inference in helion-sv | SUPERSEDED by fm/zedboard-merge 7ec3192, do not pick up |
+| ZB-05 | ZB-05-bram-port-config.md | BRAM port config + loud INIT failure | SUPERSEDED by fm/zedboard-merge 7ec3192, do not pick up |
+| ZB-06 | ZB-06-dsp-fail-loud.md | DSP fail loud or implement | SUPERSEDED by fm/zedboard-merge 7ec3192, do not pick up |
+| ZB-07 | ZB-07-site-allocators.md | Site allocators respect the used set | SUPERSEDED by fm/zedboard-merge 7ec3192, do not pick up |
+| ZB-08 | ZB-08-carry4-adjacency.md | CARRY4 vertical adjacency in placement | SUPERSEDED by fm/zedboard-merge 7ec3192, do not pick up |
+| ZB-09 | ZB-09-ld6-ld7-sing-gap.md | LD6/LD7 on RIOB33_SING tiles (DB gap) | SUPERSEDED by fm/zedboard-merge 7ec3192, do not pick up |
+| ZB-10 | ZB-10-vivado-bitstream-diff.md | Vivado-vs-Helion bitstream diff on blinky | SUPERSEDED by fm/zedboard-merge 7ec3192, do not pick up |
+| ZB-11 | ZB-11-iob-driver.md | IOB output driver (t01, no clock) | SUPERSEDED by fm/zedboard-merge 7ec3192, do not pick up |
+| ZB-12 | ZB-12-high-medium-cleanup.md | Remaining investigator findings (H/M/L) | SUPERSEDED by fm/zedboard-merge 7ec3192, do not pick up |
 
 ### UltraScale+ track (12 files, parallel: encoding layer)
 
@@ -62,6 +66,8 @@ and the proof is shown.
 | US-12 | US-12-harness-speed.md | Harness speed | Open |
 
 ### Suggested order
+
+NOTE (Nov 19, 2026): the ZedBoard order below is superseded by fm/zedboard-merge. Do not follow it. The UltraScale+ order is the US items in step 4 and 5.
 
 1. ZB-00 first. Nothing hardware can proceed without it.
 2. ZB-01 next. One flash answers whether the clock fix was the whole story.
