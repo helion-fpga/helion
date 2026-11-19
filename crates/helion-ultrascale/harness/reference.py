@@ -248,6 +248,43 @@ class Tier1Reference:
         f = far(BLOCK_CLB_IO_CLK, row_major, col_major, minor)
         return {(f, ofst + delta): 1 - (srval_value & 1)}
 
+    def resolve_lutram_mode(self, part, slice_x, slice_y, feature):
+        """Reference bits for one LUTRAM mode-selection feature.
+
+        The feature string is the segbits feature without the tile-type
+        prefix (e.g. `ALUT.MODE.RAM`, `ALUT.DI1.DI1`, `ALUT.SIZE.LARGE`,
+        `WA7USED.V0`). The slice must be a SLICEM tile (CLEM/CLEM_R):
+        the prjuray DBs carry no MODE.RAM for SLICEL tiles, and a LUTRAM
+        on one is unrepresentable. The mode bits are tile-relative (one
+        slice per CLB tile), so they do not vary with Y_ofst; only the
+        row major (from Y) and the column major (from X) locate them.
+        Returns {(far, offset): value}, absolute FARs.
+
+        The 64 content bits of the same LUTRAM resolve through
+        resolve_lut (block LUT_INIT): same encoding, proven in
+        docs/ultra-bitgen-crew/subproblems/US-04-lutram-table.md.
+        """
+        row_major, _ = self._slr_row(part, slice_y, NUM_CLB_PER_COLUMN)
+        col_major, tile_type = self._clb_column(part, row_major, slice_x)
+        if tile_type not in ("CLEM", "CLEM_R"):
+            raise MissingReference(
+                "LUTRAM mode feature %r on %s tile (SLICE_X%dY%d): LUTRAMs live on SLICEM tiles (CLEM/CLEM_R) only"
+                % (feature, tile_type, slice_x, slice_y)
+            )
+        db_name = {"CLEM": "clem", "CLEM_R": "clem_r"}[tile_type]
+        db = self.segbits(db_name)
+        key = "%s.%s" % (tile_type, feature)
+        if key not in db:
+            raise MissingReference(
+                "LUTRAM mode feature %r not in prjuray-db segbits_%s.db; encoding of this LUTRAM attribute is unverified"
+                % (feature, db_name)
+            )
+        bits = {}
+        for frame, bit, val in db[key]:
+            f = far(BLOCK_CLB_IO_CLK, row_major, col_major, frame)
+            bits[(f, bit)] = val
+        return bits
+
     def resolve_bram(self, part, bram_x, bram_y, size_kb, init_bits):
         """Reference bits for one RAMB18 INIT: {(far, offset): value}.
 

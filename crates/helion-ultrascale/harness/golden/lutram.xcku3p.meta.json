@@ -1,0 +1,16 @@
+{
+  "design": "lutram",
+  "fasm_sha256": "af92f975fe4ec85b1d1c5c25ca11c2c84e15c0fdec8aac35fc609015e305b6ec",
+  "notes": "One RAM64X1S on SLICE_X1Y0 ALUT (CLEM tile). No INT/HPIO tiles.",
+  "part": "xcku3p",
+  "placement_hash": "0057cf5491250dd6d682fb94f5ab413d8d391283b3be90840c3d81e34e182668",
+  "provisional_tiles": [],
+  "seed": 20261107,
+  "sites": [
+    {
+      "bel": "A6LUT",
+      "role": "lutram",
+      "tile": "SLICE_X1Y0"
+    }
+  ]
+}

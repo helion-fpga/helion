@@ -16,6 +16,7 @@ import re
 
 BLOCKS = [
     "LUT_INIT",
+    "LUTRAM",
     "FF_INIT",
     "BRAM_CONTENT",
     "BRAM_PARITY",
@@ -31,6 +32,10 @@ _TILE_RE = re.compile(r"^[A-Za-z0-9_]+_X\d+Y\d+$")
 _FEATURE_RE = re.compile(r"^[A-Za-z0-9_\.\[\]:]+$")
 _HEX_RE = re.compile(r"^0[xX][0-9a-fA-F]+$")
 _LUT_INIT_RE = re.compile(r"^([A-H])6LUT\.INIT\[63:0\]$")
+_LUTRAM_MODE_RE = re.compile(r"^([A-H])LUT\.MODE\.RAM$")
+_LUTRAM_DI1_RE = re.compile(r"^([A-H])LUT\.DI1\.(SIN|DI1)$")
+_LUTRAM_SIZE_RE = re.compile(r"^([A-H])LUT\.SIZE\.(LARGE|SMALL)$")
+_LUTRAM_WA_RE = re.compile(r"^WA[789]USED\.V[01]$")
 _FF_INIT_RE = re.compile(r"^([A-H])FF2?\.INIT$")
 _FF_SRVAL_RE = re.compile(r"^([A-H])FF2?\.SRVAL$")
 _SLICE_RE = re.compile(r"^SLICE_X(\d+)Y(\d+)$")
@@ -166,6 +171,23 @@ def classify(feature):
         return "FF_INIT"
     if ".ABCDFF." in feat or ".ABCFF." in feat or feat.endswith(".CEUSED.V0") or feat.endswith(".CEUSED.V1"):
         return "FF_INIT"
+    # LUTRAM mode-selection bits. A LUTRAM's 64 content bits are the
+    # LUT INIT bits (same encoding, proven in docs/ultra-bitgen-crew/
+    # subproblems/US-04-lutram-table.md) and classify as LUT_INIT; this
+    # block is only the mode bits that make those content bits behave
+    # as RAM. MODE.LUT/MODE.SRL are NOT here: SRL is a block-to-be, and
+    # MODE.LUT sets no bits. SIZE.SMALL is labeled LUTRAM: SIZE exists
+    # only in the CLEM DBs (the RAM/SRL family); a logic 5-LUT use of
+    # the same bit would mislabel, and that approximation is recorded
+    # here so a future owner can split it if a design ever sets it
+    # outside a RAM/SRL.
+    if (
+        _LUTRAM_MODE_RE.match(feat)
+        or _LUTRAM_DI1_RE.match(feat)
+        or _LUTRAM_SIZE_RE.match(feat)
+        or _LUTRAM_WA_RE.match(feat)
+    ):
+        return "LUTRAM"
     if "INITP" in feat or "INIT_P" in feat:
         if "BRAM" in feat or "RAMB" in tile or "RAMB" in feat:
             return "BRAM_PARITY"

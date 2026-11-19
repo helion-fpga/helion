@@ -1,0 +1,35 @@
+# golden FASM: lutram on xcku3p
+# seed: 20261107
+# source: RAM64X1S (64x1 single-port distributed RAM) on SLICE_X1Y0 ALUT.
+# placement: SLICE_X1Y0 (xcku3p: row major 0, CLB column 1, tile type CLEM
+# per the BitFiltrator xcku3p device file). One RAM64X1S only: no FF, no
+# route, no IO. The design is the minimal LUTRAM exercise, not a full
+# system; routing of address/data/clock is the router worker's scope.
+# derivation: the LUTRAM content bits ARE the LUT INIT bits (same
+# encoding), proven three ways, see docs/ultra-bitgen-crew/subproblems/
+# US-04-lutram-table.md: (1) BitFiltrator's own extraction code states
+# the INIT bits "ended up having the same encoding for LUTRAMs and
+# standard LUTs when we extracted the data" (extract_encoding_from_
+# logic_loc.py); its pipeline extracts CLEM LutLoc from Vivado
+# logic-location files of all-LUTRAM columns and CLEL LutLoc from a LUT
+# INIT fuzzing sweep. (2) The vendored tables are byte-identical across
+# all four CLB tile types (0 differing pairs of 30,720 per pair).
+# (3) Every prjuray xLUT.INIT[i] line equals the LutLoc Y0 pair (512 of
+# 512 per tile type). The mode lines below resolve through the vendored
+# segbits_clem.db: ALUT.MODE.RAM, ALUT.DI1.DI1, ALUT.SIZE.LARGE,
+# WA7/8/9USED.V0. Their SELECTION for a 64x1S follows the f4pga Project
+# X-Ray DRAM documentation (7-series feature family, same concepts under
+# UltraScale+ spellings): 64x1S needs xLUT.RAM plus the data-in mux to
+# the LUT's own input; SMALL only for 32-bit use; WA7/8USED only for
+# 128x1/256x1 use. That selection is a documented cross-family
+# inference, not a Vivado-verified UltraScale+ fact: tier 2 (a Vivado
+# bitstream diff) remains its arbiter. The bit LOCATIONS are proven.
+# PROVISIONAL: the xcvu3p golden reuses the xcku3p placement verbatim and
+# is provisional until the xcvu3p device file lands.
+SLICE_X1Y0.A6LUT.INIT[63:0] = 0x6996966996696996
+SLICE_X1Y0.ALUT.MODE.RAM
+SLICE_X1Y0.ALUT.DI1.DI1
+SLICE_X1Y0.ALUT.SIZE.LARGE
+SLICE_X1Y0.WA7USED.V0
+SLICE_X1Y0.WA8USED.V0
+SLICE_X1Y0.WA9USED.V0
