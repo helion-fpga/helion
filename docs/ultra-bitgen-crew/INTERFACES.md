@@ -190,11 +190,20 @@ records the seed and the placement hash with every run.
 ## Block registry (diff-harness owns, all workers use these names)
 
 LUT_INIT, FF_INIT, BRAM_CONTENT, BRAM_PARITY, INT_PIP, IO_CONFIG, CLK,
-DSP48E2, URAM288, FRAMING. A fix commit names its block. A block goes
+DSP48E2, URAM288, FRAMING, LUTRAM. A fix commit names its block. A block goes
 green only on zero diff plus a critic re-run.
 
-LUTRAM is a separate block, BLOCKED: LUTRAM emission fails loud
-(LutramBlocked) until a LUTRAM table or Vivado logic-location data
-exists. It is not covered by LUT_INIT. CTO ruling 2026-11-07: G4
-REJECTED, the paper section V-B does not state LUTRAM shares LUT INIT
-bits and the arch JSON has no LUTRAM table.
+LUTRAM is a separate block, DERIVED (tier 1), 2026-11-19: the 64 LUTRAM
+content bits ARE the LUT INIT bits (`LutLoc`), proven three ways (see
+docs/ultra-bitgen-crew/subproblems/US-04-lutram-table.md): BitFiltrator's
+own extraction code states the same encoding for LUTRAMs and standard
+LUTs; the vendored tables are byte-identical across all four CLB tile
+types; every prjuray xLUT.INIT[i] line equals the LutLoc Y0 pair. The
+LUTRAM block covers only the mode-selection bits (MODE.RAM, DI1, SIZE,
+WA7/8/9USED); the content bits classify as LUT_INIT. CTO ruling
+2026-11-07 (G4 REJECTED) still stands for the paper text: section V-B
+does not state LUTRAM shares LUT INIT bits. The derivation does not
+rest on the paper; it rests on the extraction code and the tables.
+Tier 2 (a Vivado bitstream diff) remains the arbiter for the mode-line
+selection for a 64x1S, which follows the f4pga Project X-Ray DRAM
+documentation as a documented cross-family inference.
