@@ -56,7 +56,8 @@ pub use int_pip::{
 };
 pub use legality::{LegalityViolation, check_legality};
 pub use multiseed::{
-    MultiseedSummary, SeedResult, best_seed_line, read_completed_seeds, select_best_seed,
+    MultiseedSummary, SeedResult, best_seed_line, dedup_results, escape_json_value,
+    parse_results_text, read_completed_seeds, seed_range, seeds_to_run, select_best_seed,
     summarize_multiseed,
 };
 pub use pack::{ControlSetLimits, PackedUltraSlice, SliceKind, UltraBel, UltraPacked, pack_ultra};
