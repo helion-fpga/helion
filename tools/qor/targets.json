@@ -14,5 +14,12 @@
   {"gap": "G9", "design": "bram_fill", "metric": "ok", "eq": true, "goal": "240-RAM fill builds a bitstream"},
   {"gap": "G9", "design": "dsp_fill_prims", "metric": "ok", "eq": true, "goal": "192-DSP fill (primitives) builds a bitstream"},
   {"gap": "G38", "design": "bram_fill", "metric": "slack_ns", "min": 0, "goal": "240-RAM fill meets 100 MHz in Helion STA (Vivado: +2.094 ns)"},
-  {"gap": "G22", "design": "blinky", "metric": "deterministic", "eq": true, "goal": "two builds give a byte-identical .bit"}
+  {"gap": "G22", "design": "blinky", "metric": "deterministic", "eq": true, "goal": "two builds give a byte-identical .bit"},
+  {"gap": "G22", "design": "pico", "metric": "deterministic", "eq": true, "goal": "two PicoRV32 builds give a byte-identical .bit (the old router differed here)"},
+  {"gap": "G33", "design": "bram_fill_25mhz", "metric": "ok", "eq": true, "goal": "RAMs on a divided clock and flops on the board clock time and build"},
+  {"gap": "G74", "design": "ibex_soc", "metric": "slack_ns", "min": 0, "goal": "the board's Ibex SoC meets 38.89 MHz (25.714 ns) with the default seed"},
+  {"gap": "G76", "design": "dsp_fill_prims", "metric": "slack_ns", "min": 0, "goal": "192-DSP fill meets 100 MHz in Helion STA (it did on the board build, 07e3be2)"},
+  {"gap": "G46", "design": "dsp_fill_prims", "metric": "lut_ratio", "max": 1.5, "goal": "192-DSP fill within 1.5x Vivado's 3,273 LUTs"},
+  {"gap": "G78", "design": "mmcm", "metric": "lut_ratio", "max": 1.5, "goal": "rung 4 MMCM design within 1.5x Vivado's 37 LUTs (G59 took it from 8.6x to 1.57x; the rest is the 64-bit compare)"},
+  {"gap": "G4", "design": "ibex_soc", "metric": "t_route", "max": 600, "goal": "the board's Ibex SoC routes in under 10 min"}
 ]

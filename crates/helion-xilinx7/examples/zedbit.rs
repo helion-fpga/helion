@@ -622,6 +622,7 @@ fn run(design_path: &str, xdc_path: &str, out: &str, top: Option<&str>, ignore_t
         "zedbit: summary {}",
         json_object(&[
             ("lut", built.luts.len() as f64),
+            ("lut_rt", carry_route_throughs(built) as f64),
             ("ff", built.ffs.len() as f64),
             ("carry", built.carries.len() as f64),
             ("ramb36", ramb36 as f64),
@@ -666,4 +667,45 @@ fn json_object(fields: &[(&str, f64)]) -> String {
         .map(|(k, v)| format!("\"{k}\":{v:?}"))
         .collect();
     format!("{{{}}}", body.join(","))
+}
+
+/// LUTs that only pass one net into a carry chain's S input. Vivado's
+/// "Slice LUTs" leaves these route-throughs out (the rung 4 design: 30 CARRY4
+/// and 12 LUT1 in its 37), so comparisons with it subtract them. A LUT that
+/// also drives a constant DI from O5 still counts (an incrementer's chain).
+fn carry_route_throughs(p: &helion_xilinx7::pack::Packed7) -> usize {
+    let tie = |n: &str| match n {
+        "0" | "gnd" | "GND" | "$false" | "const0" => Some(0u64),
+        "1" | "vcc" | "VCC" | "$true" | "const1" => Some(1),
+        _ => None,
+    };
+    let mut readers: std::collections::HashMap<&str, (usize, usize)> = std::collections::HashMap::new(); // net -> (carry S reads, other reads)
+    for c in &p.carries {
+        for n in c.s_nets.iter().flatten() {
+            readers.entry(n.as_str()).or_default().0 += 1;
+        }
+    }
+    let others = p
+        .luts
+        .iter()
+        .flat_map(|l| l.input_nets.iter().flatten())
+        .chain(p.ffs.iter().flat_map(|f| [Some(&f.d_net), f.ce_net.as_ref(), f.sr_net.as_ref()].into_iter().flatten()))
+        .chain(p.iobs.iter().map(|i| &i.net));
+    for n in others {
+        readers.entry(n.as_str()).or_default().1 += 1;
+    }
+    p.luts
+        .iter()
+        .filter(|l| {
+            let live: Vec<usize> = (0..6).filter(|&k| l.input_nets[k].as_deref().is_some_and(|n| tie(n).is_none())).collect();
+            let [k] = live[..] else { return false };
+            // O6 equals input k wherever the tied inputs hold their value (A6 high on a dual LUT).
+            let dual = p.dual_luts.contains(&l.name);
+            let identity = (0..64u64).all(|a| {
+                let held = (0..6).all(|j| l.input_nets[j].as_deref().and_then(tie).is_none_or(|v| (a >> j) & 1 == v));
+                !held || (dual && a & 32 == 0) || (l.init >> a) & 1 == (a >> k) & 1
+            });
+            identity && readers.get(l.output_net.as_str()).is_some_and(|&(s, o)| s > 0 && o == 0)
+        })
+        .count()
 }
