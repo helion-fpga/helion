@@ -1645,6 +1645,7 @@ dependencies = [
  "helion-route",
  "helion-sta",
  "helion-sv",
+ "helion-ultrascale",
  "helion-vhdl",
  "rayon",
 ]
@@ -1962,7 +1963,7 @@ dependencies = [
 
 [[package]]
 name = "helion-ultrascale"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "helion-ir",
  "helion-sv",
