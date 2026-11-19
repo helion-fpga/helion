@@ -332,14 +332,14 @@ pub fn pair_carry4_chains(chains: &[Vec<String>]) -> Vec<Carry8Mapping> {
     out
 }
 
-/// FF control group for the CEUSED/CLKINV/SRINV segbits features.
+/// FF control group for the CEUSED/SRUSED/CLKINV/SRINV/SYNC segbits features.
 ///
 /// The vendored DBs carry these features per group, not per FF:
 /// `ABCDFF` (FFs A-D, Q), `EFGHFF` (FFs E-H, Q), `ABCDFF2` (FFs A-D,
-/// Q2), `EFGHFF2` (FFs E-H, Q2) for CEUSED; CLKINV and SRINV exist
-/// only on the Q groups (`ABCDFF`, `EFGHFF`), shared with the Q2 FFs
-/// of the same letters. BEL index 0..15 maps letter = index/2 (A-H),
-/// Q2 = odd index.
+/// Q2), `EFGHFF2` (FFs E-H, Q2) for CEUSED and SRUSED; CLKINV, SRINV,
+/// and SYNC exist only on the Q groups (`ABCDFF`, `EFGHFF`), shared
+/// with the Q2 FFs of the same letters. BEL index 0..15 maps letter =
+/// index/2 (A-H), Q2 = odd index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FfControlGroup {
     Abcd,
@@ -392,33 +392,72 @@ impl FfControlGroup {
             FfControlGroup::Efgh | FfControlGroup::Efgh2 => "EFGHFF.SRINV",
         }
     }
+
+    /// FASM feature prefix for the SRUSED bit of this group.
+    pub fn srused_feature(&self) -> &'static str {
+        match self {
+            FfControlGroup::Abcd => "ABCDFF.SRUSED",
+            FfControlGroup::Efgh => "EFGHFF.SRUSED",
+            FfControlGroup::Abcd2 => "ABCDFF2.SRUSED",
+            FfControlGroup::Efgh2 => "EFGHFF2.SRUSED",
+        }
+    }
+
+    /// FASM feature prefix for the SYNC bit shared by this group and
+    /// its Q2 partner group. Only the Q groups carry the feature.
+    pub fn sync_feature(&self) -> &'static str {
+        match self {
+            FfControlGroup::Abcd | FfControlGroup::Abcd2 => "ABCDFF.SYNC",
+            FfControlGroup::Efgh | FfControlGroup::Efgh2 => "EFGHFF.SYNC",
+        }
+    }
 }
 
-/// Emit FF control FASM for a placed design: one CEUSED line per used
-/// CEUSED group, plus one CLKINV and one SRINV line per used half
-/// (ABCD/EFGH), in deterministic order.
+/// Emit FF control FASM for a placed design: one CEUSED line and one
+/// SRUSED line per used group, plus one CLKINV, one SRINV, and (when
+/// the half has an SR net) one SYNC line per used half (ABCD/EFGH),
+/// in deterministic order.
 ///
-/// Polarity (INTERFACES.md, resolved): for CEUSED, CLKINV, and SRINV,
-/// V0 clears the bit and V1 sets it, the opposite of INIT/SRVAL.
+/// Polarity (INTERFACES.md, resolved): for CEUSED, SRUSED, CLKINV,
+/// and SRINV, V0 clears the bit and V1 sets it, the opposite of
+/// INIT/SRVAL.
 /// - CEUSED is the OR over the group: V1 if any FF in the group has a
-///   CE net, else V0.
+///   CE net, else V0. SRUSED is the same OR over SR nets: V1 if any FF
+///   in the group has an SR net, else V0. SRUSED.V0 is the all-zero
+///   default and means the SR input is ignored, so omitting the line
+///   for an SR-carrying group would silently drop the reset.
 /// - CLKINV/SRINV are always V0 today: the IR carries no clock or
 ///   reset inversion, so no inversion is ever specified. If the IR
 ///   grows inversion, this function must take it as input; emitting V0
 ///   unconditionally then would be a miscompile, so the limitation is
 ///   stated here, not hidden.
-/// - Fail loud if two FFs in one CEUSED group have DIFFERENT CE nets:
-///   the group shares one CEUSED config bit in the DB, so the group
-///   cannot express two different enables. This is a conservative
-///   backstop: pack does not enforce CEUSED groups today, so the
-///   emitter must. If the CTO rules CE is per-FF and CEUSED is only an
-///   OR enable, this check relaxes to the OR rule above.
+/// - SYNC follows the FDRE mapping: Hff maps to FDRE, a synchronous
+///   reset FF, so a half with any SR net emits `{half}.SYNC.SYNC`
+///   (sets the bit; the all-zero default is ASYNC). A half with no SR
+///   net emits no SYNC line: SRUSED.V0 ignores SR there, so SYNC is
+///   don't-care. If a future front end emits asynchronous-reset FFs,
+///   they must map to FDCE and this emitter must take sync/async as
+///   input; emitting SYNC.SYNC for them would be wrong.
+/// - MODE needs no line: the DB default (bit clear) is MODE.FF, and
+///   Hff is always a flip-flop, never a latch.
+/// - Fail loud if two FFs in one CEUSED or SRUSED group have DIFFERENT
+///   CE or SR nets: the group shares one config bit per feature in the
+///   DB, so the group cannot express two different enables or resets.
+///   This is a conservative backstop: pack does not enforce CEUSED or
+///   SRUSED groups today, so the emitter must. If the CTO rules CE/SR
+///   is per-FF and CEUSED/SRUSED is only an OR enable, this check
+///   relaxes to the OR rule above.
 pub fn emit_ff_control_fasm(
     packed: &[PackedUltraSlice],
     placed: &UltraPlaced,
 ) -> Result<Vec<String>, String> {
-    // (site, group) -> (any_ce, ce_net or None for the first CE seen).
-    let mut groups: HashMap<(String, FfControlGroup), (bool, Option<String>)> = HashMap::new();
+    // (site, group) -> (any_ce, ce_net, any_sr, sr_net). The net is the
+    // first CE/SR net seen in the group; a second, different net fails
+    // loud below.
+    let mut groups: HashMap<
+        (String, FfControlGroup),
+        (bool, Option<String>, bool, Option<String>),
+    > = HashMap::new();
     // site -> (half ABCD?, half EFGH?) present.
     let mut halves: HashMap<String, (bool, bool)> = HashMap::new();
     for p in &placed.slices {
@@ -431,9 +470,10 @@ pub fn emit_ff_control_fasm(
         for (bel, _) in &slice.ffs {
             let group = FfControlGroup::for_ff(*bel)?;
             let ce = slice.ff_ce.get(bel).cloned().flatten();
+            let sr = slice.ff_sr.get(bel).cloned().flatten();
             let entry = groups
                 .entry((p.site.clone(), group))
-                .or_insert((false, None));
+                .or_insert((false, None, false, None));
             if ce.is_some() {
                 if let Some(seen) = &entry.1 {
                     if seen != ce.as_ref().unwrap() {
@@ -449,6 +489,21 @@ pub fn emit_ff_control_fasm(
                 entry.0 = true;
                 entry.1 = ce;
             }
+            if sr.is_some() {
+                if let Some(seen) = &entry.3 {
+                    if seen != sr.as_ref().unwrap() {
+                        return Err(format!(
+                            "ULTRA SYNTHMAP: FFs in SRUSED group {:?} at {} have different \
+                             SR nets ({seen} vs {}); the group shares one SRUSED config bit",
+                            group,
+                            p.site,
+                            sr.as_ref().unwrap()
+                        ));
+                    }
+                }
+                entry.2 = true;
+                entry.3 = sr;
+            }
             let h = halves.entry(p.site.clone()).or_insert((false, false));
             if *bel < 8 {
                 h.0 = true;
@@ -460,15 +515,30 @@ pub fn emit_ff_control_fasm(
     let mut lines: Vec<String> = Vec::new();
     let mut group_keys: Vec<(String, FfControlGroup)> = groups.keys().cloned().collect();
     group_keys.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| (a.1 as u8).cmp(&(b.1 as u8))));
-    for (site, group) in group_keys {
-        let (any_ce, _) = groups[&(site.clone(), group)];
+    for (site, group) in &group_keys {
+        let (any_ce, _, _, _) = groups[&(site.clone(), *group)];
         let v = if any_ce { 1 } else { 0 };
         lines.push(format!("{site}.{}.V{v}", group.ceused_feature()));
+    }
+    for (site, group) in &group_keys {
+        let (_, _, any_sr, _) = groups[&(site.clone(), *group)];
+        let v = if any_sr { 1 } else { 0 };
+        lines.push(format!("{site}.{}.V{v}", group.srused_feature()));
     }
     let mut sites: Vec<String> = halves.keys().cloned().collect();
     sites.sort();
     for site in sites {
         let (abcd, efgh) = halves[&site];
+        let half_has_sr = |group: FfControlGroup, group2: FfControlGroup| {
+            groups
+                .get(&(site.clone(), group))
+                .map(|g| g.2)
+                .unwrap_or(false)
+                || groups
+                    .get(&(site.clone(), group2))
+                    .map(|g| g.2)
+                    .unwrap_or(false)
+        };
         if abcd {
             lines.push(format!(
                 "{site}.{}.V0",
@@ -478,6 +548,9 @@ pub fn emit_ff_control_fasm(
                 "{site}.{}.V0",
                 FfControlGroup::Abcd.srinv_feature()
             ));
+            if half_has_sr(FfControlGroup::Abcd, FfControlGroup::Abcd2) {
+                lines.push(format!("{site}.{}", FfControlGroup::Abcd.sync_feature()));
+            }
         }
         if efgh {
             lines.push(format!(
@@ -488,6 +561,9 @@ pub fn emit_ff_control_fasm(
                 "{site}.{}.V0",
                 FfControlGroup::Efgh.srinv_feature()
             ));
+            if half_has_sr(FfControlGroup::Efgh, FfControlGroup::Efgh2) {
+                lines.push(format!("{site}.{}", FfControlGroup::Efgh.sync_feature()));
+            }
         }
     }
     Ok(lines)
@@ -770,6 +846,14 @@ mod tests {
             lines.contains(&format!("{site}.ABCDFF.SRINV.V0")),
             "got {lines:?}"
         );
+        assert!(
+            lines.contains(&format!("{site}.ABCDFF.SRUSED.V0")),
+            "got {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("SYNC")),
+            "no SR net, so no SYNC line is emitted, got {lines:?}"
+        );
     }
 
     #[test]
@@ -790,6 +874,82 @@ mod tests {
             lines.contains(&format!("{site}.ABCDFF.CEUSED.V1")),
             "got {lines:?}"
         );
+    }
+
+    #[test]
+    fn ff_control_fasm_with_sr_emits_srused_v1_and_sync() {
+        // An FF with an SR net but no CE: CEUSED stays V0, SRUSED goes
+        // V1, and the half emits SYNC.SYNC (FDRE, synchronous reset).
+        let limits = ControlSetLimits::default();
+        let luts = vec![("lut0".to_string(), 0xAAAAAAAAAAAAAAAAu64, false)];
+        let ffs = vec![(
+            "q_reg".to_string(),
+            "clk".to_string(),
+            None,
+            Some("rst".to_string()),
+        )];
+        let packed = pack_ultra(&luts, &ffs, &[], &limits).unwrap();
+        let placed = place_ultra(&packed.slices, &SmallGrid, &UltraPlaceOpts::default()).unwrap();
+        let lines = emit_ff_control_fasm(&packed.slices, &placed).unwrap();
+        let site = &placed.slices[0].site;
+        assert!(
+            lines.contains(&format!("{site}.ABCDFF.CEUSED.V0")),
+            "got {lines:?}"
+        );
+        assert!(
+            lines.contains(&format!("{site}.ABCDFF.SRUSED.V1")),
+            "got {lines:?}"
+        );
+        assert!(
+            lines.contains(&format!("{site}.ABCDFF.SYNC.SYNC")),
+            "got {lines:?}"
+        );
+        assert!(
+            lines.contains(&format!("{site}.ABCDFF.CLKINV.V0")),
+            "got {lines:?}"
+        );
+        assert!(
+            lines.contains(&format!("{site}.ABCDFF.SRINV.V0")),
+            "got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn ff_control_fasm_different_sr_in_one_group_fails_loud() {
+        // Two FFs in the ABCD group (BELs 0 and 2) with different SR
+        // nets: the shared SRUSED bit cannot express both.
+        let mut slice = PackedUltraSlice::new("SLICE_X0Y0".to_string(), SliceKind::Logic);
+        for (bel, name, sr) in [(0u8, "qa", "rst_a"), (2u8, "qb", "rst_b")] {
+            slice.ffs.insert(bel, name.to_string());
+            slice.ff_clk.insert(bel, "clk".to_string());
+            slice.ff_ce.insert(bel, None);
+            slice.ff_sr.insert(bel, Some(sr.to_string()));
+        }
+        let packed = vec![slice];
+        let placed = UltraPlaced {
+            slices: vec![crate::place::PlacedUltraSlice {
+                packed_idx: 0,
+                site: "SLICE_X0Y0".to_string(),
+                tile: "CLB_X0Y0".to_string(),
+                x: 0,
+                y: 0,
+            }],
+            seed: 0,
+        };
+        let err = emit_ff_control_fasm(&packed, &placed).unwrap_err();
+        assert!(err.contains("different"), "got {err}");
+        assert!(err.contains("SRUSED"), "got {err}");
+    }
+
+    #[test]
+    fn ff_control_group_srused_sync_features() {
+        assert_eq!(FfControlGroup::Abcd.srused_feature(), "ABCDFF.SRUSED");
+        assert_eq!(FfControlGroup::Efgh.srused_feature(), "EFGHFF.SRUSED");
+        assert_eq!(FfControlGroup::Abcd2.srused_feature(), "ABCDFF2.SRUSED");
+        assert_eq!(FfControlGroup::Efgh2.srused_feature(), "EFGHFF2.SRUSED");
+        // SYNC is shared with the Q2 partner group, like CLKINV/SRINV.
+        assert_eq!(FfControlGroup::Abcd2.sync_feature(), "ABCDFF.SYNC");
+        assert_eq!(FfControlGroup::Efgh2.sync_feature(), "EFGHFF.SYNC");
     }
 
     #[test]
