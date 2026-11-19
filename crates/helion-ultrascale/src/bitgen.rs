@@ -705,12 +705,15 @@ pub fn emit_frames(
     for entry in &entries {
         // URAM288 has no public encoding: fail with the named error
         // rather than the generic unknown-tile / unknown-feature
-        // errors, so the blocker is visible. Checked on the tile name
-        // and feature first (the device file resolves no URAM tile),
-        // and again on the resolved tile type below, so a future
+        // errors, so the blocker is visible. The detector in
+        // crate::uram covers URAM tiles, URAM-named features, and
+        // bare URAM288 attribute names (UG974), and runs before any
+        // lookup so that even a segbits entry for the feature (which
+        // could only come from a non-public source) is never trusted.
+        // Checked again on the resolved tile type below, so a future
         // device file that resolves URAM tiles still fails loud here
         // until a URAM segbits encoding lands.
-        if entry.tile.contains("URAM") || entry.feature.contains("URAM") {
+        if crate::uram::is_uram288_entry(&entry.tile, &entry.feature) {
             return Err(BitgenError::UramBlocked {
                 tile: entry.tile.clone(),
                 feature: entry.feature.clone(),
@@ -1752,6 +1755,48 @@ mod tests {
             BitgenError::UramBlocked {
                 tile: "SLICE_X0Y0".to_string(),
                 feature: "URAM288.OREG_A".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn uram_bare_attribute_on_slice_fails_loud() {
+        // A bare URAM288 attribute name (UG974) on a non-URAM tile is
+        // still a URAM request: the detector in crate::uram catches
+        // it before the segbits lookup, so it cannot fall through to
+        // UnknownFeature.
+        let (device, db) = one_bit_db();
+        let err = emit_frames("SLICE_X0Y0.OREG_A\n", &device, &db).unwrap_err();
+        assert_eq!(
+            err,
+            BitgenError::UramBlocked {
+                tile: "SLICE_X0Y0".to_string(),
+                feature: "OREG_A".to_string()
+            }
+        );
+        let err = emit_frames("SLICE_X0Y0.EN_ECC_RD_B\n", &device, &db).unwrap_err();
+        assert_eq!(
+            err,
+            BitgenError::UramBlocked {
+                tile: "SLICE_X0Y0".to_string(),
+                feature: "EN_ECC_RD_B".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn cascade_order_bare_name_is_not_uram_blocked() {
+        // CASCADE_ORDER_A/B are also RAMB36E2 attributes (UG974), so
+        // the bare name on a non-URAM tile must stay UnknownFeature,
+        // never UramBlocked. The URAM spelling still blocks when the
+        // tile or feature names URAM (see the uram_tile tests).
+        let (device, db) = one_bit_db();
+        let err = emit_frames("SLICE_X0Y0.CASCADE_ORDER_A\n", &device, &db).unwrap_err();
+        assert_eq!(
+            err,
+            BitgenError::UnknownFeature {
+                tile: "SLICE_X0Y0".to_string(),
+                feature: "CASCADE_ORDER_A".to_string()
             }
         );
     }
