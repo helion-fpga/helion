@@ -24,8 +24,8 @@ pub mod int_pip;
 pub mod legality;
 pub mod pack;
 pub mod place;
-pub mod router;
 pub mod route_to_pip;
+pub mod router;
 pub mod segbits;
 pub mod sta;
 pub mod timing_db;
@@ -60,12 +60,12 @@ pub use pack::{ControlSetLimits, PackedUltraSlice, SliceKind, UltraBel, UltraPac
 pub use place::{
     PlacedUltraSlice, UltraGrid, UltraPlaceOpts, UltraPlaced, place_ultra, seeded_order,
 };
+pub use route_to_pip::{
+    RouteToPipError, TranslatedRoute, translate_route, translate_route_with, translate_routes,
+    translate_routes_with, translated_to_fasm,
+};
 pub use router::{
     RoutableNet, RouteError, RouteErrorKind, UltraRouteOpts, UltraRouted, route_ultra,
-};
-pub use route_to_pip::{
-    RouteToPipError, TranslatedRoute, translate_route, translate_route_with,
-    translate_routes, translate_routes_with, translated_to_fasm,
 };
 pub use segbits::{BitRef, FileSegbitsDb, SegbitsDb, SegbitsLoadError};
 pub use sta::{StaNetlist, TimingReport, sta_routed};
