@@ -77,13 +77,20 @@ silently dropped and never fuzzed under a guessed spelling.
   attributes. Whatever the enumeration finds is fuzzed; whatever it
   does not find is logged as not present.
 - **MMCME4_ADV** (`scripts/clk-fuzz/mmcm_top.v`): the driver
-  enumerates all cell properties at runtime (dozens expected:
-  CLKOUT divide/multiply, CLKFBOUT, DIVCLK_DIVIDE, phase, duty,
-  bandwidth, compensation, and the IS_*_INVERTED set). No attribute
-  list is hardcoded here; the run log must list every property
-  fuzzed. This is the largest sub-pass; it runs last.
+  enumerates the placed cell's properties at runtime and fuzzes its
+  IS_*_INVERTED booleans; every other property (CLKOUT divide /
+  multiply, CLKFBOUT, DIVCLK_DIVIDE, phase, duty, bandwidth,
+  compensation) is logged in `runs.txt` as skipped-not-fuzzed, because
+  a bare 0/1 value cannot tell a boolean from an integer attribute
+  (DIVCLK_DIVIDE reads back as "1"; flipping it to 0 would be an
+  invalid divide value). Integer/enum attributes need per-attribute
+  value tables, which is future work: SPEC.md keeps MMCM/PLL
+  attribute fuzzing out of scope until a design needs it. The run log
+  lists every property considered, fuzzed or skipped. This is the
+  largest sub-pass; it runs last.
 - **PLLE4_ADV** (`scripts/clk-fuzz/pll_top.v`): same runtime
-  enumeration as MMCM.
+  enumeration as MMCM (IS_*_INVERTED booleans fuzzed, every other
+  property logged as skipped-not-fuzzed).
 
 ## Audit dumps (no bitstream needed, run first)
 
