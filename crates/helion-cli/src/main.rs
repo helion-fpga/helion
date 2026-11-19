@@ -341,6 +341,7 @@ fn main() {
         "synth" => cmd_synth(&args),
         "equiv" => cmd_equiv(&args),
         "impl" => cmd_impl(&args),
+        "multiseed" => cmd_multiseed(&args),
         "run" => cmd_run(&args),
         "report_timing" => cmd_timing(&args),
         "report_utilization" => cmd_util(&args),
@@ -570,6 +571,38 @@ fn cmd_equiv(args: &[String]) {
             eprintln!("equiv error: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// `helion multiseed <design> --part xcku3p --seeds N --seed-start S
+/// --jobs J --out FILE --threshold WNS_PS`.
+///
+/// UltraScale+ multi-seed timing-closure sweep (port of the proof on
+/// fm/ultra-multiseed e1c2e47). Non-UltraScale+ parts are rejected:
+/// the HL10T flow has its own place/route and no ultra seed contract.
+/// WNS is a preliminary estimate and route is blocked for every seed
+/// on this base; see `ultra::run_multiseed`.
+fn cmd_multiseed(args: &[String]) {
+    let path = positional(args).unwrap_or("examples/blinky.sv");
+    let part = take_flag(args, "--part").unwrap_or_else(|| "xcku3p".into());
+    let n_seeds: u64 = take_flag(args, "--seeds")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let seed_start: u64 = take_flag(args, "--seed-start")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let jobs: usize = take_flag(args, "--jobs")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let out_path = take_flag(args, "--out").unwrap_or_else(|| "multiseed_results.jsonl".into());
+    let threshold: i64 = take_flag(args, "--threshold")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if let Err(e) =
+        ultra::run_multiseed(path, &part, n_seeds, seed_start, jobs, &out_path, threshold)
+    {
+        eprintln!("multiseed: {e}");
+        std::process::exit(1);
     }
 }
 

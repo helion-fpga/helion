@@ -22,6 +22,7 @@ pub mod fasm_gen;
 pub mod grid;
 pub mod int_pip;
 pub mod legality;
+pub mod multiseed;
 pub mod pack;
 pub mod place;
 pub mod router;
@@ -54,6 +55,10 @@ pub use int_pip::{
     missing_pip_report, resolve_pips, verify_zero_bits,
 };
 pub use legality::{LegalityViolation, check_legality};
+pub use multiseed::{
+    MultiseedSummary, SeedResult, best_seed_line, read_completed_seeds, select_best_seed,
+    summarize_multiseed,
+};
 pub use pack::{ControlSetLimits, PackedUltraSlice, SliceKind, UltraBel, UltraPacked, pack_ultra};
 pub use place::{
     PlacedUltraSlice, UltraGrid, UltraPlaceOpts, UltraPlaced, place_ultra, seeded_order,
