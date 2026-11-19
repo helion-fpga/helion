@@ -341,8 +341,9 @@ pub fn run_impl(path: &str, part: &str, seed: u64) -> Result<(), String> {
         .map_err(|e| format!("ULTRA FASM: {e}"))?;
     println!("hang_diag ultra fasm ff_lines={}", ff_fasm.len());
 
-    // FF control FASM (CEUSED/CLKINV/SRINV per group, synthmap): fails
-    // loud if two FFs in one CEUSED group have different CE nets. Like
+    // FF control FASM (CEUSED/SRUSED/CLKINV/SRINV/SYNC per group,
+    // synthmap): fails loud if two FFs in one group have different CE
+    // or SR nets. Like
     // the INIT/SRVAL lines above, these are generated here and consumed
     // by the BITGEN stage once ROUTE lands.
     let ff_control_fasm =
