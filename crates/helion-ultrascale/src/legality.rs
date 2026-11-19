@@ -489,10 +489,11 @@ mod tests {
             y: 1,
         }];
         let violations = check_legality(&vec![s0], &placed, &grid, &limits);
-        assert!(violations.iter().any(|v| matches!(
-            v,
-            LegalityViolation::UnknownPackedIndex { index: 7 }
-        )));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, LegalityViolation::UnknownPackedIndex { index: 7 }))
+        );
     }
 
     #[test]
@@ -510,10 +511,11 @@ mod tests {
             y: 99,
         }];
         let violations = check_legality(&vec![s0], &placed, &grid, &limits);
-        assert!(violations.iter().any(|v| matches!(
-            v,
-            LegalityViolation::UnknownSite { .. }
-        )));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, LegalityViolation::UnknownSite { .. }))
+        );
     }
 
     #[test]
@@ -542,10 +544,11 @@ mod tests {
             },
         ];
         let violations = check_legality(&vec![s0, s1], &placed, &grid, &limits);
-        assert!(violations.iter().any(|v| matches!(
-            v,
-            LegalityViolation::MultipleCarry8 { .. }
-        )));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, LegalityViolation::MultipleCarry8 { .. }))
+        );
     }
 
     #[test]
@@ -595,9 +598,10 @@ mod tests {
             },
         ];
         let violations = check_legality(&vec![s0, s1], &placed, &grid, &limits);
-        assert!(violations.iter().any(|v| matches!(
-            v,
-            LegalityViolation::CarryChainBroken { .. }
-        )));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, LegalityViolation::CarryChainBroken { .. }))
+        );
     }
 }

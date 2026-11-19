@@ -58,8 +58,8 @@ pub use int_pip::{
 pub use legality::{LegalityViolation, check_legality};
 pub use pack::{ControlSetLimits, PackedUltraSlice, SliceKind, UltraBel, UltraPacked, pack_ultra};
 pub use place::{
-    PlacedUltraSlice, UltraGrid, UltraPlaceOpts, UltraPlaced, place_ultra,
-    render_placed_netlist, seeded_order,
+    PlacedUltraSlice, UltraGrid, UltraPlaceOpts, UltraPlaced, place_ultra, render_placed_netlist,
+    seeded_order,
 };
 pub use router::{
     RoutableNet, RouteError, RouteErrorKind, UltraRouteOpts, UltraRouted, route_ultra,

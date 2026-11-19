@@ -17,8 +17,8 @@
 //! from the device file, not a verified Vivado tile X (see
 //! PACKPLACE_INVENTORY.md, G-F2a).
 
-use helion_ultrascale::device_grid::DeviceFileGrid;
 use helion_ultrascale::device_file::DeviceFile;
+use helion_ultrascale::device_grid::DeviceFileGrid;
 use helion_ultrascale::legality::check_legality;
 use helion_ultrascale::pack::{ControlSetLimits, pack_ultra};
 use helion_ultrascale::place::{UltraPlaceOpts, place_ultra, render_placed_netlist};
@@ -130,7 +130,11 @@ fn carry_chain_of_four_is_vertically_contiguous_on_device_grid() {
     ordered.sort_by_key(|p| p.y);
     for w in 1..ordered.len() {
         assert_eq!(ordered[w].x, ordered[w - 1].x, "chain X must be constant");
-        assert_eq!(ordered[w].y, ordered[w - 1].y + 1, "chain Y must ascend by 1");
+        assert_eq!(
+            ordered[w].y,
+            ordered[w - 1].y + 1,
+            "chain Y must ascend by 1"
+        );
     }
 
     let violations = check_legality(&packed.slices, &placed.slices, &grid, &limits);
