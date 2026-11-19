@@ -29,9 +29,9 @@
 //   zedbit examples/zedboard_fill.sv,examples/zedboard_bram_fill.sv,examples/zedboard_dsp_fill_prims.sv
 //          examples/zedboard_bram_fill.xdc out.bit zedboard_fill
 module zedboard_fill #(
-    parameter int          LANES   = 960,
+    parameter int          LANES   = 1040, // 960 until synchronous resets went on SR (7549af3) and the DSP part shrank
     parameter int          NCYC    = 1024,
-    parameter logic [31:0] EXP_LUT = 32'h4658B7EB
+    parameter logic [31:0] EXP_LUT = 32'h45D1E1CB
 ) (
     input  logic       clk,
     input  logic       rst,
