@@ -128,9 +128,21 @@ struct IntTilePipJson {
 
 /// Span-wire naming: `<DIR><LEN>[_E|_W]_(BEG|END)<n>`, e.g.
 /// `NN12_BEG7`, `EE2_E_END3`, `SS1_W_BEG0`. DIR is NN/SS/EE/WW, LEN
-/// is 1, 2, 4, or 12. Returns (direction unit, span, side suffix,
-/// is_begin, index) on a match.
-fn parse_span_wire(name: &str) -> Option<((i32, i32), i32, &str, bool, &str)> {
+/// is 1, 2, 4, or 12.
+struct SpanWire<'a> {
+    /// Direction unit vector: (0, 1) NN, (0, -1) SS, (1, 0) EE, (-1, 0) WW.
+    dir: (i32, i32),
+    /// Span length in tiles.
+    len: i32,
+    /// `_E` / `_W` side suffix, or "" when absent.
+    side: &'a str,
+    /// True when this end is BEG, false when END.
+    is_beg: bool,
+    /// Numeric index after BEG/END.
+    idx: &'a str,
+}
+
+fn parse_span_wire(name: &str) -> Option<SpanWire<'_>> {
     let (head, kind_idx) = match name.find("_BEG") {
         Some(i) => (&name[..i], Some((i, true))),
         None => match name.find("_END") {
@@ -167,7 +179,13 @@ fn parse_span_wire(name: &str) -> Option<((i32, i32), i32, &str, bool, &str)> {
         "WW12" => ((-1, 0), 12),
         _ => return None,
     };
-    Some((dir, len, side, is_beg, idx))
+    Some(SpanWire {
+        dir,
+        len,
+        side,
+        is_beg,
+        idx,
+    })
 }
 
 /// The partner wire of a span wire: same base, BEG swapped for END or
@@ -175,7 +193,12 @@ fn parse_span_wire(name: &str) -> Option<((i32, i32), i32, &str, bool, &str)> {
 /// partner's tile, plus whether this wire is the BEG end. `None` when
 /// the name is not a span wire.
 fn continuation_partner(name: &str) -> Option<(String, (i32, i32), bool)> {
-    let ((dx, dy), len, side, is_beg, idx) = parse_span_wire(name)?;
+    let span = parse_span_wire(name)?;
+    let (dx, dy) = span.dir;
+    let len = span.len;
+    let side = span.side;
+    let is_beg = span.is_beg;
+    let idx = span.idx;
     // Rebuild the base from the parsed parts so the partner name is
     // exact: DIR + LEN + optional _E/_W + BEG/END + index.
     let base = format!(
