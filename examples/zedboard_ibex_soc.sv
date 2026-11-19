@@ -16,7 +16,10 @@
 // Build with VERILATOR defined (ysyx_ibex takes its clock from the pin then):
 //   HELION_DEFINES=VERILATOR zedbit examples/ysyx_ibex.sv,examples/zedboard_ibex_soc.sv
 //       examples/zedboard_ibex_soc.xdc out.bit zedboard_ibex_soc
-module zedboard_ibex_soc (
+module zedboard_ibex_soc #(
+    // 1: run the multiply test of zedboard_ibex_mul.sv instead of the counter.
+    parameter bit MUL_TEST = 1'b0
+) (
     input  logic       clk,
     output logic [7:0] led
 );
@@ -45,7 +48,31 @@ module zedboard_ibex_soc (
 
     // Program ROM, word-addressed; everything else is a NOP.
     function automatic logic [31:0] rom(input logic [5:0] a);
-        case (a)
+        if (MUL_TEST) case (a)
+            6'd32: rom = 32'h100000B7;
+            6'd33: rom = 32'h9E378137;
+            6'd34: rom = 32'h9B910113;
+            6'd35: rom = 32'h7F4A81B7;
+            6'd36: rom = 32'h7C118193;
+            6'd37: rom = 32'h02310233;
+            6'd38: rom = 32'h023112B3;
+            6'd39: rom = 32'h02313333;
+            6'd40: rom = 32'h023123B3;
+            6'd41: rom = 32'h00524433;
+            6'd42: rom = 32'h00644433;
+            6'd43: rom = 32'h00744433;
+            6'd44: rom = 32'h01045493;
+            6'd45: rom = 32'h00944433;
+            6'd46: rom = 32'h00845493;
+            6'd47: rom = 32'h00944433;
+            6'd48: rom = 32'h0080A023;
+            6'd49: rom = 32'h00410133;
+            6'd50: rom = 32'h0051C1B3;
+            6'd51: rom = 32'h03518193;
+            6'd52: rom = 32'hFC5FF06F;
+            default: rom = 32'h00000013;
+        endcase
+        else case (a)
             6'd32: rom = 32'h100000B7;
             6'd33: rom = 32'h00000113;
             6'd34: rom = 32'h0020A023;
