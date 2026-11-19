@@ -25,9 +25,11 @@ pub mod legality;
 pub mod pack;
 pub mod place;
 pub mod router;
+pub mod route_to_pip;
 pub mod segbits;
 pub mod sta;
 pub mod timing_db;
+pub mod wire_db;
 
 pub use bel::{Bel, BelKind, ClbBelInventory, TileId, TileKind};
 pub use bitgen::{
@@ -50,8 +52,8 @@ pub use fabric::{
 };
 pub use fasm_gen::{FfAttr, emit_ff_fasm, ff_init_fasm_line, ff_srval_fasm_line};
 pub use int_pip::{
-    EmittedPip, IntPip, IntPipError, MissingPip, PipResolution, emit_pips, emitted_to_fasm,
-    missing_pip_report, resolve_pips, verify_zero_bits,
+    BidirDir, EmittedPip, IntPip, IntPipError, MissingPip, PipResolution, emit_pips,
+    emitted_to_fasm, missing_pip_report, resolve_pips, verify_zero_bits,
 };
 pub use legality::{LegalityViolation, check_legality};
 pub use pack::{ControlSetLimits, PackedUltraSlice, SliceKind, UltraBel, UltraPacked, pack_ultra};
@@ -61,6 +63,11 @@ pub use place::{
 pub use router::{
     RoutableNet, RouteError, RouteErrorKind, UltraRouteOpts, UltraRouted, route_ultra,
 };
+pub use route_to_pip::{
+    RouteToPipError, TranslatedRoute, translate_route, translate_route_with,
+    translate_routes, translate_routes_with, translated_to_fasm,
+};
 pub use segbits::{BitRef, FileSegbitsDb, SegbitsDb, SegbitsLoadError};
 pub use sta::{StaNetlist, TimingReport, sta_routed};
 pub use timing_db::{DelaySource, SourcedDelay, UltraScaleTimingDb, preliminary_xcvu3p};
+pub use wire_db::{IntTile, IntTileWireDb, WireDbError};
