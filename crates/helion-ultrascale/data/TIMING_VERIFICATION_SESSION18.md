@@ -59,18 +59,30 @@ the source strings so each says it is an assumed allocation within the
 forum 0.3 ns level. The values themselves do not change; they stay
 Ballpark and the reports stay labeled estimate.
 
-### V-2: STA cannot run on counter.sv (carry chains dropped)
+### V-2: STA dropped Carry4 cells (latent; NOT exercised by counter.sv)
 
-`sta_on_placed` in `crates/helion-cli/src/ultra.rs` builds drivers and
-fanin only for `Lut6` and `Hff` cells. A counter (`cnt <= cnt + 1`)
-synthesizes to `Carry4` cells whose `O{lane}` sum outputs drive the FF
-D pins, so those D nets have no driver and `sta_routed` errors with
-`timing: no driver for net ...`. STA therefore runs on blinky (one LUT
-plus one FF) but fails on counter before ROUTE is even reached. The
-carry8 DB fields are also never consumed by `sta_routed`. Fix: model
-Carry4 cells in the STA netlist with the carry8 `s_to_o` delay, with
-regression tests on a carry-chain netlist and an end-to-end `helion
-impl` run on blinky and counter through the STA stage.
+CORRECTION, recorded after the end-to-end runs: the original V-2
+wording ("STA cannot run on counter.sv") was wrong. `helion impl`
+on the shipped counter.sv reports `carry_chains=0`: the synth path
+emits 4 LUTs and 4 FFs, no Carry4 cells, so STA ran fine on counter
+with or without this fix. A 32-bit counter probe (/tmp/widecounter.sv)
+also reports `carry_chains=0` (110 LUTs), and no caller of
+`extract_carry4_chains_from_luts` exists in helion-sv (only the
+re-export in helion-ir lib.rs), so today no synth path in this flow
+produces Carry4 cells at all.
+
+What V-2 actually is: a latent defect. `sta_on_placed` built drivers
+and fanin only for `Lut6` and `Hff` cells, so any future design that
+DOES synthesize Carry4 cells (the extractor exists, pack/place and
+the STA stack all handle Carry4) would fail STA with
+`timing: no driver for net ...` on every carry-driven FF D pin, and
+the carry8 DB fields were never consumed by `sta_routed`. Fix (kept):
+model Carry4 cells in the STA netlist with the carry8 `s_to_o`
+delay, covered by unit tests (carry path hand-computed at 550 ps,
+UNKNOWN s_to_o fails loud). The fix is verified at unit level, not
+end-to-end: no in-repo design exercises the carry path through
+`helion impl` today. When a synth path starts emitting Carry4, rerun
+`helion impl` on a carry design to close that loop.
 
 ## What is still genuinely unblockable
 
@@ -81,4 +93,28 @@ by the spot checks above. Unblocker (unchanged): licensed Vivado
 `report_timing` plus `write_sdf` on probe designs, per
 TIMING_XCKU3P.md section 5. License state UNKNOWN; no check run.
 Until then STA runs on the preliminary ballpark DB and every report is
-labeled estimate. No delay number was invented to get around this.
+labeled estimate. ## End-to-end STA runs (this session, real `helion` binary)
+
+Built with `cargo build -j1 -p helion-cli --offline --bin helion`
+(Finished dev profile in 2m 50s, 2 pre-existing bin warnings, none in
+ultra.rs). All four runs print the `hang_diag timing` line with
+`estimate=1` and then fail loud at ROUTE (expected: GAP-F4 owns the
+empty WireDb, not this workstream).
+
+- blinky, xcku3p: `luts=1 ffs=1 carry_chains=0`, 1 slice, legality ok,
+  `hang_diag timing WNS_PS=9650 TNS_PS=0 endpoints=1 r2r_ps=270
+  iob_ps=0 ms=0 estimate=1`. Hand check: 150 ckq + 120 lut + 0 wire
+  (same slice) = 270; WNS = 10000 - 80 - 270 = 9650. Correct.
+- counter, xcku3p: `luts=4 ffs=4 carry_chains=0`, 1 slice, legality
+  ok, `hang_diag timing WNS_PS=9650 TNS_PS=0 endpoints=4 r2r_ps=270
+  iob_ps=0 ms=0 estimate=1`. Same per-path arithmetic, 4 endpoints.
+  Helion exit code 1 (the ROUTE fail-loud, as designed).
+- blinky and counter, xcvu3p: identical timing lines (same
+  preliminary DB values, different part name only).
+- 32-bit counter probe (/tmp/widecounter.sv, xcku3p): `luts=110
+  ffs=32 carry_chains=0`, 14 slices, `WNS_PS=-250 TNS_PS=-380
+  endpoints=32 r2r_ps=10170 estimate=1`. STA finds a real (estimated)
+  violation on a long LUT ripple path: the estimator is not vacuous.
+
+No delay number was invented to get around this.
+
