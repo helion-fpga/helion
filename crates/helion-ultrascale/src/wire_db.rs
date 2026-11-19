@@ -567,9 +567,18 @@ mod tests {
             .all(|w| db.wire_info(*w).unwrap().tile == "INT_X12Y57");
         assert!(beg_same);
         // NN12_END7 in (12,45) is fed by NN12_BEG7 in (12,33), which
-        // is not instantiated, so it has no continuation edge here.
+        // is not instantiated, so it has no continuation edge here:
+        // every fanout target of END7 stays in its own tile. (It does
+        // have a same-tile PIP edge to NN12_BEG7 in (12,45): END feeds
+        // BEG through one PIP inside the tile, so a bare
+        // `!fanout(end45).contains(&beg)` check would be wrong.)
         let end45 = db.wire_id("INT_X12Y45", "NN12_END7").unwrap();
-        assert!(!db.fanout(end45).contains(&beg));
+        let end_same = db
+            .fanout(end45)
+            .iter()
+            .all(|w| db.wire_info(*w).unwrap().tile == "INT_X12Y45");
+        assert!(end_same);
+        assert!(!db.is_continuation(end45, beg));
         // Short spans: EE2_E_BEG3 in (12,45) needs (14,45), absent.
         let ee = db.wire_id("INT_X12Y45", "EE2_E_BEG3").unwrap();
         assert!(db.fanout(ee).is_empty());

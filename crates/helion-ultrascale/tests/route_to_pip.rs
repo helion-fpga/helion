@@ -16,7 +16,7 @@ use helion_ultrascale::route_to_pip::translated_to_fasm;
 use helion_ultrascale::{
     emit_pips, route_ultra, translate_routes, verify_zero_bits, Bel, BelKind, FileSegbitsDb,
     IntTile, IntTileWireDb, RoutableNet, RouteErrorKind, TileId, UltraPlaceOpts, UltraRouteOpts,
-    UltraScaleDevice,
+    UltraScaleDevice, WireDb,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
