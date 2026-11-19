@@ -235,6 +235,19 @@ pub struct SigInfo {
 /// The flops of one clocked process for one signal: bit `i` is a flop when
 /// `mask[i]`, with data input bit `i` of `d`.
 /// The part of a concatenation (MSB first) holding bit `i`, and the bit in it.
+/// Bit `i` of `n` when it is a constant.
+fn const_bit(dag: &Dag, n: N, i: u32) -> Result<Option<bool>, String> {
+    Ok(match dag.op(n) {
+        Op::Const(b) => Some(b[i as usize]),
+        Op::Slice(a, lo) => const_bit(dag, *a, lo + i)?,
+        Op::Concat(parts) => {
+            let (p, k) = concat_part(dag, parts, i)?;
+            const_bit(dag, p, k)?
+        }
+        _ => None,
+    })
+}
+
 fn concat_part(dag: &Dag, parts: &[N], i: u32) -> Result<(N, u32), String> {
     let mut off = 0;
     for p in parts.iter().rev() {
@@ -548,6 +561,39 @@ impl<'a> Blaster<'a> {
         };
         memo.insert((n, i), r);
         Ok(r)
+    }
+
+    /// Bit `i` of `n` as a flop's next value with a synchronous reset on
+    /// top: `(select literal, value, rest)` when the outermost select is a
+    /// mux with a constant arm (`if (rst) q <= K; else ...`), the flop
+    /// loading `value` while the select is 1 and `rest` (a node and bit)
+    /// otherwise. Only the outermost mux counts: a reset under an enable
+    /// must not override it, and the SR pin does.
+    fn sync_reset(&mut self, n: N, i: u32) -> Result<Option<(Lit, bool, N, u32)>, String> {
+        let dag = &self.flat.dag;
+        match dag.op(n).clone() {
+            Op::Slice(a, lo) => self.sync_reset(a, lo + i),
+            Op::Concat(parts) => {
+                let (p, k) = concat_part(dag, &parts, i)?;
+                self.sync_reset(p, k)
+            }
+            Op::Mux(s, a, b) => {
+                let ca = const_bit(dag, a, i)?;
+                let cb = const_bit(dag, b, i)?;
+                let (inv, v, rest) = match (ca, cb) {
+                    (Some(_), Some(_)) => return Ok(None),
+                    (Some(v), None) => (0, v, b),
+                    (None, Some(v)) => (1, v, a),
+                    (None, None) => return Ok(None),
+                };
+                let sel = self.bit(s, 0)?;
+                if sel == TRUE || sel == FALSE {
+                    return Ok(None);
+                }
+                Ok(Some((sel ^ inv, v, rest, i)))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn bit(&mut self, n: N, i: u32) -> Result<Lit, String> {
@@ -923,6 +969,9 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
         arst: Option<(Lit, bool)>,
         /// Clock enable (Xilinx flow), else the hold is a mux in front of D.
         ce: Option<Lit>,
+        /// Synchronous reset (Xilinx flow): the SR pin, which wins over CE,
+        /// and the stored value it loads (SRVAL).
+        sr: Option<(Lit, bool)>,
     }
     let mut reg_bits: Vec<RegBit> = Vec::new();
     // Every hard cell is built; its inputs are roots.
@@ -940,14 +989,26 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
         // Xilinx flow: holds in the next value's select tree and clock
         // gates drive the flop's CE pin instead of a mux in front of D.
         let xil = super::dag::carry_arith();
-        let (mut d, mut ce) = match xil {
-            true => match bl.enable(r.d, bit, sig, bit, &mut HashMap::new())? {
-                (en, Some(data)) if en != FALSE => (data, en),
-                _ => (bl.bit(r.d, bit)?, TRUE),
-            },
-            false => (bl.bit(r.d, bit)?, TRUE),
+        let init = flat.sigs[sig as usize].init[bit as usize];
+        // A synchronous reset goes on the SR pin (G59): not with an
+        // asynchronous one (one SR pin) or a gated clock (the reset would
+        // act while the gate is shut).
+        let has_arst = r.arst.is_some() && r.arst_mask[bit as usize];
+        let srst = match xil && !has_arst && enables.is_empty() {
+            true => bl.sync_reset(r.d, bit)?,
+            false => None,
         };
-        if flat.sigs[sig as usize].init[bit as usize] {
+        let (dn, di) = srst.map_or((r.d, bit), |(_, _, n, i)| (n, i));
+        let sr = srst.map(|(l, v, _, _)| (l, v ^ init));
+        let (mut d, mut ce) = match xil {
+            true => match bl.enable(dn, di, sig, bit, &mut HashMap::new())? {
+                (en, Some(data)) if en != FALSE => (data, en),
+                (_, None) if sr.is_some() => (bl.sig_bit[&(sig, bit)], TRUE),
+                _ => (bl.bit(dn, di)?, TRUE),
+            },
+            false => (bl.bit(dn, di)?, TRUE),
+        };
+        if init {
             d ^= 1;
         }
         if !enables.is_empty() {
@@ -974,11 +1035,23 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
             }
             _ => None,
         };
-        reg_bits.push(RegBit { sig, bit, d, clk, negedge: r.negedge, arst, ce });
+        reg_bits.push(RegBit { sig, bit, d, clk, negedge: r.negedge, arst, ce, sr });
     }
-    // Each enable is a slice control set: one shared by only a few flops
-    // costs slice space for nothing, so those keep the mux in front of D.
+    // Each enable or reset is a slice control set: one shared by only a few
+    // flops costs slice space for nothing, so those keep the mux in front
+    // of D. A reset folded back also opens the enable (it wins over CE).
     const CE_MIN_FLOPS: usize = 4;
+    let mut sr_uses: HashMap<Lit, usize> = HashMap::new();
+    for (l, _) in reg_bits.iter().filter_map(|rb| rb.sr) {
+        *sr_uses.entry(l).or_default() += 1;
+    }
+    for rb in &mut reg_bits {
+        if let Some((l, v)) = rb.sr.filter(|(l, _)| sr_uses[l] < CE_MIN_FLOPS) {
+            rb.d = bl.aig.mux(l, if v { TRUE } else { FALSE }, rb.d);
+            rb.ce = rb.ce.map(|c| bl.aig.or(c, l));
+            rb.sr = None;
+        }
+    }
     let mut ce_uses: HashMap<Lit, usize> = HashMap::new();
     for c in reg_bits.iter().filter_map(|rb| rb.ce) {
         *ce_uses.entry(c).or_default() += 1;
@@ -999,6 +1072,7 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
             roots.extend([rb.d, rb.clk]);
             roots.extend(rb.arst.map(|a| a.0));
             roots.extend(rb.ce);
+            roots.extend(rb.sr.map(|s| s.0));
         }
         // Block RAM / DSP inputs are roots too (their outputs are inputs).
         roots.extend(hard_ins.iter().flatten());
@@ -1024,6 +1098,7 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
                 a.0 = m(a.0).unwrap();
             }
             rb.ce = rb.ce.map(|c| m(c).unwrap());
+            rb.sr = rb.sr.map(|(l, v)| (m(l).unwrap(), v));
         }
         for ch in &mut chains {
             for l in ch.xs.iter_mut().chain(ch.ys.iter_mut()).chain(ch.sums.iter_mut()) {
@@ -1295,6 +1370,14 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
             depth = depth.max(map.depth[(c / 2) as usize]);
             let enet = emit(c, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut);
             d.connect(&enet, &cell, "CE");
+        }
+        if let Some((l, v)) = rb.sr {
+            depth = depth.max(map.depth[(l / 2) as usize]);
+            let snet = emit(l, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut);
+            d.connect(&snet, &cell, "SR");
+            if let Some(c) = d.cells.iter_mut().rev().find(|c| helion_ir::resolve(c.name) == cell) {
+                c.attrs.set("SRVAL", if v { "1" } else { "0" });
+            }
         }
         if let Some((l, level)) = rb.arst {
             // The stored bit is the register XOR its power-up value, and

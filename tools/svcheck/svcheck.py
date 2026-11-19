@@ -257,7 +257,8 @@ def build(nl: Netlist, widths: dict[str, int]):
                 stmt = f"if ({ref(pin('CE'))}) {stmt}"
             rst = pin("SR") or pin("RST") or pin("R")
             if rst:
-                stmt = f"if ({ref(rst)}) {vid(q)} <= 1'b0; else {stmt}"
+                srval = nl.attrs.get(cell, {}).get("SRVAL", "0")
+                stmt = f"if ({ref(rst)}) {vid(q)} <= 1'b{srval}; else {stmt}"
             if pin("S"):
                 stmt = f"if ({ref(pin('S'))}) {vid(q)} <= 1'b1; else {stmt}"
             if pin("ARST"):
