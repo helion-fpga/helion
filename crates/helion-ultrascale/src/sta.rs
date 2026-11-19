@@ -32,15 +32,25 @@ pub struct TimingReport {
     pub worst_endpoint: String,
     /// Worst path delay (ps).
     pub worst_delay_ps: i64,
+    /// True when any delay behind this report is a ballpark estimate
+    /// rather than a documented datasheet value. Such a report is an
+    /// estimate, never signoff timing.
+    pub is_estimate: bool,
 }
 
 impl TimingReport {
-    /// Format exactly like the existing hang_diag timing line.
+    /// Format exactly like the existing hang_diag timing line, plus an
+    /// `estimate=1` token when the report is an estimate.
     pub fn hang_diag_line(&self, ms: u128) -> String {
-        format!(
+        let base = format!(
             "hang_diag timing WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={} ms={}",
             self.wns_ps, self.tns_ps, self.endpoints, self.r2r_ps, self.iob_ps, ms
-        )
+        );
+        if self.is_estimate {
+            format!("{base} estimate=1")
+        } else {
+            base
+        }
     }
 }
 
@@ -62,6 +72,15 @@ pub trait StaNetlist {
     fn ff_q_net(&self, ff: &str) -> Option<String>;
     /// Net name feeding a flip-flop's D pin.
     fn ff_d_net(&self, ff: &str) -> Option<String>;
+    /// Carry-chain cells: driver cell names whose combinational delay is
+    /// the CARRY8 sum-output delay (`carry8.s_to_o`) rather than the
+    /// LUT6 delay. Default: none. A carry cell drives its sum (`O`) and
+    /// carry-out (`CO`) nets; every output is charged `s_to_o`, which is
+    /// an approximation (the per-pin CI-to-CO delay is a refinement for
+    /// a real DB, not a ballpark one).
+    fn carry_cells(&self) -> HashSet<String> {
+        HashSet::new()
+    }
 }
 
 /// Run STA over a placed/routed netlist.
@@ -93,6 +112,26 @@ pub fn sta_routed<N: StaNetlist>(
         .single
         .ps
         .ok_or_else(|| "timing: INT single-hop delay UNKNOWN in TimingDb".to_string())?;
+    let carry_cells = nl.carry_cells();
+    let carry_ps = if carry_cells.is_empty() {
+        0
+    } else {
+        db.carry8
+            .s_to_o
+            .ps
+            .ok_or_else(|| "timing: CARRY8 S to O delay UNKNOWN in TimingDb".to_string())?
+    };
+    // Combinational delay of a driver cell: the CARRY8 sum-output delay
+    // for carry-chain cells, the LUT6 delay for everything else.
+    // `carry_ps` is only consulted for cells in `carry_cells`, which is
+    // empty exactly when it is 0, so the placeholder never leaks.
+    let cell_delay = |cell: &str| -> i64 {
+        if carry_cells.contains(cell) {
+            carry_ps
+        } else {
+            lut_ps
+        }
+    };
 
     let drivers = nl.net_drivers();
     let fanin = nl.cell_fanin();
@@ -117,7 +156,7 @@ pub fn sta_routed<N: StaNetlist>(
         drivers: &HashMap<String, (String, i32, i32)>,
         fanin: &HashMap<String, Vec<String>>,
         sites: &HashMap<String, (i32, i32)>,
-        lut_ps: i64,
+        cell_delay: &dyn Fn(&str) -> i64,
         ckq_ps: i64,
         route_delay: &dyn Fn((i32, i32), (i32, i32)) -> i64,
         depth: usize,
@@ -148,7 +187,7 @@ pub fn sta_routed<N: StaNetlist>(
                     drivers,
                     fanin,
                     sites,
-                    lut_ps,
+                    cell_delay,
                     ckq_ps,
                     route_delay,
                     depth + 1,
@@ -159,7 +198,7 @@ pub fn sta_routed<N: StaNetlist>(
                     worst_src = src;
                 }
             }
-            Ok((worst + lut_ps + wire, worst_src))
+            Ok((worst + cell_delay(drv) + wire, worst_src))
         })();
         visiting.remove(net);
         result
@@ -185,7 +224,7 @@ pub fn sta_routed<N: StaNetlist>(
             &drivers,
             &fanin,
             &sites,
-            lut_ps,
+            &cell_delay,
             ckq_ps,
             &route_delay,
             0,
@@ -219,5 +258,6 @@ pub fn sta_routed<N: StaNetlist>(
         worst_startpoint: worst_start,
         worst_endpoint: worst_end,
         worst_delay_ps: worst_delay,
+        is_estimate: db.is_estimate(),
     })
 }

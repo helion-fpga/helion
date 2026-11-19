@@ -1,0 +1,157 @@
+//! Timing DB regression tests (GAP-F5).
+//!
+//! Every delay value is pinned to its source. The preliminary DBs are
+//! ballpark estimates from the AMD forum ~0.3 ns per logic level split
+//! (120 ps LUT + 180 ps one INT hop); the documented DBs carry exactly
+//! one datasheet value each (BRAM CLK to DOUT, DS922/DS923 Table 33
+//! TRCKO_DO, 1.46 ns at -2 / 0.85V) and UNKNOWN everywhere else.
+
+use helion_ultrascale::timing_db::{
+    documented_xcku3p, documented_xcvu3p, preliminary_xcku3p, preliminary_xcvu3p,
+    sta_db_for_part,
+};
+use helion_ultrascale::timing_db::{DelaySource, SourcedDelay, UltraScaleTimingDb};
+
+fn assert_ballpark(d: &SourcedDelay, ps: i64) {
+    assert_eq!(d.ps, Some(ps), "delay {d:?} must be {ps} ps");
+    assert!(
+        matches!(d.source, DelaySource::Ballpark(_)),
+        "delay {d:?} must be Ballpark-sourced"
+    );
+    if let DelaySource::Ballpark(src) = &d.source {
+        assert!(
+            src.contains("0.3ns"),
+            "ballpark source must name the forum 0.3 ns level: {src}"
+        );
+        assert!(
+            src.contains("assumed allocation"),
+            "ballpark source must say the value is an assumed allocation, not a forum-stated value: {src}"
+        );
+    }
+}
+
+fn assert_unknown(d: &SourcedDelay) {
+    assert_eq!(d.ps, None, "delay {d:?} must be UNKNOWN");
+    assert_eq!(d.source, DelaySource::Unknown);
+}
+
+/// All 20 delay fields of a DB, in struct order, for exhaustive checks.
+fn all_fields(db: &UltraScaleTimingDb) -> Vec<(&'static str, &SourcedDelay)> {
+    vec![
+        ("cells.lut6", &db.cells.lut6),
+        ("cells.ff_ckq", &db.cells.ff_ckq),
+        ("cells.ff_setup", &db.cells.ff_setup),
+        ("cells.ff_hold", &db.cells.ff_hold),
+        ("carry8.ci_to_co_bit", &db.carry8.ci_to_co_bit),
+        ("carry8.s_to_o", &db.carry8.s_to_o),
+        ("carry8.cyinit_to_co", &db.carry8.cyinit_to_co),
+        ("dsp.mult_a_b_to_p", &db.dsp.mult_a_b_to_p),
+        ("dsp.clk_to_p", &db.dsp.clk_to_p),
+        ("bram.clk_to_do", &db.bram.clk_to_do),
+        ("bram.addr_setup", &db.bram.addr_setup),
+        ("uram.clk_to_do", &db.uram.clk_to_do),
+        ("uram.addr_setup", &db.uram.addr_setup),
+        ("interconnect.single", &db.interconnect.single),
+        ("interconnect.double", &db.interconnect.double),
+        ("interconnect.quad", &db.interconnect.quad),
+        ("interconnect.long", &db.interconnect.long),
+        ("interconnect.pip", &db.interconnect.pip),
+        ("iob.pad_to_fabric", &db.iob.pad_to_fabric),
+        ("iob.fabric_to_pad", &db.iob.fabric_to_pad),
+    ]
+}
+
+fn assert_preliminary_values(db: &UltraScaleTimingDb, part: &str) {
+    assert_eq!(db.part, part);
+    assert_eq!(db.speed_grade, "-2");
+    assert_ballpark(&db.cells.lut6, 120);
+    assert_ballpark(&db.cells.ff_ckq, 150);
+    assert_ballpark(&db.cells.ff_setup, 80);
+    assert_ballpark(&db.cells.ff_hold, 60);
+    assert_ballpark(&db.carry8.ci_to_co_bit, 40);
+    assert_ballpark(&db.carry8.s_to_o, 100);
+    assert_ballpark(&db.carry8.cyinit_to_co, 60);
+    assert_unknown(&db.dsp.mult_a_b_to_p);
+    assert_unknown(&db.dsp.clk_to_p);
+    assert_unknown(&db.bram.clk_to_do);
+    assert_unknown(&db.bram.addr_setup);
+    assert_unknown(&db.uram.clk_to_do);
+    assert_unknown(&db.uram.addr_setup);
+    assert_ballpark(&db.interconnect.single, 180);
+    assert_unknown(&db.interconnect.double);
+    assert_unknown(&db.interconnect.quad);
+    assert_unknown(&db.interconnect.long);
+    assert_ballpark(&db.interconnect.pip, 50);
+    assert_unknown(&db.iob.pad_to_fabric);
+    assert_unknown(&db.iob.fabric_to_pad);
+    assert!(db.is_estimate(), "preliminary DB must be an estimate");
+}
+
+#[test]
+fn preliminary_xcku3p_values_pinned_to_forum_ballpark() {
+    assert_preliminary_values(&preliminary_xcku3p(), "xcku3p");
+}
+
+#[test]
+fn preliminary_xcvu3p_values_pinned_to_forum_ballpark() {
+    assert_preliminary_values(&preliminary_xcvu3p(), "xcvu3p");
+}
+
+#[test]
+fn preliminary_dbs_differ_only_by_part() {
+    let ku = preliminary_xcku3p();
+    let vu = preliminary_xcvu3p();
+    assert_eq!(ku.cells.lut6, vu.cells.lut6);
+    assert_eq!(ku.interconnect.single, vu.interconnect.single);
+    assert_ne!(ku.part, vu.part);
+}
+
+#[test]
+fn documented_xcku3p_has_only_bram_clk_to_do() {
+    let db = documented_xcku3p();
+    assert_eq!(db.part, "xcku3p");
+    assert_eq!(db.speed_grade, "-2");
+    assert_eq!(db.bram.clk_to_do.ps, Some(1460));
+    assert_eq!(
+        db.bram.clk_to_do.source,
+        DelaySource::Documented("DS922 Table 33 TRCKO_DO, -2 0.85V".to_string()),
+        "BRAM delay must cite DS922 Table 33 exactly"
+    );
+    for (name, d) in all_fields(&db) {
+        if name != "bram.clk_to_do" {
+            assert_unknown(d);
+        }
+    }
+    assert!(!db.is_estimate(), "documented DB has no ballpark value");
+}
+
+#[test]
+fn documented_xcvu3p_has_only_bram_clk_to_do() {
+    let db = documented_xcvu3p();
+    assert_eq!(db.part, "xcvu3p");
+    assert_eq!(db.bram.clk_to_do.ps, Some(1460));
+    assert_eq!(
+        db.bram.clk_to_do.source,
+        DelaySource::Documented("DS923 Table 33 TRCKO_DO, -2 0.85V".to_string()),
+        "BRAM delay must cite DS923 Table 33 exactly"
+    );
+    for (name, d) in all_fields(&db) {
+        if name != "bram.clk_to_do" {
+            assert_unknown(d);
+        }
+    }
+}
+
+#[test]
+fn sta_db_for_part_selects_per_part() {
+    assert_eq!(sta_db_for_part("xcku3p").unwrap().part, "xcku3p");
+    assert_eq!(sta_db_for_part("xcvu3p").unwrap().part, "xcvu3p");
+    assert!(sta_db_for_part("xcku3p").unwrap().is_estimate());
+}
+
+#[test]
+fn sta_db_for_part_rejects_unknown_part() {
+    let err = sta_db_for_part("xc7a35t").expect_err("must fail loud");
+    assert!(err.contains("xc7a35t"), "err: {err}");
+    assert!(err.contains("unsupported part"), "err: {err}");
+}

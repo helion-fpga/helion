@@ -19,7 +19,7 @@
 
 use helion_ir::{intern, resolve, CellKind, Design};
 use helion_ultrascale::{
-    check_legality, emit_ff_fasm, pack_ultra, place_ultra, preliminary_xcvu3p, route_ultra,
+    check_legality, emit_ff_fasm, pack_ultra, place_ultra, route_ultra, sta_db_for_part,
     sta_routed, ControlSetLimits, FabricWithPlaceholders, RoutableNet, StaNetlist, TimingReport,
     UltraPlaceOpts, UltraRouteOpts, UltraScaleDevice, UltraScaleFabric,
 };
@@ -173,6 +173,8 @@ struct UltraStaNetlist<'a> {
     fanin: HashMap<String, Vec<String>>,
     ff_q: HashMap<String, String>,
     ff_d: HashMap<String, String>,
+    /// Carry-chain cells (CARRY8), charged the carry8 s_to_o delay.
+    carry: HashSet<String>,
 }
 
 impl<'a> StaNetlist for UltraStaNetlist<'a> {
@@ -214,6 +216,10 @@ impl<'a> StaNetlist for UltraStaNetlist<'a> {
 
     fn ff_d_net(&self, ff: &str) -> Option<String> {
         self.ff_d.get(ff).cloned()
+    }
+
+    fn carry_cells(&self) -> HashSet<String> {
+        self.carry.clone()
     }
 }
 
@@ -295,8 +301,10 @@ pub fn run_impl(path: &str, part: &str, seed: u64) -> Result<(), String> {
     println!("hang_diag ultra fasm ff_lines={}", ff_fasm.len());
 
     // Preliminary STA on the placed netlist (Manhattan estimates, ballpark
-    // delays; NOT signoff timing).
-    let timing = sta_on_placed(&design, &packed, &placed)?;
+    // delays; NOT signoff timing). The DB is selected by part (F3 fix:
+    // xcku3p no longer silently runs on the xcvu3p DB) and the report is
+    // labeled estimate=1 until a real delay DB exists.
+    let timing = sta_on_placed(&design, &packed, &placed, part)?;
     println!("{}", timing.hang_diag_line(0));
 
     // ROUTE: blocked until a real WireDb exists. Fail loud with the stage
@@ -335,14 +343,19 @@ fn sta_on_placed(
     design: &Design,
     packed: &helion_ultrascale::UltraPacked,
     placed: &helion_ultrascale::UltraPlaced,
+    part: &str,
 ) -> Result<TimingReport, String> {
-    // Map cell name -> placed (x, y) via its packed slice.
+    // Map cell name -> placed (x, y) via its packed slice. Carry8 cells
+    // live in `slice.carry8`, not in the LUT/FF lists.
     let mut sites: HashMap<String, (i32, i32)> = HashMap::new();
     for p in &placed.slices {
         let Some(slice) = packed.slices.get(p.packed_idx) else {
             continue;
         };
         for (_, cell) in slice.luts.iter().chain(slice.ffs.iter()) {
+            sites.insert(cell.clone(), (p.x, p.y));
+        }
+        if let Some(cell) = &slice.carry8 {
             sites.insert(cell.clone(), (p.x, p.y));
         }
     }
@@ -364,6 +377,7 @@ fn sta_on_placed(
     let mut fanin: HashMap<String, Vec<String>> = HashMap::new();
     let mut ff_q: HashMap<String, String> = HashMap::new();
     let mut ff_d: HashMap<String, String> = HashMap::new();
+    let mut carry: HashSet<String> = HashSet::new();
     for cell in &design.cells {
         let cname = resolve(cell.name).to_string();
         let Some(&(x, y)) = sites.get(&cname) else {
@@ -391,11 +405,51 @@ fn sta_on_placed(
                     ff_d.insert(cname.clone(), d);
                 }
             }
+            CellKind::Carry4 => {
+                // Sum outputs O0..O3 drive FF D pins; carry outputs
+                // CO0..CO3 (plus the CO[3] spelling) feed the next
+                // chunk's CI. Fanin is the S/DI propagate/generate
+                // inputs plus CI/CYINIT. Every output is charged the
+                // carry8 s_to_o delay by sta_routed (see carry_cells).
+                carry.insert(cname.clone());
+                for lane in 0..4 {
+                    for pin in [format!("O{lane}"), format!("CO{lane}")] {
+                        if let Some(o) = net_of(cell.name, &pin) {
+                            drivers.insert(o, (cname.clone(), x, y));
+                        }
+                    }
+                }
+                if let Some(o) = net_of(cell.name, "CO[3]") {
+                    drivers.insert(o, (cname.clone(), x, y));
+                }
+                let mut ins = Vec::new();
+                for lane in 0..4 {
+                    for pin in [format!("S{lane}"), format!("DI{lane}")] {
+                        if let Some(n) = net_of(cell.name, &pin) {
+                            ins.push(n);
+                        }
+                    }
+                }
+                for pin in ["CI", "CYINIT"] {
+                    if let Some(n) = net_of(cell.name, pin) {
+                        ins.push(n);
+                    }
+                }
+                fanin.insert(cname, ins);
+            }
             _ => {}
         }
     }
+    // Nets driven by top-level input ports (e.g. clk) and by constants
+    // (e.g. CYINIT, the +1 operand of a counter's propagate LUTs) have
+    // no cell driver; they arrive at time 0. Drop them from fanin lists
+    // so STA traverses only driven nets instead of failing loud on a
+    // missing driver for a primary input or constant.
+    for ins in fanin.values_mut() {
+        ins.retain(|n| drivers.contains_key(n));
+    }
     // Nets driven by top-level input ports (e.g. clk) have no cell driver;
-    // STA only traverses LUT/FF fanin cones, so they are not needed here.
+    // STA only traverses LUT/FF/carry fanin cones, so they are not needed here.
     let nl = UltraStaNetlist {
         design,
         sites,
@@ -403,8 +457,9 @@ fn sta_on_placed(
         fanin,
         ff_q,
         ff_d,
+        carry,
     };
-    let db = preliminary_xcvu3p();
+    let db = sta_db_for_part(part).map_err(|e| format!("ULTRA STA: {e}"))?;
     sta_routed(&nl, &db, 10_000).map_err(|e| format!("ULTRA STA: {e}"))
 }
 
