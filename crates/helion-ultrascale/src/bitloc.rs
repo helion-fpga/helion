@@ -237,6 +237,13 @@ pub enum BitLocError {
     /// methods). Blocked until a LUTRAM table or Vivado logic-location
     /// data lands.
     LutramBlocked,
+    /// URAM288 content emission requested. No URAM288 content table
+    /// exists in any public source (prjuray-db has no URAM mention;
+    /// BitFiltrator ULTRASCALE_PLUS.json has no URAM table), and
+    /// URAM288 has no INIT attributes in UG974, so there is nothing
+    /// to vary for a content sweep. Blocked until the Vivado fuzzing
+    /// job (Job 5, phase 3 probe) lands the encoding.
+    UramBlocked,
     /// The vendored table file is missing a key or has the wrong shape.
     TableCorrupt(String),
 }
@@ -261,6 +268,10 @@ impl fmt::Display for BitLocError {
                 "LUTRAM emission blocked: no LUTRAM table in the vendored \
                  BitFiltrator JSON and paper section V-B does not establish \
                  that LUTRAM shares the LUT INIT bits"
+            ),
+            BitLocError::UramBlocked => write!(
+                f,
+                "URAM288 emission blocked: no URAM288 content or config encoding in any public source (prjuray-db and BitFiltrator ULTRASCALE_PLUS.json carry no URAM data) and URAM288 has no INIT attributes in UG974; blocked until the Vivado fuzzing job (Job 5) lands it"
             ),
             BitLocError::TableCorrupt(detail) => {
                 write!(f, "vendored bit-location table corrupt: {detail}")
@@ -950,4 +961,21 @@ pub fn bram_tile_fasm(
             lines
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// URAM288 (blocked: no public encoding)
+// ---------------------------------------------------------------------------
+
+/// Content-bit locations for one URAM288 site (4096 words x 72 bits =
+/// 294912 content bits). There is no table to read: prjuray-db has no
+/// URAM mention and BitFiltrator ULTRASCALE_PLUS.json has no URAM table,
+/// and URAM288 has no INIT attributes in UG974, so the content encoding
+/// cannot even be swept the BRAM way. This is the seam where the Vivado
+/// fuzzing job (Job 5, phase 3 probe) lands the table; until then every
+/// call fails loud with [`BitLocError::UramBlocked`] and emits no bits.
+/// `_uram_y` is the Vivado URAM288 site Y, kept so the signature matches
+/// the BRAM location functions when the table lands.
+pub fn uram_content_locations(_uram_y: u32) -> Result<Vec<BitLoc>, BitLocError> {
+    Err(BitLocError::UramBlocked)
 }
