@@ -92,3 +92,115 @@ license state UNKNOWN; nothing here runs Vivado or claims Tier 2.
 
 (Commands and outputs appended here as they are run. Nothing in
 this file is claimed without a shown run.)
+
+## Verification by the second replacement (2026-11-19, branch tip 5b338d37)
+
+Read the driver from first principles against `compile_design_xdc`
+before running anything. All 7 defects from the list above are
+confirmed fixed in the code at 5b338d37:
+
+1. Pack once: `multiseed_front` packs once and shares the `Packed`
+   across seeds; per-seed work is place/route/DRC/STA only.
+2. Per-seed logs: `--log-dir` writes `seed-<n>.log` per seed.
+3. Mutex poison: `file.lock().unwrap_or_else(|e| e.into_inner())`.
+4. Last record wins: `dedup_results` inserts into a HashMap in file
+   order, so the later record overwrites.
+5. Control chars: `escape_json_value` replaces every char below
+   0x20 with a space (lossy but keeps the JSONL line intact).
+6. Best-seed artifacts: `--best-out` and `--emit-best` both wired.
+7. Checked seed range: `seed_range` uses `checked_add`.
+
+Equivalence check, `run_one_seed` vs `compile_design_xdc` at the
+same seed, weight 0.0, default XDC (verified by reading both):
+apply_xdc once in the front end, same `Device::load_part`, same
+`pack` plus the shared `trim_iobs_to_budget`, same
+`place_with_guide` with `timing_weight: 0.0` and the same timing
+guide, same `RouteOpts` budget (24 iters over 2000 LUTFFs, else 8),
+same `check_routed` plus DRC fail, same default 10 ns clock, same
+`report_timing_routed_xdc`. Bitgen is skipped per seed and runs
+only for the best seed; bitgen cannot affect timing, so the skip is
+exact. The reproduce command in `--best-out` (`helion impl ...
+--seed N`) uses weight 0.0 too (`cmd_impl` calls `compile_sv` with
+0.0), so it reproduces the sweep numbers. The
+`pack_once_matches_full_compile` test asserts WNS/TNS/endpoints
+equality against `compile_design` for seeds 0 and 7.
+
+Seed mechanism re-verified: `seeded_order` in
+`crates/helion-place/src/lib.rs` is SplitMix64 plus Fisher-Yates,
+seed 0 is the identity order, deterministic per seed.
+
+New defects found by this re-read, fixed in commit d2db932a
+(all with regression tests in `mod multiseed_tests`):
+
+8. `parse_seed` searched the whole line, so a `"seed": N` inside a
+   fail reason could invent a phantom record; `parse_results_text`
+   read status and slack numbers from the whole line, so reason text
+   could fake an ok status or a WNS. Fixed: seed parse is anchored
+   to the line start, and status/WNS/TNS are read only from the head
+   before `"reason":`.
+9. Numeric flags (`--seeds`, `--seed-start`, `--jobs`,
+   `--threshold`) silently fell back to defaults on garbage input.
+   Fixed: `parse_multiseed_args` fails loud on a present but
+   unparseable number; defaults still apply when the flag is absent.
+10. Resume skipped recorded failures forever, so a transient
+    failure (OOM, killed run) permanently lost that seed. Fixed:
+    `--retry-failed` re-runs failed seeds; ok seeds never rerun.
+    Resume now parses the checkpoint with the same parser as the
+    final report (last record wins); a torn line from a killed run
+    parses to no seed and reruns.
+11. The header's "already done" count counted seeds outside this
+    sweep's range. Fixed: it now counts only in-range skipped seeds.
+12. The `RouteOpts` budget formula was duplicated in
+    `compile_design_xdc` and `run_one_seed`. Fixed: one shared
+    `route_opts_for` helper, used by both, with a boundary test.
+13. One em dash in the `--emit-best` refusal message, left by
+    5b338d37. Fixed to a comma. (Other pre-existing em dashes in
+    `main.rs` strings and `batch_dashboard.rs` HTML are outside this
+    driver and untouched.)
+
+Known limitation, not fixed: the file mutex is per-process, so two
+concurrent runs sharing one out file can interleave lines. A torn
+line is skipped on resume and the seed reruns, so the failure mode
+is a wasted rerun, never a wrong best seed. Do not run two sweeps
+into the same out file at once.
+
+## FLAG: two multiseed worktrees, one with uncommitted work
+
+The orchestrator record conflates them; the on-disk state is:
+
+- This branch, `fm/ultra-multiseed`, worktree
+  `~/workspace/helion-ultra-multiseed`, tip d2db932a (after the
+  fixes above), clean. This is the master-based helion-cli driver.
+- `fm/ultra-bitgen-multiseed`, worktree
+  `~/workspace/helion-ultra-bitgen-multiseed`, base 07d0d7df, with
+  UNCOMMITTED work: new `crates/helion-ultrascale/src/multiseed.rs`
+  (423 lines, the UltraScale-crate port: pack once, place plus
+  preliminary STA per seed, route blocked, bitgen not implemented),
+  plus diffs to `crates/helion-cli/src/main.rs` (33 lines,
+  `helion multiseed` wired to `ultra::run_multiseed`),
+  `crates/helion-cli/src/ultra.rs` (199 lines) and
+  `crates/helion-ultrascale/src/lib.rs` (5 lines). Files last
+  modified 14:18-15:17 UTC Nov 19. Not touched here: it is another
+  worker's uncommitted work on another branch, and the orchestrator
+  decides what happens to it. The port still carries the old forms
+  of defects 3, 4, 5, 7, 8, 9, 10, 11 above (mutex unwrap,
+  first-record-wins dedup, unescaped control chars, unchecked seed
+  range, unanchored parse, silent flag defaults, no retry-failed,
+  out-of-range done count) and has no per-seed logs or best-seed
+  artifacts; whoever picks it up should apply the same hardening.
+  The two JSONL shapes stay mutually readable: the port adds a
+  `route_status` key its parser defaults to `"unknown"` when
+  missing, and this driver ignores keys it does not know.
+- The predecessor's `cargo test -j2` (pid 54046, started 15:17 UTC,
+  log `/tmp/ms-test-ultra.log`) runs in the session-18 worktree,
+  not this one. Its lib suite passed 91 tests (including 9
+  multiseed port tests); its `helion-bitgen` bin tests are slow
+  under load (each full emit plus parse on the xcku3p golden) and
+  were still running at last check. This branch's own tests had
+  not been run yet at the time of writing; results go below once
+  that cargo run finishes and this worktree's suite runs.
+
+## Reproduction runs
+
+(Commands and outputs appended here as they are run. Nothing in
+this file is claimed without a shown run.)
