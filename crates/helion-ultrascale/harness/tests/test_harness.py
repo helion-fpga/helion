@@ -434,9 +434,11 @@ class TestLutram(unittest.TestCase):
                 "lutram/%s golden differs from build_fasm" % part)
 
     def test_lutram_golden_lines_match_rust_spelling(self):
-        # The 7 non-comment lines must match the Rust lutram_fasm /
-        # lutram_slice_fasm output exactly (checked on the Rust side
-        # too); the two implementations are pinned together here.
+        # The 7 non-comment lines of the golden. The mode lines match
+        # the Rust lutram_fasm / lutram_slice_fasm output exactly;
+        # the INIT line matches after roundtrip normalization only
+        # (Rust renders Verilog 64'h..., the golden uses 0x...),
+        # pinned below by canonicalizing the Rust spelling.
         lines = [l for l in golden_fasm("lutram", "xcku3p").splitlines()
                  if l and not l.startswith("#")]
         self.assertEqual(lines, [
@@ -448,6 +450,20 @@ class TestLutram(unittest.TestCase):
             "SLICE_X1Y0.WA8USED.V0",
             "SLICE_X1Y0.WA9USED.V0",
         ])
+        rust_spelling = (
+            "SLICE_X1Y0.A6LUT.INIT[63:0] = 64'h6996966996696996\n"
+            "SLICE_X1Y0.ALUT.MODE.RAM\n"
+            "SLICE_X1Y0.ALUT.DI1.DI1\n"
+            "SLICE_X1Y0.ALUT.SIZE.LARGE\n"
+            "SLICE_X1Y0.WA7USED.V0\n"
+            "SLICE_X1Y0.WA8USED.V0\n"
+            "SLICE_X1Y0.WA9USED.V0\n"
+        )
+        self.assertEqual(
+            canonical_roundtrip_fasm(rust_spelling, "lutram"),
+            canonical_roundtrip_fasm(
+                golden_fasm("lutram", "xcku3p"), "lutram"),
+        )
 
     def test_resolve_lutram_mode_exact_bits(self):
         # SLICE_X1Y0: row 0, CLB col major 6, tile CLEM. Absolute FARs
