@@ -14,12 +14,12 @@
       },
       {
         "field": "license",
-        "source": "copied from the xcku3p template; every BitFiltrator device file carries Webpack, and xcvu3p appears in parts_webpack.json",
+        "source": "copied from the xcku3p template; every BitFiltrator device file carries Webpack, but BitFiltrator resources/parts_webpack.json lists NO xcvu3p parts (Virtex UltraScale+ xcvu3p: []), so Webpack is an unconfirmed template copy and the Vivado LICENSE part property for xcvu3p-ffvc1517-1-e is unknown until the Vivado probe runs",
         "value": "Webpack"
       },
       {
         "field": "num_slices",
-        "source": "AMD XMP103: 394,080 LUTs / 8; see the 49,250 vs 49,260 discrepancy in data/README.md",
+        "source": "AMD XMP103: 394,080 LUTs / 8 (DS890 Table 9 exact); the earlier 49,250 came from dividing the rounded 394,000 and is gone from the model",
         "value": "49260"
       },
       {
