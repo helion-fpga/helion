@@ -17,6 +17,7 @@ pub mod bitgen_device;
 pub mod bitloc;
 pub mod device;
 pub mod device_file;
+pub mod dsp;
 pub mod fabric;
 pub mod fasm_gen;
 pub mod grid;
@@ -40,6 +41,7 @@ pub use bitloc::{
     NUM_CLB_PER_COLUMN, PlacedBit,
 };
 pub use device::{UltraScaleDevice, Xcku3pSpec, Xcvu3pSpec};
+pub use dsp::{DSP48E2_ATTRIBUTES, is_dsp48e2_entry};
 pub use device_file::{
     ArchSummary, BitLocator, BramResolution, DeviceFile, DeviceFileError, Far, FarBlockType,
     NUM_18K_BRAM_PER_COLUMN, ProvisionalNote,
