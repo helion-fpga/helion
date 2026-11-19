@@ -26,7 +26,8 @@ module dsp_regs (
     output logic        [31:0] o_mo,
     output logic signed [63:0] q_wacc,  // accumulator wider than 48 bits: the add stays in the fabric
     output logic        [31:0] q_ain,   // A register also read elsewhere: stays a flop
-    output logic        [15:0] o_ain
+    output logic        [15:0] o_ain,
+    output logic        [31:0] q_k1     // input register beside a constant 1: stays a flop
 );
     function automatic logic signed [24:0] sa(input int k); return x[25*k +: 25]; endfunction
     function automatic logic signed [17:0] sb(input int k); return y[18*k +: 18]; endfunction
@@ -105,4 +106,8 @@ module dsp_regs (
         q_ain <= ai * ub(9);
     end
     assign o_ain = ai;
+
+    logic [11:0] ki;
+    always_ff @(posedge clk) if (rst) ki <= '0; else if (en) ki <= x[160 +: 12];
+    assign q_k1 = {1'b1, ki} * ub(10);
 endmodule

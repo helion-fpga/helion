@@ -29,7 +29,8 @@
 //! - P: `p <= a * b`, or `p <= p + a * b` (OPMODE Z = P) with `p` at most
 //!   48 bits, the product used nowhere else;
 //! - M: `m <= a * b` read only by `p <= m` or `p <= p + m` (then P too);
-//! - A, B: an operand that is the output of a register nothing else reads.
+//! - A, B: an operand that is the output of a register nothing else reads,
+//!   beside constant 0 bits only.
 
 use super::dag::{Dag, Op, N};
 use super::lower::{clock_shape, wire, Drv, Flat, Hard, SigInfo};
@@ -265,7 +266,8 @@ impl Operand {
         let mut found = None;
         for &(n, i) in &self.bits[..self.e as usize] {
             match *flat.dag.op(n) {
-                Op::Const(_) => {}
+                // A constant 1 would pass through the slice register, which starts and resets at 0.
+                Op::Const(_) if flat.dag.as_const(n).is_some_and(|c| !c[i as usize]) => {}
                 Op::Read(s) => {
                     let Drv::Reg(r) = flat.sigs[s as usize].drv[i as usize] else { return None };
                     if found.is_some_and(|f| f != (r, s)) {

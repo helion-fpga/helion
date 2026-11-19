@@ -243,6 +243,17 @@ fn an_input_register_read_elsewhere_stays_in_the_fabric() {
 }
 
 #[test]
+fn an_input_register_beside_a_constant_1_stays_in_the_fabric() {
+    // The 1 would go through AREG, which is 0 after configuration and reset.
+    let (d, _, regs) = one(&format!(
+        "module t({IO}, output logic [31:0] p); logic [11:0] r;
+         always_ff @(posedge clk) if (rst) r <= '0; else if (en) r <= a[11:0]; assign p = {{1'b1, r}} * b[15:0]; endmodule"
+    ));
+    assert_eq!(regs, "0 0 0 0");
+    assert_eq!(flops(&d), 12);
+}
+
+#[test]
 fn product_then_register_is_mreg_and_preg() {
     let (d, c, regs) = one(&format!(
         "module t({IO}, output logic signed [47:0] p); logic signed [47:0] m;
