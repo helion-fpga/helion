@@ -575,6 +575,14 @@ fn classify_feature(tile: &str, feature: &str) -> Option<&'static str> {
             return Some("FF_INIT");
         }
     }
+    // CARRY8 is its own block (CTO ruling 2026-11-08, US-05), mirroring
+    // harness/fasm.py `classify`: one CARRY8 per CLB slice, never
+    // folded into LUT_INIT. The `bits` resolver already looks CARRY8
+    // features up in the segbits DB, so a CARRY8 feature that sets
+    // bits now labels CARRY8 instead of failing loud.
+    if feature.starts_with("CARRY8.") {
+        return Some("CARRY8");
+    }
     if (feature.contains("INITP") || feature.contains("INIT_P"))
         && (feature.contains("BRAM") || feature.contains("RAMB") || tile.contains("RAMB"))
     {
@@ -793,9 +801,12 @@ mod tests {
             classify_feature("SLICE_X0Y0", "ABCDFF2.SRUSED.V0"),
             Some("FF_INIT")
         );
-        // CARRY8 has no block in the harness registry: `bits` must
-        // fail loud on a CARRY8 feature that sets bits, never guess.
-        assert_eq!(classify_feature("SLICE_X0Y0", "CARRY8.DI0.DI0"), None);
+        // CARRY8 has its own block in the harness registry (US-05):
+        // a CARRY8 feature that sets bits labels CARRY8.
+        assert_eq!(
+            classify_feature("SLICE_X0Y0", "CARRY8.DI0.DI0"),
+            Some("CARRY8")
+        );
         assert_eq!(
             classify_feature("INT_X0Y0", "PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1"),
             Some("INT_PIP")
