@@ -17,6 +17,7 @@ import re
 BLOCKS = [
     "LUT_INIT",
     "FF_INIT",
+    "CARRY8",
     "BRAM_CONTENT",
     "BRAM_PARITY",
     "INT_PIP",
@@ -33,6 +34,7 @@ _HEX_RE = re.compile(r"^0[xX][0-9a-fA-F]+$")
 _LUT_INIT_RE = re.compile(r"^([A-H])6LUT\.INIT\[63:0\]$")
 _FF_INIT_RE = re.compile(r"^([A-H])FF2?\.INIT$")
 _FF_SRVAL_RE = re.compile(r"^([A-H])FF2?\.SRVAL$")
+_CARRY8_RE = re.compile(r"^CARRY8\.")
 _SLICE_RE = re.compile(r"^SLICE_X(\d+)Y(\d+)$")
 _INT_RE = re.compile(r"^INT_X(\d+)Y(\d+)$")
 _BRAM_RE = re.compile(r"^RAMB(18|36)_X(\d+)Y(\d+)$")
@@ -166,6 +168,17 @@ def classify(feature):
         return "FF_INIT"
     if ".ABCDFF." in feat or ".ABCFF." in feat or feat.endswith(".CEUSED.V0") or feat.endswith(".CEUSED.V1"):
         return "FF_INIT"
+    if _CARRY8_RE.match(feat):
+        # CARRY8 is its own block (CTO ruling 2026-11-08, US-05):
+        # one CARRY8 per CLB slice, never folded into LUT_INIT or
+        # any other block. A CARRY8 feature on a non-SLICE tile
+        # fails loud instead of routing somewhere wrong.
+        if not _SLICE_RE.match(tile):
+            raise FasmError(
+                "CARRY8 feature %s.%s is not on a SLICE tile"
+                % (tile, feat)
+            )
+        return "CARRY8"
     if "INITP" in feat or "INIT_P" in feat:
         if "BRAM" in feat or "RAMB" in tile or "RAMB" in feat:
             return "BRAM_PARITY"
