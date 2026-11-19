@@ -4,7 +4,7 @@
 //! `DSP48E1` cell of the form an instantiated one takes (`mem.rs`:
 //! parameters as attributes, every input pin driven), and registers
 //! around it move into the slice when they behave exactly like the slice's
-//! own (UG479). Anything else stays in the fabric.
+//! own (UG479). A wider product becomes several cells.
 //!
 //! `Mul` is modulo 2^W at its width W with operands the elaborator has
 //! already extended, so only an operand's value modulo 2^W matters: it
@@ -13,6 +13,13 @@
 //! A takes `e <= 25`, B `e <= 18`, either operand on either port. The
 //! product of `e1`- and `e2`-bit signed values fits in `e1 + e2` bits, so
 //! result bit `i` is `P[min(i, e1 + e2 - 1)]`, for any W.
+//!
+//! A wider product is split (see [`split`]): each operand becomes chunks of
+//! 24 (A) or 17 (B) unsigned bits under a signed top chunk, every pair of
+//! chunks below the result's width is one partial product, and the fabric
+//! adds them on carry chains. Partial products take no slice registers.
+//! (The PCOUT cascade would add them in the slices, but no design here
+//! has run one through the back end and x7v yet.)
 //!
 //! The fabric keeps a product that is at most one adder: a 1-bit operand
 //! (one partial-product row), or a non-negative constant with two nonzero
@@ -307,6 +314,52 @@ fn private(flat: &Flat, refs: &[u32], reads: &[u32], x: N, uses: u32, s: u32) ->
     r == reads[s as usize]
 }
 
+/// An operand of `e` bits as chunks `(lo, len, signed)` of at most `c`
+/// unsigned bits under a signed top chunk of at most `c + 1` bits: its
+/// value is the sum of each chunk shifted to `lo` (two's complement).
+fn chunks(e: u32, c: u32) -> Vec<(u32, u32, bool)> {
+    let n = (e - 1).div_ceil(c).max(1);
+    (0..n).map(|k| (k * c, if k + 1 < n { c } else { e - k * c }, k + 1 == n)).collect()
+}
+
+/// `m`, a product wider than one multiplier, as partial products of
+/// chunks that fit (24 unsigned bits on A, 17 on B, the top chunks
+/// signed), each modulo 2^(W - its shift), added up the result in the
+/// fabric's carry chains. Returns the partial products.
+fn split(dag: &mut Dag, m: N, a: &Operand, b: &Operand) -> Vec<N> {
+    let w = dag.w(m);
+    let terms = |p: &Operand, q: &Operand| -> Vec<(u32, (u32, u32, bool), (u32, u32, bool))> {
+        let mut t: Vec<_> = chunks(p.e, 24).into_iter().flat_map(|x| chunks(q.e, 17).into_iter().map(move |y| (x.0 + y.0, x, y))).filter(|t| t.0 < w).collect();
+        t.sort_by_key(|t| t.0);
+        t
+    };
+    let (ta, tb) = (terms(a, b), terms(b, a));
+    let (t, p, q) = if tb.len() < ta.len() { (tb, b, a) } else { (ta, a, b) };
+    let mut parts = Vec::new();
+    // The sum from bit `at` up, over the bits below it that are final (LSB last).
+    let (mut at, mut sum, mut done) = (0, dag.zero(w), Vec::new());
+    for (off, (lx, nx, sx), (ly, ny, sy)) in t {
+        let ww = w - off;
+        let x = dag.slice(p.n, lx, nx);
+        let x = dag.ext(x, ww, sx);
+        let y = dag.slice(q.n, ly, ny);
+        let y = dag.ext(y, ww, sy);
+        let pp = dag.mul(x, y);
+        if matches!(dag.op(pp), Op::Mul(..)) {
+            parts.push(pp);
+        }
+        if off > at {
+            done.insert(0, dag.bits(sum, 0, off - at));
+        }
+        let hi = dag.bits(sum, off - at, ww);
+        (at, sum) = (off, dag.add(hi, pp));
+    }
+    done.insert(0, sum);
+    let v = dag.concat(done);
+    dag.nodes[m as usize] = dag.nodes[v as usize].clone();
+    parts
+}
+
 const ATTRS: [(&str, &str); 7] = [
     ("A_INPUT", "DIRECT"),
     ("B_INPUT", "DIRECT"),
@@ -320,7 +373,7 @@ const ATTRS: [(&str, &str); 7] = [
 /// Infer DSP48E1 cells for every product that fits (see the module docs).
 pub fn infer(flat: &mut Flat) {
     let (mut refs, mut reads) = refs(flat);
-    let muls: Vec<N> = (0..flat.dag.nodes.len() as N).filter(|&n| matches!(flat.dag.op(n), Op::Mul(..)) && refs[n as usize] > 0).collect();
+    let mut muls: Vec<N> = (0..flat.dag.nodes.len() as N).filter(|&n| matches!(flat.dag.op(n), Op::Mul(..)) && refs[n as usize] > 0).collect();
     if muls.is_empty() {
         return;
     }
@@ -352,7 +405,11 @@ pub fn infer(flat: &mut Flat) {
         }
     }
     let mut built = 0usize;
-    for m in muls {
+    // Partial products of a split one: combinational, as the sum reads them.
+    let mut parts: HashSet<N> = HashSet::new();
+    let mut next = 0;
+    while let Some(&m) = muls.get(next) {
+        next += 1;
         let Op::Mul(x, y) = *flat.dag.op(m) else { continue };
         let w = flat.dag.w(m);
         let (mut a, mut b) = (operand(flat, x), operand(flat, y));
@@ -363,8 +420,12 @@ pub fn infer(flat: &mut Flat) {
             std::mem::swap(&mut a, &mut b);
         }
         if a.e > 25 || b.e > 18 {
+            let pp = split(&mut flat.dag, m, &a, &b);
+            parts.extend(pp.iter().copied());
+            muls.extend(pp);
             continue;
         }
+        let part = parts.contains(&m);
         // P side: the one register loading `input` or adding it to itself,
         // with the select structure and `input` used by nothing else.
         let stage = |flat: &Flat, refs: &[u32], input: N| -> Option<(usize, bool)> {
@@ -377,7 +438,7 @@ pub fn infer(flat: &mut Flat) {
             let wide = *acc && flat.sigs[flat.regs[c.ri as usize].sig as usize].w > 48;
             (!wide && exclusive(refs, &c.peel.uses) && sole(flat, refs, &reads, x) == Some(input)).then_some((*k, *acc))
         };
-        let (mut mreg, mut preg) = (None, stage(flat, &refs, m));
+        let (mut mreg, mut preg) = (None, stage(flat, &refs, m).filter(|_| !part));
         if let Some((k, false)) = preg {
             // `m <= a * b` read only by the next stage: the M register.
             let s = flat.regs[cands[k].ri as usize].sig;
@@ -394,7 +455,7 @@ pub fn infer(flat: &mut Flat) {
         let port = |flat: &mut Flat, op: &Operand, clk: &mut Option<(N, u32)>| -> (Vec<(N, u32)>, Option<(N, N)>) {
             let pins: Vec<(N, u32)> = (0..op.e).map(|j| op.bits[j as usize]).collect();
             let uses = (x == op.n) as u32 + (y == op.n) as u32;
-            let Some((ri, s)) = op.reg(flat).filter(|&(ri, s)| !own.contains(&ri) && private(flat, &refs, &reads, op.n, uses, s)) else { return (pins, None) };
+            let Some((ri, s)) = op.reg(flat).filter(|&(ri, s)| !part && !own.contains(&ri) && private(flat, &refs, &reads, op.n, uses, s)) else { return (pins, None) };
             let Some(sr) = slice_reg(flat, ri) else { return (pins, None) };
             if clk.is_some_and(|c| c != sr.clk) {
                 return (pins, None);
@@ -512,5 +573,29 @@ pub fn infer(flat: &mut Flat) {
             }
             None => flat.dag.nodes[m as usize] = flat.dag.nodes[v as usize].clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chunks;
+
+    #[test]
+    fn chunks_cover_the_operand_and_fit_their_port() {
+        for c in [17, 24] {
+            for e in 2..=130 {
+                let ch = chunks(e, c);
+                let (top, low) = ch.split_last().unwrap();
+                let mut at = 0;
+                for &(lo, len, signed) in low {
+                    assert_eq!((lo, len, signed), (at, c, false), "e {e} c {c}");
+                    at += c;
+                }
+                assert_eq!((top.0, top.2), (at, true), "e {e} c {c}");
+                assert!(top.0 + top.1 == e && (2..=c + 1).contains(&top.1), "e {e} c {c}: top {top:?}");
+            }
+        }
+        assert_eq!(chunks(33, 24), [(0, 24, false), (24, 9, true)]);
+        assert_eq!(chunks(18, 17), [(0, 18, true)]);
     }
 }
