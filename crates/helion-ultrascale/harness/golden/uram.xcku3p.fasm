@@ -1,0 +1,23 @@
+# golden FASM: uram on xcku3p
+# seed: 20261107
+# source: one URAM288 (288K-bit UltraRAM, 4096 words x 72 bits) on
+# URAM_X0Y0, six UG974 attributes at defaults.
+# placement: URAM_X0Y0 is PROVISIONAL (no xcku3p tilegrid in any
+# public DB; the device file names only tile types URAM_URAM_FT /
+# URAM_URAM_DELAY_FT with site type URAM288). One URAM288 only: no
+# FF, no route, no IO. The design is the minimal URAM exercise, not
+# a full system; routing of address/data/clock is the router
+# worker's scope, and the content sweep is job 5's scope.
+# content: NO content line is written. URAM288 has no INIT
+# attributes in UG974 (contrast RAMB36E2 INIT_00..INIT_7F), so the
+# 294912 content bits cannot be expressed in FASM until job 5 lands
+# the encoding. The six lines below are the whole golden; every one
+# resolves to blocked until then.
+# PROVISIONAL: the xcvu3p golden reuses the xcku3p placement verbatim
+# and is provisional until the xcvu3p device file lands.
+URAM_X0Y0.URAM288.CASCADE_ORDER_A = "NONE"
+URAM_X0Y0.URAM288.CASCADE_ORDER_B = "NONE"
+URAM_X0Y0.URAM288.OREG_A = "FALSE"
+URAM_X0Y0.URAM288.OREG_B = "FALSE"
+URAM_X0Y0.URAM288.EN_ECC_RD_A = "FALSE"
+URAM_X0Y0.URAM288.EN_ECC_RD_B = "FALSE"

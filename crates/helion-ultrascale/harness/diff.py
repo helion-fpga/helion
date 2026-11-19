@@ -39,7 +39,7 @@ from emitter import find_emitter
 from gen_golden import GOLDEN_DIR, placement_hash
 from reference import Tier1Reference
 
-DESIGNS = ("blinky", "counter")
+DESIGNS = ("blinky", "counter", "uram")
 PARTS = ("xcku3p", "xcvu3p")
 
 

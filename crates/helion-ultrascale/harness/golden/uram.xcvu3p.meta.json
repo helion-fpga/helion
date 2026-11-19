@@ -1,0 +1,18 @@
+{
+  "design": "uram",
+  "fasm_sha256": "22e65bded0bdd0eb22b6667d842d2bb90464da4d27f6d6ef520e84ee841d8f23",
+  "notes": "One URAM288 on URAM_X0Y0 (provisional tile: no xcku3p tilegrid in any public DB; tile types URAM_URAM_FT / URAM_URAM_DELAY_FT per the BitFiltrator device file). No INT/HPIO tiles. xcvu3p placement reuses the xcku3p coordinates verbatim and is provisional until the xcvu3p device file lands.",
+  "part": "xcvu3p",
+  "placement_hash": "bee0c80b0ebb1b7abc2fc314417a35ea531a34ba7be665f81ac19cf88bda6c60",
+  "provisional_tiles": [
+    "URAM_X0Y0"
+  ],
+  "seed": 20261107,
+  "sites": [
+    {
+      "bel": "URAM288",
+      "role": "uram",
+      "tile": "URAM_X0Y0"
+    }
+  ]
+}

@@ -1,0 +1,81 @@
+# URAM288 attribute table for Vivado fuzzing job 5, pass A
+#
+# One row per variant run. Columns (tab-separated):
+#   id, attribute, kind, default, variant
+#
+# - id: stable run id, `v<nnn>`. The baseline is `v000` (all defaults).
+# - attribute: URAM288 primitive attribute name, exactly as in AMD
+#   UG974 (2023.1 English) URAM288 "Available Attributes". The full
+#   list of 34 attributes, with defaults, is recorded in
+#   crates/helion-ultrascale/data/URAM288_SEARCH.md section 5.
+# - kind: string (Verilog string literal), int (bare integer), or
+#   bits (sized Verilog literal, e.g. 1'b0, 11'h000).
+# - default: the UG974 default value. Variant: the non-default value
+#   to fuzz. Both are rendered verbatim into the variant Verilog by
+#   gen_uram_variants.py, except strings, which are quoted.
+#
+# Variant choices are minimal single changes, so the .rbt diff stays
+# attributable to the one attribute: string/boolean attributes flip
+# to their single alternate value, SELF_ADDR flips one address bit,
+# SELF_MASK clears one mask bit, AUTO_SLEEP_LATENCY moves 8 to 3,
+# AVG_CONS_INACTIVE_CYCLES moves 10 to 100.
+#
+# Notes per attribute (a zero .rbt diff is a RESULT, not a failure):
+# - AVG_CONS_INACTIVE_CYCLES is power estimation only; it may set no
+#   config bit at all.
+# - CASCADE_ORDER_A/B use FIRST, MIDDLE, and LAST (three runs each,
+# v005/v006 FIRST, v035/v036 MIDDLE, v037/v038 LAST). A single URAM
+# with a non-NONE cascade order and no chain partner may DRC in
+# Vivado; if that run fails, record it in runs.txt and stop (the
+# driver never skips a failed run). The crew then decides the
+# follow-up (a 2-URAM chain variant) from the log. This matches the
+# earlier phase-2 table in
+# docs/ultra-bitgen-crew/vivado-fuzzing/job5-uram/README.md (38
+# variant runs); the two tables agree on every value except
+# SELF_MASK (here 11'h7fe, one mask bit cleared; there 11'h000)
+# and AVG_CONS_INACTIVE_CYCLES (here 100, there 100000), where the
+# earlier values are follow-up runs, not primary runs.
+# - EN_ECC_RD/WR_* flip ECC on with no ECC data present; legal per
+#   UG974, and the diff is the encoding of the enable itself.
+# - IS_CLK_INVERTED is also a DSP48E2 attribute name; it is fuzzed
+#   here as a URAM288 attribute, on a URAM288 cell, so there is no
+#   ambiguity in this job.
+id	attribute	kind	default	variant
+v001	AUTO_SLEEP_LATENCY	int	8	3
+v002	AVG_CONS_INACTIVE_CYCLES	int	10	100
+v003	BWE_MODE_A	string	PARITY_INTERLEAVED	PARITY_INDEPENDENT
+v004	BWE_MODE_B	string	PARITY_INTERLEAVED	PARITY_INDEPENDENT
+v005	CASCADE_ORDER_A	string	NONE	FIRST
+v006	CASCADE_ORDER_B	string	NONE	FIRST
+v007	EN_AUTO_SLEEP_MODE	string	FALSE	TRUE
+v008	EN_ECC_RD_A	string	FALSE	TRUE
+v009	EN_ECC_RD_B	string	FALSE	TRUE
+v010	EN_ECC_WR_A	string	FALSE	TRUE
+v011	EN_ECC_WR_B	string	FALSE	TRUE
+v012	IREG_PRE_A	string	FALSE	TRUE
+v013	IREG_PRE_B	string	FALSE	TRUE
+v014	IS_CLK_INVERTED	bits	1'b0	1'b1
+v015	IS_EN_A_INVERTED	bits	1'b0	1'b1
+v016	IS_EN_B_INVERTED	bits	1'b0	1'b1
+v017	IS_RDB_WR_A_INVERTED	bits	1'b0	1'b1
+v018	IS_RDB_WR_B_INVERTED	bits	1'b0	1'b1
+v019	IS_RST_A_INVERTED	bits	1'b0	1'b1
+v020	IS_RST_B_INVERTED	bits	1'b0	1'b1
+v021	OREG_A	string	FALSE	TRUE
+v022	OREG_B	string	FALSE	TRUE
+v023	OREG_ECC_A	string	FALSE	TRUE
+v024	OREG_ECC_B	string	FALSE	TRUE
+v025	REG_CAS_A	string	FALSE	TRUE
+v026	REG_CAS_B	string	FALSE	TRUE
+v027	RST_MODE_A	string	SYNC	ASYNC
+v028	RST_MODE_B	string	SYNC	ASYNC
+v029	SELF_ADDR_A	bits	11'h000	11'h001
+v030	SELF_ADDR_B	bits	11'h000	11'h001
+v031	SELF_MASK_A	bits	11'h7ff	11'h7fe
+v032	SELF_MASK_B	bits	11'h7ff	11'h7fe
+v033	USE_EXT_CE_A	string	FALSE	TRUE
+v034	USE_EXT_CE_B	string	FALSE	TRUE
+v035	CASCADE_ORDER_A	string	NONE	MIDDLE
+v036	CASCADE_ORDER_B	string	NONE	MIDDLE
+v037	CASCADE_ORDER_A	string	NONE	LAST
+v038	CASCADE_ORDER_B	string	NONE	LAST
