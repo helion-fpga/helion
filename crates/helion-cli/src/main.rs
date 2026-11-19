@@ -679,7 +679,9 @@ impl SeedResult {
     fn parse_seed(line: &str) -> Option<u64> {
         let rest = line.trim_start().strip_prefix("{\"seed\":")?;
         let rest = rest.trim_start();
-        let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
         if end == 0 {
             return None;
         }
