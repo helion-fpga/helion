@@ -41,11 +41,35 @@ use std::fmt;
 /// translator filling src/dst in physical direction under the old
 /// `feature()` would have emitted `PIP.INODE.BOUNCE`, which is not in
 /// the DB.
+///
+/// Four PIPs in the INT tile are bidirectional (`is_directional` 0 in
+/// tile_type_INT.json): the mux can pass either way, and the DB carries
+/// two features per PIP, `.FWD` and `.REV` (8 features total, see the
+/// INT PIP audit). For a bidirectional PIP, `src` and `dst` are ALWAYS
+/// the tile JSON's `src_wire` and `dst_wire` (canonical order), never
+/// the route direction: both DB features spell the same
+/// `PIP.<dst>.<src>` prefix and differ only in the `.FWD` / `.REV`
+/// suffix. `bidir` records which way a route traverses the PIP: `Fwd`
+/// when the route flows in the tile JSON's src to dst direction, `Rev`
+/// when it flows the other way. It is `None` for the 3,770 directional
+/// PIPs. A bidirectional PIP with `bidir` unset has no DB feature and
+/// must fail loud at emission, never silently emit the bare feature.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct IntPip {
     pub tile: String,
     pub src: String,
     pub dst: String,
+    pub bidir: Option<BidirDir>,
+}
+
+/// Traversal direction through a bidirectional PIP, relative to the
+/// tile JSON's src to dst direction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum BidirDir {
+    /// Route flows tile src to tile dst; the DB feature is `.FWD`.
+    Fwd,
+    /// Route flows tile dst to tile src; the DB feature is `.REV`.
+    Rev,
 }
 
 impl IntPip {
@@ -54,13 +78,33 @@ impl IntPip {
             tile: tile.to_string(),
             src: src.to_string(),
             dst: dst.to_string(),
+            bidir: None,
+        }
+    }
+
+    /// A bidirectional PIP traversed in `dir`. `src` and `dst` must be
+    /// the tile JSON's canonical order (see the struct docs); `dir`
+    /// records the traversal direction relative to that order.
+    /// Directional PIPs must use [`IntPip::new`]; a directional PIP
+    /// built with a direction has no DB feature and fails loud at emission.
+    pub fn with_bidir(tile: &str, src: &str, dst: &str, dir: BidirDir) -> Self {
+        Self {
+            tile: tile.to_string(),
+            src: src.to_string(),
+            dst: dst.to_string(),
+            bidir: Some(dir),
         }
     }
 
     /// Segbits feature string, exactly as it appears in the DB.
-    /// Sink-first: `PIP.<dst>.<src>`.
+    /// Sink-first: `PIP.<dst>.<src>`, plus `.FWD` or `.REV` for a
+    /// bidirectional PIP traversed in a known direction.
     pub fn feature(&self) -> String {
-        format!("PIP.{}.{}", self.dst, self.src)
+        match self.bidir {
+            Some(BidirDir::Fwd) => format!("PIP.{}.{}.FWD", self.dst, self.src),
+            Some(BidirDir::Rev) => format!("PIP.{}.{}.REV", self.dst, self.src),
+            None => format!("PIP.{}.{}", self.dst, self.src),
+        }
     }
 
     /// Tile type for the DB lookup: the part of the tile name before the
@@ -97,22 +141,28 @@ impl EmittedPip {
 }
 
 /// A PIP the router needed that has no segbits entry. Kept exact: tile,
-/// src, dst, and the design that needed it. This list is the input to the
-/// INT PIP completeness audit.
+/// src, dst, traversal direction for bidirectional PIPs, and the design
+/// that needed it. This list is the input to the INT PIP completeness audit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MissingPip {
     pub tile: String,
     pub src: String,
     pub dst: String,
+    pub bidir: Option<BidirDir>,
     pub design: String,
 }
 
 impl fmt::Display for MissingPip {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let suffix = match self.bidir {
+            Some(BidirDir::Fwd) => ".FWD",
+            Some(BidirDir::Rev) => ".REV",
+            None => "",
+        };
         write!(
             f,
-            "{}.PIP.{}.{} (design {})",
-            self.tile, self.dst, self.src, self.design
+            "{}.PIP.{}.{}{} (design {})",
+            self.tile, self.dst, self.src, suffix, self.design
         )
     }
 }
@@ -200,6 +250,7 @@ pub fn resolve_pips(design: &str, pips: &[IntPip], db: &dyn SegbitsDb) -> PipRes
                 tile: pip.tile.clone(),
                 src: pip.src.clone(),
                 dst: pip.dst.clone(),
+                bidir: pip.bidir,
                 design: design.to_string(),
             }),
         }
@@ -274,9 +325,12 @@ mod tests {
     use crate::segbits::FileSegbitsDb;
 
     /// Two verbatim lines from prjuray-db zynqusp/segbits_int.db
-    /// (commit affbc5e, CC0 1.0).
+    /// (commit affbc5e, CC0 1.0), plus the .FWD / .REV pair for the
+    /// bidirectional PIP INT_NODE_IMUX_5_INT_OUT0 <-> BYPASS_E8.
     const FIXTURE: &str = "INT.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1 64_00 !66_00 !68_00 !72_00 !72_01 !74_00\n\
-         INT.PIP.INODE_E_1_FT1.BYPASS_E4 !57_00 !59_00 !61_00 65_01 !67_01 !69_01\n";
+         INT.PIP.INODE_E_1_FT1.BYPASS_E4 !57_00 !59_00 !61_00 65_01 !67_01 !69_01\n\
+         INT.PIP.BYPASS_E8.INT_NODE_IMUX_5_INT_OUT0.FWD !71_13 74_24\n\
+         INT.PIP.BYPASS_E8.INT_NODE_IMUX_5_INT_OUT0.REV 71_13 !74_24\n";
 
     fn fixture_db() -> FileSegbitsDb {
         FileSegbitsDb::from_text(FIXTURE, "fixture").unwrap()
@@ -353,6 +407,7 @@ mod tests {
                 tile: "INT_X12Y45".to_string(),
                 src: "NOPE_SRC".to_string(),
                 dst: "NOPE_DST".to_string(),
+                bidir: None,
                 design: "blinky".to_string(),
             }]
         );
@@ -373,5 +428,45 @@ mod tests {
         assert!(res.emitted.is_empty() && res.missing.is_empty());
         assert_eq!(missing_pip_report(&res.missing), "Missing PIPs: 0\n");
         assert!(emit_pips("blinky", &[], &db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bidir_pip_fwd_and_rev_emit_exact_bits() {
+        let db = fixture_db();
+        // Tile-canonical order for this PIP is src INT_NODE_IMUX_5_INT_OUT0,
+        // dst BYPASS_E8. Both features spell PIP.BYPASS_E8.INT_NODE_IMUX_5_INT_OUT0
+        // and differ only in the suffix.
+        let fwd = IntPip::with_bidir(
+            "INT_X12Y45",
+            "INT_NODE_IMUX_5_INT_OUT0",
+            "BYPASS_E8",
+            BidirDir::Fwd,
+        );
+        assert_eq!(fwd.feature(), "PIP.BYPASS_E8.INT_NODE_IMUX_5_INT_OUT0.FWD");
+        let emitted = emit_pips("blinky", &[fwd], &db).unwrap();
+        assert_eq!(emitted[0].set_bits, vec![BitRef::set(74, 24)]);
+        assert_eq!(emitted[0].zero_bits, vec![BitRef::zero(71, 13)]);
+        let rev = IntPip::with_bidir(
+            "INT_X12Y45",
+            "INT_NODE_IMUX_5_INT_OUT0",
+            "BYPASS_E8",
+            BidirDir::Rev,
+        );
+        assert_eq!(rev.feature(), "PIP.BYPASS_E8.INT_NODE_IMUX_5_INT_OUT0.REV");
+        let emitted = emit_pips("blinky", &[rev], &db).unwrap();
+        assert_eq!(emitted[0].set_bits, vec![BitRef::set(71, 13)]);
+        assert_eq!(emitted[0].zero_bits, vec![BitRef::zero(74, 24)]);
+    }
+
+    #[test]
+    fn bidir_pip_without_direction_fails_loud() {
+        // The bare feature PIP.BYPASS_E8.INT_NODE_IMUX_5_INT_OUT0 is not
+        // in the DB; only the .FWD / .REV suffixed features exist.
+        let db = fixture_db();
+        let bare = IntPip::new("INT_X12Y45", "INT_NODE_IMUX_5_INT_OUT0", "BYPASS_E8");
+        let err = emit_pips("blinky", &[bare], &db).unwrap_err();
+        let text = format!("{}", err);
+        assert!(text.contains("INT_X12Y45.PIP.BYPASS_E8.INT_NODE_IMUX_5_INT_OUT0"));
+        assert!(text.contains("blinky"));
     }
 }

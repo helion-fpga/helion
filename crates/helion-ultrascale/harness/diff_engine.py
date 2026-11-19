@@ -105,9 +105,20 @@ def resolve_feature(ref, part, feature):
             bits = ref.resolve_hpio(tile, feat)
             return block, bits, "tile-relative", None
         if block == "CLK":
-            if ".PIP." in feat:
+            if tile.startswith("RCLK_"):
+                bits = ref.resolve_rclk(tile, feat)
+                return block, bits, "tile-relative", None
+            if ".PIP." in feat or feat.startswith("WIRE."):
                 bits = ref.resolve_cmt_pip(tile, feat)
                 return block, bits, "tile-relative", None
+            if tile.startswith("CMT_L"):
+                raise MissingReference(
+                    "CMT BUFGCE site config has no public encoding: "
+                    "no segbits file for CMT_LEFT exists in prjuray-db, "
+                    "segbits_cmt_right.db carries HROUTE/HDISTR only, "
+                    "and BitFiltrator has no CMT data; encoding needs "
+                    "the Vivado clocking fuzz job (data/CLK_FUZZ_JOB.md, Job 4)"
+                )
             raise MissingReference(
                 "BUFGCE/MMCM config-bit encoding absent from prjuray-db "
                 "segbits_cmt_right.db (104 lines, CLK_HROUTE PIPs only) "
