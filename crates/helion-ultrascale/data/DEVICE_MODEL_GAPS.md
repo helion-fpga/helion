@@ -69,7 +69,10 @@ Status: RECORD CORRECTED, both counts grounded, tests pinned.
 The old record called the file's 27,120 a "file-header anomaly".
 That is refuted: in all 40 BitFiltrator device files, header
 `num_slices` equals geometry slices (CLB columns x FAR rows x
-60), and `create_device_summary.py` shows it is the Vivado
+60), counting rows that carry no `clb_colMajors` key as zero
+CLB columns (xcku025 rows 3-4 have minors tables but no CLB
+columns; its header 18,180 still equals 101 x 3 x 60), and
+`create_device_summary.py` shows it is the Vivado
 SLICES part property. 20,340 is LUT-derived from the
 AMD-published 162,720 LUTs (162,720 / 8 = 325,440 / 16 =
 20,340); AMD publishes no slice count, and the distributor
@@ -84,6 +87,23 @@ BRAM header 360 is exactly 9 per BRAM column (40 columns).
 Neither number was changed to match the other. See
 `tests/device_model_counts.rs`.
 
+Grounding refinement (replacement worker, 2026-11-19): the
+full-density multipliers used for the implied-site counts
+are not equally sourced. DSP 24 sites per column is grounded
+in the file itself: every row of xcku3p.json, xcku5p.json,
+and the generated xcvu3p.json carries
+`min_dsp_y_ofst`/`max_dsp_y_ofst` spanning 0..23, i.e. 24
+DSP sites per column, and KU3P usable 18 is 3/4 of that.
+BRAM 12 sites per column has no such file-internal span
+(the row records carry no BRAM y-offset range); 12 comes
+only from the KU5P ratio (480 BRAMs over 40 columns) plus
+the same 3/4 pattern (KU3P usable 9 = 3/4 of 12). The
+xcvu3p implied counts (133 cols x 24 = 3,192 DSP sites,
+70 cols x 12 = 840 BRAM sites) therefore rest on a
+file-grounded DSP multiplier and a ratio-derived BRAM
+multiplier; the test pins both so a generator change fails
+loudly, but only the DSP one is independently file-grounded.
+
 Open remainder: which sites are usable on KU3P (the fused-off
 subset of the shared die) is not in any public source.
 Unblocker: Vivado probe, `get_sites SLICE` on
@@ -93,9 +113,11 @@ per-site usable LUT/DSP/BRAM properties.
 ### (b2). xcvu3p slices: 49,250 vs 49,260
 
 Status: CLOSED before this session, verified here. No 49,250
-remains in the crate; the model uses 49,260 = 394,080 / 8
-(DS890 Table 9 exact LUT count, CTO ruling 2026-11-07; 49,250
-came from dividing the rounded 394,000). Stale 49,250
+remains in the crate as a live count or discrepancy (the
+remaining mentions are historical: "the earlier 49,250 came
+from dividing the rounded 394,000"); the model uses 49,260
+= 394,080 / 8 (DS890 Table 9 exact LUT count, CTO ruling
+2026-11-07; 49,250 came from dividing the rounded 394,000). Stale 49,250
 references in `scripts/gen_xcvu3p.py` and the xcvu3p.json
 `num_slices` note are fixed in this session (commit 98a2ce1).
 Regression test pins 49,260 x 8 = 394,080 and x 16 = 788,160,
@@ -106,9 +128,14 @@ the header. Vivado confirmation must still re-check the count.
 
 Status: OPEN, verified, narrowed, not closable from public
 sources. The gap is 16 frames, exactly 4 per FAR row, and the
-4-per-row pattern is confirmed on four devices whose UG570
-counts were checked (xcku3p, xcku5p, xcau20p, xcau25p: UG570
-41,476 each, file 41,460 each, 4 FAR rows each). The
+4-per-row pattern is confirmed on eight devices whose UG570
+counts were checked (xcku3p, xcku5p, xcau20p, xcau25p,
+xcau10p, xcau15p, xcku025, xcku035: UG570 41,476 / 41,476 /
+14,376 / 14,376 / 32,530 / 32,530, file 41,460 / 41,460 /
+14,364 / 14,364 / 32,510 / 32,510). The replacement-worker
+check 2026-11-19 extends the pattern beyond UltraScale+:
+xcku025/xcku035 are 123-word-frame UltraScale parts and show
+the same 4.00 per row (gap 20 over 5 rows). The
 extraction source is a per-frame-CRC debug bitstream's FAR
 writes, which drop reserved-address FAR writes and
 deduplicate, so the 16 frames are either missing from that
@@ -125,6 +152,24 @@ CRCs) run through BitFiltrator
 cross-check (FDRI words / 93 must equal 41,476), locating
 the 16 FARs by row and column. Needs Vivado plus the license
 server, both blocked since Oct 22, 2026.
+
+Numerical cross-check, not ground truth (replacement worker,
+2026-11-19): for the nine XCU SSI files, `file frames + 4 x
+rows` equals a UG570 Table 1 value exactly (xcu200 215,400 +
+60 = 215,460 = VU9P; xcu25 97,647 + 44 = 97,691 = KU15P;
+xcu250 304,528 + 64 = 304,592 = VU13P/VU27P/VU29P; xcu26 and
+xcux35 175,340 + 44 = 175,384 = KU19P/VU23P; xcu280 and
+xcu55c 228,396 + 48 = 228,444 = VU11P/VU37P/VU47P/VU57P;
+xcu50 and xcu55n 152,264 + 32 = 152,296 = VU35P/VU45P).
+That is consistency with the 4-per-row rule, not proof of a
+die equivalence: the XCU-to-UG570-device mapping is
+unverified, and no UG570 row exists to check the 15 Zynq
+MPSoC/RFSoC files (xczu/xazu), xck26, or xcu30 (51,882
+frames, 6 rows; 51,906 matches no UG570 Table 1 value).
+17 of 40 files are consistent with exactly 4 missing frames
+per FAR row (8 direct, 9 numerical); 23 have no UG570
+reference to check against. Do not use the XCU matches as
+ground truth for any device-file value.
 
 ### (d). Every provisional value in xcvu3p.json
 
@@ -264,3 +309,94 @@ corrected note sources (license, num_slices).
 
 No merges, no pushes, no Vivado runs, no license-port checks.
 ZedBoard untouched (out of scope).
+
+## Replacement-worker verification (session 18, 2026-11-19)
+
+The first device-model worker errored on a runtime transport
+fault (sqlx pool timeout), not on a work failure. The
+replacement worker re-verified every claim above from the
+primary sources instead of trusting the commits, using only
+lightweight reads (python3 over the vendored JSON and the
+reference clone, `git show`, `grep`, one live UG570 read).
+Findings, all reproduced this session:
+
+- eb2af3e verified: xcku3p.json header 27,120 / 162,720 /
+  325,440 / 1,368 / 360; geometry 113 CLB cols x 4 rows x 60
+  = 27,120; minors sums 41,460 frames; DSP 19 cols/row x 18
+  = 1,368; BRAM 10 cols/row x 9 = 360; KU3P/KU5P rowMajors
+  byte-identical; KU5P header 27,120 / 216,960 / 433,920 /
+  1,824 / 480 (exactly 4/3 on LUTs, DSPs, BRAMs).
+  `create_device_summary.py` line:
+  `summary["num_slices"] = part_properties["SLICES"]`.
+  All-40 header-vs-geometry check re-run: 0 mismatches (see
+  the xcku025 qualification in (b1) above).
+- 98a2ce1 verified: `parts_webpack.json` lists
+  `Virtex UltraScale+ xcvu3p: []` and 36 xcku3p parts; all
+  40 reference device files carry license Webpack; xcvu3p
+  is listed in `parts_all.json` (Virtex UltraScale+, 7
+  parts). The corrected license note is in the committed
+  xcvu3p.json; `grep -c "appears in parts_webpack"` is 0 in
+  xcvu3p.json and gen_xcvu3p.py (2 hits only in the
+  regression test that asserts the phrase is absent). No
+  file presents 49,250 as a live slice count or discrepancy:
+  the remaining `49,250` mentions in device.rs, gen_xcvu3p.py,
+  device_file_xcvu3p.rs, and xcvu3p.json are all historical
+  ("the earlier 49,250 came from dividing the rounded
+  394,000", "49,250 was a rounding artifact"). The `49,250`
+  hits in ULTRASCALE_PLUS.json and
+  ultrascale_plus_lut_ff_bram.json are (minor 49, frame_ofst
+  250) bit-location pairs, unrelated to slice counts.
+  `python3 scripts/gen_xcvu3p.py --check` reproduces the committed
+  file: slices 49,260, frames 73,035, overshoot 1,215, 18
+  provisional notes, self-checks PASS, exit 0.
+- G2 verified: device.rs grid is 144 wide x 400 tall
+  (lines 153-154); `tile_base_far` exists only on the
+  `BitgenDevice` trait (bitgen.rs:443, implemented by
+  `DeviceFile` in bitgen_device.rs:338 and the test stub),
+  never on `UltraScaleDevice`; grid.rs still carries the
+  provisional `CLBLL_L_X{x}Y{y}` tile names, owned by the
+  integration lane. xcku3p.json SHA-256 re-computed:
+  07e6a7d3d586bf9ae3ad6c5d0959b669c5332af36f473ecd44e169c47512cfbe,
+  identical to the vendored copy and the reference clone.
+- UG570 re-verified live from docs.amd.com 2026-11-19
+  (page crawled 15:11 UTC): Table 1 KU3P 41,476 frames, 93
+  words, bitstream 123,449,056 bits, overhead 515 words;
+  VU3P 71,820 frames; AU20P/AU25P 41,476; KU5P 41,476;
+  AU10P/AU15P 14,376; KU025/KU035 32,530. Table 2 KU3P
+  X4A63093 revision 0 or later, VU3P X4B39093 revision 1
+  or later. XMP103 v2.8 resource rows confirm KU3P 163K
+  LUTs / 325K FFs / 1,368 DSP and VU3P 394K LUTs / 788K
+  FFs / 2,280 DSP / 90.0 Mb URAM.
+- Frame-gap extension (this session): the 4-per-row gap now
+  holds on 8 devices with a direct UG570 Table 1 row
+  (added xcau10p, xcau15p, xcku025, xcku035), including
+  123-word-frame UltraScale parts, plus 9 XCU SSI files
+  whose `file + 4 x rows` matches a UG570 value exactly
+  (mapping unverified, recorded as numerical consistency
+  only). See (c) above.
+- Test status, open: the new regression tests in
+  `tests/device_model_counts.rs` (6 tests) and the
+  `tests/device_file_xcvu3p.rs` license-note test have NOT
+  been run green on this branch in either worker session.
+  The first worker's `cargo test -j2 -p helion-ultrascale
+  --offline` (started 14:22, log
+  /tmp/devmodel-baseline-test.log) died compiling
+  `sv-parser-syntaxtree` with rustc SIGKILLed (signal 9,
+  OOM) under 20+ concurrent cargo processes; it never
+  reached any test. The replacement worker started no
+  build: load average was 9.67 at 15:10 and 21.66 at
+  15:14 with 35 cargo processes running. A single `-j1`
+  targeted run (`cargo test -j1 -p helion-ultrascale
+  --offline --test device_model_counts --test
+  device_file_xcvu3p`) is the next step once the machine
+  quiets; until it passes, the new tests are code-reviewed
+  and python-verified only, not cargo-verified.
+
+## Commits on fm/ultra-bitgen-devmodel (replacement worker, this session)
+
+- (this file) docs(ultrascale): replacement-worker
+  verification of GAP-F7, frame-gap extension to 8 direct
+  devices plus 9 XCU numerical matches, DSP/BRAM grounding
+  refinement, xcku025 qualification. No code changes: no
+  first-worker claim was found wrong, so nothing was
+  reverted or corrected.
