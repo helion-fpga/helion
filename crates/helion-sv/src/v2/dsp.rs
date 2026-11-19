@@ -14,10 +14,12 @@
 //! product of `e1`- and `e2`-bit signed values fits in `e1 + e2` bits, so
 //! result bit `i` is `P[min(i, e1 + e2 - 1)]`, for any W.
 //!
-//! The fabric keeps a product its Wallace tree builds with one adder: an
-//! operand with at most two partial-product rows (a constant with two
-//! nonzero bits, such as 3, 5, 6 or -3, or a 1- or 2-bit operand). A power
-//! of two never gets here (`Dag::mul` makes it a shift).
+//! The fabric keeps a product that is at most one adder: a 1-bit operand
+//! (one partial-product row), or a non-negative constant with two nonzero
+//! bits (3, 5, 6, 10, ...: a shift and an add, 19 LUTs for 16 bits). A
+//! power of two never gets here (`Dag::mul` makes it a shift). Measured
+//! fabric costs of the rest, 16 bits wide: x * 7 62 LUTs, x * -3 67,
+//! 2 x 16 bits 51, 3 x 8 34, 8 x 8 115, 16 x 16 482; each is one DSP.
 //!
 //! Registers move in only on one rising clock with no gate, no
 //! asynchronous reset and a power-up value of 0 (the slice's registers
@@ -250,9 +252,12 @@ fn operand(flat: &Flat, x: N) -> Operand {
 }
 
 impl Operand {
-    /// Partial-product rows the fabric's multiplier builds for it.
-    fn rows(&self, flat: &Flat) -> usize {
-        self.bits[..self.e as usize].iter().filter(|b| flat.dag.as_const(b.0).map_or(true, |c| c[b.1 as usize])).count()
+    /// At most one adder in the fabric (see the module docs).
+    fn cheap(&self, flat: &Flat) -> bool {
+        let bits = &self.bits[..self.e as usize];
+        let rows = bits.iter().filter(|b| flat.dag.as_const(b.0).map_or(true, |c| c[b.1 as usize])).count();
+        let konst = |b: &(N, u32)| flat.dag.as_const(b.0).map(|c| c[b.1 as usize]);
+        rows <= 1 || (rows == 2 && bits.iter().all(|b| konst(b).is_some()) && konst(&bits[bits.len() - 1]) == Some(false))
     }
 
     /// The register whose output this operand is: (register, its signal).
@@ -324,7 +329,7 @@ pub fn infer(flat: &mut Flat) {
         let Op::Mul(x, y) = *flat.dag.op(m) else { continue };
         let w = flat.dag.w(m);
         let (mut a, mut b) = (operand(flat, x), operand(flat, y));
-        if a.rows(flat).min(b.rows(flat)) <= 2 {
+        if a.cheap(flat) || b.cheap(flat) {
             continue;
         }
         if a.e > 25 || b.e > 18 {
