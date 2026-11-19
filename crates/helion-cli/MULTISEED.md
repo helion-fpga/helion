@@ -100,6 +100,15 @@ imports `place_with`, `route_with`, also present at e1c2e47).
 Tests: `cargo test -j1 -p helion-cli --offline --bin helion`
 (bin target holds only the 16 multiseed tests): 16 passed,
 0 failed, including the 4 new tests from d2db932a.
+Clippy: `cargo clippy -j1 -p helion-cli --offline --bin helion
+--all-targets` cannot reach helion-cli: it stops in `helion-sv`
+with `clippy::overly_complex_bool_expr` denied by default at
+`crates/helion-sv/src/lib.rs:15059` (`descending || (!ne_cmp &&
+step_signed < 0) || (ne_cmp && step_signed < 0)`), plus 426
+warnings in that crate. Verified pre-existing: the identical
+line is at e1c2e47 and this branch has zero diff under
+`crates/helion-sv/`. Out of GAP-F6 scope, so not fixed here;
+clippy on helion-cli stays blocked on it.
 
 ### Run 1: 5-seed sweep, counter, HL10T (2026-11-19 ~17:29 UTC)
 
