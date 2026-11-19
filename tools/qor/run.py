@@ -26,6 +26,7 @@ DESIGNS = [
     ("pico", "quick", "examples/zedboard_pico_soc.sv,third_party/picorv32/picorv32.v", "examples/zedboard_pico_soc.xdc", "zedboard_pico_soc", {}),
     ("bram_fill", "full", "examples/zedboard_bram_fill.sv", "examples/zedboard_bram_fill.xdc", "zedboard_bram_fill", {}),
     ("dsp_fill_prims", "full", "examples/zedboard_dsp_fill_prims.sv", "examples/zedboard_dsp_fill.xdc", "zedboard_dsp_fill_prims", {}),
+    ("dsp_fill", "full", "examples/zedboard_dsp_fill.sv", "examples/zedboard_dsp_fill.xdc", "zedboard_dsp_fill", {}),
     ("ibex", "full", "examples/ysyx_ibex.sv,examples/ibex_obs_wrap.sv", "tools/qor/ibex_obs.xdc", "ibex_obs_wrap", {"HELION_DEFINES": "VERILATOR"}),
     # Designs proven on the board (rungs 1 and 4), and RAMs on a derived clock (G33).
     ("mmcm", "quick", "examples/zedboard_mmcm.sv", "examples/zedboard_mmcm.xdc", "zedboard_mmcm", {}),
