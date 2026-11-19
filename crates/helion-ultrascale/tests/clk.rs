@@ -8,8 +8,8 @@
 
 use helion_ultrascale::bitgen::{BitgenDevice, BitgenError, emit_frames};
 use helion_ultrascale::clk::{
-    BufceLeafConfig, BufgceHdioConfig, ClkError, bufgce_div_site_config, bufgce_hdio_ce_blocked,
-    bufgce_site_config, bufce_row_site_config, bufgctrl_site_config, clk_features_to_fasm,
+    BufceLeafConfig, BufgceHdioConfig, ClkError, bufce_row_site_config, bufgce_div_site_config,
+    bufgce_hdio_ce_blocked, bufgce_site_config, bufgctrl_site_config, clk_features_to_fasm,
     cmt_hdistr_used_feature, cmt_hroute_used_feature, mmcm_site_config, pll_site_config,
     require_no_clock_manager, resolve_bufce_leaf, resolve_bufgce_hdio, resolve_clk_feature,
     resolve_clk_features, resolve_cmt_feature,
@@ -192,13 +192,9 @@ fn bufce_leaf_all_32_sites_resolve_in_both_rclk_int_files() {
         for x in 0..8 {
             for y in 0..4 {
                 let site = format!("BUFCE_LEAF_X{x}Y{y}");
-                let bits = resolve_bufce_leaf(
-                    &db,
-                    tile_type,
-                    &site,
-                    &BufceLeafConfig::default_used(),
-                )
-                .unwrap_or_else(|e| panic!("{tile_type} {site} must resolve: {e}"));
+                let bits =
+                    resolve_bufce_leaf(&db, tile_type, &site, &BufceLeafConfig::default_used())
+                        .unwrap_or_else(|e| panic!("{tile_type} {site} must resolve: {e}"));
                 assert_eq!(bits.len(), 9, "{tile_type} {site} bit count");
             }
         }
@@ -286,12 +282,7 @@ fn rclk_pip_muxes_resolve_with_complement_bits() {
     // HDIO BUFGCE input mux: CLK_INT_TOP sets 05_07, the CMT mux
     // alternative clears the same bit.
     assert_eq!(
-        resolve_clk_feature(
-            &db,
-            "RCLK_HDIO",
-            "PIP.CLK_BUFGCE_HDIO_0_CLK_IN.CLK_INT_TOP"
-        )
-        .unwrap(),
+        resolve_clk_feature(&db, "RCLK_HDIO", "PIP.CLK_BUFGCE_HDIO_0_CLK_IN.CLK_INT_TOP").unwrap(),
         vec![BitRef::set(5, 7)]
     );
     assert_eq!(
@@ -343,11 +334,7 @@ fn clk_resolution_partitions_resolved_from_missing() {
             "RCLK_INT_L",
             "BUFCE_LEAF_X0Y0.BUFCE_LEAF.CE_TYPE.SYNC",
         ),
-        (
-            "CMT_RIGHT_X0Y0",
-            "CMT_RIGHT",
-            "WIRE.CLK_HDISTR_0_0.USED.V1",
-        ),
+        ("CMT_RIGHT_X0Y0", "CMT_RIGHT", "WIRE.CLK_HDISTR_0_0.USED.V1"),
         ("CMT_L_X0Y0", "CMT_L", "BUFGCE_X0Y0.BUFGCE.IINV.V0"),
     ];
     let out = resolve_clk_features(&db, &requests, "clk_blinky");
@@ -422,11 +409,7 @@ fn clk_blinky_golden_splits_resolved_from_blocked() {
         // CMT_L_X0Y0 gives CMT_L.
         let xpos = tile.rfind("_X").unwrap();
         let tile_type = &tile[..xpos];
-        requests.push((
-            tile.to_string(),
-            tile_type.to_string(),
-            feature.to_string(),
-        ));
+        requests.push((tile.to_string(), tile_type.to_string(), feature.to_string()));
     }
     assert_eq!(requests.len(), 9, "CLK lines in the golden");
     let refs: Vec<(&str, &str, &str)> = requests
