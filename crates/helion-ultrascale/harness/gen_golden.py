@@ -194,10 +194,13 @@ HEADER = """# golden FASM: {design} on {part}
 def build_lutram_fasm(design, part):
     """FASM for the lutram golden: one RAM64X1S on SLICE_X1Y0 ALUT.
 
-    The line spellings must match the Rust `lutram_fasm` /
-    `lutram_slice_fasm` output exactly (checked by tests on both
-    sides); the duplication is deliberate, the two implementations
-    are in different languages and the tests pin them together.
+    The mode lines match the Rust `lutram_fasm` /
+    `lutram_slice_fasm` output exactly; the INIT line matches after
+    roundtrip normalization only (the Rust emitter renders Verilog
+    `64'h...`, the golden uses the harness `0x...` spelling, same
+    value; see roundtrip.py). The duplication is deliberate, the two
+    implementations are in different languages and the tests pin
+    them together.
     """
     lines = [LUTRAM_HEADER.format(design=design, part=part, seed=SEED).rstrip()]
     lines.append(
