@@ -233,13 +233,13 @@ fn input_registers_are_areg_and_breg() {
 }
 
 #[test]
-fn an_input_register_read_elsewhere_stays_too() {
+fn an_input_register_read_elsewhere_stays_in_the_fabric() {
     let (d, _, regs) = one(&format!(
         "module t({IO}, output logic signed [42:0] p, output logic signed [24:0] o); logic signed [24:0] ar;
          always_ff @(posedge clk) begin ar <= a; p <= ar * b; end assign o = ar; endmodule"
     ));
-    assert_eq!(regs, "1 0 0 1");
-    assert_eq!(flops(&d), 25, "ar's flops feed o");
+    assert_eq!(regs, "0 0 0 1");
+    assert_eq!(flops(&d), 25, "ar's flops feed o and A");
 }
 
 #[test]
