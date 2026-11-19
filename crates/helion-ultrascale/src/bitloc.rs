@@ -52,13 +52,55 @@
 //! non-canonical; the `.V0`/`.V1` spelling below selects the feature by
 //! value and lets segbits resolution carry the polarity.
 //!
-//! LUTRAM is BLOCKED, fail loud. The BitFiltrator paper section V-B does
-//! not state that LUTRAM uses the same INIT bits as LUTs: it describes
-//! LUTRAM/register formats as discovered separately from the logic
-//! location file (LUTRAMs are user-state bits), while standard LUTs were
-//! discovered by fuzzing. The arch JSON contains no LUTRAM table either.
-//! Until a LUTRAM table or Vivado logic-location data lands, any LUTRAM
-//! request returns [`BitLocError::LutramBlocked`] and emits no bits.
+//! LUTRAM content bits ARE the LUT INIT bits (derived, not assumed).
+//! Three independent public sources agree:
+//! - BitFiltrator's own extraction code
+//!   (`bitfiltrator-ref/src/extract_encoding_from_logic_loc.py`, the
+//!   `LutramLoc`/`LutLoc` branch): "the INIT bits we were interested in
+//!   ended up having the same encoding for LUTRAMs and standard LUTs
+//!   when we extracted the data", so both map to the one `LutLoc` key.
+//!   The pipeline extracts CLEM/CLEM_R `LutLoc` from Vivado
+//!   logic-location files of all-LUTRAM columns (`^LutramLoc$`, see
+//!   `create_arch_summary.py`, the SLICEM loop) and CLEL_L/CLEL_R
+//!   `LutLoc` from a LUT INIT fuzzing sweep (the SLICEL loop).
+//! - The vendored tables are byte-identical across all four tile types
+//!   (checked by `tests/lutram.rs`: 0 differing pairs out of 30,720 per
+//!   tile-type pair, all 60 Y rows, all 8 LUTs, all 64 bits). The
+//!   LUTRAM-extracted table and the LUT-sweep table are the same table.
+//! - prjuray-db segbits agree bit for bit: every `xLUT.INIT[i]` line in
+//!   all four vendored `segbits_cle*.db` files equals the `LutLoc` Y0
+//!   pair (512 of 512 per tile type, checked by `tests/lutram.rs`).
+//! The LUTRAM mode-selection bits live in the vendored segbits DBs, not
+//! in this table: `xLUT.MODE.RAM` (2 bits per LUT), `xLUT.DI1.*` (1 bit,
+//! A..G LUTs only; the H LUT has no DI1 feature), `xLUT.SIZE.*` (1 bit
+//! per LUT), `WA7/8/9USED.V0/V1` (1 bit each, slice-wide). None of them
+//! collides with any INIT bit (checked by `tests/lutram.rs`).
+//! A LUTRAM is therefore emitted as its 64 content bits through
+//! [`lut_placed_bits`] with [`LutMode::Lutram`] (same locations as a
+//! logic LUT, block label `LUT_INIT`) plus its mode lines through
+//! [`lutram_fasm`] (block `LUTRAM`). The mode-line selection for a
+//! 64x1 single-port RAM (RAM64X1S) follows the f4pga Project X-Ray
+//! DRAM documentation (7-series feature family, same concepts under
+//! UltraScale+ spellings): 64x1S needs `xLUT.RAM` plus the data-in mux
+//! to the LUT's own input, `SMALL` only for 32-bit use, `WA7/8USED`
+//! only for 128x1/256x1 use. That selection is a documented
+//! cross-family inference, not a Vivado-verified UltraScale+ fact:
+//! tier 2 (a Vivado bitstream diff) remains the arbiter for it. The
+//! bit LOCATIONS are proven by the three sources above; only the
+//! SELECTION of the mode values awaits tier 2.
+//! LUTRAMs live on SLICEM tiles only (CLEM/CLEM_R). A LUTRAM request on
+//! a SLICEL tile fails loud with [`BitLocError::LutramRequiresSlicem`].
+//! The H LUT has no DI1 feature in the vendored DB, so [`lutram_fasm`]
+//! fails loud for it with [`BitLocError::LutramNoDataInput`]: the H
+//! data-input path is unverified, never guessed.
+//!
+//! Interface to the synthesis-mapping worker (fm/ultra-bitgen-synthmap):
+//! that worker owns mapping netlist RAM cells to UltraScale primitives
+//! (RAM64X1S and friends) and deciding which packed LUTs are memory
+//! LUTs (`pack::lut_is_memory`, `LutMode::Lutram`); this module owns
+//! only the bit locations and the FASM spelling for one such LUT.
+//! Coordination goes through the orchestrator, never by editing the
+//! other worker's branch.
 //!
 //! BRAM tile use (CTO ruling on critic G3): a BRAM tile is 720 RAMB36E2
 //! total across the part. The two RAMB18E2 BELs on a tile are alternate
@@ -130,8 +172,10 @@ impl std::str::FromStr for ClbTileType {
 pub enum LutMode {
     /// Plain 6-input LUT. INIT bits come from `LutLoc`.
     Logic,
-    /// LUTRAM (distributed RAM). BLOCKED: no table, no verified
-    /// equivalence; see the module docs. Requests fail loud.
+    /// LUTRAM (distributed RAM). Content bits use the LUT INIT
+    /// locations (proven same encoding, see the module docs); only
+    /// SLICEM tiles (CLEM/CLEM_R) accept it, enforced in
+    /// [`lut_placed_bits`].
     Lutram,
 }
 
@@ -142,6 +186,12 @@ pub enum Block {
     FfInit,
     BramContent,
     BramParity,
+    /// LUTRAM mode-selection bits (`xLUT.MODE.RAM`, `xLUT.DI1.*`,
+    /// `xLUT.SIZE.*`, `WA7/8/9USED`). A LUTRAM's 64 content bits are
+    /// `LutInit` bits (same encoding, proven in the module docs); this
+    /// block labels only the mode bits, which arrive via the segbits DB,
+    /// not via [`PlacedBit`].
+    Lutram,
 }
 
 impl Block {
@@ -151,6 +201,7 @@ impl Block {
             Block::FfInit => "FF_INIT",
             Block::BramContent => "BRAM_CONTENT",
             Block::BramParity => "BRAM_PARITY",
+            Block::Lutram => "LUTRAM",
         }
     }
 }
@@ -231,12 +282,14 @@ pub enum BitLocError {
     BramIndexOutOfRange { index: u32, max: u32 },
     /// Tile-type name is not one of CLEL_L, CLEL_R, CLEM, CLEM_R.
     UnknownTileType(String),
-    /// LUTRAM emission requested. No LUTRAM table exists in the vendored
-    /// BitFiltrator JSON, and paper section V-B does not establish that
-    /// LUTRAM shares the LUT INIT bits (it describes separate extraction
-    /// methods). Blocked until a LUTRAM table or Vivado logic-location
-    /// data lands.
-    LutramBlocked,
+    /// LUTRAM requested on a SLICEL tile (CLEL_L/CLEL_R). LUTRAMs live
+    /// on SLICEM tiles (CLEM/CLEM_R) only; the vendored segbits DBs
+    /// carry no MODE.RAM feature for SLICEL tiles.
+    LutramRequiresSlicem(ClbTileType),
+    /// LUTRAM FASM requested for a LUT with no DI1 feature in the
+    /// vendored segbits DB (the H LUT). The H data-input path is
+    /// unverified; it fails loud instead of guessing a DI source.
+    LutramNoDataInput(u8),
     /// The vendored table file is missing a key or has the wrong shape.
     TableCorrupt(String),
 }
@@ -256,11 +309,14 @@ impl fmt::Display for BitLocError {
             BitLocError::UnknownTileType(name) => {
                 write!(f, "unknown CLB tile type {name:?}")
             }
-            BitLocError::LutramBlocked => write!(
+            BitLocError::LutramRequiresSlicem(tile) => write!(
                 f,
-                "LUTRAM emission blocked: no LUTRAM table in the vendored \
-                 BitFiltrator JSON and paper section V-B does not establish \
-                 that LUTRAM shares the LUT INIT bits"
+                "LUTRAM requested on SLICEL tile {}: LUTRAMs live on SLICEM tiles (CLEM/CLEM_R) only",
+                tile.json_key()
+            ),
+            BitLocError::LutramNoDataInput(lut) => write!(
+                f,
+                "LUTRAM on LUT {lut} has no DI1 feature in the vendored segbits DB: the data-input path is unverified"
             ),
             BitLocError::TableCorrupt(detail) => {
                 write!(f, "vendored bit-location table corrupt: {detail}")
@@ -592,8 +648,11 @@ pub fn lut_locations(
 }
 
 /// The 64 placed INIT bits for one LUT, in INIT-bit order, each with its
-/// table location and its value from `init`. LUTRAM mode fails loud with
-/// [`BitLocError::LutramBlocked`] and emits nothing.
+/// table location and its value from `init`. LUTRAM mode returns the same
+/// 64 locations as logic mode (proven same encoding, see the module
+/// docs), labeled block `LutInit`; the mode-selection bits are separate
+/// segbits features, emitted by [`lutram_fasm`]. LUTRAM mode on a SLICEL
+/// tile fails loud with [`BitLocError::LutramRequiresSlicem`].
 pub fn lut_placed_bits(
     tile_type: ClbTileType,
     slice_y: u32,
@@ -602,7 +661,10 @@ pub fn lut_placed_bits(
     init: u64,
 ) -> Result<Vec<PlacedBit>, BitLocError> {
     if mode == LutMode::Lutram {
-        return Err(BitLocError::LutramBlocked);
+        match tile_type {
+            ClbTileType::Clem | ClbTileType::ClemR => {}
+            other => return Err(BitLocError::LutramRequiresSlicem(other)),
+        }
     }
     let locs = lut_locations(tile_type, slice_y, lut_index)?;
     Ok(locs
@@ -629,6 +691,59 @@ pub fn lut_init_fasm(
     Ok(format!(
         "SLICE_X{slice_x}Y{slice_y}.{name}.INIT[63:0] = 64'h{init:016X}"
     ))
+}
+
+/// FASM lines for one 64x1 single-port LUTRAM (RAM64X1S) on one LUT, in
+/// emission order: the content line (same `INIT[63:0]` spelling as a
+/// logic LUT, same 64 locations), then the mode lines, all bare
+/// presence-only features resolved through the vendored segbits DBs:
+/// `{L}LUT.MODE.RAM` (RAM mode, 2 bits), `{L}LUT.DI1.DI1` (write data
+/// from the DI1 input, not serial-in), `{L}LUT.SIZE.LARGE` (64-bit use:
+/// all 6 address inputs; the `SIZE` bit reads 0 for LARGE).
+///
+/// Mode-line selection follows the f4pga Project X-Ray DRAM
+/// documentation (7-series feature family, same concepts under
+/// UltraScale+ spellings): 64x1S needs `xLUT.RAM` plus the data-in mux
+/// to the LUT's own input; `SMALL` only for 32-bit use; `WA7/8USED`
+/// only for 128x1/256x1 use (those are slice-wide, see
+/// [`lutram_slice_fasm`]). That selection is a documented cross-family
+/// inference; tier 2 (a Vivado bitstream diff) remains its arbiter.
+/// The H LUT (index 7) has no DI1 feature in the vendored DB, so this
+/// fails loud for it with [`BitLocError::LutramNoDataInput`]. Callers
+/// must place the LUT on a SLICEM tile (pack/legality enforces it);
+/// emitting these lines for a SLICEL tile fails loud at segbits
+/// resolution (no MODE.RAM feature exists for SLICEL tiles).
+pub fn lutram_fasm(
+    slice_x: u32,
+    slice_y: u32,
+    lut_index: u8,
+    init: u64,
+) -> Result<Vec<String>, BitLocError> {
+    if lut_index == 7 {
+        return Err(BitLocError::LutramNoDataInput(lut_index));
+    }
+    let letter = (b'A' + lut_index) as char;
+    Ok(vec![
+        lut_init_fasm(slice_x, slice_y, lut_index, init)?,
+        format!("SLICE_X{slice_x}Y{slice_y}.{letter}LUT.MODE.RAM"),
+        format!("SLICE_X{slice_x}Y{slice_y}.{letter}LUT.DI1.DI1"),
+        format!("SLICE_X{slice_x}Y{slice_y}.{letter}LUT.SIZE.LARGE"),
+    ])
+}
+
+/// FASM lines for the slice-wide write-address-use bits of a SLICEM
+/// slice holding only 64-deep RAMs: `WA7USED.V0`, `WA8USED.V0`,
+/// `WA9USED.V0` (WA7/8/9 not used: the f4pga DRAM documentation
+/// requires them only for 128x1/256x1 slice-wide modes). The `.V0`
+/// spelling names the value 0 (not used); each line resolves to a
+/// must-be-0 bit in the vendored segbits DBs. Emit once per slice,
+/// not once per LUT.
+pub fn lutram_slice_fasm(slice_x: u32, slice_y: u32) -> Vec<String> {
+    vec![
+        format!("SLICE_X{slice_x}Y{slice_y}.WA7USED.V0"),
+        format!("SLICE_X{slice_x}Y{slice_y}.WA8USED.V0"),
+        format!("SLICE_X{slice_x}Y{slice_y}.WA9USED.V0"),
+    ]
 }
 
 // ---------------------------------------------------------------------------
