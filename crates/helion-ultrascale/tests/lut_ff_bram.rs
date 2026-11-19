@@ -839,8 +839,5 @@ fn uram_blocked_fail_loud() {
     // No URAM288 content table exists in any public source, and
     // URAM288 has no INIT attributes to sweep. A URAM content request
     // must error and emit no bits, never fall back to the BRAM table.
-    assert_eq!(
-        uram_content_locations(0),
-        Err(BitLocError::UramBlocked)
-    );
+    assert_eq!(uram_content_locations(0), Err(BitLocError::UramBlocked));
 }

@@ -149,7 +149,10 @@ mod tests {
     fn uram_tile_is_uram_even_for_pips() {
         // No segbits DB exists for the URAM tile type at all, so even a
         // routing PIP on a URAM tile has no encoding.
-        assert!(is_uram288_entry("URAM_X0Y0", "PIP.URAM_X0Y0_FOO.URAM_X0Y0_BAR"));
+        assert!(is_uram288_entry(
+            "URAM_X0Y0",
+            "PIP.URAM_X0Y0_FOO.URAM_X0Y0_BAR"
+        ));
     }
 
     #[test]
