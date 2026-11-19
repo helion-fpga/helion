@@ -374,6 +374,45 @@ class Tier1Reference:
             bits[(f, bit)] = val
         return bits
 
+    def resolve_carry8(self, part, slice_x, slice_y, feature):
+        """Reference bits for one CARRY8 feature: {(far, offset): value}.
+
+        CARRY8 lives in the CLB segbits DBs (prjuray-db, CC0): 24
+        features per CLB tile type (CARRY_TYPE.DUAL_CY4/SINGLE_CY8,
+        CI.AX/CI.V0/CI.V1, CI_TOP.EX/CI_TOP.V0/CI_TOP.V1,
+        DI0.AX/DI0.DI0 through DI7.HX/DI7.DI7), identical on CLEL_L,
+        CLEL_R, CLEM, and CLEM_R. Absolute FARs use the same
+        construction as the other CLB resolvers: DB frame minor plus
+        the tile column major. A feature absent from the DB for its
+        tile type fails loud: no CARRY8 bit is ever guessed.
+
+        Grounding limit, recorded not hidden: BitFiltrator ships no
+        CARRY8 table, so there is no second-source cross-check (unlike
+        LUT/FF, which cross-check against BitFiltrator). The DB lists
+        one line per feature per tile type, so Y-independence within
+        a column is the DB's own structure, not independently
+        verified. A Vivado bitstream with a known CARRY8 config is
+        the tier-2 check for this block.
+        """
+        row_major, _ = self._slr_row(part, slice_y, NUM_CLB_PER_COLUMN)
+        col_major, tile_type = self._clb_column(part, row_major, slice_x)
+        db_name = {
+            "CLEL_L": "clel_l", "CLEL_R": "clel_r",
+            "CLEM": "clem", "CLEM_R": "clem_r",
+        }[tile_type]
+        db = self.segbits(db_name)
+        key = "%s.CARRY8.%s" % (tile_type, feature[len("CARRY8."):])
+        if key not in db:
+            raise MissingReference(
+                "CARRY8 feature %r not in prjuray-db segbits_%s.db; "
+                "no public encoding for this CARRY8 feature" % (feature, db_name)
+            )
+        bits = {}
+        for frame, bit, val in db[key]:
+            f = far(BLOCK_CLB_IO_CLK, row_major, col_major, frame)
+            bits[(f, bit)] = val
+        return bits
+
     def resolve_hpio(self, tile, feature):
         """Reference bits for one HPIO feature, tile-relative.
 
