@@ -47,9 +47,14 @@ them, with no other block regressed.
   because no INIT attribute exists) and reports URAM288 blocked with
   the missing data named; full-run record count is 60 (3 designs x
   2 parts x 10 blocks). The Job 5 package is ready to run at
-  docs/ultra-bitgen-crew/fuzzing-job5-uram288/ (JOB5.md, 35-run
-  attribute sweep, 13-run content-probe pass with an all-ones
-  control, 1-run one-per-column pass; 49 runs total). The encoding
+  docs/ultra-bitgen-crew/fuzzing-job5-uram288/ (JOB5.md, 39-run
+  attribute sweep with 38 variants, 13-run content-probe pass with
+  an all-ones control, 1-run one-per-column pass; 53 runs total),
+  built on the branch's phase scaffold at
+  docs/ultra-bitgen-crew/vivado-fuzzing/job5-uram/ (commit
+  013044f2); JOB5.md records where the two packages differ
+  (variant values, port ties, COMPRESS/CRC convention) and which
+  form runs. The encoding
   itself is still missing: URAM288 stays BLOCKED on the Vivado
   license, and no bit is emitted for any URAM design.
 - The out-of-scope rules are set (INTERFACES.md): DSP48E2 config bits are

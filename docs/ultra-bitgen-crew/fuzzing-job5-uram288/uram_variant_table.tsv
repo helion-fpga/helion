@@ -23,10 +23,18 @@
 # Notes per attribute (a zero .rbt diff is a RESULT, not a failure):
 # - AVG_CONS_INACTIVE_CYCLES is power estimation only; it may set no
 #   config bit at all.
-# - CASCADE_ORDER_A/B use FIRST. A single URAM with FIRST and no
-#   chain partner may DRC in Vivado; if that run fails, record it in
-#   runs.txt and stop (the driver never skips a failed run). The crew
-#   then decides the follow-up (a 2-URAM chain variant) from the log.
+# - CASCADE_ORDER_A/B use FIRST, MIDDLE, and LAST (three runs each,
+# v005/v006 FIRST, v035/v036 MIDDLE, v037/v038 LAST). A single URAM
+# with a non-NONE cascade order and no chain partner may DRC in
+# Vivado; if that run fails, record it in runs.txt and stop (the
+# driver never skips a failed run). The crew then decides the
+# follow-up (a 2-URAM chain variant) from the log. This matches the
+# earlier phase-2 table in
+# docs/ultra-bitgen-crew/vivado-fuzzing/job5-uram/README.md (38
+# variant runs); the two tables agree on every value except
+# SELF_MASK (here 11'h7fe, one mask bit cleared; there 11'h000)
+# and AVG_CONS_INACTIVE_CYCLES (here 100, there 100000), where the
+# earlier values are follow-up runs, not primary runs.
 # - EN_ECC_RD/WR_* flip ECC on with no ECC data present; legal per
 #   UG974, and the diff is the encoding of the enable itself.
 # - IS_CLK_INVERTED is also a DSP48E2 attribute name; it is fuzzed
@@ -67,3 +75,7 @@ v031	SELF_MASK_A	bits	11'h7ff	11'h7fe
 v032	SELF_MASK_B	bits	11'h7ff	11'h7fe
 v033	USE_EXT_CE_A	string	FALSE	TRUE
 v034	USE_EXT_CE_B	string	FALSE	TRUE
+v035	CASCADE_ORDER_A	string	NONE	MIDDLE
+v036	CASCADE_ORDER_B	string	NONE	MIDDLE
+v037	CASCADE_ORDER_A	string	NONE	LAST
+v038	CASCADE_ORDER_B	string	NONE	LAST

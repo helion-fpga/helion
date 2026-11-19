@@ -32,10 +32,11 @@ URAM columns xcvu3p has or which frames each column occupies.
 
 ## Method (BitFiltrator paper section V)
 
-1. Pass A, attribute sweep (35 runs): baseline (v000), one URAM288
+1. Pass A, attribute sweep (39 runs): baseline (v000), one URAM288
    with DONT_TOUCH, all attributes at UG974 defaults, placed at one
    fixed site. For each of the 34 URAM288 attributes, one bitstream
-   per non-default value (v001..v034, `uram_variant_table.tsv`).
+   per non-default value (v001..v038, `uram_variant_table.tsv`; 38
+   variants because CASCADE_ORDER_A/B have three values each).
    Each variant differs from the baseline in exactly one attribute.
 2. Pass B, content probes (13 runs): baseline (p000), one URAM288
    through an xpm_memory_spram with `MEMORY_PRIMITIVE` "ultra" and
@@ -48,8 +49,8 @@ URAM columns xcvu3p has or which frames each column occupies.
    column, all at UG974 defaults. The `.ll` file maps every column's
    cell to its frames.
 
-Total: 49 Vivado runs (35 + 13 + 1). The instructions estimate
-60-100 runs for job 2; 49 is the single-attribute plus probe sweep
+Total: 53 Vivado runs (39 + 13 + 1). The instructions estimate
+60-100 runs for job 2; 53 is the single-attribute plus probe sweep
 for URAM. Follow-up combined runs are extra and are logged
 separately.
 
@@ -57,8 +58,8 @@ separately.
 
 | File | What it is |
 |---|---|
-| `uram_variant_table.tsv` | The pass-A sweep table: 34 attributes, 34 variants, defaults and variant values. Single source of truth. |
-| `gen_uram_variants.py` | Generates `variants/v000..v034/uram_variant.v` plus `manifest.tsv` from the table. Self-checks that every variant differs from the baseline in exactly one attribute line. |
+| `uram_variant_table.tsv` | The pass-A sweep table: 34 attributes, 38 variants, defaults and variant values. Single source of truth. |
+| `gen_uram_variants.py` | Generates `variants/v000..v038/uram_variant.v` plus `manifest.tsv` from the table. Self-checks that every variant differs from the baseline in exactly one attribute line. |
 | `gen_uram_content_probes.py` | Generates `probes/p000..p012/probe.mem` plus `uram_probe.v` plus `manifest.tsv`. Self-checks the `.mem` shape (4096 lines of 18 hex digits). |
 | `gen_uram_column_design.py` | Generates `column_design.v` (one URAM288 per column) from `column_sites.txt`. |
 | `pick_uram_site.tcl` | Resolves one fixed URAM288 site (lowest site in dictionary order) for passes A and B. Run once, by the driver. |
@@ -108,9 +109,10 @@ Plus, once per job, in `out/`:
 A variant whose `.rbt` is identical to the baseline is a RESULT, not
 a failure. It means that attribute value produces no config-bit
 change in isolation (for example, `AVG_CONS_INACTIVE_CYCLES` is
-power estimation only and may set no bit, and `CASCADE_ORDER_A =
-FIRST` on a lone URAM may be a no-op or a DRC; a DRC is a failed run
-with a log, not a zero diff). Record the zero diff in the analysis.
+power estimation only and may set no bit, and a non-NONE
+`CASCADE_ORDER` on a lone URAM may be a no-op or a DRC; a DRC is a
+failed run with a log, not a zero diff). Record the zero diff in
+the analysis.
 Do not silently re-run the variant combined with its enabling
 attribute as the primary run. If a combined run is wanted, log it in
 `runs.txt` as a follow-up run with both attributes named, and keep
@@ -174,19 +176,72 @@ Once vendored, the `UramBlocked` fail-loud paths in
 `src/bitloc.rs` are replaced by real emission, with regression tests
 and the URAM golden design diffed to zero.
 
-## Fixes vs the shipped fuzzing package
+## Relationship to the earlier phase scaffold on this branch
+
+This package does not replace
+`docs/ultra-bitgen-crew/vivado-fuzzing/job5-uram/` (commit 013044f2,
+same branch). That directory is the phase scaffold: `tcl/uram.v`
+(the UG974-defaults template, G_SIZE generate), `tcl/
+one_uram_in_every_uram_column.tcl` (SLR- and clock-region-aware
+phase-1 runner), and its README (phase plan, package defects). This
+package is the runnable job built on it: the driver, the table-driven
+generators, and passes A, B, and C. Where the two disagree, the
+difference is recorded here, not hidden:
+
+- Variant values: this package's table agrees with the scaffold's
+  phase-2 table on every value except SELF_MASK (here `11'h7fe`, one
+  mask bit cleared, so the diff stays attributable; there
+  `11'h000`) and AVG_CONS_INACTIVE_CYCLES (here 100, there 100000).
+  The scaffold values are follow-up runs, not primary runs.
+  CASCADE_ORDER has three variants per port in both (FIRST, MIDDLE,
+  LAST; 38 variants total), after this package was extended from
+  FIRST-only to match.
+- Port ties: this package's generator ties BWE to 0 and RDB_WR to 1,
+  matching `uram.v`, so the pass-A baseline is the same design as
+  the scaffold template with G_SIZE=1. The RDB_WR polarity is not
+  asserted in either document; the tie is constant across all
+  variants in both, so no sweep result depends on it.
+- Pass C vs phase 1: the scaffold's phase-1 script enumerates the
+  bottom-most site per URAM column SLR by SLR and clock region by
+  clock region, using the shipped `helpers.tcl`, with
+  `-no_timing_driven` synthesis, no `opt_design`, and
+  `BITSTREAM.GENERAL.COMPRESS FALSE` plus `CRC DISABLE` (deliberate
+  there, for deterministic frames). This package's pass C enumerates
+  the lowest site per X (the same site: dictionary order is X then
+  Y, so lowest per X is bottom-most per column) and runs the
+  standard flow template with `opt_design` and neither CRC nor
+  compression override, like passes A and B. The two pass-C forms
+  are alternatives, not both to run: run this package's pass C,
+  which the driver drives. Two open items for the crew before
+  diffing any phase-1 output against the Job 1 empty design: the
+  COMPRESS/CRC settings must match the Job 1 empty run's settings
+  or the framing bits will differ for reasons that have nothing to
+  do with URAM, and the `-no_timing_driven` / skipped `opt_design`
+  choice must be one convention, not two.
+- Phase 3 vs pass B: the scaffold's phase 3 is probe-first (inspect
+  the phase-1 `.ll`, run `report_property` on a placed URAM cell,
+  design the sweep only if a contents mechanism is found). Pass B
+  supersedes it with a sourced mechanism: the XPM `.mem` file
+  (UG974 XPM_MEMORY_SPRAM). If the pass-B control fails (p012 .rbt
+  identical to p000 .rbt), the scaffold's `report_property` step is
+  the fallback: run it on the placed cell, record the full property
+  list in `runs.txt`, and report the content encoding as still
+  blocked with that list attached.
 
 The shipped package (`~/workspace/your_files/vivado-fuzzing-package.zip`,
 `instructions.md` identical to
 `~/workspace/your_files/vivado-fuzzing-instructions.md`) had these
 gaps for job 5, all fixed on this branch:
 
-- F1 (missing): no job-5 sweep script existed at all. The
-  instructions described the method in one paragraph ("Mirror the
-  BRAM approach (one URAM per column, then content sweep)"). This
-  directory adds the table, both generators, the site pickers, the
-  three per-run drivers, the column design generator, and the job
-  driver.
+- F1 (missing): the shipped package had no job-5 script at all.
+  The instructions described the method in one paragraph ("Mirror
+  the BRAM approach (one URAM per column, then content sweep)"). The
+  branch's phase scaffold
+  (`docs/ultra-bitgen-crew/vivado-fuzzing/job5-uram/`, commit
+  013044f2) added the template, the phase-1 runner, and the phase
+  plan. This directory adds the runnable job on top of it: the
+  table, both generators, the site pickers, the three per-run
+  drivers, the column design generator, and the job driver.
 - F2 (wrong method): mirroring the BRAM approach literally does not
   work for URAM288, because URAM288 has no INIT attributes to sweep
   (UG974 lists 34 attributes, no INIT; see
@@ -206,7 +261,7 @@ gaps for job 5, all fixed on this branch:
   is the fuzzed attribute or content.
 - F5 (unpinned): the instructions say "one URAM per column, then
   content sweep" with no attribute list, no probe set, and no
-  control. The table pins the exact 34 attributes and 34 variant
+  control. The table pins the exact 34 attributes and 38 variant
   values, the probe generator pins the exact 13 probes including the
   all-ones control, and pass C pins the column enumeration.
 
