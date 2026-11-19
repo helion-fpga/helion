@@ -34,9 +34,20 @@
 //! `num_minors_per_bram_content_colMajor` over all rows of xcku3p.json
 //! gives 41,460 frames, while AMD UG570 Table 1 lists 41,476
 //! configuration frames for KU3P. The gap is 16 frames, exactly 4 per
-//! FAR row, systematic across every BitFiltrator device file checked.
-//! `DeviceFile::total_frames` reports the file's own total; the UG570
-//! delta is documented, not adjusted.
+//! FAR row. It is systematic: the same 4-per-row gap holds on every
+//! BitFiltrator device file whose UG570 Table 1 count was checked
+//! 2026-11-19 (xcku3p, xcku5p, xcau20p, xcau25p: UG570 41,476 each,
+//! file 41,460 each, 4 FAR rows each). The extraction source is a
+//! per-frame-CRC debug bitstream's FAR writes (BitFiltrator
+//! `extract_all_frame_addresses.py`, which drops FAR writes to a
+//! reserved address and deduplicates), so the 16 frames are either
+//! missing from that extraction or counted by UG570 outside the
+//! FAR-addressable minors; block type 2 is excluded as the cause
+//! (UG570 FAR table: a normal bitstream does not include block
+//! types 010, 011, or 100). `DeviceFile::total_frames` reports the
+//! file's own total; the UG570 delta is documented, not adjusted.
+//! Unblocker: a fresh Vivado KU3P debug-bitstream FAR enumeration
+//! with an FDRI word-count cross-check, locating the 16 FARs.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -1231,9 +1242,14 @@ mod tests {
         // Both header values come from Vivado part properties via
         // create_device_summary.py, so they are reported as file
         // truth and never derived from geometry. The 3/4 ratio is
-        // an open question (Vivado part-property counting vs
-        // physical sites), recorded in data/README.md. The loader
-        // must not assert num_luts == num_slices * 8.
+        // the KU3P usable fraction of the shared KU3P/KU5P die:
+        // KU5P has the identical file geometry and the identical
+        // UG570 Table 1 frame count (41,476), with 216,960 LUTs,
+        // 1,824 DSPs, and 480 BRAMs, exactly 4/3 of KU3P on each.
+        // 20,340 usable slices is the LUT-derived count
+        // (162,720 / 8); 27,120 is the Vivado SLICES site count.
+        // See tests/device_model_counts.rs. The loader must not
+        // assert num_luts == num_slices * 8.
         assert_eq!(device.num_luts(), 162_720);
         assert_eq!(device.num_regs(), 325_440);
     }

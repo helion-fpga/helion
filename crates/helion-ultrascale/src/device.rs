@@ -65,14 +65,32 @@ impl Xcvu3pSpec {
 /// - RAMB36 blocks 360 = DS890 (12.7 Mb).
 /// - URAM288 blocks 48 = DS890 (13.5 Mb / 288 Kb).
 ///
-/// Known discrepancy, owned by the device-file worker: the device file
-/// reports `num_slices` 27,120 (113 CLB columns x 4 clock rows x 60),
-/// which is one clock row (6,780 slices) more than AMD's 20,340. CTO
-/// ruling 2026-11-07: the file's `num_slices` contradicts its own
-/// `num_luts` 162,720 (= 20,340 x 8) and is a file-header anomaly, not
-/// ground truth. The model uses AMD's 20,340; the device file's per-row
-/// column layout needs Vivado confirmation before the grid is treated
-/// as physical.
+/// Known count distinction, resolved 2026-11-19 by cross-checking
+/// all 40 BitFiltrator device files plus AMD UG570 Table 1 and
+/// DS890 Table 9 (see tests/device_model_counts.rs):
+/// - Usable slices are 20,340, LUT-derived: DS890 Table 9 gives KU3P
+///   162,720 CLB LUTs and 325,440 CLB FFs, and 162,720 / 8 =
+///   325,440 / 16 = 20,340. AMD publishes no slice count for KU3P;
+///   the distributor figure 20,340 is the same derivation.
+/// - The device file reports `num_slices` 27,120, which is the
+///   Vivado SLICES part property (BitFiltrator
+///   create_device_summary.py: `summary["num_slices"] =
+///   part_properties["SLICES"]`) and equals the file geometry
+///   exactly: 113 CLB columns x 4 FAR rows x 60 slices = 27,120.
+///   It is a site count, not a header anomaly: in every
+///   BitFiltrator device file checked, header `num_slices` equals
+///   geometry slices.
+/// - The two differ by exactly one clock row, 6,780 slices. KU3P
+///   and KU5P share the identical file geometry and the identical
+///   UG570 Table 1 frame count (41,476), while KU3P usable LUTs,
+///   DSPs, and BRAMs are exactly 3/4 of KU5P (162,720 vs 216,960;
+///   1,368 vs 1,824; 360 vs 480). The file geometry is the
+///   shared-die geometry; which sites are usable on KU3P is not in
+///   any public source. The model uses AMD-derived 20,340 usable
+///   slices; the device file keeps 27,120 sites. Neither number is
+///   changed to match the other. Unblocker for the usable-site
+///   subset: a Vivado probe (`get_sites SLICE` on
+///   xcku3p-ffva676-1-e, PinPlanning probe family).
 pub struct Xcku3pSpec;
 
 impl Xcku3pSpec {
