@@ -1,5 +1,7 @@
 use helion_ultrascale::sta::{StaNetlist, TimingReport, sta_routed};
-use helion_ultrascale::timing_db::preliminary_xcvu3p;
+use helion_ultrascale::timing_db::{
+    documented_xcku3p, preliminary_xcvu3p, SourcedDelay,
+};
 use std::collections::HashMap;
 
 /// Synthetic 2-bit counter: ff0 -> lut -> ff1, ff1 -> lut -> ff0.
@@ -64,9 +66,12 @@ fn sta_counter_sane() {
     assert_eq!(r.worst_delay_ps, 810);
     assert_eq!(r.wns_ps, 10_000 - 80 - 810);
     assert_eq!(r.tns_ps, 0);
+    // Preliminary DB is a ballpark estimate: the report says so.
+    assert!(r.is_estimate, "preliminary STA must be labeled estimate");
     let line = r.hang_diag_line(5);
     assert!(line.contains("WNS_PS=9110"), "line: {line}");
     assert!(line.contains("endpoints=2"), "line: {line}");
+    assert!(line.contains("estimate=1"), "line: {line}");
 }
 
 /// 4-LUT chain: critical path must name the right endpoints.
@@ -148,4 +153,34 @@ fn sta_unknown_delay_fails_loud() {
     db.cells.lut6.ps = None;
     let err = sta_routed(&nl, &db, 10_000).expect_err("must fail");
     assert!(err.contains("UNKNOWN"), "err: {err}");
+}
+
+/// The documented-only xcku3p DB cannot run STA: it has no LUT6 delay.
+/// It fails loud on the first required field instead of producing a
+/// number from a partially documented DB.
+#[test]
+fn sta_documented_db_fails_loud_on_lut6() {
+    let nl = CounterNetlist::new();
+    let db = documented_xcku3p();
+    assert_eq!(db.bram.clk_to_do.ps, Some(1460));
+    let err = sta_routed(&nl, &db, 10_000).expect_err("must fail");
+    assert!(err.contains("LUT6 delay UNKNOWN"), "err: {err}");
+}
+
+/// A DB with only documented values behind the four required delays is
+/// not an estimate: no estimate flag, no estimate token on the line.
+#[test]
+fn sta_fully_documented_db_is_not_an_estimate() {
+    let nl = CounterNetlist::new();
+    let mut db = documented_xcku3p();
+    db.cells.lut6 = SourcedDelay::documented(120, "test fixture");
+    db.cells.ff_ckq = SourcedDelay::documented(150, "test fixture");
+    db.cells.ff_setup = SourcedDelay::documented(80, "test fixture");
+    db.interconnect.single = SourcedDelay::documented(180, "test fixture");
+    assert!(!db.is_estimate());
+    let r: TimingReport = sta_routed(&nl, &db, 10_000).expect("sta");
+    assert!(!r.is_estimate);
+    assert_eq!(r.r2r_ps, 810);
+    let line = r.hang_diag_line(5);
+    assert!(!line.contains("estimate"), "line: {line}");
 }
