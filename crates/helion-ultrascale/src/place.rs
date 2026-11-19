@@ -162,7 +162,14 @@ pub fn place_ultra(
                 by_x.entry(s.2).or_default().push(s.clone());
             }
         }
-        for (_x, mut col) in by_x {
+        // HashMap iteration order is not deterministic; sort columns by
+        // X so the same seed always picks the same column (D1). Without
+        // this, one seed could place the same chain on different columns
+        // across runs.
+        let mut columns: Vec<(i32, Vec<(String, String, i32, i32)>)> =
+            by_x.into_iter().collect();
+        columns.sort_by_key(|(x, _)| *x);
+        for (_x, mut col) in columns {
             col.sort_by_key(|s| s.3);
             for window in col.windows(chain.len()) {
                 // Check Y contiguity.
@@ -343,5 +350,40 @@ mod tests {
         let p1 = placed.slices.iter().find(|p| p.packed_idx == 1).unwrap();
         assert_eq!(p0.x, p1.x);
         assert!((p0.y - p1.y).abs() == 1);
+    }
+
+    #[test]
+    fn carry_chain_placement_is_deterministic() {
+        // D1: before the fix, chain column choice iterated a HashMap, so
+        // repeated placements of the same chain could land on different
+        // columns. Each HashMap gets a fresh random seed, so ten runs
+        // make a pre-fix failure near-certain and a post-fix pass
+        // meaningful.
+        let grid = test_grid();
+        let mut s0 = PackedUltraSlice::new("s0".to_string(), SliceKind::Logic);
+        s0.carry8 = Some("carry0".to_string());
+        s0.carry_next = Some("carry1".to_string());
+        let mut s1 = PackedUltraSlice::new("s1".to_string(), SliceKind::Logic);
+        s1.carry8 = Some("carry1".to_string());
+        s1.carry_prev = Some("carry0".to_string());
+        s1.carry_next = Some("carry2".to_string());
+        let mut s2 = PackedUltraSlice::new("s2".to_string(), SliceKind::Logic);
+        s2.carry8 = Some("carry2".to_string());
+        s2.carry_prev = Some("carry1".to_string());
+
+        let packed = vec![s0, s1, s2];
+        let opts = UltraPlaceOpts::default();
+        let first = place_ultra(&packed, &grid, &opts).unwrap();
+        let sites = |p: &UltraPlaced| {
+            p.slices
+                .iter()
+                .map(|s| (s.packed_idx, s.site.clone()))
+                .collect::<Vec<_>>()
+        };
+        let expected = sites(&first);
+        for _ in 0..9 {
+            let again = place_ultra(&packed, &grid, &opts).unwrap();
+            assert_eq!(sites(&again), expected);
+        }
     }
 }
