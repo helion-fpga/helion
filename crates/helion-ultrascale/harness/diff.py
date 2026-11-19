@@ -39,7 +39,7 @@ from emitter import find_emitter
 from gen_golden import GOLDEN_DIR, placement_hash
 from reference import Tier1Reference
 
-DESIGNS = ("blinky", "counter")
+DESIGNS = ("blinky", "counter", "lutram")
 PARTS = ("xcku3p", "xcvu3p")
 
 
@@ -109,13 +109,18 @@ def main():
     for bel in ("A6LUT", "B6LUT", "C6LUT", "D6LUT"):
         checked, mismatches = ref.cross_check_lut("xcku3p", 0, 0, bel)
         cross["lut-%s" % bel] = {"checked": checked, "mismatches": mismatches}
+    # The LUTRAM golden sits on a CLEM tile: the same cross-check on
+    # SLICE_X1Y0 proves the LUTRAM-extracted CLEM table agrees with
+    # prjuray too (see US-04).
+    checked, mismatches = ref.cross_check_lut("xcku3p", 1, 0, "A6LUT")
+    cross["lut-CLEM-A6LUT"] = {"checked": checked, "mismatches": mismatches}
     for bel in ("AFF", "BFF", "CFF", "DFF"):
         cross["ff-%s" % bel] = {"match": ref.cross_check_ff("xcku3p", 0, 0, bel)}
     cross_ok = all(
         (v.get("mismatches") == [] if "mismatches" in v else v.get("match") is True)
         for v in cross.values()
     )
-    print("reference cross-check (BitFiltrator vs prjuray, SLICE_X0Y0): %s"
+    print("reference cross-check (BitFiltrator vs prjuray, SLICE_X0Y0 + CLEM SLICE_X1Y0): %s"
           % ("PASS" if cross_ok else "FAIL"))
     if not cross_ok:
         print(json.dumps(cross, indent=2))
