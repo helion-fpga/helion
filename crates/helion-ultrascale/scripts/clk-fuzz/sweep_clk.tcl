@@ -152,31 +152,49 @@ proc enumerate_attrs { cell log_fp } {
 
 proc run_flow { top_file part out_dir tag cell attr value log_fp } {
   set script_dir [file dirname [file normalize [info script]]]
-  read_verilog [file join $script_dir $top_file]
-  read_xdc [file join $script_dir clk_fuzz.xdc]
-  synth_design -top clk_fuzz_top -part $part
-  if { $attr ne "" } {
-    # Existence check first: a rejected attribute is a skipped run,
-    # logged, never fuzzed under a guessed spelling.
-    if { [catch { get_property $attr [get_cells $cell] } cur] } {
-      puts $log_fp "$tag SKIP $attr: property does not exist on $cell"
-      flush $log_fp
-      close_project -quiet
-      return 0
+  # The whole flow runs inside catch: a failed synth, place, route,
+  # or set_property logs "$tag FAIL" and the job moves on to the next
+  # variant instead of aborting the batch script mid-job. Returns 1
+  # when a bitstream was written, 0 when the run was skipped or failed.
+  set skip 0
+  set ok [catch {
+    read_verilog [file join $script_dir $top_file]
+    read_xdc [file join $script_dir clk_fuzz.xdc]
+    synth_design -top clk_fuzz_top -part $part
+    if { $attr ne "" } {
+      # Existence check first: a rejected attribute is a skipped run,
+      # logged, never fuzzed under a guessed spelling.
+      if { [catch { get_property $attr [get_cells $cell] } cur] } {
+        puts $log_fp "$tag SKIP $attr: property does not exist on $cell"
+        flush $log_fp
+        set skip 1
+      } else {
+        puts $log_fp "$tag $attr: $cur -> $value"
+        flush $log_fp
+        set_property $attr $value [get_cells $cell]
+      }
     }
-    puts $log_fp "$tag $attr: $cur -> $value"
+    if { !$skip } {
+      opt_design
+      place_design
+      route_design
+      set base [file join $out_dir $tag]
+      write_checkpoint -force ${base}.dcp
+      write_bitstream -force -raw_bitfile -logic_location_file ${base}.bit
+      puts $log_fp "$tag DONE"
+      flush $log_fp
+    }
+    close_project -quiet
+  } msg]
+  if { $ok } {
+    puts $log_fp "$tag FAIL: $msg"
     flush $log_fp
-    set_property $attr $value [get_cells $cell]
+    catch { close_project -quiet }
+    return 0
   }
-  opt_design
-  place_design
-  route_design
-  set base [file join $out_dir $tag]
-  write_checkpoint -force ${base}.dcp
-  write_bitstream -force -raw_bitfile -logic_location_file ${base}.bit
-  puts $log_fp "$tag DONE"
-  flush $log_fp
-  close_project -quiet
+  if { $skip } {
+    return 0
+  }
   return 1
 }
 
@@ -188,20 +206,35 @@ proc main { primitive part dir_out } {
   puts $log_fp "vivado: [version -short]"
   flush $log_fp
   lassign [top_info $primitive] top_file cell
-  # Baseline first, all attributes at the top's defaults.
-  run_flow $top_file $part $dir_out baseline $cell "" "" $log_fp
+  # Baseline first, all attributes at the top's defaults. A failed
+  # baseline means every variant would fail the same way, so the job
+  # stops here with the failure logged instead of burning runs.
+  if { ![run_flow $top_file $part $dir_out baseline $cell "" "" $log_fp] } {
+    puts $log_fp "baseline FAILED; stopping job"
+    flush $log_fp
+    close $log_fp
+    return
+  }
   set table [attr_table $primitive]
   if { [llength $table] == 0 } {
     # Runtime enumeration: synth once, read the cell's properties,
     # then fuzz each one found.
     set script_dir [file dirname [file normalize [info script]]]
-    read_verilog [file join $script_dir $top_file]
-    read_xdc [file join $script_dir clk_fuzz.xdc]
-    synth_design -top clk_fuzz_top -part $part
-    set table [enumerate_attrs [get_cells $cell] $log_fp]
+    set enum_ok [catch {
+      read_verilog [file join $script_dir $top_file]
+      read_xdc [file join $script_dir clk_fuzz.xdc]
+      synth_design -top clk_fuzz_top -part $part
+      set table [enumerate_attrs [get_cells $cell] $log_fp]
+      close_project -quiet
+    } enum_msg]
+    if { $enum_ok } {
+      puts $log_fp "enumeration FAIL: $enum_msg; stopping job"
+      flush $log_fp
+      close $log_fp
+      return
+    }
     puts $log_fp "enumerated attributes for $primitive: $table"
     flush $log_fp
-    close_project -quiet
   }
   foreach entry $table {
     lassign $entry attr values
