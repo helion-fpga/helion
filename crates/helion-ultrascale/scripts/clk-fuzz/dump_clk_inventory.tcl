@@ -12,6 +12,11 @@
 
 proc main { part dir_out } {
   file mkdir $dir_out
+  # Non-project batch mode has no design open until the part is set;
+  # set_part creates the in-memory project that get_tiles and
+  # get_sites query (UG994, Creating a Flow in Non-Project Mode).
+  # Without it the first get_tiles below errors and no dump is made.
+  set_part $part
   set fp [open [file join $dir_out cmt_tiles.txt] w]
   foreach tile [get_tiles -filter {TILE_TYPE =~ CMT*}] {
     puts $fp [get_property NAME $tile]

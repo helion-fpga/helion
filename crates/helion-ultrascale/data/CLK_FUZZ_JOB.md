@@ -99,6 +99,9 @@ Before the fuzz runs, dump the inventory the public sources lack:
 ```tcl
 # save as dump_clk_inventory.tcl, run once per part
 set part xcvu3p-ffvc1517-2-e
+# set_part first: non-project batch mode has no design open until the
+# part is set, and get_tiles errors without it (UG994).
+set_part $part
 # CMT tiles and their sites (BUFGCE/MMCM/PLL coordinates)
 set fp [open "cmt_tiles.txt" w]
 foreach tile [get_tiles -filter {TILE_TYPE =~ CMT*}] {
