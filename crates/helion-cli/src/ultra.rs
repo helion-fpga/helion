@@ -22,7 +22,7 @@ use helion_ultrascale::{
     ControlSetLimits, FabricWithPlaceholders, RoutableNet, SourceCell, SourceKind, StaNetlist,
     TimingReport, UltraPlaceOpts, UltraRouteOpts, UltraScaleDevice, UltraScaleFabric,
     check_legality, emit_ff_control_fasm, emit_ff_fasm, map_source_cell, pack_ultra, place_ultra,
-    preliminary_xcvu3p, route_ultra, sta_db_for_part, sta_routed,
+    route_ultra, sta_db_for_part, sta_routed,
 };
 use std::collections::{HashMap, HashSet};
 
