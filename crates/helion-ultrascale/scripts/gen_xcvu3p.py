@@ -45,16 +45,21 @@ Construction:
 - Header counts are the XMP103 published values, not derived from
   the column tables. The loader never asserts header counts against
   geometry, and the confirmed xcku3p file already disagrees the
-  same way (header 162,720 LUTs is 6 per slice against 8 in the
-  geometry; header 360 BRAMs against 480 implied by the tables).
-  See data/README.md.
+  same way: header 162,720 LUTs is 6 per slice against 8 in the
+  geometry, and header 360 BRAMs against 480 implied by the
+  tables. That is the KU3P usable fraction of the shared KU3P/KU5P
+  die (3/4 on LUTs, DSPs, and BRAMs; see data/README.md and
+  tests/device_model_counts.rs), not a contradiction. The 49,260
+  slices here follow the same rule in the other direction: the
+  provisional geometry is built to match the LUT-derived header
+  count, not the other way around.
 
 Open discrepancies, recorded not hidden:
-- Slice count 49,260 vs 49,250: AMD datasheet values in distributor
-  listings give 49,260 CLBs for XCVU3P (49,260 * 8 = 394,080 LUTs,
-  the XMP103 "394K"), while the Helion device model uses 49,250
-  (394,000 / 8). This file uses 49,260 per the README. The CTO
-  rules on both counts together; Vivado confirmation must re-check.
+- Slice count 49,260: 394,080 LUTs / 8 (DS890 Table 9 exact value;
+  XMP103 rounds it to "394K"). The earlier 49,250 came from
+  dividing the rounded 394,000 and is gone from the model (CTO
+  ruling 2026-11-07: 49,250 was a rounding artifact). The file
+  uses 49,260; Vivado confirmation must re-check.
 - Frame total 73,035 computed vs 71,820 UG570 Table 1: the
   construction OVERSHOOTS UG570 by 1,215 frames (1.7%). That is the
   opposite direction from xcku3p, whose file total 41,460 sits 16
@@ -180,12 +185,12 @@ def build() -> dict:
         {
             "field": "license",
             "value": "Webpack",
-            "source": "copied from the xcku3p template; every BitFiltrator device file carries Webpack, and xcvu3p appears in parts_webpack.json",
+            "source": "copied from the xcku3p template; every BitFiltrator device file carries Webpack, but BitFiltrator resources/parts_webpack.json lists NO xcvu3p parts (Virtex UltraScale+ xcvu3p: []), so Webpack is an unconfirmed template copy and the Vivado LICENSE part property for xcvu3p-ffvc1517-1-e is unknown until the Vivado probe runs",
         },
         {
             "field": "num_slices",
             "value": str(NUM_SLICES),
-            "source": "AMD XMP103: 394,080 LUTs / 8; see the 49,250 vs 49,260 discrepancy in data/README.md",
+            "source": "AMD XMP103: 394,080 LUTs / 8 (DS890 Table 9 exact); the earlier 49,250 came from dividing the rounded 394,000 and is gone from the model",
         },
         {
             "field": "num_luts",
