@@ -17,6 +17,7 @@ pub mod bitgen_device;
 pub mod bitloc;
 pub mod device;
 pub mod device_file;
+pub mod device_grid;
 pub mod fabric;
 pub mod fasm_gen;
 pub mod grid;
@@ -44,6 +45,7 @@ pub use device_file::{
     ArchSummary, BitLocator, BramResolution, DeviceFile, DeviceFileError, Far, FarBlockType,
     NUM_18K_BRAM_PER_COLUMN, ProvisionalNote,
 };
+pub use device_grid::{DeviceColumn, DeviceFileGrid};
 pub use fabric::{
     EmptyTimingDb, EmptyWireDb, FabricWithPlaceholders, TimingDb, UltraScaleFabric, UltraSite,
     WireDb, WireId, WireInfo,
