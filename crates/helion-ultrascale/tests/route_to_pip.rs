@@ -10,13 +10,13 @@
 //! source maps BEL pins to INT wires (that table is US-01 tilegrid
 //! data), so the failure is a named data gap, not a code gap.
 
-use helion_ultrascale::pack::{pack_ultra, ControlSetLimits};
+use helion_ultrascale::pack::{ControlSetLimits, pack_ultra};
 use helion_ultrascale::place_ultra;
 use helion_ultrascale::route_to_pip::translated_to_fasm;
 use helion_ultrascale::{
-    emit_pips, route_ultra, translate_routes, verify_zero_bits, Bel, BelKind, FileSegbitsDb,
-    IntTile, IntTileWireDb, RoutableNet, RouteErrorKind, TileId, UltraPlaceOpts, UltraRouteOpts,
-    UltraScaleDevice, WireDb,
+    Bel, BelKind, FileSegbitsDb, IntTile, IntTileWireDb, RoutableNet, RouteErrorKind, TileId,
+    UltraPlaceOpts, UltraRouteOpts, UltraScaleDevice, WireDb, emit_pips, route_ultra,
+    translate_routes, verify_zero_bits,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -181,7 +181,7 @@ fn extract_cells(
     Vec<(String, String, Option<String>, Option<String>)>,
     Vec<Vec<String>>,
 ) {
-    use helion_ir::{resolve, CellKind};
+    use helion_ir::{CellKind, resolve};
 
     let mut luts = Vec::new();
     let mut ffs = Vec::new();

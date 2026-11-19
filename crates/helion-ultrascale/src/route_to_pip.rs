@@ -182,7 +182,11 @@ fn continuation_partner(name: &str) -> Option<(String, (i32, i32))> {
     Some((partner, delta))
 }
 
-fn named<'a>(db: &'a dyn WireDb, wire: WireId, design: &str) -> Result<WireInfo<'a>, RouteToPipError> {
+fn named<'a>(
+    db: &'a dyn WireDb,
+    wire: WireId,
+    design: &str,
+) -> Result<WireInfo<'a>, RouteToPipError> {
     db.wire_info(wire)
         .ok_or_else(|| RouteToPipError::UnnamedWire {
             wire,
@@ -380,6 +384,28 @@ mod tests {
         assert_eq!(t.continuations, 1);
         assert_eq!(t.pips.len(), 1);
         assert_eq!(t.pips[0].fasm_line(), "INT_X12Y57.PIP.NN12_BEG7.NN12_END7");
+    }
+
+    #[test]
+    fn continuation_crosses_tiles_in_reverse_without_a_pip() {
+        let db = IntTileWireDb::from_json(
+            TILE_JSON,
+            &[
+                IntTile::new("INT_X12Y45", 12, 45),
+                IntTile::new("INT_X12Y57", 12, 57),
+            ],
+        )
+        .unwrap();
+        // The same span wire traversed south: NN12_END7 in (12,57)
+        // continues as NN12_BEG7 in (12,45). A continuation either
+        // way programs no PIP.
+        let route = [
+            db.wire_id("INT_X12Y57", "NN12_END7").unwrap(),
+            db.wire_id("INT_X12Y45", "NN12_BEG7").unwrap(),
+        ];
+        let t = translate_route(&db, &route, "blinky").unwrap();
+        assert_eq!(t.continuations, 1);
+        assert!(t.pips.is_empty());
     }
 
     #[test]
