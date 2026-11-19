@@ -21,8 +21,9 @@ use helion_ir::{CellKind, Design, intern, resolve};
 use helion_ultrascale::{
     ControlSetLimits, FabricWithPlaceholders, RoutableNet, SeedResult, StaNetlist, TimingReport,
     UltraPlaceOpts, UltraRouteOpts, UltraScaleDevice, UltraScaleFabric, best_seed_line,
-    check_legality, emit_ff_fasm, pack_ultra, place_ultra, preliminary_xcvu3p,
-    read_completed_seeds, route_ultra, sta_routed, summarize_multiseed,
+    check_legality, dedup_results, emit_ff_fasm, escape_json_value, pack_ultra, parse_results_text,
+    place_ultra, preliminary_xcvu3p, route_ultra, seed_range, seeds_to_run, sta_routed,
+    summarize_multiseed,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -73,9 +74,8 @@ pub fn extract_cells(design: &Design) -> Result<ExtractedCells, String> {
                 luts.push((name, init, is_mem));
             }
             CellKind::Hff => {
-                let clk = net_of(cell.name, "CLK").ok_or_else(|| {
-                    format!("ULTRA PACK: FF {name} has no CLK pin net")
-                })?;
+                let clk = net_of(cell.name, "CLK")
+                    .ok_or_else(|| format!("ULTRA PACK: FF {name} has no CLK pin net"))?;
                 let ce = net_of(cell.name, "CE");
                 let sr = net_of(cell.name, "SR");
                 ffs.push((name, clk, ce, sr));
@@ -310,12 +310,16 @@ pub fn run_impl(path: &str, part: &str, seed: u64) -> Result<(), String> {
         );
     }
     let nets = build_routable_nets(&design, &packed, &placed)?;
+    // Route budget has one home: UltraRouteOpts::default() (max_iters
+    // 50). This call site takes the default rather than restating the
+    // number, so the multiseed path and the impl path can never drift
+    // apart on it once routing lands for multiseed.
     let routed = route_ultra(
         &nets,
         fabric.wires(),
         UltraRouteOpts {
             seed,
-            max_iters: 50,
+            ..Default::default()
         },
     )
     .map_err(|e| format!("ULTRA ROUTE: {e}"))?;
@@ -441,7 +445,16 @@ fn build_routable_nets(
     let site_of = |cell: &str| -> Result<(UltraSite, String), String> {
         cell_site
             .get(cell)
-            .map(|(x, y, bel)| (UltraSite { x: *x, y: *y, kind: 0 }, bel.clone()))
+            .map(|(x, y, bel)| {
+                (
+                    UltraSite {
+                        x: *x,
+                        y: *y,
+                        kind: 0,
+                    },
+                    bel.clone(),
+                )
+            })
             .ok_or_else(|| format!("ULTRA ROUTE: cell {cell} has no placed site"))
     };
     // Pin -> net map.
@@ -519,13 +532,28 @@ fn build_routable_nets(
 /// that hardcoding must change the day the routing graph lands.
 /// WNS here is a preliminary estimate (ballpark delays, see the
 /// `multiseed` module docs), not signoff timing.
+struct UltraSeedRun {
+    result: SeedResult,
+    placed_slices: usize,
+    endpoints: usize,
+    r2r_ps: i64,
+    iob_ps: i64,
+}
+
 fn run_one_seed(
     design: &Design,
     packed: &helion_ultrascale::UltraPacked,
     device: &UltraScaleDevice,
     seed: u64,
-) -> SeedResult {
+) -> UltraSeedRun {
     let t0 = std::time::Instant::now();
+    let fail = |reason: String| UltraSeedRun {
+        result: SeedResult::fail(seed, t0.elapsed().as_secs_f64(), reason),
+        placed_slices: 0,
+        endpoints: 0,
+        r2r_ps: 0,
+        iob_ps: 0,
+    };
     let placed = match place_ultra(
         &packed.slices,
         device,
@@ -535,14 +563,9 @@ fn run_one_seed(
         },
     ) {
         Ok(p) => p,
-        Err(e) => {
-            return SeedResult::fail(
-                seed,
-                t0.elapsed().as_secs_f64(),
-                format!("ULTRA PLACE: {e}"),
-            );
-        }
+        Err(e) => return fail(format!("ULTRA PLACE: {e}")),
     };
+    let placed_slices = placed.slices.len();
     let limits = ControlSetLimits::default();
     let violations = check_legality(&packed.slices, &placed.slices, device, &limits);
     if !violations.is_empty() {
@@ -550,17 +573,101 @@ fn run_one_seed(
         for v in &violations {
             msg.push_str(&format!(" {v};"));
         }
-        return SeedResult::fail(seed, t0.elapsed().as_secs_f64(), msg);
+        let mut run = fail(msg);
+        run.placed_slices = placed_slices;
+        return run;
     }
     match sta_on_placed(design, packed, &placed) {
-        Ok(timing) => SeedResult::ok(
-            seed,
-            timing.wns_ps,
-            timing.tns_ps,
-            t0.elapsed().as_secs_f64(),
-        ),
-        Err(e) => SeedResult::fail(seed, t0.elapsed().as_secs_f64(), e),
+        Ok(timing) => UltraSeedRun {
+            result: SeedResult::ok(
+                seed,
+                timing.wns_ps,
+                timing.tns_ps,
+                t0.elapsed().as_secs_f64(),
+            ),
+            placed_slices,
+            endpoints: timing.endpoints,
+            r2r_ps: timing.r2r_ps,
+            iob_ps: timing.iob_ps,
+        },
+        Err(e) => {
+            let mut run = fail(e);
+            run.placed_slices = placed_slices;
+            run
+        }
     }
+}
+
+/// Write one log file per seed under log_dir (seed-<n>.log) with the
+/// placement and preliminary STA summary for that seed. Each worker
+/// thread writes only its own seed's file, so no lock is needed. A
+/// write failure is reported on stderr and never fails the sweep:
+/// the JSONL record is the checkpoint, the log is detail.
+fn write_seed_log(log_dir: &str, seed: u64, part: &str, run: &UltraSeedRun, runtime_s: f64) {
+    let path = format!("{log_dir}/seed-{seed}.log");
+    let mut text = format!(
+        "seed={seed} part={part} runtime_s={runtime_s:.3} route_status={}\n",
+        run.result.route_status
+    );
+    if run.result.status == "ok" {
+        text += &format!(
+            "status=ok wns_ps={} tns_ps={} endpoints={} r2r_ps={} iob_ps={} placed_slices={}\n",
+            run.result.wns_ps,
+            run.result.tns_ps,
+            run.endpoints,
+            run.r2r_ps,
+            run.iob_ps,
+            run.placed_slices
+        );
+    } else {
+        text += &format!(
+            "status=fail reason={}\n",
+            run.result.reason.replace('\n', " ")
+        );
+    }
+    if let Err(e) = std::fs::write(&path, text) {
+        eprintln!("multiseed: cannot write {path}: {e}");
+    }
+}
+
+/// Write the best-seed decision to a JSON file so a later step can
+/// reproduce it without re-running the sweep: the best seed, its
+/// numbers, and the exact `helion impl` command that rebuilds it.
+/// `helion impl --seed N` routes to the UltraScale+ flow for ultra
+/// parts and prints the same preliminary STA numbers before the
+/// route gate stops it, so the command reproduces the sweep numbers
+/// even while route is blocked. Written even when no seed met the
+/// threshold (best_seed null), so scripts can tell "sweep finished,
+/// no winner" from "no file".
+fn write_best_out(
+    path: &str,
+    design: &str,
+    part: &str,
+    threshold: i64,
+    best: Option<&SeedResult>,
+) -> Result<(), String> {
+    let body = match best {
+        Some(b) => format!(
+            "{{\"best_seed\": {}, \"wns_ps\": {}, \"tns_ps\": {}, \"route_status\": \"{}\", \"design\": \"{}\", \"part\": \"{}\", \"threshold_wns_ps\": {}, \"reproduce\": \"helion impl {} --part {} --seed {}\"}}",
+            b.seed,
+            b.wns_ps,
+            b.tns_ps,
+            escape_json_value(&b.route_status),
+            escape_json_value(design),
+            escape_json_value(part),
+            threshold,
+            escape_json_value(design),
+            escape_json_value(part),
+            b.seed
+        ),
+        None => format!(
+            "{{\"best_seed\": null, \"design\": \"{}\", \"part\": \"{}\", \"threshold_wns_ps\": {}}}",
+            escape_json_value(design),
+            escape_json_value(part),
+            threshold
+        ),
+    };
+    std::fs::write(path, body + "\n").map_err(|e| format!("multiseed: cannot write {path}: {e}"))
 }
 
 /// Overnight multi-seed timing-closure sweep for an UltraScale+ part.
@@ -579,6 +686,15 @@ fn run_one_seed(
 /// preliminary estimate from `preliminary_xcvu3p` ballpark delays
 /// until the xcku3p delay DB exists (GAP-F5). The printed report
 /// says both, every run.
+///
+/// `--log-dir` writes one log file per seed (seed-<n>.log) with the
+/// place and preliminary STA summary. `--best-out` writes the
+/// best-seed decision plus the exact `helion impl` command that
+/// reproduces it. `--emit-best` is accepted and refused loud:
+/// bitgen is not implemented on this base, so no bitstream exists
+/// to emit. `--retry-failed` re-runs seeds whose checkpoint record
+/// is a failure instead of skipping them (transient failures); ok
+/// seeds are never re-run.
 pub fn run_multiseed(
     path: &str,
     part: &str,
@@ -587,10 +703,12 @@ pub fn run_multiseed(
     jobs: usize,
     out_path: &str,
     threshold: i64,
+    log_dir: Option<&str>,
+    best_out: Option<&str>,
+    emit_best: Option<&str>,
+    retry_failed: bool,
 ) -> Result<(), String> {
-    if n_seeds == 0 {
-        return Err("multiseed: --seeds must be > 0".to_string());
-    }
+    let (seed_first, seed_end) = seed_range(seed_start, n_seeds)?;
     if !is_ultra_part(part) {
         return Err(format!(
             "multiseed: part {part} is not an UltraScale+ part (xcku3p or xcvu3p)"
@@ -624,19 +742,28 @@ pub fn run_multiseed(
         packed.slices.len()
     );
 
-    let completed = read_completed_seeds(out_path);
-    let seeds: Vec<u64> = (seed_start..seed_start + n_seeds)
-        .filter(|s| !completed.contains(s))
-        .collect();
+    if let Some(dir) = log_dir {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("multiseed: cannot create log dir {dir}: {e}"))?;
+    }
+
+    // Resume from the checkpoint file, parsed the same way the final
+    // report parses it (last record per seed wins). The "already done"
+    // count covers only seeds in this sweep's range.
+    let prior: Vec<SeedResult> = std::fs::read_to_string(out_path)
+        .map(|t| dedup_results(parse_results_text(&t)))
+        .unwrap_or_default();
+    let seeds = seeds_to_run(seed_first, seed_end, &prior, retry_failed);
+    let n_already_done = (seed_end - seed_first) as usize - seeds.len();
     println!(
         "multiseed: design={} part={} seeds={}..{} jobs={} threshold_wns_ps={} ({} already done, {} to run) out={} route_blocked={} [WNS is a preliminary estimate from ballpark delays; route blocked until the routing graph lands]",
         path,
         part,
-        seed_start,
-        seed_start + n_seeds - 1,
+        seed_first,
+        seed_end - 1,
         jobs,
         threshold,
-        completed.len(),
+        n_already_done,
         seeds.len(),
         out_path,
         route_blocked
@@ -652,6 +779,7 @@ pub fn run_multiseed(
             .open(out_path)
             .map_err(|e| format!("multiseed: cannot open {out_path}: {e}"))?;
         let file = Mutex::new(file);
+        let log_dir_ref = &log_dir;
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(jobs)
             .build()
@@ -659,9 +787,15 @@ pub fn run_multiseed(
         pool.install(|| {
             use rayon::prelude::*;
             seeds.par_iter().for_each(|&seed| {
-                let result = run_one_seed(&design, &packed, &device, seed);
+                let run = run_one_seed(&design, &packed, &device, seed);
+                if let Some(dir) = log_dir_ref {
+                    write_seed_log(dir, seed, part, &run, run.result.runtime_s);
+                }
+                let result = run.result;
                 let line = result.to_jsonl();
-                let mut f = file.lock().unwrap();
+                // A poisoned mutex (a worker panicked while holding
+                // it) is recovered instead of panicking the sweep.
+                let mut f = file.lock().unwrap_or_else(|e| e.into_inner());
                 let _ = writeln!(f, "{line}");
                 let _ = f.flush();
                 eprintln!(
@@ -679,22 +813,29 @@ pub fn run_multiseed(
 
     // Report: re-read the full JSONL (checkpointed plus this run) so
     // the best-seed decision is deterministic over everything on disk.
+    // Last record per seed wins (see dedup_results).
     let mut results: Vec<SeedResult> = Vec::new();
     if let Ok(text) = std::fs::read_to_string(out_path) {
-        for line in text.lines() {
-            if let Some(r) = SeedResult::from_jsonl(line) {
-                results.push(r);
-            }
-        }
+        results = parse_results_text(&text);
     }
-    results.sort_by_key(|r| r.seed);
-    results.dedup_by_key(|r| r.seed);
+    let results = dedup_results(results);
     let summary = summarize_multiseed(&results, threshold);
     println!("{}", best_seed_line(&summary, threshold));
     if let (Some(min), Some(max)) = (summary.min_wns_ps, summary.max_wns_ps) {
         println!(
             "multiseed: WNS range over ok seeds: min={} max={} ps ({} seeds) [preliminary estimate]",
             min, max, summary.n_ok
+        );
+    }
+    if let Some(best_path) = best_out {
+        let best = helion_ultrascale::select_best_seed(&results, threshold);
+        write_best_out(best_path, path, part, threshold, best)?;
+        println!("multiseed: best-seed record wrote {best_path}");
+    }
+    if emit_best.is_some() {
+        return Err(
+            "multiseed: --emit-best refused: UltraScale+ bitgen is not implemented on this base (route blocked, no bitstream exists to emit)"
+                .to_string(),
         );
     }
     Ok(())

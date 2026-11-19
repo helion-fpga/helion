@@ -193,3 +193,14 @@ fn mock_wire_info_is_none() {
     assert_eq!(db.wire_info(0), None);
     assert_eq!(db.wire_info(42), None);
 }
+
+#[test]
+fn default_route_opts_is_the_single_budget_home() {
+    // The route iteration budget lives here and nowhere else: the
+    // impl flow takes `..Default::default()` instead of restating
+    // the number, so the multiseed path and the impl path can never
+    // drift apart on it once routing lands for multiseed.
+    let opts = UltraRouteOpts::default();
+    assert_eq!(opts.max_iters, 50);
+    assert_eq!(opts.seed, 0);
+}

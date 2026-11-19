@@ -10,7 +10,7 @@ use helion_hw::{
     CableBackend, ProgramOutcome, Tap, detect_boards, list_cables, prog_sim,
     program_hbits_with_cable, resolve_cable,
 };
-use helion_ir::{resolve, Design};
+use helion_ir::{Design, resolve};
 use helion_pack::pack;
 use helion_place::{PlaceOpts, place, place_with, place_with_guide};
 use helion_proj::{
@@ -319,12 +319,7 @@ fn main() {
     }
     let cmd = if args
         .first()
-        .map(|s| {
-            s == "--part"
-                || s == "--top"
-                || s.ends_with(".sv")
-                || s.ends_with(".v")
-        })
+        .map(|s| s == "--part" || s == "--top" || s.ends_with(".sv") || s.ends_with(".v"))
         .unwrap_or(false)
     {
         "synth".to_string()
@@ -462,7 +457,11 @@ fn cmd_synth(args: &[String]) {
         // All must be SV/Verilog for multi-file; otherwise fall back to single-file error.
         let all_sv = paths.iter().all(|p| {
             matches!(
-                p.extension().and_then(|e| e.to_str()).unwrap_or("sv").to_ascii_lowercase().as_str(),
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("sv")
+                    .to_ascii_lowercase()
+                    .as_str(),
                 "sv" | "v"
             )
         });
@@ -532,10 +531,8 @@ fn cmd_equiv(args: &[String]) {
         .unwrap_or_else(|| "examples/blinky.sv".into());
 
     // Synthesize golden and revised in parallel (independent work)
-    let (golden_res, revised_res) = rayon::join(
-        || synth_any(golden_path),
-        || synth_any(&revised_path),
-    );
+    let (golden_res, revised_res) =
+        rayon::join(|| synth_any(golden_path), || synth_any(&revised_path));
 
     let golden = golden_res.unwrap_or_else(|e| {
         eprintln!("equiv golden: {e}");
@@ -550,11 +547,10 @@ fn cmd_equiv(args: &[String]) {
         eprintln!("equiv golden model: {e}");
         std::process::exit(1);
     });
-    let revised_model =
-        helion_sv::equiv::EquivModel::from_design(&revised).unwrap_or_else(|e| {
-            eprintln!("equiv revised model: {e}");
-            std::process::exit(1);
-        });
+    let revised_model = helion_sv::equiv::EquivModel::from_design(&revised).unwrap_or_else(|e| {
+        eprintln!("equiv revised model: {e}");
+        std::process::exit(1);
+    });
 
     match helion_sv::equiv::prove_equivalent(&golden_model, &revised_model) {
         Ok(helion_sv::equiv::EquivVerdict::Equivalent) => {
@@ -575,32 +571,83 @@ fn cmd_equiv(args: &[String]) {
 }
 
 /// `helion multiseed <design> --part xcku3p --seeds N --seed-start S
-/// --jobs J --out FILE --threshold WNS_PS`.
+/// --jobs J --out FILE --threshold WNS_PS --log-dir DIR --best-out FILE
+/// --emit-best FILE --retry-failed`.
 ///
 /// UltraScale+ multi-seed timing-closure sweep (port of the proof on
 /// fm/ultra-multiseed e1c2e47). Non-UltraScale+ parts are rejected:
 /// the HL10T flow has its own place/route and no ultra seed contract.
 /// WNS is a preliminary estimate and route is blocked for every seed
 /// on this base; see `ultra::run_multiseed`.
+fn parse_u64_flag(args: &[String], name: &str, default: u64) -> Result<u64, String> {
+    match take_flag(args, name) {
+        None => Ok(default),
+        Some(s) => s
+            .parse()
+            .map_err(|_| format!("multiseed: {name} must be a whole number, got {s:?}")),
+    }
+}
+
+fn parse_i64_flag(args: &[String], name: &str, default: i64) -> Result<i64, String> {
+    match take_flag(args, name) {
+        None => Ok(default),
+        Some(s) => s
+            .parse()
+            .map_err(|_| format!("multiseed: {name} must be a whole number, got {s:?}")),
+    }
+}
+
+fn parse_usize_flag(args: &[String], name: &str, default: usize) -> Result<usize, String> {
+    match take_flag(args, name) {
+        None => Ok(default),
+        Some(s) => s
+            .parse()
+            .map_err(|_| format!("multiseed: {name} must be a whole number, got {s:?}")),
+    }
+}
+
+/// Parse the multiseed flags. A numeric flag that is present but
+/// unparseable fails loud instead of silently falling back to its
+/// default: `--seeds abc` must never quietly become a 10-seed sweep.
 fn cmd_multiseed(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
     let part = take_flag(args, "--part").unwrap_or_else(|| "xcku3p".into());
-    let n_seeds: u64 = take_flag(args, "--seeds")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
-    let seed_start: u64 = take_flag(args, "--seed-start")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-    let jobs: usize = take_flag(args, "--jobs")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2);
+    let n_seeds = parse_u64_flag(args, "--seeds", 10).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let seed_start = parse_u64_flag(args, "--seed-start", 1).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let jobs = parse_usize_flag(args, "--jobs", 2)
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        })
+        .max(1);
     let out_path = take_flag(args, "--out").unwrap_or_else(|| "multiseed_results.jsonl".into());
-    let threshold: i64 = take_flag(args, "--threshold")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if let Err(e) =
-        ultra::run_multiseed(path, &part, n_seeds, seed_start, jobs, &out_path, threshold)
-    {
+    let threshold = parse_i64_flag(args, "--threshold", 0).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let log_dir = take_flag(args, "--log-dir");
+    let best_out = take_flag(args, "--best-out");
+    let emit_best = take_flag(args, "--emit-best");
+    let retry_failed = args.iter().any(|a| a == "--retry-failed");
+    if let Err(e) = ultra::run_multiseed(
+        path,
+        &part,
+        n_seeds,
+        seed_start,
+        jobs,
+        &out_path,
+        threshold,
+        log_dir.as_deref(),
+        best_out.as_deref(),
+        emit_best.as_deref(),
+        retry_failed,
+    ) {
         eprintln!("multiseed: {e}");
         std::process::exit(1);
     }
@@ -719,7 +766,12 @@ fn cmd_timing(args: &[String]) {
     }
     println!(
         "report_timing {} WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={}",
-        resolve(c.design.name), timing.wns_ps, timing.tns_ps, timing.endpoints, timing.r2r_ps, timing.iob_ps
+        resolve(c.design.name),
+        timing.wns_ps,
+        timing.tns_ps,
+        timing.endpoints,
+        timing.r2r_ps,
+        timing.iob_ps
     );
 }
 
@@ -847,7 +899,11 @@ fn cmd_bits(args: &[String]) {
         });
         println!("wrote {p} {} bytes", c.bits.packets.len());
     } else {
-        println!("bitstream {} bytes={}", resolve(c.design.name), c.bits.packets.len());
+        println!(
+            "bitstream {} bytes={}",
+            resolve(c.design.name),
+            c.bits.packets.len()
+        );
     }
 }
 
@@ -921,8 +977,8 @@ fn cmd_qor(args: &[String]) {
 }
 
 fn maybe_export_dashboard(path: &str, c: &Compiled, args: &[String]) {
-    let Some(dir) = take_flag(args, "--export-dashboard")
-        .or_else(|| take_flag(args, "-export-dashboard"))
+    let Some(dir) =
+        take_flag(args, "--export-dashboard").or_else(|| take_flag(args, "-export-dashboard"))
     else {
         return;
     };
