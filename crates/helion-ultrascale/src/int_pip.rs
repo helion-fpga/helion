@@ -327,8 +327,7 @@ mod tests {
     /// Two verbatim lines from prjuray-db zynqusp/segbits_int.db
     /// (commit affbc5e, CC0 1.0), plus the .FWD / .REV pair for the
     /// bidirectional PIP INT_NODE_IMUX_5_INT_OUT0 <-> BYPASS_E8.
-    const FIXTURE: &str =
-        "INT.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1 64_00 !66_00 !68_00 !72_00 !72_01 !74_00\n\
+    const FIXTURE: &str = "INT.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1 64_00 !66_00 !68_00 !72_00 !72_01 !74_00\n\
          INT.PIP.INODE_E_1_FT1.BYPASS_E4 !57_00 !59_00 !61_00 65_01 !67_01 !69_01\n\
          INT.PIP.BYPASS_E8.INT_NODE_IMUX_5_INT_OUT0.FWD !71_13 74_24\n\
          INT.PIP.BYPASS_E8.INT_NODE_IMUX_5_INT_OUT0.REV 71_13 !74_24\n";

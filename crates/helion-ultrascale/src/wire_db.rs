@@ -348,11 +348,7 @@ impl IntTileWireDb {
     /// Tile index a wire belongs to.
     fn tile_of(&self, wire: WireId) -> Option<usize> {
         let t = wire as usize / self.wire_names.len();
-        if t < self.tiles.len() {
-            Some(t)
-        } else {
-            None
-        }
+        if t < self.tiles.len() { Some(t) } else { None }
     }
 
     /// Wire index within its tile.
