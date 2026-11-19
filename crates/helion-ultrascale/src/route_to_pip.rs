@@ -182,7 +182,7 @@ fn continuation_partner(name: &str) -> Option<(String, (i32, i32))> {
     Some((partner, delta))
 }
 
-fn named(db: &dyn WireDb, wire: WireId, design: &str) -> Result<WireInfo<'_>, RouteToPipError> {
+fn named<'a>(db: &'a dyn WireDb, wire: WireId, design: &str) -> Result<WireInfo<'a>, RouteToPipError> {
     db.wire_info(wire)
         .ok_or_else(|| RouteToPipError::UnnamedWire {
             wire,
