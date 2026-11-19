@@ -224,3 +224,33 @@ routing, or nondeterminism across platforms), and re-check md5s after any fix.
   `cargo`/`rustc`, with logs kept under `~/workspace/` so they survive a
   restart.
 - No files under the hands-off paths were touched.
+
+## Resolution (2026-11-19, third run)
+
+Root cause confirmed: the local database had no `required_features.fasm`
+for `xc7z020clg484-1` (upstream f4pga master does not ship one for that
+part either) and no `xc7z020clg400-1/` part directory at all, so zedbit
+warned and left the three always-on bits out of the FASM. The Linux FASM
+differed from the Mac FASM only by those 3 lines
+(`CFG_CENTER_MID_X123Y84.ALWAYS_ON_PROP1` to `3`); placement and routing
+were identical. Claude Code confirmed the diagnosis by rebuilding on the
+Mac with a database shaped like the Linux one and reproducing the Linux
+md5s byte for byte.
+
+Fix: restored `zynq7/xc7z020clg400-1/` from f4pga prjxray-db master
+(`package_pins.csv`, `part.json`, `part.yaml`,
+`required_features.fasm` carrying exactly those 3 lines). The loader falls
+back to another part on the same fabric for `required_features.fasm`, so
+the clg400-1 file supplies the always-on bits for clg484-1 builds.
+
+Rerun, same two commands, same binary, logs `blinky-rerun2.log` and
+`pico-rerun2.log` (real captured stdout this time), both exit 0:
+
+- blinky md5 `d622e9831c0fa76faa5cbaec1aea2267`: MATCHES Mac
+- pico md5 `08ca33a6ff702841ca8851cf20b023c4`: MATCHES Mac
+- Both FASM files now contain the 3 ALWAYS_ON lines.
+
+Verdict: Helion is deterministic across Linux x86_64 and Mac arm64 for
+these two designs. T3 closed. Follow-up logged by Claude Code as gap G81:
+make zedbit and x7v fail loudly when `required_features.fasm` is missing
+instead of warning and silently dropping always-on bits.
