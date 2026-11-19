@@ -413,6 +413,7 @@ class TestReference(unittest.TestCase):
             self.assertIn("absent", miss)
 
 
+
 class TestUram(unittest.TestCase):
     def setUp(self):
         self.ref = Tier1Reference()
@@ -483,6 +484,137 @@ class TestUram(unittest.TestCase):
             self.assertIn("absent", rec["missing"])
 
 
+class TestLutram(unittest.TestCase):
+    def setUp(self):
+        self.ref = Tier1Reference()
+
+    def test_classify_lutram_lines(self):
+        feats = parse_fasm(golden_fasm("lutram", "xcku3p"))
+        got = {}
+        for feat in feats:
+            got[classify(feat)] = got.get(classify(feat), 0) + 1
+        self.assertEqual(got, {"LUT_INIT": 1, "LUTRAM": 6})
+
+    def test_lutram_golden_matches_generator(self):
+        # The on-disk golden is exactly what build_fasm produces.
+        for part in ("xcku3p", "xcvu3p"):
+            self.assertEqual(
+                build_fasm("lutram", part), golden_fasm("lutram", part),
+                "lutram/%s golden differs from build_fasm" % part)
+
+    def test_lutram_golden_lines_match_rust_spelling(self):
+        # The 7 non-comment lines of the golden. The mode lines match
+        # the Rust lutram_fasm / lutram_slice_fasm output exactly;
+        # the INIT line matches after roundtrip normalization only
+        # (Rust renders Verilog 64'h..., the golden uses 0x...),
+        # pinned below by canonicalizing the Rust spelling.
+        lines = [l for l in golden_fasm("lutram", "xcku3p").splitlines()
+                 if l and not l.startswith("#")]
+        self.assertEqual(lines, [
+            "SLICE_X1Y0.A6LUT.INIT[63:0] = 0x6996966996696996",
+            "SLICE_X1Y0.ALUT.MODE.RAM",
+            "SLICE_X1Y0.ALUT.DI1.DI1",
+            "SLICE_X1Y0.ALUT.SIZE.LARGE",
+            "SLICE_X1Y0.WA7USED.V0",
+            "SLICE_X1Y0.WA8USED.V0",
+            "SLICE_X1Y0.WA9USED.V0",
+        ])
+        rust_spelling = (
+            "SLICE_X1Y0.A6LUT.INIT[63:0] = 64'h6996966996696996\n"
+            "SLICE_X1Y0.ALUT.MODE.RAM\n"
+            "SLICE_X1Y0.ALUT.DI1.DI1\n"
+            "SLICE_X1Y0.ALUT.SIZE.LARGE\n"
+            "SLICE_X1Y0.WA7USED.V0\n"
+            "SLICE_X1Y0.WA8USED.V0\n"
+            "SLICE_X1Y0.WA9USED.V0\n"
+        )
+        self.assertEqual(
+            canonical_roundtrip_fasm(rust_spelling, "lutram"),
+            canonical_roundtrip_fasm(
+                golden_fasm("lutram", "xcku3p"), "lutram"),
+        )
+
+    def test_resolve_lutram_mode_exact_bits(self):
+        # SLICE_X1Y0: row 0, CLB col major 6, tile CLEM. Absolute FARs
+        # are base 0x600 plus the segbits frame (the tile minor).
+        # MODE.RAM sets (9, 19) and clears (11, 18); DI1.DI1 sets
+        # (10, 19); SIZE.LARGE, WA7/8/9USED.V0 clear one bit each.
+        far = lambda minor: (0 << 24) | (0 << 18) | (6 << 8) | minor
+        cases = {
+            "ALUT.MODE.RAM": {(far(9), 19): 1, (far(11), 18): 0},
+            "ALUT.DI1.DI1": {(far(10), 19): 1},
+            "ALUT.SIZE.LARGE": {(far(8), 18): 0},
+            "WA7USED.V0": {(far(8), 23): 0},
+            "WA8USED.V0": {(far(11), 22): 0},
+            "WA9USED.V0": {(far(9), 22): 0},
+        }
+        for feat_str, expected in cases.items():
+            bits = self.ref.resolve_lutram_mode("xcku3p", 1, 0, feat_str)
+            self.assertEqual(bits, expected, feat_str)
+            feat = parse_fasm(
+                "SLICE_X1Y0.%s\n" % feat_str)[0]
+            block, rbits, coord, miss = resolve_feature(
+                self.ref, "xcku3p", feat)
+            self.assertIsNone(miss, feat_str)
+            self.assertEqual(block, "LUTRAM")
+            self.assertEqual(coord, "absolute")
+            self.assertEqual(rbits, expected, feat_str)
+
+    def test_lutram_mode_on_slicel_is_blocked(self):
+        # SLICE_X0Y0 is CLEL_R: a LUTRAM there is unrepresentable and
+        # resolves to a blocked record naming the tile type, never to
+        # guessed bits.
+        feat = parse_fasm("SLICE_X0Y0.ALUT.MODE.RAM\n")[0]
+        _, _, _, miss = resolve_feature(self.ref, "xcku3p", feat)
+        self.assertIsNotNone(miss)
+        self.assertIn("CLEL_R", miss)
+        self.assertIn("SLICEM", miss)
+
+    def test_clem_cross_check(self):
+        # The LUTRAM-extracted CLEM table agrees with prjuray too:
+        # 64 checked, 0 mismatches on SLICE_X1Y0 A6LUT.
+        self.assertEqual(
+            self.ref.cross_check_lut("xcku3p", 1, 0, "A6LUT"), (64, []))
+
+    def test_diff_lutram_green_with_fake_emitter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shim = _fake_emitter_shim(tmp)
+            emitter = Emitter(shim)
+            meta = golden_meta("lutram", "xcku3p")
+            recs = diff_design(
+                self.ref, emitter, "lutram", "xcku3p",
+                os.path.join(GOLDEN_DIR, "lutram.xcku3p.fasm"),
+                meta["seed"], meta["placement_hash"], "tier1", tmp,
+            )
+            by_block = {r["block"]: r for r in recs}
+            self.assertEqual(by_block["LUTRAM"]["status"], "green")
+            self.assertEqual(by_block["LUTRAM"]["diff_bits"], 0)
+            self.assertEqual(by_block["LUTRAM"]["total_bits"], 7)
+            self.assertEqual(by_block["LUT_INIT"]["status"], "green")
+            self.assertEqual(by_block["LUT_INIT"]["diff_bits"], 0)
+            self.assertEqual(by_block["LUT_INIT"]["total_bits"], 64)
+            self.assertEqual(by_block["FRAMING"]["status"], "green")
+
+    def test_diff_lutram_xcvu3p_blocked(self):
+        # No xcvu3p device file: both LUTRAM and LUT_INIT report
+        # blocked with the missing data named, never zero.
+        with tempfile.TemporaryDirectory() as tmp:
+            shim = _fake_emitter_shim(tmp)
+            emitter = Emitter(shim)
+            meta = golden_meta("lutram", "xcvu3p")
+            recs = diff_design(
+                self.ref, emitter, "lutram", "xcvu3p",
+                os.path.join(GOLDEN_DIR, "lutram.xcvu3p.fasm"),
+                meta["seed"], meta["placement_hash"], "tier1", tmp,
+            )
+            by_block = {r["block"]: r for r in recs}
+            for block in ("LUTRAM", "LUT_INIT"):
+                self.assertEqual(by_block[block]["status"], "blocked")
+                self.assertIsNone(by_block[block]["diff_bits"])
+                self.assertIn("xcvu3p", by_block[block]["missing"])
+
+
+
 class TestDiffEngine(unittest.TestCase):
     def setUp(self):
         self.ref = Tier1Reference()
@@ -501,7 +633,7 @@ class TestDiffEngine(unittest.TestCase):
                 os.path.join(GOLDEN_DIR, "blinky.xcku3p.fasm"),
                 20261107, "hash", "tier1", tmp,
             )
-            self.assertEqual(len(recs), 10)
+            self.assertEqual(len(recs), 11)
             for rec in recs:
                 self.assertEqual(rec["status"], "blocked")
                 self.assertIsNone(rec["diff_bits"])
@@ -825,7 +957,7 @@ class TestDiffEngine(unittest.TestCase):
                 )
             finally:
                 del os.environ["FAKE_PARSE_GARBAGE"]
-            self.assertEqual(len(recs), 10)
+            self.assertEqual(len(recs), 11)
             by_block = {r["block"]: r for r in recs}
             framing = by_block["FRAMING"]
             self.assertEqual(framing["status"], "red")
@@ -839,7 +971,7 @@ class TestDiffEngine(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
-    def test_full_run_exits_zero_with_60_blocked_records(self):
+    def test_full_run_exits_zero_with_88_blocked_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "run")
             proc = subprocess.run(
@@ -849,16 +981,16 @@ class TestCli(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             recs = [json.loads(l) for l in open(os.path.join(out, "diff.jsonl"))]
-            self.assertEqual(len(recs), 60)
+            self.assertEqual(len(recs), 88)
             self.assertTrue(all(r["status"] == "blocked" for r in recs))
             self.assertTrue(all(r["diff_bits"] is None for r in recs))
             manifest = json.load(open(os.path.join(out, "manifest.json")))
             self.assertEqual(manifest["tier"], "tier1")
-            self.assertEqual(len(manifest["combos"]), 6)
+            self.assertEqual(len(manifest["combos"]), 8)
 
     def test_garbage_parse_emitter_full_run_writes_all_records(self):
         # Critic session 5, FLAG 2, end to end: a bad-parse emitter
-        # over all 6 combos must exit 0 with all 60 records and a
+        # over all 8 combos must exit 0 with all 88 records and a
         # manifest, never a traceback. Every combo's FRAMING record
         # is red with the error named.
         with tempfile.TemporaryDirectory() as tmp:
@@ -875,16 +1007,16 @@ class TestCli(unittest.TestCase):
             self.assertNotIn("Traceback", proc.stderr)
             with open(os.path.join(out, "diff.jsonl")) as f:
                 recs = [json.loads(l) for l in f]
-            self.assertEqual(len(recs), 60)
+            self.assertEqual(len(recs), 88)
             framing = [r for r in recs if r["block"] == "FRAMING"]
-            self.assertEqual(len(framing), 6)
+            self.assertEqual(len(framing), 8)
             for r in framing:
                 self.assertEqual(r["status"], "red")
                 self.assertEqual(r["diff_bits"], 1)
                 self.assertIn("not valid FASM", r["detail"])
             with open(os.path.join(out, "manifest.json")) as f:
                 manifest = json.load(f)
-            self.assertEqual(len(manifest["combos"]), 6)
+            self.assertEqual(len(manifest["combos"]), 8)
 
     def test_tampered_golden_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

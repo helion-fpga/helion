@@ -63,7 +63,7 @@ use helion_ultrascale::bitgen::{
 };
 use helion_ultrascale::device_file::DeviceFile;
 use helion_ultrascale::segbits::{FileSegbitsDb, SegbitsDb};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -575,6 +575,17 @@ fn classify_feature(tile: &str, feature: &str) -> Option<&'static str> {
             return Some("FF_INIT");
         }
     }
+    // LUTRAM mode-selection bits (harness `fasm.py::classify`, LUTRAM
+    // arm, same order: after the FF checks). The 64 content bits are
+    // LUT_INIT, not this block; these are the mode lines only:
+    // MODE.RAM selects distributed RAM, DI1 selects the data-in mux,
+    // SIZE selects the 32/64-bit use, WA7/8/9USED select the
+    // slice-wide address width. MODE.SRL is deliberately NOT here:
+    // SRL is a block-to-be, and `bits` must fail loud on its bits.
+    // MODE.LUT sets no bits, so it never reaches classification.
+    if is_lutram_mode(feature) {
+        return Some("LUTRAM");
+    }
     if (feature.contains("INITP") || feature.contains("INIT_P"))
         && (feature.contains("BRAM") || feature.contains("RAMB") || tile.contains("RAMB"))
     {
@@ -663,6 +674,47 @@ fn is_ff_init(feature: &str) -> bool {
         return false;
     }
     is_ff_bel(bel) && (attr == "INIT" || attr == "SRVAL")
+}
+
+/// LUTRAM mode lines (harness `_LUTRAM_MODE_RE` / `_LUTRAM_DI1_RE` /
+/// `_LUTRAM_SIZE_RE` / `_LUTRAM_WA_RE`): `^([A-H])LUT\.MODE\.RAM$`,
+/// `^([A-H])LUT\.DI1\.(SIN|DI1)$`, `^([A-H])LUT\.SIZE\.(LARGE|SMALL)$`,
+/// `^WA[789]USED\.V[01]$`. Syntactic only: whether the feature exists
+/// in the segbits DB for the tile (the H LUT has no DI1) is the DB's
+/// call at emit time, and `lutram_fasm` in the library fails loud for
+/// lut_index 7 already.
+fn is_lutram_mode(feature: &str) -> bool {
+    let parts: Vec<&str> = feature.split('.').collect();
+    match parts.len() {
+        2 => {
+            // WA7/8/9USED.V0/V1.
+            let wa = match parts[0]
+                .strip_prefix("WA")
+                .and_then(|s| s.strip_suffix("USED"))
+            {
+                Some(d) => d,
+                None => return false,
+            };
+            wa.len() == 1
+                && matches!(wa.as_bytes()[0], b'7' | b'8' | b'9')
+                && (parts[1] == "V0" || parts[1] == "V1")
+        }
+        3 => {
+            // xLUT.MODE.RAM / xLUT.DI1.(SIN|DI1) / xLUT.SIZE.(LARGE|SMALL).
+            let bel = parts[0].as_bytes();
+            if parts[0].len() != 4 || !(b'A'..=b'H').contains(&bel[0]) || &parts[0][1..] != "LUT"
+            {
+                return false;
+            }
+            match parts[1] {
+                "MODE" => parts[2] == "RAM",
+                "DI1" => parts[2] == "SIN" || parts[2] == "DI1",
+                "SIZE" => parts[2] == "LARGE" || parts[2] == "SMALL",
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -793,6 +845,40 @@ mod tests {
             classify_feature("SLICE_X0Y0", "ABCDFF2.SRUSED.V0"),
             Some("FF_INIT")
         );
+        // LUTRAM mode lines: the content bits are LUT_INIT, these
+        // mode-selection lines are the LUTRAM block. Same patterns as
+        // the harness registry, on the CLEM golden slice.
+        assert_eq!(
+            classify_feature("SLICE_X1Y0", "ALUT.MODE.RAM"),
+            Some("LUTRAM")
+        );
+        assert_eq!(
+            classify_feature("SLICE_X1Y0", "ALUT.DI1.DI1"),
+            Some("LUTRAM")
+        );
+        assert_eq!(
+            classify_feature("SLICE_X1Y0", "ALUT.DI1.SIN"),
+            Some("LUTRAM")
+        );
+        assert_eq!(
+            classify_feature("SLICE_X1Y0", "ALUT.SIZE.LARGE"),
+            Some("LUTRAM")
+        );
+        assert_eq!(
+            classify_feature("SLICE_X1Y0", "ALUT.SIZE.SMALL"),
+            Some("LUTRAM")
+        );
+        assert_eq!(
+            classify_feature("SLICE_X1Y0", "WA7USED.V0"),
+            Some("LUTRAM")
+        );
+        assert_eq!(
+            classify_feature("SLICE_X1Y0", "WA9USED.V1"),
+            Some("LUTRAM")
+        );
+        // MODE.SRL is a block-to-be, not LUTRAM: `bits` must fail loud
+        // on an SRL feature that sets bits, never guess.
+        assert_eq!(classify_feature("SLICE_X1Y0", "ALUT.MODE.SRL"), None);
         // CARRY8 has no block in the harness registry: `bits` must
         // fail loud on a CARRY8 feature that sets bits, never guess.
         assert_eq!(classify_feature("SLICE_X0Y0", "CARRY8.DI0.DI0"), None);
@@ -906,5 +992,139 @@ mod tests {
         assert!(blocks.contains("FF_INIT"));
         assert!(blocks.contains("INT_PIP"));
         assert!(blocks.contains("IO_CONFIG"));
+    }
+
+    #[test]
+    fn emit_parse_roundtrip_lutram_golden() {
+        // End-to-end on the harness lutram golden, in-process: one
+        // RAM64X1S on SLICE_X1Y0 ALUT (xcku3p row 0, CLB column 1,
+        // tile type CLEM, base FAR 0x600). Emit the golden FASM, parse
+        // it back, and check the parse-back renders the LUTRAM lines
+        // and re-emits identical set bits. Same shape as the blinky
+        // round-trip test; the golden has no FF lines, so no
+        // translation applies.
+        let golden = include_str!("../../tests/fixtures/lutram.xcku3p.fasm");
+        let device = load_device("xcku3p", &data_dir()).unwrap();
+        assert_eq!(device.tile_type("SLICE_X1Y0"), Some("CLEM"));
+        assert_eq!(device.tile_base_far("SLICE_X1Y0"), Some(0x600));
+        let segbits = load_segbits(&data_dir()).unwrap();
+        let translated = translate_ff_valued_fasm(golden).unwrap();
+        let bytes = emit_bitstream(&translated, device.as_ref(), &segbits).unwrap();
+        let back = parse_bitstream(&bytes, device.as_ref(), &segbits).unwrap();
+        assert!(
+            back.contains("SLICE_X1Y0.A6LUT.INIT[63:0] = 64'h6996966996696996\n"),
+            "parse-back renders the LUTRAM INIT value, got:\n{back}"
+        );
+        assert!(
+            back.contains("SLICE_X1Y0.ALUT.MODE.RAM\n"),
+            "parse-back renders MODE.RAM, got:\n{back}"
+        );
+        assert!(
+            back.contains("SLICE_X1Y0.ALUT.DI1.DI1\n"),
+            "parse-back renders DI1.DI1, got:\n{back}"
+        );
+        assert!(
+            back.contains("SLICE_X1Y0.ALUT.SIZE.LARGE\n"),
+            "parse-back renders SIZE.LARGE, got:\n{back}"
+        );
+        assert!(
+            back.contains("SLICE_X1Y0.WA7USED.V0\n"),
+            "parse-back renders WA7USED.V0, got:\n{back}"
+        );
+        assert!(
+            back.contains("SLICE_X1Y0.WA8USED.V0\n"),
+            "parse-back renders WA8USED.V0, got:\n{back}"
+        );
+        assert!(
+            back.contains("SLICE_X1Y0.WA9USED.V0\n"),
+            "parse-back renders WA9USED.V0, got:\n{back}"
+        );
+        // Re-emitting the parse-back must set identical bits. Same
+        // empty-frame note as the blinky test: the parse-back renders
+        // complement lines for BELs the golden never mentions (other
+        // LUTs' SIZE.LARGE and DI1.SIN, FF INIT.V1/SRVAL.V1), and
+        // their re-emit legitimately carries empty frames the first
+        // emit never touched. Empty frames carry no configuration.
+        let frames1 = emit_frames(&translated, device.as_ref(), &segbits).unwrap();
+        let frames2 = emit_frames(&back, device.as_ref(), &segbits).unwrap();
+        let set_bits = |frames: &BTreeMap<u32, [u32; 93]>| -> BTreeSet<(u32, u16)> {
+            let mut out = BTreeSet::new();
+            for (far, words) in frames {
+                for (wi, word) in words.iter().enumerate() {
+                    let mut w = *word;
+                    while w != 0 {
+                        let b = w.trailing_zeros() as usize;
+                        out.insert((*far, (wi * 32 + b) as u16));
+                        w &= w - 1;
+                    }
+                }
+            }
+            out
+        };
+        assert_eq!(
+            set_bits(&frames1),
+            set_bits(&frames2),
+            "parse-back re-emits identical set bits"
+        );
+    }
+
+    #[test]
+    fn bits_labels_lutram_set_bits() {
+        let golden = include_str!("../../tests/fixtures/lutram.xcku3p.fasm");
+        let device = load_device("xcku3p", &data_dir()).unwrap();
+        let segbits = load_segbits(&data_dir()).unwrap();
+        let translated = translate_ff_valued_fasm(golden).unwrap();
+        let bytes = emit_bitstream(&translated, device.as_ref(), &segbits).unwrap();
+        let frames = parse_frames(&bytes).unwrap();
+        let mut frame_set: HashSet<(u32, u16)> = HashSet::new();
+        for (far, words) in &frames {
+            for (wi, word) in words.iter().enumerate() {
+                let mut w = *word;
+                while w != 0 {
+                    let b = w.trailing_zeros() as usize;
+                    frame_set.insert((*far, (wi * 32 + b) as u16));
+                    w &= w - 1;
+                }
+            }
+        }
+        // The INIT value 0x6996966996696996 has 32 set bits, MODE.RAM
+        // sets 1 ((0x609, 19)), DI1.DI1 sets 1 ((0x60a, 19)); SIZE.LARGE
+        // and the WA*USED.V0 lines set no bits. Total 34 set bits,
+        // split 32 LUT_INIT and 2 LUTRAM.
+        let out = bits_for_bytes(&bytes, device.as_ref(), &segbits).unwrap();
+        let mut labeled: HashMap<(u32, u16), &str> = HashMap::new();
+        let mut blocks: HashSet<&str> = HashSet::new();
+        for line in out.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(f.len(), 4, "bits line shape: {line}");
+            labeled.insert(
+                (
+                    u32::from_str_radix(f[0], 16).unwrap(),
+                    f[1].parse().unwrap(),
+                ),
+                f[3],
+            );
+            assert_eq!(f[2], "1");
+            blocks.insert(f[3]);
+        }
+        assert_eq!(labeled.len(), 34, "34 set bits total");
+        assert_eq!(
+            labeled.keys().collect::<HashSet<_>>(),
+            frame_set.iter().collect::<HashSet<_>>(),
+            "labeled bits equal frame set bits"
+        );
+        assert_eq!(blocks, HashSet::from(["LUT_INIT", "LUTRAM"]));
+        assert_eq!(labeled[&(0x609, 19)], "LUTRAM", "MODE.RAM set bit");
+        assert_eq!(labeled[&(0x60a, 19)], "LUTRAM", "DI1.DI1 set bit");
+        assert_eq!(
+            labeled.values().filter(|b| **b == "LUTRAM").count(),
+            2,
+            "exactly the two mode bits are LUTRAM"
+        );
+        assert_eq!(
+            labeled.values().filter(|b| **b == "LUT_INIT").count(),
+            32,
+            "the 32 INIT bits are LUT_INIT"
+        );
     }
 }

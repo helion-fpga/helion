@@ -57,12 +57,18 @@ is the authority for the lookup order:
 
 ### What is NOT here
 
-- No LUTRAM table exists in the source JSON, and the BitFiltrator paper
-  section V-B does not state that LUTRAM uses the same INIT bits as
-  LUTs (it describes LUTRAM/register formats as discovered separately
-  from the logic location file, while standard LUTs were fuzzed). LUTRAM
-  emission is therefore blocked, fail loud, until a LUTRAM table or
-  Vivado logic-location data lands. See `src/bitloc.rs`.
+- No separate LUTRAM table exists in the source JSON, because none is
+  needed: the LUTRAM content bits ARE the LUT INIT bits (`LutLoc`),
+  proven three ways (see docs/ultra-bitgen-crew/subproblems/
+  US-04-lutram-table.md). BitFiltrator's extraction code states the
+  INIT bits "ended up having the same encoding for LUTRAMs and
+  standard LUTs"; the vendored tables are byte-identical across all
+  four CLB tile types; every prjuray xLUT.INIT[i] line equals the
+  LutLoc Y0 pair. The mode-selection bits (MODE.RAM, DI1, SIZE,
+  WA7/8/9USED) resolve through the vendored segbits_clem.db and
+  segbits_clem_r.db. LUTRAM emission works on SLICEM tiles and fails
+  loud on SLICEL tiles. See `src/bitloc.rs`. The paper section V-B
+  claim stays rejected: the derivation does not rest on it.
 - No INT PIP, IO, clock, DSP, or URAM encodings. Those belong to other
   workers.
 - The `y_ofst` tables are per-column-relative. Absolute frame addresses

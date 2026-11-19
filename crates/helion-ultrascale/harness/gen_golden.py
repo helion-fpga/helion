@@ -119,6 +119,16 @@ DESIGNS = {
         "luts": [],
         "ffs": [],
     },
+    # lutram: one RAM64X1S (64x1 single-port distributed RAM) on
+    # SLICE_X1Y0 ALUT. No FFs, no PIPs, no IO: the minimal LUTRAM
+    # exercise. The "luts"/"ffs" shape is shared with the other
+    # designs so design_ff_locations works (ffs is empty); the tile,
+    # INIT value, and mode lines live in build_lutram_fasm, not in
+    # the boolean-function table (a RAM has no boolean function).
+    "lutram": {
+        "luts": [],
+        "ffs": [],
+    },
 }
 
 # URAM golden placement and attributes. URAM_X0Y0 is PROVISIONAL:
@@ -158,6 +168,44 @@ URAM_HEADER = """# golden FASM: uram on {part}
 # resolves to blocked until then.
 # PROVISIONAL: the xcvu3p golden reuses the xcku3p placement verbatim
 # and is provisional until the xcvu3p device file lands.
+"""
+
+# LUTRAM golden placement and INIT. SLICE_X1Y0 is xcku3p row major 0,
+# CLB column 1, tile type CLEM per the BitFiltrator xcku3p device file
+# (column 1 is the first CLEM column). The INIT value is the XOR
+# pattern 0x6996966996696996 (32 bits set), the same pattern the
+# crate's bitloc tests hand-check.
+LUTRAM_TILE = "SLICE_X1Y0"
+LUTRAM_INIT = 0x6996966996696996
+
+LUTRAM_HEADER = """# golden FASM: lutram on {part}
+# seed: {seed}
+# source: RAM64X1S (64x1 single-port distributed RAM) on SLICE_X1Y0 ALUT.
+# placement: SLICE_X1Y0 (xcku3p: row major 0, CLB column 1, tile type CLEM
+# per the BitFiltrator xcku3p device file). One RAM64X1S only: no FF, no
+# route, no IO. The design is the minimal LUTRAM exercise, not a full
+# system; routing of address/data/clock is the router worker's scope.
+# derivation: the LUTRAM content bits ARE the LUT INIT bits (same
+# encoding), proven three ways, see docs/ultra-bitgen-crew/subproblems/
+# US-04-lutram-table.md: (1) BitFiltrator's own extraction code states
+# the INIT bits "ended up having the same encoding for LUTRAMs and
+# standard LUTs when we extracted the data" (extract_encoding_from_
+# logic_loc.py); its pipeline extracts CLEM LutLoc from Vivado
+# logic-location files of all-LUTRAM columns and CLEL LutLoc from a LUT
+# INIT fuzzing sweep. (2) The vendored tables are byte-identical across
+# all four CLB tile types (0 differing pairs of 30,720 per pair).
+# (3) Every prjuray xLUT.INIT[i] line equals the LutLoc Y0 pair (512 of
+# 512 per tile type). The mode lines below resolve through the vendored
+# segbits_clem.db: ALUT.MODE.RAM, ALUT.DI1.DI1, ALUT.SIZE.LARGE,
+# WA7/8/9USED.V0. Their SELECTION for a 64x1S follows the f4pga Project
+# X-Ray DRAM documentation (7-series feature family, same concepts under
+# UltraScale+ spellings): 64x1S needs xLUT.RAM plus the data-in mux to
+# the LUT's own input; SMALL only for 32-bit use; WA7/8USED only for
+# 128x1/256x1 use. That selection is a documented cross-family
+# inference, not a Vivado-verified UltraScale+ fact: tier 2 (a Vivado
+# bitstream diff) remains its arbiter. The bit LOCATIONS are proven.
+# PROVISIONAL: the xcvu3p golden reuses the xcku3p placement verbatim and
+# is provisional until the xcvu3p device file lands.
 """
 
 PIPS = {"blinky": BLINKY_PIPS, "counter": COUNTER_PIPS}
@@ -210,9 +258,35 @@ def build_uram_fasm(design, part):
     return "\n".join(lines) + "\n"
 
 
+def build_lutram_fasm(design, part):
+    """FASM for the lutram golden: one RAM64X1S on SLICE_X1Y0 ALUT.
+
+    The mode lines match the Rust `lutram_fasm` /
+    `lutram_slice_fasm` output exactly; the INIT line matches after
+    roundtrip normalization only (the Rust emitter renders Verilog
+    `64'h...`, the golden uses the harness `0x...` spelling, same
+    value; see roundtrip.py). The duplication is deliberate, the two
+    implementations are in different languages and the tests pin
+    them together.
+    """
+    lines = [LUTRAM_HEADER.format(design=design, part=part, seed=SEED).rstrip()]
+    lines.append(
+        "%s.A6LUT.INIT[63:0] = 0x%016x" % (LUTRAM_TILE, LUTRAM_INIT)
+    )
+    lines.append("%s.ALUT.MODE.RAM" % LUTRAM_TILE)
+    lines.append("%s.ALUT.DI1.DI1" % LUTRAM_TILE)
+    lines.append("%s.ALUT.SIZE.LARGE" % LUTRAM_TILE)
+    lines.append("%s.WA7USED.V0" % LUTRAM_TILE)
+    lines.append("%s.WA8USED.V0" % LUTRAM_TILE)
+    lines.append("%s.WA9USED.V0" % LUTRAM_TILE)
+    return "\n".join(lines) + "\n"
+
+
 def build_fasm(design, part):
     if design == "uram":
         return build_uram_fasm(design, part)
+    if design == "lutram":
+        return build_lutram_fasm(design, part)
     spec = DESIGNS[design]
     lines = [HEADER.format(design=design, part=part, seed=SEED).rstrip()]
     for bel, fn in spec["luts"]:
@@ -250,6 +324,21 @@ def placement_record(design, part):
                 "tilegrid in any public DB; tile types URAM_URAM_FT / "
                 "URAM_URAM_DELAY_FT per the BitFiltrator device file). "
                 "No INT/HPIO tiles."
+            ),
+        }
+    if design == "lutram":
+        return {
+            "design": design,
+            "part": part,
+            "seed": SEED,
+            "sites": [{"tile": LUTRAM_TILE, "bel": "A6LUT", "role": "lutram"}],
+            "provisional_tiles": [],
+            "notes": (
+                "One RAM64X1S on SLICE_X1Y0 ALUT (CLEM tile). No INT/HPIO tiles. "
+                "xcvu3p placement reuses the xcku3p coordinates verbatim and "
+                "is provisional until the xcvu3p device file lands."
+                if part == "xcvu3p" else
+                "One RAM64X1S on SLICE_X1Y0 ALUT (CLEM tile). No INT/HPIO tiles."
             ),
         }
     spec = DESIGNS[design]
@@ -304,13 +393,25 @@ def verify_features_exist(ref):
         key = "HPIO_RIGHT." + feat
         if key not in hpio_db:
             raise SystemExit("golden IO %s not in segbits_hpio_right.db" % key)
+    clem_db = ref.segbits("clem")
+    for feat in (
+        "ALUT.MODE.RAM",
+        "ALUT.DI1.DI1",
+        "ALUT.SIZE.LARGE",
+        "WA7USED.V0",
+        "WA8USED.V0",
+        "WA9USED.V0",
+    ):
+        key = "CLEM." + feat
+        if key not in clem_db:
+            raise SystemExit("golden LUTRAM feature %s not in segbits_clem.db" % key)
 
 
 def main():
     ref = Tier1Reference()
     verify_features_exist(ref)
     os.makedirs(GOLDEN_DIR, exist_ok=True)
-    for design in ("blinky", "counter", "uram"):
+    for design in ("blinky", "counter", "uram", "lutram"):
         for part in ("xcku3p", "xcvu3p"):
             fasm = build_fasm(design, part)
             record = placement_record(design, part)
