@@ -82,6 +82,28 @@ class TestFasm(unittest.TestCase):
                 got[classify(feat)] = got.get(classify(feat), 0) + 1
             self.assertEqual(got, counts, design)
 
+    def test_classify_clk_lines(self):
+        # CLK golden lines (tests/fixtures/clk_blinky.fasm, clk branch):
+        # CMT WIRE, BUFCE_LEAF, and RCLK PIP lines are all CLK. The
+        # RCLK PIP must NOT classify as INT_PIP, and an INT PIP still
+        # does. Feature objects, not golden files: the fixture lives
+        # on the clk branch, not in this harness tree.
+        from fasm import Feature
+        cases = [
+            ("CMT_RIGHT_X0Y0", "WIRE.CLK_HDISTR_0_0.USED.V1", "CLK"),
+            ("CMT_RIGHT_X0Y0", "WIRE.CLK_HROUTE_1_0.USED.V1", "CLK"),
+            ("CMT_RIGHT_X0Y0", "PIP.CLK_HROUTE_1_0.CLK_HDISTR_0_0", "CLK"),
+            ("CMT_L_X0Y0", "BUFGCE_X0Y0.BUFGCE.IINV.V0", "CLK"),
+            ("RCLK_INT_L_X0Y0", "BUFCE_LEAF_X0Y0.BUFCE_LEAF.CE_TYPE.SYNC", "CLK"),
+            ("RCLK_INT_L_X0Y0", "BUFCE_LEAF_X0Y0.BUFCE_LEAF.IN_USE.V1", "CLK"),
+            ("RCLK_INT_L_X0Y0", "PIP.CLK_LEAF_SITES_0_CLK_IN.CLK_HDISTR_FT0_0", "CLK"),
+            ("INT_X0Y0", "PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1", "INT_PIP"),
+        ]
+        for tile, feat, want in cases:
+            self.assertEqual(
+                classify(Feature(tile, feat)), want, "%s.%s" % (tile, feat)
+            )
+
     def test_every_ff_has_exactly_one_srval_zero(self):
         # SRVAL golden completion (orchestrator session 13): every FF
         # in every generated golden has exactly one SRVAL line with
@@ -402,6 +424,59 @@ class TestReference(unittest.TestCase):
         with self.assertRaises(MissingReference):
             self.ref.resolve_int_pip("xcku3p", 0, 0, "PIP.NOPE.NOPE")
 
+    def test_rclk_pip_resolves_tile_relative(self):
+        bits = self.ref.resolve_rclk(
+            "RCLK_INT_L_X0Y0", "PIP.CLK_LEAF_SITES_0_CLK_IN.CLK_HDISTR_FT0_0"
+        )
+        # 11 bits (clk.rs): 00_15, 01_15, 02_17 set; 8 must-be-zero.
+        self.assertEqual(len(bits), 11)
+        self.assertEqual(bits[("RCLK_INT_L_X0Y0", 0, 15)], 1)
+        self.assertEqual(bits[("RCLK_INT_L_X0Y0", 1, 15)], 1)
+        self.assertEqual(bits[("RCLK_INT_L_X0Y0", 2, 17)], 1)
+        self.assertEqual(bits[("RCLK_INT_L_X0Y0", 0, 16)], 0)
+        self.assertEqual(sum(bits.values()), 3)
+
+    def test_rclk_bufce_leaf_resolves_tile_relative(self):
+        bits = self.ref.resolve_rclk(
+            "RCLK_INT_L_X0Y0", "BUFCE_LEAF_X0Y0.BUFCE_LEAF.CE_TYPE.SYNC"
+        )
+        # CE_TYPE.SYNC is !01_12: one must-be-zero bit, no set bit.
+        self.assertEqual(bits, {("RCLK_INT_L_X0Y0", 1, 12): 0})
+        bits = self.ref.resolve_rclk(
+            "RCLK_INT_L_X0Y0", "BUFCE_LEAF_X0Y0.BUFCE_LEAF.IN_USE.V1"
+        )
+        self.assertEqual(bits, {("RCLK_INT_L_X0Y0", 0, 15): 1})
+        bits = self.ref.resolve_rclk(
+            "RCLK_INT_L_X0Y0", "BUFCE_LEAF_X0Y0.BUFCE_LEAF.DELAY_TAP.V0"
+        )
+        self.assertEqual(len(bits), 5)
+        self.assertEqual(bits[("RCLK_INT_L_X0Y0", 0, 13)], 1)
+
+    def test_rclk_unknown_feature_and_tile_fail_loud(self):
+        with self.assertRaises(MissingReference):
+            self.ref.resolve_rclk("RCLK_INT_L_X0Y0", "PIP.NOPE.NOPE")
+        with self.assertRaises(MissingReference):
+            self.ref.resolve_rclk(
+                "INT_X0Y0", "PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1"
+            )
+
+    def test_cmt_wire_resolves_tile_relative(self):
+        bits = self.ref.resolve_cmt_pip(
+            "CMT_RIGHT_X0Y0", "WIRE.CLK_HDISTR_0_0.USED.V1"
+        )
+        self.assertEqual(bits, {("CMT_RIGHT_X0Y0", 7, 33): 1})
+        bits = self.ref.resolve_cmt_pip(
+            "CMT_RIGHT_X0Y0", "WIRE.CLK_HROUTE_1_0.USED.V1"
+        )
+        self.assertEqual(bits, {("CMT_RIGHT_X0Y0", 7, 149): 1})
+
+    def test_cmt_left_has_no_segbits_file(self):
+        with self.assertRaises(MissingReference) as ctx:
+            self.ref.resolve_cmt_pip(
+                "CMT_L_X0Y0", "WIRE.CLK_HDISTR_0_0.USED.V1"
+            )
+        self.assertIn("CMT_L", str(ctx.exception))
+
     def test_dsp_uram_have_no_encoding(self):
         feats = parse_fasm(
             "DSP_X0Y0.DSP48E2.AREG = 1\n"
@@ -423,6 +498,46 @@ class TestDiffEngine(unittest.TestCase):
         # One flipped required bit + one extra set bit = 2.
         self.assertEqual(compute_diff(ref_bits, emitted), 2)
         self.assertEqual(compute_diff(ref_bits, dict(ref_bits)), 0)
+
+    def test_clk_golden_splits_resolved_from_blocked(self):
+        # The 9 CLK lines of tests/fixtures/clk_blinky.fasm (clk
+        # branch): 8 resolve tile-relative from public segbits DBs, 1
+        # is blocked (CMT BUFGCE site config, no public encoding).
+        # Feature objects, not the fixture file: the fixture lives on
+        # the clk branch, not in this harness tree.
+        from fasm import Feature
+        lines = [
+            ("CMT_L_X0Y0", "BUFGCE_X0Y0.BUFGCE.IINV.V0"),
+            ("CMT_RIGHT_X0Y0", "WIRE.CLK_HDISTR_0_0.USED.V1"),
+            ("CMT_RIGHT_X0Y0", "WIRE.CLK_HROUTE_1_0.USED.V1"),
+            ("RCLK_INT_L_X0Y0", "BUFCE_LEAF_X0Y0.BUFCE_LEAF.CE_TYPE.SYNC"),
+            ("RCLK_INT_L_X0Y0", "BUFCE_LEAF_X0Y0.BUFCE_LEAF.CEINV.V0"),
+            ("RCLK_INT_L_X0Y0", "BUFCE_LEAF_X0Y0.BUFCE_LEAF.DELAY_TAP.V0"),
+            ("RCLK_INT_L_X0Y0", "BUFCE_LEAF_X0Y0.BUFCE_LEAF.IINV.V0"),
+            ("RCLK_INT_L_X0Y0", "BUFCE_LEAF_X0Y0.BUFCE_LEAF.IN_USE.V1"),
+            ("RCLK_INT_L_X0Y0", "PIP.CLK_LEAF_SITES_0_CLK_IN.CLK_HDISTR_FT0_0"),
+        ]
+        resolved = []
+        missing = []
+        for tile, feat in lines:
+            block, bits, coord, miss = resolve_feature(
+                self.ref, "xcku3p", Feature(tile, feat)
+            )
+            self.assertEqual(block, "CLK", "%s.%s" % (tile, feat))
+            if miss:
+                missing.append((tile, feat, miss))
+            else:
+                self.assertEqual(coord, "tile-relative", "%s.%s" % (tile, feat))
+                resolved.append((tile, feat, bits))
+        self.assertEqual(len(resolved), 8)
+        self.assertEqual(len(missing), 1)
+        self.assertEqual(missing[0][0], "CMT_L_X0Y0")
+        self.assertIn("BUFGCE", missing[0][1])
+        self.assertIn("CMT_LEFT", missing[0][2])
+        # Spot bit counts: RCLK PIP 11 bits (3 set), HDISTR USED 1 bit.
+        pip = [b for _, f, b in resolved if "CLK_LEAF_SITES_0" in f][0]
+        self.assertEqual(len(pip), 11)
+        self.assertEqual(sum(pip.values()), 3)
 
     def test_blocked_without_emitter_never_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
