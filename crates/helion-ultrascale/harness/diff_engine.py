@@ -32,7 +32,7 @@ from reference import MissingReference
 import roundtrip as roundtrip_mod
 
 # Blocks whose reference bits are absolute FARs once resolved.
-ABSOLUTE_BLOCKS = {"LUT_INIT", "FF_INIT", "BRAM_CONTENT", "BRAM_PARITY", "INT_PIP"}
+ABSOLUTE_BLOCKS = {"LUT_INIT", "LUTRAM", "FF_INIT", "BRAM_CONTENT", "BRAM_PARITY", "INT_PIP"}
 
 # Blocks the golden designs do not exercise at all (v1 goldens have no
 # BRAM, DSP, or URAM instances). Reported blocked, never green.
@@ -85,6 +85,10 @@ def resolve_feature(ref, part, feature):
                     raise MissingReference("FF SRVAL value %r is not 0 or 1" % value)
                 return block, ref.resolve_srval(part, x, y, bel, srval), "absolute", None
             raise MissingReference("unhandled FF feature %r" % feat)
+        if block == "LUTRAM":
+            from fasm import slice_xy
+            x, y = slice_xy(tile)
+            return block, ref.resolve_lutram_mode(part, x, y, feat), "absolute", None
         if block in ("BRAM_CONTENT", "BRAM_PARITY"):
             raise MissingReference(NOT_EXERCISED[block])
         if block == "INT_PIP":
