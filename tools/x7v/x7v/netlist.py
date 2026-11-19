@@ -356,6 +356,10 @@ class Extractor:
     # ---- netlist build -----------------------------------------------------
     def build(self) -> Netlist:
         nl = Netlist(self.sites)
+        ps = ps7.site(self)
+        # A PS7 the fabric only feeds (reads none of its outputs) is still the design's edge.
+        if ps and ps.name not in self.used_sites and ps7.driven(self, ps):
+            self.used_sites.add(ps.name)
         done: set[str] = set()
         while True:
             todo = sorted(self.used_sites - done)
@@ -651,7 +655,7 @@ def model_bufhce(x: Extractor, s: Site, nl: Netlist):
     nl.lines.append(f"wire {n('O')} = ({ce}) === 1'b0 ? 1'b0 : {i};")
 
 
-from . import lutram  # noqa: E402
+from . import lutram, ps7  # noqa: E402
 from .bram import VERILOG_MODEL as _BRAM_VERILOG, model_ramb18, model_ramb36  # noqa: E402
 from .dsp import VERILOG_MODEL as _DSP_VERILOG, model_dsp48e1  # noqa: E402
 from .mmcm import VERILOG_MODEL as _CMT_VERILOG, model_cmt  # noqa: E402
@@ -669,6 +673,7 @@ MODELS = {
     "OLOGICE3": model_ologic,
     "BUFGCTRL": model_bufg,
     "BUFHCE": model_bufhce,
+    "PS7": ps7.model_ps7,
 }
 
 
