@@ -2026,6 +2026,28 @@ mod tests {
         })
     }
 
+    /// G76 probe: the fastest route the search finds for one long hop on an
+    /// empty device (no other nets), to compare with a routed design.
+    /// `cargo test --release -p helion-xilinx7 --lib long_hop -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn long_hop_delay_on_an_empty_device() {
+        let (dev, maps) = test_z020();
+        let x = XDevice::new(dev, maps.clone());
+        let claimed = HashMap::new();
+        for (from, to) in [("SLICE_X93Y10", "SLICE_X36Y84"), ("SLICE_X60Y40", "SLICE_X60Y74"), ("SLICE_X40Y40", "SLICE_X74Y40"), ("SLICE_X40Y40", "SLICE_X41Y41")] {
+            let src = x.site_pin_wire(from, "AQ").expect("src");
+            let dst = x.site_pin_wire(to, "A1").expect("dst");
+            for crit in [0u8, 255] {
+                let opts = crate::route::RouteOpts { crit, ..Default::default() };
+                let r = x.astar((&src.0, &src.1), &[], &[dst.clone()], opts, "probe", &claimed);
+                let (pips, arr) = r.flatten().expect("routes");
+                let wires: Vec<String> = pips.iter().filter(|p| !p.dst_wire.starts_with("IMUX") && !p.dst_wire.contains("LOGIC_OUTS")).map(|p| p.dst_wire.clone()).collect();
+                eprintln!("{from} -> {to} crit {crit}: {} ps, {} pips: {}", arr.last().map(|a| a.1).unwrap_or(0), pips.len(), wires.join(" "));
+            }
+        }
+    }
+
     #[test]
     fn bufg_tieoff_paths() {
         let (dev, maps) = test_z020();
