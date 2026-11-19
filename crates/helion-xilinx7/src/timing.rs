@@ -531,7 +531,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         lut_letter: &HashMap<&'a str, char>,
         route: &dyn Fn(&str, &str, &str, bool) -> u32,
         bram_out: &HashMap<&'a str, &'a str>,
-        dsp_out: &HashMap<&'a str, (&'a str, u32)>,
+        dsp_out: &HashMap<&'a str, (String, u32)>,
         xy_of: &HashMap<&'a str, (i32, i32)>,
         lr: &HashMap<&'a str, crate::lutram::ReadArc<'a>>,
     ) -> Result<(u32, Vec<PathStep>), String> {
@@ -541,9 +541,9 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         if depth > 10_000 || !visiting.insert(net.to_string()) {
             return Err(format!("timing: combinational loop through net `{net}`"));
         }
-        let r = if let Some((dn, cko)) = dsp_out.get(net) {
-            // P (or another CLK-launched DSP output) starts a path here.
-            (*cko, vec![PathStep { what: format!("{dn} (DSP48E1 output)"), arrival_ps: *cko, wire_ps: 0, xy: None }])
+        let r = if let Some((what, cko)) = dsp_out.get(net) {
+            // P (or another clock-launched DSP or PS7 output) starts a path here.
+            (*cko, vec![PathStep { what: what.clone(), arrival_ps: *cko, wire_ps: 0, xy: None }])
         } else if let Some(b) = bram_out.get(net) {
             (BRAM_CKO_PS, vec![PathStep { what: format!("{b} (block RAM DO)"), arrival_ps: BRAM_CKO_PS, wire_ps: 0, xy: None }])
         } else if let Some(r) = lr.get(net) {
@@ -663,8 +663,8 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
     // the design looked faster than it is. P is launched by CLK with the
     // device's own pipeline-depth-dependent delay; a clocked data/control input
     // is a setup endpoint.
-    let mut dsp_out: HashMap<&str, (&str, u32)> = HashMap::new();
-    let mut dsp_in: Vec<(&str, &str, String, u32)> = Vec::new(); // (net, site, pin, setup)
+    let mut dsp_out: HashMap<&str, (String, u32)> = HashMap::new();
+    let mut dsp_in: Vec<(&str, &str, String, u32, &str)> = Vec::new(); // (net, site, pin, setup, block)
     let dsp_clk_by_name: HashMap<&str, Option<&str>> = packed
         .dsps
         .iter()
@@ -681,13 +681,26 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             if *is_out {
                 // P, PCOUT, CARRYOUT, ... all launch from CLK.
                 if pin.starts_with('P') || pin.starts_with("CARRYOUT") {
-                    dsp_out.insert(net.as_str(), (d.name.as_str(), cko));
+                    dsp_out.insert(net.as_str(), (format!("{} (DSP48E1 output)", d.name), cko));
                 }
             } else if on_this_clock {
                 if let Some(setup) = dsp_setup_ps(pin) {
-                    dsp_in.push((net.as_str(), pd.site.as_str(), pin.clone(), setup));
+                    dsp_in.push((net.as_str(), pd.site.as_str(), pin.clone(), setup, "DSP48E1"));
                 }
             }
+        }
+    }
+    // PS7 clocked ports (the AXI interfaces and the like), slow corner from
+    // X-Ray's PSS2.sdf: an output launches at its clock-to-out, an input on
+    // this clock ends a path at its setup.
+    for p in &packed.ps7s {
+        let Some(pp) = placed.ps7s.iter().find(|q| q.name == p.name) else { continue };
+        let (launch, capture) = crate::ps7::timing_ends(p)?;
+        for (net, clk, ps, pin) in launch {
+            dsp_out.insert(net, (format!("{}.{pin} (PS7 output, clock {clk})", p.name), ps));
+        }
+        for (net, _, ps, pin) in capture.into_iter().filter(|c| c.1 == domain) {
+            dsp_in.push((net, pp.site.as_str(), pin.to_string(), ps, "PS7"));
         }
     }
     let lr = crate::lutram::read_arcs(placed);
@@ -770,7 +783,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             worst_path = p;
         }
     }
-    for (net, site, pin, setup) in &dsp_in {
+    for (net, site, pin, setup, block) in &dsp_in {
         let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &bram_out, &dsp_out, &xy_of, &lr)?;
         if p.is_empty() {
             continue;
@@ -783,7 +796,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         }
         if slack < wns {
             wns = slack;
-            p.push(PathStep { what: format!("{site}.{pin} (DSP48E1 input)"), arrival_ps: t, wire_ps: t - a, xy: None });
+            p.push(PathStep { what: format!("{site}.{pin} ({block} input)"), arrival_ps: t, wire_ps: t - a, xy: None });
             worst_path = p;
         }
     }

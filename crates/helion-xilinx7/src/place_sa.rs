@@ -454,6 +454,15 @@ pub fn refine(out: &mut Placed7, device: &dyn DeviceQuery) {
             pins.entry(net.as_str()).or_default().push(Pin::Fixed(x, y));
         }
     }
+    // A PS7 pin sits on its own INT tile, up to 50 rows from the PS7 site's tile.
+    // shortcut: PS7 pins pull by wirelength only, they are not in the timing graph; add them there when a PS7 design misses timing.
+    for (p, site) in packed.ps7s.iter().filter_map(|p| out.ps7s.iter().find(|q| q.name == p.name).map(|q| (p, &q.site))) {
+        for (pin, net, is_out) in &p.pins {
+            if let Some((x, y)) = device.hard_pin_tile(site, pin, *is_out).and_then(|t| device.tile_xy(&t)) {
+                pins.entry(net.as_str()).or_default().push(Pin::Fixed(x, y));
+            }
+        }
+    }
     for (iob, placed) in packed.iobs.iter().zip(&out.iobs) {
         if let Some((x, y)) = device.tile_xy(&placed.tile) {
             pins.entry(iob.net.as_str()).or_default().push(Pin::Pad(x, y));

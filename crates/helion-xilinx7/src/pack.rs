@@ -665,6 +665,8 @@ pub struct Packed7 {
     pub pcies: Vec<PackedPcie>,
     pub xadcs: Vec<PackedXadc>,
     pub cfg_prims: Vec<PackedCfgPrim>,
+    /// The Zynq processing system (see [`crate::ps7`]).
+    pub ps7s: Vec<crate::ps7::PackedPs7>,
     /// Optional pinned site for the first carry-chain head (e.g.
     /// `SLICE_X113Y39`). General mechanism for convergence runs: the
     /// caller pins a golden column, the placer never invents one.
@@ -1023,6 +1025,9 @@ fn pack_blackbox_primitive(
         }
         "XADC" => {
             out.xadcs.push(pack_xadc(cell_name, pins, attrs)?);
+        }
+        "PS7" => {
+            out.ps7s.push(crate::ps7::pack(cell_name, netlist)?);
         }
         "BSCANE2" | "ICAPE2" | "DNA_PORT" | "FRAME_ECCE2" | "STARTUPE2" | "USR_ACCESSE2"
         | "CAPTUREE2" => {

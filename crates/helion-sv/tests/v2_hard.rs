@@ -216,3 +216,23 @@ fn primitive_instances_pass_through() {
     assert_eq!(net(&d, "u_mmcm", "CLKFBIN"), net(&d, "u_mmcm", "CLKFBOUT"));
     assert_eq!(net(&d, "u_mmcm", "CLKOUT0").as_deref(), Some("o"));
 }
+
+#[test]
+fn registered_primitive_passes_through() {
+    let src = "module z (output [1:0] q);
+           wire c; wire [3:0] f;
+           ZPRIM u_z (.FCLK(f), .ACLK(c), .Q(q));
+           assign c = f[0];
+         endmodule";
+    helion_sv::v2::set_hard(true);
+    let err = helion_sv::synth_sv_v2(src, "t.sv", None).err().unwrap_or_default();
+    assert!(err.contains("ZPRIM"), "an unknown module is an error until registered: {err}");
+    helion_sv::v2::mem::register_prim("ZPRIM", &[("ACLK".into(), true, 1), ("TIE".into(), true, 2), ("FCLK".into(), false, 4), ("Q".into(), false, 2)]);
+    let (d, _) = synth(src);
+    assert_eq!(boxes(&d), vec![("u_z".to_string(), "ZPRIM".to_string())]);
+    assert_eq!(net(&d, "u_z", "FCLK0"), net(&d, "u_z", "ACLK"));
+    assert_eq!(net(&d, "u_z", "Q1").as_deref(), Some("q_1"));
+    assert!(net(&d, "u_z", "TIE0").is_none(), "an unconnected input gets no pin");
+    let bad = helion_sv::synth_sv_v2("module y; ZPRIM u (.NOPE(1'b0)); endmodule", "t.sv", None).err().unwrap_or_default();
+    assert!(bad.contains("has no port 'NOPE'"), "{bad}");
+}

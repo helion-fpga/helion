@@ -836,6 +836,20 @@ impl Elab {
 }
 
 /// Ports of the device primitives that pass through: (name, input, width).
+/// Primitives the back end describes at run time (the Zynq `PS7`, whose
+/// ports come from the device database): `(port, is_input, width)`.
+static REGISTERED: std::sync::Mutex<Vec<(&'static str, &'static [(&'static str, bool, u32)])>> = std::sync::Mutex::new(Vec::new());
+
+/// Make `module` an instantiable primitive with `ports`, for this process.
+/// Registering a module again replaces its ports.
+pub fn register_prim(module: &str, ports: &[(String, bool, u32)]) {
+    let ports: Vec<(&'static str, bool, u32)> = ports.iter().map(|(n, i, w)| (&*Box::leak(n.clone().into_boxed_str()), *i, *w)).collect();
+    let entry = (&*Box::leak(module.to_string().into_boxed_str()), &*Box::leak(ports.into_boxed_slice()));
+    let mut r = REGISTERED.lock().unwrap_or_else(|e| e.into_inner());
+    r.retain(|(m, _)| *m != module);
+    r.push(entry);
+}
+
 pub fn prim_ports(module: &str) -> Option<&'static [(&'static str, bool, u32)]> {
     const RAMB18: &[(&str, bool, u32)] = &[
         ("ADDRARDADDR", true, 14), ("ADDRBWRADDR", true, 14), ("CLKARDCLK", true, 1), ("CLKBWRCLK", true, 1), ("DIADI", true, 16), ("DIBDI", true, 16),
@@ -922,7 +936,7 @@ pub fn prim_ports(module: &str) -> Option<&'static [(&'static str, bool, u32)]> 
             ("SPO", false, 1), ("DPO", false, 1),
         ],
         "RAM128X1D" => &[("A", true, 7), ("DPRA", true, 7), ("D", true, 1), ("WCLK", true, 1), ("WE", true, 1), ("SPO", false, 1), ("DPO", false, 1)],
-        _ => return None,
+        _ => return REGISTERED.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(m, _)| *m == module).map(|(_, p)| *p),
     })
 }
 
