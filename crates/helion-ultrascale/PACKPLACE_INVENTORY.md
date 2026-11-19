@@ -46,6 +46,11 @@ starting point; the defects below are staging defects carried over.
 
 ## 3. Defects found by reading (each gets a fix + regression test)
 
+Status after session 18 pack/place work (branch fm/ultra-bitgen-packplace):
+D1 FIXED (d47de949), D2-D6 FIXED (595329a0), D7 FIXED as a comment
+(50ff650b). Renderer and DeviceFileGrid added (e31ee0fd, 77e538a6).
+Final verification below in section 5.
+
 - D1 (place.rs, chain phase): chain column search groups sites into a
   `HashMap<i32, ...>` (`by_x`) and iterates it directly, so which column
   a CARRY8 chain lands on depends on HashMap iteration order. Same seed
@@ -131,11 +136,15 @@ starting point; the defects below are staging defects carried over.
 
 ## 5. Verification plan for this session
 
-- Baseline: `cargo test -j1 -p helion-ultrascale` on the untouched base
-  (record exact output before any fix).
-- One fix per commit, full crate test re-run after each fix, revert on
-  any regression.
-- New tests: D1 determinism, D2/D3/D4/D5 fail-loud legality,
+- Baseline: `cargo test -j1 -p helion-ultrascale --lib --offline` on the
+  untouched base (log /tmp/pp-baseline-lib.log, a predecessor's run
+  that finished after this worker started): 82 passed, 0 failed.
+- One fix per commit, full crate lib test re-run after each fix, no
+  regressions. Results: D1 run 83 passed; renderer run 84 passed;
+  legality run 89 passed (all five new fail-loud tests green);
+  DeviceFileGrid run 92 passed (all three new grid tests green);
+  integration run (`--test packplace_xcku3p`) 4 passed, 0 failed.
+- New tests: D1 determinism, D2/D3/D4/D5/D6 fail-loud legality,
   `DeviceFileGrid` counts (27,120 slice sites, 452 CLB columns, 208
   CLEM columns, 40 BRAM columns, 76 DSP columns, all from the vendored
   `xcku3p.json`), blinky + counter pack/place/legality on the
