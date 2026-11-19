@@ -286,7 +286,9 @@ pub fn pack_ultra(
     }
 
     // Pack FFs, respecting control sets.
-    // For now, place FFs in the same slice as their driving LUT if possible.
+    // Place each FF in the first slice with a compatible control set.
+    // No LUT-driver affinity is attempted; that is a QoR item, not a
+    // correctness requirement (D7: the old comment overclaimed this).
     for (ff_name, clk, ce, sr) in ffs {
         let mut placed = false;
         for slice in &mut packed.slices {
