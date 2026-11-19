@@ -64,6 +64,47 @@ tried.
 * `X7V_RTL_SIM=verilator`: simulate SystemVerilog RTL with Verilator instead of
   Icarus, for sources Icarus cannot read (macros in `X7V_DEFINES`). Verilator is
   two-state, so a register the RTL never initialises reads 0, not X.
+* `--axi-rw ADDR[=MASK],...` (Zynq PS7 designs): registers the AXI masters
+  must read back as written, MASK being the bits they hold (default all 32).
+
+## Zynq PS7 (`ps7.py`)
+
+The PS7 has no PL configuration bits (its tiles' pips into the interconnect
+are bitless always-on pseudo-pips), so x7v cuts the design at its pins.
+Extraction makes each normal-class PS7 output (`ps7_ports.json`: FCLK,
+FCLKRESETN, the AXI masters, EMIO, ...) a netlist input `PS7_<pin>` and each
+input a netlist output; an input with no driver at all (an unused port's
+clock, left unrouted) floats (`z`). Cosim gives the RTL a stub `PS7` with the
+same ports (outputs set by the testbench, inputs sampled), so both sides get
+one stimulus and every PS7 input (1,774 bits) and every pad output is compared
+twice per cycle. An input the RTL leaves unconnected must read 0 or float,
+never 1 (an unused interrupt on its interconnect default would be asserted).
+
+The clock is the `create_clock ... [get_pins ps7/FCLKCLK[n]]` pin (else
+FCLKCLK[0]). FCLKRESETN is one active-low reset, pulsed like any reset
+input (`--no-reset` holds it high). Each M_AXI_GP port the RTL connects gets
+an AXI3 master that first runs against the RTL: up to 4 reads and 4 writes
+outstanding, VALID raised the cycle after the last handshake (back to back),
+random AW/W/AR delays (W often before AW), random BREADY/RREADY, partial
+strobes, 2-4 beat bursts, the first eight words of the window, the `--axi-rw`
+registers and random words in it. Half the OKAY writes to an `--axi-rw`
+register are read back next, and a read with no write in flight from its
+address to its last beat must return what was written (under MASK). BID/RID
+must match an outstanding ID and RLAST the last beat. What the masters drove
+becomes the stimulus that both simulations replay. The `axi` check fails if
+no write or no read completes, on any readback mismatch or protocol error,
+and if an `--axi-rw` register is never read back. PS7 cosim runs on Icarus
+only (it tells an unconnected input by `z`); the S_AXI ports, interrupts
+and EMIO get the random walk.
+
+`tests/ps7.py` builds examples/zedboard_ps7_axi.sv with zedbit (or takes
+`--bit`) and checks: no bit in a PS tile, none unexplained; extraction gives
+the BUFG FCLKCLK0, all 1,774 PS7 inputs as ports, 67 driven by the slave
+and the rest 0 or floating; verify PASS with random resets and with
+`--no-reset`. Negative controls, each FAIL: RDATA0 and RDATA1 swapped in the
+bitstream (their interconnect muxes exchange sources; cosim only, on those
+two bits), the IRQF2P0 tie pip removed (reads 1), and an RTL whose SCRATCH
+ignores WSTRB[1] (the readback check).
 
 ## What `verify` checks
 
@@ -75,6 +116,7 @@ tried.
 | clocks | clock spine and leaf enables present for every used clock path (`clockcheck.py`) | clock never reaches flops |
 | extract | no undriven, multiply driven, or unmodelled logic | floating or shorted logic |
 | cosim | extracted netlist equals the RTL, cycle by cycle, random stimulus | wrong behaviour |
+| axi | (PS7 designs) the AXI masters' traffic completed, read back what it wrote, with no protocol error | none: proves the stimulus exercised the slave |
 | io | I/O configuration equals the golden (Vivado) build, tile by tile | wrong standard, drive, pull, or a dead pin |
 
 ## Electrical model
