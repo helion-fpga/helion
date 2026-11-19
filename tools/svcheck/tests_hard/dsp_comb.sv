@@ -15,7 +15,7 @@ module dsp_comb (
     output logic        [15:0] p_trunc,  // 16 x 16 truncated to 16 bits
     output logic signed [63:0] p_wide,   // result wider than the product and than P
     output logic signed [42:0] p_swap,   // 18 x 25: the wide operand goes on A
-    output logic        [35:0] p_u18,    // unsigned 18 x 18 needs 19 x 19 signed: fabric
+    output logic        [35:0] p_u18,    // unsigned 18 x 18 needs 19 x 19 signed: split
     output logic        [31:0] p_k100,   // constant with three set bits: DSP
     output logic        [31:0] p_k3,     // constant 3 is one adder: fabric
     output logic signed [31:0] p_kneg,   // negative constant

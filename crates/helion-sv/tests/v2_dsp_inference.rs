@@ -9,10 +9,10 @@
 //! Behaviour is checked against the RTL by `tools/svcheck`
 //! (`tools/svcheck/tests_hard/dsp_*.sv`); these tests pin the netlist shape.
 //!
-//! What v2 does not do yet (G3a stage 2): products wider than one
-//! multiplier, such as the unsigned 18x18 below (19x19 signed), stay in
-//! LUTs. The legacy front end puts that one in a single DSP; whether its
-//! mapping keeps `b[17]` unsigned is not checked here.
+//! A product wider than one multiplier, such as the unsigned 18x18 below
+//! (19x19 signed), is split into partial products that fit, added in the
+//! fabric (G3a stage 2). The legacy front end puts that one in a single
+//! DSP; whether its mapping keeps `b[17]` unsigned is not checked here.
 
 use helion_ir::{resolve, CellKind, Design};
 use std::collections::HashMap;
@@ -107,21 +107,77 @@ fn v2_multiply_lands_in_a_dsp() {
     assert_eq!(flops(&d), 0, "p is the slice's P register");
 }
 
-/// Unsigned 18x18 needs a 19x19 signed multiplier: one DSP48E1 cannot hold
-/// it exactly, so v2 keeps it in LUTs (stage 2 of G3a splits it). Pinned so
-/// the day it changes, this file says so.
+/// Unsigned 18x18 needs a 19x19 signed multiplier: one DSP48E1 takes
+/// a x b[16:0] and b[17] is one row of AND gates added in the fabric.
 #[test]
-fn v2_keeps_an_unsigned_18x18_in_luts() {
+fn an_unsigned_18x18_is_one_dsp_and_one_fabric_row() {
     let d = v2(MUL);
-    assert_eq!(count(&d, true), 0);
-    assert!(count(&d, false) > 500, "expected the Wallace-tree LUT multiplier");
+    assert_eq!(count(&d, true), 1);
+    let luts = count(&d, false);
+    assert!(luts < 60, "expected one 19-bit row and its add, got {luts} Lut6 (2012 as a LUT multiplier)");
+    assert_eq!(flops(&d), 36, "a partial product keeps p in flops");
 }
 
 #[test]
-fn the_front_ends_agree_on_a_product_that_fits_and_differ_on_one_that_does_not() {
+fn the_front_ends_agree_on_products_up_to_18x18() {
     let legacy = |s: &str| count(&helion_sv::synth_sv(s, "m.sv").unwrap(), true);
     assert_eq!((legacy(MUL_SIGNED), count(&v2(MUL_SIGNED), true)), (1, 1));
-    assert_eq!((legacy(MUL), count(&v2(MUL), true)), (1, 0));
+    assert_eq!((legacy(MUL), count(&v2(MUL), true)), (1, 1));
+}
+
+// ---- products wider than one multiplier ----------------------------------
+
+/// The DSPs of `src` with their registers; every one combinational P = M.
+fn split(src: &str) -> (Design, usize) {
+    let d = v2(src);
+    let ds = dsps(&d);
+    for (name, a) in &ds {
+        let regs: Vec<&str> = ["AREG", "BREG", "MREG", "PREG"].iter().map(|k| a[*k].as_str()).collect();
+        assert_eq!(regs, ["0", "0", "0", "0"], "{name}: a partial product is combinational");
+        assert_eq!(opmode(&d, name), 0b0000101, "{name}: P = M");
+    }
+    let n = ds.len();
+    (d, n)
+}
+
+/// 32 x 32 to 64 bits (RISC-V MULH, MULHU): each operand is a 24- or
+/// 17-bit unsigned chunk under a signed top chunk, so four partial products.
+#[test]
+fn a_32x32_product_is_four_partial_products() {
+    for (sign, what) in [("signed", "signed"), ("", "unsigned")] {
+        let (d, n) = split(&format!("module t(input logic {sign} [31:0] a, b, output logic {sign} [63:0] p); assign p = a * b; endmodule"));
+        assert_eq!(n, 4, "{what}");
+        let luts = count(&d, false);
+        assert!(luts < 200, "{what}: three adds in the fabric, got {luts} Lut6");
+    }
+}
+
+/// RISC-V MUL keeps the low 32 bits: the partial product of the two top
+/// chunks starts at bit 41 and is dropped.
+#[test]
+fn a_truncated_32x32_drops_the_partial_product_above_it() {
+    let (_, n) = split("module t(input logic [31:0] a, b, output logic [31:0] p); assign p = a * b; endmodule");
+    assert_eq!(n, 3);
+}
+
+/// Signed 26 x 19 splits either operand: 26 bits over B's 17 takes two
+/// partial products, over A's 24 and 19 over B's 17 would take four.
+#[test]
+fn the_split_takes_the_way_with_fewer_partial_products() {
+    let (_, n) = split("module t(input logic signed [25:0] a, input logic signed [18:0] b, output logic signed [44:0] p); assign p = a * b; endmodule");
+    assert_eq!(n, 2);
+}
+
+/// The slice registers would delay one partial product against the sum
+/// that reads it, so a registered wide product keeps its flops.
+#[test]
+fn a_registered_wide_product_keeps_its_registers_in_the_fabric() {
+    let (d, n) = split(
+        "module t(input logic clk, input logic signed [31:0] a, b, output logic signed [63:0] p);
+         logic signed [31:0] ra, rb; always_ff @(posedge clk) begin ra <= a; rb <= b; p <= ra * rb; end endmodule",
+    );
+    assert_eq!(n, 4);
+    assert_eq!(flops(&d), 128, "ra, rb and p stay flops");
 }
 
 // ---- operand shapes ----------------------------------------------------
@@ -145,8 +201,9 @@ fn unsigned_operands_zero_extend_up_to_24x17() {
     assert_eq!(net(&d, &c, "A24").as_deref(), Some("const0"));
     assert_eq!(net(&d, &c, "B16").as_deref(), Some("b_16"));
     assert_eq!(net(&d, &c, "B17").as_deref(), Some("const0"));
-    // 25 x 17 unsigned is 26 x 18 signed: no port takes 26 bits.
-    assert!(dsps(&v2("module t(input logic [24:0] a, input logic [16:0] b, output logic [41:0] p); assign p = a * b; endmodule")).is_empty());
+    // 25 x 17 unsigned is 26 x 18 signed, more than A takes: split, b on A
+    // times a[16:0] and a[24:17].
+    assert_eq!(dsps(&v2("module t(input logic [24:0] a, input logic [16:0] b, output logic [41:0] p); assign p = a * b; endmodule")).len(), 2);
 }
 
 #[test]
@@ -155,8 +212,8 @@ fn a_signed_times_unsigned_product_is_unsigned() {
     let (d, c, _) = one("module t(input logic signed [19:0] s, input logic [16:0] u, output logic [47:0] p); assign p = s * u; endmodule");
     assert_eq!(net(&d, &c, "A19").as_deref(), Some("s_19"));
     assert_eq!(net(&d, &c, "A20").as_deref(), Some("const0"));
-    // A 25-bit signed operand becomes 25 bits unsigned: 26 signed bits, too many.
-    assert!(dsps(&v2("module t(input logic signed [24:0] s, input logic [16:0] u, output logic [47:0] p); assign p = s * u; endmodule")).is_empty());
+    // A 25-bit signed operand becomes 25 bits unsigned: 26 signed bits, split.
+    assert_eq!(dsps(&v2("module t(input logic signed [24:0] s, input logic [16:0] u, output logic [47:0] p); assign p = s * u; endmodule")).len(), 2);
 }
 
 #[test]
