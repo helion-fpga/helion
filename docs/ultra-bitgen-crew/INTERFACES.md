@@ -189,9 +189,26 @@ records the seed and the placement hash with every run.
 
 ## Block registry (diff-harness owns, all workers use these names)
 
-LUT_INIT, FF_INIT, BRAM_CONTENT, BRAM_PARITY, INT_PIP, IO_CONFIG, CLK,
+LUT_INIT, FF_INIT, CARRY8, BRAM_CONTENT, BRAM_PARITY, INT_PIP, IO_CONFIG, CLK,
 DSP48E2, URAM288, FRAMING. A fix commit names its block. A block goes
 green only on zero diff plus a critic re-run.
+
+CARRY8 is its own block (CTO ruling 2026-11-08, US-05): one CARRY8 per
+CLB slice (UG574), tile types CLEL_L, CLEL_R, CLEM, CLEM_R, FASM
+features `SLICE_XxYy.CARRY8.<attr>` where `<attr>` is one of the 24
+prjuray segbits features per tile type: CARRY_TYPE.DUAL_CY4,
+CARRY_TYPE.SINGLE_CY8, CI.AX, CI.V0, CI.V1, CI_TOP.EX, CI_TOP.V0,
+CI_TOP.V1, DI0.AX, DI0.DI0, DI1.BX, DI1.DI1, DI2.CX, DI2.DI2, DI3.DX,
+DI3.DI3, DI4.EX, DI4.DI4, DI5.FX, DI5.DI5, DI6.GX, DI6.DI6, DI7.HX,
+DI7.DI7. CARRY8 bits are never folded into LUT_INIT or any other block.
+Resolution is absolute (prjuray frame minors plus the tile column
+major, same construction as INT PIP). A feature absent from the DB for
+its tile type fails loud, never emits a guessed bit. No BitFiltrator
+CARRY8 table exists, so there is no second-source cross-check, and
+Y-independence within a column is the DB's own structure, not
+independently verified. A design with no CARRY8 features reports a
+zero-bit green CARRY8 line when an emitter ran and set no CARRY8 bits;
+with no emitter it reports blocked, like every other block.
 
 LUTRAM is a separate block, BLOCKED: LUTRAM emission fails loud
 (LutramBlocked) until a LUTRAM table or Vivado logic-location data
