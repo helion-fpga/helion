@@ -176,6 +176,15 @@ fn trim_iobs_to_budget(packed: &mut Packed, dev: &Device) {
     }
 }
 
+/// Shared PathFinder iteration budget: designs over 2000 LUTFFs get 24
+/// iters, smaller ones 8. One helper so compile_design_xdc and the
+/// multiseed per-seed run can never drift apart on it.
+fn route_opts_for(n_lutffs: usize) -> RouteOpts {
+    RouteOpts {
+        max_iters: if n_lutffs > 2000 { 24 } else { 8 },
+        extra_hops: 0,
+    }
+}
 
 fn compile_design_xdc(
     mut design: Design,
@@ -218,10 +227,7 @@ fn compile_design_xdc(
         t1.elapsed().as_millis()
     );
     let t2 = std::time::Instant::now();
-    let route_opts = RouteOpts {
-        max_iters: if packed.lutffs.len() > 2000 { 24 } else { 8 },
-        extra_hops: 0,
-    };
+    let route_opts = route_opts_for(packed.lutffs.len());
     let routed = route_with_guide(&placed, &dev, route_opts, &guide)?;
     eprintln!(
         "hang_diag route imux={} imux_skip={} pathfinder_iters={} overused={} ms={}",
@@ -404,7 +410,7 @@ fn usage() {
   helion synth <file.sv> [--part P] [--verify]
   helion equiv <golden.sv> <revised.sv> [--part P]
   helion impl <file.sv> [--part P]
-  helion multiseed <file.sv> [--part P] [--seeds N] [--seed-start S] [--jobs J] [--out FILE] [--threshold T] [--log-dir DIR] [--best-out FILE] [--emit-best FILE.hbits]
+  helion multiseed <file.sv> [--part P] [--seeds N] [--seed-start S] [--jobs J] [--out FILE] [--threshold T] [--log-dir DIR] [--best-out FILE] [--emit-best FILE.hbits] [--retry-failed]
   helion run <file.sv> [--cycles N] [--part P]
   helion report_timing <file.sv|.vhd> [--sdc f.sdc]
   helion report_utilization <file.sv|.vhd>
@@ -667,29 +673,18 @@ impl SeedResult {
     }
 
     /// Parse the seed field back from a JSONL line we wrote. Returns None if
-    /// the line is not one of ours.
+    /// the line is not one of ours. Anchored to the line start: our lines
+    /// always begin `{"seed": N, ...}`. An unanchored search could match
+    /// a `"seed": N` inside a fail reason and invent a phantom record.
     fn parse_seed(line: &str) -> Option<u64> {
-        let key = "\"seed\":";
-        let i = line.find(key)?;
-        let rest = line[i + key.len()..].trim_start();
+        let rest = line.trim_start().strip_prefix("{\"seed\":")?;
+        let rest = rest.trim_start();
         let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        if end == 0 {
+            return None;
+        }
         rest[..end].parse().ok()
     }
-}
-
-/// Read an existing JSONL results file and return the set of seeds already
-/// recorded (ok or failed). Missing file = empty set.
-fn read_completed_seeds(path: &str) -> std::collections::HashSet<u64> {
-    let mut set = std::collections::HashSet::new();
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return set;
-    };
-    for line in text.lines() {
-        if let Some(seed) = SeedResult::parse_seed(line) {
-            set.insert(seed);
-        }
-    }
-    set
 }
 
 /// Seed-independent front end of the multiseed sweep, built once and
@@ -749,10 +744,7 @@ fn run_one_seed(front: &MultiseedFront, seed: u64) -> Result<SeedRun, String> {
         },
         &guide,
     )?;
-    let route_opts = RouteOpts {
-        max_iters: if front.packed.lutffs.len() > 2000 { 24 } else { 8 },
-        extra_hops: 0,
-    };
+    let route_opts = route_opts_for(front.packed.lutffs.len());
     let routed = route_with_guide(&placed, &front.dev, route_opts, &guide)?;
     let drc = check_routed(&front.design, &routed, &front.dev);
     if !drc.ok() {
@@ -788,18 +780,23 @@ fn seed_range(seed_start: u64, n_seeds: u64) -> Result<(u64, u64), String> {
 fn parse_results_text(text: &str) -> Vec<SeedResult> {
     let mut results: Vec<SeedResult> = Vec::new();
     for line in text.lines() {
-        // Re-parse our own lines. Keep it simple: seed + status + numbers.
-        let seed = SeedResult::parse_seed(line);
-        let status = if line.contains("\"status\": \"ok\"") {
+        let Some(seed) = SeedResult::parse_seed(line) else {
+            continue;
+        };
+        // Only the head of the line (before "reason") is structured:
+        // the reason is free text and must never be able to fake a
+        // status or a slack number.
+        let head = line.split("\"reason\":").next().unwrap_or(line);
+        let status = if head.contains("\"status\": \"ok\"") {
             "ok"
         } else {
             "fail"
         };
         let num = |key: &str| -> i64 {
             let k = format!("\"{key}\":");
-            line.find(&k)
+            head.find(&k)
                 .and_then(|i| {
-                    let rest = line[i + k.len()..].trim_start();
+                    let rest = head[i + k.len()..].trim_start();
                     let end = rest
                         .find(|c: char| !c.is_ascii_digit() && c != '-')
                         .unwrap_or(rest.len());
@@ -807,16 +804,14 @@ fn parse_results_text(text: &str) -> Vec<SeedResult> {
                 })
                 .unwrap_or(0)
         };
-        if let Some(seed) = seed {
-            results.push(SeedResult {
-                seed,
-                wns_ps: num("wns_ps"),
-                tns_ps: num("tns_ps"),
-                runtime_s: 0.0,
-                status: status.to_string(),
-                reason: String::new(),
-            });
-        }
+        results.push(SeedResult {
+            seed,
+            wns_ps: num("wns_ps"),
+            tns_ps: num("tns_ps"),
+            runtime_s: 0.0,
+            status: status.to_string(),
+            reason: String::new(),
+        });
     }
     results
 }
@@ -916,6 +911,82 @@ fn select_best_seed<'a>(results: &'a [SeedResult], threshold: i64) -> Option<&'a
         })
 }
 
+/// Parsed `helion multiseed` flags.
+struct MultiseedArgs {
+    path: String,
+    part: String,
+    n_seeds: u64,
+    seed_start: u64,
+    jobs: usize,
+    out_path: String,
+    threshold: i64,
+    log_dir: Option<String>,
+    best_out: Option<String>,
+    emit_best: Option<String>,
+    retry_failed: bool,
+}
+
+fn parse_u64_flag(args: &[String], name: &str, default: u64) -> Result<u64, String> {
+    match take_flag(args, name) {
+        None => Ok(default),
+        Some(s) => s
+            .parse()
+            .map_err(|_| format!("multiseed: {name} must be a whole number, got {s:?}")),
+    }
+}
+
+fn parse_i64_flag(args: &[String], name: &str, default: i64) -> Result<i64, String> {
+    match take_flag(args, name) {
+        None => Ok(default),
+        Some(s) => s
+            .parse()
+            .map_err(|_| format!("multiseed: {name} must be a whole number, got {s:?}")),
+    }
+}
+
+fn parse_usize_flag(args: &[String], name: &str, default: usize) -> Result<usize, String> {
+    match take_flag(args, name) {
+        None => Ok(default),
+        Some(s) => s
+            .parse()
+            .map_err(|_| format!("multiseed: {name} must be a whole number, got {s:?}")),
+    }
+}
+
+/// Parse the multiseed flags. A numeric flag that is present but
+/// unparseable fails loud instead of silently falling back to its
+/// default: `--seeds abc` must never quietly become a 100-seed sweep.
+fn parse_multiseed_args(args: &[String]) -> Result<MultiseedArgs, String> {
+    Ok(MultiseedArgs {
+        path: positional(args).unwrap_or("examples/blinky.sv").to_string(),
+        part: take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into()),
+        n_seeds: parse_u64_flag(args, "--seeds", 100)?,
+        seed_start: parse_u64_flag(args, "--seed-start", 1)?,
+        jobs: parse_usize_flag(args, "--jobs", 2)?.max(1),
+        out_path: take_flag(args, "--out").unwrap_or_else(|| "multiseed_results.jsonl".into()),
+        threshold: parse_i64_flag(args, "--threshold", 0)?,
+        log_dir: take_flag(args, "--log-dir"),
+        best_out: take_flag(args, "--best-out"),
+        emit_best: take_flag(args, "--emit-best"),
+        // Bare flag; the design path comes first on the command line,
+        // matching every other multiseed invocation.
+        retry_failed: args.iter().any(|a| a == "--retry-failed"),
+    })
+}
+
+/// Seeds still to run: every seed in [first, end) except those with a
+/// recorded "ok". Failed seeds are skipped too, unless retry_failed:
+/// a recorded failure is usually deterministic (DRC/place), but a
+/// transient failure (OOM, killed run) should be retryable on resume.
+fn seeds_to_run(first: u64, end: u64, results: &[SeedResult], retry_failed: bool) -> Vec<u64> {
+    let done: std::collections::HashSet<u64> = results
+        .iter()
+        .filter(|r| r.status == "ok" || !retry_failed)
+        .map(|r| r.seed)
+        .collect();
+    (first..end).filter(|s| !done.contains(s)).collect()
+}
+
 /// Overnight multi-seed timing-closure flow.
 ///
 /// Synths and packs once, then runs place+route+STA for each seed in
@@ -931,27 +1002,27 @@ fn select_best_seed<'a>(results: &'a [SeedResult], threshold: i64) -> Option<&'a
 /// writes the best-seed decision plus the exact `helion impl` command
 /// that reproduces it. --emit-best FILE re-runs the full compile for
 /// the best seed only and writes its bitstream; per-seed runs skip
-/// bitgen because it is seed-independent.
+/// bitgen because it is seed-independent. --retry-failed re-runs seeds
+/// whose checkpoint record is a failure instead of skipping them
+/// (transient failures); ok seeds are never re-run.
 fn cmd_multiseed(args: &[String]) {
-    let path = positional(args).unwrap_or("examples/blinky.sv").to_string();
-    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
-    let n_seeds: u64 = take_flag(args, "--seeds")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
-    let seed_start: u64 = take_flag(args, "--seed-start")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-    let jobs: usize = take_flag(args, "--jobs")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2)
-        .max(1);
-    let out_path = take_flag(args, "--out").unwrap_or_else(|| "multiseed_results.jsonl".into());
-    let threshold: i64 = take_flag(args, "--threshold")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let log_dir = take_flag(args, "--log-dir");
-    let best_out = take_flag(args, "--best-out");
-    let emit_best = take_flag(args, "--emit-best");
+    let parsed = parse_multiseed_args(args).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let MultiseedArgs {
+        path,
+        part,
+        n_seeds,
+        seed_start,
+        jobs,
+        out_path,
+        threshold,
+        log_dir,
+        best_out,
+        emit_best,
+        retry_failed,
+    } = parsed;
 
     let (seed_first, seed_end) = seed_range(seed_start, n_seeds).unwrap_or_else(|e| {
         eprintln!("{e}");
@@ -978,10 +1049,15 @@ fn cmd_multiseed(args: &[String]) {
         }
     }
 
-    let completed = read_completed_seeds(&out_path);
-    let seeds: Vec<u64> = (seed_first..seed_end)
-        .filter(|s| !completed.contains(s))
-        .collect();
+    // Resume from the checkpoint file, parsed the same way the final
+    // report parses it (last record per seed wins). A torn line from a
+    // killed run parses to no seed and reruns, never to a wrong result.
+    // The "already done" count covers only seeds in this sweep's range.
+    let prior: Vec<SeedResult> = std::fs::read_to_string(&out_path)
+        .map(|t| dedup_results(parse_results_text(&t)))
+        .unwrap_or_default();
+    let seeds = seeds_to_run(seed_first, seed_end, &prior, retry_failed);
+    let n_already_done = (seed_end - seed_first) as usize - seeds.len();
     println!(
         "multiseed: design={} part={} seeds={}..{} jobs={} threshold_wns_ps={} ({} already done, {} to run) out={}",
         path,
@@ -990,7 +1066,7 @@ fn cmd_multiseed(args: &[String]) {
         seed_end - 1,
         jobs,
         threshold,
-        completed.len(),
+        n_already_done,
         seeds.len(),
         out_path
     );
@@ -1114,7 +1190,7 @@ fn cmd_multiseed(args: &[String]) {
         });
         if c.bits.frames.is_empty() {
             eprintln!(
-                "multiseed emit-best: empty/fake bitstream refused (no configured frames) — check design routed"
+                "multiseed emit-best: empty/fake bitstream refused (no configured frames), check design routed"
             );
             std::process::exit(1);
         }
@@ -2342,23 +2418,83 @@ mod multiseed_tests {
     }
 
     #[test]
-    fn checkpoint_reads_completed_seeds() {
-        let dir = std::env::temp_dir().join("helion_multiseed_test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("ckpt.jsonl");
-        let p = path.to_str().unwrap().to_string();
-        std::fs::write(
-            &path,
-            "{\"seed\": 1, \"wns_ps\": 100, \"tns_ps\": 0, \"runtime_s\": 1.0, \"status\": \"ok\", \"reason\": \"\"}\n\
-             not-json garbage\n\
-             {\"seed\": 3, \"wns_ps\": 0, \"tns_ps\": 0, \"runtime_s\": 0.5, \"status\": \"fail\", \"reason\": \"boom\"}\n",
-        )
+    fn resume_skips_ok_and_failed_unless_retry_flag() {
+        let text = "{\"seed\": 1, \"wns_ps\": 100, \"tns_ps\": 0, \"runtime_s\": 1.0, \"status\": \"ok\", \"reason\": \"\"}\n\
+                    not-json garbage\n\
+                    {\"seed\": 3, \"wns_ps\": 0, \"tns_ps\": 0, \"runtime_s\": 0.5, \"status\": \"fail\", \"reason\": \"boom\"}\n";
+        let prior = dedup_results(parse_results_text(text));
+        assert_eq!(prior.len(), 2);
+        // No retry: ok seed 1 and failed seed 3 both skipped; only 2 and 4 run.
+        assert_eq!(seeds_to_run(1, 5, &prior, false), vec![2, 4]);
+        // Retry: failed seed 3 runs again; ok seed 1 still never reruns.
+        assert_eq!(seeds_to_run(1, 5, &prior, true), vec![2, 3, 4]);
+        // No prior results: the whole range runs.
+        assert_eq!(seeds_to_run(1, 3, &[], false), vec![1, 2]);
+    }
+
+    #[test]
+    fn jsonl_reason_cannot_fake_status_or_numbers() {
+        // A fail reason carrying a fake ok status, fake WNS, and a fake
+        // seed must not change the parsed record or invent a record.
+        let text = "{\"seed\": 1, \"wns_ps\": 0, \"tns_ps\": 0, \"runtime_s\": 1.0, \"status\": \"fail\", \"reason\": \"boom \\\"status\\\": \\\"ok\\\" \\\"wns_ps\\\": 99999 {\\\"seed\\\": 99}\"}\n";
+        let results = parse_results_text(text);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].seed, 1);
+        assert_eq!(results[0].status, "fail");
+        assert_eq!(results[0].wns_ps, 0);
+        // parse_seed is anchored: a line that does not start with our
+        // record shape yields no seed even if it mentions one later.
+        assert_eq!(SeedResult::parse_seed("garbage {\"seed\": 99}"), None);
+        assert_eq!(
+            SeedResult::parse_seed("{\"seed\": 7, \"wns_ps\": 1}"),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn multiseed_args_reject_garbage_numbers() {
+        let base = |extra: &[&str]| -> Vec<String> {
+            let mut v = vec!["examples/blinky.sv".to_string()];
+            v.extend(extra.iter().map(|s| s.to_string()));
+            v
+        };
+        assert!(parse_multiseed_args(&base(&["--seeds", "abc"])).is_err());
+        assert!(parse_multiseed_args(&base(&["--threshold", "1.5"])).is_err());
+        assert!(parse_multiseed_args(&base(&["--jobs", "-1"])).is_err());
+        let ok = parse_multiseed_args(&base(&[
+            "--seeds",
+            "10",
+            "--seed-start",
+            "5",
+            "--jobs",
+            "3",
+            "--threshold",
+            "-100",
+            "--retry-failed",
+        ]))
         .unwrap();
-        let done = read_completed_seeds(&p);
-        assert!(done.contains(&1));
-        assert!(done.contains(&3));
-        assert!(!done.contains(&2));
-        assert!(read_completed_seeds("/nonexistent/path.jsonl").is_empty());
-        let _ = std::fs::remove_file(&path);
+        assert_eq!(ok.n_seeds, 10);
+        assert_eq!(ok.seed_start, 5);
+        assert_eq!(ok.jobs, 3);
+        assert_eq!(ok.threshold, -100);
+        assert!(ok.retry_failed);
+        // Absent flags keep their defaults; jobs 0 clamps to 1.
+        let def = parse_multiseed_args(&base(&[])).unwrap();
+        assert_eq!(def.n_seeds, 100);
+        assert_eq!(def.seed_start, 1);
+        assert_eq!(def.jobs, 2);
+        assert!(!def.retry_failed);
+        assert_eq!(
+            parse_multiseed_args(&base(&["--jobs", "0"])).unwrap().jobs,
+            1
+        );
+    }
+
+    #[test]
+    fn route_opts_budget_boundary() {
+        assert_eq!(route_opts_for(0).max_iters, 8);
+        assert_eq!(route_opts_for(2000).max_iters, 8);
+        assert_eq!(route_opts_for(2001).max_iters, 24);
+        assert_eq!(route_opts_for(2001).extra_hops, 0);
     }
 }
