@@ -17,7 +17,6 @@ members = [
     "crates/helion-ipxact",
     "crates/helion-bd",
     "crates/helion-proj",
-    "crates/helion-gui",
     "crates/helion-lab",
     "crates/helion-lib",
     "crates/helion-drc",
