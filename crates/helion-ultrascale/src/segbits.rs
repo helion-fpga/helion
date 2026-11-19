@@ -625,13 +625,35 @@ mod tests {
             ("segbits_hdio_top_right.db", 812),
             ("segbits_hdio_bot_right.db", 828),
             ("segbits_cmt_right.db", 104),
+            ("segbits_clel_l.db", 768),
+            ("segbits_clel_r.db", 768),
+            ("segbits_clem.db", 829),
+            ("segbits_clem_r.db", 829),
+            // RCLK row-clock files, vendored 2026-11-19 by the clocking
+            // worker (branch fm/ultra-bitgen-clk); counts from
+            // data/PROVENANCE.md.
+            ("segbits_rclk_ams_cfgio.db", 144),
+            ("segbits_rclk_bram_intf_l.db", 160),
+            ("segbits_rclk_bram_intf_td_l.db", 160),
+            ("segbits_rclk_bram_intf_td_r.db", 160),
+            ("segbits_rclk_clel_l_l.db", 40),
+            ("segbits_rclk_clem_l.db", 40),
+            ("segbits_rclk_clem_r.db", 40),
+            ("segbits_rclk_dsp_intf_clkbuf_l.db", 288),
+            ("segbits_rclk_dsp_intf_l.db", 80),
+            ("segbits_rclk_dsp_intf_r.db", 80),
+            ("segbits_rclk_hdio.db", 512),
+            ("segbits_rclk_int_l.db", 1576),
+            ("segbits_rclk_int_r.db", 1576),
+            ("segbits_rclk_intf_left_term_alto.db", 456),
+            ("segbits_rclk_xiphy_outer_right.db", 48),
         ] {
             let db = FileSegbitsDb::from_file(&data.join(name))
                 .unwrap_or_else(|e| panic!("vendored {name} must load: {e}"));
             assert_eq!(db.feature_count(), count, "feature count for {name}");
             total += count;
         }
-        assert_eq!(total, 7082, "total vendored features");
+        assert_eq!(total, 15636, "total vendored features");
         let db = FileSegbitsDb::from_file(&data.join("segbits_int.db")).unwrap();
         assert_eq!(db.tile_types(), &["INT".to_string()]);
         let db = FileSegbitsDb::from_file(&data.join("segbits_hpio_right.db")).unwrap();
