@@ -5,6 +5,11 @@
   ~/workspace/helion-ultra-bitstream.
 - Status: BLOCKED. No encodings exist in any public source. Needs Vivado
   fuzzing, which needs the license.
+- URAM288 status 2026-11-19 (session 18, branch fm/ultra-bitgen-uram):
+  done-pending-critic, NOT green. The fail-loud paths, the search
+  record, the harness golden, and the Job 5 package are all on the
+  branch; the encoding itself is still missing and stays blocked on
+  the Vivado license. Nothing merged, nothing pushed.
 
 ## Goal
 
@@ -28,6 +33,30 @@ them, with no other block regressed.
   instructions.md plus vivado-fuzzing-package.zip (30 files). Job 2 is
   DSP48E2 bits; jobs 4 and 5 are deferred. The package was delivered, the
   jobs were never run.
+- URAM288 (session 18, 2026-11-19, branch fm/ultra-bitgen-uram): the
+  fail-loud paths are in place (`BitgenError::UramBlocked` in
+  src/bitgen.rs for any URAM tile, tile type, feature, or bare URAM288
+  attribute name; `BitLocError::UramBlocked` in src/bitloc.rs for
+  content; `src/uram.rs` detector with the 34 UG974 attribute names
+  as a 32-name bare-name list). The search record is
+  crates/helion-ultrascale/data/URAM288_SEARCH.md (0 URAM lines in
+  all 18 vendored segbits DBs, 0 mentions in BitFiltrator
+  ULTRASCALE_PLUS.json, 34 UG974 attributes with no INIT, 4096 x 72
+  geometry from UG573 and WP477). The harness has a uram golden
+  (one URAM288, six UG974 attributes at defaults, no content line
+  because no INIT attribute exists) and reports URAM288 blocked with
+  the missing data named; full-run record count is 60 (3 designs x
+  2 parts x 10 blocks). The Job 5 package is ready to run at
+  docs/ultra-bitgen-crew/fuzzing-job5-uram288/ (JOB5.md, 39-run
+  attribute sweep with 38 variants, 13-run content-probe pass with
+  an all-ones control, 1-run one-per-column pass; 53 runs total),
+  built on the branch's phase scaffold at
+  docs/ultra-bitgen-crew/vivado-fuzzing/job5-uram/ (commit
+  013044f2); JOB5.md records where the two packages differ
+  (variant values, port ties, COMPRESS/CRC convention) and which
+  form runs. The encoding
+  itself is still missing: URAM288 stays BLOCKED on the Vivado
+  license, and no bit is emitted for any URAM design.
 - The out-of-scope rules are set (INTERFACES.md): DSP48E2 config bits are
   fail-loud until segbits-vendor lands the encoding; URAM content is
   fail-loud until the device file lands; MMCM attribute fuzzing is out of

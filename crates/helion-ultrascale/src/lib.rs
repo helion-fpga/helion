@@ -29,6 +29,7 @@ pub mod router;
 pub mod segbits;
 pub mod sta;
 pub mod timing_db;
+pub mod uram;
 
 pub use bel::{Bel, BelKind, ClbBelInventory, TileId, TileKind};
 pub use bitgen::{

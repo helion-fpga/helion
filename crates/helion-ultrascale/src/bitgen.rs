@@ -67,6 +67,11 @@
 //!   contribution. The required post-preamble CRC state for the BitFiltrator
 //!   example frame is 0x01e2bcae; a future preamble candidate can be checked
 //!   against that number before it is trusted.
+//! - URAM288 FASM lines fail with `BitgenError::UramBlocked`: no URAM288
+//!   content or config encoding exists in any public source, so the
+//!   emitter names the missing encoding instead of the generic
+//!   unknown-tile / unknown-feature errors. Unblocker is the Vivado
+//!   fuzzing job (Job 5).
 //! - `parse_bitstream` returns the FASM of features whose configuration is
 //!   observable in the frames. A valued feature whose value is all zero
 //!   sets no bits and is indistinguishable from an absent feature, so it is
@@ -246,6 +251,12 @@ pub enum BitgenError {
     /// DSP48E2 / DSP tile feature: no config-bit encoding exists in any
     /// public source (see `crate::dsp`). Blocked on Vivado fuzzing job 2.
     Dsp48e2Blocked { tile: String, feature: String },
+    /// A URAM288 tile or feature was requested. No URAM288 content or
+    /// config encoding exists in any public source (prjuray-db has no
+    /// URAM mention; BitFiltrator ULTRASCALE_PLUS.json has no URAM
+    /// table), so no bits can be emitted. Blocked until the Vivado
+    /// fuzzing job (Job 5) lands the encoding.
+    UramBlocked { tile: String, feature: String },
     /// Duplicate (tile, feature) line in the FASM input.
     DuplicateFeature { tile: String, feature: String },
     /// A `!` bit reads 1 when the feature requires 0.
@@ -335,6 +346,12 @@ impl fmt::Display for BitgenError {
                      no public source documents DSP48E2 config bits (prjuray-db ships no segbits_dsp DB; \
                      BitFiltrator ULTRASCALE_PLUS.json has no DSP table); blocked on Vivado fuzzing job 2 \
                      (DSP48E2 attribute sweep); refusing to emit guessed bits"
+                )
+            }
+            BitgenError::UramBlocked { tile, feature } => {
+                write!(
+                    f,
+                    "tile {tile} feature {feature}: URAM288 encoding is missing from every public source (no URAM288 content or config encoding in prjuray-db or BitFiltrator ULTRASCALE_PLUS.json); blocked until the Vivado fuzzing job (Job 5) lands it, no bits emitted"
                 )
             }
             BitgenError::DuplicateFeature { tile, feature } => {
@@ -710,11 +727,33 @@ pub fn emit_frames(
                 feature: entry.feature.clone(),
             });
         }
+        // URAM288 has no public encoding: fail with the named error
+        // rather than the generic unknown-tile / unknown-feature
+        // errors, so the blocker is visible. The detector in
+        // crate::uram covers URAM tiles, URAM-named features, and
+        // bare URAM288 attribute names (UG974), and runs before any
+        // lookup so that even a segbits entry for the feature (which
+        // could only come from a non-public source) is never trusted.
+        // Checked again on the resolved tile type below, so a future
+        // device file that resolves URAM tiles still fails loud here
+        // until a URAM segbits encoding lands.
+        if crate::uram::is_uram288_entry(&entry.tile, &entry.feature) {
+            return Err(BitgenError::UramBlocked {
+                tile: entry.tile.clone(),
+                feature: entry.feature.clone(),
+            });
+        }
         let tile_type = device
             .tile_type(&entry.tile)
             .ok_or_else(|| BitgenError::UnknownTile {
                 tile: entry.tile.clone(),
             })?;
+        if tile_type.contains("URAM") {
+            return Err(BitgenError::UramBlocked {
+                tile: entry.tile.clone(),
+                feature: entry.feature.clone(),
+            });
+        }
         let base_far =
             device
                 .tile_base_far(&entry.tile)
@@ -1685,6 +1724,103 @@ mod tests {
             err,
             BitgenError::UnknownTile {
                 tile: "SLICE_X9Y9".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn uram_tile_fails_loud_with_uram_blocked() {
+        // No URAM288 encoding exists in any public source. A URAM
+        // design must fail with the named error and emit no bits,
+        // even when the device file resolves the tile: the segbits
+        // DB has no URAM entry, so without the gate this would be a
+        // generic unknown-feature error. The full bitstream path
+        // fails the same way, since it runs through emit_frames.
+        let device = StubDevice::new(
+            "xcku3p",
+            Some(0x04A6_3093),
+            vec![("URAM_X0Y0".to_string(), "URAM_URAM_FT".to_string(), 0x600)],
+            vec![0x600],
+        );
+        let db = StubSegbitsDb::new(vec![]);
+        let expected = BitgenError::UramBlocked {
+            tile: "URAM_X0Y0".to_string(),
+            feature: "URAM288.OREG_A".to_string(),
+        };
+        let err = emit_frames("URAM_X0Y0.URAM288.OREG_A\n", &device, &db).unwrap_err();
+        assert_eq!(err, expected);
+        let err = emit_bitstream("URAM_X0Y0.URAM288.OREG_A\n", &device, &db).unwrap_err();
+        assert_eq!(err, expected);
+    }
+
+    #[test]
+    fn uram_tile_unknown_to_device_still_uram_blocked() {
+        // The device file resolves no URAM tile today; the error must
+        // still name URAM288, not the generic unknown-tile error.
+        let (device, db) = one_bit_db();
+        let err = emit_frames("URAM_X0Y0.URAM288.OREG_A\n", &device, &db).unwrap_err();
+        assert_eq!(
+            err,
+            BitgenError::UramBlocked {
+                tile: "URAM_X0Y0".to_string(),
+                feature: "URAM288.OREG_A".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn uram_feature_on_known_tile_fails_loud() {
+        // A URAM feature on a resolved non-URAM tile is still a URAM
+        // request, not an unknown feature.
+        let (device, db) = one_bit_db();
+        let err = emit_frames("SLICE_X0Y0.URAM288.OREG_A\n", &device, &db).unwrap_err();
+        assert_eq!(
+            err,
+            BitgenError::UramBlocked {
+                tile: "SLICE_X0Y0".to_string(),
+                feature: "URAM288.OREG_A".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn uram_bare_attribute_on_slice_fails_loud() {
+        // A bare URAM288 attribute name (UG974) on a non-URAM tile is
+        // still a URAM request: the detector in crate::uram catches
+        // it before the segbits lookup, so it cannot fall through to
+        // UnknownFeature.
+        let (device, db) = one_bit_db();
+        let err = emit_frames("SLICE_X0Y0.OREG_A\n", &device, &db).unwrap_err();
+        assert_eq!(
+            err,
+            BitgenError::UramBlocked {
+                tile: "SLICE_X0Y0".to_string(),
+                feature: "OREG_A".to_string()
+            }
+        );
+        let err = emit_frames("SLICE_X0Y0.EN_ECC_RD_B\n", &device, &db).unwrap_err();
+        assert_eq!(
+            err,
+            BitgenError::UramBlocked {
+                tile: "SLICE_X0Y0".to_string(),
+                feature: "EN_ECC_RD_B".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn cascade_order_bare_name_is_not_uram_blocked() {
+        // CASCADE_ORDER_A/B are also RAMB36E2 attributes (UG974), so
+        // the bare name on a non-URAM tile must stay UnknownFeature,
+        // never UramBlocked. The URAM spelling still blocks when the
+        // tile or feature names URAM (see the uram_tile tests).
+        let (device, db) = one_bit_db();
+        let err = emit_frames("SLICE_X0Y0.CASCADE_ORDER_A\n", &device, &db).unwrap_err();
+        assert_eq!(
+            err,
+            BitgenError::UnknownFeature {
+                tile: "SLICE_X0Y0".to_string(),
+                feature: "CASCADE_ORDER_A".to_string()
             }
         );
     }
