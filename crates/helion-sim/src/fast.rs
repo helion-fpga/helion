@@ -376,6 +376,8 @@ pub struct CompiledFf {
     pub q_net: u32,
     pub ce_net: u32,
     pub rst_net: u32,
+    /// Value loaded while `rst_net` is 1 (`SRVAL`).
+    pub srval: bool,
 }
 
 /// Topologically levelized schedule for a [`Design`].
@@ -502,6 +504,7 @@ impl LevelizedSchedule {
                         q_net,
                         ce_net,
                         rst_net,
+                        srval: c.attrs.get("SRVAL") == Some("1"),
                     });
                 }
                 CellKind::Lut6 { init } => {
@@ -583,7 +586,7 @@ impl LevelizedSchedule {
                             internal.push(d_net);
                             let name = format!("{cname}$preg{i}");
                             ff_ids.insert(name.clone(), ffs.len());
-                            ffs.push(CompiledFf { name, d_net, q_net, ce_net: NET_ONE, rst_net: NET_ZERO });
+                            ffs.push(CompiledFf { name, d_net, q_net, ce_net: NET_ONE, rst_net: NET_ZERO, srval: false });
                         }
                         internal
                     } else {
@@ -1153,7 +1156,7 @@ impl CompiledSim {
         for (idx, ff) in self.schedule.ffs.iter().enumerate() {
             let rst = get_bit(&self.net_val, ff.rst_net);
             let next_q = if rst {
-                false
+                ff.srval
             } else if get_bit(&self.net_val, ff.ce_net) {
                 get_bit(&self.net_val, ff.d_net)
             } else {
@@ -1209,11 +1212,12 @@ impl CompiledSim {
             let cur_q = get_logic4(&self.ff_val, &self.ff_xz, idx as u32);
 
             let next_q = match rst {
-                Logic4::One => Logic4::Zero,
+                Logic4::One => if ff.srval { Logic4::One } else { Logic4::Zero },
                 Logic4::Zero => Logic4::mux(ce, cur_q, d),
                 Logic4::X | Logic4::Z => {
-                    if cur_q == Logic4::Zero && d == Logic4::Zero {
-                        Logic4::Zero
+                    let v = if ff.srval { Logic4::One } else { Logic4::Zero };
+                    if cur_q == v && d == v {
+                        v
                     } else {
                         Logic4::X
                     }

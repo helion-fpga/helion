@@ -112,6 +112,8 @@ struct VerilateFf {
     q_net: Option<String>,
     ce_net: Option<String>,
     rst_net: Option<String>,
+    /// Value loaded while `rst_net` is 1 (`SRVAL`).
+    srval: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -260,6 +262,7 @@ fn build_verilate_schedule(design: &Design) -> VerilateSchedule {
                     q_net,
                     ce_net,
                     rst_net,
+                    srval: cell.attrs.get("SRVAL") == Some("1"),
                 });
             }
             CellKind::Bram18 | CellKind::Bram18e1 { .. } => {
@@ -601,7 +604,8 @@ pub fn emit_cpp_cycle_model(design: &Design) -> String {
         };
         let rst_e = net_expr_cpp(ff.rst_net.as_deref());
         out.push_str(&format!(
-            "        const uint64_t next_ff_{fid} = ({rst_e} != 0ULL) ? 0ULL : (({ce_e} != 0ULL) ? {d_e} : this->ff_{fid});\n"
+            "        const uint64_t next_ff_{fid} = ({rst_e} != 0ULL) ? {sv}ULL : (({ce_e} != 0ULL) ? {d_e} : this->ff_{fid});\n",
+            sv = ff.srval as u8
         ));
     }
     for ram in &sched.rams {
@@ -849,7 +853,8 @@ pub fn emit_rust_cycle_model(design: &Design) -> String {
         };
         let rst_e = net_expr_rust(ff.rst_net.as_deref());
         out.push_str(&format!(
-            "        let next_ff_{fid}: u64 = if {rst_e} != 0 {{ 0 }} else if {ce_e} != 0 {{ {d_e} }} else {{ self.ff_{fid} }};\n"
+            "        let next_ff_{fid}: u64 = if {rst_e} != 0 {{ {sv} }} else if {ce_e} != 0 {{ {d_e} }} else {{ self.ff_{fid} }};\n",
+            sv = ff.srval as u8
         ));
     }
     for ff in &sched.ffs {

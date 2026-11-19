@@ -1041,7 +1041,8 @@ impl SeqModel {
                 .or_else(|| pin_idx.net_on(cname, "RST"))
             {
                 if let Some(&sr_node) = net_to_node.get(&srnet) {
-                    d_node = m.mk_ite(sr_node, 0, d_node);
+                    let set = d.cells.iter().any(|c| c.name == cspur && c.attrs.get("SRVAL") == Some("1"));
+                    d_node = m.mk_ite(sr_node, set as usize, d_node); // nodes 0 and 1 are the constants
                 }
             }
             m.regs[r_ix].2 = d_node;

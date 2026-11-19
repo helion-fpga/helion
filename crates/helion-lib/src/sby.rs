@@ -967,8 +967,9 @@ impl FormalSystem {
                 .or_else(|| pin_idx.net_on(cname, "RST"))
             {
                 let sr_node = resolve_or_create_input(&mut sys, &mut net_to_node, srnet);
-                let zero = sys.c0();
-                d_node = sys.mk_ite(sr_node, zero, d_node);
+                let set = d.cells.iter().any(|c| c.name == cell_spur && c.attrs.get("SRVAL") == Some("1"));
+                let val = if set { sys.c1() } else { sys.c0() };
+                d_node = sys.mk_ite(sr_node, val, d_node);
             }
             sys.states[st_ix].next_node = d_node;
         }
