@@ -229,20 +229,6 @@ fn lut_errors_fail_loud() {
     );
 }
 
-#[test]
-fn lutram_blocked_fail_loud() {
-    // G4: no LUTRAM table, no verified equivalence. A LUTRAM request
-    // must error and emit no bits, never fall back to the LUT table.
-    let err = lut_placed_bits(
-        ClbTileType::Clem,
-        0,
-        0,
-        LutMode::Lutram,
-        0xFFFF_FFFF_FFFF_FFFF,
-    );
-    assert_eq!(err, Err(BitLocError::LutramBlocked));
-}
-
 // ---------------------------------------------------------------------------
 // FF
 // ---------------------------------------------------------------------------

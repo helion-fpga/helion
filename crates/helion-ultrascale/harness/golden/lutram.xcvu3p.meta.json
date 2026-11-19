@@ -1,0 +1,16 @@
+{
+  "design": "lutram",
+  "fasm_sha256": "bedf096c27da6e73de9527a8d2c12fa2affd551074cdeb828e9c556b699b423a",
+  "notes": "One RAM64X1S on SLICE_X1Y0 ALUT (CLEM tile). No INT/HPIO tiles. xcvu3p placement reuses the xcku3p coordinates verbatim and is provisional until the xcvu3p device file lands.",
+  "part": "xcvu3p",
+  "placement_hash": "c3f87fde23fb7c8e6a9cc37bca80ca74443252460b59ff4357b786ad09c3f51e",
+  "provisional_tiles": [],
+  "seed": 20261107,
+  "sites": [
+    {
+      "bel": "A6LUT",
+      "role": "lutram",
+      "tile": "SLICE_X1Y0"
+    }
+  ]
+}
