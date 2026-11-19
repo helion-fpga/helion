@@ -672,13 +672,11 @@ pub fn emit_ff_control_fasm(
     packed: &[PackedUltraSlice],
     placed: &UltraPlaced,
 ) -> Result<Vec<String>, String> {
-    // (site, group) -> (any_ce, ce_net, any_sr, sr_net). The net is the
-    // first CE/SR net seen in the group; a second, different net fails
-    // loud below.
-    let mut groups: HashMap<
-        (String, FfControlGroup),
-        (bool, Option<String>, bool, Option<String>),
-    > = HashMap::new();
+    // (any_ce, ce_net, any_sr, sr_net) for one FF control group: the
+    // net is the first CE/SR net seen in the group; a second, different
+    // net fails loud below.
+    type FfControlState = (bool, Option<String>, bool, Option<String>);
+    let mut groups: HashMap<(String, FfControlGroup), FfControlState> = HashMap::new();
     // site -> (half ABCD?, half EFGH?) present.
     let mut halves: HashMap<String, (bool, bool)> = HashMap::new();
     for p in &placed.slices {
@@ -688,7 +686,7 @@ pub fn emit_ff_control_fasm(
                 p.site, p.packed_idx
             )
         })?;
-        for (bel, _) in &slice.ffs {
+        for bel in slice.ffs.keys() {
             let group = FfControlGroup::for_ff(*bel)?;
             let ce = slice.ff_ce.get(bel).cloned().flatten();
             let sr = slice.ff_sr.get(bel).cloned().flatten();
