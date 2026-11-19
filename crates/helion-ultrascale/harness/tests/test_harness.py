@@ -475,7 +475,7 @@ class TestUram(unittest.TestCase):
                 os.path.join(GOLDEN_DIR, "uram.xcku3p.fasm"),
                 meta["seed"], meta["placement_hash"], "tier1", tmp,
             )
-            self.assertEqual(len(recs), 10)
+            self.assertEqual(len(recs), 11)
             by_block = {r["block"]: r for r in recs}
             rec = by_block["URAM288"]
             self.assertEqual(rec["status"], "blocked")
