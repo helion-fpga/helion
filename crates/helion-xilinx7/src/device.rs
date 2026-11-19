@@ -209,6 +209,23 @@ pub struct Device {
     pub missing_db_types: Vec<String>,
 }
 
+/// The part's `required_features.fasm`, or else one from another part on the
+/// same fabric. The features name fabric tiles (`CFG_CENTER_MID_X123Y84`), so
+/// every package of a die shares them; prjxray-db ships xc7z020clg400-1's but
+/// not the ZedBoard's xc7z020clg484-1.
+fn required_features_text(family: &Path, fabric: &Path, partdir: &Path) -> Option<String> {
+    if let Ok(text) = std::fs::read_to_string(partdir.join("required_features.fasm")) {
+        return Some(text);
+    }
+    let fabric = fabric.file_name()?.to_str()?;
+    let parts = crate::parts::read_yaml_map(&family.join("mapping/parts.yaml")).ok()?;
+    let devices = crate::parts::read_yaml_map(&family.join("mapping/devices.yaml")).ok()?;
+    parts
+        .iter()
+        .filter(|(_, p)| p.get("device").and_then(|d| devices.get(d)).and_then(|d| d.get("fabric")).is_some_and(|f| f == fabric))
+        .find_map(|(name, _)| std::fs::read_to_string(family.join(name).join("required_features.fasm")).ok())
+}
+
 impl Device {
     /// Load the full `xc7a35t` device model from the raw X-Ray DB.
     ///
@@ -258,16 +275,16 @@ impl Device {
         // The part's static always-on features. A missing file warns
         // rather than errors: plenty of part directories ship without
         // one, but then the bitstream quietly omits mandatory bits.
-        let required = match std::fs::read_to_string(partdir.join("required_features.fasm")) {
-            Ok(text) => text
+        let required = match required_features_text(family, fabric, partdir) {
+            Some(text) => text
                 .lines()
                 .map(str::trim)
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .map(str::to_string)
                 .collect(),
-            Err(_) => {
+            None => {
                 eprintln!(
-                    "device: warning: no required_features.fasm for this part, \
+                    "device: warning: no required_features.fasm for this part or its fabric, \
                      always-on configuration bits will not be emitted"
                 );
                 Vec::new()
@@ -1474,6 +1491,29 @@ fn _use_tile_conn_fields(e: &TileConnEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_part_without_required_features_takes_its_fabrics() {
+        // prjxray-db's layout: the ZedBoard package has no file, another
+        // package of the same die does, and a different die must not lend its own.
+        let fam = std::env::temp_dir().join(format!("helion_reqfeat_{}", std::process::id()));
+        let w = |p: &str, t: &str| {
+            let f = fam.join(p);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, t).unwrap();
+        };
+        w("mapping/parts.yaml", "a-clg400:\n  device: a\na-clg484:\n  device: a\nb-clg400:\n  device: b\n");
+        w("mapping/devices.yaml", "\"a\":\n  fabric: \"fa\"\nb:\n  fabric: fb\n");
+        w("a-clg400/required_features.fasm", "CFG_A.ALWAYS_ON\n");
+        w("b-clg400/required_features.fasm", "CFG_B.ALWAYS_ON\n");
+        std::fs::create_dir_all(fam.join("a-clg484")).unwrap();
+        std::fs::create_dir_all(fam.join("c-clg484")).unwrap();
+        let got = |fabric: &str, part: &str| required_features_text(&fam, &fam.join(fabric), &fam.join(part));
+        assert_eq!(got("fa", "a-clg484").as_deref(), Some("CFG_A.ALWAYS_ON\n"));
+        assert_eq!(got("fb", "b-clg400").as_deref(), Some("CFG_B.ALWAYS_ON\n"));
+        assert_eq!(got("fc", "c-clg484"), None);
+        std::fs::remove_dir_all(&fam).unwrap();
+    }
 
     #[test]
     fn hard_block_sites_snake_between_columns() {

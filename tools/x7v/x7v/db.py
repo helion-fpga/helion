@@ -108,8 +108,17 @@ class Db:
 
     @cached_property
     def required_features(self) -> list[str]:
+        """The part's always-on features, or another package's of the same
+        fabric: they name fabric tiles, and prjxray-db ships xc7z020clg400-1's
+        but not the ZedBoard's xc7z020clg484-1."""
         p = f"{self.root}/{self.package}/required_features.fasm"
         if not os.path.exists(p):
+            parts = _yaml_map(f"{self.root}/mapping/parts.yaml") if os.path.exists(f"{self.root}/mapping/parts.yaml") else {}
+            devices = _yaml_map(f"{self.root}/mapping/devices.yaml") if parts else {}
+            same = [n for n, v in sorted(parts.items()) if devices.get(v.get("device", ""), {}).get("fabric") == self.fabric]
+            p = next((f"{self.root}/{n}/required_features.fasm" for n in same
+                      if os.path.exists(f"{self.root}/{n}/required_features.fasm")), "")
+        if not p:
             return []
         return [l.strip() for l in open(p) if l.strip() and not l.startswith("#")]
 
