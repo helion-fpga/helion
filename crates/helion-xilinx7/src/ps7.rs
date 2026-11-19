@@ -268,6 +268,32 @@ pub fn timing_ends(p: &PackedPs7) -> Result<(Vec<(&str, &str, u32, &str)>, Vec<(
     Ok((launch, capture))
 }
 
+/// Period (ps) of each PS7 fabric clock on a net (`FCLKCLK<n>`), from the
+/// XDC's `create_clock -period <ns> ... [get_pins <cell>/FCLKCLK[<n>]]`: the
+/// PS programs the rate (ps7_init), so only the XDC can say what it is.
+pub fn fclk_periods(xdc: &str, ps7s: &[PackedPs7]) -> Result<HashMap<String, u32>, String> {
+    let mut out = HashMap::new();
+    for p in ps7s {
+        for (pin, net, _) in p.pins.iter().filter(|(pin, _, is_out)| *is_out && pin.starts_with("FCLKCLK")) {
+            let bit = &pin["FCLKCLK".len()..];
+            let line = xdc
+                .lines()
+                .map(|l| l.split('#').next().unwrap_or(""))
+                .find(|l| l.trim_start().starts_with("create_clock") && l.contains("get_pins") && l.contains(&format!("FCLKCLK[{bit}]")))
+                .ok_or_else(|| format!("XDC: PS7 {}/FCLKCLK[{bit}] drives net `{net}` but has no create_clock", p.name))?;
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            let ns = toks
+                .iter()
+                .position(|t| *t == "-period")
+                .and_then(|i| toks.get(i + 1))
+                .and_then(|v| v.parse::<f64>().ok())
+                .ok_or_else(|| format!("XDC: create_clock for {}/FCLKCLK[{bit}] has no -period", p.name))?;
+            out.insert(net.clone(), (ns * 1000.0).round() as u32);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +330,36 @@ mod tests {
         assert_eq!(db.clk_to_out["MAXIGP0ARADDR"], ("MAXIGP0ACLK".to_string(), 1438));
         assert_eq!(db.setup["MAXIGP0RDATA"], ("MAXIGP0ACLK".to_string(), 550));
         assert!(!db.clk_to_out.contains_key("FCLKCLK") && !db.setup.contains_key("IRQF2P"), "FCLK and interrupts are not clocked ports");
+    }
+
+    #[test]
+    fn clocked_ports_launch_and_capture_on_their_clock() {
+        let mut p = PackedPs7 {
+            name: "ps7".into(),
+            pins: vec![
+                ("MAXIGP0ACLK".into(), "clk".into(), false),
+                ("MAXIGP0RDATA0".into(), "d0".into(), false),
+                ("MAXIGP0ARADDR0".into(), "a0".into(), true),
+                ("FCLKRESETN0".into(), "rstn".into(), true),
+                ("IRQF2P0".into(), "irq".into(), false),
+            ],
+            ties: Vec::new(),
+        };
+        let (launch, capture) = timing_ends(&p).unwrap();
+        assert_eq!(launch, [("a0", "clk", 1438, "MAXIGP0ARADDR0")], "FCLK_RESET0_N has no clock");
+        assert_eq!(capture, [("d0", "clk", 550, "MAXIGP0RDATA0")], "interrupts have no clock");
+        p.pins.remove(0);
+        let (launch, capture) = timing_ends(&p).unwrap();
+        assert!(launch.is_empty() && capture.is_empty(), "an unclocked port is not timed");
+    }
+
+    #[test]
+    fn fclk_period_comes_from_its_create_clock() {
+        let p = PackedPs7 { name: "ps7".into(), pins: vec![("FCLKCLK0".into(), "fclk_0".into(), true), ("FCLKCLKTRIGN1".into(), "t".into(), false)], ties: Vec::new() };
+        let xdc = "# create_clock -period 5 [get_pins ps7/FCLKCLK[0]]\ncreate_clock -period 20.000 -name f [get_pins ps7/FCLKCLK[1]]\ncreate_clock -period 10.000 -name f0 [get_pins ps7/FCLKCLK[0]]\n";
+        assert_eq!(fclk_periods(xdc, std::slice::from_ref(&p)).unwrap(), HashMap::from([("fclk_0".to_string(), 10_000)]));
+        let e = fclk_periods("create_clock -period 8 [get_ports clk]\n", &[p]).unwrap_err();
+        assert!(e.contains("FCLKCLK[0]") && e.contains("no create_clock"), "{e}");
     }
 
     #[test]
