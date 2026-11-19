@@ -51,7 +51,7 @@ const SHORT_NAMES: &[(&str, &str)] = &[("xc7a35t", "xc7a35tcsg324-1"), ("xc7z020
 
 /// Minimal reader for the database's `mapping/*.yaml`: two-level maps of
 /// `key:` lines followed by indented `field: value` lines.
-fn read_yaml_map(path: &Path) -> Result<BTreeMap<String, BTreeMap<String, String>>, String> {
+pub(crate) fn read_yaml_map(path: &Path) -> Result<BTreeMap<String, BTreeMap<String, String>>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let unquote = |s: &str| s.trim().trim_matches('"').trim_matches('\'').to_string();
     let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
