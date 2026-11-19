@@ -70,10 +70,24 @@ module zedboard_vga (
     end
 
     // Sync pulses are active low during the sync intervals.
-    assign vga_hs = !((h_cnt >= H_VISIBLE[9:0] + H_FRONT[9:0]) &&
-                      (h_cnt < H_VISIBLE[9:0] + H_FRONT[9:0] + H_SYNC[9:0]));
-    assign vga_vs = !((v_cnt >= V_VISIBLE[9:0] + V_FRONT[9:0]) &&
-                      (v_cnt < V_VISIBLE[9:0] + V_FRONT[9:0] + V_SYNC[9:0]));
+    logic hs_next, vs_next;
+    assign hs_next = !((h_cnt >= H_VISIBLE[9:0] + H_FRONT[9:0]) &&
+                       (h_cnt < H_VISIBLE[9:0] + H_FRONT[9:0] + H_SYNC[9:0]));
+    assign vs_next = !((v_cnt >= V_VISIBLE[9:0] + V_FRONT[9:0]) &&
+                       (v_cnt < V_VISIBLE[9:0] + V_FRONT[9:0] + V_SYNC[9:0]));
+
+    // Colour and sync outputs are registered together so all five change
+    // on the same clock edge and stay aligned; the combinational colour
+    // logic would otherwise glitch at each counter change. The outputs
+    // lag the counters by one system clock (10 ns).
+    logic [3:0] r_next, g_next, b_next;
+    always_ff @(posedge clk) begin
+        vga_hs <= hs_next;
+        vga_vs <= vs_next;
+        vga_r  <= r_next;
+        vga_g  <= g_next;
+        vga_b  <= b_next;
+    end
 
     // Frame heartbeat: led toggles once per frame (about 60 Hz).
     always_ff @(posedge clk) begin
@@ -108,17 +122,17 @@ module zedboard_vga (
 
     always_comb begin
         if (!visible) begin
-            vga_r = 4'h0;
-            vga_g = 4'h0;
-            vga_b = 4'h0;
+            r_next = 4'h0;
+            g_next = 4'h0;
+            b_next = 4'h0;
         end else if (border) begin
-            vga_r = 4'hf;
-            vga_g = 4'hf;
-            vga_b = 4'hf;
+            r_next = 4'hf;
+            g_next = 4'hf;
+            b_next = 4'hf;
         end else begin
-            vga_r = bar_r;
-            vga_g = bar_g;
-            vga_b = bar_b;
+            r_next = bar_r;
+            g_next = bar_g;
+            b_next = bar_b;
         end
     end
 endmodule
