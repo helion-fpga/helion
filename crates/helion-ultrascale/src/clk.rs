@@ -41,10 +41,7 @@ use std::fmt;
 pub enum ClkError {
     /// No DB line exists for this (tile type, feature). The feature
     /// string may be misspelled, or the encoding may not exist publicly.
-    UnknownFeature {
-        tile_type: String,
-        feature: String,
-    },
+    UnknownFeature { tile_type: String, feature: String },
     /// The site and attribute are real (the site-type JSON documents
     /// the pin or pip), but no public segbits line encodes the
     /// attribute. Unblocker is the Vivado clocking fuzz job
@@ -69,18 +66,14 @@ pub enum ClkError {
 impl fmt::Display for ClkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownFeature {
-                tile_type,
-                feature,
-            } => write!(f, "unknown clocking feature {tile_type}.{feature}"),
+            Self::UnknownFeature { tile_type, feature } => {
+                write!(f, "unknown clocking feature {tile_type}.{feature}")
+            }
             Self::MissingEncoding {
                 site,
                 attribute,
                 detail,
-            } => write!(
-                f,
-                "no public encoding for {site} {attribute}: {detail}"
-            ),
+            } => write!(f, "no public encoding for {site} {attribute}: {detail}"),
             Self::InvalidValue {
                 site,
                 attribute,
@@ -126,7 +119,11 @@ pub struct MissingClkFeature {
 
 impl fmt::Display for MissingClkFeature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{} (design {})", self.tile_type, self.feature, self.design)
+        write!(
+            f,
+            "{}.{} (design {})",
+            self.tile_type, self.feature, self.design
+        )
     }
 }
 
@@ -349,10 +346,7 @@ pub fn cmt_hroute_used_feature(index: u32) -> Result<String, ClkError> {
 }
 
 /// Resolve one CMT_RIGHT feature (PIP or WIRE) by exact lookup.
-pub fn resolve_cmt_feature(
-    db: &dyn SegbitsDb,
-    feature: &str,
-) -> Result<Vec<BitRef>, ClkError> {
+pub fn resolve_cmt_feature(db: &dyn SegbitsDb, feature: &str) -> Result<Vec<BitRef>, ClkError> {
     resolve_clk_feature(db, "CMT_RIGHT", feature)
 }
 
