@@ -140,6 +140,177 @@ class TestFasm(unittest.TestCase):
         self.assertEqual(lut_init_64(lambda b: 1 - b[0]), 0x5555555555555555)
 
 
+class TestCarry8(unittest.TestCase):
+    # CARRY8 as its own harness block (CTO ruling 2026-11-08, US-05).
+    # The vocabulary is the 24 prjuray segbits features per CLB tile
+    # type: CARRY_TYPE.DUAL_CY4/SINGLE_CY8, CI.AX/CI.V0/CI.V1,
+    # CI_TOP.EX/CI_TOP.V0/CI_TOP.V1, DI0.AX/DI0.DI0 through
+    # DI7.HX/DI7.DI7. The list below is cross-checked against the DB
+    # itself, not trusted on its own.
+    CARRY8_SUFFIXES = (
+        "CARRY_TYPE.DUAL_CY4", "CARRY_TYPE.SINGLE_CY8",
+        "CI.AX", "CI.V0", "CI.V1",
+        "CI_TOP.EX", "CI_TOP.V0", "CI_TOP.V1",
+        "DI0.AX", "DI0.DI0", "DI1.BX", "DI1.DI1",
+        "DI2.CX", "DI2.DI2", "DI3.DX", "DI3.DI3",
+        "DI4.EX", "DI4.DI4", "DI5.FX", "DI5.DI5",
+        "DI6.GX", "DI6.DI6", "DI7.HX", "DI7.DI7",
+    )
+
+    def test_classify_all_24_carry8_suffixes(self):
+        db = Tier1Reference().segbits("clel_l")
+        db_suffixes = sorted(
+            k.split("CARRY8.", 1)[1]
+            for k in db if ".CARRY8." in k
+        )
+        self.assertEqual(db_suffixes, sorted(self.CARRY8_SUFFIXES))
+        for suffix in self.CARRY8_SUFFIXES:
+            feat = parse_fasm("SLICE_X0Y0.CARRY8.%s\n" % suffix)[0]
+            self.assertEqual(classify(feat), "CARRY8", suffix)
+            self.assertNotEqual(classify(feat), "LUT_INIT", suffix)
+            self.assertNotEqual(classify(feat), "FF_INIT", suffix)
+
+    def test_classify_carry8_off_slice_fails_loud(self):
+        feat = parse_fasm("INT_X0Y0.CARRY8.DI0.DI0\n")[0]
+        with self.assertRaises(FasmError):
+            classify(feat)
+
+    def test_resolve_carry8_hand_checked_bits(self):
+        # SLICE_X0Y0 is CLEL_R, column major 5: FAR base 0x500.
+        # Positions read by hand from segbits_clel_r.db.
+        ref = Tier1Reference()
+        cases = {
+            "CARRY8.CARRY_TYPE.DUAL_CY4": {(0x50C, 45): 1},
+            "CARRY8.CARRY_TYPE.SINGLE_CY8": {(0x50C, 45): 0},
+            "CARRY8.DI0.DI0": {(0x50C, 3): 1},
+            "CARRY8.DI0.AX": {(0x50C, 3): 0},
+            "CARRY8.CI.V1": {(0x50A, 18): 1, (0x50E, 1): 0},
+            "CARRY8.CI.V0": {(0x50A, 18): 0, (0x50E, 1): 0},
+            "CARRY8.CI_TOP.V1": {(0x50B, 31): 1, (0x50C, 27): 0},
+            "CARRY8.CI_TOP.EX": {(0x50B, 31): 0, (0x50C, 27): 1},
+            "CARRY8.DI7.DI7": {(0x50F, 47): 1},
+        }
+        for feature, want in cases.items():
+            feat = parse_fasm("SLICE_X0Y0.%s\n" % feature)[0]
+            block, bits, coord, miss = resolve_feature(ref, "xcku3p", feat)
+            self.assertIsNone(miss, feature)
+            self.assertEqual(block, "CARRY8", feature)
+            self.assertEqual(coord, "absolute", feature)
+            self.assertEqual(bits, want, feature)
+
+    def test_resolve_carry8_unknown_feature_fails_loud(self):
+        feat = parse_fasm("SLICE_X0Y0.CARRY8.NOPE\n")[0]
+        self.assertEqual(classify(feat), "CARRY8")
+        _, _, _, miss = resolve_feature(Tier1Reference(), "xcku3p", feat)
+        self.assertIsNotNone(miss)
+        self.assertIn("not in prjuray-db", miss)
+
+    def test_resolve_carry8_on_all_clb_tile_types(self):
+        # First column of each CLB tile type in xcku3p row 0:
+        # CLEL_R x=0 major 5, CLEM x=1 major 6, CLEL_L x=7 major 18,
+        # CLEM_R x=103 major 208. DUAL_CY4 is frame 12 bit 45 val 1
+        # on every tile type (same DB line on all four).
+        ref = Tier1Reference()
+        for x, major in ((0, 5), (1, 6), (7, 18), (103, 208)):
+            feat = parse_fasm(
+                "SLICE_X%dY0.CARRY8.CARRY_TYPE.DUAL_CY4\n" % x)[0]
+            block, bits, coord, miss = resolve_feature(ref, "xcku3p", feat)
+            self.assertIsNone(miss, x)
+            self.assertEqual(block, "CARRY8", x)
+            self.assertEqual(bits, {((major << 8) | 12, 45): 1}, x)
+
+    def _carry8_fasm(self, tmp):
+        text = golden_fasm("blinky", "xcku3p")
+        text += (
+            "SLICE_X0Y0.CARRY8.CARRY_TYPE.DUAL_CY4\n"
+            "SLICE_X0Y0.CARRY8.DI0.DI0\n"
+            "SLICE_X0Y0.CARRY8.CI.V1\n"
+        )
+        path = os.path.join(tmp, "carry8.fasm")
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def test_design_without_carry8_is_zero_bit_green(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            emitter = Emitter(_fake_emitter_shim(tmp))
+            recs = diff_design(
+                Tier1Reference(), emitter, "blinky", "xcku3p",
+                os.path.join(GOLDEN_DIR, "blinky.xcku3p.fasm"),
+                20261107, "hash", "tier1", tmp,
+            )
+            by_block = {r["block"]: r for r in recs}
+            carry8 = by_block["CARRY8"]
+            self.assertEqual(carry8["status"], "green")
+            self.assertEqual(carry8["diff_bits"], 0)
+            self.assertEqual(carry8["total_bits"], 0)
+
+    def test_design_with_carry8_reports_carry8_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            emitter = Emitter(_fake_emitter_shim(tmp))
+            recs = diff_design(
+                Tier1Reference(), emitter, "blinky", "xcku3p",
+                self._carry8_fasm(tmp), 20261107, "hash", "tier1", tmp,
+            )
+            by_block = {r["block"]: r for r in recs}
+            carry8 = by_block["CARRY8"]
+            self.assertEqual(carry8["status"], "green")
+            self.assertEqual(carry8["diff_bits"], 0)
+            # DUAL_CY4 1 bit + DI0.DI0 1 bit + CI.V1 2 bits.
+            self.assertEqual(carry8["total_bits"], 4)
+            self.assertEqual(by_block["LUT_INIT"]["status"], "green")
+            self.assertEqual(by_block["FF_INIT"]["status"], "green")
+            self.assertEqual(by_block["INT_PIP"]["status"], "green")
+            self.assertEqual(by_block["FRAMING"]["status"], "green")
+
+    def test_carry8_flip_is_red(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            emitter = Emitter(_fake_emitter_shim(tmp))
+            os.environ["FAKE_FLIP_COUNT"] = "1"
+            os.environ["FAKE_FLIP_BLOCK"] = "CARRY8"
+            try:
+                recs = diff_design(
+                    Tier1Reference(), emitter, "blinky", "xcku3p",
+                    self._carry8_fasm(tmp), 20261107, "hash", "tier1", tmp,
+                )
+            finally:
+                del os.environ["FAKE_FLIP_COUNT"]
+                del os.environ["FAKE_FLIP_BLOCK"]
+            by_block = {r["block"]: r for r in recs}
+            self.assertEqual(by_block["CARRY8"]["status"], "red")
+            self.assertEqual(by_block["CARRY8"]["diff_bits"], 1)
+            self.assertEqual(by_block["LUT_INIT"]["status"], "green")
+            self.assertEqual(by_block["FF_INIT"]["status"], "green")
+
+    def test_extra_carry8_bit_on_design_without_carry8_is_red(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            emitter = Emitter(_fake_emitter_shim(tmp))
+            os.environ["FAKE_EXTRA_BIT_BLOCK"] = "CARRY8"
+            try:
+                recs = diff_design(
+                    Tier1Reference(), emitter, "blinky", "xcku3p",
+                    os.path.join(GOLDEN_DIR, "blinky.xcku3p.fasm"),
+                    20261107, "hash", "tier1", tmp,
+                )
+            finally:
+                del os.environ["FAKE_EXTRA_BIT_BLOCK"]
+            by_block = {r["block"]: r for r in recs}
+            self.assertEqual(by_block["CARRY8"]["status"], "red")
+            self.assertEqual(by_block["CARRY8"]["diff_bits"], 1)
+
+    def test_no_emitter_carry8_is_blocked_not_green(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recs = diff_design(
+                Tier1Reference(), None, "blinky", "xcku3p",
+                os.path.join(GOLDEN_DIR, "blinky.xcku3p.fasm"),
+                20261107, "hash", "tier1", tmp,
+            )
+            by_block = {r["block"]: r for r in recs}
+            self.assertEqual(by_block["CARRY8"]["status"], "blocked")
+            self.assertIsNone(by_block["CARRY8"]["diff_bits"])
+            self.assertIn("CARRY8", by_block["CARRY8"]["missing"])
+
+
 class TestRoundtrip(unittest.TestCase):
     def test_completes_missing_ff_init_with_v0(self):
         # Diff-harness session 3: a partial FASM completes to the
@@ -431,7 +602,7 @@ class TestDiffEngine(unittest.TestCase):
                 os.path.join(GOLDEN_DIR, "blinky.xcku3p.fasm"),
                 20261107, "hash", "tier1", tmp,
             )
-            self.assertEqual(len(recs), 10)
+            self.assertEqual(len(recs), 11)
             for rec in recs:
                 self.assertEqual(rec["status"], "blocked")
                 self.assertIsNone(rec["diff_bits"])
@@ -443,6 +614,9 @@ class TestDiffEngine(unittest.TestCase):
             self.assertEqual(by_block["FF_INIT"]["total_bits"], 2)
             self.assertEqual(by_block["INT_PIP"]["total_bits"], 11)
             self.assertEqual(by_block["IO_CONFIG"]["total_bits"], 55)
+            # CARRY8 is blocked without an emitter, like every block:
+            # no comparison ran, so no zero-bit green.
+            self.assertEqual(by_block["CARRY8"]["total_bits"], 0)
 
     def test_greedy_order_largest_first(self):
         recs = [
@@ -755,7 +929,7 @@ class TestDiffEngine(unittest.TestCase):
                 )
             finally:
                 del os.environ["FAKE_PARSE_GARBAGE"]
-            self.assertEqual(len(recs), 10)
+            self.assertEqual(len(recs), 11)
             by_block = {r["block"]: r for r in recs}
             framing = by_block["FRAMING"]
             self.assertEqual(framing["status"], "red")
@@ -769,7 +943,7 @@ class TestDiffEngine(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
-    def test_full_run_exits_zero_with_40_blocked_records(self):
+    def test_full_run_exits_zero_with_44_blocked_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "run")
             proc = subprocess.run(
@@ -779,7 +953,7 @@ class TestCli(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             recs = [json.loads(l) for l in open(os.path.join(out, "diff.jsonl"))]
-            self.assertEqual(len(recs), 40)
+            self.assertEqual(len(recs), 44)
             self.assertTrue(all(r["status"] == "blocked" for r in recs))
             self.assertTrue(all(r["diff_bits"] is None for r in recs))
             manifest = json.load(open(os.path.join(out, "manifest.json")))
@@ -805,7 +979,7 @@ class TestCli(unittest.TestCase):
             self.assertNotIn("Traceback", proc.stderr)
             with open(os.path.join(out, "diff.jsonl")) as f:
                 recs = [json.loads(l) for l in f]
-            self.assertEqual(len(recs), 40)
+            self.assertEqual(len(recs), 44)
             framing = [r for r in recs if r["block"] == "FRAMING"]
             self.assertEqual(len(framing), 4)
             for r in framing:
