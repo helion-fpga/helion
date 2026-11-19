@@ -177,7 +177,19 @@ def classify(feature):
         return "URAM288"
     if "BUFGCE" in feat or "BUFGCTRL" in feat or "MMCM" in feat or "PLL" in feat:
         return "CLK"
-    if tile.startswith("CMT_") and (feat.startswith("PIP.") or ".PIP." in feat):
+    # BUFCE_LEAF site config lives on RCLK tiles (segbits_rclk_int_l/r.db,
+    # 416 lines per file); the feature name alone marks it clocking.
+    if "BUFCE_LEAF" in feat:
+        return "CLK"
+    # Every feature on an RCLK tile is clock distribution (PIP, WIRE, or
+    # site config in the fifteen segbits_rclk_*.db files). This must sit
+    # above the generic PIP rule: an RCLK PIP is not an INT PIP.
+    if tile.startswith("RCLK_"):
+        return "CLK"
+    # CMT tiles carry clock routing only: HROUTE/HDISTR PIPs and USED
+    # bits (segbits_cmt_right.db, 104 lines). WIRE lines are clocking
+    # the same as PIP lines; neither is an INT PIP.
+    if tile.startswith("CMT_") and (feat.startswith("PIP.") or ".PIP." in feat or feat.startswith("WIRE.")):
         return "CLK"
     if feat.startswith("PIP.") or ".PIP." in feat:
         return "INT_PIP"
