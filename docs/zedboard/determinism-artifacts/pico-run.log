@@ -1,0 +1,9 @@
+NOTE: transcribed from the rerun report in docs/zedboard/determinism.md
+(second attempt, 2026-11-19). Raw stdout was not captured to a file during
+the run; the commands, exit code, and output lines below are exactly as
+recorded there.
+Command: ./target/release/examples/zedbit examples/zedboard_pico_soc.sv,third_party/picorv32/picorv32.v examples/zedboard_pico_soc.xdc pico.bit zedboard_pico_soc --ignore-timing
+Exit: 0 (about 185 s, mostly routing)
+HELION_XILINX_DB=$HOME/workspace/xilinx-dbsrc
+zedbit timing: worst clock period 10.000 ns, worst slack 8.467 ns (0 of 1258 endpoints failing), est. fmax 652 MHz on that clock
+zedbit: examples/zedboard_pico_soc.sv,third_party/picorv32/picorv32.v -> pico.bit (37975 FASM lines, 61515 features, cells {"BlackBox": 11, "Carry4": 74, "Hff": 516, "IobOut": 8, "Lut6": 1464}, 1464 luts / 516 ffs / 15 iobs packed)
