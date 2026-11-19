@@ -17,11 +17,12 @@
 //!   IOBs have no placed site in this flow yet; both are recorded in the
 //!   gate, not hidden.
 
-use helion_ir::{intern, resolve, CellKind, Design};
+use helion_ir::{CellKind, Design, intern, resolve};
 use helion_ultrascale::{
-    check_legality, emit_ff_fasm, pack_ultra, place_ultra, preliminary_xcvu3p, route_ultra,
-    sta_routed, ControlSetLimits, FabricWithPlaceholders, RoutableNet, StaNetlist, TimingReport,
-    UltraPlaceOpts, UltraRouteOpts, UltraScaleDevice, UltraScaleFabric,
+    ControlSetLimits, FabricWithPlaceholders, RoutableNet, SeedResult, StaNetlist, TimingReport,
+    UltraPlaceOpts, UltraRouteOpts, UltraScaleDevice, UltraScaleFabric, best_seed_line,
+    check_legality, emit_ff_fasm, pack_ultra, place_ultra, preliminary_xcvu3p,
+    read_completed_seeds, route_ultra, sta_routed, summarize_multiseed,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -507,4 +508,194 @@ fn build_routable_nets(
         });
     }
     Ok(nets)
+}
+
+/// One seed of the multiseed sweep: place with this seed, check
+/// legality, run preliminary STA on the placed netlist.
+///
+/// Route is NOT attempted: the fabric WireDb is empty on this base,
+/// so every seed is route-blocked by construction. `SeedResult::ok`
+/// and `SeedResult::fail` both record `route_status: "blocked"`;
+/// that hardcoding must change the day the routing graph lands.
+/// WNS here is a preliminary estimate (ballpark delays, see the
+/// `multiseed` module docs), not signoff timing.
+fn run_one_seed(
+    design: &Design,
+    packed: &helion_ultrascale::UltraPacked,
+    device: &UltraScaleDevice,
+    seed: u64,
+) -> SeedResult {
+    let t0 = std::time::Instant::now();
+    let placed = match place_ultra(
+        &packed.slices,
+        device,
+        &UltraPlaceOpts {
+            seed,
+            timing_weight: 0.0,
+        },
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            return SeedResult::fail(
+                seed,
+                t0.elapsed().as_secs_f64(),
+                format!("ULTRA PLACE: {e}"),
+            );
+        }
+    };
+    let limits = ControlSetLimits::default();
+    let violations = check_legality(&packed.slices, &placed.slices, device, &limits);
+    if !violations.is_empty() {
+        let mut msg = String::from("ULTRA LEGALITY: placement illegal:");
+        for v in &violations {
+            msg.push_str(&format!(" {v};"));
+        }
+        return SeedResult::fail(seed, t0.elapsed().as_secs_f64(), msg);
+    }
+    match sta_on_placed(design, packed, &placed) {
+        Ok(timing) => SeedResult::ok(
+            seed,
+            timing.wns_ps,
+            timing.tns_ps,
+            t0.elapsed().as_secs_f64(),
+        ),
+        Err(e) => SeedResult::fail(seed, t0.elapsed().as_secs_f64(), e),
+    }
+}
+
+/// Overnight multi-seed timing-closure sweep for an UltraScale+ part.
+///
+/// Port of the proof on fm/ultra-multiseed (e1c2e47): synth once,
+/// pack once (seed independent), then place plus preliminary STA per
+/// seed on a rayon pool sized by `jobs`, checkpointing each finished
+/// seed to `out_path` as JSONL under a file mutex so a killed run
+/// resumes where it stopped. Seeds already present in the file are
+/// skipped. Best-seed rule: highest WNS at or above `threshold`,
+/// tie-break lowest TNS then lowest seed.
+///
+/// Honest limits on this base: route is blocked for every seed
+/// (WireDb empty) and bitgen is not implemented, so no seed
+/// completes the full flow and no bitstream is produced. WNS is a
+/// preliminary estimate from `preliminary_xcvu3p` ballpark delays
+/// until the xcku3p delay DB exists (GAP-F5). The printed report
+/// says both, every run.
+pub fn run_multiseed(
+    path: &str,
+    part: &str,
+    n_seeds: u64,
+    seed_start: u64,
+    jobs: usize,
+    out_path: &str,
+    threshold: i64,
+) -> Result<(), String> {
+    if n_seeds == 0 {
+        return Err("multiseed: --seeds must be > 0".to_string());
+    }
+    if !is_ultra_part(part) {
+        return Err(format!(
+            "multiseed: part {part} is not an UltraScale+ part (xcku3p or xcvu3p)"
+        ));
+    }
+    let jobs = jobs.max(1);
+
+    // Synth once; pack once. Neither depends on the seed.
+    let design = super::synth_any(path)?;
+    let device = match part {
+        "xcku3p" => UltraScaleDevice::xcku3p(),
+        "xcvu3p" => UltraScaleDevice::xcvu3p(),
+        _ => return Err(format!("multiseed: unsupported part {part}")),
+    };
+    let fabric = match part {
+        "xcku3p" => FabricWithPlaceholders::xcku3p(),
+        _ => FabricWithPlaceholders::xcvu3p(),
+    };
+    let route_blocked = fabric.wires().wire_count() == 0;
+    let cells = extract_cells(&design)?;
+    let limits = ControlSetLimits::default();
+    let packed = pack_ultra(&cells.luts, &cells.ffs, &cells.carry_chains, &limits)
+        .map_err(|e| format!("ULTRA PACK: {e}"))?;
+    println!(
+        "multiseed: design={} part={} synth luts={} ffs={} carry_chains={} packed_slices={}",
+        path,
+        part,
+        cells.luts.len(),
+        cells.ffs.len(),
+        cells.carry_chains.len(),
+        packed.slices.len()
+    );
+
+    let completed = read_completed_seeds(out_path);
+    let seeds: Vec<u64> = (seed_start..seed_start + n_seeds)
+        .filter(|s| !completed.contains(s))
+        .collect();
+    println!(
+        "multiseed: design={} part={} seeds={}..{} jobs={} threshold_wns_ps={} ({} already done, {} to run) out={} route_blocked={} [WNS is a preliminary estimate from ballpark delays; route blocked until the routing graph lands]",
+        path,
+        part,
+        seed_start,
+        seed_start + n_seeds - 1,
+        jobs,
+        threshold,
+        completed.len(),
+        seeds.len(),
+        out_path,
+        route_blocked
+    );
+    if seeds.is_empty() {
+        println!("multiseed: nothing to run");
+    } else {
+        use std::io::Write;
+        use std::sync::Mutex;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(out_path)
+            .map_err(|e| format!("multiseed: cannot open {out_path}: {e}"))?;
+        let file = Mutex::new(file);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            .build()
+            .map_err(|e| format!("multiseed: cannot build thread pool: {e}"))?;
+        pool.install(|| {
+            use rayon::prelude::*;
+            seeds.par_iter().for_each(|&seed| {
+                let result = run_one_seed(&design, &packed, &device, seed);
+                let line = result.to_jsonl();
+                let mut f = file.lock().unwrap();
+                let _ = writeln!(f, "{line}");
+                let _ = f.flush();
+                eprintln!(
+                    "multiseed: seed={} status={} wns_ps={} tns_ps={} runtime_s={:.1} route={}",
+                    result.seed,
+                    result.status,
+                    result.wns_ps,
+                    result.tns_ps,
+                    result.runtime_s,
+                    result.route_status
+                );
+            });
+        });
+    }
+
+    // Report: re-read the full JSONL (checkpointed plus this run) so
+    // the best-seed decision is deterministic over everything on disk.
+    let mut results: Vec<SeedResult> = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(out_path) {
+        for line in text.lines() {
+            if let Some(r) = SeedResult::from_jsonl(line) {
+                results.push(r);
+            }
+        }
+    }
+    results.sort_by_key(|r| r.seed);
+    results.dedup_by_key(|r| r.seed);
+    let summary = summarize_multiseed(&results, threshold);
+    println!("{}", best_seed_line(&summary, threshold));
+    if let (Some(min), Some(max)) = (summary.min_wns_ps, summary.max_wns_ps) {
+        println!(
+            "multiseed: WNS range over ok seeds: min={} max={} ps ({} seeds) [preliminary estimate]",
+            min, max, summary.n_ok
+        );
+    }
+    Ok(())
 }
