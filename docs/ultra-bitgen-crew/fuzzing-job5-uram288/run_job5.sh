@@ -12,9 +12,9 @@
 # (or pass VARIANTS_DIR / PROBES_DIR to override those locations).
 #
 # Passes, in order:
-#   A. Attribute sweep: v000 (baseline) then v001..v034 in manifest
+#   A. Attribute sweep: v000 (baseline) then v001..v038 in manifest
 #      order, one Vivado batch run per variant, via
-#      run_uram_variant.tcl. 35 runs.
+#      run_uram_variant.tcl. 39 runs.
 #   B. Content probes: p000 (baseline, all zero) then p001..p012 in
 #      manifest order, one Vivado batch run per probe, via
 #      run_uram_content_probe.tcl. 13 runs. After p012, the driver
@@ -126,7 +126,7 @@ SITE="$(cat "$OUT_ROOT/site.txt")"
 echo "site: $SITE" >> "$RUNS_TXT"
 echo "fixed URAM site: $SITE"
 
-echo "=== pass A: attribute sweep (35 runs) ==="
+echo "=== pass A: attribute sweep (39 runs) ==="
 tail -n +2 "$VARIANTS_DIR/manifest.tsv" | while IFS="$(printf '\t')" read -r run_id attribute default variant verilog; do
   echo "=== $run_id ($attribute = $variant, default $default) ==="
   if ! run_one run_uram_variant.tcl "$run_id" "$PART" "$VARIANTS_DIR/$verilog" "$SITE" "$OUT_ROOT/$run_id"; then

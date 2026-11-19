@@ -14,6 +14,11 @@ layout:
     ...
     out_dir/manifest.tsv   (id, attribute, default, variant, verilog)
 
+There are 38 variants for 34 attributes: CASCADE_ORDER_A and
+CASCADE_ORDER_B have three variants each (FIRST, MIDDLE, LAST) and
+every other attribute has one. The table is the single source of
+truth for the count.
+
 The generator never edits a variant between runs: the same file is
 the input to every Vivado run for that id, so a diff between two runs
 can only come from the one attribute that differs.
@@ -79,9 +84,13 @@ EXPECTED_ATTRIBUTES = [
 
 # Port connections: identical in every variant. All inputs tied to
 # constants, all outputs unconnected, clock tied low. This is the
-# UG974 URAM288 port list: ADDR_A/B 23 bits, BWE_A/B 9 bits, DIN/DOUT
-# 72 bits, cascade ports tied low (a single URAM, no chain), enables
-# high, resets low, sleep low.
+# UG974 URAM288 port list. The ties match the branch's phase-1
+# template (docs/ultra-bitgen-crew/vivado-fuzzing/job5-uram/tcl/uram.v,
+# commit 013044f2) so the sweep baseline is the same design as the
+# phase-1 template with G_SIZE=1: BWE 0 (no byte lanes written),
+# RDB_WR 1, enables high. The RDB_WR polarity is not asserted here;
+# the tie is constant across all variants, so no sweep result
+# depends on it.
 PORTS = """        .CAS_OUT_ADDR_A(),
         .CAS_OUT_ADDR_B(),
         .CAS_OUT_BWE_A(),
@@ -110,8 +119,8 @@ PORTS = """        .CAS_OUT_ADDR_A(),
         .SBITERR_B(),
         .ADDR_A(23'b0),
         .ADDR_B(23'b0),
-        .BWE_A(9'h1FF),
-        .BWE_B(9'h1FF),
+        .BWE_A(9'b0),
+        .BWE_B(9'b0),
         .CAS_IN_ADDR_A(23'b0),
         .CAS_IN_ADDR_B(23'b0),
         .CAS_IN_BWE_A(9'b0),
@@ -143,8 +152,8 @@ PORTS = """        .CAS_OUT_ADDR_A(),
         .OREG_CE_B(1'b1),
         .OREG_ECC_CE_A(1'b1),
         .OREG_ECC_CE_B(1'b1),
-        .RDB_WR_A(1'b0),
-        .RDB_WR_B(1'b0),
+        .RDB_WR_A(1'b1),
+        .RDB_WR_B(1'b1),
         .RST_A(1'b0),
         .RST_B(1'b0),
         .SLEEP(1'b0)
@@ -229,9 +238,10 @@ def read_table(path):
     assert not missing, "table is missing attributes: %s" % ", ".join(missing)
     extra = [a for a in kinds if a not in EXPECTED_ATTRIBUTES]
     assert not extra, "table has unknown attributes: %s" % ", ".join(extra)
-    assert len(variants) == len(EXPECTED_ATTRIBUTES), (
-        "expected one variant per attribute, got %d variants for %d attributes"
-        % (len(variants), len(EXPECTED_ATTRIBUTES))
+    # 38 variants for 34 attributes: CASCADE_ORDER_A/B have three
+    # each (FIRST, MIDDLE, LAST), every other attribute has one.
+    assert len(variants) == 38, (
+        "expected 38 variants, got %d" % len(variants)
     )
     return kinds, values, variants
 
