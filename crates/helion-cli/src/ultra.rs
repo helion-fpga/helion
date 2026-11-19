@@ -658,6 +658,7 @@ fn run_one_seed(
     design: &Design,
     packed: &helion_ultrascale::UltraPacked,
     device: &UltraScaleDevice,
+    part: &str,
     seed: u64,
 ) -> UltraSeedRun {
     let t0 = std::time::Instant::now();
@@ -691,7 +692,7 @@ fn run_one_seed(
         run.placed_slices = placed_slices;
         return run;
     }
-    match sta_on_placed(design, packed, &placed) {
+    match sta_on_placed(design, packed, &placed, part) {
         Ok(timing) => UltraSeedRun {
             result: SeedResult::ok(
                 seed,
@@ -901,7 +902,7 @@ pub fn run_multiseed(
         pool.install(|| {
             use rayon::prelude::*;
             seeds.par_iter().for_each(|&seed| {
-                let run = run_one_seed(&design, &packed, &device, seed);
+                let run = run_one_seed(&design, &packed, &device, part, seed);
                 if let Some(dir) = log_dir_ref {
                     write_seed_log(dir, seed, part, &run, run.result.runtime_s);
                 }

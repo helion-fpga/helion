@@ -1021,33 +1021,6 @@ struct MultiseedArgs {
     retry_failed: bool,
 }
 
-fn parse_u64_flag(args: &[String], name: &str, default: u64) -> Result<u64, String> {
-    match take_flag(args, name) {
-        None => Ok(default),
-        Some(s) => s
-            .parse()
-            .map_err(|_| format!("multiseed: {name} must be a whole number, got {s:?}")),
-    }
-}
-
-fn parse_i64_flag(args: &[String], name: &str, default: i64) -> Result<i64, String> {
-    match take_flag(args, name) {
-        None => Ok(default),
-        Some(s) => s
-            .parse()
-            .map_err(|_| format!("multiseed: {name} must be a whole number, got {s:?}")),
-    }
-}
-
-fn parse_usize_flag(args: &[String], name: &str, default: usize) -> Result<usize, String> {
-    match take_flag(args, name) {
-        None => Ok(default),
-        Some(s) => s
-            .parse()
-            .map_err(|_| format!("multiseed: {name} must be a whole number, got {s:?}")),
-    }
-}
-
 /// Parse the multiseed flags. A numeric flag that is present but
 /// unparseable fails loud instead of silently falling back to its
 /// default: `--seeds abc` must never quietly become a 100-seed sweep.
