@@ -97,7 +97,7 @@ class Boundary:
 def boundary(rtl_files: list[str], top: str, plist: list) -> Boundary | None:
     """The PS7 the RTL's top module instantiates, or None (no PS7, or the
     RTL brings its own PS7 model)."""
-    text = "\n".join(re.sub(r"//[^\n]*", "", open(f).read()) for f in rtl_files)
+    text = "\n".join(re.sub(r"//[^\n]*|/\*.*?\*/", "", open(f).read(), flags=re.S) for f in rtl_files)
     if not plist or not re.search(r"\bPS7\b", text) or re.search(r"\bmodule\s+PS7\b", text):
         return None
     body = re.search(rf"\bmodule\s+{top}\b(.*?)\bendmodule\b", text, re.S)
@@ -143,6 +143,15 @@ def stub(plist: list) -> str:
 # in --axi-rw are read back next, with no write issued until that read
 # returns; a read is checked against what was written only when no write
 # was in flight from its address handshake to its last beat.
+#
+# Protocol checks: a BID/RID must match an outstanding transaction, RLAST
+# must mark the last beat, and BVALID/RVALID once raised must hold with the
+# same payload until BREADY/RREADY (a response the slave overwrites or
+# drops is lost on silicon). The masters stay idle while FCLKRESETN is low
+# and for RESET_QUIET cycles after (the slave's reset synchroniser), and
+# start nothing in the last DRAIN cycles, with BREADY/RREADY high: a write
+# or read still outstanding at the end never completes.
+RESET_QUIET = 4
 _DECL = """
 // ---- AXI3 master on @P
 reg @v_awvalid = 0, @v_wvalid = 0, @v_wlast = 0, @v_bready = 0, @v_arvalid = 0, @v_rready = 0;
@@ -161,13 +170,14 @@ reg [11:0] @v_s_bid, @v_s_rid; reg [1:0] @v_s_bresp, @v_s_rresp; reg [31:0] @v_s
 integer @v_n_aw = 0, @v_n_w = 0, @v_n_bok = 0, @v_n_berr = 0, @v_n_ar = 0, @v_n_rok = 0, @v_n_rerr = 0;
 integer @v_n_part = 0, @v_n_burst = 0, @v_n_b2b = 0, @v_n_rb = 0, @v_n_rbbad = 0, @v_n_perr = 0;
 integer @v_last_aw = -9, @v_last_ar = -9, @v_awfirst = -1, @v_arfirst = -1;
+reg @v_hb = 0, @v_hr = 0, @v_hrlast = 0; reg [11:0] @v_hbid = 0, @v_hrid = 0; reg [1:0] @v_hbresp = 0, @v_hrresp = 0; reg [31:0] @v_hrdata = 0;
 """
 
 _DECIDE = """
-    if (!rstn) begin
-      @v_won = 0; @v_aron = 0; @v_obn = 0; @v_orn = 0; @v_holdw = 0; @v_rbnext = 0;
+    if (!act) begin
+      @v_won = 0; @v_aron = 0; @v_obn = 0; @v_orn = 0; @v_holdw = 0; @v_rbnext = 0; @v_hb = 0; @v_hr = 0;
       for (i = 0; i < @n; i = i + 1) @v_known[i] = 0;
-    end else begin
+    end else if (!drain) begin
       if (!@v_won && !@v_holdw && @v_obn < 4 && rnd(8) != 0) begin
         @v_won = 1; @v_awpend = 1; @v_wbeat = 0;
         @v_wpool = @pick; @v_awaddr = @v_pool[@v_wpool]; @v_awid = $random(seed); @v_awfirst = -1;
@@ -183,13 +193,13 @@ _DECIDE = """
         @v_ardly = rnd(4) == 0 ? 1 + rnd(3) : 0;
       end
     end
-    @v_awvalid = rstn && @v_won && @v_awpend && @v_awdly == 0;
-    @v_wvalid = rstn && @v_won && @v_wbeat <= @v_awlen && @v_wdly == 0;
+    @v_awvalid = act && @v_won && @v_awpend && @v_awdly == 0;
+    @v_wvalid = act && @v_won && @v_wbeat <= @v_awlen && @v_wdly == 0;
     @v_wlast = @v_wbeat == @v_awlen;
-    @v_arvalid = rstn && @v_aron && @v_ardly == 0;
+    @v_arvalid = act && @v_aron && @v_ardly == 0;
     if (@v_awvalid && @v_awfirst < 0) @v_awfirst = k;
     if (@v_arvalid && @v_arfirst < 0) @v_arfirst = k;
-    @v_bready = rnd(4) != 0; @v_rready = rnd(4) != 0;
+    @v_bready = act && (drain || rnd(4) != 0); @v_rready = act && (drain || rnd(4) != 0);
 """
 
 _SAMPLE = """
@@ -199,7 +209,17 @@ _SAMPLE = """
 """
 
 _UPDATE = """
-    if (rstn) begin
+    if (act) begin
+      if (@v_hb && (!@v_s_bvalid || @v_s_bid !== @v_hbid || @v_s_bresp !== @v_hbresp)) begin
+        @v_n_perr = @v_n_perr + 1;
+        $fdisplay(fl, "error cycle %0d: @P BVALID dropped or B changed before BREADY (BID %h)", k, @v_hbid);
+      end
+      if (@v_hr && (!@v_s_rvalid || @v_s_rid !== @v_hrid || @v_s_rresp !== @v_hrresp || @v_s_rdata !== @v_hrdata || @v_s_rlast !== @v_hrlast)) begin
+        @v_n_perr = @v_n_perr + 1;
+        $fdisplay(fl, "error cycle %0d: @P RVALID dropped or R changed before RREADY (RID %h)", k, @v_hrid);
+      end
+      @v_hb = @v_s_bvalid && !@v_bready; @v_hbid = @v_s_bid; @v_hbresp = @v_s_bresp;
+      @v_hr = @v_s_rvalid && !@v_rready; @v_hrid = @v_s_rid; @v_hrresp = @v_s_rresp; @v_hrdata = @v_s_rdata; @v_hrlast = @v_s_rlast;
       if (@v_awvalid && @v_s_awready) begin
         @v_awpend = 0; @v_n_aw = @v_n_aw + 1;
         if (@v_awlen != 0) @v_n_burst = @v_n_burst + 1;
@@ -287,6 +307,11 @@ _UPDATE = """
 """
 
 _REPORT = """
+  if (@v_won || @v_aron || @v_obn != 0 || @v_orn != 0) begin
+    @v_n_perr = @v_n_perr + 1;
+    $fdisplay(fl, "error end: @P %0d writes and %0d reads outstanding after %0d cycles of draining (a lost or never-sent response hangs the PS)",
+              @v_obn + @v_won, @v_orn + @v_aron, @drain);
+  end
   $fdisplay(fl, "axi @P writes=%0d wbeats=%0d bokay=%0d berr=%0d partial=%0d reads=%0d rokay=%0d rerr=%0d bursts=%0d backtoback=%0d readbacks=%0d readbackbad=%0d protocol=%0d",
             @v_n_aw, @v_n_w, @v_n_bok, @v_n_berr, @v_n_part, @v_n_ar, @v_n_rok, @v_n_rerr, @v_n_burst, @v_n_b2b, @v_n_rb, @v_n_rbbad, @v_n_perr);
   for (i = 0; i < @n; i = i + 1) if (@v_mask[i] != 0) $fdisplay(fl, "rw @P %h readbacks=%0d", @v_pool[i], @v_nrb[i]);
@@ -318,6 +343,7 @@ def axi_tb(top: str, top_ports: list, b: Boundary, in_bits: list[str], clock: st
     n = max(1, len(in_bits))
     col = {bit: n - 1 - i for i, bit in enumerate(in_bits)}
     ref = lambda bit: f"dut.{bit}" if "." in bit else bit
+    drain = min(64, cycles // 4)
     decl, conn = [], []
     for p in top_ports:
         w = "" if p.width is None else f"[{p.hi}:{p.lo}] "
@@ -333,7 +359,7 @@ def axi_tb(top: str, top_ports: list, b: Boundary, in_bits: list[str], clock: st
         addrs, n_rw = pool(P, rw, seed + idx)
         # Half the addresses picked are --axi-rw registers, so most writes get read back.
         pick = f"(rnd(2) == 0 ? rnd({n_rw}) : rnd({len(addrs)}))" if n_rw else f"rnd({len(addrs)})"
-        sub = lambda t: t.replace("@pick", pick).replace("@v", v).replace("@d", d).replace("@P", P).replace("@n", str(len(addrs)))
+        sub = lambda t: t.replace("@pick", pick).replace("@drain", str(drain)).replace("@v", v).replace("@d", d).replace("@P", P).replace("@n", str(len(addrs)))
         blocks["decl"].append(sub(_DECL))
         for i, a in enumerate(addrs):
             blocks["init"].append(f"  {v}_pool[{i}] = 32'h{a:08x}; {v}_mask[{i}] = 32'h{rw.get(a, 0):08x}; "
@@ -362,7 +388,8 @@ module tb_axi;
 {top} dut({', '.join(conn)});
 integer fi, fs, fl, k, rc, i, j, p;
 integer seed = {seed};
-reg rstn;
+integer quiet = {RESET_QUIET};
+reg rstn, act, drain;
 reg [31:0] m;
 reg [{n}-1:0] vec;
 function integer rnd(input integer lim);
@@ -384,6 +411,9 @@ initial begin
   for (k = 0; k < {cycles}; k = k + 1) begin
     rc = $fscanf(fi, "%b", vec);
     rstn = vec[{col[b.resets[0]]}];
+    if (!rstn) quiet = {RESET_QUIET}; else if (quiet > 0) quiet = quiet - 1;
+    act = rstn && quiet == 0;
+    drain = k >= {cycles - drain};
 {j("decide")}
 {j("override")}
     $fwrite(fs, "%b\\n", vec);

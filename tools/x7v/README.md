@@ -73,12 +73,16 @@ The PS7 has no PL configuration bits (its tiles' pips into the interconnect
 are bitless always-on pseudo-pips), so x7v cuts the design at its pins.
 Extraction makes each normal-class PS7 output (`ps7_ports.json`: FCLK,
 FCLKRESETN, the AXI masters, EMIO, ...) a netlist input `PS7_<pin>` and each
-input a netlist output; an input with no driver at all (an unused port's
-clock, left unrouted) floats (`z`). Cosim gives the RTL a stub `PS7` with the
-same ports (outputs set by the testbench, inputs sampled), so both sides get
-one stimulus and every PS7 input (1,774 bits) and every pad output is compared
-twice per cycle. An input the RTL leaves unconnected must read 0 or float,
-never 1 (an unused interrupt on its interconnect default would be asserted).
+input a netlist output; an input with no driver at all floats (`z`). Cosim
+gives the RTL a stub `PS7` with the same ports (outputs set by the testbench,
+inputs sampled), so both sides get one stimulus and every PS7 input (1,774
+bits) and every pad output is compared twice per cycle. An input the RTL
+leaves unconnected must read 0: never 1 (an unused interrupt on its
+interconnect default would be asserted) and never float (an unused port's
+clock). Those tie checks are most of the samples (1,707 of the 1,782 bits
+per sample in examples/zedboard_ps7_axi.sv); the cosim line counts them
+apart. Only a bitstream with a PS7 boundary is co-simulated as one: any
+other takes the plain path, whatever its RTL says.
 
 The clock is the `create_clock ... [get_pins ps7/FCLKCLK[n]]` pin (else
 FCLKCLK[0]). FCLKRESETN is one active-low reset, pulsed like any reset
@@ -90,21 +94,38 @@ strobes, 2-4 beat bursts, the first eight words of the window, the `--axi-rw`
 registers and random words in it. Half the OKAY writes to an `--axi-rw`
 register are read back next, and a read with no write in flight from its
 address to its last beat must return what was written (under MASK). BID/RID
-must match an outstanding ID and RLAST the last beat. What the masters drove
-becomes the stimulus that both simulations replay. The `axi` check fails if
-no write or no read completes, on any readback mismatch or protocol error,
-and if an `--axi-rw` register is never read back. PS7 cosim runs on Icarus
-only (it tells an unconnected input by `z`); the S_AXI ports, interrupts
-and EMIO get the random walk.
+must match an outstanding ID, RLAST the last beat, and a raised BVALID or
+RVALID must hold with the same payload until READY (a slave that overwrites
+a held response loses it on silicon). The masters stay idle while
+FCLKRESETN is low and 4 cycles after (`RESET_QUIET`, the slave's reset
+synchroniser), start nothing in the last 64 cycles (`DRAIN`) with
+BREADY/RREADY high, and then no transaction may be outstanding: a response
+never sent hangs the PS. What the masters drove becomes the stimulus that
+both simulations replay. The `axi` check fails if no write or no read
+completes, on any readback mismatch or protocol error, and if an `--axi-rw`
+register is never read back. PS7 cosim runs on Icarus only (it tells an
+unconnected input by `z`); the S_AXI ports, interrupts and EMIO get the
+random walk.
+
+Cosim is bounded: a run of N cycles never sees a counter bit above
+log2(N) change from a start of 0, so a fault in such a bit's carry logic
+passes verify. examples/zedboard_ps7_axi.sv starts its counter at
+0xFFFF_FC00 so that every bit, LD7 (bit 26) included, changes in the first
+1,024 cycles; a counter that starts at 0 has its high bits compared only
+at their power-up value.
 
 `tests/ps7.py` builds examples/zedboard_ps7_axi.sv with zedbit (or takes
 `--bit`) and checks: no bit in a PS tile, none unexplained; extraction gives
 the BUFG FCLKCLK0, all 1,774 PS7 inputs as ports, 67 driven by the slave
-and the rest 0 or floating; verify PASS with random resets and with
-`--no-reset`. Negative controls, each FAIL: RDATA0 and RDATA1 swapped in the
-bitstream (their interconnect muxes exchange sources; cosim only, on those
-two bits), the IRQF2P0 tie pip removed (reads 1), and an RTL whose SCRATCH
-ignores WSTRB[1] (the readback check).
+and the rest 0; verify PASS with random resets and with `--no-reset`.
+Negative controls, each FAIL: RDATA0 and RDATA1 swapped in the bitstream
+(their interconnect muxes exchange sources; cosim only, on those two bits),
+the IRQF2P0 tie pip removed (reads 1), the MAXIGP1ACLK ground pip removed
+(floats), counter bit 26's carry LUT cleared (cosim, on LD7 and COUNTER
+reads), an RTL whose SCRATCH ignores WSTRB[1] (the readback check), and
+RTLs that take a new AW/W or AR while a B or R is held (the axi check:
+response changed before READY). Blinky, whose RTL names PS7 in a comment,
+verifies PASS.
 
 ## What `verify` checks
 
@@ -116,7 +137,7 @@ ignores WSTRB[1] (the readback check).
 | clocks | clock spine and leaf enables present for every used clock path (`clockcheck.py`) | clock never reaches flops |
 | extract | no undriven, multiply driven, or unmodelled logic | floating or shorted logic |
 | cosim | extracted netlist equals the RTL, cycle by cycle, random stimulus | wrong behaviour |
-| axi | (PS7 designs) the AXI masters' traffic completed, read back what it wrote, with no protocol error | none: proves the stimulus exercised the slave |
+| axi | (PS7 designs) the AXI masters' traffic completed (nothing outstanding after the drain), responses held until taken, read back what it wrote, no protocol error | the PS hangs on a lost response; wrong register contents |
 | io | I/O configuration equals the golden (Vivado) build, tile by tile | wrong standard, drive, pull, or a dead pin |
 
 ## Electrical model

@@ -6,13 +6,20 @@ register block on the PS7's M_AXI_GP0.
   FCLK clock from the XDC's get_pins, FCLKRESETN as one active-low reset).
 * On a Helion build of the design (zedbit, or --bit): no bit in the PS
   tiles and none unexplained; extraction cuts the design at the PS7 (FCLK
-  reaches the BUFG, every PS7 input is a port, an unused one reads 0 or
-  floats, never 1); verify passes with random resets and with --no-reset,
-  with AXI traffic that reads back what it wrote.
+  reaches the BUFG, every PS7 input is a port, an unused one reads 0,
+  port clocks included); verify passes with random resets and with
+  --no-reset, with AXI traffic that reads back what it wrote.
 * Negative controls, each must FAIL: two read-data bits swapped in the
   bitstream (their interconnect muxes exchange sources), an unused
-  interrupt input left on its mux default (1), and an RTL whose SCRATCH
-  ignores WSTRB[1] (caught by the readback check).
+  interrupt input left on its mux default (1), an unused port clock left
+  floating, counter bit 26 (LD7) with its carry LUT cleared (the design's
+  counter starts at 0xFFFF_FC00 so that every bit moves within the run),
+  an RTL whose SCRATCH ignores WSTRB[1] (caught by the readback check), and
+  RTLs that lose a write or read response by taking the next address while
+  it is held (caught by the axi check alone).
+* A design with no PS7 whose RTL names PS7 in a comment still verifies
+  (blinky, built with zedbit): only a bitstream with a PS7 boundary
+  co-simulates one.
 
     python3 tests/ps7.py [--work DIR] [--bit B]    # from tools/x7v; needs a release zedbit or --bit
 """
@@ -115,8 +122,8 @@ def main() -> int:
     assert sum(p.startswith("PS7_") for p in nl.ports_out) == 1774 and nl.ports_in["PS7_FCLKCLK0"] == "s_PS7_X0Y0__FCLKCLK0"
     used = {p for p in nl.ports_out if p.startswith("PS7_MAXIGP0") and nl.ports_out[p].startswith("s_")}
     ties = {nl.ports_out[p] for p in nl.ports_out if p.startswith("PS7_") and p not in used}
-    # The slave drives 67 inputs (ACLK, 6 handshakes, BID, RID, RDATA, BRESP, RRESP); the rest are tied or float.
-    assert len(used) == 67 and ties == {"1'b0", "1'bz"}, (len(used), ties)
+    # The slave drives 67 inputs (ACLK, 6 handshakes, BID, RID, RDATA, BRESP, RRESP); the rest are tied to 0.
+    assert len(used) == 67 and ties == {"1'b0"}, (len(used), ties)
     print("ps7: decode and extract ok")
 
     results = []
@@ -147,15 +154,61 @@ def main() -> int:
     results.append(not cos.ok and all("IRQF2P[0]" in it and "unconnected (0)" in it for it in cos.items[:20]))
     print(f"==> IRQF2P0 untied: {'FAIL as expected' if results[-1] else 'UNEXPECTED'}")
 
-    # SCRATCH byte 1 written whatever WSTRB[1] says: the readback check catches it.
-    mutant = os.path.join(work, "strobe_mutant.sv")
+    # An unused port clock with its ground pip removed floats.
+    t, w, src = mux_pip(ex, s.tile, pin_wire(ex, s, "MAXIGP1ACLK"))
+    floating = os.path.join(work, "clk_floating.bit")
+    rewrite(db, good, floating, [f"{t}.{w}.{src}"], [])
+    rep = run(db, work, "clk_floating", floating, SV, 300)
+    cos = next(c for c in rep.checks if c.name == "cosim")
+    results.append(not cos.ok and all("MAXIGP1ACLK" in it and "unconnected (0)" in it for it in cos.items[:20]))
+    print(f"==> MAXIGP1ACLK floating: {'FAIL as expected' if results[-1] else 'UNEXPECTED'}")
+
+    # LD7 (pad U14) is counter bit 26: clear the LUT on its flop's carry input.
+    ologic = re.search(r"s_(OLOGIC_X\d+Y\d+)__OQ", nl.ports_out["U14"]).group(1)
+    kind, sl, q = ex.pin_driver(ex.sites[ologic], "D1")
+    assert kind == "site" and q.endswith("Q"), (kind, sl, q)
+    feats = fasmio.to_fasm(dec.fasm())
+    sv = ex.sites[sl]
+    lut = [f for f in feats if f.startswith(f"{sv.tile}.{sv.fprefix}.{q[0]}LUT.INIT")]
+    assert len(lut) == 1, lut
+    cnt26 = os.path.join(work, "cnt26_lut0.bit")
+    rewrite(db, good, cnt26, lut, [])
+    rep = run(db, work, "cnt26_lut0", cnt26, SV, 1500)
+    cos = next(c for c in rep.checks if c.name == "cosim")
+    results.append(not cos.ok and any("U14" in it or "led[7]" in it for it in cos.items))
+    print(f"==> counter bit 26 carry LUT cleared ({lut[0]}): {'FAIL as expected' if results[-1] else 'UNEXPECTED'}")
+
+    # RTL mutants against the good bitstream; the axi check, which reads the
+    # RTL alone, must fail on each: SCRATCH byte 1 written whatever WSTRB[1]
+    # says (readback), and a held B or R overwritten by the next write or
+    # read (lost on silicon: the response changes before READY, and the
+    # first transaction never completes).
     src_text = open(SV).read()
-    assert src_text.count("if (w_strb[1]) scratch[15:8]") == 1
-    open(mutant, "w").write(src_text.replace("if (w_strb[1]) scratch[15:8]", "scratch[15:8]"))
-    rep = run(db, work, "strobe_mutant", good, mutant, 1500)
-    axi = next(c for c in rep.checks if c.name == "axi")
-    results.append(not axi.ok and axi_counts(rep)["readbackbad"] > 0 and any("returned" in it for it in axi.items))
-    print(f"==> SCRATCH ignores WSTRB[1]: {'FAIL as expected' if results[-1] else 'UNEXPECTED'}")
+    for name, old, new, want in [
+            ("strobe_mutant", "if (w_strb[1]) scratch[15:8]", "scratch[15:8]", "returned"),
+            ("b_overwrite", "assign do_write = aw_held & w_held & ~b_pend;", "assign do_write = aw_held & w_held;", "BVALID dropped or B changed"),
+            ("ar_overwrite", "assign arready = ~r_pend & ~rst;", "assign arready = ~rst;", "RVALID dropped or R changed")]:
+        assert src_text.count(old) == 1, old
+        mutant = os.path.join(work, f"{name}.sv")
+        open(mutant, "w").write(src_text.replace(old, new))
+        rep = run(db, work, name, good, mutant, 1500)
+        axi = next(c for c in rep.checks if c.name == "axi")
+        results.append(not axi.ok and any(want in it for it in axi.items))
+        print(f"==> {name}: {'FAIL as expected' if results[-1] else 'UNEXPECTED'}")
+
+    # Blinky has no PS7; its RTL saying "PS7" must not make cosim look for one.
+    blinky_sv = os.path.join(work, "zedboard_blinky.sv")
+    open(blinky_sv, "w").write("/* This design does not use the Zynq PS7. */\n" + open(os.path.join(REPO, "examples", "zedboard_blinky.sv")).read())
+    blinky = os.path.join(work, "blinky.bit")
+    if not os.path.exists(blinky):
+        subprocess.run([ZEDBIT, blinky_sv, os.path.join(REPO, "examples", "zedboard.xdc"), blinky, "zedboard_blinky"], cwd=work, check=True)
+    sim, cosim.RTL_SIM = cosim.RTL_SIM, "verilator"   # its counter has no reset or initial value
+    rep = verify.verify(db, "blinky_ps7_word", blinky, rtl=[blinky_sv], top="zedboard_blinky",
+                        xdc=os.path.join(REPO, "examples", "zedboard.xdc"), workdir=os.path.join(work, "x7v_blinky"), cycles=1000)
+    cosim.RTL_SIM = sim
+    print(rep.summary())
+    results.append(rep.ok)
+    print(f"==> blinky naming PS7 in a comment: {'PASS as expected' if results[-1] else 'UNEXPECTED'}")
 
     print(f"ps7: {sum(results)}/{len(results)} as expected ({work})")
     return 0 if all(results) else 1

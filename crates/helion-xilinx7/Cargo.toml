@@ -14,3 +14,8 @@ serde_json = { version = "1" }
 helion-sv = { workspace = true }
 helion-vhdl = { workspace = true }
 helion-zb-front = { workspace = true }
+
+# zedbit's XDC readers have unit tests; `cargo test` runs them.
+[[example]]
+name = "zedbit"
+test = true

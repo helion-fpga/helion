@@ -7,7 +7,7 @@ Checks, in order (each independent, all reported):
   clocks    clock-network enable rules (clockcheck.py)
   extract   netlist extraction found no undriven/multiply-driven/unmodelled logic
   cosim     extracted netlist equals the RTL, cycle by cycle, on random stimulus
-  axi       (PS7 designs) the AXI masters' traffic completed and read back what it wrote
+  axi       (PS7 designs) the AXI masters' traffic completed, held its responses and read back what it wrote
   io        I/O configuration equals the golden (Vivado) build's, tile by tile
 """
 from __future__ import annotations
@@ -107,8 +107,9 @@ def verify(db: Db, design: str, bitfile: str, rtl: list[str] | None = None, top:
         nv = os.path.join(wd, "netlist.v")
         open(nv, "w").write(netlist.to_verilog(nl))
         try:
+            # Only a bitstream with a PS7 boundary co-simulates one; any other takes the plain path.
             r = cosim.run(wd, rtl, top, xdc, nv, set(nl.ports_in), set(nl.ports_out), cycles=cycles, seed=seed,
-                          ps7_ports=ps7.ports(db))
+                          ps7_ports=ps7.ports(db) if n_ps else None)
             items = [f"cycle {k}: {b} rtl={x} bitstream={y}" for k, b, x, y in r.mismatches[:20]]
             items += [f"output {b} has no pad in the bitstream" for b in r.unmapped_outputs]
             # An input with no pad is one the design never reads (the RTL
@@ -116,7 +117,9 @@ def verify(db: Db, design: str, bitfile: str, rtl: list[str] | None = None, top:
             # up as output mismatches): reported, not a failure.
             items += [f"note: input {b} is unused (no pad in the bitstream)" for b in r.unmapped_inputs]
             rep.checks.append(Check("cosim", r.ok,
-                                    f"{r.compared} output samples over {cycles} cycles, {len(r.mismatches)} mismatches, "
+                                    f"{r.compared} output samples"
+                                    + (f" ({r.tie_checked} of them unconnected PS7 inputs, which must read 0)" if r.tie_checked else "")
+                                    + f" over {cycles} cycles, {len(r.mismatches)} mismatches, "
                                     f"{r.net_unknown} X/Z from bitstream, {r.rtl_unknown} RTL don't-care", items))
             if r.axi:
                 bad = r.axi_errors + ps7.axi_problems(r.axi)

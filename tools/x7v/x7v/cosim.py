@@ -368,6 +368,7 @@ class CosimResult:
     unmapped_outputs: list[str] = field(default_factory=list)
     unmapped_inputs: list[str] = field(default_factory=list)
     log: str = ""
+    tie_checked: int = 0                                   # of `compared`: unconnected PS7 inputs
     axi: list[str] = field(default_factory=list)          # AXI master summary (PS7 designs)
     axi_errors: list[str] = field(default_factory=list)   # its readback and protocol errors
 
@@ -503,10 +504,11 @@ def run(workdir: str, rtl_files: list[str], top: str, xdc: str, netlist_v: str,
             if nv == "-":
                 continue
             if rv == "z" and bitname0 in ps_in:
-                # A PS7 input the RTL leaves unconnected must read 0 (tied)
-                # or float (an unused port's clock, left unrouted): never 1.
+                # A PS7 input the RTL leaves unconnected must read 0: tied,
+                # never left on a mux default (1) or floating (a clock).
                 res.compared += 1
-                if nv not in "0z":
+                res.tie_checked += 1
+                if nv != "0":
                     res.mismatches.append((k, bitname, "unconnected (0)", nv))
                 continue
             if rv in "xu":

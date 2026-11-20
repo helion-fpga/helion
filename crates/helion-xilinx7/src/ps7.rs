@@ -10,11 +10,14 @@
 //! Ports come from X-Ray's `ps7_ports.json`, `normal` class only: those are
 //! the ports of the PS7 cell. The `mio` ports (MIO, DDR, PS_CLK, PS_PORB,
 //! PS_SRSTB) are the PS's own package pins, and the `test`/`debug` ones are
-//! not on the cell. Every `normal` input left unconnected is held at 0 in
-//! its INT tile, as Vivado's `processing_system7` wrapper ties them: an
-//! unrouted `IMUX` reads 1, which would raise all 16 PL-to-PS interrupts.
-//! An input on a `CLK` wire (a port's clock) has no ground there and is
-//! left unrouted: a clock that never toggles.
+//! not on the cell (they have no fabric path at all). Every `normal` input
+//! left unconnected is held at 0 in its INT tile: an unrouted `IMUX` reads
+//! 1, which would raise all 16 PL-to-PS interrupts. An input on a `CLK`
+//! wire (a port's clock) is grounded through `FAN_BOUNCE`/`FAN_ALT`/`GFAN`,
+//! as Vivado's board-preset PS7 build (2017.3) grounds all 21 unused ones.
+//! That build holds EMIOUART0RX/EMIOUART1RX at 1 instead: its wrapper
+//! connects them to 1 (UART idle), which an RTL that instantiates PS7 says
+//! by tying them to 1.
 
 use crate::db::parse::PpipKind;
 use crate::device::{default_db_root, Device};
@@ -173,7 +176,7 @@ pub fn int_wire(device: &Device, rq: &dyn RouteQuery, site: &str, pin: &str, out
 }
 
 /// FASM lines that hold every PS7 input not on a net: a constant net's
-/// value, else 0 (see the module doc; inputs on `CLK` wires excepted).
+/// value, else 0 (see the module doc).
 pub fn tie_lines(placed: &Placed7, nets: &[crate::route::RoutedNet7], device: &Device, rq: &dyn RouteQuery) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
     if placed.packed.ps7s.is_empty() {
@@ -189,11 +192,8 @@ pub fn tie_lines(placed: &Placed7, nets: &[crate::route::RoutedNet7], device: &D
                 continue;
             }
             let (int, w) = int_wire(device, rq, site, &pin, false).ok_or_else(|| format!("tie: {site}.{pin}: no INT-tile wire found"))?;
-            let value = tied.get(pin.as_str()).copied();
-            if w.starts_with("CLK") && value.is_none() {
-                continue;
-            }
-            lines.extend(crate::bram::tie_int(device, &routed, Vec::new(), &int, &w, value.unwrap_or(false), &format!("{site}.{pin}"), &pin)?);
+            let value = tied.get(pin.as_str()).copied().unwrap_or(false);
+            lines.extend(crate::bram::tie_int(device, &routed, Vec::new(), &int, &w, value, &format!("{site}.{pin}"), &pin)?);
         }
     }
     lines.sort();
@@ -402,8 +402,20 @@ mod tests {
         assert!(!has("INT_L_X18Y90.IMUX_L5."), "a connected input is the router's");
         let irq1 = int_wire(&dev, &x, SITE, "IRQF2P1", false).unwrap();
         assert!(!has(&format!("{}.{}.", irq1.0, irq1.1)), "a 1 is the INT tile's default");
-        assert!(!lines.iter().any(|l| l.contains(".CLK_L")), "port clocks stay unrouted");
-        // Every other input has its GFAN line: 1774 pins, 2 on nets, 1 at 1, 22 clocks.
+        // Every other IMUX input has its GFAN line: 1774 pins, 2 on nets (one a clock), 1 at 1, 21 unused clocks.
         assert_eq!(lines.iter().filter(|l| l.contains(".IMUX_L")).count(), 1774 - 2 - 1 - 21);
+        // The 21 unused port clocks are grounded exactly as in Vivado's PS7 build (zed_ps7.bit, 2017.3).
+        let clk: HashSet<&str> = lines.iter().filter(|l| l.contains(".CLK_L")).map(String::as_str).collect();
+        let vivado = [54, 62, 70, 78, 85, 86, 87, 88, 89, 105, 110, 117, 118, 121, 122, 127, 135, 139, 142, 146, 148];
+        let want: Vec<String> = vivado.iter().map(|y| format!("INT_L_X18Y{y}.CLK_L0.FAN_BOUNCE5")).collect();
+        assert_eq!(clk, want.iter().map(String::as_str).collect::<HashSet<_>>());
+        assert!(vivado.iter().all(|y| has(&format!("INT_L_X18Y{y}.FAN_ALT5.GFAN1")) && has(&format!("INT_L_X18Y{y}.GFAN1.GND_WIRE"))));
+        // A port clock tied to 0 is grounded the same way; to 1 it cannot be (no VCC default on CLK).
+        let mut t = placed.clone();
+        t.packed.ps7s[0].ties.push(("MAXIGP1ACLK".into(), false));
+        assert!(tie_lines(&t, &[], &dev, &x).unwrap().contains(&"INT_L_X18Y105.CLK_L0.FAN_BOUNCE5".to_string()));
+        t.packed.ps7s[0].ties.last_mut().unwrap().1 = true;
+        let e = tie_lines(&t, &[], &dev, &x).unwrap_err();
+        assert!(e.contains("MAXIGP1ACLK") && e.contains("tied to 1"), "{e}");
     }
 }

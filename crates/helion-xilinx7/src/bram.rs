@@ -334,14 +334,33 @@ pub(crate) fn tie_int(device: &Device, routed: &HashSet<(String, String)>, mut p
         if !device.ppips(&int_type).is_some_and(|ps| ps.iter().any(|p| p.name == default)) {
             return Err(format!("tie: {at} ({pin}) tied to 1, but {int}.{int_wire} does not read VCC by default"));
         }
-    } else {
-        let g = (0..2)
-            .find(|g| device.segbits(&int_type, &format!("{int_type}.{int_wire}.GFAN{g}")).is_some())
-            .ok_or_else(|| format!("tie: {at} ({pin}) tied to 0, but {int}.{int_wire} has no GFAN input"))?;
+    } else if let Some(g) = (0..2).find(|g| device.segbits(&int_type, &format!("{int_type}.{int_wire}.GFAN{g}")).is_some()) {
         path.push(format!("{int}.{int_wire}.GFAN{g}"));
         path.push(format!("{int}.GFAN{g}.GND_WIRE"));
+    } else {
+        let fan = ground_via_fan(device, routed, int, &int_wire)
+            .ok_or_else(|| format!("tie: {at} ({pin}) tied to 0, but {int}.{int_wire} has no GFAN input and no free FAN_BOUNCE path"))?;
+        path.extend(fan);
     }
     Ok(path)
+}
+
+/// Ground INT-tile wire `wire` of `int` that has no GFAN input (a `CLKn`)
+/// the way Vivado does: `wire <- FAN_BOUNCEk <- FAN_ALTk <- GFANg <-
+/// GND_WIRE`, FAN_BOUNCE5/GFAN1 first, else another path no routed net uses.
+pub(crate) fn ground_via_fan(device: &Device, routed: &HashSet<(String, String)>, int: &str, wire: &str) -> Option<Vec<String>> {
+    let ty = device.tile_by_name(int).and_then(|i| device.tile_type_name(i))?.to_string();
+    let has = |f: &str| device.segbits(&ty, &format!("{ty}.{f}")).is_some();
+    let free = |w: &str| !routed.contains(&(int.to_string(), w.to_string()));
+    for k in std::iter::once(5).chain((0..8).filter(|k| *k != 5)) {
+        for g in [1, 0] {
+            let (b, a) = (format!("FAN_BOUNCE{k}"), format!("FAN_ALT{k}"));
+            if has(&format!("{wire}.{b}")) && has(&format!("{a}.GFAN{g}")) && free(wire) && free(&b) && free(&a) {
+                return Some(vec![format!("{int}.{wire}.{b}"), format!("{int}.{a}.GFAN{g}"), format!("{int}.GFAN{g}.GND_WIRE")]);
+            }
+        }
+    }
+    None
 }
 
 /// Walk from a BRAM pin wire up to the INT-tile wire feeding it: the

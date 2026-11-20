@@ -86,8 +86,9 @@ proc ps7_axi_check {} {
 
     # IO PLL to M = 30. IO_PLL_CTRL 0xF8000108: PLL_FDIV [18:12] (the PLL
     # must be bypassed and put in reset before it changes); PLL_BYPASS_FORCE
-    # [4], PLL_BYPASS_QUAL [3] (0: bypass is FORCE's, 1: the strap's),
-    # PLL_PWRDWN [1], PLL_RESET [0].
+    # [4], PLL_BYPASS_QUAL [3] (QUAL 0: FORCE 0 enables the PLL, 1 bypasses
+    # it; QUAL 1, the reset value: FORCE 0 follows the strap, 1 bypasses
+    # regardless; Vivado's ps7_init field text), PLL_PWRDWN [1], PLL_RESET [0].
     ps7_rmw 0xF8000108 0x18 0x10            ;# QUAL = 0, FORCE = 1: bypassed
     ps7_rmw 0xF8000108 0x01 0x01            ;# RESET = 1
     # IO_PLL_CFG 0xF8000118: LOCK_CNT [21:12] = 325, PLL_CP [11:8] = 2,
@@ -116,7 +117,8 @@ proc ps7_axi_check {} {
     ps7_rmw 0xF8000170 0x03F03F30 [expr {(1 << 20) | (10 << 8)}]
     echo "FPGA0_CLK_CTRL [ps7_hex [ps7_rd 0xF8000170]]: FCLK0 = 33.333 MHz x 30 / 10 / 1 = 100 MHz if PS_CLK is 33.333 MHz"
     # FPGA0_THR_CTRL 0xF8000174, reset 0: bit 2 "Must be set to 1'b1 to use
-    # this feature" (clock throttling); nothing here sets it.
+    # this feature" (clock throttling); nothing here sets it, nor does
+    # Vivado's ps7_init. Unconfirmed against the TRM field table: read only.
     set thr [ps7_rd 0xF8000174]
     ps7_result [expr {($thr & 4) == 0}] "FCLK0 not throttled (FPGA0_THR_CTRL [ps7_hex $thr])"
 

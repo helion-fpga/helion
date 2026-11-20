@@ -11,6 +11,9 @@
 //   0x4000_0000  MAGIC    read-only, 0x484C_0701 ("HL", rung 7, version 1)
 //   0x4000_0004  SCRATCH  read-write, WSTRB byte enables, reset 0
 //   0x4000_0008  COUNTER  read-only, FCLK cycles (free-running, no reset)
+//                         from 0xFFFF_FC00 at configuration, so every bit
+//                         changes within 1,024 cycles and a short
+//                         simulation exercises the whole carry chain
 //   0x4000_000C  LEDS     read-write, bits [6:0] drive LD0..LD6 (WSTRB[0]),
 //                         reset 0; LD7 is a heartbeat (COUNTER bit 26,
 //                         about 0.75 Hz at 100 MHz), alive as soon as FCLK
@@ -28,11 +31,10 @@
 // read: the GP0 master never interleaves write data.
 //
 // Unused PS7 pins are left unconnected. Helion ties every unconnected PS7
-// fabric input to 0 (interrupts, the other AXI ports' handshakes, EMIO
-// inputs, DDRARB, FCLKCLKTRIGN, ...), as Vivado's processing_system7
-// wrapper does, and leaves the clock inputs of unused ports unrouted (a
-// clock that never toggles); the INT-tile default of 1 would otherwise
-// assert all 16 PL interrupts. MIO, DDR, PS_CLK, PS_PORB and PS_SRSTB are
+// fabric input to 0 (interrupts, the other AXI ports' handshakes and
+// clocks, EMIO inputs, DDRARB, FCLKCLKTRIGN, ...), as Vivado's PS7 build
+// does; the INT-tile default of 1 would otherwise assert all 16 PL
+// interrupts. MIO, DDR, PS_CLK, PS_PORB and PS_SRSTB are
 // the PS's dedicated package pins, configured by the boot code, not the
 // bitstream: they are not connected here.
 //
@@ -94,7 +96,7 @@ module zedboard_ps7_axi (
     logic rst;
     assign rst = ~rst_s2;
 
-    logic [31:0] cnt = 32'd0;
+    logic [31:0] cnt = 32'hFFFF_FC00;
     always_ff @(posedge clk) cnt <= cnt + 32'd1;
 
     logic [31:0] scratch;
