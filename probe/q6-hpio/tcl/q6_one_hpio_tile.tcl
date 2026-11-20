@@ -60,7 +60,20 @@ proc q6_main { fpga_part xdc_file verilog_file bitstream_out } {
 
   set_property BITSTREAM.GENERAL.COMPRESS FALSE [current_design]
   set_property BITSTREAM.GENERAL.CRC DISABLE [current_design]
-  write_bitstream -force -logic_location_file ${bitstream_out}
+  write_bitstream -force -raw_bitfile -logic_location_file ${bitstream_out}
+
+  # Fail loud if any documented output is missing: the .rbt is the
+  # ASCII bitstream for diffing (step 3) and the .ll is the ground
+  # truth for the FAR reading (step 2). Same shape as the DSP
+  # branch's run_dsp_variant.tcl.
+  set rbt_out [string map {.bit .rbt} ${bitstream_out}]
+  set ll_out [string map {.bit .ll} ${bitstream_out}]
+  foreach out_file [list ${bitstream_out} ${rbt_out} ${ll_out}] {
+    if { ![file exists ${out_file}] } {
+      puts "ERROR: missing output ${out_file}"
+      exit 1
+    }
+  }
   puts "Q6 step 2 bitstream written to ${bitstream_out}"
 }
 

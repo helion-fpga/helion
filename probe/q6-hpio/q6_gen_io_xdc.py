@@ -16,7 +16,11 @@ golden IOBs (IOB_X0Y0 IN, IOB_X0Y1 OUT) per tile. If row 0 has only
 one HPIO tile, only one tile is probed and the script says so; if a
 chosen IOB site has no package pin in the inventory, the script fails
 loud naming the site instead of emitting a constraint it cannot
-ground.
+ground. The script also refuses an inventory with zero HPIO_RIGHT
+tiles: step 1 said STOP in that case (HPIO_L only, or neither type),
+so generating step 2 inputs from it would probe the wrong tile type.
+Run q6_check_step1.py first and only proceed when it says
+HPIO_RIGHT exists.
 
 Usage:
 
@@ -93,6 +97,14 @@ def iob_sites(tile):
 
 def generate(inventory_path):
     part, tiles = parse_inventory(inventory_path)
+    hpio_right = [t for t in tiles if t["tile_type"] == "HPIO_RIGHT"]
+    if not hpio_right:
+        raise ValueError(
+            "no HPIO_RIGHT tile in the inventory for part %s; step 1 "
+            "said STOP (HPIO_L only, or neither type), so no step 2 "
+            "inputs are generated. Run q6_check_step1.py and escalate "
+            "instead of probing HPIO_L tiles" % part
+        )
     row0 = row0_hpio_tiles(tiles)
     if not row0:
         raise ValueError(
