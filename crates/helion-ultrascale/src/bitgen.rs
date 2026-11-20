@@ -1070,7 +1070,10 @@ fn is_lut_ff_table_feature(feature: &str) -> bool {
 
 /// Placed bits for one LUT INIT / FF INIT / FF SRVAL entry on a SLICE
 /// tile off Y0, resolved through the BitFiltrator Y_ofst tables in
-/// `bitloc.rs` (F1). Returns `Ok(None)` when the entry is not such a
+/// `bitloc.rs` (F1). Public so the `helion-bitgen` binary's `bits`
+/// subcommand resolves parse-back LUT/FF lines through the same
+/// tables the emit side uses, instead of re-resolving them through
+/// segbits at Y0. Returns `Ok(None)` when the entry is not such a
 /// feature, when the slice sits at `y_ofst` 0, or when the segbits DB
 /// carries no entry for the feature: the tables supply positions, but
 /// the DB still decides which features exist, so a design against an
@@ -1086,7 +1089,7 @@ fn is_lut_ff_table_feature(feature: &str) -> bool {
 /// types also falls through to segbits: the tables have no row for
 /// it, and failing loud there would break device files that resolve
 /// SLICE tiles to a type this crate does not know yet.
-fn lut_ff_table_placed_bits(
+pub fn lut_ff_table_placed_bits(
     tile: &str,
     tile_type: &str,
     entry: &FasmEntry,
