@@ -75,6 +75,8 @@ proc q6_emit_inventory { fpga_part out_path } {
 if { [llength $::argv] != 2 } {
   puts "received mandatory args: $::argv"
   puts "expected mandatory args: <fpga_part> <inventory_out>"
+  puts "ERROR: wrong argument count, no inventory written"
+  exit 1
 } else {
   set fpga_part [lindex $::argv 0]
   set out_path [lindex $::argv 1]

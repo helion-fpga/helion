@@ -199,6 +199,16 @@ class GenIoXdcTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_hpio_l_only_generator_refuses(self):
+        path = write_fixture(HPIO_L_FIXTURE)
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                q6_gen_io_xdc.generate(path)
+            self.assertIn("HPIO_RIGHT", str(ctx.exception))
+            self.assertIn("STOP", str(ctx.exception))
+        finally:
+            os.unlink(path)
+
     def test_no_row0_hpio_fails_loud(self):
         path = write_fixture(HPIO_L_FIXTURE.replace("X0Y0", "X0Y1"))
         try:
