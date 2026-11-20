@@ -329,6 +329,12 @@ impl IntTileWireDb {
                 fanout[b as usize].push(a);
             }
         }
+        // Sort each fanout list by WireId so A-star expansion order,
+        // and therefore tie-breaking, is deterministic. The PIP table
+        // above is a HashMap, so insertion order varies run to run.
+        for outs in fanout.iter_mut() {
+            outs.sort_unstable();
+        }
         Ok(Self {
             tiles: tiles.to_vec(),
             tile_by_name,
