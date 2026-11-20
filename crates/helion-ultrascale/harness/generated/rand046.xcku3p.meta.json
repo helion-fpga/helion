@@ -1,0 +1,62 @@
+{
+  "class": "bram",
+  "design": "rand046",
+  "fasm_sha256": "5d30bd8a5d079c50f775c586f21cbd99c5bcad3981a17b487d13c42a3dc2d170",
+  "notes": "INT/HPIO tile X is the logical CLB column index, not a verified Vivado tile X (no xcku3p tilegrid in any public DB).",
+  "part": "xcku3p",
+  "placement_hash": "6788dad2733a534f45c923b6063d04fd765eb2ece3ac5e5f94c5c500593eb124",
+  "provisional_tiles": [
+    "INT_X20Y0",
+    "INT_X70Y0",
+    "INT_X87Y0",
+    "HPIO_RIGHT_X0Y0"
+  ],
+  "seed": 20261165,
+  "sites": [
+    {
+      "bel": "D6LUT",
+      "role": "lut",
+      "tile": "SLICE_X35Y43"
+    },
+    {
+      "bel": "F6LUT",
+      "role": "lut",
+      "tile": "SLICE_X35Y43"
+    },
+    {
+      "bel": "G6LUT",
+      "role": "lut",
+      "tile": "SLICE_X35Y43"
+    },
+    {
+      "bel": "E6LUT",
+      "role": "lut",
+      "tile": "SLICE_X65Y82"
+    },
+    {
+      "bel": "EFF",
+      "role": "ff",
+      "tile": "SLICE_X65Y82"
+    },
+    {
+      "bel": "HFF",
+      "role": "ff",
+      "tile": "SLICE_X65Y82"
+    },
+    {
+      "bel": "BFF",
+      "role": "ff",
+      "tile": "SLICE_X65Y82"
+    },
+    {
+      "bel": "AFF",
+      "role": "ff",
+      "tile": "SLICE_X65Y82"
+    },
+    {
+      "bel": "RAMB18E2",
+      "role": "bram",
+      "tile": "RAMB18_X5Y92"
+    }
+  ]
+}
