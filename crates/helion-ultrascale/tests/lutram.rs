@@ -119,7 +119,7 @@ fn lutram_placed_bits_share_lut_init_locations() {
             }
             // Values follow the INIT word, bit 0 = LSB.
             assert_eq!(ram[0].value, GOLDEN_INIT & 1 == 1);
-            assert_eq!(ram[63].value, GOLDEN_INIT >> 63 & 1 == 1);
+            assert_eq!(ram[63].value, (GOLDEN_INIT >> 63) & 1 == 1);
         }
     }
     assert_eq!(Block::Lutram.name(), "LUTRAM");
@@ -365,14 +365,14 @@ fn lutram_segbits_init_matches_lutloc_y0() {
         for lut in 0..8 {
             let letter = (b'A' + lut) as char;
             let locs = lut_locations(tile, 0, lut).unwrap();
-            for bit in 0..64 {
+            for (bit, loc) in locs.iter().enumerate() {
                 let refs = db
                     .lookup(tile_name, &format!("{letter}LUT.INIT[{bit}]"))
                     .unwrap_or_else(|| panic!("{tile_name}.{letter}LUT.INIT[{bit}] missing"));
                 assert_eq!(refs.len(), 1);
                 assert!(!refs[0].must_be_zero);
-                assert_eq!(refs[0].frame, locs[bit].minor, "minor mismatch");
-                assert_eq!(refs[0].bit as u32, locs[bit].frame_ofst, "offset mismatch");
+                assert_eq!(refs[0].frame, loc.minor, "minor mismatch");
+                assert_eq!(refs[0].bit as u32, loc.frame_ofst, "offset mismatch");
                 checked += 1;
             }
         }
