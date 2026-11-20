@@ -20,10 +20,12 @@ from reference import MissingReference, Tier1Reference
 import sweep
 from sweep import (
     FF_CONTROL_FEATURES, Geometry, Item, actual_emit_count,
-    bram_code_value, bram_pos_to_bit, code_of_index, diff_item_int,
-    emitted_int_keys, enum_carry8, enum_int, enum_io, lut_code_value,
-    lut_pos_to_bit, pack_mode_a, pack_mode_b, ref_int_keys,
-    verify_bram_disjoint, verify_lut_disjoint,
+    bram_code_value, bram_pos_to_bit, code_of_index, cross_block_check,
+    diff_emit, diff_item_int, emitted_int_keys, enum_pairs,
+    int_tile_items, lut_code_value, lut_pos_to_bit, make_pair_item,
+    pack_mode_a, pack_mode_b, pair_stats, ref_int_keys,
+    resolve_item, verify_bram_disjoint, verify_lut_disjoint,
+    enum_carry8, enum_int, enum_io,
 )
 
 
@@ -231,6 +233,168 @@ class TestSummaryCounting(unittest.TestCase):
             self.skipTest("full sweep jsonl not present in this checkout")
         records = [json.loads(line) for line in open(jsonl) if line.strip()]
         self.assertEqual(actual_emit_count(records), 153)
+
+
+class TestPairSweep(unittest.TestCase):
+    def setUp(self):
+        self.ref = Tier1Reference()
+        self.geom = Geometry(self.ref, "xcku3p")
+
+    def _item(self, key, group, ref_bits):
+        return Item("TEST", key, group, "TILE." + key, ref_bits,
+                    {"kind": "test"})
+
+    def test_pair_stats_classifies_agree_contra_disjoint(self):
+        # a/b share one bit, both want 1: agree. a/c share one bit,
+        # 1 vs 0: contra. d shares nothing: no pair.
+        a = self._item("a", (0, 0, 5), {(0x500, 10): 1, (0x500, 11): 0})
+        b = self._item("b", (0, 0, 5), {(0x500, 10): 1, (0x501, 3): 1})
+        c = self._item("c", (0, 0, 5), {(0x500, 11): 1})
+        d = self._item("d", (0, 0, 5), {(0x502, 0): 1})
+        agree, contra = pair_stats([a, b, c, d])
+        self.assertEqual(len(agree), 1)
+        self.assertEqual(agree[0][0].key, "a")
+        self.assertEqual(agree[0][1].key, "b")
+        self.assertEqual(len(contra), 1)
+        self.assertEqual(contra[0][0].key, "a")
+        self.assertEqual(contra[0][1].key, "c")
+
+    def test_make_pair_item_merges_refs_and_resolves(self):
+        feats = int_tile_items(self.ref, "xcku3p", 0, 0)
+        agree, _contra = pair_stats(feats)
+        a, b, _shared = agree[0]
+        pair = make_pair_item(a, b)
+        self.assertEqual(pair.fasm.count("\n"), 1)
+        self.assertEqual(pair.feat_keys,
+                         frozenset({a.key, b.key}))
+        merged = resolve_item(self.ref, "xcku3p", pair)
+        expected = dict(resolve_item(self.ref, "xcku3p", a))
+        for pos, val in resolve_item(self.ref, "xcku3p", b).items():
+            if pos in expected:
+                self.assertEqual(expected[pos], val)
+            else:
+                expected[pos] = val
+        self.assertEqual(merged, expected)
+
+    def test_make_pair_item_contradictory_raises(self):
+        a = self._item("a", (0, 0, 5), {(0x500, 10): 1})
+        c = self._item("c", (0, 0, 5), {(0x500, 10): 0})
+        with self.assertRaises(AssertionError):
+            make_pair_item(a, c)
+
+    def test_packer_excludes_shared_feature(self):
+        # Two pair items sharing feature b must not share an emit:
+        # the real emitter fails loud on the duplicated FASM line.
+        a = self._item("a", (0, 0, 5), {(0x500, 10): 1})
+        b = self._item("b", (0, 0, 5), {(0x500, 11): 1})
+        c = self._item("c", (0, 0, 5), {(0x500, 12): 1})
+        p1 = make_pair_item(a, b)
+        p2 = make_pair_item(b, c)
+        emits = pack_mode_a("TEST", [p1, p2], 100)
+        self.assertEqual(len(emits), 2)
+        # Disjoint pair items share an emit.
+        d = self._item("d", (0, 0, 5), {(0x500, 13): 1})
+        p3 = make_pair_item(c, d)
+        emits = pack_mode_a("TEST", [p1, p3], 100)
+        self.assertEqual(len(emits), 1)
+
+    def test_emit_lines_count_pair_fasm_lines(self):
+        a = self._item("a", (0, 0, 5), {(0x500, 10): 1})
+        b = self._item("b", (0, 0, 5), {(0x500, 11): 1})
+        pair = make_pair_item(a, b)
+        from sweep import Emit
+        emit = Emit("TEST", 0)
+        emit.add(pair)
+        self.assertEqual(emit.lines, 2)
+        emit.add(a)
+        self.assertEqual(emit.lines, 3)
+
+    def test_cross_block_check_zero(self):
+        stats = cross_block_check(self.ref, "xcku3p", self.geom)
+        self.assertEqual(stats["cross_block_pairs"], 0)
+
+    def test_diff_emit_with_pair_items(self):
+        # One INT agree pair on INT_X0Y0, diffed against a hand-written
+        # bits file holding exactly its set bits. (Same-tile INT agree
+        # pairs conflict with each other through must-be-0 bits, so
+        # two of them never share an emit; the packer splits them.)
+        import tempfile
+        from sweep import Emit
+        feats = int_tile_items(self.ref, "xcku3p", 0, 0)
+        agree, _contra = pair_stats(feats)
+        self.assertEqual(len(agree), 25)
+        p1 = make_pair_item(agree[0][0], agree[0][1])
+        emit = Emit("INT_PIP", 0)
+        emit.add(p1)
+        set_bits = set()
+        for (far, off), val in resolve_item(
+                self.ref, "xcku3p", p1).items():
+            if val == 1:
+                set_bits.add((far, off))
+        with tempfile.TemporaryDirectory() as tmp:
+            bits_path = os.path.join(tmp, "bits.txt")
+            with open(bits_path, "w") as f:
+                for (far, off) in sorted(set_bits):
+                    f.write("0x%08x %d 1 INT_PIP\n" % (far, off))
+            records = []
+            green, red, extra = diff_emit(
+                self.ref, "xcku3p", emit, bits_path, records)
+            self.assertEqual((green, red, extra), (1, 0, 0))
+            # Dropping one set bit turns the pair red.
+            dropped = sorted(set_bits)[0]
+            set_bits.discard(dropped)
+            with open(bits_path, "w") as f:
+                for (far, off) in sorted(set_bits):
+                    f.write("0x%08x %d 1 INT_PIP\n" % (far, off))
+            records = []
+            green, red, extra = diff_emit(
+                self.ref, "xcku3p", emit, bits_path, records)
+            self.assertEqual((green, red, extra), (0, 1, 0))
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["status"], "red")
+
+
+class TestEnumPairs(unittest.TestCase):
+    def setUp(self):
+        self.ref = Tier1Reference()
+        self.geom = Geometry(self.ref, "xcku3p")
+
+    def test_enum_pairs_headline_counts(self):
+        pair_items, stats, contra_samples = enum_pairs(
+            self.ref, "xcku3p", self.geom)
+        # FF: 32 distinct agree types, one instance per tile type.
+        self.assertEqual(stats["FF_INIT"]["agree_types"], 32)
+        self.assertEqual(stats["FF_INIT"]["agree_swept"], 128)
+        self.assertEqual(stats["FF_INIT"]["contra_types"], 48)
+        # CARRY8: 24 types x 4 tile types.
+        self.assertEqual(stats["CARRY8"]["agree_types"], 24)
+        self.assertEqual(stats["CARRY8"]["agree_swept"], 96)
+        self.assertEqual(stats["CARRY8"]["contra_types"], 15)
+        # LUTRAM: 52 types x 2 tile types.
+        self.assertEqual(stats["LUTRAM"]["agree_types"], 52)
+        self.assertEqual(stats["LUTRAM"]["agree_swept"], 104)
+        self.assertEqual(stats["LUTRAM"]["contra_types"], 26)
+        # INT: 25 genuine PIP pairs, kept on 8 tiles.
+        self.assertEqual(stats["INT_PIP"]["agree_types"], 25)
+        self.assertEqual(stats["INT_PIP"]["agree_swept"], 200)
+        self.assertEqual(stats["INT_PIP"]["contra_types"], 8747)
+        # IO: 3976 pairs, one per (shared set, site pair).
+        self.assertEqual(stats["IO_CONFIG"]["agree_instances"], 3976)
+        self.assertEqual(stats["IO_CONFIG"]["agree_swept"], 119)
+        self.assertEqual(stats["IO_CONFIG"]["subset_groups"], 119)
+        self.assertEqual(stats["IO_CONFIG"]["contra_types"], 33844)
+        # LUT/BRAM: analytic zero.
+        for block in ("LUT_INIT", "BRAM_CONTENT", "BRAM_PARITY"):
+            self.assertEqual(stats[block]["agree_swept"], 0)
+        # Cross-block: zero.
+        self.assertEqual(stats["CROSS_BLOCK"]["cross_block_pairs"], 0)
+        # Total pair items swept.
+        self.assertEqual(len(pair_items),
+                         128 + 96 + 104 + 200 + 119)
+        # Contra samples exist for the swept blocks.
+        for block in ("FF_INIT", "CARRY8", "LUTRAM", "INT_PIP",
+                      "IO_CONFIG"):
+            self.assertEqual(len(contra_samples[block]), 4)
 
 
 class TestEnumerationScopes(unittest.TestCase):
