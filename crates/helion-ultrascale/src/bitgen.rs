@@ -103,8 +103,10 @@
 //!   bitstreams whose DB coverage is incomplete.
 
 use crate::bitloc::{
-    BRAM_MEM_BITS, BRAM_PARITY_BITS, BitLoc, BitLocError, PlacedBit, bram_mem_locations,
-    bram_mem_placed_bits, bram_parity_locations, bram_parity_placed_bits,
+    BRAM_MEM_BITS, BRAM_PARITY_BITS, BitLoc, BitLocError, ClbTileType, LutMode,
+    NUM_CLB_PER_COLUMN, PlacedBit, bram_mem_locations, bram_mem_placed_bits,
+    bram_parity_locations, bram_parity_placed_bits, ff_fasm_name, ff_location, ff_placed_bit,
+    ff_srval_location, ff_srval_placed_bit, lut_fasm_name, lut_locations, lut_placed_bits,
 };
 use crate::segbits::{BitRef, SegbitsDb};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -798,6 +800,459 @@ pub fn parse_bram_tile(tile: &str) -> Option<(u32, u32)> {
     Some((x, y))
 }
 
+/// Parse `SLICE_X<x>Y<y>` into (x, y).
+pub fn parse_slice_tile(tile: &str) -> Option<(u32, u32)> {
+    let rest = tile.strip_prefix("SLICE_X")?;
+    let (x_text, y_text) = rest.split_once('Y')?;
+    let x: u32 = x_text.parse().ok()?;
+    let y: u32 = y_text.parse().ok()?;
+    Some((x, y))
+}
+
+// ---------------------------------------------------------------------------
+// LUT/FF INIT through the BitFiltrator Y_ofst tables (F1)
+// ---------------------------------------------------------------------------
+
+/// One LUT INIT / FF INIT / FF SRVAL feature spelling on a SLICE tile.
+/// LUT letters are A..H (index 0..8); FF Bel names are AFF..HFF2
+/// (index 0..16, see `bitloc::ff_fasm_name`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LutFfFeature {
+    /// `X6LUT.INIT[63:0]` (whole 64-bit INIT value).
+    LutWhole(u8),
+    /// `XLUT.INIT[i]` (one INIT bit, the vendored DB's per-bit spelling).
+    LutBit(u8, u8),
+    /// `XFF.INIT.V0` / `.V1`; the bool is the INIT value (V1 is 1).
+    FfInitV(u8, bool),
+    /// `XFF.SRVAL.V0` / `.V1`; the bool is the SRVAL value (V1 is 1).
+    FfSrvalV(u8, bool),
+    /// `XFF.INIT` with a value (the CLI rewrites this to `.V0`/`.V1`
+    /// before emit; the library accepts the valued spelling directly).
+    FfInitValued(u8),
+    /// `XFF.SRVAL` with a value.
+    FfSrvalValued(u8),
+}
+
+/// Parse a LUT INIT / FF INIT / FF SRVAL feature spelling. Returns None
+/// for every other feature (LUTRAM mode lines, FF control attributes,
+/// CARRY8, PIPs, and so on), which keep resolving through segbits.
+fn parse_lut_ff_feature(feature: &str) -> Option<LutFfFeature> {
+    let b = feature.as_bytes();
+    // Grouped LUT INIT: `X6LUT.INIT[63:0]` (16 chars, letter A..H).
+    if feature.len() == 16
+        && (b'A'..=b'H').contains(&b[0])
+        && &feature[1..] == "6LUT.INIT[63:0]"
+    {
+        return Some(LutFfFeature::LutWhole(b[0] - b'A'));
+    }
+    let mut parts = feature.split('.');
+    let bel = parts.next()?;
+    let attr = parts.next()?;
+    // Per-bit LUT INIT: `XLUT.INIT[i]`.
+    if bel.len() == 4
+        && (b'A'..=b'H').contains(&bel.as_bytes()[0])
+        && &bel[1..] == "LUT"
+        && parts.next().is_none()
+    {
+        let inner = attr
+            .strip_prefix("INIT[")
+            .and_then(|s| s.strip_suffix(']'))?;
+        if !inner.is_empty() && inner.bytes().all(|c| c.is_ascii_digit()) {
+            if let Ok(bit) = inner.parse::<u8>() {
+                if bit < 64 {
+                    return Some(LutFfFeature::LutBit(bel.as_bytes()[0] - b'A', bit));
+                }
+            }
+        }
+        return None;
+    }
+    // FF INIT / SRVAL: `XFF[.V0|.V1]` or `XFF2[.V0|.V1]`, where the
+    // optional V suffix names the attribute value.
+    if !(3..=4).contains(&bel.len())
+        || !(b'A'..=b'H').contains(&bel.as_bytes()[0])
+        || (&bel[1..] != "FF" && &bel[1..] != "FF2")
+    {
+        return None;
+    }
+    if attr != "INIT" && attr != "SRVAL" {
+        return None;
+    }
+    let ff_index = (bel.as_bytes()[0] - b'A') * 2 + u8::from(&bel[1..] == "FF2");
+    // Defensive: the computed index must name this exact Bel.
+    if ff_fasm_name(ff_index).ok()? != bel {
+        return None;
+    }
+    match parts.next() {
+        None => {
+            if attr == "INIT" {
+                Some(LutFfFeature::FfInitValued(ff_index))
+            } else {
+                Some(LutFfFeature::FfSrvalValued(ff_index))
+            }
+        }
+        Some(v) if parts.next().is_none() && (v == "V0" || v == "V1") => {
+            let value = v == "V1";
+            if attr == "INIT" {
+                Some(LutFfFeature::FfInitV(ff_index, value))
+            } else {
+                Some(LutFfFeature::FfSrvalV(ff_index, value))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// True when `feature` is a LUT INIT or FF INIT/SRVAL spelling the
+/// Y_ofst tables render in parse-back: grouped `X6LUT.INIT[63:0]`,
+/// per-bit `XLUT.INIT[i]`, and `XFF.INIT.V0/V1` /
+/// `XFF.SRVAL.V0/V1`. The valued bare spellings (`XFF.INIT = 0/1`)
+/// are not rendered (parse-back renders the `.V0`/`.V1` spelling),
+/// and the vendored DB carries no bare `XFF.INIT` feature, so they
+/// need no skip either.
+fn is_lut_ff_table_feature(feature: &str) -> bool {
+    matches!(
+        parse_lut_ff_feature(feature),
+        Some(
+            LutFfFeature::LutWhole(_)
+                | LutFfFeature::LutBit(_, _)
+                | LutFfFeature::FfInitV(_, _)
+                | LutFfFeature::FfSrvalV(_, _)
+        )
+    )
+}
+
+/// Placed bits for one LUT INIT / FF INIT / FF SRVAL entry on a SLICE
+/// tile off Y0, resolved through the BitFiltrator Y_ofst tables in
+/// `bitloc.rs` (F1). Returns `Ok(None)` when the entry is not such a
+/// feature, when the slice sits at `y_ofst` 0, or when the segbits DB
+/// carries no entry for the feature: the tables supply positions, but
+/// the DB still decides which features exist, so a design against an
+/// INT-only DB fails loud as `UnknownFeature` exactly as before. The
+/// vendored segbits lines ARE the `y_ofst` 0 mapping (cross-checked
+/// bit for bit against the tables in `tests/lut_ff_bram.rs` and in
+/// `segbits.rs::vendored_clb_dbs_load_and_synthesize`), so at
+/// `y_ofst` 0 the segbits path stays authoritative and Y0 behavior,
+/// including stub-DB tests pinning arbitrary Y0 mappings, is
+/// unchanged. For `y_ofst` != 0 the segbits DB cannot express the
+/// position (its lookup is keyed by tile type only), so the tables
+/// supply it. A SLICE tile whose type is not one of the four CLB
+/// types also falls through to segbits: the tables have no row for
+/// it, and failing loud there would break device files that resolve
+/// SLICE tiles to a type this crate does not know yet.
+fn lut_ff_table_placed_bits(
+    tile: &str,
+    tile_type: &str,
+    entry: &FasmEntry,
+    segbits: &dyn SegbitsDb,
+) -> Result<Option<Vec<PlacedBit>>, BitgenError> {
+    let Some((_, slice_y)) = parse_slice_tile(tile) else {
+        return Ok(None);
+    };
+    if slice_y % NUM_CLB_PER_COLUMN == 0 {
+        return Ok(None);
+    }
+    let Ok(clb_type) = tile_type.parse::<ClbTileType>() else {
+        return Ok(None);
+    };
+    let Some(parsed) = parse_lut_ff_feature(&entry.feature) else {
+        return Ok(None);
+    };
+    // The DB decides feature existence: fall through to the segbits
+    // path (which fails loud as UnknownFeature) when it carries no
+    // entry for this feature. The grouped LUT spelling needs the
+    // synthesized entry; the valued FF spelling needs the `.V0` half
+    // of the pair (the CLI rewrites valued lines to `.V0`/`.V1`
+    // before emit, so the pair is what the DB must carry).
+    let db_has = |name: &str| segbits.lookup(tile_type, name).is_some();
+    match parsed {
+        LutFfFeature::LutWhole(lut_index) => {
+            let name = format!(
+                "{}6LUT.INIT[63:0]",
+                (b'A' + lut_index) as char
+            );
+            if !db_has(&name) {
+                return Ok(None);
+            }
+        }
+        LutFfFeature::LutBit(lut_index, bit) => {
+            let name = format!(
+                "{}LUT.INIT[{bit}]",
+                (b'A' + lut_index) as char
+            );
+            if !db_has(&name) {
+                return Ok(None);
+            }
+        }
+        LutFfFeature::FfInitV(_, _) | LutFfFeature::FfSrvalV(_, _) => {
+            if !db_has(&entry.feature) {
+                return Ok(None);
+            }
+        }
+        LutFfFeature::FfInitValued(ff_index) => {
+            let name = format!("{}.INIT.V0", ff_fasm_name(ff_index)?);
+            if !db_has(&name) {
+                return Ok(None);
+            }
+        }
+        LutFfFeature::FfSrvalValued(ff_index) => {
+            let name = format!("{}.SRVAL.V0", ff_fasm_name(ff_index)?);
+            if !db_has(&name) {
+                return Ok(None);
+            }
+        }
+    }
+    let value_too_wide = |bits: usize, value_bits: usize| BitgenError::ValueTooWide {
+        tile: tile.to_string(),
+        feature: entry.feature.clone(),
+        bits,
+        value_bits,
+    };
+    let placed = match parsed {
+        LutFfFeature::LutWhole(lut_index) => {
+            let init = match &entry.value {
+                // No value means every listed bit reads 1, the same
+                // reading the segbits path gives a valueless feature.
+                None => u64::MAX,
+                Some(v) => {
+                    if v.significant_bits() > 64 {
+                        return Err(value_too_wide(64, v.significant_bits()));
+                    }
+                    let mut init = 0u64;
+                    for i in 0..64 {
+                        if v.bit(i) {
+                            init |= 1u64 << i;
+                        }
+                    }
+                    init
+                }
+            };
+            lut_placed_bits(clb_type, slice_y, lut_index, LutMode::Logic, init)?
+        }
+        LutFfFeature::LutBit(lut_index, bit) => {
+            let want = match &entry.value {
+                None => true,
+                Some(v) => {
+                    if v.significant_bits() > 1 {
+                        return Err(value_too_wide(1, v.significant_bits()));
+                    }
+                    v.bit(0)
+                }
+            };
+            let loc = lut_locations(clb_type, slice_y, lut_index)?[bit as usize];
+            vec![PlacedBit {
+                block: crate::bitloc::Block::LutInit,
+                minor: loc.minor,
+                frame_ofst: loc.frame_ofst,
+                value: want,
+            }]
+        }
+        LutFfFeature::FfInitV(ff_index, value) => {
+            if entry.value.is_some() {
+                // A value on a `.V0`/`.V1` line is contradictory
+                // input; the segbits path owns that case, as before.
+                return Ok(None);
+            }
+            vec![ff_placed_bit(clb_type, slice_y, ff_index, value)?]
+        }
+        LutFfFeature::FfSrvalV(ff_index, value) => {
+            if entry.value.is_some() {
+                return Ok(None);
+            }
+            vec![ff_srval_placed_bit(clb_type, slice_y, ff_index, value)?]
+        }
+        LutFfFeature::FfInitValued(ff_index) => {
+            let Some(v) = &entry.value else {
+                // Bare `XFF.INIT` names no value: the segbits path
+                // owns it (unknown feature with the real DB), as before.
+                return Ok(None);
+            };
+            if v.significant_bits() > 1 {
+                return Err(value_too_wide(1, v.significant_bits()));
+            }
+            vec![ff_placed_bit(clb_type, slice_y, ff_index, v.bit(0))?]
+        }
+        LutFfFeature::FfSrvalValued(ff_index) => {
+            let Some(v) = &entry.value else {
+                return Ok(None);
+            };
+            if v.significant_bits() > 1 {
+                return Err(value_too_wide(1, v.significant_bits()));
+            }
+            vec![ff_srval_placed_bit(clb_type, slice_y, ff_index, v.bit(0))?]
+        }
+    };
+    Ok(Some(placed))
+}
+
+/// True when the `.V1` feature is the exact complement of the `.V0`
+/// feature in the segbits DB: `.V0` lists set bits only, `.V1` lists
+/// `!` bits only, and the two bit sets are identical. This is the
+/// pair rule the segbits loop in `parse_bitstream` applies (see
+/// `complement_signatures`); a `.V1` line renders only for a clean
+/// pair, never for a lone all-`!` feature such as a mux default.
+fn is_clean_complement_pair(
+    segbits: &dyn SegbitsDb,
+    tile_type: &str,
+    v0_name: &str,
+    v1_name: &str,
+) -> bool {
+    let (Some(v0), Some(v1)) = (
+        segbits.lookup(tile_type, v0_name),
+        segbits.lookup(tile_type, v1_name),
+    ) else {
+        return false;
+    };
+    if v0.is_empty() || v0.iter().any(|r| r.must_be_zero) {
+        return false;
+    }
+    if v1.is_empty() || v1.iter().any(|r| !r.must_be_zero) {
+        return false;
+    }
+    let mut set: Vec<(u32, u16)> = v0.iter().map(|r| (r.frame, r.bit)).collect();
+    let mut zero: Vec<(u32, u16)> = v1.iter().map(|r| (r.frame, r.bit)).collect();
+    set.sort();
+    zero.sort();
+    set == zero
+}
+
+/// Render one SLICE tile's LUT INIT and FF INIT/SRVAL lines from the
+/// BitFiltrator Y_ofst tables (F1, parse side of the emit fix). The
+/// caller invokes this only for slices at `y_ofst` != 0, where the
+/// segbits loop below is skipped for these features. The tables
+/// supply positions, but the segbits DB still decides which features
+/// exist, mirroring the emit gate in `lut_ff_table_placed_bits`: a
+/// LUT renders in the grouped `X6LUT.INIT[63:0]` spelling when the DB
+/// carries that entry and any INIT bit is set (valued presence is
+/// any-set, the same rule as the segbits path); when the DB carries
+/// only the per-bit lines (no synthesized grouped entry), set bits
+/// render as per-bit `XLUT.INIT[i]` lines instead, so re-emitting
+/// the parse-back resolves through the same DB. Every FF renders
+/// exactly one `.V0`/`.V1` line per attribute (INIT and SRVAL) when
+/// the DB carries that spelling, the set bit reading `.V0`; a `.V1`
+/// line additionally needs the clean complement pair (see
+/// `is_clean_complement_pair`), the same rule the segbits loop
+/// applies at `y_ofst` 0. A table position is marked explained
+/// exactly when the DB lists a feature covering it (grouped or
+/// per-bit for a LUT bit, either `.V` half for an FF bit), matching
+/// the segbits loop, which marks every listed ref explained; a DB
+/// with no LUT/FF features for the tile type therefore renders
+/// nothing and explains nothing, preserving the old behavior for
+/// INT-only DBs. Conversion is the emit inverse: frame = minor -
+/// base_minor, bit = frame_ofst.
+fn render_slice_lut_ff(
+    frames: &BTreeMap<u32, FrameWords>,
+    explained: &mut HashSet<(u32, u16)>,
+    lines: &mut Vec<(String, String, Option<String>)>,
+    tile: &str,
+    db_tile_type: &str,
+    tile_type: ClbTileType,
+    slice_y: u32,
+    base_far: u32,
+    segbits: &dyn SegbitsDb,
+) -> Result<(), BitgenError> {
+    let base_minor = base_far & 0xFF;
+    let db_has = |name: &str| segbits.lookup(db_tile_type, name).is_some();
+    let read_table_bit = |explained: &mut HashSet<(u32, u16)>,
+                          minor: u32,
+                          frame_ofst: u32,
+                          covered: bool|
+     -> Result<bool, BitgenError> {
+        let frame = minor.checked_sub(base_minor).ok_or_else(|| {
+            BitgenError::BadFar {
+                reason: format!(
+                    "tile {tile}: table minor {minor} is below base minor {base_minor}"
+                ),
+            }
+        })?;
+        let far = base_far.checked_add(frame).ok_or_else(|| {
+            BitgenError::BadFar {
+                reason: format!("tile {tile}: base FAR 0x{base_far:08x} + offset {frame} overflows"),
+            }
+        })?;
+        let bit = u16::try_from(frame_ofst).map_err(|_| BitgenError::BadFar {
+            reason: format!("tile {tile}: frame offset {frame_ofst} exceeds u16"),
+        })?;
+        if covered {
+            explained.insert((far, bit));
+        }
+        Ok(frame_bit(frames, far, bit))
+    };
+    for lut_index in 0..8u8 {
+        let letter = (b'A' + lut_index) as char;
+        let grouped = format!("{letter}6LUT.INIT[63:0]");
+        let has_grouped = db_has(&grouped);
+        let locs = lut_locations(tile_type, slice_y, lut_index)?;
+        let mut bits = vec![false; 64];
+        let mut any_set = false;
+        for (i, loc) in locs.iter().enumerate() {
+            let covered = has_grouped
+                || db_has(&format!("{letter}LUT.INIT[{i}]"));
+            bits[i] = read_table_bit(explained, loc.minor, loc.frame_ofst, covered)?;
+            any_set |= bits[i];
+        }
+        if has_grouped && any_set {
+            let name = lut_fasm_name(lut_index)?;
+            lines.push((
+                tile.to_string(),
+                format!("{name}.INIT[63:0]"),
+                Some(format_value(&bits)),
+            ));
+        } else if !has_grouped {
+            for (i, bit) in bits.iter().enumerate() {
+                if *bit && db_has(&format!("{letter}LUT.INIT[{i}]")) {
+                    lines.push((
+                        tile.to_string(),
+                        format!("{letter}LUT.INIT[{i}]"),
+                        None,
+                    ));
+                }
+            }
+        }
+    }
+    for ff_index in 0..16u8 {
+        let name = ff_fasm_name(ff_index)?;
+        let v0_init = format!("{name}.INIT.V0");
+        let v1_init = format!("{name}.INIT.V1");
+        let v0_srval = format!("{name}.SRVAL.V0");
+        let v1_srval = format!("{name}.SRVAL.V1");
+        let init_loc = ff_location(tile_type, slice_y, ff_index)?;
+        let init_covered = db_has(&v0_init) || db_has(&v1_init);
+        let init_set = read_table_bit(
+            explained,
+            init_loc.minor,
+            init_loc.frame_ofst,
+            init_covered,
+        )?;
+        if init_set {
+            if db_has(&v0_init) {
+                lines.push((tile.to_string(), format!("{name}.INIT.V0"), None));
+            }
+        } else if db_has(&v1_init)
+            && is_clean_complement_pair(segbits, db_tile_type, &v0_init, &v1_init)
+        {
+            lines.push((tile.to_string(), format!("{name}.INIT.V1"), None));
+        }
+        let srval_loc = ff_srval_location(tile_type, slice_y, ff_index)?;
+        let srval_covered = db_has(&v0_srval) || db_has(&v1_srval);
+        let srval_set = read_table_bit(
+            explained,
+            srval_loc.minor,
+            srval_loc.frame_ofst,
+            srval_covered,
+        )?;
+        if srval_set {
+            if db_has(&v0_srval) {
+                lines.push((tile.to_string(), format!("{name}.SRVAL.V0"), None));
+            }
+        } else if db_has(&v1_srval)
+            && is_clean_complement_pair(segbits, db_tile_type, &v0_srval, &v1_srval)
+        {
+            lines.push((tile.to_string(), format!("{name}.SRVAL.V1"), None));
+        }
+    }
+    Ok(())
+}
+
 /// Placed bits for one BRAM feature value, in absolute-bit order,
 /// restricted to the feature's range. Value bit k is absolute bit
 /// (`first_bit` + k) of the array. The returned bits carry the
@@ -1034,6 +1489,39 @@ pub fn emit_frames(
                 }
                 continue;
             }
+        }
+        // LUT/FF INIT on a slice off Y0 (F1): resolve through the
+        // BitFiltrator Y_ofst tables, never through segbits, whose
+        // lines carry the Y_ofst=0 mapping only. The branch runs
+        // before the segbits lookup; any other feature on a SLICE
+        // tile falls through to it. Conversion is the BRAM one:
+        // frame = minor - base_minor, bit = frame_ofst. Frame bits
+        // are always materialized, as the segbits path does, so Y0
+        // framesets are unchanged where the two sources agree.
+        if let Some(placed) = lut_ff_table_placed_bits(&entry.tile, tile_type, entry, segbits)? {
+            let base_minor = base_far & 0xFF;
+            for placed_bit in &placed {
+                let frame = placed_bit.minor.checked_sub(base_minor).ok_or_else(|| {
+                    BitgenError::BadFar {
+                        reason: format!(
+                            "tile {} feature {}: table minor {} is below base minor {base_minor}",
+                            entry.tile, entry.feature, placed_bit.minor
+                        ),
+                    }
+                })?;
+                write_frame_bit(
+                    &mut frames,
+                    &mut written,
+                    &entry.tile,
+                    &entry.feature,
+                    base_far,
+                    frame,
+                    placed_bit.frame_ofst as u16,
+                    placed_bit.value,
+                    true,
+                )?;
+            }
+            continue;
         }
         let refs = segbits.lookup(tile_type, &entry.feature).ok_or_else(|| {
             BitgenError::UnknownFeature {
@@ -1596,7 +2084,39 @@ pub fn parse_bitstream(
                 }
             }
         }
+        // LUT/FF INIT on a slice off Y0 (F1): render from the
+        // BitFiltrator Y_ofst tables, never through segbits, whose
+        // lines carry the Y_ofst=0 mapping only. At y_ofst 0 the
+        // segbits loop below stays authoritative (the two sources
+        // agree there); off Y0 the loop is skipped for these
+        // features, or it would render the Y0 positions, including
+        // a spurious `.V1` line for every FF whose real bit sits at
+        // the true Y offset.
+        let lut_ff_tables = parse_slice_tile(tile)
+            .filter(|(_, slice_y)| slice_y % NUM_CLB_PER_COLUMN != 0)
+            .and_then(|(_, slice_y)| {
+                tile_type
+                    .parse::<ClbTileType>()
+                    .ok()
+                    .map(|clb_type| (clb_type, slice_y))
+            });
+        if let Some((clb_type, slice_y)) = lut_ff_tables {
+            render_slice_lut_ff(
+                &frames,
+                &mut explained,
+                &mut lines,
+                tile,
+                tile_type,
+                clb_type,
+                slice_y,
+                base_far,
+                segbits,
+            )?;
+        }
         for feature in segbits.features(tile_type) {
+            if lut_ff_tables.is_some() && is_lut_ff_table_feature(feature) {
+                continue;
+            }
             let refs = segbits.lookup(tile_type, feature).ok_or_else(|| {
                 BitgenError::InconsistentFeature {
                     tile: tile.clone(),
