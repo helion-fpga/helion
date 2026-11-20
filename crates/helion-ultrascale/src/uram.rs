@@ -41,11 +41,15 @@
 //!   encoding), not be misattributed to URAM. They still block
 //!   whenever the tile or feature itself names URAM (rules 1-3).
 //! - `IS_CLK_INVERTED` is in this list and is also a DSP48E2
-//!   attribute name. On this branch a bare `IS_CLK_INVERTED` reports
-//!   `UramBlocked`; on the DSP branch the same bare name reports
-//!   `Dsp48e2Blocked`. Both fail loud and emit no bits, so the
-//!   difference is only the error name; the merge-time ordering of
-//!   the two detectors is a CTO decision, not a correctness issue.
+//!   attribute name. A bare `IS_CLK_INVERTED` on a non-DSP, non-URAM
+//!   tile reports `Dsp48e2Blocked`, not `UramBlocked`: the DSP check
+//!   in `emit_frames` runs before the URAM check, so the DSP error
+//!   surfaces first (pinned by
+//!   `bitgen::tests::bare_is_clk_inverted_reports_dsp_blocked_first`).
+//!   Both fail loud and emit no bits, so the difference is only the
+//!   error name. The URAM detector still matches the bare name
+//!   (`is_uram288_entry` returns true); it is simply never reached
+//!   for this spelling because the DSP check wins.
 //!   The vendored segbits DBs do carry `IS_CLK_INVERTED` in 4 lines,
 //!   but only as a trailing component of OSERDESE3 features
 //!   (`HDIOLOGIC_M_X0Y1.OPTFF.OSERDESE3.IS_CLK_INVERTED.V0/V1`); the
