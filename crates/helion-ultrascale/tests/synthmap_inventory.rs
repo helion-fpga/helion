@@ -326,5 +326,21 @@ endmodule
         .iter()
         .filter(|(c, _, _)| c.kind.starts_with("Lut6"))
         .count();
-    println!("add8: {luts} LUT6, {carry} Carry4");
+    // Pinned from the observed run: synth infers a Carry4 chain for the
+    // 8-bit adder, so CARRY8 mapping is exercised by ordinary adder RTL,
+    // not only by explicit Carry4 cells. 2 Carry4 (one per 4-bit nibble,
+    // chained) plus 8 LUT6 (one S/propagate LUT per bit).
+    assert_eq!(
+        carry, 2,
+        "add8 must synth to exactly 2 Carry4 (one per 4-bit nibble)"
+    );
+    assert_eq!(
+        luts, 8,
+        "add8 must synth to exactly 8 LUT6 (one S/propagate LUT per bit)"
+    );
+    assert!(
+        rows.iter()
+            .all(|(_, v, _)| matches!(v, MapVerdict::Mapped | MapVerdict::SkippedOutsidePack)),
+        "add8 must contain no UNMAPPED or HAZARD cells"
+    );
 }
