@@ -290,6 +290,24 @@ def build_lutram_fasm(design, part):
     return "\n".join(lines) + "\n"
 
 
+def bram_word(w):
+    if w == 0:
+        return (1 << 256) - 1
+    if w == 1:
+        return 0
+    return int("AA" * 32, 16) if w % 2 == 0 else int("55" * 32, 16)
+
+
+def bram_content_value():
+    """Whole-array content value: 64 words, word 0 lowest bits."""
+    return sum(bram_word(w) << (w * 256) for w in range(64))
+
+
+def bram_parity_value():
+    """Whole-array parity value: 8 words, word 0 lowest bits."""
+    return sum(bram_word(w) << (w * 256) for w in range(8))
+
+
 def build_fasm(design, part):
     if design == "uram":
         return build_uram_fasm(design, part)

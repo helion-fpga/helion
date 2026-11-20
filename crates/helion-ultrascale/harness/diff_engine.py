@@ -27,7 +27,7 @@ import json
 import os
 
 from emitter import NO_EMITTER_MISSING
-from fasm import BLOCKS, classify, parse_fasm, parse_init_value
+from fasm import BLOCKS, FasmError, classify, parse_bram_value, parse_fasm, parse_init_value
 from reference import MissingReference
 import roundtrip as roundtrip_mod
 
@@ -35,10 +35,9 @@ import roundtrip as roundtrip_mod
 ABSOLUTE_BLOCKS = {"LUT_INIT", "LUTRAM", "FF_INIT", "CARRY8", "BRAM_CONTENT", "BRAM_PARITY", "INT_PIP"}
 
 # Blocks the golden designs do not exercise at all (v1 goldens have no
-# BRAM, DSP, or URAM instances). Reported blocked, never green.
+# DSP or URAM instances). Reported blocked, never green. BRAM left this
+# dict when the bram golden landed: the wired branch below resolves it.
 NOT_EXERCISED = {
-    "BRAM_CONTENT": "no BRAM instances in the golden designs",
-    "BRAM_PARITY": "no BRAM instances in the golden designs",
     "DSP48E2": "no DSP48E2 instances in the golden designs",
     "URAM288": "no URAM288 instances in the golden designs",
 }
@@ -94,7 +93,26 @@ def resolve_feature(ref, part, feature):
             x, y = slice_xy(tile)
             return block, ref.resolve_carry8(part, x, y, feat), "absolute", None
         if block in ("BRAM_CONTENT", "BRAM_PARITY"):
-            raise MissingReference(NOT_EXERCISED[block])
+            from fasm import bram_xy
+            size_kb, x, y = bram_xy(tile)
+            try:
+                if block == "BRAM_CONTENT":
+                    init_bits = parse_bram_value(value, 16384)
+                    return (
+                        block,
+                        ref.resolve_bram(part, x, y, size_kb, init_bits),
+                        "absolute",
+                        None,
+                    )
+                initp_bits = parse_bram_value(value, 2048)
+                return (
+                    block,
+                    ref.resolve_bram_parity(part, x, y, initp_bits),
+                    "absolute",
+                    None,
+                )
+            except FasmError as e:
+                raise MissingReference(str(e))
         if block == "INT_PIP":
             from fasm import int_xy
             col, y = int_xy(tile)
@@ -238,21 +256,6 @@ def diff_design(ref, emitter, design, part, fasm_path, seed, placement_hash,
                     "emitter set %d bits in %s, which the golden design "
                     "does not use" % (extra_set, block)
                 )
-                records.append(rec)
-                continue
-            if block == "CARRY8" and emitter is not None and emit_error is None:
-                # Zero-bit green, not blocked: CARRY8 is the one
-                # unexercised block whose encoding is grounded
-                # (prjuray segbits, 24 features per CLB tile type),
-                # so zero reference bits against zero emitted bits
-                # is a comparison that ran, not a pass on missing
-                # data. With no emitter there is no comparison and
-                # the block stays blocked, like every other block.
-                rec["diff_bits"] = 0
-                rec["total_bits"] = 0
-                rec["status"] = "green"
-                rec["coord_system"] = "absolute"
-                rec["emitted_via"] = emitted_via
                 records.append(rec)
                 continue
             rec["diff_bits"] = None

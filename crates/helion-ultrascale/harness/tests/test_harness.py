@@ -167,6 +167,25 @@ class TestFasm(unittest.TestCase):
         self.assertEqual(lut_init_64(lambda b: 1 - b[0]), 0x5555555555555555)
 
 
+
+    def test_parse_bram_value_spellings(self):
+        from fasm import parse_bram_value
+        bits = parse_bram_value("0x1", 16384)
+        self.assertEqual(len(bits), 16384)
+        self.assertEqual(bits[0], 1)
+        self.assertEqual(bits[1:], [0] * 16383)
+        # Verilog spelling (emitter parse-back) and decimal agree.
+        self.assertEqual(parse_bram_value("16384'h1", 16384), bits)
+        self.assertEqual(parse_bram_value("1", 16384), bits)
+        # One bit over the width fails loud instead of truncating.
+        with self.assertRaises(FasmError):
+            parse_bram_value("0x1" + "0" * 4096, 16384)
+        with self.assertRaises(FasmError):
+            parse_bram_value("16384'hZZ", 16384)
+        with self.assertRaises(FasmError):
+            parse_bram_value(None, 16384)
+
+
 class TestCarry8(unittest.TestCase):
     # CARRY8 as its own harness block (CTO ruling 2026-11-08, US-05).
     # The vocabulary is the 24 prjuray segbits features per CLB tile
@@ -258,7 +277,7 @@ class TestCarry8(unittest.TestCase):
             f.write(text)
         return path
 
-    def test_design_without_carry8_is_zero_bit_green(self):
+    def test_design_without_carry8_is_blocked(self):
         with tempfile.TemporaryDirectory() as tmp:
             emitter = Emitter(_fake_emitter_shim(tmp))
             recs = diff_design(
@@ -268,8 +287,11 @@ class TestCarry8(unittest.TestCase):
             )
             by_block = {r["block"]: r for r in recs}
             carry8 = by_block["CARRY8"]
-            self.assertEqual(carry8["status"], "green")
-            self.assertEqual(carry8["diff_bits"], 0)
+            # CTO ruling 2026-11-19: zero bits exercised is not passed;
+            # an unexercised block reports blocked, like every other
+            # block (FLAG-22-1).
+            self.assertEqual(carry8["status"], "blocked")
+            self.assertIsNone(carry8["diff_bits"])
             self.assertEqual(carry8["total_bits"], 0)
 
     def test_design_with_carry8_reports_carry8_line(self):
@@ -872,6 +894,119 @@ class TestReference(unittest.TestCase):
             self.assertIsNotNone(miss, feat)
             self.assertIn("absent", miss)
 
+    def test_bram_resolves_whole_array_and_spot_bits(self):
+        from fasm import Feature
+        from gen_golden import bram_content_value, bram_parity_value
+        content = bram_content_value()
+        parity = bram_parity_value()
+        feat = Feature("RAMB18_X0Y0", "INIT[16383:0]", "0x%04096x" % content)
+        block, bits, coord, miss = resolve_feature(self.ref, "xcku3p", feat)
+        self.assertIsNone(miss)
+        self.assertEqual(block, "BRAM_CONTENT")
+        self.assertEqual(coord, "absolute")
+        self.assertEqual(len(bits), 16384)
+        # Content bit 0 (word 0 all-ones) is (far 0x01000000, ofst 0) = 1.
+        self.assertEqual(bits[(0x01000000, 0)], 1)
+        # Content bit 256 (word 1 all-zero) is (far 0x01000004, ofst 0) = 0.
+        self.assertEqual(bits[(0x01000004, 0)], 0)
+        # 8192 set bits: word 0 (256) + words 2..63 alternating (62*128).
+        self.assertEqual(sum(bits.values()), 8192)
+        feat = Feature("RAMB18_X0Y0", "INITP[2047:0]", "0x%0512x" % parity)
+        block, bits, coord, miss = resolve_feature(self.ref, "xcku3p", feat)
+        self.assertIsNone(miss)
+        self.assertEqual(block, "BRAM_PARITY")
+        self.assertEqual(len(bits), 2048)
+        self.assertEqual(bits[(0x01000000, 48)], 1, "parity bit 0")
+        self.assertEqual(bits[(0x0100001F, 59)], 1, "parity bit 255")
+        self.assertEqual(sum(bits.values()), 1024)
+        # Verilog spelling (emitter parse-back) resolves identically.
+        feat = Feature(
+            "RAMB18_X0Y0", "INIT[16383:0]", "16384'h%04096X" % content
+        )
+        block, bits, coord, miss = resolve_feature(self.ref, "xcku3p", feat)
+        self.assertIsNone(miss)
+        self.assertEqual(len(bits), 16384)
+        self.assertEqual(sum(bits.values()), 8192)
+
+    def test_bram36_reports_missing_not_green(self):
+        from fasm import Feature
+        feat = Feature("RAMB36_X0Y0", "INIT[32767:0]", "0x1")
+        block, bits, coord, miss = resolve_feature(self.ref, "xcku3p", feat)
+        self.assertEqual(block, "BRAM_CONTENT")
+        self.assertEqual(bits, {})
+        self.assertIsNotNone(miss)
+        self.assertIn("36K", miss)
+
+
+class TestBramResolver(unittest.TestCase):
+    """BRAM reference resolver, ported from the live harness
+    (FLAG-25-2): whole-array INIT/INITP resolve through
+    parse_bram_value plus ref.resolve_bram/resolve_bram_parity.
+
+    The live port is whole-array only: per-word INIT_XX spellings are
+    not a separate path here (the emitter accepts them, the harness
+    resolver does not split them; see the lane report follow-ups).
+    """
+    TILE = "RAMB18_X7Y85"
+    # Deterministic patterns with both 0 and 1 bits across the array:
+    # content bit i is 1 when i % 3 == 0, parity bit i when i % 5 == 0.
+    CONTENT_VAL = sum(1 << i for i in range(0, 16384, 3))
+    PARITY_VAL = sum(1 << i for i in range(0, 2048, 5))
+
+    def setUp(self):
+        self.ref = Tier1Reference()
+
+    def _resolve(self, feature, value):
+        return resolve_feature(
+            self.ref, "xcku3p",
+            Feature(self.TILE, feature, value))
+
+    def test_whole_array_content_resolves(self):
+        block, bits, coord, miss = self._resolve(
+            "INIT[16383:0]", "0x%x" % self.CONTENT_VAL)
+        self.assertIsNone(miss)
+        self.assertEqual(block, "BRAM_CONTENT")
+        self.assertEqual(coord, "absolute")
+        self.assertEqual(len(bits), 16384)
+        self.assertEqual(sum(bits.values()), 5462)
+
+    def test_whole_array_parity_resolves(self):
+        block, bits, coord, miss = self._resolve(
+            "INITP[2047:0]", "0x%x" % self.PARITY_VAL)
+        self.assertIsNone(miss)
+        self.assertEqual(block, "BRAM_PARITY")
+        self.assertEqual(coord, "absolute")
+        self.assertEqual(len(bits), 2048)
+        self.assertEqual(sum(bits.values()), 410)
+
+    def test_no_bram_design_blocked_with_generic_wording(self):
+        # rand001 carries no BRAM features: both BRAM blocks report
+        # blocked. BRAM left NOT_EXERCISED in the port, so the
+        # wording is the generic no-features one, not a BRAM string.
+        harness_dir = os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(
+                harness_dir, "generated", "rand001.xcku3p.meta.json")) as f:
+            meta = json.load(f)
+        DESIGNS["rand001"] = {"luts": [], "ffs": [], "ff_locations": []}
+        workdir = tempfile.mkdtemp(prefix="bram-nobram-")
+        try:
+            records = diff_design(
+                self.ref, None, "rand001", "xcku3p",
+                os.path.join(harness_dir, "generated", "rand001.xcku3p.fasm"),
+                meta["seed"], meta["placement_hash"], "tier1", workdir)
+        finally:
+            # DESIGNS is shared module state: restore it so later
+            # tests that iterate the golden designs never see rand001.
+            del DESIGNS["rand001"]
+        for block in ("BRAM_CONTENT", "BRAM_PARITY"):
+            rec = [r for r in records if r["block"] == block][0]
+            self.assertEqual(rec["status"], "blocked", block)
+            self.assertEqual(
+                rec.get("missing"),
+                "no %s features in golden FASM for rand001/xcku3p; "
+                "block not exercised by this design" % block,
+                block)
 
 
 class TestUram(unittest.TestCase):
