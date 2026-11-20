@@ -19,11 +19,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from reference import MissingReference, Tier1Reference
 import sweep
 from sweep import (
-    FF_CONTROL_FEATURES, Geometry, Item, bram_code_value,
-    bram_pos_to_bit, code_of_index, diff_item_int, emitted_int_keys,
-    enum_carry8, enum_int, enum_io, lut_code_value, lut_pos_to_bit,
-    pack_mode_a, pack_mode_b, ref_int_keys, verify_bram_disjoint,
-    verify_lut_disjoint,
+    FF_CONTROL_FEATURES, Geometry, Item, actual_emit_count,
+    bram_code_value, bram_pos_to_bit, code_of_index, diff_item_int,
+    emitted_int_keys, enum_carry8, enum_int, enum_io, lut_code_value,
+    lut_pos_to_bit, pack_mode_a, pack_mode_b, ref_int_keys,
+    verify_bram_disjoint, verify_lut_disjoint,
 )
 
 
@@ -207,6 +207,30 @@ class TestDiffer(unittest.TestCase):
         self.assertEqual(int_keys, {sweep.key64(2, 67): 1})
         diff, _ = diff_item_int(int_keys, rel)
         self.assertEqual(diff, 0)
+
+
+class TestSummaryCounting(unittest.TestCase):
+    def test_actual_emit_count_counts_records_not_plan(self):
+        # Bisection splits planned emits: 2 planned emits that split
+        # into 3 actual emit records count as 3, probes do not count.
+        records = [
+            {"kind": "emit", "emit": "X-000", "status": "ok"},
+            {"kind": "emit", "emit": "X-000-bis0", "status": "ok"},
+            {"kind": "emit", "emit": "X-000-bis1", "status": "failed"},
+            {"kind": "probe", "probe": "dsp"},
+        ]
+        self.assertEqual(actual_emit_count(records), 3)
+
+    def test_actual_emit_count_matches_full_sweep_jsonl(self):
+        # The full single-feature sweep ran 153 emits (123 planned,
+        # BRAM bisection split 30 of them); the summary must say 153.
+        import json
+        jsonl = os.path.expanduser(
+            "~/workspace/ultra-bitgen-sweeps-logs/sweeps-full/sweep.jsonl")
+        if not os.path.exists(jsonl):
+            self.skipTest("full sweep jsonl not present in this checkout")
+        records = [json.loads(line) for line in open(jsonl) if line.strip()]
+        self.assertEqual(actual_emit_count(records), 153)
 
 
 class TestEnumerationScopes(unittest.TestCase):
