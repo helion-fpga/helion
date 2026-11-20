@@ -115,11 +115,12 @@ The [user guide](https://helion-fpga.github.io/helion/use.html) walks through ea
 | **Helion HL10** | `HL10T-C32-1` (8,192 LUT6), `HL10T-DSP1`, `HL10S-C64-1` (32,768 LUT6), `HL10M-C128-1` (131,072 LUT6) | `.hbits` | Gold QoR tests; bitstreams load into Helion's fabric model and simulator |
 | **Lattice iCE40** | `ice40-hx8k` | IceStorm `.asc` (`icepack` makes the `.bin`) | `.asc` round-trips bit-exactly through icepack/iceunpack |
 | **Lattice ECP5** | `LFE5U-85F` | Trellis text config (`ecppack` makes the `.bit`) | Blinky config accepted by `ecppack` |
-| **Xilinx 7-series** | `xc7a35t` | FASM, frames and `.bit` | Blinky FASM-to-frames is byte-identical to prjxray; needs the Project X-Ray database on disk |
+| **Xilinx 7-series** | `xc7a35t`, `xc7a100t`, `xc7z020` (ZedBoard) | FASM, frames and `.bit` | Byte-identical to f4pga for the board test set; every ZedBoard bitstream is decoded and co-simulated against its RTL by `tools/x7v`, and four ZedBoard designs run on the board; needs the Project X-Ray database on disk |
 
 HL10 is Helion's own architecture. Its parts are defined in
 [`devices/helion/`](devices/helion/); there is no HL10 silicon. Bitstreams for
-the iCE40, ECP5 and 7-series backends have not yet been tested on boards.
+the iCE40 and ECP5 backends have not yet been tested on boards; 7-series
+bitstreams run on a ZedBoard (see [ZedBoard status](#zedboard-status)).
 
 **Hardware Manager.** The native JTAG engine drives FTDI MPSSE cables
 (FT2232H, FT232H, including Digilent's on-board cables). Chain scans are
@@ -239,6 +240,7 @@ nextpnr's; calibrating it is on the roadmap.
 | [Tcl reference](docs/tcl-subset.md) | The Tcl language and commands the console supports |
 | [Benchmarks](https://helion-fpga.github.io/helion/benchmarks.html) | Measured results and caveats |
 | [Changelog](CHANGELOG.md) | What changed in each release |
+| [ZedBoard Level 2](docs/zedboard-handoff/LEVEL2.md) | The "fill the ZedBoard" standard and rung status; open gaps in [GAPS.md](docs/zedboard-handoff/GAPS.md) |
 
 ## Project status and roadmap
 
@@ -251,6 +253,30 @@ against real silicon, wiring the October campaign's optimization passes into
 the default flow, and the remaining IDE gaps listed in
 [`crates/helion-rune/SWEEP.md`](crates/helion-rune/SWEEP.md). The
 [roadmap](ROADMAP.md) has the full list.
+
+### ZedBoard status
+
+The current goal is **Level 2: Helion alone fills the ZedBoard's Zynq-7020**
+(85%+ of the LUTs, 80%+ of the block RAM and DSPs, timing met, and seen
+working on the board). Every rung needs five proofs: a Helion-only build,
+Verilator co-simulation equal to the RTL (`tools/svcheck`), the bitstream
+decoded and co-simulated equal to the RTL (`tools/x7v`), timing met, and the
+design running on the board.
+
+| Rung | What | Status |
+|---|---|---|
+| 1 | Ibex RISC-V SoC at 38.89 MHz (Vivado's own Fmax for it) | runs on the board |
+| 2 | 240 RAMB18 (86%) with init data, 100 MHz | runs on the board |
+| 3 | 192 DSP48E1 (87%), 100 MHz | runs on the board |
+| 4 | MMCM, three clock domains, safe crossings | runs on the board |
+| 5 | Board peripherals: OLED, VGA, Pmods | VGA and Pmod pass both checks; OLED fix in review |
+| 6 | One design at 85% LUTs + 86% RAM + 87% DSP | synthesizes, places and simulates; routing does not converge yet |
+| 7 | The ARM (PS7) reading and writing logic over AXI | in progress |
+
+Helion still uses about 1.6x to 5x the LUTs Vivado does for the same RTL,
+and its timing of its own routes has not been checked against Vivado. The
+full standard is in [`docs/zedboard-handoff/LEVEL2.md`](docs/zedboard-handoff/LEVEL2.md)
+and every known gap is in [`docs/zedboard-handoff/GAPS.md`](docs/zedboard-handoff/GAPS.md).
 
 ## Contributing
 
