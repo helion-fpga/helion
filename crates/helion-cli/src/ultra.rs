@@ -2177,7 +2177,7 @@ fn write_seed_log(log_dir: &str, seed: u64, part: &str, run: &UltraSeedRun, runt
     );
     if run.result.status == "ok" {
         text += &format!(
-            "status=ok wns_ps={} tns_ps={} endpoints={} r2r_ps={} iob_ps={} placed_slices={}\n",
+            "status=ok wns_ps={} tns_ps={} endpoints={} r2r_ps={} iob_ps={} placed_slices={} [WNS is a preliminary estimate]\n",
             run.result.wns_ps,
             run.result.tns_ps,
             run.endpoints,
@@ -2372,7 +2372,7 @@ pub fn run_multiseed(
                 let _ = writeln!(f, "{line}");
                 let _ = f.flush();
                 eprintln!(
-                    "multiseed: seed={} status={} wns_ps={} tns_ps={} runtime_s={:.1} route={}",
+                    "multiseed: seed={} status={} wns_ps={} tns_ps={} runtime_s={:.1} route={} [WNS is a preliminary estimate]",
                     result.seed,
                     result.status,
                     result.wns_ps,
