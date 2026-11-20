@@ -5,8 +5,13 @@
 //! This module owns the packet layer only: `.bit` header, sync word,
 //! UG570 configuration packets, FAR tracking, FDRI frame collection, and
 //! the MFWR multiple-frame-write replication used by compressed bitstreams.
-//! It does not decode frames into FASM (that is the frames-to-FASM worker)
-//! and it does not verify the configuration CRC (see the limits below).
+//! It does not decode frames into FASM (that is the frames-to-FASM worker).
+//! It does verify the configuration CRC: every CRC-register write must
+//! carry the running CRC-32C of the stream (prjxray `icap_crc` model,
+//! the same `crc32c_step` as `bitgen.rs` `CrcState`), proven against 16
+//! real Vivado files (see the CRC section below). A mismatch fails loud,
+//! so a payload-corrupted `.bit` that still parses can no longer decode
+//! to wrong FASM silently.
 //!
 //! Sources, in order of authority:
 //! - UG570 (UltraScale Architecture Configuration User Guide), live at
@@ -108,9 +113,29 @@
 //!   zero words), per BitFiltrator.
 //!
 //! Known limits, stated plainly:
-//! - The configuration CRC is NOT verified here. CRC-register writes
-//!   are accepted and their values ignored. CRC-32C verification
-//!   belongs with the CRC worker (`bitgen.rs` `CrcState`).
+//! - Configuration CRC verification (CRC-32C, prjxray `icap_crc`:
+//!   `crc32c_step` over each (5-bit register address, 32-bit data word)
+//!   pair, LSB-first, 37 bits per pair, starting from 0 after RCRC).
+//!   The feed rule is: RCRC resets the running CRC without feeding; a
+//!   CRC-register write must carry the running CRC and then resets it;
+//!   every other non-NOP write packet feeds each data word, with no
+//!   register exclusions; reads and NOOPs never feed. Proven against 16
+//!   real Vivado files (`decoder-validation/crc_probe.py`, same feed
+//!   rule in Python): all 14 xczu3eg pairs plus compressed `d2.bit`
+//!   (xcku3p, 41,119 MFWR packets) and `xcau10p.bit`, 32 CRC writes in
+//!   total, 32 match, 0 mismatch. Every file carries exactly 2 CRC
+//!   writes: the first covers the whole configuration payload (preamble
+//!   plus all FDRI data) since RCRC, the second covers the ending
+//!   commands (GRESTORE, DGHIGH_LFRM, START, sentinel FAR, MASK, CTL0)
+//!   since the first CRC write reset the state (Vivado writes no RCRC
+//!   between them; the CRC write itself is the reset). A stream with no
+//!   CRC writes at all is accepted without verification (synthetic test
+//!   streams, partial bitstreams, and 7-series files carry none); a
+//!   present-but-wrong CRC value is a hard error. The CRC state is one
+//!   running value for the whole file and is not reset by a resync: a
+//!   new section is expected to start with its own RCRC, as Vivado
+//!   emits. `bitgen.rs` `parse_frames` implements the identical check
+//!   (`BitgenError::CrcMismatch`) for the emitter round-trip path.
 //! - FAR geometry is required for correct addressing. `parse_bitstream`
 //!   uses the embedded tables below, keyed by the stream IDCODE with
 //!   the version nibble masked. Parts without an embedded table
@@ -154,6 +179,7 @@
 //! in UG570/BitFiltrator versus bits [17:13] in `bitgen.rs`) is not a
 //! real disagreement: both decode every observed header identically.
 
+use crate::bitgen::crc32c_step;
 use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
@@ -243,6 +269,7 @@ const REG_RSVD_30: u8 = 30;
 /// Command codes (UG570 table 9-22).
 const CMD_WCFG: u32 = 1;
 const CMD_MFW: u32 = 2;
+const CMD_RCRC: u32 = 7;
 const CMD_DESYNC: u32 = 13;
 
 /// FAR block types (UG570 table 9-21). Block 7 is the post-START
@@ -752,6 +779,11 @@ struct WalkState<'g> {
     /// streams use MFW and carry no end-of-row padding; uncompressed
     /// streams carry 2 zero padding frames after every row end.
     mfw_present: bool,
+    /// Running configuration CRC (CRC-32C, prjxray `icap_crc`). One
+    /// value for the whole file, not reset by a resync: RCRC resets
+    /// it, a CRC-register write checks it and then resets it, and
+    /// every other non-NOP write packet feeds it. Starts at 0.
+    crc: u32,
 }
 
 fn is_known_command(value: u32) -> bool {
@@ -788,6 +820,7 @@ fn walk_items(
         anchor_checked: false,
         last_far_written: None,
         mfw_present,
+        crc: 0,
     };
     for item in items {
         match item {
@@ -823,12 +856,30 @@ fn walk_items(
                 }
                 st.section_seen = true;
                 if packet.opcode == 1 {
-                    // Reads carry no frame data; their payload words
-                    // were consumed as packet data in pass 1.
+                    // Reads carry no frame data and never feed the
+                    // CRC; their payload words were consumed as
+                    // packet data in pass 1.
                     continue;
                 }
                 // Opcode 2 (Write) from here on; opcode 0 never
                 // reaches this walk.
+                //
+                // Configuration CRC tracking (CRC-32C, prjxray
+                // `icap_crc`, same model as `bitgen.rs` `CrcState`):
+                // every non-NOP write packet feeds each data word as
+                // (register address, word), except the RCRC command,
+                // which resets the running CRC without feeding, and
+                // a CRC-register write, which is checked against the
+                // running CRC in its own arm below and then resets
+                // it. NOOPs never reach this walk (dropped in pass 1).
+                let is_crc_write = packet.reg == REG_CRC;
+                let is_rcrc = packet.reg == REG_CMD
+                    && packet.data.first().copied().unwrap_or(0) & 0x1F == CMD_RCRC;
+                if !is_crc_write && !is_rcrc {
+                    for word in &packet.data {
+                        st.crc = crc32c_step(packet.reg as u32, *word, st.crc);
+                    }
+                }
                 match packet.reg {
                     REG_FAR => {
                         if packet.data.len() != 1 {
@@ -886,6 +937,13 @@ fn walk_items(
                             ));
                         }
                         st.cmd = Some(value);
+                        if value & 0x1F == CMD_RCRC {
+                            // RCRC resets the running CRC without
+                            // feeding (the RCRC command word itself
+                            // is not CRC-covered; the pre-loop feed
+                            // already skipped it for this reason).
+                            st.crc = 0;
+                        }
                         if value == CMD_MFW {
                             st.mfw_armed = true;
                             st.anchor_checked = false;
@@ -1034,8 +1092,24 @@ fn walk_items(
                                 packet.data.len()
                             ));
                         }
-                        // CRC values are accepted and ignored: this
-                        // module does not verify the configuration CRC.
+                        // The CRC register carries the running CRC of
+                        // every write packet since the last RCRC or
+                        // CRC write; the device compares and then
+                        // resets. A mismatch means the payload (in
+                        // practice FDRI frame data) was corrupted
+                        // after Vivado wrote it, so decoding on would
+                        // produce wrong FASM silently. Fail loud
+                        // instead, naming the CRC packet word index
+                        // and both values: the corrupted word is in a
+                        // packet before this CRC write.
+                        let found = packet.data[0];
+                        if found != st.crc {
+                            return Err(format!(
+                                "CRC mismatch at word {}: CRC register carries 0x{found:08x} but the running CRC is 0x{:08x}",
+                                packet.word_index, st.crc
+                            ));
+                        }
+                        st.crc = 0;
                     }
                     _ => {
                         // Every other register (CTL0, MASK, COR0, COR1,
@@ -1535,5 +1609,122 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].far, 0x400);
         assert_eq!(frames[0].words, replacement);
+    }
+
+    /// Fold one register write into a running CRC, following the feed
+    /// rule the parser checks: every write feeds each data word as
+    /// (address, word). Callers handle RCRC (reset) and CRC writes
+    /// (check, then reset) themselves.
+    fn feed_crc(mut crc: u32, reg: u8, data: &[u32]) -> u32 {
+        for word in data {
+            crc = crc32c_step(reg as u32, *word, crc);
+        }
+        crc
+    }
+
+    /// Build a minimal valid stream with a CRC write after the frame
+    /// data, without the DESYNC ending (callers append `ending`, or
+    /// more packets first). Preamble (RCRC, IDCODE), WCFG, FAR 0, one
+    /// FDRI frame, FAR rewrite, CRC carrying the running CRC.
+    /// Returns the word vector and the index of the first FDRI payload
+    /// word, so the corruption test can flip it.
+    fn stream_with_crc(frame: &[u32]) -> (Vec<u32>, usize) {
+        let mut w = preamble();
+        // Preamble fed: RCRC resets, then IDCODE feeds.
+        let mut crc = feed_crc(0, REG_IDCODE, &[TEST_IDCODE]);
+        write_reg(&mut w, REG_FAR, &[0]);
+        crc = feed_crc(crc, REG_FAR, &[0]);
+        write_cmd(&mut w, CMD_WCFG);
+        crc = feed_crc(crc, REG_CMD, &[CMD_WCFG]);
+        let fdri_payload_at = w.len() + 1;
+        write_reg(&mut w, REG_FDRI, frame);
+        crc = feed_crc(crc, REG_FDRI, frame);
+        write_reg(&mut w, REG_FAR, &[0]);
+        crc = feed_crc(crc, REG_FAR, &[0]);
+        write_reg(&mut w, REG_CRC, &[crc]);
+        (w, fdri_payload_at)
+    }
+
+    #[test]
+    fn crc_write_with_correct_value_passes() {
+        let frame = frame_words(0xC0FF_EE, 0x4444_4444);
+        let (mut w, _) = stream_with_crc(&frame);
+        ending(&mut w);
+        let frames = parse(&w).expect("stream with a correct CRC must parse");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].words, frame);
+    }
+
+    #[test]
+    fn crc_mismatch_fails_loud() {
+        let frame = frame_words(0xC0FF_EE, 0x4444_4444);
+        let (mut w, _) = stream_with_crc(&frame);
+        ending(&mut w);
+        // Corrupt the CRC value itself: flip its low bit. The CRC
+        // packet is the only CRC-register header in the stream.
+        let crc_header = t1(2, REG_CRC, 1);
+        let pos = w
+            .iter()
+            .rposition(|x| *x == crc_header)
+            .expect("CRC header present");
+        w[pos + 1] ^= 1;
+        let err = parse(&w).expect_err("wrong CRC value must fail");
+        assert!(err.contains("CRC mismatch"), "unexpected error: {err}");
+        assert!(err.contains("0x"), "error must show the values: {err}");
+    }
+
+    #[test]
+    fn corrupted_fdri_payload_fails_crc() {
+        // A single flipped FDRI word changes the running CRC, so the
+        // stored CRC no longer matches: the exact failure the CRC
+        // check exists to catch.
+        let frame = frame_words(0xC0FF_EE, 0x4444_4444);
+        let (mut w, fdri_payload_at) = stream_with_crc(&frame);
+        ending(&mut w);
+        w[fdri_payload_at] ^= 0x0000_0001;
+        let err = parse(&w).expect_err("corrupted FDRI payload must fail the CRC check");
+        assert!(err.contains("CRC mismatch"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn stream_without_crc_writes_still_parses() {
+        // Absence of CRC writes is not an error: synthetic streams,
+        // partial bitstreams, and 7-series files carry none. Only a
+        // present-but-wrong CRC fails.
+        let mut w = preamble();
+        write_reg(&mut w, REG_FAR, &[0]);
+        write_cmd(&mut w, CMD_WCFG);
+        write_reg(&mut w, REG_FDRI, &frame_words(0x1, 0));
+        ending(&mut w);
+        let frames = parse(&w).expect("stream without CRC writes must parse");
+        assert_eq!(frames.len(), 1);
+    }
+
+    #[test]
+    fn second_crc_write_after_ending_commands_is_checked() {
+        // Vivado writes two CRCs: one after the frame data, one after
+        // the ending commands (GRESTORE, DGHIGH_LFRM, START, sentinel
+        // FAR, MASK, CTL0), with the first CRC write itself as the
+        // reset between them (no RCRC in between). The second CRC
+        // covers exactly those ending writes.
+        let frame = frame_words(0xC0FF_EE, 0x4444_4444);
+        let (mut w, _) = stream_with_crc(&frame);
+        let mut crc = 0;
+        for (reg, value) in [
+            (REG_CMD, 10u32), // GRESTORE
+            (REG_CMD, 3u32),  // DGHIGH_LFRM
+            (REG_CMD, 5u32),  // START
+            (REG_FAR, 0x07FC_0000u32),
+            (6u8, 0x101u32), // MASK
+            (5u8, 0x101u32), // CTL0
+        ] {
+            write_reg(&mut w, reg, &[value]);
+            crc = feed_crc(crc, reg, &[value]);
+        }
+        write_reg(&mut w, REG_CRC, &[crc]);
+        ending(&mut w);
+        let frames = parse(&w).expect("stream with two correct CRCs must parse");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].words, frame);
     }
 }
