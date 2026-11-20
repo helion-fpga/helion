@@ -702,8 +702,7 @@ fn is_lutram_mode(feature: &str) -> bool {
         3 => {
             // xLUT.MODE.RAM / xLUT.DI1.(SIN|DI1) / xLUT.SIZE.(LARGE|SMALL).
             let bel = parts[0].as_bytes();
-            if parts[0].len() != 4 || !(b'A'..=b'H').contains(&bel[0]) || &parts[0][1..] != "LUT"
-            {
+            if parts[0].len() != 4 || !(b'A'..=b'H').contains(&bel[0]) || &parts[0][1..] != "LUT" {
                 return false;
             }
             match parts[1] {
@@ -869,14 +868,8 @@ mod tests {
             classify_feature("SLICE_X1Y0", "ALUT.SIZE.SMALL"),
             Some("LUTRAM")
         );
-        assert_eq!(
-            classify_feature("SLICE_X1Y0", "WA7USED.V0"),
-            Some("LUTRAM")
-        );
-        assert_eq!(
-            classify_feature("SLICE_X1Y0", "WA9USED.V1"),
-            Some("LUTRAM")
-        );
+        assert_eq!(classify_feature("SLICE_X1Y0", "WA7USED.V0"), Some("LUTRAM"));
+        assert_eq!(classify_feature("SLICE_X1Y0", "WA9USED.V1"), Some("LUTRAM"));
         // MODE.SRL is a block-to-be, not LUTRAM: `bits` must fail loud
         // on an SRL feature that sets bits, never guess.
         assert_eq!(classify_feature("SLICE_X1Y0", "ALUT.MODE.SRL"), None);
