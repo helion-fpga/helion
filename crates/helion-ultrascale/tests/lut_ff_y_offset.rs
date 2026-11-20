@@ -17,6 +17,7 @@
 //! grouped LUT INIT entries synthesized, exactly as the `helion-bitgen`
 //! CLI loads them.
 
+use helion_ultrascale::band_code::{BAND_HI, BAND_LO};
 use helion_ultrascale::bitgen::{
     BitgenDevice, FrameWords, emit_bitstream, emit_frames, parse_bitstream,
 };
@@ -52,6 +53,9 @@ fn load_db() -> FileSegbitsDb {
 /// Set bits of the frameset as (frame offset from the tile base FAR,
 /// bit offset within the frame), restricted to frames of this tile
 /// (base FAR minor is 0 for CLB tiles, so the offset is the minor).
+/// The computed band bits (1440-1487) are excluded: they are a code
+/// over the feature bits, not feature positions, and are pinned by
+/// tests/band_code.rs and tests/bitgen_roundtrip.rs.
 fn set_bits(
     frames: &std::collections::BTreeMap<u32, FrameWords>,
     base_far: u32,
@@ -65,7 +69,10 @@ fn set_bits(
             let mut w = *word;
             while w != 0 {
                 let b = w.trailing_zeros() as u16;
-                out.insert((far - base_far, (wi * 32 + b as usize) as u16));
+                let bit = (wi * 32 + b as usize) as u16;
+                if bit < BAND_LO || bit > BAND_HI {
+                    out.insert((far - base_far, bit));
+                }
                 w &= w - 1;
             }
         }
