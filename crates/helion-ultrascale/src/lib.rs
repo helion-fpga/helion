@@ -14,6 +14,8 @@
 pub mod bel;
 pub mod bitgen;
 pub mod bitgen_device;
+pub mod bitstream_decode;
+pub mod bitstream_packets;
 pub mod bitloc;
 pub mod device;
 pub mod device_file;
