@@ -1337,6 +1337,16 @@ def aggregate_features(ref, part, geom, records):
 # Report
 # ---------------------------------------------------------------------------
 
+def actual_emit_count(records):
+    """Actual emits run: emit records in the JSONL, not planned emits.
+
+    Bisection splits planned emits, so the planned count understates
+    the run (the full single-feature sweep planned 123 emits and ran
+    153). The summary must record the actual count.
+    """
+    return sum(1 for r in records if r.get("kind") == "emit")
+
+
 def load_records(path):
     records = []
     if os.path.exists(path):
@@ -1664,7 +1674,8 @@ def main(argv=None):
         "part": args.part, "started": started,
         "finished": datetime.datetime.now().isoformat(timespec="seconds"),
         "totals": {"green": totals[0], "red": totals[1], "extra": totals[2]},
-        "emits": len(all_emits),
+        "emits": actual_emit_count(records),
+        "planned_emits": len(all_emits),
         "out_dir": out_dir,
     }
     with open(os.path.join(out_dir, "sweep_summary.json"), "w") as f:
