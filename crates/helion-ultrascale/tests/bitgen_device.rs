@@ -30,6 +30,7 @@
 //!
 //! No em dashes anywhere.
 
+use helion_ultrascale::band_code::{compute_band_map_a, frame_band};
 use helion_ultrascale::bitgen::{emit_bitstream, emit_frames, parse_bitstream};
 use helion_ultrascale::{ArchSummary, BitLocator, BitgenDevice, DeviceFile, Far, FileSegbitsDb};
 use std::collections::HashSet;
@@ -305,14 +306,28 @@ fn int_pip_frames_land_at_expected_fars() {
     let fasm = "INT_X0Y0.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1\n\
                 INT_X0Y0.PIP.INT_NODE_GLOBAL_0_INT_OUT0.GCLK_B_0_0\n";
     let frames = emit_frames(fasm, &device, &db).unwrap();
+    // Frames now carry their computed H-1 band in words 45-46, so a
+    // whole-frame sum no longer equals the feature-bit sum. Check the
+    // feature bits alone, and check the stored band against the MAP-A
+    // value of those bits (the band is never an input to itself).
+    let no_mask = [false; 93 * 32];
+    let check_frame = |words: &[u32; 93], feature_word0: u32| {
+        assert_eq!(words[0], feature_word0);
+        assert!(words[1..45].iter().all(|w| *w == 0));
+        assert_eq!(words[46] & 0xFFFF_0000, 0);
+        assert!(words[47..].iter().all(|w| *w == 0));
+        assert_eq!(
+            frame_band(words),
+            compute_band_map_a(words, &no_mask),
+            "stored band equals the MAP-A value of the feature bits"
+        );
+    };
     // BOUNCE sets frame 64 bit 0 at base 0x400 -> FAR 0x440.
     let bounce = frames.get(&0x440).expect("BOUNCE frame 0x440");
-    assert_eq!(bounce[0] & 1, 1);
-    assert_eq!(bounce.iter().sum::<u32>(), 1);
+    check_frame(bounce, 1);
     // GCLK sets frame 41 bit 3 at base 0x400 -> FAR 0x429.
     let gclk = frames.get(&0x429).expect("GCLK frame 0x429");
-    assert_eq!(gclk[0], 8);
-    assert_eq!(gclk.iter().sum::<u32>(), 8);
+    check_frame(gclk, 8);
     // The map also materializes the zero-checked FARs as all-zero
     // frames (emit_frames inserts the entry to test the bit): 5
     // zero bits for BOUNCE (frames 66, 68, 72 twice, 74) and 4 for

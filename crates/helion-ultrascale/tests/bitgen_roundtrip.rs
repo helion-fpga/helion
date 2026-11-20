@@ -51,10 +51,13 @@
 //! and sets the bit, V1 by value 1 and clears it. This test pins the
 //! bit pattern and the value meaning together.
 //!
-//! Expected frames (hand-computed):
-//!   F2 = 0x00000304: word3 = 0x00000010 (frame bit 100), rest 0
+//! Expected frames (hand-computed; band words from MAP-A key "A",
+//! recomputed independently in decoder-validation/band_crc_recompute.py):
+//!   F2 = 0x00000304: word3 = 0x00000010 (frame bit 100), word45 = 0x00110001,
+//!                     word46 = 0x00000101 (band 0x010100110001), rest 0
 //!   F1 = 0x0000050C: word0 = 0x00000001 (bit 0), word1 = 0x80000000 (bit 63),
-//!                     word2 = 0x00000001 (bit 64), rest 0
+//!                     word2 = 0x00000001 (bit 64), word45 = 0x00910888,
+//!                     word46 = 0x00008808 (band 0x880800910888), rest 0
 //!   F3a = 0x01000000: word0 = 0x00000001 (content bit 0), rest 0
 //!   F3d = 0x01000003: word3 = 0x00000800 (content bit 255: ofst 107,
 //!                     word 3 bit 11), rest 0
@@ -63,8 +66,11 @@
 //! the IDCODE write feeds the CRC, so only the first frame's CRC depends on
 //! the preamble; later frames start from 0 after the CRC-register write.
 //! The port was validated by reproducing the pre-BRAM-branch known CRCs
-//! F2 = 0x9ac4dc29, F1 = 0xaa75db0b, F3 = 0x66924d7d for the old layout):
-//!   F2 = 0x9ac4dc29, F1 = 0xaa75db0b, F3a = 0xd9880946, F3d = 0x0b9f8503
+//! F2 = 0x9ac4dc29, F1 = 0xaa75db0b, F3 = 0x66924d7d for the old layout,
+//! and the Python model in band_crc_recompute.py reproduces the
+//! pre-band CRCs F2 = 0x9ac4dc29, F1 = 0xaa75db0b, F3a = 0xd9880946,
+//! F3d = 0x0b9f8503 exactly before computing the band-carrying ones):
+//!   F2 = 0x85e74bef, F1 = 0x8a32ed70, F3a = 0xd9880946, F3d = 0x0b9f8503
 //!
 //! Expected stream: 833 words = 3332 bytes. Sync word at byte 48 (word 12).
 //! Packet word offsets: RCRC header 14, IDCODE header 16, WCFG header 18,
@@ -164,17 +170,25 @@ fn frames_match_hand_computed_words() {
 
     let f2 = frames.get(&F2).unwrap();
     assert_eq!(f2[3], 0x0000_0010);
-    assert!(f2.iter().enumerate().all(|(i, w)| i == 3 || *w == 0));
+    // Band for the single set source bit 100 (MAP-A column 0x010100110001).
+    assert_eq!(f2[45], 0x0011_0001);
+    assert_eq!(f2[46], 0x0000_0101);
+    assert!(f2
+        .iter()
+        .enumerate()
+        .all(|(i, w)| i == 3 || i == 45 || i == 46 || *w == 0));
 
     let f1 = frames.get(&F1).unwrap();
     assert_eq!(f1[0], 0x0000_0001);
     assert_eq!(f1[1], 0x8000_0000);
     assert_eq!(f1[2], 0x0000_0001);
-    assert!(
-        f1.iter()
-            .enumerate()
-            .all(|(i, w)| (0..3).contains(&i) || *w == 0)
-    );
+    // Band for set source bits 0, 63, 64 (XOR of MAP-A columns 0x880800910888).
+    assert_eq!(f1[45], 0x0091_0888);
+    assert_eq!(f1[46], 0x0000_8808);
+    assert!(f1
+        .iter()
+        .enumerate()
+        .all(|(i, w)| (0..3).contains(&i) || i == 45 || i == 46 || *w == 0));
 
     let f3a = frames.get(&F3A).unwrap();
     assert_eq!(f3a[0], 0x0000_0001);
@@ -213,10 +227,13 @@ fn bitstream_has_expected_length_sync_headers_and_crcs() {
     assert_eq!(word(&bytes, 21), F2);
     assert_eq!(word(&bytes, 22), 0x3000_405D);
     assert_eq!(word(&bytes, 23 + 3), 0x0000_0010);
+    // Band words of the F2 frame (FDRI starts at stream word 23).
+    assert_eq!(word(&bytes, 23 + 45), 0x0011_0001);
+    assert_eq!(word(&bytes, 23 + 46), 0x0000_0101);
     assert_eq!(word(&bytes, 116), 0x3000_2001);
     assert_eq!(word(&bytes, 117), F2);
     assert_eq!(word(&bytes, 118), 0x3000_0001);
-    assert_eq!(word(&bytes, 119), 0x9ac4_dc29);
+    assert_eq!(word(&bytes, 119), 0x85e7_4bef);
 
     // Frame F1.
     assert_eq!(word(&bytes, 120), 0x3000_2001);
@@ -225,10 +242,13 @@ fn bitstream_has_expected_length_sync_headers_and_crcs() {
     assert_eq!(word(&bytes, 123), 0x0000_0001);
     assert_eq!(word(&bytes, 124), 0x8000_0000);
     assert_eq!(word(&bytes, 125), 0x0000_0001);
+    // Band words of the F1 frame (FDRI starts at stream word 123).
+    assert_eq!(word(&bytes, 123 + 45), 0x0091_0888);
+    assert_eq!(word(&bytes, 123 + 46), 0x0000_8808);
     assert_eq!(word(&bytes, 216), 0x3000_2001);
     assert_eq!(word(&bytes, 217), F1);
     assert_eq!(word(&bytes, 218), 0x3000_0001);
-    assert_eq!(word(&bytes, 219), 0xaa75_db0b);
+    assert_eq!(word(&bytes, 219), 0x8a32_ed70);
 
     // Frame F3a (BRAM minor 0).
     assert_eq!(word(&bytes, 220), 0x3000_2001);
