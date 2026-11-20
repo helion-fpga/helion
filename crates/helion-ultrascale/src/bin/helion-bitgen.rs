@@ -16,9 +16,12 @@
 //!   `FAR_HEX OFFSET VALUE BLOCK`, where FAR_HEX is the 32-bit frame
 //!   address in hex, OFFSET is the bit offset within the 93-word frame,
 //!   VALUE is 0 or 1 (always 1 here: set bits only), and BLOCK is the
-//!   block-registry name the bit belongs to. Block labels are what let
-//!   the harness compare per block: without them, one block's set bits
-//!   would count as diffs in another block. If `bits` is ever wrong,
+//!   block-registry name the bit belongs to. Band bits of block-0
+//!   frames (absolute bits 1440-1487) are not printed: they are a
+//!   computed code with no block label and no reference bits in the
+//!   harness, so `bits` reports feature bits only. Block labels are
+//!   what let the harness compare per block: without them, one block's
+//!   set bits would count as diffs in another block. If `bits` is ever wrong,
 //!   the harness falls back to parse-mediated derivation; `bits` failing
 //!   loud is better than `bits` mislabeling.
 //!
@@ -58,8 +61,9 @@
 //!
 //! No em dashes anywhere.
 
+use helion_ultrascale::band_code::{BAND_HI, BAND_LO};
 use helion_ultrascale::bitgen::{
-    BitgenDevice, BitgenError, BramFeature, bram_feature_placed_bits, emit_bitstream,
+    BitgenDevice, BitgenError, BramFeature, bram_feature_placed_bits, emit_bitstream, far_decode,
     lut_ff_table_placed_bits, parse_bitstream, parse_bram_tile, parse_fasm,
 };
 use helion_ultrascale::bitgen::{ConfigOrderGeometry, parse_frames_with_geometry};
@@ -505,14 +509,21 @@ fn bits_for_bytes(
         }
     }
     // Cross-check against the frames: no set bit may be unattributed,
-    // and no attributed bit may read 0.
+    // and no attributed bit may read 0. Band bits of block-0 frames
+    // are excluded from the frame set: they are a computed code with
+    // no block label and no reference bits in the harness, so `bits`
+    // reports feature bits only.
     let mut frame_set: HashSet<(u32, u16)> = HashSet::new();
     for (far, words) in &frames {
+        let (block, _, _, _) = far_decode(*far);
         for (wi, word) in words.iter().enumerate() {
             let mut w = *word;
             while w != 0 {
                 let b = w.trailing_zeros() as usize;
-                frame_set.insert((*far, (wi * 32 + b) as u16));
+                let abs = (wi * 32 + b) as u16;
+                if !(block == 0 && (BAND_LO..=BAND_HI).contains(&abs)) {
+                    frame_set.insert((*far, abs));
+                }
                 w &= w - 1;
             }
         }
@@ -1068,13 +1079,20 @@ mod tests {
         let translated = translate_ff_valued_fasm(golden).unwrap();
         let bytes = emit_bitstream(&translated, device.as_ref(), &segbits).unwrap();
         let frames = parse_frames(&bytes).unwrap();
+        // Feature set bits only: band bits of block-0 frames are a
+        // computed code with no block label, excluded here as in
+        // `bits_for_bytes`.
         let mut frame_set: HashSet<(u32, u16)> = HashSet::new();
         for (far, words) in &frames {
+            let (block, _, _, _) = far_decode(*far);
             for (wi, word) in words.iter().enumerate() {
                 let mut w = *word;
                 while w != 0 {
                     let b = w.trailing_zeros() as usize;
-                    frame_set.insert((*far, (wi * 32 + b) as u16));
+                    let abs = (wi * 32 + b) as u16;
+                    if !(block == 0 && (BAND_LO..=BAND_HI).contains(&abs)) {
+                        frame_set.insert((*far, abs));
+                    }
                     w &= w - 1;
                 }
             }
@@ -1185,13 +1203,20 @@ mod tests {
         let translated = translate_ff_valued_fasm(golden).unwrap();
         let bytes = emit_bitstream(&translated, device.as_ref(), &segbits).unwrap();
         let frames = parse_frames(&bytes).unwrap();
+        // Feature set bits only: band bits of block-0 frames are a
+        // computed code with no block label, excluded here as in
+        // `bits_for_bytes`.
         let mut frame_set: HashSet<(u32, u16)> = HashSet::new();
         for (far, words) in &frames {
+            let (block, _, _, _) = far_decode(*far);
             for (wi, word) in words.iter().enumerate() {
                 let mut w = *word;
                 while w != 0 {
                     let b = w.trailing_zeros() as usize;
-                    frame_set.insert((*far, (wi * 32 + b) as u16));
+                    let abs = (wi * 32 + b) as u16;
+                    if !(block == 0 && (BAND_LO..=BAND_HI).contains(&abs)) {
+                        frame_set.insert((*far, abs));
+                    }
                     w &= w - 1;
                 }
             }
@@ -1258,13 +1283,20 @@ mod tests {
                     SLICE_X48Y80.BFF.INIT.V1\n";
         let bytes = emit_bitstream(fasm, device.as_ref(), &segbits).unwrap();
         let frames = parse_frames(&bytes).unwrap();
+        // Feature set bits only: band bits of block-0 frames are a
+        // computed code with no block label, excluded here as in
+        // `bits_for_bytes`.
         let mut frame_set: HashSet<(u32, u16)> = HashSet::new();
         for (far, words) in &frames {
+            let (block, _, _, _) = far_decode(*far);
             for (wi, word) in words.iter().enumerate() {
                 let mut w = *word;
                 while w != 0 {
                     let b = w.trailing_zeros() as usize;
-                    frame_set.insert((*far, (wi * 32 + b) as u16));
+                    let abs = (wi * 32 + b) as u16;
+                    if !(block == 0 && (BAND_LO..=BAND_HI).contains(&abs)) {
+                        frame_set.insert((*far, abs));
+                    }
                     w &= w - 1;
                 }
             }

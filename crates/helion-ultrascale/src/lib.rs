@@ -11,6 +11,7 @@
 //! - BitFiltrator (EPFL, FPL 2022): tile type vocabulary (CLEL_L/R, CLEM/R,
 //!   DSP, BRAM), confirmed against Vivado tile naming
 
+pub mod band_code;
 pub mod bel;
 pub mod bitgen;
 pub mod bitgen_device;
