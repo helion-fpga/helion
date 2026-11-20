@@ -2143,6 +2143,26 @@ mod tests {
     }
 
     #[test]
+    fn bare_is_clk_inverted_reports_dsp_blocked_first() {
+        // IS_CLK_INVERTED is both a DSP48E2 attribute and a URAM288
+        // attribute (UG974), so a bare feature of that name on a
+        // non-DSP, non-URAM tile is caught by both detectors. The DSP
+        // check in emit_frames runs first, so the error that surfaces
+        // is Dsp48e2Blocked, not UramBlocked. Both fail loud and emit
+        // no bits; this test pins which error wins so a future
+        // reorder cannot silently swap it.
+        let (device, db) = one_bit_db();
+        let expected = BitgenError::Dsp48e2Blocked {
+            tile: "SLICE_X0Y0".to_string(),
+            feature: "IS_CLK_INVERTED".to_string(),
+        };
+        let err = emit_frames("SLICE_X0Y0.IS_CLK_INVERTED\n", &device, &db).unwrap_err();
+        assert_eq!(err, expected);
+        let err = emit_bitstream("SLICE_X0Y0.IS_CLK_INVERTED\n", &device, &db).unwrap_err();
+        assert_eq!(err, expected);
+    }
+
+    #[test]
     fn must_be_zero_bit_set_by_earlier_feature_fails_loud() {
         let device = StubDevice::new(
             "xcku3p",
