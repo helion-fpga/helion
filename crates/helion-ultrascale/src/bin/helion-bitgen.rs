@@ -60,7 +60,7 @@
 
 use helion_ultrascale::bitgen::{
     BitgenDevice, BitgenError, BramFeature, bram_feature_placed_bits, emit_bitstream,
-    parse_bitstream, parse_bram_tile, parse_fasm,
+    lut_ff_table_placed_bits, parse_bitstream, parse_bram_tile, parse_fasm,
 };
 use helion_ultrascale::bitgen::{ConfigOrderGeometry, parse_frames_with_geometry};
 use helion_ultrascale::device_file::DeviceFile;
@@ -410,6 +410,49 @@ fn bits_for_bytes(
                 }
                 continue;
             }
+        }
+        // LUT/FF INIT on a slice off Y0 (F1): parse-back lines
+        // resolve through the BitFiltrator Y_ofst tables, never
+        // through segbits, whose lines carry the Y_ofst=0 mapping
+        // only. Mirrors the BRAM branch above and the emit-side
+        // branch in `emit_frames`: the table helper returns None at
+        // y_ofst 0 (segbits stays authoritative there) and for
+        // non-LUT/FF features, so those fall through to the segbits
+        // lookup below. The block label comes from the placed bit
+        // itself (LUT_INIT / FF_INIT). Conversion is the emit
+        // inverse: frame = minor - base_minor, bit = frame_ofst.
+        // A complement line (e.g. BFF.INIT.V1) places its bit with
+        // value false and contributes no set bit, same as the
+        // segbits path's empty wanted set.
+        if let Some(placed) =
+            lut_ff_table_placed_bits(&entry.tile, tile_type, entry, segbits).map_err(|e| {
+                format!(
+                    "LUT/FF resolve failed for {}.{}: {e}",
+                    entry.tile, entry.feature
+                )
+            })?
+        {
+            let base_minor = base_far & 0xFF;
+            for p in &placed {
+                if !p.value {
+                    continue;
+                }
+                let frame = p.minor.checked_sub(base_minor).ok_or_else(|| {
+                    format!(
+                        "tile {} feature {}: table minor {} is below base minor {base_minor}",
+                        entry.tile, entry.feature, p.minor
+                    )
+                })?;
+                let far = base_far.checked_add(frame).ok_or_else(|| {
+                    format!(
+                        "tile {} feature {}: base FAR overflow",
+                        entry.tile, entry.feature
+                    )
+                })?;
+                bits.entry((far, p.frame_ofst as u16))
+                    .or_insert(p.block.name());
+            }
+            continue;
         }
         let refs = segbits.lookup(tile_type, &entry.feature).ok_or_else(|| {
             format!(
@@ -1187,6 +1230,83 @@ mod tests {
             labeled.values().filter(|b| **b == "LUT_INIT").count(),
             32,
             "the 32 INIT bits are LUT_INIT"
+        );
+    }
+
+    #[test]
+    fn bits_labels_lut_ff_off_y0_set_bits() {
+        // F1/F2 regression: the SLICE_X48Y80 LUT+FF design (Worker A
+        // report, `tests/lut_ff_y_offset.rs`) must label through the
+        // Y_ofst tables, not segbits at Y0. Before the fix
+        // `bits_for_bytes` failed loud here: the parse-back LUT/FF
+        // lines re-resolved to the Y0 positions, so the cross-check
+        // reported the first true Y20 bit as unexplained (e.g. bit
+        // 974 of FAR 0x00046308; the exact first bit varies because
+        // the cross-check iterates a HashSet). After the fix every
+        // set bit is attributed, including the A6LUT bit at
+        // (0x4630a, 961).
+        let device = load_device("xcku3p", &data_dir()).unwrap();
+        let segbits = load_segbits(&data_dir()).unwrap();
+        let fasm = "SLICE_X48Y80.A6LUT.INIT[63:0] = 0x0b4702d25e05c990\n\
+                    SLICE_X48Y80.AFF.INIT.V0\n\
+                    SLICE_X48Y80.AFF.SRVAL.V0\n\
+                    SLICE_X48Y80.GFF.INIT = 0\n\
+                    SLICE_X48Y80.BFF.INIT.V1\n";
+        let bytes = emit_bitstream(fasm, device.as_ref(), &segbits).unwrap();
+        let frames = parse_frames(&bytes).unwrap();
+        let mut frame_set: HashSet<(u32, u16)> = HashSet::new();
+        for (far, words) in &frames {
+            for (wi, word) in words.iter().enumerate() {
+                let mut w = *word;
+                while w != 0 {
+                    let b = w.trailing_zeros() as usize;
+                    frame_set.insert((*far, (wi * 32 + b) as u16));
+                    w &= w - 1;
+                }
+            }
+        }
+        // A6LUT INIT 0x0b4702d25e05c990 has 25 set bits, AFF INIT 1,
+        // AFF SRVAL 1, GFF INIT 1; BFF INIT.V1 sets none. Total 28.
+        let out = bits_for_bytes(&bytes, device.as_ref(), &segbits).unwrap();
+        let mut labeled: HashMap<(u32, u16), &str> = HashMap::new();
+        let mut blocks: HashSet<&str> = HashSet::new();
+        for line in out.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(f.len(), 4, "bits line shape: {line}");
+            labeled.insert(
+                (
+                    u32::from_str_radix(f[0], 16).unwrap(),
+                    f[1].parse().unwrap(),
+                ),
+                f[3],
+            );
+            assert_eq!(f[2], "1");
+            blocks.insert(f[3]);
+        }
+        assert_eq!(labeled.len(), 28, "28 set bits total");
+        assert_eq!(
+            labeled.keys().collect::<HashSet<_>>(),
+            frame_set.iter().collect::<HashSet<_>>(),
+            "labeled bits equal frame set bits"
+        );
+        assert_eq!(blocks, HashSet::from(["LUT_INIT", "FF_INIT"]));
+        assert_eq!(
+            labeled[&(0x4630a, 961)],
+            "LUT_INIT",
+            "A6LUT bit at y_ofst 20 (minor 10, offset 961)"
+        );
+        assert_eq!(labeled[&(0x4630c, 962)], "FF_INIT", "AFF INIT bit");
+        assert_eq!(labeled[&(0x4630c, 961)], "FF_INIT", "AFF SRVAL bit");
+        assert_eq!(labeled[&(0x4630c, 992)], "FF_INIT", "GFF INIT bit");
+        assert_eq!(
+            labeled.values().filter(|b| **b == "LUT_INIT").count(),
+            25,
+            "the 25 A6LUT bits are LUT_INIT"
+        );
+        assert_eq!(
+            labeled.values().filter(|b| **b == "FF_INIT").count(),
+            3,
+            "the 3 FF bits are FF_INIT"
         );
     }
 }
