@@ -17,6 +17,42 @@
 # and any emitted set bit no feature constrains is reported as a
 # global extra with its exact position.
 #
+# Pair mode (--pairs): same-bit feature pairs. Two features sharing
+# at least one bit position are enumerated from the same DBs, split
+# into agree pairs (all shared positions require the same value, so
+# the pair is emittable and diffable against the union) and
+# contradictory pairs (some shared position requires different
+# values, so no assignment satisfies both; counted, never emitted,
+# sampled by contra probes that only observe what the emitter does).
+# Pair items pack under mode A plus one more exclusion the duplicate
+# probe established: the emitter fails loud on a duplicated FASM
+# line ("duplicate feature"), so two pair items sharing a feature
+# never share an emit (Emit.feat_keys enforces it).
+#
+# Pair-scope reductions, recorded not hidden:
+# - FF/CARRY8/LUTRAM agree pairs are all the same feature on two
+#   slices sharing a column-shared bit (32/24/52 distinct types);
+#   the sweep keeps one instance per distinct type per tile type.
+#   Per-slice pairs in these blocks are all contradictory value
+#   alternatives (FF 48, CARRY8 15, LUTRAM 26 per slice).
+# - INT agree pairs are 25 genuine distinct-PIP pairs per tile,
+#   kept on the same 8 tiles as the single sweep.
+# - IO agree pairs are 3976 distinct pairs on the one bridged tile;
+#   the sweep keeps one per (shared-position set, site pair), 119
+#   pairs. Packing all 3976 needs ~2800 emits (median conflict
+#   degree 2914 of 3976, driven by ~34 constrained bits per
+#   feature), about 12 hours of `bits` runs, for no new
+#   interaction: a pair's outcome depends only on its shared
+#   positions plus the two sites, and every distinct
+#   (shared set, site pair) is swept.
+# - LUT_INIT/BRAM: a LUT/BRAM holds one INIT value, so two INITs
+#   on one BEL/RAMB are contradictory and INITs on different BELs
+#   are disjoint (proven); zero testable same-bit pairs.
+# - Cross-block: no two blocks share a bit position on any sampled
+#   slice (verified in code by cross_block_check), so zero pairs.
+# - MODE.LUT constrains two must-be-0 bits (it sets no 1-bits);
+#   MODE.LUT vs MODE.RAM is contradictory at one shared position.
+#
 # Single-bit resolution without one emit per bit: LUT INIT and BRAM
 # INIT use binary-code values. LUT bit i carries the 6-bit code of i
 # across 6 emits (code bit k of i in emit k); BRAM content bit i
@@ -52,7 +88,8 @@
 #   blocked with a probe as evidence. The CLE PIP (1 line per tile
 #   type) labels INT_PIP in `bits` and IS swept.
 # - MODE.SRL: `bits` fails loud on it (block-to-be); blocked. MODE.LUT
-#   sets no bits and is swept as a zero-bit item.
+#   two must-be-0 bits (it sets no 1-bits) and is swept as an
+#   item whose reference constrains those bits to 0.
 # - DSP48E2, URAM288, CLK (CMT/RCLK/BUFGCE/MMCM), BRAM config bits,
 #   HDIO, XIPHY, INT_INTF: blocked, each with its named unblocker
 #   and a probe emit where one exists.
@@ -71,6 +108,7 @@
 
 import argparse
 import datetime
+import itertools
 import json
 import os
 import subprocess
@@ -310,18 +348,25 @@ class Item:
     `ref` is the reference bit dict when the packer needs it (mode A,
     small dicts); None for mode B items, whose refs the differ
     regenerates from `params`. `params` is everything the differ
-    needs to regenerate the reference bits.
+    needs to regenerate the reference bits. `feat_keys` is the set of
+    feature keys this item's FASM lines carry (one for a single item,
+    two for a pair item); the packer never puts two items sharing a
+    feature key in one emit, because the emitter fails loud on a
+    duplicated FASM line.
     """
 
-    __slots__ = ("block", "key", "group", "fasm", "ref", "params")
+    __slots__ = ("block", "key", "group", "fasm", "ref", "params",
+                 "feat_keys")
 
-    def __init__(self, block, key, group, fasm, ref, params):
+    def __init__(self, block, key, group, fasm, ref, params, feat_keys=None):
         self.block = block
         self.key = key
         self.group = group
         self.fasm = fasm
         self.ref = ref
         self.params = params
+        self.feat_keys = (frozenset(feat_keys) if feat_keys is not None
+                          else frozenset((key,)))
 
 
 def far_group_for_slice(ref, part, x, y):
@@ -381,6 +426,39 @@ def enum_lut(ref, part, geom):
     return items
 
 
+def ff_slice_items(ref, part, x, y):
+    """FF_INIT items on one slice: 16 FFs x INIT/SRVAL x 0/1 plus
+    the 32 FF group control attributes. Mode A packing."""
+    items = []
+    group = far_group_for_slice(ref, part, x, y)
+    tile = "SLICE_X%dY%d" % (x, y)
+    for bel in FF_BELS:
+        for attr in ("INIT", "SRVAL"):
+            for value in (0, 1):
+                fn = ref.resolve_ff if attr == "INIT" else ref.resolve_srval
+                bits = fn(part, x, y, bel, value)
+                items.append(Item(
+                    "FF_INIT",
+                    "FF_INIT:%s:%s.%s=%d" % (tile, bel, attr, value),
+                    group,
+                    "%s.%s.%s = %d" % (tile, bel, attr, value),
+                    bits,
+                    {"kind": "ff", "x": x, "y": y, "bel": bel,
+                     "attr": attr, "value": value},
+                ))
+    for feat in FF_CONTROL_FEATURES:
+        bits = ref.resolve_clb_db_feature(part, x, y, feat)
+        items.append(Item(
+            "FF_INIT",
+            "FF_INIT:%s:%s" % (tile, feat),
+            group,
+            "%s.%s" % (tile, feat),
+            bits,
+            {"kind": "ffctrl", "x": x, "y": y, "feature": feat},
+        ))
+    return items
+
+
 def enum_ff(ref, part, geom):
     """FF_INIT items: every slice x every FF x INIT/SRVAL x value 0/1,
     plus the 32 FF group control attributes per slice.
@@ -389,32 +467,31 @@ def enum_ff(ref, part, geom):
     """
     items = []
     for (x, y) in geom.slices:
-        group = far_group_for_slice(ref, part, x, y)
-        tile = "SLICE_X%dY%d" % (x, y)
-        for bel in FF_BELS:
-            for attr in ("INIT", "SRVAL"):
-                for value in (0, 1):
-                    fn = ref.resolve_ff if attr == "INIT" else ref.resolve_srval
-                    bits = fn(part, x, y, bel, value)
-                    items.append(Item(
-                        "FF_INIT",
-                        "FF_INIT:%s:%s.%s=%d" % (tile, bel, attr, value),
-                        group,
-                        "%s.%s.%s = %d" % (tile, bel, attr, value),
-                        bits,
-                        {"kind": "ff", "x": x, "y": y, "bel": bel,
-                         "attr": attr, "value": value},
-                    ))
-        for feat in FF_CONTROL_FEATURES:
-            bits = ref.resolve_clb_db_feature(part, x, y, feat)
-            items.append(Item(
-                "FF_INIT",
-                "FF_INIT:%s:%s" % (tile, feat),
-                group,
-                "%s.%s" % (tile, feat),
-                bits,
-                {"kind": "ffctrl", "x": x, "y": y, "feature": feat},
-            ))
+        items.extend(ff_slice_items(ref, part, x, y))
+    return items
+
+
+def carry8_slice_items(ref, part, x, y):
+    """CARRY8 items on one slice: all 24 CARRY8 features."""
+    db = ref.segbits("clel_r")
+    features = sorted(
+        k.split(".", 1)[1] for k in db if ".CARRY8." in k
+    )
+    assert len(features) == 24, "CARRY8 feature count %d != 24" % len(features)
+    items = []
+    group = far_group_for_slice(ref, part, x, y)
+    tile = "SLICE_X%dY%d" % (x, y)
+    for feat in features:
+        full = "CARRY8." + feat[len("CARRY8."):] if feat.startswith("CARRY8.") else feat
+        bits = ref.resolve_carry8(part, x, y, full)
+        items.append(Item(
+            "CARRY8",
+            "CARRY8:%s:%s" % (tile, full),
+            group,
+            "%s.%s" % (tile, full),
+            bits,
+            {"kind": "carry8", "x": x, "y": y, "feature": full},
+        ))
     return items
 
 
@@ -425,26 +502,30 @@ def enum_carry8(ref, part, geom):
     the same attribute (CI.AX vs CI.V0/V1, DUAL_CY4 vs SINGLE_CY8)
     conflict and split into separate emits.
     """
-    db = ref.segbits("clel_r")
-    features = sorted(
-        k.split(".", 1)[1] for k in db if ".CARRY8." in k
-    )
-    assert len(features) == 24, "CARRY8 feature count %d != 24" % len(features)
     items = []
     for (x, y) in geom.slices:
-        group = far_group_for_slice(ref, part, x, y)
-        tile = "SLICE_X%dY%d" % (x, y)
-        for feat in features:
-            full = "CARRY8." + feat[len("CARRY8."):] if feat.startswith("CARRY8.") else feat
-            bits = ref.resolve_carry8(part, x, y, full)
-            items.append(Item(
-                "CARRY8",
-                "CARRY8:%s:%s" % (tile, full),
-                group,
-                "%s.%s" % (tile, full),
-                bits,
-                {"kind": "carry8", "x": x, "y": y, "feature": full},
-            ))
+        items.extend(carry8_slice_items(ref, part, x, y))
+    return items
+
+
+def int_tile_items(ref, part, x, y):
+    """INT_PIP items on one INT tile: every PIP (3778)."""
+    db = ref.segbits("int")
+    features = sorted(k[len("INT."):] for k in db)
+    assert len(features) == 3778, "INT PIP count %d != 3778" % len(features)
+    items = []
+    group = far_group_for_int(ref, part, x, y)
+    tile = "INT_X%dY%d" % (x, y)
+    for feat in features:
+        bits = ref.resolve_int_pip(part, x, y, feat)
+        items.append(Item(
+            "INT_PIP",
+            "INT_PIP:%s:%s" % (tile, feat),
+            group,
+            "%s.%s" % (tile, feat),
+            bits,
+            {"kind": "int", "x": x, "y": y, "feature": feat},
+        ))
     return items
 
 
@@ -458,12 +539,9 @@ def enum_int(ref, part, geom):
     (which tests its base FAR). See the module header.
     Mode A packing: positions are Y-independent within a column.
     """
-    db = ref.segbits("int")
-    # DB keys are INT.<feature>; the FASM feature is <feature>.
-    features = sorted(k[len("INT."):] for k in db)
-    assert len(features) == 3778, "INT PIP count %d != 3778" % len(features)
     probe_pip = "PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1"
-    assert probe_pip in features, "probe PIP missing from segbits_int.db"
+    assert "INT." + probe_pip in ref.segbits("int"), \
+        "probe PIP missing from segbits_int.db"
     items = []
     # 8 tiles: row r, CLB col 0 (CLEL_R, INT on the left) and col 1
     # (CLEM, INT on the right), at the row's first Y.
@@ -472,18 +550,7 @@ def enum_int(ref, part, geom):
         for col in (0, 1):
             eight.append((col, r * N_Y_OFST_CLB))
     for (x, y) in eight:
-        group = far_group_for_int(ref, part, x, y)
-        tile = "INT_X%dY%d" % (x, y)
-        for feat in features:
-            bits = ref.resolve_int_pip(part, x, y, feat)
-            items.append(Item(
-                "INT_PIP",
-                "INT_PIP:%s:%s" % (tile, feat),
-                group,
-                "%s.%s" % (tile, feat),
-                bits,
-                {"kind": "int", "x": x, "y": y, "feature": feat},
-            ))
+        items.extend(int_tile_items(ref, part, x, y))
     # 1 PIP on every INT tile instance.
     for (x, y) in geom.int_tiles:
         if (x, y) in eight:
@@ -548,7 +615,8 @@ def lutram_features_for_slice(ref, part, x, y):
     for w in ("WA7USED", "WA8USED", "WA9USED"):
         feats.append("%s.V0" % w)
         feats.append("%s.V1" % w)
-    # MODE.LUT sets no bits; swept as a zero-bit item on the same slice.
+    # MODE.LUT constrains two must-be-0 bits (sets no 1-bits);
+    # swept as an item on the same slice.
     for letter in BEL_LETTERS:
         feats.append("%sLUT.MODE.LUT" % letter)
     out = []
@@ -561,27 +629,35 @@ def lutram_features_for_slice(ref, part, x, y):
     return out
 
 
-def enum_lutram(ref, part, geom):
-    """LUTRAM items: every CLEM/CLEM_R slice x its 44 mode features
-    plus 8 MODE.LUT zero-bit features. Mode A packing."""
+def lutram_slice_items(ref, part, x, y):
+    """LUTRAM items on one CLEM/CLEM_R slice: its 44 mode features
+    plus 8 MODE.LUT must-be-0 features. Mode A packing."""
     items = []
-    for (x, y) in geom.clem_slices:
-        group = far_group_for_slice(ref, part, x, y)
-        tile = "SLICE_X%dY%d" % (x, y)
-        for feat in lutram_features_for_slice(ref, part, x, y):
-            bits = ref.resolve_lutram_mode(part, x, y, feat)
-            items.append(Item(
-                "LUTRAM",
-                "LUTRAM:%s:%s" % (tile, feat),
-                group,
-                "%s.%s" % (tile, feat),
-                bits,
-                {"kind": "lutram", "x": x, "y": y, "feature": feat},
-            ))
+    group = far_group_for_slice(ref, part, x, y)
+    tile = "SLICE_X%dY%d" % (x, y)
+    for feat in lutram_features_for_slice(ref, part, x, y):
+        bits = ref.resolve_lutram_mode(part, x, y, feat)
+        items.append(Item(
+            "LUTRAM",
+            "LUTRAM:%s:%s" % (tile, feat),
+            group,
+            "%s.%s" % (tile, feat),
+            bits,
+            {"kind": "lutram", "x": x, "y": y, "feature": feat},
+        ))
     return items
 
 
-def enum_io(ref, part, geom):
+def enum_lutram(ref, part, geom):
+    """LUTRAM items: every CLEM/CLEM_R slice x its 44 mode features
+    plus 8 MODE.LUT must-be-0 features. Mode A packing."""
+    items = []
+    for (x, y) in geom.clem_slices:
+        items.extend(lutram_slice_items(ref, part, x, y))
+    return items
+
+
+def io_tile_items(ref, part, geom):
     """IO_CONFIG items: all 1560 HPIO_RIGHT features on HPIO_RIGHT_X0Y0.
 
     Tile-relative reference bits (resolve_hpio); the differ converts
@@ -604,6 +680,11 @@ def enum_io(ref, part, geom):
             {"kind": "io", "tile": HPIO_TILE, "feature": feat},
         ))
     return items
+
+
+def enum_io(ref, part, geom):
+    """IO_CONFIG items: all 1560 HPIO_RIGHT features on HPIO_RIGHT_X0Y0."""
+    return io_tile_items(ref, part, geom)
 
 
 ENUMERATORS = {
@@ -636,13 +717,367 @@ FEATURE_COUNTS = {
 
 
 # ---------------------------------------------------------------------------
+# Pair sweep (same-bit feature pairs)
+# ---------------------------------------------------------------------------
+
+def pair_type_name(item):
+    """Feature name without tile coordinates: key is BLOCK:TILE:FEATURE."""
+    parts = item.key.split(":", 2)
+    return parts[2] if len(parts) == 3 else item.key
+
+
+def pair_stats(items):
+    """(agree, contra) same-bit pair lists over Items.
+
+    Each entry is (item_a, item_b, shared_int_keys). Agree: all shared
+    positions require the same value. Contra: some shared position
+    requires different values. Disjoint pairs are not listed.
+    """
+    int_refs = {}
+    pos_to_idx = {}
+    for idx, item in enumerate(items):
+        int_refs[idx] = ref_int_keys(item, item.ref)
+        for k in int_refs[idx]:
+            pos_to_idx.setdefault(k, []).append(idx)
+    pairs = {}
+    for pos, idxs in pos_to_idx.items():
+        for a, b in itertools.combinations(sorted(set(idxs)), 2):
+            pairs.setdefault((a, b), []).append(pos)
+    agree, contra = [], []
+    for (a, b), shared in pairs.items():
+        if all(int_refs[a][p] == int_refs[b][p] for p in shared):
+            agree.append((items[a], items[b], shared))
+        else:
+            contra.append((items[a], items[b], shared))
+    return agree, contra
+
+
+def make_pair_item(a, b):
+    """One pair Item from two single Items on the same FAR group.
+
+    The pair's reference is the union of the two features' bits;
+    the caller guarantees they agree on every shared position.
+    """
+    assert a.block == b.block, "pair spans blocks: %s vs %s" % (
+        a.block, b.block)
+    assert a.group == b.group, "pair spans FAR groups: %s vs %s" % (
+        a.group, b.group)
+    merged = {}
+    for item in (a, b):
+        for pos, val in item.ref.items():
+            if pos in merged and merged[pos] != val:
+                raise AssertionError(
+                    "contradictory pair: %s + %s" % (a.key, b.key))
+            merged[pos] = val
+    return Item(
+        a.block,
+        "PAIR:%s + %s" % (a.key, b.key),
+        a.group,
+        a.fasm + "\n" + b.fasm,
+        merged,
+        {"kind": "pair", "a": a.params, "b": b.params},
+        feat_keys=set(a.feat_keys) | set(b.feat_keys),
+    )
+
+
+PAIR_COLUMN_BLOCKS = {
+    "FF_INIT": (ff_slice_items, ("CLEL_L", "CLEL_R", "CLEM", "CLEM_R")),
+    "CARRY8": (carry8_slice_items, ("CLEL_L", "CLEL_R", "CLEM", "CLEM_R")),
+    "LUTRAM": (lutram_slice_items, ("CLEM", "CLEM_R")),
+}
+
+
+def cross_block_check(ref, part, geom):
+    """Verify no two blocks share a bit position on sample slices.
+
+    Builds FF + CARRY8 + LUTRAM (CLEM only) + LUT all-ones INIT items
+    on one slice per tile type at Y_ofst 0 and 30, and counts pairs
+    whose two features belong to different blocks. Returns a stats
+    dict; the pair sweep covers zero cross-block pairs when the
+    count is zero.
+    """
+    first_col = {}
+    for x, _, t in geom.clb_cols[0]:
+        first_col.setdefault(t, x)
+    total_cross = 0
+    checked = 0
+    for t, x in sorted(first_col.items()):
+        for y in (0, 30):
+            items = []
+            items.extend(ff_slice_items(ref, part, x, y))
+            items.extend(carry8_slice_items(ref, part, x, y))
+            if t in ("CLEM", "CLEM_R"):
+                items.extend(lutram_slice_items(ref, part, x, y))
+            for letter in BEL_LETTERS:
+                bel = letter + "6LUT"
+                bits = ref.resolve_lut(part, x, y, bel, 0xFFFFFFFFFFFFFFFF)
+                items.append(Item(
+                    "LUT_INIT",
+                    "LUT_INIT:SLICE_X%dY%d:%s:all1" % (x, y, bel),
+                    far_group_for_slice(ref, part, x, y),
+                    "SLICE_X%dY%d.%s.INIT[63:0] = 0xFFFFFFFFFFFFFFFF"
+                    % (x, y, bel),
+                    bits,
+                    {"kind": "test"},
+                ))
+            agree, contra = pair_stats(items)
+            total_cross += sum(
+                1 for (a, b, _s) in agree + contra if a.block != b.block)
+            checked += 1
+    return {
+        "scope": "%d sample slices (one per tile type x Y_ofst 0, 30)" % checked,
+        "cross_block_pairs": total_cross,
+    }
+
+
+def io_site(item):
+    """Site prefix of an IO feature (IOB_X0Y15, or PIP)."""
+    feat = item.key.split(":", 2)[2]
+    return feat.split(".", 1)[0]
+
+
+def enum_pairs(ref, part, geom):
+    """Enumerate same-bit pairs. Returns (pair_items, stats, contra_samples).
+
+    pair_items: agree-pair Items to sweep. stats: per-block dict with
+    agree/contra instance and distinct-type counts plus the scope.
+    contra_samples: {block: [(a, b, shared), ...]} deterministic
+    samples of contradictory pairs for observation probes (at most 4
+    per block, first by sorted type name).
+    """
+    pair_items = []
+    stats = {}
+    contra_samples = {}
+    first_col = {}
+    for x, _, t in geom.clb_cols[0]:
+        first_col.setdefault(t, x)
+
+    # FF / CARRY8 / LUTRAM: one column per tile type, all 60 slices.
+    # Agree pairs are deduped by distinct feature-name type: one
+    # instance per type per tile type.
+    for block, (builder, tile_types) in PAIR_COLUMN_BLOCKS.items():
+        agree_types = set()
+        contra_types = set()
+        n_agree = n_contra = 0
+        swept = 0
+        contra_first = {}
+        for t in tile_types:
+            x = first_col[t]
+            feats = []
+            for y in range(N_Y_OFST_CLB):
+                feats.extend(builder(ref, part, x, y))
+            agree, contra = pair_stats(feats)
+            n_agree += len(agree)
+            n_contra += len(contra)
+            seen = set()
+            for (a, b, shared) in agree:
+                typ = tuple(sorted((pair_type_name(a), pair_type_name(b))))
+                agree_types.add(typ)
+                if typ in seen:
+                    continue
+                seen.add(typ)
+                pair_items.append(make_pair_item(a, b))
+                swept += 1
+            for (a, b, shared) in contra:
+                typ = tuple(sorted((pair_type_name(a), pair_type_name(b))))
+                contra_types.add(typ)
+                if typ not in contra_first:
+                    contra_first[typ] = (a, b, shared)
+        stats[block] = {
+            "scope": "one column per tile type (%s), all 60 slices; "
+            "one instance per distinct agree type per tile type"
+            % ", ".join(tile_types),
+            "agree_instances": n_agree,
+            "agree_types": len(agree_types),
+            "agree_swept": swept,
+            "contra_instances": n_contra,
+            "contra_types": len(contra_types),
+            "contra_swept": 0,
+        }
+        contra_samples[block] = [
+            contra_first[typ] for typ in sorted(contra_types)[:4]]
+
+    # INT: agree pairs kept per tile on the same 8 tiles as the
+    # single sweep (the encoding is tile-independent).
+    eight = []
+    for r in geom.rows:
+        for col in (0, 1):
+            eight.append((col, r * N_Y_OFST_CLB))
+    int_agree_types = set()
+    int_contra_types = set()
+    int_contra_first = {}
+    n_int_agree = n_int_contra = 0
+    for (x, y) in eight:
+        feats = int_tile_items(ref, part, x, y)
+        agree, contra = pair_stats(feats)
+        n_int_agree += len(agree)
+        n_int_contra += len(contra)
+        for (a, b, shared) in agree:
+            typ = tuple(sorted((pair_type_name(a), pair_type_name(b))))
+            int_agree_types.add(typ)
+            pair_items.append(make_pair_item(a, b))
+        for (a, b, shared) in contra:
+            typ = tuple(sorted((pair_type_name(a), pair_type_name(b))))
+            int_contra_types.add(typ)
+            if typ not in int_contra_first:
+                int_contra_first[typ] = (a, b, shared)
+    stats["INT_PIP"] = {
+        "scope": "8 tiles (same reduction as the single sweep)",
+        "agree_instances": n_int_agree,
+        "agree_types": len(int_agree_types),
+        "agree_swept": n_int_agree,
+        "contra_instances": n_int_contra,
+        "contra_types": len(int_contra_types),
+        "contra_swept": 0,
+    }
+    contra_samples["INT_PIP"] = [
+        int_contra_first[typ] for typ in sorted(int_contra_types)[:4]]
+
+    # IO: one bridged tile. Agree pairs are deduped by
+    # (shared-position set, site pair): one pair per distinct
+    # shared-bit interaction (see the module header for why the
+    # full 3976 are not packed; packing them needs ~2800 emits).
+    feats = io_tile_items(ref, part, geom)
+    agree, contra = pair_stats(feats)
+    io_contra_first = {}
+    seen_io = set()
+    swept_io = 0
+    for (a, b, shared) in agree:
+        group_key = (frozenset(shared),
+                     tuple(sorted((io_site(a), io_site(b)))))
+        if group_key in seen_io:
+            continue
+        seen_io.add(group_key)
+        pair_items.append(make_pair_item(a, b))
+        swept_io += 1
+    for (a, b, shared) in contra:
+        typ = tuple(sorted((pair_type_name(a), pair_type_name(b))))
+        if typ not in io_contra_first:
+            io_contra_first[typ] = (a, b, shared)
+    stats["IO_CONFIG"] = {
+        "scope": "one bridged tile HPIO_RIGHT_X0Y0; one pair per "
+        "(shared-position set, site pair)",
+        "agree_instances": len(agree),
+        "agree_types": len(agree),
+        "agree_swept": swept_io,
+        "subset_groups": len(seen_io),
+        "contra_instances": len(contra),
+        "contra_types": len(contra),
+        "contra_swept": 0,
+    }
+    contra_samples["IO_CONFIG"] = [
+        io_contra_first[typ] for typ in sorted(io_contra_first)[:4]]
+
+    # LUT / BRAM: analytic zero. A LUT holds one 64-bit INIT and a
+    # RAMB holds one INIT/INITP value, so two INITs on one BEL/RAMB
+    # are contradictory, and INITs on different BELs/RAMBs are
+    # disjoint (proven by verify_lut_disjoint / verify_bram_disjoint).
+    # There is no same-bit pair to sweep.
+    for block, what in (
+        ("LUT_INIT", "one 64-bit INIT per BEL"),
+        ("BRAM_CONTENT", "one INIT value per RAMB18"),
+        ("BRAM_PARITY", "one INITP value per RAMB18"),
+    ):
+        stats[block] = {
+            "scope": "analytic: %s; no same-bit pairs exist" % what,
+            "agree_instances": 0,
+            "agree_types": 0,
+            "agree_swept": 0,
+            "contra_instances": 0,
+            "contra_types": 0,
+            "contra_swept": 0,
+        }
+    contra_samples["LUT_INIT"] = []
+    contra_samples["BRAM_CONTENT"] = []
+    contra_samples["BRAM_PARITY"] = []
+
+    stats["CROSS_BLOCK"] = cross_block_check(ref, part, geom)
+    return pair_items, stats, contra_samples
+
+
+def run_contra_probes(ref, part, emitter_cmd, samples, out_dir, records):
+    """Observe what the emitter does with contradictory pairs.
+
+    Each sampled pair is emitted alone; the outcome is recorded as
+    an observation (kind contra-probe), never as a red: no assignment
+    satisfies both features, so there is no valid expected bitset.
+    For each shared position the record carries what each side
+    wanted and what the emitter actually set.
+    """
+    for block in sorted(samples):
+        for idx, (a, b, shared) in enumerate(samples[block]):
+            name = "contra-%s-%d" % (block, idx)
+            fasm_path = os.path.join(out_dir, name + ".fasm")
+            bit_path = os.path.join(out_dir, name + ".bit")
+            bits_path = os.path.join(out_dir, name + ".bits")
+            with open(fasm_path, "w") as f:
+                f.write("# contra probe: %s + %s\n%s\n%s\n"
+                        % (a.key, b.key, a.fasm, b.fasm))
+            ra = ref_int_keys(a, a.ref)
+            rb = ref_int_keys(b, b.ref)
+            rec = {
+                "kind": "contra-probe", "block": block,
+                "pair": "%s + %s" % (a.key, b.key),
+                "positions": [],
+            }
+            try:
+                run_emitter_emit(emitter_cmd, fasm_path, part, bit_path)
+            except (SweepError, subprocess.TimeoutExpired) as err:
+                rec["outcome"] = "emit failed loud: %s" % err
+                records.append(rec)
+                continue
+            try:
+                run_emitter_bits(emitter_cmd, bit_path, part, bits_path)
+            except (SweepError, subprocess.TimeoutExpired) as err:
+                rec["outcome"] = "emit ok, bits failed loud: %s" % err
+                records.append(rec)
+                continue
+            emitted = set()
+            for far, off, _blk in parse_bits_file(bits_path):
+                if block == "IO_CONFIG":
+                    emitted.add(key64(far & 0xFF, off))
+                else:
+                    emitted.add(key64(far, off))
+            for k in shared:
+                rec["positions"].append({
+                    "far": ("frame %d (tile-relative)" % far_of(k)
+                            if block == "IO_CONFIG"
+                            else "0x%08x" % far_of(k)),
+                    "offset": int(off_of(k)),
+                    "wanted_by_a": ra[k],
+                    "wanted_by_b": rb[k],
+                    "observed": 1 if k in emitted else 0,
+                })
+            rec["outcome"] = "emit ok, bits ok"
+            records.append(rec)
+            try:
+                os.remove(bit_path)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Reference regeneration (the differ calls this per item)
 # ---------------------------------------------------------------------------
 
 def resolve_item(ref, part, item):
     """Reference bits for one item, regenerated from its params."""
-    p = item.params
+    return resolve_item_params(ref, part, item.params)
+
+
+def resolve_item_params(ref, part, params):
+    """Reference bits for one params dict (recurses for pairs)."""
+    p = params
     kind = p["kind"]
+    if kind == "pair":
+        merged = {}
+        for sub in (p["a"], p["b"]):
+            for pos, val in resolve_item_params(ref, part, sub).items():
+                if pos in merged and merged[pos] != val:
+                    raise AssertionError(
+                        "pair sub-features disagree at %r" % (pos,))
+                merged[pos] = val
+        return merged
     if kind == "lut":
         return ref.resolve_lut(part, p["x"], p["y"], p["bel"], lut_code_value(p["code"]))
     if kind == "ff":
@@ -674,7 +1109,8 @@ def resolve_item(ref, part, item):
 class Emit:
     """One emitter run: a set of items with no value conflicts."""
 
-    __slots__ = ("block", "index", "items", "groups", "lines", "emit_id_override")
+    __slots__ = ("block", "index", "items", "groups", "lines",
+                 "emit_id_override", "feat_keys")
 
     def __init__(self, block, index):
         self.block = block
@@ -683,6 +1119,7 @@ class Emit:
         self.groups = {}  # far_group -> {pos_key: value}
         self.lines = 0
         self.emit_id_override = None
+        self.feat_keys = set()
 
     @property
     def emit_id(self):
@@ -693,7 +1130,11 @@ class Emit:
     def conflicts(self, item):
         """True when the item requires a different value at a position
         this emit already constrains (same far_group only; other
-        groups are different FARs and cannot collide)."""
+        groups are different FARs and cannot collide), or when the
+        item repeats a feature key already in this emit (the emitter
+        fails loud on a duplicated FASM line)."""
+        if self.feat_keys & set(item.feat_keys):
+            return True
         union = self.groups.get(item.group)
         if union is None:
             return False
@@ -707,8 +1148,9 @@ class Emit:
         union = self.groups.setdefault(item.group, {})
         for key, val in ref_int_keys(item, item.ref).items():
             union.setdefault(key, val)
+        self.feat_keys |= set(item.feat_keys)
         self.items.append(item)
-        self.lines += 1
+        self.lines += item.fasm.count("\n") + 1
 
 
 def pack_mode_a(block, items, max_lines):
@@ -989,7 +1431,7 @@ def diff_emit(ref, part, emit, bits_path, records):
 
 def write_fasm(path, emit):
     with open(path, "w") as f:
-        f.write("# single-feature sweep emit %s: %d items, block %s\n" % (
+        f.write("# sweep emit %s: %d items, block %s\n" % (
             emit.emit_id, len(emit.items), emit.block))
         f.write("# packed: features share this emit only when no bit "
                 "position is required to two different values.\n")
@@ -1560,8 +2002,89 @@ def write_report(ref, part, geom, out_dir, records, report_path,
 # Main
 # ---------------------------------------------------------------------------
 
+def run_pairs(args, ref, geom, out_dir, jsonl_path, records,
+              completed_emit_ids, started, commands):
+    """Pair-sweep driver: enumerate, pack, run, probe, summarize."""
+    t0 = time.time()
+    pair_items, stats, contra_samples = enum_pairs(
+        ref, args.part, geom)
+    print("pair enumeration in %.1fs" % (time.time() - t0))
+    for block in ("FF_INIT", "CARRY8", "LUTRAM", "INT_PIP", "IO_CONFIG",
+                  "LUT_INIT", "BRAM_CONTENT", "BRAM_PARITY"):
+        s = stats[block]
+        print("%s: agree instances %d, types %d, swept %d; "
+              "contra instances %d, types %d" % (
+                  block, s["agree_instances"], s["agree_types"],
+                  s["agree_swept"], s["contra_instances"],
+                  s["contra_types"]))
+    print("cross-block pairs: %d (%s)" % (
+        stats["CROSS_BLOCK"]["cross_block_pairs"],
+        stats["CROSS_BLOCK"]["scope"]))
+    n_probes = args.contra_probes
+    samples = {}
+    if n_probes:
+        for block, lst in contra_samples.items():
+            samples[block] = lst[:n_probes]
+
+    all_emits = []
+    for block in ("FF_INIT", "CARRY8", "LUTRAM", "INT_PIP", "IO_CONFIG"):
+        items = [i for i in pair_items if i.block == block]
+        if not items:
+            continue
+        t0 = time.time()
+        emits = pack_block(block, items, args.max_lines)
+        for e in emits:
+            e.emit_id_override = "PAIR-%s-%03d" % (block, e.index)
+        print("%s: %d pair items in %d emits (%.1fs)" % (
+            block, len(items), len(emits), time.time() - t0))
+        all_emits.extend(emits)
+    if args.limit_emits:
+        all_emits = all_emits[:args.limit_emits]
+    print("total pair emits planned: %d" % len(all_emits))
+    if args.dry_run:
+        plan_path = os.path.join(out_dir, "pair_plan.json")
+        with open(plan_path, "w") as f:
+            json.dump([{"emit": e.emit_id, "block": e.block,
+                        "items": len(e.items), "lines": e.lines}
+                       for e in all_emits], f, indent=1)
+        print("dry run: plan written to %s" % plan_path)
+        return 0
+
+    totals = run_jobs(ref, args.part, args.emitter, all_emits, out_dir,
+                      records, completed_emit_ids)
+    print("pair sweep totals (green, red, extra): %s" % (totals,))
+    if samples:
+        run_contra_probes(ref, args.part, args.emitter, samples,
+                          out_dir, records)
+        print("contra probes run: %d" % sum(
+            len(v) for v in samples.values()))
+
+    with open(jsonl_path, "w") as f:
+        for rec in records:
+            f.write(json.dumps(rec, sort_keys=True) + "\n")
+    finished = datetime.datetime.now().isoformat(timespec="seconds")
+    summary = {
+        "part": args.part, "started": started, "finished": finished,
+        "mode": "pairs",
+        "totals": {"green": totals[0], "red": totals[1], "extra": totals[2]},
+        "emits": actual_emit_count(records),
+        "planned_emits": len(all_emits),
+        "pair_stats": stats,
+        "contra_probes": sum(len(v) for v in samples.values()),
+        "commands": commands,
+        "out_dir": out_dir,
+    }
+    with open(os.path.join(out_dir, "pair_summary.json"), "w") as f:
+        json.dump(summary, f, indent=1, sort_keys=True)
+    print("pair summary written to %s" % os.path.join(
+        out_dir, "pair_summary.json"))
+    print("results in %s" % out_dir)
+    return 0
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Single-feature sweep")
+    ap = argparse.ArgumentParser(
+        description="Single-feature and pair sweeps")
     ap.add_argument("--part", default=PART)
     ap.add_argument("--blocks", default=",".join(
         ["LUT_INIT", "FF_INIT", "CARRY8", "BRAM_CONTENT", "BRAM_PARITY",
@@ -1577,6 +2100,12 @@ def main(argv=None):
                     help="stop after N emits (0 = no limit)")
     ap.add_argument("--report-only", action="store_true")
     ap.add_argument("--report-path", default=None)
+    ap.add_argument("--pairs", action="store_true",
+                    help="run the same-bit pair sweep instead of the "
+                    "single-feature sweep")
+    ap.add_argument("--contra-probes", type=int, default=4,
+                    help="contradictory pairs sampled per block for "
+                    "observation probes (0 = none)")
     args = ap.parse_args(argv)
 
     started = datetime.datetime.now().isoformat(timespec="seconds")
@@ -1617,6 +2146,9 @@ def main(argv=None):
     if not os.path.exists(args.emitter):
         print("error: emitter not found: %s" % args.emitter)
         return 2
+    if args.pairs:
+        return run_pairs(args, ref, geom, out_dir, jsonl_path, records,
+                         completed_emit_ids, started, commands)
     blocks = [b.strip() for b in args.blocks.split(",") if b.strip()]
     for b in blocks:
         if b not in ENUMERATORS and b not in ("BRAM_CONTENT", "BRAM_PARITY"):
