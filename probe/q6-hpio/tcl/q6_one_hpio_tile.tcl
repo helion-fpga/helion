@@ -67,6 +67,7 @@ proc q6_main { fpga_part xdc_file verilog_file bitstream_out } {
 if { [llength $::argv] != 4 } {
   puts "received mandatory args: $::argv"
   puts "expected mandatory args: <fpga_part> <xdc_file> <verilog_file> <bitstream_out>"
+  exit 1
 } else {
   set fpga_part [lindex $::argv 0]
   set xdc_file [lindex $::argv 1]
