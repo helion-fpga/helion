@@ -517,7 +517,11 @@ fn bits_for_bytes(
             }
         }
     }
-    for pos in frame_set.iter() {
+    // Sorted, so the first unexplained bit named in the error is
+    // stable run to run (HashSet iteration order is not).
+    let mut frame_bits: Vec<(u32, u16)> = frame_set.iter().copied().collect();
+    frame_bits.sort();
+    for pos in &frame_bits {
         if !bits.contains_key(pos) {
             return Err(format!(
                 "bit {1} of FAR 0x{0:08x} is set in the bitstream but no parse-back feature explains it",

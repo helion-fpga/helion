@@ -160,6 +160,32 @@ def parse_init_value(value, width=64):
     return n
 
 
+def parse_bram_value(value, width):
+    """Parse a whole-array BRAM value to a bit list of exactly width ints.
+
+    Accepts 0x<hex>, N'h<hex> (Verilog, as the emitter renders on
+    parse-back), or decimal. Bit i of the list is absolute bit i
+    (INIT word i//256, bit i%256). Leading zeros are harmless; a value
+    wider than width bits fails loud instead of truncating.
+    """
+    if value is None:
+        raise FasmError("BRAM feature with no value")
+    v = value.strip()
+    if _HEX_RE.match(v):
+        n = int(v, 16)
+    elif re.match(r"^\d+'[hH][0-9a-fA-F]+$", v):
+        n = int(v.split(chr(39), 1)[1][1:], 16)
+    elif v.isdigit():
+        n = int(v, 10)
+    else:
+        raise FasmError(
+            "BRAM value %r is not hex, Verilog hex, or decimal" % value
+        )
+    if n >= (1 << width):
+        raise FasmError("BRAM value %r exceeds %d bits" % (value, width))
+    return [(n >> i) & 1 for i in range(width)]
+
+
 def classify(feature):
     """Map a parsed Feature to its block in the registry.
 
