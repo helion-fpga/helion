@@ -226,6 +226,144 @@ pub fn far_decode(far: u32) -> (u8, u8, u16, u8) {
 }
 
 // ---------------------------------------------------------------------------
+// FAR geometry: the device auto-increment order
+// ---------------------------------------------------------------------------
+//
+// The configuration logic advances the FAR geometry-aware, not by plain
+// integer +1: minor +1, wrapping to the next column at the column height,
+// then the next row, then the next block type (UG570 table 9-21 field
+// order). Plain +1 is wrong for any multi-frame FDRI packet that crosses
+// a column boundary: it lands on a minor past the column height, which
+// addresses no real frame. Proven three ways on real Vivado files by the
+// decoder crew (BitFiltrator FrameAddressIncrementer; MFWR run-start
+// anchors in d2.bit matching geometry-aware on all 68 runs and
+// mismatching plain +1 on 4; decoded unique-frame totals matching device
+// totals only under geometry-aware).
+//
+// This trait and `far_increment` are the twin of the decoder's
+// `FarGeometry` / `far_increment` in `bitstream_packets.rs` (decoder
+// branch, unmerged): same method shapes, same wrap semantics, same FAR
+// field layout. Two copies exist only because that module is not on this
+// branch; unify them into one shared definition at integration. The
+// `far_increment_matches_decoder_d2_walk` test pins this copy to the
+// decoder's published d2.bit walk, so a drift between the copies fails
+// the suite instead of failing silently.
+
+/// Per-part FAR geometry: minor counts per column, column counts per row,
+/// row counts per block. `block` is 0 (CLB/IO/CLK) or 1 (BRAM content).
+pub trait FarGeometry {
+    /// Number of minor addresses (frames) in one column of one row of
+    /// one block. None when the column does not exist.
+    fn minor_count(&self, block: u8, row: u8, col: u16) -> Option<u16>;
+    /// Number of columns in one row of one block. None when the row does
+    /// not exist.
+    fn column_count(&self, block: u8, row: u8) -> Option<u16>;
+    /// Number of FAR rows in one block. None when the block has no rows.
+    fn row_count(&self, block: u8) -> Option<u8>;
+}
+
+/// Geometry-aware FAR increment: minor +1, wrapping to the next column at
+/// the column height, then the next row, then block 1 (BRAM content).
+/// Returns None when the FAR is outside the geometry or the increment
+/// would run past the last frame of block 1. The roll from the last block
+/// 0 frame to the first block 1 frame is unconditional once block 1 is
+/// reached, matching the decoder: its tables always define both blocks.
+pub fn far_increment(geometry: &dyn FarGeometry, far: u32) -> Option<u32> {
+    let (block, row, col, minor) = far_decode(far);
+    let height = geometry.minor_count(block, row, col)?;
+    let mut minor = minor as u16 + 1;
+    let mut col = col;
+    let mut row = row;
+    let mut block = block;
+    if minor < height {
+        return far_encode(block, row, col, minor as u8).ok();
+    }
+    minor = 0;
+    col += 1;
+    let ncols = geometry.column_count(block, row)?;
+    if col < ncols {
+        return far_encode(block, row, col, minor as u8).ok();
+    }
+    col = 0;
+    row += 1;
+    let nrows = geometry.row_count(block)?;
+    if row < nrows {
+        return far_encode(block, row, col, minor as u8).ok();
+    }
+    row = 0;
+    block += 1;
+    if block > block::BRAM_CONTENT {
+        return None;
+    }
+    far_encode(block, row, col, minor as u8).ok()
+}
+
+/// FAR geometry derived from a device config order: the emitter's own
+/// per-column frame counts, read off the ordered list of every real frame
+/// FAR (`BitgenDevice::config_order_fars`, built in `bitgen_device.rs`
+/// from the device file's minors-per-column tables). Ascending FAR
+/// integer order is block, row, column, minor, which is exactly the
+/// geometry-aware increment order, so counting the FARs in each
+/// (block, row, column) gives that column's height, counting distinct
+/// columns gives the row width, and counting distinct rows gives the row
+/// count.
+///
+/// The list must enumerate every real frame of the device, as the
+/// `DeviceFile` config order does (its count equals
+/// `DeviceFile::total_frames`). A partial list, such as a test stub that
+/// lists only touched frames, yields a partial geometry: columns it does
+/// not list report no height, and `far_increment` fails loud there
+/// instead of guessing.
+#[derive(Debug, Default)]
+pub struct ConfigOrderGeometry {
+    minors: HashMap<(u8, u8, u16), u16>,
+    columns: HashMap<(u8, u8), u16>,
+    rows: HashMap<u8, u8>,
+}
+
+impl ConfigOrderGeometry {
+    /// Build the geometry from the device config order.
+    pub fn from_config_order(fars: &[u32]) -> Self {
+        let mut minors: HashMap<(u8, u8, u16), u16> = HashMap::new();
+        let mut col_set: HashMap<(u8, u8), HashSet<u16>> = HashMap::new();
+        let mut row_set: HashMap<u8, HashSet<u8>> = HashMap::new();
+        for &far in fars {
+            let (block, row, col, _minor) = far_decode(far);
+            *minors.entry((block, row, col)).or_insert(0) += 1;
+            col_set.entry((block, row)).or_default().insert(col);
+            row_set.entry(block).or_default().insert(row);
+        }
+        let columns = col_set
+            .into_iter()
+            .map(|(key, set)| (key, set.len() as u16))
+            .collect();
+        let rows = row_set
+            .into_iter()
+            .map(|(key, set)| (key, set.len() as u8))
+            .collect();
+        Self {
+            minors,
+            columns,
+            rows,
+        }
+    }
+}
+
+impl FarGeometry for ConfigOrderGeometry {
+    fn minor_count(&self, block: u8, row: u8, col: u16) -> Option<u16> {
+        self.minors.get(&(block, row, col)).copied()
+    }
+
+    fn column_count(&self, block: u8, row: u8) -> Option<u16> {
+        self.columns.get(&(block, row)).copied()
+    }
+
+    fn row_count(&self, block: u8) -> Option<u8> {
+        self.rows.get(&block).copied()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
@@ -1898,9 +2036,40 @@ fn parse_packets(words: &[u32]) -> Result<Vec<Packet>, BitgenError> {
 
 /// Parse a bitstream into frames, verifying every CRC-register write.
 /// Accepts raw (.bin) input or .bit input with a TLV header. Returns frames
-/// keyed by FAR. FDRI writes auto-increment the FAR by integer +1 per frame,
-/// which follows FAR increment order (minor, column, row, block type).
+/// keyed by FAR.
+///
+/// A multi-frame FDRI packet advances the FAR geometry-aware between its
+/// frames (see `far_increment`); this entry point carries no geometry, so
+/// it accepts only single-frame FDRI packets and fails loud on a
+/// multi-frame one instead of silently mis-addressing its frames by plain
+/// +1. Pass the device geometry explicitly with
+/// `parse_frames_with_geometry` for streams whose FDRI packets carry more
+/// than one frame, such as Vivado bitstreams. A following FDRI packet
+/// without an intervening FAR rewrite re-addresses the last frame under
+/// this entry point; the geometry entry point continues at the next frame.
 pub fn parse_frames(bytes: &[u8]) -> Result<BTreeMap<u32, FrameWords>, BitgenError> {
+    parse_frames_inner(bytes, None)
+}
+
+/// Parse a bitstream into frames with explicit FAR geometry, verifying
+/// every CRC-register write. Accepts raw (.bin) input or .bit input with
+/// a TLV header. Returns frames keyed by FAR. Successive frames of one
+/// FDRI packet advance by `far_increment` on `geometry`, so packets
+/// crossing a column boundary land on the next column's minor 0. The
+/// geometry normally comes from the device config order
+/// (`ConfigOrderGeometry::from_config_order` over
+/// `BitgenDevice::config_order_fars`).
+pub fn parse_frames_with_geometry(
+    bytes: &[u8],
+    geometry: &dyn FarGeometry,
+) -> Result<BTreeMap<u32, FrameWords>, BitgenError> {
+    parse_frames_inner(bytes, Some(geometry))
+}
+
+fn parse_frames_inner(
+    bytes: &[u8],
+    geometry: Option<&dyn FarGeometry>,
+) -> Result<BTreeMap<u32, FrameWords>, BitgenError> {
     if bytes.len() % 4 != 0 {
         return Err(BitgenError::Truncated {
             at_byte: bytes.len(),
@@ -1948,11 +2117,44 @@ pub fn parse_frames(bytes: &[u8]) -> Result<BTreeMap<u32, FrameWords>, BitgenErr
                         words: packet.data.len(),
                     });
                 }
-                for chunk in packet.data.chunks_exact(FRAME_WORDS) {
+                if geometry.is_none() && packet.data.len() > FRAME_WORDS {
+                    return Err(BitgenError::BadFar {
+                        reason: format!(
+                            "multi-frame FDRI packet at FAR 0x{far:08x} carries {} frames but no FAR geometry was supplied; the FAR increment is geometry-aware, not plain +1, so the frames cannot be addressed without it (use parse_frames_with_geometry)",
+                            packet.data.len() / FRAME_WORDS
+                        ),
+                    });
+                }
+                for (i, chunk) in packet.data.chunks_exact(FRAME_WORDS).enumerate() {
+                    if i > 0 {
+                        // Geometry is present here: the no-geometry
+                        // multi-frame case returned above.
+                        let geometry = geometry.ok_or_else(|| BitgenError::BadFar {
+                            reason: "multi-frame FDRI packet without FAR geometry".to_string(),
+                        })?;
+                        far = far_increment(geometry, far).ok_or_else(|| {
+                            BitgenError::BadFar {
+                                reason: format!(
+                                    "FAR 0x{far:08x} has no geometry-aware successor; the FDRI packet runs past the device end or outside the geometry"
+                                ),
+                            }
+                        })?;
+                    }
                     let mut frame = [0u32; FRAME_WORDS];
                     frame.copy_from_slice(chunk);
                     frames.insert(far, frame);
-                    far = far.wrapping_add(1);
+                }
+                // Advance once so a following FDRI packet without a FAR
+                // rewrite continues at the next frame. Tolerate running
+                // off the device end: the last frame of the device has
+                // no successor, and the stream ends there. An empty FDRI
+                // packet writes no frame and advances nothing.
+                if !packet.data.is_empty() {
+                    if let Some(geometry) = geometry {
+                        if let Some(next) = far_increment(geometry, far) {
+                            far = next;
+                        }
+                    }
                 }
                 let _ = crc.feed_packet(addr, &packet.data);
             }
@@ -2005,7 +2207,8 @@ pub fn parse_bitstream(
     device: &dyn BitgenDevice,
     segbits: &dyn SegbitsDb,
 ) -> Result<String, BitgenError> {
-    let frames = parse_frames(bytes)?;
+    let geometry = ConfigOrderGeometry::from_config_order(device.config_order_fars());
+    let frames = parse_frames_with_geometry(bytes, &geometry)?;
     if let Some(expected_idcode) = device.idcode() {
         let found = find_idcode(bytes)?;
         if let Some(found) = found {

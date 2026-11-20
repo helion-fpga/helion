@@ -60,8 +60,9 @@
 
 use helion_ultrascale::bitgen::{
     BitgenDevice, BitgenError, BramFeature, bram_feature_placed_bits, emit_bitstream,
-    parse_bitstream, parse_bram_tile, parse_fasm, parse_frames,
+    parse_bitstream, parse_bram_tile, parse_fasm,
 };
+use helion_ultrascale::bitgen::{ConfigOrderGeometry, parse_frames_with_geometry};
 use helion_ultrascale::device_file::DeviceFile;
 use helion_ultrascale::segbits::{FileSegbitsDb, SegbitsDb};
 use std::collections::{BTreeMap, HashSet};
@@ -348,8 +349,9 @@ fn bits_for_bytes(
     device: &dyn BitgenDevice,
     segbits: &dyn SegbitsDb,
 ) -> Result<String, String> {
-    let frames =
-        parse_frames(bytes).map_err(|e: BitgenError| format!("cannot parse frames: {e}"))?;
+    let geometry = ConfigOrderGeometry::from_config_order(device.config_order_fars());
+    let frames = parse_frames_with_geometry(bytes, &geometry)
+        .map_err(|e: BitgenError| format!("cannot parse frames: {e}"))?;
     let fasm = parse_bitstream(bytes, device, segbits)
         .map_err(|e: BitgenError| format!("parse failed: {e}"))?;
     let entries =
@@ -780,7 +782,7 @@ fn is_lutram_mode(feature: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helion_ultrascale::bitgen::{emit_frames, far_encode};
+    use helion_ultrascale::bitgen::{emit_frames, far_encode, parse_frames};
     use std::collections::BTreeSet;
     use std::collections::HashMap;
 
