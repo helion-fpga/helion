@@ -95,7 +95,12 @@
 //!   lines: its features are all at default and indistinguishable from
 //!   absent. This keeps an unused tile out of the output; a touched
 //!   tile still renders its complement `.V0` / `.V1` lines, which is
-//!   the complete-FASM form the crate canonicalizes to.
+//!   the complete-FASM form the crate canonicalizes to. An all-`!`
+//!   complement-default line additionally requires the window to have
+//!   a set bit a real feature of the window owns (see
+//!   `window_has_owned_set_bit`): a window active only on bits no
+//!   feature owns renders no complement defaults, so widening a window
+//!   over a featureless band (H-1 RCLK) invents no lines.
 //!
 //! # Regrouping (no new encoding, only the harness canonical form)
 //!
@@ -200,6 +205,10 @@ pub fn decode_frames(frames: &[Frame], db_root: &str) -> Result<DecodeOutput, St
         if !window_is_active(window, &frame_map) {
             continue;
         }
+        // Lazily computed on first use: whether the window has a set
+        // bit a real feature owns (H-1 owned-bit gate, see
+        // `window_has_owned_set_bit`).
+        let mut owned_set_bit: Option<bool> = None;
         let (block_type, row, col, _) = far_decode(window.base_far);
         for unit in window_units {
             if unit.block != window.block {
@@ -268,7 +277,18 @@ pub fn decode_frames(frames: &[Frame], db_root: &str) -> Result<DecodeOutput, St
                         .get(&window.tile_type)
                         .map(|s| s.contains(&zero_signature(&unit.refs)))
                         .unwrap_or(false);
-                if all_set && all_zero && observable {
+                // H-1: an all-`!` complement default renders only when
+                // the window has a set bit a real feature owns. A
+                // window active on unowned bits alone (the widened
+                // RCLK band) emits no complement defaults.
+                let owned = if set_refs.is_empty() {
+                    *owned_set_bit.get_or_insert_with(|| {
+                        window_has_owned_set_bit(window, window_units, &set_bits)
+                    })
+                } else {
+                    true
+                };
+                if all_set && all_zero && observable && owned {
                     Some(Vec::new())
                 } else {
                     None
@@ -517,6 +537,62 @@ fn window_is_active(window: &TileWindow, frame_map: &HashMap<u32, &[u32]>) -> bo
         }
     }
     false
+}
+
+/// True when the window has at least one set bit at a position a real
+/// feature of the window actually owns: a non-`!` ref of some unit of
+/// the window's tile type and block, resolved to its absolute
+/// (FAR, bit) exactly as the main loop resolves it, and present in
+/// `set_bits`.
+///
+/// H-1: widening an RCLK window from bit 1488 down to 1440 activates
+/// the window on set bits in the new band (relative bits 0-47), bits
+/// no feature owns yet. Without this gate the newly active window
+/// renders its all-`!` complement-default lines (their `!` bits all
+/// read 0), inventing FASM lines bit2fasm never emits. A window whose
+/// only set bits are unowned is not evidence any of its features is
+/// configured, so it emits no complement defaults. A window with an
+/// owned set bit is unchanged. (bit2fasm's group-drop rule is the
+/// stricter form of this gate; the owned-bit form is used here because
+/// it is the minimal change that fixes the H-1 gate while keeping the
+/// validated unpatched-root normalized output exact. On the raw
+/// unpatched output it removes only 48 pre-existing spurious `.V0`
+/// lines in P-11 (one CMT tile, 0 of them in the bit2fasm baseline).
+/// If the normalized diff ever shows a decoded-only all-`!` line from
+/// a window with owned set bits but no matched non-zero feature, the
+/// gate must be tightened to "at least one claimed set bit".)
+fn window_has_owned_set_bit(
+    window: &TileWindow,
+    units: &[Unit],
+    set_bits: &HashSet<u64>,
+) -> bool {
+    let (block_type, row, col, _) = far_decode(window.base_far);
+    units
+        .iter()
+        .filter(|unit| unit.block == window.block)
+        .flat_map(|unit| unit.refs.iter())
+        .filter(|r| !r.must_be_zero)
+        .any(|r| {
+            // Same bounds as the main loop: a ref outside the
+            // window's frame range has no absolute position and can
+            // never be an owned set bit (the main loop itself errors
+            // on it when it evaluates that unit).
+            if r.frame >= window.frames {
+                return false;
+            }
+            let minor = window.base_minor as u32 + r.frame;
+            if minor > u8::MAX as u32 {
+                return false;
+            }
+            let Some(far) = far_encode(block_type, row, col, minor as u8).ok() else {
+                return false;
+            };
+            let abs_bit = r.bit as u32 + window.bit_lo;
+            if abs_bit >= window.bit_hi {
+                return false;
+            }
+            set_bits.contains(&bit_key(far, abs_bit))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,6 +1111,32 @@ CLEL_L.SOME.MUX.DEFAULT !13_03\n";
             !out.fasm.iter().any(|l| l.contains("MUX.DEFAULT")),
             "fasm: {:?}",
             out.fasm
+        );
+    }
+
+    /// H-1: a window active only on bits no feature owns renders no
+    /// complement-default lines. Frame 12 bit 5 is inside the window
+    /// [0, 48) but no feature lists it as a set bit, so the window has
+    /// no owned set bit and the all-`!` complement lines (AFF.INIT.V1,
+    /// AFF.SRVAL.V1, ABCDFF.CEUSED.V0) must stay absent. Without the
+    /// owned-bit gate they render, inventing FASM lines bit2fasm
+    /// never emits. The owned-bit case is covered by
+    /// `known_feature_decodes_to_exactly_that_feature`, which asserts
+    /// the complement lines do render when an owned bit is set.
+    #[test]
+    fn window_active_only_on_unowned_bits_renders_no_complement_defaults() {
+        let dir = fixture_dir("unowned_only");
+        write_fixture(&dir, CLB_TILEGRID, &[("segbits_clel_l.db", CLB_SEGBITS)]);
+        let frames = vec![frame(0x0000_0F0C, &[5])];
+        let out = decode_frames(&frames, dir.to_str().unwrap()).unwrap();
+        assert!(out.fasm.is_empty(), "fasm: {:?}", out.fasm);
+        assert_eq!(
+            out.unexplained,
+            vec![DecodedBit {
+                far: 0x0000_0F0C,
+                word: 0,
+                bit: 5
+            }]
         );
     }
 
