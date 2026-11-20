@@ -129,10 +129,10 @@ the header. Vivado confirmation must still re-check the count.
 Status: OPEN, verified, narrowed, not closable from public
 sources. The gap is 16 frames, exactly 4 per FAR row, and the
 4-per-row pattern is confirmed on eight devices whose UG570
-counts were checked (xcku3p, xcku5p, xcau20p, xcau25p,
-xcau10p, xcau15p, xcku025, xcku035: UG570 41,476 / 41,476 /
-14,376 / 14,376 / 32,530 / 32,530, file 41,460 / 41,460 /
-14,364 / 14,364 / 32,510 / 32,510). The replacement-worker
+counts were checked (xcku3p UG570 41,476 / file 41,460;
+xcku5p 41,476 / 41,460; xcau20p 41,476 / 41,460; xcau25p
+41,476 / 41,460; xcau10p 14,376 / 14,364; xcau15p 14,376 /
+14,364; xcku025 32,530 / 32,510; xcku035 32,530 / 32,510). The replacement-worker
 check 2026-11-19 extends the pattern beyond UltraScale+:
 xcku025/xcku035 are 123-word-frame UltraScale parts and show
 the same 4.00 per row (gap 20 over 5 rows). The
