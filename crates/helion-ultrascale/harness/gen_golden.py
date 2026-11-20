@@ -223,8 +223,16 @@ def design_ff_locations(design):
     Raises KeyError for an unknown design; the caller maps it to
     FasmError so the round-trip stage reports blocked, never a
     traceback.
+
+    A design entry may carry an explicit "ff_locations" list of
+    (tile, bel) pairs (US-07 generated designs, which place FFs on
+    several slices); entries without it keep the frozen single-slice
+    behaviour (all FFs on SLICE_X0Y0).
     """
-    return [(LOGIC_TILE, bel) for bel in DESIGNS[design]["ffs"]]
+    entry = DESIGNS[design]
+    if "ff_locations" in entry:
+        return list(entry["ff_locations"])
+    return [(LOGIC_TILE, bel) for bel in entry["ffs"]]
 
 HEADER = """# golden FASM: {design} on {part}
 # seed: {seed}
