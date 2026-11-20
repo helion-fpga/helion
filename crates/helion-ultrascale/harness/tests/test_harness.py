@@ -9,6 +9,7 @@
 #
 # No em dashes anywhere.
 
+import hashlib
 import json
 import os
 import subprocess
@@ -21,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from diff_engine import compute_diff, diff_design, greedy_order, resolve_feature
 from emitter import Emitter, NO_EMITTER_MISSING
 from fasm import FasmError, canonical_fasm, classify, parse_fasm, parse_init_value
-from gen_golden import DESIGNS, GOLDEN_DIR, build_fasm, lut_init_64
+from gen_golden import DESIGNS, GOLDEN_DIR, build_fasm, lut_init_64, placement_hash
 from reference import MissingReference, Tier1Reference, int_col_offset_from_clb
 from roundtrip import (
     canonical_roundtrip_fasm,
@@ -74,6 +75,8 @@ class TestFasm(unittest.TestCase):
         expected = {
             "blinky": {"LUT_INIT": 1, "FF_INIT": 2, "INT_PIP": 2, "IO_CONFIG": 2},
             "counter": {"LUT_INIT": 4, "FF_INIT": 8, "INT_PIP": 3, "IO_CONFIG": 2},
+            "carry8": {"LUT_INIT": 8, "FF_INIT": 16, "CARRY8": 10,
+                       "INT_PIP": 3, "IO_CONFIG": 2},
         }
         for design, counts in expected.items():
             feats = parse_fasm(golden_fasm(design, "xcku3p"))
@@ -127,6 +130,11 @@ class TestFasm(unittest.TestCase):
                 "C6LUT": truth(lambda b: b[2] ^ (b[1] & b[0])),
                 "D6LUT": truth(lambda b: b[3] ^ (b[2] & b[1] & b[0])),
             },
+            "carry8": {
+                bel: truth(lambda b: b[0])
+                for bel in ("A6LUT", "B6LUT", "C6LUT", "D6LUT",
+                            "E6LUT", "F6LUT", "G6LUT", "H6LUT")
+            },
         }
         for design, luts in cases.items():
             feats = parse_fasm(golden_fasm(design, "xcku3p"))
@@ -138,6 +146,7 @@ class TestFasm(unittest.TestCase):
                                  "%s %s INIT mismatch" % (design, bel))
         # And the generator's own function agrees.
         self.assertEqual(lut_init_64(lambda b: 1 - b[0]), 0x5555555555555555)
+        self.assertEqual(lut_init_64(lambda b: b[0]), 0xAAAAAAAAAAAAAAAA)
 
 
 class TestCarry8(unittest.TestCase):
@@ -309,6 +318,111 @@ class TestCarry8(unittest.TestCase):
             self.assertEqual(by_block["CARRY8"]["status"], "blocked")
             self.assertIsNone(by_block["CARRY8"]["diff_bits"])
             self.assertIn("CARRY8", by_block["CARRY8"]["missing"])
+
+
+class TestCarry8Golden(unittest.TestCase):
+    # The carry8 golden (gen_golden.py, examples/carry8.sv): an 8-bit
+    # incrementer on one CARRY8 in SLICE_X0Y0. Ten CARRY8 lines
+    # constraining eleven bit positions. The expected bitset below is
+    # hand-computed from segbits_clel_r.db (frame minors plus the
+    # SLICE_X0Y0 column major 5, FAR 0x500 + minor) and cross-checked
+    # against the hand-checked values in TestCarry8 (CI.V1, DI0.AX,
+    # SINGLE_CY8, DI7.HX).
+    EXPECTED_CARRY8_BITS = {
+        (0x50A, 18): 1,  # CI.V1 sets 10_18; 14_01 must read 0
+        (0x50E, 1): 0,
+        (0x50C, 45): 0,  # SINGLE_CY8 clears 12_45
+        (0x50C, 3): 0,  # DI0.AX
+        (0x50C, 9): 0,  # DI1.BX
+        (0x50C, 15): 0,  # DI2.CX
+        (0x50C, 21): 0,  # DI3.DX
+        (0x50F, 23): 0,  # DI4.EX
+        (0x50C, 39): 0,  # DI5.FX
+        (0x50C, 33): 0,  # DI6.GX
+        (0x50F, 47): 0,  # DI7.HX
+    }
+
+    def test_golden_carry8_resolves_to_eleven_bits(self):
+        ref = Tier1Reference()
+        feats = parse_fasm(golden_fasm("carry8", "xcku3p"))
+        bits = {}
+        for feat in feats:
+            if classify(feat) != "CARRY8":
+                continue
+            block, b, coord, miss = resolve_feature(ref, "xcku3p", feat)
+            self.assertIsNone(miss, feat)
+            self.assertEqual(block, "CARRY8", feat)
+            self.assertEqual(coord, "absolute", feat)
+            bits.update(b)
+        self.assertEqual(bits, self.EXPECTED_CARRY8_BITS)
+        self.assertEqual(sum(1 for v in bits.values() if v == 1), 1)
+
+    def test_golden_meta_hashes_match(self):
+        for part in ("xcku3p", "xcvu3p"):
+            text = golden_fasm("carry8", part)
+            meta = golden_meta("carry8", part)
+            record = {k: v for k, v in meta.items()
+                      if k not in ("placement_hash", "fasm_sha256")}
+            self.assertEqual(placement_hash(record, text),
+                             meta["placement_hash"], part)
+            self.assertEqual(hashlib.sha256(text.encode()).hexdigest(),
+                             meta["fasm_sha256"], part)
+
+    def test_golden_carry8_diff_is_green_with_fake_emitter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            emitter = Emitter(_fake_emitter_shim(tmp))
+            meta = golden_meta("carry8", "xcku3p")
+            recs = diff_design(
+                Tier1Reference(), emitter, "carry8", "xcku3p",
+                os.path.join(GOLDEN_DIR, "carry8.xcku3p.fasm"),
+                20261107, meta["placement_hash"], "tier1", tmp,
+            )
+            by_block = {r["block"]: r for r in recs}
+            carry8 = by_block["CARRY8"]
+            self.assertEqual(carry8["status"], "green")
+            self.assertEqual(carry8["diff_bits"], 0)
+            self.assertEqual(carry8["total_bits"], 11)
+            self.assertEqual(carry8["coord_system"], "absolute")
+            self.assertEqual(by_block["LUT_INIT"]["total_bits"], 512)
+            self.assertEqual(by_block["LUT_INIT"]["status"], "green")
+            self.assertEqual(by_block["FF_INIT"]["total_bits"], 16)
+            self.assertEqual(by_block["FF_INIT"]["status"], "green")
+            self.assertEqual(by_block["INT_PIP"]["total_bits"], 17)
+            self.assertEqual(by_block["INT_PIP"]["status"], "green")
+            self.assertEqual(by_block["FRAMING"]["status"], "green")
+
+    def test_golden_carry8_flip_is_red(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            emitter = Emitter(_fake_emitter_shim(tmp))
+            meta = golden_meta("carry8", "xcku3p")
+            os.environ["FAKE_FLIP_COUNT"] = "1"
+            os.environ["FAKE_FLIP_BLOCK"] = "CARRY8"
+            try:
+                recs = diff_design(
+                    Tier1Reference(), emitter, "carry8", "xcku3p",
+                    os.path.join(GOLDEN_DIR, "carry8.xcku3p.fasm"),
+                    20261107, meta["placement_hash"], "tier1", tmp,
+                )
+            finally:
+                del os.environ["FAKE_FLIP_COUNT"]
+                del os.environ["FAKE_FLIP_BLOCK"]
+            by_block = {r["block"]: r for r in recs}
+            self.assertEqual(by_block["CARRY8"]["status"], "red")
+            self.assertEqual(by_block["CARRY8"]["diff_bits"], 1)
+
+    def test_golden_carry8_has_no_ci_top_line(self):
+        # CI_TOP is deliberately unconfigured in the golden. The
+        # correct value is 0 (ground; UG974: tie CI_TOP to ground
+        # when CARRY_TYPE is SINGLE_CY8), but CI_TOP.V0 is
+        # unobservable through parse-back: a mux default with no
+        # exact complement (bitgen.rs presence rule), so a golden
+        # line for it would fail the FRAMING round trip. The emitted
+        # frames still read 0 on both CI_TOP bits, and the
+        # per-block diff catches an emitter that sets them as extra
+        # set bits. Anyone adding a CI_TOP line here must re-check
+        # the round trip with the real emitter first.
+        text = golden_fasm("carry8", "xcku3p")
+        self.assertNotIn("CI_TOP", text)
 
 
 class TestRoundtrip(unittest.TestCase):
@@ -943,7 +1057,7 @@ class TestDiffEngine(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
-    def test_full_run_exits_zero_with_44_blocked_records(self):
+    def test_full_run_exits_zero_with_66_blocked_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "run")
             proc = subprocess.run(
@@ -953,16 +1067,16 @@ class TestCli(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             recs = [json.loads(l) for l in open(os.path.join(out, "diff.jsonl"))]
-            self.assertEqual(len(recs), 44)
+            self.assertEqual(len(recs), 66)
             self.assertTrue(all(r["status"] == "blocked" for r in recs))
             self.assertTrue(all(r["diff_bits"] is None for r in recs))
             manifest = json.load(open(os.path.join(out, "manifest.json")))
             self.assertEqual(manifest["tier"], "tier1")
-            self.assertEqual(len(manifest["combos"]), 4)
+            self.assertEqual(len(manifest["combos"]), 6)
 
     def test_garbage_parse_emitter_full_run_writes_all_records(self):
         # Critic session 5, FLAG 2, end to end: a bad-parse emitter
-        # over all 4 combos must exit 0 with all 40 records and a
+        # over all 6 combos must exit 0 with all 66 records and a
         # manifest, never a traceback. Every combo's FRAMING record
         # is red with the error named.
         with tempfile.TemporaryDirectory() as tmp:
@@ -979,16 +1093,16 @@ class TestCli(unittest.TestCase):
             self.assertNotIn("Traceback", proc.stderr)
             with open(os.path.join(out, "diff.jsonl")) as f:
                 recs = [json.loads(l) for l in f]
-            self.assertEqual(len(recs), 44)
+            self.assertEqual(len(recs), 66)
             framing = [r for r in recs if r["block"] == "FRAMING"]
-            self.assertEqual(len(framing), 4)
+            self.assertEqual(len(framing), 6)
             for r in framing:
                 self.assertEqual(r["status"], "red")
                 self.assertEqual(r["diff_bits"], 1)
                 self.assertIn("not valid FASM", r["detail"])
             with open(os.path.join(out, "manifest.json")) as f:
                 manifest = json.load(f)
-            self.assertEqual(len(manifest["combos"]), 4)
+            self.assertEqual(len(manifest["combos"]), 6)
 
     def test_tampered_golden_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

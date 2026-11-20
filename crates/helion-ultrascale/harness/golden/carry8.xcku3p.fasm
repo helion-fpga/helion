@@ -1,0 +1,54 @@
+# golden FASM: carry8 on xcku3p
+# seed: 20261107
+# source: examples/carry8.sv in the worktree (blinky: registered
+# inverter, led = q; counter: 4-bit incrementer, led = cnt[3];
+# carry8: 8-bit incrementer on one CARRY8, led = cnt[7]).
+# placement: all logic in SLICE_X0Y0 (xcku3p: row major 0, CLB column 0,
+# tile type CLEL_R per the BitFiltrator xcku3p device file).
+# PROVISIONAL: INT and HPIO tile coordinates below use the logical CLB
+# column index as the tile X, NOT a verified Vivado tile X. No xcku3p
+# tilegrid exists in any public DB yet. The PIP and IO feature strings
+# are verified to exist in prjuray-db segbits_int.db and
+# segbits_hpio_right.db. The route is the frozen chosen target, not a
+# Vivado-produced route. The harness resolves INT PIPs with the
+# xczu3eg-derived rule INT column major = CLB column major - 1,
+# flagged absolute-provisional in every record.
+SLICE_X0Y0.A6LUT.INIT[63:0] = 0xaaaaaaaaaaaaaaaa
+SLICE_X0Y0.B6LUT.INIT[63:0] = 0xaaaaaaaaaaaaaaaa
+SLICE_X0Y0.C6LUT.INIT[63:0] = 0xaaaaaaaaaaaaaaaa
+SLICE_X0Y0.D6LUT.INIT[63:0] = 0xaaaaaaaaaaaaaaaa
+SLICE_X0Y0.E6LUT.INIT[63:0] = 0xaaaaaaaaaaaaaaaa
+SLICE_X0Y0.F6LUT.INIT[63:0] = 0xaaaaaaaaaaaaaaaa
+SLICE_X0Y0.G6LUT.INIT[63:0] = 0xaaaaaaaaaaaaaaaa
+SLICE_X0Y0.H6LUT.INIT[63:0] = 0xaaaaaaaaaaaaaaaa
+SLICE_X0Y0.AFF.INIT = 0
+SLICE_X0Y0.AFF.SRVAL = 0
+SLICE_X0Y0.BFF.INIT = 0
+SLICE_X0Y0.BFF.SRVAL = 0
+SLICE_X0Y0.CFF.INIT = 0
+SLICE_X0Y0.CFF.SRVAL = 0
+SLICE_X0Y0.DFF.INIT = 0
+SLICE_X0Y0.DFF.SRVAL = 0
+SLICE_X0Y0.EFF.INIT = 0
+SLICE_X0Y0.EFF.SRVAL = 0
+SLICE_X0Y0.FFF.INIT = 0
+SLICE_X0Y0.FFF.SRVAL = 0
+SLICE_X0Y0.GFF.INIT = 0
+SLICE_X0Y0.GFF.SRVAL = 0
+SLICE_X0Y0.HFF.INIT = 0
+SLICE_X0Y0.HFF.SRVAL = 0
+SLICE_X0Y0.CARRY8.CARRY_TYPE.SINGLE_CY8
+SLICE_X0Y0.CARRY8.CI.V1
+SLICE_X0Y0.CARRY8.DI0.AX
+SLICE_X0Y0.CARRY8.DI1.BX
+SLICE_X0Y0.CARRY8.DI2.CX
+SLICE_X0Y0.CARRY8.DI3.DX
+SLICE_X0Y0.CARRY8.DI4.EX
+SLICE_X0Y0.CARRY8.DI5.FX
+SLICE_X0Y0.CARRY8.DI6.GX
+SLICE_X0Y0.CARRY8.DI7.HX
+INT_X0Y0.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1
+INT_X0Y0.PIP.INT_NODE_GLOBAL_0_INT_OUT0.GCLK_B_0_0
+INT_X0Y0.PIP.IMUX_E0.INODE_E_5_FT1
+HPIO_RIGHT_X0Y0.IOB_X0Y0.IOSTANDARD_IN.LVCMOS12
+HPIO_RIGHT_X0Y0.IOB_X0Y1.IOSTANDARD_OUT.LVCMOS12_IDRIVE_I2_SLEW_SLEW_SLOW

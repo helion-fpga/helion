@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # Differential harness: UltraScale+ bitgen, block by block, greedy queue.
 #
-# One command runs the full diff on blinky and counter for xcku3p and
+# One command runs the full diff on blinky, counter, and carry8 for xcku3p and
 # xcvu3p, prints the blocks ordered by diff size descending (that
 # ordering IS the greedy work queue), and writes JSONL records plus a
 # run manifest recording the seed and placement hash with every run.
 #
-#   python3 diff.py [--design blinky|counter|all] [--part xcku3p|xcvu3p|all]
+#   python3 diff.py [--design blinky|counter|carry8|all] [--part xcku3p|xcvu3p|all]
 #                   [--reference-bit PATH] [--emitter-cmd CMD] [--out DIR]
 #
 # Tier 1 (default): diff against the public segbits DBs plus BitFiltrator
@@ -39,7 +39,7 @@ from emitter import find_emitter
 from gen_golden import GOLDEN_DIR, placement_hash
 from reference import Tier1Reference
 
-DESIGNS = ("blinky", "counter")
+DESIGNS = ("blinky", "counter", "carry8")
 PARTS = ("xcku3p", "xcvu3p")
 
 
