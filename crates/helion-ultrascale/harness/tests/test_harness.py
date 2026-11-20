@@ -591,6 +591,31 @@ class TestReference(unittest.TestCase):
         far66 = (0 << 24) | (0 << 18) | (7 << 8) | 66
         self.assertEqual(bits[(far66, 0)], 0)
 
+    def test_int_pip_y_is_absolute_row(self):
+        # F3: INT tile Y is an absolute tile-row coordinate, not
+        # the FAR row. FAR row is Y // 60 (60 CLB rows per
+        # clock-region row). Grounded in the xczu3eg tilegrid:
+        # INT_X11Y60 baseaddr 0x00042300 decodes to block 0,
+        # row 1, col 35, minor 0, and INT_X11Y0..Y59 all share
+        # the row-0 baseaddr 0x00002300. The emitter used to
+        # read Y as the FAR row itself (bitgen_device.rs
+        # parse_int_tile); this test pins the harness side so a
+        # future "alignment" with the emitter cannot silently
+        # flip the convention back. CLB column 11 is CLEL_R,
+        # major 26, in every xcku3p row, so its INT column is
+        # major 25 in every row; only the row changes with Y.
+        for y, row in ((0, 0), (1, 0), (59, 0), (60, 1),
+                       (119, 1), (120, 2), (179, 2), (239, 3)):
+            bits = self.ref.resolve_int_pip(
+                "xcku3p", 11, y, "PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1")
+            self.assertEqual(len(bits), 6, "Y=%d" % y)
+            rows = set((far >> 18) & 0x3F for far, _ in bits)
+            self.assertEqual(rows, set([row]), "Y=%d" % y)
+            cols = set((far >> 8) & 0x3FF for far, _ in bits)
+            self.assertEqual(cols, set([25]), "Y=%d" % y)
+            far64 = (0 << 24) | (row << 18) | (25 << 8) | 64
+            self.assertEqual(bits[(far64, 0)], 1, "Y=%d" % y)
+
     def test_unknown_pip_missing(self):
         with self.assertRaises(MissingReference):
             self.ref.resolve_int_pip("xcku3p", 0, 0, "PIP.NOPE.NOPE")
