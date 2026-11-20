@@ -52,6 +52,17 @@
 # coverage. Completing the golden tile-wide with attribute defaults
 # was the alternative; the CTO ruled feature scoping.
 #
+# Zero-bit features (ZERO_BIT_PIP_CONTRACT.md, F4): a valueless
+# segbits feature whose DB entry lists zero set bits and has no
+# exact complement (a mux default such as VCC_WIRE) cannot render
+# on parse-back: it is indistinguishable from absent, and bitgen.rs
+# and the decoder both drop it by design. The round-trip comparison
+# therefore removes such features from the design's feature set on
+# both sides and names each one in the skipped checks; their bits
+# are verified by the per-block bit diff instead (INT_PIP constrains
+# every listed bit to 0). The contract is parse(emit(f))==f over
+# observable features, plus bit-level verification of the rest.
+#
 # Independent byte checks on the emitted .bit (no emitter code involved):
 # - sync word 0xAA995566 present
 # - IDCODE matches the part (xcku3p 0x04a63093 from the device file;
@@ -67,9 +78,9 @@ import os
 import re
 
 from emitter import EmitterError, NO_EMITTER_MISSING
-from fasm import FasmError, Feature, parse_fasm, serialize_fasm
+from fasm import FasmError, Feature, classify, parse_fasm, serialize_fasm
 from gen_golden import design_ff_locations
-from reference import XCKU3P_IDCODE
+from reference import Tier1Reference, XCKU3P_IDCODE
 
 SYNC_WORD = b"\xaa\x99\x55\x66"
 
@@ -240,6 +251,92 @@ def scope_fasm_to_feature_keys(text, keys, source="<canonical>"):
     return serialize_fasm(kept)
 
 
+def drop_feature_keys(text, keys, source="<canonical>"):
+    """Canonical FASM text with every line whose feature key is in `keys` removed.
+
+    The complement of scope_fasm_to_feature_keys: used to remove
+    unobservable features (ZERO_BIT_PIP_CONTRACT.md) from the
+    round-trip comparison. Parses, drops, sorts, serializes.
+    Dropping an empty key set is a no-op.
+    """
+    kept = [f for f in parse_fasm(text, source) if _feature_key(f) not in keys]
+    kept.sort(key=repr)
+    return serialize_fasm(kept)
+
+
+def complement_signatures(db):
+    """Set-bit signatures of DB features that list no `!` bits.
+
+    `db` is a parsed segbits DB ({feature: [(frame, bit, value)]}).
+    Mirrors bitgen.rs complement_signatures exactly: a feature is a
+    complement candidate only when its refs are non-empty and none
+    of them is must-be-zero. Returns a set of frozensets of
+    (frame, bit) pairs.
+    """
+    sigs = set()
+    for bits in db.values():
+        if bits and all(val == 1 for (_, _, val) in bits):
+            sigs.add(frozenset((frame, bit) for (frame, bit, _) in bits))
+    return sigs
+
+
+def zero_signature(db_bits):
+    """(frame, bit) pairs of a DB entry's must-be-zero bits."""
+    return frozenset((frame, bit) for (frame, bit, val) in db_bits if val == 0)
+
+
+def is_unobservable_feature(db_bits, comp_sigs):
+    """True when a segbits DB entry cannot render on parse-back.
+
+    Mirrors the bitgen.rs presence rule for valueless features:
+    unobservable when the entry lists zero set bits and its zero
+    signature is not the set-bit signature of any feature of the
+    same tile type that lists no `!` bits (no exact complement).
+    An entry with a set bit, or with an exact complement (FF .V1),
+    is observable. An empty entry is not unobservable: nothing is
+    known about it, so it is never dropped.
+    """
+    if not db_bits:
+        return False
+    if any(val == 1 for (_, _, val) in db_bits):
+        return False
+    return zero_signature(db_bits) not in comp_sigs
+
+
+def unobservable_int_pip_keys(ref, features):
+    """Feature keys of the INT PIP features in `features` that parse-back cannot render.
+
+    `ref` is a Tier1Reference (or None, in which case one is built);
+    `features` are parsed FASM Features. Only INT_PIP features are
+    considered: the proven zero-bit class
+    (ZERO_BIT_PIP_CONTRACT.md). Fail-safe: when the reference DB
+    cannot be loaded, or a feature has no DB entry, the feature is
+    treated as observable and is never dropped, so the strict
+    comparison stands.
+    """
+    try:
+        if ref is None:
+            ref = Tier1Reference()
+        db = ref.segbits("int")
+    except Exception:  # noqa: BLE001 - fail-safe: strict comparison stands
+        return set()
+    comp_sigs = complement_signatures(db)
+    out = set()
+    for feat in features:
+        try:
+            block = classify(feat)
+        except FasmError:
+            continue
+        if block != "INT_PIP":
+            continue
+        bits = db.get("INT." + feat.feature)
+        if bits is None:
+            continue
+        if is_unobservable_feature(bits, comp_sigs):
+            out.add(_feature_key(feat))
+    return out
+
+
 def check_bit_bytes(bit_path, part):
     """Independent checks on raw bitstream bytes.
 
@@ -265,7 +362,7 @@ def check_bit_bytes(bit_path, part):
     return passed, failed, skipped
 
 
-def run_roundtrip(emitter, fasm_path, part, workdir, design):
+def run_roundtrip(emitter, fasm_path, part, workdir, design, ref=None):
     """Run the round-trip stage for one golden FASM.
 
     Returns a dict with status (green/red/blocked), checks run, and
@@ -302,7 +399,14 @@ def run_roundtrip(emitter, fasm_path, part, workdir, design):
     the parse-back renders for unused BELs and attribute pairs on
     the design's own tile are dropped. The per-block bits diff
     still catches stray set bits anywhere, so the scoping loses no
-    coverage. A faithful emitter reproduces a partial golden clean:
+    coverage. Zero-bit features (ZERO_BIT_PIP_CONTRACT.md, F4) leave
+    the compared feature set before comparing: a valueless segbits
+    feature with zero set bits and no exact complement cannot render
+    on parse-back, so it is removed from the golden side and the
+    parsed side is scoped to the same reduced set; each removed
+    feature is named in the skipped checks. Their bits are verified
+    by the per-block bit diff instead.
+    A faithful emitter reproduces a partial golden clean:
     both sides complete identically. The real emitter renders .V1
     for an unmentioned FF (bit 0), so a partial golden still fails
     against it, as a precise .V0 vs .V1 value mismatch: the emitted
@@ -323,8 +427,20 @@ def run_roundtrip(emitter, fasm_path, part, workdir, design):
         }
     with open(fasm_path) as f:
         golden_text = f.read()
+    unobservable = set()
     try:
+        golden_features = parse_fasm(golden_text, fasm_path)
+        # Zero-bit PIP contract (ZERO_BIT_PIP_CONTRACT.md): features
+        # parse-back cannot render leave the compared feature set;
+        # their bits are verified by the per-block bit diff instead.
+        # The feature set is the dropped golden's features, so the
+        # parsed side is scoped to the same set below and both sides
+        # are compared without them.
+        unobservable = unobservable_int_pip_keys(ref, golden_features)
         golden_canon = canonical_roundtrip_fasm(golden_text, design, fasm_path)
+        if unobservable:
+            golden_canon = drop_feature_keys(
+                golden_canon, unobservable, fasm_path)
         # The design's feature set is the completed golden's
         # features. Scoping the golden to its own keys is a no-op
         # by construction; it is done here so both sides go through
@@ -343,7 +459,7 @@ def run_roundtrip(emitter, fasm_path, part, workdir, design):
         }
     # The design's tiles are the tiles in the golden FASM itself.
     # The parse-back side is scoped to them; see module doc.
-    design_tiles = {f.tile for f in parse_fasm(golden_text, fasm_path)}
+    design_tiles = {f.tile for f in golden_features}
     bit_path = os.path.join(workdir, "roundtrip.bit")
     try:
         emitter.emit(fasm_path, part, bit_path)
@@ -354,6 +470,12 @@ def run_roundtrip(emitter, fasm_path, part, workdir, design):
         parsed_canon = scope_fasm_to_feature_keys(
             parsed_canon, golden_keys, "emitter parse output")
         passed, failed, skipped = check_bit_bytes(bit_path, part)
+        # Each unobservable feature is named here, so a green that
+        # excludes one is auditable, never silent.
+        skipped = skipped + sorted(
+            "roundtrip-unobservable:%s.%s" % (tile, feat)
+            for (tile, feat) in unobservable
+        )
     except FasmError as e:
         return {
             "status": "red",
