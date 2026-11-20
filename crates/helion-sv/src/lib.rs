@@ -15294,7 +15294,7 @@ fn parse_for_unroll_module<'a>(
     } else {
         let _ = p.ident();
     }
-    let (inclusive, descending, ne_cmp) = if matches!(p.peek(), Some(Tok::Le)) {
+    let (inclusive, descending, _ne_cmp) = if matches!(p.peek(), Some(Tok::Le)) {
         p.bump();
         (true, false, false)
     } else if matches!(p.peek(), Some(Tok::Ge)) {
