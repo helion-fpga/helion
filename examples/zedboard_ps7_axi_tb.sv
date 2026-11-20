@@ -236,10 +236,10 @@ module zedboard_ps7_axi_tb;
     localparam logic [1:0] OKAY = 2'b00, SLVERR = 2'b10;
 
     logic [31:0] data, c1, c2;
-    logic [1:0] resp;
-    logic [11:0] id;
+    logic [1:0] resp, r1, r2;
+    logic [11:0] id, i1, i2;
     logic last;
-    integer a1, i, j, k;
+    integer a1, i, j, k, t_aw, t_w, t_b;
 
     initial begin
         dut.ps7.reset_pl(10);
@@ -279,8 +279,8 @@ module zedboard_ps7_axi_tb;
         // Counter: two reads differ by the cycles between their AR handshakes.
         dut.ps7.read(COUNTER, 12'h010, 0, c1, resp);
         a1 = dut.ps7.ar_cyc;
-        // Free-running from configuration: the count is the edges before the read.
-        if (c1 !== a1) dut.ps7.fail($sformatf("counter read %0d at cycle %0d", c1, a1));
+        // Free-running from configuration: the count is the start plus the edges before the read.
+        if (c1 !== 32'hFFFF_FC00 + a1) dut.ps7.fail($sformatf("counter read %0d at cycle %0d", c1, a1));
         repeat (17) @(posedge dut.clk);
         dut.ps7.read(COUNTER, 12'h011, 2, c2, resp);
         if (c2 - c1 !== dut.ps7.ar_cyc - a1) dut.ps7.fail($sformatf("counter moved %0d in %0d cycles", c2 - c1, dut.ps7.ar_cyc - a1));
@@ -375,6 +375,29 @@ module zedboard_ps7_axi_tb;
             end
         join
         dut.ps7.read_expect(SCRATCH, 32'h600D_F00D, OKAY);
+
+        // W may come first: a W offered 60 cycles before its AW is taken
+        // at once, not held until the AW arrives.
+        fork
+            begin dut.ps7.aw_send(12'hC01, SCRATCH, 4'd0, 60); t_aw = dut.ps7.cyc; end
+            begin dut.ps7.w_send(32'h1357_9BDF, 4'b1001, 1'b1, 0); t_w = dut.ps7.cyc; end
+            begin dut.ps7.b_recv(0, id, resp); t_b = dut.ps7.cyc; end
+        join
+        if (!(t_w + 50 < t_aw)) dut.ps7.fail($sformatf("W taken at cycle %0d, AW at %0d: W waited for AW", t_w, t_aw));
+        if (!(t_b > t_aw) || id !== 12'hC01 || resp !== OKAY) dut.ps7.fail($sformatf("W first: B at %0d (AW %0d), BID %h BRESP %b", t_b, t_aw, id, resp));
+        dut.ps7.read_expect(SCRATCH, 32'h130D_F0DF, OKAY);
+
+        // BREADY held off 200 cycles while a second write is taken: the
+        // first response holds (the monitor checks it) and is not lost.
+        fork
+            begin dut.ps7.aw_send(12'hD01, SCRATCH, 4'd0, 0); dut.ps7.aw_send(12'hD02, LEDS, 4'd0, 0); t_aw = dut.ps7.cyc; end
+            begin dut.ps7.w_send(32'h2468_ACE0, 4'hF, 1'b1, 0); dut.ps7.w_send(32'h0000_002A, 4'h1, 1'b1, 0); t_w = dut.ps7.cyc; end
+            begin dut.ps7.b_recv(200, i1, r1); t_b = dut.ps7.cyc; dut.ps7.b_recv(0, i2, r2); end
+        join
+        if (i1 !== 12'hD01 || r1 !== OKAY || i2 !== 12'hD02 || r2 !== OKAY) dut.ps7.fail($sformatf("held B: %h/%b then %h/%b", i1, r1, i2, r2));
+        if (!(t_aw < t_b && t_w < t_b)) dut.ps7.fail($sformatf("held B: second AW/W at %0d/%0d, not before the first B at %0d", t_aw, t_w, t_b));
+        dut.ps7.read_expect(SCRATCH, 32'h2468_ACE0, OKAY);
+        dut.ps7.read_expect(LEDS, 32'h0000_002A, OKAY);
 
         // A PL reset clears the writable registers.
         dut.ps7.reset_pl(4);
