@@ -179,10 +179,7 @@ fn lutram_mode_bits_resolve_through_segbits() {
     // DB lines (not from code). ALUT.MODE.RAM sets (9, 19) and clears
     // (11, 18); the LUT/SRL alternatives are the other combinations of
     // the same two bits, so exactly one mode holds at a time.
-    let paths = [
-        data_path("segbits_clem.db"),
-        data_path("segbits_clem_r.db"),
-    ];
+    let paths = [data_path("segbits_clem.db"), data_path("segbits_clem_r.db")];
     let refs: Vec<&std::path::Path> = paths.iter().map(PathBuf::as_path).collect();
     let db = FileSegbitsDb::from_files(&refs).unwrap();
     for tile in ["CLEM", "CLEM_R"] {
@@ -190,63 +187,116 @@ fn lutram_mode_bits_resolve_through_segbits() {
         assert_eq!(
             mode_ram,
             &[
-                BitRef { frame: 9, bit: 19, must_be_zero: false },
-                BitRef { frame: 11, bit: 18, must_be_zero: true },
+                BitRef {
+                    frame: 9,
+                    bit: 19,
+                    must_be_zero: false
+                },
+                BitRef {
+                    frame: 11,
+                    bit: 18,
+                    must_be_zero: true
+                },
             ]
         );
         assert_eq!(
             db.lookup(tile, "ALUT.MODE.LUT").unwrap(),
             &[
-                BitRef { frame: 9, bit: 19, must_be_zero: true },
-                BitRef { frame: 11, bit: 18, must_be_zero: true },
+                BitRef {
+                    frame: 9,
+                    bit: 19,
+                    must_be_zero: true
+                },
+                BitRef {
+                    frame: 11,
+                    bit: 18,
+                    must_be_zero: true
+                },
             ]
         );
         assert_eq!(
             db.lookup(tile, "ALUT.MODE.SRL").unwrap(),
             &[
-                BitRef { frame: 9, bit: 19, must_be_zero: true },
-                BitRef { frame: 11, bit: 18, must_be_zero: false },
+                BitRef {
+                    frame: 9,
+                    bit: 19,
+                    must_be_zero: true
+                },
+                BitRef {
+                    frame: 11,
+                    bit: 18,
+                    must_be_zero: false
+                },
             ]
         );
         assert_eq!(
             db.lookup(tile, "ALUT.DI1.DI1").unwrap(),
-            &[BitRef { frame: 10, bit: 19, must_be_zero: false }]
+            &[BitRef {
+                frame: 10,
+                bit: 19,
+                must_be_zero: false
+            }]
         );
         assert_eq!(
             db.lookup(tile, "ALUT.DI1.SIN").unwrap(),
-            &[BitRef { frame: 10, bit: 19, must_be_zero: true }]
+            &[BitRef {
+                frame: 10,
+                bit: 19,
+                must_be_zero: true
+            }]
         );
         assert_eq!(
             db.lookup(tile, "ALUT.SIZE.LARGE").unwrap(),
-            &[BitRef { frame: 8, bit: 18, must_be_zero: true }]
+            &[BitRef {
+                frame: 8,
+                bit: 18,
+                must_be_zero: true
+            }]
         );
         assert_eq!(
             db.lookup(tile, "ALUT.SIZE.SMALL").unwrap(),
-            &[BitRef { frame: 8, bit: 18, must_be_zero: false }]
+            &[BitRef {
+                frame: 8,
+                bit: 18,
+                must_be_zero: false
+            }]
         );
         assert_eq!(
             db.lookup(tile, "WA7USED.V0").unwrap(),
-            &[BitRef { frame: 8, bit: 23, must_be_zero: true }]
+            &[BitRef {
+                frame: 8,
+                bit: 23,
+                must_be_zero: true
+            }]
         );
         assert_eq!(
             db.lookup(tile, "WA7USED.V1").unwrap(),
-            &[BitRef { frame: 8, bit: 23, must_be_zero: false }]
+            &[BitRef {
+                frame: 8,
+                bit: 23,
+                must_be_zero: false
+            }]
         );
         assert_eq!(
             db.lookup(tile, "WA8USED.V0").unwrap(),
-            &[BitRef { frame: 11, bit: 22, must_be_zero: true }]
+            &[BitRef {
+                frame: 11,
+                bit: 22,
+                must_be_zero: true
+            }]
         );
         assert_eq!(
             db.lookup(tile, "WA9USED.V0").unwrap(),
-            &[BitRef { frame: 9, bit: 22, must_be_zero: true }]
+            &[BitRef {
+                frame: 9,
+                bit: 22,
+                must_be_zero: true
+            }]
         );
         // Every LUT letter carries MODE.RAM; DI1 exists for A..G only.
         for letter in 'A'..='H' {
             let feat = format!("{letter}LUT.MODE.RAM");
-            assert!(
-                db.lookup(tile, &feat).is_some(),
-                "{tile}.{feat} missing"
-            );
+            assert!(db.lookup(tile, &feat).is_some(), "{tile}.{feat} missing");
         }
         for letter in 'A'..='G' {
             assert!(db.lookup(tile, &format!("{letter}LUT.DI1.DI1")).is_some());
