@@ -18,7 +18,15 @@
 //!   A6LUT; CLEL DB frames span 0..15, the 16 minors of a CLB
 //!   column). `tile_base_far` is therefore
 //!   `Far(ClbIoClk, row_major, col_major, 0)`.
-//! - INT tiles (`INT_X<x>Y<r>`, r the FAR row): PROVISIONAL rule,
+//! - INT tiles (`INT_X<x>Y<y>`, y absolute INT tile Y, the same
+//!   coordinate system as SLICE Y): one INT tile per absolute Y per
+//!   column, 60 per clock-region row. The FAR row is y // 60
+//!   (`NUM_CLB_PER_COLUMN`), exactly as the harness reference
+//!   (`harness/reference.py`, `_slr_row`) computes it. Grounded in
+//!   the xczu3eg tilegrid (prjuray-db): INT_X11Y60 baseaddr
+//!   0x00042300 decodes to block 0, row 1, col 35, minor 0, and
+//!   all 60 INT tiles Y0..Y59 in column X11 share the row-0
+//!   baseaddr 0x00002300. The column rule is PROVISIONAL and
 //!   tile-type dependent, the same rule the diff harness reference
 //!   uses (`harness/reference.py`, `int_col_offset_from_clb`,
 //!   xczu3eg-derived): CLEL_R columns take INT column major =
@@ -113,14 +121,18 @@ fn parse_slice_tile(tile: &str) -> Option<(u32, u32)> {
     Some((x, y))
 }
 
-/// Parse `INT_X<x>Y<r>` into (x, r). The Y is the FAR row (one INT
-/// tile per clock-region row), not an absolute slice Y.
+/// Parse `INT_X<x>Y<y>` into (x, y). The Y is the absolute INT
+/// tile row (one INT tile per absolute Y per column, 60 per
+/// clock-region row), not the FAR row: the FAR row is y / 60.
+/// Grounded in the xczu3eg tilegrid (F3): INT_X11Y60 baseaddr
+/// 0x00042300 is FAR row 1, and INT_X11Y0..Y59 all share the
+/// row-0 baseaddr 0x00002300.
 fn parse_int_tile(tile: &str) -> Option<(u32, u32)> {
     let rest = tile.strip_prefix("INT_X")?;
-    let (x_text, r_text) = rest.split_once('Y')?;
+    let (x_text, y_text) = rest.split_once('Y')?;
     let x: u32 = x_text.parse().ok()?;
-    let r: u32 = r_text.parse().ok()?;
-    Some((x, r))
+    let y: u32 = y_text.parse().ok()?;
+    Some((x, y))
 }
 
 /// Parse `RAMB18_X<x>Y<y>` into (x, y). Only 18K BRAM tiles are
@@ -200,7 +212,8 @@ fn resolve_tile<'a>(device: &'a DeviceFile, tile: &str) -> Option<(&'a str, u32)
             .to_u32();
         return Some((ty, base));
     }
-    if let Some((x, row_major)) = parse_int_tile(tile) {
+    if let Some((x, y)) = parse_int_tile(tile) {
+        let (_slr, row_major) = slr_row_for_y(device, y, NUM_CLB_PER_COLUMN)?;
         let (_slr, int_major) = int_col_major(device, x, row_major)?;
         let base = Far::new(FarBlockType::ClbIoClk, row_major, int_major, 0)
             .ok()?
@@ -239,7 +252,11 @@ fn compute_tile_names(device: &DeviceFile) -> Vec<String> {
                         names.push(format!("SLICE_X{x}Y{abs_y}"));
                     }
                     if int_col_major(device, x, row_major).is_some() {
-                        names.push(format!("INT_X{x}Y{row_major}"));
+                        for y_ofst in 0..NUM_CLB_PER_COLUMN {
+                            let abs_y =
+                                (min_clk_row + row_major) * NUM_CLB_PER_COLUMN + y_ofst;
+                            names.push(format!("INT_X{x}Y{abs_y}"));
+                        }
                     }
                 }
             }

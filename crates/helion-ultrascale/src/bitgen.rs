@@ -938,6 +938,15 @@ pub fn parse_bram_tile(tile: &str) -> Option<(u32, u32)> {
     Some((x, y))
 }
 
+/// Parse the Y out of `INT_X<x>Y<y>`. Private to this module; the
+/// emitter-side parser lives in `bitgen_device.rs` (same split as
+/// `parse_slice_tile` / `parse_bram_tile`).
+fn parse_int_tile_y(tile: &str) -> Option<u32> {
+    let rest = tile.strip_prefix("INT_X")?;
+    let (_, y_text) = rest.split_once('Y')?;
+    y_text.parse().ok()
+}
+
 /// Parse `SLICE_X<x>Y<y>` into (x, y).
 pub fn parse_slice_tile(tile: &str) -> Option<(u32, u32)> {
     let rest = tile.strip_prefix("SLICE_X")?;
@@ -2232,6 +2241,20 @@ pub fn parse_bitstream(
     // appears on many tiles.
     let mut complement_sets: HashMap<String, HashSet<Vec<(u32, u16)>>> = HashMap::new();
     for tile in device.tile_names() {
+        // F3: the 60 INT tiles in one clock-region row share one base
+        // FAR, so render INT features only on the row-start tile
+        // (Y % 60 == 0); otherwise one set INT PIP renders 60 times.
+        // Documented limitation: a design using a non-row-start INT
+        // tile (e.g. INT_X11Y119) parses back as its row-start tile
+        // (INT_X11Y60); the bits alone cannot distinguish the 60
+        // tiles in a row, since they share one column. The same class
+        // of limitation already applies to SLICE tiles sharing a
+        // column base (F1).
+        if let Some(y) = parse_int_tile_y(tile) {
+            if y % NUM_CLB_PER_COLUMN != 0 {
+                continue;
+            }
+        }
         let tile_type = device
             .tile_type(tile)
             .ok_or_else(|| BitgenError::UnknownTileType { tile: tile.clone() })?;
