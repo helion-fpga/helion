@@ -100,6 +100,21 @@ class TestGeneratorValidity(unittest.TestCase):
             ]
             self.assertEqual(len(tiles), len(set(tiles)))
 
+    def test_int_tiles_are_y0_intersection(self):
+        # The harness reference and the emitter agree on INT tile
+        # coordinates only at Y=0 (see the gen_random module
+        # docstring: reference reads Y as absolute row, emitter
+        # reads it as the FAR row). Every generated INT tile must
+        # sit in that intersection, or emit fails loud.
+        ref = Tier1Reference()
+        for i in range(10):
+            design = generate_design(ref, i)
+            for feat in parse_fasm(design["fasm"]):
+                if classify(feat) == "INT_PIP":
+                    self.assertTrue(
+                        feat.tile.endswith("Y0"), design["name"]
+                    )
+
     def test_placement_hash_recomputes(self):
         ref = Tier1Reference()
         design = generate_design(ref, 5)

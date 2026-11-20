@@ -1,12 +1,12 @@
 {
   "class": "bram",
   "design": "rand028",
-  "fasm_sha256": "4a19b57f404ae9663934be4e830d483c3381571c8de28d2df032fb20cbe74ec5",
+  "fasm_sha256": "2c643f15ce528d21c4c94fe59819eb7022b8e24ff31a5f754b8394bb2c51729f",
   "notes": "INT/HPIO tile X is the logical CLB column index, not a verified Vivado tile X (no xcku3p tilegrid in any public DB).",
   "part": "xcku3p",
-  "placement_hash": "8d8676fb1ba54da66f9df590547f6c072c31dd97684470405225da9b3734564a",
+  "placement_hash": "661049ae34b741eb3ce1b45fc71f39123cc61f56d38042ef404649e45da76b88",
   "provisional_tiles": [
-    "INT_X100Y51",
+    "INT_X25Y0",
     "HPIO_RIGHT_X0Y0"
   ],
   "seed": 20261147,

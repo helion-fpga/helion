@@ -1,13 +1,13 @@
 {
   "class": "bram",
   "design": "rand074",
-  "fasm_sha256": "3a726473999e6b685f402b010412887e4e6be7beb327711f0a513c84df96105f",
+  "fasm_sha256": "1a695100481f409ee37d36194917b449b2d4f8566782c1c95e0d63c24134c34b",
   "notes": "INT/HPIO tile X is the logical CLB column index, not a verified Vivado tile X (no xcku3p tilegrid in any public DB).",
   "part": "xcku3p",
-  "placement_hash": "78b3226d6055389f478a865d7a9abc1389178b6da4ad558601d7a16bf9478197",
+  "placement_hash": "8f5dfa18e8a1028ec83fd41d87e010d8fa33cf4aa122a0cc17496ec92776d727",
   "provisional_tiles": [
-    "INT_X27Y77",
-    "INT_X73Y11",
+    "INT_X27Y0",
+    "INT_X38Y0",
     "HPIO_RIGHT_X0Y0"
   ],
   "seed": 20261193,
@@ -40,7 +40,7 @@
     {
       "bel": "RAMB18E2",
       "role": "bram",
-      "tile": "RAMB18_X8Y90"
+      "tile": "RAMB18_X9Y14"
     }
   ]
 }

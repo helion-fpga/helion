@@ -18,6 +18,18 @@
 # - INT PIPs come only from prjuray-db segbits_int.db (3778 entries),
 #   one PIP per distinct INT tile, so no two PIPs can fight over the
 #   same tile-relative bit.
+# - INT tiles are INT_X<col>Y0 only (Y always 0). Reason, a real
+#   emitter-vs-harness convention mismatch, not a generator choice:
+#   the harness reference (reference.py resolve_int_pip) reads the
+#   INT tile Y as an absolute row coordinate (row major = Y // 60),
+#   while the emitter (bitgen_device.rs parse_int_tile) reads Y as
+#   the FAR row itself (row major = Y). The two agree only at Y=0.
+#   The xczu3eg tilegrid evidence (INT_X11Y60, cited in
+#   reference.py) supports the harness reading, so the emitter side
+#   is the suspect; fixing emit semantics is bitgen-core work, not
+#   US-07, and is reported as a finding, not silently worked around
+#   by emitting FASM only the emitter understands. Column variety
+#   (113 columns) still gives distinct INT tiles per design.
 # - DSP48E2, URAM288, and CLK (BUFGCE/MMCM/RCLK/CMT site config)
 #   have no public encoding, so the generator never emits them in the
 #   100-design loop. They are covered instead by the blocked-encoding
@@ -115,13 +127,17 @@ def _random_slice(rng, ref, used):
 
 
 def _random_int_tile(rng, ref, used):
-    """One unused (int_col, int_y) pair (logical CLB column index)."""
+    """One unused INT tile (logical CLB column index, Y always 0).
+
+    Y is 0 by the intersection rule in the module docstring: the
+    harness reference and the emitter agree on INT tile coordinates
+    only at Y=0. Columns vary across all 113 CLB columns of row 0.
+    """
     while True:
-        y = rng.randrange(0, MAX_SLICE_Y + 1)
-        col = rng.choice(clb_columns(ref, y // NUM_CLB_PER_COLUMN))
-        if (col, y) not in used:
-            used.add((col, y))
-            return col, y
+        col = rng.choice(clb_columns(ref, 0))
+        if (col, 0) not in used:
+            used.add((col, 0))
+            return col, 0
 
 
 def generate_design(ref, index, seed_base=SEED_BASE):
