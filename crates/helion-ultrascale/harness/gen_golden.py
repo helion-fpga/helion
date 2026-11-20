@@ -3,7 +3,10 @@
 # The golden designs are the placed-and-routed targets for the diff:
 #   blinky: 1 LUT (inverter) + 1 FF (toggle), clk in, led out
 #   counter: 4 LUTs (4-bit incrementer) + 4 FFs, clk in, led out
-# Sources: examples/blinky.sv and examples/counter.sv in the worktree.
+#   carry8: 8 LUTs (buffers) + 8 FFs + 1 CARRY8 (8-bit incrementer),
+#     clk in, led out (led = cnt[7])
+# Sources: examples/blinky.sv, examples/counter.sv, and
+# examples/carry8.sv in the worktree.
 #
 # LUT INIT values are COMPUTED here from the boolean function of each
 # output bit (input I0 is LUT input bit 0, I1 bit 1, ...). They are
@@ -92,6 +95,10 @@ def cnt3(b):
     return b[3] ^ (b[2] & b[1] & b[0])
 
 
+def carry8_buf(b):
+    return b[0]
+
+
 DESIGNS = {
     "blinky": {
         "luts": [("A6LUT", blinky_inv)],
@@ -106,9 +113,51 @@ DESIGNS = {
         ],
         "ffs": ["AFF", "BFF", "CFF", "DFF"],
     },
+    "carry8": {
+        # 8-bit incrementer on one CARRY8. Each LUT is a buffer of its
+        # count bit: O6 drives the CARRY8 S input (propagate) and O5
+        # drives the DI input (generate) of the same stage, so S[i]
+        # and DI[i] are both cnt[i] and the chain adds 1 with CI = 1.
+        "luts": [
+            ("A6LUT", carry8_buf),
+            ("B6LUT", carry8_buf),
+            ("C6LUT", carry8_buf),
+            ("D6LUT", carry8_buf),
+            ("E6LUT", carry8_buf),
+            ("F6LUT", carry8_buf),
+            ("G6LUT", carry8_buf),
+            ("H6LUT", carry8_buf),
+        ],
+        "ffs": ["AFF", "BFF", "CFF", "DFF", "EFF", "FFF", "GFF", "HFF"],
+    },
 }
 
-PIPS = {"blinky": BLINKY_PIPS, "counter": COUNTER_PIPS}
+PIPS = {"blinky": BLINKY_PIPS, "counter": COUNTER_PIPS, "carry8": COUNTER_PIPS}
+
+# CARRY8 features for the carry8 golden. One 8-bit chain
+# (CARRY_TYPE.SINGLE_CY8), carry-in 1 (CI.V1), DI from the LUT
+# outputs (DIi.<letter>). CI_TOP is deliberately absent: the correct
+# value is 0 (ground; UG974 says tie CI_TOP to ground when
+# CARRY_TYPE is SINGLE_CY8), but CI_TOP.V0 is unobservable through
+# parse-back (a mux default with no exact complement, bitgen.rs
+# presence rule), so a golden line for it would fail the FRAMING
+# round trip. The emitted frames still read 0 on both CI_TOP bits,
+# and the per-block diff catches an emitter that sets them as extra
+# set bits. See docs/ultra-bitgen-crew/carry8-golden.md.
+CARRY8 = {
+    "carry8": [
+        "CARRY_TYPE.SINGLE_CY8",
+        "CI.V1",
+        "DI0.AX",
+        "DI1.BX",
+        "DI2.CX",
+        "DI3.DX",
+        "DI4.EX",
+        "DI5.FX",
+        "DI6.GX",
+        "DI7.HX",
+    ],
+}
 
 # All golden logic is placed in one slice; the tile is part of the
 # frozen placement, not per-design data. The round-trip
@@ -129,7 +178,8 @@ def design_ff_locations(design):
 HEADER = """# golden FASM: {design} on {part}
 # seed: {seed}
 # source: examples/{design}.sv in the worktree (blinky: registered
-# inverter, led = q; counter: 4-bit incrementer, led = cnt[3]).
+# inverter, led = q; counter: 4-bit incrementer, led = cnt[3];
+# carry8: 8-bit incrementer on one CARRY8, led = cnt[7]).
 # placement: all logic in SLICE_X0Y0 (xcku3p: row major 0, CLB column 0,
 # tile type CLEL_R per the BitFiltrator xcku3p device file).
 # PROVISIONAL: INT and HPIO tile coordinates below use the logical CLB
@@ -154,6 +204,8 @@ def build_fasm(design, part):
     for bel in spec["ffs"]:
         lines.append("SLICE_X0Y0.%s.INIT = 0" % bel)
         lines.append("SLICE_X0Y0.%s.SRVAL = 0" % bel)
+    for feat in CARRY8.get(design, []):
+        lines.append("SLICE_X0Y0.CARRY8.%s" % feat)
     for pip in PIPS[design]:
         lines.append("INT_X0Y0.%s" % pip)
     lines.append("HPIO_RIGHT_X0Y0.%s" % CLK_IO)
@@ -168,6 +220,8 @@ def placement_record(design, part):
         sites.append({"tile": "SLICE_X0Y0", "bel": bel, "role": "lut"})
     for bel in spec["ffs"]:
         sites.append({"tile": "SLICE_X0Y0", "bel": bel, "role": "ff"})
+    if design in CARRY8:
+        sites.append({"tile": "SLICE_X0Y0", "bel": "CARRY8", "role": "carry8"})
     provisional_tiles = ["INT_X0Y0", "HPIO_RIGHT_X0Y0"]
     return {
         "design": design,
@@ -214,13 +268,21 @@ def verify_features_exist(ref):
         key = "HPIO_RIGHT." + feat
         if key not in hpio_db:
             raise SystemExit("golden IO %s not in segbits_hpio_right.db" % key)
+    clel_r_db = ref.segbits("clel_r")
+    for design, feats in CARRY8.items():
+        for feat in feats:
+            key = "CLEL_R.CARRY8." + feat
+            if key not in clel_r_db:
+                raise SystemExit(
+                    "golden CARRY8 %s not in segbits_clel_r.db" % key
+                )
 
 
 def main():
     ref = Tier1Reference()
     verify_features_exist(ref)
     os.makedirs(GOLDEN_DIR, exist_ok=True)
-    for design in ("blinky", "counter"):
+    for design in ("blinky", "counter", "carry8"):
         for part in ("xcku3p", "xcvu3p"):
             fasm = build_fasm(design, part)
             record = placement_record(design, part)
