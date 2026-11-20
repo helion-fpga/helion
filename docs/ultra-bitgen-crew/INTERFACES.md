@@ -206,9 +206,10 @@ major, same construction as INT PIP). A feature absent from the DB for
 its tile type fails loud, never emits a guessed bit. No BitFiltrator
 CARRY8 table exists, so there is no second-source cross-check, and
 Y-independence within a column is the DB's own structure, not
-independently verified. A design with no CARRY8 features reports a
-zero-bit green CARRY8 line when an emitter ran and set no CARRY8 bits;
-with no emitter it reports blocked, like every other block.
+independently verified. A design with no CARRY8 features reports
+CARRY8 blocked (unexercised), like every other block, whether or
+not an emitter ran (CTO ruling 2026-11-19; FLAG-22-1 removed the
+earlier zero-bit-green rule).
 
 LUTRAM is a separate block, BLOCKED: LUTRAM emission fails loud
 (LutramBlocked) until a LUTRAM table or Vivado logic-location data

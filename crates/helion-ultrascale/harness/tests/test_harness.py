@@ -240,7 +240,7 @@ class TestCarry8(unittest.TestCase):
             f.write(text)
         return path
 
-    def test_design_without_carry8_is_zero_bit_green(self):
+    def test_design_without_carry8_is_blocked(self):
         with tempfile.TemporaryDirectory() as tmp:
             emitter = Emitter(_fake_emitter_shim(tmp))
             recs = diff_design(
@@ -250,8 +250,11 @@ class TestCarry8(unittest.TestCase):
             )
             by_block = {r["block"]: r for r in recs}
             carry8 = by_block["CARRY8"]
-            self.assertEqual(carry8["status"], "green")
-            self.assertEqual(carry8["diff_bits"], 0)
+            # CTO ruling 2026-11-19: zero bits exercised is not passed;
+            # an unexercised block reports blocked, like every other
+            # block (FLAG-22-1).
+            self.assertEqual(carry8["status"], "blocked")
+            self.assertIsNone(carry8["diff_bits"])
             self.assertEqual(carry8["total_bits"], 0)
 
     def test_design_with_carry8_reports_carry8_line(self):
@@ -729,7 +732,7 @@ class TestDiffEngine(unittest.TestCase):
             self.assertEqual(by_block["INT_PIP"]["total_bits"], 11)
             self.assertEqual(by_block["IO_CONFIG"]["total_bits"], 55)
             # CARRY8 is blocked without an emitter, like every block:
-            # no comparison ran, so no zero-bit green.
+            # an unexercised block is never green (FLAG-22-1).
             self.assertEqual(by_block["CARRY8"]["total_bits"], 0)
 
     def test_greedy_order_largest_first(self):

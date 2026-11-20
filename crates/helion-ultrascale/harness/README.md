@@ -84,7 +84,7 @@ on both parts. BRAM/DSP/URAM are not exercised by the golden designs.
 |---|---|---|
 | LUT_INIT | BitFiltrator LutLoc, cross-checked vs prjuray CLEL/CLEM INIT lines (all 8 LUTs, 64 bits each, zero mismatches every run) | Resolves, absolute |
 | FF_INIT | BitFiltrator RegLoc, cross-checked vs prjuray INIT.V0/V1 (all 16 FFs); polarity inverted per XAPP1230 (frame bit = 1 - INIT) | Resolves, absolute |
-| CARRY8 | prjuray segbits_clel_l/r + segbits_clem/r .db (24 CARRY8 features per CLB tile type, CC0); no BitFiltrator table, so no second-source cross-check | Resolves, absolute; zero-bit green on designs without CARRY8 when an emitter ran and set no CARRY8 bits |
+| CARRY8 | prjuray segbits_clel_l/r + segbits_clem/r .db (24 CARRY8 features per CLB tile type, CC0); no BitFiltrator table, so no second-source cross-check | Resolves, absolute; blocked (unexercised) on designs without CARRY8 |
 | BRAM_CONTENT / BRAM_PARITY | BitFiltrator BramMemLoc/BramMemParityLoc, cross-checked vs prjuray segbits_bram.block_ram.db (INIT_00[0..4] matches exactly) | Resolves; not exercised by goldens |
 | INT_PIP | prjuray segbits_int.db (3778 PIPs); absolute FARs via INT col = CLB col - 1 (provisional) | Resolves, absolute-provisional |
 | IO_CONFIG | prjuray segbits_hpio_right.db (1560 lines) | Tile-relative only; absolute needs xcku3p tilegrid |

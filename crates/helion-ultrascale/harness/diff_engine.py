@@ -225,21 +225,6 @@ def diff_design(ref, emitter, design, part, fasm_path, seed, placement_hash,
                 )
                 records.append(rec)
                 continue
-            if block == "CARRY8" and emitter is not None and emit_error is None:
-                # Zero-bit green, not blocked: CARRY8 is the one
-                # unexercised block whose encoding is grounded
-                # (prjuray segbits, 24 features per CLB tile type),
-                # so zero reference bits against zero emitted bits
-                # is a comparison that ran, not a pass on missing
-                # data. With no emitter there is no comparison and
-                # the block stays blocked, like every other block.
-                rec["diff_bits"] = 0
-                rec["total_bits"] = 0
-                rec["status"] = "green"
-                rec["coord_system"] = "absolute"
-                rec["emitted_via"] = emitted_via
-                records.append(rec)
-                continue
             rec["diff_bits"] = None
             rec["total_bits"] = 0
             rec["status"] = "blocked"
