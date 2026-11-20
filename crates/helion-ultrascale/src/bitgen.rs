@@ -838,6 +838,22 @@ fn bram_array_value_bits(
     Ok(value_bits)
 }
 
+/// One frame-bit write: identity (`tile`, `feature`, `base_far`),
+/// position (`frame` offset from the base FAR, `bit` within the
+/// frame), and values (`want`, `materialize`). Grouped so the
+/// `write_frame_bit` helper takes 3 arguments instead of 9; the
+/// mutable frame state (`frames`, `written`) stays separate
+/// parameters because both call sites thread it through.
+struct FrameBit<'a> {
+    tile: &'a str,
+    feature: &'a str,
+    base_far: u32,
+    frame: u32,
+    bit: u16,
+    want: bool,
+    materialize: bool,
+}
+
 /// Write one frame bit, failing loud on overflow, an out-of-range bit
 /// offset, or a conflicting earlier write. Shared by the segbits path
 /// and the BRAM path so the two cannot drift apart. The bit is always
@@ -853,14 +869,17 @@ fn bram_array_value_bits(
 fn write_frame_bit(
     frames: &mut BTreeMap<u32, FrameWords>,
     written: &mut HashMap<(u32, u16), bool>,
-    tile: &str,
-    feature: &str,
-    base_far: u32,
-    frame: u32,
-    bit: u16,
-    want: bool,
-    materialize: bool,
+    target: FrameBit<'_>,
 ) -> Result<(), BitgenError> {
+    let FrameBit {
+        tile,
+        feature,
+        base_far,
+        frame,
+        bit,
+        want,
+        materialize,
+    } = target;
     if bit as usize >= FRAME_BITS {
         return Err(BitgenError::BadFar {
             reason: format!("tile {tile} feature {feature}: frame bit {bit} exceeds {FRAME_BITS}"),
@@ -960,13 +979,15 @@ pub fn emit_frames(
                     write_frame_bit(
                         &mut frames,
                         &mut written,
-                        &entry.tile,
-                        &entry.feature,
-                        base_far,
-                        frame,
-                        placed_bit.frame_ofst as u16,
-                        placed_bit.value,
-                        placed_bit.value,
+                        FrameBit {
+                            tile: &entry.tile,
+                            feature: &entry.feature,
+                            base_far,
+                            frame,
+                            bit: placed_bit.frame_ofst as u16,
+                            want: placed_bit.value,
+                            materialize: placed_bit.value,
+                        },
                     )?;
                 }
                 continue;
@@ -1034,13 +1055,15 @@ pub fn emit_frames(
             write_frame_bit(
                 &mut frames,
                 &mut written,
-                &entry.tile,
-                &entry.feature,
-                base_far,
-                r.frame,
-                r.bit,
-                want,
-                true,
+                FrameBit {
+                    tile: &entry.tile,
+                    feature: &entry.feature,
+                    base_far,
+                    frame: r.frame,
+                    bit: r.bit,
+                    want,
+                    materialize: true,
+                },
             )?;
         }
     }
