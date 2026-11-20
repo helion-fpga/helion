@@ -154,9 +154,23 @@ fn int_tile_resolves_by_provisional_rule_and_validates() {
     // CLEL_L, major 18, INT major 19 (76 minors). Base FAR 0x1300.
     assert_eq!(device.tile_type("INT_X7Y0"), Some("INT"));
     assert_eq!(device.tile_base_far("INT_X7Y0"), Some(0x0000_1300));
-    // INT tiles exist in every FAR row.
-    assert_eq!(device.tile_base_far("INT_X0Y3"), Some(0x000C_0400));
-    assert_eq!(device.tile_base_far("INT_X0Y4"), None);
+    // INT Y is absolute, not the FAR row (F3): Y0..Y59 share the
+    // row-0 base FAR, Y60..Y119 the row-1 base, and so on. The
+    // xczu3eg tilegrid pins this: INT_X11Y60 baseaddr 0x00042300
+    // is FAR row 1, and INT_X11Y0..Y59 share 0x00002300 (row 0).
+    // INT column for CLB column 0 is major 4 in every row.
+    assert_eq!(device.tile_base_far("INT_X0Y3"), Some(0x0000_0400));
+    assert_eq!(device.tile_base_far("INT_X0Y4"), Some(0x0000_0400));
+    assert_eq!(device.tile_base_far("INT_X0Y59"), Some(0x0000_0400));
+    assert_eq!(device.tile_base_far("INT_X0Y60"), Some(0x0004_0400));
+    assert_eq!(device.tile_base_far("INT_X0Y119"), Some(0x0004_0400));
+    assert_eq!(device.tile_base_far("INT_X0Y120"), Some(0x0008_0400));
+    assert_eq!(device.tile_base_far("INT_X0Y239"), Some(0x000C_0400));
+    assert_eq!(device.tile_base_far("INT_X0Y240"), None);
+    // The Y60 case from the tilegrid, on xcku3p columns: CLB
+    // column 11 is CLEL_R, major 26, so its INT column is major
+    // 25; row 1 base is 0x0004_1900.
+    assert_eq!(device.tile_base_far("INT_X11Y60"), Some(0x0004_1900));
 }
 
 #[test]
@@ -202,15 +216,16 @@ fn tile_names_enumerate_resolving_tiles_xcku3p() {
     // Sorted, unique.
     assert!(names.windows(2).all(|w| w[0] < w[1]));
     assert_eq!(names.len(), names.iter().collect::<HashSet<_>>().len());
-    // Counts: 27,120 SLICE + 452 INT (all 113 CLB columns per row
-    // resolve under the tile-type-dependent rule: 52 via -1, 61
-    // via +1, x 4 rows) + 960 RAMB18 (10 cols x 4 rows x 24).
-    assert_eq!(names.len(), 27_120 + 452 + 960);
+    // Counts: 27,120 SLICE + 27,120 INT (all 113 CLB columns per
+    // row resolve under the tile-type-dependent rule: 52 via -1,
+    // 61 via +1, x 4 rows x 60 absolute Y values per row) + 960
+    // RAMB18 (10 cols x 4 rows x 24).
+    assert_eq!(names.len(), 27_120 + 27_120 + 960);
     assert_eq!(
         names.iter().filter(|n| n.starts_with("SLICE_")).count(),
         27_120
     );
-    assert_eq!(names.iter().filter(|n| n.starts_with("INT_")).count(), 452);
+    assert_eq!(names.iter().filter(|n| n.starts_with("INT_")).count(), 27_120);
     assert_eq!(
         names.iter().filter(|n| n.starts_with("RAMB18_")).count(),
         960
@@ -219,7 +234,7 @@ fn tile_names_enumerate_resolving_tiles_xcku3p() {
     assert!(names.contains(&"SLICE_X112Y239".to_string()));
     assert!(names.contains(&"INT_X0Y0".to_string()));
     assert!(names.contains(&"INT_X1Y0".to_string()));
-    assert!(names.contains(&"INT_X112Y3".to_string()));
+    assert!(names.contains(&"INT_X112Y239".to_string()));
     assert!(names.contains(&"RAMB18_X0Y0".to_string()));
     assert!(!names.iter().any(|n| n.starts_with("HPIO")));
     assert!(!names.iter().any(|n| n.starts_with("RAMB36")));
@@ -230,16 +245,16 @@ fn tile_names_enumerate_resolving_tiles_xcvu3p() {
     let (device, _) = load_xcvu3p();
     let names = device.tile_names();
     assert!(names.windows(2).all(|w| w[0] < w[1]));
-    // Counts: 49,260 SLICE + 791 INT (113 resolving CLB columns
-    // per row x 7 rows; the tail CLB columns 113..117 resolve to
-    // no 76-minor neighbour and do not resolve) + 1,680 RAMB18
-    // (10 cols x 7 rows x 24).
-    assert_eq!(names.len(), 49_260 + 791 + 1_680);
+    // Counts: 49,260 SLICE + 47,460 INT (113 resolving CLB columns
+    // per row x 7 rows x 60 absolute Y values per row; the tail CLB
+    // columns 113..117 resolve to no 76-minor neighbour and do not
+    // resolve) + 1,680 RAMB18 (10 cols x 7 rows x 24).
+    assert_eq!(names.len(), 49_260 + 47_460 + 1_680);
     assert_eq!(
         names.iter().filter(|n| n.starts_with("SLICE_")).count(),
         49_260
     );
-    assert_eq!(names.iter().filter(|n| n.starts_with("INT_")).count(), 791);
+    assert_eq!(names.iter().filter(|n| n.starts_with("INT_")).count(), 47_460);
     assert_eq!(
         names.iter().filter(|n| n.starts_with("RAMB18_")).count(),
         1_680
