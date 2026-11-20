@@ -322,8 +322,11 @@ def diff_design(ref, emitter, design, part, fasm_path, seed, placement_hash,
         rec["emitted_via"] = emitted_via
         records.append(rec)
 
-    # FRAMING block: round-trip stage.
-    rt = roundtrip_mod.run_roundtrip(emitter, fasm_path, part, workdir, design)
+    # FRAMING block: round-trip stage. The reference goes along so
+    # the round-trip stage can judge which features parse-back cannot
+    # render (zero-bit PIP contract, F4).
+    rt = roundtrip_mod.run_roundtrip(
+        emitter, fasm_path, part, workdir, design, ref=ref)
     framing = {
         "block": "FRAMING",
         "design": design,

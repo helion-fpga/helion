@@ -20,13 +20,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from diff_engine import compute_diff, diff_design, greedy_order, resolve_feature
 from emitter import Emitter, NO_EMITTER_MISSING
-from fasm import FasmError, canonical_fasm, classify, parse_fasm, parse_init_value
+from fasm import FasmError, Feature, canonical_fasm, classify, parse_fasm, parse_init_value
 from gen_golden import DESIGNS, GOLDEN_DIR, build_fasm, lut_init_64
 from reference import MissingReference, Tier1Reference, int_col_offset_from_clb
 from roundtrip import (
     canonical_roundtrip_fasm,
+    complement_signatures,
+    drop_feature_keys,
+    is_unobservable_feature,
     roundtrip_feature_keys,
     scope_fasm_to_feature_keys,
+    unobservable_int_pip_keys,
+    zero_signature,
 )
 
 HARNESS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -484,6 +489,190 @@ class TestRoundtrip(unittest.TestCase):
             keys)
         self.assertNotEqual(scoped_wrong, golden)
         self.assertIn("SLICE_X0Y0.AFF.INIT.V1\n", scoped_wrong)
+
+
+class TestZeroBitPip(unittest.TestCase):
+    def setUp(self):
+        self.ref = Tier1Reference()
+
+    # --- the observability rule, on synthetic DB entries ---
+
+    def test_all_bang_without_complement_is_unobservable(self):
+        bits = [(1, 11, 0), (3, 10, 0), (3, 11, 0)]
+        self.assertTrue(is_unobservable_feature(bits, set()))
+
+    def test_all_bang_with_exact_complement_is_observable(self):
+        bits = [(12, 2, 0)]
+        comp = {frozenset([(12, 2)])}
+        self.assertFalse(is_unobservable_feature(bits, comp))
+
+    def test_feature_with_a_set_bit_is_observable(self):
+        bits = [(21, 35, 1), (36, 32, 0)]
+        self.assertFalse(is_unobservable_feature(bits, set()))
+
+    def test_empty_entry_is_not_unobservable(self):
+        self.assertFalse(is_unobservable_feature([], set()))
+
+    def test_drop_feature_keys_removes_only_named_lines(self):
+        text = (
+            "INT_X0Y0.PIP.IMUX_W23.VCC_WIRE\n"
+            "INT_X0Y0.PIP.IMUX_E9.INT_NODE_IMUX_19_INT_OUT1\n"
+        )
+        keys = {("INT_X0Y0", "PIP.IMUX_W23.VCC_WIRE")}
+        dropped = drop_feature_keys(text, keys)
+        self.assertNotIn("VCC_WIRE", dropped)
+        self.assertIn(
+            "INT_X0Y0.PIP.IMUX_E9.INT_NODE_IMUX_19_INT_OUT1\n", dropped)
+        # Dropping an empty key set keeps every line (sorted, like
+        # the scope helper: canonical form is sorted).
+        self.assertEqual(
+            set(drop_feature_keys(text, set()).splitlines()),
+            set(text.splitlines()))
+
+    # --- the rule against the real segbits_int.db ---
+
+    def test_five_failing_vcc_wire_features_are_unobservable(self):
+        # The five US-07 FRAMING reds (F4): each feature is 6
+        # must-be-zero bits, 0 set bits, no exact complement.
+        cases = {
+            "rand057": "INT.PIP.IMUX_W23.VCC_WIRE",
+            "rand073": "INT.PIP.IMUX_E23.VCC_WIRE",
+            "rand079": "INT.PIP.IMUX_E16.VCC_WIRE",
+            "rand085": "INT.PIP.IMUX_E24.VCC_WIRE",
+            "rand097": "INT.PIP.BYPASS_E10.VCC_WIRE",
+        }
+        db = self.ref.segbits("int")
+        comp = complement_signatures(db)
+        self.assertEqual(comp, set())
+        for design, key in cases.items():
+            bits = db[key]
+            self.assertEqual(len(bits), 6, design)
+            self.assertEqual(sum(v for (_, _, v) in bits), 0, design)
+            self.assertTrue(is_unobservable_feature(bits, comp), design)
+
+    def test_int_db_all_bang_count_is_145_with_no_complement(self):
+        # Structural fact: every INT PIP lists at least one `!` bit,
+        # so the INT complement set is empty and all 145 all-`!`
+        # features (all VCC_WIRE) are unobservable.
+        db = self.ref.segbits("int")
+        all_bang = [k for k, b in db.items()
+                    if all(v == 0 for (_, _, v) in b)]
+        self.assertEqual(len(all_bang), 145)
+        self.assertTrue(all(k.endswith(".VCC_WIRE") for k in all_bang))
+        pure_set = [k for k, b in db.items()
+                    if b and all(v == 1 for (_, _, v) in b)]
+        self.assertEqual(pure_set, [])
+
+    def test_ctrl_w5_vcc_wire_is_observable(self):
+        # The one VCC_WIRE with a set bit (the normalization report's
+        # DB exception): it sets 21_35, so parse-back renders it and
+        # the contract must NOT drop it.
+        db = self.ref.segbits("int")
+        bits = db["INT.PIP.CTRL_W5.VCC_WIRE"]
+        self.assertEqual(sum(v for (_, _, v) in bits), 1)
+        self.assertIn((21, 35, 1), bits)
+        self.assertFalse(
+            is_unobservable_feature(bits, complement_signatures(db)))
+
+    def test_ff_v1_has_complement_and_is_observable(self):
+        # The guard against over-dropping: AFF.INIT.V1 is all-`!`
+        # but its zero signature is AFF.INIT.V0's set-bit signature.
+        db = self.ref.segbits("clel_l")
+        comp = complement_signatures(db)
+        v1 = db["CLEL_L.AFF.INIT.V1"]
+        self.assertEqual(v1, [(12, 2, 0)])
+        self.assertIn(zero_signature(v1), comp)
+        self.assertFalse(is_unobservable_feature(v1, comp))
+
+    def test_unobservable_keys_from_design_features(self):
+        # Feature objects, not design files: the five failing
+        # VCC_WIRE lines plus one observable PIP and the CTRL_W5
+        # exception. Only the five come back.
+        feats = [
+            Feature("INT_X87Y0", "PIP.IMUX_W23.VCC_WIRE"),
+            Feature("INT_X86Y0", "PIP.IMUX_E23.VCC_WIRE"),
+            Feature("INT_X62Y0", "PIP.IMUX_E16.VCC_WIRE"),
+            Feature("INT_X45Y0", "PIP.IMUX_E24.VCC_WIRE"),
+            Feature("INT_X98Y0", "PIP.BYPASS_E10.VCC_WIRE"),
+            Feature("INT_X0Y0", "PIP.IMUX_E9.INT_NODE_IMUX_19_INT_OUT1"),
+            Feature("INT_X0Y0", "PIP.CTRL_W5.VCC_WIRE"),
+        ]
+        keys = unobservable_int_pip_keys(self.ref, feats)
+        self.assertEqual(len(keys), 5)
+        for tile, feat in keys:
+            self.assertTrue(feat.endswith(".VCC_WIRE"))
+            self.assertNotIn("CTRL_W5", feat)
+
+    # --- end to end: FRAMING through the fake emitter ---
+
+    def _diff_with_dropped_parse(self, text, drop, design="blinky"):
+        # Runs diff_design with the fake emitter dropping `drop`
+        # (comma-separated TILE.FEATURE) from its parse output,
+        # mimicking the real emitter's parse-back dropping a feature
+        # it cannot render. Returns {block: record}.
+        with tempfile.TemporaryDirectory() as tmp:
+            shim = _fake_emitter_shim(tmp)
+            emitter = Emitter(shim)
+            fasm_path = os.path.join(tmp, "design.fasm")
+            with open(fasm_path, "w") as f:
+                f.write(text)
+            os.environ["FAKE_PARSE_DROP_FEATURES"] = drop
+            try:
+                recs = diff_design(
+                    self.ref, emitter, design, "xcku3p",
+                    fasm_path, 20261107, "hash", "tier1", tmp,
+                )
+            finally:
+                del os.environ["FAKE_PARSE_DROP_FEATURES"]
+            return {r["block"]: r for r in recs}
+
+    def test_zero_bit_vcc_wire_roundtrip_green(self):
+        # F4 regression: blinky plus rand057's VCC_WIRE, with the
+        # fake parse dropping it like the real emitter's parse-back
+        # does. Before the fix this is FRAMING red; after the fix
+        # it is green, the exclusion named in checks_skipped, and
+        # INT_PIP green (the covering bit-level check).
+        pip = "INT_X0Y0.PIP.IMUX_W23.VCC_WIRE"
+        text = golden_fasm("blinky", "xcku3p") + pip + "\n"
+        by_block = self._diff_with_dropped_parse(text, pip)
+        framing = by_block["FRAMING"]
+        self.assertEqual(framing["status"], "green")
+        self.assertEqual(framing["diff_bits"], 0)
+        self.assertIn(
+            "roundtrip-unobservable:" + pip,
+            framing.get("checks_skipped", []))
+        self.assertIn("1 skipped", framing["detail"])
+        self.assertEqual(by_block["INT_PIP"]["status"], "green")
+        self.assertEqual(by_block["INT_PIP"]["diff_bits"], 0)
+
+    def test_observable_pip_dropped_still_red(self):
+        # The fix must not blanket-drop PIPs: a normal PIP (one set
+        # bit) dropped by parse-back is still a FRAMING red.
+        pip = "INT_X0Y0.PIP.IMUX_E9.INT_NODE_IMUX_19_INT_OUT1"
+        text = golden_fasm("blinky", "xcku3p") + pip + "\n"
+        by_block = self._diff_with_dropped_parse(text, pip)
+        self.assertEqual(by_block["FRAMING"]["status"], "red")
+        self.assertEqual(by_block["FRAMING"]["diff_bits"], 1)
+
+    def test_ctrl_w5_vcc_wire_dropped_still_red(self):
+        # Same for the one observable VCC_WIRE: it sets 21_35, so a
+        # parse-back that drops it is a real defect, still red.
+        pip = "INT_X0Y0.PIP.CTRL_W5.VCC_WIRE"
+        text = golden_fasm("blinky", "xcku3p") + pip + "\n"
+        by_block = self._diff_with_dropped_parse(text, pip)
+        self.assertEqual(by_block["FRAMING"]["status"], "red")
+        self.assertEqual(by_block["FRAMING"]["diff_bits"], 1)
+
+    def test_vcc_wire_only_design_roundtrips_green(self):
+        # A design whose only non-default feature is a zero-bit PIP:
+        # FRAMING green with the exclusion recorded, INT_PIP green
+        # over exactly its 6 must-be-zero bits.
+        pip = "INT_X0Y0.PIP.IMUX_W23.VCC_WIRE"
+        by_block = self._diff_with_dropped_parse(pip + "\n", pip)
+        self.assertEqual(by_block["FRAMING"]["status"], "green")
+        self.assertEqual(by_block["INT_PIP"]["status"], "green")
+        self.assertEqual(by_block["INT_PIP"]["total_bits"], 6)
+        self.assertEqual(by_block["INT_PIP"]["diff_bits"], 0)
 
 
 class TestReference(unittest.TestCase):

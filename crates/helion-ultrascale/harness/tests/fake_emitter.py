@@ -11,6 +11,13 @@
 # FAKE_PARSE_GARBAGE=1 makes parse return text that is not FASM at
 # all (critic session 5, FLAG 2): the harness must record a FRAMING
 # red, never die with a traceback.
+# FAKE_PARSE_DROP_FEATURES=comma-separated TILE.FEATURE lines to remove
+# from the parse output (valueless lines only): mimics the real
+# emitter's parse-back dropping a feature it cannot render, such as
+# a zero-bit PIP (F4: a VCC_WIRE sets no bits, so parse-back cannot
+# tell it from an unconfigured mux and drops it). The bits path
+# still reads the unmodified sidecar, like the real emitter's bits
+# path reads the unmodified bitstream bytes.
 # FAKE_PARSE_FF_FLIP=1 makes parse flip the AFF INIT value (0 to 1,
 # 1 to 0) in the returned FASM: the round-trip check must fail on a
 # genuinely wrong INIT value while the bits path (which reads the
@@ -137,6 +144,13 @@ def main():
                 "SLICE_X0Y0.CARRY8.DI7.HX\n"
             )
             text += extra
+        drop = os.environ.get("FAKE_PARSE_DROP_FEATURES", "")
+        if drop:
+            wanted = {s.strip() for s in drop.split(",") if s.strip()}
+            text = "".join(
+                line for line in text.splitlines(keepends=True)
+                if line.strip() not in wanted
+            )
         sys.stdout.write(text)
         return 0
     if cmd == "bits":
