@@ -9,6 +9,7 @@
 //! helion-bitgen emit --fasm FILE --part PART --out FILE.bit [--data-dir DIR]
 //! helion-bitgen parse --bit FILE.bit --part PART [--data-dir DIR]
 //! helion-bitgen bits --bit FILE.bit --part PART [--data-dir DIR]
+//! helion-bitgen decode --bit FILE.bit --db-root DIR [--part PART] [--data-dir DIR]
 //! ```
 //! - `emit` writes a raw bitstream for the FASM design, exit 0 on success.
 //! - `parse` prints the FASM the bitstream encodes, on stdout, exit 0.
@@ -24,6 +25,42 @@
 //!   set bits would count as diffs in another block. If `bits` is ever wrong,
 //!   the harness falls back to parse-mediated derivation; `bits` failing
 //!   loud is better than `bits` mislabeling.
+//! - `decode` prints the FASM the bitstream encodes, on stdout, and
+//!   exits non-zero with a clear message on any failure. It is the
+//!   decoder entry point (Worker D): it reads the .bit, loads the
+//!   segbits DBs from `--db-root` (a prjuray-db family dir such as
+//!   `zynqusp`, with `segbits_*.db` files at the top level), and runs
+//!   the decoder for `--part`. `--part` defaults to
+//!   `xczu3eg-sbva484-1-e`; `xcku3p` is also supported (vendored
+//!   device file, `--data-dir` for its location).
+//!
+//! Two decoder engines, by part:
+//! - xczu3eg: `bitstream_decode::decode_bitstream` (Worker B, the
+//!   full .bit decoder). It is offset-aware: a tile owns a bit window
+//!   inside every frame of its column (`bit = offset * 16 + db_bit`,
+//!   prjuray `WORD_SIZE_BITS = 16`, `tile_segbits.py`), so tiles
+//!   sharing a base FAR decode to their own windows instead of
+//!   colliding. It handles both tile blocks (BRAM decodes as two
+//!   `RAMB18_XxYy` lines, content from `BLOCK_RAM`, config from
+//!   `CLB_IO_CLK`) and reports every set bit no feature owns in its
+//!   output instead of failing on the first one. `decode` prints the
+//!   FASM lines to stdout, prints every unexplained bit, one
+//!   `unexplained: FAR 0x........ bit N` line per bit, to stderr, and
+//!   exits non-zero when any bit is unexplained. The FASM and the
+//!   unexplained list print in the same run; the non-zero exit is
+//!   what marks the FASM incomplete, so callers must check it before
+//!   consuming stdout. Valued features render in
+//!   the harness canonical form (`0x...`, lowercase, no leading
+//!   zeros), and FASM tile names follow this crate's convention
+//!   (SLICE site for CLB tiles, RAMB18 site by half for BRAM, grid
+//!   tile name otherwise).
+//! - xcku3p: the library `parse_bitstream` over `parse_frames`
+//!   (Worker A), with the vendored device file. It has no
+//!   word-offset concept (known F1: tiles in one column share a base
+//!   FAR), so xcku3p decode is exact only for offset-0 tiles and
+//!   fails loud with unexplained bits otherwise. On unexplained bits
+//!   `decode` lists every one on stderr (the library reports only
+//!   the first FAR) and exits non-zero, printing no FASM.
 //!
 //! Data paths: `--data-dir` overrides the vendored data directory; the
 //! default is the crate's `data/` at compile time (`CARGO_MANIFEST_DIR`).
@@ -64,16 +101,21 @@
 use helion_ultrascale::band_code::{BAND_HI, BAND_LO};
 use helion_ultrascale::bitgen::{
     BitgenDevice, BitgenError, BramFeature, bram_feature_placed_bits, emit_bitstream, far_decode,
-    lut_ff_table_placed_bits, parse_bitstream, parse_bram_tile, parse_fasm,
+    lut_ff_table_placed_bits, parse_bitstream, parse_bram_tile, parse_fasm, parse_frames,
 };
 use helion_ultrascale::bitgen::{ConfigOrderGeometry, parse_frames_with_geometry};
+use helion_ultrascale::bitstream_decode::decode_bitstream;
 use helion_ultrascale::device_file::DeviceFile;
 use helion_ultrascale::segbits::{FileSegbitsDb, SegbitsDb};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: helion-bitgen <emit|parse|bits> --part PART [--fasm FILE --out FILE | --bit FILE] [--data-dir DIR]";
+const USAGE: &str = "usage: helion-bitgen <emit|parse|bits|decode> --part PART [--fasm FILE --out FILE | --bit FILE] [--data-dir DIR] [--db-root DIR]";
+
+/// Default `--part` for `decode`: the proving part (Claude Code plan
+/// part 1a), the only part with a public tilegrid in prjuray-db.
+const DEFAULT_DECODE_PART: &str = "xczu3eg-sbva484-1-e";
 
 /// Vendored segbits DB files, in load order. The CLB DBs carry the LUT
 /// and FF encodings; the rest carry INT PIP, IO, clock, and HDIO.
@@ -123,6 +165,16 @@ fn run(args: &[String]) -> Result<(), String> {
             print!("{text}");
             Ok(())
         }
+        "decode" => {
+            let bit_path = opts.bit.ok_or("--decode needs --bit FILE")?;
+            let db_root = opts.db_root.ok_or("--decode needs --db-root DIR")?;
+            let part = if opts.part.is_empty() {
+                DEFAULT_DECODE_PART.to_string()
+            } else {
+                opts.part.clone()
+            };
+            cmd_decode(&bit_path, &db_root, &part, &data_dir)
+        }
         other => Err(format!("unknown subcommand {other:?}\n{USAGE}")),
     }
 }
@@ -133,6 +185,7 @@ struct Opts {
     part: String,
     out: Option<String>,
     data_dir: Option<PathBuf>,
+    db_root: Option<PathBuf>,
 }
 
 fn parse_args(args: &[String]) -> Result<(String, Opts), String> {
@@ -140,7 +193,7 @@ fn parse_args(args: &[String]) -> Result<(String, Opts), String> {
         return Err(format!("no subcommand given\n{USAGE}"));
     }
     let cmd = args[0].clone();
-    if cmd != "emit" && cmd != "parse" && cmd != "bits" {
+    if cmd != "emit" && cmd != "parse" && cmd != "bits" && cmd != "decode" {
         return Err(format!("unknown subcommand {cmd:?}\n{USAGE}"));
     }
     let mut opts = Opts {
@@ -149,6 +202,7 @@ fn parse_args(args: &[String]) -> Result<(String, Opts), String> {
         part: String::new(),
         out: None,
         data_dir: None,
+        db_root: None,
     };
     let mut i = 1;
     while i < args.len() {
@@ -171,11 +225,15 @@ fn parse_args(args: &[String]) -> Result<(String, Opts), String> {
             "--part" => opts.part = take(&mut i, inline_val)?,
             "--out" => opts.out = Some(take(&mut i, inline_val)?),
             "--data-dir" => opts.data_dir = Some(PathBuf::from(take(&mut i, inline_val)?)),
+            "--db-root" => opts.db_root = Some(PathBuf::from(take(&mut i, inline_val)?)),
             other => return Err(format!("unknown flag {other:?}\n{USAGE}")),
         }
         i += 1;
     }
-    if opts.part.is_empty() {
+    // `--part` is required for emit/parse/bits. `decode` defaults it
+    // to xczu3eg-sbva484-1-e (DEFAULT_DECODE_PART), so an empty part
+    // is legal there and filled in by `run`.
+    if cmd != "decode" && opts.part.is_empty() {
         return Err(format!("--part PART is required\n{USAGE}"));
     }
     Ok((cmd, opts))
@@ -285,6 +343,192 @@ fn load_device(part: &str, data_dir: &Path) -> Result<Box<dyn BitgenDevice>, Str
             xcvu3p.json is provisional until its frame-total gap is resolved"
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// decode subcommand (Worker D)
+// ---------------------------------------------------------------------------
+
+/// Decode a .bit to FASM on stdout.
+///
+/// Dispatches on `--part`: xczu3eg-sbva484-1-e runs Worker B's
+/// offset-aware `decode_bitstream` against the prjuray DBs at
+/// `--db-root`; any other supported part runs the library
+/// `parse_bitstream` against the DBs at `--db-root` and the vendored
+/// device file. On success the FASM goes to stdout and nothing goes
+/// to stderr. On unexplained set bits every unexplained bit is listed
+/// on stderr and the run fails; the xczu3eg path prints the FASM
+/// lines as well (the exit code marks them incomplete), while the
+/// xcku3p path prints no FASM. Any other
+/// failure (unreadable file, bad packets, bad CRC, missing sync,
+/// IDCODE mismatch, missing DB) fails with its message.
+fn cmd_decode(bit_path: &str, db_root: &Path, part: &str, data_dir: &Path) -> Result<(), String> {
+    let bytes =
+        std::fs::read(bit_path).map_err(|e| format!("cannot read bitstream {bit_path}: {e}"))?;
+    if part == DEFAULT_DECODE_PART {
+        return cmd_decode_xczu3eg(&bytes, db_root);
+    }
+    let segbits = load_db_root_segbits(db_root)?;
+    let device = load_decode_device(part, data_dir)?;
+    match parse_bitstream(&bytes, device.as_ref(), &segbits) {
+        Ok(fasm) => {
+            print!("{fasm}");
+            Ok(())
+        }
+        Err(BitgenError::UnexplainedBits { far, bits }) => {
+            let listing = unexplained_bits_listing(&bytes, device.as_ref(), &segbits)
+                .unwrap_or_else(|e| format!("(could not list all unexplained bits: {e})\n"));
+            eprint!("{listing}");
+            Err(format!(
+                "decode failed: FAR 0x{far:08x} has set bits no feature explains: {bits:?} (full list above)"
+            ))
+        }
+        Err(e) => Err(format!("decode failed: {e}")),
+    }
+}
+
+/// xczu3eg decode via Worker B's `decode_bitstream`. The decoder
+/// reports unexplained bits in its output instead of failing on
+/// them, so this function prints the FASM lines, then lists any
+/// unexplained bits on stderr and fails: the exit code marks the
+/// FASM incomplete, and callers must not consume stdout as complete
+/// when the run fails.
+fn cmd_decode_xczu3eg(bytes: &[u8], db_root: &Path) -> Result<(), String> {
+    let db_root_str = db_root
+        .to_str()
+        .ok_or_else(|| format!("db-root {} is not valid UTF-8", db_root.display()))?;
+    let out = decode_bitstream(bytes, db_root_str).map_err(|e| format!("decode failed: {e}"))?;
+    for line in &out.fasm {
+        println!("{line}");
+    }
+    if out.unexplained.is_empty() {
+        return Ok(());
+    }
+    let mut listing = String::new();
+    for bit in &out.unexplained {
+        let abs_bit = bit.word * 32 + bit.bit as usize;
+        listing.push_str(&format!(
+            "unexplained: FAR 0x{:08x} bit {abs_bit}\n",
+            bit.far
+        ));
+    }
+    listing.push_str(&format!(
+        "unexplained: {} set bits no feature explains\n",
+        out.unexplained.len()
+    ));
+    eprint!("{listing}");
+    Err(format!(
+        "decode failed: {} set bits no feature explains (listed above)",
+        out.unexplained.len()
+    ))
+}
+
+/// Load every segbits DB in a prjuray-db family dir (e.g. `zynqusp`):
+/// all `segbits_*.db` files at the top level, sorted, except the
+/// `*.origin_info.db` provenance files, which repeat every feature
+/// (same feature, extra `origin:` token) and would fail the load as
+/// duplicates. Then synthesize the single-feature LUT INIT lists,
+/// exactly as `load_segbits` does for the vendored set. Fails loud
+/// when the dir has no segbits files at all: decoding against an
+/// empty DB would report every bit unexplained, which is a
+/// misconfigured invocation, not a decode result.
+fn load_db_root_segbits(db_root: &Path) -> Result<FileSegbitsDb, String> {
+    let entries = std::fs::read_dir(db_root)
+        .map_err(|e| format!("cannot read segbits DB root {}: {e}", db_root.display()))?;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| format!("cannot read segbits DB root {}: {e}", db_root.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("segbits_") && name.ends_with(".db") && !name.contains("origin_info") {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    if paths.is_empty() {
+        return Err(format!(
+            "no segbits_*.db files in {}: expected a prjuray-db family dir \
+            (e.g. zynqusp) with segbits_*.db files at the top level",
+            db_root.display()
+        ));
+    }
+    let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    let mut db = FileSegbitsDb::from_files(&refs)
+        .map_err(|e| format!("cannot load segbits DBs from {}: {e}", db_root.display()))?;
+    db.synthesize_lut_init()
+        .map_err(|e| format!("cannot synthesize LUT INIT entries: {e}"))?;
+    Ok(db)
+}
+
+/// Device for `decode` on the non-xczu3eg parts. `xcku3p` reuses the
+/// emitter device (vendored device file plus the HPIO bridge).
+/// xczu3eg never reaches here (`cmd_decode` routes it to Worker B's
+/// decoder first). Any other part fails loud with the supported
+/// list: guessing a device would guess FARs.
+fn load_decode_device(part: &str, data_dir: &Path) -> Result<Box<dyn BitgenDevice>, String> {
+    match part {
+        "xcku3p" => load_device(part, data_dir),
+        other => Err(format!(
+            "part {other} has no decoder device: supported parts are xcku3p and xczu3eg-sbva484-1-e"
+        )),
+    }
+}
+
+/// Every set bit in the frames that no enumerated feature explains,
+/// one line per bit, sorted by (FAR, bit), plus a count line. This is
+/// the full hole list the 44-pair check needs (plan part 1c):
+/// `parse_bitstream` reports only the first unexplained FAR, so the
+/// CLI recomputes the explained set itself on the failure path. The
+/// extra pass costs the same as the decoder's own explained-set pass
+/// and only runs when decode already failed, so the success path pays
+/// nothing for it.
+fn unexplained_bits_listing(
+    bytes: &[u8],
+    device: &dyn BitgenDevice,
+    segbits: &dyn SegbitsDb,
+) -> Result<String, String> {
+    let frames =
+        parse_frames(bytes).map_err(|e: BitgenError| format!("cannot parse frames: {e}"))?;
+    let mut explained: HashSet<(u32, u16)> = HashSet::new();
+    for tile in device.tile_names() {
+        let tile_type = device
+            .tile_type(tile)
+            .ok_or_else(|| format!("tile {tile} has no tile type in the device"))?;
+        let base_far = device
+            .tile_base_far(tile)
+            .ok_or_else(|| format!("tile {tile} has no base FAR in the device"))?;
+        for feature in segbits.features(tile_type) {
+            let refs = segbits.lookup(tile_type, feature).ok_or_else(|| {
+                format!("tile type {tile_type} lists feature {feature} but lookup returns None")
+            })?;
+            for r in refs {
+                let far = base_far
+                    .checked_add(r.frame)
+                    .ok_or_else(|| format!("tile {tile} feature {feature}: base FAR overflow"))?;
+                explained.insert((far, r.bit));
+            }
+        }
+    }
+    let mut out = String::new();
+    let mut count = 0usize;
+    for (far, words) in &frames {
+        for (wi, word) in words.iter().enumerate() {
+            let mut w = *word;
+            while w != 0 {
+                let b = w.trailing_zeros() as usize;
+                let bit = (wi * 32 + b) as u16;
+                if !explained.contains(&(*far, bit)) {
+                    out.push_str(&format!("unexplained: FAR 0x{far:08x} bit {bit}\n"));
+                    count += 1;
+                }
+                w &= w - 1;
+            }
+        }
+    }
+    out.push_str(&format!(
+        "unexplained: {count} set bits no feature explains\n"
+    ));
+    Ok(out)
 }
 
 fn cmd_emit(
@@ -1343,6 +1587,125 @@ mod tests {
             labeled.values().filter(|b| **b == "FF_INIT").count(),
             3,
             "the 3 FF bits are FF_INIT"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // decode subcommand (Worker D)
+    // ------------------------------------------------------------------
+
+    /// prjuray-db family dir for decode tests: `$HELION_DECODE_DB_ROOT`
+    /// when set, else the reference clone at
+    /// `~/workspace/prjuray-db-ref/zynqusp`. The tilegrid tests fail
+    /// loud with the path when the clone is absent: a silent skip
+    /// would hide a broken decoder.
+    fn decode_db_root() -> PathBuf {
+        if let Ok(p) = std::env::var("HELION_DECODE_DB_ROOT") {
+            return PathBuf::from(p);
+        }
+        let home = std::env::var("HOME").unwrap_or_default();
+        PathBuf::from(home).join("workspace/prjuray-db-ref/zynqusp")
+    }
+
+    #[test]
+    fn decode_db_root_loads_all_zynqusp_segbits() {
+        let db = load_db_root_segbits(&decode_db_root()).unwrap();
+        // 28 real files (origin_info excluded): 27 tile types.
+        assert!(db.tile_types().contains(&"INT".to_string()));
+        assert!(db.tile_types().contains(&"CLEL_R".to_string()));
+        assert!(db.tile_types().contains(&"BRAM".to_string()));
+        assert!(db.tile_types().contains(&"RCLK_INT_L".to_string()));
+        assert_eq!(db.features("INT").len(), 3778);
+        // 768 lines in the file plus the 8 synthesized [63:0] LUT
+        // INIT entries (A-H), added by synthesize_lut_init.
+        assert_eq!(db.features("CLEL_R").len(), 768 + 8);
+        // BRAM is the union of the config DB (270 features) and the
+        // block-RAM content DB (36,864 per-bit INIT features).
+        assert_eq!(db.features("BRAM").len(), 270 + 36864);
+        assert!(db.lookup("BRAM", "RAMB18E2_L.INIT_00[0]").is_some());
+        // The synthesized grouped LUT INIT is present, built from the
+        // per-bit lines.
+        assert!(db.lookup("CLEL_R", "A6LUT.INIT[63:0]").is_some());
+    }
+
+    #[test]
+    fn decode_unknown_part_fails_loud() {
+        assert!(load_decode_device("nosuchpart", &data_dir()).is_err());
+        assert!(load_decode_device("xcvu3p", &data_dir()).is_err());
+    }
+
+    #[test]
+    fn decode_missing_db_root_fails_loud() {
+        let missing = PathBuf::from("/definitely/not/a/db/root");
+        assert!(load_db_root_segbits(&missing).is_err());
+        assert!(decode_bitstream(&[], missing.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn decode_xczu3eg_synthetic_round_trips() {
+        // End to end through Worker B's decoder: emit one LUT plus
+        // one PIP on offset-0 tiles with the real zynqusp DB (the
+        // stub device only supplies tile type and base FAR; the
+        // feature bits come from the real DB), then decode the
+        // bitstream and require the three lines back with zero
+        // unexplained bits. Fast: the decoder skips windows with no
+        // set bits, so only the touched column windows are evaluated.
+        // The parse-back also renders the observable zero state of
+        // untouched FF attributes on the touched tile, so containment,
+        // not exact equality, is asserted here.
+        use helion_ultrascale::bitgen::{StubDevice, emit_bitstream, emit_frames};
+        let db_root = decode_db_root();
+        let segbits = load_db_root_segbits(&db_root).unwrap();
+        let fasm = "INT_X0Y0.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1\n\
+            SLICE_X0Y0.A6LUT.INIT[63:0] = 64'h8000000000000001\n\
+            SLICE_X0Y0.AFF.INIT.V0\n";
+        let probe = StubDevice::new(
+            "xczu3eg-sbva484-1-e",
+            Some(0x04A4_2093),
+            vec![
+                ("SLICE_X0Y0".to_string(), "CLEL_R".to_string(), 0x200),
+                ("INT_X0Y0".to_string(), "INT".to_string(), 0x100),
+            ],
+            vec![],
+        );
+        let mut order: Vec<u32> = emit_frames(fasm, &probe, &segbits)
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+        order.sort();
+        let device = StubDevice::new(
+            "xczu3eg-sbva484-1-e",
+            Some(0x04A4_2093),
+            vec![
+                ("SLICE_X0Y0".to_string(), "CLEL_R".to_string(), 0x200),
+                ("INT_X0Y0".to_string(), "INT".to_string(), 0x100),
+            ],
+            order,
+        );
+        let bytes = emit_bitstream(fasm, &device, &segbits).unwrap();
+        let out = decode_bitstream(&bytes, db_root.to_str().unwrap()).unwrap();
+        assert!(
+            out.fasm
+                .contains(&"INT_X0Y0.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1".to_string()),
+            "PIP line missing, got: {:?}",
+            out.fasm
+        );
+        assert!(
+            out.fasm
+                .contains(&"SLICE_X0Y0.A6LUT.INIT[63:0] = 0x8000000000000001".to_string()),
+            "LUT line missing, got: {:?}",
+            out.fasm
+        );
+        assert!(
+            out.fasm.contains(&"SLICE_X0Y0.AFF.INIT.V0".to_string()),
+            "FF line missing, got: {:?}",
+            out.fasm
+        );
+        assert!(
+            out.unexplained.is_empty(),
+            "unexplained bits: {:?}",
+            out.unexplained
         );
     }
 }
