@@ -70,6 +70,7 @@
 //! - prjuray-db segbits agree bit for bit: every `xLUT.INIT[i]` line in
 //!   all four vendored `segbits_cle*.db` files equals the `LutLoc` Y0
 //!   pair (512 of 512 per tile type, checked by `tests/lutram.rs`).
+//!
 //! The LUTRAM mode-selection bits live in the vendored segbits DBs, not
 //! in this table: `xLUT.MODE.RAM` (2 bits per LUT), `xLUT.DI1.*` (1 bit,
 //! A..G LUTs only; the H LUT has no DI1 feature), `xLUT.SIZE.*` (1 bit
