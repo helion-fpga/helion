@@ -692,14 +692,11 @@ impl Device {
     /// unioned into one node.
     fn stitch_nodes(&mut self, conn: &[TileConnEntry]) -> Result<(), String> {
         for e in conn {
-            let a = *self
-                .type_ids
-                .get(&e.tile_types[0])
-                .ok_or_else(|| format!("tileconn: unknown tile type '{}'", e.tile_types[0]))?;
-            let b = *self
-                .type_ids
-                .get(&e.tile_types[1])
-                .ok_or_else(|| format!("tileconn: unknown tile type '{}'", e.tile_types[1]))?;
+            // A tile type the grid does not use pairs no tiles: xc7s25's
+            // tileconn.json names BRKH_B_TERM_INT, which its tilegrid lacks.
+            let (Some(&a), Some(&b)) = (self.type_ids.get(&e.tile_types[0]), self.type_ids.get(&e.tile_types[1])) else {
+                continue;
+            };
             let tiles_a = self.tiles_by_type[a as usize].clone();
             for &ta in &tiles_a {
                 let (gx, gy) = (self.tiles[ta].grid_x, self.tiles[ta].grid_y);
