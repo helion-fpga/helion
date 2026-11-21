@@ -702,8 +702,14 @@ fn cmd_impl(args: &[String]) {
     let seed: u64 = take_flag(args, "--seed")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // UltraScale+ bitstream and FASM outputs. Defaults are
+    // `{design}.{part}.bit` / `{design}.{part}.fasm` in the working
+    // directory; nothing is written when the flow stops before BITGEN.
+    let out_bit = take_flag(args, "--out");
+    let out_fasm = take_flag(args, "--fasm-out");
     if ultra::is_ultra_part(&part) {
-        if let Err(e) = ultra::run_impl(path, &part, seed) {
+        if let Err(e) = ultra::run_impl(path, &part, seed, out_bit.as_deref(), out_fasm.as_deref())
+        {
             eprintln!("impl: {e}");
             std::process::exit(1);
         }
