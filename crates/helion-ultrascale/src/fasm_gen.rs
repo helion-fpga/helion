@@ -65,6 +65,56 @@ pub fn ff_srval_fasm_line(site: &str, ff_index: u8, srval: Option<bool>) -> Resu
     Ok(format!("{site}.{name}.SRVAL.V{v}"))
 }
 
+/// FASM line for one LUT INIT: `{site}.{letter}6LUT.INIT[63:0] = 0x{init:016x}`.
+/// The spelling matches the harness golden FASM; the emitter's
+/// parse-back renders `= 64'h...` for the same bits.
+pub fn lut_init_fasm_line(site: &str, lut_index: u8, init: u64) -> Result<String, String> {
+    let name = crate::bitloc::lut_fasm_name(lut_index).map_err(|e| format!("{e}"))?;
+    Ok(format!("{site}.{name}.INIT[63:0] = 0x{init:016x}"))
+}
+
+/// Emit LUT INIT FASM for a placed design: one line per used LUT BEL,
+/// in deterministic order (placed-slice order, then BEL index
+/// ascending). The placed site name is the FASM tile, not the packed
+/// slice name.
+///
+/// Fails loud when a LUT has no recorded INIT, and when a LUT is used
+/// as distributed RAM or SRL: LUTRAM emission is BLOCKED (no LUTRAM
+/// table) and a plain LUT INIT line for it would miscompile.
+pub fn emit_lut_fasm(
+    packed: &[PackedUltraSlice],
+    placed: &UltraPlaced,
+) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    for p in &placed.slices {
+        let slice = packed.get(p.packed_idx).ok_or_else(|| {
+            format!(
+                "ULTRA FASM: placed slice {} references packed index {} out of range",
+                p.site, p.packed_idx
+            )
+        })?;
+        let mut bels: Vec<u8> = slice.luts.keys().copied().collect();
+        bels.sort_unstable();
+        for bel in bels {
+            if slice.lut_is_memory.get(&bel).copied().unwrap_or(false) {
+                return Err(format!(
+                    "ULTRA FASM: LUT {} in slice {} is used as distributed RAM or SRL; \
+                     LUTRAM emission is blocked (no LUTRAM table), refusing to emit a plain LUT INIT line",
+                    slice.luts[&bel], p.site
+                ));
+            }
+            let init = slice.lut_inits.get(&bel).ok_or_else(|| {
+                format!(
+                    "ULTRA FASM: LUT {} in slice {} has no recorded INIT value",
+                    slice.luts[&bel], p.site
+                )
+            })?;
+            lines.push(lut_init_fasm_line(&p.site, bel, *init)?);
+        }
+    }
+    Ok(lines)
+}
+
 /// Emit complete FF FASM for a placed design: for every used FF BEL in
 /// every placed slice, one INIT line and one SRVAL line, in deterministic
 /// order (placed-slice order, then BEL index ascending). `attrs` maps FF
@@ -277,5 +327,100 @@ mod tests {
         placed.slices[0].packed_idx = 99;
         let err = emit_ff_fasm(&packed, &placed, &HashMap::new()).unwrap_err();
         assert!(err.contains("out of range"), "got {err}");
+    }
+
+    fn one_lut_packed() -> (Vec<PackedUltraSlice>, UltraPlaced) {
+        let mut slice = PackedUltraSlice::new("SLICE_X0Y0".to_string(), SliceKind::Logic);
+        slice.luts.insert(0, "inv".to_string());
+        slice.lut_inits.insert(0, 0x5555555555555555);
+        let packed = vec![slice];
+        let placed = UltraPlaced {
+            slices: vec![crate::place::PlacedUltraSlice {
+                packed_idx: 0,
+                site: "SLICE_X0Y0".to_string(),
+                tile: "CLB_X0Y0".to_string(),
+                x: 0,
+                y: 0,
+            }],
+            seed: 0,
+        };
+        (packed, placed)
+    }
+
+    #[test]
+    fn lut_init_emits_golden_spelling() {
+        let (packed, placed) = one_lut_packed();
+        let lines = emit_lut_fasm(&packed, &placed).unwrap();
+        assert_eq!(
+            lines,
+            vec!["SLICE_X0Y0.A6LUT.INIT[63:0] = 0x5555555555555555".to_string()]
+        );
+    }
+
+    #[test]
+    fn lut_init_emits_in_bel_order_at_placed_site() {
+        let mut slice = PackedUltraSlice::new("SLICE_X0Y0".to_string(), SliceKind::Logic);
+        slice.luts.insert(3, "d".to_string());
+        slice.lut_inits.insert(3, 0x7f807f807f807f80);
+        slice.luts.insert(1, "b".to_string());
+        slice.lut_inits.insert(1, 0x6666666666666666);
+        let packed = vec![slice];
+        let placed = UltraPlaced {
+            slices: vec![crate::place::PlacedUltraSlice {
+                packed_idx: 0,
+                site: "SLICE_X10Y20".to_string(),
+                tile: "CLB_X10Y20".to_string(),
+                x: 10,
+                y: 20,
+            }],
+            seed: 0,
+        };
+        let lines = emit_lut_fasm(&packed, &placed).unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "SLICE_X10Y20.B6LUT.INIT[63:0] = 0x6666666666666666".to_string(),
+                "SLICE_X10Y20.D6LUT.INIT[63:0] = 0x7f807f807f807f80".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn lut_init_memory_lut_fails_loud() {
+        let (mut packed, placed) = one_lut_packed();
+        packed[0].lut_is_memory.insert(0, true);
+        let err = emit_lut_fasm(&packed, &placed).unwrap_err();
+        assert!(err.contains("LUTRAM"), "got {err}");
+    }
+
+    #[test]
+    fn lut_init_missing_init_fails_loud() {
+        let (mut packed, placed) = one_lut_packed();
+        packed[0].lut_inits.remove(&0);
+        let err = emit_lut_fasm(&packed, &placed).unwrap_err();
+        assert!(err.contains("no recorded INIT"), "got {err}");
+    }
+
+    #[test]
+    fn lut_init_bad_bel_index_fails_loud() {
+        assert!(lut_init_fasm_line("SLICE_X0Y0", 8, 0).is_err());
+    }
+
+    #[test]
+    fn pack_place_then_generate_lut_init() {
+        // End to end through the real packer and placer: one LUT plus
+        // one FF yields the LUT INIT line for the placed site.
+        let limits = ControlSetLimits::default();
+        let luts = vec![("lut0".to_string(), 0xAAAAAAAAAAAAAAAAu64, false)];
+        let ffs = vec![("q_reg".to_string(), "clk".to_string(), None, None)];
+        let packed = pack_ultra(&luts, &ffs, &[], &limits).unwrap();
+        let placed = place_ultra(&packed.slices, &SmallGrid, &UltraPlaceOpts::default()).unwrap();
+        let lines = emit_lut_fasm(&packed.slices, &placed).unwrap();
+        assert_eq!(lines.len(), 1, "one LUT gives one INIT line");
+        assert!(
+            lines[0].ends_with(".A6LUT.INIT[63:0] = 0xaaaaaaaaaaaaaaaa"),
+            "got {}",
+            lines[0]
+        );
     }
 }

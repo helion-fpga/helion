@@ -69,7 +69,9 @@ pub use fabric::{
     EmptyTimingDb, EmptyWireDb, FabricWithPlaceholders, TimingDb, UltraScaleFabric, UltraSite,
     WireDb, WireId, WireInfo,
 };
-pub use fasm_gen::{FfAttr, emit_ff_fasm, ff_init_fasm_line, ff_srval_fasm_line};
+pub use fasm_gen::{
+    emit_ff_fasm, emit_lut_fasm, ff_init_fasm_line, ff_srval_fasm_line, lut_init_fasm_line, FfAttr,
+};
 pub use int_pip::{
     BidirDir, EmittedPip, IntPip, IntPipError, MissingPip, PipResolution, emit_pips,
     emitted_to_fasm, missing_pip_report, resolve_pips, verify_zero_bits,

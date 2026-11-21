@@ -40,6 +40,7 @@
 
 use crate::fabric::{UltraSite, WireDb, WireId, WireInfo};
 use crate::int_pip::BidirDir;
+use crate::place::UltraPlaced;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
@@ -343,6 +344,29 @@ impl IntTileWireDb {
     /// One tile instance.
     pub fn single_tile(name: &str, x: i32, y: i32, json: &str) -> Result<Self, WireDbError> {
         Self::from_json(json, &[IntTile::new(name, x, y)])
+    }
+
+    /// Build the routing graph for the INT tiles covering the placed
+    /// slices: one INT tile per distinct placed (x, y), named
+    /// `INT_X{x}Y{y}`.
+    ///
+    /// PROVISIONAL (US-01): no xcku3p tilegrid exists in any public
+    /// source, so the INT tile X/Y are taken equal to the placed
+    /// slice X/Y, the same convention the harness golden FASM uses
+    /// (`INT_X0Y0` for `SLICE_X0Y0`). The day the tilegrid lands
+    /// this helper takes real tile names and coordinates instead.
+    /// Tile names and coordinates come only from the placed slices;
+    /// nothing here invents device geometry. An empty placement
+    /// fails loud (`EmptyTiles`): there is nothing to route over.
+    pub fn from_placed_slices(json: &str, placed: &UltraPlaced) -> Result<Self, WireDbError> {
+        let mut tiles: Vec<IntTile> = placed
+            .slices
+            .iter()
+            .map(|s| IntTile::new(&format!("INT_X{}Y{}", s.x, s.y), s.x, s.y))
+            .collect();
+        tiles.sort_by_key(|t| (t.y, t.x));
+        tiles.dedup_by(|a, b| a.name == b.name);
+        Self::from_json(json, &tiles)
     }
 
     /// Number of tile instances in the graph.
@@ -713,6 +737,51 @@ mod tests {
         assert!(matches!(
             IntTileWireDb::from_json(pseudo, &[IntTile::new("INT_X0Y0", 0, 0)]),
             Err(WireDbError::PseudoPip(_))
+        ));
+    }
+
+    fn placed_at(coords: &[(i32, i32)]) -> crate::place::UltraPlaced {
+        crate::place::UltraPlaced {
+            slices: coords
+                .iter()
+                .enumerate()
+                .map(|(i, (x, y))| crate::place::PlacedUltraSlice {
+                    packed_idx: i,
+                    site: format!("SLICE_X{x}Y{y}"),
+                    tile: format!("CLB_X{x}Y{y}"),
+                    x: *x,
+                    y: *y,
+                })
+                .collect(),
+            seed: 0,
+        }
+    }
+
+    #[test]
+    fn from_placed_slices_names_int_tiles_from_slices() {
+        let db = IntTileWireDb::from_placed_slices(TILE_JSON, &placed_at(&[(0, 0)])).unwrap();
+        assert_eq!(db.tile_count(), 1);
+        assert_eq!(db.wire_count(), 1475);
+        let w = db.wire_id("INT_X0Y0", "BOUNCE_E_0_FT1").unwrap();
+        assert_eq!(
+            db.wire_info(w),
+            Some(WireInfo {
+                name: "BOUNCE_E_0_FT1",
+                tile: "INT_X0Y0"
+            })
+        );
+        // Slices sharing one tile dedup to one INT tile; distinct
+        // slices give distinct tiles.
+        let db =
+            IntTileWireDb::from_placed_slices(TILE_JSON, &placed_at(&[(0, 0), (0, 0), (12, 45)]))
+                .unwrap();
+        assert_eq!(db.tile_count(), 2);
+        assert_eq!(db.wire_count(), 2 * 1475);
+        assert!(db.wire_id("INT_X12Y45", "BOUNCE_E_0_FT1").is_some());
+        // Empty placement fails loud: nothing to route over.
+        assert!(matches!(
+            IntTileWireDb::from_placed_slices(TILE_JSON, &placed_at(&[])),
+            Err(WireDbError::EmptyTiles)
         ));
     }
 }
