@@ -153,7 +153,7 @@ impl FabricWithPlaceholders {
     pub fn xczu3eg() -> Self {
         Self {
             device: UltraScaleDevice::xczu3eg(),
-            wires: EmptyWireDb,
+            wires: Arc::new(EmptyWireDb),
             timing: EmptyTimingDb,
         }
     }
@@ -164,7 +164,6 @@ impl FabricWithPlaceholders {
     /// router-to-PIP translator's bidirectional-PIP resolver).
     pub fn with_wire_db(self, wires: Arc<dyn WireDb>) -> Self {
         Self { wires, ..self }
-    }
     }
 
     /// Access the underlying device model.
