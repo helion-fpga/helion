@@ -1,0 +1,23 @@
+# golden FASM: blinky on xczu3eg
+# seed: 20261107 (same design as blinky.xcku3p.fasm)
+# source: examples/blinky.sv in the worktree (blinky: registered
+# inverter, led = q; counter: 4-bit incrementer, led = cnt[3]).
+# placement: all logic in SLICE_X0Y0 (xczu3eg: row major 0, CLB column 0,
+# tile type CLEL_R, column major 2 per the BitFiltrator xczu3eg device
+# file; base FAR 0x200).
+# INT_X0Y0 resolves from the tilegrid-derived INT column table
+# (data/xczu3eg_int_columns.json): row 0, X 0 -> column major 1,
+# base FAR 0x100. The PIP feature strings are verified to exist in
+# prjuray-db segbits_int.db. The route is the frozen chosen target,
+# not a Vivado-produced route.
+# HPIO lines: the xcku3p golden carries two HPIO_RIGHT_X0Y0 lines.
+# They are REMOVED here, not carried over: xczu3eg HPIO tiles do not
+# resolve (no HPIO column mapping in the device file or the INT
+# sidecar table, and the xcku3p bridge value 0x000 is never applied
+# to this part), so any HPIO line must fail loud. Re-add HPIO lines
+# only when a tilegrid-derived HPIO column table lands.
+SLICE_X0Y0.A6LUT.INIT[63:0] = 0x5555555555555555
+SLICE_X0Y0.AFF.INIT = 0
+SLICE_X0Y0.AFF.SRVAL = 0
+INT_X0Y0.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1
+INT_X0Y0.PIP.INT_NODE_GLOBAL_0_INT_OUT0.GCLK_B_0_0

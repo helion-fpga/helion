@@ -9,10 +9,20 @@
 //!   Blocks 320, DSP Slices 2,280. Neither DS890 nor XMP103
 //!   publishes a slice count; slice counts here are LUT-derived
 //!   (LUTs / 8) and labeled as such.
+//! - AMD DS891 (Zynq UltraScale+ MPSoC Overview): ZU3EG CLB LUTs
+//!   70,560, CLB FFs 141,120, Block RAM 7.6 Mb, DSP Slices 360,
+//!   no UltraRAM. ZU3EG slices 8,820 are geometry-equal (49 CLB
+//!   columns x 3 FAR rows x 60), unlike KU3P's usable-vs-geometry
+//!   split.
 //! - AMD UG570 Table 1: KU3P and KU5P 41,476 configuration frames
 //!   each; VU3P 71,820; frame length 93 words. UG570 FAR table:
 //!   valid block types are 000 (CLB, I/O, CLK) and 001 (BRAM
 //!   content); a normal bitstream does not include 010, 011, or 100.
+//! - AMD UG1085 Table 1 (PL Bitstream Length): ZU3 14,964
+//!   configuration frames. The xczu3eg file totals 14,952, gap 12
+//!   = 4 per FAR row x 3 rows, explained by 12 padding frames in
+//!   real bitstreams (decoder lane: fdri_frames=14964
+//!   padding_skipped=12).
 //! - BitFiltrator xcku3p.json (MIT, byte-identical to
 //!   bitfiltrator-ref/resources/devices/xcku3p.json, SHA-256
 //!   07e6a7d3d586bf9ae3ad6c5d0959b669c5332af36f473ecd44e169c47512cfbe):
@@ -31,7 +41,7 @@
 
 use helion_ultrascale::{
     ArchSummary, BelKind, BitLocator, BitgenDevice, DeviceFile, UltraScaleDevice, Xcku3pSpec,
-    Xcvu3pSpec,
+    Xcvu3pSpec, Xczu3egSpec,
 };
 use std::path::PathBuf;
 
@@ -211,4 +221,83 @@ fn far_mapping_comes_from_device_file_not_logical_grid() {
     // exists only on the BitgenDevice trait, implemented by the
     // device file (and the test stub), never by UltraScaleDevice.
     assert_eq!(<DeviceFile as BitgenDevice>::part(&device), "xcku3p");
+}
+
+#[test]
+fn xczu3eg_header_slices_are_geometry_sites() {
+    // Unlike xcku3p, usable slices equal geometry slices on
+    // xczu3eg: 49 CLB columns x 3 FAR rows x 60 slices = 8,820,
+    // and the header, the DS891 LUT/FF counts, and the tilegrid
+    // CLE tile count (5,220 SLICEL + 3,600 SLICEM) all agree.
+    let device = load("xczu3eg.json");
+    let mut clb_cols = 0;
+    for row in 0..3 {
+        let n = device.num_clb_columns("SLR0", row).unwrap();
+        assert_eq!(n, 49, "xczu3eg has 49 CLB columns in every row");
+        clb_cols += n as u64;
+    }
+    assert_eq!(clb_cols, 147);
+    let geo_slices = clb_cols * 60;
+    assert_eq!(geo_slices, 8_820);
+    assert_eq!(device.num_slices(), 8_820);
+    assert_eq!(geo_slices as u32, device.num_slices());
+
+    assert_eq!(Xczu3egSpec::CLB_SLICE_COUNT, 8_820);
+    assert_eq!(device.num_luts(), 70_560);
+    assert_eq!(device.num_regs(), 141_120);
+    assert_eq!(device.num_luts() / 8, 8_820);
+    assert_eq!(device.num_regs() / 16, 8_820);
+    // No usable-vs-geometry gap on this part.
+    assert_eq!(device.num_slices() - Xczu3egSpec::CLB_SLICE_COUNT, 0);
+
+    // The logical grid model carries the same counts.
+    let model = UltraScaleDevice::xczu3eg();
+    assert_eq!((model.grid_width(), model.grid_height()), (80, 130));
+    assert_eq!(model.part, "xczu3eg");
+    assert_eq!(model.count_bels(BelKind::Lut6), 70_560);
+    assert_eq!(model.count_bels(BelKind::FdRe), 141_120);
+    assert_eq!(model.count_bels(BelKind::Carry8), 8_820);
+    assert_eq!(model.count_bels(BelKind::Dsp48e2), 360);
+    assert_eq!(model.count_bels(BelKind::Ramb36e2), 216);
+    assert_eq!(model.count_bels(BelKind::Uram288), 0);
+}
+
+#[test]
+fn xczu3eg_dsp_and_bram_headers_match_table_density() {
+    let device = load("xczu3eg.json");
+    // DSP: 5 columns per row, 3 rows, 24 sites per column.
+    let mut dsp_cols = 0;
+    for row in 0..3 {
+        assert_eq!(count_dsp_columns(&device, row), 5);
+        dsp_cols += 5;
+    }
+    assert_eq!(dsp_cols, 15);
+    assert_eq!(device.num_dsps(), 360);
+    assert_eq!(device.num_dsps() as usize % dsp_cols, 0);
+    assert_eq!(device.num_dsps() as usize / dsp_cols, 24);
+    // BRAM: 6 columns per row, 3 rows, 12 sites per column.
+    let mut bram_cols = 0;
+    for row in 0..3 {
+        assert_eq!(device.num_bram_columns("SLR0", row).unwrap(), 6);
+        bram_cols += 6;
+    }
+    assert_eq!(bram_cols, 18);
+    assert_eq!(device.num_brams(), 216);
+    assert_eq!(device.num_brams() as usize % bram_cols, 0);
+    assert_eq!(device.num_brams() as usize / bram_cols, 12);
+}
+
+#[test]
+fn xczu3eg_frame_gap_is_four_per_far_row_vs_ug1085() {
+    // UG1085 Table 1 lists 14,964 configuration frames for ZU3.
+    // The file totals 14,952: gap 12 = 4 per FAR row x 3 rows, the
+    // same systematic pattern as xcku3p (16 = 4 x 4), explained by
+    // 12 padding frames in real bitstreams (see
+    // tests/device_file_xczu3eg.rs). Do not tune to match UG1085.
+    let device = load("xczu3eg.json");
+    let rows = device.max_far_row_idx("SLR0").unwrap() + 1;
+    assert_eq!(rows, 3);
+    assert_eq!(device.total_frames(), 14_952);
+    assert_eq!(device.total_frames() + 4 * rows as u64, 14_964);
+    assert_eq!(14_964 - device.total_frames(), 12);
 }
