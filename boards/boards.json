@@ -344,5 +344,74 @@
    "35"
   ],
   "note": "SW8 and SW9 are on bank 34 (1.8 V, shared with the DDR2) and are left out; bank 34 is not used."
+ },
+ "arty-s7-25": {
+  "part": "xc7s25csga324-1",
+  "title": "Digilent Arty S7-25",
+  "source": "Digilent Arty-S7-25-Master.xdc",
+  "clock": "F14",
+  "clock_period_ns": 83.333,
+  "switches": [
+   "H14",
+   "H18",
+   "G18"
+  ],
+  "buttons": [
+   "G15",
+   "K16",
+   "J16",
+   "H13"
+  ],
+  "button_names": [
+   "btn0",
+   "btn1",
+   "btn2",
+   "btn3"
+  ],
+  "leds": [
+   "E18",
+   "F13",
+   "E13",
+   "H15"
+  ],
+  "rgb_leds": [
+   "J15",
+   "G17",
+   "F15",
+   "E15",
+   "F18",
+   "E14"
+  ],
+  "in_pmods": {
+   "ja": [
+    "L17",
+    "L18",
+    "M14",
+    "N14",
+    "M16",
+    "M17",
+    "M18",
+    "N18"
+   ],
+   "jb": [
+    "P17",
+    "P18",
+    "R18",
+    "T18",
+    "P14",
+    "P15",
+    "N15",
+    "P16"
+   ]
+  },
+  "out_pmods": {},
+  "iostandard": {
+   "default": "LVCMOS33"
+  },
+  "spare_banks": [
+   "14",
+   "15"
+  ],
+  "note": "The clock is the 12 MHz oscillator (F14, bank 15); the 100 MHz clock (R2) and sw[3] (M5) are on bank 34, the DDR3L bank (1.35 V, SSTL135), which is not used. RGB LED order: led0_r, led0_g, led0_b, led1_r, led1_g, led1_b."
  }
 }

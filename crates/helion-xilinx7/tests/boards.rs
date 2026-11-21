@@ -71,6 +71,7 @@ fn board_parts_resolve() {
         ("arty-a7-35", "artix7", "xc7a50t", 0x0362_D093),
         ("basys3", "artix7", "xc7a50t", 0x0362_D093),
         ("nexys-a7-100t", "artix7", "xc7a100t", 0x0363_1093),
+        ("arty-s7-25", "spartan7", "xc7s25", 0x037C_4093),
     ];
     for (b, family, fabric, idcode) in want {
         let p = parts::resolve(&root, parts::board(b).unwrap().part).unwrap();

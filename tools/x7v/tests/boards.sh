@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.."
 R=$(cd ../.. && pwd)
 ZEDBIT=${X7V_ZEDBIT:-$R/target/release/examples/zedbit}
 WORK=${X7V_BOARDS_WORK:-$(mktemp -d)}
-BOARDS=${*:-zedboard arty-a7-35 basys3 nexys-a7-100t}
+BOARDS=${*:-zedboard arty-a7-35 basys3 nexys-a7-100t arty-s7-25}
 fail=0
 for B in $BOARDS; do
   W=$WORK/$B; mkdir -p "$W"

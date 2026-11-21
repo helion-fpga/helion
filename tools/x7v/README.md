@@ -43,7 +43,7 @@ python3 -m x7v --part xc7a100tcsg324-1 verify design.bit --rtl design.sv --top t
 tests/boards.sh [board ...]    # counter + PicoRV32 SoC per board, built and verified
 ```
 
-Boards: `zedboard`, `arty-a7-35` (Arty A7-35T), `basys3`, `nexys-a7-100t`.
+Boards: `zedboard`, `arty-a7-35` (Arty A7-35T), `basys3`, `nexys-a7-100t`, `arty-s7-25` (Arty S7-25).
 `verify` also checks that the bitstream's IDCODE is the part's: a device
 refuses a bitstream written for another part.
 
