@@ -79,7 +79,7 @@ fn board_parts_resolve() {
     // The short names Helion has always accepted.
     assert_eq!(parts::resolve(&root, "xc7a35t").unwrap().name, "xc7a35tcsg324-1");
     assert_eq!(parts::resolve(&root, "xc7z020").unwrap().name, "xc7z020clg484-1");
-    let err = parts::resolve(&root, "xc7k325tffg900-2").unwrap_err();
+    let err = parts::resolve(&root, "xc7k999tffg900-2").unwrap_err();
     assert!(err.contains("unknown part"), "{err}");
 }
 
