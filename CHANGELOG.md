@@ -49,6 +49,8 @@ x86_64 zip. The empty-XDC `examples/counter.sv` gold is unchanged:
   logic on the board. The VGA picture, the HDMI picture and the audio tone
   were not observed. `docs/zedboard/rung5-av.md` and
   `docs/zedboard/rung5-summary.json` give the details.
+- **Digilent Arty S7-25** (`xc7s25csga324-1`) as a board (`--board arty-s7-25`),
+  with part tests against prjxray-db and x7v coverage.
 - **Zynq PS7 as a hard block** in pack, place, route and timing, with FCLK
   periods. `x7v` treats the PS7 as the design boundary, with AXI3 masters in
   co-simulation.

@@ -165,6 +165,7 @@ pub const BOARDS: &[Board] = &[
     Board { name: "arty-a7-35", aliases: &["arty", "arty-a7"], part: "xc7a35tcsg324-1", xdc: "boards/arty-a7-35.xdc", pins: include_str!("../../../boards/arty-a7-35.xdc"), title: "Digilent Arty A7-35T" },
     Board { name: "basys3", aliases: &["basys-3"], part: "xc7a35tcpg236-1", xdc: "boards/basys3.xdc", pins: include_str!("../../../boards/basys3.xdc"), title: "Digilent Basys 3" },
     Board { name: "nexys-a7-100t", aliases: &["nexys-a7", "nexys4-ddr"], part: "xc7a100tcsg324-1", xdc: "boards/nexys-a7-100t.xdc", pins: include_str!("../../../boards/nexys-a7-100t.xdc"), title: "Digilent Nexys A7-100T" },
+    Board { name: "arty-s7-25", aliases: &["arty-s7"], part: "xc7s25csga324-1", xdc: "boards/arty-s7-25.xdc", pins: include_str!("../../../boards/arty-s7-25.xdc"), title: "Digilent Arty S7-25" },
 ];
 
 /// The first board built on `part` (full part name, any case).
@@ -201,6 +202,7 @@ mod tests {
     fn boards_resolve_by_alias() {
         assert_eq!(board("Arty").unwrap().part, "xc7a35tcsg324-1");
         assert_eq!(board("zed").unwrap().name, "zedboard");
+        assert_eq!(board("arty-s7").unwrap().part, "xc7s25csga324-1");
         assert!(board("kc705").unwrap_err().contains("known: zedboard"));
     }
 }

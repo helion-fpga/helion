@@ -26,7 +26,7 @@ from .cosim import is_verilog as cosim_is_verilog
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="x7v")
     ap.add_argument("--part", help="part the bitstream is for (default xc7z020clg484-1, the ZedBoard's)")
-    ap.add_argument("--board", help="board: sets the part and, for flow, the pin pools (zedboard, arty-a7-35, basys3, nexys-a7-100t)")
+    ap.add_argument("--board", help="board: sets the part and, for flow, the pin pools (zedboard, arty-a7-35, basys3, nexys-a7-100t, arty-s7-25)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("info"); p.add_argument("bit")
     p = sub.add_parser("decode"); p.add_argument("bit"); p.add_argument("-o")
