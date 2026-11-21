@@ -31,7 +31,7 @@ the ad-hoc signature); Developer ID-signed bundles refuse in-place and fall
 back to download-only. Restart saves the editor, spawns the new binary with
 the same args, then closes. Menu: Help -> "Check for updates…".
 
-## 7-series flow (ZedBoard, Arty A7, Basys3, Nexys A7)
+## 7-series flow (ZedBoard, Arty A7, Basys3, Nexys A7, Arty S7)
 
 `crates/helion-xilinx7/examples/zedbit.rs` builds a `.bit` from HDL and an XDC
 for the ZedBoard's `xc7z020clg484-1`, or `--board`/`--part` (any part the X-Ray
@@ -43,7 +43,7 @@ misses its clock). `zedbit --front=v2` uses the v2 SystemVerilog front end;
 `--front=zb` uses the front ends frozen in `crates/zb` (read its README before
 touching them: they are copies, not to be edited), which are the only ones
 that infer carry chains. Database: `HELION_XILINX_DB` (directory holding
-`zynq7/`, `artix7/`; default `~/.cache/helion/prjxray-db`), `X7V_DB_ROOT` for
+`zynq7/`, `artix7/`, `spartan7/`; default `~/.cache/helion/prjxray-db`), `X7V_DB_ROOT` for
 x7v. `tools/x7v/tests/boards.sh` builds and verifies a counter and PicoRV32 per
 board. Never flash a board without the user watching.
 
