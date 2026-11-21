@@ -7,6 +7,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- 7-series: the Digilent Arty S7-25 (`xc7s25csga324-1`) as a board
+  (`--board arty-s7-25`), with part tests against prjxray-db and x7v coverage.
+
 [Unreleased]: https://github.com/helion-fpga/helion/compare/v4.0.0...HEAD
 
 ## [4.0.0] — 2026-11-12

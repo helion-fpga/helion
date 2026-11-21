@@ -71,6 +71,7 @@ fn board_parts_resolve() {
         ("arty-a7-35", "artix7", "xc7a50t", 0x0362_D093),
         ("basys3", "artix7", "xc7a50t", 0x0362_D093),
         ("nexys-a7-100t", "artix7", "xc7a100t", 0x0363_1093),
+        ("arty-s7-25", "spartan7", "xc7s25", 0x037C_4093),
     ];
     for (b, family, fabric, idcode) in want {
         let p = parts::resolve(&root, parts::board(b).unwrap().part).unwrap();
@@ -79,7 +80,7 @@ fn board_parts_resolve() {
     // The short names Helion has always accepted.
     assert_eq!(parts::resolve(&root, "xc7a35t").unwrap().name, "xc7a35tcsg324-1");
     assert_eq!(parts::resolve(&root, "xc7z020").unwrap().name, "xc7z020clg484-1");
-    let err = parts::resolve(&root, "xc7k325tffg900-2").unwrap_err();
+    let err = parts::resolve(&root, "xc7k999tffg900-2").unwrap_err();
     assert!(err.contains("unknown part"), "{err}");
 }
 

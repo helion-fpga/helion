@@ -24,7 +24,7 @@ def board(name: str | None) -> dict:
     all_ = boards()
     key = (name or DEFAULT_BOARD).lower()
     aliases = {"zed": "zedboard", "arty": "arty-a7-35", "arty-a7": "arty-a7-35", "basys-3": "basys3",
-               "nexys-a7": "nexys-a7-100t", "nexys4-ddr": "nexys-a7-100t"}
+               "nexys-a7": "nexys-a7-100t", "nexys4-ddr": "nexys-a7-100t", "arty-s7": "arty-s7-25"}
     key = aliases.get(key, key)
     if key not in all_:
         raise ValueError(f"unknown board {name} (known: {', '.join(all_)})")
