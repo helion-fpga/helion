@@ -26,7 +26,18 @@
 //!   the xczu3eg tilegrid (prjuray-db): INT_X11Y60 baseaddr
 //!   0x00042300 decodes to block 0, row 1, col 35, minor 0, and
 //!   all 60 INT tiles Y0..Y59 in column X11 share the row-0
-//!   baseaddr 0x00002300. The column rule is PROVISIONAL and
+//!   baseaddr 0x00002300. On xczu3eg the column comes from a
+//!   tilegrid-derived table (`IntColumnTable`, 33 INT columns x 3
+//!   FAR rows, verified 5,940 of 5,940 INT tiles by
+//!   `tools/verify_xczu3eg.py`), not from the provisional rule:
+//!   the rule keys CLB columns by SLICE_X, and on xczu3eg the INT
+//!   tile X is not the SLICE_X (tile X is per-type numbering;
+//!   CLEL_L_X5Y0 holds SLICE_X7Y0), so the rule matches only
+//!   INT_X0 and INT_X1 there and mispredicts the rest (INT_X2Y0:
+//!   actual col 7, rule predicts 4). Where a table is attached it
+//!   replaces the rule wholesale, with no fallback: a (row, X) the
+//!   table does not list fails loud. On xcku3p/xcvu3p (no public
+//!   tilegrid, no table) the column rule is PROVISIONAL and
 //!   tile-type dependent, the same rule the diff harness reference
 //!   uses (`harness/reference.py`, `int_col_offset_from_clb`,
 //!   xczu3eg-derived): CLEL_R columns take INT column major =
@@ -66,7 +77,12 @@
 //!   base FAR would be invented. This is a named blocker, not a
 //!   silent skip: the golden's HPIO lines cannot emit until the
 //!   tilegrid lands (the harness resolves IO bits tile-relatively,
-//!   so the IO_CONFIG block itself is unaffected).
+//!   so the IO_CONFIG block itself is unaffected). xczu3eg HAS a
+//!   public tilegrid with real HPIO tiles, but they still do not
+//!   resolve: no HPIO column mapping exists in the device file or
+//!   the INT sidecar table, and the xcku3p HPIO bridge value is
+//!   never applied to this part. Unblocker: a tilegrid-derived
+//!   HPIO column table, the same pattern as the INT table.
 //!
 //! `tile_names` enumerates exactly the tiles that resolve (all
 //! SLICE tiles, the resolving INT tiles, all RAMB18 tiles),
@@ -162,31 +178,41 @@ fn slr_row_for_y(device: &DeviceFile, y: u32, per_column: u32) -> Option<(&str, 
     None
 }
 
-/// INT column major for a CLB column, by the provisional
-/// tile-type-dependent rule (CLEL_R: CLB column major - 1; every
-/// other CLB tile type: CLB column major + 1, harness
-/// `reference.py`), validated against the device file: the
-/// rule-derived column must carry at least `INT_FRAME_SPAN`
-/// minors. Returns the SLR name and the INT column major, or
-/// `None` when the tile does not resolve (unknown row, unknown
-/// CLB column, or the rule points at a column too short to hold
+/// INT column major for an INT tile X at a FAR row.
+///
+/// When the device carries a tilegrid-derived INT column table
+/// (`IntColumnTable`, xczu3eg only so far), the table is ground truth
+/// and replaces the rule wholesale: no fallback, so a (row, X) the
+/// table does not list returns `None` (fail loud) instead of
+/// resolving to a rule-derived column that is wrong on this part.
+/// Otherwise the PROVISIONAL tile-type-dependent rule applies
+/// (CLEL_R: CLB column major - 1; every other CLB tile type: CLB
+/// column major + 1, harness `reference.py`), validated against the
+/// device file: the derived column must carry at least
+/// `INT_FRAME_SPAN` minors. Returns the SLR name and the INT column
+/// major, or `None` when the tile does not resolve (unknown row,
+/// unknown CLB column, table miss, or the column too short to hold
 /// INT frames).
-fn int_col_major(device: &DeviceFile, clb_x: u32, row_major: u32) -> Option<(&str, u32)> {
+fn int_col_major(device: &DeviceFile, int_x: u32, row_major: u32) -> Option<(&str, u32)> {
     for slr in device.slr_names() {
         let rows = device.row_majors(slr).ok()?;
         if !rows.contains(&row_major) {
             continue;
         }
-        let clb_major = device.clb_col_major(slr, row_major, clb_x).ok()?;
-        let tile_type = device.clb_tile_type(slr, row_major, clb_x).ok()?;
-        // CLEL_R columns are served by the INT column on the left;
-        // CLEL_L, CLEM, and CLEM_R columns by the one on the right.
-        let int_major = if tile_type == "CLEL_R" {
-            clb_major.checked_sub(1)?
-        } else {
-            clb_major.checked_add(1)?
-        };
         let minors = device.num_minors_per_std_col_major(slr, row_major).ok()?;
+        let int_major = if device.has_int_columns() {
+            device.int_column(row_major, int_x)?
+        } else {
+            let clb_major = device.clb_col_major(slr, row_major, int_x).ok()?;
+            let tile_type = device.clb_tile_type(slr, row_major, int_x).ok()?;
+            // CLEL_R columns are served by the INT column on the left;
+            // CLEL_L, CLEM, and CLEM_R columns by the one on the right.
+            if tile_type == "CLEL_R" {
+                clb_major.checked_sub(1)?
+            } else {
+                clb_major.checked_add(1)?
+            }
+        };
         let n = *minors.get(int_major as usize)?;
         if n >= INT_FRAME_SPAN {
             return Some((slr, int_major));
@@ -234,7 +260,10 @@ fn resolve_tile<'a>(device: &'a DeviceFile, tile: &str) -> Option<(&'a str, u32)
 /// All tile names in the device file that resolve, sorted and
 /// deduplicated: every SLICE tile, every resolving INT tile, every
 /// RAMB18 tile. Tiles that do not resolve (HPIO/HDIO/CMT/DSP,
-/// RAMB36, rule-invalid INT tiles) are absent by design.
+/// RAMB36, rule-invalid INT tiles) are absent by design. When a
+/// tilegrid-derived INT column table is attached, INT tiles are
+/// enumerated from the table (33 columns x 3 rows on xczu3eg),
+/// not from the CLB-column enumeration the provisional rule uses.
 fn compute_tile_names(device: &DeviceFile) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for slr in device.slr_names() {
@@ -251,12 +280,28 @@ fn compute_tile_names(device: &DeviceFile) -> Vec<String> {
                         let abs_y = (min_clk_row + row_major) * NUM_CLB_PER_COLUMN + y_ofst;
                         names.push(format!("SLICE_X{x}Y{abs_y}"));
                     }
-                    if int_col_major(device, x, row_major).is_some() {
+                    // Provisional-rule enumeration only: with a table,
+                    // INT tiles come from the table below, never from
+                    // CLB column indices (INT tile X is not SLICE_X).
+                    if !device.has_int_columns()
+                        && int_col_major(device, x, row_major).is_some()
+                    {
                         for y_ofst in 0..NUM_CLB_PER_COLUMN {
                             let abs_y =
                                 (min_clk_row + row_major) * NUM_CLB_PER_COLUMN + y_ofst;
                             names.push(format!("INT_X{x}Y{abs_y}"));
                         }
+                    }
+                }
+            }
+            if let Some(entries) = device.int_column_entries() {
+                for &(row, int_x) in entries.keys() {
+                    if row != row_major {
+                        continue;
+                    }
+                    for y_ofst in 0..NUM_CLB_PER_COLUMN {
+                        let abs_y = (min_clk_row + row_major) * NUM_CLB_PER_COLUMN + y_ofst;
+                        names.push(format!("INT_X{int_x}Y{abs_y}"));
                     }
                 }
             }
@@ -281,7 +326,7 @@ fn compute_tile_names(device: &DeviceFile) -> Vec<String> {
 /// (asserted in the integration tests); a shortfall would mean a
 /// frame the emitter could touch is missing from config order.
 /// `Far::new` cannot fail for these values (row <= 6, column <=
-/// 234, minor <= 255 on both files on disk), so a failed
+/// 234, minor <= 255 on all files on disk), so a failed
 /// construction is skipped defensively and caught by the count
 /// assertion instead of panicking the library.
 fn compute_config_order_fars(device: &DeviceFile) -> Vec<u32> {
@@ -328,7 +373,7 @@ impl BitgenDevice for DeviceFile {
     }
 
     /// The single SLR IDCODE when every SLR in the file shares one
-    /// (both files on disk have one SLR); `None` when SLRs disagree
+    /// (all files on disk have one SLR); `None` when SLRs disagree
     /// or an IDCODE fails to parse, since the emitter writes one
     /// IDCODE per bitstream.
     fn idcode(&self) -> Option<u32> {

@@ -58,11 +58,11 @@ pub use clk::{
     require_no_clock_manager, resolve_bufce_leaf, resolve_bufgce_hdio, resolve_clk_feature,
     resolve_clk_features, resolve_cmt_feature,
 };
-pub use device::{UltraScaleDevice, Xcku3pSpec, Xcvu3pSpec};
+pub use device::{UltraScaleDevice, Xcku3pSpec, Xcvu3pSpec, Xczu3egSpec};
 pub use dsp::{DSP48E2_ATTRIBUTES, is_dsp48e2_entry};
 pub use device_file::{
     ArchSummary, BitLocator, BramResolution, DeviceFile, DeviceFileError, Far, FarBlockType,
-    NUM_18K_BRAM_PER_COLUMN, ProvisionalNote,
+    IntColumnTable, NUM_18K_BRAM_PER_COLUMN, ProvisionalNote,
 };
 pub use device_grid::{DeviceColumn, DeviceFileGrid};
 pub use fabric::{

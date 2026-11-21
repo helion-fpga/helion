@@ -146,6 +146,14 @@ impl FabricWithPlaceholders {
         }
     }
 
+    pub fn xczu3eg() -> Self {
+        Self {
+            device: UltraScaleDevice::xczu3eg(),
+            wires: EmptyWireDb,
+            timing: EmptyTimingDb,
+        }
+    }
+
     /// Access the underlying device model.
     pub fn device(&self) -> &UltraScaleDevice {
         &self.device

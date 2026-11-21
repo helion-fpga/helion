@@ -29,6 +29,11 @@
 //! ever presented as confirmed. The xcvu3p.json file is provisional in
 //! full (see `crates/helion-ultrascale/data/README.md`).
 //!
+//! INT columns: the device file carries no INT column mapping (see
+//! `IntColumnTable`). xczu3eg attaches one derived from the public
+//! prjuray-db tilegrid; other parts keep the provisional rule in
+//! `bitgen_device.rs`.
+//!
 //! Known cross-check, recorded not hidden: summing
 //! `num_minors_per_std_colMajor` plus
 //! `num_minors_per_bram_content_colMajor` over all rows of xcku3p.json
@@ -275,6 +280,83 @@ struct DeviceFileRaw {
     helion_provisional: ProvisionalBlock,
 }
 
+/// Tilegrid-derived INT column table for one part.
+///
+/// Maps (FAR row major, INT tile X) to the CLB_IO_CLK column major of
+/// that INT tile's base FAR. Generated from a public prjuray-db
+/// tilegrid by `tools/verify_xczu3eg.py --write-int-columns`; see
+/// `data/xczu3eg_int_columns.json` and `data/README.md` for the
+/// derivation and the verification (5,940 of 5,940 INT tiles).
+///
+/// The BitFiltrator device file carries no INT column mapping: it keys
+/// CLB columns by SLICE_X, and on xczu3eg the INT tile X is not the
+/// SLICE_X (tile X is per-type numbering; e.g. CLEL_L_X5Y0 holds
+/// SLICE_X7Y0). The generic provisional rule in `bitgen_device.rs`
+/// therefore mispredicts INT columns for INT_X2 and above on xczu3eg.
+/// The table replaces the rule with ground truth wherever it is
+/// attached; parts without a table keep the provisional rule.
+///
+/// Single-SLR parts only: the key has no SLR dimension, so a
+/// multi-SLR part would need a per-SLR table before this shape can
+/// be attached to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntColumnTable {
+    /// Full part string, e.g. `xczu3eg-sbva484-1-e`.
+    pub part: String,
+    /// (FAR row major, INT tile X) -> CLB_IO_CLK column major.
+    pub columns: BTreeMap<(u32, u32), u32>,
+}
+
+impl IntColumnTable {
+    /// Load a table from the sidecar JSON written by
+    /// `tools/verify_xczu3eg.py --write-int-columns`. Fails loud on a
+    /// missing `part` or `columns` key, a non-numeric row / X / column,
+    /// or an empty table.
+    pub fn from_path(path: &Path) -> Result<Self, DeviceFileError> {
+        let text = fs::read_to_string(path)
+            .map_err(|e| DeviceFileError::Io(format!("{}: {e}", path.display())))?;
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| DeviceFileError::Json(e.to_string()))?;
+        let part = value
+            .get("part")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DeviceFileError::Missing("int column table: missing part".into()))?
+            .to_string();
+        let columns = value
+            .get("columns")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| {
+                DeviceFileError::Missing("int column table: missing columns".into())
+            })?;
+        let mut table = BTreeMap::new();
+        for (row_text, row_value) in columns {
+            let row: u32 = row_text.parse().map_err(|_| {
+                DeviceFileError::Json(format!("int column table: bad row key {row_text}"))
+            })?;
+            let row_map = row_value.as_object().ok_or_else(|| {
+                DeviceFileError::Json(format!("int column table: row {row} is not an object"))
+            })?;
+            for (x_text, col_value) in row_map {
+                let x: u32 = x_text.parse().map_err(|_| {
+                    DeviceFileError::Json(format!("int column table: bad INT X key {x_text}"))
+                })?;
+                let col: u32 = col_value.as_u64().ok_or_else(|| {
+                    DeviceFileError::Json(format!(
+                        "int column table: row {row} X {x} is not a column number"
+                    ))
+                })? as u32;
+                table.insert((row, x), col);
+            }
+        }
+        if table.is_empty() {
+            return Err(DeviceFileError::Missing(
+                "int column table: no entries".into(),
+            ));
+        }
+        Ok(IntColumnTable { part, columns: table })
+    }
+}
+
 /// A parsed BitFiltrator device file.
 #[derive(Clone, Debug)]
 pub struct DeviceFile {
@@ -287,6 +369,10 @@ pub struct DeviceFile {
     /// Lazily computed config-order FAR list for the `BitgenDevice`
     /// impl. Same laziness rationale as `tile_names_cache`.
     pub(crate) config_order_cache: OnceLock<Vec<u32>>,
+    /// Optional tilegrid-derived INT column table (see
+    /// `IntColumnTable`). `None` for parts without a public tilegrid:
+    /// those keep the provisional INT rule in `bitgen_device.rs`.
+    int_columns: Option<IntColumnTable>,
 }
 
 impl DeviceFile {
@@ -295,6 +381,49 @@ impl DeviceFile {
         let text = fs::read_to_string(path)
             .map_err(|e| DeviceFileError::Io(format!("{}: {e}", path.display())))?;
         Self::from_str(&text)
+    }
+
+    /// Attach a tilegrid-derived INT column table to this device.
+    /// The table's part must match this file's part; a mismatch fails
+    /// loud instead of silently resolving INT tiles to another part's
+    /// columns. Attach before the first `BitgenDevice` use: the
+    /// lazily computed tile-name and config-order caches are cleared
+    /// here, so a table attached after a first enumeration still
+    /// takes effect on the next one.
+    pub fn set_int_columns(&mut self, table: IntColumnTable) -> Result<(), DeviceFileError> {
+        if table.part != self.raw.part {
+            return Err(DeviceFileError::Json(format!(
+                "INT column table is for part {}, not {}",
+                table.part, self.raw.part
+            )));
+        }
+        self.int_columns = Some(table);
+        self.tile_names_cache.take();
+        self.config_order_cache.take();
+        Ok(())
+    }
+
+    /// True when a tilegrid-derived INT column table is attached.
+    pub fn has_int_columns(&self) -> bool {
+        self.int_columns.is_some()
+    }
+
+    /// INT column major for (FAR row major, INT tile X) from the
+    /// attached table, or `None` when no table is attached or the
+    /// (row, X) pair is not in it.
+    pub fn int_column(&self, row_major: u32, int_x: u32) -> Option<u32> {
+        self.int_columns
+            .as_ref()?
+            .columns
+            .get(&(row_major, int_x))
+            .copied()
+    }
+
+    /// The attached INT column table's entries, or `None` when no
+    /// table is attached. Used by `bitgen_device.rs` to enumerate
+    /// the INT tiles the table covers.
+    pub fn int_column_entries(&self) -> Option<&BTreeMap<(u32, u32), u32>> {
+        self.int_columns.as_ref().map(|t| &t.columns)
     }
 
     /// Device name, e.g. `xcku3p`.
@@ -636,6 +765,7 @@ impl FromStr for DeviceFile {
             raw,
             tile_names_cache: OnceLock::new(),
             config_order_cache: OnceLock::new(),
+            int_columns: None,
         })
     }
 }

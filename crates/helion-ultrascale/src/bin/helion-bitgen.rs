@@ -76,7 +76,13 @@
 //! 0x000 (critic session 13 FLAG F1). The harness blocks IO_CONFIG
 //! before comparing, so no greenness depends on that value, and it must
 //! never be consumed as ground truth. The bridge dies the day the
-//! xcku3p tilegrid lands. Unknown parts fail loud here.
+//! xcku3p tilegrid lands. `xczu3eg` loads the real `DeviceFile` from
+//! `data/xczu3eg.json` plus the tilegrid-derived INT column table
+//! `data/xczu3eg_int_columns.json` (ground truth for INT tiles on
+//! this part; without it the provisional rule mispredicts INT columns
+//! for INT_X2 and above, see `bitgen_device.rs`). No HPIO bridge on
+//! xczu3eg: its HPIO tiles do not resolve and must fail loud, never
+//! emit at a borrowed xcku3p FAR. Unknown parts fail loud here.
 //!
 //! FASM vocabulary gap, closed here (not in the library): the golden
 //! FASM uses `A6LUT.INIT[63:0]` and valued `AFF.INIT = 0`, while the
@@ -105,7 +111,7 @@ use helion_ultrascale::bitgen::{
 };
 use helion_ultrascale::bitgen::{ConfigOrderGeometry, parse_frames_with_geometry};
 use helion_ultrascale::bitstream_decode::decode_bitstream;
-use helion_ultrascale::device_file::DeviceFile;
+use helion_ultrascale::device_file::{DeviceFile, IntColumnTable};
 use helion_ultrascale::segbits::{FileSegbitsDb, SegbitsDb};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -278,10 +284,11 @@ fn load_segbits(data_dir: &Path) -> Result<FileSegbitsDb, String> {
 /// not a table: every other tile the file does not resolve still
 /// fails loud. It dies when the xcku3p tilegrid lands.
 ///
-/// Only `xcku3p` is wired. `xcvu3p.json` exists on disk but is
-/// provisional (computed frame total 73,035 vs UG570 Table 1's
-/// 71,820), so it stays unwired until that gap is resolved by a
-/// CTO decision; any other part fails loud here.
+/// The xcku3p-only HPIO bridge (see `load_device`): `xcvu3p.json`
+/// exists on disk but is provisional (computed frame total 73,035
+/// vs UG570 Table 1's 71,820), so it stays unwired until that gap
+/// is resolved by a CTO decision; any other part fails loud here.
+/// xczu3eg is wired without this bridge: its HPIO tiles fail loud.
 struct HpioProvisionalFallback {
     inner: DeviceFile,
     /// The real impl's tile list plus the one bridged HPIO tile:
@@ -338,8 +345,35 @@ fn load_device(part: &str, data_dir: &Path) -> Result<Box<dyn BitgenDevice>, Str
             names.dedup();
             Ok(Box::new(HpioProvisionalFallback { inner: file, names }))
         }
+        "xczu3eg" => {
+            let mut file = DeviceFile::from_path(&data_dir.join("xczu3eg.json")).map_err(|e| {
+                format!(
+                    "cannot load device file {}: {e}",
+                    data_dir.join("xczu3eg.json").display()
+                )
+            })?;
+            // Tilegrid-derived INT column table: without it the
+            // provisional rule mispredicts INT columns for INT_X2
+            // and above on this part (see bitgen_device.rs). No
+            // HPIO bridge here: xczu3eg HPIO tiles do not resolve,
+            // and any HPIO line must fail loud, not emit at a
+            // borrowed xcku3p FAR.
+            let table =
+                IntColumnTable::from_path(&data_dir.join("xczu3eg_int_columns.json")).map_err(
+                    |e| {
+                        format!(
+                            "cannot load INT column table {}: {e}",
+                            data_dir.join("xczu3eg_int_columns.json").display()
+                        )
+                    },
+                )?;
+            file.set_int_columns(table).map_err(|e| {
+                format!("INT column table does not match xczu3eg.json: {e}")
+            })?;
+            Ok(Box::new(file))
+        }
         other => Err(format!(
-            "part {other} has no emitter device yet: only xcku3p is wired; \
+            "part {other} has no emitter device yet: xcku3p and xczu3eg are wired; \
             xcvu3p.json is provisional until its frame-total gap is resolved"
         )),
     }
@@ -1131,9 +1165,40 @@ mod tests {
     }
 
     #[test]
+    fn xczu3eg_loads_with_int_table_and_no_hpio_bridge() {
+        // The xczu3eg device file plus its tilegrid-derived INT table.
+        // SLICE_X0Y0: CLEL_R column 2, base FAR 0x200. INT_X0Y0:
+        // table column 1, base FAR 0x100. INT_X11Y60: the tilegrid
+        // anchor, row 1 col 35, base FAR 0x00042300. INT_X2Y0:
+        // table column 7, base FAR 0x700; the provisional rule
+        // would have predicted column 4 (0x400) here.
+        let device = load_device("xczu3eg", &data_dir()).unwrap();
+        assert_eq!(device.tile_type("SLICE_X0Y0"), Some("CLEL_R"));
+        assert_eq!(device.tile_base_far("SLICE_X0Y0"), Some(0x200));
+        assert_eq!(device.tile_type("INT_X0Y0"), Some("INT"));
+        assert_eq!(device.tile_base_far("INT_X0Y0"), Some(0x100));
+        assert_eq!(device.tile_base_far("INT_X11Y60"), Some(0x0004_2300));
+        assert_eq!(device.tile_base_far("INT_X2Y0"), Some(0x700));
+        assert_eq!(device.idcode(), Some(0x04A4_2093));
+        // No HPIO bridge on xczu3eg: HPIO tiles fail loud even
+        // though the tilegrid has real HPIO tiles (e.g.
+        // HPIO_RIGHT_X32Y0). The xcku3p bridge value 0x000 must
+        // never leak onto this part.
+        assert_eq!(device.tile_type("HPIO_RIGHT_X0Y0"), None);
+        assert_eq!(device.tile_base_far("HPIO_RIGHT_X0Y0"), None);
+        assert_eq!(device.tile_type("HPIO_RIGHT_X32Y0"), None);
+        assert_eq!(device.tile_base_far("HPIO_RIGHT_X32Y0"), None);
+        // INT tiles past the table (X33 does not exist in the
+        // tilegrid) fail loud instead of resolving by the rule.
+        assert_eq!(device.tile_base_far("INT_X33Y0"), None);
+        // Config order is the file's own frames: 14,952.
+        assert_eq!(device.config_order_fars().len(), 14_952);
+    }
+
+    #[test]
     fn unknown_part_fails_loud() {
         assert!(load_device("xcvu3p", &data_dir()).is_err());
-        assert!(load_device("xczu3eg", &data_dir()).is_err());
+        assert!(load_device("xczu3eg-ffva676", &data_dir()).is_err());
     }
 
     #[test]

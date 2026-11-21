@@ -32,7 +32,9 @@
 
 use helion_ultrascale::band_code::{compute_band_map_a, frame_band};
 use helion_ultrascale::bitgen::{emit_bitstream, emit_frames, parse_bitstream};
-use helion_ultrascale::{ArchSummary, BitLocator, BitgenDevice, DeviceFile, Far, FileSegbitsDb};
+use helion_ultrascale::{
+    ArchSummary, BitLocator, BitgenDevice, DeviceFile, Far, FileSegbitsDb, IntColumnTable,
+};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -52,6 +54,17 @@ fn load_xcku3p() -> (DeviceFile, ArchSummary) {
 
 fn load_xcvu3p() -> (DeviceFile, ArchSummary) {
     let device = DeviceFile::from_path(&data_dir().join("xcvu3p.json")).unwrap();
+    let arch = ArchSummary::from_path(&data_dir().join("ULTRASCALE_PLUS.json")).unwrap();
+    (device, arch)
+}
+
+/// xczu3eg with its tilegrid-derived INT column table attached,
+/// exactly as `helion-bitgen load_device` wires it.
+fn load_xczu3eg() -> (DeviceFile, ArchSummary) {
+    let mut device = DeviceFile::from_path(&data_dir().join("xczu3eg.json")).unwrap();
+    let table =
+        IntColumnTable::from_path(&data_dir().join("xczu3eg_int_columns.json")).unwrap();
+    device.set_int_columns(table).unwrap();
     let arch = ArchSummary::from_path(&data_dir().join("ULTRASCALE_PLUS.json")).unwrap();
     (device, arch)
 }
@@ -186,6 +199,101 @@ fn bram_tile_resolves() {
     // RAMB36 has no resolver (BitLocator rejects it too).
     assert_eq!(device.tile_type("RAMB36_X0Y0"), None);
     assert_eq!(device.tile_base_far("RAMB36_X0Y0"), None);
+}
+
+#[test]
+fn xczu3eg_part_and_idcode() {
+    let (device, _) = load_xczu3eg();
+    assert_eq!(<DeviceFile as BitgenDevice>::part(&device), "xczu3eg");
+    assert_eq!(device.idcode(), Some(0x04A4_2093));
+    assert_eq!(device.total_frames(), 14_952);
+}
+
+#[test]
+fn xczu3eg_tiles_resolve_from_tilegrid_table() {
+    let (device, arch) = load_xczu3eg();
+    let loc = BitLocator::new(&device, &arch);
+    // SLICE_X0Y0: CLEL_R column 2, base FAR 0x200; the locator's
+    // AFF minor 12 gives FAR 0x20C, exactly as on xcku3p.
+    assert_eq!(device.tile_type("SLICE_X0Y0"), Some("CLEL_R"));
+    assert_eq!(device.tile_base_far("SLICE_X0Y0"), Some(0x200));
+    let (_, far, _) = loc.locate_reg("SLICE_X0Y0/AFF").unwrap();
+    assert_eq!(far.to_u32(), 0x200 + 12);
+    // INT tiles from the table, not the provisional rule:
+    // INT_X0Y0 -> col 1 (0x100); INT_X2Y0 -> col 7 (0x700);
+    // INT_X11Y60 -> row 1 col 35 (0x00042300, the tilegrid anchor).
+    assert_eq!(device.tile_type("INT_X0Y0"), Some("INT"));
+    assert_eq!(device.tile_base_far("INT_X0Y0"), Some(0x100));
+    assert_eq!(device.tile_base_far("INT_X2Y0"), Some(0x700));
+    assert_eq!(device.tile_base_far("INT_X11Y60"), Some(0x0004_2300));
+    assert_eq!(device.tile_base_far("INT_X11Y0"), Some(0x2300));
+    // Y is absolute, not the FAR row: Y0..Y59 share the row-0
+    // base, Y60..Y119 the row-1 base, Y120..Y179 the row-2 base.
+    assert_eq!(device.tile_base_far("INT_X0Y59"), Some(0x100));
+    assert_eq!(device.tile_base_far("INT_X0Y60"), Some(0x0004_0100));
+    assert_eq!(device.tile_base_far("INT_X0Y120"), Some(0x0008_0100));
+    assert_eq!(device.tile_base_far("INT_X0Y180"), None);
+    // RAMB18_X0Y0: BRAM content block, row 0, column 0, minor 0.
+    assert_eq!(device.tile_type("RAMB18_X0Y0"), Some("BRAM"));
+    assert_eq!(device.tile_base_far("RAMB18_X0Y0"), Some(0x0100_0000));
+    let (_, mem_fars, _, _, _) = loc.locate_bram("RAMB18_X0Y0").unwrap();
+    assert_eq!(mem_fars[0].to_u32(), 0x0100_0000);
+    // HPIO tiles do not resolve on xczu3eg even though the tilegrid
+    // has real ones (HPIO_RIGHT_X32Y0): no HPIO bridge on this part.
+    assert_eq!(device.tile_type("HPIO_RIGHT_X32Y0"), None);
+    assert_eq!(device.tile_base_far("HPIO_RIGHT_X32Y0"), None);
+    // Config order is the file's own frames: 14,952.
+    assert_eq!(device.config_order_fars().len(), 14_952);
+}
+
+#[test]
+fn xczu3eg_int_table_covers_every_int_tile() {
+    let (device, _) = load_xczu3eg();
+    // Full sweep over the sidecar table: every (row, X) entry
+    // resolves to Far(0, row, col, 0). This is the regression test
+    // for the table: a wrong entry fails here, not in a bitstream.
+    let table =
+        IntColumnTable::from_path(&data_dir().join("xczu3eg_int_columns.json")).unwrap();
+    for ((row, x), col) in &table.columns {
+        let tile = format!("INT_X{x}Y{}", row * 60);
+        let expected = Far::new(
+            helion_ultrascale::FarBlockType::ClbIoClk,
+            *row,
+            *col,
+            0,
+        )
+        .unwrap()
+        .to_u32();
+        assert_eq!(
+            device.tile_base_far(&tile),
+            Some(expected),
+            "table entry row {row} X {x} col {col}"
+        );
+    }
+    // tile_names enumerates exactly the table's INT tiles:
+    // 33 columns x 3 rows x 60 Y = 5,940, no more (the provisional
+    // rule would have enumerated 49 CLB columns x 3 rows x 60).
+    let int_names = device
+        .tile_names()
+        .iter()
+        .filter(|n| n.starts_with("INT_X"))
+        .count();
+    assert_eq!(int_names, 5_940);
+}
+
+#[test]
+fn xczu3eg_bare_file_int_rule_is_wrong_without_table() {
+    // Documents WHY the table must be attached: the bare file's
+    // provisional rule keys CLB columns by SLICE_X, which is not
+    // the INT tile X on this part. INT_X2Y0 resolves to col 4
+    // (0x400) by the rule but the tilegrid says col 7 (0x700);
+    // INT_X11Y60 resolves to col 22 (0x00041600) by the rule but
+    // the tilegrid says col 35 (0x00042300). Do not "fix" the rule
+    // to match: the rule is generic, the table is the fix.
+    let device = DeviceFile::from_path(&data_dir().join("xczu3eg.json")).unwrap();
+    assert!(!device.has_int_columns());
+    assert_eq!(device.tile_base_far("INT_X2Y0"), Some(0x400));
+    assert_eq!(device.tile_base_far("INT_X11Y60"), Some(0x0004_1600));
 }
 
 #[test]
