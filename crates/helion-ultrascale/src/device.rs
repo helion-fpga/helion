@@ -119,6 +119,62 @@ impl Xcku3pSpec {
     pub const IDCODE: u32 = 0x04a6_3093;
 }
 
+/// xczu3eg aggregate resources. Values from AMD DS891 (Zynq UltraScale+
+/// MPSoC Overview, ZU3EG column) and the BitFiltrator xczu3eg device
+/// file (resources/devices/xczu3eg.json, MIT), cross-checked against
+/// the public prjuray-db tilegrid
+/// (zynqusp/xczu3eg-sbva484-1-e, CC0).
+///
+/// Cross-checks that hold exactly (see
+/// `tools/verify_xczu3eg.py` and tests/device_model_counts.rs):
+/// - CLB slices 8,820 x 8 LUTs = 70,560 = device file `num_luts`
+///   (Vivado LUT_ELEMENTS) and DS891 CLB LUTs.
+/// - CLB slices 8,820 x 16 FFs = 141,120 = device file `num_regs`
+///   (Vivado FLIPFLOPS) and DS891 CLB FFs.
+/// - DSP slices 360 = device file `num_dsps`, DS891, and the
+///   tilegrid DSP48E2 site count.
+/// - RAMB36 blocks 216 = device file `num_brams`, DS891 7.6 Mb
+///   (216 x 36 Kb = 7,776 Kb), and the tilegrid BRAM tile count.
+/// - URAM288 blocks 0: DS891 lists no UltraRAM for ZU3EG.
+/// - The device file's 8,820 slices equal the tilegrid CLE tile
+///   count (5,220 SLICEL + 3,600 SLICEM) and the file geometry
+///   (49 CLB columns x 3 FAR rows x 60 slices). Unlike xcku3p,
+///   usable slices equal geometry slices here: there is no
+///   KU3P-style usable-vs-geometry fraction on this part.
+///
+/// No HP I/O count is recorded: no public source was checked for
+/// the SBVA484 package pin count, and an unsourced number would be
+/// invented. Add it with its source when one is verified.
+pub struct Xczu3egSpec;
+
+impl Xczu3egSpec {
+    /// Part name.
+    pub const PART: &'static str = "xczu3eg";
+    /// CLB LUTs, K (DS891: 70,560; device file num_luts).
+    pub const CLB_LUTS_K: u32 = 71;
+    /// CLB flip-flops, K (DS891: 141,120; device file num_regs).
+    pub const CLB_FFS_K: u32 = 141;
+    /// DSP slices (DS891: 360; device file num_dsps).
+    pub const DSP_SLICES: u32 = 360;
+    /// Block RAM total, Mb (DS891: 7.6).
+    pub const BRAM_MB: f64 = 7.6;
+    /// UltraRAM total, Mb (DS891: none on ZU3EG).
+    pub const URAM_MB: f64 = 0.0;
+
+    /// RAMB36E2 count (DS891: 7.6 Mb; 216 x 36 Kb = 7,776 Kb).
+    pub const RAMB36_COUNT: u32 = 216;
+    /// URAM288 count (DS891: none).
+    pub const URAM288_COUNT: u32 = 0;
+    /// CLB slice count: 70,560 LUTs / 8 = 141,120 FFs / 16 = 8,820.
+    pub const CLB_SLICE_COUNT: u32 = 8_820;
+    /// BitFiltrator device-file IDCODE for xczu3eg-sbva484-1-e,
+    /// confirmed by real Vivado bitstreams (big-endian bytes at
+    /// offset 291 of the 14 public xczu3eg pairs; see
+    /// data/README.md). The AMD forum figure 0x14710093 is the PS
+    /// TAP IDCODE, not the PL configuration IDCODE.
+    pub const IDCODE: u32 = 0x04a4_2093;
+}
+
 /// Resource counts used to build a device grid. One instance per part.
 struct DeviceCounts {
     part: &'static str,
@@ -169,6 +225,21 @@ impl UltraScaleDevice {
             bram: Xcku3pSpec::RAMB36_COUNT,
             uram: Xcku3pSpec::URAM288_COUNT,
             clb_slices: Xcku3pSpec::CLB_SLICE_COUNT,
+        })
+    }
+
+    /// Build the xczu3eg model (proving part; see [`Xczu3egSpec`]).
+    /// Grid 80x130 = 10,400 slots, the same slots-per-slice ratio
+    /// (~1.18) as the xcku3p (120x200) and xcvu3p (144x400) models.
+    pub fn xczu3eg() -> Self {
+        Self::build(&DeviceCounts {
+            part: Xczu3egSpec::PART,
+            grid_w: 80,
+            grid_h: 130,
+            dsp: Xczu3egSpec::DSP_SLICES,
+            bram: Xczu3egSpec::RAMB36_COUNT,
+            uram: Xczu3egSpec::URAM288_COUNT,
+            clb_slices: Xczu3egSpec::CLB_SLICE_COUNT,
         })
     }
 

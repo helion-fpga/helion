@@ -1,4 +1,4 @@
-//! UltraScale+ `helion impl` flow (xcku3p / xcvu3p).
+//! UltraScale+ `helion impl` flow (xcku3p / xcvu3p / xczu3eg).
 //!
 //! Synth (helion-sv) -> pack -> place -> legality -> preliminary STA ->
 //! route -> bitgen. Every stage that is not implemented for UltraScale+
@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 
 /// True for the UltraScale+ parts this flow owns.
 pub fn is_ultra_part(part: &str) -> bool {
-    matches!(part, "xcku3p" | "xcvu3p")
+    matches!(part, "xcku3p" | "xcvu3p" | "xczu3eg")
 }
 
 /// Packer inputs extracted from a synthesized [`Design`].
@@ -279,11 +279,14 @@ pub fn run_impl(path: &str, part: &str, seed: u64) -> Result<(), String> {
     let device = match part {
         "xcku3p" => UltraScaleDevice::xcku3p(),
         "xcvu3p" => UltraScaleDevice::xcvu3p(),
+        "xczu3eg" => UltraScaleDevice::xczu3eg(),
         _ => return Err(format!("ULTRA: unsupported part {part}")),
     };
     let fabric = match part {
         "xcku3p" => FabricWithPlaceholders::xcku3p(),
-        _ => FabricWithPlaceholders::xcvu3p(),
+        "xcvu3p" => FabricWithPlaceholders::xcvu3p(),
+        "xczu3eg" => FabricWithPlaceholders::xczu3eg(),
+        _ => return Err(format!("ULTRA: unsupported part {part}")),
     };
 
     // SYNTH is done (synth_any above); extract packer inputs.
@@ -826,7 +829,7 @@ pub fn run_multiseed(
     let (seed_first, seed_end) = seed_range(seed_start, n_seeds)?;
     if !is_ultra_part(part) {
         return Err(format!(
-            "multiseed: part {part} is not an UltraScale+ part (xcku3p or xcvu3p)"
+            "multiseed: part {part} is not an UltraScale+ part (xcku3p, xcvu3p, or xczu3eg)"
         ));
     }
     let jobs = jobs.max(1);
@@ -836,11 +839,14 @@ pub fn run_multiseed(
     let device = match part {
         "xcku3p" => UltraScaleDevice::xcku3p(),
         "xcvu3p" => UltraScaleDevice::xcvu3p(),
+        "xczu3eg" => UltraScaleDevice::xczu3eg(),
         _ => return Err(format!("multiseed: unsupported part {part}")),
     };
     let fabric = match part {
         "xcku3p" => FabricWithPlaceholders::xcku3p(),
-        _ => FabricWithPlaceholders::xcvu3p(),
+        "xcvu3p" => FabricWithPlaceholders::xcvu3p(),
+        "xczu3eg" => FabricWithPlaceholders::xczu3eg(),
+        _ => return Err(format!("multiseed: unsupported part {part}")),
     };
     let route_blocked = fabric.wires().wire_count() == 0;
     let cells = extract_cells(&design)?;
