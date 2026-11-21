@@ -172,6 +172,55 @@ pub fn write_computed_band(
     write_band(words, band);
 }
 
+/// Outcome of checking one stored band against the formula. This is
+/// the parse-side verdict (N7): the stored band must equal the masked
+/// MAP-A value, or that value XOR the Q residual, and anything else is
+/// a named mismatch, never a silent accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandCheck {
+    /// Stored band equals the expected value.
+    Exact,
+    /// Stored band equals the expected value XOR `Q_RESIDUAL`: a Q
+    /// frame, accepted, not explained.
+    QResidual,
+    /// Stored band matches neither the expected value nor the expected
+    /// value XOR `Q_RESIDUAL`. `expected` is the masked MAP-A value
+    /// for block-0 frames and 0 for block-1 and block-2+ frames.
+    Mismatch { stored: u64, expected: u64 },
+}
+
+/// Check one stored band against the masked MAP-A formula. This is the
+/// function `parse_bitstream` calls (N7) and the function the corpus
+/// run (`band_check`) calls over the stored frames, so the parse check
+/// and the corpus proof are the same code, not two implementations.
+///
+/// - Block type 0: expected is `compute_band_map_a` with the LUTRAM
+///   mask; accept the stored band when it equals the expected value,
+///   or the expected value XOR `Q_RESIDUAL` (the 484 Q frames).
+/// - Block type 1 (BRAM content) and block types 2 and above: the
+///   expected band is 0, matching `compute_band`; any nonzero stored
+///   band is a mismatch. Block types 2 and above are untested and
+///   their zero band is the documented gap, not a claim.
+pub fn check_stored_band(
+    far: u32,
+    words: &FrameWords,
+    lutram_mask: &[bool; FRAME_BITS],
+) -> BandCheck {
+    let stored = frame_band(words) & BAND_MASK;
+    let (block, _, _, _) = far_decode(far);
+    let expected = match block {
+        0 => compute_band_map_a(words, lutram_mask),
+        _ => 0,
+    };
+    if stored == expected {
+        BandCheck::Exact
+    } else if block == 0 && stored == (expected ^ Q_RESIDUAL) {
+        BandCheck::QResidual
+    } else {
+        BandCheck::Mismatch { stored, expected }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +376,73 @@ mod tests {
         // Block types 2 and above are untested: zero, documented gap.
         let far2 = far_encode(2, 0, 0, 0).unwrap();
         assert_eq!(compute_band(far2, &words, &mask, BandFormula::MapA), 0);
+    }
+
+    #[test]
+    fn check_stored_band_accepts_exact_and_q_and_rejects_other() {
+        // One set content bit: its MAP-A column is the expected band.
+        let words = single_bit_words(0);
+        let expected = compute_band_map_a(&words, &no_mask());
+        assert_eq!(expected, 0x110100011000);
+        let mut stored = words;
+        write_band(&mut stored, expected);
+        assert_eq!(
+            check_stored_band(far_encode(0, 0, 0, 0).unwrap(), &stored, &no_mask()),
+            BandCheck::Exact
+        );
+        // The same frame carrying formula + w is a Q frame: accepted
+        // as QResidual, never silently, and never as Exact.
+        let mut q_words = words;
+        write_band(&mut q_words, expected ^ Q_RESIDUAL);
+        assert_eq!(
+            check_stored_band(far_encode(0, 0, 0, 0).unwrap(), &q_words, &no_mask()),
+            BandCheck::QResidual
+        );
+        // One flipped band bit off the formula value is a mismatch
+        // with the expected value named, not an accept.
+        let mut bad_words = words;
+        write_band(&mut bad_words, expected ^ 1);
+        assert_eq!(
+            check_stored_band(far_encode(0, 0, 0, 0).unwrap(), &bad_words, &no_mask()),
+            BandCheck::Mismatch {
+                stored: expected ^ 1,
+                expected
+            }
+        );
+        // A masked content bit contributes nothing: the stored band
+        // must be 0, and a stored column value is a mismatch.
+        let mut mask = no_mask();
+        mask[0] = true;
+        assert_eq!(
+            check_stored_band(far_encode(0, 0, 0, 0).unwrap(), &single_bit_words(0), &mask),
+            BandCheck::Exact,
+            "masked bit set, stored band 0"
+        );
+        let mut unmasked_band = single_bit_words(0);
+        write_band(&mut unmasked_band, expected);
+        assert_eq!(
+            check_stored_band(far_encode(0, 0, 0, 0).unwrap(), &unmasked_band, &mask),
+            BandCheck::Mismatch {
+                stored: expected,
+                expected: 0
+            }
+        );
+        // Block-1 frames expect a zero band with no Q allowance: a
+        // stored w is a mismatch, not a QResidual.
+        let mut bram = single_bit_words(0);
+        write_band(&mut bram, Q_RESIDUAL);
+        assert_eq!(
+            check_stored_band(far_encode(1, 0, 0, 0).unwrap(), &bram, &no_mask()),
+            BandCheck::Mismatch {
+                stored: Q_RESIDUAL,
+                expected: 0
+            }
+        );
+        let bram_zero = single_bit_words(0);
+        assert_eq!(
+            check_stored_band(far_encode(1, 0, 0, 0).unwrap(), &bram_zero, &no_mask()),
+            BandCheck::Exact
+        );
     }
 
     #[test]

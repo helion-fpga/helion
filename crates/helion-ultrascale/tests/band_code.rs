@@ -8,11 +8,12 @@
 //! other residuals 0, block-1 stored band always 0.
 
 use helion_ultrascale::band_code::{
-    BandFormula, compute_band, compute_band_h76, compute_band_map_a, frame_band,
+    BandCheck, BandFormula, check_stored_band, compute_band, compute_band_h76,
+    compute_band_map_a, frame_band,
 };
 use helion_ultrascale::bitgen::{
-    FRAME_BITS, FrameWords, StubDevice, StubSegbitsDb, emit_bitstream, emit_frames, far_decode,
-    parse_bitstream,
+    FRAME_BITS, BitgenError, FrameWords, StubDevice, StubSegbitsDb, emit_bitstream,
+    emit_frames, far_decode, parse_bitstream,
 };
 use helion_ultrascale::bitloc::lut_locations;
 use helion_ultrascale::{BitRef, ClbTileType};
@@ -77,23 +78,31 @@ fn corpus_sample_reproduces_python_counts() {
         match block {
             0 => {
                 b0 += 1;
-                let pred_a = compute_band_map_a(&words, &mask);
-                if pred_a == stored {
-                    map_a_exact += 1;
-                } else if pred_a ^ stored == 0xf0000000000f {
-                    q += 1;
-                } else {
-                    other += 1;
+                // The same check `parse_bitstream` runs (N7): Exact
+                // counts as MAP-A exact, QResidual as the w residual,
+                // Mismatch as other.
+                match check_stored_band(far, &words, &mask) {
+                    BandCheck::Exact => map_a_exact += 1,
+                    BandCheck::QResidual => q += 1,
+                    BandCheck::Mismatch { .. } => other += 1,
                 }
                 if compute_band_h76(&words) == stored {
                     h76_exact += 1;
                 }
                 // The dispatcher agrees with MAP-A on block-0 frames.
-                assert_eq!(compute_band(far, &words, &mask, BandFormula::MapA), pred_a);
+                assert_eq!(
+                    compute_band(far, &words, &mask, BandFormula::MapA),
+                    compute_band_map_a(&words, &mask)
+                );
             }
             1 => {
                 b1 += 1;
                 assert_eq!(stored, 0, "block-1 stored band is zero, FAR 0x{far:08x}");
+                assert_eq!(
+                    check_stored_band(far, &words, &mask),
+                    BandCheck::Exact,
+                    "block-1 frame passes the stored-band check, FAR 0x{far:08x}"
+                );
                 assert_eq!(
                     compute_band(far, &words, &mask, BandFormula::MapA),
                     0,
@@ -227,4 +236,136 @@ fn emit_parse_roundtrip_keeps_band_bits() {
     let frames1 = emit_frames(fasm, &device, &db).unwrap();
     let frames2 = emit_frames(&back, &device, &db).unwrap();
     assert_eq!(frame_band(&frames1[&0x60c]), frame_band(&frames2[&0x60c]));
+}
+
+#[test]
+fn parse_roundtrip_keeps_band_bits_logic_mode() {
+    // Logic-mode INIT feeds the band: parse-back must succeed with
+    // the band check (unmasked formula), not just through the old
+    // blanket exemption.
+    let db = stub_db();
+    let device = stub_device_y0();
+    let fasm = "SLICE_X0Y0.A6LUT.INIT[63:0] = 64'h0000000000000001\n";
+    let bytes = emit_bitstream(fasm, &device, &db).unwrap();
+    let back = parse_bitstream(&bytes, &device, &db).unwrap();
+    assert!(
+        back.contains("SLICE_X0Y0.A6LUT.INIT[63:0]"),
+        "parse-back renders the INIT line, got:\n{back}"
+    );
+    let frames = emit_frames(fasm, &device, &db).unwrap();
+    assert_eq!(
+        frame_band(&frames[&0x60c]),
+        0x110100011000,
+        "logic-mode INIT bit carries its MAP-A column"
+    );
+}
+
+#[test]
+fn parse_rejects_flipped_band_bit_with_named_error() {
+    // Emit the RAM-mode stub design, flip one band bit in the last
+    // frame's FDRI payload, fix up that frame's CRC (replayed with
+    // crc32c_step, asserting the pre-flip CRCs match so a replay bug
+    // shows up as a CRC failure, not a band failure), and confirm
+    // parse fails loud with BandMismatch, not UnexplainedBits.
+    use helion_ultrascale::bitgen::{DUMMY_WORD, SYNC_WORD, cmd, crc32c_step, reg};
+    let db = stub_db();
+    let device = stub_device_y0();
+    let fasm = "SLICE_X0Y0.A6LUT.INIT[63:0] = 64'h0000000000000001\n\
+                SLICE_X0Y0.ALUT.MODE.RAM\n";
+    let bytes = emit_bitstream(fasm, &device, &db).unwrap();
+    // Sanity: the unflipped stream parses clean (the band check
+    // passes on the RAM-mode design through the derived mask).
+    assert!(parse_bitstream(&bytes, &device, &db).is_ok());
+    let mut words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let sync = words.iter().position(|w| *w == SYNC_WORD).unwrap();
+    // Find the FDRI payload of the INIT frame 0x60c (last frame in
+    // the stub config order) and the CRC packet that follows it.
+    let mut i = sync + 1;
+    let mut far = 0u32;
+    let mut target: Option<usize> = None;
+    let mut flipped_crc: Option<usize> = None;
+    while i < words.len() {
+        let header = words[i];
+        let ptype = header >> 29;
+        if ptype == 0 {
+            assert_eq!(header, DUMMY_WORD);
+            i += 1;
+            continue;
+        }
+        assert_eq!(ptype, 1, "emit writes type-1 packets only");
+        let opcode = (header >> 27) & 0x3;
+        let addr = ((header >> 13) & 0x1F) as u8;
+        let count = (header & 0x7FF) as usize;
+        if opcode == 2 && addr == reg::FAR && count == 1 {
+            far = words[i + 1];
+        }
+        if opcode == 2 && addr == reg::FDRI && far == 0x60c {
+            assert_eq!(count, 93);
+            target = Some(i + 1 + 45);
+        }
+        if opcode == 2 && addr == reg::CRC && count == 1 && far == 0x60c {
+            flipped_crc = Some(i + 1);
+        }
+        i += 1 + count;
+    }
+    let bit_word = target.expect("FDRI payload for FAR 0x60c");
+    let crc_word = flipped_crc.expect("CRC packet for FAR 0x60c");
+    words[bit_word] ^= 1u32;
+    // Flip band bit 1440 (word 45, bit 0). The RAM-mode mask zeroes
+    // the INIT contribution, so the stored band becomes 0x1 against
+    // an expected 0.
+    let mut crc: u32 = 0;
+    let mut i = sync + 1;
+    while i < words.len() {
+        let header = words[i];
+        let ptype = header >> 29;
+        if ptype == 0 {
+            assert_eq!(header, DUMMY_WORD);
+            i += 1;
+            continue;
+        }
+        let opcode = (header >> 27) & 0x3;
+        let addr = ((header >> 13) & 0x1F) as u8;
+        let count = (header & 0x7FF) as usize;
+        if opcode == 0 {
+            // NOOP: nothing to feed.
+        } else if addr == reg::CMD && count > 0 && words[i + 1] & 0x1F == cmd::RCRC {
+            crc = 0;
+        } else if addr == reg::CRC {
+            assert_eq!(count, 1);
+            if i + 1 != crc_word {
+                assert_eq!(
+                    words[i + 1],
+                    crc,
+                    "replay must reproduce the stored CRC before the flip"
+                );
+            }
+            words[i + 1] = crc;
+            crc = 0;
+        } else {
+            for j in 0..count {
+                crc = crc32c_step(addr as u32, words[i + 1 + j], crc);
+            }
+        }
+        i += 1 + count;
+    }
+    let mut flipped = Vec::with_capacity(words.len() * 4);
+    for w in words {
+        flipped.extend_from_slice(&w.to_be_bytes());
+    }
+    let err = parse_bitstream(&flipped, &device, &db).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BitgenError::BandMismatch {
+                far: 0x60c,
+                stored: 0x1,
+                expected: 0
+            }
+        ),
+        "flipped band bit must fail loud as BandMismatch, got: {err}"
+    );
 }
