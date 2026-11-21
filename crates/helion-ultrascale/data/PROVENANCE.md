@@ -195,6 +195,23 @@ during the segbits-vendor rebase onto a09df12). The extracted tables
 are byte-identical to the source sections; `generate_tables.py`
 asserts the table counts and warns if the source hash changes.
 
+### Vendored BitFiltrator device files
+
+| File | Source SHA-256 | License |
+|---|---|---|
+| xcku3p.json | 07e6a7d3d586bf9ae3ad6c5d0959b669c5332af36f473ecd44e169c47512cfbe | MIT, Copyright (c) 2022 EPFL VLSC |
+| xczu3eg.json | 248e0f9fb43187e893e1c2566ac59c781d6f1e424c8fae145afc3eb60a765863 | MIT, Copyright (c) 2022 EPFL VLSC |
+| xczu3eg_int_columns.json | 5a88f87f8e7f18f369ea14a4ffca1c66ba5026a2d52b03461f8a85ebbd203fc2 | CC0-1.0 (derived from prjuray-db tilegrid) |
+
+`xcku3p.json` and `xczu3eg.json` are vendored verbatim from
+`bitfiltrator-ref/resources/devices/`; extraction details and
+cross-checks are in `README.md` in this directory.
+`xczu3eg_int_columns.json` is not a BitFiltrator file: it is the
+Helion-derived INT column table for xczu3eg, generated from the
+public prjuray-db tilegrid by
+`tools/verify_xczu3eg.py --write-int-columns` (see README.md for
+the derivation and the 5,940-of-5,940 verification).
+
 ## What is NOT here (rejected or missing)
 
 - RapidWright `.dat` files: REJECTED (Xilinx EULA). Never ingested.
@@ -215,5 +232,7 @@ asserts the table counts and warns if the source hash changes.
   subset (CMT HROUTE/HDISTR, RCLK PIPs and USED bits, BUFCE_LEAF config,
   BUFGCE_HDIO IINV) is vendored above and implemented in `src/clk.rs`;
   see `CLK_AUDIT.md` for the exact inventory.
-- xcvu3p device file: MISSING (BitFiltrator ships xcku3p only).
-  Device-file worker owns it; this crate vendors no device JSON.
+- xcvu3p device file: MISSING from BitFiltrator (it ships xcku3p
+  and xczu3eg device files; no xcvu3p file). The xcvu3p.json in
+  data/ is a script-built provisional file (see README.md), not a
+  BitFiltrator vendoring.
