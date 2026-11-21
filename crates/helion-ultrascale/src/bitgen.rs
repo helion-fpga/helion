@@ -99,12 +99,17 @@
 //!   the input FASM to specify every FF's INIT (complete FASM); a
 //!   partial FASM gains .V1 lines for unmentioned FFs.
 //! - Frames with set bits no enumerated feature explains fail loud in
-//!   `parse_bitstream` (`UnexplainedBits`), except the H-1 band bits
-//!   (absolute bits 1440-1487) of block-0 frames: the band is a computed
-//!   code, not a feature (see `band_code`). Use `parse_frames` for foreign
-//!   bitstreams whose DB coverage is incomplete.
+//!   `parse_bitstream` (`UnexplainedBits`). The H-1 band bits
+//!   (absolute bits 1440-1487) of block-0 and block-1 frames are a
+//!   computed code, not a feature (see `band_code`), so they are
+//!   checked against the masked MAP-A formula instead (`BandMismatch`
+//!   on a mismatch; Q frames are accepted as formula XOR w). Use
+//!   `parse_frames` for foreign bitstreams whose DB coverage is
+//!   incomplete.
 
-use crate::band_code::{BAND_HI, BAND_LO, BandFormula, write_computed_band};
+use crate::band_code::{
+    BAND_HI, BAND_LO, BandCheck, BandFormula, check_stored_band, write_computed_band,
+};
 use crate::bitloc::{
     BRAM_MEM_BITS, BRAM_PARITY_BITS, BitLoc, BitLocError, ClbTileType, LutMode,
     NUM_CLB_PER_COLUMN, PlacedBit, bram_mem_locations, bram_mem_placed_bits,
@@ -447,6 +452,17 @@ pub enum BitgenError {
     /// the band step at the end of `emit_frames`. A set band bit before
     /// that step means a feature encoding overlaps the band.
     BandBitSetByFeature { far: u32, bits: Vec<u16> },
+    /// A stored band does not match the masked MAP-A formula (N7).
+    /// `stored` is the band read from the frame, `expected` is the
+    /// masked MAP-A value for a block-0 frame or 0 for a block-1
+    /// frame. A Q frame (stored equals expected XOR
+    /// `Q_RESIDUAL = 0xf0000000000f`) is accepted by
+    /// `check_stored_band` and never reaches this error.
+    BandMismatch {
+        far: u32,
+        stored: u64,
+        expected: u64,
+    },
     /// The vendored BRAM bit-location table failed to load.
     BramTable { reason: String },
     /// A feature reads back inconsistently from the frames.
@@ -582,6 +598,16 @@ impl fmt::Display for BitgenError {
                 write!(
                     f,
                     "FAR 0x{far:08x} has band bits set by a feature: {bits:?}; no feature may cover the band (absolute bits 1440-1487)"
+                )
+            }
+            BitgenError::BandMismatch {
+                far,
+                stored,
+                expected,
+            } => {
+                write!(
+                    f,
+                    "FAR 0x{far:08x} has stored band 0x{stored:012x} but the masked MAP-A band is 0x{expected:012x} (a Q frame carries the expected value XOR 0xf0000000000f); the band is a computed code, so a mismatch means the bitstream or the LUTRAM mask derivation is wrong"
                 )
             }
             BitgenError::BramTable { reason } => {
@@ -1303,10 +1329,18 @@ fn is_clean_complement_pair(
 /// nothing and explains nothing, preserving the old behavior for
 /// INT-only DBs. Conversion is the emit inverse: frame = minor -
 /// base_minor, bit = frame_ofst.
+///
+/// `lut_init_bits` collects every LUT INIT position read here as
+/// (LUT index, far, absolute bit), set or clear, for the caller's
+/// LUTRAM mask derivation: the caller keeps the positions whose LUT
+/// is RAM-mode (decoded MODE.RAM in the segbits loop, which runs
+/// after this function) and drops the rest. FF positions are never
+/// collected: they are not LUTRAM content bits.
 fn render_slice_lut_ff(
     frames: &BTreeMap<u32, FrameWords>,
     explained: &mut HashSet<(u32, u16)>,
     lines: &mut Vec<(String, String, Option<String>)>,
+    lut_init_bits: &mut Vec<(u8, u32, u16)>,
     tile: &str,
     db_tile_type: &str,
     tile_type: ClbTileType,
@@ -1320,7 +1354,7 @@ fn render_slice_lut_ff(
                           minor: u32,
                           frame_ofst: u32,
                           covered: bool|
-     -> Result<bool, BitgenError> {
+     -> Result<(bool, u32, u16), BitgenError> {
         let frame = minor.checked_sub(base_minor).ok_or_else(|| {
             BitgenError::BadFar {
                 reason: format!(
@@ -1339,7 +1373,7 @@ fn render_slice_lut_ff(
         if covered {
             explained.insert((far, bit));
         }
-        Ok(frame_bit(frames, far, bit))
+        Ok((frame_bit(frames, far, bit), far, bit))
     };
     for lut_index in 0..8u8 {
         let letter = (b'A' + lut_index) as char;
@@ -1351,7 +1385,10 @@ fn render_slice_lut_ff(
         for (i, loc) in locs.iter().enumerate() {
             let covered = has_grouped
                 || db_has(&format!("{letter}LUT.INIT[{i}]"));
-            bits[i] = read_table_bit(explained, loc.minor, loc.frame_ofst, covered)?;
+            let (bit, far, bit_abs) =
+                read_table_bit(explained, loc.minor, loc.frame_ofst, covered)?;
+            bits[i] = bit;
+            lut_init_bits.push((lut_index, far, bit_abs));
             any_set |= bits[i];
         }
         if has_grouped && any_set {
@@ -1381,7 +1418,7 @@ fn render_slice_lut_ff(
         let v1_srval = format!("{name}.SRVAL.V1");
         let init_loc = ff_location(tile_type, slice_y, ff_index)?;
         let init_covered = db_has(&v0_init) || db_has(&v1_init);
-        let init_set = read_table_bit(
+        let (init_set, _, _) = read_table_bit(
             explained,
             init_loc.minor,
             init_loc.frame_ofst,
@@ -1398,7 +1435,7 @@ fn render_slice_lut_ff(
         }
         let srval_loc = ff_srval_location(tile_type, slice_y, ff_index)?;
         let srval_covered = db_has(&v0_srval) || db_has(&v1_srval);
-        let srval_set = read_table_bit(
+        let (srval_set, _, _) = read_table_bit(
             explained,
             srval_loc.minor,
             srval_loc.frame_ofst,
@@ -2349,6 +2386,15 @@ pub fn parse_bitstream(
     let mut explained: HashSet<(u32, u16)> = HashSet::new();
     // (tile, feature, value-string-or-None) lines, collected then sorted.
     let mut lines: Vec<(String, String, Option<String>)> = Vec::new();
+    // Per-frame LUTRAM masks for the band check (N7): (far, absolute
+    // bit) positions of RAM-mode LUT INIT bits, grouped by FAR. Built
+    // per tile below from the decoded features, mirroring the emit
+    // side, which builds the same map from FASM lines: a LUT is
+    // RAM-mode when its tile carries `{L}LUT.MODE.RAM`, and only the
+    // INIT positions of RAM-mode LUTs are masked. Logic-mode INIT
+    // bits are never masked: the ECC lane proved full-SLICEM-INIT
+    // masking breaks 8,143 previously correct frames.
+    let mut lutram_masks: HashMap<u32, [bool; FRAME_BITS]> = HashMap::new();
     // For each tile type, the set-bit signatures of features that list no
     // `!` bits. An all-`!` feature whose zero signature is one of these
     // is the exact complement of that feature (a binary attribute pair
@@ -2433,6 +2479,17 @@ pub fn parse_bitstream(
         // features, or it would render the Y0 positions, including
         // a spurious `.V1` line for every FF whose real bit sits at
         // the true Y offset.
+        //
+        // Per-tile LUTRAM mask inputs (N7): RAM-mode LUT indices
+        // decoded on this tile, and candidate INIT positions (LUT
+        // index, far, absolute bit) from both render paths. INIT
+        // precedes MODE.RAM in the feature order, and the table
+        // path runs before the segbits loop, so candidates are
+        // collected first and filtered by the RAM set after the
+        // loop: only a LUT whose tile carries MODE.RAM keeps its
+        // INIT positions in the mask.
+        let mut tile_ram_luts: HashSet<u8> = HashSet::new();
+        let mut tile_lut_init_bits: Vec<(u8, u32, u16)> = Vec::new();
         let lut_ff_tables = parse_slice_tile(tile)
             .filter(|(_, slice_y)| slice_y % NUM_CLB_PER_COLUMN != 0)
             .and_then(|(_, slice_y)| {
@@ -2446,6 +2503,7 @@ pub fn parse_bitstream(
                 &frames,
                 &mut explained,
                 &mut lines,
+                &mut tile_lut_init_bits,
                 tile,
                 tile_type,
                 clb_type,
@@ -2534,6 +2592,30 @@ pub fn parse_bitstream(
                     });
                 }
             }
+            // LUTRAM mask inputs (N7): a present MODE.RAM line marks
+            // its LUT RAM-mode on this tile; a present LUT INIT line
+            // contributes its listed positions as candidates. Only
+            // present features contribute: an absent INIT line lists
+            // positions that hold no set bit, and an absent MODE.RAM
+            // line must not mark the LUT. `must_be_zero` refs are
+            // never INIT positions (the emit side records after the
+            // same skip), and FF INIT/SRVAL never match
+            // `lut_init_index`. Candidates are filtered by the RAM
+            // set after this loop, once every feature on the tile
+            // has been seen.
+            if let Some(idx) = ram_mode_lut_index(feature) {
+                tile_ram_luts.insert(idx);
+            }
+            if let Some(idx) = lut_init_index(feature) {
+                for r in refs.iter().filter(|r| !r.must_be_zero) {
+                    let far = base_far
+                        .checked_add(r.frame)
+                        .ok_or_else(|| BitgenError::BadFar {
+                            reason: format!("tile {tile} feature {feature}: base FAR overflow"),
+                        })?;
+                    tile_lut_init_bits.push((idx, far, r.bit));
+                }
+            }
             if valued {
                 lines.push((
                     tile.clone(),
@@ -2544,13 +2626,43 @@ pub fn parse_bitstream(
                 lines.push((tile.clone(), feature.clone(), None));
             }
         }
+        // Keep only the INIT positions of RAM-mode LUTs on this tile.
+        for (idx, far, bit) in &tile_lut_init_bits {
+            if tile_ram_luts.contains(idx) {
+                record_lutram_bit(&mut lutram_masks, *far, *bit);
+            }
+        }
     }
-    // Fail loud on set bits no feature explains. The H-1 band of a
-    // block-0 frame is exempt: it is a computed code, not a feature, so
-    // no segbits feature explains it. Its value is not verified here:
-    // the 484 Q frames carry formula + w (see `band_code`), so a strict
-    // check would reject real Vivado bitstreams. Block-1 frames carry
-    // a zero band, so a set band bit there stays unexplained.
+    // Check every stored band against the masked MAP-A formula (N7):
+    // the band is a computed code, not a feature, so no segbits
+    // feature explains it, but its value is verified here against the
+    // formula with the LUTRAM masks derived above. A stored band
+    // equal to the masked formula, or to the formula XOR the Q
+    // residual w (the 484 Q frames carry formula + w, see
+    // `band_code`), passes; anything else fails loud with the named
+    // `BandMismatch` error. Block-1 frames expect a zero band, also
+    // checked here. This runs before the unexplained-bits check so a
+    // wrong band reports `BandMismatch` even when the frame also
+    // carries unexplained bits.
+    for (far, words) in &frames {
+        let (block, _, _, _) = far_decode(*far);
+        if block > 1 {
+            continue;
+        }
+        let empty_mask = [false; FRAME_BITS];
+        let mask = lutram_masks.get(far).unwrap_or(&empty_mask);
+        if let BandCheck::Mismatch { stored, expected } = check_stored_band(*far, words, mask) {
+            return Err(BitgenError::BandMismatch {
+                far: *far,
+                stored,
+                expected,
+            });
+        }
+    }
+    // Fail loud on set bits no feature explains. Band bits of block-0
+    // and block-1 frames are skipped here because the check above
+    // already verified them; band bits of block-2+ frames are
+    // untested (see `band_code`) and stay unexplained, as before.
     let mut unexplained: Vec<(u32, Vec<u16>)> = Vec::new();
     for (far, words) in &frames {
         let (block, _, _, _) = far_decode(*far);
@@ -2560,7 +2672,7 @@ pub fn parse_bitstream(
             while w != 0 {
                 let b = w.trailing_zeros() as u16;
                 let bit = (wi * 32 + b as usize) as u16;
-                let is_band = block == 0 && (BAND_LO..=BAND_HI).contains(&bit);
+                let is_band = block <= 1 && (BAND_LO..=BAND_HI).contains(&bit);
                 if !is_band && !explained.contains(&(*far, bit)) {
                     bits.push(bit);
                 }

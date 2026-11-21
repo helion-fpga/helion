@@ -25,7 +25,7 @@
 //! the output are the verdict, compared against those numbers.
 
 use helion_ultrascale::band_code::{
-    BAND_MASK, Q_RESIDUAL, compute_band_h76, compute_band_map_a, frame_band,
+    BAND_MASK, Q_RESIDUAL, BandCheck, check_stored_band, compute_band_h76, frame_band,
 };
 use helion_ultrascale::bitgen::{FRAME_BITS, FrameWords, far_decode};
 use std::collections::HashMap;
@@ -148,14 +148,21 @@ fn main() -> Result<(), String> {
                     pair_b0 += 1;
                     let stored = frame_band(words) & BAND_MASK;
                     let mask = masks.get(far).unwrap_or(&empty_mask);
-                    let pred_a = compute_band_map_a(words, mask);
-                    if pred_a == stored {
-                        map_a_exact += 1;
-                        pair_a += 1;
-                    } else if pred_a ^ stored == Q_RESIDUAL {
-                        map_a_w += 1;
-                    } else {
-                        map_a_other += 1;
+                    // The same check `parse_bitstream` runs (N7):
+                    // Exact counts as MAP-A exact, QResidual as the
+                    // w residual, Mismatch as other. H76 below stays
+                    // an independent cross-check, not this function.
+                    match check_stored_band(*far, words, mask) {
+                        BandCheck::Exact => {
+                            map_a_exact += 1;
+                            pair_a += 1;
+                        }
+                        BandCheck::QResidual => {
+                            map_a_w += 1;
+                        }
+                        BandCheck::Mismatch { .. } => {
+                            map_a_other += 1;
+                        }
                     }
                     let pred_h = compute_band_h76(words);
                     if pred_h == stored {
@@ -169,7 +176,9 @@ fn main() -> Result<(), String> {
                 }
                 1 => {
                     total_b1 += 1;
-                    if frame_band(words) != 0 {
+                    // The same check `parse_bitstream` runs: a
+                    // block-1 frame expects a zero band.
+                    if check_stored_band(*far, words, &empty_mask) != BandCheck::Exact {
                         b1_nonzero += 1;
                     }
                 }
