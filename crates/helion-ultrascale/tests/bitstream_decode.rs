@@ -94,6 +94,39 @@ fn set_bits(frames: &std::collections::BTreeMap<u32, [u32; 93]>) -> BTreeSet<(u3
     out
 }
 
+/// MAP-A band the emitter computes for one frame, cross-checked
+/// against the band stored in the frame words. The FASM under test
+/// has no RAM-mode LUT, so the LUTRAM mask is all false; if a masked
+/// bit ever contributed, the stored band would differ from this
+/// unmasked computation and the assert would fail loud instead of
+/// silently passing with the wrong expectation.
+fn expected_band(far: u32, words: &[u32; 93]) -> u64 {
+    use helion_ultrascale::band_code::{BandFormula, compute_band, frame_band};
+    use helion_ultrascale::bitgen::FRAME_BITS;
+    let mask = [false; FRAME_BITS];
+    let computed = compute_band(far, words, &mask, BandFormula::MapA);
+    assert_eq!(
+        frame_band(words),
+        computed,
+        "emitter stored band must equal the MAP-A computation for FAR 0x{far:08x}"
+    );
+    computed
+}
+
+/// Absolute bit positions (1440-1487) of the computed band for one
+/// frame, as (FAR, bit) pairs.
+fn expected_band_bits(far: u32, words: &[u32; 93]) -> BTreeSet<(u32, u16)> {
+    use helion_ultrascale::band_code::BAND_LO;
+    let band = expected_band(far, words);
+    let mut out = BTreeSet::new();
+    for j in 0..48 {
+        if (band >> j) & 1 == 1 {
+            out.insert((far, BAND_LO + j as u16));
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // (a) Synthetic minimal .bit, built by hand, round-trips the packet layer
 // ---------------------------------------------------------------------------
@@ -123,9 +156,25 @@ fn synthetic_minimal_bit_round_trips_through_packet_layer() {
     );
     let frame = frames.get(&0x50C).expect("LUT frame FAR 0x50C");
     assert_eq!(frame[0], 0x0000_0001, "value bit 0 is frame bit 0");
+    // The emitter writes the computed H-1 band into words 45-46 of
+    // this block-0 frame, so words 45/46 must carry EXACTLY the
+    // MAP-A band for the single set bit and nothing else; every
+    // other word besides 0, 45 and 46 is zero. The band is recomputed
+    // here from the emitter's own computation and cross-checked
+    // against the stored band, never copied from a previous run.
+    let band = expected_band(0x50C, frame);
+    assert_eq!(frame[45], band as u32, "word 45 is the low band word");
+    assert_eq!(
+        frame[46],
+        (band >> 32) as u32,
+        "word 46 low half is the high band word"
+    );
     assert!(
-        frame.iter().enumerate().all(|(i, w)| i == 0 || *w == 0),
-        "all other words are zero"
+        frame
+            .iter()
+            .enumerate()
+            .all(|(i, w)| i == 0 || i == 45 || i == 46 || *w == 0),
+        "all words besides 0, 45 and 46 are zero"
     );
     // The packet layer agrees with the frame emitter exactly on the
     // touched frame.
@@ -156,13 +205,23 @@ fn decode_emit_round_trips_lut_and_pip() {
     assert_eq!(back, FASM_LUT_AND_PIP, "decode(emit(f)) == f");
     let parsed = parse_frames(&bytes).unwrap();
     assert_eq!(parsed, emit_frames(FASM_LUT_AND_PIP, &device, &db).unwrap());
-    // Hand-computed set bits: LUT value 0x8000...0001 sets frame bits
-    // 63 and 0 of FAR 0x50C; AFF.INIT.V0 sets bit 64 of FAR 0x50C;
-    // the PIP sets bit 100 of FAR 0x304.
-    assert_eq!(
-        set_bits(&parsed),
-        BTreeSet::from([(0x50C, 0), (0x50C, 63), (0x50C, 64), (0x304, 100)])
+    // Hand-computed feature set bits: LUT value 0x8000...0001 sets
+    // frame bits 63 and 0 of FAR 0x50C; AFF.INIT.V0 sets bit 64 of
+    // FAR 0x50C; the PIP sets bit 100 of FAR 0x304. The emitter also
+    // writes the computed H-1 band (absolute bits 1440-1487) into
+    // each block-0 frame, so the full set is the feature bits plus
+    // EXACTLY the MAP-A band bits recomputed here per frame: no band
+    // bit missing, no bit outside the band range, nothing else.
+    let mut expected: BTreeSet<(u32, u16)> =
+        BTreeSet::from([(0x50C, 0), (0x50C, 63), (0x50C, 64), (0x304, 100)]);
+    for (far, words) in &parsed {
+        expected.extend(expected_band_bits(*far, words));
+    }
+    assert!(
+        expected.iter().all(|&(_, bit)| bit <= 1487),
+        "no set bit may sit above the band 1440-1487: {expected:?}"
     );
+    assert_eq!(set_bits(&parsed), expected);
 }
 
 #[test]
@@ -569,11 +628,8 @@ fn cli_decode_default_part_decodes_xczu3eg() {
         tiles.clone(),
         vec![],
     );
-    let mut order: Vec<u32> = emit_frames(fasm, &probe, &db)
-        .unwrap()
-        .keys()
-        .copied()
-        .collect();
+    let frames = emit_frames(fasm, &probe, &db).unwrap();
+    let mut order: Vec<u32> = frames.keys().copied().collect();
     order.sort();
     let device = StubDevice::new("xczu3eg-sbva484-1-e", Some(0x04A4_2093), tiles, order);
     let bytes = emit_bitstream(fasm, &device, &db).unwrap();
@@ -587,13 +643,27 @@ fn cli_decode_default_part_decodes_xczu3eg() {
         db_root.to_str().unwrap(),
     ]);
     let _ = std::fs::remove_file(&bit_path);
+    // The emitter writes the computed H-1 band into every block-0
+    // frame and Worker B's decoder does not explain band bits, so
+    // this decode exits non-zero. That failure must be ONLY the
+    // band: the FASM lines still print on stdout, and stderr must
+    // list EXACTLY the MAP-A band bits recomputed here per frame,
+    // with the count line and the failure line naming the same
+    // count. Any other unexplained bit, or a missing band bit,
+    // fails this test. (Teaching the decoder to explain band bits
+    // would change the verified 14-pair reproduction counts, so the
+    // exit code stays non-zero until that work lands.)
+    let mut band_bits: BTreeSet<(u32, u16)> = BTreeSet::new();
+    for (far, words) in &frames {
+        band_bits.extend(expected_band_bits(*far, words));
+    }
     assert!(
-        ok,
-        "decode with the default part must exit 0, stderr: {stderr}"
+        !band_bits.is_empty(),
+        "the synthetic stream must carry band bits"
     );
     assert!(
-        stderr.is_empty(),
-        "decode stderr must be empty on success: {stderr}"
+        !ok,
+        "decode must exit non-zero while the decoder leaves band bits unexplained"
     );
     assert!(
         stdout.contains("INT_X0Y0.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1"),
@@ -606,5 +676,21 @@ fn cli_decode_default_part_decodes_xczu3eg() {
     assert!(
         stdout.contains("SLICE_X0Y0.AFF.INIT.V0"),
         "FF line missing, got:\n{stdout}"
+    );
+    let mut expected_stderr = String::new();
+    for (far, abs) in &band_bits {
+        expected_stderr.push_str(&format!("unexplained: FAR 0x{far:08x} bit {abs}\n"));
+    }
+    expected_stderr.push_str(&format!(
+        "unexplained: {} set bits no feature explains\n",
+        band_bits.len()
+    ));
+    expected_stderr.push_str(&format!(
+        "helion-bitgen: decode failed: {} set bits no feature explains (listed above)\n",
+        band_bits.len()
+    ));
+    assert_eq!(
+        stderr, expected_stderr,
+        "stderr must list exactly the computed band bits"
     );
 }
