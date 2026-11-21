@@ -7,6 +7,7 @@
 
 use crate::bel::{Bel, TileId, TileKind};
 use crate::device::UltraScaleDevice;
+use std::sync::Arc;
 
 /// Wire node identifier: index into a WireDb node table.
 pub type WireId = u32;
@@ -122,10 +123,13 @@ pub trait UltraScaleFabric: Send + Sync {
 }
 
 /// `UltraScaleDevice` implements the fabric contract with placeholder
-/// wire and timing databases.
+/// wire and timing databases. The wire database is replaceable: the
+/// impl flow installs the real INT-tile routing graph with
+/// [`FabricWithPlaceholders::with_wire_db`] (US-09); the default
+/// constructors keep `EmptyWireDb`.
 pub struct FabricWithPlaceholders {
     device: UltraScaleDevice,
-    wires: EmptyWireDb,
+    wires: Arc<dyn WireDb>,
     timing: EmptyTimingDb,
 }
 
@@ -133,7 +137,7 @@ impl FabricWithPlaceholders {
     pub fn xcvu3p() -> Self {
         Self {
             device: UltraScaleDevice::xcvu3p(),
-            wires: EmptyWireDb,
+            wires: Arc::new(EmptyWireDb),
             timing: EmptyTimingDb,
         }
     }
@@ -141,9 +145,17 @@ impl FabricWithPlaceholders {
     pub fn xcku3p() -> Self {
         Self {
             device: UltraScaleDevice::xcku3p(),
-            wires: EmptyWireDb,
+            wires: Arc::new(EmptyWireDb),
             timing: EmptyTimingDb,
         }
+    }
+
+    /// Install a real routing graph, replacing the placeholder wire
+    /// database. The caller keeps its own handle when it also needs
+    /// the concrete graph (the impl flow keeps one for the
+    /// router-to-PIP translator's bidirectional-PIP resolver).
+    pub fn with_wire_db(self, wires: Arc<dyn WireDb>) -> Self {
+        Self { wires, ..self }
     }
 
     /// Access the underlying device model.
@@ -162,7 +174,7 @@ impl UltraScaleFabric for FabricWithPlaceholders {
     }
 
     fn wires(&self) -> &dyn WireDb {
-        &self.wires
+        self.wires.as_ref()
     }
 
     fn timing(&self) -> &dyn TimingDb {
@@ -279,5 +291,23 @@ mod tests {
         let db = EmptyWireDb;
         assert_eq!(db.wire_info(0), None);
         assert_eq!(db.wire_info(999), None);
+    }
+
+    #[test]
+    fn with_wire_db_installs_real_graph() {
+        let fabric = FabricWithPlaceholders::xcku3p();
+        assert_eq!(fabric.wires().wire_count(), 0);
+        let db: Arc<dyn WireDb> = Arc::new(NamedTestDb::new());
+        let fabric = fabric.with_wire_db(Arc::clone(&db));
+        assert_eq!(fabric.wires().wire_count(), 3);
+        assert_eq!(
+            fabric.wires().wire_info(0),
+            Some(WireInfo {
+                name: "BOUNCE_E_0_FT1",
+                tile: "INT_X12Y45"
+            })
+        );
+        // The default constructors still carry the placeholder.
+        assert_eq!(FabricWithPlaceholders::xcvu3p().wires().wire_count(), 0);
     }
 }

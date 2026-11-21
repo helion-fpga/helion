@@ -15,13 +15,15 @@
 //! - Per-seed work here is pack-once, then place(seed) plus legality
 //!   plus preliminary STA on the placed netlist. Pack is seed
 //!   independent, so it runs once and is shared across seeds.
-//! - ROUTE is blocked for every seed: the fabric WireDb is empty (no
-//!   routing graph yet; routing-graph worker owns it), so `route_ultra`
-//!   is never reached. Each record carries `route_status: "blocked"` and
+//! - ROUTE is not attempted by the per-seed path: the impl flow
+//!   routes on the real INT-tile graph, but the sweep runs place
+//!   plus preliminary STA only, so `route_ultra` is never reached.
+//!   Each record carries `route_status: "blocked"` and
 //!   the summary report says so. A seed with place plus STA green is
 //!   `status: "ok"` for place-plus-STA only, never for the full flow.
-//! - BITGEN is not implemented on this base. No bitstream is produced
-//!   by any seed.
+//! - BITGEN is not attempted by any seed: the sweep never routes, so
+//!   no routed design exists to emit. The impl flow emits (see
+//!   crates/helion-cli/src/ultra.rs).
 //! - Timing numbers are ESTIMATES until the xcku3p delay DB exists
 //!   (GAP-F5). STA uses `timing_db::preliminary_xcvu3p` (ballpark
 //!   delays: LUT 120ps, FF ckq 150ps, setup 80ps, one INT hop 180ps).
@@ -60,7 +62,8 @@ pub fn escape_json_value(s: &str) -> String {
 /// JSONL shape (one line per seed, keys in this order):
 /// `{"seed": N, "wns_ps": N, "tns_ps": N, "runtime_s": N.NNN,
 /// "status": "ok"|"fail", "reason": "...", "route_status": "..."}`
-/// `route_status` is `"blocked"` on this base (WireDb empty),
+/// `route_status` is `"blocked"` on this base (route is not
+/// attempted by the per-seed path),
 /// `"ok"` once routing lands, `"fail"` when routing itself errors.
 /// Lines written by the master-based proof have no `route_status`
 /// key; parsing one defaults it to `"unknown"`.
