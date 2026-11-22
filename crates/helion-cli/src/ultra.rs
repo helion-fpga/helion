@@ -1802,17 +1802,14 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
     /// - every stored H-1 band checks Exact under masked MAP-A
     ///   (no Q residual, no mismatch) over all 14,952 frames;
     /// - the standalone decoder round-trips all 12 flow lines, and
-    ///   its only unexplained bits are the 41 H-1 band bits at
-    ///   absolute frame bits 1440..=1487. The count moved from 38
-    ///   (GAP-F5 FASM) to 41 here because the band code is computed
-    ///   from frame contents: dropping the 2 AX-leg PIP bits and
-    ///   adding the FFMUX bit changed which band bits are set. The
-    ///   invariant is not the count but that every unexplained bit
-    ///   is a band bit and the band check above is Exact on every
-    ///   frame. The decoder still exits 1 on those bits (it does not
-    ///   apply the N7 band check that parse_bitstream does); this
-    ///   test asserts the bits are band bits, it does not claim
-    ///   decode exits 0.
+    ///   reports zero unexplained bits: the decoder now applies the
+    ///   N7 band check, so the H-1 band bits (41 of them on the
+    ///   GAP-F5 FASM, counted here before the port because the band
+    ///   code is computed from frame contents) are explained instead
+    ///   of listed. The band check above is Exact on every frame, so
+    ///   a non-zero unexplained count here would mean the decoder's
+    ///   mask derivation disagrees with the emitter, not a band
+    ///   error.
     ///
     /// Deliberately NOT asserted here: US-09 verify-bit. The flow now
     /// emits FFMUXA1.D6, so the route leg's missing-driver failure is
@@ -1825,7 +1822,7 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
     /// as the pass bar.
     #[test]
     fn blinky_flow_emits_bitstream_on_xczu3eg() {
-        use helion_ultrascale::band_code::{BAND_HI, BAND_LO, BandCheck, check_stored_band};
+        use helion_ultrascale::band_code::{BandCheck, check_stored_band};
         let Ok(db_root) = std::env::var("HELION_TILECONN_DB_ROOT") else {
             println!(
                 "blinky_flow_emits_bitstream_on_xczu3eg: skipping, \
@@ -1920,7 +1917,9 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
             }
         }
         assert_eq!(exact, 14_952, "band Exact frame count");
-        // Standalone decoder round-trip.
+        // Standalone decoder round-trip: the decoder now applies the
+        // N7 band check, so the H-1 band bits are explained and the
+        // unexplained set must be empty.
         let decoded =
             helion_ultrascale::bitstream_decode::decode_bitstream(&bytes, &db_root).unwrap();
         for line in expected {
@@ -1929,19 +1928,11 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
                 "decoded FASM is missing flow line: {line}"
             );
         }
-        assert_eq!(
-            decoded.unexplained.len(),
-            41,
-            "unexplained bit count changed; recheck the band accounting"
+        assert!(
+            decoded.unexplained.is_empty(),
+            "unexplained bits must be empty now that the decoder explains band bits: {:?}",
+            decoded.unexplained
         );
-        for b in &decoded.unexplained {
-            let abs = b.word * 32 + b.bit as usize;
-            assert!(
-                (BAND_LO as usize..=BAND_HI as usize).contains(&abs),
-                "unexplained bit outside the H-1 band: far=0x{:08x} abs={abs}",
-                b.far
-            );
-        }
     }
 
     #[test]

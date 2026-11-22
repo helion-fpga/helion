@@ -602,16 +602,12 @@ fn real_zynqusp_db(db_root: &Path) -> helion_ultrascale::segbits::FileSegbitsDb 
     db
 }
 
-#[test]
-fn cli_decode_default_part_decodes_xczu3eg() {
-    // Emit one LUT plus one PIP on offset-0 xczu3eg tiles with the
-    // real DB (the stub device only supplies tile type and base FAR:
-    // SLICE_X0Y0 is CLEL_R at 0x200, INT_X0Y0 is INT at 0x100, both
-    // read from the public tilegrid), then decode with no --part
-    // flag: the default must be xczu3eg-sbva484-1-e and the run must
-    // exit 0 with the three lines on stdout. Worker B renders valued
-    // features as lowercase 0x, so the LUT line is asserted in that
-    // spelling.
+/// Emit one LUT plus one PIP on offset-0 xczu3eg tiles with the real
+/// DB (the stub device only supplies tile type and base FAR:
+/// SLICE_X0Y0 is CLEL_R at 0x200, INT_X0Y0 is INT at 0x100, both read
+/// from the public tilegrid). Returns the bitstream bytes and the
+/// emitted frame map.
+fn emit_xczu3eg_synthetic_bitstream() -> (Vec<u8>, std::collections::BTreeMap<u32, [u32; 93]>) {
     use helion_ultrascale::bitgen::{StubDevice, emit_bitstream, emit_frames};
     let db_root = zynqusp_db_root();
     let db = real_zynqusp_db(&db_root);
@@ -633,6 +629,21 @@ fn cli_decode_default_part_decodes_xczu3eg() {
     order.sort();
     let device = StubDevice::new("xczu3eg-sbva484-1-e", Some(0x04A4_2093), tiles, order);
     let bytes = emit_bitstream(fasm, &device, &db).unwrap();
+    (bytes, frames)
+}
+
+#[test]
+fn cli_decode_default_part_decodes_xczu3eg() {
+    // Decode with no --part flag: the default must be
+    // xczu3eg-sbva484-1-e and the run must exit 0 with the three
+    // lines on stdout and empty stderr. Worker B renders valued
+    // features as lowercase 0x, so the LUT line is asserted in that
+    // spelling. The emitter writes the computed H-1 band into every
+    // block-0 frame and the decoder now explains band bits through
+    // the N7 check (masked MAP-A, no RAM-mode LUT here so the mask
+    // is all false), so no bit is unexplained.
+    let (bytes, _frames) = emit_xczu3eg_synthetic_bitstream();
+    let db_root = zynqusp_db_root();
     let bit_path = temp_path("xczu3eg.bit");
     std::fs::write(&bit_path, &bytes).unwrap();
     let (ok, stdout, stderr) = run_cli(&[
@@ -643,27 +654,10 @@ fn cli_decode_default_part_decodes_xczu3eg() {
         db_root.to_str().unwrap(),
     ]);
     let _ = std::fs::remove_file(&bit_path);
-    // The emitter writes the computed H-1 band into every block-0
-    // frame and Worker B's decoder does not explain band bits, so
-    // this decode exits non-zero. That failure must be ONLY the
-    // band: the FASM lines still print on stdout, and stderr must
-    // list EXACTLY the MAP-A band bits recomputed here per frame,
-    // with the count line and the failure line naming the same
-    // count. Any other unexplained bit, or a missing band bit,
-    // fails this test. (Teaching the decoder to explain band bits
-    // would change the verified 14-pair reproduction counts, so the
-    // exit code stays non-zero until that work lands.)
-    let mut band_bits: BTreeSet<(u32, u16)> = BTreeSet::new();
-    for (far, words) in &frames {
-        band_bits.extend(expected_band_bits(*far, words));
-    }
+    assert!(ok, "decode must exit 0, stderr: {stderr}");
     assert!(
-        !band_bits.is_empty(),
-        "the synthetic stream must carry band bits"
-    );
-    assert!(
-        !ok,
-        "decode must exit non-zero while the decoder leaves band bits unexplained"
+        stderr.is_empty(),
+        "decode stderr must be empty on success: {stderr}"
     );
     assert!(
         stdout.contains("INT_X0Y0.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1"),
@@ -677,20 +671,124 @@ fn cli_decode_default_part_decodes_xczu3eg() {
         stdout.contains("SLICE_X0Y0.AFF.INIT.V0"),
         "FF line missing, got:\n{stdout}"
     );
-    let mut expected_stderr = String::new();
-    for (far, abs) in &band_bits {
-        expected_stderr.push_str(&format!("unexplained: FAR 0x{far:08x} bit {abs}\n"));
+}
+
+#[test]
+fn cli_decode_flipped_band_bit_fails_loud_with_band_mismatch() {
+    // Emit the xczu3eg synthetic bitstream, flip one band bit in the
+    // LUT frame's FDRI payload, fix up that frame's CRC (replayed
+    // with crc32c_step, asserting the pre-flip CRCs match so a replay
+    // bug shows up as a CRC failure, not a band failure), and confirm
+    // CLI decode fails loud with BandMismatch naming FAR 0x20c, not
+    // with unexplained bits. Same replay pattern as the N7 parse test
+    // (`parse_rejects_flipped_band_bit_with_named_error`).
+    use helion_ultrascale::band_code::frame_band;
+    use helion_ultrascale::bitgen::{DUMMY_WORD, SYNC_WORD, cmd, crc32c_step, reg};
+    let (bytes, frames) = emit_xczu3eg_synthetic_bitstream();
+    let db_root = zynqusp_db_root();
+    let stored_before = frame_band(&frames[&0x20c]);
+    let mut words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let sync = words.iter().position(|w| *w == SYNC_WORD).unwrap();
+    let mut i = sync + 1;
+    let mut far = 0u32;
+    let mut target: Option<usize> = None;
+    let mut flipped_crc: Option<usize> = None;
+    while i < words.len() {
+        let header = words[i];
+        let ptype = header >> 29;
+        if ptype == 0 {
+            assert_eq!(header, DUMMY_WORD);
+            i += 1;
+            continue;
+        }
+        assert_eq!(ptype, 1, "emit writes type-1 packets only");
+        let opcode = (header >> 27) & 0x3;
+        let addr = ((header >> 13) & 0x1F) as u8;
+        let count = (header & 0x7FF) as usize;
+        if opcode == 2 && addr == reg::FAR && count == 1 {
+            far = words[i + 1];
+        }
+        if opcode == 2 && addr == reg::FDRI && far == 0x20c {
+            assert_eq!(count, 93);
+            target = Some(i + 1 + 45);
+        }
+        if opcode == 2 && addr == reg::CRC && count == 1 && far == 0x20c {
+            flipped_crc = Some(i + 1);
+        }
+        i += 1 + count;
     }
-    expected_stderr.push_str(&format!(
-        "unexplained: {} set bits no feature explains\n",
-        band_bits.len()
-    ));
-    expected_stderr.push_str(&format!(
-        "helion-bitgen: decode failed: {} set bits no feature explains (listed above)\n",
-        band_bits.len()
-    ));
-    assert_eq!(
-        stderr, expected_stderr,
-        "stderr must list exactly the computed band bits"
+    let bit_word = target.expect("FDRI payload for FAR 0x20c");
+    let crc_word = flipped_crc.expect("CRC packet for FAR 0x20c");
+    words[bit_word] ^= 1u32;
+    // Flip band bit 1440 (word 45, bit 0): stored becomes
+    // stored_before ^ 1 against the unchanged expected band.
+    let mut crc: u32 = 0;
+    let mut i = sync + 1;
+    while i < words.len() {
+        let header = words[i];
+        let ptype = header >> 29;
+        if ptype == 0 {
+            assert_eq!(header, DUMMY_WORD);
+            i += 1;
+            continue;
+        }
+        let opcode = (header >> 27) & 0x3;
+        let addr = ((header >> 13) & 0x1F) as u8;
+        let count = (header & 0x7FF) as usize;
+        if opcode == 0 {
+            // NOOP: nothing to feed.
+        } else if addr == reg::CMD && count > 0 && words[i + 1] & 0x1F == cmd::RCRC {
+            crc = 0;
+        } else if addr == reg::CRC {
+            assert_eq!(count, 1);
+            if i + 1 != crc_word {
+                assert_eq!(
+                    words[i + 1],
+                    crc,
+                    "replay must reproduce the stored CRC before the flip"
+                );
+            }
+            words[i + 1] = crc;
+            crc = 0;
+        } else {
+            for j in 0..count {
+                crc = crc32c_step(addr as u32, words[i + 1 + j], crc);
+            }
+        }
+        i += 1 + count;
+    }
+    let mut flipped = Vec::with_capacity(words.len() * 4);
+    for w in words {
+        flipped.extend_from_slice(&w.to_be_bytes());
+    }
+    let bit_path = temp_path("flipped-band.bit");
+    std::fs::write(&bit_path, &flipped).unwrap();
+    let (ok, _stdout, stderr) = run_cli(&[
+        "decode",
+        "--bit",
+        bit_path.to_str().unwrap(),
+        "--db-root",
+        db_root.to_str().unwrap(),
+    ]);
+    let _ = std::fs::remove_file(&bit_path);
+    assert!(!ok, "decode of a flipped-band .bit must exit non-zero");
+    assert!(
+        stderr.contains("BandMismatch"),
+        "stderr must name BandMismatch, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("0x0000020c"),
+        "stderr must name the LUT FAR 0x0000020c, got: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("0x{:012x}", stored_before ^ 1)),
+        "stderr must name the flipped stored band, got: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("0x{:012x}", stored_before)),
+        "stderr must name the expected band, got: {stderr}"
     );
 }
