@@ -105,11 +105,26 @@ pub fn load_ultra_segbits(data_dir: &Path) -> Result<FileSegbitsDb, String> {
 /// Device for a part: the real `DeviceFile` implementation of
 /// `BitgenDevice` (SLICE base FARs from the file's own CLB column
 /// majors, INT base FARs by the provisional rule, RAMB18 from the
-/// BRAM content columns, full config order). Only `xcku3p` is wired:
-/// `xcvu3p.json` is provisional (computed frame total 73,035 vs
-/// UG570 Table 1's 71,820) until that gap is resolved by a CTO
-/// decision; any other part fails loud here. The flow emits no HPIO
-/// lines (no IO placement), so no HPIO bridge is needed here.
+/// BRAM content columns, full config order). `xcku3p` and `xczu3eg`
+/// are wired: `xcvu3p.json` is provisional (computed frame total
+/// 73,035 vs UG570 Table 1's 71,820) until that gap is resolved by
+/// a CTO decision; any other part fails loud here. The flow emits
+/// no HPIO lines (no IO placement), so no HPIO bridge is needed
+/// here. xczu3eg: IDCODE 0x04a42093 is the PL configuration IDCODE
+/// read from the file, confirmed by the public Vivado bitstream
+/// P-13 (BNN-PYNQ cnvW1A1-ultra96.bit, md5
+/// a56a86cf137c719c09f891a8b2472280, header part
+/// xczu3eg-sbva484-1-i, big-endian bytes at offset 291); the AMD
+/// forum figure 0x14710093 is the PS TAP IDCODE, not this one.
+/// Total frames 14,952 (UG1085 Table 1 lists 14,964 for ZU3; the
+/// 12-frame gap is 4 padding frames per FAR row x 3 rows, which
+/// real Vivado streams carry and the decoder skips, so the
+/// emitter writes one FDRI frame per real FAR, 14,952, and the
+/// decoder does not require the padding). INT tiles resolve by
+/// the provisional rule without the tilegrid sidecar table; the
+/// rule agrees with the table for INT_X1 but mispredicts INT_X2
+/// and above on this part, so only low-X INT tiles are proven
+/// here.
 pub fn load_ultra_device(part: &str, data_dir: &Path) -> Result<DeviceFile, String> {
     match part {
         "xcku3p" => DeviceFile::from_path(&data_dir.join("xcku3p.json")).map_err(|e| {
@@ -118,8 +133,14 @@ pub fn load_ultra_device(part: &str, data_dir: &Path) -> Result<DeviceFile, Stri
                 data_dir.join("xcku3p.json").display()
             )
         }),
+        "xczu3eg" => DeviceFile::from_path(&data_dir.join("xczu3eg.json")).map_err(|e| {
+            format!(
+                "ULTRA BITGEN: cannot load device file {}: {e}",
+                data_dir.join("xczu3eg.json").display()
+            )
+        }),
         other => Err(format!(
-            "ULTRA BITGEN: part {other} has no emitter device yet: only xcku3p is wired; \
+            "ULTRA BITGEN: part {other} has no emitter device yet: only xcku3p and xczu3eg are wired; \
             xcvu3p.json is provisional until its frame-total gap is resolved"
         )),
     }
@@ -1463,8 +1484,110 @@ INT_X0Y0.PIP.INT_NODE_GLOBAL_0_INT_OUT0.GCLK_B_0_0\n";
     }
 
     #[test]
-    fn unknown_part_fails_loud_at_bitgen_load() {
+    fn xczu3eg_device_loads_with_part_idcode_and_frame_total() {
+        use helion_ultrascale::bitgen::BitgenDevice;
         let data_dir = ultrascale_data_dir();
+        let device = load_ultra_device("xczu3eg", &data_dir).unwrap();
+        // Short device name; the full part string lives in part().
+        assert_eq!(device.device(), "xczu3eg");
+        assert_eq!(device.part(), "xczu3eg-sbva484-1-e");
+        // The emitter sees the device through the BitgenDevice
+        // trait, whose part() is the short name, not the full part
+        // string (the inherent DeviceFile::part shadows it).
+        assert_eq!(<DeviceFile as BitgenDevice>::part(&device), "xczu3eg");
+        // PL configuration IDCODE, confirmed by public Vivado
+        // bitstream P-13 (see load_ultra_device docs); the AMD
+        // forum figure 0x14710093 is the PS TAP IDCODE, not this one.
+        assert_eq!(device.slr_idcode("SLR0").unwrap(), 0x04A4_2093);
+        assert_eq!(device.idcode().unwrap(), 0x04A4_2093);
+        // The file's own total. UG1085 Table 1 lists 14,964 for
+        // ZU3; the 12-frame gap is 4 padding frames per FAR row x
+        // 3 rows, explained by padding frames in real bitstreams.
+        // Do not tune this constant to match UG1085.
+        assert_eq!(device.total_frames(), 14_952);
+        assert_eq!(device.config_order_fars().len(), 14_952);
+    }
+
+    /// Count single-frame FDRI packets in an emitted bitstream by
+    /// walking the word stream: a type-1 write header to register 2
+    /// (FDRI) with 93 words, then skip the 93 payload words.
+    fn count_fdri_frames(bytes: &[u8]) -> usize {
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let fdri_header = (1u32 << 29) | (2u32 << 27) | (2u32 << 13) | 93;
+        let mut count = 0;
+        let mut i = 0;
+        while i < words.len() {
+            if words[i] == fdri_header {
+                count += 1;
+                i += 1 + 93;
+            } else {
+                i += 1;
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn blinky_fasm_emits_and_parses_back_on_xczu3eg() {
+        // The 13-line flow FASM for blinky on xczu3eg (SLICE_X1Y0,
+        // INT_X1Y0), as routed in the GAP-F5 lane; inlined here so
+        // the test does not depend on a log file outside the repo.
+        // Every feature must resolve through the vendored segbits
+        // DBs on the xczu3eg device: a missing resolution fails
+        // loud in emit, it is not skipped.
+        let data_dir = ultrascale_data_dir();
+        let fasm = "\
+SLICE_X1Y0.A6LUT.INIT[63:0] = 0x5555555555555555\n\
+SLICE_X1Y0.AFF.INIT.V0\n\
+SLICE_X1Y0.AFF.SRVAL.V0\n\
+SLICE_X1Y0.ABCDFF.CEUSED.V0\n\
+SLICE_X1Y0.ABCDFF.SRUSED.V0\n\
+SLICE_X1Y0.ABCDFF.CLKINV.V0\n\
+SLICE_X1Y0.ABCDFF.SRINV.V0\n\
+INT_X1Y0.PIP.INT_NODE_IMUX_42_INT_OUT1.LOGIC_OUTS_W14\n\
+INT_X1Y0.PIP.BYPASS_W5.INT_NODE_IMUX_42_INT_OUT1\n\
+INT_X1Y0.PIP.INT_NODE_IMUX_48_INT_OUT0.BYPASS_W5\n\
+INT_X1Y0.PIP.IMUX_W10.INT_NODE_IMUX_48_INT_OUT0\n\
+INT_X1Y0.PIP.INODE_W_1_FT1.LOGIC_OUTS_W0\n\
+INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
+        assert_eq!(fasm.lines().count(), 13, "blinky FASM line count");
+        let bytes = emit_ultra_bitstream(fasm, "xczu3eg", &data_dir).unwrap();
+        assert!(!bytes.is_empty(), "emitted bitstream is empty");
+        // The emitter writes the PL configuration IDCODE, not the
+        // PS TAP figure 0x14710093.
+        assert!(
+            bytes.windows(4).any(|w| w == [0x04, 0xa4, 0x20, 0x93]),
+            "emitted bitstream carries no 0x04a42093 IDCODE word"
+        );
+        // One single-frame FDRI packet per real FAR: 14,952, not
+        // the UG1085 14,964. The 12 padding frames real Vivado
+        // streams carry are skipped by the decoder, not required.
+        assert_eq!(count_fdri_frames(&bytes), 14_952);
+        let back = parse_ultra_bitstream(&bytes, "xczu3eg", &data_dir).unwrap();
+        assert!(
+            back.contains("SLICE_X1Y0.AFF.INIT.V0\n"),
+            "parse-back renders canonical .V0, got:\n{back}"
+        );
+        assert!(
+            back.contains("SLICE_X1Y0.A6LUT.INIT[63:0] = 64'h5555555555555555\n"),
+            "parse-back renders the LUT INIT value, got:\n{back}"
+        );
+        assert!(
+            fasm_set_bits_equal(fasm, &back, "xczu3eg", &data_dir).unwrap(),
+            "parse-back re-emits different set bits than the flow FASM"
+        );
+    }
+
+    #[test]
+    fn xcvu3p_still_fails_loud_with_provisional_message() {
+        let data_dir = ultrascale_data_dir();
+        let err = load_ultra_device("xcvu3p", &data_dir).unwrap_err();
+        assert!(err.contains("xcvu3p"), "got {err}");
+        assert!(err.contains("provisional"), "got {err}");
+        // Same through the emit path, which is the gate the flow hits.
         let err = emit_ultra_bitstream(
             "SLICE_X0Y0.A6LUT.INIT[63:0] = 0x5555555555555555\n",
             "xcvu3p",
@@ -1472,5 +1595,14 @@ INT_X0Y0.PIP.INT_NODE_GLOBAL_0_INT_OUT0.GCLK_B_0_0\n";
         )
         .unwrap_err();
         assert!(err.contains("xcvu3p"), "got {err}");
+        assert!(err.contains("provisional"), "got {err}");
+    }
+
+    #[test]
+    fn unknown_part_fails_loud_at_bitgen_load() {
+        let data_dir = ultrascale_data_dir();
+        let err = load_ultra_device("xc7a35t", &data_dir).unwrap_err();
+        assert!(err.contains("xc7a35t"), "got {err}");
+        assert!(err.contains("has no emitter device yet"), "got {err}");
     }
 }
