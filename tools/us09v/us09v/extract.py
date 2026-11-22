@@ -10,8 +10,10 @@ vendored segbits feature vocabulary:
 * Sites: per-site behavioural models driven by the site's features.
   A site output pin is driven by its site model only.
 * LUT6_2: O6 = INIT[{A6..A1}], O5 = INIT[{0,A5..A1}] (A1 is the LSB).
-* FFs: INIT/SRVAL polarity V0 sets, V1 clears (INTERFACES.md); CEUSED,
-  SRUSED, CLKINV, SRINV polarity V1 sets, V0 clears. SYNC.SYNC is a
+* FFs: INIT/SRVAL polarity, the V suffix IS the value (V0 is 0,
+  V1 is 1); the segbits bit is NOT the value (V0 sets the bit,
+  V1 clears it, bit = NOT(INIT)). CEUSED, SRUSED, CLKINV, SRINV
+  polarity V1 sets, V0 clears. SYNC.SYNC is a
   synchronous reset, SYNC.ASYNC (or absent) asynchronous. MODE.LATCH
   is an extraction error, not modelled.
 * F7/F8/F9 (assumption A-F7F8, see README): F7AMUX = AX ? B : A,
@@ -51,7 +53,7 @@ from dataclasses import dataclass, field
 
 from .db import Db
 from .fabric import Fabric
-from .fasmio import ff_attr, group_attr, init_value, lut_depends
+from .fasmio import ff_attr, group_attr, init_value, lut_depends, parse_pip
 
 LETTERS = "ABCDEFGH"
 
@@ -293,8 +295,15 @@ class Extractor:
                     # An unconfigured site drives nothing.
                     continue
             for src, _bid in tt["pips_into"].get(wire, ()):
-                feat = f"PIP.{wire}.{src}"
-                if feat in act:
+                # A PIP driving `wire` from `src` may be spelled
+                # plain (PIP.wire.src), FWD (PIP.wire.src.FWD), or
+                # REV with the components swapped
+                # (PIP.src.wire.REV); see fasmio.parse_pip.
+                if (
+                    f"PIP.{wire}.{src}" in act
+                    or f"PIP.{wire}.{src}.FWD" in act
+                    or f"PIP.{src}.{wire}.REV" in act
+                ):
                     sources.append(("pip", tile, src))
         result: tuple = ("undriven",)
         resolved = []
@@ -735,8 +744,10 @@ class Extractor:
         # they are the node's drivers, not its consumers.
         for t, w in self.fab.nodes[nid]:
             for f in self.tiles.get(t, {}):
-                m = re.match(r"^PIP\.([^.]+)\.([^.]+)$", f)
-                if m and m.group(2) == w:
+                # A PIP counts as sourced by `w` in its normalized
+                # direction (plain, .FWD, or swapped .REV spelling).
+                parsed = parse_pip(f)
+                if parsed is not None and parsed[1] == w:
                     return True
             ttype = self._ttype(t)
             if ttype is None:

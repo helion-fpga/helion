@@ -94,11 +94,13 @@ class TestNegative(CosimBase):
 
     def test_flipped_ff_init_mismatch(self):
         # Flip the blinky FF INIT 0 -> 1: the first cycles differ.
+        # The fixture now reads INIT 0 as AFF.INIT.V0, so flipping
+        # means deleting V0 and adding V1.
         fasm_path, rtl_path, _pm = load_fixture("blinky")
         port_ins, port_outs, pin_of = fixture_ports("blinky")
         tiles = parse_fasm_file(fasm_path)
-        del tiles["SLICE_X10Y10"]["AFF.INIT.V1"]
-        tiles["SLICE_X10Y10"]["AFF.INIT.V0"] = None
+        del tiles["SLICE_X10Y10"]["AFF.INIT.V0"]
+        tiles["SLICE_X10Y10"]["AFF.INIT.V1"] = None
         nl = extract(self.db, tiles, port_ins, port_outs)
         self.assertEqual(nl.errors, [])
         with tempfile.TemporaryDirectory() as d:

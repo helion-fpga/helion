@@ -59,6 +59,21 @@ class TestFixturesExtractClean(ExtractFixtureBase):
         self.assertIn("F7/F8/F9 mux used", nl.warnings[0])
         self.assertIn("not yet validated", nl.warnings[0])
 
+    def test_fwd_pips_resolve(self):
+        # Rewriting every blinky PIP in the .FWD spelling must not
+        # change the rebuild: driver() sees the suffixed PIPs.
+        # (Fixture PIPs are directional, so no .REV form applies.)
+        fasm_path, _rtl, _pm = load_fixture("blinky")
+        port_ins, port_outs, _pin_of = fixture_ports("blinky")
+        tiles = parse_fasm_file(fasm_path)
+        for tile, feats in tiles.items():
+            for f in list(feats):
+                if f.startswith("PIP."):
+                    feats[f + ".FWD"] = feats.pop(f)
+        nl = extract(self.db, tiles, port_ins, port_outs)
+        self.assertEqual(nl.errors, [], nl.errors)
+        self.assertEqual(nl.warnings, [])
+
 
 class TestVerilogOutput(ExtractFixtureBase):
     def test_no_self_assign_on_ports(self):
@@ -116,7 +131,7 @@ class TestNegative(ExtractFixtureBase):
     def test_missing_ff_init_errors(self):
         fasm_path, _rtl, _pm = load_fixture("blinky")
         tiles = parse_fasm_file(fasm_path)
-        del tiles["SLICE_X10Y10"]["AFF.INIT.V1"]
+        del tiles["SLICE_X10Y10"]["AFF.INIT.V0"]
         port_ins, port_outs, _ = fixture_ports("blinky")
         nl = extract(self.db, tiles, port_ins, port_outs)
         self.assertTrue(any("no INIT feature" in e for e in nl.errors))
