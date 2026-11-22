@@ -51,3 +51,37 @@ def _rtl_top(rtl_path):
         text = f.read()
     m = re.search(r"module\s+(\w+)", text)
     return m.group(1)
+
+
+def byp_shape_tiles():
+    """The BYP-shape blinky tiles: the old flow FASM (13 lines, 6
+    PIPs, LUT O routed through the INT to the AX pin) plus
+    SLICE_X1Y0.FFMUXA1.BYP. Fresh dict on every call so tests can
+    mutate their copy. Route must pass on this shape: the LUT O
+    pin A_O drives the AX leg, the FF Q pin AQ drives the A1 leg.
+    """
+    return {
+        "SLICE_X1Y0": {
+            "A6LUT.INIT[63:0]": 0x5555555555555555,
+            "AFF.INIT.V0": None,
+            "AFF.SRVAL.V0": None,
+            "ABCDFF.CEUSED.V0": None,
+            "ABCDFF.SRUSED.V0": None,
+            "ABCDFF.CLKINV.V0": None,
+            "ABCDFF.SRINV.V0": None,
+            "FFMUXA1.BYP": None,
+        },
+        "INT_X1Y0": {
+            "PIP.INT_NODE_IMUX_42_INT_OUT1.LOGIC_OUTS_W14": None,
+            "PIP.BYPASS_W5.INT_NODE_IMUX_42_INT_OUT1": None,
+            "PIP.INT_NODE_IMUX_48_INT_OUT0.BYPASS_W5": None,
+            "PIP.IMUX_W10.INT_NODE_IMUX_48_INT_OUT0": None,
+            "PIP.INODE_W_1_FT1.LOGIC_OUTS_W0": None,
+            "PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1": None,
+        },
+    }
+
+
+def byp_shape_port_ins():
+    """Primary inputs for the BYP shape: the clock on CLK1."""
+    return {"clk": ("SLICE_X1Y0", "CLK1")}

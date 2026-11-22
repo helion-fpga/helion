@@ -532,6 +532,12 @@ class Extractor:
             L.append(f"wire [63:0] {n(c + '_INIT')} = 64'h{init:016x};")
             L.append(f"wire {n(c)} = {n(c + '_INIT')}[{idx6}];")
             L.append(f"wire {n(c + '_O5')} = {n(c + '_INIT')}[{idx5}];")
+            # The {c}_O site pin is the LUT O6 output: the BYP path
+            # resolves the fabric back to that pin, so the extracted
+            # netlist references s_<site>__{c}_O. Declare it as an
+            # alias of the O6 wire, or cosim fails at elaboration
+            # on the undefined wire.
+            L.append(f"wire {n(c + '_O')} = {n(c)};")
             lut_o6[c] = n(c)
             lut_o5[c] = n(c + "_O5")
         # Bypass pins, resolved lazily.

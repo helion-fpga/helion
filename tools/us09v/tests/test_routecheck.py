@@ -7,7 +7,14 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tests import fixture_ports, load_db, load_fabric, load_fixture  # noqa: E402
+from tests import (  # noqa: E402
+    byp_shape_port_ins,
+    byp_shape_tiles,
+    fixture_ports,
+    load_db,
+    load_fabric,
+    load_fixture,
+)
 from us09v.fasmio import parse_fasm_file  # noqa: E402
 from us09v.routecheck import check_route_fasm, pip_exists_in_tile_type  # noqa: E402
 
@@ -151,6 +158,86 @@ class TestNegative(RouteBase):
         s, d = pair
         tiles["INT_X6Y10"] = {f"PIP.{d}.{s}": None, f"PIP.{s}.{d}": None}
         rep = check_route_fasm(self.db, tiles, self.fabric)
+        self.assertTrue(
+            any("driven only by a PIP" in v for v in rep.violations),
+            f"violations were {rep.violations}",
+        )
+
+
+class TestSliceOutputPin(RouteBase):
+    """LUT O pin {c}_O as a driver (sliceout lane): a live LUT
+    (INIT present) whose letter is selected by an FFMUX or OUTMUX
+    drives the fabric through its O pin. The BYP shape routes LUT
+    O through the INT to the AX pin; without this the A_O net
+    fails as undriven / driven-only-by-PIP."""
+
+    def test_byp_shape_passes(self):
+        tiles = byp_shape_tiles()
+        rep = check_route_fasm(
+            self.db, tiles, self.fabric, port_ins=byp_shape_port_ins()
+        )
+        self.assertEqual(rep.violations, [], rep.violations)
+        self.assertEqual(rep.pips, 6)
+        self.assertEqual(rep.nets, 4)
+
+    def test_byp_shape_outmux_selects_lut_o(self):
+        # Same AX leg, but the letter is selected by OUTMUX instead
+        # of FFMUX: the LUT O pin is still the driver. The Q chain
+        # is dropped (no FFMUX means AQ is not a driver) and the
+        # LUT INIT is constant, so A1 is not a sink either.
+        tiles = byp_shape_tiles()
+        feats = tiles["SLICE_X1Y0"]
+        del feats["FFMUXA1.BYP"]
+        feats["OUTMUXA.D6"] = None
+        feats["A6LUT.INIT[63:0]"] = 0xFFFFFFFFFFFFFFFF
+        int_feats = tiles["INT_X1Y0"]
+        for f in list(int_feats):
+            if f not in (
+                "PIP.INODE_W_1_FT1.LOGIC_OUTS_W0",
+                "PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1",
+            ):
+                del int_feats[f]
+        rep = check_route_fasm(
+            self.db, tiles, self.fabric, port_ins=byp_shape_port_ins()
+        )
+        self.assertEqual(rep.violations, [], rep.violations)
+        self.assertEqual(rep.pips, 2)
+
+    def test_no_init_lut_o_is_not_a_driver(self):
+        # FFMUXA1.BYP present but the LUT has no INIT: the LUT is
+        # not live, so A_O must not count as a driver and the AX
+        # leg stays undriven.
+        tiles = byp_shape_tiles()
+        del tiles["SLICE_X1Y0"]["A6LUT.INIT[63:0]"]
+        rep = check_route_fasm(
+            self.db, tiles, self.fabric, port_ins=byp_shape_port_ins()
+        )
+        self.assertTrue(
+            any("LOGIC_OUTS_W0" in v for v in rep.violations),
+            f"violations were {rep.violations}",
+        )
+        self.assertTrue(
+            any("driven only by a PIP" in v for v in rep.violations),
+            f"violations were {rep.violations}",
+        )
+
+    def test_no_selection_lut_o_is_not_a_driver(self):
+        # LUT live (INIT present) but no FFMUX or OUTMUX selects
+        # the letter: A_O must not count as a driver, so the AX
+        # leg stays undriven. A genuinely undriven net still fails
+        # after the fix.
+        tiles = byp_shape_tiles()
+        del tiles["SLICE_X1Y0"]["FFMUXA1.BYP"]
+        rep = check_route_fasm(
+            self.db, tiles, self.fabric, port_ins=byp_shape_port_ins()
+        )
+        self.assertTrue(
+            any(
+                "undriven sink" in v and "LOGIC_OUTS_W0" in v
+                for v in rep.violations
+            ),
+            f"violations were {rep.violations}",
+        )
         self.assertTrue(
             any("driven only by a PIP" in v for v in rep.violations),
             f"violations were {rep.violations}",
