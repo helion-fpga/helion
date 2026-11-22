@@ -188,6 +188,19 @@ impl UltraScaleTimingDb {
     }
 }
 
+/// Preliminary UltraScale+ timing for xczu3eg, speed grade -2.
+///
+/// Same AMD forum ballpark as [`preliminary_xcvu3p`]: the ballpark is
+/// UltraScale+ generic, not part-specific, so the xczu3eg preliminary DB
+/// carries the same split (120 ps LUT + 180 ps one INT hop = 300 ps per
+/// logic level) under the xczu3eg part name. Every value is Ballpark.
+/// Do not use for signoff.
+pub fn preliminary_xczu3eg() -> UltraScaleTimingDb {
+    let mut db = preliminary_xcvu3p();
+    db.part = "xczu3eg".to_string();
+    db
+}
+
 /// Preliminary UltraScale+ timing for xcku3p, speed grade -2.
 ///
 /// Same AMD forum ballpark as [`preliminary_xcvu3p`]: the ballpark is
@@ -201,7 +214,7 @@ pub fn preliminary_xcku3p() -> UltraScaleTimingDb {
     db
 }
 
-/// Select the STA delay DB for a part. Today both parts run on the
+/// Select the STA delay DB for a part. Today all three parts run on the
 /// preliminary ballpark DB, labeled estimate; the documented DBs below
 /// cannot run STA (they fail loud on the first UNKNOWN field). Unknown
 /// parts fail loud instead of silently falling back to another part.
@@ -209,6 +222,7 @@ pub fn sta_db_for_part(part: &str) -> Result<UltraScaleTimingDb, String> {
     match part {
         "xcku3p" => Ok(preliminary_xcku3p()),
         "xcvu3p" => Ok(preliminary_xcvu3p()),
+        "xczu3eg" => Ok(preliminary_xczu3eg()),
         _ => Err(format!("timing: unsupported part {part}")),
     }
 }

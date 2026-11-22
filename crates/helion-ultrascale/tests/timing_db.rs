@@ -8,7 +8,7 @@
 
 use helion_ultrascale::timing_db::{
     documented_xcku3p, documented_xcvu3p, preliminary_xcku3p, preliminary_xcvu3p,
-    sta_db_for_part,
+    preliminary_xczu3eg, sta_db_for_part,
 };
 use helion_ultrascale::timing_db::{DelaySource, SourcedDelay, UltraScaleTimingDb};
 
@@ -98,6 +98,24 @@ fn preliminary_xcvu3p_values_pinned_to_forum_ballpark() {
 }
 
 #[test]
+fn preliminary_xczu3eg_values_pinned_to_forum_ballpark() {
+    assert_preliminary_values(&preliminary_xczu3eg(), "xczu3eg");
+}
+
+#[test]
+fn preliminary_xczu3eg_differs_only_by_part() {
+    let zu = preliminary_xczu3eg();
+    let ku = preliminary_xcku3p();
+    let vu = preliminary_xcvu3p();
+    assert_eq!(zu.cells.lut6, ku.cells.lut6);
+    assert_eq!(zu.cells.lut6, vu.cells.lut6);
+    assert_eq!(zu.interconnect.single, ku.interconnect.single);
+    assert_eq!(zu.interconnect.single, vu.interconnect.single);
+    assert_ne!(zu.part, ku.part);
+    assert_ne!(zu.part, vu.part);
+}
+
+#[test]
 fn preliminary_dbs_differ_only_by_part() {
     let ku = preliminary_xcku3p();
     let vu = preliminary_xcvu3p();
@@ -146,7 +164,10 @@ fn documented_xcvu3p_has_only_bram_clk_to_do() {
 fn sta_db_for_part_selects_per_part() {
     assert_eq!(sta_db_for_part("xcku3p").unwrap().part, "xcku3p");
     assert_eq!(sta_db_for_part("xcvu3p").unwrap().part, "xcvu3p");
+    assert_eq!(sta_db_for_part("xczu3eg").unwrap().part, "xczu3eg");
     assert!(sta_db_for_part("xcku3p").unwrap().is_estimate());
+    assert!(sta_db_for_part("xczu3eg").unwrap().is_estimate());
+    assert_preliminary_values(&sta_db_for_part("xczu3eg").unwrap(), "xczu3eg");
 }
 
 #[test]
