@@ -202,7 +202,9 @@ def build_fixture(db, fabric, name, rtl, site_feats, routes, port_map):
 
 
 def ff_feats(letter: str) -> dict[str, None]:
-    return {f"{letter}FF.INIT.V1": None, f"{letter}FF.SRVAL.V1": None}
+    # All fixture registers reset to 0, so INIT and SRVAL are V0
+    # under the V-suffix-is-the-value reading (see fasmio.ff_attr).
+    return {f"{letter}FF.INIT.V0": None, f"{letter}FF.SRVAL.V0": None}
 
 
 def write_fixture(name: str, rtl: str, fasm: str, port_map: dict[str, str]):

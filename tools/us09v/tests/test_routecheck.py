@@ -157,6 +157,73 @@ class TestNegative(RouteBase):
         )
 
 
+class TestFwdRevNormalization(RouteBase):
+    def test_fwd_spelling_same_as_plain(self):
+        # Rewriting every blinky PIP in the .FWD spelling must not
+        # change the route report: same PIP count, same violations.
+        base = self.check_fixture("blinky")
+        fasm_path, _rtl, _pm = load_fixture("blinky")
+        port_ins, _po, _pin = fixture_ports("blinky")
+        tiles = parse_fasm_file(fasm_path)
+        for tile, feats in tiles.items():
+            for f in list(feats):
+                if f.startswith("PIP."):
+                    feats[f + ".FWD"] = feats.pop(f)
+        rep = check_route_fasm(self.db, tiles, self.fabric, port_ins=port_ins)
+        self.assertEqual(rep.pips, base.pips)
+        self.assertEqual(rep.violations, base.violations)
+
+    def test_rev_spelling_of_bidirectional_pip(self):
+        # The three spellings of one bidirectional PIP (plain, .FWD,
+        # and .REV with swapped components) must normalize to the
+        # same PIP: same count, same violations, no "does not exist".
+        tt = self.fabric.tt("INT")
+        pair = None
+        for (s, d) in tt["pip_pairs"]:
+            if (d, s) in tt["pip_pairs"]:
+                pair = (s, d)
+                break
+        self.assertIsNotNone(pair, "no bidirectional PIP pair in INT")
+        s, d = pair
+        slice_tile = {"SLICE_X10Y10": {
+            "A6LUT.INIT[63:0]": 0x5555555555555555,
+            "OUTMUXA.D6": None,
+        }}
+        reports = []
+        for feat in (f"PIP.{d}.{s}", f"PIP.{d}.{s}.FWD", f"PIP.{s}.{d}.REV"):
+            tiles = dict(slice_tile)
+            tiles["INT_X6Y10"] = {feat: None}
+            rep = check_route_fasm(self.db, tiles, self.fabric)
+            reports.append(rep)
+        for rep in reports:
+            self.assertEqual(rep.pips, 1)
+            self.assertFalse(
+                any("does not exist" in v for v in rep.violations),
+                rep.violations,
+            )
+        self.assertEqual(reports[1].violations, reports[0].violations)
+        self.assertEqual(reports[2].violations, reports[0].violations)
+
+    def test_plain_plus_fwd_counts_once(self):
+        # A plain PIP and its .FWD spelling on the same tile are
+        # the same PIP, not a double driver.
+        tt = self.fabric.tt("INT")
+        pair = None
+        for (s, d) in tt["pip_pairs"]:
+            if (d, s) in tt["pip_pairs"]:
+                pair = (s, d)
+                break
+        self.assertIsNotNone(pair, "no bidirectional PIP pair in INT")
+        s, d = pair
+        tiles = {"SLICE_X10Y10": {
+            "A6LUT.INIT[63:0]": 0x5555555555555555,
+            "OUTMUXA.D6": None,
+        }}
+        tiles["INT_X6Y10"] = {f"PIP.{d}.{s}": None, f"PIP.{d}.{s}.FWD": None}
+        rep = check_route_fasm(self.db, tiles, self.fabric)
+        self.assertEqual(rep.pips, 1)
+
+
 class TestGoldenPips(RouteBase):
     def test_golden_pips_exist(self):
         # The harness golden FASM PIPs exist in the INT tile type

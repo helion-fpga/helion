@@ -5,6 +5,9 @@ this oracle must not trust).
 Checks, per design:
 - every PIP feature names a real pip in its tile's tile_type JSON
   (FASM PIP.<dst>.<src> = physical direction src -> dst).
+  Bidirectional BYPASS PIPs may carry a .FWD/.REV suffix; the
+  suffix is normalized before the check (FWD keeps the direction,
+  REV swaps it; see fasmio.parse_pip).
 - no wire has two drivers (two active PIPs into one wire, or an
   active PIP into a wire also driven by a site output pin).
 - every active PIP's source wire is driven.
@@ -32,8 +35,9 @@ from dataclasses import dataclass, field
 
 from .db import Db
 from .fabric import Fabric
+from .fasmio import parse_pip
 
-PIP_RE = re.compile(r"^PIP\.([^.]+)\.([^.]+)$")
+PIP_RE = re.compile(r"^PIP\.([^.]+)\.([^.]+)(?:\.(FWD|REV))?$")
 
 
 @dataclass
@@ -134,11 +138,18 @@ def check_route_fasm(
             continue
         tt = fabric.tt(ttype)
         pips = tt.get("pip_pairs", set())
+        seen: set[tuple[str, str]] = set()
         for f in feats:
-            m = PIP_RE.match(f)
-            if not m:
+            parsed = parse_pip(f)
+            if parsed is None:
                 continue
-            dst, src = m.group(1), m.group(2)
+            # Normalized direction: .FWD keeps (dst, src), .REV
+            # swaps them (parse_pip). A suffixed spelling and its
+            # plain form are the same PIP, counted once.
+            dst, src = parsed
+            if (src, dst) in seen:
+                continue
+            seen.add((src, dst))
             if (src, dst) not in pips:
                 rep.violations.append(
                     f"{tile}: PIP {dst}.{src} does not exist in {ttype}"
