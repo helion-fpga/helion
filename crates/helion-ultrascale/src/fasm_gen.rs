@@ -26,7 +26,8 @@
 //! INIT/SRVAL params, so every FF is unspecified and defaults to V0;
 //! the `FfAttr` map leaves the specified path open for when the IR
 //! grows them. LUT, BRAM, and PIP lines are other workers' scope;
-//! this module emits FF lines only.
+//! this module emits FF lines (INIT/SRVAL plus the FFMUX D select)
+//! only.
 
 use crate::pack::PackedUltraSlice;
 use crate::place::UltraPlaced;
@@ -141,6 +142,80 @@ pub fn emit_ff_fasm(
             let attr = attrs.get(cell).copied().unwrap_or_default();
             lines.push(ff_init_fasm_line(&p.site, bel, attr.init)?);
             lines.push(ff_srval_fasm_line(&p.site, bel, attr.srval)?);
+        }
+    }
+    Ok(lines)
+}
+
+/// Which FFMUX input feeds an FF's D pin (FFMUX corpus census,
+/// tools/ffmux-corpus/FFMUX_CORPUS_REPORT.md, Q2: Vivado encodes a
+/// same-slice LUT-O to FF-D edge as D6 in 119,729 cases and as BYP with
+/// a fabric route from the same LUT O in exactly 7 of 456,354 rows).
+/// `D6`: the same-slice, same-letter LUT O6 feeds D directly inside the
+/// slice, so no fabric route exists for that edge. `Byp`: D arrives
+/// from outside the slice through the `{letter}X` site pin, routed on
+/// the fabric as the flow already does.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FfMuxSel {
+    D6,
+    Byp,
+}
+
+impl FfMuxSel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FfMuxSel::D6 => "D6",
+            FfMuxSel::Byp => "BYP",
+        }
+    }
+}
+
+/// FASM line for one FF D mux: `{site}.FFMUX{letter}{1,2}.{sel}`, e.g.
+/// `SLICE_X1Y0.FFMUXA1.D6` for BEL 0, `SLICE_X1Y0.FFMUXA2.BYP` for
+/// BEL 1. The letter is `bel / 2`, the number is `bel % 2 + 1`, the
+/// same mapping as `ff_fasm_name` (BEL 0 is AFF / FFMUXA1).
+pub fn ffmux_fasm_line(site: &str, ff_index: u8, sel: FfMuxSel) -> Result<String, String> {
+    let name = ff_fasm_name(ff_index)?;
+    let letter = name.chars().next().expect("ff_fasm_name is never empty");
+    let num = ff_index % 2 + 1;
+    Ok(format!("{site}.FFMUX{letter}{num}.{}", sel.as_str()))
+}
+
+/// Emit FFMUX FASM for a placed design: for every used FF BEL in every
+/// placed slice, one `{site}.FFMUX{letter}{1,2}.{D6|BYP}` line, in
+/// deterministic order (placed-slice order, then BEL index ascending).
+/// `sels` maps FF cell name to its selection, as decided by the flow
+/// from the design nets (same-slice same-letter LUT O driving D means
+/// D6, anything else means BYP); a cell missing from the map fails
+/// loud instead of silently defaulting, because the map is built for
+/// every packed FF by construction. The placed site name is the FASM
+/// tile, not the packed slice name. FFMUX lines resolve through the
+/// generic segbits lookup (BYP sets only 15_01, D6 only 14_05 for
+/// FFMUXA1); no segbits change is needed.
+pub fn emit_ffmux_fasm(
+    packed: &[PackedUltraSlice],
+    placed: &UltraPlaced,
+    sels: &HashMap<String, FfMuxSel>,
+) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    for p in &placed.slices {
+        let slice = packed.get(p.packed_idx).ok_or_else(|| {
+            format!(
+                "ULTRA FASM: placed slice {} references packed index {} out of range",
+                p.site, p.packed_idx
+            )
+        })?;
+        let mut bels: Vec<u8> = slice.ffs.keys().copied().collect();
+        bels.sort_unstable();
+        for bel in bels {
+            let cell = &slice.ffs[&bel];
+            let sel = sels.get(cell).ok_or_else(|| {
+                format!(
+                    "ULTRA FASM: FF {cell} in slice {} has no FFMUX selection",
+                    p.site
+                )
+            })?;
+            lines.push(ffmux_fasm_line(&p.site, bel, *sel)?);
         }
     }
     Ok(lines)
@@ -274,6 +349,75 @@ mod tests {
             ]
         );
         assert!(ff_fasm_name(16).is_err());
+    }
+
+    #[test]
+    fn ffmux_lines_use_letter_and_index_from_bel() {
+        // BEL 0 is AFF, so FFMUXA1; BEL 1 is AFF2, so FFMUXA2. D6 for
+        // the FF whose D is the same-letter LUT O, BYP otherwise.
+        let mut slice = PackedUltraSlice::new("SLICE_X0Y0".to_string(), SliceKind::Logic);
+        slice.ffs.insert(0, "q".to_string());
+        slice.ffs.insert(1, "q2".to_string());
+        slice.ff_clk.insert(0, "clk".to_string());
+        slice.ff_clk.insert(1, "clk".to_string());
+        let packed = vec![slice];
+        let placed = UltraPlaced {
+            slices: vec![crate::place::PlacedUltraSlice {
+                packed_idx: 0,
+                site: "SLICE_X10Y20".to_string(),
+                tile: "CLB_X10Y20".to_string(),
+                x: 10,
+                y: 20,
+            }],
+            seed: 0,
+        };
+        let mut sels = HashMap::new();
+        sels.insert("q".to_string(), FfMuxSel::D6);
+        sels.insert("q2".to_string(), FfMuxSel::Byp);
+        let lines = emit_ffmux_fasm(&packed, &placed, &sels).unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "SLICE_X10Y20.FFMUXA1.D6".to_string(),
+                "SLICE_X10Y20.FFMUXA2.BYP".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ffmux_missing_selection_fails_loud() {
+        let (packed, placed) = one_ff_packed();
+        let err = emit_ffmux_fasm(&packed, &placed, &HashMap::new()).unwrap_err();
+        assert!(err.contains("no FFMUX selection"), "got {err}");
+    }
+
+    #[test]
+    fn ffmux_names_cover_all_sixteen() {
+        let names: Vec<String> = (0..16)
+            .map(|i| ffmux_fasm_line("SLICE_X0Y0", i, FfMuxSel::D6).unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "SLICE_X0Y0.FFMUXA1.D6",
+                "SLICE_X0Y0.FFMUXA2.D6",
+                "SLICE_X0Y0.FFMUXB1.D6",
+                "SLICE_X0Y0.FFMUXB2.D6",
+                "SLICE_X0Y0.FFMUXC1.D6",
+                "SLICE_X0Y0.FFMUXC2.D6",
+                "SLICE_X0Y0.FFMUXD1.D6",
+                "SLICE_X0Y0.FFMUXD2.D6",
+                "SLICE_X0Y0.FFMUXE1.D6",
+                "SLICE_X0Y0.FFMUXE2.D6",
+                "SLICE_X0Y0.FFMUXF1.D6",
+                "SLICE_X0Y0.FFMUXF2.D6",
+                "SLICE_X0Y0.FFMUXG1.D6",
+                "SLICE_X0Y0.FFMUXG2.D6",
+                "SLICE_X0Y0.FFMUXH1.D6",
+                "SLICE_X0Y0.FFMUXH2.D6",
+            ]
+        );
+        assert!(ffmux_fasm_line("SLICE_X0Y0", 16, FfMuxSel::D6).is_err());
     }
 
     #[test]

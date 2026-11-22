@@ -25,8 +25,9 @@
 //!   vendored segbits DBs, with a parse-back set-bit check), but is
 //!   unreachable until a design routes. CARRY8 designs fail loud at
 //!   BITGEN: the flow has no CARRY8 FASM generator yet.
-//! - FF FASM (complete, INIT/SRVAL default V0), FF control FASM, and
-//!   LUT INIT FASM are generated after legality.
+//! - FF FASM (complete, INIT/SRVAL default V0), FFMUX FASM (D6 for a
+//!   same-slice same-letter LUT-O to FF-D edge, BYP otherwise), FF
+//!   control FASM, and LUT INIT FASM are generated after legality.
 //! - Clock nets are phase 2 for the router and IOBs have no placed
 //!   site in this flow yet; nets touching them are skipped loudly at
 //!   ROUTE, not routed.
@@ -38,12 +39,12 @@ use helion_ultrascale::bitgen::{
 use helion_ultrascale::device_file::DeviceFile;
 use helion_ultrascale::{
     best_seed_line, check_legality, dedup_results, emit_ff_control_fasm, emit_ff_fasm,
-    emit_lut_fasm, escape_json_value, map_source_cell, pack_ultra, parse_results_text, place_ultra,
-    route_ultra, seed_range, seeds_to_run, sta_db_for_part, sta_routed, summarize_multiseed,
-    translated_to_fasm, ControlSetLimits, FabricWithPlaceholders, FileSegbitsDb, IntTileWireDb,
-    RouteToPipError, RoutableNet, SeedResult, SourceCell, SourceKind, StaNetlist, TimingReport,
-    TileconnWireDb, TranslatedRoute, UltraPlaceOpts, UltraRouteOpts, UltraScaleDevice,
-    UltraScaleFabric, WireDb,
+    emit_ffmux_fasm, emit_lut_fasm, escape_json_value, map_source_cell, pack_ultra,
+    parse_results_text, place_ultra, route_ultra, seed_range, seeds_to_run, sta_db_for_part,
+    sta_routed, summarize_multiseed, translated_to_fasm, ControlSetLimits, FabricWithPlaceholders,
+    FileSegbitsDb, FfMuxSel, IntTileWireDb, RouteToPipError, RoutableNet, SeedResult, SourceCell,
+    SourceKind, StaNetlist, TimingReport, TileconnWireDb, TranslatedRoute, UltraPlaceOpts,
+    UltraRouteOpts, UltraScaleDevice, UltraScaleFabric, WireDb,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -621,6 +622,15 @@ pub fn run_impl(
         ff_control_fasm.len()
     );
 
+    // FFMUX FASM (D6/BYP per FF, decided from the design nets): a FF
+    // whose D is driven by the same-slice, same-letter LUT O takes D6
+    // (intra-slice, no fabric route for that edge); any other driver
+    // takes BYP (D arrives through the AX site pin, routed as today).
+    // Generated here with the other FF lines, consumed at BITGEN.
+    let ffmux_fasm = emit_ffmux_fasm(&packed.slices, &placed, &ffmux_selections(&design, &packed))
+        .map_err(|e| format!("ULTRA FASM: {e}"))?;
+    println!("hang_diag ultra fasm ffmux_lines={}", ffmux_fasm.len());
+
     // Preliminary STA on the placed netlist (Manhattan estimates, ballpark
     // delays; NOT signoff timing). The DB is selected by part (F3 fix:
     // xcku3p no longer silently runs on the xcvu3p DB) and the report is
@@ -701,6 +711,7 @@ pub fn run_impl(
     let mut fasm_lines: Vec<String> = Vec::new();
     fasm_lines.extend(lut_fasm);
     fasm_lines.extend(ff_fasm);
+    fasm_lines.extend(ffmux_fasm);
     fasm_lines.extend(ff_control_fasm);
     fasm_lines.extend(pip_fasm.lines().map(|l| l.to_string()));
     let fasm_text = fasm_lines.join("\n") + "\n";
@@ -857,6 +868,78 @@ fn sta_on_placed(
     sta_routed(&nl, &db, 10_000).map_err(|e| format!("ULTRA STA: {e}"))
 }
 
+/// Decide the FFMUX selection for every packed FF, from the design
+/// nets. A FF whose D net is driven by a LUT O packed into the same
+/// slice with the same BEL letter takes D6 (the LUT O feeds D directly
+/// inside the slice); every other D source takes BYP: another LUT in
+/// the same slice but a different letter, a LUT in another slice, an
+/// FF Q, a carry output, or a port. A FF with no D net at all also
+/// takes BYP (nothing drives its fabric input either). The decision is
+/// per FF cell, keyed by cell name, and covers every packed FF by
+/// construction; `emit_ffmux_fasm` fails loud on a missing entry.
+/// The D net is recovered from `design.nets` here (the same pin_to_net
+/// pattern as `sta_on_placed`): `PackedUltraSlice` carries no `ff_d`
+/// field and `extract_cells` drops the D pin, so the packer cannot
+/// supply it.
+fn ffmux_selections(
+    design: &Design,
+    packed: &helion_ultrascale::UltraPacked,
+) -> HashMap<String, FfMuxSel> {
+    // Pin -> net, by resolved names.
+    let mut pin_to_net: HashMap<(String, String), String> = HashMap::new();
+    for net in &design.nets {
+        let net_name = resolve(net.name).to_string();
+        for ep in &net.endpoints {
+            pin_to_net.insert(
+                (resolve(ep.cell).to_string(), resolve(ep.pin).to_string()),
+                net_name.clone(),
+            );
+        }
+    }
+    // Net -> driving LUT cell, for nets driven by a LUT O. Only a LUT
+    // driver can select D6; any other driver means BYP.
+    let mut lut_driver: HashMap<String, String> = HashMap::new();
+    for cell in &design.cells {
+        if !matches!(cell.kind, CellKind::Lut6 { .. }) {
+            continue;
+        }
+        let cell_name = resolve(cell.name).to_string();
+        if let Some(net) = pin_to_net.get(&(cell_name.clone(), "O".to_string())) {
+            lut_driver.insert(net.clone(), cell_name);
+        }
+    }
+    // Packed placement per cell: (packed slice index, BEL letter).
+    // LUT letter is `bel`, FF letter is `bel / 2` (same mapping as
+    // build_routable_nets).
+    let mut lut_place: HashMap<String, (usize, char)> = HashMap::new();
+    let mut ff_place: HashMap<String, (usize, char)> = HashMap::new();
+    for (idx, slice) in packed.slices.iter().enumerate() {
+        for (bel, cell) in &slice.luts {
+            lut_place.insert(cell.clone(), (idx, (b'A' + *bel) as char));
+        }
+        for (bel, cell) in &slice.ffs {
+            ff_place.insert(cell.clone(), (idx, (b'A' + (bel / 2)) as char));
+        }
+    }
+    let mut sels = HashMap::new();
+    for (ff_cell, (ff_slice, ff_letter)) in &ff_place {
+        let sel = pin_to_net
+            .get(&(ff_cell.clone(), "D".to_string()))
+            .and_then(|d_net| lut_driver.get(d_net))
+            .and_then(|lut_cell| lut_place.get(lut_cell))
+            .map(|(lut_slice, lut_letter)| {
+                if lut_slice == ff_slice && lut_letter == ff_letter {
+                    FfMuxSel::D6
+                } else {
+                    FfMuxSel::Byp
+                }
+            })
+            .unwrap_or(FfMuxSel::Byp);
+        sels.insert(ff_cell.clone(), sel);
+    }
+    sels
+}
+
 /// Build routable nets from the placed design. Only reached once a real
 /// WireDb exists. Nets touching IOBs or clock nets are skipped loudly
 /// (one hang_diag line each, naming the net and the gap): IOBs have
@@ -865,7 +948,9 @@ fn sta_on_placed(
 /// carries no configuration for it; that is the honest state until IO
 /// placement and clock routing land. Carry4 cells fail loud: carry
 /// routing is not implemented in this flow, and silently dropping
-/// carry nets would misconfigure the design.
+/// carry nets would misconfigure the design. Intra-slice LUT-O to
+/// same-slice same-letter FF-D edges are also skipped, loudly: the FF
+/// takes D6 and the edge needs no fabric route (see the filter below).
 fn build_routable_nets(
     design: &Design,
     packed: &helion_ultrascale::UltraPacked,
@@ -968,6 +1053,40 @@ fn build_routable_nets(
         let Some((dcell, dpin)) = driver else {
             continue;
         };
+        // Intra-slice LUT-O to FF-D edges are not fabric nets: when a
+        // LUT O drives a FF D in the same placed slice with the same
+        // BEL letter, the FF takes D6 and the edge needs no INT route
+        // (FFMUX corpus census: Vivado encodes this edge as D6 in
+        // 119,729 cases and as BYP with a fabric route in 7 of
+        // 456,354). Drop those sinks from the routable net; a net
+        // whose sinks are all intra-slice is dropped entirely. Other
+        // sinks on the same net still route, so the LUT O still
+        // reaches the fabric where it is consumed elsewhere, and the
+        // FF D is never double-driven (no PIPs drive its AX pin for
+        // this net). Only LUT O drivers are filtered: an FF Q or a
+        // carry output driving an FF D still routes to AX (BYP).
+        if dpin == "O6" {
+            let n_before = sinks.len();
+            if let Some((dx, dy, dbel)) = cell_site.get(&dcell) {
+                let dletter = dbel.chars().next();
+                sinks.retain(|(scell, spin)| {
+                    if spin != "D" {
+                        return true;
+                    }
+                    let Some((sx, sy, sbel)) = cell_site.get(scell) else {
+                        return true;
+                    };
+                    let same_slice = sx == dx && sy == dy;
+                    let same_letter = sbel.chars().next() == dletter;
+                    !(same_slice && same_letter)
+                });
+            }
+            if sinks.is_empty() && sinks.len() < n_before {
+                println!(
+                    "hang_diag ultra route skip net={net_name} reason=intra-slice LUT-O to same-letter FF-D (D6, no fabric route)"
+                );
+            }
+        }
         if sinks.is_empty() {
             continue;
         }
@@ -1361,18 +1480,93 @@ mod tests {
 
     #[test]
     fn io_and_clock_nets_skip_loudly_not_error() {
-        // The q net (LUT O to FF D) routes; the led net (FF Q to the
-        // top-level port) and the clk net (top-level input to FF CLK)
-        // drop out because their port endpoints have no placed site.
-        // Skipping is printed, not silent, and never errors.
+        // The q net (LUT O to same-slice same-letter FF D) is
+        // intra-slice (D6) and needs no fabric route, so it drops out
+        // here; the led net (FF Q to the top-level port) and the clk
+        // net (top-level input to FF CLK) drop out because their port
+        // endpoints have no placed site. Skipping is printed, not
+        // silent, and never errors.
         let (design, packed, placed) = one_slice_design();
         let nets = build_routable_nets(&design, &packed, &placed).unwrap();
-        assert_eq!(nets.len(), 1, "only the cell-driven net routes");
+        assert_eq!(nets.len(), 0, "no net needs a fabric route here");
+    }
+
+    #[test]
+    fn ffmux_selections_same_letter_lut_is_d6() {
+        // The fixture's FF D is driven by the same-slice, same-letter
+        // (A) LUT O, so it takes D6.
+        let (design, packed, _) = one_slice_design();
+        let sels = ffmux_selections(&design, &packed);
+        assert_eq!(sels.get("u_ff"), Some(&FfMuxSel::D6));
+    }
+
+    #[test]
+    fn ffmux_selections_other_sources_are_byp() {
+        // One LUT O drives three FF D pins: the same-slice
+        // same-letter FF (D6), a same-slice different-letter FF
+        // (BYP), and a FF in another slice (BYP).
+        let mut design = Design::new("fanout");
+        design.add_cell(
+            "u_lut",
+            CellKind::Lut6 {
+                init: 0x5555555555555555,
+            },
+        );
+        design.add_cell("u_ff", CellKind::Hff);
+        design.add_cell("u_ff_b", CellKind::Hff);
+        design.add_cell("u_ff_other", CellKind::Hff);
+        design.add_cell("u_clkin", CellKind::IobIn);
+        design.connect("q", "u_lut", "O");
+        design.connect("q", "u_ff", "D");
+        design.connect("q", "u_ff_b", "D");
+        design.connect("q", "u_ff_other", "D");
+        design.connect("clk", "u_clkin", "PAD");
+        design.connect("clk", "u_ff", "CLK");
+        design.connect("clk", "u_ff_b", "CLK");
+        design.connect("clk", "u_ff_other", "CLK");
+        let mut slice0 = PackedUltraSlice::new("SLICE_X0Y0".to_string(), SliceKind::Logic);
+        slice0.luts.insert(0, "u_lut".to_string());
+        slice0.lut_inits.insert(0, 0x5555555555555555);
+        slice0.ffs.insert(0, "u_ff".to_string());
+        slice0.ffs.insert(2, "u_ff_b".to_string());
+        slice0.ff_clk.insert(0, "clk".to_string());
+        slice0.ff_clk.insert(2, "clk".to_string());
+        let mut slice1 = PackedUltraSlice::new("SLICE_X0Y1".to_string(), SliceKind::Logic);
+        slice1.ffs.insert(0, "u_ff_other".to_string());
+        slice1.ff_clk.insert(0, "clk".to_string());
+        let packed = UltraPacked {
+            slices: vec![slice0, slice1],
+            ..Default::default()
+        };
+        let sels = ffmux_selections(&design, &packed);
+        assert_eq!(sels.get("u_ff"), Some(&FfMuxSel::D6));
+        assert_eq!(sels.get("u_ff_b"), Some(&FfMuxSel::Byp));
+        assert_eq!(sels.get("u_ff_other"), Some(&FfMuxSel::Byp));
+        // The shared q net still routes: it has fabric sinks (the two
+        // BYP FFs), only the intra-slice same-letter sink is dropped.
+        let placed = UltraPlaced {
+            slices: vec![
+                PlacedUltraSlice {
+                    packed_idx: 0,
+                    site: "SLICE_X0Y0".to_string(),
+                    tile: "CLB_X0Y0".to_string(),
+                    x: 0,
+                    y: 0,
+                },
+                PlacedUltraSlice {
+                    packed_idx: 1,
+                    site: "SLICE_X0Y1".to_string(),
+                    tile: "CLB_X0Y1".to_string(),
+                    x: 0,
+                    y: 1,
+                },
+            ],
+            seed: 0,
+        };
+        let nets = build_routable_nets(&design, &packed, &placed).unwrap();
+        assert_eq!(nets.len(), 1, "the shared q net still routes");
         assert_eq!(nets[0].name, "q");
-        assert_eq!(nets[0].driver.1, "A6LUT");
-        assert_eq!(nets[0].driver.2, "O6");
-        assert_eq!(nets[0].sinks.len(), 1);
-        assert_eq!(nets[0].sinks[0].1, "AQ");
+        assert_eq!(nets[0].sinks.len(), 2, "only the D6 sink is dropped");
     }
 
     #[test]
@@ -1532,12 +1726,16 @@ INT_X0Y0.PIP.INT_NODE_GLOBAL_0_INT_OUT0.GCLK_B_0_0\n";
 
     #[test]
     fn blinky_fasm_emits_and_parses_back_on_xczu3eg() {
-        // The 13-line flow FASM for blinky on xczu3eg (SLICE_X1Y0,
-        // INT_X1Y0), as routed in the GAP-F5 lane; inlined here so
-        // the test does not depend on a log file outside the repo.
-        // Every feature must resolve through the vendored segbits
-        // DBs on the xczu3eg device: a missing resolution fails
-        // loud in emit, it is not skipped.
+        // The 13-line GAP-F5 FASM for blinky on xczu3eg (SLICE_X1Y0,
+        // INT_X1Y0), as routed before the FFMUX lane: no FFMUX line,
+        // and the LUT-O to FF-D edge still routed through the INT to
+        // AX (the last two PIPs). Inlined here so the test does not
+        // depend on a log file outside the repo; it pins the bitgen
+        // path, not the current flow FASM (the flow now emits 12
+        // lines with FFMUXA1.D6 and no AX leg). Every feature must
+        // resolve through the vendored segbits DBs on the xczu3eg
+        // device: a missing resolution fails loud in emit, it is not
+        // skipped.
         let data_dir = ultrascale_data_dir();
         let fasm = "\
 SLICE_X1Y0.A6LUT.INIT[63:0] = 0x5555555555555555\n\
@@ -1594,25 +1792,37 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
     ///
     /// What this pins, all measured on the 2026-11-22 flow run:
     /// - the flow reaches BITGEN (exit Ok) and writes .bit + .fasm;
-    /// - the emitted FASM is exactly the 13-line GAP-F5 FASM, all PIPs
-    ///   on INT_X1Y0 (the provisional INT rule is proven only for
-    ///   INT_X1, so any PIP on INT_X2+ fails this test);
+    /// - the emitted FASM is exactly the 12-line FFMUX-flow FASM:
+    ///   LUT INIT, FF INIT/SRVAL, FFMUXA1.D6 (the LUT O feeds the FF
+    ///   D intra-slice, so the AX leg is gone and only the 4 PIPs of
+    ///   the AQ feedback leg remain), FF control, all PIPs on
+    ///   INT_X1Y0 (the provisional INT rule is proven only for INT_X1,
+    ///   so any PIP on INT_X2+ fails this test);
     /// - IDCODE 0x04a42093 and 14,952 FDRI frames (not UG1085 14,964);
     /// - every stored H-1 band checks Exact under masked MAP-A
     ///   (no Q residual, no mismatch) over all 14,952 frames;
-    /// - the standalone decoder round-trips all 13 flow lines, and
-    ///   its only unexplained bits are the 38 H-1 band bits at
-    ///   absolute frame bits 1440..=1487. The decoder still exits 1
-    ///   on those bits (it does not apply the N7 band check that
-    ///   parse_bitstream does); this test asserts the bits are band
-    ///   bits, it does not claim decode exits 0.
+    /// - the standalone decoder round-trips all 12 flow lines, and
+    ///   its only unexplained bits are the 41 H-1 band bits at
+    ///   absolute frame bits 1440..=1487. The count moved from 38
+    ///   (GAP-F5 FASM) to 41 here because the band code is computed
+    ///   from frame contents: dropping the 2 AX-leg PIP bits and
+    ///   adding the FFMUX bit changed which band bits are set. The
+    ///   invariant is not the count but that every unexplained bit
+    ///   is a band bit and the band check above is Exact on every
+    ///   frame. The decoder still exits 1 on those bits (it does not
+    ///   apply the N7 band check that parse_bitstream does); this
+    ///   test asserts the bits are band bits, it does not claim
+    ///   decode exits 0.
     ///
-    /// Deliberately NOT asserted here: US-09 verify-bit. The emitted
-    /// bitstream fails it on route (the flow emits no FFMUXA1, so the
-    /// checker finds no real driver for AQ) and on cosim (the
-    /// extractor models AQ as X without FFMUX). The FFMUX gap is a
-    /// follow-up lane, not this one; asserting it here would enshrine
-    /// a known-bad state as the pass bar.
+    /// Deliberately NOT asserted here: US-09 verify-bit. The flow now
+    /// emits FFMUXA1.D6, so the route leg's missing-driver failure is
+    /// gone on the flow side, but cosim still depends on the
+    /// unresolved FF INIT polarity flag (INTERFACES.md item 5): with
+    /// D6 the extracted values invert against the RTL until one side
+    /// of the V0/V1 mapping is fixed, and that fix belongs to the
+    /// checker lane (tools/us09v/), not this flow. Asserting
+    /// verify-bit here would enshrine a known-open polarity question
+    /// as the pass bar.
     #[test]
     fn blinky_flow_emits_bitstream_on_xczu3eg() {
         use helion_ultrascale::band_code::{BAND_HI, BAND_LO, BandCheck, check_stored_band};
@@ -1663,10 +1873,11 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
         );
         assert_eq!(count_fdri_frames(&bytes), 14_952);
         let fasm = std::fs::read_to_string(&out_fasm).unwrap();
-        let expected: [&str; 13] = [
+        let expected: [&str; 12] = [
             "SLICE_X1Y0.A6LUT.INIT[63:0] = 0x5555555555555555",
             "SLICE_X1Y0.AFF.INIT.V0",
             "SLICE_X1Y0.AFF.SRVAL.V0",
+            "SLICE_X1Y0.FFMUXA1.D6",
             "SLICE_X1Y0.ABCDFF.CEUSED.V0",
             "SLICE_X1Y0.ABCDFF.SRUSED.V0",
             "SLICE_X1Y0.ABCDFF.CLKINV.V0",
@@ -1675,10 +1886,8 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
             "INT_X1Y0.PIP.BYPASS_W5.INT_NODE_IMUX_42_INT_OUT1",
             "INT_X1Y0.PIP.INT_NODE_IMUX_48_INT_OUT0.BYPASS_W5",
             "INT_X1Y0.PIP.IMUX_W10.INT_NODE_IMUX_48_INT_OUT0",
-            "INT_X1Y0.PIP.INODE_W_1_FT1.LOGIC_OUTS_W0",
-            "INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1",
         ];
-        assert_eq!(fasm.lines().count(), 13, "flow FASM line count");
+        assert_eq!(fasm.lines().count(), 12, "flow FASM line count");
         for line in expected {
             assert!(
                 fasm.lines().any(|l| l == line),
@@ -1722,7 +1931,7 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
         }
         assert_eq!(
             decoded.unexplained.len(),
-            38,
+            41,
             "unexplained bit count changed; recheck the band accounting"
         );
         for b in &decoded.unexplained {
