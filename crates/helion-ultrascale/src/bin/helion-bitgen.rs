@@ -1765,20 +1765,15 @@ mod tests {
             out.fasm
         );
         // The emitter writes the computed H-1 band (absolute frame
-        // bits 1440-1487) into every block-0 frame, and Worker B's
-        // decoder does not explain band bits, so the unexplained set
-        // must be EXACTLY the emitter-computed band bits: every band
-        // bit present, and nothing else. The expectation is recomputed
-        // here from the emitter's own MAP-A computation over the
-        // emitted frames, never copied from a previous run. The FASM
-        // has no RAM-mode LUT, so the LUTRAM mask is all false; the
-        // stored-band cross-check below fails loud if that premise
-        // ever breaks.
+        // bits 1440-1487) into every block-0 frame, and the decoder
+        // now explains band bits through the N7 check (masked MAP-A,
+        // no RAM-mode LUT here so the LUTRAM mask is all false), so
+        // the unexplained set must be empty. The stored-band
+        // cross-check below fails loud if the no-LUTRAM premise ever
+        // breaks.
         use helion_ultrascale::band_code::{BandFormula, compute_band, frame_band};
         use helion_ultrascale::bitgen::FRAME_BITS;
-        use helion_ultrascale::bitstream_decode::DecodedBit;
         let no_mask = [false; FRAME_BITS];
-        let mut expected: Vec<DecodedBit> = Vec::new();
         for (far, words) in &frames {
             let computed = compute_band(*far, words, &no_mask, BandFormula::MapA);
             assert_eq!(
@@ -1786,26 +1781,11 @@ mod tests {
                 computed,
                 "emitter stored band must equal the MAP-A computation for FAR 0x{far:08x}"
             );
-            for j in 0..48 {
-                if (computed >> j) & 1 == 1 {
-                    let abs = BAND_LO as usize + j;
-                    expected.push(DecodedBit {
-                        far: *far,
-                        word: abs / 32,
-                        bit: (abs % 32) as u8,
-                    });
-                }
-            }
         }
-        expected.sort();
         assert!(
-            expected.iter().all(|b| (BAND_LO..=BAND_HI)
-                .contains(&((b.word * 32 + b.bit as usize) as u16))),
-            "every expected unexplained bit must lie in the band 1440-1487: {expected:?}"
-        );
-        assert_eq!(
-            out.unexplained, expected,
-            "unexplained bits must be exactly the computed H-1 band bits"
+            out.unexplained.is_empty(),
+            "unexplained bits must be empty now that the decoder explains band bits: {:?}",
+            out.unexplained
         );
     }
 }
