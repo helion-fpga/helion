@@ -1581,6 +1581,160 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
         );
     }
 
+    /// Flow-level test: `helion impl examples/blinky.sv --part xczu3eg`
+    /// runs synth to BITGEN and emits a real bitstream. Needs the public
+    /// prjuray-db tileconn root, so it skips (like tileconn_route.rs)
+    /// when HELION_TILECONN_DB_ROOT is unset or absent. Two part
+    /// directories live under zynqusp (sbva484 and sfvc784), so
+    /// HELION_TILECONN_PART must also be set or the router fails loud
+    /// on the ambiguous part. Run with:
+    /// HELION_TILECONN_DB_ROOT=~/workspace/prjuray-db-ref/zynqusp
+    /// HELION_TILECONN_PART=xczu3eg-sbva484-1-e cargo test --release
+    /// -j1 -p helion-cli blinky_flow_emits_bitstream_on_xczu3eg
+    ///
+    /// What this pins, all measured on the 2026-11-22 flow run:
+    /// - the flow reaches BITGEN (exit Ok) and writes .bit + .fasm;
+    /// - the emitted FASM is exactly the 13-line GAP-F5 FASM, all PIPs
+    ///   on INT_X1Y0 (the provisional INT rule is proven only for
+    ///   INT_X1, so any PIP on INT_X2+ fails this test);
+    /// - IDCODE 0x04a42093 and 14,952 FDRI frames (not UG1085 14,964);
+    /// - every stored H-1 band checks Exact under masked MAP-A
+    ///   (no Q residual, no mismatch) over all 14,952 frames;
+    /// - the standalone decoder round-trips all 13 flow lines, and
+    ///   its only unexplained bits are the 38 H-1 band bits at
+    ///   absolute frame bits 1440..=1487. The decoder still exits 1
+    ///   on those bits (it does not apply the N7 band check that
+    ///   parse_bitstream does); this test asserts the bits are band
+    ///   bits, it does not claim decode exits 0.
+    ///
+    /// Deliberately NOT asserted here: US-09 verify-bit. The emitted
+    /// bitstream fails it on route (the flow emits no FFMUXA1, so the
+    /// checker finds no real driver for AQ) and on cosim (the
+    /// extractor models AQ as X without FFMUX). The FFMUX gap is a
+    /// follow-up lane, not this one; asserting it here would enshrine
+    /// a known-bad state as the pass bar.
+    #[test]
+    fn blinky_flow_emits_bitstream_on_xczu3eg() {
+        use helion_ultrascale::band_code::{BAND_HI, BAND_LO, BandCheck, check_stored_band};
+        let Ok(db_root) = std::env::var("HELION_TILECONN_DB_ROOT") else {
+            println!(
+                "blinky_flow_emits_bitstream_on_xczu3eg: skipping, \
+                 HELION_TILECONN_DB_ROOT is unset"
+            );
+            return;
+        };
+        if !std::path::Path::new(&db_root).is_dir() {
+            println!(
+                "blinky_flow_emits_bitstream_on_xczu3eg: skipping, \
+                 HELION_TILECONN_DB_ROOT {db_root} is absent"
+            );
+            return;
+        }
+        let Ok(part) = std::env::var("HELION_TILECONN_PART") else {
+            println!(
+                "blinky_flow_emits_bitstream_on_xczu3eg: skipping, \
+                 HELION_TILECONN_PART is unset (zynqusp holds two part dirs)"
+            );
+            return;
+        };
+        assert_eq!(
+            part, "xczu3eg-sbva484-1-e",
+            "HELION_TILECONN_PART must be the sbva484 part for this test, got {part}"
+        );
+        let dir = std::env::temp_dir().join("helion-us09-flow-blinky-xczu3eg");
+        let _ = std::fs::create_dir_all(&dir);
+        let out_bit = dir.join("blinky.xczu3eg.bit");
+        let out_fasm = dir.join("blinky.xczu3eg.fasm");
+        let _ = std::fs::remove_file(&out_bit);
+        let _ = std::fs::remove_file(&out_fasm);
+        run_impl(
+            &workspace_example("blinky.sv"),
+            "xczu3eg",
+            0,
+            Some(&out_bit.to_string_lossy()),
+            Some(&out_fasm.to_string_lossy()),
+        )
+        .unwrap();
+        let bytes = std::fs::read(&out_bit).unwrap();
+        assert!(!bytes.is_empty(), "emitted bitstream is empty");
+        assert!(
+            bytes.windows(4).any(|w| w == [0x04, 0xa4, 0x20, 0x93]),
+            "emitted bitstream carries no 0x04a42093 IDCODE word"
+        );
+        assert_eq!(count_fdri_frames(&bytes), 14_952);
+        let fasm = std::fs::read_to_string(&out_fasm).unwrap();
+        let expected: [&str; 13] = [
+            "SLICE_X1Y0.A6LUT.INIT[63:0] = 0x5555555555555555",
+            "SLICE_X1Y0.AFF.INIT.V0",
+            "SLICE_X1Y0.AFF.SRVAL.V0",
+            "SLICE_X1Y0.ABCDFF.CEUSED.V0",
+            "SLICE_X1Y0.ABCDFF.SRUSED.V0",
+            "SLICE_X1Y0.ABCDFF.CLKINV.V0",
+            "SLICE_X1Y0.ABCDFF.SRINV.V0",
+            "INT_X1Y0.PIP.INT_NODE_IMUX_42_INT_OUT1.LOGIC_OUTS_W14",
+            "INT_X1Y0.PIP.BYPASS_W5.INT_NODE_IMUX_42_INT_OUT1",
+            "INT_X1Y0.PIP.INT_NODE_IMUX_48_INT_OUT0.BYPASS_W5",
+            "INT_X1Y0.PIP.IMUX_W10.INT_NODE_IMUX_48_INT_OUT0",
+            "INT_X1Y0.PIP.INODE_W_1_FT1.LOGIC_OUTS_W0",
+            "INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1",
+        ];
+        assert_eq!(fasm.lines().count(), 13, "flow FASM line count");
+        for line in expected {
+            assert!(
+                fasm.lines().any(|l| l == line),
+                "flow FASM is missing line: {line}"
+            );
+        }
+        for line in fasm.lines() {
+            if let Some(rest) = line.strip_prefix("INT_X") {
+                assert!(
+                    rest.starts_with("1Y0."),
+                    "PIP on an INT tile outside proven INT_X1: {line}"
+                );
+            }
+        }
+        // H-1 band: blinky carries no LUTRAM, so the mask is all
+        // false. Every frame must check Exact (a Q residual is
+        // accepted by check_stored_band but must not appear here).
+        let frames = helion_ultrascale::bitgen::parse_frames(&bytes).unwrap();
+        assert_eq!(frames.len(), 14_952);
+        let mask = [false; helion_ultrascale::bitgen::FRAME_BITS];
+        let mut exact = 0usize;
+        for (far, words) in &frames {
+            match check_stored_band(*far, words, &mask) {
+                BandCheck::Exact => exact += 1,
+                BandCheck::QResidual => panic!("unexpected Q-residual band at far=0x{far:08x}"),
+                BandCheck::Mismatch { stored, expected } => panic!(
+                    "band mismatch far=0x{far:08x} stored=0x{stored:012x} \
+                     expected=0x{expected:012x}"
+                ),
+            }
+        }
+        assert_eq!(exact, 14_952, "band Exact frame count");
+        // Standalone decoder round-trip.
+        let decoded =
+            helion_ultrascale::bitstream_decode::decode_bitstream(&bytes, &db_root).unwrap();
+        for line in expected {
+            assert!(
+                decoded.fasm.iter().any(|l| l == line),
+                "decoded FASM is missing flow line: {line}"
+            );
+        }
+        assert_eq!(
+            decoded.unexplained.len(),
+            38,
+            "unexplained bit count changed; recheck the band accounting"
+        );
+        for b in &decoded.unexplained {
+            let abs = b.word * 32 + b.bit as usize;
+            assert!(
+                (BAND_LO as usize..=BAND_HI as usize).contains(&abs),
+                "unexplained bit outside the H-1 band: far=0x{:08x} abs={abs}",
+                b.far
+            );
+        }
+    }
+
     #[test]
     fn xcvu3p_still_fails_loud_with_provisional_message() {
         let data_dir = ultrascale_data_dir();
