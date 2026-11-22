@@ -10,7 +10,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tests import FIXTURES, byp_shape_tiles, fixture_ports, load_db, load_fabric, load_fixture  # noqa: E402
+from tests import FIXTURES, byp_cross_letter_tiles, byp_shape_tiles, fixture_ports, load_db, load_fabric, load_fixture  # noqa: E402
 from us09v.extract import extract, to_verilog  # noqa: E402
 from us09v.fasmio import parse_fasm_file  # noqa: E402
 
@@ -97,6 +97,32 @@ class TestVerilogOutput(ExtractFixtureBase):
         text = to_verilog(nl)
         self.assertIn("wire s_SLICE_X1Y0__A_O;", text)
         self.assertIn("assign s_SLICE_X1Y0__A_O = s_SLICE_X1Y0__A;", text)
+        with tempfile.TemporaryDirectory() as d:
+            vpath = os.path.join(d, "extracted.v")
+            with open(vpath, "w") as f:
+                f.write(text)
+            r = subprocess.run(
+                ["iverilog", "-g2012", "-o", os.path.join(d, "out.vvp"), vpath],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(r.returncode, 0, f"{r.stdout}{r.stderr}")
+
+    def test_byp_cross_letter_declares_lut_o_wire(self):
+        # The cross-letter BYP shape resolves FF A2 D through the
+        # fabric back to the LUT O site pin B_O: the extracted
+        # netlist must declare s_SLICE_X1Y0__B_O as an alias of
+        # the LUT O6 wire, or iverilog fails at elaboration on
+        # the undefined wire. The sliceout fix declares one
+        # {c}_O alias per live LUT letter, so B_O already
+        # resolves; this pins it.
+        tiles = byp_cross_letter_tiles()
+        port_ins = {"clk": ("SLICE_X1Y0", "CLK1")}
+        port_outs = {"led1": ("SLICE_X1Y0", "AQ"), "led2": ("SLICE_X1Y0", "AQ2")}
+        nl = extract(self.db, tiles, port_ins, port_outs)
+        self.assertEqual(nl.errors, [], nl.errors)
+        text = to_verilog(nl)
+        self.assertIn("wire s_SLICE_X1Y0__B_O;", text)
+        self.assertIn("assign s_SLICE_X1Y0__B_O = s_SLICE_X1Y0__B;", text)
         with tempfile.TemporaryDirectory() as d:
             vpath = os.path.join(d, "extracted.v")
             with open(vpath, "w") as f:
