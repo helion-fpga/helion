@@ -1586,7 +1586,10 @@ fn write_frame_bit(
 /// line is a RAM-mode LUT and its INIT bits are LUTRAM content bits.
 /// The broader mode-selection lines (DI1, SIZE, WA7/8/9USED) do not
 /// identify RAM mode on their own.
-fn ram_mode_lut_index(feature: &str) -> Option<u8> {
+///
+/// Shared with `bitstream_decode.rs`: the decoder derives its LUTRAM
+/// masks with this same identifier, so the mask rule cannot drift.
+pub(crate) fn ram_mode_lut_index(feature: &str) -> Option<u8> {
     let mut parts = feature.split('.');
     let bel = parts.next()?;
     let attr = parts.next()?;
@@ -1605,7 +1608,9 @@ fn ram_mode_lut_index(feature: &str) -> Option<u8> {
 /// LUT index (0..8) when `feature` is a LUT INIT spelling (grouped
 /// `X6LUT.INIT[63:0]` or per-bit `XLUT.INIT[i]`), else None. FF INIT
 /// and SRVAL spellings are not LUT INIT bits.
-fn lut_init_index(feature: &str) -> Option<u8> {
+///
+/// Shared with `bitstream_decode.rs` (see `ram_mode_lut_index`).
+pub(crate) fn lut_init_index(feature: &str) -> Option<u8> {
     match parse_lut_ff_feature(feature)? {
         LutFfFeature::LutWhole(idx) | LutFfFeature::LutBit(idx, _) => Some(idx),
         _ => None,
@@ -1613,7 +1618,8 @@ fn lut_init_index(feature: &str) -> Option<u8> {
 }
 
 /// Record one RAM-mode LUT INIT position into the per-frame masks.
-fn record_lutram_bit(masks: &mut HashMap<u32, [bool; FRAME_BITS]>, far: u32, bit: u16) {
+/// Shared with `bitstream_decode.rs` (see `ram_mode_lut_index`).
+pub(crate) fn record_lutram_bit(masks: &mut HashMap<u32, [bool; FRAME_BITS]>, far: u32, bit: u16) {
     masks.entry(far).or_insert([false; FRAME_BITS])[bit as usize] = true;
 }
 
