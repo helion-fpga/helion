@@ -95,8 +95,14 @@ python3 -m us09v brute --cells 2 --kind LUT --grid 2x2
   per-slice limits (1 CLK, 1 SR, 2 CE per slice); this checker
   applies the per-half rule from the brief. Flagged to the
   coordinator, not resolved here.
-- FF INIT/SRVAL: V0 sets the bit, V1 clears it; group attributes
-  CEUSED/SRUSED/CLKINV/SRINV: V1 sets, V0 clears (INTERFACES.md).
+- FF INIT/SRVAL: the V suffix IS the value (V0 is 0, V1 is 1);
+  the segbits bit is NOT the value (V0 sets the bit, V1 clears
+  it, bit = NOT(INIT)). Group attributes CEUSED/SRUSED/CLKINV/
+  SRINV: V1 sets, V0 clears. Decided on balance of evidence
+  (FDRE default 1'b0, corpus V0 dominance, emitter consistency);
+  NOT settled by a direct Vivado known-INIT comparison, whose
+  missing datum is a decoded Vivado bitstream with known INIT
+  on a decoder-supported part.
 - LUT O6/O5 indexing: A1 is the LSB.
 - INT PIP FASM order is DST.SRC: `PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1`
   means physical direction INODE_E_1_FT1 -> BOUNCE_E_0_FT1.

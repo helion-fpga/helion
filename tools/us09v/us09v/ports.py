@@ -24,6 +24,7 @@ from collections import deque
 from .cosim import parse_xdc
 from .db import Db
 from .fabric import Fabric
+from .fasmio import parse_pip
 
 
 def port_name(site: str, pin: str) -> str:
@@ -97,11 +98,13 @@ def trace_pad_to_slice_pin(
             if (t2, w2) not in seen:
                 seen.add((t2, w2))
                 q.append((t2, w2))
-        # Active PIPs into this wire (reverse direction).
+        # Active PIPs into this wire (reverse direction). The PIP
+        # is matched in its normalized direction (plain, .FWD, or
+        # swapped .REV spelling); see fasmio.parse_pip.
         for f, _v in tiles.get(tile, {}).items():
-            m = re.match(r"^PIP\.([^.]+)\.([^.]+)$", f)
-            if m and m.group(1) == wire:
-                src = m.group(2)
+            parsed = parse_pip(f)
+            if parsed is not None and parsed[0] == wire:
+                src = parsed[1]
                 if (tile, src) not in seen:
                     seen.add((tile, src))
                     q.append((tile, src))
