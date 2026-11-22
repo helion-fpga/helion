@@ -10,7 +10,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tests import FIXTURES, fixture_ports, load_db, load_fabric, load_fixture  # noqa: E402
+from tests import FIXTURES, byp_shape_tiles, fixture_ports, load_db, load_fabric, load_fixture  # noqa: E402
 from us09v.extract import extract, to_verilog  # noqa: E402
 from us09v.fasmio import parse_fasm_file  # noqa: E402
 
@@ -83,6 +83,29 @@ class TestVerilogOutput(ExtractFixtureBase):
         text = to_verilog(nl)
         self.assertNotIn("assign p_SLICE_X10Y10_A1 = p_SLICE_X10Y10_A1", text)
         self.assertIn("assign s_SLICE_X10Y10__A1 = p_SLICE_X10Y10_A1", text)
+
+    def test_byp_shape_declares_lut_o_wire(self):
+        # The BYP shape resolves the FF D through the fabric back
+        # to the LUT O site pin A_O: the extracted netlist must
+        # declare s_SLICE_X1Y0__A_O as an alias of the LUT O6 wire,
+        # or iverilog fails at elaboration on the undefined wire.
+        tiles = byp_shape_tiles()
+        port_ins = {"clk": ("SLICE_X1Y0", "CLK1")}
+        port_outs = {"led": ("SLICE_X1Y0", "AQ")}
+        nl = extract(self.db, tiles, port_ins, port_outs)
+        self.assertEqual(nl.errors, [], nl.errors)
+        text = to_verilog(nl)
+        self.assertIn("wire s_SLICE_X1Y0__A_O;", text)
+        self.assertIn("assign s_SLICE_X1Y0__A_O = s_SLICE_X1Y0__A;", text)
+        with tempfile.TemporaryDirectory() as d:
+            vpath = os.path.join(d, "extracted.v")
+            with open(vpath, "w") as f:
+                f.write(text)
+            r = subprocess.run(
+                ["iverilog", "-g2012", "-o", os.path.join(d, "out.vvp"), vpath],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(r.returncode, 0, f"{r.stdout}{r.stderr}")
 
     def test_iverilog_compiles(self):
         for name in ("and2", "blinky", "counter4", "carry8-inc", "wide-mux-f7"):

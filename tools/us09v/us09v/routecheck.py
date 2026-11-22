@@ -278,6 +278,7 @@ def _pin_dir(db: Db, stype: str, pin: str) -> str | None:
 def _slice_output_pins(feats) -> set[str]:
     """Output pins of a slice that are driven by configured BELs."""
     from .extract import LETTERS
+    from .fasmio import init_value
 
     pins = set()
     for c in LETTERS:
@@ -289,6 +290,17 @@ def _slice_output_pins(feats) -> set[str]:
         # undriven (the extractor emits X for it).
         if any(f.startswith(f"OUTMUX{c}.") for f in feats):
             pins.add(f"{c}MUX")
+        # The {c}_O pin is the LUT O6 output: it drives the fabric
+        # when the LUT is live (INIT present) and the letter's
+        # output is selected by an FFMUX or OUTMUX feature. Without
+        # this, a LUT driving the fabric through its O pin (the
+        # FFMUX BYP shape: LUT O through the INT to the AX pin)
+        # fails as undriven / driven-only-by-PIP.
+        if init_value(feats, c) is not None and (
+            any(f.startswith(f"FFMUX{c}{num}.") for num in ("1", "2") for f in feats)
+            or any(f.startswith(f"OUTMUX{c}.") for f in feats)
+        ):
+            pins.add(f"{c}_O")
     if any(
         f.startswith(f"FFMUX{c}") and f.endswith((".CY", ".XORIN"))
         or f.startswith(f"OUTMUX{c}") and f.endswith((".CY", ".XORIN"))
