@@ -36,6 +36,7 @@ pub mod router;
 pub mod segbits;
 pub mod sta;
 pub mod synthmap;
+pub mod tileconn;
 pub mod timing_db;
 pub mod uram;
 pub mod wire_db;
@@ -104,4 +105,5 @@ pub use timing_db::{
     documented_xcku3p, documented_xcvu3p, sta_db_for_part, DelaySource, SourcedDelay,
     UltraScaleTimingDb, preliminary_xcku3p, preliminary_xcvu3p,
 };
+pub use tileconn::{PinCoverage, PinWire, SiteTile, TileconnDb, TileconnError, TileconnWireDb};
 pub use wire_db::{IntTile, IntTileWireDb, WireDbError};

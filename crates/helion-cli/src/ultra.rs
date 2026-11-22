@@ -9,10 +9,13 @@
 //! - SYNTH, PACK, PLACE, LEGALITY, STA (preliminary) run.
 //! - ROUTE runs on the real INT-tile routing graph (vendored INT tile
 //!   JSON, one INT tile per placed slice, PROVISIONAL tile naming
-//!   INT_X{x}Y{y} until the xcku3p tilegrid lands). It fails loud with
-//!   NoPath naming the first BEL pin with no wire: no public source
-//!   maps BEL pins to INT wires (US-01 data gap), so no placed design
-//!   routes yet.
+//!   INT_X{x}Y{y} until the xcku3p tilegrid lands). Without a tileconn
+//!   DB it fails loud with NoPath naming the first BEL pin with no
+//!   wire. With `HELION_TILECONN_DB_ROOT` set to a prjuray-db family
+//!   root, the graph is a `TileconnWireDb` instead: BEL pins resolve
+//!   through the public `tileconn.json` map (US-01 wiredb lane) and
+//!   the INT tiles are the real tilegrid tiles. xczu3eg still stops
+//!   at preliminary STA before ROUTE (no xczu3eg STA DB, GAP-F5).
 //! - ROUTE-TO-PIP translates routed nets to INT PIPs via the WireDb
 //!   naming seam (CTO ruling 2026-11-07, option A); unnamed wires and
 //!   non-edges fail loud. Multi-sink nets route as a flattened union
@@ -38,8 +41,9 @@ use helion_ultrascale::{
     emit_lut_fasm, escape_json_value, map_source_cell, pack_ultra, parse_results_text, place_ultra,
     route_ultra, seed_range, seeds_to_run, sta_db_for_part, sta_routed, summarize_multiseed,
     translated_to_fasm, ControlSetLimits, FabricWithPlaceholders, FileSegbitsDb, IntTileWireDb,
-    RoutableNet, SeedResult, SourceCell, SourceKind, StaNetlist, TimingReport, TranslatedRoute,
-    UltraPlaceOpts, UltraRouteOpts, UltraScaleDevice, UltraScaleFabric, WireDb,
+    RouteToPipError, RoutableNet, SeedResult, SourceCell, SourceKind, StaNetlist, TimingReport,
+    TileconnWireDb, TranslatedRoute, UltraPlaceOpts, UltraRouteOpts, UltraScaleDevice,
+    UltraScaleFabric, WireDb,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -406,6 +410,94 @@ impl<'a> StaNetlist for UltraStaNetlist<'a> {
     }
 }
 
+/// The routing graph the impl flow routes on: either the plain
+/// INT-tile graph (no BEL-pin map; route fails loud naming the first
+/// pin with no wire) or the tileconn graph (BEL pins resolved from
+/// the public `tileconn.json` map). The two graphs share the
+/// `WireDb` trait for routing but have different concrete
+/// `translate_route` methods, so the enum carries both.
+enum RouteDb {
+    Int(Arc<IntTileWireDb>),
+    Tileconn(Arc<TileconnWireDb>),
+}
+
+impl RouteDb {
+    fn wires(&self) -> Arc<dyn WireDb> {
+        match self {
+            RouteDb::Int(db) => db.clone(),
+            RouteDb::Tileconn(db) => db.clone(),
+        }
+    }
+
+    fn translate_route(
+        &self,
+        route: &[helion_ultrascale::WireId],
+        design: &str,
+    ) -> Result<TranslatedRoute, RouteToPipError> {
+        match self {
+            RouteDb::Int(db) => db.translate_route(route, design),
+            RouteDb::Tileconn(db) => db.translate_route(route, design),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            RouteDb::Int(db) => format!(
+                "tiles={} wires={} tileconn=none",
+                db.tile_count(),
+                db.wire_count()
+            ),
+            RouteDb::Tileconn(db) => format!(
+                "tiles={} wires={} tileconn={} entries={} pairs={}",
+                db.tile_count(),
+                db.wire_count(),
+                db.tileconn_db().part_dir.display(),
+                db.tileconn_db().tileconn_entries,
+                db.tileconn_db().tileconn_pairs
+            ),
+        }
+    }
+}
+
+/// Build the routing graph for the placed slices. Without
+/// `HELION_TILECONN_DB_ROOT` this is the plain INT-tile graph (the
+/// US-09 behavior: no BEL-pin map). With it set to a prjuray-db
+/// family root (the same directory the `helion-bitgen` decoder takes
+/// as `--db-root`, e.g. `~/workspace/prjuray-db-ref/zynqusp`), the
+/// graph is a `TileconnWireDb` loaded from that root for `part`.
+/// `HELION_TILECONN_PART` optionally names the full part directory
+/// (e.g. `xczu3eg-sbva484-1-e`); without it, the part directory is
+/// resolved from `part` and must match exactly one directory, else
+/// the load fails loud naming the candidates. The 84 MB
+/// `tileconn.json` is never vendored: it is read from the DB root at
+/// runtime (US-01 wiredb lane decision).
+fn load_route_db(
+    tile_json: &str,
+    placed: &helion_ultrascale::UltraPlaced,
+    part: &str,
+) -> Result<RouteDb, String> {
+    let Some(root) = std::env::var("HELION_TILECONN_DB_ROOT")
+        .ok()
+        .filter(|s| !s.is_empty())
+    else {
+        let db = IntTileWireDb::from_placed_slices(tile_json, placed)
+            .map_err(|e| format!("ULTRA ROUTE: {e}"))?;
+        return Ok(RouteDb::Int(Arc::new(db)));
+    };
+    let part_arg = std::env::var("HELION_TILECONN_PART")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| part.to_string());
+    let db = TileconnWireDb::from_placed_slices(
+        tile_json,
+        Path::new(&root),
+        &part_arg,
+        placed,
+    )
+    .map_err(|e| format!("ULTRA ROUTE: tileconn load failed: {e}"))?;
+    Ok(RouteDb::Tileconn(Arc::new(db)))
+}
+
 /// Run `helion impl` for an UltraScale+ part. Prints hang_diag lines and
 /// returns Err naming the first blocking stage. `out_bit` / `out_fasm`
 /// are the bitstream and FASM output paths; when None they default to
@@ -516,26 +608,18 @@ pub fn run_impl(
     println!("{}", timing.hang_diag_line(0));
 
     // ROUTE: build the real INT-tile routing graph for the placed
-    // slices (vendored INT tile JSON) and route on it. The graph is
-    // real DB data; what it does NOT have is the BEL-pin to INT-wire
-    // map (US-01, no public source), so route_ultra fails loud naming
-    // the first pin with no wire. That failure is the named data gap,
-    // not a code gap. The graph is installed into the fabric (the
-    // EmptyWireDb placeholder is gone); the flow keeps its own Arc
-    // handle for the translator's bidirectional-PIP resolver.
+    // slices (vendored INT tile JSON). Without HELION_TILECONN_DB_ROOT
+    // the graph has no BEL-pin to INT-wire map (US-01 data gap), so
+    // route_ultra fails loud naming the first pin with no wire. With
+    // the variable set, the graph is a TileconnWireDb loaded from the
+    // public tileconn DB (US-01 wiredb lane) and the flow keeps its
+    // own handle for the translator's bidirectional-PIP resolver.
     let data_dir = ultrascale_data_dir();
     let tile_json = std::fs::read_to_string(data_dir.join("tile_type_INT.json"))
         .map_err(|e| format!("ULTRA ROUTE: cannot read INT tile JSON: {e}"))?;
-    let wire_db = Arc::new(
-        IntTileWireDb::from_placed_slices(&tile_json, &placed)
-            .map_err(|e| format!("ULTRA ROUTE: {e}"))?,
-    );
-    println!(
-        "hang_diag ultra wiredb tiles={} wires={}",
-        wire_db.tile_count(),
-        wire_db.wire_count()
-    );
-    let fabric_wires: Arc<dyn WireDb> = wire_db.clone();
+    let wire_db = load_route_db(&tile_json, &placed, part)?;
+    println!("hang_diag ultra wiredb {}", wire_db.describe());
+    let fabric_wires: Arc<dyn WireDb> = wire_db.wires();
     let fabric = fabric.with_wire_db(fabric_wires);
     let nets = build_routable_nets(&design, &packed, &placed)?;
     // Route budget has one home: UltraRouteOpts::default() (max_iters
