@@ -8,6 +8,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests import (  # noqa: E402
+    byp_cross_letter_tiles,
     byp_shape_port_ins,
     byp_shape_tiles,
     fixture_ports,
@@ -237,6 +238,80 @@ class TestSliceOutputPin(RouteBase):
                 for v in rep.violations
             ),
             f"violations were {rep.violations}",
+        )
+        self.assertTrue(
+            any("driven only by a PIP" in v for v in rep.violations),
+            f"violations were {rep.violations}",
+        )
+
+
+class TestCrossLetterByp(RouteBase):
+    """Cross-letter BYP (bypleg lane): LUT B drives FF A2 through
+    the fabric (FFMUXA2.BYP) while LUT A drives FF A1 through D6.
+    B_O is a route driver even though the selecting FFMUX belongs
+    to letter A, not B. The flow decides BYP exactly in this case
+    (ultra.rs ffmux_selections: D6 only for same slice same
+    letter)."""
+
+    def test_cross_letter_byp_shape_passes(self):
+        tiles = byp_cross_letter_tiles()
+        rep = check_route_fasm(
+            self.db, tiles, self.fabric, port_ins=byp_shape_port_ins()
+        )
+        self.assertEqual(rep.violations, [], rep.violations)
+        self.assertEqual(rep.pips, 8)
+        self.assertEqual(rep.nets, 6)
+
+    def test_cross_letter_no_init_lut_o_is_not_a_driver(self):
+        # FFMUXA2.BYP present but the B LUT has no INIT: the LUT
+        # is not live, so B_O must not count as a driver and the
+        # BYP leg stays undriven.
+        tiles = byp_cross_letter_tiles()
+        del tiles["SLICE_X1Y0"]["B6LUT.INIT[63:0]"]
+        rep = check_route_fasm(
+            self.db, tiles, self.fabric, port_ins=byp_shape_port_ins()
+        )
+        self.assertTrue(
+            any("LOGIC_OUTS_W12" in v for v in rep.violations),
+            f"violations were {rep.violations}",
+        )
+        self.assertTrue(
+            any("driven only by a PIP" in v for v in rep.violations),
+            f"violations were {rep.violations}",
+        )
+
+    def test_cross_letter_no_byp_lut_o_is_not_a_driver(self):
+        # Both LUTs live, but the only selections are D6: no FFMUX
+        # selects BYP, so no fabric leg is selected and B_O must
+        # not count as a driver. A D6 on another letter selects no
+        # fabric leg. The BYP leg stays undriven.
+        tiles = byp_cross_letter_tiles()
+        feats = tiles["SLICE_X1Y0"]
+        del feats["FFMUXA2.BYP"]
+        feats["FFMUXA2.D6"] = None
+        rep = check_route_fasm(
+            self.db, tiles, self.fabric, port_ins=byp_shape_port_ins()
+        )
+        self.assertTrue(
+            any(
+                "undriven sink" in v and "LOGIC_OUTS_W12" in v
+                for v in rep.violations
+            ),
+            f"violations were {rep.violations}",
+        )
+        self.assertTrue(
+            any("driven only by a PIP" in v for v in rep.violations),
+            f"violations were {rep.violations}",
+        )
+
+    def test_cross_letter_genuinely_undriven_net_still_fails(self):
+        # The BYP leg with its first PIP removed: the remaining
+        # PIPs form a driverless chain, so route must still fail
+        # even though B_O is a driver elsewhere in the slice.
+        tiles = byp_cross_letter_tiles()
+        del tiles["INT_X1Y0"]["PIP.INT_NODE_IMUX_40_INT_OUT1.LOGIC_OUTS_W12"]
+        rep = check_route_fasm(
+            self.db, tiles, self.fabric, port_ins=byp_shape_port_ins()
         )
         self.assertTrue(
             any("driven only by a PIP" in v for v in rep.violations),

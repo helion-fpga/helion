@@ -85,3 +85,43 @@ def byp_shape_tiles():
 def byp_shape_port_ins():
     """Primary inputs for the BYP shape: the clock on CLK1."""
     return {"clk": ("SLICE_X1Y0", "CLK1")}
+
+
+def byp_cross_letter_tiles():
+    """The cross-letter BYP shape (bypleg lane): the byp2 flow
+    design, reduced to the two routed legs. LUT A drives FF A1
+    through D6 (AQ feeds the A LUT input back); LUT B drives FF
+    A2 through the fabric (FFMUXA2.BYP): B_O on LOGIC_OUTS_W12
+    through IMUX_40, BYPASS_W6, INODE_W_9 to BOUNCE_W_0 (the AX
+    pin). B INIT is constant, so B has no LUT-input sink; the A
+    leg keeps the A1 sink driven. Fresh dict on every call so
+    tests can mutate their copy. Route must pass on this shape.
+    """
+    return {
+        "SLICE_X1Y0": {
+            "A6LUT.INIT[63:0]": 0x5555555555555555,
+            "B6LUT.INIT[63:0]": 0xFFFFFFFFFFFFFFFF,
+            "AFF.INIT.V0": None,
+            "AFF.SRVAL.V0": None,
+            "AFF2.INIT.V0": None,
+            "AFF2.SRVAL.V0": None,
+            "ABCDFF.CEUSED.V0": None,
+            "ABCDFF.SRUSED.V0": None,
+            "ABCDFF.CLKINV.V0": None,
+            "ABCDFF.SRINV.V0": None,
+            "ABCDFF2.CEUSED.V0": None,
+            "ABCDFF2.SRUSED.V0": None,
+            "FFMUXA1.D6": None,
+            "FFMUXA2.BYP": None,
+        },
+        "INT_X1Y0": {
+            "PIP.INT_NODE_IMUX_42_INT_OUT1.LOGIC_OUTS_W14": None,
+            "PIP.BYPASS_W5.INT_NODE_IMUX_42_INT_OUT1": None,
+            "PIP.INT_NODE_IMUX_48_INT_OUT0.BYPASS_W5": None,
+            "PIP.IMUX_W10.INT_NODE_IMUX_48_INT_OUT0": None,
+            "PIP.INT_NODE_IMUX_40_INT_OUT1.LOGIC_OUTS_W12": None,
+            "PIP.BYPASS_W6.INT_NODE_IMUX_40_INT_OUT1": None,
+            "PIP.INODE_W_9_FT1.BYPASS_W6": None,
+            "PIP.BOUNCE_W_0_FT1.INODE_W_9_FT1": None,
+        },
+    }

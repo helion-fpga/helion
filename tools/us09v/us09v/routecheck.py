@@ -296,9 +296,20 @@ def _slice_output_pins(feats) -> set[str]:
         # this, a LUT driving the fabric through its O pin (the
         # FFMUX BYP shape: LUT O through the INT to the AX pin)
         # fails as undriven / driven-only-by-PIP.
+        # Cross-letter BYP (bypleg lane): the FFMUX that selects the
+        # fabric leg need not be the LUT's own letter. The flow
+        # selects BYP whenever the driving LUT is in a different
+        # letter than the FF (ultra.rs ffmux_selections: D6 only for
+        # same slice same letter, BYP otherwise), so a live LUT O
+        # is a driver when ANY FFMUX in this slice selects BYP,
+        # even if that FFMUX belongs to another letter. A D6
+        # selection on another letter selects no fabric leg, so it
+        # does not count: only BYP crosses letters. OUTMUX stays
+        # same-letter: an OUTMUX selects its own letter's output.
         if init_value(feats, c) is not None and (
             any(f.startswith(f"FFMUX{c}{num}.") for num in ("1", "2") for f in feats)
             or any(f.startswith(f"OUTMUX{c}.") for f in feats)
+            or any(f.startswith("FFMUX") and f.endswith(".BYP") for f in feats)
         ):
             pins.add(f"{c}_O")
     if any(
