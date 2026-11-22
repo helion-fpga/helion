@@ -4,7 +4,8 @@
 //! `xczu3eg-sbva484`, using only public data: the prjuray-db tilegrid and
 //! segbits DBs under a `db_root` directory (the `zynqusp` tree). It never
 //! invents a feature: every set bit is either owned by a DB feature that
-//! matches the frames, or listed in `DecodeOutput::unexplained`.
+//! matches the frames, listed in `DecodeOutput::unexplained`, or a band
+//! bit explained by the N7 check below.
 //!
 //! # Worker A (packet layer, landed)
 //!
@@ -102,6 +103,30 @@
 //!   feature owns renders no complement defaults, so widening a window
 //!   over a featureless band (H-1 RCLK) invents no lines.
 //!
+//! # H-1 band (N7 port)
+//!
+//! The band (absolute frame bits 1440-1487) is a computed code, not a
+//! feature, so no segbits feature claims it. `decode_frames` checks
+//! every block-0 and block-1 frame's stored band against the masked
+//! MAP-A formula (`band_code::check_stored_band`) with per-frame
+//! LUTRAM masks derived from the decoded features: candidate INIT
+//! positions of present LUT INIT lines, filtered after the window
+//! loop by the tiles carrying a present `{L}LUT.MODE.RAM` line, the
+//! same identifiers (`ram_mode_lut_index`, `lut_init_index`) and the
+//! same filter order as `parse_bitstream`. A frame whose check is
+//! Exact or QResidual has its band bits explained, never listed in
+//! `unexplained`; a Mismatch fails loud with a `BandMismatch` error
+//! naming the FAR, stored and expected band. Block-2+ frames are not
+//! checked: their band bits stay unexplained, as before.
+//!
+//! The mask derivation resolves MODE.RAM per slice tile (each tile
+//! owns its own bit window), and real Vivado frames carry the
+//! MODE.RAM bits at per-slice positions (measured on the P-11/P-13/
+//! P-40 corpus: 4,992 cases, per-slice in every case, shared in
+//! none), so unlike the parse side a column holding a RAM-mode LUT
+//! and a logic-mode LUT of the same letter decodes clean (see
+//! `tests/n7_decode_mixed_column.rs`).
+//!
 //! # Regrouping (no new encoding, only the harness canonical form)
 //!
 //! - LUT INIT: the DB carries per-bit `XLUT.INIT[i]` lines; they are
@@ -133,7 +158,10 @@
 //!
 //! No em dashes anywhere.
 
-use crate::bitgen::{far_decode, far_encode, FRAME_WORDS};
+use crate::band_code::{BAND_HI, BAND_LO, BandCheck, check_stored_band};
+use crate::bitgen::{
+    FRAME_WORDS, far_decode, far_encode, lut_init_index, ram_mode_lut_index, record_lutram_bit,
+};
 use crate::bitloc::BramHalf;
 use crate::bitstream_packets::{Frame, parse_bitstream};
 use crate::segbits::{BitRef, FileSegbitsDb, SegbitsDb};
@@ -163,9 +191,10 @@ pub struct DecodeOutput {
 /// Decode frames into FASM. `db_root` is the prjuray-db `zynqusp`
 /// directory: it must contain `xczu3eg-sbva484-1-e/tilegrid.json` (or a
 /// top-level `tilegrid.json`, accepted for test fixtures) and the
-/// `segbits_*.db` files. Loading failures fail loud with a named cause;
-/// decode itself never fails on input bits: unowned bits are reported
-/// in `unexplained`.
+/// `segbits_*.db` files. Loading failures, a frame with the wrong word
+/// count, and a stored H-1 band that does not match the masked MAP-A
+/// formula fail loud with a named cause; every other unowned bit is
+/// reported in `unexplained`.
 pub fn decode_frames(frames: &[Frame], db_root: &str) -> Result<DecodeOutput, String> {
     let windows = load_tilegrid(db_root)?;
     let db = load_segbits(db_root)?;
@@ -198,6 +227,15 @@ pub fn decode_frames(frames: &[Frame], db_root: &str) -> Result<DecodeOutput, St
 
     let mut claimed: HashSet<u64> = HashSet::new();
     let mut lines: Vec<String> = Vec::new();
+    // Per-tile LUTRAM mask inputs (N7 port): RAM-mode LUT indices
+    // decoded on each tile, and candidate INIT positions (LUT index,
+    // far, absolute bit) from present LUT INIT features. INIT
+    // precedes MODE.RAM in feature order, so candidates are collected
+    // first and filtered by the RAM set after the window loop,
+    // exactly as `parse_bitstream` does. Only present features
+    // contribute; logic-mode INIT bits are never masked.
+    let mut tile_ram_luts: HashMap<String, HashSet<u8>> = HashMap::new();
+    let mut tile_lut_init_bits: HashMap<String, Vec<(u8, u32, u16)>> = HashMap::new();
     for window in &windows {
         let Some(window_units) = units.get(&window.tile_type) else {
             continue;
@@ -298,6 +336,27 @@ pub fn decode_frames(frames: &[Frame], db_root: &str) -> Result<DecodeOutput, St
                 for r in &set_refs {
                     claimed.insert(bit_key(r.0, r.1));
                 }
+                // LUTRAM mask inputs (N7 port): a present MODE.RAM
+                // line marks its LUT RAM-mode on this tile; a present
+                // LUT INIT line contributes its listed positions as
+                // candidates. `must_be_zero` refs are never INIT
+                // positions (the emit side records after the same
+                // skip), and FF INIT/SRVAL never match
+                // `lut_init_index`.
+                if let Some(idx) = ram_mode_lut_index(&unit.feature) {
+                    tile_ram_luts
+                        .entry(window.tile_name.clone())
+                        .or_default()
+                        .insert(idx);
+                }
+                if let Some(idx) = lut_init_index(&unit.feature) {
+                    let entry = tile_lut_init_bits
+                        .entry(window.tile_name.clone())
+                        .or_default();
+                    for r in abs_refs.iter().filter(|r| !r.2) {
+                        entry.push((idx, r.0, r.1 as u16));
+                    }
+                }
                 let tile = fasm_tile_for_window(window, unit)?;
                 if valued {
                     lines.push(format!(
@@ -314,15 +373,63 @@ pub fn decode_frames(frames: &[Frame], db_root: &str) -> Result<DecodeOutput, St
     lines.sort();
     lines.dedup();
 
+    // Per-frame LUTRAM masks (N7 port): keep only the INIT positions
+    // of RAM-mode LUTs, per tile. Built after the window loop because
+    // INIT precedes MODE.RAM in feature order.
+    let mut lutram_masks: HashMap<u32, [bool; crate::bitgen::FRAME_BITS]> = HashMap::new();
+    for (tile, inits) in &tile_lut_init_bits {
+        let Some(ram) = tile_ram_luts.get(tile) else {
+            continue;
+        };
+        for (idx, far, bit) in inits {
+            if ram.contains(idx) {
+                record_lutram_bit(&mut lutram_masks, *far, *bit);
+            }
+        }
+    }
+
     let mut unexplained: Vec<DecodedBit> = Vec::new();
     for far in &sorted_fars {
         let words = frame_map[far];
+        let words_arr: [u32; FRAME_WORDS] = match words.try_into() {
+            Ok(a) => a,
+            Err(_) => {
+                return Err(format!(
+                    "frame FAR 0x{far:08x} has {} words, want {FRAME_WORDS}",
+                    words.len()
+                ));
+            }
+        };
+        // N7 band check: the band (absolute bits 1440-1487) is a
+        // computed code, not a feature. A frame whose stored band
+        // matches the masked MAP-A formula (Exact) or the formula XOR
+        // the Q residual (QResidual) has its band bits explained;
+        // anything else fails loud here, before the unexplained-bits
+        // check, exactly as `parse_bitstream` does. Block-1 frames
+        // expect a zero band, also checked here. Block-2+ frames are
+        // not checked: their band bits stay unexplained, as before.
+        let (block, _, _, _) = far_decode(*far);
+        if block <= 1 {
+            let empty_mask = [false; crate::bitgen::FRAME_BITS];
+            let mask = lutram_masks.get(far).unwrap_or(&empty_mask);
+            if let BandCheck::Mismatch { stored, expected } =
+                check_stored_band(*far, &words_arr, mask)
+            {
+                return Err(format!(
+                    "BandMismatch: FAR 0x{far:08x} has stored band 0x{stored:012x} but the masked MAP-A band is 0x{expected:012x} (a Q frame carries the expected value XOR 0xf0000000000f); the band is a computed code, so a mismatch means the bitstream or the LUTRAM mask derivation is wrong"
+                ));
+            }
+        }
         for (wi, word) in words.iter().enumerate() {
             let mut w = *word;
             while w != 0 {
                 let b = w.trailing_zeros() as u8;
                 let abs_bit = (wi as u32) * 32 + b as u32;
-                if !claimed.contains(&bit_key(*far, abs_bit)) {
+                // Band bits of a checked frame are explained by the N7
+                // check above, never listed. Band bits of a block-2+
+                // frame were not checked and stay unexplained.
+                let is_band = (BAND_LO as u32..=BAND_HI as u32).contains(&abs_bit);
+                if !claimed.contains(&bit_key(*far, abs_bit)) && !(block <= 1 && is_band) {
                     unexplained.push(DecodedBit {
                         far: *far,
                         word: wi,
@@ -986,6 +1093,7 @@ fn format_hex_value(value_bits: &[bool]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::band_code::{BandFormula, Q_RESIDUAL, compute_band, frame_band, write_band};
     use crate::bitgen::{
         cmd, reg, BUS_WIDTH_DETECT, BUS_WIDTH_SYNC, DUMMY_WORD, NOOP_WORD, SYNC_WORD,
     };
@@ -1011,13 +1119,31 @@ mod tests {
         }
     }
 
-    /// One frame with exactly the given absolute bit offsets set.
+    /// One frame with exactly the given absolute bit offsets set,
+    /// carrying the computed H-1 band for those bits (empty LUTRAM
+    /// mask: no fixture DB here carries a RAM-mode LUT, so no INIT
+    /// bit is masked; block-1 frames get a zero band through
+    /// `compute_band`). A fixture frame is a valid bitstream frame,
+    /// and since the N7 port the decoder fails loud on a stored band
+    /// that does not match the masked MAP-A formula. Band bits are
+    /// never inputs to the formula, so stamping after setting the
+    /// content bits is exact.
     fn frame(far: u32, set_bits: &[u32]) -> Frame {
-        let mut words = vec![0u32; FRAME_WORDS];
+        let mut words = [0u32; FRAME_WORDS];
         for bit in set_bits {
             words[(*bit as usize) / 32] |= 1u32 << (bit % 32);
         }
-        Frame { far, words }
+        let band = compute_band(
+            far,
+            &words,
+            &[false; crate::bitgen::FRAME_BITS],
+            BandFormula::MapA,
+        );
+        write_band(&mut words, band);
+        Frame {
+            far,
+            words: words.to_vec(),
+        }
     }
 
     /// One CLEL_L tile: base FAR 0x00000F00, 16 frames, window bits
@@ -1137,6 +1263,50 @@ CLEL_L.SOME.MUX.DEFAULT !13_03\n";
                 word: 0,
                 bit: 5
             }]
+        );
+    }
+
+    /// N7 port: a valid frame (band stamped by `frame()`) with one
+    /// band bit flipped. The stored band no longer matches the masked
+    /// MAP-A formula, so decode must fail loud naming the FAR, not
+    /// list the band bits as unexplained.
+    #[test]
+    fn flipped_band_bit_fails_loud_with_band_mismatch() {
+        let dir = fixture_dir("flipped_band");
+        write_fixture(&dir, CLB_TILEGRID, &[("segbits_clel_l.db", CLB_SEGBITS)]);
+        let mut f = frame(0x0000_0F0C, &[2]);
+        f.words[45] ^= 1;
+        let err = decode_frames(&[f], dir.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("BandMismatch"), "err: {err}");
+        assert!(err.contains("0x00000f0c"), "err: {err}");
+    }
+
+    /// N7 port: stored band = formula XOR the Q residual is a Q
+    /// frame. Decode accepts it and the band bits are explained, not
+    /// listed. The content bits are the known-feature frame, so the
+    /// FASM is the known-feature FASM.
+    #[test]
+    fn q_residual_band_is_accepted_not_unexplained() {
+        let dir = fixture_dir("q_band");
+        write_fixture(&dir, CLB_TILEGRID, &[("segbits_clel_l.db", CLB_SEGBITS)]);
+        let mut f = frame(0x0000_0F0C, &[2]);
+        let mut words: [u32; FRAME_WORDS] = f.words.try_into().unwrap();
+        let stored = frame_band(&words);
+        write_band(&mut words, stored ^ Q_RESIDUAL);
+        f.words = words.to_vec();
+        let out = decode_frames(&[f], dir.to_str().unwrap()).unwrap();
+        assert_eq!(
+            out.fasm,
+            vec![
+                "SLICE_X0Y0.ABCDFF.CEUSED.V0".to_string(),
+                "SLICE_X0Y0.AFF.INIT.V0".to_string(),
+                "SLICE_X0Y0.AFF.SRVAL.V1".to_string(),
+            ]
+        );
+        assert!(
+            out.unexplained.is_empty(),
+            "unexplained: {:?}",
+            out.unexplained
         );
     }
 
@@ -1311,9 +1481,10 @@ BRAM.RAMB36E2.CLKARDCLKINV.V1 04_165 05_91\n";
         words.push(type1_write(reg::CMD, 1));
         words.push(cmd::WCFG);
         words.push(type1_write(reg::FDRI, FRAME_WORDS as u32));
-        let mut frame_words = [0u32; FRAME_WORDS];
-        frame_words[0] = 1 << 2;
-        words.extend(frame_words);
+        // The FDRI frame: AFF.INIT.V0 sets frame bit 2 (word 0 bit
+        // 2). Built through `frame()` so it carries the computed H-1
+        // band, as a valid bitstream frame must since the N7 port.
+        words.extend(frame(0x0000_0F0C, &[2]).words);
         words.push(type1_write(reg::CMD, 1));
         words.push(cmd::DESYNC);
         words.extend([NOOP_WORD; 400]);
