@@ -2,7 +2,7 @@
 
 Date: 2026-11-22. Lane branch fm/ultra-bitgen-ffmux, code tip
 618e2be2 (merge of W-FLOW 78315041 onto W-CHECK 471bd99d onto
-W-CORPUS e3b23142 onto emitter base 15ec6db2). Report commit: 56e13f2c.
+W-CORPUS e3b23142 onto emitter base 15ec6db2). This report is committed on top of the code tip; the lane tip is the report commit itself.
 Worktree ~/workspace/helion-ultra-bitgen-ffmux. No merges into
 fm/ultra-bitstream, fm/zedboard-merge, or master. No em dashes in
 this report (verified by grep). Workstream reports:
