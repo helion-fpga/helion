@@ -95,6 +95,22 @@ python3 -m us09v brute --cells 2 --kind LUT --grid 2x2
   per-slice limits (1 CLK, 1 SR, 2 CE per slice); this checker
   applies the per-half rule from the brief. Flagged to the
   coordinator, not resolved here.
+- A-CLKSPINE: a slice clock pin fed by a leg PIP (CTRL_Wx <-
+  INT_NODE_GLOBAL_y <- GCLK_B_0_z) resolves to the design's clock
+  primary, the port mapped to a CLK1/CLK2 site pin. The GCLK spine
+  is the device clock distribution network, driven by BUFCE_LEAF
+  clock leaves (the spine node stitches to a CLK_LEAF OUT pin);
+  the BUFG/RCLK tree above the leaves is not modelled, so the leg
+  is the asserted connection and the primary is the only clock
+  source the harness has. The rule fires only for the leg shape:
+  every active PIP sourced from the spine node must feed a GLOBAL
+  wire, so a data net routed through a GCLK wire does not resolve,
+  and with no single clock port the spine stays undriven. The
+  flow emits the leg for every slice half with FFs past the
+  clock-entry slice (whose ABCD half is primary-driven). NOT
+  settled by a Vivado clock-tree build: the RCLK/BUFG features
+  the tree would carry have no public segbits, so no decoded
+  Vivado bitstream can confirm the leg spelling yet.
 - FF INIT/SRVAL: the V suffix IS the value (V0 is 0, V1 is 1);
   the segbits bit is NOT the value (V0 sets the bit, V1 clears
   it, bit = NOT(INIT)). Group attributes CEUSED/SRUSED/CLKINV/

@@ -39,7 +39,7 @@ use helion_ultrascale::bitgen::{
 use helion_ultrascale::device_file::{DeviceFile, IntColumnTable, IntfColumnTable};
 use helion_ultrascale::{
     best_seed_line, check_legality, dedup_results, emit_ff_control_fasm, emit_ff_fasm,
-    emit_ffmux_fasm, emit_lut_fasm, escape_json_value, map_source_cell, pack_ultra,
+    emit_ffmux_fasm, emit_lut_fasm, emit_outmux_fasm, escape_json_value, map_source_cell, pack_ultra,
     parse_results_text, place_ultra, route_ultra, seed_range, seeds_to_run, sta_db_for_part,
     sta_routed, summarize_multiseed, translated_to_fasm, ControlSetLimits, FabricWithPlaceholders,
     FileSegbitsDb, FfMuxSel, IntTileWireDb, RouteToPipError, RoutableNet, SeedResult, SourceCell,
@@ -512,6 +512,32 @@ impl RouteDb {
             ),
         }
     }
+
+    /// `(INT tile, INT wire)` for one slice clock pin (`CLK1` ->
+    /// `CTRL_W4`, `CLK2` -> `CTRL_W5`). With tileconn the answer comes
+    /// from the public DB; without it the provisional convention
+    /// applies (INT tile named from the slice coordinates, see
+    /// `IntTileWireDb::from_placed_slices`). `None` when the pin has
+    /// no INT partner.
+    fn clock_int_tile(
+        &self,
+        site: &str,
+        pin: &str,
+        x: i32,
+        y: i32,
+    ) -> Option<(String, String)> {
+        match self {
+            RouteDb::Tileconn(db) => db.tileconn_db().int_tile_for_site(site, pin),
+            RouteDb::Int(_) => {
+                let ctrl = match pin {
+                    "CLK1" => "CTRL_W4",
+                    "CLK2" => "CTRL_W5",
+                    _ => return None,
+                };
+                Some((format!("INT_X{x}Y{y}"), ctrl.to_string()))
+            }
+        }
+    }
 }
 
 /// Build the routing graph for the placed slices. Without
@@ -745,12 +771,29 @@ pub fn run_impl(
     let lut_fasm =
         emit_lut_fasm(&packed.slices, &placed).map_err(|e| format!("ULTRA FASM: {e}"))?;
     println!("hang_diag ultra fasm lut_lines={}", lut_fasm.len());
+    // OUTMUX FASM: live LUT letters with no FF in the letter select
+    // D6 on their OUTMUX, so the route checker counts the letter's
+    // LUT O as a driver of its LOGIC_OUTS leg (see emit_outmux_fasm).
+    let outmux_fasm =
+        emit_outmux_fasm(&packed.slices, &placed).map_err(|e| format!("ULTRA FASM: {e}"))?;
+    println!("hang_diag ultra fasm outmux_lines={}", outmux_fasm.len());
+    // Clock-leg FASM: slices past the clock-entry slice need a leg
+    // from the GCLK spine to their CTRL wire, or their FFs read an
+    // undriven clock (see clock_leg_fasm).
+    let clock_leg_fasm_lines =
+        clock_leg_fasm(&packed, &placed, &wire_db, &translated).map_err(|e| format!("ULTRA FASM: {e}"))?;
+    println!(
+        "hang_diag ultra fasm clock_leg_lines={}",
+        clock_leg_fasm_lines.len()
+    );
     let mut fasm_lines: Vec<String> = Vec::new();
     fasm_lines.extend(lut_fasm);
+    fasm_lines.extend(outmux_fasm);
     fasm_lines.extend(ff_fasm);
     fasm_lines.extend(ffmux_fasm);
     fasm_lines.extend(ff_control_fasm);
     fasm_lines.extend(pip_fasm.lines().map(|l| l.to_string()));
+    fasm_lines.extend(clock_leg_fasm_lines);
     let fasm_text = fasm_lines.join("\n") + "\n";
     let out_bit = out_bit
         .map(|s| s.to_string())
@@ -977,6 +1020,119 @@ fn ffmux_selections(
     sels
 }
 
+/// Clock-leg candidates: (GLOBAL wire, GCLK spine wire) pairs that
+/// can feed a slice CTRL wire. Every GLOBAL wire here is a
+/// `CTRL_W4`/`CTRL_W5` source in the vendored INT tile JSON and is
+/// driven by the named GCLK spine wire (verified by
+/// `clock_leg_candidates_exist_in_int_tile`). The flow picks the
+/// first pair whose GLOBAL wire is not already a route PIP dst in
+/// the slice's INT tile, so a leg never multi-drives a wire the
+/// router already uses.
+const CLOCK_LEG_CANDIDATES: &[(&str, &str)] = &[
+    ("INT_NODE_GLOBAL_14_INT_OUT0", "GCLK_B_0_9"),
+    ("INT_NODE_GLOBAL_10_INT_OUT1", "GCLK_B_0_15"),
+    ("INT_NODE_GLOBAL_8_INT_OUT0", "GCLK_B_0_14"),
+    ("INT_NODE_GLOBAL_3_INT_OUT1", "GCLK_B_0_11"),
+    ("INT_NODE_GLOBAL_5_INT_OUT1", "GCLK_B_0_12"),
+    ("INT_NODE_GLOBAL_1_INT_OUT0", "GCLK_B_0_10"),
+    ("INT_NODE_GLOBAL_6_INT_OUT0", "GCLK_B_0_13"),
+    ("INT_NODE_GLOBAL_0_INT_OUT1", "GCLK_B_0_8"),
+];
+
+/// First clock-leg candidate whose GLOBAL wire is not already used
+/// as a PIP dst in the tile (`used_dsts` holds the dst wire names
+/// the router already programs there). `None` when every candidate
+/// is taken: the caller fails loud rather than multi-driving.
+fn pick_clock_leg(used_dsts: &std::collections::HashSet<&str>) -> Option<(&'static str, &'static str)> {
+    CLOCK_LEG_CANDIDATES
+        .iter()
+        .copied()
+        .find(|(global, _)| !used_dsts.contains(global))
+}
+
+/// Clock-leg FASM for every placed slice with FFs.
+///
+/// A slice's FFs clock on its half's CTRL wire (`CTRL_W4` for the
+/// ABCD half, `CTRL_W5` for EFGH). Only the clock-entry slice's
+/// ABCD half is driven by the design's clock primary (the harness
+/// port map drives `clk` into the first placed slice's `CLK1`); every
+/// other slice half with FFs needs a leg from the clock spine:
+/// `CTRL_Wx.INT_NODE_GLOBAL_y` plus `INT_NODE_GLOBAL_y.GCLK_B_0_z`.
+/// The GCLK spine is the device clock distribution network, driven
+/// by the BUFCE_LEAF clock leaves; the checker models a spine-fed
+/// leg as driven by the design's clock port (assumption A-CLKSPINE
+/// in the us09v README). Without the leg, a second slice's FFs read
+/// an undriven clock in placecheck, routecheck, and extract, and
+/// the design cannot pass verify-bit. EFGH halves need the same leg
+/// on `CLK2` when they hold FFs (the ABCD-first X-pin repair keeps
+/// them empty on the lane designs, but the leg covers them when
+/// they are used).
+///
+/// Fails loud naming the slice and pin when the clock pin has no
+/// INT partner, when the resolved wire is not the expected CTRL
+/// wire, or when no candidate GLOBAL wire is free in the tile.
+fn clock_leg_fasm(
+    packed: &helion_ultrascale::UltraPacked,
+    placed: &helion_ultrascale::UltraPlaced,
+    wire_db: &RouteDb,
+    translated: &[helion_ultrascale::TranslatedRoute],
+) -> Result<Vec<String>, String> {
+    use std::collections::HashSet;
+    let mut used_dsts: HashSet<(String, String)> = HashSet::new();
+    for t in translated {
+        for p in &t.pips {
+            used_dsts.insert((p.tile.clone(), p.dst.clone()));
+        }
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for (idx, p) in placed.slices.iter().enumerate() {
+        let Some(slice) = packed.slices.get(p.packed_idx) else {
+            continue;
+        };
+        let has_abcd = slice.ffs.keys().any(|bel| *bel < 8);
+        let has_efgh = slice.ffs.keys().any(|bel| *bel >= 8);
+        for (half, pin, ctrl) in [
+            (has_abcd, "CLK1", "CTRL_W4"),
+            (has_efgh, "CLK2", "CTRL_W5"),
+        ] {
+            if !half {
+                continue;
+            }
+            // The clock-entry slice is the first placed slice; its
+            // ABCD half is driven by the clock primary, not a leg.
+            if idx == 0 && pin == "CLK1" {
+                continue;
+            }
+            let (tile, wire) = wire_db
+                .clock_int_tile(&p.site, pin, p.x, p.y)
+                .ok_or_else(|| {
+                    format!("ULTRA CLOCK LEG: slice {} pin {pin} has no INT partner", p.site)
+                })?;
+            if wire != ctrl {
+                return Err(format!(
+                    "ULTRA CLOCK LEG: slice {} pin {pin} resolved to {wire}, expected {ctrl}",
+                    p.site
+                ));
+            }
+            let used: HashSet<&str> = used_dsts
+                .iter()
+                .filter(|(t, _)| *t == tile)
+                .map(|(_, d)| d.as_str())
+                .collect();
+            let (global, gclk) = pick_clock_leg(&used).ok_or_else(|| {
+                format!(
+                    "ULTRA CLOCK LEG: no free GLOBAL wire for slice {} pin {pin} in {tile}",
+                    p.site
+                )
+            })?;
+            lines.push(format!("{tile}.PIP.{ctrl}.{global}"));
+            lines.push(format!("{tile}.PIP.{global}.{gclk}"));
+            used_dsts.insert((tile.clone(), global.to_string()));
+        }
+    }
+    Ok(lines)
+}
+
 /// Repair shared-X-pin conflicts after packing.
 ///
 /// Two FFs in one slice letter share the one X pin (`{L}X`), so when
@@ -1124,6 +1280,20 @@ fn repair_ff_xpin_conflicts(
         // driver LUT's letter comes first (the move then selects
         // D6), then A..H in order. A fresh slice is appended when no
         // existing slice has a compatible letter.
+        //
+        // The search runs in two phases: ABCD-half letters first,
+        // EFGH-half letters only after. An FF in the EFGH half needs
+        // its slice's CLK2 driven, and this flow cannot drive CLK2:
+        // clock routing is phase 2, no INT PIP chain connects the
+        // clk primary (CTRL_W4) to CLK2 (CTRL_W5), and the GCLK
+        // spine is undriven in the checker model, so an EFGH FF
+        // fails verify-bit on place even when everything else
+        // routes. Preferring ABCD letters in every slice (including
+        // a second slice's free ABCD letters) over the mover's own
+        // slice's EFGH letters keeps the design clockable on CLK1
+        // alone. EFGH letters stay available as a last resort so a
+        // design that genuinely cannot fit in ABCD halves still
+        // repairs instead of failing loud here.
         let mover_clk = packed.slices[slice_idx]
             .ff_clk
             .get(&mover_bel)
@@ -1146,63 +1316,73 @@ fn repair_ff_xpin_conflicts(
             }
         }
         let mut target: Option<(usize, u8, u8)> = None;
-        'search: for &tslice in &slice_order {
-            let driver_letter: Option<char> = lut_driver
-                .get(&mover_net)
-                .and_then(|lut_cell| lut_place.get(lut_cell))
-                .filter(|(s, _)| *s == tslice)
-                .map(|(_, l)| *l);
-            let mut candidates: Vec<u8> = Vec::new();
-            if let Some(l) = driver_letter {
-                candidates.push(l as u8 - b'A');
-            }
-            for l in 0..8u8 {
-                if !candidates.contains(&l) {
-                    candidates.push(l);
+        // Two phases: ABCD letters (0..4) in every slice, then EFGH
+        // letters (4..8) in every slice. The driver letter leads
+        // within its own phase only.
+        'search: for phase in [0..4u8, 4..8u8] {
+            for &tslice in &slice_order {
+                let driver_letter: Option<char> = lut_driver
+                    .get(&mover_net)
+                    .and_then(|lut_cell| lut_place.get(lut_cell))
+                    .filter(|(s, _)| *s == tslice)
+                    .map(|(_, l)| *l);
+                let mut candidates: Vec<u8> = Vec::new();
+                if let Some(l) = driver_letter {
+                    let li = l as u8 - b'A';
+                    if phase.contains(&li) {
+                        candidates.push(li);
+                    }
                 }
-            }
-            for tletter in candidates {
-                if tslice == slice_idx && tletter == letter {
-                    continue;
+                for l in phase.clone() {
+                    if !candidates.contains(&l) {
+                        candidates.push(l);
+                    }
                 }
-                for tbel in [tletter * 2, tletter * 2 + 1] {
-                    if packed.slices[tslice].ffs.contains_key(&tbel) {
+                for tletter in candidates {
+                    if tslice == slice_idx && tletter == letter {
                         continue;
                     }
-                    // The target slice must accept the FF's control
-                    // set (a cross-slice move can change it).
-                    if !packed.slices[tslice].can_place_ff(
-                        tbel,
-                        &mover_clk,
-                        &mover_ce,
-                        &mover_sr,
-                        &ControlSetLimits::default(),
-                    ) {
-                        continue;
-                    }
-                    // The move selects D6 in the driver letter, so
-                    // it consumes no X pin there and compatibility
-                    // is automatic. Else every resident BYP user of
-                    // the target letter must share the mover's D net.
-                    let becomes_d6 = driver_letter == Some((b'A' + tletter) as char);
-                    if !becomes_d6 {
-                        let mut ok = true;
-                        for rbel in [tletter * 2, tletter * 2 + 1] {
-                            if let Some(rcell) = packed.slices[tslice].ffs.get(&rbel) {
-                                if let Some((FfMuxSel::Byp, Some(rnet))) = ff_info.get(rcell) {
-                                    if *rnet != mover_net {
-                                        ok = false;
-                                        break;
+                    for tbel in [tletter * 2, tletter * 2 + 1] {
+                        if packed.slices[tslice].ffs.contains_key(&tbel) {
+                            continue;
+                        }
+                        // The target slice must accept the FF's control
+                        // set (a cross-slice move can change it).
+                        if !packed.slices[tslice].can_place_ff(
+                            tbel,
+                            &mover_clk,
+                            &mover_ce,
+                            &mover_sr,
+                            &ControlSetLimits::default(),
+                        ) {
+                            continue;
+                        }
+                        // The move selects D6 in the driver letter, so
+                        // it consumes no X pin there and compatibility
+                        // is automatic. Else every resident BYP user of
+                        // the target letter must share the mover's D net.
+                        let becomes_d6 = driver_letter == Some((b'A' + tletter) as char);
+                        if !becomes_d6 {
+                            let mut ok = true;
+                            for rbel in [tletter * 2, tletter * 2 + 1] {
+                                if let Some(rcell) = packed.slices[tslice].ffs.get(&rbel) {
+                                    if let Some((FfMuxSel::Byp, Some(rnet))) =
+                                        ff_info.get(rcell)
+                                    {
+                                        if *rnet != mover_net {
+                                            ok = false;
+                                            break;
+                                        }
                                     }
                                 }
                             }
+                            if !ok {
+                                continue;
+                            }
                         }
-                        if !ok {
-                            continue;
-                        }
+                        target = Some((tslice, tletter, tbel));
+                        break 'search;
                     }
-                    target = Some((tslice, tletter, tbel));
-                    break 'search;
                 }
             }
         }
@@ -2602,5 +2782,137 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
         let err = load_ultra_device("xc7a35t", &data_dir).unwrap_err();
         assert!(err.contains("xc7a35t"), "got {err}");
         assert!(err.contains("has no emitter device yet"), "got {err}");
+    }
+
+    #[test]
+    fn clock_leg_candidates_exist_in_int_tile() {
+        // Every candidate pair must be a real PIP chain in the
+        // vendored INT tile JSON: CTRL_W4/CTRL_W5 <- GLOBAL <- GCLK.
+        // The flow trusts this table at runtime, so the table is
+        // verified here against the same JSON the router uses, via
+        // the wire DB fanout (a PIP src -> dst edge).
+        let json = std::fs::read_to_string(ultrascale_data_dir().join("tile_type_INT.json"))
+            .expect("vendored INT tile JSON");
+        let placed = UltraPlaced {
+            slices: vec![PlacedUltraSlice {
+                packed_idx: 0,
+                site: "SLICE_X0Y0".to_string(),
+                tile: "CLB_X0Y0".to_string(),
+                x: 0,
+                y: 0,
+            }],
+            seed: 0,
+        };
+        let db = IntTileWireDb::from_placed_slices(&json, &placed).unwrap();
+        let has_pip = |src: &str, dst: &str| {
+            let s = db.wire_id("INT_X0Y0", src).expect("src wire");
+            let d = db.wire_id("INT_X0Y0", dst).expect("dst wire");
+            db.fanout(s).contains(&d)
+        };
+        for (global, gclk) in CLOCK_LEG_CANDIDATES {
+            assert!(has_pip(gclk, global), "missing PIP {global}.{gclk}");
+            for ctrl in ["CTRL_W4", "CTRL_W5"] {
+                assert!(has_pip(global, ctrl), "missing PIP {ctrl}.{global}");
+            }
+        }
+    }
+
+    #[test]
+    fn pick_clock_leg_skips_used_global() {
+        let used: HashSet<&str> =
+            ["INT_NODE_GLOBAL_14_INT_OUT0"].into_iter().collect();
+        assert_eq!(
+            pick_clock_leg(&used),
+            Some(("INT_NODE_GLOBAL_10_INT_OUT1", "GCLK_B_0_15"))
+        );
+        let all: HashSet<&str> = CLOCK_LEG_CANDIDATES
+            .iter()
+            .map(|(g, _)| *g)
+            .collect();
+        assert_eq!(pick_clock_leg(&all), None);
+    }
+
+    #[test]
+    fn clock_leg_fasm_legs_non_entry_slices_only() {
+        // Two placed slices, one FF each in the ABCD half, no routes:
+        // only the second slice needs a CLK1 leg; the first is the
+        // clock-entry slice and is driven by the primary.
+        let json = std::fs::read_to_string(ultrascale_data_dir().join("tile_type_INT.json"))
+            .expect("vendored INT tile JSON");
+        let mut s0 = PackedUltraSlice::new("SLICE_X0Y0".to_string(), SliceKind::Logic);
+        s0.ffs.insert(0, "u_ff0".to_string());
+        s0.ff_clk.insert(0, "clk".to_string());
+        let mut s1 = PackedUltraSlice::new("SLICE_X1Y0".to_string(), SliceKind::Logic);
+        s1.ffs.insert(0, "u_ff1".to_string());
+        s1.ff_clk.insert(0, "clk".to_string());
+        let packed = UltraPacked {
+            slices: vec![s0, s1],
+            ..Default::default()
+        };
+        let placed = UltraPlaced {
+            slices: vec![
+                PlacedUltraSlice {
+                    packed_idx: 0,
+                    site: "SLICE_X0Y0".to_string(),
+                    tile: "CLB_X0Y0".to_string(),
+                    x: 0,
+                    y: 0,
+                },
+                PlacedUltraSlice {
+                    packed_idx: 1,
+                    site: "SLICE_X1Y0".to_string(),
+                    tile: "CLB_X1Y0".to_string(),
+                    x: 1,
+                    y: 0,
+                },
+            ],
+            seed: 0,
+        };
+        let db = IntTileWireDb::from_placed_slices(&json, &placed).unwrap();
+        let wire_db = RouteDb::Int(Arc::new(db));
+        let legs = clock_leg_fasm(&packed, &placed, &wire_db, &[]).unwrap();
+        assert_eq!(
+            legs,
+            vec![
+                "INT_X1Y0.PIP.CTRL_W4.INT_NODE_GLOBAL_14_INT_OUT0".to_string(),
+                "INT_X1Y0.PIP.INT_NODE_GLOBAL_14_INT_OUT0.GCLK_B_0_9".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn clock_leg_fasm_legs_efgh_half_of_entry_slice() {
+        // An EFGH FF (bel 8) on the entry slice needs a CLK2 leg even
+        // though the slice is the clock entry: only its ABCD half is
+        // primary-driven.
+        let json = std::fs::read_to_string(ultrascale_data_dir().join("tile_type_INT.json"))
+            .expect("vendored INT tile JSON");
+        let mut s0 = PackedUltraSlice::new("SLICE_X0Y0".to_string(), SliceKind::Logic);
+        s0.ffs.insert(8, "u_ff_e".to_string());
+        s0.ff_clk.insert(8, "clk".to_string());
+        let packed = UltraPacked {
+            slices: vec![s0],
+            ..Default::default()
+        };
+        let placed = UltraPlaced {
+            slices: vec![PlacedUltraSlice {
+                packed_idx: 0,
+                site: "SLICE_X0Y0".to_string(),
+                tile: "CLB_X0Y0".to_string(),
+                x: 0,
+                y: 0,
+            }],
+            seed: 0,
+        };
+        let db = IntTileWireDb::from_placed_slices(&json, &placed).unwrap();
+        let wire_db = RouteDb::Int(Arc::new(db));
+        let legs = clock_leg_fasm(&packed, &placed, &wire_db, &[]).unwrap();
+        assert_eq!(
+            legs,
+            vec![
+                "INT_X0Y0.PIP.CTRL_W5.INT_NODE_GLOBAL_14_INT_OUT0".to_string(),
+                "INT_X0Y0.PIP.INT_NODE_GLOBAL_14_INT_OUT0.GCLK_B_0_9".to_string(),
+            ]
+        );
     }
 }

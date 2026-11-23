@@ -10,7 +10,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tests import FIXTURES, byp_cross_letter_tiles, byp_shape_tiles, fixture_ports, load_db, load_fabric, load_fixture  # noqa: E402
+from tests import FIXTURES, byp_cross_letter_tiles, byp_shape_tiles, clock_leg_tiles, fixture_ports, load_db, load_fabric, load_fixture  # noqa: E402
 from us09v.extract import extract, to_verilog  # noqa: E402
 from us09v.fasmio import parse_fasm_file  # noqa: E402
 
@@ -205,6 +205,35 @@ class TestNegative(ExtractFixtureBase):
         nl = extract(self.db, tiles, port_ins, port_outs)
         self.assertTrue(
             any("has no selection but AMUX is consumed" in e for e in nl.errors),
+            f"errors were {nl.errors}",
+        )
+
+
+class TestClockLeg(ExtractFixtureBase):
+    """Clock-leg shape (spanclk lane, assumption A-CLKSPINE): the
+    second slice's CLK1 resolves through the leg to the clock
+    primary, so its FF clocks on clk; without a clock port the
+    clock is undriven and extraction fails loud."""
+
+    def test_clock_leg_resolves_to_clock_primary(self):
+        tiles = clock_leg_tiles()
+        port_ins = {"clk": ("SLICE_X1Y0", "CLK1")}
+        port_outs = {"led": ("SLICE_X1Y0", "AQ")}
+        nl = extract(self.db, tiles, port_ins, port_outs)
+        self.assertEqual(nl.errors, [], nl.errors)
+        self.assertEqual(nl.clock_sinks, [
+            ("SLICE_X1Y0", "s_SLICE_X1Y0__CLK1"),
+            ("SLICE_X4Y0", "s_SLICE_X1Y0__CLK1"),
+        ])
+        text = to_verilog(nl)
+        self.assertIn("always @(posedge s_SLICE_X1Y0__CLK1", text)
+
+    def test_clock_leg_without_clock_port_fails(self):
+        tiles = clock_leg_tiles()
+        port_outs = {"led": ("SLICE_X1Y0", "AQ")}
+        nl = extract(self.db, tiles, {}, port_outs)
+        self.assertTrue(
+            any("SLICE_X4Y0.CLK1 (clock) is undriven" in e for e in nl.errors),
             f"errors were {nl.errors}",
         )
 
