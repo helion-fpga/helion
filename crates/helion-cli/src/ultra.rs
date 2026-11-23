@@ -41,10 +41,11 @@ use helion_ultrascale::{
     best_seed_line, check_legality, dedup_results, emit_ff_control_fasm, emit_ff_fasm,
     emit_ffmux_fasm, emit_lut_fasm, emit_outmux_fasm, escape_json_value, map_source_cell, pack_ultra,
     parse_results_text, place_ultra, route_ultra, seed_range, seeds_to_run, sta_db_for_part,
-    sta_routed, summarize_multiseed, translated_to_fasm, ControlSetLimits, FabricWithPlaceholders,
-    FileSegbitsDb, FfMuxSel, IntTileWireDb, RouteToPipError, RoutableNet, SeedResult, SourceCell,
-    SourceKind, StaNetlist, TimingReport, TileconnWireDb, TranslatedRoute, UltraPlaceOpts,
-    UltraRouteOpts, UltraScaleDevice, UltraScaleFabric, WireDb,
+    sta_routed, summarize_multiseed, translated_to_fasm, BitRef, ControlSetLimits,
+    FabricWithPlaceholders, FileSegbitsDb, FfMuxSel, IntTileWireDb, RouteToPipError,
+    RoutableNet, SeedResult, SegbitsDb, SourceCell, SourceKind, StaNetlist, TimingReport,
+    TileconnWireDb, TranslatedRoute, UltraPlaceOpts, UltraRouteOpts, UltraScaleDevice,
+    UltraScaleFabric, WireDb,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -495,6 +496,40 @@ impl RouteDb {
         }
     }
 
+    /// Remove forbidden PIP edges from the routing graph, before any
+    /// route runs on it. The graph is still uniquely owned here
+    /// (the flow calls this before handing the `Arc` to the fabric),
+    /// so `Arc::get_mut` succeeds; a shared graph fails loud instead
+    /// of silently routing on with the conflict in place. Each PIP
+    /// must name a real edge: a forbidden PIP the graph never had
+    /// means the segbits table and the tile JSON disagree.
+    fn forbid_pips(&mut self, pips: &[(String, String, String)]) -> Result<(), String> {
+        for (tile, src, dst) in pips {
+            let removed = match self {
+                RouteDb::Int(db) => Arc::get_mut(db).map(|db| db.forbid_pip(tile, src, dst)),
+                RouteDb::Tileconn(db) => {
+                    Arc::get_mut(db).map(|db| db.forbid_pip(tile, src, dst))
+                }
+            };
+            match removed {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(format!(
+                        "ULTRA ROUTE: cannot forbid PIP {tile}.PIP.{dst}.{src}: \
+                         no such edge in the routing graph"
+                    ));
+                }
+                None => {
+                    return Err(
+                        "ULTRA ROUTE: cannot forbid PIPs: the routing graph is already shared"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn describe(&self) -> String {
         match self {
             RouteDb::Int(db) => format!(
@@ -711,8 +746,21 @@ pub fn run_impl(
     let data_dir = ultrascale_data_dir();
     let tile_json = std::fs::read_to_string(data_dir.join("tile_type_INT.json"))
         .map_err(|e| format!("ULTRA ROUTE: cannot read INT tile JSON: {e}"))?;
-    let wire_db = load_route_db(&tile_json, &placed, part)?;
+    let mut wire_db = load_route_db(&tile_json, &placed, part)?;
     println!("hang_diag ultra wiredb {}", wire_db.describe());
+    // Clock-leg avoidance (N46): the tiles that will carry a clock
+    // leg are known from placement, and the vendored segbits DB
+    // proves which routed PIPs can never share such a tile (they
+    // disagree with every leg candidate for the tile's CTRL wire).
+    // Those PIP edges leave the routing graph before the router
+    // runs, so the leg the flow emits later cannot fail at bitgen.
+    let segbits = load_ultra_segbits(&data_dir)?;
+    let leg_targets = clock_leg_targets(&packed, &placed, &wire_db)?;
+    let forbidden = clock_leg_forbidden_pips(&segbits, &leg_targets)?;
+    for (tile, src, dst) in &forbidden {
+        println!("hang_diag ultra clock_leg_forbidden {tile}.PIP.{dst}.{src}");
+    }
+    wire_db.forbid_pips(&forbidden)?;
     let fabric_wires: Arc<dyn WireDb> = wire_db.wires();
     let fabric = fabric.with_wire_db(fabric_wires);
     let nets = build_routable_nets(&design, &packed, &placed)?;
@@ -781,7 +829,8 @@ pub fn run_impl(
     // from the GCLK spine to their CTRL wire, or their FFs read an
     // undriven clock (see clock_leg_fasm).
     let clock_leg_fasm_lines =
-        clock_leg_fasm(&packed, &placed, &wire_db, &translated).map_err(|e| format!("ULTRA FASM: {e}"))?;
+        clock_leg_fasm(&packed, &placed, &wire_db, &translated, Some(&segbits))
+            .map_err(|e| format!("ULTRA FASM: {e}"))?;
     println!(
         "hang_diag ultra fasm clock_leg_lines={}",
         clock_leg_fasm_lines.len()
@@ -794,6 +843,10 @@ pub fn run_impl(
     fasm_lines.extend(ff_control_fasm);
     fasm_lines.extend(pip_fasm.lines().map(|l| l.to_string()));
     fasm_lines.extend(clock_leg_fasm_lines);
+    // FASM bit-consistency net (N46): two INT PIPs that disagree on
+    // a configuration bit fail here naming both features, instead of
+    // surfacing as a bare bit read at bitgen.
+    check_fasm_int_pip_bits(&fasm_lines, &segbits)?;
     let fasm_text = fasm_lines.join("\n") + "\n";
     let out_bit = out_bit
         .map(|s| s.to_string())
@@ -1050,41 +1103,33 @@ fn pick_clock_leg(used_dsts: &std::collections::HashSet<&str>) -> Option<(&'stat
         .find(|(global, _)| !used_dsts.contains(global))
 }
 
-/// Clock-leg FASM for every placed slice with FFs.
-///
-/// A slice's FFs clock on its half's CTRL wire (`CTRL_W4` for the
-/// ABCD half, `CTRL_W5` for EFGH). Only the clock-entry slice's
+/// One slice half that needs a clock leg: the slice site and clock
+/// pin, the INT tile carrying the pin, and the CTRL wire the leg
+/// must drive (`CTRL_W4` for CLK1, `CTRL_W5` for CLK2).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClockLegTarget {
+    site: String,
+    pin: &'static str,
+    tile: String,
+    ctrl: &'static str,
+}
+
+/// Slice halves that need a clock leg, in placed order. A slice's
+/// FFs clock on its half's CTRL wire; only the clock-entry slice's
 /// ABCD half is driven by the design's clock primary (the harness
-/// port map drives `clk` into the first placed slice's `CLK1`); every
-/// other slice half with FFs needs a leg from the clock spine:
-/// `CTRL_Wx.INT_NODE_GLOBAL_y` plus `INT_NODE_GLOBAL_y.GCLK_B_0_z`.
-/// The GCLK spine is the device clock distribution network, driven
-/// by the BUFCE_LEAF clock leaves; the checker models a spine-fed
-/// leg as driven by the design's clock port (assumption A-CLKSPINE
-/// in the us09v README). Without the leg, a second slice's FFs read
-/// an undriven clock in placecheck, routecheck, and extract, and
-/// the design cannot pass verify-bit. EFGH halves need the same leg
-/// on `CLK2` when they hold FFs (the ABCD-first X-pin repair keeps
-/// them empty on the lane designs, but the leg covers them when
-/// they are used).
-///
+/// port map drives `clk` into the first placed slice's `CLK1`),
+/// every other half with FFs needs a leg. Shared with the router
+/// avoidance (`clock_leg_forbidden_pips`): the tiles that will carry
+/// a leg are computable before routing, from placement alone.
 /// Fails loud naming the slice and pin when the clock pin has no
-/// INT partner, when the resolved wire is not the expected CTRL
-/// wire, or when no candidate GLOBAL wire is free in the tile.
-fn clock_leg_fasm(
+/// INT partner, or when the resolved wire is not the expected CTRL
+/// wire (N47: east slices resolve to CTRL_E4/E5).
+fn clock_leg_targets(
     packed: &helion_ultrascale::UltraPacked,
     placed: &helion_ultrascale::UltraPlaced,
     wire_db: &RouteDb,
-    translated: &[helion_ultrascale::TranslatedRoute],
-) -> Result<Vec<String>, String> {
-    use std::collections::HashSet;
-    let mut used_dsts: HashSet<(String, String)> = HashSet::new();
-    for t in translated {
-        for p in &t.pips {
-            used_dsts.insert((p.tile.clone(), p.dst.clone()));
-        }
-    }
-    let mut lines: Vec<String> = Vec::new();
+) -> Result<Vec<ClockLegTarget>, String> {
+    let mut targets = Vec::new();
     for (idx, p) in placed.slices.iter().enumerate() {
         let Some(slice) = packed.slices.get(p.packed_idx) else {
             continue;
@@ -1114,21 +1159,297 @@ fn clock_leg_fasm(
                     p.site
                 ));
             }
-            let used: HashSet<&str> = used_dsts
-                .iter()
-                .filter(|(t, _)| *t == tile)
-                .map(|(_, d)| d.as_str())
-                .collect();
-            let (global, gclk) = pick_clock_leg(&used).ok_or_else(|| {
-                format!(
-                    "ULTRA CLOCK LEG: no free GLOBAL wire for slice {} pin {pin} in {tile}",
-                    p.site
-                )
-            })?;
-            lines.push(format!("{tile}.PIP.{ctrl}.{global}"));
-            lines.push(format!("{tile}.PIP.{global}.{gclk}"));
-            used_dsts.insert((tile.clone(), global.to_string()));
+            targets.push(ClockLegTarget {
+                site: p.site.clone(),
+                pin,
+                tile,
+                ctrl,
+            });
         }
+    }
+    Ok(targets)
+}
+
+/// (Set bits, clear bits) of one segbits feature, as (frame, bit)
+/// pairs. A feature disagrees with another when one requires a bit
+/// set the other requires clear.
+fn segbits_sets_and_clears(bits: &[BitRef]) -> (HashSet<(u32, u16)>, HashSet<(u32, u16)>) {
+    let mut set = HashSet::new();
+    let mut clear = HashSet::new();
+    for b in bits {
+        if b.must_be_zero {
+            clear.insert((b.frame, b.bit));
+        } else {
+            set.insert((b.frame, b.bit));
+        }
+    }
+    (set, clear)
+}
+
+/// True when two segbits features disagree on a configuration bit.
+/// Two features that disagree can never appear together in one
+/// tile's FASM: the emitter fails the second one at bitgen with a
+/// bare bit read.
+fn segbits_disagree(a: &[BitRef], b: &[BitRef]) -> bool {
+    let (a_set, a_clear) = segbits_sets_and_clears(a);
+    let (b_set, b_clear) = segbits_sets_and_clears(b);
+    !a_set.is_disjoint(&b_clear) || !b_set.is_disjoint(&a_clear)
+}
+
+/// INT PIPs the router must not use on a clock-leg tile, as
+/// (tile, src, dst) triples: any INT PIP whose segbits disagree
+/// with EVERY candidate leg for that tile's CTRL wire. A leg is two
+/// PIPs (`CTRL_Wx.INT_NODE_GLOBAL_y` plus
+/// `INT_NODE_GLOBAL_y.GCLK_B_0_z`); a routed PIP conflicts with a
+/// candidate when it disagrees with either one. Verified against
+/// the vendored segbits DB, this yields exactly one PIP for CTRL_W5
+/// (`INT_NODE_SDQ_80_INT_OUT1.LOGIC_OUTS_W22`, which sets bit
+/// 21_35 while every CTRL_W5 leg requires it clear) and none for
+/// CTRL_W4: the CLK2 leg cannot coexist on a tile where the router
+/// uses that PIP, and no GLOBAL choice avoids it, so the fix is in
+/// what routes on the tile, not which GLOBAL is picked. A leg
+/// feature missing from the DB fails loud: without its bits the
+/// flow cannot prove any routing compatible with the leg.
+/// PIPs that conflict with only some candidates are left to the
+/// leg picker (`clock_leg_candidate_compatible`), which skips the
+/// conflicting candidates; GLOBAL-reuse conflicts are left to the
+/// used-dst check in `pick_clock_leg`.
+fn clock_leg_forbidden_pips(
+    segbits: &dyn SegbitsDb,
+    targets: &[ClockLegTarget],
+) -> Result<Vec<(String, String, String)>, String> {
+    let mut pairs: BTreeSet<(&str, &str)> = BTreeSet::new();
+    for t in targets {
+        pairs.insert((t.tile.as_str(), t.ctrl));
+    }
+    let mut out: BTreeSet<(String, String, String)> = BTreeSet::new();
+    for (tile, ctrl) in pairs {
+        let mut legs: Vec<(Vec<BitRef>, Vec<BitRef>)> = Vec::new();
+        for (global, gclk) in CLOCK_LEG_CANDIDATES {
+            let leg1 = segbits
+                .lookup("INT", &format!("PIP.{ctrl}.{global}"))
+                .ok_or_else(|| {
+                    format!(
+                        "ULTRA CLOCK LEG: no segbits entry for leg PIP.{ctrl}.{global}; \
+                         cannot prove the leg compatible with routing on {tile}"
+                    )
+                })?;
+            let leg2 = segbits
+                .lookup("INT", &format!("PIP.{global}.{gclk}"))
+                .ok_or_else(|| {
+                    format!(
+                        "ULTRA CLOCK LEG: no segbits entry for leg PIP.{global}.{gclk}; \
+                         cannot prove the leg compatible with routing on {tile}"
+                    )
+                })?;
+            legs.push((leg1.to_vec(), leg2.to_vec()));
+        }
+        for feature in segbits.features("INT") {
+            let Some(pip) = feature.strip_prefix("PIP.") else {
+                continue;
+            };
+            let Some((dst, src)) = pip.split_once('.') else {
+                continue;
+            };
+            let Some(bits) = segbits.lookup("INT", feature) else {
+                continue;
+            };
+            let conflicts_all = legs
+                .iter()
+                .all(|(l1, l2)| segbits_disagree(bits, l1) || segbits_disagree(bits, l2));
+            if conflicts_all {
+                out.insert((tile.to_string(), src.to_string(), dst.to_string()));
+            }
+        }
+    }
+    Ok(out.into_iter().collect())
+}
+
+/// True when one clock-leg candidate is segbits-compatible with
+/// every PIP already programmed on the tile (`programmed` holds
+/// feature names `PIP.{dst}.{src}`: the routed PIPs there, plus
+/// any leg PIPs already emitted there). A PIP the DB does not know
+/// is skipped: bitgen owns the unknown-feature verdict. A leg
+/// feature missing from the DB fails loud instead of guessing.
+fn clock_leg_candidate_compatible(
+    ctrl: &str,
+    global: &str,
+    gclk: &str,
+    programmed: &[String],
+    segbits: &dyn SegbitsDb,
+) -> Result<bool, String> {
+    let leg1 = segbits
+        .lookup("INT", &format!("PIP.{ctrl}.{global}"))
+        .ok_or_else(|| {
+            format!("ULTRA CLOCK LEG: no segbits entry for leg PIP.{ctrl}.{global}")
+        })?;
+    let leg2 = segbits
+        .lookup("INT", &format!("PIP.{global}.{gclk}"))
+        .ok_or_else(|| {
+            format!("ULTRA CLOCK LEG: no segbits entry for leg PIP.{global}.{gclk}")
+        })?;
+    for feature in programmed {
+        let Some(bits) = segbits.lookup("INT", feature) else {
+            continue;
+        };
+        if segbits_disagree(bits, leg1) || segbits_disagree(bits, leg2) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Fail loud when two INT PIP features in the assembled FASM
+/// disagree on a configuration bit in the same tile: one requires
+/// the bit set, the other requires it clear. Names both features
+/// and the bit, so the conflict is diagnosable at FASM time instead
+/// of surfacing as a bare bit read at bitgen. PIPs the DB does not
+/// know are skipped: bitgen owns the unknown-feature verdict.
+/// Other tile types (SLICE, OUTMUX, ...) live in other segbits DBs
+/// and other FARs, so only INT PIPs are checked here.
+fn check_fasm_int_pip_bits(
+    fasm_lines: &[String],
+    segbits: &dyn SegbitsDb,
+) -> Result<(), String> {
+    // (tile, bit) -> (feature, must_be_zero) first seen.
+    let mut seen: HashMap<(String, (u32, u16)), (String, bool)> = HashMap::new();
+    for line in fasm_lines {
+        let mut parts = line.split('.');
+        let (Some(tile), Some(pip), Some(dst), Some(src), None) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            continue;
+        };
+        if pip != "PIP" {
+            continue;
+        }
+        let feature = format!("PIP.{dst}.{src}");
+        let Some(bits) = segbits.lookup("INT", &feature) else {
+            continue;
+        };
+        for b in bits {
+            let key = (tile.to_string(), (b.frame, b.bit));
+            if let Some((other, other_zero)) = seen.get(&key) {
+                if *other_zero != b.must_be_zero {
+                    return Err(format!(
+                        "ULTRA FASM: INT PIP conflict on {tile}: {feature} and {other} \
+                         disagree on bit {}_{:02} (one requires it set, the other clear)",
+                        b.frame, b.bit
+                    ));
+                }
+            } else {
+                seen.insert(key, (feature.clone(), b.must_be_zero));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Clock-leg FASM for every placed slice with FFs.
+///
+/// A slice's FFs clock on its half's CTRL wire (`CTRL_W4` for the
+/// ABCD half, `CTRL_W5` for EFGH). Only the clock-entry slice's
+/// ABCD half is driven by the design's clock primary (the harness
+/// port map drives `clk` into the first placed slice's `CLK1`); every
+/// other slice half with FFs needs a leg from the clock spine:
+/// `CTRL_Wx.INT_NODE_GLOBAL_y` plus `INT_NODE_GLOBAL_y.GCLK_B_0_z`.
+/// The GCLK spine is the device clock distribution network, driven
+/// by the BUFCE_LEAF clock leaves; the checker models a spine-fed
+/// leg as driven by the design's clock port (assumption A-CLKSPINE
+/// in the us09v README). Without the leg, a second slice's FFs read
+/// an undriven clock in placecheck, routecheck, and extract, and
+/// the design cannot pass verify-bit. EFGH halves need the same leg
+/// on `CLK2` when they hold FFs (the ABCD-first X-pin repair keeps
+/// them empty on the lane designs, but the leg covers them when
+/// they are used).
+///
+/// `segbits` makes the pick compatibility-aware: with it, the first
+/// candidate is the first whose GLOBAL is unused AND whose two leg
+/// PIPs disagree with no PIP already programmed on the tile. With
+/// `None` the pick is the old first-unused-GLOBAL rule (unit tests
+/// without a DB). The router avoidance
+/// (`clock_leg_forbidden_pips`) already keeps PIPs that conflict
+/// with every candidate off leg tiles; this pick covers the rest
+/// (a PIP conflicting with only some candidates).
+///
+/// Fails loud naming the slice and pin when the clock pin has no
+/// INT partner, when the resolved wire is not the expected CTRL
+/// wire, or when no candidate GLOBAL wire is free in the tile.
+fn clock_leg_fasm(
+    packed: &helion_ultrascale::UltraPacked,
+    placed: &helion_ultrascale::UltraPlaced,
+    wire_db: &RouteDb,
+    translated: &[helion_ultrascale::TranslatedRoute],
+    segbits: Option<&dyn SegbitsDb>,
+) -> Result<Vec<String>, String> {
+    use std::collections::HashSet;
+    let targets = clock_leg_targets(packed, placed, wire_db)?;
+    let mut used_dsts: HashSet<(String, String)> = HashSet::new();
+    for t in translated {
+        for p in &t.pips {
+            used_dsts.insert((p.tile.clone(), p.dst.clone()));
+        }
+    }
+    // Routed PIP features per tile, for the compatibility check.
+    let mut routed: HashMap<String, Vec<String>> = HashMap::new();
+    for t in translated {
+        for p in &t.pips {
+            routed
+                .entry(p.tile.clone())
+                .or_default()
+                .push(format!("PIP.{}.{}", p.dst, p.src));
+        }
+    }
+    // Leg PIPs already emitted per tile: two legs on one tile must
+    // be compatible with each other too.
+    let mut emitted: HashMap<String, Vec<String>> = HashMap::new();
+    let mut lines: Vec<String> = Vec::new();
+    for t in &targets {
+        let used: HashSet<&str> = used_dsts
+            .iter()
+            .filter(|(tile, _)| *tile == t.tile)
+            .map(|(_, d)| d.as_str())
+            .collect();
+        let mut programmed: Vec<String> = routed.get(&t.tile).cloned().unwrap_or_default();
+        programmed.extend(emitted.get(&t.tile).cloned().unwrap_or_default());
+        let picked: Option<(&'static str, &'static str)> = if segbits.is_none() {
+            pick_clock_leg(&used)
+        } else {
+            let db = segbits.unwrap();
+            let mut found = None;
+            for (global, gclk) in CLOCK_LEG_CANDIDATES {
+                if used.contains(global) {
+                    continue;
+                }
+                if !clock_leg_candidate_compatible(t.ctrl, global, gclk, &programmed, db)? {
+                    continue;
+                }
+                found = Some((*global, *gclk));
+                break;
+            }
+            found
+        };
+        let (global, gclk) = picked.ok_or_else(|| {
+            format!(
+                "ULTRA CLOCK LEG: no free GLOBAL wire for slice {} pin {} in {}",
+                t.site, t.pin, t.tile
+            )
+        })?;
+        lines.push(format!("{}.PIP.{}.{}", t.tile, t.ctrl, global));
+        lines.push(format!("{}.PIP.{}.{}", t.tile, global, gclk));
+        used_dsts.insert((t.tile.clone(), global.to_string()));
+        emitted
+            .entry(t.tile.clone())
+            .or_default()
+            .push(format!("PIP.{}.{}", t.ctrl, global));
+        emitted
+            .entry(t.tile.clone())
+            .or_default()
+            .push(format!("PIP.{}.{}", global, gclk));
     }
     Ok(lines)
 }
@@ -1939,7 +2260,9 @@ pub fn run_multiseed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helion_ultrascale::{PackedUltraSlice, PlacedUltraSlice, SliceKind, UltraPacked, UltraPlaced};
+    use helion_ultrascale::{
+        IntPip, PackedUltraSlice, PlacedUltraSlice, SliceKind, UltraPacked, UltraPlaced,
+    };
 
     fn one_slice_design() -> (Design, UltraPacked, UltraPlaced) {
         // One LUT plus one FF in SLICE_X0Y0, with an IOB output and a
@@ -2870,7 +3193,7 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
         };
         let db = IntTileWireDb::from_placed_slices(&json, &placed).unwrap();
         let wire_db = RouteDb::Int(Arc::new(db));
-        let legs = clock_leg_fasm(&packed, &placed, &wire_db, &[]).unwrap();
+        let legs = clock_leg_fasm(&packed, &placed, &wire_db, &[], None).unwrap();
         assert_eq!(
             legs,
             vec![
@@ -2906,7 +3229,7 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
         };
         let db = IntTileWireDb::from_placed_slices(&json, &placed).unwrap();
         let wire_db = RouteDb::Int(Arc::new(db));
-        let legs = clock_leg_fasm(&packed, &placed, &wire_db, &[]).unwrap();
+        let legs = clock_leg_fasm(&packed, &placed, &wire_db, &[], None).unwrap();
         assert_eq!(
             legs,
             vec![
@@ -2914,5 +3237,235 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
                 "INT_X0Y0.PIP.INT_NODE_GLOBAL_14_INT_OUT0.GCLK_B_0_9".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn clock_leg_targets_cover_efgh_half_of_entry_slice() {
+        // Same fixture as clock_leg_fasm_legs_efgh_half_of_entry_slice:
+        // the target is the entry slice's CLK2 leg, not its CLK1.
+        let json = std::fs::read_to_string(ultrascale_data_dir().join("tile_type_INT.json"))
+            .expect("vendored INT tile JSON");
+        let mut s0 = PackedUltraSlice::new("SLICE_X0Y0".to_string(), SliceKind::Logic);
+        s0.ffs.insert(8, "u_ff_e".to_string());
+        s0.ff_clk.insert(8, "clk".to_string());
+        let packed = UltraPacked {
+            slices: vec![s0],
+            ..Default::default()
+        };
+        let placed = UltraPlaced {
+            slices: vec![PlacedUltraSlice {
+                packed_idx: 0,
+                site: "SLICE_X0Y0".to_string(),
+                tile: "CLB_X0Y0".to_string(),
+                x: 0,
+                y: 0,
+            }],
+            seed: 0,
+        };
+        let db = IntTileWireDb::from_placed_slices(&json, &placed).unwrap();
+        let wire_db = RouteDb::Int(Arc::new(db));
+        assert_eq!(
+            clock_leg_targets(&packed, &placed, &wire_db).unwrap(),
+            vec![ClockLegTarget {
+                site: "SLICE_X0Y0".to_string(),
+                pin: "CLK2",
+                tile: "INT_X0Y0".to_string(),
+                ctrl: "CTRL_W5",
+            }]
+        );
+    }
+
+    #[test]
+    fn clock_leg_forbidden_pips_find_sdq80_and_vcc_conflicts() {
+        // Against the real vendored segbits DB, the forbidden set
+        // for the two leg tiles is exactly three PIPs: the N46
+        // routed PIP (SDQ_80 OUT1 sets 21_35; every CTRL_W5 leg
+        // requires it clear), plus one VCC_WIRE PIP per leg tile.
+        // Each VCC_WIRE PIP requires clear every mux bit its
+        // CTRL wire's legs set, so it conflicts with all 8
+        // candidates on that tile. Neither VCC_WIRE PIP is ever
+        // routed in practice (0 lines in any FASM); forbidding
+        // them is defensive. The CLK1 tile has no routed-PIP
+        // conflict: only its VCC_WIRE PIP is forbidden there.
+        let segbits = load_ultra_segbits(&ultrascale_data_dir()).expect("vendored segbits DBs");
+        let clk2 = ClockLegTarget {
+            site: "SLICE_X1Y0".to_string(),
+            pin: "CLK2",
+            tile: "INT_X1Y0".to_string(),
+            ctrl: "CTRL_W5",
+        };
+        let clk1 = ClockLegTarget {
+            site: "SLICE_X4Y0".to_string(),
+            pin: "CLK1",
+            tile: "INT_X3Y0".to_string(),
+            ctrl: "CTRL_W4",
+        };
+        assert_eq!(
+            clock_leg_forbidden_pips(&segbits, &[clk2.clone(), clk1.clone()]).unwrap(),
+            vec![
+                (
+                    "INT_X1Y0".to_string(),
+                    "LOGIC_OUTS_W22".to_string(),
+                    "INT_NODE_SDQ_80_INT_OUT1".to_string(),
+                ),
+                (
+                    "INT_X1Y0".to_string(),
+                    "VCC_WIRE".to_string(),
+                    "CTRL_W5".to_string(),
+                ),
+                (
+                    "INT_X3Y0".to_string(),
+                    "VCC_WIRE".to_string(),
+                    "CTRL_W4".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(
+            clock_leg_forbidden_pips(&segbits, &[clk1]).unwrap(),
+            vec![(
+                "INT_X3Y0".to_string(),
+                "VCC_WIRE".to_string(),
+                "CTRL_W4".to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn clock_leg_forbidden_pips_missing_leg_fails_loud() {
+        // A DB without the leg entries cannot prove any routing
+        // compatible: fail loud instead of forbidding nothing.
+        let db = FileSegbitsDb::from_text(
+            "INT.PIP.INT_NODE_SDQ_80_INT_OUT1.LOGIC_OUTS_W22 21_35\n",
+            "missing-leg fixture",
+        )
+        .unwrap();
+        let err = clock_leg_forbidden_pips(
+            &db,
+            &[ClockLegTarget {
+                site: "SLICE_X1Y0".to_string(),
+                pin: "CLK2",
+                tile: "INT_X1Y0".to_string(),
+                ctrl: "CTRL_W5",
+            }],
+        )
+        .unwrap_err();
+        assert!(err.contains("no segbits entry"), "got {err}");
+        assert!(err.contains("CTRL_W5"), "got {err}");
+    }
+
+    #[test]
+    fn clock_leg_pick_skips_segbits_conflicting_global() {
+        // Fixture DB: candidate 1 (GLOBAL_14) sets bit 46_31, and a
+        // routed PIP on the tile requires it clear, so the pick must
+        // fall through to candidate 2 (GLOBAL_10). Without segbits
+        // the same flow picks candidate 1.
+        let db = FileSegbitsDb::from_text(
+            "INT.PIP.CTRL_W5.INT_NODE_GLOBAL_14_INT_OUT0 !21_35 46_31\n\
+             INT.PIP.INT_NODE_GLOBAL_14_INT_OUT0.GCLK_B_0_9 40_09\n\
+             INT.PIP.CTRL_W5.INT_NODE_GLOBAL_10_INT_OUT1 !21_35 47_33\n\
+             INT.PIP.INT_NODE_GLOBAL_10_INT_OUT1.GCLK_B_0_15 38_47\n\
+             INT.PIP.INT_NODE_IMUX_51_INT_OUT0.LOGIC_OUTS_W22 !46_31\n",
+            "leg-pick fixture",
+        )
+        .unwrap();
+        let json = std::fs::read_to_string(ultrascale_data_dir().join("tile_type_INT.json"))
+            .expect("vendored INT tile JSON");
+        let mut s0 = PackedUltraSlice::new("SLICE_X0Y0".to_string(), SliceKind::Logic);
+        s0.ffs.insert(8, "u_ff_e".to_string());
+        s0.ff_clk.insert(8, "clk".to_string());
+        let packed = UltraPacked {
+            slices: vec![s0],
+            ..Default::default()
+        };
+        let placed = UltraPlaced {
+            slices: vec![PlacedUltraSlice {
+                packed_idx: 0,
+                site: "SLICE_X0Y0".to_string(),
+                tile: "CLB_X0Y0".to_string(),
+                x: 0,
+                y: 0,
+            }],
+            seed: 0,
+        };
+        let db_graph = IntTileWireDb::from_placed_slices(&json, &placed).unwrap();
+        let wire_db = RouteDb::Int(Arc::new(db_graph));
+        let translated = vec![TranslatedRoute {
+            pips: vec![IntPip::new(
+                "INT_X0Y0",
+                "LOGIC_OUTS_W22",
+                "INT_NODE_IMUX_51_INT_OUT0",
+            )],
+            continuations: 0,
+        }];
+        let legs = clock_leg_fasm(&packed, &placed, &wire_db, &translated, Some(&db)).unwrap();
+        assert_eq!(
+            legs,
+            vec![
+                "INT_X0Y0.PIP.CTRL_W5.INT_NODE_GLOBAL_10_INT_OUT1".to_string(),
+                "INT_X0Y0.PIP.INT_NODE_GLOBAL_10_INT_OUT1.GCLK_B_0_15".to_string(),
+            ]
+        );
+        let legs_no_db = clock_leg_fasm(&packed, &placed, &wire_db, &translated, None).unwrap();
+        assert_eq!(
+            legs_no_db,
+            vec![
+                "INT_X0Y0.PIP.CTRL_W5.INT_NODE_GLOBAL_14_INT_OUT0".to_string(),
+                "INT_X0Y0.PIP.INT_NODE_GLOBAL_14_INT_OUT0.GCLK_B_0_9".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn check_fasm_int_pip_bits_names_both_features() {
+        let db = FileSegbitsDb::from_text(
+            "INT.PIP.CTRL_W5.INT_NODE_GLOBAL_10_INT_OUT1 !21_35 46_31\n\
+             INT.PIP.INT_NODE_SDQ_80_INT_OUT1.LOGIC_OUTS_W22 21_35\n\
+             INT.PIP.INT_NODE_SDQ_78_INT_OUT0.LOGIC_OUTS_W22 20_33\n",
+            "fasm-check fixture",
+        )
+        .unwrap();
+        // The N46 pair, on one tile: the leg requires 21_35 clear,
+        // the routed PIP sets it.
+        let err = check_fasm_int_pip_bits(
+            &[
+                "INT_X1Y0.PIP.CTRL_W5.INT_NODE_GLOBAL_10_INT_OUT1".to_string(),
+                "INT_X1Y0.PIP.INT_NODE_SDQ_80_INT_OUT1.LOGIC_OUTS_W22".to_string(),
+            ],
+            &db,
+        )
+        .unwrap_err();
+        assert!(err.contains("CTRL_W5"), "got {err}");
+        assert!(err.contains("SDQ_80"), "got {err}");
+        assert!(err.contains("21_35"), "got {err}");
+        assert!(err.contains("INT_X1Y0"), "got {err}");
+        // The compatible sibling PIP passes.
+        check_fasm_int_pip_bits(
+            &[
+                "INT_X1Y0.PIP.CTRL_W5.INT_NODE_GLOBAL_10_INT_OUT1".to_string(),
+                "INT_X1Y0.PIP.INT_NODE_SDQ_78_INT_OUT0.LOGIC_OUTS_W22".to_string(),
+            ],
+            &db,
+        )
+        .unwrap();
+        // The same disagreeing pair on different tiles passes: bits
+        // are per-tile FARs, so only same-tile pairs conflict.
+        check_fasm_int_pip_bits(
+            &[
+                "INT_X1Y0.PIP.CTRL_W5.INT_NODE_GLOBAL_10_INT_OUT1".to_string(),
+                "INT_X3Y0.PIP.INT_NODE_SDQ_80_INT_OUT1.LOGIC_OUTS_W22".to_string(),
+            ],
+            &db,
+        )
+        .unwrap();
+        // Non-PIP lines and unknown features are skipped, not failed.
+        check_fasm_int_pip_bits(
+            &[
+                "SLICE_X1Y0.A6LUT.INIT[63:0] = 0x5555555555555555".to_string(),
+                "INT_X1Y0.PIP.NOPE.NOPE".to_string(),
+                "INT_X1Y0.PIP.CTRL_W5.INT_NODE_GLOBAL_10_INT_OUT1".to_string(),
+            ],
+            &db,
+        )
+        .unwrap();
     }
 }

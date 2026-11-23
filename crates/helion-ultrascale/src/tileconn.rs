@@ -977,6 +977,23 @@ impl TileconnWireDb {
         self.inner.wire_id(tile, wire)
     }
 
+    /// Remove one intra-tile PIP edge (`src` -> `dst` on `tile`)
+    /// from the routing graph. See
+    /// [`IntTileWireDb::remove_edge`]: the router can never traverse
+    /// the PIP again, so a design whose clock leg conflicts with it
+    /// routes around it instead of failing at bitgen. Returns true
+    /// when the edge existed and was removed; false when the tile or
+    /// a wire is unknown, or the pair was not an edge. Callers fail
+    /// loud on false: a forbidden PIP the graph never had means the
+    /// segbits table and the tile JSON disagree, and silently
+    /// routing on would reintroduce the bitgen failure.
+    pub fn forbid_pip(&mut self, tile: &str, src: &str, dst: &str) -> bool {
+        let (Some(s), Some(d)) = (self.wire_id(tile, src), self.wire_id(tile, dst)) else {
+            return false;
+        };
+        self.inner.remove_edge(s, d)
+    }
+
     /// Translate one ordered route to INT PIPs, resolving
     /// bidirectional PIPs from the PIP table.
     pub fn translate_route(
@@ -1286,6 +1303,34 @@ mod tests {
                 tile: "INT_X0Y0"
             })
         );
+    }
+
+    #[test]
+    fn forbid_pip_removes_one_edge_from_the_tile() {
+        // The N46 conflict edge on its tile: LOGIC_OUTS_W22 drives
+        // INT_NODE_SDQ_80_INT_OUT1. Forbidding it leaves the sibling
+        // PIPs from the same source wire alone; a second forbid, an
+        // unknown tile, and an unknown wire all report false instead
+        // of removing anything.
+        let (_dir, db) = fixture_db();
+        let mut wdb =
+            TileconnWireDb::from_db_and_sites(TILE_JSON, db, &[(site0(), "SLICE_X0Y0".into())])
+                .unwrap();
+        let src = wdb.wire_id("INT_X0Y0", "LOGIC_OUTS_W22").unwrap();
+        let dst = wdb
+            .wire_id("INT_X0Y0", "INT_NODE_SDQ_80_INT_OUT1")
+            .unwrap();
+        let sib = wdb
+            .wire_id("INT_X0Y0", "INT_NODE_SDQ_78_INT_OUT0")
+            .unwrap();
+        assert!(wdb.fanout(src).contains(&dst));
+        assert!(wdb.fanout(src).contains(&sib));
+        assert!(wdb.forbid_pip("INT_X0Y0", "LOGIC_OUTS_W22", "INT_NODE_SDQ_80_INT_OUT1"));
+        assert!(!wdb.fanout(src).contains(&dst));
+        assert!(wdb.fanout(src).contains(&sib));
+        assert!(!wdb.forbid_pip("INT_X0Y0", "LOGIC_OUTS_W22", "INT_NODE_SDQ_80_INT_OUT1"));
+        assert!(!wdb.forbid_pip("INT_X9Y9", "LOGIC_OUTS_W22", "INT_NODE_SDQ_80_INT_OUT1"));
+        assert!(!wdb.forbid_pip("INT_X0Y0", "NOPE", "INT_NODE_SDQ_80_INT_OUT1"));
     }
 
     #[test]
