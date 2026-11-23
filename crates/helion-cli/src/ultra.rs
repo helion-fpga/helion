@@ -105,8 +105,9 @@ pub fn load_ultra_segbits(data_dir: &Path) -> Result<FileSegbitsDb, String> {
 
 /// Device for a part: the real `DeviceFile` implementation of
 /// `BitgenDevice` (SLICE base FARs from the file's own CLB column
-/// majors, INT base FARs by the provisional rule, RAMB18 from the
-/// BRAM content columns, full config order). `xcku3p` and `xczu3eg`
+/// majors, INT base FARs from the tilegrid table on xczu3eg and the
+/// provisional rule on xcku3p, RAMB18 from the BRAM content columns,
+/// full config order). `xcku3p` and `xczu3eg`
 /// are wired: `xcvu3p.json` is provisional (computed frame total
 /// 73,035 vs UG570 Table 1's 71,820) until that gap is resolved by
 /// a CTO decision; any other part fails loud here. The flow emits
@@ -2156,8 +2157,9 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
     ///   LUT INIT, FF INIT/SRVAL, FFMUXA1.D6 (the LUT O feeds the FF
     ///   D intra-slice, so the AX leg is gone and only the 4 PIPs of
     ///   the AQ feedback leg remain), FF control, all PIPs on
-    ///   INT_X1Y0 (the provisional INT rule is proven only for INT_X1,
-    ///   so any PIP on INT_X2+ fails this test);
+    ///   INT_X1Y0 (this run routes only through INT_X1, so any PIP on
+    ///   INT_X2+ fails this test; INT_X2+ itself now resolves per the
+    ///   table, see xczu3eg_int_x2_pip_emits_at_table_far_not_provisional);
     /// - IDCODE 0x04a42093 and 14,952 FDRI frames (not UG1085 14,964);
     /// - every stored H-1 band checks Exact under masked MAP-A
     ///   (no Q residual, no mismatch) over all 14,952 frames;
@@ -2255,7 +2257,7 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
             if let Some(rest) = line.strip_prefix("INT_X") {
                 assert!(
                     rest.starts_with("1Y0."),
-                    "PIP on an INT tile outside proven INT_X1: {line}"
+                    "PIP on an INT tile other than INT_X1Y0: {line}"
                 );
             }
         }
@@ -2403,7 +2405,7 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
                 pips += 1;
                 assert!(
                     line.starts_with("INT_X1Y0."),
-                    "PIP on an INT tile outside proven INT_X1: {line}"
+                    "PIP on an INT tile other than INT_X1Y0: {line}"
                 );
             }
         }
