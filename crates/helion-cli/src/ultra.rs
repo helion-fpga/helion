@@ -992,13 +992,23 @@ fn ffmux_selections(
 /// makes zero overuse impossible, see the counter lane report).
 ///
 /// This repair moves the second BYP FF of a conflicted letter to the
-/// first free letter of the same slice that can take it, preferring
-/// its driver LUT's letter (the move then selects D6 and needs no
-/// fabric route at all). A target letter can take the FF when it has
-/// a free BEL and its resident BYP users (if any) share the moved
-/// FF's D net; resident D6 users never consume the X pin. Moving
-/// within the slice cannot change control sets. When no letter in the
-/// slice can take the FF, the repair fails loud naming the FF, its D
+/// first free letter that can take it, preferring its driver LUT's
+/// letter (the move then selects D6 and needs no fabric route at
+/// all). A target letter can take the FF when it has a free BEL, the
+/// target slice's control set accepts the FF's clock/CE/SR, and its
+/// resident BYP users (if any) share the moved FF's D net; resident
+/// D6 users never consume the X pin. The target search covers every
+/// slice, the mover's own slice first, then the others in order:
+/// the old same-slice-only search could not fix a full slice (a
+/// 16-FF counter fills all 8 letters x 2 BELs). When no letter in
+/// any existing slice can take the FF, the repair appends a fresh
+/// empty slice and moves the FF there: a shift register's FFs all
+/// carry distinct BYP D nets, so one letter holds at most one of
+/// them and the design needs more slices than the packer made.
+/// Moving across slices can change control sets, so the target
+/// slice is checked with the FF's own clock/CE/SR. When no move
+/// exists even after creating a slice (unreachable: a fresh slice
+/// always takes the FF), the repair fails loud naming the FF, its D
 /// net, and the slice, instead of emitting a packing the router
 /// cannot configure. Runs after pack, before place, in `run_impl`
 /// (and the multiseed pack-once site, so both flows pack alike).
@@ -1109,87 +1119,141 @@ fn repair_ff_xpin_conflicts(
         let Some((slice_idx, letter, mover_cell, mover_net, mover_bel)) = conflict else {
             return Ok(());
         };
-        // Target letters in the same slice: the driver LUT's letter
-        // first (the move then selects D6), then A..H in order.
-        let driver_letter: Option<char> = lut_driver
-            .get(&mover_net)
-            .and_then(|lut_cell| lut_place.get(lut_cell))
-            .filter(|(s, _)| *s == slice_idx)
-            .map(|(_, l)| *l);
-        let mut candidates: Vec<u8> = Vec::new();
-        if let Some(l) = driver_letter {
-            candidates.push(l as u8 - b'A');
-        }
-        for l in 0..8u8 {
-            if !candidates.contains(&l) {
-                candidates.push(l);
+        // Target search across all slices, the mover's own slice
+        // first, then the others in slice order. Within a slice the
+        // driver LUT's letter comes first (the move then selects
+        // D6), then A..H in order. A fresh slice is appended when no
+        // existing slice has a compatible letter.
+        let mover_clk = packed.slices[slice_idx]
+            .ff_clk
+            .get(&mover_bel)
+            .cloned()
+            .unwrap_or_default();
+        let mover_ce: Option<String> = packed.slices[slice_idx]
+            .ff_ce
+            .get(&mover_bel)
+            .cloned()
+            .flatten();
+        let mover_sr: Option<String> = packed.slices[slice_idx]
+            .ff_sr
+            .get(&mover_bel)
+            .cloned()
+            .flatten();
+        let mut slice_order: Vec<usize> = vec![slice_idx];
+        for i in 0..packed.slices.len() {
+            if i != slice_idx {
+                slice_order.push(i);
             }
         }
-        let mut target: Option<(u8, u8)> = None;
-        for tletter in candidates {
-            if tletter == letter {
-                continue;
+        let mut target: Option<(usize, u8, u8)> = None;
+        'search: for &tslice in &slice_order {
+            let driver_letter: Option<char> = lut_driver
+                .get(&mover_net)
+                .and_then(|lut_cell| lut_place.get(lut_cell))
+                .filter(|(s, _)| *s == tslice)
+                .map(|(_, l)| *l);
+            let mut candidates: Vec<u8> = Vec::new();
+            if let Some(l) = driver_letter {
+                candidates.push(l as u8 - b'A');
             }
-            for tbel in [tletter * 2, tletter * 2 + 1] {
-                if packed.slices[slice_idx].ffs.contains_key(&tbel) {
+            for l in 0..8u8 {
+                if !candidates.contains(&l) {
+                    candidates.push(l);
+                }
+            }
+            for tletter in candidates {
+                if tslice == slice_idx && tletter == letter {
                     continue;
                 }
-                // The move selects D6 in the driver letter, so it
-                // consumes no X pin there and compatibility is
-                // automatic. Else every resident BYP user of the
-                // target letter must share the mover's D net.
-                let becomes_d6 = driver_letter == Some((b'A' + tletter) as char);
-                if !becomes_d6 {
-                    let mut ok = true;
-                    for rbel in [tletter * 2, tletter * 2 + 1] {
-                        if let Some(rcell) = packed.slices[slice_idx].ffs.get(&rbel) {
-                            if let Some((FfMuxSel::Byp, Some(rnet))) = ff_info.get(rcell) {
-                                if *rnet != mover_net {
-                                    ok = false;
-                                    break;
+                for tbel in [tletter * 2, tletter * 2 + 1] {
+                    if packed.slices[tslice].ffs.contains_key(&tbel) {
+                        continue;
+                    }
+                    // The target slice must accept the FF's control
+                    // set (a cross-slice move can change it).
+                    if !packed.slices[tslice].can_place_ff(
+                        tbel,
+                        &mover_clk,
+                        &mover_ce,
+                        &mover_sr,
+                        &ControlSetLimits::default(),
+                    ) {
+                        continue;
+                    }
+                    // The move selects D6 in the driver letter, so
+                    // it consumes no X pin there and compatibility
+                    // is automatic. Else every resident BYP user of
+                    // the target letter must share the mover's D net.
+                    let becomes_d6 = driver_letter == Some((b'A' + tletter) as char);
+                    if !becomes_d6 {
+                        let mut ok = true;
+                        for rbel in [tletter * 2, tletter * 2 + 1] {
+                            if let Some(rcell) = packed.slices[tslice].ffs.get(&rbel) {
+                                if let Some((FfMuxSel::Byp, Some(rnet))) = ff_info.get(rcell) {
+                                    if *rnet != mover_net {
+                                        ok = false;
+                                        break;
+                                    }
                                 }
                             }
                         }
+                        if !ok {
+                            continue;
+                        }
                     }
-                    if !ok {
-                        continue;
-                    }
+                    target = Some((tslice, tletter, tbel));
+                    break 'search;
                 }
-                target = Some((tletter, tbel));
-                break;
-            }
-            if target.is_some() {
-                break;
             }
         }
-        let Some((target_letter, new_bel)) = target else {
-            return Err(format!(
-                "ULTRA PACK: FF {mover_cell} (D net {mover_net}) shares the X pin of slice {} letter {} with a different BYP D net and no free compatible letter exists in the slice",
-                packed.slices[slice_idx].name,
-                (b'A' + letter) as char
-            ));
+        let (target_slice, target_letter, new_bel) = match target {
+            Some(t) => t,
+            None => {
+                // No compatible letter anywhere: append a fresh
+                // empty slice (provisional name after the existing
+                // SLICE_X0Y<n> names) and move the FF to its
+                // letter A. A fresh slice always accepts the FF.
+                let mut n = packed.slices.len();
+                let mut new_name = format!("SLICE_X0Y{n}");
+                while packed.slices.iter().any(|s| s.name == new_name) {
+                    n += 1;
+                    new_name = format!("SLICE_X0Y{n}");
+                }
+                packed.slices.push(helion_ultrascale::PackedUltraSlice::new(
+                    new_name,
+                    helion_ultrascale::SliceKind::Logic,
+                ));
+                (packed.slices.len() - 1, 0u8, 0u8)
+            }
         };
         let old_letter = (b'A' + letter) as char;
         let new_letter = (b'A' + target_letter) as char;
-        let slice = &mut packed.slices[slice_idx];
-        let cell = slice.ffs.remove(&mover_bel).expect("mover FF present");
+        let source_name = packed.slices[slice_idx].name.clone();
+        let target_name = packed.slices[target_slice].name.clone();
+        let cell = {
+            let slice = &mut packed.slices[slice_idx];
+            slice.ffs.remove(&mover_bel).expect("mover FF present")
+        };
         debug_assert_eq!(cell, mover_cell);
-        let clk = slice.ff_clk.remove(&mover_bel);
-        let ce = slice.ff_ce.remove(&mover_bel);
-        let sr = slice.ff_sr.remove(&mover_bel);
-        slice.ffs.insert(new_bel, cell);
-        if let Some(v) = clk {
-            slice.ff_clk.insert(new_bel, v);
-        }
-        if let Some(v) = ce {
-            slice.ff_ce.insert(new_bel, v);
-        }
-        if let Some(v) = sr {
-            slice.ff_sr.insert(new_bel, v);
+        let clk = packed.slices[slice_idx].ff_clk.remove(&mover_bel);
+        let ce = packed.slices[slice_idx].ff_ce.remove(&mover_bel);
+        let sr = packed.slices[slice_idx].ff_sr.remove(&mover_bel);
+        {
+            let slice = &mut packed.slices[target_slice];
+            slice.ffs.insert(new_bel, cell);
+            if let Some(v) = clk {
+                slice.ff_clk.insert(new_bel, v);
+            }
+            if let Some(v) = ce {
+                slice.ff_ce.insert(new_bel, v);
+            }
+            if let Some(v) = sr {
+                slice.ff_sr.insert(new_bel, v);
+            }
         }
         println!(
-            "hang_diag ultra pack xpin_repair ff={mover_cell} d_net={mover_net} slice={} letter {old_letter}->{new_letter}",
-            packed.slices[slice_idx].name
+            "hang_diag ultra pack xpin_repair ff={} d_net={} slice={} letter {}->{} target_slice={}",
+            mover_cell, mover_net, source_name, old_letter, new_letter, target_name
         );
     }
     Err(
@@ -1827,6 +1891,83 @@ mod tests {
         assert_eq!(nets.len(), 1, "the shared q net still routes");
         assert_eq!(nets[0].name, "q");
         assert_eq!(nets[0].sinks.len(), 2, "only the D6 sink is dropped");
+    }
+
+    #[test]
+    fn xpin_repair_moves_ff_to_another_slice_when_slice_is_full() {
+        // Slice 0 holds 16 FFs (all 8 letters x 2 BELs) with distinct
+        // D nets, so letter A carries two different BYP D nets and no
+        // letter in slice 0 is free. Slice 1 is empty. Before the fix
+        // the repair searched only slice 0 and failed loud; now it
+        // moves the conflicting FF to slice 1 and returns Ok.
+        let mut design = Design::new("full_slice");
+        design.add_cell("u_clkin", CellKind::IobIn);
+        for i in 0..16 {
+            design.add_cell(&format!("ff{i}"), CellKind::Hff);
+            design.connect(&format!("d{i}"), &format!("ff{i}"), "D");
+            design.connect("clk", &format!("ff{i}"), "CLK");
+        }
+        design.connect("clk", "u_clkin", "PAD");
+        let mut slice0 = PackedUltraSlice::new("SLICE_X0Y0".to_string(), SliceKind::Logic);
+        for i in 0..16u8 {
+            slice0.ffs.insert(i, format!("ff{i}"));
+            slice0.ff_clk.insert(i, "clk".to_string());
+            slice0.ff_ce.insert(i, None);
+            slice0.ff_sr.insert(i, None);
+        }
+        let slice1 = PackedUltraSlice::new("SLICE_X0Y1".to_string(), SliceKind::Logic);
+        let mut packed = UltraPacked {
+            slices: vec![slice0, slice1],
+            ..Default::default()
+        };
+        repair_ff_xpin_conflicts(&design, &mut packed).unwrap();
+        // One conflicting FF per letter moves out: slice 0 keeps one
+        // BYP FF per letter (8), slice 1 takes the other eight.
+        assert_eq!(packed.slices[0].ffs.len(), 8);
+        assert_eq!(packed.slices[1].ffs.len(), 8);
+        // No letter in either slice now carries two distinct BYP D
+        // nets: the repair converged, not just moved the problem.
+        repair_ff_xpin_conflicts(&design, &mut packed).unwrap();
+        assert_eq!(packed.slices[0].ffs.len(), 8);
+        assert_eq!(packed.slices[1].ffs.len(), 8);
+    }
+
+    #[test]
+    fn xpin_repair_creates_slice_when_every_slice_is_full() {
+        // Two slices, each full with 16 FFs on distinct D nets: no
+        // existing letter can take a conflicting FF. The repair
+        // appends a fresh slice and moves FFs there instead of
+        // failing loud.
+        let mut design = Design::new("two_full_slices");
+        design.add_cell("u_clkin", CellKind::IobIn);
+        for i in 0..32 {
+            design.add_cell(&format!("ff{i}"), CellKind::Hff);
+            design.connect(&format!("d{i}"), &format!("ff{i}"), "D");
+            design.connect("clk", &format!("ff{i}"), "CLK");
+        }
+        design.connect("clk", "u_clkin", "PAD");
+        let mut slices = Vec::new();
+        for s in 0..2 {
+            let mut slice =
+                PackedUltraSlice::new(format!("SLICE_X0Y{s}"), SliceKind::Logic);
+            for i in 0..16u8 {
+                slice.ffs.insert(i, format!("ff{}", s * 16 + i as usize));
+                slice.ff_clk.insert(i, "clk".to_string());
+                slice.ff_ce.insert(i, None);
+                slice.ff_sr.insert(i, None);
+            }
+            slices.push(slice);
+        }
+        let mut packed = UltraPacked {
+            slices,
+            ..Default::default()
+        };
+        repair_ff_xpin_conflicts(&design, &mut packed).unwrap();
+        assert!(packed.slices.len() > 2, "repair created a fresh slice");
+        assert_eq!(
+            packed.slices.iter().map(|s| s.ffs.len()).sum::<usize>(),
+            32
+        );
     }
 
     #[test]

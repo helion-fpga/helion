@@ -753,7 +753,11 @@ impl TileconnWireDb {
 
     /// Build from an already-loaded [`TileconnDb`] and explicit
     /// `(site, site name)` pairs. The test-friendly constructor:
-    /// unit tests pass fixture DBs here.
+    /// unit tests pass fixture DBs here. Besides the INT tiles the
+    /// placed pins stitch to, the graph also instantiates the INT
+    /// tiles neighboring them (see the expansion in the body), so
+    /// continuation edges exist and the router can spill across INT
+    /// tiles.
     pub fn from_db_and_sites(
         int_tile_json: &str,
         db: TileconnDb,
@@ -886,6 +890,48 @@ impl TileconnWireDb {
                     )?;
                     alias(&mut regs, format!("{l}Q"), "D".to_string(), &format!("{l}X"))?;
                     alias(&mut regs, format!("{l}Q2"), "D".to_string(), &format!("{l}X"))?;
+                }
+            }
+        }
+        // Expand the graph to the INT tiles neighboring each seed
+        // tile in tile-name coordinates (dx, dy in -1..=1). A seed
+        // tile alone has zero continuation edges, so the router can
+        // never leave it: every inter-slice net must fit inside one
+        // tile and PathFinder deadlocks on the same BYPASS/IMUX wires.
+        // Neighbor tiles give the router somewhere to spill: span
+        // wires (EE1, EE2, NN1, WW1, and so on) continue into the
+        // tile one name step away, so a net can detour
+        // through INT_X2+ and back. Only tiles that exist in this
+        // part's tilegrid (type INT) are added, so no invented tile
+        // ever reaches FASM or bitgen; a tile at a negative or
+        // missing coordinate is skipped (for example INT_X1Y-1 does
+        // not exist). The seed tiles are unchanged, so single-slice
+        // designs keep exactly their old graph plus neighbors they
+        // can also use.
+        let existing_int: std::collections::HashSet<String> = db
+            .tile_by_grid
+            .values()
+            .filter(|(_, t)| t == "INT")
+            .map(|(n, _)| n.clone())
+            .collect();
+        let seed_tiles = int_tiles.clone();
+        for t in &seed_tiles {
+            for dx in -1..=1i32 {
+                for dy in -1..=1i32 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let (nx, ny) = (t.x + dx, t.y + dy);
+                    if nx < 0 || ny < 0 {
+                        continue;
+                    }
+                    let name = format!("INT_X{nx}Y{ny}");
+                    if !existing_int.contains(&name) {
+                        continue;
+                    }
+                    if tile_seen.insert(name.clone(), ()).is_none() {
+                        int_tiles.push(IntTile::new(&name, nx, ny));
+                    }
                 }
             }
         }
@@ -1320,6 +1366,68 @@ mod tests {
         );
         assert_eq!(external_wire("CLE_CLE_L_SITE_0_A1"), "CLE_CLE_L_SITE_0_A1");
         assert_eq!(external_wire("VCC_WIRE"), "VCC_WIRE");
+    }
+
+    /// Neighbor expansion: the TINY fixture's tilegrid gains the
+    /// INT tiles one name step east and north of the seed INT_X0Y0
+    /// (INT_X1Y0, INT_X2Y0, INT_X0Y1, INT_X1Y1). Before the fix the
+    /// graph held only the seed tile (tile_count 1, zero
+    /// continuation edges); with the fix it holds the seed plus its
+    /// existing neighbors, and a span wire continues from the seed
+    /// into INT_X1Y0. INT_X2Y0 is two steps away, so it is not
+    /// added from this seed.
+    const NEIGHBOR_TILEGRID: &str = r#"{
+      "CLEL_R_X0Y0": {"grid_x": 161, "grid_y": 185, "type": "CLEL_R",
+        "sites": {"SLICE_X0Y0": "SLICEL"}},
+      "INT_X0Y0": {"grid_x": 160, "grid_y": 185, "type": "INT", "sites": {}},
+      "INT_X1Y0": {"grid_x": 165, "grid_y": 185, "type": "INT", "sites": {}},
+      "INT_X2Y0": {"grid_x": 169, "grid_y": 185, "type": "INT", "sites": {}},
+      "INT_X0Y1": {"grid_x": 160, "grid_y": 184, "type": "INT", "sites": {}},
+      "INT_X1Y1": {"grid_x": 165, "grid_y": 184, "type": "INT", "sites": {}}
+    }"#;
+
+    fn fixture_db_neighbors() -> (TempfileDir, TileconnDb) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static FIXTURE_SEQ_3: AtomicU64 = AtomicU64::new(0);
+        let n = FIXTURE_SEQ_3.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "helion-tileconn-fixture3-{}-{n}",
+            std::process::id()
+        ));
+        let part_dir = dir.join("xczu3eg-sbva484-1-e");
+        let _ = fs::create_dir_all(&part_dir);
+        fs::write(part_dir.join("tileconn.json"), TINY_TILECONN).unwrap();
+        fs::write(part_dir.join("tilegrid.json"), NEIGHBOR_TILEGRID).unwrap();
+        let root_types = dir.join("tile_types");
+        let _ = fs::create_dir_all(&root_types);
+        fs::write(
+            root_types.join("tile_type_CLEL_R.json"),
+            TINY_TILE_TYPE_CLEL_R,
+        )
+        .unwrap();
+        let db = TileconnDb::load(&dir, "xczu3eg-sbva484-1-e").unwrap();
+        (TempfileDir(dir), db)
+    }
+
+    #[test]
+    fn wire_db_expands_to_neighboring_int_tiles() {
+        let (_dir, db) = fixture_db_neighbors();
+        let wdb =
+            TileconnWireDb::from_db_and_sites(TILE_JSON, db, &[(site0(), "SLICE_X0Y0".into())])
+                .unwrap();
+        assert_eq!(wdb.tile_count(), 4);
+        assert_eq!(wdb.wire_count(), 4 * 1475);
+        // The east neighbor exists in the graph, so a length-1 span
+        // continues out of the seed tile instead of dead-ending.
+        let beg = wdb.wire_id("INT_X0Y0", "EE1_E_BEG0").unwrap();
+        let end = wdb.wire_id("INT_X1Y0", "EE1_E_END0").unwrap();
+        assert!(wdb.fanout(beg).contains(&end));
+        assert!(wdb.fanout(end).contains(&beg));
+        // The seed tile's own pin wires are unchanged by expansion.
+        assert_eq!(
+            wdb.wire_for_bel_pin(site0(), "A6LUT", "O6"),
+            wdb.wire_id("INT_X0Y0", "LOGIC_OUTS_E0")
+        );
     }
 
     #[test]
