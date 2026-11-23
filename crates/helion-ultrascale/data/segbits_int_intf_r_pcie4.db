@@ -1,0 +1,15 @@
+# Helion-derived segbits, NOT upstream prjuray-db data.
+# Derived: 2026-11-22, INT_INTF lane, from the 14-pair public xczu3eg
+# corpus (ultra-bitgen-crew/decoder-validation/bits). OUTPUTS_ENABLED.1
+# is the 3-bit set 01_21 02_27 03_24, identical in 5 independent designs
+# (P-13..P-17, BNN Ultra96), 8 tiles each, 120 bits total. The bit
+# positions match INT_INTF_LEFT_TERM_PSS.OUTPUTS_ENABLED.1 in prjuray-db
+# segbits_int_intf_left_term_pss.db exactly. No INT_INTF PIP bit is set
+# in any corpus design, so no PIP line is derived here; PIP segbits are
+# blocked on a Vivado reference build. See
+# ultra-bitgen-crew/INTINTF_REPORT.md. Bits are tile-relative, the
+# prjuray convention: the emitter writes them directly, so they land
+# correctly only on offset-0 tiles (same class of limitation as the
+# documented F3 INT collapse).
+INT_INTF_R_PCIE4.OUTPUTS_ENABLED.0 !01_21 !02_27 !03_24
+INT_INTF_R_PCIE4.OUTPUTS_ENABLED.1 01_21 02_27 03_24

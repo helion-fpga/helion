@@ -63,7 +63,7 @@ pub use device::{UltraScaleDevice, Xcku3pSpec, Xcvu3pSpec, Xczu3egSpec};
 pub use dsp::{DSP48E2_ATTRIBUTES, is_dsp48e2_entry};
 pub use device_file::{
     ArchSummary, BitLocator, BramResolution, DeviceFile, DeviceFileError, Far, FarBlockType,
-    IntColumnTable, NUM_18K_BRAM_PER_COLUMN, ProvisionalNote,
+    IntColumnTable, IntfColumnTable, NUM_18K_BRAM_PER_COLUMN, ProvisionalNote,
 };
 pub use device_grid::{DeviceColumn, DeviceFileGrid};
 pub use fabric::{
