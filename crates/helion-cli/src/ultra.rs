@@ -36,7 +36,7 @@ use helion_ir::{CellKind, Design, intern, resolve};
 use helion_ultrascale::bitgen::{
     BitgenError, emit_bitstream, emit_frames, parse_bitstream,
 };
-use helion_ultrascale::device_file::DeviceFile;
+use helion_ultrascale::device_file::{DeviceFile, IntColumnTable, IntfColumnTable};
 use helion_ultrascale::{
     best_seed_line, check_legality, dedup_results, emit_ff_control_fasm, emit_ff_fasm,
     emit_ffmux_fasm, emit_lut_fasm, escape_json_value, map_source_cell, pack_ultra,
@@ -121,11 +121,10 @@ pub fn load_ultra_segbits(data_dir: &Path) -> Result<FileSegbitsDb, String> {
 /// 12-frame gap is 4 padding frames per FAR row x 3 rows, which
 /// real Vivado streams carry and the decoder skips, so the
 /// emitter writes one FDRI frame per real FAR, 14,952, and the
-/// decoder does not require the padding). INT tiles resolve by
-/// the provisional rule without the tilegrid sidecar table; the
-/// rule agrees with the table for INT_X1 but mispredicts INT_X2
-/// and above on this part, so only low-X INT tiles are proven
-/// here.
+/// decoder does not require the padding). INT tiles resolve per the
+/// tilegrid-derived INT column table attached here (INT_X2+ included),
+/// and INT_INTF/HDIO tiles resolve per the INTF column table attached
+/// here; both tables match the helion-bitgen binary device.
 pub fn load_ultra_device(part: &str, data_dir: &Path) -> Result<DeviceFile, String> {
     match part {
         "xcku3p" => DeviceFile::from_path(&data_dir.join("xcku3p.json")).map_err(|e| {
@@ -134,12 +133,45 @@ pub fn load_ultra_device(part: &str, data_dir: &Path) -> Result<DeviceFile, Stri
                 data_dir.join("xcku3p.json").display()
             )
         }),
-        "xczu3eg" => DeviceFile::from_path(&data_dir.join("xczu3eg.json")).map_err(|e| {
-            format!(
-                "ULTRA BITGEN: cannot load device file {}: {e}",
-                data_dir.join("xczu3eg.json").display()
+        "xczu3eg" => {
+            let mut file = DeviceFile::from_path(&data_dir.join("xczu3eg.json")).map_err(|e| {
+                format!(
+                    "ULTRA BITGEN: cannot load device file {}: {e}",
+                    data_dir.join("xczu3eg.json").display()
+                )
+            })?;
+            // Tilegrid-derived INT column table: without it the
+            // provisional rule mispredicts INT columns for INT_X2
+            // and above on this part (see bitgen_device.rs).
+            let table =
+                IntColumnTable::from_path(&data_dir.join("xczu3eg_int_columns.json")).map_err(
+                    |e| {
+                        format!(
+                            "cannot load INT column table {}: {e}",
+                            data_dir.join("xczu3eg_int_columns.json").display()
+                        )
+                    },
+                )?;
+            file.set_int_columns(table).map_err(|e| {
+                format!("INT column table does not match xczu3eg.json: {e}")
+            })?;
+            // Tilegrid-derived INT_INTF / HDIO column table (B2):
+            // without it INT_INTF and HDIO tiles do not resolve and
+            // any interface line fails loud.
+            let intf_table = IntfColumnTable::from_path(
+                &data_dir.join("xczu3eg_intf_columns.json"),
             )
-        }),
+            .map_err(|e| {
+                format!(
+                    "cannot load INTF column table {}: {e}",
+                    data_dir.join("xczu3eg_intf_columns.json").display()
+                )
+            })?;
+            file.set_intf_columns(intf_table).map_err(|e| {
+                format!("INTF column table does not match xczu3eg.json: {e}")
+            })?;
+            Ok(file)
+        }
         other => Err(format!(
             "ULTRA BITGEN: part {other} has no emitter device yet: only xcku3p and xczu3eg are wired; \
             xcvu3p.json is provisional until its frame-total gap is resolved"
@@ -1927,6 +1959,107 @@ INT_X0Y0.PIP.INT_NODE_GLOBAL_0_INT_OUT0.GCLK_B_0_0\n";
         // Do not tune this constant to match UG1085.
         assert_eq!(device.total_frames(), 14_952);
         assert_eq!(device.config_order_fars().len(), 14_952);
+    }
+
+    #[test]
+    fn xczu3eg_flow_device_has_both_column_tables() {
+        use helion_ultrascale::bitgen::BitgenDevice;
+        let data_dir = ultrascale_data_dir();
+        let device = load_ultra_device("xczu3eg", &data_dir).unwrap();
+        assert!(device.has_int_columns(), "flow device lacks INT table");
+        assert!(device.has_intf_columns(), "flow device lacks INTF table");
+        assert_eq!(device.int_column_entries().unwrap().len(), 99);
+        assert_eq!(device.intf_column_entries().unwrap().len(), 15);
+        // xcku3p is untouched: no table is attached there.
+        let ku = load_ultra_device("xcku3p", &data_dir).unwrap();
+        assert!(!ku.has_int_columns());
+        assert!(!ku.has_intf_columns());
+        // INT_INTF/HDIO tiles resolve through the flow device.
+        assert_eq!(
+            device.tile_base_far("INT_INTF_R_PCIE4_X9Y120"),
+            Some(0x81D00)
+        );
+        assert_eq!(
+            device.tile_base_far("HDIO_BOT_RIGHT_X9Y0"),
+            Some(0x1E00)
+        );
+    }
+
+    #[test]
+    fn xczu3eg_flow_device_int_columns_match_table_all_99() {
+        use helion_ultrascale::bitgen::BitgenDevice;
+        use helion_ultrascale::device_file::{Far, FarBlockType};
+        let data_dir = ultrascale_data_dir();
+        let device = load_ultra_device("xczu3eg", &data_dir).unwrap();
+        // Anchors from the tilegrid table (mispredictions.txt):
+        // X0/X1 agree with the provisional rule, X2/X10/X20/X32
+        // mismatch it in every row.
+        let anchors: [(u32, u32, u32); 18] = [
+            (0, 0, 0x100),
+            (0, 1, 0x400),
+            (0, 2, 0x700),
+            (0, 10, 0x2000),
+            (0, 20, 0x3e00),
+            (0, 32, 0x6300),
+            (1, 0, 0x40100),
+            (1, 1, 0x40400),
+            (1, 2, 0x40700),
+            (1, 10, 0x42000),
+            (1, 20, 0x43e00),
+            (1, 32, 0x46300),
+            (2, 0, 0x80100),
+            (2, 1, 0x80400),
+            (2, 2, 0x80700),
+            (2, 10, 0x82000),
+            (2, 20, 0x83e00),
+            (2, 32, 0x86300),
+        ];
+        for (row, x, far) in anchors {
+            let tile = format!("INT_X{x}Y{}", row * 60);
+            assert_eq!(
+                device.tile_base_far(&tile),
+                Some(far),
+                "anchor {tile} must resolve to 0x{far:05x}"
+            );
+        }
+        // Full loop over the vendored table: every one of the 99
+        // (row, X) entries must resolve to Far(ClbIoClk, row, col, 0).
+        let table =
+            IntColumnTable::from_path(&data_dir.join("xczu3eg_int_columns.json")).unwrap();
+        assert_eq!(table.columns.len(), 99);
+        for ((row, x), col) in &table.columns {
+            let tile = format!("INT_X{x}Y{}", row * 60);
+            let expected = Far::new(FarBlockType::ClbIoClk, *row, *col, 0)
+                .unwrap()
+                .to_u32();
+            assert_eq!(
+                device.tile_base_far(&tile),
+                Some(expected),
+                "{tile} must resolve to table FAR 0x{expected:05x}"
+            );
+        }
+    }
+
+    #[test]
+    fn xczu3eg_int_x2_pip_emits_at_table_far_not_provisional() {
+        // Flip test for the baseline hand-FASM probe: the blinky PIP
+        // INT_NODE_IMUX_42_INT_OUT1.LOGIC_OUTS_W14 carries a single
+        // segbit (frame offset 17, bit 20) on INT_X2Y0, so bit 20 of
+        // words[0] must land at FAR 0x711 (table base 0x700 + 17),
+        // not at 0x411 (provisional base 0x400 + 17). Band bits live
+        // at frame bits 1440..1487, so words[0] bit 20 is the PIP
+        // bit alone.
+        let data_dir = ultrascale_data_dir();
+        let fasm = "INT_X2Y0.PIP.INT_NODE_IMUX_42_INT_OUT1.LOGIC_OUTS_W14\n";
+        let bytes = emit_ultra_bitstream(fasm, "xczu3eg", &data_dir).unwrap();
+        let frames = helion_ultrascale::bitgen::parse_frames(&bytes).unwrap();
+        let mut hits: Vec<u32> = frames
+            .iter()
+            .filter(|(_, words)| (words[0] >> 20) & 1 == 1)
+            .map(|(far, _)| *far)
+            .collect();
+        hits.sort_unstable();
+        assert_eq!(hits, vec![0x711], "INT_X2Y0 PIP bit must land at 0x711");
     }
 
     /// Count single-frame FDRI packets in an emitted bitstream by
