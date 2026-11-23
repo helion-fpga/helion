@@ -454,6 +454,55 @@ pub fn decode_bitstream(bytes: &[u8], db_root: &str) -> Result<DecodeOutput, Str
     decode_frames(&frames, db_root)
 }
 
+/// One tile window, as loaded from the tilegrid: the tile's name and
+/// type, the FAR column it belongs to (`block`, `row`, `col`, with
+/// `base_minor` the minor of the column's frame 0), the number of
+/// frames in the column, the bit range the tile owns inside every
+/// frame of the column (`bit_lo..bit_hi`), its sites, and its grid
+/// coordinates (-1 when the tilegrid does not carry them).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileWindowInfo {
+    pub tile_name: String,
+    pub tile_type: String,
+    pub block: u8,
+    pub row: u8,
+    pub col: u16,
+    pub base_minor: u8,
+    pub frames: u32,
+    pub bit_lo: u32,
+    pub bit_hi: u32,
+    pub sites: Vec<String>,
+    pub grid_x: i64,
+    pub grid_y: i64,
+}
+
+/// Load the tile windows for a `db_root` without decoding anything.
+/// Used by analysis tooling (attributing unexplained bits to tiles,
+/// deriving base-FAR tables) and by tests that pin the tilegrid model.
+pub fn tile_windows(db_root: &str) -> Result<Vec<TileWindowInfo>, String> {
+    let windows = load_tilegrid(db_root)?;
+    Ok(windows
+        .into_iter()
+        .map(|w| {
+            let (block, row, col, _) = far_decode(w.base_far);
+            TileWindowInfo {
+                tile_name: w.tile_name,
+                tile_type: w.tile_type,
+                block,
+                row,
+                col,
+                base_minor: w.base_minor,
+                frames: w.frames,
+                bit_lo: w.bit_lo,
+                bit_hi: w.bit_hi,
+                sites: w.sites,
+                grid_x: w.grid_x,
+                grid_y: w.grid_y,
+            }
+        })
+        .collect())
+}
+
 /// One `(far, bit)` position as a single hash key.
 fn bit_key(far: u32, bit: u32) -> u64 {
     ((far as u64) << 32) | bit as u64
@@ -494,6 +543,8 @@ struct TileWindow {
     bit_lo: u32,
     bit_hi: u32,
     sites: Vec<String>,
+    grid_x: i64,
+    grid_y: i64,
 }
 
 fn parse_hex_u32(text: &str) -> Option<u32> {
@@ -532,6 +583,10 @@ fn load_tilegrid(db_root: &str) -> Result<Vec<TileWindow>, String> {
             .map(|o| o.keys().cloned().collect())
             .unwrap_or_default();
         sites.sort();
+        // Grid coordinates are advisory (adjacency, B2 table derivation);
+        // a fixture tilegrid without them still decodes.
+        let grid_x = tile.get("grid_x").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let grid_y = tile.get("grid_y").and_then(|v| v.as_i64()).unwrap_or(-1);
         for (block_name, info) in bits {
             let block = BlockName::from_tilegrid(block_name).ok_or_else(|| {
                 format!("tilegrid tile {tile_name} has unknown block {block_name}")
@@ -595,6 +650,8 @@ fn load_tilegrid(db_root: &str) -> Result<Vec<TileWindow>, String> {
                 bit_lo,
                 bit_hi,
                 sites: sites.clone(),
+                grid_x,
+                grid_y,
             });
         }
     }

@@ -161,6 +161,22 @@ fn parse_bram_tile(tile: &str) -> Option<(u32, u32)> {
     Some((x, y))
 }
 
+/// Parse an interface tile name `<TYPE>_X<x>Y<y>` (INT_INTF_* or
+/// HDIO_*) into (tile type, x, y). The type is the whole prefix before
+/// `_X`; the caller looks it up in the INT_INTF/HDIO column table, so
+/// an unknown type fails loud there instead of here. Returns `None`
+/// when the name has no `_X<x>Y<y>` tail.
+fn parse_intf_tile(tile: &str) -> Option<(&str, u32, u32)> {
+    let (ty, rest) = tile.rsplit_once("_X")?;
+    let (x_text, y_text) = rest.split_once('Y')?;
+    let x: u32 = x_text.parse().ok()?;
+    let y: u32 = y_text.parse().ok()?;
+    if ty.is_empty() {
+        return None;
+    }
+    Some((ty, x, y))
+}
+
 /// Which SLR holds a BEL at absolute Y, given the number of that BEL
 /// kind per column. Mirrors `BitLocator::slr_name`: the SLR whose
 /// clock-region row range contains Y. Returns the SLR name and the
@@ -225,9 +241,11 @@ fn int_col_major(device: &DeviceFile, int_x: u32, row_major: u32) -> Option<(&st
 /// Resolve a Vivado tile name to its segbits tile type and base FAR
 /// (the FAR of the tile's frame offset 0; `BitRef` frame offsets add
 /// to it). Returns `None` for any tile the device file does not
-/// cover: unknown names, HPIO/HDIO/CMT/DSP tiles (no column mapping
-/// in the file), RAMB36 tiles (no resolver), and INT tiles where
-/// the provisional rule fails validation.
+/// cover: unknown names, HPIO/CMT/DSP tiles (no column mapping in
+/// the file), INT_INTF/HDIO tiles when no INT_INTF/HDIO table is
+/// attached or the (type, row, X) is not in it, RAMB36 tiles (no
+/// resolver), and INT tiles where the provisional rule fails
+/// validation.
 fn resolve_tile<'a>(device: &'a DeviceFile, tile: &str) -> Option<(&'a str, u32)> {
     if let Some((x, y)) = parse_slice_tile(tile) {
         let (slr, row_major) = slr_row_for_y(device, y, NUM_CLB_PER_COLUMN)?;
@@ -254,14 +272,40 @@ fn resolve_tile<'a>(device: &'a DeviceFile, tile: &str) -> Option<(&'a str, u32)
             .to_u32();
         return Some(("BRAM", base));
     }
+    // Interface tiles (INT_INTF_* and HDIO_*): the column comes from
+    // the tilegrid-derived INT_INTF/HDIO table (IntfColumnTable,
+    // xczu3eg only so far), keyed by (tile type, FAR row, tile X).
+    // The FAR row is y // 60, the same clock-region rule as INT
+    // tiles. A (type, row, X) the table does not list fails loud: a
+    // tile type with no tilegrid windows (INT_INTF_L/R/L_PCIE4/
+    // RIGHT_TERM_IO) is never in the table, so its tiles do not
+    // resolve instead of borrowing another type's column. The table
+    // is ground truth, so no minors validation applies: every entry
+    // is a recorded baseaddr (verified by tools/verify_xczu3eg.py
+    // section 11, 283 windowed tiles, 15 entries, 0 conflicts).
+    if let Some((ty, x, y)) = parse_intf_tile(tile) {
+        if !ty.starts_with("INT_INTF") && !ty.starts_with("HDIO") {
+            return None;
+        }
+        let (_slr, row_major) = slr_row_for_y(device, y, NUM_CLB_PER_COLUMN)?;
+        // The canonical type string comes from the table's own key,
+        // so the returned &str borrows from the device, not the tile
+        // name (the trait's tile_type borrows from &self).
+        let (canon_ty, col) = device.intf_column_entry(ty, row_major, x)?;
+        let base = Far::new(FarBlockType::ClbIoClk, row_major, col, 0)
+            .ok()?
+            .to_u32();
+        return Some((canon_ty, base));
+    }
     None
 }
 
 /// All tile names in the device file that resolve, sorted and
 /// deduplicated: every SLICE tile, every resolving INT tile, every
-/// RAMB18 tile. Tiles that do not resolve (HPIO/HDIO/CMT/DSP,
-/// RAMB36, rule-invalid INT tiles) are absent by design. When a
-/// tilegrid-derived INT column table is attached, INT tiles are
+/// RAMB18 tile, and every INT_INTF/HDIO tile the attached table
+/// covers. Tiles that do not resolve (HPIO/CMT/DSP, RAMB36,
+/// rule-invalid INT tiles, and INT_INTF/HDIO tiles with no table)
+/// are absent by design. When a tilegrid-derived INT column table is attached, INT tiles are
 /// enumerated from the table (33 columns x 3 rows on xczu3eg),
 /// not from the CLB-column enumeration the provisional rule uses.
 fn compute_tile_names(device: &DeviceFile) -> Vec<String> {
@@ -302,6 +346,24 @@ fn compute_tile_names(device: &DeviceFile) -> Vec<String> {
                     for y_ofst in 0..NUM_CLB_PER_COLUMN {
                         let abs_y = (min_clk_row + row_major) * NUM_CLB_PER_COLUMN + y_ofst;
                         names.push(format!("INT_X{int_x}Y{abs_y}"));
+                    }
+                }
+            }
+            // Interface tiles from the INT_INTF/HDIO table: one name
+            // per (type, row, X) per absolute Y in the row, the same
+            // 60-per-row enumeration as INT. INT_INTF tiles exist at
+            // all 60 Y per row; HDIO tiles exist only at the row-start
+            // Y (Y0/Y60/Y120), so the parse-back row-start rule in
+            // bitgen.rs renders exactly the real HDIO tiles and the
+            // other 59 names per (row, X) stay silent (no bits).
+            if let Some(entries) = device.intf_column_entries() {
+                for (tile_type, row, intf_x) in entries.keys() {
+                    if *row != row_major {
+                        continue;
+                    }
+                    for y_ofst in 0..NUM_CLB_PER_COLUMN {
+                        let abs_y = (min_clk_row + row_major) * NUM_CLB_PER_COLUMN + y_ofst;
+                        names.push(format!("{tile_type}_X{intf_x}Y{abs_y}"));
                     }
                 }
             }

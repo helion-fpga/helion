@@ -96,6 +96,17 @@ pub enum TileconnError {
     WrongIntTileType { tile: String, tile_type: String },
     /// An INT tile name does not parse as `INT_X<num>Y<num>`.
     BadIntTileName(String),
+    /// A site name does not end in `X<num>Y<num>`, so its rank
+    /// among same-type sites cannot be computed.
+    BadSiteName(String),
+    /// A site's rank among same-type sites exceeds the tile-type
+    /// file's same-type entries (tilegrid / tile_type mismatch).
+    SiteIndexOutOfRange {
+        site: String,
+        tile_type: String,
+        index: usize,
+        count: usize,
+    },
     /// No sites were supplied to build the graph from.
     NoSites,
     /// The underlying INT-tile graph build failed.
@@ -141,6 +152,19 @@ impl fmt::Display for TileconnError {
             Self::BadIntTileName(n) => {
                 write!(f, "INT tile name '{}' does not parse as INT_X<num>Y<num>", n)
             }
+            Self::BadSiteName(n) => {
+                write!(f, "site name '{}' does not end in X<num>Y<num>", n)
+            }
+            Self::SiteIndexOutOfRange {
+                site,
+                tile_type,
+                index,
+                count,
+            } => write!(
+                f,
+                "site '{}' is rank {} among same-type sites but tile_type '{}' has only {} same-type entries",
+                site, index, tile_type, count
+            ),
             Self::NoSites => write!(f, "no sites supplied to build the tileconn wire DB"),
             Self::WireDb(e) => write!(f, "INT tile graph error: {}", e),
         }
@@ -225,6 +249,34 @@ fn external_wire(wire: &str) -> &str {
     wire.strip_suffix("_PIN").unwrap_or(wire)
 }
 
+/// Parse the trailing `X<num>Y<num>` of a site name (e.g.
+/// `IOB_X0Y0` -> (0, 0), `SLICE_X10Y10` -> (10, 10)) into tile-local
+/// or absolute coordinates. Returns `None` when the name has no
+/// such tail. Every site name in the tilegrid ends in `X<num>Y<num>`.
+fn parse_site_coords(name: &str) -> Option<(i32, i32)> {
+    let (_, rest) = name.rsplit_once("_X")?;
+    let (xs, ys) = rest.split_once('Y')?;
+    let x: i32 = xs.parse().ok()?;
+    let y: i32 = ys.parse().ok()?;
+    Some((x, y))
+}
+
+/// The rank-th same-type site template of a tile-type file, or
+/// `None` when the file has fewer same-type entries. The tile_type
+/// sites list orders same-type sites by (X, Y), so the rank (see
+/// [`SiteTile::site_index`]) selects the one template that belongs
+/// to the site.
+fn same_type_site<'a>(
+    file: &'a TileTypeFile,
+    site_type: &str,
+    index: usize,
+) -> Option<&'a TileTypeSite> {
+    file.sites
+        .iter()
+        .filter(|s| s.site_type == site_type)
+        .nth(index)
+}
+
 /// Parse `INT_X<num>Y<num>` into tile coordinates.
 fn parse_int_tile_name(name: &str) -> Result<(i32, i32), TileconnError> {
     let rest = name
@@ -278,6 +330,17 @@ pub struct SiteTile {
     pub tile_type: String,
     /// Site type, e.g. `SLICEL`.
     pub site_type: String,
+    /// Rank among same-type sites in the tile (0-based), by (X, Y)
+    /// parsed from the site name. A tile holds several sites of one
+    /// type (6 HDIOB_M on an HDIO tile); the tile_type sites list
+    /// holds one template per site, in the same (X, Y) order, so the
+    /// rank selects the template that belongs to this site. Without
+    /// it, pin resolution conflates the sites: every same-type
+    /// site's pins register under one site and the last one's wires
+    /// win. Computed at load time; `TileGridEntry.sites` is a
+    /// HashMap, so its order is lost and the rank must be derived
+    /// from the names.
+    pub site_index: usize,
     pub grid_x: i32,
     pub grid_y: i32,
 }
@@ -405,12 +468,34 @@ impl TileconnDb {
                 sited_types.push(entry.tile_type.clone());
             }
             for (site_name, site_type) in &entry.sites {
+                // Rank among same-type sites in this tile, by (X, Y)
+                // parsed from the site name (see SiteTile::site_index).
+                // The sites map is unordered, so the rank is counted
+                // explicitly; a site name without coordinates fails
+                // loud instead of mis-ranking.
+                let (sx, sy) = parse_site_coords(site_name).ok_or_else(|| {
+                    TileconnError::BadSiteName(site_name.clone())
+                })?;
+                let mut site_index = 0usize;
+                for (other_name, other_type) in &entry.sites {
+                    if other_type != site_type {
+                        continue;
+                    }
+                    let (ox, oy) =
+                        parse_site_coords(other_name).ok_or_else(|| {
+                            TileconnError::BadSiteName(other_name.clone())
+                        })?;
+                    if (ox, oy) < (sx, sy) {
+                        site_index += 1;
+                    }
+                }
                 site_tiles.insert(
                     site_name.clone(),
                     SiteTile {
                         tile: name.clone(),
                         tile_type: entry.tile_type.clone(),
                         site_type: site_type.clone(),
+                        site_index,
                         grid_x: entry.grid_x,
                         grid_y: entry.grid_y,
                     },
@@ -555,29 +640,23 @@ impl TileconnDb {
 
     /// `(INT tile name, INT wire name)` for one site pin, or `None`
     /// when the pin has no INT partner (carry pins, unmapped pins).
+    /// The pin is read from the site's own template only (the
+    /// rank-th same-type entry in the tile-type file): a tile with
+    /// several sites of one type used to loop over all of them and
+    /// return `None` on the ambiguity, so a pin present on more than
+    /// one same-type site never resolved.
     pub fn int_tile_for_site(&self, site: &str, pin: &str) -> Option<(String, String)> {
         let st = self.site_tiles.get(site)?;
         let file = self.tile_types.get(&st.tile_type)?;
-        let mut found: Option<(String, String)> = None;
-        for s in &file.sites {
-            if s.site_type != st.site_type {
-                continue;
-            }
-            let Some(Some(info)) = s.site_pins.get(pin) else {
-                continue;
-            };
-            let ext = external_wire(&info.wire);
-            let Some(edge) = self.edges.get(&(st.tile_type.clone(), ext.to_string())) else {
-                continue;
-            };
-            let (gx, gy) = (st.grid_x + edge.delta.0, st.grid_y + edge.delta.1);
-            let (tile, _) = self.tile_by_grid.get(&(gx, gy))?;
-            if found.is_some() {
-                return None;
-            }
-            found = Some((tile.clone(), edge.int_wire.clone()));
-        }
-        found
+        let s = same_type_site(file, &st.site_type, st.site_index)?;
+        let Some(Some(info)) = s.site_pins.get(pin) else {
+            return None;
+        };
+        let ext = external_wire(&info.wire);
+        let edge = self.edges.get(&(st.tile_type.clone(), ext.to_string()))?;
+        let (gx, gy) = (st.grid_x + edge.delta.0, st.grid_y + edge.delta.1);
+        let (tile, _) = self.tile_by_grid.get(&(gx, gy))?;
+        Some((tile.clone(), edge.int_wire.clone()))
     }
 
     /// Coverage for one (tile type, site type).
@@ -700,30 +779,41 @@ impl TileconnWireDb {
                     path: db.part_dir.join("tile_types"),
                 }
             })?;
-            for s in &file.sites {
-                if s.site_type != st.site_type {
+            // Register this site's own pins only (the rank-th
+            // same-type template): looping over every same-type
+            // template registered all of them under this one site
+            // and add_pin_wire kept the last one's wires.
+            let s = same_type_site(file, &st.site_type, st.site_index).ok_or_else(|| {
+                TileconnError::SiteIndexOutOfRange {
+                    site: site_name.clone(),
+                    tile_type: st.tile_type.clone(),
+                    index: st.site_index,
+                    count: file
+                        .sites
+                        .iter()
+                        .filter(|s| s.site_type == st.site_type)
+                        .count(),
+                }
+            })?;
+            for (pin, pin_info) in &s.site_pins {
+                let Some(info) = pin_info else {
                     continue;
+                };
+                let ext = external_wire(&info.wire);
+                let Some((int_tile, int_wire)) = resolve_int_tile(&db, st, ext)? else {
+                    continue;
+                };
+                let (tx, ty) = parse_int_tile_name(&int_tile)?;
+                if tile_seen.insert(int_tile.clone(), ()).is_none() {
+                    int_tiles.push(IntTile::new(&int_tile, tx, ty));
                 }
-                for (pin, pin_info) in &s.site_pins {
-                    let Some(info) = pin_info else {
-                        continue;
-                    };
-                    let ext = external_wire(&info.wire);
-                    let Some((int_tile, int_wire)) = resolve_int_tile(&db, st, ext)? else {
-                        continue;
-                    };
-                    let (tx, ty) = parse_int_tile_name(&int_tile)?;
-                    if tile_seen.insert(int_tile.clone(), ()).is_none() {
-                        int_tiles.push(IntTile::new(&int_tile, tx, ty));
-                    }
-                    regs.push((
-                        *site,
-                        pin.clone(),
-                        pin.clone(),
-                        int_tile,
-                        int_wire,
-                    ));
-                }
+                regs.push((
+                    *site,
+                    pin.clone(),
+                    pin.clone(),
+                    int_tile,
+                    int_wire,
+                ));
             }
             // Flow BEL-pin aliases for CLE slices (see module docs).
             if st.site_type == "SLICEL" || st.site_type == "SLICEM" {
@@ -738,15 +828,19 @@ impl TileconnWireDb {
                             path: db.part_dir.join("tile_types"),
                         }
                     })?;
-                    let mut ext_wire: Option<String> = None;
-                    for s in &file.sites {
-                        if s.site_type != st.site_type {
-                            continue;
-                        }
-                        if let Some(Some(info)) = s.site_pins.get(site_pin) {
-                            ext_wire = Some(external_wire(&info.wire).to_string());
-                        }
-                    }
+                    // The site's own template only: the old loop
+                    // over every same-type template kept the last
+                    // one's wire.
+                    let s = same_type_site(file, &st.site_type, st.site_index);
+                    let ext_wire: Option<String> = match s {
+                        Some(s) => match s.site_pins.get(site_pin) {
+                            Some(Some(info)) => {
+                                Some(external_wire(&info.wire).to_string())
+                            }
+                            _ => None,
+                        },
+                        None => None,
+                    };
                     let Some(ext) = ext_wire else {
                         return Ok(());
                     };
@@ -913,6 +1007,37 @@ mod tests {
       }}]
     }"#;
 
+    /// Two-site fixture (separate from TINY, whose counts it must
+    /// not disturb): one tile type with TWO sites of the same type
+    /// and distinct OP wires. Before the site_index fix,
+    /// int_tile_for_site returned None for OP on both sites (the
+    /// ambiguity) and from_db_and_sites registered both OP wires
+    /// under one site with the last (highest-Y) wire winning.
+    const TWO_SITE_TILECONN: &str = r#"[
+      {"grid_deltas": [-1, 0], "tile_types": ["TESTIO", "INT"], "wire_pairs": [
+        ["TEST_IOBPAIR_0_OP", "IMUX_E10"],
+        ["TEST_IOBPAIR_2_OP", "IMUX_E12"]
+      ]}
+    ]"#;
+
+    const TWO_SITE_TILEGRID: &str = r#"{
+      "TESTIO_X0Y0": {"grid_x": 10, "grid_y": 10, "type": "TESTIO",
+        "sites": {"IOB_X0Y0": "TESTIOB", "IOB_X0Y2": "TESTIOB"}},
+      "INT_X0Y0": {"grid_x": 9, "grid_y": 10, "type": "INT", "sites": {}}
+    }"#;
+
+    const TWO_SITE_TILE_TYPE_TESTIO: &str = r#"{
+      "tile_type": "TESTIO",
+      "sites": [
+        {"name": "X0Y0", "type": "TESTIOB", "site_pins": {
+          "OP": {"wire": "TEST_IOBPAIR_0_OP_PIN"}
+        }},
+        {"name": "X0Y2", "type": "TESTIOB", "site_pins": {
+          "OP": {"wire": "TEST_IOBPAIR_2_OP_PIN"}
+        }}
+      ]
+    }"#;
+
     fn fixture_db() -> (TempfileDir, TileconnDb) {
         // Fixture files live in a temp dir (tests never write
         // outside the temp dir). The dir name is unique per call:
@@ -956,6 +1081,76 @@ mod tests {
             y: 0,
             kind: 0,
         }
+    }
+
+    fn site1() -> UltraSite {
+        UltraSite {
+            x: 0,
+            y: 1,
+            kind: 0,
+        }
+    }
+
+    /// Two-site fixture DB (see TWO_SITE_* above). Separate builder
+    /// so TINY stays untouched.
+    fn fixture_db_two_sites() -> (TempfileDir, TileconnDb) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static FIXTURE_SEQ_2: AtomicU64 = AtomicU64::new(0);
+        let n = FIXTURE_SEQ_2.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "helion-tileconn-fixture2-{}-{n}",
+            std::process::id()
+        ));
+        let part_dir = dir.join("xczu3eg-sbva484-1-e");
+        let _ = fs::create_dir_all(&part_dir);
+        fs::write(part_dir.join("tileconn.json"), TWO_SITE_TILECONN).unwrap();
+        fs::write(part_dir.join("tilegrid.json"), TWO_SITE_TILEGRID).unwrap();
+        let root_types = dir.join("tile_types");
+        let _ = fs::create_dir_all(&root_types);
+        fs::write(
+            root_types.join("tile_type_TESTIO.json"),
+            TWO_SITE_TILE_TYPE_TESTIO,
+        )
+        .unwrap();
+        let db = TileconnDb::load(&dir, "xczu3eg-sbva484-1-e").unwrap();
+        (TempfileDir(dir), db)
+    }
+
+    #[test]
+    fn multi_site_type_resolves_each_sites_own_wire() {
+        let (_dir, db) = fixture_db_two_sites();
+        // Rank among same-type sites, by (X, Y): IOB_X0Y0 is first,
+        // IOB_X0Y2 second.
+        assert_eq!(db.site_tiles["IOB_X0Y0"].site_index, 0);
+        assert_eq!(db.site_tiles["IOB_X0Y2"].site_index, 1);
+        // Each site's OP resolves to its own INT wire (before the
+        // fix both returned None: the pin was present on both
+        // same-type templates, so the loop hit the ambiguity arm).
+        assert_eq!(
+            db.int_tile_for_site("IOB_X0Y0", "OP"),
+            Some(("INT_X0Y0".to_string(), "IMUX_E10".to_string()))
+        );
+        assert_eq!(
+            db.int_tile_for_site("IOB_X0Y2", "OP"),
+            Some(("INT_X0Y0".to_string(), "IMUX_E12".to_string()))
+        );
+        // The wire DB registers each OP under its own UltraSite with
+        // its own wire (before the fix both registered under one
+        // site and the last wire won).
+        let wdb = TileconnWireDb::from_db_and_sites(
+            TILE_JSON,
+            db,
+            &[(site0(), "IOB_X0Y0".into()), (site1(), "IOB_X0Y2".into())],
+        )
+        .unwrap();
+        assert_eq!(
+            wdb.wire_for_bel_pin(site0(), "OP", "OP"),
+            wdb.wire_id("INT_X0Y0", "IMUX_E10")
+        );
+        assert_eq!(
+            wdb.wire_for_bel_pin(site1(), "OP", "OP"),
+            wdb.wire_id("INT_X0Y0", "IMUX_E12")
+        );
     }
 
     #[test]

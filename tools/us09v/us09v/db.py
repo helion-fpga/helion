@@ -135,14 +135,39 @@ class Db:
 
     def site_index(self, site: str) -> tuple[str, int]:
         """site name -> (tile name, index into the tile type's sites
-        list). The tilegrid sites dict preserves the tile_type sites
-        list order, so the index is the site's position in the
-        tile's sites dict."""
-        tile, _stype = self.site_to_tile[site]
-        for i, name in enumerate(self.tilegrid[tile].get("sites", {})):
+        list). The index is the tile_type-list position, computed by
+        rank among same-type sites: the tilegrid sites dict and the
+        tile_type sites list both order same-type sites by (X, Y), so
+        the rank of the site among its type in the tilegrid dict
+        selects the same entry in the tile_type list. The tilegrid
+        dict order does NOT match the tile_type list order across
+        types (HDIO tiles interleave site types per coordinate), so
+        the tilegrid dict position is the wrong index: IOB_X0Y0 sits
+        at dict position 19 but tile_type index 4 (HDIOB_M X0Y0).
+        Consumers (fabric.site_pin_wire, ports.trace_pad_to_slice_pin,
+        routecheck._pin_wire) index the tile_type sites list, so they
+        need the tile_type index, not the dict position."""
+        tile, stype = self.site_to_tile[site]
+        rank = 0
+        for name, t in self.tilegrid[tile].get("sites", {}).items():
             if name == site:
-                return tile, i
-        raise KeyError(f"{site}: not listed in tile {tile} sites")
+                break
+            if t == stype:
+                rank += 1
+        else:
+            raise KeyError(f"{site}: not listed in tile {tile} sites")
+        ttype = self.tilegrid[tile]["type"]
+        same = [
+            i
+            for i, s in enumerate(self.tile_type(ttype)["sites"])
+            if s.get("type") == stype
+        ]
+        if rank >= len(same):
+            raise KeyError(
+                f"{site}: rank {rank} beyond {len(same)} {stype} "
+                f"sites in {ttype}"
+            )
+        return tile, same[rank]
 
     @property
     def package_pins(self) -> dict[str, str]:
