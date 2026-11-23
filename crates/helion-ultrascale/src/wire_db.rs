@@ -429,6 +429,17 @@ impl IntTileWireDb {
         Some(wire as usize % self.wire_names.len())
     }
 
+    /// Remove one intra-tile PIP edge (`src` -> `dst` on `tile`)
+    /// from the routing graph. See [`IntTileWireDb::remove_edge`].
+    /// Returns false when the tile or a wire is unknown, or the pair
+    /// was not an edge.
+    pub fn forbid_pip(&mut self, tile: &str, src: &str, dst: &str) -> bool {
+        let (Some(s), Some(d)) = (self.wire_id(tile, src), self.wire_id(tile, dst)) else {
+            return false;
+        };
+        self.remove_edge(s, d)
+    }
+
     /// Register a BEL pin to wire mapping. This is caller-supplied
     /// data: no public source maps BEL pins to INT wires, so the DB
     /// cannot derive it. Fails loud on an unknown tile or wire.
@@ -449,6 +460,50 @@ impl IntTileWireDb {
         self.pin_wires
             .insert((site.x, site.y, bel.to_string(), pin.to_string()), id);
         Ok(())
+    }
+
+    /// Remove one directed intra-tile PIP edge (`src` -> `dst`) from
+    /// the routing graph, so the router can never traverse it and the
+    /// translator can never emit it. The caller names the conflict
+    /// (the clock-leg avoidance in helion-cli removes a routed PIP
+    /// whose segbits disagree with every clock leg its tile must
+    /// carry). Only same-tile pairs are removed: a cross-tile pair
+    /// is a span-wire continuation, not a PIP, and is never a
+    /// segbits conflict. A bidirectional PIP removes both
+    /// directions: the PIP programs its bits whichever way the
+    /// router traverses it. Returns true when an edge was removed;
+    /// false when the pair was not an edge (unknown wire, different
+    /// tiles, or already removed). The PIP table is untouched, so
+    /// `pip_bidir` still answers for edges the router did use.
+    pub fn remove_edge(&mut self, src: WireId, dst: WireId) -> bool {
+        let Some(ts) = self.tile_of(src) else {
+            return false;
+        };
+        let Some(td) = self.tile_of(dst) else {
+            return false;
+        };
+        if ts != td {
+            return false;
+        }
+        let mut removed = false;
+        if let Some(list) = self.fanout.get_mut(src as usize) {
+            let before = list.len();
+            list.retain(|w| *w != dst);
+            removed = list.len() != before;
+        }
+        let (Some(is), Some(id)) = (self.wire_idx_of(src), self.wire_idx_of(dst)) else {
+            return removed;
+        };
+        if self.pip_table.get(&(is as u32, id as u32)) == Some(&true)
+            || self.pip_table.get(&(id as u32, is as u32)) == Some(&true)
+        {
+            if let Some(list) = self.fanout.get_mut(dst as usize) {
+                let before = list.len();
+                list.retain(|w| *w != src);
+                removed = removed || list.len() != before;
+            }
+        }
+        removed
     }
 
     /// Translate one ordered route (driver to sink, physical
@@ -615,6 +670,37 @@ mod tests {
         // LOGIC_OUTS_E0 drives INODE_E_1_FT1 directly.
         let logic = db.wire_id("INT_X12Y45", "LOGIC_OUTS_E0").unwrap();
         assert!(db.fanout(logic).contains(&inode));
+    }
+
+    #[test]
+    fn remove_edge_drops_one_directional_pip_only() {
+        // The clock-leg conflict PIP: LOGIC_OUTS_W22 drives
+        // INT_NODE_SDQ_80_INT_OUT1 (directional). Removing it must
+        // leave the sibling PIPs from the same source wire alone.
+        let mut db = one_tile();
+        let src = db.wire_id("INT_X12Y45", "LOGIC_OUTS_W22").unwrap();
+        let dst = db
+            .wire_id("INT_X12Y45", "INT_NODE_SDQ_80_INT_OUT1")
+            .unwrap();
+        let sib = db
+            .wire_id("INT_X12Y45", "INT_NODE_SDQ_78_INT_OUT0")
+            .unwrap();
+        assert!(db.fanout(src).contains(&dst));
+        assert!(db.fanout(src).contains(&sib));
+        assert!(!db.fanout(dst).contains(&src));
+        assert!(db.remove_edge(src, dst));
+        assert!(!db.fanout(src).contains(&dst));
+        assert!(db.fanout(src).contains(&sib));
+        // Second removal is a no-op, not an error.
+        assert!(!db.remove_edge(src, dst));
+        // A cross-tile continuation pair is not a PIP edge and is
+        // never removed.
+        let db2 = two_tiles_north();
+        let beg = db2.wire_id("INT_X12Y45", "NN12_BEG7").unwrap();
+        let end = db2.wire_id("INT_X12Y57", "NN12_END7").unwrap();
+        let mut db2 = db2;
+        assert!(!db2.remove_edge(beg, end));
+        assert!(db2.fanout(beg).contains(&end));
     }
 
     #[test]
