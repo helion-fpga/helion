@@ -209,6 +209,52 @@ def check_route_fasm(
             nid = node_of(wtile, wire)
             real_drivers[nid].append(f"primary {site}.{pin}")
             local_drivers[nid].append(f"primary {site}.{pin}")
+    # Clock spine (assumption A-CLKSPINE, see README): a leg PIP
+    # (CTRL_Wx <- INT_NODE_GLOBAL_y <- GCLK_B_0_z) asserts a slice is
+    # clocked by the device clock distribution network. The GCLK spine
+    # node stitches to a BUFCE_LEAF CLK_LEAF output pin, and the
+    # network's only source in this harness is the design's clock
+    # primary (the port mapped to a CLK1/CLK2 site pin). The spine
+    # counts as a real driver only for that leg shape: every active
+    # PIP sourced from the spine node must feed a GLOBAL wire, and
+    # there must be exactly one clock port. Without a clock port the
+    # spine stays undriven and the leg fails as driven-only-by-PIP,
+    # exactly like any other undriven net.
+    clock_ports = [
+        p for p, (_s, pin) in (port_ins or {}).items() if pin in ("CLK1", "CLK2")
+    ]
+    if len(clock_ports) == 1:
+        src_pips: dict[int, list[tuple[str, str]]] = defaultdict(list)
+        for tile, plist in active_pips.items():
+            for src, dst in plist:
+                src_pips[node_of(tile, src)].append((tile, dst))
+        for nid, dsts in src_pips.items():
+            if not all(dst.startswith("INT_NODE_GLOBAL") for _t, dst in dsts):
+                continue
+            is_spine = False
+            for tile, wire in fabric.nodes[nid]:
+                ttype = _tile_type_for(db, tile, provisional)
+                if ttype is None:
+                    continue
+                tt = fabric.tt(ttype)
+                got = tt["site_pin_wire"].get(wire)
+                if got is None:
+                    continue
+                si, pin = got
+                sites = tt["sites"]
+                if si >= len(sites):
+                    continue
+                stype = sites[si].get("type")
+                if (
+                    stype == "BUFCE_LEAF"
+                    and pin == "CLK_LEAF"
+                    and _pin_dir(db, stype, pin) == "OUT"
+                ):
+                    is_spine = True
+                    break
+            if is_spine:
+                real_drivers[nid].append(f"clock spine ({clock_ports[0]})")
+                local_drivers[nid].append(f"clock spine ({clock_ports[0]})")
     # Active PIPs drive their dst node.
     pip_edges: dict[int, list[int]] = defaultdict(list)
     for tile, plist in active_pips.items():

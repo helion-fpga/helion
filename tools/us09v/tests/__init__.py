@@ -87,6 +87,32 @@ def byp_shape_port_ins():
     return {"clk": ("SLICE_X1Y0", "CLK1")}
 
 
+def clock_leg_tiles():
+    """The clock-leg shape (spanclk lane): the BYP-shape entry slice
+    plus a second slice SLICE_X4Y0 whose ABCD FF clocks through a
+    GCLK leg on INT_X3Y0 (CTRL_W4 <- GLOBAL_14 <- GCLK_B_0_9).
+    The second slice's LUT B is constant, so it has no LUT-input
+    sink; its only fabric sink is CLK1, driven by the leg. Fresh
+    dict on every call so tests can mutate their copy.
+    """
+    tiles = byp_shape_tiles()
+    tiles["SLICE_X4Y0"] = {
+        "B6LUT.INIT[63:0]": 0xFFFFFFFFFFFFFFFF,
+        "BFF.INIT.V0": None,
+        "BFF.SRVAL.V0": None,
+        "ABCDFF.CEUSED.V0": None,
+        "ABCDFF.SRUSED.V0": None,
+        "ABCDFF.CLKINV.V0": None,
+        "ABCDFF.SRINV.V0": None,
+        "FFMUXB1.D6": None,
+    }
+    tiles["INT_X3Y0"] = {
+        "PIP.CTRL_W4.INT_NODE_GLOBAL_14_INT_OUT0": None,
+        "PIP.INT_NODE_GLOBAL_14_INT_OUT0.GCLK_B_0_9": None,
+    }
+    return tiles
+
+
 def byp_cross_letter_tiles():
     """The cross-letter BYP shape (bypleg lane): the byp2 flow
     design, reduced to the two routed legs. LUT A drives FF A1

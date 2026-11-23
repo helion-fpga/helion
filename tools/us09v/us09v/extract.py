@@ -23,6 +23,17 @@ vendored segbits feature vocabulary:
   A->F7A, B->F8A, C->F7B, D->F8A, E->F7C, F->F8B, G->F7D, H->F9.
   Every use is recorded as a warning: the mapping is not validated
   against a Vivado F7/F8 build yet.
+* Clock spine (assumption A-CLKSPINE, see README): a slice clock
+  pin fed by a leg PIP (CTRL_Wx <- INT_NODE_GLOBAL_y <- GCLK_B_0_z)
+  resolves to the design's clock primary, the port mapped to a
+  CLK1/CLK2 site pin. The GCLK spine is the device clock
+  distribution network, driven by BUFCE_LEAF clock leaves; the
+  BUFG/RCLK tree above the leaves is not modelled (blocked clock
+  network scope), so the leg is the asserted connection and the
+  primary is the only clock source the harness has. The rule fires
+  only for the leg shape: a node used as a data route through a
+  GCLK wire does not resolve, and with no single clock port the
+  spine stays undriven.
 * CARRY8: S[i] is the LUT O6 output, DI[i] is the DI mux selection
   (DI{i}.X{i} = bypass pin, DI{i}.DI{i} is unmodelled and fails loud),
   O[i] = S[i] ^ C[i], CO[i] = S[i] ? C[i] : DI[i]. SINGLE_CY8 ripples
@@ -290,6 +301,22 @@ class Extractor:
                         sources.append(("primary", self._port_in_by_sitepin[(s.name, pin)]))
                     elif s.stype in SLICE_TYPES:
                         sources.append(("site", s.name, pin))
+                    elif s.stype == "BUFCE_LEAF" and pin == "CLK_LEAF":
+                        # Clock spine leaf (assumption A-CLKSPINE):
+                        # the GCLK spine is the device clock
+                        # distribution network, and the flow asserts
+                        # a slice is clocked by it with a leg PIP
+                        # (CTRL_Wx <- GLOBAL <- GCLK). The leaf
+                        # resolves to the design's clock primary,
+                        # but only when the node is used as a clock
+                        # leg: every active PIP sourced from it must
+                        # feed a GLOBAL wire. A data net routed
+                        # through a GCLK wire does not resolve here.
+                        clk = self._clock_port()
+                        if clk is not None and self._is_clock_leg_node(nid):
+                            sources.append(("primary", clk))
+                        elif self.tiles.get(tile):
+                            sources.append(("unmodelled", s.name, pin))
                     elif self.tiles.get(tile):
                         sources.append(("unmodelled", s.name, pin))
                     # An unconfigured site drives nothing.
@@ -308,7 +335,7 @@ class Extractor:
         result: tuple = ("undriven",)
         resolved = []
         for s in sources:
-            if s[0] in ("site", "const", "unmodelled"):
+            if s[0] in ("site", "const", "unmodelled", "primary"):
                 resolved.append(s)
                 continue
             r = self.driver(self.fab.node(s[1], s[2]), stack)
@@ -342,6 +369,42 @@ class Extractor:
         if _stack is None or result[0] != "undriven":
             self._driver_memo[nid] = result
         return result
+
+    def _clock_port(self) -> str | None:
+        """The design's clock primary: the port mapped to a CLK1/CLK2
+        site pin. None when there is not exactly one: with no clock
+        port, or an ambiguous one, the spine has no source and stays
+        undriven instead of guessing."""
+        found = [
+            p for p, (_site, pin) in self.port_ins.items() if pin in ("CLK1", "CLK2")
+        ]
+        return found[0] if len(found) == 1 else None
+
+    def _is_clock_leg_node(self, nid: int) -> bool:
+        """True when the node is used only as a clock leg: at least
+        one active PIP is sourced from a member wire, and every such
+        PIP feeds an INT_NODE_GLOBAL wire (the CTRL <- GLOBAL <- GCLK
+        leg shape). A node with no active PIP, or one feeding a data
+        wire, is not a leg."""
+        found = False
+        for tile, wire in self.fab.nodes[nid]:
+            ttype = self._ttype(tile)
+            if ttype is None:
+                continue
+            tt = self.fab.tt(ttype)
+            act = self.tiles.get(tile, {})
+            for src, dst in tt["pip_pairs"]:
+                if src != wire:
+                    continue
+                if (
+                    f"PIP.{dst}.{src}" in act
+                    or f"PIP.{dst}.{src}.FWD" in act
+                    or f"PIP.{src}.{dst}.REV" in act
+                ):
+                    if not dst.startswith("INT_NODE_GLOBAL"):
+                        return False
+                    found = True
+        return found
 
     def _pin_dir(self, stype: str, pin: str) -> str:
         if not self.db.has_site_type(stype):

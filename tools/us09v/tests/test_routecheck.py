@@ -11,6 +11,7 @@ from tests import (  # noqa: E402
     byp_cross_letter_tiles,
     byp_shape_port_ins,
     byp_shape_tiles,
+    clock_leg_tiles,
     fixture_ports,
     load_db,
     load_fabric,
@@ -384,6 +385,42 @@ class TestFwdRevNormalization(RouteBase):
         tiles["INT_X6Y10"] = {f"PIP.{d}.{s}": None, f"PIP.{d}.{s}.FWD": None}
         rep = check_route_fasm(self.db, tiles, self.fabric)
         self.assertEqual(rep.pips, 1)
+
+
+class TestClockLeg(RouteBase):
+    """Clock-leg shape (spanclk lane, assumption A-CLKSPINE): a
+    slice past the clock-entry slice clocks through a leg PIP
+    (CTRL_W4 <- INT_NODE_GLOBAL_14 <- GCLK_B_0_9). The spine node
+    stitches to a BUFCE_LEAF CLK_LEAF output pin and resolves to
+    the design's clock primary; without a clock port the leg has
+    no source and fails as driven-only-by-PIP."""
+
+    def test_clock_leg_passes(self):
+        tiles = clock_leg_tiles()
+        port_ins = {"clk": ("SLICE_X1Y0", "CLK1")}
+        rep = check_route_fasm(self.db, tiles, self.fabric, port_ins=port_ins)
+        self.assertEqual(rep.violations, [], rep.violations)
+
+    def test_clock_leg_without_clock_port_fails(self):
+        # No clock port: the spine has no source, so the leg PIPs
+        # are driven only by a PIP, not reachable from a driver.
+        tiles = clock_leg_tiles()
+        rep = check_route_fasm(self.db, tiles, self.fabric, port_ins={})
+        self.assertTrue(
+            any("GLOBAL_14" in v and "driven only by a PIP" in v for v in rep.violations),
+            f"violations were {rep.violations}",
+        )
+
+    def test_clock_leg_without_leg_pip_fails(self):
+        # The second slice's CLK1 with no leg PIP: an undriven sink.
+        tiles = clock_leg_tiles()
+        del tiles["INT_X3Y0"]
+        port_ins = {"clk": ("SLICE_X1Y0", "CLK1")}
+        rep = check_route_fasm(self.db, tiles, self.fabric, port_ins=port_ins)
+        self.assertTrue(
+            any("undriven sink" in v and "CLK1" in v for v in rep.violations),
+            f"violations were {rep.violations}",
+        )
 
 
 class TestGoldenPips(RouteBase):
