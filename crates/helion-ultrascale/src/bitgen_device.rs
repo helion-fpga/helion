@@ -151,6 +151,32 @@ fn parse_int_tile(tile: &str) -> Option<(u32, u32)> {
     Some((x, y))
 }
 
+/// Bit shift applied to segbits refs for a plain INT tile.
+///
+/// Grounding: prjuray-db tilegrid for xczu3eg gives every INT tile in
+/// a 60-row clock region the same base FAR and 76 frames, with an
+/// `offset` that steps 3 per Y and jumps 6 at Y30 (the HCLK spine):
+/// offset(y) = 3*(y%60) + 6 when (y%60) >= 30. The BitFiltrator
+/// LutLoc Y_ofst table for CLB tiles shows the identical progression
+/// in frame_ofst: +48 bits per Y, +96 at Y30. One tilegrid offset unit
+/// is therefore 16 bits, and the tile's 48-bit segbits window starts at
+/// 16 * offset(y) bits into each frame. The segbits DB lines carry the
+/// Y0 mapping only (bits 0..47); without the shift, two tiles in one
+/// column map the same mux to the same (FAR, bit) and bitgen rejects
+/// the second PIP with MustBeZeroViolated. The shift is exact: the
+/// highest window (Y59, offset 183) ends at bit 47 + 16*183 = 2975,
+/// the last bit of the 93-word frame. Non-INT tiles shift 0: CLB
+/// tiles carry their Y offset in the BitFiltrator tables, and
+/// INT_INTF/HDIO tiles keep their existing row-start handling.
+pub(crate) fn int_tile_bit_shift(tile: &str) -> u16 {
+    let Some((_, y)) = parse_int_tile(tile) else {
+        return 0;
+    };
+    let y_in_row = y % NUM_CLB_PER_COLUMN;
+    let offset = 3 * y_in_row + if y_in_row >= 30 { 6 } else { 0 };
+    (16 * offset) as u16
+}
+
 /// Parse `RAMB18_X<x>Y<y>` into (x, y). Only 18K BRAM tiles are
 /// supported, as in `BitLocator`.
 fn parse_bram_tile(tile: &str) -> Option<(u32, u32)> {
@@ -473,5 +499,27 @@ impl BitgenDevice for DeviceFile {
     fn config_order_fars(&self) -> &[u32] {
         self.config_order_cache
             .get_or_init(|| compute_config_order_fars(self))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn int_tile_bit_shift_matches_tilegrid_offsets() {
+        // Tilegrid offsets (xczu3eg INT_X1 column) times 16 bits:
+        // Y0 0, Y1 3, Y2 6, Y29 87, Y30 96, Y59 183; Y60 starts a
+        // new FAR row, so its shift is 0 again.
+        assert_eq!(int_tile_bit_shift("INT_X1Y0"), 0);
+        assert_eq!(int_tile_bit_shift("INT_X1Y1"), 48);
+        assert_eq!(int_tile_bit_shift("INT_X1Y2"), 96);
+        assert_eq!(int_tile_bit_shift("INT_X1Y29"), 1392);
+        assert_eq!(int_tile_bit_shift("INT_X1Y30"), 1536);
+        assert_eq!(int_tile_bit_shift("INT_X1Y59"), 2928);
+        assert_eq!(int_tile_bit_shift("INT_X1Y60"), 0);
+        assert_eq!(int_tile_bit_shift("INT_X2Y1"), 48);
+        assert_eq!(int_tile_bit_shift("SLICE_X0Y0"), 0);
+        assert_eq!(int_tile_bit_shift("INT_INTF_R_PCIE4_X9Y120"), 0);
     }
 }

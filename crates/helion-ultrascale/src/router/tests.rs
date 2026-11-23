@@ -180,6 +180,50 @@ fn counter_unrepaired_netlist_still_fails_loud() {
 }
 
 #[test]
+fn sink_wire_is_not_shared_with_a_through_net() {
+    // counter5 regression, pinned as an invariant: cnt_1_d sinks at
+    // BYPASS_W1 (its FF D pin stitches to that wire) while cnt_3
+    // passed through the same wire on its way to IMUX_W26 in the
+    // full flow. The old router excluded terminals from presence,
+    // so it reported overused=0 while emitting two PIPs into
+    // BYPASS_W1, which bitgen rejects (MustBeZero). With terminals
+    // counted, cnt_3 must detour around BYPASS_W1 and the two nets
+    // share no wire at all. Note this small netlist also routes
+    // cleanly on the old router (the sharing needs the full
+    // counter5 congestion to emerge), so it pins the invariant
+    // rather than failing on the base tip; the fail-on-base proof
+    // for this fix is the counter5 flow itself (bitgen MustBeZero
+    // on base, verify-bit PASS with the fix).
+    let mut db = int_tile_db();
+    pin(&mut db, "C6LUT", "O6", "LOGIC_OUTS_W4");
+    pin(&mut db, "BQ", "D", "BYPASS_W1");
+    pin(&mut db, "AQ", "Q", "LOGIC_OUTS_W2");
+    pin(&mut db, "A6LUT", "I4", "IMUX_W26");
+    pin(&mut db, "A6LUT", "I5", "IMUX_W44");
+    let nets = vec![
+        rnet(
+            "cnt_3",
+            "AQ",
+            "Q",
+            &[("A6LUT", "I4"), ("A6LUT", "I5")],
+        ),
+        rnet("cnt_1_d", "C6LUT", "O6", &[("BQ", "D")]),
+    ];
+    let r = route_ultra(&nets, &db, UltraRouteOpts::default())
+        .expect("both nets must route");
+    assert_eq!(r.overused_nodes, 0);
+    let bypass = db.wire_id("INT_X1Y0", "BYPASS_W1").unwrap();
+    assert!(
+        r.routes[1].contains(&bypass),
+        "cnt_1_d must still sink at BYPASS_W1"
+    );
+    assert!(
+        !r.routes[0].contains(&bypass),
+        "cnt_3 must not pass through the sink wire BYPASS_W1"
+    );
+}
+
+#[test]
 fn determinism_same_seed_identical_routes() {
     let db = small_db();
     let nets = vec![

@@ -237,7 +237,10 @@ fn astar(
             // PathFinder cost: base 1 + hist + pres * pres_fac, where
             // pres counts OTHER nets only (see astar docs): a wire
             // this net already uses costs no presence penalty.
-            // Skip src/dst terminals in congestion accounting (handled by caller).
+            // `pres` counts every wire other nets use, terminals
+            // included (the caller counts them), so a sink wire of
+            // another net is expensive to pass through, as it must
+            // be: one mux drives one wire.
             let pres_others = pres[ni].saturating_sub(u32::from(own[ni]));
             let cost = 1i64 + hist[ni] as i64 + pres_others as i64 * pres_fac;
             let ng = g + cost;
@@ -397,13 +400,33 @@ pub fn route_ultra(
                             if !seen[wi] {
                                 seen[wi] = true;
                                 net_wires.push(w);
-                                // Count intermediate nodes toward present congestion.
-                                // Terminals (src/sink of THIS net) do not congest
-                                // themselves. Each net counts a wire once.
-                                if w != *src && !sinks.contains(&w) {
-                                    pres[wi] = pres[wi].saturating_add(1);
-                                    own[wi] = true;
-                                }
+                                // Count EVERY wire this net uses toward
+                                // present congestion, terminals
+                                // included. A wire is one physical
+                                // conductor driven by one mux: a net
+                                // that sinks at a wire (a FF D pin
+                                // whose site pin stitches to BYPASS_W1)
+                                // and a net that passes through the
+                                // same wire each drive it through a
+                                // different PIP, and bitgen rejects the
+                                // second PIP (MustBeZero) even though
+                                // the old code counted pres=1 and
+                                // reported overused=0. The old code
+                                // excluded src/sinks here, so that
+                                // sink/through sharing was invisible
+                                // to PathFinder. Each net still counts
+                                // a wire once (`seen`), and `own`
+                                // still exempts a net from its own
+                                // wires, so multi-sink trunks stay
+                                // free for their own net. Forced
+                                // sharing stays impossible to clear:
+                                // two nets that must sink at the same
+                                // wire (the unrepaired counter's BQ
+                                // and BQ2 both sink at BYPASS_W1)
+                                // still time out loudly, as the
+                                // router test requires.
+                                pres[wi] = pres[wi].saturating_add(1);
+                                own[wi] = true;
                             }
                         }
                     }

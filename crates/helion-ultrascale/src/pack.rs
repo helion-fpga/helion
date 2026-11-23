@@ -289,6 +289,13 @@ pub fn pack_ultra(
     // Place each FF in the first slice with a compatible control set.
     // No LUT-driver affinity is attempted; that is a QoR item, not a
     // correctness requirement (D7: the old comment overclaimed this).
+    // When no existing slice can take an FF, create a fresh slice
+    // for it instead of failing: the old code failed on the first FF
+    // of any FF-only design (shift32 synths to 0 LUTs, so the LUT
+    // loop above created no slices at all), and a design with more
+    // FFs than the existing slices hold also needs new slices.
+    // A fresh slice is empty, so bel 0 always accepts the FF; later
+    // FFs fill it through the normal loop above.
     for (ff_name, clk, ce, sr) in ffs {
         let mut placed = false;
         for slice in &mut packed.slices {
@@ -308,9 +315,16 @@ pub fn pack_ultra(
             }
         }
         if !placed {
-            return Err(format!(
-                "cannot place FF {ff_name}: no slice with compatible control set"
-            ));
+            let slice_name = format!("SLICE_X0Y{}", slice_idx);
+            let mut slice = PackedUltraSlice::new(slice_name, SliceKind::Logic);
+            debug_assert!(slice.can_place_ff(0, clk, ce, sr, limits));
+            slice.ffs.insert(0, ff_name.clone());
+            slice.ff_clk.insert(0, clk.clone());
+            slice.ff_ce.insert(0, ce.clone());
+            slice.ff_sr.insert(0, sr.clone());
+            packed.stats.ff_count += 1;
+            packed.slices.push(slice);
+            slice_idx += 1;
         }
     }
 
@@ -345,6 +359,40 @@ mod tests {
         let packed = pack_ultra(&luts, &ffs, &chains, &limits).unwrap();
         assert_eq!(packed.stats.lut_count, 2);
         assert_eq!(packed.slices.len(), 1);
+    }
+
+    #[test]
+    fn ff_only_design_creates_slices() {
+        // shift32 shape: 0 LUTs, 32 FFs on one clock. Before the fix
+        // the FF loop found no slices at all and failed on the first
+        // FF ("no slice with compatible control set"); now it creates
+        // slices as needed, 16 FFs per slice.
+        let limits = ControlSetLimits::default();
+        let luts = vec![];
+        let ffs: Vec<(String, String, Option<String>, Option<String>)> = (0..32)
+            .map(|i| (format!("ff{i}"), "clk".to_string(), None, None))
+            .collect();
+        let chains = vec![];
+        let packed = pack_ultra(&luts, &ffs, &chains, &limits).unwrap();
+        assert_eq!(packed.stats.ff_count, 32);
+        assert_eq!(packed.slices.len(), 2);
+        assert!(packed.slices.iter().all(|s| s.ffs.len() == 16));
+    }
+
+    #[test]
+    fn ff_overflow_creates_extra_slice() {
+        // One LUT slice exists, but 20 FFs on one clock exceed its
+        // 16-FF capacity; the overflow creates a second slice
+        // instead of failing.
+        let limits = ControlSetLimits::default();
+        let luts = vec![("lut0".to_string(), 0xAAAAAAAAAAAAAAAA, false)];
+        let ffs: Vec<(String, String, Option<String>, Option<String>)> = (0..20)
+            .map(|i| (format!("ff{i}"), "clk".to_string(), None, None))
+            .collect();
+        let chains = vec![];
+        let packed = pack_ultra(&luts, &ffs, &chains, &limits).unwrap();
+        assert_eq!(packed.stats.ff_count, 20);
+        assert_eq!(packed.slices.len(), 2);
     }
 
     #[test]

@@ -207,7 +207,23 @@ pub fn place_ultra(
         }
     }
 
-    // Phase 2: Place remaining slices in seeded order.
+    // Phase 2: Place remaining slices in seeded order, spread so
+    // consecutive slices do not stack on adjacent sites. The old
+    // code took the first free site in (Y, X) order, so every slice
+    // landed at X=1, X=2, ... on Y=0; the two slices of a 2-slice
+    // design flank the same INT tile, and the wire DB saw one tile.
+    // A candidate now needs Manhattan distance at least 2 from
+    // every already placed slice (chains from Phase 1 count), which
+    // steps slices two logical columns apart: X=1, X=3, X=5, ...
+    // on Y=0, and consecutive slices flank different INT tiles
+    // (physical tilegrid: SLICE_X1Y0 and SLICE_X2Y0 both flank
+    // INT_X1Y0, SLICE_X3Y0 flanks INT_X2Y0). When no candidate
+    // satisfies the distance (a nearly full row), fall back to the
+    // first free site so placement still succeeds. The first slice
+    // is unaffected (no placed slice to measure against), so
+    // single-slice designs keep their old site. Candidate order is
+    // the grid's deterministic (Y, X) order in both passes, so the
+    // choice is deterministic for a fixed seed.
     let remaining: Vec<usize> = (0..packed.len())
         .filter(|i| !in_chain.contains(i))
         .collect();
@@ -225,28 +241,44 @@ pub fn place_ultra(
             &logic_sites
         };
 
-        let mut placed_slice = false;
-        for (site, tile, x, y) in candidates {
-            if !used_sites.contains(site) {
-                placed.slices.push(PlacedUltraSlice {
-                    packed_idx,
-                    site: site.clone(),
-                    tile: tile.clone(),
-                    x: *x,
-                    y: *y,
-                });
-                used_sites.insert(site.clone());
-                placed_slice = true;
+        let placed_positions: Vec<(i32, i32)> =
+            placed.slices.iter().map(|p| (p.x, p.y)).collect();
+        let mut chosen: Option<&(String, String, i32, i32)> = None;
+        for cand in candidates {
+            if used_sites.contains(&cand.0) {
+                continue;
+            }
+            let spread_ok = placed_positions.iter().all(|(px, py)| {
+                (cand.2 - px).abs() + (cand.3 - py).abs() >= 2
+            });
+            if spread_ok {
+                chosen = Some(cand);
                 break;
             }
         }
-        if !placed_slice {
+        if chosen.is_none() {
+            for cand in candidates {
+                if !used_sites.contains(&cand.0) {
+                    chosen = Some(cand);
+                    break;
+                }
+            }
+        }
+        let Some((site, tile, x, y)) = chosen else {
             return Err(format!(
                 "cannot place slice {}: no free {} sites",
                 slice.name,
                 if needs_memory { "SLICEM" } else { "SLICE" }
             ));
-        }
+        };
+        placed.slices.push(PlacedUltraSlice {
+            packed_idx,
+            site: site.clone(),
+            tile: tile.clone(),
+            x: *x,
+            y: *y,
+        });
+        used_sites.insert(site.clone());
     }
 
     Ok(placed)
@@ -377,6 +409,29 @@ mod tests {
             .map(|(_, _, _, _, k)| *k)
             .unwrap();
         assert_eq!(site_kind, SliceKind::Memory);
+    }
+
+    #[test]
+    fn consecutive_slices_spread_two_columns_apart() {
+        // Two logic slices must not land on adjacent sites: the old
+        // first-free placer put them at X=0 and X=1 (distance 1),
+        // which in the real tilegrid flanks one INT tile. The spread
+        // placer keeps Manhattan distance at least 2, so the second
+        // slice lands at least two columns away, flanking a
+        // different INT tile. The first slice keeps the old site.
+        let grid = test_grid();
+        let mut s0 = PackedUltraSlice::new("s0".to_string(), SliceKind::Logic);
+        s0.luts.insert(0, "lut0".to_string());
+        let mut s1 = PackedUltraSlice::new("s1".to_string(), SliceKind::Logic);
+        s1.luts.insert(0, "lut1".to_string());
+        let packed = vec![s0, s1];
+        let placed = place_ultra(&packed, &grid, &UltraPlaceOpts::default()).unwrap();
+        assert_eq!(placed.slices.len(), 2);
+        let p0 = placed.slices.iter().find(|p| p.packed_idx == 0).unwrap();
+        let p1 = placed.slices.iter().find(|p| p.packed_idx == 1).unwrap();
+        assert_eq!((p0.x, p0.y), (1, 0));
+        assert!((p0.x - p1.x).abs() + (p0.y - p1.y).abs() >= 2);
+        assert_eq!((p1.x, p1.y), (3, 0));
     }
 
     #[test]
