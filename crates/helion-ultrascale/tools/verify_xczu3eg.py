@@ -18,6 +18,17 @@ INT_X2 and above (see section 10 notes). Regenerate the table with
 `--write-int-columns`; the run asserts the table equals the tilegrid
 before writing it.
 
+Section 11 does the same for the interface columns
+(data/xczu3eg_intf_columns.json): (tile type, FAR row, tile X) ->
+CLB_IO_CLK column major, from the INT_INTF and HDIO tiles' own
+baseaddrs. Only the four types with tilegrid windows are covered
+(INT_INTF_LEFT_TERM_PSS, INT_INTF_R_PCIE4, HDIO_BOT_RIGHT,
+HDIO_TOP_RIGHT); INT_INTF_L, INT_INTF_R, INT_INTF_L_PCIE4 and
+INT_INTF_RIGHT_TERM_IO record no baseaddr anywhere, so they stay
+unresolvable and the emitter must fail loud on them. Regenerate with
+`--write-intf-columns`; without the flag the run asserts the vendored
+table equals the tilegrid derivation.
+
 This script lives in the repo at
 crates/helion-ultrascale/tools/verify_xczu3eg.py. Paths are
 overridable with BF_PATH / PJ_PATH / TG_PATH / OUT_PATH /
@@ -33,7 +44,9 @@ PJ = os.environ.get('PJ_PATH', '/home/hatch/workspace/prjuray-db-ref/zynqusp/xcz
 TG = os.environ.get('TG_PATH', '/home/hatch/workspace/prjuray-db-ref/zynqusp/xczu3eg-sbva484-1-e/tilegrid.json')
 OUT = os.environ.get('OUT_PATH', '/home/hatch/workspace/us09-device/verify-report.txt')
 SIDECAR = os.environ.get('SIDECAR_PATH', str(Path(__file__).resolve().parent.parent / 'data' / 'xczu3eg_int_columns.json'))
+SIDECAR_INTF = os.environ.get('SIDECAR_INTF_PATH', str(Path(__file__).resolve().parent.parent / 'data' / 'xczu3eg_intf_columns.json'))
 WRITE_SIDECAR = '--write-int-columns' in sys.argv
+WRITE_INTF_SIDECAR = '--write-intf-columns' in sys.argv
 
 bf = json.load(open(BF))
 pj = json.load(open(PJ))
@@ -422,6 +435,77 @@ for _d in dsp_detail:
     lines.append(_d)
 lines.append(f'[{{"PASS" if dsp_ok else "FAIL"}}] dsp_colMajors == neighbor CLEM/CLEM_R col - 1 :: {dsp_detail}')
 results.append(('DSP colMajors vs tilegrid', dsp_ok))
+# ---- 11. INT_INTF / HDIO columns vs tilegrid ground truth ----
+# Same pattern as section 10, but the key adds the tile type: an
+# INT_INTF or HDIO tile name is <TYPE>_X<x>Y<y> with y absolute
+# (60 per clock-region row), and the column is the tile's own
+# CLB_IO_CLK baseaddr column. Only four types carry tilegrid windows
+# (INT_INTF_LEFT_TERM_PSS, INT_INTF_R_PCIE4, HDIO_BOT_RIGHT,
+# HDIO_TOP_RIGHT); the other INT_INTF types record no baseaddr, so
+# they are listed as uncovered and excluded, never inferred. Every
+# windowed tile must agree on one column per (type, row, X), its FAR
+# row must equal Y // 60, and its base minor must be 0 (the table
+# stores the column; the emitter builds base FAR (0, row, col, 0)).
+INTF_TYPES = ('INT_INTF_LEFT_TERM_PSS', 'INT_INTF_R_PCIE4', 'HDIO_BOT_RIGHT', 'HDIO_TOP_RIGHT')
+_intf_table = {}  # (tile_type, row, x) -> col
+_intf_conflicts = 0
+_intf_tiles = 0
+_intf_bad = []
+_intf_nobits = collections.Counter()
+for _name, _t in tg.items():
+    _ty = _t.get('type')
+    if _ty not in INTF_TYPES and not (_ty or '').startswith('INT_INTF'):
+        continue
+    if _ty not in INTF_TYPES:
+        # An INT_INTF type with no windows: uncovered by design.
+        _intf_nobits[_ty] += 1
+        continue
+    _bits = _t.get('bits', {}).get('CLB_IO_CLK')
+    if _bits is None:
+        _intf_nobits[_ty] += 1
+        continue
+    m = re.fullmatch(r'(.+)_X(\d+)Y(\d+)', _name)
+    if not m:
+        _intf_bad.append((_name, 'unparsable tile name'))
+        continue
+    _x, _y = int(m.group(2)), int(m.group(3))
+    _row = _y // 60
+    _blk, _r, _col, _minor = _far(_bits['baseaddr'])
+    _intf_tiles += 1
+    if not (_blk == 0 and _r == _row and _minor == 0):
+        _intf_bad.append((_name, f'row={_r}/{_row} block={_blk} minor={_minor}'))
+    _key = (_ty, _row, _x)
+    if _key in _intf_table and _intf_table[_key] != _col:
+        _intf_conflicts += 1
+    _intf_table[_key] = _col
+_intf_ok = (len(_intf_bad) == 0 and _intf_conflicts == 0 and _intf_tiles > 0)
+lines.append(f"[{'PASS' if _intf_ok else 'FAIL'}] INTF/HDIO same-(type,row,X) rule matches tilegrid on every windowed tile :: {_intf_tiles} tiles, {len(_intf_table)} entries, conflicts={_intf_conflicts}, bad={_intf_bad[:3]}")
+lines.append(f'INTF/HDIO tiles with no bits entry (uncovered, fail loud in the emitter): {dict(_intf_nobits)}')
+results.append(('INTF/HDIO column table vs tilegrid', _intf_ok))
+if WRITE_INTF_SIDECAR:
+    assert _intf_ok, 'refusing to write INTF table: tilegrid check failed'
+    _cols = {}
+    for (_ty, _row, _x), _col in sorted(_intf_table.items()):
+        _cols.setdefault(_ty, {}).setdefault(str(_row), {})[str(_x)] = _col
+    _doc = {
+        'part': 'xczu3eg-sbva484-1-e',
+        'source': 'prjuray-db zynqusp/xczu3eg-sbva484-1-e/tilegrid.json (CC0): INT_INTF/HDIO tile CLB_IO_CLK baseaddr per (tile type, FAR row, tile X)',
+        'license': 'CC0-1.0 (prjuray-db); derived table, no AMD content',
+        'generated_by': 'crates/helion-ultrascale/tools/verify_xczu3eg.py --write-intf-columns (section 11)',
+        'columns': _cols,
+    }
+    open(SIDECAR_INTF, 'w').write(json.dumps(_doc, indent=2, sort_keys=True) + '\n')
+    lines.append(f'INTF/HDIO column table written to {SIDECAR_INTF} ({len(_intf_table)} entries)')
+elif os.path.exists(SIDECAR_INTF):
+    _on_disk = json.load(open(SIDECAR_INTF))
+    _disk_cols = {}
+    for _ty, _rows in _on_disk.get('columns', {}).items():
+        for _row, _xs in _rows.items():
+            for _x, _col in _xs.items():
+                _disk_cols[(_ty, int(_row), int(_x))] = _col
+    _match = (_disk_cols == _intf_table and _on_disk.get('part') == 'xczu3eg-sbva484-1-e')
+    lines.append(f"[{'PASS' if _match else 'FAIL'}] vendored INTF/HDIO table equals the tilegrid derivation :: disk={len(_disk_cols)} derived={len(_intf_table)}")
+    results.append(('vendored INTF/HDIO table == tilegrid', _match))
 _npass = sum(1 for _, _ok in results if _ok)
 lines.append('')
 lines.append(f'SUMMARY (with INT/DSP): {_npass}/{len(results)} checks passed')

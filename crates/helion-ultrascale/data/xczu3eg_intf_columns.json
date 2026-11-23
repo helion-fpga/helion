@@ -1,0 +1,55 @@
+{
+  "columns": {
+    "HDIO_BOT_RIGHT": {
+      "0": {
+        "24": 76,
+        "9": 30
+      },
+      "1": {
+        "9": 30
+      },
+      "2": {
+        "9": 30
+      }
+    },
+    "HDIO_TOP_RIGHT": {
+      "0": {
+        "24": 76,
+        "9": 30
+      },
+      "1": {
+        "9": 30
+      },
+      "2": {
+        "9": 30
+      }
+    },
+    "INT_INTF_LEFT_TERM_PSS": {
+      "0": {
+        "0": 0
+      },
+      "1": {
+        "0": 0
+      },
+      "2": {
+        "0": 0
+      }
+    },
+    "INT_INTF_R_PCIE4": {
+      "0": {
+        "24": 75,
+        "9": 29
+      },
+      "1": {
+        "9": 29
+      },
+      "2": {
+        "9": 29
+      }
+    }
+  },
+  "generated_by": "crates/helion-ultrascale/tools/verify_xczu3eg.py --write-intf-columns (section 11)",
+  "license": "CC0-1.0 (prjuray-db); derived table, no AMD content",
+  "part": "xczu3eg-sbva484-1-e",
+  "source": "prjuray-db zynqusp/xczu3eg-sbva484-1-e/tilegrid.json (CC0): INT_INTF/HDIO tile CLB_IO_CLK baseaddr per (tile type, FAR row, tile X)"
+}

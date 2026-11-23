@@ -212,6 +212,19 @@ public prjuray-db tilegrid by
 `tools/verify_xczu3eg.py --write-int-columns` (see README.md for
 the derivation and the 5,940-of-5,940 verification).
 
+## Helion-derived segbits (not upstream data)
+
+The files in this section are derived by Helion from the public
+corpus bitstreams, not vendored from prjuray-db. They are kept
+separate from the vendored table above: no upstream line count or
+SHA-256 applies, and their headers say so. Each file documents its
+derivation and cross-validation in its own header; the lane report
+holds the full evidence.
+
+| File | Lines | Derived | Evidence |
+|---|---|---|---|
+| segbits_int_intf_r_pcie4.db | 2 | 2026-11-22, INT_INTF lane | OUTPUTS_ENABLED.1 = 01_21 02_27 03_24, identical in 5 independent corpus designs (P-13..P-17), 8 tiles each, 120 bits total; positions match INT_INTF_LEFT_TERM_PSS.OUTPUTS_ENABLED.1 in the public segbits_int_intf_left_term_pss.db exactly. No INT_INTF PIP bit is set in any corpus design, so no PIP line is derived; see ultra-bitgen-crew/INTINTF_REPORT.md. |
+
 ## What is NOT here (rejected or missing)
 
 - RapidWright `.dat` files: REJECTED (Xilinx EULA). Never ingested.

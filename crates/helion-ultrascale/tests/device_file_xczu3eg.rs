@@ -21,7 +21,11 @@
 //!   is tilegrid-derived ground truth: without it the provisional
 //!   INT rule mispredicts INT_X2 and above on this part.
 
-use helion_ultrascale::{ArchSummary, BitLocator, DeviceFile, IntColumnTable};
+use helion_ultrascale::bitgen::{BitgenDevice, BitgenError, emit_frames};
+use helion_ultrascale::segbits::FileSegbitsDb;
+use helion_ultrascale::{
+    ArchSummary, BitLocator, DeviceFile, IntColumnTable, IntfColumnTable,
+};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -138,4 +142,184 @@ fn xczu3eg_int_table_rejects_wrong_part() {
     };
     assert!(device.set_int_columns(wrong).is_err());
     assert!(!device.has_int_columns());
+}
+
+fn load_intf_table() -> IntfColumnTable {
+    IntfColumnTable::from_path(&manifest_dir().join("data").join("xczu3eg_intf_columns.json"))
+        .unwrap()
+}
+
+#[test]
+fn xczu3eg_intf_table_loads_and_attaches() {
+    let table = load_intf_table();
+    assert_eq!(table.part, "xczu3eg-sbva484-1-e");
+    // 4 tile types: INT_INTF_R_PCIE4 (4 columns), INT_INTF_LEFT_TERM_PSS
+    // (3), HDIO_BOT_RIGHT (4), HDIO_TOP_RIGHT (4). Verified against
+    // the tilegrid by tools/verify_xczu3eg.py section 11 (283 windowed
+    // tiles, 0 conflicts).
+    assert_eq!(table.columns.len(), 15);
+    // Tilegrid anchors: R_PCIE4 row 2 X9 -> col 29, R_PCIE4 row 0 X24
+    // -> col 75, LEFT_TERM_PSS row 0 X0 -> col 0, HDIO_BOT_RIGHT row 0
+    // X9 -> col 30, HDIO_TOP_RIGHT row 2 X24 -> col 76.
+    assert_eq!(
+        table.columns[&("INT_INTF_R_PCIE4".to_string(), 2, 9)],
+        29
+    );
+    assert_eq!(
+        table.columns[&("INT_INTF_R_PCIE4".to_string(), 0, 24)],
+        75
+    );
+    assert_eq!(
+        table.columns[&("INT_INTF_LEFT_TERM_PSS".to_string(), 0, 0)],
+        0
+    );
+    assert_eq!(table.columns[&("HDIO_BOT_RIGHT".to_string(), 0, 9)], 30);
+    // X24 exists only in row 0 for both HDIO types (one tile per
+    // row: X24Y0); rows 1 and 2 have no X24 HDIO tile.
+    assert_eq!(table.columns[&("HDIO_TOP_RIGHT".to_string(), 0, 24)], 76);
+    // Tile types with no tilegrid windows are not in the table and
+    // must not resolve.
+    assert_eq!(
+        table.columns.get(&("INT_INTF_L".to_string(), 0, 0)),
+        None
+    );
+    assert_eq!(
+        table.columns.get(&("INT_INTF_R_PCIE4".to_string(), 2, 10)),
+        None
+    );
+
+    let (mut device, _) = load();
+    assert!(!device.has_intf_columns());
+    assert_eq!(device.intf_column("INT_INTF_R_PCIE4", 2, 9), None);
+    device.set_intf_columns(table).unwrap();
+    assert!(device.has_intf_columns());
+    assert_eq!(device.intf_column("INT_INTF_R_PCIE4", 2, 9), Some(29));
+    assert_eq!(device.intf_column("INT_INTF_R_PCIE4", 0, 24), Some(75));
+    assert_eq!(
+        device.intf_column("INT_INTF_LEFT_TERM_PSS", 0, 0),
+        Some(0)
+    );
+    assert_eq!(device.intf_column("HDIO_BOT_RIGHT", 0, 9), Some(30));
+    assert_eq!(device.intf_column("HDIO_TOP_RIGHT", 0, 24), Some(76));
+    assert_eq!(device.intf_column("INT_INTF_L", 0, 0), None);
+    assert_eq!(device.intf_column("INT_INTF_R_PCIE4", 2, 10), None);
+    assert_eq!(device.intf_column_entries().unwrap().len(), 15);
+}
+
+#[test]
+fn xczu3eg_intf_table_rejects_wrong_part() {
+    let (mut device, _) = load();
+    let wrong = IntfColumnTable {
+        part: "xcku3p-ffva676-1-e".to_string(),
+        columns: BTreeMap::new(),
+    };
+    assert!(device.set_intf_columns(wrong).is_err());
+    assert!(!device.has_intf_columns());
+}
+
+/// The xczu3eg device exactly as the CLI loads it: INT table plus
+/// INT_INTF/HDIO table attached.
+fn load_cli_device() -> DeviceFile {
+    let (mut device, _) = load();
+    device.set_int_columns(load_int_table()).unwrap();
+    device.set_intf_columns(load_intf_table()).unwrap();
+    device
+}
+
+/// The vendored segbits DBs exactly as the CLI loads them, in the
+/// same order (see SEGBITS_FILES in src/bin/helion-bitgen.rs),
+/// including the Helion-derived INT_INTF_R_PCIE4 file.
+fn load_cli_segbits() -> FileSegbitsDb {
+    let data = manifest_dir().join("data");
+    let names = [
+        "segbits_int.db",
+        "segbits_hpio_right.db",
+        "segbits_hdio_top_right.db",
+        "segbits_hdio_bot_right.db",
+        "segbits_cmt_right.db",
+        "segbits_clel_l.db",
+        "segbits_clel_r.db",
+        "segbits_clem.db",
+        "segbits_clem_r.db",
+        "segbits_int_intf_r_pcie4.db",
+    ];
+    let paths: Vec<PathBuf> = names.iter().map(|n| data.join(n)).collect();
+    let refs: Vec<&std::path::Path> = paths.iter().map(PathBuf::as_path).collect();
+    let mut db = FileSegbitsDb::from_files(&refs).unwrap();
+    db.synthesize_lut_init().unwrap();
+    db
+}
+
+#[test]
+fn xczu3eg_intintf_outputs_enabled_emits_corpus_bits() {
+    // INT_INTF_R_PCIE4_X9Y120 is the offset-0 tile (row 2, col 29):
+    // the emitter's segbits path writes the listed bit as the
+    // absolute frame bit, so only offset-0 tiles land correctly
+    // (documented F3-class limitation; the decoder, which adds the
+    // window offset, is the authority for attribution).
+    let device = load_cli_device();
+    assert_eq!(
+        device.tile_base_far("INT_INTF_R_PCIE4_X9Y120"),
+        Some(0x81D00)
+    );
+    let db = load_cli_segbits();
+    let fasm = "INT_INTF_R_PCIE4_X9Y120.OUTPUTS_ENABLED.1\n";
+    let frames = emit_frames(fasm, &device, &db).unwrap();
+    // Exactly the 3 corpus positions, at the FARs the decoder
+    // reports for the 5 BNN designs (P-13 through P-17): frame 1
+    // bit 21, frame 2 bit 27, frame 3 bit 24. The band step may set
+    // ECC bits in the same frames, so assert the positions are set,
+    // not that they are the only bits.
+    let mut keys: Vec<u32> = frames.keys().copied().collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec![0x81D01, 0x81D02, 0x81D03]);
+    let bit_is_set = |far: u32, bit: u16| -> bool {
+        let words = &frames[&far];
+        (words[(bit / 32) as usize] >> (bit % 32)) & 1 == 1
+    };
+    assert!(bit_is_set(0x81D01, 21));
+    assert!(bit_is_set(0x81D02, 27));
+    assert!(bit_is_set(0x81D03, 24));
+    // The inverse value clears the same bits (OUTPUTS_ENABLED.0 is
+    // the same bits negated): emitting it sets no bit anywhere.
+    // (write_frame_bit materializes the frame entries even for a
+    // clear, so the map holds 3 all-zero frames; the assertion is on
+    // set bits, not on map emptiness.)
+    let frames0 = emit_frames(
+        "INT_INTF_R_PCIE4_X9Y120.OUTPUTS_ENABLED.0\n",
+        &device,
+        &db,
+    )
+    .unwrap();
+    let set_bits0: u32 = frames0
+        .values()
+        .flat_map(|w| w.iter())
+        .map(|word| word.count_ones())
+        .sum();
+    assert_eq!(set_bits0, 0);
+}
+
+#[test]
+fn xczu3eg_intintf_pip_still_fails_unknown_feature() {
+    // B1, the proven-blocked PIP: the tile now resolves (B2 fixed),
+    // but no public segbits pin the IMUX PIP, so the emitter must
+    // still fail loud with UnknownFeature, not UnknownTile. This
+    // test documents the blocked state; it flips to a pass only when
+    // a Vivado-built design pins the PIP segbits.
+    let device = load_cli_device();
+    assert!(device.tile_type("INT_INTF_R_PCIE4_X9Y0").is_some());
+    let db = load_cli_segbits();
+    let err = emit_frames(
+        "INT_INTF_R_PCIE4_X9Y0.PIP.IMUXOUT16.IMUX16\n",
+        &device,
+        &db,
+    )
+    .unwrap_err();
+    match err {
+        BitgenError::UnknownFeature { tile, feature } => {
+            assert_eq!(tile, "INT_INTF_R_PCIE4_X9Y0");
+            assert_eq!(feature, "PIP.IMUXOUT16.IMUX16");
+        }
+        other => panic!("expected UnknownFeature, got {other:?}"),
+    }
 }

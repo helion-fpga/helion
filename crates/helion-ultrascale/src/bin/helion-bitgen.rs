@@ -111,7 +111,7 @@ use helion_ultrascale::bitgen::{
 };
 use helion_ultrascale::bitgen::{ConfigOrderGeometry, parse_frames_with_geometry};
 use helion_ultrascale::bitstream_decode::decode_bitstream;
-use helion_ultrascale::device_file::{DeviceFile, IntColumnTable};
+use helion_ultrascale::device_file::{DeviceFile, IntColumnTable, IntfColumnTable};
 use helion_ultrascale::segbits::{FileSegbitsDb, SegbitsDb};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -125,7 +125,7 @@ const DEFAULT_DECODE_PART: &str = "xczu3eg-sbva484-1-e";
 
 /// Vendored segbits DB files, in load order. The CLB DBs carry the LUT
 /// and FF encodings; the rest carry INT PIP, IO, clock, and HDIO.
-const SEGBITS_FILES: [&str; 9] = [
+const SEGBITS_FILES: [&str; 10] = [
     "segbits_int.db",
     "segbits_hpio_right.db",
     "segbits_hdio_top_right.db",
@@ -135,6 +135,10 @@ const SEGBITS_FILES: [&str; 9] = [
     "segbits_clel_r.db",
     "segbits_clem.db",
     "segbits_clem_r.db",
+    // Helion-derived, not upstream prjuray data: INT_INTF_R_PCIE4
+    // OUTPUTS_ENABLED, cross-validated on 5 corpus designs (see the
+    // file header and ultra-bitgen-crew/INTINTF_REPORT.md).
+    "segbits_int_intf_r_pcie4.db",
 ];
 
 fn main() -> ExitCode {
@@ -369,6 +373,23 @@ fn load_device(part: &str, data_dir: &Path) -> Result<Box<dyn BitgenDevice>, Str
                 )?;
             file.set_int_columns(table).map_err(|e| {
                 format!("INT column table does not match xczu3eg.json: {e}")
+            })?;
+            // Tilegrid-derived INT_INTF / HDIO column table (B2):
+            // without it INT_INTF and HDIO tiles do not resolve and
+            // any interface line fails loud. Tile types with no
+            // tilegrid windows (INT_INTF_L/R/L_PCIE4/RIGHT_TERM_IO)
+            // are not in the table and still fail loud by design.
+            let intf_table = IntfColumnTable::from_path(
+                &data_dir.join("xczu3eg_intf_columns.json"),
+            )
+            .map_err(|e| {
+                format!(
+                    "cannot load INTF column table {}: {e}",
+                    data_dir.join("xczu3eg_intf_columns.json").display()
+                )
+            })?;
+            file.set_intf_columns(intf_table).map_err(|e| {
+                format!("INTF column table does not match xczu3eg.json: {e}")
             })?;
             Ok(Box::new(file))
         }
@@ -1009,7 +1030,16 @@ fn classify_feature(tile: &str, feature: &str) -> Option<&'static str> {
     if feature.starts_with("PIP.") || feature.contains(".PIP.") {
         return Some("INT_PIP");
     }
-    if feature.contains("IOB") || tile.starts_with("HPIO") || tile.starts_with("HDIO") {
+    // Interface-tile output config: HPIO/HDIO IOB lines and the
+    // INT_INTF OUTPUTS_ENABLED line are the same class (an
+    // interface tile's output enable), so they share the IO_CONFIG
+    // block. The PIP arm above runs first, so an INT_INTF PIP still
+    // classifies as INT_PIP, not IO_CONFIG.
+    if feature.contains("IOB")
+        || tile.starts_with("HPIO")
+        || tile.starts_with("HDIO")
+        || tile.starts_with("INT_INTF")
+    {
         return Some("IO_CONFIG");
     }
     None
@@ -1318,6 +1348,17 @@ mod tests {
         assert_eq!(
             classify_feature("HPIO_RIGHT_X0Y0", "IOB_X0Y0.IOSTANDARD_IN.LVCMOS12"),
             Some("IO_CONFIG")
+        );
+        // INT_INTF OUTPUTS_ENABLED is interface-tile output config,
+        // same block as the HPIO/HDIO IOB lines; an INT_INTF PIP
+        // still classifies as INT_PIP (the PIP arm runs first).
+        assert_eq!(
+            classify_feature("INT_INTF_R_PCIE4_X9Y120", "OUTPUTS_ENABLED.1"),
+            Some("IO_CONFIG")
+        );
+        assert_eq!(
+            classify_feature("INT_INTF_R_PCIE4_X9Y0", "PIP.IMUXOUT16.IMUX16"),
+            Some("INT_PIP")
         );
         assert_eq!(
             classify_feature("CMT_RIGHT_X0Y0", "PIP.CLK_HROUTE.SOME"),

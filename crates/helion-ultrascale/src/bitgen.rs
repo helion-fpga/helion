@@ -987,6 +987,20 @@ fn parse_int_tile_y(tile: &str) -> Option<u32> {
     y_text.parse().ok()
 }
 
+/// Parse an interface tile name `<TYPE>_X<x>Y<y>` (INT_INTF_* or
+/// HDIO_*) into its absolute Y. The parse-back row-start rule applies
+/// to these tiles the same way it applies to INT tiles: the tiles in
+/// one clock-region row share one base FAR, so only the row-start
+/// tile (Y % 60 == 0) renders. Returns `None` for any other tile.
+fn parse_intf_tile_y(tile: &str) -> Option<u32> {
+    let (ty, rest) = tile.rsplit_once("_X")?;
+    if !ty.starts_with("INT_INTF") && !ty.starts_with("HDIO") {
+        return None;
+    }
+    let (_, y_text) = rest.split_once('Y')?;
+    y_text.parse().ok()
+}
+
 /// Parse `SLICE_X<x>Y<y>` into (x, y).
 pub fn parse_slice_tile(tile: &str) -> Option<(u32, u32)> {
     let rest = tile.strip_prefix("SLICE_X")?;
@@ -2416,8 +2430,13 @@ pub fn parse_bitstream(
         // (INT_X11Y60); the bits alone cannot distinguish the 60
         // tiles in a row, since they share one column. The same class
         // of limitation already applies to SLICE tiles sharing a
-        // column base (F1).
-        if let Some(y) = parse_int_tile_y(tile) {
+        // column base (F1). INT_INTF and HDIO tiles share a base FAR
+        // per (type, row, X) the same way, so the same row-start rule
+        // applies to them (an INT_INTF feature set on a non-row-start
+        // tile parses back as its row-start tile; HDIO tiles exist
+        // only at row-start Y, so the rule renders exactly the real
+        // HDIO tiles).
+        if let Some(y) = parse_int_tile_y(tile).or_else(|| parse_intf_tile_y(tile)) {
             if y % NUM_CLB_PER_COLUMN != 0 {
                 continue;
             }
