@@ -12,13 +12,15 @@
 //!   [`RouteToPipError::UnnamedWire`]. Mock-routed designs can never
 //!   feed int-pip emission: the mock has grid positions only, no names,
 //!   and that is expected, not a bug.
-//! - A consecutive pair that is not an edge in the graph stops
-//!   translation with [`RouteToPipError::NotConnected`], naming both
-//!   wires. In particular a multi-sink net whose route is a flattened
-//!   union of per-sink paths (see `route_ultra`) is not an ordered
-//!   path, so its flattened list fails here rather than emitting PIPs
-//!   for jumps that do not exist. Single-sink routes are ordered paths
-//!   and translate cleanly.
+//! - A wire with no driver among the earlier route wires stops
+//!   translation with [`RouteToPipError::NotConnected`], naming the
+//!   driver and the undriven wire. A multi-sink net's route is a
+//!   flattened union of per-sink paths (see `route_ultra`), not an
+//!   ordered walk, so consecutive entries can jump between branches;
+//!   each wire takes its parent from the latest earlier route wire
+//!   that drives it, which reproduces the path's own PIPs for a
+//!   single-sink route. A route whose wires do not connect back to
+//!   the driver through earlier wires is refused, never patched up.
 //! - A consecutive pair in different tiles is a span-wire continuation
 //!   (BEG in one tile to END in the tile LEN steps away), not a PIP:
 //!   it emits nothing and is counted in `continuations`. A cross-tile
@@ -53,9 +55,9 @@ pub enum RouteToPipError {
     /// A wire in the route has no name in this WireDb (placeholder,
     /// mock, or an out-of-range ID). Translation refused.
     UnnamedWire { wire: WireId, design: String },
-    /// Two consecutive wires in the route are not connected by any
-    /// graph edge. The route is not an ordered path, or it jumps
-    /// between wires that do not touch.
+    /// A wire in the route has no driver among the earlier route
+    /// wires: no graph edge reaches it from the driver through the
+    /// route's own wires. The route is disconnected, not a tree.
     NotConnected {
         src: String,
         dst: String,
@@ -92,8 +94,8 @@ impl fmt::Display for RouteToPipError {
             ),
             Self::NotConnected { src, dst, design } => write!(
                 f,
-                "route in design '{}' jumps from wire '{}' to '{}' with no edge between them",
-                design, src, dst
+                "route in design '{}' cannot drive wire '{}' from the driver '{}': no edge from any earlier route wire",
+                design, dst, src
             ),
             Self::NotAContinuation { src, dst, design } => write!(
                 f,
@@ -194,13 +196,24 @@ fn named<'a>(
         })
 }
 
-/// Translate one ordered route (driver to sink, physical direction) to
-/// INT PIPs, with an optional bidirectional-PIP direction resolver.
-/// The resolver maps a route pair (a, b) to the traversal direction
+/// Translate one route (driver to sinks, physical direction) to INT
+/// PIPs, with an optional bidirectional-PIP direction resolver. The
+/// resolver maps a route pair (a, b) to the traversal direction
 /// relative to the tile JSON's src to dst order (`Fwd` when (a, b) is
 /// in that order, `Rev` when it is the reverse), or `None` when the
 /// pair is not a bidirectional PIP. Pass `None` for the resolver to
 /// fail loud on any bidirectional PIP instead of guessing.
+///
+/// The route is a wire SET forming a tree (the union of the router's
+/// per-sink paths), not necessarily an ordered walk: a multi-sink net
+/// lists one src-to-sink path per sink, so consecutive entries can
+/// jump between branches. Each wire except the driver takes its
+/// parent from the latest earlier route wire that drives it (an edge
+/// in the graph); a single ordered path translates to exactly its own
+/// PIPs in order, since each wire's latest preceding driver is its
+/// immediate predecessor there. A wire with no preceding driver in
+/// the route fails loud with [`RouteToPipError::NotConnected`],
+/// naming the driver and the undriven wire.
 pub fn translate_route_with(
     db: &dyn WireDb,
     route: &[WireId],
@@ -211,17 +224,48 @@ pub fn translate_route_with(
     if route.len() < 2 {
         return Ok(out);
     }
-    for pair in route.windows(2) {
-        let (a, b) = (pair[0], pair[1]);
-        let info_a = named(db, a, design)?;
-        let info_b = named(db, b, design)?;
-        if !db.fanout(a).contains(&b) {
+    // Dedup, keeping first-occurrence order (the router already
+    // dedups within a net; this only guards the translator).
+    let mut wires: Vec<WireId> = Vec::with_capacity(route.len());
+    for &w in route {
+        if !wires.contains(&w) {
+            wires.push(w);
+        }
+    }
+    if wires.len() < 2 {
+        return Ok(out);
+    }
+    // Name every wire first, so an unnamed wire fails loud naming
+    // itself rather than surfacing as a missing edge.
+    let mut infos: Vec<WireInfo<'_>> = Vec::with_capacity(wires.len());
+    for &w in &wires {
+        infos.push(named(db, w, design)?);
+    }
+    // Derive the tree edges: each wire's parent is its latest
+    // preceding driver in the route. Parent indices strictly
+    // decrease, so the edges form a tree rooted at the driver.
+    let mut edges: Vec<(usize, usize)> = Vec::with_capacity(wires.len() - 1);
+    for i in 1..wires.len() {
+        let mut parent: Option<usize> = None;
+        for j in (0..i).rev() {
+            if db.fanout(wires[j]).contains(&wires[i]) {
+                parent = Some(j);
+                break;
+            }
+        }
+        let Some(j) = parent else {
             return Err(RouteToPipError::NotConnected {
-                src: info_a.name.to_string(),
-                dst: info_b.name.to_string(),
+                src: infos[0].name.to_string(),
+                dst: infos[i].name.to_string(),
                 design: design.to_string(),
             });
-        }
+        };
+        edges.push((j, i));
+    }
+    for (ai, bi) in edges {
+        let (a, b) = (wires[ai], wires[bi]);
+        let info_a = infos[ai];
+        let info_b = infos[bi];
         if info_a.tile == info_b.tile {
             // Same tile: a PIP. Bidirectional PIPs are edges in both
             // directions; directional PIPs are one-way.
@@ -276,7 +320,7 @@ pub fn translate_route_with(
     Ok(out)
 }
 
-/// Translate one ordered route (driver to sink, physical direction) to
+/// Translate one route (driver to sinks, physical direction) to
 /// INT PIPs. Bidirectional PIPs fail loud: without a direction
 /// resolver FWD vs REV cannot be decided. Use
 /// [`translate_route_with`] or
@@ -464,6 +508,81 @@ mod tests {
             err,
             RouteToPipError::UnnamedWire {
                 wire: 0,
+                design: "blinky".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn multi_sink_union_translates_to_pip_tree() {
+        let db = one_tile();
+        // cnt_0's routed union from the counter flow (4 sinks, 19
+        // wires): the legs share the driver LOGIC_OUTS_W23 and
+        // branch at BYPASS_W14 (W11 leg), BYPASS_W8 (W6 leg), and
+        // BYPASS_W14 again (W7 leg). The flattened list jumps
+        // between legs (IMUX_W8 -> INT_NODE_IMUX_49_INT_OUT0 is not
+        // an edge); the translator derives the tree from the wire
+        // set instead of failing on the jump, reproducing exactly
+        // the 18 PIPs the flow emitted for this net.
+        let route = [
+            db.wire_id("INT_X12Y45", "LOGIC_OUTS_W23").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_NODE_SDQ_82_INT_OUT0").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_INT_SDQ_6_INT_OUT0").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_NODE_GLOBAL_6_INT_OUT0").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_NODE_IMUX_50_INT_OUT0").unwrap(),
+            db.wire_id("INT_X12Y45", "BYPASS_W14").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_NODE_IMUX_49_INT_OUT1").unwrap(),
+            db.wire_id("INT_X12Y45", "IMUX_W8").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_NODE_IMUX_49_INT_OUT0").unwrap(),
+            db.wire_id("INT_X12Y45", "BYPASS_W12").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_NODE_IMUX_46_INT_OUT0").unwrap(),
+            db.wire_id("INT_X12Y45", "IMUX_W11").unwrap(),
+            db.wire_id("INT_X12Y45", "BYPASS_W8").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_NODE_IMUX_36_INT_OUT0").unwrap(),
+            db.wire_id("INT_X12Y45", "IMUX_W6").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_NODE_IMUX_50_INT_OUT1").unwrap(),
+            db.wire_id("INT_X12Y45", "BYPASS_W10").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_NODE_IMUX_41_INT_OUT0").unwrap(),
+            db.wire_id("INT_X12Y45", "IMUX_W7").unwrap(),
+        ];
+        let t = db.translate_route(&route, "counter").unwrap();
+        assert_eq!(t.continuations, 0);
+        assert_eq!(t.pips.len(), 18);
+        // The leg-junction PIPs: the W11 leg branches off
+        // BYPASS_W14, the W6 leg off BYPASS_W8, the W7 leg off
+        // BYPASS_W14 again.
+        for feature in [
+            "PIP.INT_NODE_IMUX_49_INT_OUT0.BYPASS_W14",
+            "PIP.INT_NODE_IMUX_36_INT_OUT0.BYPASS_W8",
+            "PIP.INT_NODE_IMUX_50_INT_OUT1.BYPASS_W14",
+        ] {
+            assert!(
+                t.pips.iter().any(|p| p.feature() == feature),
+                "translated PIPs are missing the junction PIP {feature}: {:?}",
+                t.pips.iter().map(|p| p.feature()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn union_with_unreachable_wire_still_fails_loud() {
+        let db = one_tile();
+        // GCLK_B_0_0 has no fanin in the tile: no earlier route
+        // wire drives it, so the union is disconnected and must
+        // fail loud rather than emit PIPs for a jump that does not
+        // exist.
+        let route = [
+            db.wire_id("INT_X12Y45", "LOGIC_OUTS_E0").unwrap(),
+            db.wire_id("INT_X12Y45", "INODE_E_1_FT1").unwrap(),
+            db.wire_id("INT_X12Y45", "BOUNCE_E_0_FT1").unwrap(),
+            db.wire_id("INT_X12Y45", "GCLK_B_0_0").unwrap(),
+        ];
+        let err = translate_route(&db, &route, "blinky").unwrap_err();
+        assert_eq!(
+            err,
+            RouteToPipError::NotConnected {
+                src: "LOGIC_OUTS_E0".to_string(),
+                dst: "GCLK_B_0_0".to_string(),
                 design: "blinky".to_string(),
             }
         );
