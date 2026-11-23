@@ -116,6 +116,7 @@ use crate::bitloc::{
     bram_parity_locations, bram_parity_placed_bits, ff_fasm_name, ff_location, ff_placed_bit,
     ff_srval_location, ff_srval_placed_bit, lut_fasm_name, lut_locations, lut_placed_bits,
 };
+use crate::bitgen_device::int_tile_bit_shift;
 use crate::segbits::{BitRef, SegbitsDb};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -981,12 +982,6 @@ pub fn parse_bram_tile(tile: &str) -> Option<(u32, u32)> {
 /// Parse the Y out of `INT_X<x>Y<y>`. Private to this module; the
 /// emitter-side parser lives in `bitgen_device.rs` (same split as
 /// `parse_slice_tile` / `parse_bram_tile`).
-fn parse_int_tile_y(tile: &str) -> Option<u32> {
-    let rest = tile.strip_prefix("INT_X")?;
-    let (_, y_text) = rest.split_once('Y')?;
-    y_text.parse().ok()
-}
-
 /// Parse an interface tile name `<TYPE>_X<x>Y<y>` (INT_INTF_* or
 /// HDIO_*) into its absolute Y. The parse-back row-start rule applies
 /// to these tiles the same way it applies to INT tiles: the tiles in
@@ -999,6 +994,59 @@ fn parse_intf_tile_y(tile: &str) -> Option<u32> {
     }
     let (_, y_text) = rest.split_once('Y')?;
     y_text.parse().ok()
+}
+
+/// True when any set bit sits in an INT tile's segbits window
+/// (bits `bit_shift..=bit_shift+max_bit`) in any of its 76 frames
+/// starting at `base_far`. Decode fast path for the lifted row-start
+/// rule: a tile with no set bit in its window renders nothing.
+/// `max_bit` is the widest segbits bit of any INT feature in the DB
+/// (47 in the vendored DB, higher in stub DBs), so the window covers
+/// every bit the tile's shifted refs can touch. The window spans at
+/// most a few frame words; the edge words are masked to the window
+/// so a neighbouring tile's bit cannot keep this tile alive. Bits
+/// outside every window (such as the H-1 band bits 1440..1487, which
+/// fall between the Y29 and Y30 windows) never keep a tile alive.
+fn int_tile_window_has_set_bit(
+    frames: &BTreeMap<u32, FrameWords>,
+    base_far: u32,
+    bit_shift: u16,
+    max_bit: u16,
+) -> bool {
+    // INT segbits frames run 0..=75 (the vendored segbits_int.db tops
+    // out at frame 74); 76 covers the whole span. The window end is
+    // clamped to the last frame bit: a DB bit past the frame cannot
+    // be set, and the top word is then fully in the window.
+    let end_bit = (bit_shift.saturating_add(max_bit) as usize).min(FRAME_BITS - 1);
+    let lo_word = (bit_shift / 32) as usize;
+    let hi_word = (end_bit / 32).min(FRAME_WORDS - 1);
+    let lo_mask: u32 = u32::MAX << (bit_shift % 32);
+    let hi_mask: u32 = if end_bit % 32 == 31 {
+        u32::MAX
+    } else {
+        (1u32 << ((end_bit % 32) + 1)) - 1
+    };
+    for frame in 0..76u32 {
+        let Some(far) = base_far.checked_add(frame) else {
+            break;
+        };
+        let Some(words) = frames.get(&far) else {
+            continue;
+        };
+        for w in lo_word..=hi_word {
+            let mut word = words[w];
+            if w == lo_word {
+                word &= lo_mask;
+            }
+            if w == hi_word {
+                word &= hi_mask;
+            }
+            if word != 0 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Parse `SLICE_X<x>Y<y>` into (x, y).
@@ -1818,6 +1866,29 @@ pub fn emit_frames(
                 feature: entry.feature.clone(),
             }
         })?;
+        // INT tiles off Y0: the segbits lines carry the Y0 mapping
+        // only, so shift every ref bit into this tile's 48-bit window
+        // (see int_tile_bit_shift). Without the shift, two tiles in
+        // one column map the same mux to the same (FAR, bit) and the
+        // second PIP fails below with MustBeZeroViolated. The shift
+        // is 0 for Y0 tiles and for non-INT tiles, so Y0 behavior is
+        // unchanged. The per-ref FRAME_BITS check below validates
+        // the shifted bit.
+        let bit_shift = int_tile_bit_shift(&entry.tile);
+        let shifted_refs: Vec<BitRef>;
+        let refs: &[BitRef] = if bit_shift == 0 {
+            refs
+        } else {
+            shifted_refs = refs
+                .iter()
+                .map(|r| BitRef {
+                    frame: r.frame,
+                    bit: r.bit + bit_shift,
+                    must_be_zero: r.must_be_zero,
+                })
+                .collect();
+            &shifted_refs
+        };
         if let Some(v) = &entry.value {
             let highest = v.significant_bits();
             let n_set = refs.iter().filter(|r| !r.must_be_zero).count();
@@ -2415,28 +2486,40 @@ pub fn parse_bitstream(
     // bits are never masked: the ECC lane proved full-SLICEM-INIT
     // masking breaks 8,143 previously correct frames.
     let mut lutram_masks: HashMap<u32, [bool; FRAME_BITS]> = HashMap::new();
-    // For each tile type, the set-bit signatures of features that list no
-    // `!` bits. An all-`!` feature whose zero signature is one of these
-    // is the exact complement of that feature (a binary attribute pair
-    // such as FF INIT .V0/.V1). Built lazily per tile type; a tile type
-    // appears on many tiles.
-    let mut complement_sets: HashMap<String, HashSet<Vec<(u32, u16)>>> = HashMap::new();
+    // For each (tile type, INT bit shift), the set-bit signatures of
+    // features that list no `!` bits. An all-`!` feature whose zero
+    // signature is one of these is the exact complement of that
+    // feature (a binary attribute pair such as FF INIT .V0/.V1).
+    // Built lazily; a tile type appears on many tiles. The shift is
+    // part of the key because an INT tile off Y0 carries the same
+    // features at shifted bit positions (see int_tile_bit_shift).
+    let mut complement_sets: HashMap<(String, u16), HashSet<Vec<(u32, u16)>>> =
+        HashMap::new();
+    // Widest segbits bit of any INT feature in the DB, for the decode
+    // fast path below: an INT tile's window is [shift, shift+max].
+    // The vendored INT DB tops out at bit 47, but stub DBs may use
+    // higher bits (bitgen_roundtrip uses bit 100), so the bound
+    // comes from the DB, not a constant.
+    let int_max_bit: u16 = segbits
+        .features("INT")
+        .iter()
+        .filter_map(|f| segbits.lookup("INT", f))
+        .flat_map(|refs| refs.iter().map(|r| r.bit))
+        .max()
+        .unwrap_or(0);
     for tile in device.tile_names() {
-        // F3: the 60 INT tiles in one clock-region row share one base
-        // FAR, so render INT features only on the row-start tile
-        // (Y % 60 == 0); otherwise one set INT PIP renders 60 times.
-        // Documented limitation: a design using a non-row-start INT
-        // tile (e.g. INT_X11Y119) parses back as its row-start tile
-        // (INT_X11Y60); the bits alone cannot distinguish the 60
-        // tiles in a row, since they share one column. The same class
-        // of limitation already applies to SLICE tiles sharing a
-        // column base (F1). INT_INTF and HDIO tiles share a base FAR
-        // per (type, row, X) the same way, so the same row-start rule
-        // applies to them (an INT_INTF feature set on a non-row-start
+        // F3 (revised): the 60 INT tiles in one clock-region row share
+        // one base FAR, but each tile occupies its own 48-bit window
+        // within each frame (see int_tile_bit_shift), so the bits DO
+        // distinguish the 60 tiles and every INT tile renders its own
+        // features. The row-start rule below therefore applies only
+        // to INT_INTF/HDIO tiles, whose per-Y bit layout is not
+        // established here (an INT_INTF feature set on a non-row-start
         // tile parses back as its row-start tile; HDIO tiles exist
         // only at row-start Y, so the rule renders exactly the real
-        // HDIO tiles).
-        if let Some(y) = parse_int_tile_y(tile).or_else(|| parse_intf_tile_y(tile)) {
+        // HDIO tiles). The same class of limitation already applies
+        // to SLICE tiles sharing a column base (F1).
+        if let Some(y) = parse_intf_tile_y(tile) {
             if y % NUM_CLB_PER_COLUMN != 0 {
                 continue;
             }
@@ -2444,12 +2527,27 @@ pub fn parse_bitstream(
         let tile_type = device
             .tile_type(tile)
             .ok_or_else(|| BitgenError::UnknownTileType { tile: tile.clone() })?;
+        // INT tiles off Y0: segbits lines carry the Y0 mapping only;
+        // shift every ref bit into this tile's window. 0 for Y0
+        // tiles and for non-INT tiles.
+        let bit_shift = int_tile_bit_shift(tile);
         let complements = complement_sets
-            .entry(tile_type.to_string())
-            .or_insert_with(|| complement_signatures(segbits, tile_type));
+            .entry((tile_type.to_string(), bit_shift))
+            .or_insert_with(|| complement_signatures(segbits, tile_type, bit_shift));
         let base_far = device
             .tile_base_far(tile)
             .ok_or_else(|| BitgenError::UnknownTileType { tile: tile.clone() })?;
+        // INT fast path: every INT tile now renders (the row-start
+        // skip is lifted above), so a tile whose segbits window holds
+        // no set bit in any of its 76 frames renders nothing and
+        // explains nothing (the unexplained check only consults set
+        // bits). Without this, decoding would run the 3,778-feature
+        // loop over every INT tile in the device.
+        if tile_type == "INT"
+            && !int_tile_window_has_set_bit(&frames, base_far, bit_shift, int_max_bit)
+        {
+            continue;
+        }
         // BRAM tiles render through the bit-location tables, never
         // through segbits: no vendored segbits DB carries BRAM INIT.
         // Each array renders only when it holds a set bit (valued
@@ -2548,6 +2646,25 @@ pub fn parse_bitstream(
                     reason: "features() lists it but lookup() returns None".to_string(),
                 }
             })?;
+            // Same shift as the emit side: segbits lines carry the
+            // Y0 mapping, so read this tile's window. The shifted
+            // refs are used for everything below (explained set,
+            // presence test, value reconstruction, MustBeZero check,
+            // complement signature), exactly as emit writes them.
+            let shifted_refs: Vec<BitRef>;
+            let refs: &[BitRef] = if bit_shift == 0 {
+                refs
+            } else {
+                shifted_refs = refs
+                    .iter()
+                    .map(|r| BitRef {
+                        frame: r.frame,
+                        bit: r.bit + bit_shift,
+                        must_be_zero: r.must_be_zero,
+                    })
+                    .collect();
+                &shifted_refs
+            };
             for r in refs {
                 let far = base_far
                     .checked_add(r.frame)
@@ -2766,14 +2883,25 @@ fn zero_signature(refs: &[BitRef]) -> Vec<(u32, u16)> {
 /// exact complement of one of these features (a binary attribute pair
 /// such as FF INIT .V0/.V1). Features the DB lists but lookup cannot
 /// resolve are skipped here; the main loop fails loud on them.
-fn complement_signatures(segbits: &dyn SegbitsDb, tile_type: &str) -> HashSet<Vec<(u32, u16)>> {
+/// `bit_shift` is the tile's INT segbits window shift (0 for Y0 tiles
+/// and non-INT tiles); signatures are built from the shifted bits so
+/// they match the shifted zero signatures the main loop compares
+/// against.
+fn complement_signatures(
+    segbits: &dyn SegbitsDb,
+    tile_type: &str,
+    bit_shift: u16,
+) -> HashSet<Vec<(u32, u16)>> {
     let mut set = HashSet::new();
     for feature in segbits.features(tile_type) {
         if let Some(refs) = segbits.lookup(tile_type, feature) {
             if refs.is_empty() || refs.iter().any(|r| r.must_be_zero) {
                 continue;
             }
-            let mut sig: Vec<(u32, u16)> = refs.iter().map(|r| (r.frame, r.bit)).collect();
+            let mut sig: Vec<(u32, u16)> = refs
+                .iter()
+                .map(|r| (r.frame, r.bit + bit_shift))
+                .collect();
             sig.sort();
             set.insert(sig);
         }
@@ -3241,5 +3369,81 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[&0x50C], [0u32; FRAME_WORDS]);
         assert_eq!(parse_bitstream(&bytes, &device, &db).unwrap(), "");
+    }
+
+    /// INT tiles in one column share a base FAR but occupy distinct
+    /// 48-bit windows per Y (see the INT bit-shift helper in
+    /// bitgen_device.rs). The two SDQ_4 selections below collide
+    /// without the shift: SDQ_52 on Y0 sets frame 26 bit 10, and
+    /// SDQ_56 on Y1 requires that same (frame, bit) to read 0. With
+    /// the shift, Y1's bits land 48 higher and both selections emit.
+    fn int_two_tile_db() -> (StubDevice, StubSegbitsDb) {
+        // Both INT tiles share base FAR 0x400 (the xczu3eg tilegrid
+        // baseaddr for the INT_X1 column, row 0). Config order covers
+        // the tile's 76 frames, 0x400..0x44b.
+        let device = StubDevice::new(
+            "xczu3eg",
+            Some(0x04A4_2093),
+            vec![
+                ("INT_X1Y0".to_string(), "INT".to_string(), 0x400),
+                ("INT_X1Y1".to_string(), "INT".to_string(), 0x400),
+            ],
+            (0x400..0x44c).collect(),
+        );
+        // Verbatim SDQ_4 lines from the vendored segbits_int.db.
+        let db = StubSegbitsDb::new(vec![
+            (
+                "INT".to_string(),
+                "PIP.INT_INT_SDQ_4_INT_OUT0.INT_NODE_SDQ_52_INT_OUT1".to_string(),
+                vec![
+                    BitRef::zero(16, 11),
+                    BitRef::zero(18, 11),
+                    BitRef::zero(24, 10),
+                    BitRef::set(26, 10),
+                ],
+            ),
+            (
+                "INT".to_string(),
+                "PIP.INT_INT_SDQ_4_INT_OUT0.INT_NODE_SDQ_56_INT_OUT0".to_string(),
+                vec![
+                    BitRef::zero(16, 11),
+                    BitRef::set(18, 11),
+                    BitRef::zero(24, 10),
+                    BitRef::zero(26, 10),
+                ],
+            ),
+        ]);
+        (device, db)
+    }
+
+    #[test]
+    fn int_tiles_in_one_column_emit_different_mux_selections() {
+        let (device, db) = int_two_tile_db();
+        let fasm = "INT_X1Y0.PIP.INT_INT_SDQ_4_INT_OUT0.INT_NODE_SDQ_52_INT_OUT1\n\
+                    INT_X1Y1.PIP.INT_INT_SDQ_4_INT_OUT0.INT_NODE_SDQ_56_INT_OUT0\n";
+        // Without the shift this fails with MustBeZeroViolated: both
+        // selections touch frame 26 bit 10 of FAR 0x41a.
+        let bytes = emit_bitstream(fasm, &device, &db).unwrap();
+        let frames = parse_frames(&bytes).unwrap();
+        // Y0 SDQ_52 sets frame 26 bit 10 (FAR 0x41a).
+        assert!(frame_bit(&frames, 0x41a, 10));
+        // Y1 SDQ_56 sets frame 18 bit 11+48=59 (FAR 0x412) and
+        // requires frame 26 bit 10+48=58 clear (FAR 0x41a).
+        assert!(frame_bit(&frames, 0x412, 59));
+        assert!(!frame_bit(&frames, 0x41a, 58));
+        // Parse-back renders both PIPs on their own tiles.
+        let back = parse_bitstream(&bytes, &device, &db).unwrap();
+        assert!(
+            back.contains(
+                "INT_X1Y0.PIP.INT_INT_SDQ_4_INT_OUT0.INT_NODE_SDQ_52_INT_OUT1"
+            ),
+            "Y0 PIP missing from parse-back:\n{back}"
+        );
+        assert!(
+            back.contains(
+                "INT_X1Y1.PIP.INT_INT_SDQ_4_INT_OUT0.INT_NODE_SDQ_56_INT_OUT0"
+            ),
+            "Y1 PIP missing from parse-back:\n{back}"
+        );
     }
 }
