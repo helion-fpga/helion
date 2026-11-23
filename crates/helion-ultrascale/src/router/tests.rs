@@ -31,6 +31,154 @@ fn small_db() -> MockWireDb {
     db
 }
 
+/// The vendored INT tile JSON (BitFiltrator, MIT), shared with the
+/// wire_db tests.
+const TILE_JSON: &str = include_str!("../../data/tile_type_INT.json");
+
+/// One INT tile at (1, 0), the tile the counter flow routes over
+/// (SLICE_X1Y0 partners INT_X1Y0).
+fn int_tile_db() -> crate::wire_db::IntTileWireDb {
+    crate::wire_db::IntTileWireDb::single_tile("INT_X1Y0", 1, 0, TILE_JSON).unwrap()
+}
+
+fn counter_site() -> UltraSite {
+    UltraSite { x: 1, y: 0, kind: 0 }
+}
+
+/// Register one BEL pin to its INT wire in the tile DB.
+fn pin(db: &mut crate::wire_db::IntTileWireDb, bel: &str, pin: &str, wire: &str) {
+    db.add_pin_wire(counter_site(), bel, pin, "INT_X1Y0", wire)
+        .unwrap();
+}
+
+fn rnet(name: &str, dbel: &str, dpin: &str, sinks: &[(&str, &str)]) -> RoutableNet {
+    RoutableNet {
+        name: name.to_string(),
+        driver: (counter_site(), dbel.to_string(), dpin.to_string()),
+        sinks: sinks
+            .iter()
+            .map(|(b, p)| (counter_site(), b.to_string(), p.to_string()))
+            .collect(),
+        is_clock: false,
+    }
+}
+
+#[test]
+fn counter_repaired_netlist_routes() {
+    // The counter netlist after the flow's X-pin repair (cnt_2's FF
+    // moved BQ2 -> DQ, so cnt_2_d takes D6 and is not routed):
+    // the exact driver/sink wires from the flow's debug log. Must
+    // route with zero overuse; on the base router this netlist
+    // times out (OveruseTimeout on BYPASS_W6 after 50 iters).
+    let mut db = int_tile_db();
+    pin(&mut db, "AQ", "Q", "LOGIC_OUTS_W14");
+    pin(&mut db, "AQ2", "Q", "LOGIC_OUTS_W23");
+    pin(&mut db, "BQ", "Q", "LOGIC_OUTS_W6");
+    pin(&mut db, "DQ", "Q", "LOGIC_OUTS_W10");
+    pin(&mut db, "B6LUT", "O6", "LOGIC_OUTS_W12");
+    pin(&mut db, "C6LUT", "O6", "LOGIC_OUTS_W4");
+    pin(&mut db, "A6LUT", "I0", "IMUX_W10");
+    pin(&mut db, "A6LUT", "I1", "IMUX_W8");
+    pin(&mut db, "B6LUT", "I0", "IMUX_W11");
+    pin(&mut db, "C6LUT", "I0", "IMUX_W6");
+    pin(&mut db, "D6LUT", "I0", "IMUX_W7");
+    pin(&mut db, "A6LUT", "I2", "IMUX_W24");
+    pin(&mut db, "C6LUT", "I1", "IMUX_W12");
+    pin(&mut db, "D6LUT", "I1", "IMUX_W13");
+    pin(&mut db, "A6LUT", "I3", "IMUX_W22");
+    pin(&mut db, "D6LUT", "I2", "IMUX_W17");
+    pin(&mut db, "AQ2", "D", "BOUNCE_W_0_FT1");
+    pin(&mut db, "BQ", "D", "BYPASS_W1");
+    let nets = vec![
+        rnet("cnt_3", "AQ", "Q", &[("A6LUT", "I0")]),
+        rnet(
+            "cnt_0",
+            "AQ2",
+            "Q",
+            &[
+                ("A6LUT", "I1"),
+                ("B6LUT", "I0"),
+                ("C6LUT", "I0"),
+                ("D6LUT", "I0"),
+            ],
+        ),
+        rnet(
+            "cnt_1",
+            "BQ",
+            "Q",
+            &[("A6LUT", "I2"), ("C6LUT", "I1"), ("D6LUT", "I1")],
+        ),
+        rnet("cnt_2", "DQ", "Q", &[("A6LUT", "I3"), ("D6LUT", "I2")]),
+        rnet("cnt_0_d", "B6LUT", "O6", &[("AQ2", "D")]),
+        rnet("cnt_1_d", "C6LUT", "O6", &[("BQ", "D")]),
+    ];
+    let r = route_ultra(&nets, &db, UltraRouteOpts::default())
+        .expect("repaired counter netlist must route");
+    assert_eq!(r.overused_nodes, 0);
+    assert_eq!(r.routes.len(), nets.len());
+}
+
+#[test]
+fn counter_unrepaired_netlist_still_fails_loud() {
+    // The counter netlist BEFORE the X-pin repair: cnt_1's and
+    // cnt_2's FFs share letter B, so both D nets sink at the shared
+    // BX pin (BYPASS_W1). Zero overuse is impossible for this
+    // netlist: cnt_2 -> IMUX_W17 requires BYPASS_W6, and cnt_0_d
+    // and cnt_2_d each require BYPASS_W6 or BYPASS_W4, so one of
+    // those wires is shared by two nets in every routing. The
+    // router must still fail loud with OveruseTimeout here (and not
+    // silently emit an overused routing): the fix is the packing
+    // repair, not a weaker router.
+    let mut db = int_tile_db();
+    pin(&mut db, "AQ", "Q", "LOGIC_OUTS_W14");
+    pin(&mut db, "AQ2", "Q", "LOGIC_OUTS_W23");
+    pin(&mut db, "BQ", "Q", "LOGIC_OUTS_W6");
+    pin(&mut db, "BQ2", "Q", "LOGIC_OUTS_W19");
+    pin(&mut db, "B6LUT", "O6", "LOGIC_OUTS_W12");
+    pin(&mut db, "C6LUT", "O6", "LOGIC_OUTS_W4");
+    pin(&mut db, "D6LUT", "O6", "LOGIC_OUTS_W16");
+    pin(&mut db, "A6LUT", "I0", "IMUX_W10");
+    pin(&mut db, "A6LUT", "I1", "IMUX_W8");
+    pin(&mut db, "B6LUT", "I0", "IMUX_W11");
+    pin(&mut db, "C6LUT", "I0", "IMUX_W6");
+    pin(&mut db, "D6LUT", "I0", "IMUX_W7");
+    pin(&mut db, "A6LUT", "I2", "IMUX_W24");
+    pin(&mut db, "C6LUT", "I1", "IMUX_W12");
+    pin(&mut db, "D6LUT", "I1", "IMUX_W13");
+    pin(&mut db, "A6LUT", "I3", "IMUX_W22");
+    pin(&mut db, "D6LUT", "I2", "IMUX_W17");
+    pin(&mut db, "AQ2", "D", "BOUNCE_W_0_FT1");
+    pin(&mut db, "BQ", "D", "BYPASS_W1");
+    pin(&mut db, "BQ2", "D", "BYPASS_W1");
+    let nets = vec![
+        rnet("cnt_3", "AQ", "Q", &[("A6LUT", "I0")]),
+        rnet(
+            "cnt_0",
+            "AQ2",
+            "Q",
+            &[
+                ("A6LUT", "I1"),
+                ("B6LUT", "I0"),
+                ("C6LUT", "I0"),
+                ("D6LUT", "I0"),
+            ],
+        ),
+        rnet(
+            "cnt_1",
+            "BQ",
+            "Q",
+            &[("A6LUT", "I2"), ("C6LUT", "I1"), ("D6LUT", "I1")],
+        ),
+        rnet("cnt_2", "BQ2", "Q", &[("A6LUT", "I3"), ("D6LUT", "I2")]),
+        rnet("cnt_0_d", "B6LUT", "O6", &[("AQ2", "D")]),
+        rnet("cnt_1_d", "C6LUT", "O6", &[("BQ", "D")]),
+        rnet("cnt_2_d", "D6LUT", "O6", &[("BQ2", "D")]),
+    ];
+    let err = route_ultra(&nets, &db, UltraRouteOpts::default())
+        .expect_err("unrepaired counter netlist must fail loud");
+    assert_eq!(err.kind, RouteErrorKind::OveruseTimeout);
+}
+
 #[test]
 fn determinism_same_seed_identical_routes() {
     let db = small_db();
