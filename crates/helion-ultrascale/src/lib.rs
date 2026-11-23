@@ -71,8 +71,8 @@ pub use fabric::{
     WireDb, WireId, WireInfo,
 };
 pub use fasm_gen::{
-    emit_ff_fasm, emit_ffmux_fasm, emit_lut_fasm, ff_init_fasm_line, ff_srval_fasm_line,
-    ffmux_fasm_line, lut_init_fasm_line, FfAttr, FfMuxSel,
+    emit_ff_fasm, emit_ffmux_fasm, emit_lut_fasm, emit_outmux_fasm, ff_init_fasm_line,
+    ff_srval_fasm_line, ffmux_fasm_line, lut_init_fasm_line, FfAttr, FfMuxSel,
 };
 pub use int_pip::{
     BidirDir, EmittedPip, IntPip, IntPipError, MissingPip, PipResolution, emit_pips,

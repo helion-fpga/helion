@@ -221,6 +221,48 @@ pub fn emit_ffmux_fasm(
     Ok(lines)
 }
 
+/// Emit OUTMUX FASM for live LUT letters with no FF in the letter:
+/// one `{site}.OUTMUX{letter}.D6` line per such letter, in
+/// deterministic order (placed-slice order, then letter ascending).
+/// A LUT O drives the fabric through its `{letter}_O` pin
+/// (LOGIC_OUTS wire) whether or not the letter has an FF, but the
+/// route checker only counts a live LUT O as a driver when the
+/// letter is selected by an FFMUX or an OUTMUX (us09v routecheck
+/// `_slice_output_pins`, with a negative test pinning that a LUT
+/// with no selection at all must not count). A slice with live LUTs
+/// and no FFs at all (the FF-less slice of a two-slice counter)
+/// therefore left every LOGIC_OUTS leg undriven. Selecting D6 on
+/// the letter's OUTMUX records that the letter's O6 output is the
+/// letter's mux output, which is what the LUT already drives, and
+/// makes the checker count the pin. Letters with an FF already have
+/// an FFMUX selection and need no OUTMUX line.
+pub fn emit_outmux_fasm(
+    packed: &[PackedUltraSlice],
+    placed: &UltraPlaced,
+) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    for p in &placed.slices {
+        let slice = packed.get(p.packed_idx).ok_or_else(|| {
+            format!(
+                "ULTRA FASM: placed slice {} references packed index {} out of range",
+                p.site, p.packed_idx
+            )
+        })?;
+        let mut lut_letters: Vec<u8> = slice.luts.keys().copied().collect();
+        lut_letters.sort_unstable();
+        for bel in lut_letters {
+            let ff_in_letter = slice.ffs.contains_key(&(bel * 2))
+                || slice.ffs.contains_key(&(bel * 2 + 1));
+            if ff_in_letter {
+                continue;
+            }
+            let letter = (b'A' + bel) as char;
+            lines.push(format!("{}.OUTMUX{}.D6", p.site, letter));
+        }
+    }
+    Ok(lines)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,6 +391,33 @@ mod tests {
             ]
         );
         assert!(ff_fasm_name(16).is_err());
+    }
+
+    #[test]
+    fn outmux_lines_cover_ff_less_lut_letters_only() {
+        // LUTs in letters A and B with an FF only in letter A: the
+        // B letter gets OUTMUXB.D6, the A letter does not (its
+        // FFMUX already selects it).
+        let mut slice = PackedUltraSlice::new("SLICE_X0Y0".to_string(), SliceKind::Logic);
+        slice.luts.insert(0, "lut_a".to_string());
+        slice.lut_inits.insert(0, 0x8888888888888888);
+        slice.luts.insert(1, "lut_b".to_string());
+        slice.lut_inits.insert(1, 0x7fff8000ffff0000);
+        slice.ffs.insert(0, "q".to_string());
+        slice.ff_clk.insert(0, "clk".to_string());
+        let packed = vec![slice];
+        let placed = UltraPlaced {
+            slices: vec![crate::place::PlacedUltraSlice {
+                packed_idx: 0,
+                site: "SLICE_X10Y20".to_string(),
+                tile: "CLB_X10Y20".to_string(),
+                x: 10,
+                y: 20,
+            }],
+            seed: 0,
+        };
+        let lines = emit_outmux_fasm(&packed, &placed).unwrap();
+        assert_eq!(lines, vec!["SLICE_X10Y20.OUTMUXB.D6".to_string()]);
     }
 
     #[test]
