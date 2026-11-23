@@ -561,8 +561,12 @@ pub fn run_impl(
 
     // PACK.
     let limits = ControlSetLimits::default();
-    let packed = pack_ultra(&cells.luts, &cells.ffs, &cells.carry_chains, &limits)
+    let mut packed = pack_ultra(&cells.luts, &cells.ffs, &cells.carry_chains, &limits)
         .map_err(|e| format!("ULTRA PACK: {e}"))?;
+    // X-pin repair: the packer cannot see D nets, so two FFs with
+    // different BYP D nets can share one letter (one X pin). Move
+    // the second one before place; see repair_ff_xpin_conflicts.
+    repair_ff_xpin_conflicts(&design, &mut packed)?;
     println!(
         "hang_diag ultra pack slices={} slicel={} slicem={} luts={} ffs={} carry8={}",
         packed.slices.len(),
@@ -677,10 +681,10 @@ pub fn run_impl(
     // the wire_info naming seam (INTERFACES.md). The concrete graph
     // resolves bidirectional PIPs from its PIP table; any unnamed
     // wire or non-edge fails loud here, never silently skipped.
-    // Multi-sink nets route as a flattened union of per-sink paths,
-    // which is not an ordered path: translation fails loud on those
-    // (NotConnected) until the router emits trees the translator can
-    // follow.
+    // Multi-sink nets route as a flattened union of per-sink paths;
+    // the translator derives the PIP tree from that wire set (each
+    // wire's parent is its latest preceding driver), so unions
+    // translate instead of failing on the leg junctions.
     let mut translated: Vec<TranslatedRoute> = Vec::with_capacity(routed.routes.len());
     for (net, route) in nets.iter().zip(routed.routes.iter()) {
         translated.push(
@@ -938,6 +942,227 @@ fn ffmux_selections(
         sels.insert(ff_cell.clone(), sel);
     }
     sels
+}
+
+/// Repair shared-X-pin conflicts after packing.
+///
+/// Two FFs in one slice letter share the one X pin (`{L}X`), so when
+/// both select BYP (their D nets come from a LUT of another letter,
+/// another slice, an FF Q, or a port) they must share one D net: the
+/// X pin is a single physical input. The packer assigns FF BELs
+/// without D-net knowledge (see `ffmux_selections`: `PackedUltraSlice`
+/// carries no `ff_d` field), so it can pack two FFs with different BYP
+/// D nets into one letter. That packing is unroutable: both D nets
+/// must terminate at the same INT wire, and the router can only fail
+/// with OveruseTimeout after 50 iters (counter: BQ/BQ2 share BX, so
+/// cnt_1_d and cnt_2_d both sink at BYPASS_W1; the forced sharing
+/// makes zero overuse impossible, see the counter lane report).
+///
+/// This repair moves the second BYP FF of a conflicted letter to the
+/// first free letter of the same slice that can take it, preferring
+/// its driver LUT's letter (the move then selects D6 and needs no
+/// fabric route at all). A target letter can take the FF when it has
+/// a free BEL and its resident BYP users (if any) share the moved
+/// FF's D net; resident D6 users never consume the X pin. Moving
+/// within the slice cannot change control sets. When no letter in the
+/// slice can take the FF, the repair fails loud naming the FF, its D
+/// net, and the slice, instead of emitting a packing the router
+/// cannot configure. Runs after pack, before place, in `run_impl`
+/// (and the multiseed pack-once site, so both flows pack alike).
+/// Each move strictly reduces the conflict count, so the loop
+/// terminates; the pass bound only guards against a logic error.
+fn repair_ff_xpin_conflicts(
+    design: &Design,
+    packed: &mut helion_ultrascale::UltraPacked,
+) -> Result<(), String> {
+    // Pin -> net, and net -> driving LUT cell (same pattern as
+    // ffmux_selections).
+    let mut pin_to_net: HashMap<(String, String), String> = HashMap::new();
+    for net in &design.nets {
+        let net_name = resolve(net.name).to_string();
+        for ep in &net.endpoints {
+            pin_to_net.insert(
+                (resolve(ep.cell).to_string(), resolve(ep.pin).to_string()),
+                net_name.clone(),
+            );
+        }
+    }
+    let mut lut_driver: HashMap<String, String> = HashMap::new();
+    for cell in &design.cells {
+        if !matches!(cell.kind, CellKind::Lut6 { .. }) {
+            continue;
+        }
+        let cell_name = resolve(cell.name).to_string();
+        if let Some(net) = pin_to_net.get(&(cell_name.clone(), "O".to_string())) {
+            lut_driver.insert(net.clone(), cell_name);
+        }
+    }
+    for _ in 0..64 {
+        // Current placements: LUT cell -> (slice, letter), FF cell ->
+        // (slice, bel).
+        let mut lut_place: HashMap<String, (usize, char)> = HashMap::new();
+        let mut ff_place: HashMap<String, (usize, u8)> = HashMap::new();
+        for (idx, slice) in packed.slices.iter().enumerate() {
+            for (bel, cell) in &slice.luts {
+                lut_place.insert(cell.clone(), (idx, (b'A' + *bel) as char));
+            }
+            for (bel, cell) in &slice.ffs {
+                ff_place.insert(cell.clone(), (idx, *bel));
+            }
+        }
+        // Selection and D net per FF (same D6 rule as
+        // ffmux_selections).
+        let mut ff_info: HashMap<String, (FfMuxSel, Option<String>)> = HashMap::new();
+        for (ff_cell, (ff_slice, ff_bel)) in &ff_place {
+            let ff_letter = (b'A' + (ff_bel / 2)) as char;
+            let d_net = pin_to_net
+                .get(&(ff_cell.clone(), "D".to_string()))
+                .cloned();
+            let sel = d_net
+                .as_ref()
+                .and_then(|n| lut_driver.get(n))
+                .and_then(|lut_cell| lut_place.get(lut_cell))
+                .map(|(lut_slice, lut_letter)| {
+                    if lut_slice == ff_slice && lut_letter == &ff_letter {
+                        FfMuxSel::D6
+                    } else {
+                        FfMuxSel::Byp
+                    }
+                })
+                .unwrap_or(FfMuxSel::Byp);
+            ff_info.insert(ff_cell.clone(), (sel, d_net));
+        }
+        // First conflict: one slice letter whose BYP users (FFs with
+        // a D net selecting BYP) carry two distinct D nets. A FF with
+        // no D net consumes no X pin and never counts here.
+        let mut conflict: Option<(usize, u8, String, String, u8)> = None;
+        'outer: for (idx, slice) in packed.slices.iter().enumerate() {
+            for letter in 0..8u8 {
+                let mut byp: Vec<(u8, String, String)> = Vec::new();
+                for bel in [letter * 2, letter * 2 + 1] {
+                    let Some(ff_cell) = slice.ffs.get(&bel) else {
+                        continue;
+                    };
+                    let Some((sel, d_net)) = ff_info.get(ff_cell) else {
+                        continue;
+                    };
+                    if *sel == FfMuxSel::Byp {
+                        if let Some(n) = d_net {
+                            byp.push((bel, ff_cell.clone(), n.clone()));
+                        }
+                    }
+                }
+                byp.sort_by_key(|(bel, _, _)| *bel);
+                let mut distinct: Vec<&str> = Vec::new();
+                for (_, _, n) in &byp {
+                    if !distinct.contains(&n.as_str()) {
+                        distinct.push(n.as_str());
+                    }
+                }
+                if distinct.len() > 1 {
+                    let keep = byp[0].2.clone();
+                    let mover = byp.iter().find(|(_, _, n)| *n != keep).unwrap();
+                    conflict = Some((
+                        idx,
+                        letter,
+                        mover.1.clone(),
+                        mover.2.clone(),
+                        mover.0,
+                    ));
+                    break 'outer;
+                }
+            }
+        }
+        let Some((slice_idx, letter, mover_cell, mover_net, mover_bel)) = conflict else {
+            return Ok(());
+        };
+        // Target letters in the same slice: the driver LUT's letter
+        // first (the move then selects D6), then A..H in order.
+        let driver_letter: Option<char> = lut_driver
+            .get(&mover_net)
+            .and_then(|lut_cell| lut_place.get(lut_cell))
+            .filter(|(s, _)| *s == slice_idx)
+            .map(|(_, l)| *l);
+        let mut candidates: Vec<u8> = Vec::new();
+        if let Some(l) = driver_letter {
+            candidates.push(l as u8 - b'A');
+        }
+        for l in 0..8u8 {
+            if !candidates.contains(&l) {
+                candidates.push(l);
+            }
+        }
+        let mut target: Option<(u8, u8)> = None;
+        for tletter in candidates {
+            if tletter == letter {
+                continue;
+            }
+            for tbel in [tletter * 2, tletter * 2 + 1] {
+                if packed.slices[slice_idx].ffs.contains_key(&tbel) {
+                    continue;
+                }
+                // The move selects D6 in the driver letter, so it
+                // consumes no X pin there and compatibility is
+                // automatic. Else every resident BYP user of the
+                // target letter must share the mover's D net.
+                let becomes_d6 = driver_letter == Some((b'A' + tletter) as char);
+                if !becomes_d6 {
+                    let mut ok = true;
+                    for rbel in [tletter * 2, tletter * 2 + 1] {
+                        if let Some(rcell) = packed.slices[slice_idx].ffs.get(&rbel) {
+                            if let Some((FfMuxSel::Byp, Some(rnet))) = ff_info.get(rcell) {
+                                if *rnet != mover_net {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                }
+                target = Some((tletter, tbel));
+                break;
+            }
+            if target.is_some() {
+                break;
+            }
+        }
+        let Some((target_letter, new_bel)) = target else {
+            return Err(format!(
+                "ULTRA PACK: FF {mover_cell} (D net {mover_net}) shares the X pin of slice {} letter {} with a different BYP D net and no free compatible letter exists in the slice",
+                packed.slices[slice_idx].name,
+                (b'A' + letter) as char
+            ));
+        };
+        let old_letter = (b'A' + letter) as char;
+        let new_letter = (b'A' + target_letter) as char;
+        let slice = &mut packed.slices[slice_idx];
+        let cell = slice.ffs.remove(&mover_bel).expect("mover FF present");
+        debug_assert_eq!(cell, mover_cell);
+        let clk = slice.ff_clk.remove(&mover_bel);
+        let ce = slice.ff_ce.remove(&mover_bel);
+        let sr = slice.ff_sr.remove(&mover_bel);
+        slice.ffs.insert(new_bel, cell);
+        if let Some(v) = clk {
+            slice.ff_clk.insert(new_bel, v);
+        }
+        if let Some(v) = ce {
+            slice.ff_ce.insert(new_bel, v);
+        }
+        if let Some(v) = sr {
+            slice.ff_sr.insert(new_bel, v);
+        }
+        println!(
+            "hang_diag ultra pack xpin_repair ff={mover_cell} d_net={mover_net} slice={} letter {old_letter}->{new_letter}",
+            packed.slices[slice_idx].name
+        );
+    }
+    Err(
+        "ULTRA PACK: X-pin repair did not converge within 64 passes (internal error)"
+            .to_string(),
+    )
 }
 
 /// Build routable nets from the placed design. Only reached once a real
@@ -1321,8 +1546,10 @@ pub fn run_multiseed(
     let route_blocked = fabric.wires().wire_count() == 0;
     let cells = extract_cells(&design)?;
     let limits = ControlSetLimits::default();
-    let packed = pack_ultra(&cells.luts, &cells.ffs, &cells.carry_chains, &limits)
+    let mut packed = pack_ultra(&cells.luts, &cells.ffs, &cells.carry_chains, &limits)
         .map_err(|e| format!("ULTRA PACK: {e}"))?;
+    // Same X-pin repair as the impl flow, so both flows pack alike.
+    repair_ff_xpin_conflicts(&design, &mut packed)?;
     println!(
         "multiseed: design={} part={} synth luts={} ffs={} carry_chains={} packed_slices={}",
         path,
@@ -1933,6 +2160,147 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
             "unexplained bits must be empty now that the decoder explains band bits: {:?}",
             decoded.unexplained
         );
+    }
+
+    /// Flow-level test: `helion impl examples/counter.sv --part xczu3eg`
+    /// runs synth to BITGEN and emits a real bitstream. Same tileconn
+    /// env gate as the blinky flow test above; run with:
+    /// HELION_TILECONN_DB_ROOT=~/workspace/prjuray-db-ref/zynqusp
+    /// HELION_TILECONN_PART=xczu3eg-sbva484-1-e cargo test --release
+    /// -j1 -p helion-cli counter_flow_emits_bitstream_on_xczu3eg
+    ///
+    /// What this pins: the counter routes (6 nets, 0 overuse) after
+    /// the X-pin repair and the own-trunk router fix, and BITGEN
+    /// emits a 5,982,532-byte bitstream with IDCODE 0x04a42093 and
+    /// 14,952 FDRI frames. Only the stable FASM lines are pinned:
+    /// the 4 LUT INITs, the 8 FF INIT/SRVAL lines, the 4 FFMUX
+    /// lines (A1.D6, A2.BYP, B1.BYP, D1.D6: the repair moved cnt_2's
+    /// FF to letter D, so its D takes D6), and the 6 FF control
+    /// lines. The PIP set is NOT pinned: the router is
+    /// nondeterministic across processes (fanout order comes from a
+    /// HashMap), so the PIPs vary run to run; the test asserts only
+    /// that every PIP is on INT_X1Y0 and that at least one PIP was
+    /// emitted. On the base this test fails at ROUTE with
+    /// OveruseTimeout and writes no .bit.
+    #[test]
+    fn counter_flow_emits_bitstream_on_xczu3eg() {
+        use helion_ultrascale::band_code::{BandCheck, check_stored_band};
+        let Ok(db_root) = std::env::var("HELION_TILECONN_DB_ROOT") else {
+            println!(
+                "counter_flow_emits_bitstream_on_xczu3eg: skipping, \
+                 HELION_TILECONN_DB_ROOT is unset"
+            );
+            return;
+        };
+        if !std::path::Path::new(&db_root).is_dir() {
+            println!(
+                "counter_flow_emits_bitstream_on_xczu3eg: skipping, \
+                 HELION_TILECONN_DB_ROOT {db_root} is absent"
+            );
+            return;
+        }
+        let Ok(part) = std::env::var("HELION_TILECONN_PART") else {
+            println!(
+                "counter_flow_emits_bitstream_on_xczu3eg: skipping, \
+                 HELION_TILECONN_PART is unset (zynqusp holds two part dirs)"
+            );
+            return;
+        };
+        assert_eq!(
+            part, "xczu3eg-sbva484-1-e",
+            "HELION_TILECONN_PART must be the sbva484 part for this test, got {part}"
+        );
+        let dir = std::env::temp_dir().join("helion-us09-flow-counter-xczu3eg");
+        let _ = std::fs::create_dir_all(&dir);
+        let out_bit = dir.join("counter.xczu3eg.bit");
+        let out_fasm = dir.join("counter.xczu3eg.fasm");
+        let _ = std::fs::remove_file(&out_bit);
+        let _ = std::fs::remove_file(&out_fasm);
+        run_impl(
+            &workspace_example("counter.sv"),
+            "xczu3eg",
+            0,
+            Some(&out_bit.to_string_lossy()),
+            Some(&out_fasm.to_string_lossy()),
+        )
+        .unwrap();
+        let bytes = std::fs::read(&out_bit).unwrap();
+        assert!(!bytes.is_empty(), "emitted bitstream is empty");
+        assert!(
+            bytes.windows(4).any(|w| w == [0x04, 0xa4, 0x20, 0x93]),
+            "emitted bitstream carries no 0x04a42093 IDCODE word"
+        );
+        assert_eq!(count_fdri_frames(&bytes), 14_952);
+        let fasm = std::fs::read_to_string(&out_fasm).unwrap();
+        // Stable lines only (see the doc comment above): LUT INITs,
+        // FF INIT/SRVAL, FFMUX, FF control.
+        let stable: [&str; 22] = [
+            "SLICE_X1Y0.A6LUT.INIT[63:0] = 0x6aaa6aaa6aaa6aaa",
+            "SLICE_X1Y0.B6LUT.INIT[63:0] = 0x5555555555555555",
+            "SLICE_X1Y0.C6LUT.INIT[63:0] = 0x6666666666666666",
+            "SLICE_X1Y0.D6LUT.INIT[63:0] = 0x7878787878787878",
+            "SLICE_X1Y0.AFF.INIT.V0",
+            "SLICE_X1Y0.AFF.SRVAL.V0",
+            "SLICE_X1Y0.AFF2.INIT.V0",
+            "SLICE_X1Y0.AFF2.SRVAL.V0",
+            "SLICE_X1Y0.BFF.INIT.V0",
+            "SLICE_X1Y0.BFF.SRVAL.V0",
+            "SLICE_X1Y0.DFF.INIT.V0",
+            "SLICE_X1Y0.DFF.SRVAL.V0",
+            "SLICE_X1Y0.FFMUXA1.D6",
+            "SLICE_X1Y0.FFMUXA2.BYP",
+            "SLICE_X1Y0.FFMUXB1.BYP",
+            "SLICE_X1Y0.FFMUXD1.D6",
+            "SLICE_X1Y0.ABCDFF.CEUSED.V0",
+            "SLICE_X1Y0.ABCDFF2.CEUSED.V0",
+            "SLICE_X1Y0.ABCDFF.SRUSED.V0",
+            "SLICE_X1Y0.ABCDFF2.SRUSED.V0",
+            "SLICE_X1Y0.ABCDFF.CLKINV.V0",
+            "SLICE_X1Y0.ABCDFF.SRINV.V0",
+        ];
+        for line in stable {
+            assert!(
+                fasm.lines().any(|l| l == line),
+                "flow FASM is missing line: {line}"
+            );
+        }
+        let mut pips = 0usize;
+        for line in fasm.lines() {
+            if line.contains(".PIP.") {
+                pips += 1;
+                assert!(
+                    line.starts_with("INT_X1Y0."),
+                    "PIP on an INT tile outside proven INT_X1: {line}"
+                );
+            }
+        }
+        assert!(pips > 0, "flow FASM carries no PIPs");
+        // H-1 band: the counter carries no LUTRAM, so the mask is
+        // all false, as in the blinky flow test.
+        let frames = helion_ultrascale::bitgen::parse_frames(&bytes).unwrap();
+        assert_eq!(frames.len(), 14_952);
+        let mask = [false; helion_ultrascale::bitgen::FRAME_BITS];
+        let mut exact = 0usize;
+        for (far, words) in &frames {
+            match check_stored_band(*far, words, &mask) {
+                BandCheck::Exact => exact += 1,
+                BandCheck::QResidual => panic!("unexpected Q-residual band at far=0x{far:08x}"),
+                BandCheck::Mismatch { stored, expected } => panic!(
+                    "band mismatch far=0x{far:08x} stored=0x{stored:012x} \
+                     expected=0x{expected:012x}"
+                ),
+            }
+        }
+        assert_eq!(exact, 14_952, "band Exact frame count");
+        // Standalone decoder round-trip over the stable lines.
+        let decoded =
+            helion_ultrascale::bitstream_decode::decode_bitstream(&bytes, &db_root).unwrap();
+        for line in stable {
+            assert!(
+                decoded.fasm.iter().any(|l| l == line),
+                "decoded FASM is missing flow line: {line}"
+            );
+        }
     }
 
     #[test]

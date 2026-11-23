@@ -160,9 +160,21 @@ impl AstarScratch {
 
 /// A* from src wire to dst wire.
 /// Returns the wire path or None if unreachable.
-/// Eight arguments is the day-1 scaffold signature (db, scratch, src,
-/// dst, congestion history, presence, presence factor, tie seed); a
-/// parameter split would churn the router scaffold for no semantic gain.
+/// Nine arguments is the day-1 scaffold signature (db, scratch, src,
+/// dst, congestion history, presence, own-use, presence factor, tie
+/// seed); a parameter split would churn the router scaffold for no
+/// semantic gain.
+///
+/// Presence cost counts OTHER nets only: `own` marks the wires this
+/// net already uses from its earlier sink legs this iteration, and
+/// those wires cost no presence penalty. Sharing a wire within one
+/// net is the Steiner-tree trunk, not congestion: the overuse metric
+/// counts each wire once per net, so charging a net for its own trunk
+/// makes the cost model disagree with the objective it optimizes.
+/// Without this exclusion a multi-sink net's later legs detour around
+/// their own trunk (at `pres_fac` per shared wire) and collide with
+/// other nets instead, freezing PathFinder on a wire another net is
+/// forced to use (counter: BYPASS_W6, see the router tests).
 #[allow(clippy::too_many_arguments)]
 fn astar(
     wires: &dyn WireDb,
@@ -171,6 +183,7 @@ fn astar(
     dst: WireId,
     hist: &[u32],
     pres: &[u32],
+    own: &[bool],
     pres_fac: i64,
     tie_seed: u64,
 ) -> Option<Vec<WireId>> {
@@ -221,9 +234,12 @@ fn astar(
             if ni >= n {
                 continue;
             }
-            // PathFinder cost: base 1 + hist + pres * pres_fac.
+            // PathFinder cost: base 1 + hist + pres * pres_fac, where
+            // pres counts OTHER nets only (see astar docs): a wire
+            // this net already uses costs no presence penalty.
             // Skip src/dst terminals in congestion accounting (handled by caller).
-            let cost = 1i64 + hist[ni] as i64 + pres[ni] as i64 * pres_fac;
+            let pres_others = pres[ni].saturating_sub(u32::from(own[ni]));
+            let cost = 1i64 + hist[ni] as i64 + pres_others as i64 * pres_fac;
             let ng = g + cost;
             if scratch.visited_gen[ni] != generation || ng < scratch.g_score[ni] {
                 scratch.visited_gen[ni] = generation;
@@ -300,6 +316,34 @@ pub fn route_ultra(
     let mut pres = vec![0u32; n_wires];
     let mut scratch = AstarScratch::new(n_wires);
 
+    // Env-gated trace for congestion diagnosis (HELION_ROUTE_DEBUG=1):
+    // resolved pin-to-wire mapping and, per iteration, the overused
+    // wires with their present-use count and historic cost. No output
+    // unless the variable is set.
+    let route_debug = std::env::var("HELION_ROUTE_DEBUG").is_ok();
+    if route_debug {
+        for (name, src, sinks) in &resolved {
+            let src_name = wires
+                .wire_info(*src)
+                .map(|i| i.name.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let sink_names: Vec<String> = sinks
+                .iter()
+                .map(|w| {
+                    format!(
+                        "{}:{}",
+                        w,
+                        wires.wire_info(*w).map(|i| i.name).unwrap_or("?")
+                    )
+                })
+                .collect();
+            eprintln!(
+                "route_debug resolved net={name} src={src}:{src_name} sinks=[{}]",
+                sink_names.join(",")
+            );
+        }
+    }
+
     let max_iters = opts.max_iters.max(1);
     let mut best_overused = u32::MAX;
     let mut best_wire_count = u64::MAX;
@@ -331,6 +375,10 @@ pub fn route_ultra(
             // (Steiner tree optimization is future work; correctness first.)
             let mut net_wires: Vec<WireId> = Vec::new();
             let mut seen = vec![false; n_wires];
+            // Wires this net already contributes to `pres` this
+            // iteration (its earlier sink legs). A* excludes them
+            // from the presence cost: sharing its own trunk is free.
+            let mut own = vec![false; n_wires];
             for &sink in sinks {
                 match astar(
                     wires,
@@ -339,6 +387,7 @@ pub fn route_ultra(
                     sink,
                     &hist,
                     &pres,
+                    &own,
                     pres_fac,
                     tie_seed,
                 ) {
@@ -353,6 +402,7 @@ pub fn route_ultra(
                                 // themselves. Each net counts a wire once.
                                 if w != *src && !sinks.contains(&w) {
                                     pres[wi] = pres[wi].saturating_add(1);
+                                    own[wi] = true;
                                 }
                             }
                         }
@@ -390,6 +440,46 @@ pub fn route_ultra(
 
         let overused = pres.iter().filter(|c| **c > 1).count() as u32;
         let wire_count: u64 = ordered.iter().map(|r| r.len() as u64).sum();
+        if route_debug {
+            let mut over_list: Vec<(WireId, u32)> = pres
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c > 1)
+                .map(|(i, &c)| (i as WireId, c))
+                .collect();
+            over_list.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+            let over_str: Vec<String> = over_list
+                .iter()
+                .map(|&(w, c)| {
+                    let nm = wires
+                        .wire_info(w)
+                        .map(|i| i.name.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    format!("{w}:{nm}x{c}(hist={})", hist[w as usize])
+                })
+                .collect();
+            eprintln!(
+                "route_debug iter={iter} pres_fac={pres_fac} overused={overused} wires=[{}]",
+                over_str.join(",")
+            );
+            for (ni, route) in ordered.iter().enumerate() {
+                let names: Vec<String> = route
+                    .iter()
+                    .map(|w| {
+                        wires
+                            .wire_info(*w)
+                            .map(|i| i.name.to_string())
+                            .unwrap_or_else(|| format!("{w}"))
+                    })
+                    .collect();
+                eprintln!(
+                    "route_debug iter={iter} net={} len={} path=[{}]",
+                    nets[ni].name,
+                    route.len(),
+                    names.join(",")
+                );
+            }
+        }
         if overused < best_overused || (overused == best_overused && wire_count < best_wire_count) {
             best_overused = overused;
             best_wire_count = wire_count;
