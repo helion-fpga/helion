@@ -22,7 +22,9 @@
 //!   single-sink route. A route whose wires do not connect back to
 //!   the driver through earlier wires is refused, never patched up.
 //! - A consecutive pair in different tiles is a span-wire continuation
-//!   (BEG in one tile to END in the tile LEN steps away), not a PIP:
+//!   (BEG in one tile to END in the tile the tileconn-stitched distance
+//!   away: LEN steps for vertical spans, (LEN + 1) / 2 for horizontal
+//!   spans), not a PIP:
 //!   it emits nothing and is counted in `continuations`. A cross-tile
 //!   pair that does not fit the continuation naming rule fails loud
 //!   instead of being silently skipped.
@@ -176,10 +178,18 @@ fn continuation_partner(name: &str) -> Option<(String, (i32, i32))> {
     } else {
         format!("{}_BEG{}", base, idx)
     };
+    // Tile steps are the tileconn-stitched distance, not the span
+    // length: vertical spans (NN/SS) advance LEN INT tiles, but
+    // horizontal spans (EE/WW) advance (LEN + 1) / 2 INT tiles (a
+    // length-2 span reaches the adjacent INT tile). See
+    // wire_db::continuation_partner: the old LEN-in-both-directions
+    // rule made the router emit PIPs out of span ENDs two tiles away
+    // whose node has no driver in the tileconn model.
+    let steps = if dx != 0 { (len + 1) / 2 } else { len };
     let delta = if is_beg {
-        (dx * len, dy * len)
+        (dx * steps, dy * steps)
     } else {
-        (-dx * len, -dy * len)
+        (-dx * steps, -dy * steps)
     };
     Some((partner, delta))
 }
@@ -450,6 +460,32 @@ mod tests {
         let t = translate_route(&db, &route, "blinky").unwrap();
         assert_eq!(t.continuations, 1);
         assert!(t.pips.is_empty());
+    }
+
+    #[test]
+    fn horizontal_continuation_crosses_one_int_tile() {
+        let db = IntTileWireDb::from_json(
+            TILE_JSON,
+            &[
+                IntTile::new("INT_X12Y45", 12, 45),
+                IntTile::new("INT_X13Y45", 13, 45),
+            ],
+        )
+        .unwrap();
+        // EE2_E_BEG3 in (12,45) continues as EE2_E_END3 in (13,45),
+        // which drives INT_NODE_SDQ_14_INT_OUT0 there through one PIP.
+        let route = [
+            db.wire_id("INT_X12Y45", "EE2_E_BEG3").unwrap(),
+            db.wire_id("INT_X13Y45", "EE2_E_END3").unwrap(),
+            db.wire_id("INT_X13Y45", "INT_NODE_SDQ_14_INT_OUT0").unwrap(),
+        ];
+        let t = translate_route(&db, &route, "span").unwrap();
+        assert_eq!(t.continuations, 1);
+        assert_eq!(t.pips.len(), 1);
+        assert_eq!(
+            t.pips[0].fasm_line(),
+            "INT_X13Y45.PIP.INT_NODE_SDQ_14_INT_OUT0.EE2_E_END3"
+        );
     }
 
     #[test]

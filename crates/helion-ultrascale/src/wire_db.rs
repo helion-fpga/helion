@@ -21,7 +21,13 @@
 //! - Inter-tile continuations: a span wire named `<DIR><LEN>[_E|_W]_BEG<n>`
 //!   in tile T is the same physical conductor as
 //!   `<DIR><LEN>[_E|_W]_END<n>` in the tile LEN steps away in direction
-//!   DIR (NN north, SS south, EE east, WW west). The continuation edge
+//!   DIR for vertical spans (NN/SS), and (LEN + 1) / 2 INT tiles away
+//!   for horizontal spans (EE/WW): a length-2 horizontal span reaches
+//!   the adjacent INT tile, a length-4 span two INT tiles away. The
+//!   horizontal step count is the tileconn-stitched distance, not the
+//!   span length: INT tiles are spaced about two columns apart in the
+//!   real grid, so a WW2 wire driven in INT_X2Y0 continues to
+//!   INT_X1Y0, not INT_X0Y0. The continuation edge
 //!   runs both ways between those two nodes and carries no PIP: the
 //!   translator skips it. This pairing is a naming-convention inference
 //!   from the tile JSON itself (all 208 BEG wires match the pattern and
@@ -193,6 +199,21 @@ fn parse_span_wire(name: &str) -> Option<SpanWire<'_>> {
 /// vice versa, plus the tile delta from this wire's tile to the
 /// partner's tile, plus whether this wire is the BEG end. `None` when
 /// the name is not a span wire.
+///
+/// Tile steps are NOT the span length in both directions. The public
+/// tileconn.json stitches a span wire's BEG in one INT tile to its
+/// END in the tile LEN steps away only for vertical spans (NN/SS:
+/// 1, 2, 4, 12 tiles). Horizontal spans (EE/WW) cross one INT tile
+/// per two columns of span: a length-1 span reaches the adjacent INT
+/// tile, a length-2 span also reaches the adjacent INT tile, a
+/// length-4 span reaches two INT tiles away, and a length-12 span
+/// reaches six INT tiles away. The old rule used LEN steps in both
+/// directions, so a WW2 wire driven in INT_X2Y0 was treated as
+/// continuing to INT_X0Y0, while tileconn stitches it to INT_X1Y0:
+/// the router emitted PIPs out of the far END whose node has no
+/// driver in the tileconn-stitched model, and every net downstream
+/// of it failed as unreachable. Horizontal steps are therefore
+/// (LEN + 1) / 2; vertical steps stay LEN.
 fn continuation_partner(name: &str) -> Option<(String, (i32, i32), bool)> {
     let span = parse_span_wire(name)?;
     let (dx, dy) = span.dir;
@@ -217,10 +238,14 @@ fn continuation_partner(name: &str) -> Option<(String, (i32, i32), bool)> {
     } else {
         format!("{}_BEG{}", base, idx)
     };
+    // Horizontal spans (EE/WW) advance one INT tile per two span
+    // columns; vertical spans (NN/SS) advance one INT tile per span
+    // row.
+    let steps = if dx != 0 { (len + 1) / 2 } else { len };
     let delta = if is_beg {
-        (dx * len, dy * len)
+        (dx * steps, dy * steps)
     } else {
-        (-dx * len, -dy * len)
+        (-dx * steps, -dy * steps)
     };
     Some((partner, delta, is_beg))
 }
@@ -622,9 +647,48 @@ mod tests {
             .all(|w| db.wire_info(*w).unwrap().tile == "INT_X12Y45");
         assert!(end_same);
         assert!(!db.is_continuation(end45, beg));
-        // Short spans: EE2_E_BEG3 in (12,45) needs (14,45), absent.
+        // Short spans: EE2_E_BEG3 in (12,45) needs (13,45), absent.
         let ee = db.wire_id("INT_X12Y45", "EE2_E_BEG3").unwrap();
         assert!(db.fanout(ee).is_empty());
+    }
+
+    #[test]
+    fn horizontal_span_continuations_use_tileconn_steps() {
+        // Tileconn stitches a length-2 horizontal span to the
+        // adjacent INT tile, not two away: EE2 in (12,45) continues
+        // to (13,45), WW2 in (13,45) continues to (12,45).
+        let db = IntTileWireDb::from_json(
+            TILE_JSON,
+            &[
+                IntTile::new("INT_X12Y45", 12, 45),
+                IntTile::new("INT_X13Y45", 13, 45),
+                IntTile::new("INT_X14Y45", 14, 45),
+            ],
+        )
+        .unwrap();
+        let ee_beg = db.wire_id("INT_X12Y45", "EE2_E_BEG3").unwrap();
+        let ee_end = db.wire_id("INT_X13Y45", "EE2_E_END3").unwrap();
+        assert!(db.fanout(ee_beg).contains(&ee_end));
+        assert!(db.fanout(ee_end).contains(&ee_beg));
+        assert!(db.is_continuation(ee_beg, ee_end));
+        // The old two-tile partner (14,45) is not a continuation.
+        let ee_far = db.wire_id("INT_X14Y45", "EE2_E_END3").unwrap();
+        assert!(!db.fanout(ee_beg).contains(&ee_far));
+        assert!(!db.is_continuation(ee_beg, ee_far));
+        let ww_beg = db.wire_id("INT_X13Y45", "WW2_E_BEG3").unwrap();
+        let ww_end = db.wire_id("INT_X12Y45", "WW2_E_END3").unwrap();
+        assert!(db.fanout(ww_beg).contains(&ww_end));
+        assert!(db.is_continuation(ww_beg, ww_end));
+        // A length-4 horizontal span reaches two INT tiles away.
+        let ee4_beg = db.wire_id("INT_X12Y45", "EE4_E_BEG3").unwrap();
+        let ee4_end = db.wire_id("INT_X14Y45", "EE4_E_END3").unwrap();
+        assert!(db.fanout(ee4_beg).contains(&ee4_end));
+        assert!(db.is_continuation(ee4_beg, ee4_end));
+        // A length-1 horizontal span still reaches the adjacent tile.
+        let ee1_beg = db.wire_id("INT_X12Y45", "EE1_E_BEG3").unwrap();
+        let ee1_end = db.wire_id("INT_X13Y45", "EE1_E_END3").unwrap();
+        assert!(db.fanout(ee1_beg).contains(&ee1_end));
+        assert!(db.is_continuation(ee1_beg, ee1_end));
     }
 
     #[test]
