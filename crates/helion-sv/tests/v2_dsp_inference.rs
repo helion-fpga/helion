@@ -471,3 +471,59 @@ fn an_m_then_p_pair_read_by_another_product_is_the_same_in_any_order() {
         assert_eq!(flops(&d), 0, "order {o:?}");
     }
 }
+
+/// Every order of the statements in `st`.
+fn orders(st: &[&str]) -> Vec<String> {
+    if st.len() <= 1 {
+        return st.iter().map(|s| s.to_string()).collect();
+    }
+    (0..st.len())
+        .flat_map(|i| {
+            let mut rest = st.to_vec();
+            let s = rest.remove(i);
+            orders(&rest).into_iter().map(move |r| format!("{s} {r}"))
+        })
+        .collect()
+}
+
+fn regs_of(d: &Design) -> Vec<(String, String)> {
+    let mut ds: Vec<(String, String)> =
+        dsps(d).into_iter().map(|(n, a)| (n.split("_dsp").next().unwrap().to_string(), ["AREG", "BREG", "MREG", "PREG"].map(|k| a[k].as_str()).join(" "))).collect();
+    ds.sort();
+    ds
+}
+
+#[test]
+fn a_register_two_hops_behind_an_m_register_stays_free_for_the_next_product_in_any_order() {
+    // p1 is the first slice's P; p2 is nobody's, so it is q's A register.
+    let st = ["always_ff @(posedge clk) m <= a * b;", "always_ff @(posedge clk) p1 <= m;", "always_ff @(posedge clk) p2 <= p1;", "always_ff @(posedge clk) q <= p2 * c;"];
+    let all = orders(&st);
+    assert_eq!(all.len(), 24);
+    for body in all {
+        let d = v2(&format!(
+            "module t(input logic clk, input logic signed [11:0] a, b, input logic signed [17:0] c, output logic signed [41:0] q);
+             logic signed [23:0] m, p1, p2; {body} endmodule"
+        ));
+        assert_eq!(regs_of(&d), [("p1".to_string(), "0 0 1 1".to_string()), ("q".to_string(), "1 0 0 1".to_string())], "{body}");
+        assert_eq!(flops(&d), 0, "{body}");
+    }
+}
+
+#[test]
+fn a_product_that_is_split_does_not_keep_its_registers_from_other_products() {
+    // 20x20 does not fit one slice: m and p1 stay in the fabric, and p1's
+    // low bits are free to be q's A register whichever comes first.
+    let st = ["always_ff @(posedge clk) m <= a * b;", "always_ff @(posedge clk) p1 <= m;", "always_ff @(posedge clk) q <= $signed(p1[23:0]) * c;"];
+    let mut seen = Vec::new();
+    for body in orders(&st) {
+        let d = v2(&format!(
+            "module t(input logic clk, input logic signed [19:0] a, b, input logic signed [17:0] c, output logic signed [41:0] q);
+             logic signed [39:0] m, p1; {body} endmodule"
+        ));
+        let q: Vec<String> = regs_of(&d).into_iter().filter(|(n, _)| n == "q").map(|(_, r)| r).collect();
+        assert_eq!(q.len(), 1, "{body}");
+        assert!(q[0].starts_with("1 "), "q AREG in {body}: {}", q[0]);
+        seen.push(flops(&d));
+    }
+    assert!(seen.iter().all(|&f| f == seen[0]), "flops by order: {seen:?}");
+}

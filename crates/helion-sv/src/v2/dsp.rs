@@ -380,9 +380,12 @@ const ATTRS: [(&str, &str); 7] = [
     ("AUTORESET_PATDET", "NO_RESET"),
 ];
 
-/// `n` is a product that gets a DSP48E1 of its own when its turn comes.
+/// `n` is a product that gets a DSP48E1 of its own, unsplit, when its turn
+/// comes (a split one's partial products take no slice registers).
 fn takes_dsp(flat: &Flat, n: N) -> bool {
-    matches!(*flat.dag.op(n), Op::Mul(x, y) if !operand(flat, x).cheap(flat) && !operand(flat, y).cheap(flat))
+    let Op::Mul(x, y) = *flat.dag.op(n) else { return false };
+    let (a, b) = (operand(flat, x), operand(flat, y));
+    !a.cheap(flat) && !b.cheap(flat) && ((a.e <= 25 && b.e <= 18) || (b.e <= 25 && a.e <= 18))
 }
 
 /// Infer DSP48E1 cells for every product that fits (see the module docs).
@@ -424,14 +427,16 @@ pub fn infer(flat: &mut Flat) {
         }
     }
     // `m <= a * b; p <= m`: p is that product's P register behind its M.
-    for c in &cands {
-        let Some(&x) = stage_of.get(&c.ri) else { continue };
-        let Op::Read(s) = *flat.dag.op(x) else { continue };
-        let n = cands.iter().find(|m| flat.regs[m.ri as usize].sig == s && m.clk == c.clk).and_then(|m| stage_of.get(&m.ri).copied());
-        if let Some(n) = n.filter(|&n| takes_dsp(flat, n)) {
-            stage_of.insert(c.ri, n);
-        }
-    }
+    // One hop, from the map as built: `p2 <= p` is never that slice's.
+    let mp: Vec<(u32, N)> = cands
+        .iter()
+        .filter_map(|c| {
+            let Op::Read(s) = *flat.dag.op(*stage_of.get(&c.ri)?) else { return None };
+            let m = cands.iter().find(|m| flat.regs[m.ri as usize].sig == s && m.clk == c.clk)?;
+            stage_of.get(&m.ri).copied().filter(|&n| takes_dsp(flat, n)).map(|n| (c.ri, n))
+        })
+        .collect();
+    stage_of.extend(mp);
     let mut built = 0usize;
     let mut room = DSP_SITES.load(Ordering::Relaxed).saturating_sub(flat.hard.iter().filter(|h| h.module == "DSP48E1").count());
     // Partial products of a split one: combinational, as the sum reads them.
