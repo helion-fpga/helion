@@ -530,7 +530,10 @@ impl<'a> XDevice<'a> {
                 break;
             }
             expanded += 1;
-            if expanded > if opts.negotiate { 6_000_000 } else { 30_000_000 } {
+            // The exact search closes each wire once, so it ends by itself
+            // after at most the device's wire count (any cap below that,
+            // on any part, would fail a net that has a path).
+            if opts.negotiate && expanded > 6_000_000 {
                 break;
             }
             // Node siblings (tileconn stitching): free.
@@ -589,6 +592,7 @@ impl<'a> XDevice<'a> {
                 }
             }
         }
+        LAST_EXPANDED.with(|e| e.set(expanded));
         if debug_env("HELION_ROUTE_STATS") {
             let (cost, dist) = match found {
                 Some(e) => (sb.best[e as usize], h(start) / if opts.negotiate { 220 } else { 90 }),
@@ -773,6 +777,11 @@ impl<'a> XDevice<'a> {
         }
         Ok(())
     }
+}
+
+thread_local! {
+    /// Wires the last [`XDevice::astar`] on this thread expanded (for tests).
+    static LAST_EXPANDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Build the node -> members map from a mutable Device.
@@ -2331,6 +2340,40 @@ mod tests {
         );
         // SING IOBs pair with the SING IOI tile of the same row.
         assert_eq!(xdev.ioi_tile("RIOB33_SING_X73Y49").as_deref(), Some("RIOI3_SING_X73Y49"));
+    }
+
+    /// G77: the exact search (PathFinder's) is not capped below the device.
+    /// With the load walled off by a clock net it expands every wire it can
+    /// reach before it gives up: 6.86M on the xc7a100t, past the 6M the
+    /// negotiating search stops at (the xc7z020 reaches 5.77M). A cap below
+    /// that would fail PathFinder nets that do have a path.
+    #[test]
+    fn exact_search_can_expand_the_whole_device() {
+        let part = crate::parts::resolve(&default_db_root(), "xc7a100tcsg324-1").expect("part");
+        let mut dev = Device::load_part(&part).expect("load");
+        let maps = build_node_map(&mut dev);
+        let dev = &dev;
+        let mut x = XDevice::new(dev, maps);
+        x.clock_nets.insert("clk".into());
+        let src = x.site_pin_wire("SLICE_X40Y40", "AQ").expect("src");
+        let dst = x.site_pin_wire("SLICE_X56Y40", "A1").expect("dst");
+        let mut claimed = HashMap::new();
+        // The load's tile and its interconnect tile (the next column).
+        let d = dev.tile(dev.tile_by_name(&dst.0).expect("tile")).expect("tile");
+        for i in 0..dev.tile_count() {
+            let t = dev.tile(i).expect("tile");
+            if (t.grid_x - d.grid_x).abs() <= 1 && t.grid_y == d.grid_y {
+                for w in dev.wires(i).unwrap_or(&[]) {
+                    claimed.insert((t.name.clone(), w.clone()), "clk".to_string());
+                }
+            }
+        }
+        let opts = crate::route::RouteOpts { bbox: 0, ..Default::default() };
+        let r = x.astar((&src.0, &src.1), &[], &[dst.clone()], opts, "n", &claimed);
+        let e = LAST_EXPANDED.with(|e| e.get());
+        eprintln!("expanded {e} of {} wires", x.wire_to_tile.len());
+        assert!(matches!(r, Some(None)), "found a path through the clock wires");
+        assert!(e > 6_500_000, "gave up after {e} expansions");
     }
 
     /// PathFinder bookkeeping: two nets on different wires of one node

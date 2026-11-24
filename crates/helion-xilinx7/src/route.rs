@@ -236,17 +236,38 @@ thread_local! {
 
 /// PathFinder search box margin for a net that has been on an overused node
 /// in `fails` iterations: the first pass's 8 grid tiles, doubled every second
-/// failure, the whole device (0) from the eighth. A fixed box kept nets
+/// failure, the whole device (0) from the `open`th (8; `HELION_ROUTE_PF_OPEN`
+/// lowers it so a board design exercises the whole-device search). A fixed box kept nets
 /// whose only free detour lies outside it sharing at any price (G77: Ibex
 /// overuse sat at about 3,700 wires until a global whole-device switch at
 /// iteration 13, then fell to 243); opening it for every net at once cost
 /// 17x per search, so only the nets that keep failing pay for it (VPR's
 /// conflicted-mode doubling, nextpnr router2's growth on failure).
-fn pf_margin(fails: u32) -> i32 {
-    if fails >= 8 {
+fn pf_margin(fails: u32, open: u32) -> i32 {
+    if fails >= open {
         0
     } else {
         8 << (fails / 2)
+    }
+}
+
+/// The searches [`route_net`] tries in order for a load, as (negotiate,
+/// margin, cap_detour); `pf` is PathFinder's margin for the net, if any.
+/// Outside PathFinder: a free path near the net first (giving up on long
+/// detours); else the cheapest path through other nets' wires, near the net
+/// and then anywhere; the caller rips up the displaced nets. In PathFinder
+/// every signal wire but a clock net's may be shared: a search is the
+/// cheapest path at current prices in the net's box (the detour cap and the
+/// steep negotiating estimate let it run straight through congestion
+/// instead, G77). A box walled off by clock wires falls back to the same
+/// exact search over the whole device, which is not capped (each wire is
+/// expanded at most once), so it fails only when no path exists; the
+/// negotiating search's 6M cap is below the xc7z020's 9.25M wires.
+fn search_tries(pf: Option<i32>) -> Vec<(bool, i32, bool)> {
+    match pf {
+        Some(0) => vec![(false, 0, false)],
+        Some(m) => vec![(false, m, false), (false, 0, false)],
+        None => vec![(false, 8, true), (true, 8, false), (true, 0, false)],
     }
 }
 
@@ -1088,6 +1109,7 @@ fn pathfinder(
     let mut last_it = 0;
     // Iterations each net has been on an overused node: its box grows with it.
     let mut fails: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    let open = std::env::var("HELION_ROUTE_PF_OPEN").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
     for it in 1..=MAX_ITERATIONS {
         last_it = it;
         for (n, p) in &pf {
@@ -1103,7 +1125,7 @@ fn pathfinder(
             let drv = eps.iter().find(|e| e.is_driver).ok_or_else(|| format!("route: PathFinder: net `{net}` has no driver"))?;
             let loads: Vec<&Endpoint> = eps.iter().filter(|e| !e.is_driver).collect();
             let mut delays = Vec::new();
-            PF_MARGIN.with(|m| m.set(Some(pf_margin(fails.get(&net).copied().unwrap_or(0)))));
+            PF_MARGIN.with(|m| m.set(Some(pf_margin(fails.get(&net).copied().unwrap_or(0), open))));
             let r = route_net(&net, drv, &loads, clock_spine_nets, device, claimed, &mut delays, &[]);
             PF_MARGIN.with(|m| m.set(None));
             let p = match r? {
@@ -1430,22 +1452,7 @@ fn route_net(
             }
         }
         if fast.is_none() {
-            // A free path near the net first (giving up on long detours);
-            // else the cheapest path through other nets' wires, near the
-            // net and then anywhere. The caller rips up the displaced nets.
-            // In PathFinder every signal wire but a clock net's may be shared:
-            // a search is the cheapest path at current prices in the net's box
-            // (the detour cap and the steep negotiating estimate let it run
-            // straight through congestion instead, G77). A box walled off by
-            // clock wires falls back to the same search over the whole device,
-            // whose expansion cap (30M) exceeds the xc7z020's 9.25M wires: it
-            // fails only when no path exists at all.
-            let tries: &[(bool, i32, bool)] = match PF_MARGIN.with(|m| m.get()) {
-                Some(0) => &[(false, 0, false)],
-                Some(m) => &[(false, m, false), (false, 0, false)],
-                None => &[(false, 8, true), (true, 8, false), (true, 0, false)],
-            };
-            for &(negotiate, bbox, cap_detour) in tries {
+            for &(negotiate, bbox, cap_detour) in &search_tries(PF_MARGIN.with(|m| m.get())) {
                 if negotiate && FREE_ONLY.with(|f| f.get()) {
                     return Err(NO_FREE_PATH.to_string());
                 }
@@ -2302,8 +2309,23 @@ mod tests {
 
     #[test]
     fn pf_margin_doubles_then_opens_the_device() {
-        let m: Vec<i32> = (0..10).map(pf_margin).collect();
+        let m: Vec<i32> = (0..10).map(|f| pf_margin(f, 8)).collect();
         assert_eq!(m, vec![8, 8, 16, 16, 32, 32, 64, 64, 0, 0]);
+        assert_eq!(pf_margin(0, 1), 8);
+        assert_eq!(pf_margin(1, 1), 0);
+    }
+
+    /// G77: every PathFinder search is exact (not negotiating, no detour
+    /// cap), and every PathFinder net's last try covers the whole device.
+    /// A negotiating fallback stops at 6M expansions, below the xc7z020's
+    /// 9.25M wires, and running out aborted all of PathFinder.
+    #[test]
+    fn pathfinder_searches_are_exact_and_end_on_the_whole_device() {
+        for f in 0..10 {
+            let t = search_tries(Some(pf_margin(f, 8)));
+            assert!(t.iter().all(|&(neg, _, cap)| !neg && !cap), "fails {f}: {t:?}");
+            assert_eq!(t.last(), Some(&(false, 0, false)), "fails {f}");
+        }
     }
 
     /// G77: a net whose every path inside the first PathFinder box crosses a
