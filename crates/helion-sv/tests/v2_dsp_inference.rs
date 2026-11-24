@@ -433,3 +433,41 @@ fn products_past_the_dsp_sites_stay_in_the_fabric() {
     assert_eq!(dsps(&d).len(), n);
     assert!(count(&d, false) > 10 * 50, "ten 8x8 LUT multipliers");
 }
+
+/// Instantiated DSP48E1 cells take sites first: inference fills what is left.
+#[test]
+fn instantiated_dsps_count_against_the_sites() {
+    let n = helion_sv::v2::dsp::DSP_SITES.load(std::sync::atomic::Ordering::Relaxed);
+    let inst = "DSP48E1 #(.AREG(0),.BREG(0),.MREG(0),.PREG(0),.ACASCREG(0),.BCASCREG(0),.CREG(0),.DREG(0),.ADREG(0),.INMODEREG(0),.OPMODEREG(0),.ALUMODEREG(0),.CARRYINREG(0),.CARRYINSELREG(0))";
+    let d = v2(&format!(
+        "module t(input logic [{w}:0] a, b, input logic [29:0] x, input logic [17:0] y, output logic [{w2}:0] p, output logic [47:0] o0, o1, o2);
+         for (genvar i = 0; i < {n}; i++) begin : g assign p[i*16 +: 16] = a[i*8 +: 8] * b[i*8 +: 8]; end
+         {inst} d0 (.A(x), .B(y), .P(o0), .OPMODE(7'b0000101));
+         {inst} d1 (.A(x), .B(y), .P(o1), .OPMODE(7'b0000101));
+         {inst} d2 (.A(x), .B(y), .P(o2), .OPMODE(7'b0000101)); endmodule",
+        w = n * 8 - 1,
+        w2 = n * 16 - 1
+    ));
+    let ds = dsps(&d);
+    assert_eq!(ds.len(), n);
+    assert_eq!(ds.iter().filter(|(c, _)| c.contains("_dsp")).count(), n - 3, "three sites already taken");
+}
+
+/// `m <= a * b; p1 <= m; q <= p1 * c`: p1 is the first slice's P behind its
+/// M register, never q's A register, whatever order the source lists them in.
+#[test]
+fn an_m_then_p_pair_read_by_another_product_is_the_same_in_any_order() {
+    let st = ["always_ff @(posedge clk) m <= a * b;", "always_ff @(posedge clk) p1 <= m;", "always_ff @(posedge clk) q <= p1 * c;"];
+    for o in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+        let body = o.map(|i| st[i]).join(" ");
+        let d = v2(&format!(
+            "module t(input logic clk, input logic signed [11:0] a, b, input logic signed [17:0] c, output logic signed [41:0] q);
+             logic signed [23:0] m, p1; {body} endmodule"
+        ));
+        let mut ds: Vec<(String, String)> =
+            dsps(&d).into_iter().map(|(n, a)| (n.split("_dsp").next().unwrap().to_string(), ["AREG", "BREG", "MREG", "PREG"].map(|k| a[k].as_str()).join(" "))).collect();
+        ds.sort();
+        assert_eq!(ds, [("p1".to_string(), "0 0 1 1".to_string()), ("q".to_string(), "0 0 0 1".to_string())], "order {o:?}");
+        assert_eq!(flops(&d), 0, "order {o:?}");
+    }
+}

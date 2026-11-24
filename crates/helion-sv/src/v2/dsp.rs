@@ -423,6 +423,15 @@ pub fn infer(flat: &mut Flat) {
             stage_of.insert(sr.ri, x);
         }
     }
+    // `m <= a * b; p <= m`: p is that product's P register behind its M.
+    for c in &cands {
+        let Some(&x) = stage_of.get(&c.ri) else { continue };
+        let Op::Read(s) = *flat.dag.op(x) else { continue };
+        let n = cands.iter().find(|m| flat.regs[m.ri as usize].sig == s && m.clk == c.clk).and_then(|m| stage_of.get(&m.ri).copied());
+        if let Some(n) = n.filter(|&n| takes_dsp(flat, n)) {
+            stage_of.insert(c.ri, n);
+        }
+    }
     let mut built = 0usize;
     let mut room = DSP_SITES.load(Ordering::Relaxed).saturating_sub(flat.hard.iter().filter(|h| h.module == "DSP48E1").count());
     // Partial products of a split one: combinational, as the sum reads them.
