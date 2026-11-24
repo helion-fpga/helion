@@ -16,7 +16,8 @@ register block on the PS7's M_AXI_GP0.
   counter starts at 0xFFFF_FC00 so that every bit moves within the run),
   an RTL whose SCRATCH ignores WSTRB[1] (caught by the readback check), and
   RTLs that lose a write or read response by taking the next address while
-  it is held (caught by the axi check alone).
+  it is held (caught by the axi check alone), and one that never sends the
+  B of an SLVERR write (caught only by the end-of-run outstanding check).
 * The database's always-on features (CFG_CENTER_MID ALWAYS_ON_PROP1-3)
   cleared from the bitstream: the decode check fails (G81).
 * A design with no PS7 whose RTL names PS7 in a comment still verifies
@@ -209,13 +210,16 @@ def main() -> int:
     for name, old, new, want in [
             ("strobe_mutant", "if (w_strb[1]) scratch[15:8]", "scratch[15:8]", "returned"),
             ("b_overwrite", "assign do_write = aw_held & w_held & ~b_pend;", "assign do_write = aw_held & w_held;", "BVALID dropped or B changed"),
-            ("ar_overwrite", "assign arready = ~r_pend & ~rst;", "assign arready = ~rst;", "RVALID dropped or R changed")]:
+            ("ar_overwrite", "assign arready = ~r_pend & ~rst;", "assign arready = ~rst;", "RVALID dropped or R changed"),
+            # Every SLVERR write's B never sent: no hold check fires, only the end-of-run drain check.
+            ("b_never_sent", "b_pend <= 1'b1;", "b_pend <= wr_ok;", "outstanding after")]:
         assert src_text.count(old) == 1, old
         mutant = os.path.join(work, f"{name}.sv")
         open(mutant, "w").write(src_text.replace(old, new))
         rep = run(db, work, name, good, mutant, 1500)
         axi = next(c for c in rep.checks if c.name == "axi")
-        results.append(not axi.ok and any(want in it for it in axi.items))
+        results.append(not axi.ok and any(want in it for it in axi.items)
+                       and (name != "b_never_sent" or not any("dropped" in it for it in axi.items)))
         print(f"==> {name}: {'FAIL as expected' if results[-1] else 'UNEXPECTED'}")
 
     # Blinky has no PS7; its RTL saying "PS7" must not make cosim look for one.
