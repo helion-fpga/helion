@@ -2987,11 +2987,12 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
     /// lines (A1.D6, A2.BYP, B1.BYP, D1.D6: the repair moved cnt_2's
     /// FF to letter D, so its D takes D6), and the 6 FF control
     /// lines. The PIP set is NOT pinned: the router is
-    /// nondeterministic across processes (fanout order comes from a
-    /// HashMap), so the PIPs vary run to run; the test asserts only
-    /// that every PIP is on INT_X1Y0 and that at least one PIP was
-    /// emitted. On the base this test fails at ROUTE with
-    /// OveruseTimeout and writes no .bit.
+    /// deterministic across processes since N48 (fanout lists are
+    /// sorted at DB build), but the PIPs are still an
+    /// implementation detail of the negotiated routes, so the test
+    /// asserts only that every PIP is on INT_X1Y0 and that at
+    /// least one PIP was emitted. On the base this test fails at
+    /// ROUTE with OveruseTimeout and writes no .bit.
     #[test]
     fn counter_flow_emits_bitstream_on_xczu3eg() {
         use helion_ultrascale::band_code::{BandCheck, check_stored_band};
