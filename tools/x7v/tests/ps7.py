@@ -20,6 +20,10 @@ register block on the PS7's M_AXI_GP0.
   B of an SLVERR write (caught only by the end-of-run outstanding check;
   also run on the RTL alone over 12 seeds and run lengths, since a reset
   must not forgive it).
+* The RTL with no initial values on its reset synchroniser (reset only by
+  FCLKRESETN) verifies, with the masters run on it alone over the same 12
+  seeds and run lengths: a master busy at start-up once held off the
+  start-up reset pulse, and the slave was never reset.
 * The database's always-on features (CFG_CENTER_MID ALWAYS_ON_PROP1-3)
   cleared from the bitstream: the decode check fails (G81).
 * A design with no PS7 whose RTL names PS7 in a comment still verifies
@@ -90,7 +94,9 @@ def master_checks(db: Db, work: str) -> None:
     write is reported on every seed and run length, whatever the random
     resets (it once hid behind a reset in the drain window, as for seeds 4
     and 8 at 3000 cycles), while the correct RTL logs no error. And the
-    summary check counts responses by itself, apart from the master's queues."""
+    summary check counts responses by itself, apart from the master's queues.
+    The masters wait for the start-up reset: the slave with no initial values
+    (reset only by FCLKRESETN) logs no error either."""
     mutant = os.path.join(work, "b_never_sent_rtl.sv")
     open(mutant, "w").write(open(SV).read().replace("b_pend <= 1'b1;", "b_pend <= wr_ok;"))
     for cycles, seeds in ((3000, range(1, 9)), (1500, range(1, 5))):
@@ -100,9 +106,22 @@ def master_checks(db: Db, work: str) -> None:
             assert any("B and" in e for e in ps7.axi_problems(summ)), (cycles, seed, summ)
             summ, errs = master_run(db, work, SV, cycles, seed)
             assert not errs and not any("B and" in e for e in ps7.axi_problems(summ)), (cycles, seed, errs, summ)
+            summ, errs = master_run(db, work, no_init_rtl(work), cycles, seed)
+            assert not errs and not ps7.axi_problems(summ), (cycles, seed, errs, summ)
     lost = "axi MAXIGP0 writes=3 wbeats=3 bokay=1 berr=1 partial=0 reads=2 rokay=2 rerr=0 bursts=0 backtoback=0 readbacks=1 readbackbad=0 protocol=0"
     assert ps7.axi_problems([lost]) == ["MAXIGP0: 3 writes and 2 reads, 2 B and 2 last R responses"], ps7.axi_problems([lost])
-    print("ps7: masters ok (a never-sent B caught on 12 runs, none forgiven by a reset)")
+    print("ps7: masters ok (a never-sent B caught on 12 runs, none forgiven by a reset; no-initial-value RTL clean)")
+
+
+def no_init_rtl(work: str) -> str:
+    """examples/zedboard_ps7_axi.sv without the initial values of its reset
+    synchroniser: only the start-up FCLKRESETN pulse resets the slave."""
+    old = "logic rst_s1 = 1'b0, rst_s2 = 1'b0;"
+    src = open(SV).read()
+    assert src.count(old) == 1, old
+    out = os.path.join(work, "no_init_rtl.sv")
+    open(out, "w").write(src.replace(old, "logic rst_s1, rst_s2;"))
+    return out
 
 
 def mux_pip(ex, tile: str, wire: str):
@@ -130,10 +149,10 @@ def rewrite(db: Db, base: str, out: str, drop: list[str], add: list[str]) -> Non
     bit.rewrite(base, out, encode.encode(db, feats, list(bit.parse(base, db.part).frames)), db.part)
 
 
-def run(db: Db, work: str, name: str, bitf: str, rtl: str, cycles: int, no_reset: bool = False) -> verify.Report:
+def run(db: Db, work: str, name: str, bitf: str, rtl: str, cycles: int, no_reset: bool = False, seed: int = 1) -> verify.Report:
     cosim.RESET_PULSE = not no_reset
     cosim.AXI_RW = RW
-    rep = verify.verify(db, name, bitf, rtl=[rtl], top=TOP, xdc=XDC, workdir=os.path.join(work, f"x7v_{name}"), cycles=cycles)
+    rep = verify.verify(db, name, bitf, rtl=[rtl], top=TOP, xdc=XDC, workdir=os.path.join(work, f"x7v_{name}"), cycles=cycles, seed=seed)
     cosim.RESET_PULSE = True
     print(rep.summary())
     return rep
@@ -178,6 +197,9 @@ def main() -> int:
         rep = run(db, work, "ps7_axi" + ("_no_reset" if no_reset else ""), good, SV, a.cycles, no_reset)
         n = axi_counts(rep)
         results.append(rep.ok and all(n[k] > 0 for k in ("partial", "bursts", "backtoback", "readbacks", "berr", "rerr")))
+    # Seed 2: a master went busy before the start-up reset pulse and held it off.
+    results.append(run(db, work, "no_init_seed2", good, no_init_rtl(work), 1500, seed=2).ok)
+    print(f"==> RTL reset only by FCLKRESETN: {'PASS as expected' if results[-1] else 'UNEXPECTED'}")
 
     # Two RDATA bits whose muxes (one INT tile) can take each other's source: swap them.
     pins = {k: mux_pip(ex, s.tile, pin_wire(ex, s, f"MAXIGP0RDATA{k}")) for k in range(32)}

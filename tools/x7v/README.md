@@ -100,7 +100,10 @@ a held response loses it on silicon). FCLK_RESET does not reset the PS
 interconnect, so a reset never forgives a transaction: when the random
 stimulus asks for one, the masters start nothing new and FCLKRESETN stays
 high until every transaction has completed, and a response never sent keeps
-it high to the end. The masters stay idle while FCLKRESETN is low and 4 cycles after (`RESET_QUIET`, the slave's reset
+it high to the end. The masters stay idle until the stimulus's first reset
+has been applied (none with `--no-reset`), so a transaction never holds off
+the start-up pulse that a slave with no initial values needs, while
+FCLKRESETN is low and 4 cycles after (`RESET_QUIET`, the slave's reset
 synchroniser), start nothing in the last 64 cycles (`DRAIN`) with
 BREADY/RREADY high, and then no transaction may be outstanding: a response
 never sent hangs the PS. What the masters drove becomes the stimulus that

@@ -151,11 +151,13 @@ def stub(plist: list) -> str:
 # so a reset never forgives a transaction: when the random stimulus asks
 # for one, the masters start nothing new and FCLKRESETN stays high until
 # every transaction has completed (software quiescing the port), and a
-# response never sent keeps it high to the end. The masters stay idle while
-# FCLKRESETN is low and for RESET_QUIET cycles after (the slave's reset
-# synchroniser), and start nothing in the last DRAIN cycles, with
-# BREADY/RREADY high: a write or read still outstanding at the end never
-# completes.
+# response never sent keeps it high to the end. The masters stay idle until
+# the stimulus's first reset has been applied (if it has one: none with
+# --no-reset), so a busy master never holds off the start-up pulse that a
+# slave with no initial values needs, while FCLKRESETN is low and for
+# RESET_QUIET cycles after (the slave's reset synchroniser), and start
+# nothing in the last DRAIN cycles, with BREADY/RREADY high: a write or read
+# still outstanding at the end never completes.
 RESET_QUIET = 4
 _DECL = """
 // ---- AXI3 master on @P
@@ -385,6 +387,7 @@ def axi_tb(top: str, top_ports: list, b: Boundary, in_bits: list[str], clock: st
                 blocks["override"].append(f"    vec[{col[bit]}] = {val};")
     blocks["override"] += [f"    vec[{col[r]}] = rstn;" for r in b.resets if r in col]
     drive = [f"    {ref(bit)} = vec[{n - 1 - i}];" for i, bit in enumerate(in_bits)]
+    first_reset = any(l[in_bits.index(b.resets[0])] == "0" for l in open(base_stim).read().split())
     j = lambda key: "\n".join(blocks[key])
     return f"""`timescale 1ns/1ps
 // x7v: AXI3 masters on the PS7's M_AXI_GP ports, run against the RTL; the
@@ -395,7 +398,7 @@ module tb_axi;
 {top} dut({', '.join(conn)});
 integer fi, fs, fl, k, rc, i, j, p;
 integer seed = {seed};
-integer quiet = {RESET_QUIET};
+integer quiet = {-1 if first_reset else RESET_QUIET};   // -1: idle until the first reset
 reg rstn = 0, rq, act, drain, stop;
 reg [31:0] m;
 reg [{n}-1:0] vec;
