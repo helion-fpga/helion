@@ -548,12 +548,15 @@ impl RouteDb {
         }
     }
 
-    /// `(INT tile, INT wire)` for one slice clock pin (`CLK1` ->
-    /// `CTRL_W4`, `CLK2` -> `CTRL_W5`). With tileconn the answer comes
-    /// from the public DB; without it the provisional convention
-    /// applies (INT tile named from the slice coordinates, see
-    /// `IntTileWireDb::from_placed_slices`). `None` when the pin has
-    /// no INT partner.
+    /// `(INT tile, INT wire)` for one slice clock pin. West-side
+    /// (CLEM) slices resolve `CLK1` -> `CTRL_W4`, `CLK2` ->
+    /// `CTRL_W5`; east-side (CLEL_R) slices resolve `CLK1` ->
+    /// `CTRL_E4`, `CLK2` -> `CTRL_E5` (N47: the public DB stitches
+    /// SLICE_X10Y0's CLK1 to CTRL_E4). With tileconn the answer
+    /// comes from the public DB; without it the provisional
+    /// convention applies (INT tile named from the slice
+    /// coordinates, see `IntTileWireDb::from_placed_slices`).
+    /// `None` when the pin has no INT partner.
     fn clock_int_tile(
         &self,
         site: &str,
@@ -1075,12 +1078,15 @@ fn ffmux_selections(
 
 /// Clock-leg candidates: (GLOBAL wire, GCLK spine wire) pairs that
 /// can feed a slice CTRL wire. Every GLOBAL wire here is a
-/// `CTRL_W4`/`CTRL_W5` source in the vendored INT tile JSON and is
-/// driven by the named GCLK spine wire (verified by
-/// `clock_leg_candidates_exist_in_int_tile`). The flow picks the
-/// first pair whose GLOBAL wire is not already a route PIP dst in
-/// the slice's INT tile, so a leg never multi-drives a wire the
-/// router already uses.
+/// `CTRL_W4`/`CTRL_W5`/`CTRL_E4`/`CTRL_E5` source in the vendored
+/// INT tile JSON and is driven by the named GCLK spine wire
+/// (verified by `clock_leg_candidates_exist_in_int_tile`). The
+/// same 8 pairs serve all four CTRL wires: the east-side legs use
+/// the same GLOBAL names and the same GCLK_B_0_8..15 spine wires
+/// as the west-side legs (N47). The flow picks the first pair
+/// whose GLOBAL wire is not already a route PIP dst in the slice's
+/// INT tile, so a leg never multi-drives a wire the router already
+/// uses.
 const CLOCK_LEG_CANDIDATES: &[(&str, &str)] = &[
     ("INT_NODE_GLOBAL_14_INT_OUT0", "GCLK_B_0_9"),
     ("INT_NODE_GLOBAL_10_INT_OUT1", "GCLK_B_0_15"),
@@ -1105,13 +1111,29 @@ fn pick_clock_leg(used_dsts: &std::collections::HashSet<&str>) -> Option<(&'stat
 
 /// One slice half that needs a clock leg: the slice site and clock
 /// pin, the INT tile carrying the pin, and the CTRL wire the leg
-/// must drive (`CTRL_W4` for CLK1, `CTRL_W5` for CLK2).
+/// must drive (`CTRL_W4`/`CTRL_E4` for CLK1, `CTRL_W5`/`CTRL_E5`
+/// for CLK2, west/east per the resolved wire).
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ClockLegTarget {
     site: String,
     pin: &'static str,
     tile: String,
     ctrl: &'static str,
+}
+
+/// Accepted CTRL wires for a slice clock pin (N47). West-side
+/// (CLEM) slices resolve to `CTRL_W4`/`CTRL_W5`; east-side
+/// (CLEL_R) slices resolve to `CTRL_E4`/`CTRL_E5`. The resolver
+/// (`clock_int_tile`, via the public tileconn DB) returns the
+/// correct side; this table only states which answers are legal
+/// for each pin, so a resolver returning any other wire still
+/// fails loud in `clock_leg_targets`.
+fn clock_ctrl_wires(pin: &str) -> &'static [&'static str] {
+    match pin {
+        "CLK1" => &["CTRL_W4", "CTRL_E4"],
+        "CLK2" => &["CTRL_W5", "CTRL_E5"],
+        _ => &[],
+    }
 }
 
 /// Slice halves that need a clock leg, in placed order. A slice's
@@ -1122,8 +1144,8 @@ struct ClockLegTarget {
 /// avoidance (`clock_leg_forbidden_pips`): the tiles that will carry
 /// a leg are computable before routing, from placement alone.
 /// Fails loud naming the slice and pin when the clock pin has no
-/// INT partner, or when the resolved wire is not the expected CTRL
-/// wire (N47: east slices resolve to CTRL_E4/E5).
+/// INT partner, or when the resolved wire is not an accepted CTRL
+/// wire for the pin (N47: east slices resolve to CTRL_E4/E5).
 fn clock_leg_targets(
     packed: &helion_ultrascale::UltraPacked,
     placed: &helion_ultrascale::UltraPlaced,
@@ -1136,10 +1158,7 @@ fn clock_leg_targets(
         };
         let has_abcd = slice.ffs.keys().any(|bel| *bel < 8);
         let has_efgh = slice.ffs.keys().any(|bel| *bel >= 8);
-        for (half, pin, ctrl) in [
-            (has_abcd, "CLK1", "CTRL_W4"),
-            (has_efgh, "CLK2", "CTRL_W5"),
-        ] {
+        for (half, pin) in [(has_abcd, "CLK1"), (has_efgh, "CLK2")] {
             if !half {
                 continue;
             }
@@ -1153,12 +1172,18 @@ fn clock_leg_targets(
                 .ok_or_else(|| {
                     format!("ULTRA CLOCK LEG: slice {} pin {pin} has no INT partner", p.site)
                 })?;
-            if wire != ctrl {
+            let accepted = clock_ctrl_wires(pin);
+            let Some(ctrl) = accepted
+                .iter()
+                .copied()
+                .find(|c| *c == wire.as_str())
+            else {
                 return Err(format!(
-                    "ULTRA CLOCK LEG: slice {} pin {pin} resolved to {wire}, expected {ctrl}",
-                    p.site
+                    "ULTRA CLOCK LEG: slice {} pin {pin} resolved to {wire}, expected {}",
+                    p.site,
+                    accepted.join(" or ")
                 ));
-            }
+            };
             targets.push(ClockLegTarget {
                 site: p.site.clone(),
                 pin,
@@ -1207,9 +1232,14 @@ fn segbits_disagree(a: &[BitRef], b: &[BitRef]) -> bool {
 /// 21_35 while every CTRL_W5 leg requires it clear) and none for
 /// CTRL_W4: the CLK2 leg cannot coexist on a tile where the router
 /// uses that PIP, and no GLOBAL choice avoids it, so the fix is in
-/// what routes on the tile, not which GLOBAL is picked. A leg
-/// feature missing from the DB fails loud: without its bits the
-/// flow cannot prove any routing compatible with the leg.
+/// what routes on the tile, not which GLOBAL is picked. East side
+/// (N47): the same computation for CTRL_E4 and CTRL_E5 yields
+/// only each wire's VCC_WIRE PIP, so no routed PIP can conflict
+/// with every east-side candidate and the N46 class cannot recur
+/// there (no east-side leg touches bit 21_35; only two PIPs in
+/// the whole DB set it, both CTRL_W5). A leg feature missing from
+/// the DB fails loud: without its bits the flow cannot prove any
+/// routing compatible with the leg.
 /// PIPs that conflict with only some candidates are left to the
 /// leg picker (`clock_leg_candidate_compatible`), which skips the
 /// conflicting candidates; GLOBAL-reuse conflicts are left to the
@@ -1351,8 +1381,9 @@ fn check_fasm_int_pip_bits(
 
 /// Clock-leg FASM for every placed slice with FFs.
 ///
-/// A slice's FFs clock on its half's CTRL wire (`CTRL_W4` for the
-/// ABCD half, `CTRL_W5` for EFGH). Only the clock-entry slice's
+/// A slice's FFs clock on its half's CTRL wire (`CTRL_W4`/`CTRL_E4`
+/// for the ABCD half, `CTRL_W5`/`CTRL_E5` for EFGH, west/east per
+/// the resolved wire). Only the clock-entry slice's
 /// ABCD half is driven by the design's clock primary (the harness
 /// port map drives `clk` into the first placed slice's `CLK1`); every
 /// other slice half with FFs needs a leg from the clock spine:
@@ -3134,7 +3165,7 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
         };
         for (global, gclk) in CLOCK_LEG_CANDIDATES {
             assert!(has_pip(gclk, global), "missing PIP {global}.{gclk}");
-            for ctrl in ["CTRL_W4", "CTRL_W5"] {
+            for ctrl in ["CTRL_W4", "CTRL_W5", "CTRL_E4", "CTRL_E5"] {
                 assert!(has_pip(global, ctrl), "missing PIP {ctrl}.{global}");
             }
         }
@@ -3272,6 +3303,57 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
                 tile: "INT_X0Y0".to_string(),
                 ctrl: "CTRL_W5",
             }]
+        );
+    }
+
+    #[test]
+    fn clock_ctrl_wires_accept_east_side() {
+        // N47: each pin accepts its west-side wire and its
+        // east-side wire, and nothing else. An unknown pin accepts
+        // nothing, so the target builder still fails loud on it.
+        assert_eq!(clock_ctrl_wires("CLK1"), &["CTRL_W4", "CTRL_E4"]);
+        assert_eq!(clock_ctrl_wires("CLK2"), &["CTRL_W5", "CTRL_E5"]);
+        assert!(clock_ctrl_wires("CLK3").is_empty());
+        assert!(clock_ctrl_wires("").is_empty());
+    }
+
+    #[test]
+    fn clock_leg_forbidden_pips_east_side_only_vcc() {
+        // N47, against the real vendored segbits DB: for east-side
+        // legs the forbidden set is only each CTRL wire's VCC_WIRE
+        // PIP. No routed PIP conflicts with every east-side
+        // candidate, so the N46 class (a routed PIP setting bit
+        // 21_35, which every west-side CLK2 leg requires clear)
+        // cannot recur on an east-side tile: no CTRL_E4/CTRL_E5
+        // leg touches 21_35. The targets use the counter16 seed 1
+        // tile INT_X6Y0 (SLICE_X10Y0's INT partner).
+        let segbits = load_ultra_segbits(&ultrascale_data_dir()).expect("vendored segbits DBs");
+        let clk1_east = ClockLegTarget {
+            site: "SLICE_X10Y0".to_string(),
+            pin: "CLK1",
+            tile: "INT_X6Y0".to_string(),
+            ctrl: "CTRL_E4",
+        };
+        let clk2_east = ClockLegTarget {
+            site: "SLICE_X10Y0".to_string(),
+            pin: "CLK2",
+            tile: "INT_X6Y0".to_string(),
+            ctrl: "CTRL_E5",
+        };
+        assert_eq!(
+            clock_leg_forbidden_pips(&segbits, &[clk1_east, clk2_east]).unwrap(),
+            vec![
+                (
+                    "INT_X6Y0".to_string(),
+                    "VCC_WIRE".to_string(),
+                    "CTRL_E4".to_string(),
+                ),
+                (
+                    "INT_X6Y0".to_string(),
+                    "VCC_WIRE".to_string(),
+                    "CTRL_E5".to_string(),
+                ),
+            ]
         );
     }
 
