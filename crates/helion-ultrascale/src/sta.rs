@@ -72,6 +72,15 @@ pub trait StaNetlist {
     fn ff_q_net(&self, ff: &str) -> Option<String>;
     /// Net name feeding a flip-flop's D pin.
     fn ff_d_net(&self, ff: &str) -> Option<String>;
+    /// Nets driven by top-level input ports (e.g. `din`, `clk`).
+    /// A port net has no cell driver; STA treats it as a timing
+    /// startpoint arriving at time 0 at the port. Default: none.
+    /// An undriven net that is NOT an input port still fails loud
+    /// in `arrival` with the missing-driver error, so this never
+    /// lets an undriven internal net through.
+    fn input_ports(&self) -> HashSet<String> {
+        HashSet::new()
+    }
     /// Carry-chain cells: driver cell names whose combinational delay is
     /// the CARRY8 sum-output delay (`carry8.s_to_o`) rather than the
     /// LUT6 delay. Default: none. A carry cell drives its sum (`O`) and
@@ -136,6 +145,7 @@ pub fn sta_routed<N: StaNetlist>(
     let drivers = nl.net_drivers();
     let fanin = nl.cell_fanin();
     let ffs = nl.flip_flops();
+    let input_ports = nl.input_ports();
 
     let mut sites: HashMap<String, (i32, i32)> = HashMap::new();
     for (name, x, y) in nl.flip_flops() {
@@ -156,6 +166,7 @@ pub fn sta_routed<N: StaNetlist>(
         drivers: &HashMap<String, (String, i32, i32)>,
         fanin: &HashMap<String, Vec<String>>,
         sites: &HashMap<String, (i32, i32)>,
+        input_ports: &HashSet<String>,
         cell_delay: &dyn Fn(&str) -> i64,
         ckq_ps: i64,
         route_delay: &dyn Fn((i32, i32), (i32, i32)) -> i64,
@@ -169,6 +180,14 @@ pub fn sta_routed<N: StaNetlist>(
             return Err(format!("timing: combinational cycle through net {net}"));
         }
         let result = (|| -> Result<(i64, String), String> {
+            // A top-level input port is a timing startpoint: it
+            // arrives at time 0 at the port (the port has no placed
+            // site, so no wire delay is charged). The startpoint
+            // names the port. Anything else without a driver still
+            // fails loud below.
+            if input_ports.contains(net) {
+                return Ok((0, net.to_string()));
+            }
             let (drv, dx, dy) = drivers
                 .get(net)
                 .ok_or_else(|| format!("timing: no driver for net {net}"))?;
@@ -187,13 +206,17 @@ pub fn sta_routed<N: StaNetlist>(
                     drivers,
                     fanin,
                     sites,
+                    input_ports,
                     cell_delay,
                     ckq_ps,
                     route_delay,
                     depth + 1,
                     visiting,
                 )?;
-                if a > worst {
+                // `>=` so a cone fed only by input ports still names
+                // its startpoint instead of leaving it empty: a port
+                // arrives at 0, which ties the initial worst of 0.
+                if a >= worst {
                     worst = a;
                     worst_src = src;
                 }
@@ -224,6 +247,7 @@ pub fn sta_routed<N: StaNetlist>(
             &drivers,
             &fanin,
             &sites,
+            &input_ports,
             &cell_delay,
             ckq_ps,
             &route_delay,

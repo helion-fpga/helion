@@ -32,7 +32,7 @@
 //!   site in this flow yet; nets touching them are skipped loudly at
 //!   ROUTE, not routed.
 
-use helion_ir::{CellKind, Design, intern, resolve};
+use helion_ir::{CellKind, Design, PortDir, intern, resolve};
 use helion_ultrascale::bitgen::{
     BitgenError, emit_bitstream, emit_frames, parse_bitstream,
 };
@@ -418,6 +418,9 @@ struct UltraStaNetlist<'a> {
     ff_d: HashMap<String, String>,
     /// Carry-chain cells (CARRY8), charged the carry8 s_to_o delay.
     carry: HashSet<String>,
+    /// Nets driven by top-level input ports (In/Inout). STA treats
+    /// each as a timing startpoint arriving at time 0 at the port.
+    inputs: HashSet<String>,
 }
 
 impl<'a> StaNetlist for UltraStaNetlist<'a> {
@@ -463,6 +466,10 @@ impl<'a> StaNetlist for UltraStaNetlist<'a> {
 
     fn carry_cells(&self) -> HashSet<String> {
         self.carry.clone()
+    }
+
+    fn input_ports(&self) -> HashSet<String> {
+        self.inputs.clone()
     }
 }
 
@@ -981,16 +988,36 @@ fn sta_on_placed(
             _ => {}
         }
     }
+    // Top-level input ports are timing startpoints in STA: a port
+    // name is the net it drives (see `helion_ir::Design::ports`;
+    // the same convention is used for FRAIG leaves), so a net whose
+    // name matches an In/Inout port arrives at time 0 at the port.
+    // Intersect with real net names so a port with no net never
+    // claims a name. The clock net needs no entry: clk feeds FF CLK
+    // pins only, and STA traverses D-pin cones, so it never reaches
+    // `arrival`.
+    let net_names: HashSet<String> = design
+        .nets
+        .iter()
+        .map(|n| resolve(n.name).to_string())
+        .collect();
+    let input_ports: HashSet<String> = design
+        .ports
+        .iter()
+        .filter(|p| matches!(p.dir, PortDir::In | PortDir::Inout))
+        .map(|p| resolve(p.name).to_string())
+        .filter(|n| net_names.contains(n))
+        .collect();
     // Nets driven by top-level input ports (e.g. clk) and by constants
     // (e.g. CYINIT, the +1 operand of a counter's propagate LUTs) have
-    // no cell driver; they arrive at time 0. Drop them from fanin lists
-    // so STA traverses only driven nets instead of failing loud on a
-    // missing driver for a primary input or constant.
+    // no cell driver. Input-port nets stay in fanin lists: STA models
+    // them as startpoints arriving at 0. Only constants and other
+    // undriven nets are dropped, so STA traverses only driven nets
+    // and input ports instead of failing loud on a missing driver
+    // for a primary input or constant.
     for ins in fanin.values_mut() {
-        ins.retain(|n| drivers.contains_key(n));
+        ins.retain(|n| drivers.contains_key(n) || input_ports.contains(n));
     }
-    // Nets driven by top-level input ports (e.g. clk) have no cell driver;
-    // STA only traverses LUT/FF/carry fanin cones, so they are not needed here.
     let nl = UltraStaNetlist {
         design,
         sites,
@@ -999,6 +1026,7 @@ fn sta_on_placed(
         ff_q,
         ff_d,
         carry,
+        inputs: input_ports,
     };
     let db = sta_db_for_part(part).map_err(|e| format!("ULTRA STA: {e}"))?;
     sta_routed(&nl, &db, 10_000).map_err(|e| format!("ULTRA STA: {e}"))
