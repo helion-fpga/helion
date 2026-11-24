@@ -247,7 +247,8 @@ fn pf_margin(fails: u32, open: u32) -> i32 {
     if fails >= open {
         0
     } else {
-        8 << (fails / 2)
+        // Capped: 8 << 12 tiles is past any device, and an open from the environment can reach 100 fails.
+        8 << (fails / 2).min(12)
     }
 }
 
@@ -2313,6 +2314,9 @@ mod tests {
         assert_eq!(m, vec![8, 8, 16, 16, 32, 32, 64, 64, 0, 0]);
         assert_eq!(pf_margin(0, 1), 8);
         assert_eq!(pf_margin(1, 1), 0);
+        // A large HELION_ROUTE_PF_OPEN: the box stays a positive margin.
+        assert_eq!(pf_margin(99, 1000), 8 << 12);
+        assert!((0..100).all(|f| pf_margin(f, 1000) >= 8));
     }
 
     /// G77: every PathFinder search is exact (not negotiating, no detour
