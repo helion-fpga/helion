@@ -229,6 +229,25 @@ thread_local! {
     /// Set once the rip-up phase has displaced enough nets: a net then takes a
     /// free path or none (see [`NO_FREE_PATH`]).
     static FREE_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set by PathFinder for the net being routed: the margin (grid tiles) of
+    /// its search box, 0 for the whole device (see [`pf_margin`]).
+    static PF_MARGIN: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// PathFinder search box margin for a net that has been on an overused node
+/// in `fails` iterations: the first pass's 8 grid tiles, doubled every second
+/// failure, the whole device (0) from the eighth. A fixed box kept nets
+/// whose only free detour lies outside it sharing at any price (G77: Ibex
+/// overuse sat at about 3,700 wires until a global whole-device switch at
+/// iteration 13, then fell to 243); opening it for every net at once cost
+/// 17x per search, so only the nets that keep failing pay for it (VPR's
+/// conflicted-mode doubling, nextpnr router2's growth on failure).
+fn pf_margin(fails: u32) -> i32 {
+    if fails >= 8 {
+        0
+    } else {
+        8 << (fails / 2)
+    }
 }
 
 /// What [`route_net`] returns, as its error, when [`FREE_ONLY`] is set and a
@@ -1028,7 +1047,7 @@ fn pathfinder(
     claimed: &mut HashMap<(String, String), String>,
     load_delays: &mut HashMap<(String, String, String), u32>,
     queued: Vec<String>,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     const MAX_ITERATIONS: usize = 100;
     let wires_of = |pips: &[RoutedPip]| -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = pips
@@ -1065,11 +1084,14 @@ fn pathfinder(
     const STALL_ITERATIONS: usize = 30;
     let (mut best_over, mut best_it) = (usize::MAX, 0usize);
     let mut last_it = 0;
+    // Iterations each net has been on an overused node: its box grows with it.
+    let mut fails: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
     for it in 1..=MAX_ITERATIONS {
         last_it = it;
         for (n, p) in &pf {
             if device.pf_overused(&wires_of(p)) {
                 todo.insert(n.clone());
+                *fails.entry(n.clone()).or_insert(0) += 1;
             }
         }
         let count = todo.len();
@@ -1079,7 +1101,10 @@ fn pathfinder(
             let drv = eps.iter().find(|e| e.is_driver).ok_or_else(|| format!("route: PathFinder: net `{net}` has no driver"))?;
             let loads: Vec<&Endpoint> = eps.iter().filter(|e| !e.is_driver).collect();
             let mut delays = Vec::new();
-            let p = match route_net(&net, drv, &loads, clock_spine_nets, device, claimed, &mut delays, &[])? {
+            PF_MARGIN.with(|m| m.set(Some(pf_margin(fails.get(&net).copied().unwrap_or(0)))));
+            let r = route_net(&net, drv, &loads, clock_spine_nets, device, claimed, &mut delays, &[]);
+            PF_MARGIN.with(|m| m.set(None));
+            let p = match r? {
                 RouteKind::Pips(p) => p,
                 k => return Err(format!("route: PathFinder: net `{net}` routed as {k:?}, not pips")),
             };
@@ -1150,7 +1175,7 @@ fn pathfinder(
         device.note_claims(&net, &new, claimed.len());
         nets.push(RoutedNet7 { net, kind: RouteKind::Pips(p) });
     }
-    Ok(())
+    Ok(last_it)
 }
 
 /// Check whether `driver -> load` is a dedicated hardware cascade wire and
@@ -1406,7 +1431,15 @@ fn route_net(
             // A free path near the net first (giving up on long detours);
             // else the cheapest path through other nets' wires, near the
             // net and then anywhere. The caller rips up the displaced nets.
-            for (negotiate, bbox, cap_detour) in [(false, 8, true), (true, 8, false), (true, 0, false)] {
+            // In PathFinder every signal wire may be shared, so the first search
+            // already succeeds: it is the cheapest path at current prices in
+            // the net's box (the detour cap and the steep negotiating estimate
+            // let it run straight through congestion instead, G77).
+            let tries: &[(bool, i32, bool)] = match PF_MARGIN.with(|m| m.get()) {
+                Some(m) => &[(false, m, false), (true, 0, false)],
+                None => &[(false, 8, true), (true, 8, false), (true, 0, false)],
+            };
+            for &(negotiate, bbox, cap_detour) in tries {
                 if negotiate && FREE_ONLY.with(|f| f.get()) {
                     return Err(NO_FREE_PATH.to_string());
                 }
@@ -2259,5 +2292,111 @@ mod tests {
         p.luts.push(PlacedLut { name: "u_probe".into(), init: 1, tile: "CLB_X1".into(), site: "SLICE_X1".into(), bel: "B6LUT".into() });
         let err = route(&p, &FakeRouter).unwrap_err();
         assert!(err.contains("co0") && err.contains("cascade"), "got: {err}");
+    }
+
+    #[test]
+    fn pf_margin_doubles_then_opens_the_device() {
+        let m: Vec<i32> = (0..10).map(pf_margin).collect();
+        assert_eq!(m, vec![8, 8, 16, 16, 32, 32, 64, 64, 0, 0]);
+    }
+
+    /// G77: a net whose every path inside the first PathFinder box crosses a
+    /// band of used wires. With a fixed box it shares until the stall stop;
+    /// with the box grown for each net that keeps sharing it takes a free
+    /// detour within a few iterations, and the same input routes the same way.
+    #[test]
+    fn pathfinder_grows_the_box_of_a_net_that_keeps_sharing() {
+        use crate::device::{default_db_root, Device};
+        use crate::xdevice::{build_node_map, XDevice};
+        let mut dev = Device::load_xc7z020(&default_db_root()).expect("load xc7z020");
+        let maps = build_node_map(&mut dev);
+        let ep = |site: &str, pin: &str, is_driver: bool| Endpoint { site: site.into(), pin: pin.into(), is_driver };
+        let run = || {
+            let x = XDevice::new(&dev, maps.clone());
+            let grid = |site: &str, pin: &str| {
+                let (t, _) = x.site_pin_wire(site, pin).expect("pin wire");
+                let tile = dev.tile(dev.tile_by_name(&t).expect("tile")).expect("tile");
+                (tile.grid_x, tile.grid_y)
+            };
+            let ((sx, sy), (tx, _)) = (grid("SLICE_X40Y40", "AQ"), grid("SLICE_X56Y40", "AQ"));
+            // Every interconnect wire of a band 3 columns wide between the two,
+            // reaching well past the first box (8 tiles) above and below.
+            let xm = (sx + tx) / 2;
+            let mut band = Vec::new();
+            for i in 0..dev.tile_count() {
+                let t = dev.tile(i).expect("tile");
+                if t.name.starts_with("INT_") && (t.grid_x - xm).abs() <= 1 && (t.grid_y - sy).abs() <= 12 {
+                    band.extend(dev.wires(i).unwrap_or(&[]).iter().filter(|w| !is_power_wire(w)).map(|w| (t.name.clone(), w.clone())));
+                }
+            }
+            let net_eps: HashMap<String, Vec<Endpoint>> =
+                [("n".to_string(), vec![ep("SLICE_X40Y40", "AQ", true), ep("SLICE_X56Y40", "A1", false)])].into_iter().collect();
+            x.pf_present(Some(200));
+            x.pf_occupy(&band, 1);
+            let (mut nets, mut claimed, mut delays) = (Vec::new(), HashMap::new(), HashMap::new());
+            let its = pathfinder(&net_eps, &HashSet::new(), &x, &mut nets, &mut claimed, &mut delays, vec!["n".into()]).expect("converges");
+            let RouteKind::Pips(p) = &nets.iter().find(|n| n.net == "n").expect("routed").kind else { panic!("not pips") };
+            (its, p.iter().map(|p| format!("{}.{}->{}", p.tile, p.src_wire, p.dst_wire)).collect::<Vec<_>>())
+        };
+        let (its, pips) = run();
+        assert!(its <= 8, "took {its} iterations");
+        assert_eq!(run(), (its, pips), "same input, same route");
+    }
+
+    /// G77 benchmark: PathFinder alone on a dense patch of the xc7z020 (every
+    /// net starts unrouted, as the fill's deferred nets do), to compare router
+    /// changes in minutes instead of a fill build. `PF_BENCH_NETS` sets the
+    /// net count (default 2400 in a 20 x 20 slice patch). 2400 nets: 13
+    /// iterations with the fixed box, 6 with it grown per net; 3000 nets: 18
+    /// grown, and the fixed box still had 1,868 wires overused at iteration 12.
+    /// `cargo test --release -p helion-xilinx7 --lib pathfinder_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn pathfinder_bench_dense_patch() {
+        use crate::device::{default_db_root, Device};
+        use crate::xdevice::{build_node_map, XDevice};
+        let mut dev = Device::load_xc7z020(&default_db_root()).expect("load xc7z020");
+        let maps = build_node_map(&mut dev);
+        let x = XDevice::new(&dev, maps);
+        let nets: usize = std::env::var("PF_BENCH_NETS").ok().and_then(|v| v.parse().ok()).unwrap_or(2400);
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        let outs = ["AQ", "BQ", "CQ", "DQ", "A", "B", "C", "D", "AMUX", "BMUX", "CMUX", "DMUX"];
+        let mut free_in: HashSet<(u64, u64, usize)> = HashSet::new();
+        for sx in 0..20 {
+            for sy in 0..20 {
+                for i in 0..24 {
+                    free_in.insert((sx, sy, i));
+                }
+            }
+        }
+        let mut net_eps: HashMap<String, Vec<Endpoint>> = HashMap::new();
+        let ep = |sx: u64, sy: u64, pin: String, is_driver: bool| Endpoint { site: format!("SLICE_X{}Y{}", 30 + sx, 30 + sy), pin, is_driver };
+        for k in 0..nets {
+            let (sx, sy) = ((k / outs.len()) as u64 % 20, (k / outs.len() / 20) as u64 % 20);
+            let mut eps = vec![ep(sx, sy, outs[k % outs.len()].to_string(), true)];
+            for _ in 0..2 {
+                for _ in 0..50 {
+                    let (lx, ly, i) = ((sx + 14 + next(13)) % 20, (sy + 14 + next(13)) % 20, next(24) as usize);
+                    if free_in.remove(&(lx, ly, i)) {
+                        eps.push(ep(lx, ly, format!("{}{}", ["A", "B", "C", "D"][i / 6], i % 6 + 1), false));
+                        break;
+                    }
+                }
+            }
+            net_eps.insert(format!("n{k:05}"), eps);
+        }
+        let queued: Vec<String> = net_eps.keys().cloned().collect();
+        let (mut routed, mut claimed, mut delays) = (Vec::new(), HashMap::new(), HashMap::new());
+        let t = std::time::Instant::now();
+        let r = pathfinder(&net_eps, &HashSet::new(), &x, &mut routed, &mut claimed, &mut delays, queued);
+        let pips: usize = routed.iter().map(|n| if let RouteKind::Pips(p) = &n.kind { p.len() } else { 0 }).sum();
+        let worst = delays.values().max().copied().unwrap_or(0);
+        eprintln!("pf_bench nets={nets} result={:?} time={:.1}s pips={pips} worst_delay={worst}ps", r.as_ref().map_err(|e| e.lines().next().unwrap_or("").to_string()), t.elapsed().as_secs_f64());
     }
 }

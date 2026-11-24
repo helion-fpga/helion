@@ -488,9 +488,8 @@ impl<'a> XDevice<'a> {
         // Search region: the box spanned by the sinks, the net's source and
         // the nearest wire of its tree. Without the source a far load could
         // only branch off the tree near it.
-        // Late PathFinder iterations search the whole device: a net whose
-        // only free detour leaves the box would otherwise keep sharing.
-        let bbox = if pf.as_ref().is_some_and(|(_, ps)| *ps >= 20_000) { 0 } else { opts.bbox };
+        // PathFinder widens the box per net that keeps sharing (route::pf_margin).
+        let bbox = opts.bbox;
         let region = (bbox > 0).then(|| {
             let (sx, sy) = self.wire_xy(near.1);
             let (qx, qy) = self.wire_xy(start);
