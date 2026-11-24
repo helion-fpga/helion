@@ -75,6 +75,50 @@ pub struct XDevice<'a> {
     /// Per search, by node: whether a dead-end node leads into the target
     /// (stamp of the search that computed it, and the answer).
     approach: std::cell::RefCell<(Vec<u32>, Vec<u8>)>,
+    /// PathFinder's cost-to-go estimate (see [`Lookahead`]), built on first use.
+    lookahead: std::cell::OnceCell<Lookahead>,
+}
+
+/// Per wire class (tile type, wire index) and tile offset to a CLB input
+/// pin: the cheapest path's cost (pip delay + `PIP_BASE`) on the empty
+/// device, as VPR's map lookahead and nextpnr router2 do. The flat
+/// 30 ps/tile estimate is about half the real cost of a short route (each
+/// pip is about 160 ps), so PathFinder's searches flooded every wire near
+/// the load (G77).
+struct Lookahead {
+    /// Per tile type id, per wire index: class (`u32::MAX`: none).
+    cls: Vec<Vec<u32>>,
+    /// `[class][target kind][dy + R][dx + R]`, `u16::MAX` where no path was found.
+    table: Vec<u16>,
+}
+
+/// Target tile types the lookahead covers (the table's target kinds).
+const LA_KINDS: [&str; 4] = ["CLBLL_L", "CLBLL_R", "CLBLM_L", "CLBLM_R"];
+/// Lookahead reach in grid tiles each way; past it the flat estimate adds on.
+const LA_R: i32 = 16;
+const LA_S: usize = (2 * LA_R + 1) as usize;
+/// Search per sample target, in grid tiles each way, so paths may stray
+/// past the reach.
+const LA_WINDOW: i32 = LA_R + 6;
+const PIP_BASE: u32 = 15;
+// Estimated cost to go per tile. A hex costs about 27 ps per tile
+// (pip delay + PIP_BASE over 6 tiles); at 90 the search was close to
+// greedy and extended whichever tree wire lay nearest the load, so
+// the loads of a chip-wide net were reached one after another (G38).
+const EST_TILE_PS: u32 = 30;
+
+impl Lookahead {
+    /// Estimated cost from wire `wi` of a tile of type `ty` to a pin of a
+    /// `kind` tile `(dx, dy)` grid tiles away.
+    fn est(&self, kind: usize, ty: u32, wi: u32, dx: i32, dy: i32) -> Option<u32> {
+        let c = *self.cls.get(ty as usize)?.get(wi as usize)?;
+        if c == u32::MAX {
+            return None;
+        }
+        let (cx, cy) = ((dx.clamp(-LA_R, LA_R) + LA_R) as usize, (dy.clamp(-LA_R, LA_R) + LA_R) as usize);
+        let v = self.table[((c as usize * LA_KINDS.len() + kind) * LA_S + cy) * LA_S + cx];
+        (v != u16::MAX).then(|| v as u32 + EST_TILE_PS * ((dx.abs() - LA_R).max(0) + (dy.abs() - LA_R).max(0)) as u32)
+    }
 }
 
 #[derive(Default)]
@@ -125,7 +169,125 @@ impl<'a> XDevice<'a> {
             history: std::cell::RefCell::new(Vec::new()),
             pf: std::cell::RefCell::new(None),
             approach: std::cell::RefCell::new((Vec::new(), Vec::new())),
+            lookahead: std::cell::OnceCell::new(),
         }
+    }
+
+    /// Build the [`Lookahead`]: for two tiles of each kind (a third and two
+    /// thirds across the device, mid height), a Dijkstra backwards from all
+    /// of the tile's input pins over the wires the router may take, keeping
+    /// the cheapest cost per wire class and offset (the minimum over the two
+    /// samples, so columns of other tile types near one sample do not
+    /// inflate it). Deterministic: fixed samples, minimum costs.
+    /// `flags`: [`Self::wire_flags`] (the caller holds them borrowed).
+    fn build_lookahead(&self, flags: &[u8]) -> Lookahead {
+        use std::cmp::Reverse;
+        let t0 = std::time::Instant::now();
+        let dev = self.device;
+        let tiles: Vec<&crate::device::Tile> = (0..dev.tile_count()).filter_map(|i| dev.tile(i)).collect();
+        let ntypes = tiles.iter().map(|t| t.type_id as usize + 1).max().unwrap_or(0);
+        let (gx, gy) = tiles.iter().fold((0, 0), |(x, y), t| (x.max(t.grid_x), y.max(t.grid_y)));
+        // Pips into each wire, per tile type: (source wire index, cost, pseudo).
+        let mut into: Vec<Option<Vec<Vec<(u32, u32, bool)>>>> = vec![None; ntypes];
+        let mut la = Lookahead { cls: vec![Vec::new(); ntypes], table: Vec::new() };
+        let n = self.wire_to_tile.len();
+        let mut dist = vec![u32::MAX; n];
+        let mut touched: Vec<u32> = Vec::new();
+        // A wire the router may take (power, GCLK and clock-buffer wires excluded).
+        let open = |id: u32| flags[id as usize] & (1 | 16) == 0;
+        for (kind, ty) in LA_KINDS.iter().enumerate() {
+            for third in [1, 2] {
+                let (fx, fy) = (gx * third / 3, gy / 2);
+                let Some(ci) = (0..tiles.len())
+                    .filter(|&i| dev.tile_type_name(i) == Some(*ty))
+                    .min_by_key(|&i| ((tiles[i].grid_x - fx).abs() + (tiles[i].grid_y - fy).abs(), i))
+                else {
+                    continue;
+                };
+                let (cx, cy) = (tiles[ci].grid_x, tiles[ci].grid_y);
+                let inside = |id: u32| {
+                    let (x, y) = self.wire_xy(id);
+                    (x - cx).abs() <= LA_WINDOW && (y - cy).abs() <= LA_WINDOW
+                };
+                for &t in &touched {
+                    dist[t as usize] = u32::MAX;
+                }
+                touched.clear();
+                let mut heap = std::collections::BinaryHeap::new();
+                let base = dev.wire_id(ci, 0).unwrap_or(0);
+                for wi in 0..dev.wires(ci).map_or(0, |w| w.len()) as u32 {
+                    let id = base + wi;
+                    if flags[id as usize] & 128 != 0 && open(id) {
+                        dist[id as usize] = 0;
+                        touched.push(id);
+                        heap.push(Reverse((0u32, id)));
+                    }
+                }
+                while let Some(Reverse((c, v))) = heap.pop() {
+                    if c > dist[v as usize] {
+                        continue;
+                    }
+                    let (ti, wi) = self.wire_to_tile[v as usize];
+                    let t = tiles[ti];
+                    let (dx, dy) = (cx - t.grid_x, cy - t.grid_y);
+                    // Interconnect and CLB wires only: other tile types keep the flat estimate.
+                    if dx.abs() <= LA_R && dy.abs() <= LA_R && flags[v as usize] & (4 | 8) != 0 {
+                        let cl = &mut la.cls[t.type_id as usize];
+                        if cl.is_empty() {
+                            cl.resize(dev.wires(ti).map_or(0, |w| w.len()), u32::MAX);
+                        }
+                        if cl[wi as usize] == u32::MAX {
+                            cl[wi as usize] = (la.table.len() / (LA_KINDS.len() * LA_S * LA_S)) as u32;
+                            la.table.resize(la.table.len() + LA_KINDS.len() * LA_S * LA_S, u16::MAX);
+                        }
+                        let k = ((cl[wi as usize] as usize * LA_KINDS.len() + kind) * LA_S + (dy + LA_R) as usize) * LA_S + (dx + LA_R) as usize;
+                        la.table[k] = la.table[k].min(c.min(u16::MAX as u32 - 1) as u16);
+                    }
+                    let mut relax = |u: u32, cu: u32, heap: &mut std::collections::BinaryHeap<Reverse<(u32, u32)>>| {
+                        if cu < dist[u as usize] && open(u) && inside(u) {
+                            if dist[u as usize] == u32::MAX {
+                                touched.push(u);
+                            }
+                            dist[u as usize] = cu;
+                            heap.push(Reverse((cu, u)));
+                        }
+                    };
+                    // Node siblings: free (the forward search's node hop).
+                    let nid = self.wire_to_node[v as usize];
+                    if nid != u32::MAX {
+                        for &m in self.node_wires(nid) {
+                            relax(m, c, &mut heap);
+                        }
+                    }
+                    // Pips into v: the forward search takes usable pips, no
+                    // pseudo-pip in a CLB tile, none out of a global buffer input.
+                    let lists = into[t.type_id as usize].get_or_insert_with(|| {
+                        let nw = dev.wires(ti).map_or(0, |w| w.len());
+                        let mut l = vec![Vec::new(); nw];
+                        for sw in 0..nw as u32 {
+                            for p in dev.pips_from_idx(ti, sw).filter(|p| p.usable) {
+                                if let Some(e) = l.get_mut(p.dst as usize) {
+                                    e.push((sw, p.delay_ps as u32 + PIP_BASE, p.is_pseudo));
+                                }
+                            }
+                        }
+                        l
+                    });
+                    let tb = dev.wire_id(ti, 0).unwrap_or(0);
+                    for &(sw, cost, pseudo) in &lists[wi as usize] {
+                        let u = tb + sw;
+                        if flags[u as usize] & 64 != 0 || (pseudo && flags[u as usize] & 4 != 0) {
+                            continue;
+                        }
+                        relax(u, c + cost, &mut heap);
+                    }
+                }
+            }
+        }
+        if debug_env("HELION_ROUTE_STATS") {
+            eprintln!("route_stat lookahead classes {} in {:.1}s", la.table.len() / (LA_KINDS.len() * LA_S * LA_S), t0.elapsed().as_secs_f64());
+        }
+        la
     }
 
     /// Members of node `nid` (empty for a wire with no node).
@@ -401,19 +563,32 @@ impl<'a> XDevice<'a> {
         }
         let tgt_xy: Vec<(i32, i32)> = targets.iter().map(|&t| self.wire_xy(t)).collect();
 
-        const PIP_BASE: u32 = 15;
-        // Estimated cost to go per tile. A hex costs about 27 ps per tile
-        // (pip delay + PIP_BASE over 6 tiles); at 90 the search was close to
-        // greedy and extended whichever tree wire lay nearest the load, so
-        // the loads of a chip-wide net were reached one after another (G38).
-        const EST_TILE_PS: u32 = 30;
+        // PathFinder's exact searches estimate by the lookahead table (into a
+        // CLB pin; other targets and classes keep the flat estimate).
+        let la = (pf.is_some() && !opts.negotiate && !clock && !allow_power && !opts.any_pip).then(|| self.lookahead.get_or_init(|| self.build_lookahead(&flags)));
+        let tgt_kind: Vec<Option<usize>> = targets
+            .iter()
+            .map(|&t| la.and_then(|_| self.device.tile_type_name(self.wire_to_tile[t as usize].0)).and_then(|n| LA_KINDS.iter().position(|k| *k == n)))
+            .collect();
         let h = |id: u32| -> u32 {
-            let (x, y) = self.wire_xy(id);
-            let d = tgt_xy.iter().map(|(tx, ty)| (x - tx).abs() + (y - ty).abs()).min().unwrap_or(0);
-            // Negotiating adds penalties near the sinks; a steeper
-            // estimate keeps that search aimed at them instead of flooding
-            // everything within the penalty's reach.
-            (d as u32) * if opts.negotiate { 220 } else { EST_TILE_PS }
+            let (ti, wi) = self.wire_to_tile[id as usize];
+            let Some(t) = self.device.tile(ti) else { return 0 };
+            let (x, y) = (t.grid_x, t.grid_y);
+            tgt_xy
+                .iter()
+                .zip(&tgt_kind)
+                .map(|(&(tx, ty), k)| {
+                    let d = ((x - tx).abs() + (y - ty).abs()) as u32;
+                    // Negotiating adds penalties near the sinks; a steeper
+                    // estimate keeps that search aimed at them instead of flooding
+                    // everything within the penalty's reach.
+                    if opts.negotiate {
+                        return d * 220;
+                    }
+                    k.and_then(|k| la?.est(k, t.type_id, wi, tx - x, ty - y)).unwrap_or(d * EST_TILE_PS)
+                })
+                .min()
+                .unwrap_or(0)
         };
         let mut sb = self.search.borrow_mut();
         if sb.stamp.len() != n {
@@ -2032,6 +2207,33 @@ mod tests {
             let maps = build_node_map(&mut dev);
             (dev, maps)
         })
+    }
+
+    /// G77: PathFinder's searches estimate by the lookahead table. On the
+    /// empty device (same costs as the flat-estimate search) they find
+    /// routes as fast (in delay) while expanding a fraction of the wires.
+    #[test]
+    fn lookahead_finds_as_fast_a_route_with_fewer_expansions() {
+        let (dev, maps) = test_z020();
+        let x = XDevice::new(dev, maps.clone());
+        let claimed = HashMap::new();
+        let opts = crate::route::RouteOpts { bbox: 8, ..Default::default() };
+        let (mut flat_e, mut la_e) = (0, 0);
+        for (from, to) in [("SLICE_X40Y40", "SLICE_X41Y41"), ("SLICE_X40Y40", "SLICE_X45Y46"), ("SLICE_X60Y40", "SLICE_X56Y30"), ("SLICE_X40Y40", "SLICE_X74Y40")] {
+            let src = x.site_pin_wire(from, "AQ").expect("src");
+            let dst = x.site_pin_wire(to, "A1").expect("dst");
+            let mut run = |pf: bool| {
+                x.pf_present(pf.then_some(200));
+                let r = x.astar((&src.0, &src.1), &[], &[dst.clone()], opts, "probe", &claimed);
+                let (_, arr) = r.flatten().expect("routes");
+                (arr.last().map(|a| a.1).unwrap_or(0), LAST_EXPANDED.with(|e| e.get()))
+            };
+            let ((fd, fe), (ld, le)) = (run(false), run(true));
+            assert!(ld * 100 <= fd * 103, "{from} -> {to}: {ld} ps with the lookahead, {fd} ps flat");
+            (flat_e, la_e) = (flat_e + fe, la_e + le);
+        }
+        x.pf_present(None);
+        assert!(la_e * 2 < flat_e, "expanded {la_e} with the lookahead, {flat_e} flat");
     }
 
     /// G76 probe: the fastest route the search finds for one long hop on an
