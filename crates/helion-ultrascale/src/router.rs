@@ -354,8 +354,16 @@ pub fn route_ultra(
     let mut best_pres: Vec<u32> = vec![0; n_wires];
     let mut iters_used = 0u32;
 
-    // Seed-derived net processing order. Same every iteration for stability;
-    // seed variation comes from order + tie-breaks + cost perturbation.
+    // Seed-derived net processing order. Fixed across iterations:
+    // per-iteration re-draws were tried for N48 and REJECTED by
+    // measurement (harness: counter16 seed 0 went from 22 iters
+    // routed to OveruseTimeout, 76 iters at a 150 budget):
+    // reshuffling spreads history costs thinly across the
+    // contenders instead of accumulating them on the contested
+    // wire, so no net ever feels enough pressure to detour. The
+    // fixed order plus history-cost accumulation is the mechanism
+    // that converges; seed variation comes from order +
+    // tie-breaks + cost perturbation.
     let net_order = seeded_order(nets.len(), opts.seed);
 
     for iter in 0..max_iters {
@@ -512,10 +520,21 @@ pub fn route_ultra(
         if overused == 0 {
             break;
         }
-        // Update historic congestion on overused nodes.
+        // Update historic congestion on overused nodes (N48): the
+        // history cost grows by the present-use count, not by 1.
+        // The first net in the fixed order routes with presence 0,
+        // so history is the ONLY signal that ever moves it off a
+        // contested wire, and it must outgrow that net's detour
+        // length (tens of wires) before the net detours. Growing
+        // by the use count doubles the pressure on the tail wires
+        // every net pair shares (c = 2) and quadruples it on the
+        // iter-0 trunk wires four nets share, so the grind that
+        // took 34 iterations on counter12 seed 0 finishes sooner.
+        // History still only grows on overused wires, so a wire
+        // one net uses keeps history 0.
         for (i, &c) in pres.iter().enumerate() {
             if c > 1 {
-                hist[i] = hist[i].saturating_add(1);
+                hist[i] = hist[i].saturating_add(c);
             }
         }
     }
