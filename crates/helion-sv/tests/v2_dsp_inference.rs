@@ -357,6 +357,7 @@ fn registers_the_slice_cannot_match_stay_in_the_fabric() {
         ("reset under the enable", "always_ff @(posedge clk) if (en) begin if (rst) p <= '0; else p <= a * b; end"),
         ("falling edge", "always_ff @(negedge clk) p <= a * b;"),
         ("product also read", "always_ff @(posedge clk) p <= a * b; assign o = a * b;"),
+        ("select also read", "always_ff @(posedge clk) if (en) p <= a * b; assign o = en ? a * b : p;"),
     ] {
         let (d, _, regs) = one(&format!("module t({IO}, output logic signed [42:0] p, o); {body} endmodule"));
         assert_eq!(regs, "0 0 0 0", "{what}");
@@ -379,4 +380,56 @@ fn an_accumulator_over_48_bits_keeps_its_add_in_the_fabric() {
     let (d, _, regs) = one(&format!("module t({IO}, output logic signed [63:0] p); always_ff @(posedge clk) p <= p + a * b; endmodule"));
     assert_eq!(regs, "0 0 0 0");
     assert_eq!(flops(&d), 64);
+}
+
+/// `q <= p1 * c` reads the first slice's P register whichever block comes
+/// first in the source. Consumer first used to take p1 as the second
+/// slice's A register, leaving `a * b` a combinational DSP in front of it
+/// (A -> P then A setup: zedbit refused the bitstream).
+#[test]
+fn a_product_register_read_by_another_product_is_its_p_in_either_order() {
+    let (prod, cons) = ("always_ff @(posedge clk) p1 <= a * b;", "always_ff @(posedge clk) q <= p1 * c;");
+    for (what, body) in [("producer first", format!("{prod} {cons}")), ("consumer first", format!("{cons} {prod}"))] {
+        let d = v2(&format!(
+            "module t(input logic clk, input logic signed [11:0] a, b, input logic signed [17:0] c, output logic signed [41:0] q);
+             logic signed [23:0] p1; {body} endmodule"
+        ));
+        let mut ds: Vec<(String, String)> =
+            dsps(&d).into_iter().map(|(n, a)| (n.split("_dsp").next().unwrap().to_string(), ["AREG", "BREG", "MREG", "PREG"].map(|k| a[k].as_str()).join(" "))).collect();
+        ds.sort();
+        assert_eq!(ds, [("p1".to_string(), "0 0 0 1".to_string()), ("q".to_string(), "0 0 0 1".to_string())], "{what}");
+        assert!(count(&d, false) <= 2, "{what}: no LUT multiplier, got {} Lut6", count(&d, false));
+        assert_eq!(flops(&d), 0, "{what}");
+    }
+}
+
+/// A register on another clock, or behind a clock gate, is not the slice's.
+#[test]
+fn registers_on_another_or_gated_clock_stay_in_the_fabric() {
+    let gate = "logic en_l, gclk; always_latch if (!clk) en_l = en; assign gclk = clk & en_l;";
+    for (what, body, regs, ff) in [
+        ("A on clk2", "logic signed [24:0] ar; always_ff @(posedge clk2) ar <= a; always_ff @(posedge clk) p <= ar * b;".to_string(), "0 0 0 1", 25),
+        ("M on clk, P on clk2", "logic signed [47:0] m; always_ff @(posedge clk) m <= a * b; always_ff @(posedge clk2) p <= m;".to_string(), "0 0 0 1", 48),
+        ("P on a gated clock", format!("{gate} always_ff @(posedge gclk) p <= a * b;"), "0 0 0 0", 48),
+        ("A on a gated clock", format!("{gate} logic signed [24:0] ar; always_ff @(posedge gclk) ar <= a; assign p = ar * b;"), "0 0 0 0", 25),
+    ] {
+        let (d, _, r) = one(&format!("module t({IO}, input logic clk2, output logic signed [47:0] p); {body} endmodule"));
+        assert_eq!(r, regs, "{what}");
+        assert_eq!(flops(&d), ff, "{what}");
+    }
+}
+
+/// Products past the part's DSP48E1 count stay LUT multipliers.
+#[test]
+fn products_past_the_dsp_sites_stay_in_the_fabric() {
+    let n = helion_sv::v2::dsp::DSP_SITES.load(std::sync::atomic::Ordering::Relaxed);
+    let k = n + 10;
+    let d = v2(&format!(
+        "module t(input logic [{w}:0] a, b, output logic [{w2}:0] p);
+         for (genvar i = 0; i < {k}; i++) begin : g assign p[i*16 +: 16] = a[i*8 +: 8] * b[i*8 +: 8]; end endmodule",
+        w = k * 8 - 1,
+        w2 = k * 16 - 1
+    ));
+    assert_eq!(dsps(&d).len(), n);
+    assert!(count(&d, false) > 10 * 50, "ten 8x8 LUT multipliers");
 }

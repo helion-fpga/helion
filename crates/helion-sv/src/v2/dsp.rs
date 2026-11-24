@@ -37,11 +37,21 @@
 //!   48 bits, the product used nowhere else;
 //! - M: `m <= a * b` read only by `p <= m` or `p <= p + m` (then P too);
 //! - A, B: an operand that is the output of a register nothing else reads,
-//!   beside constant 0 bits only.
+//!   beside constant 0 bits only, unless that register is the P or M
+//!   register of a product that gets its own DSP48E1 (`q <= p1 * c` after
+//!   `p1 <= a * b` reads the first slice's P, in either source order).
+//!
+//! Products past [`DSP_SITES`] stay in the fabric.
 
 use super::dag::{Dag, Op, N};
 use super::lower::{clock_shape, wire, Drv, Flat, Hard, SigInfo};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// DSP48E1 sites on the part: 220 on the xc7z020 (ZedBoard). Products past
+/// it, after the instantiated DSP48E1 cells, stay in the fabric.
+// shortcut: one part's count, first come first served in node order; set it per part when another one builds.
+pub static DSP_SITES: AtomicUsize = AtomicUsize::new(220);
 
 /// A register's next value as `rst ? 0 : en ? core : hold`.
 struct Peel {
@@ -370,6 +380,11 @@ const ATTRS: [(&str, &str); 7] = [
     ("AUTORESET_PATDET", "NO_RESET"),
 ];
 
+/// `n` is a product that gets a DSP48E1 of its own when its turn comes.
+fn takes_dsp(flat: &Flat, n: N) -> bool {
+    matches!(*flat.dag.op(n), Op::Mul(x, y) if !operand(flat, x).cheap(flat) && !operand(flat, y).cheap(flat))
+}
+
 /// Infer DSP48E1 cells for every product that fits (see the module docs).
 pub fn infer(flat: &mut Flat) {
     let (mut refs, mut reads) = refs(flat);
@@ -394,6 +409,9 @@ pub fn infer(flat: &mut Flat) {
         cands.push(sr);
     }
     let mut by_input: HashMap<N, Vec<(usize, bool)>> = HashMap::new();
+    // Register -> the node its core reads, to leave a product's own P or M
+    // register out of another product's A/B ports whatever the node order.
+    let mut stage_of: HashMap<u32, N> = HashMap::new();
     for (k, sr) in cands.iter().enumerate() {
         let (x, acc) = match *flat.dag.op(sr.peel.core) {
             Op::Add(a, b) if a == sr.hold => (b, true),
@@ -402,9 +420,11 @@ pub fn infer(flat: &mut Flat) {
         };
         if let Some(x) = sole(flat, &refs, &reads, x) {
             by_input.entry(x).or_default().push((k, acc));
+            stage_of.insert(sr.ri, x);
         }
     }
     let mut built = 0usize;
+    let mut room = DSP_SITES.load(Ordering::Relaxed).saturating_sub(flat.hard.iter().filter(|h| h.module == "DSP48E1").count());
     // Partial products of a split one: combinational, as the sum reads them.
     let mut parts: HashSet<N> = HashSet::new();
     let mut next = 0;
@@ -413,7 +433,7 @@ pub fn infer(flat: &mut Flat) {
         let Op::Mul(x, y) = *flat.dag.op(m) else { continue };
         let w = flat.dag.w(m);
         let (mut a, mut b) = (operand(flat, x), operand(flat, y));
-        if a.cheap(flat) || b.cheap(flat) {
+        if a.cheap(flat) || b.cheap(flat) || room == 0 {
             continue;
         }
         if a.e > 25 || b.e > 18 {
@@ -455,7 +475,9 @@ pub fn infer(flat: &mut Flat) {
         let port = |flat: &mut Flat, op: &Operand, clk: &mut Option<(N, u32)>| -> (Vec<(N, u32)>, Option<(N, N)>) {
             let pins: Vec<(N, u32)> = (0..op.e).map(|j| op.bits[j as usize]).collect();
             let uses = (x == op.n) as u32 + (y == op.n) as u32;
-            let Some((ri, s)) = op.reg(flat).filter(|&(ri, s)| !part && !own.contains(&ri) && private(flat, &refs, &reads, op.n, uses, s)) else { return (pins, None) };
+            let Some((ri, s)) = op.reg(flat).filter(|&(ri, s)| !part && !own.contains(&ri) && !stage_of.get(&ri).is_some_and(|&n| takes_dsp(flat, n)) && private(flat, &refs, &reads, op.n, uses, s)) else {
+                return (pins, None);
+            };
             let Some(sr) = slice_reg(flat, ri) else { return (pins, None) };
             if clk.is_some_and(|c| c != sr.clk) {
                 return (pins, None);
@@ -473,6 +495,7 @@ pub fn infer(flat: &mut Flat) {
         };
         let name = format!("{base}_dsp{built}");
         built += 1;
+        room -= 1;
         let acc = preg.is_some_and(|p| p.1);
         let wp = match preg {
             Some((k, _)) => flat.sigs[flat.regs[cands[k].ri as usize].sig as usize].w,
