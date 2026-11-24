@@ -17,11 +17,12 @@ use helion_targets::reports::TileClass;
 /// World pixels per tile at zoom 1.
 const TILE: f32 = 9.0;
 
-/// True when `part` names an iCE40 / ECP5 device (name pattern only; the
-/// registry lookup that loads every HAD part stays off the UI thread).
+/// True when `part` names an iCE40 / ECP5 / 7-series device (name pattern
+/// only; the registry lookup that loads every HAD part stays off the UI
+/// thread).
 pub fn is_family_part(part: &str) -> bool {
     let p = part.to_ascii_lowercase();
-    p.starts_with("ice40") || p.starts_with("lfe5u") || p.starts_with("lfe5um")
+    p.starts_with("ice40") || p.starts_with("lfe5u") || p.starts_with("lfe5um") || p.starts_with("xc7")
 }
 
 fn class_color(c: TileClass, t: &VivadoTheme) -> rune::Color {
@@ -88,7 +89,7 @@ fn legend(die: &FamilyDie, t: &VivadoTheme) -> El {
 
 /// Device pane body for a family part.
 pub fn family_device_pane(s: &AppState, t: &VivadoTheme) -> El {
-    let part = s.project.part.clone();
+    let part = helion_targets::canonical_part(&s.project.part).to_string();
     let die = s.runs.family_die.as_ref().filter(|d| d.grid.part.eq_ignore_ascii_case(&part));
     let body = match die {
         None => cad::empty_state(

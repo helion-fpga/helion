@@ -15,11 +15,27 @@
 //!   (`$HELION_XILINX_DB` or `~/workspace/xilinx-dbsrc`). Without it the
 //!   backend falls back to a two-pin synthetic model that cannot produce a
 //!   usable bitstream, so the part is listed only when the database exists.
+//! - **Zynq-7000** (`xc7z020clg484-1`, the ZedBoard): listed when the
+//!   X-Ray `zynq7` database is on disk. The IDE builds it, like every
+//!   7-series part, with [`xdc_flow`], the HDL + XDC flow `zedbit` runs, so
+//!   the IDE and `zedbit` write the same `.bit`.
 
 pub mod reports;
 
 use helion_backend::Backend;
 use helion_ir::Design;
+
+/// HDL + XDC to `.bit` for 7-series parts (the `zedbit` flow).
+pub use helion_xilinx7::xdc_flow;
+/// Types the IDE needs from the 7-series backend alongside [`xdc_flow`].
+pub mod xdc_flow_types {
+    pub use helion_backend::Backend;
+    pub use helion_xilinx7::backend::{Packed7, Xilinx7Backend};
+    pub use helion_xilinx7::device::Device;
+}
+
+/// The ZedBoard's part, listed when the X-Ray `zynq7` database has it.
+pub const ZEDBOARD_PART: &str = "xc7z020clg484-1";
 
 /// Device family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -46,7 +62,7 @@ impl Family {
             Family::Helion => ("bit", "Helion bitstream"),
             Family::Ice40 => ("asc", "IceStorm ASCII config (icepack → .bin)"),
             Family::Ecp5 => ("config", "Trellis text config (ecppack → .bit)"),
-            Family::Xilinx7 => ("fasm", "FASM (xcfasm/frames2bit → .bit)"),
+            Family::Xilinx7 => ("bit", "7-series bitstream (X-Ray frames; FASM beside it)"),
         }
     }
 }
@@ -65,6 +81,11 @@ pub fn xilinx_db_present() -> bool {
     helion_xilinx7::device::default_db_root()
         .join("artix7/xc7a50t/tilegrid.json")
         .is_file()
+}
+
+/// True when the X-Ray database describes the ZedBoard's part.
+pub fn zynq_db_present() -> bool {
+    helion_xilinx7::parts::resolve(&helion_xilinx7::device::default_db_root(), ZEDBOARD_PART).is_ok()
 }
 
 /// Every part some backend can take from netlist to bitstream on this
@@ -103,11 +124,24 @@ pub fn implementable_parts() -> Vec<TargetPart> {
             summary: "20800 LUT6 · 50 BRAM36 · csg324 (X-Ray)".into(),
         });
     }
+    if zynq_db_present() {
+        out.push(TargetPart {
+            part: ZEDBOARD_PART.into(),
+            family: Family::Xilinx7,
+            summary: "53200 LUT6 · 140 BRAM36 · 220 DSP · clg484, ZedBoard (X-Ray)".into(),
+        });
+    }
     out
+}
+
+/// The full part name for the short name projects may use (`xc7z020`).
+pub fn canonical_part(part: &str) -> &str {
+    if part.eq_ignore_ascii_case("xc7z020") { ZEDBOARD_PART } else { part }
 }
 
 /// Family of a part name, or `None` for parts no backend implements.
 pub fn family_of(part: &str) -> Option<Family> {
+    let part = canonical_part(part);
     implementable_parts()
         .into_iter()
         .find(|p| p.part.eq_ignore_ascii_case(part))
@@ -222,7 +256,9 @@ pub fn implement(
         progress(&line);
         stages.push(line);
     };
-    let (ext, _) = family.artifact();
+    // `implement` stops at FASM for 7-series; the IDE builds the `.bit` with
+    // `xdc_flow`.
+    let ext = if family == Family::Xilinx7 { "fasm" } else { family.artifact().0 };
     if pads > 0 {
         stage("io", format!("{pads} I/O buffer(s) inserted"), progress);
     }
@@ -306,6 +342,8 @@ mod tests {
         assert_eq!(family_of("LFE5U-85F"), Some(Family::Ecp5));
         assert_eq!(family_of("LFE5U-45F"), None, "no Trellis DB vendored for 45F");
         assert_eq!(parts.iter().any(|p| p.part == "xc7a35t"), xilinx_db_present());
+        assert_eq!(parts.iter().any(|p| p.part == ZEDBOARD_PART), zynq_db_present());
+        assert_eq!(family_of("xc7z020"), zynq_db_present().then_some(Family::Xilinx7));
         for p in parts.iter().filter(|p| p.family == Family::Helion) {
             assert!(helion_device::Device::load_part(&p.part).is_ok());
         }

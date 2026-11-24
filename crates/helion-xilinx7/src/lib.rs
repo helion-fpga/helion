@@ -35,6 +35,7 @@ pub mod place_sa;
 pub mod route;
 pub mod timing;
 pub mod vivado_export;
+pub mod xdc_flow;
 pub mod xdevice;
 pub use xdevice::{build_node_map, XDevice};
 

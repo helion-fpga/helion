@@ -399,6 +399,55 @@ pub fn placement(design: &Design, part: &str) -> Result<Vec<PlacedPrim>, String>
     Ok(out)
 }
 
+/// Tile class of a 7-series tile type (X-Ray names); `None` for routing
+/// and filler tiles, which the Device view leaves empty.
+fn xilinx_tile_class(ty: &str) -> Option<TileClass> {
+    Some(match ty {
+        t if t.starts_with("CLBL") => TileClass::Logic,
+        t if t.starts_with("BRAM_") && !t.contains("INT") => TileClass::Ram,
+        t if t.starts_with("DSP_") => TileClass::Dsp,
+        t if t.contains("IOB") || t.contains("IOI") => TileClass::Io,
+        t if t.starts_with("CMT_") || t.starts_with("CLK_") || t.starts_with("HCLK_CMT") => TileClass::Clock,
+        _ => return None,
+    })
+}
+
+/// 7-series die from the X-Ray tile grid (row 0 at the top).
+pub fn xilinx_die(dev: &helion_xilinx7::device::Device, part: &str) -> DieGrid {
+    let (mut cols, mut rows) = (0u32, 0u32);
+    let mut tiles = Vec::new();
+    for i in 0..dev.tile_count() {
+        let Some(t) = dev.tile(i) else { continue };
+        cols = cols.max(t.grid_x as u32 + 1);
+        rows = rows.max(t.grid_y as u32 + 1);
+        if let Some(class) = dev.tile_type_name(i).and_then(xilinx_tile_class) {
+            tiles.push(DieTile { x: t.grid_x as u32, y: t.grid_y as u32, class });
+        }
+    }
+    DieGrid { family: Family::Xilinx7, part: part.to_string(), cols, rows, row0_top: true, tiles }
+}
+
+/// Where the 7-series flow placed each primitive, in [`xilinx_die`]
+/// coordinates (the tile holding its site). Sites the device does not know
+/// are left out.
+pub fn xilinx_placement(routed: &helion_xilinx7::backend::Routed7, dev: &helion_xilinx7::device::Device) -> Vec<PlacedPrim> {
+    let p = &routed.placed;
+    let cells = p.luts.iter().map(|c| (&c.name, &c.site, TileClass::Logic))
+        .chain(p.ffs.iter().map(|c| (&c.name, &c.site, TileClass::Logic)))
+        .chain(p.carries.iter().map(|c| (&c.name, &c.site, TileClass::Logic)))
+        .chain(p.brams.iter().map(|c| (&c.name, &c.site, TileClass::Ram)))
+        .chain(p.dsps.iter().map(|c| (&c.name, &c.site, TileClass::Dsp)))
+        .chain(p.iobs.iter().map(|c| (&c.name, &c.site, TileClass::Io)))
+        .chain(p.bufgs.iter().map(|c| (&c.name, &c.site, TileClass::Clock)))
+        .chain(p.cmts.iter().map(|c| (&c.name, &c.site, TileClass::Clock)));
+    cells
+        .filter_map(|(name, site, class)| {
+            let t = dev.tile(dev.site_by_name(site)?.0)?;
+            Some(PlacedPrim { name: name.clone(), x: t.grid_x as u32, y: t.grid_y as u32, class })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
