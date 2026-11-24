@@ -78,7 +78,8 @@ is cited next to its value in the `.sv` and `.xdc` headers.
   version held the bit for 5 us: up to 5 us of contention on every byte
   ending in 1). A NACK cannot be detected: there is no ACK-error LED and no
   PLL-lock read-back.
-- Not run on the board (no board access for this work).
+- Board run (2026-11-24): see "On the board" below. Neither picture nor sound
+  has been seen or heard yet.
 
 ## Checks
 
@@ -104,3 +105,18 @@ Results (2026-11-23, Verilator 5.052, prebuilt zedbit/hnf from fm/zedboard-rung5
 | svcheck, 200k cycles, --regs | PASS, 4,800,000 output samples equal | PASS, 2,000,000 output samples equal |
 | zedbit at 100 MHz | 403 LUTs, 100 flops, 37 CARRY4, slack +3.242 ns | 251 LUTs, 97 flops, 13 CARRY4, slack +5.275 ns |
 | x7v verify --rtl --no-reset | PASS, 2,500,000 cycles (whole init), 0 mismatches, 0 unexplained bits | PASS, 3,800,000 cycles (whole init), 0 mismatches, 0 unexplained bits |
+
+## On the board (2026-11-24)
+
+These bitstreams were built at f29a8590 with the prebuilt zedbit (timed, no
+`--ignore-timing`) and loaded over JTAG with `openFPGALoader -b zedboard`.
+
+| Design | Bitstream md5 | Slack | Seen on the board | Result |
+|---|---|---|---|---|
+| `zedboard_hdmi` | f8d121e8c0e866bb2cd8751a000e419e | +3.242 ns | LD0 on (ROM sent), LD1 blinks about once a second (frame counter runs) | PARTIAL: the only HDMI sink was a broken TV, so the bars were not seen |
+| `zedboard_audio` | f030568988ce6a4711dbb5af06534ddf | +5.275 ns | LD0 on (ROM sent, after the 20 ms PLL wait), LD1 blinks fast (LRCLK-derived) | PARTIAL: nothing was plugged into HPH OUT or LINE OUT |
+
+LD0 shows only that the I2C ROM was sent. With push-pull SDA and no ACK
+read-back (see Limits), a wrong address or register value looks the same on the
+LEDs. A pass needs the colour bars on a monitor (or a USB HDMI capture device) and
+the 999 Hz tone on headphones.
