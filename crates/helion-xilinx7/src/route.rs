@@ -236,19 +236,25 @@ thread_local! {
 
 /// PathFinder search box margin for a net that has been on an overused node
 /// in `fails` iterations: the first pass's 8 grid tiles, doubled every second
-/// failure, the whole device (0) from the `open`th (8; `HELION_ROUTE_PF_OPEN`
-/// lowers it so a board design exercises the whole-device search). A fixed box kept nets
+/// failure up to `cap` (16; `HELION_ROUTE_PF_CAP`), the whole device (0) from
+/// the `open`th (24; `HELION_ROUTE_PF_OPEN` lowers it so a board design
+/// exercises the whole-device search). A fixed box kept nets
 /// whose only free detour lies outside it sharing at any price (G77: Ibex
 /// overuse sat at about 3,700 wires until a global whole-device switch at
 /// iteration 13, then fell to 243); opening it for every net at once cost
 /// 17x per search, so only the nets that keep failing pay for it (VPR's
-/// conflicted-mode doubling, nextpnr router2's growth on failure).
-fn pf_margin(fails: u32, open: u32) -> i32 {
+/// conflicted-mode doubling, nextpnr router2's growth on failure). Growth is
+/// bounded because a congested search floods its box: on the 3000-net bench a
+/// search expanded 7.7k wires at margin 8, 40k at 16, 215k at 32 and 2.1M over
+/// the whole device. Capping at 16 and opening at 24 instead of 8 cut its
+/// expansions 31% for 20 iterations instead of 18; opening later still frees
+/// a net whose only detour lies far outside its box.
+fn pf_margin(fails: u32, open: u32, cap: i32) -> i32 {
     if fails >= open {
         0
     } else {
-        // Capped: 8 << 12 tiles is past any device, and an open from the environment can reach 100 fails.
-        8 << (fails / 2).min(12)
+        // Shift capped: 8 << 12 tiles is past any device, and an open from the environment can reach 100 fails.
+        (8 << (fails / 2).min(12)).min(cap.max(8))
     }
 }
 
@@ -1110,7 +1116,8 @@ fn pathfinder(
     let mut last_it = 0;
     // Iterations each net has been on an overused node: its box grows with it.
     let mut fails: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
-    let open = std::env::var("HELION_ROUTE_PF_OPEN").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let open = std::env::var("HELION_ROUTE_PF_OPEN").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
+    let cap = std::env::var("HELION_ROUTE_PF_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
     for it in 1..=MAX_ITERATIONS {
         last_it = it;
         for (n, p) in &pf {
@@ -1126,7 +1133,7 @@ fn pathfinder(
             let drv = eps.iter().find(|e| e.is_driver).ok_or_else(|| format!("route: PathFinder: net `{net}` has no driver"))?;
             let loads: Vec<&Endpoint> = eps.iter().filter(|e| !e.is_driver).collect();
             let mut delays = Vec::new();
-            PF_MARGIN.with(|m| m.set(Some(pf_margin(fails.get(&net).copied().unwrap_or(0), open))));
+            PF_MARGIN.with(|m| m.set(Some(pf_margin(fails.get(&net).copied().unwrap_or(0), open, cap))));
             let r = route_net(&net, drv, &loads, clock_spine_nets, device, claimed, &mut delays, &[]);
             PF_MARGIN.with(|m| m.set(None));
             let p = match r? {
@@ -2310,13 +2317,17 @@ mod tests {
 
     #[test]
     fn pf_margin_doubles_then_opens_the_device() {
-        let m: Vec<i32> = (0..10).map(|f| pf_margin(f, 8)).collect();
+        let m: Vec<i32> = (0..10).map(|f| pf_margin(f, 8, i32::MAX)).collect();
         assert_eq!(m, vec![8, 8, 16, 16, 32, 32, 64, 64, 0, 0]);
-        assert_eq!(pf_margin(0, 1), 8);
-        assert_eq!(pf_margin(1, 1), 0);
+        // The defaults: the box stops at 16 tiles until the 24th failure.
+        let m: Vec<i32> = (0..26).map(|f| pf_margin(f, 24, 16)).collect();
+        assert_eq!(m, [vec![8, 8], vec![16; 22], vec![0, 0]].concat());
+        assert_eq!(pf_margin(0, 1, 16), 8);
+        assert_eq!(pf_margin(1, 1, 16), 0);
+        assert_eq!(pf_margin(9, 99, 0), 8, "a cap below the first box keeps the first box");
         // A large HELION_ROUTE_PF_OPEN: the box stays a positive margin.
-        assert_eq!(pf_margin(99, 1000), 8 << 12);
-        assert!((0..100).all(|f| pf_margin(f, 1000) >= 8));
+        assert_eq!(pf_margin(99, 1000, i32::MAX), 8 << 12);
+        assert!((0..100).all(|f| pf_margin(f, 1000, i32::MAX) >= 8));
     }
 
     /// G77: every PathFinder search is exact (not negotiating, no detour
@@ -2326,7 +2337,7 @@ mod tests {
     #[test]
     fn pathfinder_searches_are_exact_and_end_on_the_whole_device() {
         for f in 0..10 {
-            let t = search_tries(Some(pf_margin(f, 8)));
+            let t = search_tries(Some(pf_margin(f, 8, 16)));
             assert!(t.iter().all(|&(neg, _, cap)| !neg && !cap), "fails {f}: {t:?}");
             assert_eq!(t.last(), Some(&(false, 0, false)), "fails {f}");
         }
@@ -2375,11 +2386,12 @@ mod tests {
         assert!(its <= 8, "took {its} iterations");
         assert_eq!(run(12), (its, pips), "same input, same route");
         // A band 70 rows above and below: only the whole device (from the
-        // eighth failure) holds the detour, which is long, so a search capped
-        // at twice the direct estimate finds none, and the negotiating search
-        // (220 ps per tile) kept crossing the band. The exact search detours.
+        // 24th failure; the box stops at 16 tiles) holds the detour, which is
+        // long, so a search capped at twice the direct estimate finds none, and
+        // the negotiating search (220 ps per tile) kept crossing the band. The
+        // exact search detours.
         let (its, pips) = run(70);
-        assert!(its <= 9 && pips.len() <= 30, "took {its} iterations, {} pips", pips.len());
+        assert!(its <= 25 && pips.len() <= 30, "took {its} iterations, {} pips", pips.len());
     }
 
     /// G77: a PathFinder net whose first box is cut by a clock net's wires
