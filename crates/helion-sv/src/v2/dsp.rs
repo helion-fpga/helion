@@ -391,7 +391,8 @@ fn takes_dsp(flat: &Flat, n: N) -> bool {
 /// `muls` with each after every other one its operands read, through logic
 /// and registers: a slice once built narrows what its readers see to
 /// `sext(P)`, so a product is judged only after those it reads, whatever
-/// the source order. Node order breaks ties, and cycles.
+/// the source order. Node order breaks ties, and picks among a cycle's
+/// products once only cycles are left.
 fn upstream_first(flat: &Flat, muls: &[N]) -> Vec<N> {
     let set: HashSet<N> = muls.iter().copied().collect();
     let ups: Vec<HashSet<N>> = muls
@@ -425,7 +426,25 @@ fn upstream_first(flat: &Flat, muls: &[N]) -> Vec<N> {
     let (mut left, mut out): (Vec<usize>, Vec<N>) = ((0..muls.len()).collect(), Vec::new());
     let mut done: HashSet<N> = HashSet::new();
     while !left.is_empty() {
-        let i = left.iter().position(|&k| ups[k].is_subset(&done)).unwrap_or(0);
+        // Nothing ready means a cycle of products: take one whose unbuilt
+        // inputs all sit on a cycle with it, so nothing outside feeds it.
+        let feeds = |u: N, k: usize| {
+            let (mut st, mut seen) = (vec![u], HashSet::new());
+            while let Some(v) = st.pop() {
+                if v == muls[k] {
+                    return true;
+                }
+                if seen.insert(v) {
+                    st.extend(ups[muls.iter().position(|&x| x == v).unwrap()].iter().filter(|w| !done.contains(*w)));
+                }
+            }
+            false
+        };
+        let i = left
+            .iter()
+            .position(|&k| ups[k].is_subset(&done))
+            .or_else(|| left.iter().position(|&k| ups[k].iter().all(|&u| done.contains(&u) || feeds(u, k))))
+            .unwrap_or(0);
         let k = left.remove(i);
         done.insert(muls[k]);
         out.push(muls[k]);

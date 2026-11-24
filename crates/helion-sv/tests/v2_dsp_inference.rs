@@ -569,3 +569,40 @@ fn a_product_whose_operand_an_earlier_slice_narrows_maps_the_same_in_any_order()
         assert_eq!(shape, &all[0].1, "{body} against {}", all[0].0);
     }
 }
+
+#[test]
+fn a_product_reading_a_product_cycle_maps_the_same_in_any_order() {
+    // x1 and x2 read each other, so neither is upstream of the other; z
+    // reads x1, narrowed to 24 bits once x1 is a slice, and must not be
+    // judged (and split) before it, whichever statement comes first.
+    let head = "module t(input logic clk, input logic sel, input logic signed [11:0] a, b, input logic signed [17:0] c,
+        output logic signed [47:0] z, output logic signed [29:0] o1, o2);
+        logic signed [29:0] x1, x2; assign o1 = x1; assign o2 = x2;";
+    let st = [
+        "always_ff @(posedge clk) x1 <= $signed(sel ? b : x2[11:0]) * a;",
+        "always_ff @(posedge clk) x2 <= $signed(x1[11:0]) * b;",
+        "always_ff @(posedge clk) z <= x1 * c;",
+    ];
+    let all = by_order(head, &st);
+    assert_eq!(all.len(), 6);
+    for (body, shape) in &all {
+        assert_eq!((shape.0.len(), shape.1), (3, 0), "{body}");
+        assert_eq!(shape, &all[0].1, "{body} against {}", all[0].0);
+    }
+    // z on a cycle of its own with w: the x1/x2 cycle that feeds it goes first.
+    let head = "module t(input logic clk, input logic sel, input logic signed [11:0] a, b, input logic signed [17:0] c,
+        output logic signed [47:0] z, output logic signed [29:0] o1, o2, o3);
+        logic signed [29:0] x1, x2, w; assign o1 = x1; assign o2 = x2; assign o3 = w;";
+    let st = [
+        "always_ff @(posedge clk) x1 <= $signed(sel ? b : x2[11:0]) * a;",
+        "always_ff @(posedge clk) x2 <= $signed(x1[11:0]) * b;",
+        "always_ff @(posedge clk) z <= x1 * $signed(w[17:0]);",
+        "always_ff @(posedge clk) w <= $signed(z[11:0]) * a;",
+    ];
+    let all = by_order(head, &st);
+    assert_eq!(all.len(), 24);
+    for (body, shape) in &all {
+        assert_eq!((shape.0.len(), shape.1), (4, 0), "{body}");
+        assert_eq!(shape, &all[0].1, "{body} against {}", all[0].0);
+    }
+}
