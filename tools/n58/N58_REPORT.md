@@ -1,8 +1,8 @@
 # N58 router-fix lane report (fm/ultra-bitgen-n58), Nov 24, 2026
 
 Lane branch `fm/ultra-bitgen-n58` (impl commit `68f96af9` on stadin base
-`be1a3178`; merge `6978a724`; report commit stated below in the header
-commit). Impl branch `fm/ultra-bitgen-n58-impl` at `68f96af9` on origin.
+`be1a3178`; merge `6978a724`; report commit `61b7a29d`). Impl branch
+`fm/ultra-bitgen-n58-impl` at `68f96af9` on origin.
 Worktree `~/workspace/helion-ultra-bitgen-n58`, clean. Report
 `~/workspace/ultra-bitgen-crew/N58_REPORT.md` (this file); copy committed
 at `tools/n58/N58_REPORT.md` on the lane branch, byte-identical.
