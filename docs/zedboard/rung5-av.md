@@ -10,8 +10,11 @@ Two PL-only designs, both clocked by the 100 MHz GCLK, no Zynq PS:
 ## How they work
 
 Each design has the same small write-only I2C master (a ROM of bytes, 50 kHz
-SCL, every phase at least 5 us so all standard-mode limits of NXP UM10204
-Rev. 7.0 Table 11 hold) and a free-running stream:
+SCL, 10 us low and 10 us high; while SCL is low a data bit changes 2.5 us
+after the fall and the ACK level 50 ns after the 8th fall, inside the
+standard-mode tVD;DAT / tVD;ACK maximum of 3.45 us; the testbenches check
+these and the other NXP UM10204 Rev. 7.0 Table 11 limits listed in their
+headers) and a free-running stream:
 
 - HDMI: 16-bit YCbCr 4:2:2 (Y on HD-D[7:0], Cb/Cr alternating on HD-D[15:8],
   Cb first), separate HSYNC/VSYNC/DE, 25 MHz HD-CLK made in fabric (100 MHz
@@ -58,6 +61,7 @@ is cited next to its value in the `.sv` and `.xdc` headers.
 | ADAU1761 register map and bit fields | see `zedboard_audio.sv` | Linux adau17x1/adau1761 | TODO-UNVERIFIED against the datasheet |
 | PLL byte encoding | `R << 3 \| X << 1 \| frac` | Linux `adau_calc_pll_cfg`; reproduces ems-kl's board-proven bytes | confirmed by cross-check |
 | R0 INFREQ = 11 with PLL source | 0x0E / 0x0F | ems-kl (Linux leaves INFREQ = 00) | TODO-UNVERIFIED |
+| Dejitter re-init after power-up (codec is I2S slave) | 0x4036 = 0x00 then 0x03, last two writes | Linux adau1761.c `adau1761_dejitter_fixup` (ems-kl skips it, codec master there) | TODO-UNVERIFIED against the datasheet (R67) |
 | PLL lock time, PLL input/output range, R = 3 allowed | 20 ms wait; 12.5 MHz in, 47.06 MHz out | Linux limits (input <= 13.5 MHz, R 2..8) | TODO-UNVERIFIED |
 | Codec at fs = 45.956 kHz | core 47.06 MHz | between the 44.1 and 48 kHz cores | TODO-UNVERIFIED |
 | No clock stretching by either chip | push-pull SCL | none | TODO-UNVERIFIED |
@@ -89,14 +93,14 @@ zedbit examples/zedboard_hdmi.sv examples/zedboard_hdmi.xdc zedboard_hdmi.bit ze
    --top zedboard_hdmi --xdc ../../examples/zedboard_hdmi.xdc --cycles 2500000 --no-reset)
 ```
 
-and the same for `zedboard_audio` with `--cycles 3600000`.
+and the same for `zedboard_audio` with `--cycles 3800000`.
 
 Results (2026-11-23, Verilator 5.052, prebuilt zedbit/hnf from fm/zedboard-rung5):
 
 | Check | zedboard_hdmi | zedboard_audio |
 |---|---|---|
-| Testbench | PASS: 41 I2C writes, 123 ACK hand-overs, 34 frames checked, last STOP at 23.672 ms (600 ms simulated) | PASS: 18 I2C writes, 77 ACK hand-overs, PLL wait 20.010 ms, 18390 frames, 799 tone half periods, last STOP at 34.586 ms (400 ms simulated) |
-| Testbench catches faults | wrong ROM value (0x16=0x30), wrong bar luma, HSYNC one clock long, V_FRONT 11 or 30 (porch check), BT.601 green bar, ACK low only at the next quarter (old timing, 33 bytes) or 20 ns after SCL falls (hold check), SDA changed on the same edge as SCL: each fails | wrong PLL byte, BCLK divider 16, tone half period 22, ACK low only at the next quarter (old timing, 22 bytes): each fails |
+| Testbench | PASS: 41 I2C writes, 123 ACK hand-overs, 34 frames checked, last STOP at 23.672 ms (600 ms simulated) | PASS: 20 I2C writes, 85 ACK hand-overs, PLL wait 20.010 ms, 18390 frames, 799 tone half periods, last STOP at 36.096 ms (400 ms simulated) |
+| Testbench catches faults | wrong ROM value (0x16=0x30), wrong bar luma, HSYNC one clock long, V_FRONT 11 or 30 (porch check), BT.601 green bar, ACK low only at the next quarter (old timing, 33 bytes) or 20 ns after SCL falls (hold check), SDA changed on the same edge as SCL, data bit 3.5 us or 5 us after SCL falls (tVD;DAT check): each fails | wrong PLL byte, BCLK divider 16, tone half period 22, ACK low only at the next quarter (old timing, 22 bytes), data bit 5 us after SCL falls (tVD;DAT check), dejitter writes missing or second one 0x00: each fails |
 | svcheck, 200k cycles, --regs | PASS, 4,800,000 output samples equal | PASS, 2,000,000 output samples equal |
-| zedbit at 100 MHz | 402 LUTs, 100 flops, 37 CARRY4, slack +3.674 ns | 252 LUTs, 97 flops, 13 CARRY4, slack +5.103 ns |
-| x7v verify --rtl --no-reset | PASS, 2,500,000 cycles (whole init), 0 mismatches, 0 unexplained bits | PASS, 3,600,000 cycles (whole init), 0 mismatches, 0 unexplained bits |
+| zedbit at 100 MHz | 403 LUTs, 100 flops, 37 CARRY4, slack +3.242 ns | 251 LUTs, 97 flops, 13 CARRY4, slack +5.275 ns |
+| x7v verify --rtl --no-reset | PASS, 2,500,000 cycles (whole init), 0 mismatches, 0 unexplained bits | PASS, 3,800,000 cycles (whole init), 0 mismatches, 0 unexplained bits |

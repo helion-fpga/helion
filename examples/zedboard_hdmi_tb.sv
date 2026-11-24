@@ -11,6 +11,8 @@
 //     drives the ACK level (low) by 100 ns after SCL falls on the 8th bit
 //     of each byte: a slave may start its ACK 0 ns after that fall
 //     (UM10204 tHD;DAT min), so a 1 held longer fights it;
+//   - every SDA change while SCL is low comes within 3.45 us of the SCL
+//     fall (UM10204 tVD;DAT and tVD;ACK max);
 //   - standard-mode timing (NXP UM10204 Rev. 7.0, Table 11): START hold >= 4.0 us,
 //     SCL low >= 4.7 us, SCL high >= 4.0 us, data setup >= 250 ns,
 //     STOP setup >= 4.0 us, bus free between STOP and START >= 4.7 us;
@@ -114,6 +116,10 @@ module zedboard_hdmi_tb;
                 in_txn = 0; t_stop = $realtime; t_last_stop = $realtime;
             end
         end
+        // tVD;DAT / tVD;ACK max (UM10204 Table 11): a change while SCL is low
+        // must come within 3.45 us of the SCL fall.
+        if (hd_scl === 1'b0 && in_txn && $realtime - t_scl_fall > 3450)
+            fail("SDA changed > 3.45 us after SCL fell (tVD;DAT)");
         t_sda_chg = $realtime;
     end
 

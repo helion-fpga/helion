@@ -54,6 +54,12 @@
 //    0x40F2 = 0x01  serial input route: serial port to DACs (DSP bypass)
 //    0x40F9 = 0x7F  clock enable 0: all seven blocks
 //    0x40FA = 0x03  clock enable 1: digital clock 0 and 1
+//    0x4036 = 0x00, then 0x4036 = 0x03  dejitter: Linux adau1761.c
+//                   adau1761_dejitter_fixup re-initialises it this way
+//                   after power changes when the codec is the I2S slave
+//                   (0x03 is also the driver's reset default); ems-kl skips
+//                   it because there the codec is master. Effect not
+//                   checked against the datasheet (R67): TODO-UNVERIFIED.
 // The ADAU1761 datasheet itself could not be downloaded here (the
 // analog.com host refused the connection); INFREQ's meaning with the PLL,
 // the PLL lock time, and the PLL input/output ranges are therefore
@@ -97,7 +103,7 @@ module zedboard_audio (
     // transaction, byte}.
     // ------------------------------------------------------------------
     localparam int unsigned Q        = 500;       // quarter SCL period: 50 kHz
-    localparam int unsigned N_ENT    = 77;        // 18 writes, 77 bytes
+    localparam int unsigned N_ENT    = 85;        // 20 writes, 85 bytes
     localparam int unsigned T_INIT   = 10_000;    // 100 us after configuration
     localparam int unsigned T_PLL    = 2_000_000; // 20 ms PLL lock wait
 
@@ -203,6 +209,14 @@ module zedboard_audio (
             8'd74: ent = 10'h040;
             8'd75: ent = 10'h0fa;
             8'd76: ent = 10'h103;
+            8'd77: ent = 10'h076;
+            8'd78: ent = 10'h040;
+            8'd79: ent = 10'h036;
+            8'd80: ent = 10'h100;
+            8'd81: ent = 10'h076;
+            8'd82: ent = 10'h040;
+            8'd83: ent = 10'h036;
+            8'd84: ent = 10'h103;
             default: ent = 10'h000;
         endcase
     end
@@ -242,20 +256,26 @@ module zedboard_audio (
             end
 
             I_BIT: if (!qtick) begin
-                // A slave may pull SDA low for its ACK anywhere from 0 ns
-                // (tHD;DAT min) to 3.45 us (tVD;ACK max) after SCL falls on
-                // the 8th bit (NXP UM10204 Rev. 7.0, Table 11), so drive the
-                // ACK level 50 ns after that fall rather than at the next
-                // quarter (5 us later), where a 1 LSB would fight the slave.
-                // The 50 ns lets SCL get below 0.3 VDD first (note [2]).
-                if (bitn == 4'd8 && q == 2'd0 && qcnt == 9'd4)
+                // In q0 SCL is low. NXP UM10204 Rev. 7.0, Table 11: SDA must
+                // be valid within 3.45 us of the SCL fall (tVD;DAT, tVD;ACK
+                // max) and may not move before SCL is below 0.3 VDD (note
+                // [2]). A slave may start its ACK 0 ns after the 8th fall
+                // (tHD;DAT min), so the ACK level goes out 50 ns after it.
+                // A data bit goes out 2.5 us after the fall: under 3.45 us,
+                // late enough for the slave to release the ACK it may hold
+                // after the previous byte, and 7.5 us before SCL rises.
+                if (q == 2'd0 && bitn == 4'd8 && qcnt == 9'd4)
                     ac_sda <= 1'b0;
+                if (q == 2'd0 && bitn != 4'd8 && qcnt == 9'd249) begin
+                    ac_sda <= sh[8];
+                    sh <= {sh[7:0], 1'b0};
+                end
             end else begin
-                // q0: SDA takes the bit while SCL is low; q1, q2: SCL high
-                // (the slave samples); q3: SCL low again.
+                // q0: SCL low (SDA set above); q1, q2: SCL high (the slave
+                // samples); q3: SCL low again.
                 q <= q + 2'd1;
                 case (q)
-                    2'd0: begin ac_sda <= sh[8]; sh <= {sh[7:0], 1'b0}; end
+                    2'd0: begin end
                     2'd1: ac_scl <= 1'b1;
                     2'd2: ac_scl <= 1'b1;
                     default: begin

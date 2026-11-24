@@ -2,7 +2,7 @@
 //
 // I2C side: an ADAU1761 slave model samples SDA on each SCL rising edge,
 // frames bytes between START and STOP, and checks
-//   - the 18 transactions match the expected byte list below exactly
+//   - the 20 transactions match the expected byte list below exactly
 //     (address byte 0x76, register address MSB 0x40, LSB, data);
 //   - the ACK slot after every byte is low (the master drives it low);
 //   - SDA never changes while SCL is high, except for START and STOP;
@@ -10,6 +10,8 @@
 //     drives the ACK level (low) by 100 ns after SCL falls on the 8th bit
 //     of each byte: a slave may start its ACK 0 ns after that fall
 //     (UM10204 tHD;DAT min), so a 1 held longer fights it;
+//   - every SDA change while SCL is low comes within 3.45 us of the SCL
+//     fall (UM10204 tVD;DAT and tVD;ACK max);
 //   - standard-mode timing (NXP UM10204 Rev. 7.0, Table 11): START hold >= 4.0 us,
 //     SCL low >= 4.7 us, SCL high >= 4.0 us, data setup >= 250 ns,
 //     STOP setup >= 4.0 us, bus free between STOP and START >= 4.7 us;
@@ -47,9 +49,9 @@ module zedboard_audio_tb;
 
     // Expected transactions after the 0x76 0x40 prefix, flattened; txn_len
     // gives the number of bytes (register LSB + data) in each one.
-    localparam int N_TXN = 18;
-    localparam int N_EXP = 41;
-    int txn_len [0:N_TXN-1] = '{2, 7, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2};
+    localparam int N_TXN = 20;
+    localparam int N_EXP = 45;
+    int txn_len [0:N_TXN-1] = '{2, 7, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2};
     logic [7:0] exp_b [0:N_EXP-1] = '{
         8'h00, 8'h0e,                                  // R0 clock control, core off, PLL
         8'h02, 8'h00, 8'h11, 8'h00, 8'h0d, 8'h19, 8'h01, // R1 PLL M=17 N=13 R=3 X=1 frac, enable
@@ -66,7 +68,8 @@ module zedboard_audio_tb;
         8'h2a, 8'h03,                                  // DAC enable
         8'hf2, 8'h01,                                  // serial input route
         8'hf9, 8'h7f,                                  // clock enable 0
-        8'hfa, 8'h03                                   // clock enable 1
+        8'hfa, 8'h03,                                  // clock enable 1
+        8'h36, 8'h00, 8'h36, 8'h03                     // dejitter re-init (slave)
     };
 
     integer errors = 0;
@@ -117,6 +120,10 @@ module zedboard_audio_tb;
                 in_txn = 0; t_stop = $realtime;
             end
         end
+        // tVD;DAT / tVD;ACK max (UM10204 Table 11): a change while SCL is low
+        // must come within 3.45 us of the SCL fall.
+        if (ac_scl === 1'b0 && in_txn && $realtime - t_scl_fall > 3450)
+            fail("SDA changed > 3.45 us after SCL fell (tVD;DAT)");
         t_sda_chg = $realtime;
     end
 

@@ -286,20 +286,26 @@ module zedboard_hdmi (
             end
 
             I_BIT: if (!qtick) begin
-                // A slave may pull SDA low for its ACK anywhere from 0 ns
-                // (tHD;DAT min) to 3.45 us (tVD;ACK max) after SCL falls on
-                // the 8th bit (NXP UM10204 Rev. 7.0, Table 11), so drive the
-                // ACK level 50 ns after that fall rather than at the next
-                // quarter (5 us later), where a 1 LSB would fight the slave.
-                // The 50 ns lets SCL get below 0.3 VDD first (note [2]).
-                if (bitn == 4'd8 && q == 2'd0 && qcnt == 9'd4)
+                // In q0 SCL is low. NXP UM10204 Rev. 7.0, Table 11: SDA must
+                // be valid within 3.45 us of the SCL fall (tVD;DAT, tVD;ACK
+                // max) and may not move before SCL is below 0.3 VDD (note
+                // [2]). A slave may start its ACK 0 ns after the 8th fall
+                // (tHD;DAT min), so the ACK level goes out 50 ns after it.
+                // A data bit goes out 2.5 us after the fall: under 3.45 us,
+                // late enough for the slave to release the ACK it may hold
+                // after the previous byte, and 7.5 us before SCL rises.
+                if (q == 2'd0 && bitn == 4'd8 && qcnt == 9'd4)
                     hd_sda <= 1'b0;
+                if (q == 2'd0 && bitn != 4'd8 && qcnt == 9'd249) begin
+                    hd_sda <= sh[8];
+                    sh <= {sh[7:0], 1'b0};
+                end
             end else begin
-                // q0: SDA takes the bit while SCL is low; q1, q2: SCL high
-                // (the slave samples); q3: SCL low again.
+                // q0: SCL low (SDA set above); q1, q2: SCL high (the slave
+                // samples); q3: SCL low again.
                 q <= q + 2'd1;
                 case (q)
-                    2'd0: begin hd_sda <= sh[8]; sh <= {sh[7:0], 1'b0}; end
+                    2'd0: begin end
                     2'd1: hd_scl <= 1'b1;
                     2'd2: hd_scl <= 1'b1;
                     default: begin
