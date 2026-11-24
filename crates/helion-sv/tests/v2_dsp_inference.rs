@@ -527,3 +527,45 @@ fn a_product_that_is_split_does_not_keep_its_registers_from_other_products() {
     }
     assert!(seen.iter().all(|&f| f == seen[0]), "flops by order: {seen:?}");
 }
+
+/// The DSPs with their registers, flops and LUTs of `head` + `body`, for every order of `st`.
+fn by_order(head: &str, st: &[&str]) -> Vec<(String, (Vec<(String, String)>, usize, usize))> {
+    orders(st)
+        .into_iter()
+        .map(|body| {
+            let d = v2(&format!("{head} {body} endmodule"));
+            let shape = (regs_of(&d), flops(&d), count(&d, false));
+            (body, shape)
+        })
+        .collect()
+}
+
+#[test]
+fn a_product_whose_operand_an_earlier_slice_narrows_maps_the_same_in_any_order() {
+    // m1 is 30 bits but only its low 24 are significant once a * b is a
+    // slice: r <= m1 * c then fits one (24 x 18), with r as its M and pr
+    // its P, whichever statement comes first.
+    let head = "module t(input logic clk, input logic signed [11:0] a, b, input logic signed [17:0] c, d, output logic signed [41:0] q);
+        logic signed [29:0] m1; logic signed [47:0] r, pr;";
+    let st = [
+        "always_ff @(posedge clk) m1 <= a * b;",
+        "always_ff @(posedge clk) r <= m1 * c;",
+        "always_ff @(posedge clk) pr <= r;",
+        "always_ff @(posedge clk) q <= $signed(pr[23:0]) * d;",
+    ];
+    let all = by_order(head, &st);
+    assert_eq!(all.len(), 24);
+    let want = [("m1", "0 0 0 1"), ("pr", "0 0 1 1"), ("q", "0 0 0 1")].map(|(n, r)| (n.to_string(), r.to_string()));
+    assert_eq!((all[0].1).0, want);
+    for (body, shape) in &all {
+        assert_eq!(shape, &all[0].1, "{body} against {}", all[0].0);
+    }
+    // The 2-hop chain of `a_register_two_hops_behind_...`, counted the same way.
+    let head = "module t(input logic clk, input logic signed [11:0] a, b, input logic signed [17:0] c, output logic signed [41:0] q);
+        logic signed [23:0] m, p1, p2;";
+    let st = ["always_ff @(posedge clk) m <= a * b;", "always_ff @(posedge clk) p1 <= m;", "always_ff @(posedge clk) p2 <= p1;", "always_ff @(posedge clk) q <= p2 * c;"];
+    let all = by_order(head, &st);
+    for (body, shape) in &all {
+        assert_eq!(shape, &all[0].1, "{body} against {}", all[0].0);
+    }
+}

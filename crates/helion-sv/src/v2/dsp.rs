@@ -50,7 +50,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// DSP48E1 sites on the part: 220 on the xc7z020 (ZedBoard). Products past
 /// it, after the instantiated DSP48E1 cells, stay in the fabric.
-// shortcut: one part's count, first come first served in node order; set it per part when another one builds.
+// shortcut: one part's count, first come first served in build order (upstream first, then node order); set it per part when another one builds.
 pub static DSP_SITES: AtomicUsize = AtomicUsize::new(220);
 
 /// A register's next value as `rst ? 0 : en ? core : hold`.
@@ -388,6 +388,51 @@ fn takes_dsp(flat: &Flat, n: N) -> bool {
     !a.cheap(flat) && !b.cheap(flat) && ((a.e <= 25 && b.e <= 18) || (b.e <= 25 && a.e <= 18))
 }
 
+/// `muls` with each after every other one its operands read, through logic
+/// and registers: a slice once built narrows what its readers see to
+/// `sext(P)`, so a product is judged only after those it reads, whatever
+/// the source order. Node order breaks ties, and cycles.
+fn upstream_first(flat: &Flat, muls: &[N]) -> Vec<N> {
+    let set: HashSet<N> = muls.iter().copied().collect();
+    let ups: Vec<HashSet<N>> = muls
+        .iter()
+        .map(|&m| {
+            let (mut ups, mut seen, mut stack) = (HashSet::new(), HashSet::new(), flat.dag.kids(m));
+            while let Some(n) = stack.pop() {
+                if !seen.insert(n) {
+                    continue;
+                }
+                if set.contains(&n) {
+                    ups.insert(n);
+                    continue;
+                }
+                stack.extend(flat.dag.kids(n));
+                if let Op::Read(s) = *flat.dag.op(n) {
+                    for d in &flat.sigs[s as usize].drv {
+                        match *d {
+                            Drv::Comb(c, _) => stack.push(c),
+                            Drv::Reg(r) => stack.push(flat.regs[r as usize].d),
+                            Drv::Latch(l) => stack.push(flat.latches[l as usize].d),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            ups.remove(&m);
+            ups
+        })
+        .collect();
+    let (mut left, mut out): (Vec<usize>, Vec<N>) = ((0..muls.len()).collect(), Vec::new());
+    let mut done: HashSet<N> = HashSet::new();
+    while !left.is_empty() {
+        let i = left.iter().position(|&k| ups[k].is_subset(&done)).unwrap_or(0);
+        let k = left.remove(i);
+        done.insert(muls[k]);
+        out.push(muls[k]);
+    }
+    out
+}
+
 /// Infer DSP48E1 cells for every product that fits (see the module docs).
 pub fn infer(flat: &mut Flat) {
     let (mut refs, mut reads) = refs(flat);
@@ -395,6 +440,7 @@ pub fn infer(flat: &mut Flat) {
     if muls.is_empty() {
         return;
     }
+    muls = upstream_first(flat, &muls);
     // Registers that could be the slice's P or M register, by the node
     // their core reads (`p <= x` or `p <= p + x`).
     let mut cands: Vec<SliceReg> = Vec::new();
