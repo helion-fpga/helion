@@ -7,6 +7,10 @@
 //     order of the expected list below;
 //   - the ACK slot after every byte is low (the master drives it low);
 //   - SDA never changes while SCL is high, except for START and STOP;
+//   - SDA does not change within 40 ns after an SCL fall, and the master
+//     drives the ACK level (low) by 100 ns after SCL falls on the 8th bit
+//     of each byte: a slave may start its ACK 0 ns after that fall
+//     (UM10204 tHD;DAT min), so a 1 held longer fights it;
 //   - standard-mode timing (NXP UM10204 Rev. 7.0, Table 11): START hold >= 4.0 us,
 //     SCL low >= 4.7 us, SCL high >= 4.0 us, data setup >= 250 ns,
 //     STOP setup >= 4.0 us, bus free between STOP and START >= 4.7 us;
@@ -18,6 +22,9 @@
 //   - 800 clocks per line, HSYNC low for 96 clocks starting 16 clocks
 //     after the 640-clock DE run ends;
 //   - 525 lines per frame, VSYNC low for 2 lines, 480 DE lines per frame;
+//   - vertical porches: the first DE line starts 35 lines (sync 2 + back
+//     porch 33) after VSYNC falls, and VSYNC falls 10 lines (front porch)
+//     after the last DE line ends; lines are counted by HSYNC falls;
 //   - every active pixel carries {C, Y} of its colour bar with Cb on even
 //     and Cr on odd pixels; blanking carries 0x8010;
 //   - led[1] (heartbeat) toggles.
@@ -58,10 +65,11 @@ module zedboard_hdmi_tb;
         16'haf14
     };
 
-    // Bar colours {Cb, Cr, Y}, BT.601 limited range.
+    // Bar colours {Cb, Cr, Y}, BT.709 limited range (matches the BT.709
+    // CSC table the design loads; see the zedboard_hdmi.sv header).
     logic [23:0] bars [0:7] = '{
-        24'h8080eb, 24'h1092d2, 24'ha610aa, 24'h362291,
-        24'hcade6a, 24'h5af051, 24'hf06e29, 24'h808010
+        24'h8080eb, 24'h108adb, 24'h9a10bc, 24'h2a1aad,
+        24'hd6e64e, 24'h66f03f, 24'hf07620, 24'h808010
     };
 
     integer errors = 0;
@@ -117,6 +125,7 @@ module zedboard_hdmi_tb;
             sh = {sh[7:0], hd_sda};
             nbits = nbits + 1;
             if (nbits == 9) begin
+                n_bytes_all = n_bytes_all + 1;
                 if (sh[0] !== 1'b0) fail($sformatf("ACK slot high after byte %0d of txn %0d", nbytes, n_txn));
                 if (nbytes < 3) txb[nbytes] = sh[8:1];
                 nbytes = nbytes + 1;
@@ -131,6 +140,20 @@ module zedboard_hdmi_tb;
         if (in_txn && ($realtime - t_scl_rise) < 4000 && !(nbits == 0 && nbytes == 0))
             fail("SCL high < 4.0 us");
         t_scl_fall = $realtime;
+    end
+
+    // SDA hold after SCL falls, and the ACK hand-over after the 8th bit.
+    integer n_bytes_all = 0, n_ack_handover = 0;
+    realtime t_fall_chk;
+    always @(negedge hd_scl) if (in_txn) begin
+        t_fall_chk = $realtime;
+        #40;
+        if (t_sda_chg >= t_fall_chk) fail("SDA changed < 40 ns after SCL fell");
+        if (nbits == 8) begin
+            #60;
+            if (hd_sda !== 1'b0) fail($sformatf("SDA not low 100 ns after the 8th SCL fall of byte %0d, txn %0d", nbytes, n_txn));
+            else n_ack_handover = n_ack_handover + 1;
+        end
     end
 
     // ---------------- Video checker ----------------
@@ -148,6 +171,7 @@ module zedboard_hdmi_tb;
     logic prev_hs = 1, prev_vs = 1, prev_de = 0;
     integer synced = 0;         // set after the first HSYNC falling edge
     integer vsynced = 0;        // set after the first VSYNC falling edge
+    integer first_de = -1, last_de = -1; // lines_in_frame at DE line starts
 
     always @(posedge hd_clk) begin
         if (clk_n > 0 && ($realtime - t_clk_rise) != 40) fail($sformatf("HD-CLK period %0t", $realtime - t_clk_rise));
@@ -169,7 +193,11 @@ module zedboard_hdmi_tb;
         end
 
         // DE runs.
-        if (hd_de === 1'b1 && prev_de !== 1'b1) begin de_run = 1; line_had_de = 1; end
+        if (hd_de === 1'b1 && prev_de !== 1'b1) begin
+            de_run = 1; line_had_de = 1;
+            if (first_de < 0) first_de = lines_in_frame;
+            last_de = lines_in_frame;
+        end
         else if (hd_de === 1'b1) de_run = de_run + 1;
         if (hd_de !== 1'b1 && prev_de === 1'b1) begin
             if (de_run != 640) fail($sformatf("DE run %0d, want 640", de_run));
@@ -195,9 +223,16 @@ module zedboard_hdmi_tb;
             if (vsynced) begin
                 if (lines_in_frame != 525) fail($sformatf("frame has %0d lines, want 525", lines_in_frame));
                 if (de_lines != 480) fail($sformatf("frame has %0d DE lines, want 480", de_lines));
+                // VSYNC falls at a line start, before that line's HSYNC, so
+                // lines_in_frame counts the 2 sync lines and the back porch
+                // by the time the first DE line starts.
+                if (first_de != 35) fail($sformatf("first DE line %0d lines after VSYNC fall, want 35 (2 + 33)", first_de));
+                if (lines_in_frame - last_de - 1 != 10)
+                    fail($sformatf("front porch %0d lines, want 10", lines_in_frame - last_de - 1));
                 frames = frames + 1;
             end
             vsynced = 1; lines_in_frame = 0; de_lines = 0; vs_low_clks = 1;
+            first_de = -1; last_de = -1;
         end else if (hd_vsync === 1'b0) vs_low_clks = vs_low_clks + 1;
         if (hd_vsync === 1'b1 && prev_vs === 1'b0 && vsynced && vs_low_clks != 1600)
             fail($sformatf("VSYNC low %0d clocks, want 1600", vs_low_clks));
@@ -215,9 +250,11 @@ module zedboard_hdmi_tb;
         if (led[0] !== 1'b1) fail("led[0] (init done) not high");
         if (frames < 30) fail($sformatf("only %0d full frames checked", frames));
         if (led[1] === beat0) fail("heartbeat led[1] never toggled");
+        if (n_ack_handover != n_bytes_all || n_bytes_all == 0)
+            fail($sformatf("%0d ACK hand-overs checked for %0d bytes", n_ack_handover, n_bytes_all));
         if (errors == 0)
-            $display("PASS: hdmi %0d I2C writes, %0d frames checked, last STOP at %0.3f ms",
-                     n_txn, frames, t_last_stop / 1.0e6);
+            $display("PASS: hdmi %0d I2C writes, %0d ACK hand-overs, %0d frames checked, last STOP at %0.3f ms",
+                     n_txn, n_ack_handover, frames, t_last_stop / 1.0e6);
         else
             $display("FAIL: hdmi check, %0d errors", errors);
         $finish;

@@ -16,7 +16,13 @@ Rev. 7.0 Table 11 hold) and a free-running stream:
 - HDMI: 16-bit YCbCr 4:2:2 (Y on HD-D[7:0], Cb/Cr alternating on HD-D[15:8],
   Cb first), separate HSYNC/VSYNC/DE, 25 MHz HD-CLK made in fabric (100 MHz
   / 4). Data changes when HD-CLK falls; 20 ns setup and hold at each rising
-  edge. The ADV7511's CSC converts to RGB and it sends DVI.
+  edge. The ADV7511's CSC converts to RGB and it sends DVI. The bars are
+  BT.709 limited-range YCbCr, because the CSC table (Linux
+  `adv7511_csc_ycbcr_to_rgb`, the one ADI's driver loads) is a BT.709 matrix:
+  its Cr->R / Y ratio is 1.541 (BT.709 1.540, BT.601 1.371). The first version
+  sent BT.601 bars, which that table would show as e.g. red (255, 24, 0) and
+  green (0, 217, 0). The decode model (coefficients x 4 / 4096, offsets
+  x 4 / 16) is TODO-UNVERIFIED against the Programming Guide.
 - Audio: the PL is I2S master. MCLK 12.5 MHz (100/8), BCLK 2.941 MHz
   (100/34), LRCLK = fs = 45955.9 Hz (100 MHz / 2176). The codec PLL makes
   its 1024 x fs core clock from MCLK with R = 3, N = 13, M = 17 (exact:
@@ -61,9 +67,13 @@ is cited next to its value in the `.sv` and `.xdc` headers.
 
 - Helion's v2 front end rejects `inout` on the top module and has no
   tristate output primitive, so SDA and SCL are push-pull. The master drives
-  SDA low in each ACK slot (the level an acknowledging slave drives), so the
-  chips and the FPGA never fight, but a NACK cannot be detected: there is no
-  ACK-error LED and no PLL-lock read-back.
+  SDA low for each ACK slot (the level an acknowledging slave drives),
+  starting 50 ns after SCL falls on the 8th bit. UM10204 lets a slave start
+  its ACK anywhere from 0 ns to 3.45 us after that fall, so the FPGA can
+  still drive a 1 against a slave for up to 50 ns per byte (the first
+  version held the bit for 5 us: up to 5 us of contention on every byte
+  ending in 1). A NACK cannot be detected: there is no ACK-error LED and no
+  PLL-lock read-back.
 - Not run on the board (no board access for this work).
 
 ## Checks
@@ -85,8 +95,8 @@ Results (2026-11-23, Verilator 5.052, prebuilt zedbit/hnf from fm/zedboard-rung5
 
 | Check | zedboard_hdmi | zedboard_audio |
 |---|---|---|
-| Testbench | PASS: 41 I2C writes, 34 frames checked, last STOP at 23.672 ms (600 ms simulated) | PASS: 18 I2C writes, PLL wait 20.010 ms, 18390 frames, 799 tone half periods, last STOP at 34.586 ms (400 ms simulated) |
-| Testbench catches faults | wrong ROM value (0x16=0x30), wrong bar luma, HSYNC one clock long: each fails | wrong PLL byte, BCLK divider 16, tone half period 22: each fails |
+| Testbench | PASS: 41 I2C writes, 123 ACK hand-overs, 34 frames checked, last STOP at 23.672 ms (600 ms simulated) | PASS: 18 I2C writes, 77 ACK hand-overs, PLL wait 20.010 ms, 18390 frames, 799 tone half periods, last STOP at 34.586 ms (400 ms simulated) |
+| Testbench catches faults | wrong ROM value (0x16=0x30), wrong bar luma, HSYNC one clock long, V_FRONT 11 or 30 (porch check), BT.601 green bar, ACK low only at the next quarter (old timing, 33 bytes) or 20 ns after SCL falls (hold check), SDA changed on the same edge as SCL: each fails | wrong PLL byte, BCLK divider 16, tone half period 22, ACK low only at the next quarter (old timing, 22 bytes): each fails |
 | svcheck, 200k cycles, --regs | PASS, 4,800,000 output samples equal | PASS, 2,000,000 output samples equal |
-| zedbit at 100 MHz | 397 LUTs, 100 flops, 37 CARRY4, slack +3.412 ns | 249 LUTs, 97 flops, 13 CARRY4, slack +5.219 ns |
+| zedbit at 100 MHz | 402 LUTs, 100 flops, 37 CARRY4, slack +3.674 ns | 252 LUTs, 97 flops, 13 CARRY4, slack +5.103 ns |
 | x7v verify --rtl --no-reset | PASS, 2,500,000 cycles (whole init), 0 mismatches, 0 unexplained bits | PASS, 3,600,000 cycles (whole init), 0 mismatches, 0 unexplained bits |

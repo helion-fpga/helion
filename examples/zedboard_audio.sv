@@ -66,9 +66,11 @@
 //
 // I2C: SCL and SDA are driven push-pull, because Helion's v2 front end
 // does not accept an inout port on the top module and has no tristate
-// output primitive. The master never reads the bus: in each ACK slot it
-// drives SDA low itself, the level an acknowledging slave drives, so the
-// two never fight; a NACK cannot be seen and there is no ACK-error LED.
+// output primitive. The master never reads the bus: it drives SDA low
+// itself for each ACK slot, starting 50 ns after SCL falls on the 8th bit,
+// the level an acknowledging slave drives. The FPGA can still drive a 1
+// against the slave for up to those 50 ns, if the slave pulls SDA low that
+// soon after SCL falls. A NACK cannot be seen and there is no ACK-error LED.
 // shortcut: no ACK check, no PLL-lock poll and no clock-stretch support,
 // upgrade to an open-drain IOBUF once Helion supports inout pins.
 //
@@ -239,7 +241,16 @@ module zedboard_audio (
                 ist  <= I_BIT;
             end
 
-            I_BIT: if (qtick) begin
+            I_BIT: if (!qtick) begin
+                // A slave may pull SDA low for its ACK anywhere from 0 ns
+                // (tHD;DAT min) to 3.45 us (tVD;ACK max) after SCL falls on
+                // the 8th bit (NXP UM10204 Rev. 7.0, Table 11), so drive the
+                // ACK level 50 ns after that fall rather than at the next
+                // quarter (5 us later), where a 1 LSB would fight the slave.
+                // The 50 ns lets SCL get below 0.3 VDD first (note [2]).
+                if (bitn == 4'd8 && q == 2'd0 && qcnt == 9'd4)
+                    ac_sda <= 1'b0;
+            end else begin
                 // q0: SDA takes the bit while SCL is low; q1, q2: SCL high
                 // (the slave samples); q3: SCL low again.
                 q <= q + 2'd1;

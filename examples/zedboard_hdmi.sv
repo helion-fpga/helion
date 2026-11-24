@@ -47,10 +47,16 @@
 // guide: see docs/zedboard/rung5-av.md (TODO-UNVERIFIED against the guide).
 //
 // Colour bars: eight 80-pixel bars, white, yellow, cyan, green, magenta,
-// red, blue, black, as ITU-R BT.601 limited-range YCbCr of 100 % RGB
-// (Y = 16 + 65.481 R + 128.553 G + 24.966 B, Cb = 128 - 37.797 R
-// - 74.203 G + 112 B, Cr = 128 + 112 R - 93.786 G - 18.214 B). Bars are
-// 80 pixels wide, an even number, so a Cb/Cr pair never straddles a bar.
+// red, blue, black, as ITU-R BT.709 limited-range YCbCr of 100 % RGB
+// (Kr = 0.2126, Kb = 0.0722: Y = 16 + 46.559 R + 156.629 G + 15.812 B,
+// Cb = 128 - 25.664 R - 86.336 G + 112 B, Cr = 128 + 112 R - 101.730 G
+// - 10.270 B). BT.709, not BT.601, because the CSC table above (Linux
+// adv7511_csc_ycbcr_to_rgb) has BT.709 coefficient ratios: Cr->R / Y =
+// 0x734 / 0x4AD = 1.541 (BT.709 1.540, BT.601 1.371). Decoding these bars
+// with that table (coefficients x 4 / 4096, offsets x 4 / 16 at 8 bits)
+// gives each bar's RGB within 1 LSB of 0 or 255; BT.601 bars would come out
+// e.g. green (0, 217, 0), red (255, 24, 0). Bars are 80 pixels wide, an even
+// number, so a Cb/Cr pair never straddles a bar.
 //
 // Video timing: 640x480 at 60 Hz (VESA DMT), 25.000 MHz pixel clock (0.7 %
 // below 25.175 MHz, the same rate examples/zedboard_vga.sv uses):
@@ -64,10 +70,12 @@
 //
 // I2C: SCL and SDA are driven push-pull, because Helion's v2 front end
 // does not accept an inout port on the top module and has no tristate
-// output primitive (HELION_GAPS). The master never reads the bus: in each
-// ACK slot it drives SDA low itself, which is the level an acknowledging
-// slave drives, so the two never fight. A slave that NACKs only releases
-// the line, so a NACK cannot be seen and there is no ACK-error LED.
+// output primitive (HELION_GAPS). The master never reads the bus: it drives
+// SDA low itself for each ACK slot, starting 50 ns after SCL falls on the
+// 8th bit, the level an acknowledging slave drives. The FPGA can still
+// drive a 1 against the slave for up to those 50 ns, if the slave pulls SDA
+// low that soon after SCL falls. A slave that NACKs only releases the line,
+// so a NACK cannot be seen and there is no ACK-error LED.
 // shortcut: no ACK check and no clock-stretch support, upgrade to an
 // open-drain IOBUF once Helion supports inout pins.
 module zedboard_hdmi (
@@ -277,7 +285,16 @@ module zedboard_hdmi (
                 ist  <= I_BIT;
             end
 
-            I_BIT: if (qtick) begin
+            I_BIT: if (!qtick) begin
+                // A slave may pull SDA low for its ACK anywhere from 0 ns
+                // (tHD;DAT min) to 3.45 us (tVD;ACK max) after SCL falls on
+                // the 8th bit (NXP UM10204 Rev. 7.0, Table 11), so drive the
+                // ACK level 50 ns after that fall rather than at the next
+                // quarter (5 us later), where a 1 LSB would fight the slave.
+                // The 50 ns lets SCL get below 0.3 VDD first (note [2]).
+                if (bitn == 4'd8 && q == 2'd0 && qcnt == 9'd4)
+                    hd_sda <= 1'b0;
+            end else begin
                 // q0: SDA takes the bit while SCL is low; q1, q2: SCL high
                 // (the slave samples); q3: SCL low again.
                 q <= q + 2'd1;
@@ -348,12 +365,12 @@ module zedboard_hdmi (
     always_comb begin
         case (bar)
             3'd0:    begin y = 8'd235; cb = 8'd128; cr = 8'd128; end // white
-            3'd1:    begin y = 8'd210; cb = 8'd16;  cr = 8'd146; end // yellow
-            3'd2:    begin y = 8'd170; cb = 8'd166; cr = 8'd16;  end // cyan
-            3'd3:    begin y = 8'd145; cb = 8'd54;  cr = 8'd34;  end // green
-            3'd4:    begin y = 8'd106; cb = 8'd202; cr = 8'd222; end // magenta
-            3'd5:    begin y = 8'd81;  cb = 8'd90;  cr = 8'd240; end // red
-            3'd6:    begin y = 8'd41;  cb = 8'd240; cr = 8'd110; end // blue
+            3'd1:    begin y = 8'd219; cb = 8'd16;  cr = 8'd138; end // yellow
+            3'd2:    begin y = 8'd188; cb = 8'd154; cr = 8'd16;  end // cyan
+            3'd3:    begin y = 8'd173; cb = 8'd42;  cr = 8'd26;  end // green
+            3'd4:    begin y = 8'd78;  cb = 8'd214; cr = 8'd230; end // magenta
+            3'd5:    begin y = 8'd63;  cb = 8'd102; cr = 8'd240; end // red
+            3'd6:    begin y = 8'd32;  cb = 8'd240; cr = 8'd118; end // blue
             default: begin y = 8'd16;  cb = 8'd128; cr = 8'd128; end // black
         endcase
     end

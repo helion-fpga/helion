@@ -6,6 +6,10 @@
 //     (address byte 0x76, register address MSB 0x40, LSB, data);
 //   - the ACK slot after every byte is low (the master drives it low);
 //   - SDA never changes while SCL is high, except for START and STOP;
+//   - SDA does not change within 40 ns after an SCL fall, and the master
+//     drives the ACK level (low) by 100 ns after SCL falls on the 8th bit
+//     of each byte: a slave may start its ACK 0 ns after that fall
+//     (UM10204 tHD;DAT min), so a 1 held longer fights it;
 //   - standard-mode timing (NXP UM10204 Rev. 7.0, Table 11): START hold >= 4.0 us,
 //     SCL low >= 4.7 us, SCL high >= 4.0 us, data setup >= 250 ns,
 //     STOP setup >= 4.0 us, bus free between STOP and START >= 4.7 us;
@@ -124,6 +128,7 @@ module zedboard_audio_tb;
             sh = {sh[7:0], ac_sda};
             nbits = nbits + 1;
             if (nbits == 9) begin
+                n_bytes_all = n_bytes_all + 1;
                 if (sh[0] !== 1'b0) fail($sformatf("ACK slot high after byte %0d of txn %0d", nbytes, n_txn));
                 if (nbytes < 16) txb[nbytes] = sh[8:1];
                 nbytes = nbytes + 1;
@@ -138,6 +143,20 @@ module zedboard_audio_tb;
         if (in_txn && ($realtime - t_scl_rise) < 4000 && !(nbits == 0 && nbytes == 0))
             fail("SCL high < 4.0 us");
         t_scl_fall = $realtime;
+    end
+
+    // SDA hold after SCL falls, and the ACK hand-over after the 8th bit.
+    integer n_bytes_all = 0, n_ack_handover = 0;
+    realtime t_fall_chk;
+    always @(negedge ac_scl) if (in_txn) begin
+        t_fall_chk = $realtime;
+        #40;
+        if (t_sda_chg >= t_fall_chk) fail("SDA changed < 40 ns after SCL fell");
+        if (nbits == 8) begin
+            #60;
+            if (ac_sda !== 1'b0) fail($sformatf("SDA not low 100 ns after the 8th SCL fall of byte %0d, txn %0d", nbytes, n_txn));
+            else n_ack_handover = n_ack_handover + 1;
+        end
     end
 
     // ---------------- I2S checker ----------------
@@ -218,9 +237,11 @@ module zedboard_audio_tb;
         if (led[0] !== 1'b1) fail("led[0] (init done) not high");
         if (flips < 100) fail($sformatf("only %0d tone flips seen", flips));
         if (led[1] === beat0) fail("heartbeat led[1] never toggled");
+        if (n_ack_handover != n_bytes_all || n_bytes_all == 0)
+            fail($sformatf("%0d ACK hand-overs checked for %0d bytes", n_ack_handover, n_bytes_all));
         if (errors == 0)
-            $display("PASS: audio %0d I2C writes, PLL wait %0.3f ms, %0d frames, %0d tone half periods, last STOP at %0.3f ms",
-                     n_txn, (t_after_pll - t_pll_stop) / 1.0e6, frames, flips, t_stop / 1.0e6);
+            $display("PASS: audio %0d I2C writes, %0d ACK hand-overs, PLL wait %0.3f ms, %0d frames, %0d tone half periods, last STOP at %0.3f ms",
+                     n_txn, n_ack_handover, (t_after_pll - t_pll_stop) / 1.0e6, frames, flips, t_stop / 1.0e6);
         else
             $display("FAIL: audio check, %0d errors", errors);
         $finish;
