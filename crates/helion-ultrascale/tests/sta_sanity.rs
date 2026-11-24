@@ -266,3 +266,172 @@ fn sta_carry_unknown_s_to_o_fails_loud() {
     assert!(err.contains("CARRY8"), "err: {err}");
     assert!(err.contains("UNKNOWN"), "err: {err}");
 }
+
+/// A top-level input port feeding an FF D directly (the chain16 /
+/// shift32 shape: `pipe[0] <= din`, `sr[0] <= din`). The port net
+/// has no cell driver; it must be a timing startpoint, not a
+/// missing-driver error.
+struct DirectPortNetlist {
+    declare_port: bool,
+}
+
+impl StaNetlist for DirectPortNetlist {
+    fn flip_flops(&self) -> Vec<(String, i32, i32)> {
+        vec![("ff0".to_string(), 0, 0)]
+    }
+    fn luts(&self) -> Vec<(String, i32, i32)> {
+        vec![]
+    }
+    fn net_drivers(&self) -> HashMap<String, (String, i32, i32)> {
+        HashMap::new()
+    }
+    fn cell_fanin(&self) -> HashMap<String, Vec<String>> {
+        HashMap::new()
+    }
+    fn ff_q_net(&self, _ff: &str) -> Option<String> {
+        None
+    }
+    fn ff_d_net(&self, ff: &str) -> Option<String> {
+        if ff == "ff0" {
+            Some("din".to_string())
+        } else {
+            None
+        }
+    }
+    fn input_ports(&self) -> HashSet<String> {
+        if self.declare_port {
+            HashSet::from(["din".to_string()])
+        } else {
+            HashSet::new()
+        }
+    }
+}
+
+/// A declared input port feeding an FF D directly arrives at 0 and
+/// names the port as the startpoint: worst_delay 0, WNS 10000-80.
+#[test]
+fn sta_input_port_feeding_ff_directly_is_startpoint() {
+    let nl = DirectPortNetlist { declare_port: true };
+    let db = preliminary_xcvu3p();
+    let r: TimingReport = sta_routed(&nl, &db, 10_000).expect("sta");
+    assert_eq!(r.endpoints, 1);
+    assert_eq!(r.worst_delay_ps, 0);
+    assert_eq!(r.worst_startpoint, "din");
+    assert_eq!(r.worst_endpoint, "ff0");
+    assert_eq!(r.wns_ps, 10_000 - 80);
+    assert_eq!(r.tns_ps, 0);
+}
+
+/// The same net with no port declared still fails loud: the
+/// startpoint model must not let an undriven internal net through.
+#[test]
+fn sta_undriven_internal_net_still_fails_loud() {
+    let nl = DirectPortNetlist {
+        declare_port: false,
+    };
+    let db = preliminary_xcvu3p();
+    let err = sta_routed(&nl, &db, 10_000).expect_err("must fail");
+    assert!(err.contains("timing: no driver for net din"), "err: {err}");
+}
+
+/// The chain16 head shape: ff0 D is `din` directly, ff1 D comes
+/// through a LUT on ff0 Q and `din`. Model: ckq=150, hop=180,
+/// lut=120, setup=80. Path to ff1: ckq(150) + wire 1 hop (180) +
+/// lut(120) + wire 2 hops (360) = 810; ff0 arrives at 0 from the
+/// port, so the worst path starts at ff0.
+struct ChainHeadNetlist;
+
+impl StaNetlist for ChainHeadNetlist {
+    fn flip_flops(&self) -> Vec<(String, i32, i32)> {
+        vec![("ff0".to_string(), 0, 0), ("ff1".to_string(), 1, 0)]
+    }
+    fn luts(&self) -> Vec<(String, i32, i32)> {
+        vec![("lut0".to_string(), 0, 1)]
+    }
+    fn net_drivers(&self) -> HashMap<String, (String, i32, i32)> {
+        HashMap::from([
+            ("q0".to_string(), ("ff:ff0".to_string(), 0, 0)),
+            ("d1".to_string(), ("lut0".to_string(), 0, 1)),
+        ])
+    }
+    fn cell_fanin(&self) -> HashMap<String, Vec<String>> {
+        HashMap::from([(
+            "lut0".to_string(),
+            vec!["q0".to_string(), "din".to_string()],
+        )])
+    }
+    fn ff_q_net(&self, ff: &str) -> Option<String> {
+        if ff == "ff0" {
+            Some("q0".to_string())
+        } else {
+            None
+        }
+    }
+    fn ff_d_net(&self, ff: &str) -> Option<String> {
+        match ff {
+            "ff0" => Some("din".to_string()),
+            "ff1" => Some("d1".to_string()),
+            _ => None,
+        }
+    }
+    fn input_ports(&self) -> HashSet<String> {
+        HashSet::from(["din".to_string()])
+    }
+}
+
+#[test]
+fn sta_chain_head_with_port_input() {
+    let nl = ChainHeadNetlist;
+    let db = preliminary_xcvu3p();
+    let r: TimingReport = sta_routed(&nl, &db, 10_000).expect("sta");
+    assert_eq!(r.endpoints, 2);
+    assert_eq!(r.worst_delay_ps, 810);
+    assert_eq!(r.worst_startpoint, "ff0");
+    assert_eq!(r.worst_endpoint, "ff1");
+    assert_eq!(r.wns_ps, 10_000 - 80 - 810);
+    assert_eq!(r.tns_ps, 0);
+}
+
+/// A LUT fed only by an input port still names the port as the
+/// startpoint: lut(120) + wire 2 hops (360) = 480, startpoint din.
+struct PortOnlyLutNetlist;
+
+impl StaNetlist for PortOnlyLutNetlist {
+    fn flip_flops(&self) -> Vec<(String, i32, i32)> {
+        vec![("ff0".to_string(), 1, 0)]
+    }
+    fn luts(&self) -> Vec<(String, i32, i32)> {
+        vec![("lut0".to_string(), 0, 1)]
+    }
+    fn net_drivers(&self) -> HashMap<String, (String, i32, i32)> {
+        HashMap::from([("d0".to_string(), ("lut0".to_string(), 0, 1))])
+    }
+    fn cell_fanin(&self) -> HashMap<String, Vec<String>> {
+        HashMap::from([("lut0".to_string(), vec!["din".to_string()])])
+    }
+    fn ff_q_net(&self, _ff: &str) -> Option<String> {
+        None
+    }
+    fn ff_d_net(&self, ff: &str) -> Option<String> {
+        if ff == "ff0" {
+            Some("d0".to_string())
+        } else {
+            None
+        }
+    }
+    fn input_ports(&self) -> HashSet<String> {
+        HashSet::from(["din".to_string()])
+    }
+}
+
+#[test]
+fn sta_lut_fed_only_by_port_names_port_startpoint() {
+    let nl = PortOnlyLutNetlist;
+    let db = preliminary_xcvu3p();
+    let r: TimingReport = sta_routed(&nl, &db, 10_000).expect("sta");
+    assert_eq!(r.endpoints, 1);
+    assert_eq!(r.worst_delay_ps, 480);
+    assert_eq!(r.worst_startpoint, "din");
+    assert_eq!(r.worst_endpoint, "ff0");
+    assert_eq!(r.wns_ps, 10_000 - 80 - 480);
+}
