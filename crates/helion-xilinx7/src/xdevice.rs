@@ -188,7 +188,8 @@ impl<'a> XDevice<'a> {
         let ntypes = tiles.iter().map(|t| t.type_id as usize + 1).max().unwrap_or(0);
         let (gx, gy) = tiles.iter().fold((0, 0), |(x, y), t| (x.max(t.grid_x), y.max(t.grid_y)));
         // Pips into each wire, per tile type: (source wire index, cost, pseudo).
-        let mut into: Vec<Option<Vec<Vec<(u32, u32, bool)>>>> = vec![None; ntypes];
+        type PipsInto = Vec<Vec<(u32, u32, bool)>>;
+        let mut into: Vec<Option<PipsInto>> = vec![None; ntypes];
         let mut la = Lookahead { cls: vec![Vec::new(); ntypes], table: Vec::new() };
         let n = self.wire_to_tile.len();
         let mut dist = vec![u32::MAX; n];
