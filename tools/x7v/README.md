@@ -96,13 +96,17 @@ register are read back next, and a read with no write in flight from its
 address to its last beat must return what was written (under MASK). BID/RID
 must match an outstanding ID, RLAST the last beat, and a raised BVALID or
 RVALID must hold with the same payload until READY (a slave that overwrites
-a held response loses it on silicon). The masters stay idle while
-FCLKRESETN is low and 4 cycles after (`RESET_QUIET`, the slave's reset
+a held response loses it on silicon). FCLK_RESET does not reset the PS
+interconnect, so a reset never forgives a transaction: when the random
+stimulus asks for one, the masters start nothing new and FCLKRESETN stays
+high until every transaction has completed, and a response never sent keeps
+it high to the end. The masters stay idle while FCLKRESETN is low and 4 cycles after (`RESET_QUIET`, the slave's reset
 synchroniser), start nothing in the last 64 cycles (`DRAIN`) with
 BREADY/RREADY high, and then no transaction may be outstanding: a response
 never sent hangs the PS. What the masters drove becomes the stimulus that
 both simulations replay. The `axi` check fails if no write or no read
-completes, on any readback mismatch or protocol error, and if an `--axi-rw`
+completes, if the writes and reads accepted do not equal the B and last R
+responses counted, on any readback mismatch or protocol error, and if an `--axi-rw`
 register is never read back. PS7 cosim runs on Icarus only (it tells an
 unconnected input by `z`); the S_AXI ports, interrupts and EMIO get the
 random walk.

@@ -17,7 +17,9 @@ register block on the PS7's M_AXI_GP0.
   an RTL whose SCRATCH ignores WSTRB[1] (caught by the readback check), and
   RTLs that lose a write or read response by taking the next address while
   it is held (caught by the axi check alone), and one that never sends the
-  B of an SLVERR write (caught only by the end-of-run outstanding check).
+  B of an SLVERR write (caught only by the end-of-run outstanding check;
+  also run on the RTL alone over 12 seeds and run lengths, since a reset
+  must not forgive it).
 * The database's always-on features (CFG_CENTER_MID ALWAYS_ON_PROP1-3)
   cleared from the bitstream: the decode check fails (G81).
 * A design with no PS7 whose RTL names PS7 in a comment still verifies
@@ -60,6 +62,47 @@ def boundary_checks(db: Db) -> None:
     st = cosim.make_stimulus(["a", "n0", "n1"], 200, 3, active_low=["n0", "n1"])
     assert all(l[1] == l[2] for l in st) and [l[1] for l in st[:8]] == list("11110001"), st[:8]
     print("ps7: boundary ok")
+
+
+class _AxiDone(Exception):
+    pass
+
+
+def master_run(db: Db, work: str, rtl: str, cycles: int, seed: int) -> tuple[list[str], list[str]]:
+    """The AXI masters against the RTL alone (no bitstream): (summary, errors)."""
+    got, orig = {}, ps7.run_axi
+    def grab(wd, rtl_files, tb):
+        got["r"] = orig(wd, rtl_files, tb)
+        raise _AxiDone
+    ps7.run_axi, cosim.AXI_RW = grab, RW
+    try:
+        cosim.run(os.path.join(work, f"axi_{os.path.basename(rtl)[:-3]}_{cycles}_{seed}"), [rtl], TOP, XDC, "",
+                  set(), set(), cycles=cycles, seed=seed, ps7_ports=ps7.ports(db))
+    except _AxiDone:
+        pass
+    finally:
+        ps7.run_axi = orig
+    return got["r"]
+
+
+def master_checks(db: Db, work: str) -> None:
+    """A reset never forgives a lost response: the B never sent for an SLVERR
+    write is reported on every seed and run length, whatever the random
+    resets (it once hid behind a reset in the drain window, as for seeds 4
+    and 8 at 3000 cycles), while the correct RTL logs no error. And the
+    summary check counts responses by itself, apart from the master's queues."""
+    mutant = os.path.join(work, "b_never_sent_rtl.sv")
+    open(mutant, "w").write(open(SV).read().replace("b_pend <= 1'b1;", "b_pend <= wr_ok;"))
+    for cycles, seeds in ((3000, range(1, 9)), (1500, range(1, 5))):
+        for seed in seeds:
+            summ, errs = master_run(db, work, mutant, cycles, seed)
+            assert any("outstanding after" in e for e in errs), (cycles, seed, errs, summ)
+            assert any("B and" in e for e in ps7.axi_problems(summ)), (cycles, seed, summ)
+            summ, errs = master_run(db, work, SV, cycles, seed)
+            assert not errs and not any("B and" in e for e in ps7.axi_problems(summ)), (cycles, seed, errs, summ)
+    lost = "axi MAXIGP0 writes=3 wbeats=3 bokay=1 berr=1 partial=0 reads=2 rokay=2 rerr=0 bursts=0 backtoback=0 readbacks=1 readbackbad=0 protocol=0"
+    assert ps7.axi_problems([lost]) == ["MAXIGP0: 3 writes and 2 reads, 2 B and 2 last R responses"], ps7.axi_problems([lost])
+    print("ps7: masters ok (a never-sent B caught on 12 runs, none forgiven by a reset)")
 
 
 def mux_pip(ex, tile: str, wire: str):
@@ -111,6 +154,7 @@ def main() -> int:
     os.makedirs(work, exist_ok=True)
     db = Db()
     boundary_checks(db)
+    master_checks(db, work)
 
     good = a.bit or os.path.join(work, "ps7_axi.bit")
     if not os.path.exists(good):

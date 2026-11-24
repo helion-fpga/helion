@@ -147,10 +147,15 @@ def stub(plist: list) -> str:
 # Protocol checks: a BID/RID must match an outstanding transaction, RLAST
 # must mark the last beat, and BVALID/RVALID once raised must hold with the
 # same payload until BREADY/RREADY (a response the slave overwrites or
-# drops is lost on silicon). The masters stay idle while FCLKRESETN is low
-# and for RESET_QUIET cycles after (the slave's reset synchroniser), and
-# start nothing in the last DRAIN cycles, with BREADY/RREADY high: a write
-# or read still outstanding at the end never completes.
+# drops is lost on silicon). FCLK_RESET does not reset the PS interconnect,
+# so a reset never forgives a transaction: when the random stimulus asks
+# for one, the masters start nothing new and FCLKRESETN stays high until
+# every transaction has completed (software quiescing the port), and a
+# response never sent keeps it high to the end. The masters stay idle while
+# FCLKRESETN is low and for RESET_QUIET cycles after (the slave's reset
+# synchroniser), and start nothing in the last DRAIN cycles, with
+# BREADY/RREADY high: a write or read still outstanding at the end never
+# completes.
 RESET_QUIET = 4
 _DECL = """
 // ---- AXI3 master on @P
@@ -177,7 +182,7 @@ _DECIDE = """
     if (!act) begin
       @v_won = 0; @v_aron = 0; @v_obn = 0; @v_orn = 0; @v_holdw = 0; @v_rbnext = 0; @v_hb = 0; @v_hr = 0;
       for (i = 0; i < @n; i = i + 1) @v_known[i] = 0;
-    end else if (!drain) begin
+    end else if (!stop) begin
       if (!@v_won && !@v_holdw && @v_obn < 4 && rnd(8) != 0) begin
         @v_won = 1; @v_awpend = 1; @v_wbeat = 0;
         @v_wpool = @pick; @v_awaddr = @v_pool[@v_wpool]; @v_awid = $random(seed); @v_awfirst = -1;
@@ -199,7 +204,7 @@ _DECIDE = """
     @v_arvalid = act && @v_aron && @v_ardly == 0;
     if (@v_awvalid && @v_awfirst < 0) @v_awfirst = k;
     if (@v_arvalid && @v_arfirst < 0) @v_arfirst = k;
-    @v_bready = act && (drain || rnd(4) != 0); @v_rready = act && (drain || rnd(4) != 0);
+    @v_bready = act && (stop || rnd(4) != 0); @v_rready = act && (stop || rnd(4) != 0);
 """
 
 _SAMPLE = """
@@ -353,7 +358,7 @@ def axi_tb(top: str, top_ports: list, b: Boundary, in_bits: list[str], clock: st
     for bit in b.out_bits + b.in_bits:
         m = re.match(rf"{b.inst}\.(\w+)(?:\[(\d+)\])?$", bit)
         widths[m.group(1)] = max(widths.get(m.group(1), 0), int(m.group(2) or 0) + 1)
-    blocks = {"decl": [], "init": [], "decide": [], "override": [], "sample": [], "update": [], "report": []}
+    blocks = {"decl": [], "init": [], "decide": [], "override": [], "sample": [], "update": [], "report": [], "busy": []}
     for idx, P in enumerate(b.masters):
         v, d = f"m{idx}", f"dut.{b.inst}.{P}"
         addrs, n_rw = pool(P, rw, seed + idx)
@@ -368,6 +373,7 @@ def axi_tb(top: str, top_ports: list, b: Boundary, in_bits: list[str], clock: st
         blocks["sample"].append(sub(_SAMPLE))
         blocks["update"].append(sub(_UPDATE))
         blocks["report"].append(sub(_REPORT))
+        blocks["busy"].append(sub("@v_won || @v_aron || @v_obn != 0 || @v_orn != 0"))
         drives = dict(_DRIVES, **{z: 0 for z in _ZERO})
         for suffix, e in drives.items():
             w = widths[P + suffix]
@@ -377,6 +383,7 @@ def axi_tb(top: str, top_ports: list, b: Boundary, in_bits: list[str], clock: st
                     continue
                 val = f"1'b{(e >> k) & 1}" if isinstance(e, int) else (sub(e) if w == 1 else f"{sub(e)}[{k}]")
                 blocks["override"].append(f"    vec[{col[bit]}] = {val};")
+    blocks["override"] += [f"    vec[{col[r]}] = rstn;" for r in b.resets if r in col]
     drive = [f"    {ref(bit)} = vec[{n - 1 - i}];" for i, bit in enumerate(in_bits)]
     j = lambda key: "\n".join(blocks[key])
     return f"""`timescale 1ns/1ps
@@ -389,7 +396,7 @@ module tb_axi;
 integer fi, fs, fl, k, rc, i, j, p;
 integer seed = {seed};
 integer quiet = {RESET_QUIET};
-reg rstn, act, drain;
+reg rstn = 0, rq, act, drain, stop;
 reg [31:0] m;
 reg [{n}-1:0] vec;
 function integer rnd(input integer lim);
@@ -410,10 +417,13 @@ initial begin
   fl = $fopen("{log}", "w");
   for (k = 0; k < {cycles}; k = k + 1) begin
     rc = $fscanf(fi, "%b", vec);
-    rstn = vec[{col[b.resets[0]]}];
+    rq = vec[{col[b.resets[0]]}];
+    // A reset waits for every transaction to complete (see above).
+    rstn = rq || (rstn && ({' || '.join(blocks['busy']) or '0'}));
     if (!rstn) quiet = {RESET_QUIET}; else if (quiet > 0) quiet = quiet - 1;
     act = rstn && quiet == 0;
     drain = k >= {cycles - drain};
+    stop = drain || !rq;
 {j("decide")}
 {j("override")}
     $fwrite(fs, "%b\\n", vec);
@@ -458,6 +468,8 @@ def axi_problems(summary: list[str]) -> list[str]:
         if l.startswith("axi "):
             if int(f["bokay"]) + int(f["berr"]) == 0 or int(f["rokay"]) + int(f["rerr"]) == 0:
                 out.append(f"{l.split()[1]}: no write or no read completed")
+            if int(f["writes"]) != int(f["bokay"]) + int(f["berr"]) or int(f["reads"]) != int(f["rokay"]) + int(f["rerr"]):
+                out.append(f"{l.split()[1]}: {f['writes']} writes and {f['reads']} reads, {int(f['bokay']) + int(f['berr'])} B and {int(f['rokay']) + int(f['rerr'])} last R responses")
             if int(f["readbackbad"]) or int(f["protocol"]):
                 out.append(f"{l.split()[1]}: {f['readbackbad']} readback mismatches, {f['protocol']} protocol errors")
         elif l.startswith("rw ") and int(f["readbacks"]) == 0:
