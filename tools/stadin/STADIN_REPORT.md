@@ -2,7 +2,7 @@
 
 Lane branch `fm/ultra-bitgen-stadin` at `6d03d47c` on origin (code tip
 `5b14e11a`: impl commit on N48 base `ac4d6f68`; merge `6d03d47c`;
-report commit pending). Impl branch `fm/ultra-bitgen-stadin-impl` at
+report commit `8744b5cb`). Impl branch `fm/ultra-bitgen-stadin-impl` at
 `5b14e11a` on origin. Worktree `~/workspace/helion-ultra-bitgen-stadin`,
 clean. Report `~/workspace/ultra-bitgen-crew/STADIN_REPORT.md` (this
 file; copy committed at `tools/stadin/STADIN_REPORT.md` on the lane branch,
