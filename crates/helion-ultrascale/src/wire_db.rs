@@ -355,6 +355,20 @@ impl IntTileWireDb {
                 fanout[b as usize].push(a);
             }
         }
+        // Deterministic fanout order (N48): the PIP table above is a
+        // HashMap, so iterating it pushes PIP edges in per-process
+        // random order. A* explores neighbors in fanout order and
+        // breaks f-score ties in push order, so the same netlist
+        // routed differently on every process (N35/N36: identical
+        // placement, different failing nets, iters_used 28-50 for
+        // the same counter12 seed-0 netlist). Sorting each fanout
+        // list by wire id makes the graph, and therefore every
+        // route, a pure function of the netlist and the seed.
+        // Continuation edges are appended in sorted wire order
+        // already, so the sort only canonicalizes the PIP edges.
+        for list in fanout.iter_mut() {
+            list.sort_unstable();
+        }
         Ok(Self {
             tiles: tiles.to_vec(),
             tile_by_name,
@@ -631,6 +645,33 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn fanout_lists_are_sorted_deterministic() {
+        // N48: the PIP table is a HashMap, so building fanout by
+        // iterating it pushes PIP edges in per-process random
+        // order, and A* explores neighbors (and breaks f-score
+        // ties) in fanout order: the same netlist routed
+        // differently on every process (counter12 seed 0 needed
+        // 28-50 iterations and timed out 2/10 runs; counter16
+        // seed 0 4/10). Sorting each fanout list makes the graph
+        // a pure function of the tile JSON and the tile set.
+        // Rebuild twice and require byte-identical fanout: a
+        // second build in the same process uses a fresh HashMap
+        // seed, so equal fanout proves the order no longer comes
+        // from the map.
+        let db1 = one_tile();
+        let db2 = one_tile();
+        for w in 0..db1.wire_count() {
+            let f1 = db1.fanout(w as u32);
+            let f2 = db2.fanout(w as u32);
+            assert_eq!(f1, f2, "fanout of wire {w} differs between builds");
+            assert!(
+                f1.windows(2).all(|p| p[0] <= p[1]),
+                "fanout of wire {w} is not sorted: {f1:?}"
+            );
+        }
     }
 
     #[test]
