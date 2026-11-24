@@ -268,6 +268,8 @@ pub struct RunArtifacts {
     pub ooc: Vec<crate::views::ooc::OocRow>,
     /// iCE40/ECP5 die (and placement after implementation).
     pub family_die: Option<crate::runs_family::FamilyDie>,
+    /// 7-series `.bit` on disk: Program Device loads it with openFPGALoader.
+    pub bit_file: Option<PathBuf>,
 }
 
 /// The live worker handle: its event channel plus the cancel flag the
@@ -920,6 +922,9 @@ pub fn apply_artifacts(s: &mut AppState, art: RunArtifacts) {
     }
     if let Some(b) = art.bitstream {
         s.bitstream = b;
+    }
+    if let Some(b) = art.bit_file {
+        s.program.file = Some(b);
     }
     if let Some(d) = art.design {
         s.runs.live_design = Some(d);
@@ -2856,6 +2861,7 @@ mod tests {
             reuse: None,
             ooc: Vec::new(),
             family_die: None,
+            bit_file: None,
         };
         deliver(&mut s, RunKind::Synth, RunEvent::Finished(Ok(art)));
         assert_eq!(s.flow.synth, RunStatus::Complete);

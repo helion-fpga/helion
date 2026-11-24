@@ -983,6 +983,14 @@ pub fn resolve_ofl_board(part: Option<&str>) -> Option<String> {
     }
     part.and_then(lookup_had_board)
         .map(|b| b.ofl_board.to_string())
+        .or_else(|| part.and_then(xilinx_ofl_board).map(str::to_string))
+}
+
+/// openFPGALoader `-b` for the 7-series boards Helion builds for. Kept out of
+/// [`HAD_KNOWN_BOARDS`], whose IDCODEs mark a TAP as a Helion HL10T.
+fn xilinx_ofl_board(part: &str) -> Option<&'static str> {
+    // clg484 is the ZedBoard's package (PYNQ-Z1 and MicroZed are clg400).
+    part.to_ascii_lowercase().starts_with("xc7z020clg484").then_some("zedboard")
 }
 
 fn ofl_verify_enabled() -> bool {
@@ -2990,6 +2998,11 @@ mod tests {
         assert_eq!(row.usb_vid, 0x0403);
         assert_eq!(row.usb_pid, 0x6010);
         assert!(lookup_had_board("no-such-part").is_none());
+        // The ZedBoard's part loads with `-b zedboard` but is not a Helion TAP.
+        if std::env::var("HELION_OFL_BOARD").is_err() {
+            assert_eq!(resolve_ofl_board(Some("xc7z020clg484-1")).as_deref(), Some("zedboard"));
+            assert!(lookup_had_board("xc7z020clg484-1").is_none());
+        }
         assert_eq!(
             resolve_ofl_board(Some("HL10T-C32-1")).as_deref(),
             Some("helion_hl10t")

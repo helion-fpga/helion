@@ -1553,6 +1553,12 @@ pub fn poll_all(s: &mut AppState, t: f64, tx: &mut rune::Tx) -> bool {
     // re-mirror the live edit field; a no-op when already synced.
     views::editor::sync_edit(s);
     let hw_dirty = views::program::poll(s);
+    // Hardware workers cannot wake the UI either: without this, "Program
+    // finished" waits for the next mouse move.
+    let p = &s.program;
+    if p.busy().is_some() || p.debug.busy().is_some() || p.cfgmem.busy().is_some() || p.native.busy() {
+        tx.wake_after(std::time::Duration::from_millis(100));
+    }
     let pblocks_dirty = views::device_floor::sync_from_project(s);
     let tabs_dirty = layout::sync_tabs(s);
     let jobs_dirty = jobs::poll(s, tx) | views::hls::poll(s, tx);

@@ -609,6 +609,9 @@ pub fn program_blocking(job: &ProgramJob, emit: &dyn Fn(HwEvent)) -> HwEvent {
             bytes: 0,
         }))
     };
+    if crate::runs_family::is_xilinx7(&job.part) {
+        return program_x7_blocking(job, emit);
+    }
     stage(1, format!("Loading device {}", job.part));
     let dev = match helion_device::Device::load_part(&job.part) {
         Ok(d) => d,
@@ -680,6 +683,43 @@ pub fn program_blocking(job: &ProgramJob, emit: &dyn Fn(HwEvent)) -> HwEvent {
         },
         stat,
     )))
+}
+
+/// Program a 7-series `.bit` (the implementation run's file) into SRAM over
+/// JTAG with openFPGALoader. Its output is shown as is: there is no STAT
+/// readback on this path, so DONE is only what openFPGALoader reports.
+fn program_x7_blocking(job: &ProgramJob, emit: &dyn Fn(HwEvent)) -> HwEvent {
+    let part = helion_targets::canonical_part(&job.part).to_string();
+    let fail = |line: String| {
+        HwEvent::Programmed(Err(ProgramResult { ok: false, backend: "openfpgaloader".into(), line, frames: 0, bytes: 0 }))
+    };
+    let BitsSource::File(path) = &job.bits else {
+        return fail(format!("program_hw: {part} needs the .bit file from Run Implementation"));
+    };
+    if job.cable == "sim" {
+        return fail(format!("program_hw: the Simulation cable models Helion parts only; pick Automatic or USB to load {part}"));
+    }
+    let bytes = std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
+    emit(HwEvent::Stage { step: 2, label: format!("Loading {}", path.display()) });
+    emit(HwEvent::Stage { step: 3, label: "Programming SRAM via openFPGALoader".into() });
+    match helion_hw::program_via_openfpgaloader_for_part(path, false, Some(&part)) {
+        Ok(r) => {
+            for l in r.stdout.lines().chain(r.stderr.lines()).filter(|l| !l.trim().is_empty()) {
+                emit(HwEvent::Line { text: format!("openFPGALoader: {}", l.trim()), sev: MsgSev::Info });
+            }
+            HwEvent::Programmed(Ok((
+                ProgramResult {
+                    ok: true,
+                    backend: "openfpgaloader".into(),
+                    line: format!("program_hw {part} backend=openfpgaloader exit=0: {}", r.command),
+                    frames: 0,
+                    bytes,
+                },
+                Err("openFPGALoader has no STAT readback: check the board's DONE LED.".into()),
+            )))
+        }
+        Err(e) => fail(e),
+    }
 }
 
 // ---- worker plumbing ----

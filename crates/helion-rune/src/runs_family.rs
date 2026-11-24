@@ -382,6 +382,7 @@ pub fn run_xdc_flow(source: &Path, part: &str, out_dir: &Path, send: &dyn Fn(Str
         timing: Some(timing),
         family_die,
         design: Some(b.design),
+        bit_file: Some(bit.clone()),
         ..RunArtifacts::default()
     })
 }
