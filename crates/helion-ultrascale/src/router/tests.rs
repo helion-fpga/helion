@@ -263,6 +263,44 @@ fn bypass_sink_wire_is_terminal_for_other_nets() {
 }
 
 #[test]
+fn bypass_sink_wire_is_terminal_for_other_nets_w8() {
+    // N58 (a), second wire: the same terminal-only rule for
+    // BYPASS_W8 (the EX feed, chain16's actual bad wire). The
+    // victim net sinks at BYPASS_W8; the through net's shortest
+    // path to IMUX_W3 runs through it (5 wires; the shortest path
+    // avoiding it is 7). On the base router the through net takes
+    // the shortcut and the call fails loud with OveruseTimeout at
+    // max_iters=1; with the fix it detours and both nets route.
+    // Together with the W1 test this pins that the rule covers the
+    // whole BYPASS_W family (it is a name-prefix rule, not a
+    // per-wire list), not just one wire.
+    let mut db = int_tile_db();
+    pin(&mut db, "C6LUT", "O6", "LOGIC_OUTS_W4");
+    pin(&mut db, "EQ", "D", "BYPASS_W8");
+    pin(&mut db, "G6LUT", "O6", "LOGIC_OUTS_W20");
+    pin(&mut db, "F6LUT", "I0", "IMUX_W3");
+    let nets = vec![
+        rnet("through", "G6LUT", "O6", &[("F6LUT", "I0")]),
+        rnet("victim_d", "C6LUT", "O6", &[("EQ", "D")]),
+    ];
+    let opts = UltraRouteOpts {
+        seed: 0,
+        max_iters: 1,
+    };
+    let r = route_ultra(&nets, &db, opts).expect("both nets must route");
+    assert_eq!(r.overused_nodes, 0);
+    let bypass = db.wire_id("INT_X1Y0", "BYPASS_W8").unwrap();
+    assert!(
+        !r.routes[0].contains(&bypass),
+        "through net must not pass through the victim's BYPASS sink wire"
+    );
+    assert!(
+        r.routes[1].contains(&bypass),
+        "victim net must still sink at BYPASS_W8"
+    );
+}
+
+#[test]
 fn determinism_same_seed_identical_routes() {
     let db = small_db();
     let nets = vec![
