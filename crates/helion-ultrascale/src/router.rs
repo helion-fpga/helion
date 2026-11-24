@@ -10,7 +10,7 @@
 //! No HashMap iteration in the hot path.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 
 // ============================================================================
 // WireDb seam: owned by crate::fabric (day-1 contract). The router codes
@@ -160,10 +160,18 @@ impl AstarScratch {
 
 /// A* from src wire to dst wire.
 /// Returns the wire path or None if unreachable.
-/// Nine arguments is the day-1 scaffold signature (db, scratch, src,
+/// Eleven arguments is the day-1 scaffold signature (db, scratch, src,
 /// dst, congestion history, presence, own-use, presence factor, tie
-/// seed); a parameter split would churn the router scaffold for no
-/// semantic gain.
+/// seed, blocked BYPASS wires, this net's sink wires); a parameter
+/// split would churn the router scaffold for no semantic gain.
+///
+/// N58: `blocked` holds the BYPASS wires that feed a used site pin
+/// (a sink wire of some net in this routing call). A* never expands
+/// from a blocked wire unless it is this leg's source or one of this
+/// net's own sink wires: a BYPASS wire is physically the site pin's
+/// feed, so passing through it drives that pin with this net. The
+/// leg's destination is always one of its own sinks, so it is never
+/// blocked for its own net.
 ///
 /// Presence cost counts OTHER nets only: `own` marks the wires this
 /// net already uses from its earlier sink legs this iteration, and
@@ -186,6 +194,8 @@ fn astar(
     own: &[bool],
     pres_fac: i64,
     tie_seed: u64,
+    blocked: &HashSet<WireId>,
+    own_sinks: &[WireId],
 ) -> Option<Vec<WireId>> {
     let n = wires.wire_count();
     scratch.generation = scratch.generation.wrapping_add(1);
@@ -227,6 +237,15 @@ fn astar(
         let g = scratch.g_score[w as usize];
         // Skip stale entries.
         if node.f_score != g + heuristic(w) {
+            continue;
+        }
+        // N58: a BYPASS wire feeding a used site pin is terminal-only.
+        // Expanding from it would drive that pin with this net, so a
+        // leg may end there (when it is this net's own sink) but never
+        // pass through it. The leg's source and its own sink wires
+        // are exempt: the source drives its own pin by construction,
+        // and this net's own sink pin is meant to see this net.
+        if w != src && blocked.contains(&w) && !own_sinks.contains(&w) {
             continue;
         }
         for &next in wires.fanout(w) {
@@ -315,6 +334,32 @@ pub fn route_ultra(
         resolved.push((net.name.clone(), src_wire, sink_wires));
     }
 
+    // N58: BYPASS wires that feed a used site pin are terminal-only,
+    // never transit. A BYPASS wire is the feed of exactly one site
+    // pin (tileconn: W1 BX, W3 DX, W4-W7 A_I-D_I, W8 EX, W9 FX,
+    // W10 GX, W11 HX, W12 E_I, W14 G_I), so a net that passes
+    // through one drives that pin with its own signal. The used
+    // pins are exactly the routed sinks: every checker-consumed
+    // BYPASS pin (a BYP FF D, via its X pin) is a sink of a routed
+    // net, while D6 FF D pins are ignored by the FFMUX and the
+    // _I pins are consumed by no model, so neither needs
+    // protection. A wire that no net names as a sink stays usable
+    // as transit. A net may still end at its own BYPASS sink wire
+    // (and pass through it on a later leg to another sink): the pin
+    // is meant to see this net. A wire whose name the DB does not
+    // report (the mock WireDb) is never protected.
+    let mut protected: HashSet<WireId> = HashSet::new();
+    for (_, _, sinks) in &resolved {
+        for &w in sinks {
+            if wires
+                .wire_info(w)
+                .is_some_and(|i| i.name.starts_with("BYPASS_"))
+            {
+                protected.insert(w);
+            }
+        }
+    }
+
     let mut hist = vec![0u32; n_wires];
     let mut pres = vec![0u32; n_wires];
     let mut scratch = AstarScratch::new(n_wires);
@@ -401,6 +446,8 @@ pub fn route_ultra(
                     &own,
                     pres_fac,
                     tie_seed,
+                    &protected,
+                    sinks,
                 ) {
                     Some(path) => {
                         for &w in &path {
