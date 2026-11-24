@@ -17,6 +17,8 @@ register block on the PS7's M_AXI_GP0.
   an RTL whose SCRATCH ignores WSTRB[1] (caught by the readback check), and
   RTLs that lose a write or read response by taking the next address while
   it is held (caught by the axi check alone).
+* The database's always-on features (CFG_CENTER_MID ALWAYS_ON_PROP1-3)
+  cleared from the bitstream: the decode check fails (G81).
 * A design with no PS7 whose RTL names PS7 in a comment still verifies
   (blinky, built with zedbit): only a bitstream with a PS7 boundary
   co-simulates one.
@@ -154,6 +156,17 @@ def main() -> int:
     results.append(not cos.ok and all("IRQF2P[0]" in it and "unconnected (0)" in it for it in cos.items[:20]))
     print(f"==> IRQF2P0 untied: {'FAIL as expected' if results[-1] else 'UNEXPECTED'}")
 
+    # G81: the database's always-on CFG_CENTER_MID bits cleared (as a build
+    # from a database without required_features.fasm had them): decode fails.
+    req = db.required_features
+    assert len(req) == 3 and all("ALWAYS_ON_PROP" in f for f in req), req
+    no_req = os.path.join(work, "no_required.bit")
+    rewrite(db, good, no_req, req, [])
+    rep = run(db, work, "no_required", no_req, SV, 300)
+    d = next(c for c in rep.checks if c.name == "decode")
+    results.append(not d.ok and sorted(it for it in d.items if it.startswith("required feature not set")) == [f"required feature not set: {f}" for f in sorted(req)])
+    print(f"==> always-on features cleared: {'FAIL as expected' if results[-1] else 'UNEXPECTED'}")
+
     # An unused port clock with its ground pip removed floats.
     t, w, src = mux_pip(ex, s.tile, pin_wire(ex, s, "MAXIGP1ACLK"))
     floating = os.path.join(work, "clk_floating.bit")
@@ -163,13 +176,22 @@ def main() -> int:
     results.append(not cos.ok and all("MAXIGP1ACLK" in it and "unconnected (0)" in it for it in cos.items[:20]))
     print(f"==> MAXIGP1ACLK floating: {'FAIL as expected' if results[-1] else 'UNEXPECTED'}")
 
-    # LD7 (pad U14) is counter bit 26: clear the LUT on its flop's carry input.
+    # LD7 (pad U14) is counter bit 26: clear the carry-propagate LUT of its
+    # flop, the LUT that reads the flop's Q in a slice whose carry XOR is used
+    # (placement decides which slice; a route-through LUT may sit before the pad).
     ologic = re.search(r"s_(OLOGIC_X\d+Y\d+)__OQ", nl.ports_out["U14"]).group(1)
     kind, sl, q = ex.pin_driver(ex.sites[ologic], "D1")
+    if kind == "site" and len(q) == 1:
+        kind, sl, q = next((d for d in (ex.pin_driver(ex.sites[sl], f"{q}{i}") for i in range(1, 7)) if d[0] == "site"), ("none", sl, q))
     assert kind == "site" and q.endswith("Q"), (kind, sl, q)
+    text = netlist.to_verilog(nl)
+    carry = {(m[1], m[2]) for m in re.finditer(r"assign s_(SLICE_X\d+Y\d+)__([A-D]) = s_\1__\2_INIT\[\{([^}]*)\}\]", text)
+             if f"s_{sl}__{q}" in m[3].split(",") and f"s_{m[1]}__{m[2]}_XOR" in text}
+    assert len(carry) == 1, carry
+    csl, letter = carry.pop()
     feats = fasmio.to_fasm(dec.fasm())
-    sv = ex.sites[sl]
-    lut = [f for f in feats if f.startswith(f"{sv.tile}.{sv.fprefix}.{q[0]}LUT.INIT")]
+    sv = ex.sites[csl]
+    lut = [f for f in feats if f.startswith(f"{sv.tile}.{sv.fprefix}.{letter}LUT.INIT")]
     assert len(lut) == 1, lut
     cnt26 = os.path.join(work, "cnt26_lut0.bit")
     rewrite(db, good, cnt26, lut, [])

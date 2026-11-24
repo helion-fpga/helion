@@ -120,7 +120,8 @@ the BUFG FCLKCLK0, all 1,774 PS7 inputs as ports, 67 driven by the slave
 and the rest 0; verify PASS with random resets and with `--no-reset`.
 Negative controls, each FAIL: RDATA0 and RDATA1 swapped in the bitstream
 (their interconnect muxes exchange sources; cosim only, on those two bits),
-the IRQF2P0 tie pip removed (reads 1), the MAXIGP1ACLK ground pip removed
+the IRQF2P0 tie pip removed (reads 1), the always-on CFG_CENTER_MID bits
+cleared (decode), the MAXIGP1ACLK ground pip removed
 (floats), counter bit 26's carry LUT cleared (cosim, on LD7 and COUNTER
 reads), an RTL whose SCRATCH ignores WSTRB[1] (the readback check), and
 RTLs that take a new AW/W or AR while a B or R is held (the axi check:
@@ -133,7 +134,7 @@ verifies PASS.
 |---|---|---|
 | packets | command sequence equals Vivado's; both written CRCs are correct | wrong CRC: the device refuses to start |
 | ecc | each frame's ECC (word 50, bits [12:0]) matches its contents | none (readback/SEU checks report corruption) |
-| decode | every set bit is explained by an X-Ray feature | unknown configuration |
+| decode | every set bit is explained by an X-Ray feature, and the database's always-on features (`required_features.fasm`) are all set | unknown configuration; a build from an incomplete database |
 | clocks | clock spine and leaf enables present for every used clock path (`clockcheck.py`) | clock never reaches flops |
 | extract | no undriven, multiply driven, or unmodelled logic | floating or shorted logic |
 | cosim | extracted netlist equals the RTL, cycle by cycle, random stimulus | wrong behaviour |

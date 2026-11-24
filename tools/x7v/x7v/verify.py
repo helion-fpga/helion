@@ -3,7 +3,8 @@
 Checks, in order (each independent, all reported):
   packets   configuration command sequence equals Vivado's (CRC handling aside)
   ecc       every frame's ECC matches its contents
-  decode    every set bit is explained by an X-Ray feature (no unknown bits)
+  decode    every set bit is explained by an X-Ray feature (no unknown bits), and the
+            database's always-on (required) features are all set
   clocks    clock-network enable rules (clockcheck.py)
   extract   netlist extraction found no undriven/multiply-driven/unmodelled logic
   cosim     extracted netlist equals the RTL, cycle by cycle, on random stimulus
@@ -83,9 +84,15 @@ def verify(db: Db, design: str, bitfile: str, rtl: list[str] | None = None, top:
                             [f"FAR {far:#010x} stored {s:#06x} expected {c:#06x}" for far, (s, c) in list(dec.ecc_mismatch.items())[:20]]))
     unk = dec.unknown()
     n_unk = sum(len(v) for v in unk.values())
-    rep.checks.append(Check("decode", n_unk == 0 and not dec.orphan_bits,
-                            f"{len(dec.fasm())} features, {n_unk} unexplained bits, {len(dec.orphan_bits)} orphan bits",
-                            [f"{t}: {v[:8]}" for t, v in unk.items()]))
+    # G81: the database's always-on features must be set; a zynq7 database without them is incomplete.
+    req = db.required_features
+    missing = sorted(set(req) - set(dec.fasm()))
+    if not req and os.path.basename(os.path.normpath(db.root)) == "zynq7":
+        missing = [f"(none known: no required_features.fasm for {db.package} or its fabric in {db.root})"]
+    rep.checks.append(Check("decode", n_unk == 0 and not dec.orphan_bits and not missing,
+                            f"{len(dec.fasm())} features, {n_unk} unexplained bits, {len(dec.orphan_bits)} orphan bits, "
+                            f"{len(missing)} required features missing",
+                            [f"{t}: {v[:8]}" for t, v in unk.items()] + [f"required feature not set: {f}" for f in missing]))
 
     cr = clockcheck.check(db, dec)
     rep.checks.append(Check("clocks", not cr.errors, f"{len(cr.errors)} rule violations, {len(cr.extra)} unexplained enables",
