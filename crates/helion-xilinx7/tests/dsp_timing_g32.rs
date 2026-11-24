@@ -95,44 +95,44 @@ fn dsp_output_delay_depends_on_pipeline_depth() {
     );
 }
 
+/// Setup is that of the register a pin first reaches: its own, else M,
+/// else P (X-Ray's zynq7 timings/DSP_L.sdf, slow corner). Pins are per bit
+/// (`A0`, `C5`, `CARRYINSEL1`), as `pack` names them.
 #[test]
 fn dsp_pin_setups_match_the_sdf() {
-    // Slow-corner maxima from X-Ray's timings/DSP_L.sdf (zynq7).
+    use helion_xilinx7::pack::PackedDsp;
     use helion_xilinx7::timing::dsp_setup_ps;
-    assert_eq!(dsp_setup_ps("A"), Some(5474));
-    assert_eq!(dsp_setup_ps("B"), Some(3929));
-    assert_eq!(dsp_setup_ps("C"), Some(2093));
-    assert_eq!(dsp_setup_ps("D"), Some(5342));
-    assert_eq!(dsp_setup_ps("INMODE"), Some(5557));
-    assert_eq!(dsp_setup_ps("OPMODE"), Some(2600));
-    // Not a clocked data input.
-    assert_eq!(dsp_setup_ps("P"), None);
-    assert_eq!(dsp_setup_ps("CLK"), None);
-}
-
-/// What G32 owns is the *model*, so test it at the model boundary: given a DSP
-/// on the clock, its clocked inputs must be classified as setup endpoints and
-/// its P must be an arrival source. (G35, which used to block routing every DSP
-/// input but A, is fixed; see tests/dsp_tile_mux_routing.rs for routing and
-/// `a_dsp_multiplier_packs_places_routes_and_is_timed` for the end-to-end case.)
-#[test]
-fn dsp_pins_are_classified_for_timing() {
-    // An input with a setup requirement must be recognised as an endpoint
-    // candidate; one without must not be.
-    use helion_xilinx7::timing::dsp_setup_ps;
-    let clocked_inputs = ["A", "B", "C", "D", "INMODE", "OPMODE", "ALUMODE", "CARRYIN"];
-    for pin in clocked_inputs {
-        assert!(
-            dsp_setup_ps(pin).is_some(),
-            "{pin} is a clocked DSP input but the model gives no setup"
-        );
+    let m = |f: fn(&mut PackedDsp)| {
+        let mut d = PackedDsp { use_mult: "MULTIPLY".into(), ..Default::default() };
+        f(&mut d);
+        d
+    };
+    let s = dsp_setup_ps;
+    // AREG_1_A_INPUT_DIRECT 0.362; AREG_0 ... MREG_1 1.928; AREG_0 ... MREG_0_PREG_1 3.722 (PATDET 4.114, with the D port 5.474).
+    assert_eq!(s(&m(|d| { d.areg = 1; d.preg = 1 }), "A0"), Some(362));
+    assert_eq!(s(&m(|d| { d.mreg = 1; d.preg = 1 }), "A24"), Some(1928));
+    assert_eq!(s(&m(|d| d.preg = 1), "A3"), Some(3722));
+    assert_eq!(s(&m(|d| { d.preg = 1; d.use_pattern_detect = true }), "A3"), Some(4114));
+    assert_eq!(s(&m(|d| { d.preg = 1; d.use_pattern_detect = true; d.use_dport = true }), "A3"), Some(5474));
+    assert_eq!(s(&m(|d| d.breg = 1), "B17"), Some(450));
+    assert_eq!(s(&m(|d| d.preg = 1), "B0"), Some(3536));
+    assert_eq!(s(&m(|d| { d.preg = 1; d.use_dport = true }), "D4"), Some(4951));
+    assert_eq!(s(&m(|d| d.preg = 1), "INMODE2"), Some(3805));
+    assert_eq!(s(&m(|d| d.creg = 1), "C5"), Some(233));
+    assert_eq!(s(&m(|d| d.preg = 1), "C47"), Some(1701));
+    assert_eq!(s(&m(|d| d.preg = 1), "OPMODE6"), Some(2209));
+    assert_eq!(s(&m(|d| d.preg = 1), "ALUMODE0"), Some(1978));
+    assert_eq!(s(&m(|d| d.preg = 1), "CARRYINSEL1"), Some(1793));
+    assert_eq!(s(&m(|d| d.preg = 1), "CARRYIN"), Some(1298));
+    assert_eq!(s(&m(|d| d.areg = 1), "CEA2"), Some(497));
+    assert_eq!(s(&m(|d| d.preg = 1), "RSTP"), Some(347));
+    // No register on the way: a combinational arc to P, not an endpoint.
+    for pin in ["A0", "B0", "C0", "OPMODE0", "CEA1", "RSTP"] {
+        assert_eq!(s(&m(|_| {}), pin), None, "{pin}");
     }
-    // Outputs and the clock itself are not setup endpoints.
-    for pin in ["P", "PCOUT", "CARRYOUT", "CLK"] {
-        assert!(
-            dsp_setup_ps(pin).is_none(),
-            "{pin} is not a clocked data input but the model treats it as one"
-        );
+    assert_eq!(s(&m(|d| d.preg = 1), "D0"), None, "no D port");
+    for pin in ["P0", "PCOUT3", "CARRYOUT0", "CLK"] {
+        assert_eq!(s(&m(|d| { d.areg = 1; d.preg = 1 }), pin), None, "{pin}");
     }
 }
 
@@ -151,6 +151,7 @@ fn dsp_arcs_are_the_sdf_slow_corner() {
     // A registered input or product is not a combinational arc to P.
     assert_eq!(dsp_comb_ps(&helion_xilinx7::pack::PackedDsp { areg: 1, ..none.clone() }, "A0"), None);
     assert_eq!(dsp_comb_ps(&helion_xilinx7::pack::PackedDsp { mreg: 1, ..none.clone() }, "B0"), None);
+    assert_eq!(dsp_comb_ps(&helion_xilinx7::pack::PackedDsp { breg: 1, ..none.clone() }, "B0"), None);
     assert_eq!(dsp_comb_ps(&helion_xilinx7::pack::PackedDsp { preg: 1, ..none }, "C0"), None);
 }
 
@@ -186,4 +187,39 @@ fn a_combinational_dsp_passes_its_input_arrival_to_p() {
     assert!(k > 0 && a.worst_path[0].what.contains("u_ffa"), "the path must start at the flop feeding A: {path:?}");
     let (before, arc) = (&a.worst_path[k - 1], &a.worst_path[k]);
     assert_eq!(arc.arrival_ps, before.arrival_ps + arc.wire_ps + 3841, "{path:?}");
+}
+
+/// AREG=1 and no P register: A's flop ends at the A register (0.362 ns
+/// setup) and P is launched by CLK through the multiplier (4.009 ns) on
+/// to the flop after it.
+#[test]
+fn an_input_registered_dsp_launches_p_from_its_clock() {
+    let mut d = Design::new("areg_dsp");
+    d.add_port("clk", PortDir::In);
+    d.add_port("a", PortDir::In);
+    d.add_port("q", PortDir::Out);
+    for (port, loc) in d.ports.iter_mut().zip(["Y9", "V5", "R16"]) {
+        port.attrs.set("LOC", loc);
+    }
+    for (ff, din, q) in [("u_ffa", "a", "qa"), ("u_ffp", "p", "q")] {
+        d.add_cell(ff, CellKind::Hff);
+        d.connect("clk", ff, "CLK");
+        d.connect(din, ff, "D");
+        d.connect(q, ff, "Q");
+    }
+    d.add_cell("u_dsp", CellKind::BlackBox { module: intern("DSP48E1") });
+    for k in ["BREG", "CREG", "DREG", "ADREG", "MREG", "PREG", "OPMODEREG", "ALUMODEREG", "INMODEREG", "CARRYINREG", "CARRYINSELREG"] {
+        d.set_cell_attr("u_dsp", k, "0").unwrap();
+    }
+    d.set_cell_attr("u_dsp", "AREG", "1").unwrap();
+    d.set_cell_attr("u_dsp", "ACASCREG", "1").unwrap();
+    d.connect("clk", "u_dsp", "CLK");
+    d.connect("qa", "u_dsp", "A0");
+    d.connect("p", "u_dsp", "P0");
+    let be = Xilinx7Backend::open("xc7z020").unwrap();
+    let routed = be.route(&be.place(&be.pack(&d).expect("pack")).expect("place")).expect("route");
+    let a = helion_xilinx7::timing::analyze_clocks(&routed, &|c: &str| c.contains("clk").then_some(10_000)).expect("timing");
+    let path: Vec<String> = a.worst_path.iter().map(|s| format!("{} @{}", s.what, s.arrival_ps)).collect();
+    assert!(a.worst_path[0].what.contains("u_dsp (DSP48E1 output)") && a.worst_path[0].arrival_ps == 4009, "P launched by CLK: {path:?}");
+    assert!(a.worst_path.iter().all(|s| !s.what.contains("A0 -> P")), "A is registered, no A -> P arc: {path:?}");
 }

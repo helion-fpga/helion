@@ -308,37 +308,70 @@ struct DspArc<'a> {
     ins: Vec<(&'a str, &'a str, u32)>,
 }
 
-/// DSP48E1 input setup in ps for a site pin, from the device's settings.
-///
-/// Only the clocked (registered) inputs have a setup requirement. With
-/// `AREG=0` the A/B/D pins feed the multiplier combinationally, so there is no
-/// setup edge to fail — the path simply gets longer, which the row's guard
-/// checks by requiring a design with AREG=0 to be reported differently from one
-/// with AREG=1. INMODE is the worst input in the SDF (5.557 ns).
-pub fn dsp_setup_ps(pin: &str) -> Option<u32> {
-    let p = pin.to_ascii_uppercase();
-    let v = if p.starts_with('A') && !p.starts_with("ALUMODE") {
-        5474 // A (worst of A/ACASCREG paths)
-    } else if p.starts_with('B') {
-        3929
-    } else if p == "C" {
-        2093
-    } else if p.starts_with('D') {
-        5342
-    } else if p.starts_with("INMODE") {
-        5557
-    } else if p.starts_with("OPMODE") {
-        2600
-    } else if p.starts_with("ALUMODE") {
-        2369
-    } else if p.starts_with("CARRYIN") {
-        1690
-    } else if p.starts_with("CARRYINSEL") {
-        2184
-    } else {
-        return None;
+/// DSP48E1 input setup in ps for a site pin (`A0`, `CARRYINSEL1`, ...),
+/// from the register the pin first reaches: its own (`AREG`, `CREG`, ...),
+/// else M, else P (slow corner, X-Ray's `timings/DSP_L.sdf`; the pattern
+/// detector adds to a path into P). `None` when the pin reaches no register
+/// (a combinational arc to P, [`dsp_comb_ps`]) or is not a data input.
+pub fn dsp_setup_ps(d: &crate::pack::PackedDsp, pin: &str) -> Option<u32> {
+    let (dport, none, pd) = (d.use_dport, d.use_mult == "NONE", d.use_pattern_detect);
+    let (m, p) = (d.mreg > 0 && !none, d.preg > 0);
+    // (own register, own, via AD, via M, via P) setups.
+    let pick = |own: u8, s: u32, ad: Option<u32>, mm: Option<u32>, pp: [u32; 2]| -> Option<u32> {
+        if own > 0 {
+            Some(s)
+        } else if let Some(v) = ad.filter(|_| dport && d.adreg > 0) {
+            Some(v)
+        } else if let Some(v) = mm.filter(|_| m) {
+            Some(v)
+        } else {
+            p.then_some(pp[pd as usize])
+        }
     };
-    Some(v)
+    match pin.trim_end_matches(|c: char| c.is_ascii_digit()) {
+        "A" | "ACIN" => pick(d.areg, 362, Some(1756), Some(if dport { 3288 } else { 1928 }), match (none, dport) {
+            (true, _) => [1958, 2349],
+            (_, true) => [5081, 5474],
+            _ => [3722, 4114],
+        }),
+        "B" | "BCIN" => pick(d.breg, 450, None, Some(1743), if none { [1938, 2331] } else { [3536, 3929] }),
+        "D" => pick(d.dreg, 413, Some(1626), Some(3158), [4951, 5342]).filter(|_| dport),
+        "INMODE" => pick(d.inmodereg, 449, Some(2089), Some(if dport { 3372 } else { 2012 }), if dport { [5165, 5557] } else { [3805, 4196] }),
+        "C" => pick(d.creg, 233, None, None, [1701, 2093]),
+        "OPMODE" => pick(d.opmodereg, 449, None, None, [2209, 2600]),
+        "ALUMODE" => pick(d.alumodereg, 246, None, None, [1978, 2369]),
+        "CARRYINSEL" => pick(d.carryinselreg, 208, None, None, [1793, 2184]),
+        "CARRYIN" => pick(d.carryinreg, 299, None, None, [1298, 1690]),
+        "PCIN" | "MULTSIGNIN" => pick(0, 0, None, None, [1400, 1792]),
+        "CARRYCASCIN" => pick(0, 0, None, None, [1028, 1420]),
+        // Clock enables and resets: only of a register that is there.
+        c => {
+            let (on, v) = match c {
+                "CEA" => (d.areg, 497),
+                "RSTA" => (d.areg, 507),
+                "CEB" => (d.breg, 514),
+                "RSTB" => (d.breg, 543),
+                "CEC" => (d.creg, 414),
+                "RSTC" => (d.creg, 84),
+                "CED" => (d.dreg, 513),
+                "RSTD" => (d.dreg.max(d.adreg), 589),
+                "CEAD" => (d.adreg, 426),
+                "CEM" => (d.mreg, 266),
+                "RSTM" => (d.mreg, 270),
+                "CEP" => (d.preg, 524),
+                "RSTP" => (d.preg, 347),
+                "CEINMODE" => (d.inmodereg, 603),
+                "RSTINMODE" => (d.inmodereg, 686),
+                "CEALUMODE" | "RSTALUMODE" => (d.alumodereg, 411),
+                "CECTRL" => (d.opmodereg.max(d.carryinselreg), 421),
+                "RSTCTRL" => (d.opmodereg.max(d.carryinselreg), 469),
+                "CECARRYIN" => (d.carryinreg, 665),
+                "RSTALLCARRYIN" => (d.carryinreg.max(d.mreg), 287),
+                _ => (0, 0),
+            };
+            (on > 0).then_some(v)
+        }
+    }
 }
 
 /// One step of a timing path.
@@ -745,7 +778,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
                     dsp_out.insert(net.as_str(), (d.name.as_str(), cko));
                 }
             } else if on_this_clock {
-                if let Some(setup) = dsp_setup_ps(pin) {
+                if let Some(setup) = dsp_setup_ps(d, pin) {
                     dsp_in.push((net.as_str(), pd.site.as_str(), pin.clone(), setup));
                 }
             }
