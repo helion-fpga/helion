@@ -1,9 +1,9 @@
 # Rung 7 board check: the ARM writes and reads the PL registers of
 # examples/zedboard_ps7_axi.sv over M_AXI_GP0, driven by openocd over JTAG.
 #
-# *** UNTESTED ON HARDWARE. ***  Written without a board. It has only been run
-# against ps7_axi_check_mock.tcl (a model of the SLCR, devcfg and the register
-# block) under tclsh and under openocd with the dummy adapter. See README.md.
+# Passes on the board: 15/15 on a ZedBoard, 2026-11-24 (see README.md). Also
+# checked against ps7_axi_check_mock.tcl (a model of the SLCR, devcfg and the
+# register block) under tclsh and under openocd with the dummy adapter.
 #
 #   ZedBoard in JTAG boot mode, then:
 #   openFPGALoader -b zedboard out.bit
@@ -163,18 +163,23 @@ proc ps7_axi_check {} {
     if {[ps7_put "LEDS byte 0" 0x4000000C 0x2A 8]} { ps7_expect "LEDS byte 0" 0x4000000C 0x2A }
     ps7_put "LEDS pattern" 0x4000000C 0x55 32
 
-    # COUNTER (0x4000_0008) counts FCLK0 cycles: measure FCLK0 over a second.
+    # COUNTER (0x4000_0008) counts FCLK0 cycles. On the board (2026-11-24) one
+    # JTAG read through the halted Cortex-A9 took 35 to 300 ms, so a single
+    # 1 s window read 76 MHz. Count over a 1 s and a 21 s sleep and divide the
+    # difference by 20 s: the read latency cancels, and its jitter is at most
+    # ~1.5% of 20 s. 21 s stays under the 42.9 s wrap of a 32-bit count at 100 MHz.
     if {[catch {
-        set t0 [ms]
-        set c0 [ps7_rd 0x40000008]
-        sleep 1000
-        set c1 [ps7_rd 0x40000008]
-        set t1 [ms]
+        set d {}
+        foreach w {1000 21000} {
+            set c0 [ps7_rd 0x40000008]
+            sleep $w
+            lappend d [expr {([ps7_rd 0x40000008] - $c0) & 0xFFFFFFFF}]
+        }
     } err]} {
         ps7_result 0 "COUNTER: $err"
     } else {
-        set mhz [expr {(($c1 - $c0) & 0xFFFFFFFF) / 1000.0 / ($t1 - $t0)}]
-        ps7_result [expr {$mhz > 98.0 && $mhz < 102.0}] "FCLK0 from COUNTER: [format %.2f $mhz] MHz over [expr {$t1 - $t0}] ms (expected 100, +-2% for JTAG latency)"
+        set mhz [expr {([lindex $d 1] - [lindex $d 0]) / 20000.0 / 1000.0}]
+        ps7_result [expr {$mhz > 98.0 && $mhz < 102.0}] "FCLK0 from COUNTER: [format %.2f $mhz] MHz from 21 s and 1 s windows (counts $d; expected 100, +-2% for JTAG latency jitter)"
     }
 
     echo "ps7_axi_check: [expr {$ps7_n - $ps7_bad}]/$ps7_n PASS (LD0..LD6 = 0x55: LD0, LD2, LD4, LD6 on; LD7 blinks at 0.75 Hz)"

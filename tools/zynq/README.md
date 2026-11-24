@@ -1,9 +1,8 @@
 # zynq: board check of the PS7 rung (ZedBoard)
 
-**Untested on hardware.** `ps7_axi_check.tcl` was written with no board
-connected. It has only been run against `ps7_axi_check_mock.tcl`, under tclsh 9
-and under openocd 0.12 with the dummy adapter. The first board session is its
-first real run.
+**Passes on the board: 15/15 (2026-11-24).** ZedBoard in JTAG boot mode, openocd
+0.12.0 on macOS, bitstream from `zedbit` at 5c95cd42 (md5
+60025d1f952a8c4099cd14668e6309ea, +4.254 ns). See "Board results" below.
 
 It checks `examples/zedboard_ps7_axi.sv` on silicon: the ARM reads and writes
 the PL registers over M_AXI_GP0, and FCLK0 is measured with the PL's cycle
@@ -27,7 +26,7 @@ The script does the following:
    - SCRATCH and LEDS after reset;
    - SCRATCH with word, byte and halfword writes (WSTRB 1111, 0010, 1100, 0001);
    - LEDS bits 6:0, and that a byte-1 write leaves it alone.
-6. Measures FCLK0 from two COUNTER reads one second apart. It must be within 2% of 100 MHz.
+6. Measures FCLK0 from COUNTER over a 1 s and a 21 s window and divides the difference by 20 s, so the JTAG read latency (35 to 300 ms per read on the board) cancels. It must be within 2% of 100 MHz.
 7. Ends with LD0, LD2, LD4 and LD6 on. LD7 blinks at about 0.75 Hz (COUNTER bit 26).
 
 The script returns the number of failed checks. The CPU is left halted.
@@ -63,11 +62,20 @@ It runs six cases, and each must end as expected:
 - PS_CLK of 50 MHz, where the FCLK0 check must FAIL;
 - PL not configured, where the script must stop before GP0.
 
-## Unverified until the board session
+## Board results (2026-11-24)
 
-- The script under openocd against the real chip: `halt`, and `read_memory`/`write_memory` through cortex_a.
-- The assumption that each CPU store becomes a single GP0 write of its own size. With the MMU off (UG585 "APU and OCM State after BootROM"), accesses should be strongly ordered.
-- The IO PLL actually locking at M = 30, and the loop settings above.
-- FCLK0 at 100 MHz. This assumes the ZedBoard's PS_CLK is 33.333 MHz; the COUNTER check measures it.
-- Whether devcfg's PCFG_DONE_INT is set when the PL is configured over JTAG by openFPGALoader. If not, the script stops at that step: check the printed INT_STS value.
-- The design itself on silicon: GP0 transactions, byte strobes, the LEDs and the LD7 heartbeat.
+First run on a ZedBoard, JTAG boot mode (BOOT_MODE read as 0x00000000), PL
+loaded with `openFPGALoader -b zedboard`. Everything the list below used to call
+unverified is now confirmed on silicon:
+
+- openocd `halt`, `read_memory` and `write_memory` through cortex_a work. The CPU sits in the BootROM JTAG loop (pc 0xffffff34) with MMU and caches off.
+- Each CPU store reaches GP0 as one write of its own size: the WSTRB 1111, 0010, 1100 and 0001 checks on SCRATCH and the byte-1 check on LEDS all pass.
+- The IO PLL locks at M = 30 with PLL_CP 2, PLL_RES 12 and LOCK_CNT 325 (IO_PLL_CTRL 0x0001E000, PLL_STATUS 0x3F).
+- FCLK0 is 100.02 MHz (this script) and 100.44 MHz (a separate 30 s differenced read), so PS_CLK is 33.333 MHz.
+- devcfg INT_STS reads 0xF802000F after an openFPGALoader JTAG load: PCFG_DONE_INT is set.
+- The design: MAGIC reads 0x484C0701, and the LEDs show 0x55 with the LD7 heartbeat blinking (seen on camera).
+
+The first run scored 14/15. Its single 1 s FCLK0 window read 76.15 MHz, because the
+JTAG reads around it took about 700 ms. The two-window measurement above replaced
+it, the mock still passes 6/6 (the 50 MHz PS_CLK case still fails as it must),
+and the second board run scored 15/15.
