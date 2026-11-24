@@ -96,7 +96,8 @@ def master_checks(db: Db, work: str) -> None:
     and 8 at 3000 cycles), while the correct RTL logs no error. And the
     summary check counts responses by itself, apart from the master's queues.
     The masters wait for the start-up reset: the slave with no initial values
-    (reset only by FCLKRESETN) logs no error either."""
+    (reset only by FCLKRESETN) logs no error either, and with no start-up
+    pulse (`--no-reset --reset-at`) they start at power-on."""
     mutant = os.path.join(work, "b_never_sent_rtl.sv")
     open(mutant, "w").write(open(SV).read().replace("b_pend <= 1'b1;", "b_pend <= wr_ok;"))
     for cycles, seeds in ((3000, range(1, 9)), (1500, range(1, 5))):
@@ -108,6 +109,14 @@ def master_checks(db: Db, work: str) -> None:
             assert not errs and not any("B and" in e for e in ps7.axi_problems(summ)), (cycles, seed, errs, summ)
             summ, errs = master_run(db, work, no_init_rtl(work), cycles, seed)
             assert not errs and not ps7.axi_problems(summ), (cycles, seed, errs, summ)
+    # `--no-reset --reset-at` has no start-up pulse: the masters run from
+    # power-on, so a late reset does not leave them idle to the end.
+    cosim.RESET_PULSE, cosim.RESET_AT = False, (2940, 3)
+    try:
+        summ, errs = master_run(db, work, SV, 3000, 1)
+    finally:
+        cosim.RESET_PULSE, cosim.RESET_AT = True, None
+    assert not errs and not ps7.axi_problems(summ), (errs, summ)
     lost = "axi MAXIGP0 writes=3 wbeats=3 bokay=1 berr=1 partial=0 reads=2 rokay=2 rerr=0 bursts=0 backtoback=0 readbacks=1 readbackbad=0 protocol=0"
     assert ps7.axi_problems([lost]) == ["MAXIGP0: 3 writes and 2 reads, 2 B and 2 last R responses"], ps7.axi_problems([lost])
     print("ps7: masters ok (a never-sent B caught on 12 runs, none forgiven by a reset; no-initial-value RTL clean)")

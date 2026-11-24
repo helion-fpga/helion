@@ -387,7 +387,9 @@ def axi_tb(top: str, top_ports: list, b: Boundary, in_bits: list[str], clock: st
                 blocks["override"].append(f"    vec[{col[bit]}] = {val};")
     blocks["override"] += [f"    vec[{col[r]}] = rstn;" for r in b.resets if r in col]
     drive = [f"    {ref(bit)} = vec[{n - 1 - i}];" for i, bit in enumerate(in_bits)]
-    first_reset = any(l[in_bits.index(b.resets[0])] == "0" for l in open(base_stim).read().split())
+    # Only the start-up pulse (cycles 4-6) counts: `--no-reset --reset-at N`
+    # must not keep the masters idle until N.
+    first_reset = any(l[in_bits.index(b.resets[0])] == "0" for l in open(base_stim).read().split()[:7])
     j = lambda key: "\n".join(blocks[key])
     return f"""`timescale 1ns/1ps
 // x7v: AXI3 masters on the PS7's M_AXI_GP ports, run against the RTL; the
@@ -398,7 +400,7 @@ module tb_axi;
 {top} dut({', '.join(conn)});
 integer fi, fs, fl, k, rc, i, j, p;
 integer seed = {seed};
-integer quiet = {-1 if first_reset else RESET_QUIET};   // -1: idle until the first reset
+integer quiet = {-1 if first_reset else RESET_QUIET};   // -1: idle until the start-up reset
 reg rstn = 0, rq, act, drain, stop;
 reg [31:0] m;
 reg [{n}-1:0] vec;
