@@ -738,7 +738,9 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     // threshold is capped, and past it no net displaces another: the rest of
     // the pass routes what has a free path and leaves the others, with the
     // nets already displaced, to PathFinder.
-    let pf_after = (net_names.len() / 4 + 500).min(4000);
+    // HELION_ROUTE_PF_AFTER overrides it: 0 hands every net that would rip
+    // up another to PathFinder, to check PathFinder on a board design.
+    let pf_after = std::env::var("HELION_ROUTE_PF_AFTER").ok().and_then(|v| v.parse().ok()).unwrap_or((net_names.len() / 4 + 500).min(4000));
     FREE_ONLY.with(|f| f.set(false));
     let mut deferred: Vec<String> = Vec::new();
     let mut rips = 0usize;
@@ -1431,12 +1433,16 @@ fn route_net(
             // A free path near the net first (giving up on long detours);
             // else the cheapest path through other nets' wires, near the
             // net and then anywhere. The caller rips up the displaced nets.
-            // In PathFinder every signal wire may be shared, so the first search
-            // already succeeds: it is the cheapest path at current prices in
-            // the net's box (the detour cap and the steep negotiating estimate
-            // let it run straight through congestion instead, G77).
+            // In PathFinder every signal wire but a clock net's may be shared:
+            // a search is the cheapest path at current prices in the net's box
+            // (the detour cap and the steep negotiating estimate let it run
+            // straight through congestion instead, G77). A box walled off by
+            // clock wires falls back to the same search over the whole device,
+            // whose expansion cap (30M) exceeds the xc7z020's 9.25M wires: it
+            // fails only when no path exists at all.
             let tries: &[(bool, i32, bool)] = match PF_MARGIN.with(|m| m.get()) {
-                Some(m) => &[(false, m, false), (true, 0, false)],
+                Some(0) => &[(false, 0, false)],
+                Some(m) => &[(false, m, false), (false, 0, false)],
                 None => &[(false, 8, true), (true, 8, false), (true, 0, false)],
             };
             for &(negotiate, bbox, cap_detour) in tries {
@@ -2302,8 +2308,9 @@ mod tests {
 
     /// G77: a net whose every path inside the first PathFinder box crosses a
     /// band of used wires. With a fixed box it shares until the stall stop;
-    /// with the box grown for each net that keeps sharing it takes a free
-    /// detour within a few iterations, and the same input routes the same way.
+    /// with the box grown for each net that keeps sharing, and searched for
+    /// the cheapest path, it takes a free detour within a few iterations, and
+    /// the same input routes the same way.
     #[test]
     fn pathfinder_grows_the_box_of_a_net_that_keeps_sharing() {
         use crate::device::{default_db_root, Device};
@@ -2311,7 +2318,7 @@ mod tests {
         let mut dev = Device::load_xc7z020(&default_db_root()).expect("load xc7z020");
         let maps = build_node_map(&mut dev);
         let ep = |site: &str, pin: &str, is_driver: bool| Endpoint { site: site.into(), pin: pin.into(), is_driver };
-        let run = || {
+        let run = |rows: i32| {
             let x = XDevice::new(&dev, maps.clone());
             let grid = |site: &str, pin: &str| {
                 let (t, _) = x.site_pin_wire(site, pin).expect("pin wire");
@@ -2325,7 +2332,7 @@ mod tests {
             let mut band = Vec::new();
             for i in 0..dev.tile_count() {
                 let t = dev.tile(i).expect("tile");
-                if t.name.starts_with("INT_") && (t.grid_x - xm).abs() <= 1 && (t.grid_y - sy).abs() <= 12 {
+                if t.name.starts_with("INT_") && (t.grid_x - xm).abs() <= 1 && (t.grid_y - sy).abs() <= rows {
                     band.extend(dev.wires(i).unwrap_or(&[]).iter().filter(|w| !is_power_wire(w)).map(|w| (t.name.clone(), w.clone())));
                 }
             }
@@ -2338,9 +2345,60 @@ mod tests {
             let RouteKind::Pips(p) = &nets.iter().find(|n| n.net == "n").expect("routed").kind else { panic!("not pips") };
             (its, p.iter().map(|p| format!("{}.{}->{}", p.tile, p.src_wire, p.dst_wire)).collect::<Vec<_>>())
         };
-        let (its, pips) = run();
+        let (its, pips) = run(12);
         assert!(its <= 8, "took {its} iterations");
-        assert_eq!(run(), (its, pips), "same input, same route");
+        assert_eq!(run(12), (its, pips), "same input, same route");
+        // A band 70 rows above and below: only the whole device (from the
+        // eighth failure) holds the detour, which is long, so a search capped
+        // at twice the direct estimate finds none, and the negotiating search
+        // (220 ps per tile) kept crossing the band. The exact search detours.
+        let (its, pips) = run(70);
+        assert!(its <= 9 && pips.len() <= 30, "took {its} iterations, {} pips", pips.len());
+    }
+
+    /// G77: a PathFinder net whose first box is cut by a clock net's wires
+    /// (which nothing may share) still routes, through the whole-device
+    /// fallback, around the clock wires and outside the box.
+    #[test]
+    fn pathfinder_falls_back_to_the_whole_device_around_clock_wires() {
+        use crate::device::{default_db_root, Device};
+        use crate::xdevice::{build_node_map, XDevice};
+        let mut dev = Device::load_xc7z020(&default_db_root()).expect("load xc7z020");
+        let maps = build_node_map(&mut dev);
+        let mut x = XDevice::new(&dev, maps);
+        x.clock_nets.insert("clk".into());
+        let grid = |x: &XDevice, site: &str, pin: &str| {
+            let (t, _) = x.site_pin_wire(site, pin).expect("pin wire");
+            let tile = dev.tile(dev.tile_by_name(&t).expect("tile")).expect("tile");
+            (tile.grid_x, tile.grid_y)
+        };
+        let ((sx, sy), (tx, _)) = (grid(&x, "SLICE_X40Y40", "AQ"), grid(&x, "SLICE_X56Y40", "AQ"));
+        // A clock net owns every interconnect wire of a band 3 columns wide
+        // between the two, 12 rows above and below: past the first box (8).
+        let xm = (sx + tx) / 2;
+        let mut claimed = HashMap::new();
+        for i in 0..dev.tile_count() {
+            let t = dev.tile(i).expect("tile");
+            if t.name.starts_with("INT_") && (t.grid_x - xm).abs() <= 1 && (t.grid_y - sy).abs() <= 12 {
+                for w in dev.wires(i).unwrap_or(&[]).iter().filter(|w| !is_power_wire(w)) {
+                    claimed.insert((t.name.clone(), w.clone()), "clk".to_string());
+                }
+            }
+        }
+        let wall: HashSet<(String, String)> = claimed.keys().cloned().collect();
+        let ep = |site: &str, pin: &str, is_driver: bool| Endpoint { site: site.into(), pin: pin.into(), is_driver };
+        let net_eps: HashMap<String, Vec<Endpoint>> =
+            [("n".to_string(), vec![ep("SLICE_X40Y40", "AQ", true), ep("SLICE_X56Y40", "A1", false)])].into_iter().collect();
+        let (mut nets, mut delays) = (Vec::new(), HashMap::new());
+        let its = pathfinder(&net_eps, &HashSet::new(), &x, &mut nets, &mut claimed, &mut delays, vec!["n".into()]).expect("routes");
+        assert_eq!(its, 1);
+        let RouteKind::Pips(p) = &nets.iter().find(|n| n.net == "n").expect("routed").kind else { panic!("not pips") };
+        assert!(!p.is_empty());
+        let node = |t: &str, w: &str| x.node_key(t, w);
+        let wall_nodes: HashSet<u64> = wall.iter().filter_map(|(t, w)| node(t, w)).collect();
+        assert!(!p.iter().flat_map(|q| [node(&q.tile, &q.src_wire), node(&q.tile, &q.dst_wire)]).flatten().any(|k| wall_nodes.contains(&k)), "took a clock wire");
+        let far = p.iter().any(|q| (dev.tile(dev.tile_by_name(&q.tile).expect("tile")).expect("tile").grid_y - sy).abs() > 8);
+        assert!(far, "stayed inside the first box");
     }
 
     /// G77 benchmark: PathFinder alone on a dense patch of the xc7z020 (every
