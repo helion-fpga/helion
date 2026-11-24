@@ -224,6 +224,45 @@ fn sink_wire_is_not_shared_with_a_through_net() {
 }
 
 #[test]
+fn bypass_sink_wire_is_terminal_for_other_nets() {
+    // N58 (a): a BYPASS wire feeding a used site pin is terminal-only,
+    // never transit. The victim net sinks at BYPASS_W1 (its FF D pin
+    // stitches to that wire); the through net's shortest path to
+    // IMUX_W26 runs through BYPASS_W1 (8 wires; the shortest path
+    // avoiding it is 10). On the base router the through net takes
+    // the shortcut in iteration 0 and the call fails loud with
+    // OveruseTimeout at max_iters=1, because both nets claim the
+    // wire. With the fix the through net detours around BYPASS_W1
+    // in iteration 0 and both nets route with zero overuse. The
+    // victim still sinks at BYPASS_W1: the rule blocks other nets,
+    // never the net the pin belongs to.
+    let mut db = int_tile_db();
+    pin(&mut db, "C6LUT", "O6", "LOGIC_OUTS_W4");
+    pin(&mut db, "BQ", "D", "BYPASS_W1");
+    pin(&mut db, "EQ2", "Q", "LOGIC_OUTS_W7");
+    pin(&mut db, "A6LUT", "I4", "IMUX_W26");
+    let nets = vec![
+        rnet("through", "EQ2", "Q", &[("A6LUT", "I4")]),
+        rnet("victim_d", "C6LUT", "O6", &[("BQ", "D")]),
+    ];
+    let opts = UltraRouteOpts {
+        seed: 0,
+        max_iters: 1,
+    };
+    let r = route_ultra(&nets, &db, opts).expect("both nets must route");
+    assert_eq!(r.overused_nodes, 0);
+    let bypass = db.wire_id("INT_X1Y0", "BYPASS_W1").unwrap();
+    assert!(
+        !r.routes[0].contains(&bypass),
+        "through net must not pass through the victim's BYPASS sink wire"
+    );
+    assert!(
+        r.routes[1].contains(&bypass),
+        "victim net must still sink at BYPASS_W1"
+    );
+}
+
+#[test]
 fn determinism_same_seed_identical_routes() {
     let db = small_db();
     let nets = vec![

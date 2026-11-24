@@ -1822,6 +1822,54 @@ fn repair_ff_xpin_conflicts(
     )
 }
 
+/// Fabric entry for a port-driven net (N58 (b)): the (site, BEL,
+/// pin) whose wire the port drives. A top-level input port has no
+/// cell and no IOB site in this flow (IOB placement is blocked on
+/// B1), so the port enters the fabric at an unused LUT O pin in a
+/// sink slice: the first unused LUT letter (A-H) of the first sink
+/// slice in sorted sink order, falling back to the next sink slice
+/// when the first is full. The pin is an OUT pin by construction,
+/// so the US-09 checker resolves it as a primary driver and traces
+/// every sink back to the port through the emitted PIPs, exactly as
+/// it resolves an IOB "I" pin. The letter must have no LUT: its O
+/// wire is then driven by nothing but the port, so the emitted PIPs
+/// cannot double-drive it. An FF in the same letter is no conflict:
+/// only a LUT drives the O wire. `None` when no sink slice has a
+/// free LUT letter; the caller fails loud naming the net.
+fn port_entry(
+    rsinks: &[(helion_ultrascale::UltraSite, String, String)],
+    placed: &helion_ultrascale::UltraPlaced,
+    packed: &helion_ultrascale::UltraPacked,
+) -> Option<(helion_ultrascale::UltraSite, String, String)> {
+    let mut ordered: Vec<&(helion_ultrascale::UltraSite, String, String)> =
+        rsinks.iter().collect();
+    ordered.sort_by_key(|(s, b, p)| (s.x, s.y, b.clone(), p.clone()));
+    let mut seen: Vec<helion_ultrascale::UltraSite> = Vec::new();
+    for (site, _, _) in &ordered {
+        if seen.contains(site) {
+            continue;
+        }
+        seen.push(*site);
+        let Some(p) = placed
+            .slices
+            .iter()
+            .find(|p| p.x == site.x && p.y == site.y)
+        else {
+            continue;
+        };
+        let Some(slice) = packed.slices.get(p.packed_idx) else {
+            continue;
+        };
+        for bel in 0..8u8 {
+            if !slice.luts.contains_key(&bel) {
+                let letter = (b'A' + bel) as char;
+                return Some((*site, format!("{letter}6LUT"), "O6".to_string()));
+            }
+        }
+    }
+    None
+}
+
 /// Build routable nets from the placed design. Only reached once a real
 /// WireDb exists. Nets touching IOBs or clock nets are skipped loudly
 /// (one hang_diag line each, naming the net and the gap): IOBs have
@@ -1892,6 +1940,15 @@ fn build_routable_nets(
         }
     }
     // Net name -> driver (cell, pin) and sinks [(cell, pin)].
+    // N58 (b): top-level input ports drive nets with no cell driver;
+    // the port names are collected here so a driverless net can be
+    // recognized as port-driven below instead of dropped silently.
+    let input_ports: HashSet<String> = design
+        .ports
+        .iter()
+        .filter(|p| matches!(p.dir, PortDir::In | PortDir::Inout))
+        .map(|p| resolve(p.name).to_string())
+        .collect();
     let mut nets: Vec<RoutableNet> = Vec::new();
     for net in &design.nets {
         let net_name = resolve(net.name).to_string();
@@ -1933,6 +1990,47 @@ fn build_routable_nets(
             }
         }
         let Some((dcell, dpin)) = driver else {
+            // N58 (b): a net driven by a top-level input port has no
+            // cell driver (the front end creates no IobIn cell), so
+            // the old code dropped it silently here and the port
+            // never reached any sink. Give it a virtual driver at
+            // an unused LUT O pin in a sink slice (see port_entry)
+            // and route it to all its sinks. The virtual driver is
+            // not a LUT O, so the intra-slice D6 filter below never
+            // applies to it: no D6 edge exists from the entry pin.
+            if !input_ports.contains(&net_name) {
+                continue;
+            }
+            // Clock pins are served by the clock legs, not by fabric
+            // routes: a port net whose sinks are all clock pins
+            // still drops out here, exactly as before.
+            sinks.retain(|(_, pin)| pin != "CLK");
+            if sinks.is_empty() {
+                println!(
+                    "hang_diag ultra route skip net={net_name} reason=top-level input port with only clock sinks (clock routing is phase 2)"
+                );
+                continue;
+            }
+            let mut rsinks = Vec::new();
+            for (scell, spin) in &sinks {
+                let (ssite, sbel) = site_of(scell)?;
+                rsinks.push((ssite, sbel, spin.clone()));
+            }
+            let Some(entry) = port_entry(&rsinks, placed, packed) else {
+                return Err(format!(
+                    "ULTRA ROUTE: port net {net_name} has no unused LUT O pin to enter the fabric at"
+                ));
+            };
+            println!(
+                "hang_diag ultra route port net={net_name} entry=SLICE_X{}Y{}.{}.{} reason=top-level input port; virtual driver at unused LUT O pin",
+                entry.0.x, entry.0.y, entry.1, entry.2
+            );
+            nets.push(RoutableNet {
+                name: net_name,
+                driver: entry,
+                sinks: rsinks,
+                is_clock: false,
+            });
             continue;
         };
         // Intra-slice LUT-O to FF-D edges are not fabric nets: when a
@@ -2375,6 +2473,138 @@ mod tests {
         let (design, packed, placed) = one_slice_design();
         let nets = build_routable_nets(&design, &packed, &placed).unwrap();
         assert_eq!(nets.len(), 0, "no net needs a fabric route here");
+    }
+
+    fn port_fanout_design() -> (Design, UltraPacked, UltraPlaced) {
+        // N58 (b): a top-level input port drives an FF D and a LUT
+        // input with no cell driver. The FF sits in letter A, the
+        // same letter as the entry, so the test also pins that the
+        // intra-slice D6 filter never applies to the virtual driver:
+        // no D6 edge exists from the entry pin, and the FF takes BYP.
+        let mut design = Design::new("portfan");
+        design.add_port("din", PortDir::In);
+        design.add_port("clk", PortDir::In);
+        design.add_cell("u_ff", CellKind::Hff);
+        design.add_cell(
+            "u_lut",
+            CellKind::Lut6 {
+                init: 0x6666666666666666,
+            },
+        );
+        design.add_cell("u_clkin", CellKind::IobIn);
+        design.connect("din", "u_ff", "D");
+        design.connect("din", "u_lut", "I0");
+        design.connect("clk", "u_clkin", "PAD");
+        design.connect("clk", "u_ff", "CLK");
+        let mut slice = PackedUltraSlice::new("SLICE_X0Y0".to_string(), SliceKind::Logic);
+        slice.luts.insert(1, "u_lut".to_string());
+        slice.lut_inits.insert(1, 0x6666666666666666);
+        slice.ffs.insert(0, "u_ff".to_string());
+        slice.ff_clk.insert(0, "clk".to_string());
+        let packed = UltraPacked {
+            slices: vec![slice],
+            ..Default::default()
+        };
+        let placed = UltraPlaced {
+            slices: vec![PlacedUltraSlice {
+                packed_idx: 0,
+                site: "SLICE_X0Y0".to_string(),
+                tile: "CLB_X0Y0".to_string(),
+                x: 0,
+                y: 0,
+            }],
+            seed: 0,
+        };
+        (design, packed, placed)
+    }
+
+    #[test]
+    fn port_driven_net_is_routable_with_virtual_driver() {
+        // The old code dropped the din net silently (no cell
+        // driver); now it routes from a virtual driver at the first
+        // unused LUT O pin in the sink slice (letter A: only the B
+        // LUT is placed). The clock port net still drops out: its
+        // sinks are all clock pins, served by the clock legs.
+        let (design, packed, placed) = port_fanout_design();
+        let nets = build_routable_nets(&design, &packed, &placed).unwrap();
+        let din = nets
+            .iter()
+            .find(|n| n.name == "din")
+            .expect("din must route");
+        assert_eq!(din.driver.1, "A6LUT");
+        assert_eq!(din.driver.2, "O6");
+        assert_eq!(
+            din.sinks.len(),
+            2,
+            "both din sinks route; the D6 filter must not drop the same-letter FF D"
+        );
+        assert!(
+            nets.iter().all(|n| n.name != "clk"),
+            "the clock port net still drops out"
+        );
+    }
+
+    #[test]
+    fn port_driven_net_routes_on_int_tile() {
+        // Flow level for N58 (b): the built din net routes on one
+        // INT tile from the virtual entry to both sinks, with zero
+        // overuse. The entry wire is LOGIC_OUTS_W0 (A_O); the FF D
+        // is AX (BOUNCE_W_0_FT1) and the LUT input is B1 (IMUX_W11).
+        let (design, packed, placed) = port_fanout_design();
+        let nets = build_routable_nets(&design, &packed, &placed).unwrap();
+        let tile_json = std::fs::read_to_string(format!(
+            "{}/../helion-ultrascale/data/tile_type_INT.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let mut db = IntTileWireDb::single_tile("INT_X0Y0", 0, 0, &tile_json).unwrap();
+        let site = helion_ultrascale::UltraSite { x: 0, y: 0, kind: 0 };
+        db.add_pin_wire(site, "A6LUT", "O6", "INT_X0Y0", "LOGIC_OUTS_W0")
+            .unwrap();
+        db.add_pin_wire(site, "AQ", "D", "INT_X0Y0", "BOUNCE_W_0_FT1")
+            .unwrap();
+        db.add_pin_wire(site, "B6LUT", "I0", "INT_X0Y0", "IMUX_W11")
+            .unwrap();
+        let r = route_ultra(&nets, &db, UltraRouteOpts::default())
+            .expect("port net must route");
+        assert_eq!(r.overused_nodes, 0);
+        let din_route = &r.routes[0];
+        let ax = db.wire_id("INT_X0Y0", "BOUNCE_W_0_FT1").unwrap();
+        let b1 = db.wire_id("INT_X0Y0", "IMUX_W11").unwrap();
+        assert!(
+            din_route.contains(&ax),
+            "din route must reach the FF D pin wire"
+        );
+        assert!(
+            din_route.contains(&b1),
+            "din route must reach the LUT input wire"
+        );
+    }
+
+    #[test]
+    fn port_driven_net_fails_loud_when_no_unused_lut_letter() {
+        // Every LUT letter is placed, so no O pin is free for the
+        // port to enter at. The builder fails loud naming the net
+        // instead of silently dropping it (the base behavior).
+        let (mut design, mut packed, placed) = port_fanout_design();
+        for bel in 0..8u8 {
+            if bel == 1 {
+                continue;
+            }
+            let cell = format!("u_lut{bel}");
+            design.add_cell(
+                &cell,
+                CellKind::Lut6 {
+                    init: 0x6666666666666666,
+                },
+            );
+            packed.slices[0].luts.insert(bel, cell);
+        }
+        let err = build_routable_nets(&design, &packed, &placed).unwrap_err();
+        assert!(
+            err.contains("din"),
+            "error must name the port net, got {err}"
+        );
     }
 
     #[test]
