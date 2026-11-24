@@ -170,6 +170,14 @@ pub fn not_ready(s: &AppState, nav: ReportNav, t: &VivadoTheme) -> El {
             None,
             t,
         )
+    } else if crate::views::device_family::is_family_part(&s.project.part) {
+        // These reports read Helion's HL10 device model; a rerun can't fill them (G86).
+        let sentence = format!(
+            "{} is not available for {} yet: it needs a Helion (HL10) device model.",
+            nav.label(),
+            s.project.part
+        );
+        kit::empty_state("reports-no-model", &sentence, None, t)
     } else {
         let (sentence, cta) = match nav {
             ReportNav::Drc => (
