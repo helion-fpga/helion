@@ -18,6 +18,11 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bitframes  # noqa: E402
 
+# Frame ECC bits (frame_bit = word*32 + bit). They follow any data change in their
+# frame, so they are dropped from the counts. US+: 1440-1487 (checked on xcku3p:
+# never flipped without a data bit in the same frame); 7-series: word 50 bits 0-12.
+ECC = {True: range(1440, 1488), False: range(1600, 1613)}
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -42,7 +47,7 @@ def main():
             continue
         idc, fr = bitframes.frames(bit)
         us = bitframes.is_ultrascale(idc)
-        diff = []
+        diff, ecc = [], 0
         for far in sorted(set(fr) | set(base_frames)):
             wa, wb = base_frames.get(far, ()), fr.get(far, ())
             for w in range(max(len(wa), len(wb))):
@@ -51,6 +56,9 @@ def main():
                     b = (x & -x).bit_length() - 1
                     x &= x - 1
                     up = (wb[w] if w < len(wb) else 0) >> b & 1
+                    if w * 32 + b in ECC[us]:
+                        ecc += 1
+                        continue
                     diff.append((far, *bitframes.far_fields(far, us), w, b, "0->1" if up else "1->0"))
         with open(os.path.join(d, f"{vid}.diff.tsv"), "w") as f:
             f.write("FAR\tblock\trow\tcol\tminor\tword\tbit\tchange\n")
@@ -61,7 +69,7 @@ def main():
                         for r in diff[: a.max_list])
         if len(diff) > a.max_list:
             bits += f",...(+{len(diff) - a.max_list})"
-        rows.append((vid, "OK", " ".join(info[1:]), str(len(diff)),
+        rows.append((vid, "OK", " ".join(info[1:]), f"{len(diff)} (+{ecc} ecc)",
                      " ".join(f"blk{b}/r{r}/c{c}" for b, r, c in cols[:8]), bits))
     with open(os.path.join(d, "summary.tsv"), "w") as f:
         f.write("id\tstatus\tchange\tbits\tcolumns\tbits(row:col:minor:framebit, +=set -=cleared)\n")
