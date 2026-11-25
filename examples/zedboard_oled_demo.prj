@@ -1,0 +1,5 @@
+# Helion project for the ZedBoard OLED bouncing-ball demo (xc7z020clg484-1).
+part xc7z020
+read_sv examples/zedboard_oled_demo.sv
+read_xdc examples/zedboard_oled_demo.xdc
+top zedboard_oled_demo
