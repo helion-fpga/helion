@@ -414,6 +414,32 @@ pub fn bitstream_pane(s: &AppState, t: &VivadoTheme) -> El {
                 .child(legend(b, t))
                 .child(far_table(s, t))
                 .child(detail(s, t))
+        } else if let Some(bit) = s
+            .program
+            .file
+            .as_ref()
+            .filter(|_| crate::runs_family::is_xilinx7(&s.project.part))
+        {
+            // The frame view reads HL10 frames; a 7-series run only leaves the .bit (G86).
+            let sentence = format!(
+                "Bitstream written: {}. The frame view isn't available for {} yet; program it from the Hardware Manager.",
+                bit.file_name().unwrap_or_default().to_string_lossy(),
+                s.project.part
+            );
+            let open_hw = cad::primary_btn(
+                "bitstream-open-hw",
+                "Open Hardware Manager",
+                t,
+                None,
+                |s: &mut AppState| {
+                    s.navigate(crate::state::CenterPane::Program);
+                },
+            );
+            col()
+                .w_full()
+                .grow(1.0)
+                .padding(8.0)
+                .child(cad::empty_state("bitstream-x7", &sentence, Some(open_hw), t))
         } else {
             let cta = match gen_reason {
                 None => Some(cad::primary_btn(
