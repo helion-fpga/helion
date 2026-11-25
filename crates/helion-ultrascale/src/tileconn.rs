@@ -41,15 +41,29 @@
 //! (`PinCoverage::ambiguous`) instead of failing the whole load, and
 //! the router never asks for them. No CLE, DSP, or BRAM pin is
 //! ambiguous.
-//! DSP and BRAM edges are loaded and counted but not registered into
-//! the routing graph, for two reasons. First, the flow places no
-//! DSP/BRAM sites yet. Second, DSP/BRAM pins stitch to INT_INTF
-//! tiles (the interface columns flanking DSP/BRAM columns), not to
-//! plain INT tiles, and the graph is built from the plain INT tile
-//! JSON only; routing them needs an INT_INTF tile model (a named
-//! follow-up gap, not a CLE blocker). A DSP pin name is also
-//! ambiguous across the tile's two sites, so DSP/BRAM registration
-//! needs a site index the flow does not carry.
+//! DSP and BRAM edges are loaded, counted, and registered into the
+//! routing graph. DSP/BRAM pins stitch to INT_INTF tiles (the
+//! interface columns flanking DSP/BRAM columns), not to plain INT
+//! tiles, so the graph instantiates those tiles from their
+//! `tile_type_INT_INTF_*.json` files (runtime-loaded from the DB
+//! root, like the tile-type files above) alongside the plain INT
+//! tiles, and joins each INT_INTF tile to its INT neighbor with
+//! tileconn stitch edges (same node, no PIP). A DSP pin name is
+//! ambiguous across the tile's two sites, so registration carries
+//! the site index (see [`SiteTile::site_index`]): each site's pins
+//! register under that site's own template, never under the other
+//! site's wires. The flow still places no DSP/BRAM sites, so the
+//! CLI flow stays CLE-only; the model is exercised through
+//! [`TileconnWireDb::from_db_and_sites`] with explicit sites.
+//!
+//! Input pins need no INT_INTF PIP: their INT_INTF wire stitches
+//! straight to an INT wire (586 of the 850 counted pins). Output
+//! pins drive through the tile's LOGIC_OUTS pass-through PIP (264 of
+//! 850); that PIP has no public segbits (no `segbits_int_intf_l.db`
+//! or `segbits_int_intf_r.db` exists), so bitgen of an output-pin
+//! route fails loud. The graph models the PIP anyway: routing and
+//! translation are proven, emission is blocked on data, not on the
+//! model.
 //!
 //! BEL-pin naming (the flow's names to site pins, for SLICEL/SLICEM):
 //! - `({L}6LUT, O6)` to `{L}_O` (LUT O6 output), `({L}6LUT, O5)` to
@@ -92,7 +106,8 @@ pub enum TileconnError {
     MissingTileType { tile_type: String, path: PathBuf },
     /// The INT tile at the stitched grid offset does not exist.
     UnknownIntTile { site: String, grid: (i32, i32) },
-    /// The stitched partner tile is not a plain INT tile.
+    /// The stitched partner tile is neither a plain INT tile nor an
+    /// INT_INTF tile.
     WrongIntTileType { tile: String, tile_type: String },
     /// An INT tile name does not parse as `INT_X<num>Y<num>`.
     BadIntTileName(String),
@@ -146,7 +161,7 @@ impl fmt::Display for TileconnError {
             ),
             Self::WrongIntTileType { tile, tile_type } => write!(
                 f,
-                "stitched partner tile '{}' has type '{}', expected 'INT'",
+                "stitched partner tile '{}' has type '{}', expected 'INT' or 'INT_INTF*'",
                 tile, tile_type
             ),
             Self::BadIntTileName(n) => {
@@ -277,31 +292,17 @@ fn same_type_site<'a>(
         .nth(index)
 }
 
-/// Parse `INT_X<num>Y<num>` into tile coordinates.
-fn parse_int_tile_name(name: &str) -> Result<(i32, i32), TileconnError> {
-    let rest = name
-        .strip_prefix("INT_X")
-        .ok_or_else(|| TileconnError::BadIntTileName(name.to_string()))?;
-    let (xs, ys) = rest
-        .split_once('Y')
-        .ok_or_else(|| TileconnError::BadIntTileName(name.to_string()))?;
-    let x: i32 = xs
-        .parse()
-        .map_err(|_| TileconnError::BadIntTileName(name.to_string()))?;
-    let y: i32 = ys
-        .parse()
-        .map_err(|_| TileconnError::BadIntTileName(name.to_string()))?;
-    Ok((x, y))
-}
-
-/// One resolved site-pin to INT-wire edge.
+/// One resolved site-pin to INT/INT_INTF-wire edge.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PinWire {
     /// External site wire, e.g. `CLE_CLE_L_SITE_0_A1`.
     pub site_wire: String,
-    /// INT wire name, e.g. `IMUX_E10`.
+    /// Partner wire name in the partner tile, e.g. `IMUX_E10`.
     pub int_wire: String,
-    /// Grid delta from the site tile to the INT tile, e.g. `(-1, 0)`.
+    /// Partner tile type: `INT` for CLE pins, `INT_INTF_L` /
+    /// `INT_INTF_R` (or a PCIE4 / TERM variant) for DSP/BRAM pins.
+    pub partner_type: String,
+    /// Grid delta from the site tile to the partner tile, e.g. `(-1, 0)`.
     pub delta: (i32, i32),
 }
 
@@ -363,6 +364,21 @@ pub struct TileconnDb {
     /// tile's sites (DSP has two `DSP48E2` sites per tile), while a
     /// site wire is unique.
     pub edges: HashMap<(String, String), PinWire>,
+    /// `(tile type, external site wire)` to its INT_INTF edge, for
+    /// pins whose unique partner is an INT_INTF tile (all DSP/BRAM
+    /// fabric pins: 472 DSP, 131 RAMB181, 81 RAMBFIFO36, 166
+    /// RAMBFIFO18). Same keying as `edges`; the two maps are
+    /// disjoint by construction (no pin has both a plain-INT and an
+    /// INT_INTF partner in this DB).
+    pub intf_edges: HashMap<(String, String), PinWire>,
+    /// Tileconn stitch pairs between INT_INTF and INT tiles, by
+    /// INT_INTF tile type: `(INT_INTF wire, INT wire, grid delta from
+    /// the INT_INTF tile to the INT tile)`. 1,878 distinct pairs for
+    /// xczu3eg. The graph adds one bidirectional same-node edge per
+    /// pair for each instantiated INT_INTF tile. Retained from the
+    /// load (the full partner index is dropped); the pairs are the
+    /// only fabric-to-fabric stitches the graph needs.
+    pub intf_stitches: HashMap<String, Vec<(String, String, (i32, i32))>>,
     /// Tile-type files as loaded, by tile type.
     pub tile_types: HashMap<String, TileTypeFile>,
     /// Site name to its tile.
@@ -440,19 +456,48 @@ impl TileconnDb {
         // table and coverage, then dropped.
         let mut partners: HashMap<(String, String), Vec<(String, String, (i32, i32))>> =
             HashMap::new();
+        // INT_INTF to INT stitch pairs, by INT_INTF tile type: kept,
+        // unlike the partner index (the graph adds one edge per pair
+        // per instantiated INT_INTF tile). Each pair is stored once,
+        // normalized to (INT_INTF wire, INT wire, delta from the
+        // INT_INTF tile to the INT tile), whichever orientation the
+        // entry lists.
+        let mut intf_stitches: HashMap<String, Vec<(String, String, (i32, i32))>> = HashMap::new();
         for e in &entries {
             let (a, b) = (e.tile_types[0].clone(), e.tile_types[1].clone());
             let (dx, dy) = (e.grid_deltas[0], e.grid_deltas[1]);
             for [wa, wb] in &e.wire_pairs {
-                partners
-                    .entry((a.clone(), wa.clone()))
-                    .or_default()
-                    .push((b.clone(), wb.clone(), (dx, dy)));
-                partners
-                    .entry((b.clone(), wb.clone()))
-                    .or_default()
-                    .push((a.clone(), wa.clone(), (-dx, -dy)));
+                partners.entry((a.clone(), wa.clone())).or_default().push((
+                    b.clone(),
+                    wb.clone(),
+                    (dx, dy),
+                ));
+                partners.entry((b.clone(), wb.clone())).or_default().push((
+                    a.clone(),
+                    wa.clone(),
+                    (-dx, -dy),
+                ));
+                if a.starts_with("INT_INTF") && b == "INT" {
+                    intf_stitches.entry(a.clone()).or_default().push((
+                        wa.clone(),
+                        wb.clone(),
+                        (dx, dy),
+                    ));
+                } else if b.starts_with("INT_INTF") && a == "INT" {
+                    intf_stitches.entry(b.clone()).or_default().push((
+                        wb.clone(),
+                        wa.clone(),
+                        (-dx, -dy),
+                    ));
+                }
             }
+        }
+        // Stitch pairs are unique per (type, intf wire, INT wire,
+        // delta): tileconn lists each pair once, and the two
+        // orientations above never both fire for one entry.
+        for pairs in intf_stitches.values_mut() {
+            pairs.sort();
+            pairs.dedup();
         }
 
         // Site lookup from the tilegrid.
@@ -524,8 +569,9 @@ impl TileconnDb {
             tile_types.insert(t.clone(), file);
         }
 
-        // Edge table and coverage.
+        // Edge tables and coverage.
         let mut edges: HashMap<(String, String), PinWire> = HashMap::new();
+        let mut intf_edges: HashMap<(String, String), PinWire> = HashMap::new();
         let mut coverage: HashMap<(String, String), PinCoverage> = HashMap::new();
         for (tile_type, file) in &tile_types {
             for site in &file.sites {
@@ -550,35 +596,63 @@ impl TileconnDb {
                     int_partners.dedup();
                     // DSP/BRAM columns are flanked by INT_INTF tiles,
                     // not plain INT tiles: their pins stitch to the
-                    // interface tiles, which this graph does not model
-                    // yet. Counted, not edged.
-                    if ps.iter().any(|(pt, _, _)| pt.starts_with("INT_INTF")) {
+                    // interface tiles. A pin with exactly one
+                    // INT_INTF partner gets an INT_INTF edge, the
+                    // same as a plain-INT edge, and the graph
+                    // registers it into that tile.
+                    let mut intf_partners: Vec<(String, String, (i32, i32))> = ps
+                        .iter()
+                        .filter(|(pt, _, _)| pt.starts_with("INT_INTF"))
+                        .map(|(pt, w, d)| (pt.clone(), w.clone(), *d))
+                        .collect();
+                    intf_partners.sort();
+                    intf_partners.dedup();
+                    if !intf_partners.is_empty() {
                         cov.intf_partner += 1;
                     }
-                    if int_partners.is_empty() {
+                    if int_partners.len() == 1 {
+                        // Unchanged from the INT-only loader: one
+                        // plain-INT partner is the edge, whatever
+                        // else the pin touches (no pin in this DB has
+                        // both a plain-INT and an INT_INTF partner).
+                        cov.int_partner += 1;
+                        let (int_wire, delta) = int_partners.into_iter().next().unwrap();
+                        edges.insert(
+                            (tile_type.clone(), ext.clone()),
+                            PinWire {
+                                site_wire: ext,
+                                int_wire,
+                                partner_type: "INT".to_string(),
+                                delta,
+                            },
+                        );
                         continue;
                     }
-                    if int_partners.len() > 1 {
-                        // Ambiguous fan-out: the pin stitches to the
-                        // same INT wire in more than one neighboring
-                        // tile (IO, clock, and config pins do this;
-                        // no CLE, DSP, or BRAM pin does). No single
-                        // edge exists, so no edge is recorded and the
-                        // load does not fail: the router never asks
-                        // for these pins. Counted separately.
-                        cov.ambiguous += 1;
+                    if int_partners.is_empty() && intf_partners.len() == 1 {
+                        let (partner_type, int_wire, delta) =
+                            intf_partners.into_iter().next().unwrap();
+                        intf_edges.insert(
+                            (tile_type.clone(), ext.clone()),
+                            PinWire {
+                                site_wire: ext,
+                                int_wire,
+                                partner_type,
+                                delta,
+                            },
+                        );
                         continue;
                     }
-                    cov.int_partner += 1;
-                    let (int_wire, delta) = int_partners.into_iter().next().unwrap();
-                    edges.insert(
-                        (tile_type.clone(), ext.clone()),
-                        PinWire {
-                            site_wire: ext,
-                            int_wire,
-                            delta,
-                        },
-                    );
+                    if int_partners.is_empty() && intf_partners.is_empty() {
+                        continue;
+                    }
+                    // Ambiguous fan-out: the pin stitches to the
+                    // same wire in more than one neighboring tile
+                    // (IO, clock, and config pins do this; no CLE,
+                    // DSP, or BRAM pin does). No single edge exists,
+                    // so no edge is recorded and the load does not
+                    // fail: the router never asks for these pins.
+                    // Counted separately.
+                    cov.ambiguous += 1;
                 }
             }
         }
@@ -587,6 +661,8 @@ impl TileconnDb {
             part_dir,
             part: part.to_string(),
             edges,
+            intf_edges,
+            intf_stitches,
             tile_types,
             site_tiles,
             tile_by_grid,
@@ -638,13 +714,15 @@ impl TileconnDb {
         found
     }
 
-    /// `(INT tile name, INT wire name)` for one site pin, or `None`
-    /// when the pin has no INT partner (carry pins, unmapped pins).
-    /// The pin is read from the site's own template only (the
-    /// rank-th same-type entry in the tile-type file): a tile with
-    /// several sites of one type used to loop over all of them and
-    /// return `None` on the ambiguity, so a pin present on more than
-    /// one same-type site never resolved.
+    /// `(partner tile name, partner wire name)` for one site pin, or
+    /// `None` when the pin has no fabric partner (carry pins,
+    /// unmapped pins). The partner tile is a plain INT tile for CLE
+    /// pins and an INT_INTF tile for DSP/BRAM pins. The pin is read
+    /// from the site's own template only (the rank-th same-type entry
+    /// in the tile-type file): a tile with several sites of one type
+    /// used to loop over all of them and return `None` on the
+    /// ambiguity, so a pin present on more than one same-type site
+    /// never resolved.
     pub fn int_tile_for_site(&self, site: &str, pin: &str) -> Option<(String, String)> {
         let st = self.site_tiles.get(site)?;
         let file = self.tile_types.get(&st.tile_type)?;
@@ -653,10 +731,34 @@ impl TileconnDb {
             return None;
         };
         let ext = external_wire(&info.wire);
-        let edge = self.edges.get(&(st.tile_type.clone(), ext.to_string()))?;
+        let edge = partner_edge(self, &st.tile_type, ext)?;
         let (gx, gy) = (st.grid_x + edge.delta.0, st.grid_y + edge.delta.1);
         let (tile, _) = self.tile_by_grid.get(&(gx, gy))?;
         Some((tile.clone(), edge.int_wire.clone()))
+    }
+
+    /// The `tile_type_INT_INTF_*.json` text for one INT_INTF tile
+    /// type, read from the DB root's `tile_types` directory (the
+    /// runtime-loading pattern of [`TileconnDb::load`]: the DB files
+    /// are never vendored). Fails loud when the file is missing: a
+    /// graph that needs the tile cannot be built without its PIPs.
+    pub fn intf_tile_json(&self, tile_type: &str) -> Result<String, TileconnError> {
+        let Some(root) = self.part_dir.parent() else {
+            return Err(TileconnError::Io(format!(
+                "part dir {} has no parent",
+                self.part_dir.display()
+            )));
+        };
+        let path = root
+            .join("tile_types")
+            .join(format!("tile_type_{tile_type}.json"));
+        if !path.is_file() {
+            return Err(TileconnError::MissingTileType {
+                tile_type: tile_type.to_string(),
+                path,
+            });
+        }
+        read_text(&path)
     }
 
     /// Coverage for one (tile type, site type).
@@ -674,18 +776,25 @@ impl TileconnDb {
     }
 }
 
-/// Resolve the (INT tile name, INT wire name) for one site pin of one
-/// site tile, failing loud when the stitched tile is missing or is
-/// not a plain INT tile.
-fn resolve_int_tile(
+/// The edge for one (tile type, external site wire): the plain-INT
+/// edge first, else the INT_INTF edge. `None` when the pin has no
+/// single fabric edge (carry pins, cascade pins, ambiguous pins).
+fn partner_edge<'a>(db: &'a TileconnDb, tile_type: &str, ext_wire: &str) -> Option<&'a PinWire> {
+    let key = (tile_type.to_string(), ext_wire.to_string());
+    db.edges.get(&key).or_else(|| db.intf_edges.get(&key))
+}
+
+/// Resolve the (partner tile name, partner wire name, partner tile
+/// type) for one site pin of one site tile, failing loud when the
+/// stitched tile is missing or is neither a plain INT tile nor an
+/// INT_INTF tile. CLE pins resolve to INT tiles; DSP/BRAM pins to
+/// INT_INTF tiles.
+fn resolve_partner_tile(
     db: &TileconnDb,
     st: &SiteTile,
     ext_wire: &str,
-) -> Result<Option<(String, String)>, TileconnError> {
-    let Some(edge) = db
-        .edges
-        .get(&(st.tile_type.clone(), ext_wire.to_string()))
-    else {
+) -> Result<Option<(String, String, String)>, TileconnError> {
+    let Some(edge) = partner_edge(db, &st.tile_type, ext_wire) else {
         return Ok(None);
     };
     let grid = (st.grid_x + edge.delta.0, st.grid_y + edge.delta.1);
@@ -695,13 +804,38 @@ fn resolve_int_tile(
             grid,
         });
     };
-    if tile_type != "INT" {
+    if tile_type != "INT" && !tile_type.starts_with("INT_INTF") {
         return Err(TileconnError::WrongIntTileType {
             tile: tile.clone(),
             tile_type: tile_type.clone(),
         });
     }
-    Ok(Some((tile.clone(), edge.int_wire.clone())))
+    Ok(Some((
+        tile.clone(),
+        edge.int_wire.clone(),
+        tile_type.clone(),
+    )))
+}
+
+/// Parse `<TYPE>_X<num>Y<num>` into tile coordinates, where TYPE is
+/// the tile type (e.g. `INT`, `INT_INTF_R`, `INT_INTF_L_PCIE4`).
+/// The name coordinates are the graph coordinates: INT_X13Y0 and
+/// INT_INTF_R_X13Y0 are both (13, 0), the same column and row.
+fn parse_named_tile(name: &str, tile_type: &str) -> Result<(i32, i32), TileconnError> {
+    let prefix = format!("{tile_type}_X");
+    let rest = name
+        .strip_prefix(&prefix)
+        .ok_or_else(|| TileconnError::BadIntTileName(name.to_string()))?;
+    let (xs, ys) = rest
+        .split_once('Y')
+        .ok_or_else(|| TileconnError::BadIntTileName(name.to_string()))?;
+    let x: i32 = xs
+        .parse()
+        .map_err(|_| TileconnError::BadIntTileName(name.to_string()))?;
+    let y: i32 = ys
+        .parse()
+        .map_err(|_| TileconnError::BadIntTileName(name.to_string()))?;
+    Ok((x, y))
 }
 
 /// Routing graph over real INT tiles with BEL pins resolved from the
@@ -753,11 +887,12 @@ impl TileconnWireDb {
 
     /// Build from an already-loaded [`TileconnDb`] and explicit
     /// `(site, site name)` pairs. The test-friendly constructor:
-    /// unit tests pass fixture DBs here. Besides the INT tiles the
-    /// placed pins stitch to, the graph also instantiates the INT
-    /// tiles neighboring them (see the expansion in the body), so
-    /// continuation edges exist and the router can spill across INT
-    /// tiles.
+    /// unit tests pass fixture DBs here. Besides the INT/INT_INTF
+    /// tiles the placed pins stitch to, the graph also instantiates
+    /// the INT tiles neighboring them (see the expansion in the
+    /// body), so continuation edges exist and the router can spill
+    /// across INT tiles. Each INT_INTF tile is joined to its INT
+    /// neighbor with tileconn stitch edges (same node, no PIP).
     pub fn from_db_and_sites(
         int_tile_json: &str,
         db: TileconnDb,
@@ -766,11 +901,11 @@ impl TileconnWireDb {
         if sites.is_empty() {
             return Err(TileconnError::NoSites);
         }
-        // Resolve the INT tiles and pin registrations first, so a
-        // bad site fails loud before any graph is built.
-        let mut int_tiles: Vec<IntTile> = Vec::new();
+        // Resolve the partner tiles and pin registrations first, so
+        // a bad site fails loud before any graph is built.
+        let mut tiles: Vec<IntTile> = Vec::new();
         let mut tile_seen: HashMap<String, ()> = HashMap::new();
-        // (site, bel, pin, INT tile, INT wire).
+        // (site, bel, pin, partner tile, partner wire).
         let mut regs: Vec<(UltraSite, String, String, String, String)> = Vec::new();
         for (site, site_name) in sites {
             let st = db
@@ -804,20 +939,14 @@ impl TileconnWireDb {
                     continue;
                 };
                 let ext = external_wire(&info.wire);
-                let Some((int_tile, int_wire)) = resolve_int_tile(&db, st, ext)? else {
+                let Some((tile, wire, tile_type)) = resolve_partner_tile(&db, st, ext)? else {
                     continue;
                 };
-                let (tx, ty) = parse_int_tile_name(&int_tile)?;
-                if tile_seen.insert(int_tile.clone(), ()).is_none() {
-                    int_tiles.push(IntTile::new(&int_tile, tx, ty));
+                let (tx, ty) = parse_named_tile(&tile, &tile_type)?;
+                if tile_seen.insert(tile.clone(), ()).is_none() {
+                    tiles.push(IntTile::new_typed(&tile, tx, ty, &tile_type));
                 }
-                regs.push((
-                    *site,
-                    pin.clone(),
-                    pin.clone(),
-                    int_tile,
-                    int_wire,
-                ));
+                regs.push((*site, pin.clone(), pin.clone(), tile, wire));
             }
             // Flow BEL-pin aliases for CLE slices (see module docs).
             if st.site_type == "SLICEL" || st.site_type == "SLICEM" {
@@ -848,14 +977,14 @@ impl TileconnWireDb {
                     let Some(ext) = ext_wire else {
                         return Ok(());
                     };
-                    let Some((int_tile, int_wire)) = resolve_int_tile(&db, st, &ext)? else {
+                    let Some((tile, wire, tile_type)) = resolve_partner_tile(&db, st, &ext)? else {
                         return Ok(());
                     };
-                    let (tx, ty) = parse_int_tile_name(&int_tile)?;
-                    if tile_seen.insert(int_tile.clone(), ()).is_none() {
-                        int_tiles.push(IntTile::new(&int_tile, tx, ty));
+                    let (tx, ty) = parse_named_tile(&tile, &tile_type)?;
+                    if tile_seen.insert(tile.clone(), ()).is_none() {
+                        tiles.push(IntTile::new_typed(&tile, tx, ty, &tile_type));
                     }
-                    regs.push((*site, bel, pin, int_tile, int_wire));
+                    regs.push((*site, bel, pin, tile, wire));
                     Ok(())
                 };
                 for letter in 'A'..='H' {
@@ -893,7 +1022,56 @@ impl TileconnWireDb {
                 }
             }
         }
-        // Expand the graph to the INT tiles neighboring each seed
+        // Tile name to tilegrid grid coordinates. Tile NAME
+        // coordinates and tilegrid GRID coordinates differ
+        // (INT_X13Y0 is name (13, 0) but grid (217, 185)), and
+        // tileconn deltas are grid deltas, so every stitch lookup
+        // below goes through this map, never through name coords.
+        let grid_of: HashMap<String, (i32, i32)> = db
+            .tile_by_grid
+            .iter()
+            .map(|((gx, gy), (name, _))| (name.clone(), (*gx, *gy)))
+            .collect();
+        // Instantiate each INT_INTF tile's stitch-partner INT tile:
+        // the INT tile tileconn names at the pair's grid delta. The
+        // pin loop above only instantiated tiles pins stitch to, so
+        // without this the stitch edges below would have no INT end.
+        // A pair whose INT tile is missing from the tilegrid fails
+        // loud: the DB and the tilegrid disagree.
+        let intf_tiles: Vec<IntTile> = tiles
+            .iter()
+            .filter(|t| t.tile_type.starts_with("INT_INTF"))
+            .cloned()
+            .collect();
+        for t in &intf_tiles {
+            let Some(pairs) = db.intf_stitches.get(&t.tile_type) else {
+                continue;
+            };
+            let (igx, igy) = grid_of[&t.name];
+            let mut partner_grids: std::collections::HashSet<(i32, i32)> =
+                std::collections::HashSet::new();
+            for (_, _, (dx, dy)) in pairs {
+                partner_grids.insert((igx + dx, igy + dy));
+            }
+            for grid in partner_grids {
+                let Some((name, tile_type)) = db.tile_by_grid.get(&grid) else {
+                    return Err(TileconnError::UnknownIntTile {
+                        site: t.name.clone(),
+                        grid,
+                    });
+                };
+                if tile_type != "INT" {
+                    return Err(TileconnError::WrongIntTileType {
+                        tile: name.clone(),
+                        tile_type: tile_type.clone(),
+                    });
+                }
+                if tile_seen.insert(name.clone(), ()).is_none() {
+                    tiles.push(IntTile::new(name, grid.0, grid.1));
+                }
+            }
+        }
+        // Expand the graph to the INT tiles neighboring each seed INT
         // tile in tile-name coordinates (dx, dy in -1..=1). A seed
         // tile alone has zero continuation edges, so the router can
         // never leave it: every inter-slice net must fit inside one
@@ -907,14 +1085,20 @@ impl TileconnWireDb {
         // missing coordinate is skipped (for example INT_X1Y-1 does
         // not exist). The seed tiles are unchanged, so single-slice
         // designs keep exactly their old graph plus neighbors they
-        // can also use.
+        // can also use. INT_INTF tiles are not expanded: they have
+        // no span wires, so their only neighbors are the stitch
+        // partners added above.
         let existing_int: std::collections::HashSet<String> = db
             .tile_by_grid
             .values()
             .filter(|(_, t)| t == "INT")
             .map(|(n, _)| n.clone())
             .collect();
-        let seed_tiles = int_tiles.clone();
+        let seed_tiles: Vec<IntTile> = tiles
+            .iter()
+            .filter(|t| t.tile_type == "INT")
+            .cloned()
+            .collect();
         for t in &seed_tiles {
             for dx in -1..=1i32 {
                 for dy in -1..=1i32 {
@@ -930,15 +1114,69 @@ impl TileconnWireDb {
                         continue;
                     }
                     if tile_seen.insert(name.clone(), ()).is_none() {
-                        int_tiles.push(IntTile::new(&name, nx, ny));
+                        tiles.push(IntTile::new(&name, nx, ny));
                     }
                 }
             }
         }
-        int_tiles.sort_by_key(|t| (t.y, t.x));
-        let mut inner = IntTileWireDb::from_json(int_tile_json, &int_tiles)?;
+        tiles.sort_by_key(|t| (t.y, t.x));
+        // Load one JSON per INT_INTF tile type present, from the DB
+        // root (runtime loading, never vendored).
+        let mut intf_types: Vec<String> = tiles
+            .iter()
+            .filter(|t| t.tile_type.starts_with("INT_INTF"))
+            .map(|t| t.tile_type.clone())
+            .collect();
+        intf_types.sort();
+        intf_types.dedup();
+        let mut intf_jsons: Vec<(String, String)> = Vec::with_capacity(intf_types.len());
+        for t in &intf_types {
+            intf_jsons.push((t.clone(), db.intf_tile_json(t)?));
+        }
+        let mut json_refs: Vec<(&str, &str)> = vec![("INT", int_tile_json)];
+        for (t, j) in &intf_jsons {
+            json_refs.push((t.as_str(), j.as_str()));
+        }
+        let mut inner = IntTileWireDb::from_json_typed(&json_refs, &tiles)?;
         for (site, bel, pin, tile, wire) in &regs {
             inner.add_pin_wire(*site, bel, pin, tile, wire)?;
+        }
+        // Tileconn stitch edges: one bidirectional same-node edge per
+        // (INT_INTF wire, INT wire) pair, for each instantiated
+        // INT_INTF tile. A pair whose INT tile was not instantiated
+        // fails loud: the graph and tileconn disagree.
+        for t in &intf_tiles {
+            let Some(pairs) = db.intf_stitches.get(&t.tile_type) else {
+                continue;
+            };
+            let (igx, igy) = grid_of[&t.name];
+            for (intf_wire, int_wire, (dx, dy)) in pairs {
+                let grid = (igx + dx, igy + dy);
+                let Some((int_tile, _)) = db.tile_by_grid.get(&grid) else {
+                    return Err(TileconnError::UnknownIntTile {
+                        site: t.name.clone(),
+                        grid,
+                    });
+                };
+                let (Some(a), Some(b)) = (
+                    inner.wire_id(&t.name, intf_wire),
+                    inner.wire_id(int_tile, int_wire),
+                ) else {
+                    return Err(TileconnError::UnknownIntTile {
+                        site: format!(
+                            "{}.{} stitch to {}.{}",
+                            t.name, intf_wire, int_tile, int_wire
+                        ),
+                        grid,
+                    });
+                };
+                inner.add_stitch(a, b).map_err(|e| {
+                    TileconnError::Io(format!(
+                        "stitch {}.{} to {}.{}: {}",
+                        t.name, intf_wire, int_tile, int_wire, e
+                    ))
+                })?;
+            }
         }
         Ok(Self {
             inner,
@@ -960,6 +1198,20 @@ impl TileconnWireDb {
     /// Number of INT tile instances in the graph.
     pub fn tile_count(&self) -> usize {
         self.inner.tile_count()
+    }
+
+    /// Number of INT_INTF tile instances in the graph.
+    pub fn intf_tile_count(&self) -> usize {
+        self.inner
+            .tiles()
+            .iter()
+            .filter(|t| t.tile_type.starts_with("INT_INTF"))
+            .count()
+    }
+
+    /// Number of tileconn stitch edges in the graph.
+    pub fn stitch_count(&self) -> usize {
+        self.inner.stitch_count()
     }
 
     /// Wires per tile instance (1,475 for the vendored INT tile JSON).
@@ -1029,6 +1281,10 @@ impl WireDb for TileconnWireDb {
 
     fn wire_info(&self, wire: WireId) -> Option<WireInfo<'_>> {
         self.inner.wire_info(wire)
+    }
+
+    fn is_stitch(&self, a: WireId, b: WireId) -> bool {
+        self.inner.is_stitch(a, b)
     }
 }
 
@@ -1477,9 +1733,21 @@ mod tests {
 
     #[test]
     fn int_tile_name_parses() {
-        assert_eq!(parse_int_tile_name("INT_X0Y0"), Ok((0, 0)));
-        assert_eq!(parse_int_tile_name("INT_X12Y45"), Ok((12, 45)));
-        assert!(parse_int_tile_name("INT_INTF_L_X0Y0").is_err());
-        assert!(parse_int_tile_name("CLEL_R_X0Y0").is_err());
+        assert_eq!(parse_named_tile("INT_X0Y0", "INT"), Ok((0, 0)));
+        assert_eq!(parse_named_tile("INT_X12Y45", "INT"), Ok((12, 45)));
+        // INT and INT_INTF tiles in one column share name
+        // coordinates: INT_X13Y0 and INT_INTF_R_X13Y0 are both
+        // (13, 0).
+        assert_eq!(
+            parse_named_tile("INT_INTF_R_X13Y0", "INT_INTF_R"),
+            Ok((13, 0))
+        );
+        assert_eq!(
+            parse_named_tile("INT_INTF_L_PCIE4_X12Y0", "INT_INTF_L_PCIE4"),
+            Ok((12, 0))
+        );
+        assert!(parse_named_tile("INT_INTF_L_X0Y0", "INT").is_err());
+        assert!(parse_named_tile("CLEL_R_X0Y0", "INT").is_err());
+        assert!(parse_named_tile("INT_X0Y0", "INT_INTF_R").is_err());
     }
 }
