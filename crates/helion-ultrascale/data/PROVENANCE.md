@@ -162,9 +162,10 @@ so no site-type JSON feeds the INT audit directly.
   (untracked in the base worktree; not present in this worktree).
 - License: MIT. Verified 2026-11-07: the clone's `LICENSE` file is the
   MIT license, Copyright (c) 2022 EPFL VLSC.
-- The 4.5 MB `resources/archs/ULTRASCALE_PLUS.json` is NOT copied here
-  in full; the device-file worker owns the arch JSON. The four
-  LUT/FF/BRAM bit-location tables extracted from it ARE vendored here
+- The 4.5 MB `resources/archs/ULTRASCALE_PLUS.json` is vendored here
+  in full as `ULTRASCALE_PLUS.json` (SHA-256 c6320fe7..., the source
+  hash below; added in 08d3bfcd for the device-file loader). The four
+  LUT/FF/BRAM bit-location tables extracted from it are also vendored
   as `ultrascale_plus_lut_ff_bram.json`; see the subsection below.
 - The pointers this crew relies on, for the record:
   - LUT INIT: `{CLEL_L,CLEL_R,CLEM,CLEM_R}.LutLoc.Y_ofst[0..59].frame_ofst[{A..H}6LUT]` (64 offsets each) and `.minor[...]`

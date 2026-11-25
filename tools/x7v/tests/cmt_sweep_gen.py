@@ -1,7 +1,7 @@
 """Generate the CMT sweep designs Vivado builds for tests/cmt_sweep.py.
 
 Usage: python3 tests/cmt_sweep_gen.py <dir>   (writes <dir>/rtl/*.sv, *.xdc)
-Then on the USF cluster, with ref_build.tcl (~/helion-zed-builds/vivado_jobs/)
+Then on a Vivado cluster, with ref_build.tcl (~/helion-zed-builds/vivado_jobs/)
 next to tests/cmt_sweep_jobs.sh: bash cmt_sweep_jobs.sh sweep_<name> ...
 
 * sweep_<bandwidth>_<m>: four MMCME2_ADV and four PLLE2_ADV, feedback

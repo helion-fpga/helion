@@ -573,7 +573,9 @@ fn zynqusp_db_root() -> PathBuf {
     if let Ok(p) = std::env::var("HELION_DECODE_DB_ROOT") {
         return PathBuf::from(p);
     }
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
     PathBuf::from(home).join("workspace/prjuray-db-ref/zynqusp")
 }
 

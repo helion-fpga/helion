@@ -1,5 +1,5 @@
 #!/bin/bash
-# Vivado 2017.3 builds of the rung 4 design and the CMT sweep (USF cluster,
+# Vivado 2017.3 builds of the rung 4 design and the CMT sweep (Vivado cluster,
 # SLURM partition sc). Usage: bash cmt_sweep_jobs.sh [ref_mmcm | sweep_<name> ...]
 cd "$(dirname "$0")"; D=$PWD
 V=/apps/xilinx/vivado/2017.3/Vivado/2017.3/settings64.sh

@@ -19,8 +19,8 @@ block, or a named blocker proving why a block cannot be closed without Vivado.
   computes this per block. Zero diff at tier 1 means identical against every
   public source of truth that exists.
 - Tier 2, needs Vivado: the same design built by Vivado, bit-for-bit equal.
-  BLOCKED: license server 27000@license2.forest.usf.edu connection refused
-  since Oct 22, 2026. Saksham follows up with the lab admin. The PinPlanning
+  BLOCKED: license server connection refused
+  since Oct 22, 2026. The owner follows up with the license admin. The PinPlanning
   probe (license-free, exports part properties and one INT tile PIP list) is
   still not run; it unblocks the INT PIP completeness audit. Tier 2 runs the
   day license access exists. Any tier-1-green block that disagrees with

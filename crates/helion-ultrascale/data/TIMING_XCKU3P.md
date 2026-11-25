@@ -150,7 +150,7 @@ timing while its source is a forum ballpark.
 
 ## 5. Unblocker: what only Vivado can supply, and how
 
-License state is UNKNOWN (license server 27000@license2.forest.usf.edu
+License state is UNKNOWN (license server
 connection refused since Oct 22, 2026; no check run from this VM).
 When a licensed Vivado is available, on the cluster, run on the
 placed and routed blinky and counter for part xcku3p-2 (speed grade

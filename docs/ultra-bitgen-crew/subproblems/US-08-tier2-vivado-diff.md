@@ -25,7 +25,7 @@ for the same design). A design counts only when green at both tiers.
   arch JSON), checkable with no Vivado. Tier 2 is a zero diff against a
   real Vivado bitstream for the same design. Any tier-1-green block that
   disagrees with Vivado is a real bug.
-- The license history: the license server 27000@license2.forest.usf.edu
+- The license history: the Vivado license server
   refused connections from Oct 22 through Nov 7, 2026. On Nov 8 at about
   10:30 EST the port appeared to answer, but that finding was proven VOID
   later the same day (about 13:30 EST): a control test showed direct TCP
@@ -34,9 +34,8 @@ for the same design). A design counts only when green at both tiers.
   handshake and the check proves nothing about the license server. The
   license state is UNKNOWN. A real license checkout is still UNVERIFIED:
   no lmutil or Vivado exists on this VM.
-- Vivado 2017.3 lives on the USF cluster, host sc.rc.usf.edu, login
-  srivastava1. The sandbox cannot reach it (campus / VPN only). The user
-  was following up with the lab admin as of Oct 22, 2026.
+- Vivado 2017.3 lives on a remote cluster. The sandbox cannot reach it
+  (campus / VPN only). The owner was following up with the license admin as of Oct 22, 2026.
 - The fuzzing package (jobs 1-5) is the mechanism for getting Vivado
   data off the cluster: ~/workspace/your_files/vivado-fuzzing-
   instructions.md plus vivado-fuzzing-package.zip (30 files).
@@ -54,7 +53,7 @@ for the same design). A design counts only when green at both tiers.
 ## What to do
 
 1. Verify a real license checkout is possible. The real test is Vivado on
-   the cluster (sc.rc.usf.edu, campus/VPN only) or the PinPlanning probe.
+   the cluster (campus/VPN only) or the PinPlanning probe.
    Do not claim the license works because the port answers.
 2. When a checkout works, generate Vivado bitstreams for the same 100
    designs as US-07 (same FASM, same placement, same seed), and run the

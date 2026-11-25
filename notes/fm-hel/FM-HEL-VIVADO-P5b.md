@@ -30,7 +30,7 @@ No UNISIM / AMD IP / JTAG / XSim / AXI-as-Helion-product / Kintex clones. Buses 
 ## Verify
 
 ```bash
-cd /Users/saksham/helion-ip
+cd <helion-ip checkout>
 cargo test -p helion-ipxact --lib
 cargo run -p helion-cli -- ip list
 cargo run -p helion-cli -- project examples/ip_ingest/h_pwm_ip.prj

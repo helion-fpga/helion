@@ -6,15 +6,16 @@ Every file states its goal, what done looks like, what is already done,
 what was tried and what failed, what to do, the exact files and commands,
 its dependencies, and the rules.
 
-Start from docs/HANDOFF.md (the fresh combined handoff) before any single
-sub-problem. It holds the goal, the current state, the branch map, the file
-map, and the read-this-first list.
+Start from this index before any single sub-problem. The combined
+handoff these files were written against held operator notes and is not
+in the repository; current ZedBoard state is in
+docs/zedboard-handoff/LEVEL2.md.
 
 ## ZedBoard track (main focus: real hardware)
 
 | ID | Sub-problem | Status | Depends on |
 |----|-------------|--------|------------|
-| ZB-00 | Mac access (Tailscale SSH + camera) | Open, blocked, current blocker | Nothing |
+| ZB-00 | Mac access (remote login + camera) | Operator notes, not in the repository | Nothing |
 | ZB-01 | Flash v3 tie-off bitstream, LD0 blinks | Code done, hardware unproven | ZB-00 |
 | ZB-02 | BUFGCTRL I0 config (clock passes) | Code done, hardware unproven | ZB-01 |
 | ZB-03 | FF clock-enable and set/reset | Code done, hardware unproven | ZB-01 |
@@ -60,7 +61,7 @@ map, and the read-this-first list.
 
 ## Rules for every instance
 
-- Read docs/HANDOFF.md first, then your sub-problem file, then the files
+- Read this index first, then your sub-problem file, then the files
   it names. Do not re-analyze the project.
 - No em dashes anywhere.
 - Never fabricate terminal output, visuals, or numbers. Every claim needs

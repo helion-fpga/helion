@@ -26,15 +26,16 @@ exercise each pin) for the CLE types.
 Usage: python3 coverage.py <out-json>
 """
 import json
+import os
 import re
 from collections import Counter, defaultdict
 
-DB = "/home/hatch/workspace/prjuray-db-ref/zynqusp"
+DB = os.path.expanduser("~/workspace/prjuray-db-ref/zynqusp")
 PART = "xczu3eg-sbva484-1-e"
 PAIRS = ["P-11", "P-13", "P-14", "P-15", "P-16", "P-17", "P-23", "P-28",
          "P-40", "P-41", "P-42", "P-43", "P-44", "P-45"]
-DEC = "/home/hatch/workspace/us01-char-logs/decoded/{}.fasm"
-BASE = "/home/hatch/workspace/ultra-bitgen-crew/decoder-validation/baseline/{}.fasm"
+DEC = os.path.expanduser("~/workspace/us01-char-logs/decoded/{}.fasm")
+BASE = os.path.expanduser("~/workspace/ultra-bitgen-crew/decoder-validation/baseline/{}.fasm")
 
 PIP_RE = re.compile(r"^(.+?)\.PIP\.([^.]+)\.(.+)$")
 SITE_WIRE = re.compile(r"^CLE_CLE_[LM]_SITE_0_(.+)$")

@@ -14,11 +14,12 @@ Usage: python3 check-tieoff.py <decoded-fasm> <baseline-fasm>
 Output: JSON summary.
 """
 import json
+import os
 import re
 import sys
 from collections import Counter, defaultdict
 
-DB = "/home/hatch/workspace/prjuray-db-ref/zynqusp"
+DB = os.path.expanduser("~/workspace/prjuray-db-ref/zynqusp")
 PART = "xczu3eg-sbva484-1-e"
 DEFAULT_INIT = 0x8000000080000000
 LETTERS = "ABCDEFGH"

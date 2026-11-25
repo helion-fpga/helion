@@ -1527,7 +1527,7 @@ endmodule
     /// head transit plus LD0 extended stage (9 non-pad), 4 transparent
     /// pads, 26 FFs. Traces to the real Vivado oracle via
     /// examples/blinky_reg.sv, the documented equivalent of
-    /// ~/CDA4253_A1/blinky.vhd. 5000 cycles exercises bits 0-12 through
+    /// a Vivado reference blinky. 5000 cycles exercises bits 0-12 through
     /// the first two transparent pads (bit 12 toggles past 4096); 70
     /// cycles never reached bit 8, leaving pad transparency unproven.
     /// LD0 matches vacuously here (both flows hold 0 for 5000 cycles);

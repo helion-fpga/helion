@@ -1,6 +1,6 @@
 # ZedBoard Fix Crew - CRITIQUE (Hardware Verification Critic)
 
-Critic: subagent eaa335a9-a6f0-4334-a931-4d5ebfca33d7
+Critic: independent review
 Rule: PASS requires all three checkboxes. User "no" = FAIL, no exceptions.
 No em dashes used anywhere in this file.
 

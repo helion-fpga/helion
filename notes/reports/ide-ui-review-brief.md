@@ -1,8 +1,8 @@
 # Helion IDE UI Review Brief
 
 **Branch:** `wip/ide-integration` (latest)
-**For:** Codex (or any agent doing UI review + improvements)
-**Standard:** Saksham's directive, Oct 11-13
+**For:** anyone doing UI review + improvements
+**Standard:** the owner's directive, Oct 11-13
 
 ---
 
@@ -37,7 +37,7 @@ Apple HIG / GNOME HIG / Material may inform, but the EDA references come first.
 
 ---
 
-## 3. Known Defects (all photo-filed by Saksham, all must be fixed)
+## 3. Known Defects (all photo-filed by the owner, all must be fixed)
 
 ### 3a. Device view screen (Oct 13 photo)
 - [ ] `???` placeholder text in the clock-regions table. No placeholder
@@ -86,7 +86,7 @@ Apple HIG / GNOME HIG / Material may inform, but the EDA references come first.
 
 ---
 
-## 5. Merge Bar (Saksham's rule, Oct 13)
+## 5. Merge Bar (the owner's rule, Oct 13)
 
 No IDE work merges on tests alone. A change merges only when:
 
@@ -99,7 +99,7 @@ No IDE work merges on tests alone. A change merges only when:
 
 ---
 
-## 6. How to Work (for Codex)
+## 6. How to Work
 
 1. Check out `wip/ide-integration` (latest).
 2. Build: `cargo check --release -p helion-gui --bin helion-ide`

@@ -13,7 +13,7 @@ Profile box Air (helion-ide / eframe) for `request_repaint` / continuous loops; 
 
 | Check | Result |
 |-------|--------|
-| ListMachines | Mac `sakshams-MacBook-Pro-517.local` `connected: true` |
+| ListMachines | Mac `connected: true` |
 | Shell via machineId | **temporarily unreachable** (one attempt) |
 | Mac Air profile | **out of scope this turn** |
 

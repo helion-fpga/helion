@@ -2,7 +2,7 @@
   "vivado": "2017.3",
   "date": "2026-11-17",
   "part": "xc7z020clg484-1",
-  "source": "~/helion-zed-builds/vivado_jobs/COMPARISON.md (USF cluster batch runs, 4 cores)",
+  "source": "~/helion-zed-builds/vivado_jobs/COMPARISON.md (cluster batch runs, 4 cores)",
   "notes": [
     "ref: Vivado's own synth + place + route + bitstream on the same RTL. lut includes LUTRAM. fmax_mhz = 1000 / (period_ns - wns_ns) on the clock named. runtime_s is Vivado's own step total.",
     "hx: Vivado routing and timing Helion's placement (every cell LOC/BEL fixed) from fm/zedboard-l2 354ff04. Stale once Helion's placement changes; rerun tools/vivado_ref to refresh.",

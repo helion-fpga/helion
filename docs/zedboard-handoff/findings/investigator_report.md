@@ -1,7 +1,7 @@
 # Helion 7-Series Backend: Line-by-Line Investigation Report
 
 **Date:** 2026-10-22
-**Investigator:** Code audit subagent
+**Investigator:** Code audit
 **Scope:** `~/workspace/helion-zed-bringup/crates/helion-xilinx7/src/` (5017 lines, 14 files)
 **Method:** Read every file, every function. Asked: what does it do, what does it NOT do, are there silent failures?
 

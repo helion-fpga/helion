@@ -21,21 +21,22 @@ Questions answered:
 Usage: python3 di-extract-probe.py
 Output: printed verdicts.
 """
+import os
 import sys
 
-sys.path.insert(0, "/home/hatch/workspace/helion-ultra-bitgen-us01-validate/tools/us09v")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "us09v"))
 
 from us09v.db import Db
 from us09v.extract import Extractor
 from us09v.fasmio import parse_fasm_file
 
-DEC = "/home/hatch/workspace/us01-char-logs/decoded/P-11.fasm"
+DEC = os.path.expanduser("~/workspace/us01-char-logs/decoded/P-11.fasm")
 SITE = "SLICE_X11Y16"
 
 
 def probe(path, label, inject_vcc=False):
     print(f"=== {label}: {path} ===")
-    db = Db("/home/hatch/workspace/prjuray-db-ref/zynqusp")
+    db = Db(os.path.expanduser("~/workspace/prjuray-db-ref/zynqusp"))
     tiles = parse_fasm_file(path)
     if inject_vcc:
         tiles.setdefault("INT_X7Y16", {})["PIP.IMUX_W20.VCC_WIRE"] = None

@@ -87,7 +87,7 @@ frames). Related to US-08.
 Pair: Helion examples/blinky_reg.sv build
 (/tmp/x7/blinky_reg_helion.bit, 4,045,666 bytes, from
 crates/helion-xilinx7/tests/blinky_reg_e2e.rs) vs Vivado
-~/CDA4253_A1/blinky.bit (= work/ref/GT-blinky.bit, md5 3f6d7cfa...,
+reference blinky.bit (= work/ref/GT-blinky.bit, md5 3f6d7cfa...,
 verified before the run). Same RTL, same part, same pins (clk Y9,
 LD0 T22). Commands:
 
@@ -353,7 +353,7 @@ the real xc7z020 graph (lib suite 105 passed).
 Question: PRECYINIT.C0 appears in both bitstreams, but our intent is
 CYINIT=1 while golden inverts S0. Both cannot be right under one C0
 meaning. Decisive evidence from Vivado's own synth netlist
-(CDA4253_A1/vivado-on-silicon-mac/blinky_proj/blinky.runs/synth_1/blinky.dcp,
+(the reference project's blinky_proj/blinky.runs/synth_1/blinky.dcp,
 blinky.edf inside): head CARRY4 count_reg_0__i_1 has CYINIT on net
 &_const0_. So C0 is const-0, and the helion-sv comment claiming
 "proven 1" (lib.rs:16334) is backwards reasoning that must be fixed
@@ -590,7 +590,7 @@ is 0 bits (record /tmp/x7/gt_vs_gt2.json). The md5s differ only in .bit
 header timestamps; Vivado 2023.2 is payload-deterministic for this
 source, so GT2 carries no new information.
 
-New independent samples from the A3 coursework builds (all Vivado
+New independent samples from other reference builds (all Vivado
 2023.2, 7z020clg484, md5-verified): fa4b_dataflow (a2bfcb03),
 fa4b_structural (fec193838, same design, different RTL style), and
 bcd_2_bin (65430953). Probes in /tmp/x7/w50_probe.py, w50_fullmap.py,
@@ -789,9 +789,9 @@ What worked: Red Pitaya ecosystem image (pavel-demin, 120MB,
 `led_blinker_122_88.bit` is our exact die (7z020, clg400 package:
 same silicon, INT tiles identical). Dead ends logged honestly:
 pavel's git repos are source-only (no .bit), PYNQ does not commit
-base.bit, open-dpu-zedboard ships only .xsa, the extra course
+base.bit, open-dpu-zedboard ships only .xsa, the extra reference
 blinky (blinky_proj, b06c9299) is payload-identical to the oracle
-(0 rawdiff bits, header timestamp only), and the A3 adder samples
+(0 rawdiff bits, header timestamp only), and the adder samples
 are unclocked. New reusable scratch tooling (kept out of the
 repo): /tmp/x7/cmpdec.py (COMPRESS=TRUE FAR/MFWR/FDRI decoder,
 MFWR-zero assumption asserted: 9922 writes, 0 nonzero words),
@@ -836,7 +836,7 @@ parser silently misreads COMPRESS=TRUE streams (found 125 garbage
 frames in vna), so all loaders now branch on the header stamp;
 new /tmp/x7/w50pool.py pools (route-words, w50) minor samples:
 /tmp/x7/w50pool.json holds 4075 samples. faD/faS/bcd files
-recovered from the course package (A3, md5 match): faD vs faS is
+recovered from the reference package (md5 match): faD vs faS is
 80 bits (20 named IMUX/INIT at X71Y94, 60 unnamed HCLK), but the
 route delta is multi-word, not the hoped-for minimal pair.
 
@@ -1023,12 +1023,12 @@ result lines. No behavior change (log-only turn).
 
 ## Twenty-ninth run (Nov 9, 2026, Mac, Vivado fuzzing window opened, 484 held)
 
-The SSH tunnel to the USF cluster is live and real Vivado runs
+The SSH tunnel to the cluster is live and real Vivado runs
 there, so the license UNKNOWN blocker is being settled by
 experiment instead of speculation. Resolved the install layout
 (nested Vivado/2017.3 tree) and confirmed Vivado 2017.3 starts
 (Vivado v2017.3 SW Build 2018833). The cluster env already sets
-LM_LICENSE_FILE=27000@license2.rc.usf.edu, which Vivado reads.
+LM_LICENSE_FILE to the site license server, which Vivado reads.
 Also found a 2022.1-ep11 install, so both versions build the
 same RTL for a version-sensitivity comparison. No behavior
 change in Helion (log-only turn); diff baseline stays 484.

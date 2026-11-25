@@ -39,10 +39,10 @@ next to this script.
 import json, collections, re, os, sys
 from pathlib import Path
 
-BF = os.environ.get('BF_PATH', '/home/hatch/workspace/helion-ultra-bitstream/bitfiltrator-ref/resources/devices/xczu3eg.json')
-PJ = os.environ.get('PJ_PATH', '/home/hatch/workspace/prjuray-db-ref/zynqusp/xczu3eg-sbva484-1-e/part.json')
-TG = os.environ.get('TG_PATH', '/home/hatch/workspace/prjuray-db-ref/zynqusp/xczu3eg-sbva484-1-e/tilegrid.json')
-OUT = os.environ.get('OUT_PATH', '/home/hatch/workspace/us09-device/verify-report.txt')
+BF = os.environ.get('BF_PATH', os.path.expanduser('~/workspace/helion-ultra-bitstream/bitfiltrator-ref/resources/devices/xczu3eg.json'))
+PJ = os.environ.get('PJ_PATH', os.path.expanduser('~/workspace/prjuray-db-ref/zynqusp/xczu3eg-sbva484-1-e/part.json'))
+TG = os.environ.get('TG_PATH', os.path.expanduser('~/workspace/prjuray-db-ref/zynqusp/xczu3eg-sbva484-1-e/tilegrid.json'))
+OUT = os.environ.get('OUT_PATH', os.path.expanduser('~/workspace/us09-device/verify-report.txt'))
 SIDECAR = os.environ.get('SIDECAR_PATH', str(Path(__file__).resolve().parent.parent / 'data' / 'xczu3eg_int_columns.json'))
 SIDECAR_INTF = os.environ.get('SIDECAR_INTF_PATH', str(Path(__file__).resolve().parent.parent / 'data' / 'xczu3eg_intf_columns.json'))
 WRITE_SIDECAR = '--write-int-columns' in sys.argv

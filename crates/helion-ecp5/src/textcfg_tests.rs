@@ -373,9 +373,7 @@ fn dcc_emits_mode_enum() {
 /// bits.
 #[test]
 fn ecppack_accepts_emitted_textcfg() {
-    let ecppack = std::env::var("ECPPACK").unwrap_or_else(|_| {
-        "/home/hatch/workspace/.jarvis/idea-executions/1f8b45d9-076b-4729-8a42-f43021b85826/scratch/oss/oss-cad-suite/bin/ecppack".to_string()
-    });
+    let ecppack = std::env::var("ECPPACK").unwrap_or_default();
     if !std::path::Path::new(&ecppack).is_file() {
         return;
     }
@@ -436,9 +434,7 @@ fn ecppack_accepts_emitted_textcfg() {
 /// ecppack must also accept a design with EBR + DSP + PLL hard blocks.
 #[test]
 fn ecppack_accepts_hard_blocks() {
-    let ecppack = std::env::var("ECPPACK").unwrap_or_else(|_| {
-        "/home/hatch/workspace/.jarvis/idea-executions/1f8b45d9-076b-4729-8a42-f43021b85826/scratch/oss/oss-cad-suite/bin/ecppack".to_string()
-    });
+    let ecppack = std::env::var("ECPPACK").unwrap_or_default();
     if !std::path::Path::new(&ecppack).is_file() {
         return;
     }

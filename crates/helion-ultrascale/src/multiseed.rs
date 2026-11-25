@@ -33,7 +33,7 @@
 //!   either repo, so it is not reproduced here and no number from it
 //!   is reused. The runs in this crate produce their own numbers.
 //!
-//! Throughput matters more than per-run latency (Saksham's
+//! Throughput matters more than per-run latency (the
 //! requirement: 100-seed overnight runs), so the CLI runs seeds on a
 //! rayon pool sized by `--jobs` and checkpoints every finished seed
 //! to the JSONL file as soon as it lands.

@@ -7,10 +7,9 @@ the v1 goldens: one row-0 HPIO tile base FAR, the offset ruling, and
 the HPIO_RIGHT existence verdict.
 
 Status: NOT RUN. No Vivado exists in this VM, no Vivado check was run
-here, and nothing in this package claims a Vivado result. Saksham runs
-it on the USF cluster (sc.rc.usf.edu, login srivastava1) when he is
-next on campus or on the USF VPN. Do not run any license-port connect
-check: a TCP connect proves nothing from this VM, and license state
+here, and nothing in this package claims a Vivado result. The owner runs
+it on the cluster when next on campus or on the campus VPN. Do not run
+any license-port connect check: a TCP connect proves nothing from this VM, and license state
 is UNKNOWN.
 
 ## What is in this package
@@ -41,7 +40,7 @@ is UNKNOWN.
 ## Step 0: get on the cluster and check Vivado exists
 
 ```sh
-ssh srivastava1@sc.rc.usf.edu
+ssh <user>@<cluster-host>
 vivado -version
 ```
 

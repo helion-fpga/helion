@@ -1967,7 +1967,7 @@ and sufficient for the known divergences.
   byte-identical to staging; timing_db.rs is identical plus
   the `impl crate::fabric::TimingDb` adapter (has_data true).
   corpus_legality.rs: import paths plus a workspace_example
-  path fallback replacing a hardcoded /home/hatch path.
+  path fallback replacing a hardcoded home-directory path.
   sta_sanity.rs: import paths only.
 - **P3 Gate 2 reproduced exactly by my own runs.** Built
   helion-cli from the scratch worktree and ran all four
@@ -2784,7 +2784,7 @@ Harness run, re-run by the reviewer with the merged-tip binary:
 
 ```
 cd ~/workspace/ultra-bitgen-crew/harness
-HELION_BITGEN_EMITTER=/home/hatch/workspace/helion-ultra-bitstream/target/debug/helion-bitgen python3 diff.py --design all --part xcku3p --out runs/critic15
+HELION_BITGEN_EMITTER=~/workspace/helion-ultra-bitstream/target/debug/helion-bitgen python3 diff.py --design all --part xcku3p --out runs/critic15
 exit 0, wrote 20 records to runs/critic15/diff.jsonl (521.6s)
 ```
 

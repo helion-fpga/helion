@@ -23,7 +23,7 @@ directives:
 ## Reference corpus
 
 Eight Vivado-built ZedBoard designs with VHDL and XDC, kept outside the repo
-in `~/helion-zedboard-corpus/` (coursework sources; `corpus.json` lists them):
+in `~/helion-zedboard-corpus/` (sources not redistributable; `corpus.json` lists them):
 blinky (25-bit counter, carry chain), 4-bit adder x2, BCD to binary, shift
 register, up/down counter, pattern FSM, divider client/server.
 

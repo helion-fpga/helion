@@ -14,7 +14,9 @@ md5s:
 - pico.bit afe395dd2583f1264d81b409765cb9a4 (4,045,664 bytes), Mac 08ca33a6ff702841ca8851cf20b023c4: MISMATCH
 
 Files:
-- blinky.bit, pico.bit: bitstreams from the rerun
+- blinky.bit, pico.bit: the rerun's bitstreams are not kept in the repo
+  (about 4 MB each); the md5s above identify them, and the zedbit commands
+  in docs/zedboard/determinism.md rebuild them
 - blinky.fasm (570 lines), pico.fasm (37975 lines): FASM zedbit wrote next to them
 - blinky-run.log, pico-run.log: rerun logs, transcribed from
   docs/zedboard/determinism.md (see the NOTE header in each file)

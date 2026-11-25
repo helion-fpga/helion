@@ -124,7 +124,7 @@ from reference import MissingReference, Tier1Reference
 HARNESS_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_EMITTER = os.path.normpath(os.path.join(
     HARNESS_DIR, "..", "..", "..", "target", "release", "helion-bitgen"))
-CREW_REF_DIR = "/home/hatch/workspace/ultra-bitgen-crew/harness/reference"
+CREW_REF_DIR = os.path.expanduser("~/workspace/ultra-bitgen-crew/harness/reference")
 
 PART = "xcku3p"
 N_Y_OFST_CLB = 60

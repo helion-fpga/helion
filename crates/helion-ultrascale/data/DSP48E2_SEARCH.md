@@ -217,7 +217,7 @@ fixed placement) plus one variant bitstream per non-default attribute
 value, all on part `xcvu3p-ffvc1517-2-e`, each with `.bit`, `.rbt`
 (ASCII bitstream, for diffing), and `.ll` (logic location file).
 The job needs a working Vivado license checkout; the license server
-`27000@license2.forest.usf.edu` has refused connections since
+has refused connections since
 Oct 22, 2026, and license state is UNKNOWN from this VM. Do not run
 any license-port connect check from this VM: a TCP connect proves
 nothing, and the license state is recorded as UNKNOWN.

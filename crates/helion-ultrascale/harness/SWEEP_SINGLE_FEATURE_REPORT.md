@@ -218,6 +218,6 @@ Total emits: 153. Total seconds (emit+bits): 2917.4.
 
 ## Commands
 
-- `sweep.py --out /home/hatch/workspace/ultra-bitgen-sweeps-logs/sweeps-full`
+- `sweep.py --out ~/workspace/ultra-bitgen-sweeps-logs/sweeps-full`
 
-Results: sweep.jsonl and sweep_summary.json in /home/hatch/workspace/ultra-bitgen-sweeps-logs/sweeps-full. Per-emit FASM files are kept in the same directory; .bit files are deleted after diffing (the FASM plus the emitter reproduces them); .bits files are kept only for emits with reds or extras.
+Results: sweep.jsonl and sweep_summary.json in ~/workspace/ultra-bitgen-sweeps-logs/sweeps-full. Per-emit FASM files are kept in the same directory; .bit files are deleted after diffing (the FASM plus the emitter reproduces them); .bits files are kept only for emits with reds or extras.

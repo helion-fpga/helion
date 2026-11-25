@@ -83,7 +83,7 @@ PIPs? That needs the PinPlanning probe output (`get_pips -of_objects
 [get_tiles INT_X<x>Y<y>]` from an in-memory PinPlanning project,
 license-free). Status 2026-11-07: the probe has NOT been run on the
 cluster yet (license server is down, but the probe needs no license;
-Saksham prepared it and it is still not run). Until the probe output
+it is prepared and still not run). Until the probe output
 exists, part 2 cannot run. This audit does NOT claim Vivado-level
 completeness, only DB-internal completeness: the segbits DB covers
 every PIP the tile-type JSON enumerates.
