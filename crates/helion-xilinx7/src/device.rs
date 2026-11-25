@@ -691,10 +691,12 @@ impl Device {
     /// of `tile_types[1]` at `(grid_x + dx, grid_y + dy)`; each wire pair is
     /// unioned into one node.
     fn stitch_nodes(&mut self, conn: &[TileConnEntry]) -> Result<(), String> {
+        let mut skipped: Vec<(&str, &str)> = Vec::new();
         for e in conn {
             // A tile type the grid does not use pairs no tiles: xc7s25's
             // tileconn.json names BRKH_B_TERM_INT, which its tilegrid lacks.
             let (Some(&a), Some(&b)) = (self.type_ids.get(&e.tile_types[0]), self.type_ids.get(&e.tile_types[1])) else {
+                skipped.push((&e.tile_types[0], &e.tile_types[1]));
                 continue;
             };
             let tiles_a = self.tiles_by_type[a as usize].clone();
@@ -715,6 +717,14 @@ impl Device {
                     let gb = self.tiles[tb].wire_base + ib;
                     self.nodes.union(ga, gb);
                 }
+            }
+        }
+        // Silent skips would hide a tileconn.json that does not belong to
+        // this tilegrid; HELION_DEVICE_DEBUG lists them.
+        if !skipped.is_empty() && std::env::var("HELION_DEVICE_DEBUG").is_ok() {
+            eprintln!("device: skipped {} of {} tileconn entries naming tile types the grid does not use:", skipped.len(), conn.len());
+            for (a, b) in &skipped {
+                eprintln!("device:   {a} -> {b}");
             }
         }
         Ok(())
