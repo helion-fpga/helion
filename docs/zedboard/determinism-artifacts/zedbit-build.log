@@ -1,0 +1,437 @@
+build started 2026-11-19T17:54:47Z, HELION_XILINX_DB=/home/hatch/workspace/xilinx-dbsrc
+    Blocking waiting for file lock on package cache
+warning: unused import: `Endpoint`
+  --> crates/helion-ir/src/power_opt.rs:21:31
+   |
+21 | use crate::{CellKind, Design, Endpoint, PortDir, Spur, intern, resolve};
+   |                               ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `cell_index` is never used
+   --> crates/helion-ir/src/opt.rs:337:8
+    |
+301 | impl Design {
+    | ----------- method in this implementation
+...
+337 |     fn cell_index(&self) -> HashMap<Spur, usize> {
+    |        ^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `out_net` is never read
+   --> crates/helion-ir/src/datapath_extract.rs:284:5
+    |
+282 | struct CarryLutCandidate {
+    |        ----------------- field in this struct
+283 |     ci: usize,
+284 |     out_net: Spur,
+    |     ^^^^^^^
+    |
+    = note: `CarryLutCandidate` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: variable `promoted_Chains` should have a snake case name
+   --> crates/helion-ir/src/datapath_extract.rs:405:17
+    |
+405 |         let mut promoted_Chains: Vec<Vec<ResolvedCarrySlice>> = Vec::new();
+    |                 ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `promoted_chains`
+    |
+    = note: `#[warn(non_snake_case)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: `helion-ir` (lib) generated 4 warnings (run `cargo fix --lib -p helion-ir` to apply 1 suggestion)
+warning: unreachable pattern
+    --> crates/zb/helion-sv/src/lib.rs:2981:17
+     |
+2904 |                 RExpr::Shr(a, b) => {
+     |                 ---------------- matches all the relevant values
+...
+2981 |                 RExpr::Shr(a, b) => {
+     |                 ^^^^^^^^^^^^^^^^ no value can reach this
+     |
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable pattern
+    --> crates/zb/helion-sv/src/lib.rs:2991:17
+     |
+2909 |                 RExpr::Ashr(a, b) => {
+     |                 ----------------- matches all the relevant values
+...
+2991 |                 RExpr::Ashr(a, b) => {
+     |                 ^^^^^^^^^^^^^^^^^ no value can reach this
+
+warning: variable does not need to be mutable
+     --> crates/zb/helion-sv/src/lib.rs:10564:13
+      |
+10564 |         let mut one = |p: &mut P<'a>, parts: &mut Vec<(&'a str, Option<usize>)>| -> bool {
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+      |
+      = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+     --> crates/zb/helion-sv/src/lib.rs:11583:9
+      |
+11583 |     let mut sub = |x: &RExpr<'_>, w: usize, memo: &mut HashMap<(usize, usize), Vec<Expr<'a>>>| blast_rec(x, rtl, w, arena, memo, ...
+      |         ----^^^
+      |         |
+      |         help: remove this `mut`
+
+warning: function `try_inline_call` is never used
+    --> crates/zb/helion-sv/src/lib.rs:8586:4
+     |
+8586 | fn try_inline_call<'a>(
+     |    ^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `parse_inst_net` is never used
+     --> crates/zb/helion-sv/src/lib.rs:10303:4
+      |
+10303 | fn parse_inst_net<'a>(p: &mut P<'a>) -> Option<&'a str> {
+      |    ^^^^^^^^^^^^^^
+
+warning: function `adder_sum_bit` is never used
+     --> crates/zb/helion-sv/src/lib.rs:11779:4
+      |
+11779 | fn adder_sum_bit<'a>(a: &RExpr<'_>, b: &RExpr<'_>, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Result<Expr<'a>, String> {
+      |    ^^^^^^^^^^^^^
+
+warning: function `sub_diff_bit` is never used
+     --> crates/zb/helion-sv/src/lib.rs:11802:4
+      |
+11802 | fn sub_diff_bit<'a>(a: &RExpr<'_>, b: &RExpr<'_>, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Result<Expr<'a>, String> {
+      |    ^^^^^^^^^^^^
+
+warning: function `lt_bits` is never used
+     --> crates/zb/helion-sv/src/lib.rs:12296:4
+      |
+12296 | fn lt_bits<'a>(a: &RExpr<'_>, b: &RExpr<'_>, rtl: &Rtl, arena: &'a Bump) -> Result<Expr<'a>, String> {
+      |    ^^^^^^^
+
+warning: function `drive_target` is never used
+     --> crates/zb/helion-sv/src/lib.rs:12667:4
+      |
+12667 | fn drive_target(e: &RExpr<'_>, rtl: &Rtl) -> Result<(String, usize), String> {
+      |    ^^^^^^^^^^^^
+
+warning: function `map_wide_cone` is never used
+     --> crates/zb/helion-sv/src/lib.rs:14355:4
+      |
+14355 | fn map_wide_cone(d: &mut Design, aig: &Aig, prefix: &str, out: Option<&str>) -> String {
+      |    ^^^^^^^^^^^^^
+
+warning: function `rewrite_aig` is never used
+  --> crates/zb/helion-sv/src/aig_opt.rs:37:8
+   |
+37 | pub fn rewrite_aig(aig: &Aig) -> Aig {
+   |        ^^^^^^^^^^^
+
+warning: using `.clone()` on a double reference, which returns `&str` instead of cloning the inner type
+    --> crates/zb/helion-sv/src/lib.rs:9918:51
+     |
+9918 | ...                   if seen.insert(lhs.clone()) {
+     |                                         ^^^^^^^^
+     |
+     = note: `#[warn(suspicious_double_ref_op)]` on by default
+
+warning: `helion-sv-zb` (lib) generated 13 warnings (run `cargo fix --lib -p helion-sv-zb` to apply 2 suggestions)
+warning: variable does not need to be mutable
+   --> crates/helion-sv/src/lib.rs:558:13
+    |
+558 |         let mut template_cache: HashMap<u16, Vec<(Lit, Lit, u32)>> = HashMap::new();
+    |             ----^^^^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `template_cache`
+   --> crates/helion-sv/src/lib.rs:558:13
+    |
+558 |         let mut template_cache: HashMap<u16, Vec<(Lit, Lit, u32)>> = HashMap::new();
+    |             ^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_template_cache`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `canon`
+   --> crates/helion-sv/src/lib.rs:574:26
+    |
+574 |                     let (canon, in_neg, perm, out_neg) = Self::npn_canonical_4_transform(tt4);
+    |                          ^^^^^ help: if this is intentional, prefix it with an underscore: `_canon`
+
+warning: unused variable: `n_nodes`
+   --> crates/helion-sv/src/lib.rs:648:13
+    |
+648 |         let n_nodes = self.ands.len() as u32;
+    |             ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_n_nodes`
+
+warning: unused variable: `nid`
+   --> crates/helion-sv/src/lib.rs:671:17
+    |
+671 |             let nid = 1 + n_pis + idx as u32;
+    |                 ^^^ help: if this is intentional, prefix it with an underscore: `_nid`
+
+warning: unused variable: `n_pis`
+   --> crates/helion-sv/src/lib.rs:778:13
+    |
+778 |         let n_pis = self.pis.len() as u32;
+    |             ^^^^^ help: if this is intentional, prefix it with an underscore: `_n_pis`
+
+warning: unused variable: `last`
+    --> crates/helion-sv/src/lib.rs:1002:21
+     |
+1002 |         if let Some(last) = template.last_mut() {
+     |                     ^^^^ help: if this is intentional, prefix it with an underscore: `_last`
+
+warning: unreachable pattern
+    --> crates/helion-sv/src/lib.rs:4161:17
+     |
+4084 |                 RExpr::Shr(a, b) => {
+     |                 ---------------- matches all the relevant values
+...
+4161 |                 RExpr::Shr(a, b) => {
+     |                 ^^^^^^^^^^^^^^^^ no value can reach this
+     |
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable pattern
+    --> crates/helion-sv/src/lib.rs:4171:17
+     |
+4089 |                 RExpr::Ashr(a, b) => {
+     |                 ----------------- matches all the relevant values
+...
+4171 |                 RExpr::Ashr(a, b) => {
+     |                 ^^^^^^^^^^^^^^^^^ no value can reach this
+
+warning: value assigned to `carry` is never read
+    --> crates/helion-sv/src/lib.rs:7636:17
+     |
+7636 |                 carry = RExpr::Const {
+     |                 ^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated items `depends_on_all_4`, `extract_cone`, `build_canon_template`, `instantiate_cone`, and `map_lit` are never used
+    --> crates/helion-sv/src/lib.rs:732:8
+     |
+ 134 | impl Aig {
+     | -------- associated items in this implementation
+...
+ 732 |     fn depends_on_all_4(tt: u16) -> bool {
+     |        ^^^^^^^^^^^^^^^^
+...
+ 887 |     fn extract_cone(
+     |        ^^^^^^^^^^^^
+...
+ 927 |     fn build_canon_template(canon: u16) -> Vec<(Lit, Lit, u32)> {
+     |        ^^^^^^^^^^^^^^^^^^^^
+...
+1011 |     fn instantiate_cone(
+     |        ^^^^^^^^^^^^^^^^
+...
+1034 |     fn map_lit(
+     |        ^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `pkg_param_is_csr_or_mubi` is never used
+    --> crates/helion-sv/src/lib.rs:2403:4
+     |
+2403 | fn pkg_param_is_csr_or_mubi(name: &str) -> bool {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `try_inline_call` is never used
+     --> crates/helion-sv/src/lib.rs:11867:4
+      |
+11867 | fn try_inline_call<'a>(
+      |    ^^^^^^^^^^^^^^^
+
+warning: function `map_wide_cone` is never used
+     --> crates/helion-sv/src/lib.rs:19583:4
+      |
+19583 | fn map_wide_cone(d: &mut Design, aig: &Aig, prefix: &str, out: Option<&str>) -> String {
+      |    ^^^^^^^^^^^^^
+
+warning: function `synth_rtl` is never used
+     --> crates/helion-sv/src/lib.rs:22693:4
+      |
+22693 | fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
+      |    ^^^^^^^^^
+
+warning: function `rewrite_aig` is never used
+  --> crates/helion-sv/src/aig_opt.rs:37:8
+   |
+37 | pub fn rewrite_aig(aig: &Aig) -> Aig {
+   |        ^^^^^^^^^^^
+
+warning: using `.clone()` on a double reference, which returns `&str` instead of cloning the inner type
+     --> crates/helion-sv/src/lib.rs:13735:51
+      |
+13735 | ...                   if seen.insert(lhs.clone()) {
+      |                                         ^^^^^^^^
+      |
+      = note: `#[warn(suspicious_double_ref_op)]` on by default
+
+warning: `helion-sv` (lib) generated 17 warnings (run `cargo fix --lib -p helion-sv` to apply 7 suggestions)
+warning: unused doc comment
+   --> crates/helion-xilinx7/src/route.rs:224:1
+    |
+224 | /// Route all nets in the placed design.
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+    = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `crc` is never read
+   --> crates/helion-xilinx7/src/bitstream.rs:282:17
+    |
+282 |                 crc = icap_crc(r, v, crc);
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+291 |                 crc = 0;
+    |                 ------- `crc` is overwritten here before the previous value is read
+...
+343 |     check_crc!();
+    |     ------------ in this macro invocation
+    |
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+    = note: this warning originates in the macro `write_reg` which comes from the expansion of the macro `check_crc` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: value assigned to `crc` is never read
+   --> crates/helion-xilinx7/src/bitstream.rs:280:17
+    |
+280 |                 crc = 0;
+    |                 ^^^^^^^ this value is reassigned later and never used
+...
+291 |                 crc = 0;
+    |                 ------- `crc` is overwritten here before the previous value is read
+...
+343 |     check_crc!();
+    |     ------------ in this macro invocation
+    |
+    = note: this warning originates in the macro `write_reg` which comes from the expansion of the macro `check_crc` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: value assigned to `crc` is never read
+   --> crates/helion-xilinx7/src/bitstream.rs:282:17
+    |
+282 |                 crc = icap_crc(r, v, crc);
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+291 |                 crc = 0;
+    |                 ------- `crc` is overwritten here before the previous value is read
+...
+354 |     check_crc!();
+    |     ------------ in this macro invocation
+    |
+    = note: this warning originates in the macro `write_reg` which comes from the expansion of the macro `check_crc` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: value assigned to `crc` is never read
+   --> crates/helion-xilinx7/src/bitstream.rs:280:17
+    |
+280 |                 crc = 0;
+    |                 ^^^^^^^ this value is reassigned later and never used
+...
+291 |                 crc = 0;
+    |                 ------- `crc` is overwritten here before the previous value is read
+...
+354 |     check_crc!();
+    |     ------------ in this macro invocation
+    |
+    = note: this warning originates in the macro `write_reg` which comes from the expansion of the macro `check_crc` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: value assigned to `crc` is never read
+   --> crates/helion-xilinx7/src/bitstream.rs:282:17
+    |
+282 |                 crc = icap_crc(r, v, crc);
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+356 |     write_cmd!(cmd::DESYNC);
+    |     ----------------------- in this macro invocation
+    |
+    = help: maybe it is overwritten before being read?
+    = note: this warning originates in the macro `write_reg` which comes from the expansion of the macro `write_cmd` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: value assigned to `crc` is never read
+   --> crates/helion-xilinx7/src/bitstream.rs:280:17
+    |
+280 |                 crc = 0;
+    |                 ^^^^^^^
+...
+356 |     write_cmd!(cmd::DESYNC);
+    |     ----------------------- in this macro invocation
+    |
+    = help: maybe it is overwritten before being read?
+    = note: this warning originates in the macro `write_reg` which comes from the expansion of the macro `write_cmd` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: variable does not need to be mutable
+   --> crates/helion-xilinx7/src/lutram.rs:121:9
+    |
+121 |     let mut read = |r: &mut PackedLutRam, l: char, addr: &str, n: usize| -> Result<(), String> {
+    |         ----^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `carry_site`
+   --> crates/helion-xilinx7/src/route.rs:326:9
+    |
+326 |     let carry_site: HashMap<&str, &str> = placed
+    |         ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_carry_site`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `internal`
+    --> crates/helion-xilinx7/src/route.rs:1293:10
+     |
+1293 |     let (internal, external): (Vec<&&Endpoint>, Vec<&&Endpoint>) = loads
+     |          ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_internal`
+
+warning: function `mux_for_ff` is never used
+    --> crates/helion-xilinx7/src/emit.rs:1384:4
+     |
+1384 | fn mux_for_ff(
+     |    ^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `is_lut_input_pin` is never used
+    --> crates/helion-xilinx7/src/route.rs:1265:4
+     |
+1265 | fn is_lut_input_pin(pin: &str) -> bool {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: method `wire_name_ref` is never used
+   --> crates/helion-xilinx7/src/xdevice.rs:139:8
+    |
+ 92 | impl<'a> XDevice<'a> {
+    | -------------------- method in this implementation
+...
+139 |     fn wire_name_ref(&self, wid: u32) -> Option<&str> {
+    |        ^^^^^^^^^^^^^
+
+warning: `helion-xilinx7` (lib) generated 13 warnings (run `cargo fix --lib -p helion-xilinx7` to apply 3 suggestions)
+warning: value assigned to `depth` is never read
+    --> crates/helion-vhdl/src/lib.rs:1981:13
+     |
+1981 |             depth -= 1;
+     |             ^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: `helion-vhdl` (lib) generated 1 warning
+   Compiling helion-xilinx7 v4.0.0 (/home/hatch/workspace/helion-zedboard-determinism/crates/helion-xilinx7)
+warning: unused variable: `pin`
+   --> crates/helion-xilinx7/examples/zedbit.rs:521:26
+    |
+521 |         for ((net, site, pin), &delay) in routed.load_delays.iter() {
+    |                          ^^^ help: if this is intentional, prefix it with an underscore: `_pin`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `helion-xilinx7` (example "zedbit") generated 1 warning (run `cargo fix --example "zedbit" -p helion-xilinx7` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 7m 03s
+build exit=0 2026-11-19T18:01:51Z
