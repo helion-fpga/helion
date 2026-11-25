@@ -66,32 +66,41 @@ zero.
 ### DS922, Kintex UltraScale+ Data Sheet: DC and AC Switching Characteristics
 
 This is the correct datasheet for xcku3p (Kintex UltraScale+). Column
-mapping for every table below: 0.90V columns are speed grades -3, -2,
--1; 0.85V columns are -2, -1; 0.72V columns are -2, -1. The DB uses
-speed grade -2 at 0.85V, which is the fourth numeric column.
+mapping for every table below: the five numeric columns are -3 at
+0.90V, -2 at 0.85V, -1 at 0.85V, -2 at 0.72V, -1 at 0.72V. The DB uses
+speed grade -2 at 0.85V, which is the second numeric column, not the
+fourth: an earlier reading took the fourth column (1.46 ns) for -2 at
+0.85V, but that column is -2 at 0.72V.
 
 - Block RAM and FIFO Switching Characteristics (DS922 Table 33,
   docs.amd.com/r/en-US/ds922-kintex-ultrascale-plus/Block-RAM-and-FIFO-Switching-Characteristics):
   TRCKO_DO (CLK to DOUT, without output register) at -2 / 0.85V is
-  1.46 ns = 1460 ps, Max. TRCKO_DO_REG (with output register) at the
-  same grade is 0.42 ns = 420 ps. FMAX_WF_NC 585 MHz, FMAX_RF 510 MHz,
-  TPW 577 ps at the same grade. This is the ONLY pin-to-pin delay in
+  1.02 ns = 1020 ps, Max. TRCKO_DO_REG (with output register) at the
+  same grade is 0.29 ns = 290 ps. FMAX_WF_NC 738 MHz, FMAX_RF 637 MHz,
+  TPW 542 ps at the same grade. (An earlier reading quoted the
+  fourth-column values 0.42 ns, 585 MHz, 510 MHz, 577 ps here; those
+  are the -2 at 0.72V values.) This is the ONLY pin-to-pin delay in
   DS922 that maps onto a field of `UltraScaleTimingDb`, and it is the
   only documented value in `documented_xcku3p()` /
-  `documented_xcvu3p()`: `bram.clk_to_do` = 1460 ps, source
-  "DS922 Table 33 TRCKO_DO, -2 0.85V". The struct has no separate
+  `documented_xcvu3p()`: `bram.clk_to_do` = 1020 ps, source
+  "DS922 Table 33 TRCKO_DO, -2 0.85V". (1.46 ns is the TRCKO_DO value
+  at -2 / 0.72V, the fourth numeric column; it is not the -2 / 0.85V
+  value.) The struct has no separate
   registered-output field, so TRCKO_DO_REG is recorded here only, not
   stored. No address-setup row exists in the BRAM table, so
   `bram.addr_setup` stays UNKNOWN.
 - UltraRAM Switching Characteristics (DS922, same column mapping):
-  only FMAX values (FMAX 500 MHz, FMAX_ECC_NOPIPELINE 312 MHz,
-  FMAX_NOPIPELINE 404 MHz at -2 / 0.85V) and TPW 800 ps. No
+  only FMAX values (FMAX 600 MHz, FMAX_ECC_NOPIPELINE 400 MHz,
+  FMAX_NOPIPELINE 500 MHz at -2 / 0.85V) and TPW 700 ps. (An earlier
+  reading quoted 500 MHz, 312 MHz, 404 MHz, 800 ps; those are the -2
+  at 0.72V values.) No
   clock-to-output delay is published. 1/FMAX is a period, not a
   pin delay, so it must not be stored as `uram.clk_to_do`. Both URAM
   fields stay UNKNOWN.
 - DSP48 Slice Switching Characteristics (DS922): only FMAX values
-  (FMAX 644 MHz with all registers used, FMAX_NOPIPELINEREG 323 MHz
-  at -2 / 0.85V). No pin-to-pin delay is published. Both DSP fields
+  (FMAX 775 MHz with all registers used, FMAX_NOPIPELINEREG 410 MHz
+  at -2 / 0.85V). (An earlier reading quoted 644 MHz and 323 MHz;
+  those are the -2 at 0.72V values.) No pin-to-pin delay is published. Both DSP fields
   stay UNKNOWN.
 - FPGA Logic Switching Characteristics (DS922): this section covers
   IOB HD/HP tables only (TINBUF_DELAY_PAD_I, TOUTBUF_DELAY_O_PAD,
@@ -107,10 +116,11 @@ speed grade -2 at 0.85V, which is the fourth numeric column.
 
 ### DS923, Virtex UltraScale+ Data Sheet (xcvu3p)
 
-Same BRAM numbers as DS922 at -2 / 0.85V: TRCKO_DO 1.46 ns,
-TRCKO_DO_REG 0.42 ns (docs.amd.com/r/en-US/ds923-virtex-ultrascale-plus/Block-RAM-and-FIFO-Switching-Characteristics).
+Same BRAM numbers as DS922 at -2 / 0.85V: TRCKO_DO 1.02 ns,
+TRCKO_DO_REG 0.29 ns (docs.amd.com/r/en-US/ds923-virtex-ultrascale-plus/Block-RAM-and-FIFO-Switching-Characteristics).
 `documented_xcvu3p()` therefore carries the same single documented
-value, `bram.clk_to_do` = 1460 ps. All other fields UNKNOWN, for the
+value, `bram.clk_to_do` = 1020 ps. (1.46 ns is the TRCKO_DO value at
+-2 / 0.72V, not at -2 / 0.85V.) All other fields UNKNOWN, for the
 same reasons as DS922.
 
 ### UG574, UltraScale Architecture CLB User Guide
