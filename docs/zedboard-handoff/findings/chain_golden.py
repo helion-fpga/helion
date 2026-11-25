@@ -1,11 +1,13 @@
-import sys
-sys.path.insert(0, '/Users/saksham/Documents/zedboard-helion-debug/work')
+import os, sys
+# ZB_WORK: the ZedBoard debug work dir (x7decode.py, ref/GT-blinky.bit, prjxray-db/).
+WORK = os.environ['ZB_WORK']
+sys.path.insert(0, WORK)
 import x7decode as X
 from collections import defaultdict
-ref = X.payload('/Users/saksham/Documents/zedboard-helion-debug/work/ref/GT-blinky.bit')
+ref = X.payload(WORK + '/ref/GT-blinky.bit')
 tiles = X._tilegrid()
 frames = X.frames_by_address(X.full_addresses(), ref, check=False)
-DB = '/Users/saksham/Documents/zedboard-helion-debug/work/prjxray-db/zynq7'
+DB = WORK + '/prjxray-db/zynq7'
 seg = {}
 for line in open(DB + '/segbits_clblm_r.db'):
     p = line.split()
