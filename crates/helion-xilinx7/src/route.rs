@@ -229,6 +229,58 @@ thread_local! {
     /// Set once the rip-up phase has displaced enough nets: a net then takes a
     /// free path or none (see [`NO_FREE_PATH`]).
     static FREE_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set by PathFinder for the net being routed: the margin (grid tiles) of
+    /// its search box, 0 for the whole device (see [`pf_margin`]).
+    static PF_MARGIN: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The failure at which a PathFinder net searches the whole device (see [`pf_margin`]).
+const PF_OPEN: u32 = 12;
+
+/// PathFinder search box margin for a net that has been on an overused node
+/// in `fails` iterations: the first pass's 8 grid tiles, doubled every second
+/// failure up to `cap` (16; `HELION_ROUTE_PF_CAP`), the whole device (0) from
+/// the `open`th ([`PF_OPEN`]; `HELION_ROUTE_PF_OPEN` sets it, 1 makes a board
+/// design exercise the whole-device search). A fixed box kept nets
+/// whose only free detour lies outside it sharing at any price (G77: Ibex
+/// overuse sat at about 3,700 wires until a global whole-device switch at
+/// iteration 13, then fell to 243); opening it for every net at once cost
+/// 17x per search, so only the nets that keep failing pay for it (VPR's
+/// conflicted-mode doubling, nextpnr router2's growth on failure). Growth is
+/// bounded because a congested search floods its box: on the 3000-net bench a
+/// search expanded 7.7k wires at margin 8, 40k at 16, 215k at 32 and 2.1M over
+/// the whole device. With the cap, the 3000-net bench takes 20 iterations
+/// whether the device opens at the 8th, 12th or 24th failure, for 280M, 224M
+/// and 213M expansions; but a net whose only free detour lies past the cap
+/// shares until the open, so the open is a floor on PathFinder's iterations
+/// (13 at 12, 25 at 24).
+fn pf_margin(fails: u32, open: u32, cap: i32) -> i32 {
+    if fails >= open {
+        0
+    } else {
+        // Shift capped: 8 << 12 tiles is past any device, and an open from the environment can reach 100 fails.
+        (8 << (fails / 2).min(12)).min(cap.max(8))
+    }
+}
+
+/// The searches [`route_net`] tries in order for a load, as (negotiate,
+/// margin, cap_detour); `pf` is PathFinder's margin for the net, if any.
+/// Outside PathFinder: a free path near the net first (giving up on long
+/// detours); else the cheapest path through other nets' wires, near the net
+/// and then anywhere; the caller rips up the displaced nets. In PathFinder
+/// every signal wire but a clock net's may be shared: a search is the
+/// cheapest path at current prices in the net's box (the detour cap and the
+/// steep negotiating estimate let it run straight through congestion
+/// instead, G77). A box walled off by clock wires falls back to the same
+/// exact search over the whole device, which is not capped (each wire is
+/// expanded at most once), so it fails only when no path exists; the
+/// negotiating search's 6M cap is below the xc7z020's 9.25M wires.
+fn search_tries(pf: Option<i32>) -> Vec<(bool, i32, bool)> {
+    match pf {
+        Some(0) => vec![(false, 0, false)],
+        Some(m) => vec![(false, m, false), (false, 0, false)],
+        None => vec![(false, 8, true), (true, 8, false), (true, 0, false)],
+    }
 }
 
 /// What [`route_net`] returns, as its error, when [`FREE_ONLY`] is set and a
@@ -719,7 +771,9 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     // threshold is capped, and past it no net displaces another: the rest of
     // the pass routes what has a free path and leaves the others, with the
     // nets already displaced, to PathFinder.
-    let pf_after = (net_names.len() / 4 + 500).min(4000);
+    // HELION_ROUTE_PF_AFTER overrides it: 0 hands every net that would rip
+    // up another to PathFinder, to check PathFinder on a board design.
+    let pf_after = std::env::var("HELION_ROUTE_PF_AFTER").ok().and_then(|v| v.parse().ok()).unwrap_or((net_names.len() / 4 + 500).min(4000));
     FREE_ONLY.with(|f| f.set(false));
     let mut deferred: Vec<String> = Vec::new();
     let mut rips = 0usize;
@@ -1028,7 +1082,7 @@ fn pathfinder(
     claimed: &mut HashMap<(String, String), String>,
     load_delays: &mut HashMap<(String, String, String), u32>,
     queued: Vec<String>,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     const MAX_ITERATIONS: usize = 100;
     let wires_of = |pips: &[RoutedPip]| -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = pips
@@ -1065,11 +1119,16 @@ fn pathfinder(
     const STALL_ITERATIONS: usize = 30;
     let (mut best_over, mut best_it) = (usize::MAX, 0usize);
     let mut last_it = 0;
+    // Iterations each net has been on an overused node: its box grows with it.
+    let mut fails: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    let open = std::env::var("HELION_ROUTE_PF_OPEN").ok().and_then(|v| v.parse().ok()).unwrap_or(PF_OPEN);
+    let cap = std::env::var("HELION_ROUTE_PF_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
     for it in 1..=MAX_ITERATIONS {
         last_it = it;
         for (n, p) in &pf {
             if device.pf_overused(&wires_of(p)) {
                 todo.insert(n.clone());
+                *fails.entry(n.clone()).or_insert(0) += 1;
             }
         }
         let count = todo.len();
@@ -1079,7 +1138,10 @@ fn pathfinder(
             let drv = eps.iter().find(|e| e.is_driver).ok_or_else(|| format!("route: PathFinder: net `{net}` has no driver"))?;
             let loads: Vec<&Endpoint> = eps.iter().filter(|e| !e.is_driver).collect();
             let mut delays = Vec::new();
-            let p = match route_net(&net, drv, &loads, clock_spine_nets, device, claimed, &mut delays, &[])? {
+            PF_MARGIN.with(|m| m.set(Some(pf_margin(fails.get(&net).copied().unwrap_or(0), open, cap))));
+            let r = route_net(&net, drv, &loads, clock_spine_nets, device, claimed, &mut delays, &[]);
+            PF_MARGIN.with(|m| m.set(None));
+            let p = match r? {
                 RouteKind::Pips(p) => p,
                 k => return Err(format!("route: PathFinder: net `{net}` routed as {k:?}, not pips")),
             };
@@ -1150,7 +1212,7 @@ fn pathfinder(
         device.note_claims(&net, &new, claimed.len());
         nets.push(RoutedNet7 { net, kind: RouteKind::Pips(p) });
     }
-    Ok(())
+    Ok(last_it)
 }
 
 /// Check whether `driver -> load` is a dedicated hardware cascade wire and
@@ -1403,10 +1465,7 @@ fn route_net(
             }
         }
         if fast.is_none() {
-            // A free path near the net first (giving up on long detours);
-            // else the cheapest path through other nets' wires, near the
-            // net and then anywhere. The caller rips up the displaced nets.
-            for (negotiate, bbox, cap_detour) in [(false, 8, true), (true, 8, false), (true, 0, false)] {
+            for &(negotiate, bbox, cap_detour) in &search_tries(PF_MARGIN.with(|m| m.get())) {
                 if negotiate && FREE_ONLY.with(|f| f.get()) {
                     return Err(NO_FREE_PATH.to_string());
                 }
@@ -2259,5 +2318,187 @@ mod tests {
         p.luts.push(PlacedLut { name: "u_probe".into(), init: 1, tile: "CLB_X1".into(), site: "SLICE_X1".into(), bel: "B6LUT".into() });
         let err = route(&p, &FakeRouter).unwrap_err();
         assert!(err.contains("co0") && err.contains("cascade"), "got: {err}");
+    }
+
+    #[test]
+    fn pf_margin_doubles_then_opens_the_device() {
+        let m: Vec<i32> = (0..10).map(|f| pf_margin(f, 8, i32::MAX)).collect();
+        assert_eq!(m, vec![8, 8, 16, 16, 32, 32, 64, 64, 0, 0]);
+        // The defaults: the box stops at 16 tiles until the 12th failure.
+        let m: Vec<i32> = (0..14).map(|f| pf_margin(f, PF_OPEN, 16)).collect();
+        assert_eq!(m, [vec![8, 8], vec![16; 10], vec![0, 0]].concat());
+        assert_eq!(pf_margin(0, 1, 16), 8);
+        assert_eq!(pf_margin(1, 1, 16), 0);
+        assert_eq!(pf_margin(9, 99, 0), 8, "a cap below the first box keeps the first box");
+        // A large HELION_ROUTE_PF_OPEN: the box stays a positive margin.
+        assert_eq!(pf_margin(99, 1000, i32::MAX), 8 << 12);
+        assert!((0..100).all(|f| pf_margin(f, 1000, i32::MAX) >= 8));
+    }
+
+    /// G77: every PathFinder search is exact (not negotiating, no detour
+    /// cap), and every PathFinder net's last try covers the whole device.
+    /// A negotiating fallback stops at 6M expansions, below the xc7z020's
+    /// 9.25M wires, and running out aborted all of PathFinder.
+    #[test]
+    fn pathfinder_searches_are_exact_and_end_on_the_whole_device() {
+        for f in 0..10 {
+            let t = search_tries(Some(pf_margin(f, 8, 16)));
+            assert!(t.iter().all(|&(neg, _, cap)| !neg && !cap), "fails {f}: {t:?}");
+            assert_eq!(t.last(), Some(&(false, 0, false)), "fails {f}");
+        }
+    }
+
+    /// G77: a net whose every path inside the first PathFinder box crosses a
+    /// band of used wires. With a fixed box it shares until the stall stop;
+    /// with the box grown for each net that keeps sharing, and searched for
+    /// the cheapest path, it takes a free detour within a few iterations, and
+    /// the same input routes the same way.
+    #[test]
+    fn pathfinder_grows_the_box_of_a_net_that_keeps_sharing() {
+        use crate::device::{default_db_root, Device};
+        use crate::xdevice::{build_node_map, XDevice};
+        let mut dev = Device::load_xc7z020(&default_db_root()).expect("load xc7z020");
+        let maps = build_node_map(&mut dev);
+        let ep = |site: &str, pin: &str, is_driver: bool| Endpoint { site: site.into(), pin: pin.into(), is_driver };
+        let run = |rows: i32| {
+            let x = XDevice::new(&dev, maps.clone());
+            let grid = |site: &str, pin: &str| {
+                let (t, _) = x.site_pin_wire(site, pin).expect("pin wire");
+                let tile = dev.tile(dev.tile_by_name(&t).expect("tile")).expect("tile");
+                (tile.grid_x, tile.grid_y)
+            };
+            let ((sx, sy), (tx, _)) = (grid("SLICE_X40Y40", "AQ"), grid("SLICE_X56Y40", "AQ"));
+            // Every interconnect wire of a band 3 columns wide between the two,
+            // reaching well past the first box (8 tiles) above and below.
+            let xm = (sx + tx) / 2;
+            let mut band = Vec::new();
+            for i in 0..dev.tile_count() {
+                let t = dev.tile(i).expect("tile");
+                if t.name.starts_with("INT_") && (t.grid_x - xm).abs() <= 1 && (t.grid_y - sy).abs() <= rows {
+                    band.extend(dev.wires(i).unwrap_or(&[]).iter().filter(|w| !is_power_wire(w)).map(|w| (t.name.clone(), w.clone())));
+                }
+            }
+            let net_eps: HashMap<String, Vec<Endpoint>> =
+                [("n".to_string(), vec![ep("SLICE_X40Y40", "AQ", true), ep("SLICE_X56Y40", "A1", false)])].into_iter().collect();
+            x.pf_present(Some(200));
+            x.pf_occupy(&band, 1);
+            let (mut nets, mut claimed, mut delays) = (Vec::new(), HashMap::new(), HashMap::new());
+            let its = pathfinder(&net_eps, &HashSet::new(), &x, &mut nets, &mut claimed, &mut delays, vec!["n".into()]).expect("converges");
+            let RouteKind::Pips(p) = &nets.iter().find(|n| n.net == "n").expect("routed").kind else { panic!("not pips") };
+            (its, p.iter().map(|p| format!("{}.{}->{}", p.tile, p.src_wire, p.dst_wire)).collect::<Vec<_>>())
+        };
+        let (its, pips) = run(12);
+        assert!(its <= 8, "took {its} iterations");
+        assert_eq!(run(12), (its, pips), "same input, same route");
+        // A band 70 rows above and below: only the whole device (from the
+        // PF_OPEN-th failure; the box stops at 16 tiles) holds the detour,
+        // which is long, so a search capped at twice the direct estimate finds
+        // none, and the negotiating search (220 ps per tile) kept crossing the
+        // band. The exact search detours in the iteration after the open: the
+        // open is this net's floor, so it must stay low.
+        let (its, pips) = run(70);
+        assert!(its <= 13 && pips.len() <= 30, "took {its} iterations, {} pips", pips.len());
+    }
+
+    /// G77: a PathFinder net whose first box is cut by a clock net's wires
+    /// (which nothing may share) still routes, through the whole-device
+    /// fallback, around the clock wires and outside the box.
+    #[test]
+    fn pathfinder_falls_back_to_the_whole_device_around_clock_wires() {
+        use crate::device::{default_db_root, Device};
+        use crate::xdevice::{build_node_map, XDevice};
+        let mut dev = Device::load_xc7z020(&default_db_root()).expect("load xc7z020");
+        let maps = build_node_map(&mut dev);
+        let mut x = XDevice::new(&dev, maps);
+        x.clock_nets.insert("clk".into());
+        let grid = |x: &XDevice, site: &str, pin: &str| {
+            let (t, _) = x.site_pin_wire(site, pin).expect("pin wire");
+            let tile = dev.tile(dev.tile_by_name(&t).expect("tile")).expect("tile");
+            (tile.grid_x, tile.grid_y)
+        };
+        let ((sx, sy), (tx, _)) = (grid(&x, "SLICE_X40Y40", "AQ"), grid(&x, "SLICE_X56Y40", "AQ"));
+        // A clock net owns every interconnect wire of a band 3 columns wide
+        // between the two, 12 rows above and below: past the first box (8).
+        let xm = (sx + tx) / 2;
+        let mut claimed = HashMap::new();
+        for i in 0..dev.tile_count() {
+            let t = dev.tile(i).expect("tile");
+            if t.name.starts_with("INT_") && (t.grid_x - xm).abs() <= 1 && (t.grid_y - sy).abs() <= 12 {
+                for w in dev.wires(i).unwrap_or(&[]).iter().filter(|w| !is_power_wire(w)) {
+                    claimed.insert((t.name.clone(), w.clone()), "clk".to_string());
+                }
+            }
+        }
+        let wall: HashSet<(String, String)> = claimed.keys().cloned().collect();
+        let ep = |site: &str, pin: &str, is_driver: bool| Endpoint { site: site.into(), pin: pin.into(), is_driver };
+        let net_eps: HashMap<String, Vec<Endpoint>> =
+            [("n".to_string(), vec![ep("SLICE_X40Y40", "AQ", true), ep("SLICE_X56Y40", "A1", false)])].into_iter().collect();
+        let (mut nets, mut delays) = (Vec::new(), HashMap::new());
+        let its = pathfinder(&net_eps, &HashSet::new(), &x, &mut nets, &mut claimed, &mut delays, vec!["n".into()]).expect("routes");
+        assert_eq!(its, 1);
+        let RouteKind::Pips(p) = &nets.iter().find(|n| n.net == "n").expect("routed").kind else { panic!("not pips") };
+        assert!(!p.is_empty());
+        let node = |t: &str, w: &str| x.node_key(t, w);
+        let wall_nodes: HashSet<u64> = wall.iter().filter_map(|(t, w)| node(t, w)).collect();
+        assert!(!p.iter().flat_map(|q| [node(&q.tile, &q.src_wire), node(&q.tile, &q.dst_wire)]).flatten().any(|k| wall_nodes.contains(&k)), "took a clock wire");
+        let far = p.iter().any(|q| (dev.tile(dev.tile_by_name(&q.tile).expect("tile")).expect("tile").grid_y - sy).abs() > 8);
+        assert!(far, "stayed inside the first box");
+    }
+
+    /// G77 benchmark: PathFinder alone on a dense patch of the xc7z020 (every
+    /// net starts unrouted, as the fill's deferred nets do), to compare router
+    /// changes in minutes instead of a fill build. `PF_BENCH_NETS` sets the
+    /// net count (default 2400 in a 20 x 20 slice patch). 2400 nets: 13
+    /// iterations with the fixed box, 6 with it grown per net; 3000 nets: 18
+    /// grown, and the fixed box still had 1,868 wires overused at iteration 12.
+    /// `cargo test --release -p helion-xilinx7 --lib pathfinder_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn pathfinder_bench_dense_patch() {
+        use crate::device::{default_db_root, Device};
+        use crate::xdevice::{build_node_map, XDevice};
+        let mut dev = Device::load_xc7z020(&default_db_root()).expect("load xc7z020");
+        let maps = build_node_map(&mut dev);
+        let x = XDevice::new(&dev, maps);
+        let nets: usize = std::env::var("PF_BENCH_NETS").ok().and_then(|v| v.parse().ok()).unwrap_or(2400);
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        let outs = ["AQ", "BQ", "CQ", "DQ", "A", "B", "C", "D", "AMUX", "BMUX", "CMUX", "DMUX"];
+        let mut free_in: HashSet<(u64, u64, usize)> = HashSet::new();
+        for sx in 0..20 {
+            for sy in 0..20 {
+                for i in 0..24 {
+                    free_in.insert((sx, sy, i));
+                }
+            }
+        }
+        let mut net_eps: HashMap<String, Vec<Endpoint>> = HashMap::new();
+        let ep = |sx: u64, sy: u64, pin: String, is_driver: bool| Endpoint { site: format!("SLICE_X{}Y{}", 30 + sx, 30 + sy), pin, is_driver };
+        for k in 0..nets {
+            let (sx, sy) = ((k / outs.len()) as u64 % 20, (k / outs.len() / 20) as u64 % 20);
+            let mut eps = vec![ep(sx, sy, outs[k % outs.len()].to_string(), true)];
+            for _ in 0..2 {
+                for _ in 0..50 {
+                    let (lx, ly, i) = ((sx + 14 + next(13)) % 20, (sy + 14 + next(13)) % 20, next(24) as usize);
+                    if free_in.remove(&(lx, ly, i)) {
+                        eps.push(ep(lx, ly, format!("{}{}", ["A", "B", "C", "D"][i / 6], i % 6 + 1), false));
+                        break;
+                    }
+                }
+            }
+            net_eps.insert(format!("n{k:05}"), eps);
+        }
+        let queued: Vec<String> = net_eps.keys().cloned().collect();
+        let (mut routed, mut claimed, mut delays) = (Vec::new(), HashMap::new(), HashMap::new());
+        let t = std::time::Instant::now();
+        let r = pathfinder(&net_eps, &HashSet::new(), &x, &mut routed, &mut claimed, &mut delays, queued);
+        let pips: usize = routed.iter().map(|n| if let RouteKind::Pips(p) = &n.kind { p.len() } else { 0 }).sum();
+        let worst = delays.values().max().copied().unwrap_or(0);
+        eprintln!("pf_bench nets={nets} result={:?} time={:.1}s pips={pips} worst_delay={worst}ps", r.as_ref().map_err(|e| e.lines().next().unwrap_or("").to_string()), t.elapsed().as_secs_f64());
     }
 }
