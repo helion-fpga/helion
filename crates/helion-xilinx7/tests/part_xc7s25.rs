@@ -69,9 +69,10 @@ fn xc7s25_device_model() {
     assert_eq!(dev.bufg_sites().len(), 32);
 
     // No `required_features.fasm` for any spartan7 part: Vivado bitstreams
-    // for the XC7S25 leave the CFG_CENTER_MID bits that carry Zynq's
-    // ALWAYS_ON_PROP features (26_2206, 26_2207, 27_2205) clear, so there is
-    // nothing to add.
+    // for the XC7S25 leave the CFG_CENTER_MID bits 26_2206, 26_2207 and
+    // 27_2205 clear, so there is nothing to add. (At the pinned database
+    // these bits decode as ICAP.IN_USE on spartan7 and artix7; on zynq7 they
+    // are the ALWAYS_ON_PROP features.)
     assert!(
         dev.required_features().is_empty(),
         "{:?}",
