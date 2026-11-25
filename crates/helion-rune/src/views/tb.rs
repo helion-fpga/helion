@@ -1239,7 +1239,10 @@ pub fn last_vcd(s: &AppState) -> Option<PathBuf> {
 /// Coverage view shows a real run's coverage (never writes into the repo).
 pub fn seed_coverage_fixture(s: &mut AppState) {
     let ex = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
-    let dir = std::env::temp_dir().join("helion-rune-scenes").join("coverage");
+    // One dir per call: parallel scenes rewrote and ran the same files.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join("helion-rune-scenes").join(format!("coverage-{}-{seq}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     for f in ["counter.sv", "counter_tb.sv"] {
         let _ = std::fs::copy(ex.join(f), dir.join(f));

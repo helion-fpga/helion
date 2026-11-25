@@ -308,7 +308,10 @@ pub fn branches_tab(c: &TbCoverage, t: &VivadoTheme) -> El {
 /// testbench that exercises part of it, copied to a temp directory and run
 /// for real (never writes into the repo).
 pub fn seed_fixture(s: &mut AppState) -> Option<PathBuf> {
-    let dir = std::env::temp_dir().join("helion-rune-scenes").join(format!("coverage-dut-{}", std::process::id()));
+    // One dir per call: parallel scenes in one process rewrote and ran the same files.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join("helion-rune-scenes").join(format!("coverage-dut-{}-{seq}", std::process::id()));
     std::fs::create_dir_all(&dir).ok()?;
     let dut = dir.join("cov_dut.sv");
     std::fs::write(&dut, FIXTURE_DUT).ok()?;
