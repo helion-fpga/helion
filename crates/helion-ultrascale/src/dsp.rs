@@ -126,6 +126,103 @@ pub fn is_dsp48e2_entry(tile: &str, feature: &str) -> bool {
     DSP48E2_ATTRIBUTES.contains(&first)
 }
 
+/// What the emitter should do with one DSP48E2 entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DspEntry {
+    /// Not a DSP entry at all; the emitter continues to the normal lookup.
+    NotDsp,
+    /// A DSP attribute whose value is the base value: emits no bit.
+    Base,
+    /// A DSP attribute with a measured encoding: emit these bits.
+    Measured(Vec<crate::dsp_fuzz::Bit>),
+    /// A DSP attribute with no measured encoding. Carries the attribute name
+    /// so the error names what is missing.
+    Blocked { attribute: String, reason: String },
+}
+
+/// Split a DSP feature spelling into `(attribute, value)`.
+///
+/// The spellings seen in practice are `AREG` (bare, meaning a boolean is set),
+/// `AREG.A` or `AMULTSEL.AD`, and `MASK[47:0]`. Returns None when the feature
+/// is not an attribute setting at all (a PIP, or an empty feature).
+fn split_attribute(feature: &str) -> Option<(String, Option<String>)> {
+    if feature.starts_with("PIP.") || feature.is_empty() {
+        return None;
+    }
+    let mut parts = feature.split('.');
+    let first = parts.next()?;
+    let (name, bracketed) = match first.find('[') {
+        Some(i) => (&first[..i], Some(&first[i..])),
+        None => (first, None),
+    };
+    // `AMULTSEL.AD` style: value is the next component.
+    if let Some(value) = parts.next() {
+        return Some((name.to_string(), Some(value.to_string())));
+    }
+    // `AREG[1:0]` style: the bracket itself is the value spelling, which the
+    // resolver compares textually. A bare name carries no value.
+    Some((name.to_string(), bracketed.map(|s| s.to_string())))
+}
+
+/// Decide one DSP entry against the measured fuzz table.
+///
+/// This is the whole "lift" of the blanket block: an entry is allowed when
+/// its attribute is either at the base value or has a measured encoding, and
+/// blocked (naming the attribute) otherwise. Non-DSP entries are passed
+/// through untouched.
+pub fn classify_entry(tile: &str, feature: &str) -> DspEntry {
+    if !is_dsp48e2_entry(tile, feature) {
+        return DspEntry::NotDsp;
+    }
+    let (attribute, value) = match split_attribute(feature) {
+        Some(pair) => pair,
+        // A PIP on a DSP tile: routing, not config. Still has no encoding
+        // from any public source, so it stays blocked.
+        None => {
+            return DspEntry::Blocked {
+                attribute: feature.to_string(),
+                reason: "routing or non-attribute feature on a DSP tile".to_string(),
+            }
+        }
+    };
+    // A bare attribute name with no value is the set form (for example
+    // `AREG` means the register is 1). Treat it as value "1".
+    let value = value.unwrap_or_else(|| "1".to_string());
+    // Measured bits only mean anything on a tile that really is a DSP48E2.
+    // `is_dsp48e2_entry` also fires for a bare attribute name on ANY tile
+    // (rule 4), which is how a stray `SLICE_X0Y0.AREG` gets caught. Such an
+    // entry has no DSP tile to place bits in, so it stays blocked even when
+    // the attribute and value are measured.
+    if !is_dsp_tile(tile) {
+        return DspEntry::Blocked {
+            attribute,
+            reason: "DSP48E2 attribute named on a non-DSP tile".to_string(),
+        };
+    }
+    match crate::dsp_fuzz::resolve(&attribute, &value) {
+        Ok(crate::dsp_fuzz::Resolved::Base) => DspEntry::Base,
+        Ok(crate::dsp_fuzz::Resolved::Bits(bits)) => DspEntry::Measured(bits),
+        Err(crate::dsp_fuzz::Unmeasured::Attribute) => DspEntry::Blocked {
+            attribute,
+            reason: "no measured encoding for any value of this attribute".to_string(),
+        },
+        Err(crate::dsp_fuzz::Unmeasured::Value { from, to }) => DspEntry::Blocked {
+            attribute,
+            reason: format!(
+                "measured only for {from} -> {to}; the requested value is not covered"
+            ),
+        },
+    }
+}
+
+/// True when the tile name denotes a DSP48E2 site or a DSP tile, i.e. a tile
+/// the measured bits can actually be written into. Mirrors rules 1 and 3 of
+/// [`is_dsp48e2_entry`] but excludes the bare-name rule.
+pub fn is_dsp_tile(tile: &str) -> bool {
+    tile.contains("DSP48E2") || tile.starts_with("DSP_")
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

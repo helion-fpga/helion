@@ -1,10 +1,20 @@
 # DSP48E2 config-bit encoding: search record
 
-Status: MISSING in every public source searched. No DSP48E2 config-bit
-encoding is derivable from public sources. Do not invent one. Designs
-using a DSP48E2 fail loud (`BitgenError::Dsp48e2Blocked`, see
-`crates/helion-ultrascale/src/dsp.rs`) until Vivado fuzzing job 2
-lands the encoding.
+Status: MISSING in every public source searched (sections 1-6 below still
+stand). PARTIALLY SUPPLIED since 2026-11-25 by black-box fuzzing on part
+xcku3p-ffva676-1-e: `vivado_fuzz_xcku3p.tsv` records the measured bits for
+17 attribute/value pairs, and `src/dsp_fuzz.rs` resolves them. An
+attribute listed there emits its measured bits; everything else still
+fails loud with `BitgenError::Dsp48e2Blocked`, naming the attribute. The
+fuzz data is a separate provenance class that needs owner approval before
+it goes to the public remote (see `PROVENANCE.md`).
+
+Still unmeasured, and therefore still blocked: any pipeline register value
+other than the base (all registers 1) or `MREG 1 -> 0`; `USE_SIMD` modes
+(Vivado refused to write a bitstream for TWO24 and FOUR12); the
+`IS_*_INVERTED` attributes on driven pins (Vivado accepted the change but
+wrote no bit); `MASK`, `SEL_MASK` (no bit written); `USE_MULT DYNAMIC`
+(no bit written).
 
 Searched 2026-11-19 by the DSP48E2 worker (session 18), on branch
 `fm/ultra-bitgen-dsp`, worktree `~/workspace/helion-ultra-bitgen-dsp`.

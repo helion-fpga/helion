@@ -1,0 +1,58 @@
+# DSP48E2 config bits measured by black-box fuzzing (xcku3p-ffva676-1-e)
+#
+# PROVENANCE: see the "Vivado black-box fuzz" section of PROVENANCE.md.
+# Method: one attribute changed per bitstream from a base design, bitstream
+# diffed against the base. Same black-box method prjxray/prjuray used for
+# their CC0 databases. Raw .bit/.ll/.dcp files are NOT in this repo.
+#
+# Target: DSP48E2_X0Y44 at tile DSP_X3Y110 (column 68, row 134, X0Y1).
+# Frame base minor 4; the DSP occupies minors 4..6 of FAR 0x00040e04..e06.
+# Bit numbers below are absolute within a frame (0..2591).
+#
+# Format:
+#   <attribute>\t<from value>\t<to value>\t<frame minor>\t<bit>\t<effect>
+#
+# <effect> is one of:
+#   +8   the diff set the bit (base had 0)
+#   -8   the diff cleared the bit (base had 1)
+#
+# POLARITY WARNING: "-8" rows mean the stored bit is the INVERSE of the
+# attribute value: to emit value "to", CLEAR the bit. Rows marked +8 set it.
+# An attribute with several rows must have them applied together; that is the
+# whole point of the multi-row AMULTSEL/BMULTSEL entries below.
+#
+# Every row here was independently re-derived from the base and variant
+# .bit.gz pairs and matched the stored per-variant diff exactly
+# (49 of 49 variants, 0 mismatches, ECC words 45/46 excluded).
+#
+# NOT MEASURED (still blocked): any pipeline register value other than the
+# base (all registers = 1) or the MREG 1->0 row below; USE_SIMD TWO24/FOUR12
+# (Vivado refused both, dsp_v009/v010 BIT_FAIL); IS_*_INVERTED on a driven
+# pin (Vivado accepted the change but wrote no bit: dsp_v023/v024/v026-v037);
+# MASK and SEL_MASK changes (no bit written: dsp_v016/v018/v019/v020);
+# USE_MULT DYNAMIC (no bit written: dsp_v008).
+
+attribute	from	to	minor	bit	effect
+AMULTSEL	A	AD	4	2579	-8
+AMULTSEL	A	AD	5	2585	+8
+AMULTSEL	A	AD	5	2611	-8
+BMULTSEL	B	AD	4	2579	-8
+BMULTSEL	B	AD	5	2583	+8
+BMULTSEL	B	AD	5	2611	-8
+A_INPUT	DIRECT	CASCADE	4	2580	+8
+B_INPUT	DIRECT	CASCADE	4	2560	+8
+PREADDINSEL	A	B	4	2582	+8
+RND	000000000000	000000000001	4	2565	+8
+USE_MULT	MULTIPLY	NONE	5	2574	+8
+USE_WIDEXOR	FALSE	TRUE	5	2576	+8
+XORSIMD	XOR24_48_96	XOR12	4	2505	+8
+AUTORESET_PATDET	NO_RESET	RESET_MATCH	5	2531	+8
+AUTORESET_PATDET	NO_RESET	RESET_NOT_MATCH	5	2503	+8
+AUTORESET_PATDET	NO_RESET	RESET_NOT_MATCH	5	2531	+8
+AUTORESET_PRIORITY	RESET	CEP	5	2540	+8
+PATTERN	000000000000	000000000001	5	2571	+8
+SEL_PATTERN	PATTERN	C	5	2579	+8
+USE_PATTERN_DETECT	NO_PATDET	PATDET	6	2534	-8
+USE_PATTERN_DETECT	NO_PATDET	PATDET	6	2536	-8
+IS_CLK_INVERTED	1'b0	1'b1	4	2536	-8
+MREG	1	0	5	2582	+8

@@ -1714,17 +1714,52 @@ pub fn emit_frames(
     // correct frames.
     let mut lutram_masks: HashMap<u32, [bool; FRAME_BITS]> = HashMap::new();
     for entry in &entries {
-        // DSP first: a DSP48E2 / DSP tile entry has no encoding in any
-        // public source, so it must fail here with the specific error,
-        // not further down as UnknownTile / UnknownTileType /
-        // UnknownFeature. The check runs before any lookup so that even
-        // a segbits entry for the feature (which could only come from a
-        // non-public source) is never trusted.
-        if crate::dsp::is_dsp48e2_entry(&entry.tile, &entry.feature) {
-            return Err(BitgenError::Dsp48e2Blocked {
-                tile: entry.tile.clone(),
-                feature: entry.feature.clone(),
-            });
+        // DSP48E2: the blanket block is lifted for the attributes whose
+        // bits were measured by black-box fuzzing (see src/dsp_fuzz.rs and
+        // data/vivado_fuzz_xcku3p.tsv). An entry is allowed when its
+        // attribute is at the base value (emits nothing) or has a measured
+        // encoding (emits those bits); anything else still fails here, with
+        // the specific error naming the attribute, before the generic
+        // UnknownTile / UnknownTileType / UnknownFeature paths. The check
+        // runs before any segbits lookup so that a segbits entry for a DSP
+        // feature is never trusted over the measured table.
+        match crate::dsp::classify_entry(&entry.tile, &entry.feature) {
+            crate::dsp::DspEntry::NotDsp => {}
+            crate::dsp::DspEntry::Base => continue,
+            crate::dsp::DspEntry::Blocked { .. } => {
+                return Err(BitgenError::Dsp48e2Blocked {
+                    tile: entry.tile.clone(),
+                    feature: entry.feature.clone(),
+                });
+            }
+            crate::dsp::DspEntry::Measured(bits) => {
+                let base_far = device
+                    .tile_base_far(&entry.tile)
+                    .ok_or_else(|| BitgenError::UnknownTile {
+                        tile: entry.tile.clone(),
+                    })?;
+                for b in bits {
+                    write_frame_bit(
+                        &mut frames,
+                        &mut written,
+                        &entry.tile,
+                        &entry.feature,
+                        base_far,
+                        b.frame_offset(),
+                        b.bit,
+                        b.set,
+                        // Every measured DSP bit is materialized, cleared
+                        // ones included. The device's base frame has some
+                        // of these bits SET (minor 4 bit 2579 and minor 5
+                        // bit 2611 are 1 in the base bitstream), so a
+                        // measured clear is a real state change, not a
+                        // no-op on a zeroed frame. Passing `b.set` here
+                        // would have silently dropped the clears.
+                        true,
+                    )?;
+                }
+                continue;
+            }
         }
         // URAM288 has no public encoding: fail with the named error
         // rather than the generic unknown-tile / unknown-feature
@@ -3444,6 +3479,140 @@ mod tests {
                 "INT_X1Y1.PIP.INT_INT_SDQ_4_INT_OUT0.INT_NODE_SDQ_56_INT_OUT0"
             ),
             "Y1 PIP missing from parse-back:\n{back}"
+        );
+    }
+
+    /// A device with one real DSP48E2 tile at the measured FAR, so the DSP
+    /// guard tests can assert exact frames against the fuzz data.
+    ///
+    /// DSP48E2_X0Y44 sits at tile DSP_X3Y110 (column 68, row 134) and its
+    /// frame base is 0x00040E04, minor 4; the measured bits live in minors
+    /// 4, 5 and 6 of that base.
+    fn dsp_db() -> (StubDevice, StubSegbitsDb) {
+        let base: u32 = 0x0004_0E04;
+        let device = StubDevice::new(
+            "xcku3p",
+            Some(0x04A6_3093),
+            vec![("DSP_X3Y110".to_string(), "DSP".to_string(), base)],
+            (0..8).map(|i| base + i).collect(),
+        );
+        let db = StubSegbitsDb::new(vec![]);
+        (device, db)
+    }
+
+    /// Read one bit out of the emitted frames, or false when the frame or
+    /// bit was never materialized in that state.
+    fn frame_bit(frames: &BTreeMap<u32, FrameWords>, far: u32, bit: u16) -> bool {
+        frames
+            .get(&far)
+            .map(|w| {
+                let word = w[bit as usize / 32];
+                (word >> (bit % 32)) & 1 == 1
+            })
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn dsp_amultsel_ad_emits_exactly_the_measured_bits() {
+        // The task guard: a DSP using AMULTSEL=AD emits exactly the bits the
+        // fuzz run measured, no more and no fewer. From
+        // data/vivado_fuzz_xcku3p.tsv: AMULTSEL A -> AD is
+        //   minor 4 bit 2579 clear, minor 5 bit 2585 set, minor 5 bit 2611 clear.
+        let (device, db) = dsp_db();
+        let frames = emit_frames("DSP_X3Y110.AMULTSEL.AD\n", &device, &db)
+            .expect("AMULTSEL=AD is measured and must emit");
+        // FAR 0x40E04 is the tile base, which is minor 4, so minor m lives
+        // at offset (m - 4).
+        let base: u32 = 0x0004_0E04;
+        assert!(!frame_bit(&frames, base, 2579), "minor 4 bit 2579 cleared");
+        assert!(frame_bit(&frames, base + 1, 2585), "minor 5 bit 2585 set");
+        assert!(!frame_bit(&frames, base + 1, 2611), "minor 5 bit 2611 cleared");
+        // Exactly three bits across exactly two frames: no collateral writes.
+        // Only bit 2585 is a config bit. The other set bits in the emitted
+        // frame are the frame ECC band (1440..1487), which emit_frames
+        // computes independently; a fuzz diff excludes that band too, so
+        // comparing config bits only is the like-for-like check.
+        let ecc_lo = 1440usize;
+        let ecc_hi = 1487usize;
+        let mut config_set: Vec<(u32, usize)> = Vec::new();
+        for (far, w) in &frames {
+            for (wi, word) in w.iter().enumerate() {
+                for b in 0..32 {
+                    let bit = wi * 32 + b;
+                    if (word >> b) & 1 == 1 && !(ecc_lo..=ecc_hi).contains(&bit) {
+                        config_set.push((*far, bit));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            config_set,
+            vec![(base + 1, 2585)],
+            "exactly one config bit set, at minor 5 bit 2585"
+        );
+        // Both addressed frames must be present. The base bitstream has
+        // minor 4 bit 2579 and minor 5 bit 2611 SET, so the measured clears
+        // are real state changes: an emitter that started from an all-zero
+        // frame and skipped the clears would produce a bitstream Vivado
+        // never produced, with AMULTSEL left at its base encoding.
+        assert_eq!(frames.len(), 2, "minors 4 and 5 are both addressed");
+        assert!(frames.contains_key(&base), "minor 4 carries a cleared bit");
+        assert!(!frames.contains_key(&(base + 2)), "minor 6 must not be written");
+    }
+
+    #[test]
+    fn dsp_areg_zero_is_refused_with_the_attribute_named() {
+        // The task guard: AREG=0 has no measured encoding, so the emitter
+        // must refuse rather than guess, and the error must be the DSP one.
+        let (device, db) = dsp_db();
+        let err = emit_frames("DSP_X3Y110.AREG.0\n", &device, &db)
+            .expect_err("AREG=0 is unmeasured and must be refused");
+        assert_eq!(
+            err,
+            BitgenError::Dsp48e2Blocked {
+                tile: "DSP_X3Y110".to_string(),
+                feature: "AREG.0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn dsp_base_values_emit_nothing() {
+        // Base values must not write a single bit: the tile stays absent from
+        // the frameset entirely.
+        let (device, db) = dsp_db();
+        let frames = emit_frames("DSP_X3Y110.AMULTSEL.A\n", &device, &db)
+            .expect("the base value is allowed");
+        assert!(frames.is_empty(), "base value must emit no bits");
+    }
+
+    #[test]
+    fn dsp_pip_on_dsp_tile_stays_blocked() {
+        // Lifting the attribute block must not open the tile to routing
+        // entries, which still have no encoding.
+        let (device, db) = dsp_db();
+        let err = emit_frames(
+            "DSP_X3Y110.PIP.DSP_DSP48_0_A0.DSP_DSP48_0_A0_PIN\n",
+            &device,
+            &db,
+        )
+        .expect_err("a PIP on a DSP tile is still blocked");
+        assert!(matches!(err, BitgenError::Dsp48e2Blocked { .. }));
+    }
+
+    #[test]
+    fn dsp_measured_value_on_non_dsp_tile_stays_blocked() {
+        // A bare DSP attribute name on a slice tile is caught by the
+        // bare-name rule and must not resolve to measured bits there.
+        let (device, db) = one_bit_db();
+        let err = emit_frames("SLICE_X0Y0.IS_CLK_INVERTED\n", &device, &db)
+            .expect_err("bare DSP attribute on a slice is blocked");
+        assert_eq!(
+            err,
+            BitgenError::Dsp48e2Blocked {
+                tile: "SLICE_X0Y0".to_string(),
+                feature: "IS_CLK_INVERTED".to_string(),
+            }
         );
     }
 }
