@@ -986,11 +986,54 @@ pub fn resolve_ofl_board(part: Option<&str>) -> Option<String> {
         .or_else(|| part.and_then(xilinx_ofl_board).map(str::to_string))
 }
 
-/// openFPGALoader `-b` for the 7-series boards Helion builds for. Kept out of
-/// [`HAD_KNOWN_BOARDS`], whose IDCODEs mark a TAP as a Helion HL10T.
-fn xilinx_ofl_board(part: &str) -> Option<&'static str> {
+/// 7-series boards Helion builds for: part prefix, openFPGALoader `-b` name,
+/// and whether a Helion bitstream has been loaded and run on that board.
+/// Kept out of [`HAD_KNOWN_BOARDS`], whose IDCODEs mark a TAP as a Helion HL10T.
+const X7_BOARDS: &[(&str, &str, bool)] = &[
     // clg484 is the ZedBoard's package (PYNQ-Z1 and MicroZed are clg400).
-    part.to_ascii_lowercase().starts_with("xc7z020clg484").then_some("zedboard")
+    ("xc7z020clg484", "zedboard", true),
+    ("xc7a35tcsg324", "arty_a7_35t", false),
+    // cpg236 is also the Cmod A7-35T; Basys 3 is the board Helion lists.
+    ("xc7a35tcpg236", "basys3", false),
+    ("xc7a100tcsg324", "nexys_a7_100", false),
+];
+
+fn x7_board(part: &str) -> Option<&'static (&'static str, &'static str, bool)> {
+    let p = part.trim().to_ascii_lowercase();
+    // The IDE's short "xc7a35t" is the Arty A7-35T's csg324.
+    let p = if p == "xc7a35t" { "xc7a35tcsg324".to_string() } else { p };
+    X7_BOARDS.iter().find(|(prefix, _, _)| p.starts_with(prefix))
+}
+
+/// openFPGALoader `-b` for a 7-series part, if Helion knows its board.
+pub fn xilinx_ofl_board(part: &str) -> Option<&'static str> {
+    x7_board(part).map(|b| b.1)
+}
+
+/// False for a 7-series board no Helion bitstream has been run on yet.
+pub fn x7_board_hardware_tested(part: &str) -> bool {
+    x7_board(part).is_some_and(|b| b.2)
+}
+
+/// Why Helion cannot program a Lattice part, with the commands that pack and
+/// load `artifact` (the run's `.asc` / `.config`) outside Helion. `None` for
+/// other families.
+pub fn lattice_program_reason(part: &str, artifact: Option<&std::path::Path>) -> Option<String> {
+    let p = part.to_ascii_lowercase();
+    let (ext, cmd) = if p.starts_with("ice40") {
+        ("asc", "icepack {s}.asc {s}.bin && iceprog {s}.bin")
+    } else if p.starts_with("lfe5u") {
+        ("config", "ecppack {s}.config {s}.bit && openFPGALoader -b ulx3s {s}.bit")
+    } else {
+        return None;
+    };
+    let stem = artifact.map_or_else(|| "top".to_string(), |a| a.with_extension("").display().to_string());
+    let stem = if stem.contains(' ') { format!("\"{stem}\"") } else { stem };
+    Some(format!(
+        "Helion can't program {part} yet, and no Helion Lattice bitstream has been tested on a board{}. To try it yourself: {}",
+        if ext == "asc" { " (iCE40 routing has a known defect, G25)" } else { "" },
+        cmd.replace("{s}", &stem)
+    ))
 }
 
 /// A copy of a 7-series `.bit` that is safe to load over a running design:
@@ -3054,6 +3097,15 @@ mod tests {
     }
 
     #[test]
+    fn lattice_parts_get_the_external_pack_and_load_commands() {
+        let ice = lattice_program_reason("ice40-hx8k", Some(std::path::Path::new("/r/blinky.asc"))).unwrap();
+        assert!(ice.contains("icepack /r/blinky.asc /r/blinky.bin && iceprog /r/blinky.bin") && ice.contains("G25"), "{ice}");
+        let ecp = lattice_program_reason("LFE5U-85F", None).unwrap();
+        assert!(ecp.contains("ecppack top.config top.bit && openFPGALoader -b ulx3s top.bit"), "{ecp}");
+        assert!(lattice_program_reason("xc7z020clg484-1", None).is_none());
+    }
+
+    #[test]
     fn had_board_lookup_and_ofl_board_resolve() {
         let _guard = OFL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
@@ -3070,6 +3122,18 @@ mod tests {
         if std::env::var("HELION_OFL_BOARD").is_err() {
             assert_eq!(resolve_ofl_board(Some("xc7z020clg484-1")).as_deref(), Some("zedboard"));
             assert!(lookup_had_board("xc7z020clg484-1").is_none());
+            // openFPGALoader --list-boards names (v1.x).
+            for (part, board, tested) in [
+                ("xc7a35t", "arty_a7_35t", false),
+                ("xc7a35tcsg324-1", "arty_a7_35t", false),
+                ("xc7a35tcpg236-1", "basys3", false),
+                ("xc7a100tcsg324-1", "nexys_a7_100", false),
+                ("xc7z020clg484-1", "zedboard", true),
+            ] {
+                assert_eq!(resolve_ofl_board(Some(part)).as_deref(), Some(board), "{part}");
+                assert_eq!(x7_board_hardware_tested(part), tested, "{part}");
+            }
+            assert_eq!(resolve_ofl_board(Some("xc7z020clg400-1")), None, "PYNQ/Zybo package is not the ZedBoard");
         }
         assert_eq!(
             resolve_ofl_board(Some("HL10T-C32-1")).as_deref(),

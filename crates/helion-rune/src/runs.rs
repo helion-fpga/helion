@@ -43,11 +43,6 @@ use crate::state::{
     ToastKind, UtilState,
 };
 
-/// Fallback device when the project part has no Helion HAD model (same
-/// default part `GpuiShell::default` ships). The substitution is always
-/// announced as a warning line, never silent.
-const FALLBACK_PART: &str = "HL10T-C32-1";
-
 /// Implicit analysis clock when no user SDC is found (10 ns, mirroring
 /// `ide.rs:7283 clock_period_ps: 10_000`).
 const IMPLICIT_CLOCK_PS: u64 = 10_000;
@@ -1081,6 +1076,12 @@ fn run_worker(
 
     send(format!("open_source {}", source.display()), MsgSev::Info);
 
+    // A part no backend implements stops before any stage, with the reason.
+    if helion_targets::family_of(&part_req).is_none() {
+        finish(Err(part_not_implementable(&part_req)));
+        return;
+    }
+
     // 7-series parts run the HDL + XDC flow (its own synthesis front end).
     if kind == RunKind::Synth && crate::runs_family::is_xilinx7(&part_req) {
         finish(crate::runs_family::run_xdc_synth(&source, &part_req, &send));
@@ -1720,34 +1721,42 @@ pub(crate) fn load_run_constraints(
     (xdc, clks)
 }
 
-/// Project part first, HL10T fallback with a loud warning (never silent).
+/// The project part's Helion HAD model. Any other part is an error, never
+/// an HL10T stand-in: numbers from the HL10T model would describe another chip.
 pub(crate) fn resolve_device(
     part_req: &str,
-    emit: &impl Fn(String, MsgSev),
+    _emit: &impl Fn(String, MsgSev),
 ) -> Result<helion_device::Device, String> {
     match helion_device::Device::load_part(part_req) {
         Ok(dev) => Ok(dev),
-        // An iCE40 / ECP5 / 7-series part is a real device: numbers from the
-        // HL10T model would describe another chip.
-        Err(_) if crate::views::device_family::is_family_part(part_req) => Err(format!(
+        Err(_) if crate::runs_family::foreign_family(part_req).is_some() => Err(format!(
             "{part_req}: this report needs a Helion (HL10) device model and is not available for this family yet"
         )),
-        Err(first) => {
-            if part_req == FALLBACK_PART {
-                return Err(format!(
-                    "no Helion device model for part {part_req}: {first}"
-                ));
-            }
-            emit(
-                format!(
-                    "WARN: part {part_req} has no Helion HAD model ({first}); using {FALLBACK_PART}"
-                ),
-                MsgSev::Warn,
-            );
-            helion_device::Device::load_part(FALLBACK_PART).map_err(|e| {
-                format!("no Helion device model (tried {part_req}, {FALLBACK_PART}): {e}")
-            })
+        Err(first) if helion_targets::family_of(part_req).is_some() => {
+            Err(format!("no Helion device model for part {part_req}: {first}"))
         }
+        Err(_) => Err(part_not_implementable(part_req)),
+    }
+}
+
+/// Why no backend implements `part`, and what the IDE offers instead.
+pub(crate) fn part_not_implementable(part: &str) -> String {
+    use helion_targets::Family;
+    let parts = helion_targets::implementable_parts();
+    let list = |fs: &[Family]| parts.iter().filter(|p| fs.contains(&p.family)).map(|p| p.part.as_str()).collect::<Vec<_>>().join(", ");
+    let p = part.to_ascii_lowercase();
+    let db = "7-series parts appear when the Project X-Ray database has them: set HELION_XILINX_DB (see docs/xilinx-db.md)";
+    if p.starts_with("xc7") {
+        match list(&[Family::Xilinx7]) {
+            x7 if x7.is_empty() => format!("{part}: no Project X-Ray database found, so no 7-series part can be implemented. {db}."),
+            x7 => format!("{part}: the IDE implements only these 7-series parts here: {x7}. {db}."),
+        }
+    } else if p.starts_with("ice40") || p.starts_with("lfe5") {
+        format!("{part}: Helion's Lattice backends implement {} only.", list(&[Family::Ice40, Family::Ecp5]))
+    } else if ["xcku", "xczu", "xcvu"].iter().any(|x| p.starts_with(x)) {
+        format!("{part}: UltraScale+ is command-line only (helion impl --part {part}); the IDE does not implement it.")
+    } else {
+        format!("{part:?} is not a part Helion can implement. Pick one of: {}.", list(&[Family::Helion, Family::Ice40, Family::Ecp5, Family::Xilinx7]))
     }
 }
 
@@ -3075,5 +3084,19 @@ mod tests {
                 .any(|l| l.text.starts_with("synth_design")),
             "log must carry the real synth stage line"
         );
+    }
+
+    #[test]
+    fn unknown_parts_are_refused_not_built_on_hl10t() {
+        let quiet = |_: String, _: MsgSev| {};
+        assert!(resolve_device("HL10T-C32-1", &quiet).is_ok());
+        let e = resolve_device("xc7k325t-typo", &quiet).unwrap_err();
+        assert!(e.contains("7-series") && e.contains("HELION_XILINX_DB"), "{e}");
+        let e = resolve_device("xczu3eg", &quiet).unwrap_err();
+        assert!(e.contains("helion impl --part xczu3eg"), "{e}");
+        let e = resolve_device("ice40-up5k", &quiet).unwrap_err();
+        assert!(e.contains("ice40-hx8k") && e.contains("LFE5U-85F"), "{e}");
+        let e = resolve_device("HL10Q-typo", &quiet).unwrap_err();
+        assert!(e.contains("not a part Helion can implement") && e.contains("HL10T-C32-1"), "{e}");
     }
 }

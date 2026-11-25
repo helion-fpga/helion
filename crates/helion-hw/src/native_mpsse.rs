@@ -376,6 +376,21 @@ pub fn parse_stat_tdo_mpsse(tdo: &[u8]) -> Result<u32, String> {
     Ok(word)
 }
 
+/// Refuse to send Helion configuration opcodes unless the TAP read back
+/// (`tdo` from [`NativeFtdiMpsse::encode_read_idcode`]) is the bitstream's
+/// part. A ZedBoard on the cable reads 0x03727093 or the ARM DAP, and gets
+/// nothing.
+pub fn check_tap_idcode(tdo: &[u8], want: u32) -> Result<u32, NativeUsbError> {
+    let got = parse_stat_tdo_mpsse(tdo).map_err(|e| NativeUsbError::Io(format!("native MPSSE: IDCODE read failed: {e}")))?;
+    if got != want {
+        let part = crate::HAD_KNOWN_BOARDS.iter().find(|b| b.idcode == want).map_or("this bitstream's part", |b| b.part);
+        return Err(NativeUsbError::Io(format!(
+            "native MPSSE: TAP IDCODE {got:#010x} is not {part} ({want:#010x}); refusing to send Helion configuration to another device"
+        )));
+    }
+    Ok(got)
+}
+
 /// True when Helion STAT bit5 (DONE) is set — does not invent the word.
 pub fn stat_word_done(word: u32) -> bool {
     (word >> helion_fabric::Stat::BIT_DONE) & 1 != 0
@@ -499,6 +514,18 @@ impl NativeFtdiMpsse {
         b.into_bytes()
     }
 
+    /// Reset the chain and capture the 32-bit DR nearest TDO. No IR shift:
+    /// Test-Logic-Reset selects IDCODE on every IEEE 1149.1 TAP, so this
+    /// reads any chip without sending it a Helion opcode.
+    pub fn encode_read_idcode() -> Vec<u8> {
+        let mut b = MpsseOpcodeBuilder::new();
+        b.init_clock(0x0002);
+        b.jtag_reset_to_idle();
+        b.helion_shift_dr_u32_capture(0);
+        b.send_immediate();
+        b.into_bytes()
+    }
+
     /// Build IR_STAT + DR opcode stream (no USB).
     pub fn encode_read_stat() -> Vec<u8> {
         let mut b = MpsseOpcodeBuilder::new();
@@ -540,10 +567,12 @@ impl HadUsbTransport for NativeFtdiMpsse {
                 "{ERR_CODE_EMPTY_BITSTREAM}: empty bitstream — refusing native MPSSE program"
             )));
         }
+        let mut want_idcode = None;
         if bytes.starts_with(b"HBIT") {
             match Bitstream::from_packets(&bytes) {
                 Ok(bits) => {
                     crate::refuse_empty_bitstream(&bits).map_err(NativeUsbError::Io)?;
+                    want_idcode = Some(bits.idcode);
                 }
                 Err(e) => {
                     return Err(NativeUsbError::Io(format!(
@@ -557,6 +586,15 @@ impl HadUsbTransport for NativeFtdiMpsse {
         let opcodes = Self::encode_cfg_w_and_stat(&bytes);
         #[cfg(feature = "usb-native")]
         {
+            // Read the TAP's IDCODE before any Helion opcode goes out.
+            let Some(want) = want_idcode else {
+                return Err(NativeUsbError::Io(format!(
+                    "native MPSSE loads Helion .hbits only: {} has no HBIT header, so the target IDCODE is unknown",
+                    path.display()
+                )));
+            };
+            let tdo = self.xfer_inout(&Self::encode_read_idcode(), STAT_CAPTURE_TDO_LEN)?;
+            check_tap_idcode(&tdo, want)?;
             let open_before = self.usb_open_count;
             let xfer_before = self.session_xfer_count();
             let stat_ops = Self::encode_read_stat();
@@ -615,7 +653,7 @@ impl HadUsbTransport for NativeFtdiMpsse {
         }
         #[cfg(not(feature = "usb-native"))]
         {
-            let _ = opcodes;
+            let _ = (opcodes, want_idcode);
             Err(NativeUsbError::NotImplemented(
                 "usb-native off — native MPSSE program unavailable",
             ))
@@ -1061,6 +1099,25 @@ mod tests {
         assert_eq!(parse_stat_tdo_mpsse(&tdo).unwrap(), helion_fabric::Stat::RESET_WORD);
         let packed = pack_mock_stat_tdo(0x7F00_0000);
         assert_eq!(packed[3], 0xFE, "7 bits left-aligned at bit 1");
+    }
+
+    #[test]
+    fn idcode_gate_refuses_a_zynq_and_passes_a_helion_tap() {
+        use crate::jtag_engine::MpssePort;
+        let d = helion_device::Device::load_part("HL10T-C32-1").unwrap();
+        let read = |m: &mut crate::MockFtdi| {
+            m.set_bitmode(0x0B, 0x02).unwrap();
+            m.write(&NativeFtdiMpsse::encode_read_idcode()).unwrap();
+            m.read(STAT_CAPTURE_TDO_LEN).unwrap()
+        };
+        // ZedBoard PL (xc7z020) alone on the chain: refused, both IDCODEs named.
+        let mut zynq = crate::MockFtdi::with_chain(vec![crate::mock_ftdi::MockChainDevice::Generic(
+            crate::mock_ftdi::GenericTap::new(Some(0x0372_7093), 6),
+        )]);
+        let err = check_tap_idcode(&read(&mut zynq), d.idcode).unwrap_err().to_string();
+        assert!(err.contains("0x03727093") && err.contains("HL10T-C32-1") && err.contains("refusing"), "{err}");
+        let mut helion = crate::MockFtdi::helion(&d);
+        assert_eq!(check_tap_idcode(&read(&mut helion), d.idcode).unwrap(), d.idcode);
     }
 
     #[test]

@@ -385,9 +385,8 @@ fn select_report(s: &mut AppState, nav: ReportNav) {
     }
 }
 
-/// Fallback part when the project part has no Helion HAD model, mirroring
-/// `runs.rs::resolve_device` (loud warning, never silent).
-const FALLBACK_PART: &str = "HL10T-C32-1";
+/// Part assessed when the project names none (the IDE's default part).
+const DEFAULT_PART: &str = "HL10T-C32-1";
 
 /// Implicit analysis clock when the run produced no clocks, mirroring
 /// `runs.rs::IMPLICIT_CLOCK_PS`.
@@ -396,9 +395,8 @@ const IMPLICIT_CLOCK_PS: u64 = 10_000;
 /// Real QoR assessment over the elaborated session design (the `tcl.design`
 /// from `read_sv`/`synth_design`, else the `launch_runs` worker design):
 /// device model, analysis clocks, then
-/// `helion_proj::qor::report_qor_suggestions`. Returns the snapshot plus an
-/// optional fallback-device note the caller echoes loudly.
-fn compute_qor_report(s: &AppState) -> Result<(QorSnapshot, Option<String>), String> {
+/// `helion_proj::qor::report_qor_suggestions`.
+fn compute_qor_report(s: &AppState) -> Result<QorSnapshot, String> {
     let design = s
         .tcl
         .design
@@ -410,26 +408,13 @@ fn compute_qor_report(s: &AppState) -> Result<(QorSnapshot, Option<String>), Str
         })?;
     let design_name = helion_ir::resolve(design.name).to_string();
     let requested = if s.project.part.is_empty() {
-        FALLBACK_PART
+        DEFAULT_PART
     } else {
         s.project.part.as_str()
     };
-    let (dev, device_part, fallback_note) = match helion_device::Device::load_part(requested) {
-        Ok(dev) => (dev, requested.to_string(), None),
-        Err(_) if crate::views::device_family::is_family_part(requested) => {
-            return Err(format!("{requested}: QoR suggestions need a Helion (HL10) device model and are not available for this family yet"));
-        }
-        Err(first) if requested != FALLBACK_PART => {
-            let dev = helion_device::Device::load_part(FALLBACK_PART).map_err(|e| {
-                format!("no Helion device model (tried {requested}, {FALLBACK_PART}): {e}")
-            })?;
-            let note = format!(
-                "part {requested} has no Helion HAD model ({first}); using {FALLBACK_PART}"
-            );
-            (dev, FALLBACK_PART.to_string(), Some(note))
-        }
-        Err(e) => return Err(format!("no Helion device model for part {requested}: {e}")),
-    };
+    // Another part's QoR is never assessed on an HL10T stand-in.
+    let dev = crate::runs::resolve_device(requested, &|_, _| {})?;
+    let device_part = requested.to_string();
     let mut xdc = helion_sta::Constraints::default();
     for clock in &s.timing.clocks {
         helion_sta::create_clock(&mut xdc.clocks, &clock.name, clock.period_ps, &clock.source);
@@ -440,7 +425,7 @@ fn compute_qor_report(s: &AppState) -> Result<(QorSnapshot, Option<String>), Str
     let mut session = helion_proj::Session::new(helion_proj::Mode::NonProject);
     session.synth_design(design);
     let report = helion_proj::qor::report_qor_suggestions(&session, &dev, &xdc)?;
-    Ok((
+    Ok(
         QorSnapshot {
             rqa_score: report.rqa_score,
             wns_ps: report.wns_ps,
@@ -473,8 +458,7 @@ fn compute_qor_report(s: &AppState) -> Result<(QorSnapshot, Option<String>), Str
                 })
                 .collect(),
         },
-        fallback_note,
-    ))
+    )
 }
 
 /// Re-run the QoR assessment on demand (report-tree tap, Refresh link,
@@ -483,13 +467,7 @@ fn compute_qor_report(s: &AppState) -> Result<(QorSnapshot, Option<String>), Str
 /// numbers never stay mounted.
 pub(crate) fn refresh_qor(s: &mut AppState) {
     match compute_qor_report(s) {
-        Ok((snap, note)) => {
-            if let Some(n) = note {
-                s.console.lines.push(ConsoleLine {
-                    text: format!("WARN: {n}"),
-                    sev: MsgSev::Warn,
-                });
-            }
+        Ok(snap) => {
             let critical = snap.severity_count("Critical");
             let warning = snap.severity_count("Warning");
             echo(

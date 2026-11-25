@@ -196,6 +196,9 @@ pub fn run_family(
     std::fs::write(&path, &out.text).map_err(|e| format!("{}: {e}", path.display()))?;
     let (_, what) = family.artifact();
     send(format!("write_bitstream {} ({what})", path.display()), MsgSev::Info);
+    if let Some(why) = helion_hw::lattice_program_reason(part, Some(&path)) {
+        send(format!("WARN: {why}"), MsgSev::Warn);
+    }
     Ok(RunArtifacts {
         cells: design.cells.len(),
         part: part.to_string(),
@@ -211,6 +214,9 @@ pub fn run_family(
         drc,
         timing,
         family_die,
+        // Program Device then names the pack-and-load commands instead of
+        // "No bitstream yet" sending the user back to Generate.
+        bit_file: Some(path),
         ..RunArtifacts::default()
     })
 }
@@ -368,6 +374,9 @@ pub fn run_xdc_flow(source: &Path, part: &str, out_dir: &Path, send: &dyn Fn(Str
     let timing = x7_timing(&b);
     send(format!("report_timing_summary WNS={:.3} ns (period {:.3} ns)", b.slack_ns, b.period_ns), MsgSev::Info);
     send(format!("zedbit: summary {}", b.summary), MsgSev::Info);
+    if !p.ps7s.is_empty() {
+        send("WARN: this design uses the Zynq PS7; Program Device loads the PL only. Start the PS (FCLK, AXI) separately, e.g. openocd with tools/zynq/ps7_axi_check.tcl.".into(), MsgSev::Warn);
+    }
     let bytes = std::fs::metadata(&bit).map(|m| m.len() as usize).unwrap_or(0);
     send(format!("write_bitstream {} ({bytes} bytes)", bit.display()), MsgSev::Info);
     let family_die = Some(FamilyDie {
@@ -491,6 +500,8 @@ mod tests {
         .unwrap();
         assert!(art.summary.contains(".asc") || art.summary.contains("asc written"), "{}", art.summary);
         assert!(dir.join("blinky.asc").is_file());
+        assert_eq!(art.bit_file.as_deref(), Some(dir.join("blinky.asc").as_path()), "Program Device sees the .asc");
+        assert!(lines.borrow().iter().any(|l| l.starts_with("WARN:") && l.contains("G25") && l.contains("icepack")));
         assert!(lines.borrow().iter().any(|l| l.starts_with("route")));
         assert!(foreign_family("HL10T-C32-1").is_none());
         // Reports reflect the iCE40 part, not the HL10T model.

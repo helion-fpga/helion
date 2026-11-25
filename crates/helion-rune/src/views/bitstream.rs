@@ -418,11 +418,17 @@ pub fn bitstream_pane(s: &AppState, t: &VivadoTheme) -> El {
             .program
             .file
             .as_ref()
-            .filter(|_| crate::runs_family::is_xilinx7(&s.project.part))
+            .filter(|_| crate::views::device_family::is_family_part(&s.project.part))
         {
-            // The frame view reads HL10 frames; a 7-series run only leaves the .bit (G86).
+            // The frame view reads HL10 frames; a family run only leaves its
+            // file (G86). Lattice files can't be loaded from Helion yet.
+            let next = if s.project.part.to_ascii_lowercase().starts_with("xc7") {
+                "program it from the Hardware Manager"
+            } else {
+                "Helion can't program it yet; the Hardware Manager names the commands that can"
+            };
             let sentence = format!(
-                "Bitstream written: {}. The frame view isn't available for {} yet; program it from the Hardware Manager.",
+                "Bitstream written: {}. The frame view isn't available for {} yet; {next}.",
                 bit.file_name().unwrap_or_default().to_string_lossy(),
                 s.project.part
             );

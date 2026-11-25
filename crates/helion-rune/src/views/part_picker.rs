@@ -46,6 +46,33 @@ fn matches(p: &helion_targets::TargetPart, q: &str) -> bool {
         || p.summary.to_ascii_lowercase().contains(&q)
 }
 
+/// What hardware has proven for `p`, shown beside its resources.
+fn hw_status(p: &helion_targets::TargetPart) -> &'static str {
+    use helion_targets::Family;
+    match p.family {
+        Family::Helion => "no silicon: Simulation cable only",
+        Family::Ice40 | Family::Ecp5 => "not hardware-tested; Helion can't program it",
+        Family::Xilinx7 if helion_hw::x7_board_hardware_tested(&p.part) => "board-tested",
+        Family::Xilinx7 => "not hardware-tested",
+    }
+}
+
+/// Why the 7-series parts are missing from the list, when they are: the
+/// Project X-Ray database Helion reads them from was not found.
+fn xilinx_hidden_note(parts: &[helion_targets::TargetPart]) -> Option<String> {
+    let missing: Vec<&str> = ["xc7a35t", helion_targets::ZEDBOARD_PART]
+        .into_iter()
+        .filter(|m| !parts.iter().any(|p| p.part == *m))
+        .collect();
+    (!missing.is_empty()).then(|| {
+        format!(
+            "Xilinx 7-series {} hidden: no Project X-Ray database with {} found. Set HELION_XILINX_DB to a prjxray-db checkout (default ~/.cache/helion/prjxray-db); see docs/xilinx-db.md.",
+            missing.join(", "),
+            if missing.len() == 1 { "it" } else { "them" }
+        )
+    })
+}
+
 /// Pick `board` (or none): selects the board's part.
 pub fn pick_board(s: &mut AppState, board: Option<String>) {
     let c = &mut s.dialogs.create;
@@ -128,7 +155,7 @@ pub fn part_page(s: &AppState, t: &VivadoTheme, kit: &Kit) -> El {
         let locked = board_part.as_ref().is_some_and(|bp| bp != &p.part);
         let mut r = cad::table_row(format!("create-part-row-{}", p.part), p.part.clone(), c.part == i, t)
             .child(cad::cell(&PART_COLS[0], cad::cut(p.part.clone(), cad::mono_style(), if locked { t.text_faint } else { t.text })))
-            .child(cad::cell(&PART_COLS[1], cad::cut(p.summary.clone(), VivadoTheme::FONT_UI, t.text_dim)));
+            .child(cad::cell(&PART_COLS[1], cad::cut(format!("{} · {}", p.summary, hw_status(p)), VivadoTheme::FONT_UI, t.text_dim)));
         if locked {
             r = r
                 .disabled(true)
@@ -170,6 +197,9 @@ pub fn part_page(s: &AppState, t: &VivadoTheme, kit: &Kit) -> El {
                 .child(cad::header("create-part-head", &PART_COLS, t))
                 .child(col().w_full().max_h(200.0).scroll(ScrollSpec { stick_bottom: false }).child(list)),
         );
+    if let Some(note) = xilinx_hidden_note(&c.catalog.parts) {
+        page = page.child(cad::dim(note, t).key("create-part-xray"));
+    }
     if let Some(b) = c.board.as_deref().and_then(|b| c.catalog.board(b)) {
         if b.pins.is_empty() {
             page = page.child(cad::dim(format!("{} declares no pin constraints.", b.board), t));
@@ -227,6 +257,16 @@ mod tests {
         assert_eq!(c.catalog.parts[c.part].part, "HL10T-C32-1");
         assert!(c.board_xdc, "HB1 has pins, so the XDC is offered");
         assert!(!matches(&c.catalog.parts[0], "zzz"));
+    }
+
+    #[test]
+    fn missing_xray_parts_are_named_with_the_fix() {
+        let note = xilinx_hidden_note(&[]).expect("both hidden");
+        assert!(note.contains("xc7a35t, xc7z020clg484-1") && note.contains("HELION_XILINX_DB") && note.contains("docs/xilinx-db.md"), "{note}");
+        let part = |p: &str| helion_targets::TargetPart { part: p.into(), family: helion_targets::Family::Xilinx7, summary: String::new() };
+        let both = [part("xc7a35t"), part(helion_targets::ZEDBOARD_PART)];
+        assert_eq!(xilinx_hidden_note(&both), None);
+        assert_eq!((hw_status(&both[0]), hw_status(&both[1])), ("not hardware-tested", "board-tested"));
     }
 }
 

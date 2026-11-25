@@ -177,3 +177,25 @@ fn version_and_doctor() {
     // The netlist has LUT and flop cells (their names are the front end's business).
     assert!(hs.contains(" Lut6 ") && hs.contains(" Hff"), "{hs}");
 }
+
+#[test]
+fn hw_program_stops_family_parts_with_the_reason_before_any_cable_io() {
+    let bin = env!("CARGO_BIN_EXE_helion");
+    let run = |args: &[&str]| {
+        let o = Command::new(bin).arg("hw").args(args).output().expect("helion hw");
+        (o.status.code(), String::from_utf8_lossy(&o.stderr).into_owned())
+    };
+    let (code, err) = run(&["program", "--part", "ice40-hx8k", "/r/top.asc"]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("icepack /r/top.asc /r/top.bin && iceprog /r/top.bin"), "{err}");
+    let (code, err) = run(&["flash", "--part", "xc7z020clg484-1", "/r/top.bit"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("configuration memory isn't supported"), "{err}");
+    let (code, err) = run(&["program", "--cable", "sim", "--part", "xc7z020clg484-1", "/r/top.bit"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("load through openFPGALoader"), "{err}");
+    // The SHUTDOWN copy needs the file: a missing one stops before openFPGALoader runs.
+    let (code, err) = run(&["program", "--part", "xc7a35t", "/nonexistent/top.bit"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("read /nonexistent/top.bit"), "{err}");
+}
