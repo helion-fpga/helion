@@ -18,7 +18,7 @@ INT_INTF PIP.
 What this lane does NOT deliver: no DSP/BRAM design flows end to end yet.
 Three independent, evidenced blockers remain (section 9): no DSP/BRAM
 placement, no DSP config-bit encoding and no INT_INTF L/R segbits DBs, and
-xczu3eg STA GAP-F5. Nothing was invented to work around them; the lane
+no documented DSP/BRAM delays in the preliminary xczu3eg STA DB. Nothing was invented to work around them; the lane
 delivers the graph, the site-indexed registration, the stitch model, the
 translator support, and the wire verification only.
 
@@ -189,7 +189,7 @@ reasons:
    bitgen would refuse. Input-pin routes (586 of 850) need no INT_INTF
    PIP and are emittable in principle. Both are data gaps (B1 class),
    not model gaps.
-3. xczu3eg STA GAP-F5 (unsupported part) still stands for timing.
+3. The preliminary xczu3eg STA DB has no documented DSP/BRAM delays.
 
 Proven on the measured design set only. The wire verification covers
 the xczu3eg tileconn DB as shipped; no Vivado check.
