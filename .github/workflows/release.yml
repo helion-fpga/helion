@@ -48,6 +48,16 @@ jobs:
         run: codesign --verify --deep --strict dist/Helion.app && echo "ad-hoc signature OK"
       - name: helion-prog
         run: cargo build --locked --release --target aarch64-apple-darwin -p helion-hw --features usb-native
+      - name: no Homebrew dylibs
+        run: |
+          # Helion.app must start on a Mac without Homebrew (libusb is linked statically).
+          for b in target/aarch64-apple-darwin/release/helion-ide target/aarch64-apple-darwin/release/helion-prog; do
+            otool -L "$b"
+            if otool -L "$b" | grep -E '/opt/homebrew|/usr/local'; then
+              echo "$b links a Homebrew dylib" >&2
+              exit 1
+            fi
+          done
       - name: zip app
         run: |
           mkdir -p dist/upload

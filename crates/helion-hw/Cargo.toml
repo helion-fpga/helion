@@ -19,9 +19,10 @@ helion-bits = { workspace = true }
 helion-fabric = { workspace = true }
 rusb = { version = "0.9", optional = true }
 
-[target.'cfg(windows)'.dependencies]
-# Windows has no system libusb: build the bundled one and link it statically
-# (skips the vcpkg/pkg-config probe, which can find a stray MinGW libusb).
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+# Windows has no system libusb, and on macOS pkg-config finds Homebrew's dylib,
+# which Macs without Homebrew lack: build the bundled one and link it
+# statically (skips the vcpkg/pkg-config probe).
 rusb = { version = "0.9", optional = true, features = ["vendored"] }
 
 [dev-dependencies]
