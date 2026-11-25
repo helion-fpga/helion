@@ -16,7 +16,7 @@ to watch a build).
 | set | designs | time |
 |---|---|---|
 | `quick` | `zedboard_blinky` (built twice, see G22), svcheck `counter`, `complex`, `hier_bitsel` (clk + led, pins from `examples/zedboard.xdc`), PicoRV32 SoC | 21 min at load average 270-410 (2026-11-17, ae5deb8), 18 of them PicoRV32's route |
-| `full` | quick + `zedboard_bram_fill`, `zedboard_dsp_fill_prims`, Ibex (`HELION_DEFINES=VERILATOR`, pins in `ibex_obs.xdc`) | Ibex routing can take hours on the old router; `--timeout` bounds each build |
+| `full` | quick + `zedboard_bram_fill`, `zedboard_dsp_fill_prims`, `zedboard_dsp_fill` (its plain-SV twin, DSPs inferred), Ibex (`HELION_DEFINES=VERILATOR`, pins in `ibex_obs.xdc`) | Ibex routing can take hours on the old router; `--timeout` bounds each build |
 
 A design that fails to build, or is killed by `--timeout`, is recorded as a result (with zedbit's last
 line), not an error. There is no timeout unless you give one.

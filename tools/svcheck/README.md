@@ -31,10 +31,10 @@ primitives, found by module name (`NAME.v`) in `--models DIR` (repeatable,
 searched first), `SVCHECK_MODELS` (colon separated), then `models/`.
 `models/` holds Helion's own behavioural models of `RAMB18E1`, `RAMB36E1`
 (true dual port, no ECC/cascade/output register), the nine LUT RAM
-primitives, `BUFG`, `BUFGCE`, `CARRY4`, `SRL16E` and `SRLC32E`; Xilinx's
-simulation library is not
-bundled. `DSP48E1`, `MMCME2_*`, `PLLE2_ADV`, `IDDR` and `ODDR` need models
-from `--models`.
+primitives, `BUFG`, `BUFGCE`, `CARRY4`, `SRL16E`, `SRLC32E` and `DSP48E1`
+(written from UG479 like x7v's; no cascade inputs or pattern detector);
+Xilinx's simulation library is not bundled. `MMCME2_*`, `PLLE2_ADV`,
+`IDDR` and `ODDR` need models from `--models`.
 
 ```sh
 HELION_V2_HARD=1 python3 tools/svcheck/svcheck.py --corpus tools/svcheck/tests_hard
@@ -49,7 +49,10 @@ built as `SRL16E` / `SRLC32E` (`srl_*`: fixed and variable taps, enables,
 cascades, and registers that must stay flops), and LUT RAM: a 32 x 8 register file with two reads
 (`lutram_rf32x8`), 64 x 1 single port, 128 x 1 with two reads, 256 x 1,
 64 x 8 with a registered read, a 128 x 16 asynchronous read
-(`async_rd`) and every LUT RAM primitive by hand (`lutram_prims`).
+(`async_rd`) and every LUT RAM primitive by hand (`lutram_prims`), and
+inferred `DSP48E1`: products that fit one slice with and without its
+registers (`dsp_comb`, `dsp_regs`), and wider ones split into partial
+products (`dsp_wide`, `dsp_wide_regs`).
 
 ## What has been checked
 

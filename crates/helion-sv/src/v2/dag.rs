@@ -188,6 +188,19 @@ impl Dag {
         }
     }
 
+    /// Bits `lo..lo + w` of `a` as they are: unlike [`Dag::slice`], the
+    /// low bits of a sum or product do not become a narrower copy of it.
+    pub fn bits(&mut self, a: N, lo: u32, w: u32) -> N {
+        let (a, lo) = match *self.op(a) {
+            Op::Slice(x, l) => (x, l + lo),
+            _ => (a, lo),
+        };
+        match self.op(a) {
+            Op::Add(..) | Op::Sub(..) | Op::Mul(..) if lo == 0 && w < self.w(a) => self.intern(Op::Slice(a, 0), w),
+            _ => self.slice(a, lo, w),
+        }
+    }
+
     /// MSB-first concatenation.
     pub fn concat(&mut self, parts: Vec<N>) -> N {
         let mut flat: Vec<N> = Vec::new();

@@ -238,61 +238,140 @@ pub const BRAM_SETUP_PS: u32 = 737;
 // ALUMODEREG/INMODEREG combination; the values below are the slow-corner
 // maximum over the entries with that configuration.
 //
-// Measured spread on CLK -> P alone: 0.192 ns (fully pipelined) to 2.304 ns
-// (INMODEREG with no output register). A single constant would be wrong by
-// more than a factor of ten at one end, which is why G32 asks for the ports to
-// be modelled rather than merely listed.
+// Measured spread on CLK -> P alone: 0.434 ns (PREG=1) to 5.470 ns (INMODEREG
+// with the pre-adder and no M or P register). A single constant would be wrong
+// by more than a factor of ten at one end, which is why G32 asks for the ports
+// to be modelled rather than merely listed.
 
 /// DSP48E1 `CLK -> P` in ps, from the device's pipeline register settings.
 ///
 /// The output register is what breaks the path: with `PREG=1` the P pin is a
 /// flop output, so a path *to* P's consumers starts here; with `PREG=0` the
-/// value comes through the M register and the adder, which the SDF prices at
-/// 1.589..=2.304 ns against 0.192..=0.758 ns when registered.
+/// value comes from the latest register before P through the multiplier and
+/// the adder. The SDF's second triple is the slow corner (its first is the
+/// fast one). With no register at all this is A -> P, and the STA adds the
+/// inputs' own arrival ([`dsp_comb_ps`]).
 pub fn dsp_cko_ps(d: &crate::pack::PackedDsp) -> u32 {
-    // Slow-corner maxima bucketed by the register stage that produces P.
+    let dport = d.use_dport;
     if d.preg == 1 {
-        758 // finest-grained P register
+        758 // pessimistic: the slow corner is 434; kept so registered builds do not move
     } else if d.mreg == 1 {
-        1589
-    } else if d.opmodereg == 1 || d.alumodereg == 1 || d.inmodereg == 1 {
-        2304
+        2305
     } else {
-        2234 // no P-side register at all
+        let regs = [
+            (d.inmodereg, if dport { 5470 } else { 4111 }),
+            (d.areg, if dport { 5368 } else { 4009 }),
+            (d.dreg, 5320),
+            (d.breg, 3813),
+            (d.adreg, 3684),
+            (d.creg, 2291),
+            (d.opmodereg, 2231),
+            (d.alumodereg, 2054),
+            (d.carryinselreg, 1927),
+            (d.carryinreg, 1764),
+        ];
+        regs.iter().filter(|r| r.0 > 0).map(|r| r.1).max().unwrap_or(if dport { 5201 } else { 3841 })
     }
 }
 
-/// DSP48E1 input setup in ps for a site pin, from the device's settings.
-///
-/// Only the clocked (registered) inputs have a setup requirement. With
-/// `AREG=0` the A/B/D pins feed the multiplier combinationally, so there is no
-/// setup edge to fail — the path simply gets longer, which the row's guard
-/// checks by requiring a design with AREG=0 to be reported differently from one
-/// with AREG=1. INMODE is the worst input in the SDF (5.557 ns).
-pub fn dsp_setup_ps(pin: &str) -> Option<u32> {
-    let p = pin.to_ascii_uppercase();
-    let v = if p.starts_with('A') && !p.starts_with("ALUMODE") {
-        5474 // A (worst of A/ACASCREG paths)
-    } else if p.starts_with('B') {
-        3929
-    } else if p == "C" {
-        2093
-    } else if p.starts_with('D') {
-        5342
-    } else if p.starts_with("INMODE") {
-        5557
-    } else if p.starts_with("OPMODE") {
-        2600
-    } else if p.starts_with("ALUMODE") {
-        2369
-    } else if p.starts_with("CARRYIN") {
-        1690
-    } else if p.starts_with("CARRYINSEL") {
-        2184
-    } else {
-        return None;
+/// DSP48E1 input pin -> P in ps when nothing registers that input on its
+/// way to P (slow corner, X-Ray's `timings/DSP_L.sdf`); `None` otherwise.
+/// Before this, P of a DSP without its output register started a path at a
+/// fixed time, whatever its operands' arrival (G3a stage 1's STA gap).
+pub fn dsp_comb_ps(d: &crate::pack::PackedDsp, pin: &str) -> Option<u32> {
+    let (mult, none, dport) = (d.preg == 0 && d.mreg == 0, d.use_mult == "NONE", d.use_dport);
+    let v = match pin.trim_end_matches(|c: char| c.is_ascii_digit()) {
+        "A" if mult && d.areg == 0 => match (none, dport) {
+            (true, _) => 2077,
+            (_, true) => 5201,
+            _ => 3841,
+        },
+        "B" if mult && d.breg == 0 => if none { 2057 } else { 3656 },
+        "D" if mult && dport && d.dreg == 0 && d.adreg == 0 => 5070,
+        "INMODE" if mult && d.inmodereg == 0 => if dport { 5283 } else { 3923 },
+        "C" if d.preg == 0 && d.creg == 0 => 1820,
+        "OPMODE" if d.preg == 0 && d.opmodereg == 0 => 2326,
+        "ALUMODE" if d.preg == 0 && d.alumodereg == 0 => 2098,
+        "CARRYINSEL" if d.preg == 0 && d.carryinselreg == 0 => 1910,
+        "CARRYIN" if d.preg == 0 && d.carryinreg == 0 => 1416,
+        _ => return None,
     };
     Some(v)
+}
+
+/// A DSP48E1 output that follows some of its inputs: launched at `launch`
+/// by a register before it, if any, and reached through each input.
+struct DspArc<'a> {
+    name: &'a str,
+    site: &'a str,
+    launch: Option<u32>,
+    ins: Vec<(&'a str, &'a str, u32)>,
+}
+
+/// DSP48E1 input setup in ps for a site pin (`A0`, `CARRYINSEL1`, ...),
+/// from the register the pin first reaches: its own (`AREG`, `CREG`, ...),
+/// else M, else P (slow corner, X-Ray's `timings/DSP_L.sdf`; the pattern
+/// detector adds to a path into P). `None` when the pin reaches no register
+/// (a combinational arc to P, [`dsp_comb_ps`]) or is not a data input.
+pub fn dsp_setup_ps(d: &crate::pack::PackedDsp, pin: &str) -> Option<u32> {
+    let (dport, none, pd) = (d.use_dport, d.use_mult == "NONE", d.use_pattern_detect);
+    let (m, p) = (d.mreg > 0 && !none, d.preg > 0);
+    // (own register, own, via AD, via M, via P) setups.
+    let pick = |own: u8, s: u32, ad: Option<u32>, mm: Option<u32>, pp: [u32; 2]| -> Option<u32> {
+        if own > 0 {
+            Some(s)
+        } else if let Some(v) = ad.filter(|_| dport && d.adreg > 0) {
+            Some(v)
+        } else if let Some(v) = mm.filter(|_| m) {
+            Some(v)
+        } else {
+            p.then_some(pp[pd as usize])
+        }
+    };
+    match pin.trim_end_matches(|c: char| c.is_ascii_digit()) {
+        "A" | "ACIN" => pick(d.areg, 362, Some(1756), Some(if dport { 3288 } else { 1928 }), match (none, dport) {
+            (true, _) => [1958, 2349],
+            (_, true) => [5081, 5474],
+            _ => [3722, 4114],
+        }),
+        "B" | "BCIN" => pick(d.breg, 450, None, Some(1743), if none { [1938, 2331] } else { [3536, 3929] }),
+        "D" => pick(d.dreg, 413, Some(1626), Some(3158), [4951, 5342]).filter(|_| dport),
+        "INMODE" => pick(d.inmodereg, 449, Some(2089), Some(if dport { 3372 } else { 2012 }), if dport { [5165, 5557] } else { [3805, 4196] }),
+        "C" => pick(d.creg, 233, None, None, [1701, 2093]),
+        "OPMODE" => pick(d.opmodereg, 449, None, None, [2209, 2600]),
+        "ALUMODE" => pick(d.alumodereg, 246, None, None, [1978, 2369]),
+        "CARRYINSEL" => pick(d.carryinselreg, 208, None, None, [1793, 2184]),
+        "CARRYIN" => pick(d.carryinreg, 299, None, None, [1298, 1690]),
+        "PCIN" | "MULTSIGNIN" => pick(0, 0, None, None, [1400, 1792]),
+        "CARRYCASCIN" => pick(0, 0, None, None, [1028, 1420]),
+        // Clock enables and resets: only of a register that is there.
+        c => {
+            let (on, v) = match c {
+                "CEA" => (d.areg, 497),
+                "RSTA" => (d.areg, 507),
+                "CEB" => (d.breg, 514),
+                "RSTB" => (d.breg, 543),
+                "CEC" => (d.creg, 414),
+                "RSTC" => (d.creg, 84),
+                "CED" => (d.dreg, 513),
+                "RSTD" => (d.dreg.max(d.adreg), 589),
+                "CEAD" => (d.adreg, 426),
+                "CEM" => (d.mreg, 266),
+                "RSTM" => (d.mreg, 270),
+                "CEP" => (d.preg, 524),
+                "RSTP" => (d.preg, 347),
+                "CEINMODE" => (d.inmodereg, 603),
+                "RSTINMODE" => (d.inmodereg, 686),
+                "CEALUMODE" | "RSTALUMODE" => (d.alumodereg, 411),
+                "CECTRL" => (d.opmodereg.max(d.carryinselreg), 421),
+                "RSTCTRL" => (d.opmodereg.max(d.carryinselreg), 469),
+                "CECARRYIN" => (d.carryinreg, 665),
+                "RSTALLCARRYIN" => (d.carryinreg.max(d.mreg), 287),
+                _ => (0, 0),
+            };
+            (on > 0).then_some(v)
+        }
+    }
 }
 
 /// One step of a timing path.
@@ -560,6 +639,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         dsp_out: &HashMap<&'a str, (String, u32)>,
         xy_of: &HashMap<&'a str, (i32, i32)>,
         lr: &HashMap<&'a str, crate::lutram::ReadArc<'a>>,
+        dsp_comb: &HashMap<&'a str, &DspArc<'a>>,
     ) -> Result<(u32, Vec<PathStep>), String> {
         if let Some(x) = memo.get(net) {
             return Ok(x.clone());
@@ -572,11 +652,25 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             (*cko, vec![PathStep { what: what.clone(), arrival_ps: *cko, wire_ps: 0, xy: None }])
         } else if let Some(b) = bram_out.get(net) {
             (BRAM_CKO_PS, vec![PathStep { what: format!("{b} (block RAM DO)"), arrival_ps: BRAM_CKO_PS, wire_ps: 0, xy: None }])
+        } else if let Some(d) = dsp_comb.get(net) {
+            let mut best = match d.launch {
+                Some(t) => (t, vec![PathStep { what: format!("{} (DSP48E1 output)", d.name), arrival_ps: t, wire_ps: 0, xy: None }]),
+                None => (0, Vec::new()),
+            };
+            for &(inn, pin, ps) in &d.ins {
+                let (a, mut p) = arrival(inn, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, dsp_out, xy_of, lr, dsp_comb)?;
+                let w = route(inn, d.site, pin, false);
+                if !p.is_empty() && (a + w + ps > best.0 || best.1.is_empty()) {
+                    p.push(PathStep { what: format!("{} (DSP48E1 {pin} -> P)", d.name), arrival_ps: a + w + ps, wire_ps: w, xy: None });
+                    best = (a + w + ps, p);
+                }
+            }
+            best
         } else if let Some(r) = lr.get(net) {
             // LUT RAM: launched by its clock, or read from its address pins.
             let mut best = (r.cko_ps, vec![PathStep { what: format!("{} (LUT RAM, clock {}, {})", r.name, r.clk, r.site), arrival_ps: r.cko_ps, wire_ps: 0, xy: None }]);
             for (inn, pin) in &r.ins {
-                let (a, mut p) = arrival(inn, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, dsp_out, xy_of, lr)?;
+                let (a, mut p) = arrival(inn, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, dsp_out, xy_of, lr, dsp_comb)?;
                 let w = route(inn, r.site, pin, false);
                 let t = a + w + r.read_ps;
                 if !p.is_empty() && t > best.0 {
@@ -595,7 +689,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             let mut wire = 0;
             for (k, inn) in l.input_nets.iter().enumerate() {
                 let Some(inn) = inn else { continue };
-                let (a, p) = arrival(inn, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, dsp_out, xy_of, lr)?;
+                let (a, p) = arrival(inn, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, dsp_out, xy_of, lr, dsp_comb)?;
                 if p.is_empty() {
                     continue; // launched by a pad or constant: unconstrained
                 }
@@ -619,7 +713,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             let mut wire = 0;
             let upto = j.map(|j| j + 1).unwrap_or(4);
             for s in c.s_nets.iter().take(upto).flatten() {
-                let (a, p) = arrival(s, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, dsp_out, xy_of, lr)?;
+                let (a, p) = arrival(s, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, dsp_out, xy_of, lr, dsp_comb)?;
                 if p.is_empty() {
                     continue;
                 }
@@ -630,7 +724,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
                 }
             }
             if c.cyinit.is_none() && !c.ci_net.is_empty() {
-                let (a, p) = arrival(&c.ci_net, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, dsp_out, xy_of, lr)?;
+                let (a, p) = arrival(&c.ci_net, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, dsp_out, xy_of, lr, dsp_comb)?;
                 let cascade = carry_by_net.get(c.ci_net.as_str()).map(|(_, j)| j.is_none()).unwrap_or(false);
                 let w = if cascade { 0 } else { route(&c.ci_net, site, "AX", false) };
                 if !p.is_empty() && (a + w > best.0 || best.1.is_empty()) {
@@ -710,7 +804,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
                     dsp_out.insert(net.as_str(), (format!("{} (DSP48E1 output)", d.name), cko));
                 }
             } else if on_this_clock {
-                if let Some(setup) = dsp_setup_ps(pin) {
+                if let Some(setup) = dsp_setup_ps(d, pin) {
                     dsp_in.push((net.as_str(), pd.site.as_str(), pin.clone(), setup, "DSP48E1"));
                 }
             }
@@ -730,6 +824,26 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         }
     }
     let lr = crate::lutram::read_arcs(placed);
+    let arcs: Vec<(Vec<&str>, DspArc)> = packed
+        .dsps
+        .iter()
+        .filter(|d| d.preg == 0)
+        .filter_map(|d| {
+            let pd = placed.dsps.iter().find(|p| p.name == d.name)?;
+            let ins: Vec<(&str, &str, u32)> = d.pins.iter().filter(|p| !p.2).filter_map(|(pin, net, _)| Some((net.as_str(), pin.as_str(), dsp_comb_ps(d, pin)?))).collect();
+            let outs = d.pins.iter().filter(|p| p.2 && p.0.starts_with('P')).map(|p| p.1.as_str()).collect();
+            let regs = [d.areg, d.breg, d.creg, d.dreg, d.adreg, d.mreg, d.opmodereg, d.alumodereg, d.inmodereg, d.carryinreg, d.carryinselreg];
+            let launch = regs.iter().any(|&r| r > 0).then(|| dsp_cko_ps(d));
+            Some((outs, DspArc { name: d.name.as_str(), site: pd.site.as_str(), launch, ins }))
+        })
+        .collect();
+    let mut dsp_comb: HashMap<&str, &DspArc> = HashMap::new();
+    for (outs, arc) in &arcs {
+        for &n in outs {
+            dsp_out.remove(n);
+            dsp_comb.insert(n, arc);
+        }
+    }
     let mut visiting = HashSet::new();
     let mut wns = i64::MAX;
     let mut worst_path = Vec::new();
@@ -753,7 +867,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             }
         }
         for (net, pin, internal) in inputs {
-            let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &&bram_out, &dsp_out, &xy_of, &lr)?;
+            let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &&bram_out, &dsp_out, &xy_of, &lr, &dsp_comb)?;
             if p.is_empty() {
                 continue; // driven by an input pad or a constant: unconstrained
             }
@@ -776,7 +890,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         if clk != domain {
             continue;
         }
-        let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &bram_out, &dsp_out, &xy_of, &lr)?;
+        let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &bram_out, &dsp_out, &xy_of, &lr, &dsp_comb)?;
         if p.is_empty() {
             continue;
         }
@@ -793,7 +907,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         }
     }
     for (net, site, sp) in &bram_in {
-        let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &bram_out, &dsp_out, &xy_of, &lr)?;
+        let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &bram_out, &dsp_out, &xy_of, &lr, &dsp_comb)?;
         if p.is_empty() {
             continue;
         }
@@ -810,7 +924,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         }
     }
     for (net, site, pin, setup, block) in &dsp_in {
-        let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &bram_out, &dsp_out, &xy_of, &lr)?;
+        let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &bram_out, &dsp_out, &xy_of, &lr, &dsp_comb)?;
         if p.is_empty() {
             continue;
         }

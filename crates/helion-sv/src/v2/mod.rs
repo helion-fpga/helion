@@ -7,6 +7,7 @@
 
 pub mod ast;
 pub mod dag;
+pub mod dsp;
 pub mod elab;
 pub mod exec;
 pub mod lex;
@@ -24,7 +25,7 @@ static HARD: AtomicBool = AtomicBool::new(false);
 
 /// Build hard blocks for the Xilinx 7-series back end: block RAM from
 /// memories, device primitives (`RAMB36E1`, `DSP48E1`, ...) from their
-/// instances (see [`mem`]) and shift registers as SRLs (see [`srl`]). Off by default (the own-fabric flow has none);
+/// instances (see [`mem`]), products as DSP48E1 (see [`dsp`]) and shift registers as SRLs (see [`srl`]). Off by default (the own-fabric flow has none);
 /// `HELION_V2_HARD=1` turns it on too, `HELION_V2_HARD=0` keeps it off.
 pub fn set_hard(on: bool) {
     HARD.store(on, Ordering::Relaxed);
@@ -67,7 +68,7 @@ fn run(sources: &[(String, String)], top: Option<&str>, defines: &[(String, Stri
     let dirs: Vec<std::path::PathBuf> = sources.iter().filter_map(|(n, _)| std::path::Path::new(n).parent().map(|p| p.to_path_buf())).collect();
     let mut no_bram = std::collections::HashSet::new();
     let mut flops = Vec::new();
-    let (flat, mut warnings) = loop {
+    let (mut flat, mut warnings) = loop {
         let mut e = elab::Elab::new(src.clone()).map_err(fix)?;
         e.mem.on = hard();
         e.mem.no_bram = no_bram.clone();
@@ -85,6 +86,9 @@ fn run(sources: &[(String, String)], top: Option<&str>, defines: &[(String, Stri
         }
     };
     warnings.extend(flops);
+    if hard() {
+        dsp::infer(&mut flat);
+    }
     let (mut design, mut st, undriven) = lower::lower(&flat)?;
     if hard() && srl::on() {
         srl::infer(&mut design, &mut st);

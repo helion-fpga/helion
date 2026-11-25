@@ -30,6 +30,11 @@
 //   cargo run --release -p helion-xilinx7 --example zedbit -- \
 //       examples/zedboard_dsp_fill.sv examples/zedboard_dsp_fill.xdc \
 //       dsp_fill.bit --front=v2
+// Check without a board (x7v's random resets would restart the test before it
+// ends, so pulse reset once and see it pass twice: LEDs 11000000):
+//   cd tools/x7v && python3 -m x7v --board zedboard verify dsp_fill.bit \
+//       --rtl ../../examples/zedboard_dsp_fill.sv --top zedboard_dsp_fill \
+//       --xdc ../../examples/zedboard_dsp_fill.xdc --cycles 6000 --reset-at 2500
 module zedboard_dsp_fill #(
     parameter int          LANES   = 192,
     parameter int          NCYC    = 1024,
