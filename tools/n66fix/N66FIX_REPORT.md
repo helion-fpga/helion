@@ -1,5 +1,7 @@
 # N66 fix lane: correct the BRAM docs from 1460 to 1020 ps
 
+Report commit: 7b4f2ee502cea58304e17f56a6fa14eeb9446776
+
 ## 1. Outcome
 
 N66 is fixed. The two data docs that still described 1460 ps as the current
