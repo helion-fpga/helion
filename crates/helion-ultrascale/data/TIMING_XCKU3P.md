@@ -66,20 +66,24 @@ zero.
 ### DS922, Kintex UltraScale+ Data Sheet: DC and AC Switching Characteristics
 
 This is the correct datasheet for xcku3p (Kintex UltraScale+). Column
-mapping for every table below: 0.90V columns are speed grades -3, -2,
--1; 0.85V columns are -2, -1; 0.72V columns are -2, -1. The DB uses
-speed grade -2 at 0.85V, which is the fourth numeric column.
+mapping for every table below: the five numeric columns are -3 at
+0.90V, -2 at 0.85V, -1 at 0.85V, -2 at 0.72V, -1 at 0.72V. The DB uses
+speed grade -2 at 0.85V, which is the second numeric column, not the
+fourth: an earlier reading took the fourth column (1.46 ns) for -2 at
+0.85V, but that column is -2 at 0.72V.
 
 - Block RAM and FIFO Switching Characteristics (DS922 Table 33,
   docs.amd.com/r/en-US/ds922-kintex-ultrascale-plus/Block-RAM-and-FIFO-Switching-Characteristics):
   TRCKO_DO (CLK to DOUT, without output register) at -2 / 0.85V is
-  1.46 ns = 1460 ps, Max. TRCKO_DO_REG (with output register) at the
+  1.02 ns = 1020 ps, Max. TRCKO_DO_REG (with output register) at the
   same grade is 0.42 ns = 420 ps. FMAX_WF_NC 585 MHz, FMAX_RF 510 MHz,
   TPW 577 ps at the same grade. This is the ONLY pin-to-pin delay in
   DS922 that maps onto a field of `UltraScaleTimingDb`, and it is the
   only documented value in `documented_xcku3p()` /
-  `documented_xcvu3p()`: `bram.clk_to_do` = 1460 ps, source
-  "DS922 Table 33 TRCKO_DO, -2 0.85V". The struct has no separate
+  `documented_xcvu3p()`: `bram.clk_to_do` = 1020 ps, source
+  "DS922 Table 33 TRCKO_DO, -2 0.85V". (1.46 ns is the TRCKO_DO value
+  at -2 / 0.72V, the fourth numeric column; it is not the -2 / 0.85V
+  value.) The struct has no separate
   registered-output field, so TRCKO_DO_REG is recorded here only, not
   stored. No address-setup row exists in the BRAM table, so
   `bram.addr_setup` stays UNKNOWN.
@@ -107,10 +111,11 @@ speed grade -2 at 0.85V, which is the fourth numeric column.
 
 ### DS923, Virtex UltraScale+ Data Sheet (xcvu3p)
 
-Same BRAM numbers as DS922 at -2 / 0.85V: TRCKO_DO 1.46 ns,
+Same BRAM numbers as DS922 at -2 / 0.85V: TRCKO_DO 1.02 ns,
 TRCKO_DO_REG 0.42 ns (docs.amd.com/r/en-US/ds923-virtex-ultrascale-plus/Block-RAM-and-FIFO-Switching-Characteristics).
 `documented_xcvu3p()` therefore carries the same single documented
-value, `bram.clk_to_do` = 1460 ps. All other fields UNKNOWN, for the
+value, `bram.clk_to_do` = 1020 ps. (1.46 ns is the TRCKO_DO value at
+-2 / 0.72V, not at -2 / 0.85V.) All other fields UNKNOWN, for the
 same reasons as DS922.
 
 ### UG574, UltraScale Architecture CLB User Guide
