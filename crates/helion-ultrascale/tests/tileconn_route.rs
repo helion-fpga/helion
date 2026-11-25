@@ -205,8 +205,8 @@ fn blinky_routes_on_loaded_tileconn_map() {
     };
     let wdb = TileconnWireDb::from_placed_slices(&tile_json(), &root, PART, &blinky_placed())
         .unwrap();
-    assert_eq!(wdb.tile_count(), 1);
-    assert_eq!(wdb.wire_count(), 1475);
+    assert_eq!(wdb.tile_count(), 4);
+    assert_eq!(wdb.wire_count(), 5900);
     // The flow's BEL-pin names resolve to the DB's INT wires.
     assert_eq!(
         wdb.wire_for_bel_pin(site0(), "A6LUT", "O6"),
