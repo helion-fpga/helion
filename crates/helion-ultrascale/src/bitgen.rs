@@ -1590,7 +1590,7 @@ fn bram_array_value_bits(
 /// frame), and values (`want`, `materialize`). Grouped so the
 /// `write_frame_bit` helper takes 3 arguments instead of 9; the
 /// mutable frame state (`frames`, `written`) stays separate
-/// parameters because both call sites thread it through.
+/// parameters because every call site threads it through.
 struct FrameBit<'a> {
     tile: &'a str,
     feature: &'a str,
@@ -1861,13 +1861,15 @@ pub fn emit_frames(
                 write_frame_bit(
                     &mut frames,
                     &mut written,
-                    &entry.tile,
-                    &entry.feature,
-                    base_far,
-                    frame,
-                    placed_bit.frame_ofst as u16,
-                    placed_bit.value,
-                    true,
+                    FrameBit {
+                        tile: &entry.tile,
+                        feature: &entry.feature,
+                        base_far,
+                        frame,
+                        bit: placed_bit.frame_ofst as u16,
+                        want: placed_bit.value,
+                        materialize: true,
+                    },
                 )?;
                 if is_ram_lut {
                     if let Some(far) = base_far.checked_add(frame) {
