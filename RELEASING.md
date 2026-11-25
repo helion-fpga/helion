@@ -45,6 +45,7 @@ that the README, website and [ROADMAP.md](ROADMAP.md) describe the release.
    | `Helion-X.Y.Z-macos-arm64.zip` | `Helion.app` for Apple Silicon, ad-hoc signed |
    | `helion-X.Y.Z-aarch64-apple-darwin.tar.gz` | `helion`, `helion-ide`, `helion-prog`, HAD, examples |
    | `helion-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | The same for Linux x86_64 |
+   | `helion-X.Y.Z-x86_64-pc-windows-msvc.zip` | `helion.exe`, `helion-ide.exe`, `helion-prog.exe`, HAD, examples, `README-WINDOWS.txt` (WinUSB/Zadig), libusb's LGPL notice |
    | `SHA256SUMS.txt` | Checksums |
 
    The release body is the changelog excerpt for the tag
@@ -61,3 +62,6 @@ that the README, website and [ROADMAP.md](ROADMAP.md) describe the release.
 - Do not call the macOS app signed or notarized: it is ad-hoc signed only,
   and users clear the quarantine flag once (`xattr -cr /Applications/Helion.app`).
   Notarization needs an Apple Developer ID on the runner.
+- Do not call the Windows `.exe` files signed: they are not code-signed, and
+  SmartScreen warns on first run. Signing needs a code-signing certificate on
+  the runner.

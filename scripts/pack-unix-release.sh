@@ -1,5 +1,7 @@
 #!/bin/sh
 # Pack helion + optional helion-ide / helion-prog + HAD + examples + licenses.
+# A *windows* TRIPLE packs the .exe files into a .zip; it needs LIBUSB_COPYING
+# (the bundled libusb's license; libusb is linked statically on Windows).
 #
 #   scripts/pack-unix-release.sh VERSION TRIPLE BIN_DIR OUT_DIR
 set -eu
@@ -16,6 +18,10 @@ OUT_DIR=${4:-}
 VER=${VER#v}
 NAME="helion-${VER}-${TRIPLE}"
 STAGE="$OUT_DIR/$NAME"
+case "$TRIPLE" in *windows*) EXE=.exe ;; *) EXE= ;; esac
+if [ -n "$EXE" ]; then
+  [ -f "${LIBUSB_COPYING:-}" ] || { echo "LIBUSB_COPYING must name libusb's COPYING file" >&2; exit 1; }
+fi
 mkdir -p "$STAGE"
 
 copy_bin() {
@@ -26,14 +32,13 @@ copy_bin() {
   chmod +x "$dest"
 }
 
-copy_bin "$BIN_DIR/helion" "$STAGE/helion" \
-  || { echo "missing $BIN_DIR/helion" >&2; exit 1; }
-if [ -f "$BIN_DIR/helion-ide" ]; then
-  copy_bin "$BIN_DIR/helion-ide" "$STAGE/helion-ide"
-fi
-if [ -f "$BIN_DIR/helion-prog" ]; then
-  copy_bin "$BIN_DIR/helion-prog" "$STAGE/helion-prog"
-fi
+copy_bin "$BIN_DIR/helion$EXE" "$STAGE/helion$EXE" \
+  || { echo "missing $BIN_DIR/helion$EXE" >&2; exit 1; }
+for b in helion-ide helion-prog; do
+  if [ -f "$BIN_DIR/$b$EXE" ]; then
+    copy_bin "$BIN_DIR/$b$EXE" "$STAGE/$b$EXE"
+  fi
+done
 
 mkdir -p "$STAGE/devices"
 cp -R "$ROOT/devices/helion" "$STAGE/devices/helion"
@@ -47,7 +52,32 @@ cp "$ROOT/LICENSE" "$ROOT/LICENSE-APACHE" "$ROOT/LICENSE-MIT" "$ROOT/README.md" 
 cp "$ROOT/third_party/rune/LICENSE" "$STAGE/LICENSE-RUNE"
 printf '%s\n' "$VER" "$TRIPLE" > "$STAGE/VERSION"
 
+if [ -n "$EXE" ]; then
+  cp "$LIBUSB_COPYING" "$STAGE/LICENSE-LIBUSB"
+  cat > "$STAGE/README-WINDOWS.txt" <<'TXT'
+Helion for Windows x86_64. Unzip anywhere and run helion-ide.exe (or helion.exe
+from a terminal). The .exe files are not code-signed, so SmartScreen may warn.
+
+Programming a board over JTAG: helion-prog.exe and the IDE open FTDI cables
+(Digilent, FT2232H) through WinUSB. Use Zadig (https://zadig.akeo.ie) to bind
+the cable's interface 0 to WinUSB. While it is bound, Vivado and other D2XX
+tools cannot use that cable; reinstall the vendor driver to undo it. Without
+WinUSB, Helion falls back to openFPGALoader.exe if it is on PATH.
+TXT
+fi
+
 mkdir -p "$OUT_DIR"
-tar -C "$OUT_DIR" -czf "$OUT_DIR/${NAME}.tar.gz" "$NAME"
+if [ -n "$EXE" ]; then
+  ARCHIVE="$OUT_DIR/${NAME}.zip"
+  # 7-Zip ships on the Windows runners; Info-ZIP elsewhere.
+  if command -v 7z >/dev/null 2>&1; then
+    (cd "$OUT_DIR" && 7z a -tzip -bd "${NAME}.zip" "$NAME" >/dev/null)
+  else
+    (cd "$OUT_DIR" && zip -qr "${NAME}.zip" "$NAME")
+  fi
+else
+  ARCHIVE="$OUT_DIR/${NAME}.tar.gz"
+  tar -C "$OUT_DIR" -czf "$ARCHIVE" "$NAME"
+fi
 rm -rf "$STAGE"
-printf '%s\n' "$OUT_DIR/${NAME}.tar.gz"
+printf '%s\n' "$ARCHIVE"

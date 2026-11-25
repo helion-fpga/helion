@@ -19,6 +19,11 @@ helion-bits = { workspace = true }
 helion-fabric = { workspace = true }
 rusb = { version = "0.9", optional = true }
 
+[target.'cfg(windows)'.dependencies]
+# Windows has no system libusb: build the bundled one and link it statically
+# (skips the vcpkg/pkg-config probe, which can find a stray MinGW libusb).
+rusb = { version = "0.9", optional = true, features = ["vendored"] }
+
 [dev-dependencies]
 helion-ir = { workspace = true }
 helion-pack = { workspace = true }
