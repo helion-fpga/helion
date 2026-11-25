@@ -1,4 +1,4 @@
-//! Routing graph for UltraScale+ INT tiles, built from public sources only.
+//! Routing graph for UltraScale+ INT and INT_INTF tiles, built from public sources only.
 //!
 //! The graph is built from the vendored BitFiltrator INT tile JSON
 //! (`crates/helion-ultrascale/data/tile_type_INT.json`, MIT, extracted
@@ -8,8 +8,20 @@
 //! to prjuray-db segbits features. No RapidWright .dat and no FPGA
 //! Interchange DB is ingested: both are under the Xilinx EULA.
 //!
+//! INT_INTF tiles (the interface columns flanking DSP/BRAM columns)
+//! have their own, smaller tile JSONs (350 wires / 32 PIPs for
+//! INT_INTF_L/R, up to 446 wires / 224 PIPs for the PCIE4 and
+//! LEFT_TERM_PSS variants), loaded at runtime from the prjuray-db
+//! family root by the tileconn loader, never vendored. The graph is
+//! heterogeneous: each tile instance carries its tile type, and wire
+//! and PIP tables are per type. DSP/BRAM pins stitch to INT_INTF
+//! wires, and INT_INTF wires stitch to INT wires (tileconn pairs);
+//! those tileconn stitches are bidirectional same-node edges added
+//! with [`IntTileWireDb::add_stitch`], distinct from span-wire
+//! continuations (which exist only between INT tiles).
+//!
 //! Node layout: one node per (tile instance, wire name). A tile instance
-//! is supplied by the caller as a (tile name, x, y) triple; this module
+//! is supplied by the caller as a (tile name, x, y, tile type) tuple; this module
 //! never invents device tile coordinates. A full-device graph needs the
 //! xcku3p tilegrid (US-01, no public source), so callers instantiate
 //! the tiles they route over, e.g. the tiles covering the placed slices
@@ -56,8 +68,8 @@ use std::fmt;
 pub enum WireDbError {
     /// The JSON text does not parse.
     Json(String),
-    /// The JSON is not an INT tile file.
-    WrongTileType(String),
+    /// The JSON is not a tile file of the expected tile type.
+    WrongTileType { found: String, expected: String },
     /// A PIP references a wire that is not in the tile wire list.
     UnknownWireInPip { pip: String, wire: String },
     /// A PIP is marked pseudo: it is not a real mux, so it cannot be
@@ -69,14 +81,23 @@ pub enum WireDbError {
     DuplicateTile(String),
     /// `add_pin_wire` named a tile or wire this DB does not have.
     UnknownPinWire { tile: String, wire: String },
+    /// A tile instance names a tile type no JSON was supplied for.
+    UnknownTileType { tile: String, tile_type: String },
+    /// `add_stitch` was given a same-tile pair or an unknown wire:
+    /// stitches join two tiles, never two wires of one tile.
+    BadStitch(String),
 }
 
 impl fmt::Display for WireDbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Json(e) => write!(f, "INT tile JSON does not parse: {}", e),
-            Self::WrongTileType(t) => {
-                write!(f, "INT tile JSON has tile_type '{}', expected 'INT'", t)
+            Self::Json(e) => write!(f, "tile JSON does not parse: {}", e),
+            Self::WrongTileType { found, expected } => {
+                write!(
+                    f,
+                    "tile JSON has tile_type '{}', expected '{}'",
+                    found, expected
+                )
             }
             Self::UnknownWireInPip { pip, wire } => {
                 write!(f, "PIP '{}' references unknown wire '{}'", pip, wire)
@@ -91,13 +112,19 @@ impl fmt::Display for WireDbError {
             Self::UnknownPinWire { tile, wire } => {
                 write!(f, "no wire '{}' in tile '{}'", wire, tile)
             }
+            Self::UnknownTileType { tile, tile_type } => write!(
+                f,
+                "tile '{}' has tile type '{}', but no JSON was supplied for it",
+                tile, tile_type
+            ),
+            Self::BadStitch(m) => write!(f, "bad tileconn stitch: {}", m),
         }
     }
 }
 
 impl std::error::Error for WireDbError {}
 
-/// One INT tile instance in the graph.
+/// One INT or INT_INTF tile instance in the graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IntTile {
     /// Vivado tile name, e.g. `INT_X12Y45`.
@@ -106,15 +133,90 @@ pub struct IntTile {
     pub x: i32,
     /// Tile Y coordinate (Vivado tile grid).
     pub y: i32,
+    /// Tile type, e.g. `INT` or `INT_INTF_R`. Selects the wire and
+    /// PIP table this instance is built from.
+    pub tile_type: String,
 }
 
 impl IntTile {
+    /// A plain INT tile instance.
     pub fn new(name: &str, x: i32, y: i32) -> Self {
+        Self::new_typed(name, x, y, "INT")
+    }
+
+    /// A tile instance of any type (`INT`, `INT_INTF_L`,
+    /// `INT_INTF_R`, `INT_INTF_L_PCIE4`, ...).
+    pub fn new_typed(name: &str, x: i32, y: i32, tile_type: &str) -> Self {
         Self {
             name: name.to_string(),
             x,
             y,
+            tile_type: tile_type.to_string(),
         }
+    }
+}
+
+/// Wire and PIP tables for one tile type, parsed from that type's
+/// tile JSON. Every tile instance of the type shares this table.
+#[derive(Debug)]
+struct TileTypeTable {
+    /// Tile type name, e.g. `INT` or `INT_INTF_R`.
+    name: String,
+    /// Wire names in sorted order; the wire index is the position here.
+    wire_names: Vec<String>,
+    wire_index: HashMap<String, usize>,
+    /// (src wire idx, dst wire idx) to true when the PIP is
+    /// bidirectional. Directional PIPs map to false.
+    pip_table: HashMap<(u32, u32), bool>,
+}
+
+impl TileTypeTable {
+    /// Parse one tile JSON. The JSON's `tile_type` must equal
+    /// `expected`; any pseudo PIP, or any PIP naming an unknown wire,
+    /// fails loud, exactly as the old INT-only loader did.
+    fn parse(json: &str, expected: &str) -> Result<Self, WireDbError> {
+        let parsed: IntTileJson =
+            serde_json::from_str(json).map_err(|e| WireDbError::Json(e.to_string()))?;
+        if parsed.tile_type != expected {
+            return Err(WireDbError::WrongTileType {
+                found: parsed.tile_type,
+                expected: expected.to_string(),
+            });
+        }
+        let mut wire_names: Vec<String> = parsed.wires.keys().cloned().collect();
+        wire_names.sort();
+        let wire_index: HashMap<String, usize> = wire_names
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w.clone(), i))
+            .collect();
+        let mut pip_table: HashMap<(u32, u32), bool> = HashMap::new();
+        for (key, pip) in &parsed.pips {
+            if pip.is_pseudo != "0" {
+                return Err(WireDbError::PseudoPip(key.clone()));
+            }
+            let src =
+                wire_index
+                    .get(&pip.src_wire)
+                    .ok_or_else(|| WireDbError::UnknownWireInPip {
+                        pip: key.clone(),
+                        wire: pip.src_wire.clone(),
+                    })?;
+            let dst =
+                wire_index
+                    .get(&pip.dst_wire)
+                    .ok_or_else(|| WireDbError::UnknownWireInPip {
+                        pip: key.clone(),
+                        wire: pip.dst_wire.clone(),
+                    })?;
+            pip_table.insert((*src as u32, *dst as u32), pip.is_directional == "0");
+        }
+        Ok(Self {
+            name: expected.to_string(),
+            wire_names,
+            wire_index,
+            pip_table,
+        })
     }
 }
 
@@ -250,18 +352,27 @@ fn continuation_partner(name: &str) -> Option<(String, (i32, i32), bool)> {
     Some((partner, delta, is_beg))
 }
 
-/// Routing graph over INT tiles, built from the vendored INT tile JSON.
+/// Routing graph over INT and INT_INTF tiles, built from the tile JSONs.
 pub struct IntTileWireDb {
     tiles: Vec<IntTile>,
     tile_by_name: HashMap<String, usize>,
-    /// Wire names in sorted order; the wire index is the position here.
-    wire_names: Vec<String>,
-    wire_index: HashMap<String, usize>,
+    /// One table per tile type present in this graph.
+    tables: Vec<TileTypeTable>,
+    /// Per tile instance, the index of its table in `tables`.
+    tile_type_idx: Vec<usize>,
+    /// Per tile instance, the first node id of that tile. Node ids
+    /// are contiguous per tile in tile order: tile i occupies
+    /// `tile_base[i] .. tile_base[i] + tables[tile_type_idx[i]].wire_names.len()`.
+    /// Tiles of different types have different widths, so there is no
+    /// single `wires_per_tile` for the node math.
+    tile_base: Vec<usize>,
+    /// Total node count (sum of per-tile wire counts).
+    node_count: usize,
     fanout: Vec<Vec<WireId>>,
-    /// (src wire idx, dst wire idx) to true when the PIP is
-    /// bidirectional. Keyed by tile-type wire indices, shared by all
-    /// tile instances. Directional PIPs map to false.
-    pip_table: HashMap<(u32, u32), bool>,
+    /// Tileconn stitch pairs, canonical (min, max) wire-id order.
+    /// A stitch joins an INT_INTF wire to the INT wire tileconn names
+    /// as the same node; it programs no PIP. See [`Self::add_stitch`].
+    stitches: std::collections::HashSet<(WireId, WireId)>,
     pin_wires: HashMap<(i32, i32, String, String), WireId>,
 }
 
@@ -270,62 +381,68 @@ impl IntTileWireDb {
     /// to instantiate. The JSON must be the vendored
     /// `tile_type_INT.json` (or the same shape); any other tile type,
     /// any pseudo PIP, or any PIP naming an unknown wire fails loud.
+    /// Every tile defaults to type `INT` (see [`IntTile::new`]).
     pub fn from_json(json: &str, tiles: &[IntTile]) -> Result<Self, WireDbError> {
+        Self::from_json_typed(&[("INT", json)], tiles)
+    }
+
+    /// Build the graph from one tile JSON per tile type and the tile
+    /// instances to instantiate. Each tile's [`IntTile::tile_type`]
+    /// must name one of the supplied JSONs; a tile of an unknown type,
+    /// a JSON whose `tile_type` disagrees with its key, a pseudo PIP,
+    /// or a PIP naming an unknown wire fails loud. INT tiles get span
+    /// continuations as before; INT_INTF tiles get their own PIPs and
+    /// no continuations (their wires have no span names), and their
+    /// tileconn stitches to INT tiles are added later with
+    /// [`Self::add_stitch`].
+    pub fn from_json_typed(jsons: &[(&str, &str)], tiles: &[IntTile]) -> Result<Self, WireDbError> {
         if tiles.is_empty() {
             return Err(WireDbError::EmptyTiles);
         }
+        let mut tables: Vec<TileTypeTable> = Vec::with_capacity(jsons.len());
+        let mut table_by_name: HashMap<String, usize> = HashMap::new();
+        for (i, (name, json)) in jsons.iter().enumerate() {
+            tables.push(TileTypeTable::parse(json, name)?);
+            table_by_name.insert((*name).to_string(), i);
+        }
         let mut tile_by_name: HashMap<String, usize> = HashMap::new();
-        let mut tile_by_xy: HashMap<(i32, i32), usize> = HashMap::new();
+        // Continuation lookup is scoped per tile type: an INT tile
+        // and an INT_INTF tile can share name coordinates (e.g.
+        // INT_X13Y0 and INT_INTF_R_X13Y0 are both (13, 0)).
+        let mut tile_by_xy: HashMap<(usize, i32, i32), usize> = HashMap::new();
+        let mut tile_type_idx: Vec<usize> = Vec::with_capacity(tiles.len());
+        let mut tile_base: Vec<usize> = Vec::with_capacity(tiles.len());
+        let mut node_count = 0usize;
         for (i, t) in tiles.iter().enumerate() {
-            if tile_by_name.insert(t.name.clone(), i).is_some()
-                || tile_by_xy.insert((t.x, t.y), i).is_some()
-            {
+            if tile_by_name.insert(t.name.clone(), i).is_some() {
                 return Err(WireDbError::DuplicateTile(format!(
                     "{} at ({},{})",
                     t.name, t.x, t.y
                 )));
             }
-        }
-        let parsed: IntTileJson =
-            serde_json::from_str(json).map_err(|e| WireDbError::Json(e.to_string()))?;
-        if parsed.tile_type != "INT" {
-            return Err(WireDbError::WrongTileType(parsed.tile_type));
-        }
-        let mut wire_names: Vec<String> = parsed.wires.keys().cloned().collect();
-        wire_names.sort();
-        let wire_index: HashMap<String, usize> = wire_names
-            .iter()
-            .enumerate()
-            .map(|(i, w)| (w.clone(), i))
-            .collect();
-        let wires_per_tile = wire_names.len();
-        let mut pip_table: HashMap<(u32, u32), bool> = HashMap::new();
-        for (key, pip) in &parsed.pips {
-            if pip.is_pseudo != "0" {
-                return Err(WireDbError::PseudoPip(key.clone()));
+            let ti =
+                *table_by_name
+                    .get(&t.tile_type)
+                    .ok_or_else(|| WireDbError::UnknownTileType {
+                        tile: t.name.clone(),
+                        tile_type: t.tile_type.clone(),
+                    })?;
+            if tile_by_xy.insert((ti, t.x, t.y), i).is_some() {
+                return Err(WireDbError::DuplicateTile(format!(
+                    "{} at ({},{})",
+                    t.name, t.x, t.y
+                )));
             }
-            let src =
-                wire_index
-                    .get(&pip.src_wire)
-                    .ok_or_else(|| WireDbError::UnknownWireInPip {
-                        pip: key.clone(),
-                        wire: pip.src_wire.clone(),
-                    })?;
-            let dst =
-                wire_index
-                    .get(&pip.dst_wire)
-                    .ok_or_else(|| WireDbError::UnknownWireInPip {
-                        pip: key.clone(),
-                        wire: pip.dst_wire.clone(),
-                    })?;
-            pip_table.insert((*src as u32, *dst as u32), pip.is_directional == "0");
+            tile_type_idx.push(ti);
+            tile_base.push(node_count);
+            node_count += tables[ti].wire_names.len();
         }
-        let node_count = tiles.len() * wires_per_tile;
         let mut fanout: Vec<Vec<WireId>> = vec![Vec::new(); node_count];
-        let node = |tile: usize, wire: usize| (tile * wires_per_tile + wire) as WireId;
-        // Intra-tile PIP edges.
+        let node = |tile: usize, wire: usize| (tile_base[tile] + wire) as WireId;
+        // Intra-tile PIP edges, from each tile's own type table.
         for (i, _) in tiles.iter().enumerate() {
-            for ((src, dst), bidir) in &pip_table {
+            let table = &tables[tile_type_idx[i]];
+            for ((src, dst), bidir) in &table.pip_table {
                 fanout[node(i, *src as usize) as usize].push(node(i, *dst as usize));
                 if *bidir {
                     fanout[node(i, *dst as usize) as usize].push(node(i, *src as usize));
@@ -333,8 +450,11 @@ impl IntTileWireDb {
             }
         }
         // Inter-tile continuation edges, one per BEG wire per tile.
+        // Only INT tiles have span wires; INT_INTF wires return None
+        // from continuation_partner, so those tiles get none here.
         for (i, tile) in tiles.iter().enumerate() {
-            for (w, name) in wire_names.iter().enumerate() {
+            let table = &tables[tile_type_idx[i]];
+            for (w, name) in table.wire_names.iter().enumerate() {
                 let Some((partner, (dx, dy), is_beg)) = continuation_partner(name) else {
                     continue;
                 };
@@ -343,10 +463,10 @@ impl IntTileWireDb {
                 if !is_beg {
                     continue;
                 }
-                let Some(&j) = tile_by_xy.get(&(tile.x + dx, tile.y + dy)) else {
+                let Some(&j) = tile_by_xy.get(&(tile_type_idx[i], tile.x + dx, tile.y + dy)) else {
                     continue;
                 };
-                let Some(&partner_idx) = wire_index.get(&partner) else {
+                let Some(&partner_idx) = tables[tile_type_idx[j]].wire_index.get(&partner) else {
                     continue;
                 };
                 let a = node(i, w);
@@ -372,10 +492,12 @@ impl IntTileWireDb {
         Ok(Self {
             tiles: tiles.to_vec(),
             tile_by_name,
-            wire_names,
-            wire_index,
+            tables,
+            tile_type_idx,
+            tile_base,
+            node_count,
             fanout,
-            pip_table,
+            stitches: std::collections::HashSet::new(),
             pin_wires: HashMap::new(),
         })
     }
@@ -413,34 +535,129 @@ impl IntTileWireDb {
         self.tiles.len()
     }
 
-    /// Wires per tile instance (1,475 for the vendored INT tile JSON).
+    /// Wires per INT tile instance (1,475 for the vendored INT tile
+    /// JSON). INT_INTF tile instances have fewer wires; use
+    /// [`Self::wire_count`] for the graph total.
     pub fn wires_per_tile(&self) -> usize {
-        self.wire_names.len()
+        self.int_table().wire_names.len()
     }
 
-    /// PIPs per tile instance (3,774 for the vendored INT tile JSON).
+    /// PIPs per INT tile instance (3,774 for the vendored INT tile JSON).
     pub fn pip_count(&self) -> usize {
-        self.pip_table.len()
+        self.int_table().pip_table.len()
+    }
+
+    /// The `INT` table when the graph has one, else the first table.
+    /// Every graph the flow builds has an INT table; the fallback only
+    /// serves single-type INT_INTF fixture graphs.
+    fn int_table(&self) -> &TileTypeTable {
+        self.tables
+            .iter()
+            .find(|t| t.name == "INT")
+            .unwrap_or(&self.tables[0])
+    }
+
+    /// The table of one tile instance.
+    fn table_for_tile(&self, tile: usize) -> &TileTypeTable {
+        &self.tables[self.tile_type_idx[tile]]
+    }
+
+    /// Wire names of one tile type, or `None` when the graph has no
+    /// such type. Used by tests; the graph itself resolves by tile.
+    pub fn wire_names_for_type(&self, tile_type: &str) -> Option<&[String]> {
+        self.tables
+            .iter()
+            .find(|t| t.name == tile_type)
+            .map(|t| t.wire_names.as_slice())
+    }
+
+    /// Number of tile instances of one tile type.
+    pub fn tile_count_of_type(&self, tile_type: &str) -> usize {
+        self.tiles
+            .iter()
+            .filter(|t| t.tile_type == tile_type)
+            .count()
+    }
+
+    /// Tile instances in graph order, with their types.
+    pub fn tiles(&self) -> &[IntTile] {
+        &self.tiles
     }
 
     /// Wire ID for a (tile, wire name) pair, or `None` when either is
-    /// unknown.
+    /// unknown. The wire must belong to the tile's own type: an INT
+    /// wire name on an INT_INTF tile is unknown, not an INT node.
     pub fn wire_id(&self, tile: &str, wire: &str) -> Option<WireId> {
-        let t = self.tile_by_name.get(tile)?;
-        let w = self.wire_index.get(wire)?;
-        Some((t * self.wire_names.len() + w) as WireId)
+        let t = *self.tile_by_name.get(tile)?;
+        let w = self.table_for_tile(t).wire_index.get(wire)?;
+        Some((self.tile_base[t] + w) as WireId)
     }
 
-    /// Tile index a wire belongs to.
+    /// Tile index a wire belongs to. Node ids are contiguous per tile
+    /// in tile order, so this is a binary search over the per-tile
+    /// base offsets; an id past the last node is not a wire.
     fn tile_of(&self, wire: WireId) -> Option<usize> {
-        let t = wire as usize / self.wire_names.len();
-        if t < self.tiles.len() { Some(t) } else { None }
+        let w = wire as usize;
+        if w >= self.node_count {
+            return None;
+        }
+        let t = self.tile_base.partition_point(|&b| b <= w) - 1;
+        Some(t)
     }
 
     /// Wire index within its tile.
     fn wire_idx_of(&self, wire: WireId) -> Option<usize> {
-        self.tile_of(wire)?;
-        Some(wire as usize % self.wire_names.len())
+        let t = self.tile_of(wire)?;
+        let idx = wire as usize - self.tile_base[t];
+        if idx < self.table_for_tile(t).wire_names.len() {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Add one tileconn stitch edge between two wires in different
+    /// tiles: the two wires are the same electrical node (tileconn
+    /// names the pair), so the router may cross either way and the
+    /// translator programs no PIP for the crossing. Fails loud on a
+    /// same-tile pair or an unknown wire: a stitch is by definition
+    /// cross-tile, and a stitch to a wire the graph does not have
+    /// means the tile JSONs and tileconn disagree. Adding the same
+    /// pair twice is a no-op. The two fanout lists are re-sorted, so
+    /// the N48 determinism rule still holds.
+    pub fn add_stitch(&mut self, a: WireId, b: WireId) -> Result<(), WireDbError> {
+        let (Some(ta), Some(tb)) = (self.tile_of(a), self.tile_of(b)) else {
+            return Err(WireDbError::BadStitch(format!(
+                "unknown wire in stitch pair ({a}, {b})"
+            )));
+        };
+        if ta == tb {
+            return Err(WireDbError::BadStitch(format!(
+                "stitch pair ({a}, {b}) is inside one tile '{}'",
+                self.tiles[ta].name
+            )));
+        }
+        let key = (a.min(b), a.max(b));
+        if !self.stitches.insert(key) {
+            return Ok(());
+        }
+        self.fanout[a as usize].push(b);
+        self.fanout[b as usize].push(a);
+        self.fanout[a as usize].sort_unstable();
+        self.fanout[b as usize].sort_unstable();
+        Ok(())
+    }
+
+    /// True when the pair is a tileconn stitch added with
+    /// [`Self::add_stitch`]. Used by the translator to tell stitches
+    /// apart from PIPs and span continuations.
+    pub fn is_stitch(&self, a: WireId, b: WireId) -> bool {
+        self.stitches.contains(&(a.min(b), a.max(b)))
+    }
+
+    /// Number of tileconn stitch edges in the graph.
+    pub fn stitch_count(&self) -> usize {
+        self.stitches.len()
     }
 
     /// Remove one intra-tile PIP edge (`src` -> `dst` on `tile`)
@@ -508,8 +725,9 @@ impl IntTileWireDb {
         let (Some(is), Some(id)) = (self.wire_idx_of(src), self.wire_idx_of(dst)) else {
             return removed;
         };
-        if self.pip_table.get(&(is as u32, id as u32)) == Some(&true)
-            || self.pip_table.get(&(id as u32, is as u32)) == Some(&true)
+        let pip_table = &self.table_for_tile(ts).pip_table;
+        if pip_table.get(&(is as u32, id as u32)) == Some(&true)
+            || pip_table.get(&(id as u32, is as u32)) == Some(&true)
         {
             if let Some(list) = self.fanout.get_mut(dst as usize) {
                 let before = list.len();
@@ -549,9 +767,10 @@ impl IntTileWireDb {
         }
         let ia = self.wire_idx_of(a)? as u32;
         let ib = self.wire_idx_of(b)? as u32;
-        if self.pip_table.get(&(ia, ib)) == Some(&true) {
+        let pip_table = &self.table_for_tile(ta).pip_table;
+        if pip_table.get(&(ia, ib)) == Some(&true) {
             Some(BidirDir::Fwd)
-        } else if self.pip_table.get(&(ib, ia)) == Some(&true) {
+        } else if pip_table.get(&(ib, ia)) == Some(&true) {
             Some(BidirDir::Rev)
         } else {
             None
@@ -569,10 +788,16 @@ impl IntTileWireDb {
         if ta == tb {
             return false;
         }
-        let Some(na) = self.wire_idx_of(a).and_then(|i| self.wire_names.get(i)) else {
+        let Some(na) = self
+            .wire_idx_of(a)
+            .and_then(|i| self.table_for_tile(ta).wire_names.get(i))
+        else {
             return false;
         };
-        let Some(nb) = self.wire_idx_of(b).and_then(|i| self.wire_names.get(i)) else {
+        let Some(nb) = self
+            .wire_idx_of(b)
+            .and_then(|i| self.table_for_tile(tb).wire_names.get(i))
+        else {
             return false;
         };
         let Some((partner, (dx, dy), _)) = continuation_partner(na) else {
@@ -589,7 +814,11 @@ impl IntTileWireDb {
 
 impl WireDb for IntTileWireDb {
     fn wire_count(&self) -> usize {
-        self.tiles.len() * self.wire_names.len()
+        self.node_count
+    }
+
+    fn is_stitch(&self, a: WireId, b: WireId) -> bool {
+        IntTileWireDb::is_stitch(self, a, b)
     }
 
     fn fanout(&self, wire: WireId) -> &[WireId] {
@@ -619,7 +848,7 @@ impl WireDb for IntTileWireDb {
         let t = self.tile_of(wire)?;
         let w = self.wire_idx_of(wire)?;
         Some(WireInfo {
-            name: &self.wire_names[w],
+            name: &self.table_for_tile(t).wire_names[w],
             tile: &self.tiles[t].name,
         })
     }
@@ -823,12 +1052,12 @@ mod tests {
         let db = one_tile();
         let mut beg = 0;
         let mut end = 0;
-        for name in &db.wire_names {
+        for name in db.wire_names_for_type("INT").unwrap() {
             if let Some((partner, _, _)) = continuation_partner(name) {
                 // Every span wire has a partner of the same form in
                 // the same wire list.
                 assert!(
-                    db.wire_index.contains_key(&partner),
+                    db.wire_id("INT_X12Y45", &partner).is_some(),
                     "{} partner {} missing",
                     name,
                     partner
@@ -901,7 +1130,7 @@ mod tests {
                 r#"{"tile_type": "CLB", "pips": {}, "wires": {}}"#,
                 &[IntTile::new("INT_X0Y0", 0, 0)]
             ),
-            Err(WireDbError::WrongTileType(_))
+            Err(WireDbError::WrongTileType { .. })
         ));
         assert!(matches!(
             IntTileWireDb::from_json(r#"{"tile_type": "INT", "pips": {}, "wires": {}}"#, &[]),
@@ -973,6 +1202,127 @@ mod tests {
         assert!(matches!(
             IntTileWireDb::from_placed_slices(TILE_JSON, &placed_at(&[])),
             Err(WireDbError::EmptyTiles)
+        ));
+    }
+
+    /// A small INT_INTF-like tile JSON: 6 wires, 2 LOGIC_OUTS
+    /// pass-through PIPs, mirroring INT_INTF_R at small scale.
+    const INTF_JSON: &str = r#"{"tile_type": "TESTINTF", "pips": {
+      "TESTINTF.LOGIC_OUTS_R0->>LOGIC_OUTS_L0": {"src_wire": "LOGIC_OUTS_R0", "dst_wire": "LOGIC_OUTS_L0", "is_directional": "1", "is_pseudo": "0"},
+      "TESTINTF.LOGIC_OUTS_R1->>LOGIC_OUTS_L1": {"src_wire": "LOGIC_OUTS_R1", "dst_wire": "LOGIC_OUTS_L1", "is_directional": "1", "is_pseudo": "0"}
+    }, "wires": {
+      "IMUX_FT0_1": null, "IMUX_FT0_3": null,
+      "LOGIC_OUTS_L0": null, "LOGIC_OUTS_L1": null,
+      "LOGIC_OUTS_R0": null, "LOGIC_OUTS_R1": null
+    }}"#;
+
+    #[test]
+    fn mixed_int_and_intintf_tiles_keep_separate_tables() {
+        let db = IntTileWireDb::from_json_typed(
+            &[("INT", TILE_JSON), ("TESTINTF", INTF_JSON)],
+            &[
+                IntTile::new("INT_X0Y0", 0, 0),
+                IntTile::new_typed("TESTINTF_X0Y0", 0, 0, "TESTINTF"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(db.tile_count(), 2);
+        assert_eq!(db.tile_count_of_type("INT"), 1);
+        assert_eq!(db.tile_count_of_type("TESTINTF"), 1);
+        // Node count is the sum of the per-type wire counts, not two
+        // times one width.
+        assert_eq!(db.wire_count(), 1475 + 6);
+        assert_eq!(db.wires_per_tile(), 1475);
+        assert_eq!(db.pip_count(), 3774);
+        // Each tile resolves only its own type's wires: the INT tile
+        // has no LOGIC_OUTS_R0, the INT_INTF tile has no BOUNCE wire.
+        assert!(db.wire_id("INT_X0Y0", "BOUNCE_E_0_FT1").is_some());
+        assert!(db.wire_id("INT_X0Y0", "LOGIC_OUTS_R0").is_none());
+        assert!(db.wire_id("TESTINTF_X0Y0", "LOGIC_OUTS_R0").is_some());
+        assert!(db.wire_id("TESTINTF_X0Y0", "BOUNCE_E_0_FT1").is_none());
+        // The INT_INTF PIPs are edges only on the INT_INTF tile.
+        let r0 = db.wire_id("TESTINTF_X0Y0", "LOGIC_OUTS_R0").unwrap();
+        let l0 = db.wire_id("TESTINTF_X0Y0", "LOGIC_OUTS_L0").unwrap();
+        assert!(db.fanout(r0).contains(&l0));
+        assert!(!db.fanout(l0).contains(&r0));
+        // The two tiles share name coordinates (0, 0): no duplicate
+        // error, and the INT tile still has its span wires.
+        assert!(db.wire_id("INT_X0Y0", "NN12_BEG7").is_some());
+        // Wire info names the right tile for each node.
+        assert_eq!(
+            db.wire_info(l0),
+            Some(WireInfo {
+                name: "LOGIC_OUTS_L0",
+                tile: "TESTINTF_X0Y0"
+            })
+        );
+        assert_eq!(db.wire_info(db.wire_count() as u32), None);
+    }
+
+    #[test]
+    fn mixed_graph_rejects_unknown_tile_type_and_bad_stitch() {
+        // A tile of a type with no JSON fails loud.
+        assert!(matches!(
+            IntTileWireDb::from_json_typed(
+                &[("INT", TILE_JSON)],
+                &[IntTile::new_typed("TESTINTF_X0Y0", 0, 0, "TESTINTF")]
+            ),
+            Err(WireDbError::UnknownTileType { .. })
+        ));
+        // A JSON whose tile_type disagrees with its key fails loud.
+        assert!(matches!(
+            IntTileWireDb::from_json_typed(
+                &[("TESTINTF", TILE_JSON)],
+                &[IntTile::new_typed("TESTINTF_X0Y0", 0, 0, "TESTINTF")]
+            ),
+            Err(WireDbError::WrongTileType { .. })
+        ));
+        // Stitches join two tiles, never two wires of one tile, and
+        // never an unknown wire.
+        let mut db = IntTileWireDb::from_json_typed(
+            &[("INT", TILE_JSON), ("TESTINTF", INTF_JSON)],
+            &[
+                IntTile::new("INT_X0Y0", 0, 0),
+                IntTile::new_typed("TESTINTF_X0Y0", 0, 0, "TESTINTF"),
+            ],
+        )
+        .unwrap();
+        let int_wire = db.wire_id("INT_X0Y0", "BOUNCE_E_0_FT1").unwrap();
+        let intf_wire = db.wire_id("TESTINTF_X0Y0", "IMUX_FT0_1").unwrap();
+        assert!(!db.is_stitch(int_wire, intf_wire));
+        assert_eq!(db.stitch_count(), 0);
+        db.add_stitch(int_wire, intf_wire).unwrap();
+        assert!(db.is_stitch(int_wire, intf_wire));
+        assert!(db.is_stitch(intf_wire, int_wire));
+        assert_eq!(db.stitch_count(), 1);
+        assert!(db.fanout(int_wire).contains(&intf_wire));
+        assert!(db.fanout(intf_wire).contains(&int_wire));
+        // Adding the same pair twice is a no-op, not a second edge.
+        db.add_stitch(int_wire, intf_wire).unwrap();
+        assert_eq!(db.stitch_count(), 1);
+        assert_eq!(
+            db.fanout(int_wire)
+                .iter()
+                .filter(|w| **w == intf_wire)
+                .count(),
+            1
+        );
+        // Same-tile and unknown-wire stitches fail loud.
+        let other_int = db.wire_id("INT_X0Y0", "LOGIC_OUTS_E0").unwrap();
+        assert!(matches!(
+            db.add_stitch(int_wire, other_int),
+            Err(WireDbError::BadStitch(_))
+        ));
+        assert!(matches!(
+            db.add_stitch(int_wire, u32::MAX),
+            Err(WireDbError::BadStitch(_))
+        ));
+        // A stitch is not a continuation, and a continuation is not
+        // a stitch.
+        assert!(!db.is_continuation(int_wire, intf_wire));
+        assert!(!db.is_stitch(
+            db.wire_id("INT_X0Y0", "NN12_BEG7").unwrap(),
+            db.wire_id("INT_X0Y0", "NN12_BEG7").unwrap()
         ));
     }
 }
