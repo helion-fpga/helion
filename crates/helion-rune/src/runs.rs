@@ -969,7 +969,10 @@ pub(crate) fn resolve_source(s: &AppState) -> Result<PathBuf, String> {
         .file_name()
         .map(|n| n.to_owned())
         .unwrap_or_else(|| std::ffi::OsString::from("design.v"));
-    let dir = std::env::temp_dir().join("helion-rune-runs");
+    // One dir per call: runs in parallel (tests, two IDE windows) truncated each other's file mid-read.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join("helion-rune-runs").join(format!("staged-{}-{seq}", std::process::id()));
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("launch_runs: cannot stage RTL ({}): {e}", dir.display()))?;
     let path = dir.join(file);
