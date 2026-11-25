@@ -3121,6 +3121,13 @@ pub(crate) fn program_hw_session(
     if let Some(why) = crate::views::hw::part_program_block(part, cable, None) {
         return Err(format!("program_hw: {why}"));
     }
+    // 7-series loads the run's .bit through openFPGALoader, not a HAD session.
+    if part.to_ascii_lowercase().starts_with("xc7") {
+        return Err(format!(
+            "program_hw: {part} is a 7-series part: load its .bit with Program Device in the Hardware Manager, \
+             or run `helion hw program --part {part} <run>/top.bit`"
+        ));
+    }
     let dev = crate::runs::resolve_device(part, &|_, _| {})?;
     if session.bitstream.is_none() {
         let d = design
@@ -6508,6 +6515,14 @@ fn xfunc(name: &str, args: &[XVal]) -> Result<XVal, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_hw_on_a_7_series_part_names_program_device() {
+        let mut session = helion_proj::Session::new(helion_proj::Mode::Project);
+        let e = program_hw_session(&mut session, None, "xc7z020clg484-1", "auto").unwrap_err();
+        assert!(e.contains("Program Device") && e.contains("helion hw program --part xc7z020clg484-1"), "{e}");
+        assert!(!e.contains("HL10"), "{e}");
+    }
 
     #[test]
     fn write_bitstream_writes_the_file_and_refuses_to_clobber() {
