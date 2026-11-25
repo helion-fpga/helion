@@ -7,7 +7,207 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-[Unreleased]: https://github.com/helion-fpga/helion/compare/v4.0.0...HEAD
+[Unreleased]: https://github.com/helion-fpga/helion/compare/v4.5.0...HEAD
+
+## [4.5.0] — 2026-11-25
+
+Helion 4.5 takes the Xilinx 7-series backend from bit-exact files to designs
+running on a real board. On a ZedBoard (Zynq-7020), Helion-only bitstreams run
+an Ibex RISC-V SoC at 38.89 MHz, 240 block RAMs and 192 DSP slices at 100 MHz,
+an MMCM design with three clock domains, the OLED display, and the ARM (PS7)
+reading and writing fabric registers over AXI. The IDE now builds, shows and
+programs ZedBoard designs. Every ZedBoard bitstream is decoded and
+co-simulated against its RTL by an independent checker (`tools/x7v`). A new
+SystemVerilog front end (v2) is the default in the CLI and IDE. An
+experimental UltraScale+ backend writes its first bitstreams, which are
+checked by decode and co-simulation only. Helion now also ships a Windows
+x86_64 zip. The empty-XDC `examples/counter.sv` gold is unchanged:
+`WNS_PS=9640`, `LED[16]=0000000111111110`.
+
+### Added
+
+- **ZedBoard (xc7z020clg484-1) end to end.** `zedbit`'s flow (synthesis,
+  XDC pins, pack, place, route, timing, `.bit`) is a library function,
+  `helion_xilinx7::xdc_flow`, shared by the CLI example and the IDE. These
+  ran on the board, with LEDs or the display watched:
+  - PicoRV32 SoC at 50 MHz, with power-on reset.
+  - Ibex SoC at 38.89 MHz (Vivado's own Fmax for it), through an MMCM.
+  - 240 RAMB18 (86%) with initial contents, at 100 MHz, checked by signature.
+  - 192 DSP48E1 (87%, primitive version) at 100 MHz, checked by signature.
+  - One MMCM making 50, 125 and 25 MHz, with a checked clock-domain crossing.
+  - SSD1306 OLED (`examples/zedboard_oled.sv`), and the OLED demo
+    (`examples/zedboard_oled_demo.sv` and `.prj`: text and a moving ball),
+    built and flashed from the IDE.
+  - PS7 to fabric over M_AXI_GP0 (`examples/zedboard_ps7_axi.sv`):
+    `tools/zynq/ps7_axi_check.tcl` passes 15/15 on the board, with FCLK0
+    measured at 100.02 MHz.
+  The RAM and DSP fill builds that ran on the board predate later placer and
+  router changes. Those later builds pass `x7v` but have not been back on the
+  board.
+- **More board designs, partly checked.** VGA 640x480, Pmod loopback, HDMI
+  out (ADV7511) and audio out (ADAU1761) build with timing met and run their
+  logic on the board. The VGA picture, the HDMI picture and the audio tone
+  were not observed. `docs/zedboard/rung5-av.md` and
+  `docs/zedboard/rung5-summary.json` give the details.
+- **Zynq PS7 as a hard block** in pack, place, route and timing, with FCLK
+  periods. `x7v` treats the PS7 as the design boundary, with AXI3 masters in
+  co-simulation.
+- **`tools/x7v`: independent bitstream verification.** Using only the
+  Project X-Ray database, it checks a 7-series `.bit` end to end:
+  - packet sequence and CRCs, frame ECC, and a complete decode with no
+    unexplained bits;
+  - clock-network enable rules;
+  - netlist extraction and co-simulation against the RTL;
+  - block RAM, DSP48E1, LUT RAM and MMCM/PLL models;
+  - `--part` and `--board`, with an IDCODE check.
+  On eight Vivado ZedBoard bitstreams it finds 0 unexplained bits, and
+  decode then re-encode is bit-exact.
+- **Vivado-identical 7-series bitgen.** Frame ECC, `_SING` I/O tile aliasing
+  and CRC now match Vivado: re-assembling eight decoded Vivado ZedBoard
+  bitstreams gives byte-identical configuration streams. Builds are
+  deterministic across machines. Linux and macOS produce the same md5 on
+  openXC7/prjxray-db `0c3504f`, which is byte-identical to f4pga on every
+  board design.
+- **7-series implementation features:**
+  - Placement and routing: block RAM (RAMB18E1/RAMB36E1) and DSP48E1 on the
+    fabric with timing, a timing-driven slot placer, critical nets routed
+    first, and a PathFinder phase with a lookahead estimate behind the
+    rip-up router.
+  - Clocking: MMCM/PLL written as Vivado writes them, CMT clocks on
+    dedicated wires, and row clock buffers enabled across HCLK tiles.
+  - Logic: LUT RAM in SLICEMs, SRL16E/SRLC32E, CARRY4 chains.
+  - Tooling: `HELION_PLACE_SEED`; `zedbit --vivado=PREFIX`, which exports
+    the placed design as UNISIM Verilog plus a LOC'd XDC for a Vivado
+    timing cross-check.
+- **Board registry** (`boards/`): ZedBoard, Arty A7-35T, Basys3 and Nexys
+  A7-100T, with pins from Digilent's master XDCs. Any part in the X-Ray
+  database resolves by its full name. The three Artix boards are built and
+  checked by `x7v` (`tools/x7v/tests/boards.sh`) but not tested on hardware.
+- **SystemVerilog front end v2** (`helion-sv`). It has its own parser, a
+  real elaborator, word-level symbolic execution and a depth-optimal LUT6
+  cover. Unsupported constructs are errors with a line number. Ibex,
+  PicoRV32, SERV, SHA-256 and the IP library equal their RTL in
+  co-simulation. For 7-series it infers carry chains, block RAM, LUT RAM,
+  SRLs, synchronous resets on the flop's SR pin, and `*` as DSP48E1 (25x18
+  signed with A/B/M/P registers and accumulate; wider products are split).
+  The CLI and IDE use v2 first; `HELION_SV_FRONTEND=legacy` forces the old
+  front end.
+- **`tools/svcheck`**: Verilator co-simulation of Helion's netlist against
+  the RTL, with a corpus of small designs.
+- **`tools/qor`**: a standing ZedBoard QoR and runtime benchmark. It fails
+  on regressions against `baseline.json`, checks that blinky and PicoRV32
+  rebuild byte-identically, and reports ratios to Vivado.
+- **HL10T fabric:** general interconnect (every connection routed and
+  proven), four global clock lines with per-CLB select and both edges, real
+  asynchronous reset, pads on all four sides, and timing over the real
+  logic graph with timing-driven placement. Full Ibex places and routes on
+  HL10S-C64-1.
+- **UltraScale+ backend, experimental** (`helion-ultrascale`,
+  `helion-bitgen`):
+  - Parts: `helion impl --part xcku3p|xcvu3p|xczu3eg` packs, places and runs
+    STA on a preliminary, labelled timing model. On xczu3eg it also routes
+    over the real INT graph and writes a `.bit`.
+  - Bitstreams: blinky and small counters emit bitstreams that pass decode,
+    netlist extraction and co-simulation (`tools/us09v`).
+  - Data: device and bit-location data are vendored from prjuray-db (CC0)
+    and BitFiltrator (MIT). `helion-bitgen decode` turns a bitstream back
+    into FASM with CRC and band checks.
+  - Refusals: DSP48E2 and URAM288 refuse with a named error rather than
+    emit guessed bits.
+  - Not yet: no UltraScale+ bitstream has been loaded on hardware, and no
+    Vivado comparison (tier 2) has been run.
+- **Windows x86_64 zip** with `helion.exe`, `helion-ide.exe` and
+  `helion-prog.exe`, built by the release workflow. The `.exe` files are not
+  code-signed, and the first proof that they build and run is the Windows CI
+  job; no Windows machine has run them on a board. 7-series boards program
+  through `openFPGALoader.exe` with the cable bound to WinUSB by Zadig
+  (`README-WINDOWS.txt` in the zip).
+- **`helion hw program --part xc7...`** loads a 7-series `.bit` through
+  openFPGALoader with the board's `-b` and the SHUTDOWN preamble, as the IDE
+  does.
+- **`docs/xilinx-db.md`**: where Helion looks for the Project X-Ray
+  database (`HELION_XILINX_DB`, default `~/.cache/helion/prjxray-db`), the
+  files each part needs, and how to get it. 7-series parts appear in the IDE
+  only when the database is there; the part picker says so when it is not.
+- **`helion-update`**: the release check, download and install logic for
+  in-app updates, including SHA256SUMS verification and `.app` bundle swap.
+  The Rune IDE does not call it yet.
+
+### Changed
+
+- **The IDE builds and programs ZedBoard designs.**
+  - When the X-Ray zynq7 database is present, the IDE lists
+    `xc7z020clg484-1` and runs it through `xdc_flow`. The IDE's `.bit`
+    equals zedbit's, and the run fills utilization, timing, schematic and
+    the Zynq die view.
+  - Program Device sends 7-series bitstreams to openFPGALoader
+    (`-b zedboard`). An IDE-built blinky was loaded and ran on the board.
+  - Programming over the native FTDI engine is still not verified on a
+    board.
+- Reports that need an HL10 device model now say so for iCE40, ECP5 and
+  7-series parts instead of showing HL10T-C32-1 numbers.
+- A zynq7 database without the always-on `required_features.fasm` is an
+  error, and `x7v` fails a bitstream that lacks those features.
+- The macOS release job builds on `macos-latest`. libusb is linked
+  statically on macOS (as on Windows), so `Helion.app` and `helion-prog` no
+  longer need Homebrew's libusb; the release job fails if either links a
+  Homebrew dylib.
+- **Every offered part programs or stops with the exact reason.**
+  - An unknown or mistyped part in a project is refused before any stage,
+    with the reason and the parts Helion can implement; it is no longer
+    built on HL10T-C32-1. UltraScale+ parts say they are command-line only.
+    A missing HL10 device folder is named, with the path Helion searched.
+  - Before the native MPSSE engine sends Helion configuration, it reads the
+    TAP's IDCODE and refuses any device that is not the target part (a
+    Zynq, for example).
+  - iCE40 and ECP5 runs record their `.asc` / `.config` as the run's
+    bitstream. Program Device, the CLI and Tcl say Helion can't program
+    Lattice parts yet and give the `icepack`/`iceprog` or
+    `ecppack`/`openFPGALoader` commands to do it by hand.
+  - HL10 parts on a board cable, 7-series parts on the Simulation cable,
+    configuration memory on 7-series and Lattice parts, Tcl `program_hw` on
+    a 7-series part and `helion-prog` with a 7-series or Lattice part each
+    stop with a message naming what to use instead.
+  - The part picker labels each part: board-tested (ZedBoard), not
+    hardware-tested (Arty A7-35T, Basys 3, Nexys A7-100T), or no silicon
+    (HL10, Simulation cable only). Loading a non-ZedBoard 7-series part
+    warns that it is not hardware-tested.
+  - A Zynq design that uses the PS7 warns that Program Device loads the PL
+    only.
+
+### Fixed
+
+- Reloading the ZedBoard over JTAG left the previous design's flop values in
+  the fabric, so switching designs could start from garbage (the OLED
+  blanked until a power cycle). Program Device now sends the bitstream with
+  a SHUTDOWN preamble. The `.bit` on disk is unchanged.
+- After a 7-series run, the bitstream view said "No bitstream yet". It now
+  names the written `.bit` and links to the Hardware Manager.
+- A placement collision that left DSP-heavy designs unroutable; a missing
+  row clock buffer enable that broke block RAM on the board; CARRY4 sum and
+  carry-out bits not reaching fabric; DSP non-A inputs not routing.
+- Generate-for loops with a negative step.
+- Eight tests that failed on master at 4.0.
+
+### Known limitations
+
+- **The full ZedBoard fill does not route yet.** The rung 6 design (85% LUTs,
+  86% block RAM, 87% DSP) synthesizes, places and passes RTL simulation, but
+  routing does not converge (G77).
+- Helion uses about 1.6x to 5x the LUTs Vivado uses for the same RTL.
+  Helion's timing of its own routes has not been checked against Vivado.
+- UltraScale+: simulation and bit-diff only, no hardware, and the tier-2
+  Vivado comparison is still open. DSP48E2, URAM288 and I/O configuration
+  are blocked.
+- A variable with an initializer and no other driver reads 0 in hardware
+  instead of its initial value; the v2 front end only warns (G84, deferred
+  to after 4.5).
+- Only the ZedBoard has run a Helion bitstream. The Arty A7-35T, Basys 3
+  and Nexys A7-100T are verified up to the openFPGALoader command Helion
+  runs, not on hardware; iCE40 and ECP5 bitstreams are not tested on boards.
+- Programming over the native FTDI engine is not verified on a board.
+
+[4.5.0]: https://github.com/helion-fpga/helion/compare/v4.0.0...v4.5.0
 
 ## [4.0.0] — 2026-11-12
 
