@@ -13,7 +13,7 @@
   fm/ultra-bitgen-xtiming-impl at e4c7438e on origin (first impl commit
   64bb8b9c, follow-up commit e4c7438e). Merge commit a6a7bd14 merges
   origin/fm/ultra-bitgen-xtiming-impl into the lane branch.
-- Report commit: pending (this commit). Header commit: pending (states the
+- Report commit: cfa41a40. Header commit: pending (this commit, states the
   report commit, same two-commit pattern as N58 and STADIN).
 - Report copy: tools/xtiming/XTIMING_REPORT.md on the lane branch,
   byte-identical to this file.
