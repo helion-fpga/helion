@@ -244,7 +244,7 @@ pub fn sta_db_for_part(part: &str) -> Result<UltraScaleTimingDb, String> {
 
 /// Documented-only timing DB for xcku3p, speed grade -2 at 0.85V.
 ///
-/// Contains exactly one value: BRAM CLK to DOUT, 1460 ps, from DS922
+/// Contains exactly one value: BRAM CLK to DOUT, 1020 ps, from DS922
 /// Table 33 (Block RAM and FIFO Switching Characteristics), TRCKO_DO,
 /// -2 / 0.85V, Max. Every other field is UNKNOWN: DS922 publishes no
 /// LUT6, flip-flop, CARRY8, interconnect, DSP, URAM, or IOB pin-to-pin
@@ -252,16 +252,16 @@ pub fn sta_db_for_part(part: &str) -> Result<UltraScaleTimingDb, String> {
 /// Deliberately unusable for STA: [`crate::sta::sta_routed`] on this DB
 /// fails loud with `timing: LUT6 delay UNKNOWN in TimingDb`.
 pub fn documented_xcku3p() -> UltraScaleTimingDb {
-    documented_db("xcku3p", 1460, "DS922 Table 33 TRCKO_DO, -2 0.85V")
+    documented_db("xcku3p", 1020, "DS922 Table 33 TRCKO_DO, -2 0.85V")
 }
 
 /// Documented-only timing DB for xcvu3p, speed grade -2 at 0.85V.
 ///
 /// Same single value as [`documented_xcku3p`], from DS923 Table 33
 /// (Block RAM and FIFO Switching Characteristics), TRCKO_DO, -2 / 0.85V,
-/// Max: 1460 ps. All other fields UNKNOWN, for the same reasons.
+/// Max: 1020 ps. All other fields UNKNOWN, for the same reasons.
 pub fn documented_xcvu3p() -> UltraScaleTimingDb {
-    documented_db("xcvu3p", 1460, "DS923 Table 33 TRCKO_DO, -2 0.85V")
+    documented_db("xcvu3p", 1020, "DS923 Table 33 TRCKO_DO, -2 0.85V")
 }
 
 /// Documented-only timing DB for xczu3eg, speed grade -2 at 0.85V.
