@@ -74,6 +74,15 @@ pub trait DeviceQuery {
     }
     /// Grid coordinates of a tile (for distance estimates).
     fn tile_xy(&self, tile: &str) -> Option<(i32, i32)>;
+    /// `(tile, site)` of the site named `site`, if the part has it.
+    fn site_tile(&self, _site: &str) -> Option<(String, String)> {
+        None
+    }
+    /// The INT tile a hard-block pin reaches (a `PS7` pin sits on one of
+    /// the INT tiles beside the PS, see [`crate::ps7::int_wire`]).
+    fn hard_pin_tile(&self, _site: &str, _pin: &str, _output: bool) -> Option<String> {
+        None
+    }
     /// A free SLICEL/SLICEM site near `(x, y)`; `used` holds taken site names.
     fn slice_near(&self, x: i32, y: i32, used: &HashSet<String>) -> Option<(String, String)>;
     /// A free `SLICEM` site near `(x, y)` (required for `SRL16E` / `SRLC32E`).
@@ -335,6 +344,14 @@ pub struct PlacedXadc {
     pub site: String,
 }
 
+/// A placed `PS7`.
+#[derive(Clone, Debug)]
+pub struct PlacedPs7 {
+    pub name: String,
+    pub tile: String,
+    pub site: String,
+}
+
 /// A placed 7-Series configuration primitive (`BSCANE2`, `ICAPE2`, `DNA_PORT`, `FRAME_ECCE2`, `STARTUPE2`, `USR_ACCESSE2`, `CAPTUREE2`).
 #[derive(Clone, Debug)]
 pub struct PlacedCfgPrim {
@@ -368,6 +385,7 @@ pub struct Placed7 {
     pub pcies: Vec<PlacedPcie>,
     pub xadcs: Vec<PlacedXadc>,
     pub cfg_prims: Vec<PlacedCfgPrim>,
+    pub ps7s: Vec<PlacedPs7>,
     /// Routed tie-offs of block RAM and DSP inputs held at 0:
     /// `(net, site, site pin, is_driver)`, see [`crate::bram::tie0_endpoints`].
     pub tie_eps: Vec<(String, String, String, bool)>,
@@ -835,6 +853,13 @@ pub fn place_with_pools(
             tile: "CFG_CENTER_MID_X51Y76".to_string(),
             site: "XADC_X0Y0".to_string(),
         });
+    }
+    for (i, ps7) in packed.ps7s.iter().enumerate() {
+        if i >= 1 {
+            return Err(format!("place: a Zynq has one PS7; {} is a second", ps7.name));
+        }
+        let (tile, site) = device.site_tile(crate::ps7::SITE).ok_or_else(|| format!("place: PS7 {}: this part has no {} site", ps7.name, crate::ps7::SITE))?;
+        out.ps7s.push(PlacedPs7 { name: ps7.name.clone(), tile, site });
     }
     for cfg in &packed.cfg_prims {
         let site = match cfg.kind {

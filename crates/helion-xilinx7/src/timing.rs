@@ -365,12 +365,8 @@ pub fn analyze_clocks_async(
     period_of: &dyn Fn(&str) -> Option<u32>,
     is_async: &dyn Fn(&str, &str) -> bool,
 ) -> Result<Analysis, String> {
-    let mut domains: Vec<&str> = routed.placed.packed.ffs.iter().map(|f| f.clk_net.as_str()).chain(routed.placed.packed.lutrams.iter().map(|r| r.clk.as_str())).collect();
-    domains.sort();
-    domains.dedup();
-    if domains.len() > 1 {
-        check_no_crossings(&routed.placed.packed, is_async)?;
-    }
+    let domains = clock_domains(&routed.placed.packed)?;
+    check_no_crossings(&routed.placed.packed, is_async)?;
     let mut worst: Option<Analysis> = None;
     let (mut endpoints, mut failing) = (0usize, 0usize);
     let mut clocks = Vec::new();
@@ -395,11 +391,47 @@ pub fn analyze_clocks_async(
     Ok(w)
 }
 
-/// Every flop input's combinational fan-in reaches flops of its own clock
-/// only.
+/// Clock nets that end timing paths, each analysed as a domain: those of
+/// flops, LUT RAMs, block RAM ports, DSPs and clocked PS7 inputs. A hard
+/// block on a clock no flop shares still has its inputs timed.
+pub fn clock_domains(packed: &crate::pack::Packed7) -> Result<Vec<&str>, String> {
+    let mut d: Vec<&str> = packed
+        .ffs
+        .iter()
+        .map(|f| f.clk_net.as_str())
+        .chain(packed.lutrams.iter().map(|r| r.clk.as_str()))
+        .chain(packed.brams.iter().flat_map(|b| [b.clka_net.as_deref(), b.clkb_net.as_deref()]).flatten())
+        .chain(packed.dsps.iter().filter_map(|x| x.clk_net.as_deref()))
+        .collect();
+    for p in &packed.ps7s {
+        d.extend(crate::ps7::timing_ends(p)?.1.into_iter().map(|c| c.1));
+    }
+    d.sort();
+    d.dedup();
+    Ok(d)
+}
+
+/// Every flop input's and clocked PS7 input's combinational fan-in reaches
+/// flops and clocked PS7 outputs of its own clock only.
 fn check_no_crossings(packed: &crate::pack::Packed7, is_async: &dyn Fn(&str, &str) -> bool) -> Result<(), String> {
     let lut_by_out: HashMap<&str, &crate::pack::PackedLut> = packed.luts.iter().map(|l| (l.output_net.as_str(), l)).collect();
-    let ff_by_q: HashMap<&str, &crate::pack::PackedFf> = packed.ffs.iter().map(|f| (f.q_net.as_str(), f)).collect();
+    // Clock of each net a clock launches: flop outputs and clocked PS7 outputs.
+    let mut ff_by_q: HashMap<&str, &str> = packed.ffs.iter().map(|f| (f.q_net.as_str(), f.clk_net.as_str())).collect();
+    // (what, clock, nets ending there, the first is a flop's D)
+    let mut ends: Vec<(String, &str, Vec<&str>, bool)> = Vec::new();
+    for ff in &packed.ffs {
+        let mut ins: Vec<&str> = vec![ff.d_net.as_str()];
+        ins.extend(ff.ce_net.iter().map(|s| s.as_str()));
+        if !ff.sr_async {
+            ins.extend(ff.sr_net.iter().map(|s| s.as_str()));
+        }
+        ends.push((format!("flop {}", ff.name), ff.clk_net.as_str(), ins, true));
+    }
+    for p in &packed.ps7s {
+        let (launch, capture) = crate::ps7::timing_ends(p)?;
+        ff_by_q.extend(launch.into_iter().map(|(net, clk, _, _)| (net, clk)));
+        ends.extend(capture.into_iter().map(|(net, clk, _, pin)| (format!("PS7 input {}.{pin}", p.name), clk, vec![net], false)));
+    }
     let mut carry_ins: HashMap<&str, Vec<&str>> = HashMap::new();
     for c in &packed.carries {
         let mut ins: Vec<&str> = c.s_nets.iter().chain(c.di_nets.iter()).flatten().map(|n| n.as_str()).collect();
@@ -410,13 +442,13 @@ fn check_no_crossings(packed: &crate::pack::Packed7, is_async: &dyn Fn(&str, &st
             carry_ins.insert(o.as_str(), ins.clone());
         }
     }
-    // Clock of the flops that launch into each net (memoized walk).
+    // Clocks that launch into each net (memoized walk).
     let mut memo: HashMap<&str, Vec<&str>> = HashMap::new();
     fn launches<'a>(
         net: &'a str,
         memo: &mut HashMap<&'a str, Vec<&'a str>>,
         lut_by_out: &HashMap<&'a str, &'a crate::pack::PackedLut>,
-        ff_by_q: &HashMap<&'a str, &'a crate::pack::PackedFf>,
+        ff_by_q: &HashMap<&'a str, &'a str>,
         carry_ins: &HashMap<&'a str, Vec<&'a str>>,
         depth: usize,
     ) -> Vec<&'a str> {
@@ -424,8 +456,8 @@ fn check_no_crossings(packed: &crate::pack::Packed7, is_async: &dyn Fn(&str, &st
             return v.clone();
         }
         memo.insert(net, Vec::new()); // a loop is reported by the timing pass
-        let mut out: Vec<&str> = if let Some(f) = ff_by_q.get(net) {
-            vec![f.clk_net.as_str()]
+        let mut out: Vec<&str> = if let Some(clk) = ff_by_q.get(net) {
+            vec![*clk]
         } else if depth > 10_000 {
             Vec::new()
         } else {
@@ -445,22 +477,16 @@ fn check_no_crossings(packed: &crate::pack::Packed7, is_async: &dyn Fn(&str, &st
         memo.insert(net, out.clone());
         out
     }
-    for ff in &packed.ffs {
-        let mut ins: Vec<&str> = vec![ff.d_net.as_str()];
-        ins.extend(ff.ce_net.iter().map(|s| s.as_str()));
-        if !ff.sr_async {
-            ins.extend(ff.sr_net.iter().map(|s| s.as_str()));
-        }
-        for (k, i) in ins.into_iter().enumerate() {
-            // A declared-asynchronous crossing straight from a flop into D.
-            if k == 0 && ff_by_q.get(i).is_some_and(|src| is_async(&src.clk_net, &ff.clk_net)) {
+    for (what, clk, ins, d_first) in &ends {
+        for (k, i) in ins.iter().enumerate() {
+            // A declared-asynchronous crossing straight from a launch into a flop's D.
+            if k == 0 && *d_first && ff_by_q.get(i).is_some_and(|src| is_async(src, clk)) {
                 continue;
             }
             for c in launches(i, &mut memo, &lut_by_out, &ff_by_q, &carry_ins, 0) {
-                if c != ff.clk_net {
+                if c != *clk {
                     return Err(format!(
-                        "timing: data path from clock `{c}` into flop {} on clock `{}`; paths between clock domains are not supported",
-                        ff.name, ff.clk_net
+                        "timing: data path from clock `{c}` into {what} on clock `{clk}`; paths between clock domains are not supported"
                     ));
                 }
             }
@@ -531,7 +557,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         lut_letter: &HashMap<&'a str, char>,
         route: &dyn Fn(&str, &str, &str, bool) -> u32,
         bram_out: &HashMap<&'a str, &'a str>,
-        dsp_out: &HashMap<&'a str, (&'a str, u32)>,
+        dsp_out: &HashMap<&'a str, (String, u32)>,
         xy_of: &HashMap<&'a str, (i32, i32)>,
         lr: &HashMap<&'a str, crate::lutram::ReadArc<'a>>,
     ) -> Result<(u32, Vec<PathStep>), String> {
@@ -541,9 +567,9 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         if depth > 10_000 || !visiting.insert(net.to_string()) {
             return Err(format!("timing: combinational loop through net `{net}`"));
         }
-        let r = if let Some((dn, cko)) = dsp_out.get(net) {
-            // P (or another CLK-launched DSP output) starts a path here.
-            (*cko, vec![PathStep { what: format!("{dn} (DSP48E1 output)"), arrival_ps: *cko, wire_ps: 0, xy: None }])
+        let r = if let Some((what, cko)) = dsp_out.get(net) {
+            // P (or another clock-launched DSP or PS7 output) starts a path here.
+            (*cko, vec![PathStep { what: what.clone(), arrival_ps: *cko, wire_ps: 0, xy: None }])
         } else if let Some(b) = bram_out.get(net) {
             (BRAM_CKO_PS, vec![PathStep { what: format!("{b} (block RAM DO)"), arrival_ps: BRAM_CKO_PS, wire_ps: 0, xy: None }])
         } else if let Some(r) = lr.get(net) {
@@ -663,8 +689,8 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
     // the design looked faster than it is. P is launched by CLK with the
     // device's own pipeline-depth-dependent delay; a clocked data/control input
     // is a setup endpoint.
-    let mut dsp_out: HashMap<&str, (&str, u32)> = HashMap::new();
-    let mut dsp_in: Vec<(&str, &str, String, u32)> = Vec::new(); // (net, site, pin, setup)
+    let mut dsp_out: HashMap<&str, (String, u32)> = HashMap::new();
+    let mut dsp_in: Vec<(&str, &str, String, u32, &str)> = Vec::new(); // (net, site, pin, setup, block)
     let dsp_clk_by_name: HashMap<&str, Option<&str>> = packed
         .dsps
         .iter()
@@ -681,13 +707,26 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             if *is_out {
                 // P, PCOUT, CARRYOUT, ... all launch from CLK.
                 if pin.starts_with('P') || pin.starts_with("CARRYOUT") {
-                    dsp_out.insert(net.as_str(), (d.name.as_str(), cko));
+                    dsp_out.insert(net.as_str(), (format!("{} (DSP48E1 output)", d.name), cko));
                 }
             } else if on_this_clock {
                 if let Some(setup) = dsp_setup_ps(pin) {
-                    dsp_in.push((net.as_str(), pd.site.as_str(), pin.clone(), setup));
+                    dsp_in.push((net.as_str(), pd.site.as_str(), pin.clone(), setup, "DSP48E1"));
                 }
             }
+        }
+    }
+    // PS7 clocked ports (the AXI interfaces and the like), slow corner from
+    // X-Ray's PSS2.sdf: an output launches at its clock-to-out, an input on
+    // this clock ends a path at its setup.
+    for p in &packed.ps7s {
+        let Some(pp) = placed.ps7s.iter().find(|q| q.name == p.name) else { continue };
+        let (launch, capture) = crate::ps7::timing_ends(p)?;
+        for (net, clk, ps, pin) in launch {
+            dsp_out.insert(net, (format!("{}.{pin} (PS7 output, clock {clk})", p.name), ps));
+        }
+        for (net, _, ps, pin) in capture.into_iter().filter(|c| c.1 == domain) {
+            dsp_in.push((net, pp.site.as_str(), pin.to_string(), ps, "PS7"));
         }
     }
     let lr = crate::lutram::read_arcs(placed);
@@ -770,7 +809,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             worst_path = p;
         }
     }
-    for (net, site, pin, setup) in &dsp_in {
+    for (net, site, pin, setup, block) in &dsp_in {
         let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &bram_out, &dsp_out, &xy_of, &lr)?;
         if p.is_empty() {
             continue;
@@ -783,7 +822,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         }
         if slack < wns {
             wns = slack;
-            p.push(PathStep { what: format!("{site}.{pin} (DSP48E1 input)"), arrival_ps: t, wire_ps: t - a, xy: None });
+            p.push(PathStep { what: format!("{site}.{pin} ({block} input)"), arrival_ps: t, wire_ps: t - a, xy: None });
             worst_path = p;
         }
     }
@@ -921,5 +960,45 @@ mod tests {
         let err = report_timing(&routed, &tm, 10_000).expect_err("cycle must fail");
         assert!(err.contains("cycle"), "{err}");
         let _ = &mut packed;
+    }
+
+    /// A PS7 port clock no flop shares is still a domain: its input is
+    /// timed. A path between it and a flop on another clock is refused.
+    #[test]
+    fn ps7_ends_are_timed_and_crossings_refused() {
+        let ff = |name: &str, d: &str, q: &str| crate::pack::PackedFf {
+            name: name.into(),
+            d_net: d.into(),
+            q_net: q.into(),
+            clk_net: "clk_b".into(),
+            ce_net: None,
+            sr_net: None,
+            init: false,
+            srval: false,
+            sr_async: false,
+        };
+        let mut routed = Routed7::default();
+        routed.placed.packed.ps7s.push(crate::ps7::PackedPs7 {
+            name: "ps7".into(),
+            pins: vec![("MAXIGP0ACLK".into(), "clk_a".into(), false), ("MAXIGP0ARADDR0".into(), "a0".into(), true), ("MAXIGP0RDATA0".into(), "r0".into(), false)],
+            ties: Vec::new(),
+        });
+        routed.placed.ps7s.push(crate::place::PlacedPs7 { name: "ps7".into(), tile: "PSS2_X32Y105".into(), site: "PS7_X0Y0".into() });
+        routed.placed.packed.luts.push(crate::pack::PackedLut { name: "l".into(), init: 2, input_nets: [Some("a0".into()), None, None, None, None, None], output_net: "r0".into() });
+        routed.load_delays.insert(("r0".into(), "PS7_X0Y0".into(), "MAXIGP0RDATA0".into()), 2000);
+        let period = |c: &str| (c == "clk_a").then_some(10_000);
+        let a = analyze_clocks(&routed, &period).unwrap();
+        // ARADDR clock-to-out 1438 + LUT input wire (unknown) + LUT + 2000 to RDATA (setup 550).
+        let t = 1438 + UNKNOWN_ROUTE_PS + LUT_PS + 2000;
+        assert_eq!((a.endpoints, a.wns_ps), (1, 10_000 - 550 - MARGIN_PS as i64 - t as i64), "{:?}", a.worst_path);
+        let mut into_ff = routed.clone();
+        into_ff.placed.packed.ffs.push(ff("f", "r0", "q"));
+        let e = analyze_clocks(&into_ff, &|_| Some(10_000)).unwrap_err();
+        assert!(e.contains("from clock `clk_a` into flop f on clock `clk_b`"), "{e}");
+        let mut into_ps7 = routed;
+        into_ps7.placed.packed.luts[0].input_nets[0] = Some("q".into());
+        into_ps7.placed.packed.ffs.push(ff("f", "d", "q"));
+        let e = analyze_clocks(&into_ps7, &|_| Some(10_000)).unwrap_err();
+        assert!(e.contains("from clock `clk_b` into PS7 input ps7.MAXIGP0RDATA0 on clock `clk_a`"), "{e}");
     }
 }

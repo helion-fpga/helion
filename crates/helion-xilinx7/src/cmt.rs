@@ -285,24 +285,8 @@ fn tie_clock_low(
             device.tile_by_name(t).and_then(|i| device.tile_type_name(i)).is_some_and(|ty| ty == "INT_L" || ty == "INT_R")
         });
         if let Some((it, iw)) = int {
-            let ii = device.tile_by_name(&it).ok_or_else(|| err("no INT tile"))?;
-            let ty = device.tile_type_name(ii).unwrap_or("").to_string();
-            let has = |f: &str| device.segbits(&ty, &format!("{ty}.{f}")).is_some();
-            let free = |w: &str| !routed.contains(&(it.clone(), w.to_string()));
-            let mut ks: Vec<u32> = vec![5];
-            ks.extend((0..8).filter(|k| *k != 5));
-            for k in ks {
-                for g in [1, 0] {
-                    let (b, a) = (format!("FAN_BOUNCE{k}"), format!("FAN_ALT{k}"));
-                    if has(&format!("{iw}.{b}")) && has(&format!("{a}.GFAN{g}")) && free(&iw) && free(&b) && free(&a) {
-                        path.push(format!("{it}.{iw}.{b}"));
-                        path.push(format!("{it}.{a}.GFAN{g}"));
-                        path.push(format!("{it}.GFAN{g}.GND_WIRE"));
-                        return Ok(path);
-                    }
-                }
-            }
-            return Err(err(&format!("no free FAN_BOUNCE/GFAN path in {it} for {iw}")));
+            path.extend(crate::bram::ground_via_fan(device, routed, &it, &iw).ok_or_else(|| err(&format!("no free FAN_BOUNCE/GFAN path in {it} for {iw}")))?);
+            return Ok(path);
         }
         let ti = device.tile_by_name(&tile).ok_or_else(|| err("no tile"))?;
         let ty = device.tile_type_name(ti).unwrap_or("").to_string();

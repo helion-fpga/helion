@@ -3,10 +3,12 @@
 Checks, in order (each independent, all reported):
   packets   configuration command sequence equals Vivado's (CRC handling aside)
   ecc       every frame's ECC matches its contents
-  decode    every set bit is explained by an X-Ray feature (no unknown bits)
+  decode    every set bit is explained by an X-Ray feature (no unknown bits), and the
+            database's always-on (required) features are all set
   clocks    clock-network enable rules (clockcheck.py)
   extract   netlist extraction found no undriven/multiply-driven/unmodelled logic
   cosim     extracted netlist equals the RTL, cycle by cycle, on random stimulus
+  axi       (PS7 designs) the AXI masters' traffic completed, held its responses and read back what it wrote
   io        I/O configuration equals the golden (Vivado) build's, tile by tile
 """
 from __future__ import annotations
@@ -15,7 +17,7 @@ import json
 import os
 from dataclasses import asdict, dataclass, field
 
-from . import bit, bram, clockcheck, cosim, decode, dsp, netlist
+from . import bit, bram, clockcheck, cosim, decode, dsp, netlist, ps7
 from .db import Db
 
 VIVADO_COMMANDS = ["NULL", "RCRC", "SWITCH", "WCFG", "GRESTORE", "LFRM", "START", "DESYNC"]
@@ -82,9 +84,15 @@ def verify(db: Db, design: str, bitfile: str, rtl: list[str] | None = None, top:
                             [f"FAR {far:#010x} stored {s:#06x} expected {c:#06x}" for far, (s, c) in list(dec.ecc_mismatch.items())[:20]]))
     unk = dec.unknown()
     n_unk = sum(len(v) for v in unk.values())
-    rep.checks.append(Check("decode", n_unk == 0 and not dec.orphan_bits,
-                            f"{len(dec.fasm())} features, {n_unk} unexplained bits, {len(dec.orphan_bits)} orphan bits",
-                            [f"{t}: {v[:8]}" for t, v in unk.items()]))
+    # G81: the database's always-on features must be set; a zynq7 database without them is incomplete.
+    req = db.required_features
+    missing = sorted(set(req) - set(dec.fasm()))
+    if not req and os.path.basename(os.path.normpath(db.root)) == "zynq7":
+        missing = [f"(none known: no required_features.fasm for {db.package} or its fabric in {db.root})"]
+    rep.checks.append(Check("decode", n_unk == 0 and not dec.orphan_bits and not missing,
+                            f"{len(dec.fasm())} features, {n_unk} unexplained bits, {len(dec.orphan_bits)} orphan bits, "
+                            f"{len(missing)} required features missing",
+                            [f"{t}: {v[:8]}" for t, v in unk.items()] + [f"required feature not set: {f}" for f in missing]))
 
     cr = clockcheck.check(db, dec)
     rep.checks.append(Check("clocks", not cr.errors, f"{len(cr.errors)} rule violations, {len(cr.extra)} unexplained enables",
@@ -93,8 +101,11 @@ def verify(db: Db, design: str, bitfile: str, rtl: list[str] | None = None, top:
     nl = netlist.extract(db, dec)
     halves = sum(h.in_use for hs in bram.tile_halves(dec).values() for h in hs.values())
     dsps = sum(len(ds) for ds in dsp.tile_dsps(dec).values())
+    pads = lambda ps: sorted(p for p in ps if not p.startswith("PS7_"))
+    n_ps = sum(p.startswith("PS7_") for p in [*nl.ports_in, *nl.ports_out])
     rep.checks.append(Check("extract", not nl.errors,
-                            f"{len(nl.regs)} flops, {halves} RAMB18 halves ({halves / 2:g} RAMB36), {dsps} DSP48E1, in {sorted(nl.ports_in)}, out {sorted(nl.ports_out)}, {len(nl.errors)} errors",
+                            f"{len(nl.regs)} flops, {halves} RAMB18 halves ({halves / 2:g} RAMB36), {dsps} DSP48E1, in {pads(nl.ports_in)}, out {pads(nl.ports_out)}"
+                            + (f", PS7 boundary {n_ps} pins" if n_ps else "") + f", {len(nl.errors)} errors",
                             nl.errors))
 
     if rtl and top and xdc:
@@ -103,7 +114,9 @@ def verify(db: Db, design: str, bitfile: str, rtl: list[str] | None = None, top:
         nv = os.path.join(wd, "netlist.v")
         open(nv, "w").write(netlist.to_verilog(nl))
         try:
-            r = cosim.run(wd, rtl, top, xdc, nv, set(nl.ports_in), set(nl.ports_out), cycles=cycles, seed=seed)
+            # Only a bitstream with a PS7 boundary co-simulates one; any other takes the plain path.
+            r = cosim.run(wd, rtl, top, xdc, nv, set(nl.ports_in), set(nl.ports_out), cycles=cycles, seed=seed,
+                          ps7_ports=ps7.ports(db) if n_ps else None)
             items = [f"cycle {k}: {b} rtl={x} bitstream={y}" for k, b, x, y in r.mismatches[:20]]
             items += [f"output {b} has no pad in the bitstream" for b in r.unmapped_outputs]
             # An input with no pad is one the design never reads (the RTL
@@ -111,8 +124,14 @@ def verify(db: Db, design: str, bitfile: str, rtl: list[str] | None = None, top:
             # up as output mismatches): reported, not a failure.
             items += [f"note: input {b} is unused (no pad in the bitstream)" for b in r.unmapped_inputs]
             rep.checks.append(Check("cosim", r.ok,
-                                    f"{r.compared} output samples over {cycles} cycles, {len(r.mismatches)} mismatches, "
+                                    f"{r.compared} output samples"
+                                    + (f" ({r.tie_checked} of them unconnected PS7 inputs, which must read 0)" if r.tie_checked else "")
+                                    + f" over {cycles} cycles, {len(r.mismatches)} mismatches, "
                                     f"{r.net_unknown} X/Z from bitstream, {r.rtl_unknown} RTL don't-care", items))
+            if r.axi:
+                bad = r.axi_errors + ps7.axi_problems(r.axi)
+                rep.checks.append(Check("axi", not bad, "; ".join(l for l in r.axi if l.startswith("axi ")),
+                                        bad + [l for l in r.axi if not l.startswith("axi ")]))
         except Exception as e:  # simulator failures are reported, not hidden
             rep.checks.append(Check("cosim", False, f"simulation failed: {str(e)[:300]}"))
 

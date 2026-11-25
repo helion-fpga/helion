@@ -226,6 +226,28 @@ fn required_features_text(family: &Path, fabric: &Path, partdir: &Path) -> Optio
         .find_map(|(name, _)| std::fs::read_to_string(family.join(name).join("required_features.fasm")).ok())
 }
 
+/// The part's static always-on features (G81). A zynq7 part with no file
+/// for its fabric is an error: the database ships one for every zynq7 die
+/// (as xc7z020clg400-1's), and a bitstream without its always-on
+/// `CFG_CENTER_MID` bits differs from the board-proven one. The artix7
+/// database ships none, so there it is a warning.
+fn required_features(family: &Path, fabric: &Path, partdir: &Path) -> Result<Vec<String>, String> {
+    let Some(text) = required_features_text(family, fabric, partdir) else {
+        let missing = partdir.join("required_features.fasm");
+        if family.file_name().is_some_and(|f| f == "zynq7") {
+            return Err(format!(
+                "device: {} not found, nor one for any part on fabric {}: the bitstream would lack the always-on \
+                 configuration bits (CFG_CENTER_MID ALWAYS_ON_PROP*); the database is incomplete",
+                missing.display(),
+                fabric.display()
+            ));
+        }
+        eprintln!("device: warning: no {} (nor for its fabric), always-on configuration bits will not be emitted", missing.display());
+        return Ok(Vec::new());
+    };
+    Ok(text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(str::to_string).collect())
+}
+
 impl Device {
     /// Load the full `xc7a35t` device model from the raw X-Ray DB.
     ///
@@ -272,24 +294,7 @@ impl Device {
         let part = load_part(&partdir.join("part.json"))?;
         let pins_text = read_text(&partdir.join("package_pins.csv"))?;
         let pins = parse_package_pins(&pins_text)?;
-        // The part's static always-on features. A missing file warns
-        // rather than errors: plenty of part directories ship without
-        // one, but then the bitstream quietly omits mandatory bits.
-        let required = match required_features_text(family, fabric, partdir) {
-            Some(text) => text
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .map(str::to_string)
-                .collect(),
-            None => {
-                eprintln!(
-                    "device: warning: no required_features.fasm for this part or its fabric, \
-                     always-on configuration bits will not be emitted"
-                );
-                Vec::new()
-            }
-        };
+        let required = required_features(family, fabric, partdir)?;
 
         let mut dev = Self {
             tiles: Vec::new(),
@@ -1513,6 +1518,30 @@ mod tests {
         assert_eq!(got("fb", "b-clg400").as_deref(), Some("CFG_B.ALWAYS_ON\n"));
         assert_eq!(got("fc", "c-clg484"), None);
         std::fs::remove_dir_all(&fam).unwrap();
+    }
+
+    /// G81: a zynq7 part whose fabric has no `required_features.fasm` is
+    /// refused, naming the file; a die that has one gives its lines; artix7
+    /// (none in the database) still loads without them.
+    #[test]
+    fn a_zynq7_part_without_required_features_is_an_error() {
+        let root = std::env::temp_dir().join(format!("helion_reqfeat_g81_{}", std::process::id()));
+        for fam in ["zynq7", "artix7"] {
+            let f = root.join(fam);
+            std::fs::create_dir_all(f.join("mapping")).unwrap();
+            std::fs::write(f.join("mapping/parts.yaml"), "z-clg484:\n  device: z\nz-clg400:\n  device: z\n").unwrap();
+            std::fs::write(f.join("mapping/devices.yaml"), "z:\n  fabric: fz\n").unwrap();
+            std::fs::create_dir_all(f.join("z-clg484")).unwrap();
+            std::fs::create_dir_all(f.join("z-clg400")).unwrap();
+        }
+        let z = root.join("zynq7");
+        let e = required_features(&z, &z.join("fz"), &z.join("z-clg484")).unwrap_err();
+        assert!(e.contains("z-clg484/required_features.fasm not found") && e.contains("ALWAYS_ON"), "{e}");
+        let a = root.join("artix7");
+        assert_eq!(required_features(&a, &a.join("fz"), &a.join("z-clg484")), Ok(Vec::new()));
+        std::fs::write(z.join("z-clg400/required_features.fasm"), "# c\nCFG_Z.ALWAYS_ON_PROP1\n\n").unwrap();
+        assert_eq!(required_features(&z, &z.join("fz"), &z.join("z-clg484")), Ok(vec!["CFG_Z.ALWAYS_ON_PROP1".to_string()]));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

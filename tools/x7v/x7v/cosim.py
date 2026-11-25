@@ -36,6 +36,10 @@ def parse_xdc(path: str) -> tuple[dict[str, str], set[str]]:
                 pins[_norm(n)] = m.group(1)
         if line.startswith("create_clock") and names:
             clocks.update(_norm(n) for n in names)
+        if line.startswith("create_clock"):
+            # A clock on an instance pin (the PS7's FCLK): "ps7/FCLKCLK[0]" -> "ps7.FCLKCLK[0]".
+            for m in re.finditer(r"get_pins\s+(?:\{([^}]*)\}|(\S+)\])", line):
+                clocks.update(n.replace("/", ".") for n in (m.group(1) or m.group(2)).split())
     return pins, clocks
 
 
@@ -108,14 +112,16 @@ NO_RESET_SETTLE = 64
 RESET_AT: tuple[int, int] | None = None
 
 
-def make_stimulus(bits: list[str], cycles: int, seed: int, hold: dict[str, float] | None = None) -> list[str]:
+def make_stimulus(bits: list[str], cycles: int, seed: int, hold: dict[str, float] | None = None,
+                  active_low: list[str] = ()) -> list[str]:
     """Random walk: each input bit flips with a per-bit probability per cycle.
     The first 4 cycles hold all zeros, then any reset-like input is pulsed
-    high for 3 cycles so designs start from a defined state."""
+    high for 3 cycles so designs start from a defined state. `active_low`
+    bits (the PS7's FCLKRESETN) all follow one reset, inverted."""
     rng = random.Random(seed)
     cur = {b: 0 for b in bits}
     out = []
-    resets = [b for b in bits if re.search(r"(^|_)(rst|reset|btnc|clr)", b, re.I)]
+    resets = [b for b in bits if re.search(r"(^|_)(rst|reset|btnc|clr)", b, re.I)] + list(active_low[:1])
     for k in range(cycles):
         if k >= 4:
             for b in bits:
@@ -135,7 +141,8 @@ def make_stimulus(bits: list[str], cycles: int, seed: int, hold: dict[str, float
                 cur[b] = int(RESET_AT[0] <= k < RESET_AT[0] + RESET_AT[1])
         # A design with no data inputs still gets one placeholder column so
         # every stimulus line is non-empty (VHDL READ rejects empty lines).
-        out.append("".join(str(cur[b]) for b in bits) or "0")
+        low = {b: 1 - cur[active_low[0]] for b in active_low}
+        out.append("".join(str(low.get(b, cur[b])) for b in bits) or "0")
     return out
 
 
@@ -278,12 +285,14 @@ def rtl_verilog_tb(top: str, ports: list["Port"], clock: str | None, in_bits: li
             decl.append(f"wire {w}{p.name};")
         conn.append(f".{p.name}({p.name})")
     n = max(1, len(in_bits))
+    # A pin of an instance (the PS7 stub's "ps7.FCLKCLK[0]") is reached through the top.
+    ref = lambda b: f"dut.{b}" if "." in b else b
     for i, b in enumerate(in_bits):
-        drive.append(f"    {b} = vec[{n - 1 - i}];")
+        drive.append(f"    {ref(b)} = vec[{n - 1 - i}];")
     for b in out_bits:
-        sample.append(f'    $fwrite(fo, "%s", bitc({b}));')
-    clk_lo = f"    {clock} = 1'b0;" if clock else ""
-    clk_hi = f"    {clock} = 1'b1;" if clock else ""
+        sample.append(f'    $fwrite(fo, "%s", bitc({ref(b)}));')
+    clk_lo = f"    {ref(clock)} = 1'b0;" if clock else ""
+    clk_hi = f"    {ref(clock)} = 1'b1;" if clock else ""
     return f"""`timescale 1ns/1ps
 module tb_rtl;
 {chr(10).join(decl)}
@@ -359,22 +368,44 @@ class CosimResult:
     unmapped_outputs: list[str] = field(default_factory=list)
     unmapped_inputs: list[str] = field(default_factory=list)
     log: str = ""
+    tie_checked: int = 0                                   # of `compared`: unconnected PS7 inputs
+    axi: list[str] = field(default_factory=list)          # AXI master summary (PS7 designs)
+    axi_errors: list[str] = field(default_factory=list)   # its readback and protocol errors
 
     @property
     def ok(self) -> bool:
         return not self.mismatches and not self.unmapped_outputs and self.compared > 0
 
 
+# Registers the PS7's AXI masters must read back as written, {address: bit
+# mask} (`verify --axi-rw`).
+AXI_RW: dict[int, int] = {}
+
+
 def run(workdir: str, rtl_files: list[str], top: str, xdc: str, netlist_v: str,
-        ports_in: set[str], ports_out: set[str], cycles: int = 2000, seed: int = 1) -> CosimResult:
+        ports_in: set[str], ports_out: set[str], cycles: int = 2000, seed: int = 1,
+        ps7_ports: list | None = None) -> CosimResult:
+    from . import ps7
     os.makedirs(workdir, exist_ok=True)
     pin_of, clocks = parse_xdc(xdc)
     ports = sv_ports(rtl_files, top) if is_verilog(rtl_files) else vhdl_ports(rtl_files, top)
-    clock = next((p.name for p in ports if p.name in clocks), None)
+    # A PS7 in the RTL is the design's edge: its outputs are inputs here, its inputs outputs.
+    ps = ps7.boundary(rtl_files, top, ps7_ports) if ps7_ports and is_verilog(rtl_files) else None
+    if ps and RTL_SIM == "verilator":
+        # shortcut: unconnected PS7 inputs are told by Icarus's z; port to Verilator when a PS7 design needs it.
+        raise ValueError("a PS7 design co-simulates on Icarus only (unset X7V_RTL_SIM)")
+    clock = next((p.name for p in ports if p.name in clocks), None) or \
+        next((b for b in (ps.out_bits if ps else ()) if b in clocks), None)
     if clock is None:
         clock = next((p.name for p in ports if p.direction == "in" and p.width is None and re.fullmatch(r"(clk|clock|gclk|sysclk)", p.name, re.I)), None)
+    if clock is None and ps:
+        clock = f"{ps.inst}.FCLKCLK[0]"
     in_bits = [b for p in ports if p.direction == "in" for b in p.bits() if b != clock]
     out_bits = [b for p in ports if p.direction == "out" for b in p.bits()]
+    if ps:
+        pin_of = {**pin_of, **ps.pin_of}
+        in_bits += [b for b in ps.out_bits if b != clock]
+        out_bits += ps.in_bits
     res = CosimResult(cycles, 0)
     res.unmapped_inputs = [b for b in in_bits if pin_of.get(b) not in ports_in]
     res.unmapped_outputs = [b for b in out_bits if pin_of.get(b) not in ports_out]
@@ -387,8 +418,21 @@ def run(workdir: str, rtl_files: list[str], top: str, xdc: str, netlist_v: str,
             prims = os.path.join(workdir, "x7v_prims.v")
             open(prims, "w").write(mmcm.RTL_PRIMS)
             rtl_files = [prims, *rtl_files]
+    if ps:
+        stub = os.path.join(workdir, "x7v_ps7.v")
+        open(stub, "w").write(ps7.stub(ps7_ports))
+        rtl_files = [stub, *rtl_files]
     stim = os.path.join(workdir, "stim.txt")
-    open(stim, "w").write("\n".join(make_stimulus(in_bits, cycles, seed)) + "\n")
+    lines = make_stimulus(in_bits, cycles, seed, active_low=ps.resets if ps else ())
+    if ps and ps.masters:
+        # The AXI masters react to the RTL's responses: run them against the
+        # RTL once; what they drove becomes the stimulus both sides replay.
+        base = os.path.join(workdir, "stim_random.txt")
+        open(base, "w").write("\n".join(lines) + "\n")
+        res.axi, res.axi_errors = ps7.run_axi(workdir, rtl_files, ps7.axi_tb(
+            top, ports, ps, in_bits, clock, cycles, base, stim, os.path.join(workdir, "axi.log"), seed, AXI_RW))
+    else:
+        open(stim, "w").write("\n".join(lines) + "\n")
     rtl_trace = os.path.join(workdir, "rtl.trace")
     net_trace = os.path.join(workdir, "net.trace")
     if is_verilog(rtl_files):
@@ -448,6 +492,7 @@ def run(workdir: str, rtl_files: list[str], top: str, xdc: str, netlist_v: str,
     res.log = "\n".join(logs)
     a = open(rtl_trace).read().split()
     b = open(net_trace).read().split()
+    ps_in = set(ps.in_bits) if ps else set()
     # Two samples per cycle: just before the rising edge (inputs settled;
     # catches combinational paths and asynchronous set/reset) and after it.
     for t, (ra, nb) in enumerate(zip(a, b)):
@@ -457,6 +502,14 @@ def run(workdir: str, rtl_files: list[str], top: str, xdc: str, netlist_v: str,
             bitname = f"{bitname0} (before edge)" if pre else bitname0
             rv, nv = ra[i], nb[i]
             if nv == "-":
+                continue
+            if rv == "z" and bitname0 in ps_in:
+                # A PS7 input the RTL leaves unconnected must read 0: tied,
+                # never left on a mux default (1) or floating (a clock).
+                res.compared += 1
+                res.tie_checked += 1
+                if nv != "0":
+                    res.mismatches.append((k, bitname, "unconnected (0)", nv))
                 continue
             if rv in "xu":
                 res.rtl_unknown += 1

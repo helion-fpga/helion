@@ -32,6 +32,7 @@ pub mod pack;
 pub mod parts;
 pub mod place;
 pub mod place_sa;
+pub mod ps7;
 pub mod route;
 pub mod timing;
 pub mod vivado_export;
