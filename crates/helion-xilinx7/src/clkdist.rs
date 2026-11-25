@@ -1,5 +1,5 @@
 //! Clock-distribution raw codes (ZB-10): HROW word-50 bits that no segbits
-//! feature names, measured from real Vivado builds on the USF cluster.
+//! feature names, measured from reference Vivado builds.
 //!
 //! SCOPE AND PROVENANCE. 12 single-trunk samples (cnt8/blinky designs,
 //! GCLK trunks 0-3, BOT-region and TOP-region taps through MUX_OUT_R8,

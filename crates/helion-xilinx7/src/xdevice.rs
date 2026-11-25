@@ -2068,7 +2068,7 @@ impl<'a> EmitDevice for XDevice<'a> {
     }
 
     fn pudc_b(&self, low_v_tiles: &[String], used: &[(String, String)]) -> Vec<String> {
-        // Vivado (the seven coursework builds using bank 34): when the bank holding
+        // Vivado (the seven reference Vivado builds using bank 34): when the bank holding
         // the PUDC_B pin runs a <=1.8 V standard and the design leaves the pin
         // unused, the pin is a pulled-up input of that bank's standard.
         let pins: Vec<&crate::db::parse::PackagePin> = self.device.package_pins().collect();
