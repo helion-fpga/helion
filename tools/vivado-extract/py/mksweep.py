@@ -11,6 +11,8 @@ Output columns: id kind pattern property value.
 """
 import argparse
 
+# Values must differ from the base cell (RAMB36E2 defaults: DOx_REG 1, WRITE_MODE NO_CHANGE;
+# opt_design turns CLOCK_DOMAINS into COMMON), or the variant measures nothing.
 US_BUILTIN = [
     # (cell or port, pattern, property, [values])
     ("cell", "lut_i", "INIT", ["64'h0000000000000001", "64'h0000000000000002", "64'h0000000080000000",
@@ -20,14 +22,14 @@ US_BUILTIN = [
     ("cell", "ff_i", "IS_R_INVERTED", ["1'b1"]),
     ("cell", "ff_i", "IS_D_INVERTED", ["1'b1"]),
     ("cell", "carry_i", "CARRY_TYPE", ["DUAL_CY4"]),
-    ("cell", "bram_i", "DOA_REG", ["1"]),
-    ("cell", "bram_i", "DOB_REG", ["1"]),
-    ("cell", "bram_i", "WRITE_MODE_A", ["READ_FIRST", "NO_CHANGE"]),
+    ("cell", "bram_i", "DOA_REG", ["0"]),
+    ("cell", "bram_i", "DOB_REG", ["0"]),
+    ("cell", "bram_i", "WRITE_MODE_A", ["READ_FIRST", "WRITE_FIRST"]),
     ("cell", "bram_i", "WRITE_MODE_B", ["READ_FIRST"]),
     ("cell", "bram_i", "INIT_A", ["36'h000000001"]),
     ("cell", "bram_i", "SRVAL_A", ["36'h000000001"]),
     ("cell", "bram_i", "RDADDRCHANGEA", ["TRUE"]),
-    ("cell", "bram_i", "CLOCK_DOMAINS", ["COMMON"]),
+    ("cell", "bram_i", "CLOCK_DOMAINS", ["INDEPENDENT"]),
     ("cell", "bram_i", "SLEEP_ASYNC", ["TRUE"]),
     ("cell", "bram_i", "EN_ECC_READ", ["TRUE"]),
     ("cell", "bram_i", "IS_CLKARDCLK_INVERTED", ["1'b1"]),
