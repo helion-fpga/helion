@@ -103,8 +103,9 @@ pub use synthmap::{
     emit_ff_control_fasm, map_source_cell, pair_carry4_chains,
 };
 pub use timing_db::{
-    documented_xcku3p, documented_xcvu3p, sta_db_for_part, DelaySource, SourcedDelay,
-    UltraScaleTimingDb, preliminary_xcku3p, preliminary_xcvu3p, preliminary_xczu3eg,
+    documented_xcku3p, documented_xcvu3p, documented_xczu3eg, sta_db_for_part, DelaySource,
+    SourcedDelay, UltraScaleTimingDb, preliminary_xcku3p, preliminary_xcvu3p,
+    preliminary_xczu3eg,
 };
 pub use tileconn::{PinCoverage, PinWire, SiteTile, TileconnDb, TileconnError, TileconnWireDb};
 pub use wire_db::{IntTile, IntTileWireDb, WireDbError};
