@@ -104,7 +104,8 @@ def main():
         missing = []
         for r in vp:
             f, bidir = pip_feature(t, r["NAME"])
-            if f in feats or (bidir and f + ".FWD" in feats):
+            fu = f.replace(f"{t}.", f"{t}.PIP.", 1)  # prjuray spelling: TYPE.PIP.DST.SRC
+            if f in feats or fu in feats or (bidir and (f + ".FWD" in feats or fu + ".FWD" in feats)):
                 continue
             if r.get("IS_PSEUDO") == "1":
                 continue

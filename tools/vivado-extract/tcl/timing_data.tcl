@@ -20,14 +20,26 @@ proc dump_timing_data {out} {
     array set seen {}
     foreach c [get_cells -hier -filter {IS_PRIMITIVE && STATUS != UNPLACED}] {
         set ref [get_property REF_NAME $c]
-        set bel [lindex [split [get_property -quiet BEL $c] .] end]
+        # Full BEL (SLICEL.A6LUT): the site type is part of the key.
+        set bel [get_property -quiet BEL $c]
+        # Slice output pin a LUT leaves through (A vs AMUX); none = stays inside the slice.
+        set opin ""
+        if {[string match LUT* $ref]} {
+            set site [get_sites -quiet -of_objects $c]
+            foreach sp [get_site_pins -quiet -of_objects [get_nets -quiet -of_objects [get_pins -quiet $c/O]]] {
+                if {[string match "$site/*" $sp] && [get_property -quiet DIRECTION $sp] eq "OUT"} {
+                    set opin [lindex [split $sp /] end]
+                }
+            }
+        }
         foreach a [get_timing_arcs -quiet -of_objects $c] {
             # LUT delay depends on the physical pin (A1..A6), not the logical one: record both.
             set from [lindex [split [get_property FROM_PIN $a] /] end]
             set bp [get_bel_pins -quiet -of_objects [get_pins -quiet [get_property FROM_PIN $a]]]
             if {[string match LUT* $ref] && $bp ne ""} { append from "([lindex [split [lindex $bp 0] /] end])" }
-            set row [list $ref $bel $from \
-                [lindex [split [get_property TO_PIN $a] /] end] [get_property -quiet TYPE $a] [get_property -quiet SENSE $a]]
+            set to [lindex [split [get_property TO_PIN $a] /] end]
+            if {$opin ne ""} { append to "($opin)" }
+            set row [list $ref $bel $from $to [get_property -quiet TYPE $a] [get_property -quiet SENSE $a]]
             foreach k $ak { lappend row [get_property -quiet $k $a] }
             set key [join $row \t]
             if {[info exists seen($key)]} { incr seen($key) } else { set seen($key) 1 }

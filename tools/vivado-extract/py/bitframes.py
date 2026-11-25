@@ -15,7 +15,8 @@ import struct
 import sys
 
 SYNC = b"\xaa\x99\x55\x66"
-REG_FAR, REG_FDRI, REG_IDCODE, REG_LOUT = 0x01, 0x02, 0x0C, 0x13
+# Config registers (UG470 / UG570 type-1 packet addresses): LOUT is 0x08.
+REG_FAR, REG_FDRI, REG_IDCODE, REG_LOUT = 0x01, 0x02, 0x0C, 0x08
 
 
 def words(path):
@@ -96,6 +97,9 @@ def selftest():
     # Hand-built stream: sync, IDCODE, FAR, two (FDRI frame, LOUT far) pairs.
     def t1(reg, n):
         return (1 << 29) | (2 << 27) | (reg << 13) | n
+    # Literal headers as Vivado 2017.3 writes them (xcku3p debug bitstream), so a
+    # wrong register constant cannot pass by agreeing with itself.
+    assert t1(REG_LOUT, 1) == 0x30010001 and t1(REG_FDRI, 93) == 0x3000405D
     fw = 3
     s = [t1(REG_IDCODE, 1), 0x04A63093, t1(REG_FAR, 1), 0,
          t1(REG_FDRI, fw), 1, 0, 0, t1(REG_LOUT, 1), 0x100,

@@ -24,7 +24,8 @@ module us_sink (
         .CEA1(1'b1), .CEA2(1'b1), .CEB1(1'b1), .CEB2(1'b1), .CEC(1'b1), .CED(1'b1),
         .CEAD(1'b1), .CEM(1'b1), .CEP(1'b1), .CECTRL(1'b1), .CEINMODE(1'b1),
         .CEALUMODE(1'b1), .CECARRYIN(1'b1), .P(p));
-    (* DONT_TOUCH = "TRUE" *) RAMB36E2 bram_i (
+    (* DONT_TOUCH = "TRUE" *) RAMB36E2 #(.READ_WIDTH_A(36), .READ_WIDTH_B(36),
+        .WRITE_WIDTH_A(36), .WRITE_WIDTH_B(36)) bram_i (
         .CLKARDCLK(clk_g), .CLKBWRCLK(clk_g), .ENARDEN(1'b1), .ENBWREN(1'b1),
         .ADDRARDADDR({a, 7'b0}), .ADDRBWRADDR({a, 7'b0}), .DINADIN({24'b0, a}),
         .WEA(4'b0), .WEBWE({7'b0, a[0]}), .DOUTADOUT(bd));
