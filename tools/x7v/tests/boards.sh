@@ -15,7 +15,23 @@ cd "$(dirname "$0")/.."
 R=$(cd ../.. && pwd)
 ZEDBIT=${X7V_ZEDBIT:-$R/target/release/examples/zedbit}
 WORK=${X7V_BOARDS_WORK:-$(mktemp -d)}
-BOARDS=${*:-zedboard arty-a7-35 basys3 nexys-a7-100t arty-s7-25}
+# With no arguments, every board whose family is in the database (an
+# artix7 + zynq7 database has no spartan7): the others are reported as SKIP.
+DB=${HELION_XILINX_DB:-}
+if [ -z "$DB" ]; then
+  for c in "$HOME/.cache/helion/prjxray-db" "$HOME/workspace/xilinx-dbsrc" "$HOME/Documents/zedboard-helion-debug/work/prjxray-db" "$R/xilinx-dbsrc"; do
+    [ -d "$c" ] && { DB=$c; break; }
+  done
+fi
+family() { case $1 in arty-s7-25) echo spartan7;; zedboard) echo zynq7;; *) echo artix7;; esac; }
+if [ $# -gt 0 ]; then
+  BOARDS=$*
+else
+  BOARDS=""
+  for B in zedboard arty-a7-35 basys3 nexys-a7-100t arty-s7-25; do
+    if [ -f "$DB/$(family $B)/mapping/parts.yaml" ]; then BOARDS="$BOARDS $B"; else echo "$B: SKIP (no $(family $B) in the database at ${DB:-<none>})"; fi
+  done
+fi
 fail=0
 for B in $BOARDS; do
   W=$WORK/$B; mkdir -p "$W"

@@ -31,6 +31,28 @@ fn have_db() -> bool {
     ok
 }
 
+/// Database family of a part, from its name prefix.
+fn family_of(part: &str) -> &'static str {
+    match &part[..4.min(part.len())] {
+        "xc7s" => "spartan7",
+        "xc7a" => "artix7",
+        "xc7z" => "zynq7",
+        "xc7k" => "kintex7",
+        _ => "",
+    }
+}
+
+/// Whether the database has the board's family; prints a SKIP line if not
+/// (an artix7 + zynq7 database, e.g. f4pga's, has no spartan7).
+fn board_in_db(name: &str, part: &str) -> bool {
+    let fam = family_of(part);
+    let ok = parts::families(&default_db_root()).iter().any(|f| f == fam);
+    if !ok {
+        eprintln!("SKIP: {name}: no {fam} in the Project X-Ray database at {}", default_db_root().display());
+    }
+    ok
+}
+
 /// `(port bit, package pin)` pairs of an XDC, in file order.
 fn xdc_pins(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -74,6 +96,9 @@ fn board_parts_resolve() {
         ("arty-s7-25", "spartan7", "xc7s25", 0x037C_4093),
     ];
     for (b, family, fabric, idcode) in want {
+        if !board_in_db(b, parts::board(b).unwrap().part) {
+            continue;
+        }
         let p = parts::resolve(&root, parts::board(b).unwrap().part).unwrap();
         assert_eq!((p.family.as_str(), p.fabric.as_str(), p.idcode), (family, fabric, idcode), "{b}");
     }
@@ -93,6 +118,9 @@ fn board_xdc_pins_exist_on_their_parts() {
     }
     let root = default_db_root();
     for b in BOARDS {
+        if !board_in_db(b.name, b.part) {
+            continue;
+        }
         let part = parts::resolve(&root, b.part).unwrap();
         let pkg = package_pins(&part);
         let text = std::fs::read_to_string(repo().join(b.xdc)).unwrap();
@@ -128,6 +156,9 @@ fn counter_builds_for_every_board() {
 endmodule
 ";
     for b in BOARDS {
+        if !board_in_db(b.name, b.part) {
+            continue;
+        }
         let mut d = helion_sv::synth_sv_v2(src, "counter.sv", Some("counter")).expect("synth").design;
         let xdc: HashMap<String, String> = xdc_pins(&std::fs::read_to_string(repo().join(b.xdc)).unwrap()).into_iter().collect();
         d.set_loc("clk", &xdc["clk"]).unwrap();
