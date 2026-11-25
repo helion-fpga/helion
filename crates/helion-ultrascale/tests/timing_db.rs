@@ -176,3 +176,53 @@ fn sta_db_for_part_rejects_unknown_part() {
     assert!(err.contains("xc7a35t"), "err: {err}");
     assert!(err.contains("unsupported part"), "err: {err}");
 }
+
+/// Path of the xczu3eg timing source audit, relative to this crate.
+fn xczu3eg_timing_audit_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("docs")
+        .join("xczu3eg_timing_sources.md")
+}
+
+/// The xtiming lane outcome is BLOCKED, proven by a committed audit:
+/// no public source retrievable by that lane carries a documented
+/// xczu3eg fabric delay, so no documented value may enter the DB.
+/// This test pins the audit file itself: it must exist and must name
+/// the document searched (DS925), the one value that should exist
+/// (TRCKO_DO), the verdict (BLOCKED), and the named unblocker
+/// (Vivado report_timing). Fail-before: on the base code the file
+/// does not exist and this test fails at the read.
+#[test]
+fn xczu3eg_timing_audit_present_and_names_unblocker() {
+    let path = xczu3eg_timing_audit_path();
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("xczu3eg timing audit missing at {}: {e}", path.display()));
+    for marker in ["DS925", "TRCKO_DO", "BLOCKED", "report_timing", "write_sdf"] {
+        assert!(
+            text.contains(marker),
+            "audit {} must name {marker}",
+            path.display()
+        );
+    }
+}
+
+/// Guard against an invented documented value: the preliminary
+/// xczu3eg DB must carry no Documented delay at all. Every field is
+/// Ballpark or Unknown, and the DB stays an estimate. This pins the
+/// current state rather than a change, so it passes on the base too;
+/// its value is regression protection, and the audit-presence test
+/// above is the one with fail-before proof.
+#[test]
+fn preliminary_xczu3eg_has_no_documented_value() {
+    let db = preliminary_xczu3eg();
+    for (name, d) in all_fields(&db) {
+        assert!(
+            !matches!(d.source, DelaySource::Documented(_)),
+            "preliminary xczu3eg field {name} must not be Documented: {d:?}"
+        );
+    }
+    assert!(
+        db.is_estimate(),
+        "preliminary xczu3eg DB must be an estimate"
+    );
+}

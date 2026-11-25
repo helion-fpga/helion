@@ -11,6 +11,9 @@
 //! - AMD community forum (adaptivesupport.amd.com): ~0.3ns per logic level
 //!   (LUT + route) ballpark for UltraScale+, LUT alone under 1ns.
 //! - UG570: UltraScale Architecture Configurable Logic Blocks (structure).
+//! - DS925 source audit: crates/helion-ultrascale/docs/xczu3eg_timing_sources.md
+//!   (outcome BLOCKED: no documented xczu3eg fabric delay is retrievable
+//!   from public sources; the audit names the Vivado unblocker).
 //!
 //! Speed grade: -2 (0.85V) unless noted. All values are max (slow corner).
 
@@ -195,6 +198,12 @@ impl UltraScaleTimingDb {
 /// carries the same split (120 ps LUT + 180 ps one INT hop = 300 ps per
 /// logic level) under the xczu3eg part name. Every value is Ballpark.
 /// Do not use for signoff.
+///
+/// No documented value replaces any of this yet: the DS925 source audit
+/// (crates/helion-ultrascale/docs/xczu3eg_timing_sources.md) is BLOCKED,
+/// no public source retrievable by that lane carries a documented
+/// xczu3eg fabric delay, and the unblocker is Vivado report_timing plus
+/// write_sdf.
 pub fn preliminary_xczu3eg() -> UltraScaleTimingDb {
     let mut db = preliminary_xcvu3p();
     db.part = "xczu3eg".to_string();
