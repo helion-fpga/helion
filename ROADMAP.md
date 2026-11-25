@@ -22,6 +22,15 @@ updates the QoR tests and says why.
 | 2.5 | shipped | IDE features: cross-probing, Tcl console, runs, checkpoints, ILA |
 | 3.0 | shipped | Xilinx 7-series backend; SAT equivalence, SVA, CDC |
 | 4.0 | shipped | Rune IDE, iCE40 and ECP5 backends, self-contained build, native JTAG on real hardware |
+| 4.5 | shipped | Helion-only designs running on a ZedBoard, v2 SystemVerilog front end, experimental UltraScale+, Windows zip |
+
+## 4.5: what it delivers
+
+Released 2026-11-25. The details are in the [changelog](CHANGELOG.md#450--2026-11-25).
+Helion-only ZedBoard bitstreams run Ibex, block RAM and DSP fills, an MMCM
+design, the OLED and the PS7 over AXI on the board; the IDE builds and
+programs them; `tools/x7v` decodes and co-simulates every one against its
+RTL. Every part the IDE offers programs or stops with the exact reason.
 
 ## 4.0: what it delivers
 
@@ -51,7 +60,7 @@ Released 2026-11-12. The details are in the [changelog](CHANGELOG.md#400--2026-1
 - **The egui IDE is removed.** `helion-ide` is the Rune IDE.
 
 
-## After 4.0
+## After 4.5
 
 Ordered roughly by priority. None of these are promised for a date.
 
@@ -59,9 +68,14 @@ Ordered roughly by priority. None of these are promised for a date.
 - Verify programming over the native FTDI cable on a board (scan is
   verified; programming is not).
 - STAT readback when programming through openFPGALoader.
-- Load iCE40, ECP5 and 7-series bitstreams on real boards; today they are
-  checked against the open toolchains (icepack, ecppack, prjxray), not on
-  hardware.
+- Load iCE40, ECP5 and the Artix-7 boards' bitstreams on real boards; today
+  they are checked against the open toolchains (icepack, ecppack, prjxray),
+  not on hardware. ZedBoard bitstreams run on the board.
+- Route the full ZedBoard fill (G77), and bring Helion's LUT count closer to
+  Vivado's (G78).
+- UltraScale+: the tier-2 Vivado comparison, then hardware.
+- Read an undriven variable's initializer as its value (G84).
+- Wire `helion-update` into the IDE.
 
 **Quality of results**
 - Calibrate the timing models against measured data, then make pack, place

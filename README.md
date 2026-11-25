@@ -115,7 +115,8 @@ The [user guide](https://helion-fpga.github.io/helion/use.html) walks through ea
 | **Helion HL10** | `HL10T-C32-1` (8,192 LUT6), `HL10T-DSP1`, `HL10S-C64-1` (32,768 LUT6), `HL10M-C128-1` (131,072 LUT6) | `.hbits` | Gold QoR tests; bitstreams load into Helion's fabric model and simulator |
 | **Lattice iCE40** | `ice40-hx8k` | IceStorm `.asc` (`icepack` makes the `.bin`) | `.asc` round-trips bit-exactly through icepack/iceunpack |
 | **Lattice ECP5** | `LFE5U-85F` | Trellis text config (`ecppack` makes the `.bit`) | Blinky config accepted by `ecppack` |
-| **Xilinx 7-series** | `xc7a35t`, `xc7a100t`, `xc7z020` (ZedBoard) | FASM, frames and `.bit` | Byte-identical to f4pga for the board test set; every ZedBoard bitstream is decoded and co-simulated against its RTL by `tools/x7v`, and four ZedBoard designs run on the board; needs the Project X-Ray database on disk |
+| **Xilinx 7-series** | `xc7a35t`, `xc7a100t`, `xc7z020` (ZedBoard) | FASM, frames and `.bit` | Byte-identical to f4pga for the board test set; every ZedBoard bitstream is decoded and co-simulated against its RTL by `tools/x7v`, and ZedBoard designs run on the board (PicoRV32, Ibex, RAM and DSP fills, MMCM, OLED, PS7 over AXI); Arty A7-35T, Basys 3 and Nexys A7-100T are built and checked by `tools/x7v` but not tested on hardware; needs the Project X-Ray database on disk |
+| **Xilinx UltraScale+** (experimental) | `xcku3p`, `xcvu3p`, `xczu3eg` (command line only) | `.bit` on `xczu3eg` | Decode and co-simulation only; no hardware, no Vivado comparison yet |
 
 HL10 is Helion's own architecture. Its parts are defined in
 [`devices/helion/`](devices/helion/); there is no HL10 silicon. Bitstreams for
@@ -126,7 +127,9 @@ bitstreams run on a ZedBoard (see [ZedBoard status](#zedboard-status)).
 (FT2232H, FT232H, including Digilent's on-board cables). Chain scans are
 verified on a real ZedBoard (Zynq-7020 plus ARM DAP, 1 to 30 MHz).
 Programming over the native cable is implemented but not yet verified on a
-board. [openFPGALoader](https://github.com/trabucayre/openFPGALoader), when
+board. The IDE and `helion hw program` load 7-series bitstreams through
+openFPGALoader (with a SHUTDOWN preamble, so a reload starts clean), and an
+IDE-built design has run on the ZedBoard this way. [openFPGALoader](https://github.com/trabucayre/openFPGALoader), when
 installed, is used for program and flash; the simulated cable programs the
 HL10 fabric model.
 
@@ -244,11 +247,14 @@ nextpnr's; calibrating it is on the roadmap.
 
 ## Project status and roadmap
 
-The current release is **4.0**: the new Rune-based IDE replaces the egui IDE,
-iCE40 and ECP5 backends join HL10 and Xilinx 7-series, the native JTAG
-engine reaches real hardware, and the build is self-contained. See the [changelog](CHANGELOG.md) for the details.
+The current release is **4.5**: Helion-only bitstreams run on a ZedBoard
+(Ibex, block RAM and DSP fills, MMCM, OLED, the PS7 over AXI), the IDE builds
+and programs ZedBoard designs, the v2 SystemVerilog front end is the default,
+an experimental UltraScale+ backend writes its first bitstreams, and a
+Windows zip ships beside the macOS and Linux builds. See the [changelog](CHANGELOG.md) for the details.
 
-Next up: verifying native programming on boards, timing-model calibration
+Next up: routing the full ZedBoard fill (G77), verifying native programming
+on boards, the UltraScale+ Vivado comparison, timing-model calibration
 against real silicon, wiring the October campaign's optimization passes into
 the default flow, and the remaining IDE gaps listed in
 [`crates/helion-rune/SWEEP.md`](crates/helion-rune/SWEEP.md). The
@@ -269,9 +275,9 @@ design running on the board.
 | 2 | 240 RAMB18 (86%) with init data, 100 MHz | runs on the board |
 | 3 | 192 DSP48E1 (87%), 100 MHz | runs on the board |
 | 4 | MMCM, three clock domains, safe crossings | runs on the board |
-| 5 | Board peripherals: OLED, VGA, Pmods | VGA and Pmod pass both checks; OLED fix in review |
+| 5 | Board peripherals: OLED, VGA, Pmods | OLED runs on the board; VGA, Pmod, HDMI and audio run their logic on the board, but their outputs were not observed |
 | 6 | One design at 85% LUTs + 86% RAM + 87% DSP | synthesizes, places and simulates; routing does not converge yet |
-| 7 | The ARM (PS7) reading and writing logic over AXI | in progress |
+| 7 | The ARM (PS7) reading and writing logic over AXI | runs on the board (`tools/zynq/ps7_axi_check.tcl`, 15/15) |
 
 Helion still uses about 1.6x to 5x the LUTs Vivado does for the same RTL,
 and its timing of its own routes has not been checked against Vivado. The
