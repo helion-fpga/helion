@@ -1742,6 +1742,10 @@ pub(crate) fn resolve_device(
 /// Why no backend implements `part`, and what the IDE offers instead.
 pub(crate) fn part_not_implementable(part: &str) -> String {
     use helion_targets::Family;
+    // implementable_parts() drops HL10 parts it cannot read: say why.
+    if let Some(why) = had_unreadable(part, helion_device::Device::list_parts(), |p| helion_device::Device::load_part(p).map(drop)) {
+        return why;
+    }
     let parts = helion_targets::implementable_parts();
     let list = |fs: &[Family]| parts.iter().filter(|p| fs.contains(&p.family)).map(|p| p.part.as_str()).collect::<Vec<_>>().join(", ");
     let p = part.to_ascii_lowercase();
@@ -1758,6 +1762,21 @@ pub(crate) fn part_not_implementable(part: &str) -> String {
     } else {
         format!("{part:?} is not a part Helion can implement. Pick one of: {}.", list(&[Family::Helion, Family::Ice40, Family::Ecp5, Family::Xilinx7]))
     }
+}
+
+/// Why an HL10 part is not implementable although Helion ships it: the HAD
+/// folder (`parts`, from `Device::list_parts`) or the part's file could not be
+/// read. `None` when the part is simply unknown.
+fn had_unreadable(part: &str, parts: Result<Vec<String>, String>, load: impl Fn(&str) -> Result<(), String>) -> Option<String> {
+    let err = match parts {
+        Err(e) if part.to_ascii_lowercase().starts_with("hl10") => e,
+        Ok(ps) if ps.iter().any(|p| p.eq_ignore_ascii_case(part)) => load(part).err()?,
+        _ => return None,
+    };
+    Some(format!(
+        "{part}: Helion's HL10 device models could not be read ({err}). Helion looked in {}; set HELION_HAD to the folder that holds parts/.",
+        helion_device::Device::devices_dir().display()
+    ))
 }
 
 /// SystemVerilog files behind a run source: the `.prj`'s `.sv`/`.v`
@@ -3098,5 +3117,15 @@ mod tests {
         assert!(e.contains("ice40-hx8k") && e.contains("LFE5U-85F"), "{e}");
         let e = resolve_device("HL10Q-typo", &quiet).unwrap_err();
         assert!(e.contains("not a part Helion can implement") && e.contains("HL10T-C32-1"), "{e}");
+    }
+
+    #[test]
+    fn missing_had_folder_is_named_not_called_an_unknown_part() {
+        let e = had_unreadable("HL10T-C32-1", Err("read /nowhere/parts: No such file".into()), |_| Ok(())).unwrap();
+        assert!(e.contains("No such file") && e.contains("HELION_HAD") && !e.contains("not a part"), "{e}");
+        let bad = had_unreadable("HL10T-C32-1", Ok(vec!["HL10T-C32-1".into()]), |_| Err("parse error".into())).unwrap();
+        assert!(bad.contains("parse error"), "{bad}");
+        assert!(had_unreadable("HL10Q-typo", Ok(vec!["HL10T-C32-1".into()]), |_| Ok(())).is_none());
+        assert!(had_unreadable("ice40-up5k", Err("gone".into()), |_| Ok(())).is_none());
     }
 }
