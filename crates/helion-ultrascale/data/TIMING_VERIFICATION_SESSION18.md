@@ -6,18 +6,24 @@ the 3 predecessor commits (8aa5395e, 7a3ff672, 9b463cf0). No work redone.
 
 ## Spot checks against cited sources (independent re-verification)
 
-### DS922 / DS923 Table 33, TRCKO_DO 1.46 ns: CONFIRMED
+### DS922 / DS923 Table 33, TRCKO_DO 1.02 ns: CORRECTED (session 18 read 1.46 ns)
 
 Source checked: docs.amd.com DS922 Block RAM and FIFO Switching
 Characteristics page, and the DS923 equivalent page. The TRCKO_DO row
 (Clock CLK to DOUT output, without output register) reads 0.91, 1.02,
-1.11, 1.46, 1.53 ns across the columns 0.90V -3/-2/-1, 0.85V -2/-1,
-0.72V -2/-1. The fourth numeric column is 0.85V -2, value 1.46 ns.
-`documented_xcku3p()` / `documented_xcvu3p()` store 1460 ps. Correct.
+1.11, 1.46, 1.53 ns across the columns -3 at 0.90V, -2 at 0.85V,
+-1 at 0.85V, -2 at 0.72V, -1 at 0.72V. Session 18 read the fourth
+numeric column (1.46 ns) as 0.85V -2; that column is -2 at 0.72V.
+The -2 at 0.85V column is the second numeric column, value 1.02 ns.
+`documented_xcku3p()` / `documented_xcvu3p()` store 1020 ps
+(corrected from 1460 ps by the N64 fix lane, 2026-11-25; the N66
+fix lane corrected this record and TIMING_XCKU3P.md the same day).
 Cross-checks on the same pages also match TIMING_XCKU3P.md:
-TRCKO_DO_REG 0.42 ns at 0.85V -2, FMAX_WF_NC 585 MHz at 0.85V -2,
-UltraRAM only FMAX values plus TPW 800 ps (no clock-to-output delay),
-DSP only FMAX values (no pin-to-pin delay).
+TRCKO_DO_REG 0.29 ns at 0.85V -2, FMAX_WF_NC 738 MHz at 0.85V -2,
+UltraRAM only FMAX values plus TPW 700 ps (no clock-to-output delay),
+DSP only FMAX values (no pin-to-pin delay). (Session 18 quoted the
+fourth-column values 0.42 ns, 585 MHz, 800 ps here; those are -2 at
+0.72V. Corrected by the N66 fix lane, 2026-11-25.)
 
 Note: the AMD web pages number this table "Table 1"; "Table 33" is the
 PDF numbering used by the code and docs. The value and the table are
@@ -42,7 +48,8 @@ documents this honestly in TIMING_XCKU3P.md section 1.
   appends `estimate=1` when set.
 - `sta_db_for_part()` selects per part and fails loud on unknown parts.
 - `documented_xcku3p()` / `documented_xcvu3p()` carry exactly one value
-  (BRAM CLK to DOUT 1460 ps) and UNKNOWN elsewhere, so `sta_routed`
+  (BRAM CLK to DOUT 1020 ps, corrected from 1460 ps; see the TRCKO_DO
+  section above) and UNKNOWN elsewhere, so `sta_routed`
   fails loud on them with `timing: LUT6 delay UNKNOWN in TimingDb`.
 - No em dashes in the branch diff (`git diff 07d0d7d..HEAD`: 0).
 
