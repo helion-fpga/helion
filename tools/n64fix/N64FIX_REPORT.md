@@ -8,7 +8,7 @@
 - Base: fm/ultra-bitgen-xtiming at c6e7615d (timing lane tip, A-partial
   closed by Critic Session 48).
 - Lane branch: fm/ultra-bitgen-n64fix at 9f5fcd93 (merge; impl commit
-  8ccf7c0c). Report commit: f39e9ef5. Header commit: PENDING.
+  8ccf7c0c). Report commit: f39e9ef5 (the header commit states it).
 - Report copy: tools/n64fix/N64FIX_REPORT.md on the lane branch,
   byte-identical to this file.
 - Workers: W-BASELINE (agent 8c076f14-e24e-4976-8d56-f260ee091627),
