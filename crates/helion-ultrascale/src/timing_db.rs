@@ -12,8 +12,10 @@
 //!   (LUT + route) ballpark for UltraScale+, LUT alone under 1ns.
 //! - UG570: UltraScale Architecture Configurable Logic Blocks (structure).
 //! - DS925 source audit: crates/helion-ultrascale/docs/xczu3eg_timing_sources.md
-//!   (outcome BLOCKED: no documented xczu3eg fabric delay is retrievable
-//!   from public sources; the audit names the Vivado unblocker).
+//!   (outcome A-partial: exactly one documented xczu3eg value, BRAM
+//!   CLK to DOUT 1020 ps from DS925 v1.30 Table 80 TRCKO_DO, -2 /
+//!   0.85V; every other xczu3eg field stays Ballpark/UNKNOWN and the
+//!   fabric-delay unblocker is Vivado report_timing plus write_sdf).
 //!
 //! Speed grade: -2 (0.85V) unless noted. All values are max (slow corner).
 
@@ -199,10 +201,14 @@ impl UltraScaleTimingDb {
 /// logic level) under the xczu3eg part name. Every value is Ballpark.
 /// Do not use for signoff.
 ///
-/// No documented value replaces any of this yet: the DS925 source audit
-/// (crates/helion-ultrascale/docs/xczu3eg_timing_sources.md) is BLOCKED,
-/// no public source retrievable by that lane carries a documented
-/// xczu3eg fabric delay, and the unblocker is Vivado report_timing plus
+/// One documented value exists for this part, in
+/// [`documented_xczu3eg`]: BRAM CLK to DOUT, 1020 ps, from DS925
+/// v1.30 Table 80 TRCKO_DO, -2 / 0.85V. It is not in this preliminary
+/// DB: the preliminary DB stays a pure ballpark estimate, and the
+/// documented DB stays deliberately unusable for STA. The DS925
+/// source audit
+/// (crates/helion-ultrascale/docs/xczu3eg_timing_sources.md) records
+/// the read; the fabric-delay unblocker is Vivado report_timing plus
 /// write_sdf.
 pub fn preliminary_xczu3eg() -> UltraScaleTimingDb {
     let mut db = preliminary_xcvu3p();
@@ -246,10 +252,7 @@ pub fn sta_db_for_part(part: &str) -> Result<UltraScaleTimingDb, String> {
 /// Deliberately unusable for STA: [`crate::sta::sta_routed`] on this DB
 /// fails loud with `timing: LUT6 delay UNKNOWN in TimingDb`.
 pub fn documented_xcku3p() -> UltraScaleTimingDb {
-    documented_db(
-        "xcku3p",
-        "DS922 Table 33 TRCKO_DO, -2 0.85V",
-    )
+    documented_db("xcku3p", 1460, "DS922 Table 33 TRCKO_DO, -2 0.85V")
 }
 
 /// Documented-only timing DB for xcvu3p, speed grade -2 at 0.85V.
@@ -258,13 +261,29 @@ pub fn documented_xcku3p() -> UltraScaleTimingDb {
 /// (Block RAM and FIFO Switching Characteristics), TRCKO_DO, -2 / 0.85V,
 /// Max: 1460 ps. All other fields UNKNOWN, for the same reasons.
 pub fn documented_xcvu3p() -> UltraScaleTimingDb {
-    documented_db(
-        "xcvu3p",
-        "DS923 Table 33 TRCKO_DO, -2 0.85V",
-    )
+    documented_db("xcvu3p", 1460, "DS923 Table 33 TRCKO_DO, -2 0.85V")
 }
 
-fn documented_db(part: &str, bram_source: &str) -> UltraScaleTimingDb {
+/// Documented-only timing DB for xczu3eg, speed grade -2 at 0.85V.
+///
+/// Contains exactly one value: BRAM CLK to DOUT, 1020 ps, from DS925
+/// v1.30 Table 80 (Block RAM and FIFO Switching Characteristics),
+/// TRCKO_DO, Clock CLK to DOUT output (without output register),
+/// -2 / 0.85V, Max, 1.02 ns. The v1.30 value was read from the
+/// docs.amd.com DS925 page and agrees value-for-value with the v1.23
+/// PDF Table 80, so the value is pinned to the current revision. The
+/// -2 at 0.85V column is the second data column: -3 at 0.90V is 0.91 ns,
+/// -2 at 0.72V is 1.46 ns, and the two must not be confused (see nit
+/// N64 in the DS925 source audit). Every other field is UNKNOWN: DS925
+/// publishes no LUT6, flip-flop, CARRY8, interconnect, DSP, URAM, or
+/// IOB pin-to-pin delay, and FMAX values are periods, not delays, so
+/// none is stored. Deliberately unusable for STA: [`crate::sta::sta_routed`]
+/// on this DB fails loud with `timing: LUT6 delay UNKNOWN in TimingDb`.
+pub fn documented_xczu3eg() -> UltraScaleTimingDb {
+    documented_db("xczu3eg", 1020, "DS925 v1.30 Table 80 TRCKO_DO, -2 0.85V")
+}
+
+fn documented_db(part: &str, bram_clk_to_do_ps: i64, bram_source: &str) -> UltraScaleTimingDb {
     UltraScaleTimingDb {
         part: part.to_string(),
         speed_grade: "-2".to_string(),
@@ -284,7 +303,7 @@ fn documented_db(part: &str, bram_source: &str) -> UltraScaleTimingDb {
             clk_to_p: SourcedDelay::unknown(),
         },
         bram: Ramb36e2Delays {
-            clk_to_do: SourcedDelay::documented(1460, bram_source),
+            clk_to_do: SourcedDelay::documented(bram_clk_to_do_ps, bram_source),
             addr_setup: SourcedDelay::unknown(),
         },
         uram: Uram288Delays {
