@@ -1,5 +1,5 @@
-// Faithful SystemVerilog equivalent of the Vivado oracle source
-// ~/CDA4253_A1/blinky.vhd (GT-blinky.bit, md5 3f6d7cfa8a5db206e5cf6fd0e3568324).
+// Faithful SystemVerilog equivalent of a Vivado reference blinky (VHDL
+// source not in the repo; GT-blinky.bit, md5 3f6d7cfa8a5db206e5cf6fd0e3568324).
 // Copied from work/ref/blinky_reg.sv in the handoff package. Pin map matches
 // examples/zedboard.xdc: clk on Y9, LD0 on T22.
 //

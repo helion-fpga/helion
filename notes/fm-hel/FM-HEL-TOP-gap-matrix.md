@@ -14,7 +14,7 @@ Helion did **not** merge #7. MergeBy on GitHub: `saksham-45` at 2026-09-06 06:54
 
 **Grinding continues** on `fm-hel-top` / PR #8. **NO MERGE.** **NEVER push soft-pass.**
 
-## Mac sync (e6c67522 / sakshams-MacBook-Pro-517.local)
+## Mac sync (e6c67522)
 
 | Item | Status |
 |------|--------|

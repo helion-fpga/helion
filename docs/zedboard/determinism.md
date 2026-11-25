@@ -93,13 +93,13 @@ Both runs exit 1 within a second, after synthesis, at device load:
 ```
 zedbit synth: v2 front end, 27 LUTs, 27 flops, 1 LUT levels
 zedbit: synthesized in 0.0s; loading the device
-zedbit: unknown part xc7z020clg484-1: not in the Project X-Ray database at /home/hatch/workspace/xilinx-dbsrc (families artix7; 0 parts, e.g. )
+zedbit: unknown part xc7z020clg484-1: not in the Project X-Ray database at ~/workspace/xilinx-dbsrc (families artix7; 0 parts, e.g. )
 ```
 
 ```
 zedbit synth: v2 front end, 1464 LUTs, 516 flops, 6 LUT levels
 zedbit: synthesized in 0.9s; loading the device
-zedbit: unknown part xc7z020clg484-1: not in the Project X-Ray database at /home/hatch/workspace/xilinx-dbsrc (families artix7; 0 parts, e.g. )
+zedbit: unknown part xc7z020clg484-1: not in the Project X-Ray database at ~/workspace/xilinx-dbsrc (families artix7; 0 parts, e.g. )
 ```
 
 ## Root cause
@@ -233,7 +233,7 @@ part either) and no `xc7z020clg400-1/` part directory at all, so zedbit
 warned and left the three always-on bits out of the FASM. The Linux FASM
 differed from the Mac FASM only by those 3 lines
 (`CFG_CENTER_MID_X123Y84.ALWAYS_ON_PROP1` to `3`); placement and routing
-were identical. Claude Code confirmed the diagnosis by rebuilding on the
+were identical. The diagnosis was confirmed by rebuilding on the
 Mac with a database shaped like the Linux one and reproducing the Linux
 md5s byte for byte.
 
@@ -243,14 +243,14 @@ Fix: restored `zynq7/xc7z020clg400-1/` from f4pga prjxray-db master
 back to another part on the same fabric for `required_features.fasm`, so
 the clg400-1 file supplies the always-on bits for clg484-1 builds.
 
-Rerun, same two commands, same binary, logs `blinky-rerun2.log` and
-`pico-rerun2.log` (real captured stdout this time), both exit 0:
+Rerun, same two commands, same binary (real captured stdout this time,
+not kept in the repo), both exit 0:
 
 - blinky md5 `d622e9831c0fa76faa5cbaec1aea2267`: MATCHES Mac
 - pico md5 `08ca33a6ff702841ca8851cf20b023c4`: MATCHES Mac
 - Both FASM files now contain the 3 ALWAYS_ON lines.
 
 Verdict: Helion is deterministic across Linux x86_64 and Mac arm64 for
-these two designs. T3 closed. Follow-up logged by Claude Code as gap G81:
+these two designs. T3 closed. Follow-up logged as gap G81:
 make zedbit and x7v fail loudly when `required_features.fasm` is missing
 instead of warning and silently dropping always-on bits.

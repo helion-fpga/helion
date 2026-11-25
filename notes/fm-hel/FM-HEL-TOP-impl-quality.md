@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06 ~08:25 America/New_York (EDT)  
 **Branch:** `fm-hel-top` — PR https://github.com/helion-fpga/helion/pull/8 (**NO MERGE**)  
-**Author:** saksham-45 `<72103486+saksham-45@users.noreply.github.com>`  
+**Author:** saksham-45  
 **Fence:** AIG/flowmap **STOP** (no thrash). No uncapped Ibex. Sim absolute split / `SPLITTER_GRAB_PX` / void Timing-Reports **untouched**.
 
 ## Gold (counter)

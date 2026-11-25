@@ -3,7 +3,7 @@
 **Date:** 2026-10-18  
 **Branch:** `wip/ide-integration` (HEAD: `61f510d`)  
 **Target:** 400-case corpus gate, 0 regressions from the 5 commits, 237/237 passing unit tests  
-**Audience:** Incoming AI Agent / Compiler Engineer — Read this document carefully before modifying code.
+**Audience:** Incoming compiler engineer — Read this document carefully before modifying code.
 
 ---
 
@@ -239,7 +239,7 @@ return Ok((!n) & mask);
 
 ---
 
-## 5. Step-by-Step Instructions for the Next AI / Engineer
+## 5. Step-by-Step Instructions for the Next Engineer
 
 Follow this exact order of execution:
 

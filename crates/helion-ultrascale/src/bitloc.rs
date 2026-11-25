@@ -30,7 +30,7 @@
 //!   the RAMB18 Y modulo 24 (`ArchSpec.num_18k_bram_per_column`).
 //!
 //! FASM emission follows the crew contract (`INTERFACES.md`) and the
-//! day-1 scout report (`report.md`, route-to-bitgen handoff):
+//! day-1 scout report (route-to-bitgen handoff, not in the repo):
 //! `SLICE_XxYy.A6LUT.INIT[63:0] = 64'h...`,
 //! `SLICE_XxYy.AFF.INIT.V0` / `SLICE_XxYy.AFF.INIT.V1`,
 //! `SLICE_XxYy.AFF.SRVAL.V0` / `SLICE_XxYy.AFF.SRVAL.V1`,

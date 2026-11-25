@@ -162,7 +162,7 @@ Total pair emits: 58 (planned 58). Total seconds (emit+bits): 862.1.
 
 ## Random FASM fuzz
 
-100 fresh random designs from gen_random.py, seed base 20261120 (design seeds 20261120 to 20261219), generated into /home/hatch/workspace/ultra-bitgen-sweeps-logs/fuzz-designs and run through the branch-copy harness loop (run_100.py, diff_design per design). Classes alternate bram/core; each design carries random LUT INITs, FF INIT/SRVAL, INT PIPs, and (bram class) random BRAM INIT/INITP, plus the frozen IO lines. CARRY8, LUTRAM mode, and FF control attributes are not generated (covered by the pair sweep); DSP48E2/URAM288/CLK are not generated (no public encoding).
+100 fresh random designs from gen_random.py, seed base 20261120 (design seeds 20261120 to 20261219), generated into ~/workspace/ultra-bitgen-sweeps-logs/fuzz-designs and run through the branch-copy harness loop (run_100.py, diff_design per design). Classes alternate bram/core; each design carries random LUT INITs, FF INIT/SRVAL, INT PIPs, and (bram class) random BRAM INIT/INITP, plus the frozen IO lines. CARRY8, LUTRAM mode, and FF control attributes are not generated (covered by the pair sweep); DSP48E2/URAM288/CLK are not generated (no public encoding).
 
 | Block | Green | Red | Blocked |
 | --- | ---: | ---: | ---: |
@@ -211,8 +211,8 @@ First blocked record per block (exact missing data):
 
 ## Commands
 
-- `sweep.py --pairs --out /home/hatch/workspace/ultra-bitgen-sweeps-logs/pairs-full`
-- `python3 gen_random.py --out /home/hatch/workspace/ultra-bitgen-sweeps-logs/fuzz-designs --count 100 --seed-base 20261120`
-- `run_fuzz_batches.sh`: 4 sequential `run_100.py` batches of 25 (`--start 0/25/50/75 --count 25`, --generated-dir /home/hatch/workspace/ultra-bitgen-sweeps-logs/fuzz-designs, --out fuzz-run-b<start>, --emitter-cmd <worktree>/target/release/helion-bitgen), then `merge_fuzz_batches.py` into /home/hatch/workspace/ultra-bitgen-sweeps-logs/fuzz-run`
+- `sweep.py --pairs --out ~/workspace/ultra-bitgen-sweeps-logs/pairs-full`
+- `python3 gen_random.py --out ~/workspace/ultra-bitgen-sweeps-logs/fuzz-designs --count 100 --seed-base 20261120`
+- `run_fuzz_batches.sh`: 4 sequential `run_100.py` batches of 25 (`--start 0/25/50/75 --count 25`, --generated-dir ~/workspace/ultra-bitgen-sweeps-logs/fuzz-designs, --out fuzz-run-b<start>, --emitter-cmd <worktree>/target/release/helion-bitgen), then `merge_fuzz_batches.py` into ~/workspace/ultra-bitgen-sweeps-logs/fuzz-run`
 
-Results: pair sweep.jsonl and pair_summary.json in /home/hatch/workspace/ultra-bitgen-sweeps-logs/pairs-full; fuzz diff.jsonl and manifest.json in /home/hatch/workspace/ultra-bitgen-sweeps-logs/fuzz-run; fuzz designs in /home/hatch/workspace/ultra-bitgen-sweeps-logs/fuzz-designs.
+Results: pair sweep.jsonl and pair_summary.json in ~/workspace/ultra-bitgen-sweeps-logs/pairs-full; fuzz diff.jsonl and manifest.json in ~/workspace/ultra-bitgen-sweeps-logs/fuzz-run; fuzz designs in ~/workspace/ultra-bitgen-sweeps-logs/fuzz-designs.

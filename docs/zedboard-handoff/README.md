@@ -1,7 +1,7 @@
 # Helion 7-Series Backend: ZedBoard Debug Handoff
 
-> STALE, Oct 22, 2026. Superseded by HANDOFF.md (the fresh combined
-> handoff) and HANDOFF-INDEX.md (the master map). Kept for history only.
+> STALE, Oct 22, 2026. Superseded by later handoffs; the current state is
+> docs/zedboard-handoff/LEVEL2.md. Kept for history only.
 > In particular the BUFG section below describes the 10-bit config as a
 > guess; the corrected 7-feature config and the BUFG tie-off fix landed
 > after this file was written.

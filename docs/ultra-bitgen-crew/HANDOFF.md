@@ -1,12 +1,8 @@
 # UltraScale+ bitgen handoff: everything needed to resume from here
 
-> A fresh combined handoff covering both tracks (ZedBoard and UltraScale+),
-> the goal, both fix lists, the hardware loop, and the Mac access problem,
-> is at `docs/HANDOFF.md` on branch fm/zedboard-fix-router and in the
-> zedboard-handoff folder. Read that file first. This file is the
-> UltraScale+ detail underneath it. The master map of the whole division
-> (all 25 sub-problems and where everything is stored) is
-> `docs/HANDOFF-INDEX.md`, on both branches.
+> This file is the UltraScale+ detail of the Nov 8, 2026 handoff. The
+> combined handoff and its index were operator notes and are not in the
+> repository; the sub-problem list is `subproblems/INDEX.md`.
 
 State as of Nov 8, 2026, about 11:45 EST. Branch `fm/ultra-bitstream`, tip `060b230`
 (merge of the tile-type-dependent INT column offset, `a63f49c`). Pushed to
@@ -199,7 +195,7 @@ files.
 
 ## License and the Q6 probe
 
-- License server 27000@license2.forest.usf.edu: connection refused Oct 22
+- License server: connection refused Oct 22
   through Nov 7. On Nov 8 about 10:27-10:31 EST the port appeared to ANSWER,
   but that finding was proven VOID later the same day (about 13:30 EST): a
   control test showed direct TCP connects from this VM succeed to every port,
@@ -207,7 +203,7 @@ files.
   gateway accepts the handshake and the check proves nothing about the license
   server. The license state is UNKNOWN. A real license checkout is still
   UNVERIFIED: no lmutil or Vivado exists on this VM. The real test is Vivado
-  on the cluster (sc.rc.usf.edu, campus/VPN only) or the PinPlanning probe.
+  on the cluster (campus/VPN only) or the PinPlanning probe.
 - The Q6 Vivado probe is the tilegrid unblocker. It is written up in
   `BRIEFS/tilegrid-research.md` (1,173 lines): step 1 tile inventory
   (extract_device_info.tcl plus `TILE_TYPE =~ HPIO*` arbiter queries, which
@@ -218,9 +214,9 @@ files.
   `vivado-fuzzing-package.zip`. The PinPlanning probe was prepared but never
   run on the cluster.
 - Sandbox limits (do not re-discover): outbound SSH from this VM is blocked
-  at the network level; sc.rc.usf.edu is unreachable from here (campus/VPN
-  only); USF VPN needs interactive Microsoft SAML SSO plus Duo, it cannot be
-  completed headlessly. Practical route: prepare scripts locally, Saksham runs
+  at the network level; the cluster is unreachable from here (campus/VPN
+  only); the VPN needs interactive SSO plus two-factor, it cannot be
+  completed headlessly. Practical route: prepare scripts locally, the owner runs
   them on the cluster, pastes back outputs.
 
 ## Values that are provisional or invented (never treat as truth)
@@ -323,7 +319,7 @@ Outside the repo (local only, NOT pushed; 350 MB, mostly harness runs):
    zero diff PLUS a critic re-run.
 6. Crew rules (`~/workspace/custom-skills/crew-flow/SKILL.md`): one spawner
    per crew; CTO spawns orchestrator plus critics only, the orchestrator
-   spawns workers. Never merge to master without Saksham's explicit word.
+   spawns workers. Never merge to master without the owner's explicit word.
 
 ## ZedBoard pointer (where focus went)
 
@@ -333,5 +329,5 @@ handoff package on the Mac at `~/Documents/zedboard-helion-debug/`. The v3
 tie-off bitstream (`~/workspace/zedboard-hw-loop/bitstreams/zedboard_blinky_v3_tieoff.bit`)
 is built and bit-verified but never hardware tested. The loop is: flash with
 `openFPGALoader -b zedboard --write-sram <file.bit>`, photograph the board
-with the Mac camera, check LD0, iterate. Ownership was with another AI via
-the Mac folder; Saksham redirected it to this agent on Nov 8, 2026.
+with the Mac camera, check LD0, iterate. Ownership was with another contributor via
+the Mac folder; it moved to this track on Nov 8, 2026.

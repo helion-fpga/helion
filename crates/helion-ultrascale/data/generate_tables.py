@@ -23,8 +23,8 @@ import json
 import sys
 from pathlib import Path
 
-DEFAULT_SOURCE = Path(
-    "/home/hatch/workspace/helion-ultra-bitstream/bitfiltrator-ref"
+DEFAULT_SOURCE = Path.home() / (
+    "workspace/helion-ultra-bitstream/bitfiltrator-ref"
     "/resources/archs/ULTRASCALE_PLUS.json"
 )
 EXPECTED_SHA256 = (

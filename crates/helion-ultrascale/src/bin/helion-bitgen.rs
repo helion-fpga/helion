@@ -119,8 +119,8 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage: helion-bitgen <emit|parse|bits|decode> --part PART [--fasm FILE --out FILE | --bit FILE] [--data-dir DIR] [--db-root DIR]";
 
-/// Default `--part` for `decode`: the proving part (Claude Code plan
-/// part 1a), the only part with a public tilegrid in prjuray-db.
+/// Default `--part` for `decode`: the proving part (plan part 1a), the
+/// only part with a public tilegrid in prjuray-db.
 const DEFAULT_DECODE_PART: &str = "xczu3eg-sbva484-1-e";
 
 /// Vendored segbits DB files, in load order. The CLB DBs carry the LUT
@@ -1702,7 +1702,9 @@ mod tests {
         if let Ok(p) = std::env::var("HELION_DECODE_DB_ROOT") {
             return PathBuf::from(p);
         }
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_default();
         PathBuf::from(home).join("workspace/prjuray-db-ref/zynqusp")
     }
 

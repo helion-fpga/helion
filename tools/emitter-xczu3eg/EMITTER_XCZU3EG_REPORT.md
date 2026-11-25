@@ -228,7 +228,7 @@ FFMUX gap, and asserting it would enshrine a known-bad state.
   new submission"), mid-suite-verification. Coordinator
   investigation: session files last wrote at the error time, the
   polled cargo process was gone, resume failed (terminal
-  subagent). Only a partial suite log survived (lib target, 235
+  worker). Only a partial suite log survived (lib target, 235
   passed). W-FLOW-2 (b8163e37) redid the work from scratch on
   the same branch and completed it. No work lost beyond the
   unfinished suite run.

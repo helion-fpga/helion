@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06 ~08:03 America/New_York (EDT)  
 **Branch:** `fm-hel-corpus-soft-pass` (PR #7, **NO MERGE**)  
-**Author:** saksham-45 `<72103486+saksham-45@users.noreply.github.com>`  
+**Author:** saksham-45  
 **CLI breadcrumb SHA:** `9ef40e9d21aabe2d5f0597c45b132e3617b560d8` (`9ef40e9`)  
 **Tip HEAD:** `826186afb1f45b4e0746db87179390c48e2b8b86` (`826186a`)  
 
@@ -52,7 +52,7 @@ Simulate/Wave uses workspace canvas label: `Simulate › Waveform · …`
 
 ## Board A (Mac)
 
-- Machine: `sakshams-MacBook-Pro-517.local` connected  
+- Machine: the Mac, connected  
 - USB: **empty** for FTDI/Lattice — no `/dev/tty.usb*`, no `0x0403` in tree  
 - Live OFL / `--cable native` / STAT TDO: **blocked** (soft-hold, no fake DONE)
 

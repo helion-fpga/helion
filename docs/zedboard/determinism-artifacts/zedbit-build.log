@@ -1,4 +1,4 @@
-build started 2026-11-19T17:54:47Z, HELION_XILINX_DB=/home/hatch/workspace/xilinx-dbsrc
+build started 2026-11-19T17:54:47Z, HELION_XILINX_DB=~/workspace/xilinx-dbsrc
     Blocking waiting for file lock on package cache
 warning: unused import: `Endpoint`
   --> crates/helion-ir/src/power_opt.rs:21:31
@@ -423,7 +423,7 @@ warning: value assigned to `depth` is never read
      = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
 
 warning: `helion-vhdl` (lib) generated 1 warning
-   Compiling helion-xilinx7 v4.0.0 (/home/hatch/workspace/helion-zedboard-determinism/crates/helion-xilinx7)
+   Compiling helion-xilinx7 v4.0.0 (~/workspace/helion-zedboard-determinism/crates/helion-xilinx7)
 warning: unused variable: `pin`
    --> crates/helion-xilinx7/examples/zedbit.rs:521:26
     |

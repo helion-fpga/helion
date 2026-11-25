@@ -3,7 +3,7 @@
 **When:** 2026-09-06 08:09 EDT  
 **Branch:** `fm-hel-corpus-soft-pass` (NO MERGE)  
 **Repo tip (commit):** `2714c61f7b4f734c184228d7b2798852b81526af`  
-**Author lock:** saksham-45 / 72103486+saksham-45@users.noreply.github.com
+**Author lock:** saksham-45
 
 ## Goals
 

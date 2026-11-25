@@ -68,9 +68,9 @@ Owner: orchestrator agent. Append-only. Newest at the bottom.
 
 ## Blockers
 
-- Vivado license server 27000@license2.forest.usf.edu connection refused
+- Vivado license server connection refused
   since Oct 22, 2026. Blocks tier-2 diff and xcvu3p device-file confirmation.
-  Saksham follows up with the lab admin. Carried from the day-1 crew.
+  The owner follows up with the license admin. Carried from the day-1 crew.
 - PinPlanning probe (license-free) not yet run on the cluster. It unblocks
   the INT PIP completeness audit. Carried from the day-1 crew.
 - /tmp/prjuray-db clone is gone (deployments wipe /tmp). segbits-vendor
@@ -119,7 +119,7 @@ The CTO spawned all 10 crew agents directly (created 1794088223) in
 parallel with the orchestrator task. The orchestrator, not yet seeing the
 CTO's spawns, spawned 7 workers of its own (created 1794088284, about 61
 seconds later) for the same 7 roles in the same 7 worktrees. Evidence:
-`subagent.list` showed 7 CTO-spawned workers (parent 4b6f28e0) and 7
+the worker list showed 7 CTO-spawned workers (parent 4b6f28e0) and 7
 orchestrator-spawned workers (parent 947547eb) all status running, plus
 critic-interfaces e64f7358 already done with its baseline critique in
 CRITIQUE.md.
@@ -3037,7 +3037,7 @@ plain clippy --all-targets blocked on helion-sv lib.rs:15059.
 
 - Base verified fresh: fm/ultra-bitstream tip fa58d5c, clean except untracked bitfiltrator-ref/. Critic 13 PASS (emitter), critic 14 PASS (HPIO bridge only, CRITIQUE.md:2506). Queue items 1-3 closed; emitter merged by orchestrator session 12.
 - Queue item 4 (golden-side SRVAL) IN FLIGHT, no spawn: orchestrator session 13 (0adb7d15) running, worker 2 wiring SRVAL into the harness resolver. runs/srval-golden verified from diff.jsonl: FRAMING green 0/3 both designs, LUT_INIT and INT_PIP green, FF_INIT blocked on the resolver gap. runs/srval-complete not yet present. FRAMING green is interim until the resolver fix plus a critic re-run.
-- LICENSE SERVER: TCP connect to license2.forest.usf.edu:27000 succeeded twice this run (DNS 198.18.111.127), first time the port answers since Oct 22. No lmutil or Vivado on this VM, so a real license checkout is NOT verified. Tier-2 diff still cannot run (2 designs only, tier 1 not at 100). Flagged as tier-2 progress; next runs re-check.
+- LICENSE SERVER: TCP connect to the license server port succeeded twice this run, first time the port answers since Oct 22. No lmutil or Vivado on this VM, so a real license checkout is NOT verified. Tier-2 diff still cannot run (2 designs only, tier 1 not at 100). Flagged as tier-2 progress; next runs re-check.
 
 ## 2026-11-08 ~10:55 EST: orchestrator session 14, xcku3p tilegrid (IO_CONFIG)
 
@@ -3195,4 +3195,4 @@ random-design generator (scheduler drives next).
 - Base verified fresh: fm/ultra-bitstream tip fa58d5c, clean except untracked bitfiltrator-ref/.
 - Critic session 15 PASS verified in CRITIQUE.md:2690: FRAMING green and the FF_INIT total change are formal, no defects. runs/srval-complete/diff.jsonl re-verified directly: blinky and counter both LUT_INIT, FF_INIT, INT_PIP, FRAMING green, diff 0; IO_CONFIG blocked 55; BRAM/DSP/URAM/CLK blocked.
 - Orchestrator session 14 (tilegrid) in flight, no spawn: agent 38efe3e3 running ~33 min; builder work live in ~/workspace/helion-ultra-bitgen-tilegrid (uncommitted INT-rule changes, 71 insertions / 37 deletions) and harness/runs/tilegrid-int-rule in progress (emit.bit/roundtrip.bit written 11:21-11:27 EST, no diff.jsonl yet). Tilegrid itself stays blocked pending the Q6 Vivado probe; HPIO_RIGHT may not exist on xcku3p (HPIO_L instead).
-- License server: TCP connect to license2.forest.usf.edu:27000 succeeded twice this run (DNS 198.18.111.127), same as 10:27. No lmutil/Vivado on this VM, so a real checkout is still unverified. Tier 2 still cannot run.
+- License server: TCP connect to the license server port succeeded twice this run, same as 10:27. No lmutil/Vivado on this VM, so a real checkout is still unverified. Tier 2 still cannot run.

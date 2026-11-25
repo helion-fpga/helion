@@ -19,7 +19,7 @@ STA, `timing: unsupported part xczu3eg`), which stops the flow
 before ROUTE no matter what the router does.
 
 The lane's premise changed mid-flight, and the change is the story:
-Saksham chose bitstream mining because the standing evidence said no
+The lane chose bitstream mining because the standing evidence said no
 public source maps BEL pins to INT wires. Characterization proved
 that premise wrong for CLE slices. `tileconn.json` was sitting in
 the public DB reference all along, missed because the prior check

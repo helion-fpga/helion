@@ -34,11 +34,12 @@ one example tile. Zero contradictions is a result and is stated so.
 Usage: python3 consistency.py <decoded-fasm> <out-json>
 """
 import json
+import os
 import re
 import sys
 from collections import Counter, defaultdict
 
-DB = "/home/hatch/workspace/prjuray-db-ref/zynqusp"
+DB = os.path.expanduser("~/workspace/prjuray-db-ref/zynqusp")
 PART = "xczu3eg-sbva484-1-e"
 
 PIP_RE = re.compile(r"^(.+?)\.PIP\.([^.]+)\.(.+)$")

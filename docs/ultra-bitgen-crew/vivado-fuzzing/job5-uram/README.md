@@ -51,8 +51,8 @@ else unblocks it.
 ## How to run (on the cluster, when the license works)
 
 Prerequisites and batch-mode rules are the package instructions
-(`vivado-fuzzing-instructions.md`): SSH to sc.rc.usf.edu as
-srivastava1, batch mode only, non-project flow, keep the Vivado
+(`vivado-fuzzing-instructions.md`): SSH to the cluster,
+batch mode only, non-project flow, keep the Vivado
 version consistent across all runs in the job, confirm the exact
 part string with `get_parts` (expect `xcvu3p-ffvc1517-2-e`).
 

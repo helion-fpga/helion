@@ -55,22 +55,22 @@ relevant lines are shown, and the trimming is stated.
 Command:
 
 ```
-diff /home/hatch/workspace/helion-ultra-bitstream/crates/helion-ultrascale/data/xcku3p.json /home/hatch/workspace/helion-ultra-bitstream/bitfiltrator-ref/resources/devices/xcku3p.json && echo IDENTICAL || echo DIFFER
-md5sum /home/hatch/workspace/helion-ultra-bitstream/crates/helion-ultrascale/data/xcku3p.json /home/hatch/workspace/helion-ultra-bitstream/bitfiltrator-ref/resources/devices/xcku3p.json
+diff ~/workspace/helion-ultra-bitstream/crates/helion-ultrascale/data/xcku3p.json ~/workspace/helion-ultra-bitstream/bitfiltrator-ref/resources/devices/xcku3p.json && echo IDENTICAL || echo DIFFER
+md5sum ~/workspace/helion-ultra-bitstream/crates/helion-ultrascale/data/xcku3p.json ~/workspace/helion-ultra-bitstream/bitfiltrator-ref/resources/devices/xcku3p.json
 ```
 
 Output:
 
 ```
 IDENTICAL
-e4e060cb73f243eccbe9dacf23072897  /home/hatch/workspace/helion-ultra-bitstream/crates/helion-ultrascale/data/xcku3p.json
-e4e060cb73f243eccbe9dacf23072897  /home/hatch/workspace/helion-ultra-bitstream/bitfiltrator-ref/resources/devices/xcku3p.json
+e4e060cb73f243eccbe9dacf23072897  ~/workspace/helion-ultra-bitstream/crates/helion-ultrascale/data/xcku3p.json
+e4e060cb73f243eccbe9dacf23072897  ~/workspace/helion-ultra-bitstream/bitfiltrator-ref/resources/devices/xcku3p.json
 ```
 
 The harness copy is also identical:
 
 ```
-diff -q /home/hatch/workspace/ultra-bitgen-crew/harness/reference/xcku3p.json /home/hatch/workspace/helion-ultra-bitstream/crates/helion-ultrascale/data/xcku3p.json && echo SAME || echo DIFFER
+diff -q ~/workspace/ultra-bitgen-crew/harness/reference/xcku3p.json ~/workspace/helion-ultra-bitstream/crates/helion-ultrascale/data/xcku3p.json && echo SAME || echo DIFFER
 SAME
 ```
 
@@ -81,7 +81,7 @@ Command:
 ```
 python3 -c "
 import json, pathlib
-for p in ['/home/hatch/workspace/helion-ultra-bitstream/crates/helion-ultrascale/data/xcku3p.json','/home/hatch/workspace/helion-ultra-bitstream/bitfiltrator-ref/resources/devices/xcku3p.json']:
+for p in ['~/workspace/helion-ultra-bitstream/crates/helion-ultrascale/data/xcku3p.json','~/workspace/helion-ultra-bitstream/bitfiltrator-ref/resources/devices/xcku3p.json']:
     d=json.load(open(p))
     print('==',p)
     print('top keys:', list(d.keys()))
@@ -98,7 +98,7 @@ for p in ['/home/hatch/workspace/helion-ultra-bitstream/crates/helion-ultrascale
 Output (identical for both files, shown once):
 
 ```
-== /home/hatch/workspace/helion-ultra-bitstream/crates/helion-ultrascale/data/xcku3p.json
+== ~/workspace/helion-ultra-bitstream/crates/helion-ultrascale/data/xcku3p.json
 top keys: ['device', 'license', 'num_brams', 'num_dsps', 'num_luts', 'num_regs', 'num_slices', 'num_slrs', 'part', 'slrs', 'tileType_siteType_pairs']
   device: str = 'xcku3p'
   license: str = 'Webpack'
@@ -120,7 +120,7 @@ Command (keys and per-table sizes for all four row majors):
 ```
 python3 << 'PY'
 import json
-p='/home/hatch/workspace/helion-ultra-bitstream/crates/helion-ultrascale/data/xcku3p.json'
+p='~/workspace/helion-ultra-bitstream/crates/helion-ultrascale/data/xcku3p.json'
 d=json.load(open(p))
 slr=d['slrs']['SLR0']
 print("SLR0 keys:", list(slr.keys()))
@@ -199,7 +199,7 @@ Command:
 ```
 python3 << 'PY'
 import json
-p='/home/hatch/workspace/helion-ultra-bitstream/crates/helion-ultrascale/data/xcku3p.json'
+p='~/workspace/helion-ultra-bitstream/crates/helion-ultrascale/data/xcku3p.json'
 txt=open(p).read()
 print("contains HPIO_RIGHT?", "HPIO_RIGHT" in txt)
 print("contains HPIO?", "HPIO" in txt)
@@ -250,7 +250,7 @@ Command:
 ```
 python3 -c "
 import json, glob
-for p in sorted(glob.glob('/home/hatch/workspace/helion-ultra-bitstream/bitfiltrator-ref/resources/devices/*.json')):
+for p in sorted(glob.glob('~/workspace/helion-ultra-bitstream/bitfiltrator-ref/resources/devices/*.json')):
     d=json.load(open(p))
     pairs=[t for t,s in d['tileType_siteType_pairs']]
     print(p.split('/')[-1], 'HPIO_RIGHT' in pairs, 'HPIO_L' in pairs, 'HDIO_BOT_RIGHT' in pairs, 'CMT_RIGHT' in pairs, 'CMT_L' in pairs)
@@ -426,7 +426,7 @@ file. Command confirming no HPIO/HDIO string exists anywhere in the
 BitFiltrator Python sources or arch JSONs:
 
 ```
-grep -rn "HPIO\|HDIO\|hpio\|hdio" /home/hatch/workspace/helion-ultra-bitstream/bitfiltrator-ref/src/*.py /home/hatch/workspace/helion-ultra-bitstream/bitfiltrator-ref/resources/archs/*.json
+grep -rn "HPIO\|HDIO\|hpio\|hdio" ~/workspace/helion-ultra-bitstream/bitfiltrator-ref/src/*.py ~/workspace/helion-ultra-bitstream/bitfiltrator-ref/resources/archs/*.json
 ```
 
 Output: empty (no matches). The `device_summary.py` getters are
@@ -480,20 +480,20 @@ column majors; those need the bitstream/.ll step.
 ### Q3.1 Files and identity
 
 ```
-ls /home/hatch/workspace/prjuray-db-ref/zynqusp/xczu3eg-sbva484-1-e/ /home/hatch/workspace/prjuray-db-ref/zynqusp/xczu3eg-sfvc784-1-e/
+ls ~/workspace/prjuray-db-ref/zynqusp/xczu3eg-sbva484-1-e/ ~/workspace/prjuray-db-ref/zynqusp/xczu3eg-sfvc784-1-e/
 ```
 
 Output:
 
 ```
-/home/hatch/workspace/prjuray-db-ref/zynqusp/xczu3eg-sbva484-1-e/:
+~/workspace/prjuray-db-ref/zynqusp/xczu3eg-sbva484-1-e/:
 package_pins.csv
 part.json
 part.yaml
 tileconn.json
 tilegrid.json
 
-/home/hatch/workspace/prjuray-db-ref/zynqusp/xczu3eg-sfvc784-1-e/:
+~/workspace/prjuray-db-ref/zynqusp/xczu3eg-sfvc784-1-e/:
 package_pins.csv
 part.json
 part.yaml
@@ -505,11 +505,11 @@ The two tilegrids are byte-identical (same part, different packages;
 the tilegrid is package-independent):
 
 ```
-diff -q /home/hatch/workspace/prjuray-db-ref/zynqusp/xczu3eg-sbva484-1-e/tilegrid.json /home/hatch/workspace/prjuray-db-ref/zynqusp/xczu3eg-sfvc784-1-e/tilegrid.json && echo TILEGRID_IDENTICAL || echo TILEGRID_DIFFER
+diff -q ~/workspace/prjuray-db-ref/zynqusp/xczu3eg-sbva484-1-e/tilegrid.json ~/workspace/prjuray-db-ref/zynqusp/xczu3eg-sfvc784-1-e/tilegrid.json && echo TILEGRID_IDENTICAL || echo TILEGRID_DIFFER
 TILEGRID_IDENTICAL
-md5sum /home/hatch/workspace/prjuray-db-ref/zynqusp/xczu3eg-sbva484-1-e/tilegrid.json /home/hatch/workspace/prjuray-db-ref/zynqusp/xczu3eg-sfvc784-1-e/tilegrid.json
-7cea605749f946f896338fa527fccf1e  /home/hatch/workspace/prjuray-db-ref/zynqusp/xczu3eg-sbva484-1-e/tilegrid.json
-7cea605749f946f896338fa527fccf1e  /home/hatch/workspace/prjuray-db-ref/zynqusp/xczu3eg-sfvc784-1-e/tilegrid.json
+md5sum ~/workspace/prjuray-db-ref/zynqusp/xczu3eg-sbva484-1-e/tilegrid.json ~/workspace/prjuray-db-ref/zynqusp/xczu3eg-sfvc784-1-e/tilegrid.json
+7cea605749f946f896338fa527fccf1e  ~/workspace/prjuray-db-ref/zynqusp/xczu3eg-sbva484-1-e/tilegrid.json
+7cea605749f946f896338fa527fccf1e  ~/workspace/prjuray-db-ref/zynqusp/xczu3eg-sfvc784-1-e/tilegrid.json
 ```
 
 Size: 15 MB, 66,385 tiles, 158 distinct tile types. `part.json`
@@ -740,7 +740,7 @@ Command:
 ```
 python3 << 'PY'
 import sys
-sys.path.insert(0, '/home/hatch/workspace/ultra-bitgen-crew/harness')
+sys.path.insert(0, '~/workspace/ultra-bitgen-crew/harness')
 from reference import Tier1Reference
 ref = Tier1Reference()
 for feat in ['IOB_X0Y0.IOSTANDARD_IN.LVCMOS12','IOB_X0Y1.IOSTANDARD_OUT.LVCMOS12_IDRIVE_I2_SLEW_SLEW_SLOW']:

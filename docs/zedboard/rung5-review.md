@@ -1,8 +1,8 @@
 # Rung 5 review (fm/zedboard-rung5 at 8b9f2d9)
 
-Checked on the Mac by Claude Code on 2026-11-19 with the fm/zedboard-merge
+Checked on the Mac on 2026-11-19 with the fm/zedboard-merge
 binaries (zedbit and hnf), the prjxray database and verilator. Nothing on
-fm/zedboard-rung5 was changed; fixes stay with Muse, who owns those files.
+fm/zedboard-rung5 was changed; fixes stay with the owner of those files.
 
 ## Results
 
@@ -55,8 +55,8 @@ Smaller points (fix if cheap):
   waits 1 ms after VBAT.
 - A testbench with a small SSD1306 SPI model (sample SDIN on SCLK rising,
   check D/C per byte, check the 25 init bytes and 512 data bytes) would have
-  caught 2 and 3. Muse cannot run it on its box; push it and Claude Code runs
-  it here.
+  caught 2 and 3. It needs a machine with a simulator; the Mac here has
+  one.
 
 ## zedboard_vga
 

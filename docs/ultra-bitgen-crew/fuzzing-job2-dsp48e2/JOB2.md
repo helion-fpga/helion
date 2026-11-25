@@ -1,7 +1,7 @@
 # Vivado fuzzing job 2: DSP48E2 config bits
 
 Status: READY TO RUN, blocked on a verified Vivado license checkout.
-License server `27000@license2.forest.usf.edu` has refused connections
+The Vivado license server has refused connections
 since Oct 22, 2026; license state is UNKNOWN from this VM. Do not run
 any license-port connect check from this VM: a TCP connect proves
 nothing. The driver (see `run_job2.sh`) checks the license the only

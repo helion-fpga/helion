@@ -54,7 +54,7 @@ would have to return). "Probably unfillable" is not done.
    constraint.
 4. If the bits are found, wire them in and run the blinky: LD6 and LD7
    must light. If they are proven unfillable, update this file and
-   docs/HANDOFF.md with the exact missing data and close the sub-problem
+   docs/zedboard-handoff/GAPS.md with the exact missing data and close the sub-problem
    as "blocked on Vivado data", not as "done".
 
 ## Files and commands

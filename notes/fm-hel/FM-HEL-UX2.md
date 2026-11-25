@@ -4,7 +4,7 @@
 **Branch:** `fm-hel-corpus-soft-pass` (PR #7, **NO MERGE**)  
 **Score tip (branch HEAD):** `55b9d1844686362eb14cdd7b0bed5faea2e80c21` (`55b9d18`)  
 **Sim abut chrome:** `e521e45`  
-**Author:** saksham-45 `<72103486+saksham-45@users.noreply.github.com>`
+**Author:** saksham-45
 
 ## Gold
 

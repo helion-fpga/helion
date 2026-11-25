@@ -61,7 +61,7 @@ For each new device family:
 
 ## Current Blockers
 
-- No Vivado access (USF cluster requires VPN + SAML, not available from sandbox)
+- No Vivado access (the cluster requires VPN + SSO, not available from sandbox)
 - No hardware yet (ZedBoard pickup pending)
 - iCE40/ECP5: need IceStorm/Trellis timing data or nextpnr reports
 

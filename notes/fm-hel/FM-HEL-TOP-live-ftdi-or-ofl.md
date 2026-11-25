@@ -14,7 +14,7 @@ Try **live** FTDI / openFPGALoader on captain's Mac (`e6c67522-8627-418d-a593-df
 
 | Check | Result |
 |-------|--------|
-| `ListMachines` | Mac listed `connected: true` (sakshams-MacBook-Pro-517.local) |
+| `ListMachines` | Mac listed `connected: true` |
 | Shell / Read via machineId | **Repeatedly failed:** `temporarily unreachable` (spawn error) — no `system_profiler`, no PATH OFL check, no Mac repo sync possible this turn |
 | Box USB / FTDI | **0** FTDI (VID 0x0403); `openFPGALoader` not on PATH |
 | OFL program | **Not run** — no probe + no OFL on box; never invent Helion TAP STAT |

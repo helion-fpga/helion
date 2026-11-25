@@ -1,8 +1,8 @@
 //! End-to-end: examples/blinky_reg.sv -> pack -> place -> route -> FASM ->
 //! frames -> `.bit` for xc7z020 (ZedBoard).
 //!
-//! blinky_reg.sv is the faithful SystemVerilog equivalent of the Vivado
-//! oracle source ~/CDA4253_A1/blinky.vhd (GT-blinky.bit, md5
+//! blinky_reg.sv is the faithful SystemVerilog equivalent of a Vivado
+//! reference blinky in VHDL (GT-blinky.bit, md5
 //! 3f6d7cfa8a5db206e5cf6fd0e3568324): 25-bit counter plus registered LD0,
 //! 26 flops. Same part (xc7z020clg484-1), same pins (clk Y9, LD0 T22),
 //! same 100 MHz clock. This is the Helion half of the ZB-10 Vivado diff

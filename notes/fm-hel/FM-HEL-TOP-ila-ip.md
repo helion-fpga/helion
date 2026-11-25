@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-09 ~23:50 America/New_York (EDT)  
 **Branch:** `fm-hel-vivado-sim` (**NO MERGE** / soft-hold)  
-**Author:** saksham-45 `<72103486+saksham-45@users.noreply.github.com>`  
+**Author:** saksham-45  
 **Remote:** push **only** `origin fm-hel-vivado-sim` (never force-push, never rewrite history)
 
 ## Problem

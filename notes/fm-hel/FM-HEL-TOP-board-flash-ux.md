@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06 ~08:10 America/New_York (EDT)  
 **Branch:** `fm-hel-top` (new PR off master after #7 merge, **NO MERGE**)  
-**Author:** saksham-45 `<72103486+saksham-45@users.noreply.github.com>`  
+**Author:** saksham-45  
 **Goal:** Honest Program-rail UX while Board A / FTDI is soft-hold. Do **not** claim board DONE.
 
 ## Constraints held
