@@ -9,6 +9,10 @@
 //! checkpoints. Utilization, DRC and the die/placement come from the family
 //! crate (helion-targets `reports`), timing from the family's delay model;
 //! there is no power model for these families, so no power report.
+//!
+//! 7-series parts (the ZedBoard's xc7z020 among them) skip all of the above
+//! and run [`run_xdc_flow`]: the HDL + XDC flow `zedbit` runs, with its own
+//! synthesis and timing, writing the real `.bit`.
 
 use std::path::{Path, PathBuf};
 
@@ -211,6 +215,178 @@ pub fn run_family(
     })
 }
 
+/// True for 7-series parts, which build with the HDL + XDC flow (`zedbit`'s).
+pub fn is_xilinx7(part: &str) -> bool {
+    helion_targets::family_of(part) == Some(helion_targets::Family::Xilinx7)
+}
+
+/// HDL sources, constraint files and top of a run source: a `.prj` lists
+/// them; a single HDL file uses its sibling `<stem>.xdc`.
+fn xdc_inputs(source: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>, Option<String>), String> {
+    if source.extension().is_some_and(|e| e.eq_ignore_ascii_case("prj")) {
+        let text = std::fs::read_to_string(source).map_err(|e| format!("{}: {e}", source.display()))?;
+        let prj = helion_proj::load_prj(&text)?;
+        let res = |v: &[String]| v.iter().map(|s| helion_proj::resolve_prj_path(source, s)).collect::<Vec<_>>();
+        let xdc: Vec<PathBuf> = res(&prj.constraint_files).into_iter().filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("xdc"))).collect();
+        return Ok((res(&prj.sources), xdc, prj.top));
+    }
+    let xdc = source.with_extension("xdc");
+    Ok((vec![source.to_path_buf()], if xdc.is_file() { vec![xdc] } else { Vec::new() }, None))
+}
+
+/// Utilization of a packed 7-series design against the device's sites.
+fn x7_util(p: &helion_targets::xdc_flow_types::Packed7, dev: &helion_targets::xdc_flow_types::Device, design: &str) -> UtilState {
+    let slices = dev.slices().len() as u32;
+    UtilState {
+        luts_used: p.luts.len() as u32,
+        luts_avail: slices * 4,
+        regs_used: p.ffs.len() as u32,
+        regs_avail: slices * 8,
+        bram_used: p.brams.len() as u32,
+        bram_avail: dev.bram36_sites().len() as u32,
+        io_used: p.iobs.len() as u32,
+        io_avail: dev.iob_sites().len() as u32,
+        dsp_used: p.dsps.len() as u32,
+        dsp_avail: dev.dsp48_sites().len() as u32,
+        bufg_used: p.bufgs.len() as u32,
+        bufg_avail: dev.bufg_sites().len() as u32,
+        design: design.to_string(),
+        family: helion_targets::Family::Xilinx7.label().to_string(),
+        family_labels: ["LUT6", "FF", "RAMB36/18", "IOB", "DSP48E1", "BUFG"].map(String::from).to_vec(),
+        ..UtilState::default()
+    }
+}
+
+/// The flow's routed timing as the Timing view's summary, clocks and worst
+/// path (one row per path step, with its routed wire delay).
+fn x7_timing(b: &helion_targets::xdc_flow::Built) -> TimingState {
+    let a = &b.timing;
+    let mut clocks: Vec<crate::state::TimingClock> = b
+        .periods
+        .iter()
+        .map(|(net, &ps)| crate::state::TimingClock { name: net.clone(), period_ps: ps as u64, source: net.clone(), generated: false, master: None })
+        .collect();
+    clocks.sort_by(|x, y| x.name.cmp(&y.name));
+    let mut pins = Vec::new();
+    let mut prev = 0i64;
+    for st in &a.worst_path {
+        let at = st.arrival_ps as i64;
+        if st.wire_ps > 0 {
+            pins.push(crate::state::TimingPinRow { cell: st.what.clone(), delay_type: "net".into(), incr_ps: st.wire_ps as i64, path_ps: prev + st.wire_ps as i64, ..Default::default() });
+        }
+        pins.push(crate::state::TimingPinRow { cell: st.what.clone(), delay_type: "cell".into(), incr_ps: at - prev - st.wire_ps as i64, path_ps: at, ..Default::default() });
+        prev = at;
+    }
+    let paths = match (a.worst_path.first(), a.worst_path.last()) {
+        (Some(f), Some(l)) => vec![crate::state::TimingPathRow {
+            name: "Path 1 (worst)".into(),
+            from: f.what.clone(),
+            to: l.what.clone(),
+            slack_ps: a.wns_ps,
+            delay_ps: l.arrival_ps as i64,
+            pins,
+            ..Default::default()
+        }],
+        _ => Vec::new(),
+    };
+    TimingState {
+        wns_ps: Some(a.wns_ps),
+        tns_ps: a.wns_ps.min(0),
+        failing_endpoints: a.failing_endpoints,
+        failing_setup: a.failing_endpoints,
+        endpoints: a.endpoints,
+        has_run: true,
+        clocks,
+        paths,
+        ..TimingState::default()
+    }
+}
+
+/// Synthesis-only run on a 7-series part: the flow's front end, then the
+/// packer for resource counts (no placement, so no die and no timing).
+pub fn run_xdc_synth(source: &Path, part: &str, send: &dyn Fn(String, MsgSev)) -> Result<RunArtifacts, String> {
+    use helion_targets::xdc_flow_types::Backend;
+    let part = helion_targets::canonical_part(part);
+    let (srcs, _, top) = xdc_inputs(source)?;
+    if srcs.is_empty() {
+        return Err(format!("{}: no HDL sources", source.display()));
+    }
+    let design_arg = srcs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(",");
+    let mut log = |l: &str| send(l.to_string(), MsgSev::Info);
+    let (design, _) = helion_targets::xdc_flow::synth(&design_arg, top.as_deref(), "auto", &mut log)?;
+    let be = helion_targets::xdc_flow_types::Xilinx7Backend::open(part)?;
+    let packed = be.pack(&design)?;
+    let stem = helion_ir::resolve(design.name).to_string();
+    let util = x7_util(&packed, be.device(), &stem);
+    send(format!("report_utilization {} LUT6={}/{} FF={}/{} (7-series packer)", part, util.luts_used, util.luts_avail, util.regs_used, util.regs_avail), MsgSev::Info);
+    Ok(RunArtifacts {
+        cells: design.cells.len(),
+        part: part.to_string(),
+        summary: format!("{} LUTs, {} FFs after packing on {part}", packed.luts.len(), packed.ffs.len()),
+        util: Some(util),
+        design: Some(design),
+        ..RunArtifacts::default()
+    })
+}
+
+/// Implement `source` on a 7-series part with `helion_targets::xdc_flow`
+/// (synthesis, pins from the XDC, pack, place, route, timing, `.bit`), the
+/// flow `zedbit` runs, and report it to the IDE: utilization, slack, the
+/// die with every placed primitive, and the netlist for the schematic.
+pub fn run_xdc_flow(source: &Path, part: &str, out_dir: &Path, send: &dyn Fn(String, MsgSev)) -> Result<RunArtifacts, String> {
+    let part = helion_targets::canonical_part(part);
+    let (srcs, xdcs, top) = xdc_inputs(source)?;
+    if srcs.is_empty() {
+        return Err(format!("{}: no HDL sources", source.display()));
+    }
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
+    let xdc = match xdcs.as_slice() {
+        [] => return Err(format!("{part}: no .xdc constraints; every top-level port needs a PACKAGE_PIN (add one with read_xdc in the project, or put <name>.xdc next to the source)")),
+        [one] => one.clone(),
+        many => {
+            // xdc_flow reads one file; several are read in project order.
+            let mut text = String::new();
+            for f in many {
+                text.push_str(&std::fs::read_to_string(f).map_err(|e| format!("{}: {e}", f.display()))?);
+                text.push('\n');
+            }
+            let joined = out_dir.join("constraints.xdc");
+            std::fs::write(&joined, text).map_err(|e| format!("{}: {e}", joined.display()))?;
+            joined
+        }
+    };
+    let stem = top.clone().or_else(|| srcs[0].file_stem().and_then(|s| s.to_str()).map(str::to_string)).unwrap_or_else(|| "design".into());
+    let bit = out_dir.join(format!("{stem}.bit"));
+    let design_arg = srcs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(",");
+    send(format!("launch_runs impl_1 -part {part} (Xilinx 7-Series, xdc_flow) read_xdc {}", xdc.display()), MsgSev::Info);
+    let mut log = |l: &str| send(l.to_string(), MsgSev::Info);
+    let b = helion_targets::xdc_flow::run(&design_arg, &xdc.display().to_string(), &bit.display().to_string(), top.as_deref(), false, "auto", part, None, &mut log)?
+        .ok_or("xdc_flow stopped before routing")?;
+    let dev = b.backend.device();
+    let p = &b.routed.placed.packed;
+    let util = x7_util(p, dev, &stem);
+    let timing = x7_timing(&b);
+    send(format!("report_timing_summary WNS={:.3} ns (period {:.3} ns)", b.slack_ns, b.period_ns), MsgSev::Info);
+    send(format!("zedbit: summary {}", b.summary), MsgSev::Info);
+    let bytes = std::fs::metadata(&bit).map(|m| m.len() as usize).unwrap_or(0);
+    send(format!("write_bitstream {} ({bytes} bytes)", bit.display()), MsgSev::Info);
+    let family_die = Some(FamilyDie {
+        grid: helion_targets::reports::xilinx_die(dev, part),
+        placed: helion_targets::reports::xilinx_placement(&b.routed, dev),
+    });
+    Ok(RunArtifacts {
+        cells: b.design.cells.len(),
+        part: part.to_string(),
+        summary: format!("{} LUTs, {} FFs, WNS {:.3} ns; {} written", p.luts.len(), p.ffs.len(), b.slack_ns, bit.display()),
+        util: Some(util),
+        timing: Some(timing),
+        family_die,
+        design: Some(b.design),
+        bit_file: Some(bit.clone()),
+        ..RunArtifacts::default()
+    })
+}
+
 /// Scene/test fixture: implement `examples/counter.sv` on `part` through the
 /// real family flow (temp output dir) and apply the run's reports.
 pub fn seed_family_fixture(s: &mut crate::state::AppState, part: &str) -> Result<(), String> {
@@ -252,6 +428,37 @@ pub fn seed_family_fixture(s: &mut crate::state::AppState, part: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zedboard_blinky_project_builds_a_bit_with_the_xdc_flow() {
+        if !helion_targets::zynq_db_present() {
+            eprintln!("skipped: no zynq7 X-Ray database");
+            return;
+        }
+        let prj = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/zedboard_blinky.prj");
+        let dir = std::env::temp_dir().join(format!("helion-rune-xdc-{}", std::process::id()));
+        let art = run_xdc_flow(&prj, "xc7z020", &dir, &|_, _| {}).expect("xdc flow");
+        let bit = std::fs::read(dir.join("zedboard_blinky.bit")).expect(".bit written");
+        let _ = std::fs::remove_dir_all(&dir);
+        // Sync word of a 7-series configuration stream.
+        assert!(bit.windows(4).any(|w| w == [0xAA, 0x99, 0x55, 0x66]), "no sync word in {} bytes", bit.len());
+        assert_eq!(art.part, "xc7z020clg484-1");
+        let u = art.util.expect("utilization");
+        assert_eq!((u.io_used, u.regs_used), (9, 27), "clk + 8 LEDs, 27-bit counter");
+        let t = art.timing.expect("timing");
+        assert!(t.wns_ps.expect("wns") >= 0);
+        assert_eq!(t.clocks.len(), 1, "one 100 MHz clock: {:?}", t.clocks);
+        assert_eq!(t.clocks[0].period_ps, 10_000);
+        assert!(t.endpoints >= 27 && !t.paths.is_empty() && !t.paths[0].pins.is_empty());
+        let syn = run_xdc_synth(&prj, "xc7z020", &|_, _| {}).expect("synth run");
+        assert_eq!(syn.util.expect("util").luts_avail, 53_200);
+        // Reports that need an HL10 model refuse the part instead of using HL10T numbers.
+        assert!(crate::runs::resolve_device("xc7z020", &|_, _| {}).is_err());
+        let die = art.family_die.expect("die");
+        assert!(die.grid.count(helion_targets::reports::TileClass::Logic) > 1000);
+        assert_eq!(die.placed.iter().filter(|p| p.class == helion_targets::reports::TileClass::Io).count(), 9);
+        assert!(art.design.is_some(), "netlist for the schematic");
+    }
 
     #[test]
     fn ice40_run_writes_an_asc_with_project_pins() {

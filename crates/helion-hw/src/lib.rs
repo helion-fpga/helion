@@ -983,6 +983,58 @@ pub fn resolve_ofl_board(part: Option<&str>) -> Option<String> {
     }
     part.and_then(lookup_had_board)
         .map(|b| b.ofl_board.to_string())
+        .or_else(|| part.and_then(xilinx_ofl_board).map(str::to_string))
+}
+
+/// openFPGALoader `-b` for the 7-series boards Helion builds for. Kept out of
+/// [`HAD_KNOWN_BOARDS`], whose IDCODEs mark a TAP as a Helion HL10T.
+fn xilinx_ofl_board(part: &str) -> Option<&'static str> {
+    // clg484 is the ZedBoard's package (PYNQ-Z1 and MicroZed are clg400).
+    part.to_ascii_lowercase().starts_with("xc7z020clg484").then_some("zedboard")
+}
+
+/// A copy of a 7-series `.bit` that is safe to load over a running design:
+/// `CMD=SHUTDOWN`, 32 NOOPs and a fresh `RCRC` go in right after the first
+/// `RCRC`. On the ZedBoard a JTAG reload with openFPGALoader does not clear
+/// the PL (G87): without SHUTDOWN the new frames land in live fabric and every
+/// flop keeps the previous design's value. The added `RCRC` restarts the CRC,
+/// so the bitstream's own CRC checks are unchanged.
+pub fn x7_bit_with_shutdown(bit: &[u8]) -> Result<Vec<u8>, String> {
+    let err = |m: &str| Err(format!("x7 reload: {m}"));
+    // Header: 13 fixed bytes, then keyed fields ('a'..'d' have a u16 length,
+    // 'e' a u32 length followed by the configuration data).
+    let mut i = 13;
+    let len_at = loop {
+        let Some(&key) = bit.get(i) else { return err("no 'e' field in the .bit header") };
+        if key == b'e' {
+            break i + 1;
+        }
+        let Some(n) = bit.get(i + 1..i + 3) else { return err("truncated .bit header") };
+        i += 3 + usize::from(u16::from_be_bytes([n[0], n[1]]));
+    };
+    let Some(n) = bit.get(len_at..len_at + 4) else { return err("truncated .bit header") };
+    let body = len_at + 4;
+    let data_len = u32::from_be_bytes([n[0], n[1], n[2], n[3]]) as usize;
+    if bit.len() - body != data_len {
+        return err("data length in the header does not match the file");
+    }
+    let words = |ws: &[u32]| ws.iter().flat_map(|w| w.to_be_bytes()).collect::<Vec<u8>>();
+    let rcrc = words(&[0x3000_8001, 0x0000_0007]);
+    let sync = words(&[0xAA99_5566]);
+    let Some(s) = bit[body..].windows(4).position(|w| w == sync.as_slice()) else { return err("no sync word") };
+    let from = body + s;
+    let Some(r) = bit[from..].windows(8).position(|w| w == rcrc.as_slice()) else { return err("no RCRC after sync") };
+    let at = from + r + 8;
+    let mut ins = words(&[0x3000_8001, 0x0000_000B]); // CMD = SHUTDOWN
+    ins.extend(words(&[0x2000_0000; 32]));
+    ins.extend(&rcrc);
+    let mut out = Vec::with_capacity(bit.len() + ins.len());
+    out.extend_from_slice(&bit[..len_at]);
+    out.extend(((data_len + ins.len()) as u32).to_be_bytes());
+    out.extend_from_slice(&bit[body..at]);
+    out.extend(ins);
+    out.extend_from_slice(&bit[at..]);
+    Ok(out)
 }
 
 fn ofl_verify_enabled() -> bool {
@@ -2033,6 +2085,30 @@ impl ProgramOutcome {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn x7_bit_with_shutdown_inserts_after_first_rcrc() {
+        let be = |ws: &[u32]| ws.iter().flat_map(|w| w.to_be_bytes()).collect::<Vec<u8>>();
+        let data = be(&[0xFFFF_FFFF, 0xAA99_5566, 0x2000_0000, 0x3000_8001, 7, 0x3001_8001, 0xDEAD_BEEF, 0x3000_8001, 7]);
+        let mut bit = vec![0, 9, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0, 0, 1];
+        bit.extend(b"a\0\x02x\0");
+        bit.push(b'e');
+        bit.extend((data.len() as u32).to_be_bytes());
+        let body = bit.len();
+        bit.extend(&data);
+        let out = x7_bit_with_shutdown(&bit).expect("patch");
+        let ins = 4 * (2 + 32 + 2);
+        assert_eq!(out.len(), bit.len() + ins);
+        assert_eq!(&out[body - 4..body], ((data.len() + ins) as u32).to_be_bytes());
+        // Sync, NOOP, RCRC untouched; then SHUTDOWN, NOOPs, RCRC; then the rest.
+        let at = body + 20;
+        assert_eq!(&out[..at], &{ let mut h = bit[..body - 4].to_vec(); h.extend(((data.len() + ins) as u32).to_be_bytes()); h.extend(&data[..20]); h });
+        assert_eq!(&out[at..at + 8], be(&[0x3000_8001, 0xB]));
+        assert_eq!(&out[at + 8..at + 136], be(&[0x2000_0000; 32]));
+        assert_eq!(&out[at + 136..at + 144], be(&[0x3000_8001, 7]));
+        assert_eq!(&out[at + 144..], &data[20..]);
+        assert!(x7_bit_with_shutdown(&bit[..body + 8]).is_err(), "length mismatch must be refused");
+    }
     use super::*;
     use helion_device::Device;
     use std::path::PathBuf;
@@ -2990,6 +3066,11 @@ mod tests {
         assert_eq!(row.usb_vid, 0x0403);
         assert_eq!(row.usb_pid, 0x6010);
         assert!(lookup_had_board("no-such-part").is_none());
+        // The ZedBoard's part loads with `-b zedboard` but is not a Helion TAP.
+        if std::env::var("HELION_OFL_BOARD").is_err() {
+            assert_eq!(resolve_ofl_board(Some("xc7z020clg484-1")).as_deref(), Some("zedboard"));
+            assert!(lookup_had_board("xc7z020clg484-1").is_none());
+        }
         assert_eq!(
             resolve_ofl_board(Some("HL10T-C32-1")).as_deref(),
             Some("helion_hl10t")

@@ -416,6 +416,9 @@ fn compute_qor_report(s: &AppState) -> Result<(QorSnapshot, Option<String>), Str
     };
     let (dev, device_part, fallback_note) = match helion_device::Device::load_part(requested) {
         Ok(dev) => (dev, requested.to_string(), None),
+        Err(_) if crate::views::device_family::is_family_part(requested) => {
+            return Err(format!("{requested}: QoR suggestions need a Helion (HL10) device model and are not available for this family yet"));
+        }
         Err(first) if requested != FALLBACK_PART => {
             let dev = helion_device::Device::load_part(FALLBACK_PART).map_err(|e| {
                 format!("no Helion device model (tried {requested}, {FALLBACK_PART}): {e}")

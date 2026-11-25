@@ -9,13 +9,9 @@ helion-ir = { workspace = true }
 helion-backend = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
-
-[dev-dependencies]
+# Synthesis for the HDL + XDC flow (`xdc_flow`, run by zedbit and the IDE).
 helion-sv = { workspace = true }
-helion-vhdl = { workspace = true }
 helion-zb-front = { workspace = true }
 
-# zedbit's XDC readers have unit tests; `cargo test` runs them.
-[[example]]
-name = "zedbit"
-test = true
+[dev-dependencies]
+helion-vhdl = { workspace = true }

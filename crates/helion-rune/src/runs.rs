@@ -268,6 +268,8 @@ pub struct RunArtifacts {
     pub ooc: Vec<crate::views::ooc::OocRow>,
     /// iCE40/ECP5 die (and placement after implementation).
     pub family_die: Option<crate::runs_family::FamilyDie>,
+    /// 7-series `.bit` on disk: Program Device loads it with openFPGALoader.
+    pub bit_file: Option<PathBuf>,
 }
 
 /// The live worker handle: its event channel plus the cancel flag the
@@ -712,9 +714,14 @@ pub fn poll_runs(s: &mut AppState) -> bool {
 }
 
 /// `AppSpec::poll` wiring: pump the run channel every frame.
-pub fn poll(s: &mut AppState, _t: f64, _tx: &mut Tx) -> bool {
+pub fn poll(s: &mut AppState, _t: f64, tx: &mut Tx) -> bool {
     let a = poll_runs(s);
     let b = pump_queue(s);
+    // The worker cannot wake the UI; keep polling while a run is live, or its
+    // lines and result wait for the next mouse move.
+    if s.runs.is_active() {
+        tx.wake_after(std::time::Duration::from_millis(100));
+    }
     a || b
 }
 
@@ -916,6 +923,9 @@ pub fn apply_artifacts(s: &mut AppState, art: RunArtifacts) {
     if let Some(b) = art.bitstream {
         s.bitstream = b;
     }
+    if let Some(b) = art.bit_file {
+        s.program.file = Some(b);
+    }
     if let Some(d) = art.design {
         s.runs.live_design = Some(d);
     }
@@ -1070,6 +1080,20 @@ fn run_worker(
     };
 
     send(format!("open_source {}", source.display()), MsgSev::Info);
+
+    // 7-series parts run the HDL + XDC flow (its own synthesis front end).
+    if kind == RunKind::Synth && crate::runs_family::is_xilinx7(&part_req) {
+        finish(crate::runs_family::run_xdc_synth(&source, &part_req, &send));
+        return;
+    }
+    if crate::runs_family::is_xilinx7(&part_req) {
+        let out_dir = checkpoint
+            .as_ref()
+            .and_then(|c| c.parent().map(std::path::Path::to_path_buf))
+            .unwrap_or_else(|| std::env::temp_dir().join("helion-rune-runs"));
+        finish(crate::runs_family::run_xdc_flow(&source, &part_req, &out_dir, &send));
+        return;
+    }
 
     let mut ooc_rows = Vec::new();
     let synthesized = if ooc.is_empty() {
@@ -1703,6 +1727,11 @@ pub(crate) fn resolve_device(
 ) -> Result<helion_device::Device, String> {
     match helion_device::Device::load_part(part_req) {
         Ok(dev) => Ok(dev),
+        // An iCE40 / ECP5 / 7-series part is a real device: numbers from the
+        // HL10T model would describe another chip.
+        Err(_) if crate::views::device_family::is_family_part(part_req) => Err(format!(
+            "{part_req}: this report needs a Helion (HL10) device model and is not available for this family yet"
+        )),
         Err(first) => {
             if part_req == FALLBACK_PART {
                 return Err(format!(
@@ -2832,6 +2861,7 @@ mod tests {
             reuse: None,
             ooc: Vec::new(),
             family_die: None,
+            bit_file: None,
         };
         deliver(&mut s, RunKind::Synth, RunEvent::Finished(Ok(art)));
         assert_eq!(s.flow.synth, RunStatus::Complete);
