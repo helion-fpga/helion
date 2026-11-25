@@ -701,8 +701,20 @@ fn program_x7_blocking(job: &ProgramJob, emit: &dyn Fn(HwEvent)) -> HwEvent {
     }
     let bytes = std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
     emit(HwEvent::Stage { step: 2, label: format!("Loading {}", path.display()) });
+    // Load a copy with a SHUTDOWN preamble so a reload over a running design
+    // starts clean (G87); the .bit on disk stays as written.
+    let patched = match std::fs::read(path).map_err(|e| e.to_string()).and_then(|b| helion_hw::x7_bit_with_shutdown(&b)) {
+        Ok(b) => b,
+        Err(e) => return fail(format!("program_hw: {}: {e}", path.display())),
+    };
+    let tmp = std::env::temp_dir().join(format!("helion-program-{}.bit", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, &patched) {
+        return fail(format!("program_hw: write {}: {e}", tmp.display()));
+    }
     emit(HwEvent::Stage { step: 3, label: "Programming SRAM via openFPGALoader".into() });
-    match helion_hw::program_via_openfpgaloader_for_part(path, false, Some(&part)) {
+    let result = helion_hw::program_via_openfpgaloader_for_part(&tmp, false, Some(&part));
+    let _ = std::fs::remove_file(&tmp);
+    match result {
         Ok(r) => {
             for l in r.stdout.lines().chain(r.stderr.lines()).filter(|l| !l.trim().is_empty()) {
                 emit(HwEvent::Line { text: format!("openFPGALoader: {}", l.trim()), sev: MsgSev::Info });
