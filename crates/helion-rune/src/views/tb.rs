@@ -1311,7 +1311,10 @@ pub fn seed_run_fixture(s: &mut AppState) -> Result<PathBuf, String> {
 /// a temp dir; the failing one is selected.
 pub fn seed_vhdl_fixture(s: &mut AppState) -> Result<PathBuf, String> {
     let ex = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
-    let dir = std::env::temp_dir().join(format!("helion-rune-vhdl-fixture-{}", std::process::id()));
+    // One dir per call: parallel tests in one process removed each other's.
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("helion-rune-vhdl-fixture-{}-{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     for f in ["counter.sv", "counter_tb.vhd"] {
