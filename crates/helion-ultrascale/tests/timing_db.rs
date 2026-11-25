@@ -4,11 +4,13 @@
 //! ballpark estimates from the AMD forum ~0.3 ns per logic level split
 //! (120 ps LUT + 180 ps one INT hop); the documented DBs carry exactly
 //! one datasheet value each (BRAM CLK to DOUT, DS922/DS923 Table 33
-//! TRCKO_DO, 1.46 ns at -2 / 0.85V) and UNKNOWN everywhere else.
+//! TRCKO_DO, 1.46 ns at -2 / 0.85V as cited, and DS925 v1.30 Table 80
+//! TRCKO_DO, 1.02 ns at -2 / 0.85V for xczu3eg) and UNKNOWN everywhere
+//! else.
 
 use helion_ultrascale::timing_db::{
-    documented_xcku3p, documented_xcvu3p, preliminary_xcku3p, preliminary_xcvu3p,
-    preliminary_xczu3eg, sta_db_for_part,
+    documented_xcku3p, documented_xcvu3p, documented_xczu3eg, preliminary_xcku3p,
+    preliminary_xcvu3p, preliminary_xczu3eg, sta_db_for_part,
 };
 use helion_ultrascale::timing_db::{DelaySource, SourcedDelay, UltraScaleTimingDb};
 
@@ -160,6 +162,32 @@ fn documented_xcvu3p_has_only_bram_clk_to_do() {
     }
 }
 
+/// xczu3eg documented DB: exactly one value, BRAM CLK to DOUT 1020 ps
+/// from DS925 v1.30 Table 80 TRCKO_DO at -2 / 0.85V (1.02 ns, Max,
+/// without output register). The -2 at 0.85V column is the second data
+/// column; -2 at 0.72V is 1.46 ns and must not be confused with it
+/// (see nit N64 in the DS925 source audit). Every other field is
+/// UNKNOWN, and the DB carries no ballpark value, so it is not an
+/// estimate and stays deliberately unusable for STA.
+#[test]
+fn documented_xczu3eg_has_only_bram_clk_to_do() {
+    let db = documented_xczu3eg();
+    assert_eq!(db.part, "xczu3eg");
+    assert_eq!(db.speed_grade, "-2");
+    assert_eq!(db.bram.clk_to_do.ps, Some(1020));
+    assert_eq!(
+        db.bram.clk_to_do.source,
+        DelaySource::Documented("DS925 v1.30 Table 80 TRCKO_DO, -2 0.85V".to_string()),
+        "BRAM delay must cite DS925 v1.30 Table 80 exactly"
+    );
+    for (name, d) in all_fields(&db) {
+        if name != "bram.clk_to_do" {
+            assert_unknown(d);
+        }
+    }
+    assert!(!db.is_estimate(), "documented DB has no ballpark value");
+}
+
 #[test]
 fn sta_db_for_part_selects_per_part() {
     assert_eq!(sta_db_for_part("xcku3p").unwrap().part, "xcku3p");
@@ -175,4 +203,54 @@ fn sta_db_for_part_rejects_unknown_part() {
     let err = sta_db_for_part("xc7a35t").expect_err("must fail loud");
     assert!(err.contains("xc7a35t"), "err: {err}");
     assert!(err.contains("unsupported part"), "err: {err}");
+}
+
+/// Path of the xczu3eg timing source audit, relative to this crate.
+fn xczu3eg_timing_audit_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("docs")
+        .join("xczu3eg_timing_sources.md")
+}
+
+/// The xtiming lane outcome is now A-partial (one documented BRAM
+/// value, the rest still blocked), proven by a committed audit: the
+/// audit records the DS925 read and the remaining Vivado unblocker.
+/// This test pins the audit file itself: it must exist and must name
+/// the document searched (DS925), the one value that exists
+/// (TRCKO_DO), the prior verdict (BLOCKED), and the named unblocker
+/// (Vivado report_timing). Fail-before: on the base code the file
+/// does not exist and this test fails at the read.
+#[test]
+fn xczu3eg_timing_audit_present_and_names_unblocker() {
+    let path = xczu3eg_timing_audit_path();
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("xczu3eg timing audit missing at {}: {e}", path.display()));
+    for marker in ["DS925", "TRCKO_DO", "BLOCKED", "report_timing", "write_sdf"] {
+        assert!(
+            text.contains(marker),
+            "audit {} must name {marker}",
+            path.display()
+        );
+    }
+}
+
+/// Guard against an invented documented value: the preliminary
+/// xczu3eg DB must carry no Documented delay at all. Every field is
+/// Ballpark or Unknown, and the DB stays an estimate. This pins the
+/// current state rather than a change, so it passes on the base too;
+/// its value is regression protection, and the audit-presence test
+/// above is the one with fail-before proof.
+#[test]
+fn preliminary_xczu3eg_has_no_documented_value() {
+    let db = preliminary_xczu3eg();
+    for (name, d) in all_fields(&db) {
+        assert!(
+            !matches!(d.source, DelaySource::Documented(_)),
+            "preliminary xczu3eg field {name} must not be Documented: {d:?}"
+        );
+    }
+    assert!(
+        db.is_estimate(),
+        "preliminary xczu3eg DB must be an estimate"
+    );
 }
