@@ -1,0 +1,4 @@
+bram_doa_reg_0	cell	bram_i	DOA_REG	0
+bram_dob_reg_0	cell	bram_i	DOB_REG	0
+bram_write_mode_a_1	cell	bram_i	WRITE_MODE_A	WRITE_FIRST
+bram_clock_domains_0	cell	bram_i	CLOCK_DOMAINS	INDEPENDENT
