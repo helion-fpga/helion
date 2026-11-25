@@ -1053,7 +1053,8 @@ pub const ALL: &[SceneExpect] = &[
             "sim-list",
             "sim-tb-0",
             "sim-tb-status-0",
-            // examples/ ships counter_tb.sv and counter_tb.vhd.
+            // examples/ ships counter_tb.sv, counter_tb.vhd and the
+            // zedboard_*_tb.sv testbenches, so the list is never one row.
             "sim-tb-1",
             "sim-detail-prompt",
             "sim-settings",
@@ -1064,7 +1065,6 @@ pub const ALL: &[SceneExpect] = &[
             "sim-history-empty",
         ],
         absent: &[
-            "sim-tb-2",
             "sim-list-empty",
             "sim-detail",
             "sim-detail-run",

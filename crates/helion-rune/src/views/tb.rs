@@ -1395,8 +1395,9 @@ mod tests {
         ensure_scanned(&mut s);
         let names: Vec<&str> = s.sim.tbs.iter().map(|t| t.name()).collect();
         // SV and VHDL versions of the counter testbench; same stem, so the
-        // list shows file names.
-        assert_eq!(names, vec!["counter_tb.sv", "counter_tb.vhd"]);
+        // list shows file names. The zedboard_*_tb.sv examples sort after.
+        assert_eq!(names[..2], ["counter_tb.sv", "counter_tb.vhd"]);
+        assert!(names[2..].iter().all(|n| n.starts_with("zedboard_")), "{names:?}");
         let vhdl = s.sim.tbs[1].info.as_ref().expect("counter_tb.vhd parses");
         assert_eq!(vhdl.dut_module, "counter");
         assert_eq!(vhdl.clocks, vec![("clk".to_string(), 5)]);
