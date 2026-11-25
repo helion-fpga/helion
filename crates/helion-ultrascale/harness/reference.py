@@ -414,6 +414,45 @@ class Tier1Reference:
             bits[(f, bit)] = val
         return bits
 
+    def resolve_clb_db_feature(self, part, slice_x, slice_y, feature):
+        """Reference bits for one CLB segbits-DB feature: {(far, offset): value}.
+
+        Generic tile-type DB lookup: the feature string is the segbits
+        feature without the tile-type prefix (e.g. `ABCDFF.CEUSED.V0`,
+        `PIP.CLE_CLE_L_SITE_0_CIN_PIN.CLE_CLE_L_SITE_0_CIN`), looked
+        up as `<tile type>.<feature>` in that tile type's segbits DB
+        (clel_l, clel_r, clem, clem_r). Absolute FARs use the DB frame
+        minor plus the tile column major, the same construction as
+        resolve_carry8. A feature absent from the DB for its tile type
+        fails loud: no CLB bit is ever guessed. This is the resolver
+        for the CLB feature families the block-specific resolvers do
+        not cover: FF group control attributes (ABCDFF/EFGHFF CEUSED,
+        CLKINV, MODE, SRINV, SRUSED, SYNC and the FF2 CEUSED/SRUSED
+        pairs) and the site-internal CLE PIP. FFMUX/OUTMUX lines live
+        in the same DBs but are NOT resolved here: the emitter `bits`
+        subcommand cannot label them (no block in its registry) and
+        the harness registry has no block for them either, so they
+        stay blocked until that gap is closed (see sweep.py).
+        """
+        row_major, _ = self._slr_row(part, slice_y, NUM_CLB_PER_COLUMN)
+        col_major, tile_type = self._clb_column(part, row_major, slice_x)
+        db_name = {
+            "CLEL_L": "clel_l", "CLEL_R": "clel_r",
+            "CLEM": "clem", "CLEM_R": "clem_r",
+        }[tile_type]
+        db = self.segbits(db_name)
+        key = "%s.%s" % (tile_type, feature)
+        if key not in db:
+            raise MissingReference(
+                "CLB feature %r not in prjuray-db segbits_%s.db; "
+                "no public encoding for this CLB feature" % (feature, db_name)
+            )
+        bits = {}
+        for frame, bit, val in db[key]:
+            f = far(BLOCK_CLB_IO_CLK, row_major, col_major, frame)
+            bits[(f, bit)] = val
+        return bits
+
     def resolve_hpio(self, tile, feature):
         """Reference bits for one HPIO feature, tile-relative.
 
