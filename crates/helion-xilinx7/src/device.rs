@@ -32,7 +32,7 @@ pub fn default_db_root() -> PathBuf {
         return PathBuf::from(p);
     }
     let mut candidates = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
         let home = PathBuf::from(home);
         candidates.push(home.join(".cache/helion/prjxray-db"));
         candidates.push(home.join("workspace/xilinx-dbsrc"));

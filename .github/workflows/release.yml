@@ -47,7 +47,7 @@ jobs:
       - name: verify app signature
         run: codesign --verify --deep --strict dist/Helion.app && echo "ad-hoc signature OK"
       - name: helion-prog
-        run: cargo build --locked --release --target aarch64-apple-darwin -p helion-hw
+        run: cargo build --locked --release --target aarch64-apple-darwin -p helion-hw --features usb-native
       - name: zip app
         run: |
           mkdir -p dist/upload
@@ -101,8 +101,56 @@ jobs:
           path: dist/upload/*
           if-no-files-found: error
 
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # The image sets core.autocrlf=true; keep HAD, examples and golds LF.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: version
+        id: meta
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          case "$TAG" in v*.*.*) ;; *) TAG="v0.0.0-dev" ;; esac
+          echo "ver=${TAG#v}" >> "$GITHUB_OUTPUT"
+      # One invocation so helion-rune's usb-native also reaches helion-prog.
+      # libusb is built from source (rusb "vendored" on Windows) and linked statically;
+      # .cargo/config.toml raises the main-thread stack to 8 MiB.
+      - name: build
+        run: cargo build --locked --release -p helion-cli -p helion-rune -p helion-hw
+      - name: smoke
+        run: |
+          set -euo pipefail
+          target/release/helion-ide.exe --headless examples/counter.sv | tee gold.log
+          grep -F 'WNS_PS=9640' gold.log
+          target/release/helion.exe run examples/counter.sv --cycles 16 | tee run.log
+          grep -F 'LED[16]=0000000111111110' run.log
+          target/release/helion-prog.exe --help
+      - name: zip
+        run: |
+          set -euo pipefail
+          mkdir -p dist/upload
+          CARGO_DIR=$(cygpath -u "${CARGO_HOME:-$USERPROFILE/.cargo}")
+          LIBUSB_COPYING=$(ls "$CARGO_DIR"/registry/src/*/libusb1-sys-*/libusb/COPYING | head -1)
+          export LIBUSB_COPYING
+          ./scripts/pack-unix-release.sh \
+            "${{ steps.meta.outputs.ver }}" \
+            x86_64-pc-windows-msvc \
+            target/release \
+            dist/upload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/upload/*
+          if-no-files-found: error
+
   publish:
-    needs: [darwin, linux]
+    needs: [darwin, linux, windows]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     steps:
@@ -115,9 +163,9 @@ jobs:
         working-directory: dist/upload
         run: |
           if command -v sha256sum >/dev/null; then
-            sha256sum Helion-*.zip helion-*.tar.gz > SHA256SUMS.txt
+            sha256sum Helion-*.zip helion-*.zip helion-*.tar.gz > SHA256SUMS.txt
           else
-            shasum -a 256 Helion-*.zip helion-*.tar.gz > SHA256SUMS.txt
+            shasum -a 256 Helion-*.zip helion-*.zip helion-*.tar.gz > SHA256SUMS.txt
           fi
           cat SHA256SUMS.txt
       - name: notes
@@ -126,7 +174,8 @@ jobs:
           {
             echo "Helion ${TAG#v}"
             echo
-            echo "Original FPGA family + CAD. Native Apple Silicon app; Linux tarball (helion CLI + helion-ide)."
+            echo "Original FPGA family + CAD. Native Apple Silicon app; Linux tarball and Windows x86_64 zip (helion CLI + helion-ide + helion-prog)."
+            echo "Windows: unzip and run helion-ide.exe (unsigned; SmartScreen warns). JTAG over USB needs the cable bound to WinUSB with Zadig, or openFPGALoader.exe on PATH (see README-WINDOWS.txt)."
             echo "Linux helion-ide needs libxkbcommon0, libwayland-client0 and libusb-1.0-0 (present on desktop distros)."
             echo "Unsigned macOS build — Gatekeeper will warn. AGPL-3.0."
             echo

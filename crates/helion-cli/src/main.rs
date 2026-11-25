@@ -2232,7 +2232,10 @@ fn cmd_ip(args: &[String]) {
 fn cmd_gui() {
     let exe = std::env::current_exe().unwrap_or_else(|_| Path::new("helion").to_path_buf());
     let dir = exe.parent().unwrap_or(Path::new("."));
-    let candidates = [dir.join("Helion"), dir.join("helion-ide")];
+    let candidates = [
+        dir.join("Helion"),
+        dir.join(format!("helion-ide{}", std::env::consts::EXE_SUFFIX)),
+    ];
     let Some(gui) = candidates.into_iter().find(|p| p.is_file()) else {
         eprintln!(
             "helion-ide not found next to {}; build it with `cargo build --release -p helion-rune --bin helion-ide`",

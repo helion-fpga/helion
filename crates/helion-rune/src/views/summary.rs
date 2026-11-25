@@ -264,7 +264,10 @@ fn flow_messages(
 /// Paths under the user's home folder display as `~/…` (shorter, and keeps
 /// the account name out of screenshots and screen shares).
 pub fn home_relative(path: &str) -> String {
-    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+    let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+    else {
         return path.to_string();
     };
     match std::path::Path::new(path).strip_prefix(&home) {

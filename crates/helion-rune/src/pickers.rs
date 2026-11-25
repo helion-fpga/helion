@@ -224,6 +224,7 @@ pub fn default_projects_dir() -> PathBuf {
         return std::env::temp_dir().join("helion-rune-test-projects");
     }
     std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(|h| PathBuf::from(h).join("helion-projects"))
         .unwrap_or_else(|| std::env::temp_dir().join("helion-projects"))
 }

@@ -53,3 +53,35 @@ jobs:
           grep -F 'WNS_PS=9640' gold.log
       - name: release helion-ide
         run: cargo check --locked --release -p helion-rune --bin helion-ide
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # The image sets core.autocrlf=true; keep HAD, examples and golds LF.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: lockfile is current
+        run: cargo metadata --locked --format-version 1 > /dev/null
+      # A full build, not a check: proves the static libusb and Rune's Windows deps link.
+      - name: build shipped binaries
+        run: cargo build --locked -p helion-cli -p helion-rune -p helion-hw
+      - name: counter gold
+        run: |
+          set -euo pipefail
+          target/debug/helion-ide.exe --headless examples/counter.sv | tee gold-windows.log
+          grep -F 'WNS_PS=9640' gold-windows.log
+          target/debug/helion.exe run examples/counter.sv --cycles 16 | tee run-windows.log
+          grep -F 'LED[16]=0000000111111110' run-windows.log
+          target/debug/helion-prog.exe --help
+      - name: IDE and hardware tests
+        run: cargo test --locked -p helion-rune --lib -p helion-hw
+      - name: zip packs
+        run: |
+          set -euo pipefail
+          LIBUSB_COPYING=LICENSE ./scripts/pack-unix-release.sh 0.0.0-ci x86_64-pc-windows-msvc target/debug dist
+          7z l dist/helion-0.0.0-ci-x86_64-pc-windows-msvc.zip | grep -F 'helion-ide.exe'

@@ -1,0 +1,4 @@
+# Windows gives the main thread 1 MiB of stack; macOS and Linux give 8 MiB.
+# Front ends and place/route run on the main thread, so match the Unix size.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
