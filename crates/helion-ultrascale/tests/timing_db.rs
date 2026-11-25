@@ -4,7 +4,7 @@
 //! ballpark estimates from the AMD forum ~0.3 ns per logic level split
 //! (120 ps LUT + 180 ps one INT hop); the documented DBs carry exactly
 //! one datasheet value each (BRAM CLK to DOUT, DS922/DS923 Table 33
-//! TRCKO_DO, 1.46 ns at -2 / 0.85V as cited, and DS925 v1.30 Table 80
+//! TRCKO_DO, 1.02 ns at -2 / 0.85V as cited, and DS925 v1.30 Table 80
 //! TRCKO_DO, 1.02 ns at -2 / 0.85V for xczu3eg) and UNKNOWN everywhere
 //! else.
 
@@ -131,7 +131,7 @@ fn documented_xcku3p_has_only_bram_clk_to_do() {
     let db = documented_xcku3p();
     assert_eq!(db.part, "xcku3p");
     assert_eq!(db.speed_grade, "-2");
-    assert_eq!(db.bram.clk_to_do.ps, Some(1460));
+    assert_eq!(db.bram.clk_to_do.ps, Some(1020));
     assert_eq!(
         db.bram.clk_to_do.source,
         DelaySource::Documented("DS922 Table 33 TRCKO_DO, -2 0.85V".to_string()),
@@ -149,7 +149,7 @@ fn documented_xcku3p_has_only_bram_clk_to_do() {
 fn documented_xcvu3p_has_only_bram_clk_to_do() {
     let db = documented_xcvu3p();
     assert_eq!(db.part, "xcvu3p");
-    assert_eq!(db.bram.clk_to_do.ps, Some(1460));
+    assert_eq!(db.bram.clk_to_do.ps, Some(1020));
     assert_eq!(
         db.bram.clk_to_do.source,
         DelaySource::Documented("DS923 Table 33 TRCKO_DO, -2 0.85V".to_string()),

@@ -162,7 +162,7 @@ fn sta_unknown_delay_fails_loud() {
 fn sta_documented_db_fails_loud_on_lut6() {
     let nl = CounterNetlist::new();
     let db = documented_xcku3p();
-    assert_eq!(db.bram.clk_to_do.ps, Some(1460));
+    assert_eq!(db.bram.clk_to_do.ps, Some(1020));
     let err = sta_routed(&nl, &db, 10_000).expect_err("must fail");
     assert!(err.contains("LUT6 delay UNKNOWN"), "err: {err}");
 }

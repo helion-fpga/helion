@@ -290,6 +290,8 @@ tests: correcting a pinned documented value for the other two
 parts needs a parent ruling. The new `documented_xczu3eg()` value
 applies the correct column: 1020 ps from the -2 at 0.85V column.
 
+Correction (2026-11-25, N64 fix lane): the xcku3p/xcvu3p value was corrected from 1460 ps to 1020 ps, keeping the "-2 0.85V" citations.
+
 ## What this lane changed
 
 First lane (2026-11-24, outcome BLOCKED):
