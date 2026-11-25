@@ -1,0 +1,117 @@
+{
+  "class": "bram",
+  "design": "rand050",
+  "fasm_sha256": "7f6f0c56be35f8decabfe861c098a25c8f2a35b297630286088e174f18519b59",
+  "notes": "INT/HPIO tile X is the logical CLB column index, not a verified Vivado tile X (no xcku3p tilegrid in any public DB).",
+  "part": "xcku3p",
+  "placement_hash": "ef82475dd23ac136ab0ffbe3ec004c7dd43c6e16c4747e2cd73ac98cbe2f1bc6",
+  "provisional_tiles": [
+    "INT_X109Y0",
+    "INT_X5Y0",
+    "INT_X81Y0",
+    "HPIO_RIGHT_X0Y0"
+  ],
+  "seed": 20261169,
+  "sites": [
+    {
+      "bel": "D6LUT",
+      "role": "lut",
+      "tile": "SLICE_X78Y27"
+    },
+    {
+      "bel": "F6LUT",
+      "role": "lut",
+      "tile": "SLICE_X78Y27"
+    },
+    {
+      "bel": "A6LUT",
+      "role": "lut",
+      "tile": "SLICE_X78Y27"
+    },
+    {
+      "bel": "H6LUT",
+      "role": "lut",
+      "tile": "SLICE_X78Y27"
+    },
+    {
+      "bel": "G6LUT",
+      "role": "lut",
+      "tile": "SLICE_X78Y27"
+    },
+    {
+      "bel": "C6LUT",
+      "role": "lut",
+      "tile": "SLICE_X78Y27"
+    },
+    {
+      "bel": "E6LUT",
+      "role": "lut",
+      "tile": "SLICE_X78Y27"
+    },
+    {
+      "bel": "FFF",
+      "role": "ff",
+      "tile": "SLICE_X78Y27"
+    },
+    {
+      "bel": "AFF",
+      "role": "ff",
+      "tile": "SLICE_X78Y27"
+    },
+    {
+      "bel": "A6LUT",
+      "role": "lut",
+      "tile": "SLICE_X78Y141"
+    },
+    {
+      "bel": "F6LUT",
+      "role": "lut",
+      "tile": "SLICE_X78Y141"
+    },
+    {
+      "bel": "D6LUT",
+      "role": "lut",
+      "tile": "SLICE_X78Y141"
+    },
+    {
+      "bel": "C6LUT",
+      "role": "lut",
+      "tile": "SLICE_X78Y141"
+    },
+    {
+      "bel": "E6LUT",
+      "role": "lut",
+      "tile": "SLICE_X78Y141"
+    },
+    {
+      "bel": "B6LUT",
+      "role": "lut",
+      "tile": "SLICE_X78Y141"
+    },
+    {
+      "bel": "DFF",
+      "role": "ff",
+      "tile": "SLICE_X78Y141"
+    },
+    {
+      "bel": "G6LUT",
+      "role": "lut",
+      "tile": "SLICE_X2Y137"
+    },
+    {
+      "bel": "GFF",
+      "role": "ff",
+      "tile": "SLICE_X2Y137"
+    },
+    {
+      "bel": "DFF",
+      "role": "ff",
+      "tile": "SLICE_X2Y137"
+    },
+    {
+      "bel": "RAMB18E2",
+      "role": "bram",
+      "tile": "RAMB18_X1Y76"
+    }
+  ]
+}

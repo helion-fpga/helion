@@ -1645,6 +1645,7 @@ dependencies = [
  "helion-route",
  "helion-sta",
  "helion-sv",
+ "helion-ultrascale",
  "helion-vhdl",
  "rayon",
 ]
@@ -1958,6 +1959,16 @@ dependencies = [
  "helion-ir",
  "helion-sv",
  "helion-xilinx7",
+]
+
+[[package]]
+name = "helion-ultrascale"
+version = "4.0.0"
+dependencies = [
+ "helion-ir",
+ "helion-sv",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

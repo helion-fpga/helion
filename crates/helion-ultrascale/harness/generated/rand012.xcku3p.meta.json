@@ -1,0 +1,102 @@
+{
+  "class": "bram",
+  "design": "rand012",
+  "fasm_sha256": "05a199ef95f45b51b5e65ec621c96889edb174c78e3374745e65c40ba8c519d7",
+  "notes": "INT/HPIO tile X is the logical CLB column index, not a verified Vivado tile X (no xcku3p tilegrid in any public DB).",
+  "part": "xcku3p",
+  "placement_hash": "97bd0622317fd11b1a4ad5434b0c4afef3d58078320ecf7df492bd34d32f4cb2",
+  "provisional_tiles": [
+    "INT_X61Y0",
+    "INT_X68Y0",
+    "INT_X70Y0",
+    "HPIO_RIGHT_X0Y0"
+  ],
+  "seed": 20261131,
+  "sites": [
+    {
+      "bel": "C6LUT",
+      "role": "lut",
+      "tile": "SLICE_X62Y147"
+    },
+    {
+      "bel": "B6LUT",
+      "role": "lut",
+      "tile": "SLICE_X62Y147"
+    },
+    {
+      "bel": "E6LUT",
+      "role": "lut",
+      "tile": "SLICE_X62Y147"
+    },
+    {
+      "bel": "G6LUT",
+      "role": "lut",
+      "tile": "SLICE_X62Y147"
+    },
+    {
+      "bel": "HFF",
+      "role": "ff",
+      "tile": "SLICE_X62Y147"
+    },
+    {
+      "bel": "GFF",
+      "role": "ff",
+      "tile": "SLICE_X62Y147"
+    },
+    {
+      "bel": "CFF",
+      "role": "ff",
+      "tile": "SLICE_X62Y147"
+    },
+    {
+      "bel": "AFF",
+      "role": "ff",
+      "tile": "SLICE_X62Y147"
+    },
+    {
+      "bel": "DFF",
+      "role": "ff",
+      "tile": "SLICE_X62Y147"
+    },
+    {
+      "bel": "BFF",
+      "role": "ff",
+      "tile": "SLICE_X62Y147"
+    },
+    {
+      "bel": "EFF",
+      "role": "ff",
+      "tile": "SLICE_X62Y147"
+    },
+    {
+      "bel": "C6LUT",
+      "role": "lut",
+      "tile": "SLICE_X52Y208"
+    },
+    {
+      "bel": "G6LUT",
+      "role": "lut",
+      "tile": "SLICE_X52Y208"
+    },
+    {
+      "bel": "D6LUT",
+      "role": "lut",
+      "tile": "SLICE_X52Y208"
+    },
+    {
+      "bel": "B6LUT",
+      "role": "lut",
+      "tile": "SLICE_X52Y208"
+    },
+    {
+      "bel": "DFF",
+      "role": "ff",
+      "tile": "SLICE_X52Y208"
+    },
+    {
+      "bel": "RAMB18E2",
+      "role": "bram",
+      "tile": "RAMB18_X0Y2"
+    }
+  ]
+}

@@ -1,0 +1,110 @@
+{
+  "class": "core",
+  "design": "rand033",
+  "fasm_sha256": "537b7d30ed1b0bff538012d7fd7955166795290d8c9ee95c3178c828cb2e4196",
+  "notes": "INT/HPIO tile X is the logical CLB column index, not a verified Vivado tile X (no xcku3p tilegrid in any public DB).",
+  "part": "xcku3p",
+  "placement_hash": "5f76d44e8e6e2aa65ebbfb19845021ba7d2c400f1e4f834b6f3b7b85541e9b00",
+  "provisional_tiles": [
+    "INT_X52Y0",
+    "HPIO_RIGHT_X0Y0"
+  ],
+  "seed": 20261152,
+  "sites": [
+    {
+      "bel": "B6LUT",
+      "role": "lut",
+      "tile": "SLICE_X102Y40"
+    },
+    {
+      "bel": "D6LUT",
+      "role": "lut",
+      "tile": "SLICE_X102Y40"
+    },
+    {
+      "bel": "A6LUT",
+      "role": "lut",
+      "tile": "SLICE_X102Y40"
+    },
+    {
+      "bel": "F6LUT",
+      "role": "lut",
+      "tile": "SLICE_X102Y40"
+    },
+    {
+      "bel": "BFF",
+      "role": "ff",
+      "tile": "SLICE_X102Y40"
+    },
+    {
+      "bel": "AFF",
+      "role": "ff",
+      "tile": "SLICE_X102Y40"
+    },
+    {
+      "bel": "DFF",
+      "role": "ff",
+      "tile": "SLICE_X102Y40"
+    },
+    {
+      "bel": "EFF",
+      "role": "ff",
+      "tile": "SLICE_X102Y40"
+    },
+    {
+      "bel": "CFF",
+      "role": "ff",
+      "tile": "SLICE_X102Y40"
+    },
+    {
+      "bel": "GFF",
+      "role": "ff",
+      "tile": "SLICE_X102Y40"
+    },
+    {
+      "bel": "C6LUT",
+      "role": "lut",
+      "tile": "SLICE_X18Y132"
+    },
+    {
+      "bel": "BFF",
+      "role": "ff",
+      "tile": "SLICE_X18Y132"
+    },
+    {
+      "bel": "HFF",
+      "role": "ff",
+      "tile": "SLICE_X18Y132"
+    },
+    {
+      "bel": "EFF",
+      "role": "ff",
+      "tile": "SLICE_X18Y132"
+    },
+    {
+      "bel": "DFF",
+      "role": "ff",
+      "tile": "SLICE_X18Y132"
+    },
+    {
+      "bel": "AFF",
+      "role": "ff",
+      "tile": "SLICE_X18Y132"
+    },
+    {
+      "bel": "CFF",
+      "role": "ff",
+      "tile": "SLICE_X18Y132"
+    },
+    {
+      "bel": "FFF",
+      "role": "ff",
+      "tile": "SLICE_X18Y132"
+    },
+    {
+      "bel": "GFF",
+      "role": "ff",
+      "tile": "SLICE_X18Y132"
+    }
+  ]
+}

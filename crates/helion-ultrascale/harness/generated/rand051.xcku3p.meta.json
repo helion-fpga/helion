@@ -1,0 +1,142 @@
+{
+  "class": "core",
+  "design": "rand051",
+  "fasm_sha256": "69aac28f4ef705c6b44d2e312987b18f98fcb3180ae6bfbe17bf1b3198f3e521",
+  "notes": "INT/HPIO tile X is the logical CLB column index, not a verified Vivado tile X (no xcku3p tilegrid in any public DB).",
+  "part": "xcku3p",
+  "placement_hash": "f0b1554c0ebf6aac0996bef8c34ab71e59cbddece45ba0ba027da0439b298ecc",
+  "provisional_tiles": [
+    "INT_X14Y0",
+    "INT_X67Y0",
+    "INT_X6Y0",
+    "HPIO_RIGHT_X0Y0"
+  ],
+  "seed": 20261170,
+  "sites": [
+    {
+      "bel": "A6LUT",
+      "role": "lut",
+      "tile": "SLICE_X52Y127"
+    },
+    {
+      "bel": "D6LUT",
+      "role": "lut",
+      "tile": "SLICE_X52Y127"
+    },
+    {
+      "bel": "B6LUT",
+      "role": "lut",
+      "tile": "SLICE_X52Y127"
+    },
+    {
+      "bel": "E6LUT",
+      "role": "lut",
+      "tile": "SLICE_X52Y127"
+    },
+    {
+      "bel": "EFF",
+      "role": "ff",
+      "tile": "SLICE_X52Y127"
+    },
+    {
+      "bel": "F6LUT",
+      "role": "lut",
+      "tile": "SLICE_X54Y100"
+    },
+    {
+      "bel": "B6LUT",
+      "role": "lut",
+      "tile": "SLICE_X54Y100"
+    },
+    {
+      "bel": "C6LUT",
+      "role": "lut",
+      "tile": "SLICE_X54Y100"
+    },
+    {
+      "bel": "H6LUT",
+      "role": "lut",
+      "tile": "SLICE_X54Y100"
+    },
+    {
+      "bel": "DFF",
+      "role": "ff",
+      "tile": "SLICE_X54Y100"
+    },
+    {
+      "bel": "BFF",
+      "role": "ff",
+      "tile": "SLICE_X54Y100"
+    },
+    {
+      "bel": "EFF",
+      "role": "ff",
+      "tile": "SLICE_X54Y100"
+    },
+    {
+      "bel": "HFF",
+      "role": "ff",
+      "tile": "SLICE_X54Y100"
+    },
+    {
+      "bel": "AFF",
+      "role": "ff",
+      "tile": "SLICE_X54Y100"
+    },
+    {
+      "bel": "CFF",
+      "role": "ff",
+      "tile": "SLICE_X54Y100"
+    },
+    {
+      "bel": "F6LUT",
+      "role": "lut",
+      "tile": "SLICE_X97Y213"
+    },
+    {
+      "bel": "B6LUT",
+      "role": "lut",
+      "tile": "SLICE_X97Y213"
+    },
+    {
+      "bel": "A6LUT",
+      "role": "lut",
+      "tile": "SLICE_X97Y213"
+    },
+    {
+      "bel": "AFF",
+      "role": "ff",
+      "tile": "SLICE_X97Y213"
+    },
+    {
+      "bel": "HFF",
+      "role": "ff",
+      "tile": "SLICE_X97Y213"
+    },
+    {
+      "bel": "EFF",
+      "role": "ff",
+      "tile": "SLICE_X97Y213"
+    },
+    {
+      "bel": "GFF",
+      "role": "ff",
+      "tile": "SLICE_X97Y213"
+    },
+    {
+      "bel": "BFF",
+      "role": "ff",
+      "tile": "SLICE_X97Y213"
+    },
+    {
+      "bel": "DFF",
+      "role": "ff",
+      "tile": "SLICE_X97Y213"
+    },
+    {
+      "bel": "CFF",
+      "role": "ff",
+      "tile": "SLICE_X97Y213"
+    }
+  ]
+}

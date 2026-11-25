@@ -1,0 +1,321 @@
+//! The `UltraScaleFabric` trait: the contract that pack-place, router, and
+//! timing agents code against.
+//!
+//! `WireDb` and `TimingDb` are seams. The routing-graph agent owns the
+//! `WireDb` internals; the timing agent owns the `TimingDb` internals. This
+//! crate defines the trait shapes only.
+
+use crate::bel::{Bel, TileId, TileKind};
+use crate::device::UltraScaleDevice;
+use std::sync::Arc;
+
+/// Wire node identifier: index into a WireDb node table.
+pub type WireId = u32;
+
+/// A wire's name and Vivado tile name, for the router-to-PIP translator.
+///
+/// Added by CTO ruling on the int-pip naming seam (COORD.md 2026-11-07):
+/// the router emits wire-ID paths, the int-pip emitter consumes named
+/// PIPs (`IntPip { tile, src, dst }`), and this query is the bridge
+/// between them. The routing-graph WireDb returns `Some` from its
+/// DB-derived node table; `EmptyWireDb` and the mock return `None`.
+/// The translator fails loud on any unnamed wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WireInfo<'a> {
+    /// Wire name exactly as it appears in the segbits DB, e.g.
+    /// `BOUNCE_E_0_FT1`.
+    pub name: &'a str,
+    /// Vivado tile name, e.g. `INT_X12Y45`.
+    pub tile: &'a str,
+}
+
+/// Physical site identifier. Shape per the day-1 router contract; `kind`
+/// follows the router scaffold convention: 0=CLB, 1=IOB, 2=DSP, 3=BRAM,
+/// 4=URAM, 5=CLK.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct UltraSite {
+    pub x: i32,
+    pub y: i32,
+    pub kind: u8,
+}
+
+/// Routing graph seam. The routing-graph agent provides the implementation.
+///
+/// Required queries (day-1 contract, router agent 2026-10-22):
+/// - wires incident to a BEL pin
+/// - wire-to-wire connectivity (PIP model)
+/// - tile-to-tile adjacency
+pub trait WireDb: Send + Sync {
+    /// Number of wire nodes in the database. Zero for the placeholder.
+    fn wire_count(&self) -> usize;
+    /// Downstream wires reachable through one PIP. Slice is stable.
+    fn fanout(&self, wire: WireId) -> &[WireId];
+    /// Physical tile coords for A* heuristic.
+    fn wire_xy(&self, wire: WireId) -> (i32, i32);
+    /// Entry wire driven by a BEL pin.
+    fn wire_for_bel_pin(&self, site: UltraSite, bel: &str, pin: &str) -> Option<WireId>;
+    /// Wire name and tile name for the router-to-PIP translator.
+    /// `None` when this database cannot name wires (placeholder, mock).
+    fn wire_info(&self, wire: WireId) -> Option<WireInfo<'_>>;
+}
+
+/// Timing database seam. The timing agent provides the implementation.
+///
+/// Required queries (to be finalized by the timing agent):
+/// - BEL pin-to-pin delays
+/// - wire delays
+pub trait TimingDb: Send + Sync {
+    /// True if the database has real delay numbers (false for placeholder).
+    fn has_data(&self) -> bool;
+}
+
+/// Placeholder wire database. The routing-graph agent replaces this.
+#[derive(Debug, Default)]
+pub struct EmptyWireDb;
+
+impl WireDb for EmptyWireDb {
+    fn wire_count(&self) -> usize {
+        0
+    }
+
+    fn fanout(&self, _wire: WireId) -> &[WireId] {
+        &[]
+    }
+
+    fn wire_xy(&self, _wire: WireId) -> (i32, i32) {
+        (0, 0)
+    }
+
+    fn wire_for_bel_pin(&self, _site: UltraSite, _bel: &str, _pin: &str) -> Option<WireId> {
+        None
+    }
+
+    fn wire_info(&self, _wire: WireId) -> Option<WireInfo<'_>> {
+        None
+    }
+}
+
+/// Placeholder timing database. The timing agent replaces this.
+#[derive(Debug, Default)]
+pub struct EmptyTimingDb;
+
+impl TimingDb for EmptyTimingDb {
+    fn has_data(&self) -> bool {
+        false
+    }
+}
+
+/// The fabric contract. Pack-place, router, and timing agents code against
+/// this trait, not against `UltraScaleDevice` directly.
+pub trait UltraScaleFabric: Send + Sync {
+    /// BELs available at a tile. Empty slice if the tile is out of bounds.
+    fn bels_at(&self, tile: TileId) -> &[Bel];
+    /// Kind of the tile at the given coordinates, or None if out of bounds.
+    fn tile_kind(&self, tile: TileId) -> Option<TileKind>;
+    /// Routing graph. Sealed behind the `WireDb` trait until the
+    /// routing-graph agent delivers.
+    fn wires(&self) -> &dyn WireDb;
+    /// Timing database. Sealed behind the `TimingDb` trait until the timing
+    /// agent delivers.
+    fn timing(&self) -> &dyn TimingDb;
+    /// Part name, e.g. "xcvu3p".
+    fn part(&self) -> &str;
+}
+
+/// `UltraScaleDevice` implements the fabric contract with placeholder
+/// wire and timing databases. The wire database is replaceable: the
+/// impl flow installs the real INT-tile routing graph with
+/// [`FabricWithPlaceholders::with_wire_db`] (US-09); the default
+/// constructors keep `EmptyWireDb`.
+pub struct FabricWithPlaceholders {
+    device: UltraScaleDevice,
+    wires: Arc<dyn WireDb>,
+    timing: EmptyTimingDb,
+}
+
+impl FabricWithPlaceholders {
+    pub fn xcvu3p() -> Self {
+        Self {
+            device: UltraScaleDevice::xcvu3p(),
+            wires: Arc::new(EmptyWireDb),
+            timing: EmptyTimingDb,
+        }
+    }
+
+    pub fn xcku3p() -> Self {
+        Self {
+            device: UltraScaleDevice::xcku3p(),
+            wires: Arc::new(EmptyWireDb),
+            timing: EmptyTimingDb,
+        }
+    }
+
+    pub fn xczu3eg() -> Self {
+        Self {
+            device: UltraScaleDevice::xczu3eg(),
+            wires: Arc::new(EmptyWireDb),
+            timing: EmptyTimingDb,
+        }
+    }
+
+    /// Install a real routing graph, replacing the placeholder wire
+    /// database. The caller keeps its own handle when it also needs
+    /// the concrete graph (the impl flow keeps one for the
+    /// router-to-PIP translator's bidirectional-PIP resolver).
+    pub fn with_wire_db(self, wires: Arc<dyn WireDb>) -> Self {
+        Self { wires, ..self }
+    }
+
+    /// Access the underlying device model.
+    pub fn device(&self) -> &UltraScaleDevice {
+        &self.device
+    }
+}
+
+impl UltraScaleFabric for FabricWithPlaceholders {
+    fn bels_at(&self, tile: TileId) -> &[Bel] {
+        self.device.bels_at(tile)
+    }
+
+    fn tile_kind(&self, tile: TileId) -> Option<TileKind> {
+        self.device.tile_kind(tile)
+    }
+
+    fn wires(&self) -> &dyn WireDb {
+        self.wires.as_ref()
+    }
+
+    fn timing(&self) -> &dyn TimingDb {
+        &self.timing
+    }
+
+    fn part(&self) -> &str {
+        self.device.part.as_str()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fabric_trait_shape_is_coherent() {
+        let f = FabricWithPlaceholders::xcvu3p();
+        assert_eq!(f.part(), "xcvu3p");
+        // Wires and timing are placeholders on day 1.
+        assert_eq!(f.wires().wire_count(), 0);
+        assert!(!f.timing().has_data());
+        // But BEL queries work through the trait.
+        let tile = TileId::new(1, 0);
+        assert!(f.tile_kind(tile).is_some());
+        assert!(!f.bels_at(tile).is_empty());
+    }
+
+    #[test]
+    fn fabric_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<FabricWithPlaceholders>();
+    }
+
+    /// Test-only WireDb backed by two verbatim lines from prjuray-db
+    /// zynqusp/segbits_int.db (commit affbc5e, CC0 1.0), tile INT_X12Y45:
+    ///   INT.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1 64_00 !66_00 !68_00 !72_00 !72_01 !74_00
+    ///   INT.PIP.INODE_E_1_FT1.BYPASS_E4 !57_00
+    struct NamedTestDb {
+        names: Vec<(&'static str, &'static str)>,
+        fanout: Vec<Vec<WireId>>,
+    }
+
+    impl NamedTestDb {
+        fn new() -> Self {
+            Self {
+                names: vec![
+                    ("BOUNCE_E_0_FT1", "INT_X12Y45"),
+                    ("INODE_E_1_FT1", "INT_X12Y45"),
+                    ("BYPASS_E4", "INT_X12Y45"),
+                ],
+                fanout: vec![vec![1], vec![2], vec![]],
+            }
+        }
+    }
+
+    impl WireDb for NamedTestDb {
+        fn wire_count(&self) -> usize {
+            self.names.len()
+        }
+
+        fn fanout(&self, wire: WireId) -> &[WireId] {
+            &self.fanout[wire as usize]
+        }
+
+        fn wire_xy(&self, _wire: WireId) -> (i32, i32) {
+            (12, 45)
+        }
+
+        fn wire_for_bel_pin(&self, site: UltraSite, bel: &str, pin: &str) -> Option<WireId> {
+            match (site.x, site.y, bel, pin) {
+                (12, 45, "A6LUT", "O6") => Some(0),
+                (12, 45, "A6LUT", "A1") => Some(1),
+                _ => None,
+            }
+        }
+
+        fn wire_info(&self, wire: WireId) -> Option<WireInfo<'_>> {
+            self.names
+                .get(wire as usize)
+                .map(|(name, tile)| WireInfo { name, tile })
+        }
+    }
+
+    #[test]
+    fn db_backed_wire_db_wire_info_names_wires() {
+        let db = NamedTestDb::new();
+        assert_eq!(
+            db.wire_info(0),
+            Some(WireInfo {
+                name: "BOUNCE_E_0_FT1",
+                tile: "INT_X12Y45"
+            })
+        );
+        assert_eq!(
+            db.wire_info(1),
+            Some(WireInfo {
+                name: "INODE_E_1_FT1",
+                tile: "INT_X12Y45"
+            })
+        );
+        assert_eq!(
+            db.wire_info(2),
+            Some(WireInfo {
+                name: "BYPASS_E4",
+                tile: "INT_X12Y45"
+            })
+        );
+        assert_eq!(db.wire_info(3), None);
+    }
+
+    #[test]
+    fn empty_wire_db_wire_info_is_none() {
+        let db = EmptyWireDb;
+        assert_eq!(db.wire_info(0), None);
+        assert_eq!(db.wire_info(999), None);
+    }
+
+    #[test]
+    fn with_wire_db_installs_real_graph() {
+        let fabric = FabricWithPlaceholders::xcku3p();
+        assert_eq!(fabric.wires().wire_count(), 0);
+        let db: Arc<dyn WireDb> = Arc::new(NamedTestDb::new());
+        let fabric = fabric.with_wire_db(Arc::clone(&db));
+        assert_eq!(fabric.wires().wire_count(), 3);
+        assert_eq!(
+            fabric.wires().wire_info(0),
+            Some(WireInfo {
+                name: "BOUNCE_E_0_FT1",
+                tile: "INT_X12Y45"
+            })
+        );
+        // The default constructors still carry the placeholder.
+        assert_eq!(FabricWithPlaceholders::xcvu3p().wires().wire_count(), 0);
+    }
+}

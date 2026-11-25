@@ -1,0 +1,525 @@
+//! `BitgenDevice` implementation for the real device file.
+//!
+//! This closes the interfaces session 2 item 4 FLAG: the emitter
+//! (`bitgen.rs`) can now run on a real `DeviceFile` instead of only
+//! the provisional `StubDevice`. FRAMING green on a real device
+//! depends on this impl.
+//!
+//! Ground rules, tile by tile:
+//!
+//! - SLICE tiles (`SLICE_X<x>Y<y>`, y absolute slice Y): ground
+//!   truth from the device file. SLR from the Y range, row major
+//!   from Y and 60 CLBs per column, column major and tile type
+//!   (`CLEL_L`, `CLEM`, `CLEL_R`, `CLEM_R`) from the file, exactly
+//!   as `BitLocator` resolves BELs. Base FAR minor is 0: the
+//!   segbits DB frame equals the `BitLocator` minor for every CLB
+//!   bit checked (FF INIT: DB frame 12, locator minor 12 for AFF
+//!   and BFF; LUT INIT: DB frames 11..8, locator minors 11..8 for
+//!   A6LUT; CLEL DB frames span 0..15, the 16 minors of a CLB
+//!   column). `tile_base_far` is therefore
+//!   `Far(ClbIoClk, row_major, col_major, 0)`.
+//! - INT tiles (`INT_X<x>Y<y>`, y absolute INT tile Y, the same
+//!   coordinate system as SLICE Y): one INT tile per absolute Y per
+//!   column, 60 per clock-region row. The FAR row is y // 60
+//!   (`NUM_CLB_PER_COLUMN`), exactly as the harness reference
+//!   (`harness/reference.py`, `_slr_row`) computes it. Grounded in
+//!   the xczu3eg tilegrid (prjuray-db): INT_X11Y60 baseaddr
+//!   0x00042300 decodes to block 0, row 1, col 35, minor 0, and
+//!   all 60 INT tiles Y0..Y59 in column X11 share the row-0
+//!   baseaddr 0x00002300. On xczu3eg the column comes from a
+//!   tilegrid-derived table (`IntColumnTable`, 33 INT columns x 3
+//!   FAR rows, verified 5,940 of 5,940 INT tiles by
+//!   `tools/verify_xczu3eg.py`), not from the provisional rule:
+//!   the rule keys CLB columns by SLICE_X, and on xczu3eg the INT
+//!   tile X is not the SLICE_X (tile X is per-type numbering;
+//!   CLEL_L_X5Y0 holds SLICE_X7Y0), so the rule matches only
+//!   INT_X0 and INT_X1 there and mispredicts the rest (INT_X2Y0:
+//!   actual col 7, rule predicts 4). Where a table is attached it
+//!   replaces the rule wholesale, with no fallback: a (row, X) the
+//!   table does not list fails loud. On xcku3p/xcvu3p (no public
+//!   tilegrid, no table) the column rule is PROVISIONAL and
+//!   tile-type dependent, the same rule the diff harness reference
+//!   uses (`harness/reference.py`, `int_col_offset_from_clb`,
+//!   xczu3eg-derived): CLEL_R columns take INT column major =
+//!   CLB column major - 1; CLEL_L, CLEM, and CLEM_R columns take
+//!   CLB column major + 1. Two independent public sources agree
+//!   on the split: the xczu3eg tilegrid geometry (prjuray-db,
+//!   `~/workspace/ultra-bitgen-crew/BRIEFS/tilegrid-research.md`
+//!   Q5.2) and the xcku3p device-file minors table (Q5.3: 52 CLB
+//!   columns have a 76-minor left neighbour, all CLEL_R; 61 have
+//!   one on the right, all other CLB types; 0 overlap, 0 neither).
+//!   The device file confirms the rule where the golden exercises
+//!   it: INT_X0Y0 resolves to major 4, which carries exactly 76
+//!   minors, the INT segbits frame span (vendored
+//!   `segbits_int.db`, frames 0..75). The rule is validated, not
+//!   assumed: an INT tile resolves only when its rule-derived
+//!   column carries at least 76 minors; otherwise `tile_base_far`
+//!   and `tile_type` return `None` (fail loud). On xcku3p every
+//!   CLB column resolves (113 per row); on xcvu3p the tail CLB
+//!   columns 113..117 resolve to no 76-minor neighbour and do
+//!   not resolve. The +1 side has never been exercised by a
+//!   golden (every golden INT line is INT_X0Y0 on CLEL_R column
+//!   0), so INT placement stays absolute-provisional until the
+//!   xcku3p tilegrid lands, which is the arbiter that replaces
+//!   this rule with ground truth.
+//! - RAMB18 tiles (`RAMB18_X<x>Y<y>`, y absolute 18K Y): ground
+//!   truth from the device file (BRAM content column major, 24
+//!   18K blocks per column), tile type `BRAM` (the device file's
+//!   own tile-type string), base FAR
+//!   `Far(BramContent, row_major, col_major, 0)`. BRAM parity
+//!   shares the content column majors in the file (the parity
+//!   table equals the content table), so no separate parity
+//!   enumeration is needed. RAMB36 tiles have no resolver
+//!   (`BitLocator` rejects them too) and do not resolve here.
+//! - HPIO, HDIO, CMT, DSP, and every other tile kind: NOT
+//!   resolved (`None`). Their column majors are not in the device
+//!   file and no public tilegrid exists for xcku3p/xcvu3p, so any
+//!   base FAR would be invented. This is a named blocker, not a
+//!   silent skip: the golden's HPIO lines cannot emit until the
+//!   tilegrid lands (the harness resolves IO bits tile-relatively,
+//!   so the IO_CONFIG block itself is unaffected). xczu3eg HAS a
+//!   public tilegrid with real HPIO tiles, but they still do not
+//!   resolve: no HPIO column mapping exists in the device file or
+//!   the INT sidecar table, and the xcku3p HPIO bridge value is
+//!   never applied to this part. Unblocker: a tilegrid-derived
+//!   HPIO column table, the same pattern as the INT table.
+//!
+//! `tile_names` enumerates exactly the tiles that resolve (all
+//! SLICE tiles, the resolving INT tiles, all RAMB18 tiles),
+//! sorted, deduplicated. `config_order_fars` enumerates every
+//! real frame in the file (standard columns plus BRAM content
+//! columns), ascending FAR integer, which is the config order
+//! the demo reconstruction uses (`sorted(frames)` in
+//! `make_synth_xcku3p_bit.py`); its length equals
+//! `DeviceFile::total_frames` (41,460 for xcku3p), asserted in
+//! the integration tests. Both lists are computed lazily on
+//! first use (`OnceLock` caches on `DeviceFile`) so loading a
+//! device file for the locator or the demo stays cheap.
+//!
+//! Carried, not fixed here (recorded, not hidden):
+//!
+//! - Critic session 7 FLAG F1: the last-of-row FAR 2-zero-padding
+//!   path is untested (0 of 261 FARs in the demo validation
+//!   exercised it). This impl does not change frame emission, so
+//!   it does not fix F1; the generator must not be trusted for
+//!   full-device bitstreams until F1 is exercised.
+//! - The xcvu3p frame-total gap: the file's tables sum to 73,035
+//!   frames against UG570 Table 1's 71,820 (overshoot 1,215).
+//!   Flagged provisional in the file, never tuned away; this impl
+//!   enumerates the file's own frames.
+//! - The device file's `num_slices` (27,120) contradicts its own
+//!   `num_luts` (162,720, 6 per slice, not 8) and the BRAM/DSP
+//!   tables imply more sites than the headers claim. This impl
+//!   enumerates tiles from the column tables, never from the
+//!   header counts, so those anomalies do not affect it.
+//!
+//! No em dashes anywhere.
+
+use crate::bitgen::BitgenDevice;
+use crate::device_file::{
+    DeviceFile, Far, FarBlockType, NUM_18K_BRAM_PER_COLUMN, NUM_CLB_PER_COLUMN,
+};
+
+/// INT segbits frame span: the vendored `segbits_int.db` carries
+/// frames 0..75 (3778 lines). An INT tile's column must carry at
+/// least this many minors for the tile to resolve; see the module
+/// docs for why the provisional rule is validated against the
+/// device file's own minors table.
+pub const INT_FRAME_SPAN: u32 = 76;
+
+/// Parse `SLICE_X<x>Y<y>` into (x, y). Returns `None` on any
+/// malformed name instead of panicking.
+fn parse_slice_tile(tile: &str) -> Option<(u32, u32)> {
+    let rest = tile.strip_prefix("SLICE_X")?;
+    let (x_text, y_text) = rest.split_once('Y')?;
+    let x: u32 = x_text.parse().ok()?;
+    let y: u32 = y_text.parse().ok()?;
+    Some((x, y))
+}
+
+/// Parse `INT_X<x>Y<y>` into (x, y). The Y is the absolute INT
+/// tile row (one INT tile per absolute Y per column, 60 per
+/// clock-region row), not the FAR row: the FAR row is y / 60.
+/// Grounded in the xczu3eg tilegrid (F3): INT_X11Y60 baseaddr
+/// 0x00042300 is FAR row 1, and INT_X11Y0..Y59 all share the
+/// row-0 baseaddr 0x00002300.
+fn parse_int_tile(tile: &str) -> Option<(u32, u32)> {
+    let rest = tile.strip_prefix("INT_X")?;
+    let (x_text, y_text) = rest.split_once('Y')?;
+    let x: u32 = x_text.parse().ok()?;
+    let y: u32 = y_text.parse().ok()?;
+    Some((x, y))
+}
+
+/// Bit shift applied to segbits refs for a plain INT tile.
+///
+/// Grounding: prjuray-db tilegrid for xczu3eg gives every INT tile in
+/// a 60-row clock region the same base FAR and 76 frames, with an
+/// `offset` that steps 3 per Y and jumps 6 at Y30 (the HCLK spine):
+/// offset(y) = 3*(y%60) + 6 when (y%60) >= 30. The BitFiltrator
+/// LutLoc Y_ofst table for CLB tiles shows the identical progression
+/// in frame_ofst: +48 bits per Y, +96 at Y30. One tilegrid offset unit
+/// is therefore 16 bits, and the tile's 48-bit segbits window starts at
+/// 16 * offset(y) bits into each frame. The segbits DB lines carry the
+/// Y0 mapping only (bits 0..47); without the shift, two tiles in one
+/// column map the same mux to the same (FAR, bit) and bitgen rejects
+/// the second PIP with MustBeZeroViolated. The shift is exact: the
+/// highest window (Y59, offset 183) ends at bit 47 + 16*183 = 2975,
+/// the last bit of the 93-word frame. Non-INT tiles shift 0: CLB
+/// tiles carry their Y offset in the BitFiltrator tables, and
+/// INT_INTF/HDIO tiles keep their existing row-start handling.
+pub(crate) fn int_tile_bit_shift(tile: &str) -> u16 {
+    let Some((_, y)) = parse_int_tile(tile) else {
+        return 0;
+    };
+    let y_in_row = y % NUM_CLB_PER_COLUMN;
+    let offset = 3 * y_in_row + if y_in_row >= 30 { 6 } else { 0 };
+    (16 * offset) as u16
+}
+
+/// Parse `RAMB18_X<x>Y<y>` into (x, y). Only 18K BRAM tiles are
+/// supported, as in `BitLocator`.
+fn parse_bram_tile(tile: &str) -> Option<(u32, u32)> {
+    let rest = tile.strip_prefix("RAMB18_X")?;
+    let (x_text, y_text) = rest.split_once('Y')?;
+    let x: u32 = x_text.parse().ok()?;
+    let y: u32 = y_text.parse().ok()?;
+    Some((x, y))
+}
+
+/// Parse an interface tile name `<TYPE>_X<x>Y<y>` (INT_INTF_* or
+/// HDIO_*) into (tile type, x, y). The type is the whole prefix before
+/// `_X`; the caller looks it up in the INT_INTF/HDIO column table, so
+/// an unknown type fails loud there instead of here. Returns `None`
+/// when the name has no `_X<x>Y<y>` tail.
+fn parse_intf_tile(tile: &str) -> Option<(&str, u32, u32)> {
+    let (ty, rest) = tile.rsplit_once("_X")?;
+    let (x_text, y_text) = rest.split_once('Y')?;
+    let x: u32 = x_text.parse().ok()?;
+    let y: u32 = y_text.parse().ok()?;
+    if ty.is_empty() {
+        return None;
+    }
+    Some((ty, x, y))
+}
+
+/// Which SLR holds a BEL at absolute Y, given the number of that BEL
+/// kind per column. Mirrors `BitLocator::slr_name`: the SLR whose
+/// clock-region row range contains Y. Returns the SLR name and the
+/// row major inside it.
+fn slr_row_for_y(device: &DeviceFile, y: u32, per_column: u32) -> Option<(&str, u32)> {
+    for slr in device.slr_names() {
+        let min_row = device.min_clock_region_row_idx(slr).ok()?;
+        let max_row = device.max_clock_region_row_idx(slr).ok()?;
+        let min_y = min_row * per_column;
+        let max_y = (max_row + 1) * per_column - 1;
+        if min_y <= y && y <= max_y {
+            return Some((slr, y / per_column - min_row));
+        }
+    }
+    None
+}
+
+/// INT column major for an INT tile X at a FAR row.
+///
+/// When the device carries a tilegrid-derived INT column table
+/// (`IntColumnTable`, xczu3eg only so far), the table is ground truth
+/// and replaces the rule wholesale: no fallback, so a (row, X) the
+/// table does not list returns `None` (fail loud) instead of
+/// resolving to a rule-derived column that is wrong on this part.
+/// Otherwise the PROVISIONAL tile-type-dependent rule applies
+/// (CLEL_R: CLB column major - 1; every other CLB tile type: CLB
+/// column major + 1, harness `reference.py`), validated against the
+/// device file: the derived column must carry at least
+/// `INT_FRAME_SPAN` minors. Returns the SLR name and the INT column
+/// major, or `None` when the tile does not resolve (unknown row,
+/// unknown CLB column, table miss, or the column too short to hold
+/// INT frames).
+fn int_col_major(device: &DeviceFile, int_x: u32, row_major: u32) -> Option<(&str, u32)> {
+    for slr in device.slr_names() {
+        let rows = device.row_majors(slr).ok()?;
+        if !rows.contains(&row_major) {
+            continue;
+        }
+        let minors = device.num_minors_per_std_col_major(slr, row_major).ok()?;
+        let int_major = if device.has_int_columns() {
+            device.int_column(row_major, int_x)?
+        } else {
+            let clb_major = device.clb_col_major(slr, row_major, int_x).ok()?;
+            let tile_type = device.clb_tile_type(slr, row_major, int_x).ok()?;
+            // CLEL_R columns are served by the INT column on the left;
+            // CLEL_L, CLEM, and CLEM_R columns by the one on the right.
+            if tile_type == "CLEL_R" {
+                clb_major.checked_sub(1)?
+            } else {
+                clb_major.checked_add(1)?
+            }
+        };
+        let n = *minors.get(int_major as usize)?;
+        if n >= INT_FRAME_SPAN {
+            return Some((slr, int_major));
+        }
+        return None;
+    }
+    None
+}
+
+/// Resolve a Vivado tile name to its segbits tile type and base FAR
+/// (the FAR of the tile's frame offset 0; `BitRef` frame offsets add
+/// to it). Returns `None` for any tile the device file does not
+/// cover: unknown names, HPIO/CMT/DSP tiles (no column mapping in
+/// the file), INT_INTF/HDIO tiles when no INT_INTF/HDIO table is
+/// attached or the (type, row, X) is not in it, RAMB36 tiles (no
+/// resolver), and INT tiles where the provisional rule fails
+/// validation.
+fn resolve_tile<'a>(device: &'a DeviceFile, tile: &str) -> Option<(&'a str, u32)> {
+    if let Some((x, y)) = parse_slice_tile(tile) {
+        let (slr, row_major) = slr_row_for_y(device, y, NUM_CLB_PER_COLUMN)?;
+        let col = device.clb_col_major(slr, row_major, x).ok()?;
+        let ty = device.clb_tile_type(slr, row_major, x).ok()?;
+        let base = Far::new(FarBlockType::ClbIoClk, row_major, col, 0)
+            .ok()?
+            .to_u32();
+        return Some((ty, base));
+    }
+    if let Some((x, y)) = parse_int_tile(tile) {
+        let (_slr, row_major) = slr_row_for_y(device, y, NUM_CLB_PER_COLUMN)?;
+        let (_slr, int_major) = int_col_major(device, x, row_major)?;
+        let base = Far::new(FarBlockType::ClbIoClk, row_major, int_major, 0)
+            .ok()?
+            .to_u32();
+        return Some(("INT", base));
+    }
+    if let Some((x, y)) = parse_bram_tile(tile) {
+        let (slr, row_major) = slr_row_for_y(device, y, NUM_18K_BRAM_PER_COLUMN)?;
+        let col = device.bram_content_col_major(slr, row_major, x).ok()?;
+        let base = Far::new(FarBlockType::BramContent, row_major, col, 0)
+            .ok()?
+            .to_u32();
+        return Some(("BRAM", base));
+    }
+    // Interface tiles (INT_INTF_* and HDIO_*): the column comes from
+    // the tilegrid-derived INT_INTF/HDIO table (IntfColumnTable,
+    // xczu3eg only so far), keyed by (tile type, FAR row, tile X).
+    // The FAR row is y // 60, the same clock-region rule as INT
+    // tiles. A (type, row, X) the table does not list fails loud: a
+    // tile type with no tilegrid windows (INT_INTF_L/R/L_PCIE4/
+    // RIGHT_TERM_IO) is never in the table, so its tiles do not
+    // resolve instead of borrowing another type's column. The table
+    // is ground truth, so no minors validation applies: every entry
+    // is a recorded baseaddr (verified by tools/verify_xczu3eg.py
+    // section 11, 283 windowed tiles, 15 entries, 0 conflicts).
+    if let Some((ty, x, y)) = parse_intf_tile(tile) {
+        if !ty.starts_with("INT_INTF") && !ty.starts_with("HDIO") {
+            return None;
+        }
+        let (_slr, row_major) = slr_row_for_y(device, y, NUM_CLB_PER_COLUMN)?;
+        // The canonical type string comes from the table's own key,
+        // so the returned &str borrows from the device, not the tile
+        // name (the trait's tile_type borrows from &self).
+        let (canon_ty, col) = device.intf_column_entry(ty, row_major, x)?;
+        let base = Far::new(FarBlockType::ClbIoClk, row_major, col, 0)
+            .ok()?
+            .to_u32();
+        return Some((canon_ty, base));
+    }
+    None
+}
+
+/// All tile names in the device file that resolve, sorted and
+/// deduplicated: every SLICE tile, every resolving INT tile, every
+/// RAMB18 tile, and every INT_INTF/HDIO tile the attached table
+/// covers. Tiles that do not resolve (HPIO/CMT/DSP, RAMB36,
+/// rule-invalid INT tiles, and INT_INTF/HDIO tiles with no table)
+/// are absent by design. When a tilegrid-derived INT column table is attached, INT tiles are
+/// enumerated from the table (33 columns x 3 rows on xczu3eg),
+/// not from the CLB-column enumeration the provisional rule uses.
+fn compute_tile_names(device: &DeviceFile) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for slr in device.slr_names() {
+        let Ok(min_clk_row) = device.min_clock_region_row_idx(slr) else {
+            continue;
+        };
+        let Ok(rows) = device.row_majors(slr) else {
+            continue;
+        };
+        for &row_major in &rows {
+            if let Ok(n_clb) = device.num_clb_columns(slr, row_major) {
+                for x in 0..n_clb as u32 {
+                    for y_ofst in 0..NUM_CLB_PER_COLUMN {
+                        let abs_y = (min_clk_row + row_major) * NUM_CLB_PER_COLUMN + y_ofst;
+                        names.push(format!("SLICE_X{x}Y{abs_y}"));
+                    }
+                    // Provisional-rule enumeration only: with a table,
+                    // INT tiles come from the table below, never from
+                    // CLB column indices (INT tile X is not SLICE_X).
+                    if !device.has_int_columns()
+                        && int_col_major(device, x, row_major).is_some()
+                    {
+                        for y_ofst in 0..NUM_CLB_PER_COLUMN {
+                            let abs_y =
+                                (min_clk_row + row_major) * NUM_CLB_PER_COLUMN + y_ofst;
+                            names.push(format!("INT_X{x}Y{abs_y}"));
+                        }
+                    }
+                }
+            }
+            if let Some(entries) = device.int_column_entries() {
+                for &(row, int_x) in entries.keys() {
+                    if row != row_major {
+                        continue;
+                    }
+                    for y_ofst in 0..NUM_CLB_PER_COLUMN {
+                        let abs_y = (min_clk_row + row_major) * NUM_CLB_PER_COLUMN + y_ofst;
+                        names.push(format!("INT_X{int_x}Y{abs_y}"));
+                    }
+                }
+            }
+            // Interface tiles from the INT_INTF/HDIO table: one name
+            // per (type, row, X) per absolute Y in the row, the same
+            // 60-per-row enumeration as INT. INT_INTF tiles exist at
+            // all 60 Y per row; HDIO tiles exist only at the row-start
+            // Y (Y0/Y60/Y120), so the parse-back row-start rule in
+            // bitgen.rs renders exactly the real HDIO tiles and the
+            // other 59 names per (row, X) stay silent (no bits).
+            if let Some(entries) = device.intf_column_entries() {
+                for (tile_type, row, intf_x) in entries.keys() {
+                    if *row != row_major {
+                        continue;
+                    }
+                    for y_ofst in 0..NUM_CLB_PER_COLUMN {
+                        let abs_y = (min_clk_row + row_major) * NUM_CLB_PER_COLUMN + y_ofst;
+                        names.push(format!("{tile_type}_X{intf_x}Y{abs_y}"));
+                    }
+                }
+            }
+            if let Ok(n_bram) = device.num_bram_columns(slr, row_major) {
+                for x in 0..n_bram as u32 {
+                    for y_ofst in 0..NUM_18K_BRAM_PER_COLUMN {
+                        let abs_y = (min_clk_row + row_major) * NUM_18K_BRAM_PER_COLUMN + y_ofst;
+                        names.push(format!("RAMB18_X{x}Y{abs_y}"));
+                    }
+                }
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Every real frame in the device file, ascending FAR integer:
+/// all standard (CLB_IO_CLK) columns plus all BRAM content columns,
+/// per FAR row per SLR. The count equals `DeviceFile::total_frames`
+/// (asserted in the integration tests); a shortfall would mean a
+/// frame the emitter could touch is missing from config order.
+/// `Far::new` cannot fail for these values (row <= 6, column <=
+/// 234, minor <= 255 on all files on disk), so a failed
+/// construction is skipped defensively and caught by the count
+/// assertion instead of panicking the library.
+fn compute_config_order_fars(device: &DeviceFile) -> Vec<u32> {
+    let mut fars: Vec<u32> = Vec::new();
+    for slr in device.slr_names() {
+        let Ok(rows) = device.row_majors(slr) else {
+            continue;
+        };
+        for &row_major in &rows {
+            if let Ok(minors) = device.num_minors_per_std_col_major(slr, row_major) {
+                for (col, &n) in minors.iter().enumerate() {
+                    for minor in 0..n {
+                        if let Ok(far) =
+                            Far::new(FarBlockType::ClbIoClk, row_major, col as u32, minor)
+                        {
+                            fars.push(far.to_u32());
+                        }
+                    }
+                }
+            }
+            if let Ok(minors) = device.num_minors_per_bram_content_col_major(slr, row_major) {
+                for (col, &n) in minors.iter().enumerate() {
+                    for minor in 0..n {
+                        if let Ok(far) =
+                            Far::new(FarBlockType::BramContent, row_major, col as u32, minor)
+                        {
+                            fars.push(far.to_u32());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fars.sort_unstable();
+    fars.dedup();
+    fars
+}
+
+impl BitgenDevice for DeviceFile {
+    /// Device name, e.g. `xcku3p` (the trait wants the short name,
+    /// not the full part string `xcku3p-ffva676-1-e`).
+    fn part(&self) -> &str {
+        self.device()
+    }
+
+    /// The single SLR IDCODE when every SLR in the file shares one
+    /// (all files on disk have one SLR); `None` when SLRs disagree
+    /// or an IDCODE fails to parse, since the emitter writes one
+    /// IDCODE per bitstream.
+    fn idcode(&self) -> Option<u32> {
+        let mut found: Option<u32> = None;
+        for slr in self.slr_names() {
+            let code = self.slr_idcode(slr).ok()?;
+            match found {
+                None => found = Some(code),
+                Some(prev) if prev == code => {}
+                Some(_) => return None,
+            }
+        }
+        found
+    }
+
+    /// Segbits tile type for a Vivado tile name, or `None` when the
+    /// device file does not cover the tile.
+    fn tile_type(&self, tile: &str) -> Option<&str> {
+        resolve_tile(self, tile).map(|(ty, _)| ty)
+    }
+
+    /// Base FAR (frame offset 0) for a Vivado tile name, or `None`
+    /// when the device file does not cover the tile.
+    fn tile_base_far(&self, tile: &str) -> Option<u32> {
+        resolve_tile(self, tile).map(|(_, base)| base)
+    }
+
+    /// All resolving tile names in the device file, sorted.
+    fn tile_names(&self) -> &[String] {
+        self.tile_names_cache
+            .get_or_init(|| compute_tile_names(self))
+    }
+
+    /// All real frame FARs in config order (ascending FAR integer).
+    fn config_order_fars(&self) -> &[u32] {
+        self.config_order_cache
+            .get_or_init(|| compute_config_order_fars(self))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn int_tile_bit_shift_matches_tilegrid_offsets() {
+        // Tilegrid offsets (xczu3eg INT_X1 column) times 16 bits:
+        // Y0 0, Y1 3, Y2 6, Y29 87, Y30 96, Y59 183; Y60 starts a
+        // new FAR row, so its shift is 0 again.
+        assert_eq!(int_tile_bit_shift("INT_X1Y0"), 0);
+        assert_eq!(int_tile_bit_shift("INT_X1Y1"), 48);
+        assert_eq!(int_tile_bit_shift("INT_X1Y2"), 96);
+        assert_eq!(int_tile_bit_shift("INT_X1Y29"), 1392);
+        assert_eq!(int_tile_bit_shift("INT_X1Y30"), 1536);
+        assert_eq!(int_tile_bit_shift("INT_X1Y59"), 2928);
+        assert_eq!(int_tile_bit_shift("INT_X1Y60"), 0);
+        assert_eq!(int_tile_bit_shift("INT_X2Y1"), 48);
+        assert_eq!(int_tile_bit_shift("SLICE_X0Y0"), 0);
+        assert_eq!(int_tile_bit_shift("INT_INTF_R_PCIE4_X9Y120"), 0);
+    }
+}

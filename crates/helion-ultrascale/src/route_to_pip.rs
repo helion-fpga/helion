@@ -1,0 +1,685 @@
+//! Router-to-PIP translator: routed wire-ID paths to INT PIP FASM lines.
+//!
+//! This is the WireDb seam from INTERFACES.md: the router emits wire-ID
+//! paths (`UltraRouted { routes: Vec<Vec<WireId>> }`) and the int-pip
+//! emitter consumes named PIPs (`IntPip { tile, src, dst }`). The
+//! translator maps each consecutive wire pair in a route to an `IntPip`
+//! via `wire_info`, in physical signal-flow order (driver to sink, the
+//! order `route_ultra` produces).
+//!
+//! Rules, all fail-loud:
+//! - Any wire `wire_info` cannot name stops translation with
+//!   [`RouteToPipError::UnnamedWire`]. Mock-routed designs can never
+//!   feed int-pip emission: the mock has grid positions only, no names,
+//!   and that is expected, not a bug.
+//! - A wire with no driver among the earlier route wires stops
+//!   translation with [`RouteToPipError::NotConnected`], naming the
+//!   driver and the undriven wire. A multi-sink net's route is a
+//!   flattened union of per-sink paths (see `route_ultra`), not an
+//!   ordered walk, so consecutive entries can jump between branches;
+//!   each wire takes its parent from the latest earlier route wire
+//!   that drives it, which reproduces the path's own PIPs for a
+//!   single-sink route. A route whose wires do not connect back to
+//!   the driver through earlier wires is refused, never patched up.
+//! - A consecutive pair in different tiles is a span-wire continuation
+//!   (BEG in one tile to END in the tile the tileconn-stitched distance
+//!   away: LEN steps for vertical spans, (LEN + 1) / 2 for horizontal
+//!   spans), not a PIP:
+//!   it emits nothing and is counted in `continuations`. A cross-tile
+//!   pair that does not fit the continuation naming rule fails loud
+//!   instead of being silently skipped.
+//! - A same-tile pair that is an edge in both directions is one of the
+//!   4 bidirectional PIPs (no directional PIP pair exists in both
+//!   directions in the INT tile: verified over all 3,774 PIPs). The
+//!   caller supplies the traversal direction through `bidir`: the
+//!   concrete [`crate::wire_db::IntTileWireDb`] resolves it from its
+//!   PIP table, and [`translate_route`] without a resolver fails loud
+//!   with [`RouteToPipError::AmbiguousBidirectionalPip`] rather than
+//!   guessing FWD or REV.
+
+use crate::fabric::{WireDb, WireId, WireInfo};
+use crate::int_pip::{BidirDir, IntPip};
+use crate::router::UltraRouted;
+use std::fmt;
+
+/// A translated route: the INT PIPs it programs, in route order, plus
+/// the number of span-wire continuations crossed (which program no PIP).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TranslatedRoute {
+    pub pips: Vec<IntPip>,
+    pub continuations: usize,
+}
+
+/// Translation failure. Carries the exact wire or PIP that stopped the
+/// translation, and the design that needed it. Never a bare message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RouteToPipError {
+    /// A wire in the route has no name in this WireDb (placeholder,
+    /// mock, or an out-of-range ID). Translation refused.
+    UnnamedWire { wire: WireId, design: String },
+    /// A wire in the route has no driver among the earlier route
+    /// wires: no graph edge reaches it from the driver through the
+    /// route's own wires. The route is disconnected, not a tree.
+    NotConnected {
+        src: String,
+        dst: String,
+        design: String,
+    },
+    /// A cross-tile pair does not fit the span-wire continuation rule
+    /// (BEG in one tile to its END partner LEN steps away). It is
+    /// neither a PIP nor a continuation.
+    NotAContinuation {
+        src: String,
+        dst: String,
+        design: String,
+    },
+    /// A same-tile pair is an edge in both directions (a bidirectional
+    /// PIP) and no direction resolver was supplied, so FWD vs REV
+    /// cannot be decided. Use [`crate::wire_db::IntTileWireDb::translate_route`]
+    /// or pass a resolver to [`translate_route_with`].
+    AmbiguousBidirectionalPip {
+        tile: String,
+        src: String,
+        dst: String,
+        design: String,
+    },
+}
+
+impl fmt::Display for RouteToPipError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnnamedWire { wire, design } => write!(
+                f,
+                "wire {} in design '{}' has no name in this WireDb; \
+                 mock-routed designs cannot feed int-pip emission",
+                wire, design
+            ),
+            Self::NotConnected { src, dst, design } => write!(
+                f,
+                "route in design '{}' cannot drive wire '{}' from the driver '{}': no edge from any earlier route wire",
+                design, dst, src
+            ),
+            Self::NotAContinuation { src, dst, design } => write!(
+                f,
+                "route in design '{}' crosses tiles from '{}' to '{}', \
+                 which is neither a PIP nor a span-wire continuation",
+                design, src, dst
+            ),
+            Self::AmbiguousBidirectionalPip {
+                tile,
+                src,
+                dst,
+                design,
+            } => write!(
+                f,
+                "bidirectional PIP {}.PIP.{}.{} in design '{}' needs a \
+                 direction resolver (FWD vs REV); none was supplied",
+                tile, dst, src, design
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RouteToPipError {}
+
+/// Span-wire naming: `<DIR><LEN>[_E|_W]_(BEG|END)<n>`. Returns the
+/// partner wire name and the tile delta from this wire's tile to the
+/// partner's tile, or `None` when the name is not a span wire. This is
+/// the translator-side check that a cross-tile pair is a genuine
+/// continuation; the graph-side builder lives in `wire_db`.
+fn continuation_partner(name: &str) -> Option<(String, (i32, i32))> {
+    let (head, kind) = match name.find("_BEG") {
+        Some(i) => (&name[..i], Some((i, true))),
+        None => match name.find("_END") {
+            Some(i) => (&name[..i], Some((i, false))),
+            None => (name, None),
+        },
+    };
+    let (i, is_beg) = kind?;
+    let idx = &name[i + 4..];
+    if idx.is_empty() || !idx.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (dir_len, side) = match head.rsplit_once('_') {
+        Some((d, s)) if s == "E" || s == "W" => (d, s),
+        _ => (head, ""),
+    };
+    let ((dx, dy), len) = match dir_len {
+        "NN1" => ((0, 1), 1),
+        "NN2" => ((0, 1), 2),
+        "NN4" => ((0, 1), 4),
+        "NN12" => ((0, 1), 12),
+        "SS1" => ((0, -1), 1),
+        "SS2" => ((0, -1), 2),
+        "SS4" => ((0, -1), 4),
+        "SS12" => ((0, -1), 12),
+        "EE1" => ((1, 0), 1),
+        "EE2" => ((1, 0), 2),
+        "EE4" => ((1, 0), 4),
+        "EE12" => ((1, 0), 12),
+        "WW1" => ((-1, 0), 1),
+        "WW2" => ((-1, 0), 2),
+        "WW4" => ((-1, 0), 4),
+        "WW12" => ((-1, 0), 12),
+        _ => return None,
+    };
+    let base = format!(
+        "{}{}{}",
+        &name[..2],
+        len,
+        if side.is_empty() {
+            String::new()
+        } else {
+            format!("_{}", side)
+        }
+    );
+    let partner = if is_beg {
+        format!("{}_END{}", base, idx)
+    } else {
+        format!("{}_BEG{}", base, idx)
+    };
+    // Tile steps are the tileconn-stitched distance, not the span
+    // length: vertical spans (NN/SS) advance LEN INT tiles, but
+    // horizontal spans (EE/WW) advance (LEN + 1) / 2 INT tiles (a
+    // length-2 span reaches the adjacent INT tile). See
+    // wire_db::continuation_partner: the old LEN-in-both-directions
+    // rule made the router emit PIPs out of span ENDs two tiles away
+    // whose node has no driver in the tileconn model.
+    let steps = if dx != 0 { (len + 1) / 2 } else { len };
+    let delta = if is_beg {
+        (dx * steps, dy * steps)
+    } else {
+        (-dx * steps, -dy * steps)
+    };
+    Some((partner, delta))
+}
+
+fn named<'a>(
+    db: &'a dyn WireDb,
+    wire: WireId,
+    design: &str,
+) -> Result<WireInfo<'a>, RouteToPipError> {
+    db.wire_info(wire)
+        .ok_or_else(|| RouteToPipError::UnnamedWire {
+            wire,
+            design: design.to_string(),
+        })
+}
+
+/// Translate one route (driver to sinks, physical direction) to INT
+/// PIPs, with an optional bidirectional-PIP direction resolver. The
+/// resolver maps a route pair (a, b) to the traversal direction
+/// relative to the tile JSON's src to dst order (`Fwd` when (a, b) is
+/// in that order, `Rev` when it is the reverse), or `None` when the
+/// pair is not a bidirectional PIP. Pass `None` for the resolver to
+/// fail loud on any bidirectional PIP instead of guessing.
+///
+/// The route is a wire SET forming a tree (the union of the router's
+/// per-sink paths), not necessarily an ordered walk: a multi-sink net
+/// lists one src-to-sink path per sink, so consecutive entries can
+/// jump between branches. Each wire except the driver takes its
+/// parent from the latest earlier route wire that drives it (an edge
+/// in the graph); a single ordered path translates to exactly its own
+/// PIPs in order, since each wire's latest preceding driver is its
+/// immediate predecessor there. A wire with no preceding driver in
+/// the route fails loud with [`RouteToPipError::NotConnected`],
+/// naming the driver and the undriven wire.
+pub fn translate_route_with(
+    db: &dyn WireDb,
+    route: &[WireId],
+    design: &str,
+    bidir: Option<&dyn Fn(WireId, WireId) -> Option<BidirDir>>,
+) -> Result<TranslatedRoute, RouteToPipError> {
+    let mut out = TranslatedRoute::default();
+    if route.len() < 2 {
+        return Ok(out);
+    }
+    // Dedup, keeping first-occurrence order (the router already
+    // dedups within a net; this only guards the translator).
+    let mut wires: Vec<WireId> = Vec::with_capacity(route.len());
+    for &w in route {
+        if !wires.contains(&w) {
+            wires.push(w);
+        }
+    }
+    if wires.len() < 2 {
+        return Ok(out);
+    }
+    // Name every wire first, so an unnamed wire fails loud naming
+    // itself rather than surfacing as a missing edge.
+    let mut infos: Vec<WireInfo<'_>> = Vec::with_capacity(wires.len());
+    for &w in &wires {
+        infos.push(named(db, w, design)?);
+    }
+    // Derive the tree edges: each wire's parent is its latest
+    // preceding driver in the route. Parent indices strictly
+    // decrease, so the edges form a tree rooted at the driver.
+    let mut edges: Vec<(usize, usize)> = Vec::with_capacity(wires.len() - 1);
+    for i in 1..wires.len() {
+        let mut parent: Option<usize> = None;
+        for j in (0..i).rev() {
+            if db.fanout(wires[j]).contains(&wires[i]) {
+                parent = Some(j);
+                break;
+            }
+        }
+        let Some(j) = parent else {
+            return Err(RouteToPipError::NotConnected {
+                src: infos[0].name.to_string(),
+                dst: infos[i].name.to_string(),
+                design: design.to_string(),
+            });
+        };
+        edges.push((j, i));
+    }
+    for (ai, bi) in edges {
+        let (a, b) = (wires[ai], wires[bi]);
+        let info_a = infos[ai];
+        let info_b = infos[bi];
+        if info_a.tile == info_b.tile {
+            // Same tile: a PIP. Bidirectional PIPs are edges in both
+            // directions; directional PIPs are one-way.
+            if db.fanout(b).contains(&a) {
+                match bidir.and_then(|resolve| resolve(a, b)) {
+                    Some(BidirDir::Fwd) => out.pips.push(IntPip::with_bidir(
+                        info_a.tile,
+                        info_a.name,
+                        info_b.name,
+                        BidirDir::Fwd,
+                    )),
+                    Some(BidirDir::Rev) => out.pips.push(IntPip::with_bidir(
+                        info_a.tile,
+                        info_b.name,
+                        info_a.name,
+                        BidirDir::Rev,
+                    )),
+                    None => {
+                        return Err(RouteToPipError::AmbiguousBidirectionalPip {
+                            tile: info_a.tile.to_string(),
+                            src: info_a.name.to_string(),
+                            dst: info_b.name.to_string(),
+                            design: design.to_string(),
+                        });
+                    }
+                }
+            } else {
+                out.pips
+                    .push(IntPip::new(info_a.tile, info_a.name, info_b.name));
+            }
+        } else {
+            // Cross-tile: must be a span-wire continuation.
+            let (xa, ya) = db.wire_xy(a);
+            let (xb, yb) = db.wire_xy(b);
+            let is_continuation = match continuation_partner(info_a.name) {
+                Some((partner, (dx, dy))) => {
+                    partner == info_b.name && xb - xa == dx && yb - ya == dy
+                }
+                None => false,
+            };
+            if is_continuation {
+                out.continuations += 1;
+            } else {
+                return Err(RouteToPipError::NotAContinuation {
+                    src: format!("{}.{}", info_a.tile, info_a.name),
+                    dst: format!("{}.{}", info_b.tile, info_b.name),
+                    design: design.to_string(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Translate one route (driver to sinks, physical direction) to
+/// INT PIPs. Bidirectional PIPs fail loud: without a direction
+/// resolver FWD vs REV cannot be decided. Use
+/// [`translate_route_with`] or
+/// [`crate::wire_db::IntTileWireDb::translate_route`] for those.
+pub fn translate_route(
+    db: &dyn WireDb,
+    route: &[WireId],
+    design: &str,
+) -> Result<TranslatedRoute, RouteToPipError> {
+    translate_route_with(db, route, design, None)
+}
+
+/// Translate every net of a routed design, in net order. One entry per
+/// net in `routed.routes`, in the same order.
+pub fn translate_routes(
+    db: &dyn WireDb,
+    routed: &UltraRouted,
+    design: &str,
+) -> Result<Vec<TranslatedRoute>, RouteToPipError> {
+    translate_routes_with(db, routed, design, None)
+}
+
+/// Like [`translate_routes`], with a bidirectional-PIP resolver.
+pub fn translate_routes_with(
+    db: &dyn WireDb,
+    routed: &UltraRouted,
+    design: &str,
+    bidir: Option<&dyn Fn(WireId, WireId) -> Option<BidirDir>>,
+) -> Result<Vec<TranslatedRoute>, RouteToPipError> {
+    let mut out = Vec::with_capacity(routed.routes.len());
+    for route in &routed.routes {
+        out.push(translate_route_with(db, route, design, bidir)?);
+    }
+    Ok(out)
+}
+
+/// FASM text for translated PIPs: one line per PIP, in route order,
+/// across all nets.
+pub fn translated_to_fasm(translated: &[TranslatedRoute]) -> String {
+    let mut out = String::new();
+    for t in translated {
+        for pip in &t.pips {
+            out.push_str(&pip.fasm_line());
+            out.push('\n');
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fabric::EmptyWireDb;
+    use crate::router::mock::MockWireDb;
+    use crate::wire_db::{IntTile, IntTileWireDb};
+
+    const TILE_JSON: &str = include_str!("../data/tile_type_INT.json");
+
+    fn one_tile() -> IntTileWireDb {
+        IntTileWireDb::single_tile("INT_X12Y45", 12, 45, TILE_JSON).unwrap()
+    }
+
+    #[test]
+    fn blinky_path_translates_to_golden_pips() {
+        let db = one_tile();
+        // Physical order: LUT output wire to the BOUNCE wire that
+        // feeds the FF input side of the tile.
+        let route = [
+            db.wire_id("INT_X12Y45", "LOGIC_OUTS_E0").unwrap(),
+            db.wire_id("INT_X12Y45", "INODE_E_1_FT1").unwrap(),
+            db.wire_id("INT_X12Y45", "BOUNCE_E_0_FT1").unwrap(),
+        ];
+        let t = translate_route(&db, &route, "blinky").unwrap();
+        assert_eq!(t.continuations, 0);
+        assert_eq!(
+            t.pips.iter().map(|p| p.fasm_line()).collect::<Vec<_>>(),
+            vec![
+                "INT_X12Y45.PIP.INODE_E_1_FT1.LOGIC_OUTS_E0",
+                "INT_X12Y45.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1",
+            ]
+        );
+        // The second PIP is the golden blinky PIP (modulo the tile
+        // name: the golden uses INT_X0Y0, this test uses INT_X12Y45).
+        assert_eq!(t.pips[1].feature(), "PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1");
+    }
+
+    #[test]
+    fn continuation_crosses_tiles_without_a_pip() {
+        let db = IntTileWireDb::from_json(
+            TILE_JSON,
+            &[
+                IntTile::new("INT_X12Y45", 12, 45),
+                IntTile::new("INT_X12Y57", 12, 57),
+            ],
+        )
+        .unwrap();
+        // NN12_BEG7 in (12,45) continues as NN12_END7 in (12,57),
+        // which drives NN12_BEG7 there through one PIP.
+        let route = [
+            db.wire_id("INT_X12Y45", "NN12_BEG7").unwrap(),
+            db.wire_id("INT_X12Y57", "NN12_END7").unwrap(),
+            db.wire_id("INT_X12Y57", "NN12_BEG7").unwrap(),
+        ];
+        let t = translate_route(&db, &route, "blinky").unwrap();
+        assert_eq!(t.continuations, 1);
+        assert_eq!(t.pips.len(), 1);
+        assert_eq!(t.pips[0].fasm_line(), "INT_X12Y57.PIP.NN12_BEG7.NN12_END7");
+    }
+
+    #[test]
+    fn continuation_crosses_tiles_in_reverse_without_a_pip() {
+        let db = IntTileWireDb::from_json(
+            TILE_JSON,
+            &[
+                IntTile::new("INT_X12Y45", 12, 45),
+                IntTile::new("INT_X12Y57", 12, 57),
+            ],
+        )
+        .unwrap();
+        // The same span wire traversed south: NN12_END7 in (12,57)
+        // continues as NN12_BEG7 in (12,45). A continuation either
+        // way programs no PIP.
+        let route = [
+            db.wire_id("INT_X12Y57", "NN12_END7").unwrap(),
+            db.wire_id("INT_X12Y45", "NN12_BEG7").unwrap(),
+        ];
+        let t = translate_route(&db, &route, "blinky").unwrap();
+        assert_eq!(t.continuations, 1);
+        assert!(t.pips.is_empty());
+    }
+
+    #[test]
+    fn horizontal_continuation_crosses_one_int_tile() {
+        let db = IntTileWireDb::from_json(
+            TILE_JSON,
+            &[
+                IntTile::new("INT_X12Y45", 12, 45),
+                IntTile::new("INT_X13Y45", 13, 45),
+            ],
+        )
+        .unwrap();
+        // EE2_E_BEG3 in (12,45) continues as EE2_E_END3 in (13,45),
+        // which drives INT_NODE_SDQ_14_INT_OUT0 there through one PIP.
+        let route = [
+            db.wire_id("INT_X12Y45", "EE2_E_BEG3").unwrap(),
+            db.wire_id("INT_X13Y45", "EE2_E_END3").unwrap(),
+            db.wire_id("INT_X13Y45", "INT_NODE_SDQ_14_INT_OUT0").unwrap(),
+        ];
+        let t = translate_route(&db, &route, "span").unwrap();
+        assert_eq!(t.continuations, 1);
+        assert_eq!(t.pips.len(), 1);
+        assert_eq!(
+            t.pips[0].fasm_line(),
+            "INT_X13Y45.PIP.INT_NODE_SDQ_14_INT_OUT0.EE2_E_END3"
+        );
+    }
+
+    #[test]
+    fn bidir_pair_fails_loud_without_resolver_and_resolves_with_one() {
+        let db = one_tile();
+        let imux = db
+            .wire_id("INT_X12Y45", "INT_NODE_IMUX_5_INT_OUT0")
+            .unwrap();
+        let bypass = db.wire_id("INT_X12Y45", "BYPASS_E8").unwrap();
+        // No resolver: fail loud, do not guess FWD or REV.
+        let err = translate_route(&db, &[imux, bypass], "blinky").unwrap_err();
+        assert_eq!(
+            err,
+            RouteToPipError::AmbiguousBidirectionalPip {
+                tile: "INT_X12Y45".to_string(),
+                src: "INT_NODE_IMUX_5_INT_OUT0".to_string(),
+                dst: "BYPASS_E8".to_string(),
+                design: "blinky".to_string(),
+            }
+        );
+        // With the concrete DB as resolver: FWD one way, REV the other,
+        // both spelled with the tile-canonical src/dst order.
+        let fwd = db.translate_route(&[imux, bypass], "blinky").unwrap();
+        assert_eq!(fwd.pips.len(), 1);
+        assert_eq!(
+            fwd.pips[0].feature(),
+            "PIP.BYPASS_E8.INT_NODE_IMUX_5_INT_OUT0.FWD"
+        );
+        let rev = db.translate_route(&[bypass, imux], "blinky").unwrap();
+        assert_eq!(rev.pips.len(), 1);
+        assert_eq!(
+            rev.pips[0].feature(),
+            "PIP.BYPASS_E8.INT_NODE_IMUX_5_INT_OUT0.REV"
+        );
+        // The REV PIP still carries canonical src/dst.
+        assert_eq!(rev.pips[0].src, "INT_NODE_IMUX_5_INT_OUT0");
+        assert_eq!(rev.pips[0].dst, "BYPASS_E8");
+    }
+
+    #[test]
+    fn mock_routed_design_fails_loud_on_unnamed_wire() {
+        let db = MockWireDb::new(4, 4);
+        let err = translate_route(&db, &[0, 1, 2], "blinky").unwrap_err();
+        assert_eq!(
+            err,
+            RouteToPipError::UnnamedWire {
+                wire: 0,
+                design: "blinky".to_string(),
+            }
+        );
+        let empty = EmptyWireDb;
+        let err = translate_route(&empty, &[0], "blinky").unwrap();
+        assert!(err.pips.is_empty());
+        let err = translate_route(&empty, &[0, 1], "blinky").unwrap_err();
+        assert_eq!(
+            err,
+            RouteToPipError::UnnamedWire {
+                wire: 0,
+                design: "blinky".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn multi_sink_union_translates_to_pip_tree() {
+        let db = one_tile();
+        // cnt_0's routed union from the counter flow (4 sinks, 19
+        // wires): the legs share the driver LOGIC_OUTS_W23 and
+        // branch at BYPASS_W14 (W11 leg), BYPASS_W8 (W6 leg), and
+        // BYPASS_W14 again (W7 leg). The flattened list jumps
+        // between legs (IMUX_W8 -> INT_NODE_IMUX_49_INT_OUT0 is not
+        // an edge); the translator derives the tree from the wire
+        // set instead of failing on the jump, reproducing exactly
+        // the 18 PIPs the flow emitted for this net.
+        let route = [
+            db.wire_id("INT_X12Y45", "LOGIC_OUTS_W23").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_NODE_SDQ_82_INT_OUT0").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_INT_SDQ_6_INT_OUT0").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_NODE_GLOBAL_6_INT_OUT0").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_NODE_IMUX_50_INT_OUT0").unwrap(),
+            db.wire_id("INT_X12Y45", "BYPASS_W14").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_NODE_IMUX_49_INT_OUT1").unwrap(),
+            db.wire_id("INT_X12Y45", "IMUX_W8").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_NODE_IMUX_49_INT_OUT0").unwrap(),
+            db.wire_id("INT_X12Y45", "BYPASS_W12").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_NODE_IMUX_46_INT_OUT0").unwrap(),
+            db.wire_id("INT_X12Y45", "IMUX_W11").unwrap(),
+            db.wire_id("INT_X12Y45", "BYPASS_W8").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_NODE_IMUX_36_INT_OUT0").unwrap(),
+            db.wire_id("INT_X12Y45", "IMUX_W6").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_NODE_IMUX_50_INT_OUT1").unwrap(),
+            db.wire_id("INT_X12Y45", "BYPASS_W10").unwrap(),
+            db.wire_id("INT_X12Y45", "INT_NODE_IMUX_41_INT_OUT0").unwrap(),
+            db.wire_id("INT_X12Y45", "IMUX_W7").unwrap(),
+        ];
+        let t = db.translate_route(&route, "counter").unwrap();
+        assert_eq!(t.continuations, 0);
+        assert_eq!(t.pips.len(), 18);
+        // The leg-junction PIPs: the W11 leg branches off
+        // BYPASS_W14, the W6 leg off BYPASS_W8, the W7 leg off
+        // BYPASS_W14 again.
+        for feature in [
+            "PIP.INT_NODE_IMUX_49_INT_OUT0.BYPASS_W14",
+            "PIP.INT_NODE_IMUX_36_INT_OUT0.BYPASS_W8",
+            "PIP.INT_NODE_IMUX_50_INT_OUT1.BYPASS_W14",
+        ] {
+            assert!(
+                t.pips.iter().any(|p| p.feature() == feature),
+                "translated PIPs are missing the junction PIP {feature}: {:?}",
+                t.pips.iter().map(|p| p.feature()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn union_with_unreachable_wire_still_fails_loud() {
+        let db = one_tile();
+        // GCLK_B_0_0 has no fanin in the tile: no earlier route
+        // wire drives it, so the union is disconnected and must
+        // fail loud rather than emit PIPs for a jump that does not
+        // exist.
+        let route = [
+            db.wire_id("INT_X12Y45", "LOGIC_OUTS_E0").unwrap(),
+            db.wire_id("INT_X12Y45", "INODE_E_1_FT1").unwrap(),
+            db.wire_id("INT_X12Y45", "BOUNCE_E_0_FT1").unwrap(),
+            db.wire_id("INT_X12Y45", "GCLK_B_0_0").unwrap(),
+        ];
+        let err = translate_route(&db, &route, "blinky").unwrap_err();
+        assert_eq!(
+            err,
+            RouteToPipError::NotConnected {
+                src: "LOGIC_OUTS_E0".to_string(),
+                dst: "GCLK_B_0_0".to_string(),
+                design: "blinky".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn non_adjacent_pair_fails_loud_naming_both_wires() {
+        let db = one_tile();
+        // LOGIC_OUTS_E0 does not drive BOUNCE_E_0_FT1 directly.
+        let route = [
+            db.wire_id("INT_X12Y45", "LOGIC_OUTS_E0").unwrap(),
+            db.wire_id("INT_X12Y45", "BOUNCE_E_0_FT1").unwrap(),
+        ];
+        let err = translate_route(&db, &route, "blinky").unwrap_err();
+        assert_eq!(
+            err,
+            RouteToPipError::NotConnected {
+                src: "LOGIC_OUTS_E0".to_string(),
+                dst: "BOUNCE_E_0_FT1".to_string(),
+                design: "blinky".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn short_routes_translate_to_nothing() {
+        let db = one_tile();
+        let w = db.wire_id("INT_X12Y45", "BOUNCE_E_0_FT1").unwrap();
+        assert_eq!(
+            translate_route(&db, &[], "blinky").unwrap(),
+            TranslatedRoute::default()
+        );
+        assert_eq!(
+            translate_route(&db, &[w], "blinky").unwrap(),
+            TranslatedRoute::default()
+        );
+    }
+
+    #[test]
+    fn translate_routes_keeps_net_order() {
+        let db = one_tile();
+        let routed = UltraRouted {
+            routes: vec![
+                vec![
+                    db.wire_id("INT_X12Y45", "LOGIC_OUTS_E0").unwrap(),
+                    db.wire_id("INT_X12Y45", "INODE_E_1_FT1").unwrap(),
+                    db.wire_id("INT_X12Y45", "BOUNCE_E_0_FT1").unwrap(),
+                ],
+                vec![db.wire_id("INT_X12Y45", "GCLK_B_0_0").unwrap()],
+            ],
+            iters_used: 1,
+            overused_nodes: 0,
+        };
+        let ts = translate_routes(&db, &routed, "blinky").unwrap();
+        assert_eq!(ts.len(), 2);
+        assert_eq!(ts[0].pips.len(), 2);
+        assert!(ts[1].pips.is_empty());
+        assert_eq!(
+            translated_to_fasm(&ts),
+            "INT_X12Y45.PIP.INODE_E_1_FT1.LOGIC_OUTS_E0\n\
+             INT_X12Y45.PIP.BOUNCE_E_0_FT1.INODE_E_1_FT1\n"
+        );
+    }
+}

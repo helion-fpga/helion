@@ -1,0 +1,25 @@
+{
+  "class": "probe",
+  "design": "probe_clk",
+  "fasm_sha256": "63b1869a1c41510012dc988ebf8ff84f95ec24d2548447ddf684aabbb144b750",
+  "notes": "Probe design: its probed block has no public encoding (DSP48E2/URAM288) or no emitter tile mapping (CLK/RCLK); the harness must report it blocked, never green.",
+  "part": "xcku3p",
+  "placement_hash": "e9f6dea36a2d58ccbcec829218802f0ae30682790a24b295cee627af00f59c2e",
+  "provisional_tiles": [
+    "INT_X0Y0",
+    "HPIO_RIGHT_X0Y0"
+  ],
+  "seed": 20262121,
+  "sites": [
+    {
+      "bel": "A6LUT",
+      "role": "lut",
+      "tile": "SLICE_X0Y0"
+    },
+    {
+      "bel": "AFF",
+      "role": "ff",
+      "tile": "SLICE_X0Y0"
+    }
+  ]
+}
