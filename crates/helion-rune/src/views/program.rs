@@ -750,9 +750,25 @@ mod tests {
         let mut s = program_state();
         with_bits(&mut s);
         s.program.detect = Some(no_usb_fixture());
+        // HL10 has no silicon: a board cable is refused before the USB scan matters.
+        let why = program_block_reason(&s).expect("HL10 on a board cable must block");
+        assert!(why.contains("no HL10 silicon") && why.contains("Simulation"), "{why}");
+        // A 7-series .bit with no openFPGALoader names the missing tool.
+        s.program.file = Some("/r/top.bit".into());
+        s.project.part = "xc7z020clg484-1".into();
         let why = program_block_reason(&s).expect("auto without USB must block");
-        assert!(why.contains("No USB programmer"), "{why}");
+        assert!(why.contains("openFPGALoader not found"), "{why}");
+        s.program.detect.as_mut().unwrap().usb.ofl_path = Some("/bin/openFPGALoader".into());
+        assert!(program_block_reason(&s).unwrap().contains("No USB programmer"));
         s.program.cable = CableChoice::Sim;
+        assert!(program_block_reason(&s).unwrap().contains("Helion parts only"));
+        // Lattice: the run's artifact and the commands to load it outside Helion.
+        s.project.part = "ice40-hx8k".into();
+        s.program.file = Some("/r/top.asc".into());
+        assert!(program_block_reason(&s).unwrap().contains("icepack /r/top.asc /r/top.bin && iceprog /r/top.bin"));
+        // Back to HL10 with Simulation: nothing blocks.
+        s.project.part = "HL10T-C32-1".into();
+        s.program.file = None;
         assert_eq!(program_block_reason(&s), None, "sim needs no USB");
         let mut rt = harness_with(s);
         rt.frame(0.0);

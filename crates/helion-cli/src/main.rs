@@ -2117,6 +2117,20 @@ fn hw(args: Vec<String>) {
     );
     println!("hw note {}", det.note);
     let flash = sub == "flash";
+    if let Some(why) = helion_hw::lattice_program_reason(&part, bitstream.as_deref().map(Path::new)) {
+        eprintln!("helion hw {sub}: {why}");
+        std::process::exit(2);
+    }
+    if part.to_ascii_lowercase().starts_with("xc7") {
+        match hw_program_x7(&part, bitstream.as_deref(), &info, flash) {
+            Ok(line) => println!("hw {sub} {line}"),
+            Err(e) => {
+                eprintln!("helion hw {sub}: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let dev = Device::load_part(&part).unwrap_or_else(|e| {
         eprintln!("helion hw {sub}: HAD {part}: {e}");
         std::process::exit(1);
@@ -2162,6 +2176,30 @@ fn hw(args: Vec<String>) {
         };
         println!("{}", outcome.summary_line(&sub, &dev.part));
     }
+}
+
+/// Load a 7-series `.bit` into SRAM with openFPGALoader, with the SHUTDOWN
+/// preamble the IDE adds (`x7_bit_with_shutdown`), so a reload over a
+/// running design starts clean (G87). The file on disk is not changed.
+fn hw_program_x7(part: &str, bitstream: Option<&str>, cable: &helion_hw::CableInfo, flash: bool) -> Result<String, String> {
+    if flash {
+        return Err(format!("{part}: configuration memory isn't supported for 7-series/Zynq yet; `helion hw program` loads SRAM (lost at power-off)"));
+    }
+    if cable.backend != CableBackend::OpenFpgaLoader {
+        return Err(format!("{part}: 7-series parts load through openFPGALoader; use --cable auto or usb (not {})", cable.backend.as_str()));
+    }
+    let path = bitstream.ok_or_else(|| format!("{part}: give the .bit to load (the IDE run or zedbit writes it)"))?;
+    let bit = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+    let patched = helion_hw::x7_bit_with_shutdown(&bit).map_err(|e| format!("{path}: {e}"))?;
+    let tmp = std::env::temp_dir().join(format!("helion-hw-program-{}.bit", std::process::id()));
+    std::fs::write(&tmp, &patched).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    if !helion_hw::x7_board_hardware_tested(part) {
+        eprintln!("helion hw: warning: {part} is not hardware-tested (only the ZedBoard has run a Helion bitstream)");
+    }
+    let r = helion_hw::program_via_openfpgaloader_for_part(&tmp, false, Some(part));
+    let _ = std::fs::remove_file(&tmp);
+    let r = r?;
+    Ok(format!("{part} backend=openfpgaloader (SHUTDOWN preamble added): {}", r.command))
 }
 
 fn cmd_ip(args: &[String]) {

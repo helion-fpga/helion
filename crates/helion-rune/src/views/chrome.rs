@@ -955,7 +955,10 @@ fn flow_entries(section: FlowSection, s: &AppState) -> Vec<FlowEntry> {
                     "Generate Bitstream",
                     "launch_runs -to_step write_bitstream",
                     RunTarget::Bitstream,
-                    if s.bitstream.has_run {
+                    // A family run writes its file without the HL10 frame view.
+                    if s.bitstream.has_run
+                        || (s.program.file.is_some() && crate::views::device_family::is_family_part(&s.project.part))
+                    {
                         RunStatus::Complete
                     } else {
                         RunStatus::NotStarted

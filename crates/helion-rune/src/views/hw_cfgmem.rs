@@ -203,8 +203,24 @@ pub fn start_addr(s: &AppState) -> Result<u32, String> {
     u32::try_from(v).map_err(|_| "start address must fit 32 bits".to_string())
 }
 
+/// Configuration memory models Helion images only; name why for other parts.
+fn family_block(s: &AppState) -> Option<String> {
+    let part = crate::views::program::program_part(s);
+    if !crate::views::device_family::is_family_part(&part) {
+        return None;
+    }
+    Some(if part.to_ascii_lowercase().starts_with("xc7") {
+        format!("Configuration memory isn't supported for {part} (7-series/Zynq) yet; Program Device loads SRAM, which is lost at power-off.")
+    } else {
+        format!("Configuration memory isn't supported for {part}.")
+    })
+}
+
 /// Why Generate Image is unavailable.
 pub fn write_block(s: &AppState) -> Option<String> {
+    if let Some(why) = family_block(s) {
+        return Some(why);
+    }
     if s.program.cfgmem.part.is_none() {
         return Some("Add a configuration memory device first.".into());
     }
@@ -294,6 +310,9 @@ pub fn op_block(s: &AppState, op: CfgOp) -> Option<String> {
     let c = &s.program.cfgmem;
     if let Some(b) = c.busy() {
         return Some(format!("Busy: {}", b.busy_label()));
+    }
+    if let Some(why) = family_block(s) {
+        return Some(why);
     }
     let part = c.part?;
     if flash_path(s) == FlashPath::Native {
@@ -805,6 +824,12 @@ mod tests {
         assert!(op_block(&s, CfgOp::Program).unwrap().contains("USB"));
         s.program.cable = CableChoice::Native;
         assert!(op_block(&s, CfgOp::Erase).is_none(), "native FTDI erases");
+        // 7-series: no flash path, whatever the cable.
+        s.project.part = "xc7z020clg484-1".into();
+        s.program.file = Some("/r/top.bit".into());
+        for why in [op_block(&s, CfgOp::Program), write_block(&s)] {
+            assert!(why.unwrap().contains("isn't supported for xc7z020clg484-1"));
+        }
     }
 
     #[test]

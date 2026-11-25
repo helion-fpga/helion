@@ -503,6 +503,29 @@ pub fn program_part(s: &AppState) -> String {
     s.project.part.clone()
 }
 
+/// Why `part` can't be programmed over `cable` from Helion, whatever the
+/// USB scan says (`None` = nothing about the part blocks it). Name pattern
+/// only: this runs every frame. `file` is the run's artifact, for the
+/// commands a Lattice user runs instead.
+pub fn part_program_block(part: &str, cable: &str, file: Option<&std::path::Path>) -> Option<String> {
+    let p = part.to_ascii_lowercase();
+    let sim = matches!(cable, "sim" | "mpsse-sim");
+    if p.starts_with("hl10") && !sim {
+        return Some(format!(
+            "{part} is a Helion HL10 part: there is no HL10 silicon, so no board can take it. Use the Simulation cable."
+        ));
+    }
+    if let Some(why) = helion_hw::lattice_program_reason(part, file) {
+        return Some(why);
+    }
+    if p.starts_with("xc7") && sim {
+        return Some(format!(
+            "The Simulation cable models Helion parts only; pick Automatic or USB to load {part}."
+        ));
+    }
+    None
+}
+
 /// Why Program Device is unavailable right now (`None` = enabled).
 pub fn program_block_reason(s: &AppState) -> Option<String> {
     if let Some(kind) = s.program.busy() {
@@ -514,15 +537,20 @@ pub fn program_block_reason(s: &AppState) -> Option<String> {
     if bits_source(s).is_none() {
         return Some("No bitstream yet. Generate Bitstream first.".into());
     }
+    if let Some(why) = part_program_block(&program_part(s), s.program.cable.spec(), s.program.file.as_deref()) {
+        return Some(why);
+    }
     if s.program.cable.needs_usb() {
         match &s.program.detect {
             None => {
-                return Some("USB not scanned. Run Detect, or use the Simulation cable.".into());
+                return Some("USB not scanned. Connect the board's JTAG USB port and run Detect.".into());
             }
             Some(d) if !d.physical_had => {
-                return Some(
-                    "No USB programmer (USB=0). Use Simulation for fabric-only programming.".into(),
-                );
+                return Some(if d.usb.ofl_path.is_none() && s.program.cable != CableChoice::Native {
+                    "openFPGALoader not found: install it (or set HELION_OPENFPGALOADER), then run Detect.".into()
+                } else {
+                    "No USB programmer (USB=0). Connect the board's JTAG USB port and run Detect.".into()
+                });
             }
             Some(_) => {}
         }
@@ -609,6 +637,13 @@ pub fn program_blocking(job: &ProgramJob, emit: &dyn Fn(HwEvent)) -> HwEvent {
             bytes: 0,
         }))
     };
+    let file = match &job.bits {
+        BitsSource::File(p) => Some(p.as_path()),
+        BitsSource::Memory(_) => None,
+    };
+    if let Some(why) = part_program_block(&job.part, &job.cable, file) {
+        return fail(format!("program_hw: {why}"));
+    }
     if crate::runs_family::is_xilinx7(&job.part) {
         return program_x7_blocking(job, emit);
     }
@@ -696,9 +731,6 @@ fn program_x7_blocking(job: &ProgramJob, emit: &dyn Fn(HwEvent)) -> HwEvent {
     let BitsSource::File(path) = &job.bits else {
         return fail(format!("program_hw: {part} needs the .bit file from Run Implementation"));
     };
-    if job.cable == "sim" {
-        return fail(format!("program_hw: the Simulation cable models Helion parts only; pick Automatic or USB to load {part}"));
-    }
     let bytes = std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
     emit(HwEvent::Stage { step: 2, label: format!("Loading {}", path.display()) });
     // Load a copy with a SHUTDOWN preamble so a reload over a running design
@@ -710,6 +742,9 @@ fn program_x7_blocking(job: &ProgramJob, emit: &dyn Fn(HwEvent)) -> HwEvent {
     let tmp = std::env::temp_dir().join(format!("helion-program-{}.bit", std::process::id()));
     if let Err(e) = std::fs::write(&tmp, &patched) {
         return fail(format!("program_hw: write {}: {e}", tmp.display()));
+    }
+    if !helion_hw::x7_board_hardware_tested(&part) {
+        emit(HwEvent::Line { text: format!("WARN: {part} is not hardware-tested: only the ZedBoard has run a Helion bitstream."), sev: MsgSev::Warn });
     }
     emit(HwEvent::Stage { step: 3, label: "Programming SRAM via openFPGALoader".into() });
     let result = helion_hw::program_via_openfpgaloader_for_part(&tmp, false, Some(&part));

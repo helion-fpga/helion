@@ -3118,7 +3118,10 @@ pub(crate) fn program_hw_session(
     part: &str,
     cable: &str,
 ) -> Result<Result<String, String>, String> {
-    let dev = helion_device::Device::load_part(part)?;
+    if let Some(why) = crate::views::hw::part_program_block(part, cable, None) {
+        return Err(format!("program_hw: {why}"));
+    }
+    let dev = crate::runs::resolve_device(part, &|_, _| {})?;
     if session.bitstream.is_none() {
         let d = design
             .cloned()
@@ -3140,7 +3143,7 @@ fn impl_if_needed(s: &mut AppState) -> Result<(), String> {
     let d = s.tcl.design.clone().ok_or(
         "no design open (read_verilog / synth_design, or open_run after a run finishes)",
     )?;
-    let dev = helion_device::Device::load_part(&s.project.part)?;
+    let dev = crate::runs::resolve_device(&s.project.part, &|_, _| {})?;
     s.tcl.session.impl_design(d, &dev)
 }
 
