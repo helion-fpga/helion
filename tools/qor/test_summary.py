@@ -26,7 +26,7 @@ import run  # noqa: E402
 
 def check_emitter_and_parser_agree():
     """Every SUMMARY_KEYS entry appears in the emitter's json_object call."""
-    src = open(os.path.join(ROOT, "crates/helion-xilinx7/examples/zedbit.rs")).read()
+    src = open(os.path.join(ROOT, "crates/helion-xilinx7/src/xdc_flow.rs")).read()
     start = src.index("fn json_object")
     body = src[start:]
     missing = [k for k in run.SUMMARY_KEYS if f'"{k}"' not in src[index_of_emit(src):start]]
@@ -35,7 +35,7 @@ def check_emitter_and_parser_agree():
 
 
 def index_of_emit(src):
-    marker = '("lut", packed.luts.len() as f64)'
+    marker = '("lut", built.luts.len() as f64)'
     return src.index(marker)
 
 
