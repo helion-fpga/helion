@@ -58,11 +58,17 @@ if [ -n "$EXE" ]; then
 Helion for Windows x86_64. Unzip anywhere and run helion-ide.exe (or helion.exe
 from a terminal). The .exe files are not code-signed, so SmartScreen may warn.
 
-Programming a board over JTAG: helion-prog.exe and the IDE open FTDI cables
-(Digilent, FT2232H) through WinUSB. Use Zadig (https://zadig.akeo.ie) to bind
-the cable's interface 0 to WinUSB. While it is bound, Vivado and other D2XX
-tools cannot use that cable; reinstall the vendor driver to undo it. Without
-WinUSB, Helion falls back to openFPGALoader.exe if it is on PATH.
+Programming a board over JTAG:
+- Xilinx 7-series boards (ZedBoard and the other xc7 boards) are programmed
+  only through openFPGALoader. Install openFPGALoader.exe and put it on PATH
+  (or set HELION_OPENFPGALOADER to its full path), then use Program Device in
+  the IDE or: helion.exe hw program --part <part> <run>\top.bit
+- openFPGALoader opens the cable through libusb, so bind the cable's
+  interface 0 (Digilent, FT2232H) to WinUSB with Zadig (https://zadig.akeo.ie).
+  While it is bound, Vivado and other D2XX tools cannot use that cable;
+  reinstall the vendor driver to undo it.
+- helion-prog.exe and the native WinUSB path load Helion .hbits files
+  (HL10 parts) only; they do not program 7-series or Lattice parts.
 TXT
 fi
 

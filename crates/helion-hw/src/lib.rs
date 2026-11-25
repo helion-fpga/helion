@@ -1036,6 +1036,19 @@ pub fn lattice_program_reason(part: &str, artifact: Option<&std::path::Path>) ->
     ))
 }
 
+/// Why `helion-prog`, which loads Helion `.hbits` (HL10 parts) only, cannot
+/// program `part`, naming the command that can. `None` for HL10 parts.
+pub fn hbits_only_reason(part: &str, artifact: Option<&std::path::Path>) -> Option<String> {
+    if part.trim().to_ascii_lowercase().starts_with("xc7") {
+        let bit = artifact.map_or_else(|| "<run>/top.bit".to_string(), |a| a.display().to_string());
+        return Some(format!(
+            "{part} is a 7-series part and helion-prog loads Helion .hbits (HL10 parts) only. \
+             Program it with `helion hw program --part {part} {bit}` or Program Device in the IDE (both use openFPGALoader)."
+        ));
+    }
+    lattice_program_reason(part, artifact)
+}
+
 /// A copy of a 7-series `.bit` that is safe to load over a running design:
 /// `CMD=SHUTDOWN`, 32 NOOPs and a fresh `RCRC` go in right after the first
 /// `RCRC`. On the ZedBoard a JTAG reload with openFPGALoader does not clear
@@ -3103,6 +3116,14 @@ mod tests {
         let ecp = lattice_program_reason("LFE5U-85F", None).unwrap();
         assert!(ecp.contains("ecppack top.config top.bit && openFPGALoader -b ulx3s top.bit"), "{ecp}");
         assert!(lattice_program_reason("xc7z020clg484-1", None).is_none());
+    }
+
+    #[test]
+    fn helion_prog_names_the_tool_for_non_hbits_parts() {
+        let x7 = hbits_only_reason("xc7z020clg484-1", Some(std::path::Path::new("r/top.bit"))).unwrap();
+        assert!(x7.contains("helion hw program --part xc7z020clg484-1 r/top.bit"), "{x7}");
+        assert!(hbits_only_reason("ice40-hx8k", None).unwrap().contains("iceprog"));
+        assert!(hbits_only_reason("HL10T-C32-1", None).is_none());
     }
 
     #[test]

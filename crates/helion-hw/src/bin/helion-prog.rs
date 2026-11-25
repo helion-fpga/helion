@@ -52,6 +52,10 @@ fn main() {
         }
         i += 1;
     }
+    if let Some(why) = helion_hw::hbits_only_reason(&part, bits_path.as_deref()) {
+        eprintln!("helion-prog: {why}");
+        process::exit(2);
+    }
     let info = resolve_cable(&cable).unwrap_or_else(|e| {
         eprintln!("helion-prog: {e}");
         process::exit(2);

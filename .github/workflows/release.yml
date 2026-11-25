@@ -175,7 +175,7 @@ jobs:
             echo "Helion ${TAG#v}"
             echo
             echo "Original FPGA family + CAD. Native Apple Silicon app; Linux tarball and Windows x86_64 zip (helion CLI + helion-ide + helion-prog)."
-            echo "Windows: unzip and run helion-ide.exe (unsigned; SmartScreen warns). JTAG over USB needs the cable bound to WinUSB with Zadig, or openFPGALoader.exe on PATH (see README-WINDOWS.txt)."
+            echo "Windows: unzip and run helion-ide.exe (unsigned; SmartScreen warns). 7-series boards program only through openFPGALoader.exe on PATH (or HELION_OPENFPGALOADER), with the cable bound to WinUSB by Zadig; helion-prog.exe loads Helion .hbits only (see README-WINDOWS.txt)."
             echo "Linux helion-ide needs libxkbcommon0, libwayland-client0 and libusb-1.0-0 (present on desktop distros)."
             echo "Unsigned macOS build — Gatekeeper will warn. AGPL-3.0."
             echo
