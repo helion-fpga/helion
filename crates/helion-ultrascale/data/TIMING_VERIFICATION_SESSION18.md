@@ -19,9 +19,11 @@ The -2 at 0.85V column is the second numeric column, value 1.02 ns.
 (corrected from 1460 ps by the N64 fix lane, 2026-11-25; the N66
 fix lane corrected this record and TIMING_XCKU3P.md the same day).
 Cross-checks on the same pages also match TIMING_XCKU3P.md:
-TRCKO_DO_REG 0.42 ns at 0.85V -2, FMAX_WF_NC 585 MHz at 0.85V -2,
-UltraRAM only FMAX values plus TPW 800 ps (no clock-to-output delay),
-DSP only FMAX values (no pin-to-pin delay).
+TRCKO_DO_REG 0.29 ns at 0.85V -2, FMAX_WF_NC 738 MHz at 0.85V -2,
+UltraRAM only FMAX values plus TPW 700 ps (no clock-to-output delay),
+DSP only FMAX values (no pin-to-pin delay). (Session 18 quoted the
+fourth-column values 0.42 ns, 585 MHz, 800 ps here; those are -2 at
+0.72V. Corrected by the N66 fix lane, 2026-11-25.)
 
 Note: the AMD web pages number this table "Table 1"; "Table 33" is the
 PDF numbering used by the code and docs. The value and the table are
