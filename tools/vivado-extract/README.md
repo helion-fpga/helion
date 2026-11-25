@@ -18,14 +18,17 @@ repo holds only these scripts and tests Helion derives from its own code.
 | `tcl/inventory.tcl` | Every part and board part the install offers (`parts.tsv`, `boards.tsv`). No license. |
 | `tcl/license_probe.tcl` | A 4-bit counter through synth/place/route/bitstream per part; records the stage a missing license stops. |
 | `tcl/device.tcl` | Device model in pin-planning mode (no license): grid, sites, clock regions, IO banks, package pins, and per tile type its wires, PIPs and site-pin wiring (`speed` arg adds speed models; `full` adds nodes), per site type its BELs, pins, site PIPs. |
-| `tcl/fuzz.tcl` | One routed design, then one bitstream per single property change (debug bitstreams, so every frame carries its address). |
-| `tcl/reference.tcl` | Vivado's full flow on a design with every report Helion cross-checks, plus per-arc cell delays (`cell_arcs.tsv`) and per-load net delays (`net_delays.tsv`) as data. |
+| `tcl/fuzz.tcl` | One routed design, then one bitstream per property change (debug bitstreams, so every frame carries its address). A sweep row may change several properties together: `AREG,ACASCREG` with value `0,0`. |
+| `tcl/placement.tcl` | Cell, site, BEL and tile of every placed primitive in a checkpoint (to tie a fuzz diff to a tile). |
+| `tcl/redump.tcl` | Re-runs `timing_data.tcl` on an existing `post_route.dcp`. |
+| `tcl/reference.tcl` | Vivado's full flow on a design with every report Helion cross-checks, plus per-arc cell delays (`cell_arcs.tsv`), per-load net delays (`net_delays.tsv`) and one row per LUT input (`lut_arcs.tsv`: delay, physical pin, the slice pin its driver leaves through) as data. |
 | `py/bitframes.py` | Reads a debug `.bit`(.gz): frames by address; `diff` lists every flipped bit as FAR/block/row/column/minor/word/bit. `selftest` checks the parser. |
 | `py/mksweep.py` | Writes the fuzz sweep for `rtl/us_sink.v`; can add rows from attribute tables (`id attribute kind default variant`). |
 | `py/fuzzsum.py` | Diffs every variant bitstream of a `fuzz.tcl` run against `base.bit.gz`: one `<id>.diff.tsv` each and a `summary.tsv` (zero-bit variants are results too). |
 | `py/compare_db.py` | Compares a `device.tcl` dump with a Project X-Ray / prjuray style database (X-Ray `TYPE.DST.SRC` or prjuray `TYPE.PIP.DST.SRC` names; `--tilegrid` for the grid): grid, tile types, PIPs with no known bits, site types, package pins. |
 | `py/compare_timing.py` | Compares `cell_arcs.tsv` / `summary.tsv` from `reference.tcl` with Helion's 7-series delay constants. |
-| `rtl/us_sink.v`, `rtl/us_sink.sweep.tsv` | UltraScale+ fuzz base (LUT6, FDRE, CARRY8, DSP48E2, RAMB36E2, URAM288, MMCME4_ADV, BUFGCE, IOBUF) and its sweep. |
+| `rtl/us_sink.v`, `rtl/us_sink.sweep.tsv` | UltraScale+ fuzz base (LUT6, FDRE, CARRY8, DSP48E2, RAMB36E2, URAM288, MMCME4_ADV, BUFGCE, IOBUF) and its sweep; `us_sink_hp.*` repeats the IO rows in an HP bank, `us_sink_fix.sweep.tsv` reruns four RAMB36E2 rows. |
+| `rtl/us_dsp.v`, `rtl/us_dsp.sweep.tsv` | DSP48E2 base with every control pin driven by a flip-flop, and its sweep (paired register attributes, pin inversions). |
 
 ## Setup
 
@@ -83,5 +86,11 @@ python3 py/compare_timing.py ~/helion-vivado-data/7series/xc7z020clg484-1/ref/*
   pin-planning mode, hence the opt-in `speed` argument to `device.tcl`.
 - `report_drc` blocks `write_bitstream` on unconnected primitive pins (e.g. RAMB36E2
   `REQP-1809` at default widths): give fuzz base cells explicit widths and tie-offs.
+- UltraScale+ frames carry ECC in bits 1440-1487 (word 45 and the low half of word
+  46): they change with any data bit in the frame, so `fuzzsum.py` counts them apart.
+- A pin tied to a constant absorbs its `IS_*_INVERTED` attribute (no bit changes);
+  fuzz inversions on pins driven by logic (`us_dsp.v`).
+- A sweep value equal to the cell's current value measures nothing: check defaults
+  (RAMB36E2 DOx_REG 1; `opt_design` rewrites CLOCK_DOMAINS to COMMON).
 - Vivado 2017.3 takes about three minutes to start on a network filesystem; batch
   many parts or variants per session.
