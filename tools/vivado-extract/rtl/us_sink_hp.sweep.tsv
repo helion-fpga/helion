@@ -1,0 +1,15 @@
+io0_iostandard_0	port	io0	IOSTANDARD	LVCMOS12
+io0_iostandard_1	port	io0	IOSTANDARD	LVCMOS15
+io0_iostandard_2	port	io0	IOSTANDARD	SSTL12
+io0_iostandard_3	port	io0	IOSTANDARD	HSTL_I_18
+io0_iostandard_4	port	io0	IOSTANDARD	POD12
+io0_drive_0	port	io0	DRIVE	4
+io0_drive_1	port	io0	DRIVE	8
+io0_slew_0	port	io0	SLEW	FAST
+io0_pulltype_0	port	io0	PULLTYPE	PULLUP
+io0_pulltype_1	port	io0	PULLTYPE	PULLDOWN
+io0_pulltype_2	port	io0	PULLTYPE	KEEPER
+io0_iostandard_5	port	io0	IOSTANDARD	LVCMOS18
+io0_iostandard_6	port	io0	IOSTANDARD	LVDCI_18
+io0_drive_2	port	io0	DRIVE	12
+io0_slew_1	port	io0	SLEW	MEDIUM

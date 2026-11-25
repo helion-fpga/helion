@@ -61,5 +61,44 @@ proc dump_timing_data {out} {
         }
     }
     close $f
+
+    # One row per LUT arc per cell (not aggregated), with what the output drives,
+    # to explain why some LUT arcs cost ~124 ps and others ~300 ps.
+    set f [open $out/lut_arcs.tsv w]
+    puts $f [join {CELL BEL PIN PHYS_PIN SLOW_MAX_PS OUT_SITE_PIN FANOUT LOAD_REFS IN_DRIVER_SITE_PIN} \t]
+    foreach c [get_cells -hier -filter {IS_PRIMITIVE && REF_NAME =~ LUT* && STATUS != UNPLACED}] {
+        set site [get_sites -quiet -of_objects $c]
+        set n [get_nets -quiet -of_objects [get_pins -quiet $c/O]]
+        set opin ""
+        foreach sp [get_site_pins -quiet -of_objects $n] {
+            if {[string match "$site/*" $sp] && [get_property -quiet DIRECTION $sp] eq "OUT"} {
+                set opin [lindex [split $sp /] end]
+            }
+        }
+        set loads [get_pins -quiet -leaf -of_objects $n -filter {DIRECTION == IN}]
+        set refs [lsort -unique [get_property -quiet REF_NAME [get_cells -quiet -of_objects $loads]]]
+        foreach a [get_timing_arcs -quiet -of_objects $c] {
+            set fp [get_property FROM_PIN $a]
+            # Slice output pin the input's net leaves its driver through (AQ vs AMUX ...).
+            set drv ""
+            set in [get_nets -quiet -of_objects [get_pins -quiet $fp]]
+            set dc [get_cells -quiet -of_objects [get_pins -quiet -leaf -of_objects $in -filter {DIRECTION == OUT}]]
+            set ds [get_sites -quiet -of_objects $dc]
+            foreach sp [get_site_pins -quiet -of_objects $in] {
+                if {$ds ne "" && [string match "[lindex $ds 0]/*" $sp] && [get_property -quiet DIRECTION $sp] eq "OUT"} {
+                    set drv [lindex [split $sp /] end]
+                }
+            }
+            set bp [lindex [split [lindex [get_bel_pins -quiet -of_objects [get_pins -quiet $fp]] 0] /] end]
+            set d 0
+            foreach k {DELAY_SLOW_MAX_RISE DELAY_SLOW_MAX_FALL} {
+                set v [get_property -quiet $k $a]
+                if {$v ne "" && $v > $d} { set d $v }
+            }
+            puts $f [join [list $c [get_property -quiet BEL $c] [lindex [split $fp /] end] $bp \
+                [expr {round($d * 1000)}] $opin [llength $loads] [join $refs ,] $drv] \t]
+        }
+    }
+    close $f
 }
 proc clean {v} { string map {\t " " \n " "} $v }

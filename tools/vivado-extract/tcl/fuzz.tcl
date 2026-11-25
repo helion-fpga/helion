@@ -27,7 +27,7 @@ if {[file exists $out/base.dcp]} {
     report_utilization -file $out/base_util.rpt
 }
 # Pins in fuzz designs are left unconstrained on purpose.
-set_property SEVERITY Warning [get_drc_checks {NSTD-1 UCIO-1 RTSTAT-10 PDRC-153 LUTLP-1}]
+set_property SEVERITY Warning [get_drc_checks {NSTD-1 UCIO-1 RTSTAT-10 PDRC-153 LUTLP-1 BIVC-1}]
 set_property BITSTREAM.GENERAL.DEBUGBITSTREAM YES [current_design]
 set_property BITSTREAM.GENERAL.COMPRESS FALSE [current_design]
 
