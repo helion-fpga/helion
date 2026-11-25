@@ -45,14 +45,24 @@ while {[gets $f line] >= 0} {
     if {[file exists $out/$id.bit.gz]} continue
     set objs [expr {$kind eq "port" ? [get_ports -quiet $pat] : [get_cells -quiet -hier $pat]}]
     if {[llength $objs] == 0} { note "$id\tSKIP\tno $kind matches $pat"; continue }
-    set old [get_property -quiet $prop [lindex $objs 0]]
-    if {[catch {set_property $prop $val $objs} err]} { note "$id\tSET_FAIL\t$prop=$val\t[string map {\n " "} $err]"; continue }
-    if {[catch {bit $id} err]} {
+    # PROP may list several properties (AREG,ACASCREG) with matching VALUEs (0,0)
+    # for attributes Vivado only accepts changed together.
+    set props [split $prop ,]
+    set vals [split $val ,]
+    set old {}
+    foreach p $props { lappend old [get_property -quiet $p [lindex $objs 0]] }
+    set err ""
+    foreach p $props v $vals {
+        if {[catch {set_property $p $v $objs} e]} { set err $e; break }
+    }
+    if {$err ne ""} {
+        note "$id\tSET_FAIL\t$prop=$val\t[string map {\n " "} $err]"
+    } elseif {[catch {bit $id} err]} {
         note "$id\tBIT_FAIL\t$prop=$val\t[string map {\n " "} $err]"
     } else {
-        note "$id\tOK\t$prop\t$old\t$val"
+        note "$id\tOK\t$prop\t[join $old ,]\t$val"
     }
-    catch {set_property $prop $old $objs}
+    foreach p $props o $old { catch {set_property $p $o $objs} }
 }
 close $f
 note "fuzz done"
