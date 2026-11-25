@@ -234,11 +234,14 @@ thread_local! {
     static PF_MARGIN: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
+/// The failure at which a PathFinder net searches the whole device (see [`pf_margin`]).
+const PF_OPEN: u32 = 12;
+
 /// PathFinder search box margin for a net that has been on an overused node
 /// in `fails` iterations: the first pass's 8 grid tiles, doubled every second
 /// failure up to `cap` (16; `HELION_ROUTE_PF_CAP`), the whole device (0) from
-/// the `open`th (24; `HELION_ROUTE_PF_OPEN` lowers it so a board design
-/// exercises the whole-device search). A fixed box kept nets
+/// the `open`th ([`PF_OPEN`]; `HELION_ROUTE_PF_OPEN` sets it, 1 makes a board
+/// design exercise the whole-device search). A fixed box kept nets
 /// whose only free detour lies outside it sharing at any price (G77: Ibex
 /// overuse sat at about 3,700 wires until a global whole-device switch at
 /// iteration 13, then fell to 243); opening it for every net at once cost
@@ -246,9 +249,11 @@ thread_local! {
 /// conflicted-mode doubling, nextpnr router2's growth on failure). Growth is
 /// bounded because a congested search floods its box: on the 3000-net bench a
 /// search expanded 7.7k wires at margin 8, 40k at 16, 215k at 32 and 2.1M over
-/// the whole device. Capping at 16 and opening at 24 instead of 8 cut its
-/// expansions 31% for 20 iterations instead of 18; opening later still frees
-/// a net whose only detour lies far outside its box.
+/// the whole device. With the cap, the 3000-net bench takes 20 iterations
+/// whether the device opens at the 8th, 12th or 24th failure, for 280M, 224M
+/// and 213M expansions; but a net whose only free detour lies past the cap
+/// shares until the open, so the open is a floor on PathFinder's iterations
+/// (13 at 12, 25 at 24).
 fn pf_margin(fails: u32, open: u32, cap: i32) -> i32 {
     if fails >= open {
         0
@@ -1116,7 +1121,7 @@ fn pathfinder(
     let mut last_it = 0;
     // Iterations each net has been on an overused node: its box grows with it.
     let mut fails: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
-    let open = std::env::var("HELION_ROUTE_PF_OPEN").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
+    let open = std::env::var("HELION_ROUTE_PF_OPEN").ok().and_then(|v| v.parse().ok()).unwrap_or(PF_OPEN);
     let cap = std::env::var("HELION_ROUTE_PF_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
     for it in 1..=MAX_ITERATIONS {
         last_it = it;
@@ -2319,9 +2324,9 @@ mod tests {
     fn pf_margin_doubles_then_opens_the_device() {
         let m: Vec<i32> = (0..10).map(|f| pf_margin(f, 8, i32::MAX)).collect();
         assert_eq!(m, vec![8, 8, 16, 16, 32, 32, 64, 64, 0, 0]);
-        // The defaults: the box stops at 16 tiles until the 24th failure.
-        let m: Vec<i32> = (0..26).map(|f| pf_margin(f, 24, 16)).collect();
-        assert_eq!(m, [vec![8, 8], vec![16; 22], vec![0, 0]].concat());
+        // The defaults: the box stops at 16 tiles until the 12th failure.
+        let m: Vec<i32> = (0..14).map(|f| pf_margin(f, PF_OPEN, 16)).collect();
+        assert_eq!(m, [vec![8, 8], vec![16; 10], vec![0, 0]].concat());
         assert_eq!(pf_margin(0, 1, 16), 8);
         assert_eq!(pf_margin(1, 1, 16), 0);
         assert_eq!(pf_margin(9, 99, 0), 8, "a cap below the first box keeps the first box");
@@ -2386,12 +2391,13 @@ mod tests {
         assert!(its <= 8, "took {its} iterations");
         assert_eq!(run(12), (its, pips), "same input, same route");
         // A band 70 rows above and below: only the whole device (from the
-        // 24th failure; the box stops at 16 tiles) holds the detour, which is
-        // long, so a search capped at twice the direct estimate finds none, and
-        // the negotiating search (220 ps per tile) kept crossing the band. The
-        // exact search detours.
+        // PF_OPEN-th failure; the box stops at 16 tiles) holds the detour,
+        // which is long, so a search capped at twice the direct estimate finds
+        // none, and the negotiating search (220 ps per tile) kept crossing the
+        // band. The exact search detours in the iteration after the open: the
+        // open is this net's floor, so it must stay low.
         let (its, pips) = run(70);
-        assert!(its <= 25 && pips.len() <= 30, "took {its} iterations, {} pips", pips.len());
+        assert!(its <= 13 && pips.len() <= 30, "took {its} iterations, {} pips", pips.len());
     }
 
     /// G77: a PathFinder net whose first box is cut by a clock net's wires
