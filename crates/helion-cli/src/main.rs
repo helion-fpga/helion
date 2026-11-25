@@ -2182,6 +2182,8 @@ fn hw(args: Vec<String>) {
 /// preamble the IDE adds (`x7_bit_with_shutdown`), so a reload over a
 /// running design starts clean (G87). The file on disk is not changed.
 fn hw_program_x7(part: &str, bitstream: Option<&str>, cable: &helion_hw::CableInfo, flash: bool) -> Result<String, String> {
+    // The short name projects use, as helion_targets::canonical_part maps it for the IDE.
+    let part = if part.eq_ignore_ascii_case("xc7z020") { "xc7z020clg484-1" } else { part };
     if flash {
         return Err(format!("{part}: configuration memory isn't supported for 7-series/Zynq yet; `helion hw program` loads SRAM (lost at power-off)"));
     }

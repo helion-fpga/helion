@@ -1000,8 +1000,13 @@ const X7_BOARDS: &[(&str, &str, bool)] = &[
 
 fn x7_board(part: &str) -> Option<&'static (&'static str, &'static str, bool)> {
     let p = part.trim().to_ascii_lowercase();
-    // The IDE's short "xc7a35t" is the Arty A7-35T's csg324.
-    let p = if p == "xc7a35t" { "xc7a35tcsg324".to_string() } else { p };
+    // The IDE's short names: "xc7a35t" is the Arty A7-35T's csg324, "xc7z020"
+    // the ZedBoard's clg484 (helion_targets::canonical_part).
+    let p = match p.as_str() {
+        "xc7a35t" => "xc7a35tcsg324".to_string(),
+        "xc7z020" => "xc7z020clg484".to_string(),
+        _ => p,
+    };
     X7_BOARDS.iter().find(|(prefix, _, _)| p.starts_with(prefix))
 }
 
@@ -3150,6 +3155,7 @@ mod tests {
                 ("xc7a35tcpg236-1", "basys3", false),
                 ("xc7a100tcsg324-1", "nexys_a7_100", false),
                 ("xc7z020clg484-1", "zedboard", true),
+                ("xc7z020", "zedboard", true),
             ] {
                 assert_eq!(resolve_ofl_board(Some(part)).as_deref(), Some(board), "{part}");
                 assert_eq!(x7_board_hardware_tested(part), tested, "{part}");
