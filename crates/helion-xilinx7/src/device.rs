@@ -622,6 +622,20 @@ impl Device {
             && (src_wire.starts_with("DSP_BYP") || src_wire.starts_with("DSP_FAN"))
     }
 
+    /// A block RAM tile's address cascade: an address pin taken from the
+    /// tile below (`BRAM_CASCINBOT_ADDR*`) or from the tile's other half
+    /// (`BRAM_CASCINTOP_ADDR*`), and the output that feeds the tile above
+    /// (`BRAM_CASCOUT_ADDR*`). The router must not use it as a way into an
+    /// address pin: on the ZedBoard every 240-RAM fill whose read address
+    /// went through `BRAM_CASCINTOP_ADDRARDADDR*` failed on silicon (6 of 6
+    /// builds) and both builds without one passed, with co-simulation
+    /// passing all eight (2026-11-26). Address pins are reached through the
+    /// tile's ordinary inputs instead.
+    fn bram_address_cascade_pip(tile_type: &str, dst_wire: &str, src_wire: &str) -> bool {
+        (tile_type.starts_with("BRAM_L") || tile_type.starts_with("BRAM_R"))
+            && (src_wire.starts_with("BRAM_CASCINBOT_ADDR") || src_wire.starts_with("BRAM_CASCINTOP_ADDR") || dst_wire.starts_with("BRAM_CASCOUT_ADDR"))
+    }
+
     /// [`Pip::usable`]). `_SING` tile types share their base type's bits.
     fn mark_usable_pips(&mut self) {
         use crate::db::parse::PpipKind;
@@ -637,6 +651,7 @@ impl Device {
                 let key = format!("{name}.{d}.{s}");
                 let listed = td.ppips.iter().find(|pp| pp.name == key).map(|pp| pp.kind);
                 let ok = match listed {
+                    _ if Self::bram_address_cascade_pip(&name, d, s) => false,
                     // LUT route-through hints are not connections.
                     Some(PpipKind::Hint) => false,
                     // Bit-less always-on / default-selected connections.
@@ -1498,6 +1513,37 @@ fn _use_tile_conn_fields(e: &TileConnEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Block RAM address cascades are never a route into an address pin:
+    /// on the ZedBoard, the 240-RAM fill failed in every build whose read
+    /// address went through `BRAM_CASCINTOP_ADDRARDADDR*` and ran in every
+    /// build without one (2026-11-26). The ordinary address inputs stay.
+    #[test]
+    fn block_ram_address_cascades_are_not_routing() {
+        let root = default_db_root();
+        if !root.join("zynq7").is_dir() {
+            eprintln!("SKIP: no zynq7 X-Ray database at {}", root.display());
+            return;
+        }
+        let dev = Device::load_xc7z020(&root).expect("load xc7z020");
+        let (mut cascades, mut ordinary) = (0, 0);
+        for td in dev.types.iter().filter(|t| t.name.starts_with("BRAM_L") || t.name.starts_with("BRAM_R")) {
+            for p in &td.pips {
+                let (d, s) = (&td.wires[p.dst as usize], &td.wires[p.src as usize]);
+                if s.starts_with("BRAM_CASCINBOT_ADDR") || s.starts_with("BRAM_CASCINTOP_ADDR") || d.starts_with("BRAM_CASCOUT_ADDR") {
+                    assert!(!p.usable, "{}.{d}.{s} is open to the router", td.name);
+                    cascades += 1;
+                } else if d.starts_with("BRAM_ADDRARDADDR") || d.starts_with("BRAM_ADDRBWRADDR") {
+                    assert!(p.usable, "{}.{d}.{s}: the ordinary address input is closed", td.name);
+                    ordinary += 1;
+                }
+            }
+        }
+        assert!(cascades > 0 && ordinary > 0, "{cascades} cascade pips, {ordinary} ordinary address pips");
+        assert!(Device::bram_address_cascade_pip("BRAM_L", "BRAM_ADDRARDADDRL6", "BRAM_CASCINTOP_ADDRARDADDRU6"));
+        assert!(!Device::bram_address_cascade_pip("BRAM_L", "BRAM_ADDRARDADDRL6", "BRAM_IMUX_ADDRARDADDRL6"));
+        assert!(!Device::bram_address_cascade_pip("INT_L", "BRAM_CASCOUT_ADDRARDADDRU6", "X"));
+    }
 
     #[test]
     fn a_part_without_required_features_takes_its_fabrics() {
