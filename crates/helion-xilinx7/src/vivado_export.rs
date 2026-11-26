@@ -603,10 +603,24 @@ pub fn export(
         ("PCIE_2_1", packed.pcies.len()),
         ("XADC", packed.xadcs.len()),
         ("configuration primitives", packed.cfg_prims.len()),
-        ("LUT RAM", packed.lutrams.len()),
     ];
     if let Some((k, n)) = unsupported.iter().find(|(_, n)| *n > 0) {
         return Err(format!("export: {n} {k} cell(s): not supported by the Vivado export yet"));
+    }
+    // LUT RAM: the source primitive as written, its INIT and inversion
+    // parameters copied, LOC'd to Helion's SLICEM (Vivado picks the BELs inside it).
+    let attrs_of: HashMap<String, &helion_ir::Attrs> = design.cells.iter().map(|c| (resolve(c.name).to_string(), &c.attrs)).collect();
+    for r in &packed.lutrams {
+        let params: Vec<(String, String)> = attrs_of
+            .get(&r.name)
+            .map(|a| a.map.iter().filter(|(k, _)| k.starts_with("INIT") || (k.starts_with("IS_") && k.ends_with("_INVERTED"))))
+            .into_iter()
+            .flatten()
+            .map(|(k, v)| (k.clone(), if v.contains('\'') { v.clone() } else { format!("{}'h{}", if r.module.starts_with("RAM32X") { 32 } else { 64 }, v.trim_start_matches("0x")) }))
+            .collect();
+        ir_instance(&mut o, &cell_pins, &r.module, &r.name, params, &[])?;
+        let id = o.cell(&r.name);
+        o.fix(&id, placed.lutrams.iter().find(|x| x.name == r.name).map(|x| x.site.as_str()), None);
     }
 
 
@@ -707,6 +721,12 @@ fn buses_of(prim: &str) -> &'static [(&'static str, usize)] {
             ("A", 30), ("B", 18), ("C", 48), ("D", 25), ("P", 48), ("PCIN", 48), ("PCOUT", 48), ("ACIN", 30), ("ACOUT", 30), ("BCIN", 18),
             ("BCOUT", 18), ("OPMODE", 7), ("ALUMODE", 4), ("INMODE", 5), ("CARRYINSEL", 3), ("CARRYOUT", 4),
         ],
+        "RAM32M" => &[("ADDRA", 5), ("ADDRB", 5), ("ADDRC", 5), ("ADDRD", 5), ("DIA", 2), ("DIB", 2), ("DIC", 2), ("DID", 2), ("DOA", 2), ("DOB", 2), ("DOC", 2), ("DOD", 2)],
+        "RAM64M" => &[("ADDRA", 6), ("ADDRB", 6), ("ADDRC", 6), ("ADDRD", 6)],
+        "RAM128X1D" => &[("A", 7), ("DPRA", 7)],
+        "RAM256X1S" => &[("A", 8)],
+        // The other LUT RAMs have scalar A0..An / DPRA0..n pins.
+        m if crate::lutram::is_lutram(m) => &[],
         _ => &[("DADDR", 7), ("DI", 16), ("DO", 16)],
     }
 }
@@ -715,6 +735,7 @@ fn buses_of(prim: &str) -> &'static [(&'static str, usize)] {
 fn is_output_pin(prim: &str, pin: &str) -> bool {
     let outs: &[&str] = match prim {
         "RAMB18E1" | "RAMB36E1" => &["DOADO", "DOBDO", "DOPADOP", "DOPBDOP", "CASCADEOUTA", "CASCADEOUTB", "DBITERR", "SBITERR", "ECCPARITY", "RDADDRECC"],
+        m if crate::lutram::is_lutram(m) => &["DOA", "DOB", "DOC", "DOD", "O", "SPO", "DPO"],
         "DSP48E1" => &["P", "PCOUT", "ACOUT", "BCOUT", "CARRYOUT", "CARRYCASCOUT", "MULTSIGNOUT", "PATTERNDETECT", "PATTERNBDETECT", "OVERFLOW", "UNDERFLOW"],
         _ => &["CLKOUT0", "CLKOUT0B", "CLKOUT1", "CLKOUT1B", "CLKOUT2", "CLKOUT2B", "CLKOUT3", "CLKOUT3B", "CLKOUT4", "CLKOUT5", "CLKOUT6", "CLKFBOUT", "CLKFBOUTB", "LOCKED", "DO", "DRDY", "PSDONE", "CLKINSTOPPED", "CLKFBSTOPPED"],
     };
@@ -781,6 +802,14 @@ mod tests {
 
     fn lut(init: u64, ins: [Option<&str>; 6], out: &str) -> PackedLut {
         PackedLut { name: format!("{out}_lut"), init, input_nets: ins.map(|n| n.map(str::to_string)), output_net: out.into() }
+    }
+
+    /// LUT RAM ports go out as the UNISIM buses and outputs (G122).
+    #[test]
+    fn lut_ram_pins_are_unisim_buses() {
+        assert!(buses_of("RAM32M").contains(&("DOA", 2)) && buses_of("RAM64M").contains(&("ADDRD", 6)));
+        assert!(buses_of("RAM64X1D").is_empty(), "A0..A5 are scalar ports");
+        assert!(is_output_pin("RAM64X1D", "DPO") && is_output_pin("RAM32M", "DOD") && !is_output_pin("RAM32M", "DID"));
     }
 
     /// The compacted LUT equals the physical one: connected pins as given,

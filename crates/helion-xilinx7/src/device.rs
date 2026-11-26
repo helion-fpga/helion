@@ -23,9 +23,8 @@ use crate::db::parse::{PackagePin, Ppip, SegBit, parse_mask_line, parse_package_
 /// Root of the raw X-Ray database.
 ///
 /// `HELION_XILINX_DB` wins; otherwise the first of these that exists:
-/// `~/.cache/helion/prjxray-db`, `~/workspace/xilinx-dbsrc` (Linux VM), then
-/// `~/Documents/zedboard-helion-debug/work/prjxray-db` (MacBook; iCloud,
-/// slow to read).
+/// `~/.cache/helion/prjxray-db` (where `helion-update` installs it), then
+/// `~/workspace/xilinx-dbsrc` (Linux VM).
 /// When none exists, the VM path is returned so the error names it.
 pub fn default_db_root() -> PathBuf {
     if let Ok(p) = std::env::var("HELION_XILINX_DB") {
@@ -36,7 +35,6 @@ pub fn default_db_root() -> PathBuf {
         let home = PathBuf::from(home);
         candidates.push(home.join(".cache/helion/prjxray-db"));
         candidates.push(home.join("workspace/xilinx-dbsrc"));
-        candidates.push(home.join("Documents/zedboard-helion-debug/work/prjxray-db"));
     }
     candidates.push(PathBuf::from("xilinx-dbsrc"));
     first_existing_dir(&candidates).unwrap_or_else(|| {
