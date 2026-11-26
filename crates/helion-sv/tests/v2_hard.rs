@@ -90,11 +90,14 @@ fn deep_memory_splits_into_rows_with_a_select_register() {
            always_ff @(posedge clk) begin if (we) mem[wa] <= wd; if (en) q <= mem[ra]; end
          endmodule",
     );
+    // 16 rows of RAMB18 rather than 8 of RAMB36: equal cost, and the router
+    // does not wire RAMB36E1 yet (G11). Checked on the board flow: a 64K x 4
+    // memory with the row bits changing every cycle co-simulates clean.
     let b = boxes(&d);
-    assert_eq!(b.len(), 8);
-    assert!(b.iter().all(|x| x.1 == "RAMB36E1"));
+    assert_eq!(b.len(), 16);
+    assert!(b.iter().all(|x| x.1 == "RAMB18E1"));
     let ffs = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count();
-    assert_eq!(ffs, 1, "one flop remembers which row was read");
+    assert_eq!(ffs, 2, "the row select register");
 }
 
 #[test]
