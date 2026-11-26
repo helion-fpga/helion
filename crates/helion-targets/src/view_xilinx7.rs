@@ -36,7 +36,7 @@ use helion_xilinx7::xdc_flow::Built;
 
 use crate::Family;
 use crate::view::{
-    CellPlacement, ClockNet, ClockUtilization, CongestionWindow, ControlSet, DrcViolation, EndpointSlack,
+    CellPlacement, ClockNet, ClockUtilization, CongestionWindow, PowerBlock, PowerEstimate, TilePower, ControlSet, DrcViolation, EndpointSlack,
     HighFanoutNet, ImplView, IoPin, IoPlan, Overflow, Provenance, ResourceRow, RoutedNet, Stage, TileClass,
     TileUsage, TimingPath, TimingSummary, ViewTile, WireHop,
 };
@@ -498,6 +498,119 @@ pub fn fill_resources(view: &mut ImplView, routed: &Routed7, dev: &Device) {
     );
 }
 
+/// Helion's 7-series (xc7z020 -1, commercial, 25 C ambient) power
+/// coefficients, mW per unit at 100 MHz and a 12.5% data toggle rate
+/// (Vivado's vectorless default). Fitted by least squares per resource
+/// class against vendor power reports of six reference designs; only the
+/// fitted values live here. See [`POWER_FIT`] for the fit error.
+pub mod power_coeffs {
+    /// Per LUT (logic, distributed RAM or shift register).
+    pub const LUT: f64 = 0.01057;
+    pub const FF: f64 = 0.0003750;
+    pub const CARRY4: f64 = 0.03121;
+    /// Per block RAM tile (a RAMB18 is half).
+    pub const BRAM: f64 = 0.07502;
+    pub const DSP: f64 = 0.9635;
+    /// Per bonded IO buffer.
+    pub const IO: f64 = 0.1919;
+    /// Per routed fabric wire (non-pseudo PIP) of a data net.
+    pub const WIRE: f64 = 0.0003253;
+    /// Clock tree: per global buffer and per clocked load (100 MHz, the
+    /// clock toggles every cycle whatever the data rate).
+    pub const BUFG: f64 = 1.778;
+    pub const CLOCK_LOAD: f64 = 0.004013;
+    /// Device static: base, per block RAM tile, and the leakage rise per mW
+    /// of dynamic power (junction heating).
+    pub const STATIC: f64 = 104.7;
+    pub const STATIC_PER_BRAM: f64 = 0.08223;
+    pub const STATIC_PER_DYNAMIC: f64 = 0.01793;
+}
+
+/// The fit's error, stated in the power report's method note.
+pub const POWER_FIT: &str = "fit error on the six reference designs' totals (Helion's own counts): RMS 16.8 mW, worst +36.4 mW (+26%, a block RAM design whose routed wire count the model over-weights); Vivado propagates activity through the logic, this model applies one rate to every data net";
+
+/// Vectorless toggle rate (Vivado's default for data nets).
+pub const DEFAULT_TOGGLE_RATE: f64 = 0.125;
+
+/// Fill the power estimate: static + dynamic per resource class, scaled by
+/// the dominant clock's frequency and the toggle rate, and attributed to
+/// tiles. `toggle` is the design's own default toggle rate, if it sets one.
+pub fn fill_power(view: &mut ImplView, routed: &Routed7, periods: &HashMap<String, u32>, toggle: Option<f64>) {
+    use power_coeffs as k;
+    let p = &routed.placed;
+    let alpha = toggle.unwrap_or(DEFAULT_TOGGLE_RATE);
+    // The clock with the most clocked loads sets the data rate.
+    let (clk_name, f_mhz) = view
+        .clocks
+        .as_ref()
+        .and_then(|c| c.clocks.iter().max_by_key(|n| n.loads).map(|n| (n.name.clone(), 1.0e6 / n.period_ps.max(1) as f64)))
+        .unwrap_or_else(|| (String::new(), 0.0));
+    let data = f_mhz / 100.0 * alpha / DEFAULT_TOGGLE_RATE;
+    let clk = f_mhz / 100.0;
+    let tile_xy: HashMap<&str, (u32, u32)> = view.tiles.iter().map(|t| (t.name.as_str(), (t.x, t.y))).collect();
+    let mut tiles: HashMap<(u32, u32), f64> = HashMap::new();
+    let mut blocks: Vec<PowerBlock> = Vec::new();
+    let mut class = |name: &str, cells: Vec<(&str, f64)>, mw_each: f64, tiles: &mut HashMap<(u32, u32), f64>| {
+        let mut used = 0.0;
+        for (tile, w) in &cells {
+            used += w;
+            if let Some(xy) = tile_xy.get(tile) {
+                *tiles.entry(*xy).or_insert(0.0) += w * mw_each;
+            }
+        }
+        blocks.push(PowerBlock { block: name.to_string(), used: used.round() as usize, total_mw: used * mw_each });
+    };
+    // Physical LUTs: one per (site, letter); LUT RAM by its LUT count.
+    let mut luts: BTreeMap<(&str, char), &str> = BTreeMap::new();
+    for l in &p.luts {
+        luts.insert((l.site.as_str(), l.bel.chars().next().unwrap_or('A')), l.tile.as_str());
+    }
+    let ram_luts: HashMap<&str, u32> = p.packed.lutrams.iter().map(|r| (r.name.as_str(), lutram_luts(&r.module))).collect();
+    let mut lut_cells: Vec<(&str, f64)> = luts.values().map(|t| (*t, 1.0)).collect();
+    lut_cells.extend(p.srls.iter().map(|c| (c.tile.as_str(), 1.0)));
+    lut_cells.extend(p.lutrams.iter().map(|c| (c.tile.as_str(), ram_luts.get(c.name.as_str()).copied().unwrap_or(1) as f64)));
+    class("LUTs (logic and memory)", lut_cells, k::LUT * data, &mut tiles);
+    class("Registers", p.ffs.iter().map(|c| (c.tile.as_str(), 1.0)).collect(), k::FF * data, &mut tiles);
+    class("CARRY4", p.carries.iter().map(|c| (c.tile.as_str(), 1.0)).collect(), k::CARRY4 * data, &mut tiles);
+    let bram: Vec<(&str, f64)> = p.brams.iter().map(|b| (b.tile.as_str(), if b.site.starts_with("RAMB36") { 1.0 } else { 0.5 })).collect();
+    let bram_tiles: f64 = bram.iter().map(|b| b.1).sum();
+    class("Block RAM", bram, k::BRAM * data, &mut tiles);
+    class("DSPs", p.dsps.iter().map(|c| (c.tile.as_str(), 1.0)).collect(), k::DSP * data, &mut tiles);
+    class("I/O", p.iobs.iter().map(|c| (c.tile.as_str(), 1.0)).collect(), k::IO * data, &mut tiles);
+    // Signals: every fabric wire a data net's PIPs drive, in that PIP's tile.
+    let clock_nets: HashSet<&str> = periods.keys().map(String::as_str).collect();
+    let mut wires: Vec<(&str, f64)> = Vec::new();
+    for n in &routed.nets {
+        if let RouteKind::Pips(pips) = &n.kind {
+            if !clock_nets.contains(n.net.as_str()) {
+                wires.extend(pips.iter().filter(|q| !q.is_pseudo).map(|q| (q.tile.as_str(), 1.0)));
+            }
+        }
+    }
+    class("Signals (routed wires)", wires, k::WIRE * data, &mut tiles);
+    // Clock tree: buffers plus every clocked primitive's clock pin.
+    let mut clocked: Vec<(&str, f64)> = p.ffs.iter().map(|c| (c.tile.as_str(), 1.0)).collect();
+    clocked.extend(p.srls.iter().map(|c| (c.tile.as_str(), 1.0)));
+    clocked.extend(p.lutrams.iter().map(|c| (c.tile.as_str(), 1.0)));
+    clocked.extend(p.brams.iter().map(|c| (c.tile.as_str(), 1.0)));
+    clocked.extend(p.dsps.iter().map(|c| (c.tile.as_str(), 1.0)));
+    class("Clock loads", clocked, k::CLOCK_LOAD * clk, &mut tiles);
+    let bufg: Vec<(&str, f64)> = p.bufgs.iter().filter(|g| g.site.starts_with("BUFGCTRL")).map(|g| (g.tile.as_str(), 1.0)).collect();
+    class("Clock buffers", bufg, k::BUFG * clk, &mut tiles);
+    let dynamic: f64 = blocks.iter().map(|b| b.total_mw).sum();
+    let static_mw = k::STATIC + k::STATIC_PER_BRAM * bram_tiles + k::STATIC_PER_DYNAMIC * dynamic;
+    blocks.push(PowerBlock { block: "Device static".into(), used: 0, total_mw: static_mw });
+    let mut tiles: Vec<TilePower> = tiles.into_iter().map(|((x, y), mw)| TilePower { x, y, mw }).collect();
+    tiles.sort_by(|a, b| b.mw.total_cmp(&a.mw).then((a.x, a.y).cmp(&(b.x, b.y))));
+    let method = format!(
+        "vectorless estimate: static + dynamic per resource class with Helion's fitted coefficients, data toggle rate {:.1}% ({}), data and clock tree at {clk_name} ({f_mhz:.1} MHz, the clock with the most loads), linear in frequency; {POWER_FIT}",
+        alpha * 100.0,
+        if toggle.is_some() { "set by the design" } else { "Vivado's vectorless default" }
+    );
+    view.power = Some(PowerEstimate { total_mw: dynamic + static_mw, static_mw, dynamic_mw: dynamic, toggle_rate: alpha, blocks, tiles, method });
+    view.set_provenance("power", Provenance::new("helion-targets view_xilinx7 power", "per-class counts from the placed and routed design", SCOPE));
+}
+
 /// Fill the timing summary and per-endpoint slack from the run's setup
 /// analysis.
 pub fn fill_timing(view: &mut ImplView, analysis: &Analysis, dev: &Device) {
@@ -812,7 +925,8 @@ pub fn from_built(b: &Built) -> ImplView {
         &drc,
         "BIVC-1 (bank VCCO consistency); the flow itself stops on a port without PACKAGE_PIN, packer overflow and unresolved routing overuse, so a finished run passed those",
     );
-    v.mark_missing("power", "no power model: Helion has no 7-series capacitance or static-power table and the run has no switching activity");
+    let toggle = b.design.attrs.get("DEFAULT_TOGGLE_RATE").and_then(|t| t.trim().trim_end_matches('%').parse::<f64>().ok()).map(|t| if t > 1.0 { t / 100.0 } else { t });
+    fill_power(&mut v, &b.routed, &b.periods, toggle);
     v.mark_missing("board", "the board panel is not built yet: it needs the board's XDC labels joined to the design ports");
     v
 }
@@ -900,6 +1014,44 @@ mod tests {
         assert_eq!(v.len(), 1, "{v:?}");
         assert_eq!(v[0].0, "BIVC-1");
         assert!(v[0].2.contains("bank 33") && v[0].2.contains("3.3 V: a") && v[0].2.contains("1.8 V: b"), "{}", v[0].2);
+    }
+
+    #[test]
+    fn power_scales_with_frequency_and_toggle_and_lands_on_tiles() {
+        use helion_xilinx7::place::PlacedFf;
+        let mut v = ImplView::empty(FAMILY, "xc7z020clg484-1", ROUTED_STAGE);
+        v.tiles.push(ViewTile { x: 3, y: 4, class: TileClass::Logic, name: "CLBLL_L_X0Y0".into(), clock_region: "X0Y0".into(), sites: vec![], io_bank: None });
+        let clock = |period_ps| ClockUtilization {
+            clocks: vec![ClockNet { name: "clk".into(), period_ps, loads: 2, regions: vec![], buffer: None }],
+            loads_by_region: BTreeMap::new(),
+            bufgs_used: 0,
+            bufgs_available: 32,
+        };
+        let mut r = Routed7::default();
+        for n in ["a", "b"] {
+            r.placed.ffs.push(PlacedFf { name: n.into(), tile: "CLBLL_L_X0Y0".into(), site: "SLICE_X0Y0".into(), bel: "AFF".into() });
+        }
+        let run = |v: &mut ImplView, period, toggle| {
+            v.clocks = Some(clock(period));
+            fill_power(v, &r, &HashMap::new(), toggle);
+            v.power.clone().unwrap()
+        };
+        let block = |p: &PowerEstimate, name: &str| p.blocks.iter().find(|b| b.block == name).unwrap().total_mw;
+        let p = run(&mut v, 10_000, None);
+        assert_eq!(p.toggle_rate, DEFAULT_TOGGLE_RATE);
+        assert!((block(&p, "Registers") - 2.0 * power_coeffs::FF).abs() < 1e-12);
+        assert!((block(&p, "Clock loads") - 2.0 * power_coeffs::CLOCK_LOAD).abs() < 1e-12);
+        let tile_sum: f64 = p.tiles.iter().map(|t| t.mw).sum();
+        assert!((tile_sum - p.dynamic_mw).abs() < 1e-9 && p.tiles.iter().all(|t| (t.x, t.y) == (3, 4)));
+        assert!((p.total_mw - p.static_mw - p.dynamic_mw).abs() < 1e-9);
+        // Twice the clock: twice the dynamic power. Twice the toggle rate:
+        // twice the data part, the clock tree unchanged.
+        let fast = run(&mut v, 5_000, None);
+        assert!((fast.dynamic_mw - 2.0 * p.dynamic_mw).abs() < 1e-9);
+        let busy = run(&mut v, 10_000, Some(0.25));
+        assert!((block(&busy, "Registers") - 2.0 * block(&p, "Registers")).abs() < 1e-12);
+        assert_eq!(block(&busy, "Clock loads"), block(&p, "Clock loads"));
+        assert!(busy.method.contains("25.0%") && busy.method.contains("set by the design"), "{}", busy.method);
     }
 
     #[test]

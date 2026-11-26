@@ -129,7 +129,7 @@ impl Panel {
         }
         match &self.body {
             PanelBody::Table(t) => out.push_str(&t.render()),
-            PanelBody::Missing(reason) => out.push_str(&format!("unavailable: {reason}\n")),
+            PanelBody::Missing(reason) => out.push_str(&format!("missing input: {reason}\n")),
         }
         out
     }
@@ -334,11 +334,14 @@ fn power(view: &ImplView) -> Panel {
     let Some(pw) = &view.power else {
         return missing(view, "power", Report::Power.title());
     };
-    let mut tbl = Table::new(&["Block", "Total (mW)"]);
+    let mut tbl = Table::new(&["On-Chip", "Used", "Power (mW)"]);
     for b in &pw.blocks {
-        tbl.push(&[&b.block, &b.total_mw.to_string()]);
+        let used = if b.used > 0 { b.used.to_string() } else { String::new() };
+        tbl.push(&[&b.block, &used, &format!("{:.3}", b.total_mw)]);
     }
-    tbl.push(&["Total", &pw.total_mw.to_string()]);
+    tbl.push(&["Dynamic", "", &format!("{:.3}", pw.dynamic_mw)]);
+    tbl.push(&["Static", "", &format!("{:.3}", pw.static_mw)]);
+    tbl.push(&["Total", "", &format!("{:.3}", pw.total_mw)]);
     Panel::table(Report::Power.title(), tbl).with_note(format!("method: {}", pw.method))
 }
 
@@ -601,7 +604,7 @@ impl HeatMap {
             HeatMap::CongestionH => "Congestion (horizontal)",
             HeatMap::CongestionV => "Congestion (vertical)",
             HeatMap::Slack => "Timing slack",
-            HeatMap::Power => "Power by block",
+            HeatMap::Power => "Power by tile",
         }
     }
 }
@@ -705,11 +708,17 @@ fn slack_heat(view: &ImplView) -> Vec<HotTile> {
 }
 
 fn power_heat(view: &ImplView) -> Vec<HotTile> {
-    // Power is reported per block, not per tile, so it cannot be painted on
-    // the die without inventing a placement. Returns empty and the caller
-    // shows the block table instead.
-    let _ = view;
-    Vec::new()
+    // Each tile's dynamic power as a share of the hottest tile's, so the
+    // same 0..100 ramp as the other maps applies; the panel note gives mW.
+    let Some(pw) = &view.power else { return Vec::new() };
+    let max = pw.tiles.iter().map(|t| t.mw).fold(0.0, f64::max);
+    if max <= 0.0 {
+        return Vec::new();
+    }
+    pw.tiles
+        .iter()
+        .map(|t| HotTile { x: t.x, y: t.y, value: (100.0 * t.mw / max) as f32, overused: false })
+        .collect()
 }
 
 /// A panel for a heat map: the top tiles and the summary a reader needs.
@@ -717,7 +726,7 @@ pub fn heat_panel(view: &ImplView, which: HeatMap) -> Panel {
     let tiles = heat_map(view, which);
     if tiles.is_empty() {
         let reason = match which {
-            HeatMap::Power => "power is reported per block, not per tile: see the Power report",
+            HeatMap::Power => "no power estimate with dynamic power on placed cells in this run",
             _ => "no routed data in this run to compute the map",
         };
         return Panel::missing(which.title(), reason);
@@ -734,12 +743,15 @@ pub fn heat_panel(view: &ImplView, which: HeatMap) -> Panel {
             if t.overused { "yes" } else { "" },
         ]);
     }
-    Panel::table(which.title(), tbl).with_note(format!(
-        "{} tiles, {} over capacity, max {:.1}%",
-        tiles.len(),
-        over,
-        max
-    ))
+    let note = match (which, &view.power) {
+        (HeatMap::Power, Some(pw)) => format!(
+            "{} tiles with dynamic power; value is the share of the hottest tile ({:.4} mW)",
+            tiles.len(),
+            pw.tiles.first().map(|t| t.mw).unwrap_or(0.0)
+        ),
+        _ => format!("{} tiles, {} over capacity, max {:.1}%", tiles.len(), over, max),
+    };
+    Panel::table(which.title(), tbl).with_note(note)
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,7 +1050,7 @@ mod tests {
             }
             other => panic!("expected Missing, got {other:?}"),
         }
-        assert!(p.render().contains("unavailable:"));
+        assert!(p.render().contains("missing input:"));
     }
 
     #[test]
@@ -1087,10 +1099,33 @@ mod tests {
         let p = heat_panel(&v, HeatMap::Power);
         match &p.body {
             PanelBody::Missing(reason) => {
-                assert!(reason.contains("per block"), "got {reason}");
+                assert!(reason.contains("power estimate"), "got {reason}");
             }
             other => panic!("expected Missing, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn power_heat_map_paints_each_tile_against_the_hottest() {
+        let mut v = sample();
+        v.power = Some(helion_targets::view::PowerEstimate {
+            total_mw: 105.0,
+            static_mw: 104.0,
+            dynamic_mw: 1.0,
+            toggle_rate: 0.125,
+            blocks: vec![helion_targets::view::PowerBlock { block: "Registers".into(), used: 4, total_mw: 1.0 }],
+            tiles: vec![
+                helion_targets::view::TilePower { x: 0, y: 0, mw: 0.8 },
+                helion_targets::view::TilePower { x: 1, y: 0, mw: 0.2 },
+            ],
+            method: "test".into(),
+        });
+        let t = heat_map(&v, HeatMap::Power);
+        assert_eq!(t.iter().map(|t| t.value).collect::<Vec<_>>(), vec![100.0, 25.0]);
+        let text = heat_panel(&v, HeatMap::Power).render();
+        assert!(text.contains("0.8000 mW"), "{text}");
+        let text = power(&v).render();
+        assert!(text.contains("105.000") && text.contains("Registers"), "{text}");
     }
 
     #[test]
@@ -1101,7 +1136,7 @@ mod tests {
             let text = p.render();
             assert!(!text.trim().is_empty(), "{:?} rendered nothing", r);
             assert!(
-                text.contains("unavailable:") || text.contains("---"),
+                text.contains("missing input:") || text.contains("---"),
                 "{:?} has neither a table nor a reason:\n{text}",
                 r
             );

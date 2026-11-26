@@ -418,23 +418,37 @@ pub struct IoPlan {
     pub package_pins: usize,
 }
 
-/// Power estimate for one block.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Power of one resource class (Vivado's "On-Chip Components" rows).
+#[derive(Clone, Debug, PartialEq)]
 pub struct PowerBlock {
     pub block: String,
-    /// Total power, milliwatts.
-    pub total_mw: u32,
+    /// How many of the class the estimate counted (LUTs, flops, routed
+    /// wires, clock loads, ...); 0 for device static power.
+    pub used: usize,
+    pub total_mw: f64,
 }
 
-/// Power estimate for the design. `method` states how it was derived, because
-/// without switching activity this is a structural estimate, not a vendor
-/// vector-based number.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Dynamic power attributed to one tile: each placed cell's power in its
+/// own tile, each routed wire's in the tile that drives it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TilePower {
+    pub x: u32,
+    pub y: u32,
+    pub mw: f64,
+}
+
+/// Power estimate for the design. `method` states how it was derived and
+/// how far it is from the vendor's numbers, because without switching
+/// activity this is a vectorless estimate.
+#[derive(Clone, Debug, PartialEq)]
 pub struct PowerEstimate {
-    pub total_mw: u32,
+    pub total_mw: f64,
+    pub static_mw: f64,
+    pub dynamic_mw: f64,
+    /// Toggle rate assumed for data nets (0.125 = 12.5% per clock).
+    pub toggle_rate: f64,
     pub blocks: Vec<PowerBlock>,
-    /// Method, for example `"static: one toggle per clock per net, no
-    /// activity file"`.
+    pub tiles: Vec<TilePower>,
     pub method: String,
 }
 
