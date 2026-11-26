@@ -37,7 +37,7 @@ use helion_xilinx7::xdc_flow::Built;
 use crate::Family;
 use crate::view::{
     CellPlacement, ClockNet, ClockUtilization, ControlSet, DrcViolation, EndpointSlack,
-    HighFanoutNet, ImplView, IoPin, IoPlan, Overflow, Provenance, RoutedNet, Stage, TileClass,
+    HighFanoutNet, ImplView, IoPin, IoPlan, Overflow, Provenance, ResourceRow, RoutedNet, Stage, TileClass,
     TileUsage, TimingPath, TimingSummary, ViewTile, WireHop,
 };
 
@@ -383,6 +383,73 @@ pub fn fill_usage(view: &mut ImplView, routed: &Routed7, dev: &Device) {
     );
 }
 
+/// LUTs a LUT RAM primitive occupies.
+fn lutram_luts(module: &str) -> u32 {
+    match module {
+        "RAM32X1S" | "RAM64X1S" => 1,
+        "RAM32X1D" | "RAM64X1D" | "RAM128X1S" => 2,
+        _ => 4, // RAM32M, RAM64M, RAM128X1D, RAM256X1S
+    }
+}
+
+/// Utilization in `report_utilization`'s rows: slice logic, slices, block
+/// RAM tiles, DSPs, bonded IOB and global clock buffers, each against the
+/// part's own site count.
+pub fn fill_resources(view: &mut ImplView, routed: &Routed7, dev: &Device) {
+    let p = &routed.placed;
+    let slices = dev.slices().len() as u32;
+    let slicem = dev.sites_of_types(&["SLICEM"]).len() as u32;
+    // One physical LUT per (site, letter): an O5/O6 pair shares it.
+    let logic: HashSet<(&str, char)> = p.luts.iter().map(|l| (l.site.as_str(), l.bel.chars().next().unwrap_or('A'))).collect();
+    let ram: u32 = p.packed.lutrams.iter().map(|r| lutram_luts(&r.module)).sum();
+    let srl = p.srls.len() as u32;
+    let f8 = p.muxfs.iter().filter(|m| m.bel.starts_with("F8")).count() as u32;
+    let used_slices: HashSet<&str> = p
+        .luts
+        .iter()
+        .map(|c| c.site.as_str())
+        .chain(p.ffs.iter().map(|c| c.site.as_str()))
+        .chain(p.srls.iter().map(|c| c.site.as_str()))
+        .chain(p.muxfs.iter().map(|c| c.site.as_str()))
+        .chain(p.carries.iter().map(|c| c.site.as_str()))
+        .chain(p.lutrams.iter().map(|c| c.site.as_str()))
+        .collect();
+    let b36 = p.brams.iter().filter(|b| b.site.starts_with("RAMB36")).count() as f64;
+    let b18 = p.brams.len() as f64 - b36;
+    // X-Ray types a block RAM tile's lower RAMB18 site FIFO18E1, so count tiles.
+    let ramb18_sites = 2 * dev.sites_of_types(&["RAMB36E1"]).len() as u32;
+    let iob_sites = dev.package_pins().filter(|pp| pp.site.starts_with("IOB_")).count() as u32;
+    let iobs: HashSet<&str> = p.iobs.iter().map(|i| i.site.as_str()).collect();
+    let bufg = p.bufgs.iter().filter(|g| g.site.starts_with("BUFGCTRL")).count() as f64;
+    let row = |name: &str, depth: u8, used: f64, available: u32| ResourceRow { name: name.into(), depth, used, available };
+    let n = logic.len() as f64;
+    view.resources = vec![
+        row("Slice LUTs", 0, n + (ram + srl) as f64, slices * 4),
+        row("LUT as Logic", 1, n, slices * 4),
+        row("LUT as Memory", 1, (ram + srl) as f64, slicem * 4),
+        row("LUT as Distributed RAM", 2, ram as f64, 0),
+        row("LUT as Shift Register", 2, srl as f64, 0),
+        row("Slice Registers", 0, p.ffs.len() as f64, slices * 8),
+        row("F7 Muxes", 0, (p.muxfs.len() as u32 - f8) as f64, slices * 2),
+        row("F8 Muxes", 0, f8 as f64, slices),
+        row("Slice", 0, used_slices.len() as f64, slices),
+        row("Block RAM Tile", 0, b36 + b18 / 2.0, ramb18_sites / 2),
+        row("RAMB36/FIFO", 1, b36, ramb18_sites / 2),
+        row("RAMB18", 1, b18, ramb18_sites),
+        row("DSPs", 0, p.dsps.len() as f64, dev.dsp_sites().len() as u32),
+        row("Bonded IOB", 0, iobs.len() as f64, iob_sites),
+        row("BUFGCTRL", 0, bufg, dev.bufg_sites().len() as u32),
+    ];
+    view.set_provenance(
+        "resources",
+        Provenance::new(
+            "helion-xilinx7 place",
+            "placed primitives in report_utilization's rows: a LUT is one per (slice, letter) so an O5/O6 pair counts once; LUT RAM by its primitive's LUT count; slices are distinct occupied SLICE sites; a RAMB18 is half a block RAM tile; bonded IOB against package pins bonded to IOB sites",
+            SCOPE,
+        ),
+    );
+}
+
 /// Fill the timing summary and per-endpoint slack from the run's setup
 /// analysis.
 pub fn fill_timing(view: &mut ImplView, analysis: &Analysis, dev: &Device) {
@@ -681,6 +748,7 @@ pub fn from_built(b: &Built) -> ImplView {
     fill_cells(&mut v, &b.routed);
     fill_nets(&mut v, &b.routed);
     fill_usage(&mut v, &b.routed, dev);
+    fill_resources(&mut v, &b.routed, dev);
     fill_timing(&mut v, &b.timing, dev);
     fill_io(&mut v, &b.routed, &b.design, dev);
     let (clocks, by_region) = clock_nets(&v, &b.routed, &b.periods);

@@ -239,6 +239,20 @@ impl TileUsage {
     }
 }
 
+/// One row of the utilization report in the vendor's own terms (`Slice
+/// LUTs`, `F7 Muxes`, `Block RAM Tile`), so a reader can hold it against
+/// the vendor report line by line. `depth` is the row's indent level.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResourceRow {
+    pub name: String,
+    pub depth: u8,
+    /// Used count; fractional where the vendor counts halves (a RAMB18 is
+    /// half a block RAM tile).
+    pub used: f64,
+    /// Sites of that kind on the part; 0 for a breakdown row with none.
+    pub available: u32,
+}
+
 /// Slack at one timing endpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EndpointSlack {
@@ -441,6 +455,8 @@ pub struct ImplView {
     pub nets: Vec<RoutedNet>,
     /// Per-tile usage and capacity.
     pub usage: Vec<TileUsage>,
+    /// Utilization rows in the family's vendor terms.
+    pub resources: Vec<ResourceRow>,
     /// Timing summary, when the run has timing.
     pub timing: Option<TimingSummary>,
     /// Clock utilization.
@@ -482,6 +498,7 @@ impl ImplView {
             cells: Vec::new(),
             nets: Vec::new(),
             usage: Vec::new(),
+            resources: Vec::new(),
             timing: None,
             clocks: None,
             io: None,

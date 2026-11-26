@@ -265,30 +265,43 @@ fn fmt_ps(ps: i64) -> String {
 }
 
 fn utilization(view: &ImplView) -> Panel {
+    if !view.resources.is_empty() {
+        let mut tbl = Table::new(&["Site Type", "Used", "Available", "Util%"]);
+        for r in &view.resources {
+            let name = format!("{}{}", "  ".repeat(r.depth as usize), r.name);
+            let used = if r.used.fract() == 0.0 { format!("{}", r.used) } else { format!("{:.1}", r.used) };
+            let (avail, pct) = if r.available > 0 {
+                (r.available.to_string(), format!("{:.2}", 100.0 * r.used / r.available as f64))
+            } else {
+                (String::new(), String::new())
+            };
+            tbl.push(&[&name, &used, &avail, &pct]);
+        }
+        let mut p = Panel::table(Report::Utilization.title(), tbl);
+        if let Some(n) = provenance_note(view, "resources") {
+            p = p.with_note(n);
+        }
+        return p;
+    }
     if view.tiles.is_empty() {
         return missing(view, "tiles", Report::Utilization.title());
     }
+    // Tile classes, for a family that fills no vendor rows. `Other` tiles
+    // (interconnect, TIEOFF, config) hold sites no design logic occupies, so
+    // they stay out of the rows and the total.
     let mut tbl = Table::new(&["Resource", "Used", "Available", "Utilisation"]);
-    let mut total_sites = 0u32;
-    let mut used_sites = 0u32;
-    // Join usage onto tiles by coordinate so the used count lands in the
-    // class the capacity came from.
     let class_at: std::collections::HashMap<(u32, u32), TileClass> =
         view.tiles.iter().map(|t| ((t.x, t.y), t.class)).collect();
     let mut per_class: BTreeMap<TileClass, (u32, u32)> = BTreeMap::new();
-    for t in &view.tiles {
-        let e = per_class.entry(t.class).or_insert((0, 0));
-        e.1 += t.sites.len() as u32;
-        total_sites += t.sites.len() as u32;
+    for t in view.tiles.iter().filter(|t| t.class != TileClass::Other) {
+        per_class.entry(t.class).or_insert((0, 0)).1 += t.sites.len() as u32;
     }
     for u in &view.usage {
-        if u.sites_capacity > 0 {
-            used_sites += u.sites_used;
-            if let Some(c) = class_at.get(&(u.x, u.y)) {
-                per_class.entry(*c).or_insert((0, 0)).0 += u.sites_used;
-            }
+        if let Some(c) = class_at.get(&(u.x, u.y)).filter(|c| **c != TileClass::Other) {
+            per_class.entry(*c).or_insert((0, 0)).0 += u.sites_used;
         }
     }
+    let (used_sites, total_sites) = per_class.values().fold((0, 0), |a, v| (a.0 + v.0, a.1 + v.1));
     for (class, (used, avail)) in &per_class {
         if *avail == 0 {
             continue;
@@ -296,10 +309,9 @@ fn utilization(view: &ImplView) -> Panel {
         let pct = 100.0 * *used as f64 / *avail as f64;
         tbl.push(&[class.label(), &used.to_string(), &avail.to_string(), &format!("{pct:.1}%")]);
     }
-    // The honest total: sites used against sites the die has.
     if total_sites > 0 {
         tbl.push(&[
-            "Logic sites (all classes)",
+            "Sites in logic, RAM, DSP, IO and clock tiles",
             &used_sites.to_string(),
             &total_sites.to_string(),
             &format!("{:.1}%", 100.0 * used_sites as f64 / total_sites as f64),
@@ -1013,6 +1025,26 @@ mod tests {
     }
 
     #[test]
+    fn utilization_uses_vendor_rows_and_never_counts_other_tiles() {
+        let mut v = sample();
+        v.tiles.push(helion_targets::view::ViewTile {
+            x: 1,
+            y: 1,
+            class: TileClass::Other,
+            name: "INT_L_X0Y0".into(),
+            clock_region: "X0Y0".into(),
+            sites: vec!["TIEOFF_X0Y0".into(); 50],
+            io_bank: None,
+        });
+        let text = utilization(&v).render();
+        // 2 of 3 sites; the 50 TIEOFF sites would make it 2 of 53.
+        assert!(!text.contains("Other") && text.contains("66.7%"), "TIEOFF sites must not join the total: {text}");
+        v.resources.push(helion_targets::view::ResourceRow { name: "Block RAM Tile".into(), depth: 0, used: 0.5, available: 140 });
+        let text = utilization(&v).render();
+        assert!(text.contains("Block RAM Tile") && text.contains("0.5") && text.contains("0.36"), "{text}");
+    }
+
+    #[test]
     fn congestion_maps_keep_the_two_directions_apart() {
         let v = sample();
         let h = heat_map(&v, HeatMap::CongestionH);
@@ -1091,7 +1123,7 @@ mod tests {
     fn utilization_counts_sites_not_tiles() {
         let v = sample();
         let text = utilization(&v).render();
-        assert!(text.contains("Logic sites"), "{text}");
+        assert!(text.contains("Sites in logic"), "{text}");
         assert!(text.contains("1"), "one site used");
     }
 

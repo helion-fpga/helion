@@ -770,7 +770,8 @@ impl Device {
         self.sites_of_types(&["DSP48E1"])
     }
 
-    fn sites_of_types(&self, types: &[&str]) -> Vec<(String, String)> {
+    /// Sites of the given site types: `(tile_name, site_name)`.
+    pub fn sites_of_types(&self, types: &[&str]) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for t in &self.tiles {
             for s in &t.sites {
