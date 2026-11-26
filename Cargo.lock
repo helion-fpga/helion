@@ -1975,11 +1975,13 @@ dependencies = [
 name = "helion-update"
 version = "4.5.0"
 dependencies = [
+ "flate2",
  "self_update",
  "semver",
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "tempfile",
  "thiserror 2.0.20",
 ]

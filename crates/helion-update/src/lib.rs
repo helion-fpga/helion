@@ -28,6 +28,7 @@ mod check;
 mod error;
 mod install;
 mod verify;
+pub mod xray_db;
 
 pub use assets::{select_asset, AssetKind, SelectedAsset};
 pub use check::{check_for_update, current_version, is_newer, latest_stable, parse_tag, AssetInfo, ReleaseInfo, REPO_NAME, REPO_OWNER};

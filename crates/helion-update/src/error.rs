@@ -29,6 +29,9 @@ pub enum UpdateError {
     /// Local filesystem failure.
     #[error("io error: {0}")]
     Io(String),
+    /// The user cancelled.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl From<std::io::Error> for UpdateError {

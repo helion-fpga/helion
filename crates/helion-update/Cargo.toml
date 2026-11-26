@@ -17,6 +17,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tempfile = "3"
+# Streaming unpack of the Project X-Ray database with a hash per file
+# (xray_db.rs). Both are already in the tree through self_update.
+tar = "0.4"
+flate2 = "1"
 
 [dev-dependencies]
 tempfile = "3"
