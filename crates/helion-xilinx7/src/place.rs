@@ -1240,33 +1240,74 @@ fn hard_block_sites(out: &Placed7, device: &dyn DeviceQuery, b18: &[(String, Str
             _ => n.to_string(),
         }
     };
-    let centre = |pins: &[(String, String, bool)]| -> Option<(i64, (i32, i32))> {
+    // A block output wired straight into another block (ROM data into a
+    // multiplier) has no slack to spend on distance: a block RAM takes
+    // 2.5 ns from clock to data and a DSP 3.8 ns from A/B to P. Such a link
+    // pulls as hard as HARD_PULL slice pins, toward where the other block
+    // sits now. A block that drives another one follows it outright (its
+    // own inputs come from flops, with a whole cycle to spare) and is
+    // sited after it.
+    const HARD_PULL: i64 = 8;
+    let mut blk_xy: HashMap<&str, (i32, i32)> = HashMap::new();
+    for (name, tile) in out.brams.iter().map(|b| (&b.name, &b.tile)).chain(out.dsps.iter().map(|d| (&d.name, &d.tile))) {
+        if let Some(xy) = device.tile_xy(tile) {
+            blk_xy.insert(name.as_str(), xy);
+        }
+    }
+    let mut drives: HashMap<String, &str> = HashMap::new();
+    let mut loads: HashMap<String, Vec<&str>> = HashMap::new();
+    let all_pins = out.packed.brams.iter().map(|b| (b.name.as_str(), &b.pins)).chain(out.packed.dsps.iter().map(|d| (d.name.as_str(), &d.pins)));
+    for (name, pins) in all_pins {
+        for (_, net, is_out) in pins {
+            if *is_out {
+                drives.insert(base(net), name);
+            } else {
+                loads.entry(base(net)).or_default().push(name);
+            }
+        }
+    }
+    let centre = |me: &str, pins: &[(String, String, bool)], blk_xy: &HashMap<&str, (i32, i32)>| -> Option<(i64, (i32, i32))> {
         let (mut sx, mut sy, mut k) = (0i64, 0i64, 0i64);
-        for (_, net, _) in pins {
+        let fed: Vec<(i32, i32)> = pins.iter().filter(|p| p.2).flat_map(|p| loads.get(&base(&p.1)).into_iter().flatten()).filter(|o| **o != me).filter_map(|o| blk_xy.get(o).copied()).collect();
+        if !fed.is_empty() {
+            let n = fed.len() as i64;
+            return Some((0, ((fed.iter().map(|p| p.0 as i64).sum::<i64>() / n) as i32, (fed.iter().map(|p| p.1 as i64).sum::<i64>() / n) as i32)));
+        }
+        for (_, net, is_out) in pins {
+            let net = base(net);
             // A copy sits beside the block's old site: the logic is on the original net.
-            let Some(p) = at.get(base(net).as_str()).filter(|p| p.len() <= MAX_PINS) else { continue };
-            for &(x, y) in p {
-                sx += x as i64;
-                sy += y as i64;
-                k += 1;
+            if let Some(p) = at.get(net.as_str()).filter(|p| p.len() <= MAX_PINS) {
+                for &(x, y) in p {
+                    sx += x as i64;
+                    sy += y as i64;
+                    k += 1;
+                }
+            }
+            let none = Vec::new();
+            let others: Vec<&str> = if *is_out { loads.get(&net).unwrap_or(&none).clone() } else { drives.get(&net).copied().into_iter().collect() };
+            for (x, y) in others.iter().filter(|o| **o != me).filter_map(|o| blk_xy.get(o)) {
+                sx += *x as i64 * HARD_PULL;
+                sy += *y as i64 * HARD_PULL;
+                k += HARD_PULL;
             }
         }
         (k > 0).then(|| (k, ((sx / k) as i32, (sy / k) as i32)))
     };
-    // (name, is dsp, current site, weight, centre)
-    let mut todo: Vec<(&str, bool, &str, i64, (i32, i32))> = Vec::new();
+    // Weight 0 marks a follower: it sorts last.
+    // (name, is dsp, current site, weight, pins)
+    let mut todo: Vec<(&str, bool, &str, i64, &[(String, String, bool)])> = Vec::new();
     for b in &out.brams {
         let Some(pb) = out.packed.brams.iter().find(|p| p.name == b.name) else { continue };
         let cascaded = pb.cascade_in_a.is_some() || pb.cascade_out_a.is_some() || pb.cascade_in_b.is_some() || pb.cascade_out_b.is_some();
-        if let (true, Some((k, c))) = (pb.kind == BramKind::Ramb18e1 && !cascaded, centre(&pb.pins)) {
-            todo.push((&b.name, false, &b.site, k, c));
+        if let (true, Some((k, _))) = (pb.kind == BramKind::Ramb18e1 && !cascaded, centre(&b.name, &pb.pins, &blk_xy)) {
+            todo.push((&b.name, false, &b.site, k, &pb.pins));
         }
     }
     for d in &out.dsps {
         let Some(pd) = out.packed.dsps.iter().find(|p| p.name == d.name) else { continue };
         let cascaded = [&pd.pcin_net, &pd.pcout_net, &pd.acin_net, &pd.acout_net, &pd.bcin_net, &pd.bcout_net, &pd.carrycascin_net, &pd.carrycascout_net].iter().any(|n| n.is_some());
-        if let (false, Some((k, c))) = (cascaded, centre(&pd.pins)) {
-            todo.push((&d.name, true, &d.site, k, c));
+        if let (false, Some((k, _))) = (cascaded, centre(&d.name, &pd.pins, &blk_xy)) {
+            todo.push((&d.name, true, &d.site, k, &pd.pins));
         }
     }
     let mut taken: HashSet<String> = out.brams.iter().map(|b| b.site.clone()).chain(out.dsps.iter().map(|d| d.site.clone())).collect();
@@ -1283,7 +1324,9 @@ fn hard_block_sites(out: &Placed7, device: &dyn DeviceQuery, b18: &[(String, Str
     todo.sort_by_key(|t| (-t.3, t.0));
     let mut sites = HashMap::new();
     let mut moved = false;
-    for (name, is_dsp, cur, _, (cx, cy)) in todo {
+    for (name, is_dsp, cur, _, pins) in todo {
+        // Blocks placed earlier in this loop pull from their new sites.
+        let Some((_, (cx, cy))) = centre(name, pins, &blk_xy) else { continue };
         let pool = if is_dsp { dsp } else { b18 };
         let best = pool
             .iter()
@@ -1293,6 +1336,9 @@ fn hard_block_sites(out: &Placed7, device: &dyn DeviceQuery, b18: &[(String, Str
         let Some((_, t, s)) = best else { continue };
         taken.insert(s.clone());
         moved |= s != cur;
+        if let Some(xy) = device.tile_xy(t) {
+            blk_xy.insert(name, xy);
+        }
         sites.insert(name.to_string(), (t.clone(), s.clone()));
     }
     if moved {
