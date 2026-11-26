@@ -453,6 +453,8 @@ pub fn seed_xilinx7_view_fixture(s: &mut crate::state::AppState) -> Result<(), S
     });
     s.project.part = helion_targets::ZEDBOARD_PART.to_string();
     s.runs.impl_view = Some(v.clone()?);
+    // A real run's timing state carries WNS to the status bar; the fixture takes it from the view.
+    s.timing.wns_ps = s.runs.impl_view.as_ref().and_then(|v| v.timing.as_ref()).map(|t| t.wns_ps);
     s.flow.impl_run = crate::state::RunStatus::Complete;
     Ok(())
 }
@@ -490,6 +492,21 @@ mod tests {
         assert!(die.grid.count(helion_targets::reports::TileClass::Logic) > 1000);
         assert_eq!(die.placed.iter().filter(|p| p.class == helion_targets::reports::TileClass::Io).count(), 9);
         assert!(art.design.is_some(), "netlist for the schematic");
+    }
+
+    /// Guard: the view fixture the scenes draw carries the run's WNS to the
+    /// status bar, as a finished run's timing state does.
+    #[test]
+    fn the_view_fixture_gives_the_status_bar_the_runs_wns() {
+        if !helion_targets::zynq_db_present() {
+            eprintln!("skipped: no zynq7 X-Ray database");
+            return;
+        }
+        let mut s = crate::init();
+        seed_xilinx7_view_fixture(&mut s).expect("fixture");
+        let wns = s.runs.impl_view.as_ref().and_then(|v| v.timing.as_ref()).map(|t| t.wns_ps);
+        assert!(wns.is_some(), "the run has timing");
+        assert_eq!(s.timing.wns_ps, wns);
     }
 
     /// Guard: a ZedBoard implementation run fills the view contract from the

@@ -23,6 +23,15 @@ use rune_kit::Checkbox;
 
 /// World pixels per tile at zoom 1.
 const TILE: f32 = 9.0;
+/// Width of one wide capital of a board-part label (`cad::FONT_PIN`), for
+/// deciding whether a label fits its cell.
+const PIN_CHAR_W: f32 = 7.8;
+/// Smallest fitted tile of the contract die: below this a tile is under a
+/// device pixel on a 1x display.
+const MIN_TILE: f32 = 2.0;
+/// The Device pane's canvas size in the default window, used until the
+/// first layout reports the real one.
+const FIRST_VIEWPORT: [f32; 2] = [880.0, 449.0];
 
 /// True when `part` names an iCE40 / ECP5 / 7-series device (name pattern
 /// only; the registry lookup that loads every HAD part stays off the UI
@@ -115,10 +124,12 @@ fn quad(x: f32, y: f32, w: f32, h: f32) -> Vec<[f32; 2]> {
 fn view_shape(v: &ImplView, s: &AppState, tile: f32, t: &VivadoTheme) -> Shape {
     let vy = |y: u32| if v.row0_top { y } else { v.rows.saturating_sub(1 + y) };
     let at = |x: u32, y: u32, inset: f32| quad(x as f32 * tile + inset, vy(y) as f32 * tile + inset, tile - 2.0 * inset, tile - 2.0 * inset);
+    // The fixed gaps between tiles shrink with a fitted die, so its tiles stay visible.
+    let k = (tile / TILE).min(1.0);
     let mut shape = Shape::new();
     for tl in &v.tiles {
         if let Some(c) = view_class_color(tl.class, t) {
-            shape = shape.fill(at(tl.x, tl.y, 1.0), c);
+            shape = shape.fill(at(tl.x, tl.y, k), c);
         }
     }
     let heat = s.device.view_heat;
@@ -128,14 +139,14 @@ fn view_shape(v: &ImplView, s: &AppState, tile: f32, t: &VivadoTheme) -> Shape {
                 continue;
             }
             let c = if ht.overused { t.fail } else { heat_color(t, ht.value / 100.0) };
-            shape = shape.fill(at(ht.x, ht.y, 0.5), c);
+            shape = shape.fill(at(ht.x, ht.y, 0.5 * k), c);
         }
     }
     let l = &s.device.layers;
     if l.cells {
         let c = if heat.is_some() { t.die_cell.alpha(0.55) } else { t.die_cell };
         for u in v.usage.iter().filter(|u| u.sites_used > 0) {
-            shape = shape.fill(at(u.x, u.y, 0.5), c);
+            shape = shape.fill(at(u.x, u.y, 0.5 * k), c);
         }
     }
     if l.nets {
@@ -233,9 +244,9 @@ fn view_controls(s: &AppState, t: &VivadoTheme) -> El {
 fn board_slot(kind: &str) -> ([f32; 4], usize) {
     match kind {
         "Clock" => ([0.03, 0.42, 0.12, 0.12], 1),
-        "HDMI" => ([0.03, 0.04, 0.30, 0.22], 6),
+        "HDMI" => ([0.03, 0.04, 0.30, 0.22], 5),
         "VGA" => ([0.35, 0.04, 0.22, 0.22], 4),
-        "Audio" => ([0.59, 0.04, 0.16, 0.22], 4),
+        "Audio" => ([0.59, 0.04, 0.16, 0.22], 2),
         "OLED" => ([0.30, 0.32, 0.26, 0.16], 3),
         "LED" => ([0.20, 0.62, 0.46, 0.10], 8),
         "Switch" => ([0.20, 0.80, 0.46, 0.12], 8),
@@ -281,6 +292,11 @@ fn board_body(v: &ImplView, s: &AppState, t: &VivadoTheme) -> El {
             .size(w, h)
             .border(1.0, if used > 0 { t.accent } else { t.border })
             .child(text(format!("{} {used}/{}", g.kind, g.items.len())).font(cad::FONT_PIN).color(t.text_dim).absolute(3.0, 1.0));
+        // Labels wider than their cells drop the prefix the group shares:
+        // the group title already says it, and the tooltip keeps the full
+        // name. Anything still too wide ends in an ellipsis.
+        let label_w = (cw - 4.0).max(2.0);
+        let shared = shared_prefix(&g.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), label_w);
         for (k, i) in g.items.iter().enumerate() {
             let (cx, cy) = (2.0 + (k % per_row) as f32 * cw, 14.0 + (k / per_row) as f32 * ch);
             let tip = match &i.port {
@@ -295,9 +311,10 @@ fn board_body(v: &ImplView, s: &AppState, t: &VivadoTheme) -> El {
                 .absolute(cx + 1.0, cy + 1.0)
                 .size((cw - 2.0).max(2.0), (ch - 2.0).max(2.0))
                 .border(1.0, t.border);
+            let short = i.label.get(shared..).unwrap_or(&i.label).to_string();
             cell = match &i.port {
-                Some(p) => cell.fill(t.accent.alpha(0.35)).child(text(p.clone()).font(cad::FONT_PIN).color(t.text).absolute(2.0, 1.0)),
-                None => cell.child(text(i.label.clone()).font(cad::FONT_PIN).color(t.text_dim).absolute(2.0, 1.0)),
+                Some(p) => cell.fill(t.accent.alpha(0.35)).child(text(p.clone()).font(cad::FONT_PIN).color(t.text).absolute(2.0, 1.0).w(label_w).truncate()),
+                None => cell.child(text(short).font(cad::FONT_PIN).color(t.text_dim).absolute(2.0, 1.0).w(label_w).truncate()),
             };
             grp = grp.child(cell);
         }
@@ -328,12 +345,36 @@ fn board_body(v: &ImplView, s: &AppState, t: &VivadoTheme) -> El {
         .child(cad::dim(format!("Unused board parts. {}", unused.join(" · ")), t).key("device-board-unused"))
 }
 
+/// Tile size at zoom 1 that shows a `cols` x `rows` die whole in a canvas
+/// of `viewport` points, never under [`MIN_TILE`].
+fn fitted_tile(viewport: [f32; 2], cols: u32, rows: u32) -> f32 {
+    ((viewport[0] - 8.0) / cols.max(1) as f32).min((viewport[1] - 8.0) / rows.max(1) as f32).max(MIN_TILE)
+}
+
+/// How many leading characters a group's labels drop so they fit cells
+/// `label_w` wide: the prefix they all share (`HD-`, `JA`), or none when
+/// every label already fits. The shortest label keeps a character.
+fn shared_prefix(labels: &[&str], label_w: f32) -> usize {
+    let fits = |l: &str| l.chars().count() as f32 * PIN_CHAR_W <= label_w;
+    if labels.len() < 2 || labels.iter().all(|l| fits(l)) {
+        return 0;
+    }
+    let first = labels[0].as_bytes();
+    let common = |l: &str| first.iter().zip(l.as_bytes()).take_while(|(a, b)| a == b).count();
+    let shared = labels.iter().map(|l| common(l)).min().unwrap_or(0);
+    let shortest = labels.iter().map(|l| l.len()).min().unwrap_or(0);
+    let n = shared.min(shortest.saturating_sub(1));
+    // Never cut inside a character.
+    if labels.iter().all(|l| l.is_char_boundary(n)) { n } else { 0 }
+}
+
 /// Device pane body for a 7-series run's view contract.
 fn view_body(v: &ImplView, s: &AppState, t: &VivadoTheme) -> El {
     let z = s.device.zoom.max(0.25);
-    let [vw, vh] = s.device.viewport;
-    let fit = if vw > 0.0 && vh > 0.0 { ((vw - 8.0) / v.cols as f32).min((vh - 8.0) / v.rows as f32) } else { TILE };
-    let tile = fit.max(3.0) * z;
+    // Before the first layout reports the canvas size, fit to the default
+    // window's Device pane, so the first frame already shows the whole die.
+    let [vw, vh] = if s.device.viewport[0] > 0.0 && s.device.viewport[1] > 0.0 { s.device.viewport } else { FIRST_VIEWPORT };
+    let tile = fitted_tile([vw, vh], v.cols, v.rows) * z;
     let (ww, wh) = (v.cols as f32 * tile, v.rows as f32 * tile);
     let heat_line = match s.device.view_heat {
         None => cv::usage_summary(v),
@@ -351,6 +392,9 @@ fn view_body(v: &ImplView, s: &AppState, t: &VivadoTheme) -> El {
     for b in view_regions(v, s, tile, t) {
         world = world.child(b);
     }
+    // A die smaller than the canvas sits in its middle.
+    let (pad_x, pad_y) = (((vw - ww) / 2.0).max(0.0).floor(), ((vh - wh) / 2.0).max(0.0).floor());
+    let world = el().w(ww + pad_x).h(wh + pad_y).child(world.absolute(pad_x, pad_y));
     col()
         .grow(1.0)
         .min_h(0.0)
@@ -508,4 +552,34 @@ pub fn family_device_pane(s: &AppState, t: &VivadoTheme) -> El {
         .border(1.0, t.border)
         .child(pane_header("Device", "device-pane", t))
         .child(body)
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    #[test]
+    fn the_fitted_die_is_whole_inside_the_canvas() {
+        // xc7z020: 187 x 157 tiles, in the default pane and in a small and a large one.
+        for viewport in [FIRST_VIEWPORT, [400.0, 340.0], [1600.0, 1000.0]] {
+            let tile = fitted_tile(viewport, 187, 157);
+            assert!(tile >= MIN_TILE);
+            assert!(187.0 * tile <= viewport[0] && 157.0 * tile <= viewport[1], "{viewport:?}: tile {tile}");
+            let slack = (viewport[0] - 187.0 * tile).min(viewport[1] - 157.0 * tile);
+            assert!(slack <= 8.5, "the die fills one axis: {viewport:?} leaves {slack}");
+        }
+        assert_eq!(fitted_tile([100.0, 100.0], 187, 157), MIN_TILE, "a tiny canvas scrolls instead of hiding tiles");
+    }
+
+    #[test]
+    fn crowded_board_groups_drop_their_shared_prefix_and_roomy_ones_keep_it() {
+        let hdmi = ["HD-CLK", "HD-D0", "HD-HSYNC", "HD-SDA"];
+        assert_eq!(shared_prefix(&hdmi, 30.0), 3, "HD- goes: the group title says HDMI");
+        let pmod = ["JA1", "JA2", "JA10"];
+        assert_eq!(shared_prefix(&pmod, 14.0), 2);
+        let leds = ["LD0", "LD1", "LD7"];
+        assert_eq!(shared_prefix(&leds, 46.0), 0, "labels that fit stay whole");
+        assert_eq!(shared_prefix(&["GCLK"], 4.0), 0, "a lone label has no shared prefix");
+        assert_eq!(shared_prefix(&["AB", "ABC"], 4.0), 1, "the shortest label keeps a character");
+    }
 }
