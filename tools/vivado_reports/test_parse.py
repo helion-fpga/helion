@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """Tests for tools/vivado_reports/parse.py.
 
-Fixtures are small Vivado 2017.3 text reports written in the exact
-2017.3 ASCII table format: plus/minus borders, pipe columns, setext
-section headings.
+Fixtures are small Vivado 2017.3 text reports in the exact 2017.3
+formats, verified against real reports from the cluster:
+- every report starts with a Table of Contents repeating the titles,
+- power headlines are a two-column pipe table in 1. Summary,
+- the on-chip breakdown is 1.1 On-Chip Components,
+- the Intra Clock Table is whitespace-aligned with a dash row,
+- control sets live in a Status and Count table,
+- DRC/methodology have 1. REPORT SUMMARY key: value lines and a
+  Rule/Severity/Description/Violations table,
+- clock regions are named like X1Y0.
 
     python3 -m unittest test_parse -v
 """
@@ -20,7 +27,43 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from parse import parse_all, parse_report  # noqa: E402
 
-TIMING_FULL = """Design Timing Summary
+
+def _ws_table(rows):
+    """Build a whitespace-aligned table with a dash row, 2017.3 style.
+
+    Column widths are fixed; the first column is left-aligned, the rest
+    right-aligned, one space between columns. Blank cells stay blank, so
+    a row may fill only its trailing columns.
+    """
+    widths = [10, 9, 9, 22, 20, 9, 9, 22, 20, 9, 9, 23, 21]
+    headers = [
+        "Clock", "WNS(ns)", "TNS(ns)", "TNS Failing Endpoints",
+        "TNS Total Endpoints", "WHS(ns)", "THS(ns)",
+        "THS Failing Endpoints", "THS Total Endpoints", "WPWS(ns)",
+        "TPWS(ns)", "TPWS Failing Endpoints", "TPWS Total Endpoints",
+    ]
+    lines = [" ".join(name.ljust(w) for name, w in zip(headers, widths))]
+    lines.append(" ".join("-" * w for w in widths))
+    for row in rows:
+        cells = []
+        for i, (value, w) in enumerate(zip(row, widths)):
+            if i == 0:
+                cells.append(str(value).ljust(w))
+            elif value == "":
+                cells.append(" " * w)
+            else:
+                cells.append(str(value).rjust(w))
+        lines.append(" ".join(cells))
+    return "\n".join(lines)
+
+
+TIMING_FULL = """Table of Contents
+-----------------
+1. Design Timing Summary
+2. Clock Summary
+3. Intra Clock Table
+
+Design Timing Summary
 ---------------------
 
     WNS(ns)      TNS(ns)  TNS Failing Endpoints  TNS Total Endpoints      WHS(ns)      THS(ns)  THS Failing Endpoints  THS Total Endpoints     WPWS(ns)     TPWS(ns)  TPWS Failing Endpoints  TPWS Total Endpoints
@@ -36,6 +79,18 @@ Clock Summary
     -----     ------------         ----------      --------------
     clk          {0.000 5.000}         10.000             100.000
     clk_fast     {0.000 2.500}          5.000             200.000
+
+Intra Clock Table
+-----------------
+
+""" + _ws_table(
+    [
+        ["clk", "-0.432", "-2.156", "12", "843", "0.018", "0.000",
+         "0", "843", "0.250", "0.000", "0", "0"],
+        ["sys_clk", "", "", "", "", "", "", "", "",
+         "4.500", "0.000", "0", "2"],
+    ]
+) + """
 """
 
 TIMING_NO_CLOCKS = """Design Timing Summary
@@ -46,7 +101,16 @@ TIMING_NO_CLOCKS = """Design Timing Summary
       0.123        0.000                      0                  843        0.018        0.000                      0                  843      0.250        0.000                       0                    0
 """
 
-UTIL_FULL = """1. Slice Logic
+UTIL_FULL = """Table of Contents
+-----------------
+1. Slice Logic
+2. Slice Logic Distribution
+3. Memory
+4. DSP
+5. IO and GT Specific
+6. Clocking
+
+1. Slice Logic
 -------------
 
 +----------------------------+------+-------+-----------+-------+
@@ -121,74 +185,117 @@ UTIL_SLICE_ONLY = """1. Slice Logic
 +----------------------------+------+-------+-----------+-------+
 """
 
-POWER_FULL = """Power analysis from Implemented netlist. Activity derived from constraints files, simulation files or vectorless analysis.
-
-Total On-Chip Power (W):   2.456
-Design Power Budget (W):   Unspecified
-Power Budget Margin (W):   NA
-Dynamic (W):               1.900
-Device Static (W):         0.556
-Effective TJA (C/W):       4.2
-Max Ambient (C):           85.0
-Junction Temperature (C):  35.3
-Confidence Level:          Medium
-
-On-Chip Power
--------------
-
-+----------------+-----------+-------+
-|                | Power (W) | %     |
-+----------------+-----------+-------+
-| Clocks         |     0.123 |  5.0  |
-| Signals        |     0.234 |  9.5  |
-| Logic          |     0.456 | 18.6  |
-| BRAM           |     0.078 |  3.2  |
-| DSP            |     0.012 |  0.5  |
-| IO             |     0.345 | 14.0  |
-+----------------+-----------+-------+
+POWER_SUMMARY_TABLE = """+--------------------------------+------------+
+| Total On-Chip Power (W)        |      0.106 |
+| Design Power Budget (W)        | Unspecified* |
+| Dynamic (W)                    |      0.080 |
+| Device Static (W)              |      0.026 |
+| Effective TJA (C/W)            |        4.2 |
+| Max Ambient (C)                |       85.0 |
+| Junction Temperature (C)       |       25.4 |
+| Confidence Level               |     Medium |
++--------------------------------+------------+
 """
 
-POWER_NO_BREAKDOWN = """Total On-Chip Power (W):   2.456
-Dynamic (W):               1.900
-Device Static (W):         0.556
-Junction Temperature (C):  35.3
-Confidence Level:          Low
-"""
-
-CLOCK_UTIL_FULL = """Clock Utilization
+POWER_FULL = """Table of Contents
 -----------------
+1. Summary
+1.1 On-Chip Components
 
-+----------------+---------------+------+----------+------+-----+
-| Clock Region   | Global Clocks | BUFG | BUFGCTRL | MMCM | PLL |
-+----------------+---------------+------+----------+------+-----+
-| X0Y0           |             2 |    1 |        1 |    0 |   0 |
-| X1Y0           |             1 |    1 |        0 |    1 |   0 |
-+----------------+---------------+------+----------+------+-----+
-"""
-
-CONTROL_SETS_FULL = """Control Sets Report
--------------------
-
-Total control sets: 12
-Unique control sets: 8
-"""
-
-CONTROL_SETS_TOTAL_ONLY = """Control Sets Report
--------------------
-
-Total control sets: 3
-"""
-
-DRC_FULL = """DRC Report
+1. Summary
 ----------
 
-+----------+----------+-------+
-| Rule     | Severity | Count |
-+----------+----------+-------+
-| UCIO-1   | Warning  |     3 |
-| CFGBVS-1 | Warning  |     1 |
-| REQP-1839| Error    |     2 |
-+----------+----------+-------+
+""" + POWER_SUMMARY_TABLE + """
+1.1 On-Chip Components
+----------------------
+
++------------+-----------+------+-----------+---------------+
+| On-Chip    | Power (W) | Used | Available | Utilization (%) |
++------------+-----------+------+-----------+---------------+
+| Clocks     |     0.012 |  123 |       456 |           5.0   |
+| Signals    |     0.023 |  234 |       567 |           9.5   |
+| Logic      |     0.045 |  345 |       678 |          18.6   |
+| BRAM       |     0.008 |   12 |        34 |           3.2   |
+| DSP        |     0.001 |    3 |        22 |           0.5   |
+| IO         |     0.017 |   45 |       100 |          14.0   |
++------------+-----------+------+-----------+---------------+
+"""
+
+POWER_NO_BREAKDOWN = """Table of Contents
+-----------------
+1. Summary
+1.1 On-Chip Components
+
+1. Summary
+----------
+
+""" + POWER_SUMMARY_TABLE
+
+CLOCK_UTIL_FULL = """Table of Contents
+-----------------
+4. Clock Regions: Key Resource Utilization
+5. Clock Regions : Global Clock Summary
+
+4. Clock Regions: Key Resource Utilization
+-------------------------------------------
+
++----------------+------+----------+------+-----+
+| Clock Region   | BUFG | BUFGCTRL | MMCM | PLL |
++----------------+------+----------+------+-----+
+| X1Y0           |    1 |        1 |    0 |   0 |
+| X1Y1           |    1 |        0 |    1 |   0 |
++----------------+------+----------+------+-----+
+
+5. Clock Regions : Global Clock Summary
+----------------------------------------
+
++----------------+---------------+----------+
+| Clock Region   | Global Clocks | BUFGCTRL |
++----------------+---------------+----------+
+| X1Y0           |             2 |        1 |
+| X1Y1           |             1 |        0 |
++----------------+---------------+----------+
+"""
+
+CONTROL_SETS_FULL = """Table of Contents
+-----------------
+1. Summary
+
+1. Summary
+----------
+
++--------------------------------------------------------------+---------+
+| Status                                                       | Count   |
++--------------------------------------------------------------+---------+
+| Number of unique control sets                                |       8 |
+| Unused register locations in slices containing registers     |    1234 |
++--------------------------------------------------------------+---------+
+"""
+
+DRC_SUMMARY_LINES = """Netlist: top.dcp
+Floorplan: placed
+Design limits: none
+Ruledeck: default
+Max violations: 10
+Violations found: 6
+"""
+
+DRC_FULL = """Table of Contents
+-----------------
+1. REPORT SUMMARY
+2. DRC DETAILS
+
+1. REPORT SUMMARY
+-----------------
+
+""" + DRC_SUMMARY_LINES + """
++----------+----------+--------------------------------+------------+
+| Rule     | Severity | Description                    | Violations |
++----------+----------+--------------------------------+------------+
+| UCIO-1   | Warning  | Unconstrained IO               |          3 |
+| CFGBVS-1 | Warning  | Configuration bank voltage     |          1 |
+| REQP-1839| Error    | Required pins                  |          2 |
++----------+----------+--------------------------------+------------+
 """
 
 DRC_NONE = """DRC Report
@@ -197,17 +304,53 @@ DRC_NONE = """DRC Report
 No DRC violations found.
 """
 
-METHODOLOGY_FULL = """Methodology Report
-------------------
+DRC_ZERO = """Table of Contents
+-----------------
+1. REPORT SUMMARY
 
-+----------+----------+-------+
-| Rule     | Severity | Count |
-+----------+----------+-------+
-| TIMING-17| Warning  |     5 |
-| XDCB-5   | Advisory |     2 |
-| SYNTH-4  | Warning  |     1 |
-+----------+----------+-------+
+1. REPORT SUMMARY
+-----------------
+
+Netlist: top.dcp
+Floorplan: placed
+Design limits: none
+Ruledeck: default
+Max violations: 10
+Violations found: 0
 """
+
+METHODOLOGY_FULL = """Table of Contents
+-----------------
+1. REPORT SUMMARY
+2. METHODOLOGY DETAILS
+
+1. REPORT SUMMARY
+-----------------
+
+Netlist: top.dcp
+Floorplan: placed
+Design limits: none
+Ruledeck: default
+Max violations: 10
+Violations found: 8
+
++----------+----------+-------------+------------+
+| Rule     | Severity | Description | Violations |
++----------+----------+-------------+------------+
+| TIMING-17| Warning  | Late clock  |          5 |
+| XDCB-5   | Advisory | Constraint  |          2 |
+| SYNTH-4  | Warning  | Inference   |          1 |
++----------+----------+-------------+------------+
+"""
+
+DRC_SUMMARY = {
+    "netlist": "top.dcp",
+    "floorplan": "placed",
+    "design_limits": "none",
+    "ruledeck": "default",
+    "max_violations": 10,
+    "violations_found": 6,
+}
 
 
 class TestTimingSummary(unittest.TestCase):
@@ -238,12 +381,48 @@ class TestTimingSummary(unittest.TestCase):
                 },
             ],
         )
+        self.assertEqual(
+            out["intra_clock"],
+            [
+                {
+                    "clock": "clk",
+                    "wns": -0.432,
+                    "tns": -2.156,
+                    "tns_failing_endpoints": 12,
+                    "tns_total_endpoints": 843,
+                    "whs": 0.018,
+                    "ths": 0.0,
+                    "ths_failing_endpoints": 0,
+                    "ths_total_endpoints": 843,
+                    "wpws": 0.25,
+                    "tpws": 0.0,
+                    "tpws_failing_endpoints": 0,
+                    "tpws_total_endpoints": 0,
+                },
+                {
+                    "clock": "sys_clk",
+                    "wns": None,
+                    "tns": None,
+                    "tns_failing_endpoints": None,
+                    "tns_total_endpoints": None,
+                    "whs": None,
+                    "ths": None,
+                    "ths_failing_endpoints": None,
+                    "ths_total_endpoints": None,
+                    "wpws": 4.5,
+                    "tpws": 0.0,
+                    "tpws_failing_endpoints": 0,
+                    "tpws_total_endpoints": 2,
+                },
+            ],
+        )
 
     def test_no_clock_section(self):
         out = parse_report("timing_summary", TIMING_NO_CLOCKS)
         self.assertEqual(out["wns"], 0.123)
         self.assertEqual(out["tns"], 0.0)
         self.assertIsNone(out["clocks"])
+        self.assertIsNone(out["intra_clock"])
 
     def test_empty(self):
         out = parse_report("timing_summary", "")
@@ -259,6 +438,7 @@ class TestTimingSummary(unittest.TestCase):
                 "failing_endpoints": {"tns": None, "ths": None, "tpws": None},
                 "total_endpoints": {"tns": None, "ths": None, "tpws": None},
                 "clocks": None,
+                "intra_clock": None,
             },
         )
 
@@ -325,27 +505,27 @@ class TestUtilization(unittest.TestCase):
 class TestPower(unittest.TestCase):
     def test_full(self):
         out = parse_report("power", POWER_FULL)
-        self.assertEqual(out["total_on_chip_w"], 2.456)
-        self.assertEqual(out["dynamic_w"], 1.9)
-        self.assertEqual(out["device_static_w"], 0.556)
-        self.assertEqual(out["junction_temp_c"], 35.3)
+        self.assertEqual(out["total_on_chip_w"], 0.106)
+        self.assertEqual(out["dynamic_w"], 0.08)
+        self.assertEqual(out["device_static_w"], 0.026)
+        self.assertEqual(out["junction_temp_c"], 25.4)
         self.assertEqual(out["confidence_level"], "Medium")
         self.assertEqual(
             out["breakdown"],
             [
-                {"name": "Clocks", "power_w": 0.123, "percent": 5.0},
-                {"name": "Signals", "power_w": 0.234, "percent": 9.5},
-                {"name": "Logic", "power_w": 0.456, "percent": 18.6},
-                {"name": "BRAM", "power_w": 0.078, "percent": 3.2},
-                {"name": "DSP", "power_w": 0.012, "percent": 0.5},
-                {"name": "IO", "power_w": 0.345, "percent": 14.0},
+                {"name": "Clocks", "power_w": 0.012, "percent": 5.0},
+                {"name": "Signals", "power_w": 0.023, "percent": 9.5},
+                {"name": "Logic", "power_w": 0.045, "percent": 18.6},
+                {"name": "BRAM", "power_w": 0.008, "percent": 3.2},
+                {"name": "DSP", "power_w": 0.001, "percent": 0.5},
+                {"name": "IO", "power_w": 0.017, "percent": 14.0},
             ],
         )
 
     def test_no_breakdown(self):
         out = parse_report("power", POWER_NO_BREAKDOWN)
-        self.assertEqual(out["total_on_chip_w"], 2.456)
-        self.assertEqual(out["confidence_level"], "Low")
+        self.assertEqual(out["total_on_chip_w"], 0.106)
+        self.assertEqual(out["confidence_level"], "Medium")
         self.assertIsNone(out["breakdown"])
 
     def test_empty(self):
@@ -370,20 +550,20 @@ class TestClockUtilization(unittest.TestCase):
             out["regions"],
             [
                 {
-                    "region": "X0Y0",
-                    "global_clocks": 2,
+                    "region": "X1Y0",
                     "bufg": 1,
                     "bufgctrl": 1,
                     "mmcm": 0,
                     "pll": 0,
+                    "global_clocks": 2,
                 },
                 {
-                    "region": "X1Y0",
-                    "global_clocks": 1,
+                    "region": "X1Y1",
                     "bufg": 1,
                     "bufgctrl": 0,
                     "mmcm": 1,
                     "pll": 0,
+                    "global_clocks": 1,
                 },
             ],
         )
@@ -401,51 +581,103 @@ class TestClockUtilization(unittest.TestCase):
 class TestControlSets(unittest.TestCase):
     def test_full(self):
         out = parse_report("control_sets", CONTROL_SETS_FULL)
-        self.assertEqual(out, {"total": 12, "unique": 8})
-
-    def test_total_only(self):
-        out = parse_report("control_sets", CONTROL_SETS_TOTAL_ONLY)
-        self.assertEqual(out, {"total": 3, "unique": None})
+        self.assertEqual(
+            out,
+            {"total": None, "unique": 8, "unused_register_locations": 1234},
+        )
 
     def test_empty(self):
         self.assertEqual(
-            parse_report("control_sets", ""), {"total": None, "unique": None}
+            parse_report("control_sets", ""),
+            {"total": None, "unique": None, "unused_register_locations": None},
         )
 
 
 class TestDrc(unittest.TestCase):
     def test_full(self):
         out = parse_report("drc", DRC_FULL)
+        self.assertEqual(out["summary"], DRC_SUMMARY)
         self.assertEqual(
             out["rules"],
             [
-                {"rule_id": "UCIO-1", "severity": "Warning", "count": 3},
-                {"rule_id": "CFGBVS-1", "severity": "Warning", "count": 1},
-                {"rule_id": "REQP-1839", "severity": "Error", "count": 2},
+                {
+                    "rule_id": "UCIO-1",
+                    "severity": "Warning",
+                    "description": "Unconstrained IO",
+                    "count": 3,
+                },
+                {
+                    "rule_id": "CFGBVS-1",
+                    "severity": "Warning",
+                    "description": "Configuration bank voltage",
+                    "count": 1,
+                },
+                {
+                    "rule_id": "REQP-1839",
+                    "severity": "Error",
+                    "description": "Required pins",
+                    "count": 2,
+                },
             ],
         )
 
     def test_no_violations(self):
-        self.assertEqual(parse_report("drc", DRC_NONE), {"rules": []})
+        out = parse_report("drc", DRC_NONE)
+        self.assertEqual(out["rules"], [])
+        self.assertEqual(
+            out["summary"],
+            {
+                "netlist": None,
+                "floorplan": None,
+                "design_limits": None,
+                "ruledeck": None,
+                "max_violations": None,
+                "violations_found": None,
+            },
+        )
+
+    def test_zero_violations_found(self):
+        out = parse_report("drc", DRC_ZERO)
+        self.assertEqual(out["rules"], [])
+        self.assertEqual(out["summary"]["violations_found"], 0)
 
     def test_empty(self):
-        self.assertEqual(parse_report("drc", ""), {"rules": None})
+        out = parse_report("drc", "")
+        self.assertEqual(out["rules"], None)
 
 
 class TestMethodology(unittest.TestCase):
     def test_full(self):
         out = parse_report("methodology", METHODOLOGY_FULL)
+        self.assertEqual(out["summary"]["violations_found"], 8)
+        self.assertEqual(out["summary"]["ruledeck"], "default")
         self.assertEqual(
             out["rules"],
             [
-                {"rule_id": "TIMING-17", "severity": "Warning", "count": 5},
-                {"rule_id": "XDCB-5", "severity": "Advisory", "count": 2},
-                {"rule_id": "SYNTH-4", "severity": "Warning", "count": 1},
+                {
+                    "rule_id": "TIMING-17",
+                    "severity": "Warning",
+                    "description": "Late clock",
+                    "count": 5,
+                },
+                {
+                    "rule_id": "XDCB-5",
+                    "severity": "Advisory",
+                    "description": "Constraint",
+                    "count": 2,
+                },
+                {
+                    "rule_id": "SYNTH-4",
+                    "severity": "Warning",
+                    "description": "Inference",
+                    "count": 1,
+                },
             ],
         )
 
     def test_empty(self):
-        self.assertEqual(parse_report("methodology", ""), {"rules": None})
+        out = parse_report("methodology", "")
+        self.assertEqual(out["rules"], None)
 
 
 class TestDispatch(unittest.TestCase):
@@ -455,7 +687,7 @@ class TestDispatch(unittest.TestCase):
         )
         self.assertEqual(parse_report("timing", TIMING_NO_CLOCKS)["wns"], 0.123)
         self.assertEqual(
-            parse_report("report_drc", DRC_NONE), {"rules": []}
+            parse_report("report_drc", DRC_NONE)["rules"], []
         )
 
     def test_unknown_kind(self):
@@ -495,6 +727,7 @@ class TestCli(unittest.TestCase):
             os.unlink(path)
         self.assertEqual(out["wns"], -0.432)
         self.assertEqual(len(out["clocks"]), 2)
+        self.assertEqual(len(out["intra_clock"]), 2)
 
     def test_cli_stdin(self):
         out = self._run_cli(["drc", "-"], stdin_text=DRC_FULL)
