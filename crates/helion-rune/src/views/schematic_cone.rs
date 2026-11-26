@@ -29,7 +29,7 @@ use crate::live::{LiveKind, LiveNetlist, live_design, schematic_netlist};
 use crate::state::{AppState, CenterPane};
 use crate::theme::VivadoTheme;
 use crate::views::cad::{self, ColSpec};
-use crate::views::schematic::{SchemSel, SchematicState, WORLD_W};
+use crate::views::schematic::{SchemSel, SchematicState};
 
 /// Hop-count limits for the cone stepper.
 pub const HOPS_MIN: usize = 1;
@@ -439,12 +439,12 @@ impl SchematicState {
 
     /// Zoom that fits the whole sheet into the canvas viewport (`None`
     /// until the canvas has been laid out once).
-    pub fn fit_zoom(&self, world_h: f32) -> Option<f32> {
+    pub fn fit_zoom(&self, world_w: f32, world_h: f32) -> Option<f32> {
         let [vw, vh] = self.viewport;
-        if vw < 8.0 || vh < 8.0 || world_h <= 0.0 {
+        if vw < 8.0 || vh < 8.0 || world_w <= 0.0 || world_h <= 0.0 {
             return None;
         }
-        let z = ((vw - 4.0) / WORLD_W).min((vh - 4.0) / world_h);
+        let z = ((vw - 4.0) / world_w).min((vh - 4.0) / world_h);
         Some(z.clamp(
             crate::views::schematic::ZOOM_MIN,
             crate::views::schematic::ZOOM_MAX,
@@ -456,7 +456,7 @@ impl SchematicState {
 pub fn fit(s: &mut AppState) -> String {
     if let Some(live) = schematic_netlist(s) {
         let layout = crate::views::schematic::SchemLayout::of(&live, &s.schematic);
-        match s.schematic.fit_zoom(layout.world_h) {
+        match s.schematic.fit_zoom(layout.world_w, layout.world_h) {
             Some(z) => s.schematic.zoom = z,
             None => s.schematic.zoom = 1.0,
         }
@@ -1494,14 +1494,15 @@ mod tests {
         tap(&mut rt, "schematic-zoom-in");
         tap(&mut rt, "schematic-zoom-fit");
         let live = schematic_netlist(&rt.state).unwrap();
-        let h = crate::views::schematic::SchemLayout::of(&live, &rt.state.schematic).world_h;
+        let sheet = crate::views::schematic::SchemLayout::of(&live, &rt.state.schematic);
+        let (w, h) = (sheet.world_w, sheet.world_h);
         let z = rt.state.schematic.zoom;
         assert!(
-            WORLD_W * z <= vw + 0.5 && h * z <= vh + 0.5,
+            w * z <= vw + 0.5 && h * z <= vh + 0.5,
             "fit shows the whole sheet"
         );
         assert!(
-            WORLD_W * z >= vw - 6.0 || h * z >= vh - 6.0,
+            w * z >= vw - 6.0 || h * z >= vh - 6.0,
             "fit fills one axis of the viewport"
         );
     }

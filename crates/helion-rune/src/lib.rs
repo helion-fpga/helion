@@ -330,13 +330,19 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
     ("schematic", |s| {
         s.center = state::CenterPane::Schematic;
         let _ = live::seed_live_fixture(s);
+        // The sheet is wider than the canvas at 100%. A snapshot is one
+        // frame, taken before the first layout fits it, so frame the whole
+        // design here.
+        s.schematic.zoom = 0.65;
     }),
     ("schematic-detail", |s| {
         s.center = state::CenterPane::Schematic;
         let _ = live::seed_live_fixture(s);
+        // Close zoom on the left of the sheet, where signal flow starts: a
+        // collapsed block (u_div) beside the selected top-level flop it feeds.
         s.schematic.zoom = 1.5;
-        s.schematic.selected = Some(views::schematic::SchemSel::Cell("u_div_u_ff0".into()));
-        s.schematic.collapsed.insert("u_led".into());
+        s.schematic.selected = Some(views::schematic::SchemSel::Cell("u_ff0".into()));
+        s.schematic.collapsed.insert("u_div".into());
     }),
     ("schematic-cone", |s| {
         s.center = state::CenterPane::Schematic;

@@ -39,10 +39,11 @@ use crate::live::{LiveNetlist, schematic_netlist, slug};
 use crate::state::{AppState, ConsoleLine, MsgSev};
 use crate::theme::VivadoTheme;
 use crate::views::schematic_cone::{self as cone, ConeTrace, SheetFind};
+use crate::views::schematic_flow as flow;
 use crate::views::sources::pane_header;
 
-/// Sheet width in points at 100% (columns are fixed; height grows with the
-/// live netlist).
+/// Minimum sheet width in points at 100%; the layout extends it with the
+/// logic depth.
 pub const WORLD_W: f32 = 660.0;
 /// Minimum sheet height; the layout extends it for large netlists.
 pub const WORLD_H_MIN: f32 = 300.0;
@@ -68,22 +69,20 @@ const PORT_IN_X: f32 = 8.0;
 const PORT_W: f32 = 84.0;
 /// Port node height.
 const PORT_H: f32 = 24.0;
-/// Port row pitch.
-const PORT_PITCH: f32 = 34.0;
-/// Hierarchy-block column.
-const BLOCK_X: f32 = 110.0;
-/// Hierarchy-block width.
+/// Hierarchy-block width when collapsed (an expanded block grows to fit).
 const BLOCK_W: f32 = 190.0;
-/// Block header height (name strip above the child grid).
+/// Block header height (name strip above the block's own cells).
 const BLOCK_HEAD: f32 = 26.0;
+/// Space between a block's outline and its own sheet.
+const BLOCK_PAD: f32 = 6.0;
 /// Child mini-cell size inside an expanded block.
 const CHILD_W: f32 = 88.0;
 const CHILD_H: f32 = 24.0;
-/// Top-level kind columns (LUT / FF / other).
-const KIND_X: [f32; 3] = [110.0, 225.0, 340.0];
+/// Top-level cell size.
 const KIND_W: f32 = 105.0;
 const CELL_H: f32 = 28.0;
-const CELL_PITCH: f32 = 34.0;
+/// Space above the first row of the sheet.
+const SHEET_TOP: f32 = 16.0;
 
 /// Pin/net label type: smaller than CAD body text.
 const FONT_PIN: TextStyle = TextStyle::new(10.0, 400.0);
@@ -145,14 +144,22 @@ pub struct SchemWire {
     pub pts: Vec<[f32; 2]>,
     pub level: NetLevel,
     pub ends: (String, String),
+    /// Leading points that run from a cell inside an expanded block to the
+    /// block's edge. They are dropped while that cell does not draw (the
+    /// Blocks LOD), so the wire starts at the block outline.
+    pub head: usize,
+    /// Trailing points from a block's edge to a cell inside it.
+    pub tail: usize,
 }
 
-/// Deterministic column layout of a live netlist: rects for every port,
-/// hierarchy block, and cell, plus one wire star per net. Rebuilt per frame
-/// from the session design (cheap); never stored.
+/// Signal-flow layout of a live netlist ([`flow`]): rects for every port,
+/// hierarchy block and cell, plus one routed wire per net sink. Derived
+/// from the session design; [`SchemLayout::of`] keeps the last one.
 #[derive(Clone, Debug, Default)]
 pub struct SchemLayout {
-    /// World height for this netlist (width is [`WORLD_W`]).
+    /// World width for this netlist: it grows with the logic depth.
+    pub world_w: f32,
+    /// World height for this netlist.
     pub world_h: f32,
     /// Cell name → world rect.
     pub cells: HashMap<String, [f32; 4]>,
@@ -165,88 +172,96 @@ pub struct SchemLayout {
 }
 
 impl SchemLayout {
-    /// Column layout of a live netlist. Collapsed blocks shrink to a header
-    /// row (their children unmount, so they get no rects); everything below
-    /// reflows, so collapse never leaves a void.
-    pub fn of(live: &LiveNetlist, st: &SchematicState) -> Self {
-        let mut out = SchemLayout {
-            world_h: WORLD_H_MIN,
-            ..SchemLayout::default()
-        };
-        // Input ports, left column.
-        for (i, p) in live.ports_in.iter().enumerate() {
-            out.ports.insert(
-                p.clone(),
-                [PORT_IN_X, 40.0 + i as f32 * PORT_PITCH, PORT_W, PORT_H],
-            );
+    /// Signal-flow layout of a live netlist. Input ports sit on the left,
+    /// output ports on the right, and blocks and top-level cells in columns
+    /// by logic level between them. An expanded block lays its own cells out
+    /// the same way inside its outline. A collapsed block shrinks to a header
+    /// row (its children unmount, so they get no rects) and the wires of its
+    /// cells end on its outline; the sheet reflows, so collapse never leaves
+    /// a void.
+    pub fn of(live: &LiveNetlist, st: &SchematicState) -> std::rc::Rc<Self> {
+        use std::hash::{Hash, Hasher};
+        thread_local! {
+            static LAST: std::cell::RefCell<Option<(u64, std::rc::Rc<SchemLayout>)>> = const { std::cell::RefCell::new(None) };
         }
-        // Hierarchy blocks, stacked; expanded children in a 2-wide mini-grid.
-        let mut kids_of: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+        // The layout depends on the netlist and on which blocks are open:
+        // hash both (cheap next to the layout) and keep the last result, so
+        // scrolling and selecting do not lay the sheet out again each frame.
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        live.design.hash(&mut h);
         for c in &live.cells {
-            if let Some(o) = live.owner_of(&c.name) {
-                kids_of.entry(o).or_default().push(c.name.as_str());
+            (c.name.as_str(), matches!(c.kind, crate::live::LiveKind::Ff)).hash(&mut h);
+        }
+        for n in &live.nets {
+            (n.name.as_str(), n.loads, &n.cells).hash(&mut h);
+        }
+        (&live.ports_in, &live.ports_out).hash(&mut h);
+        for b in &live.hier {
+            (b.name.as_str(), st.is_expanded(&b.name)).hash(&mut h);
+        }
+        let key = h.finish();
+        if let Some(hit) = LAST.with(|c| c.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, l)| l.clone())) {
+            return hit;
+        }
+        let out = std::rc::Rc::new(Self::build(live, st));
+        LAST.with(|c| *c.borrow_mut() = Some((key, out.clone())));
+        out
+    }
+
+    fn build(live: &LiveNetlist, st: &SchematicState) -> Self {
+        use flow::{Edge, End};
+        /// Where a net endpoint draws: a port, a top-level node, or cell
+        /// `.1` of block `.0`.
+        #[derive(Clone, Copy)]
+        enum At {
+            In(usize),
+            Out(usize),
+            Top(usize),
+            Kid(usize, usize),
+        }
+        /// Which sheet routed a wire, and the edge's index there.
+        enum Route {
+            Inner(usize, usize),
+            Top(usize),
+        }
+
+        // Top-level nodes are the blocks, then the cells outside every block.
+        let nb = live.hier.len();
+        let block_of: HashMap<&str, usize> = live.hier.iter().enumerate().map(|(i, h)| (h.name.as_str(), i)).collect();
+        let open: Vec<bool> = live.hier.iter().map(|h| st.is_expanded(&h.name)).collect();
+        let mut kids: Vec<Vec<&str>> = vec![Vec::new(); nb];
+        let mut tops: Vec<&str> = Vec::new();
+        let mut at: HashMap<&str, At> = HashMap::new();
+        for c in &live.cells {
+            let name = c.name.as_str();
+            match live.owner_of(name).and_then(|o| block_of.get(o)) {
+                Some(&b) => {
+                    at.insert(name, At::Kid(b, kids[b].len()));
+                    kids[b].push(name);
+                }
+                None => {
+                    at.insert(name, At::Top(nb + tops.len()));
+                    tops.push(name);
+                }
             }
         }
-        let mut y = 24.0;
-        for h in &live.hier {
-            if !st.is_expanded(&h.name) {
-                out.blocks
-                    .insert(h.name.clone(), [BLOCK_X, y, BLOCK_W, BLOCK_HEAD]);
-                y += BLOCK_HEAD + 12.0;
-                continue;
+
+        // One leg per sink: an input port drives its net, else the net's
+        // first cell does; an output port is one more sink.
+        let mut inner_edges: Vec<Vec<Edge>> = vec![Vec::new(); nb];
+        let mut top_edges: Vec<Edge> = Vec::new();
+        let mut legs: Vec<(usize, NetLevel, &str, At, &str, At, Route)> = Vec::new();
+        for (ni, net) in live.nets.iter().enumerate() {
+            let name = net.name.as_str();
+            let in_port = live.ports_in.binary_search(&net.name).ok();
+            let out_port = live.ports_out.binary_search(&net.name).ok();
+            let mut ends: Vec<(&str, At)> = Vec::new();
+            if let Some(i) = in_port {
+                ends.push((name, At::In(i)));
             }
-            let kids: &[&str] = kids_of.get(h.name.as_str()).map_or(&[], Vec::as_slice);
-            let rows = kids.len().div_ceil(2).max(1) as f32;
-            let bh = BLOCK_HEAD + rows * (CHILD_H + 6.0) + 4.0;
-            out.blocks.insert(h.name.clone(), [BLOCK_X, y, BLOCK_W, bh]);
-            for (i, kid) in kids.iter().enumerate() {
-                let cx = BLOCK_X + 6.0 + (i % 2) as f32 * (CHILD_W + 6.0);
-                let cy = y + BLOCK_HEAD + (i / 2) as f32 * (CHILD_H + 6.0);
-                out.cells
-                    .insert((*kid).to_string(), [cx, cy, CHILD_W, CHILD_H]);
-            }
-            y += bh + 12.0;
-        }
-        // Top-level cells in kind columns below the blocks.
-        let top_y = if live.hier.is_empty() { 24.0 } else { y };
-        let mut col_y = [top_y; 3];
-        for cell in &live.cells {
-            if live.owner_of(&cell.name).is_some() {
-                continue;
-            }
-            let col = match cell.kind {
-                crate::live::LiveKind::Lut => 0,
-                crate::live::LiveKind::Ff => 1,
-                _ => 2,
-            };
-            out.cells
-                .insert(cell.name.clone(), [KIND_X[col], col_y[col], KIND_W, CELL_H]);
-            col_y[col] += CELL_PITCH;
-            y = y.max(col_y[col] + 12.0);
-        }
-        // Output ports, right column.
-        for (i, p) in live.ports_out.iter().enumerate() {
-            out.ports.insert(
-                p.clone(),
-                [
-                    WORLD_W - PORT_W - 10.0,
-                    40.0 + i as f32 * PORT_PITCH,
-                    PORT_W,
-                    PORT_H,
-                ],
-            );
-        }
-        // One star leg per sink: the first sorted endpoint drives (ports
-        // drive when they are inputs, sink when they are outputs).
-        for net in &live.nets {
-            let in_port = live.is_in_port(&net.name).then(|| net.name.clone());
-            let out_port = live.is_out_port(&net.name).then(|| net.name.clone());
-            let mut ends: Vec<String> = net.cells.clone();
-            if in_port.is_some() {
-                ends.insert(0, net.name.clone());
-            }
-            if out_port.is_some() {
-                ends.push(net.name.clone());
+            ends.extend(net.cells.iter().filter_map(|c| at.get(c.as_str()).map(|a| (c.as_str(), *a))));
+            if let Some(j) = out_port {
+                ends.push((name, At::Out(j)));
             }
             if ends.len() < 2 {
                 continue;
@@ -254,56 +269,127 @@ impl SchemLayout {
             let level = if in_port.is_some() || out_port.is_some() || net.loads >= 8 {
                 NetLevel::Backbone
             } else {
-                let owners: HashSet<&str> = ends.iter().filter_map(|e| live.owner_of(e)).collect();
-                if owners.len() == 1
-                    && !ends
-                        .iter()
-                        .any(|e| live.is_in_port(e) || live.is_out_port(e))
-                {
-                    NetLevel::Internal(owners.into_iter().next().unwrap().to_string())
-                } else {
-                    NetLevel::Detail
+                let owners: HashSet<usize> = ends.iter().filter_map(|e| if let At::Kid(b, _) = e.1 { Some(b) } else { None }).collect();
+                match owners.iter().next() {
+                    Some(&b) if owners.len() == 1 => NetLevel::Internal(live.hier[b].name.clone()),
+                    _ => NetLevel::Detail,
                 }
             };
-            let (driver, sinks) = (&ends[0], &ends[1..]);
-            for sink in sinks {
-                let (Some(a), Some(b)) = (Self::anchor(&out, driver), Self::anchor(&out, sink))
-                else {
-                    continue;
+            let (driver, da) = ends[0];
+            for &(sink, sa) in &ends[1..] {
+                let route = match (da, sa) {
+                    (At::Kid(b, k0), At::Kid(b1, k1)) if b == b1 => {
+                        if !open[b] {
+                            // Both ends are inside one collapsed block.
+                            continue;
+                        }
+                        inner_edges[b].push(Edge { net: ni, from: End::Node(k0), to: End::Node(k1) });
+                        Route::Inner(b, inner_edges[b].len() - 1)
+                    }
+                    _ => {
+                        let from = match da {
+                            At::In(i) => End::Left(i),
+                            At::Top(n) | At::Kid(n, _) => End::Node(n),
+                            // An output port never drives: it is always last.
+                            At::Out(_) => continue,
+                        };
+                        let to = match sa {
+                            At::Out(j) => End::Right(j),
+                            At::Top(n) | At::Kid(n, _) => End::Node(n),
+                            At::In(_) => continue,
+                        };
+                        top_edges.push(Edge { net: ni, from, to });
+                        Route::Top(top_edges.len() - 1)
+                    }
                 };
-                let x0 = a[0] + a[2];
-                let y0 = a[1] + a[3] / 2.0;
-                let x1 = b[0];
-                let y1 = b[1] + b[3] / 2.0;
-                let mx = (x0 + x1) / 2.0;
-                out.wires.push(SchemWire {
-                    name: net.name.clone(),
-                    pts: vec![[x0, y0], [mx, y0], [mx, y1], [x1, y1]],
-                    level: level.clone(),
-                    ends: (driver.clone(), sink.clone()),
-                });
+                legs.push((ni, level.clone(), driver, da, sink, sa, route));
             }
         }
-        // Sheet height covers the lowest rect.
-        let mut bottom = WORLD_H_MIN - 24.0;
-        for r in out
-            .cells
-            .values()
-            .chain(out.ports.values())
-            .chain(out.blocks.values())
-        {
-            bottom = bottom.max(r[1] + r[3]);
-        }
-        out.world_h = bottom + 24.0;
-        out
-    }
 
-    fn anchor(layout: &SchemLayout, name: &str) -> Option<[f32; 4]> {
-        layout
-            .cells
-            .get(name)
-            .or_else(|| layout.ports.get(name))
-            .copied()
+        // Registers and latches end a loop: the flow layout cuts it at their output.
+        let is_seq = |name: &str| live.cell(name).is_some_and(|c| matches!(c.kind, crate::live::LiveKind::Ff));
+        // Expanded blocks first: their size is what the top sheet places.
+        let inner: Vec<Option<flow::Sheet>> = (0..nb)
+            .map(|b| {
+                let seq: Vec<bool> = kids[b].iter().map(|k| is_seq(k)).collect();
+                open[b].then(|| flow::layout(&vec![[CHILD_W, CHILD_H]; kids[b].len()], &seq, 0, 0, [0.0, 0.0], &inner_edges[b], [0.0, 0.0]))
+            })
+            .collect();
+        let mut sizes: Vec<[f32; 2]> = inner
+            .iter()
+            .map(|s| match s {
+                Some(s) => [BLOCK_W.max(s.size[0] + 2.0 * BLOCK_PAD), BLOCK_HEAD + s.size[1].max(CHILD_H) + BLOCK_PAD],
+                None => [BLOCK_W, BLOCK_HEAD],
+            })
+            .collect();
+        sizes.extend(tops.iter().map(|_| [KIND_W, CELL_H]));
+        let seq: Vec<bool> = (0..nb).map(|_| false).chain(tops.iter().map(|t| is_seq(t))).collect();
+        let sheet = flow::layout(&sizes, &seq, live.ports_in.len(), live.ports_out.len(), [PORT_W, PORT_H], &top_edges, [PORT_IN_X, SHEET_TOP]);
+
+        let mut out = SchemLayout {
+            world_w: (PORT_IN_X + sheet.size[0] + 10.0).max(WORLD_W),
+            world_h: (SHEET_TOP + sheet.size[1] + 24.0).max(WORLD_H_MIN),
+            ..SchemLayout::default()
+        };
+        for (i, p) in live.ports_in.iter().enumerate() {
+            out.ports.insert(p.clone(), sheet.left[i]);
+        }
+        for (j, p) in live.ports_out.iter().enumerate() {
+            out.ports.insert(p.clone(), sheet.right[j]);
+        }
+        for (i, name) in tops.iter().enumerate() {
+            out.cells.insert((*name).to_string(), sheet.nodes[nb + i]);
+        }
+        // Where each expanded block's own sheet starts.
+        let inner_at = |b: usize| [sheet.nodes[b][0] + BLOCK_PAD, sheet.nodes[b][1] + BLOCK_HEAD];
+        for (b, h) in live.hier.iter().enumerate() {
+            out.blocks.insert(h.name.clone(), sheet.nodes[b]);
+            if let Some(s) = &inner[b] {
+                let [ox, oy] = inner_at(b);
+                for (k, kid) in kids[b].iter().enumerate() {
+                    let r = s.nodes[k];
+                    out.cells.insert((*kid).to_string(), [r[0] + ox, r[1] + oy, r[2], r[3]]);
+                }
+            }
+        }
+        for (ni, level, driver, da, sink, sa, route) in legs {
+            let (mut pts, mut head, mut tail) = (Vec::new(), 0, 0);
+            match route {
+                Route::Inner(b, e) => {
+                    let [ox, oy] = inner_at(b);
+                    if let Some(s) = &inner[b] {
+                        pts.extend(s.paths[e].iter().map(|p| [p[0] + ox, p[1] + oy]));
+                    }
+                }
+                Route::Top(e) => {
+                    // shortcut: inside an expanded block the leg from its outline to the cell takes the short way and can pass under the block's other cells; give blocks their own terminals when that reads badly.
+                    if let (At::Kid(b, _), Some(c)) = (da, out.cells.get(driver)) {
+                        if open[b] {
+                            let (cy, jx, edge) = (c[1] + c[3] / 2.0, c[0] + c[2] + 4.0, sheet.paths[e][0]);
+                            pts.extend([[c[0] + c[2], cy], [jx, cy], [jx, edge[1]]]);
+                            head = 3;
+                        }
+                    }
+                    pts.extend(sheet.paths[e].iter().copied());
+                    if let (At::Kid(b, _), Some(c)) = (sa, out.cells.get(sink)) {
+                        if open[b] {
+                            let (cy, jx, edge) = (c[1] + c[3] / 2.0, c[0] - 4.0, pts[pts.len() - 1]);
+                            pts.extend([[jx, edge[1]], [jx, cy], [c[0], cy]]);
+                            tail = 3;
+                        }
+                    }
+                }
+            }
+            out.wires.push(SchemWire {
+                name: live.nets[ni].name.clone(),
+                pts,
+                level,
+                ends: (driver.to_string(), sink.to_string()),
+                head,
+                tail,
+            });
+        }
+        out
     }
 
     /// Mounted rect for a wire endpoint: the cell/port rect when it mounts,
@@ -391,6 +477,10 @@ pub struct SchematicState {
     pub find_ix: usize,
     /// Query `find_ix` belongs to (a new query restarts at the first hit).
     pub find_last: String,
+    /// The sheet has not been fitted to its canvas yet: the first layout
+    /// (and a stage switch or a new run) zooms out to show all of it, as
+    /// Vivado opens a schematic.
+    pub fit_pending: bool,
 }
 
 impl Default for SchematicState {
@@ -418,6 +508,7 @@ impl SchematicState {
             find_kind: SheetFind::Cells,
             find_ix: 0,
             find_last: String::new(),
+            fit_pending: true,
         }
     }
 
@@ -564,6 +655,35 @@ pub fn set_stage(s: &mut AppState, stage: helion_targets::view::NetlistStage) {
     s.schematic.cone = None;
     if let Some(live) = schematic_netlist(s) {
         s.schematic.set_all(&live, false);
+    }
+    refit(s);
+}
+
+/// A different sheet is on show (another stage, a new run): go back to
+/// 100% and fit it again.
+pub(crate) fn refit(s: &mut AppState) {
+    s.schematic.zoom = 1.0;
+    s.schematic.fit_pending = true;
+    fit_on_open(s);
+}
+
+/// Zoom out to show the whole sheet once its canvas has a size, as Vivado
+/// opens a schematic. It keeps a zoom the user or a scene already chose,
+/// and never zooms in past 100%.
+fn fit_on_open(s: &mut AppState) {
+    if !s.schematic.fit_pending || s.schematic.viewport[0] < 8.0 || s.schematic.viewport[1] < 8.0 {
+        return;
+    }
+    let Some(live) = schematic_netlist(s) else {
+        return;
+    };
+    s.schematic.fit_pending = false;
+    if (s.schematic.zoom - 1.0).abs() > f32::EPSILON {
+        return;
+    }
+    let layout = SchemLayout::of(&live, &s.schematic);
+    if let Some(z) = s.schematic.fit_zoom(layout.world_w, layout.world_h) {
+        s.schematic.zoom = z.min(1.0);
     }
 }
 
@@ -812,18 +932,17 @@ fn hierarchy_tree(s: &AppState, t: &VivadoTheme, live: &LiveNetlist) -> El {
         )
 }
 
-/// Wire/highlight shape for the canvas: dotted grid, sheet frame, net wires
-/// (red when touching the selection), and pin dots at Full LOD.
-fn wires_shape(s: &AppState, t: &VivadoTheme, live: &LiveNetlist, layout: &SchemLayout) -> Shape {
+/// The sheet under everything: dotted grid and sheet frame.
+fn grid_shape(s: &AppState, t: &VivadoTheme, layout: &SchemLayout) -> Shape {
     let z = s.schematic.zoom;
-    let world_h = layout.world_h;
     let px = |x: f32, y: f32| [x * z, y * z];
     let mut shape = Shape::new();
     // Dotted grid, in the near window only.
-    let [x0, y0, x1, y1] = s.schematic.near_window().unwrap_or([0.0, 0.0, WORLD_W, world_h]);
+    let (world_w, world_h) = (layout.world_w, layout.world_h);
+    let [x0, y0, x1, y1] = s.schematic.near_window().unwrap_or([0.0, 0.0, world_w, world_h]);
     let first = |lo: f32| ((lo / GRID).floor() * GRID).max(GRID);
     let mut gx = first(x0);
-    while gx < WORLD_W.min(x1) {
+    while gx < world_w.min(x1) {
         let mut gy = first(y0);
         while gy < world_h.min(y1) {
             let [dx, dy] = px(gx, gy);
@@ -841,7 +960,7 @@ fn wires_shape(s: &AppState, t: &VivadoTheme, live: &LiveNetlist, layout: &Schem
         gx += GRID;
     }
     // Sheet frame.
-    let [fw, fh] = px(WORLD_W, world_h);
+    let [fw, fh] = px(world_w, world_h);
     shape = shape.stroke_with(
         vec![
             [0.5, 0.5],
@@ -854,6 +973,16 @@ fn wires_shape(s: &AppState, t: &VivadoTheme, live: &LiveNetlist, layout: &Schem
         rune::LineCap::Butt,
         t.border,
     );
+    shape
+}
+
+/// Net wires (red when touching the selection) and pin dots at Full LOD.
+/// They paint over the hierarchy blocks, so the nets inside an expanded
+/// block show, and under the cells and ports.
+fn wires_shape(s: &AppState, t: &VivadoTheme, live: &LiveNetlist, layout: &SchemLayout) -> Shape {
+    let z = s.schematic.zoom;
+    let px = |x: f32, y: f32| [x * z, y * z];
+    let mut shape = Shape::new();
     // Wires, re-anchored through the live visibility rules.
     for wire in &layout.wires {
         if !s.schematic.wire_visible(live, layout, wire) {
@@ -866,33 +995,22 @@ fn wires_shape(s: &AppState, t: &VivadoTheme, live: &LiveNetlist, layout: &Schem
                     && (wire.ends.0 == *sel.name() || wire.ends.1 == *sel.name()))
                 || matches!(sel, SchemSel::Hier(h) if live.owner_of(&wire.ends.0).as_deref() == Some(h.as_str()) || live.owner_of(&wire.ends.1).as_deref() == Some(h.as_str()))
         });
-        let (Some(a), Some(b)) = (
-            layout.end_rect(&s.schematic, live, &wire.ends.0),
-            layout.end_rect(&s.schematic, live, &wire.ends.1),
-        ) else {
+        // A wire into an expanded block ends on the block outline while the
+        // cell inside does not draw.
+        let drawn = |name: &str| layout.ports.contains_key(name) || s.schematic.cell_visible(live, name);
+        let from = if drawn(&wire.ends.0) { 0 } else { wire.head };
+        let to = wire.pts.len() - if drawn(&wire.ends.1) { 0 } else { wire.tail };
+        let Some(world) = wire.pts.get(from..to).filter(|p| p.len() >= 2) else {
             continue;
         };
-        let x0 = a[0] + a[2];
-        let y0 = a[1] + a[3] / 2.0;
-        let x1 = b[0];
-        let y1 = b[1] + b[3] / 2.0;
-        let mut mx = (x0 + x1) / 2.0;
-        // Keep the vertical drop out of block interiors (wires paint under
-        // the nodes, so a drop inside a foreign block reads as a stub).
-        // Legs internal to a block keep their midpoint.
-        for r in layout.blocks.values() {
-            let inside = |p: f32| p > r[0] + 2.0 && p < r[0] + r[2] - 2.0;
-            let a_in = inside(a[0] + a[2] / 2.0);
-            let b_in = inside(b[0] + b[2] / 2.0);
-            if inside(mx) && !(a_in && b_in) {
-                mx = r[0] + r[2] + 8.0;
-            }
+        let (mut lx, mut ly, mut hx, mut hy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for p in world {
+            (lx, ly, hx, hy) = (lx.min(p[0]), ly.min(p[1]), hx.max(p[0]), hy.max(p[1]));
         }
-        let (lx, hx, ly, hy) = (x0.min(x1).min(mx), x0.max(x1).max(mx), y0.min(y1), y0.max(y1));
         if !s.schematic.near_view(&[lx, ly, hx - lx, hy - ly]) {
             continue;
         }
-        let pts = vec![px(x0, y0), px(mx, y0), px(mx, y1), px(x1, y1)];
+        let pts: Vec<[f32; 2]> = world.iter().map(|p| px(p[0], p[1])).collect();
         let (width, ink) = match (hot, in_cone) {
             (true, _) => (2.0, t.fail),
             (false, Some(true)) => (2.5, t.accent),
@@ -1053,7 +1171,7 @@ fn cell_node(
 fn schematic_canvas(s: &AppState, t: &VivadoTheme, live: &LiveNetlist, layout: &SchemLayout) -> El {
     let z = s.schematic.zoom;
     let mut sheet = el()
-        .w(WORLD_W * z)
+        .w(layout.world_w * z)
         .h(layout.world_h * z)
         .fill(t.panel_bg)
         .on_press(|s: &mut AppState| s.schematic.selected = None)
@@ -1068,14 +1186,16 @@ fn schematic_canvas(s: &AppState, t: &VivadoTheme, live: &LiveNetlist, layout: &
                 tx.live_only();
             }
         })
-        .child(canvas(wires_shape(s, t, live, layout)).w_full().h_full());
+        .child(canvas(grid_shape(s, t, layout)).w_full().h_full());
     let near = |r: &[f32; 4]| s.schematic.near_view(r);
-    // Blocks first (under their children), then ports, then mounted cells.
+    // Blocks first (under the wires and their children), then the wires,
+    // then ports, then mounted cells.
     for h in &live.hier {
         if let Some(rect) = layout.blocks.get(&h.name) {
             sheet = sheet.child(cell_node(s, t, live, SchemSel::Hier(h.name.clone()), *rect));
         }
     }
+    sheet = sheet.child(canvas(wires_shape(s, t, live, layout)).absolute(0.0, 0.0).w_full().h_full().inert());
     for (name, rect) in layout.ports.iter().filter(|(_, r)| near(r)) {
         sheet = sheet.child(cell_node(s, t, live, SchemSel::Port(name.clone()), *rect));
     }
@@ -1114,6 +1234,7 @@ fn schematic_canvas(s: &AppState, t: &VivadoTheme, live: &LiveNetlist, layout: &
             if (r[0] - s.schematic.canvas_at[0]).abs() > 0.5 || (r[1] - s.schematic.canvas_at[1]).abs() > 0.5 {
                 s.schematic.canvas_at = [r[0], r[1]];
             }
+            fit_on_open(s);
         })
         .child(sheet)
 }
@@ -1408,6 +1529,69 @@ mod tests {
     }
 
     #[test]
+    fn a_blocks_wires_end_on_its_outline_when_collapsed_and_reach_its_cell_when_expanded() {
+        let mut s = init();
+        crate::live::seed_live_fixture(&mut s).expect("fixture must seed");
+        let live = schematic_netlist(&s).unwrap();
+        let mut st = SchematicState::new();
+        // A wire with exactly one end inside u_led crosses the block's outline.
+        let crossing = |w: &&SchemWire| (live.owner_of(&w.ends.0) == Some("u_led")) != (live.owner_of(&w.ends.1) == Some("u_led"));
+        let on_edge = |p: [f32; 2], r: [f32; 4]| ((p[0] - r[0]).abs() < 0.01 || (p[0] - r[0] - r[2]).abs() < 0.01) && p[1] > r[1] && p[1] < r[1] + r[3];
+        let open = SchemLayout::of(&live, &st);
+        let w = open.wires.iter().find(crossing).expect("a net crosses u_led");
+        let into = live.owner_of(&w.ends.1) == Some("u_led");
+        let (inside, tip, stub) = if into { (&w.ends.1, w.pts[w.pts.len() - 1], w.tail) } else { (&w.ends.0, w.pts[0], w.head) };
+        assert!(stub > 0, "an expanded block's wire has a leg inside it");
+        assert!(on_edge(tip, open.cells[inside]), "the wire reaches the cell {inside}: {tip:?}");
+        let at_outline = if into { w.pts[w.pts.len() - 1 - stub] } else { w.pts[stub] };
+        assert!(on_edge(at_outline, open.blocks["u_led"]), "the leg starts on the block outline");
+        st.toggle("u_led");
+        let shut = SchemLayout::of(&live, &st);
+        let w = shut.wires.iter().find(crossing).expect("a collapsed block keeps its outside nets");
+        assert_eq!((w.head, w.tail), (0, 0));
+        let tip = if into { w.pts[w.pts.len() - 1] } else { w.pts[0] };
+        assert!(on_edge(tip, shut.blocks["u_led"]), "the wire ends on the collapsed block: {tip:?}");
+        assert!(st.wire_visible(&live, &shut, w) || !matches!(w.level, NetLevel::Backbone), "a backbone net into a collapsed block draws");
+    }
+
+    #[test]
+    fn the_sheet_widens_with_the_logic_depth_and_holds_every_rect() {
+        let mut s = init();
+        crate::live::seed_live_fixture(&mut s).expect("fixture must seed");
+        let live = schematic_netlist(&s).unwrap();
+        let layout = SchemLayout::of(&live, &SchematicState::new());
+        assert!(layout.world_w >= WORLD_W);
+        for r in layout.cells.values().chain(layout.ports.values()).chain(layout.blocks.values()) {
+            assert!(r[0] >= 0.0 && r[0] + r[2] <= layout.world_w && r[1] >= 0.0 && r[1] + r[3] <= layout.world_h, "rect on the sheet: {r:?}");
+        }
+        for w in &layout.wires {
+            for p in &w.pts {
+                assert!(p[0] >= 0.0 && p[0] <= layout.world_w && p[1] >= 0.0 && p[1] <= layout.world_h, "wire {} on the sheet: {p:?}", w.name);
+            }
+        }
+    }
+
+    #[test]
+    fn a_sheet_wider_than_its_canvas_opens_fitted_and_a_chosen_zoom_stays() {
+        let mut rt = harness_with(schem_state());
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+        let st = &rt.state.schematic;
+        let live = schematic_netlist(&rt.state).unwrap();
+        let sheet = SchemLayout::of(&live, st);
+        assert!(!st.fit_pending, "the first layout fits the sheet");
+        assert!(st.zoom <= 1.0, "opening never zooms in");
+        assert!(sheet.world_w * st.zoom <= st.viewport[0] + 0.5 && sheet.world_h * st.zoom <= st.viewport[1] + 0.5 || st.zoom <= ZOOM_MIN, "the whole sheet shows: zoom {}", st.zoom);
+        // A zoom chosen before the first layout (a scene, a restored session) is kept.
+        let mut chosen = schem_state();
+        chosen.schematic.zoom = 1.5;
+        let mut rt = harness_with(chosen);
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.schematic.zoom, 1.5);
+    }
+
+    #[test]
     fn empty_session_shows_the_reason_not_demo_cells() {
         let mut s = init();
         s.center = crate::state::CenterPane::Schematic;
@@ -1522,8 +1706,11 @@ mod tests {
     fn zoom_steps_change_lod() {
         let mut rt = harness_with(schem_state());
         rt.frame(0.0);
+        // The sheet fits itself on its first layout; step from there.
+        rt.frame(1.0 / 60.0);
+        let opened = rt.state.schematic.zoom;
         tap(&mut rt, "schematic-zoom-in");
-        assert!(rt.state.schematic.zoom > 1.0);
+        assert!(rt.state.schematic.zoom > opened);
         for _ in 0..6 {
             tap(&mut rt, "schematic-zoom-out");
         }

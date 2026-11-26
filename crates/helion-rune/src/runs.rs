@@ -946,6 +946,7 @@ pub fn apply_artifacts(s: &mut AppState, art: RunArtifacts) {
         s.runs.impl_view = Some(v);
         if let Some(live) = s.schematic.stage.and(crate::live::schematic_netlist(s)) {
             s.schematic.set_all(&live, false);
+            crate::views::schematic::refit(s);
         }
     }
     if !art.part.is_empty() {

@@ -53,6 +53,7 @@ pub mod reports;
 pub mod runs_table;
 pub mod schematic;
 pub mod schematic_cone;
+pub mod schematic_flow;
 pub mod sim_settings;
 pub mod sources;
 pub mod start;
