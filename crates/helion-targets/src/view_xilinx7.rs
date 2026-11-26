@@ -36,7 +36,7 @@ use helion_xilinx7::xdc_flow::Built;
 
 use crate::Family;
 use crate::view::{
-    CellPlacement, ClockNet, ClockUtilization, ControlSet, DrcViolation, EndpointSlack,
+    CellPlacement, ClockNet, ClockUtilization, CongestionWindow, ControlSet, DrcViolation, EndpointSlack,
     HighFanoutNet, ImplView, IoPin, IoPlan, Overflow, Provenance, ResourceRow, RoutedNet, Stage, TileClass,
     TileUsage, TimingPath, TimingSummary, ViewTile, WireHop,
 };
@@ -378,6 +378,54 @@ pub fn fill_usage(view: &mut ImplView, routed: &Routed7, dev: &Device) {
         Provenance::new(
             "helion-xilinx7 route",
             "occupied sites per tile; PIP-driven wires per tile counted by direction (E/W horizontal, N/S vertical) against the tile type's wires of that direction, not clamped",
+            SCOPE,
+        ),
+    );
+}
+
+/// Window threshold for the congestion level. shortcut: Vivado's placed
+/// threshold is not recovered (DECOMPILE_NOTES 3.3, 9); 85% is the floor the
+/// routed table of the hotspot capture states ("less than 85% congestion are
+/// not reported"), and that capture's levels (0 at 71-85% single tiles, 3
+/// at 88%, 4 at 98%) are consistent with it. Upgrade when the cut-point is
+/// recovered.
+pub const CONGESTION_THRESHOLD_PCT: f32 = 85.0;
+
+/// `X`/`Y` of a 7-series tile name (`INT_L_X26Y0` -> `(26, 0)`).
+fn tile_index(name: &str) -> Option<(u32, u32)> {
+    let (_, xy) = name.rsplit_once("_X")?;
+    let (x, y) = xy.split_once('Y')?;
+    Some((x.parse().ok()?, y.parse().ok()?))
+}
+
+/// Congestion levels per direction over the interconnect tiles, on the
+/// `INT_*_XnYm` grid (one interconnect tile per CLB column and row, the unit
+/// Vivado's windows use).
+pub fn fill_congestion(view: &mut ImplView) {
+    let name_at: HashMap<(u32, u32), &str> = view.tiles.iter().map(|t| ((t.x, t.y), t.name.as_str())).collect();
+    let mut h: BTreeMap<(u32, u32), (u32, u32)> = BTreeMap::new();
+    let mut v: BTreeMap<(u32, u32), (u32, u32)> = BTreeMap::new();
+    let mut int_name: HashMap<(u32, u32), &str> = HashMap::new();
+    for u in &view.usage {
+        let (Some(o), Some(name)) = (u.overflow, name_at.get(&(u.x, u.y))) else { continue };
+        let Some(xy) = name.starts_with("INT_").then(|| tile_index(name)).flatten() else { continue };
+        h.insert(xy, (o.h_used, o.h_capacity));
+        v.insert(xy, (o.v_used, o.v_capacity));
+        int_name.insert(xy, name);
+    }
+    let corner = |x: u32, y: u32| int_name.get(&(x, y)).map(|s| s.to_string()).unwrap_or_else(|| format!("INT_X{x}Y{y}"));
+    view.congestion = [("Horizontal", &h), ("Vertical", &v)]
+        .into_iter()
+        .filter_map(|(dir, g)| {
+            let (level, percent, (x0, y0, x1, y1)) = crate::view::congestion_level(g, CONGESTION_THRESHOLD_PCT, 7)?;
+            Some(CongestionWindow { direction: dir, level, percent, from_tile: corner(x0, y0), to_tile: corner(x1, y1), overlap: percent > 100.0 })
+        })
+        .collect();
+    view.set_provenance(
+        "congestion",
+        Provenance::new(
+            "helion-xilinx7 route",
+            format!("routed wires per interconnect tile by direction against the tile's wires of that direction; level = largest 2^l x 2^l tile window (l <= 7) whose summed use over summed capacity reaches {CONGESTION_THRESHOLD_PCT}% (threshold from the hotspot capture's routed-table floor; Vivado's own cut-point is not recovered), level 0 reports the hottest single tile; H covers East/West and V North/South, Vivado splits them four ways"),
             SCOPE,
         ),
     );
@@ -749,6 +797,7 @@ pub fn from_built(b: &Built) -> ImplView {
     fill_nets(&mut v, &b.routed);
     fill_usage(&mut v, &b.routed, dev);
     fill_resources(&mut v, &b.routed, dev);
+    fill_congestion(&mut v);
     fill_timing(&mut v, &b.timing, dev);
     fill_io(&mut v, &b.routed, &b.design, dev);
     let (clocks, by_region) = clock_nets(&v, &b.routed, &b.periods);
@@ -851,6 +900,13 @@ mod tests {
         assert_eq!(v.len(), 1, "{v:?}");
         assert_eq!(v[0].0, "BIVC-1");
         assert!(v[0].2.contains("bank 33") && v[0].2.contains("3.3 V: a") && v[0].2.contains("1.8 V: b"), "{}", v[0].2);
+    }
+
+    #[test]
+    fn tile_index_reads_the_name_suffix() {
+        assert_eq!(tile_index("INT_L_X26Y0"), Some((26, 0)));
+        assert_eq!(tile_index("INT_R_X41Y149"), Some((41, 149)));
+        assert_eq!(tile_index("INT_L"), None);
     }
 
     #[test]

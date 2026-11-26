@@ -253,6 +253,75 @@ pub struct ResourceRow {
     pub available: u32,
 }
 
+/// The congestion level of one routing direction, as Vivado's "Maximum
+/// Level Congestion" table states it: the side of the largest square
+/// window (`2^level` tiles) whose average use reaches the threshold, that
+/// window's average, and its corner tiles. Level 0 means no window of two
+/// tiles or more reaches it; the window is then the hottest single tile.
+/// Distinct from the per-tile value on purpose (DECOMPILE_NOTES 14.2).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CongestionWindow {
+    /// `"Horizontal"` (east/west wires) or `"Vertical"` (north/south).
+    pub direction: &'static str,
+    pub level: u8,
+    /// Window average use, percent; may exceed 100.
+    pub percent: f32,
+    pub from_tile: String,
+    pub to_tile: String,
+    /// The window is over capacity (above 100%).
+    pub overlap: bool,
+}
+
+/// Find the congestion level over a grid of `(used, capacity)` per
+/// `(x, y)`: for each window side `2^l`, `l` in `1..=max_level`, the window
+/// with the highest average (summed use over summed capacity) anywhere on
+/// the grid; the level is the largest `l` whose best window reaches
+/// `threshold_pct`. Returns `(level, percent, (x0, y0, x1, y1))`, or None
+/// for an empty grid.
+pub fn congestion_level(grid: &BTreeMap<(u32, u32), (u32, u32)>, threshold_pct: f32, max_level: u8) -> Option<(u8, f32, (u32, u32, u32, u32))> {
+    let pct = |u: u64, c: u64| if c == 0 { 0.0 } else { 100.0 * u as f32 / c as f32 };
+    let hottest = grid
+        .iter()
+        .filter(|(_, v)| v.1 > 0)
+        .map(|(&(x, y), &(u, c))| (pct(u as u64, c as u64), (x, y, x, y)))
+        .max_by(|a, b| a.0.total_cmp(&b.0))?;
+    let w = grid.keys().map(|k| k.0).max()? as usize + 1;
+    let h = grid.keys().map(|k| k.1).max()? as usize + 1;
+    // 2-D prefix sums of use and capacity.
+    let mut su = vec![0u64; (w + 1) * (h + 1)];
+    let mut sc = su.clone();
+    let at = |x: usize, y: usize| y * (w + 1) + x;
+    for y in 0..h {
+        for x in 0..w {
+            let (u, c) = grid.get(&(x as u32, y as u32)).copied().unwrap_or((0, 0));
+            su[at(x + 1, y + 1)] = u as u64 + su[at(x, y + 1)] + su[at(x + 1, y)] - su[at(x, y)];
+            sc[at(x + 1, y + 1)] = c as u64 + sc[at(x, y + 1)] + sc[at(x + 1, y)] - sc[at(x, y)];
+        }
+    }
+    let rect = |s: &Vec<u64>, x0: usize, y0: usize, n: usize| s[at(x0 + n, y0 + n)] + s[at(x0, y0)] - s[at(x0 + n, y0)] - s[at(x0, y0 + n)];
+    let mut best = (0u8, hottest.0, hottest.1);
+    for l in 1..=max_level {
+        let n = 1usize << l;
+        if n > w || n > h {
+            break;
+        }
+        let mut top: Option<(f32, (u32, u32, u32, u32))> = None;
+        for y0 in 0..=h - n {
+            for x0 in 0..=w - n {
+                let p = pct(rect(&su, x0, y0, n), rect(&sc, x0, y0, n));
+                if top.is_none_or(|t| p > t.0) {
+                    top = Some((p, (x0 as u32, y0 as u32, (x0 + n - 1) as u32, (y0 + n - 1) as u32)));
+                }
+            }
+        }
+        match top {
+            Some((p, win)) if p >= threshold_pct => best = (l, p, win),
+            _ => {}
+        }
+    }
+    Some(best)
+}
+
 /// Slack at one timing endpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EndpointSlack {
@@ -457,6 +526,8 @@ pub struct ImplView {
     pub usage: Vec<TileUsage>,
     /// Utilization rows in the family's vendor terms.
     pub resources: Vec<ResourceRow>,
+    /// Congestion level per routing direction.
+    pub congestion: Vec<CongestionWindow>,
     /// Timing summary, when the run has timing.
     pub timing: Option<TimingSummary>,
     /// Clock utilization.
@@ -499,6 +570,7 @@ impl ImplView {
             nets: Vec::new(),
             usage: Vec::new(),
             resources: Vec::new(),
+            congestion: Vec::new(),
             timing: None,
             clocks: None,
             io: None,
@@ -691,6 +763,35 @@ mod tests {
         let (tile, pct) = v.hottest_tile().expect("a hot tile");
         assert_eq!((tile.x, tile.y), (1, 0));
         assert_eq!(pct, 130.0);
+    }
+
+    #[test]
+    fn congestion_level_is_the_largest_window_at_threshold_not_the_hottest_tile() {
+        // A lone 150% tile is level 0; a 4x4 block at 90% is level 2 even
+        // though no tile in it is as hot as the lone one.
+        let mut g = BTreeMap::new();
+        for x in 0..16 {
+            for y in 0..16 {
+                g.insert((x, y), (10, 100));
+            }
+        }
+        g.insert((0, 0), (150, 100));
+        assert_eq!(congestion_level(&g, 85.0, 6), Some((0, 150.0, (0, 0, 0, 0))));
+        for x in 8..12 {
+            for y in 4..8 {
+                g.insert((x, y), (90, 100));
+            }
+        }
+        let (level, pct, win) = congestion_level(&g, 85.0, 6).unwrap();
+        assert_eq!((level, pct, win), (2, 90.0, (8, 4, 11, 7)));
+        // Over capacity across the window: the percentage passes 100.
+        for x in 8..12 {
+            for y in 4..8 {
+                g.insert((x, y), (130, 100));
+            }
+        }
+        assert_eq!(congestion_level(&g, 85.0, 6).unwrap().1, 130.0);
+        assert_eq!(congestion_level(&BTreeMap::new(), 85.0, 6), None);
     }
 
     #[test]

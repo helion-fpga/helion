@@ -442,7 +442,24 @@ fn design_analysis(view: &ImplView) -> Panel {
             tbl.push(&["Hottest tile", "no routed occupancy in this run"]);
         }
     }
-    Panel::table(Report::DesignAnalysis.title(), tbl)
+    for c in &view.congestion {
+        tbl.push(&[
+            &format!("Congestion level ({})", c.direction),
+            &format!(
+                "level {}, {:.0}% in window ({}, {}){}",
+                c.level,
+                c.percent,
+                c.from_tile,
+                c.to_tile,
+                if c.overlap { ", over capacity" } else { "" }
+            ),
+        ]);
+    }
+    let mut p = Panel::table(Report::DesignAnalysis.title(), tbl);
+    if let Some(n) = provenance_note(view, "congestion") {
+        p = p.with_note(n);
+    }
+    p
 }
 
 fn clock_utilization(view: &ImplView) -> Panel {
