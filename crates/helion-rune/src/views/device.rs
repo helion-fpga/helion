@@ -207,6 +207,8 @@ pub struct DeviceState {
     pub pblocks_from: Option<std::path::PathBuf>,
     /// Bottom panel tab (I/O Ports or Pblocks).
     pub bottom: DeviceBottom,
+    /// Heat map painted over a contract-driven die (`None` = off).
+    pub view_heat: Option<crate::views::contract_views::HeatMap>,
 }
 
 impl Default for DeviceState {
@@ -225,6 +227,7 @@ impl Default for DeviceState {
             pblock_sel: None,
             pblocks_from: None,
             bottom: DeviceBottom::IoPorts,
+            view_heat: None,
         }
     }
 }

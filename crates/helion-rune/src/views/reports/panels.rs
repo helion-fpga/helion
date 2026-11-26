@@ -47,6 +47,7 @@ pub fn report_ready(s: &AppState, nav: ReportNav) -> bool {
         }
         // I/O pages always mount: they show their own result or reason.
         ReportNav::ClockUtil | ReportNav::ControlSets | ReportNav::Ssn | ReportNav::Ibis => true,
+        ReportNav::ImplView => s.runs.impl_view.is_some(),
     }
 }
 
@@ -81,6 +82,17 @@ pub fn action_bar(s: &AppState, nav: ReportNav, t: &VivadoTheme) -> El {
             )
             .child(el().grow(1.0))
             .child(button);
+    }
+    if nav == ReportNav::ImplView {
+        // Read-only: the reports are the run's own contract, re-run by
+        // running implementation again.
+        let line = s.runs.impl_view.as_ref().map(|v| format!("{} {} · {}", v.family.label(), v.part, v.stage.label())).unwrap_or_default();
+        return row()
+            .key("reports-actions")
+            .w_full()
+            .h(28.0)
+            .items_center()
+            .child(text(line).font(VivadoTheme::FONT_UI).color(t.text_dim).truncate().key("reports-stage"));
     }
     let design_missing =
         (s.tcl.design.is_none() && s.runs.live_design.is_none()).then_some("Run Synthesis first");
@@ -120,8 +132,8 @@ pub fn action_bar(s: &AppState, nav: ReportNav, t: &VivadoTheme) -> El {
             design_missing,
             "Evaluated on the elaborated design".to_string(),
         ),
-        // Handled by the early return above.
-        ReportNav::ClockUtil | ReportNav::ControlSets | ReportNav::Ssn | ReportNav::Ibis => {
+        // Handled by the early returns above.
+        ReportNav::ClockUtil | ReportNav::ControlSets | ReportNav::Ssn | ReportNav::Ibis | ReportNav::ImplView => {
             ("", "reports-action-io", None, String::new())
         }
     };
@@ -170,6 +182,15 @@ pub fn not_ready(s: &AppState, nav: ReportNav, t: &VivadoTheme) -> El {
             None,
             t,
         )
+    } else if nav == ReportNav::ImplView {
+        kit::empty_state(
+            "reports-cta",
+            "The implemented-design reports appear after a 7-series implementation run.",
+            Some(kit::link("reports-run-impl", "Run Implementation", t, |s: &mut AppState| {
+                crate::runs::launch(s, crate::runs::RunKind::Impl)
+            })),
+            t,
+        )
     } else if crate::views::device_family::is_family_part(&s.project.part) {
         // These reports read Helion's HL10 device model; a rerun can't fill them (G86).
         let sentence = format!(
@@ -202,7 +223,7 @@ pub fn not_ready(s: &AppState, nav: ReportNav, t: &VivadoTheme) -> El {
                 synth_link(t),
             ),
             ReportNav::Qor => ("QoR needs a synthesized design.", synth_link(t)),
-            ReportNav::ClockUtil | ReportNav::ControlSets | ReportNav::Ssn | ReportNav::Ibis => {
+            ReportNav::ClockUtil | ReportNav::ControlSets | ReportNav::Ssn | ReportNav::Ibis | ReportNav::ImplView => {
                 ("This report needs an implemented design.", synth_link(t))
             }
         };
@@ -577,4 +598,44 @@ pub fn qor_detail(s: &AppState, snap: &QorSnapshot, t: &VivadoTheme) -> El {
             t,
         ),
     }
+}
+
+/// Implemented Design: every report of the run's view contract
+/// ([`crate::views::contract_views::all_reports`]), each with its engine and
+/// method note, or the named reason it could not be computed.
+pub fn impl_view_body(s: &AppState, t: &VivadoTheme) -> El {
+    use crate::views::contract_views::{self as cv, PanelBody};
+    let Some(view) = s.runs.impl_view.as_ref() else {
+        return col();
+    };
+    let mut body = col().key("reports-impl-view").w_full().gap(12.0);
+    for (i, p) in cv::all_reports(view).into_iter().enumerate() {
+        let mut sec = col().key(format!("reports-impl-view-{i}")).w_full().gap(4.0).child(kit::section_title(p.title.clone(), t));
+        if let Some(n) = &p.note {
+            sec = sec.child(kit::wrap_value(n.clone(), t.text_dim));
+        }
+        sec = sec.child(match &p.body {
+            PanelBody::Missing(why) => kit::wrap_value(format!("Not computed: {why}"), t.warn),
+            PanelBody::Table(tb) => {
+                let mut head = header_row(t);
+                for c in &tb.columns {
+                    head = head.child(kit::text_cell(c.clone(), 1.0, t.text_dim));
+                }
+                let mut rows = col().w_full();
+                for (r, cells) in tb.rows.iter().enumerate() {
+                    let mut line = plain_row(format!("reports-impl-view-{i}-{r}"));
+                    for c in cells {
+                        line = line.child(kit::text_cell(c.clone(), 1.0, t.text));
+                    }
+                    rows = rows.child(line);
+                }
+                if tb.rows.is_empty() {
+                    rows = rows.child(plain_row(format!("reports-impl-view-{i}-none")).child(kit::text_cell("none", 1.0, t.text_dim)));
+                }
+                table(head, rows, t)
+            }
+        });
+        body = body.child(sec);
+    }
+    body
 }

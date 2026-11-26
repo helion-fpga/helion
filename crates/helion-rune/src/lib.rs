@@ -811,6 +811,20 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         s.center = state::CenterPane::Timing;
         let _ = runs_family::seed_family_fixture(s, "ice40-hx8k");
     }),
+    ("device-xc7z020", |s| {
+        // Real ZedBoard implementation of examples/zedboard_blinky.prj drawn
+        // from its view contract, routing and H congestion on (needs the
+        // zynq7 X-Ray database; without it the die reads as not loaded).
+        s.center = state::CenterPane::Device;
+        let _ = runs_family::seed_xilinx7_view_fixture(s);
+        s.device.layers.nets = true;
+        s.device.view_heat = Some(views::contract_views::HeatMap::CongestionH);
+    }),
+    ("reports-xc7z020", |s| {
+        s.center = state::CenterPane::Reports;
+        let _ = runs_family::seed_xilinx7_view_fixture(s);
+        s.reports_view.selected = views::reports::ReportNav::ImplView;
+    }),
     ("hls-fir-cosim", |s| {
         // The FIR MAC kernel that used to read back 0 in co-simulation.
         s.hls.source = rune::TextEdit::new("void fir_mac(int a[4], int b[4], int bias, int *out) {\n  #pragma HLS PIPELINE II=1\n  #pragma HLS ARRAY_PARTITION variable=a complete\n  #pragma HLS ARRAY_PARTITION variable=b complete\n  int acc = bias;\n  for (int i = 0; i < 4; i++) {\n    acc += a[i] * b[i];\n  }\n  *out = acc;\n}\n");

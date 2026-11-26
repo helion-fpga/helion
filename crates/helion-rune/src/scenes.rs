@@ -1872,6 +1872,18 @@ pub const ALL: &[SceneExpect] = &[
         absent: &[],
     },
     SceneExpect {
+        name: "device-xc7z020",
+        surface: "device",
+        keys: &["device"],
+        absent: &["device-canvas"],
+    },
+    SceneExpect {
+        name: "reports-xc7z020",
+        surface: "reports",
+        keys: &["reports-pane", "reports-nav-impl-view"],
+        absent: &[],
+    },
+    SceneExpect {
         name: "hls-fir-cosim",
         surface: "hls",
         keys: &["hls", "hls-kpi-rtl", "hls-cosim-status", "hls-cosim-row-0", "hls-cosim-row-1"],

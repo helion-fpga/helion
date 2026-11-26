@@ -436,6 +436,27 @@ pub fn seed_family_fixture(s: &mut crate::state::AppState, part: &str) -> Result
     Ok(())
 }
 
+/// Scene fixture: the view contract of a real ZedBoard blinky implementation
+/// (`examples/zedboard_blinky.prj`), run once per process and shared, since
+/// the flow takes most of a minute.
+pub fn seed_xilinx7_view_fixture(s: &mut crate::state::AppState) -> Result<(), String> {
+    static VIEW: std::sync::OnceLock<Result<helion_targets::view::ImplView, String>> = std::sync::OnceLock::new();
+    let v = VIEW.get_or_init(|| {
+        if !helion_targets::zynq_db_present() {
+            return Err("no zynq7 X-Ray database".into());
+        }
+        let prj = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/zedboard_blinky.prj");
+        let dir = std::env::temp_dir().join(format!("helion-rune-view-fixture-{}", std::process::id()));
+        let art = run_xdc_flow(&prj, "xc7z020", &dir, &|_, _| {});
+        let _ = std::fs::remove_dir_all(&dir);
+        art?.view.ok_or_else(|| "the run produced no view".to_string())
+    });
+    s.project.part = helion_targets::ZEDBOARD_PART.to_string();
+    s.runs.impl_view = Some(v.clone()?);
+    s.flow.impl_run = crate::state::RunStatus::Complete;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -17,9 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use helion_targets::view::{
-    CellPlacement, ImplView, PowerEstimate, Stage, TileClass, TileUsage, TimingSummary,
-};
+use helion_targets::view::{CellPlacement, ImplView, Stage, TileClass};
 
 /// One rendered table: a header and rows of equal width.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
