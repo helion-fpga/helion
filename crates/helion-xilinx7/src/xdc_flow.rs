@@ -567,7 +567,7 @@ pub fn run(
     let mut prev: Option<(i32, i32)> = None;
     for st in &ta.worst_path {
         let est = match (prev, st.xy) {
-            (Some(a), Some(b)) if a != b && st.wire_ps > 0 => format!("{:>6.3}", crate::place_sa::wire_ps((a.0 - b.0).abs() + (a.1 - b.1).abs()) as f64 / 1000.0),
+            (Some(a), Some(b)) if a != b && st.wire_ps > 0 => format!("{:>6.3}", crate::place_sa::wire_ps(a.0 - b.0, a.1 - b.1) as f64 / 1000.0),
             _ => "     -".into(),
         };
         say!(log, "  {:>8.3} ns  wire {:>6.3} (placer est {est})  {}", st.arrival_ps as f64 / 1000.0, st.wire_ps as f64 / 1000.0, st.what);
