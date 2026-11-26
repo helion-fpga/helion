@@ -232,8 +232,8 @@ fn timing_summary(view: &ImplView) -> Panel {
     tbl.push(&["WNS (ns)", &fmt_ps(t.wns_ps)]);
     tbl.push(&["TNS (ns)", &fmt_ps(t.tns_ps)]);
     let hold_missing = || {
-        let why = view.missing.get("hold").map(String::as_str).unwrap_or("the engine reported no hold analysis");
-        format!("not computed: {why}")
+        let why = view.missing.get("hold").map(String::as_str).unwrap_or("the engine timed no hold endpoint");
+        format!("no value: {why}")
     };
     tbl.push(&["WHS (ns)", &t.whs_ps.map(fmt_ps).unwrap_or_else(hold_missing)]);
     tbl.push(&["THS (ns)", &t.ths_ps.map(fmt_ps).unwrap_or_else(hold_missing)]);
@@ -248,6 +248,10 @@ fn timing_summary(view: &ImplView) -> Panel {
         tbl.push(&["Worst path", &format!("{} -> {}", p.from, p.to)]);
         tbl.push(&["Worst path slack (ns)", &fmt_ps(p.slack_ps)]);
         tbl.push(&["Worst path requirement (ns)", &fmt_ps(p.requirement_ps)]);
+    }
+    if let Some(p) = &t.worst_hold_path {
+        tbl.push(&["Worst hold path", &format!("{} -> {}", p.from, p.to)]);
+        tbl.push(&["Worst hold path slack (ns)", &fmt_ps(p.slack_ps)]);
     }
     let mut p = Panel::table(Report::TimingSummary.title(), tbl);
     if let Some(n) = provenance_note(view, "timing") {

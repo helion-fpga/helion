@@ -386,7 +386,6 @@ pub fn fill_usage(view: &mut ImplView, routed: &Routed7, dev: &Device) {
 /// Fill the timing summary and per-endpoint slack from the run's setup
 /// analysis.
 pub fn fill_timing(view: &mut ImplView, analysis: &Analysis, dev: &Device) {
-    view.mark_missing("hold", "Helion's 7-series timing checks setup only; no hold analysis is run");
     if analysis.endpoints == 0 {
         view.mark_missing("timing", "no timed endpoint: no flop, LUT RAM, block RAM or DSP input is driven by clocked logic");
         return;
@@ -420,15 +419,27 @@ pub fn fill_timing(view: &mut ImplView, analysis: &Analysis, dev: &Device) {
         _ => None,
     };
     let fmax = analysis.fmax_mhz();
+    let h = &analysis.hold;
+    let worst_hold_path = match (h.worst_path.first(), h.worst_path.last()) {
+        (Some(f), Some(l)) => Some(TimingPath {
+            from: f.what.clone(),
+            to: l.what.clone(),
+            clock: h.clock.clone(),
+            slack_ps: h.whs_ps,
+            requirement_ps: 0,
+            kind: "hold",
+        }),
+        _ => None,
+    };
     view.timing = Some(TimingSummary {
         wns_ps: analysis.wns_ps,
         tns_ps: endpoints.iter().map(|e| e.slack_ps.min(0)).sum(),
-        whs_ps: None,
-        ths_ps: None,
+        whs_ps: (h.endpoints > 0).then_some(h.whs_ps),
+        ths_ps: (h.endpoints > 0).then_some(h.ths_ps),
         failing_endpoints: analysis.failing_endpoints,
         total_endpoints: analysis.endpoints,
         worst_path,
-        worst_hold_path: None,
+        worst_hold_path,
         endpoints,
         fmax_mhz: fmax.is_finite().then_some(fmax),
     });
@@ -436,7 +447,7 @@ pub fn fill_timing(view: &mut ImplView, analysis: &Analysis, dev: &Device) {
         "timing",
         Provenance::new(
             "helion-xilinx7 timing",
-            "setup analysis on routed wire delays and SDF cell delays at the XDC clock periods; IO paths unconstrained",
+            "setup: routed wire delays and X-Ray SDF slow-corner cell delays at the XDC clock periods, flat 400 ps margin for skew and uncertainty; hold: shortest path with X-Ray SDF fast-corner cell delays, routed wire delays scaled by the LUT fast/slow ratio 45/124, ideal clock (zero skew); IO paths unconstrained",
             SCOPE,
         ),
     );
