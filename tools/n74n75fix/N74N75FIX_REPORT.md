@@ -196,6 +196,14 @@ and checkers run (N34 trap), absolute `--workdir` and `--top` on verify-bit
 - `helion` 13,095,296 bytes, md5 `d3f4985a7d86f949de0df7ce94f879f6`
 - `helion-bitgen` 5,738,240 bytes, md5 `a1ed3100bbc32989f2f81a8f3535f359`
 
+Note: the `helion` size/md5 above is the plain `cargo build --release`
+value. The regrowth rebuild in section 6 produced a different `helion`
+(13,002,872 bytes, md5 `6a9d03ad84c8ccb177140a35aed1233b`) because the
+`cargo test --release` run rebuilt the bin in the test universe;
+`helion-bitgen` was not rebuilt by the test run and still matches
+`a1ed3100`. This is the same bin-vs-test universe effect as N78, and the
+same build-to-build variation already noted for the decoder in N73.
+
 ### Full suites: exit 0, ALL SUITES DONE
 
 `tools/ultra-bitgen/run-suites.sh --prune-target`, one invocation
