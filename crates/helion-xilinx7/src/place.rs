@@ -531,6 +531,29 @@ pub fn place_with_pools(
     device: &dyn DeviceQuery,
     pools: (Vec<(String, String)>, Vec<(String, String)>, Vec<(String, String)>),
 ) -> Result<Placed7, String> {
+    // Block RAMs and DSPs first go to the first free sites. Once the logic
+    // has settled around them, each one's site is chosen next to the logic
+    // it talks to, and the design is placed again with those sites (G99:
+    // 4-5 ns wires to RAMs and DSPs at 100 MHz).
+    let mut cur = place_hinted(packed, device, pools.clone(), &HashMap::new())?;
+    // `HELION_PLACE_NO_RESITE`: keep the first-fit sites (to compare).
+    let passes = if std::env::var("HELION_PLACE_NO_RESITE").is_ok() { 0 } else { 2 };
+    for _ in 0..passes {
+        let hint = hard_block_sites(&cur, device, &pools.0, &pools.2);
+        if hint.is_empty() {
+            break;
+        }
+        cur = place_hinted(packed, device, pools.clone(), &hint)?;
+    }
+    Ok(cur)
+}
+
+fn place_hinted(
+    packed: &Packed7,
+    device: &dyn DeviceQuery,
+    pools: (Vec<(String, String)>, Vec<(String, String)>, Vec<(String, String)>),
+    hint: &HashMap<String, (String, String)>,
+) -> Result<Placed7, String> {
     let (b18, b36, dsp_pool) = pools;
     let bram_pools = (b18, b36);
     let mut out = Placed7 {
@@ -648,10 +671,10 @@ pub fn place_with_pools(
     }
 
     // 2b. Block RAMs (RAMB18E1 and RAMB36E1) with column-aligned cascade placement.
-    place_brams(&packed.brams, &bram_pools, &mut used_sites, &mut out.brams)?;
+    place_brams(&packed.brams, &bram_pools, &mut used_sites, &mut out.brams, hint)?;
 
     // 2c. DSP48E1s with column-aligned PCOUT->PCIN / ACOUT->ACIN / BCOUT->BCIN cascade placement.
-    place_dsps(&packed.dsps, &dsp_pool, &mut used_sites, &mut out.dsps)?;
+    place_dsps(&packed.dsps, &dsp_pool, &mut used_sites, &mut out.dsps, hint)?;
 
     // 2c2. Drivers shared by many block RAMs/DSPs are copied per group of
     // blocks in a column (see `replicate_hard_block_drivers`); the logic
@@ -1189,6 +1212,96 @@ fn check_one_cell_per_bel(out: &Placed7) -> Result<(), String> {
 
 /// Move each `*_rep{g}` lone cell to the free slice nearest its group's blocks,
 /// preferring the group's dominant column. Run after annealing.
+/// The site each RAMB18 and DSP48 without a cascade should take: the free
+/// site of its kind nearest the centre of the slices it connects to, the
+/// most connected block choosing first. Empty when no block would move.
+fn hard_block_sites(out: &Placed7, device: &dyn DeviceQuery, b18: &[(String, String)], dsp: &[(String, String)]) -> HashMap<String, (String, String)> {
+    // Nets with more slice pins than this (clocks, resets, enables) say
+    // nothing about where a block belongs.
+    const MAX_PINS: usize = 64;
+    let mut at: HashMap<&str, Vec<(i32, i32)>> = HashMap::new();
+    let lut_tile: HashMap<&str, &str> = out.luts.iter().map(|l| (l.name.as_str(), l.tile.as_str())).collect();
+    let ff_tile: HashMap<&str, &str> = out.ffs.iter().map(|f| (f.name.as_str(), f.tile.as_str())).collect();
+    for l in &out.packed.luts {
+        let Some(xy) = lut_tile.get(l.name.as_str()).and_then(|t| device.tile_xy(t)) else { continue };
+        for n in l.input_nets.iter().flatten().chain(std::iter::once(&l.output_net)) {
+            at.entry(n.as_str()).or_default().push(xy);
+        }
+    }
+    for f in &out.packed.ffs {
+        let Some(xy) = ff_tile.get(f.name.as_str()).and_then(|t| device.tile_xy(t)) else { continue };
+        for n in [&f.d_net, &f.q_net] {
+            at.entry(n.as_str()).or_default().push(xy);
+        }
+    }
+    let base = |n: &str| -> String {
+        match n.rsplit_once("_rep") {
+            Some((b, g)) if !g.is_empty() && g.bytes().all(|c| c.is_ascii_digit()) => b.to_string(),
+            _ => n.to_string(),
+        }
+    };
+    let centre = |pins: &[(String, String, bool)]| -> Option<(i64, (i32, i32))> {
+        let (mut sx, mut sy, mut k) = (0i64, 0i64, 0i64);
+        for (_, net, _) in pins {
+            // A copy sits beside the block's old site: the logic is on the original net.
+            let Some(p) = at.get(base(net).as_str()).filter(|p| p.len() <= MAX_PINS) else { continue };
+            for &(x, y) in p {
+                sx += x as i64;
+                sy += y as i64;
+                k += 1;
+            }
+        }
+        (k > 0).then(|| (k, ((sx / k) as i32, (sy / k) as i32)))
+    };
+    // (name, is dsp, current site, weight, centre)
+    let mut todo: Vec<(&str, bool, &str, i64, (i32, i32))> = Vec::new();
+    for b in &out.brams {
+        let Some(pb) = out.packed.brams.iter().find(|p| p.name == b.name) else { continue };
+        let cascaded = pb.cascade_in_a.is_some() || pb.cascade_out_a.is_some() || pb.cascade_in_b.is_some() || pb.cascade_out_b.is_some();
+        if let (true, Some((k, c))) = (pb.kind == BramKind::Ramb18e1 && !cascaded, centre(&pb.pins)) {
+            todo.push((&b.name, false, &b.site, k, c));
+        }
+    }
+    for d in &out.dsps {
+        let Some(pd) = out.packed.dsps.iter().find(|p| p.name == d.name) else { continue };
+        let cascaded = [&pd.pcin_net, &pd.pcout_net, &pd.acin_net, &pd.acout_net, &pd.bcin_net, &pd.bcout_net, &pd.carrycascin_net, &pd.carrycascout_net].iter().any(|n| n.is_some());
+        if let (false, Some((k, c))) = (cascaded, centre(&pd.pins)) {
+            todo.push((&d.name, true, &d.site, k, c));
+        }
+    }
+    let mut taken: HashSet<String> = out.brams.iter().map(|b| b.site.clone()).chain(out.dsps.iter().map(|d| d.site.clone())).collect();
+    // A RAMB36 holds both RAMB18 sites of its tile.
+    for b in &out.brams {
+        if let (true, Some((x, y))) = (b.site.starts_with("RAMB36_"), parse_site_xy(&b.site)) {
+            taken.insert(format!("RAMB18_X{x}Y{}", y * 2));
+            taken.insert(format!("RAMB18_X{x}Y{}", y * 2 + 1));
+        }
+    }
+    for t in &todo {
+        taken.remove(t.2);
+    }
+    todo.sort_by_key(|t| (-t.3, t.0));
+    let mut sites = HashMap::new();
+    let mut moved = false;
+    for (name, is_dsp, cur, _, (cx, cy)) in todo {
+        let pool = if is_dsp { dsp } else { b18 };
+        let best = pool
+            .iter()
+            .filter(|(_, s)| !taken.contains(s))
+            .filter_map(|(t, s)| device.tile_xy(t).map(|(x, y)| ((x - cx).abs() + (y - cy).abs(), t, s)))
+            .min_by_key(|(d, _, s)| (*d, s.as_str()));
+        let Some((_, t, s)) = best else { continue };
+        taken.insert(s.clone());
+        moved |= s != cur;
+        sites.insert(name.to_string(), (t.clone(), s.clone()));
+    }
+    if moved {
+        sites
+    } else {
+        HashMap::new()
+    }
+}
+
 fn reseat_hard_block_copies(out: &mut Placed7, device: &dyn DeviceQuery) {
     let groups = out.packed.copy_groups.clone();
     if groups.is_empty() {
@@ -1275,9 +1388,19 @@ fn place_brams(
     pools: &(Vec<(String, String)>, Vec<(String, String)>),
     used_sites: &mut HashSet<String>,
     out_brams: &mut Vec<PlacedBram>,
+    hint: &HashMap<String, (String, String)>,
 ) -> Result<(), String> {
     if brams.is_empty() {
         return Ok(());
+    }
+    // Hinted sites are reserved for their blocks before anything is placed.
+    for b in brams {
+        if let Some((_, site)) = hint.get(&b.name) {
+            used_sites.insert(site.clone());
+            if let Some((x, y)) = parse_site_xy(site) {
+                used_sites.insert(format!("RAMB36_X{x}Y{}", y / 2));
+            }
+        }
     }
     let (ramb18_pool, ramb36_pool) = pools;
 
@@ -1330,7 +1453,8 @@ fn place_brams(
 
         let is_36 = brams[start].kind == BramKind::Ramb36e1;
         let pool = if is_36 { ramb36_pool } else { ramb18_pool };
-        let window = find_column_window(pool, chain.len(), used_sites).ok_or_else(|| {
+        let hinted = hint.get(&brams[start].name).filter(|_| chain.len() == 1).cloned();
+        let window = hinted.map(|h| vec![h]).or_else(|| find_column_window(pool, chain.len(), used_sites)).ok_or_else(|| {
             format!(
                 "place: no contiguous {:?} column of length {} for {}",
                 brams[start].kind,
@@ -1378,9 +1502,15 @@ fn place_dsps(
     pool: &[(String, String)],
     used_sites: &mut HashSet<String>,
     out_dsps: &mut Vec<PlacedDsp>,
+    hint: &HashMap<String, (String, String)>,
 ) -> Result<(), String> {
     if dsps.is_empty() {
         return Ok(());
+    }
+    for d in dsps {
+        if let Some((_, site)) = hint.get(&d.name) {
+            used_sites.insert(site.clone());
+        }
     }
     let mut pcout_map: HashMap<&str, usize> = HashMap::new();
     let mut acout_map: HashMap<&str, usize> = HashMap::new();
@@ -1438,7 +1568,8 @@ fn place_dsps(
             chain.push(nxt);
             cur = nxt;
         }
-        let window = find_column_window(pool, chain.len(), used_sites).ok_or_else(|| {
+        let hinted = hint.get(&dsps[start].name).filter(|_| chain.len() == 1).cloned();
+        let window = hinted.map(|h| vec![h]).or_else(|| find_column_window(pool, chain.len(), used_sites)).ok_or_else(|| {
             format!(
                 "place: no contiguous DSP48E1 column of length {} for {}",
                 chain.len(),
