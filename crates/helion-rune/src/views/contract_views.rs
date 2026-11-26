@@ -927,7 +927,7 @@ pub fn usage_summary(view: &ImplView) -> String {
 mod tests {
     use super::*;
     use helion_targets::Family;
-    use helion_targets::view::{Overflow, Provenance, TimingPath};
+    use helion_targets::view::{Overflow, Provenance, TileUsage, TimingPath, TimingSummary};
 
     fn sample() -> ImplView {
         let mut v = ImplView::empty(Family::Xilinx7, "xc7z020clg484-1", Stage::Routed);
