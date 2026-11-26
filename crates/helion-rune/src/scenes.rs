@@ -1878,6 +1878,24 @@ pub const ALL: &[SceneExpect] = &[
         absent: &["device-canvas"],
     },
     SceneExpect {
+        name: "schematic-xc7z020-rtl",
+        surface: "schematic",
+        keys: &["schematic", "schematic-toolbar", "schematic-stages"],
+        absent: &[],
+    },
+    SceneExpect {
+        name: "schematic-xc7z020-impl",
+        surface: "schematic",
+        keys: &["schematic", "schematic-stages"],
+        absent: &[],
+    },
+    SceneExpect {
+        name: "board-xc7z020",
+        surface: "device",
+        keys: &["device"],
+        absent: &["device-canvas"],
+    },
+    SceneExpect {
         name: "reports-xc7z020",
         surface: "reports",
         keys: &["reports-pane", "reports-nav-impl-view"],

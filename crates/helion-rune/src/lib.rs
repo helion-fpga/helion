@@ -820,6 +820,26 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         s.device.layers.nets = true;
         s.device.view_heat = Some(views::contract_views::HeatMap::CongestionH);
     }),
+    ("schematic-xc7z020-rtl", |s| {
+        // The elaborated netlist of a real ZedBoard blinky run (v2 front end).
+        s.center = state::CenterPane::Schematic;
+        let _ = runs_family::seed_xilinx7_view_fixture(s);
+        views::schematic::set_stage(s, helion_targets::view::NetlistStage::Rtl);
+    }),
+    ("schematic-xc7z020-impl", |s| {
+        // The same run's implemented netlist: a flop selected shows its site.
+        s.center = state::CenterPane::Schematic;
+        let _ = runs_family::seed_xilinx7_view_fixture(s);
+        views::schematic::set_stage(s, helion_targets::view::NetlistStage::Implemented);
+        let ff = s.runs.impl_view.as_ref().and_then(|v| v.netlist(helion_targets::view::NetlistStage::Implemented)?.cells.iter().find(|c| c.kind.starts_with("FD") && c.site.is_some()).map(|c| c.name.clone()));
+        s.schematic.selected = ff.map(views::schematic::SchemSel::Cell);
+    }),
+    ("board-xc7z020", |s| {
+        // The ZedBoard panel of the blinky run: clock and eight LEDs used.
+        s.center = state::CenterPane::Device;
+        let _ = runs_family::seed_xilinx7_view_fixture(s);
+        s.device.view_board = true;
+    }),
     ("reports-xc7z020", |s| {
         s.center = state::CenterPane::Reports;
         let _ = runs_family::seed_xilinx7_view_fixture(s);

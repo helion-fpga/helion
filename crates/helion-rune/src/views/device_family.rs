@@ -223,7 +223,109 @@ fn view_controls(s: &AppState, t: &VivadoTheme) -> El {
     for (mode, label, key) in modes {
         r = r.child(cad::tab(key, label, s.device.view_heat == mode, t, move |s: &mut AppState| s.device.view_heat = mode));
     }
-    r
+    r.child(el().w(1.0).h(16.0).fill(t.border))
+        .child(cad::tab("device-view-board", "Board", s.device.view_board, t, |s: &mut AppState| s.device.view_board = !s.device.view_board))
+}
+
+/// Where each board group sits on the board picture, as fractions of the
+/// board outline (x, y, w, h), and its items per row.
+// shortcut: one ZedBoard-like arrangement for every board; a board with another layout draws its groups in the same places.
+fn board_slot(kind: &str) -> ([f32; 4], usize) {
+    match kind {
+        "Clock" => ([0.03, 0.42, 0.12, 0.12], 1),
+        "HDMI" => ([0.03, 0.04, 0.30, 0.22], 6),
+        "VGA" => ([0.35, 0.04, 0.22, 0.22], 4),
+        "Audio" => ([0.59, 0.04, 0.16, 0.22], 4),
+        "OLED" => ([0.30, 0.32, 0.26, 0.16], 3),
+        "LED" => ([0.20, 0.62, 0.46, 0.10], 8),
+        "Switch" => ([0.20, 0.80, 0.46, 0.12], 8),
+        "Button" => ([0.70, 0.62, 0.11, 0.30], 1),
+        "Pmod JA" => ([0.84, 0.04, 0.13, 0.20], 4),
+        "Pmod JB" => ([0.84, 0.27, 0.13, 0.20], 4),
+        "Pmod JC" => ([0.84, 0.50, 0.13, 0.20], 4),
+        "Pmod JD" => ([0.84, 0.73, 0.13, 0.20], 4),
+        _ => ([0.03, 0.60, 0.14, 0.32], 2),
+    }
+}
+
+/// The board panel: a picture of the board with each part the run's XDC
+/// uses filled and labelled with its port, then the constrained pins that
+/// are off the board and the board parts left unused.
+fn board_body(v: &ImplView, s: &AppState, t: &VivadoTheme) -> El {
+    let Some(b) = &v.board else {
+        let why = v.missing.get("board").cloned().unwrap_or_else(|| "the run has no board panel".into());
+        return cad::empty_state("device-board-missing", &format!("No board panel: {why}"), None, t);
+    };
+    let [vw, _] = s.device.viewport;
+    let bw = if vw > 200.0 { (vw - 16.0).min(900.0) } else { 720.0 };
+    let bh = bw * 0.6;
+    let mut board = el()
+        .key("device-board")
+        .role("img")
+        .label(format!("{}: {} parts used", b.board, b.used().count()))
+        .w(bw)
+        .h(bh)
+        .fill(t.die_bg)
+        .border(1.5, t.border);
+    for g in &b.groups {
+        let ([fx, fy, fw, fh], per_row) = board_slot(&g.kind);
+        let (x, y, w, h) = (fx * bw, fy * bh, fw * bw, fh * bh);
+        let used = g.items.iter().filter(|i| i.port.is_some()).count();
+        let rows = g.items.len().div_ceil(per_row).max(1);
+        let (cw, ch) = ((w - 4.0) / per_row as f32, (h - 16.0) / rows as f32);
+        let mut grp = el()
+            .key(format!("device-board-group-{}", crate::live::slug(&g.kind)))
+            .role("group")
+            .label(format!("{}: {used} of {} used", g.kind, g.items.len()))
+            .absolute(x, y)
+            .size(w, h)
+            .border(1.0, if used > 0 { t.accent } else { t.border })
+            .child(text(format!("{} {used}/{}", g.kind, g.items.len())).font(cad::FONT_PIN).color(t.text_dim).absolute(3.0, 1.0));
+        for (k, i) in g.items.iter().enumerate() {
+            let (cx, cy) = (2.0 + (k % per_row) as f32 * cw, 14.0 + (k / per_row) as f32 * ch);
+            let tip = match &i.port {
+                Some(p) => format!("{} ({}) <- {p}", i.label, i.pin),
+                None => format!("{} ({}) unused", i.label, i.pin),
+            };
+            let mut cell = el()
+                .key(format!("device-board-item-{}", crate::live::slug(&i.label)))
+                .role("note")
+                .label(tip.clone())
+                .help(tip)
+                .absolute(cx + 1.0, cy + 1.0)
+                .size((cw - 2.0).max(2.0), (ch - 2.0).max(2.0))
+                .border(1.0, t.border);
+            cell = match &i.port {
+                Some(p) => cell.fill(t.accent.alpha(0.35)).child(text(p.clone()).font(cad::FONT_PIN).color(t.text).absolute(2.0, 1.0)),
+                None => cell.child(text(i.label.clone()).font(cad::FONT_PIN).color(t.text_dim).absolute(2.0, 1.0)),
+            };
+            grp = grp.child(cell);
+        }
+        board = board.child(grp);
+    }
+    let off = if b.off_board.is_empty() {
+        "Every constrained pin is on a board part.".to_string()
+    } else {
+        format!("Off the board: {}", b.off_board.iter().map(|(p, pin)| format!("{p} on {pin}")).collect::<Vec<_>>().join(", "))
+    };
+    let unused: Vec<String> = b
+        .groups
+        .iter()
+        .filter_map(|g| {
+            let free: Vec<&str> = g.items.iter().filter(|i| i.port.is_none()).map(|i| i.label.as_str()).collect();
+            (!free.is_empty()).then(|| format!("{}: {}", g.kind, free.join(" ")))
+        })
+        .collect();
+    col()
+        .key("device-board-panel")
+        .grow(1.0)
+        .w_full()
+        .min_h(0.0)
+        .gap(4.0)
+        .scroll_xy()
+        .child(board)
+        .child(cad::dim(off, t).key("device-board-off"))
+        .child(cad::dim(format!("Unused board parts. {}", unused.join(" · ")), t).key("device-board-unused"))
 }
 
 /// Device pane body for a 7-series run's view contract.
@@ -280,7 +382,9 @@ fn view_body(v: &ImplView, s: &AppState, t: &VivadoTheme) -> El {
         )
         .child(view_controls(s, t))
         .child(cad::dim(heat_line, t).key("device-view-heat-line"))
-        .child(
+        .child(if s.device.view_board {
+            board_body(v, s, t)
+        } else {
             col()
                 .key("device-family-canvas")
                 .role("img")
@@ -298,8 +402,8 @@ fn view_body(v: &ImplView, s: &AppState, t: &VivadoTheme) -> El {
                         s.device.viewport = v;
                     }
                 })
-                .child(world),
-        )
+                .child(world)
+        })
 }
 
 /// Device pane body for a family part.

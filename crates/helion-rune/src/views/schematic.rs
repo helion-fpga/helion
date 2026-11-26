@@ -35,7 +35,7 @@ use rune::tok::TextStyle;
 use rune::{El, Shape, canvas, col, el, icon, row, text};
 use rune_kit::glyphs;
 
-use crate::live::{LiveNetlist, live_netlist, slug};
+use crate::live::{LiveNetlist, schematic_netlist, slug};
 use crate::state::{AppState, ConsoleLine, MsgSev};
 use crate::theme::VivadoTheme;
 use crate::views::schematic_cone::{self as cone, ConeTrace, SheetFind};
@@ -364,6 +364,9 @@ impl Lod {
 /// selection history, the measured canvas viewport, and sheet find.
 #[derive(Clone, Debug)]
 pub struct SchematicState {
+    /// Netlist stage from the last implementation run's view contract
+    /// (`None`: the session design).
+    pub stage: Option<helion_targets::view::NetlistStage>,
     pub zoom: f32,
     pub selected: Option<SchemSel>,
     pub collapsed: HashSet<String>,
@@ -399,6 +402,7 @@ impl Default for SchematicState {
 impl SchematicState {
     pub fn new() -> Self {
         Self {
+            stage: None,
             zoom: 1.0,
             selected: None,
             collapsed: HashSet::new(),
@@ -552,6 +556,38 @@ fn tool_btn(
 }
 
 /// Zoom/LOD/expand toolbar over the canvas.
+/// Show one netlist stage, Vivado style: the top level opens with its
+/// hierarchy collapsed, and selections from another stage are dropped.
+pub fn set_stage(s: &mut AppState, stage: helion_targets::view::NetlistStage) {
+    s.schematic.stage = Some(stage);
+    s.schematic.selected = None;
+    s.schematic.cone = None;
+    if let Some(live) = schematic_netlist(s) {
+        s.schematic.set_all(&live, false);
+    }
+}
+
+/// RTL / Synthesized / Implemented tabs for the stages the last run kept.
+fn stage_tabs(s: &AppState, t: &VivadoTheme) -> El {
+    let mut r = row().key("schematic-stages").role("tablist").gap(2.0).items_center();
+    let Some(v) = s.runs.impl_view.as_ref() else {
+        return r;
+    };
+    for n in &v.schematic {
+        let st = n.stage;
+        r = r.child(
+            crate::views::cad::tab(format!("schematic-stage-{}", st.label().to_ascii_lowercase()), st.label(), s.schematic.stage == Some(st), t, move |s: &mut AppState| set_stage(s, st))
+                .help(format!("{} netlist: {} cells, {} nets", st.label(), n.cells.len(), n.nets.len())),
+        );
+    }
+    for st in helion_targets::view::NetlistStage::ALL.into_iter().filter(|st| v.netlist(*st).is_none()) {
+        if let Some(why) = v.missing.get(st.section()) {
+            r = r.child(dim_label(&format!("{}: {why}", st.label()), t).key(format!("schematic-stage-missing-{}", st.label().to_ascii_lowercase())).max_w(260.0).truncate().help(why.clone()));
+        }
+    }
+    r
+}
+
 fn schematic_toolbar(s: &AppState, t: &VivadoTheme, live: Option<&LiveNetlist>) -> El {
     row()
         .key("schematic-toolbar")
@@ -562,6 +598,7 @@ fn schematic_toolbar(s: &AppState, t: &VivadoTheme, live: Option<&LiveNetlist>) 
         .gap(2.0)
         .px(6.0)
         .fill(t.panel_bg)
+        .child(stage_tabs(s, t))
         .child(
             tool_btn("schematic-zoom-out", "Zoom out", "−", t)
                 .on_press(|s: &mut AppState| s.schematic.zoom_out()),
@@ -611,7 +648,7 @@ fn schematic_toolbar(s: &AppState, t: &VivadoTheme, live: Option<&LiveNetlist>) 
                 .center()
                 .hover(t.selection)
                 .on_press(|s: &mut AppState| {
-                    if let Some(live) = live_netlist(s) {
+                    if let Some(live) = schematic_netlist(s) {
                         s.schematic.set_all(&live, true);
                     }
                 })
@@ -630,7 +667,7 @@ fn schematic_toolbar(s: &AppState, t: &VivadoTheme, live: Option<&LiveNetlist>) 
                 .center()
                 .hover(t.selection)
                 .on_press(|s: &mut AppState| {
-                    if let Some(live) = live_netlist(s) {
+                    if let Some(live) = schematic_netlist(s) {
                         s.schematic.set_all(&live, false);
                     }
                 })
@@ -900,7 +937,7 @@ fn cell_node(
         _ => false,
     };
     let kind_label = match &sel {
-        SchemSel::Cell(n) => live.cell(n).map(|c| c.kind.label()).unwrap_or("Cell"),
+        SchemSel::Cell(n) => live.cell(n).map(|c| c.prim.as_str()).unwrap_or("Cell"),
         SchemSel::Port(n) => {
             if live.is_in_port(n) {
                 "Input port"
@@ -1123,7 +1160,10 @@ fn schematic_props(s: &AppState, t: &VivadoTheme, live: Option<&LiveNetlist>) ->
             let (kind, fanout, source) = match sel {
                 SchemSel::Cell(n) => (
                     live.cell(n)
-                        .map(|c| c.kind.label().to_string())
+                        .map(|c| match &c.loc {
+                            Some(l) => format!("{} @ {l}", c.prim),
+                            None => c.prim.clone(),
+                        })
                         .unwrap_or_else(|| "Cell".into()),
                     live.cell(n)
                         .map(|c| format!("fanout {}", c.fanout))
@@ -1174,7 +1214,8 @@ fn schematic_props(s: &AppState, t: &VivadoTheme, live: Option<&LiveNetlist>) ->
         None => {
             strip = strip.child(dim_label(
                 &format!(
-                    "{} · {} cells · {} nets — click a cell or hierarchy row",
+                    "{}{} · {} cells · {} nets — click a cell or hierarchy row",
+                    s.schematic.stage.map(|st| format!("{} netlist · ", st.label())).unwrap_or_default(),
                     live.design,
                     live.cells.len(),
                     live.nets.len()
@@ -1188,7 +1229,7 @@ fn schematic_props(s: &AppState, t: &VivadoTheme, live: Option<&LiveNetlist>) ->
 
 /// The center Schematic pane wired into the shell.
 pub fn schematic_pane(s: &AppState, t: &VivadoTheme) -> El {
-    let live = live_netlist(s);
+    let live = schematic_netlist(s);
     let mut body = row().w_full().grow(1.0).min_h(0.0).gap(6.0).padding(6.0);
     let mut results = None;
     if let Some(live) = &live {
@@ -1274,7 +1315,7 @@ mod tests {
     fn collapsed_blocks_hide_children_and_their_nets() {
         let mut s = init();
         crate::live::seed_live_fixture(&mut s).expect("fixture must seed");
-        let live = live_netlist(&s).unwrap();
+        let live = schematic_netlist(&s).unwrap();
         let mut st = SchematicState::new();
         assert!(st.cell_visible(&live, "u_div_u_ff0"));
         st.toggle("u_div");
@@ -1316,7 +1357,7 @@ mod tests {
     fn layout_covers_every_live_object_deterministically() {
         let mut s = init();
         crate::live::seed_live_fixture(&mut s).expect("fixture must seed");
-        let live = live_netlist(&s).unwrap();
+        let live = schematic_netlist(&s).unwrap();
         let st = SchematicState::new();
         let a = SchemLayout::of(&live, &st);
         let b = SchemLayout::of(&live, &st);
@@ -1343,7 +1384,7 @@ mod tests {
     fn collapsed_blocks_shrink_and_reflow() {
         let mut s = init();
         crate::live::seed_live_fixture(&mut s).expect("fixture must seed");
-        let live = live_netlist(&s).unwrap();
+        let live = schematic_netlist(&s).unwrap();
         let mut st = SchematicState::new();
         let open = SchemLayout::of(&live, &st);
         st.toggle("u_led");

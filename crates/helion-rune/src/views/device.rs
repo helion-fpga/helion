@@ -209,6 +209,8 @@ pub struct DeviceState {
     pub bottom: DeviceBottom,
     /// Heat map painted over a contract-driven die (`None` = off).
     pub view_heat: Option<crate::views::contract_views::HeatMap>,
+    /// Show the board panel instead of the die (contract-driven parts).
+    pub view_board: bool,
 }
 
 impl Default for DeviceState {
@@ -228,6 +230,7 @@ impl Default for DeviceState {
             pblocks_from: None,
             bottom: DeviceBottom::IoPorts,
             view_heat: None,
+            view_board: false,
         }
     }
 }

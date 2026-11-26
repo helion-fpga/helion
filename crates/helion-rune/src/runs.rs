@@ -926,6 +926,13 @@ pub fn apply_artifacts(s: &mut AppState, art: RunArtifacts) {
     if let Some(b) = art.bit_file {
         s.program.file = Some(b);
     }
+    // A run with its own netlist stages opens the schematic on them; a run
+    // without shows its session design.
+    s.schematic.stage = match (&art.view, &art.design) {
+        (Some(v), _) if !v.schematic.is_empty() => Some(helion_targets::view::NetlistStage::Synthesized),
+        (_, Some(_)) => None,
+        _ => s.schematic.stage,
+    };
     if let Some(d) = art.design {
         s.runs.live_design = Some(d);
     }
@@ -937,6 +944,9 @@ pub fn apply_artifacts(s: &mut AppState, art: RunArtifacts) {
     }
     if let Some(v) = art.view {
         s.runs.impl_view = Some(v);
+        if let Some(live) = s.schematic.stage.and(crate::live::schematic_netlist(s)) {
+            s.schematic.set_all(&live, false);
+        }
     }
     if !art.part.is_empty() {
         if let Ok(dev) = helion_device::Device::load_part(&art.part) {

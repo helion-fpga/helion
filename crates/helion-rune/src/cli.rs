@@ -142,6 +142,7 @@ fn headless_xilinx7(path: &Path, part: Option<&str>) -> Option<i32> {
             use crate::views::contract_views as cv;
             print!("{}", cv::render_all_reports(&v));
             print!("{}", cv::render_device_tab(&v));
+            print!("{}", cv::summary_lines(&v));
             println!("{}", cv::usage_summary(&v));
             match &v.timing {
                 Some(t) => {

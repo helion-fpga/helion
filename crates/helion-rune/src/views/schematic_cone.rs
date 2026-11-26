@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use rune::{El, Tx, col, el, row, text, text_input};
 use rune_kit::Checkbox;
 
-use crate::live::{LiveKind, LiveNetlist, live_design, live_netlist};
+use crate::live::{LiveKind, LiveNetlist, live_design, schematic_netlist};
 use crate::state::{AppState, CenterPane};
 use crate::theme::VivadoTheme;
 use crate::views::cad::{self, ColSpec};
@@ -172,8 +172,10 @@ fn pin_is_output(kind: &helion_ir::CellKind, pin: &str) -> bool {
 }
 
 /// Driver/sink adjacency of a design, by engine name.
-struct Graph<'a> {
-    kinds: HashMap<String, &'a helion_ir::CellKind>,
+struct Graph {
+    /// Cell name to its type label.
+    kinds: HashMap<String, String>,
+    ffs: HashSet<String>,
     drivers: HashMap<String, Vec<String>>,
     sinks: HashMap<String, Vec<String>>,
     outs: HashMap<String, Vec<String>>,
@@ -181,15 +183,41 @@ struct Graph<'a> {
     ports: HashSet<String>,
 }
 
-impl<'a> Graph<'a> {
-    fn of(d: &'a helion_ir::Design) -> Self {
-        let kinds: HashMap<String, &helion_ir::CellKind> = d
+impl Graph {
+    /// The graph of one stage of the view contract's schematic netlist.
+    fn of_netlist(n: &helion_targets::view::SchematicNetlist) -> Self {
+        let mut g = Graph {
+            kinds: n.cells.iter().map(|c| (c.name.clone(), c.kind.clone())).collect(),
+            ffs: n.cells.iter().filter(|c| LiveKind::from_prim(&c.kind) == LiveKind::Ff).map(|c| c.name.clone()).collect(),
+            drivers: HashMap::new(),
+            sinks: HashMap::new(),
+            outs: HashMap::new(),
+            ins: HashMap::new(),
+            ports: n.ports.iter().map(|p| p.name.clone()).collect(),
+        };
+        for c in &n.cells {
+            for p in &c.pins {
+                if p.output {
+                    g.drivers.entry(p.net.clone()).or_default().push(c.name.clone());
+                    g.outs.entry(c.name.clone()).or_default().push(p.net.clone());
+                } else {
+                    g.sinks.entry(p.net.clone()).or_default().push(c.name.clone());
+                    g.ins.entry(c.name.clone()).or_default().push(p.net.clone());
+                }
+            }
+        }
+        g
+    }
+
+    fn of(d: &helion_ir::Design) -> Self {
+        let cell_kinds: HashMap<String, &helion_ir::CellKind> = d
             .cells
             .iter()
             .map(|c| (helion_ir::resolve(c.name).to_string(), &c.kind))
             .collect();
         let mut g = Graph {
-            kinds,
+            kinds: cell_kinds.iter().map(|(n, k)| (n.clone(), LiveKind::from_cell(k).label().to_string())).collect(),
+            ffs: cell_kinds.iter().filter(|(_, k)| matches!(k, helion_ir::CellKind::Hff)).map(|(n, _)| n.clone()).collect(),
             drivers: HashMap::new(),
             sinks: HashMap::new(),
             outs: HashMap::new(),
@@ -204,7 +232,7 @@ impl<'a> Graph<'a> {
             let n = helion_ir::resolve(net.name).to_string();
             for ep in &net.endpoints {
                 let cell = helion_ir::resolve(ep.cell).to_string();
-                let Some(kind) = g.kinds.get(&cell) else {
+                let Some(kind) = cell_kinds.get(&cell) else {
                     continue;
                 };
                 if pin_is_output(kind, helion_ir::resolve(ep.pin)) {
@@ -220,7 +248,7 @@ impl<'a> Graph<'a> {
     }
 
     fn is_ff(&self, cell: &str) -> bool {
-        matches!(self.kinds.get(cell), Some(helion_ir::CellKind::Hff))
+        self.ffs.contains(cell)
     }
 
     /// One-direction breadth-first walk: (cell depths, net depths).
@@ -291,11 +319,25 @@ pub fn trace(
     hops: usize,
     stop_at_ff: bool,
 ) -> Result<ConeTrace, String> {
+    trace_graph(&Graph::of(d), root, dir, hops, stop_at_ff)
+}
+
+/// [`trace`] over one stage of the view contract's schematic netlist.
+pub fn trace_netlist(
+    n: &helion_targets::view::SchematicNetlist,
+    root: &str,
+    dir: ConeDir,
+    hops: usize,
+    stop_at_ff: bool,
+) -> Result<ConeTrace, String> {
+    trace_graph(&Graph::of_netlist(n), root, dir, hops, stop_at_ff)
+}
+
+fn trace_graph(g: &Graph, root: &str, dir: ConeDir, hops: usize, stop_at_ff: bool) -> Result<ConeTrace, String> {
     let root = root.trim();
     let root = root.split_once('/').map(|(c, _)| c).unwrap_or(root);
-    let g = Graph::of(d);
     let is_cell = g.kinds.contains_key(root);
-    let is_net = d.nets.iter().any(|n| helion_ir::resolve(n.name) == root);
+    let is_net = g.drivers.contains_key(root) || g.sinks.contains_key(root);
     if !is_cell && !is_net {
         return Err(format!("unknown root {root}"));
     }
@@ -322,11 +364,7 @@ pub fn trace(
         .map(|(name, hops)| ConeRow {
             name: name.clone(),
             obj: ConeObj::Cell,
-            kind: g
-                .kinds
-                .get(name)
-                .map(|k| LiveKind::from_cell(k).label().to_string())
-                .unwrap_or_else(|| "Cell".into()),
+            kind: g.kinds.get(name).cloned().unwrap_or_else(|| "Cell".into()),
             hops: *hops,
         })
         .chain(nets.iter().map(|(name, hops)| ConeRow {
@@ -416,7 +454,7 @@ impl SchematicState {
 
 /// Fit the drawing to the canvas viewport and scroll to its origin.
 pub fn fit(s: &mut AppState) -> String {
-    if let Some(live) = live_netlist(s) {
+    if let Some(live) = schematic_netlist(s) {
         let layout = crate::views::schematic::SchemLayout::of(&live, &s.schematic);
         match s.schematic.fit_zoom(layout.world_h) {
             Some(z) => s.schematic.zoom = z,
@@ -431,7 +469,7 @@ pub fn fit(s: &mut AppState) -> String {
 /// Make a selection's canvas node mount (expand its owner, leave Blocks
 /// LOD) and scroll the canvas and the hierarchy tree to it.
 pub fn reveal(s: &mut AppState, sel: &SchemSel, tx: &mut Tx) {
-    let Some(live) = live_netlist(s) else {
+    let Some(live) = schematic_netlist(s) else {
         return;
     };
     let target = match sel {
@@ -511,7 +549,7 @@ pub fn find_hits(live: &LiveNetlist, query: &str, kind: SheetFind) -> Vec<SchemS
 
 /// Select and reveal the next find hit (Return cycles through them).
 pub fn find_next(s: &mut AppState, tx: &mut Tx) {
-    let Some(live) = live_netlist(s) else {
+    let Some(live) = schematic_netlist(s) else {
         return;
     };
     let hits = find_hits(&live, &s.schematic.find.text, s.schematic.find_kind);
@@ -603,9 +641,13 @@ fn run_cone(
     hops: usize,
     stop: bool,
 ) -> Result<String, String> {
-    let d = live_design(s).ok_or_else(|| format!("{verb}: no synthesized design"))?;
     let hops = hops.clamp(HOPS_MIN, HOPS_MAX);
-    let cone = trace(d, &root, dir, hops, stop).map_err(|e| format!("{verb}: {e}"))?;
+    let stage = s.schematic.stage.and_then(|st| s.runs.impl_view.as_ref()?.netlist(st));
+    let cone = match stage {
+        Some(n) => trace_netlist(n, &root, dir, hops, stop),
+        None => trace(live_design(s).ok_or_else(|| format!("{verb}: no synthesized design"))?, &root, dir, hops, stop),
+    }
+    .map_err(|e| format!("{verb}: {e}"))?;
     let text = cone.summary_text();
     s.schematic.cone_hops = hops;
     s.schematic.stop_at_ff = stop;
@@ -657,7 +699,7 @@ pub fn tcl_verb(s: &mut AppState, name: &str, args: &[String]) -> Result<String,
             })
         }
         "expand_inside" | "collapse_inside" => {
-            let live = live_netlist(s).ok_or_else(|| format!("{name}: no synthesized design"))?;
+            let live = schematic_netlist(s).ok_or_else(|| format!("{name}: no synthesized design"))?;
             let inst = match args.first() {
                 Some(n) => n.clone(),
                 None => match &s.schematic.selected {
@@ -1348,7 +1390,7 @@ mod tests {
     #[test]
     fn find_hits_follow_scope_and_query() {
         let s = fixture();
-        let live = live_netlist(&s).unwrap();
+        let live = schematic_netlist(&s).unwrap();
         assert_eq!(
             find_hits(&live, "", SheetFind::Cells).len(),
             live.cells.len()
@@ -1433,7 +1475,7 @@ mod tests {
     fn debug_actions_are_disabled_without_a_net() {
         let mut s = fixture();
         s.schematic.selected = Some(SchemSel::Cell("u_div_u_ff0".into()));
-        let live = live_netlist(&s).unwrap();
+        let live = schematic_netlist(&s).unwrap();
         assert_eq!(debug_net(&s, &live), None);
         s.schematic.selected = Some(SchemSel::Net("clk".into()));
         assert_eq!(debug_net(&s, &live).as_deref(), Some("clk"));
@@ -1451,7 +1493,7 @@ mod tests {
         );
         tap(&mut rt, "schematic-zoom-in");
         tap(&mut rt, "schematic-zoom-fit");
-        let live = live_netlist(&rt.state).unwrap();
+        let live = schematic_netlist(&rt.state).unwrap();
         let h = crate::views::schematic::SchemLayout::of(&live, &rt.state.schematic).world_h;
         let z = rt.state.schematic.zoom;
         assert!(

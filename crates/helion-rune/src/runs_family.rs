@@ -536,6 +536,101 @@ mod tests {
         assert_eq!(v.congestion.len(), 2, "H and V congestion levels");
     }
 
+    /// One real run of the ZedBoard OLED demo, shared by the schematic and
+    /// board guards (`None` without the X-Ray database).
+    fn oled_view() -> Option<&'static helion_targets::view::ImplView> {
+        static RUN: std::sync::OnceLock<Option<helion_targets::view::ImplView>> = std::sync::OnceLock::new();
+        RUN.get_or_init(|| {
+            if !helion_targets::zynq_db_present() {
+                eprintln!("skipped: no zynq7 X-Ray database");
+                return None;
+            }
+            let prj = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/zedboard_oled_demo.prj");
+            let dir = std::env::temp_dir().join(format!("helion-rune-oled-{}", std::process::id()));
+            let art = run_xdc_flow(&prj, "xc7z020", &dir, &|_, _| {}).expect("xdc flow");
+            let _ = std::fs::remove_dir_all(&dir);
+            Some(art.view.expect("impl view"))
+        })
+        .as_ref()
+    }
+
+    /// Guard: the RTL schematic is the v2 front end's elaborated netlist of
+    /// this run: word registers and operators, the design's own ports.
+    #[test]
+    fn oled_run_fills_the_rtl_schematic() {
+        use helion_targets::view::NetlistStage;
+        let Some(v) = oled_view() else { return };
+        let n = v.netlist(NetlistStage::Rtl).expect("RTL netlist");
+        assert_eq!(n.top, "zedboard_oled_demo");
+        assert_eq!(n.ports.len(), 8, "clk, six OLED pins, led");
+        let kind = |c: &str| n.cells.iter().find(|x| x.name == c).map(|x| x.kind.as_str());
+        for r in ["wait_cnt", "rom_idx", "bx", "by", "frame"] {
+            assert_eq!(kind(r), Some("RTL_REG"), "{r} is one word register");
+        }
+        let k = n.kinds();
+        assert!(k.get("RTL_ADD").copied().unwrap_or(0) + k.get("RTL_SUB").copied().unwrap_or(0) >= 3, "counters add: {k:?}");
+        assert!(k.get("RTL_MUX").copied().unwrap_or(0) >= 1 && k.get("RTL_EQ").copied().unwrap_or(0) >= 1, "{k:?}");
+        assert!(!k.keys().any(|t| t.starts_with("LUT") || t.starts_with("FD")), "no mapped primitives at RTL: {k:?}");
+        let clk = n.nets.iter().find(|x| x.name == "clk").expect("clk net");
+        assert_eq!(clk.drivers, vec!["clk".to_string()], "the port drives clk");
+        assert!(clk.loads.iter().filter(|l| l.ends_with("/C")).count() >= 5, "registers clocked by clk");
+        assert!(n.ports.iter().all(|p| !p.nets.is_empty()), "every port is wired");
+    }
+
+    /// Guard: the synthesized schematic is the mapped netlist the packer read.
+    #[test]
+    fn oled_run_fills_the_synthesized_schematic() {
+        use helion_targets::view::NetlistStage;
+        let Some(v) = oled_view() else { return };
+        let n = v.netlist(NetlistStage::Synthesized).expect("synthesized netlist");
+        let k = n.kinds();
+        let luts: usize = k.iter().filter(|(t, _)| t.starts_with("LUT")).map(|(_, c)| c).sum();
+        let ffs: usize = k.iter().filter(|(t, _)| t.starts_with("FD")).map(|(_, c)| c).sum();
+        assert!(luts >= 50 && ffs >= 60, "{k:?}");
+        assert!(!k.keys().any(|t| t.starts_with("RTL_")), "no RTL operators after mapping: {k:?}");
+        assert_eq!(ffs, v.cells.iter().filter(|c| c.kind == "FF").count(), "every flop the placer placed");
+        let undriven = n.nets.iter().filter(|x| x.drivers.is_empty() && !x.loads.is_empty()).count();
+        assert_eq!(undriven, 0, "every used net has a driver: {:?}", n.nets.iter().filter(|x| x.drivers.is_empty()).take(5).collect::<Vec<_>>());
+        assert!(n.cells.iter().all(|c| c.site.is_none()), "no placement before implementation");
+    }
+
+    /// Guard: the implemented schematic is the synthesized one with the
+    /// placement's site and BEL on every LUT and flop.
+    #[test]
+    fn oled_run_fills_the_implemented_schematic() {
+        use helion_targets::view::NetlistStage;
+        let Some(v) = oled_view() else { return };
+        let syn = v.netlist(NetlistStage::Synthesized).expect("synthesized");
+        let n = v.netlist(NetlistStage::Implemented).expect("implemented netlist");
+        assert!(n.cells.len() >= syn.cells.len());
+        for c in n.cells.iter().filter(|c| c.kind.starts_with("FD")) {
+            let site = c.site.as_deref().unwrap_or_else(|| panic!("{} unplaced", c.name));
+            assert!(site.starts_with("SLICE_") && c.bel.is_some(), "{}: {site} {:?}", c.name, c.bel);
+            assert!(v.cells.iter().any(|p| p.cell == c.name && p.site == site), "{} site from the run", c.name);
+        }
+        assert!(n.cells.iter().filter(|c| c.kind.starts_with("LUT")).all(|c| c.site.is_some()), "every LUT placed");
+        assert!(v.provenance[NetlistStage::Implemented.section()].method.contains("placed under their own name"));
+    }
+
+    /// Guard: the board panel puts the OLED demo's ports on the right
+    /// ZedBoard parts and lists what it leaves free.
+    #[test]
+    fn oled_run_maps_its_ports_onto_the_zedboard() {
+        let Some(v) = oled_view() else { return };
+        let b = v.board.as_ref().expect("board panel");
+        assert_eq!(b.board, "Avnet/Digilent ZedBoard");
+        let at = |p: &str| b.part_of(p).map(|(g, i)| (g.kind.as_str(), i.label.as_str(), i.pin.as_str()));
+        assert_eq!(at("clk"), Some(("Clock", "GCLK", "Y9")));
+        assert_eq!(at("led"), Some(("LED", "LD0", "T22")));
+        for (port, label, pin) in [("oled_dc", "OLED-DC", "U10"), ("oled_res", "OLED-RES", "U9"), ("oled_sclk", "OLED-SCLK", "AB12"), ("oled_sdin", "OLED-SDIN", "AA12"), ("oled_vbat", "OLED-VBAT", "U11"), ("oled_vdd", "OLED-VDD", "U12")] {
+            assert_eq!(at(port), Some(("OLED", label, pin)), "{port}");
+        }
+        assert_eq!(b.used().count(), 8);
+        assert!(b.off_board.is_empty(), "{:?}", b.off_board);
+        let free = |k: &str| b.groups.iter().find(|g| g.kind == k).map(|g| g.items.iter().filter(|i| i.port.is_none()).count());
+        assert_eq!((free("LED"), free("Switch"), free("Button"), free("Pmod JA")), (Some(7), Some(8), Some(5), Some(8)));
+    }
+
     #[test]
     fn ice40_run_writes_an_asc_with_project_pins() {
         let d = helion_sv::synth_sv(

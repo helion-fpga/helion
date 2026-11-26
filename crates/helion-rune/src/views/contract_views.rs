@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use helion_targets::view::{CellPlacement, ImplView, Stage, TileClass};
+use helion_targets::view::{CellPlacement, ImplView, NetlistStage, Stage, TileClass};
 
 /// One rendered table: a header and rows of equal width.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -872,38 +872,95 @@ pub fn layer_panel(view: &ImplView, layer: Layer) -> Panel {
 // Schematic
 // ---------------------------------------------------------------------------
 
-/// The three schematic stages.
+/// The three schematic stages: cells and nets per stage, the cell types
+/// that dominate, and placement coverage of the implemented netlist. A stage
+/// the run did not keep names why.
 pub fn schematic_panel(view: &ImplView) -> Panel {
-    if view.cells.is_empty() {
-        return Panel::missing(
-            "Schematic",
-            "the run produced no netlist cells to draw",
-        );
+    if view.schematic.is_empty() {
+        let why = view.missing.get(NetlistStage::Synthesized.section()).cloned().unwrap_or_else(|| "the run kept no netlist for the schematic".into());
+        return Panel::missing("Schematic", why);
     }
-    let mut tbl = Table::new(&["Stage", "Cells", "Nets", "Placed", "Routed"]);
-    // The same netlist is shown at every stage the run reached: the schematic
-    // is Helion's own netlist, annotated with what the run did to it.
-    let placed = !view.cells.is_empty() && view.stage != Stage::Synthesized;
-    let routed = view.stage == Stage::Routed && !view.nets.is_empty();
-    for stage in [Stage::Synthesized, Stage::Placed, Stage::Routed] {
-        let reached = match stage {
-            Stage::Synthesized => true,
-            Stage::Placed => placed,
-            Stage::Routed => routed,
+    let mut tbl = Table::new(&["Stage", "Cells", "Nets", "Ports", "Placed", "Top cell types"]);
+    for st in NetlistStage::ALL {
+        let Some(n) = view.netlist(st) else {
+            let why = view.missing.get(st.section()).map(String::as_str).unwrap_or("not kept by this run");
+            tbl.push(&[st.label(), "-", "-", "-", "-", &format!("missing input: {why}")]);
+            continue;
         };
+        let mut kinds: Vec<(&str, usize)> = n.kinds().into_iter().collect();
+        kinds.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let top: Vec<String> = kinds.iter().take(4).map(|(k, c)| format!("{k} {c}")).collect();
+        let placed = n.cells.iter().filter(|c| c.site.is_some()).count();
         tbl.push(&[
-            stage.label(),
-            &view.cells.len().to_string(),
-            &view.nets.len().to_string(),
-            if placed { "yes" } else { "no" },
-            if reached && routed { "yes" } else { "no" },
+            st.label(),
+            &n.cells.len().to_string(),
+            &n.nets.len().to_string(),
+            &n.ports.len().to_string(),
+            &if st == NetlistStage::Implemented { placed.to_string() } else { "-".into() },
+            &top.join(", "),
         ]);
     }
-    Panel::table("Schematic", tbl).with_note(format!(
-        "{} cells, {} nets from Helion's own netlist",
-        view.cells.len(),
-        view.nets.len()
-    ))
+    let mut p = Panel::table("Schematic", tbl);
+    if let Some(note) = provenance_note(view, NetlistStage::Implemented.section()) {
+        p = p.with_note(note);
+    }
+    p
+}
+
+/// The board panel as text: each used board part with its port, then the
+/// pins the run constrains off the board, then the unused parts per group.
+pub fn board_panel(view: &ImplView) -> Panel {
+    let Some(b) = &view.board else {
+        return missing(view, "board", "Board");
+    };
+    let mut tbl = Table::new(&["Group", "Part", "Pin", "Port"]);
+    for (g, i) in b.used() {
+        tbl.push(&[&g.kind, &i.label, &i.pin, i.port.as_deref().unwrap_or("")]);
+    }
+    for (port, pin) in &b.off_board {
+        tbl.push(&["off board", "", pin, port]);
+    }
+    for g in &b.groups {
+        let free: Vec<&str> = g.items.iter().filter(|i| i.port.is_none()).map(|i| i.label.as_str()).collect();
+        if !free.is_empty() {
+            tbl.push(&[&g.kind, &format!("unused: {}", free.join(" ")), "", ""]);
+        }
+    }
+    let used = b.used().count();
+    let total: usize = b.groups.iter().map(|g| g.items.len()).sum();
+    Panel::table(format!("Board: {}", b.board), tbl).with_note(format!("{used} of {total} board pins used, {} constrained pins off the board", b.off_board.len()))
+}
+
+/// Short schematic and board summary for headless runs.
+pub fn summary_lines(view: &ImplView) -> String {
+    let mut out = String::new();
+    for st in NetlistStage::ALL {
+        match view.netlist(st) {
+            Some(n) => {
+                let mut kinds: Vec<(&str, usize)> = n.kinds().into_iter().collect();
+                kinds.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+                let top: Vec<String> = kinds.iter().take(5).map(|(k, c)| format!("{k} {c}")).collect();
+                out.push_str(&format!("SCHEMATIC_{}: {} cells, {} nets ({})\n", st.label().to_ascii_uppercase(), n.cells.len(), n.nets.len(), top.join(", ")));
+            }
+            None => out.push_str(&format!(
+                "SCHEMATIC_{}: missing input: {}\n",
+                st.label().to_ascii_uppercase(),
+                view.missing.get(st.section()).map(String::as_str).unwrap_or("not kept by this run")
+            )),
+        }
+    }
+    match &view.board {
+        Some(b) => {
+            let used: Vec<String> = b.used().map(|(g, i)| format!("{}={} ({})", i.label, i.port.as_deref().unwrap_or(""), g.kind)).collect();
+            out.push_str(&format!("BOARD: {}: {}\n", b.board, used.join(", ")));
+            if !b.off_board.is_empty() {
+                let off: Vec<String> = b.off_board.iter().map(|(p, pin)| format!("{p}@{pin}")).collect();
+                out.push_str(&format!("BOARD_OFF: {}\n", off.join(", ")));
+            }
+        }
+        None => out.push_str(&format!("BOARD: missing input: {}\n", view.missing.get("board").map(String::as_str).unwrap_or("no board panel"))),
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1180,13 +1237,21 @@ mod tests {
     }
 
     #[test]
-    fn schematic_shows_a_row_for_each_stage() {
+    fn schematic_shows_each_stage_or_why_it_is_missing() {
+        use helion_targets::view::{NetlistCell, SchematicNetlist};
         let mut v = sample();
-        v.stage = Stage::Placed;
+        assert!(matches!(schematic_panel(&v).body, PanelBody::Missing(_)), "no netlist, no table");
+        let cell = |n: &str, k: &str, site: Option<&str>| NetlistCell { name: n.into(), kind: k.into(), pins: vec![], site: site.map(str::to_string), bel: None };
+        let net = |st, cells| SchematicNetlist { stage: st, top: "t".into(), ports: vec![], cells, nets: vec![], instances: vec![] };
+        v.schematic = vec![
+            net(NetlistStage::Synthesized, vec![cell("a", "LUT2", None), cell("q", "FDRE", None)]),
+            net(NetlistStage::Implemented, vec![cell("a", "LUT2", Some("SLICE_X0Y0")), cell("q", "FDRE", Some("SLICE_X0Y0"))]),
+        ];
+        v.mark_missing(NetlistStage::Rtl.section(), "zb front end");
         let text = schematic_panel(&v).render();
-        for s in ["Synthesized", "Placed", "Routed"] {
-            assert!(text.contains(s), "missing stage {s}:\n{text}");
-        }
+        assert!(text.contains("missing input: zb front end"), "{text}");
+        assert!(text.contains("FDRE 1") && text.contains("Implemented"), "{text}");
+        assert!(summary_lines(&v).contains("SCHEMATIC_IMPLEMENTED: 2 cells, 0 nets"));
     }
 
     #[test]
