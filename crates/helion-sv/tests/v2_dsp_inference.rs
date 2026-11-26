@@ -372,7 +372,7 @@ fn an_m_register_read_elsewhere_is_p_instead() {
          always_ff @(posedge clk) begin m <= a * b; p <= m; end assign o = m; endmodule"
     ));
     assert_eq!(regs, "0 0 0 1");
-    assert_eq!(flops(&d), 48, "p is a flop after m");
+    assert_eq!(flops(&d), 43, "p is a flop after m: a 43-bit product, its five sign copies merged");
 }
 
 #[test]
@@ -409,8 +409,8 @@ fn registers_on_another_or_gated_clock_stay_in_the_fabric() {
     let gate = "logic en_l, gclk; always_latch if (!clk) en_l = en; assign gclk = clk & en_l;";
     for (what, body, regs, ff) in [
         ("A on clk2", "logic signed [24:0] ar; always_ff @(posedge clk2) ar <= a; always_ff @(posedge clk) p <= ar * b;".to_string(), "0 0 0 1", 25),
-        ("M on clk, P on clk2", "logic signed [47:0] m; always_ff @(posedge clk) m <= a * b; always_ff @(posedge clk2) p <= m;".to_string(), "0 0 0 1", 48),
-        ("P on a gated clock", format!("{gate} always_ff @(posedge gclk) p <= a * b;"), "0 0 0 0", 48),
+        ("M on clk, P on clk2", "logic signed [47:0] m; always_ff @(posedge clk) m <= a * b; always_ff @(posedge clk2) p <= m;".to_string(), "0 0 0 1", 43),
+        ("P on a gated clock", format!("{gate} always_ff @(posedge gclk) p <= a * b;"), "0 0 0 0", 43),
         ("A on a gated clock", format!("{gate} logic signed [24:0] ar; always_ff @(posedge gclk) ar <= a; assign p = ar * b;"), "0 0 0 0", 25),
     ] {
         let (d, _, r) = one(&format!("module t({IO}, input logic clk2, output logic signed [47:0] p); {body} endmodule"));

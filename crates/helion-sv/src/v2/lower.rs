@@ -1149,6 +1149,37 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
         taken.insert(n.clone());
         net_of.insert(l, n);
     }
+    // Equivalent registers (same D, clock, enable, resets and power-up
+    // value: the copies a sign extension makes of its top bit) are one
+    // flop, and readers of the later ones take the first one's net. With a
+    // flop each, one LUT feeds them all and only one sits beside it.
+    // One level: registers that become equal only through a merge stay.
+    let q_net = |rb: &RegBit| -> String {
+        let s = &flat.sigs[rb.sig as usize];
+        format!("{}{}", bit_name(&s.name, s.w, rb.bit), if s.init[rb.bit as usize] { "_n" } else { "" })
+    };
+    let pi_lit: HashMap<(u32, u32), Lit> = pi_name.iter().map(|&(l, sig, bit)| ((sig, bit), l)).collect();
+    let mut same_as: Vec<Option<usize>> = vec![None; reg_bits.len()];
+    let mut first = HashMap::new();
+    for (i, rb) in reg_bits.iter().enumerate() {
+        let s = &flat.sigs[rb.sig as usize];
+        if s.debug {
+            continue;
+        }
+        let key = (rb.d, rb.clk, rb.negedge, rb.arst, rb.ce, rb.sr, s.init[rb.bit as usize]);
+        match first.entry(key) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(i);
+            }
+            std::collections::hash_map::Entry::Occupied(e) => {
+                let j = *e.get();
+                if let Some(&l) = pi_lit.get(&(rb.sig, rb.bit)) {
+                    net_of.insert(l, q_net(&reg_bits[j]));
+                }
+                same_as[i] = Some(j);
+            }
+        }
+    }
     for p in &flat.ports {
         if p.dir != PortDir::Out {
             for i in 0..p.w {
@@ -1347,10 +1378,13 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
 
     // Registers.
     let mut regmap = Vec::with_capacity(reg_bits.len());
-    for rb in &reg_bits {
+    for (i, rb) in reg_bits.iter().enumerate() {
         let s = &flat.sigs[rb.sig as usize];
         let inverted = s.init[rb.bit as usize];
-        let q = format!("{}{}", bit_name(&s.name, s.w, rb.bit), if inverted { "_n" } else { "" });
+        let q = match same_as[i] {
+            Some(j) => q_net(&reg_bits[j]),
+            None => q_net(rb),
+        };
         let cell = format!("{}_reg", bit_name(&s.name, s.w, rb.bit));
         regmap.push(RegMap {
             net: q.clone(),
@@ -1359,6 +1393,9 @@ pub fn lower(flat: &Flat) -> Result<(Design, Stats, Vec<String>), String> {
             scalar: s.w == 1,
             inverted,
         });
+        if same_as[i].is_some() {
+            continue;
+        }
         depth = depth.max(map.depth[(rb.d / 2) as usize]);
         let dnet = emit(rb.d, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut);
         let cnet = emit(rb.clk, &aig, &map, &mut d, &mut net_of, &hint, &mut taken, &mut n_lut);
