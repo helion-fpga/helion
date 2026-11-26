@@ -46,19 +46,43 @@ fn is_vhdl(path: &str) -> bool {
     path.ends_with(".vhd") || path.ends_with(".vhdl")
 }
 
+/// The VHDL files joined into one text (the translator reads one), with the
+/// first line of each file in it.
+fn join_sources<'a>(paths: &[&'a str]) -> Result<(String, Vec<(&'a str, usize)>), String> {
+    let mut src = String::new();
+    let mut starts = Vec::new();
+    for p in paths {
+        starts.push((*p, src.lines().count() + 1));
+        src.push_str(&std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?);
+        if !src.ends_with('\n') {
+            src.push('\n');
+        }
+    }
+    Ok((src, starts))
+}
+
+/// Turn the first `line N` of a message about the joined text into
+/// `file: line M` (G96: errors named the first file and a global line).
+fn locate(msg: &str, starts: &[(&str, usize)]) -> String {
+    let msg = msg.strip_prefix("vhdl.vhd: ").unwrap_or(msg);
+    let Some(i) = msg.find("line ") else { return msg.to_string() };
+    let digits: String = msg[i + 5..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    let Ok(n) = digits.parse::<usize>() else { return msg.to_string() };
+    let Some((file, first)) = starts.iter().rev().find(|(_, f)| *f <= n) else { return msg.to_string() };
+    format!("{}{file}: line {}{}", &msg[..i], n - first + 1, &msg[i + 5 + digits.len()..])
+}
+
 /// The front end proven on the board: one source text, carry chains for
 /// arithmetic unless `HELION_NO_CARRY` is set.
 fn synth_zb(paths: &[&str], top: Option<&str>) -> Result<Design, String> {
     helion_zb_front::set_dsp_inference(false);
     helion_zb_front::set_carry_arith(std::env::var("HELION_NO_CARRY").is_err());
-    let mut src = String::new();
-    for p in paths {
-        src.push_str(&std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?);
-        src.push('\n');
-    }
+    helion_zb_front::set_native_mul(false);
     if is_vhdl(paths[0]) {
-        helion_zb_front::synth_vhdl_top(&src, top)
+        let (src, starts) = join_sources(paths)?;
+        helion_zb_front::synth_vhdl_top(&src, top).map_err(|e| locate(&e, &starts))
     } else {
+        let src = join_sources(paths)?.0;
         helion_zb_front::synth_sv(&src, paths[0])
     }
 }
@@ -74,12 +98,11 @@ fn synth_v2(paths: &[&str], top: Option<&str>, log: &mut dyn FnMut(&str)) -> Res
     let mut renames = Vec::new();
     helion_sv::v2::dag::set_carry_arith(std::env::var("HELION_NO_CARRY").is_err());
     let s = if is_vhdl(paths[0]) {
-        let mut src = String::new();
-        for p in paths {
-            src.push_str(&std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?);
-            src.push('\n');
-        }
-        let (sv, r) = helion_zb_front::vhdl_to_sv(&src, top).map_err(|e| format!("{}: {e}", paths[0]))?;
+        // `+` and `*` reach the v2 front end as such: carry chains and DSP48s (G99).
+        helion_zb_front::set_carry_arith(std::env::var("HELION_NO_CARRY").is_err());
+        helion_zb_front::set_native_mul(true);
+        let (src, starts) = join_sources(paths)?;
+        let (sv, r) = helion_zb_front::vhdl_to_sv(&src, top).map_err(|e| locate(&e, &starts))?;
         renames = r;
         helion_sv::synth_sv_v2(&sv, "vhdl.sv", None)?
     } else {
@@ -732,6 +755,16 @@ mod tests {
 
     const PAD: &str = "create_clock -period 3.000 -name gclk [get_ports gclk]";
     const FCLK: &str = "create_clock -period 10.000 -name fclk0 [get_pins ps7/FCLKCLK[0]]";
+
+    /// G96 guard: an error in the second VHDL file names that file and its
+    /// own line, not the first file and a line of the joined text.
+    #[test]
+    fn vhdl_error_names_its_own_file() {
+        let starts = [("pkg.vhd", 1), ("rom.vhd", 7), ("top.vhd", 64)];
+        assert_eq!(locate("vhdl.vhd: line 34: unknown type `line`", &starts), "rom.vhd: line 28: unknown type `line`");
+        assert_eq!(locate("line 64: x", &starts), "top.vhd: line 1: x");
+        assert_eq!(locate("no line number", &starts), "no line number");
+    }
 
     #[test]
     fn pad_period_ignores_a_ps7_clock_in_either_order() {
