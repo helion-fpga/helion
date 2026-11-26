@@ -12,7 +12,7 @@ pub mod expr;
 pub mod lex;
 pub mod parse;
 
-pub use dag::set_carry_arith;
+pub use dag::{set_carry_arith, set_native_mul};
 
 /// Translate VHDL source to flat SystemVerilog. `top` picks the top-level
 /// entity; by default the last entity that no other entity instantiates.

@@ -562,6 +562,8 @@ impl Elab {
                     .ok_or_else(|| format!("line {line}: variable outside a process"))?
                     .st
                     .vars[slot as usize];
+                // the value escapes: nobody may change it in place any more
+                self.px.last().unwrap().st.fresh.0.borrow_mut().remove(&n);
                 Ok(Val::B { ty, n })
             }
             Some(Sym::Val(v)) => Ok(v),
@@ -582,6 +584,7 @@ impl Elab {
             Some(Sym::Comp(_)) => err(line, format!("component `{x}` used as a value")),
             Some(Sym::Pkg) => err(line, format!("package `{x}` used as a value")),
             Some(Sym::Unsupported(w)) => err(line, format!("`{x}`: {w} is not supported")),
+            Some(Sym::File(_) | Sym::Line(_)) => err(line, format!("std.textio `{x}` is only supported in readline, read, hread and endfile")),
             None => match x {
                 "math_pi" => Ok(Val::R(std::f64::consts::PI)),
                 "math_e" => Ok(Val::R(std::f64::consts::E)),
@@ -704,6 +707,15 @@ impl Elab {
                 ty: a.elem.clone(),
                 n: s,
             });
+        }
+        // An array read by a natural index from 0 is a memory read: the
+        // emitter makes a large constant array a ROM (block RAM behind) and
+        // anything else a balanced mux tree (G97, G99).
+        if let (Ty::Int { lo, .. }, Val::B { n: ix, .. }) = (iv.ty(), &iv) {
+            if lo >= 0 && r.lo() == 0 {
+                let x = self.dag.index(n, *ix, ew, !r.down);
+                return Ok(Val::B { ty: a.elem.clone(), n: x });
+            }
         }
         // Dynamic index: priority mux over the indices the index can take.
         let cands = self.index_candidates(&iv, &r);
@@ -2190,6 +2202,22 @@ impl Elab {
                 );
             }
             "now" => return err(line, "`now` is not synthesizable"),
+            "endfile" => {
+                let i = match args.first().map(|a| &a.actual) {
+                    Some(Expr::Name(n)) => match &**n {
+                        Name::Id(x, _) => match self.lookup(x) {
+                            Some(Sym::File(i)) => *i as usize,
+                            _ => return err(line, "endfile expects a file"),
+                        },
+                        _ => return err(line, "endfile expects a file"),
+                    },
+                    _ => return err(line, "endfile expects a file"),
+                };
+                let (_, lines, pos) = &self.tio_files[i];
+                let b = *pos >= lines.len();
+                let n = self.dag.bit(b);
+                Val::B { ty: Ty::Bool, n }
+            }
             "to_unsigned"
             | "to_signed"
             | "conv_unsigned"

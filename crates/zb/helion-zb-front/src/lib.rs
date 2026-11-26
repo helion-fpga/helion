@@ -82,6 +82,12 @@ pub fn set_carry_arith(on: bool) {
     zb_vhdl::set_carry_arith(on);
 }
 
+/// VHDL products as `*` in the translated SystemVerilog (for the v2 front
+/// end's DSP48 inference) instead of shift-and-add.
+pub fn set_native_mul(on: bool) {
+    zb_vhdl::v2::set_native_mul(on);
+}
+
 /// SystemVerilog source to a netlist.
 pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
     zb_sv::synth_sv(source, origin).map(|d| to_current(&d))

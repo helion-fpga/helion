@@ -15,7 +15,10 @@ use super::dag::*;
 use super::elab::*;
 use super::expr::*;
 
-const MAX_LOOP: usize = 1 << 16;
+// a 256-image 1-bit ROM is filled by a 200,704-iteration loop
+/// Constant array variables wider than this are updated in place.
+const IN_PLACE_BITS: usize = 4096;
+const MAX_LOOP: usize = 1 << 20;
 
 fn name_key(n: &Name) -> String {
     match n {
@@ -767,6 +770,21 @@ impl Elab {
         match lv.base {
             LBase::Var(slot) => {
                 let old = self.px.last().unwrap().st.vars[slot as usize];
+                if let (Off::Static(o), Some([false])) = (&lv.off, self.dag.as_const(dead)) {
+                    let total = self.dag.w(old) as usize;
+                    if total > IN_PLACE_BITS && self.dag.as_const(old).is_some() && self.dag.as_const(v).is_some() {
+                        let st = &self.px.last().unwrap().st;
+                        let owned = st.fresh.0.borrow().contains(&old);
+                        let n = if owned { old } else { self.dag.konst_fresh(old) };
+                        let vb = self.dag.as_const(v).unwrap().to_vec();
+                        let o = *o as usize;
+                        self.dag.const_mut(n)[o..o + vb.len()].copy_from_slice(&vb);
+                        let st = &mut self.px.last_mut().unwrap().st;
+                        st.fresh.0.borrow_mut().insert(n);
+                        st.vars[slot as usize] = n;
+                        return Ok(());
+                    }
+                }
                 let new = self.insert(old, &lv.off, v, w);
                 let new = self.dag.mux(dead, old, new);
                 self.px.last_mut().unwrap().st.vars[slot as usize] = new;
@@ -835,6 +853,7 @@ impl Elab {
             (None, y) => y,
         };
         Ok(St {
+            fresh: Fresh::default(),
             vars,
             pend,
             ret,
@@ -1183,12 +1202,87 @@ impl Elab {
                 self.call_user(&subs, args, None, false, line)?;
                 Ok(())
             }
+            _ if matches!(f.as_str(), "readline" | "read" | "hread" | "bread" | "oread") => self.textio_call(&f, args, line),
             _ => match f.as_str() {
                 "finish" | "stop" | "write" | "writeline" | "read" | "readline" | "deallocate"
                 | "file_open" | "file_close" => err(line, format!("`{f}` is not synthesizable")),
                 _ => err(line, format!("unknown procedure `{f}`")),
             },
         }
+    }
+
+    /// The `std.textio` symbol an argument names (a file or a `line`).
+    fn tio_arg(&self, args: &[Assoc], i: usize, line: Line) -> R<Sym> {
+        if let Some(Expr::Name(n)) = args.get(i).map(|a| &a.actual) {
+            if let Name::Id(x, _) = &**n {
+                if let Some(s @ (Sym::File(_) | Sym::Line(_))) = self.lookup(x) {
+                    return Ok(s.clone());
+                }
+            }
+        }
+        err(line, "expected a file or a `line` variable from std.textio")
+    }
+
+    /// `readline(f, l)` and `read` / `hread` / `oread` / `bread(l, target)`,
+    /// run while elaborating (a ROM initializer reading its contents).
+    fn textio_call(&mut self, f: &str, args: &[Assoc], line: Line) -> R<()> {
+        if f == "readline" {
+            let (Sym::File(fi), Sym::Line(li)) = (self.tio_arg(args, 0, line)?, self.tio_arg(args, 1, line)?) else {
+                return err(line, "readline(file, line) expects a file and a `line` variable");
+            };
+            let (name, lines, pos) = &mut self.tio_files[fi as usize];
+            let Some(t) = lines.get(*pos) else {
+                return err(line, format!("readline past the end of `{name}` ({} lines)", lines.len()));
+            };
+            self.tio_lines[li as usize] = t.clone();
+            *pos += 1;
+            return Ok(());
+        }
+        let Sym::Line(li) = self.tio_arg(args, 0, line)? else {
+            return err(line, format!("{f}(line, value) expects a `line` variable"));
+        };
+        if args.len() != 2 {
+            return err(line, format!("{f} with a `good` argument is not supported"));
+        }
+        let lv = self.lval(&args[1].actual, line)?;
+        if !matches!(lv.ty, Ty::Arr(_) | Ty::Logic | Ty::Bit) {
+            return err(line, format!("{f} into a {} is not supported", lv.ty.name()));
+        }
+        let w = lv.ty.width()? as usize;
+        let per = match f {
+            "hread" => 4,
+            "oread" => 3,
+            _ => 1,
+        };
+        let text = &self.tio_lines[li as usize];
+        let rest = text.trim_start();
+        let need = w.div_ceil(per);
+        let mut bits = Vec::new(); // MSB first
+        let mut used = 0;
+        for (i, c) in rest.char_indices() {
+            if bits.len() == need * per {
+                break;
+            }
+            used = i + c.len_utf8();
+            if c == '_' && per > 1 {
+                continue;
+            }
+            let d = c.to_digit(1 << per).ok_or_else(|| {
+                format!("line {line}: {f}: `{c}` in `{}` is not a {}-bit digit", text.trim(), per)
+            })?;
+            bits.extend((0..per).rev().map(|k| (d >> k) & 1 == 1));
+        }
+        if bits.len() < need * per {
+            return err(line, format!("{f}: `{}` has fewer than {need} digits", text.trim()));
+        }
+        let extra = bits.len() - w;
+        if bits[..extra].iter().any(|&b| b) {
+            return err(line, format!("{f}: `{}` does not fit in {w} bits", text.trim()));
+        }
+        let lsb_first: Vec<bool> = bits[extra..].iter().rev().copied().collect();
+        self.tio_lines[li as usize] = rest[used..].to_string();
+        let v = self.dag.konst(lsb_first);
+        self.write_lval(&lv, v, line)
     }
 
     // ------------------------------------------------------------------

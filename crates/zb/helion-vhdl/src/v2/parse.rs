@@ -734,6 +734,20 @@ impl P {
         }
         if self.eat_kw("file") {
             let name = self.ident().ok();
+            // file NAME : TYPE open read_mode is EXPR;  (or VHDL-87: is in EXPR)
+            if name.is_some() && self.eat_sym(":") && self.ident().is_ok() {
+                let read = if self.eat_kw("open") {
+                    self.ident().map(|m| m == "read_mode").unwrap_or(false)
+                } else {
+                    true
+                };
+                if read && self.eat_kw("is") {
+                    let _ = self.eat_kw("in");
+                    let path = self.expr()?;
+                    self.expect_sym(";")?;
+                    return Ok(Decl::File { name: name.unwrap(), path, line });
+                }
+            }
             self.skip_semi();
             return Ok(Decl::Unsupported {
                 name,

@@ -446,9 +446,27 @@ impl Elab {
         Ok(())
     }
 
+    /// Memory reads that are not ROMs become mux trees.
+    fn lower_index(&mut self) {
+        let mut memo = HashMap::new();
+        for ni in 0..self.nets.len() {
+            for di in 0..self.nets[ni].drivers.len() {
+                if let DrvSrc::Comb(n) = self.nets[ni].drivers[di].src {
+                    let m = self.dag.lower_index(n, &mut memo);
+                    self.nets[ni].drivers[di].src = DrvSrc::Comb(m);
+                }
+            }
+        }
+        for ri in 0..self.regs.len() {
+            let d = self.dag.lower_index(self.regs[ri].d, &mut memo);
+            self.regs[ri].d = d;
+        }
+    }
+
     pub fn emit_sv(&mut self) -> R<String> {
         self.check_drivers()?;
         self.forward_aliases()?;
+        self.lower_index();
 
         // Reachability from the top-level outputs.
         let mut nets_r: HashSet<u32> = HashSet::new();
@@ -642,6 +660,26 @@ impl Elab {
                 }
             }
         }
+        // Constant arrays read by a runtime index: one ROM per array.
+        let mut roms: Vec<N> = Vec::new();
+        for &n in &order {
+            if let Op::Index(b, _, rev) = *self.dag.op(n) {
+                if roms.contains(&b) {
+                    continue;
+                }
+                roms.push(b);
+                let ew = self.dag.w(n);
+                let bits = self.dag.as_const(b).ok_or("internal: memory read of an array that is not constant")?;
+                let depth = bits.len() as u32 / ew;
+                let el: Vec<String> = (0..depth)
+                    .map(|k| {
+                        let p = (if rev { depth - 1 - k } else { k } * ew) as usize;
+                        lit(&bits[p..p + ew as usize])
+                    })
+                    .collect();
+                writeln!(v, "  reg {}hv_m{b} [0:{}] = '{{{}}};", range(ew), depth - 1, el.join(", ")).unwrap();
+            }
+        }
         // Register D expressions used nowhere else are written inside the
         // always_ff (`q <= q + 1`), which lets helion-sv recognise counters
         // and enables.
@@ -721,6 +759,12 @@ impl Elab {
                 Op::RedAnd(a) => format!("&{}", o(*a)),
                 Op::RedOr(a) => format!("|{}", o(*a)),
                 Op::RedXor(a) => format!("^{}", o(*a)),
+                Op::Index(b, i, _) => {
+                    if !matches!(dag.op(*b), Op::Const(_)) {
+                        return Err("internal: memory read of an array that is not constant".into());
+                    }
+                    format!("hv_m{b}[{}]", o(*i))
+                }
             })
         };
         for n in order {

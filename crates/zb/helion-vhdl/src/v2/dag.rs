@@ -41,6 +41,9 @@ pub enum Op {
     RedAnd(N),
     RedOr(N),
     RedXor(N),
+    /// Element `idx` of the array `base` (node width = element width).
+    /// `rev`: element 0 sits at the top of `base` (an ascending VHDL range).
+    Index(N, N, bool),
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +104,19 @@ impl Dag {
     pub fn konst(&mut self, bits: Vec<bool>) -> N {
         let w = bits.len() as u32;
         self.intern(Op::Const(bits), w)
+    }
+    /// A private copy of constant `n`, outside the hash-consing table, so
+    /// its owner may change it with [`Dag::const_mut`].
+    pub fn konst_fresh(&mut self, n: N) -> N {
+        let node = self.nodes[n as usize].clone();
+        self.nodes.push(node);
+        self.nodes.len() as N - 1
+    }
+    pub fn const_mut(&mut self, n: N) -> &mut Vec<bool> {
+        match &mut self.nodes[n as usize].op {
+            Op::Const(b) => b,
+            _ => panic!("const_mut of a non-constant node"),
+        }
     }
     pub fn kval(&mut self, v: u128, w: u32) -> N {
         self.konst(from_u128(v, w))
@@ -488,6 +504,9 @@ impl Dag {
                 }
             }
         }
+        if native_mul() {
+            return self.intern(Op::Mul(a, b), w);
+        }
         // Shift-and-add over named partial sums (no `*` in the emitted SV).
         let (a, b) = if self.as_const(a).is_some() {
             (b, a)
@@ -635,6 +654,41 @@ impl Dag {
         let fa = self.xor(a, m);
         let fb = self.xor(b, m);
         self.ult(fa, fb)
+    }
+
+    /// Read element `idx` (unsigned) of an array of `ew`-bit elements.
+    pub fn index(&mut self, base: N, idx: N, ew: u32, rev: bool) -> N {
+        let depth = self.w(base) / ew;
+        if let Some(i) = self.const_u128(idx) {
+            if i < depth as u128 {
+                let p = if rev { depth - 1 - i as u32 } else { i as u32 };
+                return self.slice(base, p * ew, ew);
+            }
+        }
+        self.intern(Op::Index(base, idx, rev), ew)
+    }
+
+    /// The same read as a balanced mux tree on the index bits; an index
+    /// past the end reads the last element (as the priority mux did).
+    pub fn index_mux(&mut self, base: N, idx: N, ew: u32, rev: bool) -> N {
+        let depth = self.w(base) / ew;
+        let iw = self.w(idx);
+        self.index_tree(base, idx, ew, rev, depth, iw, 0)
+    }
+
+    /// Elements `first .. first + 2^bits` of the tree.
+    #[allow(clippy::too_many_arguments)]
+    fn index_tree(&mut self, base: N, idx: N, ew: u32, rev: bool, depth: u32, bits: u32, first: u64) -> N {
+        if first >= depth as u64 - 1 || bits == 0 {
+            let i = first.min(depth as u64 - 1) as u32;
+            let p = if rev { depth - 1 - i } else { i };
+            return self.slice(base, p * ew, ew);
+        }
+        let half = 1u64 << (bits - 1);
+        let lo = self.index_tree(base, idx, ew, rev, depth, bits - 1, first);
+        let hi = self.index_tree(base, idx, ew, rev, depth, bits - 1, first + half);
+        let s = self.slice(idx, bits - 1, 1);
+        self.mux(s, hi, lo)
     }
 
     pub fn mux(&mut self, s: N, a: N, b: N) -> N {
@@ -788,6 +842,7 @@ impl Dag {
             | Op::Shl(a, b)
             | Op::Lshr(a, b) => vec![*a, *b],
             Op::Mux(s, a, b) => vec![*s, *a, *b],
+            Op::Index(a, i, _) => vec![*a, *i],
         }
     }
 
@@ -826,6 +881,33 @@ impl Dag {
         memo[&n]
     }
 
+    /// Rebuild `n` with every `Index` that is not a ROM turned into its mux
+    /// tree (memoized).
+    pub fn lower_index(&mut self, n: N, memo: &mut HashMap<N, N>) -> N {
+        let mut stack: Vec<(N, bool)> = vec![(n, false)];
+        while let Some((x, done)) = stack.pop() {
+            if memo.contains_key(&x) {
+                continue;
+            }
+            let kids = self.kids(x);
+            if !done {
+                stack.push((x, true));
+                stack.extend(kids.iter().filter(|k| !memo.contains_key(k)).map(|&k| (k, false)));
+                continue;
+            }
+            let nk: Vec<N> = kids.iter().map(|k| memo[k]).collect();
+            let mut r = if nk == kids { x } else { self.rebuild(x, &nk) };
+            if let Op::Index(b, i, rev) = *self.op(r) {
+                if self.as_const(b).is_none() || self.w(b) / self.w(r) <= ROM_MIN_ELEMS {
+                    let w = self.w(r);
+                    r = self.index_mux(b, i, w, rev);
+                }
+            }
+            memo.insert(x, r);
+        }
+        memo[&n]
+    }
+
     fn rebuild(&mut self, n: N, k: &[N]) -> N {
         let w = self.w(n);
         match self.op(n).clone() {
@@ -848,6 +930,7 @@ impl Dag {
             Op::RedAnd(_) => self.red_and(k[0]),
             Op::RedOr(_) => self.red_or(k[0]),
             Op::RedXor(_) => self.red_xor(k[0]),
+            Op::Index(_, _, rev) => self.index(k[0], k[1], w, rev),
             Op::Const(_) | Op::Read(_) | Op::Hold(_) | Op::VHold(_) => n,
         }
     }
@@ -914,11 +997,27 @@ impl Dag {
     }
 }
 
+/// Constant arrays with more elements than this become ROMs (an SV memory);
+/// smaller ones are LUT logic, as a ROM of a few words is in Vivado.
+pub const ROM_MIN_ELEMS: u32 = 64;
+
 /// Adders/comparators wider than this become parallel-prefix gate logic.
 const PREFIX_MIN_W: u32 = 4;
 
 thread_local! {
     static CARRY_ARITH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static NATIVE_MUL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Emit `*` for a product instead of shift-and-add, so the SystemVerilog
+/// front end behind can use a DSP48 (the v2 front end does; helion-sv-zb
+/// does not). Off by default.
+pub fn set_native_mul(on: bool) {
+    NATIVE_MUL.with(|c| c.set(on));
+}
+
+pub fn native_mul() -> bool {
+    NATIVE_MUL.with(|c| c.get())
 }
 
 /// Keep wide adders, subtractors and comparators as `+` on named buses, for

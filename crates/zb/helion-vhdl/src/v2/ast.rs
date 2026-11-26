@@ -256,6 +256,12 @@ pub enum Decl {
         what: String,
         line: Line,
     },
+    /// `file f : text open read_mode is "name";` (read mode only).
+    File {
+        name: String,
+        path: Expr,
+        line: Line,
+    },
     /// A declaration Helion cannot represent; an error only if it is used.
     Unsupported {
         name: Option<String>,

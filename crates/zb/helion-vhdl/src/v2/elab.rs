@@ -314,6 +314,10 @@ pub enum Sym {
     Comp(Rc<(Vec<IfDecl>, Vec<IfDecl>)>),
     Pkg,
     Unsupported(String),
+    /// `std.textio` file opened for reading (index into `Elab::tio_files`).
+    File(u32),
+    /// `std.textio` `line` variable (index into `Elab::tio_lines`).
+    Line(u32),
 }
 
 #[derive(Clone, Debug)]
@@ -373,8 +377,22 @@ pub enum PxKind {
     Static,
 }
 
+/// Constant nodes that exactly one variable slot owns, so a write to one
+/// element can update them in place (a ROM filled element by element in a
+/// loop stays linear). Cloning a state gives up ownership on both sides.
+#[derive(Debug, Default)]
+pub struct Fresh(pub std::cell::RefCell<std::collections::HashSet<N>>);
+
+impl Clone for Fresh {
+    fn clone(&self) -> Self {
+        self.0.borrow_mut().clear();
+        Fresh::default()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct St {
+    pub fresh: Fresh,
     pub vars: Vec<N>,
     pub pend: BTreeMap<u32, N>,
     pub ret: N,
@@ -417,6 +435,10 @@ pub struct Elab {
     pub ret_vtys: Vec<Option<Ty>>,
     /// (VHDL name, SV name) for top-level names that are SV keywords.
     pub renames: Vec<(String, String)>,
+    /// `std.textio` state, used while elaborating ROM initializers:
+    /// (file name, its lines, next line) and the text left in each `line`.
+    pub tio_files: Vec<(String, Vec<String>, usize)>,
+    pub tio_lines: Vec<String>,
 }
 
 pub fn err<X>(line: Line, msg: impl AsRef<str>) -> R<X> {
@@ -443,6 +465,8 @@ impl Elab {
             ret_tys: Vec::new(),
             ret_vtys: Vec::new(),
             renames: Vec::new(),
+            tio_files: Vec::new(),
+            tio_lines: Vec::new(),
         };
         e.std_env();
         e
@@ -697,6 +721,7 @@ impl Elab {
         self.px.push(Px {
             kind,
             st: St {
+                fresh: Fresh::default(),
                 vars: Vec::new(),
                 pend: BTreeMap::new(),
                 ret: z,
@@ -1106,6 +1131,13 @@ impl Elab {
                 if self.px.is_empty() {
                     return err(*line, "variable declared outside a process or subprogram");
                 }
+                if matches!(&ty.mark, Name::Id(m, _) if m == "line") && self.lookup("line").is_none() {
+                    for (n, _) in names {
+                        self.tio_lines.push(String::new());
+                        self.declare(n, Sym::Line(self.tio_lines.len() as u32 - 1));
+                    }
+                    return Ok(());
+                }
                 let t = self.resolve_subind(ty)?;
                 let t = if let (Ty::Arr(a), Some(e)) = (&t, init) {
                     if a.idx.is_none() {
@@ -1196,6 +1228,17 @@ impl Elab {
                 self.declare(name, sym);
             }
             Decl::Ignored { .. } => {}
+            Decl::File { name, path, line } => {
+                let Val::S(file) = self.eval_static(path, Some(&Ty::Str), *line)? else {
+                    return err(*line, "file name is not a string");
+                };
+                let text = std::fs::read_to_string(&file).map_err(|e| {
+                    format!("line {line}: cannot open `{file}` for reading ({e}; looked in the working directory)")
+                })?;
+                let lines = text.lines().map(str::to_string).collect();
+                self.tio_files.push((file, lines, 0));
+                self.declare(name, Sym::File(self.tio_files.len() as u32 - 1));
+            }
             Decl::Unsupported { name, what, .. } => {
                 if let Some(n) = name {
                     self.declare(n, Sym::Unsupported(what.clone()));
