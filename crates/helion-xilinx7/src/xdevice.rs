@@ -273,6 +273,13 @@ impl<'a> XDevice<'a> {
         self.flags.borrow()
     }
 
+    /// Whether the wire is one end of the link between an HCLK_L and an
+    /// HCLK_R tile, which carries one tile's row clock to the other's leaves.
+    fn is_hclk_link(&self, id: u32) -> bool {
+        let (ti, wi) = self.wire_to_tile[id as usize];
+        self.device.wires(ti).and_then(|ws| ws.get(wi as usize)).is_some_and(|w| w.starts_with("HCLK_CK_INOUT_") || w.starts_with("HCLK_CK_OUTIN_"))
+    }
+
     /// A* over integer wire ids: same wire rules as `route::bfs_route`
     /// (power/clock and BYP_ALT wires, foreign claims, CLB pseudo-pips).
     /// Search state lives in flat per-wire arrays stamped per search.
@@ -335,6 +342,11 @@ impl<'a> XDevice<'a> {
             }
             // A clock stays on clock wires inside INT tiles.
             if clock && f & 8 != 0 && f & 32 == 0 {
+                return false;
+            }
+            // A row clock enters a tile's leaves through that tile's own
+            // buffer, not the neighbouring tile's.
+            if clock && !opts.hclk_link && self.is_hclk_link(id) {
                 return false;
             }
             if !allow_power && !allow_byp && f & 2 != 0 {
@@ -2265,6 +2277,35 @@ mod tests {
         let pips = [pip("HCLK_R_X22Y26", "HCLK_CK_INOUT_R0", "HCLK_CK_BUFHCLK0"), pip("HCLK_L_X21Y26", "HCLK_LEAF_CLK_B_BOTL0", "HCLK_CK_OUTIN_L0")];
         let statics = xdev.clock_statics(&pips.iter().collect::<Vec<_>>());
         assert!(statics.iter().any(|f| f == "HCLK_R_X22Y26.ENABLE_BUFFER.HCLK_CK_BUFHCLK0"), "got {statics:?}");
+    }
+
+    /// A row clock reaches a column through the HCLK tile whose own buffer
+    /// takes that line, never through the link to the neighbouring tile:
+    /// on the XC7S25 the columns clocked through the link had no clock on
+    /// silicon, and Vivado never uses it. Line 0 enters HCLK_R tiles, so an
+    /// INT_L column takes it from the HCLK_R leaf across the INT_R tile.
+    #[test]
+    fn a_row_clock_takes_the_tiles_own_buffer_not_the_neighbour_link() {
+        let (dev, maps) = test_z020();
+        let xdev = XDevice::new(dev, maps.clone());
+        let src = ("HCLK_R_X22Y26", "HCLK_CK_BUFHCLK0");
+        let tree = vec![(src.0.to_string(), src.1.to_string(), 0u32)];
+        let sinks = vec![("INT_L_X6Y3".to_string(), "CLK_L0".to_string())];
+        let route = |hclk_link: bool| {
+            let opts = crate::route::RouteOpts { clock: true, hclk_link, ..Default::default() };
+            xdev.route_fast(src, &tree, &sinks, opts, "clk", &HashMap::new()).flatten().map(|(pips, _)| pips)
+        };
+        let link = |p: &RoutedPip| [&p.src_wire, &p.dst_wire].iter().any(|w| w.starts_with("HCLK_CK_INOUT_") || w.starts_with("HCLK_CK_OUTIN_"));
+        let pips = route(false).expect("a clock path without the link");
+        assert!(!pips.iter().any(link), "the path uses the link: {pips:?}");
+        assert!(
+            pips.iter().any(|p| p.tile == "HCLK_R_X22Y26" && p.dst_wire.starts_with("HCLK_LEAF_CLK_B_") && p.src_wire == "HCLK_CK_BUFHCLK0"),
+            "the leaf comes from the tile's own buffer: {pips:?}"
+        );
+        let statics = xdev.clock_statics(&pips.iter().collect::<Vec<_>>());
+        assert!(statics.iter().any(|f| f == "HCLK_R_X22Y26.ENABLE_BUFFER.HCLK_CK_BUFHCLK0"), "the buffer is enabled in the same tile: {statics:?}");
+        // With the link allowed the search takes it for this column: the rule above is what keeps it off.
+        assert!(route(true).is_some_and(|p| p.iter().any(link)), "the test column no longer tempts the search onto the link");
     }
 
     #[test]
